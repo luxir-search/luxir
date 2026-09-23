@@ -37,7 +37,6 @@ public:
   // Filename related utilities.  We try to keep filenames short for many reasons, including
   // being able to fit in short-string optimization.
 
-  static constexpr std::string_view INDEX_INFO_FILE = "s.olux"; // lists all segments in the index
   static constexpr std::string_view PREFIX_FNAME = "s";         // prefix for all data files
   static constexpr std::string_view LUXIR_HEADER = "LUXIR002";  // every data file starts with this header
 

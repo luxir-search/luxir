@@ -176,19 +176,38 @@ private:
     uint64_t coreGeneration = 0;
     int64_t totalMaxDoc = 0;
     int64_t livedocs = 0;
-    uint64_t commitTimeUs = 0;
+    struct SegmentFiles {
+      uint64_t segId;
+      std::vector<FileDescriptor> files;
+      std::vector<std::vector<FileDescriptor>> overlays;
+      bool operator==(const SegmentFiles&) const = default;
+    };
+    std::vector<SegmentFiles> segmentFiles;
+    std::vector<std::vector<FileDescriptor>> auxFiles;
+    std::string incarnation;
 
-    PhysicalCore(Directory& dir, const PhysicalCore* previous);
     std::span<const ProjectableField> projectableFields();
   };
 
+  struct Snapshot {
+    std::shared_ptr<PhysicalCore> core;
+    std::shared_ptr<Schema> schema;
+    uint64_t commitTime = 0;
+    uint64_t indexGen = 0;
+  };
+  const uint64_t snapshotTime;
+  const uint64_t snapshotGen;
   const std::shared_ptr<PhysicalCore> core;
   const std::shared_ptr<Schema> sharedSchema;
   const std::shared_ptr<FilterCache> sharedFilterCache;
   std::once_flag retrievableOnce;
   std::vector<RetrievableField> retrievable;
 
-  IndexReader(std::shared_ptr<PhysicalCore> core, std::shared_ptr<Schema> schema,
+  static Snapshot openSnapshot(Directory& dir, const IndexReader* previous,
+                               std::shared_ptr<Schema> schema,
+                               std::shared_ptr<const std::vector<std::byte>> manifest);
+
+  IndexReader(Snapshot snapshot,
               std::shared_ptr<FilterCache> filterCache);
 
 public:
@@ -200,8 +219,10 @@ public:
   // The time in microseconds when this version of the index was committed.  Guaranteed to be strictly increasing
   // with new versions of the index.
   uint64_t commitTime() const noexcept {
-    return core->commitTimeUs;
+    return snapshotTime;
   }
+
+  uint64_t commitId() const noexcept { return snapshotGen; }
 
   std::span<Segment> segments() noexcept {
     return core->segs;
@@ -283,7 +304,8 @@ public:
   // Direct tools/tests may omit the schema if they only use physical state.
   IndexReader(Directory& dir, IndexReader* previousReader = nullptr,
               std::shared_ptr<FilterCache> filterCache = nullptr,
-              std::shared_ptr<Schema> schema = nullptr);
+              std::shared_ptr<Schema> schema = nullptr,
+              std::shared_ptr<const std::vector<std::byte>> manifest = {});
 };
 
 }

@@ -370,7 +370,7 @@ public:
         "VectorAuxReader: expected 1 file, got {} for aux '{}'",
         info.files.size(), info.name));
     }
-    std::string_view fname = info.files[0];
+    std::string_view fname = info.files[0].name;
 
     // expectSynced=true: aux files were fsynced before the IndexInfo that
     // references them was published, same contract as segment files.

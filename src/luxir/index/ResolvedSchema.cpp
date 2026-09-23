@@ -7,7 +7,7 @@
 namespace luxir {
 
 std::string IndexWriter::resolvedSchema() {
-  auto schema = currentSchema.load();
+  auto schema = getSchema();
   std::optional<uint64_t> oldest;
   {
     std::lock_guard<std::mutex> lock(indexMutex);

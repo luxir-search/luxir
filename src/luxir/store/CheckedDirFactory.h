@@ -106,11 +106,9 @@ public:
   void renameFile(std::string_view from, std::string_view to) override {
     delegate_->renameFile(from, to);
     std::lock_guard lock(mu_);
-    auto it = unsyncedFiles_.find(std::string(from));
-    if (it != unsyncedFiles_.end()) {
-      unsyncedFiles_.erase(it);
-      unsyncedFiles_.insert(std::string(to));
-    }
+    bool unsynced = unsyncedFiles_.erase(std::string(from));
+    unsyncedFiles_.erase(std::string(to));
+    if (unsynced) unsyncedFiles_.insert(std::string(to));
     if (verbose_) LOG_DEBUG("CheckedDirectory: renameFile({} -> {})", from, to);
   }
 
@@ -149,8 +147,8 @@ public:
   CheckedDirFactory(std::unique_ptr<DirectoryFactory> delegate, CheckedDirMode mode, bool verbose = false)
       : delegate_(std::move(delegate)), mode_(mode), verbose_(verbose) {}
 
-  std::shared_ptr<Directory> create(std::string_view collectionName) override {
-    auto dir = delegate_->create(collectionName);
+  std::shared_ptr<Directory> create(std::string_view collectionName, bool exclusive = false) override {
+    auto dir = delegate_->create(collectionName, exclusive);
     return std::make_shared<CheckedDirectory>(std::move(dir), mode_, verbose_);
   }
 

@@ -50,7 +50,7 @@ public:
         "TestOverlayAuxReader: expected 1 file, got {} for overlay '{}'",
         info.files.size(), info.name));
     }
-    std::string_view fname = info.files[0];
+    std::string_view fname = info.files[0].name;
     auto file = dir.openFile(fname, /*expectSynced=*/true);
     if (file == nullptr) {
       if (missingFileOK) {

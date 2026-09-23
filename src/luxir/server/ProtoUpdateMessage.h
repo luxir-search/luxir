@@ -91,6 +91,8 @@ public:
   ResponseProto* finishResponse() {
     auto* rsp = getResponse();
     rsp->update_version = updateVersion;
+    if (resultingCommit) rsp->commit = api::CommitId{
+        api::build::arenaStr(mr_, resultingCommit->incarnation), resultingCommit->index_gen};
     if (result.errored()) {
       rsp->status = ResponseStatus::ERROR;
       rsp->error = luxir::api::build::arenaError(mr_, result.info());

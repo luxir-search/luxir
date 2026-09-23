@@ -28,10 +28,6 @@ namespace api = luxir::api;
 using FieldClass = luxir::api::FieldDef::FieldClass;
 using IndexMode = luxir::api::FieldDef::IndexMode;
 
-static std::string schemaFileName(uint64_t gen) {
-  return "_schema_" + Postings::getSortableString(gen);
-}
-
 class SchemaTest : public LuxirTest {};
 
 
@@ -84,11 +80,11 @@ TEST_F(SchemaTest, collectionHelperClearSkipsDefaultSchemaReset) {
   CollectionHelper ch;
 
   auto schema = ch.collection().getSchema();
-  uint64_t nextGen = ch.collection().schemaGen();
+  uint64_t nextGen = ch.collection().getSchema()->gen_;
 
   ch.clear();
 
-  EXPECT_EQ(nextGen, ch.collection().schemaGen());
+  EXPECT_EQ(nextGen, ch.collection().getSchema()->gen_);
   EXPECT_EQ(schema.get(), ch.collection().getSchema().get());
 }
 
@@ -978,18 +974,13 @@ TEST_F(SchemaTest, schemaPersistence) {
   EXPECT_GT(schema->gen_, (uint64_t)0);
   uint64_t gen = schema->gen_;
 
-  // Verify schema file exists in Directory
   auto& dir = *ch.collection().getShard()->getDirectory();
-  std::string fileName = schemaFileName(gen);
-  auto file = dir.openFile(fileName);
-  ASSERT_NE(nullptr, file.get()) << "Schema file " << fileName << " should exist";
-
-  // Verify we can parse the persisted schema
+  auto manifest = readDurableIndexInfo(dir);
+  ASSERT_TRUE(manifest->schema);
+  EXPECT_EQ(gen, manifest->schema_gen);
   std::pmr::monotonic_buffer_resource arena;
-  InputStream is = file->getInputStream();
   api::SchemaDef persistedDef;
-  std::span<const char> persistedBytes(is.ptr(), (size_t)is.left());
-  auto persistedSchema = Schema::decodeStored(std::as_bytes(persistedBytes));
+  auto persistedSchema = Schema::fromStored(*manifest->schema, manifest->schema_gen);
   persistedSchema->toProto(&persistedDef, arena);
 
   // The persisted def should contain "title" field
@@ -1018,13 +1009,8 @@ TEST_F(SchemaTest, schemaGenIncrements) {
 
   EXPECT_GT(gen2, gen1) << "Schema gen should increment on each setSchema";
 
-  // Old schema file should be cleaned up
-  auto oldFile = ch.collection().getShard()->getDirectory()->openFile(schemaFileName(gen1));
-  EXPECT_EQ(nullptr, oldFile.get()) << "Old schema file should be deleted";
-
-  // New schema file should exist
-  auto newFile = ch.collection().getShard()->getDirectory()->openFile(schemaFileName(gen2));
-  EXPECT_NE(nullptr, newFile.get()) << "New schema file should exist";
+  auto manifest = readDurableIndexInfo(*ch.collection().getShard()->getDirectory());
+  EXPECT_EQ(gen2, manifest->schema_gen);
 
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
@@ -1049,15 +1035,8 @@ TEST_F(SchemaTest, schemaGenWrittenToIndexInfo) {
 
   // Read IndexInfo directly and check schema_gen
   auto& dir = *ch.collection().getShard()->getDirectory();
-  auto indexInfoFile = dir.openFile("s.olux");
-  ASSERT_NE(nullptr, indexInfoFile.get());
-
-  std::pmr::monotonic_buffer_resource arena;
-  InputStream is = indexInfoFile->getInputStream();
-  api::IndexInfo indexInfo;
-  std::span<const char> indexInfoBytes(is.ptr(), (size_t)is.left());
-  auto paddedIndexInfoBytes = api::copyToPaddedInput(std::as_bytes(indexInfoBytes), arena);
-  ASSERT_TRUE(api::decode(indexInfo, paddedIndexInfoBytes, arena));
+  auto stored = test::readDurableIndexInfo(dir);
+  const auto& indexInfo = *stored;
   EXPECT_EQ(expectedGen, indexInfo.schema_gen) << "IndexInfo should contain the current schema_gen";
 
   // Check that SegmentInfo also has schema_gen
@@ -1069,7 +1048,10 @@ TEST_F(SchemaTest, schemaGenWrittenToIndexInfo) {
 
 
 TEST_F(SchemaTest, schemaLoadOnRestart) {
-  CollectionHelper ch;
+  LuxirConfig config;
+  config.store.backend = "ram";
+  LuxirNode node(config);
+  CollectionHelper ch(node);
 
   // Set a custom schema with "title" field
   SchemaBuilder b;
@@ -1085,11 +1067,9 @@ TEST_F(SchemaTest, schemaLoadOnRestart) {
   ch.index(doc);
   ch.commit();
 
-  // Simulate restart: load latest schema from Directory
-  auto loaded = ch.collection().loadSchema();
-  ASSERT_TRUE(loaded) << "Should successfully load schema from Directory";
-
-  auto loadedSchema = ch.collection().getSchema();
+  ch.getIndexWriter()->close();
+  IndexWriter reopened(*ch.collection().getShard()->getDirectory());
+  auto loadedSchema = reopened.getSchema();
   EXPECT_EQ(schemaGen, loadedSchema->gen_);
 
   // The loaded schema should have the "title" field
@@ -1100,63 +1080,6 @@ TEST_F(SchemaTest, schemaLoadOnRestart) {
   // It should also have default fields that were merged in
   EXPECT_NE(nullptr, loadedSchema->getFieldTypePtr("id"));
   EXPECT_NE(nullptr, loadedSchema->getFieldTypePtr("title_s"));
-
-  ch.collection().setSchema(Schema::createDefaultSchema());
-}
-
-// A protobuf length-delimited field: tag byte + one-byte length + payload.
-static std::string pbLen(int field, std::string_view payload) {
-  std::string out;
-  out += (char)((field << 3) | 2);
-  out += (char)payload.size();
-  out += payload;
-  return out;
-}
-
-TEST_F(SchemaTest, oldAnalyzerSchemaFileIsRejectedAtLoad) {
-  // AnalyzerDef.tokenizer / filters used to be strings at the same tags.  A
-  // schema file from then must fail to load loudly, not decode to a schema
-  // that silently lost its analyzer.  Hand-encoded old shape, for every
-  // component name that existed:
-  //   SchemaDef{fields: {"t": FieldDef{type: TEXT, analyzer: {tokenizer, [filter]}}}}
-  CollectionHelper ch;
-  auto& dir = *ch.collection().getShard()->getDirectory();
-  auto installed = ch.collection().getSchema();
-  // Tokenizer-only and filter-only payloads for every old name, so each field
-  // is rejected on its own, plus the common default pair.
-  const std::pair<const char*, const char*> combos[] = {
-      {"whitespace", nullptr}, {"keyword", nullptr}, {"unicode_word", nullptr},
-      {nullptr, "lowercase"}, {nullptr, "nfkc_cf"}, {nullptr, "fold"},
-      {"unicode_word", "nfkc_cf"}};
-  for (const auto& [tokenizer, filter] : combos) {
-    std::string analyzer;
-    if (tokenizer != nullptr) analyzer += pbLen(1, tokenizer);
-    if (filter != nullptr) analyzer += pbLen(2, filter);
-    std::string fieldDef = std::string("\x10\x01") + pbLen(6, analyzer);
-    std::string entry = pbLen(1, "t") + pbLen(2, fieldDef);
-    std::string schemaDef = pbLen(1, entry);
-
-    std::string fileName = schemaFileName(1000000);  // sorts after any live generation
-    auto file = dir.createFile(fileName);
-    OutputStream out;
-    out.setFile(&*file);
-    out.write(schemaDef.data(), schemaDef.size());
-    out.close();
-    dir.finishFile(*file);
-    std::vector<std::string> syncFiles = {fileName, "."};
-    dir.sync(syncFiles);
-
-    try {
-      ch.collection().loadSchema();
-      FAIL() << "old-format schema file loaded for " << (tokenizer ? tokenizer : "-") << "/"
-             << (filter ? filter : "-");
-    } catch (const std::runtime_error& e) {
-      EXPECT_NE(std::string::npos, std::string(e.what()).find("Failed to parse schema file")) << e.what();
-    }
-    EXPECT_EQ(installed, ch.collection().getSchema()) << "a failed load leaves the installed schema alone";
-    dir.deleteFile(fileName);
-  }
-  ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
 TEST_F(SchemaTest, sourceDef) {
@@ -1186,48 +1109,6 @@ TEST_F(SchemaTest, sourceDef) {
     << "templates persist in their own map";
 }
 
-
-TEST_F(SchemaTest, loadSchemaAfterOldFileDeleted) {
-  // Simulates the race where the schema file from IndexInfo's gen was already
-  // cleaned up by a newer setSchema. loadSchema() must find the newer file.
-  // Without the retry logic, this test fails because the only schema file
-  // is manually deleted before calling loadSchema().
-  CollectionHelper ch;
-
-  // setSchema - writes _schema.<gen1>
-  SchemaBuilder b1;
-  b1.field("field1").type = FieldClass::STRING;
-  b1.set(ch.collection());
-  uint64_t gen1 = ch.collection().getSchema()->gen_;
-
-  // Manually delete the schema file to simulate the race
-  auto& dir = *ch.collection().getShard()->getDirectory();
-  ASSERT_TRUE(dir.deleteFile(schemaFileName(gen1)));
-
-  // loadSchema should fail - no schema files remain
-  EXPECT_FALSE(ch.collection().loadSchema()) << "Should fail with no schema files";
-
-  // Now do two setSchema calls so the first gen's file gets cleaned up naturally
-  SchemaBuilder b2;
-  b2.field("field2").type = FieldClass::INT;
-  b2.set(ch.collection());
-
-  SchemaBuilder b3;
-  auto& f3 = b3.field("field3");
-  f3.type = FieldClass::INT;
-  f3.column = true;
-  b3.set(ch.collection());
-  uint64_t gen3 = ch.collection().getSchema()->gen_;
-
-  // loadSchema should find the latest file
-  ASSERT_TRUE(ch.collection().loadSchema());
-  auto loadedSchema = ch.collection().getSchema();
-  EXPECT_EQ(gen3, loadedSchema->gen_) << "Should have loaded the newest schema generation";
-  EXPECT_NE(nullptr, loadedSchema->getFieldTypePtr("field3"))
-    << "Loaded schema should contain 'field3' from the newest schema";
-
-  ch.collection().setSchema(Schema::createDefaultSchema());
-}
 
 // Keep the parser, schema compiler, and persisted source on the same path in
 // these fixtures. Returned schemas own all resolved state after this arena dies.
@@ -1413,8 +1294,9 @@ TEST_F(SchemaTest, variantInferenceUsesResolvedTypesAndSurvivesRoundTrips) {
   }})");
   auto json = authoredJson(*s);
   EXPECT_EQ(std::string::npos, json.find("\"defaults\"")); // inferred choices stay out of authored definitions
-  auto stored = s->encodeStored();
-  for (const auto& copy : {s, schemaJson(json), Schema::decodeStored(std::as_bytes(std::span(stored)))}) {
+  std::pmr::monotonic_buffer_resource storedArena;
+  auto stored = s->storedInfo(storedArena);
+  for (const auto& copy : {s, schemaJson(json), Schema::fromStored(stored, s->gen_)}) {
     EXPECT_EQ(s->sourceDef_, copy->sourceDef_);
     EXPECT_EQ("author__raw", copy->resolveFor("author", OpClass::VALUE).physicalName);
     EXPECT_EQ("book_words__raw", copy->resolveFor("book_words", OpClass::VALUE).physicalName);
@@ -1843,4 +1725,23 @@ TEST_F(SchemaTest, resolvedHandleNamesSurviveCopiesAndMoves) {
     EXPECT_EQ(copy.fieldType, moved.fieldType);
     EXPECT_EQ(copy.owner, moved.owner);
   }
+}
+
+
+TEST_F(SchemaTest, concurrentSchemaTransactionsCompose) {
+  CollectionHelper helper("schema_transactions");
+  tbb::task_arena arena(2);
+  arena.execute([&] {
+    tbb::parallel_for(0, 8, [&](int i) {
+      SchemaBuilder builder;
+      builder.field("field" + std::to_string(i)).type = FieldClass::STRING;
+      builder.set(helper.collection());
+    });
+  });
+  auto schema = helper.collection().getSchema();
+  for (int i = 0; i < 8; i++) EXPECT_NE(nullptr, schema->getFieldTypePtr("field" + std::to_string(i)));
+  auto manifest = readDurableIndexInfo(helper.getIndexWriter()->dir);
+  auto stored = Schema::fromStored(*manifest->schema, manifest->schema_gen);
+  EXPECT_EQ(schema->introducedGen, stored->introducedGen);
+  EXPECT_TRUE(manifest->segments.empty());
 }

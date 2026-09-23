@@ -12,8 +12,8 @@ overlays all read or regenerate from the column.
 
 ## Overlay Lifecycle
 
-Vector aux indexes are recorded as segment overlays in the index-level
-`s.olux` file. Each segment's `SegmentInfo` can carry `AuxIndexInfo` entries
+Vector aux indexes are recorded as segment overlays in the commit
+manifest. Each segment's `SegmentInfo` can carry `AuxIndexInfo` entries
 whose vector kind is `vector_faiss` and whose opaque metadata is
 `VectorAuxMeta`.
 
@@ -30,7 +30,7 @@ writer. That activation is process-local unless it produced a durable overlay
 entry. A commit that fails mid-build has no side effects: staged overlay files
 are deleted, no overlay entries are published, and no names are activated -
 the caller sees the error and decides whether to retry. Startup seeds active
-names only from overlays already present in `s.olux`, so Luxir never treats
+names only from overlays already present in the commit manifest, so Luxir never treats
 intent-only state as a boot-time "must build" queue.
 
 Explicit commit-time vector builds stage overlay files and entries across the

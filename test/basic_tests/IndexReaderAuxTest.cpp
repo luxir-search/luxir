@@ -349,7 +349,7 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterTinyCommitCarryForward) {
     auto loaded = readDurableIndexInfo(dir);
     const auto& auxInfo = onlyVectorOverlay(loaded.info);
     ASSERT_EQ(auxInfo.files.size(), 1u);
-    oldFile = std::string(auxInfo.files[0]);
+    oldFile = std::string(auxInfo.files[0].name);
   }
 
   // Publish a tiny below-threshold segment.  It should not build a new ANN
@@ -397,7 +397,7 @@ TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
     auto loaded = readDurableIndexInfo(dir);
     const auto& auxInfo = onlyVectorOverlay(loaded.info);
     ASSERT_EQ(auxInfo.files.size(), 1u);
-    auxFile = std::string(auxInfo.files[0]);
+    auxFile = std::string(auxInfo.files[0].name);
   }
   ASSERT_TRUE(dir.deleteFile(auxFile));
 
@@ -430,6 +430,7 @@ TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
 
   auto& dir = h.getIndexWriter()->dir;
   auto reader1 = std::make_shared<IndexReader>(dir);
+  auto firstManifest = readDurableIndexInfo(dir);
   auto aux1 = firstSegmentAux(*reader1, "vec.embedding_v");
   ASSERT_NE(aux1, nullptr);
 
@@ -441,6 +442,14 @@ TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
   auto reader2 = std::make_shared<IndexReader>(dir, reader1.get());
   auto aux2 = firstSegmentAux(*reader2, "vec.embedding_v");
   ASSERT_NE(aux2, nullptr);
+
+  auto carriedManifest = readDurableIndexInfo(dir);
+  EXPECT_EQ(firstManifest->segments[0].overlays[0].commit_time,
+            carriedManifest->segments[0].overlays[0].commit_time);
+  auto writerReader = h.getIndexWriter()->getIndexReader();
+  h.commit();
+  auto unchanged = h.getIndexWriter()->getIndexReader();
+  EXPECT_EQ(writerReader->segments().data(), unchanged->segments().data());
 
   // Same shared_ptr target - reused, not re-deserialized.
   EXPECT_EQ(aux1.get(), aux2.get())
@@ -495,6 +504,7 @@ TEST_F(IndexReaderAuxTest, schemaOnlyReaderSharesPhysicalState) {
   ASSERT_TRUE(h.index(flatdoc("id", "c", "name_s", "gamma")).success);
   h.commit({std::string(TestOverlayAuxReader::NAME)});
   ASSERT_TRUE(h.deleteById("a", UpdateMessage::COMMIT).success);
+  expectValidInventory(writer->dir, *readDurableIndexInfo(writer->dir));
   auto before = writer->getIndexReader();
   ASSERT_EQ(2u, before->segments().size());
   ASSERT_NE(nullptr, before->segments()[0].liveDocs());
@@ -507,7 +517,8 @@ TEST_F(IndexReaderAuxTest, schemaOnlyReaderSharesPhysicalState) {
   auto after = writer->getIndexReader(UINT64_MAX);
   EXPECT_NE(before, after);
   EXPECT_EQ(schema, after->schema());
-  EXPECT_EQ(before->commitTime(), after->commitTime());
+  EXPECT_LT(before->commitTime(), after->commitTime());
+  EXPECT_LT(before->commitId(), after->commitId());
   EXPECT_EQ(before->coreGen(), after->coreGen());
   EXPECT_EQ(before->maxDoc(), after->maxDoc());
   EXPECT_EQ(before->liveDocs(), after->liveDocs());
@@ -606,7 +617,7 @@ TEST_F(IndexReaderAuxTest, testOverlayConcurrentOpenHammer) {
 
 // Unknown aux kinds in IndexInfo are ignored, not treated as missing files.
 // We construct an IndexInfo with an extra unknown aux entry by hand-writing
-// a modified s.olux on top of an existing index.
+// a modified manifest on top of an existing index.
 TEST_F(IndexReaderAuxTest, unknownAuxKindIsSkipped) {
   CollectionHelper h("main");
 
@@ -627,21 +638,36 @@ TEST_F(IndexReaderAuxTest, unknownAuxKindIsSkipped) {
   extra.name = "future.foo";
   extra.gen = 1;
   luxir::api::build::allocArray(extra.files, 1, *loaded.arena)[0] =
-      "nonexistent_file_should_not_be_opened";
+      {"nonexistent_file_should_not_be_opened", 0, 0};
 
   {
     std::vector<std::byte> serialized;
     ASSERT_TRUE(luxir::api::encode(loaded.info, serialized));
-    auto out = dir.createFile(Postings::INDEX_INFO_FILE);
-    OutputStream os;
-    os.setFile(&*out);
-    os.write((const char*)serialized.data(), serialized.size());
-    os.close();
-    dir.finishFile(*out);
+    Manifest::write(dir, loaded.info.index_gen, serialized);
   }
 
   // Open should succeed: the unknown entry is skipped silently.
   auto reader = std::make_shared<IndexReader>(dir);
   ASSERT_EQ(reader->auxReaders().size(), 0u);
   EXPECT_EQ(reader->getAuxReader("future.foo"), nullptr);
+}
+
+
+TEST_F(IndexReaderAuxTest, inventoryReopensWithOverlaysAndDeletes) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto writer = helper.getIndexWriter();
+  ASSERT_TRUE(helper.indexAll(std::array{flatdoc("id", "a"), flatdoc("id", "b")}).success);
+  helper.commit({std::string(TestOverlayAuxReader::NAME)});
+  ASSERT_TRUE(helper.deleteById("a", UpdateMessage::COMMIT).success);
+  auto before = readDurableIndexInfo(writer->dir);
+  ASSERT_FALSE(before->segments[0].overlays.empty());
+  ASSERT_GT(before->segments[0].live_gen, 0u);
+  expectValidInventory(writer->dir, *before);
+  writer->close();
+  IndexWriter reopened(writer->dir);
+  reopened.commit();
+  auto after = readDurableIndexInfo(writer->dir);
+  expectValidInventory(writer->dir, *after);
+  EXPECT_EQ(fileInventory(*before), fileInventory(*after));
 }

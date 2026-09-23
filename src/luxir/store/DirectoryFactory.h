@@ -20,8 +20,8 @@ class DirectoryFactory {
 public:
   virtual ~DirectoryFactory() = default;
 
-  /// Create a Directory for the named collection.
-  virtual std::shared_ptr<Directory> create(std::string_view collectionName) = 0;
+  /// Open or create storage. Exclusive creation fails if storage already exists.
+  virtual std::shared_ptr<Directory> create(std::string_view collectionName, bool exclusive = false) = 0;
 
   /// Return the names of collections that already exist on disk.
   virtual std::vector<std::string> listCollections() = 0;
@@ -34,8 +34,9 @@ public:
 /// Factory that creates RAMDir instances (one per collection).
 class RAMDirFactory : public DirectoryFactory {
 public:
-  std::shared_ptr<Directory> create(std::string_view collectionName) override {
+  std::shared_ptr<Directory> create(std::string_view collectionName, bool exclusive = false) override {
     (void)collectionName;
+    (void)exclusive;
     return std::make_shared<RAMDir>();
   }
 
@@ -91,8 +92,18 @@ public:
     std::filesystem::create_directories(trashPath_);
   }
 
-  std::shared_ptr<Directory> create(std::string_view collectionName) override {
-    return std::make_shared<FSDirectory>(collectionsPath_ / collectionName);
+  std::shared_ptr<Directory> create(std::string_view collectionName, bool exclusive = false) override {
+    auto path = collectionsPath_ / collectionName;
+    if (exclusive && !std::filesystem::create_directory(path)) {
+      throw std::filesystem::filesystem_error("collection directory already exists", path,
+          std::make_error_code(std::errc::file_exists));
+    }
+    try {
+      return std::make_shared<FSDirectory>(path);
+    } catch (...) {
+      if (exclusive) std::filesystem::remove(path);
+      throw;
+    }
   }
 
   std::vector<std::string> listCollections() override {

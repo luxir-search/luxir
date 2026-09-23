@@ -250,7 +250,7 @@ void Inverter::InputHandler::index(Inverter& inverter, std::span<const GeoPoint>
 }
 
 
-bool Inverter::flush(std::vector<std::string>* filenames) {
+bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescriptor>* descriptors) {
   getPostingsWriter().setMaxDoc(getMaxDoc());  // TODO: this won't always be accurate currently?
   // Index-time stored/vector streams begin as candidates because their final
   // segment size is not known when they are checked out. Once flushing starts,
@@ -315,7 +315,7 @@ bool Inverter::flush(std::vector<std::string>* filenames) {
     liveGen = 1;  // start with generation 1 for the first liveDocs file
     liveDocs = numLiveDocs;
     if (filenames) {
-      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, liveGen, liveBits, maxDocId, numLiveDocs, *filenames);
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, liveGen, liveBits, maxDocId, numLiveDocs, *filenames, descriptors);
     } else {
       LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, liveGen, liveBits, maxDocId, numLiveDocs);
     }
@@ -325,7 +325,7 @@ bool Inverter::flush(std::vector<std::string>* filenames) {
     liveDocs = getMaxDoc();
   }
 
-  return getPostingsWriter().finish(filenames);
+  return getPostingsWriter().finish(filenames, descriptors);
 }
 
 

@@ -5,13 +5,21 @@ syntax = "proto3";
 
 package luxir.index;
 
+message FileDescriptor {
+  string name = 1;
+  uint64 size = 2;
+  fixed64 xxh3 = 3;
+}
+
 message IndexInfo {
   uint64 version = 1;                 // Version of the index format
   uint64 commit_time = 2;             // Commit time of this index (microseconds since epoch)
   uint64 index_gen = 3;               // Generation of this index (incremented on each commit)
   uint64 core_gen = 4;                // Segment composition generation (incremented only when segments change, not deletes)
   uint64 update_version = 5;          // Highest update version in this index (incremented on each update)
-  uint64 schema_gen = 6;              // Schema generation (incremented on each schema change)
+  uint64 schema_gen = 6;             // Schema generation (incremented on each schema change)
+  SchemaInfo schema = 7;             // Query schema and field history for this snapshot
+  string incarnation = 8;            // Collection UUID, changes on recreate
   repeated SegmentInfo segments = 15; // List of segments in this index
 
   // Auxiliary indexes built at index scope. Segment-local overlays live on
@@ -19,7 +27,7 @@ message IndexInfo {
   repeated AuxIndexInfo aux_indexes = 16;
 }
 
-// Authored schema and field introduction history stored in _schema_<generation>.
+// Authored schema and field introduction history embedded in the manifest.
 message SchemaInfo {
   bytes source_def = 1; // encoded luxir.SchemaDef
   map<string, uint64> introduced_gen = 2; // physical field name to introduction generation
@@ -32,9 +40,9 @@ message AuxIndexInfo {
   string kind = 1;             // e.g. "vector_faiss"
   string field = 2;            // empty if not field-scoped
   string name = 3;             // unique identifier; convention: "<kind_short>.<field>" (e.g. "vec.title_v")
-  uint64 gen = 4;              // index_gen this aux index was built at
+  uint64 gen = 4;              // Build generation, local to this aux index
   uint64 commit_time = 5;      // microseconds since epoch
-  repeated string files = 6;   // segment-style filenames that comprise this aux index
+  repeated FileDescriptor files = 6; // Immutable files owned by this aux index
   bytes opaque_meta = 7;       // kind-specific metadata blob
 
   // Index-level core_gen stamp. Segment overlays, including vector ANN
@@ -56,4 +64,5 @@ message SegmentInfo {
   // Segment-local auxiliary overlays. Vector ANN indexes are recorded here
   // with kind "vector_faiss"; validity is segment liveness, not core_gen.
   repeated AuxIndexInfo overlays = 9;
+  repeated FileDescriptor files = 10; // Segment data and current liveDocs
 }

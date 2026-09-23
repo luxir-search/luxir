@@ -802,6 +802,12 @@ message UpdateRequest {
   bool drop_unmapped = 12;
 }
 
+// A snapshot identity remains unique across collection deletion and recreation.
+message CommitId {
+  string incarnation = 1;
+  uint64 index_gen = 2;
+}
+
 // The response to an update request.  In streaming mode the server sends exactly one
 // response per request.
 message UpdateResponse {
@@ -852,6 +858,9 @@ message UpdateResponse {
   // Request-level failure (not tied to a single document), e.g. a failure in the commit
   // pipeline.  Set exactly when status == ERROR for a non-document failure.
   Error error = 6;
+
+  // Resulting snapshot identity; absent without a completed commit.
+  CommitId commit = 8;
 }
 
 
@@ -1056,7 +1065,7 @@ message StatsTotals {
 message CollectionStats {
   string name = 1;
   StatsTotals totals = 2;
-  string schema_gen = 3;  // sortable-string spelling (see SegmentStats); empty = no schema
+  uint64 schema_gen = 3; // Schema generation
   repeated ShardStats shards = 4;
 
   // Set for a collection that is not serving (failed to load, or a delete failed
@@ -1075,7 +1084,7 @@ message IndexStats {
   uint64 index_gen = 2;
   uint64 core_gen = 3;
   uint64 update_version = 4;
-  string schema_gen = 5;  // sortable-string spelling (see SegmentStats); empty = no schema
+  uint64 schema_gen = 5; // Schema generation
   uint64 active_merges = 6;
   repeated AuxStats aux_indexes = 7;
   QueryCacheStats query_cache = 8;
@@ -1086,8 +1095,8 @@ message IndexStats {
 // filesystem spelling so stats output correlates directly with directory
 // listings and logs: "seg" is the segment's data-file prefix (e.g. "s0a"),
 // while generations are the length-prefixed base36 sortable strings embedded
-// in filenames (e.g. live_gen "01" -> file "s0a__L01", schema_gen "02" ->
-// file "_schema_02").  Sortable strings order the same as the numbers they
+// in filenames (e.g. live_gen "01" -> file "s0a__L01").
+// Sortable strings order the same as the numbers they
 // encode, so lexicographic comparison remains valid.  Empty (omitted in JSON)
 // means none.  Generations that never appear on disk (index_gen, core_gen,
 // update_version) stay numeric.
@@ -1100,7 +1109,7 @@ message SegmentStats {
   int32 max_doc = 6;
   int32 live_docs = 7;
   int32 deleted_docs = 8;
-  string schema_gen = 9;
+  uint64 schema_gen = 9; // Schema generation
   bool committed = 10;
   bool merging = 11;
   uint32 merge_level = 12;

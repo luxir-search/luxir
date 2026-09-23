@@ -164,19 +164,33 @@ mean something there - `collections` only on the node total, `shards` only on
 node and collection totals.
 
 Totals also report on-disk `bytes`, where the index level counts the whole
-directory (manifest, schema files, in-flight files), so it can exceed the sum
+directory (manifest and in-flight files), so it can exceed the sum
 of segment bytes. With `?segments=true` each segment reports its own `bytes`
 (data + deletes + overlays) and each aux entry reports the bytes of its listed
 files.
 
 Ids and generations that appear in filenames use their filesystem spelling so
 the response correlates directly with a directory listing: each segment's
-`seg` is its data-file prefix (e.g. `s0a`), while `live_gen`, `schema_gen`,
-and aux `gen` are the sortable strings embedded in filenames (segment `s0a`
-with `live_gen` `01` has its deletes in `s0a__L01`; `schema_gen` `02` is the
-file `_schema_02`). These strings sort in generation order, and an absent
-field means none (no deletes file, no schema). Generations that never appear
-on disk (`index_gen`, `core_gen`, `update_version`) stay numeric.
+`seg` is its data-file prefix (e.g. `s0a`), while `live_gen` and aux `gen`
+are the sortable strings embedded in filenames (segment `s0a` with `live_gen`
+`01` has its deletes in `s0a__L01`). These strings sort in generation order,
+and an absent field means none. `schema_gen`, `index_gen`, `core_gen`, and
+`update_version` are numeric. The schema and its history are embedded in each `s.olux_<index_gen>` manifest.
+
+Filesystem publication syncs new data files and then the directory before
+writing a new `s.olux_<index_gen>` manifest with a length and xxh3 checksum
+footer. It syncs that manifest and then the directory before acknowledging
+the commit. Startup checks the newest manifest's footer and decodes its payload;
+it does not hash data files. Torn candidates are skipped. Fallback candidates
+also require their referenced files to be present with matching sizes.
+
+Once the new root is durable, obsolete manifests and data are removed.
+Removals are not directory-synced: a crash may restore obsolete names, but the
+newest durable manifest does not reference them. Failed publication candidates
+are removed and the directory is synced best-effort. An error response does not
+guarantee that the commit is absent: a crash or cleanup failure can leave a
+complete, unacknowledged candidate recoverable at startup. The local filename is not part
+of the commit identity: clients use `(incarnation, index_gen)`.
 
 Set log verbosity with:
 

@@ -8,6 +8,13 @@
 
 namespace luxir {
 
+std::shared_ptr<Schema> Schema::withHistory(uint64_t gen, const Schema* previous) const {
+  auto copy = std::make_shared<Schema>(*this);
+  copy->gen_ = gen;
+  copy->inheritIntroductions(previous);
+  return copy;
+}
+
 FieldSignatures Schema::signatures(bool includeTemplates) const {
   FieldSignatures result;
   for (const auto& [name, type] : fieldTypeMap) {
@@ -56,29 +63,23 @@ void Schema::inheritIntroductions(const Schema* previous) {
   }
 }
 
-std::string Schema::encodeStored() const {
+api::SchemaInfo Schema::storedInfo(std::pmr::memory_resource& arena) const {
   api::SchemaInfo info;
   info.source_def = std::as_bytes(std::span(sourceDef_.data(), sourceDef_.size()));
-  std::vector<std::pair<std::string_view, uint64_t>> introductions;
-  introductions.reserve(introducedGen.size());
-  for (const auto& [name, gen] : introducedGen) introductions.emplace_back(name, gen);
-  info.introduced_gen = api::map_view<std::string_view, uint64_t>(introductions);
-  std::vector<std::byte> bytes;
-  if (!api::encode(info, bytes)) throw std::runtime_error("Cannot serialize schema history");
-  return std::string((const char*)bytes.data(), bytes.size());
+  auto* introductions = api::build::allocArray(info.introduced_gen, introducedGen.size(), arena);
+  size_t i = 0;
+  for (const auto& [name, gen] : introducedGen) introductions[i++] = {name, gen};
+  return info;
 }
 
-std::shared_ptr<Schema> Schema::decodeStored(std::span<const std::byte> bytes) {
+std::shared_ptr<Schema> Schema::fromStored(const api::SchemaInfo& info, uint64_t gen) {
   std::pmr::monotonic_buffer_resource arena;
-  api::SchemaInfo info;
-  if (!api::decode(info, api::copyToPaddedInput(bytes, arena), arena) || info.source_def.empty()) {
-    throw std::runtime_error("Cannot decode schema history");
-  }
   api::SchemaDef def;
   if (!api::decode(def, api::copyToPaddedInput(info.source_def, arena), arena)) {
     throw std::runtime_error("Cannot decode stored schema definition");
   }
   auto schema = fromProto(def);
+  schema->gen_ = gen;
   for (const auto& [name, gen] : info.introduced_gen) schema->introducedGen.emplace(name, gen);
   return schema;
 }

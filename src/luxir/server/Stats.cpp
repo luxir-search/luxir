@@ -74,7 +74,7 @@ void fillIndexStats(api::IndexStats& dst, const IndexWriter::Stats& src,
   dst.index_gen = src.indexGen;
   dst.core_gen = src.coreGen;
   dst.update_version = src.updateVersion;
-  dst.schema_gen = sortableGen(src.schemaGen, resource);
+  dst.schema_gen = src.schemaGen;
   dst.active_merges = src.activeMerges;
 
   auto* aux = api::build::allocArray(dst.aux_indexes, src.auxIndexes.size(), resource);
@@ -95,7 +95,7 @@ void fillIndexStats(api::IndexStats& dst, const IndexWriter::Stats& src,
     out.max_doc = in.maxDoc;
     out.live_docs = in.liveDocs;
     out.deleted_docs = in.maxDoc - in.liveDocs;
-    out.schema_gen = sortableGen(in.schemaGen, resource);
+    out.schema_gen = in.schemaGen;
     out.committed = in.committed;
     out.merging = in.merging;
     out.merge_level = (uint32_t)in.mergeLevel;
@@ -132,7 +132,7 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     }
 
     auto schema = entry.collection->getSchema();
-    collectionStats.schema_gen = sortableGen(schema ? schema->gen_ : 0, resource);
+    collectionStats.schema_gen = schema ? schema->gen_ : 0;
 
     auto shard = entry.collection->getShard();
     assert(shard);

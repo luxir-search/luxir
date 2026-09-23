@@ -18,12 +18,7 @@
 
 namespace luxir {
 
-static constexpr std::string_view SCHEMA_PREFIX = "_schema_";
 static constexpr std::string_view DELETING_REASON = "being deleted";
-
-static std::string schemaFileName(uint64_t gen) {
-  return std::string(SCHEMA_PREFIX) + Postings::getSortableString(gen);
-}
 
 void LuxirNode::validateCollectionName(std::string_view name) {
   constexpr std::size_t kMaxCollectionNameBytes = 255;
@@ -52,142 +47,14 @@ void LuxirNode::validateCollectionName(std::string_view name) {
 
 std::shared_ptr<Schema> Collection::updateSchema(const luxir::api::SchemaDef& def,
                                                  luxir::api::SchemaRequest_::Mode mode) {
-  // One transaction per collection: read-current -> apply -> resolve ->
-  // persist -> swap.  Without the lock, two concurrent SETs could each build
-  // from the same base and the second swap would silently drop the first's
-  // fields (and their persistence passes would delete each other's files).
-  std::lock_guard lock(schemaMutex_);
-  std::shared_ptr<Schema> newSchema;
-  if (mode == luxir::api::SchemaRequest_::Mode::SET) {
-    auto current = getSchema();
-    newSchema = Schema::fromProto(def, current.get());
-  } else {
-    newSchema = Schema::fromProto(def);
-  }
-  setSchemaLocked(newSchema);
-  return newSchema;
+  return shard->iw->updateSchema([&](const Schema* current) {
+    return Schema::fromProto(def, mode == api::SchemaRequest_::Mode::SET ? current : nullptr);
+  });
 }
 
 void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
-  std::lock_guard lock(schemaMutex_);
-  setSchemaLocked(std::move(newSchema));
+  shard->iw->setSchema(std::move(newSchema));
 }
-
-void Collection::setSchemaLocked(std::shared_ptr<Schema> newSchema) {
-  newSchema->gen_ = schemaGen_.load();
-  auto previous = getSchema();
-  newSchema->inheritIntroductions(previous.get());
-  persistSchemaLocked(newSchema);
-  if (shard && shard->iw) shard->iw->setSchema(std::move(newSchema));
-}
-
-void Collection::persistSchemaLocked(std::shared_ptr<Schema> newSchema) {
-  uint64_t gen = schemaGen_++;
-  newSchema->gen_ = gen;
-
-  // Persist the schema source def to the Directory.  The durable file IS the
-  // publication point: once it is synced, restart would load this generation,
-  // so the in-memory swap below must happen (and the caller must see success)
-  // regardless of anything after the sync.  A failure BEFORE the sync removes
-  // the staged file so a partial write can never be selected at startup.
-  if (shard && shard->dir && !newSchema->sourceDef_.empty()) {
-    std::string stored = newSchema->encodeStored();
-    std::string fileName = schemaFileName(gen);
-    try {
-      auto file = shard->dir->createFile(fileName);
-      OutputStream out;
-      out.setFile(&*file);
-      out.write(stored.data(), stored.size());
-      out.close();
-      shard->dir->finishFile(*file);
-
-      std::vector<std::string> syncFiles = {fileName, "."};
-      shard->dir->sync(syncFiles);
-    } catch (...) {
-      try {
-        shard->dir->deleteFile(fileName);
-      } catch (...) {
-        LOG_WARN("failed to remove staged schema file {} after write failure", fileName);
-      }
-      throw;
-    }
-
-    // Publish for schema GET handlers. setSchemaLocked hands the same schema
-    // to the writer after persistence returns.
-    schema.store(std::move(newSchema));
-
-    // Best-effort cleanup of older generations: the new schema is already
-    // durable and published, so a cleanup failure must not fail the request
-    // (loadSchema always picks the highest generation anyway).
-    try {
-      std::vector<Directory::FileInfo> files;
-      shard->dir->listFiles(files);
-      for (const auto& f : files) {
-        if (f.name.starts_with(SCHEMA_PREFIX) && f.name != fileName) {
-          shard->dir->deleteFile(f.name);
-        }
-      }
-    } catch (const std::exception& e) {
-      LOG_WARN("failed to clean up old schema files: {}", e.what());
-    }
-    return;
-  }
-
-  schema.store(std::move(newSchema));
-}
-
-
-bool Collection::loadSchema() {
-  std::lock_guard lock(schemaMutex_);
-  if (!shard || !shard->dir) return false;
-
-  // Find the latest schema file by lexicographic order (sortable naming).
-  std::string lastSchemaFile;
-  std::vector<Directory::FileInfo> files;
-  shard->dir->listFiles(files);
-  for (const auto& f : files) {
-    if (f.name.starts_with(SCHEMA_PREFIX)) {
-      if (f.name > lastSchemaFile) lastSchemaFile = f.name;
-    }
-  }
-
-  while (!lastSchemaFile.empty()) {
-    auto file = shard->dir->openFile(lastSchemaFile, true);
-    if (file) {
-      InputStream is = file->getInputStream();
-      std::span<const char> bytes((const char*)is.ptr(), is.left());
-      std::shared_ptr<Schema> newSchema;
-      try {
-        newSchema = Schema::decodeStored(std::as_bytes(bytes));
-      } catch (const std::runtime_error& e) {
-        throw std::runtime_error("Failed to parse schema file: " + lastSchemaFile + ": " + e.what());
-      }
-
-      // Parse the gen back from the sortable filename suffix
-      auto genStr = std::string_view(lastSchemaFile).substr(SCHEMA_PREFIX.size());
-      uint64_t gen = Postings::parseSortableString(genStr);
-
-      newSchema->gen_ = gen;
-      schemaGen_ = gen + 1;  // next setSchema will use gen+1
-      schema.store(newSchema);
-      if (shard->iw) shard->iw->setSchema(std::move(newSchema));
-      return true;
-    }
-
-    // File was deleted by a concurrent setSchema - rescan for the latest.
-    lastSchemaFile.clear();
-    files.clear();
-    shard->dir->listFiles(files);
-    for (const auto& f : files) {
-      if (f.name.starts_with(SCHEMA_PREFIX)) {
-        if (f.name > lastSchemaFile) lastSchemaFile = f.name;
-      }
-    }
-  }
-
-  return false;
-}
-
 
 LuxirNode::LuxirNode(LuxirConfig config)
   : config(std::move(config)) {
@@ -208,11 +75,19 @@ std::shared_ptr<Collection> LuxirNode::getCollection(std::string_view name) {
   return getCollection(root.get(), name);
 }
 
+std::string Collection::getUnavailableReason() const {
+  if (!unavailableReason.empty()) return unavailableReason;
+  if (shard && shard->iw) {
+    if (auto failure = shard->iw->getFailureReason()) return *failure;
+  }
+  return {};
+}
+
 std::shared_ptr<Collection> LuxirNode::checkLoaded(std::shared_ptr<Collection> collection) {
-  if (collection && !collection->unavailableReason.empty()) {
-    throw CollectionUnavailableError(
-        "collection '" + collection->name + "' is unavailable: " +
-        collection->unavailableReason);
+  if (collection) {
+    auto reason = collection->getUnavailableReason();
+    if (!reason.empty()) throw CollectionUnavailableError(
+        "collection '" + collection->name + "' is unavailable: " + reason);
   }
   return collection;
 }
@@ -278,7 +153,7 @@ std::vector<LuxirNode::CollectionEntry> LuxirNode::collectionEntries() {
   using Pointer = SharedLazyMap<std::string, Collection>::Pointer;
   root->collections.dataMap.cvisit_all([&](const auto& elem) {
     if (auto* collection = std::get_if<Pointer>(&elem.second)) {
-      entries.push_back({elem.first, *collection, (*collection)->unavailableReason});
+      entries.push_back({elem.first, *collection, (*collection)->getUnavailableReason()});
     }
   });
   std::sort(entries.begin(), entries.end(),
@@ -301,11 +176,12 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
   auto collection = targetLibrary->collections.getOrCreate(collectionName, [&]() {
     createdHere = true;
     std::shared_ptr<Collection> created;
+    std::shared_ptr<Directory> directory;
     try {
-      created = initCollection(collectionName);
-      if (schema != nullptr) {
-        created->updateSchema(*schema, api::SchemaRequest_::Mode::SET);
-      }
+      auto initialSchema = Schema::createDefaultSchema();
+      if (schema) initialSchema = Schema::fromProto(*schema, initialSchema.get());
+      directory = dirFactory->create(collectionName, true);
+      created = initCollection(collectionName, std::move(initialSchema), directory);
       LOG_INFO("Created collection: {}", collectionName);
       return created;
     } catch (...) {
@@ -314,7 +190,7 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
         if (created && created->shard && created->shard->iw) {
           created->shard->iw->close();
         }
-        dirFactory->remove(collectionName);
+        if (directory) dirFactory->remove(collectionName);
       } catch (const std::exception& e) {
         auto tombstone = std::make_shared<Collection>();
         tombstone->name = collectionName;
@@ -394,21 +270,15 @@ void LuxirNode::deleteCollection(std::string_view name) {
   }
 }
 
-std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name) {
+std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema,
+                                                       std::shared_ptr<Directory> directory) {
   auto col = std::make_shared<Collection>();
   col->name = name;
   col->shard = std::make_shared<Shard>(*col);
-  col->shard->dir = dirFactory->create(name);
+  col->shard->dir = directory ? std::move(directory) : dirFactory->create(name);
 
-  // Set default schema initially (without persisting, gen=0 means not yet persisted)
-  auto defaultSchema = Schema::createDefaultSchema();
-  defaultSchema->gen_ = 0;
-  col->schema.store(std::move(defaultSchema));
-
-  // The writer must start with the persisted schema, including on reopen.
-  col->loadSchema();
   col->shard->iw = std::make_shared<IndexWriter>(*col->shard->dir,
-    col->getSchema(), &indexRamBudget,
+    std::move(initialSchema), &indexRamBudget,
     FilterCacheConfig{.maxBytes = config.queryCacheBytes}, config.index.merge_factor);
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;

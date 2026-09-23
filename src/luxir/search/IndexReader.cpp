@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "IndexReader.h"
+#include "luxir/store/Manifest.h"
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/StoredFieldsReader.h"
@@ -120,18 +121,30 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
 }
 
 
-IndexReader::IndexReader(std::shared_ptr<PhysicalCore> core, std::shared_ptr<Schema> schema,
-                         std::shared_ptr<FilterCache> filterCache)
-  : core(std::move(core)), sharedSchema(std::move(schema)),
+IndexReader::IndexReader(Snapshot snapshot, std::shared_ptr<FilterCache> filterCache)
+  : snapshotTime(snapshot.commitTime), snapshotGen(snapshot.indexGen),
+    core(std::move(snapshot.core)), sharedSchema(std::move(snapshot.schema)),
     sharedFilterCache(std::move(filterCache)) {}
 
 IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
-                         std::shared_ptr<FilterCache> filterCache, std::shared_ptr<Schema> schema)
-  : IndexReader(std::make_shared<PhysicalCore>(dir, previousReader ? previousReader->core.get() : nullptr),
-                std::move(schema), filterCache ? std::move(filterCache)
+                         std::shared_ptr<FilterCache> filterCache, std::shared_ptr<Schema> schema,
+                         std::shared_ptr<const std::vector<std::byte>> manifest)
+  : IndexReader(openSnapshot(dir, previousReader, std::move(schema), std::move(manifest)),
+                filterCache ? std::move(filterCache)
                     : (previousReader ? previousReader->sharedFilterCache : nullptr)) {}
 
-IndexReader::PhysicalCore::PhysicalCore(Directory& dir, const PhysicalCore* previous) {
+IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReader* previousReader,
+                                                std::shared_ptr<Schema> preferredSchema,
+                                                std::shared_ptr<const std::vector<std::byte>> manifest) {
+  auto core = std::make_shared<PhysicalCore>();
+  const auto* previous = previousReader ? previousReader->core.get() : nullptr;
+  auto& segs = core->segs;
+  auto& auxReadersList = core->auxReadersList;
+  auto& totalMaxDoc = core->totalMaxDoc;
+  auto& livedocs = core->livedocs;
+  uint64_t commitTimeUs = 0;
+  uint64_t indexGen = 0;
+  std::shared_ptr<Schema> schema;
   // because old segments could be merged away before we have a chance to read them, we need
   // to check if there is a new index info file and retry the open if so.
   // This could be optimized by saving the segments we did read properly in case they are still in the index.
@@ -170,25 +183,43 @@ IndexReader::PhysicalCore::PhysicalCore(Directory& dir, const PhysicalCore* prev
     std::pmr::monotonic_buffer_resource indexInfoArena;
     luxir::api::IndexInfo indexInfo;
 
-    // Don't use expectSynced here - IndexReader can race with a concurrent
-    // commit that has finished s.olux but not yet synced it.
-    std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
-    if (inputFile == nullptr) {
-      IREADER_DEBUG("No {} file, Empty IndexReader", Postings::INDEX_INFO_FILE);
-    }
-    else {
-      IREADER_DEBUG("Opening IndexReader");
-      InputStream segmentsIs = inputFile->getInputStream();
-
-      std::span<const char> indexInfoBytes(segmentsIs.ptr(), (size_t)segmentsIs.left());
-      auto padded = luxir::api::copyToPaddedInput(std::as_bytes(indexInfoBytes), indexInfoArena);
-      if (!luxir::api::decode(indexInfo, padded, indexInfoArena)) {
-        throw std::runtime_error("Failed to parse IndexInfo protobuf");
+    auto bytes = manifest ? manifest : Manifest::load(dir).bytes;
+    if (!bytes) {
+      schema = preferredSchema ? preferredSchema : Schema::createDefaultSchema();
+    } else {
+      indexInfo = Manifest::decode(bytes, indexInfoArena);
+      if (!indexInfo.schema || indexInfo.incarnation.empty()) {
+        throw std::runtime_error("Incomplete commit manifest");
       }
-
+      core->incarnation = indexInfo.incarnation;
+      if (previous && previous->incarnation != indexInfo.incarnation) {
+        previous = nullptr;
+        prevAuxByName.clear();
+        prevSegAuxByKey.clear();
+      }
+      if (preferredSchema && preferredSchema->gen_ == indexInfo.schema_gen) {
+        schema = preferredSchema;
+      } else if (previous && previousReader->schema()->gen_ == indexInfo.schema_gen) {
+        schema = previousReader->schema();
+      } else {
+        schema = Schema::fromStored(*indexInfo.schema, indexInfo.schema_gen);
+      }
+      indexGen = indexInfo.index_gen;
+      core->segmentFiles.clear();
+      core->auxFiles.clear();
+      for (const auto& segment : indexInfo.segments) {
+        auto& files = core->segmentFiles.emplace_back();
+        files.segId = segment.seg_id;
+        files.files = fromWire(segment.files);
+        for (const auto& overlay : segment.overlays) files.overlays.push_back(fromWire(overlay.files));
+      }
+      for (const auto& aux : indexInfo.aux_indexes) core->auxFiles.push_back(fromWire(aux.files));
+      if (previous && previous->segmentFiles == core->segmentFiles && previous->auxFiles == core->auxFiles) {
+        return {previousReader->core, std::move(schema), indexInfo.commit_time, indexGen};
+      }
       commitTimeUs = indexInfo.commit_time;
-      this->coreGeneration = indexInfo.core_gen;
-      bool missingFileOK = true; // Allow missing files on first attempt
+      core->coreGeneration = indexInfo.core_gen;
+      bool missingFileOK = !manifest; // Allow missing files on first attempt
       IREADER_DEBUG("\tOpening IndexReader, commitTime={} nSegs={} gen={}", indexInfo.commit_time,
                     indexInfo.segments.size(), indexInfo.index_gen);
       if (commitTimeUs == lastCommitTime) {
@@ -314,15 +345,16 @@ IndexReader::PhysicalCore::PhysicalCore(Directory& dir, const PhysicalCore* prev
   while (retry);
 
   // Check if we can share ordMaps from the previous reader
-  if (previous && previous->coreGeneration == this->coreGeneration) {
-    IREADER_DEBUG("Sharing ordMaps from previous IndexReader (coreGen={})", this->coreGeneration);
-    this->ordMaps = previous->ordMaps;
+  if (previous && previous->coreGeneration == core->coreGeneration) {
+    IREADER_DEBUG("Sharing ordMaps from previous IndexReader (coreGen={})", core->coreGeneration);
+    core->ordMaps = previous->ordMaps;
   } else {
-    IREADER_DEBUG("Creating new ordMaps cache (coreGen={})", this->coreGeneration);
-    this->ordMaps = std::make_shared<SharedLazyMap<std::string, OrdMap>>();
+    IREADER_DEBUG("Creating new ordMaps cache (coreGen={})", core->coreGeneration);
+    core->ordMaps = std::make_shared<SharedLazyMap<std::string, OrdMap>>();
   }
 
   IREADER_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), totalMaxDoc, commitTimeUs);
+  return {std::move(core), std::move(schema), commitTimeUs, indexGen};
 }
 
 

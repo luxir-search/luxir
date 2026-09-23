@@ -84,6 +84,7 @@ defaults and constraints are described in the comments and guides.
 - [`CollectionCacheControl`](#message-luxir.collectioncachecontrol)
 - [`CollectionStats`](#message-luxir.collectionstats)
 - [`Column`](#message-luxir.column)
+- [`CommitId`](#message-luxir.commitid)
 - [`CommitParams`](#message-luxir.commitparams)
 - [`ConstantScoreQuery`](#message-luxir.constantscorequery)
 - [`CreateCollectionRequest`](#message-luxir.createcollectionrequest)
@@ -481,7 +482,7 @@ Single-valued vector column. Each Vector slot is independently nullable via its 
 |---|---|---|---|---|
 | <a id="field-luxir.collectionstats.name"></a>[`name`](#field-luxir.collectionstats.name) | 1 | `string` | singular |  |
 | <a id="field-luxir.collectionstats.totals"></a>[`totals`](#field-luxir.collectionstats.totals) | 2 | [`StatsTotals`](#message-luxir.statstotals) | singular |  |
-| <a id="field-luxir.collectionstats.schema_gen"></a>[`schema_gen`](#field-luxir.collectionstats.schema_gen) | 3 | `string` | singular | sortable-string spelling (see SegmentStats); empty = no schema |
+| <a id="field-luxir.collectionstats.schema_gen"></a>[`schema_gen`](#field-luxir.collectionstats.schema_gen) | 3 | `uint64` | singular | Schema generation |
 | <a id="field-luxir.collectionstats.shards"></a>[`shards`](#field-luxir.collectionstats.shards) | 4 | [`ShardStats`](#message-luxir.shardstats) | repeated |  |
 | <a id="field-luxir.collectionstats.error"></a>[`error`](#field-luxir.collectionstats.error) | 5 | [`Error`](#message-luxir.error) | singular | Set for a collection that is not serving (failed to load, or a delete failed partway); kind is UNAVAILABLE and the message is the recorded reason. |
 
@@ -509,6 +510,19 @@ One slot per document, including missing values, aligned with DocList rows. Scal
 | <a id="field-luxir.column.multi_d"></a>[`multi_d`](#field-luxir.column.multi_d) | 8 | [`ArrArrDouble`](#message-luxir.arrarrdouble) | oneof [`kind`](#oneof-luxir.column.kind) |  |
 | <a id="field-luxir.column.col_vec"></a>[`col_vec`](#field-luxir.column.col_vec) | 16 | [`ColVector`](#message-luxir.colvector) | oneof [`kind`](#oneof-luxir.column.kind) | single-valued vector column: one Vector per doc; missing = unset oneof |
 | <a id="field-luxir.column.multi_vec"></a>[`multi_vec`](#field-luxir.column.multi_vec) | 17 | [`MultiVector`](#message-luxir.multivector) | oneof [`kind`](#oneof-luxir.column.kind) | multi-valued vector column: one ArrVector per doc; missing = empty list |
+
+<a id="message-luxir.commitid"></a>
+
+### luxir.CommitId
+
+A snapshot identity remains unique across collection deletion and recreation.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.commitid.incarnation"></a>[`incarnation`](#field-luxir.commitid.incarnation) | 1 | `string` | singular |  |
+| <a id="field-luxir.commitid.index_gen"></a>[`index_gen`](#field-luxir.commitid.index_gen) | 2 | `uint64` | singular |  |
 
 <a id="message-luxir.commitparams"></a>
 
@@ -897,7 +911,7 @@ Geographic distance query with a center in degrees and radius in meters. Matches
 | <a id="field-luxir.indexstats.index_gen"></a>[`index_gen`](#field-luxir.indexstats.index_gen) | 2 | `uint64` | singular |  |
 | <a id="field-luxir.indexstats.core_gen"></a>[`core_gen`](#field-luxir.indexstats.core_gen) | 3 | `uint64` | singular |  |
 | <a id="field-luxir.indexstats.update_version"></a>[`update_version`](#field-luxir.indexstats.update_version) | 4 | `uint64` | singular |  |
-| <a id="field-luxir.indexstats.schema_gen"></a>[`schema_gen`](#field-luxir.indexstats.schema_gen) | 5 | `string` | singular | sortable-string spelling (see SegmentStats); empty = no schema |
+| <a id="field-luxir.indexstats.schema_gen"></a>[`schema_gen`](#field-luxir.indexstats.schema_gen) | 5 | `uint64` | singular | Schema generation |
 | <a id="field-luxir.indexstats.active_merges"></a>[`active_merges`](#field-luxir.indexstats.active_merges) | 6 | `uint64` | singular |  |
 | <a id="field-luxir.indexstats.aux_indexes"></a>[`aux_indexes`](#field-luxir.indexstats.aux_indexes) | 7 | [`AuxStats`](#message-luxir.auxstats) | repeated |  |
 | <a id="field-luxir.indexstats.query_cache"></a>[`query_cache`](#field-luxir.indexstats.query_cache) | 8 | [`QueryCacheStats`](#message-luxir.querycachestats) | singular |  |
@@ -1282,7 +1296,7 @@ Top-level response to a Search request
 
 ### luxir.SegmentStats
 
-Ids and generations that appear in filenames are reported in their filesystem spelling so stats output correlates directly with directory listings and logs: "seg" is the segment's data-file prefix (e.g. "s0a"), while generations are the length-prefixed base36 sortable strings embedded in filenames (e.g. live\_gen "01" -&gt; file "s0a\_\_L01", schema\_gen "02" -&gt; file "\_schema\_02"). Sortable strings order the same as the numbers they encode, so lexicographic comparison remains valid. Empty (omitted in JSON) means none. Generations that never appear on disk (index\_gen, core\_gen, update\_version) stay numeric.
+Ids and generations that appear in filenames are reported in their filesystem spelling so stats output correlates directly with directory listings and logs: "seg" is the segment's data-file prefix (e.g. "s0a"), while generations are the length-prefixed base36 sortable strings embedded in filenames (e.g. live\_gen "01" -&gt; file "s0a\_\_L01"). Sortable strings order the same as the numbers they encode, so lexicographic comparison remains valid. Empty (omitted in JSON) means none. Generations that never appear on disk (index\_gen, core\_gen, update\_version) stay numeric.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1296,7 +1310,7 @@ Ids and generations that appear in filenames are reported in their filesystem sp
 | <a id="field-luxir.segmentstats.max_doc"></a>[`max_doc`](#field-luxir.segmentstats.max_doc) | 6 | `int32` | singular |  |
 | <a id="field-luxir.segmentstats.live_docs"></a>[`live_docs`](#field-luxir.segmentstats.live_docs) | 7 | `int32` | singular |  |
 | <a id="field-luxir.segmentstats.deleted_docs"></a>[`deleted_docs`](#field-luxir.segmentstats.deleted_docs) | 8 | `int32` | singular |  |
-| <a id="field-luxir.segmentstats.schema_gen"></a>[`schema_gen`](#field-luxir.segmentstats.schema_gen) | 9 | `string` | singular |  |
+| <a id="field-luxir.segmentstats.schema_gen"></a>[`schema_gen`](#field-luxir.segmentstats.schema_gen) | 9 | `uint64` | singular | Schema generation |
 | <a id="field-luxir.segmentstats.committed"></a>[`committed`](#field-luxir.segmentstats.committed) | 10 | `bool` | singular |  |
 | <a id="field-luxir.segmentstats.merging"></a>[`merging`](#field-luxir.segmentstats.merging) | 11 | `bool` | singular |  |
 | <a id="field-luxir.segmentstats.merge_level"></a>[`merge_level`](#field-luxir.segmentstats.merge_level) | 12 | `uint32` | singular |  |
@@ -1457,6 +1471,7 @@ The response to an update request. In streaming mode the server sends exactly on
 | <a id="field-luxir.updateresponse.errors"></a>[`errors`](#field-luxir.updateresponse.errors) | 5 | [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror) | repeated | Per-document failures. A failed document has no effect on search results; the previous version of the document, if any, is untouched. |
 | <a id="field-luxir.updateresponse.total_errors"></a>[`total_errors`](#field-luxir.updateresponse.total_errors) | 7 | `int64` | singular | Number of failed documents. Equals the length of errors unless the transport retained only a prefix (the NDJSON stream keeps the first 100 per group). |
 | <a id="field-luxir.updateresponse.error"></a>[`error`](#field-luxir.updateresponse.error) | 6 | [`Error`](#message-luxir.error) | singular | Request-level failure (not tied to a single document), e.g. a failure in the commit pipeline. Set exactly when status == ERROR for a non-document failure. |
+| <a id="field-luxir.updateresponse.commit"></a>[`commit`](#field-luxir.updateresponse.commit) | 8 | [`CommitId`](#message-luxir.commitid) | singular | Resulting snapshot identity; absent without a completed commit. |
 
 <a id="message-luxir.updateresponse.docerror"></a>
 

@@ -164,9 +164,12 @@ namespace UpdateResponse_ {
 struct DocError { std::string_view id; std::optional<Error> error; int32_t index = 0; };
 } // namespace UpdateResponse_
 
+struct CommitId { std::string_view incarnation; uint64_t index_gen = 0; };
+
 struct UpdateResponse {
   using Status = luxir::api::UpdateResponse_::Status;
   using DocError = luxir::api::UpdateResponse_::DocError;
+  std::optional<CommitId> commit;
   std::string_view request_id;
   uint64_t update_version = 0;
   std::span<const std::string_view> ids;
@@ -268,7 +271,7 @@ struct StatsTotals {
 struct SegmentStats {
   std::string_view seg;
   std::string_view live_gen;
-  std::string_view schema_gen;
+  uint64_t schema_gen = 0;
   uint64_t min_update_version = 0;
   uint64_t max_update_version = 0;
   uint64_t first_commit_time = 0;
@@ -287,7 +290,7 @@ struct IndexStats {
   uint64_t index_gen = 0;
   uint64_t core_gen = 0;
   uint64_t update_version = 0;
-  std::string_view schema_gen;
+  uint64_t schema_gen = 0;
   uint64_t active_merges = 0;
   std::span<const AuxStats> aux_indexes;
   QueryCacheStats query_cache;
@@ -300,7 +303,7 @@ struct ShardStats {
 struct CollectionStats {
   std::string_view name;
   StatsTotals totals;
-  std::string_view schema_gen;
+  uint64_t schema_gen = 0;
   std::span<const ShardStats> shards;
   std::optional<Error> error;
 };
@@ -634,7 +637,7 @@ LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionP
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
 LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult)
-LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
+LUXIR_TD(CommitId) LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
 LUXIR_TD(Val) LUXIR_TD(ArrVal) LUXIR_TD(ArrStr) LUXIR_TD(ArrInt) LUXIR_TD(ArrFloat)
 LUXIR_TD(ArrDouble) LUXIR_TD(ArrBin) LUXIR_TD(ArrArrStr) LUXIR_TD(ArrArrInt) LUXIR_TD(ArrArrFloat)
 LUXIR_TD(ArrArrDouble) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
@@ -675,7 +678,7 @@ LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)
 LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(DocList)
 LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
-LUXIR_ENTRY(UpdateResponse) LUXIR_ENTRY(Map)
+LUXIR_ENTRY(CommitId) LUXIR_ENTRY(UpdateResponse) LUXIR_ENTRY(Map)
 LUXIR_ENTRY(Val) LUXIR_ENTRY(ArrVal) LUXIR_ENTRY(ArrStr) LUXIR_ENTRY(ArrInt) LUXIR_ENTRY(ArrFloat)
 LUXIR_ENTRY(ArrDouble) LUXIR_ENTRY(ArrBin) LUXIR_ENTRY(ArrArrStr) LUXIR_ENTRY(ArrArrInt)
 LUXIR_ENTRY(ArrArrFloat) LUXIR_ENTRY(ArrArrDouble) LUXIR_ENTRY(Vector)

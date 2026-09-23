@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <memory_resource>
 #include <span>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <type_traits>
@@ -19,6 +20,12 @@
 #include "luxir/api/luxir_types.hpp"
 
 namespace luxir::api {
+
+struct FileDescriptor {
+  std::string_view name;
+  uint64_t size = 0;
+  uint64_t xxh3 = 0;
+};
 
 struct SchemaInfo {
   ::hpp_proto::bytes_view source_def;
@@ -31,7 +38,7 @@ struct AuxIndexInfo {
   std::string_view name;
   uint64_t gen = 0;
   uint64_t commit_time = 0;
-  std::span<const std::string_view> files;
+  std::span<const FileDescriptor> files;
   ::hpp_proto::bytes_view opaque_meta;
   uint64_t built_core_gen = 0;
 };
@@ -44,11 +51,14 @@ struct SegmentInfo {
   uint64_t commit_time = 0;
   uint64_t schema_gen = 0;
   std::span<const AuxIndexInfo> overlays;
+  std::span<const FileDescriptor> files;
   int32_t max_doc = 0;
   int32_t live_docs = 0;
 };
 
 struct IndexInfo {
+  std::optional<SchemaInfo> schema;
+  std::string_view incarnation;
   uint64_t version = 0;
   uint64_t commit_time = 0;
   uint64_t index_gen = 0;
@@ -61,7 +71,7 @@ struct IndexInfo {
 
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
 LUXIR_TD(IndexInfo) LUXIR_TD(SegmentInfo) LUXIR_TD(AuxIndexInfo)
-LUXIR_TD(SchemaInfo)
+LUXIR_TD(SchemaInfo) LUXIR_TD(FileDescriptor)
 #undef LUXIR_TD
 
 #define LUXIR_ENTRY(M)                                                                  \
@@ -73,7 +83,7 @@ LUXIR_TD(SchemaInfo)
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,         \
                   std::string *error = nullptr);
 LUXIR_ENTRY(IndexInfo) LUXIR_ENTRY(SegmentInfo) LUXIR_ENTRY(AuxIndexInfo)
-LUXIR_ENTRY(SchemaInfo)
+LUXIR_ENTRY(SchemaInfo) LUXIR_ENTRY(FileDescriptor)
 #undef LUXIR_ENTRY
 
 } // namespace luxir::api

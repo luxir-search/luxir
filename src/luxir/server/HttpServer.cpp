@@ -189,6 +189,7 @@ struct HttpStreamBatchResult {
   std::optional<ErrorInfo> error;
   luxir::api::UpdateResponse_::Status status = luxir::api::UpdateResponse_::Status::OK;
   std::uint64_t updateVersion = 0;
+  std::optional<CommitId> commit;
   std::size_t docCount = 0;
   std::size_t deleteCount = 0;
   std::size_t firstDocIndex = 0;
@@ -199,6 +200,7 @@ struct HttpStreamInterval {
   std::vector<std::string> ids;
   std::vector<HttpStreamAccumError> errors;
   std::uint64_t lastUpdateVersion = 0;
+  std::optional<CommitId> commit;
   std::size_t firstDocIndex = 0;
   std::size_t docCount = 0;
   std::size_t docsIndexed = 0;
@@ -598,6 +600,7 @@ private:
           auto* resp = finishResponse();
           result_.status = resp->status;
           result_.updateVersion = resp->update_version;
+          if (resp->commit) result_.commit = CommitId{std::string(resp->commit->incarnation), resp->commit->index_gen};
           if (resp->error) result_.error = luxir::api::build::errorInfo(*resp->error);
           result_.ids.reserve(resp->ids.size());
           for (std::string_view id : resp->ids) result_.ids.emplace_back(id);
@@ -1729,7 +1732,7 @@ private:
       return;
     }
 
-    // updateSchema persists (fsync) under the collection's schema lock, so run
+    // updateSchema persists (fsync) under the publication mutex, so run
     // it off the io thread like handleUpdate.
     auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin, mode, coll] {
@@ -2104,6 +2107,8 @@ private:
     luxir::api::UpdateResponse resp;
     resp.request_id = luxir::api::build::arenaStr(responseResource, requestId);
     resp.update_version = interval.lastUpdateVersion;
+    if (interval.commit) resp.commit = api::CommitId{
+        api::build::arenaStr(responseResource, interval.commit->incarnation), interval.commit->index_gen};
 
     luxir::api::build::SpanBuilder<std::string_view> ids(responseResource);
     ids.reserve(interval.ids.size());
@@ -2666,6 +2671,7 @@ private:
     assert(state != nullptr);
     auto& interval = state->interval;
     interval.lastUpdateVersion = result.updateVersion;
+    if (result.commit) interval.commit = result.commit;
 
     std::size_t indexedDocs = 0;
     if (result.status != luxir::api::UpdateResponse_::Status::ERROR) {
@@ -2778,17 +2784,18 @@ private:
     node_.getTaskArena().enqueue(
         [self = shared_from_this(), state, writers = std::move(writers), shardPin] {
           std::optional<ErrorInfo> err;
+          std::optional<CommitId> targetCommit;
           try {
             for (const auto& [name, writer] : writers) {
-              unused(name);
-              writer->commit();
+              auto commit = writer->commit();
+              if (name == state->defaultCollectionName) targetCommit = commit;
             }
           } catch (...) {
             err = currentExceptionInfo(ErrorKind::INTERNAL);
           }
 
           net::post(self->stream_.get_executor(),
-              [self, state, shardPin, err = std::move(err)]() mutable {
+              [self, state, shardPin, targetCommit, err = std::move(err)]() mutable {
                 if (self->streamUpdate_ != state || state->failed) return;
                 state->urlCommitInFlight = false;
                 if (err) {
@@ -2796,6 +2803,8 @@ private:
                   self->failStreamingUpdate(std::move(*err));
                   return;
                 }
+                state->interval.commit = targetCommit;
+                state->interval.submitted = true;
                 self->finishStreamingUpdate();
               });
         });

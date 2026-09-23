@@ -268,7 +268,7 @@ public:
 
   // returns true if anything was written.
   // If filenames is non-null, appends the names of files written (for fsync at commit time).
-  bool finish(std::vector<std::string>* filenames = nullptr) {
+  bool finish(std::vector<std::string>* filenames = nullptr, std::vector<FileDescriptor>* descriptors = nullptr) {
 
     if (fieldInfos.empty()) {
       return false;  // already called, or no data added.
@@ -308,6 +308,7 @@ public:
       sizeInBytes += dataFile.out.size();
       dataFile.out.close();
       directory.finishFile(*dataFile.file);
+      if (descriptors) descriptors->push_back(dataFile.file->descriptor());
       if (filenames) {
         filenames->emplace_back(dataFile.file->name());
       }

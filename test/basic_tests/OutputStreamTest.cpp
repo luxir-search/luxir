@@ -98,6 +98,7 @@ TEST_F(OutputStreamTest, randWrite) {
 
     ASSERT_EQ(pos-start, targetLen);
     dir.finishFile(*f);
+    EXPECT_EQ(f->digest(), XXH3_64bits(start, targetLen));
     auto input = dir.openFile("rdata");
     ASSERT_EQ(targetLen, input->size());
     auto data = input->read();

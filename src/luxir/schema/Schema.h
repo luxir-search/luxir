@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/api/luxir_index.hpp"
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <memory_resource>
@@ -67,7 +68,7 @@ public:
   std::map<std::string, uint64_t, std::less<>> introducedGen;
 
 private:
-  using logical_map = boost::unordered_flat_map<std::string, std::unique_ptr<LogicalField>,
+  using logical_map = boost::unordered_flat_map<std::string, std::shared_ptr<const LogicalField>,
                                                PackedTermHash, PackedTermEqual>;
   logical_map logicalFields;
   struct RootField {
@@ -80,6 +81,7 @@ private:
 
 public:
   Schema() = default;
+  std::shared_ptr<Schema> withHistory(uint64_t gen, const Schema* previous) const;
 
   // Ingest accepts logical document keys only. The returned primary handle
   // exposes the owner and its variants for the later ingest dispatcher.
@@ -91,8 +93,8 @@ public:
   FieldSignatures signatures(bool includeTemplates = false) const;
   void inheritIntroductions(const Schema* previous);
   uint64_t introduction(std::string_view physicalName) const;
-  std::string encodeStored() const;
-  static std::shared_ptr<Schema> decodeStored(std::span<const std::byte> bytes);
+  api::SchemaInfo storedInfo(std::pmr::memory_resource& arena) const;
+  static std::shared_ptr<Schema> fromStored(const api::SchemaInfo& info, uint64_t gen);
 
   // Physical lookup includes suffix-template prototypes, never bindings or
   // __self aliases. Copy a shared_ptr before the Schema's lifetime ends.

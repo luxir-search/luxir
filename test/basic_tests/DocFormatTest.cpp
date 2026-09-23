@@ -583,11 +583,14 @@ TEST_F(FieldVariantsProjectionTest, retrievableCatalogUsesSchemaIdentityAndPrima
   author.type = api::FieldDef::FieldClass::TEXT;
   author.stored = false;
   auto other = b.build(schema.get());
-  other->gen_ = schema->gen_;  // identity must distinguish equal generations
+  other->gen_ = schema->gen_;  // publication must assign a fresh generation to a copy
   helper.getIndexWriter()->setSchema(other);
   auto replacement = helper.getIndexWriter()->getIndexReader(UINT64_MAX);
   EXPECT_EQ(schema, reader->schema());
-  EXPECT_EQ(other, replacement->schema());
+  EXPECT_EQ(helper.collection().getSchema(), replacement->schema());
+  EXPECT_NE(other, replacement->schema());
+  EXPECT_EQ(schema->gen_, other->gen_);
+  EXPECT_GT(replacement->schema()->gen_, schema->gen_);
   auto changed = replacement->retrievableFields();
   EXPECT_NE(catalog.data(), changed.data());
   EXPECT_EQ(changed.data(), replacement->retrievableFields().data());
@@ -687,7 +690,7 @@ TEST_F(DocFormatTest, discoveryRequiresConfiguredStoreOrPrimaryColumnFallback) {
   EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "a", "string", "Value", "string__self", "Value"));
 }
 
-TEST_F(DocFormatTest, schemaChangeUpdatesSearchAndProjectionWithoutCommit) {
+TEST_F(DocFormatTest, schemaOnlyPublicationUpdatesSearchAndProjection) {
   CollectionHelper ch;
   SchemaBuilder b;
   auto& title = b.field("title");
@@ -720,7 +723,7 @@ TEST_F(DocFormatTest, schemaChangeUpdatesSearchAndProjectionWithoutCommit) {
   EXPECT_EQ(schema, resolved->schema);
   EXPECT_EQ(resolved->reader->schema(), resolved->schema);
   EXPECT_NE(nullptr, resolved->schema->getFieldTypePtr("added__words"));
-  EXPECT_EQ(reader->commitTime(), resolved->reader->commitTime());
+  EXPECT_LT(reader->commitTime(), resolved->reader->commitTime());
 
   auto checkProjection = [&] {
     for (auto fields : {std::initializer_list<std::string>{}, {"*"}, {"id", "year*"}}) {

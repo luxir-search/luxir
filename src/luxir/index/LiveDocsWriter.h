@@ -21,7 +21,7 @@ public:
   /// @param maxDoc Maximum document ID (total documents in segment)
   /// @param numLiveDocs Number of live documents (bits set in liveBits)
   static bool writeLiveDocs(Directory& dir, uint64_t segId, uint64_t liveGen,
-                                   const screaming::FixedBitSet& liveBits, int32_t maxDoc, int32_t numLiveDocs) {
+                                   const screaming::FixedBitSet& liveBits, int32_t maxDoc, int32_t numLiveDocs, std::vector<FileDescriptor>* descriptors = nullptr) {
     assert(liveGen > 0 && numLiveDocs >= 0 && numLiveDocs <= maxDoc);
     if (liveGen == 0) {
       return false; // liveGen must be > 0
@@ -49,6 +49,7 @@ public:
     out.close();
 
     dir.finishFile(*deleteFile);
+    if (descriptors) descriptors->push_back(deleteFile->descriptor());
 
     return true;
   }
@@ -56,10 +57,10 @@ public:
   // Overload that also appends the written filename for fsync at commit time.
   static bool writeLiveDocs(Directory& dir, uint64_t segId, uint64_t liveGen,
                             const screaming::FixedBitSet& liveBits, int32_t maxDoc, int32_t numLiveDocs,
-                            std::vector<std::string>& filenames) {
+                            std::vector<std::string>& filenames, std::vector<FileDescriptor>* descriptors = nullptr) {
     std::string segStr = Postings::getSortableString(segId);
     std::string deleteFileName = Postings::getLiveDocsFileName(segStr, liveGen);
-    bool ok = writeLiveDocs(dir, segId, liveGen, liveBits, maxDoc, numLiveDocs);
+    bool ok = writeLiveDocs(dir, segId, liveGen, liveBits, maxDoc, numLiveDocs, descriptors);
     if (ok) {
       filenames.push_back(std::move(deleteFileName));
     }

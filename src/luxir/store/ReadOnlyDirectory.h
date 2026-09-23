@@ -84,7 +84,8 @@ public:
   explicit ReadOnlyDirFactory(std::unique_ptr<DirectoryFactory> delegate)
       : delegate_(std::move(delegate)) {}
 
-  std::shared_ptr<Directory> create(std::string_view collectionName) override {
+  std::shared_ptr<Directory> create(std::string_view collectionName, bool exclusive = false) override {
+    if (exclusive) throw ReadOnlyError("cannot create a collection in read-only storage");
     // Backends materialize storage for an unknown collection on create() (and
     // are entitled to), so refuse before delegating rather than after.  For one
     // that already exists, create() only opens what is there.

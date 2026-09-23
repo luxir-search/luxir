@@ -459,6 +459,7 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
       segments_.front().segId, auxName, overlayGen_, 0);
   outFilesToSync.push_back(faissFile);
 
+  FileDescriptor descriptor;
   {
     auto file = dir_.createFile(faissFile);
     OutputStream os;
@@ -502,6 +503,7 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
     os.write(&footer, sizeof(footer));
     os.close();
     dir_.finishFile(*file);
+    descriptor = file->descriptor();
   }
 
   AuxInfo info;
@@ -509,7 +511,7 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
   info.field = std::string(fieldName);
   info.name = std::move(auxName);
   info.gen = overlayGen_;
-  info.files.push_back(faissFile);
+  info.files.push_back(std::move(descriptor));
   {
     std::string meta = makeVectorMeta(
         dims, ft, VectorAuxMeta::ENGINE_IVFPQ, nlist, nprobe, pqM, pqBits);

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include "test/DurableIndexInfo.h"
 
 #include <algorithm>
 #include <array>
@@ -145,6 +146,7 @@ void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
 
   writer.releaseInverter(inverter, true);
   writer.commit();
+  test::expectValidInventory(directory, *test::readDurableIndexInfo(directory));
   auto reader = writer.getIndexReader();
   ASSERT_EQ(1u, reader->segments().size());
   Segment& segment = reader->segments()[0];
@@ -363,7 +365,16 @@ TEST(CompoundFileTest, RelocationPreservesSparseFilenumAndTailSlack) {
   streams[2]->flush();
 
   for (auto& stream : streams) stream.reset();
-  writer.finish();
+  std::vector<FileDescriptor> descriptors;
+  writer.finish(nullptr, &descriptors);
+  ASSERT_EQ(2u, descriptors.size());
+  for (const auto& descriptor : descriptors) {
+    auto file = directory.openFile(descriptor.name);
+    ASSERT_NE(nullptr, file);
+    auto bytes = file->read();
+    EXPECT_EQ(descriptor.size, bytes.size());
+    EXPECT_EQ(descriptor.xxh3, XXH3_64bits(bytes.data(), bytes.size()));
+  }
 
   std::string seg = Postings::getSortableString(17);
   std::vector<Directory::FileInfo> files;
@@ -589,6 +600,7 @@ TEST(CompoundFileTest, PartitionRowsMaterializeDelegatingFiles) {
 
   writer.mergeSegments();
   writer.commit();
+  test::expectValidInventory(directory, *test::readDurableIndexInfo(directory));
   auto reader = writer.getIndexReader();
   ASSERT_EQ(1u, reader->segments().size());
   PostingsReader& postings = reader->segments()[0].postingsReader();

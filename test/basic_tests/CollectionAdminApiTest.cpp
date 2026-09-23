@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/store/Manifest.h"
 #include <atomic>
 #include <chrono>
 #include <filesystem>
@@ -313,8 +314,11 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
     CollectionHelper helper(node, "admin_corrupt");
     ASSERT_TRUE(helper.index(flatdoc("id", "corrupt"), UpdateMessage::COMMIT).success);
   }
+  for (const auto& file : std::filesystem::directory_iterator(data.path() / "c" / "admin_corrupt")) {
+    if (Manifest::generationOf(file.path().filename().string())) std::filesystem::remove(file.path());
+  }
   std::ofstream(data.path() / "c" / "admin_corrupt" /
-                std::string(Postings::INDEX_INFO_FILE),
+                Manifest::name(1),
                 std::ios::binary | std::ios::trunc)
       << "\xff\xff\xff\xff\xff\xff\xff\xff";
 
@@ -322,6 +326,107 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
   EXPECT_THROW(node.getCollection("admin_corrupt"), CollectionUnavailableError);
   EXPECT_NO_THROW(node.deleteCollection("admin_corrupt"));
   EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "admin_corrupt"));
+}
+
+} // namespace luxir::test
+
+namespace luxir::test {
+
+TEST_F(CollectionAdminApiTest, manifestsOwnSchemaAndIncarnation) {
+  for (bool disk : {false, true}) {
+    CollectionAdminDataDir data("luxir_manifest");
+    auto config = disk ? fsConfig(data) : LuxirConfig{};
+    if (!disk) config.store.backend = "ram";
+    std::string incarnation;
+    uint64_t schemaGen = 0;
+    {
+      LuxirNode node(config);
+      CollectionHelper helper(node);
+      auto writer = helper.getIndexWriter();
+      auto initial = readDurableIndexInfo(writer->dir);
+      ASSERT_TRUE(initial->schema);
+      EXPECT_TRUE(initial->segments.empty());
+      EXPECT_TRUE(manifestFiles(*initial).empty());
+      EXPECT_GT(initial->index_gen, 0u);
+      incarnation = initial->incarnation;
+      EXPECT_EQ(36u, incarnation.size());
+
+      ASSERT_TRUE(helper.index(flatdoc("id", "published"), UpdateMessage::COMMIT).success);
+      auto old = writer->getIndexReader();
+      auto physical = readDurableIndexInfo(writer->dir);
+      auto cachePublications = writer->getFilterCache()->readerPublicationsForTest();
+      ASSERT_TRUE(helper.index(flatdoc("id", "buffered")).success);
+      auto schema = Schema::createDefaultSchema();
+      helper.collection().setSchema(schema);
+      schemaGen = helper.collection().getSchema()->gen_;
+      auto changed = readDurableIndexInfo(writer->dir);
+      EXPECT_GT(changed->index_gen, physical->index_gen);
+      EXPECT_EQ(physical->update_version, changed->update_version);
+      EXPECT_EQ(physical->core_gen, changed->core_gen);
+      EXPECT_EQ(fileInventory(*physical), fileInventory(*changed));
+      auto current = writer->getIndexReader(UINT64_MAX);
+      EXPECT_EQ(1, current->liveDocs());
+      EXPECT_EQ(old->segments().data(), current->segments().data());
+      EXPECT_EQ(cachePublications, writer->getFilterCache()->readerPublicationsForTest());
+      EXPECT_EQ(helper.collection().getSchema(), current->schema());
+      EXPECT_EQ(0u, schema->gen_);
+      EXPECT_NE(schema, old->schema());
+      EXPECT_EQ(changed->index_gen, current->commitId());
+      std::vector<Directory::FileInfo> files;
+      writer->dir.listFiles(files);
+      for (const auto& file : files) EXPECT_FALSE(file.name.starts_with("_schema_"));
+    }
+    {
+      LuxirNode reopened(config);
+      CollectionHelper helper(reopened);
+      auto manifest = readDurableIndexInfo(helper.getIndexWriter()->dir);
+      if (disk) {
+        EXPECT_EQ(incarnation, manifest->incarnation);
+        EXPECT_EQ(schemaGen, helper.collection().getSchema()->gen_);
+        EXPECT_EQ(1, helper.getIndexWriter()->getIndexReader()->liveDocs());
+      } else {
+        EXPECT_NE(incarnation, manifest->incarnation);
+      }
+      auto previous = std::string(manifest->incarnation);
+      reopened.deleteCollection("main");
+      reopened.createCollection(nullptr, "main");
+      auto recreated = readDurableIndexInfo(*reopened.getCollection("main")->getShard()->getDirectory());
+      EXPECT_NE(previous, recreated->incarnation);
+      EXPECT_TRUE(recreated->segments.empty());
+    }
+  }
+}
+
+TEST_F(CollectionAdminApiTest, initialSchemaPublishesOneManifest) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  LuxirNode node(config);
+  api::SchemaDef schema;
+  std::pmr::monotonic_buffer_resource arena;
+  ASSERT_TRUE(api::read_json(schema, R"({"fields":{"title":{"type":"string"}}})", arena));
+  auto collection = node.createCollection(nullptr, "initial_schema", &schema);
+  auto manifest = readDurableIndexInfo(*collection->getShard()->getDirectory());
+  EXPECT_EQ(1u, manifest->index_gen);
+  EXPECT_EQ(1u, manifest->schema_gen);
+  EXPECT_TRUE(manifest->segments.empty());
+  EXPECT_NE(nullptr, collection->getSchema()->getFieldTypePtr("title"));
+  EXPECT_NE(nullptr, collection->getSchema()->getFieldTypePtr("id"));
+}
+
+} // namespace luxir::test
+
+namespace luxir::test {
+TEST_F(CollectionAdminApiTest, createPreservesUnregisteredStorage) {
+  CollectionAdminDataDir data("luxir_collection_admin_existing");
+  LuxirNode node(fsConfig(data));
+  FSDirectory existing(data.path() / "c" / "unregistered");
+  std::string incarnation;
+  {
+    IndexWriter writer(existing);
+    incarnation = test::readDurableIndexInfo(existing)->incarnation;
+  }
+  EXPECT_THROW(node.createCollection(nullptr, "unregistered"), std::filesystem::filesystem_error);
+  EXPECT_EQ(incarnation, test::readDurableIndexInfo(existing)->incarnation);
 }
 
 } // namespace luxir::test

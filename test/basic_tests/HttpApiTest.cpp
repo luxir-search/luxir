@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/store/Manifest.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -118,6 +119,21 @@ protected:
       if (auto* s = id.get_if<std::string>()) out.push_back(*s);
     }
     return out;
+  }
+
+  static void expectResponsesDifferOnlyByIncarnation(std::string_view first, std::string_view second) {
+    std::pmr::monotonic_buffer_resource arena;
+    api::UpdateResponse a, b;
+    ASSERT_TRUE(api::read_json(a, first, arena));
+    ASSERT_TRUE(api::read_json(b, second, arena));
+    ASSERT_TRUE(a.commit);
+    ASSERT_TRUE(b.commit);
+    EXPECT_NE(a.commit->incarnation, b.commit->incarnation);
+    a.commit->incarnation = b.commit->incarnation = {};
+    std::string normalizedA, normalizedB;
+    ASSERT_TRUE(api::write_json(a, normalizedA));
+    ASSERT_TRUE(api::write_json(b, normalizedB));
+    EXPECT_EQ(normalizedA, normalizedB);
   }
 
   static std::optional<int64_t> updateVersionInLine(const std::string& line) {
@@ -930,9 +946,9 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
     localServer.shutdown();
   }
 
-  {
-    std::ofstream out(base / "c" / "bad" / std::string(Postings::INDEX_INFO_FILE),
-                      std::ios::binary | std::ios::trunc);
+  for (const auto& file : std::filesystem::directory_iterator(base / "c" / "bad")) {
+    if (!Manifest::generationOf(file.path().filename().string())) continue;
+    std::ofstream out(file.path(), std::ios::binary | std::ios::trunc);
     out << "\xff\xff\xff\xff\xff\xff\xff\xff";
   }
 
@@ -1408,8 +1424,8 @@ TEST_F(HttpApiTest, ndjsonPipelinedMatchesSerialIncludingOverwrites) {
 
   EXPECT_EQ((int64_t)128, serial.plainCount);
   EXPECT_EQ(serial.plainCount, pipelined.plainCount);
-  EXPECT_EQ(serial.plainResponse, pipelined.plainResponse);
-  EXPECT_EQ(serial.overwriteResponse, pipelined.overwriteResponse);
+  expectResponsesDifferOnlyByIncarnation(serial.plainResponse, pipelined.plainResponse);
+  expectResponsesDifferOnlyByIncarnation(serial.overwriteResponse, pipelined.overwriteResponse);
   EXPECT_EQ(serial.overwriteDocs, pipelined.overwriteDocs);
   ASSERT_EQ((std::size_t)12, pipelined.overwriteDocs.size());
   for (int id = 0; id < 12; id++) {
@@ -1502,7 +1518,7 @@ TEST_F(HttpApiTest, ndjsonHeaderNoopPreservesSingleBatchAndPipelineParity) {
   ASSERT_TRUE(serial.updateVersion.has_value()) << serial.response;
   EXPECT_EQ((int64_t)1, *serial.updateVersion) << serial.response;
   EXPECT_EQ((int64_t)2, serial.found);
-  EXPECT_EQ(serial.response, pipelined.response);
+  expectResponsesDifferOnlyByIncarnation(serial.response, pipelined.response);
   EXPECT_EQ(serial.updateVersion, pipelined.updateVersion);
   EXPECT_EQ(serial.found, pipelined.found);
 }
@@ -2058,7 +2074,11 @@ TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
   localServer.shutdown();
 
   ASSERT_EQ(200, update.result_int()) << update.body();
-  EXPECT_EQ(1u, splitLines(update.body()).size()) << update.body();
+  EXPECT_EQ(2u, splitLines(update.body()).size()) << update.body();
+  auto lines = splitLines(update.body());
+  glz::generic_i64 eof;
+  ASSERT_FALSE(glz::read_json(eof, lines.back()));
+  EXPECT_EQ((uint64_t)eof["commit"]["index_gen"].get<int64_t>(), writer->getIndexReader()->commitId());
   EXPECT_GT(writer->getIndexReader()->commitTime(), before);
 }
 
@@ -3995,6 +4015,30 @@ TEST_F(HttpApiTest, explainResolvedManyVariantTargetsStayInTheBody) {
   std::string encodedNotes;
   ASSERT_FALSE(glz::write_json(envelope["resolved_fields"], encodedNotes));
   EXPECT_GT(encodedNotes.size(), 8192u);
+}
+
+TEST_F(HttpApiTest, commitResponseIdentifiesSnapshot) {
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"snapshot"}],"commit":{}})");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  glz::generic_i64 body;
+  ASSERT_FALSE(glz::read_json(body, response.body()));
+  auto commit = body["commit"]["index_gen"].get<int64_t>();
+  auto snapshot = readDurableIndexInfo(helper.getIndexWriter()->dir);
+  EXPECT_EQ((uint64_t)commit, snapshot->index_gen);
+  EXPECT_EQ(body["commit"]["incarnation"].get<std::string>(), snapshot->incarnation);
+  EXPECT_EQ((uint64_t)commit, helper.getIndexWriter()->getIndexReader()->commitId());
+  auto streamed = httpRequest(port(), http::verb::post,
+      "/collections/main/_update?commit=true", "{\"id\":\"streamed\"}\n",
+      "application/x-ndjson");
+  ASSERT_EQ(200, streamed.result_int()) << streamed.body();
+  glz::generic_i64 eof;
+  auto lines = splitLines(streamed.body());
+  ASSERT_FALSE(lines.empty());
+  ASSERT_FALSE(glz::read_json(eof, lines.back())) << streamed.body();
+  EXPECT_GT(eof["commit"]["index_gen"].get<int64_t>(), commit);
+  EXPECT_EQ((uint64_t)eof["commit"]["index_gen"].get<int64_t>(),
+            readDurableIndexInfo(helper.getIndexWriter()->dir)->index_gen);
 }
 
 } // namespace luxir::test

@@ -18,8 +18,9 @@
 
 #include <hpp_proto/field_types.hpp>  // bytes_view
 
+#include "luxir/store/OutputStream.h"
 #include "luxir/api/build.h"
-#include "luxir/api/luxir_index.hpp"
+#include "luxir/api/index_files.h"
 
 namespace luxir {
 
@@ -29,7 +30,7 @@ struct AuxInfo {
   std::string name;
   std::uint64_t gen = 0;
   std::uint64_t commit_time = 0;
-  std::vector<std::string> files;
+  std::vector<FileDescriptor> files;
   std::vector<std::byte> opaque_meta;  // raw bytes
   std::uint64_t built_core_gen = 0;
 };
@@ -42,10 +43,7 @@ inline AuxInfo fromWire(const luxir::api::AuxIndexInfo& w) {
   a.name = std::string(w.name);
   a.gen = w.gen;
   a.commit_time = w.commit_time;
-  a.files.reserve(w.files.size());
-  for (auto f : w.files) {
-    a.files.emplace_back(f);
-  }
+  a.files = fromWire(w.files);
   a.opaque_meta.assign(w.opaque_meta.data(), w.opaque_meta.data() + w.opaque_meta.size());
   a.built_core_gen = w.built_core_gen;
   return a;
@@ -61,10 +59,7 @@ inline luxir::api::AuxIndexInfo toWire(const AuxInfo& a, std::pmr::memory_resour
   w.name = a.name;
   w.gen = a.gen;
   w.commit_time = a.commit_time;
-  std::string_view* files = luxir::api::build::allocArray(w.files, a.files.size(), mr);
-  for (std::size_t i = 0; i < a.files.size(); i++) {
-    files[i] = a.files[i];
-  }
+  w.files = toWire(a.files, mr);
   w.opaque_meta = ::hpp_proto::bytes_view(a.opaque_meta.data(), a.opaque_meta.size());
   w.built_core_gen = a.built_core_gen;
   return w;

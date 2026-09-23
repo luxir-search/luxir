@@ -4,6 +4,7 @@
 #pragma once
 
 #include <stdexcept>
+#include <xxhash.h>
 
 #include "InputStream.h"
 
@@ -65,6 +66,13 @@ public:
   using std::runtime_error::runtime_error;
 };
 
+struct FileDescriptor {
+  std::string name;
+  uint64_t size = 0;
+  uint64_t xxh3 = 0;
+  bool operator==(const FileDescriptor&) const = default;
+};
+
 class File {
   friend class OutputStream;
 
@@ -92,6 +100,9 @@ public:
   const std::string& name() { return name_; }
 
   virtual size_t size() = 0;
+  // Valid after close and Directory::finishFile.
+  virtual uint64_t digest() const = 0;
+  FileDescriptor descriptor() { return {name_, size(), digest()}; }
 
   /// Appends the input RAMFile by stealing its buffers. OutputStream::appendFile
   /// is the normal entry point because it also repairs the attached stream.
@@ -398,6 +409,18 @@ public:
   /// only valid after flush or close
   size_t size() override {
     return fileSize;
+  }
+
+  uint64_t digest() const override {
+    auto* state = XXH3_createState();
+    if (!state) throw std::bad_alloc();
+    XXH3_64bits_reset(state);
+    for (const auto& buffer : buffers) {
+      XXH3_64bits_update(state, buffer.data.get(), buffer.used);
+    }
+    auto result = XXH3_64bits_digest(state);
+    XXH3_freeState(state);
+    return result;
   }
 
   size_t allocatedBytes() const noexcept { return allocatedSize; }

@@ -22,6 +22,7 @@
 #include <luxir/server/ProtoUpdateMessage.h>
 
 #include "luxir/index/IndexWriter.h"
+#include "luxir/store/CheckedDirFactory.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/IndexReader.h"
@@ -2497,4 +2498,561 @@ TEST_F(IndexWriterTest, testCoreGen) {
     }
   }
   EXPECT_EQ(mergedSegmentCount, 1);
+}
+
+TEST_F(IndexWriterTest, manifestInventorySurvivesReopenAndMerge) {
+  for (bool disk : {false, true}) {
+    auto path = std::filesystem::temp_directory_path() / "luxir-manifest-inventory";
+    std::filesystem::remove_all(path);
+    auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+    std::unique_ptr<Directory> dir = disk
+        ? std::unique_ptr<Directory>(std::make_unique<FSDirectory>(path))
+        : std::unique_ptr<Directory>(std::make_unique<RAMDir>());
+    auto verify = [&] {
+      auto manifest = test::readDurableIndexInfo(*dir);
+      test::expectValidInventory(*dir, *manifest);
+      return test::fileInventory(*manifest);
+    };
+    std::map<std::string, std::pair<uint64_t, uint64_t>> before;
+    {
+      IndexWriter writer(*dir);
+      addDoc(writer);
+      writer.commit();
+      addDoc(writer);
+      writer.commit();
+      before = verify();
+      EXPECT_FALSE(before.empty());
+      writer.close();
+    }
+    {
+      IndexWriter reopened(*dir);
+      reopened.commit();
+      EXPECT_EQ(before, verify());
+      reopened.mergeSegments();
+      verify();
+      for (const auto& [name, descriptor] : before) EXPECT_EQ(nullptr, dir->openFile(name));
+      std::vector<Directory::FileInfo> files;
+      dir->listFiles(files);
+      EXPECT_EQ(1, std::ranges::count_if(files, [](const auto& f) { return Manifest::generationOf(f.name) != 0; }));
+      EXPECT_EQ(reopened.getIndexReader()->liveDocs(), 2);
+      reopened.close();
+    }
+  }
+}
+
+TEST_F(IndexWriterTest, responsesIdentifyTheirPublishedSnapshot) {
+  test::CollectionHelper helper("commit_ids");
+  auto writer = helper.getIndexWriter();
+  auto before = test::readDurableIndexInfo(writer->dir);
+  auto buffered = helper.index(test::flatdoc("id", "a"));
+  ASSERT_TRUE(buffered.success);
+  EXPECT_FALSE(buffered.commit);
+  auto committed = helper.index(test::flatdoc("id", "b"), UpdateMessage::COMMIT);
+  ASSERT_TRUE(committed.success);
+  ASSERT_TRUE(committed.commit);
+  EXPECT_GT(committed.commit->index_gen, before->index_gen);
+  EXPECT_EQ(committed.commit->index_gen, test::readDurableIndexInfo(writer->dir)->index_gen);
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "c"), UpdateMessage::COMMIT).success);
+  test::CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  auto merged = helper.submit(merge);
+  ASSERT_TRUE(merged.success);
+  ASSERT_TRUE(merged.commit);
+  auto snapshot = test::readDurableIndexInfo(writer->dir);
+  EXPECT_EQ(merged.commit->index_gen, snapshot->index_gen);
+  EXPECT_EQ(merged.commit->incarnation, snapshot->incarnation);
+  EXPECT_EQ(1u, snapshot->segments.size());
+  test::expectValidInventory(writer->dir, *snapshot);
+  auto finalCommit = writer->commit();
+  EXPECT_EQ(finalCommit->index_gen, test::readDurableIndexInfo(writer->dir)->index_gen);
+}
+
+TEST_F(IndexWriterTest, failedSchemaChangeLeavesPublicationUntouched) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  auto before = test::readDurableIndexInfo(dir);
+  auto schema = writer.getSchema();
+  EXPECT_THROW(writer.updateSchema([](const Schema*) -> std::shared_ptr<Schema> {
+    throw SchemaError("invalid schema");
+  }), SchemaError);
+  auto after = test::readDurableIndexInfo(dir);
+  EXPECT_EQ(before->index_gen, after->index_gen);
+  EXPECT_EQ(before->schema_gen, after->schema_gen);
+  EXPECT_EQ(before->commit_time, after->commit_time);
+  EXPECT_EQ(schema, writer.getSchema());
+  writer.setSchema(schema);
+  EXPECT_EQ(before->index_gen + 1, test::readDurableIndexInfo(dir)->index_gen);
+  EXPECT_EQ(before->schema_gen, schema->gen_);
+  EXPECT_NE(schema, writer.getSchema());
+}
+
+TEST_F(IndexWriterTest, schemaPublicationDoesNotWaitForPendingMergeCommit) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  for (int i = 0; i < 2; i++) {
+    addDoc(writer);
+    writer.commit();
+  }
+  std::latch mergeStarted(1), releaseMerge(1), commitWaiting(1);
+  Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
+    mergeStarted.count_down();
+    releaseMerge.wait();
+    return nullptr;
+  });
+  Signal::listen("commitWaitingForMerges", [&](void*, void*, void*) -> void* {
+    commitWaiting.count_down();
+    return nullptr;
+  });
+  std::thread merge([&] { writer.mergeSegments(); });
+  mergeStarted.wait();
+  TimedCommitMessage commit;
+  commit.waitForMerges = true;
+  writer.submitUpdate(&commit);
+  commitWaiting.wait();
+  auto before = test::readDurableIndexInfo(dir);
+  auto schema = std::async(std::launch::async, [&] { writer.setSchema(Schema::createDefaultSchema()); });
+  bool prompt = schema.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+  EXPECT_TRUE(prompt);
+  if (prompt) {
+    EXPECT_FALSE(commit.waitFor(std::chrono::milliseconds(0)));
+    auto after = test::readDurableIndexInfo(dir);
+    EXPECT_EQ(before->index_gen + 1, after->index_gen);
+    EXPECT_EQ(test::fileInventory(*before), test::fileInventory(*after));
+  }
+  releaseMerge.count_down();
+  schema.get();
+  merge.join();
+  EXPECT_TRUE(commit.waitFor(std::chrono::seconds(10)));
+  writer.close();
+  Signal::unlisten("mergeStart");
+  Signal::unlisten("commitWaitingForMerges");
+  auto final = test::readDurableIndexInfo(dir);
+  EXPECT_EQ(writer.getSchema()->gen_, final->schema_gen);
+  EXPECT_GT(final->index_gen, before->index_gen + 1);
+}
+
+TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
+  auto path = std::filesystem::temp_directory_path() / "luxir-publication-durability";
+  std::filesystem::remove_all(path);
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  auto fs = std::make_shared<FSDirectory>(path);
+  CheckedDirectory dir(fs, CheckedDirMode::THROW);
+  IndexWriter writer(dir);
+  auto before = test::readDurableIndexInfo(dir);
+  auto originalSchema = writer.getSchema();
+  Signal::listen("manifestDurable", [&](void*, void*, void*) -> void* {
+    EXPECT_NE(nullptr, dir.openFile(Manifest::name(before->index_gen + 1), true));
+    throw std::runtime_error("injected publication failure");
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("manifestDurable"); });
+  EXPECT_THROW(writer.setSchema(Schema::createDefaultSchema()), std::runtime_error);
+  EXPECT_TRUE(writer.isClosed());
+  EXPECT_EQ(originalSchema, writer.getSchema());
+  EXPECT_THROW(writer.setSchema(originalSchema), IndexWriterClosedError);
+  EXPECT_THROW(writer.getIndexReader(), IndexWriterClosedError);
+  Signal::unlisten("manifestDurable");
+  writer.close();
+  auto visible = test::readDurableIndexInfo(dir);
+  EXPECT_EQ(before->index_gen + 1, visible->index_gen);
+  IndexWriter reopened(dir);
+  auto next = reopened.commit();
+  ASSERT_TRUE(next);
+  EXPECT_EQ(visible->index_gen + 1, next->index_gen);
+  EXPECT_EQ(visible->incarnation, next->incarnation);
+}
+
+TEST_F(IndexWriterTest, initialSchemaIsForCreationOnlyAndResetChangesIdentity) {
+  RAMDir dir;
+  auto schema = Schema::createDefaultSchema();
+  IndexWriter writer(dir, schema);
+  EXPECT_EQ(0u, schema->gen_);
+  auto before = test::readDurableIndexInfo(dir);
+  EXPECT_EQ(1u, before->index_gen);
+  writer.testDeleteAllData();
+  auto after = test::readDurableIndexInfo(dir);
+  EXPECT_NE(before->incarnation, after->incarnation);
+  EXPECT_EQ(1u, after->index_gen);
+  writer.close();
+  EXPECT_THROW(IndexWriter(dir, schema), std::invalid_argument);
+  IndexWriter reopened(dir);
+  EXPECT_EQ(after->schema_gen, reopened.getSchema()->gen_);
+}
+
+TEST_F(IndexWriterTest, filesystemCommitsSyncCollapsedSegmentsAndDeletes) {
+  auto path = std::filesystem::temp_directory_path() / "luxir-checked-commits";
+  std::filesystem::remove_all(path);
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  LuxirConfig config;
+  config.store.backend = "fs";
+  config.store.data_dir = path.string();
+  config.store.checked_dir.sync = "throw";
+  LuxirNode node(config);
+  test::CollectionHelper helper(node, "main");
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  Signal::listen("manifestWritten", [&](void* source, void*, void*) -> void* {
+    if (source == writer.get()) {
+      auto manifest = test::readDurableIndexInfo(writer->dir);
+      for (const auto& file : test::manifestFiles(*manifest)) {
+        EXPECT_NE(nullptr, writer->dir.openFile(file.name, true));
+      }
+    }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("manifestWritten"); });
+  ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "keep"), test::flatdoc("id", "replace")},
+                           UpdateMessage::COMMIT).success);
+  for (int i = 0; i < 3; i++) {
+    ASSERT_TRUE(helper.index(test::flatdoc("id", "replace", "body_t", "valid"),
+                             UpdateMessage::COMMIT, true).success);
+    auto reader = writer->getIndexReader();
+    EXPECT_EQ(2, reader->liveDocs());
+    auto manifest = test::readDurableIndexInfo(writer->dir);
+    bool deletes = false;
+    for (const auto& seg : manifest->segments) deletes |= seg.live_gen > 0;
+    EXPECT_TRUE(deletes);
+    test::expectValidInventory(writer->dir, *manifest);
+    for (const auto& file : test::manifestFiles(*manifest)) {
+      EXPECT_NE(nullptr, writer->dir.openFile(file.name, true));
+    }
+  }
+  ASSERT_TRUE(helper.deleteById("replace", UpdateMessage::COMMIT).success);
+  EXPECT_EQ(1, writer->getIndexReader()->liveDocs());
+}
+
+TEST_F(IndexWriterTest, admittedCommitPublishesDuringClose) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  addDoc(writer);
+  std::latch admitted(1), release(1);
+  Signal::listen("initiateCommit", [&](void*, void*, void*) -> void* {
+    admitted.count_down();
+    release.wait();
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("initiateCommit"); });
+  TimedCommitMessage commit;
+  writer.submitUpdate(&commit);
+  admitted.wait();
+  std::thread close([&] { writer.close(); });
+  while (!writer.isClosed()) std::this_thread::yield();
+  release.count_down();
+  close.join();
+  ASSERT_TRUE(commit.waitFor(std::chrono::seconds(5)));
+  EXPECT_FALSE(commit.result.errored());
+  ASSERT_TRUE(commit.resultingCommit);
+  IndexReader reader(dir);
+  EXPECT_EQ(1, reader.liveDocs());
+  EXPECT_EQ(commit.resultingCommit->index_gen, reader.commitId());
+}
+
+TEST_F(IndexWriterTest, noCommitReturnsNoIdentity) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  auto before = test::readDurableIndexInfo(dir);
+  EXPECT_FALSE(writer.commit(UpdateMessage::NO_COMMIT));
+  EXPECT_EQ(before->index_gen, test::readDurableIndexInfo(dir)->index_gen);
+}
+
+TEST_F(IndexWriterTest, recoverySkipsTornCandidatesAndChecksFallbackPresence) {
+  for (int damage = 0; damage < 3; damage++) {
+    SCOPED_TRACE(damage);
+    RAMDir dir;
+    {
+      IndexWriter writer(dir);
+      addDoc(writer);
+      writer.commit();
+    }
+    auto before = test::readDurableIndexInfo(dir);
+    uint64_t candidate = before->index_gen + 1;
+    std::vector<char> corrupt;
+    if (damage == 1) {
+      auto bytes = dir.openFile(Manifest::name(before->index_gen))->read();
+      corrupt.assign(bytes.begin(), bytes.end());
+      corrupt.back() ^= 1;
+    }
+    auto file = dir.createFile(Manifest::name(candidate));
+    OutputStream out(file.get());
+    if (corrupt.empty()) out.writeInt(42);
+    else out.write(corrupt.data(), corrupt.size());
+    out.close();
+    dir.finishFile(*file);
+    if (damage == 2) {
+      ASSERT_TRUE(dir.deleteFile(before->segments.front().files.front().name));
+      EXPECT_THROW(IndexWriter{dir}, std::runtime_error);
+      EXPECT_THROW(IndexReader{dir}, std::runtime_error);
+      continue;
+    }
+    IndexWriter recovered(dir);
+    EXPECT_GT(recovered.getIndexReader()->commitId(), candidate);
+    EXPECT_EQ(recovered.getIndexReader()->commitId(), IndexReader(dir).commitId());
+    EXPECT_NE(before->incarnation, test::readDurableIndexInfo(dir)->incarnation);
+    EXPECT_EQ(1, recovered.getIndexReader()->liveDocs());
+    EXPECT_GT(recovered.commit()->index_gen, candidate);
+  }
+}
+
+TEST_F(IndexWriterTest, newestManifestSelectionDoesNotReadData) {
+  RAMDir dir;
+  {
+    IndexWriter writer(dir);
+    addDoc(writer);
+    writer.commit();
+  }
+  auto before = test::readDurableIndexInfo(dir);
+  ASSERT_TRUE(dir.deleteFile(before->segments.front().files.front().name));
+  // Root selection checks only the footer and wire payload. Data damage is
+  // reported when opening the affected segment, never by startup hashing.
+  EXPECT_EQ(before->index_gen, Manifest::load(dir).generation);
+  EXPECT_NO_THROW(IndexWriter{dir});
+}
+
+TEST_F(IndexWriterTest, refusesIndexFilesWithoutManifest) {
+  for (auto name : {"s01_00", "s.olux", "s.olux_3.tmp"}) {
+    RAMDir dir;
+    auto file = dir.createFile(name);
+    OutputStream out(file.get());
+    out.writeInt(42);
+    out.close();
+    dir.finishFile(*file);
+    EXPECT_THROW(IndexWriter{dir}, std::runtime_error) << name;
+    EXPECT_THROW(IndexReader{dir}, std::runtime_error) << name;
+    EXPECT_NE(nullptr, dir.openFile(name));
+  }
+}
+
+TEST_F(IndexWriterTest, manifestEnospcLeavesWriterUsable) {
+  auto path = std::filesystem::temp_directory_path() / "luxir-manifest-enospc";
+  std::filesystem::remove_all(path);
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  auto fs = std::make_shared<FSDirectory>(path);
+  CheckedDirectory dir(fs, CheckedDirMode::THROW);
+  IndexWriter writer(dir);
+  auto before = test::readDurableIndexInfo(dir);
+  std::filesystem::create_symlink("/dev/full", path / (Manifest::name(before->index_gen + 1) + ".tmp"));
+  addDoc(writer);
+  EXPECT_THROW(writer.commit(), std::runtime_error);
+  EXPECT_FALSE(writer.isClosed());
+  EXPECT_EQ(before->index_gen, test::readDurableIndexInfo(dir)->index_gen);
+  EXPECT_EQ(0, writer.getIndexReader()->liveDocs());
+  EXPECT_EQ(before->index_gen + 2, writer.commit()->index_gen);
+  EXPECT_EQ(1, writer.getIndexReader()->liveDocs());
+  test::expectValidInventory(dir, *test::readDurableIndexInfo(dir));
+}
+
+TEST_F(IndexWriterTest, failuresBeforeDurabilityLeaveWriterUsable) {
+  for (auto signal : {"commitDataSync", "manifestWritten", "manifestSynced"}) {
+    RAMDir dir;
+    IndexWriter writer(dir);
+    auto before = test::readDurableIndexInfo(dir);
+    addDoc(writer);
+    Signal::listen(signal, [](void*, void*, void*) -> void* {
+      throw std::runtime_error("injected I/O failure");
+    });
+    EXPECT_THROW(writer.commit(), std::runtime_error);
+    Signal::unlisten(signal);
+    EXPECT_FALSE(writer.isClosed());
+    EXPECT_EQ(before->index_gen, test::readDurableIndexInfo(dir)->index_gen);
+    EXPECT_GT(writer.commit()->index_gen, before->index_gen);
+    EXPECT_EQ(1, writer.getIndexReader()->liveDocs());
+  }
+}
+
+TEST_F(IndexWriterTest, readersAndSchemaDoNotWaitForDataSync) {
+  for (auto signal : {"commitDataSync", "manifestWritten"}) {
+    RAMDir dir;
+    IndexWriter writer(dir);
+    addDoc(writer);
+    auto before = writer.commit();
+    std::latch entered(1), release(1);
+    Signal::listen(signal, [&](void*, void*, void*) -> void* {
+      entered.count_down();
+      release.wait();
+      return nullptr;
+    });
+    addDoc(writer);
+    auto commit = std::async(std::launch::async, [&] { return writer.commit(); });
+    entered.wait();
+    auto read = std::async(std::launch::async, [&] { return writer.getIndexReader(); });
+    bool readPrompt = read.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    EXPECT_TRUE(readPrompt);
+    if (readPrompt) { EXPECT_EQ(before->index_gen, read.get()->commitId()); }
+    std::future<void> schema;
+    if (std::string_view(signal) == "commitDataSync") {
+      schema = std::async(std::launch::async, [&] { writer.setSchema(Schema::createDefaultSchema()); });
+      EXPECT_EQ(std::future_status::ready, schema.wait_for(std::chrono::seconds(2)));
+    }
+    release.count_down();
+    commit.get();
+    if (schema.valid()) schema.get();
+    if (read.valid()) read.get();
+    Signal::unlisten(signal);
+    EXPECT_EQ(2, writer.getIndexReader()->liveDocs());
+    EXPECT_EQ(writer.getSchema(), writer.getIndexReader()->schema());
+  }
+}
+
+TEST_F(IndexWriterTest, fatalPublicationMakesCollectionUnavailable) {
+  LuxirNode node(LuxirConfig{});
+  test::CollectionHelper helper(node, "failed_publication");
+  auto writer = helper.getIndexWriter();
+  Signal::listen("manifestDurable", [&](void* source, void*, void*) -> void* {
+    if (source == writer.get()) throw std::runtime_error("injected publication failure");
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("manifestDurable"); });
+  EXPECT_THROW(writer->commit(), std::runtime_error);
+  EXPECT_FALSE(helper.collection().getUnavailableReason().empty());
+  EXPECT_THROW(node.getCollection("failed_publication"), CollectionUnavailableError);
+  auto entries = node.collectionEntries();
+  auto failed = std::ranges::find_if(entries, [](const auto& e) { return e.name == "failed_publication"; });
+  ASSERT_NE(entries.end(), failed);
+  EXPECT_FALSE(failed->error.empty());
+}
+
+TEST_F(IndexWriterTest, admittedMergePublishesDuringClose) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  for (int i = 0; i < 2; i++) {
+    addDoc(writer);
+    writer.commit();
+  }
+  std::latch started(1), release(1);
+  Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
+    started.count_down();
+    release.wait();
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("mergeStart"); });
+  std::thread merge([&] { writer.mergeSegments(); });
+  started.wait();
+  std::thread close([&] { writer.close(); });
+  while (!writer.isClosed()) std::this_thread::yield();
+  release.count_down();
+  merge.join();
+  close.join();
+  IndexReader reader(dir);
+  EXPECT_EQ(2, reader.liveDocs());
+  EXPECT_EQ(1u, reader.segments().size());
+}
+
+TEST_F(IndexWriterTest, snapshotRetirementPreservesMergeLiveDocs) {
+  test::CollectionHelper helper("merge_live_docs");
+  auto writer = helper.getIndexWriter();
+  ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "a"), test::flatdoc("id", "b"),
+                               test::flatdoc("id", "c"), test::flatdoc("id", "e"),
+                               test::flatdoc("id", "f")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(test::flatdoc("id", "d"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("a", UpdateMessage::COMMIT).success);
+  auto before = test::readDurableIndexInfo(writer->dir);
+  const auto& seg = before->segments.front();
+  auto oldLiveDocs = Postings::getLiveDocsFileName(Postings::getSortableString(seg.seg_id), seg.live_gen);
+  std::latch started(1), release(1);
+  Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
+    started.count_down();
+    release.wait();
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("mergeStart"); });
+  auto merge = std::async(std::launch::async, [&] { writer->mergeSegments(); });
+  started.wait();
+  EXPECT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
+  auto intermediate = test::readDurableIndexInfo(writer->dir);
+  auto intermediateLiveDocs = Postings::getLiveDocsFileName(
+      Postings::getSortableString(seg.seg_id), intermediate->segments.front().live_gen);
+  EXPECT_TRUE(helper.deleteById("c", UpdateMessage::COMMIT).success);
+  writer->setSchema(writer->getSchema());
+  EXPECT_EQ(nullptr, writer->dir.openFile(intermediateLiveDocs));
+  EXPECT_NE(nullptr, writer->dir.openFile(oldLiveDocs));
+  release.count_down();
+  EXPECT_NO_THROW(merge.get());
+  EXPECT_EQ(3, writer->getIndexReader()->liveDocs());
+  EXPECT_EQ(nullptr, writer->dir.openFile(oldLiveDocs));
+}
+
+TEST_F(IndexWriterTest, automaticMergePublishesDuringClose) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  writer.mergePolicy->setMergeFactor(2);
+  addDoc(writer);
+  writer.commit();
+  std::latch started(1), release(1);
+  Signal::listen("mergeStart", [&](void*, void*, void*) -> void* {
+    started.count_down();
+    release.wait();
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("mergeStart"); });
+  addDoc(writer);
+  // A synchronous commit may execute the paused merge on its waiting thread.
+  auto commit = std::async(std::launch::async, [&] { writer.commit(); });
+  started.wait();
+  std::thread close([&] { writer.close(); });
+  while (!writer.isClosed()) std::this_thread::yield();
+  release.count_down();
+  commit.get();
+  close.join();
+  IndexReader reader(dir);
+  EXPECT_EQ(2, reader.liveDocs());
+  EXPECT_EQ(1u, reader.segments().size());
+}
+
+TEST_F(IndexWriterTest, retiresOldLiveDocsWithoutMerging) {
+  test::CollectionHelper helper("live_docs_retirement");
+  auto writer = helper.getIndexWriter();
+  ASSERT_TRUE(helper.indexAll({test::flatdoc("id", "a"), test::flatdoc("id", "b"),
+                               test::flatdoc("id", "c"), test::flatdoc("id", "keep")},
+                              UpdateMessage::COMMIT).success);
+  auto held = writer->getIndexReader();
+  for (auto id : {"a", "b", "c"}) {
+    ASSERT_TRUE(helper.deleteById(id, UpdateMessage::COMMIT).success);
+    std::vector<Directory::FileInfo> files;
+    writer->dir.listFiles(files);
+    EXPECT_EQ(1, std::ranges::count_if(files, [](const auto& f) { return f.name.find("__L") != std::string::npos; }));
+    test::expectValidInventory(writer->dir, *test::readDurableIndexInfo(writer->dir));
+  }
+  EXPECT_EQ(4, held->liveDocs());
+  EXPECT_EQ(1, writer->getIndexReader()->liveDocs());
+}
+
+TEST_F(IndexWriterTest, schemaPublicationDoesNotWaitForSegmentUnlinks) {
+  RAMDir dir;
+  IndexWriter writer(dir);
+  addDoc(writer);
+  std::latch entered(1), release(1);
+  std::atomic<bool> paused = false;
+  Signal::listen("segmentRetirement", [&](void*, void*, void*) -> void* {
+    if (!paused.exchange(true)) { entered.count_down(); release.wait(); }
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("segmentRetirement"); });
+  auto commit = std::async(std::launch::async, [&] { writer.commit(); });
+  entered.wait();
+  auto schema = std::async(std::launch::async, [&] { writer.setSchema(Schema::createDefaultSchema()); });
+  EXPECT_EQ(std::future_status::ready, schema.wait_for(std::chrono::seconds(2)));
+  release.count_down();
+  commit.get();
+  schema.get();
+}
+
+TEST_F(IndexWriterTest, readerRetriesAnyFailureOnlyWhenPublicationChanges) {
+  for (bool change : {false, true}) {
+    RAMDir dir;
+    IndexWriter writer(dir);
+    bool first = true;
+    Signal::listen("indexReaderOpening", [&](void*, void*, void*) -> void* {
+      if (std::exchange(first, false)) {
+        if (change) writer.setSchema(Schema::createDefaultSchema());
+        throw std::runtime_error("injected reader failure");
+      }
+      return nullptr;
+    });
+    auto unlisten = scope_guard([] { Signal::unlisten("indexReaderOpening"); });
+    if (change) {
+      auto reader = writer.getIndexReader();
+      EXPECT_EQ(reader->schema(), writer.getSchema());
+    } else {
+      EXPECT_THROW(writer.getIndexReader(), std::runtime_error);
+    }
+  }
 }

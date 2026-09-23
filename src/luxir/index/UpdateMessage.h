@@ -10,6 +10,13 @@
 
 namespace luxir {
 
+// Owning snapshot identity for asynchronous completion and synchronous commits.
+struct CommitId {
+  std::string incarnation;
+  uint64_t index_gen = 0;
+  bool operator==(const CommitId&) const = default;
+};
+
 class IndexWriter;
 class UpdateMessage;
 
@@ -23,17 +30,10 @@ public:
 
   // highest update version in this commit, including deletes and the commit message itself.
   uint64_t highestUpdateVersion = 0;
-  // The index generation this commit will be published under.  Assigned by
-  // finishCommitBody once segsToKeep is finalized, then read by everything that
-  // produces commit-stage artifacts (aux index builders, IndexInfo writer).
-  uint64_t indexGen = 0;
   // The segment-composition generation this commit will be published under.
-  // Assigned alongside indexGen in finishCommitBody.  Equal to the previous
+  // Assigned in finishCommitBody.  Equal to the previous
   // commit's core_gen if segment composition is unchanged, else previous + 1.
   uint64_t coreGen = 0;
-  // Schema generation captured for this commit and published only after the
-  // commit point is durable.
-  uint64_t schemaGen = 0;
   // Number of segments left to flush, protected by same mutex that protects the inverter lists.
   // making this an atomic is not enough to avoid race conditions since we also depend on coordination with
   // inverter->updateMessage, among other things.
@@ -77,6 +77,7 @@ public:
   // Internal synthetic commits use this to publish an already-produced segment
   // layout without flushing unrelated inverter state that arrived later.
   bool publishOnly = false;
+  std::optional<CommitId> resultingCommit;
 
   // Aux index rebuild request, applied during this commit (no effect if commit == NO_COMMIT).
   // See proto CommitParams.build_aux_indexes for semantics:

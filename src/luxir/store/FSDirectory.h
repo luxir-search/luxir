@@ -9,6 +9,8 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#define XXH_STATIC_LINKING_ONLY
+#include <xxhash.h>
 #include "Directory.h"
 
 namespace luxir {
@@ -56,6 +58,7 @@ class FSFile : public File {
   std::filesystem::path tmpPath_;  // write to temp, rename on finish
   int fd_ = -1;
   size_t fileSize_ = 0;
+  XXH3_state_t hash;
 
   // Single reusable write buffer
   std::unique_ptr<char[]> buf_;
@@ -73,6 +76,7 @@ class FSFile : public File {
   }
 
   void writeToFd(const char* data, size_t len) {
+    XXH3_64bits_update(&hash, data, len);
     while (len > 0) {
       auto n = ::write(fd_, data, len);
       if (n < 0) {
@@ -116,7 +120,9 @@ class FSFile : public File {
 
 public:
   FSFile(std::string_view name, const std::filesystem::path& path)
-      : File(name), path_(path), tmpPath_(path.string() + ".tmp") {}
+      : File(name), path_(path), tmpPath_(path.string() + ".tmp") {
+    XXH3_64bits_reset(&hash);
+  }
 
   ~FSFile() override {
     if (fd_ >= 0) {
@@ -125,6 +131,7 @@ public:
   }
 
   size_t size() override { return fileSize_; }
+  uint64_t digest() const override { return XXH3_64bits_digest(&hash); }
 
   void closeFd() {
     if (fd_ >= 0) {
@@ -280,6 +287,10 @@ public:
 
   ~RAMDelegatingFile() override {
     accountChange(-(int64_t) ramFile.allocatedBytes());
+  }
+
+  uint64_t digest() const override {
+    return delegate ? delegate->digest() : ramFile.digest();
   }
 
   size_t size() override {

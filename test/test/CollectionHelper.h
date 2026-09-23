@@ -34,6 +34,7 @@ struct IndexResult {
   };
 
   uint64_t updateVersion = 0;
+  std::optional<CommitId> commit;
   bool success = false;  // false if the message errored or the response status is ERROR
   Status status = Status::UNKNOWN;
   std::string error_message;          // message-level error, if any
@@ -54,6 +55,7 @@ private:
   static void fillResult(ProtoUpdateMessage& msg, IndexResult& out) {
     auto* rsp = msg.finishResponse();
     out.updateVersion = rsp->update_version;
+    if (rsp->commit) out.commit = CommitId{std::string(rsp->commit->incarnation), rsp->commit->index_gen};
     out.status = rsp->status;
     out.error_message.clear();
     out.error_code.clear();

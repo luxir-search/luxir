@@ -368,7 +368,7 @@ public:
   /// finishes indexing this segment (also calls finish on the underlying postings writer)
   /// returns true on success if anything was written.
   /// If filenames is provided, appends the names of all files written (for fsync at commit time).
-  bool flush(std::vector<std::string>* filenames = nullptr);
+  bool flush(std::vector<std::string>* filenames = nullptr, std::vector<FileDescriptor>* descriptors = nullptr);
 
 private:
   IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createPhysicalHandler

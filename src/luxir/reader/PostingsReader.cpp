@@ -91,19 +91,6 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
 }
 
 std::shared_ptr<PostingsReader> PostingsReader::create(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced) {
-  std::string segStr = Postings::getSortableString(segId);
-  auto segInfoFile = Postings::getIndexFileName(segStr, 0);
-  auto firstFile = dir.openFile(segInfoFile, expectSynced);
-
-  if (firstFile == nullptr) {
-    if (missingFileOK) {
-      return nullptr;
-    }
-    throw std::filesystem::filesystem_error(
-            std::format("Can't find/open first segment file '{}'", segInfoFile),
-            std::make_error_code(std::errc::no_such_file_or_directory));
-  }
-
   // Try to create the PostingsReader - use private constructor
   auto reader = std::shared_ptr<PostingsReader>(new PostingsReader());
   if (!reader->initializeFromFiles(dir, segId, missingFileOK, expectSynced)) {

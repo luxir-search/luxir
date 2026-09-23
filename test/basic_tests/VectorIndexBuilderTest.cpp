@@ -306,6 +306,7 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   auto& shardDir = h.getIndexWriter()->dir;
 
   auto info = readIndexInfo(shardDir);
+  expectValidInventory(shardDir, *info);
   EXPECT_EQ(0, info->aux_indexes.size());
   const auto& aux = onlyVectorOverlay(info);
   EXPECT_EQ(aux.kind, "vector_faiss");
@@ -315,7 +316,7 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   ASSERT_EQ(aux.files.size(), 1);
 
   // Read and verify the FAISS index.
-  auto idx = readFaissIndex(shardDir, aux.files[0]);
+  auto idx = readFaissIndex(shardDir, aux.files[0].name);
   ASSERT_NE(idx, nullptr);
   EXPECT_EQ(idx->d, 4);
   EXPECT_EQ(idx->ntotal, (faiss::idx_t)vecs.size());
@@ -326,7 +327,7 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   shardDir.listFiles(files);
   uint64_t fileSize = 0;
   for (const auto& f : files) {
-    if (f.name == aux.files[0]) fileSize = f.size;
+    if (f.name == aux.files[0].name) fileSize = f.size;
   }
   ASSERT_GT(fileSize, 0u);
   auto stats = h.getIndexWriter()->stats(true);
@@ -354,6 +355,7 @@ TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
 
   auto& shardDir = h.getIndexWriter()->dir;
   auto info = readIndexInfo(shardDir);
+  expectValidInventory(shardDir, *info);
   const auto& aux = onlyVectorOverlay(info);
   ASSERT_EQ(aux.files.size(), 1);
 
@@ -367,10 +369,10 @@ TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
   std::filesystem::path tmp(tmpl);
   {
     FSDirectory fsDir(tmp);
-    auto src = shardDir.openFile(aux.files[0]);
+    auto src = shardDir.openFile(aux.files[0].name);
     ASSERT_NE(src, nullptr);
     auto bytes = src->read();
-    auto dst = fsDir.createFile(aux.files[0]);
+    auto dst = fsDir.createFile(aux.files[0].name);
     OutputStream os;
     os.setFile(&*dst);
     os.write(bytes.data(), bytes.size());
@@ -436,7 +438,7 @@ TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
 
   for (const auto* aux : overlays) {
     ASSERT_EQ(aux->files.size(), 1);
-    auto idx = readFaissIndex(h.getIndexWriter()->dir, aux->files[0]);
+    auto idx = readFaissIndex(h.getIndexWriter()->dir, aux->files[0].name);
     EXPECT_EQ(idx->d, 3);
     EXPECT_EQ(idx->ntotal, 80);
 
@@ -477,7 +479,7 @@ TEST_F(VectorIndexBuilderTest, carryForwardOnDeleteOnlyCommit) {
 
   auto info1 = readIndexInfo(h.getIndexWriter()->dir);
   const auto& orig = onlyVectorOverlay(info1);
-  std::vector<std::string> origFiles(orig.files.begin(), orig.files.end());
+  auto origFiles = fileNames(orig.files);
 
   // Delete one doc and commit - segment composition unchanged.
   std::vector<std::string> ids{"doc0"};
@@ -487,7 +489,7 @@ TEST_F(VectorIndexBuilderTest, carryForwardOnDeleteOnlyCommit) {
   const auto& carried = onlyVectorOverlay(info2);
   EXPECT_EQ(carried.name, "vec.embedding_v");
   EXPECT_EQ(carried.built_core_gen, 0u);
-  EXPECT_EQ(std::vector<std::string>(carried.files.begin(), carried.files.end()), origFiles);
+  EXPECT_EQ(fileNames(carried.files), origFiles);
   // Files survive on disk.
   for (const auto& f : origFiles) {
     EXPECT_NE(h.getIndexWriter()->dir.openFile(f), nullptr) << "carried file: " << f;
@@ -510,7 +512,7 @@ TEST_F(VectorIndexBuilderTest, segmentChangeCarriesExistingOverlay) {
 
   auto info1 = readIndexInfo(h.getIndexWriter()->dir);
   const auto& orig = onlyVectorOverlay(info1);
-  std::vector<std::string> origFiles(orig.files.begin(), orig.files.end());
+  auto origFiles = fileNames(orig.files);
 
   // Index one tiny segment and commit without rebuild.
   Doc d2 = flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{0, 1, 0});
@@ -519,7 +521,7 @@ TEST_F(VectorIndexBuilderTest, segmentChangeCarriesExistingOverlay) {
   auto info2 = readIndexInfo(h.getIndexWriter()->dir);
   auto overlays = vectorOverlays(info2);
   ASSERT_EQ(overlays.size(), 1u);
-  EXPECT_EQ(std::vector<std::string>(overlays[0]->files.begin(), overlays[0]->files.end()), origFiles);
+  EXPECT_EQ(fileNames(overlays[0]->files), origFiles);
   for (const auto& f : origFiles) {
     EXPECT_NE(h.getIndexWriter()->dir.openFile(f), nullptr) << "carried file: " << f;
   }
@@ -573,7 +575,7 @@ TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
   auto info1 = readIndexInfo(h.getIndexWriter()->dir);
   auto overlays1 = vectorOverlays(info1);
   ASSERT_EQ(overlays1.size(), 1u);
-  std::string firstFile{overlays1[0]->files[0]};
+  std::string firstFile{overlays1[0]->files[0].name};
   // Overlay filename convention: segment-prefixed like liveDocs -
   // s<segId>__<name>_<gen>_<fnum> - so ls groups overlays with their segment
   // (all-lowercase names render verbatim in filenames).
@@ -596,7 +598,7 @@ TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
   int fresh = 0;
   for (const auto* overlay : overlays2) {
     ASSERT_EQ(overlay->files.size(), 1);
-    if (overlay->files[0] == firstFile) {
+    if (overlay->files[0].name == firstFile) {
       carried++;
     } else {
       fresh++;
@@ -619,7 +621,7 @@ TEST_F(VectorIndexBuilderTest, littleCommitDoesNoAnnWorkAndMatchesExact) {
   h.commit({"*"});
 
   auto info1 = readIndexInfo(h.getIndexWriter()->dir);
-  std::string firstFile{onlyVectorOverlay(info1).files[0]};
+  std::string firstFile{onlyVectorOverlay(info1).files[0].name};
 
   VectorIndexBuilder::ivfPqBuildThresholdScanCost = 1000;
   resetVectorBuildCounters();
@@ -631,7 +633,7 @@ TEST_F(VectorIndexBuilderTest, littleCommitDoesNoAnnWorkAndMatchesExact) {
   auto info2 = readIndexInfo(h.getIndexWriter()->dir);
   auto overlays = vectorOverlays(info2);
   ASSERT_EQ(overlays.size(), 1u);
-  EXPECT_EQ(overlays[0]->files[0], firstFile);
+  EXPECT_EQ(overlays[0]->files[0].name, firstFile);
 
   auto approx = runKnnIds(h.getSearchEngine(), "embedding_v",
                           {100.0f, 0.0f, 0.0f, 0.0f}, 3,
@@ -657,7 +659,7 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
 
   auto info1 = readIndexInfo(h.getIndexWriter()->dir);
   const auto& first = onlyVectorOverlay(info1);
-  std::string firstFile{first.files[0]};
+  std::string firstFile{first.files[0].name};
   EXPECT_EQ(first.gen, 0u);
   EXPECT_TRUE(firstFile.ends_with("_00_00")) << firstFile;
 
@@ -670,8 +672,8 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
   const auto& rebuilt = onlyVectorOverlay(info2);
   ASSERT_EQ(rebuilt.files.size(), 1);
   EXPECT_EQ(rebuilt.gen, 1u);
-  EXPECT_NE(rebuilt.files[0], firstFile);
-  EXPECT_TRUE(std::string(rebuilt.files[0]).ends_with("_01_00")) << rebuilt.files[0];
+  EXPECT_NE(rebuilt.files[0].name, firstFile);
+  EXPECT_TRUE(std::string(rebuilt.files[0].name).ends_with("_01_00")) << rebuilt.files[0].name;
   EXPECT_EQ(h.getIndexWriter()->dir.openFile(firstFile), nullptr);
 
   auto ids = runKnnIds(h.getSearchEngine(), "embedding_v",
@@ -702,15 +704,14 @@ TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
   auto oldOverlays = vectorOverlays(info1);
   ASSERT_EQ(oldOverlays.size(), 2u);
   std::vector<std::string> oldFiles;
-  for (const auto* overlay : oldOverlays) oldFiles.emplace_back(overlay->files[0]);
+  for (const auto* overlay : oldOverlays) oldFiles.emplace_back(overlay->files[0].name);
 
   h.getIndexWriter()->mergeSegments();
-  h.commit();
 
   auto info2 = readIndexInfo(h.getIndexWriter()->dir);
   ASSERT_EQ(info2->segments.size(), 1);
   const auto& aux = onlyVectorOverlay(info2);
-  std::vector<std::string> newFiles(aux.files.begin(), aux.files.end());
+  auto newFiles = fileNames(aux.files);
 
   // Old files should be gone.
   for (const auto& f : oldFiles) {
@@ -720,7 +721,7 @@ TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
   for (const auto& f : newFiles) {
     EXPECT_NE(h.getIndexWriter()->dir.openFile(f), nullptr) << "new file should exist: " << f;
   }
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0].name);
   EXPECT_EQ(idx->ntotal, 160);
 }
 
@@ -765,7 +766,7 @@ TEST_F(VectorIndexBuilderTest, forceMergeFlushesPendingIndexingAndBuildsOverlayB
   ASSERT_EQ(info->segments.size(), 1);
   auto overlays = vectorOverlays(info);
   ASSERT_EQ(overlays.size(), 1u);
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, overlays[0]->files[0]);
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, overlays[0]->files[0].name);
   EXPECT_EQ(idx->ntotal, 161);
 
   auto afterApprox = runKnnIds(h.getSearchEngine(), "embedding_v",
@@ -810,7 +811,7 @@ TEST_F(VectorIndexBuilderTest, mergePromotesBelowThresholdSegmentsForActiveField
   ASSERT_EQ(overlays.size(), 2u);
   bool sawMergedSmall = false;
   for (const auto* overlay : overlays) {
-    auto idx = readFaissIndex(iw->dir, overlay->files[0]);
+    auto idx = readFaissIndex(iw->dir, overlay->files[0].name);
     if (idx->ntotal == 158) {
       sawMergedSmall = true;
     }
@@ -885,7 +886,7 @@ TEST_F(VectorIndexBuilderTest, explicitActivationBelowThresholdPromotesInProcess
   auto info2 = readIndexInfo(h.getIndexWriter()->dir);
   ASSERT_EQ(info2->segments.size(), 1);
   const auto& aux = onlyVectorOverlay(info2);
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0].name);
   EXPECT_EQ(idx->ntotal, 158);
 }
 
@@ -916,7 +917,7 @@ TEST_F(VectorIndexBuilderTest, explicitActivationOnEmptyIndexPromotesLaterMerge)
   auto info = readIndexInfo(iw->dir);
   ASSERT_EQ(info->segments.size(), 1);
   const auto& aux = onlyVectorOverlay(info);
-  auto idx = readFaissIndex(iw->dir, aux.files[0]);
+  auto idx = readFaissIndex(iw->dir, aux.files[0].name);
   EXPECT_EQ(idx->ntotal, 158);
 }
 
@@ -1228,7 +1229,7 @@ TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
   auto& aux = onlyVectorOverlay(info);
   auto meta = readVectorAuxMeta(aux);
   EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 0);
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0].name);
   EXPECT_EQ(idx->metric_type, faiss::METRIC_INNER_PRODUCT);
   EXPECT_EQ(idx->ntotal, 80);
 }
@@ -1257,7 +1258,7 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
   auto& aux = onlyVectorOverlay(info);
   auto meta = readVectorAuxMeta(aux);
   EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 0);
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0].name);
   EXPECT_EQ(idx->ntotal, 80);
 }
 
@@ -1276,7 +1277,7 @@ TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
   h.commit({"*"});
 
   auto info1 = readIndexInfo(h.getIndexWriter()->dir);
-  std::string origFile{onlyVectorOverlay(info1).files[0]};
+  std::string origFile{onlyVectorOverlay(info1).files[0].name};
 
   // Delete-only commit (coreGen unchanged) that *also* requests a rebuild via
   // "*".  The rebuild should be a no-op because the carried entry is still
@@ -1286,7 +1287,7 @@ TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
   h.commit({"*"});
 
   auto info2 = readIndexInfo(h.getIndexWriter()->dir);
-  EXPECT_EQ(onlyVectorOverlay(info2).files[0], origFile)
+  EXPECT_EQ(onlyVectorOverlay(info2).files[0].name, origFile)
       << "filename should be unchanged (no rebuild)";
   EXPECT_NE(h.getIndexWriter()->dir.openFile(origFile), nullptr);
 }
@@ -1325,7 +1326,7 @@ TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
   auto& aux = onlyVectorOverlay(info);
   auto meta = readVectorAuxMeta(aux);
   EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 1);
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0].name);
   ASSERT_EQ(idx->ntotal, 80);
 
   VectorIndexBuilder::renormChunkBytes = saved;
@@ -1352,7 +1353,7 @@ TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {
   EXPECT_EQ(aux.built_core_gen, 0u);
   ASSERT_EQ(aux.files.size(), 1);
 
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0].name);
   auto* ivfpq = dynamic_cast<faiss::IndexIVFPQ*>(idx.get());
   ASSERT_NE(ivfpq, nullptr);
   EXPECT_EQ(ivfpq->d, 4);

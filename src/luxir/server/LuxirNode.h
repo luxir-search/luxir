@@ -108,12 +108,10 @@ namespace api::SchemaRequest_ { enum class Mode; }
 class Collection {
   std::string name;
   std::string unavailableReason;  // non-empty means resolution rejects the collection
-  std::atomic<std::shared_ptr<Schema>> schema;  // administration/stats; searches use their reader's schema
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
-  std::atomic<uint64_t> schemaGen_{1};  // starts at 1 for default schema
-  std::mutex schemaMutex_;  // serializes complete schema transactions on the calling thread
 public:
+  std::string getUnavailableReason() const;
 
   std::shared_ptr<Shard> getShard() {
     return shard;
@@ -121,7 +119,7 @@ public:
 
   // Returns the latest published schema for administration and stats.
   std::shared_ptr<Schema> getSchema() {
-    return schema.load();
+    return shard->getIndexWriter()->getSchema();
   }
 
   // The schema mutation transaction: applies `def` to the current schema
@@ -131,18 +129,9 @@ public:
   std::shared_ptr<Schema> updateSchema(const luxir::api::SchemaDef& def,
                                        luxir::api::SchemaRequest_::Mode mode);
 
-  // Atomically replaces the schema and persists it to the shard's Directory.
+  // Publishes a copy of this schema over the last committed physical snapshot.
   void setSchema(std::shared_ptr<Schema> newSchema);
 
-  uint64_t schemaGen() const { return schemaGen_.load(); }
-
-  // Load the latest schema from the Directory.
-  // Returns true if schema was loaded, false if no schema file found.
-  bool loadSchema();
-
-private:
-  void setSchemaLocked(std::shared_ptr<Schema> newSchema);
-  void persistSchemaLocked(std::shared_ptr<Schema> newSchema);
 
   friend class Library;
   friend class LuxirNode;
@@ -230,7 +219,8 @@ public:
 private:
 
   void createSingletons();
-  std::shared_ptr<Collection> initCollection(const std::string& name);
+  std::shared_ptr<Collection> initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema = {},
+                                             std::shared_ptr<Directory> directory = {});
   // Returns the collection unchanged, or throws if it is unavailable.
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
   static void validateCollectionName(std::string_view name);
