@@ -316,11 +316,11 @@ TEST_F(HttpApiTest, prettyExplainAndErrors) {
   }
 }
 
-TEST_F(HttpApiTest, prettyInBandSearchError) {
+TEST_F(HttpApiTest, prettySearchError) {
   helper.index(flatdoc("id", "p1"), UpdateMessage::COMMIT);
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search?pretty",
       R"({"query":{"all":true},"fields":["nosuchfield"]})");
-  ASSERT_EQ(200, res.result_int()) << res.body();
+  ASSERT_EQ(400, res.result_int()) << res.body();
   EXPECT_EQ("application/json", res[http::field::content_type]);
   expectJsonObject(res.body(), true);
   EXPECT_NE(std::string::npos, res.body().find("\"error\":"));
@@ -856,7 +856,7 @@ TEST_F(HttpApiTest, searchMissingCollectionErrorsWithoutCreating) {
   HttpReq autoOnReq(port());
   autoOnReq.collection(autoOnName).matchQuery("title_w", "missingtoken")
       .fields({"id"}).execute();
-  EXPECT_EQ(200, autoOnReq.status()) << autoOnReq.rawResponse();
+  EXPECT_EQ(404, autoOnReq.status()) << autoOnReq.rawResponse();
   EXPECT_NE(autoOnReq.rawResponse().find("collection '" + autoOnName + "' does not exist"),
             std::string::npos) << autoOnReq.rawResponse();
   EXPECT_THROW(LuxirTest::luxirNode->getCollection(autoOnName), CollectionResolutionError);
@@ -873,7 +873,7 @@ TEST_F(HttpApiTest, searchMissingCollectionErrorsWithoutCreating) {
       .fields({"id"}).execute();
   localServer.shutdown();
 
-  EXPECT_EQ(200, autoOffReq.status()) << autoOffReq.rawResponse();
+  EXPECT_EQ(404, autoOffReq.status()) << autoOffReq.rawResponse();
   EXPECT_NE(autoOffReq.rawResponse().find("collection '" + autoOffName + "' does not exist"),
             std::string::npos) << autoOffReq.rawResponse();
   EXPECT_THROW(node.getCollection(autoOffName), CollectionResolutionError);
@@ -2017,6 +2017,16 @@ TEST_F(HttpApiTest, ndjsonUrlCommitCommitsAtEof) {
       .limit(10).withStats().execute();
   ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
   EXPECT_EQ((int64_t)1, hreq.found()) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonUrlCommitLeavesUntouchedDefaultUnpublished) {
+  auto before = helper.collection().getShard()->getSnapshots().snapshot()->id;
+  ASSERT_TRUE(helper.index(flatdoc("id", "pending")).success);
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=true",
+      "{\"_update_\":{\"collection\":\"other_eof\"}}\n{\"id\":\"other\"}\n", "application/x-ndjson");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  EXPECT_EQ(before, helper.collection().getShard()->getSnapshots().snapshot()->id);
+  EXPECT_EQ(1, luxirNode->getCollection("other_eof")->getReaderManager().getReader()->liveDocs());
 }
 
 TEST_F(HttpApiTest, jsonUrlCommitCommits) {
@@ -3581,7 +3591,7 @@ TEST_F(HttpApiTest, emitterExceptionCompletesWithError) {
   // join and batch-arena cleanup, not just the error surface.
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"query":{"all":true},"batch_size":1,"fields":["id","nosuchfield"]})");
-  EXPECT_EQ(200, res.result_int());
+  EXPECT_EQ(400, res.result_int());
   EXPECT_NE(std::string::npos, res.body().find(R"("error":)")) << res.body();
   EXPECT_NE(std::string::npos, res.body().find("nosuchfield")) << res.body();
 }
@@ -3742,10 +3752,9 @@ TEST_F(HttpApiTest, collectionResolutionStatusesAreUniform) {
   EXPECT_EQ(400, update.result_int()) << update.body();
   EXPECT_NE(update.body().find(R"("code":"invalid_collection_name")"), std::string::npos)
       << update.body();
-  // A search resolves its collection after submission, so the same failure is
-  // the in-band error line.
+  // Resolving after submission still uses the same pre-output HTTP status.
   auto search = httpRequest(port(), http::verb::get, "/collections/Bad-Name/_search");
-  ASSERT_EQ(200, search.result_int()) << search.body();
+  ASSERT_EQ(400, search.result_int()) << search.body();
   EXPECT_NE(search.body().find(R"({"error":{"kind":"invalid_request","code":"invalid_collection_name")"),
             std::string::npos) << search.body();
 
@@ -3758,10 +3767,10 @@ TEST_F(HttpApiTest, collectionResolutionStatusesAreUniform) {
   EXPECT_EQ("collection_not_found", root["error"]["code"].get_string());
 }
 
-TEST_F(HttpApiTest, searchFailureAfterSubmissionIsAnErrorLine) {
+TEST_F(HttpApiTest, searchFailureBeforeOutputUsesHttpStatus) {
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"request_id":"s1","max_parallel":5,"ops":{"q":{"top_docs":{"query":"title_w:dune"}}}})");
-  ASSERT_EQ(200, res.result_int()) << res.body();
+  ASSERT_EQ(400, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
   ASSERT_EQ(1u, lines.size()) << res.body();
   EXPECT_NE(lines[0].find(R"({"request_id":"s1","error":{"kind":"invalid_request","code":"invalid_request","message":"max_parallel)"),

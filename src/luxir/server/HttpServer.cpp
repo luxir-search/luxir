@@ -3061,7 +3061,7 @@ private:
 
     if (state->url.commit) {
       ErrorInfo err;
-      if (streamWriterTarget(state->defaultCollectionName, err) == nullptr) {
+      if (state->writerCache.empty() && streamWriterTarget(state->defaultCollectionName, err) == nullptr) {
         failStreamingUpdate(std::move(err));
         return;
       }
@@ -3367,6 +3367,9 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
     response.proto.more = !last;
     if (session->aborted()) {
       status = ReplyStatus::CANCEL;  // connection failed; skip the render
+    } else if (response.proto.error && !outputCommitted) {
+      auto info = api::build::errorInfo(*response.proto.error);
+      session->respondErrorFromEngine(httpStatusFor(info), renderErrorBody(info, response.proto.request_id));
     } else {
       int64_t queued = session->enqueueJson(
           renderSearchResponseBody(response.proto, requestState->proto.json_shorthand), last);
