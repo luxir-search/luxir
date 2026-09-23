@@ -218,7 +218,7 @@ TEST_F(RescoreQueryTest, childScoreDependencyAndScorelessBinding) {
                UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "other", "body_w", "beta"),
                UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto schema = helper.collection().getSchema();
   google::protobuf::Arena arena;
   ArenaResource wire(&arena);
@@ -313,7 +313,7 @@ TEST_F(RescoreQueryTest, forwardsTwoPhaseVerification) {
                UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "gap", "body_w", "alpha gap beta"),
                UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto schema = helper.collection().getSchema();
   auto& segment = reader->segments()[0];
 
@@ -370,7 +370,7 @@ TEST_F(RescoreQueryTest, optionalNegativeExpressionsPruneSoundly) {
                                     : UpdateMessage::NO_COMMIT);
     }
   }
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto schema = helper.collection().getSchema();
   google::protobuf::Arena arena;
   TermQuery alpha("body_w", "alpha");

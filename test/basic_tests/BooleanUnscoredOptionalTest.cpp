@@ -171,7 +171,7 @@ public:
   DomainRun runFilteredDisjConjCount(bool disabled) {
     DisjConjBulkGuard bulkGuard(disabled);
     SkipStatsGuard stats;
-    auto reader = helper.getIndexWriter()->getIndexReader();
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     MemPool pool;
     Query::Context context(pool, *reader);
     auto& segment = context.topReader.segments()[0];

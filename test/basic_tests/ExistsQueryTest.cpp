@@ -283,7 +283,7 @@ TEST_F(ExistsQueryTest, PositionalBoostAndConstantScoreSemantics) {
 }
 
 TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto& segment = reader->segments()[0];
 
@@ -341,7 +341,7 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
   EXPECT_EQ(2, countReq->getMatchCount());
 
   ASSERT_TRUE(helper.deleteById("d0", UpdateMessage::COMMIT).success);
-  auto deletedReader = helper.getIndexWriter()->getIndexReader();
+  auto deletedReader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, deletedReader->segments().size());
   MemPool deletedPool;
   Query::Context deletedContext(deletedPool, *deletedReader);
@@ -360,7 +360,7 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
 
 TEST_F(ExistsQueryTest,
        FullFieldSupplierDescribesTheResolvedAllDocsArm) {
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto& segment = reader->segments()[0];
   MemPool pool;
@@ -424,7 +424,7 @@ TEST_F(ExistsQueryTest, MissingFieldSegmentHasNoSupplier) {
   CollectionHelper split("exists_split_segments");
   split.index(flatdoc("id", "s0", "only_w", "present"), UpdateMessage::COMMIT);
   split.index(flatdoc("id", "s1"), UpdateMessage::COMMIT);
-  auto reader = split.getIndexWriter()->getIndexReader();
+  auto reader = split.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(2u, reader->segments().size());
 
   MemPool pool;
@@ -454,7 +454,7 @@ TEST_F(ExistsQueryTest, ZeroTermTextFlushReadsAndMergesInEitherOrder) {
                                 flatdoc("id", zeroFirst ? "m0" : "m1")};
     ASSERT_TRUE(helper.indexAll(firstBatch, UpdateMessage::COMMIT).success);
 
-    auto firstReader = helper.getIndexWriter()->getIndexReader();
+    auto firstReader = helper.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(1u, firstReader->segments().size());
     SegFieldInfo firstInfo = readFieldInfo(firstReader->segments()[0], "zero_w");
     EXPECT_EQ(zeroFirst ? 0 : 1, firstInfo.nTerms);
@@ -490,7 +490,7 @@ TEST_F(ExistsQueryTest, ZeroTermTextFlushReadsAndMergesInEitherOrder) {
   CollectionHelper::UpdateBuilder merge;
   merge.commit(true, 1);
   ASSERT_TRUE(helper.submit(merge).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   EXPECT_EQ(0, readFieldInfo(reader->segments()[0], "zero_w").nTerms);
   EXPECT_EQ(expectedIds({"z0", "z1"}), exprIds("zero_w:*"));

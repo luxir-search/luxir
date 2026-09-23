@@ -870,7 +870,7 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
   
   // Verify the field was written with fixed-size optimization
   auto indexWriter = helper.getIndexWriter();
-  auto reader = indexWriter->getIndexReader();
+  auto reader = indexWriter->snapshots.readers.getReader();
   ASSERT_TRUE(reader != nullptr);
   ASSERT_GT(reader->segments().size(), 0);
   
@@ -953,7 +953,7 @@ TEST_F(StrColTest, DocValuesManyValuesPerDoc) {
   }
 
   auto indexWriter = helper.getIndexWriter();
-  auto reader = indexWriter->getIndexReader();
+  auto reader = indexWriter->snapshots.readers.getReader();
   ASSERT_TRUE(reader != nullptr);
   ASSERT_GT(reader->segments().size(), 0);
   auto& segment = reader->segments()[0];

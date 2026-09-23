@@ -80,7 +80,7 @@ TEST_F(AutoFlushTest, singleMessageKeptWholeAndOverwritesResolve) {
   }
   helper.indexAll(docs, UpdateMessage::COMMIT, /*overwrite=*/true);  // one message, overwrite mode
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), 1u)
       << "a single message must stay in one inverter/segment (no mid-request flush)";
 
@@ -109,7 +109,7 @@ TEST_F(AutoFlushTest, accumulationAcrossMessagesFlushesAtBoundaries) {
   }
   helper.commit();
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   EXPECT_GT(reader->segments().size(), 1u)
       << "per-message flush should bound accumulation into multiple segments";
 
@@ -159,7 +159,7 @@ TEST_F(AutoFlushTest, overBudgetReleaseFlushesIdleInverter) {
   budget.setTotalBytes(budgetGuard.saved);  // commit-time flushes/merges run unpressured
   helper.commit();
 
-  auto reader = iw->getIndexReader();
+  auto reader = iw->snapshots.readers.getReader();
   EXPECT_GT(reader->segments().size(), 1u)
       << "an over-budget release should flush an idle inverter into its own segment";
 
@@ -199,7 +199,7 @@ TEST_F(AutoFlushTest, pressureFlushRespectsFloor) {
   budget.setTotalBytes(budgetGuard.saved);
   helper.commit();
 
-  auto reader = iw->getIndexReader();
+  auto reader = iw->snapshots.readers.getReader();
   EXPECT_EQ(reader->segments().size(), 1u)
       << "below-floor inverters must not be pressure-flushed";
 }
@@ -230,7 +230,8 @@ TEST(PressureShedDirectTest, concurrentShedsWithInFlightDiscount) {
   auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
 
   {
-    IndexWriter iw(dir, schema, &budget);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema, &budget);
     iw.pressureFlushFloorBytes = 1;  // every inverter is a valid victim
 
     // Three concurrently-busy inverters so obtainInverter cannot reuse an
@@ -277,7 +278,7 @@ TEST(PressureShedDirectTest, concurrentShedsWithInFlightDiscount) {
     releaseFlushes.store(true);
     iw.commit();
 
-    auto reader = iw.getIndexReader();
+    auto reader = iw.snapshots.readers.getReader();
     EXPECT_EQ(reader->segments().size(), 3u);  // A shed, B shed, C at commit
     int64_t totalDocs = 0;
     for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
@@ -304,7 +305,8 @@ TEST(PressureShedDirectTest, mergeDemandWakesIdleWriter) {
   auto cleanup = luxir::scope_guard([]() { Signal::unlisten("segmentFlushBody"); });
 
   {
-    IndexWriter iw(dir, schema, &budget);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema, &budget);
     iw.pressureFlushFloorBytes = 1;
     auto& inverter = iw.obtainInverter();
     for (int i = 0; i < 30; i++) {
@@ -329,7 +331,7 @@ TEST(PressureShedDirectTest, mergeDemandWakesIdleWriter) {
     demand.publish(0);
     budget.setTotalBytes(0);
     iw.commit();
-    EXPECT_EQ(1u, iw.getIndexReader()->segments().size());
+    EXPECT_EQ(1u, iw.snapshots.readers.getReader()->segments().size());
   }
 }
 
@@ -348,7 +350,8 @@ TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
   }
 
   IndexRamBudget budget;
-  IndexWriter iw(dir, schema, &budget);
+  CommitSnapshotRegistry iwSnapshots(dir);
+  IndexWriter iw(iwSnapshots, schema, &budget);
   iw.mergePolicy->setMergeFactor(2);
   iw.termPartitionMinBytes = INT64_MAX;
   iw.pressureFlushFloorBytes = 1;
@@ -367,7 +370,7 @@ TEST(PressureShedDirectTest, mergeDemandRestoresParallelAdmission) {
   addDoc(firstSource, 0);
   iw.releaseInverter(firstSource, true);
   iw.commit();
-  ASSERT_EQ(1u, iw.getIndexReader()->segments().size());
+  ASSERT_EQ(1u, iw.snapshots.readers.getReader()->segments().size());
 
   // Keep the parked inverter busy while obtaining the second source inverter,
   // then hold that source flush.  Releasing the parked inverter while the source

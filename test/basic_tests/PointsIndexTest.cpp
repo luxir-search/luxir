@@ -402,7 +402,7 @@ TEST_F(PointsIndexTest, flushMatchesSingleAndMultiValuedColumns) {
   IndexResult result = helper.indexAll(docs, UpdateMessage::COMMIT);
   ASSERT_TRUE(result.success) << result.error_message;
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto& postingsReader = reader->segments()[0].postingsReader();
   MemPool pool;

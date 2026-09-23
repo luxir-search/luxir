@@ -143,7 +143,7 @@ public:
   DirectRun runStandalone(bool disabled, Iteration iteration = Iteration::NEXT) {
     DisjTwoPhaseGuard disjGuard(disabled);
     SkipStatsGuard statsGuard;
-    auto reader = helper.getIndexWriter()->getIndexReader();
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     MemPool pool;
     Query::Context context(pool, *reader);
     std::string_view phraseTerms[] = {"sa", "sb"};
@@ -195,7 +195,7 @@ public:
   DirectRun runConjunction(bool disabled) {
     DisjTwoPhaseGuard disjGuard(disabled);
     SkipStatsGuard statsGuard;
-    auto reader = helper.getIndexWriter()->getIndexReader();
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     MemPool pool;
     Query::Context context(pool, *reader);
     std::string_view firstTerms[] = {"ca", "cb"};
@@ -257,7 +257,7 @@ public:
 
   RequestRun runLegacyMaxScoreConjunction() {
     SkipStatsGuard statsGuard;
-    auto reader = helper.getIndexWriter()->getIndexReader();
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     MemPool pool;
     Query::Context context(pool, *reader);
     std::string_view firstTerms[] = {"ca", "cb"};
@@ -304,7 +304,7 @@ public:
 
   void assertScoredRouting(bool disabled) {
     DisjTwoPhaseGuard disjGuard(disabled);
-    auto reader = helper.getIndexWriter()->getIndexReader();
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     MemPool pool;
     Query::Context context(pool, *reader);
     std::string_view firstTerms[] = {"ca", "cb"};

@@ -1,17 +1,20 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "IndexWriter.h"
+#include "luxir/search/ReaderManager.h"
+#include "luxir/store/Manifest.h"
 #include <glaze/glaze.hpp>
 
 namespace luxir {
 
-std::string IndexWriter::resolvedSchema() {
-  auto schema = getSchema();
+std::string ReaderManager::resolvedSchema() {
+  auto current = snapshot();
+  auto schema = current->schema;
   std::optional<uint64_t> oldest;
-  {
-    std::lock_guard<std::mutex> lock(indexMutex);
-    oldest = oldestCommittedSchemaGen;
+  std::pmr::monotonic_buffer_resource arena;
+  auto info = Manifest::decode(current->bytes, arena);
+  for (const auto& seg : info.segments) {
+    if (seg.live_docs > 0) oldest = oldest ? std::min(*oldest, seg.schema_gen) : seg.schema_gen;
   }
   auto fields = schema->signatures();
   using Json = glz::generic_sorted_u64;

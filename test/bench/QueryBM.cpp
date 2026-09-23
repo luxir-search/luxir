@@ -171,7 +171,7 @@ static void BM_QueryBuildIndex(benchmark::State& state, int64_t nDocs, std::stri
   }
 
   // test that index was built correctly
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   int readerSegs = reader->segments().size();
   ASSERT_EQ(readerSegs, docsPerSeg.size());
   // check each segment size
@@ -257,7 +257,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
   bool hasStringSort = std::ranges::any_of(
     sortFields, [](std::string_view field) { return field.ends_with("_s"); });
   if (hasStringSort) {
-    auto reader = helper.getIndexWriter()->getIndexReader();
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     /* basic info for the ordMap
     ordMap = reader->getOrdMap(sfield);
     for (int seg = 0; seg < reader->segments().size(); seg++) {
@@ -275,7 +275,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
 
     // scan int col just to get an idea of what a full scan costs vs all the sort logic.
     if (qfield=="scan") {
-      fp = scanIntCol(sfield, *helper.getIndexWriter()->getIndexReader());
+      fp = scanIntCol(sfield, *helper.getIndexWriter()->snapshots.readers.getReader());
       continue;
     }
 

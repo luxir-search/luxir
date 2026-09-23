@@ -404,7 +404,7 @@ public:
   // True if the current index matches the shape of docsPerSeg (for index reuse).
   bool indexMatchesShape(std::span<const int32_t> docsPerSeg) {
     auto iw = getIndexWriter();
-    auto reader = iw->getIndexReader();
+    auto reader = iw->snapshots.readers.getReader();
     auto readerSegs = reader->segments().size();
     bool reuseIndex = readerSegs == docsPerSeg.size();
     if (reuseIndex) {

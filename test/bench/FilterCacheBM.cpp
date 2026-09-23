@@ -138,11 +138,12 @@ struct EffectiveFixture {
   static constexpr int32_t MAX_DOC = 2048;
 
   RAMDir dir;
+  CommitSnapshotRegistry snapshots{dir};
   IndexWriter writer;
   std::shared_ptr<IndexReader> withoutDeletes;
   std::shared_ptr<IndexReader> withDeletes;
 
-  EffectiveFixture() : writer(dir) {
+  EffectiveFixture() : writer(snapshots) {
     auto& inverter = writer.obtainInverter(1);
     auto& id = inverter.getIndexHandler("id");
     for (int32_t doc = 0; doc < MAX_DOC; doc++) {
@@ -152,7 +153,7 @@ struct EffectiveFixture {
     }
     writer.releaseInverter(inverter);
     writer.commit();
-    withoutDeletes = writer.getIndexReader(0);
+    withoutDeletes = writer.snapshots.readers.getReader(0);
 
     auto& deletes = writer.obtainInverter(2);
     for (int32_t doc = 1; doc < MAX_DOC; doc += 2) {
@@ -160,7 +161,7 @@ struct EffectiveFixture {
     }
     writer.releaseInverter(deletes);
     writer.commit();
-    withDeletes = writer.getIndexReader(0);
+    withDeletes = writer.snapshots.readers.getReader(0);
   }
 };
 

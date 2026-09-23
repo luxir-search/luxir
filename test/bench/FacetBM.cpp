@@ -321,7 +321,7 @@ static void BM_AggregateFacet(benchmark::State& state,
   state.counters["rate"] = benchmark::Counter(
       state.iterations(), benchmark::Counter::kIsRate);
   if (mode != AggregateFacetBenchMode::BUCKET_DOMAIN) {
-    auto runStats = measureFacetRuns(*helper.getIndexWriter()->getIndexReader(),
+    auto runStats = measureFacetRuns(*helper.getIndexWriter()->snapshots.readers.getReader(),
                                      bucketCardinality == 10
                                          ? "short_u10_s"
                                          : bucketCardinality == 1000

@@ -661,7 +661,7 @@ TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
   // data-file prefix, and live_gen is absent when there are no deletes.
   auto* seg = (*segments)[0]["seg"].get_if<std::string>();
   ASSERT_NE(nullptr, seg);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   EXPECT_EQ(Postings::getIndexFileNamePrefix(reader->segments()[0].segInfo.seg_id), *seg);
   EXPECT_FALSE((*segments)[0].contains("live_gen"));
@@ -2064,7 +2064,7 @@ TEST_F(HttpApiTest, jsonInvalidUrlCommitRejected) {
 TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
   LuxirNode node;
   auto writer = node.getCollection("main")->getShard()->getIndexWriter();
-  std::uint64_t before = writer->getIndexReader()->commitTime();
+  std::uint64_t before = writer->snapshots.readers.getReader()->commitTime();
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
@@ -2078,8 +2078,8 @@ TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
   auto lines = splitLines(update.body());
   glz::generic_i64 eof;
   ASSERT_FALSE(glz::read_json(eof, lines.back()));
-  EXPECT_EQ((uint64_t)eof["commit"]["index_gen"].get<int64_t>(), writer->getIndexReader()->commitId());
-  EXPECT_GT(writer->getIndexReader()->commitTime(), before);
+  EXPECT_EQ((uint64_t)eof["commit"]["index_gen"].get<int64_t>(), writer->snapshots.readers.getReader()->commitId());
+  EXPECT_GT(writer->snapshots.readers.getReader()->commitTime(), before);
 }
 
 TEST_F(HttpApiTest, ndjsonAllOrNoneStreamSuccess) {
@@ -4027,7 +4027,7 @@ TEST_F(HttpApiTest, commitResponseIdentifiesSnapshot) {
   auto snapshot = readDurableIndexInfo(helper.getIndexWriter()->dir);
   EXPECT_EQ((uint64_t)commit, snapshot->index_gen);
   EXPECT_EQ(body["commit"]["incarnation"].get<std::string>(), snapshot->incarnation);
-  EXPECT_EQ((uint64_t)commit, helper.getIndexWriter()->getIndexReader()->commitId());
+  EXPECT_EQ((uint64_t)commit, helper.getIndexWriter()->snapshots.readers.getReader()->commitId());
   auto streamed = httpRequest(port(), http::verb::post,
       "/collections/main/_update?commit=true", "{\"id\":\"streamed\"}\n",
       "application/x-ndjson");

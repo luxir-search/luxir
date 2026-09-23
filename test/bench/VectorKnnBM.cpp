@@ -361,7 +361,7 @@ std::vector<int32_t> clusteredDocsPerSeg(int64_t nDocs) {
 // build via its metadata.
 bool clusteredIndexReusable(CollectionHelper& helper, std::span<const int32_t> docsPerSeg) {
   if (!helper.indexMatchesShape(docsPerSeg)) return false;
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   for (const auto& seg : reader->segments()) {
     auto aux = seg.getAuxReader("vec.bench_v");
     if (!aux) return false;

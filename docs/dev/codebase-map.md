@@ -13,6 +13,9 @@ locations, browse `src/luxir/<area>/`.
    - `LuxirNode`: Central coordinator managing collections and services
 
 2. **Search Engine** (`src/luxir/search/`)
+   - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
+     searches do not require an `IndexWriter`. Schema-only snapshots share physical cores.
+   - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
    - `IndexReader` is for reading a whole index and contains a `PostingsReader` per index segment
      - Physical field catalog records available columns and stored resources;
        logical retrieval discovery is cached per reader and schema identity
@@ -66,7 +69,10 @@ locations, browse `src/luxir/<area>/`.
      - Manages `Inverter` instances, flushing, merging, and commits.
      - Atomically pins schema at update admission; stale inverters flush at
        checkout or release, keeping one schema per segment
-   - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
+   - `CommitSnapshotRegistry`: Shard-owned current snapshot and commit-ID reservations,
+     lazy idle expiry, and retained-byte eviction. Publishes into its ReaderManager;
+     accepts retirement from a writer or installer independently. Retirement preserves
+     both snapshot reservations and writer/merge ownership.
    - `Inverter`: Single-threaded document processing under one pinned schema.
      - `InputHandler`: One logical dispatcher per document key; stores source once
        when the primary enables it and sends the submitted value to every branch

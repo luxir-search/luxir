@@ -51,7 +51,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   helper.index(flatdoc("id_s", "c", "x_i", -5, "f_f", 0.0f,
                        "den_i", 1), UpdateMessage::COMMIT);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
@@ -247,7 +247,7 @@ TEST_F(ValueExprKernelTest, negativeValuesAndRuntimeFiniteGuard) {
                UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "pos", "x_i", 4, "den_i", 2),
                UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
@@ -297,7 +297,7 @@ TEST_F(ValueExprKernelTest, provenInvalidityIsRejectedAtBind) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "zero", "x_i", 0), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "one", "x_i", 1), UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
@@ -318,7 +318,7 @@ TEST_F(ValueExprKernelTest, provenInvalidityIsRejectedAtBind) {
 TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "x_i", 2), UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
@@ -413,7 +413,7 @@ TEST_F(ValueExprKernelTest, columnInfinityIsAValueAndNaNIsMissing) {
   helper.index(flatdoc("id_s", "nan", "weight_d",
                        std::numeric_limits<double>::quiet_NaN()),
                UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
   MemPool pool;

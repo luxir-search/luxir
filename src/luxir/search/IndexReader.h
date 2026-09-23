@@ -163,7 +163,7 @@ public:
   };
 
 private:
-  friend class IndexWriter;
+  friend class ReaderManager;
 
   // A physical snapshot is shared directly by readers with different schemas.
   // Its lazy catalogs and maps never retain a reader or schema.

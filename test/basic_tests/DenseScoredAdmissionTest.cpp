@@ -124,7 +124,7 @@ AdmissionRun runShape(CollectionHelper& helper, const Shape& shape,
 
 int64_t runPullCount(CollectionHelper& helper, const Shape& shape,
                      int32_t topK) {
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   MemPool pool;
   Query::Context context(pool, *reader);
   TermQuery lead("body_w", shape.lead);
@@ -269,7 +269,7 @@ TEST_F(DenseScoredAdmissionTest, segmentsDecideIndependently) {
   helper.indexAll(
       makeSegment("outside", std::span{&segmentOutside, 1}),
       UpdateMessage::COMMIT);
-  ASSERT_EQ(helper.getIndexWriter()->getIndexReader()->segments().size(), 2);
+  ASSERT_EQ(helper.getIndexWriter()->snapshots.readers.getReader()->segments().size(), 2);
 
   AdmissionRun enabled = runShape(
       helper, segmentInside, 100, false, false);

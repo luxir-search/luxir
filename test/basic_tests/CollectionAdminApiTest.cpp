@@ -120,7 +120,7 @@ TEST_F(CollectionAdminApiTest, httpLifecycleAndValidation) {
                                R"({"name":"admin_lifecycle"})");
   ASSERT_EQ(200, recreated.result_int()) << recreated.body();
   auto fresh = node.getCollection("admin_lifecycle");
-  EXPECT_EQ(0, fresh->getShard()->getIndexWriter()->getIndexReader()->liveDocs());
+  EXPECT_EQ(0, fresh->getShard()->getIndexWriter()->snapshots.readers.getReader()->liveDocs());
 
   auto deleteMain = httpRequest(port, http::verb::post, "/collections/_delete",
                                 R"({"name":"main"})");
@@ -259,10 +259,10 @@ TEST_F(CollectionAdminApiTest, heldReaderSearchSurvivesDelete) {
   ASSERT_TRUE(indexed.success) << indexed.error_message;
 
   auto writer = helper.getIndexWriter();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   node.deleteCollection("admin_held_reader");
 
-  EXPECT_THROW(writer->getIndexReader(), IndexWriterClosedError);
+  EXPECT_THROW(writer->snapshots.readers.getReader(), ApiError);
   EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "admin_held_reader"));
 
   MemPool pool;
@@ -352,9 +352,9 @@ TEST_F(CollectionAdminApiTest, manifestsOwnSchemaAndIncarnation) {
       EXPECT_EQ(36u, incarnation.size());
 
       ASSERT_TRUE(helper.index(flatdoc("id", "published"), UpdateMessage::COMMIT).success);
-      auto old = writer->getIndexReader();
+      auto old = writer->snapshots.readers.getReader();
       auto physical = readDurableIndexInfo(writer->dir);
-      auto cachePublications = writer->getFilterCache()->readerPublicationsForTest();
+      auto cachePublications = writer->snapshots.readers.filterCache->readerPublicationsForTest();
       ASSERT_TRUE(helper.index(flatdoc("id", "buffered")).success);
       auto schema = Schema::createDefaultSchema();
       helper.collection().setSchema(schema);
@@ -364,10 +364,10 @@ TEST_F(CollectionAdminApiTest, manifestsOwnSchemaAndIncarnation) {
       EXPECT_EQ(physical->update_version, changed->update_version);
       EXPECT_EQ(physical->core_gen, changed->core_gen);
       EXPECT_EQ(fileInventory(*physical), fileInventory(*changed));
-      auto current = writer->getIndexReader(UINT64_MAX);
+      auto current = writer->snapshots.readers.getReader(UINT64_MAX);
       EXPECT_EQ(1, current->liveDocs());
       EXPECT_EQ(old->segments().data(), current->segments().data());
-      EXPECT_EQ(cachePublications, writer->getFilterCache()->readerPublicationsForTest());
+      EXPECT_EQ(cachePublications, writer->snapshots.readers.filterCache->readerPublicationsForTest());
       EXPECT_EQ(helper.collection().getSchema(), current->schema());
       EXPECT_EQ(0u, schema->gen_);
       EXPECT_NE(schema, old->schema());
@@ -383,7 +383,7 @@ TEST_F(CollectionAdminApiTest, manifestsOwnSchemaAndIncarnation) {
       if (disk) {
         EXPECT_EQ(incarnation, manifest->incarnation);
         EXPECT_EQ(schemaGen, helper.collection().getSchema()->gen_);
-        EXPECT_EQ(1, helper.getIndexWriter()->getIndexReader()->liveDocs());
+        EXPECT_EQ(1, helper.getIndexWriter()->snapshots.readers.getReader()->liveDocs());
       } else {
         EXPECT_NE(incarnation, manifest->incarnation);
       }
@@ -422,7 +422,8 @@ TEST_F(CollectionAdminApiTest, createPreservesUnregisteredStorage) {
   FSDirectory existing(data.path() / "c" / "unregistered");
   std::string incarnation;
   {
-    IndexWriter writer(existing);
+    CommitSnapshotRegistry writerSnapshots(existing);
+    IndexWriter writer(writerSnapshots);
     incarnation = test::readDurableIndexInfo(existing)->incarnation;
   }
   EXPECT_THROW(node.createCollection(nullptr, "unregistered"), std::filesystem::filesystem_error);

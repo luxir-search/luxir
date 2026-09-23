@@ -150,7 +150,7 @@ void SearchEngine::getResources(SearchRequest& req) {
   constexpr uint64_t maxUs = std::numeric_limits<uint64_t>::max();
   uint64_t freshnessUs = request.freshness_ms > maxUs / 1000
       ? maxUs : request.freshness_ms * 1000;
-  req.reader = collection->getShard()->getIndexWriter()->getIndexReader(freshnessUs);
+  req.reader = collection->getReaderManager().getReader(freshnessUs);
   req.schema = req.reader->schema();
   auto* filterCache = req.reader->filterCache();
   req.filterUses = std::make_shared<FilterCache::UseRegistry>(

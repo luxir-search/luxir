@@ -289,7 +289,7 @@ TEST_F(NumericRangeZoneMapTest, deletedOnlyMatchesKeepScorerPresent) {
   ASSERT_TRUE(helper.deleteById(
       "deleted_range_0", UpdateMessage::COMMIT).success);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   MemPool pool;
   Query::Context context(pool, *reader);

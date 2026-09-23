@@ -570,7 +570,7 @@ TEST_F(FieldVariantsProjectionTest, invalidSelectorsTeachSourceForms) {
 }
 
 TEST_F(FieldVariantsProjectionTest, retrievableCatalogUsesSchemaIdentityAndPrimaryPresence) {
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto schema = helper.collection().getSchema();
   auto catalog = reader->retrievableFields();
   EXPECT_EQ(catalog.data(), reader->retrievableFields().data());
@@ -585,7 +585,7 @@ TEST_F(FieldVariantsProjectionTest, retrievableCatalogUsesSchemaIdentityAndPrima
   auto other = b.build(schema.get());
   other->gen_ = schema->gen_;  // publication must assign a fresh generation to a copy
   helper.getIndexWriter()->setSchema(other);
-  auto replacement = helper.getIndexWriter()->getIndexReader(UINT64_MAX);
+  auto replacement = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
   EXPECT_EQ(schema, reader->schema());
   EXPECT_EQ(helper.collection().getSchema(), replacement->schema());
   EXPECT_NE(other, replacement->schema());
@@ -668,7 +668,7 @@ TEST_F(DocFormatTest, discoveryRequiresConfiguredStoreOrPrimaryColumnFallback) {
   b.set(ch.collection());
   ASSERT_TRUE(ch.index(flatdoc("id", "a", "text", "Source", "string", "Value"),
                        UpdateMessage::COMMIT).success);
-  auto reader = ch.getIndexWriter()->getIndexReader();
+  auto reader = ch.getIndexWriter()->snapshots.readers.getReader();
   auto original = reader->retrievableFields();
 
   // Both names occur in the old store. Only STRING has a usable fallback
@@ -677,7 +677,7 @@ TEST_F(DocFormatTest, discoveryRequiresConfiguredStoreOrPrimaryColumnFallback) {
   string.stored_resource = "_stored_cold_";
   auto schema = b.build(ch.collection().getSchema().get());
   ch.collection().setSchema(schema);
-  auto replacement = ch.getIndexWriter()->getIndexReader();
+  auto replacement = ch.getIndexWriter()->snapshots.readers.getReader();
   auto current = replacement->retrievableFields();
   EXPECT_NE(original.data(), current.data());
   ASSERT_EQ(2u, current.size());
@@ -753,11 +753,11 @@ TEST_F(DocFormatTest, readerCapturesSchemaAfterPhysicalOpen) {
   CollectionHelper ch;
   indexBooks(ch);
   auto writer = ch.getIndexWriter();
-  auto before = writer->getIndexReader();
+  auto before = writer->snapshots.readers.getReader();
   ASSERT_TRUE(ch.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success);
   std::shared_ptr<Schema> published;
   Signal::listen("indexReaderOpened", [&](void* source, void*, void*) -> void* {
-    if (source == writer.get()) {
+    if (source == &writer->snapshots.readers) {
       SchemaBuilder b;
       b.field("added").type = api::FieldDef::FieldClass::STRING;
       published = b.set(ch.collection());
@@ -765,12 +765,12 @@ TEST_F(DocFormatTest, readerCapturesSchemaAfterPhysicalOpen) {
     return nullptr;
   });
   auto cleanup = scope_guard([] { Signal::unlisten("indexReaderOpened"); });
-  auto after = writer->getIndexReader();
+  auto after = writer->snapshots.readers.getReader();
   ASSERT_NE(nullptr, published);
   EXPECT_EQ(published, after->schema());
   EXPECT_NE(published, before->schema());
   EXPECT_GT(after->commitTime(), before->commitTime());
-  EXPECT_EQ(after, writer->getIndexReader());
+  EXPECT_EQ(after, writer->snapshots.readers.getReader());
 }
 
 TEST_F(DocFormatTest, emptyStringAndVectorSelectorsKeepColumnsEmpty) {

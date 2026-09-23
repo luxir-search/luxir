@@ -1493,7 +1493,7 @@ private:
         std::shared_ptr<Collection> collection =
             self->node_.resolveOrCreateCollection(state->proto.collection);
         auto shard = collection->getShard();
-        auto iw = shard->getIndexWriter();
+        auto iw = shard->requireIndexWriter();
 
         class BlockingUpdateMessage : public ProtoUpdateMessage {
         public:
@@ -1654,7 +1654,7 @@ private:
         std::optional<ErrorInfo> failure;
         try {
           auto collection = self->node_.resolveCollection(coll);
-          out = collection->getShard()->getIndexWriter()->resolvedSchema();
+          out = collection->getReaderManager().resolvedSchema();
         } catch (const std::exception& e) {
           failure = classifyException(e, ErrorKind::INTERNAL);
         }
@@ -2239,7 +2239,7 @@ private:
 
     try {
       it->second.collection = node_.resolveOrCreateCollection(collectionName);
-      it->second.indexWriter = it->second.collection->getShard()->getIndexWriter();
+      it->second.indexWriter = it->second.collection->getShard()->requireIndexWriter();
     } catch (...) {
       err = currentExceptionInfo(ErrorKind::INTERNAL);
       state->writerCache.erase(it);

@@ -230,7 +230,7 @@ TEST_F(ValueExprSortTest, collectorReuseAndPairwiseMergeKeepOnlyValues) {
     helper.index(flatdoc("id_s", std::to_string(value), "key_i", value),
                  UpdateMessage::COMMIT);
   }
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto schema = helper.collection().getSchema();
   google::protobuf::Arena* arena = createArena();
   ValueExprOptions options{schema.get(), {}};

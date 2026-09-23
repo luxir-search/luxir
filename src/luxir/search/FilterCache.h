@@ -60,7 +60,7 @@ struct FilterCacheConfig {
 // commitTime and seg_id. They are admitted only at a canonical reader-live
 // PrepareContext, published and evicted atomically as a unit, and never enter
 // the raw per-segment APIs. The semantic map key contains no reader version.
-// The owning IndexWriter bounds the cache lifetime so its seg_id namespace can
+// The owning ReaderManager bounds the cache lifetime so its seg_id namespace can
 // never be reused underneath either value kind.
 //
 // Use performs the one outer-map lookup for a query/filter pair, snapshots the

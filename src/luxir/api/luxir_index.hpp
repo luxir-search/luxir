@@ -44,6 +44,7 @@ struct AuxIndexInfo {
 };
 
 struct SegmentInfo {
+  uint64_t next_overlay_gen = 0;
   uint64_t seg_id = 0;
   uint64_t live_gen = 0;
   uint64_t min_version = 0;
@@ -57,6 +58,7 @@ struct SegmentInfo {
 };
 
 struct IndexInfo {
+  uint64_t last_seg_id = 0;
   std::optional<SchemaInfo> schema;
   std::string_view incarnation;
   uint64_t version = 0;

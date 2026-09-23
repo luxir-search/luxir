@@ -2825,7 +2825,7 @@ TEST_F(TermScorerTest, phraseConjunctionDefersPositionChecks) {
   constexpr int32_t topK = 100;
   CollectionHelper helper("main");
   addPhraseDeferralDocs(helper, nDocs, filterStep);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   int64_t rawPhraseChecks = countStandalonePhraseMatchChecks(*reader);
   EXPECT_EQ(nDocs, rawPhraseChecks);
@@ -4056,7 +4056,7 @@ TEST_F(TermScorerTest, mandOptBulkZeroAndOneSurvivingOptionalScorers) {
   CollectionHelper helper("mand_opt_zero_one_surviving_optional");
   helper.index(flatdoc("id", "z0", "body_w", "mob_zero_mand"), UpdateMessage::COMMIT);
   helper.index(flatdoc("id", "z1", "body_w", "mob_zero_mand mob_one_opt"), UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   MemPool pool;
   Query::Context qContext(pool, *reader);
@@ -4424,7 +4424,7 @@ TEST_F(TermScorerTest, mandOptBulkPreparedSourcesCanRouteToBulk) {
   CollectionHelper helper("main");
   helper.index(flatdoc("id", "prep0", "body_w", "prep_mand prep_opt"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "prep1", "body_w", "prep_mand"), UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   MemPool pool;
   Query::Context qContext(pool, *reader);
@@ -7232,7 +7232,7 @@ TEST_F(TermScorerTest, WindowFilterIntersectsDirectTermsAcrossWindowJumps) {
                            "body_w", body));
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   MemPool pool;
   Query::Context context(pool, *reader);
@@ -7597,7 +7597,7 @@ TEST_F(TermScorerTest, ScoredDirectTermFiltersRouteToAttachedBulks) {
                            "body_w", body));
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   constexpr int32_t topK = 20;
 
   auto runBulk = [&](Query& query, std::type_index expectedType) {
@@ -8052,7 +8052,7 @@ TEST_F(TermScorerTest, FilteredConjunctionClampsSparseProductionWindows) {
 TEST_F(TermScorerTest, maxScoreDisjunctionPathsMatchReferences) {
   CollectionHelper helper("main");
   addMaxScoreDisjunctionDocs(helper);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   const int32_t totalDocs = 3 * kMaxScoreDisjunctionSegDocs;
   std::array<std::string_view, 3> terms = {"common", "medium", "rare"};
 
@@ -8584,7 +8584,7 @@ TEST_F(TermScorerTest, ScoredWordProbeApplyToCandidatesMatchesPerDocAdvanceAcros
   CollectionHelper helper("main");
   auto postings = makeMixedProbePostings();
   indexProbeTermDocs(helper, "probe_mix", postings, "probe_mix");
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   const int32_t packedOrd = Postings::DOCS_BLOCK_SIZE;
   const int32_t wordOrd = 2 * Postings::DOCS_BLOCK_SIZE;
 
@@ -8628,7 +8628,7 @@ TEST_F(TermScorerTest, CandidateLeapfrogPreservesBatchedScoreAndMatchCompaction)
   indexProbeTermDocs(
       helper, "leapfrog", postings, "leapfrog",
       2 * batchSize - postings.back());
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   std::vector<int32_t> candidates((size_t) (2 * batchSize));
   std::iota(candidates.begin(), candidates.end(), 0);
 
@@ -8699,7 +8699,7 @@ TEST_F(TermScorerTest, RetainMatchesCompactsAcrossPostingsBlockShapesAndBatches)
   CollectionHelper helper("main");
   auto postings = makeMixedProbePostings();
   indexProbeTermDocs(helper, "retain_mix", postings, "retain_mix");
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   MemPool pool;
   Query::Context qContext(pool, *reader);
@@ -8740,7 +8740,7 @@ TEST_F(TermScorerTest, FillScoreBlockCountLimitedCallsResumeOnBothFillPaths) {
   CollectionHelper helper("main");
   auto postings = makeMixedProbePostings();
   indexProbeTermDocs(helper, "count_limited", postings, "count_limited");
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   int32_t start = postings[5];
   int32_t upTo = postings.back() + 1;
@@ -8765,7 +8765,7 @@ TEST_F(TermScorerTest, ScoredWordProbeRankAndEarlyCompactionKeepsCursorCoherent)
   CollectionHelper helper("main");
   auto postings = makeWordProbeBlock(0);
   indexProbeTermDocs(helper, "rank_probe", postings, "rank_probe");
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   std::vector<int32_t> rankCandidates = {
     postings[0],
@@ -8822,7 +8822,7 @@ TEST_F(TermScorerTest, ScoredWordProbeSweepThenEssentialFillAcrossWindowBoundary
   CollectionHelper helper("main");
   auto postings = makeWordProbeBlock(0);
   indexProbeTermDocs(helper, "flip_probe", postings, "flip_probe");
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   MemPool pool;
   Query::Context qContext(pool, *reader);
@@ -8870,7 +8870,7 @@ TEST_F(TermScorerTest, ScoredWordProbeSkipStatsSeparateFromPackedFallback) {
     CollectionHelper helper("main");
     auto postings = makeWordProbeBlock(0);
     indexProbeTermDocs(helper, "word_stats_probe", postings, "word_stats_probe");
-    auto reader = helper.getIndexWriter()->getIndexReader();
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     std::vector<int32_t> candidates = {
       postings[0],
       postings[1] + 1,
@@ -8887,7 +8887,7 @@ TEST_F(TermScorerTest, ScoredWordProbeSkipStatsSeparateFromPackedFallback) {
     CollectionHelper helper("main");
     auto postings = makePackedProbeBlock(0);
     indexProbeTermDocs(helper, "packed_stats_probe", postings, "packed_stats_probe");
-    auto reader = helper.getIndexWriter()->getIndexReader();
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     std::vector<int32_t> candidates = {0, 1, 8, 64, 65, postings.back()};
     auto expected = runPerDocTermCandidateSweep(*reader, "packed_stats_probe",
                                                 candidates, false);
@@ -8986,7 +8986,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerHighThetaTwoClauseCorpusChecks) {
   constexpr int32_t windowEnd = 2 * DocsEnumMeta::L1_DOCS;
   CollectionHelper helper("main");
   addHighThetaTwoClauseDocs(helper, windowStart, windowEnd);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   std::array<std::string_view, 2> terms = {"high_a", "high_b"};
 
   auto scores = exhaustiveWindowScores(*reader, terms, windowStart, windowEnd);
@@ -9272,7 +9272,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerFilteredDeletedTopKMatchesPull) {
 TEST_F(TermScorerTest, MaxScoreBulkScorerTiesMatchExhaustive) {
   CollectionHelper helper("main");
   addBulkTieDisjunctionDocs(helper);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   const int32_t k = 9;
   std::array<std::string_view, 2> terms = {"tie_a", "tie_b"};
 
@@ -9284,7 +9284,7 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerTiesMatchExhaustive) {
 TEST_F(TermScorerTest, WandMinShouldMatchTopKMatchesExhaustive) {
   CollectionHelper helper("main");
   addWandMsmDocs(helper);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   const int32_t totalDocs = 8 * Postings::DOCS_BLOCK_SIZE + 73;
 
   for (int32_t minMatch : {2, 3}) {
@@ -9310,7 +9310,7 @@ TEST_F(TermScorerTest, WandManyClauseMsmMatchesExhaustive) {
   CollectionHelper helper("main");
   const int32_t numTerms = 12;
   addManyTermMsmDocs(helper, numTerms);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   for (int32_t minMatch : {3, 6}) {
     for (int32_t k : {5, 200}) {
@@ -9416,7 +9416,7 @@ TEST_F(TermScorerTest, CrossSegmentAccumulatorCorpusChecks) {
   CollectionHelper helper("main");
   std::vector<std::vector<std::string>> idsBySeg;
   addCrossSegmentAccumulatorDocs(helper, idsBySeg, 3);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   {
     SCOPED_TRACE("RealOpMatchesExhaustive");

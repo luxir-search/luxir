@@ -368,7 +368,7 @@ TEST_F(SortCollectorTest, numericKeyGatherMatchesFallbackAcrossColumnShapes) {
   }
   ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), 2);
   int64_t hits = reader->liveDocs();
   for (std::string_view field :
@@ -397,7 +397,7 @@ TEST_F(SortCollectorTest, keyGatherTieBreaksAcrossReversedSegments) {
       flatdoc("id", "early", "key_i", 10), UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper.index(
       flatdoc("id", "late", "key_i", 10), UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), 2);
   std::array<int32_t, 2> reversed = {1, 0};
 
@@ -431,7 +431,7 @@ TEST_F(SortCollectorTest, keyGatherWarmupCrossesChunkPositions) {
     docs.push_back(std::move(input));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   for (int32_t topCount : topCounts) {
     std::string field = "warm" + std::to_string(topCount) + "_i";
@@ -463,7 +463,7 @@ TEST_F(SortCollectorTest, sparseLandingReusesPresentCandidate) {
     docs.push_back(std::move(input));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   std::array<int32_t, 2> candidates = {5, 7};
 
   auto run = [&](std::string_view field, bool disableGather) {
@@ -499,7 +499,7 @@ TEST_F(SortCollectorTest, numericMissingPlacementIsDirectionIndependent) {
       flatdoc("id", "d3", "value_i", 20),
   };
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   struct Case {
     SortField::SortOrder order;
@@ -536,7 +536,7 @@ TEST_F(SortCollectorTest, collectWindowFallbackCountsEachHitOnce) {
         "primary_i", doc % 3, "secondary_i", 9 - doc));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   IntFieldType primaryType("primary_i");
   IntFieldType secondaryType("secondary_i");
   std::vector<SortClause> clauses = {
@@ -916,7 +916,7 @@ TEST_F(SortCollectorTest, smallEdge) {
   helper.index(flatdoc("id_s", "doc5", "price_i", 25, "rating_i", 5), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "doc6", "price_i", 50, "rating_i", 4), UpdateMessage::COMMIT);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   // Create a mock IntFieldType for testing
   IntFieldType priceType("price_i");
@@ -1040,7 +1040,7 @@ TEST_F(SortCollectorTest, randomSmall) {
       return a.first < b.first;
     });
 
-    auto reader = helper.getIndexWriter()->getIndexReader();
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
     auto collect = [&](FieldSortCollector& collector, int32_t seg) {
       auto* postingsReader = &reader->segments()[seg].postingsReader();
@@ -1129,7 +1129,7 @@ TEST_F(SortCollectorTest, DeepLimitGrowsSlotStorageOnDemand) {
                            "sort_i", (int64_t)((i * 37) % 251)));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   // collectWindow path (direct slotKeys writes across growth).
   auto exact = collectNumericWindows(*reader, "sort_i", nDocs, SortField::ASC,
@@ -1315,7 +1315,7 @@ TEST_F(SortCollectorTest, SegmentModeIsParseBoundAndDoesNotBuildOrdMap) {
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "name_s", "b"), UpdateMessage::COMMIT);
   helper.index(flatdoc("id_s", "b", "name_s", "a"), UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(2u, reader->segments().size());
   size_t cacheSize = reader->getOrdMapCacheSize();
 
@@ -1358,7 +1358,7 @@ TEST_F(SortCollectorTest, SegmentOrdBottomAnchors) {
 
   helper.index(flatdoc("id_s", "absent"), UpdateMessage::COMMIT);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto compare = [&](int32_t pivotDoc, int32_t targetSegment, int32_t candidateDoc,
                      FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST,
                      bool reversed = false) {
@@ -1402,7 +1402,7 @@ TEST_F(SortCollectorTest, SegmentOrdCollectorReuseAcrossAdversarialSegments) {
   helper.index(flatdoc("id_s", "s3a", "name_s", "a"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "s3d", "name_s", "d"), UpdateMessage::COMMIT);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   StrFieldType fieldType("name_s");
   SortField field("name_s", fieldType, SortField::ASC,
                   FieldComparator::MISSING_LAST, StringSortMode::SEGMENT);
@@ -1453,7 +1453,7 @@ TEST_F(SortCollectorTest, SegmentOrdPairwiseMergeOwnsCopiedTerms) {
     return a.first < b.first;
   });
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   StrFieldType fieldType("name_s");
   SortField field("name_s", fieldType, SortField::ASC,
                   FieldComparator::MISSING_LAST, StringSortMode::SEGMENT);
@@ -3249,7 +3249,7 @@ TEST_F(SortCollectorTest, missingFirstBlocksCandidateIntervals) {
   helper.index(flatdoc("id_s", "d1"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "d2", "s_s", "a"), UpdateMessage::COMMIT);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto& leaf = reader->segments()[0];
   using Status = FieldComparator::OrdIntervalStatus;
   for (bool missingFirst : {false, true}) {
@@ -3371,7 +3371,7 @@ TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
       ASSERT_EQ(docs->found.value_or(0), docId) << "Should match all documents";
 
       // Debug: print how many segments we have
-      auto reader = helper.getIndexWriter()->getIndexReader();
+      auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
       // Verify results are in expected order
       const auto& idCol = std::get<luxir::api::ColStr>(docs->columns.at("id_s").kind);

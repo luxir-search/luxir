@@ -260,7 +260,7 @@ TEST_F(NumericRangePointsTest, exactSetUsesCoalescedPointRunsForCostAndShape) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
 
   const std::array<int64_t, 5> values{1022, 1023, 1024, 1025, 1300};
   const std::array<PointsReader::ValueRange, 2> intervals{{
@@ -309,7 +309,7 @@ TEST_F(NumericRangePointsTest, absentExactSetInsideEnvelopeIsStructurallyEmpty) 
       {flatdoc("id", "zero", "set_gap", 0),
        flatdoc("id", "ten", "set_gap", 10)},
       UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   const std::array<int64_t, 2> values{5, 7};
   const std::array<PointsReader::ValueRange, 2> intervals{{
@@ -357,7 +357,7 @@ TEST_F(NumericRangePointsTest, randomizedOracleAcrossScorerAndBulkPaths) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
 
   for (int32_t i = 0; i < 18; i++) {
     int64_t lo = -8000 + (int64_t)((i * 1237) % 12000);
@@ -424,7 +424,7 @@ TEST_F(NumericRangePointsTest, bitsetLeavesMatchEveryQueryArm) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
   SegFieldInfo info = fieldInfo(segment, "bitset_point");
   PointsReader points(segment.postingsReader(), info);
@@ -483,7 +483,7 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
 
   auto sweepShape = [&](std::string_view field, int64_t lo, int64_t hi,
@@ -658,7 +658,7 @@ TEST_F(NumericRangePointsTest, optionalComplementAndMultiLeafDedup) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
 
   auto optionalExpected = oracle(optional, 0, 900);
   EXPECT_EQ(selectedScorer(*reader, "optional_point", 0, 900,
@@ -694,7 +694,7 @@ TEST_F(NumericRangePointsTest, fanoutCostAndArrayBitsetBoundary) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
 
   MemPool pool;
@@ -735,7 +735,7 @@ TEST_F(NumericRangePointsTest, exactCountDuplicatesAndBulkDomain) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   EXPECT_EQ(exactCount(*reader, "duplicate_endpoint", 7, 7), 600);
   EXPECT_EQ(exactCount(*reader, "duplicate_endpoint", 7, 9), N);
 
@@ -783,7 +783,7 @@ TEST_F(NumericRangePointsTest, arrayPathDedupsMultiValuedDuplicates) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
 
   auto expected = oracle(values, 500'000, 500'001);
   ASSERT_EQ(expected, std::vector<int32_t>{3});
@@ -827,7 +827,7 @@ TEST_F(NumericRangePointsTest, boundaryInsideGcdStepAndRawLeaf) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
 
   for (auto [lo, hi] : {std::pair<int64_t, int64_t>{3, 5}, {3, 4}, {4, 5},
                         {3, 3}, {1, 399}, {-1, 1}, {395, 399}}) {
@@ -858,7 +858,7 @@ TEST_F(NumericRangePointsTest, missingRangeInsideEnvelopeHasEmptyShape) {
       {flatdoc("id", "zero", "fence_gap", 0),
        flatdoc("id", "ten", "fence_gap", 10)},
       UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   MemPool pool;
   QueryState state(pool, *reader, "fence_gap", 5, 5);
@@ -900,7 +900,7 @@ TEST_F(NumericRangePointsTest, mergedSegmentRetainsPoints) {
     writer->commit();
   }
   writer->mergeSegments();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), 1);
   SegFieldInfo info = fieldInfo(reader->segments()[0], "merged_range");
   ASSERT_NE(info.pointsMetaOff, 0);
@@ -924,7 +924,7 @@ TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
       flatdoc("id", "s1-a", "merge_values_is", vec_i(2, 2, 10)),
       flatdoc("id", "s1-b", "merge_values_is", vec_i(14))};
   ASSERT_TRUE(helper.indexAll(source1, UpdateMessage::COMMIT).success);
-  auto firstReader = writer->getIndexReader();
+  auto firstReader = writer->snapshots.readers.getReader();
   ASSERT_EQ(firstReader->segments().size(), 1);
   EXPECT_NE(fieldInfo(firstReader->segments()[0],
                       "merge_values_is").pointsMetaOff, 0);
@@ -943,7 +943,7 @@ TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
   ASSERT_TRUE(helper.indexAll(source4, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper.deleteById("s2-delete", UpdateMessage::COMMIT).success);
 
-  auto sourceReader = writer->getIndexReader();
+  auto sourceReader = writer->snapshots.readers.getReader();
   ASSERT_EQ(sourceReader->segments().size(), 4);
   int32_t pointSources = 0;
   int32_t synthesizedSources = 0;
@@ -959,7 +959,7 @@ TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
   EXPECT_EQ(absentSources, 1);
 
   writer->mergeSegments();
-  auto mergedReader = writer->getIndexReader();
+  auto mergedReader = writer->snapshots.readers.getReader();
   ASSERT_EQ(mergedReader->segments().size(), 1);
   auto& mergedSegment = mergedReader->segments()[0];
   SegFieldInfo mergedInfo = fieldInfo(mergedSegment, "merge_values_is");
@@ -973,7 +973,7 @@ TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
   std::vector<Doc> liveDocs = {source1[0], source1[1], source2[0], source2[2],
                                source3[0], source3[1], source4[0], source4[1]};
   ASSERT_TRUE(fresh.indexAll(liveDocs, UpdateMessage::COMMIT).success);
-  auto freshReader = fresh.getIndexWriter()->getIndexReader();
+  auto freshReader = fresh.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(freshReader->segments().size(), 1);
 
   auto merged = mergedPoints.readAll();

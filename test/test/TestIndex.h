@@ -150,6 +150,7 @@ namespace luxir::test {
   class TestIndex {
   public:
     RAMDir dir;
+    CommitSnapshotRegistry snapshots{dir};
     MemPool pool;
     std::unique_ptr<IndexWriter> iw;
     Inverter* inverter = nullptr;
@@ -165,7 +166,7 @@ namespace luxir::test {
 
     void initWriter() {
       if (iw.get() == nullptr) {
-        iw = std::make_unique<IndexWriter>(dir);
+        iw = std::make_unique<IndexWriter>(snapshots);
       }
       inverter = &iw->obtainInverter();
       gen = inverter->getPostingsWriter().getSegId();
@@ -194,7 +195,7 @@ namespace luxir::test {
     }
 
     void initReader() {
-      // auto indexReader = iw->getIndexReader();
+      // auto indexReader = iw->snapshots.readers.getReader();
       reader = std::make_shared<IndexReader>(dir);
     }
 

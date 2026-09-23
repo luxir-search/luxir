@@ -272,7 +272,7 @@ TEST_F(SearchParserTest, topDocsExprAndNamedFilterCompose) {
   shapeReq->topDocs("q").exprQuery("body_w:a AND (body_w:b OR body_w:c)")
       .withStats().fields({"id"}).limit(-1).matchFilter("keep_s", "yes");
   shapeReq->schema = helper.collection().getSchema();
-  shapeReq->reader = helper.getIndexWriter()->getIndexReader();
+  shapeReq->reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ProtobufSearchParser parser(*shapeReq);
   SearchOp* root = parser.parse();
   auto* topDocs = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
@@ -316,7 +316,7 @@ TEST_F(SearchParserTest, selectedFiltersAppendInChildKeyOrder) {
     facet.selected = selected;
   }
   request->schema = helper.collection().getSchema();
-  request->reader = helper.getIndexWriter()->getIndexReader();
+  request->reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ProtobufSearchParser parser(*request);
   SearchOp* root = parser.parse();
   auto* parsed = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
@@ -344,7 +344,7 @@ TEST_F(SearchParserTest, absentQueryIsMatchAllAndNormalizesAway) {
   shapeReq->topDocs("q").withStats().fields({"id"}).limit(-1)
       .matchFilter("keep_s", "yes");
   shapeReq->schema = helper.collection().getSchema();
-  shapeReq->reader = helper.getIndexWriter()->getIndexReader();
+  shapeReq->reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ProtobufSearchParser parser(*shapeReq);
   SearchOp* root = parser.parse();
   auto* topDocs = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
@@ -406,7 +406,7 @@ TEST_F(SearchParserTest, normalizationScoreModesAndStringComparator) {
   helper.index(flatdoc("id_s", "b", "name_s", "a", "price_i", 1,
                        "popularity_i", 20, "body_w", "term"),
                UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   StringSortModeGuard stringMode(StringSortMode::SEGMENT);
 
   auto inspect = [&](std::string_view expression, qb::SortDir direction,
@@ -497,7 +497,7 @@ TEST_F(SearchParserTest, getNumberControlsPruningWeightFlag) {
     auto& topDocs = request->collection("main").topDocs("q")
         .prefixQuery("body_w", "ap").limit(10);
     topDocs.getNumber(getNumber);
-    request->reader = helper.getIndexWriter()->getIndexReader();
+    request->reader = helper.getIndexWriter()->snapshots.readers.getReader();
     request->schema = helper.collection().getSchema();
     ProtobufSearchParser parser(*request);
     auto* root = static_cast<RootOp*>(parser.parse());
@@ -530,7 +530,7 @@ TEST_F(SearchParserTest, domainVariantPlanIsInertOrDedupedAtParseTime) {
     } else {
       top.matchFilter("brand_s", "acme");
     }
-    request->reader = helper.getIndexWriter()->getIndexReader();
+    request->reader = helper.getIndexWriter()->snapshots.readers.getReader();
     request->schema = helper.collection().getSchema();
     ProtobufSearchParser parser(*request);
     auto* root = static_cast<RootOp*>(parser.parse());
@@ -566,7 +566,7 @@ TEST_F(SearchParserTest, opNestingDepthCapped) {
     for (int i = 1; i < depth; i++) {
       cursor = &cursor->topDocs("op" + std::to_string(i));
     }
-    request->reader = helper.getIndexWriter()->getIndexReader();
+    request->reader = helper.getIndexWriter()->snapshots.readers.getReader();
     request->schema = helper.collection().getSchema();
     ProtobufSearchParser parser(*request);
     parser.parse();

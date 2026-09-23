@@ -1142,7 +1142,7 @@ void indexFilteredCountDocs(CollectionHelper& helper, bool multiSegment) {
 void expectFilteredCountEquivalence(SearchEngine& engine, bool multiSegment) {
   CollectionHelper helper;
   indexFilteredCountDocs(helper, multiSegment);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), multiSegment ? 2u : 1u);
 
   constexpr std::array<FilteredCountShape, 4> shapes = {
@@ -1254,7 +1254,7 @@ void setPrunableDisjunction(OpCursor& cur) {
 void expectPrunedFacetTwoPassMatchesExhaustive(CollectionHelper& helper,
                                                 int32_t segmentCount) {
   addPrunableFacetDocs(helper, segmentCount);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), (size_t) segmentCount);
   const int64_t topK = 3;
 
@@ -1301,7 +1301,7 @@ void expectPrunedFacetTwoPassMatchesExhaustive(CollectionHelper& helper,
 void indexSparseConstantDispatchDocs(CollectionHelper& helper) {
   // These tests assert collector-path counters; filter admission/materialization
   // is independent work that would otherwise contaminate those counters.
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0});
   std::vector<Doc> docs;
   docs.reserve(1024);
@@ -1564,7 +1564,7 @@ TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
 TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
   constexpr std::string_view collection = "whole_count_families";
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   SchemaBuilder schema;
   auto& geo = schema.field("where");
@@ -1786,8 +1786,8 @@ TEST_F(SearchEngineTest,
     .admissionThreshold = 2,
   };
   auto cache = std::make_shared<FilterCache>(enabledConfig);
-  enabled.getIndexWriter()->filterCache = cache;
-  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  enabled.getIndexWriter()->snapshots.readers.filterCache = cache;
+  disabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{
         .maxBytes = 0,
         .minSegmentDocs = 5,
@@ -1811,7 +1811,7 @@ TEST_F(SearchEngineTest,
     ASSERT_TRUE(helper->indexAll(tiny, UpdateMessage::COMMIT).success);
   }
 
-  auto reader = enabled.getIndexWriter()->getIndexReader();
+  auto reader = enabled.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(2u, reader->segments().size());
   std::vector<int32_t> segmentSizes;
   for (const auto& segment : reader->segments()) {
@@ -1901,7 +1901,7 @@ TEST_F(SearchEngineTest,
       .minSegmentDocs = 0,
     };
     auto cache = std::make_shared<FilterCache>(cacheConfig);
-    helper.getIndexWriter()->filterCache = cache;
+    helper.getIndexWriter()->snapshots.readers.filterCache = cache;
     EXPECT_TRUE(helper.indexAll(std::array{
         flatdoc("id", "1", "body_w", "quick fox"),
         flatdoc("id", "2", "body_w", "quick brown fox"),
@@ -1963,7 +1963,7 @@ TEST_F(SearchEngineTest,
 TEST_F(SearchEngineTest, limitZeroGetScoresUsesUnscoredWholeMembership) {
   constexpr std::string_view collection = "whole_count_get_scores";
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   for (int32_t doc = 0; doc < 32; doc++) {
     ASSERT_TRUE(helper.index(
@@ -2000,7 +2000,7 @@ TEST_F(SearchEngineTest, wholeCountConstantGateAvoidsWholeAdmission) {
   CollectionHelper helper(collection);
   auto cache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 32; doc++) {
     docs.push_back(flatdoc(
@@ -2056,7 +2056,7 @@ TEST_F(SearchEngineTest, foldedNamedFilterUsesWholeCompoundPlan) {
   CollectionHelper helper(collection);
   auto cache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 24; doc++) {
     docs.push_back(flatdoc(
@@ -2120,7 +2120,7 @@ TEST_F(SearchEngineTest, foldedNamedFilterUsesWholeCompoundPlan) {
 TEST_F(SearchEngineTest, wholeCountGatesSegmentsAndComposesDeletesOnce) {
   constexpr std::string_view collection = "whole_count_segment_gate";
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
 
   std::vector<Doc> firstSegment;
@@ -2144,7 +2144,7 @@ TEST_F(SearchEngineTest, wholeCountGatesSegmentsAndComposesDeletesOnce) {
   firstIds.pop_back();
   ASSERT_TRUE(helper.deleteByIds(
       firstIds, UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(2u, reader->segments().size());
 
   WholeCountQueryBuilder term = [](auto& mr) {
@@ -2189,7 +2189,7 @@ TEST_F(SearchEngineTest, wholeCountIsInertWithCacheOffOrPrepare) {
   CollectionHelper cacheOff(cacheOffCollection);
   auto disabled = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
-  cacheOff.getIndexWriter()->filterCache = disabled;
+  cacheOff.getIndexWriter()->snapshots.readers.filterCache = disabled;
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 24; doc++) {
     docs.push_back(flatdoc(
@@ -2216,7 +2216,7 @@ TEST_F(SearchEngineTest, wholeCountIsInertWithCacheOffOrPrepare) {
   CollectionHelper prepared(preparedCollection);
   auto preparedCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  prepared.getIndexWriter()->filterCache = preparedCache;
+  prepared.getIndexWriter()->snapshots.readers.filterCache = preparedCache;
   ASSERT_TRUE(prepared.indexAll(docs, UpdateMessage::COMMIT).success);
   for (int round = 0; round < 3; round++) {
     WholeCountRun run = runWholeCount(
@@ -2232,7 +2232,7 @@ TEST_F(SearchEngineTest, wholeCountIsInertWithCacheOffOrPrepare) {
 TEST_F(SearchEngineTest, fuzzyWholeCountSeparatesCoreGenerations) {
   constexpr std::string_view collection = "whole_count_fuzzy_core";
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   ASSERT_TRUE(helper.indexAll(
       {flatdoc("id", "f0", "body_w", "color"),
@@ -2258,7 +2258,7 @@ TEST_F(SearchEngineTest, fuzzyWholeCountSeparatesCoreGenerations) {
        flatdoc("id", "f4", "body_w", "other")},
       UpdateMessage::COMMIT).success);
   size_t segmentCount =
-      helper.getIndexWriter()->getIndexReader()->segments().size();
+      helper.getIndexWriter()->snapshots.readers.getReader()->segments().size();
   ASSERT_GT(segmentCount, 1u);
   WholeCountRun newBypass = runWholeCount(
       helper.getSearchEngine(), collection, fuzzy);
@@ -2287,7 +2287,7 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
       .admissionThreshold = 1,
   };
   auto cache = std::make_shared<FilterCache>(config);
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 32; doc++) {
     docs.push_back(flatdoc(
@@ -2296,7 +2296,7 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   TermQuery alpha("body_w", "alpha");
   TermQuery beta("body_w", "beta");
   std::array<Query*, 2> required{&alpha, &beta};
@@ -2339,8 +2339,8 @@ TEST_F(SearchEngineTest, wholeTopKCountFamiliesMatchCacheOffAtAllDepths) {
   CollectionHelper disabled(disabledCollection);
   auto cache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  enabled.getIndexWriter()->filterCache = cache;
-  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  enabled.getIndexWriter()->snapshots.readers.filterCache = cache;
+  disabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
 
   struct Case {
@@ -2466,7 +2466,7 @@ TEST_F(SearchEngineTest, wholeTopKCountConstantGateAndLimitOnlyStayCacheFree) {
   CollectionHelper helper(collection);
   auto cache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 64; doc++) {
     docs.push_back(flatdoc(
@@ -2532,9 +2532,9 @@ TEST_F(SearchEngineTest,
       "resident_exact_domain_consumers_off";
   CollectionHelper enabled(enabledCollection);
   CollectionHelper disabled(disabledCollection);
-  enabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  enabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  disabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
 
   struct Case {
@@ -2614,7 +2614,7 @@ TEST_F(SearchEngineTest,
 TEST_F(SearchEngineTest, wholeTopKCountHandlesEmptyAndNonemptySegments) {
   constexpr std::string_view collection = "whole_topk_count_segments";
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   std::vector<Doc> first;
   std::vector<Doc> second;
@@ -2628,7 +2628,7 @@ TEST_F(SearchEngineTest, wholeTopKCountHandlesEmptyAndNonemptySegments) {
   ASSERT_TRUE(helper.indexAll(first, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper.indexAll(second, UpdateMessage::COMMIT).success);
   ASSERT_EQ(2u,
-            helper.getIndexWriter()->getIndexReader()->segments().size());
+            helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
 
   WholeTopKRun bypass = runWholeTopK(
       helper.getSearchEngine(), collection, WholeTopKFamily::INTERSECTION,
@@ -2655,7 +2655,7 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
       .minSegmentDocs = 0,
       .admissionThreshold = 1,
   });
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 64; doc++) {
     docs.push_back(flatdoc(
@@ -2664,7 +2664,7 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   TermQuery a("body_w", "s3backa");
   TermQuery b("body_w", "s3backb");
   std::array<Query*, 2> required{&a, &b};
@@ -2701,9 +2701,9 @@ TEST_F(SearchEngineTest,
       "whole_field_sort_matrix_off";
   CollectionHelper enabled(enabledCollection);
   CollectionHelper disabled(disabledCollection);
-  enabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  enabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  disabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
   indexWholeFieldSortDocs(enabled);
   indexWholeFieldSortDocs(disabled);
@@ -2802,9 +2802,9 @@ TEST_F(SearchEngineTest, wholeFieldSortDroppedOptionalSingletonServesResident) {
       "whole_field_sort_mandopt_off";
   CollectionHelper enabled(enabledCollection);
   CollectionHelper disabled(disabledCollection);
-  enabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  enabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  disabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
   indexWholeFieldSortDocs(enabled);
   indexWholeFieldSortDocs(disabled);
@@ -2906,8 +2906,8 @@ TEST_F(SearchEngineTest, wholeFieldSortRoutesBeforeCacheTrafficByShape) {
   CollectionHelper disabled(disabledCollection);
   auto cache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  enabled.getIndexWriter()->filterCache = cache;
-  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  enabled.getIndexWriter()->snapshots.readers.filterCache = cache;
+  disabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
   indexWholeFieldSortDocs(enabled);
   indexWholeFieldSortDocs(disabled);
@@ -3075,9 +3075,9 @@ TEST_F(SearchEngineTest,
       "whole_field_sort_multiterm_off";
   CollectionHelper enabled(enabledCollection);
   CollectionHelper disabled(disabledCollection);
-  enabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  enabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  disabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
   indexWholeFieldSortDocs(enabled);
   indexWholeFieldSortDocs(disabled);
@@ -3123,9 +3123,9 @@ TEST_F(SearchEngineTest, wholeFieldSortPartialResidencyKeepsOrdinaryPath) {
       "whole_field_sort_partial_off";
   CollectionHelper enabled(enabledCollection);
   CollectionHelper disabled(disabledCollection);
-  enabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  enabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  disabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
 
   auto addSegment = [](CollectionHelper& helper, int32_t segment) {
@@ -3172,8 +3172,8 @@ TEST_F(SearchEngineTest, wholeFieldSortContinuationGatesAndScoreExclusions) {
   CollectionHelper disabled(disabledCollection);
   auto cache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  enabled.getIndexWriter()->filterCache = cache;
-  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  enabled.getIndexWriter()->snapshots.readers.filterCache = cache;
+  disabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
   indexWholeFieldSortDocs(enabled);
   indexWholeFieldSortDocs(disabled);
@@ -3322,7 +3322,7 @@ TEST_F(SearchEngineTest, wholeFieldSortConstantFactFallsBackWithoutCacheUse) {
   CollectionHelper helper(collection);
   auto cache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 64; doc++) {
     docs.push_back(flatdoc(
@@ -3364,7 +3364,7 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
       .minSegmentDocs = 0,
       .admissionThreshold = 1,
   });
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 128; doc++) {
     docs.push_back(flatdoc(
@@ -3375,7 +3375,7 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   TermQuery a("body_w", "s4backoffa");
   std::array<std::string_view, 2> phraseTerms{
       "s4backoffa", "s4backoffb"};
@@ -3415,7 +3415,7 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
 TEST_F(SearchEngineTest, wholeFieldSortHitComposesFusionDomainOnce) {
   constexpr std::string_view collection = "whole_field_sort_fusion";
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   indexWholeFieldSortDocs(helper);
 
@@ -4419,7 +4419,7 @@ TEST_F(SearchEngineTest, routedFiltersReuseFilterCacheArtifacts) {
       .minSegmentDocs = 0,
       .admissionThreshold = 1,
   });
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 64; doc++) {
     docs.push_back(flatdoc(
@@ -4713,7 +4713,7 @@ TEST_F(SearchEngineTest, structurallyEqualDomainsShareVariant) {
   setResetDomain(top.facet("b", "brand_s"),
                  qb::match(top.mr(), "brand_s", "acme"));
   req->schema = helper.collection().getSchema();
-  req->reader = helper.getIndexWriter()->getIndexReader();
+  req->reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ProtobufSearchParser parser(*req);
   auto* root = parser.parse();
   auto* parsed = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
@@ -4867,7 +4867,7 @@ TEST_F(SearchEngineTest,
       "uncached_filtered_count_candidate";
   constexpr int32_t nDocs = 3 * DocsEnumMeta::L1_DOCS + 123;
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0});
 
   std::vector<Doc> docs;
@@ -5040,7 +5040,7 @@ TEST_F(SearchEngineTest, cachedFilterHitKeepsDenseCountPath) {
   constexpr std::string_view collection = "cached_dense_count";
   CollectionHelper helper(collection);
   indexFilteredCountDocs(helper, false);
-  auto cache = helper.getIndexWriter()->getFilterCache();
+  auto cache = helper.getIndexWriter()->snapshots.readers.filterCache;
 
   auto first = runFilteredCount(
       luxirNode->getSearchEngine(), FilteredCountShape::TERM,
@@ -5063,7 +5063,7 @@ TEST_F(SearchEngineTest, cachedNumericFilterHitIgnoresShapeToggle) {
   constexpr std::string_view collection = "cached_numeric_dense_count";
   constexpr int32_t N = DocsEnumMeta::L1_DOCS + 257;
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   SchemaBuilder schema;
   auto& range = schema.field("range_i");
@@ -5078,7 +5078,7 @@ TEST_F(SearchEngineTest, cachedNumericFilterHitIgnoresShapeToggle) {
         "body_w", "alpha", "range_i", doc));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
-  auto cache = helper.getIndexWriter()->getFilterCache();
+  auto cache = helper.getIndexWriter()->snapshots.readers.filterCache;
 
   struct Run {
     int64_t found;
@@ -5201,7 +5201,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsDenseCountWorkByCardinality) {
   ASSERT_LE(filterCard, DocSetBuilder::arrayLimitFor(nDocs));
   auto indexed = helper.indexAll(docs, UpdateMessage::COMMIT);
   ASSERT_TRUE(indexed.success) << indexed.error_message;
-  auto cache = helper.getIndexWriter()->getFilterCache();
+  auto cache = helper.getIndexWriter()->snapshots.readers.filterCache;
 
   // Default admission is two sightings: warm through publication, then
   // measure a true hit whose DocSet is a costed conjunction clause.
@@ -5414,7 +5414,7 @@ TEST_F(SearchEngineTest,
   constexpr std::string_view collection =
       "whole_topk_count_sparse_reroute";
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   indexSparseFilteredTopKDocs(helper);
   auto& engine = helper.getSearchEngine();
@@ -5455,7 +5455,7 @@ TEST_F(SearchEngineTest,
        wholeTopKCountHitUsesCountFreeMaxScoreRankingAccounting) {
   constexpr std::string_view collection = "whole_topk_count_max_score";
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   std::vector<Doc> docs;
   docs.reserve(2048);
@@ -5766,7 +5766,7 @@ TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
   constexpr std::string_view collection = "exact_count_topk_composition";
   constexpr int32_t nDocs = DocsEnumMeta::L1_DOCS + 257;
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{
         .minSegmentDocs = 0,
         .admissionThreshold = 100,
@@ -5952,7 +5952,7 @@ TEST_F(SearchEngineTest, unfilteredCountDoesNotConstructFilterClause) {
 TEST_F(SearchEngineTest, sparseConstantPullDispatchUsesInclusiveArrayThreshold) {
   CollectionHelper helper;
   indexSparseConstantDispatchDocs(helper);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), 1u);
   ASSERT_EQ(reader->segments()[0].maxDoc(), 1024);
   ASSERT_EQ(DocSetBuilder::arrayLimitFor(1024), 32);
@@ -5984,7 +5984,7 @@ TEST_F(SearchEngineTest, sparseConstantPullDispatchUsesInclusiveArrayThreshold) 
 TEST_F(SearchEngineTest, sparseConstantPullDispatchExcludesMultiFilterPlans) {
   CollectionHelper helper;
   indexSparseConstantDispatchDocs(helper);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), 1u);
   ASSERT_EQ(reader->segments()[0].maxDoc(), 1024);
 
@@ -6002,7 +6002,7 @@ TEST_F(SearchEngineTest, sparseConstantPullDispatchExcludesMultiFilterPlans) {
 TEST_F(SearchEngineTest, sparseConstantPullDispatchLeavesMatchAllShortcutUntouched) {
   CollectionHelper helper;
   indexSparseConstantDispatchDocs(helper);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(reader->segments().size(), 1u);
   ASSERT_EQ(reader->segments()[0].maxDoc(), 1024);
 
@@ -6034,7 +6034,7 @@ TEST_F(SearchEngineTest, filterOnlyBulkAndConstantTopKMatchPassivePath) {
   }
   std::vector<std::string> deleted = {"f2", "f25", "f38"};
   helper.deleteByIds(deleted, UpdateMessage::COMMIT);
-  ASSERT_GT(helper.getIndexWriter()->getIndexReader()->segments().size(), 1u);
+  ASSERT_GT(helper.getIndexWriter()->snapshots.readers.getReader()->segments().size(), 1u);
 
   struct Result {
     std::vector<std::string> ids;
@@ -6101,7 +6101,7 @@ TEST_F(SearchEngineTest, filterOnlyBulkAndConstantTopKMatchPassivePath) {
 TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
   constexpr std::string_view collection = "filter_docset_identity";
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 16; doc++) {
@@ -6116,7 +6116,7 @@ TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
         "value_i", doc));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
-  auto cache = helper.getIndexWriter()->getFilterCache();
+  auto cache = helper.getIndexWriter()->snapshots.readers.filterCache;
 
   struct Result {
     std::vector<std::string> ids;
@@ -6251,7 +6251,7 @@ TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
 TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
   constexpr std::string_view collection = "filter_docset_identity_guards";
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 12; doc++) {
@@ -6281,7 +6281,7 @@ TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
   };
   warm("keep_s");
   warm("even_s");
-  auto cache = helper.getIndexWriter()->getFilterCache();
+  auto cache = helper.getIndexWriter()->snapshots.readers.filterCache;
 
   auto run = [&](bool twoFilters, bool scoredQuery, bool fieldSort,
                  bool passive, bool disableFilterClause) {
@@ -6373,7 +6373,7 @@ TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
 TEST_F(SearchEngineTest, limitZeroSubOpsIntersectQueryAndFilterDocSets) {
   constexpr std::string_view collection = "query_filter_docset_domain";
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   std::vector<Doc> docs;
   for (int32_t doc = 0; doc < 12; doc++) {
@@ -6410,14 +6410,14 @@ TEST_F(SearchEngineTest, limitZeroSubOpsIntersectQueryAndFilterDocSets) {
 
   auto first = run();
   auto second = run();
-  auto beforeHit = helper.getIndexWriter()->getFilterCache()->counters();
+  auto beforeHit = helper.getIndexWriter()->snapshots.readers.filterCache->counters();
   auto [found, facets, docSetDomains, domainWindows] = run();
   EXPECT_EQ(3, found);
   EXPECT_EQ((std::map<std::string, int64_t>{{"g1", 1}, {"g2", 2}}),
             facets);
   EXPECT_GT(docSetDomains, 0);
   EXPECT_EQ(0, domainWindows);
-  EXPECT_GE(helper.getIndexWriter()->getFilterCache()->counters().hits
+  EXPECT_GE(helper.getIndexWriter()->snapshots.readers.filterCache->counters().hits
                 - beforeHit.hits,
             3);
   EXPECT_EQ(std::get<0>(first), found);
@@ -6960,7 +6960,7 @@ TEST_F(SearchEngineTest, filteredNumericCountRetiresNumericIsland) {
   constexpr std::string_view collection = "numeric_shape_island";
   constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0});
   SchemaBuilder schema;
   auto& range = schema.field("range_i");
@@ -7056,7 +7056,7 @@ TEST_F(SearchEngineTest,
   constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
   constexpr int64_t hi = (int64_t) N * 4 / 5 - 1;
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0});
   SchemaBuilder schema;
   auto& range = schema.field("range_i");
@@ -7144,7 +7144,7 @@ TEST_F(SearchEngineTest,
   constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
   constexpr int64_t hi = (int64_t) N * 4 / 5 - 1;
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0});
   SchemaBuilder schema;
   auto& range = schema.field("range_i");
@@ -7222,7 +7222,7 @@ TEST_F(SearchEngineTest,
   constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
   constexpr int64_t hi = (int64_t) N * 4 / 5 - 1;
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0});
   SchemaBuilder schema;
   auto& range = schema.field("range_i");
@@ -7294,7 +7294,7 @@ TEST_F(SearchEngineTest,
   constexpr int32_t N = 2 * DocsEnumMeta::L1_DOCS + 257;
   constexpr int64_t hi = (int64_t) N * 4 / 5 - 1;
   CollectionHelper helper(collection);
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0});
   SchemaBuilder schema;
   auto& range = schema.field("range_i");
@@ -7477,7 +7477,7 @@ TEST_F(SearchEngineTest, offsetNegativeRejected) {
 
 TEST_F(SearchEngineTest, offsetCachedMembership) {
   CollectionHelper helper;
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0, .admissionThreshold = 1});
   for (int i = 0; i < 20; i++) {
     helper.index(flatdoc("id", std::to_string(i), "body_w",
@@ -7510,7 +7510,7 @@ TEST_F(SearchEngineTest, offsetCachedMembership) {
 
 TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
   CollectionHelper helper;
-  helper.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0, .admissionThreshold = 1});
   std::vector<Doc> docs;
   for (int i = 0; i < 4096; i++) {

@@ -92,7 +92,7 @@ public:
     auto base = Schema::createDefaultSchema();
     schema = b.build(base.get());
     index.iw = std::make_unique<IndexWriter>(
-        index.dir, schema);
+        index.snapshots, schema);
 
     std::vector<int32_t> shuffledDocs((size_t)numDocs);
     std::iota(shuffledDocs.begin(), shuffledDocs.end(), 0);

@@ -72,7 +72,8 @@ public:
 class Shard {
   Collection& collection; // hard reference to the collection that owns this shard
   std::shared_ptr<Directory> dir;  // does this need to be shared_ptr?  Perhaps not if we have a shared ptr to a parent object (Shard or Collection?)
-  std::shared_ptr<IndexWriter> iw;
+  std::unique_ptr<CommitSnapshotRegistry> snapshots;
+  std::shared_ptr<IndexWriter> iw; // absent on read-only collections
 
 public:
   explicit Shard(Collection& collection) : collection(collection) {
@@ -84,6 +85,17 @@ public:
   // having the ability for it to come and go, it should be a singleton (which could still be created on demand) that
   // can dump most of it's state for low memory usage?  Then this method would not return a shared_ptr, but a simple reference.
   std::shared_ptr<IndexWriter> getIndexWriter() {
+    return iw;
+  }
+
+  ~Shard() {
+    if (iw) iw->close();
+    if (snapshots) snapshots->close();
+  }
+  ReaderManager& getReaderManager() const { return snapshots->readers; }
+  CommitSnapshotRegistry& getSnapshots() const { return *snapshots; }
+  std::shared_ptr<IndexWriter> requireIndexWriter() {
+    if (!iw) throw ReadOnlyError("collection has no index writer");
     return iw;
   }
 
@@ -117,9 +129,11 @@ public:
     return shard;
   }
 
+  ReaderManager& getReaderManager() const { return shard->getReaderManager(); }
+
   // Returns the latest published schema for administration and stats.
   std::shared_ptr<Schema> getSchema() {
-    return shard->getIndexWriter()->getSchema();
+    return getReaderManager().getSchema();
   }
 
   // The schema mutation transaction: applies `def` to the current schema

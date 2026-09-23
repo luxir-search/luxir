@@ -831,7 +831,8 @@ TEST_F(TermsDictTest, QueryStatsOnlyPathMatchesDocsEnumAcrossIndexLevels) {
     SCOPED_TRACE(level.label);
     RAMDir dir;
     auto schema = schemaForLevel(level.type, level.flags);
-    IndexWriter writer(dir, schema);
+    CommitSnapshotRegistry writerSnapshots(dir);
+    IndexWriter writer(writerSnapshots, schema);
     indexQueryStatsTerms(writer, level.type, terms);
 
     MemPool pool;
@@ -949,7 +950,8 @@ TEST_F(TermsDictTest, MergedSegmentsRoundTripAllIndexLevels) {
     SCOPED_TRACE(level.label);
     RAMDir dir;
     auto schema = schemaForLevel(level.type, level.flags);
-    IndexWriter writer(dir, schema);
+    CommitSnapshotRegistry writerSnapshots(dir);
+    IndexWriter writer(writerSnapshots, schema);
     addMergeSegment(writer, level.type == FieldType::STRING, 3, 2);
     addMergeSegment(writer, level.type == FieldType::STRING, 4, 3);
     writer.mergeSegments();

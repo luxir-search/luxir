@@ -342,7 +342,8 @@ private:
   }
 
   void buildStatsReader() {
-    IndexWriter writer(queryDir);
+    CommitSnapshotRegistry writerSnapshots(queryDir);
+    IndexWriter writer(writerSnapshots);
     Inverter& inverter = writer.obtainInverter();
     auto& handler = inverter.getIndexHandler(kStatsFieldName);
     std::vector<uint8_t> dense((size_t)nTerms, 0);

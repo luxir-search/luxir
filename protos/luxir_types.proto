@@ -1089,6 +1089,10 @@ message IndexStats {
   repeated AuxStats aux_indexes = 7;
   QueryCacheStats query_cache = 8;
   repeated SegmentStats segments = 9;
+  uint64 snapshot_pins = 11;
+  uint64 pin_retained_bytes = 12; // bytes whose only remaining owners are pins
+  uint64 pin_idle_drops = 13;
+  uint64 pin_budget_drops = 14;
 }
 
 // Ids and generations that appear in filenames are reported in their

@@ -340,7 +340,7 @@ TEST_F(GeoDistanceQueryTest, uniformScoreAndBoundsAcrossExecutionArms) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
 
   auto check = [](Query::Scorer* scorer) {
@@ -416,7 +416,7 @@ TEST_F(GeoDistanceQueryTest, bkdScanAndColumnOraclesAcrossCorpora) {
     }
     writer->releaseInverter(inverter);
     writer->commit();
-    auto reader = writer->getIndexReader();
+    auto reader = writer->snapshots.readers.getReader();
     ASSERT_EQ(1u, reader->segments().size());
     auto& segment = reader->segments()[0];
     GeoPoint center = shapeCenter(shape);
@@ -467,7 +467,7 @@ TEST_F(GeoDistanceQueryTest, scanFallbackAndCountGating) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
   ASSERT_EQ(0, fieldInfo(segment, "geo_single").pointsMetaOff);
   MemPool pool;
@@ -491,7 +491,7 @@ TEST_F(GeoDistanceQueryTest, countRejectsDeletedSegment) {
   inverter.deleteDoc(3);
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
   ASSERT_NE(nullptr, segment.liveDocs());
   MemPool pool;

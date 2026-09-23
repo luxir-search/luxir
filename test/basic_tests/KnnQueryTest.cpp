@@ -500,7 +500,7 @@ TEST_F(KnnQueryTest, routedFilterRepreparesTopKForSidewaysFacet) {
   h.index(flatdoc("id", "c", "brand_s", "beta", "embedding_v",
                   std::vector<float>{0.98f, 0.02f, 0}));
   h.commit();
-  ASSERT_EQ(2u, h.getIndexWriter()->getIndexReader()->segments().size());
+  ASSERT_EQ(2u, h.getIndexWriter()->snapshots.readers.getReader()->segments().size());
 
   auto request = localReq(luxirNode->getSearchEngine());
   auto& top = request->collection("main").topDocs("q")
@@ -631,13 +631,13 @@ TEST_F(KnnQueryTest, readerCanonicalDomainSourceRepreparesOutsideLiveFrame) {
   config.maxBytes = 4 * 1024 * 1024;
   config.minSegmentDocs = 0;
   config.admissionThreshold = 1;
-  h.getIndexWriter()->filterCache = std::make_shared<FilterCache>(config);
+  h.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(config);
   h.index(flatdoc("id", "a", "brand_s", "acme", "embedding_v",
                   std::vector<float>{1, 0, 0}));
   h.index(flatdoc("id", "b", "brand_s", "beta", "embedding_v",
                   std::vector<float>{0.9f, 0.1f, 0}));
   h.commit({"*"});
-  auto cache = h.getIndexWriter()->getFilterCache();
+  auto cache = h.getIndexWriter()->snapshots.readers.filterCache;
 
   auto request = localReq(luxirNode->getSearchEngine());
   request->collection("main");
@@ -727,7 +727,7 @@ TEST_F(KnnQueryTest, routedPreparedFilterUsesParentBaseDomain) {
     h.commit();
   }
   h.commit({"*"});
-  ASSERT_EQ(8u, h.getIndexWriter()->getIndexReader()->segments().size());
+  ASSERT_EQ(8u, h.getIndexWriter()->snapshots.readers.getReader()->segments().size());
 
   auto request = localReq(luxirNode->getSearchEngine());
   auto& top = request->collection("main").topDocs("q")
@@ -1646,7 +1646,7 @@ TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
   }
   h.commit({"*"});
   {
-    auto reader = h.getIndexWriter()->getIndexReader();
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(reader->segments().size(), 2u);
     ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr)
         << "segment 0 fell back to flat (below IVF training floor)";
@@ -1728,7 +1728,7 @@ TEST_F(KnnQueryTest, parallelMultiValuedIvfMatchesSerial) {
   }
   h.commit({"*"});
   {
-    auto reader = h.getIndexWriter()->getIndexReader();
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(reader->segments().size(), 2u);
     ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
         << "segment 0 fell back to flat (below IVF training floor)";
@@ -1779,7 +1779,7 @@ TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
   }
   h.commit({"*"});
   {
-    auto reader = h.getIndexWriter()->getIndexReader();
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr)
         << "segment 0 fell back to flat (below IVF training floor)";
   }
@@ -1819,7 +1819,7 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
   }
   h.commit({"*"});
   {
-    auto reader = h.getIndexWriter()->getIndexReader();
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(reader->segments().size(), 1u);
     ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr)
         << "segment fell back to flat (below IVF training floor)";
@@ -1828,7 +1828,7 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
   h.deleteByIds(dels, UpdateMessage::COMMIT);
 
   {
-    auto reader = h.getIndexWriter()->getIndexReader();
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(reader->segments().size(), 1u);
     ASSERT_NE(reader->segments()[0].liveDocs(), nullptr) << "delete did not produce liveDocs";
     ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr)
@@ -1885,7 +1885,7 @@ TEST_F(KnnQueryTest, ivfFilteredQueryWithDeletesMatchesExact) {
   }
   h.commit({"*"});
   {
-    auto reader = h.getIndexWriter()->getIndexReader();
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr)
         << "segment fell back to flat (below IVF training floor)";
   }
@@ -1931,7 +1931,7 @@ TEST_F(KnnQueryTest, filterCacheMatchesUncachedExactAndIvfWithDeletes) {
   FilterCacheConfig cacheConfig;
   cacheConfig.maxBytes = 4 * 1024 * 1024;
   cacheConfig.minSegmentDocs = 0;
-  h.getIndexWriter()->filterCache = std::make_shared<FilterCache>(cacheConfig);
+  h.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(cacheConfig);
   for (int i = 0; i < 160; i++) {
     h.index(flatdoc(
         "id", "d" + std::to_string(i),
@@ -1941,10 +1941,10 @@ TEST_F(KnnQueryTest, filterCacheMatchesUncachedExactAndIvfWithDeletes) {
   h.commit({"*"});
   std::vector<std::string> deletes{"d40"};
   h.deleteByIds(deletes, UpdateMessage::COMMIT);
-  auto reader = h.getIndexWriter()->getIndexReader();
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_NE(reader->segments()[0].liveDocs(), nullptr);
   ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr);
-  auto cache = h.getIndexWriter()->getFilterCache();
+  auto cache = h.getIndexWriter()->snapshots.readers.filterCache;
 
   auto run = [&](bool exact) {
     auto* req = makeKnnFilterReq(
@@ -1981,7 +1981,7 @@ TEST_F(KnnQueryTest, wholeReaderCountAndFieldSortSkipAnnPrepare) {
   cacheConfig.minSegmentDocs = 0;
   cacheConfig.admissionThreshold = 1;
   auto cache = std::make_shared<FilterCache>(cacheConfig);
-  h.getIndexWriter()->filterCache = cache;
+  h.getIndexWriter()->snapshots.readers.filterCache = cache;
   for (int32_t i = 0; i < 64; i++) {
     h.index(flatdoc(
         "id", "d" + std::to_string(i), "rank_i", (int64_t)(64 - i),
@@ -2100,7 +2100,7 @@ TEST_F(KnnQueryTest, wholeReaderRefreshAndDeleteOnlyRefreshRebuild) {
   cacheConfig.minSegmentDocs = 0;
   cacheConfig.admissionThreshold = 1;
   auto cache = std::make_shared<FilterCache>(cacheConfig);
-  h.getIndexWriter()->filterCache = cache;
+  h.getIndexWriter()->snapshots.readers.filterCache = cache;
   for (int32_t i = 0; i < 32; i++) {
     h.index(flatdoc(
         "id", "d" + std::to_string(i), "rank_i", (int64_t)i,
@@ -2131,12 +2131,12 @@ TEST_F(KnnQueryTest, wholeReaderRefreshAndDeleteOnlyRefreshRebuild) {
             run());
   EXPECT_EQ(initialPrepare,
             KnnQuery::prepareCallsForTests.load(std::memory_order_relaxed));
-  auto firstReader = h.getIndexWriter()->getIndexReader();
+  auto firstReader = h.getIndexWriter()->snapshots.readers.getReader();
 
   h.index(flatdoc("id", "far", "rank_i", (int64_t)100,
                   "embedding_v", std::vector<float>{100.0f, 0.0f}));
   h.commit({"*"});
-  auto secondReader = h.getIndexWriter()->getIndexReader();
+  auto secondReader = h.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_GT(secondReader->commitTime(), firstReader->commitTime());
   auto beforeRefreshBuild = cache->counters();
   EXPECT_EQ((std::vector<std::string>{"d0", "d1", "d2", "d3", "d4", "d5"}),
@@ -2146,7 +2146,7 @@ TEST_F(KnnQueryTest, wholeReaderRefreshAndDeleteOnlyRefreshRebuild) {
 
   std::vector<std::string> deletes{"d0"};
   h.deleteByIds(deletes, UpdateMessage::COMMIT);
-  auto thirdReader = h.getIndexWriter()->getIndexReader();
+  auto thirdReader = h.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_GT(thirdReader->commitTime(), secondReader->commitTime());
   auto beforeDeleteBuild = cache->counters();
   EXPECT_EQ((std::vector<std::string>{"d1", "d2", "d3", "d4", "d5", "d6"}),
@@ -2171,7 +2171,7 @@ TEST_F(KnnQueryTest, fusionFieldSortDoesNotSightWholeReaderCache) {
   cacheConfig.minSegmentDocs = 0;
   cacheConfig.admissionThreshold = 1;
   auto cache = std::make_shared<FilterCache>(cacheConfig);
-  h.getIndexWriter()->filterCache = cache;
+  h.getIndexWriter()->snapshots.readers.filterCache = cache;
   for (int32_t i = 0; i < 16; i++) {
     h.index(flatdoc(
         "id", "d" + std::to_string(i), "rank_i", (int64_t)(16 - i),
@@ -2233,7 +2233,7 @@ TEST_F(KnnQueryTest, uncachedApproximateMembershipIsDeterministic) {
                       /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2);
-  h.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  h.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0});
   for (int i = 0; i < 160; i++) {
     h.index(flatdoc(
@@ -2244,7 +2244,7 @@ TEST_F(KnnQueryTest, uncachedApproximateMembershipIsDeterministic) {
   h.commit({"*"});
   std::vector<std::string> deletes{"d40"};
   h.deleteByIds(deletes, UpdateMessage::COMMIT);
-  auto pinned = h.getIndexWriter()->getIndexReader();
+  auto pinned = h.getIndexWriter()->snapshots.readers.getReader();
 
   std::vector<std::string> expected;
   for (int repeat = 0; repeat < 5; repeat++) {
@@ -2259,7 +2259,7 @@ TEST_F(KnnQueryTest, uncachedApproximateMembershipIsDeterministic) {
     if (repeat == 0) expected = ids;
     EXPECT_EQ(expected, ids);
     EXPECT_EQ(pinned->commitTime(),
-              h.getIndexWriter()->getIndexReader()->commitTime());
+              h.getIndexWriter()->snapshots.readers.getReader()->commitTime());
   }
 }
 
@@ -2475,7 +2475,7 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedDeletesClearAllRanks) {
   }
   h.commit({"*"});
   {
-    auto reader = h.getIndexWriter()->getIndexReader();
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(reader->segments().size(), 1u);
     ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
         << "segment fell back to flat (below IVF training floor)";
@@ -2540,7 +2540,7 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
   }
   h.commit({"*"});
   {
-    auto reader = h.getIndexWriter()->getIndexReader();
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(reader->segments().size(), 1u);
     ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
         << "segment fell back to flat (below IVF training floor)";

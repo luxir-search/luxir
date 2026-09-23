@@ -32,7 +32,7 @@ public:
          flatdoc("id", "2", "body_w", "common"),
          flatdoc("id", "3", "body_w", "common")},
         UpdateMessage::COMMIT).success);
-    reader = helper.getIndexWriter()->getIndexReader();
+    reader = helper.getIndexWriter()->snapshots.readers.getReader();
   }
 
   Query::ScorerShape shape(

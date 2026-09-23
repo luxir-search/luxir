@@ -40,7 +40,7 @@ protected:
 
   static Json view(IndexWriter& writer) {
     Json value;
-    if (glz::read_json(value, writer.resolvedSchema())) throw std::runtime_error("Invalid resolved view");
+    if (glz::read_json(value, writer.snapshots.readers.resolvedSchema())) throw std::runtime_error("Invalid resolved view");
     return value;
   }
 

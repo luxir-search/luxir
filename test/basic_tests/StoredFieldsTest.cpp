@@ -90,7 +90,8 @@ TEST_F(StoredFieldsTest, basicSingleValued) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, schema);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
 
     inv.startDoc();
@@ -143,7 +144,8 @@ TEST_F(StoredFieldsTest, multiValued) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, schema);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
 
     std::vector<std::string_view> tags1 = {"red", "blue", "green"};
@@ -188,7 +190,8 @@ TEST_F(StoredFieldsTest, manyDocsMultipleChunks) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, schema);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
     for (int32_t i = 0; i < N; i++) {
       inv.startDoc();
@@ -229,7 +232,8 @@ TEST_F(StoredFieldsTest, oversizeDoc) {
   std::string big = bigStoredValue();
 
   {
-    IndexWriter iw(dir, schema);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
 
     inv.startDoc();
@@ -262,7 +266,8 @@ TEST_F(StoredFieldsTest, segmentMerge) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, schema);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema);
     // Segment 1
     {
       auto& inv = iw.obtainInverter();
@@ -288,7 +293,7 @@ TEST_F(StoredFieldsTest, segmentMerge) {
       iw.commit();
     }
 
-    ASSERT_EQ(iw.getIndexReader()->segments().size(), 2u);
+    ASSERT_EQ(iw.snapshots.readers.getReader()->segments().size(), 2u);
 
     iw.mergeSegments();
   }
@@ -318,7 +323,8 @@ TEST_F(StoredFieldsTest, oversizeDocMaxChunkBytesRoundTripsThroughMerge) {
   std::atomic<int64_t> maxReserved{0};
 
   {
-    IndexWriter iw(dir, schema, &budget);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema, &budget);
 
     {
       auto& inv = iw.obtainInverter();
@@ -376,7 +382,8 @@ TEST_F(StoredFieldsTest, mergeOneSegmentHasNoStored) {
   // without stored fields using schemaPlain, by swapping schemas between
   // flushes.
   {
-    IndexWriter iw(dir, schemaWithStored);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schemaWithStored);
 
     // Segment 1: stored on
     {
@@ -425,7 +432,8 @@ TEST_F(StoredFieldsTest, mergePreservesMultiValuedGrouping) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, schema);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema);
     {
       auto& inv = iw.obtainInverter();
       std::vector<std::string_view> tagsA = {"x", "y", "z"};
@@ -473,7 +481,8 @@ TEST_F(StoredFieldsTest, mergeFieldTableMismatchFallsBack) {
   RAMDir dir;
   auto schema = makeSchema();
   {
-    IndexWriter iw(dir, schema);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema);
     {
       auto& inv = iw.obtainInverter();
       inv.startDoc();
@@ -500,7 +509,7 @@ TEST_F(StoredFieldsTest, mergeFieldTableMismatchFallsBack) {
       iw.releaseInverter(inv, true);
       iw.commit();
     }
-    ASSERT_EQ(iw.getIndexReader()->segments().size(), 3u);
+    ASSERT_EQ(iw.snapshots.readers.getReader()->segments().size(), 3u);
     iw.mergeSegments();
   }
 
@@ -545,7 +554,8 @@ TEST_F(StoredFieldsTest, columnFamilies) {
   schema->fieldTypeMap["paragraphs"] = paraFt;
 
   {
-    IndexWriter iw(dir, schema);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
 
     inv.startDoc();
@@ -605,7 +615,8 @@ TEST_F(StoredFieldsTest, manyFieldsVarintBoundary) {
   }
 
   {
-    IndexWriter iw(dir, schema);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
     inv.startDoc();
     for (int i = 0; i < N_FIELDS; i++) {
@@ -644,7 +655,8 @@ TEST_F(StoredFieldsTest, emptySegment) {
       "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
 
   {
-    IndexWriter iw(dir, schema);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, schema);
     auto& inv = iw.obtainInverter();
     inv.startDoc();
     inv.getIndexHandler("body").index(inv, std::string_view("not stored"));

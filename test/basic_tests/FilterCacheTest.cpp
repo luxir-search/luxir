@@ -754,11 +754,12 @@ TEST(FilterCacheTest, existingAcceptanceRevalidatesEverySegment) {
 
 TEST(FilterCacheTest, existingReaderAcceptanceIsInertUntilCommit) {
   RAMDir dir;
-  IndexWriter writer(dir);
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "first");
   addTermDoc(writer, "second");
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
   auto domains = canonicalDomains(*reader);
 
   FilterCacheConfig config = testConfig();
@@ -808,10 +809,11 @@ TEST(FilterCacheTest, existingReaderAcceptanceIsInertUntilCommit) {
 
 TEST(FilterCacheTest, existingReaderAcceptanceRejectsPublishedReader) {
   RAMDir dir;
-  IndexWriter writer(dir);
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "first");
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
   auto domains = canonicalDomains(*reader);
 
   FilterCacheConfig config = testConfig();
@@ -836,7 +838,7 @@ TEST(FilterCacheTest, existingReaderAcceptanceRejectsPublishedReader) {
 
   addTermDoc(writer, "second");
   writer.commit();
-  auto nextReader = writer.getIndexReader();
+  auto nextReader = writer.snapshots.readers.getReader();
   ASSERT_GT(nextReader->commitTime(), reader->commitTime());
   ASSERT_TRUE(cache.onReaderPublished(*nextReader));
   auto beforeAccept = cache.counters();
@@ -1918,12 +1920,13 @@ TEST(FilterCacheTest, filterSupplierRoutesBypassBuildThenHit) {
   FilterCacheConfig config = testConfig();
   config.minSegmentDocs = 0;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "cache me");
   addTermDoc(writer, "other");
   writer.commit();
-  auto reader = writer.getIndexReader();
-  auto cache = writer.getFilterCache();
+  auto reader = writer.snapshots.readers.getReader();
+  auto cache = writer.snapshots.readers.filterCache;
   TermQuery query("text_w", "cache");
 
   {
@@ -1971,12 +1974,13 @@ TEST(FilterCacheTest, disabledCacheSparseBatchRetainsPostingsFeed) {
   FilterCacheConfig config = testConfig();
   config.maxBytes = 0;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   for (int32_t doc = 0; doc < 1024; doc++) {
     addTermDoc(writer, doc == 7 ? "selected body" : "body");
   }
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
   ASSERT_NE(nullptr, reader->filterCache());
   ASSERT_FALSE(reader->filterCache()->enabled());
 
@@ -2029,7 +2033,8 @@ TEST(FilterCacheTest, sparsePostingsFeedMatchesMaterializedBatch) {
   FilterCacheConfig config = testConfig();
   config.maxBytes = 0;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   constexpr int32_t maxDoc = 2 * DocsEnumMeta::L1_DOCS;
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     std::string text = "filler";
@@ -2041,7 +2046,7 @@ TEST(FilterCacheTest, sparsePostingsFeedMatchesMaterializedBatch) {
     addTermDoc(writer, text);
   }
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
 
   struct Run {
@@ -2223,7 +2228,8 @@ TEST(FilterCacheTest, sparsePostingsFeedMatchesMaterializedBatch) {
 
 TEST(FilterCacheTest, ownedAndBorrowedValuesComposeDeletesIdentically) {
   RAMDir dir;
-  IndexWriter writer(dir);
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
   for (int32_t doc = 0; doc < 8; doc++) {
     addIdTermDoc(writer, std::to_string(doc), "selected");
   }
@@ -2233,7 +2239,7 @@ TEST(FilterCacheTest, ownedAndBorrowedValuesComposeDeletesIdentically) {
   deletes.deleteId("3", 1);
   writer.releaseInverter(deletes);
   writer.commit();
-  auto reader = writer.getIndexReader(0);
+  auto reader = writer.snapshots.readers.getReader(0);
   ASSERT_EQ(1u, reader->segments().size());
   ASSERT_NE(nullptr, reader->segments()[0].liveDocs());
   auto identities = readerIdentitiesForTest(*reader);
@@ -2315,11 +2321,12 @@ TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
   FilterCacheConfig config = testConfig();
   config.maxBytes = 0;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "selected");
   addTermDoc(writer, "other");
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
 
   TermQuery term("text_w", "selected");
   UncacheableQuery query(term);
@@ -2338,12 +2345,13 @@ TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
 
 TEST(FilterCacheTest, weightConstantCountIsNarrowAndTransparent) {
   RAMDir dir;
-  IndexWriter writer(dir);
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "alpha beta");
   addTermDoc(writer, "alpha");
   addTermDoc(writer, "beta");
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
   MemPool pool;
   Query::Context context(pool, *reader);
@@ -2426,14 +2434,15 @@ TEST(FilterCacheTest,
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "alpha beta");
   addTermDoc(writer, "alpha");
   addTermDoc(writer, "alpha beta");
   addTermDoc(writer, "beta");
   addTermDoc(writer, "alpha beta gamma");
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
   TermQuery alpha("text_w", "alpha");
   TermQuery beta("text_w", "beta");
@@ -2514,11 +2523,12 @@ TEST(FilterCacheTest, wholeAdmissionDiscriminatesSchemaGeneration) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "alpha beta");
   addTermDoc(writer, "alpha");
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
   TermQuery alpha("text_w", "alpha");
   TermQuery beta("text_w", "beta");
   std::array<Query*, 2> required{&alpha, &beta};
@@ -2546,7 +2556,8 @@ TEST(FilterCacheTest, ownedSupplierPredicateIsModeSpecific) {
   FilterCacheConfig config = testConfig();
   config.maxBytes = 0;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   constexpr int32_t maxDoc = 1024;
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     std::string terms = "body";
@@ -2556,7 +2567,7 @@ TEST(FilterCacheTest, ownedSupplierPredicateIsModeSpecific) {
     addTermDoc(writer, terms);
   }
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
   constexpr int32_t sparseInverse = 64;
   ASSERT_EQ(32, DocSetBuilder::arrayLimitFor(maxDoc));
 
@@ -2626,14 +2637,15 @@ TEST(FilterCacheTest, exactScoredSparseFilterUsesCachedDocSetLead) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   constexpr int32_t maxDoc = 1024;
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     addTermDoc(writer, doc == 0 ? "alpha beta selected" : "alpha beta");
   }
   writer.commit();
-  auto reader = writer.getIndexReader();
-  auto cache = writer.getFilterCache();
+  auto reader = writer.snapshots.readers.getReader();
+  auto cache = writer.snapshots.readers.filterCache;
 
   TermQuery alpha("text_w", "alpha");
   TermQuery beta("text_w", "beta");
@@ -3369,12 +3381,13 @@ TEST(FilterCacheTest, effectiveMaterializationOffersRawByproduct) {
   config.minSegmentDocs = 0;
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "cache me");
   addTermDoc(writer, "other");
   writer.commit();
-  auto reader = writer.getIndexReader();
-  auto cache = writer.getFilterCache();
+  auto reader = writer.snapshots.readers.getReader();
+  auto cache = writer.snapshots.readers.filterCache;
   TermQuery query("text_w", "cache");
   MemPool contextPool;
   Query::Context context(contextPool, *reader);
@@ -3398,12 +3411,13 @@ TEST(FilterCacheTest, preparedDomainProvenanceControlsQueryKeyPublication) {
   config.minSegmentDocs = 0;
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "a keep");
   addTermDoc(writer, "a");
   addTermDoc(writer, "keep");
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
 
   TermQuery term("text_w", "a");
   ForcePrepareQuery forcedTerm(&term);
@@ -3459,12 +3473,13 @@ TEST(FilterCacheTest, pruningBypassDoesNotOfferByproduct) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "cache me");
   addTermDoc(writer, "other");
   writer.commit();
-  auto reader = writer.getIndexReader();
-  auto cache = writer.getFilterCache();
+  auto reader = writer.snapshots.readers.getReader();
+  auto cache = writer.snapshots.readers.filterCache;
   TermQuery query("text_w", "cache");
   MemPool contextPool;
   Query::Context context(contextPool, *reader);
@@ -3489,13 +3504,14 @@ TEST(FilterCacheTest, domainCompositionsAreOwnedAndLiveCompositionIsMemoized) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "cache");
   addTermDoc(writer, "cache");
   addTermDoc(writer, "other");
   writer.commit();
-  auto reader = writer.getIndexReader();
-  auto cache = writer.getFilterCache();
+  auto reader = writer.snapshots.readers.getReader();
+  auto cache = writer.snapshots.readers.filterCache;
   std::array identities{FilterCache::SegmentIdentity{
       reader->segments()[0].segInfo.seg_id, reader->segments()[0].maxDoc()}};
   FilterCache::UseRegistry request(*cache, reader->coreGen(), identities);
@@ -3550,10 +3566,11 @@ TEST(FilterCacheTest, domainCompositionsAreOwnedAndLiveCompositionIsMemoized) {
 
 TEST(FilterCacheTest, rawMaterializationEnforcesExhaustiveFlags) {
   RAMDir dir;
-  IndexWriter writer(dir);
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "cache me");
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
   TermQuery query("text_w", "cache");
   MemPool contextPool;
   Query::Context context(contextPool, *reader);
@@ -3570,7 +3587,8 @@ TEST(FilterCacheTest, recursiveRawBuildUsesRawHitsAcrossBooleanFilterModes) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addIdTermDoc(writer, "0", "body selected alpha");
   addIdTermDoc(writer, "1", "body selected beta");
   addIdTermDoc(writer, "2", "body alpha");
@@ -3579,7 +3597,7 @@ TEST(FilterCacheTest, recursiveRawBuildUsesRawHitsAcrossBooleanFilterModes) {
   deletes.deleteId("0", 1);
   writer.releaseInverter(deletes);
   writer.commit();
-  auto reader = writer.getIndexReader(0);
+  auto reader = writer.snapshots.readers.getReader(0);
   ASSERT_EQ(1u, reader->segments().size());
   auto& segment = reader->segments()[0];
   ASSERT_NE(nullptr, segment.liveDocs());
@@ -3600,7 +3618,7 @@ TEST(FilterCacheTest, recursiveRawBuildUsesRawHitsAcrossBooleanFilterModes) {
   }
 
   auto assertRawBuild = [&](Query& query) {
-    auto before = writer.getFilterCache()->counters();
+    auto before = writer.snapshots.readers.filterCache->counters();
     MemPool contextPool;
     Query::Context context(contextPool, *reader);
     auto* weight = query.createWeight(context, 0);
@@ -3613,7 +3631,7 @@ TEST(FilterCacheTest, recursiveRawBuildUsesRawHitsAcrossBooleanFilterModes) {
     EXPECT_TRUE(use->rawDocSet(0)->get(0));
     EXPECT_EQ(1, effective.get()->card());
     EXPECT_FALSE(effective.get()->get(0));
-    auto after = writer.getFilterCache()->counters();
+    auto after = writer.snapshots.readers.filterCache->counters();
     EXPECT_GT(after.hits, before.hits);
     EXPECT_EQ(before.builds + 1, after.builds);
   };
@@ -3635,7 +3653,8 @@ TEST(FilterCacheTest, recursiveRawBuildUsesRawProhibitedHit) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addIdTermDoc(writer, "0", "body selected");
   addIdTermDoc(writer, "1", "body selected");
   addIdTermDoc(writer, "2", "body");
@@ -3644,7 +3663,7 @@ TEST(FilterCacheTest, recursiveRawBuildUsesRawProhibitedHit) {
   deletes.deleteId("0", 1);
   writer.releaseInverter(deletes);
   writer.commit();
-  auto reader = writer.getIndexReader(0);
+  auto reader = writer.snapshots.readers.getReader(0);
   ASSERT_EQ(1u, reader->segments().size());
   auto& segment = reader->segments()[0];
   ASSERT_NE(nullptr, segment.liveDocs());
@@ -3668,7 +3687,7 @@ TEST(FilterCacheTest, recursiveRawBuildUsesRawProhibitedHit) {
     EXPECT_EQ(2, warmUse->rawDocSet(0)->card());
   }
 
-  auto hitsBefore = writer.getFilterCache()->counters().hits;
+  auto hitsBefore = writer.snapshots.readers.filterCache->counters().hits;
   MemPool contextPool;
   Query::Context context(contextPool, *reader);
   auto* weight = outer.createWeight(context, 0);
@@ -3687,19 +3706,20 @@ TEST(FilterCacheTest, recursiveRawBuildUsesRawProhibitedHit) {
   ASSERT_NE(nullptr, effective.get());
   EXPECT_EQ(1, effective.get()->card());
   EXPECT_TRUE(effective.get()->get(2));
-  EXPECT_GT(writer.getFilterCache()->counters().hits, hitsBefore);
+  EXPECT_GT(writer.snapshots.readers.filterCache->counters().hits, hitsBefore);
 }
 
 TEST(FilterCacheTest, preparedProhibitedSourceBuildsThenHits) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "body selected");
   addTermDoc(writer, "body");
   addTermDoc(writer, "body selected");
   writer.commit();
-  auto reader = writer.getIndexReader(0);
+  auto reader = writer.snapshots.readers.getReader(0);
   auto& segment = reader->segments()[0];
 
   auto run = [&]() {
@@ -3738,12 +3758,13 @@ TEST(FilterCacheTest, recursiveRawPublicationServesPinnedOldReader) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addIdTermDoc(writer, "0", "body selected");
   addIdTermDoc(writer, "1", "body selected");
   addIdTermDoc(writer, "2", "body");
   writer.commit();
-  auto oldReader = writer.getIndexReader(0);
+  auto oldReader = writer.snapshots.readers.getReader(0);
   ASSERT_EQ(1u, oldReader->segments().size());
   ASSERT_EQ(nullptr, oldReader->segments()[0].liveDocs());
 
@@ -3751,7 +3772,7 @@ TEST(FilterCacheTest, recursiveRawPublicationServesPinnedOldReader) {
   deletes.deleteId("0", 1);
   writer.releaseInverter(deletes);
   writer.commit();
-  auto newReader = writer.getIndexReader(0);
+  auto newReader = writer.snapshots.readers.getReader(0);
   ASSERT_NE(oldReader, newReader);
   ASSERT_EQ(oldReader->segments()[0].segInfo.seg_id,
             newReader->segments()[0].segInfo.seg_id);
@@ -3787,7 +3808,7 @@ TEST(FilterCacheTest, recursiveRawPublicationServesPinnedOldReader) {
     EXPECT_EQ(1, effective.get()->card());
   }
 
-  auto beforeOld = writer.getFilterCache()->counters();
+  auto beforeOld = writer.snapshots.readers.filterCache->counters();
   {
     MemPool contextPool;
     Query::Context context(contextPool, *oldReader);
@@ -3798,7 +3819,7 @@ TEST(FilterCacheTest, recursiveRawPublicationServesPinnedOldReader) {
     ASSERT_NE(nullptr, effective.get());
     EXPECT_EQ(2, effective.get()->card());
     EXPECT_TRUE(effective.get()->get(0));
-    EXPECT_GT(writer.getFilterCache()->counters().hits, beforeOld.hits);
+    EXPECT_GT(writer.snapshots.readers.filterCache->counters().hits, beforeOld.hits);
   }
 }
 
@@ -3806,11 +3827,12 @@ TEST(FilterCacheTest, recursiveRawBuildExceptionReleasesBothClaims) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   RAMDir dir;
-  IndexWriter writer(dir, {}, nullptr, config);
+  CommitSnapshotRegistry writerSnapshots(dir, config);
+  IndexWriter writer(writerSnapshots, {}, nullptr);
   addTermDoc(writer, "body selected");
   addTermDoc(writer, "body");
   writer.commit();
-  auto reader = writer.getIndexReader(0);
+  auto reader = writer.snapshots.readers.getReader(0);
 
   TermQuery selected("text_w", "selected");
   FailSecondSupplierQuery failing(selected);
@@ -3828,7 +3850,7 @@ TEST(FilterCacheTest, recursiveRawBuildExceptionReleasesBothClaims) {
       *weight, outerUse, *reader, reader->segments()[0], nullptr),
       std::runtime_error);
   EXPECT_EQ(2, failing.calls());
-  EXPECT_EQ(0u, writer.getFilterCache()->counters().builds);
+  EXPECT_EQ(0u, writer.snapshots.readers.filterCache->counters().builds);
 
   auto outerRetry = outerUse->probe(0);
   EXPECT_EQ(FilterCache::Probe::Kind::BUILD, outerRetry.kind());
@@ -3860,12 +3882,12 @@ TEST(FilterCacheTest, readerProbeCountsDeferredBypassesAndMisses) {
   config.maxEntryBytes = 16;
   config.admissionThreshold = 2;
   auto cache = std::make_shared<FilterCache>(config);
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   ASSERT_TRUE(helper.indexAll(std::array{
       luxir::test::flatdoc("id", "1", "body_w", "body"),
       luxir::test::flatdoc("id", "2", "body_w", "body")},
       UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto domains = canonicalDomains(*reader);
 
   FilterCache::UseRegistry missedRequest(*cache, *reader);
@@ -3891,11 +3913,12 @@ TEST(FilterCacheTest, readerProbeCountsDeferredBypassesAndMisses) {
 
 TEST(FilterCacheTest, readerValueParticipatesInBenefitDensityEviction) {
   RAMDir dir;
-  IndexWriter writer(dir);
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "first");
   addTermDoc(writer, "second");
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto domains = canonicalDomains(*reader);
 
@@ -3967,7 +3990,7 @@ TEST(FilterCacheTest, readerZeroHitEvictionBacksOffAndHitResets) {
       luxir::test::flatdoc("id", "2", "body_w", "body")},
       UpdateMessage::COMMIT).success);
   auto writer = helper.getIndexWriter();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   auto domains = canonicalDomains(*reader);
 
   FilterCacheConfig sizingConfig = testConfig();
@@ -3988,7 +4011,7 @@ TEST(FilterCacheTest, readerZeroHitEvictionBacksOffAndHitResets) {
   config.maxBytes = 2 * charge - 1;
   config.lowWatermarkBytes = config.maxBytes;
   auto cache = std::make_shared<FilterCache>(config);
-  writer->filterCache = cache;
+  writer->snapshots.readers.filterCache = cache;
   cache->onReaderPublished(*reader);
 
   auto publish = [&](IndexReader& targetReader, const FilterKey& key,
@@ -4018,7 +4041,7 @@ TEST(FilterCacheTest, readerZeroHitEvictionBacksOffAndHitResets) {
 
   std::vector<std::string> deletes{"1"};
   helper.deleteByIds(deletes, UpdateMessage::COMMIT);
-  auto nextReader = writer->getIndexReader();
+  auto nextReader = writer->snapshots.readers.getReader();
   ASSERT_GT(nextReader->commitTime(), reader->commitTime());
   auto nextDomains = canonicalDomains(*nextReader);
   EXPECT_EQ(0u, cache->bytesUsed());
@@ -4052,7 +4075,7 @@ TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   auto cache = std::make_shared<FilterCache>(config);
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   std::vector<luxir::test::Doc> input;
   for (int32_t i = 0; i < 8; i++) {
     input.push_back(luxir::test::flatdoc(
@@ -4060,7 +4083,7 @@ TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
         "embedding_v", std::vector<float>{(float)i, 0.0f}));
   }
   ASSERT_TRUE(helper.indexAll(input, UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto schema = helper.collection().getSchema();
   auto* fieldType = dynamic_cast<VectorFieldType*>(
       schema->getFieldTypePtr("embedding_v"));
@@ -4131,12 +4154,12 @@ TEST(FilterCacheTest, readerPublicationRetiresAndRejectsLateKnnValue) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;
   auto cache = std::make_shared<FilterCache>(config);
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   ASSERT_TRUE(helper.indexAll(std::array{
       luxir::test::flatdoc("id", "1", "body_w", "body"),
       luxir::test::flatdoc("id", "2", "body_w", "body")},
       UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto domains = canonicalDomains(*reader);
   auto identities = readerIdentitiesForTest(*reader);
 
@@ -4179,10 +4202,11 @@ TEST(FilterCacheTest, readerPublicationRetiresAndRejectsLateKnnValue) {
 
 TEST(FilterCacheTest, routedAccountingOwnsRejectedReaderValue) {
   RAMDir dir;
-  IndexWriter writer(dir);
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
   addTermDoc(writer, "body");
   writer.commit();
-  auto reader = writer.getIndexReader();
+  auto reader = writer.snapshots.readers.getReader();
   auto domains = canonicalDomains(*reader);
   auto identities = readerIdentitiesForTest(*reader);
 
@@ -4221,12 +4245,12 @@ TEST(FilterCacheTest, readerPublishRaceCannotResurrectStaleValue) {
   config.maxMetadataEntries = ENTRY_COUNT * 2;
   config.maxMetadataBytes = 1024 * 1024;
   auto cache = std::make_shared<FilterCache>(config);
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   ASSERT_TRUE(helper.indexAll(std::array{
       luxir::test::flatdoc("id", "1", "body_w", "body"),
       luxir::test::flatdoc("id", "2", "body_w", "body")},
       UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto domains = canonicalDomains(*reader);
   auto identities = readerIdentitiesForTest(*reader);
 
@@ -4598,8 +4622,8 @@ TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
   }
   ASSERT_TRUE(on.indexAll(docs, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(off.indexAll(docs, UpdateMessage::COMMIT).success);
-  auto onCache = on.getIndexWriter()->getFilterCache();
-  auto offCache = off.getIndexWriter()->getFilterCache();
+  auto onCache = on.getIndexWriter()->snapshots.readers.filterCache;
+  auto offCache = off.getIndexWriter()->snapshots.readers.filterCache;
   ASSERT_TRUE(onCache->enabled());
   ASSERT_FALSE(offCache->enabled());
 
@@ -4657,7 +4681,7 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
   cacheConfig.minSegmentDocs = 1000;
   cacheConfig.admissionThreshold = 1;
   auto firstCache = std::make_shared<FilterCache>(cacheConfig);
-  writer->filterCache = firstCache;
+  writer->snapshots.readers.filterCache = firstCache;
 
   std::vector<luxir::test::Doc> firstPhase;
   firstPhase.reserve(1000);
@@ -4677,12 +4701,12 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
   // A namespace rewind rebuilds from the writer's CONSTRUCTION config, not
   // the installed cache's: a test-assigned policy must not outlive a reset.
   // This writer was constructed with the cache disabled (queryCacheBytes 0).
-  auto autoCache = writer->getFilterCache();
+  auto autoCache = writer->snapshots.readers.filterCache;
   ASSERT_NE(firstCache, autoCache);
   EXPECT_FALSE(autoCache->enabled());
   // A test that wants cache-on after a reset installs its own again.
   auto secondCache = std::make_shared<FilterCache>(cacheConfig);
-  writer->filterCache = secondCache;
+  writer->snapshots.readers.filterCache = secondCache;
   EXPECT_EQ(0u, secondCache->entryCountForTest());
 
   std::vector<luxir::test::Doc> secondPhase;
@@ -4709,12 +4733,12 @@ TEST(FilterCacheIntegrationTest, dataResetReplacesRewoundCacheNamespace) {
   // The swap must propagate through READER succession, not just the writer
   // pointer: a post-swap reader carries the fresh cache, and a further
   // reader built WITH a previousReader must not resurrect the old one.
-  auto postResetReader = writer->getIndexReader();
+  auto postResetReader = writer->snapshots.readers.getReader();
   EXPECT_EQ(secondCache.get(), postResetReader->filterCache());
   luxir::test::CollectionHelper::UpdateBuilder touch;
   touch.remove("new-0").commit();
   ASSERT_TRUE(helper.submit(touch).success);
-  auto successorReader = writer->getIndexReader();
+  auto successorReader = writer->snapshots.readers.getReader();
   ASSERT_NE(postResetReader.get(), successorReader.get());
   EXPECT_EQ(secondCache.get(), successorReader->filterCache());
 }
@@ -4726,7 +4750,7 @@ TEST(FilterCacheIntegrationTest, membershipProjectionCachesScoreOnlyAndMembershi
   luxir::test::CollectionHelper helper(node, "filter_cache_membership");
   auto writer = helper.getIndexWriter();
   auto cache = std::make_shared<FilterCache>(testConfig());
-  writer->filterCache = cache;
+  writer->snapshots.readers.filterCache = cache;
   SchemaBuilder schema;
   auto& vector = schema.templ("_v");
   vector.type = api::FieldDef_::FieldClass::VECTOR;
@@ -4795,7 +4819,7 @@ TEST(FilterCacheIntegrationTest, knnRefreshKeepsEntryAndUsesCommitTime) {
   luxir::test::CollectionHelper helper(node, "filter_cache_knn_refresh");
   installVectorSchema(helper.collection());
   auto cache = std::make_shared<FilterCache>(testConfig());
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
 
   std::vector<luxir::test::Doc> input;
   for (int32_t i = 0; i < 24; i++) {
@@ -4804,7 +4828,7 @@ TEST(FilterCacheIntegrationTest, knnRefreshKeepsEntryAndUsesCommitTime) {
         "embedding_v", std::vector<float>{(float)i, 0.0f}));
   }
   ASSERT_TRUE(helper.indexAll(input, UpdateMessage::COMMIT).success);
-  auto firstReader = helper.getIndexWriter()->getIndexReader();
+  auto firstReader = helper.getIndexWriter()->snapshots.readers.getReader();
   std::array<float, 2> queryVector{0.0f, 0.0f};
   FilterKey key = knnKey(helper.collection(), *firstReader, queryVector, 4);
 
@@ -4822,7 +4846,7 @@ TEST(FilterCacheIntegrationTest, knnRefreshKeepsEntryAndUsesCommitTime) {
   luxir::test::CollectionHelper::UpdateBuilder update;
   update.remove("0").commit();
   ASSERT_TRUE(helper.submit(update).success);
-  auto secondReader = helper.getIndexWriter()->getIndexReader();
+  auto secondReader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_GT(secondReader->commitTime(), firstReader->commitTime());
   EXPECT_EQ(entryIdentity, cache->entryIdentityForTest(key));
   auto retired = cache->counters();
@@ -4854,7 +4878,7 @@ TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
   cacheConfig.admissionThreshold = 1;
   cacheConfig.minSegmentDocs = 0;
   auto cache = std::make_shared<FilterCache>(cacheConfig);
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
 
   ASSERT_TRUE(helper.indexAll(std::array{
       luxir::test::flatdoc("id", "1", "body_w", "color"),
@@ -4862,7 +4886,7 @@ TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
       luxir::test::flatdoc("id", "3", "body_w", "colors"),
       luxir::test::flatdoc("id", "4", "body_w", "other")},
       UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto schema = helper.collection().getSchema();
 
   auto count = [&](float boost) {
@@ -4905,7 +4929,7 @@ TEST(FilterCacheIntegrationTest, cacheFirstKnnCountOmitsWeightAndPrepare) {
   luxir::test::CollectionHelper helper(node, collection);
   installVectorSchema(helper.collection());
   auto cache = std::make_shared<FilterCache>(testConfig());
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
 
   std::vector<luxir::test::Doc> input;
   for (int32_t i = 0; i < 24; i++) {
@@ -4963,7 +4987,7 @@ TEST(FilterCacheIntegrationTest,
   luxir::test::CollectionHelper helper(node, collection);
   installVectorSchema(helper.collection());
   auto cache = std::make_shared<FilterCache>(testConfig());
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
 
   std::vector<luxir::test::Doc> input;
   for (int32_t i = 0; i < 24; i++) {
@@ -5024,7 +5048,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   cacheConfig.admissionThreshold = 1;
   auto cache = std::make_shared<FilterCache>(cacheConfig);
   auto writer = helper.getIndexWriter();
-  writer->filterCache = cache;
+  writer->snapshots.readers.filterCache = cache;
 
   std::vector<luxir::test::Doc> input;
   input.reserve(4096);
@@ -5037,7 +5061,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
 
   constexpr int32_t k = 1024;
   std::array<float, 2> queryVector{0.0f, 0.0f};
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   auto schema = helper.collection().getSchema();
   auto* fieldType = dynamic_cast<VectorFieldType*>(
       schema->getFieldTypePtr("embedding_v"));
@@ -5153,7 +5177,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   std::shared_ptr<IndexReader> nextReader;
   bool readerFailed = false;
   try {
-    nextReader = writer->getIndexReader();
+    nextReader = writer->snapshots.readers.getReader();
   } catch (...) {
     readerFailed = true;
   }
@@ -5179,7 +5203,7 @@ TEST(FilterCacheIntegrationTest, nestedBucketKnnDoesNotRecordAdmission) {
   luxir::test::CollectionHelper helper(node, "filter_cache_knn_gate");
   installVectorSchema(helper.collection());
   auto cache = std::make_shared<FilterCache>(testConfig());
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
 
   std::vector<luxir::test::Doc> input;
   for (int32_t i = 0; i < 20; i++) {
@@ -5251,7 +5275,7 @@ TEST(FilterCacheIntegrationTest, cachedArrayComposesWithDeletedLiveDocs) {
         "filter_w", i < 30 ? "sparse" : "other"));
   }
   ASSERT_TRUE(helper.indexAll(input, UpdateMessage::COMMIT).success);
-  auto cache = helper.getIndexWriter()->getFilterCache();
+  auto cache = helper.getIndexWriter()->snapshots.readers.filterCache;
   EXPECT_EQ(30, runCachedSearch(node, "filter_cache_mixed", "sparse").count);
   EXPECT_EQ(30, runCachedSearch(node, "filter_cache_mixed", "sparse").count);
 
@@ -5297,13 +5321,13 @@ TEST(FilterCacheIntegrationTest, multiSelectFacetExactDomainWarmsSources) {
   };
 
   EXPECT_EQ(184, run());
-  auto beforeBuild = helper.getIndexWriter()->getFilterCache()->counters();
+  auto beforeBuild = helper.getIndexWriter()->snapshots.readers.filterCache->counters();
   EXPECT_EQ(184, run());
-  auto afterBuild = helper.getIndexWriter()->getFilterCache()->counters();
+  auto afterBuild = helper.getIndexWriter()->snapshots.readers.filterCache->counters();
   EXPECT_GE(afterBuild.builds - beforeBuild.builds, 2u);
   auto beforeHit = afterBuild;
   EXPECT_EQ(184, run());
-  EXPECT_GE(helper.getIndexWriter()->getFilterCache()->counters().hits
+  EXPECT_GE(helper.getIndexWriter()->snapshots.readers.filterCache->counters().hits
                 - beforeHit.hits,
             2u);
 }
@@ -5880,7 +5904,7 @@ IndexResult commitAndDrain(CollectionHelper& helper) {
   commit.commit(true);
   auto result = helper.submit(commit);
   helper.getIndexWriter()->updateGraph.wait_for_all();
-  helper.getIndexWriter()->getIndexReader();
+  helper.getIndexWriter()->snapshots.readers.getReader();
   return result;
 }
 
@@ -6073,7 +6097,7 @@ TEST_F(FilterCacheConcurrencyTest, updateMergePurgeEvictFuzz) {
       .maxMetadataEntries = 32,
       .maxMetadataBytes = 16 * 1024};
   auto cache = std::make_shared<FilterCache>(cacheConfig);
-  writer->filterCache = cache;
+  writer->snapshots.readers.filterCache = cache;
 
   // Seed the bounded universe in small committed batches. The low merge factor
   // turns these into a mix of live tiers before concurrent mutation begins.

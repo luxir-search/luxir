@@ -117,7 +117,7 @@ void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
                   bool partitioned, int32_t termBase = 0,
                   IndexRamBudget* budget = nullptr, int32_t maxRanges = 4) {
   index.iw = std::make_unique<IndexWriter>(
-      index.dir, schema, budget);
+      index.snapshots, schema, budget);
   index.iw->mergePolicy->setMergeFactor(1000);
   if (partitioned) {
     index.iw->termPartitionMinBytes = 1;
@@ -151,7 +151,7 @@ void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
 void buildWideDictionarySources(TestIndex& index,
                                 const std::shared_ptr<Schema>& schema) {
   index.iw = std::make_unique<IndexWriter>(
-      index.dir, schema);
+      index.snapshots, schema);
   index.iw->mergePolicy->setMergeFactor(1000);
   TestField body(index, "body");
 
@@ -326,7 +326,7 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
 
 SegFieldInfo buildSparseRanges(TestIndex& index, const std::shared_ptr<Schema>& schema,
                                bool keepOneRange) {
-  index.iw = std::make_unique<IndexWriter>(index.dir, schema);
+  index.iw = std::make_unique<IndexWriter>(index.snapshots, schema);
   index.iw->mergePolicy->setMergeFactor(1000);
   index.iw->termPartitionMinBytes = 1;
   index.iw->termPartitionMinRangeBytes = 1;

@@ -55,12 +55,10 @@ It serves searches, schema reads, and `_stats`.
 Use it to query a directory another instance is writing, or to inspect one
 offline without risking a stray write. Current limitations:
 
-- **The view does not advance.** A read-only node pins its index view the first
-  time it serves a query and never reopens, so commits the writer publishes
-  after that point are invisible until the read-only node restarts.
-- **`_stats` reports a different point in time** than searches do: it reflects
-  the directory as it was read at startup, while searches reflect the commit
-  pinned at the first query.
+- **The view does not advance.** A read-only node opens its index view at
+  startup and never reopens, so later commits are invisible until it restarts.
+- **`_stats` describes the same snapshot as searches.** Directory byte totals
+  still reflect the files present when stats are requested.
 - **Pinned files are not reclaimed.** Segment files are held open by `mmap`, so
   files the writer deletes stay on disk until the read-only node exits. A
   long-lived read-only node against a busy writer holds disk space that `du`
@@ -184,7 +182,23 @@ the commit. Startup checks the newest manifest's footer and decodes its payload;
 it does not hash data files. Torn candidates are skipped. Fallback candidates
 also require their referenced files to be present with matching sizes.
 
-Once the new root is durable, obsolete manifests and data are removed.
+Once the new root is durable, obsolete manifests and unreferenced data are removed.
+Transfer reservations are keyed by `(incarnation, index_gen)` and survive
+individual requests. Clients downloading the same commit share one reservation;
+release revokes that reservation for all of them. `snapshot_pins`, `pin_retained_bytes`, `pin_idle_drops`, and
+`pin_budget_drops` report reservation state and policy drops. Retained bytes
+count unique files whose only remaining owners are pins; current-snapshot
+files and files still owned by indexing or merges do not count. The oldest
+reservations are revoked first when the budget is exceeded. Only actual bytes
+read refresh idle activity. Expiry is lazy on acquire, touch, file open, retirement,
+and stats. A fully idle collection can retain abandoned reservations until the
+next activity, bounded by the retained-bytes budget. An already-open transfer
+can finish after revocation.
+Reservations are process-local; writer startup removes leftover unreferenced
+index files using the directory listing, without reading their contents. If
+startup falls back below the highest manifest generation, it logs an error and
+skips this sweep, preserving newer files for recovery.
+
 Removals are not directory-synced: a crash may restore obsolete names, but the
 newest durable manifest does not reference them. Failed publication candidates
 are removed and the directory is synced best-effort. An error response does not

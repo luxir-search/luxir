@@ -29,7 +29,7 @@ public:
     helper.index(flatdoc("id", "d3", "body_w", "a"), UpdateMessage::NO_COMMIT);
     helper.index(flatdoc("id", "d4", "body_w", "a"), UpdateMessage::NO_COMMIT);
     helper.index(flatdoc("id", "d5", "body_w", "b a"), UpdateMessage::COMMIT);
-    reader = helper.getIndexWriter()->getIndexReader();
+    reader = helper.getIndexWriter()->snapshots.readers.getReader();
   }
 
   int64_t cost(Query* q) {

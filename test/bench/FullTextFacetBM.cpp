@@ -1077,7 +1077,7 @@ static void BM_FullTextScoreTopK(benchmark::State& state, int64_t nDocs, std::st
     buildFullTextBenchIndex(helper, nDocs, docsPerSeg);
   }
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   ScoreTopKResult exhaustive = runFullTextScoreTopK(*reader, qterm, topK, false);
   ScoreTopKResult pruned = runFullTextScoreTopK(*reader, qterm, topK, true);
@@ -1136,7 +1136,7 @@ static void BM_FullTextScoreTopKDisjunction(benchmark::State& state, int64_t nDo
     buildFullTextBenchIndex(helper, nDocs, docsPerSeg);
   }
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   ScoreTopKResult exhaustive = runFullTextScoreTopKDisjunction(*reader, commonTerm, rareTerm, topK, false);
   ScoreTopKResult pruned = runFullTextScoreTopKDisjunction(*reader, commonTerm, rareTerm, topK, true);
@@ -1194,7 +1194,7 @@ static void BM_FullTextScoreTopKDisjunctionClustered(benchmark::State& state,
     builtShape = docsPerSeg;
   }
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   ScoreTopKResult exhaustive = runClusteredDisjunctionTopK(
     *reader, topK, DisjunctionMaxScoreMode::Exhaustive);
@@ -1259,7 +1259,7 @@ static void BM_FullTextScoreTopKCrossSegmentAccumulator(benchmark::State& state,
     builtShape = docsPerSeg;
   }
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   ScoreTopKResult exhaustive = runCrossSegmentAccumulatorTopK(*reader, topK, false, nullptr);
   ScoreTopKResult local = runCrossSegmentAccumulatorTopK(*reader, topK, true, nullptr);
@@ -1322,7 +1322,7 @@ static void BM_FullTextScoreTopKMsmWand(benchmark::State& state, MsmWandMode mod
     builtMsmDocs = msmDocs;
   }
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   ScoreTopKResult exhaustive = runMsmWandTopK(*reader, topK, MsmWandMode::Exhaustive);
   ScoreTopKResult wand = runMsmWandTopK(*reader, topK, MsmWandMode::Wand);
@@ -1369,9 +1369,10 @@ static void BM_FullTextScoreTopKClustered(benchmark::State& state, bool skip) {
   constexpr int32_t topK = 100;
 
   RAMDir dir;
-  IndexWriter iw(dir);
+  CommitSnapshotRegistry iwSnapshots(dir);
+  IndexWriter iw(iwSnapshots);
   buildClusteredScoreTopKIndex(iw, clusteredDocs);
-  auto reader = iw.getIndexReader();
+  auto reader = iw.snapshots.readers.getReader();
 
   ScoreTopKResult exhaustive = runFullTextScoreTopK(*reader, "hot", topK, false);
   ScoreTopKResult pruned = runFullTextScoreTopK(*reader, "hot", topK, true);
@@ -1435,7 +1436,7 @@ static void BM_FullTextScoreTopKMultiTermFrontier(benchmark::State& state,
     builtZipf = zipf;
   }
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ScoreTopKResult t2 = runMultiTermDisjunctionTopK(*reader, terms, topK, true);
   ScoreTopKResult t1 = runMultiTermDisjunctionTopK(*reader, terms, topK, false);
   assertSameTopK(t2, t1);
@@ -1517,7 +1518,7 @@ static void BM_SkipEffectiveness(benchmark::State& state,
     builtShape = docsPerSeg;
   }
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   // Numerator (impact-pruned) and denominator (exhaustive), measured once outside
   // timing with counters on. Same top-k must fall out either way (byte-identical).
@@ -1594,7 +1595,7 @@ static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
     builtTerms = numTerms;
   }
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ScoreTopKResult pull = runBulkOrPullDisjunctionTopK(
     *reader, terms, topK, false, domainStep, domainArray);
   ScoreTopKResult bulk = runBulkOrPullDisjunctionTopK(
@@ -1679,7 +1680,7 @@ static void BM_FullTextScoreTopKPhraseFilterConjunction(benchmark::State& state,
     builtAdjacencyStep = adjacencyStep;
   }
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   // Two-phase only changes WHEN positions are verified, not the match set, so it
   // must be byte-identical to the eager path. Verify that once, outside timing.
@@ -1782,7 +1783,7 @@ static void BM_FullTextScoreTopKFrontierBounds(benchmark::State& state,
     qterm = "t100";
   }
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ScoreTopKResult exhaustive = runFullTextScoreTopK(*reader, qterm, topK, false, true);
   ScoreTopKResult corner = runFullTextScoreTopK(*reader, qterm, topK, true, false);
   ScoreTopKResult frontier = runFullTextScoreTopK(*reader, qterm, topK, true, true);

@@ -15,9 +15,14 @@ namespace luxir {
 struct Manifest {
   using Bytes = std::shared_ptr<const std::vector<std::byte>>;
   std::vector<std::string> names;
+  std::vector<Directory::FileInfo> listing; // reused by writer startup retirement
   Bytes bytes;
   uint64_t generation = 0;
   uint64_t highestGeneration = 0;
+
+  static bool indexFile(std::string_view name) {
+    return name.starts_with("s.olux") || (name.starts_with("s") && name.find('_') != std::string_view::npos);
+  }
 
   static std::string name(uint64_t gen) { return "s.olux_" + std::to_string(gen); }
 
@@ -81,8 +86,7 @@ struct Manifest {
         sizes.emplace(f.name, f.size);
         if (f.name.starts_with("s.olux_")) result.names.push_back(f.name);
         if (auto gen = generationOf(f.name)) generations.push_back(gen);
-        if (f.name.starts_with("s.olux")
-            || (f.name.starts_with("s") && f.name.find('_') != std::string::npos)) indexFiles = true;
+        if (indexFile(f.name)) indexFiles = true;
       }
       if (generations.empty() && !indexFiles) return result;
       if (retried && result.names == failedNames) {
@@ -105,6 +109,7 @@ struct Manifest {
         }
         result.bytes = std::move(bytes);
         result.generation = generations[i];
+        result.listing = std::move(listing);
         return result;
       }
       // Publication can retire a root after this scan, before read() opens it.

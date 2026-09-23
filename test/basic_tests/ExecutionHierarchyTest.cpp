@@ -44,7 +44,7 @@ public:
         {flatdoc("id", "0", "body_w", "common rare"),
          flatdoc("id", "1", "body_w", "common")},
         UpdateMessage::COMMIT).success);
-    reader = helper.getIndexWriter()->getIndexReader();
+    reader = helper.getIndexWriter()->snapshots.readers.getReader();
   }
 };
 

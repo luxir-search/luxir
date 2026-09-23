@@ -13,12 +13,13 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/flow_graph.h>
 #include "luxir/index/AuxInfo.h"
+#include "CommitSnapshotRegistry.h"
 #include "luxir/index/IndexRamBudget.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/store/Directory.h"
 #include "luxir/search/IndexReader.h"
-#include "luxir/search/FilterCache.h"
+#include "luxir/search/ReaderManager.h"
 #include "luxir/server/LuxirError.h"
 #include "luxir/util/DeadlineScheduler.h"
 #include "Inverter.h"
@@ -84,6 +85,7 @@ public:
     // ANN entries are carried by segment liveness; coreGen does not
     // participate.
     std::vector<AuxInfo> auxOverlays;
+    uint64_t nextOverlayGen = 0; // high-water mark survives separately published drops
 
     SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs), liveDocs(nDocs) {}
 
@@ -115,22 +117,10 @@ class IndexWriter {
   std::mutex closeMutex;
   std::mutex publicationMutex; // held only while constructing and publishing a manifest
   std::mutex indexMutex;
-  std::mutex indexReaderMutex;
-  struct Published {
-    std::shared_ptr<const std::vector<std::byte>> bytes;
-    std::shared_ptr<Schema> schema;
-    CommitId id;
-    uint64_t commitTime;
-  };
-  std::atomic<std::shared_ptr<const Published>> published;
-  // Fast-path hints precede the owning snapshot store. Readers may reopen early,
-  // but never need to acquire the Published control block just to check freshness.
-  std::atomic<uint64_t> publishedSchemaGen = 0;
   std::vector<std::string> manifestNames;
+  std::vector<std::string> pendingRetirement; // publicationMutex
   uint64_t nextManifestGen = 0;
   std::string incarnation;
-  // Protected by indexMutex.
-  std::optional<uint64_t> oldestCommittedSchemaGen;
 
 public:
 
@@ -143,53 +133,14 @@ public:
     bool outputPublished = false;
   };
 
-  struct AuxStats {
-    std::string kind;
-    std::string field;
-    std::string name;
-    uint64_t gen = 0;
-    uint64_t commitTime = 0;
-    uint64_t builtCoreGen = 0;
-    uint64_t bytes = 0;
-    std::vector<std::string> files;
-  };
-
-  struct SegmentStats {
-    uint64_t segId = 0;
-    uint64_t liveGen = 0;
-    uint64_t minUpdateVersion = 0;
-    uint64_t maxUpdateVersion = 0;
-    uint64_t firstCommitTime = 0;
-    uint64_t schemaGen = 0;
-    uint64_t bytes = 0;
-    std::vector<AuxStats> overlays;
-    int32_t maxDoc = 0;
-    int32_t liveDocs = 0;
+  using AuxStats = ReaderManager::AuxStats;
+  struct SegmentStats : ReaderManager::SegmentStats {
     int32_t mergeLevel = 0;
-    bool committed = false;
     bool merging = false;
   };
-
-  struct Stats {
-    uint64_t commitTime = 0;
-    uint64_t commits = 0;  // commits performed by this writer instance
-    uint64_t indexGen = 0;
-    uint64_t coreGen = 0;
-    uint64_t updateVersion = 0;
-    uint64_t schemaGen = 0;
-    uint64_t segments = 0;
-    uint64_t committedSegments = 0;
-    uint64_t maxDocs = 0;
-    uint64_t liveDocs = 0;
+  struct Stats : ReaderManager::SnapshotStats<SegmentStats> {
+    uint64_t commits = 0;
     uint64_t activeMerges = 0;
-    uint64_t totalBytes = 0;
-    std::vector<AuxStats> auxIndexes;
-    std::vector<SegmentStats> segmentStats;
-    FilterCache::CounterValues filterCacheCounters;
-    uint64_t filterCacheMaxBytes = 0;
-    uint64_t filterCacheResidentBytes = 0;
-    uint64_t filterCacheMetadataBytes = 0;
-    bool filterCacheEnabled = false;
   };
 
   // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file
@@ -338,16 +289,8 @@ public:
   // the last segId generated. Atomic since we don't grab any lock in the merge code to generate a new segment id.
   std::atomic_uint64_t lastSegId;
 
-  // The reader searches use. Published under indexReaderMutex, loaded without
-  // it: a request the current reader satisfies never waits on a reopen in
-  // progress (see getIndexReader).
-  std::atomic<std::shared_ptr<IndexReader>> indexReader;
-  std::shared_ptr<FilterCache> filterCache;
-  // Construction-time cache config. Namespace rewinds (testDeleteAllData, a
-  // future truncate) rebuild the cache from THIS, not from the installed
-  // cache's config, so a test-assigned replacement cache cannot leak its
-  // policy past a reset of the shared collection.
-  FilterCacheConfig originalFilterCacheConfig;
+  CommitSnapshotRegistry& snapshots;
+  std::atomic<std::shared_ptr<const CommitSnapshot>> lastSnapshot;
 
   std::unique_ptr<MergePolicy> mergePolicy;
 
@@ -422,8 +365,7 @@ public:
   // One entry per segment overlay referenced by the last published IndexInfo,
   // keyed by owning segment (the manifest nests overlays under SegmentInfo;
   // this preserves that association in memory).  Consumers: orphan-file
-  // cleanup after publishing a new IndexInfo, gen-ordinal continuity for
-  // drop-then-rebuild (nextVectorOverlayGen), and activation seeding at
+  // cleanup after publishing a new IndexInfo and activation seeding at
   // startup.  The authoritative per-segment copy lives on SegInfo.
   struct PublishedOverlay {
     uint64_t segId;
@@ -452,7 +394,6 @@ public:
   // This would allow a searching client to specify a time to search up to.
   // Time of the last commit (since 1970 epoch) in microseconds. Guaranteed to be strictly increasing.
   std::atomic_uint64_t lastCommitTime;
-  std::atomic_uint64_t lastAdvertisedCommitTime;
 
   // Commits performed by this writer instance (process lifetime, not persisted).
   std::atomic_uint64_t commitCount = 0;
@@ -510,10 +451,10 @@ public:
 
   // indexRamBudget is the (usually node-wide) pool that parallel merge tasks
   // reserve against; pass null for a private unlimited budget (tests, embedded).
+  // The collection owns snapshots and closes it after draining this writer.
   // A nonnull schema is for creation only; reopening loads the manifest schema.
-  explicit IndexWriter(Directory &dir, std::shared_ptr<Schema> schema = {},
+  explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
-                       FilterCacheConfig filterCacheConfig = {},
                        int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR);
   ~IndexWriter();
   void close();
@@ -580,14 +521,6 @@ public:
     return closed.load(std::memory_order_relaxed) || failed.load(std::memory_order_acquire);
   }
 
-  // Pins a physical snapshot and its schema for the caller's lifetime.
-  std::shared_ptr<IndexReader> getIndexReader(uint64_t freshness_us = 0);
-
-  std::shared_ptr<FilterCache> getFilterCache() const {
-    return filterCache;
-  }
-
-
   // Obtains an inverter for writing documents and sets its updateVersion.
   // Messages supply their admission pin. Without a pin, use the current schema.
   Inverter& obtainInverter(uint64_t updateVersion = 0, std::shared_ptr<Schema> pinned = {});
@@ -595,8 +528,7 @@ public:
   // Publish over the last physical snapshot without waiting for commit preparation.
   void setSchema(std::shared_ptr<Schema> schema);
   std::shared_ptr<Schema> updateSchema(std::function<std::shared_ptr<Schema>(const Schema*)> change);
-  std::shared_ptr<Schema> getSchema() const { return published.load()->schema; }
-  std::string resolvedSchema();
+  std::shared_ptr<Schema> getSchema() const { return lastSnapshot.load()->schema; }
 
   // Releases an inverter back to the pool.
   void releaseInverter(Inverter& inverter, bool flush=false);
@@ -642,7 +574,7 @@ private:
         && dynamic_cast<MergeCommitMessage*>(&msg) == nullptr)) {
       throw IndexWriterClosedError("index writer is closed");
     }
-    msg.schema = published.load()->schema;
+    msg.schema = lastSnapshot.load()->schema;
     // Sequences must start at 0 for the sequencer nodes.
     msg.updateVersion = updateNumber.fetch_add(1, std::memory_order_relaxed) + 1;
     msg.updateOrdinal = updateOrdinal++;
@@ -748,7 +680,7 @@ private:
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
   std::vector<std::string> snapshotActiveVectorOverlayNames();
-  uint64_t nextVectorOverlayGen(const SegInfo& seg, std::string_view name);
+  uint64_t nextSegmentOverlayGen(SegInfo& seg);
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
       PostingsReader& postingsReader,
@@ -758,7 +690,7 @@ private:
       std::vector<std::string>& outFiles);
   void deleteStagedOverlayFiles(std::span<const std::string> files,
                                 std::string_view context) noexcept;
-  // Reclaim retired segments once neither retained snapshot needs them.
+  // Release writer ownership; reservations can retain the retired files.
   void tryDeleteSegments();
   void moveSegmentToDelete(uint64_t segId);
   void applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData);

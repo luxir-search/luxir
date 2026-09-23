@@ -195,7 +195,8 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
 
   {
     FSDirectory dir(path);
-    IndexWriter iw(dir);
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots);
 
     auto submit = [&](bool commit) {
       std::pmr::monotonic_buffer_resource mr;
@@ -238,7 +239,7 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
     std::filesystem::remove(failingTmp);
     EXPECT_TRUE(submit(true));
     iw.updateGraph.wait_for_all();
-    EXPECT_EQ(1, iw.getIndexReader()->maxDoc());
+    EXPECT_EQ(1, iw.snapshots.readers.getReader()->maxDoc());
   }
 
   std::filesystem::remove_all(path);

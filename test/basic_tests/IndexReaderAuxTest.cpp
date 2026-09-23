@@ -446,9 +446,9 @@ TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
   auto carriedManifest = readDurableIndexInfo(dir);
   EXPECT_EQ(firstManifest->segments[0].overlays[0].commit_time,
             carriedManifest->segments[0].overlays[0].commit_time);
-  auto writerReader = h.getIndexWriter()->getIndexReader();
+  auto writerReader = h.getIndexWriter()->snapshots.readers.getReader();
   h.commit();
-  auto unchanged = h.getIndexWriter()->getIndexReader();
+  auto unchanged = h.getIndexWriter()->snapshots.readers.getReader();
   EXPECT_EQ(writerReader->segments().data(), unchanged->segments().data());
 
   // Same shared_ptr target - reused, not re-deserialized.
@@ -505,16 +505,16 @@ TEST_F(IndexReaderAuxTest, schemaOnlyReaderSharesPhysicalState) {
   h.commit({std::string(TestOverlayAuxReader::NAME)});
   ASSERT_TRUE(h.deleteById("a", UpdateMessage::COMMIT).success);
   expectValidInventory(writer->dir, *readDurableIndexInfo(writer->dir));
-  auto before = writer->getIndexReader();
+  auto before = writer->snapshots.readers.getReader();
   ASSERT_EQ(2u, before->segments().size());
   ASSERT_NE(nullptr, before->segments()[0].liveDocs());
-  auto cache = writer->getFilterCache();
+  auto cache = writer->snapshots.readers.filterCache;
   auto publications = cache->readerPublicationsForTest();
 
   SchemaBuilder b;
   b.field("added").type = api::FieldDef::FieldClass::STRING;
   auto schema = b.set(h.collection());
-  auto after = writer->getIndexReader(UINT64_MAX);
+  auto after = writer->snapshots.readers.getReader(UINT64_MAX);
   EXPECT_NE(before, after);
   EXPECT_EQ(schema, after->schema());
   EXPECT_LT(before->commitTime(), after->commitTime());
@@ -540,7 +540,7 @@ TEST_F(IndexReaderAuxTest, schemaOnlyReaderSharesPhysicalState) {
   ASSERT_NE(nullptr, ordMap);
   EXPECT_EQ(ordMap, before->getOrdMap("name_s"));
   EXPECT_EQ(publications, cache->readerPublicationsForTest());
-  EXPECT_EQ(after, writer->getIndexReader());
+  EXPECT_EQ(after, writer->snapshots.readers.getReader());
   std::weak_ptr<IndexReader> retired = before;
   before.reset();
   EXPECT_TRUE(retired.expired());  // the replacement must not retain a chain
@@ -665,7 +665,8 @@ TEST_F(IndexReaderAuxTest, inventoryReopensWithOverlaysAndDeletes) {
   ASSERT_GT(before->segments[0].live_gen, 0u);
   expectValidInventory(writer->dir, *before);
   writer->close();
-  IndexWriter reopened(writer->dir);
+  CommitSnapshotRegistry reopenedSnapshots(writer->dir);
+  IndexWriter reopened(reopenedSnapshots);
   reopened.commit();
   auto after = readDurableIndexInfo(writer->dir);
   expectValidInventory(writer->dir, *after);

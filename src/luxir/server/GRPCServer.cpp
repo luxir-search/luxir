@@ -661,7 +661,7 @@ static grpc::ByteBuffer doBlockingUpdate(GRPCServer& server, const UpdateReqProt
   std::shared_ptr<Collection> collection = resolveUpdateCollection(server, request);
 
   auto shard = collection->getShard();
-  auto iw = shard->getIndexWriter();
+  auto iw = shard->requireIndexWriter();
 
   class BlockingUpdateMessage : public ProtoUpdateMessage {
   public:
@@ -731,7 +731,7 @@ static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf)
   try {
     auto collection = resolveUpdateCollection(call.server, request->proto);
     auto shard = collection->getShard();
-    auto iw = shard->getIndexWriter();
+    auto iw = shard->requireIndexWriter();
 
     Update* updateMessage = new Update(std::move(request), &call);
     try {

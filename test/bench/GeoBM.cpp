@@ -357,7 +357,7 @@ public:
         boxes(boxesFor(corpus.shape)), circles(circlesFor(corpus.shape)) {
     schema = geoSchema(corpus.multi);
     index.iw = std::make_unique<IndexWriter>(
-        index.dir, schema);
+        index.snapshots, schema);
     Inverter& inverter = index.getInverter();
     std::vector<std::array<int64_t, 2>> packed;
     populate(inverter, corpus.shape, corpus.multi, docs,
@@ -716,8 +716,8 @@ void BM_GeoBuild(benchmark::State& state, CorpusShape shape) {
     state.PauseTiming();
     auto dir = std::make_unique<RAMDir>();
     auto schema = geoSchema(corpus.multi);
-    auto writer = std::make_unique<IndexWriter>(
-        *dir, schema);
+    CommitSnapshotRegistry snapshots(*dir);
+    auto writer = std::make_unique<IndexWriter>(snapshots, schema);
     Inverter& inverter = writer->obtainInverter();
     populate(inverter, shape, corpus.multi, docs,
              0x3e8c7b1d956a204fULL + (uint64_t)shape);
@@ -725,7 +725,7 @@ void BM_GeoBuild(benchmark::State& state, CorpusShape shape) {
     writer->releaseInverter(inverter, true);
     writer->commit();
     state.PauseTiming();
-    auto reader = writer->getIndexReader();
+    auto reader = writer->snapshots.readers.getReader();
     if (reader->segments().size() != 1) {
       state.SkipWithError("geo build did not produce one segment");
     }
@@ -751,8 +751,8 @@ void BM_GeoMerge(benchmark::State& state, CorpusShape shape) {
     state.PauseTiming();
     auto dir = std::make_unique<RAMDir>();
     auto schema = geoSchema(corpus.multi);
-    auto writer = std::make_unique<IndexWriter>(
-        *dir, schema);
+    CommitSnapshotRegistry snapshots(*dir);
+    auto writer = std::make_unique<IndexWriter>(snapshots, schema);
     for (int32_t half = 0; half < 2; half++) {
       int32_t halfDocs = half == 0 ? firstHalf : docs - firstHalf;
       Inverter& inverter = writer->obtainInverter();
@@ -761,7 +761,7 @@ void BM_GeoMerge(benchmark::State& state, CorpusShape shape) {
       writer->releaseInverter(inverter, true);
       writer->commit();
     }
-    auto before = writer->getIndexReader();
+    auto before = writer->snapshots.readers.getReader();
     if (before->segments().size() != 2) {
       state.SkipWithError("geo merge setup did not produce two segments");
     }
@@ -769,7 +769,7 @@ void BM_GeoMerge(benchmark::State& state, CorpusShape shape) {
     state.ResumeTiming();
     writer->mergeSegments();
     state.PauseTiming();
-    auto after = writer->getIndexReader();
+    auto after = writer->snapshots.readers.getReader();
     if (after->segments().size() != 1) {
       state.SkipWithError("geo merge did not produce one segment");
     }

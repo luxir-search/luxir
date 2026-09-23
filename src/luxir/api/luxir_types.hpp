@@ -292,6 +292,10 @@ struct IndexStats {
   uint64_t update_version = 0;
   uint64_t schema_gen = 0;
   uint64_t active_merges = 0;
+  uint64_t snapshot_pins = 0;
+  uint64_t pin_retained_bytes = 0;
+  uint64_t pin_idle_drops = 0;
+  uint64_t pin_budget_drops = 0;
   std::span<const AuxStats> aux_indexes;
   QueryCacheStats query_cache;
   std::span<const SegmentStats> segments;

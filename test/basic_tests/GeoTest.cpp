@@ -423,7 +423,7 @@ TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
 
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto& segment = reader->segments()[0];
   SegFieldInfo singleInfo = fieldInfo(segment, "geo_single");
@@ -540,7 +540,7 @@ TEST_F(GeoBoxQueryTest, scanFallbackWithoutPointsUsesDenseColumnPath) {
   }
   writer->releaseInverter(inverter);
   writer->commit();
-  auto reader = writer->getIndexReader();
+  auto reader = writer->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
   EXPECT_EQ(0, fieldInfo(segment, "geo_single").pointsMetaOff);
   Box box{-10.0, 10.0, 160.0, -170.0};
@@ -574,7 +574,7 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
     writer->commit();
   }
 
-  auto beforeMerge = writer->getIndexReader();
+  auto beforeMerge = writer->snapshots.readers.getReader();
   ASSERT_EQ(2u, beforeMerge->segments().size());
   for (auto& segment : beforeMerge->segments()) {
     for (std::string_view field : {"geo_single", "geo_multi"}) {
@@ -592,7 +592,7 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   EXPECT_EQ(-1, deletedCountState.weight->count(beforeMerge->segments()[1]));
 
   writer->mergeSegments();
-  auto afterMerge = writer->getIndexReader();
+  auto afterMerge = writer->snapshots.readers.getReader();
   ASSERT_EQ(1u, afterMerge->segments().size());
   auto& merged = afterMerge->segments()[0];
   for (std::string_view field : {"geo_single", "geo_multi"}) {

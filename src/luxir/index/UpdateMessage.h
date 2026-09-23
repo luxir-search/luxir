@@ -4,18 +4,12 @@
 #pragma once
 
 #include <deque>
+#include "CommitSnapshot.h"
 #include "Inverter.h"
 #include "luxir/server/LuxirError.h"
 
 
 namespace luxir {
-
-// Owning snapshot identity for asynchronous completion and synchronous commits.
-struct CommitId {
-  std::string incarnation;
-  uint64_t index_gen = 0;
-  bool operator==(const CommitId&) const = default;
-};
 
 class IndexWriter;
 class UpdateMessage;

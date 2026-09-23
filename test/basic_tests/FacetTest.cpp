@@ -420,7 +420,7 @@ TEST_F(FacetTest, spanCounterModesMatchAuto) {
     ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   }
   ASSERT_EQ((size_t)segments,
-            helper.getIndexWriter()->getIndexReader()->segments().size());
+            helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
 
   SearchOverridesGuard guard(forcedFacetCounterMode);
   auto run = [&](FacetCounterMode mode, int64_t mincount) {
@@ -4961,7 +4961,7 @@ TEST_F(FacetTest, selectedAnyComposesPerValueCacheEntries) {
       .minSegmentDocs = 0,
       .admissionThreshold = 1,
   });
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   helper.indexAll(std::array{
     flatdoc("id", "1", "brand_s", "acme", "color_s", "red"),
     flatdoc("id", "2", "brand_s", "acme", "color_s", "blue"),

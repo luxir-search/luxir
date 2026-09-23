@@ -47,12 +47,14 @@ void LuxirNode::validateCollectionName(std::string_view name) {
 
 std::shared_ptr<Schema> Collection::updateSchema(const luxir::api::SchemaDef& def,
                                                  luxir::api::SchemaRequest_::Mode mode) {
+  if (!shard->iw) throw ReadOnlyError("collection has no writer");
   return shard->iw->updateSchema([&](const Schema* current) {
     return Schema::fromProto(def, mode == api::SchemaRequest_::Mode::SET ? current : nullptr);
   });
 }
 
 void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
+  if (!shard->iw) throw ReadOnlyError("collection has no writer");
   shard->iw->setSchema(std::move(newSchema));
 }
 
@@ -249,6 +251,7 @@ void LuxirNode::deleteCollection(std::string_view name) {
     if (collection->shard && collection->shard->iw) {
       collection->shard->iw->close();
     }
+    if (collection->shard) collection->shard->snapshots->close();
     dirFactory->remove(collectionName);
   } catch (const std::exception& e) {
     auto failed = std::make_shared<Collection>();
@@ -277,9 +280,15 @@ std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name, s
   col->shard = std::make_shared<Shard>(*col);
   col->shard->dir = directory ? std::move(directory) : dirFactory->create(name);
 
-  col->shard->iw = std::make_shared<IndexWriter>(*col->shard->dir,
+  col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(*col->shard->dir,
+      FilterCacheConfig{.maxBytes = config.queryCacheBytes});
+  if (config.read_only) {
+    col->shard->snapshots->openLocalSnapshot();
+    return col;
+  }
+  col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
     std::move(initialSchema), &indexRamBudget,
-    FilterCacheConfig{.maxBytes = config.queryCacheBytes}, config.index.merge_factor);
+    config.index.merge_factor);
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
 

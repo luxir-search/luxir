@@ -75,7 +75,7 @@ TEST_F(AllQueryCapabilityShapeTest,
   ASSERT_TRUE(helper.index(
       flatdoc("id", "0", "body_w", "keep"),
       UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto& sourceSegment = reader->segments()[0];
 
@@ -107,7 +107,7 @@ TEST_F(AllQueryCapabilityShapeTest, disableSwitchGatesDenseClauseProtocol) {
   ASSERT_TRUE(helper.index(
       flatdoc("id", "0", "body_w", "keep"),
       UpdateMessage::COMMIT).success);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto& segment = reader->segments()[0];
   MemPool pool;
 
@@ -187,7 +187,7 @@ TEST_F(AllQueryCapabilityShapeTest,
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto& segment = reader->segments()[0];
 

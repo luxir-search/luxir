@@ -1068,7 +1068,8 @@ TEST_F(SchemaTest, schemaLoadOnRestart) {
   ch.commit();
 
   ch.getIndexWriter()->close();
-  IndexWriter reopened(*ch.collection().getShard()->getDirectory());
+  CommitSnapshotRegistry reopenedSnapshots(*ch.collection().getShard()->getDirectory());
+  IndexWriter reopened(reopenedSnapshots);
   auto loadedSchema = reopened.getSchema();
   EXPECT_EQ(schemaGen, loadedSchema->gen_);
 

@@ -73,6 +73,7 @@ TEST_F(ReadOnlyNodeTest, servesSearchesAlongsideTheWriter) {
 
   // The writer is still up and still holds write.lock.
   LuxirNode reader(fsConfig(data, /*readOnly=*/true));
+  EXPECT_EQ(nullptr, reader.getCollection("main")->getShard()->getIndexWriter());
   HttpServer readerServer(reader, 2, 0);
   readerServer.start();
   int port = readerServer.getPort();

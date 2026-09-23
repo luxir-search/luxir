@@ -106,7 +106,7 @@ void expectSameDocs(const std::vector<Doc>& expected, const std::vector<Doc>& ac
 
 int mergedSegmentFileCount(CollectionHelper& helper) {
   auto iw = helper.getIndexWriter();
-  auto reader = iw->getIndexReader();
+  auto reader = iw->snapshots.readers.getReader();
   assert(reader->segments().size() == 1);
   uint64_t segId = reader->segments()[0].segInfo.seg_id;
   std::string prefix = Postings::getIndexFileNamePrefix(segId);
@@ -154,7 +154,7 @@ TEST(MergeParallelismTest, MergedSegmentFileCountStaysWithinStreamCap) {
   CollectionHelper helper("main");
   buildMergedIndex(helper);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1, reader->segments().size());
   EXPECT_LE(mergedSegmentFileCount(helper), MergeCostModel::STREAM_BUDGET_FLOOR);
 }

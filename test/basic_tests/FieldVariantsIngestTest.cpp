@@ -47,7 +47,7 @@ TEST_F(FieldVariantsIngestTest, authorFanoutAndOneStoredSource) {
   EXPECT_TRUE(containsDoc(docs, flatdoc("author", "Ursula K. Le Guin")));
   EXPECT_TRUE(match(helper, "author__s", "ursula").empty());
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   FieldReader fields(reader->segments()[0].postingsReader());
   ASSERT_TRUE(fields.seek("author__s"));
@@ -87,7 +87,7 @@ TEST_F(FieldVariantsIngestTest, onlyStoredPrimariesWriteSourceValues) {
     ASSERT_EQ(1u, docs.size());
     EXPECT_TRUE(containsDoc(docs, flatdoc("id", "a")));
 
-    auto reader = helper.getIndexWriter()->getIndexReader();
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(1u, reader->segments().size());
     auto stored = StoredFieldsReader::open(reader->segments()[0].postingsReader());
     if (!keepSource) {
@@ -135,7 +135,7 @@ TEST_F(FieldVariantsIngestTest, dynamicTemplateUsesVariantPrototype) {
   auto docs = match(helper, "book_t__s", "42", {"book_t", "book_t__s"});
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("book_t", "0042", "book_t__s", 42)));
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   FieldReader fields(reader->segments()[0].postingsReader());
   ASSERT_TRUE(fields.seek("book_t__s"));

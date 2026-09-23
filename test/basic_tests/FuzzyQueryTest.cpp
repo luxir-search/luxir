@@ -597,7 +597,7 @@ TEST_F(FuzzyQueryTest, scoredFuzzyTopKMatchesBruteForceWithPruningEngaged) {
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   FuzzyTopKRun bruteForce = runFuzzyTopK(*reader, 3, false, true);
   FuzzyTopKRun pruned = runFuzzyTopK(*reader, 3, true);
   expectSameTopDocs(bruteForce, pruned);
@@ -636,7 +636,7 @@ TEST_F(FuzzyQueryTest, boostedFuzzyTopKMatchesBruteForceWithPruningEngaged) {
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   FuzzyTopKRun bruteForce = runFuzzyTopK(*reader, 3, false, true, 2.75f);
   FuzzyTopKRun pruned = runFuzzyTopK(*reader, 3, true, false, 2.75f);
   expectSameTopDocs(bruteForce, pruned);

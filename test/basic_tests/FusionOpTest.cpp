@@ -306,7 +306,7 @@ TEST_F(FusionOpTest, routedSourceFilterHasNoTarget) {
 
 TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
   CollectionHelper h("main");
-  h.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  h.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   ASSERT_TRUE(h.indexAll(
       {flatdoc("id", "a", "foo_w", "alpha beta", "keep_s", "yes"),
@@ -395,7 +395,7 @@ TEST_F(FusionOpTest, defaultProjectionWhenNoFieldsNamed) {
 
 TEST_F(FusionOpTest, topKCountWholeHitComposesSharedDomainOnce) {
   CollectionHelper h("main");
-  h.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  h.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
   ASSERT_TRUE(h.indexAll(
       {flatdoc("id", "a", "foo_w", "alpha beta", "keep_s", "yes"),
@@ -587,7 +587,7 @@ TEST_F(FusionOpTest, subOpsUseFusedCandidates) {
   index("f", "apple", "excluded", 200, 0.1f, "no");
   index("g", "apple", "excluded", 300, 40, "yes", "no");
   h.commit();
-  ASSERT_EQ(3u, h.getIndexWriter()->getIndexReader()->segments().size());
+  ASSERT_EQ(3u, h.getIndexWriter()->snapshots.readers.getReader()->segments().size());
 
   for (int maxParallel : {0, 1, -1}) {
     for (int limit : {0, 1, 10}) {

@@ -49,7 +49,7 @@ TEST_F(OrdMapTest, EmptyIndex) {
   // Don't index any documents
   helper->commit();
   
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
 
   EXPECT_EQ(reader->getOrdMapCacheSize(), 0);
 
@@ -78,7 +78,7 @@ TEST_F(OrdMapTest, SingleSegmentSimpleTerms) {
   helper->index({{"field1_s", "apple"}, {"id", "4"}}); // duplicate term
   helper->commit();
   
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   
   // Debug: Check if we have segments and the field exists
   const auto& segments = reader->segments();
@@ -112,7 +112,7 @@ TEST_F(OrdMapTest, MultipleSegmentsDisjointTerms) {
   helper->index({{"field1_s", "fig"}, {"id", "6"}});
   helper->commit();
   
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   auto ordMap = reader->getOrdMap("field1_s");
 
   ASSERT_NE(ordMap, nullptr);
@@ -160,7 +160,7 @@ TEST_F(OrdMapTest, MultipleSegmentsOverlappingTerms) {
   helper->index({{"field1_s", "date"}, {"id", "9"}}); // overlap
   helper->commit();
   
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   auto ordMap = reader->getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
@@ -199,7 +199,7 @@ TEST_F(OrdMapTest, FieldInSomeSegments) {
   helper->index({{"different_field_s", "value3"}, {"id", "7"}});
   helper->commit();
   
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   auto ordMap = reader->getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
@@ -239,7 +239,7 @@ TEST_F(OrdMapTest, EmptyFieldInSegment) {
   helper->index({{"field1_s", "cherry"}, {"id", "5"}});
   helper->commit();
   
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   auto ordMap = reader->getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
@@ -269,7 +269,7 @@ TEST_F(OrdMapTest, SegmentWithAllTerms) {
   helper->index({{"field1_s", "cherry"}, {"id", "8"}});
   helper->commit();
   
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   auto ordMap = reader->getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
@@ -320,7 +320,7 @@ TEST_F(OrdMapTest, SegToGlobalMapping) {
   helper->index({{"field1_s", "cherry"}, {"id", "7"}});
   helper->commit();
   
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   auto ordMap = reader->getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
@@ -379,7 +379,7 @@ TEST_F(OrdMapTest, SegToGlobalNullCases) {
   helper->index({{"field1_s", "banana"}, {"id", "6"}});
   helper->commit();
   
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   auto ordMap = reader->getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
@@ -432,7 +432,7 @@ TEST_F(OrdMapTest, GlobalToSegmentReverseMapping) {
   helper->index({{"field1_s", "fig"}, {"id", "8"}});
   helper->commit();
   
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   auto ordMap = reader->getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
@@ -533,7 +533,7 @@ TEST_F(OrdMapTest, GlobalPrefixSubsetUsesIdentityMapping) {
   helper->index({{"field1_s", "cherry"}, {"id", "3"}});
   helper->commit();
 
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   auto ordMap = reader->getOrdMap("field1_s");
   ASSERT_NE(ordMap, nullptr);
   auto mapping = ordMap->getSegToGlobal(0);
@@ -556,7 +556,7 @@ TEST_F(OrdMapTest, FlatDeltaFramesIncludeSafeTail) {
   }
   helper->commit();
 
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   auto ordMap = reader->getOrdMap("field1_s");
   ASSERT_NE(ordMap, nullptr);
   EXPECT_EQ(ordMap->numOrds(), 300);
@@ -594,7 +594,7 @@ TEST_F(OrdMapTest, PackedDeltaRunsCrossWidthBoundaries) {
   }
   helper->commit();
 
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   auto ordMap = reader->getOrdMap("field1_s");
   ASSERT_NE(ordMap, nullptr);
   ASSERT_EQ(ordMap->numOrds(), 70);
@@ -634,7 +634,7 @@ TEST_F(OrdMapTest, FlatPredictedAndFitParityAcrossBlockBoundary) {
   ASSERT_TRUE(helper->indexAll(evenDocs, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(helper->indexAll(oddDocs, UpdateMessage::COMMIT).success);
 
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   std::shared_ptr<OrdMap> flat;
   std::shared_ptr<OrdMap> predicted;
   std::shared_ptr<OrdMap> fit;
@@ -812,7 +812,7 @@ TEST_F(OrdMapTest, FacetAndStringSortMatchAcrossEncodings) {
     ASSERT_TRUE(helper->indexAll(docs, UpdateMessage::COMMIT).success);
   }
 
-  auto reader = helper->getIndexWriter()->getIndexReader();
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
   {
     OrdMapEncodingGuard guard(OrdMap::DeltaEncoding::FLAT);
     ASSERT_NE(reader->getOrdMap("flat_s"), nullptr);

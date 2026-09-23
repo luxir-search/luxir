@@ -58,7 +58,7 @@ TEST_F(NumericColumnBoundsTest, typedEndpointsDecodeFromTrailer) {
   helper.index(flatdoc("id", "hi", "wide_i", std::numeric_limits<int64_t>::max(),
                        "when_dt", int64_t{9000}, "price_f", 3.75f,
                        "weight_d", 8.5), UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1, reader->segments().size());
   auto& segment = reader->segments()[0];
 
@@ -87,7 +87,7 @@ TEST_F(NumericColumnBoundsTest, missingOnlySegmentBindsAsMissing) {
   CollectionHelper helper;
   helper.index(flatdoc("id", "with", "price_i", 4), UpdateMessage::COMMIT);
   helper.index(flatdoc("id", "without"), UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(2, reader->segments().size());
   EXPECT_FALSE(readBounds(reader->segments()[1], "price_i").has_value());
 
@@ -110,7 +110,7 @@ TEST_F(NumericColumnBoundsTest, mergeRecomputesDeletedExtrema) {
   ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
   helper.getIndexWriter()->mergeSegments();
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1, reader->segments().size());
   auto bounds = readBounds(reader->segments()[0], "price_i");
   ASSERT_TRUE(bounds && bounds->hasValues);

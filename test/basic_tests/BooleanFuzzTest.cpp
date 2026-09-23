@@ -776,7 +776,7 @@ TEST_F(BooleanFuzzTest, negatedDenseCountHandlesWindowsSegmentsDeletesAndDomain)
 
   // Exercise the same negated words as a DocSetBuilder-producing domain pass.
   NegatedCountGuard bulkEnabled(false);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   MemPool pool;
   Query::Context context(pool, *reader);
   TermQuery positive("body_w", "nc_pos");
@@ -917,12 +917,12 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
   // Scoped install: the shared collection's writer must get its own cache
   // back, or this aggressive config (admission on first sighting) leaks into
   // every later test via readers and namespace-reset swaps.
-  auto savedCache = helper.getIndexWriter()->filterCache;
-  helper.getIndexWriter()->filterCache = cache;
+  auto savedCache = helper.getIndexWriter()->snapshots.readers.filterCache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   struct CacheRestore {
     luxir::test::CollectionHelper& helper;
     std::shared_ptr<FilterCache> saved;
-    ~CacheRestore() { helper.getIndexWriter()->filterCache = saved; }
+    ~CacheRestore() { helper.getIndexWriter()->snapshots.readers.filterCache = saved; }
   } cacheRestore{helper, std::move(savedCache)};
 
   const int numDocs = 48;
@@ -1230,7 +1230,7 @@ TEST_F(BooleanFuzzTest, conjunctionBulkCountMatchesPullOnMixedBlockShapes) {
     docs.push_back(flatdoc("id", "bc" + std::to_string(doc), "body_w", body));
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   auto makeFilter = [](int32_t maxDoc, int32_t mode) -> std::unique_ptr<DocSet> {
     if (mode == 0) {
@@ -1338,7 +1338,7 @@ TEST_F(BooleanFuzzTest, mandOptBulkCountMatchesPullOnMixedBlockShapes) {
     docs.push_back(flatdoc("id", "bm" + std::to_string(doc), "body_w", body));
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
   auto makeFilter = [](int32_t maxDoc, int32_t mode) -> std::unique_ptr<DocSet> {
     if (mode == 0) {

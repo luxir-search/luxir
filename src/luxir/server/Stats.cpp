@@ -34,7 +34,7 @@ void addTotals(api::StatsTotals& dst, const api::StatsTotals& src) {
   dst.bytes += src.bytes;
 }
 
-void copyAuxStats(api::AuxStats& dst, const IndexWriter::AuxStats& src,
+void copyAuxStats(api::AuxStats& dst, const ReaderManager::AuxStats& src,
                   std::pmr::memory_resource& resource) {
   dst.kind = api::build::arenaStr(resource, src.kind);
   dst.field = api::build::arenaStr(resource, src.field);
@@ -49,7 +49,7 @@ void copyAuxStats(api::AuxStats& dst, const IndexWriter::AuxStats& src,
   }
 }
 
-void fillQueryCacheStats(api::QueryCacheStats& dst, const IndexWriter::Stats& src) {
+void fillQueryCacheStats(api::QueryCacheStats& dst, const ReaderManager::CacheStats& src) {
   dst.enabled = src.filterCacheEnabled;
   dst.max_bytes = src.filterCacheMaxBytes;
   dst.resident_bytes = src.filterCacheResidentBytes;
@@ -68,14 +68,15 @@ void fillQueryCacheStats(api::QueryCacheStats& dst, const IndexWriter::Stats& sr
   dst.reader_stable_retires = src.filterCacheCounters.readerStableRetires;
 }
 
-void fillIndexStats(api::IndexStats& dst, const IndexWriter::Stats& src,
+template<class Stats>
+void fillIndexStats(api::IndexStats& dst, const Stats& src,
                     std::pmr::memory_resource& resource) {
   dst.commit_time = src.commitTime;
   dst.index_gen = src.indexGen;
   dst.core_gen = src.coreGen;
   dst.update_version = src.updateVersion;
   dst.schema_gen = src.schemaGen;
-  dst.active_merges = src.activeMerges;
+  if constexpr (requires { src.activeMerges; }) dst.active_merges = src.activeMerges;
 
   auto* aux = api::build::allocArray(dst.aux_indexes, src.auxIndexes.size(), resource);
   for (std::size_t i = 0; i < src.auxIndexes.size(); i++) {
@@ -97,8 +98,10 @@ void fillIndexStats(api::IndexStats& dst, const IndexWriter::Stats& src,
     out.deleted_docs = in.maxDoc - in.liveDocs;
     out.schema_gen = in.schemaGen;
     out.committed = in.committed;
-    out.merging = in.merging;
-    out.merge_level = (uint32_t)in.mergeLevel;
+    if constexpr (requires { in.merging; }) {
+      out.merging = in.merging;
+      out.merge_level = (uint32_t)in.mergeLevel;
+    }
     out.bytes = in.bytes;
 
     auto* overlays = api::build::allocArray(out.overlays, in.overlays.size(), resource);
@@ -137,26 +140,31 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     auto shard = entry.collection->getShard();
     assert(shard);
     auto writer = shard->getIndexWriter();
-    assert(writer);
-    auto writerStats = writer->stats(request.segments);
-
     auto* shards = api::build::allocArray(collectionStats.shards, 1, resource);
     auto& shardStats = shards[0];
     shardStats.shard_id = 0;
-    fillIndexStats(shardStats.index, writerStats, resource);
+    auto reservations = shard->getSnapshots().stats();
+    shardStats.index.snapshot_pins = reservations.pins;
+    shardStats.index.pin_retained_bytes = reservations.retainedBytes;
+    shardStats.index.pin_idle_drops = reservations.idleDrops;
+    shardStats.index.pin_budget_drops = reservations.budgetDrops;
+    auto fill = [&](const auto& stats) {
+      fillIndexStats(shardStats.index, stats, resource);
+      // Counts for this index alone.  "collections" is meaningless below the node
+      // total and "shards" below the collection total, so neither is set here.
+      auto& indexTotals = shardStats.index.totals;
+      indexTotals.segments = stats.segments;
+      indexTotals.committed_segments = stats.committedSegments;
+      indexTotals.max_docs = stats.maxDocs;
+      indexTotals.live_docs = stats.liveDocs;
+      assert(stats.liveDocs <= stats.maxDocs);
+      indexTotals.deleted_docs = stats.maxDocs - stats.liveDocs;
+      indexTotals.bytes = stats.totalBytes;
+    };
+    if (writer) fill(writer->stats(request.segments));
+    else fill(shard->getReaderManager().stats(request.segments));
 
-    // Counts for this index alone.  "collections" is meaningless below the node
-    // total and "shards" below the collection total, so neither is set here.
-    auto& indexTotals = shardStats.index.totals;
-    indexTotals.segments = writerStats.segments;
-    indexTotals.committed_segments = writerStats.committedSegments;
-    indexTotals.max_docs = writerStats.maxDocs;
-    indexTotals.live_docs = writerStats.liveDocs;
-    assert(writerStats.liveDocs <= writerStats.maxDocs);
-    indexTotals.deleted_docs = writerStats.maxDocs - writerStats.liveDocs;
-    indexTotals.bytes = writerStats.totalBytes;
-
-    collectionStats.totals = indexTotals;
+    collectionStats.totals = shardStats.index.totals;
     collectionStats.totals.shards = 1;
     addTotals(response.totals, collectionStats.totals);
     response.totals.collections++;
@@ -193,9 +201,7 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
 
     auto shard = entry.collection->getShard();
     assert(shard);
-    auto writer = shard->getIndexWriter();
-    assert(writer);
-    auto cache = writer->filterCache;
+    auto cache = shard->getReaderManager().filterCache;
 
     auto* shards = api::build::allocArray(collectionControl.shards, 1, resource);
     auto& shardControl = shards[0];

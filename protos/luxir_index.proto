@@ -20,6 +20,7 @@ message IndexInfo {
   uint64 schema_gen = 6;             // Schema generation (incremented on each schema change)
   SchemaInfo schema = 7;             // Query schema and field history for this snapshot
   string incarnation = 8;            // Collection UUID, changes on recreate
+  uint64 last_seg_id = 9;             // Allocation high-water mark, including retired segments
   repeated SegmentInfo segments = 15; // List of segments in this index
 
   // Auxiliary indexes built at index scope. Segment-local overlays live on
@@ -65,4 +66,5 @@ message SegmentInfo {
   // with kind "vector_faiss"; validity is segment liveness, not core_gen.
   repeated AuxIndexInfo overlays = 9;
   repeated FileDescriptor files = 10; // Segment data and current liveDocs
+  uint64 next_overlay_gen = 11; // Persistent high-water mark, including dropped overlays
 }

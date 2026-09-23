@@ -313,7 +313,7 @@ TEST_F(TermsEnumSeekFuzzTest, RandomCollectionTermsMatchVectorReference) {
   IndexResult result = helper.indexAll(docs, UpdateMessage::COMMIT);
   ASSERT_TRUE(result.success) << result.error_message;
 
-  auto reader = helper.getIndexWriter()->getIndexReader(0);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader(0);
   ASSERT_EQ(reader->segments().size(), 1u);
   Segment& seg = reader->segments()[0];
 

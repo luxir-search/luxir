@@ -233,7 +233,7 @@ TEST_F(AggregateExprTest, exactSumsMissingDefAndPerDocReducers) {
   helper.index(flatdoc("id_s", "d", "den_i", 10),
                UpdateMessage::COMMIT);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
@@ -316,7 +316,7 @@ TEST_F(AggregateExprTest, outputOverflowBecomesContainedFailure) {
                        std::numeric_limits<int64_t>::max()),
                UpdateMessage::COMMIT);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
   AggregateProgram* program = parseAggregate(memory, *schema, "sum(x_i)", "wide");

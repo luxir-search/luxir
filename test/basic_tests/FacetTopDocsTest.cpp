@@ -103,7 +103,7 @@ TEST_F(FacetTopDocsTest, bucketPreparedTopDocsRetainsSegmentDomains) {
     flatdoc("id", "e"),
     flatdoc("id", "f", "cat_s", "x"),
   }, UpdateMessage::COMMIT);
-  ASSERT_EQ(2u, helper.getIndexWriter()->getIndexReader()->segments().size());
+  ASSERT_EQ(2u, helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
 
   auto req = localReq(luxirNode->getSearchEngine());
   req->testForcePrepare = true;
@@ -443,7 +443,7 @@ TEST_F(FacetTopDocsTest, cachedMembershipComposesPerBucket) {
   // every later bucket hits it within the same request.
   auto cache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0, .admissionThreshold = 1});
-  helper.getIndexWriter()->filterCache = cache;
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
   // Bucket sizes and kept counts vary so a stale composition served to a
   // neighbouring bucket cannot pass on equal cardinality.
   constexpr int BUCKETS = 40;

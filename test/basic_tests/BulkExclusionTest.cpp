@@ -548,7 +548,7 @@ TEST_F(BulkExclusionTest, candidateConjunctionProbesCachedExclusion) {
 
 TEST_F(BulkExclusionTest, sparseExclusionBypassesBeforeSighting) {
   addSegment(helper, "s_", 10000, true, true);
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto* cache = reader->filterCache();
   ASSERT_NE(nullptr, cache);
   size_t entriesBefore = cache->entryCountForTest();
@@ -585,7 +585,7 @@ TEST_F(BulkExclusionTest, multipleNestedEmptyAndMatchAllExclusions) {
   EXPECT_GT(nestedHit.counters.cachePullHits, 0);
   EXPECT_EQ(multipleHit.ids, nestedHit.ids);
 
-  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   auto* cache = reader->filterCache();
   ASSERT_NE(nullptr, cache);
   size_t entriesBeforeConstants = cache->entryCountForTest();

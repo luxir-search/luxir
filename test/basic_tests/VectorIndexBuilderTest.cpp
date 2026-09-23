@@ -663,7 +663,9 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
   EXPECT_EQ(first.gen, 0u);
   EXPECT_TRUE(firstFile.ends_with("_00_00")) << firstFile;
 
+  auto pin = h.getIndexWriter()->snapshots.acquire();
   ASSERT_TRUE(h.getIndexWriter()->testDropSegmentOverlay("vec.embedding_v", 0));
+  h.commit(); // publish the drop separately; the old name remains reserved
   resetVectorBuildCounters();
   h.commit({"vec.embedding_v"});
   EXPECT_EQ(vectorCommitBuildCount(), 1);
@@ -674,6 +676,12 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
   EXPECT_EQ(rebuilt.gen, 1u);
   EXPECT_NE(rebuilt.files[0].name, firstFile);
   EXPECT_TRUE(std::string(rebuilt.files[0].name).ends_with("_01_00")) << rebuilt.files[0].name;
+  auto bytes = h.getIndexWriter()->snapshots.openFile(pin->id, firstFile)->read();
+  auto desc = std::ranges::find(pin->files, firstFile, &FileDescriptor::name);
+  ASSERT_NE(desc, pin->files.end());
+  EXPECT_EQ(desc->xxh3, XXH3_64bits(bytes.data(), bytes.size()));
+  EXPECT_EQ(desc->size, h.getIndexWriter()->snapshots.stats().retainedBytes);
+  h.getIndexWriter()->snapshots.evictOldest();
   EXPECT_EQ(h.getIndexWriter()->dir.openFile(firstFile), nullptr);
 
   auto ids = runKnnIds(h.getSearchEngine(), "embedding_v",
@@ -1399,4 +1407,36 @@ TEST_F(VectorIndexBuilderTest, metricNoneIsIneligible) {
   auto info = readIndexInfo(h.getIndexWriter()->dir);
   EXPECT_EQ(0, info->aux_indexes.size());
   EXPECT_EQ(vectorOverlays(info).size(), 0u);
+}
+
+TEST_F(VectorIndexBuilderTest, overlayGenerationSurvivesPublishedDropAndRestart) {
+  IvfPqGuard guard(2, 1, 1, 2, 2);
+  auto path = std::filesystem::temp_directory_path() / "luxir-overlay-restart";
+  std::filesystem::remove_all(path);
+  auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
+  LuxirConfig config;
+  config.store.backend = "fs";
+  config.store.data_dir = path.string();
+  std::string oldName;
+  {
+    LuxirNode node(config);
+    CollectionHelper h(node, "main");
+    enableL2OnVecSuffix(h.collection());
+    for (int i = 0; i < 80; i++) {
+      ASSERT_TRUE(h.index(flatdoc("id", std::to_string(i), "embedding_v",
+                                 std::vector<float>{(float)i, 0.0f, 1.0f, 0.0f})).success);
+    }
+    h.commit({"*"});
+    auto info = readIndexInfo(h.getIndexWriter()->dir);
+    oldName = onlyVectorOverlay(info).files.front().name;
+    ASSERT_TRUE(h.getIndexWriter()->testDropSegmentOverlay("vec.embedding_v", 0));
+    h.commit();
+    EXPECT_EQ(1u, readIndexInfo(h.getIndexWriter()->dir)->segments.front().next_overlay_gen);
+  }
+  LuxirNode reopened(config);
+  CollectionHelper h(reopened, "main");
+  h.commit({"vec.embedding_v"});
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
+  EXPECT_EQ(1u, onlyVectorOverlay(info).gen);
+  EXPECT_NE(oldName, onlyVectorOverlay(info).files.front().name);
 }
