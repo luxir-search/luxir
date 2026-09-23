@@ -377,10 +377,29 @@ void LuxirNode::observeCollection(const std::string& name, Collection& collectio
 }
 
 void LuxirNode::createSingletons() {
+  root = std::make_shared<Library>();
   if (config.store.backend == "fs") {
     dirFactory = std::make_unique<FSDirFactory>(config.store.data_dir, config.read_only);
   } else {
-    dirFactory = std::make_unique<RAMDirFactory>();
+    if (config.store.ram_limit_mb > UINT64_MAX / (1024 * 1024)) throw std::invalid_argument("store.ram_limit_mb is too large");
+    dirFactory = std::make_unique<RAMDirFactory>(config.store.ram_limit_mb * 1024 * 1024, [weak = std::weak_ptr(root)] {
+      auto library = weak.lock();
+      if (!library) return false;
+      std::vector<std::shared_ptr<Collection>> collections;
+      using Pointer = SharedLazyMap<std::string, Collection>::Pointer;
+      library->collections.dataMap.cvisit_all([&](const auto& entry) {
+        if (auto col = std::get_if<Pointer>(&entry.second)) collections.push_back(*col);
+      });
+      std::shared_ptr<Collection> oldest;
+      auto time = CommitSnapshotRegistry::Clock::time_point::max();
+      for (const auto& col : collections) if (auto shard = col->getShard()) {
+        auto created = shard->getSnapshots().oldestReclaimableReservation();
+        if (created && *created < time) { time = *created; oldest = col; }
+      }
+      if (!oldest) return false;
+      oldest->getShard()->getSnapshots().reclaimOldestReservation();
+      return true; // A concurrent drop also warrants retrying the allocation.
+    });
   }
 
   if (config.store.checked_dir.sync != "off") {
@@ -392,8 +411,6 @@ void LuxirNode::createSingletons() {
   if (config.read_only) {
     dirFactory = std::make_unique<ReadOnlyDirFactory>(std::move(dirFactory));
   }
-
-  root = std::make_shared<Library>();
 
   if (following()) {
     if (config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");

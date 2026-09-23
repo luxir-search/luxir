@@ -1068,6 +1068,7 @@ message StatsResponse {
   StatsTotals totals = 1;
   repeated CollectionStats collections = 2;
   IndexRamStats indexing_ram = 3;
+  StorageRamStats storage_ram = 6;
 }
 
 message ReplicationCollectionStatus {
@@ -1111,6 +1112,11 @@ message StatsTotals {
   uint64 bytes = 8;  // on-disk bytes; the index level reports the whole directory including metadata and in-flight files
 }
 
+message StorageRamStats {
+  uint64 used_bytes = 1; // Allocated RAM file buffers, including output and retained readers.
+  uint64 limit_bytes = 2; // Zero is unlimited. Independent of indexing_ram.
+}
+
 message CollectionStats {
   string name = 1;
   StatsTotals totals = 2;
@@ -1120,6 +1126,7 @@ message CollectionStats {
   // Set for a collection that is not serving (failed to load, or a delete failed
   // partway); kind is UNAVAILABLE and the message is the recorded reason.
   Error error = 5;
+  uint64 storage_ram_bytes = 6;
 }
 
 message ShardStats {

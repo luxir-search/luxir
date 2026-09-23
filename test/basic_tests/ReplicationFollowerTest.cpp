@@ -875,11 +875,94 @@ TEST_F(ReplicationFollowerTest, followerFloorSurvivesRemovalAndIncarnationSwitch
   EXPECT_EQ(409, removed.get().result_int());
 }
 
+TEST_P(ReplicationMatrixTest, snapshotsBarriersAndRestarts) {
+  exerciseSnapshots();
+  if (HasFatalFailure()) return;
+  auto commitAndRead = [&](std::string id, int wanted = 1) {
+    auto response = httpRequest(sourcePort, http::verb::post, "/collections/main/_update",
+        "{\"docs\":[{\"id\":\"" + id + "\"}],\"commit\":{\"wait_for_replicas\":\"all\"}}");
+    glz::generic result;
+    ASSERT_FALSE(glz::read_json(result, response.body())) << response.body();
+    EXPECT_EQ(wanted, result["replicas"]["wanted"].get<double>());
+    EXPECT_EQ(wanted, result["replicas"]["serving"].get<double>());
+    EXPECT_FALSE(result["replicas"]["timed_out"].get<bool>());
+    auto search = httpRequest(followerServer->getPort(), http::verb::get,
+        "/collections/main/_search?query=id:" + id + "&get_number=true&min_commit=" + result["commit"].get<std::string>());
+    EXPECT_EQ(200, search.result_int());
+    EXPECT_NE(std::string::npos, search.body().find("\"found\":1"));
+  };
+  commitAndRead("barrier");
+  stopFollower(); startFollower();
+  ASSERT_TRUE(caughtUp());
+  api::ReplicationStatus restarted; std::pmr::monotonic_buffer_resource arena;
+  follower->getFollower()->stats(restarted, arena);
+  EXPECT_EQ(followerConfig.store.backend == "ram", restarted.collections[0].bytes_downloaded > 0);
+  auto old = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
+  stopSource();
+  ASSERT_TRUE(until([&] { return stateIs("stale"); }));
+  EXPECT_EQ(old, follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id);
+  startSource();
+  if (sourceConfig.store.backend == "ram") {
+    ASSERT_TRUE(until([&] { return stateIs("waiting"); }));
+    EXPECT_EQ(old, follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id);
+  } else {
+    ASSERT_TRUE(caughtUp());
+  }
+  ASSERT_TRUE(until([&] { return source->getReplication().stats(*source).size() == 1; }));
+  commitAndRead("restarted", sourceConfig.store.backend == "ram" ? 0 : 1);
+  EXPECT_EQ(sourceConfig.store.backend == "ram", source->storageBytes() > 0);
+  EXPECT_EQ(followerConfig.store.backend == "ram", follower->storageBytes() > 0);
+}
 
+TEST_F(ReplicationFollowerTest, fullDiskLeavesOldReaderServingAndRetries) {
+  startSource(); startFollower();
+  CollectionHelper h(*source, "main");
+  ASSERT_TRUE(h.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(caughtUp());
+  std::atomic<bool> full{true};
+  Signal::listen("replicationDownloadWrite", [&](void*, void*, void*) -> void* {
+    if (full.load()) throw std::system_error(std::make_error_code(std::errc::no_space_on_device));
+    return nullptr;
+  });
+  auto join = scope_guard([&] { stopFollower(); });
+  ASSERT_TRUE(h.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(until([&] { return stateIs("error"); }));
+  EXPECT_NE(std::string::npos, status().find("No space left on device"));
+  EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+  full = false;
+  ASSERT_TRUE(caughtUp());
+}
 
-
-
-
+TEST_F(ReplicationFollowerTest, ramLimitKeepsOldSnapshotAndChargesReadersUntilRelease) {
+  followerConfig.store.backend = "ram"; followerConfig.store.ram_limit_mb = 1;
+  startSource(); startFollower();
+  CollectionHelper h(*source, "main");
+  SchemaBuilder builder; auto& field = builder.field("payload");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.index = api::FieldDef::IndexMode::NONE; field.column = false; field.stored = true;
+  h.collection().setSchema(builder.build(h.collection().getSchema().get()));
+  ASSERT_TRUE(h.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(caughtUp());
+  auto old = follower->getCollection("main")->getReaderManager().getReader();
+  std::string payload(2 * 1024 * 1024, 'a'); uint32_t random = 1;
+  for (auto& c : payload) { random = random * 1664525 + 1013904223; c = (char)(' ' + (random >> 24) % 95); }
+  ASSERT_TRUE(h.index(flatdoc("id", "new", "payload", payload), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(until([&] { return stateIs("error"); }));
+  EXPECT_NE(std::string::npos, status().find("RAM storage memory limit exceeded"));
+  EXPECT_LE(follower->storageBytes(), 1024 * 1024);
+  EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+  auto memory = follower->storageBytes("main");
+  EXPECT_GT(memory, 0);
+  auto stats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats");
+  glz::generic json; ASSERT_FALSE(glz::read_json(json, stats.body()));
+  EXPECT_EQ(1024 * 1024, json["storage_ram"]["limit_bytes"].get<double>());
+  EXPECT_EQ(memory, json["collections"][0]["storage_ram_bytes"].get<double>());
+  source->deleteCollection("main");
+  ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));
+  EXPECT_GT(follower->storageBytes("main"), 0); // Only the old reader now owns the data.
+  old.reset();
+  ASSERT_TRUE(until([&] { return follower->storageBytes("main") == 0; }));
+}
 
 
 

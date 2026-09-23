@@ -117,6 +117,8 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
 
 void gatherStats(LuxirNode& node, const api::StatsRequest& request,
                  api::StatsResponse& response, std::pmr::memory_resource& resource) {
+  response.storage_ram.used_bytes = node.storageBytes();
+  response.storage_ram.limit_bytes = node.getConfig().store.backend == "ram" ? node.getConfig().store.ram_limit_mb * 1024 * 1024 : 0;
   std::vector<LuxirNode::CollectionEntry> entries;
   if (!request.collection.empty()) {
     auto collection = node.resolveCollection(request.collection);
@@ -130,6 +132,7 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     const auto& entry = entries[i];
     auto& collectionStats = collections[i];
     collectionStats.name = api::build::arenaStr(resource, entry.name);
+    collectionStats.storage_ram_bytes = node.storageBytes(entry.name);
     if (!entry.error.empty()) {
       collectionStats.error = api::build::arenaError(
           resource, {ErrorKind::UNAVAILABLE, "collection_unavailable", entry.error});

@@ -113,6 +113,11 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::acquire(std::stop_
 }
 
 std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, std::string_view name, std::stop_token* cancellation) {
+  struct ReservedFile {
+    std::shared_ptr<InputFile> file;
+    std::shared_ptr<Reservation::OpenFiles> lease;
+  };
+  auto owner = std::make_shared<ReservedFile>();
   // Validate against revocation before opening; eviction may then revoke the
   // reservation, but cannot unlink until this in-flight open owns its file.
   std::lock_guard retirementLock(retirementMutex);
@@ -127,10 +132,12 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, 
       throw ApiError(ErrorKind::NOT_FOUND, "file_not_in_snapshot", "file is not in the reserved snapshot");
     }
     if (cancellation) *cancellation = it->second.cancellation.get_token();
+    owner->lease = it->second.openFiles;
   }
   auto file = dir.openFile(name, true);
   if (!file) throw std::runtime_error("reserved snapshot file is missing");
-  return file;
+  owner->file = file;
+  return std::shared_ptr<InputFile>(std::move(owner), file.get());
 }
 
 bool CommitSnapshotRegistry::touch(const CommitId& id, uint64_t bytes) {
@@ -167,6 +174,45 @@ void CommitSnapshotRegistry::enforceBudgetLocked(std::vector<std::string>& retir
     releaseLocked(oldest->first, retired);
     counters.budgetDrops++;
   }
+}
+
+auto CommitSnapshotRegistry::oldestReclaimableLocked() -> decltype(reservations)::iterator {
+  auto oldest = reservations.end();
+  if (closed || counters.retainedBytes == 0) return oldest;
+  auto published = current.load();
+  for (auto it = reservations.begin(); it != reservations.end(); ++it) {
+    const auto& reservation = it->second;
+    if ((published && it->first == published->id) || reservation.openFiles.use_count() != 1) continue;
+    if (oldest != reservations.end() && reservation.created >= oldest->second.created) continue;
+    for (const auto& file : reservation.snapshot->files) {
+      auto ref = files.find(file.name);
+      if (ref != files.end() && ref->second.retired && ref->second.size) {
+        oldest = it;
+        break;
+      }
+    }
+  }
+  return oldest;
+}
+
+std::optional<CommitSnapshotRegistry::Clock::time_point> CommitSnapshotRegistry::oldestReclaimableReservation() {
+  std::lock_guard lock(mutex);
+  auto oldest = oldestReclaimableLocked();
+  if (oldest == reservations.end()) return {};
+  return oldest->second.created;
+}
+
+bool CommitSnapshotRegistry::reclaimOldestReservation() {
+  std::vector<std::string> retired;
+  {
+    std::lock_guard lock(mutex);
+    auto oldest = oldestReclaimableLocked();
+    if (oldest == reservations.end()) return false;
+    releaseLocked(oldest->first, retired);
+    counters.budgetDrops++;
+  }
+  unlink(retired);
+  return true;
 }
 
 bool CommitSnapshotRegistry::evictOldest() {

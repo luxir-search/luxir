@@ -270,6 +270,7 @@ struct QueryCacheStats {
   uint64_t reader_stable_retires = 0;
   bool enabled = false;
 };
+struct StorageRamStats { uint64_t used_bytes = 0; uint64_t limit_bytes = 0; };
 struct IndexRamStats { uint64_t limit_bytes = 0; uint64_t reserved_bytes = 0; };
 struct StatsTotals {
   uint64_t collections = 0;
@@ -318,6 +319,7 @@ struct ShardStats {
   uint32_t shard_id = 0;
 };
 struct CollectionStats {
+  uint64_t storage_ram_bytes = 0;
   std::string_view name;
   StatsTotals totals;
   uint64_t schema_gen = 0;
@@ -351,6 +353,7 @@ struct ReplicationStatus {
   std::span<const ReplicationCollectionStatus> collections;
 };
 struct StatsResponse {
+  StorageRamStats storage_ram;
   StatsTotals totals;
   std::span<const CollectionStats> collections;
   IndexRamStats indexing_ram;
@@ -695,7 +698,7 @@ LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStats) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
-LUXIR_TD(QueryCacheStats) LUXIR_TD(IndexRamStats)
+LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
 #undef LUXIR_TD
@@ -737,7 +740,7 @@ LUXIR_ENTRY(ListCollectionsResponse)
 LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStats) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
-LUXIR_ENTRY(IndexRamStats)
+LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
 #undef LUXIR_ENTRY

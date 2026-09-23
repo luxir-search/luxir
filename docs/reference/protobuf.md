@@ -148,6 +148,7 @@ defaults and constraints are described in the comments and guides.
 - [`StatsRequest`](#message-luxir.statsrequest)
 - [`StatsResponse`](#message-luxir.statsresponse)
 - [`StatsTotals`](#message-luxir.statstotals)
+- [`StorageRamStats`](#message-luxir.storageramstats)
 - [`TopDocs`](#message-luxir.topdocs)
 - [`UpdateRequest`](#message-luxir.updaterequest)
 - [`UpdateResponse`](#message-luxir.updateresponse)
@@ -500,6 +501,7 @@ Single-valued vector column. Each Vector slot is independently nullable via its 
 | <a id="field-luxir.collectionstats.schema_gen"></a>[`schema_gen`](#field-luxir.collectionstats.schema_gen) | 3 | `uint64` | singular | Schema generation |
 | <a id="field-luxir.collectionstats.shards"></a>[`shards`](#field-luxir.collectionstats.shards) | 4 | [`ShardStats`](#message-luxir.shardstats) | repeated |  |
 | <a id="field-luxir.collectionstats.error"></a>[`error`](#field-luxir.collectionstats.error) | 5 | [`Error`](#message-luxir.error) | singular | Set for a collection that is not serving (failed to load, or a delete failed partway); kind is UNAVAILABLE and the message is the recorded reason. |
+| <a id="field-luxir.collectionstats.storage_ram_bytes"></a>[`storage_ram_bytes`](#field-luxir.collectionstats.storage_ram_bytes) | 6 | `uint64` | singular |  |
 
 <a id="message-luxir.column"></a>
 
@@ -1228,6 +1230,7 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 | <a id="field-luxir.replicationcollectionstatus.bytes_total"></a>[`bytes_total`](#field-luxir.replicationcollectionstatus.bytes_total) | 6 | `uint64` | singular |  |
 | <a id="field-luxir.replicationcollectionstatus.last_error"></a>[`last_error`](#field-luxir.replicationcollectionstatus.last_error) | 7 | `string` | singular |  |
 | <a id="field-luxir.replicationcollectionstatus.next_retry"></a>[`next_retry`](#field-luxir.replicationcollectionstatus.next_retry) | 8 | `uint64` | singular | Unix milliseconds; zero when not backing off |
+| <a id="field-luxir.replicationcollectionstatus.storage_ram_bytes"></a>[`storage_ram_bytes`](#field-luxir.replicationcollectionstatus.storage_ram_bytes) | 9 | `uint64` | singular | Includes candidate downloads and old readers. |
 
 <a id="message-luxir.replicationstatus"></a>
 
@@ -1463,6 +1466,7 @@ Operational statistics. An empty collection requests every collection on the nod
 | <a id="field-luxir.statsresponse.indexing_ram"></a>[`indexing_ram`](#field-luxir.statsresponse.indexing_ram) | 3 | [`IndexRamStats`](#message-luxir.indexramstats) | singular |  |
 | <a id="field-luxir.statsresponse.followers"></a>[`followers`](#field-luxir.statsresponse.followers) | 4 | [`FollowerStats`](#message-luxir.followerstats) | repeated |  |
 | <a id="field-luxir.statsresponse.replication"></a>[`replication`](#field-luxir.statsresponse.replication) | 5 | [`ReplicationStatus`](#message-luxir.replicationstatus) | singular |  |
+| <a id="field-luxir.statsresponse.storage_ram"></a>[`storage_ram`](#field-luxir.statsresponse.storage_ram) | 6 | [`StorageRamStats`](#message-luxir.storageramstats) | singular |  |
 
 <a id="message-luxir.statstotals"></a>
 
@@ -1482,6 +1486,17 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 | <a id="field-luxir.statstotals.live_docs"></a>[`live_docs`](#field-luxir.statstotals.live_docs) | 6 | `uint64` | singular |  |
 | <a id="field-luxir.statstotals.deleted_docs"></a>[`deleted_docs`](#field-luxir.statstotals.deleted_docs) | 7 | `uint64` | singular |  |
 | <a id="field-luxir.statstotals.bytes"></a>[`bytes`](#field-luxir.statstotals.bytes) | 8 | `uint64` | singular | on-disk bytes; the index level reports the whole directory including metadata and in-flight files |
+
+<a id="message-luxir.storageramstats"></a>
+
+### luxir.StorageRamStats
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.storageramstats.used_bytes"></a>[`used_bytes`](#field-luxir.storageramstats.used_bytes) | 1 | `uint64` | singular | Allocated RAM file buffers, including output and retained readers. |
+| <a id="field-luxir.storageramstats.limit_bytes"></a>[`limit_bytes`](#field-luxir.storageramstats.limit_bytes) | 2 | `uint64` | singular | Zero is unlimited. Independent of indexing\_ram. |
 
 <a id="message-luxir.topdocs"></a>
 

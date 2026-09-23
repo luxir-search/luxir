@@ -120,7 +120,8 @@ struct Manifest {
   }
 
   static void write(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes) {
-    auto file = dir.createFile(name(gen));
+    Directory::FileCreateOptions options; options.expectedSize = bytes.size() + 16;
+    auto file = dir.createFile(name(gen), options);
     OutputStream out(file.get());
     out.write(bytes.data(), bytes.size());
     out.writeLong(bytes.size());

@@ -52,6 +52,7 @@ struct CheckedDirConfig {
 struct StoreConfig {
   std::string backend = "ram";           // ram, fs
   std::string data_dir = "luxir_data";
+  uint64_t ram_limit_mb = 0; // RAM storage only; zero is unlimited.
   CheckedDirConfig checked_dir;
 };
 

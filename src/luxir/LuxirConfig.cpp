@@ -115,6 +115,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
       ->default_val(store.backend)
       ->check(CLI::IsMember({"ram", "fs"}));
+  app.add_option("--store.ram-limit-mb", store.ram_limit_mb, "RAM storage allocation limit in MiB (0 = unlimited)")->check(CLI::Range((uint64_t)0, UINT64_MAX / (1024 * 1024)));
   app.add_option("--store.data-dir", store.data_dir, "Base path for filesystem storage")
       ->default_val(store.data_dir);
   app.add_option("--store.checked-dir.sync", store.checked_dir.sync, "Check fsync correctness: off, warn, throw")

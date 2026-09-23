@@ -206,6 +206,8 @@ public:
   // and represent metadata in the hierarchy.  This choice needs to be informed by the external representation
   // of collections.
 
+  uint64_t storageBytes(std::string_view collection = {}) const { return dirFactory->storageBytes(collection); }
+
   std::shared_ptr<Collection> getCollection(std::string_view name);
   std::shared_ptr<Collection> getOrCreateCollection(std::string_view name);
 

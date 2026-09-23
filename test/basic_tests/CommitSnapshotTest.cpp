@@ -344,3 +344,55 @@ TEST_F(CommitSnapshotTest, observerFailureDoesNotFailDurablePublication) {
   EXPECT_GT(writer->snapshots.snapshot()->id.index_gen, before.index_gen);
   EXPECT_FALSE(writer->isClosed());
 }
+
+TEST_F(CommitSnapshotTest, storagePressureDropsOldestReservation) {
+  LuxirConfig config; config.store.ram_limit_mb = 2;
+  LuxirNode node(config);
+  CollectionHelper first(node, "main"), second(node, "other");
+  for (auto* h : {&first, &second}) {
+    ASSERT_TRUE(h->index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+    h->collection().getShard()->getSnapshots().acquire();
+    ASSERT_TRUE(h->index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
+    h->collection().getReaderManager().getReader();
+  }
+  auto& snapshots = first.collection().getShard()->getSnapshots();
+  ASSERT_GT(snapshots.stats().retainedBytes, 0);
+  auto current = snapshots.acquire();
+  Directory::FileCreateOptions options; options.expectedSize = 2 * 1024 * 1024 - node.storageBytes() + 1;
+  auto file = snapshots.dir.createFile("download", options);
+  EXPECT_EQ(1, snapshots.stats().pins);
+  EXPECT_NO_THROW(snapshots.openFile(current->id, current->files.front().name));
+  EXPECT_EQ(1, snapshots.stats().budgetDrops);
+  EXPECT_EQ(1, second.collection().getShard()->getSnapshots().stats().pins);
+  EXPECT_LE(node.storageBytes(), 2 * 1024 * 1024);
+}
+
+TEST_F(CommitSnapshotTest, storagePressureSkipsOpenTransfersAndCurrent) {
+  LuxirConfig config; config.store.ram_limit_mb = 2;
+  LuxirNode node(config);
+  CollectionHelper first(node, "main"), second(node, "other");
+  std::shared_ptr<InputFile> transfer;
+  for (auto* h : {&first, &second}) {
+    auto& snapshots = h->collection().getShard()->getSnapshots();
+    ASSERT_TRUE(h->index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+    auto old = snapshots.acquire();
+    if (h == &first) transfer = snapshots.openFile(old->id, old->files.front().name);
+    ASSERT_TRUE(h->index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
+    h->collection().getReaderManager().getReader();
+  }
+  auto& snapshots = first.collection().getShard()->getSnapshots();
+  snapshots.acquire(); // The current reservation must also survive allocation failure.
+  auto allocate = [&] {
+    Directory::FileCreateOptions options; options.expectedSize = 2 * 1024 * 1024 - node.storageBytes() + 1;
+    return snapshots.dir.createFile("download", options);
+  };
+  auto file = allocate();
+  EXPECT_EQ(2, snapshots.stats().pins);
+  EXPECT_EQ(0, second.collection().getShard()->getSnapshots().stats().pins);
+  file.reset();
+  EXPECT_THROW(allocate(), ApiError);
+  EXPECT_EQ(2, snapshots.stats().pins);
+  transfer.reset();
+  EXPECT_NO_THROW(file = allocate());
+  EXPECT_EQ(1, snapshots.stats().pins);
+}

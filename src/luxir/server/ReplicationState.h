@@ -29,7 +29,8 @@ struct ReplicationState {
   }
   void write(Directory& dir) const {
     auto bytes = glz::write_json(*this).value();
-    auto file = dir.createFile("replication.json.pending");
+    Directory::FileCreateOptions options; options.expectedSize = bytes.size();
+    auto file = dir.createFile("replication.json.pending", options);
     OutputStream out(file.get());
     out.write(bytes.data(), bytes.size()); out.close();
     dir.finishFile(*file);

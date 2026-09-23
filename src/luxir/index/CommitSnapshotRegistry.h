@@ -42,6 +42,9 @@ private:
     Clock::time_point created;
     Clock::time_point lastRead;
     std::stop_source cancellation;
+    // File handles share this lease, even after registry/collection teardown.
+    struct OpenFiles {};
+    std::shared_ptr<OpenFiles> openFiles = std::make_shared<OpenFiles>();
   };
   struct FileRef {
     uint64_t size;
@@ -66,6 +69,7 @@ private:
   void releaseLocked(const CommitId& id, std::vector<std::string>& retired);
   void expireLocked(std::vector<std::string>& retired);
   void enforceBudgetLocked(std::vector<std::string>& retired);
+  decltype(reservations)::iterator oldestReclaimableLocked();
   void unlink(std::span<const std::string> names) noexcept;
   void unlinkFiles(std::span<const std::string> names) noexcept;
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
@@ -89,6 +93,10 @@ public:
   std::shared_ptr<const CommitSnapshot> acquire(std::stop_token* cancellation = nullptr);
   std::shared_ptr<InputFile> openFile(const CommitId& id, std::string_view name, std::stop_token* cancellation = nullptr);
   bool touch(const CommitId& id, uint64_t bytes);
+  // Storage pressure skips current snapshots and open transfers. Retention
+  // budget eviction can still revoke any reservation to enforce its bound.
+  std::optional<Clock::time_point> oldestReclaimableReservation();
+  bool reclaimOldestReservation();
   bool evictOldest();
   void setPolicy(Policy value);
   Stats stats();

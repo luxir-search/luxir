@@ -431,7 +431,8 @@ struct ReplicationFollower::Impl {
   void download(Client& client, const std::string& collection, Directory& dir, const CommitSnapshot& snapshot,
                 const FileDescriptor& descriptor) {
     Signal::emit("replicationDownloadStart", (void*)&descriptor);
-    auto file = dir.createFile(descriptor.name);
+    Directory::FileCreateOptions options; options.expectedSize = descriptor.size;
+    auto file = dir.createFile(descriptor.name, options);
     OutputStream out(file.get());
     uint64_t offset = 0;
     int failures = 0;

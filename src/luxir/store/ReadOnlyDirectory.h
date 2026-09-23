@@ -101,6 +101,8 @@ public:
                                                std::string(collectionName));
   }
 
+  uint64_t storageBytes(std::string_view collection = {}) override { return delegate_->storageBytes(collection); }
+
   std::vector<std::string> listDirectories(std::string_view parent = {}) override {
     return delegate_->listDirectories(parent);
   }

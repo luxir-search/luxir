@@ -30,7 +30,9 @@ public:
     std::string segStr = Postings::getSortableString(segId);
     std::string deleteFileName = Postings::getLiveDocsFileName(segStr, liveGen);
 
-    auto deleteFile = dir.createFile(deleteFileName);
+    Directory::FileCreateOptions options;
+    options.expectedSize = 24 + screaming::FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t);
+    auto deleteFile = dir.createFile(deleteFileName, options);
     if (!deleteFile) {
       return false;
     }

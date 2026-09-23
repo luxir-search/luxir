@@ -6,6 +6,7 @@
 #include <iostream>
 
 #include "luxir/store/Directory.h"
+#include "luxir/store/DirectoryFactory.h"
 #include "test/LuxirTest.h"
 
 using namespace luxir;
@@ -129,4 +130,67 @@ TEST_F(OutputStreamTest, appendFileContinuesWriting) {
   auto input = dir.openFile("target");
   ASSERT_NE(nullptr, input);
   EXPECT_EQ(std::string("before") + middle + "after", input->read());
+}
+
+TEST_F(OutputStreamTest, sizedRamOutputTransfersItsAllocation) {
+  for (size_t size : {0, 7, 2 * 1024 * 1024}) {
+    RAMDirFactory factory(size);
+    auto dir = factory.create("main/first");
+    Directory::FileCreateOptions options; options.expectedSize = size;
+    auto file = dir->createFile("data", options);
+    EXPECT_EQ(size, factory.storageBytes("main"));
+    OutputStream out(file.get());
+    const char* buffer = nullptr;
+    if (size) { out.reserve(1); buffer = out.ptr(); }
+    std::string bytes(size, 'x'); out.write(bytes.data(), bytes.size()); out.close();
+    dir->finishFile(*file); // Fits an exact-size limit only if there is no flatten copy.
+    auto input = dir->openFile("data");
+    EXPECT_EQ(bytes, input->read());
+    if (size) { EXPECT_EQ(buffer, input->read().data()); }
+    EXPECT_EQ(XXH3_64bits(bytes.data(), bytes.size()), file->digest());
+    file.reset();
+    auto next = factory.create("main/next"); next->linkFile(*dir, "data");
+    EXPECT_EQ(size, factory.storageBytes());
+    dir->clear(); next->clear(); factory.remove("main");
+    EXPECT_EQ(size, factory.storageBytes("main"));
+    input.reset();
+    EXPECT_EQ(0, factory.storageBytes());
+  }
+}
+
+TEST_F(OutputStreamTest, sizedRamOutputRejectsIncompleteAndOverlongWrites) {
+  RAMDir dir;
+  Directory::FileCreateOptions options; options.expectedSize = 2;
+  auto file = dir.createFile("short", options);
+  OutputStream out(file.get()); out.write('x');
+  EXPECT_THROW(out.close(), FileIOException);
+  EXPECT_THROW(dir.finishFile(*file), FileIOException);
+  auto other = dir.createFile("long", options);
+  OutputStream over(other.get());
+  EXPECT_THROW(over.reserve(3), FileIOException);
+  EXPECT_THROW(over.write("abc", 3), FileIOException);
+  EXPECT_EQ(4, dir.storageBytes());
+  file.reset(); other.reset();
+  EXPECT_EQ(0, dir.storageBytes());
+}
+
+TEST_F(OutputStreamTest, ramStorageAccountsForChunkedOutputAndLimitsAllocations) {
+  RAMDirFactory factory(1030);
+  auto dir = factory.create("main/first");
+  auto file = dir->createFile("chunked");
+  OutputStream out(file.get()); out.write("abc", 3); out.close();
+  EXPECT_EQ(1024, factory.storageBytes());
+  dir->finishFile(*file);
+  EXPECT_EQ(1027, factory.storageBytes());
+  Directory::FileCreateOptions options; options.expectedSize = 4;
+  EXPECT_THROW(dir->createFile("over-limit", options), ApiError);
+  EXPECT_EQ(1027, factory.storageBytes());
+  file.reset();
+  EXPECT_EQ(3, factory.storageBytes());
+  auto pending = dir->createFile("pending", options);
+  EXPECT_EQ(7, factory.storageBytes());
+  pending.reset();
+  auto input = dir->openFile("chunked"); dir->clear();
+  EXPECT_EQ(3, factory.storageBytes());
+  input.reset(); EXPECT_EQ(0, factory.storageBytes());
 }

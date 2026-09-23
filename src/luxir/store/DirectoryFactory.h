@@ -41,7 +41,8 @@ public:
   void select(std::string_view name, const Selection& selection) {
     auto container = create(name);
     auto bytes = glz::write_json(selection).value();
-    auto file = container->createFile("CURRENT.pending");
+    Directory::FileCreateOptions options; options.expectedSize = bytes.size();
+    auto file = container->createFile("CURRENT.pending", options);
     OutputStream out(file.get());
     out.write(bytes.data(), bytes.size()); out.close();
     container->finishFile(*file);
@@ -75,6 +76,8 @@ public:
     return selection;
   }
 
+  virtual uint64_t storageBytes(std::string_view collection = {}) { unused(collection); return 0; }
+
   virtual ~DirectoryFactory() = default;
 
   /// Open or create a directory relative to c/. Exclusive creation fails if it exists.
@@ -92,12 +95,30 @@ public:
 class RAMDirFactory : public DirectoryFactory {
   std::mutex mutex;
   std::map<std::string, std::shared_ptr<Directory>, std::less<>> directories;
+  std::shared_ptr<StorageMemory> memory;
+  std::map<std::string, std::weak_ptr<StorageMemory>, std::less<>> collections;
 public:
+  explicit RAMDirFactory(uint64_t limit = 0, std::function<bool()> reclaim = {})
+      : memory(std::make_shared<StorageMemory>(limit, nullptr, std::move(reclaim))) {}
+  uint64_t storageBytes(std::string_view collection = {}) override {
+    std::lock_guard lock(mutex);
+    std::erase_if(collections, [](const auto& entry) { return entry.second.expired(); });
+    if (collection.empty()) return memory->bytes();
+    auto it = collections.find(collection);
+    auto account = it == collections.end() ? nullptr : it->second.lock();
+    return account ? account->bytes() : 0;
+  }
   std::shared_ptr<Directory> create(std::string_view collectionName, bool exclusive = false) override {
     std::lock_guard lock(mutex);
     auto [it, inserted] = directories.try_emplace(std::string(collectionName));
     if (!inserted && exclusive) throw std::runtime_error("collection directory already exists");
-    if (inserted) it->second = std::make_shared<RAMDir>();
+    if (inserted) {
+      auto name = collectionName.substr(0, collectionName.find('/'));
+      auto& weak = collections[std::string(name)];
+      auto account = weak.lock();
+      if (!account) { account = std::make_shared<StorageMemory>(0, memory); weak = account; }
+      it->second = std::make_shared<RAMDir>(std::move(account));
+    }
     return it->second;
   }
 

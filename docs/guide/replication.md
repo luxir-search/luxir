@@ -135,9 +135,8 @@ bounded dedicated workers, outside search/indexing workers. Each worker reuses a
 connection and I/O context. Ready collections run longest-waiting first. Failures
 back off per collection from one second to at most 60 seconds. A lost reservation
 restarts immediately unless it repeats without verified-file progress; checksum
-failures retain the other verified files. RAM uses the same
-Directory operations; known-size allocation and storage memory limits are separate
-work.
+failures retain the other verified files. RAM downloads allocate their final file
+buffer once and transfer it directly to readers. They use bounded HTTP chunks, without buffering a file body as a string.
 
 An installer syncs data and directory entries, opens the candidate reader, then
 writes and syncs its local manifest before swapping readers and acknowledging.
@@ -236,3 +235,24 @@ requested:
 ```json
 {"commits":{"main":{"commit":"INC:GEN","replicas":{"wanted":2,"serving":2,"timed_out":false}},"other":{"commit":"INC:GEN","replicas":{"wanted":2,"serving":1,"timed_out":true}}}}
 ```
+
+RAM storage uses a separate, optional `--store.ram-limit-mb` limit (default `0`,
+unlimited). It counts allocated file buffer capacity, including unfinished
+outputs, completed files, reservations, and files still held by old readers.
+Cross-incarnation reuse shares one allocation and one charge. Chunked indexing
+outputs still need a flatten allocation when finished, so leave room for that
+transient copy; follower downloads, manifests, CURRENT and liveDocs use known
+sizes and avoid it. The limit is independent of `indexing_ram` and excludes
+schema, reader/cache objects, snapshot metadata, and allocator overhead. FS
+mappings and the OS page cache are not RAM storage charges.
+
+`/_stats` exposes node `storage_ram: {used_bytes, limit_bytes}` and collection
+`storage_ram_bytes`; `/_replication/status` also exposes each collection's
+`storage_ram_bytes`, including candidates not yet serving. Node usage can exceed
+the sum of visible collections while a deleted collection's old reader is alive.
+An allocation that would exceed the limit fails before allocating. A follower
+keeps serving its old snapshot, reports `RAM storage memory limit exceeded`, and
+backs off normally. Set enough headroom for the serving snapshot plus changed
+files; pinned/old readers may delay reclamation. A fixed limit can deliberately
+prevent an oversized snapshot from ever installing until the limit or data is
+changed.
