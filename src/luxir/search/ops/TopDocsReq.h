@@ -123,10 +123,12 @@ public:
     bool available() const noexcept { return keys.batch != nullptr; }
   };
 
+  // Pre-Weight FIELD_SORT outcome: an accepted resident value (the main
+  // Weight is omitted), a build veto (no segment may touch the cache), or
+  // neither, leaving the Weight-bearing router to plan builds per segment.
   struct CacheFirstFieldSortPlan {
     FilterCache::Use* acceptedUse = nullptr;
-    std::span<uint8_t> routes;
-    bool decided = false;
+    bool buildVetoed = false;
 
     bool omitsWeight() const noexcept { return acceptedUse != nullptr; }
   };
@@ -159,106 +161,52 @@ public:
         || type == FieldType::FLOAT || type == FieldType::DOUBLE;
   }
 
-  static int64_t residentFieldSortCard(
-      const FilterCache::ExistingCandidate& candidate,
-      IndexReader::Segment& segment) {
-    const BitDocSet* liveDocs = segment.liveDocs() == nullptr
-        ? nullptr : &segment.liveDocs()->docset();
-    return candidate.residentCard((size_t)segment.ord, liveDocs);
-  }
-
-  // A complete inert candidate supplies exact per-segment cardinalities.
-  // Return true only when every segment selects the existing best-first
-  // economics. card <= 0 remains a rejection exactly as in
-  // planFieldSortBestFirst(); needing no execution work does not authorize
-  // cache hit effects for a rejected route.
-  static bool planResidentFieldSortBestFirstRoutes(
-      const FilterCache::ExistingCandidate& candidate,
-      IndexReader& reader, const SortPlan& sortPlan, int64_t topCount,
-      std::span<uint8_t> routes) {
-    assert(routes.size() == reader.segments().size());
-    assert(fieldSortCanUseMaskedBestFirst(sortPlan));
-    FieldSortCollector collector(
-        topCount, sortPlan.clauses, &reader, false);
-    MemPool pool;
-    bool allRouted = true;
-    for (auto& segment : reader.segments()) {
-      auto savepoint = pool.getSavePoint();
-      int64_t card = residentFieldSortCard(candidate, segment);
-      bool routed = false;
-      if (card > 0) {
-        collector.setSegment(
-            segment.ord, &segment.postingsReader(), &pool, card);
-        routed = planFieldSortBestFirst(
-            collector, card, segment.maxDoc()).available();
-      }
-      routes[(size_t)segment.ord] = (uint8_t)routed;
-      allRouted &= routed;
-      pool.rewind(savepoint);
-    }
-    return allRouted;
-  }
-
-  // Move only the provable Stage 4b decisions ahead of Weight construction.
-  // An incomplete lookup or dynamic conjunction returns undecided so the
-  // landed Weight-bearing router remains authoritative.
+  // Pre-Weight FIELD_SORT planning. A complete resident whole membership
+  // serves every shape: the Calc still chooses per segment between best-first
+  // over the exact set and the doc-order ladder over it, and either replaces
+  // query evaluation. That includes shapes this planner never builds for,
+  // whose membership another consumer (a count over the same query) made
+  // resident; accepting applies the ordinary shared-hit effects. The inert
+  // lookup records nothing when the value is absent. Building stays a
+  // separate decision: verification-bearing and non-flat numeric shapes
+  // return undecided so the Weight-bearing router admits per segment on its
+  // estimates; flat literal conjunctions and docs-only non-numeric sorts
+  // veto every segment here, so a field sort never builds them, records
+  // their sighting, or creates their cache entry.
   static CacheFirstFieldSortPlan planCacheFirstFieldSortWholeMembership(
-      Query& query, Query::PlanningContext& planning, IndexReader& reader,
-      const SortPlan& sortPlan, int64_t topCount,
-      bool allowReaderStable) {
-    Query::VerificationWork verification =
-        membershipVerificationWork(query);
-    bool verificationRoute =
-        verification == Query::VerificationWork::PRESENT;
-    bool numericBestFirst = fieldSortCanUseMaskedBestFirst(sortPlan);
-    Query::FieldSortConjunction conjunction = numericBestFirst
-        ? query.fieldSortConjunction(planning)
-        : Query::FieldSortConjunction::NOT_FLAT;
-
-    bool mayInspectResident = verificationRoute
-        || (numericBestFirst
-            && conjunction == Query::FieldSortConjunction::NOT_FLAT);
-    if (!mayInspectResident) {
-      if (numericBestFirst
-          && conjunction == Query::FieldSortConjunction::DYNAMIC_TERMS) {
-        return {};
-      }
-      auto routes = planning.pool.make_span<uint8_t>(
-          reader.segments().size());
-      std::fill(routes.begin(), routes.end(), 0);
-      return {nullptr, routes, true};
-    }
-
+      Query& query, Query::PlanningContext& planning,
+      const SortPlan& sortPlan, bool allowReaderStable) {
     auto candidate = planning.lookupExistingFilterUse(
         query, allowReaderStable);
-    if (!candidate.has_value()) return {};
-
-    auto routes = planning.pool.make_span<uint8_t>(
-        reader.segments().size());
-    bool allRouted;
-    if (verificationRoute) {
-      std::fill(routes.begin(), routes.end(), 1);
-      allRouted = true;
-    } else {
-      allRouted = planResidentFieldSortBestFirstRoutes(
-          *candidate, reader, sortPlan, topCount, routes);
+    if (candidate.has_value()) {
+      FilterCache::Use* use = planning.acceptExistingFilterUse(
+          std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
+      // A concurrent detach after the lookup leaves the Weight-bearing
+      // router authoritative.
+      return {use, false};
     }
-    if (!allRouted) return {nullptr, routes, true};
-
-    FilterCache::Use* use = planning.acceptExistingFilterUse(
-        std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
-    return use == nullptr ? CacheFirstFieldSortPlan{}
-                          : CacheFirstFieldSortPlan{use, routes, true};
+    if (membershipVerificationWork(query)
+        == Query::VerificationWork::PRESENT) {
+      return {};
+    }
+    if (fieldSortCanUseMaskedBestFirst(sortPlan)
+        && query.fieldSortConjunction(planning)
+            != Query::FieldSortConjunction::FLAT_LITERAL_CONJUNCTION) {
+      return {};
+    }
+    return {nullptr, true};
   }
 
-  // Cached membership pays for FIELD_SORT when it removes verification work
-  // from the query-driven ladder, or when its estimated cardinality unlocks
-  // the exact-set best-first route. Flat term conjunction cost is only the
-  // cheapest posting list, not a useful estimate of intersection membership,
-  // so it cannot establish the best-first route by itself. VerificationWork
-  // includes nested two-phase children hidden behind a single-phase compound
-  // protocol. Plan before getFilterUse(): a request rejected in every segment
-  // must not create a Use, record a WHOLE-lane sighting, or admit metadata.
+  // Building membership pays for FIELD_SORT when it removes verification
+  // work from the query-driven ladder, or when its estimated cardinality
+  // unlocks the exact-set best-first route. Flat term conjunction cost is only
+  // the cheapest posting list, not a useful estimate of intersection
+  // membership, so it cannot establish the best-first route by itself.
+  // VerificationWork includes nested two-phase children hidden behind a
+  // single-phase compound protocol. Serving an already resident value is not
+  // decided here: the pre-Weight planner accepts it for every shape. Plan
+  // before getFilterUse(): a request rejected in every segment must not
+  // create a Use, record a WHOLE-lane sighting, or admit metadata.
   static bool planFieldSortWholeMembershipRoutes(
       Query& query, Query::Weight& weight, IndexReader& reader,
       const SortPlan& sortPlan, int64_t topCount,

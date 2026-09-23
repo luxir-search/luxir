@@ -897,7 +897,7 @@ void indexWholeFieldSortDocs(CollectionHelper& helper) {
     Membership{"s4subop", 2}, Membership{"s4fusion", 2},
     Membership{"s4backoff", 2}, Membership{"s4multi", 2},
     Membership{"s4doc", 2}, Membership{"s4gate", 2},
-    Membership{"s4phrase", 2},
+    Membership{"s4phrase", 2}, Membership{"s4resident", 2},
   };
   for (int32_t segment = 0; segment < 2; segment++) {
     std::vector<Doc> docs;
@@ -2986,6 +2986,87 @@ TEST_F(SearchEngineTest, wholeFieldSortRoutesBeforeCacheTrafficByShape) {
   }
 }
 
+// Serving and building are separate FIELD_SORT decisions. A flat literal
+// conjunction never builds for a field sort (numeric sort: the flat veto;
+// string sort: docs-only without verification work), yet once a count over
+// the same query has made its whole membership resident, both sorts serve it
+// without constructing the main Weight. Without the resident value they keep
+// the query route and leave the cache untouched.
+TEST_F(SearchEngineTest, wholeFieldSortServesResidentMembershipItNeverBuilds) {
+  constexpr std::string_view enabledCollection = "whole_field_sort_resident";
+  constexpr std::string_view disabledCollection =
+      "whole_field_sort_resident_off";
+  CollectionHelper enabled(enabledCollection);
+  CollectionHelper disabled(disabledCollection);
+  auto cache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.minSegmentDocs = 0});
+  enabled.getIndexWriter()->filterCache = cache;
+  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
+  indexWholeFieldSortDocs(enabled);
+  indexWholeFieldSortDocs(disabled);
+
+  constexpr std::array sorts{
+    std::pair{std::string_view("sort_i"), qb::ASC},
+    std::pair{std::string_view("sort_s"), qb::DESC},
+  };
+  auto sortRun = [&](CollectionHelper& helper, std::string_view collection,
+                     size_t sort) {
+    return runWholeFieldSort(
+        helper.getSearchEngine(), collection, "s4resident",
+        sorts[sort].first, sorts[sort].second);
+  };
+  auto conjunction = [](std::pmr::memory_resource& mr) {
+    return qb::boolean(mr, {qb::match(mr, "body_w", "s4residenta"),
+                            qb::match(mr, "body_w", "s4residentb")});
+  };
+  runWholeCount(enabled.getSearchEngine(), enabledCollection, conjunction);
+  ASSERT_EQ(2, runWholeCount(enabled.getSearchEngine(), enabledCollection,
+                             conjunction).builds);
+
+  for (size_t sort = 0; sort < sorts.size(); sort++) {
+    SCOPED_TRACE(sorts[sort].first);
+    WholeFieldSortRun off = sortRun(disabled, disabledCollection, sort);
+    auto before = cache->counters();
+    WholeFieldSortRun resident = sortRun(enabled, enabledCollection, sort);
+    auto after = cache->counters();
+    expectSameWholeFieldSort(off, resident);
+    ASSERT_TRUE(resident.found.has_value());
+    EXPECT_EQ(254, *resident.found);
+    EXPECT_EQ(2, resident.hits);
+    EXPECT_EQ(2, resident.ladderFallbacks);
+    EXPECT_EQ(0, resident.builds + resident.bypasses
+                     + resident.routingBypasses);
+    EXPECT_EQ(1, resident.weightSkips);
+    EXPECT_EQ(0, resident.contextsCreated);
+    EXPECT_EQ(1, resident.contextsOmitted);
+    EXPECT_EQ(before.hits + 2, after.hits);
+    EXPECT_EQ(before.admissions, after.admissions);
+    EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+  }
+
+  cache->clear();
+  auto before = cache->counters();
+  for (int round = 0; round < 3; round++) {
+    for (size_t sort = 0; sort < sorts.size(); sort++) {
+      SCOPED_TRACE(sorts[sort].first);
+      WholeFieldSortRun off = sortRun(disabled, disabledCollection, sort);
+      WholeFieldSortRun routed = sortRun(enabled, enabledCollection, sort);
+      expectSameWholeFieldSort(off, routed);
+      EXPECT_EQ(2, routed.routingBypasses);
+      EXPECT_EQ(0, routed.hits + routed.builds + routed.bypasses
+                       + routed.fallbackSuppliers);
+      EXPECT_EQ(0, routed.weightSkips + routed.contextsOmitted);
+      EXPECT_EQ(1, routed.contextsCreated);
+    }
+  }
+  auto after = cache->counters();
+  EXPECT_EQ(0u, cache->entryCountForTest());
+  EXPECT_EQ(before.hits, after.hits);
+  EXPECT_EQ(before.admissions, after.admissions);
+  EXPECT_EQ(before.buildAttempts, after.buildAttempts);
+}
+
 TEST_F(SearchEngineTest,
        wholeFieldSortMultiTermConjunctionKeepsWeightRouter) {
   constexpr std::string_view enabledCollection =
@@ -3016,6 +3097,9 @@ TEST_F(SearchEngineTest,
   WholeFieldSortRun hit = run(
       enabled.getSearchEngine(), enabledCollection);
 
+  // The multiterm child is classified only after segment expansion, so the
+  // Weight-bearing router plans the bypass and build rounds. The resident
+  // value then serves before any Weight exists.
   expectSameWholeFieldSort(off, bypass);
   expectSameWholeFieldSort(off, build);
   expectSameWholeFieldSort(off, hit);
@@ -3024,8 +3108,12 @@ TEST_F(SearchEngineTest,
   EXPECT_EQ(2, hit.hits);
   EXPECT_EQ(2, build.cachedBestFirst);
   EXPECT_EQ(2, hit.cachedBestFirst);
-  EXPECT_EQ(0, hit.weightSkips + hit.contextsOmitted);
-  EXPECT_EQ(1, hit.contextsCreated);
+  EXPECT_EQ(1, bypass.contextsCreated);
+  EXPECT_EQ(1, build.contextsCreated);
+  EXPECT_EQ(0, bypass.weightSkips + build.weightSkips);
+  EXPECT_EQ(1, hit.weightSkips);
+  EXPECT_EQ(1, hit.contextsOmitted);
+  EXPECT_EQ(0, hit.contextsCreated);
 }
 
 TEST_F(SearchEngineTest, wholeFieldSortPartialResidencyKeepsOrdinaryPath) {
@@ -7431,7 +7519,8 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   // Eight numeric leaf zones: depth 1 admits best-first, depth 3 rejects it.
-  // Warm membership must plan with offset + limit even though limit stays 1.
+  // Warm membership serves both depths, and its best-first plan must use
+  // offset + limit even though limit stays 1.
   BestFirstGuard bestFirst(false, false);
   for (int round = 0; round < 3; round++) {
     auto req = localReq(helper.getSearchEngine());
@@ -7446,7 +7535,11 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
     EXPECT_EQ(2048, req->docList()->found.value_or(-1));
     EXPECT_EQ((std::vector<std::string>{round == 2 ? "4" : "0"}), resultIds(*req, "q"));
     if (round > 0) {
-      EXPECT_EQ(round == 1 ? 1 : 0, SkipStats::cacheFirstFieldSortWeightSkips);
+      EXPECT_EQ(1, SkipStats::cacheFirstFieldSortWeightSkips);
+      EXPECT_EQ(1, SkipStats::wholeFieldSortHits);
+      EXPECT_EQ(round == 1 ? 1 : 0,
+                SkipStats::wholeFieldSortBestFirstActivations);
+      EXPECT_EQ(round == 1 ? 0 : 1, SkipStats::wholeFieldSortLadderFallbacks);
     }
   }
 }

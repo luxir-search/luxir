@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -356,7 +355,6 @@ public:
     friend class FilterCache;
     friend class Probe;
     friend class UseRegistry;
-    friend class ExistingCandidate;
 
     void pinValue(size_t segmentOrd,
                   const std::shared_ptr<const SegmentValue>& value,
@@ -431,44 +429,6 @@ public:
     ExistingCandidate& operator=(const ExistingCandidate&) = delete;
     ExistingCandidate(ExistingCandidate&&) noexcept = default;
     ExistingCandidate& operator=(ExistingCandidate&&) noexcept = default;
-
-    // Exact cardinality of an inert pinned candidate in the root live domain.
-    // Segment/core-stable values are raw, so compose deletes here without
-    // allocating a DocSet. Reader-stable values are already live-exact.
-    int32_t residentCard(
-        size_t segmentOrd, const BitDocSet* liveDocs) const {
-      assert(use != nullptr && segmentOrd < use->readerSegments.size());
-      DocSet* docs;
-      if (use->scope_ == FilterKeyScope::READER_STABLE) {
-        assert(use->existingReaderCandidate != nullptr);
-        docs = use->existingReaderCandidate->docSet(
-            segmentOrd, use->readerSegments[segmentOrd]);
-        assert(docs != nullptr);
-        return docs->card();
-      }
-      assert(segmentOrd < use->existingCandidates.size()
-             && use->existingCandidates[segmentOrd] != nullptr);
-      docs = use->existingCandidates[segmentOrd]->docSet();
-      if (liveDocs == nullptr) return docs->card();
-
-      const FixedBitSet& live = liveDocs->bits();
-      if (docs->type == DocSet::ARRAY) {
-        int32_t card = 0;
-        for (int32_t doc : ((ArrDocSet*)docs)->docs()) {
-          card += live.get(doc);
-        }
-        return card;
-      }
-
-      const FixedBitSet& raw = ((BitDocSet*)docs)->bits();
-      assert(raw.size() == live.size());
-      size_t words = FixedBitSet::sizeInWords(raw.size());
-      int32_t card = 0;
-      for (size_t i = 0; i < words; i++) {
-        card += (int32_t)std::popcount(raw.words[i] & live.words[i]);
-      }
-      return card;
-    }
   };
 
   // Request-local full-key dedup and value ownership. It always exists; cache

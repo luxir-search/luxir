@@ -1565,8 +1565,7 @@ public:
     }
 
     bool cacheFirstFieldSort = false;
-    bool fieldSortRoutesPreplanned = false;
-    std::span<uint8_t> cacheFirstFieldSortRoutes;
+    bool fieldSortBuildVetoed = false;
     bool cacheFirstFieldSortShape =
         placement == TopDocsPlacement::ROOT_OP
         && !QueryPrep::disableWholeMembershipPlanForTests
@@ -1579,11 +1578,9 @@ public:
     if (cacheFirstFieldSortShape) {
       auto fieldSortPreflight =
           TopDocsReq::planCacheFirstFieldSortWholeMembership(
-              *query, *planningContext, *req.reader, parsedSorts, topCount,
-              true);
+              *query, *planningContext, parsedSorts, true);
       cacheFirstMembershipUse = fieldSortPreflight.acceptedUse;
-      cacheFirstFieldSortRoutes = fieldSortPreflight.routes;
-      fieldSortRoutesPreplanned = fieldSortPreflight.decided;
+      fieldSortBuildVetoed = fieldSortPreflight.buildVetoed;
       cacheFirstFieldSort = fieldSortPreflight.omitsWeight();
       if (cacheFirstFieldSort) {
         skipCount(SkipStats::cacheFirstFieldSortWeightSkips);
@@ -1683,8 +1680,7 @@ public:
     Query::Weight* wholeMembershipWeight = nullptr;
     Query::Weight* wholeRankingWeight = nullptr;
     FilterCache::Use* wholeMembershipUse = nullptr;
-    std::span<uint8_t> wholeFieldSortCacheRoutes =
-        cacheFirstFieldSortRoutes;
+    std::span<uint8_t> wholeFieldSortCacheRoutes;
     bool wholeConstantRanking = false;
     bool pureCount = pureCountShape && filterWeights.empty();
     bool wholeTopKCount = !QueryPrep::disableWholeMembershipPlanForTests
@@ -1744,17 +1740,16 @@ public:
         if (!everySegmentConstant && cache != nullptr && cache->enabled()) {
           bool acquireUse = true;
           if (wholeFieldSort && !readerStableWhole) {
-            if (!fieldSortRoutesPreplanned) {
-              wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
-                  req.reader->segments().size());
+            wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
+                req.reader->segments().size());
+            if (fieldSortBuildVetoed) {
+              std::fill(wholeFieldSortCacheRoutes.begin(),
+                        wholeFieldSortCacheRoutes.end(), 0);
+              acquireUse = false;
+            } else {
               acquireUse = TopDocsReq::planFieldSortWholeMembershipRoutes(
                   *query, *wholeMembershipWeight, *req.reader, parsedSorts,
                   topCount, wholeFieldSortCacheRoutes);
-            } else {
-              acquireUse = std::any_of(
-                  wholeFieldSortCacheRoutes.begin(),
-                  wholeFieldSortCacheRoutes.end(),
-                  [](uint8_t routed) { return routed != 0; });
             }
             fieldSortFullyRouted = !acquireUse;
           }
