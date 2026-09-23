@@ -15,6 +15,7 @@
 #include "luxir/util/luxir_util.h"
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/HttpServer.h"
+#include "luxir/server/ReplicationFollower.h"
 #include "luxir/LuxirConfig.h"
 
 namespace fs = std::filesystem;
@@ -28,13 +29,27 @@ int luxir_main(int argc, char** argv) {
   app.set_version_flag("--version", "Luxir " LUXIR_VERSION " (" LUXIR_CPU_NAME ")");
   LuxirConfig config;
   config.addOptions(app);
+  auto* pull = app.add_subcommand("pull", "Copy current source snapshots to a follower data directory");
+  pull->add_option("source", config.replication.source, "HTTP source URL")->required();
+  pull->add_option("dir", config.store.data_dir, "Destination data directory")->required();
 
   try {
     app.parse(argc, argv);
   } catch (const CLI::ParseError &e) {
     return app.exit(e);
   }
-  std::cout << luxir_banner() << std::endl;
+  if (*pull) {
+    if (config.replication.source.empty() || config.store.data_dir.empty()) {
+      std::cerr << "pull requires nonempty source and directory arguments\n";
+      return 1;
+    }
+    if (config.read_only || config.promote) {
+      std::cerr << "pull cannot be combined with --read-only or --promote\n";
+      return 1;
+    }
+    config.store.backend = "fs";
+    if (!app.get_option("--log-level")->count()) config.log_level = "warn";
+  } else std::cout << luxir_banner() << std::endl;
 
 #ifdef __GLIBC__
   // An explicit mallopt permanently disables glibc's dynamic mmap-threshold
@@ -56,6 +71,16 @@ int luxir_main(int argc, char** argv) {
   } catch (const std::exception &e) {
     LOG_ERROR("Invalid configuration: {}", e.what());
     return 1;
+  }
+
+  if (*pull) {
+    try {
+      LuxirNode node{config, LuxirNode::Mode::PULL};
+      return node.getFollower()->pull(std::cout) ? 0 : 1;
+    } catch (const std::exception& e) {
+      std::cerr << "Pull failed: " << e.what() << '\n';
+      return 1;
+    }
   }
 
   if (config.read_only) {

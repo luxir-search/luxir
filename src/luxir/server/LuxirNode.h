@@ -192,7 +192,8 @@ public:
   };
 
   LuxirNode() : LuxirNode(LuxirConfig{}) {}
-  explicit LuxirNode(LuxirConfig config);
+  enum class Mode { SERVE, PULL };
+  explicit LuxirNode(LuxirConfig config, Mode mode = Mode::SERVE);
   ~LuxirNode();
 
   const LuxirConfig& getConfig() const { return config; }

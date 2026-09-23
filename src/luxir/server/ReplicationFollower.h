@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <iosfwd>
 #include <memory>
 #include <memory_resource>
 #include <string_view>
@@ -18,6 +19,9 @@ class ReplicationFollower {
 public:
   explicit ReplicationFollower(LuxirNode& node);
   ~ReplicationFollower();
+  // One catalog pass, before start(), with the same installation rules.
+  // Does not acknowledge serving traffic. Returns false if any collection failed.
+  bool pull(std::ostream& output);
   void start();
   void stop();
   void deleteOrphan(std::string_view name);

@@ -964,19 +964,138 @@ TEST_F(ReplicationFollowerTest, ramLimitKeepsOldSnapshotAndChargesReadersUntilRe
   ASSERT_TRUE(until([&] { return follower->storageBytes("main") == 0; }));
 }
 
+class ReplicationPullTest : public ReplicationFollowerTest, public ::testing::WithParamInterface<std::string> {
+  void SetUp() override {
+    ReplicationFollowerTest::SetUp();
+    sourceConfig.store.backend = GetParam();
+  }
+};
+INSTANTIATE_TEST_SUITE_P(Storage, ReplicationPullTest, ::testing::Values("fs", "ram"));
 
+TEST_P(ReplicationPullTest, copiesEmptyAndPopulatedCollectionsThenSeedsAndPromotes) {
+  startSource();
+  source->createCollection(nullptr, "empty");
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  auto snapshot = source->getCollection("main")->getShard()->getSnapshots().snapshot();
+  uint64_t bytes = 0; for (const auto& file : snapshot->files) bytes += file.size;
+  auto first = pull();
+  ASSERT_EQ(0, first.first) << first.second;
+  EXPECT_NE(std::string::npos, first.second.find("main " + snapshot->id.token()));
+  EXPECT_NE(std::string::npos, first.second.find("Pull: 2 installed, 0 failed, transferred=" + std::to_string(bytes) + " reused=0"));
+  for (const auto& row : source->getReplication().stats(*source)) EXPECT_TRUE(row.commit.incarnation.empty()); // Pull is not serving.
+  {
+    auto config = followerConfig; config.read_only = true;
+    LuxirNode restored(config);
+    EXPECT_EQ(1, restored.getCollection("main")->getReaderManager().getReader()->liveDocs());
+    EXPECT_EQ(0, restored.getCollection("empty")->getReaderManager().getReader()->liveDocs());
+  }
+  auto again = pull();
+  ASSERT_EQ(0, again.first) << again.second;
+  EXPECT_NE(std::string::npos, again.second.find("Pull: 2 installed, 0 failed, transferred=0 reused=" + std::to_string(bytes)));
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
+  ASSERT_EQ(0, pull().first);
+  startFollower();
+  ASSERT_TRUE(caughtUp());
+  auto current = source->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
+  ASSERT_TRUE(until([&] {
+    return std::ranges::any_of(source->getReplication().stats(*source), [&](const auto& row) {
+      return row.collection == "main" && row.commit == current;
+    });
+  }));
+  api::ReplicationStatus status; std::pmr::monotonic_buffer_resource arena;
+  follower->getFollower()->stats(status, arena);
+  for (const auto& row : status.collections) EXPECT_EQ(0, row.bytes_downloaded);
+  EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+  stopFollower();
+  auto config = followerConfig; config.replication.source.clear(); config.promote = true;
+  LuxirNode writer(config);
+  CollectionHelper h(writer, "main");
+  EXPECT_NE(snapshot->id.incarnation, h.collection().getShard()->getSnapshots().snapshot()->id.incarnation);
+  ASSERT_TRUE(h.index(flatdoc("id", "c"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(3, h.collection().getReaderManager().getReader()->liveDocs());
+}
 
+TEST_F(ReplicationFollowerTest, pullReusesFilesAfterSourcePromotion) {
+  startSource();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_EQ(0, pull().first);
+  auto destination = followerConfig.store.data_dir;
+  followerConfig.store.data_dir = (path / "promoted").string();
+  ASSERT_EQ(0, pull().first);
+  stopSource();
+  sourceConfig.store.data_dir = followerConfig.store.data_dir; sourceConfig.promote = true;
+  startSource();
+  followerConfig.store.data_dir = destination;
+  auto result = pull();
+  ASSERT_EQ(0, result.first) << result.second;
+  EXPECT_NE(std::string::npos, result.second.find("Pull: 1 installed, 0 failed, transferred=0 reused="));
+}
 
+TEST_F(ReplicationFollowerTest, pullAcceptsNewSourceAndRefusesUnrelatedData) {
+  startSource();
+  ASSERT_EQ(0, pull().first);
+  auto wrong = pull("http://127.0.0.1:1");
+  EXPECT_NE(0, wrong.first);
+  EXPECT_NE(std::string::npos, wrong.second.find("Connection refused"));
+  followerConfig.store.data_dir = (path / "unrelated").string();
+  std::filesystem::create_directories(followerConfig.store.data_dir);
+  auto sentinel = std::filesystem::path(followerConfig.store.data_dir) / "unrelated";
+  { std::ofstream file(sentinel); file << "keep me"; }
+  auto unrelated = pull();
+  EXPECT_NE(0, unrelated.first);
+  EXPECT_NE(std::string::npos, unrelated.second.find("empty data directory"));
+  EXPECT_TRUE(std::filesystem::exists(sentinel));
+  followerConfig.store.data_dir = (path / "offline").string();
+  stopSource();
+  auto offline = pull();
+  EXPECT_NE(0, offline.first);
+  EXPECT_NE(std::string::npos, offline.second.find("Pull failed:"));
+  EXPECT_NE(std::string::npos, offline.second.find("Connection refused"));
+}
 
+TEST_F(ReplicationFollowerTest, pullReportsCollectionFailureAndInstallsOtherCollections) {
+  startSource();
+  for (auto name : {"aaa", "main"}) {
+    CollectionHelper h(*source, name); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  }
+  unsigned installs = 0;
+  Signal::listen("replicationRootWritten", [&](void*, void*, void*) -> void* {
+    if (installs++ == 0) throw std::runtime_error("interrupted installation");
+    return nullptr;
+  });
+  auto result = pull();
+  EXPECT_NE(0, result.first);
+  EXPECT_NE(std::string::npos, result.second.find("ERROR: interrupted installation"));
+  EXPECT_NE(std::string::npos, result.second.find("Pull: 1 installed, 1 failed"));
+  auto retry = pull();
+  EXPECT_EQ(0, retry.first) << retry.second;
+}
 
+TEST_F(ReplicationFollowerTest, pullRetriesLostReservationAndKeepsVerifiedFiles) {
+  startSource();
+  CollectionHelper h(*source, "main");
+  for (auto id : {"a", "b"}) ASSERT_TRUE(h.index(flatdoc("id", id), UpdateMessage::COMMIT).success);
+  auto snapshot = h.collection().getShard()->getSnapshots().snapshot();
+  uint64_t bytes = 0; for (const auto& file : snapshot->files) bytes += file.size;
+  unsigned verified = 0;
+  Signal::listen("replicationFileVerified", [&](void*, void*, void*) -> void* {
+    if (++verified == 1) h.collection().getShard()->getSnapshots().evictOldest();
+    return nullptr;
+  });
+  auto result = pull();
+  EXPECT_EQ(0, result.first) << result.second;
+  EXPECT_EQ(snapshot->files.size(), verified);
+  EXPECT_NE(std::string::npos, result.second.find("Pull: 1 installed, 0 failed, transferred=" + std::to_string(bytes) + " reused="));
+}
 
-
-
-
-
-
-
-
+TEST_F(ReplicationFollowerTest, pullRejectsEmptyArgumentsBeforeCreatingDirectory) {
+  auto emptySource = command({"luxir", "pull", "", followerConfig.store.data_dir});
+  EXPECT_NE(0, emptySource.first);
+  EXPECT_FALSE(std::filesystem::exists(followerConfig.store.data_dir));
+  auto emptyDirectory = command({"luxir", "pull", "http://127.0.0.1:1", ""});
+  EXPECT_NE(0, emptyDirectory.first);
+  EXPECT_NE(std::string::npos, emptyDirectory.second.find("nonempty"));
+}
 
 TEST_F(ReplicationFollowerTest, emptyCreateAndSameBootRecreateInstallImmediately) {
   startSource(); startFollower();
@@ -1066,8 +1185,39 @@ TEST_F(ReplicationFollowerTest, fallbackWriterChangesIncarnation) {
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
 }
 
+TEST_F(ReplicationFollowerTest, repointReusesExistingFollowerDirectory) {
+  startSource();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_EQ(0, pull().first);
+  int previousPort = sourcePort;
+  stopSource();
+  net::io_context io;
+  tcp::acceptor reserved(io); reserved.open(tcp::v4());
+  reserved.set_option(net::socket_base::reuse_address(true));
+  reserved.bind({net::ip::make_address("127.0.0.1"), (uint16_t)previousPort});
+  sourcePort = 0; startSource();
+  ASSERT_NE(previousPort, sourcePort);
+  auto copied = pull();
+  ASSERT_EQ(0, copied.first) << copied.second;
+  EXPECT_NE(std::string::npos, copied.second.find("transferred=0 reused="));
+  startFollower(); ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+}
 
-
-
+TEST_F(ReplicationFollowerTest, pullReportsIncarnationChangeDuringTransfer) {
+  startSource();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_EQ(0, pull().first);
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
+  bool recreate = true;
+  Signal::listen("replicationDownloadStart", [&](void*, void*, void*) -> void* {
+    if (std::exchange(recreate, false)) { source->deleteCollection("main"); source->createCollection(nullptr, "main"); }
+    return nullptr;
+  });
+  auto interrupted = pull();
+  EXPECT_NE(0, interrupted.first);
+  EXPECT_NE(std::string::npos, interrupted.second.find("source incarnation changed"));
+  EXPECT_EQ(0, pull().first);
+}
 
 }

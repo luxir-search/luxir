@@ -256,3 +256,24 @@ backs off normally. Set enough headroom for the serving snapshot plus changed
 files; pinned/old readers may delay reclamation. A fixed limit can deliberately
 prevent an oversized snapshot from ever installing until the limit or data is
 changed.
+
+Copy every current collection, including empty/schema-only collections, without
+starting a server:
+
+```sh
+luxir pull http://writer:9400 /data/seed
+# Continue following from the copy:
+luxir --replicate-from http://writer:9400 --store.backend=fs --store.data-dir=/data/seed
+# Or restore as an independent writer (stop any user of this directory first):
+luxir --promote --store.backend=fs --store.data-dir=/data/seed
+```
+
+Pull always writes FS storage; serving commands select FS explicitly because the
+normal default is RAM. Re-running pull against the same source reuses matching
+files, even across incarnations. A different-source binding or unrelated data is
+refused. Each collection line reports its commit and file bytes transferred and
+reused, followed by a summary; any failure returns a nonzero exit code. Successful
+collections remain installed if another fails. Pull captures catalog membership
+once and fetches each collection's latest snapshot when reached; this is not an
+atomic namespace-wide snapshot. Local collections absent from that catalog are
+retained. Pull does not join replica barriers or acknowledge serving traffic.

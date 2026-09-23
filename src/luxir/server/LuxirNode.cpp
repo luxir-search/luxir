@@ -64,7 +64,7 @@ void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
   shard->iw->setSchema(std::move(newSchema));
 }
 
-LuxirNode::LuxirNode(LuxirConfig config)
+LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   : config(std::move(config)) {
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers
@@ -80,7 +80,7 @@ LuxirNode::LuxirNode(LuxirConfig config)
   preWarmTimeZoneDatabase();
   createSingletons();
   searchEngine = std::make_unique<SearchEngine>(*this);
-  if (follower) follower->start();
+  if (follower && mode == Mode::SERVE) follower->start();
 }
 
 LuxirNode::~LuxirNode() {

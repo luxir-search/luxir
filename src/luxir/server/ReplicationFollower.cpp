@@ -637,7 +637,45 @@ struct ReplicationFollower::Impl {
     }
   }
 
-
+  bool pull(std::ostream& output) {
+    if (!threads.empty() || stopping.stop_requested()) throw std::logic_error("pull requires an unstarted follower");
+    Client client(source, stopping.get_token());
+    Catalog catalog;
+    try { catalog = fetchCatalog(client, {}, 0ms); }
+    catch (const std::exception& e) {
+      output << "Pull failed: " << binding.source << ": " << errorMessage(e) << '\n';
+      return false;
+    }
+    size_t installed = 0, failed = 0;
+    uint64_t transferred = 0, reused = 0;
+    for (const auto& [name, entry] : catalog.collections) {
+      auto& state = states[name];
+      if (!entry.commit.empty() && (state.source.empty() || CommitId::parse(entry.commit).incarnation != CommitId::parse(state.source).incarnation))
+        state.replaceEmpty = state.seenBoot == catalog.boot;
+      state.source = entry.commit;
+      state.seenBoot = catalog.boot; state.downloaded = state.reused = 0;
+      uint64_t downloaded = 0;
+      try {
+        if (entry.state == "unavailable") throw std::runtime_error("source collection unavailable");
+        for (unsigned attempt = 0;; attempt++) {
+          try { sync(client, name); break; }
+          catch (const ReservationGone&) { if (attempt == 2) throw; downloaded += state.downloaded; }
+        }
+        persistState();
+        if (state.serving != state.source) throw std::runtime_error("waiting for source data before replacing the local snapshot");
+        installed++;
+        output << name << ' ' << state.serving << " transferred=" << downloaded + state.downloaded << " reused=" << state.reused << '\n';
+      } catch (const std::exception& e) {
+        client.reset(); failed++;
+        output << name << ' ' << entry.commit << " transferred=" << downloaded + state.downloaded
+               << " reused=" << state.reused << " ERROR: " << errorMessage(e) << '\n';
+      }
+      transferred += downloaded + state.downloaded; reused += state.reused;
+      output.flush();
+    }
+    output << "Pull: " << installed << " installed, " << failed << " failed, transferred=" << transferred << " reused=" << reused << '\n';
+    return failed == 0;
+  }
 
   void worker() {
     Client client(source, stopping.get_token());
@@ -712,6 +750,7 @@ struct ReplicationFollower::Impl {
 
 ReplicationFollower::ReplicationFollower(LuxirNode& node) : impl(std::make_unique<Impl>(node)) {}
 ReplicationFollower::~ReplicationFollower() { stop(); }
+bool ReplicationFollower::pull(std::ostream& output) { return impl->pull(output); }
 void ReplicationFollower::start() {
   impl->threads.emplace_back([this] { impl->watch(); });
   for (int i = 0; i < impl->node.config.replication.downloads; i++) impl->threads.emplace_back([this] { impl->worker(); });
