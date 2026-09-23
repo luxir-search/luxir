@@ -53,6 +53,12 @@ Rough hierarchy:
 */
 
 
+void ReplicationConfig::validate() const {
+  if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
+    throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
+  }
+}
+
 void LuxirConfig::addOptions(CLI::App& app) {
   app.add_flag("--read-only", read_only,
                "Serve an existing data directory without the write lock; rejects all updates");
@@ -93,6 +99,14 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.stream_buffer_bytes", server.stream_buffer_bytes,
                  "Per-connection buffered response bytes before streaming producers pause")
       ->default_val(server.stream_buffer_bytes);
+
+  app.add_option("--replication.pin-idle-timeout-ms", replication.pin_idle_timeout_ms,
+                 "Replication reservation idle timeout in milliseconds")->default_val(replication.pin_idle_timeout_ms);
+  app.add_option("--replication.pin-retained-bytes", replication.pin_retained_bytes,
+                 "Per-collection bytes retained only by reservations")->transform(CLI::AsSizeValue(false))
+      ->default_val(replication.pin_retained_bytes);
+  app.add_option("--replication.follower-timeout-ms", replication.follower_timeout_ms,
+                 "Follower liveness in milliseconds (watch timeout at most one third)")->default_val(replication.follower_timeout_ms);
 
   app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
       ->default_val(store.backend)
@@ -185,6 +199,7 @@ void LuxirConfig::resolveRamBudgets() {
 }
 
 void LuxirConfig::normalize() {
+  replication.validate();
   resolveRamBudgets();
 
   // Only an explicitly set share can exceed the node budget; a derived one is

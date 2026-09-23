@@ -55,7 +55,7 @@ private:
   static void fillResult(ProtoUpdateMessage& msg, IndexResult& out) {
     auto* rsp = msg.finishResponse();
     out.updateVersion = rsp->update_version;
-    if (rsp->commit) out.commit = CommitId{std::string(rsp->commit->incarnation), rsp->commit->index_gen};
+    if (!rsp->commit.empty()) out.commit = CommitId::parse(rsp->commit);
     out.status = rsp->status;
     out.error_message.clear();
     out.error_code.clear();

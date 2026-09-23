@@ -486,7 +486,7 @@ public:
   virtual std::string_view read() = 0;
 
   // Advisory asynchronous readahead; memory-backed inputs need no work.
-  virtual void prefetch(size_t offset, size_t length) { (void)offset; (void)length; }
+  virtual void prefetch(size_t offset, size_t length) {}
 
   virtual InputStream getInputStream() = 0;
 

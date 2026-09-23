@@ -11,6 +11,13 @@
 
 namespace luxir {
 
+struct ReplicationConfig {
+  int64_t pin_idle_timeout_ms = 60'000;
+  uint64_t pin_retained_bytes = 1024ULL * 1024 * 1024;
+  int64_t follower_timeout_ms = 90'000;
+  void validate() const;
+};
+
 struct ServerConfig {
   // Cap on buffered (rendered/serialized) response bytes, per HTTP connection
   // and per gRPC call (an HTTP/2 connection can multiplex several calls, each
@@ -138,6 +145,7 @@ struct SearchConfig {
 };
 
 struct LuxirConfig {
+  ReplicationConfig replication;
   // Serve an existing data directory without owning it: the write lock is not taken,
   // nothing is written, and every mutating request is rejected.  Lets a second process
   // query a directory another instance is writing.  The view is the commit that was

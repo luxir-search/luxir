@@ -65,6 +65,9 @@ state, and commits are crash-safe on immutable segments.
     budgets, read-only nodes, and the current security and availability
     boundary.
 
+15. [Replication source API](guide/replication.md) - discovery, reserved snapshots,
+    resumable file downloads, and follower acknowledgments.
+
 ## Reference
 
 - [Protobuf API reference](reference/protobuf.md) - messages, fields, enums,

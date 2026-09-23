@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/server/ReplicationCatalog.h"
 #include "HttpServer.h"
 
 #include <cassert>
@@ -53,6 +54,8 @@
 #include "ProtoUpdateMessage.h"
 #include "Stats.h"
 #include "luxir/util/thread.h"
+#include "luxir/util/Signal.h"
+#include "luxir/store/Manifest.h"
 #include "luxir/util/ApiError.h"
 
 namespace luxir {
@@ -61,6 +64,33 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
+
+// A deadline covers only an outstanding socket write, not request processing or
+// a parked watch/floor. Every response path uses this stream.
+class HttpStream : public beast::tcp_stream {
+  std::chrono::milliseconds writeIdleTimeout{60'000};
+public:
+  explicit HttpStream(tcp::socket socket) : beast::tcp_stream(std::move(socket)) {
+    Signal::emit("httpWriteIdleTimeout", &writeIdleTimeout);
+  }
+  template<class Buffers, class Handler>
+  auto async_read_some(const Buffers& buffers, Handler&& handler) {
+    // expires_after also sets the next read deadline when no read is pending.
+    // Clear that inherited deadline without changing an outstanding write.
+    expires_never();
+    return beast::tcp_stream::async_read_some(buffers, std::forward<Handler>(handler));
+  }
+  template<class Buffers, class Handler>
+  auto async_write_some(const Buffers& buffers, Handler&& handler) {
+    expires_after(writeIdleTimeout);
+    return beast::tcp_stream::async_write_some(buffers,
+        [this, handler = std::forward<Handler>(handler)](beast::error_code ec, size_t bytes) mutable {
+          expires_never();
+          if (ec == beast::error::timeout) Signal::emit("httpWriteTimedOut");
+          handler(ec, bytes);
+        });
+  }
+};
 
 class HttpSession;
 
@@ -95,10 +125,11 @@ struct ShardPin {
 };
 
 // The HTTP status for a classified failure: the error's kind decides, except
-// for two conditions with an HTTP idiom of their own.
+// for conditions with an HTTP idiom of their own.
 static http::status httpStatusFor(const ErrorInfo& info) {
   if (info.code == "method_not_allowed") return http::status::method_not_allowed;
   if (info.code == "request_too_large") return http::status::payload_too_large;
+  if (info.code == "snapshot_expired") return http::status::gone;
   switch (info.kind) {
     case ErrorKind::INVALID_REQUEST: return http::status::bad_request;
     case ErrorKind::NOT_FOUND: return http::status::not_found;
@@ -371,6 +402,8 @@ public:
   void closeFromServer() {
     net::post(stream_.get_executor(), [self = shared_from_this()] {
       beast::error_code ec;
+      self->replicationStopped_ = true;
+      self->cancelReplicationWatch();
       self->stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
       self->stream_.socket().close(ec);
     });
@@ -499,7 +532,8 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, HEALTH, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA
+    NONE, HEALTH, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
+    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED
   };
 
   struct RouteMatch {
@@ -507,6 +541,7 @@ private:
     std::string_view allow;  // the methods the path accepts, as an Allow header value
     std::string_view hint;   // appended to a 405 message when the verb choice needs teaching
     std::string coll;
+    std::string file;
     // /collections//{endpoint}: a collection route whose {c} segment is empty.  That
     // is a malformed URL, not a request for the default collection (which is the
     // omitted body field), so dispatch rejects it before any handler resolves it.
@@ -518,12 +553,30 @@ private:
     uint8_t indentation_width = 2;
   };
 
+  struct ReplicationTransfer {
+    std::shared_ptr<Collection> collection;
+    std::shared_ptr<InputFile> file;
+    CommitSnapshot::Bytes manifest;
+    std::string rendered;
+    std::stop_token cancellation;
+    std::optional<std::stop_callback<std::function<void()>>> onDrop;
+    std::chrono::steady_clock::time_point nextTouch{};
+    bool head = false;
+    bool json = false;
+    CommitId id;
+    std::string_view data;
+    size_t offset = 0;
+    size_t end = 0;
+    http::response<http::empty_body> response;
+    std::optional<http::response_serializer<http::empty_body>> serializer;
+  };
+
   struct Pending { std::string line; bool last; };
 
   // The last session ref can drop on a task-arena thread after shutdown has
   // joined. Declared first so the shard is destroyed after stream_.
   std::shared_ptr<HttpIoShard> shard_;
-  beast::tcp_stream stream_;
+  HttpStream stream_;
   LuxirNode& node_;
   std::shared_ptr<HttpSessionRegistry> registry_;
   std::function<void()> deregister_;  // removes this session from the registry
@@ -532,6 +585,11 @@ private:
   std::array<char, 64 * 1024> bodyBuf_{};
   std::string bufferedBody_;
   std::shared_ptr<HttpStreamUpdateState> streamUpdate_;
+  std::optional<net::steady_timer> replicationTimer_;
+  uint64_t replicationWatch_ = 0;
+  uint64_t replicationWatchEpoch_ = 0;
+  uint64_t replicationTransferEpoch_ = 0;
+  bool replicationStopped_ = false;
 
   // Carried from the request for the (later, async) streaming response.
   unsigned httpVersion_ = 11;
@@ -600,7 +658,7 @@ private:
           auto* resp = finishResponse();
           result_.status = resp->status;
           result_.updateVersion = resp->update_version;
-          if (resp->commit) result_.commit = CommitId{std::string(resp->commit->incarnation), resp->commit->index_gen};
+          if (!resp->commit.empty()) result_.commit = CommitId::parse(resp->commit);
           if (resp->error) result_.error = luxir::api::build::errorInfo(*resp->error);
           result_.ids.reserve(resp->ids.size());
           for (std::string_view id : resp->ids) result_.ids.emplace_back(id);
@@ -1153,6 +1211,21 @@ private:
       m.route = Route::SCHEMA; m.allow = "GET, POST"; m.prettyDefault = true;
       m.hint = "schema writes are POST (mode=set adds or replaces the named definitions, "
                "mode=replace_all replaces the whole schema)";
+    } else if (target.starts_with("/_replication/")) {
+      auto path = target.substr(14);
+      if (path == "status") { m.route = Route::REPLICATION_STATUS; m.allow = "GET"; }
+      else if (path == "watch") { m.route = Route::REPLICATION_WATCH; m.allow = "GET"; }
+      else if (path == "installed") { m.route = Route::REPLICATION_INSTALLED; m.allow = "POST"; }
+      else if (auto slash = path.find('/'); slash != std::string_view::npos) {
+        m.coll = path.substr(0, slash);
+        auto endpoint = path.substr(slash + 1);
+        if (endpoint == "snapshot") { m.route = Route::REPLICATION_SNAPSHOT; m.allow = "GET, HEAD"; }
+        else if (endpoint.starts_with("file/") && endpoint.size() > 5) {
+          m.route = Route::REPLICATION_FILE; m.allow = "GET, HEAD"; m.file = endpoint.substr(5);
+        }
+        m.emptyCollection = m.coll.empty();
+      }
+      return m;
     }
     bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE ||
                            m.route == Route::STATS || m.route == Route::SCHEMA;
@@ -1200,6 +1273,27 @@ private:
 
     const std::string& coll = match.coll;
     switch (match.route) {
+      case Route::REPLICATION_STATUS: {
+        std::pmr::monotonic_buffer_resource arena;
+        api::ReplicationStatus status;
+        auto followers = node_.getReplication().stats(node_);
+        auto* rows = api::build::allocArray(status.followers, followers.size(), arena);
+        for (size_t i = 0; i < followers.size(); i++) {
+          const auto& src = followers[i];
+          rows[i] = {api::build::arenaStr(arena, src.follower), api::build::arenaStr(arena, src.collection),
+              api::build::arenaStr(arena, src.commit.index_gen ? src.commit.token() : ""), src.lastSeen, src.lag};
+        }
+        std::string body;
+        api::write_json(status, body);
+        respondJson(http::status::ok, std::move(body));
+        return;
+      }
+      case Route::REPLICATION_WATCH: handleReplicationWatch(); break;
+      case Route::REPLICATION_SNAPSHOT: handleReplicationFile(coll, {}, {}, req.method() == http::verb::head); break;
+      case Route::REPLICATION_FILE:
+        handleReplicationFile(coll, match.file, req.count(http::field::range) == 1 ? std::string(req[http::field::range]) : std::string(),
+                              req.method() == http::verb::head); break;
+      case Route::REPLICATION_INSTALLED: handleReplicationInstalled(std::move(req.body())); break;
       case Route::HEALTH:
         respondJson(http::status::ok, R"({"status":"ok"})");
         break;
@@ -1681,6 +1775,221 @@ private:
     else respondJson(http::status::ok, std::move(out));
   }
 
+  static uint64_t replicationNumber(std::string_view text) {
+    uint64_t result = 0;
+    auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result);
+    if (text.empty() || error != std::errc() || end != text.data() + text.size()) {
+      throw std::invalid_argument("expected an unsigned decimal integer");
+    }
+    return result;
+  }
+
+  void cancelReplicationWatch() {
+    node_.getReplication().cancel(replicationWatch_);
+    replicationWatch_ = 0;
+    if (replicationTimer_) replicationTimer_->cancel();
+  }
+
+  void finishReplicationWatch(uint64_t epoch) {
+    if (!replicationTimer_ || epoch != replicationWatchEpoch_) return;
+    cancelReplicationWatch();
+    replicationTimer_.reset();
+    if (replicationStopped_) return;
+    try { respondJson(http::status::ok, node_.getReplication().catalog(node_)); }
+    catch (const std::exception& e) { respondException(e, ErrorKind::INTERNAL); }
+  }
+
+  void handleReplicationWatch() {
+    try {
+      // Complete watches well inside liveness, even with differently configured peers.
+      auto maximum = node_.getConfig().replication.follower_timeout_ms / 3;
+      uint64_t timeout = (uint64_t)maximum;
+      std::string cursor, follower;
+      if (auto value = findParam(urlParams_, "since")) cursor = *value;
+      if (auto value = findParam(urlParams_, "follower")) follower = *value;
+      if (auto value = findParam(urlParams_, "timeout_ms")) timeout = replicationNumber(*value);
+      timeout = std::min(timeout, (uint64_t)maximum);
+      auto epoch = ++replicationWatchEpoch_;
+      replicationTimer_.emplace(stream_.get_executor());
+      replicationTimer_->expires_after(std::chrono::milliseconds(timeout));
+      // A notification swapped out of the catalog can race cancel. Its work
+      // guard keeps the executor alive, and queued completions own only a weak
+      // session so they cannot strand a session on a stopped context.
+      auto pin = makeShardPin();
+      replicationWatch_ = node_.getReplication().watch(cursor, follower,
+          [weak = weak_from_this(), executor = stream_.get_executor(), pin, epoch] {
+            net::post(executor, [weak, pin, epoch] {
+              if (auto session = weak.lock()) session->finishReplicationWatch(epoch);
+            });
+          });
+      replicationTimer_->async_wait([self = shared_from_this(), epoch](beast::error_code ec) {
+        if (!ec) self->finishReplicationWatch(epoch);
+      });
+      if (replicationWatch_) Signal::emit("replicationWatchParked", this);
+    } catch (const std::exception& e) {
+      cancelReplicationWatch();
+      replicationTimer_.reset();
+      respondException(e, ErrorKind::INVALID_REQUEST);
+    }
+  }
+
+  void handleReplicationInstalled(std::string body) {
+    try {
+      node_.getReplication().installed(node_, body);
+      respondJson(http::status::ok, R"({"installed":true})");
+    } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); }
+  }
+
+  void abortReplicationTransfer(uint64_t epoch) {
+    if (epoch != replicationTransferEpoch_) return;
+    replicationStopped_ = true;
+    Signal::emit("replicationTransferAborted");
+    beast::error_code ec;
+    stream_.socket().close(ec);
+  }
+
+  void writeReplicationBody(const std::shared_ptr<ReplicationTransfer>& transfer) {
+    if (replicationStopped_) return;
+    if (transfer->cancellation.stop_requested()) { abortReplicationTransfer(replicationTransferEpoch_); return; }
+    if (transfer->head || transfer->offset == transfer->end) {
+      transfer->onDrop.reset();
+      ++replicationTransferEpoch_;
+      finishResponse();
+      return;
+    }
+    size_t length = std::min((size_t)256 * 1024, transfer->end - transfer->offset);
+    if (transfer->file) transfer->file->prefetch(transfer->offset, 4 * length);
+    stream_.async_write_some(net::buffer(transfer->data.data() + transfer->offset, length),
+        [self = shared_from_this(), transfer](beast::error_code ec, size_t bytes) {
+          if (ec) { self->abortReplicationTransfer(self->replicationTransferEpoch_); self->doClose(); return; }
+          transfer->offset += bytes;
+          auto time = std::chrono::steady_clock::now();
+          if (transfer->file && bytes && time >= transfer->nextTouch) {
+            if (!transfer->collection->getShard()->getSnapshots().touch(transfer->id, bytes)) {
+              self->abortReplicationTransfer(self->replicationTransferEpoch_);
+              return;
+            }
+            auto interval = std::min((int64_t)1000, self->node_.getConfig().replication.pin_idle_timeout_ms / 2);
+            transfer->nextTouch = time + std::chrono::milliseconds(interval);
+          }
+          self->writeReplicationBody(transfer);
+        });
+  }
+
+  // Malformed/unsupported ranges are ignored. Syntactically valid ranges that
+  // select no bytes get 416. Saturating decimal parsing handles huge endpoints.
+  static http::status replicationRange(std::string_view range, ReplicationTransfer& transfer) {
+    if (!range.starts_with("bytes=")) return http::status::ok;
+    range.remove_prefix(6);
+    auto dash = range.find('-');
+    if (dash == std::string_view::npos) return http::status::ok;
+    auto first = range.substr(0, dash), last = range.substr(dash + 1);
+    auto number = [](std::string_view value, uint64_t& result) {
+      result = 0;
+      if (value.empty()) return false;
+      for (char c : value) {
+        if (c < '0' || c > '9') return false;
+        auto digit = (uint64_t)(c - '0');
+        result = result > (UINT64_MAX - digit) / 10 ? UINT64_MAX : result * 10 + digit;
+      }
+      return true;
+    };
+    uint64_t start = 0, end = UINT64_MAX;
+    if (first.empty()) {
+      if (!number(last, end)) return http::status::ok;
+      if (!end || !transfer.end) return http::status::range_not_satisfiable;
+      transfer.offset = transfer.end - std::min((uint64_t)transfer.end, end);
+    } else {
+      if (!number(first, start) || (!last.empty() && !number(last, end)) || end < start) return http::status::ok;
+      if (start >= transfer.end) return http::status::range_not_satisfiable;
+      transfer.offset = (size_t)start;
+      if (end < transfer.end) transfer.end = (size_t)end + 1;
+    }
+    return http::status::partial_content;
+  }
+
+  void handleReplicationFile(const std::string& coll, const std::string& name, std::string range, bool head) {
+    CommitId id;
+    bool json = false;
+    try {
+      if (!head) if (auto follower = findParam(urlParams_, "follower")) node_.getReplication().seen(*follower);
+      if (!name.empty()) {
+        auto token = findParam(urlParams_, "commit");
+        id = CommitId::parse(token ? *token : "");
+      } else if (auto format = findParam(urlParams_, "format")) {
+        if (*format != "json") throw std::invalid_argument("snapshot format must be json");
+        json = true;
+      }
+    } catch (const std::exception& e) { respondError(classifyException(e, ErrorKind::INVALID_REQUEST), requestId_, head); return; }
+    auto shardPin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), coll, name, id, range, head, json, shardPin] {
+      auto transfer = std::make_shared<ReplicationTransfer>();
+      transfer->head = head;
+      transfer->json = json;
+      std::optional<ErrorInfo> failure;
+      http::status status = http::status::ok;
+      try {
+        transfer->collection = self->node_.getCollection(coll);
+        auto& snapshots = transfer->collection->getShard()->getSnapshots();
+        if (name.empty()) {
+          auto snapshot = head ? snapshots.snapshot() : snapshots.acquire(&transfer->cancellation);
+          transfer->manifest = snapshot->bytes;
+          transfer->id = snapshot->id;
+          if (json) {
+            std::pmr::monotonic_buffer_resource arena;
+            auto info = Manifest::decode(snapshot->bytes, arena);
+            if (!api::write_json(info, transfer->rendered)) throw std::runtime_error("cannot render snapshot JSON");
+            transfer->data = transfer->rendered;
+          } else transfer->data = {(const char*)snapshot->bytes->data(), snapshot->bytes->size()};
+        } else {
+          transfer->id = id;
+          transfer->file = snapshots.openFile(id, name, &transfer->cancellation);
+          transfer->data = transfer->file->read();
+          Signal::emit("replicationFileOpened", &transfer->file);
+        }
+        transfer->end = transfer->data.size();
+        if (!head && !range.empty() && !name.empty()) status = replicationRange(range, *transfer);
+      } catch (...) { failure = currentExceptionInfo(ErrorKind::INTERNAL); }
+      net::post(self->stream_.get_executor(), [self, transfer, failure, status, shardPin] {
+        if (self->replicationStopped_) return;
+        if (failure) { self->respondError(*failure, self->requestId_, transfer->head); return; }
+        if (transfer->cancellation.stop_requested()) { self->respondError(classifyException(SnapshotExpiredError(), ErrorKind::NOT_FOUND), self->requestId_, transfer->head); return; }
+        auto epoch = ++self->replicationTransferEpoch_;
+        transfer->onDrop.emplace(transfer->cancellation,
+            [weak = self->weak_from_this(), executor = self->stream_.get_executor(), shardPin, epoch]() noexcept {
+              try {
+                net::post(executor, [weak, shardPin, epoch] {
+                  if (auto session = weak.lock()) session->abortReplicationTransfer(epoch);
+                });
+              } catch (...) {
+                LOG_WARN("Replication transfer cancellation post failed");
+              }
+            });
+        auto& response = transfer->response;
+        response.version(self->httpVersion_);
+        response.result(status);
+        response.keep_alive(self->keepAlive_);
+        response.set(http::field::content_type, transfer->json ? "application/json" : "application/octet-stream");
+        response.set("X-Luxir-Commit", transfer->id.token());
+        response.set(http::field::accept_ranges, "bytes");
+        if (status == http::status::range_not_satisfiable) {
+          response.set(http::field::content_range, "bytes */" + std::to_string(transfer->data.size()));
+          transfer->offset = transfer->end = 0;
+        } else if (status == http::status::partial_content) {
+          response.set(http::field::content_range, "bytes " + std::to_string(transfer->offset) + "-" +
+              std::to_string(transfer->end - 1) + "/" + std::to_string(transfer->data.size()));
+        }
+        response.content_length(transfer->end - transfer->offset);
+        transfer->serializer.emplace(response);
+        http::async_write_header(self->stream_, *transfer->serializer,
+            [self, transfer](beast::error_code ec, size_t) {
+              if (ec) self->doClose();
+              else self->writeReplicationBody(transfer);
+            });
+      });
+    });
+  }
+
   void handleStats(std::optional<std::string> coll, bool includeSegments) {
     auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue(
@@ -2107,8 +2416,7 @@ private:
     luxir::api::UpdateResponse resp;
     resp.request_id = luxir::api::build::arenaStr(responseResource, requestId);
     resp.update_version = interval.lastUpdateVersion;
-    if (interval.commit) resp.commit = api::CommitId{
-        api::build::arenaStr(responseResource, interval.commit->incarnation), interval.commit->index_gen};
+    if (interval.commit) resp.commit = api::build::arenaStr(responseResource, interval.commit->token());
 
     luxir::api::build::SpanBuilder<std::string_view> ids(responseResource);
     ids.reserve(interval.ids.size());
@@ -2949,32 +3257,35 @@ private:
     respondSimple(status, "application/json", finishJson(std::move(compact)));
   }
 
-  void respondSimple(http::status status, std::string_view contentType, std::string body) {
+  void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false) {
     auto resp = std::make_shared<http::response<http::string_body>>(status, httpVersion_);
     resp->set(http::field::server, "luxir");
     resp->set(http::field::content_type, contentType);
     resp->keep_alive(keepAlive_);
     resp->body() = std::move(body);
     resp->prepare_payload();
-    http::async_write(stream_, *resp,
-        [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
-          if (ec) {
-            if (self->terminalStreamingFailure_) self->doTerminalStreamingClose();
-            else self->doClose();
-            return;
-          }
-          if (resp->keep_alive()) self->doRead();
-          else if (self->terminalStreamingFailure_) self->doTerminalStreamingClose();
-          else self->doClose();
-        });
+    auto done = [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
+      if (ec) {
+        if (self->terminalStreamingFailure_) self->doTerminalStreamingClose();
+        else self->doClose();
+        return;
+      }
+      if (resp->keep_alive()) self->doRead();
+      else if (self->terminalStreamingFailure_) self->doTerminalStreamingClose();
+      else self->doClose();
+    };
+    if (head) {
+      auto serializer = std::make_shared<http::response_serializer<http::string_body>>(*resp);
+      http::async_write_header(stream_, *serializer, [serializer, done](beast::error_code ec, size_t bytes) { done(ec, bytes); });
+    } else http::async_write(stream_, *resp, std::move(done));
   }
 
   // Every failure answered with an HTTP error status: the status follows the
   // error's kind (httpStatusFor); the body is the same {request_id, error}
   // object an in-band error line carries.
   void respondError(const ErrorInfo& info) { respondError(info, requestId_); }
-  void respondError(const ErrorInfo& info, std::string_view requestId) {
-    respondJson(httpStatusFor(info), renderErrorBody(info, requestId));
+  void respondError(const ErrorInfo& info, std::string_view requestId, bool head = false) {
+    respondSimple(httpStatusFor(info), "application/json", finishJson(renderErrorBody(info, requestId)), head);
   }
   // An unread body cannot be reused as the next request. Answer, then close.
   void respondBeforeBodyError(const ErrorInfo& info) {
@@ -2999,6 +3310,8 @@ private:
   }
 
   void doClose() {
+    replicationStopped_ = true;
+    cancelReplicationWatch();
     beast::error_code ec;
     stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
   }
@@ -3202,6 +3515,8 @@ void HttpServer::start() {
   port_ = acceptor->local_endpoint().port();
 
   doAccept();
+  replicationTimer.emplace(acceptIoc);
+  armReplicationExpiry();
 
   // Shard threads spawn on first connection assignment. Shard 0 stays warm
   // after that first use; other shards exit after their independent idle
@@ -3212,6 +3527,27 @@ void HttpServer::start() {
   });
   started = true;
   LOG_INFO("HTTP server listening on {}:{}", host, port_);
+}
+
+void HttpServer::armReplicationExpiry() {
+  if (shutdownRequested.load(std::memory_order_acquire)) return;
+  replicationTimer->expires_after(std::chrono::milliseconds(std::min(node.getConfig().replication.pin_idle_timeout_ms,
+      node.getConfig().replication.follower_timeout_ms) / 2));
+  replicationTimer->async_wait([this](beast::error_code ec) {
+    if (ec || shutdownRequested.load(std::memory_order_acquire)) return;
+    // The guard joins this arena task before the accept context can exit.
+    auto guard = net::make_work_guard(acceptIoc);
+    node.getTaskArena().enqueue([this, guard = std::move(guard)] {
+      try {
+        for (const auto& entry : node.collectionEntries()) {
+          if (entry.error.empty()) entry.collection->getShard()->getSnapshots().expire();
+        }
+        node.getReplication().expire();
+        Signal::emit("replicationExpiryTick");
+      } catch (const std::exception& e) { LOG_WARN("Replication expiry failed: {}", e.what()); }
+      net::post(acceptIoc, [this, guard] { armReplicationExpiry(); });
+    });
+  });
 }
 
 void HttpServer::armShardIdle(std::size_t idx) {
@@ -3352,6 +3688,7 @@ void HttpServer::shutdown() {
   if (acceptor) {
     net::post(acceptor->get_executor(), [this] {
       beast::error_code ec;
+      if (replicationTimer) replicationTimer->cancel();
       if (acceptor) acceptor->close(ec);
     });
   }
@@ -3361,6 +3698,7 @@ void HttpServer::shutdown() {
   //    until they finish (and release their response arenas).
   for (auto& s : live) s->closeFromServer();
   live.clear();
+  Signal::emit("httpSessionsClosing", this);
 
   // The accept loop must be quiescent before shutdown releases shard 0's floor
   // guard or joins workers: a successful accept racing the close can still
@@ -3397,6 +3735,7 @@ void HttpServer::shutdown() {
   // The acceptor and registry may only be released after every executor that
   // references them has drained. Sessions can briefly outlive this point on an
   // arena thread; they co-own the registry and shard they need for destruction.
+  replicationTimer.reset();
   acceptor.reset();
   registry.reset();
   shards.clear();

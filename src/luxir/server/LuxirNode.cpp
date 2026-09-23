@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/server/ReplicationCatalog.h"
 #include "LuxirNode.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/InputStream.h"
@@ -10,6 +11,7 @@
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/DateTime.h"
+#include "luxir/util/Signal.h"
 
 #include <algorithm>
 #include <exception>
@@ -64,6 +66,10 @@ LuxirNode::LuxirNode(LuxirConfig config)
   // normalize(), so resolve the RAM sentinels here too - before the writers
   // created by createSingletons() take a pointer to the budget.
   this->config.resolveRamBudgets();
+  auto& replicationConfig = this->config.replication;
+  replicationConfig.validate();
+  replication = std::make_shared<ReplicationCatalog>(std::chrono::milliseconds(
+      replicationConfig.follower_timeout_ms));
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
   createSingletons();
@@ -130,17 +136,20 @@ std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(Library* library, s
   std::string collectionName(name);
   validateCollectionName(collectionName);
 
+  bool createdHere = false;
   auto collection = targetLibrary->collections.getOrCreate(collectionName, [&]() -> std::shared_ptr<Collection> {
     if (!config.ingest.auto_create_collection) {
       return nullptr;
     }
     auto created = initCollection(collectionName);
+    createdHere = true;
     LOG_INFO("Created collection: {}", collectionName);
     return created;
   });
   if (!collection) {
     throw CollectionNotFoundError("collection '" + collectionName + "' does not exist");
   }
+  if (createdHere) replication->changed();
   return checkLoaded(std::move(collection));
 }
 
@@ -161,6 +170,15 @@ std::vector<LuxirNode::CollectionEntry> LuxirNode::collectionEntries() {
   std::sort(entries.begin(), entries.end(),
             [](const CollectionEntry& a, const CollectionEntry& b) { return a.name < b.name; });
   return entries;
+}
+
+std::map<std::string, CommitId> LuxirNode::replicationCollections() {
+  std::map<std::string, CommitId> result;
+  for (const auto& entry : collectionEntries()) {
+    if (!entry.error.empty()) continue;
+    if (auto snapshot = entry.collection->getShard()->getSnapshots().snapshot()) result.emplace(entry.name, snapshot->id);
+  }
+  return result;
 }
 
 std::shared_ptr<Collection> LuxirNode::createCollection(
@@ -213,6 +231,7 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
   if (!createdHere) {
     throw CollectionExistsError("collection '" + collectionName + "' already exists");
   }
+  replication->changed();
   return collection;
 }
 
@@ -267,6 +286,7 @@ void LuxirNode::deleteCollection(std::string_view name) {
     throw;
   }
 
+  replication->remove(collectionName);
   if (!root->collections.erase(collectionName, tombstone)) {
     throw std::runtime_error(
         "collection '" + collectionName + "' tombstone disappeared during deletion");
@@ -284,14 +304,20 @@ std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name, s
       FilterCacheConfig{.maxBytes = config.queryCacheBytes});
   if (config.read_only) {
     col->shard->snapshots->openLocalSnapshot();
-    return col;
+  } else {
+    col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
+      std::move(initialSchema), &indexRamBudget,
+      config.index.merge_factor);
+    col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
+    col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
   }
-  col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
-    std::move(initialSchema), &indexRamBudget,
-    config.index.merge_factor);
-  col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
-  col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
-
+  auto& snapshots = *col->shard->snapshots;
+  const auto& policy = config.replication;
+  snapshots.setPolicy({std::chrono::milliseconds(policy.pin_idle_timeout_ms), policy.pin_retained_bytes});
+  snapshots.onPublish = [catalog = replication, name](const CommitSnapshot& snapshot) noexcept {
+    catalog->changed(name, snapshot.id.incarnation);
+  };
+  Signal::emit("collectionInitialized", col.get());
   return col;
 }
 
@@ -326,6 +352,7 @@ void LuxirNode::createSingletons() {
       root->collections.getOrCreate(name, [&]() {
         return initCollection(name);
       });
+      replication->changed();
       LOG_INFO("Loaded collection: {}", name);
     } catch (const std::exception& e) {
       // Keep the node up: register a tombstone so the name resolves to a clear

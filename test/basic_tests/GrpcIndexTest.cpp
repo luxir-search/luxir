@@ -167,12 +167,12 @@ public:
     ASSERT_EQ(luxir::api::UpdateResponse_::Status::OK, response.msg.status);
     ASSERT_EQ(std::to_string(docnum), idString(response.msg.request_id));
     ASSERT_GT(response.msg.update_version, 0u);
-    ASSERT_EQ(commit, response.msg.commit.has_value());
+    ASSERT_EQ(commit, !response.msg.commit.empty());
     if (commit) {
       auto snapshot = test::readDurableIndexInfo(*LuxirTest::luxirNode->getCollection("main")->getShard()->getDirectory());
-      EXPECT_GT(response.msg.commit->index_gen, 0u);
-      EXPECT_LE(response.msg.commit->index_gen, snapshot->index_gen);
-      EXPECT_EQ(response.msg.commit->incarnation, snapshot->incarnation);
+      EXPECT_GT(CommitId::parse(response.msg.commit).index_gen, 0u);
+      EXPECT_LE(CommitId::parse(response.msg.commit).index_gen, snapshot->index_gen);
+      EXPECT_EQ(CommitId::parse(response.msg.commit).incarnation, snapshot->incarnation);
     }
   }
 

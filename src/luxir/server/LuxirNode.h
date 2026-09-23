@@ -33,6 +33,7 @@ class SearchEngine;
 class Library;
 class Collection;
 class LuxirNode;
+class ReplicationCatalog;
 
 // Resolving a request's collection target failed.  The concrete subclasses fix
 // the classification; the base is thrown directly only for internal invariants
@@ -171,7 +172,9 @@ private:
 
 
 class LuxirNode {
+  std::shared_ptr<ReplicationCatalog> replication;
 public:
+  ReplicationCatalog& getReplication() { return *replication; }
   static constexpr std::string_view kDefaultCollectionName = "main";
 
   struct CollectionEntry {
@@ -204,6 +207,7 @@ public:
   // Snapshot fully-created root collections without waiting for creations in
   // flight. Unavailable tombstones retain their recorded error.
   std::vector<CollectionEntry> collectionEntries();
+  std::map<std::string, CommitId> replicationCollections();
 
   std::shared_ptr<Collection> getCollection(Library* library, std::string_view name);
   std::shared_ptr<Collection> getOrCreateCollection(Library* library, std::string_view name);

@@ -189,11 +189,12 @@ release revokes that reservation for all of them. `snapshot_pins`, `pin_retained
 `pin_budget_drops` report reservation state and policy drops. Retained bytes
 count unique files whose only remaining owners are pins; current-snapshot
 files and files still owned by indexing or merges do not count. The oldest
-reservations are revoked first when the budget is exceeded. Only actual bytes
-read refresh idle activity. Expiry is lazy on acquire, touch, file open, retirement,
-and stats. A fully idle collection can retain abandoned reservations until the
-next activity, bounded by the retained-bytes budget. An already-open transfer
-can finish after revocation.
+reservations are revoked first when the budget is exceeded. Snapshot acquisition renews the reservation; file transfers renew on byte
+progress, at most once per second. A node-wide HTTP server timer checks expiry
+every half idle-timeout on the task arena. Acquire, file open, retirement and
+stats also check expiry; touch only updates the timestamp. Revocation aborts open
+transfers, and each socket write has an idle deadline. Without an HTTP server,
+internal reservations expire on activity. See [replication settings](replication.md).
 Reservations are process-local; writer startup removes leftover unreferenced
 index files using the directory listing, without reading their contents. If
 startup falls back below the highest manifest generation, it logs an error and
@@ -204,7 +205,7 @@ newest durable manifest does not reference them. Failed publication candidates
 are removed and the directory is synced best-effort. An error response does not
 guarantee that the commit is absent: a crash or cleanup failure can leave a
 complete, unacknowledged candidate recoverable at startup. The local filename is not part
-of the commit identity: clients use `(incarnation, index_gen)`.
+of the commit identity: clients use the `incarnation:index_gen` token.
 
 Set log verbosity with:
 
@@ -365,3 +366,8 @@ None of these can be enabled by configuration. The pieces those layers will
 build on are already in place: immutable commits, isolated collections,
 transport-independent request messages, and a node-wide scheduler and memory
 model.
+
+Startup orphan cleanup is skipped when root selection falls back from a torn
+newest manifest. A later durable publication removes the invalid roots; the
+next restart then reclaims remaining orphans. Cleanup is shared by snapshot
+owners, so installers can use the same rules.

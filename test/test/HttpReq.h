@@ -43,8 +43,10 @@ httpRequest(int port, http::verb method, std::string_view target, std::string bo
   http::write(stream, req);
 
   beast::flat_buffer buffer;
-  http::response<http::string_body> res;
-  http::read(stream, buffer, res);
+  http::response_parser<http::string_body> parser;
+  parser.skip(method == http::verb::head);
+  http::read(stream, buffer, parser);
+  auto res = parser.release();
 
   beast::error_code ec;
   stream.socket().shutdown(tcp::socket::shutdown_both, ec);

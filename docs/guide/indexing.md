@@ -157,8 +157,8 @@ Commit whichever way fits:
 
 An empty commit object commits immediately and the response waits for
 publication. The response's optional `commit` field identifies the resulting
-snapshot as `{"incarnation":"<collection UUID>","index_gen":42}`. Both values
-are required: deleting and recreating a collection changes its incarnation. Updates acknowledged before publication
+snapshot as the token `"<collection UUID>:42"` (`incarnation:index_gen`). The
+incarnation is part of the identity: deleting and recreating a collection changes its incarnation. Updates acknowledged before publication
 (including deferred commits) omit it. A forced merge returns the final merged
 snapshot's id. For an NDJSON URL commit spanning multiple collections, the EOF
 acknowledgement is a separate response line for the URL's target collection;

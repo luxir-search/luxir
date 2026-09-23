@@ -84,7 +84,6 @@ defaults and constraints are described in the comments and guides.
 - [`CollectionCacheControl`](#message-luxir.collectioncachecontrol)
 - [`CollectionStats`](#message-luxir.collectionstats)
 - [`Column`](#message-luxir.column)
-- [`CommitId`](#message-luxir.commitid)
 - [`CommitParams`](#message-luxir.commitparams)
 - [`ConstantScoreQuery`](#message-luxir.constantscorequery)
 - [`CreateCollectionRequest`](#message-luxir.createcollectionrequest)
@@ -106,6 +105,7 @@ defaults and constraints are described in the comments and guides.
 - [`FieldFacet`](#message-luxir.fieldfacet)
 - [`FieldVariants`](#message-luxir.fieldvariants)
 - [`Filter`](#message-luxir.filter)
+- [`FollowerStats`](#message-luxir.followerstats)
 - [`Fusion`](#message-luxir.fusion)
 - [`FuzzyQuery`](#message-luxir.fuzzyquery)
 - [`GeoBoxQuery`](#message-luxir.geoboxquery)
@@ -511,19 +511,6 @@ One slot per document, including missing values, aligned with DocList rows. Scal
 | <a id="field-luxir.column.col_vec"></a>[`col_vec`](#field-luxir.column.col_vec) | 16 | [`ColVector`](#message-luxir.colvector) | oneof [`kind`](#oneof-luxir.column.kind) | single-valued vector column: one Vector per doc; missing = unset oneof |
 | <a id="field-luxir.column.multi_vec"></a>[`multi_vec`](#field-luxir.column.multi_vec) | 17 | [`MultiVector`](#message-luxir.multivector) | oneof [`kind`](#oneof-luxir.column.kind) | multi-valued vector column: one ArrVector per doc; missing = empty list |
 
-<a id="message-luxir.commitid"></a>
-
-### luxir.CommitId
-
-A snapshot identity remains unique across collection deletion and recreation.
-
-[Source](../../protos/luxir_types.proto)
-
-| Field | Number | Type | Cardinality / group | Description |
-|---|---|---|---|---|
-| <a id="field-luxir.commitid.incarnation"></a>[`incarnation`](#field-luxir.commitid.incarnation) | 1 | `string` | singular |  |
-| <a id="field-luxir.commitid.index_gen"></a>[`index_gen`](#field-luxir.commitid.index_gen) | 2 | `uint64` | singular |  |
-
 <a id="message-luxir.commitparams"></a>
 
 ### luxir.CommitParams
@@ -812,6 +799,20 @@ Alternate representations of the same input value, keyed by local label. Absent 
 | <a id="field-luxir.filter.query"></a>[`query`](#field-luxir.filter.query) | 1 | [`Query`](#message-luxir.query) | singular | required; restricts matches without contributing to scores |
 | <a id="field-luxir.filter.except_ops"></a>[`except_ops`](#field-luxir.filter.except_ops) | 2 | `string` | repeated | Keys in the enclosing TopDocs.ops map that should not receive this filter. The filter still applies to the TopDocs results and other sub-operations. Names must be nonempty, distinct, and present in that ops map. Empty applies the filter to all sub-operations. Not supported on Fusion filters or Fusion source filters. |
 
+<a id="message-luxir.followerstats"></a>
+
+### luxir.FollowerStats
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.followerstats.follower"></a>[`follower`](#field-luxir.followerstats.follower) | 1 | `string` | singular |  |
+| <a id="field-luxir.followerstats.collection"></a>[`collection`](#field-luxir.followerstats.collection) | 2 | `string` | singular |  |
+| <a id="field-luxir.followerstats.commit"></a>[`commit`](#field-luxir.followerstats.commit) | 3 | `string` | singular |  |
+| <a id="field-luxir.followerstats.last_seen"></a>[`last_seen`](#field-luxir.followerstats.last_seen) | 4 | `uint64` | singular | Unix milliseconds |
+| <a id="field-luxir.followerstats.lag"></a>[`lag`](#field-luxir.followerstats.lag) | 5 | `uint64` | optional | generation distance; absent without a current acknowledgment |
+
 <a id="message-luxir.fusion"></a>
 
 ### luxir.Fusion
@@ -916,6 +917,10 @@ Geographic distance query with a center in degrees and radius in meters. Matches
 | <a id="field-luxir.indexstats.aux_indexes"></a>[`aux_indexes`](#field-luxir.indexstats.aux_indexes) | 7 | [`AuxStats`](#message-luxir.auxstats) | repeated |  |
 | <a id="field-luxir.indexstats.query_cache"></a>[`query_cache`](#field-luxir.indexstats.query_cache) | 8 | [`QueryCacheStats`](#message-luxir.querycachestats) | singular |  |
 | <a id="field-luxir.indexstats.segments"></a>[`segments`](#field-luxir.indexstats.segments) | 9 | [`SegmentStats`](#message-luxir.segmentstats) | repeated |  |
+| <a id="field-luxir.indexstats.snapshot_pins"></a>[`snapshot_pins`](#field-luxir.indexstats.snapshot_pins) | 11 | `uint64` | singular |  |
+| <a id="field-luxir.indexstats.pin_retained_bytes"></a>[`pin_retained_bytes`](#field-luxir.indexstats.pin_retained_bytes) | 12 | `uint64` | singular | bytes whose only remaining owners are pins |
+| <a id="field-luxir.indexstats.pin_idle_drops"></a>[`pin_idle_drops`](#field-luxir.indexstats.pin_idle_drops) | 13 | `uint64` | singular |  |
+| <a id="field-luxir.indexstats.pin_budget_drops"></a>[`pin_budget_drops`](#field-luxir.indexstats.pin_budget_drops) | 14 | `uint64` | singular |  |
 
 <a id="message-luxir.knnquery"></a>
 
@@ -1393,6 +1398,7 @@ Operational statistics. An empty collection requests every collection on the nod
 | <a id="field-luxir.statsresponse.totals"></a>[`totals`](#field-luxir.statsresponse.totals) | 1 | [`StatsTotals`](#message-luxir.statstotals) | singular |  |
 | <a id="field-luxir.statsresponse.collections"></a>[`collections`](#field-luxir.statsresponse.collections) | 2 | [`CollectionStats`](#message-luxir.collectionstats) | repeated |  |
 | <a id="field-luxir.statsresponse.indexing_ram"></a>[`indexing_ram`](#field-luxir.statsresponse.indexing_ram) | 3 | [`IndexRamStats`](#message-luxir.indexramstats) | singular |  |
+| <a id="field-luxir.statsresponse.followers"></a>[`followers`](#field-luxir.statsresponse.followers) | 4 | [`FollowerStats`](#message-luxir.followerstats) | repeated |  |
 
 <a id="message-luxir.statstotals"></a>
 
@@ -1471,7 +1477,7 @@ The response to an update request. In streaming mode the server sends exactly on
 | <a id="field-luxir.updateresponse.errors"></a>[`errors`](#field-luxir.updateresponse.errors) | 5 | [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror) | repeated | Per-document failures. A failed document has no effect on search results; the previous version of the document, if any, is untouched. |
 | <a id="field-luxir.updateresponse.total_errors"></a>[`total_errors`](#field-luxir.updateresponse.total_errors) | 7 | `int64` | singular | Number of failed documents. Equals the length of errors unless the transport retained only a prefix (the NDJSON stream keeps the first 100 per group). |
 | <a id="field-luxir.updateresponse.error"></a>[`error`](#field-luxir.updateresponse.error) | 6 | [`Error`](#message-luxir.error) | singular | Request-level failure (not tied to a single document), e.g. a failure in the commit pipeline. Set exactly when status == ERROR for a non-document failure. |
-| <a id="field-luxir.updateresponse.commit"></a>[`commit`](#field-luxir.updateresponse.commit) | 8 | [`CommitId`](#message-luxir.commitid) | singular | Resulting snapshot identity; absent without a completed commit. |
+| <a id="field-luxir.updateresponse.commit"></a>[`commit`](#field-luxir.updateresponse.commit) | 8 | `string` | singular | Resulting snapshot identity; absent without a completed commit. Snapshot token: incarnation:index\_gen. |
 
 <a id="message-luxir.updateresponse.docerror"></a>
 

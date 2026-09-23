@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/server/ReplicationCatalog.h"
 #include "Stats.h"
 
 #include <cassert>

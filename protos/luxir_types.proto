@@ -802,12 +802,6 @@ message UpdateRequest {
   bool drop_unmapped = 12;
 }
 
-// A snapshot identity remains unique across collection deletion and recreation.
-message CommitId {
-  string incarnation = 1;
-  uint64 index_gen = 2;
-}
-
 // The response to an update request.  In streaming mode the server sends exactly one
 // response per request.
 message UpdateResponse {
@@ -860,7 +854,8 @@ message UpdateResponse {
   Error error = 6;
 
   // Resulting snapshot identity; absent without a completed commit.
-  CommitId commit = 8;
+  // Snapshot token: incarnation:index_gen.
+  string commit = 8;
 }
 
 
@@ -1042,10 +1037,22 @@ message StatsRequest {
   bool segments = 2;
 }
 
+message ReplicationStatus {
+  repeated FollowerStats followers = 6;
+}
+
 message StatsResponse {
   StatsTotals totals = 1;
   repeated CollectionStats collections = 2;
   IndexRamStats indexing_ram = 3;
+}
+
+message FollowerStats {
+  string follower = 1;
+  string collection = 2;
+  string commit = 3;
+  uint64 last_seen = 4; // Unix milliseconds
+  optional uint64 lag = 5; // generation distance; absent without a current acknowledgment
 }
 
 // Rolled-up counts.  Only the fields meaningful at a given level are set, so

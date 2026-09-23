@@ -126,10 +126,11 @@ protected:
     api::UpdateResponse a, b;
     ASSERT_TRUE(api::read_json(a, first, arena));
     ASSERT_TRUE(api::read_json(b, second, arena));
-    ASSERT_TRUE(a.commit);
-    ASSERT_TRUE(b.commit);
-    EXPECT_NE(a.commit->incarnation, b.commit->incarnation);
-    a.commit->incarnation = b.commit->incarnation = {};
+    ASSERT_FALSE(a.commit.empty());
+    ASSERT_FALSE(b.commit.empty());
+    EXPECT_NE(CommitId::parse(a.commit).incarnation, CommitId::parse(b.commit).incarnation);
+    EXPECT_EQ(CommitId::parse(a.commit).index_gen, CommitId::parse(b.commit).index_gen);
+    a.commit = b.commit = {};
     std::string normalizedA, normalizedB;
     ASSERT_TRUE(api::write_json(a, normalizedA));
     ASSERT_TRUE(api::write_json(b, normalizedB));
@@ -2078,7 +2079,7 @@ TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
   auto lines = splitLines(update.body());
   glz::generic_i64 eof;
   ASSERT_FALSE(glz::read_json(eof, lines.back()));
-  EXPECT_EQ((uint64_t)eof["commit"]["index_gen"].get<int64_t>(), writer->snapshots.readers.getReader()->commitId());
+  EXPECT_EQ((uint64_t)CommitId::parse(eof["commit"].get<std::string>()).index_gen, writer->snapshots.readers.getReader()->commitId());
   EXPECT_GT(writer->snapshots.readers.getReader()->commitTime(), before);
 }
 
@@ -4023,10 +4024,10 @@ TEST_F(HttpApiTest, commitResponseIdentifiesSnapshot) {
   ASSERT_EQ(200, response.result_int()) << response.body();
   glz::generic_i64 body;
   ASSERT_FALSE(glz::read_json(body, response.body()));
-  auto commit = body["commit"]["index_gen"].get<int64_t>();
+  auto commit = CommitId::parse(body["commit"].get<std::string>()).index_gen;
   auto snapshot = readDurableIndexInfo(helper.getIndexWriter()->dir);
   EXPECT_EQ((uint64_t)commit, snapshot->index_gen);
-  EXPECT_EQ(body["commit"]["incarnation"].get<std::string>(), snapshot->incarnation);
+  EXPECT_EQ(CommitId::parse(body["commit"].get<std::string>()).incarnation, snapshot->incarnation);
   EXPECT_EQ((uint64_t)commit, helper.getIndexWriter()->snapshots.readers.getReader()->commitId());
   auto streamed = httpRequest(port(), http::verb::post,
       "/collections/main/_update?commit=true", "{\"id\":\"streamed\"}\n",
@@ -4036,8 +4037,8 @@ TEST_F(HttpApiTest, commitResponseIdentifiesSnapshot) {
   auto lines = splitLines(streamed.body());
   ASSERT_FALSE(lines.empty());
   ASSERT_FALSE(glz::read_json(eof, lines.back())) << streamed.body();
-  EXPECT_GT(eof["commit"]["index_gen"].get<int64_t>(), commit);
-  EXPECT_EQ((uint64_t)eof["commit"]["index_gen"].get<int64_t>(),
+  EXPECT_GT(CommitId::parse(eof["commit"].get<std::string>()).index_gen, commit);
+  EXPECT_EQ((uint64_t)CommitId::parse(eof["commit"].get<std::string>()).index_gen,
             readDurableIndexInfo(helper.getIndexWriter()->dir)->index_gen);
 }
 

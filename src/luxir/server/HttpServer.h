@@ -10,6 +10,7 @@
 #include <optional>
 #include <memory>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include "LuxirNode.h"
 
@@ -72,6 +73,7 @@ private:
   // alive until shutdown closes the acceptor.
   boost::asio::io_context acceptIoc{1};
   std::optional<boost::asio::ip::tcp::acceptor> acceptor;
+  std::optional<boost::asio::steady_timer> replicationTimer;
   std::thread acceptThread;
   // Sessions and off-io work pins co-own their shard so executor teardown is
   // safe on any thread after HttpServer has joined the shard runner.
@@ -79,6 +81,7 @@ private:
   std::shared_ptr<HttpSessionRegistry> registry;
 
   void doAccept();
+  void armReplicationExpiry();
   void armShardIdle(std::size_t idx);
   void spawnShard(std::size_t idx);
   void shardExited(std::size_t idx);
