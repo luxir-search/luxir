@@ -223,6 +223,7 @@ public:
   }
 
   uint64_t commitId() const noexcept { return snapshotGen; }
+  std::string_view incarnation() const noexcept { return core->incarnation; }
 
   std::span<Segment> segments() noexcept {
     return core->segs;

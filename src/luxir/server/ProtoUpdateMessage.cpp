@@ -3,6 +3,8 @@
 
 #include "luxir/util/proto.h"
 #include "ProtoUpdateMessage.h"
+#include "LuxirNode.h"
+#include "ReplicationCatalog.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/schema/Schema.h"
 
@@ -263,6 +265,29 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
     releaseGuard.failure = std::current_exception();
     throw;
   }
+}
+
+
+void ProtoUpdateMessage::validateReplicaWait(std::string_view value) {
+  ReplicationCatalog::replicaCount(value);
+}
+
+void ProtoUpdateMessage::complete(LuxirNode& node, std::function<void()> delivery, std::stop_token stop) {
+  if (!resultingCommit || !req->commit || req->commit->wait_for_replicas.empty() || result.errored()) {
+    delivery();
+    return;
+  }
+  auto collection = req->collection.empty() ? std::string(LuxirNode::kDefaultCollectionName) : std::string(req->collection);
+  node.getReplication().awaitBarrier(node, std::move(collection), *resultingCommit, req->commit->wait_for_replicas,
+      req->commit->replication_timeout_ms.value_or(30000),
+      [this, &node, delivery = std::move(delivery)](api::ReplicaResult replicas, ReplicationCatalog::Event event) mutable {
+        node.getTaskArena().enqueue([this, delivery = std::move(delivery), replicas, event] {
+          getResponse()->replicas = replicas;
+          if (event == ReplicationCatalog::Event::RECREATED || event == ReplicationCatalog::Event::REMOVED)
+            result.setException(ApiError(ErrorKind::UNAVAILABLE, "replica_wait_cancelled", "collection removed or recreated after commit"));
+          delivery();
+        });
+      }, stop);
 }
 
 } // namespace luxir

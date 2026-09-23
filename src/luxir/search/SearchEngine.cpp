@@ -5,6 +5,7 @@
 #include "luxir/api/padded_input.h"
 
 #include "SearchEngine.h"
+#include "luxir/server/ReplicationCatalog.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
 
@@ -113,6 +114,51 @@ void SearchEngine::submitBody(SearchRequest& req) {
 }
 
 void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
+  if (!req.proto.min_commit.empty()) {
+    try {
+      auto floor = CommitId::parse(req.proto.min_commit);
+      auto error = std::make_shared<std::optional<ErrorInfo>>();
+      using Event = ReplicationCatalog::Event;
+      auto ready = [this, &req, floor, error](Event event) {
+        if (event == Event::CANCELLED || (event == Event::REMOVED && !node.following())) {
+          *error = ErrorInfo{ErrorKind::UNAVAILABLE, "stale_replica", "search floor wait cancelled or collection deleted"};
+          return true;
+        }
+        try {
+          auto collection = node.resolveCollection(req.proto.collection);
+          auto snapshot = collection->getShard()->getSnapshots().snapshot();
+          if (snapshot && snapshot->id.incarnation != floor.incarnation) {
+            if (!node.following() || event == Event::DEADLINE) {
+              *error = ErrorInfo{ErrorKind::FAILED_PRECONDITION, "commit_incarnation_mismatch", "min_commit belongs to a different collection incarnation"};
+              return true;
+            }
+          } else if (snapshot && snapshot->id.index_gen >= floor.index_gen) {
+            req.floorCollection = std::move(collection);
+            return true;
+          }
+        } catch (const CollectionNotFoundError&) {}
+        catch (const std::exception& e) { *error = classifyException(e, ErrorKind::INTERNAL); return true; }
+        if (event != Event::DEADLINE) return false;
+        *error = ErrorInfo{ErrorKind::UNAVAILABLE, "stale_replica", "min_commit was not available before min_commit_timeout_ms"};
+        return true;
+      };
+      auto collection = req.proto.collection.empty() ? std::string(LuxirNode::kDefaultCollectionName) : std::string(req.proto.collection);
+      bool immediate = node.getReplication().await(std::move(collection), std::move(ready),
+          [this, &req, error, maxParallel] {
+            node.getTaskArena().enqueue([this, &req, error, maxParallel] {
+              if (*error) { req.setError(**error); req.bodyDone(); }
+              else submit(req, maxParallel);
+            });
+          }, req.proto.min_commit_timeout_ms.value_or(30000), req.waitCancellation.get_token());
+      if (!immediate) return;
+      if (*error) { req.setError(**error); req.bodyDone(); return; }
+
+    } catch (const std::exception& e) {
+      req.setError(classifyException(e, ErrorKind::INVALID_REQUEST));
+      req.bodyDone();
+      return;
+    }
+  }
   if (maxParallel == 0) {
     // Default lane: the whole query runs serially right here on the receiving
     // transport thread.  No scheduler hop, and the arena's parked width never
@@ -142,7 +188,7 @@ void SearchEngine::getResources(SearchRequest& req) {
   // look up the correct index reader and the associated schema
   auto& request = req.proto;
   auto& node = req.engine.node;
-  auto collection = node.resolveCollection(request.collection);
+  auto collection = req.floorCollection ? req.floorCollection : node.resolveCollection(request.collection);
 
   // get the index reader
   // The API freshness tolerance is milliseconds; the reader clock domain is
@@ -151,6 +197,15 @@ void SearchEngine::getResources(SearchRequest& req) {
   uint64_t freshnessUs = request.freshness_ms > maxUs / 1000
       ? maxUs : request.freshness_ms * 1000;
   req.reader = collection->getReaderManager().getReader(freshnessUs);
+  if (!request.min_commit.empty()) {
+    auto floor = CommitId::parse(request.min_commit);
+    if (req.reader->incarnation() != floor.incarnation || req.reader->commitId() < floor.index_gen)
+      req.reader = collection->getReaderManager().getReader(0);
+    if (req.reader->incarnation() != floor.incarnation) throw ApiError(ErrorKind::FAILED_PRECONDITION,
+        "commit_incarnation_mismatch", "min_commit belongs to a different collection incarnation");
+    if (req.reader->commitId() < floor.index_gen) throw ApiError(ErrorKind::UNAVAILABLE,
+        "stale_replica", "reader is older than min_commit");
+  }
   req.schema = req.reader->schema();
   auto* filterCache = req.reader->filterCache();
   req.filterUses = std::make_shared<FilterCache::UseRegistry>(

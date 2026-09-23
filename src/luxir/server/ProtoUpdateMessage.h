@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include <stop_token>
 #include <memory_resource>
 #include <algorithm>
 #include <limits>
@@ -14,6 +15,8 @@
 #include "luxir/util/Clock.h"
 
 namespace luxir {
+
+class LuxirNode;
 
 class ProtoUpdateMessage : public UpdateMessage {
 public:
@@ -61,6 +64,10 @@ public:
       const auto& params = *req->commit;
       commit_within_ms = (int64_t)std::min<uint64_t>(
           params.commit_within_ms, (uint64_t)std::numeric_limits<int64_t>::max());
+      if (!params.wait_for_replicas.empty()) {
+        validateReplicaWait(params.wait_for_replicas);
+        commit_within_ms = 0;
+      }
       waitForMerges = params.wait_for_merges;
       constexpr uint32_t maxInt32 = (uint32_t)std::numeric_limits<int32_t>::max();
       maxSegments = params.max_segments > maxInt32
@@ -102,6 +109,13 @@ public:
     rsp->ids = ids_.finish();
     return rsp;
   }
+
+  static void validateReplicaWait(std::string_view value);
+  // Captures "all" at commit completion. Retain the message through delivery.
+  // Delivery extracts data and queues rendering. Barriers resume on the arena;
+  // without a barrier delivery runs inline.
+  void complete(LuxirNode& node, std::function<void()> delivery,
+                std::stop_token stop = {});
 
   // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it
   // as a param in the future if obtain/release becomes more complex.

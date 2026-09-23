@@ -1179,6 +1179,40 @@ struct to<JSON, luxir::api::Val> {
   }
 };
 
+// Commit counts accept either a JSON integer or a string (including "all").
+template <>
+struct from<JSON, luxir::api::CommitParams> {
+  template <auto Opts>
+  static void op(luxir::api::CommitParams& value,
+                 hpp_proto::concepts::is_non_owning_context auto& ctx, auto& it, auto& end) {
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) target = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<Opts, true>(ctx, it, end, target, [](auto&, auto&) {},
+        [&](auto& vit, auto& vend) {
+          if (key == "commit_within_ms") util::from_json<O>(value.commit_within_ms, ctx, vit, vend);
+          else if (key == "wait_for_merges") util::from_json<O>(value.wait_for_merges, ctx, vit, vend);
+          else if (key == "max_segments") util::from_json<O>(value.max_segments, ctx, vit, vend);
+          else if (key == "replication_timeout_ms") util::from_json<O>(value.replication_timeout_ms, ctx, vit, vend);
+          else if (key == "build_aux_indexes") {
+            decltype(auto) names = ::hpp_proto::detail::as_modifiable(ctx, value.build_aux_indexes);
+            util::parse_repeated<O>(false, names, ctx, vit, vend);
+          } else if (key == "wait_for_replicas") {
+            if (skip_ws<O>(ctx, vit, vend)) return true;
+            if (vit != vend && *vit != '"') {
+              uint32_t count = 0;
+              util::from_json<O>(count, ctx, vit, vend);
+              auto text = std::to_string(count);
+              auto* bytes = (char*)ctx.memory_resource().allocate(text.size(), 1);
+              std::memcpy(bytes, text.data(), text.size());
+              value.wait_for_replicas = {bytes, text.size()};
+            } else util::from_json<O>(value.wait_for_replicas, ctx, vit, vend);
+          } else ctx.error = error_code::unknown_key;
+          return bool(ctx.error);
+        }, [](auto&, auto&) {});
+  }
+};
+
 // ----- SearchRequest: full form, root top_docs shorthand, or both at one root -----
 // Read accepts request-level keys (request_id, collection, ops, freshness_ms,
 // time_zone, response_format, profile, max_parallel) and TopDocs keys mixed at
@@ -1235,6 +1269,10 @@ struct from<JSON, luxir::api::SearchRequest> {
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
           } else if (key == "freshness_ms") {
             util::from_json<O>(value.freshness_ms, ctx, vit, vend);
+          } else if (key == "min_commit") {
+            util::from_json<O>(value.min_commit, ctx, vit, vend);
+          } else if (key == "min_commit_timeout_ms") {
+            util::from_json<O>(value.min_commit_timeout_ms, ctx, vit, vend);
           } else if (key == "time_zone") {
             util::from_json<O>(value.time_zone, ctx, vit, vend);
           } else if (key == "response_format") {

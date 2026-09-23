@@ -5,6 +5,7 @@
 #include "LuxirNode.h"
 #include "luxir/util/Uuid.h"
 #include <glaze/glaze.hpp>
+#include <charconv>
 #include "luxir/util/log.h"
 #include "luxir/util/Signal.h"
 
@@ -45,6 +46,7 @@ ReplicationCatalog::ReplicationCatalog(std::chrono::milliseconds liveness, Now n
 void ReplicationCatalog::changed(std::string_view name, std::string_view incarnation) noexcept {
   try {
     decltype(watches) ready;
+    Pending completed;
     {
       std::lock_guard lock(mutex);
       revision++;
@@ -53,21 +55,26 @@ void ReplicationCatalog::changed(std::string_view name, std::string_view incarna
         if (it != follower.commits.end() && it->second.incarnation != incarnation) follower.commits.erase(it);
       }
       ready.swap(watches);
+      if (!waits.empty()) checkLocked(name, Event::CHANGED, completed, false, incarnation);
     }
     notify(ready);
+    finish(completed);
   } catch (...) { LOG_ERROR("Replication publication notification failed"); }
 }
 
 void ReplicationCatalog::remove(const std::string& name) noexcept {
   try {
     decltype(watches) ready;
+    Pending completed;
     {
       std::lock_guard lock(mutex);
       revision++;
       for (auto& [id, follower] : followers) follower.commits.erase(name);
       ready.swap(watches);
+      if (!waits.empty()) checkLocked(name, Event::REMOVED, completed);
     }
     notify(ready);
+    finish(completed);
   } catch (...) { LOG_ERROR("Replication deletion notification failed"); }
 }
 
@@ -152,11 +159,12 @@ void ReplicationCatalog::installed(LuxirNode& node, std::string_view body) {
   }
   validateFollower(request.follower);
   auto id = CommitId::parse(request.commit);
+  Pending completed;
   for (;;) {
     uint64_t observed;
     { std::lock_guard lock(mutex); observed = revision; }
     auto collections = node.replicationCollections();
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
     if (observed != revision) continue;
     pruneLocked(collections);
     auto collection = collections.find(request.collection);
@@ -171,6 +179,9 @@ void ReplicationCatalog::installed(LuxirNode& node, std::string_view body) {
     seenLocked(request.follower);
     auto& installed = followers.at(request.follower).commits[request.collection];
     if (installed.incarnation != id.incarnation || installed.index_gen < id.index_gen) installed = std::move(id);
+    if (!waits.empty()) checkLocked(request.collection, Event::CHECK, completed);
+    lock.unlock();
+    finish(completed);
     return;
   }
 }
@@ -201,8 +212,167 @@ void ReplicationCatalog::seen(std::string_view follower) {
 }
 
 void ReplicationCatalog::expire() {
-  std::lock_guard lock(mutex);
-  expireLocked();
+  Pending completed;
+  {
+    std::lock_guard lock(mutex);
+    expireLocked();
+    for (auto it = waits.begin(); it != waits.end();) {
+      auto name = (it++)->first;
+      checkLocked(name, Event::CHECK, completed, true);
+    }
+  }
+  finish(completed);
 }
+
+uint32_t ReplicationCatalog::replicaCount(std::string_view value) {
+  if (value == "all") return 0;
+  uint32_t count = 0;
+  auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), count);
+  if (value.empty() || error != std::errc() || end != value.data() + value.size())
+    throw RequestError("wait_for_replicas must be a nonnegative integer or all");
+  return count;
+}
+
+ReplicationCatalog::Barrier ReplicationCatalog::barrier(std::string_view wanted, std::string_view collection, const CommitId& commit) {
+  Barrier result{wanted == "all", replicaCount(wanted), {}};
+  if (result.all) {
+    std::lock_guard lock(mutex);
+    expireLocked();
+    for (const auto& [id, follower] : followers) {
+      auto serving = follower.commits.find(collection);
+      if (serving != follower.commits.end() && serving->second.incarnation == commit.incarnation) result.members.insert(id);
+    }
+  }
+  return result;
+}
+
+api::ReplicaResult ReplicationCatalog::progressLocked(const Barrier& barrier, std::string_view collection, const CommitId& id) {
+  uint32_t wanted = barrier.all ? 0 : barrier.wanted, serving = 0;
+  for (const auto& [name, follower] : followers) {
+    if (barrier.all) {
+      auto member = barrier.members.find(name);
+      if (member == barrier.members.end()) continue;
+      wanted++;
+    }
+    auto commit = follower.commits.find(collection);
+    if (commit != follower.commits.end() && commit->second.incarnation == id.incarnation
+        && commit->second.index_gen >= id.index_gen) serving++;
+  }
+  return {wanted, serving, false};
+}
+
+void ReplicationCatalog::finish(Pending& ready) {
+  for (auto& wait : ready) wait->complete();
+}
+
+void ReplicationCatalog::armLocked() {
+  if (!deadlines.empty()) DeadlineScheduler::global().arm(deadline, deadlines.begin()->first.first);
+}
+
+void ReplicationCatalog::checkLocked(std::string_view collection, Event event, Pending& ready, bool allOnly, std::string_view incarnation) {
+  auto it = waits.find(collection);
+  if (it == waits.end()) return;
+  std::erase_if(it->second, [&](const auto& wait) {
+    if (allOnly && !wait->all) return false;
+    auto reason = event;
+    if (event == Event::CHANGED && !wait->incarnation.empty() && wait->incarnation != incarnation) reason = Event::RECREATED;
+    if (Clock::now() >= wait->deadline) reason = Event::DEADLINE;
+    if (!wait->ready(reason)) return false;
+    deadlines.erase({wait->deadline, wait->id});
+    ready.push_back(wait);
+    return true;
+  });
+  if (it->second.empty()) waits.erase(it);
+}
+
+bool ReplicationCatalog::await(std::string collection, std::function<bool(Event)> ready,
+                               std::function<void()> complete, uint64_t timeoutMs, std::stop_token stop, bool all, std::string incarnation) {
+  auto time = Clock::now();
+  auto maximum = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::time_point::max() - time).count();
+  auto wait = std::make_shared<Wait>();
+  wait->deadline = time + std::chrono::milliseconds((int64_t)std::min(timeoutMs, (uint64_t)maximum));
+  wait->incarnation = std::move(incarnation);
+  wait->all = all; wait->ready = std::move(ready); wait->complete = std::move(complete);
+  {
+    std::lock_guard lock(mutex);
+    auto event = waitsClosed || stop.stop_requested() ? Event::CANCELLED : timeoutMs ? Event::CHECK : Event::DEADLINE;
+    if (wait->ready(event)) return true;
+    wait->id = ++nextWait;
+    waits[collection].push_back(wait);
+    deadlines.emplace(std::pair{wait->deadline, wait->id}, collection);
+    armLocked();
+  }
+  wait->cancellation.emplace(stop, [this, collection, id = wait->id] { cancelWait(collection, id); });
+  Signal::emit("replicationWaitParked");
+  return false;
+}
+
+void ReplicationCatalog::awaitBarrier(LuxirNode& node, std::string collection, CommitId id, std::string_view wanted, uint64_t timeoutMs,
+                                      std::function<void(api::ReplicaResult, Event)> complete, std::stop_token stop) {
+  auto captured = barrier(wanted, collection, id);
+  auto result = std::make_shared<api::ReplicaResult>();
+  auto event = std::make_shared<Event>(Event::CHECK);
+  auto ready = [this, &node, captured, collection, id, result, event](Event cause) {
+    if (cause != Event::CANCELLED) try {
+      auto current = node.resolveCollection(collection)->getShard()->getSnapshots().snapshot();
+      if (current && current->id.incarnation != id.incarnation) cause = Event::RECREATED;
+    } catch (const std::exception&) { cause = Event::REMOVED; }
+    *result = progressLocked(captured, collection, id);
+    *event = cause;
+    bool terminal = cause == Event::RECREATED || cause == Event::REMOVED || cause == Event::CANCELLED || cause == Event::DEADLINE;
+    result->timed_out = cause == Event::DEADLINE && result->serving < result->wanted;
+    return terminal || result->serving >= result->wanted;
+  };
+  auto delivery = [complete = std::move(complete), result, event] { complete(*result, *event); };
+  if (await(std::move(collection), std::move(ready), delivery, timeoutMs, stop, captured.all, id.incarnation)) delivery();
+}
+
+void ReplicationCatalog::cancelWait(std::string_view collection, uint64_t id) {
+  Pending completed;
+  {
+    std::lock_guard lock(mutex);
+    auto it = waits.find(collection);
+    if (it == waits.end()) return;
+    std::erase_if(it->second, [&](const auto& wait) {
+      if (wait->id != id) return false;
+      wait->ready(Event::CANCELLED);
+      deadlines.erase({wait->deadline, wait->id});
+      completed.push_back(wait); return true;
+    });
+    if (it->second.empty()) waits.erase(it);
+  }
+  finish(completed);
+}
+
+void ReplicationCatalog::tick() {
+  Pending completed;
+  {
+    std::lock_guard lock(mutex);
+    expireLocked();
+    while (!deadlines.empty() && deadlines.begin()->first.first <= Clock::now()) {
+      auto name = deadlines.begin()->second;
+      checkLocked(name, Event::CHECK, completed);
+    }
+    armLocked();
+  }
+  finish(completed);
+}
+
+void ReplicationCatalog::closeWaits() {
+  Pending completed;
+  {
+    std::lock_guard lock(mutex);
+    waitsClosed = true;
+    for (auto& [name, pending] : waits) for (auto& wait : pending) {
+      wait->ready(Event::CANCELLED); completed.push_back(std::move(wait));
+    }
+    waits.clear();
+    deadlines.clear();
+  }
+  DeadlineScheduler::global().detach(deadline);
+  finish(completed);
+}
+
+ReplicationCatalog::~ReplicationCatalog() { closeWaits(); }
 
 }

@@ -151,6 +151,8 @@ struct CommitParams {
   std::span<const std::string_view> build_aux_indexes;
   bool wait_for_merges = false;
   uint32_t max_segments = 0;
+  std::string_view wait_for_replicas;
+  std::optional<uint64_t> replication_timeout_ms;
 };
 
 struct Error {
@@ -164,10 +166,23 @@ namespace UpdateResponse_ {
 struct DocError { std::string_view id; std::optional<Error> error; int32_t index = 0; };
 } // namespace UpdateResponse_
 
+struct ReplicaResult {
+  std::optional<uint32_t> wanted;
+  std::optional<uint32_t> serving;
+  std::optional<bool> timed_out;
+};
+
+struct CollectionCommit {
+  std::string_view commit;
+  std::optional<ReplicaResult> replicas;
+};
+
 struct UpdateResponse {
   using Status = luxir::api::UpdateResponse_::Status;
   using DocError = luxir::api::UpdateResponse_::DocError;
   std::string_view commit;
+  std::optional<ReplicaResult> replicas;
+  map_view<std::string_view, CollectionCommit> commits;
   std::string_view request_id;
   uint64_t update_version = 0;
   std::span<const std::string_view> ids;
@@ -491,6 +506,8 @@ struct SearchRequest {
   ResponseFormat response_format = ResponseFormat::ENVELOPE;
   bool profile = false;
   std::int32_t max_parallel = 0;
+  std::string_view min_commit;
+  std::optional<uint64_t> min_commit_timeout_ms;
   // JSON parsing metadata, absent from the wire schema and canonical JSON.
   // Only a root TopDocs shorthand creates this implicit q; an explicit op
   // named q (including one modified by a URL overlay) keeps its wrapper.
@@ -664,7 +681,7 @@ LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionP
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
 LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult)
-LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
+LUXIR_TD(CollectionCommit) LUXIR_TD(ReplicaResult) LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
 LUXIR_TD(Val) LUXIR_TD(ArrVal) LUXIR_TD(ArrStr) LUXIR_TD(ArrInt) LUXIR_TD(ArrFloat)
 LUXIR_TD(ArrDouble) LUXIR_TD(ArrBin) LUXIR_TD(ArrArrStr) LUXIR_TD(ArrArrInt) LUXIR_TD(ArrArrFloat)
 LUXIR_TD(ArrArrDouble) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
@@ -704,7 +721,7 @@ LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTR
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)
 LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(DocList)
-LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
+LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CollectionCommit) LUXIR_ENTRY(ReplicaResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
 LUXIR_ENTRY(UpdateResponse) LUXIR_ENTRY(Map)
 LUXIR_ENTRY(Val) LUXIR_ENTRY(ArrVal) LUXIR_ENTRY(ArrStr) LUXIR_ENTRY(ArrInt) LUXIR_ENTRY(ArrFloat)
 LUXIR_ENTRY(ArrDouble) LUXIR_ENTRY(ArrBin) LUXIR_ENTRY(ArrArrStr) LUXIR_ENTRY(ArrArrInt)

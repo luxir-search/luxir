@@ -82,6 +82,7 @@ defaults and constraints are described in the comments and guides.
 - [`ColStr`](#message-luxir.colstr)
 - [`ColVector`](#message-luxir.colvector)
 - [`CollectionCacheControl`](#message-luxir.collectioncachecontrol)
+- [`CollectionCommit`](#message-luxir.collectioncommit)
 - [`CollectionStats`](#message-luxir.collectionstats)
 - [`Column`](#message-luxir.column)
 - [`CommitParams`](#message-luxir.commitparams)
@@ -128,6 +129,7 @@ defaults and constraints are described in the comments and guides.
 - [`RangeFacet`](#message-luxir.rangefacet)
 - [`RangeQuery`](#message-luxir.rangequery)
 - [`RegexQuery`](#message-luxir.regexquery)
+- [`ReplicaResult`](#message-luxir.replicaresult)
 - [`ReplicationCollectionStatus`](#message-luxir.replicationcollectionstatus)
 - [`ReplicationStatus`](#message-luxir.replicationstatus)
 - [`RescoreQuery`](#message-luxir.rescorequery)
@@ -474,6 +476,17 @@ Single-valued vector column. Each Vector slot is independently nullable via its 
 | <a id="field-luxir.collectioncachecontrol.shards"></a>[`shards`](#field-luxir.collectioncachecontrol.shards) | 2 | [`ShardCacheControl`](#message-luxir.shardcachecontrol) | repeated |  |
 | <a id="field-luxir.collectioncachecontrol.error"></a>[`error`](#field-luxir.collectioncachecontrol.error) | 3 | [`Error`](#message-luxir.error) | singular | as CollectionStats.error |
 
+<a id="message-luxir.collectioncommit"></a>
+
+### luxir.CollectionCommit
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.collectioncommit.commit"></a>[`commit`](#field-luxir.collectioncommit.commit) | 1 | `string` | singular |  |
+| <a id="field-luxir.collectioncommit.replicas"></a>[`replicas`](#field-luxir.collectioncommit.replicas) | 2 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
+
 <a id="message-luxir.collectionstats"></a>
 
 ### luxir.CollectionStats
@@ -527,6 +540,8 @@ Parameters governing how a commit is performed. Presence of this message in an U
 | <a id="field-luxir.commitparams.build_aux_indexes"></a>[`build_aux_indexes`](#field-luxir.commitparams.build_aux_indexes) | 2 | `string` | repeated | Build missing aux overlays as part of this commit. An overlay already present on a segment is retained rather than rebuilt. \[\] - request no aux builds \["\*"\] - build every eligible missing vector overlay \["vec.title\_v"\] - build the missing vector overlay for title\_v Only "\*" and exact overlay names are supported; no partial-name patterns. |
 | <a id="field-luxir.commitparams.wait_for_merges"></a>[`wait_for_merges`](#field-luxir.commitparams.wait_for_merges) | 3 | `bool` | singular | If true, this commit will wait for any in-flight merges to finish before publishing. |
 | <a id="field-luxir.commitparams.max_segments"></a>[`max_segments`](#field-luxir.commitparams.max_segments) | 4 | `uint32` | singular | Merge down so the data visible at this commit resides in at most this many segments. 0 (default) = no forced merging. The response is not sent until the merged index is durably published: at return, everything this commit made visible lives in &lt;= max\_segments segments (concurrent ingestion after this commit may add new segments; they are not covered by the promise). The response waits for the merged layout even when commit\_within\_ms is positive. |
+| <a id="field-luxir.commitparams.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.commitparams.wait_for_replicas) | 5 | `string` | singular | Decimal follower count or "all". Forces an immediate commit. "all" captures live followers at commit completion; members that go non-live stop counting. |
+| <a id="field-luxir.commitparams.replication_timeout_ms"></a>[`replication_timeout_ms`](#field-luxir.commitparams.replication_timeout_ms) | 6 | `uint64` | optional | Visibility wait deadline. Absent defaults to 30000; timeout never undoes commit. |
 
 <a id="message-luxir.constantscorequery"></a>
 
@@ -1184,6 +1199,19 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 | <a id="field-luxir.regexquery.field"></a>[`field`](#field-luxir.regexquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.regexquery.pattern"></a>[`pattern`](#field-luxir.regexquery.pattern) | 2 | `string` | singular |  |
 
+<a id="message-luxir.replicaresult"></a>
+
+### luxir.ReplicaResult
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.replicaresult.wanted"></a>[`wanted`](#field-luxir.replicaresult.wanted) | 1 | `uint32` | optional | For "all", wanted excludes captured followers that are no longer live. |
+| <a id="field-luxir.replicaresult.serving"></a>[`serving`](#field-luxir.replicaresult.serving) | 2 | `uint32` | optional |  |
+| <a id="field-luxir.replicaresult.timed_out"></a>[`timed_out`](#field-luxir.replicaresult.timed_out) | 3 | `bool` | optional |  |
+| <a id="field-luxir.replicaresult.cancelled"></a>[`cancelled`](#field-luxir.replicaresult.cancelled) | 4 | `bool` | optional | The commit succeeded, but shutdown or client cancellation ended the wait. |
+
 <a id="message-luxir.replicationcollectionstatus"></a>
 
 ### luxir.ReplicationCollectionStatus
@@ -1312,6 +1340,8 @@ Top-level search request that can contain multiple search operations.
 | <a id="field-luxir.searchrequest.response_format"></a>[`response_format`](#field-luxir.searchrequest.response_format) | 6 | [`ResponseFormat`](#enum-luxir.responseformat) | singular | HTTP response framing. ENVELOPE (default): one JSON envelope per batch. DOCS: one document per line, with optional \_header\_ metadata records. The HTTP ?format=docs parameter also selects DOCS. gRPC rejects DOCS. See docs/guide/http-api.md for the NDJSON formats. |
 | <a id="field-luxir.searchrequest.profile"></a>[`profile`](#field-luxir.searchrequest.profile) | 7 | `bool` | singular | Return execution details for instrumented operations; see ExecutionProfile. |
 | <a id="field-luxir.searchrequest.max_parallel"></a>[`max_parallel`](#field-luxir.searchrequest.max_parallel) | 8 | `int32` | singular | Intra-request parallelism: 0 (default) lets the engine choose; 1 runs serially on the shared executor; -1 permits unlimited parallelism. Automatic execution is serial on the receiving thread. Other values are rejected. |
+| <a id="field-luxir.searchrequest.min_commit"></a>[`min_commit`](#field-luxir.searchrequest.min_commit) | 9 | `string` | singular | Require a local snapshot at least this new (incarnation:index\_gen). A different incarnation fails immediately; otherwise wait asynchronously. |
+| <a id="field-luxir.searchrequest.min_commit_timeout_ms"></a>[`min_commit_timeout_ms`](#field-luxir.searchrequest.min_commit_timeout_ms) | 10 | `uint64` | optional | Search floor deadline. Absent defaults to 30000; zero checks immediately. Maximum floor wait, in milliseconds. Defaults to 30000. |
 
 <a id="message-luxir.searchresponse"></a>
 
@@ -1512,6 +1542,8 @@ The response to an update request. In streaming mode the server sends exactly on
 | <a id="field-luxir.updateresponse.total_errors"></a>[`total_errors`](#field-luxir.updateresponse.total_errors) | 7 | `int64` | singular | Number of failed documents. Equals the length of errors unless the transport retained only a prefix (the NDJSON stream keeps the first 100 per group). |
 | <a id="field-luxir.updateresponse.error"></a>[`error`](#field-luxir.updateresponse.error) | 6 | [`Error`](#message-luxir.error) | singular | Request-level failure (not tied to a single document), e.g. a failure in the commit pipeline. Set exactly when status == ERROR for a non-document failure. |
 | <a id="field-luxir.updateresponse.commit"></a>[`commit`](#field-luxir.updateresponse.commit) | 8 | `string` | singular | Resulting snapshot identity; absent without a completed commit. Snapshot token: incarnation:index\_gen. |
+| <a id="field-luxir.updateresponse.replicas"></a>[`replicas`](#field-luxir.updateresponse.replicas) | 9 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
+| <a id="field-luxir.updateresponse.commits"></a>[`commits`](#field-luxir.updateresponse.commits) | 10 | map&lt;`string`, [`CollectionCommit`](#message-luxir.collectioncommit)&gt; | map | NDJSON EOF commits covering more than one collection. |
 
 <a id="message-luxir.updateresponse.docerror"></a>
 

@@ -47,6 +47,12 @@ message SearchRequest {
   // Automatic execution is serial on the receiving thread. Other values
   // are rejected.
   int32 max_parallel = 8;
+
+  // Require a local snapshot at least this new (incarnation:index_gen).
+  // Writers reject a different incarnation immediately; followers wait for a switch.
+  string min_commit = 9;
+  // Search floor deadline. Absent defaults to 30000; zero checks immediately.
+  optional uint64 min_commit_timeout_ms = 10;
 }
 
 enum ResponseFormat {
@@ -755,6 +761,24 @@ message CommitParams {
   // The response waits for the merged layout even when commit_within_ms is
   // positive.
   uint32 max_segments = 4;
+
+  // Decimal follower count or "all". Forces an immediate commit. "all" captures
+  // live followers at commit completion; members that go non-live stop counting.
+  string wait_for_replicas = 5;
+  // Visibility wait deadline. Absent defaults to 30000; timeout never undoes commit.
+  optional uint64 replication_timeout_ms = 6;
+}
+
+message ReplicaResult {
+  // For "all", wanted excludes captured followers that are no longer live.
+  optional uint32 wanted = 1;
+  optional uint32 serving = 2;
+  optional bool timed_out = 3;
+}
+
+message CollectionCommit {
+  string commit = 1;
+  ReplicaResult replicas = 2;
 }
 
 // Index or delete documents, with an optional commit.
@@ -856,6 +880,9 @@ message UpdateResponse {
   // Resulting snapshot identity; absent without a completed commit.
   // Snapshot token: incarnation:index_gen.
   string commit = 8;
+  ReplicaResult replicas = 9;
+  // NDJSON EOF commits covering more than one collection.
+  map<string, CollectionCommit> commits = 10;
 }
 
 

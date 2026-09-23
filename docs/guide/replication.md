@@ -186,3 +186,53 @@ report `stale`; unavailability is never interpreted as deletion. Reused HTTP
 connections retry once fresh on EOF, connection reset or broken pipe before any
 response bytes arrive. Read timeouts count as failures.
 Orphan deletion fails immediately while a transfer owns the collection.
+
+For read-your-write, commit with a visibility barrier and carry its commit token
+on searches. FS and RAM followers count equally. These waits are asynchronous;
+a slow replica does not delay later commits. A descendant commit of the same
+incarnation satisfies either wait.
+
+```sh
+curl -s 'http://writer:9400/collections/main/_update?commit=true&wait_for_replicas=all&replication_timeout_ms=30000' \
+  -H 'Content-Type: application/x-ndjson' -d '{"id":"example"}'
+# Copy the response's commit token into min_commit:
+curl -s 'http://reader:9400/collections/main/_search?min_commit=INCARNATION:GEN&min_commit_timeout_ms=30000' \
+  -H 'Content-Type: application/json' -d '{"query":"id:example"}'
+```
+
+The NDJSON `_end_` commit object, JSON update `commit` object and gRPC CommitParams
+accept the same options. `wait_for_replicas` is a decimal count or `"all"` (JSON
+also accepts an integer). It overrides `commit_within_ms`. The response includes
+`commit` and `replicas: {wanted, serving, timed_out}`. `all` captures live follower
+ids when the commit completes, including watch-only followers not yet serving;
+a follower that becomes live later does not join that wait. Captured followers
+that expire stop being required and are excluded from `wanted`. A numeric count
+can exceed the live follower count and will then time out. Timeout reports partial
+progress and never undoes the local commit. Shutdown or client cancellation also
+leaves the commit successful, with `replicas.cancelled: true` if a response can
+still be delivered. A dead follower remains live for the
+liveness window, so `all` can time out until it expires; lower the configured
+window if this matters for your latency requirements.
+
+`min_commit` works on writers, read-only nodes and followers, in the search body,
+URL parameters and gRPC. The requested freshness is used when the reader already
+satisfies the floor; otherwise the reader is refreshed. `min_commit_timeout_ms`
+controls the search wait; `replication_timeout_ms` controls commit barriers.
+Both default to 30000 ms; zero checks immediately. Waits are event-driven.
+
+An unavailable generation at the deadline returns 503 `stale_replica`. Writers
+and read-only nodes immediately return 409 `commit_incarnation_mismatch` for a
+different incarnation. Followers wait for an incarnation switch, returning 409
+only if the incarnation still differs at the deadline. Cancellation ends a wait
+promptly. Collection deletion ends writer/read-only floors and commit barriers;
+a follower floor can wait through deletion and recreation.
+
+A URL EOF commit covers only collections touched by that NDJSON request. An
+empty commit request commits its URL collection. One collection retains the
+usual `commit` and optional `replicas` response. With multiple collections,
+`commits` has a result for each; `replicas` is absent unless a replica wait was
+requested:
+
+```json
+{"commits":{"main":{"commit":"INC:GEN","replicas":{"wanted":2,"serving":2,"timed_out":false}},"other":{"commit":"INC:GEN","replicas":{"wanted":2,"serving":1,"timed_out":true}}}}
+```

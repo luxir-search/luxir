@@ -161,7 +161,7 @@ when supplied in the body or as a URL parameter.
 | `invalid_request` | 400 (405 for `method_not_allowed`) | The request as written cannot be served. |
 | `not_found` | 404 | The route or the collection does not exist. |
 | `already_exists` | 409 | Creating a collection that already exists. |
-| `failed_precondition` | 403 | The node's state forbids the operation, such as `--read-only`. |
+| `failed_precondition` | 403 (409 for `commit_incarnation_mismatch`) | The node's state forbids the operation, such as `--read-only`. |
 | `resource_exhausted` | 429 (413 for `request_too_large`) | A size or memory ceiling was exceeded. |
 | `unavailable` | 503 | The collection exists but cannot serve: it is being deleted or failed to load. |
 | `internal` | 500 | A server-side failure the request did not cause. |

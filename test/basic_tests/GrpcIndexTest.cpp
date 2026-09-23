@@ -24,6 +24,7 @@
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "luxir/server/RpcStatus.h"
+#include "luxir/util/Signal.h"
 
 // TODO - use a different logger for RPC stuff some point
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
@@ -947,4 +948,57 @@ TEST_F(GrpcIndexTest, visibility) {
   grpc::Status status = wstream.Finish();
   GRPC_DEBUG("STREAMING UPDATE CLIENT FINISHED");
   ASSERT_TRUE(status.ok());
+}
+
+TEST_F(GrpcIndexTest, replicaBarrierAndSearchFloor) {
+  CollectionHelper helper("main");
+  helper.index(flatdoc("id", "floor"), UpdateMessage::COMMIT);
+  api::UpdateRequest update;
+  update.commit.emplace();
+  update.commit->wait_for_replicas = "all";
+  update.commit->commit_within_ms = 60000;
+  Reply<api::UpdateResponse> reply;
+  grpc::ClientContext unary;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::Update, &unary, update, &reply).ok());
+  ASSERT_TRUE(reply.msg.replicas.has_value());
+  EXPECT_EQ(false, reply.msg.replicas->timed_out);
+  ASSERT_FALSE(reply.msg.commit.empty());
+  std::string token(reply.msg.commit);
+
+  update.commit->wait_for_replicas = "1";
+  update.commit->replication_timeout_ms = 0;
+  grpc::ClientContext updates;
+  HppClientReaderWriter<api::UpdateRequest, api::UpdateResponse> updateStream(channel.get(), rpc::UpdateStream, &updates);
+  ASSERT_TRUE(updateStream.Write(update)); updateStream.WritesDone();
+  ASSERT_TRUE(updateStream.Read(&reply));
+  ASSERT_TRUE(reply.msg.replicas); EXPECT_EQ(true, reply.msg.replicas->timed_out);
+  EXPECT_TRUE(updateStream.Finish().ok());
+
+  TrivialSearchRequest fixture;
+  fixture.request.min_commit = token;
+  grpc::ClientContext searches;
+  HppClientReaderWriter<api::SearchRequest, api::SearchResponse> stream(channel.get(), rpc::Search, &searches);
+  ASSERT_TRUE(stream.Write(fixture.request));
+  Reply<api::SearchResponse> response;
+  ASSERT_TRUE(stream.Read(&response)); EXPECT_FALSE(response.msg.error);
+  auto future = helper.collection().getShard()->getSnapshots().snapshot()->id; future.index_gen++;
+  token = future.token(); fixture.request.min_commit = token; fixture.request.min_commit_timeout_ms = 5000;
+  std::atomic<bool> parked{false};
+  Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* { parked = true; return nullptr; });
+  ASSERT_TRUE(stream.Write(fixture.request));
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (!parked && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+  ASSERT_TRUE(parked);
+  helper.index(flatdoc("id", "after-floor"), UpdateMessage::COMMIT);
+  ASSERT_TRUE(stream.Read(&response)); EXPECT_FALSE(response.msg.error);
+  future.index_gen += 100;
+  token = future.token(); fixture.request.min_commit = token; fixture.request.min_commit_timeout_ms = 0;
+  ASSERT_TRUE(stream.Write(fixture.request));
+  ASSERT_TRUE(stream.Read(&response)); ASSERT_TRUE(response.msg.error);
+  EXPECT_EQ("stale_replica", response.msg.error->code);
+  token = "other:1"; fixture.request.min_commit = token;
+  ASSERT_TRUE(stream.Write(fixture.request)); stream.WritesDone();
+  ASSERT_TRUE(stream.Read(&response)); ASSERT_TRUE(response.msg.error);
+  EXPECT_EQ("commit_incarnation_mismatch", response.msg.error->code);
+  EXPECT_TRUE(stream.Finish().ok());
 }

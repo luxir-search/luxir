@@ -273,6 +273,8 @@ static grpc::ByteBuffer serializeToByteBuffer(const Message& msg) {
 // post-write callback. A unary RPC is just a stream with one read + one write.
 class GenericCallData : public CallData {
 public:
+  std::stop_source waitCancellation{std::nostopstate};
+  std::optional<std::stop_callback<std::function<void()>>> serverCancellation;
   grpc::AsyncGenericService& genericService;
   grpc::GenericServerContext genericCtx;
   grpc::GenericServerAsyncReaderWriter readerWriter;  // ServerAsyncReaderWriter<ByteBuffer,ByteBuffer>
@@ -314,6 +316,12 @@ public:
       : CallData(server, threadInfo), genericService(genericService), readerWriter(&genericCtx),
         highWater(server.streamBufferBytes()), lowWater(server.streamBufferBytes() / 2) {
     genericService.RequestCall(&genericCtx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
+  }
+
+  void enableWaitCancellation() {
+    if (serverCancellation) return;
+    waitCancellation = std::stop_source{};
+    serverCancellation.emplace(server.stopToken(), [this] { waitCancellation.request_stop(); });
   }
 
   void createNew() {
@@ -641,6 +649,10 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena);
   req.requestState = std::move(requestState);
   req.parent = &call;
+  if (!req.proto.min_commit.empty()) {
+    call.enableWaitCancellation();
+    req.waitCancellation = call.waitCancellation;
+  }
   // Route by max_parallel (via dispatch()): the default (0) runs the whole
   // query serially right here on this completion-queue thread - the cheapest
   // path, accepting that this cq's other calls wait for the query's duration
@@ -654,55 +666,11 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 }
 
 
-// Shared blocking update used by the unary Update handler. Returns the serialized
-// response: the response is NON-OWNING and its spans are backed by updateMessage's arena,
-// so it must be serialized here (while updateMessage is alive), not by the caller.
-static grpc::ByteBuffer doBlockingUpdate(GRPCServer& server, const UpdateReqProto& request) {
-  std::shared_ptr<Collection> collection = resolveUpdateCollection(server, request);
-
-  auto shard = collection->getShard();
-  auto iw = shard->requireIndexWriter();
-
-  class BlockingUpdateMessage : public ProtoUpdateMessage {
-  public:
-    Blocker blocker;
-    BlockingUpdateMessage(const UpdateReqProto* req, UpdateRespProto* response)
-        : ProtoUpdateMessage(req, response) {}
-    virtual void done(IndexWriter& iw) override {
-      unused(iw);
-      blocker.notify();
-    }
-  };
-
-  UpdateRespProto response;
-  BlockingUpdateMessage updateMessage(&request, &response);
-  // A closed writer still admits the message; it comes back errored in the response.
-  if (!iw->submitUpdate(&updateMessage)) throw std::runtime_error("update was not admitted");
-  updateMessage.blocker.wait();
-  updateMessage.finishResponse();
-  return serializeToByteBuffer(response);
-}
-
-//   rpc Update(UpdateRequest) returns (UpdateResponse)  [unary]
+// Unary Update and streaming UpdateStream share asynchronous completion.
 static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
-  HppRequestState<UpdateReqProto> request;
-  if (!parseRequest(readBuf, request, "Update")) {
-    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Update: malformed request"));
-    return;
-  }
-  try {
-    grpc::ByteBuffer buf = doBlockingUpdate(call.server, request.proto);
-    call.respondRaw(std::move(buf), 1);
-  } catch (const std::exception& e) {
-    finishWithException(call, e);
-  }
-}
-
-//   rpc UpdateStream(stream UpdateRequest) returns (stream UpdateResponse)
-static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto request = std::make_unique<HppRequestState<UpdateReqProto>>();
-  if (!parseRequest(readBuf, *request, "UpdateStream")) {
-    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "UpdateStream: malformed request"));
+  if (!parseRequest(readBuf, *request, "Update")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Update: malformed request"));
     return;
   }
 
@@ -717,14 +685,18 @@ static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf)
       : ProtoUpdateMessage(&requestState->proto), request(std::move(requestState)), parent(parent) {}
     virtual void done(IndexWriter& iw) override {
       unused(iw);
-      auto* response = finishResponse();
-      try {
-        grpc::ByteBuffer buf = serializeToByteBuffer(*response);
-        parent->respondRaw(std::move(buf), 1);     // may delete parent on another thread
-      } catch (const std::exception& e) {
-        parent->finishWithError(grpcStatus(classifyException(e, ErrorKind::INTERNAL)));
-      }
-      delete this;                                 // frees request bytes, parse resource, and response
+      complete(parent->server.getLuxirNode(), [this] {
+        auto* response = finishResponse();
+        request.reset(); // Keep the response arena, release the update body.
+        parent->server.getLuxirNode().getTaskArena().enqueue([this, response] {
+          try {
+            parent->respondRaw(serializeToByteBuffer(*response), 1);
+          } catch (const std::exception& e) {
+            parent->finishWithError(grpcStatus(classifyException(e, ErrorKind::INTERNAL)));
+          }
+          delete this;
+        });
+      }, parent->waitCancellation.get_token());
     }
   };
 
@@ -733,6 +705,7 @@ static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf)
     auto shard = collection->getShard();
     auto iw = shard->requireIndexWriter();
 
+    if (request->proto.commit && !request->proto.commit->wait_for_replicas.empty()) call.enableWaitCancellation();
     Update* updateMessage = new Update(std::move(request), &call);
     try {
       if (!iw->submitUpdate(updateMessage)) {
@@ -909,7 +882,7 @@ static const MethodEntry* lookupMethod(const std::string& method) {
   static const std::unordered_map<std::string, MethodEntry> table = {
     {"/luxir.Searcher/Search",          {handleSearch}},
     {"/luxir.Indexer/Update",           {handleUpdate, true}},
-    {"/luxir.Indexer/UpdateStream",     {handleUpdateStream, true}},
+    {"/luxir.Indexer/UpdateStream",     {handleUpdate, true}},
     {"/luxir.Admin/SetSchema",          {handleSetSchema, true}},
     {"/luxir.Admin/GetSchema",          {handleGetSchema}},
     {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true}},
@@ -998,6 +971,7 @@ bool GRPCServer::waitForStart() {
     Another grpc example (written by someone else) also showed a leak after upgrading.
  */
 void luxir::GRPCServer::shutdown() {
+  stopping.request_stop();
   LOG_INFO("Shutting down luxir grpc server.");
   if (!server) {
     return;

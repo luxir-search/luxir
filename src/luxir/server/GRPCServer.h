@@ -14,7 +14,9 @@
 namespace luxir {
 
 class GRPCServer {
+  std::stop_source stopping;
 public:
+  std::stop_token stopToken() const { return stopping.get_token(); }
   // gRPC performance guidelines suggest having numcpu threads and 2 threads per completion queue.
   // Default to half the available logical CPUs, respecting CPU affinity.
   // https://grpc.io/docs/guides/performance/

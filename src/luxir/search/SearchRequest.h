@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <stop_token>
+
 #include <atomic>
 #include <functional>
 #include <memory>
@@ -74,10 +76,13 @@ struct ExecutionProfileOpState {
 };
 
 // The top-level request for the SearchEngine.
+class Collection;
 class SearchRequest {
   friend class SearchEngine;
 
 public:
+  std::stop_source waitCancellation{std::nostopstate};
+  std::shared_ptr<Collection> floorCollection;
   SearchEngine& engine;
   const SearchConfig searchConfig;
   RequestMemTracker memoryTracker;

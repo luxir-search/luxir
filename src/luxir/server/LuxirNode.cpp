@@ -85,6 +85,7 @@ LuxirNode::LuxirNode(LuxirConfig config)
 
 LuxirNode::~LuxirNode() {
   if (follower) follower->stop();
+  replication->closeWaits();
 }
 
 std::shared_ptr<Collection> LuxirNode::getCollection(std::string_view name) {
@@ -158,7 +159,7 @@ std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(Library* library, s
   if (!collection) {
     throw CollectionNotFoundError("collection '" + collectionName + "' does not exist");
   }
-  if (createdHere) replication->changed();
+  if (createdHere) replication->changed(collectionName, collection->getShard()->getSnapshots().snapshot()->id.incarnation);
   return checkLoaded(std::move(collection));
 }
 
@@ -242,7 +243,7 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
   if (!createdHere) {
     throw CollectionExistsError("collection '" + collectionName + "' already exists");
   }
-  replication->changed();
+  replication->changed(collectionName, collection->getShard()->getSnapshots().snapshot()->id.incarnation);
   return collection;
 }
 

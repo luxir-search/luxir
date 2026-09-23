@@ -128,6 +128,7 @@ struct ShardPin {
 // The HTTP status for a classified failure: the error's kind decides, except
 // for conditions with an HTTP idiom of their own.
 static http::status httpStatusFor(const ErrorInfo& info) {
+  if (info.code == "commit_incarnation_mismatch") return http::status::conflict;
   if (info.code == "method_not_allowed") return http::status::method_not_allowed;
   if (info.code == "request_too_large") return http::status::payload_too_large;
   if (info.code == "snapshot_expired") return http::status::gone;
@@ -222,17 +223,25 @@ struct HttpStreamBatchResult {
   luxir::api::UpdateResponse_::Status status = luxir::api::UpdateResponse_::Status::OK;
   std::uint64_t updateVersion = 0;
   std::optional<CommitId> commit;
+  std::optional<api::ReplicaResult> replicas;
   std::size_t docCount = 0;
   std::size_t deleteCount = 0;
   std::size_t firstDocIndex = 0;
   bool failed = false;
 };
 
+struct CollectionCommit {
+  std::string commit;
+  std::optional<api::ReplicaResult> replicas;
+};
+
 struct HttpStreamInterval {
+  std::map<std::string, CollectionCommit> commits;
   std::vector<std::string> ids;
   std::vector<HttpStreamAccumError> errors;
   std::uint64_t lastUpdateVersion = 0;
   std::optional<CommitId> commit;
+  std::optional<api::ReplicaResult> replicas;
   std::size_t firstDocIndex = 0;
   std::size_t docCount = 0;
   std::size_t docsIndexed = 0;
@@ -268,6 +277,8 @@ struct UpdateUrlParams {
   // commits immediately (its other commit options survive); an NDJSON stream
   // commits every writer it touched at EOF.
   bool commit = false;
+  std::string waitForReplicas;
+  std::optional<uint64_t> replicationTimeoutMs;
 };
 
 struct HttpStreamUpdateState {
@@ -314,6 +325,7 @@ struct HttpStreamUpdateState {
   bool barrierPending = false;
   bool eofPending = false;
   bool urlCommitInFlight = false;
+  size_t urlCommitsPending = 0;
   bool failed = false;
 
   HttpStreamUpdateState(std::size_t batchTargetBytes, std::size_t batchMaxDocs,
@@ -383,6 +395,8 @@ public:
 // executor-facing helpers below.
 class HttpSession : public std::enable_shared_from_this<HttpSession> {
 public:
+  std::stop_source waitCancellation;
+
   HttpSession(std::shared_ptr<HttpIoShard> shard, tcp::socket&& sock, LuxirNode& node,
               std::shared_ptr<HttpSessionRegistry> registry, int64_t streamBufferBytes)
     : shard_(std::move(shard)), stream_(std::move(sock)), node_(node), registry_(std::move(registry)),
@@ -404,6 +418,8 @@ public:
     net::post(stream_.get_executor(), [self = shared_from_this()] {
       beast::error_code ec;
       self->replicationStopped_ = true;
+      self->aborted_.store(true, std::memory_order_relaxed);
+      self->waitCancellation.request_stop();
       self->cancelReplicationWatch();
       self->stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
       self->stream_.socket().close(ec);
@@ -653,12 +669,18 @@ private:
     }
 
     void done(IndexWriter& iw) noexcept override {
+      unused(iw);
+      auto self = shared_from_this();
+      complete(session_->node_, [self] { self->deliver(); }, session_->waitCancellation.get_token());
+    }
+
+    void deliver() noexcept {
       try {
-        unused(iw);
         try {
           auto* resp = finishResponse();
           result_.status = resp->status;
           result_.updateVersion = resp->update_version;
+          result_.replicas = resp->replicas;
           if (!resp->commit.empty()) result_.commit = CommitId::parse(resp->commit);
           if (resp->error) result_.error = luxir::api::build::errorInfo(*resp->error);
           result_.ids.reserve(resp->ids.size());
@@ -1150,6 +1172,9 @@ private:
                                           "unsigned 64-bit decimal integer", false,
                                           json, overlay, err)) return false;
     appendStringParam(params, "time_zone", false, json, overlay);
+    appendStringParam(params, "min_commit", false, json, overlay);
+    if (!appendIntegerParam<std::uint64_t>(params, "min_commit_timeout_ms", "unsigned 64-bit decimal integer",
+                                          false, json, overlay, err)) return false;
     if (!appendBoolParam(params, "profile", false, json, overlay, err)) return false;
     if (!appendIntegerParam<std::int32_t>(params, "max_parallel",
                                          "signed 32-bit decimal integer", false,
@@ -1537,6 +1562,9 @@ private:
     auto& engine = node_.getSearchEngine();
     auto* sreq = luxir::arenaCreate<HttpSearchRequest>(
         *arena, engine, std::move(requestState), shared_from_this(), *arena);
+    if (!sreq->proto.min_commit.empty()) {
+      sreq->waitCancellation = waitCancellation;
+    }
     sreq->format = format;
     sreq->docsState.multiOp = docsMultiOp;
     sreq->docsState.requestId = sreq->proto.request_id;
@@ -1574,6 +1602,8 @@ private:
       if (url.commit) {
         if (!state->proto.commit) state->proto.commit.emplace();
         state->proto.commit->commit_within_ms = 0;
+        if (!url.waitForReplicas.empty()) state->proto.commit->wait_for_replicas = api::build::arenaStr(state->resource, url.waitForReplicas);
+        if (url.replicationTimeoutMs) state->proto.commit->replication_timeout_ms = url.replicationTimeoutMs;
       }
       requestId_ = std::string(state->proto.request_id);
     } catch (const std::exception& e) {
@@ -1583,41 +1613,38 @@ private:
 
     auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin] {
-      std::string out;
-      std::optional<ErrorInfo> failure;
-      try {
-        std::shared_ptr<Collection> collection =
-            self->node_.resolveOrCreateCollection(state->proto.collection);
-        auto shard = collection->getShard();
-        auto iw = shard->requireIndexWriter();
-
-        class BlockingUpdateMessage : public ProtoUpdateMessage {
-        public:
-          Blocker blocker;
-          explicit BlockingUpdateMessage(const HttpUpdateReqProto* req) : ProtoUpdateMessage(req) {}
-          void done(IndexWriter& iw) override {
-            unused(iw);
-            blocker.notify();
-          }
-        };
-
-        BlockingUpdateMessage msg(&state->proto);
-        // A closed writer still admits the message; it comes back errored below.
-        if (!iw->submitUpdate(&msg)) throw std::runtime_error("update was not admitted");
-        msg.blocker.wait();
-        auto* resp = msg.finishResponse();
-        if (!luxir::api::write_json(*resp, out)) {
-          throw std::runtime_error("failed to serialize update response");
+      class Update final : public ProtoUpdateMessage {
+        std::shared_ptr<HttpSession> session;
+        std::shared_ptr<HttpUpdateState> state;
+        std::shared_ptr<ShardPin> pin;
+      public:
+        Update(std::shared_ptr<HttpSession> session, std::shared_ptr<HttpUpdateState> state, std::shared_ptr<ShardPin> pin)
+            : ProtoUpdateMessage(&state->proto), session(std::move(session)), state(std::move(state)), pin(std::move(pin)) {}
+        void done(IndexWriter&) override {
+          complete(session->node_, [this] {
+            auto* response = finishResponse();
+            state.reset(); // Keep the response arena, release the update body.
+            net::post(session->stream_.get_executor(), [this, response] {
+              try {
+                std::string out;
+                if (!api::write_json(*response, out)) throw std::runtime_error("failed to serialize update response");
+                session->respondJson(http::status::ok, std::move(out));
+              } catch (...) { session->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
+              delete this;
+            });
+          }, session->waitCancellation.get_token());
         }
-      } catch (const std::exception& e) {
-        failure = classifyException(e, ErrorKind::INTERNAL);
+      };
+      try {
+        auto collection = self->node_.resolveOrCreateCollection(state->proto.collection);
+        auto iw = collection->getShard()->requireIndexWriter();
+        auto* msg = new Update(self, state, shardPin);
+        try { if (!iw->submitUpdate(msg)) throw std::runtime_error("update was not admitted"); }
+        catch (...) { delete msg; throw; }
+      } catch (...) {
+        auto failure = currentExceptionInfo(ErrorKind::INTERNAL);
+        net::post(self->stream_.get_executor(), [self, shardPin, failure] { self->respondError(failure); });
       }
-
-      net::post(self->stream_.get_executor(),
-          [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
-            if (failure) self->respondError(*failure);
-            else self->respondJson(http::status::ok, std::move(body));
-          });
     });
   }
 
@@ -2099,6 +2126,8 @@ private:
     params.commit_within_ms = src.commit_within_ms;
     params.wait_for_merges = src.wait_for_merges;
     params.max_segments = src.max_segments;
+    params.wait_for_replicas = api::build::arenaStr(resource, src.wait_for_replicas);
+    params.replication_timeout_ms = src.replication_timeout_ms;
     std::string_view* names =
         luxir::api::build::allocArray(params.build_aux_indexes, src.build_aux_indexes.size(), resource);
     for (std::size_t i = 0; i < src.build_aux_indexes.size(); i++) {
@@ -2166,6 +2195,18 @@ private:
 
   static bool parseUpdateUrlParams(const std::vector<UrlParam>& params, UpdateUrlParams& out,
                                    std::string& err) {
+    if (auto* value = findParam(params, "wait_for_replicas")) {
+      try { ProtoUpdateMessage::validateReplicaWait(*value); }
+      catch (const std::exception& e) { err = e.what(); return false; }
+      out.waitForReplicas = *value;
+    }
+    if (auto* value = findParam(params, "replication_timeout_ms")) {
+      uint64_t timeout = 0;
+      auto [end, error] = std::from_chars(value->data(), value->data() + value->size(), timeout);
+      if (error != std::errc() || end != value->data() + value->size()) { err = "invalid replication_timeout_ms"; return false; }
+      out.replicationTimeoutMs = timeout;
+    }
+    if (!out.waitForReplicas.empty() && !findParam(params, "commit")) { err = "wait_for_replicas requires commit=true"; return false; }
     return parseCommitParam(params, out.commit, err) &&
            parseFieldMapParams(params, out.fieldMap, err) &&
            parseDropUnmappedParam(params, out.dropUnmapped, err);
@@ -2418,6 +2459,7 @@ private:
     luxir::api::UpdateResponse resp;
     resp.request_id = luxir::api::build::arenaStr(responseResource, requestId);
     resp.update_version = interval.lastUpdateVersion;
+    resp.replicas = interval.replicas;
     if (interval.commit) resp.commit = api::build::arenaStr(responseResource, interval.commit->token());
 
     luxir::api::build::SpanBuilder<std::string_view> ids(responseResource);
@@ -2447,6 +2489,12 @@ private:
       resp.status = luxir::api::UpdateResponse_::Status::ERROR;
     }
 
+    api::build::SpanBuilder<std::pair<std::string_view, api::CollectionCommit>> commits(responseResource);
+    commits.reserve(interval.commits.size());
+    for (const auto& [name, result] : interval.commits) {
+      commits.emplace_back(name, api::CollectionCommit{result.commit, result.replicas});
+    }
+    resp.commits = commits.finish();
     out.clear();
     return luxir::api::write_json(resp, out);
   }
@@ -2981,7 +3029,7 @@ private:
     assert(state != nullptr);
     auto& interval = state->interval;
     interval.lastUpdateVersion = result.updateVersion;
-    if (result.commit) interval.commit = result.commit;
+    if (result.commit) { interval.commit = result.commit; interval.replicas = result.replicas; }
 
     std::size_t indexedDocs = 0;
     if (result.status != luxir::api::UpdateResponse_::Status::ERROR) {
@@ -3077,47 +3125,76 @@ private:
     enqueueLine("", true);
   }
 
+  using UrlWriters = std::vector<std::pair<std::string, std::shared_ptr<IndexWriter>>>;
+
+  void submitUrlCommit(const std::shared_ptr<HttpStreamUpdateState>& state,
+                       const std::shared_ptr<UrlWriters>& writers, size_t index) {
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, writers, index] {
+      auto request = std::make_shared<HttpUpdateState>();
+      request->proto.collection = api::build::arenaStr(request->resource, (*writers)[index].first);
+      auto& params = request->proto.commit.emplace();
+      params.wait_for_replicas = api::build::arenaStr(request->resource, state->url.waitForReplicas);
+      params.replication_timeout_ms = state->url.replicationTimeoutMs;
+      class Commit final : public ProtoUpdateMessage {
+        std::shared_ptr<HttpUpdateState> request;
+        std::shared_ptr<HttpSession> session;
+        std::shared_ptr<HttpStreamUpdateState> state;
+        std::shared_ptr<UrlWriters> writers;
+        size_t index;
+      public:
+        Commit(std::shared_ptr<HttpUpdateState> request, std::shared_ptr<HttpSession> session,
+               std::shared_ptr<HttpStreamUpdateState> state, std::shared_ptr<UrlWriters> writers, size_t index)
+            : ProtoUpdateMessage(&request->proto), request(std::move(request)), session(std::move(session)),
+              state(std::move(state)), writers(std::move(writers)), index(index) {}
+        void done(IndexWriter&) override {
+          complete(session->node_, [this] {
+            auto* response = finishResponse();
+            auto error = response->error ? std::optional(api::build::errorInfo(*response->error)) : std::nullopt;
+            net::post(session->stream_.get_executor(),
+                [self = session, state = state, writers = writers, index = index,
+                 id = resultingCommit, replicas = response->replicas, error]() mutable {
+                  if (self->streamUpdate_ != state || state->failed) return;
+                  if (error) { self->failStreamingUpdate(*error); return; }
+                  if (writers->size() == 1) {
+                    state->interval.commit = id;
+                    state->interval.replicas = replicas;
+                  } else {
+                    state->interval.commit.reset();
+                    state->interval.replicas.reset();
+                    if (id) {
+                      state->interval.commits[(*writers)[index].first] = {id->token(), replicas};
+                    }
+                  }
+                  if (--state->urlCommitsPending == 0) {
+                    state->urlCommitInFlight = false;
+                    state->interval.submitted = true;
+                    self->finishStreamingUpdate();
+                  }
+                });
+            delete this;
+          }, session->waitCancellation.get_token());
+        }
+      };
+      try {
+        auto* msg = new Commit(request, self, state, writers, index);
+        try { if (!(*writers)[index].second->submitUpdate(msg)) throw std::runtime_error("update was not admitted"); }
+        catch (...) { delete msg; throw; }
+      } catch (...) {
+        auto error = currentExceptionInfo(ErrorKind::INTERNAL);
+        net::post(self->stream_.get_executor(), [self, error] { self->failStreamingUpdate(error); });
+      }
+    });
+  }
+
   void submitUrlCommits() {
     auto state = streamUpdate_;
-    assert(state != nullptr);
-    assert(!state->urlCommitInFlight);
-
-    std::vector<std::pair<std::string, std::shared_ptr<IndexWriter>>> writers;
-    writers.reserve(state->writerCache.size());
-    for (const auto& [name, target] : state->writerCache) {
-      writers.push_back({name, target.indexWriter});
-    }
+    assert(state != nullptr && !state->urlCommitInFlight);
+    auto writers = std::make_shared<UrlWriters>();
+    for (const auto& [name, target] : state->writerCache) writers->emplace_back(name, target.indexWriter);
     state->url.commit = false;
     state->urlCommitInFlight = true;
-
-    auto shardPin = state->shardPin;
-    node_.getTaskArena().enqueue(
-        [self = shared_from_this(), state, writers = std::move(writers), shardPin] {
-          std::optional<ErrorInfo> err;
-          std::optional<CommitId> targetCommit;
-          try {
-            for (const auto& [name, writer] : writers) {
-              auto commit = writer->commit();
-              if (name == state->defaultCollectionName) targetCommit = commit;
-            }
-          } catch (...) {
-            err = currentExceptionInfo(ErrorKind::INTERNAL);
-          }
-
-          net::post(self->stream_.get_executor(),
-              [self, state, shardPin, targetCommit, err = std::move(err)]() mutable {
-                if (self->streamUpdate_ != state || state->failed) return;
-                state->urlCommitInFlight = false;
-                if (err) {
-                  err->message = "NDJSON EOF commit failed: " + err->message;
-                  self->failStreamingUpdate(std::move(*err));
-                  return;
-                }
-                state->interval.commit = targetCommit;
-                state->interval.submitted = true;
-                self->finishStreamingUpdate();
-              });
-        });
+    state->urlCommitsPending = writers->size();
+    for (size_t i = 0; i < writers->size(); i++) submitUrlCommit(state, writers, i);
   }
 
   // --- streaming (chunked NDJSON) write pump --------------------------------
@@ -3494,6 +3571,7 @@ HttpServer::HttpServer(LuxirNode& node, int threads, int port, int64_t streamBuf
         streamBufferBytes > 0 ? streamBufferBytes
                               : node.getConfig().server.stream_buffer_bytes)),
     shardIdlePeriod(shardIdlePeriod) {}
+
 
 HttpServer::~HttpServer() { shutdown(); }
 
