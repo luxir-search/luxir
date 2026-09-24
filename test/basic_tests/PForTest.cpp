@@ -136,6 +136,31 @@ std::vector<uint32_t> roundtrip(U32Codec& codec, std::vector<uint32_t> in) {
   return out;
 }
 
+std::vector<char> encodePFor(std::array<uint32_t, BLK> in) {
+  std::vector<char> enc(BLK * sizeof(uint32_t) * 2 + 1024);
+  uint32_t encSz = (uint32_t) enc.size();
+  LuxirPFOR codec;
+  codec.encodeBlock(in.data(), BLK, enc.data(), encSz);
+  enc.resize(encSz);
+  return enc;
+}
+
+// Bits of the last exception residual word past cexcept * (maxb - bestb).
+// Layout: [bestb][cexcept][maxb][positions] word-padded, 4*bestb base words,
+// then the residual lane.
+uint32_t residualPaddingBits(const std::vector<char>& enc) {
+  uint32_t bestb = (uint8_t) enc[0];
+  uint32_t exceptions = (uint8_t) enc[1];
+  uint32_t maxb = (uint8_t) enc[2];
+  uint32_t headerWords = (3 + exceptions + 3) / 4;
+  uint32_t residualBits = exceptions * (maxb - bestb);
+  uint32_t lastWord = headerWords + 4 * bestb + (residualBits - 1) / 32;
+  uint32_t word;
+  memcpy(&word, enc.data() + lastWord * 4, 4);
+  uint32_t used = residualBits % 32;
+  return used == 0 ? 0 : word & ~((1U << used) - 1);
+}
+
 }  // namespace
 
 class PForTest : public LuxirTest {
@@ -317,6 +342,34 @@ TEST_F(PForTest, vectorizedEncoderMatchesScalarBytes) {
     SCOPED_TRACE(trial);
     assertScalarEncoding(block, "mixed random widths");
   }
+}
+
+// The residual lane's final partial word must not carry the unused packer
+// slots. The dense block first leaves 0xff residuals in the lane-7 slots of the
+// stack packer that the sparse block's encode then reuses.
+TEST_F(PForTest, exceptionResidualPaddingIsZero) {
+  std::array<uint32_t, BLK> dense;
+  dense.fill(0xf);
+  for (uint32_t k = 0; k < BLK; k += 4) dense[k] = 0xfff;
+  std::array<uint32_t, BLK> sparse{};
+  sparse[5] = 0xab;
+
+  std::vector<char> denseEnc = encodePFor(dense);
+  std::vector<char> enc = encodePFor(sparse);
+  ASSERT_EQ(4, denseEnc[0]);
+  ASSERT_EQ(32, denseEnc[1]);
+  ASSERT_EQ(12, denseEnc[2]);
+  ASSERT_EQ(0, enc[0]);
+  ASSERT_EQ(1, enc[1]);
+  ASSERT_EQ(8, enc[2]);
+  EXPECT_EQ(0u, residualPaddingBits(enc)) << std::hex << "0x" << residualPaddingBits(enc);
+
+  enc.resize(enc.size() + 64);
+  std::array<uint32_t, BLK> out{};
+  uint32_t outSz = BLK;
+  LuxirPFOR codec;
+  codec.decodeBlock(enc.data(), (uint32_t) enc.size(), out.data(), outSz);
+  ASSERT_EQ(sparse, out);
 }
 
 // Delta-coded PForDelta (docs codec): monotonic inputs, like document ids.
