@@ -515,27 +515,33 @@ TEST_F(ReplicationHttpTest, socketDeadlineAbortsStalledSharedReservation) {
   EXPECT_EQ(1u, h->collection().getShard()->getSnapshots().stats().pins);
 }
 
-TEST_F(ReplicationHttpTest, socketDeadlineCoversOrdinarySearchResponses) {
-  largeSnapshot();
-  Signal::listen("httpWriteIdleTimeout", [](void* timeout, void*, void*) -> void* {
-    *(std::chrono::milliseconds*)timeout = 100ms; return nullptr;
-  });
-  std::promise<void> timedOut;
-  Signal::listen("httpWriteTimedOut", [&](void*, void*, void*) -> void* { timedOut.set_value(); return nullptr; });
+TEST_F(ReplicationHttpTest, ordinaryResponsesDoNotArmWriteDeadline) {
+  ASSERT_TRUE(h->index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  std::atomic<int> deadlines = 0;
+  auto shutdown = scope_guard([&] { server->shutdown(); });
+  Signal::listen("httpWriteIdleTimeout", [&](void*, void*, void*) -> void* { deadlines++; return nullptr; });
+  auto snap = snapshot();
   net::io_context io;
   beast::tcp_stream stream(io);
   stream.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), (unsigned short)server->getPort()));
-  stream.socket().set_option(net::socket_base::receive_buffer_size(4096));
-  http::request<http::string_body> request(http::verb::post, "/collections/main/_search", 11);
-  request.set(http::field::content_type, "application/json");
-  request.body() = R"({"query":"id:large","fields":["payload"]})"; request.prepare_payload();
-  http::write(stream, request);
   beast::flat_buffer buffer;
-  http::response_parser<http::empty_body> response;
-  http::read_header(stream, buffer, response);
-  ASSERT_EQ(200, response.get().result_int());
-  EXPECT_EQ(std::future_status::ready, timedOut.get_future().wait_for(3s));
-  EXPECT_EQ(200, get("/health").result_int());
+  auto request = [&](std::string target) {
+    http::request<http::empty_body> req(http::verb::get, target, 11);
+    http::write(stream, req);
+    http::response<http::string_body> response;
+    http::read(stream, buffer, response);
+    EXPECT_EQ(200, response.result_int());
+  };
+  request("/health");
+  request("/collections/main/_search?get_number=true");
+  EXPECT_EQ(0, deadlines.load());
+  request(fileUrl(*snap, snap->files.front().name));
+  auto fileDeadlines = deadlines.load();
+  EXPECT_GT(fileDeadlines, 0);
+  // Reuse the file transfer's connection for ordinary responses.
+  request("/health");
+  request("/collections/main/_search?get_number=true");
+  EXPECT_EQ(fileDeadlines, deadlines.load());
 }
 
 }

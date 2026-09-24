@@ -187,9 +187,9 @@ also require their referenced files to be present with matching sizes.
 
 Once the new root is durable, obsolete manifests and unreferenced data are removed.
 Replication reservation counters are described in the
-[replication reference](replication.md#reference). Every HTTP response has a fixed
-60 s idle deadline per socket write, reset as writes complete. Waiting for a
-query, commit barrier or catalog change does not start a write deadline.
+[replication reference](replication.md#reference). Replication file transfers have
+a fixed 60 s idle deadline per socket write, reset as writes complete. Ordinary
+HTTP responses have no write deadline.
 
 Writer startup removes leftover unreferenced
 index files using the directory listing, without reading their contents. If

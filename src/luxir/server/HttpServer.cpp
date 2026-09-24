@@ -66,33 +66,6 @@ namespace http = beast::http;
 namespace net = boost::asio;
 using tcp = net::ip::tcp;
 
-// A deadline covers only an outstanding socket write, not request processing or
-// a parked watch/floor. Every response path uses this stream.
-class HttpStream : public beast::tcp_stream {
-  std::chrono::milliseconds writeIdleTimeout{60'000};
-public:
-  explicit HttpStream(tcp::socket socket) : beast::tcp_stream(std::move(socket)) {
-    Signal::emit("httpWriteIdleTimeout", &writeIdleTimeout);
-  }
-  template<class Buffers, class Handler>
-  auto async_read_some(const Buffers& buffers, Handler&& handler) {
-    // expires_after also sets the next read deadline when no read is pending.
-    // Clear that inherited deadline without changing an outstanding write.
-    expires_never();
-    return beast::tcp_stream::async_read_some(buffers, std::forward<Handler>(handler));
-  }
-  template<class Buffers, class Handler>
-  auto async_write_some(const Buffers& buffers, Handler&& handler) {
-    expires_after(writeIdleTimeout);
-    return beast::tcp_stream::async_write_some(buffers,
-        [this, handler = std::forward<Handler>(handler)](beast::error_code ec, size_t bytes) mutable {
-          expires_never();
-          if (ec == beast::error::timeout) Signal::emit("httpWriteTimedOut");
-          handler(ec, bytes);
-        });
-  }
-};
-
 class HttpSession;
 
 class HttpIoShard {
@@ -593,7 +566,7 @@ private:
   // The last session ref can drop on a task-arena thread after shutdown has
   // joined. Declared first so the shard is destroyed after stream_.
   std::shared_ptr<HttpIoShard> shard_;
-  HttpStream stream_;
+  beast::tcp_stream stream_;
   LuxirNode& node_;
   std::shared_ptr<HttpSessionRegistry> registry_;
   std::function<void()> deregister_;  // removes this session from the registry
@@ -1877,6 +1850,23 @@ private:
     stream_.socket().close(ec);
   }
 
+  void startReplicationWrite(const ReplicationTransfer& transfer) {
+    if (!transfer.file) return;
+    // Bound the lifetime of a stalled client's InputFile, even when another
+    // client keeps their shared reservation alive. Ordinary writes are untimed.
+    std::chrono::milliseconds timeout{60'000};
+    Signal::emit("httpWriteIdleTimeout", &timeout);
+    stream_.expires_after(timeout);
+  }
+
+  void finishReplicationWrite(const ReplicationTransfer& transfer, beast::error_code ec) {
+    if (!transfer.file) return;
+    // expires_after also sets the next read deadline. Clear both before the
+    // connection can serve another request or wait for application work.
+    stream_.expires_never();
+    if (ec == beast::error::timeout) Signal::emit("httpWriteTimedOut");
+  }
+
   void writeReplicationBody(const std::shared_ptr<ReplicationTransfer>& transfer) {
     if (replicationStopped_) return;
     if (transfer->cancellation.stop_requested()) { abortReplicationTransfer(replicationTransferEpoch_); return; }
@@ -1888,8 +1878,10 @@ private:
     }
     size_t length = std::min((size_t)256 * 1024, transfer->end - transfer->offset);
     if (transfer->file) transfer->file->prefetch(transfer->offset, 4 * length);
+    startReplicationWrite(*transfer);
     stream_.async_write_some(net::buffer(transfer->data.data() + transfer->offset, length),
         [self = shared_from_this(), transfer](beast::error_code ec, size_t bytes) {
+          self->finishReplicationWrite(*transfer, ec);
           if (ec) { self->abortReplicationTransfer(self->replicationTransferEpoch_); self->doClose(); return; }
           transfer->offset += bytes;
           auto time = std::chrono::steady_clock::now();
@@ -2010,8 +2002,10 @@ private:
         }
         response.content_length(transfer->end - transfer->offset);
         transfer->serializer.emplace(response);
+        self->startReplicationWrite(*transfer);
         http::async_write_header(self->stream_, *transfer->serializer,
             [self, transfer](beast::error_code ec, size_t) {
+              self->finishReplicationWrite(*transfer, ec);
               if (ec) self->doClose();
               else self->writeReplicationBody(transfer);
             });

@@ -138,9 +138,10 @@ exceeded. Snapshot acquisition and byte progress renew them; idle expiry or
 revocation aborts their transfers. A server timer checks expiry; internal users
 also expire reservations on activity. `_stats` exposes `snapshot_pins`,
 `pin_retained_bytes`, `pin_idle_drops`, and `pin_budget_drops`. Reservations and
-acks are process-local. Every HTTP socket write has a fixed 60 s idle deadline,
-so one stalled client cannot hold a transfer indefinitely while another client
-renews their shared reservation. Followers back off after a lost reservation.
+acks are process-local. Replication file transfers have a fixed 60 s idle deadline
+per socket write, so one stalled client cannot hold a transfer indefinitely while
+another client renews their shared reservation. Followers back off after a lost
+reservation.
 
 Storage layout is `c/name/incarnation/`, with `CURRENT` containing
 only the selected incarnation. `replication.json` stores follower identity,

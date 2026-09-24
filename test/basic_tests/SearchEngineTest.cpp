@@ -3000,8 +3000,8 @@ TEST_F(SearchEngineTest, wholeFieldSortServesResidentMembershipItNeverBuilds) {
   CollectionHelper disabled(disabledCollection);
   auto cache = std::make_shared<FilterCache>(
       FilterCacheConfig{.minSegmentDocs = 0});
-  enabled.getIndexWriter()->filterCache = cache;
-  disabled.getIndexWriter()->filterCache = std::make_shared<FilterCache>(
+  enabled.getIndexWriter()->snapshots.readers.filterCache = cache;
+  disabled.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
       FilterCacheConfig{.maxBytes = 0, .minSegmentDocs = 0});
   indexWholeFieldSortDocs(enabled);
   indexWholeFieldSortDocs(disabled);
