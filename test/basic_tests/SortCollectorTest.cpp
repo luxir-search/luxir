@@ -2919,6 +2919,115 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
   EXPECT_EQ(deletedArrExhaustive.ids, deletedArrUnfolded.ids);
 }
 
+// The calibrated crossovers on the 5M benchgame geometry (9766 leaves): bound
+// order below ~700 expected floor leaves at k=10 and ~2000 at k=100. A
+// checkpoint without proofs hands off; a proof rate near the expected floor
+// continues, and one far past the crossover hands off.
+TEST_F(SortCollectorTest, exactDomainSortCostsCrossover) {
+  using Costs = ExactDomainSortCosts;
+  constexpr int64_t kMaxDoc = 5032104;
+  constexpr int64_t kLeaves = 9766;
+  auto pays = [&](int64_t k, int64_t card) {
+    return Costs::boundOrderPays((k * kMaxDoc + card - 1) / card, card,
+                                 kLeaves);
+  };
+  EXPECT_TRUE(pays(10, 100000));     // floor 504
+  EXPECT_FALSE(pays(10, 50000));     // floor 1007
+  EXPECT_TRUE(pays(100, 300000));    // floor 1678
+  EXPECT_FALSE(pays(100, 200000));   // floor 2517
+  EXPECT_TRUE(pays(1000, 2000000));  // floor 2517
+  EXPECT_FALSE(Costs::boundOrderKeepsPaying(252, 0, 10, 100000, kLeaves));
+  EXPECT_TRUE(Costs::boundOrderKeepsPaying(252, 4, 10, 100000, kLeaves));
+  EXPECT_FALSE(Costs::boundOrderKeepsPaying(252, 1, 10, 100000, kLeaves));
+}
+
+// The exact-domain driver picks its phases by cost (ExactDomainSortCosts).
+// One 80-leaf segment, k = 1: a small ARRAY filter sweeps in doc order from
+// the start; a half-corpus BITSET filter proves in bound order; a filter of
+// only the lowest keys, sorted descending, makes every leaf bound beat every
+// member, so bound order starts on the uniform-key floor, makes no proof by
+// the first progress checkpoint, and hands off to the sweep. Every route
+// matches exhaustive collection, the ladder, and forced bound order.
+TEST_F(SortCollectorTest, bestFirstRouteFollowsCostModel) {
+  WholeMembershipPlanGuard wholeGuard(true);
+  CollectionHelper helper("best_first_cost");
+  constexpr int32_t kDocs = 80 * 512;
+  constexpr int64_t kLowKeys = 0x7fffffff / 4;
+  for (int32_t docId = 0; docId < kDocs; docId++) {
+    int64_t key = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
+    std::string body = docId % 2 == 0 ? "large" : "odd";
+    if (docId % 34 == 0) body += " small";
+    if (key < kLowKeys) body += " low";
+    helper.index(flatdoc("id", std::to_string(docId),
+                         "id_s", std::to_string(docId), "body_w", body,
+                         "key_i", key),
+                 UpdateMessage::NO_COMMIT);
+  }
+  helper.commit();
+
+  struct Result {
+    std::vector<std::string> ids;
+    int64_t sweeps = 0;
+    int64_t boundOrder = 0;
+    int64_t proofs = 0;
+    int64_t handoffs = 0;
+  };
+  auto run = [&](std::string_view value, qb::SortDir dir, int32_t limit,
+                 bool disableBestFirst = false, bool forceBestFirst = false,
+                 bool disablePruning = false) {
+    BestFirstGuard bfGuard(disableBestFirst, forceBestFirst);
+    SortPruningGuard pruningGuard(disablePruning);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("best_first_cost");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    cur.allQuery().matchFilter("body_w", value);
+    qb::sort(cur, "key_i", dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{resultIds(*req), SkipStats::fieldSortDocOrderSweeps,
+                  SkipStats::fieldSortBestFirstActivations,
+                  SkipStats::fieldSortBestFirstTerminations,
+                  SkipStats::fieldSortBestFirstFallbacks};
+  };
+  for (std::string_view value : {"small", "large", "low"}) {
+    run(value, qb::DESC, 1);  // two sightings admit the filter
+    run(value, qb::DESC, 1);
+  }
+
+  auto small = run("small", qb::DESC, 1);
+  EXPECT_EQ(1, small.sweeps);
+  EXPECT_EQ(0, small.boundOrder);
+  auto large = run("large", qb::DESC, 1);
+  EXPECT_EQ(0, large.sweeps);
+  EXPECT_EQ(1, large.boundOrder);
+  EXPECT_EQ(1, large.proofs);
+  EXPECT_EQ(0, large.handoffs);
+  auto low = run("low", qb::DESC, 1);
+  EXPECT_EQ(0, low.sweeps);
+  EXPECT_EQ(1, low.boundOrder);
+  EXPECT_EQ(0, low.proofs);
+  EXPECT_EQ(1, low.handoffs);
+  // Ascending, the same filter holds the best keys and bound order proves.
+  auto lowAsc = run("low", qb::ASC, 1);
+  EXPECT_EQ(1, lowAsc.proofs);
+  EXPECT_EQ(0, lowAsc.handoffs);
+
+  for (std::string_view value : {"small", "large", "low"}) {
+    for (qb::SortDir dir : {qb::DESC, qb::ASC}) {
+      for (int32_t limit : {1, 10, 300}) {
+        auto exhaustive = run(value, dir, limit, false, false, true);
+        EXPECT_EQ(exhaustive.ids, run(value, dir, limit).ids)
+            << value << " limit=" << limit;
+        EXPECT_EQ(exhaustive.ids, run(value, dir, limit, true).ids)
+            << value << " limit=" << limit;
+        EXPECT_EQ(exhaustive.ids, run(value, dir, limit, false, true).ids)
+            << value << " limit=" << limit;
+      }
+    }
+  }
+}
+
 // Seeded two-pass query-driven collection must match doc-order pruning and
 // exhaustive collection. The corpus gives every query shape the driver must
 // survive: "alpha" is a mid-density term uncorrelated with the sort keys,

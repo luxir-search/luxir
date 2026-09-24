@@ -116,9 +116,16 @@ public:
     CONSTANT_FIRST_K,
   };
 
+  // Available when the sole numeric key offers masked leaf bounds and the
+  // expected bound-order visit floor, ceil(k * maxDoc / card) leaves, is
+  // sub-saturating (2 * floor < leafCount). Past that the bounds skip too
+  // little to repay the driver's per-leaf sweep, and the ladder's coarse-range
+  // walk serves a sparse domain faster (measured up to 2x on 0.1-1%
+  // memberships). The route then picks the driver's phases by cost
+  // (ExactDomainSortCosts).
   struct FieldSortBestFirstPlan {
     FieldSortCollector::KeyBlockPlan keys;
-    int64_t expectedFloor = 0;
+    ExactDomainSortRoute route;
 
     bool available() const noexcept { return keys.batch != nullptr; }
   };
@@ -147,7 +154,15 @@ public:
         && !forceFieldSortBestFirst) {
       return {};
     }
-    return {keys, expectedFloor};
+    ExactDomainSortRoute route;
+    route.card = card;
+    route.expectedFloor = expectedFloor;
+    route.boundOrder = forceFieldSortBestFirst
+        || ExactDomainSortCosts::boundOrderPays(
+            expectedFloor, card, keys.leafCount);
+    route.checkProgress = !forceFieldSortBestFirst;
+    route.gatherCapForTests = forceFieldSortWorkCapForTests;
+    return {keys, route};
   }
 
   static bool fieldSortCanUseMaskedBestFirst(const SortPlan& sortPlan) {
@@ -1758,14 +1773,14 @@ public:
             Query::ScorerSupplier::BulkScorerContext matchWindowsContext;
             // Best-first exact-domain route: when the whole result set is
             // already materialized (BITSET or ARRAY), no scorer needs to run
-            // - the driver visits key blocks in bound order and terminates
-            // on proof. Two domain sources qualify: the supplier's exact
-            // cached set (a folded filter-only Boolean over match-all, no
-            // other filter or sub-op domain restriction), or an explicit
-            // collectorFilter under a true match-all weight. Activation also
-            // requires the expected visit floor (ceil(k/d) blocks) to be
-            // sub-saturating; at ceil(k/d) >= blockCount the bound floor
-            // covers every block and bound order cannot beat doc order.
+            // - the driver visits key blocks in bound order when that pays,
+            // terminating on proof, and sweeps whatever it leaves in doc
+            // order (ExactDomainSortCosts). The domain sources: a resident
+            // whole membership, the supplier's exact cached set (a folded
+            // filter-only Boolean over match-all, no other filter or sub-op
+            // domain restriction), an explicit collectorFilter under a true
+            // match-all weight, or every doc. Activation requires the
+            // expected visit floor (ceil(k/d) leaves) to be sub-saturating.
             if (maySkipNoncompetitiveDocs
                 && (!requiresWholeIndexPrepare || wholeFieldSortAvailable)
                 && !data->fieldCollector->needsScores
@@ -1796,18 +1811,11 @@ public:
                 auto bestFirst = planFieldSortBestFirst(
                     *data->fieldCollector, card, seg.maxDoc());
                 if (bestFirst.available()) {
-                  auto& plan = bestFirst.keys;
-                  // Cap generously above the expected floor so uniform
-                  // data reaches proof termination; the forward-sweep
-                  // fallback keeps adversarial tie plateaus linear.
-                  int64_t workCap = forceFieldSortWorkCapForTests > 0
-                      ? forceFieldSortWorkCapForTests
-                      : std::min(
-                          plan.leafCount, 4 * bestFirst.expectedFloor + 64);
                   if (!allDocs && domainSet->type == DocSet::ARRAY) {
                     collectTopKArrayBestFirst(
                         segnum, ((ArrDocSet*)domainSet)->docs(),
-                        *data->fieldCollector, poolGuard.pool(), workCap);
+                        *data->fieldCollector, poolGuard.pool(),
+                        bestFirst.route);
                   } else {
                     std::span<const uint64_t> words;  // empty = every doc
                     if (!allDocs) {
@@ -1819,7 +1827,8 @@ public:
                     }
                     collectTopKBitSetBestFirst(
                         segnum, words,
-                        *data->fieldCollector, poolGuard.pool(), workCap);
+                        *data->fieldCollector, poolGuard.pool(),
+                        bestFirst.route);
                   }
                   data->fieldCollector->recordSegmentSkipStats(segnum);
                   if (wholeFieldSortAvailable) {

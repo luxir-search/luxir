@@ -85,16 +85,19 @@ inline InlineFacetEntryMode forcedInlineFacetEntryMode =
 inline bool disableFieldSortPruning =
     std::getenv("LUXIR_DISABLE_FIELD_SORT_PRUNING") != nullptr;
 
-// A/B baseline for the best-first exact-bitset field-sort driver. Default
-// false means eligible match-all + cached-bitset field sorts visit key
-// blocks in bound order with proof termination instead of doc order.
+// A/B baseline for the best-first exact-domain field-sort driver. Default
+// false means eligible materialized-domain field sorts take the driver
+// (cost-gated bound order, then a doc-order leaf sweep) instead of the
+// query-driven ladder.
 inline bool disableFieldSortBestFirst =
     std::getenv("LUXIR_DISABLE_FIELD_SORT_BEST_FIRST") != nullptr;
-// Test-only: bypass the expected-floor activation gate so small corpora
-// (too few key blocks to ever pass it) still drive the best-first arm.
+// Test-only: bypass the expected-floor activation gate and the bound-order
+// economics (cost gate and progress checkpoints) so small corpora (too few key
+// blocks to ever pass them) still drive the bound-order phase.
 inline bool forceFieldSortBestFirst = false;
-// Test-only: override the best-first leaf work cap (0 = production formula)
-// so the cap-crossing forward-sweep fallback is reachable on small corpora.
+// Test-only: hand the best-first bound-order phase off to the doc-order sweep
+// after this many leaf gathers (0 = production progress checkpoints only), so
+// the hand-off is reachable on small corpora.
 inline int64_t forceFieldSortWorkCapForTests = 0;
 
 // A/B baseline for the seeded two-pass query-driven field-sort driver.

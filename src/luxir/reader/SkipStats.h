@@ -260,14 +260,18 @@ struct SkipStats {
   static inline int64_t fieldSortLeavesSkipped = 0;
   static inline int64_t fieldSortIrreducibleLeaves = 0;
   static inline int64_t fieldSortRequiredLeaves = 0;
-  // Best-first exact-domain driver: route activations, coarse nodes
-  // expanded into leaves, leaves gathered, proof terminations (heap head
-  // strictly noncompetitive), and work-cap fallbacks to the forward sweep.
+  // Best-first exact-domain driver. Bound-order phase: activations, coarse
+  // nodes expanded into leaves, leaves gathered, proof terminations (heap
+  // head strictly noncompetitive), and hand-offs to the doc-order sweep
+  // (progress checkpoint or test cap). Doc-order phase: domains the cost
+  // gate sends straight to the sweep, and leaves the sweep gathered.
   static inline int64_t fieldSortBestFirstActivations = 0;
   static inline int64_t fieldSortBestFirstExpansions = 0;
   static inline int64_t fieldSortBestFirstLeaves = 0;
   static inline int64_t fieldSortBestFirstTerminations = 0;
   static inline int64_t fieldSortBestFirstFallbacks = 0;
+  static inline int64_t fieldSortDocOrderSweeps = 0;
+  static inline int64_t fieldSortSweepLeaves = 0;
   // Seeded two-pass query-driven driver: route activations, seed leaves the
   // scorer actually enumerated, seeds the maturing bottom classified away
   // before any postings work, seed-schedule aborts (underfilled heap or a
@@ -554,6 +558,8 @@ struct SkipStats {
     fieldSortBestFirstLeaves = 0;
     fieldSortBestFirstTerminations = 0;
     fieldSortBestFirstFallbacks = 0;
+    fieldSortDocOrderSweeps = 0;
+    fieldSortSweepLeaves = 0;
     fieldSortSeededActivations = 0;
     fieldSortSeedLeaves = 0;
     fieldSortSeedClassifiedOut = 0;

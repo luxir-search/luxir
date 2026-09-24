@@ -425,6 +425,19 @@ public:
     return topCount > 0 && pq.size() == (size_t)topCount;
   }
 
+  // Heap entries whose primary key is strictly below `bound`. When `bound`
+  // lower-bounds every doc not yet seen, no later doc can displace them, so
+  // they are final. Slots are minted densely, so slotKeys[0, size) is the
+  // heap.
+  int64_t countKeysBelow(int64_t bound,
+                         FieldComparator::KeyBatch* batch) const {
+    int64_t below = 0;
+    for (size_t slot = 0; slot < pq.size(); slot++) {
+      below += batch->slotKeys[slot] < bound;
+    }
+    return below;
+  }
+
   struct KeyBlockPlan {
     FieldComparator::KeyBatch* batch = nullptr;
     int32_t blockSize = 0;
