@@ -102,7 +102,7 @@ inline int64_t forceFieldSortWorkCapForTests = 0;
 
 // A/B baseline for the seeded two-pass query-driven field-sort driver.
 // Default false means eligible query-driven field sorts fill the heap from
-// the best-bounded key blocks first, then sweep the complement.
+// the best-bounded leaves first, then sweep the complement.
 inline bool disableFieldSortSeeding =
     std::getenv("LUXIR_DISABLE_FIELD_SORT_SEEDING") != nullptr;
 // Test-only: bypass the economic gates (materiality and matches-per-block)

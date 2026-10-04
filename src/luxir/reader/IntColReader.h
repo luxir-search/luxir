@@ -344,11 +344,22 @@ private:
   NumColumn values;
   const char* zoneMeta = nullptr;
   const char* leafZoneMeta = nullptr;
+  const char* leavesByMin = nullptr;  // uint32 leaf ids, unaligned
+  const char* leavesByMax = nullptr;
   std::optional<MonoReader> endValueRankReader;  // exists if multi-valued.
   int64_t nvals;
   int32_t docsWithField = 0;
   int64_t columnMin = 0;
   int64_t columnMax = 0;
+
+  // Zone metadata follows the block descriptors: block zones, leaf zones,
+  // then the two leaf visit orders (NumColumnWriter::finish).
+  void locateZoneMeta(const char* blockMeta) {
+    zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
+    leafZoneMeta = zoneMeta + numBlocks() * sizeof(NumBlockZone);
+    leavesByMin = leafZoneMeta + numLeafZones() * sizeof(NumBlockZone);
+    leavesByMax = leavesByMin + numLeafZones() * sizeof(uint32_t);
+  }
 
 public:
   /// The fieldInfo is only used in the constructor and can be discarded after.
@@ -361,13 +372,11 @@ public:
     const char* blocks = columnIS.ptr();
     const char* blockMeta = blocks + fieldInfo.columnMetaOff;
     values = NumColumn(blocks, blockMeta, nvals);
-    zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
-    leafZoneMeta = zoneMeta + numBlocks() * sizeof(NumBlockZone);
+    locateZoneMeta(blockMeta);
 
     // Read min/max values that come after the zone arrays
     if (nvals > 0) {
-      const char* minMaxPtr =
-          leafZoneMeta + numLeafZones() * sizeof(NumBlockZone);
+      const char* minMaxPtr = leavesByMax + numLeafZones() * sizeof(uint32_t);
       const char* endPtr = columnIS.ptr(0) + columnIS.size();
       columnMin = InputStream::readVlong(minMaxPtr, endPtr);
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
@@ -395,13 +404,11 @@ public:
     const char* blocks = columnIS.ptr();
     const char* blockMeta = blocks + columnMetaOff;
     values = NumColumn(blocks, blockMeta, nvals);
-    zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
-    leafZoneMeta = zoneMeta + numBlocks() * sizeof(NumBlockZone);
+    locateZoneMeta(blockMeta);
 
     // Read min/max values that come after the zone arrays
     if (nvals > 0) {
-      const char* minMaxPtr =
-          leafZoneMeta + numLeafZones() * sizeof(NumBlockZone);
+      const char* minMaxPtr = leavesByMax + numLeafZones() * sizeof(uint32_t);
       const char* endPtr = columnIS.ptr(0) + columnIS.size();
       columnMin = InputStream::readVlong(minMaxPtr, endPtr);
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
@@ -470,6 +477,23 @@ public:
     NumBlockZone zone;
     memcpy(&zone, leafZoneMeta + leaf * sizeof(zone), sizeof(zone));
     return zone;
+  }
+
+  // The persisted leaf visit orders (NumColumnFormat::leafVisitOrder): the
+  // leaf at `rank` ascending by (zone.min, leaf), and descending by zone.max
+  // with ties by ascending leaf.
+  int64_t leafByMinAscending(int64_t rank) const {
+    assert(rank >= 0 && rank < numLeafZones());
+    uint32_t leaf;
+    memcpy(&leaf, leavesByMin + rank * sizeof(leaf), sizeof(leaf));
+    return leaf;
+  }
+
+  int64_t leafByMaxDescending(int64_t rank) const {
+    assert(rank >= 0 && rank < numLeafZones());
+    uint32_t leaf;
+    memcpy(&leaf, leavesByMax + rank * sizeof(leaf), sizeof(leaf));
+    return leaf;
   }
 
   int32_t valuesInBlock(int64_t blockNum) const {

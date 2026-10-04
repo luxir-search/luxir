@@ -8,12 +8,35 @@
 #include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
+#include <numeric>
 #include <vector>
 
 #include "luxir/index/IntColWriter.h"
 
 using namespace luxir;
 using namespace luxir::test;
+
+// The persisted leaf visit orders against an independent oracle: a stable
+// sort of leaf ids by zone.min ascending, and by zone.max descending, so ties
+// keep ascending leaf order.
+static void expectLeafVisitOrders(const IntColReader& reader) {
+  int64_t leaves = reader.numLeafZones();
+  for (bool byMax : {false, true}) {
+    std::vector<int64_t> oracle((size_t)leaves);
+    std::iota(oracle.begin(), oracle.end(), 0);
+    std::stable_sort(oracle.begin(), oracle.end(), [&](int64_t a, int64_t b) {
+      NumBlockZone za = reader.leafZone(a);
+      NumBlockZone zb = reader.leafZone(b);
+      return byMax ? za.max > zb.max : za.min < zb.min;
+    });
+    for (int64_t rank = 0; rank < leaves; rank++) {
+      int64_t leaf = byMax ? reader.leafByMaxDescending(rank)
+                           : reader.leafByMinAscending(rank);
+      EXPECT_EQ(oracle[(size_t)rank], leaf) << "byMax=" << byMax
+                                            << " rank=" << rank;
+    }
+  }
+}
 
 class IntColTest : public LuxirTest {
 protected:
@@ -280,6 +303,11 @@ TEST_F(IntColTest, linearPackFormatCorners) {
       EXPECT_EQ(zone.min, *minIt) << "leaf=" << leaf;
       EXPECT_EQ(zone.max, *maxIt) << "leaf=" << leaf;
     }
+    expectLeafVisitOrders(reader);
+    // The bounds trailer follows the leaf orders.
+    auto [minIt, maxIt] = std::minmax_element(expected.begin(), expected.end());
+    EXPECT_EQ(reader.getMin(), *minIt);
+    EXPECT_EQ(reader.getMax(), *maxIt);
     return reader.blockInfo(0);
   };
 
@@ -346,6 +374,72 @@ TEST_F(IntColTest, linearPackFormatCorners) {
     }
     check(ramp);
   }
+}
+
+// Leaf visit orders over ten leaves spanning two blocks (the last one
+// partial), with tied mins and tied maxes: ascending by (min, leaf), and
+// descending by max with ties by ascending leaf.
+TEST_F(IntColTest, leafVisitOrders) {
+  constexpr int64_t kLeaf = NumColumnFormat::LEAF_ZONE_SIZE;
+  std::vector<NumBlockZone> zones = {{5, 9},  {3, 9}, {5, 7}, {3, 12},
+                                     {1, 7},  {5, 12}, {-2, 0}, {8, 8},
+                                     {3, 12}, {5, 9}};
+  std::vector<int64_t> values;
+  for (size_t leaf = 0; leaf < zones.size(); leaf++) {
+    int64_t count = leaf + 1 == zones.size() ? 100 : kLeaf;
+    auto [min, max] = zones[leaf];
+    for (int64_t i = 0; i < count; i++) {
+      values.push_back(i == count - 1 ? max : min + i % (max - min + 1));
+    }
+  }
+
+  RAMDir dir;
+  auto file = dir.createFile("numeric");
+  OutputStream out(file.get());
+  IntColWriter writer(out);
+  for (int64_t value : values) writer.addInt64(value);
+  auto data = writer.finish();
+  out.close();
+  dir.finishFile(*file);
+  auto in = dir.openFile("numeric");
+  InputStream input(in->getInputStream());
+  IntColReader reader(input, data.columnLoc, data.columnMetaOff,
+                      data.numValues);
+
+  ASSERT_EQ((int64_t)zones.size(), reader.numLeafZones());
+  std::vector<int64_t> ascending;
+  std::vector<int64_t> descending;
+  for (int64_t rank = 0; rank < reader.numLeafZones(); rank++) {
+    EXPECT_EQ(zones[(size_t)rank].min, reader.leafZone(rank).min);
+    EXPECT_EQ(zones[(size_t)rank].max, reader.leafZone(rank).max);
+    ascending.push_back(reader.leafByMinAscending(rank));
+    descending.push_back(reader.leafByMaxDescending(rank));
+  }
+  EXPECT_EQ((std::vector<int64_t>{6, 4, 1, 3, 8, 0, 2, 5, 9, 7}), ascending);
+  EXPECT_EQ((std::vector<int64_t>{3, 5, 8, 0, 1, 9, 7, 2, 4, 6}), descending);
+  EXPECT_EQ(-2, reader.getMin());
+  EXPECT_EQ(12, reader.getMax());
+}
+
+// Merges rewrite columns through the writer, so a merged column carries
+// orders over its merged leaves, not either input's.
+TEST_F(IntColTest, leafVisitOrdersAfterMerge) {
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_i");
+  for (int32_t seg = 0; seg < 2; seg++) {
+    f.startIndexing();
+    for (int32_t doc = 0; doc < 3000 + 700 * seg; doc++) {
+      f.add(doc, (int64_t)(((uint32_t)(doc + 5000 * seg) * 2654435761u)
+                           % 100000));
+    }
+    testIndex.flush();
+  }
+  testIndex.iw->mergeSegments();
+  f.startReading();
+  ASSERT_TRUE(f.nextSegment());
+  ASSERT_EQ(1, testIndex.reader->segments().size());
+  ASSERT_EQ(6700, f.colReader->numValues());
+  expectLeafVisitOrders(*f.colReader);
 }
 
 TEST_F(IntColTest, wrappingBaseBitPattern) {

@@ -2729,6 +2729,46 @@ TEST_F(SortCollectorTest, phraseFieldSortPruningMatchesExhaustive) {
   }
 }
 
+// The bound-ordered drivers walk KeyBatch::boundOrderLeaf as the leaf visit
+// order. In both directions it must be a permutation of the leaves, carry
+// each leaf's leafBestKey as its bound, and ascend by (bound, leaf). Keys
+// rise by block with coarse noise, so neighboring leaves tie on min and max.
+TEST_F(SortCollectorTest, boundOrderLeavesAscendByBoundThenLeaf) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 3 * 4096 + 300; doc++) {
+    int64_t key = (int64_t)(((uint32_t)doc * 2654435761u) % 1000) / 100
+        + doc / 2048;
+    docs.push_back(flatdoc("id", std::to_string(doc), "key_i", key));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  for (bool reversed : {false, true}) {
+    for (auto& segment : reader->segments()) {
+      SimpleNumericFieldComparator comparator(
+          "key_i", reversed, FieldComparator::MISSING_LAST);
+      comparator.setSegment(segment.ord, &segment.postingsReader());
+      FieldComparator::KeyBatch* batch = comparator.keyBatch();
+      ASSERT_NE(0, batch->leafBlockSize());
+      int64_t leaves = batch->leafBlockCount();
+      std::vector<bool> seen((size_t)leaves);
+      std::pair<int64_t, int64_t> previous{
+          std::numeric_limits<int64_t>::min(), -1};
+      for (int64_t rank = 0; rank < leaves; rank++) {
+        auto [leaf, bound] = batch->boundOrderLeaf(rank);
+        ASSERT_TRUE(leaf >= 0 && leaf < leaves);
+        EXPECT_FALSE(seen[(size_t)leaf]) << "leaf=" << leaf;
+        seen[(size_t)leaf] = true;
+        EXPECT_EQ(batch->leafBestKey(leaf), bound) << "leaf=" << leaf;
+        std::pair<int64_t, int64_t> current{bound, leaf};
+        EXPECT_LT(previous, current) << "reversed=" << reversed
+                                     << " rank=" << rank;
+        previous = current;
+      }
+    }
+  }
+}
+
 // The best-first exact-domain driver must return exactly what the doc-order
 // windowed path and exhaustive collection return. Its bitset domain arrives
 // two ways: the folded filter-only Boolean's cached set (delete-free
@@ -2919,44 +2959,47 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
   EXPECT_EQ(deletedArrExhaustive.ids, deletedArrUnfolded.ids);
 }
 
-// The calibrated crossovers on the 5M benchgame geometry (9766 leaves): bound
-// order below ~700 expected floor leaves at k=10 and ~2000 at k=100. A
-// checkpoint without proofs hands off; a proof rate near the expected floor
-// continues, and one far past the crossover hands off.
+// The calibrated crossovers on the 5M benchgame geometry (9829 leaves): bound
+// order below ~3000 expected floor leaves at k=10, and through the whole
+// sub-saturating band (2 * floor < leafCount) at k=100. A checkpoint without
+// proofs hands off; a proof rate near the expected floor continues, and one
+// far past the crossover hands off.
 TEST_F(SortCollectorTest, exactDomainSortCostsCrossover) {
   using Costs = ExactDomainSortCosts;
   constexpr int64_t kMaxDoc = 5032104;
-  constexpr int64_t kLeaves = 9766;
+  constexpr int64_t kLeaves = 9829;
   auto pays = [&](int64_t k, int64_t card) {
     return Costs::boundOrderPays((k * kMaxDoc + card - 1) / card, card,
                                  kLeaves);
   };
-  EXPECT_TRUE(pays(10, 100000));     // floor 504
-  EXPECT_FALSE(pays(10, 50000));     // floor 1007
-  EXPECT_TRUE(pays(100, 300000));    // floor 1678
-  EXPECT_FALSE(pays(100, 200000));   // floor 2517
+  EXPECT_TRUE(pays(10, 20000));      // floor 2517
+  EXPECT_FALSE(pays(10, 15000));     // floor 3355
+  EXPECT_TRUE(pays(100, 110000));    // floor 4575
+  EXPECT_FALSE(pays(100, 80000));    // floor 6291, past the band
   EXPECT_TRUE(pays(1000, 2000000));  // floor 2517
   EXPECT_FALSE(Costs::boundOrderKeepsPaying(252, 0, 10, 100000, kLeaves));
   EXPECT_TRUE(Costs::boundOrderKeepsPaying(252, 4, 10, 100000, kLeaves));
-  EXPECT_FALSE(Costs::boundOrderKeepsPaying(252, 1, 10, 100000, kLeaves));
+  EXPECT_TRUE(Costs::boundOrderKeepsPaying(252, 1, 10, 100000, kLeaves));
+  EXPECT_FALSE(Costs::boundOrderKeepsPaying(2000, 1, 10, 100000, kLeaves));
 }
 
 // The exact-domain driver picks its phases by cost (ExactDomainSortCosts).
-// One 80-leaf segment, k = 1: a small ARRAY filter sweeps in doc order from
-// the start; a half-corpus BITSET filter proves in bound order; a filter of
-// only the lowest keys, sorted descending, makes every leaf bound beat every
-// member, so bound order starts on the uniform-key floor, makes no proof by
-// the first progress checkpoint, and hands off to the sweep. Every route
-// matches exhaustive collection, the ladder, and forced bound order.
+// One 256-leaf segment, k = 1: a small ARRAY filter whose expected floor sits
+// just under the availability gate sweeps in doc order from the start; a
+// half-corpus BITSET filter proves in bound order; a filter of only the
+// lowest keys, sorted descending, makes every leaf bound beat every member,
+// so bound order starts on the uniform-key floor, makes no proof by the first
+// progress checkpoint, and hands off to the sweep. Every route matches
+// exhaustive collection, the ladder, and forced bound order.
 TEST_F(SortCollectorTest, bestFirstRouteFollowsCostModel) {
   WholeMembershipPlanGuard wholeGuard(true);
   CollectionHelper helper("best_first_cost");
-  constexpr int32_t kDocs = 80 * 512;
+  constexpr int32_t kDocs = 256 * 512;
   constexpr int64_t kLowKeys = 0x7fffffff / 4;
   for (int32_t docId = 0; docId < kDocs; docId++) {
     int64_t key = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
     std::string body = docId % 2 == 0 ? "large" : "odd";
-    if (docId % 34 == 0) body += " small";
+    if (docId % 127 == 0) body += " small";
     if (key < kLowKeys) body += " low";
     helper.index(flatdoc("id", std::to_string(docId),
                          "id_s", std::to_string(docId), "body_w", body,

@@ -89,8 +89,6 @@ static void recordFieldSortCounters(benchmark::State& state) {
       (double)SkipStats::fieldSortRequiredLeaves;
   state.counters["bfActivations"] =
       (double)SkipStats::fieldSortBestFirstActivations;
-  state.counters["bfExpansions"] =
-      (double)SkipStats::fieldSortBestFirstExpansions;
   state.counters["bfLeaves"] = (double)SkipStats::fieldSortBestFirstLeaves;
   state.counters["bfTerminations"] =
       (double)SkipStats::fieldSortBestFirstTerminations;

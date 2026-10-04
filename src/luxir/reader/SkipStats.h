@@ -260,13 +260,13 @@ struct SkipStats {
   static inline int64_t fieldSortLeavesSkipped = 0;
   static inline int64_t fieldSortIrreducibleLeaves = 0;
   static inline int64_t fieldSortRequiredLeaves = 0;
-  // Best-first exact-domain driver. Bound-order phase: activations, coarse
-  // nodes expanded into leaves, leaves gathered, proof terminations (heap
-  // head strictly noncompetitive), and hand-offs to the doc-order sweep
-  // (progress checkpoint or test cap). Doc-order phase: domains the cost
-  // gate sends straight to the sweep, and leaves the sweep gathered.
+  // Best-first exact-domain driver. Bound-order phase: activations, leaves
+  // gathered, proof terminations (the next leaf in bound order strictly
+  // noncompetitive; it and every later leaf count as skipped), and hand-offs
+  // to the doc-order sweep (progress checkpoint or test cap). Doc-order
+  // phase: domains the cost gate sends straight to the sweep, and leaves the
+  // sweep gathered.
   static inline int64_t fieldSortBestFirstActivations = 0;
-  static inline int64_t fieldSortBestFirstExpansions = 0;
   static inline int64_t fieldSortBestFirstLeaves = 0;
   static inline int64_t fieldSortBestFirstTerminations = 0;
   static inline int64_t fieldSortBestFirstFallbacks = 0;
@@ -554,7 +554,6 @@ struct SkipStats {
     fieldSortIrreducibleLeaves = 0;
     fieldSortRequiredLeaves = 0;
     fieldSortBestFirstActivations = 0;
-    fieldSortBestFirstExpansions = 0;
     fieldSortBestFirstLeaves = 0;
     fieldSortBestFirstTerminations = 0;
     fieldSortBestFirstFallbacks = 0;

@@ -126,13 +126,20 @@ public:
         out.write(blockZones.data(), blockZones.size() * sizeof(NumBlockZone));
       }
       // Leaf zones directly follow the block zones (both 16-byte entries, so
-      // alignment is preserved); readers locate them from the block count and
-      // the bounds trailer from ceil(numValues / LEAF_ZONE_SIZE).
+      // alignment is preserved), then the two leaf visit orders as uint32
+      // leaf ids (NumColumnFormat::leafVisitOrder): by min ascending, then by
+      // max descending. Readers locate all three from the block count and
+      // ceil(numValues / LEAF_ZONE_SIZE), and the bounds trailer after them.
       if (!leafZones.empty()) {
         assert((int64_t)leafZones.size()
                == (nAdded + NumColumnFormat::LEAF_ZONE_SIZE - 1)
                    / NumColumnFormat::LEAF_ZONE_SIZE);
         out.write(leafZones.data(), leafZones.size() * sizeof(NumBlockZone));
+        std::vector<uint32_t> order(leafZones.size());
+        for (bool byMaxDescending : {false, true}) {
+          NumColumnFormat::leafVisitOrder(leafZones, byMaxDescending, order);
+          out.write(order.data(), order.size() * sizeof(uint32_t));
+        }
       }
     }
     if (writeBounds) {

@@ -955,32 +955,36 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
 // Exact-domain field-sort economics, in units of one gathered doc (a key
 // gather plus its heap admission test). A materialized domain (cached docs,
 // or every doc for match-all with no deletes) is served in two phases: an
-// optional bound-order phase over the key-block bounds with proof
-// termination, then a forward doc-order sweep over the leaves it did not
-// visit, classifying each against the maturing bottom. With uniform keys
+// optional bound-order phase over the leaf bounds with proof termination,
+// then a forward doc-order sweep over the leaves it did not visit,
+// classifying each against the maturing bottom. With uniform keys
 // independent of the domain, both gather the ~k*leafSize domain docs of the
 // expectedFloor leaves any correct traversal visits. Bound order adds
-// kBoundOrderLeafCost per visited leaf (a frontier pop, its share of coarse
-// expansions, and a random-access gather). The sweep instead gathers the
-// leaves it reaches before its bottom matures: at its j-th leaf the bottom
-// ranks k among j*m domain docs (m = card/leafCount per leaf), so a leaf is
-// still competitive with probability about floor/j, which adds
+// kBoundOrderLeafCost per visited leaf (reading the next leaf and its bound
+// from the persisted order, and a random-access gather). The sweep instead
+// gathers the leaves it reaches before its bottom matures: at its j-th leaf
+// the bottom ranks k among j*m domain docs (m = card/leafCount per leaf), so
+// a leaf is still competitive with probability about floor/j, which adds
 // floor*ln(leafCount/floor) leaves of m docs; and it classifies every leaf at
 // kSweepLeafCost. Bound order therefore pays when one visit saves more
 // gathers than it costs: kBoundOrderLeafCost < m*ln(leafCount/floor) +
 // kSweepLeafCost*leafCount/floor.
 //
-// Calibrated on the 5M-doc benchgame corpus (9766 leaves), hugin 2026-09-23:
+// Calibrated on the 5M-doc benchgame corpus (9829 leaves), hugin 2026-10-04:
 // per-query times of each phase alone over resident term-filter memberships
-// of 3K-2.4M docs at k = 10, 100, 1000 (314 sub-saturating cases) cross at
-// floors of about 700 (k=10) and 1900 (k=100). These costs cross at 692 and
-// 2072, and choosing by them loses 0.3% against the per-query best phase. A
-// domain correlated with the sort key (a range on the sort field itself,
-// whose members sit below every leaf bound) breaks the independence premise:
-// bound order then visits every leaf without proof, never beating the sweep,
-// and the progress checkpoints below hand such a domain to the sweep.
+// of 10K-2.4M docs at k = 10, 100, 1000 (314 sub-saturating cases, two runs)
+// cross at floors of about 3100 (k=10) and 4700 (k=100, just under the
+// 2*floor < leafCount availability gate). The data pins only the k=10
+// crossover (k=100 sits at the gate, k=1000 has no sub-saturating sweep
+// win), so the sweep cost keeps its earlier fit and the visit cost is fitted
+// alone: these costs cross at 3022 (k=10) and at the gate (k=100), and
+// choosing by them loses 0.3% against the per-query best phase. A domain
+// correlated with the sort key (a range on the sort field itself, whose
+// members sit below every leaf bound) breaks the independence premise: bound
+// order then visits every leaf without proof, never beating the sweep, and
+// the progress checkpoints below hand such a domain to the sweep.
 struct ExactDomainSortCosts {
-  static constexpr double kBoundOrderLeafCost = 48;
+  static constexpr double kBoundOrderLeafCost = 8.5;
   static constexpr double kSweepLeafCost = 2;
   // The first progress checkpoint waits for this many expected proofs (heap
   // entries below every unvisited bound) under the independence premise, so
@@ -1030,83 +1034,6 @@ struct ExactDomainSortRoute {
   int64_t gatherCapForTests = 0;
 };
 
-// Mixed coarse/leaf bound frontier shared by the bound-ordered drivers: a
-// (bound, firstDoc, coarse-before-leaf) min-heap seeded with only the
-// coarse nodes; a popped-competitive coarse node is replaced by its leaves
-// via expand(). Peak occupancy never exceeds leafCount (each unexpanded
-// coarse node stands in for at least one of its own leaves), and the
-// backing span is UNINITIALIZED - the reservation touches only what the
-// frontier actually holds, so a near-ceiling segment costs pages
-// proportional to the visited frontier, not the leaf directory.
-template <typename KeyBlockPlan>
-class LeafBoundFrontier {
-public:
-  struct Node {
-    int64_t bound;
-    int32_t firstDoc;
-    bool isLeaf;  // a coarse node orders before its equal-bound first leaf
-    int64_t id;   // coarse block id or global leaf id
-    bool operator>(const Node& o) const {
-      if (bound != o.bound) return bound > o.bound;
-      if (firstDoc != o.firstDoc) return firstDoc > o.firstDoc;
-      return isLeaf && !o.isLeaf;
-    }
-  };
-
-  LeafBoundFrontier(const KeyBlockPlan& plan, MemPool& pool)
-      : plan(plan), leavesPerBlock(plan.blockSize / plan.leafSize),
-        heap(pool.make_span<Node>((size_t)plan.leafCount)) {
-    for (int64_t b = 0; b < plan.blockCount; b++) {
-      heap[(size_t)b] = {plan.batch->blockBestKey(b),
-                         (int32_t)(b * (int64_t)plan.blockSize), false, b};
-    }
-    size = (size_t)plan.blockCount;
-    std::make_heap(heap.begin(), heap.begin() + size, cmp);
-  }
-
-  bool empty() const { return size == 0; }
-
-  // The best remaining bound: it lower-bounds every doc of every node still
-  // in the frontier. Requires !empty().
-  int64_t peekBound() const {
-    assert(size != 0);
-    return heap[0].bound;
-  }
-
-  // Pop the best node. pop_heap parks it at heap[size], so
-  // remainingWithHead() covers the head plus the still-live frontier until
-  // the next expand() overwrites the parked slot.
-  Node pop() {
-    Node top = heap[0];
-    std::pop_heap(heap.begin(), heap.begin() + size, cmp);
-    size--;
-    return top;
-  }
-
-  void expand(const Node& coarse) {
-    assert(!coarse.isLeaf);
-    int64_t firstLeaf = coarse.id * leavesPerBlock;
-    int64_t leafLimit = std::min(firstLeaf + leavesPerBlock, plan.leafCount);
-    for (int64_t leaf = firstLeaf; leaf < leafLimit; leaf++) {
-      heap[size] = {plan.batch->leafBestKey(leaf),
-                    (int32_t)(leaf * (int64_t)plan.leafSize), true, leaf};
-      size++;
-      std::push_heap(heap.begin(), heap.begin() + size, cmp);
-    }
-  }
-
-  std::span<const Node> remainingWithHead() const {
-    return heap.first(size + 1);
-  }
-
-private:
-  KeyBlockPlan plan;
-  int64_t leavesPerBlock;
-  std::greater<Node> cmp;  // min-heap
-  std::span<Node> heap;
-  size_t size = 0;
-};
-
 // Doc-order phase: every leaf the bound-order phase did not visit, in doc
 // order, each coarse block and then each leaf classified against the current
 // bottom. A tie skip uses the block or leaf start as its first unseen doc,
@@ -1148,31 +1075,25 @@ void sweepLeavesInDocOrder(int32_t segnum, Collector& collector,
   }
 }
 
-// Bound-order phase: bounds are visited in ascending order through the mixed
-// lazy frontier. Only the coarse blocks are heapified up front (setup cost
-// stays independent of leaf count); popping a competitive coarse node
-// replaces it with its leaves, and only popped-competitive LEAVES gather.
-// Coarse bounds lower-bound their leaves, so a SKIP_STRICT head proves
-// global termination, and a tie-skipped coarse node discards its whole
-// subtree soundly (every child's bound and first unseen doc are at least as
-// bad against the same bottom). Returns true when the phase settled the
-// segment (proof, or an exhausted frontier); false hands the unvisited
-// leaves to the sweep. The hand-off comes from progress checkpoints (at
-// kCheckpointExpectedProofs expected proofs, then at doubling gather counts):
-// heap entries below the head bound are final, and boundOrderKeepsPaying
-// judges how many there are.
+// Bound-order phase: leaves are visited in ascending (bound, leaf) order,
+// which the column persists per direction (KeyBatch::boundOrderLeaf), so the
+// walk is a scan of that order. A SKIP_STRICT leaf proves global termination
+// (every later leaf's bound is at least as bad, and the bottom only
+// improves); a SKIP_TIE leaf is skipped alone. Returns true when the phase
+// settled the segment (proof, or every leaf visited); false hands the
+// unvisited leaves to the sweep. The hand-off comes from progress
+// checkpoints (at kCheckpointExpectedProofs expected proofs, then at
+// doubling gather counts): heap entries below the next leaf's bound are
+// final, and boundOrderKeepsPaying judges how many there are.
 template <typename Collector, typename GatherLeaf>
 bool collectTopKBoundOrder(int32_t segnum, Collector& collector,
-                           MemPool& pool,
                            const typename Collector::KeyBlockPlan& plan,
                            const ExactDomainSortRoute& route,
                            std::span<uint64_t> visited, GatherLeaf& gather) {
   using BC = typename Collector::BlockClass;
-  using Frontier = LeafBoundFrontier<typename Collector::KeyBlockPlan>;
   using Costs = ExactDomainSortCosts;
   skipCount(SkipStats::fieldSortBestFirstActivations);
 
-  Frontier frontier(plan, pool);
   int64_t topCount = collector.topCount;
   int64_t checkpoint = std::numeric_limits<int64_t>::max();
   if (route.checkProgress) {
@@ -1182,46 +1103,37 @@ bool collectTopKBoundOrder(int32_t segnum, Collector& collector,
             / topCount);
   }
   int64_t leafGathers = 0;
-  while (!frontier.empty()) {
-    auto top = frontier.pop();
+  for (int64_t rank = 0; rank < plan.leafCount; rank++) {
+    auto [leaf, bound] = plan.batch->boundOrderLeaf(rank);
     if (collector.heapFull()) {
-      auto cls = collector.classifyBlock(segnum, top.firstDoc, top.bound,
-                                         plan.batch);
+      auto cls = collector.classifyBlock(
+          segnum, (int32_t)(leaf * (int64_t)plan.leafSize), bound,
+          plan.batch);
       if (cls == BC::SKIP_STRICT) {
-        // Heap order proves every remaining node is at least as bad; credit
-        // the head and the whole remaining frontier as skipped, per level,
-        // so cross-arm skip accounting stays comparable.
+        // Credit this leaf and every later one as skipped, so cross-arm
+        // skip accounting stays comparable.
         skipCount(SkipStats::fieldSortBestFirstTerminations);
         if (SkipStats::enabled) {
-          for (const auto& node : frontier.remainingWithHead()) {
-            (node.isLeaf ? SkipStats::fieldSortLeavesSkipped
-                         : SkipStats::fieldSortBlocksSkipped)++;
-          }
+          SkipStats::fieldSortLeavesSkipped += plan.leafCount - rank;
         }
         return true;
       }
       if (cls == BC::SKIP_TIE) {
-        skipCount(top.isLeaf ? SkipStats::fieldSortLeavesSkipped
-                             : SkipStats::fieldSortBlocksSkipped);
+        skipCount(SkipStats::fieldSortLeavesSkipped);
         continue;
       }
     }
-    if (!top.isLeaf) {
-      skipCount(SkipStats::fieldSortBestFirstExpansions);
-      frontier.expand(top);
-      continue;
-    }
-    visited[(size_t)(top.id >> 6)] |= 1ULL << (top.id & 63);
+    visited[(size_t)(leaf >> 6)] |= 1ULL << (leaf & 63);
     skipCount(SkipStats::fieldSortBestFirstLeaves);
-    gather(top.id, false);
+    gather(leaf, false);
     leafGathers++;
-    if (frontier.empty()) return true;
+    if (rank + 1 == plan.leafCount) return true;
     if (route.gatherCapForTests > 0 && leafGathers >= route.gatherCapForTests) {
       return false;
     }
     if (leafGathers >= checkpoint) {
-      int64_t proofs =
-          collector.countKeysBelow(frontier.peekBound(), plan.batch);
+      int64_t proofs = collector.countKeysBelow(
+          plan.batch->boundOrderLeaf(rank + 1).bound, plan.batch);
       if (!Costs::boundOrderKeepsPaying(leafGathers, proofs, topCount,
                                         route.card, plan.leafCount)) {
         return false;
@@ -1249,7 +1161,7 @@ void collectTopKBestFirst(int32_t segnum, Collector& collector, MemPool& pool,
   if (route.boundOrder) {
     visited = pool.make_span<uint64_t>((size_t)((plan.leafCount + 63) >> 6));
     std::fill(visited.begin(), visited.end(), 0);
-    if (collectTopKBoundOrder(segnum, collector, pool, plan, route, visited,
+    if (collectTopKBoundOrder(segnum, collector, plan, route, visited,
                               gather)) {
       return;
     }
@@ -1352,27 +1264,17 @@ void collectTopKMatchWindowedSeeded(
   using BC = typename Collector::BlockClass;
   skipCount(SkipStats::fieldSortSeededActivations);
 
-  // Select the seedCount globally best-bounded leaves through the same lazy
-  // frontier the best-first driver uses - only the coarse level is
-  // heapified, and a popped coarse node is replaced by its leaves - then
-  // visit the selection in ascending doc order so the seed scorer only
-  // moves forward. Selection is metadata-only: no classification, no
-  // postings work (an undiscovered leaf cannot beat its parent's bound, so
-  // the first seedCount leaf pops ARE the global best).
-  LeafBoundFrontier<typename Collector::KeyBlockPlan> frontier(plan, pool);
+  // Select the seedCount globally best-bounded leaves - the head of the
+  // column's persisted bound order, the same order the best-first driver
+  // walks - then visit the selection in ascending doc order so the seed
+  // scorer only moves forward. Selection is metadata-only: no
+  // classification, no postings work.
   seedCount = std::min<int64_t>(seedCount, plan.leafCount);
   std::span<int64_t> seeds = pool.make_span<int64_t>((size_t)seedCount);
-  int64_t selected = 0;
-  while (!frontier.empty() && selected < seedCount) {
-    auto top = frontier.pop();
-    if (top.isLeaf) {
-      seeds[(size_t)selected++] = top.id;
-    } else {
-      frontier.expand(top);
-    }
+  for (int64_t rank = 0; rank < seedCount; rank++) {
+    seeds[(size_t)rank] = plan.batch->boundOrderLeaf(rank).leaf;
   }
-  std::span<int64_t> selectedSeeds = seeds.first((size_t)selected);
-  std::sort(selectedSeeds.begin(), selectedSeeds.end());
+  std::sort(seeds.begin(), seeds.end());
 
   std::span<uint64_t> visited =
       pool.make_span<uint64_t>((size_t)((plan.leafCount + 63) >> 6));
@@ -1380,7 +1282,7 @@ void collectTopKMatchWindowedSeeded(
 
   int64_t enumerated = 0;
   int64_t consecutiveEmpty = 0;
-  for (int64_t leaf : selectedSeeds) {
+  for (int64_t leaf : seeds) {
     if (collector.heapFull()) {
       if (collector.classifyBlock(
               segnum, (int32_t)(leaf * (int64_t)plan.leafSize),

@@ -49,7 +49,13 @@ public:
     // coarse level; leaves nest exactly in coarse blocks) refines the same
     // contract at leaf granularity: leafBestKey(l) lower-bounds every doc in
     // leaf l. Coarse bounds are the min over their leaves, so a coarse skip
-    // proves every child skips.
+    // proves every child skips. With leaves comes their bound order:
+    // boundOrderLeaf(r) is the leaf at rank r ascending by (leafBestKey,
+    // leaf), with that bound - for every r < leafBlockCount().
+    struct RankedLeaf {
+      int64_t leaf;
+      int64_t bound;
+    };
     virtual int32_t keyBlockSize() const { return 0; }
     virtual int64_t keyBlockCount() const { return 0; }
     virtual int64_t blockBestKey(int64_t block) const {
@@ -63,6 +69,11 @@ public:
       unused(leaf);
       assert(false);
       return std::numeric_limits<int64_t>::min();
+    }
+    virtual RankedLeaf boundOrderLeaf(int64_t rank) const {
+      unused(rank);
+      assert(false);
+      return {0, std::numeric_limits<int64_t>::min()};
     }
 
     // Order-independent fused leaf gather: extract one leaf's in-domain docs
@@ -344,6 +355,18 @@ public:
   int64_t leafBestKey(int64_t leaf) const override {
     NumBlockZone zone = reader->leafZone(leaf);
     return sortMultiplier < 0 ? ~zone.max : zone.min;
+  }
+
+  // The column persists both directions' leaf orders, so bound order is a
+  // lookup: ascending (zone.min, leaf) is ascending (leafBestKey, leaf), and
+  // descending zone.max with ties by leaf is ascending (~max, leaf).
+  RankedLeaf boundOrderLeaf(int64_t rank) const override {
+    if (sortMultiplier < 0) {
+      int64_t leaf = reader->leafByMaxDescending(rank);
+      return {leaf, ~reader->leafZone(leaf).max};
+    }
+    int64_t leaf = reader->leafByMinAscending(rank);
+    return {leaf, reader->leafZone(leaf).min};
   }
 
   // Dense single-valued only: doc == value rank and no forward-only landing

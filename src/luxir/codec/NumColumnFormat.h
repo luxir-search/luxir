@@ -7,6 +7,7 @@
 #include <bit>
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <numeric>
 #include <span>
 #include <vector>
@@ -185,6 +186,34 @@ struct NumColumnFormat {
     // holding.
     assert(plan.info.scaledSlope != 0 || plan.info.baseBits == (uint64_t)min);
     return plan;
+  }
+
+  // Leaf visit orders, persisted after the leaf zones. A field sort over the
+  // column visits leaves best bound first, and that bound is a pure function
+  // of the leaf zones and the sort direction - never of the query - so the
+  // writer sorts once instead of every query rederiving the order. `out`
+  // receives the leaf ids ascending by (zone.min, leaf), the ascending-sort
+  // order, or with `byMaxDescending`, descending by zone.max with ties by
+  // ascending leaf: ascending ~max, the descending transformed key. The leaf
+  // id tie-break is doc order for dense columns.
+  static void leafVisitOrder(std::span<const NumBlockZone> leafZones,
+                             bool byMaxDescending, std::span<uint32_t> out) {
+    assert(out.size() == leafZones.size());
+    assert(leafZones.size() <= std::numeric_limits<uint32_t>::max());
+    std::iota(out.begin(), out.end(), 0u);
+    if (byMaxDescending) {
+      std::sort(out.begin(), out.end(), [&](uint32_t a, uint32_t b) {
+        int64_t ka = leafZones[a].max;
+        int64_t kb = leafZones[b].max;
+        return ka != kb ? ka > kb : a < b;
+      });
+    } else {
+      std::sort(out.begin(), out.end(), [&](uint32_t a, uint32_t b) {
+        int64_t ka = leafZones[a].min;
+        int64_t kb = leafZones[b].min;
+        return ka != kb ? ka < kb : a < b;
+      });
+    }
   }
 
   static uint64_t residual(const BlockPlan& plan, uint64_t rank,

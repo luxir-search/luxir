@@ -1773,14 +1773,15 @@ public:
             Query::ScorerSupplier::BulkScorerContext matchWindowsContext;
             // Best-first exact-domain route: when the whole result set is
             // already materialized (BITSET or ARRAY), no scorer needs to run
-            // - the driver visits key blocks in bound order when that pays,
-            // terminating on proof, and sweeps whatever it leaves in doc
-            // order (ExactDomainSortCosts). The domain sources: a resident
-            // whole membership, the supplier's exact cached set (a folded
-            // filter-only Boolean over match-all, no other filter or sub-op
-            // domain restriction), an explicit collectorFilter under a true
-            // match-all weight, or every doc. Activation requires the
-            // expected visit floor (ceil(k/d) leaves) to be sub-saturating.
+            // - the driver visits leaves in the column's persisted bound
+            // order when that pays, terminating on proof, and sweeps
+            // whatever it leaves in doc order (ExactDomainSortCosts). The
+            // domain sources: a resident whole membership, the supplier's
+            // exact cached set (a folded filter-only Boolean over match-all,
+            // no other filter or sub-op domain restriction), an explicit
+            // collectorFilter under a true match-all weight, or every doc.
+            // Activation requires the expected visit floor (ceil(k/d)
+            // leaves) to be sub-saturating.
             if (maySkipNoncompetitiveDocs
                 && (!requiresWholeIndexPrepare || wholeFieldSortAvailable)
                 && !data->fieldCollector->needsScores
@@ -1857,9 +1858,10 @@ public:
             }
             // Seeded two-pass query-driven route: no materialized domain
             // exists (else best-first took it), but the sole dense numeric
-            // primary still publishes block bounds, so the driver fills the
-            // heap from the best-bounded blocks via one bulk scorer and
-            // sweeps the complement with a second, independent one. Needs a
+            // primary still publishes leaf bounds, so the driver fills the
+            // heap from the best-bounded leaves (the head of the persisted
+            // bound order) via one bulk scorer and sweeps the complement
+            // with a second, independent one. Needs a
             // supplier whose bulk plans declare independentReplan (both
             // products are built before pass 1), a sub-saturating expected
             // floor with material headroom (4*floor+64 < blockCount), and
