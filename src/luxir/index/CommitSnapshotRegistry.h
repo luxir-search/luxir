@@ -63,8 +63,9 @@ private:
 public:
   Directory& dir;
   ReaderManager readers;
-  // Set once by the collection before admitting requests.
-  std::function<void(const CommitSnapshot&)> onPublish;
+  // Set once by the collection owner before admitting requests. Runs after
+  // each publication and after fail(); it must not throw.
+  std::function<void()> onChange;
 private:
   void releaseLocked(const CommitId& id, std::vector<std::string>& retired);
   void expireLocked(std::vector<std::string>& retired);
@@ -72,12 +73,15 @@ private:
   decltype(reservations)::iterator oldestReclaimableLocked();
   void unlink(std::span<const std::string> names) noexcept;
   void unlinkFiles(std::span<const std::string> names) noexcept;
+  void notifyChange() noexcept;
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
 public:
   explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now)
       : now(std::move(now)), dir(dir), readers(dir, current, config) {}
   ~CommitSnapshotRegistry() { close(); }
   void close() noexcept;
+  // The owning writer failed after durable publication: close and notify.
+  void fail() noexcept;
   // Stop reservations and join retirement while admitted searches retain readers.
   void detach() noexcept;
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});

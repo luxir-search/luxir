@@ -2670,6 +2670,8 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
   IndexWriter writer(writerSnapshots);
   auto before = test::readDurableIndexInfo(dir);
   auto originalSchema = writer.getSchema();
+  int changes = 0;
+  writerSnapshots.onChange = [&]() noexcept { changes++; };
   Signal::listen("manifestDurable", [&](void*, void*, void*) -> void* {
     EXPECT_NE(nullptr, dir.openFile(Manifest::name(before->index_gen + 1), true));
     throw std::runtime_error("injected publication failure");
@@ -2677,6 +2679,7 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
   auto unlisten = scope_guard([] { Signal::unlisten("manifestDurable"); });
   EXPECT_THROW(writer.setSchema(Schema::createDefaultSchema()), std::runtime_error);
   EXPECT_TRUE(writer.isClosed());
+  EXPECT_EQ(1, changes); // the failure itself is announced
   EXPECT_EQ(originalSchema, writer.getSchema());
   EXPECT_THROW(writer.setSchema(originalSchema), IndexWriterClosedError);
   EXPECT_THROW(writer.snapshots.readers.getReader(), ApiError);

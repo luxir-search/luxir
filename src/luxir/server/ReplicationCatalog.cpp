@@ -62,6 +62,16 @@ void ReplicationCatalog::changed(std::string_view name, std::string_view incarna
   } catch (...) { LOG_ERROR("Replication publication notification failed"); }
 }
 
+void ReplicationCatalog::registered(const std::string& name, const std::shared_ptr<Collection>& collection) noexcept {
+  updated(name, *collection);
+}
+
+void ReplicationCatalog::updated(const std::string& name, const Collection& collection) noexcept {
+  auto shard = collection.getShard();
+  auto snapshot = shard ? shard->getSnapshots().snapshot() : nullptr;
+  changed(name, snapshot ? std::string_view(snapshot->id.incarnation) : std::string_view());
+}
+
 void ReplicationCatalog::remove(const std::string& name) noexcept {
   try {
     decltype(watches) ready;

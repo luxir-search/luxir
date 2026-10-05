@@ -334,17 +334,6 @@ TEST_F(CommitSnapshotTest, segmentNamesSurviveEmptySnapshotAndRestart) {
   EXPECT_GT(info->segments.front().seg_id, oldSegment);
 }
 
-TEST_F(CommitSnapshotTest, observerFailureDoesNotFailDurablePublication) {
-  LuxirNode node;
-  CollectionHelper h(node, "main");
-  auto writer = h.getIndexWriter();
-  writer->snapshots.onPublish = [](const CommitSnapshot&) { throw std::runtime_error("observer failure"); };
-  auto before = writer->snapshots.snapshot()->id;
-  ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
-  EXPECT_GT(writer->snapshots.snapshot()->id.index_gen, before.index_gen);
-  EXPECT_FALSE(writer->isClosed());
-}
-
 TEST_F(CommitSnapshotTest, storagePressureDropsOldestReservation) {
   LuxirConfig config; config.store.ram_limit_mb = 2;
   LuxirNode node(config);

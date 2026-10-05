@@ -313,6 +313,7 @@ struct ReplicationFollower::Impl {
         // The next successful install sweeps them against its installed root.
         node.root->collections.getOrCreate(name, [&] { return col; });
         node.observeCollection(name, *col);
+        node.events->registered(name, col);
         auto& state = states[name];
         state.serving = snapshots.snapshot()->id.token();
       } catch (const std::exception& e) {
@@ -320,7 +321,7 @@ struct ReplicationFollower::Impl {
         auto tombstone = std::make_shared<Collection>();
         tombstone->name = name;
         tombstone->unavailableReason = "failed to load: " + errorMessage(e);
-        node.root->collections.getOrCreate(name, [&] { return tombstone; });
+        node.events->registered(name, node.root->collections.getOrCreate(name, [&] { return tombstone; }));
         auto& state = states[name];
         state.localUnavailable = true;
         state.localIncarnation = selection.incarnation;
@@ -365,8 +366,8 @@ struct ReplicationFollower::Impl {
     auto old = node.root->collections.get(name);
     if (old) {
       node.root->collections.erase(name, old);
+      node.events->removed(name);
       if (auto shard = old->getShard()) shard->getSnapshots().detach();
-      node.replication->remove(name);
     }
     std::shared_ptr<Collection> candidate;
     { std::lock_guard lock(mutex); candidate = std::move(states[name].candidate); }
@@ -631,15 +632,15 @@ struct ReplicationFollower::Impl {
       if (old != candidate) {
         if (old) {
           if (!node.root->collections.replace(name, old, candidate)) throw std::runtime_error("collection changed during installation");
-          if (auto shard = old->getShard()) {
-            auto oldIncarnation = shard->getSnapshots().snapshot()->id.incarnation;
-            shard->getSnapshots().detach();
-            try { node.dirFactory->remove(name + "/" + oldIncarnation); }
-            catch (const std::exception& e) { LOG_WARN("Retired incarnation cleanup failed: {}", e.what()); }
-          }
         } else node.root->collections.getOrCreate(name, [&] { return candidate; });
         node.observeCollection(name, *candidate);
-        node.replication->changed(name, snapshot->id.incarnation);
+        node.events->registered(name, candidate);
+        if (auto shard = old ? old->getShard() : nullptr) {
+          auto oldIncarnation = shard->getSnapshots().snapshot()->id.incarnation;
+          shard->getSnapshots().detach();
+          try { node.dirFactory->remove(name + "/" + oldIncarnation); }
+          catch (const std::exception& e) { LOG_WARN("Retired incarnation cleanup failed: {}", e.what()); }
+        }
       }
     } catch (...) {
       if (!wroteRoot) {

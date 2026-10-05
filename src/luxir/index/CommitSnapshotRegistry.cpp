@@ -13,9 +13,16 @@ void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snaps
   // No reservation lock: a large acquire or slow file open cannot stall publication.
   if (opened) readers.installOpened(snapshot, std::move(opened));
   else readers.install(snapshot);
-  try { if (onPublish) onPublish(*snapshot); }
-  catch (const std::exception& e) { LOG_ERROR("Snapshot observer failed: {}", e.what()); }
-  catch (...) { LOG_ERROR("Snapshot observer failed"); }
+  notifyChange();
+}
+
+void CommitSnapshotRegistry::notifyChange() noexcept {
+  if (onChange) onChange();
+}
+
+void CommitSnapshotRegistry::fail() noexcept {
+  close();
+  notifyChange();
 }
 
 void CommitSnapshotRegistry::openLocalSnapshot() {

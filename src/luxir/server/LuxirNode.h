@@ -34,6 +34,7 @@ class Library;
 class Collection;
 class LuxirNode;
 class ReplicationCatalog;
+class CollectionEvents;
 class ReplicationFollower;
 
 // Resolving a request's collection target failed.  The concrete subclasses fix
@@ -128,7 +129,7 @@ class Collection {
 public:
   std::string getUnavailableReason() const;
 
-  std::shared_ptr<Shard> getShard() {
+  std::shared_ptr<Shard> getShard() const {
     return shard;
   }
 
@@ -177,6 +178,7 @@ private:
 
 class LuxirNode {
   std::shared_ptr<ReplicationCatalog> replication;
+  std::shared_ptr<CollectionEvents> events; // ordered feed of the collection map
   std::unique_ptr<ReplicationFollower> follower;
   friend class ReplicationFollower;
 public:

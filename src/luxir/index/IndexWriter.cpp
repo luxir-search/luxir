@@ -1968,7 +1968,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
     if (durable) {
       failureReason = std::move(failure);
       failed.store(true, std::memory_order_release);
-      snapshots.close();
+      snapshots.fail();
     } else {
       // A failed candidate can be complete but unacknowledged. Its dependencies
       // are durable, so even a crash during cleanup is recoverable. Never reuse

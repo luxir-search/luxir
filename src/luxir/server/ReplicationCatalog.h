@@ -10,13 +10,14 @@
 #include <stop_token>
 #include "luxir/util/DeadlineScheduler.h"
 #include "luxir/index/CommitSnapshot.h"
+#include "CollectionEvents.h"
 
 namespace luxir {
 class LuxirNode;
 
 // Process-local discovery. Collection state is read from the node while forming
 // a response; only revisions, waiters and liveness live here.
-class ReplicationCatalog {
+class ReplicationCatalog : public CollectionEvents {
 public:
   using Clock = std::chrono::steady_clock;
   using Now = std::function<Clock::time_point()>;
@@ -76,6 +77,9 @@ public:
   explicit ReplicationCatalog(std::chrono::milliseconds liveness, Now now = Clock::now);
   void changed(std::string_view name = {}, std::string_view incarnation = {}) noexcept;
   void remove(const std::string& name) noexcept;
+  void registered(const std::string& name, const std::shared_ptr<Collection>& collection) noexcept override;
+  void updated(const std::string& name, const Collection& collection) noexcept override;
+  void removed(const std::string& name) noexcept override { remove(name); }
   // Check and registration share a lock. Completions only schedule I/O work.
   uint64_t watch(std::string_view cursor, std::string_view follower, std::function<void()> completion);
   void cancel(uint64_t watch);

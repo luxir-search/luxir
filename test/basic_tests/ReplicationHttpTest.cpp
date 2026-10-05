@@ -167,7 +167,8 @@ TEST_F(ReplicationHttpTest, watchPublishCreateDeleteAndTimeout) {
   auto removed = wait();
   node->deleteCollection("other");
   ASSERT_EQ(std::future_status::ready, removed.wait_for(1s));
-  initial = removed.get();
+  removed.get(); // deletion announces its placeholder, then the removal
+  initial = catalog();
   EXPECT_FALSE(initial["collections"].contains("other"));
   Signal::unlisten("replicationWatchParked");
   auto start = std::chrono::steady_clock::now();

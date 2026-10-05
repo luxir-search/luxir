@@ -76,6 +76,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   replicationConfig.validate();
   replication = std::make_shared<ReplicationCatalog>(std::chrono::milliseconds(
       replicationConfig.follower_timeout_ms));
+  events = replication;
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
   createSingletons();
@@ -159,7 +160,7 @@ std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(Library* library, s
   if (!collection) {
     throw CollectionNotFoundError("collection '" + collectionName + "' does not exist");
   }
-  if (createdHere) replication->changed(collectionName, collection->getShard()->getSnapshots().snapshot()->id.incarnation);
+  if (createdHere) events->registered(collectionName, collection);
   return checkLoaded(std::move(collection));
 }
 
@@ -239,11 +240,11 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
       std::rethrow_exception(createFailure);
     }
   });
+  if (createdHere) events->registered(collectionName, collection);
   if (createFailure) std::rethrow_exception(createFailure);
   if (!createdHere) {
     throw CollectionExistsError("collection '" + collectionName + "' already exists");
   }
-  replication->changed(collectionName, collection->getShard()->getSnapshots().snapshot()->id.incarnation);
   return collection;
 }
 
@@ -282,6 +283,7 @@ void LuxirNode::deleteLocalCollection(std::string_view name) {
     throw CollectionUnavailableError(
         "collection '" + collectionName + "' changed while deletion started");
   }
+  events->registered(collectionName, tombstone);
 
   try {
     if (collection->shard && collection->shard->iw) {
@@ -293,13 +295,13 @@ void LuxirNode::deleteLocalCollection(std::string_view name) {
     auto failed = std::make_shared<Collection>();
     failed->name = collectionName;
     failed->unavailableReason = "delete failed: " + std::string(e.what());
-    root->collections.replace(collectionName, tombstone, std::move(failed));
+    if (root->collections.replace(collectionName, tombstone, failed)) events->registered(collectionName, failed);
     throw;
   } catch (...) {
     auto failed = std::make_shared<Collection>();
     failed->name = collectionName;
     failed->unavailableReason = "delete failed: unknown non-standard exception";
-    root->collections.replace(collectionName, tombstone, std::move(failed));
+    if (root->collections.replace(collectionName, tombstone, failed)) events->registered(collectionName, failed);
     throw;
   }
 
@@ -307,7 +309,7 @@ void LuxirNode::deleteLocalCollection(std::string_view name) {
     throw std::runtime_error(
         "collection '" + collectionName + "' tombstone disappeared during deletion");
   }
-  replication->remove(collectionName);
+  events->removed(collectionName);
 }
 
 std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema,
@@ -371,8 +373,9 @@ std::shared_ptr<Collection> LuxirNode::makeCollection(const std::string& name, s
 }
 
 void LuxirNode::observeCollection(const std::string& name, Collection& collection) {
-  collection.getShard()->getSnapshots().onPublish = [catalog = replication, name](const CommitSnapshot& snapshot) noexcept {
-    catalog->changed(name, snapshot.id.incarnation);
+  // The registry belongs to this collection, so the hook never outlives it.
+  collection.getShard()->getSnapshots().onChange = [events = events, name, &collection]() noexcept {
+    events->updated(name, collection);
   };
 }
 
@@ -492,10 +495,10 @@ void LuxirNode::createSingletons() {
         }
         throw std::runtime_error("Collection has no CURRENT");
       }
-      root->collections.getOrCreate(name, [&]() {
+      auto collection = root->collections.getOrCreate(name, [&]() {
         return initCollection(name);
       });
-      replication->changed();
+      events->registered(name, collection);
       LOG_INFO("Loaded collection: {}", name);
     } catch (const std::exception& e) {
       // Keep the node up: register a tombstone so the name resolves to a clear
@@ -505,7 +508,7 @@ void LuxirNode::createSingletons() {
       auto tombstone = std::make_shared<Collection>();
       tombstone->name = name;
       tombstone->unavailableReason = "failed to load: " + std::string(e.what());
-      root->collections.getOrCreate(name, [&]() { return tombstone; });
+      events->registered(name, root->collections.getOrCreate(name, [&]() { return tombstone; }));
     }
   }
 }
