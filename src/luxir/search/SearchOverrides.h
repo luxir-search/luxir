@@ -85,19 +85,19 @@ inline InlineFacetEntryMode forcedInlineFacetEntryMode =
 inline bool disableFieldSortPruning =
     std::getenv("LUXIR_DISABLE_FIELD_SORT_PRUNING") != nullptr;
 
-// A/B baseline for the best-first exact-domain field-sort driver. Default
-// false means eligible materialized-domain field sorts take the driver
-// (cost-gated bound order, then a doc-order leaf sweep) instead of the
+// A/B baseline for the exact-domain field-sort driver. Default false means
+// materialized-domain field sorts take the driver (bound order, a doc-order
+// leaf sweep, or an unclassified scan, chosen by cost) instead of the
 // query-driven ladder.
 inline bool disableFieldSortBestFirst =
     std::getenv("LUXIR_DISABLE_FIELD_SORT_BEST_FIRST") != nullptr;
-// Test-only: bypass the expected-floor activation gate and the bound-order
-// economics (cost gate and progress checkpoints) so small corpora (too few key
-// blocks to ever pass them) still drive the bound-order phase.
+// Test-only: bypass the driver's phase economics (cost gate and progress
+// checkpoints) and the whole-membership build floor, so small corpora (too
+// few leaves to ever pass them) still drive the bound-order phase.
 inline bool forceFieldSortBestFirst = false;
-// Test-only: hand the best-first bound-order phase off to the doc-order sweep
-// after this many leaf gathers (0 = production progress checkpoints only), so
-// the hand-off is reachable on small corpora.
+// Test-only: hand the bound-order phase off (to the sweep or the scan, as at
+// a progress checkpoint) after this many leaf gathers (0 = production
+// progress checkpoints only), so the hand-off is reachable on small corpora.
 inline int64_t forceFieldSortWorkCapForTests = 0;
 
 // A/B baseline for the seeded two-pass query-driven field-sort driver.

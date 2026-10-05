@@ -260,18 +260,27 @@ struct SkipStats {
   static inline int64_t fieldSortLeavesSkipped = 0;
   static inline int64_t fieldSortIrreducibleLeaves = 0;
   static inline int64_t fieldSortRequiredLeaves = 0;
-  // Best-first exact-domain driver. Bound-order phase: activations, leaves
-  // gathered, proof terminations (the next leaf in bound order strictly
-  // noncompetitive; it and every later leaf count as skipped), and hand-offs
-  // to the doc-order sweep (progress checkpoint or test cap). Doc-order
-  // phase: domains the cost gate sends straight to the sweep, and leaves the
-  // sweep gathered.
+  // Best-first exact-domain driver. Bound-order phase: activations (planned,
+  // a probe, or a scan's hand-off), leaves gathered, proof terminations (the
+  // next leaf in bound order strictly noncompetitive; every leaf not yet
+  // gathered, by this or an earlier phase, counts as skipped), and planned
+  // bound order's hand-offs to the sweep or the scan (progress checkpoint or
+  // test cap). Probes: bound-order probes ahead of a planned sweep or scan,
+  // and probes that handed the segment back (declined). Doc-order phase:
+  // domains the cost gate sends straight to the sweep, and leaves the sweep
+  // gathered. Scans of a domain's docs, unclassified (from the cost gate, a
+  // declined probe or a bound-order hand-off), and scans that handed the
+  // rest to bound order or the sweep once the bottom showed it cheaper.
   static inline int64_t fieldSortBestFirstActivations = 0;
   static inline int64_t fieldSortBestFirstLeaves = 0;
   static inline int64_t fieldSortBestFirstTerminations = 0;
   static inline int64_t fieldSortBestFirstFallbacks = 0;
+  static inline int64_t fieldSortProbes = 0;
+  static inline int64_t fieldSortProbesDeclined = 0;
   static inline int64_t fieldSortDocOrderSweeps = 0;
   static inline int64_t fieldSortSweepLeaves = 0;
+  static inline int64_t fieldSortDomainScans = 0;
+  static inline int64_t fieldSortScanHandOffs = 0;
   // Seeded two-pass query-driven driver: route activations, seed leaves the
   // scorer actually enumerated, seeds the maturing bottom classified away
   // before any postings work, seed-schedule aborts (underfilled heap or a
@@ -557,8 +566,12 @@ struct SkipStats {
     fieldSortBestFirstLeaves = 0;
     fieldSortBestFirstTerminations = 0;
     fieldSortBestFirstFallbacks = 0;
+    fieldSortProbes = 0;
+    fieldSortProbesDeclined = 0;
     fieldSortDocOrderSweeps = 0;
     fieldSortSweepLeaves = 0;
+    fieldSortDomainScans = 0;
+    fieldSortScanHandOffs = 0;
     fieldSortSeededActivations = 0;
     fieldSortSeedLeaves = 0;
     fieldSortSeedClassifiedOut = 0;

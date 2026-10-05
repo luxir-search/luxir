@@ -952,87 +952,342 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
   }
 }
 
+// How the exact-domain driver serves a materialized domain (cached docs, or
+// every doc for match-all with no deletes); ExactDomainSortCosts picks one.
+enum class ExactDomainSortPhase : uint8_t {
+  // Leaves in the column's persisted bound order, terminating on proof; a
+  // progress checkpoint may hand the unvisited leaves to the sweep or the
+  // scan.
+  BOUND_ORDER,
+  // The leaves holding domain docs in doc order, each coarse block and leaf
+  // classified against the maturing bottom.
+  SWEEP,
+  // Every domain doc in doc order, gathered and admitted with no block or
+  // leaf classification, until the bottom shows another phase costs less
+  // over the rest.
+  SCAN,
+};
+
 // Exact-domain field-sort economics, in units of one gathered doc (a key
-// gather plus its heap admission test). A materialized domain (cached docs,
-// or every doc for match-all with no deletes) is served in two phases: an
-// optional bound-order phase over the leaf bounds with proof termination,
-// then a forward doc-order sweep over the leaves it did not visit,
-// classifying each against the maturing bottom. With uniform keys
-// independent of the domain, both gather the ~k*leafSize domain docs of the
-// expectedFloor leaves any correct traversal visits. Bound order adds
-// kBoundOrderLeafCost per visited leaf (reading the next leaf and its bound
-// from the persisted order, and a random-access gather). The sweep instead
-// gathers the leaves it reaches before its bottom matures: at its j-th leaf
-// the bottom ranks k among j*m domain docs (m = card/leafCount per leaf), so
-// a leaf is still competitive with probability about floor/j, which adds
-// floor*ln(leafCount/floor) leaves of m docs; and it classifies every leaf at
-// kSweepLeafCost. Bound order therefore pays when one visit saves more
-// gathers than it costs: kBoundOrderLeafCost < m*ln(leafCount/floor) +
-// kSweepLeafCost*leafCount/floor.
+// gather plus its heap admission test). With uniform keys independent of
+// the domain, any correct traversal gathers the floor = ceil(k/d) leaves
+// whose bounds beat the final bottom, about k*leafSize domain docs.
+// - Bound order gathers just those, and adds kBoundOrderLeafCost per visited
+//   leaf (reading the next leaf and its bound from the persisted order, and
+//   a random-access gather).
+// - The sweep gathers the leaves it reaches before its bottom matures: at
+//   its j-th leaf the bottom ranks k among j*m domain docs (m = card /
+//   leafCount per leaf), so a leaf is still competitive with probability
+//   about floor/j, which adds floor*ln(leafCount/floor) leaves of m docs.
+//   It classifies every leaf holding a domain doc at kSweepLeafCost (an
+//   empty leaf costs a word check or nothing; occupiedLeaves).
+// - The scan gathers every domain doc at kScanDocCost each and classifies
+//   nothing.
+// The driver runs the cheapest. Classification pays only through the
+// leaves it skips (leafCount minus the swept leaves), each worth m gathers:
+// nothing at saturation (floor >= leafCount), and little on a sparse
+// domain. Bound order pays when one visit saves more gathers than it costs:
+// kBoundOrderLeafCost < m*ln(leafCount/floor) + sweep classification per
+// floor leaf.
 //
-// Calibrated on the 5M-doc benchgame corpus (9829 leaves), hugin 2026-10-04:
-// per-query times of each phase alone over resident term-filter memberships
-// of 10K-2.4M docs at k = 10, 100, 1000 (314 sub-saturating cases, two runs)
-// cross at floors of about 3100 (k=10) and 4700 (k=100, just under the
-// 2*floor < leafCount availability gate). The data pins only the k=10
-// crossover (k=100 sits at the gate, k=1000 has no sub-saturating sweep
-// win), so the sweep cost keeps its earlier fit and the visit cost is fitted
-// alone: these costs cross at 3022 (k=10) and at the gate (k=100), and
-// choosing by them loses 0.3% against the per-query best phase.
+// A full heap is evidence the density estimate cannot see: only the leaves
+// bounded at or before its bottom (withinBottom; a heap filled by earlier
+// segments, or by an earlier phase of this one) can still be visited, so
+// they cap both bound order's and the sweep's gathered leaves.
+//
+// Calibrated on the 5M-doc benchgame corpus (9829 leaves), hugin. Bound
+// order and sweep (2026-10-04): per-query times of each phase alone over
+// resident term-filter memberships of 10K-2.4M docs at k = 10, 100, 1000
+// (314 sub-saturating cases, two runs) cross at floors of about 3100 (k=10)
+// and 4700 (k=100); the data pins only the k=10 crossover, so the sweep cost
+// keeps its earlier fit and the visit cost is fitted alone, and choosing by
+// them loses 0.3% against the per-query best phase. The visit cost was 48,
+// crossing near 700 leaves at k=10, while each segment rebuilt a coarse and
+// leaf bound heap per query; the column's persisted bound order removed
+// that. The scan (2026-10-05): per-query times of each phase alone over
+// 7,476 resident memberships of 1 to 4.5M docs (6,711 ARRAY, 765 BITSET;
+// 1,284 sub-saturating, 6,192 saturating of which 1,506 fully clipped; the
+// unfiltered board and its term and range filter ladders at k = 10, 100,
+// 1000, uniform keys, two runs) fit kScanDocCost = 1.1 with the other two
+// constants unchanged, the sweep's classification now charged per occupied
+// leaf (a joint refit, H = 16 C = 4 at 1.15, gains 0.2% - noise); choosing
+// by these costs loses 0.45% against the per-query best phase, and takes
+// 0.69 of the time the ladder needs over the same memberships. The scan's
+// premium over a swept doc stands in for the skips this linear sweep model
+// misses near saturation: a saturated sweep still skips some leaves, which
+// pays on dense domains, so the scan wins at saturation only below m =
+// kSweepLeafCost / (kScanDocCost - 1) = 20 docs per leaf.
 //
 // A domain correlated with the sort key breaks the independence premise. When
 // the correlation is known - a range on the sort field itself puts every
 // member's key at or past a key floor (FieldSortCollector::primaryValues) -
-// the leaves bounded before that floor (clipLeaves) can never be proven out,
-// so bound order visits all of them before its first proof and the visit
-// floor is at least clipLeaves: uniform wide zones clip nearly every leaf and
-// sweep from the start, while tight (doc-order correlated) zones clip only
-// the leaves lying past the range's edge, and bound order keeps paying when
-// those are few. A correlation nothing announces
-// (a filter on another field holding the same data) shows up only as missing
-// proofs at the progress checkpoints below, which hand such a domain to the
-// sweep.
+// the leaves bounded before that floor (clipLeaves) can never be proven out
+// or skipped, so every traversal visits all of them and the visit floor is
+// at least clipLeaves: uniform wide zones clip nearly every leaf, while
+// tight (doc-order correlated) zones clip only the leaves lying past the
+// range's edge, and bound order keeps paying when those are few. A domain
+// whose every leaf is clipped is scanned, since nothing can be skipped. A
+// correlation nothing announces (a filter on another field holding the same
+// data, keys following doc order) shows up only in how a phase progresses,
+// which the re-decisions below read.
+//
+// Re-decisions. Mid-segment, a running phase is re-judged - bound order at
+// its progress checkpoints (boundOrderCheckpoint), the scan once the heap is
+// full at doubling gathered counts (scanCheckpoint) - by one rule
+// (PhaseCosts::redecide): compare the three phases' REMAINING costs over
+// the unvisited rest of the segment, work already done being sunk, each
+// phase's gathers capped by the leaves the bottom still admits; the
+// incumbent - the phase the costs planned (for a probe, the planned
+// doc-order phase) - keeps the rest unless the cheapest costs under
+// 1/kProgressMargin of it. The margin absorbs the cost model's own error,
+// largest at near-ties and in regimes the calibration never priced: a scan
+// handing a sparse array domain to a sweep the model put 24% cheaper over
+// the rest made those queries 1.65x slower.
+//
+// Remaining bound-order visits, and the sweep's maturation, come from
+// proofs (heap entries below the next leaf's bound, which are final): p
+// proofs after w leaves project a floor of about w*k/p. One proof is far
+// noisier than any fixed margin, so planned bound order also reads its own
+// count kProgressMargin times over (half the projected floor beyond the
+// clip), while a probe's count projects only from kProbeMinProofs: the
+// margin already makes a challenger prove itself, and reading its proofs
+// pessimistically as well declined a probe 1024 leaves in that was still
+// the cheapest by 1.4x. No proof projects nothing: bound order may then
+// visit every leaf the bottom admits, and the sweep matures no further.
+// Planned bound order's margin rests on its premise, that it proves before
+// visiting every leaf the bottom admits; once its own projection, read in
+// its favor, reaches them it keeps no margin, only what the costs still
+// price in its favor. A proofless checkpoint (P ~ exp(-4) under the
+// premise it was planned on) is the extreme case, the signature of a
+// domain correlated against the key. With the margin bound order would
+// keep walking such a domain when it is dense, a visit costing little next
+// to its m gathers (a range on a sibling field holding the same data:
+// 1.25-1.46x on those cells).
+//
+// How this evolved: the checkpoints first judged bound order by total cost
+// against the sweep alone at half its projected floor, while the scan's
+// self-check and the probe required a 2x cost advantage and a bound-order
+// hand-off picked the sweep or the scan with none. Comparing total costs
+// counts sunk work against the running phase and hands off at near-ties,
+// paying both (one such query went from 203 to 309 us); remaining costs
+// without a margin did too (193 to 338 us, a 1.6% tie with the scan).
+//
+// A plan other than bound order at a sub-saturating floor starts with a
+// bound-order probe (probeLeaves): the density estimate cannot see a domain
+// whose best keys beat independence (favorable correlation - an ascending
+// sort over a low range of the same values, or newest-first over recent
+// docs), where bound order proves early. A probe must be able to prove, so
+// it walks the clipped leaves first (no proof can precede them) and then up
+// to kProbeLeaves more; and it must stay small next to what it would
+// replace, so the whole walk may cost at most 1/kProbeCostShare of the
+// planned phase. That one budget bounds the clip a probe tolerates and
+// scales it to the segment: the plan costs about one doc per domain doc,
+// and a probe visit kBoundOrderLeafCost more than its m docs, so a probe
+// stays under about leafCount/8 leaves; one under kMinProbeLeaves is not
+// run. On the calibration corpus every sub-saturating plan at k >= 10
+// affords the full kProbeLeaves. A probe goes on only while its proofs (at
+// least kProbeMinProofs) project bound order's rest under 1/kProgressMargin
+// of the planned phase's. Measured with the scan cost (both engine
+// orders): 64 leaves takes the 10% range ladders' TOP_10_FF_ASC cells to
+// 0.86-0.91 of no probe and their worst per-query loss against the
+// previous driver from 6x to 1.9x, and the range ladders overall to 0.99,
+// for 0.6-0.8% on the independent (term-filtered and unfiltered)
+// memberships.
 struct ExactDomainSortCosts {
   static constexpr double kBoundOrderLeafCost = 8.5;
   static constexpr double kSweepLeafCost = 2;
-  // The first progress checkpoint waits for this many expected proofs (heap
-  // entries below every unvisited bound) under the independence premise, so
-  // an independent domain rarely shows none: P ~ exp(-4); and for at least
-  // kMinCheckpointLeaves gathers, which small floors rarely need.
+  static constexpr double kScanDocCost = 1.1;
+  // The first progress checkpoint waits for this many expected proofs under
+  // the independence premise, so an independent domain rarely shows none:
+  // P ~ exp(-4); and for at least kMinCheckpointLeaves leaves, which small
+  // floors rarely need.
   static constexpr int64_t kCheckpointExpectedProofs = 4;
   static constexpr int64_t kMinCheckpointLeaves = 16;
-  // A proof-rate floor estimate from p proofs is Poisson-noisy (~1/sqrt(p))
-  // and part of the phase is already paid, so a projection hands off only
-  // when it overshoots the crossover by this factor; bailing on noise near
-  // the crossover would pay both routes.
+  // A re-decision hands the rest to another phase only when it costs under
+  // 1/kProgressMargin of the incumbent's remaining cost (see Re-decisions).
   static constexpr int64_t kProgressMargin = 2;
+  static constexpr int64_t kProbeLeaves = 64;
+  static constexpr int64_t kProbeMinProofs = 2;
+  static constexpr int64_t kProbeCostShare = 8;
+  static constexpr int64_t kMinProbeLeaves = 8;
 
-  static bool boundOrderPays(int64_t floor, int64_t card, int64_t leafCount) {
-    if (floor <= 0 || floor >= leafCount || card <= 0) return false;
-    double perLeaf = (double)card / (double)leafCount;
-    double sweepExtra =
-        (double)floor * perLeaf * std::log((double)leafCount / (double)floor)
-        + kSweepLeafCost * (double)leafCount;
-    return (double)floor * kBoundOrderLeafCost < sweepExtra;
+  // Leaves holding at least one of card docs spread uniformly over leafCount.
+  static double occupiedLeaves(int64_t card, int64_t leafCount) {
+    return -(double)leafCount
+        * std::expm1(-(double)card / (double)leafCount);
   }
 
-  // Checkpoint verdict after `gathers` bound-order leaves hold `proofs` final
-  // heap entries. No proof at all is the signature of a domain correlated
-  // with the key (its members sit below every leaf bound); otherwise the
-  // proofs, all made past the clipLeaves visited first, project a floor of
-  // clipLeaves + (gathers - clipLeaves)*k/proofs.
-  static bool boundOrderKeepsPaying(int64_t gathers, int64_t proofs,
-                                    int64_t topCount, int64_t card,
-                                    int64_t leafCount,
-                                    int64_t clipLeaves = 0) {
-    if (proofs <= 0) return false;
-    int64_t beyond = std::max<int64_t>(0, gathers - clipLeaves);
-    int64_t observedFloor = clipLeaves
-        + (beyond * topCount + proofs - 1) / proofs;
-    return boundOrderPays(observedFloor / kProgressMargin, card, leafCount);
+  // Leaves the sweep gathers at a visit floor, at most every leaf.
+  static double sweptLeaves(int64_t floor, int64_t leafCount) {
+    if (floor >= leafCount) return (double)leafCount;
+    if (floor <= 0) return 0;
+    return (double)floor
+        * (1 + std::log((double)leafCount / (double)floor));
   }
 
-  // First progress checkpoint, in bound-order leaf gathers: the clipped
+  static double boundOrderCost(int64_t floor, int64_t withinBottom,
+                               int64_t card, int64_t leafCount) {
+    return (double)std::min(floor, withinBottom)
+        * (kBoundOrderLeafCost + (double)card / (double)leafCount);
+  }
+
+  static double sweepCost(int64_t floor, int64_t withinBottom, int64_t card,
+                          int64_t leafCount) {
+    return kSweepLeafCost * occupiedLeaves(card, leafCount)
+        + (double)card / (double)leafCount
+            * std::min(sweptLeaves(floor, leafCount), (double)withinBottom);
+  }
+
+  static double scanCost(int64_t card) { return kScanDocCost * (double)card; }
+
+  // The three phases over `card` docs in `leafCount` leaves: bound order
+  // visiting boundOrderFloor of them, the sweep maturing toward sweepFloor,
+  // neither gathering past the withinBottom leaves the bottom admits.
+  struct PhaseCosts {
+    double boundOrder = 0;
+    double sweep = 0;
+    double scan = 0;
+
+    // Ties go to the doc-order phases, and between those to the scan.
+    ExactDomainSortPhase cheapest() const {
+      if (boundOrder < sweep && boundOrder < scan) {
+        return ExactDomainSortPhase::BOUND_ORDER;
+      }
+      return cheaperInDocOrder();
+    }
+
+    ExactDomainSortPhase cheaperInDocOrder() const {
+      return sweep < scan ? ExactDomainSortPhase::SWEEP
+                          : ExactDomainSortPhase::SCAN;
+    }
+
+    double of(ExactDomainSortPhase phase) const {
+      switch (phase) {
+        case ExactDomainSortPhase::BOUND_ORDER: return boundOrder;
+        case ExactDomainSortPhase::SWEEP: return sweep;
+        case ExactDomainSortPhase::SCAN: return scan;
+      }
+      return scan;
+    }
+
+    // The one re-decision rule (see Re-decisions): the incumbent keeps the
+    // rest unless the cheapest phase costs under 1/margin of it.
+    ExactDomainSortPhase redecide(ExactDomainSortPhase incumbent,
+                                  double margin = kProgressMargin) const {
+      ExactDomainSortPhase best = cheapest();
+      return margin * of(best) < of(incumbent) ? best : incumbent;
+    }
+  };
+
+  static PhaseCosts phaseCosts(int64_t boundOrderFloor, int64_t sweepFloor,
+                               int64_t withinBottom, int64_t card,
+                               int64_t leafCount) {
+    return {boundOrderCost(boundOrderFloor, withinBottom, card, leafCount),
+            sweepCost(sweepFloor, withinBottom, card, leafCount),
+            scanCost(card)};
+  }
+
+  // The whole segment's costs at visit floor max(expectedFloor,
+  // clipLeaves), and the plan: the cheapest of them.
+  static PhaseCosts planCosts(int64_t expectedFloor, int64_t clipLeaves,
+                              int64_t withinBottom, int64_t card,
+                              int64_t leafCount) {
+    int64_t floor = std::min(std::max(expectedFloor, clipLeaves), leafCount);
+    return phaseCosts(floor, floor, withinBottom, card, leafCount);
+  }
+
+  static ExactDomainSortPhase choosePhase(int64_t expectedFloor,
+                                          int64_t clipLeaves,
+                                          int64_t withinBottom, int64_t card,
+                                          int64_t leafCount) {
+    if (clipLeaves >= leafCount) return ExactDomainSortPhase::SCAN;
+    return planCosts(expectedFloor, clipLeaves, withinBottom, card,
+                     leafCount)
+        .cheapest();
+  }
+
+  // The visit floor `proofs` final heap entries project after `walked`
+  // bound-order leaves, all made past the clipLeaves walked first:
+  // clipLeaves + (walked - clipLeaves)*k/proofs.
+  static int64_t observedFloor(int64_t walked, double proofs,
+                               int64_t topCount, int64_t clipLeaves) {
+    int64_t beyond = std::max<int64_t>(0, walked - clipLeaves);
+    return clipLeaves
+        + (int64_t)std::ceil((double)beyond * (double)topCount / proofs);
+  }
+
+  // Remaining costs at a bound-order checkpoint, `walked` leaves of its
+  // order behind with `proofs` final heap entries: the rest is restCard
+  // domain docs not yet gathered over the unwalked leaves, of which the
+  // bottom admits those left of its withinBottom-leaf prefix of the order.
+  // `incumbent` is the phase the costs planned - bound order, or for a
+  // probe the planned doc-order phase. Planned bound order reads its proofs
+  // kProgressMargin times over; a probe's count only from kProbeMinProofs
+  // (see Re-decisions).
+  static PhaseCosts boundOrderRest(ExactDomainSortPhase incumbent,
+                                   int64_t walked, int64_t proofs,
+                                   int64_t topCount, int64_t clipLeaves,
+                                   int64_t withinBottom, int64_t restCard,
+                                   int64_t leafCount) {
+    int64_t restLeaves = std::max<int64_t>(1, leafCount - walked);
+    auto ahead = [&](double read) {
+      return std::clamp<int64_t>(
+          observedFloor(walked, read, topCount, clipLeaves) - walked, 0,
+          restLeaves);
+    };
+    int64_t sweepFloor = proofs > 0 ? ahead((double)proofs) : restLeaves;
+    int64_t boundOrderFloor = restLeaves;
+    if (incumbent == ExactDomainSortPhase::BOUND_ORDER) {
+      if (proofs > 0) {
+        boundOrderFloor = ahead((double)proofs * kProgressMargin);
+      }
+    } else if (proofs >= kProbeMinProofs) {
+      boundOrderFloor = ahead((double)proofs);
+    }
+    return phaseCosts(boundOrderFloor, sweepFloor,
+                      std::max<int64_t>(0, withinBottom - walked), restCard,
+                      restLeaves);
+  }
+
+  // A bound-order checkpoint's verdict: BOUND_ORDER to go on, else the
+  // phase that serves the rest. Planned bound order's margin rests on its
+  // premise, that it proves before visiting every leaf the bottom admits:
+  // its own projection, read in its favor, reaching them (no proof at all
+  // included) falsifies it (see Re-decisions).
+  static ExactDomainSortPhase boundOrderCheckpoint(
+      ExactDomainSortPhase incumbent, int64_t walked, int64_t proofs,
+      int64_t topCount, int64_t clipLeaves, int64_t withinBottom,
+      int64_t restCard, int64_t leafCount) {
+    bool standing = incumbent != ExactDomainSortPhase::BOUND_ORDER
+        || (proofs > 0
+            && observedFloor(walked, (double)proofs * kProgressMargin,
+                             topCount, clipLeaves)
+                < withinBottom);
+    return boundOrderRest(incumbent, walked, proofs, topCount, clipLeaves,
+                          withinBottom, restCard, leafCount)
+        .redecide(incumbent, standing ? kProgressMargin : 1);
+  }
+
+  // Remaining costs at a scan checkpoint, restLeaves leaves ahead holding
+  // restCard domain docs: the scan counts no proofs, so nothing projects a
+  // floor and the bottom alone bounds the other phases.
+  static PhaseCosts scanRest(int64_t withinBottom, int64_t restCard,
+                             int64_t restLeaves) {
+    return phaseCosts(restLeaves, restLeaves,
+                      std::min(withinBottom, restLeaves), restCard,
+                      restLeaves);
+  }
+
+  // A scan checkpoint's verdict: SCAN to go on, else the phase that serves
+  // the rest.
+  static ExactDomainSortPhase scanCheckpoint(int64_t withinBottom,
+                                             int64_t restCard,
+                                             int64_t restLeaves) {
+    return scanRest(withinBottom, restCard, restLeaves)
+        .redecide(ExactDomainSortPhase::SCAN);
+  }
+
+  // First progress checkpoint, in bound-order leaves walked: the clipped
   // leaves (no proof can precede them), then enough leaves to expect
   // kCheckpointExpectedProofs proofs at the independence premise's rate of
   // k/expectedFloor per leaf.
@@ -1043,6 +1298,27 @@ struct ExactDomainSortCosts {
         clipLeaves
             + (kCheckpointExpectedProofs * expectedFloor + topCount - 1)
                 / topCount);
+  }
+
+  // Leaves a bound-order probe walks past the clipped ones ahead of a
+  // planned sweep or scan (see above), or 0: none when bound order is the
+  // plan, the density floor saturates, or every leaf is clipped.
+  static int64_t probeLeaves(ExactDomainSortPhase phase,
+                             int64_t expectedFloor, int64_t clipLeaves,
+                             int64_t withinBottom, int64_t card,
+                             int64_t leafCount) {
+    if (phase == ExactDomainSortPhase::BOUND_ORDER
+        || expectedFloor >= leafCount || clipLeaves >= leafCount
+        || card <= 0) {
+      return 0;
+    }
+    auto plan =
+        planCosts(expectedFloor, clipLeaves, withinBottom, card, leafCount);
+    double visit = kBoundOrderLeafCost + (double)card / (double)leafCount;
+    int64_t affordable =
+        (int64_t)(plan.of(phase) / (double)kProbeCostShare / visit);
+    int64_t probe = std::min(kProbeLeaves, affordable - clipLeaves);
+    return probe >= kMinProbeLeaves ? probe : 0;
   }
 };
 
@@ -1055,54 +1331,304 @@ struct ExactDomainSortRoute {
   // visits. The router prices max(expectedFloor, clipLeaves).
   int64_t expectedFloor = 0;
   int64_t clipLeaves = 0;
-  // Start in bound order; false sweeps the whole domain in doc order.
-  bool boundOrder = false;
-  // Judge the proof progress bound order actually makes at checkpoints
-  // (boundOrderKeepsPaying) and hand off to the sweep when it falls short.
-  // Off only when a test forces the bound-order route.
+  ExactDomainSortPhase phase = ExactDomainSortPhase::SWEEP;
+  // A sweep or scan at a sub-saturating floor starts with bound order over
+  // the clipped leaves and this many more (ExactDomainSortCosts::probeLeaves),
+  // kept only while its proofs show it decisively cheaper than the planned
+  // phase; the phase a checkpoint re-decides serves the rest.
+  int64_t probeLeaves = 0;
+  // Re-decide at bound-order progress checkpoints
+  // (ExactDomainSortCosts::boundOrderCheckpoint). Off only when a test
+  // forces the bound-order route, and for bound order a scan's bottom
+  // already bounds.
   bool checkProgress = true;
   // Test override: hand off after this many bound-order leaf gathers.
   int64_t gatherCapForTests = 0;
 };
 
-// Doc-order phase: every leaf the bound-order phase did not visit, in doc
-// order, each coarse block and then each leaf classified against the current
-// bottom. A tie skip uses the block or leaf start as its first unseen doc,
-// which is exact here (the sweep never revisits a doc).
-template <typename Collector, typename GatherLeaf>
-void sweepLeavesInDocOrder(int32_t segnum, Collector& collector,
-                           const typename Collector::KeyBlockPlan& plan,
-                           std::span<const uint64_t> visited,
-                           GatherLeaf& gather) {
-  using BC = typename Collector::BlockClass;
-  int64_t leavesPerBlock = plan.blockSize / plan.leafSize;
-  for (int64_t block = 0; block < plan.blockCount; block++) {
-    if (collector.heapFull()
-        && collector.classifyBlock(
-               segnum, (int32_t)(block * (int64_t)plan.blockSize),
-               plan.batch->blockBestKey(block), plan.batch)
-            != BC::COLLECT) {
-      skipCount(SkipStats::fieldSortBlocksSkipped);
-      continue;
+// Leaves an earlier bound-order phase settled - gathered, or proven out on a
+// tie - one bit each (empty: none). Later phases pass them.
+inline bool leafVisited(std::span<const uint64_t> visited, int64_t leaf) {
+  return !visited.empty()
+      && ((visited[(size_t)(leaf >> 6)] >> (leaf & 63)) & 1);
+}
+
+// The first visited leaf at or after `leaf`, or leafCount.
+inline int64_t nextVisitedLeaf(std::span<const uint64_t> visited,
+                               int64_t leaf, int64_t leafCount) {
+  size_t w = (size_t)(leaf >> 6);
+  if (w >= visited.size()) return leafCount;
+  uint64_t bits = visited[w] & (~0ULL << (leaf & 63));
+  while (bits == 0) {
+    if (++w >= visited.size()) return leafCount;
+    bits = visited[w];
+  }
+  return std::min(leafCount, (int64_t)(w << 6) + std::countr_zero(bits));
+}
+
+// The exact-domain driver reads a materialized domain three ways, each
+// feeding ascending (docs, keys) batches to admitGathered: gatherLeaf(leaf)
+// feeds one leaf, leaves arriving in any order (bound order); nextLeaf(leaf)
+// is the first leaf at or after `leaf` holding a domain doc, and
+// gatherNext(leaf) feeds the leaf nextLeaf just returned, the pair walking
+// the domain forward (the sweep, in increasing leaves); scanFrom(leaf,
+// visited, budget) feeds the domain docs of the unvisited leaves from `leaf`
+// on in doc order, unclassified, until at least `budget` docs and the end of
+// a leaf, returning the leaf to resume at (the scan). The forward walks
+// share one cursor, so a sweep resumes where a scan stopped.
+//
+// Bitset domain: a whole-segment word span (a cached set or liveDocs), or an
+// empty span meaning every doc (match-all with no deletes). Leaves gather
+// through the comparator's fused masked gather, in any order; a leaf with no
+// domain doc costs the check of its words.
+template <typename Collector>
+class BitSetSortDomain {
+  using KeyBlockPlan = typename Collector::KeyBlockPlan;
+  int32_t segnum;
+  std::span<const uint64_t> words;
+  Collector& collector;
+  KeyBlockPlan plan;
+  std::span<int32_t> outDocs;
+  std::span<int64_t> outKeys;
+  size_t wordsPerLeaf;
+
+public:
+  BitSetSortDomain(int32_t segnum, std::span<const uint64_t> words,
+                   Collector& collector, const KeyBlockPlan& plan,
+                   MemPool& pool)
+      : segnum(segnum), words(words), collector(collector), plan(plan),
+        outDocs(pool.make_span<int32_t>((size_t)plan.leafSize)),
+        outKeys(pool.make_span<int64_t>((size_t)plan.leafSize)),
+        wordsPerLeaf((size_t)plan.leafSize / 64) {
+    assert(plan.leafSize % 64 == 0);
+  }
+
+  int32_t gatherLeaf(int64_t leaf) {
+    int32_t n = plan.batch->gatherLeafMasked(leaf, words, outDocs, outKeys);
+    if (n > 0) {
+      collector.admitGathered(segnum, outDocs.first((size_t)n),
+                              outKeys.first((size_t)n), plan.batch);
     }
-    int64_t leafLimit =
-        std::min((block + 1) * leavesPerBlock, plan.leafCount);
-    for (int64_t leaf = block * leavesPerBlock; leaf < leafLimit; leaf++) {
-      if (!visited.empty()
-          && ((visited[(size_t)(leaf >> 6)] >> (leaf & 63)) & 1)) {
+    return n;
+  }
+
+  int64_t nextLeaf(int64_t leaf) const {
+    if (words.empty()) return leaf;
+    size_t w = (size_t)leaf * wordsPerLeaf;
+    while (w < words.size() && words[w] == 0) w++;
+    // Past the last word no leaf holds a domain doc (a partial last leaf
+    // ends mid-span, so dividing the span size would name it).
+    if (w >= words.size()) return plan.leafCount;
+    return (int64_t)(w / wordsPerLeaf);
+  }
+
+  void gatherNext(int64_t leaf) { gatherLeaf(leaf); }
+
+  int64_t scanFrom(int64_t leaf, std::span<const uint64_t> visited,
+                   int64_t budget) {
+    for (leaf = nextLeaf(leaf); leaf < plan.leafCount;
+         leaf = nextLeaf(leaf + 1)) {
+      if (leafVisited(visited, leaf)) continue;
+      budget -= gatherLeaf(leaf);
+      if (budget <= 0) return leaf + 1;
+    }
+    return plan.leafCount;
+  }
+};
+
+// Array domain: the whole sorted materialized set (an ARRAY DocSet, below
+// the bitset promotion threshold). Keys come from the comparator's
+// order-independent key gather; the docs themselves need no copy. A
+// bound-order visit binary-searches its leaf's docs (no forward cursor to
+// gallop from); the forward walk gallops a cursor from one domain doc's leaf
+// to the next, so the sweep costs the leaves holding domain docs, not every
+// leaf; the scan gathers the whole array in batches.
+template <typename Collector>
+class ArraySortDomain {
+  using KeyBlockPlan = typename Collector::KeyBlockPlan;
+  int32_t segnum;
+  std::span<const int32_t> docs;
+  Collector& collector;
+  KeyBlockPlan plan;
+  std::span<int64_t> outKeys;
+  const int32_t* cursor;
+
+  int32_t leafStart(int64_t leaf) const {
+    return (int32_t)std::min<int64_t>(
+        leaf * (int64_t)plan.leafSize,
+        (int64_t)std::numeric_limits<int32_t>::max());
+  }
+
+  void feed(const int32_t* lo, const int32_t* hi) {
+    std::span<const int32_t> run(lo, hi);
+    plan.batch->gatherKeys(run, outKeys.first(run.size()));
+    collector.admitGathered(segnum, run, outKeys.first(run.size()),
+                            plan.batch);
+  }
+
+public:
+  ArraySortDomain(int32_t segnum, std::span<const int32_t> docs,
+                  Collector& collector, const KeyBlockPlan& plan,
+                  MemPool& pool)
+      : segnum(segnum), docs(docs), collector(collector), plan(plan),
+        outKeys(pool.make_span<int64_t>((size_t)plan.leafSize)),
+        cursor(docs.data()) {}
+
+  void gatherLeaf(int64_t leaf) {
+    const int32_t* end = docs.data() + docs.size();
+    const int32_t* lo = std::lower_bound(docs.data(), end, leafStart(leaf));
+    const int32_t* hi =
+        screaming::gallopLowerBound(lo, end, leafStart(leaf + 1));
+    if (lo != hi) feed(lo, hi);
+  }
+
+  int64_t nextLeaf(int64_t leaf) {
+    const int32_t* end = docs.data() + docs.size();
+    cursor = screaming::gallopLowerBound(cursor, end, leafStart(leaf));
+    return cursor == end ? plan.leafCount : *cursor / plan.leafSize;
+  }
+
+  void gatherNext(int64_t leaf) {
+    const int32_t* hi = screaming::gallopLowerBound(
+        cursor, docs.data() + docs.size(), leafStart(leaf + 1));
+    feed(cursor, hi);
+    cursor = hi;
+  }
+
+  // Batches run across leaf boundaries, stopping only at leaves an earlier
+  // bound-order phase visited and at the end of the leaf holding the
+  // budget-th doc. Leaves the forward cursor where the sweep resumes.
+  int64_t scanFrom(int64_t leaf, std::span<const uint64_t> visited,
+                   int64_t budget) {
+    const int32_t* end = docs.data() + docs.size();
+    cursor = screaming::gallopLowerBound(cursor, end, leafStart(leaf));
+    while (cursor < end) {
+      leaf = *cursor / plan.leafSize;
+      if (leafVisited(visited, leaf)) {
+        cursor = screaming::gallopLowerBound(cursor, end, leafStart(leaf + 1));
         continue;
       }
-      if (collector.heapFull()
-          && collector.classifyBlock(
-                 segnum, (int32_t)(leaf * (int64_t)plan.leafSize),
-                 plan.batch->leafBestKey(leaf), plan.batch)
-              != BC::COLLECT) {
+      const int32_t* hi = end;
+      int64_t next = nextVisitedLeaf(visited, leaf + 1, plan.leafCount);
+      if (next < plan.leafCount) {
+        hi = screaming::gallopLowerBound(cursor, end, leafStart(next));
+      }
+      int64_t resume = -1;
+      if (hi - cursor >= budget) {
+        resume = cursor[budget - 1] / plan.leafSize + 1;
+        hi = screaming::gallopLowerBound(cursor + budget, hi,
+                                         leafStart(resume));
+      }
+      budget -= hi - cursor;
+      while (cursor < hi) {
+        const int32_t* batchEnd =
+            cursor + std::min((size_t)(hi - cursor), outKeys.size());
+        feed(cursor, batchEnd);
+        cursor = batchEnd;
+      }
+      if (resume >= 0) return std::min(resume, plan.leafCount);
+    }
+    return plan.leafCount;
+  }
+};
+
+// Sweep: the leaves from fromLeaf on holding domain docs that the
+// bound-order phase did not visit, in doc order, each coarse block (once, at
+// its first such leaf) and then each leaf classified against the current
+// bottom. A tie skip uses that leaf's start as its first unseen doc, which
+// is exact here: the sweep never revisits a doc, and the leaves before it in
+// the block hold no unseen domain doc.
+template <typename Collector, typename Domain>
+void sweepLeavesInDocOrder(int32_t segnum, Collector& collector,
+                           const typename Collector::KeyBlockPlan& plan,
+                           std::span<const uint64_t> visited, Domain& domain,
+                           int64_t fromLeaf = 0) {
+  using BC = typename Collector::BlockClass;
+  int64_t leavesPerBlock = plan.blockSize / plan.leafSize;
+  int64_t openBlock = -1;
+  for (int64_t leaf = domain.nextLeaf(fromLeaf); leaf < plan.leafCount;
+       leaf = domain.nextLeaf(leaf + 1)) {
+    if (leafVisited(visited, leaf)) continue;
+    if (collector.heapFull()) {
+      int32_t firstUnseen = (int32_t)(leaf * (int64_t)plan.leafSize);
+      int64_t block = leaf / leavesPerBlock;
+      if (block != openBlock) {
+        if (collector.classifyBlock(segnum, firstUnseen,
+                                    plan.batch->blockBestKey(block),
+                                    plan.batch)
+            != BC::COLLECT) {
+          skipCount(SkipStats::fieldSortBlocksSkipped);
+          leaf = std::min((block + 1) * leavesPerBlock, plan.leafCount) - 1;
+          continue;
+        }
+        openBlock = block;
+      }
+      if (collector.classifyBlock(segnum, firstUnseen,
+                                  plan.batch->leafBestKey(leaf), plan.batch)
+          != BC::COLLECT) {
         skipCount(SkipStats::fieldSortLeavesSkipped);
         continue;
       }
-      skipCount(SkipStats::fieldSortSweepLeaves);
-      gather(leaf, true);
     }
+    skipCount(SkipStats::fieldSortSweepLeaves);
+    domain.gatherNext(leaf);
+  }
+}
+
+template <typename Collector, typename Domain>
+[[nodiscard]] std::optional<ExactDomainSortPhase> collectTopKBoundOrder(
+    int32_t segnum, Collector& collector,
+    const typename Collector::KeyBlockPlan& plan,
+    const ExactDomainSortRoute& route, std::span<uint64_t> visited,
+    Domain& domain, int64_t fromLeaf = 0);
+
+// Scan: every unvisited domain doc in doc order, unclassified. Its premise -
+// the bounds would skip too little to repay classifying - comes from the
+// density estimate, which cannot see keys correlated with doc order, so the
+// scan re-checks it against the bottom once the heap is full, at doubling
+// gathered counts from max(k, leafSize) docs on, and hands the rest to bound
+// order or the sweep when either costs decisively less over it
+// (ExactDomainSortCosts::scanCheckpoint).
+template <typename Collector, typename Domain>
+void scanInDocOrder(int32_t segnum, Collector& collector,
+                    const typename Collector::KeyBlockPlan& plan,
+                    const ExactDomainSortRoute& route,
+                    std::span<uint64_t> visited, Domain& domain,
+                    int64_t restCard) {
+  skipCount(SkipStats::fieldSortDomainScans);
+  int64_t scanned = 0;
+  int64_t round = std::max<int64_t>(collector.topCount, plan.leafSize);
+  for (int64_t leaf = 0; leaf < plan.leafCount;) {
+    int64_t before = collector.hitCount;
+    leaf = domain.scanFrom(leaf, visited, round);
+    scanned += collector.hitCount - before;
+    if (leaf >= plan.leafCount) return;
+    if (collector.heapFull()) {
+      auto rest = ExactDomainSortCosts::scanCheckpoint(
+          collector.leavesWithinBottom(*plan.batch),
+          std::max<int64_t>(1, restCard - scanned), plan.leafCount - leaf);
+      if (rest != ExactDomainSortPhase::SCAN) {
+        skipCount(SkipStats::fieldSortScanHandOffs);
+        if (rest == ExactDomainSortPhase::SWEEP) {
+          sweepLeavesInDocOrder(segnum, collector, plan, visited, domain,
+                                leaf);
+        } else {
+          // The bottom bounds the rest, so no checkpoints and no cap: bound
+          // order settles the segment (a proof, or every leaf walked).
+          ExactDomainSortRoute bounded = route;
+          bounded.checkProgress = false;
+          bounded.probeLeaves = 0;
+          bounded.gatherCapForTests = 0;
+          [[maybe_unused]] bool settled =
+              !collectTopKBoundOrder(segnum, collector, plan, bounded,
+                                     visited, domain, leaf)
+                   .has_value();
+          assert(settled);
+        }
+        return;
+      }
+    }
+    round = scanned;
   }
 }
 
@@ -1110,28 +1636,53 @@ void sweepLeavesInDocOrder(int32_t segnum, Collector& collector,
 // which the column persists per direction (KeyBatch::boundOrderLeaf), so the
 // walk is a scan of that order. A SKIP_STRICT leaf proves global termination
 // (every later leaf's bound is at least as bad, and the bottom only
-// improves); a SKIP_TIE leaf is skipped alone. Returns true when the phase
-// settled the segment (proof, or every leaf visited); false hands the
-// unvisited leaves to the sweep. The hand-off comes from progress
-// checkpoints (firstCheckpoint, past any clipped leaves, then at doubling
-// gather counts): heap entries below the next leaf's bound are final, and
-// boundOrderKeepsPaying judges how many there are.
-template <typename Collector, typename GatherLeaf>
-bool collectTopKBoundOrder(int32_t segnum, Collector& collector,
-                           const typename Collector::KeyBlockPlan& plan,
-                           const ExactDomainSortRoute& route,
-                           std::span<uint64_t> visited, GatherLeaf& gather) {
+// improves); a SKIP_TIE leaf is skipped alone, and stays settled for later
+// phases. Leaves before fromLeaf (a scan's prefix) and visited leaves are
+// already settled: they pass without a gather, though their bounds still
+// terminate. Returns nothing when the phase settled the segment (a proof, or
+// every leaf walked); otherwise the phase that serves the unvisited leaves.
+// The hand-off comes from progress checkpoints - the first past any clipped
+// leaves (firstCheckpoint, or the probe's length), then at doubling walked
+// counts - where ExactDomainSortCosts::boundOrderCheckpoint re-decides from
+// the proofs so far; or from the test cap.
+template <typename Collector, typename Domain>
+std::optional<ExactDomainSortPhase> collectTopKBoundOrder(
+    int32_t segnum, Collector& collector,
+    const typename Collector::KeyBlockPlan& plan,
+    const ExactDomainSortRoute& route, std::span<uint64_t> visited,
+    Domain& domain, int64_t fromLeaf) {
   using BC = typename Collector::BlockClass;
   using Costs = ExactDomainSortCosts;
   skipCount(SkipStats::fieldSortBestFirstActivations);
-
+  bool probing = route.probeLeaves > 0;
+  if (probing) skipCount(SkipStats::fieldSortProbes);
+  int64_t leafGathers = 0;
+  int64_t hitsBefore = collector.hitCount;
   int64_t topCount = collector.topCount;
+  auto settled = [&](int64_t leaf) {
+    return leaf < fromLeaf || leafVisited(visited, leaf);
+  };
+  auto settle = [&](int64_t leaf) {
+    if (!visited.empty()) visited[(size_t)(leaf >> 6)] |= 1ULL << (leaf & 63);
+  };
+  auto restCard = [&]() {
+    return std::max<int64_t>(
+        1, route.card - (collector.hitCount - hitsBefore));
+  };
+  // A probe that hands back is declined; planned bound order falls back.
+  auto handOff = [&](ExactDomainSortPhase rest) {
+    skipCount(probing ? SkipStats::fieldSortProbesDeclined
+                      : SkipStats::fieldSortBestFirstFallbacks);
+    return rest;
+  };
+
   int64_t checkpoint = std::numeric_limits<int64_t>::max();
   if (route.checkProgress) {
-    checkpoint = Costs::firstCheckpoint(route.expectedFloor, route.clipLeaves,
-                                        topCount);
+    checkpoint = probing
+        ? route.clipLeaves + route.probeLeaves
+        : Costs::firstCheckpoint(route.expectedFloor, route.clipLeaves,
+                                 topCount);
   }
-  int64_t leafGathers = 0;
   for (int64_t rank = 0; rank < plan.leafCount; rank++) {
     auto [leaf, bound] = plan.batch->boundOrderLeaf(rank);
     if (collector.heapFull()) {
@@ -1139,128 +1690,114 @@ bool collectTopKBoundOrder(int32_t segnum, Collector& collector,
           segnum, (int32_t)(leaf * (int64_t)plan.leafSize), bound,
           plan.batch);
       if (cls == BC::SKIP_STRICT) {
-        // Credit this leaf and every later one as skipped, so cross-arm
-        // skip accounting stays comparable.
+        // Every leaf from here on not yet settled is skipped.
         skipCount(SkipStats::fieldSortBestFirstTerminations);
         if (SkipStats::enabled) {
-          SkipStats::fieldSortLeavesSkipped += plan.leafCount - rank;
+          for (int64_t r = rank; r < plan.leafCount; r++) {
+            SkipStats::fieldSortLeavesSkipped +=
+                !settled(plan.batch->boundOrderLeaf(r).leaf);
+          }
         }
-        return true;
+        return std::nullopt;
       }
       if (cls == BC::SKIP_TIE) {
-        skipCount(SkipStats::fieldSortLeavesSkipped);
+        if (!settled(leaf)) {
+          skipCount(SkipStats::fieldSortLeavesSkipped);
+          settle(leaf);
+        }
         continue;
       }
     }
-    visited[(size_t)(leaf >> 6)] |= 1ULL << (leaf & 63);
+    if (settled(leaf)) continue;
+    settle(leaf);
     skipCount(SkipStats::fieldSortBestFirstLeaves);
-    gather(leaf, false);
+    domain.gatherLeaf(leaf);
     leafGathers++;
-    if (rank + 1 == plan.leafCount) return true;
+    int64_t walked = rank + 1;
+    if (walked == plan.leafCount) return std::nullopt;
     if (route.gatherCapForTests > 0 && leafGathers >= route.gatherCapForTests) {
-      return false;
+      if (probing) return handOff(route.phase);
+      auto restCosts = Costs::boundOrderRest(
+          ExactDomainSortPhase::BOUND_ORDER, walked, 0, topCount,
+          route.clipLeaves, collector.leavesWithinBottom(*plan.batch),
+          restCard(), plan.leafCount);
+      return handOff(restCosts.cheaperInDocOrder());
     }
-    if (leafGathers >= checkpoint) {
+    if (walked >= checkpoint) {
       int64_t proofs = collector.countKeysBelow(
-          plan.batch->boundOrderLeaf(rank + 1).bound, plan.batch);
-      if (!Costs::boundOrderKeepsPaying(leafGathers, proofs, topCount,
-                                        route.card, plan.leafCount,
-                                        route.clipLeaves)) {
-        return false;
-      }
-      checkpoint = 2 * leafGathers;
+          plan.batch->boundOrderLeaf(walked).bound, plan.batch);
+      auto rest = Costs::boundOrderCheckpoint(
+          probing ? route.phase : ExactDomainSortPhase::BOUND_ORDER, walked,
+          proofs, topCount, route.clipLeaves,
+          collector.leavesWithinBottom(*plan.batch), restCard(),
+          plan.leafCount);
+      if (rest != ExactDomainSortPhase::BOUND_ORDER) return handOff(rest);
+      checkpoint = 2 * walked;
     }
   }
-  return true;
+  return std::nullopt;
 }
 
-// Exact-domain driver: the route's optional bound-order phase, then the
-// doc-order sweep over whatever it left. Every in-domain doc is gathered at
-// most once, so hitCount keeps the pruned-path semantics (counts gathered
-// docs); an exact hit count may instead come from the known domain's
-// cardinality. The domain representation lives in `gather(leaf, inDocOrder)`,
-// which feeds one leaf's in-domain (docs, keys) to admitGathered; the bitset
-// and array entry points below supply it.
-template <typename Collector, typename GatherLeaf>
-void collectTopKBestFirst(int32_t segnum, Collector& collector, MemPool& pool,
-                          const typename Collector::KeyBlockPlan& plan,
-                          const ExactDomainSortRoute& route,
-                          GatherLeaf&& gather) {
+// Exact-domain driver: the route's phase - bound order (then the sweep or
+// the scan over whatever it left, if it hands off), the sweep, or the scan,
+// either of the last two after a bound-order probe when the route has one.
+// Every in-domain doc is gathered at most once, so hitCount keeps the
+// pruned-path semantics (counts gathered docs); an exact hit count may
+// instead come from the known domain's cardinality. The representation lives
+// in the Domain (BitSetSortDomain, ArraySortDomain); the route never depends
+// on it.
+template <typename Collector, typename Domain>
+void collectTopKExactDomain(int32_t segnum, Collector& collector,
+                            MemPool& pool,
+                            const typename Collector::KeyBlockPlan& plan,
+                            const ExactDomainSortRoute& route,
+                            Domain& domain) {
   assert(plan.batch != nullptr && plan.leafSize != 0);
   std::span<uint64_t> visited;
-  if (route.boundOrder) {
+  ExactDomainSortPhase phase = route.phase;
+  int64_t hitsBefore = collector.hitCount;
+  if (phase == ExactDomainSortPhase::BOUND_ORDER || route.probeLeaves > 0) {
     visited = pool.make_span<uint64_t>((size_t)((plan.leafCount + 63) >> 6));
     std::fill(visited.begin(), visited.end(), 0);
-    if (collectTopKBoundOrder(segnum, collector, plan, route, visited,
-                              gather)) {
-      return;
-    }
-    skipCount(SkipStats::fieldSortBestFirstFallbacks);
-  } else {
-    skipCount(SkipStats::fieldSortDocOrderSweeps);
+    auto rest = collectTopKBoundOrder(segnum, collector, plan, route, visited,
+                                      domain);
+    if (!rest.has_value()) return;
+    phase = *rest;
   }
-  sweepLeavesInDocOrder(segnum, collector, plan, visited, gather);
+  if (phase == ExactDomainSortPhase::SCAN) {
+    scanInDocOrder(segnum, collector, plan, route, visited, domain,
+                   route.card - (collector.hitCount - hitsBefore));
+  } else {
+    if (visited.empty()) skipCount(SkipStats::fieldSortDocOrderSweeps);
+    sweepLeavesInDocOrder(segnum, collector, plan, visited, domain);
+  }
 }
 
-// Bitset-domain entry: domainWords is a whole-segment word span (cached
-// filter or liveDocs), or empty meaning every doc (match-all, no deletes).
-// Leaves gather through the comparator's fused masked gather, in any order.
+// Bitset entry: domainWords is a whole-segment word span (cached filter or
+// liveDocs), or empty meaning every doc (match-all, no deletes).
 template <typename Collector>
-void collectTopKBitSetBestFirst(int32_t segnum,
-                                std::span<const uint64_t> domainWords,
-                                Collector& collector, MemPool& pool,
-                                const ExactDomainSortRoute& route) {
+void collectTopKBitSetDomain(int32_t segnum,
+                             std::span<const uint64_t> domainWords,
+                             Collector& collector, MemPool& pool,
+                             const ExactDomainSortRoute& route) {
   auto plan = collector.maskedKeyBlockPlan();
   assert(plan.batch != nullptr);
-  std::span<int32_t> outDocs = pool.make_span<int32_t>((size_t)plan.leafSize);
-  std::span<int64_t> outKeys = pool.make_span<int64_t>((size_t)plan.leafSize);
-  collectTopKBestFirst(
-      segnum, collector, pool, plan, route, [&](int64_t leaf, bool) {
-        int32_t n = plan.batch->gatherLeafMasked(leaf, domainWords, outDocs,
-                                                 outKeys);
-        if (n > 0) {
-          collector.admitGathered(segnum, outDocs.first((size_t)n),
-                                  outKeys.first((size_t)n), plan.batch);
-        }
-      });
+  BitSetSortDomain<Collector> domain(segnum, domainWords, collector, plan,
+                                     pool);
+  collectTopKExactDomain(segnum, collector, pool, plan, route, domain);
 }
 
-// Array-domain entry: domainDocs is the whole sorted materialized set (an
-// ARRAY DocSet, below the bitset promotion threshold). A bound-order visit
-// binary-searches its leaf's doc sub-span (leaves arrive in bound order, so
-// there is no forward cursor to gallop from); the sweep gallops forward from
-// the end of the previous gathered leaf. Keys come from the comparator's
-// order-independent key gather - the docs themselves need no copy.
+// Array entry: domainDocs is the whole sorted materialized set.
 template <typename Collector>
-void collectTopKArrayBestFirst(int32_t segnum,
-                               std::span<const int32_t> domainDocs,
-                               Collector& collector, MemPool& pool,
-                               const ExactDomainSortRoute& route) {
+void collectTopKArrayDomain(int32_t segnum,
+                            std::span<const int32_t> domainDocs,
+                            Collector& collector, MemPool& pool,
+                            const ExactDomainSortRoute& route) {
   auto plan = collector.maskedKeyBlockPlan();
   assert(plan.batch != nullptr);
-  std::span<int64_t> outKeys = pool.make_span<int64_t>((size_t)plan.leafSize);
-  const int32_t* domainEnd = domainDocs.data() + domainDocs.size();
-  const int32_t* sweepCursor = domainDocs.data();
-  collectTopKBestFirst(
-      segnum, collector, pool, plan, route,
-      [&](int64_t leaf, bool inDocOrder) {
-        int32_t begin = (int32_t)std::min<int64_t>(
-            leaf * (int64_t)plan.leafSize,
-            (int64_t)std::numeric_limits<int32_t>::max());
-        int32_t end = (int32_t)std::min<int64_t>(
-            (leaf + 1) * (int64_t)plan.leafSize,
-            (int64_t)std::numeric_limits<int32_t>::max());
-        const int32_t* lo = inDocOrder
-            ? screaming::gallopLowerBound(sweepCursor, domainEnd, begin)
-            : std::lower_bound(domainDocs.data(), domainEnd, begin);
-        const int32_t* hi = screaming::gallopLowerBound(lo, domainEnd, end);
-        if (inDocOrder) sweepCursor = hi;
-        if (lo == hi) return;
-        std::span<const int32_t> docs(lo, hi);
-        plan.batch->gatherKeys(docs, outKeys.first(docs.size()));
-        collector.admitGathered(segnum, docs, outKeys.first(docs.size()),
-                                plan.batch);
-      });
+  ArraySortDomain<Collector> domain(segnum, domainDocs, collector, plan,
+                                    pool);
+  collectTopKExactDomain(segnum, collector, pool, plan, route, domain);
 }
 
 // Seeded two-pass query-driven field-sort driver. The domain is reachable
@@ -1295,7 +1832,7 @@ void collectTopKMatchWindowedSeeded(
   skipCount(SkipStats::fieldSortSeededActivations);
 
   // Select the seedCount globally best-bounded leaves - the head of the
-  // column's persisted bound order, the same order the best-first driver
+  // column's persisted bound order, the same order the exact-domain driver
   // walks - then visit the selection in ascending doc order so the seed
   // scorer only moves forward. Selection is metadata-only: no
   // classification, no postings work.

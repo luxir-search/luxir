@@ -116,21 +116,18 @@ public:
     CONSTANT_FIRST_K,
   };
 
-  // Available when the sole numeric key offers masked leaf bounds and the
-  // expected bound-order visit floor, ceil(k * maxDoc / card) leaves, is
-  // sub-saturating (2 * floor < leafCount). Past that the bounds skip too
-  // little to repay the driver's per-leaf sweep, and the ladder's coarse-range
-  // walk serves a sparse domain faster (measured up to 2x on 0.1-1%
-  // memberships). Leaves bounded before the domain's key floor (a range on
-  // the sort field itself; FieldSortCollector::leavesBeforeKeyFloor) are
-  // visited whatever the density, so the route prices max(floor, clip). The
-  // clip demotes only an ARRAY domain to the ladder: with every leaf visited
-  // and nothing skipped, the ladder walks an array in 0.53-0.91 of the
-  // sweep's time, while the sweep's fused masked gather serves a BITSET
-  // domain in 0.75-0.88 of the ladder's (5M benchgame range board, cached
-  // memberships, k = 10-1000). The route then picks the driver's phases by
-  // cost (ExactDomainSortCosts).
-  struct FieldSortBestFirstPlan {
+  // Every materialized domain whose sole numeric key offers masked leaf
+  // bounds takes the exact-domain driver, whatever its cardinality or
+  // representation: the driver picks its phase by cost
+  // (ExactDomainSortCosts::choosePhase) from the expected bound-order visit
+  // floor, ceil(k * maxDoc / card) leaves; the leaves bounded before the
+  // domain's key floor (a range on the sort field itself;
+  // FieldSortCollector::leavesBeforeKeyFloor), which are visited whatever
+  // the density; and the leaves a heap filled by earlier segments still
+  // admits (FieldSortCollector::leavesWithinBottom). A sweep or scan at a
+  // sub-saturating floor starts with a short bound-order probe when it can
+  // afford one (ExactDomainSortCosts::probeLeaves).
+  struct ExactDomainSortPlan {
     FieldSortCollector::KeyBlockPlan keys;
     ExactDomainSortRoute route;
 
@@ -147,32 +144,61 @@ public:
     bool omitsWeight() const noexcept { return acceptedUse != nullptr; }
   };
 
-  static FieldSortBestFirstPlan planFieldSortBestFirst(
-      FieldSortCollector& collector, int64_t card, int32_t maxDoc,
-      bool bitsetDomain) {
+  static int64_t expectedVisitFloor(int64_t topCount, int64_t card,
+                                    int32_t maxDoc, int64_t leafCount) {
+    return std::min<int64_t>(leafCount,
+                             (topCount * (int64_t)maxDoc + card - 1) / card);
+  }
+
+  static ExactDomainSortPlan planExactDomainSort(
+      FieldSortCollector& collector, int64_t card, int32_t maxDoc) {
     if (disableFieldSortPruning || disableFieldSortBestFirst || card <= 0) {
       return {};
     }
     auto keys = collector.maskedKeyBlockPlan();
     if (keys.batch == nullptr) return {};
-    int64_t expectedFloor = std::min<int64_t>(
-        keys.leafCount,
-        (collector.topCount * (int64_t)maxDoc + card - 1) / card);
-    int64_t clip = collector.leavesBeforeKeyFloor;
-    int64_t floor = std::max(expectedFloor, clip);
-    int64_t gateFloor = bitsetDomain ? expectedFloor : floor;
-    if (2 * gateFloor >= keys.leafCount && !forceFieldSortBestFirst) {
-      return {};
-    }
     ExactDomainSortRoute route;
     route.card = card;
-    route.expectedFloor = expectedFloor;
-    route.clipLeaves = clip;
-    route.boundOrder = forceFieldSortBestFirst
-        || ExactDomainSortCosts::boundOrderPays(floor, card, keys.leafCount);
+    route.expectedFloor =
+        expectedVisitFloor(collector.topCount, card, maxDoc, keys.leafCount);
+    route.clipLeaves = collector.leavesBeforeKeyFloor;
+    int64_t withinBottom = collector.leavesWithinBottom(*keys.batch);
+    route.phase = forceFieldSortBestFirst
+        ? ExactDomainSortPhase::BOUND_ORDER
+        : ExactDomainSortCosts::choosePhase(route.expectedFloor,
+                                            route.clipLeaves, withinBottom,
+                                            card, keys.leafCount);
     route.checkProgress = !forceFieldSortBestFirst;
     route.gatherCapForTests = forceFieldSortWorkCapForTests;
+    route.probeLeaves = ExactDomainSortCosts::probeLeaves(
+        route.phase, route.expectedFloor, route.clipLeaves, withinBottom,
+        card, keys.leafCount);
     return {keys, route};
+  }
+
+  // Whole-membership build policy for a FIELD_SORT segment: build when the
+  // exact-domain driver could then bound its visits - the expected visit
+  // floor sub-saturating (2 * floor < leafCount), with the key-floor clip
+  // counted only for a membership that would materialize as an ARRAY. This
+  // was the driver's availability gate while saturating domains went to the
+  // ladder (the clip counted for ARRAY only because the ladder then walked a
+  // fully clipped array faster than the driver's sweep, while a bitset's
+  // fused masked sweep beat the ladder); it stays the build rule until
+  // builds are priced with the driver's cost model.
+  static bool wholeMembershipBoundsFieldSort(
+      FieldSortCollector& collector, int64_t card, int32_t maxDoc) {
+    if (disableFieldSortPruning || disableFieldSortBestFirst || card <= 0) {
+      return false;
+    }
+    auto keys = collector.maskedKeyBlockPlan();
+    if (keys.batch == nullptr) return false;
+    if (forceFieldSortBestFirst) return true;
+    int64_t floor =
+        expectedVisitFloor(collector.topCount, card, maxDoc, keys.leafCount);
+    if (card <= (int64_t)DocSetBuilder::arrayLimitFor(maxDoc)) {
+      floor = std::max(floor, collector.leavesBeforeKeyFloor);
+    }
+    return 2 * floor < keys.leafCount;
   }
 
   // The values every collected doc holds in the primary sort column: what
@@ -216,10 +242,11 @@ public:
   }
 
   // Pre-Weight FIELD_SORT planning. A complete resident whole membership
-  // serves every shape: the Calc still chooses per segment between best-first
-  // over the exact set and the doc-order ladder over it, and either replaces
-  // query evaluation. That includes shapes this planner never builds for,
-  // whose membership another consumer (a count over the same query) made
+  // serves every shape: the Calc serves it per segment through the
+  // exact-domain driver, or through the doc-order ladder over it when the
+  // sort offers no masked leaf bounds, and either replaces query
+  // evaluation. That includes shapes this planner never builds for, whose
+  // membership another consumer (a count over the same query) made
   // resident; accepting applies the ordinary shared-hit effects. The inert
   // lookup records nothing when the value is absent. Building stays a
   // separate decision: verification-bearing and non-flat numeric shapes
@@ -253,9 +280,10 @@ public:
 
   // Building membership pays for FIELD_SORT when it removes verification
   // work from the query-driven ladder, or when its estimated cardinality
-  // unlocks the exact-set best-first route. Flat term conjunction cost is only
+  // lets the exact-domain driver bound its visits
+  // (wholeMembershipBoundsFieldSort). Flat term conjunction cost is only
   // the cheapest posting list, not a useful estimate of intersection
-  // membership, so it cannot establish the best-first route by itself.
+  // membership, so it cannot establish that by itself.
   // VerificationWork includes nested two-phase children hidden behind a
   // single-phase compound protocol. Serving an already resident value is not
   // decided here: the pre-Weight planner accepts it for every shape. Plan
@@ -301,13 +329,8 @@ public:
                 != Query::ClauseShape::FLAT_CONJUNCTION) {
           collector.setSegment(
               segment.ord, &segment.postingsReader(), &pool, estimatedCard);
-          // The membership would materialize as an array at or below the
-          // builder's promotion limit.
-          bool bitsetDomain = estimatedCard
-              > (int64_t)DocSetBuilder::arrayLimitFor(segment.maxDoc());
-          routed = planFieldSortBestFirst(
-              collector, estimatedCard, segment.maxDoc(), bitsetDomain)
-              .available();
+          routed = wholeMembershipBoundsFieldSort(
+              collector, estimatedCard, segment.maxDoc());
         }
       }
       routes[(size_t)segment.ord] = (uint8_t)routed;
@@ -1824,18 +1847,16 @@ public:
             // so the ordinary bulk arm never re-plans the same context.
             std::optional<Query::ScorerSupplier::BulkPlan> matchWindowsPlan;
             Query::ScorerSupplier::BulkScorerContext matchWindowsContext;
-            // Best-first exact-domain route: when the whole result set is
-            // already materialized (BITSET or ARRAY), no scorer needs to run
-            // - the driver visits leaves in the column's persisted bound
-            // order when that pays, terminating on proof, and sweeps
-            // whatever it leaves in doc order (ExactDomainSortCosts). The
-            // domain sources: a resident whole membership, the supplier's
-            // exact cached set (a folded filter-only Boolean over match-all,
-            // no other filter or sub-op domain restriction), an explicit
-            // collectorFilter under a true match-all weight, or every doc.
-            // Activation requires the expected visit floor (ceil(k/d)
-            // leaves, or the leaves clipped by the domain's key floor) to
-            // be sub-saturating.
+            // Exact-domain route: when the whole result set is already
+            // materialized (BITSET or ARRAY), no scorer needs to run - the
+            // driver visits leaves in the column's persisted bound order,
+            // terminating on proof, sweeps the domain's leaves in doc order,
+            // or scans every domain doc, whichever costs least
+            // (ExactDomainSortCosts). The domain sources: a resident whole
+            // membership, the supplier's exact cached set (a folded
+            // filter-only Boolean over match-all, no other filter or sub-op
+            // domain restriction), an explicit collectorFilter under a true
+            // match-all weight, or every doc.
             if (maySkipNoncompetitiveDocs
                 && (!requiresWholeIndexPrepare || wholeFieldSortAvailable)
                 && !data->fieldCollector->needsScores
@@ -1863,16 +1884,14 @@ public:
                           || domainSet->type == DocSet::ARRAY))) {
                 int64_t card =
                     allDocs ? (int64_t)seg.maxDoc() : domainSet->card();
-                bool arrayDomain =
-                    !allDocs && domainSet->type == DocSet::ARRAY;
-                auto bestFirst = planFieldSortBestFirst(
-                    *data->fieldCollector, card, seg.maxDoc(), !arrayDomain);
-                if (bestFirst.available()) {
-                  if (arrayDomain) {
-                    collectTopKArrayBestFirst(
+                auto exactDomain = planExactDomainSort(
+                    *data->fieldCollector, card, seg.maxDoc());
+                if (exactDomain.available()) {
+                  if (!allDocs && domainSet->type == DocSet::ARRAY) {
+                    collectTopKArrayDomain(
                         segnum, ((ArrDocSet*)domainSet)->docs(),
                         *data->fieldCollector, poolGuard.pool(),
-                        bestFirst.route);
+                        exactDomain.route);
                   } else {
                     std::span<const uint64_t> words;  // empty = every doc
                     if (!allDocs) {
@@ -1882,10 +1901,10 @@ public:
                           bits.words,
                           FixedBitSet::sizeInWords(bits.size()));
                     }
-                    collectTopKBitSetBestFirst(
+                    collectTopKBitSetDomain(
                         segnum, words,
                         *data->fieldCollector, poolGuard.pool(),
-                        bestFirst.route);
+                        exactDomain.route);
                   }
                   data->fieldCollector->recordSegmentSkipStats(segnum);
                   if (wholeFieldSortAvailable) {
@@ -1913,11 +1932,11 @@ public:
               supplier = obtainMainSupplier();
             }
             // Seeded two-pass query-driven route: no materialized domain
-            // exists (else best-first took it), but the sole dense numeric
-            // primary still publishes leaf bounds, so the driver fills the
-            // heap from the best-bounded leaves (the head of the persisted
-            // bound order) via one bulk scorer and sweeps the complement
-            // with a second, independent one. Needs a
+            // exists (else the exact-domain driver took it), but the sole
+            // dense numeric primary still publishes leaf bounds, so the
+            // driver fills the heap from the best-bounded leaves (the head
+            // of the persisted bound order) via one bulk scorer and sweeps
+            // the complement with a second, independent one. Needs a
             // supplier whose bulk plans declare independentReplan (both
             // products are built before pass 1), a sub-saturating expected
             // floor with material headroom (4*floor+64 < blockCount), and

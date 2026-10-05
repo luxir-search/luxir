@@ -2990,8 +2990,9 @@ TEST_F(SearchEngineTest, wholeFieldSortRoutesBeforeCacheTrafficByShape) {
 // conjunction never builds for a field sort (numeric sort: the flat veto;
 // string sort: docs-only without verification work), yet once a count over
 // the same query has made its whole membership resident, both sorts serve it
-// without constructing the main Weight. Without the resident value they keep
-// the query route and leave the cache untouched.
+// without constructing the main Weight: the numeric sort through the
+// exact-domain driver, the string sort through the ladder over it. Without
+// the resident value they keep the query route and leave the cache untouched.
 TEST_F(SearchEngineTest, wholeFieldSortServesResidentMembershipItNeverBuilds) {
   constexpr std::string_view enabledCollection = "whole_field_sort_resident";
   constexpr std::string_view disabledCollection =
@@ -3034,7 +3035,8 @@ TEST_F(SearchEngineTest, wholeFieldSortServesResidentMembershipItNeverBuilds) {
     ASSERT_TRUE(resident.found.has_value());
     EXPECT_EQ(254, *resident.found);
     EXPECT_EQ(2, resident.hits);
-    EXPECT_EQ(2, resident.ladderFallbacks);
+    EXPECT_EQ(sort == 0 ? 2 : 0, resident.cachedBestFirst);
+    EXPECT_EQ(sort == 0 ? 0 : 2, resident.ladderFallbacks);
     EXPECT_EQ(0, resident.builds + resident.bypasses
                      + resident.routingBypasses);
     EXPECT_EQ(1, resident.weightSkips);
@@ -7518,14 +7520,15 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
                            "body_w", i % 2 == 0 ? "apple pear" : "other"));
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
-  // Eight numeric leaf zones: depth 1 admits best-first, depth 3 rejects it.
-  // Warm membership serves both depths, and its best-first plan must use
+  // Eight numeric leaf zones: depth 1 builds the membership, whose floor
+  // of two leaves the exact-domain driver serves in bound order; at depth 6
+  // the floor saturates all eight and the driver sweeps, so its plan must use
   // offset + limit even though limit stays 1.
   BestFirstGuard bestFirst(false, false);
   for (int round = 0; round < 3; round++) {
     auto req = localReq(helper.getSearchEngine());
     auto& q = req->collection("main").topDocs("q").fields({"id"})
-        .limit(1).offset(round == 2 ? 2 : 0).getNumber();
+        .limit(1).offset(round == 2 ? 5 : 0).getNumber();
     q.rawQuery() = qb::boolean(q.mr(), {},
         {qb::match(q.mr(), "body_w", "apple"), qb::match(q.mr(), "body_w", "pear")});
     qb::sort(q, "rank_i", qb::ASC);
@@ -7533,13 +7536,14 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
     req->execute(false);
     ASSERT_OK(req);
     EXPECT_EQ(2048, req->docList()->found.value_or(-1));
-    EXPECT_EQ((std::vector<std::string>{round == 2 ? "4" : "0"}), resultIds(*req, "q"));
+    EXPECT_EQ((std::vector<std::string>{round == 2 ? "10" : "0"}), resultIds(*req, "q"));
     if (round > 0) {
       EXPECT_EQ(1, SkipStats::cacheFirstFieldSortWeightSkips);
       EXPECT_EQ(1, SkipStats::wholeFieldSortHits);
-      EXPECT_EQ(round == 1 ? 1 : 0,
-                SkipStats::wholeFieldSortBestFirstActivations);
-      EXPECT_EQ(round == 1 ? 0 : 1, SkipStats::wholeFieldSortLadderFallbacks);
+      EXPECT_EQ(1, SkipStats::wholeFieldSortBestFirstActivations);
+      EXPECT_EQ(0, SkipStats::wholeFieldSortLadderFallbacks);
+      EXPECT_EQ(round == 1 ? 1 : 0, SkipStats::fieldSortBestFirstActivations);
+      EXPECT_EQ(round == 1 ? 0 : 1, SkipStats::fieldSortDocOrderSweeps);
     }
   }
 }

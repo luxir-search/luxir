@@ -1755,7 +1755,8 @@ public:
           }
           // An accepted reader-stable value replaces the ANN preparation pass.
           // Its bounded kNN membership is also a valid ladder fallback, while
-          // numeric best-first still rechecks exact cardinality per segment.
+          // the numeric exact-domain driver still prices exact cardinality per
+          // segment.
           if (acquireUse) {
             wholeMembershipUse = readerStableWhole
                 ? qcontext->getFilterUse(

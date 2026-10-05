@@ -326,23 +326,42 @@ public:
     return batch.keyFloor(*primaryValues);
   }
 
-  // Bound order ascends by bound, so the leaves bounded strictly before the
-  // key floor are a prefix of it: binary-search its length.
-  int64_t countLeavesBeforeKeyFloor(
-      const FieldComparator::KeyBatch& batch) const {
-    std::optional<int64_t> floor = domainKeyFloor(batch);
-    if (!floor.has_value()) return 0;
+  // Bound order ascends by bound, so the leaves bounded strictly before a
+  // key are a prefix of it: binary-search its length.
+  static int64_t leavesBoundedBefore(const FieldComparator::KeyBatch& batch,
+                                     int64_t key) {
     int64_t lo = 0;
     int64_t hi = batch.leafBlockCount();
     while (lo < hi) {
       int64_t mid = lo + (hi - lo) / 2;
-      if (batch.boundOrderLeaf(mid).bound < *floor) {
+      if (batch.boundOrderLeaf(mid).bound < key) {
         lo = mid + 1;
       } else {
         hi = mid;
       }
     }
     return lo;
+  }
+
+  int64_t countLeavesBeforeKeyFloor(
+      const FieldComparator::KeyBatch& batch) const {
+    std::optional<int64_t> floor = domainKeyFloor(batch);
+    return floor.has_value() ? leavesBoundedBefore(batch, *floor) : 0;
+  }
+
+  // Leaves bounded at or before the heap bottom's key (a tie may still win
+  // on segdoc): once the heap is full, no doc in any other leaf of the
+  // current segment can enter it, and the bottom only improves, so no
+  // traversal from here on visits more leaves. Every leaf while the heap is
+  // not full. A heap filled by earlier segments makes this the visit
+  // bound a per-segment density estimate cannot see.
+  int64_t leavesWithinBottom(const FieldComparator::KeyBatch& batch) const {
+    if (!heapFull()) return batch.leafBlockCount();
+    int64_t bottomKey = batch.slotKeys[pq.top().slot];
+    if (bottomKey == std::numeric_limits<int64_t>::max()) {
+      return batch.leafBlockCount();
+    }
+    return leavesBoundedBefore(batch, bottomKey + 1);
   }
 
   // COLUMN comparators bake direction into their stored values (sortMultiplier).
