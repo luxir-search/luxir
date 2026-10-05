@@ -206,6 +206,7 @@ struct HttpStreamBatchResult {
 struct CollectionCommit {
   std::string commit;
   std::optional<api::ReplicaResult> replicas;
+  std::optional<ErrorInfo> error;
 };
 
 struct HttpStreamInterval {
@@ -2472,6 +2473,11 @@ private:
     resp.errors = errors.finish();
     resp.total_errors = (int64_t)interval.totalErrors;
 
+    // Commit failures have the same in-band ERROR status as unary updates.
+    // Keep every collection outcome, including durable tokens on failed waits.
+    if (!terminal) for (const auto& [name, result] : interval.commits) {
+      if (result.error) { terminal = &*result.error; break; }
+    }
     if (terminal != nullptr) {
       resp.status = luxir::api::UpdateResponse_::Status::ERROR;
       resp.error = luxir::api::build::arenaError(responseResource, *terminal);
@@ -2486,7 +2492,10 @@ private:
     api::build::SpanBuilder<std::pair<std::string_view, api::CollectionCommit>> commits(responseResource);
     commits.reserve(interval.commits.size());
     for (const auto& [name, result] : interval.commits) {
-      commits.emplace_back(name, api::CollectionCommit{result.commit, result.replicas});
+      auto& dst = commits.emplace_back(name, api::CollectionCommit{}).second;
+      dst.commit = result.commit;
+      dst.replicas = result.replicas;
+      if (result.error) dst.error = api::build::arenaError(responseResource, *result.error);
     }
     resp.commits = commits.finish();
     out.clear();
@@ -3121,61 +3130,59 @@ private:
 
   using UrlWriters = std::vector<std::pair<std::string, std::shared_ptr<IndexWriter>>>;
 
+  void onUrlCommitDone(const std::shared_ptr<HttpStreamUpdateState>& state, const std::string& name,
+                       const std::optional<CommitId>& id, std::optional<api::ReplicaResult> replicas,
+                       std::optional<ErrorInfo> error) {
+    if (streamUpdate_ != state || state->failed) return;
+    state->interval.commits[name] = {id ? id->token() : "", replicas, std::move(error)};
+    if (--state->urlCommitsPending == 0) {
+      state->urlCommitInFlight = false;
+      state->interval.submitted = true;
+      finishStreamingUpdate();
+    }
+  }
+
   void submitUrlCommit(const std::shared_ptr<HttpStreamUpdateState>& state,
                        const std::shared_ptr<UrlWriters>& writers, size_t index) {
     node_.getTaskArena().enqueue([self = shared_from_this(), state, writers, index] {
-      auto request = std::make_shared<HttpUpdateState>();
-      request->proto.collection = api::build::arenaStr(request->resource, (*writers)[index].first);
-      auto& params = request->proto.commit.emplace();
-      params.wait_for_replicas = api::build::arenaStr(request->resource, state->url.waitForReplicas);
-      params.replication_timeout_ms = state->url.replicationTimeoutMs;
-      class Commit final : public ProtoUpdateMessage {
-        std::shared_ptr<HttpUpdateState> request;
-        std::shared_ptr<HttpSession> session;
-        std::shared_ptr<HttpStreamUpdateState> state;
-        std::shared_ptr<UrlWriters> writers;
-        size_t index;
-      public:
-        Commit(std::shared_ptr<HttpUpdateState> request, std::shared_ptr<HttpSession> session,
-               std::shared_ptr<HttpStreamUpdateState> state, std::shared_ptr<UrlWriters> writers, size_t index)
-            : ProtoUpdateMessage(&request->proto), request(std::move(request)), session(std::move(session)),
-              state(std::move(state)), writers(std::move(writers)), index(index) {}
-        void done(IndexWriter&) override {
-          complete(session->node_, [this] {
-            auto* response = finishResponse();
-            auto error = response->error ? std::optional(api::build::errorInfo(*response->error)) : std::nullopt;
-            net::post(session->stream_.get_executor(),
-                [self = session, state = state, writers = writers, index = index,
-                 id = resultingCommit, replicas = response->replicas, error]() mutable {
-                  if (self->streamUpdate_ != state || state->failed) return;
-                  if (error) { self->failStreamingUpdate(*error); return; }
-                  if (writers->size() == 1) {
-                    state->interval.commit = id;
-                    state->interval.replicas = replicas;
-                  } else {
-                    state->interval.commit.reset();
-                    state->interval.replicas.reset();
-                    if (id) {
-                      state->interval.commits[(*writers)[index].first] = {id->token(), replicas};
-                    }
-                  }
-                  if (--state->urlCommitsPending == 0) {
-                    state->urlCommitInFlight = false;
-                    state->interval.submitted = true;
-                    self->finishStreamingUpdate();
-                  }
-                });
-            delete this;
-          }, session->waitCancellation.get_token());
-        }
-      };
       try {
+        auto request = std::make_shared<HttpUpdateState>();
+        request->proto.collection = api::build::arenaStr(request->resource, (*writers)[index].first);
+        auto& params = request->proto.commit.emplace();
+        params.wait_for_replicas = api::build::arenaStr(request->resource, state->url.waitForReplicas);
+        params.replication_timeout_ms = state->url.replicationTimeoutMs;
+        class Commit final : public ProtoUpdateMessage {
+          std::shared_ptr<HttpUpdateState> request;
+          std::shared_ptr<HttpSession> session;
+          std::shared_ptr<HttpStreamUpdateState> state;
+          std::shared_ptr<UrlWriters> writers;
+          size_t index;
+        public:
+          Commit(std::shared_ptr<HttpUpdateState> request, std::shared_ptr<HttpSession> session,
+                 std::shared_ptr<HttpStreamUpdateState> state, std::shared_ptr<UrlWriters> writers, size_t index)
+              : ProtoUpdateMessage(&request->proto), request(std::move(request)), session(std::move(session)),
+                state(std::move(state)), writers(std::move(writers)), index(index) {}
+          void done(IndexWriter&) override {
+            complete(session->node_, [this] {
+              auto* response = finishResponse();
+              auto error = response->error ? std::optional(api::build::errorInfo(*response->error)) : std::nullopt;
+              net::post(session->stream_.get_executor(),
+                  [self = session, state = state, writers = writers, index = index,
+                   id = resultingCommit, replicas = response->replicas, error]() mutable {
+                    self->onUrlCommitDone(state, (*writers)[index].first, id, replicas, std::move(error));
+                  });
+              delete this;
+            }, session->waitCancellation.get_token());
+          }
+        };
         auto* msg = new Commit(request, self, state, writers, index);
         try { if (!(*writers)[index].second->submitUpdate(msg)) throw std::runtime_error("update was not admitted"); }
         catch (...) { delete msg; throw; }
       } catch (...) {
         auto error = currentExceptionInfo(ErrorKind::INTERNAL);
-        net::post(self->stream_.get_executor(), [self, error] { self->failStreamingUpdate(error); });
+        net::post(self->stream_.get_executor(), [self, state, writers, index, error] {
+          self->onUrlCommitDone(state, (*writers)[index].first, {}, {}, error);
+        });
       }
     });
   }
@@ -3186,6 +3193,8 @@ private:
     auto writers = std::make_shared<UrlWriters>();
     for (const auto& [name, target] : state->writerCache) writers->emplace_back(name, target.indexWriter);
     state->url.commit = false;
+    state->interval.commit.reset();
+    state->interval.replicas.reset();
     state->urlCommitInFlight = true;
     state->urlCommitsPending = writers->size();
     for (size_t i = 0; i < writers->size(); i++) submitUrlCommit(state, writers, i);

@@ -777,8 +777,11 @@ message ReplicaResult {
 }
 
 message CollectionCommit {
+  // Durable snapshot identity, retained even if the replica wait fails.
   string commit = 1;
   ReplicaResult replicas = 2;
+  // Commit or replica-wait failure for this collection.
+  Error error = 3;
 }
 
 // Index or delete documents, with an optional commit.
@@ -881,7 +884,9 @@ message UpdateResponse {
   // Snapshot token: incarnation:index_gen.
   string commit = 8;
   ReplicaResult replicas = 9;
-  // NDJSON EOF commits covering more than one collection.
+  // NDJSON URL EOF commit outcomes, including for a single collection.
+  // Any collection error sets the response status to ERROR and a top-level error;
+  // every admitted collection outcome is retained. HTTP status remains 200.
   map<string, CollectionCommit> commits = 10;
 }
 

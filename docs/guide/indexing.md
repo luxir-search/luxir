@@ -160,10 +160,12 @@ publication. The response's optional `commit` field identifies the resulting
 snapshot as the token `"<collection UUID>:42"` (`incarnation:index_gen`). The
 incarnation is part of the identity: deleting and recreating a collection changes its incarnation. Updates acknowledged before publication
 (including deferred commits) omit it. A forced merge returns the final merged
-snapshot's id. For an NDJSON URL EOF commit spanning multiple touched collections, the result is
-`commits: {name: {commit, replicas?}}`; `replicas` appears only when requested.
-A single touched collection keeps the ordinary `commit`/`replicas` shape.
-Explicit group commits report their own collection's identity.
+snapshot's id. An NDJSON URL EOF commit always returns
+`commits: {name: {commit?, replicas?, error?}}`, including for one collection.
+`replicas` appears only when requested. Each entry retains its durable token
+if a subsequent replica wait fails. All admitted outcomes are collected; any
+collection failure sets `status: "error"` and a top-level `error`, with HTTP 200.
+Unary updates and explicit group commits keep `commit`/`replicas`.
 
 The request's `commit` object may contain:
 

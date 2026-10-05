@@ -8,6 +8,7 @@
 #include <thread>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <optional>
 #include <set>
@@ -25,6 +26,7 @@
 #include "luxir/reader/Postings.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/server/HttpServer.h"
+#include "luxir/server/ReplicationCatalog.h"
 
 namespace luxir::test {
 
@@ -2091,7 +2093,7 @@ TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
   auto lines = splitLines(update.body());
   glz::generic_i64 eof;
   ASSERT_FALSE(glz::read_json(eof, lines.back()));
-  EXPECT_EQ((uint64_t)CommitId::parse(eof["commit"].get<std::string>()).index_gen, writer->snapshots.readers.getReader()->commitId());
+  EXPECT_EQ((uint64_t)CommitId::parse(eof["commits"]["main"]["commit"].get<std::string>()).index_gen, writer->snapshots.readers.getReader()->commitId());
   EXPECT_GT(writer->snapshots.readers.getReader()->commitTime(), before);
 }
 
@@ -4048,9 +4050,80 @@ TEST_F(HttpApiTest, commitResponseIdentifiesSnapshot) {
   auto lines = splitLines(streamed.body());
   ASSERT_FALSE(lines.empty());
   ASSERT_FALSE(glz::read_json(eof, lines.back())) << streamed.body();
-  EXPECT_GT(CommitId::parse(eof["commit"].get<std::string>()).index_gen, commit);
-  EXPECT_EQ((uint64_t)CommitId::parse(eof["commit"].get<std::string>()).index_gen,
+  EXPECT_GT(CommitId::parse(eof["commits"]["main"]["commit"].get<std::string>()).index_gen, commit);
+  EXPECT_EQ((uint64_t)CommitId::parse(eof["commits"]["main"]["commit"].get<std::string>()).index_gen,
             readDurableIndexInfo(helper.getIndexWriter()->dir)->index_gen);
+}
+
+TEST_F(HttpApiTest, ndjsonEofKeepsAllCommitOutcomesOnFailure) {
+  CollectionHelper other(*luxirNode, "eof_failure_other");
+  auto cleanup = scope_guard([&] { luxirNode->deleteCollection("eof_failure_other"); });
+  auto writer = helper.getIndexWriter();
+  Signal::listen("manifestWritten", [&](void* source, void*, void*) -> void* {
+    if (source == writer.get()) throw FileIOException("commit failed");
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("manifestWritten"); });
+  for (bool multiple : {false, true}) {
+    std::string body = "{\"id\":\"first\"}\n";
+    if (multiple) body += "{\"_update_\":{\"collection\":\"eof_failure_other\"}}\n{\"id\":\"second\"}\n";
+    auto response = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=true", body, "application/x-ndjson");
+    ASSERT_EQ(200, response.result_int()) << response.body();
+    auto lines = splitLines(response.body());
+    ASSERT_FALSE(lines.empty());
+    glz::generic_i64 eof;
+    ASSERT_FALSE(glz::read_json(eof, lines.back()));
+    EXPECT_EQ("error", eof["status"].get<std::string>());
+    EXPECT_EQ("internal", eof["error"]["code"].get<std::string>());
+    EXPECT_FALSE(eof.contains("commit"));
+    EXPECT_FALSE(eof["commits"]["main"].contains("commit"));
+    EXPECT_EQ("internal", eof["commits"]["main"]["error"]["code"].get<std::string>());
+    EXPECT_EQ(multiple ? 2u : 1u, eof["commits"].get<glz::generic_i64::object_t>().size());
+    if (multiple) {
+      EXPECT_EQ(other.collection().getShard()->getSnapshots().snapshot()->id.token(),
+                eof["commits"]["eof_failure_other"]["commit"].get<std::string>());
+      EXPECT_FALSE(eof["commits"]["eof_failure_other"].contains("error"));
+      EXPECT_EQ(1, other.collection().getReaderManager().getReader()->liveDocs());
+    }
+  }
+  auto unary = httpRequest(port(), http::verb::post, "/collections/main/_update", R"({"commit":{}})");
+  ASSERT_EQ(200, unary.result_int());
+  glz::generic_i64 result; ASSERT_FALSE(glz::read_json(result, unary.body()));
+  EXPECT_EQ("error", result["status"].get<std::string>());
+}
+
+TEST_F(HttpApiTest, ndjsonEofKeepsDurableTokensAfterReplicaWaitFailure) {
+  LuxirNode node;
+  CollectionHelper failed(node, "failed"), other(node, "kept");
+  HttpServer localServer(node, 2, 0); localServer.start();
+  std::atomic<unsigned> parked{0};
+  Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* { parked++; return nullptr; });
+  auto unlisten = scope_guard([] { Signal::unlisten("replicationWaitParked"); });
+  auto response = std::async(std::launch::async, [&] {
+    return httpRequest(localServer.getPort(), http::verb::post,
+        "/collections/failed/_update?commit=true&wait_for_replicas=1&replication_timeout_ms=5000",
+        "{\"id\":\"first\"}\n{\"_update_\":{\"collection\":\"kept\"}}\n{\"id\":\"second\"}\n",
+        "application/x-ndjson");
+  });
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (parked < 2 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  ASSERT_EQ(2u, parked.load());
+  auto removed = failed.collection().getShard()->getSnapshots().snapshot()->id.token();
+  auto kept = other.collection().getShard()->getSnapshots().snapshot()->id.token();
+  node.deleteCollection("failed");
+  node.getReplication().installed(node,
+      "{\"follower\":\"test\",\"collection\":\"kept\",\"commit\":\"" + kept + "\"}");
+  auto result = response.get();
+  ASSERT_EQ(200, result.result_int()) << result.body();
+  auto lines = splitLines(result.body());
+  glz::generic_i64 eof; ASSERT_FALSE(glz::read_json(eof, lines.back()));
+  EXPECT_EQ("error", eof["status"].get<std::string>());
+  EXPECT_EQ("replica_wait_cancelled", eof["error"]["code"].get<std::string>());
+  EXPECT_EQ(removed, eof["commits"]["failed"]["commit"].get<std::string>());
+  EXPECT_EQ("replica_wait_cancelled", eof["commits"]["failed"]["error"]["code"].get<std::string>());
+  EXPECT_EQ(kept, eof["commits"]["kept"]["commit"].get<std::string>());
+  EXPECT_EQ(1, eof["commits"]["kept"]["replicas"]["serving"].get<int64_t>());
+  EXPECT_FALSE(eof["commits"]["kept"].contains("error"));
 }
 
 } // namespace luxir::test

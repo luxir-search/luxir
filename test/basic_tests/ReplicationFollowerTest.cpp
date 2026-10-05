@@ -603,10 +603,11 @@ TEST_F(ReplicationFollowerTest, barriersCountFsAndRamAndReadYourWrite) {
     auto begin = reply.body().rfind('\n', end);
     auto line = std::string_view(reply.body()).substr(begin == std::string::npos ? 0 : begin + 1);
     glz::generic json; ASSERT_FALSE(glz::read_json(json, line));
-    ASSERT_TRUE(json.contains("replicas")) << reply.body();
-    EXPECT_FALSE(json["replicas"]["timed_out"].get<bool>());
-    EXPECT_GE(json["replicas"]["serving"].get<double>(), wanted == "1" ? 1 : 2);
-    auto token = json["commit"].get<std::string>();
+    auto& outcome = json["commits"]["main"];
+    ASSERT_TRUE(outcome.contains("replicas")) << reply.body();
+    EXPECT_FALSE(outcome["replicas"]["timed_out"].get<bool>());
+    EXPECT_GE(outcome["replicas"]["serving"].get<double>(), wanted == "1" ? 1 : 2);
+    auto token = outcome["commit"].get<std::string>();
     auto search = httpRequest(followerServer->getPort(), http::verb::get,
         "/collections/main/_search?query=id:" + wanted + "&min_commit=" + token + "&get_number=true");
     EXPECT_EQ(200, search.result_int()) << search.body();
@@ -754,9 +755,9 @@ TEST_F(ReplicationFollowerTest, eofCommitsOnlyTouchedCollections) {
   auto begin = response.body().rfind('\n', end);
   glz::generic json;
   ASSERT_FALSE(glz::read_json(json, std::string_view(response.body()).substr(begin == std::string::npos ? 0 : begin + 1)));
-  EXPECT_EQ(source->getCollection("other")->getShard()->getSnapshots().snapshot()->id.token(), json["commit"].get<std::string>());
-  EXPECT_EQ(0, json["replicas"]["serving"].get<double>());
-  EXPECT_TRUE(json["replicas"]["timed_out"].get<bool>());
+  EXPECT_EQ(source->getCollection("other")->getShard()->getSnapshots().snapshot()->id.token(), json["commits"]["other"]["commit"].get<std::string>());
+  EXPECT_EQ(0, json["commits"]["other"]["replicas"]["serving"].get<double>());
+  EXPECT_TRUE(json["commits"]["other"]["replicas"]["timed_out"].get<bool>());
 }
 
 TEST_F(ReplicationFollowerTest, emptySnapshotCannotParkANewerCommit) {

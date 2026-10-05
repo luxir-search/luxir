@@ -485,8 +485,9 @@ Single-valued vector column. Each Vector slot is independently nullable via its 
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.collectioncommit.commit"></a>[`commit`](#field-luxir.collectioncommit.commit) | 1 | `string` | singular |  |
+| <a id="field-luxir.collectioncommit.commit"></a>[`commit`](#field-luxir.collectioncommit.commit) | 1 | `string` | singular | Durable snapshot identity, retained even if the replica wait fails. |
 | <a id="field-luxir.collectioncommit.replicas"></a>[`replicas`](#field-luxir.collectioncommit.replicas) | 2 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
+| <a id="field-luxir.collectioncommit.error"></a>[`error`](#field-luxir.collectioncommit.error) | 3 | [`Error`](#message-luxir.error) | singular | Commit or replica-wait failure for this collection. |
 
 <a id="message-luxir.collectionstats"></a>
 
@@ -1558,7 +1559,7 @@ The response to an update request. In streaming mode the server sends exactly on
 | <a id="field-luxir.updateresponse.error"></a>[`error`](#field-luxir.updateresponse.error) | 6 | [`Error`](#message-luxir.error) | singular | Request-level failure (not tied to a single document), e.g. a failure in the commit pipeline. Set exactly when status == ERROR for a non-document failure. |
 | <a id="field-luxir.updateresponse.commit"></a>[`commit`](#field-luxir.updateresponse.commit) | 8 | `string` | singular | Resulting snapshot identity; absent without a completed commit. Snapshot token: incarnation:index\_gen. |
 | <a id="field-luxir.updateresponse.replicas"></a>[`replicas`](#field-luxir.updateresponse.replicas) | 9 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
-| <a id="field-luxir.updateresponse.commits"></a>[`commits`](#field-luxir.updateresponse.commits) | 10 | map&lt;`string`, [`CollectionCommit`](#message-luxir.collectioncommit)&gt; | map | NDJSON EOF commits covering more than one collection. |
+| <a id="field-luxir.updateresponse.commits"></a>[`commits`](#field-luxir.updateresponse.commits) | 10 | map&lt;`string`, [`CollectionCommit`](#message-luxir.collectioncommit)&gt; | map | NDJSON URL EOF commit outcomes, including for a single collection. Any collection error sets the response status to ERROR and a top-level error; every admitted collection outcome is retained. HTTP status remains 200. |
 
 <a id="message-luxir.updateresponse.docerror"></a>
 

@@ -56,10 +56,15 @@ mismatch immediately; followers allow time for an incarnation switch.
 Both timeout defaults are 30000 ms. Waits do not block later commits. A timeout
 never rolls back a committed write. An abandoned request waits until its deadline.
 
-An NDJSON URL EOF commit covers only collections touched by that stream. For
-multiple collections its result is `commits: {name: {commit, replicas?}}`;
-`replicas` appears only when requested. Single-collection results keep the shape
-above. A floor also protects reads sent to followers excluded from captured `all`.
+An NDJSON URL EOF commit covers only collections touched by that stream and
+always returns `commits: {name: {commit?, replicas?, error?}}`, even for one
+collection. An empty stream commits the URL's collection. `replicas` appears
+only when requested. A failed commit or replica wait sets that collection's
+`error`; a durable `commit` token is retained even if the wait fails. Every
+admitted outcome is returned. Any collection failure sets the overall
+`status: "error"` and a top-level `error`, with HTTP 200, as for a unary commit
+failure. Unary updates keep `commit`/`replicas`. A floor also protects reads
+sent to followers excluded from captured `all`.
 
 ## Copy, restore or promote
 

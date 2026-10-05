@@ -185,7 +185,12 @@ update returns HTTP success with `status: "partial"` and per-document
 `status: "error"` and a top-level `error`. Clients must inspect the body. NDJSON
 ingest reports a request-level failure as a terminal response line after
 earlier group acknowledgements; no later records from that connection are
-accepted. See [Indexing](indexing.md#per-document-failures).
+accepted. URL EOF commits always return a `commits` map, even for a single
+collection, and collect every admitted collection outcome before responding.
+Entries contain `commit`, optional `replicas`, and `error` when that collection's
+commit or replica wait failed; a durable token survives a failed wait. Any such
+failure sets overall `status: "error"` and a top-level `error`, with HTTP 200,
+consistent with unary commit failures. See [Indexing](indexing.md#per-document-failures).
 
 Search warnings are successful results with a bounded declared degradation.
 Use `warnings[].code` as the machine key and the message as diagnostic detail;

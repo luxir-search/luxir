@@ -175,6 +175,7 @@ struct ReplicaResult {
 struct CollectionCommit {
   std::string_view commit;
   std::optional<ReplicaResult> replicas;
+  std::optional<Error> error;
 };
 
 struct UpdateResponse {
