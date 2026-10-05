@@ -67,10 +67,10 @@ TEST(DirLockTest, allowsMultipleRAMDirFactories) {
 TEST(DirLockTest, unownedFactoryOpensAlongsideTheWriter) {
   TempDir tempDir;
   FSDirFactory writer(tempDir.path());
-  writer.create("main");
+  writer.container("main", true);
 
   FSDirFactory reader(tempDir.path(), /*unowned=*/true);
-  EXPECT_EQ(reader.listDirectories(), std::vector<std::string>{"main"});
+  EXPECT_EQ(reader.collections(), std::vector<std::string>{"main"});
   // The reader must not have left a lock behind either.
   EXPECT_NO_THROW({ FSDirFactory alsoUnowned(tempDir.path(), /*unowned=*/true); });
 }
@@ -88,13 +88,13 @@ TEST(DirLockTest, readOnlyDecoratorRejectsEveryMutator) {
   TempDir tempDir;
   {
     FSDirFactory writer(tempDir.path());
-    auto dir = writer.create("main");
+    auto dir = writer.container("main", true);
     auto file = dir->createFile("hello");
     dir->finishFile(*file);
   }
 
   ReadOnlyDirFactory reader(std::make_unique<FSDirFactory>(tempDir.path(), /*unowned=*/true));
-  auto dir = reader.create("main");
+  auto dir = reader.container("main", false);
 
   EXPECT_TRUE(dir->openFile("hello") != nullptr);
   std::vector<Directory::FileInfo> files;
@@ -110,11 +110,14 @@ TEST(DirLockTest, readOnlyDecoratorRejectsEveryMutator) {
   std::vector<std::string> syncNames{"hello"};
   EXPECT_THROW(dir->sync(syncNames), ReadOnlyError);
   EXPECT_THROW(reader.remove("main"), ReadOnlyError);
-  EXPECT_THROW(reader.create("absent"), ReadOnlyError);
+  EXPECT_THROW(reader.container("absent", true), ReadOnlyError);
+  EXPECT_THROW(reader.collection("main").create("incarnation"), ReadOnlyError);
+  EXPECT_THROW(reader.collection("main").select("incarnation"), ReadOnlyError);
+  EXPECT_THROW(reader.removeIncarnation("main", "incarnation"), ReadOnlyError);
 
   // finishFile needs a File, which only a writable directory can hand out.
   FSDirFactory writer2(tempDir.path());
-  auto writableDir = writer2.create("main");
+  auto writableDir = writer2.container("main", false);
   auto staged = writableDir->createFile("staged");
   EXPECT_THROW(dir->finishFile(*staged), ReadOnlyError);
 
@@ -128,6 +131,6 @@ TEST(DirLockTest, readOnlyDecoratorRejectsEveryMutator) {
 // The decorator carries the guarantee for any backend, not just the fs one.
 TEST(DirLockTest, readOnlyDecoratorWorksOverRam) {
   ReadOnlyDirFactory reader(std::make_unique<RAMDirFactory>());
-  EXPECT_THROW(reader.create("main"), ReadOnlyError);
+  EXPECT_THROW(reader.container("main", true), ReadOnlyError);
   EXPECT_THROW(reader.remove("main"), ReadOnlyError);
 }

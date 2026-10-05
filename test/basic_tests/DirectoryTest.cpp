@@ -422,3 +422,31 @@ TEST_F(DirectoryTest, checkedDirPreExistingFilesAssumedSynced) {
   // Pre-existing files should be assumed synced
   ASSERT_NO_THROW(dir.openFile("pre_existing", true));
 }
+
+TEST_F(DirectoryTest, collectionStorageOpensWithoutCreating) {
+  auto path = getTempDir();
+  FSDirFactory factory(path);
+  auto storage = factory.collection("main");
+  EXPECT_THROW(storage.open("first"), std::runtime_error);
+  EXPECT_THROW(storage.current(), std::runtime_error);
+  EXPECT_TRUE(factory.collections().empty());
+  storage.create("first");
+  EXPECT_EQ(std::vector<std::string>{"main"}, factory.collections());
+  EXPECT_EQ(std::vector<std::string>{"first"}, storage.incarnations());
+  EXPECT_FALSE(storage.current());
+  storage.select("first");
+  EXPECT_EQ("first", storage.current());
+  EXPECT_THROW(storage.createExclusive(), std::filesystem::filesystem_error);
+  std::filesystem::remove_all(path);
+}
+
+TEST_F(DirectoryTest, checkedStorageRemembersUnsyncedFilesAcrossOpens) {
+  CheckedDirFactory factory(std::make_unique<RAMDirFactory>(), CheckedDirMode::THROW);
+  auto storage = factory.collection("main");
+  auto first = storage.create("first"); // the owner keeps it open
+  addFile(*first, "data", "bytes");
+  EXPECT_THROW(storage.open("first")->openFile("data", true), std::runtime_error);
+  std::array<std::string, 1> names{"data"};
+  storage.open("first")->sync(names);
+  EXPECT_NE(nullptr, storage.open("first")->openFile("data", true));
+}

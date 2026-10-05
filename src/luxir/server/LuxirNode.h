@@ -253,8 +253,7 @@ private:
   void observeCollection(const std::string& name, Collection& collection);
   void deleteLocalCollection(std::string_view name);
   std::shared_ptr<Collection> makeCollection(const std::string& name, std::shared_ptr<Directory> directory);
-  std::shared_ptr<Collection> initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema = {},
-                                             std::shared_ptr<Directory> directory = {});
+  std::shared_ptr<Collection> initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema = {});
   // Returns the collection unchanged, or throws if it is unavailable.
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
   static void validateCollectionName(std::string_view name);

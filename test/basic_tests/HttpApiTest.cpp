@@ -950,7 +950,7 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
   }
 
   FSDirectory container(base / "c" / "bad");
-  auto incarnation = DirectoryFactory::current(container).incarnation;
+  auto incarnation = *CollectionStorage::current(container);
   for (const auto& file : std::filesystem::directory_iterator(base / "c" / "bad" / incarnation)) {
     if (!Manifest::generationOf(file.path().filename().string())) continue;
     std::ofstream out(file.path(), std::ios::binary | std::ios::trunc);

@@ -292,23 +292,22 @@ struct ReplicationFollower::Impl {
       binding.write(*metadata);
     }
     if (binding.follower.empty() || binding.follower.size() > 255) throw std::invalid_argument("invalid follower id");
-    for (const auto& name : node.dirFactory->listDirectories()) {
-      DirectoryFactory::Selection selection;
+    for (const auto& name : node.dirFactory->collections()) {
+      std::optional<std::string> selection;
       try {
         LuxirNode::validateCollectionName(name);
-        selection = DirectoryFactory::current(*node.dirFactory->create(name));
-        if (selection.incarnation.empty()) {
-          std::vector<Directory::FileInfo> files;
-          node.dirFactory->create(name)->listFiles(files);
-          if (!files.empty()) throw std::runtime_error("Collection has files without CURRENT");
-          for (const auto& incarnation : node.dirFactory->listDirectories(name)) validateIncarnation(incarnation);
+        auto storage = node.dirFactory->collection(name);
+        selection = storage.current();
+        if (!selection) {
+          if (storage.hasFiles()) throw std::runtime_error("Collection has files without CURRENT");
+          for (const auto& incarnation : storage.incarnations()) validateIncarnation(incarnation);
           continue; // retain completed candidate files for a restarted download
         }
-        validateIncarnation(selection.incarnation);
-        auto col = node.makeCollection(name, node.dirFactory->create(name + "/" + selection.incarnation));
+        validateIncarnation(*selection);
+        auto col = node.makeCollection(name, storage.open(*selection));
         auto& snapshots = col->getShard()->getSnapshots();
         snapshots.openLocalSnapshot();
-        if (snapshots.snapshot()->id.incarnation != selection.incarnation) throw std::runtime_error("local incarnation does not match CURRENT");
+        if (snapshots.snapshot()->id.incarnation != *selection) throw std::runtime_error("local incarnation does not match CURRENT");
         // Candidates can contain verified files from an interrupted transfer.
         // The next successful install sweeps them against its installed root.
         node.root->collections.getOrCreate(name, [&] { return col; });
@@ -324,7 +323,7 @@ struct ReplicationFollower::Impl {
         node.events->registered(name, node.root->collections.getOrCreate(name, [&] { return tombstone; }));
         auto& state = states[name];
         state.localUnavailable = true;
-        state.localIncarnation = selection.incarnation;
+        state.localIncarnation = selection.value_or("");
         state.error = tombstone->unavailableReason;
       }
       auto& state = states[name];
@@ -372,7 +371,7 @@ struct ReplicationFollower::Impl {
     std::shared_ptr<Collection> candidate;
     { std::lock_guard lock(mutex); candidate = std::move(states[name].candidate); }
     if (candidate && candidate != old) candidate->getShard()->getSnapshots().close();
-    node.dirFactory->remove(name);
+    node.dirFactory->collection(name).remove();
     std::lock_guard lock(mutex);
     auto& state = states[name];
     state.serving.clear(); state.acknowledged.clear();
@@ -554,12 +553,12 @@ struct ReplicationFollower::Impl {
     }
     if (obsoleteCandidate) {
       obsoleteCandidate->getShard()->getSnapshots().close();
-      if (!obsoleteIncarnation.empty()) node.dirFactory->remove(name + "/" + obsoleteIncarnation);
+      if (!obsoleteIncarnation.empty()) node.dirFactory->collection(name).removeIncarnation(obsoleteIncarnation);
     }
     if (!eligible) return;
     if (!candidate) {
-      node.dirFactory->create(name); // collection parent, selected only after a durable root
-      candidate = node.makeCollection(name, node.dirFactory->create(name + "/" + snapshot->id.incarnation));
+      // Selected only after a durable root.
+      candidate = node.makeCollection(name, node.dirFactory->collection(name).create(snapshot->id.incarnation));
     }
     auto& registry = candidate->getShard()->getSnapshots();
     auto& dir = registry.dir;
@@ -626,7 +625,7 @@ struct ReplicationFollower::Impl {
       std::array<std::string, 1> root{Manifest::name(snapshot->id.index_gen)};
       dir.sync(root); syncDir(dir); wroteRoot = true;
       Signal::emit("replicationRootWritten");
-      if (!previous) node.dirFactory->select(name, {snapshot->id.incarnation});
+      if (!previous) node.dirFactory->collection(name).select(snapshot->id.incarnation);
       registry.publish(snapshot, std::move(opened));
       auto old = node.root->collections.get(name);
       if (old != candidate) {
@@ -638,7 +637,7 @@ struct ReplicationFollower::Impl {
         if (auto shard = old ? old->getShard() : nullptr) {
           auto oldIncarnation = shard->getSnapshots().snapshot()->id.incarnation;
           shard->getSnapshots().detach();
-          try { node.dirFactory->remove(name + "/" + oldIncarnation); }
+          try { node.dirFactory->collection(name).removeIncarnation(oldIncarnation); }
           catch (const std::exception& e) { LOG_WARN("Retired incarnation cleanup failed: {}", e.what()); }
         }
       }
@@ -651,9 +650,7 @@ struct ReplicationFollower::Impl {
     try {
       if (previous) registry.retire(CommitSnapshotRegistry::obsoleteFiles(*previous, *snapshot));
       registry.sweepOrphans();
-      for (const auto& incarnation : node.dirFactory->listDirectories(name)) {
-        if (incarnation != snapshot->id.incarnation) node.dirFactory->remove(name + "/" + incarnation);
-      }
+      node.dirFactory->collection(name).retainOnly(snapshot->id.incarnation);
     } catch (const std::exception& e) { LOG_WARN("Follower retirement failed: {}", e.what()); }
     {
       std::lock_guard lock(mutex);

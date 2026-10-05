@@ -5,6 +5,7 @@
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
 #include "ReplicationState.h"
+#include "Promotion.h"
 #include "luxir/util/Uuid.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/InputStream.h"
@@ -209,12 +210,13 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
   auto collection = targetLibrary->collections.getOrCreate(collectionName, [&]() {
     createdHere = true;
     std::shared_ptr<Collection> created;
-    std::shared_ptr<Directory> directory;
+    bool stored = false;
     try {
       auto initialSchema = Schema::createDefaultSchema();
       if (schema) initialSchema = Schema::fromProto(*schema, initialSchema.get());
-      directory = dirFactory->create(collectionName, true);
-      created = initCollection(collectionName, std::move(initialSchema), directory);
+      dirFactory->collection(collectionName).createExclusive();
+      stored = true;
+      created = initCollection(collectionName, std::move(initialSchema));
       LOG_INFO("Created collection: {}", collectionName);
       return created;
     } catch (...) {
@@ -223,7 +225,7 @@ std::shared_ptr<Collection> LuxirNode::createCollection(
         if (created && created->shard && created->shard->iw) {
           created->shard->iw->close();
         }
-        if (directory) dirFactory->remove(collectionName);
+        if (stored) dirFactory->collection(collectionName).remove();
       } catch (const std::exception& e) {
         auto tombstone = std::make_shared<Collection>();
         tombstone->name = collectionName;
@@ -290,7 +292,7 @@ void LuxirNode::deleteLocalCollection(std::string_view name) {
       collection->shard->iw->close();
     }
     if (collection->shard) collection->shard->snapshots->close();
-    dirFactory->remove(collectionName);
+    dirFactory->collection(collectionName).remove();
   } catch (const std::exception& e) {
     auto failed = std::make_shared<Collection>();
     failed->name = collectionName;
@@ -312,47 +314,39 @@ void LuxirNode::deleteLocalCollection(std::string_view name) {
   events->removed(collectionName);
 }
 
-std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema,
-                                                       std::shared_ptr<Directory> directory) {
-  auto container = directory ? std::move(directory) : dirFactory->create(name);
-  auto selection = DirectoryFactory::current(*container);
-  bool creating = selection.incarnation.empty();
+std::shared_ptr<Collection> LuxirNode::initCollection(const std::string& name, std::shared_ptr<Schema> initialSchema) {
+  auto storage = dirFactory->collection(name);
+  auto selected = CollectionStorage::current(*dirFactory->container(name, !config.read_only));
+  bool creating = !selected;
   if (creating) {
-    std::vector<Directory::FileInfo> files;
-    container->listFiles(files);
-    if (!files.empty() || !dirFactory->listDirectories(name).empty()) throw std::runtime_error("Collection files exist without CURRENT");
+    if (storage.hasFiles() || !storage.incarnations().empty()) throw std::runtime_error("Collection files exist without CURRENT");
     if (config.read_only) throw ReadOnlyError("Collection has no CURRENT");
-    selection.incarnation = newUuid();
+    selected = newUuid();
   }
   if (!creating && !config.read_only) {
-    auto selected = dirFactory->create(name + "/" + selection.incarnation);
-    auto manifest = Manifest::load(*selected);
+    auto manifest = Manifest::load(*storage.open(*selected));
     if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
-      auto recovered = dirFactory->copySnapshot(name, selection, manifest);
+      auto recovered = copySnapshot(storage, *selected, manifest);
       LOG_ERROR("Recovered collection '{}' from snapshot {} below {}; using new incarnation {}",
-                name, manifest.generation, manifest.highestGeneration, recovered.incarnation);
-      dirFactory->select(name, recovered);
-      selection = std::move(recovered);
+                name, manifest.generation, manifest.highestGeneration, recovered);
+      storage.select(recovered);
+      selected = std::move(recovered);
     }
   }
-  auto col = makeCollection(name, dirFactory->create(name + "/" + selection.incarnation));
+  auto col = makeCollection(name, creating ? storage.create(*selected) : storage.open(*selected));
   if (!creating && !Manifest::load(*col->shard->dir).bytes) throw std::runtime_error("CURRENT selects an empty index directory");
   if (config.read_only) {
     col->shard->snapshots->openLocalSnapshot();
   } else {
     col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
       std::move(initialSchema), &indexRamBudget,
-      config.index.merge_factor, creating ? selection.incarnation : std::string{});
+      config.index.merge_factor, creating ? *selected : std::string{});
     col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
     col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
   }
-  if (col->shard->snapshots->snapshot()->id.incarnation != selection.incarnation) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
-  if (creating) dirFactory->select(name, selection);
-  if (!config.read_only) for (const auto& incarnation : dirFactory->listDirectories(name)) {
-    if (incarnation == selection.incarnation) continue;
-    try { dirFactory->remove(name + "/" + incarnation); }
-    catch (const std::exception& e) { LOG_WARN("Unselected incarnation cleanup '{}' failed: {}", name, e.what()); }
-  }
+  if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
+  if (creating) storage.select(*selected);
+  if (!config.read_only) storage.retainOnly(*selected);
   observeCollection(name, *col);
   Signal::emit("collectionInitialized", col.get());
   return col;
@@ -430,41 +424,8 @@ void LuxirNode::createSingletons() {
     if (auto binding = metadata.openFile("replication.json")) {
       if (!config.promote) throw std::runtime_error("Follower-bound data directory: use --promote to start a writer");
       auto state = ReplicationState::read(*binding);
-      for (const auto& name : dirFactory->listDirectories()) {
-        try {
-          auto selection = DirectoryFactory::current(*dirFactory->create(name));
-          if (selection.incarnation.empty()) continue;
-          auto& promoted = state.collections[name].promoted;
-          if (!promoted.empty()) {
-            bool valid = false;
-            try {
-              auto incarnations = dirFactory->listDirectories(name);
-              if (isUuid(promoted) && std::ranges::find(incarnations, promoted) != incarnations.end()) {
-                auto target = dirFactory->create(name + "/" + promoted);
-                std::pmr::monotonic_buffer_resource arena;
-                valid = Manifest::decode(Manifest::load(*target).bytes, arena).incarnation == promoted;
-              }
-            } catch (const std::exception& e) {
-              LOG_WARN("Cannot validate promotion target for '{}': {}", name, e.what());
-            }
-            if (!valid) promoted.clear();
-          }
-          if (promoted.empty()) {
-            Signal::emit("replicationPromotingCollection", (void*)&name);
-            auto old = dirFactory->create(name + "/" + selection.incarnation);
-            auto next = dirFactory->copySnapshot(name, selection, Manifest::load(*old));
-            promoted = next.incarnation;
-            state.write(metadata);
-          }
-          if (selection.incarnation != promoted) dirFactory->select(name, {promoted});
-        } catch (const std::exception& e) {
-          promotionErrors.emplace(name, "promotion failed: " + std::string(e.what()));
-        }
-      }
+      promotionErrors = promote(*dirFactory, metadata, state);
       if (promotionErrors.empty()) {
-        metadata.deleteFile("replication.json");
-        std::array<std::string, 1> directory{"."};
-        metadata.sync(directory);
         LOG_INFO("promoted from follower of {}", state.source);
       } else {
         LOG_WARN("Promotion from follower of {} incomplete; restart with --promote to retry failed collections", state.source);
@@ -475,7 +436,7 @@ void LuxirNode::createSingletons() {
   }
 
   // Discover existing collections from the store, or create default "main".
-  auto existing = dirFactory->listDirectories();
+  auto existing = dirFactory->collections();
   bool createDefault = existing.empty();
   if (createDefault) existing.emplace_back(kDefaultCollectionName);
 
@@ -483,13 +444,10 @@ void LuxirNode::createSingletons() {
     try {
       validateCollectionName(name);
       if (auto failed = promotionErrors.find(name); failed != promotionErrors.end()) throw std::runtime_error(failed->second);
-      if (!createDefault && DirectoryFactory::current(*dirFactory->create(name)).incarnation.empty()) {
-        auto container = dirFactory->create(name);
-        std::vector<Directory::FileInfo> files;
-        container->listFiles(files);
-        auto children = dirFactory->listDirectories(name);
-        if (!config.read_only && files.empty() && std::ranges::all_of(children, isUuid)) {
-          dirFactory->remove(name);
+      auto storage = dirFactory->collection(name);
+      if (!createDefault && !storage.current()) {
+        if (!config.read_only && !storage.hasFiles() && std::ranges::all_of(storage.incarnations(), isUuid)) {
+          storage.remove();
           LOG_INFO("Removed unselected collection: {}", name);
           continue;
         }

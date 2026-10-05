@@ -119,6 +119,16 @@ struct Manifest {
     }
   }
 
+  // A root is durable only after its file and directory entry are synced. A
+  // failure here leaves the root's durability unknown; callers delete it.
+  static void commit(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes) {
+    write(dir, gen, bytes);
+    std::array<std::string, 1> root{name(gen)};
+    dir.sync(root);
+    std::array<std::string, 1> directory{"."};
+    dir.sync(directory);
+  }
+
   static void write(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes) {
     Directory::FileCreateOptions options; options.expectedSize = bytes.size() + 16;
     auto file = dir.createFile(name(gen), options);

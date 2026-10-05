@@ -83,34 +83,35 @@ public:
 class ReadOnlyDirFactory : public DirectoryFactory {
   std::unique_ptr<DirectoryFactory> delegate_;
 
+  [[noreturn]] static void refuse(std::string_view what, std::string_view name) {
+    throw ReadOnlyError("read-only data directory: cannot " + std::string(what) + " '" + std::string(name) + "'");
+  }
+
 public:
   explicit ReadOnlyDirFactory(std::unique_ptr<DirectoryFactory> delegate)
       : delegate_(std::move(delegate)) {}
 
-  std::shared_ptr<Directory> create(std::string_view collectionName, bool exclusive = false) override {
-    if (exclusive) throw ReadOnlyError("cannot create a collection in read-only storage");
-    // Backends materialize storage for an unknown collection on create() (and
-    // are entitled to), so refuse before delegating rather than after.  For one
-    // that already exists, create() only opens what is there.
-    auto existing = delegate_->listDirectories();
-    if (std::find(existing.begin(), existing.end(), collectionName.substr(0, collectionName.find('/'))) == existing.end()) {
-      throw ReadOnlyError("read-only data directory: collection '" +
-                          std::string(collectionName) + "' does not exist and cannot be created");
-    }
-    return std::make_shared<ReadOnlyDirectory>(delegate_->create(collectionName),
-                                               std::string(collectionName));
-  }
-
   uint64_t storageBytes(std::string_view collection = {}) override { return delegate_->storageBytes(collection); }
+  std::vector<std::string> collections() override { return delegate_->collections(); }
 
-  std::vector<std::string> listDirectories(std::string_view parent = {}) override {
-    return delegate_->listDirectories(parent);
+  // Every namespace mutation is refused before it reaches the backend, and
+  // opening never creates.
+  std::shared_ptr<Directory> container(std::string_view name, bool create) override {
+    if (create) refuse("create collection", name);
+    return std::make_shared<ReadOnlyDirectory>(delegate_->container(name, false), std::string(name));
   }
-
-  void remove(std::string_view collectionName) override {
-    throw ReadOnlyError("read-only data directory: cannot remove collection '" +
-                        std::string(collectionName) + "'");
+  std::shared_ptr<Directory> incarnation(std::string_view name, std::string_view incarnation, bool create) override {
+    if (create) refuse("create collection", name);
+    return std::make_shared<ReadOnlyDirectory>(delegate_->incarnation(name, incarnation, false),
+                                               std::string(name) + "/" + std::string(incarnation));
   }
+  void createCollection(std::string_view name) override { refuse("create collection", name); }
+  std::vector<std::string> incarnations(std::string_view name) override { return delegate_->incarnations(name); }
+  void removeIncarnation(std::string_view name, std::string_view incarnation) override {
+    unused(incarnation);
+    refuse("remove an incarnation of", name);
+  }
+  void remove(std::string_view name) override { refuse("remove collection", name); }
 };
 
 } // namespace luxir

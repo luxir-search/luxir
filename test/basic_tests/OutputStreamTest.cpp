@@ -135,7 +135,7 @@ TEST_F(OutputStreamTest, appendFileContinuesWriting) {
 TEST_F(OutputStreamTest, sizedRamOutputTransfersItsAllocation) {
   for (size_t size : {0, 7, 2 * 1024 * 1024}) {
     RAMDirFactory factory(size);
-    auto dir = factory.create("main/first");
+    auto dir = factory.incarnation("main", "first", true);
     Directory::FileCreateOptions options; options.expectedSize = size;
     auto file = dir->createFile("data", options);
     EXPECT_EQ(size, factory.storageBytes("main"));
@@ -149,7 +149,7 @@ TEST_F(OutputStreamTest, sizedRamOutputTransfersItsAllocation) {
     if (size) { EXPECT_EQ(buffer, input->read().data()); }
     EXPECT_EQ(XXH3_64bits(bytes.data(), bytes.size()), file->digest());
     file.reset();
-    auto next = factory.create("main/next"); next->linkFile(*dir, "data");
+    auto next = factory.incarnation("main", "next", true); next->linkFile(*dir, "data");
     EXPECT_EQ(size, factory.storageBytes());
     dir->clear(); next->clear(); factory.remove("main");
     EXPECT_EQ(size, factory.storageBytes("main"));
@@ -176,7 +176,7 @@ TEST_F(OutputStreamTest, sizedRamOutputRejectsIncompleteAndOverlongWrites) {
 
 TEST_F(OutputStreamTest, ramStorageAccountsForChunkedOutputAndLimitsAllocations) {
   RAMDirFactory factory(1030);
-  auto dir = factory.create("main/first");
+  auto dir = factory.incarnation("main", "first", true);
   auto file = dir->createFile("chunked");
   OutputStream out(file.get()); out.write("abc", 3); out.close();
   EXPECT_EQ(1024, factory.storageBytes());

@@ -312,7 +312,7 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
     ASSERT_TRUE(helper.index(flatdoc("id", "corrupt"), UpdateMessage::COMMIT).success);
   }
   FSDirectory container(data.path() / "c" / "admin_corrupt");
-  auto incarnation = DirectoryFactory::current(container).incarnation;
+  auto incarnation = *CollectionStorage::current(container);
   auto indexPath = data.path() / "c" / "admin_corrupt" / incarnation;
   for (const auto& file : std::filesystem::directory_iterator(indexPath)) {
     if (Manifest::generationOf(file.path().filename().string())) std::filesystem::remove(file.path());
