@@ -183,10 +183,10 @@ the response correlates directly with a directory listing: each segment's
 are the sortable strings embedded in filenames (segment `s0a` with `live_gen`
 `01` has its deletes in `s0a__L01`). These strings sort in generation order,
 and an absent field means none. `schema_gen`, `index_gen`, `core_gen`, and
-`update_version` are numeric. The schema and its history are embedded in each `s.olux_<index_gen>` manifest.
+`update_version` are numeric. The schema and its history are embedded in each `commit_<index_gen>` manifest.
 
 Filesystem publication syncs new data files and then the directory before
-writing a new `s.olux_<index_gen>` manifest with a length and xxh3 checksum
+writing a new `commit_<index_gen>` manifest with a length and xxh3 checksum
 footer. It syncs that manifest and then the directory before acknowledging
 the commit. Startup checks the newest manifest's footer and decodes its payload;
 it does not hash data files. Torn candidates are skipped. Fallback candidates
@@ -208,7 +208,9 @@ newest durable manifest does not reference them. Failed publication candidates
 are removed and the directory is synced best-effort. An error response does not
 guarantee that the commit is absent: a crash or cleanup failure can leave a
 complete, unacknowledged candidate recoverable at startup. The local filename is not part
-of the commit identity: clients use the `incarnation:index_gen` token.
+of the commit identity: clients use the `incarnation:index_gen` token. That
+token's manifest is `<incarnation>/commit_<index_gen>`, with the generation in
+decimal; tools that list manifests in order sort by the parsed generation.
 
 Set log verbosity with:
 

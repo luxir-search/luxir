@@ -613,7 +613,7 @@ struct ReplicationFollower::Impl {
     std::set<std::string> unique;
     for (const auto& file : snapshot.files) {
       if (file.name.empty() || file.name == "." || file.name == ".." || file.name.find_first_of("/\\") != std::string::npos
-          || file.name.starts_with("s.olux") || file.name.ends_with(".tmp") || !unique.insert(file.name).second) throw std::runtime_error("invalid snapshot file name");
+          || file.name.starts_with(Manifest::kPrefix) || file.name.ends_with(".tmp") || !unique.insert(file.name).second) throw std::runtime_error("invalid snapshot file name");
       bool reuse = verified.contains(file.name) && verified.at(file.name) == file;
       if (!reuse) {
         // Unpublished verified files can survive a reconnect or failed install.

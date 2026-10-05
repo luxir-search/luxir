@@ -21,16 +21,18 @@ struct Manifest {
   uint64_t generation = 0;
   uint64_t highestGeneration = 0;
 
+  // commit_<index_gen>: the generation in decimal, as in commit tokens.
+  static constexpr std::string_view kPrefix = "commit_";
+
   static bool indexFile(std::string_view name) {
-    return name.starts_with("s.olux") || (name.starts_with("s") && name.find('_') != std::string_view::npos);
+    return name.starts_with(kPrefix) || (name.starts_with("s") && name.find('_') != std::string_view::npos);
   }
 
-  static std::string name(uint64_t gen) { return "s.olux_" + std::to_string(gen); }
+  static std::string name(uint64_t gen) { return std::string(kPrefix) + std::to_string(gen); }
 
   static uint64_t generationOf(std::string_view name) {
-    constexpr std::string_view prefix = "s.olux_";
-    if (!name.starts_with(prefix)) return 0;
-    name.remove_prefix(prefix.size());
+    if (!name.starts_with(kPrefix)) return 0;
+    name.remove_prefix(kPrefix.size());
     uint64_t gen = 0;
     auto [end, error] = std::from_chars(name.data(), name.data() + name.size(), gen);
     return error == std::errc() && end == name.data() + name.size() ? gen : 0;
@@ -85,7 +87,7 @@ struct Manifest {
       bool indexFiles = false;
       for (const auto& f : listing) {
         sizes.emplace(f.name, f.size);
-        if (f.name.starts_with("s.olux_")) result.names.push_back(f.name);
+        if (f.name.starts_with(kPrefix)) result.names.push_back(f.name);
         if (auto gen = generationOf(f.name)) generations.push_back(gen);
         if (indexFile(f.name)) indexFiles = true;
       }

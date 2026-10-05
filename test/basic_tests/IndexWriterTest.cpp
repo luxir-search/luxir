@@ -2851,7 +2851,7 @@ TEST_F(IndexWriterTest, newestManifestSelectionDoesNotReadData) {
 }
 
 TEST_F(IndexWriterTest, refusesIndexFilesWithoutManifest) {
-  for (auto name : {"s01_00", "s.olux", "s.olux_3.tmp"}) {
+  for (auto name : {"s01_00", "commit_x", "commit_3.tmp"}) {
     RAMDir dir;
     auto file = dir.createFile(name);
     OutputStream out(file.get());
