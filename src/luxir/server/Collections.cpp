@@ -127,11 +127,11 @@ bool Collections::reclaimStorage() {
   std::shared_ptr<Collection> oldest;
   auto time = CommitSnapshotRegistry::Clock::time_point::max();
   for (const auto& entry : entries()) if (auto shard = entry.collection->getShard()) {
-    auto created = shard->getSnapshots().oldestReclaimableReservation();
+    auto created = shard->getSnapshots().oldestReclaimablePin();
     if (created && *created < time) { time = *created; oldest = entry.collection; }
   }
   if (!oldest) return false;
-  oldest->getShard()->getSnapshots().reclaimOldestReservation();
+  oldest->getShard()->getSnapshots().reclaimOldestPin();
   return true; // A concurrent drop also warrants retrying the allocation.
 }
 

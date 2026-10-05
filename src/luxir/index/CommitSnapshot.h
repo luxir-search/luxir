@@ -18,7 +18,7 @@ struct CommitId {
   auto operator<=>(const CommitId&) const = default;
 };
 
-// Immutable publication shared by the reader manager and transfer reservations.
+// Immutable publication shared by the reader manager and transfer pins.
 // The bytes are the wire manifest, without the local disk footer.
 struct CommitSnapshot {
   using Bytes = std::shared_ptr<const std::vector<std::byte>>;

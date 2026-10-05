@@ -186,7 +186,7 @@ it does not hash data files. Torn candidates are skipped. Fallback candidates
 also require their referenced files to be present with matching sizes.
 
 Once the new root is durable, obsolete manifests and unreferenced data are removed.
-Replication reservation counters are described in the
+Replication pin counters are described in the
 [replication reference](replication.md#reference). Replication file transfers have
 a fixed 60 s idle deadline per socket write, reset as writes complete. Ordinary
 HTTP responses have no write deadline.

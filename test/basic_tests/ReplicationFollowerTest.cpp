@@ -267,7 +267,7 @@ TEST_F(ReplicationFollowerTest, ramRestartKeepsOldUntilRealCommitAndOrphanDelete
   ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));
 }
 
-TEST_F(ReplicationFollowerTest, ramFollowerAndReservationLossReuseVerifiedFiles) {
+TEST_F(ReplicationFollowerTest, ramFollowerAndPinLossReuseVerifiedFiles) {
   followerConfig.store.backend = "ram";
   startSource();
   CollectionHelper h(*source, "main");
@@ -275,7 +275,7 @@ TEST_F(ReplicationFollowerTest, ramFollowerAndReservationLossReuseVerifiedFiles)
   ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
   std::atomic<int> verified = 0;
   std::atomic<bool> expired = false;
-  Signal::listen("replicationReservationGone", [&](void*, void*, void*) -> void* { expired = true; return nullptr; });
+  Signal::listen("replicationPinGone", [&](void*, void*, void*) -> void* { expired = true; return nullptr; });
   Signal::listen("replicationFileVerified", [&](void*, void*, void*) -> void* {
     if (++verified == 1) {
       auto& snapshots = h.collection().getShard()->getSnapshots();
@@ -325,10 +325,10 @@ TEST_P(ReplicationMatrixTest, connectionFailureResumesRangeAndDroppedTransferRef
   EXPECT_GT(resumed.load(), 0);
   stopFollower();
   Signal::unlisten("replicationDownloadProgress");
-  // A fresh follower loses its reservation during the large file itself.
-  followerConfig.store.data_dir = (path / "lost-reservation").string();
+  // A fresh follower loses its pin during the large file itself.
+  followerConfig.store.data_dir = (path / "lost-pin").string();
   interrupted = 0;
-  Signal::listen("replicationReservationGone", [&](void*, void*, void*) -> void* { gone = true; return nullptr; });
+  Signal::listen("replicationPinGone", [&](void*, void*, void*) -> void* { gone = true; return nullptr; });
   Signal::listen("replicationDownloadProgress", [&](void* progress, void*, void*) -> void* {
     if (*(uint64_t*)progress >= 256 * 1024 && interrupted.fetch_add(1) == 0) {
       auto& snapshots = h.collection().getShard()->getSnapshots();
@@ -1207,7 +1207,7 @@ TEST_F(ReplicationFollowerTest, pullReportsCollectionFailureAndInstallsOtherColl
   EXPECT_EQ(0, retry.first) << retry.second;
 }
 
-TEST_F(ReplicationFollowerTest, pullRetriesLostReservationAndKeepsVerifiedFiles) {
+TEST_F(ReplicationFollowerTest, pullRetriesLostPinAndKeepsVerifiedFiles) {
   startSource();
   CollectionHelper h(*source, "main");
   for (auto id : {"a", "b"}) ASSERT_TRUE(h.index(flatdoc("id", id), UpdateMessage::COMMIT).success);

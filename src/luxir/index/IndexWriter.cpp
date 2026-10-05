@@ -2645,7 +2645,7 @@ void IndexWriter::testDeleteAllData() {
     // drop segments to delete
     segmentsToDelete.clear();
 
-    // Revoke reservations before reusing the directory namespace.
+    // Revoke snapshot pins before reusing the directory namespace.
     snapshots.testReset();
     pendingRetirement.clear();
     // drop all index files

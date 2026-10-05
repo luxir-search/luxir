@@ -147,11 +147,11 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     auto* shards = api::build::allocArray(collectionStats.shards, 1, resource);
     auto& shardStats = shards[0];
     shardStats.shard_id = 0;
-    auto reservations = shard->getSnapshots().stats();
-    shardStats.index.snapshot_pins = reservations.pins;
-    shardStats.index.pin_retained_bytes = reservations.retainedBytes;
-    shardStats.index.pin_idle_drops = reservations.idleDrops;
-    shardStats.index.pin_budget_drops = reservations.budgetDrops;
+    auto pins = shard->getSnapshots().stats();
+    shardStats.index.snapshot_pins = pins.pins;
+    shardStats.index.pin_retained_bytes = pins.retainedBytes;
+    shardStats.index.pin_idle_drops = pins.idleDrops;
+    shardStats.index.pin_budget_drops = pins.budgetDrops;
     auto fill = [&](const auto& stats) {
       fillIndexStats(shardStats.index, stats, resource);
       // Counts for this index alone.  "collections" is meaningless below the node

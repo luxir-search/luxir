@@ -692,7 +692,7 @@ private:
       std::vector<std::string>& outFiles);
   void deleteStagedOverlayFiles(std::span<const std::string> files,
                                 std::string_view context) noexcept;
-  // Release writer ownership; reservations can retain the retired files.
+  // Release writer ownership; snapshot pins can retain the retired files.
   void tryDeleteSegments();
   void moveSegmentToDelete(uint64_t segId);
   void applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData);

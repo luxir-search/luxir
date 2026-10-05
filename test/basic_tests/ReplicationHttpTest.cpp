@@ -195,7 +195,7 @@ TEST_F(ReplicationHttpTest, parkedWatchesDoNotBlockIoAndShutdownCancelsThem) {
   for (auto& watch : watches) EXPECT_EQ(std::future_status::ready, watch.wait_for(1s));
 }
 
-TEST_F(ReplicationHttpTest, snapshotFilesRangeAndSharedReservations) {
+TEST_F(ReplicationHttpTest, snapshotFilesRangeAndSharedPins) {
   ASSERT_TRUE(h->indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
   ASSERT_TRUE(h->deleteById("a", UpdateMessage::COMMIT).success);
   auto first = snapshot();
@@ -496,7 +496,7 @@ TEST_F(ReplicationHttpTest, headAndMonotonicAcknowledgment) {
 }
 
 
-TEST_F(ReplicationHttpTest, socketDeadlineAbortsStalledSharedReservation) {
+TEST_F(ReplicationHttpTest, socketDeadlineAbortsStalledSharedPin) {
   Signal::listen("httpWriteIdleTimeout", [](void* timeout, void*, void*) -> void* {
     *(std::chrono::milliseconds*)timeout = 100ms; return nullptr;
   });
@@ -506,7 +506,7 @@ TEST_F(ReplicationHttpTest, socketDeadlineAbortsStalledSharedReservation) {
   stalledTransfer([&](const auto&) {
     active = std::jthread([&](std::stop_token stop) {
       while (!stop.stop_requested()) {
-        get("/_replication/main/snapshot"); // Another client renews the same reservation.
+        get("/_replication/main/snapshot"); // Another client renews the same pin.
         std::this_thread::sleep_for(10ms);
       }
     });

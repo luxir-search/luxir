@@ -216,7 +216,7 @@ std::string errorMessage(const std::exception& error) {
   if (auto* system = dynamic_cast<const boost::system::system_error*>(&error)) return system->code().message();
   return error.what();
 }
-struct ReservationGone : std::runtime_error { ReservationGone() : std::runtime_error("source reservation expired") {} };
+struct PinGone : std::runtime_error { PinGone() : std::runtime_error("source snapshot pin expired") {} };
 }
 
 struct ReplicationFollower::Impl {
@@ -330,7 +330,7 @@ struct ReplicationFollower::Impl {
     http::response<http::string_body> response;
     try { client.send(method, path, body); response = client.response(timeout); }
     catch (...) { client.reset(); throw; }
-    if (response.result_int() == 410) throw ReservationGone();
+    if (response.result_int() == 410) throw PinGone();
     if (response.result_int() != 200) throw std::runtime_error("source HTTP " + std::to_string(response.result_int()) + ": " + response.body());
     { std::lock_guard lock(mutex); lastContact = wallTime(); }
     return response;
@@ -441,7 +441,7 @@ struct ReplicationFollower::Impl {
         parser.body_limit(UINT64_MAX);
         client.header(parser);
         int status = parser.get().result_int();
-        if (status == 410) throw ReservationGone();
+        if (status == 410) throw PinGone();
         if (status != (offset ? 206 : 200)) throw std::runtime_error("source file HTTP " + std::to_string(status));
         if (parser.chunked() || parser.content_length() != descriptor.size - offset || parser.get()["X-Luxir-Commit"] != snapshot.id.token()) {
           throw std::runtime_error("source file length or commit mismatch");
@@ -460,7 +460,7 @@ struct ReplicationFollower::Impl {
         });
         if (!parser.get().keep_alive()) client.reset();
         break;
-      } catch (const ReservationGone&) { client.reset(); throw; }
+      } catch (const PinGone&) { client.reset(); throw; }
       catch (...) { client.reset(); if (++failures >= 3 || stopping.stop_requested()) throw; }
     }
     out.close();
@@ -569,7 +569,7 @@ struct ReplicationFollower::Impl {
         state.verified.insert_or_assign(file.name, file);
       }
       // Files in the serving snapshot are already durable. Retried candidates
-      // may have been verified but not synced before their reservation vanished.
+      // may have been verified but not synced before their pin vanished.
       if (!durableNames.contains(file.name)) names.push_back(file.name);
     }
     dir.sync(names); syncDir(dir);
@@ -647,7 +647,7 @@ struct ReplicationFollower::Impl {
         if (!entry.available) throw std::runtime_error("source collection unavailable");
         for (unsigned attempt = 0;; attempt++) {
           try { sync(client, std::string(name)); break; }
-          catch (const ReservationGone&) { if (attempt == 2) throw; downloaded += state.downloaded; }
+          catch (const PinGone&) { if (attempt == 2) throw; downloaded += state.downloaded; }
         }
         persistState();
         if (state.serving != state.advertised) throw std::runtime_error("waiting for source data before replacing the local snapshot");
@@ -723,7 +723,7 @@ struct ReplicationFollower::Impl {
           acknowledge();
         }
         persistState();
-      } catch (const ReservationGone& e) { error = e.what(); Signal::emit("replicationReservationGone"); }
+      } catch (const PinGone& e) { error = e.what(); Signal::emit("replicationPinGone"); }
       catch (const std::exception& e) { error = errorMessage(e); }
       if (!error.empty()) client.reset();
       {

@@ -132,7 +132,7 @@ a new incarnation. Read-only nodes can open a follower directory directly.
 shows source, connection/last-contact information and per-collection source and
 serving commits, byte progress, `last_error` and `next_retry` (Unix milliseconds).
 It also lists live downstream followers, their serving commits and generation
-lag. Follower state lives here; `_stats` retains writer-side reservation counters
+lag. Follower state lives here; `_stats` retains writer-side pin counters
 and node/per-collection RAM storage usage.
 
 | State | Meaning and action |
@@ -155,7 +155,7 @@ follower ids disappear on restart. A RAM writer starts new incarnations;
 followers keep old populated data until the first data commit. RAM followers
 refetch on restart. `--store.ram-limit-mb` (default 0, unlimited) bounds storage
 buffers independently of indexing memory. Pressure first drops the oldest
-reservations retaining retired files, excluding current snapshots and open file
+pins retaining retired files, excluding current snapshots and open file
 transfers, then reports `storage_memory_limit` if space is still insufficient. Allow
 room for current data plus changed files; old readers can delay reclamation.
 Node/per-collection storage usage remains in `_stats`.
@@ -170,20 +170,20 @@ All replication settings use `--replication.` (configuration keys use underscore
 | `follower-id` | generated | Persisted FS follower identity |
 | `downloads` | 2 | Concurrent collection transfers |
 | `follower-timeout-ms` | 90000 | Live-follower window; watches are clamped to one third |
-| `pin-idle-timeout-ms` | 60000 | Reservation expires without byte progress |
-| `pin-retained-bytes` | 1 GiB | Per-collection retired bytes retained only by reservations |
+| `pin-idle-timeout-ms` | 60000 | Pin expires without byte progress |
+| `pin-retained-bytes` | 1 GiB | Per-collection retired bytes retained only by pins |
 
-Reservations are shared by commit and survive individual requests. The retained-byte
-budget counts unique retired files held only by reservations; current/merge-owned
-files do not count. Oldest reservations are revoked first when that budget is
+Pins are shared by commit and survive individual requests. The retained-byte
+budget counts unique retired files held only by pins; current/merge-owned
+files do not count. Oldest pins are revoked first when that budget is
 exceeded. Snapshot acquisition and byte progress renew them; idle expiry or
 revocation aborts their transfers. A server timer checks expiry; internal users
-also expire reservations on activity. `_stats` exposes `snapshot_pins`,
-`pin_retained_bytes`, `pin_idle_drops`, and `pin_budget_drops`. Reservations and
+also expire pins on activity. `_stats` exposes `snapshot_pins`,
+`pin_retained_bytes`, `pin_idle_drops`, and `pin_budget_drops`. Pins and
 acks are process-local. Replication file transfers have a fixed 60 s idle deadline
 per socket write, so one stalled client cannot hold a transfer indefinitely while
-another client renews their shared reservation. Followers back off after a lost
-reservation.
+another client renews their shared pin. Followers back off after a lost
+pin.
 
 Storage layout is `c/name/incarnation/`, with `CURRENT` containing
 only the selected incarnation. `replication.json` stores follower identity,
@@ -193,7 +193,7 @@ last source URL and discovery/recovery state; it does not bind the source URL.
 |---|---|
 | `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Full `{boot, cursor, collections}` catalog; echo the opaque cursor. Unknown cursors return immediately. Requested timeout is clamped to one third of the source follower timeout; followers request one third of their own. |
 | `GET /_replication/COLLECTION/snapshot` | Reserves current snapshot; binary manifest and `X-Luxir-Commit`. Add `?format=json` to inspect files/sizes/digests. HEAD has no side effects. |
-| `GET /_replication/COLLECTION/file/NAME?commit=TOKEN` | File from a reservation; optional single byte Range (206/416), HEAD supported. Malformed/multiple ranges return full 200. Missing membership: 404 `file_not_in_snapshot`; expired reservation: 410 `snapshot_expired`. |
+| `GET /_replication/COLLECTION/file/NAME?commit=TOKEN` | File from a pin; optional single byte Range (206/416), HEAD supported. Malformed/multiple ranges return full 200. Missing membership: 404 `file_not_in_snapshot`; expired pin: 410 `snapshot_expired`. |
 | `POST /_replication/installed` | JSON `{follower, collection, commit}` acknowledges a serving snapshot. |
 | `GET /_replication/status` | Status described above. |
 

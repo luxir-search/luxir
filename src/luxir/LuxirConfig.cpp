@@ -104,9 +104,9 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(server.stream_buffer_bytes);
 
   app.add_option("--replication.pin-idle-timeout-ms", replication.pin_idle_timeout_ms,
-                 "Replication reservation idle timeout in milliseconds")->default_val(replication.pin_idle_timeout_ms);
+                 "Snapshot pin idle timeout in milliseconds")->default_val(replication.pin_idle_timeout_ms);
   app.add_option("--replication.pin-retained-bytes", replication.pin_retained_bytes,
-                 "Per-collection bytes retained only by reservations")->transform(CLI::AsSizeValue(false))
+                 "Per-collection bytes retained only by snapshot pins")->transform(CLI::AsSizeValue(false))
       ->default_val(replication.pin_retained_bytes);
   app.add_option("--replication.follower-timeout-ms", replication.follower_timeout_ms,
                  "Follower liveness in milliseconds (watch timeout at most one third)")->default_val(replication.follower_timeout_ms);

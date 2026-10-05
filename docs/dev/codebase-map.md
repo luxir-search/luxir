@@ -79,10 +79,10 @@ locations, browse `src/luxir/<area>/`.
      - Manages `Inverter` instances, flushing, merging, and commits.
      - Atomically pins schema at update admission; stale inverters flush at
        checkout or release, keeping one schema per segment
-   - `CommitSnapshotRegistry`: Shard-owned current snapshot and commit-ID reservations,
+   - `CommitSnapshotRegistry`: Shard-owned current snapshot and commit-ID pins,
      lazy idle expiry, and retained-byte eviction. Publishes into its ReaderManager;
      accepts retirement from a writer or installer independently. Retirement preserves
-     both snapshot reservations and writer/merge ownership.
+     both snapshot pins and writer/merge ownership.
    - `Inverter`: Single-threaded document processing under one pinned schema.
      - `InputHandler`: One logical dispatcher per document key; stores source once
        when the primary enables it and sends the submitted value to every branch

@@ -1926,7 +1926,7 @@ private:
   void startReplicationWrite(const ReplicationTransfer& transfer) {
     if (!transfer.file) return;
     // Bound the lifetime of a stalled client's InputFile, even when another
-    // client keeps their shared reservation alive. Ordinary writes are untimed.
+    // client keeps their shared pin alive. Ordinary writes are untimed.
     std::chrono::milliseconds timeout{60'000};
     Signal::emit("httpWriteIdleTimeout", &timeout);
     stream_.expires_after(timeout);
