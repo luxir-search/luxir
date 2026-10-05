@@ -19,6 +19,7 @@
 #include <fstream>
 #include <latch>
 #include <future>
+#include <deque>
 
 namespace luxir::test {
 using namespace std::chrono_literals;
@@ -1536,16 +1537,17 @@ TEST_F(ReplicationFollowerTest, invalidCatalogIsRejectedBeforeApplyingAnyEntry) 
   source->deleteCollection("main");
   std::array<api::ReplicationCatalogEntry, 2> entries;
   std::string token = serving.token();
+  std::string digest(16, '0'); // well-formed; these catalogs fail for other reasons
   std::atomic<int> mode{0};
   auto join = scope_guard([&] { stopFollower(); });
   Signal::listen("replicationCatalogReceived", [&](void* value, void*, void*) -> void* {
     // Fault injection into a real HTTP catalog: no partial absence or entry can be applied.
-    entries = {{{.commit = token, .tenant = "alpha", .collection = "docs", .available = true},
-                {.commit = token, .tenant = "alpha", .collection = "docs", .available = true}}};
+    entries = {{{.manifest_xxh3 = digest, .commit = token, .tenant = "alpha", .collection = "docs", .available = true},
+                {.manifest_xxh3 = digest, .commit = token, .tenant = "alpha", .collection = "docs", .available = true}}};
     if (mode == 1) entries[1].tenant = "Bad";
-    if (mode == 2) entries[1] = {.commit = "malformed", .tenant = "beta", .collection = "docs", .available = true};
-    if (mode == 3) entries[1] = {.commit = "not-a-uuid:1", .tenant = "beta", .collection = "docs", .available = true};
-    if (mode == 4) entries[1] = {.commit = {}, .tenant = "beta", .collection = "docs", .available = true};
+    if (mode == 2) entries[1] = {.manifest_xxh3 = digest, .commit = "malformed", .tenant = "beta", .collection = "docs", .available = true};
+    if (mode == 3) entries[1] = {.manifest_xxh3 = digest, .commit = "not-a-uuid:1", .tenant = "beta", .collection = "docs", .available = true};
+    if (mode == 4) entries[1] = {.manifest_xxh3 = {}, .commit = {}, .tenant = "beta", .collection = "docs", .available = true};
     ((api::ReplicationCatalog*)value)->collections = entries;
     return nullptr;
   });
@@ -1565,7 +1567,21 @@ TEST_F(ReplicationFollowerTest, invalidCatalogIsRejectedBeforeApplyingAnyEntry) 
 
 TEST_F(ReplicationFollowerTest, followersFetchFilesFromPeersAndVerifyAnnouncements) {
   startSource(); startFollower();
-  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success); }
+  {
+    // A stored payload larger than one socket write exercises a whole peer transfer.
+    CollectionHelper h(*source, "main");
+    SchemaBuilder builder;
+    auto& field = builder.field("payload");
+    field.type = api::FieldDef::FieldClass::STRING;
+    field.index = api::FieldDef::IndexMode::NONE;
+    field.column = false;
+    field.stored = true;
+    h.collection().setSchema(builder.build(h.collection().getSchema().get()));
+    std::string payload(2 * 1024 * 1024, 'a');
+    uint32_t random = 1;
+    for (auto& c : payload) { random = random * 1664525 + 1013904223; c = (char)(' ' + (random >> 24) % 95); }
+    ASSERT_TRUE(h.indexAll({flatdoc("id", "a", "payload", payload), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  }
   ASSERT_TRUE(caughtUp());
   std::atomic<int> fromSource{0}, fromPeer{0};
   Signal::listen("replicationFileOpened", [&](void*, void*, void*) -> void* { fromSource++; return nullptr; });
@@ -1588,8 +1604,13 @@ TEST_F(ReplicationFollowerTest, followersFetchFilesFromPeersAndVerifyAnnouncemen
   EXPECT_EQ(0, fromSource.load());
 
   // A manifest that does not match its announcement is never installed.
-  Signal::listen("replicationCatalogReceived", [](void* catalog, void*, void*) -> void* {
-    for (auto& entry : ((api::ReplicationCatalog*)catalog)->collections) const_cast<api::ReplicationCatalogEntry&>(entry).manifest_xxh3 ^= 1;
+  std::deque<std::string> tampered;
+  Signal::listen("replicationCatalogReceived", [&](void* catalog, void*, void*) -> void* {
+    for (auto& entry : ((api::ReplicationCatalog*)catalog)->collections) {
+      if (entry.manifest_xxh3.empty()) continue;
+      tampered.push_back(CommitSnapshot::digestText(CommitSnapshot::parseDigest(entry.manifest_xxh3) ^ 1));
+      const_cast<api::ReplicationCatalogEntry&>(entry).manifest_xxh3 = tampered.back();
+    }
     return nullptr;
   });
   auto untamper = scope_guard([] { Signal::unlisten("replicationCatalogReceived"); });

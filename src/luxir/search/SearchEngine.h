@@ -31,7 +31,8 @@ public:
   const SearchConfig& searchConfig() const;
 
   // Prepare through the ordinary parser/planner, without running calculators.
-  std::vector<std::string> explain(const ReqProto& proto);
+  // As a search in `tenant` would resolve it.
+  std::vector<std::string> explain(const ReqProto& proto, std::string tenant);
 
   // Transport entry point: route the request by max_parallel, then submit().
   // 0 (the default) executes inline on the calling thread (no cross-thread

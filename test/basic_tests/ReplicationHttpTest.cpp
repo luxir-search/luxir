@@ -785,13 +785,12 @@ TEST_F(ReplicationHttpTest, acknowledgmentBudgetIsIndependentOfFollowerCount) {
 TEST_F(ReplicationHttpTest, filesAndAnnouncementsCarryIdentity) {
   ASSERT_TRUE(h->index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
   auto pinned = snapshot();
-  // A generic JSON number would round the 64-bit digest; match its text.
-  auto announced = get("/_replication/watch?timeout_ms=0").body();
-  EXPECT_NE(std::string::npos, announced.find("\"manifest_xxh3\":" + std::to_string(pinned->digest))) << announced;
+  auto announced = catalog();
+  EXPECT_EQ(CommitSnapshot::digestText(pinned->digest), announced["collections"][0]["manifest_xxh3"].get<std::string>());
   const auto& file = pinned->files.front();
   auto byIdentity = [&](uint64_t digest) {
     return "/tenants/default/collections/main/_snapshot/files/" + file.name + "?size=" + std::to_string(file.size)
-        + "&xxh3=" + std::format("{:016x}", digest);
+        + "&xxh3=" + CommitSnapshot::digestText(digest);
   };
   auto direct = get(byIdentity(file.xxh3));
   ASSERT_EQ(200, direct.result_int()) << direct.body();

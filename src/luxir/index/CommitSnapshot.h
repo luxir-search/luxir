@@ -32,6 +32,9 @@ struct CommitSnapshot {
 
   static std::shared_ptr<const CommitSnapshot> fromBytes(Bytes bytes);
   static uint64_t digestOf(const std::vector<std::byte>& bytes);
+  // A digest's text form on the wire: 16 lowercase hex digits.
+  static std::string digestText(uint64_t digest);
+  static uint64_t parseDigest(std::string_view text);
   static bool populatedOf(const api::IndexInfo& info);
 };
 

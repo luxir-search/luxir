@@ -298,10 +298,11 @@ public:
     checkLayout();
   }
 
-  // An empty collections directory, apart from its layout marker.
+  // An empty collections directory, apart from its layout marker and what an
+  // interrupted marker write leaves behind (LAYOUT.pending and its staging).
   static bool holdsNoCollections(const std::filesystem::path& collections) {
     for (const auto& entry : std::filesystem::directory_iterator(collections)) {
-      if (entry.path().filename() != kLayoutFile) return false;
+      if (!entry.is_regular_file() || !entry.path().filename().string().starts_with(kLayoutFile)) return false;
     }
     return true;
   }

@@ -3,6 +3,7 @@
 
 #include "CommitSnapshot.h"
 #include <charconv>
+#include <format>
 #include "luxir/api/index_files.h"
 #include "luxir/store/Manifest.h"
 
@@ -30,6 +31,18 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshot::fromBytes(Bytes bytes) {
       Schema::fromStored(*info.schema, info.schema_gen),
       CommitId{std::string(info.incarnation), info.index_gen}, info.commit_time, filesOf(info), populatedOf(info),
       digestOf(*bytes));
+}
+
+std::string CommitSnapshot::digestText(uint64_t digest) { return std::format("{:016x}", digest); }
+
+uint64_t CommitSnapshot::parseDigest(std::string_view text) {
+  uint64_t result = 0;
+  auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result, 16);
+  if (text.size() != 16 || error != std::errc() || end != text.data() + text.size()
+      || std::ranges::any_of(text, [](char c) { return c >= 'A' && c <= 'F'; })) {
+    throw std::invalid_argument("expected a 16-digit lowercase hexadecimal xxh3 digest");
+  }
+  return result;
 }
 
 uint64_t CommitSnapshot::digestOf(const std::vector<std::byte>& bytes) {

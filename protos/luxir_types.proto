@@ -1128,9 +1128,10 @@ message ReplicationCatalogEntry {
   bool available = 2;
   string tenant = 3;
   string collection = 4;
-  // xxh3-64 of the exact manifest bytes of `commit`: a manifest fetched from
-  // any source must hash to it.
-  fixed64 manifest_xxh3 = 5;
+  // xxh3-64 of the exact manifest bytes of `commit`, as 16 lowercase hex
+  // digits (exact in every JSON client): a manifest of `commit` from any
+  // source must hash to it.
+  string manifest_xxh3 = 5;
 }
 message ReplicationInstalled {
   string follower = 1;
@@ -1299,7 +1300,11 @@ message IndexRamStats {
 // tracking. reset_counters zeroes the cumulative stats.
 // An empty collection targets every collection.
 message CacheControlRequest {
-  string collection = 1; // empty selects every collection
+  // Empty selects every collection of `tenant`, or of every tenant when
+  // `tenant` is also empty (administration).
+  string collection = 1;
+  // Administration only. With a collection, empty is the caller's tenant.
+  string tenant = 7;
   bool flush = 2;
   bool reset_admission = 3;
   bool reset_counters = 4;
@@ -1333,6 +1338,7 @@ message ShardCacheControl {
 
 message CollectionCacheControl {
   string name = 1;
+  string tenant = 4;
   repeated ShardCacheControl shards = 2;
   Error error = 3;  // as CollectionStats.error
 }
@@ -1506,6 +1512,8 @@ message SchemaDef {
 
 message SchemaRequest {
   string collection = 1; // empty selects the default collection, "main"
+  // Administration only: the owning tenant. Empty is the caller's tenant.
+  string tenant = 4;
 
   enum Mode {
     // Each named definition is SET to exactly the request's definition

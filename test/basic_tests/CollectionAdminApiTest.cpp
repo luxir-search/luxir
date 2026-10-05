@@ -408,7 +408,7 @@ TEST_F(CollectionAdminApiTest, initialSchemaPublishesOneManifest) {
   EXPECT_EQ(1u, manifest->index_gen);
   EXPECT_EQ(1u, manifest->schema_gen);
   EXPECT_TRUE(manifest->segments.empty());
-  EXPECT_NE(nullptr, collection->getSchema()->getFieldTypePtr("title"));
+  EXPECT_NE(nullptr, collection->getSchema()->getFieldTypePtr("title_i"));
   EXPECT_NE(nullptr, collection->getSchema()->getFieldTypePtr("id"));
 }
 
@@ -480,6 +480,47 @@ TEST_F(CollectionAdminApiTest, tenantRoutesAdministerNamedTenants) {
   EXPECT_EQ(404, body(http::verb::post, "/collections/docs/_search", "{}").first);
   EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_delete", R"({"name":"docs"})").first);
   EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "acme" / "docs"));
+  server.shutdown();
+}
+
+TEST_F(CollectionAdminApiTest, requestScopeNeverOutlivesItsRequest) {
+  CollectionAdminDataDir data("luxir_collection_admin_scope");
+  LuxirNode node(fsConfig(data));
+  HttpServer server(node, 1, 0);
+  server.start();
+  ASSERT_EQ(200, httpRequest(server.getPort(), http::verb::post, "/tenants/acme/collections/_create", R"({"name":"docs"})").result_int());
+  // A tenant-qualified schema write changes that tenant's collection only.
+  auto schema = httpRequest(server.getPort(), http::verb::post, "/tenants/acme/collections/docs/_schema",
+      R"({"fields":{"title_i":{"type":"int"}}})");
+  ASSERT_EQ(200, schema.result_int()) << schema.body();
+  EXPECT_THROW(node.getCollection("docs"), CollectionNotFoundError);
+  EXPECT_NE(nullptr, node.getCollection(CollectionId{"acme", "docs"})->getSchema()->getFieldTypePtr("title_i"));
+
+  // On one keep-alive connection, an NDJSON update after a tenant route acts in
+  // the caller's own tenant.
+  net::io_context ioc;
+  beast::tcp_stream stream(ioc);
+  stream.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), (unsigned short)server.getPort()));
+  auto send = [&](http::verb verb, std::string target, std::string body, std::string_view type) {
+    http::request<http::string_body> req(verb, target, 11);
+    req.set(http::field::host, "127.0.0.1");
+    req.set(http::field::content_type, type);
+    req.keep_alive(true);
+    req.body() = std::move(body);
+    req.prepare_payload();
+    http::write(stream, req);
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+    return res;
+  };
+  EXPECT_EQ(200, send(http::verb::get, "/tenants/acme/collections", {}, "application/json").result_int());
+  auto update = send(http::verb::post, "/collections/docs/_update?commit=true", "{\"id\":\"x\"}\n", "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_EQ(1, node.getCollection("docs")->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(0, node.getCollection(CollectionId{"acme", "docs"})->getReaderManager().getReader()->liveDocs());
+  beast::error_code ec;
+  stream.socket().shutdown(tcp::socket::shutdown_both, ec);
   server.shutdown();
 }
 

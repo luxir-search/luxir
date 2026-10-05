@@ -30,7 +30,7 @@ RootOp* SearchEngine::prepare(SearchRequest& req) {
   return parser.parse();
 }
 
-std::vector<std::string> SearchEngine::explain(const ReqProto& proto) {
+std::vector<std::string> SearchEngine::explain(const ReqProto& proto, std::string tenant) {
   class ExplainRequest final : public SearchRequest {
   public:
     using SearchRequest::SearchRequest;
@@ -49,6 +49,7 @@ std::vector<std::string> SearchEngine::explain(const ReqProto& proto) {
   google::protobuf::Arena arena;
   auto* req = arenaCreate<ExplainRequest>(arena, *this, copy, arena);
   req->maxParallel = proto.max_parallel;
+  req->tenant = std::move(tenant);
   req->resolvedFields = &notes;
   prepare(*req);
   return notes;
@@ -164,7 +165,7 @@ void SearchEngine::getResources(SearchRequest& req) {
   // look up the correct index reader and the associated schema
   auto& request = req.proto;
   auto& node = req.engine.node;
-  auto collection = req.floorCollection ? req.floorCollection : node.resolveCollection(request.collection, req.tenant);
+  auto collection = req.floorCollection ? req.floorCollection : node.getCollection(LuxirNode::target(req.tenant, request.collection));
 
   // get the index reader
   // The API freshness tolerance is milliseconds; the reader clock domain is

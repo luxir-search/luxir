@@ -208,7 +208,7 @@ api::ReplicationCatalog ReplicationSource::catalog(std::pmr::memory_resource& ar
     entry.available = state.error.empty();
     if (state.commit) {
       entry.commit = api::build::arenaStr(arena, state.commit->token());
-      entry.manifest_xxh3 = state.digest;
+      entry.manifest_xxh3 = api::build::arenaStr(arena, CommitSnapshot::digestText(state.digest));
     }
   }
   return response;

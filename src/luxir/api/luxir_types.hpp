@@ -353,7 +353,7 @@ struct FollowerStatus {
   std::optional<uint64_t> lag;
 };
 struct ReplicationCatalogEntry {
-  uint64_t manifest_xxh3 = 0;
+  std::string_view manifest_xxh3;
   std::string_view commit;
   std::string_view tenant;
   std::string_view collection;
@@ -399,6 +399,7 @@ struct StatsResponse {
 };
 struct CacheControlRequest {
   std::string_view collection;
+  std::string_view tenant;
   uint32_t dump_limit = 0;
   bool flush = false;
   bool reset_admission = false;
@@ -424,6 +425,7 @@ struct ShardCacheControl {                                      // needs QueryCa
 };
 struct CollectionCacheControl {                                 // needs ShardCacheControl
   std::string_view name;
+  std::string_view tenant;
   std::span<const ShardCacheControl> shards;
   std::optional<Error> error;
 };
@@ -457,6 +459,7 @@ struct SchemaResponse {
 struct SchemaRequest {                                           // needs SchemaDef
   using Mode = luxir::api::SchemaRequest_::Mode;
   std::string_view collection;
+  std::string_view tenant;
   std::optional<SchemaDef> schema;
   Mode mode = Mode::SET;                                      // align 4 (enum)
 };

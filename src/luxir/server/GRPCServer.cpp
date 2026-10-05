@@ -582,19 +582,13 @@ public:
 };
 
 
-static std::shared_ptr<Collection> resolveCollection(GRPCServer& server,
-                                                     std::string_view collection) {
-  return server.getLuxirNode().resolveCollection(collection);
-}
+// Data-plane calls act in the caller's tenant: the default tenant until calls
+// carry credentials. Administration requests may name a tenant.
+static constexpr std::string_view kCallerTenant = {};
 
 template <typename Request>
 static std::shared_ptr<Collection> resolveUpdateCollection(GRPCServer& server, const Request& request) {
-  return server.getLuxirNode().resolveOrCreateCollection(request.collection);
-}
-
-static std::shared_ptr<Collection> resolveSetSchemaCollection(GRPCServer& server,
-                                                              std::string_view collection) {
-  return server.getLuxirNode().resolveOrCreateCollection(collection);
+  return server.getLuxirNode().getOrCreateCollection(LuxirNode::target(kCallerTenant, request.collection));
 }
 
 static void finishWithError(GenericCallData& call, const ErrorInfo& info) {
@@ -827,7 +821,8 @@ static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     SchemaRespProto response;
     std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
 
-    auto collection = resolveSetSchemaCollection(call.server, request.proto.collection);
+    auto collection = call.server.getLuxirNode().getOrCreateCollection(
+        LuxirNode::target(request.proto.tenant, request.proto.collection));
     auto newSchema = collection->updateSchema(*request.proto.schema, request.proto.mode);
     newSchema->schema->toProto(&response.schema.emplace(), respArena);
     response.commit = api::build::arenaStr(respArena, newSchema->id.token());
@@ -850,7 +845,8 @@ static void handleGetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     SchemaRespProto response;
     std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
 
-    auto collection = resolveCollection(call.server, request.proto.collection);
+    auto collection = call.server.getLuxirNode().getCollection(
+        LuxirNode::target(request.proto.tenant, request.proto.collection));
     auto schema = collection->getSchema();
     schema->toProto(&response.schema.emplace(), respArena);
 

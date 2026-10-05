@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <fstream>
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -143,4 +144,13 @@ TEST(DirLockTest, refusesDataFromAnotherLayout) {
   std::filesystem::create_directories(tempDir.path() / "c" / "main");
   EXPECT_THROW(FSDirFactory writer(tempDir.path()), std::runtime_error);
   EXPECT_THROW(FSDirFactory reader(tempDir.path(), /*unowned=*/true), std::runtime_error);
+}
+
+TEST(DirLockTest, resumesAnInterruptedLayoutMarker) {
+  TempDir tempDir;
+  std::filesystem::create_directories(tempDir.path() / "c");
+  std::ofstream(tempDir.path() / "c" / "LAYOUT.pending") << "partial";
+  { FSDirFactory writer(tempDir.path()); }
+  EXPECT_TRUE(std::filesystem::exists(tempDir.path() / "c" / "LAYOUT"));
+  EXPECT_NO_THROW({ FSDirFactory writer(tempDir.path()); });
 }

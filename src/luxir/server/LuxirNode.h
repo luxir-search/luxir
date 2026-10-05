@@ -66,15 +66,12 @@ public:
   }
 
   // Resolution: an unavailable collection throws CollectionUnavailableError.
-  // Overloads taking only a name address the default tenant.
+  // Requests resolve a complete identity built at ingress with target(); the
+  // name-only overloads address the default tenant for embedding and tests.
   std::shared_ptr<Collection> getCollection(const CollectionId& id);
   std::shared_ptr<Collection> getCollection(std::string_view name) { return getCollection(CollectionId::of(name)); }
   std::shared_ptr<Collection> getOrCreateCollection(const CollectionId& id);
   std::shared_ptr<Collection> getOrCreateCollection(std::string_view name) { return getOrCreateCollection(CollectionId::of(name)); }
-  std::shared_ptr<Collection> resolveCollection(std::string_view name, std::string_view tenant = {}) { return getCollection(target(tenant, name)); }
-  std::shared_ptr<Collection> resolveOrCreateCollection(std::string_view name, std::string_view tenant = {}) {
-    return getOrCreateCollection(target(tenant, name));
-  }
 
   // Snapshot fully-created collections without waiting for creations in
   // flight. Unavailable placeholders retain their recorded error.

@@ -384,27 +384,33 @@ struct ReplicationFollower::Impl {
       Collections::validate(id);
       if (!seen.insert(std::move(id)).second) throw std::runtime_error("duplicate collection in source catalog");
       if (entry.available && entry.commit.empty()) throw std::runtime_error("available source collection has no commit");
-      if (!entry.commit.empty()) validateIncarnation(CommitId::parse(entry.commit).incarnation);
+      if (auto announced = announcement(entry)) validateIncarnation(announced->commit.incarnation);
     }
     return catalog;
   }
 
-  static std::optional<CommitId> advertisedCommit(const api::ReplicationCatalogEntry& entry) {
+  // A commit as the source announced it: its token and its manifest digest.
+  struct Announcement {
+    CommitId commit;
+    uint64_t digest;
+  };
+  static std::optional<Announcement> announcement(const api::ReplicationCatalogEntry& entry) {
     if (entry.commit.empty()) return std::nullopt;
-    return CommitId::parse(entry.commit);
+    return Announcement{CommitId::parse(entry.commit), CommitSnapshot::parseDigest(entry.manifest_xxh3)};
   }
 
   // Applies one collection's entry from a source catalog (absent: not in it).
   // A new incarnation may replace a populated copy with an empty snapshot only
   // if this follower saw the previous incarnation in the same source boot.
-  void observe(State& state, std::optional<CommitId> desired, uint64_t digest, bool present, const std::string& sourceBoot) {
-    state.advertisedDigest = digest;
+  void observe(State& state, std::optional<Announcement> announced, bool present, const std::string& sourceBoot) {
+    auto desired = announced ? std::optional(announced->commit) : std::nullopt;
     if (desired && (!state.advertised || desired->incarnation != state.advertised->incarnation))
       state.replaceEmpty = state.seenBoot == sourceBoot;
     if (desired != state.advertised) {
       if (!state.advertised || state.advertised == state.serving || state.waiting) state.readySince = Clock::now();
       state.advertised = std::move(desired); state.waiting = false;
     }
+    state.advertisedDigest = announced ? announced->digest : 0;
     if (present) { state.seenBoot = sourceBoot; state.remove = false; }
     else state.remove = state.seenBoot == sourceBoot;
   }
@@ -436,7 +442,7 @@ struct ReplicationFollower::Impl {
             auto* found = it == entries.end() ? nullptr : it->second;
             bool present = found != nullptr;
             state.unavailable = present && !found->available;
-            observe(state, present ? advertisedCommit(*found) : std::nullopt, present ? found->manifest_xxh3 : 0, present, boot);
+            observe(state, present ? announcement(*found) : std::nullopt, present, boot);
             if (!state.busy && state.serving && state.advertised == state.serving && state.acknowledged == state.serving) {
               state.error.clear(); state.failures = 0; state.retry = {};
             }
@@ -480,7 +486,7 @@ struct ReplicationFollower::Impl {
       Client& client = peer ? *clients.peers[next] : clients.source;
       try {
         auto path = snapshotPath(collection) + "/files/" + escape(descriptor.name) + "?" + (peer
-            ? "size=" + std::to_string(descriptor.size) + "&xxh3=" + std::format("{:016x}", descriptor.xxh3)
+            ? "size=" + std::to_string(descriptor.size) + "&xxh3=" + CommitSnapshot::digestText(descriptor.xxh3)
             : "commit=" + escape(snapshot.id.token()) + "&" + followerQuery());
         client.send(http::verb::get, path, {}, offset);
         http::response_parser<http::buffer_body> parser;
@@ -560,7 +566,7 @@ struct ReplicationFollower::Impl {
     if (state.advertised->incarnation != snapshot.id.incarnation)
       throw std::runtime_error("source incarnation changed; retry snapshot");
     // A manifest of the announced commit must be the announced bytes.
-    if (snapshot.id == state.advertised && state.advertisedDigest && snapshot.digest != state.advertisedDigest)
+    if (snapshot.id == state.advertised && snapshot.digest != state.advertisedDigest)
       throw std::runtime_error("manifest does not match its announcement");
     for (const auto& file : snapshot.files) state.total += file.size;
     decision.active = node.collections().get(name);
@@ -718,7 +724,7 @@ struct ReplicationFollower::Impl {
       CollectionId name{std::string(entry.tenant), std::string(entry.collection)};
       if (!includes(name)) continue;
       auto& state = states[name];
-      observe(state, advertisedCommit(entry), entry.manifest_xxh3, true, std::string(catalog.boot));
+      observe(state, announcement(entry), true, std::string(catalog.boot));
       state.downloaded = state.reused = 0;
       uint64_t downloaded = 0;
       try {

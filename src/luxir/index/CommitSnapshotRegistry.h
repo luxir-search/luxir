@@ -3,6 +3,7 @@
 #pragma once
 
 #include <chrono>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <functional>
 #include <map>
@@ -38,7 +39,8 @@ public:
 private:
   struct Pin {
     std::shared_ptr<const CommitSnapshot> snapshot;
-    boost::unordered_flat_set<std::string_view> fileNames;
+    // Views borrow the owning snapshot's descriptors.
+    boost::unordered_flat_map<std::string_view, const FileDescriptor*> files;
     Clock::time_point created;
     Clock::time_point lastRead;
     std::stop_source cancellation;
@@ -58,6 +60,10 @@ private:
   Now now;
   bool closed = false;
   std::map<CommitId, Pin> pins;
+  // The current snapshot's descriptors by name, rebuilt once per publication
+  // on the first lookup by identity.
+  std::shared_ptr<const CommitSnapshot> indexed;
+  boost::unordered_flat_map<std::string_view, const FileDescriptor*> indexedFiles;
   std::unordered_map<std::string, FileRef> files;
 public:
   Directory& dir;

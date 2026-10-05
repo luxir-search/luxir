@@ -120,7 +120,7 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
   response.storage_ram.limit_bytes = node.getConfig().store.backend == "ram" ? node.getConfig().store.ram_limit_mb * 1024 * 1024 : 0;
   std::vector<LuxirNode::CollectionEntry> entries;
   if (!request.collection.empty()) {
-    auto collection = node.resolveCollection(request.collection, request.tenant);
+    auto collection = node.getCollection(LuxirNode::target(request.tenant, request.collection));
     entries.push_back({collection->getId(), std::move(collection), {}});
   } else {
     entries = node.collectionEntries();
@@ -187,10 +187,11 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
                         std::pmr::memory_resource& resource) {
   std::vector<LuxirNode::CollectionEntry> entries;
   if (!request.collection.empty()) {
-    auto collection = node.resolveCollection(request.collection);
+    auto collection = node.getCollection(LuxirNode::target(request.tenant, request.collection));
     entries.push_back({collection->getId(), std::move(collection), {}});
   } else {
     entries = node.collectionEntries();
+    if (!request.tenant.empty()) std::erase_if(entries, [&](const auto& entry) { return entry.id.tenant != request.tenant; });
   }
 
   size_t dumpLimit = request.dump_limit != 0 ? request.dump_limit : 100;
@@ -199,7 +200,8 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
   for (std::size_t i = 0; i < entries.size(); i++) {
     const auto& entry = entries[i];
     auto& collectionControl = collections[i];
-    collectionControl.name = api::build::arenaStr(resource, entry.id.label());
+    collectionControl.name = api::build::arenaStr(resource, entry.id.name);
+    collectionControl.tenant = api::build::arenaStr(resource, entry.id.tenant);
     if (!entry.error.empty()) {
       collectionControl.error = api::build::arenaError(
           resource, {ErrorKind::UNAVAILABLE, "collection_unavailable", entry.error});

@@ -115,9 +115,9 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::acquire(std::stop_
   try {
     // Transfer lookup belongs to the pin, so local publications pay
     // nothing for it. Views borrow immutable names from its owning snapshot.
-    pin.fileNames.reserve(commit->files.size());
+    pin.files.reserve(commit->files.size());
     for (const auto& file : commit->files) {
-      pin.fileNames.insert(file.name);
+      pin.files.emplace(file.name, &file);
       auto [it, inserted] = files.try_emplace(file.name, FileRef{file.size});
       it->second.pins++;
       added++;
@@ -149,7 +149,7 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, 
     expireLocked(retired);
     auto it = pins.find(id);
     if (closed || it == pins.end()) throw SnapshotExpiredError();
-    if (!it->second.fileNames.contains(name)) {
+    if (!it->second.files.contains(name)) {
       throw ApiError(ErrorKind::NOT_FOUND, "file_not_in_snapshot", "file is not in the pinned snapshot");
     }
     if (cancellation) *cancellation = it->second.cancellation.get_token();
@@ -167,12 +167,17 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const FileDescriptor
   std::lock_guard retirementLock(retirementMutex);
   {
     std::lock_guard lock(mutex);
-    auto references = [&](const CommitSnapshot& snapshot) {
-      return std::ranges::any_of(snapshot.files, [&](const auto& file) { return file == descriptor; });
-    };
     auto published = snapshot();
-    bool held = !closed && ((published && references(*published))
-        || std::ranges::any_of(pins, [&](const auto& pin) { return references(*pin.second.snapshot); }));
+    if (published != indexed) {
+      indexedFiles.clear();
+      if (published) for (const auto& file : published->files) indexedFiles.emplace(file.name, &file);
+      indexed = published;
+    }
+    auto holds = [&](const auto& files) {
+      auto it = files.find(descriptor.name);
+      return it != files.end() && *it->second == descriptor;
+    };
+    bool held = !closed && (holds(indexedFiles) || std::ranges::any_of(pins, [&](const auto& pin) { return holds(pin.second.files); }));
     if (!held) throw ApiError(ErrorKind::NOT_FOUND, "file_not_held", "no current or pinned snapshot holds this file");
   }
   auto file = dir.openFile(descriptor.name, true);

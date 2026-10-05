@@ -27,7 +27,8 @@ on the next peer or the source. Every file is verified against the manifest
 digest, and a copy that fails verification is fetched again from the source.
 Peers never decide which commit is current or that a collection is gone: the
 source's catalog does, and it announces each commit with the xxh3 digest of
-its manifest, which the follower checks.
+its manifest (16 lowercase hex digits, like the `xxh3` file parameter), which
+the follower checks.
 Start it with an empty directory or an existing follower directory. Repointing
 `--replicate-from` to another source reuses files whose name, size and xxh3 digest
 match, including across incarnations. An existing data directory must be a

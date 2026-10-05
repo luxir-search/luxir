@@ -566,6 +566,9 @@ private:
     std::chrono::steady_clock::time_point nextTouch{};
     bool head = false;
     bool json = false;
+    // The transfer holds the pin of `id` and renews it as bytes flow; a file
+    // served by identity holds only its open file. Both keep write deadlines.
+    bool pinned = false;
     CommitId id;
     std::string_view data;
     size_t offset = 0;
@@ -734,6 +737,9 @@ private:
     if (const std::string* id = findParam(params, "request_id")) requestId_ = *id;
 
     route_ = matchRoute(target);
+    // The request's scope is settled with its route, before the buffered and
+    // streaming paths split; nothing carries over from an earlier request.
+    tenant_ = route_.tenantRoute ? route_.tenant : std::string(CollectionId::kDefaultTenant);
     pretty_ = route_.prettyDefault;
     if (const std::string* pretty = findParam(params, "pretty")) {
       if (pretty->empty() || *pretty == "true") pretty_ = true;
@@ -1307,8 +1313,7 @@ private:
     if (match.tenantRoute) {
       try { Collections::validateName(match.tenant, "tenant"); }
       catch (const std::exception& e) { respondError(classifyException(e, ErrorKind::INVALID_REQUEST)); return; }
-      tenant_ = match.tenant;
-    } else tenant_ = CollectionId::kDefaultTenant;
+    }
 
     const std::string& coll = match.coll;
     switch (match.route) {
@@ -1490,7 +1495,7 @@ private:
         throw ApiError(ErrorKind::INTERNAL, "internal", "failed to serialize request");
       }
       if (mode == "resolved") {
-        auto notes = node_.getSearchEngine().explain(state.proto);
+        auto notes = node_.getSearchEngine().explain(state.proto, tenant_);
         api::Val value;
         std::vector<std::string_view> views(notes.begin(), notes.end());
         value.kind.emplace<api::ArrStr>().v = views;
@@ -1660,7 +1665,7 @@ private:
       auto* msg = admission.get();
       node_.getTaskArena().enqueue([self = shared_from_this(), msg, tenant = tenant_, shardPin] {
         try {
-          auto collection = self->node_.resolveOrCreateCollection(msg->req->collection, tenant);
+          auto collection = self->node_.getOrCreateCollection(LuxirNode::target(tenant, msg->req->collection));
           msg->target = collection->getId();
           auto iw = collection->getShard()->requireIndexWriter();
           if (!iw->submitUpdate(msg)) throw std::runtime_error("update was not admitted");
@@ -1834,7 +1839,7 @@ private:
         std::string out;
         std::optional<ErrorInfo> failure;
         try {
-          auto collection = self->node_.resolveCollection(coll, tenant);
+          auto collection = self->node_.getCollection(LuxirNode::target(tenant, coll));
           out = collection->getReaderManager().resolvedSchema();
         } catch (const std::exception& e) {
           failure = classifyException(e, ErrorKind::INTERNAL);
@@ -1852,7 +1857,7 @@ private:
     std::string out;
     std::optional<ErrorInfo> failure;
     try {
-      auto collection = node_.resolveCollection(coll, tenant_);
+      auto collection = node_.getCollection(LuxirNode::target(tenant_, coll));
       auto schema = collection->getSchema();
       out = renderSchemaBody(*schema);
     } catch (const std::exception& e) {
@@ -1869,16 +1874,6 @@ private:
       auto count = replicationNumber(text);
       if (count > UINT32_MAX) throw RequestError("wait_for_replicas count exceeds uint32");
       result.kind = (uint32_t)count;
-    }
-    return result;
-  }
-
-  // A 16-digit hexadecimal xxh3-64 digest.
-  static uint64_t parseDigest(std::string_view text) {
-    uint64_t result = 0;
-    auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result, 16);
-    if (text.size() != 16 || error != std::errc() || end != text.data() + text.size()) {
-      throw std::invalid_argument("expected a 16-digit hexadecimal xxh3 digest");
     }
     return result;
   }
@@ -2061,7 +2056,7 @@ private:
           if (ec) { self->abortReplicationTransfer(self->replicationTransferEpoch_); self->doClose(); return; }
           transfer->offset += bytes;
           auto time = std::chrono::steady_clock::now();
-          if (transfer->file && bytes && time >= transfer->nextTouch) {
+          if (transfer->pinned && transfer->file && bytes && time >= transfer->nextTouch) {
             if (!transfer->collection->getShard()->getSnapshots().touch(transfer->id, bytes)) {
               self->abortReplicationTransfer(self->replicationTransferEpoch_);
               return;
@@ -2117,7 +2112,7 @@ private:
         auto token = findParam(urlParams_, "commit");
         auto size = findParam(urlParams_, "size");
         auto digest = findParam(urlParams_, "xxh3");
-        if (!token && size && digest) identity = FileDescriptor{name, replicationNumber(*size), parseDigest(*digest)};
+        if (!token && size && digest) identity = FileDescriptor{name, replicationNumber(*size), CommitSnapshot::parseDigest(*digest)};
         else id = CommitId::parse(token ? *token : "");
       } else if (auto format = findParam(urlParams_, "format")) {
         if (*format != "json") throw std::invalid_argument("snapshot format must be json");
@@ -2132,7 +2127,7 @@ private:
       std::optional<ErrorInfo> failure;
       http::status status = http::status::ok;
       try {
-        transfer->collection = self->node_.getCollection(CollectionId(tenant, coll));
+        transfer->collection = self->node_.getCollection(LuxirNode::target(tenant, coll));
         auto& snapshots = transfer->collection->getShard()->getSnapshots();
         if (name.empty()) {
           auto snapshot = head ? snapshots.snapshot() : snapshots.acquire(&transfer->cancellation);
@@ -2150,6 +2145,7 @@ private:
           Signal::emit("replicationFileOpenedByIdentity", &transfer->file);
         } else {
           transfer->id = id;
+          transfer->pinned = true;
           transfer->file = snapshots.openFile(id, name, &transfer->cancellation);
           transfer->data = transfer->file->read();
           Signal::emit("replicationFileOpened", &transfer->file);
@@ -2254,11 +2250,11 @@ private:
     // updateSchema persists (fsync) under the publication mutex, so run
     // it off the io thread like handleUpdate.
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin, mode, coll] {
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin, mode, target = LuxirNode::target(tenant_, coll)] {
       std::string out;
       std::optional<ErrorInfo> failure;
       try {
-        auto collection = self->node_.resolveOrCreateCollection(coll);
+        auto collection = self->node_.getOrCreateCollection(target);
         auto newSchema = collection->updateSchema(state->def, mode);
         std::pmr::monotonic_buffer_resource arena;
         api::SchemaResponse response;
@@ -2790,7 +2786,7 @@ private:
     if (!inserted) return &it->second;
 
     try {
-      it->second.collection = node_.resolveOrCreateCollection(collectionName, state->tenant);
+      it->second.collection = node_.getOrCreateCollection(LuxirNode::target(state->tenant, collectionName));
       it->second.indexWriter = it->second.collection->getShard()->requireIndexWriter();
     } catch (...) {
       err = currentExceptionInfo(ErrorKind::INTERNAL);

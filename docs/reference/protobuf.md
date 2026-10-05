@@ -376,7 +376,8 @@ Admin control over the per-collection query cache. Actions compose and apply in 
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.cachecontrolrequest.collection"></a>[`collection`](#field-luxir.cachecontrolrequest.collection) | 1 | `string` | singular | empty selects every collection |
+| <a id="field-luxir.cachecontrolrequest.collection"></a>[`collection`](#field-luxir.cachecontrolrequest.collection) | 1 | `string` | singular | Empty selects every collection of \`tenant\`, or of every tenant when \`tenant\` is also empty (administration). |
+| <a id="field-luxir.cachecontrolrequest.tenant"></a>[`tenant`](#field-luxir.cachecontrolrequest.tenant) | 7 | `string` | singular | Administration only. With a collection, empty is the caller's tenant. |
 | <a id="field-luxir.cachecontrolrequest.flush"></a>[`flush`](#field-luxir.cachecontrolrequest.flush) | 2 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.reset_admission"></a>[`reset_admission`](#field-luxir.cachecontrolrequest.reset_admission) | 3 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.reset_counters"></a>[`reset_counters`](#field-luxir.cachecontrolrequest.reset_counters) | 4 | `bool` | singular |  |
@@ -489,6 +490,7 @@ Single-valued vector column. Each Vector slot is independently nullable via its 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.collectioncachecontrol.name"></a>[`name`](#field-luxir.collectioncachecontrol.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.collectioncachecontrol.tenant"></a>[`tenant`](#field-luxir.collectioncachecontrol.tenant) | 4 | `string` | singular |  |
 | <a id="field-luxir.collectioncachecontrol.shards"></a>[`shards`](#field-luxir.collectioncachecontrol.shards) | 2 | [`ShardCacheControl`](#message-luxir.shardcachecontrol) | repeated |  |
 | <a id="field-luxir.collectioncachecontrol.error"></a>[`error`](#field-luxir.collectioncachecontrol.error) | 3 | [`Error`](#message-luxir.error) | singular | as CollectionStats.error |
 
@@ -1289,7 +1291,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.replicationcatalogentry.available"></a>[`available`](#field-luxir.replicationcatalogentry.available) | 2 | `bool` | singular |  |
 | <a id="field-luxir.replicationcatalogentry.tenant"></a>[`tenant`](#field-luxir.replicationcatalogentry.tenant) | 3 | `string` | singular |  |
 | <a id="field-luxir.replicationcatalogentry.collection"></a>[`collection`](#field-luxir.replicationcatalogentry.collection) | 4 | `string` | singular |  |
-| <a id="field-luxir.replicationcatalogentry.manifest_xxh3"></a>[`manifest_xxh3`](#field-luxir.replicationcatalogentry.manifest_xxh3) | 5 | `fixed64` | singular | xxh3-64 of the exact manifest bytes of \`commit\`: a manifest fetched from any source must hash to it. |
+| <a id="field-luxir.replicationcatalogentry.manifest_xxh3"></a>[`manifest_xxh3`](#field-luxir.replicationcatalogentry.manifest_xxh3) | 5 | `string` | singular | xxh3-64 of the exact manifest bytes of \`commit\`, as 16 lowercase hex digits (exact in every JSON client): a manifest of \`commit\` from any source must hash to it. |
 
 <a id="message-luxir.replicationcollectionstatus"></a>
 
@@ -1381,6 +1383,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of 1 / (k + rank\_s
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.schemarequest.collection"></a>[`collection`](#field-luxir.schemarequest.collection) | 1 | `string` | singular | empty selects the default collection, "main" |
+| <a id="field-luxir.schemarequest.tenant"></a>[`tenant`](#field-luxir.schemarequest.tenant) | 4 | `string` | singular | Administration only: the owning tenant. Empty is the caller's tenant. |
 | <a id="field-luxir.schemarequest.mode"></a>[`mode`](#field-luxir.schemarequest.mode) | 2 | [`SchemaRequest.Mode`](#enum-luxir.schemarequest.mode) | singular |  |
 | <a id="field-luxir.schemarequest.schema"></a>[`schema`](#field-luxir.schemarequest.schema) | 3 | [`SchemaDef`](#message-luxir.schemadef) | singular |  |
 
