@@ -843,6 +843,18 @@ private:
     return true;
   }
 
+  // /collections/{c}/_snapshot/files/{name}
+  static bool parseSnapshotFilePath(std::string_view target, std::string& coll, std::string& file) {
+    constexpr std::string_view pre = "/collections/", infix = "/_snapshot/files/";
+    if (!target.starts_with(pre)) return false;
+    auto rest = target.substr(pre.size());
+    auto at = rest.find(infix);
+    if (at == std::string_view::npos || at + infix.size() == rest.size()) return false;
+    coll.assign(rest.substr(0, at));
+    file.assign(rest.substr(at + infix.size()));
+    return true;
+  }
+
   static bool parseSearchPath(std::string_view target, std::string& coll) {
     return parseCollectionPath(target, "/_search", coll);
   }
@@ -1185,6 +1197,10 @@ private:
       m.route = Route::COLLECTION_DELETE; m.allow = "POST";
     } else if (parseCollectionPath(target, "/_wait_for_replicas", m.coll)) {
       m.route = Route::WAIT_FOR_REPLICAS; m.allow = "POST";
+    } else if (parseCollectionPath(target, "/_snapshot", m.coll)) {
+      m.route = Route::REPLICATION_SNAPSHOT; m.allow = "GET, HEAD";
+    } else if (parseSnapshotFilePath(target, m.coll, m.file)) {
+      m.route = Route::REPLICATION_FILE; m.allow = "GET, HEAD";
     } else if (parseSearchPath(target, m.coll)) {
       m.route = Route::SEARCH; m.allow = "GET, POST";
     } else if (parseUpdatePath(target, m.coll)) {
@@ -1200,19 +1216,11 @@ private:
       if (path == "status") { m.route = Route::REPLICATION_STATUS; m.allow = "GET"; }
       else if (path == "watch") { m.route = Route::REPLICATION_WATCH; m.allow = "GET"; }
       else if (path == "installed") { m.route = Route::REPLICATION_INSTALLED; m.allow = "POST"; }
-      else if (auto slash = path.find('/'); slash != std::string_view::npos) {
-        m.coll = path.substr(0, slash);
-        auto endpoint = path.substr(slash + 1);
-        if (endpoint == "snapshot") { m.route = Route::REPLICATION_SNAPSHOT; m.allow = "GET, HEAD"; }
-        else if (endpoint.starts_with("file/") && endpoint.size() > 5) {
-          m.route = Route::REPLICATION_FILE; m.allow = "GET, HEAD"; m.file = endpoint.substr(5);
-        }
-        m.emptyCollection = m.coll.empty();
-      }
       return m;
     }
     bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE ||
-                           m.route == Route::STATS || m.route == Route::SCHEMA || m.route == Route::WAIT_FOR_REPLICAS;
+                           m.route == Route::STATS || m.route == Route::SCHEMA || m.route == Route::WAIT_FOR_REPLICAS ||
+                           m.route == Route::REPLICATION_SNAPSHOT || m.route == Route::REPLICATION_FILE;
     m.emptyCollection = collectionRoute && m.coll.empty() && target.starts_with("/collections/");
     return m;
   }

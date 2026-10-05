@@ -20,6 +20,9 @@ names as the protobuf messages.
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
 | `GET /_stats` | Node totals and per-collection operational statistics. |
 | `GET /collections/{collection}/_stats` | Operational statistics for one collection. |
+| `GET /collections/{collection}/_snapshot` | Pin the current snapshot for copying; see [Replication](replication.md). |
+| `GET /collections/{collection}/_snapshot/files/{name}` | One file of a pinned snapshot. |
+| `GET /_replication/watch`, `POST /_replication/installed`, `GET /_replication/status` | Replication discovery, acknowledgments and status; see [Replication](replication.md). |
 
 Collection names occupy one URL path component. Names beginning with `_` are
 reserved. Search and schema reads never create a missing collection; an update

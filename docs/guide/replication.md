@@ -192,8 +192,8 @@ last source URL and discovery/recovery state; it does not bind the source URL.
 | Endpoint | Contract |
 |---|---|
 | `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Full `{boot, cursor, collections}` catalog; echo the opaque cursor. Unknown cursors return immediately. Requested timeout is clamped to one third of the source follower timeout; followers request one third of their own. |
-| `GET /_replication/COLLECTION/snapshot` | Reserves current snapshot; binary manifest and `X-Luxir-Commit`. Add `?format=json` to inspect files/sizes/digests. HEAD has no side effects. |
-| `GET /_replication/COLLECTION/file/NAME?commit=TOKEN` | File from a pin; optional single byte Range (206/416), HEAD supported. Malformed/multiple ranges return full 200. Missing membership: 404 `file_not_in_snapshot`; expired pin: 410 `snapshot_expired`. |
+| `GET /collections/COLLECTION/_snapshot` | Pins the current snapshot; binary manifest and `X-Luxir-Commit`. Add `?format=json` to inspect files/sizes/digests. HEAD has no side effects. |
+| `GET /collections/COLLECTION/_snapshot/files/NAME?commit=TOKEN` | File from a pin; optional single byte Range (206/416), HEAD supported. Malformed/multiple ranges return full 200. Missing membership: 404 `file_not_in_snapshot`; expired pin: 410 `snapshot_expired`. |
 | `POST /_replication/installed` | JSON `{follower, collection, commit}` acknowledges a serving snapshot. |
 | `GET /_replication/status` | Status described above. |
 

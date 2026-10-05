@@ -433,7 +433,7 @@ struct ReplicationFollower::Impl {
     while (offset < descriptor.size || (descriptor.size == 0 && failures == 0)) {
       if (stopping.stop_requested()) throw std::runtime_error("follower stopped");
       try {
-        auto path = "/_replication/" + collection + "/file/" + escape(descriptor.name) + "?commit=" + escape(snapshot.id.token()) + "&" + followerQuery();
+        auto path = "/collections/" + collection + "/_snapshot/files/" + escape(descriptor.name) + "?commit=" + escape(snapshot.id.token()) + "&" + followerQuery();
         client.send(http::verb::get, path, {}, offset);
         http::response_parser<http::buffer_body> parser;
         // Error bodies (especially 410 for a tiny file) can exceed file size.
@@ -470,7 +470,7 @@ struct ReplicationFollower::Impl {
   }
 
   std::shared_ptr<const CommitSnapshot> fetchSnapshot(Client& client, const std::string& name) {
-    auto response = request(client, http::verb::get, "/_replication/" + name + "/snapshot?" + followerQuery());
+    auto response = request(client, http::verb::get, "/collections/" + name + "/_snapshot?" + followerQuery());
     auto& body = response.body();
     auto bytes = std::make_shared<const std::vector<std::byte>>((const std::byte*)body.data(), (const std::byte*)body.data() + body.size());
     auto snapshot = CommitSnapshot::fromBytes(bytes);

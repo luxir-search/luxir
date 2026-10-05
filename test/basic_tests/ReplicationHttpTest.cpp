@@ -103,7 +103,7 @@ protected:
     return json["cursor"].get<std::string>();
   }
   std::shared_ptr<const CommitSnapshot> snapshot() {
-    auto response = get("/_replication/main/snapshot");
+    auto response = get("/collections/main/_snapshot");
     EXPECT_EQ(200, response.result_int());
     auto& body = response.body();
     auto bytes = std::make_shared<const std::vector<std::byte>>(
@@ -113,7 +113,7 @@ protected:
     return result;
   }
   static std::string fileUrl(const CommitSnapshot& snapshot, std::string_view name) {
-    return "/_replication/main/file/" + std::string(name) + "?commit=" + snapshot.id.incarnation +
+    return "/collections/main/_snapshot/files/" + std::string(name) + "?commit=" + snapshot.id.incarnation +
         ":" + std::to_string(snapshot.id.index_gen);
   }
   auto download(const CommitSnapshot& snapshot, std::string_view name, std::string_view range, bool head = false) {
@@ -161,7 +161,7 @@ TEST_F(ReplicationHttpTest, watchPublishCreateDeleteAndTimeout) {
   ASSERT_EQ(std::future_status::ready, created.wait_for(1s));
   initial = created.get();
   ASSERT_TRUE(initial["collections"].contains("other"));
-  EXPECT_EQ(200, get("/_replication/other/snapshot").result_int());
+  EXPECT_EQ(200, get("/collections/other/_snapshot").result_int());
   creation.get();
   Signal::unlisten("collectionInitialized");
   auto removed = wait();
@@ -230,7 +230,7 @@ TEST_F(ReplicationHttpTest, snapshotFilesRangeAndSharedPins) {
   ASSERT_FALSE(glz::read_json(error, denied.body()));
   EXPECT_EQ("missing-file", error["request_id"].get<std::string>());
   EXPECT_EQ("file_not_in_snapshot", error["error"]["code"].get<std::string>());
-  EXPECT_EQ(404, get("/_replication/missing/snapshot").result_int());
+  EXPECT_EQ(404, get("/collections/missing/_snapshot").result_int());
 }
 
 TEST_F(ReplicationHttpTest, expiryBudgetAndInstalledStats) {
@@ -344,7 +344,7 @@ TEST_F(ReplicationHttpTest, snapshotJsonHeadAndEmptyFile) {
   auto missing = download(*snap, "missing", {}, true);
   EXPECT_EQ(404, missing.result_int());
   EXPECT_TRUE(missing.body().empty());
-  auto json = get("/_replication/main/snapshot?format=json");
+  auto json = get("/collections/main/_snapshot?format=json");
   ASSERT_EQ(200, json.result_int());
   EXPECT_EQ("application/json", json[http::field::content_type]);
   api::IndexInfo decoded;
@@ -478,7 +478,7 @@ TEST_F(ReplicationHttpTest, shutdownJoinsNotificationAlreadyRemovedFromCatalog) 
 TEST_F(ReplicationHttpTest, headAndMonotonicAcknowledgment) {
   auto& registry = h->collection().getShard()->getSnapshots();
   auto old = registry.snapshot()->id;
-  auto head = httpRequest(server->getPort(), http::verb::head, "/_replication/main/snapshot");
+  auto head = httpRequest(server->getPort(), http::verb::head, "/collections/main/_snapshot");
   EXPECT_EQ(old.token(), head["X-Luxir-Commit"]);
   EXPECT_EQ(0u, registry.stats().pins);
   ASSERT_TRUE(h->index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
@@ -489,7 +489,7 @@ TEST_F(ReplicationHttpTest, headAndMonotonicAcknowledgment) {
   ack(current);
   ack(old);
   EXPECT_EQ(current, node->getReplication().status()[0].commit);
-  EXPECT_EQ(200, get("/_replication/main/snapshot?follower=downloader").result_int());
+  EXPECT_EQ(200, get("/collections/main/_snapshot?follower=downloader").result_int());
   auto snap = registry.snapshot();
   EXPECT_EQ(200, get(fileUrl(*snap, snap->files.front().name) + "&follower=file-reader").result_int());
   EXPECT_EQ(3u, node->getReplication().status().size());
@@ -506,7 +506,7 @@ TEST_F(ReplicationHttpTest, socketDeadlineAbortsStalledSharedPin) {
   stalledTransfer([&](const auto&) {
     active = std::jthread([&](std::stop_token stop) {
       while (!stop.stop_requested()) {
-        get("/_replication/main/snapshot"); // Another client renews the same pin.
+        get("/collections/main/_snapshot"); // Another client renews the same pin.
         std::this_thread::sleep_for(10ms);
       }
     });
