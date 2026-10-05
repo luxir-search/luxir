@@ -23,7 +23,8 @@ struct ReplicationState {
 
   static ReplicationState read(InputFile& file) {
     ReplicationState state;
-    if (glz::read_json(state, file.read()) || state.follower.empty() || state.follower.size() > 255)
+    std::string text(file.read()); // the parser reads up to a terminator
+    if (glz::read_json(state, text) || state.follower.empty() || state.follower.size() > 255)
       throw std::runtime_error("Invalid follower state");
     return state;
   }

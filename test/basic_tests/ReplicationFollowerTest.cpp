@@ -279,7 +279,7 @@ TEST_F(ReplicationFollowerTest, ramFollowerAndPinLossReuseVerifiedFiles) {
   Signal::listen("replicationFileVerified", [&](void*, void*, void*) -> void* {
     if (++verified == 1) {
       auto& snapshots = h.collection().getShard()->getSnapshots();
-      snapshots.evictOldest();
+      snapshots.testEvictOldest();
     }
     return nullptr;
   });
@@ -332,7 +332,7 @@ TEST_P(ReplicationMatrixTest, connectionFailureResumesRangeAndDroppedTransferRef
   Signal::listen("replicationDownloadProgress", [&](void* progress, void*, void*) -> void* {
     if (*(uint64_t*)progress >= 256 * 1024 && interrupted.fetch_add(1) == 0) {
       auto& snapshots = h.collection().getShard()->getSnapshots();
-      snapshots.evictOldest();
+      snapshots.testEvictOldest();
     }
     return nullptr;
   });
@@ -1215,7 +1215,7 @@ TEST_F(ReplicationFollowerTest, pullRetriesLostPinAndKeepsVerifiedFiles) {
   uint64_t bytes = 0; for (const auto& file : snapshot->files) bytes += file.size;
   unsigned verified = 0;
   Signal::listen("replicationFileVerified", [&](void*, void*, void*) -> void* {
-    if (++verified == 1) h.collection().getShard()->getSnapshots().evictOldest();
+    if (++verified == 1) h.collection().getShard()->getSnapshots().testEvictOldest();
     return nullptr;
   });
   auto result = pull();

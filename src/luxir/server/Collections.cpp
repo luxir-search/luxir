@@ -273,14 +273,18 @@ std::shared_ptr<Collection> Collections::getOrCreate(std::string_view name, bool
   validateName(key);
   if (auto existing = map.get(key)) return existing;
   if (!autoCreate) throw CollectionNotFoundError("collection '" + key + "' does not exist");
-  bool created = false;
+  // Concurrent first writers wait on the map's creation slot, which lets them
+  // help run work rather than block. The builder owns the name's transition and
+  // announces the collection before the map publishes it.
   auto collection = map.getOrCreate(key, [&] {
+    Transition transition(*this, key);
     auto col = initWriter(key);
-    created = true;
     LOG_INFO("Created collection: {}", key);
+    events.registered(key, col);
     return col;
   });
-  if (created) events.registered(key, collection);
+  // A removal can follow the creation before this caller re-reads the entry.
+  if (!collection) throw CollectionUnavailableError("collection '" + key + "' changed during creation");
   return collection;
 }
 
@@ -288,10 +292,11 @@ std::shared_ptr<Collection> Collections::create(std::string_view name, const api
   std::string key(name);
   validateName(key);
   bool createdHere = false;
+  std::shared_ptr<Collection> created;
   std::exception_ptr createFailure;
-  auto collection = map.getOrCreate(key, [&]() {
+  map.getOrCreate(key, [&]() {
     createdHere = true;
-    std::shared_ptr<Collection> created;
+    Transition transition(*this, key);
     bool stored = false;
     try {
       auto initialSchema = Schema::createDefaultSchema();
@@ -300,24 +305,28 @@ std::shared_ptr<Collection> Collections::create(std::string_view name, const api
       stored = true;
       created = initWriter(key, std::move(initialSchema));
       LOG_INFO("Created collection: {}", key);
+      events.registered(key, created);
       return created;
     } catch (...) {
       createFailure = std::current_exception();
+      std::shared_ptr<Collection> failed;
       try {
         if (created && created->shard && created->shard->iw) created->shard->iw->close();
         if (stored) factory->collection(key).remove();
       } catch (const std::exception& e) {
-        return Collection::placeholder(key, "create failed and cleanup failed: " + std::string(e.what()));
+        failed = Collection::placeholder(key, "create failed and cleanup failed: " + std::string(e.what()));
       } catch (...) {
-        return Collection::placeholder(key, "create failed and cleanup failed: unknown non-standard exception");
+        failed = Collection::placeholder(key, "create failed and cleanup failed: unknown non-standard exception");
       }
-      std::rethrow_exception(createFailure);
+      if (!failed) std::rethrow_exception(createFailure);
+      events.registered(key, failed);
+      return failed;
     }
   });
-  if (createdHere) events.registered(key, collection);
   if (createFailure) std::rethrow_exception(createFailure);
   if (!createdHere) throw CollectionExistsError("collection '" + key + "' already exists");
-  return collection;
+  // The collection this call built, even if a removal has since replaced it.
+  return created;
 }
 
 void Collections::remove(std::string_view name, bool mustExist) {
@@ -378,11 +387,16 @@ void Collections::remove(std::string_view name, bool mustExist) {
 
 Collections::Candidate Collections::stage(std::string_view name, std::string_view incarnation) {
   std::string key(name);
-  {
-    std::lock_guard lock(slotsMutex);
-    slots[key].leased.insert(std::string(incarnation));
-  }
   auto lease = std::unique_ptr<Lease>(new Lease{*this, key, std::string(incarnation)});
+  {
+    // Admission and the lease are one step: no removal or retirement of this
+    // name is in progress, and none can start without seeing the lease.
+    std::lock_guard lock(slotsMutex);
+    auto& slot = slots[key];
+    if (slot.busy) throw CollectionUnavailableError("collection '" + key + "' is changing");
+    slot.leased.insert(lease->incarnation);
+    lease->active = true;
+  }
   auto collection = makeCollection(key, factory->collection(key).create(incarnation));
   return Candidate(key, std::string(incarnation), std::move(collection), std::move(lease));
 }

@@ -35,7 +35,8 @@ public:
     auto file = container.openFile("CURRENT");
     if (!file) return std::nullopt;
     Selection result;
-    if (glz::read_json(result, file->read()) || result.incarnation.empty()
+    std::string text(file->read()); // the parser reads up to a terminator
+    if (glz::read_json(result, text) || result.incarnation.empty()
         || result.incarnation.find_first_of("/\\") != std::string::npos
         || result.incarnation == "." || result.incarnation == "..") {
       throw std::runtime_error("Invalid collection CURRENT");
@@ -242,6 +243,7 @@ public:
       return;
     }
 
+    bool baseExisted = std::filesystem::is_directory(basePath_);
     bool created = std::filesystem::create_directories(collectionsPath_);
     if (created) {
       LOG_INFO("Created data directory: {}", basePath_.string());
@@ -249,11 +251,10 @@ public:
       LOG_INFO("Using existing data directory: {}", basePath_.string());
     }
     lock_.emplace(basePath_ / "write.lock");
-    if (created) {
-      FSDirectory base(basePath_);
-      std::array<std::string, 1> directory{"."};
-      base.sync(directory);
-    }
+    // Every owned open re-syncs the entry for c/: an earlier creation may have
+    // failed after mkdir, before the entry was durable.
+    if (!baseExisted && basePath_.has_parent_path()) syncDirectory(basePath_.parent_path());
+    syncDirectory(basePath_);
   }
 
   std::vector<std::string> collections() override { return directoriesIn(collectionsPath_); }

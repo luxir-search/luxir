@@ -134,11 +134,11 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::acquire(std::stop_
 }
 
 std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, std::string_view name, std::stop_token* cancellation) {
-  struct ReservedFile {
+  struct PinnedFile {
     std::shared_ptr<InputFile> file;
     std::shared_ptr<Pin::OpenFiles> lease;
   };
-  auto owner = std::make_shared<ReservedFile>();
+  auto owner = std::make_shared<PinnedFile>();
   // Validate against revocation before opening; eviction may then revoke the
   // pin, but cannot unlink until this in-flight open owns its file.
   std::lock_guard retirementLock(retirementMutex);
@@ -150,13 +150,13 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, 
     auto it = pins.find(id);
     if (closed || it == pins.end()) throw SnapshotExpiredError();
     if (!it->second.fileNames.contains(name)) {
-      throw ApiError(ErrorKind::NOT_FOUND, "file_not_in_snapshot", "file is not in the reserved snapshot");
+      throw ApiError(ErrorKind::NOT_FOUND, "file_not_in_snapshot", "file is not in the pinned snapshot");
     }
     if (cancellation) *cancellation = it->second.cancellation.get_token();
     owner->lease = it->second.openFiles;
   }
   auto file = dir.openFile(name, true);
-  if (!file) throw std::runtime_error("reserved snapshot file is missing");
+  if (!file) throw std::runtime_error("pinned snapshot file is missing");
   owner->file = file;
   return std::shared_ptr<InputFile>(std::move(owner), file.get());
 }
@@ -236,7 +236,7 @@ bool CommitSnapshotRegistry::reclaimOldestPin() {
   return true;
 }
 
-bool CommitSnapshotRegistry::evictOldest() {
+bool CommitSnapshotRegistry::testEvictOldest() {
   std::vector<std::string> retired;
   {
     std::lock_guard lock(mutex);

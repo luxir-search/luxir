@@ -77,7 +77,9 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output) {
         promoted = copySnapshot(storage, *selected, Manifest::load(*storage.open(*selected)));
         state.write(metadata);
       }
-      if (*selected != promoted) storage.select(promoted);
+      // Re-select even if CURRENT already names the target: an earlier attempt
+      // may have renamed it into place without making it durable.
+      storage.select(promoted);
       storage.retainOnly(promoted);
       promotedCount++;
       output << name << ' ' << promoted << '\n';

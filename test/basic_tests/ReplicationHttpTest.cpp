@@ -302,7 +302,7 @@ TEST_F(ReplicationHttpTest, slowDownloadSurvivesMerge) {
 
 
 TEST_F(ReplicationHttpTest, evictionAbortsStalledReader) {
-  stalledTransfer([&](const auto& snapshot) { h->collection().getShard()->getSnapshots().evictOldest(); });
+  stalledTransfer([&](const auto& snapshot) { h->collection().getShard()->getSnapshots().testEvictOldest(); });
 }
 
 TEST_F(ReplicationHttpTest, deleteAbortsStalledReader) {

@@ -25,9 +25,10 @@ namespace api { struct SchemaDef; }
 // transition of it (startup discovery, creation, activation of a new
 // incarnation, removal), announced in order through CollectionEvents.
 //
-// Removal and activation own their name for their whole duration: a second
-// transition of the same name fails fast instead of waiting, and no lock is
-// held across I/O. Creation is exclusive through the map's lazy creation.
+// Creation, removal and activation own their name for their whole duration
+// and announce their result before releasing it: a second transition of the
+// same name fails fast instead of waiting, and no lock is held across I/O.
+// Concurrent auto-creators wait on the map's creation slot instead.
 // Staged candidates hold leases on their incarnation directories, and
 // retirement removes only directories nothing selects, leases or retains.
 // Publications within an incarnation are not transitions; they reach the
@@ -56,7 +57,8 @@ private:
   struct Lease {
     Collections& owner;
     std::string name, incarnation;
-    ~Lease() { owner.release(name, incarnation); }
+    bool active = false;
+    ~Lease() { if (active) owner.release(name, incarnation); }
   };
 
 public:

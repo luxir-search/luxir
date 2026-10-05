@@ -199,7 +199,7 @@ last source URL and discovery/recovery state; it does not bind the source URL.
 
 Snapshot/file GETs accept `follower=ID`; these, watches and installed acks renew
 liveness. On 410, back off, fetch a new snapshot and reuse verified files. Transfers send
-from the reserved mmap with advisory readahead and socket backpressure.
+from the pinned mmap with advisory readahead and socket backpressure.
 The catalog uses the `ReplicationCatalog` proto message. Entries contain
 `commit` when known and `available` (false when absent). Installed acknowledgments
 use `ReplicationInstalled`; status states are the `ReplicationCollectionStatus.State`

@@ -105,7 +105,8 @@ public:
   // budget eviction can still revoke any pin to enforce its bound.
   std::optional<Clock::time_point> oldestReclaimablePin();
   bool reclaimOldestPin();
-  bool evictOldest();
+  // Tests only: revoke the oldest pin as budget enforcement would.
+  bool testEvictOldest();
   void setPolicy(Policy value);
   Stats stats();
   void expire();

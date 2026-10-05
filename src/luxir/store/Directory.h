@@ -121,8 +121,11 @@ public:
     for (const auto& file : wanted) {
       auto it = byName.find(file.name);
       if (it == byName.end() || *it->second != file) continue;
-      if (!openFile(file.name)) linkFile(source, file.name);
-      else continue; // An unpublished candidate must be verified by its caller.
+      // An existing (even unreadable) candidate must be verified by its caller.
+      bool present = true;
+      try { present = openFile(file.name) != nullptr; } catch (const std::exception&) {}
+      if (present) continue;
+      linkFile(source, file.name);
       reused.push_back(file);
     }
     return reused;

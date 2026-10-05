@@ -4,6 +4,9 @@
 #include <gtest/gtest.h>
 #include "luxir/server/Promotion.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/util/Signal.h"
+#include "luxir/util/luxir_util.h"
+#include <future>
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
@@ -68,4 +71,23 @@ TEST_F(CollectionsTest, stagedCandidatesSurviveRetirementAndBlockRemoval) {
   EXPECT_EQ(std::vector<std::string>{copy}, storage.incarnations());
   collections.remove("main");
   EXPECT_FALSE(collections.get("main"));
+}
+
+TEST_F(CollectionsTest, creationOwnsItsNameUntilAnnounced) {
+  std::promise<void> initialized, resume;
+  auto resumed = resume.get_future().share();
+  Signal::listen("collectionInitialized", [&](void*, void*, void*) -> void* {
+    initialized.set_value(); resumed.wait(); return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("collectionInitialized"); });
+  auto creation = std::async(std::launch::async, [&] { return collections.create("other"); });
+  initialized.get_future().wait();
+  EXPECT_THROW(collections.remove("other"), CollectionUnavailableError);
+  EXPECT_THROW(collections.stage("other", "pending"), CollectionUnavailableError);
+  resume.set_value();
+  auto created = creation.get();
+  ASSERT_TRUE(created->getShard());
+  EXPECT_EQ(created, collections.get("other"));
+  collections.remove("other");
+  EXPECT_FALSE(collections.get("other"));
 }

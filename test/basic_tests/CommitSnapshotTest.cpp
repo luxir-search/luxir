@@ -49,7 +49,7 @@ TEST_F(CommitSnapshotTest, slowTransferSurvivesDeletesAndMerge) {
   EXPECT_EQ(bytes, w->snapshots.stats().retainedBytes);
   auto names = pin->files;
   auto inFlight = w->snapshots.openFile(pin->id, names.front().name);
-  w->snapshots.evictOldest();
+  w->snapshots.testEvictOldest();
   EXPECT_EQ(0u, w->snapshots.stats().retainedBytes);
   for (const auto& file : names) EXPECT_EQ(nullptr, w->dir.openFile(file.name));
   auto data = inFlight->read();
@@ -133,7 +133,7 @@ TEST_F(CommitSnapshotTest, currentAndSchemaOnlySnapshotsDoNotConsumeBudget) {
   EXPECT_EQ(0u, w->snapshots.stats().budgetDrops);
   EXPECT_EQ(0u, w->snapshots.stats().retainedBytes);
   EXPECT_THROW(w->snapshots.openFile(pin->id, "../write.lock"), ApiError);
-  w->snapshots.evictOldest();
+  w->snapshots.testEvictOldest();
   EXPECT_THROW(w->snapshots.openFile(pin->id, pin->files.front().name), SnapshotExpiredError);
   EXPECT_EQ(1, reader->liveDocs());
 }
@@ -227,7 +227,7 @@ TEST_F(CommitSnapshotTest, droppedPinCannotUnlinkRecreatedCollection) {
     return nullptr;
   });
   auto unlisten = scope_guard([] { Signal::unlisten("snapshotPinDropped"); });
-  std::thread release([&] { writer->snapshots.evictOldest(); });
+  std::thread release([&] { writer->snapshots.testEvictOldest(); });
   collected.wait();
   node.deleteCollection("main");
   CollectionHelper fresh(node, "main");
@@ -255,7 +255,7 @@ TEST_F(CommitSnapshotTest, twoRequestsShareOnePin) {
   EXPECT_EQ(1u, snapshots.stats().pins);
   EXPECT_NE(nullptr, snapshots.openFile(id, name));
   EXPECT_TRUE(snapshots.touch(second->id, 1));
-  snapshots.evictOldest();
+  snapshots.testEvictOldest();
   EXPECT_THROW(snapshots.openFile(second->id, name), SnapshotExpiredError);
 }
 
@@ -267,7 +267,7 @@ TEST_F(CommitSnapshotTest, concurrentBudgetEviction) {
   auto first = snapshots.acquire();
   ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
   std::latch start(2);
-  std::thread release([&] { start.count_down(); start.wait(); snapshots.evictOldest(); });
+  std::thread release([&] { start.count_down(); start.wait(); snapshots.testEvictOldest(); });
   start.count_down();
   start.wait();
   snapshots.setPolicy({60s, 0});

@@ -552,8 +552,15 @@ struct ReplicationFollower::Impl {
       bool reuse = verified.contains(file.name) && verified.at(file.name) == file;
       if (!reuse) {
         // Unpublished verified files can survive a reconnect or failed install.
-        // After process restart only these candidates need to be hashed.
-        if (auto local = dir.openFile(file.name)) {
+        // After process restart only these candidates need to be hashed. An
+        // unreadable unpublished file is downloaded again and replaced; a
+        // serving file must stay readable.
+        std::shared_ptr<InputFile> local;
+        try { local = dir.openFile(file.name); }
+        catch (const FileIOException&) {
+          if (durableNames.contains(file.name)) throw;
+        }
+        if (local) {
           auto data = local->read();
           reuse = data.size() == file.size && XXH3_64bits(data.data(), data.size()) == file.xxh3;
           if (!reuse && previous) {
