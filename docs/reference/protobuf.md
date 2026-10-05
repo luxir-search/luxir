@@ -25,6 +25,7 @@ defaults and constraints are described in the comments and guides.
 
 | Method | Request | Response | Description |
 |---|---|---|---|
+| <a id="method-luxir.admin.waitforreplicas"></a>[`WaitForReplicas`](#method-luxir.admin.waitforreplicas) | [`WaitForReplicasRequest`](#message-luxir.waitforreplicasrequest) | [`WaitForReplicasResponse`](#message-luxir.waitforreplicasresponse) |  |
 | <a id="method-luxir.admin.setschema"></a>[`SetSchema`](#method-luxir.admin.setschema) | [`SchemaRequest`](#message-luxir.schemarequest) | [`SchemaResponse`](#message-luxir.schemaresponse) |  |
 | <a id="method-luxir.admin.getschema"></a>[`GetSchema`](#method-luxir.admin.getschema) | [`SchemaRequest`](#message-luxir.schemarequest) | [`SchemaResponse`](#message-luxir.schemaresponse) |  |
 | <a id="method-luxir.admin.createcollection"></a>[`CreateCollection`](#method-luxir.admin.createcollection) | [`CreateCollectionRequest`](#message-luxir.createcollectionrequest) | [`CreateCollectionResponse`](#message-luxir.createcollectionresponse) |  |
@@ -55,6 +56,7 @@ defaults and constraints are described in the comments and guides.
 
 ## Messages
 
+- [`AllReplicas`](#message-luxir.allreplicas)
 - [`AnalyzerComponent`](#message-luxir.analyzercomponent)
 - [`AnalyzerDef`](#message-luxir.analyzerdef)
 - [`AnyOfQuery`](#message-luxir.anyofquery)
@@ -106,7 +108,7 @@ defaults and constraints are described in the comments and guides.
 - [`FieldFacet`](#message-luxir.fieldfacet)
 - [`FieldVariants`](#message-luxir.fieldvariants)
 - [`Filter`](#message-luxir.filter)
-- [`FollowerStats`](#message-luxir.followerstats)
+- [`FollowerStatus`](#message-luxir.followerstatus)
 - [`Fusion`](#message-luxir.fusion)
 - [`FuzzyQuery`](#message-luxir.fuzzyquery)
 - [`GeoBoxQuery`](#message-luxir.geoboxquery)
@@ -129,8 +131,12 @@ defaults and constraints are described in the comments and guides.
 - [`RangeFacet`](#message-luxir.rangefacet)
 - [`RangeQuery`](#message-luxir.rangequery)
 - [`RegexQuery`](#message-luxir.regexquery)
+- [`ReplicaRequirement`](#message-luxir.replicarequirement)
 - [`ReplicaResult`](#message-luxir.replicaresult)
+- [`ReplicationCatalog`](#message-luxir.replicationcatalog)
+- [`ReplicationCatalogEntry`](#message-luxir.replicationcatalogentry)
 - [`ReplicationCollectionStatus`](#message-luxir.replicationcollectionstatus)
+- [`ReplicationInstalled`](#message-luxir.replicationinstalled)
 - [`ReplicationStatus`](#message-luxir.replicationstatus)
 - [`RescoreQuery`](#message-luxir.rescorequery)
 - [`RrfFusion`](#message-luxir.rrffusion)
@@ -155,8 +161,16 @@ defaults and constraints are described in the comments and guides.
 - [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror)
 - [`Val`](#message-luxir.val)
 - [`Vector`](#message-luxir.vector)
+- [`WaitForReplicasRequest`](#message-luxir.waitforreplicasrequest)
+- [`WaitForReplicasResponse`](#message-luxir.waitforreplicasresponse)
 - [`Warning`](#message-luxir.warning)
 - [`WildcardQuery`](#message-luxir.wildcardquery)
+
+<a id="message-luxir.allreplicas"></a>
+
+### luxir.AllReplicas
+
+[Source](../../protos/luxir_types.proto)
 
 <a id="message-luxir.analyzercomponent"></a>
 
@@ -487,7 +501,7 @@ Single-valued vector column. Each Vector slot is independently nullable via its 
 |---|---|---|---|---|
 | <a id="field-luxir.collectioncommit.commit"></a>[`commit`](#field-luxir.collectioncommit.commit) | 1 | `string` | singular | Durable snapshot identity, retained even if the replica wait fails. |
 | <a id="field-luxir.collectioncommit.replicas"></a>[`replicas`](#field-luxir.collectioncommit.replicas) | 2 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
-| <a id="field-luxir.collectioncommit.error"></a>[`error`](#field-luxir.collectioncommit.error) | 3 | [`Error`](#message-luxir.error) | singular | Commit or replica-wait failure for this collection. |
+| <a id="field-luxir.collectioncommit.error"></a>[`error`](#field-luxir.collectioncommit.error) | 3 | [`Error`](#message-luxir.error) | singular | Local commit failure for this collection. |
 
 <a id="message-luxir.collectionstats"></a>
 
@@ -543,8 +557,8 @@ Parameters governing how a commit is performed. Presence of this message in an U
 | <a id="field-luxir.commitparams.build_aux_indexes"></a>[`build_aux_indexes`](#field-luxir.commitparams.build_aux_indexes) | 2 | `string` | repeated | Build missing aux overlays as part of this commit. An overlay already present on a segment is retained rather than rebuilt. \[\] - request no aux builds \["\*"\] - build every eligible missing vector overlay \["vec.title\_v"\] - build the missing vector overlay for title\_v Only "\*" and exact overlay names are supported; no partial-name patterns. |
 | <a id="field-luxir.commitparams.wait_for_merges"></a>[`wait_for_merges`](#field-luxir.commitparams.wait_for_merges) | 3 | `bool` | singular | If true, this commit will wait for any in-flight merges to finish before publishing. |
 | <a id="field-luxir.commitparams.max_segments"></a>[`max_segments`](#field-luxir.commitparams.max_segments) | 4 | `uint32` | singular | Merge down so the data visible at this commit resides in at most this many segments. 0 (default) = no forced merging. The response is not sent until the merged index is durably published: at return, everything this commit made visible lives in &lt;= max\_segments segments (concurrent ingestion after this commit may add new segments; they are not covered by the promise). The response waits for the merged layout even when commit\_within\_ms is positive. |
-| <a id="field-luxir.commitparams.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.commitparams.wait_for_replicas) | 5 | `string` | singular | Decimal follower count or "all". Forces an immediate commit. "all" captures live followers at commit completion; members that go non-live stop counting. |
-| <a id="field-luxir.commitparams.replication_timeout_ms"></a>[`replication_timeout_ms`](#field-luxir.commitparams.replication_timeout_ms) | 6 | `uint64` | optional | Visibility wait deadline. Absent defaults to 30000; timeout never undoes commit. |
+| <a id="field-luxir.commitparams.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.commitparams.wait_for_replicas) | 5 | [`ReplicaRequirement`](#message-luxir.replicarequirement) | singular | Forces an immediate commit. All captures live followers at commit completion; members that go non-live stop counting. |
+| <a id="field-luxir.commitparams.wait_for_replicas_timeout_ms"></a>[`wait_for_replicas_timeout_ms`](#field-luxir.commitparams.wait_for_replicas_timeout_ms) | 6 | `uint64` | optional | Visibility wait deadline. Absent defaults to 30000; timeout never undoes commit. |
 
 <a id="message-luxir.constantscorequery"></a>
 
@@ -576,6 +590,7 @@ Parameters governing how a commit is performed. Presence of this message in an U
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.createcollectionresponse.commit"></a>[`commit`](#field-luxir.createcollectionresponse.commit) | 2 | `string` | singular | exact snapshot published by creation |
 | <a id="field-luxir.createcollectionresponse.name"></a>[`name`](#field-luxir.createcollectionresponse.name) | 1 | `string` | singular |  |
 
 <a id="message-luxir.deletecollectionrequest"></a>
@@ -819,19 +834,19 @@ Alternate representations of the same input value, keyed by local label. Absent 
 | <a id="field-luxir.filter.query"></a>[`query`](#field-luxir.filter.query) | 1 | [`Query`](#message-luxir.query) | singular | required; restricts matches without contributing to scores |
 | <a id="field-luxir.filter.except_ops"></a>[`except_ops`](#field-luxir.filter.except_ops) | 2 | `string` | repeated | Keys in the enclosing TopDocs.ops map that should not receive this filter. The filter still applies to the TopDocs results and other sub-operations. Names must be nonempty, distinct, and present in that ops map. Empty applies the filter to all sub-operations. Not supported on Fusion filters or Fusion source filters. |
 
-<a id="message-luxir.followerstats"></a>
+<a id="message-luxir.followerstatus"></a>
 
-### luxir.FollowerStats
+### luxir.FollowerStatus
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.followerstats.follower"></a>[`follower`](#field-luxir.followerstats.follower) | 1 | `string` | singular |  |
-| <a id="field-luxir.followerstats.collection"></a>[`collection`](#field-luxir.followerstats.collection) | 2 | `string` | singular |  |
-| <a id="field-luxir.followerstats.commit"></a>[`commit`](#field-luxir.followerstats.commit) | 3 | `string` | singular |  |
-| <a id="field-luxir.followerstats.last_seen"></a>[`last_seen`](#field-luxir.followerstats.last_seen) | 4 | `uint64` | singular | Unix milliseconds |
-| <a id="field-luxir.followerstats.lag"></a>[`lag`](#field-luxir.followerstats.lag) | 5 | `uint64` | optional | generation distance; absent without a current acknowledgment |
+| <a id="field-luxir.followerstatus.follower"></a>[`follower`](#field-luxir.followerstatus.follower) | 1 | `string` | singular |  |
+| <a id="field-luxir.followerstatus.collection"></a>[`collection`](#field-luxir.followerstatus.collection) | 2 | `string` | singular |  |
+| <a id="field-luxir.followerstatus.commit"></a>[`commit`](#field-luxir.followerstatus.commit) | 3 | `string` | singular |  |
+| <a id="field-luxir.followerstatus.last_seen"></a>[`last_seen`](#field-luxir.followerstatus.last_seen) | 4 | `uint64` | singular | Unix milliseconds |
+| <a id="field-luxir.followerstatus.lag"></a>[`lag`](#field-luxir.followerstatus.lag) | 5 | `uint64` | optional | generation distance; absent without a current acknowledgment |
 
 <a id="message-luxir.fusion"></a>
 
@@ -1202,6 +1217,23 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 | <a id="field-luxir.regexquery.field"></a>[`field`](#field-luxir.regexquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.regexquery.pattern"></a>[`pattern`](#field-luxir.regexquery.pattern) | 2 | `string` | singular |  |
 
+<a id="message-luxir.replicarequirement"></a>
+
+### luxir.ReplicaRequirement
+
+Exactly one requirement is required, including an explicit count of zero.
+
+[Source](../../protos/luxir_types.proto)
+
+<a id="oneof-luxir.replicarequirement.kind"></a>
+
+**oneof `kind`:** at most one member can be set.
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.replicarequirement.count"></a>[`count`](#field-luxir.replicarequirement.count) | 1 | `uint32` | oneof [`kind`](#oneof-luxir.replicarequirement.kind) |  |
+| <a id="field-luxir.replicarequirement.all"></a>[`all`](#field-luxir.replicarequirement.all) | 2 | [`AllReplicas`](#message-luxir.allreplicas) | oneof [`kind`](#oneof-luxir.replicarequirement.kind) |  |
+
 <a id="message-luxir.replicaresult"></a>
 
 ### luxir.ReplicaResult
@@ -1212,8 +1244,32 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 |---|---|---|---|---|
 | <a id="field-luxir.replicaresult.wanted"></a>[`wanted`](#field-luxir.replicaresult.wanted) | 1 | `uint32` | optional | For "all", wanted excludes captured followers that are no longer live. |
 | <a id="field-luxir.replicaresult.serving"></a>[`serving`](#field-luxir.replicaresult.serving) | 2 | `uint32` | optional |  |
-| <a id="field-luxir.replicaresult.timed_out"></a>[`timed_out`](#field-luxir.replicaresult.timed_out) | 3 | `bool` | optional |  |
-| <a id="field-luxir.replicaresult.cancelled"></a>[`cancelled`](#field-luxir.replicaresult.cancelled) | 4 | `bool` | optional | The commit succeeded, but shutdown or client cancellation ended the wait. |
+| <a id="field-luxir.replicaresult.outcome"></a>[`outcome`](#field-luxir.replicaresult.outcome) | 3 | [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome) | optional | independent of local commit success |
+
+<a id="message-luxir.replicationcatalog"></a>
+
+### luxir.ReplicationCatalog
+
+Full catalog for a discovery cursor, scoped to this source boot.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.replicationcatalog.boot"></a>[`boot`](#field-luxir.replicationcatalog.boot) | 1 | `string` | singular |  |
+| <a id="field-luxir.replicationcatalog.cursor"></a>[`cursor`](#field-luxir.replicationcatalog.cursor) | 2 | `string` | singular |  |
+| <a id="field-luxir.replicationcatalog.collections"></a>[`collections`](#field-luxir.replicationcatalog.collections) | 3 | map&lt;`string`, [`ReplicationCatalogEntry`](#message-luxir.replicationcatalogentry)&gt; | map |  |
+
+<a id="message-luxir.replicationcatalogentry"></a>
+
+### luxir.ReplicationCatalogEntry
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.replicationcatalogentry.commit"></a>[`commit`](#field-luxir.replicationcatalogentry.commit) | 1 | `string` | singular |  |
+| <a id="field-luxir.replicationcatalogentry.available"></a>[`available`](#field-luxir.replicationcatalogentry.available) | 2 | `bool` | singular |  |
 
 <a id="message-luxir.replicationcollectionstatus"></a>
 
@@ -1226,12 +1282,23 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 | <a id="field-luxir.replicationcollectionstatus.name"></a>[`name`](#field-luxir.replicationcollectionstatus.name) | 1 | `string` | singular |  |
 | <a id="field-luxir.replicationcollectionstatus.source_commit"></a>[`source_commit`](#field-luxir.replicationcollectionstatus.source_commit) | 2 | `string` | singular |  |
 | <a id="field-luxir.replicationcollectionstatus.serving_commit"></a>[`serving_commit`](#field-luxir.replicationcollectionstatus.serving_commit) | 3 | `string` | singular |  |
-| <a id="field-luxir.replicationcollectionstatus.state"></a>[`state`](#field-luxir.replicationcollectionstatus.state) | 4 | `string` | singular | syncing, serving, waiting, stale, orphan, error |
+| <a id="field-luxir.replicationcollectionstatus.state"></a>[`state`](#field-luxir.replicationcollectionstatus.state) | 4 | [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state) | optional |  |
 | <a id="field-luxir.replicationcollectionstatus.bytes_downloaded"></a>[`bytes_downloaded`](#field-luxir.replicationcollectionstatus.bytes_downloaded) | 5 | `uint64` | singular |  |
 | <a id="field-luxir.replicationcollectionstatus.bytes_total"></a>[`bytes_total`](#field-luxir.replicationcollectionstatus.bytes_total) | 6 | `uint64` | singular |  |
 | <a id="field-luxir.replicationcollectionstatus.last_error"></a>[`last_error`](#field-luxir.replicationcollectionstatus.last_error) | 7 | `string` | singular |  |
 | <a id="field-luxir.replicationcollectionstatus.next_retry"></a>[`next_retry`](#field-luxir.replicationcollectionstatus.next_retry) | 8 | `uint64` | singular | Unix milliseconds; zero when not backing off |
-| <a id="field-luxir.replicationcollectionstatus.storage_ram_bytes"></a>[`storage_ram_bytes`](#field-luxir.replicationcollectionstatus.storage_ram_bytes) | 9 | `uint64` | singular | Includes candidate downloads and old readers. |
+
+<a id="message-luxir.replicationinstalled"></a>
+
+### luxir.ReplicationInstalled
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.replicationinstalled.follower"></a>[`follower`](#field-luxir.replicationinstalled.follower) | 1 | `string` | singular |  |
+| <a id="field-luxir.replicationinstalled.collection"></a>[`collection`](#field-luxir.replicationinstalled.collection) | 2 | `string` | singular |  |
+| <a id="field-luxir.replicationinstalled.commit"></a>[`commit`](#field-luxir.replicationinstalled.commit) | 3 | `string` | singular |  |
 
 <a id="message-luxir.replicationstatus"></a>
 
@@ -1246,6 +1313,7 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 | <a id="field-luxir.replicationstatus.connected"></a>[`connected`](#field-luxir.replicationstatus.connected) | 3 | `bool` | optional |  |
 | <a id="field-luxir.replicationstatus.last_contact"></a>[`last_contact`](#field-luxir.replicationstatus.last_contact) | 4 | `uint64` | singular | Unix milliseconds |
 | <a id="field-luxir.replicationstatus.collections"></a>[`collections`](#field-luxir.replicationstatus.collections) | 5 | [`ReplicationCollectionStatus`](#message-luxir.replicationcollectionstatus) | repeated |  |
+| <a id="field-luxir.replicationstatus.followers"></a>[`followers`](#field-luxir.replicationstatus.followers) | 6 | [`FollowerStatus`](#message-luxir.followerstatus) | repeated |  |
 
 <a id="message-luxir.rescorequery"></a>
 
@@ -1302,6 +1370,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of 1 / (k + rank\_s
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.schemaresponse.commit"></a>[`commit`](#field-luxir.schemaresponse.commit) | 2 | `string` | singular | exact snapshot published by a schema update |
 | <a id="field-luxir.schemaresponse.schema"></a>[`schema`](#field-luxir.schemaresponse.schema) | 1 | [`SchemaDef`](#message-luxir.schemadef) | singular | the resulting schema after the operation |
 
 <a id="message-luxir.searchop"></a>
@@ -1344,8 +1413,8 @@ Top-level search request that can contain multiple search operations.
 | <a id="field-luxir.searchrequest.response_format"></a>[`response_format`](#field-luxir.searchrequest.response_format) | 6 | [`ResponseFormat`](#enum-luxir.responseformat) | singular | HTTP response framing. ENVELOPE (default): one JSON envelope per batch. DOCS: one document per line, with optional \_header\_ metadata records. The HTTP ?format=docs parameter also selects DOCS. gRPC rejects DOCS. See docs/guide/http-api.md for the NDJSON formats. |
 | <a id="field-luxir.searchrequest.profile"></a>[`profile`](#field-luxir.searchrequest.profile) | 7 | `bool` | singular | Return execution details for instrumented operations; see ExecutionProfile. |
 | <a id="field-luxir.searchrequest.max_parallel"></a>[`max_parallel`](#field-luxir.searchrequest.max_parallel) | 8 | `int32` | singular | Intra-request parallelism: 0 (default) lets the engine choose; 1 runs serially on the shared executor; -1 permits unlimited parallelism. Automatic execution is serial on the receiving thread. Other values are rejected. |
-| <a id="field-luxir.searchrequest.min_commit"></a>[`min_commit`](#field-luxir.searchrequest.min_commit) | 9 | `string` | singular | Require a local snapshot at least this new (incarnation:index\_gen). A different incarnation fails immediately; otherwise wait asynchronously. |
-| <a id="field-luxir.searchrequest.min_commit_timeout_ms"></a>[`min_commit_timeout_ms`](#field-luxir.searchrequest.min_commit_timeout_ms) | 10 | `uint64` | optional | Search floor deadline. Absent defaults to 30000; zero checks immediately. Maximum floor wait, in milliseconds. Defaults to 30000. |
+| <a id="field-luxir.searchrequest.min_commit"></a>[`min_commit`](#field-luxir.searchrequest.min_commit) | 9 | `string` | singular | Require a local snapshot at least this new (incarnation:index\_gen). Writers reject a different incarnation immediately; followers wait for a switch. |
+| <a id="field-luxir.searchrequest.min_commit_timeout_ms"></a>[`min_commit_timeout_ms`](#field-luxir.searchrequest.min_commit_timeout_ms) | 10 | `uint64` | optional | Search floor deadline. Absent defaults to 30000; zero checks immediately. |
 
 <a id="message-luxir.searchresponse"></a>
 
@@ -1357,6 +1426,7 @@ Top-level response to a Search request
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.searchresponse.commit"></a>[`commit`](#field-luxir.searchresponse.commit) | 7 | `string` | singular | token of the reader used for this response |
 | <a id="field-luxir.searchresponse.request_id"></a>[`request_id`](#field-luxir.searchresponse.request_id) | 1 | `string` | singular |  |
 | <a id="field-luxir.searchresponse.ops"></a>[`ops`](#field-luxir.searchresponse.ops) | 2 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | the results of the search operations in the request, keyed by operation name. |
 | <a id="field-luxir.searchresponse.error"></a>[`error`](#field-luxir.searchresponse.error) | 3 | [`Error`](#message-luxir.error) | singular | Present on a failed request's final response; ops is then empty. A final error may follow earlier result batches. |
@@ -1465,8 +1535,6 @@ Operational statistics. An empty collection requests every collection on the nod
 | <a id="field-luxir.statsresponse.totals"></a>[`totals`](#field-luxir.statsresponse.totals) | 1 | [`StatsTotals`](#message-luxir.statstotals) | singular |  |
 | <a id="field-luxir.statsresponse.collections"></a>[`collections`](#field-luxir.statsresponse.collections) | 2 | [`CollectionStats`](#message-luxir.collectionstats) | repeated |  |
 | <a id="field-luxir.statsresponse.indexing_ram"></a>[`indexing_ram`](#field-luxir.statsresponse.indexing_ram) | 3 | [`IndexRamStats`](#message-luxir.indexramstats) | singular |  |
-| <a id="field-luxir.statsresponse.followers"></a>[`followers`](#field-luxir.statsresponse.followers) | 4 | [`FollowerStats`](#message-luxir.followerstats) | repeated |  |
-| <a id="field-luxir.statsresponse.replication"></a>[`replication`](#field-luxir.statsresponse.replication) | 5 | [`ReplicationStatus`](#message-luxir.replicationstatus) | singular |  |
 | <a id="field-luxir.statsresponse.storage_ram"></a>[`storage_ram`](#field-luxir.statsresponse.storage_ram) | 6 | [`StorageRamStats`](#message-luxir.storageramstats) | singular |  |
 
 <a id="message-luxir.statstotals"></a>
@@ -1620,6 +1688,30 @@ A dense vector value. Dimensionality is the number of elements in f32.v.
 |---|---|---|---|---|
 | <a id="field-luxir.vector.f32"></a>[`f32`](#field-luxir.vector.f32) | 1 | [`ArrFloat`](#message-luxir.arrfloat) | oneof [`kind`](#oneof-luxir.vector.kind) |  |
 
+<a id="message-luxir.waitforreplicasrequest"></a>
+
+### luxir.WaitForReplicasRequest
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.waitforreplicasrequest.collection"></a>[`collection`](#field-luxir.waitforreplicasrequest.collection) | 1 | `string` | singular | empty selects main |
+| <a id="field-luxir.waitforreplicasrequest.commit"></a>[`commit`](#field-luxir.waitforreplicasrequest.commit) | 2 | `string` | singular | existing durable commit token |
+| <a id="field-luxir.waitforreplicasrequest.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.waitforreplicasrequest.wait_for_replicas) | 3 | [`ReplicaRequirement`](#message-luxir.replicarequirement) | singular |  |
+| <a id="field-luxir.waitforreplicasrequest.wait_for_replicas_timeout_ms"></a>[`wait_for_replicas_timeout_ms`](#field-luxir.waitforreplicasrequest.wait_for_replicas_timeout_ms) | 4 | `uint64` | optional | absent = 30000 |
+
+<a id="message-luxir.waitforreplicasresponse"></a>
+
+### luxir.WaitForReplicasResponse
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.waitforreplicasresponse.commit"></a>[`commit`](#field-luxir.waitforreplicasresponse.commit) | 1 | `string` | singular |  |
+| <a id="field-luxir.waitforreplicasresponse.replicas"></a>[`replicas`](#field-luxir.waitforreplicasresponse.replicas) | 2 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
+
 <a id="message-luxir.warning"></a>
 
 ### luxir.Warning
@@ -1655,6 +1747,8 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
 - [`Match.Operator`](#enum-luxir.match.operator)
+- [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
+- [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
 - [`ResponseFormat`](#enum-luxir.responseformat)
 - [`SchemaRequest.Mode`](#enum-luxir.schemarequest.mode)
 - [`SelectionMode`](#enum-luxir.selectionmode)
@@ -1765,6 +1859,33 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.match.operator.operator_unspecified"></a>[`OPERATOR_UNSPECIFIED`](#value-luxir.match.operator.operator_unspecified) | 0 | treated as OR |
 | <a id="value-luxir.match.operator.or"></a>[`OR`](#value-luxir.match.operator.or) | 1 | a doc matches if any analyzed term matches |
 | <a id="value-luxir.match.operator.and"></a>[`AND`](#value-luxir.match.operator.and) | 2 | a doc must match every analyzed term |
+
+<a id="enum-luxir.replicaresult.outcome"></a>
+
+### luxir.ReplicaResult.Outcome
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.replicaresult.outcome.satisfied"></a>[`SATISFIED`](#value-luxir.replicaresult.outcome.satisfied) | 0 |  |
+| <a id="value-luxir.replicaresult.outcome.timed_out"></a>[`TIMED_OUT`](#value-luxir.replicaresult.outcome.timed_out) | 1 |  |
+| <a id="value-luxir.replicaresult.outcome.cancelled"></a>[`CANCELLED`](#value-luxir.replicaresult.outcome.cancelled) | 2 |  |
+
+<a id="enum-luxir.replicationcollectionstatus.state"></a>
+
+### luxir.ReplicationCollectionStatus.State
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.replicationcollectionstatus.state.syncing"></a>[`SYNCING`](#value-luxir.replicationcollectionstatus.state.syncing) | 0 |  |
+| <a id="value-luxir.replicationcollectionstatus.state.serving"></a>[`SERVING`](#value-luxir.replicationcollectionstatus.state.serving) | 1 |  |
+| <a id="value-luxir.replicationcollectionstatus.state.waiting"></a>[`WAITING`](#value-luxir.replicationcollectionstatus.state.waiting) | 2 |  |
+| <a id="value-luxir.replicationcollectionstatus.state.stale"></a>[`STALE`](#value-luxir.replicationcollectionstatus.state.stale) | 3 |  |
+| <a id="value-luxir.replicationcollectionstatus.state.orphan"></a>[`ORPHAN`](#value-luxir.replicationcollectionstatus.state.orphan) | 4 |  |
+| <a id="value-luxir.replicationcollectionstatus.state.error"></a>[`ERROR`](#value-luxir.replicationcollectionstatus.state.error) | 5 |  |
 
 <a id="enum-luxir.responseformat"></a>
 

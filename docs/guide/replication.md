@@ -32,21 +32,47 @@ the unreadable copy is treated as populated for the empty-replacement rule.
 ## Write, then read your write
 
 ```sh
-curl 'http://writer:9400/collections/main/_update?commit=true&wait_for_replicas=all&replication_timeout_ms=30000' \
+curl 'http://writer:9400/collections/main/_update?commit=true&wait_for_replicas=all&wait_for_replicas_timeout_ms=30000' \
   -H 'Content-Type: application/x-ndjson' -d '{"id":"example"}'
 # Use the returned commit token:
 curl 'http://reader:9400/collections/main/_search?min_commit=INCARNATION:GEN&min_commit_timeout_ms=30000' \
   -H 'Content-Type: application/json' -d '{"query":"id:example"}'
 ```
 
-A commit token is `INCARNATION:GEN`. `wait_for_replicas=N|all` commits immediately
-and returns `commit` plus `replicas: {wanted, serving, timed_out}`. It also works
-in JSON/NDJSON commit objects and gRPC. `all` captures live followers already
-serving some commit of that collection's incarnation when the commit completes.
-Watch-only and still-syncing followers are excluded; later arrivals do not join.
-Captured followers that expire stop being required. A dead follower remains live
-for `replication.follower-timeout-ms`, so `all` can time out before it expires.
+A commit token is `INCARNATION:GEN`. The URL syntax
+`wait_for_replicas=N|all` forces an immediate commit and returns `commit` plus
+`replicas: {wanted, serving, outcome}`. JSON/NDJSON commit objects and gRPC use
+one typed requirement: `"wait_for_replicas":{"count":2}` or
+`"wait_for_replicas":{"all":{}}`. An explicit count of zero checks immediately.
+`wait_for_replicas_timeout_ms` defaults to 30000; zero checks without parking.
+
+The outcome is `satisfied`, `timed_out`, or `cancelled`. It is separate from
+local commit success: timeout, client cancellation, server shutdown, and a
+collection removed or recreated after the commit all preserve the durable token.
+Cancellation never turns a successful local commit into an update error.
+Completed update bodies are released before the visibility wait.
+
+`all` captures live followers already serving some commit of that collection's
+incarnation when the commit completes. Watch-only and still-syncing followers
+are excluded; later arrivals do not join. Captured followers that expire stop
+being required. A dead follower remains live for
+`replication.follower-timeout-ms`, so `all` can time out before it expires.
 A numeric N can exceed the live count and waits until timeout.
+
+Retry visibility without committing again:
+
+```sh
+curl 'http://writer:9400/collections/main/_wait_for_replicas?wait_for_replicas=all&wait_for_replicas_timeout_ms=30000' \
+  -H 'Content-Type: application/json' -d '{"commit":"INCARNATION:GEN"}'
+```
+
+The body may also supply `wait_for_replicas` and
+`wait_for_replicas_timeout_ms`; URL values override them. gRPC exposes the same
+operation as `Admin.WaitForReplicas`. The response is `{commit, replicas}`.
+For standalone waits, `all` captures membership when the request starts.
+Create-collection and schema-update responses return the snapshot they published.
+Search response envelopes return the token of the reader actually used; pass it
+as the next request's `min_commit` for monotonic reads.
 
 `min_commit` waits for the requested generation or a descendant of the same
 incarnation, on either writers or followers. At timeout, an insufficient
@@ -54,13 +80,17 @@ snapshot returns 503 `stale_replica`; a different incarnation returns 409
 `commit_incarnation_mismatch`. Writers/read-only nodes reject an incarnation
 mismatch immediately; followers allow time for an incarnation switch.
 Both timeout defaults are 30000 ms. Waits do not block later commits. A timeout
-never rolls back a committed write. An abandoned request waits until its deadline.
+never rolls back a committed write. Transport cancellation completes a parked
+wait as cancelled. HTTP observes socket failures while parked without consuming
+queued request bytes. A write-half-close is valid, so EOF alone is not proof of
+cancellation. Ambiguous EOF, or a disconnect behind queued pipelined bytes, may
+only be resolved by the next I/O operation or wait deadline.
 
 An NDJSON URL EOF commit covers only collections touched by that stream and
 always returns `commits: {name: {commit?, replicas?, error?}}`, even for one
 collection. An empty stream commits the URL's collection. `replicas` appears
-only when requested. A failed commit or replica wait sets that collection's
-`error`; a durable `commit` token is retained even if the wait fails. Every
+only when requested. A failed local commit sets that collection's `error`;
+replica wait outcomes preserve the durable `commit` token and local status. Every
 admitted outcome is returned. Any collection failure sets the overall
 `status: "error"` and a top-level `error`, with HTTP 200, as for a unary commit
 failure. Unary updates keep `commit`/`replicas`. A floor also protects reads
@@ -170,5 +200,7 @@ last source URL and discovery/recovery state; it does not bind the source URL.
 Snapshot/file GETs accept `follower=ID`; these, watches and installed acks renew
 liveness. On 410, back off, fetch a new snapshot and reuse verified files. Transfers send
 from the reserved mmap with advisory readahead and socket backpressure.
-The catalog includes unavailable collections with `state: "unavailable"` and
-last commit when known. Acknowledgments never move backwards within an incarnation.
+The catalog uses the `ReplicationCatalog` proto message. Entries contain
+`commit` when known and `available` (false when absent). Installed acknowledgments
+use `ReplicationInstalled`; status states are the `ReplicationCollectionStatus.State`
+enum, rendered as lowercase JSON names. Acknowledgments never move backwards within an incarnation.

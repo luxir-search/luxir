@@ -10,6 +10,7 @@ names as the protobuf messages.
 |---|---|
 | `GET /health` | Process liveness. |
 | `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
+| `POST /collections/{collection}/_wait_for_replicas` | Wait on an existing commit token; see [Replication](replication.md#write-then-read-your-write). |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
 | `GET /collections/{collection}/_schema?view=resolved` | Read physical representations, bindings, and conservative schema coverage; HTTP only. |
@@ -25,7 +26,11 @@ reserved. Search and schema reads never create a missing collection; an update
 does by default unless `--no-indexing.auto-create-collection` is set.
 
 `_create` installs the optional `schema` (same shape as a `_schema` set)
-before the collection becomes visible. See
+before the collection becomes visible and returns `{name, commit}`. Schema
+writes return `{schema, commit}`; schema GET still returns the authored schema
+directly, suitable for posting back. Each token identifies the exact snapshot
+published by that operation. Search response envelopes include the token of the
+reader they used. See
 [Collection lifecycle](operations.md#collection-lifecycle) for deletion
 semantics under concurrent use.
 
@@ -188,7 +193,8 @@ earlier group acknowledgements; no later records from that connection are
 accepted. URL EOF commits always return a `commits` map, even for a single
 collection, and collect every admitted collection outcome before responding.
 Entries contain `commit`, optional `replicas`, and `error` when that collection's
-commit or replica wait failed; a durable token survives a failed wait. Any such
+local commit failed. Replica wait outcomes (`satisfied`, `timed_out`,
+`cancelled`) retain the token and do not change local commit success. A local
 failure sets overall `status: "error"` and a top-level `error`, with HTTP 200,
 consistent with unary commit failures. See [Indexing](indexing.md#per-document-failures).
 

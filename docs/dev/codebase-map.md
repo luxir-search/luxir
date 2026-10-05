@@ -15,6 +15,12 @@ locations, browse `src/luxir/<area>/`.
      (startup discovery, creation, activation of a new incarnation, removal),
      announced in order through `CollectionEvents`
    - `ReplicationFollower`: Discovery and transfer protocol; installs through `Collections`
+   - `ReplicationSource`: Local discovery catalog, cursors, follower liveness and acknowledgments,
+     fed by the ordered `CollectionEvents` interface.
+   - `CommitWaits`: Node-local publication floors and replica barriers; owns deadlines,
+     cancellation and captured follower expiry. Satisfied floors retain their exact collection.
+   - `ProtoUpdateMessage::Completion`: Owning local result plus copied replica-wait specification;
+     transports release indexing bodies before waiting for visibility.
 
 2. **Search Engine** (`src/luxir/search/`)
    - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
