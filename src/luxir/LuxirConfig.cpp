@@ -71,6 +71,20 @@ std::vector<std::string> ReplicationConfig::tenantFilter() const {
   return result;
 }
 
+std::vector<std::string> ReplicationConfig::peerList() const {
+  std::vector<std::string> result;
+  std::string_view remaining = peers;
+  while (!remaining.empty()) {
+    auto comma = remaining.find(',');
+    auto peer = remaining.substr(0, comma);
+    if (peer.empty()) throw std::invalid_argument("replication.peers has an empty entry");
+    result.emplace_back(peer);
+    if (comma == std::string_view::npos) break;
+    remaining.remove_prefix(comma + 1);
+  }
+  return result;
+}
+
 void ReplicationConfig::validate() const {
   tenantFilter();
   if (!max_acknowledgments) throw std::invalid_argument("replication.max-acknowledgments must be positive");
@@ -82,6 +96,7 @@ void ReplicationConfig::validate() const {
 void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--replicate-from,--replication.source", replication.source, "Follow this HTTP source namespace");
   app.add_option("--replication.tenants", replication.tenants, "Comma-separated tenant subscription (empty follows all)");
+  app.add_option("--replication.peers", replication.peers, "Comma-separated http:// nodes serving file copies, tried before the source");
   app.add_option("--replication.max-acknowledgments", replication.max_acknowledgments,
       "Node-wide follower/collection acknowledgment row budget")->default_val(replication.max_acknowledgments);
   app.add_option("--replication.follower-id", replication.follower_id, "Stable follower id (generated when omitted)");

@@ -13,6 +13,7 @@
 #include <boost/beast.hpp>
 #include <glaze/glaze.hpp>
 #include <condition_variable>
+#include <format>
 #include <thread>
 #include <set>
 #include <ostream>
@@ -217,6 +218,9 @@ std::string errorMessage(const std::exception& error) {
   return error.what();
 }
 struct PinGone : std::runtime_error { PinGone() : std::runtime_error("source snapshot pin expired") {} };
+struct PeerMismatch : std::runtime_error {
+  explicit PeerMismatch(const std::string& name) : std::runtime_error("peer file checksum mismatch: " + name) {}
+};
 }
 
 struct ReplicationFollower::Impl {
@@ -231,6 +235,7 @@ struct ReplicationFollower::Impl {
     // The local copy could not be opened; CURRENT, if it could be read, selects
     // this incarnation ("" otherwise). It is retained until an install replaces it.
     std::optional<std::string> unreadable;
+    uint64_t advertisedDigest = 0; // manifest digest announced with `advertised`
     unsigned failures = 0;
     uint64_t progress = 0;
     Clock::time_point readySince = Clock::now();
@@ -247,6 +252,7 @@ struct ReplicationFollower::Impl {
   };
   LuxirNode& node;
   Source source;
+  std::vector<Source> peers; // never resized after construction: clients reference them
   const std::vector<std::string> tenants;
   ReplicationState binding;
   std::mutex metadataMutex;
@@ -264,6 +270,7 @@ struct ReplicationFollower::Impl {
 
   explicit Impl(LuxirNode& node) : node(node), source(node.getConfig().replication.source),
       tenants(node.getConfig().replication.tenantFilter()) {
+    for (const auto& peer : node.getConfig().replication.peerList()) peers.emplace_back(peer);
     if (node.getConfig().replication.downloads < 1 || node.getConfig().replication.downloads > 64) {
       throw std::invalid_argument("replication.downloads must be between 1 and 64");
     }
@@ -292,6 +299,15 @@ struct ReplicationFollower::Impl {
     }
     if (binding.follower.empty() || binding.follower.size() > 255) throw std::invalid_argument("invalid follower id");
   }
+
+  // A worker's connections: the source, then each peer in configured order.
+  struct Clients {
+    Client source;
+    std::vector<std::unique_ptr<Client>> peers;
+    explicit Clients(Impl& impl) : source(impl.source, impl.stopping.get_token()) {
+      for (const auto& peer : impl.peers) peers.push_back(std::make_unique<Client>(peer, impl.stopping.get_token()));
+    }
+  };
 
   bool includes(const CollectionId& id) const {
     return tenants.empty() || std::ranges::find(tenants, id.tenant) != tenants.end();
@@ -381,7 +397,8 @@ struct ReplicationFollower::Impl {
   // Applies one collection's entry from a source catalog (absent: not in it).
   // A new incarnation may replace a populated copy with an empty snapshot only
   // if this follower saw the previous incarnation in the same source boot.
-  void observe(State& state, std::optional<CommitId> desired, bool present, const std::string& sourceBoot) {
+  void observe(State& state, std::optional<CommitId> desired, uint64_t digest, bool present, const std::string& sourceBoot) {
+    state.advertisedDigest = digest;
     if (desired && (!state.advertised || desired->incarnation != state.advertised->incarnation))
       state.replaceEmpty = state.seenBoot == sourceBoot;
     if (desired != state.advertised) {
@@ -419,7 +436,7 @@ struct ReplicationFollower::Impl {
             auto* found = it == entries.end() ? nullptr : it->second;
             bool present = found != nullptr;
             state.unavailable = present && !found->available;
-            observe(state, present ? advertisedCommit(*found) : std::nullopt, present, boot);
+            observe(state, present ? advertisedCommit(*found) : std::nullopt, present ? found->manifest_xxh3 : 0, present, boot);
             if (!state.busy && state.serving && state.advertised == state.serving && state.acknowledged == state.serving) {
               state.error.clear(); state.failures = 0; state.retry = {};
             }
@@ -443,18 +460,28 @@ struct ReplicationFollower::Impl {
     }
   }
 
-  void download(Client& client, const CollectionId& collection, Directory& dir, const CommitSnapshot& snapshot,
-                const FileDescriptor& descriptor) {
+  // Downloads and verifies one file. Peers serve it by identity, in order and
+  // once each; the source serves it from the pinned commit and is retried. A
+  // transfer resumes at the same offset on the next source, and the digest
+  // check covers the whole file whatever mix of sources supplied it.
+  void download(Clients& clients, const CollectionId& collection, Directory& dir, const CommitSnapshot& snapshot,
+                const FileDescriptor& descriptor, bool usePeers = true) {
     Signal::emit("replicationDownloadStart", (void*)&descriptor);
     Directory::FileCreateOptions options; options.expectedSize = descriptor.size;
     auto file = dir.createFile(descriptor.name, options);
     OutputStream out(file.get());
     uint64_t offset = 0;
     int failures = 0;
-    while (offset < descriptor.size || (descriptor.size == 0 && failures == 0)) {
+    size_t next = usePeers ? 0 : clients.peers.size();
+    bool fromPeer = false;
+    for (;;) {
       if (stopping.stop_requested()) throw std::runtime_error("follower stopped");
+      bool peer = next < clients.peers.size();
+      Client& client = peer ? *clients.peers[next] : clients.source;
       try {
-        auto path = snapshotPath(collection) + "/files/" + escape(descriptor.name) + "?commit=" + escape(snapshot.id.token()) + "&" + followerQuery();
+        auto path = snapshotPath(collection) + "/files/" + escape(descriptor.name) + "?" + (peer
+            ? "size=" + std::to_string(descriptor.size) + "&xxh3=" + std::format("{:016x}", descriptor.xxh3)
+            : "commit=" + escape(snapshot.id.token()) + "&" + followerQuery());
         client.send(http::verb::get, path, {}, offset);
         http::response_parser<http::buffer_body> parser;
         // Error bodies (especially 410 for a tiny file) can exceed file size.
@@ -462,9 +489,10 @@ struct ReplicationFollower::Impl {
         parser.body_limit(UINT64_MAX);
         client.header(parser);
         int status = parser.get().result_int();
-        if (status == 410) throw PinGone();
+        if (!peer && status == 410) throw PinGone();
         if (status != (offset ? 206 : 200)) throw std::runtime_error("source file HTTP " + std::to_string(status));
-        if (parser.chunked() || parser.content_length() != descriptor.size - offset || parser.get()["X-Luxir-Commit"] != snapshot.id.token()) {
+        if (parser.chunked() || parser.content_length() != descriptor.size - offset
+            || (!peer && parser.get()["X-Luxir-Commit"] != snapshot.id.token())) {
           throw std::runtime_error("source file length or commit mismatch");
         }
         if (offset && parser.get()[http::field::content_range] != "bytes " + std::to_string(offset) + "-" + std::to_string(descriptor.size - 1) + "/" + std::to_string(descriptor.size)) {
@@ -473,8 +501,10 @@ struct ReplicationFollower::Impl {
         client.body(descriptor.size - offset, [&](const char* bytes, size_t received) {
           Signal::emit("replicationDownloadWrite", &dir);
           out.write(bytes, received); offset += received;
+          fromPeer = fromPeer || peer;
           {
-            std::lock_guard lock(mutex); states[collection].downloaded += received; lastContact = wallTime();
+            std::lock_guard lock(mutex); states[collection].downloaded += received;
+            if (!peer) lastContact = wallTime();
           }
           Signal::emit("replicationDownloadProgress", &offset);
           if (stopping.stop_requested()) throw std::runtime_error("follower stopped");
@@ -482,10 +512,17 @@ struct ReplicationFollower::Impl {
         if (!parser.get().keep_alive()) client.reset();
         break;
       } catch (const PinGone&) { client.reset(); throw; }
-      catch (...) { client.reset(); if (++failures >= 3 || stopping.stop_requested()) throw; }
+      catch (...) {
+        client.reset();
+        if (peer) { Signal::emit("replicationPeerMiss", (void*)&descriptor); next++; continue; }
+        if (++failures >= 3 || stopping.stop_requested()) throw;
+      }
     }
     out.close();
-    if (file->size() != descriptor.size || file->digest() != descriptor.xxh3) throw std::runtime_error("source file checksum mismatch: " + descriptor.name);
+    if (file->size() != descriptor.size || file->digest() != descriptor.xxh3) {
+      if (fromPeer) throw PeerMismatch(descriptor.name);
+      throw std::runtime_error("source file checksum mismatch: " + descriptor.name);
+    }
     dir.finishFile(*file);
     Signal::emit("replicationFileVerified", &file);
   }
@@ -522,6 +559,9 @@ struct ReplicationFollower::Impl {
     if (!state.advertised) throw std::runtime_error("source collection disappeared during transfer");
     if (state.advertised->incarnation != snapshot.id.incarnation)
       throw std::runtime_error("source incarnation changed; retry snapshot");
+    // A manifest of the announced commit must be the announced bytes.
+    if (snapshot.id == state.advertised && state.advertisedDigest && snapshot.digest != state.advertisedDigest)
+      throw std::runtime_error("manifest does not match its announcement");
     for (const auto& file : snapshot.files) state.total += file.size;
     decision.active = node.collections().get(name);
     auto shard = decision.active ? decision.active->getShard() : nullptr;
@@ -551,7 +591,7 @@ struct ReplicationFollower::Impl {
 
   // Verifies every file of `snapshot` in the target directory, downloading what
   // is missing, and makes them durable. Returns the target's prior snapshot.
-  void stageFiles(Client& client, const CollectionId& name, Directory& dir, const std::shared_ptr<const CommitSnapshot>& previous,
+  void stageFiles(Clients& clients, const CollectionId& name, Directory& dir, const std::shared_ptr<const CommitSnapshot>& previous,
                   const CommitSnapshot& snapshot, const std::shared_ptr<Collection>& active) {
     std::map<std::string, FileDescriptor> verified;
     { std::lock_guard lock(mutex); verified = states[name].verified; }
@@ -593,7 +633,11 @@ struct ReplicationFollower::Impl {
           }
         }
       }
-      if (!reuse) download(client, name, dir, snapshot, file);
+      if (!reuse) {
+        // A peer copy that fails verification is fetched again from the source.
+        try { download(clients, name, dir, snapshot, file); }
+        catch (const PeerMismatch&) { download(clients, name, dir, snapshot, file, false); }
+      }
       { std::lock_guard lock(mutex);
         auto& state = states[name];
         if (reuse) state.reused += file.size;
@@ -607,11 +651,11 @@ struct ReplicationFollower::Impl {
     dir.sync(names); syncDir(dir);
   }
 
-  void sync(Client& client, const CollectionId& name) {
+  void sync(Clients& clients, const CollectionId& name) {
     { std::lock_guard lock(mutex);
       auto& state = states[name]; state.total = state.downloaded = state.reused = 0;
     }
-    auto snapshot = fetchSnapshot(client, name);
+    auto snapshot = fetchSnapshot(clients.source, name);
     auto decision = decide(name, *snapshot);
     if (decision.obsolete) node.collections().discard(*decision.obsolete);
     if (decision.current || !decision.eligible) return;
@@ -626,7 +670,7 @@ struct ReplicationFollower::Impl {
     if (decision.advance) {
       auto& registry = decision.active->getShard()->getSnapshots();
       auto previous = registry.snapshot();
-      stageFiles(client, name, registry.dir, previous, *snapshot, decision.active);
+      stageFiles(clients, name, registry.dir, previous, *snapshot, decision.active);
       auto opened = registry.readers.prepare(*snapshot);
       stillAdvertised();
       if (stopping.stop_requested()) return;
@@ -639,7 +683,7 @@ struct ReplicationFollower::Impl {
         auto candidate = node.collections().stage(name, snapshot->id.incarnation);
         std::lock_guard lock(mutex); state.candidate = std::move(candidate);
       }
-      stageFiles(client, name, state.candidate->dir(), state.candidate->committed(), *snapshot, decision.active);
+      stageFiles(clients, name, state.candidate->dir(), state.candidate->committed(), *snapshot, decision.active);
       stillAdvertised();
       if (stopping.stop_requested()) return;
       // An unregistered candidate's publication is invisible until activation.
@@ -660,10 +704,10 @@ struct ReplicationFollower::Impl {
 
   bool pull(std::ostream& output) {
     if (!threads.empty() || stopping.stop_requested()) throw std::logic_error("pull requires an unstarted follower");
-    Client client(source, stopping.get_token());
+    Clients clients(*this);
     api::ReplicationCatalog catalog;
     std::pmr::monotonic_buffer_resource arena;
-    try { catalog = fetchCatalog(client, {}, 0ms, arena); }
+    try { catalog = fetchCatalog(clients.source, {}, 0ms, arena); }
     catch (const std::exception& e) {
       output << "Pull failed: " << binding.source << ": " << errorMessage(e) << '\n';
       return false;
@@ -674,13 +718,13 @@ struct ReplicationFollower::Impl {
       CollectionId name{std::string(entry.tenant), std::string(entry.collection)};
       if (!includes(name)) continue;
       auto& state = states[name];
-      observe(state, advertisedCommit(entry), true, std::string(catalog.boot));
+      observe(state, advertisedCommit(entry), entry.manifest_xxh3, true, std::string(catalog.boot));
       state.downloaded = state.reused = 0;
       uint64_t downloaded = 0;
       try {
         if (!entry.available) throw std::runtime_error("source collection unavailable");
         for (unsigned attempt = 0;; attempt++) {
-          try { sync(client, name); break; }
+          try { sync(clients, name); break; }
           catch (const PinGone&) { if (attempt == 2) throw; downloaded += state.downloaded; }
         }
         persistState();
@@ -688,7 +732,7 @@ struct ReplicationFollower::Impl {
         installed++;
         output << name.label() << ' ' << state.serving->token() << " transferred=" << downloaded + state.downloaded << " reused=" << state.reused << '\n';
       } catch (const std::exception& e) {
-        client.reset(); failed++;
+        clients.source.reset(); failed++;
         output << name.label() << ' ' << entry.commit << " transferred=" << downloaded + state.downloaded
                << " reused=" << state.reused << " ERROR: " << errorMessage(e) << '\n';
       }
@@ -700,7 +744,7 @@ struct ReplicationFollower::Impl {
   }
 
   void worker() {
-    Client client(source, stopping.get_token());
+    Clients clients(*this);
     while (!stopping.stop_requested()) {
       CollectionId name;
       uint64_t progress = 0;
@@ -749,18 +793,18 @@ struct ReplicationFollower::Impl {
             api::ReplicationInstalled ack{binding.follower, name.tenant, name.name, token};
             std::string body;
             if (!api::write_json(ack, body)) throw std::runtime_error("failed to serialize acknowledgment");
-            request(client, http::verb::post, "/_replication/installed", body);
+            request(clients.source, http::verb::post, "/_replication/installed", body);
             std::lock_guard lock(mutex);
             if (boot == ackBoot) states[name].acknowledged = serving;
           };
           acknowledge();
-          if (needsSync) sync(client, name);
+          if (needsSync) sync(clients, name);
           acknowledge();
         }
         persistState();
       } catch (const PinGone& e) { error = e.what(); Signal::emit("replicationPinGone"); }
       catch (const std::exception& e) { error = errorMessage(e); }
-      if (!error.empty()) client.reset();
+      if (!error.empty()) clients.source.reset();
       {
         std::lock_guard lock(mutex);
         auto& state = states[name];

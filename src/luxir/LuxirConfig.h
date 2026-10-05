@@ -145,9 +145,13 @@ struct ReplicationConfig {
   std::string source;
   std::string follower_id;
   std::string tenants; // comma-separated; empty subscribes to every tenant
+  // Comma-separated http:// nodes that serve verified file copies, tried in
+  // order before the source; they never decide which commit is current.
+  std::string peers;
   uint64_t max_acknowledgments = 262144; // node-wide follower/collection rows
   int downloads = 2; // node-wide concurrent collection downloads
   std::vector<std::string> tenantFilter() const;
+  std::vector<std::string> peerList() const;
   void validate() const;
 };
 

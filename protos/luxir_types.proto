@@ -1128,6 +1128,9 @@ message ReplicationCatalogEntry {
   bool available = 2;
   string tenant = 3;
   string collection = 4;
+  // xxh3-64 of the exact manifest bytes of `commit`: a manifest fetched from
+  // any source must hash to it.
+  fixed64 manifest_xxh3 = 5;
 }
 message ReplicationInstalled {
   string follower = 1;

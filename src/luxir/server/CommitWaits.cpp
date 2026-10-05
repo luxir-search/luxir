@@ -137,7 +137,7 @@ void CommitWaits::registered(const CollectionId& name, const std::shared_ptr<Col
     {
       std::lock_guard lock(mutex);
       auto& state = collections[name];
-      if (state.collection.lock() != collection) state = {collection, {}, {}};
+      if (state.collection.lock() != collection) state = {collection, {}, 0, {}};
       state.refresh();
       checkLocked(name, ready);
     }

@@ -1873,6 +1873,16 @@ private:
     return result;
   }
 
+  // A 16-digit hexadecimal xxh3-64 digest.
+  static uint64_t parseDigest(std::string_view text) {
+    uint64_t result = 0;
+    auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result, 16);
+    if (text.size() != 16 || error != std::errc() || end != text.data() + text.size()) {
+      throw std::invalid_argument("expected a 16-digit hexadecimal xxh3 digest");
+    }
+    return result;
+  }
+
   static uint64_t replicationNumber(std::string_view text) {
     uint64_t result = 0;
     auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result);
@@ -2097,19 +2107,25 @@ private:
 
   void handleReplicationFile(const std::string& coll, const std::string& name, std::string range, bool head) {
     CommitId id;
+    std::optional<FileDescriptor> identity;
     bool json = false;
     try {
       if (!head) if (auto follower = findParam(urlParams_, "follower")) node_.getReplication().seen(*follower);
       if (!name.empty()) {
+        // A commit names the pinned snapshot; otherwise size and xxh3 name the
+        // file itself, served from whatever current or pinned snapshot holds it.
         auto token = findParam(urlParams_, "commit");
-        id = CommitId::parse(token ? *token : "");
+        auto size = findParam(urlParams_, "size");
+        auto digest = findParam(urlParams_, "xxh3");
+        if (!token && size && digest) identity = FileDescriptor{name, replicationNumber(*size), parseDigest(*digest)};
+        else id = CommitId::parse(token ? *token : "");
       } else if (auto format = findParam(urlParams_, "format")) {
         if (*format != "json") throw std::invalid_argument("snapshot format must be json");
         json = true;
       }
     } catch (const std::exception& e) { respondError(classifyException(e, ErrorKind::INVALID_REQUEST), requestId_, head); return; }
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), coll, tenant = tenant_, name, id, range, head, json, shardPin] {
+    node_.getTaskArena().enqueue([self = shared_from_this(), coll, tenant = tenant_, name, id, identity, range, head, json, shardPin] {
       auto transfer = std::make_shared<ReplicationTransfer>();
       transfer->head = head;
       transfer->json = json;
@@ -2128,6 +2144,10 @@ private:
             if (!api::write_json(info, transfer->rendered)) throw std::runtime_error("cannot render snapshot JSON");
             transfer->data = transfer->rendered;
           } else transfer->data = {(const char*)snapshot->bytes->data(), snapshot->bytes->size()};
+        } else if (identity) {
+          transfer->file = snapshots.openFile(*identity);
+          transfer->data = transfer->file->read();
+          Signal::emit("replicationFileOpenedByIdentity", &transfer->file);
         } else {
           transfer->id = id;
           transfer->file = snapshots.openFile(id, name, &transfer->cancellation);
@@ -2157,7 +2177,7 @@ private:
         response.result(status);
         response.keep_alive(self->keepAlive_);
         response.set(http::field::content_type, transfer->json ? "application/json" : "application/octet-stream");
-        response.set("X-Luxir-Commit", transfer->id.token());
+        if (!transfer->id.incarnation.empty()) response.set("X-Luxir-Commit", transfer->id.token());
         response.set(http::field::accept_ranges, "bytes");
         if (status == http::status::range_not_satisfiable) {
           response.set(http::field::content_range, "bytes */" + std::to_string(transfer->data.size()));

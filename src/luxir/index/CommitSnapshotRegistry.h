@@ -100,6 +100,9 @@ public:
   // never re-enter the registry or perform I/O from a callback.
   std::shared_ptr<const CommitSnapshot> acquire(std::stop_token* cancellation = nullptr);
   std::shared_ptr<InputFile> openFile(const CommitId& id, std::string_view name, std::stop_token* cancellation = nullptr);
+  // A file by identity (name, size and digest) from the current or any pinned
+  // snapshot, without pinning: peers serve verified copies this way.
+  std::shared_ptr<InputFile> openFile(const FileDescriptor& descriptor);
   bool touch(const CommitId& id, uint64_t bytes);
   // Storage pressure skips current snapshots and open transfers. Retention
   // budget eviction can still revoke any pin to enforce its bound.

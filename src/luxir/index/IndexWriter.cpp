@@ -132,7 +132,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     lastSnapshot.store(std::make_shared<const CommitSnapshot>(manifest.bytes,
         Schema::fromStored(*indexInfo.schema, indexInfo.schema_gen),
         CommitId{incarnation, indexInfo.index_gen}, indexInfo.commit_time, filesOf(indexInfo),
-        CommitSnapshot::populatedOf(indexInfo)));
+        CommitSnapshot::populatedOf(indexInfo), CommitSnapshot::digestOf(*manifest.bytes)));
     snapshots.publish(lastSnapshot.load());
     indexGen = indexInfo.index_gen;
     coreGen = indexInfo.core_gen;
@@ -1896,10 +1896,11 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   for (const auto& aux : info.aux_indexes) auxIndexes.push_back(fromWire(aux));
   std::vector<std::byte> serialized;
   if (!api::encode(info, serialized)) throw std::runtime_error("Failed to serialize IndexInfo");
+  auto digest = CommitSnapshot::digestOf(serialized);
 
   auto snapshot = std::make_shared<const CommitSnapshot>(
       std::make_shared<const std::vector<std::byte>>(std::move(serialized)), schema,
-      CommitId{incarnation, info.index_gen}, info.commit_time, filesOf(info), CommitSnapshot::populatedOf(info));
+      CommitId{incarnation, info.index_gen}, info.commit_time, filesOf(info), CommitSnapshot::populatedOf(info), digest);
   std::pmr::monotonic_buffer_resource retirementArena;
   api::IndexInfo obsolete;
   if (previous) obsolete = Manifest::decode(previous->bytes, retirementArena);

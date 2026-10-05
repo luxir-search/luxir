@@ -10,6 +10,7 @@ namespace luxir {
 struct CollectionPublication {
   std::weak_ptr<Collection> collection;
   std::optional<CommitId> commit;
+  uint64_t digest = 0; // of commit's manifest
   std::string error;
 
   void refresh();

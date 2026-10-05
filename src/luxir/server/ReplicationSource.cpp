@@ -80,7 +80,7 @@ void ReplicationSource::registered(const CollectionId& name, const std::shared_p
     {
       std::lock_guard lock(mutex);
       auto& state = collections[name];
-      if (state.collection.lock() != collection) state = {collection, {}, {}};
+      if (state.collection.lock() != collection) state = {collection, {}, 0, {}};
       state.refresh();
       pruneLocked(name);
       ready = changedLocked(name.tenant);
@@ -206,7 +206,10 @@ api::ReplicationCatalog ReplicationSource::catalog(std::pmr::memory_resource& ar
     entry.tenant = api::build::arenaStr(arena, id.tenant);
     entry.collection = api::build::arenaStr(arena, id.name);
     entry.available = state.error.empty();
-    if (state.commit) entry.commit = api::build::arenaStr(arena, state.commit->token());
+    if (state.commit) {
+      entry.commit = api::build::arenaStr(arena, state.commit->token());
+      entry.manifest_xxh3 = state.digest;
+    }
   }
   return response;
 }

@@ -11,6 +11,9 @@ void CollectionPublication::refresh() {
   auto shard = owner->getShard();
   auto snapshot = shard ? shard->getSnapshots().snapshot() : nullptr;
   if (snapshot && (!commit || snapshot->id.incarnation != commit->incarnation
-      || snapshot->id.index_gen >= commit->index_gen)) commit = snapshot->id;
+      || snapshot->id.index_gen >= commit->index_gen)) {
+    commit = snapshot->id;
+    digest = snapshot->digest;
+  }
 }
 }

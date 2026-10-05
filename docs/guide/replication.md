@@ -18,6 +18,16 @@ Use `--replication.tenants alpha,beta` to follow only those tenants. The subscri
 is fixed for the process; restart to change it. An empty setting follows all tenants.
 Tenant names use the same lowercase naming rules as collections; empty elements
 inside a nonempty list are rejected.
+
+`--replication.peers http://reader2:9400,http://reader3:9400` lets a follower
+fetch files from other nodes before the source, offloading the source's
+bandwidth. Peers serve files by identity from their current or pinned snapshots;
+they are tried in order, once each, and a transfer resumes at the same offset
+on the next peer or the source. Every file is verified against the manifest
+digest, and a copy that fails verification is fetched again from the source.
+Peers never decide which commit is current or that a collection is gone: the
+source's catalog does, and it announces each commit with the xxh3 digest of
+its manifest, which the follower checks.
 Start it with an empty directory or an existing follower directory. Repointing
 `--replicate-from` to another source reuses files whose name, size and xxh3 digest
 match, including across incarnations. An existing data directory must be a
@@ -181,6 +191,7 @@ All replication settings use `--replication.` (configuration keys use underscore
 | `source` | empty | Source HTTP URL; `--replicate-from` is shorthand |
 | `follower-id` | generated | Persisted FS follower identity |
 | `tenants` | empty (all) | Comma-separated tenant subscription; immutable until restart |
+| `peers` | empty | Comma-separated nodes serving file copies, tried before the source |
 | `max-acknowledgments` | 262144 | Node-wide follower/collection acknowledgment row budget |
 | `downloads` | 2 | Concurrent collection transfers |
 | `follower-timeout-ms` | 90000 | Live-follower window; watches are clamped to one third |
@@ -205,9 +216,10 @@ last source URL and discovery/recovery state; it does not bind the source URL.
 
 | Endpoint | Contract |
 |---|---|
-| `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Full catalog for the subscription (`tenant=alpha&tenant=beta`, omit for all), one `{tenant, collection, commit, available}` entry per collection in `{boot, cursor, collections}`; echo the opaque node-wide cursor. Publications in other tenants neither wake the watch nor force an immediate response. Foreign-boot, malformed and future cursors return immediately. Empty/invalid tenant parameters are rejected. Requested timeout is clamped to one third of the source follower timeout; followers request one third of their own. |
+| `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Full catalog for the subscription (`tenant=alpha&tenant=beta`, omit for all), one `{tenant, collection, commit, manifest_xxh3, available}` entry per collection in `{boot, cursor, collections}`; echo the opaque node-wide cursor. Publications in other tenants neither wake the watch nor force an immediate response. Foreign-boot, malformed and future cursors return immediately. Empty/invalid tenant parameters are rejected. Requested timeout is clamped to one third of the source follower timeout; followers request one third of their own. |
 | `GET /tenants/TENANT/collections/COLLECTION/_snapshot` | Pins the current snapshot; binary manifest and `X-Luxir-Commit`. Add `?format=json` to inspect files/sizes/digests. HEAD has no side effects. |
 | `GET /tenants/TENANT/collections/COLLECTION/_snapshot/files/NAME?commit=TOKEN` | File from a pin; optional single byte Range (206/416), HEAD supported. Malformed/multiple ranges return full 200. Missing membership: 404 `file_not_in_snapshot`; expired pin: 410 `snapshot_expired`. |
+| `GET /tenants/TENANT/collections/COLLECTION/_snapshot/files/NAME?size=BYTES&xxh3=HEX16` | The file with exactly that identity, from the current or any pinned snapshot, without pinning; Range as above. Otherwise 404 `file_not_held`. Peers serve followers this way. |
 | `POST /_replication/installed` | JSON `{follower, tenant, collection, commit}` acknowledges a serving snapshot. |
 | `GET /_replication/status` | Status described above. |
 

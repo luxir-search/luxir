@@ -353,6 +353,7 @@ struct FollowerStatus {
   std::optional<uint64_t> lag;
 };
 struct ReplicationCatalogEntry {
+  uint64_t manifest_xxh3 = 0;
   std::string_view commit;
   std::string_view tenant;
   std::string_view collection;

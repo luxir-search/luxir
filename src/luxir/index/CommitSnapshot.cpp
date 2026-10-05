@@ -28,7 +28,12 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshot::fromBytes(Bytes bytes) {
   auto info = Manifest::decode(bytes, arena);
   return std::make_shared<const CommitSnapshot>(std::move(bytes),
       Schema::fromStored(*info.schema, info.schema_gen),
-      CommitId{std::string(info.incarnation), info.index_gen}, info.commit_time, filesOf(info), populatedOf(info));
+      CommitId{std::string(info.incarnation), info.index_gen}, info.commit_time, filesOf(info), populatedOf(info),
+      digestOf(*bytes));
+}
+
+uint64_t CommitSnapshot::digestOf(const std::vector<std::byte>& bytes) {
+  return XXH3_64bits(bytes.data(), bytes.size());
 }
 
 bool CommitSnapshot::populatedOf(const api::IndexInfo& info) {

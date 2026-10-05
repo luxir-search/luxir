@@ -1563,4 +1563,39 @@ TEST_F(ReplicationFollowerTest, invalidCatalogIsRejectedBeforeApplyingAnyEntry) 
   }
 }
 
+TEST_F(ReplicationFollowerTest, followersFetchFilesFromPeersAndVerifyAnnouncements) {
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  std::atomic<int> fromSource{0}, fromPeer{0};
+  Signal::listen("replicationFileOpened", [&](void*, void*, void*) -> void* { fromSource++; return nullptr; });
+  Signal::listen("replicationFileOpenedByIdentity", [&](void*, void*, void*) -> void* { fromPeer++; return nullptr; });
+  auto unlisten = scope_guard([] {
+    Signal::unlisten("replicationFileOpened"); Signal::unlisten("replicationFileOpenedByIdentity");
+  });
+  auto second = followerConfig;
+  second.store.data_dir = (path / "second").string();
+  // A dead peer is skipped; the live one serves every file.
+  second.replication.peers = "http://127.0.0.1:1,http://127.0.0.1:" + std::to_string(followerServer->getPort());
+  LuxirNode peerFed(second);
+  auto target = source->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
+  ASSERT_TRUE(until([&] {
+    try { return peerFed.getCollection("main")->getShard()->getSnapshots().snapshot()->id == target; }
+    catch (const CollectionResolutionError&) { return false; }
+  }));
+  EXPECT_EQ(2, peerFed.getCollection("main")->getReaderManager().getReader()->liveDocs());
+  EXPECT_GT(fromPeer.load(), 0);
+  EXPECT_EQ(0, fromSource.load());
+
+  // A manifest that does not match its announcement is never installed.
+  Signal::listen("replicationCatalogReceived", [](void* catalog, void*, void*) -> void* {
+    for (auto& entry : ((api::ReplicationCatalog*)catalog)->collections) const_cast<api::ReplicationCatalogEntry&>(entry).manifest_xxh3 ^= 1;
+    return nullptr;
+  });
+  auto untamper = scope_guard([] { Signal::unlisten("replicationCatalogReceived"); });
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "c"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(until([&] { return status().find("manifest does not match its announcement") != std::string::npos; })) << status();
+  EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+}
+
 }

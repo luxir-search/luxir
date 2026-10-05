@@ -3,6 +3,7 @@
 
 #include "luxir/server/ReplicationSource.h"
 #include <future>
+#include <format>
 #include <latch>
 #include <filesystem>
 #include "test/LuxirTest.h"
@@ -779,6 +780,25 @@ TEST_F(ReplicationHttpTest, acknowledgmentBudgetIsIndependentOfFollowerCount) {
   time += 90s;
   EXPECT_NO_THROW(ack("after-expiry", first));
   EXPECT_EQ(1u, source.status().size());
+}
+
+TEST_F(ReplicationHttpTest, filesAndAnnouncementsCarryIdentity) {
+  ASSERT_TRUE(h->index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  auto pinned = snapshot();
+  // A generic JSON number would round the 64-bit digest; match its text.
+  auto announced = get("/_replication/watch?timeout_ms=0").body();
+  EXPECT_NE(std::string::npos, announced.find("\"manifest_xxh3\":" + std::to_string(pinned->digest))) << announced;
+  const auto& file = pinned->files.front();
+  auto byIdentity = [&](uint64_t digest) {
+    return "/tenants/default/collections/main/_snapshot/files/" + file.name + "?size=" + std::to_string(file.size)
+        + "&xxh3=" + std::format("{:016x}", digest);
+  };
+  auto direct = get(byIdentity(file.xxh3));
+  ASSERT_EQ(200, direct.result_int()) << direct.body();
+  EXPECT_EQ(get(fileUrl(*pinned, file.name)).body(), direct.body());
+  EXPECT_TRUE(direct["X-Luxir-Commit"].empty());
+  EXPECT_EQ(404, get(byIdentity(file.xxh3 + 1)).result_int());
+  EXPECT_EQ(400, get("/tenants/default/collections/main/_snapshot/files/" + file.name + "?size=1&xxh3=zz").result_int());
 }
 
 }

@@ -161,6 +161,25 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, 
   return std::shared_ptr<InputFile>(std::move(owner), file.get());
 }
 
+std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const FileDescriptor& descriptor) {
+  // Joined with retirement, so a referenced file cannot be unlinked between
+  // the check and the open; once open, its bytes outlive an unlink.
+  std::lock_guard retirementLock(retirementMutex);
+  {
+    std::lock_guard lock(mutex);
+    auto references = [&](const CommitSnapshot& snapshot) {
+      return std::ranges::any_of(snapshot.files, [&](const auto& file) { return file == descriptor; });
+    };
+    auto published = snapshot();
+    bool held = !closed && ((published && references(*published))
+        || std::ranges::any_of(pins, [&](const auto& pin) { return references(*pin.second.snapshot); }));
+    if (!held) throw ApiError(ErrorKind::NOT_FOUND, "file_not_held", "no current or pinned snapshot holds this file");
+  }
+  auto file = dir.openFile(descriptor.name, true);
+  if (!file) throw std::runtime_error("held snapshot file is missing");
+  return file;
+}
+
 bool CommitSnapshotRegistry::touch(const CommitId& id, uint64_t bytes) {
   std::lock_guard lock(mutex);
   auto it = pins.find(id);

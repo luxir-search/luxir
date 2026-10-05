@@ -28,8 +28,10 @@ struct CommitSnapshot {
   uint64_t commitTime;
   std::vector<FileDescriptor> files;
   bool populated; // some segment has a live document
+  uint64_t digest; // xxh3-64 of `bytes`: announcements bind a token to it
 
   static std::shared_ptr<const CommitSnapshot> fromBytes(Bytes bytes);
+  static uint64_t digestOf(const std::vector<std::byte>& bytes);
   static bool populatedOf(const api::IndexInfo& info);
 };
 

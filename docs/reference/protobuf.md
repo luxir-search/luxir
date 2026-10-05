@@ -1289,6 +1289,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.replicationcatalogentry.available"></a>[`available`](#field-luxir.replicationcatalogentry.available) | 2 | `bool` | singular |  |
 | <a id="field-luxir.replicationcatalogentry.tenant"></a>[`tenant`](#field-luxir.replicationcatalogentry.tenant) | 3 | `string` | singular |  |
 | <a id="field-luxir.replicationcatalogentry.collection"></a>[`collection`](#field-luxir.replicationcatalogentry.collection) | 4 | `string` | singular |  |
+| <a id="field-luxir.replicationcatalogentry.manifest_xxh3"></a>[`manifest_xxh3`](#field-luxir.replicationcatalogentry.manifest_xxh3) | 5 | `fixed64` | singular | xxh3-64 of the exact manifest bytes of \`commit\`: a manifest fetched from any source must hash to it. |
 
 <a id="message-luxir.replicationcollectionstatus"></a>
 
