@@ -122,9 +122,9 @@ public:
 
   // The schema mutation transaction: applies `def` to the current schema
   // (SET) or replaces it (REPLACE_ALL), persists, swaps, and returns the
-  // installed schema.  All external schema mutation (gRPC, HTTP) goes through
+  // published snapshot. All external schema mutation (gRPC, HTTP) goes through
   // here; concurrent calls serialize per collection.
-  std::shared_ptr<Schema> updateSchema(const luxir::api::SchemaDef& def,
+  std::shared_ptr<const CommitSnapshot> updateSchema(const luxir::api::SchemaDef& def,
                                        luxir::api::SchemaRequest_::Mode mode);
 
   // Publishes a copy of this schema over the last committed physical snapshot.

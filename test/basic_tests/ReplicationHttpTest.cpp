@@ -1,7 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "luxir/server/ReplicationCatalog.h"
+#include "luxir/server/ReplicationSource.h"
 #include <future>
 #include <latch>
 #include <filesystem>
@@ -267,10 +267,10 @@ TEST_F(ReplicationHttpTest, fullAcknowledgmentTableKeepsExistingFollowers) {
   auto body = [&](int follower) {
     return "{\"follower\":\"f" + std::to_string(follower) + "\",\"collection\":\"main\",\"commit\":\"" + current->id.token() + "\"}";
   };
-  for (int i = 0; i < 4096; i++) node->getReplication().installed(*node, body(i));
+  for (int i = 0; i < 4096; i++) node->getReplication().installed({"f" + std::to_string(i), "main", current->id.token()});
   EXPECT_EQ(429, httpRequest(server->getPort(), http::verb::post, "/_replication/installed", body(4096)).result_int());
   EXPECT_EQ(200, httpRequest(server->getPort(), http::verb::post, "/_replication/installed", body(0)).result_int());
-  EXPECT_EQ(4096u, node->getReplication().stats(*node).size());
+  EXPECT_EQ(4096u, node->getReplication().status().size());
 }
 
 TEST_F(ReplicationHttpTest, slowDownloadSurvivesMerge) {
@@ -367,7 +367,7 @@ TEST_F(ReplicationHttpTest, installedRejectsInvalidAcknowledgments) {
   EXPECT_EQ(400, post("f", "main", "foreign:1").result_int());
   id.index_gen++;
   EXPECT_EQ(400, post("f", "main", id.token()).result_int());
-  EXPECT_TRUE(node->getReplication().stats(*node).empty());
+  EXPECT_TRUE(node->getReplication().status().empty());
 }
 
 TEST_F(ReplicationHttpTest, nameDeletionSurvivesIncarnationChange) {
@@ -384,26 +384,26 @@ TEST_F(ReplicationHttpTest, nameDeletionSurvivesIncarnationChange) {
 }
 
 TEST_F(ReplicationHttpTest, acknowledgmentsExpireAndWatchRenewsLiveness) {
-  auto time = ReplicationCatalog::Clock::now();
-  ReplicationCatalog catalog(90s, [&] { return time; });
+  auto time = ReplicationSource::Clock::now();
+  ReplicationSource catalog(90s, [&] { return time; });
+  catalog.registered("main", node->getCollection("main"));
   auto id = snapshot()->id;
-  auto body = [&](int follower) {
-    return "{\"follower\":\"f" + std::to_string(follower) + "\",\"collection\":\"main\",\"commit\":\"" + id.token() + "\"}";
-  };
-  for (int i = 0; i < 4096; i++) catalog.installed(*node, body(i));
+  for (int i = 0; i < 4096; i++) catalog.installed({"f" + std::to_string(i), "main", id.token()});
   time += 60s;
   catalog.watch({}, "f0", [] {});
   time += 30s;
-  catalog.installed(*node, body(4096));
-  EXPECT_EQ(2u, catalog.stats(*node).size());
-  catalog.remove("main");
-  for (const auto& row : catalog.stats(*node)) EXPECT_TRUE(row.collection.empty());
-  catalog.installed(*node, body(0));
+  catalog.installed({"f4096", "main", id.token()});
+  EXPECT_EQ(2u, catalog.status().size());
+  catalog.removed("main");
+  for (const auto& row : catalog.status()) EXPECT_TRUE(row.collection.empty());
+  catalog.registered("main", node->getCollection("main"));
+  catalog.installed({"f0", "main", id.token()});
   h->getIndexWriter()->testDeleteAllData();
-  for (const auto& row : catalog.stats(*node)) EXPECT_TRUE(row.collection.empty());
+  catalog.updated("main", h->collection());
+  for (const auto& row : catalog.status()) EXPECT_TRUE(row.collection.empty());
   auto response = get("/_replication/watch?follower=watch-only&timeout_ms=0");
   EXPECT_EQ(200, response.result_int());
-  auto live = node->getReplication().stats(*node);
+  auto live = node->getReplication().status();
   ASSERT_EQ(1u, live.size());
   EXPECT_EQ("watch-only", live[0].follower);
 }
@@ -484,15 +484,15 @@ TEST_F(ReplicationHttpTest, headAndMonotonicAcknowledgment) {
   ASSERT_TRUE(h->index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
   auto current = registry.snapshot()->id;
   auto ack = [&](const CommitId& id) {
-    node->getReplication().installed(*node, "{\"follower\":\"f\",\"collection\":\"main\",\"commit\":\"" + id.token() + "\"}");
+    node->getReplication().installed({"f", "main", id.token()});
   };
   ack(current);
   ack(old);
-  EXPECT_EQ(current, node->getReplication().stats(*node)[0].commit);
+  EXPECT_EQ(current, node->getReplication().status()[0].commit);
   EXPECT_EQ(200, get("/_replication/main/snapshot?follower=downloader").result_int());
   auto snap = registry.snapshot();
   EXPECT_EQ(200, get(fileUrl(*snap, snap->files.front().name) + "&follower=file-reader").result_int());
-  EXPECT_EQ(3u, node->getReplication().stats(*node).size());
+  EXPECT_EQ(3u, node->getReplication().status().size());
 }
 
 
@@ -543,6 +543,135 @@ TEST_F(ReplicationHttpTest, ordinaryResponsesDoNotArmWriteDeadline) {
   request("/health");
   request("/collections/main/_search?get_number=true");
   EXPECT_EQ(fileDeadlines, deadlines.load());
+}
+
+TEST_F(ReplicationHttpTest, emptyReplicaRequirementIsRejectedBeforeAdmission) {
+  auto before = snapshot()->id;
+  auto response = httpRequest(server->getPort(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"not-admitted"}],"commit":{"wait_for_replicas":{}}})");
+  EXPECT_EQ(400, response.result_int()) << response.body();
+  EXPECT_EQ(before, snapshot()->id);
+  EXPECT_EQ(200, get("/health").result_int());
+}
+
+TEST_F(ReplicationHttpTest, standaloneWaitRetriesAnExistingToken) {
+  auto token = snapshot()->id.token();
+  auto wait = [&](std::string requirement) {
+    auto response = httpRequest(server->getPort(), http::verb::post,
+        "/collections/main/_wait_for_replicas?wait_for_replicas=" + requirement + "&wait_for_replicas_timeout_ms=0",
+        "{\"commit\":\"" + token + "\"}");
+    EXPECT_EQ(200, response.result_int()) << response.body();
+    Json result; EXPECT_FALSE(glz::read_json(result, response.body()));
+    return result;
+  };
+  auto first = wait("1");
+  EXPECT_EQ("timed_out", first["replicas"]["outcome"].get<std::string>());
+  node->getReplication().installed({"f", "main", token});
+  auto second = wait("1");
+  EXPECT_EQ(token, second["commit"].get<std::string>());
+  EXPECT_EQ("satisfied", second["replicas"]["outcome"].get<std::string>());
+  EXPECT_EQ("satisfied", wait("all")["replicas"]["outcome"].get<std::string>());
+  EXPECT_EQ(token, snapshot()->id.token());
+}
+
+TEST_F(ReplicationHttpTest, createSchemaAndSearchReturnPublicationTokens) {
+  auto create = httpRequest(server->getPort(), http::verb::post, "/collections/_create", R"({"name":"tokens"})");
+  ASSERT_EQ(200, create.result_int());
+  Json result; ASSERT_FALSE(glz::read_json(result, create.body()));
+  auto collection = node->getCollection("tokens");
+  auto initial = collection->getShard()->requireIndexWriter()->initialCommit();
+  EXPECT_EQ(initial.token(), result["commit"].get<std::string>());
+  auto schema = httpRequest(server->getPort(), http::verb::post, "/collections/tokens/_schema", R"({"fields":{"n_i":{"type":"int"}}})");
+  ASSERT_EQ(200, schema.result_int()) << schema.body();
+  ASSERT_FALSE(glz::read_json(result, schema.body()));
+  auto published = collection->getShard()->getSnapshots().snapshot()->id;
+  EXPECT_EQ(published.token(), result["commit"].get<std::string>());
+  EXPECT_NE(initial, published);
+  EXPECT_EQ(initial, collection->getShard()->requireIndexWriter()->initialCommit());
+  auto reader = collection->getReaderManager().getReader(0);
+  CollectionHelper helper(*node, "tokens");
+  ASSERT_TRUE(helper.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success);
+  auto search = get("/collections/tokens/_search?freshness_ms=60000");
+  ASSERT_EQ(200, search.result_int()) << search.body();
+  ASSERT_FALSE(glz::read_json(result, search.body()));
+  EXPECT_EQ(published.token(), result["commit"].get<std::string>());
+  EXPECT_NE(published, collection->getShard()->getSnapshots().snapshot()->id);
+}
+
+TEST_F(ReplicationHttpTest, updateBodiesAreReleasedBeforeReplicaWait) {
+  for (int mode = 0; mode < 3; mode++) {
+    std::atomic<int> bodies{0}, batches{0}, controls{0};
+    Signal::listen("httpUpdateBodyDestroyed", [&](void*, void*, void*) -> void* { bodies++; return nullptr; });
+    Signal::listen("httpBatchBodyDestroyed", [&](void*, void*, void*) -> void* { batches++; return nullptr; });
+    Signal::listen("httpControlBodyDestroyed", [&](void*, void*, void*) -> void* { controls++; return nullptr; });
+    std::promise<void> parked;
+    Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* {
+      if (mode == 1) { EXPECT_GT(batches.load(), 0); EXPECT_GT(controls.load(), 0); }
+      else EXPECT_GT(bodies.load(), 0);
+      parked.set_value(); return nullptr;
+    });
+    auto response = std::async(std::launch::async, [&] {
+      if (mode == 0) return httpRequest(server->getPort(), http::verb::post, "/collections/main/_update",
+          R"({"return_ids":true,"docs":[{"id":"body"}],"commit":{"wait_for_replicas":{"count":1}}})");
+      if (mode == 1) return httpRequest(server->getPort(), http::verb::post, "/collections/main/_update",
+          "{\"_update_\":{\"return_ids\":true,\"docs\":[{\"id\":\"body\"}],\"commit\":{\"wait_for_replicas\":{\"count\":1}}}}\n", "application/x-ndjson");
+      return httpRequest(server->getPort(), http::verb::post, "/collections/main/_update?commit=true&wait_for_replicas=1",
+          "{\"id\":\"body\"}\n", "application/x-ndjson");
+    });
+    ASSERT_EQ(std::future_status::ready, parked.get_future().wait_for(3s));
+    EXPECT_EQ(std::future_status::timeout, response.wait_for(0ms));
+    node->getReplication().installed({"f", "main", snapshot()->id.token()});
+    auto result = response.get();
+    EXPECT_EQ(200, result.result_int()) << result.body();
+    EXPECT_NE(std::string::npos, result.body().find("satisfied"));
+    Signal::clear();
+  }
+}
+
+TEST_F(ReplicationHttpTest, resetStandaloneWaitIsCancelled) {
+  std::promise<void> parked;
+  std::promise<api::ReplicaResult> completed;
+  Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* { parked.set_value(); return nullptr; });
+  Signal::listen("replicaWaitCompleted", [&](void* value, void*, void*) -> void* {
+    completed.set_value(*(api::ReplicaResult*)value); return nullptr;
+  });
+  net::io_context io;
+  tcp::socket socket(io);
+  socket.connect({net::ip::make_address("127.0.0.1"), (unsigned short)server->getPort()});
+  http::request<http::string_body> request(http::verb::post,
+      "/collections/main/_wait_for_replicas?wait_for_replicas=1&wait_for_replicas_timeout_ms=600000", 11);
+  request.body() = "{\"commit\":\"" + snapshot()->id.token() + "\"}";
+  request.prepare_payload();
+  http::write(socket, request);
+  ASSERT_EQ(std::future_status::ready, parked.get_future().wait_for(3s));
+  socket.set_option(net::socket_base::linger(true, 0));
+  socket.close();
+  auto result = completed.get_future();
+  ASSERT_EQ(std::future_status::ready, result.wait_for(3s));
+  EXPECT_EQ(api::ReplicaResult::Outcome::CANCELLED, result.get().outcome);
+}
+
+TEST_F(ReplicationHttpTest, halfClosedClientStillReceivesSatisfiedWait) {
+  std::promise<void> parked;
+  Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* { parked.set_value(); return nullptr; });
+  auto token = snapshot()->id.token();
+  net::io_context io;
+  tcp::socket socket(io);
+  socket.connect({net::ip::make_address("127.0.0.1"), (unsigned short)server->getPort()});
+  http::request<http::string_body> request(http::verb::post,
+      "/collections/main/_wait_for_replicas?wait_for_replicas=1", 11);
+  request.body() = "{\"commit\":\"" + token + "\"}";
+  request.prepare_payload();
+  http::write(socket, request);
+  socket.shutdown(tcp::socket::shutdown_send);
+  ASSERT_EQ(std::future_status::ready, parked.get_future().wait_for(3s));
+  node->getReplication().installed({"f", "main", token});
+  beast::flat_buffer buffer;
+  http::response<http::string_body> response;
+  http::read(socket, buffer, response);
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  Json result; ASSERT_FALSE(glz::read_json(result, response.body()));
+  EXPECT_EQ("satisfied", result["replicas"]["outcome"].get<std::string>());
 }
 
 }

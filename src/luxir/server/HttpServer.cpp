@@ -1,7 +1,9 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "luxir/server/ReplicationCatalog.h"
+#include "luxir/server/ReplicationSource.h"
+#include "luxir/server/CommitWaits.h"
+#include <boost/asio/bind_cancellation_slot.hpp>
 #include "luxir/server/ReplicationFollower.h"
 #include "HttpServer.h"
 
@@ -135,6 +137,7 @@ enum class HttpSearchFormat {
 };
 
 struct HttpUpdateState {
+  ~HttpUpdateState() { Signal::emit("httpUpdateBodyDestroyed"); }
   std::pmr::monotonic_buffer_resource resource;
   HttpUpdateReqProto proto;  // JSON readers copy update strings into resource
 };
@@ -145,6 +148,7 @@ struct HttpStreamWriterTarget {
 };
 
 struct HttpStreamControlRequest {
+  ~HttpStreamControlRequest() { Signal::emit("httpControlBodyDestroyed"); }
   std::pmr::monotonic_buffer_resource resource;
   HttpUpdateReqProto proto;  // JSON readers copy update strings into resource
   std::size_t sourceBytes = 0;
@@ -168,6 +172,7 @@ struct HttpStreamAccumError {
 };
 
 struct HttpStreamBatchState {
+  ~HttpStreamBatchState() { Signal::emit("httpBatchBodyDestroyed"); }
   std::pmr::monotonic_buffer_resource resource;
   HttpUpdateReqProto proto;  // non-owning; backed by `resource`
   luxir::api::build::SpanBuilder<luxir::api::Map> docs;
@@ -252,7 +257,7 @@ struct UpdateUrlParams {
   // commits every writer it touched at EOF.
   bool commit = false;
   std::string waitForReplicas;
-  std::optional<uint64_t> replicationTimeoutMs;
+  std::optional<uint64_t> waitForReplicasTimeoutMs;
 };
 
 struct HttpStreamUpdateState {
@@ -370,6 +375,8 @@ public:
 class HttpSession : public std::enable_shared_from_this<HttpSession> {
 public:
   std::stop_source waitCancellation;
+  net::cancellation_signal waitDisconnect_;
+  uint64_t waitDisconnectEpoch_ = 0;
 
   HttpSession(std::shared_ptr<HttpIoShard> shard, tcp::socket&& sock, LuxirNode& node,
               std::shared_ptr<HttpSessionRegistry> registry, int64_t streamBufferBytes)
@@ -524,7 +531,7 @@ private:
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
     NONE, HEALTH, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
-    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED
+    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED, WAIT_FOR_REPLICAS
   };
 
   struct RouteMatch {
@@ -644,62 +651,37 @@ private:
 
     void done(IndexWriter& iw) noexcept override {
       unused(iw);
-      auto self = shared_from_this();
-      complete(session_->node_, [self] { self->deliver(); }, session_->waitCancellation.get_token());
-    }
-
-    void deliver() noexcept {
       try {
-        try {
-          auto* resp = finishResponse();
-          result_.status = resp->status;
-          result_.updateVersion = resp->update_version;
-          result_.replicas = resp->replicas;
-          if (!resp->commit.empty()) result_.commit = CommitId::parse(resp->commit);
-          if (resp->error) result_.error = luxir::api::build::errorInfo(*resp->error);
-          result_.ids.reserve(resp->ids.size());
-          for (std::string_view id : resp->ids) result_.ids.emplace_back(id);
-          result_.errors.reserve(resp->errors.size());
-          for (const auto& e : resp->errors) {
-            result_.errors.push_back({std::string(e.id),
-                                      e.error ? luxir::api::build::errorInfo(*e.error)
-                                              : ErrorInfo::of(ErrorKind::INTERNAL,
-                                                              "document error without detail"),
-                                      e.index});
-          }
-        } catch (...) {
-          result_.failed = true;
-          result_.error = currentExceptionInfo(ErrorKind::INTERNAL);
-        }
-
-        auto keepAlive = shared_from_this();
-        auto batchGuard = batch_.lock();
-        assert(batchGuard != nullptr);
-        // post still allocates handler storage.  If that allocation fails, the
-        // outer catch protects the shared update graph, but this connection
-        // loses its completion and remains pinned until bounded-drain recovery
-        // is added.
+        auto completed = takeCompletion(session_->node_);
         net::post(session_->stream_.get_executor(),
-            [session = session_, state = state_, ordinal = ordinal_,
-             keepAlive = std::move(keepAlive), batchGuard,
-             result = std::move(result_)]() mutable {
-              session->onStreamBatchDone(state, ordinal, std::move(result));
-              unused(keepAlive);
-              unused(batchGuard);
+            [session = session_, state = state_, ordinal = ordinal_, result = std::move(result_), completed]() mutable {
+              auto entry = state->inFlightBatches.find(ordinal);
+              assert(entry != state->inFlightBatches.end());
+              // Preserve the admission slot until visibility completion, but free
+              // the decoded body and message before registering the wait.
+              if (state->resetGroupAfterBatch && entry->second->requestOwner == state->group.request)
+                state->group.request.reset();
+              entry->second.reset();
+              if (completed->wait) session->watchWaitDisconnect();
+              completed->await(session->node_, [session, state, ordinal, waiting = completed->wait.has_value(), result = std::move(result)](auto response) mutable {
+                const auto& resp = response->response;
+                try {
+                  result.status = resp.status;
+                  result.updateVersion = resp.update_version;
+                  result.replicas = resp.replicas;
+                  result.commit = response->commit;
+                  if (resp.error) result.error = api::build::errorInfo(*resp.error);
+                  for (auto id : resp.ids) result.ids.emplace_back(id);
+                  for (const auto& e : resp.errors) result.errors.push_back({std::string(e.id),
+                      e.error ? api::build::errorInfo(*e.error) : ErrorInfo::of(ErrorKind::INTERNAL, "document error without detail"), e.index});
+                } catch (...) { result.failed = true; result.error = currentExceptionInfo(ErrorKind::INTERNAL); }
+                net::post(session->stream_.get_executor(), [session, state, ordinal, waiting, result = std::move(result)]() mutable {
+                  if (waiting) session->stopWaitDisconnect();
+                  session->onStreamBatchDone(state, ordinal, std::move(result));
+                });
+              }, session->waitCancellation.get_token());
             });
-      } catch (const std::exception& e) {
-        try {
-          LOG_ERROR("StreamingUpdateMessage::done completion handoff failed: msg={} "
-                    "ordinal={} exception={}", (void*)this, ordinal_, e.what());
-        } catch (...) {
-        }
-      } catch (...) {
-        try {
-          LOG_ERROR("StreamingUpdateMessage::done completion handoff failed: msg={} "
-                    "ordinal={} unknown exception", (void*)this, ordinal_);
-        } catch (...) {
-        }
-      }
+      } catch (...) { LOG_ERROR("Streaming update completion handoff failed"); }
     }
   };
 
@@ -1201,6 +1183,8 @@ private:
       m.route = Route::COLLECTION_CREATE; m.allow = "POST, PUT";
     } else if (target == "/collections/_delete") {
       m.route = Route::COLLECTION_DELETE; m.allow = "POST";
+    } else if (parseCollectionPath(target, "/_wait_for_replicas", m.coll)) {
+      m.route = Route::WAIT_FOR_REPLICAS; m.allow = "POST";
     } else if (parseSearchPath(target, m.coll)) {
       m.route = Route::SEARCH; m.allow = "GET, POST";
     } else if (parseUpdatePath(target, m.coll)) {
@@ -1228,7 +1212,7 @@ private:
       return m;
     }
     bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE ||
-                           m.route == Route::STATS || m.route == Route::SCHEMA;
+                           m.route == Route::STATS || m.route == Route::SCHEMA || m.route == Route::WAIT_FOR_REPLICAS;
     m.emptyCollection = collectionRoute && m.coll.empty() && target.starts_with("/collections/");
     return m;
   }
@@ -1277,7 +1261,7 @@ private:
         std::pmr::monotonic_buffer_resource arena;
         api::ReplicationStatus status;
         if (auto follower = node_.getFollower()) follower->stats(status, arena);
-        auto followers = node_.getReplication().stats(node_);
+        auto followers = node_.getReplication().status();
         auto* rows = api::build::allocArray(status.followers, followers.size(), arena);
         for (size_t i = 0; i < followers.size(); i++) {
           const auto& src = followers[i];
@@ -1295,6 +1279,7 @@ private:
         handleReplicationFile(coll, match.file, req.count(http::field::range) == 1 ? std::string(req[http::field::range]) : std::string(),
                               req.method() == http::verb::head); break;
       case Route::REPLICATION_INSTALLED: handleReplicationInstalled(std::move(req.body())); break;
+      case Route::WAIT_FOR_REPLICAS: handleWaitForReplicas(req.body(), coll); break;
       case Route::HEALTH:
         respondJson(http::status::ok, R"({"status":"ok"})");
         break;
@@ -1347,7 +1332,7 @@ private:
         break;
       }
       case Route::UPDATE:
-        handleUpdate(req.body(), coll, updateUrl_);
+        handleUpdate(std::move(req.body()), coll, updateUrl_);
         break;
       case Route::STATS: {
         bool includeSegments = false;
@@ -1555,7 +1540,7 @@ private:
     engine.dispatch(*sreq, sreq->proto.max_parallel);
   }
 
-  void handleUpdate(const std::string& body, const std::string& coll,
+  void handleUpdate(std::string body, const std::string& coll,
                     const UpdateUrlParams& url) {
     auto state = std::make_shared<HttpUpdateState>();
     try {
@@ -1576,8 +1561,8 @@ private:
       if (url.commit) {
         if (!state->proto.commit) state->proto.commit.emplace();
         state->proto.commit->commit_within_ms = 0;
-        if (!url.waitForReplicas.empty()) state->proto.commit->wait_for_replicas = api::build::arenaStr(state->resource, url.waitForReplicas);
-        if (url.replicationTimeoutMs) state->proto.commit->replication_timeout_ms = url.replicationTimeoutMs;
+        if (!url.waitForReplicas.empty()) state->proto.commit->wait_for_replicas = replicaRequirement(url.waitForReplicas);
+        if (url.waitForReplicasTimeoutMs) state->proto.commit->wait_for_replicas_timeout_ms = url.waitForReplicasTimeoutMs;
       }
       requestId_ = std::string(state->proto.request_id);
     } catch (const std::exception& e) {
@@ -1585,41 +1570,50 @@ private:
       return;
     }
 
+    std::string{}.swap(body); // Decoded request strings live in state->resource.
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin] {
-      class Update final : public ProtoUpdateMessage {
-        std::shared_ptr<HttpSession> session;
-        std::shared_ptr<HttpUpdateState> state;
-        std::shared_ptr<ShardPin> pin;
-      public:
-        Update(std::shared_ptr<HttpSession> session, std::shared_ptr<HttpUpdateState> state, std::shared_ptr<ShardPin> pin)
-            : ProtoUpdateMessage(&state->proto), session(std::move(session)), state(std::move(state)), pin(std::move(pin)) {}
-        void done(IndexWriter&) override {
-          complete(session->node_, [this] {
-            auto* response = finishResponse();
-            state.reset(); // Keep the response arena, release the update body.
-            net::post(session->stream_.get_executor(), [this, response] {
-              try {
-                std::string out;
-                if (!api::write_json(*response, out)) throw std::runtime_error("failed to serialize update response");
-                session->respondJson(http::status::ok, std::move(out));
-              } catch (...) { session->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
-              delete this;
-            });
-          }, session->waitCancellation.get_token());
-        }
-      };
-      try {
-        auto collection = self->node_.resolveOrCreateCollection(state->proto.collection);
-        auto iw = collection->getShard()->requireIndexWriter();
-        auto* msg = new Update(self, state, shardPin);
-        try { if (!iw->submitUpdate(msg)) throw std::runtime_error("update was not admitted"); }
-        catch (...) { delete msg; throw; }
-      } catch (...) {
-        auto failure = currentExceptionInfo(ErrorKind::INTERNAL);
-        net::post(self->stream_.get_executor(), [self, shardPin, failure] { self->respondError(failure); });
+    class Update final : public ProtoUpdateMessage {
+      std::shared_ptr<HttpSession> session;
+      std::shared_ptr<HttpUpdateState> state;
+      std::shared_ptr<ShardPin> pin;
+    public:
+      Update(std::shared_ptr<HttpSession> session, std::shared_ptr<HttpUpdateState> state, std::shared_ptr<ShardPin> pin)
+          : ProtoUpdateMessage(&state->proto), session(std::move(session)), state(std::move(state)), pin(std::move(pin)) {}
+      void done(IndexWriter&) override {
+        auto completed = takeCompletion(session->node_);
+        auto target = session;
+        auto guard = pin;
+        delete this;
+        completed->await(target->node_, [target, guard](auto result) {
+          net::post(target->stream_.get_executor(), [target, guard, result] {
+            try {
+              std::string out;
+              if (!api::write_json(result->response, out)) throw std::runtime_error("failed to serialize update response");
+              target->respondJson(http::status::ok, std::move(out));
+            } catch (...) { target->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
+          });
+        }, target->waitCancellation.get_token());
       }
-    });
+    };
+    try {
+      if (state->proto.commit && state->proto.commit->wait_for_replicas) watchWaitDisconnect();
+      auto admission = std::make_unique<Update>(shared_from_this(), std::move(state), shardPin);
+      auto* msg = admission.get();
+      node_.getTaskArena().enqueue([self = shared_from_this(), msg, shardPin] {
+        try {
+          auto collection = self->node_.resolveOrCreateCollection(msg->req->collection);
+          auto iw = collection->getShard()->requireIndexWriter();
+          if (!iw->submitUpdate(msg)) throw std::runtime_error("update was not admitted");
+        } catch (...) {
+          delete msg;
+          auto failure = currentExceptionInfo(ErrorKind::INTERNAL);
+          net::post(self->stream_.get_executor(), [self, shardPin, failure] { self->respondError(failure); });
+        }
+      });
+      admission.release();
+    } catch (const std::exception& e) {
+      respondException(e, ErrorKind::INVALID_REQUEST);
+    }
   }
 
   // Names only - /_stats carries the detail.  Pretty-printed like the other
@@ -1667,11 +1661,13 @@ private:
       std::string out;
       std::optional<ErrorInfo> failure;
       try {
-        self->node_.createCollection(
+        auto created = self->node_.createCollection(
             state->request.name,
             state->request.schema ? &*state->request.schema : nullptr);
         luxir::api::CreateCollectionResponse response;
         response.name = state->request.name;
+        auto token = created->getShard()->requireIndexWriter()->initialCommit().token();
+        response.commit = token;
         if (!luxir::api::write_json(response, out)) {
           throw std::runtime_error("failed to serialize create collection response");
         }
@@ -1778,6 +1774,17 @@ private:
     else respondJson(http::status::ok, std::move(out));
   }
 
+  static api::ReplicaRequirement replicaRequirement(std::string_view text) {
+    api::ReplicaRequirement result;
+    if (text == "all") result.kind = api::AllReplicas{};
+    else {
+      auto count = replicationNumber(text);
+      if (count > UINT32_MAX) throw RequestError("wait_for_replicas count exceeds uint32");
+      result.kind = (uint32_t)count;
+    }
+    return result;
+  }
+
   static uint64_t replicationNumber(std::string_view text) {
     uint64_t result = 0;
     auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result);
@@ -1798,7 +1805,13 @@ private:
     cancelReplicationWatch();
     replicationTimer_.reset();
     if (replicationStopped_) return;
-    try { respondJson(http::status::ok, node_.getReplication().catalog(node_)); }
+    try {
+      std::pmr::monotonic_buffer_resource arena;
+      auto catalog = node_.getReplication().catalog(arena);
+      std::string body;
+      if (!api::write_json(catalog, body)) throw std::runtime_error("failed to serialize catalog");
+      respondJson(http::status::ok, std::move(body));
+    }
     catch (const std::exception& e) { respondException(e, ErrorKind::INTERNAL); }
   }
 
@@ -1836,9 +1849,68 @@ private:
     }
   }
 
+  // Observe socket failure while parked without consuming pipelined bytes.
+  // FIN alone is a valid write-half-close, not proof the peer abandoned its
+  // response. The cancellation slot belongs only to this readiness wait.
+  void watchWaitDisconnect() {
+    auto epoch = ++waitDisconnectEpoch_;
+    waitDisconnect_.emit(net::cancellation_type::terminal);
+    stream_.socket().async_wait(tcp::socket::wait_read,
+        net::bind_cancellation_slot(waitDisconnect_.slot(), [weak = weak_from_this(), epoch](beast::error_code ec) {
+          auto self = weak.lock();
+          if (!self || epoch != self->waitDisconnectEpoch_ || ec == net::error::operation_aborted) return;
+          beast::error_code availableError;
+          auto bytes = self->stream_.socket().available(availableError);
+          if (ec || availableError) { self->waitCancellation.request_stop(); return; }
+          if (bytes == 0) {
+            char byte;
+            beast::error_code readError;
+            self->stream_.socket().receive(net::buffer(&byte, 1), tcp::socket::message_peek, readError);
+            if (readError && readError != net::error::eof) self->waitCancellation.request_stop();
+          }
+        }));
+  }
+
+  void stopWaitDisconnect() {
+    ++waitDisconnectEpoch_;
+    waitDisconnect_.emit(net::cancellation_type::terminal);
+  }
+
+  void handleWaitForReplicas(const std::string& body, const std::string& coll) {
+    try {
+      std::pmr::monotonic_buffer_resource arena;
+      api::WaitForReplicasRequest request;
+      std::string error;
+      if (!api::read_json(request, body, arena, &error)) throw RequestError(error);
+      setCollectionTarget(request.collection, coll, arena);
+      if (auto text = findParam(urlParams_, "wait_for_replicas")) request.wait_for_replicas = replicaRequirement(*text);
+      if (auto text = findParam(urlParams_, "wait_for_replicas_timeout_ms")) request.wait_for_replicas_timeout_ms = replicationNumber(*text);
+      if (!request.wait_for_replicas) throw RequestError("wait_for_replicas is required");
+      auto id = CommitId::parse(request.commit);
+      auto pin = makeShardPin();
+      watchWaitDisconnect();
+      auto& waits = node_.getCommitWaits();
+      waits.awaitReplicas(std::string(request.collection), id, *request.wait_for_replicas,
+          waits.deadlineAfter(request.wait_for_replicas_timeout_ms.value_or(30000)), waitCancellation.get_token(),
+          [self = shared_from_this(), pin, token = id.token()](api::ReplicaResult replicas) {
+            net::post(self->stream_.get_executor(), [self, pin, token, replicas] {
+              try {
+                api::WaitForReplicasResponse response{token, replicas};
+                std::string json;
+                if (!api::write_json(response, json)) throw std::runtime_error("failed to serialize replica wait");
+                self->respondJson(http::status::ok, std::move(json));
+              } catch (...) { self->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
+            });
+          });
+    } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); }
+  }
+
   void handleReplicationInstalled(std::string body) {
     try {
-      node_.getReplication().installed(node_, body);
+      std::pmr::monotonic_buffer_resource arena;
+      api::ReplicationInstalled request;
+      if (!api::read_json(request, body, arena)) throw RequestError("expected follower, collection and commit");
+      node_.getReplication().installed(request);
       respondJson(http::status::ok, R"({"installed":true})");
     } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); }
   }
@@ -2074,7 +2146,11 @@ private:
       try {
         auto collection = self->node_.resolveOrCreateCollection(coll);
         auto newSchema = collection->updateSchema(state->def, mode);
-        out = renderSchemaBody(*newSchema);
+        std::pmr::monotonic_buffer_resource arena;
+        api::SchemaResponse response;
+        newSchema->schema->toProto(&response.schema.emplace(), arena);
+        response.commit = api::build::arenaStr(arena, newSchema->id.token());
+        if (!api::write_json(response, out)) throw std::runtime_error("failed to serialize schema response");
       } catch (const std::exception& e) {
         failure = classifyException(e, ErrorKind::INTERNAL);
       }
@@ -2121,8 +2197,8 @@ private:
     params.commit_within_ms = src.commit_within_ms;
     params.wait_for_merges = src.wait_for_merges;
     params.max_segments = src.max_segments;
-    params.wait_for_replicas = api::build::arenaStr(resource, src.wait_for_replicas);
-    params.replication_timeout_ms = src.replication_timeout_ms;
+    params.wait_for_replicas = src.wait_for_replicas;
+    params.wait_for_replicas_timeout_ms = src.wait_for_replicas_timeout_ms;
     std::string_view* names =
         luxir::api::build::allocArray(params.build_aux_indexes, src.build_aux_indexes.size(), resource);
     for (std::size_t i = 0; i < src.build_aux_indexes.size(); i++) {
@@ -2191,15 +2267,15 @@ private:
   static bool parseUpdateUrlParams(const std::vector<UrlParam>& params, UpdateUrlParams& out,
                                    std::string& err) {
     if (auto* value = findParam(params, "wait_for_replicas")) {
-      try { ProtoUpdateMessage::validateReplicaWait(*value); }
+      try { replicaRequirement(*value); }
       catch (const std::exception& e) { err = e.what(); return false; }
       out.waitForReplicas = *value;
     }
-    if (auto* value = findParam(params, "replication_timeout_ms")) {
+    if (auto* value = findParam(params, "wait_for_replicas_timeout_ms")) {
       uint64_t timeout = 0;
       auto [end, error] = std::from_chars(value->data(), value->data() + value->size(), timeout);
-      if (error != std::errc() || end != value->data() + value->size()) { err = "invalid replication_timeout_ms"; return false; }
-      out.replicationTimeoutMs = timeout;
+      if (error != std::errc() || end != value->data() + value->size()) { err = "invalid wait_for_replicas_timeout_ms"; return false; }
+      out.waitForReplicasTimeoutMs = timeout;
     }
     if (!out.waitForReplicas.empty() && !findParam(params, "commit")) { err = "wait_for_replicas requires commit=true"; return false; }
     return parseCommitParam(params, out.commit, err) &&
@@ -3136,6 +3212,7 @@ private:
     if (streamUpdate_ != state || state->failed) return;
     state->interval.commits[name] = {id ? id->token() : "", replicas, std::move(error)};
     if (--state->urlCommitsPending == 0) {
+      stopWaitDisconnect();
       state->urlCommitInFlight = false;
       state->interval.submitted = true;
       finishStreamingUpdate();
@@ -3149,8 +3226,8 @@ private:
         auto request = std::make_shared<HttpUpdateState>();
         request->proto.collection = api::build::arenaStr(request->resource, (*writers)[index].first);
         auto& params = request->proto.commit.emplace();
-        params.wait_for_replicas = api::build::arenaStr(request->resource, state->url.waitForReplicas);
-        params.replication_timeout_ms = state->url.replicationTimeoutMs;
+        params.wait_for_replicas = state->url.waitForReplicas.empty() ? std::nullopt : std::optional(replicaRequirement(state->url.waitForReplicas));
+        params.wait_for_replicas_timeout_ms = state->url.waitForReplicasTimeoutMs;
         class Commit final : public ProtoUpdateMessage {
           std::shared_ptr<HttpUpdateState> request;
           std::shared_ptr<HttpSession> session;
@@ -3163,19 +3240,20 @@ private:
               : ProtoUpdateMessage(&request->proto), request(std::move(request)), session(std::move(session)),
                 state(std::move(state)), writers(std::move(writers)), index(index) {}
           void done(IndexWriter&) override {
-            complete(session->node_, [this] {
-              auto* response = finishResponse();
-              auto error = response->error ? std::optional(api::build::errorInfo(*response->error)) : std::nullopt;
-              net::post(session->stream_.get_executor(),
-                  [self = session, state = state, writers = writers, index = index,
-                   id = resultingCommit, replicas = response->replicas, error]() mutable {
-                    self->onUrlCommitDone(state, (*writers)[index].first, id, replicas, std::move(error));
-                  });
-              delete this;
-            }, session->waitCancellation.get_token());
+            auto completed = takeCompletion(session->node_);
+            auto target = session;
+            auto streamState = state;
+            auto collectionName = (*writers)[index].first;
+            delete this;
+            completed->await(target->node_, [target, streamState, collectionName](auto result) {
+              auto error = result->response.error ? std::optional(api::build::errorInfo(*result->response.error)) : std::nullopt;
+              net::post(target->stream_.get_executor(), [target, streamState, collectionName, result, error]() mutable {
+                target->onUrlCommitDone(streamState, collectionName, result->commit, result->response.replicas, std::move(error));
+              });
+            }, target->waitCancellation.get_token());
           }
         };
-        auto* msg = new Commit(request, self, state, writers, index);
+        auto* msg = new Commit(std::move(request), self, state, writers, index);
         try { if (!(*writers)[index].second->submitUpdate(msg)) throw std::runtime_error("update was not admitted"); }
         catch (...) { delete msg; throw; }
       } catch (...) {
@@ -3188,6 +3266,7 @@ private:
   }
 
   void submitUrlCommits() {
+    if (!streamUpdate_->url.waitForReplicas.empty()) watchWaitDisconnect();
     auto state = streamUpdate_;
     assert(state != nullptr && !state->urlCommitInFlight);
     auto writers = std::make_shared<UrlWriters>();
@@ -3340,6 +3419,7 @@ private:
   }
 
   void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false) {
+    stopWaitDisconnect();
     auto resp = std::make_shared<http::response<http::string_body>>(status, httpVersion_);
     resp->set(http::field::server, "luxir");
     resp->set(http::field::content_type, contentType);
@@ -3392,6 +3472,7 @@ private:
   }
 
   void doClose() {
+    waitCancellation.request_stop();
     replicationStopped_ = true;
     cancelReplicationWatch();
     beast::error_code ec;
@@ -3399,6 +3480,7 @@ private:
   }
 
   void doTerminalStreamingClose() {
+    waitCancellation.request_stop();
     beast::error_code ec;
     stream_.socket().shutdown(tcp::socket::shutdown_both, ec);
     stream_.socket().close(ec);

@@ -18,6 +18,17 @@ class JsonResponseTest : public LuxirTest {};
 
 namespace {
 
+// Check the root token independently of the operation-shape goldens below.
+std::string renderOperations(const api::SearchResponse& response, bool shorthand = false) {
+  EXPECT_FALSE(response.commit.empty());
+  auto operations = response;
+  operations.commit = {};
+  auto body = renderSearchResponseBody(operations, shorthand);
+  EXPECT_EQ("{\"commit\":\"" + std::string(response.commit) + "\"," + body.substr(1),
+            renderSearchResponseBody(response, shorthand));
+  return body;
+}
+
 // Reference JSON string escaper: the exact semantics appendJsonString's
 // scalar path implements (two-char escapes, \u00xx lowercase for other
 // control chars, raw UTF-8 passthrough).  The SIMD bulk path must render
@@ -128,7 +139,7 @@ TEST_F(JsonResponseTest, stringFacetRowsAndOptionalMetadata) {
 
   EXPECT_EQ(
       R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1}}})",
-      renderSearchResponseBody(req->responses[0]->proto));
+      renderOperations(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, executionProfileShape) {
@@ -171,7 +182,7 @@ TEST_F(JsonResponseTest, integerFacetPreservesZeroBucketId) {
 
   EXPECT_EQ(
       R"({"ops":{"prices":{"buckets":[{"val":0,"count":2},{"val":7,"count":1}]}}})",
-      renderSearchResponseBody(req->responses[0]->proto));
+      renderOperations(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, rangeFacetRowsUseIntegerBounds) {
@@ -191,7 +202,7 @@ TEST_F(JsonResponseTest, rangeFacetRowsUseIntegerBounds) {
 
   EXPECT_EQ(
       R"({"ops":{"prices":{"buckets":[{"val":[0,10],"count":1},{"val":[10,20],"count":2},{"val":[20,30],"count":1}]}}})",
-      renderSearchResponseBody(req->responses[0]->proto));
+      renderOperations(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, rangeFacetRowsUseFloatingBounds) {
@@ -213,7 +224,7 @@ TEST_F(JsonResponseTest, rangeFacetRowsUseFloatingBounds) {
 
     EXPECT_EQ(
         R"({"ops":{"prices":{"buckets":[{"val":[-0.5,0],"count":1},{"val":[0,0.5],"count":2},{"val":[0.5,0.75],"count":0}]}}})",
-        renderSearchResponseBody(req->responses[0]->proto));
+        renderOperations(req->responses[0]->proto));
   }
 }
 
@@ -238,7 +249,7 @@ TEST_F(JsonResponseTest, facetMetricsRenderPerBucketAndEmptyAsNull) {
 
   EXPECT_EQ(
       R"({"ops":{"cats":{"buckets":[{"val":"a","count":2,"total":40,"minimum":10},{"val":"b","count":2,"total":null,"minimum":null},{"val":"c","count":1,"total":5,"minimum":5}]}}})",
-      renderSearchResponseBody(req->responses[0]->proto));
+      renderOperations(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, nestedFacetRowsRecurse) {
@@ -259,7 +270,7 @@ TEST_F(JsonResponseTest, nestedFacetRowsRecurse) {
 
   EXPECT_EQ(
       R"({"ops":{"outer":{"buckets":[{"val":"x","count":2,"inner":{"buckets":[{"val":"p","count":1},{"val":"q","count":1}]}},{"val":"y","count":1,"inner":{"buckets":[{"val":"p","count":1}]}}]}}})",
-      renderSearchResponseBody(req->responses[0]->proto));
+      renderOperations(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, wholeDomainStatsStayUnderOpsWithoutDocs) {
@@ -279,7 +290,7 @@ TEST_F(JsonResponseTest, wholeDomainStatsStayUnderOpsWithoutDocs) {
   ASSERT_OK(req);
 
   EXPECT_EQ(R"({"ops":{"average":20,"empty":null,"empty_sum":null,"total":40}})",
-            renderSearchResponseBody(req->responses[0]->proto));
+            renderOperations(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, rowsFormatRendersDocObjects) {
@@ -299,7 +310,7 @@ TEST_F(JsonResponseTest, rowsFormatRendersDocObjects) {
   // Row maps signal missing structurally: doc 2 has no cat_s/n_i keys.
   EXPECT_EQ(
       R"({"ops":{"q":{"docs":[{"id":"1","cat_s":"x","n_i":5},{"id":"2"}]}}})",
-      renderSearchResponseBody(req->responses[0]->proto));
+      renderOperations(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, namedDocListAndFacetRemainUnderOps) {
@@ -319,7 +330,7 @@ TEST_F(JsonResponseTest, namedDocListAndFacetRemainUnderOps) {
 
   EXPECT_EQ(
       R"({"ops":{"hits":{"found":3,"docs":[{"id":"1"},{"id":"2"}]},"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})",
-      renderSearchResponseBody(req->responses[0]->proto));
+      renderOperations(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, shorthandUnwrapsImplicitQ) {
@@ -340,10 +351,10 @@ TEST_F(JsonResponseTest, shorthandUnwrapsImplicitQ) {
 
   EXPECT_EQ(
       R"({"found":3,"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})",
-      renderSearchResponseBody(req->responses[0]->proto, true));
+      renderOperations(req->responses[0]->proto, true));
   EXPECT_EQ(
       R"({"ops":{"q":{"found":3,"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}}}})",
-      renderSearchResponseBody(req->responses[0]->proto));
+      renderOperations(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, secondDocListRendersItsNestedOps) {
@@ -364,7 +375,7 @@ TEST_F(JsonResponseTest, secondDocListRendersItsNestedOps) {
 
   EXPECT_EQ(
       R"({"ops":{"first":{"found":2,"docs":[{"id":"1"}]},"second":{"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":1},{"val":"y","count":1}]}}}}})",
-      renderSearchResponseBody(req->responses[0]->proto));
+      renderOperations(req->responses[0]->proto));
 }
 
 TEST_F(JsonResponseTest, everyDocListRendersUnderOps) {
@@ -384,7 +395,7 @@ TEST_F(JsonResponseTest, everyDocListRendersUnderOps) {
 
   EXPECT_EQ(
       R"({"ops":{"first":{"found":3,"docs":[{"id":"1"}]},"second":{"docs":[{"id":"1"},{"id":"2"}]}}})",
-      renderSearchResponseBody(req->responses[0]->proto));
+      renderOperations(req->responses[0]->proto));
 }
 
 } // namespace luxir::test

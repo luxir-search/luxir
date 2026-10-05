@@ -26,7 +26,7 @@
 #include "luxir/reader/Postings.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/server/HttpServer.h"
-#include "luxir/server/ReplicationCatalog.h"
+#include "luxir/server/ReplicationSource.h"
 
 namespace luxir::test {
 
@@ -48,6 +48,19 @@ protected:
   }
 
   int port() { return server->getPort(); }
+
+  std::string withCommit(std::string body) {
+    auto token = luxirNode->getCollection("main")->getShard()->getSnapshots().snapshot()->id.token();
+    return "{\"commit\":\"" + token + "\"," + body.substr(1);
+  }
+
+  static std::string explicitQuery(const std::string& body) {
+    auto split = body.find(',', body.find("\"commit\":"));
+    EXPECT_NE(std::string::npos, split);
+    if (split == std::string::npos) return {};
+    return body.substr(0, split + 1) + "\"ops\":{\"q\":{" +
+        body.substr(split + 1, body.size() - split - 2) + "}}\n";
+  }
 
   static bool waitForShardThreads(HttpServer& server, int expected,
                                   std::chrono::milliseconds timeout) {
@@ -227,7 +240,7 @@ TEST_F(HttpApiTest, prettySearch) {
     EXPECT_EQ("application/json", res[http::field::content_type]);
     EXPECT_TRUE(res.chunked());
     expectJsonObject(res.body(), true);
-    EXPECT_TRUE(res.body().starts_with("{\n  \"docs\": ")) << res.body();
+    EXPECT_TRUE(res.body().starts_with("{\n  \"commit\": ")) << res.body();
   }
 }
 
@@ -731,8 +744,8 @@ TEST_F(HttpApiTest, facetResponseUsesBucketRows) {
   auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"ops":{"cats":{"field_facet":{"field":"http_facet_s","limit":-1,"missing":true}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
-  EXPECT_EQ(
-      R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1}}})" "\n",
+  EXPECT_EQ(withCommit(
+      R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1}}})" "\n"),
       response.body());
 }
 
@@ -747,10 +760,10 @@ TEST_F(HttpApiTest, facetBucketsCarryTopDocs) {
       R"("ops":{"hits":{"top_docs":{"limit":1,"get_number":true,"fields":["id"],)"
       R"("sort":[{"field":"price_i","dir":"desc"}]}}}}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
-  EXPECT_EQ(
+  EXPECT_EQ(withCommit(
       R"({"ops":{"cats":{"buckets":[)"
       R"({"val":"x","count":2,"hits":{"found":2,"docs":[{"id":"pb2"}]}},)"
-      R"({"val":"y","count":1,"hits":{"found":1,"docs":[{"id":"pb3"}]}}]}}})" "\n",
+      R"({"val":"y","count":1,"hits":{"found":1,"docs":[{"id":"pb3"}]}}]}}})" "\n"),
       response.body());
 }
 
@@ -785,8 +798,8 @@ TEST_F(HttpApiTest, maxParallelModesAllAnswer) {
         R"({"max_parallel":)" + mp +
         R"(,"ops":{"cats":{"field_facet":{"field":"http_mp_s","limit":-1}}}})");
     ASSERT_EQ(200, response.result_int()) << response.body();
-    EXPECT_EQ(
-        R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})" "\n",
+    EXPECT_EQ(withCommit(
+        R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})" "\n"),
         response.body()) << "max_parallel=" << mp;
   }
 }
@@ -2250,7 +2263,7 @@ TEST_F(HttpApiTest, rootShorthand) {
   HttpReq full(port());
   full.matchQuery("status_s", "active").fields({"id"}).execute();
   ASSERT_EQ(200, full.status());
-  EXPECT_EQ("{\"ops\":{\"q\":" + res.body().substr(0, res.body().size() - 1) + "}}\n",
+  EXPECT_EQ(explicitQuery(res.body()),
             full.rawResponse());
   EXPECT_EQ(2u, idsOf(full.getDocs()).size());
 
@@ -2326,7 +2339,7 @@ TEST_F(HttpApiTest, urlOverlaysPreserveExplicitResponseShape) {
   for (const char* body : {"{}", R"({"time_zone":"UTC"})", R"({"query":"id:1"})"}) {
     auto res = httpRequest(port(), http::verb::post, target, body);
     ASSERT_EQ(200, res.result_int()) << res.body();
-    EXPECT_EQ("{\"docs\":[{\"id\":\"1\"}]}\n", res.body());
+    EXPECT_EQ(withCommit("{\"docs\":[{\"id\":\"1\"}]}\n"), res.body());
   }
   for (const char* body : {R"({"ops":{"q":{"top_docs":{}}}})",
                            R"json({"ops":{"q":{"top_docs":{}},"metric":"sum(1)"}})json"}) {
@@ -2400,7 +2413,7 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
   auto viaEcho = httpRequest(port(), http::verb::post, "/collections/main/_search", canonical);
   ASSERT_EQ(200, viaEcho.result_int()) << viaEcho.body();
-  EXPECT_EQ("{\"ops\":{\"q\":" + direct.body().substr(0, direct.body().size() - 1) + "}}\n",
+  EXPECT_EQ(explicitQuery(direct.body()),
             viaEcho.body());
 
   // Fixpoint: echoing the echo is byte-identical.
@@ -2516,7 +2529,7 @@ TEST_F(HttpApiTest, searchUrlOverlayEchoPostbackEquivalent) {
   ASSERT_EQ(200, echo.result_int()) << echo.body();
   auto postback = httpRequest(port(), http::verb::post, "/collections/main/_search", echo.body());
   ASSERT_EQ(200, postback.result_int()) << postback.body();
-  EXPECT_EQ("{\"ops\":{\"q\":" + direct.body().substr(0, direct.body().size() - 1) + "}}\n",
+  EXPECT_EQ(explicitQuery(direct.body()),
             postback.body());
 
   auto echo2 = httpRequest(port(), http::verb::post,
@@ -2897,17 +2910,23 @@ TEST_F(HttpApiTest, schemaSetGetRoundTrip) {
 
   auto get = httpRequest(port(), http::verb::get, "/collections/main/_schema");
   ASSERT_EQ(200, get.result_int());
-  EXPECT_EQ(set.body(), get.body()) << "write response and GET speak the same shape";
+  glz::generic written, fetched;
+  ASSERT_FALSE(glz::read_json(written, set.body()));
+  ASSERT_FALSE(glz::read_json(fetched, get.body()));
+  EXPECT_EQ(glz::write_json(written["schema"]).value(), glz::write_json(fetched).value());
+  EXPECT_FALSE(written["commit"].get<std::string>().empty());
 
   // Echo doctrine: GET output is a valid write body, and posting it back is a
   // no-op under BOTH modes (set of identical defs is identity).
   auto setBack = httpRequest(port(), http::verb::post, "/collections/main/_schema", get.body());
   ASSERT_EQ(200, setBack.result_int()) << setBack.body();
-  EXPECT_EQ(get.body(), setBack.body());
+  ASSERT_FALSE(glz::read_json(written, setBack.body()));
+  EXPECT_EQ(glz::write_json(written["schema"]).value(), glz::write_json(fetched).value());
   auto replaceBack = httpRequest(port(), http::verb::post,
                                  "/collections/main/_schema?mode=replace_all", get.body());
   ASSERT_EQ(200, replaceBack.result_int()) << replaceBack.body();
-  EXPECT_EQ(get.body(), replaceBack.body());
+  ASSERT_FALSE(glz::read_json(written, replaceBack.body()));
+  EXPECT_EQ(glz::write_json(written["schema"]).value(), glz::write_json(fetched).value());
 }
 
 TEST_F(HttpApiTest, schemaBodiesRetainVariantDefaultsAcrossAsyncDispatch) {
@@ -3997,7 +4016,7 @@ TEST_F(HttpApiTest, explainResolvedFieldVariantsKeepsRequestAndReportsPhysicalTa
   auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
   auto replay = httpRequest(port(), http::verb::post, "/collections/main/_search", explainedRequest(echo));
   ASSERT_EQ(200, direct.result_int()) << direct.body();
-  EXPECT_EQ("{\"ops\":{\"q\":" + direct.body().substr(0, direct.body().size() - 1) + "}}\n",
+  EXPECT_EQ(explicitQuery(direct.body()),
             replay.body());
   auto again = httpRequest(port(), http::verb::post,
       "/collections/main/_search?explain=resolved", explainedRequest(echo));
@@ -4101,7 +4120,7 @@ TEST_F(HttpApiTest, ndjsonEofKeepsDurableTokensAfterReplicaWaitFailure) {
   auto unlisten = scope_guard([] { Signal::unlisten("replicationWaitParked"); });
   auto response = std::async(std::launch::async, [&] {
     return httpRequest(localServer.getPort(), http::verb::post,
-        "/collections/failed/_update?commit=true&wait_for_replicas=1&replication_timeout_ms=5000",
+        "/collections/failed/_update?commit=true&wait_for_replicas=1&wait_for_replicas_timeout_ms=5000",
         "{\"id\":\"first\"}\n{\"_update_\":{\"collection\":\"kept\"}}\n{\"id\":\"second\"}\n",
         "application/x-ndjson");
   });
@@ -4111,16 +4130,16 @@ TEST_F(HttpApiTest, ndjsonEofKeepsDurableTokensAfterReplicaWaitFailure) {
   auto removed = failed.collection().getShard()->getSnapshots().snapshot()->id.token();
   auto kept = other.collection().getShard()->getSnapshots().snapshot()->id.token();
   node.deleteCollection("failed");
-  node.getReplication().installed(node,
-      "{\"follower\":\"test\",\"collection\":\"kept\",\"commit\":\"" + kept + "\"}");
+  node.getReplication().installed({"test", "kept", kept});
   auto result = response.get();
   ASSERT_EQ(200, result.result_int()) << result.body();
   auto lines = splitLines(result.body());
   glz::generic_i64 eof; ASSERT_FALSE(glz::read_json(eof, lines.back()));
-  EXPECT_EQ("error", eof["status"].get<std::string>());
-  EXPECT_EQ("replica_wait_cancelled", eof["error"]["code"].get<std::string>());
+  EXPECT_EQ("ok", eof["status"].get<std::string>());
+  EXPECT_FALSE(eof.contains("error"));
   EXPECT_EQ(removed, eof["commits"]["failed"]["commit"].get<std::string>());
-  EXPECT_EQ("replica_wait_cancelled", eof["commits"]["failed"]["error"]["code"].get<std::string>());
+  EXPECT_EQ("cancelled", eof["commits"]["failed"]["replicas"]["outcome"].get<std::string>());
+  EXPECT_FALSE(eof["commits"]["failed"].contains("error"));
   EXPECT_EQ(kept, eof["commits"]["kept"]["commit"].get<std::string>());
   EXPECT_EQ(1, eof["commits"]["kept"]["replicas"]["serving"].get<int64_t>());
   EXPECT_FALSE(eof["commits"]["kept"].contains("error"));

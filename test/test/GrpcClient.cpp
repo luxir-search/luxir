@@ -44,6 +44,13 @@ std::string parse(Msg& msg, const grpc::ByteBuffer& in, std::vector<std::byte>& 
 
 }  // namespace
 
+std::string grpcSerialize(const luxir::api::WaitForReplicasRequest& msg, grpc::ByteBuffer& out) {
+  return serialize(msg, out);
+}
+std::string grpcParse(luxir::api::WaitForReplicasResponse& msg, const grpc::ByteBuffer& in,
+                      std::vector<std::byte>& storage, std::pmr::memory_resource& arena) {
+  return parse(msg, in, storage, arena);
+}
 std::string grpcSerialize(const luxir::api::SearchRequest& msg, grpc::ByteBuffer& out) {
   return serialize(msg, out);
 }

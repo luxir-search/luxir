@@ -3,7 +3,7 @@
 
 #include "ReplicationFollower.h"
 #include "LuxirNode.h"
-#include "ReplicationCatalog.h"
+#include "CollectionEvents.h"
 #include "ReplicationState.h"
 #include "luxir/api/build.h"
 #include "luxir/store/Manifest.h"
@@ -24,14 +24,6 @@ namespace beast = boost::beast;
 namespace http = beast::http;
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
-
-struct CatalogEntry { std::string commit; std::string state; };
-struct Catalog {
-  std::string boot;
-  std::string cursor;
-  std::map<std::string, CatalogEntry> collections;
-};
-struct Ack { std::string follower; std::string collection; std::string commit; };
 
 uint64_t wallTime() {
   return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -356,11 +348,11 @@ struct ReplicationFollower::Impl {
     state.verified.clear(); state.targetIncarnation.clear(); state.remove = false;
   }
 
-  Catalog fetchCatalog(Client& client, const std::string& cursor, std::chrono::milliseconds timeout) {
+  api::ReplicationCatalog fetchCatalog(Client& client, const std::string& cursor, std::chrono::milliseconds timeout, std::pmr::memory_resource& arena) {
     auto response = request(client, http::verb::get, "/_replication/watch?" + followerQuery()
         + "&since=" + escape(cursor) + "&timeout_ms=" + std::to_string(timeout.count()), {}, timeout + 10s);
-    Catalog catalog;
-    if (glz::read_json(catalog, response.body()) || catalog.boot.empty() || catalog.cursor.empty()) throw std::runtime_error("invalid source catalog");
+    api::ReplicationCatalog catalog;
+    if (!api::read_json(catalog, api::build::arenaStr(arena, response.body()), arena) || catalog.boot.empty() || catalog.cursor.empty()) throw std::runtime_error("invalid source catalog");
     for (const auto& [name, entry] : catalog.collections) {
       Collections::validateName(name);
       if (!entry.commit.empty()) validateIncarnation(CommitId::parse(entry.commit).incarnation);
@@ -368,7 +360,7 @@ struct ReplicationFollower::Impl {
     return catalog;
   }
 
-  static std::optional<CommitId> advertisedCommit(const CatalogEntry& entry) {
+  static std::optional<CommitId> advertisedCommit(const api::ReplicationCatalogEntry& entry) {
     if (entry.commit.empty()) return std::nullopt;
     return CommitId::parse(entry.commit);
   }
@@ -393,19 +385,20 @@ struct ReplicationFollower::Impl {
     auto timeout = std::chrono::milliseconds(node.getConfig().replication.follower_timeout_ms / 3);
     while (!stopping.stop_requested()) {
       try {
-        auto catalog = fetchCatalog(client, refresh ? "" : cursor, timeout);
+        std::pmr::monotonic_buffer_resource arena;
+        auto catalog = fetchCatalog(client, refresh ? "" : cursor, timeout, arena);
         refresh = false;
         {
           std::lock_guard lock(mutex);
           if (boot != catalog.boot) for (auto& [name, state] : states) state.acknowledged.reset();
           boot = catalog.boot; cursor = catalog.cursor;
           connected = discovered = true; discoveryError.clear();
-          for (const auto& [name, entry] : catalog.collections) states.try_emplace(name);
+          for (const auto& [name, entry] : catalog.collections) states.try_emplace(std::string(name));
           for (auto& [name, state] : states) {
             auto found = catalog.collections.find(name);
-            bool present = found != catalog.collections.end();
-            state.unavailable = present && found->second.state == "unavailable";
-            observe(state, present ? advertisedCommit(found->second) : std::nullopt, present, boot);
+            bool present = found != nullptr;
+            state.unavailable = present && !found->available;
+            observe(state, present ? advertisedCommit(*found) : std::nullopt, present, boot);
             if (!state.busy && state.serving && state.advertised == state.serving && state.acknowledged == state.serving) {
               state.error.clear(); state.failures = 0; state.retry = {};
             }
@@ -636,8 +629,9 @@ struct ReplicationFollower::Impl {
   bool pull(std::ostream& output) {
     if (!threads.empty() || stopping.stop_requested()) throw std::logic_error("pull requires an unstarted follower");
     Client client(source, stopping.get_token());
-    Catalog catalog;
-    try { catalog = fetchCatalog(client, {}, 0ms); }
+    api::ReplicationCatalog catalog;
+    std::pmr::monotonic_buffer_resource arena;
+    try { catalog = fetchCatalog(client, {}, 0ms, arena); }
     catch (const std::exception& e) {
       output << "Pull failed: " << binding.source << ": " << errorMessage(e) << '\n';
       return false;
@@ -645,14 +639,14 @@ struct ReplicationFollower::Impl {
     size_t installed = 0, failed = 0;
     uint64_t transferred = 0, reused = 0;
     for (const auto& [name, entry] : catalog.collections) {
-      auto& state = states[name];
-      observe(state, advertisedCommit(entry), true, catalog.boot);
+      auto& state = states[std::string(name)];
+      observe(state, advertisedCommit(entry), true, std::string(catalog.boot));
       state.downloaded = state.reused = 0;
       uint64_t downloaded = 0;
       try {
-        if (entry.state == "unavailable") throw std::runtime_error("source collection unavailable");
+        if (!entry.available) throw std::runtime_error("source collection unavailable");
         for (unsigned attempt = 0;; attempt++) {
-          try { sync(client, name); break; }
+          try { sync(client, std::string(name)); break; }
           catch (const ReservationGone&) { if (attempt == 2) throw; downloaded += state.downloaded; }
         }
         persistState();
@@ -716,7 +710,11 @@ struct ReplicationFollower::Impl {
               ackBoot = boot;
             }
             if (!serving) return;
-            request(client, http::verb::post, "/_replication/installed", glz::write_json(Ack{binding.follower, name, serving->token()}).value());
+            auto token = serving->token();
+            api::ReplicationInstalled ack{binding.follower, name, token};
+            std::string body;
+            if (!api::write_json(ack, body)) throw std::runtime_error("failed to serialize acknowledgment");
+            request(client, http::verb::post, "/_replication/installed", body);
             std::lock_guard lock(mutex);
             if (boot == ackBoot) states[name].acknowledged = serving;
           };
@@ -790,8 +788,9 @@ void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_re
   for (const auto& [name, state] : impl->states) {
     auto token = [&](const std::optional<CommitId>& id) { return id ? str(id->token()) : std::string_view(); };
     auto& row = rows[i++]; row.name = str(name); row.source_commit = token(state.advertised); row.serving_commit = token(state.serving);
-    row.state = (!impl->connected || state.unavailable) ? "stale" : !state.advertised ? "orphan" : !state.error.empty() ? "error"
-        : state.waiting ? "waiting" : state.advertised == state.serving ? "serving" : "syncing";
+    using State = api::ReplicationCollectionStatus::State;
+    row.state = (!impl->connected || state.unavailable) ? State::STALE : !state.advertised ? State::ORPHAN : !state.error.empty() ? State::ERROR
+        : state.waiting ? State::WAITING : state.advertised == state.serving ? State::SERVING : State::SYNCING;
     auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(state.retry - Clock::now()).count();
     if (!state.error.empty() && remaining > 0) row.next_retry = wallTime() + (uint64_t)remaining;
     row.bytes_downloaded = state.downloaded; row.bytes_total = state.total; row.last_error = str(state.error.empty() && !impl->connected ? impl->discoveryError : state.error);

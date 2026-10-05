@@ -680,6 +680,7 @@ message ExecutionProfilePiece {
 
 // Top-level response to a Search request
 message SearchResponse {
+  string commit = 7; // token of the reader used for this response
   string request_id = 1;
   map<string, Val> ops = 2; // the results of the search operations in the request, keyed by operation name.
 
@@ -762,25 +763,50 @@ message CommitParams {
   // positive.
   uint32 max_segments = 4;
 
-  // Decimal follower count or "all". Forces an immediate commit. "all" captures
+  // Forces an immediate commit. All captures
   // live followers at commit completion; members that go non-live stop counting.
-  string wait_for_replicas = 5;
+  ReplicaRequirement wait_for_replicas = 5;
   // Visibility wait deadline. Absent defaults to 30000; timeout never undoes commit.
-  optional uint64 replication_timeout_ms = 6;
+  optional uint64 wait_for_replicas_timeout_ms = 6;
+}
+
+// Exactly one requirement is required, including an explicit count of zero.
+message ReplicaRequirement {
+  oneof kind {
+    uint32 count = 1;
+    AllReplicas all = 2;
+  }
+}
+message AllReplicas {}
+
+message WaitForReplicasRequest {
+  string collection = 1; // empty selects main
+  string commit = 2; // existing durable commit token
+  ReplicaRequirement wait_for_replicas = 3;
+  optional uint64 wait_for_replicas_timeout_ms = 4; // absent = 30000
+}
+message WaitForReplicasResponse {
+  string commit = 1;
+  ReplicaResult replicas = 2;
 }
 
 message ReplicaResult {
+  enum Outcome {
+    SATISFIED = 0;
+    TIMED_OUT = 1;
+    CANCELLED = 2;
+  }
   // For "all", wanted excludes captured followers that are no longer live.
   optional uint32 wanted = 1;
   optional uint32 serving = 2;
-  optional bool timed_out = 3;
+  optional Outcome outcome = 3; // independent of local commit success
 }
 
 message CollectionCommit {
   // Durable snapshot identity, retained even if the replica wait fails.
   string commit = 1;
   ReplicaResult replicas = 2;
-  // Commit or replica-wait failure for this collection.
+  // Local commit failure for this collection.
   Error error = 3;
 }
 
@@ -1044,6 +1070,7 @@ message CreateCollectionRequest {
 }
 
 message CreateCollectionResponse {
+  string commit = 2; // exact snapshot published by creation
   string name = 1;
 }
 
@@ -1076,11 +1103,35 @@ message StatsResponse {
   StorageRamStats storage_ram = 6;
 }
 
+// Full catalog for a discovery cursor, scoped to this source boot.
+message ReplicationCatalog {
+  string boot = 1;
+  string cursor = 2;
+  map<string, ReplicationCatalogEntry> collections = 3;
+}
+message ReplicationCatalogEntry {
+  string commit = 1;
+  bool available = 2;
+}
+message ReplicationInstalled {
+  string follower = 1;
+  string collection = 2;
+  string commit = 3;
+}
+
 message ReplicationCollectionStatus {
+  enum State {
+    SYNCING = 0;
+    SERVING = 1;
+    WAITING = 2;
+    STALE = 3;
+    ORPHAN = 4;
+    ERROR = 5;
+  }
   string name = 1;
   string source_commit = 2;
   string serving_commit = 3;
-  string state = 4; // syncing, serving, waiting, stale, orphan, error
+  optional State state = 4;
   uint64 bytes_downloaded = 5;
   uint64 bytes_total = 6;
   string last_error = 7;
@@ -1092,10 +1143,10 @@ message ReplicationStatus {
   optional bool connected = 3;
   uint64 last_contact = 4; // Unix milliseconds
   repeated ReplicationCollectionStatus collections = 5;
-  repeated FollowerStats followers = 6;
+  repeated FollowerStatus followers = 6;
 }
 
-message FollowerStats {
+message FollowerStatus {
   string follower = 1;
   string collection = 2;
   string commit = 3;
@@ -1448,5 +1499,6 @@ message SchemaRequest {
 }
 
 message SchemaResponse {
+  string commit = 2; // exact snapshot published by a schema update
   SchemaDef schema = 1;         // the resulting schema after the operation
 }

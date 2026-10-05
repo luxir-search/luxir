@@ -50,6 +50,7 @@ struct TrivialSearchRequest {
 
 // RPC method paths (match GRPCServer.cpp lookupMethod()).
 namespace rpc {
+inline constexpr const char* WaitForReplicas = "/luxir.Admin/WaitForReplicas";
 inline constexpr const char* Search            = "/luxir.Searcher/Search";
 inline constexpr const char* Update            = "/luxir.Indexer/Update";
 inline constexpr const char* UpdateStream      = "/luxir.Indexer/UpdateStream";
@@ -69,6 +70,9 @@ std::string grpcSerialize(const luxir::api::StatsRequest& msg, grpc::ByteBuffer&
 std::string grpcSerialize(const luxir::api::CreateCollectionRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const luxir::api::DeleteCollectionRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const luxir::api::SchemaRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::WaitForReplicasRequest& msg, grpc::ByteBuffer& out);
+std::string grpcParse(luxir::api::WaitForReplicasResponse& msg, const grpc::ByteBuffer& in,
+                      std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
 // `storage` retains the raw reply bytes the non-owning `msg` views; `arena` backs nested
 // message allocations. Both must outlive any read of `msg`.
 std::string grpcParse(luxir::api::SearchResponse& msg, const grpc::ByteBuffer& in,

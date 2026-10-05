@@ -28,7 +28,8 @@ namespace luxir {
 
 class SearchEngine;
 class LuxirNode;
-class ReplicationCatalog;
+class ReplicationSource;
+class CommitWaits;
 class ReplicationFollower;
 
 class LuxirNode {
@@ -44,7 +45,8 @@ public:
   const LuxirConfig& getConfig() const { return config; }
   ReplicationFollower* getFollower() { return follower.get(); }
   bool following() const { return !config.replication.source.empty(); }
-  ReplicationCatalog& getReplication() { return *replication; }
+  ReplicationSource& getReplication() { return *replication; }
+  CommitWaits& getCommitWaits() { return *commitWaits; }
   Collections& collections() { return *collections_; }
 
   // True when this node serves a data directory it does not own (no write lock).
@@ -64,7 +66,6 @@ public:
   // Snapshot fully-created collections without waiting for creations in
   // flight. Unavailable placeholders retain their recorded error.
   std::vector<CollectionEntry> collectionEntries() { return collections_->entries(); }
-  std::map<std::string, CommitId> replicationCollections();
 
   std::shared_ptr<Collection> createCollection(std::string_view name, const api::SchemaDef* schema = nullptr);
   void deleteCollection(std::string_view name);
@@ -87,7 +88,8 @@ private:
 
   LuxirConfig config;
   IndexRamBudget indexRamBudget;
-  std::shared_ptr<ReplicationCatalog> replication;
+  std::shared_ptr<ReplicationSource> replication;
+  std::shared_ptr<CommitWaits> commitWaits;
   std::shared_ptr<CollectionEvents> events; // ordered feed of the collection map
   std::unique_ptr<Collections> collections_;
   std::unique_ptr<ReplicationFollower> follower;

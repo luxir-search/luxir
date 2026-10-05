@@ -1,7 +1,8 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "luxir/server/ReplicationCatalog.h"
+#include "luxir/server/ReplicationSource.h"
+#include "CommitWaits.h"
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
 #include "luxir/util/DateTime.h"
@@ -17,9 +18,29 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   this->config.resolveRamBudgets();
   auto& replicationConfig = this->config.replication;
   replicationConfig.validate();
-  replication = std::make_shared<ReplicationCatalog>(std::chrono::milliseconds(
+  replication = std::make_shared<ReplicationSource>(std::chrono::milliseconds(
       replicationConfig.follower_timeout_ms));
-  events = replication;
+  commitWaits = std::make_shared<CommitWaits>(*replication, following());
+  replication->onAcknowledgmentsChanged([weak = std::weak_ptr(commitWaits)](std::string_view name) {
+    if (auto waits = weak.lock()) waits->acknowledged(name);
+  });
+  class Events final : public CollectionEvents {
+    std::shared_ptr<ReplicationSource> source;
+    std::shared_ptr<CommitWaits> waits;
+  public:
+    Events(std::shared_ptr<ReplicationSource> source, std::shared_ptr<CommitWaits> waits)
+        : source(std::move(source)), waits(std::move(waits)) {}
+    void registered(const std::string& name, const std::shared_ptr<Collection>& collection) noexcept override {
+      waits->registered(name, collection); source->registered(name, collection);
+    }
+    void updated(const std::string& name, const Collection& collection) noexcept override {
+      waits->updated(name, collection); source->updated(name, collection);
+    }
+    void removed(const std::string& name) noexcept override {
+      waits->removed(name); source->removed(name);
+    }
+  };
+  events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
   collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget);
@@ -43,7 +64,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
 
 LuxirNode::~LuxirNode() {
   if (follower) follower->stop();
-  replication->closeWaits();
+  commitWaits->close();
 }
 
 std::shared_ptr<Collection> LuxirNode::checkLoaded(std::shared_ptr<Collection> collection) {
@@ -76,16 +97,6 @@ std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(std::string_view na
 
 std::shared_ptr<Collection> LuxirNode::resolveOrCreateCollection(std::string_view name) {
   return getOrCreateCollection(name.empty() ? kDefaultCollectionName : name);
-}
-
-std::map<std::string, CommitId> LuxirNode::replicationCollections() {
-  std::map<std::string, CommitId> result;
-  for (const auto& entry : collectionEntries()) {
-    if (auto shard = entry.collection->getShard()) {
-      if (auto snapshot = shard->getSnapshots().snapshot()) result.emplace(entry.name, snapshot->id);
-    }
-  }
-  return result;
 }
 
 std::shared_ptr<Collection> LuxirNode::createCollection(std::string_view name, const api::SchemaDef* schema) {

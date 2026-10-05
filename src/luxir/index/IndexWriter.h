@@ -290,6 +290,7 @@ public:
   std::atomic_uint64_t lastSegId;
 
   CommitSnapshotRegistry& snapshots;
+  CommitId openingCommit; // Captured before this writer becomes externally visible.
   std::atomic<std::shared_ptr<const CommitSnapshot>> lastSnapshot;
 
   std::unique_ptr<MergePolicy> mergePolicy;
@@ -526,8 +527,9 @@ public:
   Inverter& obtainInverter(uint64_t updateVersion = 0, std::shared_ptr<Schema> pinned = {});
 
   // Publish over the last physical snapshot without waiting for commit preparation.
+  const CommitId& initialCommit() const { return openingCommit; }
   void setSchema(std::shared_ptr<Schema> schema);
-  std::shared_ptr<Schema> updateSchema(std::function<std::shared_ptr<Schema>(const Schema*)> change);
+  std::shared_ptr<const CommitSnapshot> updateSchema(std::function<std::shared_ptr<Schema>(const Schema*)> change);
   std::shared_ptr<Schema> getSchema() const { return lastSnapshot.load()->schema; }
 
   // Releases an inverter back to the pool.

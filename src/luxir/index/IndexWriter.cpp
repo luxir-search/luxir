@@ -325,6 +325,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   pressureRegistration = indexRamBudget->registerPressureListener([this]() noexcept {
     requestPressureCheck();
   });
+  openingCommit = lastSnapshot.load()->id;
 }
 
 IndexWriter::~IndexWriter() {
@@ -558,7 +559,7 @@ void IndexWriter::setSchema(std::shared_ptr<Schema> schema) {
   updateSchema([schema = std::move(schema)](const Schema*) { return schema; });
 }
 
-std::shared_ptr<Schema> IndexWriter::updateSchema(
+std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
     std::function<std::shared_ptr<Schema>(const Schema*)> change) {
   std::unique_lock lock(publicationMutex);
   if (isClosed()) throw IndexWriterClosedError("index writer is closed");
@@ -570,10 +571,10 @@ std::shared_ptr<Schema> IndexWriter::updateSchema(
     throw std::runtime_error("Failed to decode published manifest");
   }
   publish(info, arena, std::move(schema));
-  schema = getSchema();
+  auto published = lastSnapshot.load();
   lock.unlock();
   tryDeleteSegments();
-  return schema;
+  return published;
 }
 
 Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Schema> pinned) {

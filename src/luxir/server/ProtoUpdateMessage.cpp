@@ -4,7 +4,7 @@
 #include "luxir/util/proto.h"
 #include "ProtoUpdateMessage.h"
 #include "LuxirNode.h"
-#include "ReplicationCatalog.h"
+#include "CommitWaits.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/schema/Schema.h"
 
@@ -268,26 +268,41 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
 }
 
 
-void ProtoUpdateMessage::validateReplicaWait(std::string_view value) {
-  ReplicationCatalog::replicaCount(value);
+void ProtoUpdateMessage::validateReplicaWait(const api::ReplicaRequirement& value) {
+  if (value.kind.index() == 0) throw RequestError("wait_for_replicas requires count or all");
 }
 
-void ProtoUpdateMessage::complete(LuxirNode& node, std::function<void()> delivery, std::stop_token stop) {
-  if (!resultingCommit || !req->commit || req->commit->wait_for_replicas.empty() || result.errored()) {
-    delivery();
-    return;
+std::shared_ptr<ProtoUpdateMessage::Completion> ProtoUpdateMessage::takeCompletion(LuxirNode& node) {
+  auto completed = std::make_shared<Completion>();
+  completed->response = *finishResponse();
+  auto errors = completed->response.errors;
+  auto* copiedErrors = api::build::allocArray(completed->response.errors, errors.size(), *mr_);
+  std::copy(errors.begin(), errors.end(), copiedErrors);
+  auto ids = completed->response.ids;
+  auto* copiedIds = api::build::allocArray(completed->response.ids, ids.size(), *mr_);
+  std::copy(ids.begin(), ids.end(), copiedIds);
+  completed->commit = resultingCommit;
+  if (resultingCommit && req->commit && req->commit->wait_for_replicas && !result.errored()) {
+    auto& waits = node.getCommitWaits();
+    auto collection = req->collection.empty() ? std::string(LuxirNode::kDefaultCollectionName) : std::string(req->collection);
+    completed->wait = waits.prepareReplicas(std::move(collection), *resultingCommit, *req->commit->wait_for_replicas,
+        waits.deadlineAfter(req->commit->wait_for_replicas_timeout_ms.value_or(30000)));
   }
-  auto collection = req->collection.empty() ? std::string(LuxirNode::kDefaultCollectionName) : std::string(req->collection);
-  node.getReplication().awaitBarrier(node, std::move(collection), *resultingCommit, req->commit->wait_for_replicas,
-      req->commit->replication_timeout_ms.value_or(30000),
-      [this, &node, delivery = std::move(delivery)](api::ReplicaResult replicas, ReplicationCatalog::Event event) mutable {
-        node.getTaskArena().enqueue([this, delivery = std::move(delivery), replicas, event] {
-          getResponse()->replicas = replicas;
-          if (event == ReplicationCatalog::Event::RECREATED || event == ReplicationCatalog::Event::REMOVED)
-            result.setException(ApiError(ErrorKind::UNAVAILABLE, "replica_wait_cancelled", "collection removed or recreated after commit"));
-          delivery();
-        });
-      }, stop);
+  completed->arena = std::move(mr_);
+  req = nullptr;
+  return completed;
+}
+
+void ProtoUpdateMessage::Completion::await(LuxirNode& node,
+    std::function<void(std::shared_ptr<Completion>)> delivery, std::stop_token stop) {
+  auto self = shared_from_this();
+  if (!wait) { delivery(std::move(self)); return; }
+  auto& waits = node.getCommitWaits();
+  waits.awaitReplicas(std::move(*wait), stop,
+      [self, delivery = std::move(delivery)](api::ReplicaResult replicas) {
+        self->response.replicas = replicas;
+        delivery(self);
+      });
 }
 
 } // namespace luxir

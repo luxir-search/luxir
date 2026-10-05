@@ -35,7 +35,7 @@ protected:
     api::SchemaDef def;
     std::string error;
     if (!api::read_json(def, json, arena, &error)) throw std::runtime_error(error);
-    return collection.updateSchema(def, api::SchemaRequest_::Mode::SET);
+    return collection.updateSchema(def, api::SchemaRequest_::Mode::SET)->schema;
   }
 
   static Json view(IndexWriter& writer) {

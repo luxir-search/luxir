@@ -11,6 +11,7 @@
 #include <string>
 
 #include "luxir/index/UpdateMessage.h"
+#include "CommitWaits.h"
 #include "luxir/api/build.h"
 #include "luxir/util/Clock.h"
 
@@ -32,21 +33,21 @@ private:
   // The response is NON-OWNING; its message data (request_id, error strings, ids) and the
   // variable-count errors/ids arrays are backed by this monotonic arena. Update processing
   // for one message is single-threaded, so a plain monotonic resource suffices.
-  std::pmr::monotonic_buffer_resource mr_;
-  luxir::api::build::SpanBuilder<DocError> errors_{mr_};
-  luxir::api::build::SpanBuilder<std::string_view> ids_{mr_};
+  std::unique_ptr<std::pmr::monotonic_buffer_resource> mr_ = std::make_unique<std::pmr::monotonic_buffer_resource>();
+  luxir::api::build::SpanBuilder<DocError> errors_{*mr_};
+  luxir::api::build::SpanBuilder<std::string_view> ids_{*mr_};
 
   void initResponse(ResponseProto* rsp) {
-    rsp->request_id = luxir::api::build::arenaStr(mr_, req->request_id);
+    rsp->request_id = luxir::api::build::arenaStr(*mr_, req->request_id);
     rsp->status = ResponseStatus::OK;  // default status
   }
 
 public:
   // Build-side helpers: errors/ids accumulate at unknown count; finishResponse() seals them
   // into the response spans. Transient strings are copied into the response arena.
-  std::pmr::memory_resource& responseArena() { return mr_; }
+  std::pmr::memory_resource& responseArena() { return *mr_; }
   DocError& addError() { return errors_.emplace_back(); }
-  void addId(std::string_view id) { ids_.push_back(luxir::api::build::arenaStr(mr_, id)); }
+  void addId(std::string_view id) { ids_.push_back(luxir::api::build::arenaStr(*mr_, id)); }
   void clearIds() { ids_.clear(); }
 
   const RequestProto* req;  // The request object may become unavailable after the callback is called
@@ -64,8 +65,8 @@ public:
       const auto& params = *req->commit;
       commit_within_ms = (int64_t)std::min<uint64_t>(
           params.commit_within_ms, (uint64_t)std::numeric_limits<int64_t>::max());
-      if (!params.wait_for_replicas.empty()) {
-        validateReplicaWait(params.wait_for_replicas);
+      if (params.wait_for_replicas.has_value()) {
+        validateReplicaWait(*params.wait_for_replicas);
         commit_within_ms = 0;
       }
       waitForMerges = params.wait_for_merges;
@@ -98,10 +99,10 @@ public:
   ResponseProto* finishResponse() {
     auto* rsp = getResponse();
     rsp->update_version = updateVersion;
-    if (resultingCommit) rsp->commit = api::build::arenaStr(mr_, resultingCommit->token());
+    if (resultingCommit) rsp->commit = api::build::arenaStr(*mr_, resultingCommit->token());
     if (result.errored()) {
       rsp->status = ResponseStatus::ERROR;
-      rsp->error = luxir::api::build::arenaError(mr_, result.info());
+      rsp->error = luxir::api::build::arenaError(*mr_, result.info());
     }
     // Seal the accumulated errors/ids into the non-owning response spans.
     rsp->errors = errors_.finish();
@@ -110,12 +111,17 @@ public:
     return rsp;
   }
 
-  static void validateReplicaWait(std::string_view value);
-  // Captures "all" at commit completion. Retain the message through delivery.
-  // Delivery extracts data and queues rendering. Barriers resume on the arena;
-  // without a barrier delivery runs inline.
-  void complete(LuxirNode& node, std::function<void()> delivery,
-                std::stop_token stop = {});
+  static void validateReplicaWait(const api::ReplicaRequirement& value);
+  // This owns only response data and a copied wait specification. The transport
+  // releases its request and message before starting the replica wait.
+  struct Completion : std::enable_shared_from_this<Completion> {
+    std::unique_ptr<std::pmr::monotonic_buffer_resource> arena;
+    ResponseProto response;
+    std::optional<CommitId> commit;
+    std::optional<CommitWaits::ReplicaWait> wait;
+    void await(LuxirNode& node, std::function<void(std::shared_ptr<Completion>)> delivery, std::stop_token stop = {});
+  };
+  std::shared_ptr<Completion> takeCompletion(LuxirNode& node);
 
   // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it
   // as a param in the future if obtain/release becomes more complex.

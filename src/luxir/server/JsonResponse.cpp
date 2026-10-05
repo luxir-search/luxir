@@ -520,6 +520,10 @@ std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, boo
     appendKey("request_id");
     appendJsonString(out, resp.request_id);
   }
+  if (!resp.commit.empty()) {
+    appendKey("commit");
+    appendJsonString(out, resp.commit);
+  }
   if (resp.error.has_value()) {
     // A failed request carries no op results; warnings declared before the
     // failure still ride along.

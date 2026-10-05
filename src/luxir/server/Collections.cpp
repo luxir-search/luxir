@@ -29,7 +29,7 @@ std::string Collection::getUnavailableReason() const {
   return {};
 }
 
-std::shared_ptr<Schema> Collection::updateSchema(const luxir::api::SchemaDef& def,
+std::shared_ptr<const CommitSnapshot> Collection::updateSchema(const luxir::api::SchemaDef& def,
                                                  luxir::api::SchemaRequest_::Mode mode) {
   if (!shard->iw) throw ReadOnlyError("collection has no writer");
   return shard->iw->updateSchema([&](const Schema* current) {
