@@ -10,8 +10,10 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+#if !defined(__APPLE__)
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
@@ -158,7 +160,13 @@ public:
         if (state == nullptr) return;
         state->wire.kind = "segment";
         state->wire.segment = segnum;
+#if defined(__APPLE__)
+        uint64_t threadId = 0;
+        (void)pthread_threadid_np(nullptr, &threadId);
+        state->wire.thread_id = (int64_t)threadId;
+#else
         state->wire.thread_id = (int64_t)::syscall(SYS_gettid);
+#endif
         started = std::chrono::steady_clock::now();
       }
       ExecutionProfileScope(const ExecutionProfileScope&) = delete;

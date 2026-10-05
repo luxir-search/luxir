@@ -8,7 +8,7 @@
 
 namespace luxir {
 
-ReaderManager::ReaderManager(Directory& dir, std::atomic<std::shared_ptr<const CommitSnapshot>>& published,
+ReaderManager::ReaderManager(Directory& dir, AtomicSharedPtr<const CommitSnapshot>& published,
                              FilterCacheConfig config)
     : dir(dir), published(published), originalFilterCacheConfig(config), filterCache(std::make_shared<FilterCache>(config)) {}
 

@@ -1,7 +1,11 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#else
 #include <link.h>
+#endif
 #include <string_view>
 #include <gtest/gtest.h>
 #include "luxir/server/LuxirError.h"
@@ -9,6 +13,13 @@
 namespace {
 
 bool sharedUnwinderLoaded() {
+#if defined(__APPLE__)
+  for (uint32_t i = 0; i < _dyld_image_count(); ++i) {
+    std::string_view name(_dyld_get_image_name(i));
+    if (name.find("libunwind") != std::string_view::npos) return true;
+  }
+  return false;
+#else
   bool loaded = false;
   dl_iterate_phdr([](dl_phdr_info* info, size_t, void* data) {
     if (std::string_view(info->dlpi_name).find("libgcc_s.so") != std::string_view::npos) {
@@ -17,6 +28,7 @@ bool sharedUnwinderLoaded() {
     return 0;
   }, &loaded);
   return loaded;
+#endif
 }
 
 } // namespace
@@ -24,7 +36,7 @@ bool sharedUnwinderLoaded() {
 TEST(StackTraceTest, retainsAddressesWithoutLoadingSharedUnwinder) {
   bool loadedBefore = sharedUnwinderLoaded();
   auto trace = luxir::getStackTrace();
-  EXPECT_NE(std::string::npos, trace.find("[0x")) << trace;
+  EXPECT_NE(std::string::npos, trace.find("0x")) << trace;
   // Native builds may already link libgcc_s; static builds must not load it
   // merely to report an internal update failure.
   EXPECT_EQ(loadedBefore, sharedUnwinderLoaded());

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include "luxir/util/AtomicSharedPtr.h"
 #include <deque>
 #include <optional>
 #include <string>
@@ -61,7 +62,7 @@ public:
 
     // atomic shared pointer since it could be set / mutated by either the IW (setting or clearing),
     // or by IndexReader opening code.
-    std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
+    AtomicSharedPtr<PostingsReader> sharedPostingsReader = nullptr;
 
     // Schema generation this segment was indexed under.
     uint64_t schemaGen = 0;
@@ -290,7 +291,7 @@ public:
   std::atomic_uint64_t lastSegId;
 
   CommitSnapshotRegistry& snapshots;
-  std::atomic<std::shared_ptr<const CommitSnapshot>> lastSnapshot;
+  AtomicSharedPtr<const CommitSnapshot> lastSnapshot;
 
   std::unique_ptr<MergePolicy> mergePolicy;
 

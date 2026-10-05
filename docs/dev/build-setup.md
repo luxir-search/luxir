@@ -2,6 +2,24 @@
 
 Detailed build and environment notes for a source checkout.
 
+The default system-library build works without a preset:
+
+```bash
+cmake -B build
+cd build
+make -j
+```
+
+It uses the system compiler and installed development libraries. CMake reports
+missing dependencies; install them with the platform's package manager and
+rerun configuration. macOS uses AppleClang and discovers Homebrew libraries.
+The compiler and standard library must support the C++26 mode and features used
+by the project. The native GCC/vcpkg and container presets below remain optional
+ways to prepare a controlled dependency environment.
+
+
+For native ARM64 macOS, see [macOS build](macos-build.md).
+
 The instructions below describe the native GCC/vcpkg environment used by the
 `gcc-*` presets, with one vcpkg checkout at `/opt/vcpkg`. Its dependencies and
 compiler are built for the native host. The

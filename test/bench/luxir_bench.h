@@ -3,9 +3,16 @@
 
 #pragma once
 #include <chrono>
+#include <thread>
 #include <sys/resource.h>
 #include <fstream>
+#include <unistd.h>
+#ifdef __GLIBC__
 #include <malloc.h>
+#endif
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
 #include "benchmark/benchmark.h"
 #include "test/LuxirTest.h"
 
@@ -48,18 +55,35 @@ inline bool skipBenchIfDataMissing(benchmark::State& state, bool present, std::s
   return true;
 }
 
+inline void trimHeap() {
+#ifdef __GLIBC__
+  malloc_trim(0);
+#endif
+}
+
 inline size_t currentRSSKB() {
+#ifdef __APPLE__
+  mach_task_basic_info_data_t info{};
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                (task_info_t)&info, &count) != KERN_SUCCESS) return 0;
+  return info.resident_size / 1024;
+#else
   std::ifstream statm("/proc/self/statm");
-  size_t size, resident;
-  statm >> size >> resident;
-  size_t page_size_kb = sysconf(_SC_PAGESIZE) / 1024;
-  return resident * page_size_kb;
+  size_t size = 0, resident = 0;
+  if (!(statm >> size >> resident)) return 0;
+  return resident * (size_t)sysconf(_SC_PAGESIZE) / 1024;
+#endif
 }
 
 inline size_t peakRSSKB() {
-  struct rusage usage;
-  getrusage(RUSAGE_SELF, &usage);
+  struct rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) != 0) return 0;
+#ifdef __APPLE__
+  return usage.ru_maxrss / 1024;
+#else
   return usage.ru_maxrss;
+#endif
 }
 
 class RSSWatcher {
@@ -73,14 +97,11 @@ public:
 
   // By default sleep for 1ms between checks.
   size_t getRSSKB() {
-    std::ifstream statm("/proc/self/statm");
-    size_t size, resident;
-    statm >> size >> resident;
-    return resident * page_size_kb;
+    return currentRSSKB();
   }
 
   RSSWatcher(size_t sleepNs = 1000000) {
-    malloc_trim(0);
+    trimHeap();
     sleepns = sleepNs;
     page_size_kb = sysconf(_SC_PAGESIZE) / 1024;
     startRSS = getRSSKB();

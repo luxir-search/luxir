@@ -14,7 +14,9 @@
     "protobuf",
     {
       "name": "grpc",
-      "features": ["codegen"]
+      "features": [
+        "codegen"
+      ]
     },
     "spdlog",
     "lz4",
@@ -28,6 +30,10 @@
       "features": [
         "dynamic-arch"
       ]
+    },
+    {
+      "name": "date",
+      "platform": "osx"
     }
   ]
 }

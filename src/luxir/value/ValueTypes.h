@@ -164,7 +164,7 @@ enum class BoundsCertainty : uint8_t { BOUNDED, UNBOUNDED, INVALID };
 
 enum class BoundsInvalidity : uint8_t {
   NONE,
-  DOMAIN,
+  DOMAIN_ERROR,
   NAN_VALUE,
   POSITIVE_INFINITY,
   NEGATIVE_INFINITY,

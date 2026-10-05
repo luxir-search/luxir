@@ -48,8 +48,12 @@ public:
       mappingSize = 0;
       throw std::system_error(errno, std::generic_category(), "mmap");
     }
+#ifdef MADV_HUGEPAGE
     (void)::madvise(mapping, mappingSize, MADV_HUGEPAGE);
+#endif
+#ifdef MADV_POPULATE_WRITE
     (void)::madvise(mapping, mappingSize, MADV_POPULATE_WRITE);
+#endif
   }
 
   MappedAlloc(const MappedAlloc&) = delete;

@@ -11,7 +11,11 @@ namespace luxir {
 
 /// Label the calling thread for ps/top/gdb (15-char kernel limit).
 inline void nameThisThread(const char* name) {
+#if defined(__APPLE__)
+  pthread_setname_np(name);
+#else
   pthread_setname_np(pthread_self(), name);
+#endif
 }
 
 

@@ -704,10 +704,10 @@ TEST_F(IntColTest, testMonoBig) {
       // when we go to a new block, pick a new max bit width
       if (i % MonoReader::BLOCK_SIZE == 0) {
         rng = Rng(rng());
-        bits = rng.rint(0ul, sizeof(int32_t)+10);
+        bits = rng.rint((uint64_t)0, (uint64_t)(sizeof(int32_t)+10));
         maxVal = 1 << bits;
       }
-      int64_t delta = rng.rint(0l, maxVal);
+      int64_t delta = rng.rint((int64_t)0, maxVal);
       val += delta;
       vals.push_back(val);
       w.addInt64(val);

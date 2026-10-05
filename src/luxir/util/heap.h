@@ -4,6 +4,8 @@
 #pragma once
 
 #include <assert.h>
+#include <concepts>
+#include <type_traits>
 #include <span>
 #include <numeric>
 #include <algorithm>
@@ -64,7 +66,8 @@ class IndirectPQ {
   void makeHeap() {
     std::make_heap(pointers.data(), end, ptrcomp);
   }
-  void fillPtrs(std::span<T> arr) {
+  template <class U> requires std::same_as<U, T>
+  void fillPtrs(std::span<U> arr) {
     assert(pointers.size() >= arr.size());
     auto sz = size();
     for (size_t i=0; i<sz; i++) {
@@ -87,14 +90,16 @@ public:
   }
 
   /// Form an indirect priority queue of size initialSize, and limited in capacity to pointers.size()
-  IndirectPQ(std::span<T> arr, std::span<T*> pointers, size_t initialSize)
+  template <class U = T> requires (!std::is_abstract_v<U>)
+  IndirectPQ(std::span<std::type_identity_t<U>> arr, std::span<T*> pointers, size_t initialSize)
           : pointers(pointers), end(pointers.data() + initialSize), reference(arr.data()) {
     assert(arr.size() >= pointers.size());
     assert(pointers.size() >= initialSize);
     makeHeap();
   }
 
-  IndirectPQ(std::span<T> arr, std::span<T*> pointers, bool fillPointers=true)
+  template <class U = T> requires (!std::is_abstract_v<U>)
+  IndirectPQ(std::span<std::type_identity_t<U>> arr, std::span<T*> pointers, bool fillPointers=true)
   : pointers(pointers), end(pointers.data() + arr.size()), reference(arr.data()) {
     auto sz = arr.size();
     if (fillPointers) {

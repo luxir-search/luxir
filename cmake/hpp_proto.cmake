@@ -17,10 +17,15 @@ set(HPP_PROTO_DIR "${CMAKE_SOURCE_DIR}/deps/hpp-proto")
 set(IS_UTF8_DIR "${CMAKE_SOURCE_DIR}/deps/is_utf8")
 
 if(NOT EXISTS "${HPP_PROTO_DIR}/include/hpp_proto/binpb.hpp")
-  message(FATAL_ERROR "deps/hpp-proto submodule not initialized (run: git submodule update --init)")
+  FetchContent_Declare(luxir_hpp_proto
+    GIT_REPOSITORY https://github.com/yonik/hpp-proto.git
+    GIT_TAG 1c17824ab8e2c4dd7ec887219ef5b0f882e97049
+    SOURCE_SUBDIR luxir-unused-upstream-build)
+  FetchContent_MakeAvailable(luxir_hpp_proto)
+  set(HPP_PROTO_DIR "${luxir_hpp_proto_SOURCE_DIR}")
 endif()
 
-find_package(Protobuf CONFIG REQUIRED)  # for protobuf::protoc (the compiler front end only)
+# Dependencies.cmake provides protobuf::protoc (the compiler front end only).
 
 # --- vendored is_utf8 ---
 add_library(is_utf8 STATIC "${IS_UTF8_DIR}/src/is_utf8.cpp")

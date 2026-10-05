@@ -14,6 +14,7 @@
 #include <fmt/format.h>
 
 #include "luxir/util/Cursor.h"
+#include "luxir/util/FloatParse.h"
 
 namespace luxir::value::lex {
 
@@ -121,8 +122,8 @@ NumericLiteral parseNumericLiteral(Cursor& cur, Fail&& fail) {
     return literal;
   }
 
-  auto [ptr, ec] = std::from_chars(parsed.data(), parsed.data() + parsed.size(),
-                                   literal.doubleValue);
+  auto [ptr, ec] = fromCharsFloat(parsed.data(), parsed.data() + parsed.size(),
+                                 literal.doubleValue);
   if (ec != std::errc() || ptr != parsed.data() + parsed.size()
       || !std::isfinite(literal.doubleValue)) {
     fail(pos, fmt::format("double literal '{}' must be finite", literal.text));

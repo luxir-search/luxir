@@ -673,13 +673,13 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
   }
 
   if (node.opcode == ValueOpcode::SQRT && low < 0.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
+    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
   }
   if (node.opcode == ValueOpcode::LOG && low <= 0.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
+    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
   }
   if (node.opcode == ValueOpcode::LOG1P && low <= -1.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
+    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
   }
   if ((node.opcode == ValueOpcode::SQRT && low < 0.0)
       || (node.opcode == ValueOpcode::LOG && low <= 0.0)

@@ -55,7 +55,7 @@ GRPCServer::GRPCServer(LuxirNode& node, int nthreads, int port, int64_t streamBu
 // interface that may help with integration with external event loops.
 
 void luxir::GRPCServer::run() {
-  pthread_setname_np(pthread_self(), "luxir_grpc_main");
+  nameThisThread("luxir_grpc_main");
 
   // Use requestedPort (default 0 for dynamic allocation, or a specific port
   // like 50051).  Dynamic test ports bind localhost; configured ports keep the
@@ -896,9 +896,9 @@ static const MethodEntry* lookupMethod(const std::string& method) {
 
 
 void GRPCServer::runThread(ThreadInfo& threadInfo) {
-  // linux-only: give threads a nice name for debugging.
+  // Give threads a name for debugging.
   std::string tname = "luxir_grpc_" + std::to_string(threadInfo.threadno);
-  pthread_setname_np(pthread_self(), tname.c_str());
+  nameThisThread(tname.c_str());
 
   // wait for the server to start before trying to use it.
   startLatch.wait();

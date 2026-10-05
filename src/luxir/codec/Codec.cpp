@@ -5,7 +5,7 @@
 
 #include <algorithm>
 #include <cstring>
-#include <immintrin.h>
+#include "luxir/util/Simd128.h"
 
 #include "luxir/reader/Postings.h"
 

@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include "luxir/util/AtomicSharedPtr.h"
+#include <bit>
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -494,7 +496,7 @@ private:
     int32_t maxDoc;
     std::atomic<bool> active{true};
     std::atomic<bool> building{false};
-    std::atomic<std::shared_ptr<const SegmentValue>> value;
+    AtomicSharedPtr<const SegmentValue> value;
     // Serializes absent-value backoff decisions with publication and capacity
     // eviction. Shared hits stay lock-free unless they lose an eviction race.
     std::atomic_flag feedbackTransition = ATOMIC_FLAG_INIT;
@@ -520,8 +522,8 @@ private:
   // erase.
   struct FilterEntry {
     const FilterKeyScope scope;
-    std::atomic<std::shared_ptr<const SlotVector>> slots;
-    std::atomic<std::shared_ptr<const ReaderValue>> readerValue;
+    AtomicSharedPtr<const SlotVector> slots;
+    AtomicSharedPtr<const ReaderValue> readerValue;
     std::atomic<bool> readerBuilding{false};
     // ReaderValues are one atomic cache unit. This entry-stable ghost orders
     // zero-hit capacity feedback with shared HIT reset and survives refreshes.
@@ -597,7 +599,7 @@ private:
       FilterKey, std::shared_ptr<FilterEntry>, FilterKeyHash> entries;
   AdmissionRing clauseAdmission;
   AdmissionRing wholeAdmission;
-  std::atomic<std::shared_ptr<const ActiveSnapshot>> activeSegments;
+  AtomicSharedPtr<const ActiveSnapshot> activeSegments;
   std::atomic<size_t> residentBytes{0};
   std::atomic<size_t> metadataBytes{0};
   std::atomic<uint64_t> epoch{1};

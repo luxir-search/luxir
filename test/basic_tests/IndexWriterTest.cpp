@@ -944,7 +944,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
                         if (numAdds > 0) {
                           for (;;) {
                             auto localDocsRequested = docsRequested.load();
-                            numAdds = std::min(numAdds, docsToAdd - localDocsRequested);
+                            numAdds = std::min<int64_t>(numAdds, docsToAdd - localDocsRequested);
                             if (numAdds == 0) {
                               doCommit = true;  // turn into a commit if it wasn't already.
                             }

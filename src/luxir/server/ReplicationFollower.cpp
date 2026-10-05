@@ -18,13 +18,6 @@
 #include <ostream>
 
 namespace luxir {
-namespace {
-namespace net = boost::asio;
-namespace beast = boost::beast;
-namespace http = beast::http;
-using namespace std::chrono_literals;
-using Clock = std::chrono::steady_clock;
-
 struct CatalogEntry { std::string commit; std::string state; };
 struct Catalog {
   std::string boot;
@@ -32,6 +25,13 @@ struct Catalog {
   std::map<std::string, CatalogEntry> collections;
 };
 struct Ack { std::string follower; std::string collection; std::string commit; };
+
+namespace {
+namespace net = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
+using namespace std::chrono_literals;
+using Clock = std::chrono::steady_clock;
 
 uint64_t wallTime() {
   return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(

@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 #include <iostream>
+#include <thread>
 
 #include "test/LuxirTest.h"
 #include "luxir/util/AtomicMerger.h"

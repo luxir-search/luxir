@@ -15,6 +15,8 @@
 #include <variant>
 #include <unordered_map>
 #include <tbb/task_group.h>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"

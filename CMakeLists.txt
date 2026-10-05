@@ -1,20 +1,44 @@
 # Copyright 2020-2026 Yonik Seeley and Luxir contributors
 # SPDX-License-Identifier: Apache-2.0
 
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.25)
+
+# Native macOS builds use system/Homebrew libraries built for the host OS.
+# Respect explicit deployment targets and toolchain-controlled builds.
+if(CMAKE_HOST_APPLE AND NOT CMAKE_TOOLCHAIN_FILE
+   AND NOT CMAKE_OSX_DEPLOYMENT_TARGET
+   AND "$ENV{MACOSX_DEPLOYMENT_TARGET}" STREQUAL "")
+  execute_process(COMMAND /usr/bin/sw_vers -productVersion
+                  OUTPUT_VARIABLE _luxir_macos_version
+                  OUTPUT_STRIP_TRAILING_WHITESPACE
+                  COMMAND_ERROR_IS_FATAL ANY)
+  if(_luxir_macos_version MATCHES "^([0-9]+\\.[0-9]+)")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "${CMAKE_MATCH_1}" CACHE STRING
+        "Minimum macOS version to target for deployment" FORCE)
+  endif()
+endif()
 project(Luxir VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+if(CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+  add_compile_options(-fexperimental-library)
+  add_link_options(-fexperimental-library)
+endif()
+
 set(LUXIR_CPU_TARGET native CACHE STRING "Compiler CPU target for Luxir and vendored code")
-set_property(CACHE LUXIR_CPU_TARGET PROPERTY STRINGS native x86-64-v2 x86-64-v3 x86-64-v4)
+set_property(CACHE LUXIR_CPU_TARGET PROPERTY STRINGS native apple-m1 x86-64-v2 x86-64-v3 x86-64-v4)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-  if(LUXIR_CPU_TARGET STREQUAL "native")
-    set(_luxir_cpu_tune native)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
+    if(NOT LUXIR_CPU_TARGET MATCHES "^(native|apple-m1)$")
+      message(FATAL_ERROR "ARM64 builds require LUXIR_CPU_TARGET=native or apple-m1")
+    endif()
+    add_compile_options("-mcpu=${LUXIR_CPU_TARGET}")
+  elseif(LUXIR_CPU_TARGET STREQUAL "native")
+    add_compile_options(-march=native -mtune=native)
   else()
-    set(_luxir_cpu_tune generic)
+    add_compile_options("-march=${LUXIR_CPU_TARGET}" -mtune=generic)
   endif()
-  add_compile_options("-march=${LUXIR_CPU_TARGET}" "-mtune=${_luxir_cpu_tune}")
 endif()
 
 option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining dynamic glibc" OFF)
@@ -91,29 +115,20 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 include_directories(SYSTEM ./src)
 
-find_package(xxHash CONFIG REQUIRED)
-
-#from clion docs
-find_package(Boost CONFIG REQUIRED COMPONENTS core thread sort)
-
-find_package(TBB CONFIG REQUIRED)
-find_package(spdlog CONFIG REQUIRED)
-find_package(CLI11 CONFIG REQUIRED)
-find_package(lz4 CONFIG REQUIRED)
-# JSON (both the proto-JSON dialect and the HTTP envelope) is glaze, which comes in
-# via luxir_proto_concrete. Boost.Beast/Asio (the HTTP transport) are header-only and
-# come with the Boost include dir found above.
-# FAISS for vector ANN aux indexes (gcc vcpkg presets only).
-# FAISS exports OpenMP::OpenMP_CXX in its imported-target interface, so we must
-# locate OpenMP before find_package(faiss).
-find_package(OpenMP REQUIRED)
-find_package(faiss CONFIG REQUIRED)
-# protobuf (DescriptorPool + google::protobuf::Arena) and gRPC are linked directly into
-# luxir_lib now that myproto is gone; they used to arrive transitively via myproto.
-find_package(Protobuf CONFIG REQUIRED)
-find_package(gRPC CONFIG REQUIRED)
+include(cmake/Dependencies.cmake)
 
 include_directories(deps)
+
+include(FetchContent)
+set(LUXIR_FASTPFOR_DIR "${CMAKE_CURRENT_SOURCE_DIR}/deps/FastPFOR")
+if(NOT EXISTS "${LUXIR_FASTPFOR_DIR}/headers/fastpfor_neon.h")
+  FetchContent_Declare(luxir_fastpfor
+    GIT_REPOSITORY https://github.com/fast-pack/FastPFOR.git
+    GIT_TAG 2457e1ed1af35bbf7f4c509c863fa9797e637cb3
+    SOURCE_SUBDIR luxir-unused-upstream-build)
+  FetchContent_MakeAvailable(luxir_fastpfor)
+  set(LUXIR_FASTPFOR_DIR "${luxir_fastpfor_SOURCE_DIR}")
+endif()
 
 # uni-algo (vendored under deps/uni-algo, Unicode 15.1.0): full Unicode case
 # folding, NFC/NFKC, UAX#29 word/grapheme/sentence segmentation. The header API
@@ -132,19 +147,12 @@ set_target_properties(uni_algo PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # SIMD varint path. We skip varintdecode.c and codecfactory.cpp because Luxir
 # does not reference them.
 add_library(fastpfor STATIC
-  deps/FastPFOR/src/bitpacking.cpp
-  deps/FastPFOR/src/simdbitpacking.cpp
-  deps/FastPFOR/src/simdunalignedbitpacking.cpp
-  deps/FastPFOR/src/streamvbyte.c)
-target_include_directories(fastpfor PUBLIC deps/FastPFOR/headers)
+  ${LUXIR_FASTPFOR_DIR}/src/bitpacking.cpp
+  ${LUXIR_FASTPFOR_DIR}/src/simdbitpacking.cpp
+  ${LUXIR_FASTPFOR_DIR}/src/simdunalignedbitpacking.cpp
+  ${LUXIR_FASTPFOR_DIR}/src/streamvbyte.c)
+target_include_directories(fastpfor SYSTEM PUBLIC "${LUXIR_FASTPFOR_DIR}/headers")
 set_target_properties(fastpfor PROPERTIES POSITION_INDEPENDENT_CODE ON)
-
-#Print out all env vars... useful while build system is in development
-get_cmake_property(_variableNames VARIABLES)
-list (SORT _variableNames)
-foreach (_variableName ${_variableNames})
-    message(STATUS "${_variableName}=${${_variableName}}")
-endforeach()
 
 # set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer")   #for profiling release
 # sanitizer settings.. can leave this first one on while developing for linux
@@ -303,8 +311,7 @@ if(ROBIN_HOOD_HASHING)
   target_include_directories(luxir_lib PRIVATE ${ROBIN_HOOD_HASHING_INCLUDE_DIRS})
 endif()
 
-find_path(GTL_INCLUDE_DIRS "gtl/bit_vector.hpp")
-target_include_directories(luxir_lib PRIVATE ${GTL_INCLUDE_DIRS})
+target_include_directories(luxir_lib PUBLIC ${GTL_INCLUDE_DIRS})
 
 target_link_libraries(luxir_lib PRIVATE TBB::tbb)
 get_target_property(_luxir_tbb_type TBB::tbb TYPE)
@@ -318,7 +325,11 @@ if(_luxir_tbb_type STREQUAL "STATIC_LIBRARY")
 endif()
 target_link_libraries(luxir_lib PRIVATE xxHash::xxhash)
 target_link_libraries(luxir_lib PUBLIC Boost::core Boost::thread Boost::sort)
-target_link_libraries(luxir_lib PRIVATE fastpfor)
+# Codec.h exposes FastPFOR's 128-bit vector type to consumers.
+target_link_libraries(luxir_lib PUBLIC fastpfor)
+if(APPLE)
+  target_link_libraries(luxir_lib PUBLIC date::date-tz)
+endif()
 # Concrete luxir::api wire model (post-cutover): hand-written concrete structs + out-of-line
 # pb_meta/glz::meta (luxir_proto_concrete) carrying hpp_proto::runtime (is_utf8) + glaze.
 # libprotobuf for google::protobuf::Arena (kept as the allocator) and the DescriptorPool used

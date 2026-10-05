@@ -8,6 +8,7 @@
 #include <map>
 #include <stop_token>
 #include <unordered_map>
+#include "luxir/util/AtomicSharedPtr.h"
 #include "luxir/search/ReaderManager.h"
 
 namespace luxir {
@@ -51,7 +52,7 @@ private:
     uint64_t pins = 0;
     bool retired = false;
   };
-  std::atomic<std::shared_ptr<const CommitSnapshot>> current;
+  AtomicSharedPtr<const CommitSnapshot> current;
   std::mutex mutex;
   std::mutex retirementMutex; // joins directory access before close returns
   Policy policy;

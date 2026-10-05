@@ -10,7 +10,6 @@
 #include "luxir/util/Signal.h"
 
 namespace luxir {
-namespace {
 struct CatalogCollection { std::string commit; std::string state; };
 struct CatalogResponse {
   std::string boot;
@@ -19,6 +18,7 @@ struct CatalogResponse {
 };
 struct InstalledRequest { std::string follower; std::string collection; std::string commit; };
 
+namespace {
 void notify(std::map<uint64_t, std::function<void()>>& watches) {
   if (!watches.empty()) Signal::emit("replicationWatchNotify");
   for (auto& [id, completion] : watches) {

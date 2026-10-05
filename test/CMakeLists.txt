@@ -1,8 +1,7 @@
 # Copyright 2020-2026 Yonik Seeley and Luxir contributors
 # SPDX-License-Identifier: Apache-2.0
 
-find_package(GTest CONFIG REQUIRED)
-find_package(benchmark REQUIRED)
+# Dependencies.cmake provides GoogleTest and Google Benchmark.
 
 # CONFIGURE_DEPENDS: re-glob on build so a newly added test/helper .cpp is picked up
 # without a manual reconfigure (otherwise new files link as undefined symbols).
@@ -31,7 +30,9 @@ add_executable(decoded_successor_no_avx512_test
   basic_tests/DecodedSuccessorTest.cpp)
 target_include_directories(decoded_successor_no_avx512_test PRIVATE .)
 target_link_libraries(decoded_successor_no_avx512_test PRIVATE GTest::gtest_main)
-target_compile_options(decoded_successor_no_avx512_test PRIVATE -mno-avx512f)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$")
+  target_compile_options(decoded_successor_no_avx512_test PRIVATE -mno-avx512f)
+endif()
 target_compile_definitions(decoded_successor_no_avx512_test PRIVATE
   LUXIR_EXPECT_NO_AVX512=1)
 
@@ -41,8 +42,10 @@ add_executable(decoded_successor_scalar_test
   basic_tests/DecodedSuccessorTest.cpp)
 target_include_directories(decoded_successor_scalar_test PRIVATE .)
 target_link_libraries(decoded_successor_scalar_test PRIVATE GTest::gtest_main)
-target_compile_options(decoded_successor_scalar_test PRIVATE
-  -mno-avx512f -mno-avx2)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|i.86)$")
+  target_compile_options(decoded_successor_scalar_test PRIVATE
+    -mno-avx512f -mno-avx2)
+endif()
 target_compile_definitions(decoded_successor_scalar_test PRIVATE
   LUXIR_EXPECT_SCALAR=1)
 

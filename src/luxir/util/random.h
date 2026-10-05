@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <bit>
+#include <concepts>
+#include <type_traits>
 
 
 namespace luxir {
@@ -182,6 +184,20 @@ public:
 
   int32_t rint2(int32_t max) {
     return static_cast<int32_t>( rint(static_cast<uint32_t>(max)) );
+  }
+
+  // size_t and ptrdiff_t need not use the same underlying types as uint64_t
+  // and int64_t (notably on macOS).
+  template<std::integral T> requires (sizeof(T) <= sizeof(uint64_t))
+  T rint(T max) {
+    using Fixed = std::conditional_t<std::is_signed_v<T>, int64_t, uint64_t>;
+    return (T)rint((Fixed)max);
+  }
+
+  template<std::integral T> requires (sizeof(T) <= sizeof(uint64_t))
+  T rint2(T max) {
+    using Fixed = std::conditional_t<std::is_signed_v<T>, int64_t, uint64_t>;
+    return (T)rint2((Fixed)max);
   }
 
   template<typename T>

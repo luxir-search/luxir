@@ -3,6 +3,9 @@
 
 #include "LuxirConfig.h"
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <algorithm>
 #include <fstream>
 #include <limits>
@@ -11,6 +14,8 @@
 namespace luxir {
 
 namespace {
+
+#ifndef __APPLE__
 
 // Single integer from a one-line file; 0 if it is missing or not a number
 // (cgroup v2 spells "no limit" as the word "max").
@@ -21,9 +26,18 @@ int64_t readInt64File(const char* path) {
   return 0;
 }
 
+#endif
+
 }  // namespace
 
 int64_t systemRamBytes() {
+#ifdef __APPLE__
+  uint64_t bytes = 0;
+  size_t size = sizeof(bytes);
+  if (sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) != 0
+      || bytes > (uint64_t)std::numeric_limits<int64_t>::max()) return 0;
+  return (int64_t)bytes;
+#else
   long pages = sysconf(_SC_PHYS_PAGES);
   long pageSize = sysconf(_SC_PAGESIZE);
   if (pages <= 0 || pageSize <= 0) return 0;
@@ -38,6 +52,7 @@ int64_t systemRamBytes() {
     if (limit > 0 && limit < bytes) bytes = limit;
   }
   return bytes;
+#endif
 }
 
 /*
