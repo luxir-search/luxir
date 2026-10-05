@@ -241,6 +241,10 @@ struct ReplicationFollower::Impl {
     std::shared_ptr<Collection> candidate;
     std::string candidateIncarnation;
     std::map<std::string, FileDescriptor> verified;
+    bool needsAck() const {
+      return !serving.empty() && acknowledged != serving && !source.empty()
+          && CommitId::parse(source).incarnation == CommitId::parse(serving).incarnation;
+    }
   };
   LuxirNode& node;
   Source source;
@@ -689,7 +693,7 @@ struct ReplicationFollower::Impl {
           State* selected = nullptr;
           for (auto& [key, state] : states) {
             bool work = state.remove || (!state.source.empty() && ((state.source != state.serving && !state.waiting)
-                    || (state.source == state.serving && state.acknowledged != state.serving)));
+                    || state.needsAck()));
             if (!state.busy && !state.unavailable && work && Clock::now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
               name = key; selected = &state;
             }
@@ -713,16 +717,22 @@ struct ReplicationFollower::Impl {
         }
         if (remove) eraseLocal(name);
         else {
-          if (needsSync) sync(client, name);
-          {
-            std::lock_guard lock(mutex);
-            auto& state = states[name];
-            serving = state.source == state.serving ? state.serving : "";
-          }
-          if (!serving.empty()) {
+          auto acknowledge = [&] {
+            std::string ackBoot;
+            {
+              std::lock_guard lock(mutex);
+              auto& state = states[name];
+              serving = state.needsAck() ? state.serving : "";
+              ackBoot = boot;
+            }
+            if (serving.empty()) return;
             request(client, http::verb::post, "/_replication/installed", glz::write_json(Ack{binding.follower, name, serving}).value());
-            std::lock_guard lock(mutex); states[name].acknowledged = serving;
-          }
+            std::lock_guard lock(mutex);
+            if (boot == ackBoot) states[name].acknowledged = serving;
+          };
+          acknowledge();
+          if (needsSync) sync(client, name);
+          acknowledge();
         }
         persistState();
       } catch (const ReservationGone& e) { error = e.what(); Signal::emit("replicationReservationGone"); }

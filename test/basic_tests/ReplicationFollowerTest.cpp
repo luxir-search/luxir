@@ -1136,6 +1136,36 @@ TEST_F(ReplicationFollowerTest, refusesInvalidPromotionModes) {
   EXPECT_FALSE(std::filesystem::exists(config.store.data_dir));
 }
 
+TEST_F(ReplicationFollowerTest, acknowledgesServingWhileDiscoveryAdvances) {
+  startSource();
+  CollectionHelper h(*source, "main");
+  ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  auto first = h.collection().getShard()->getSnapshots().snapshot()->id;
+  std::latch release(1);
+  std::atomic<unsigned> installs{0};
+  Signal::listen("replicationRootWritten", [&](void*, void*, void*) -> void* {
+    if (++installs == 1) {
+      h.index(flatdoc("id", "b"), UpdateMessage::COMMIT);
+      auto next = h.collection().getShard()->getSnapshots().snapshot()->id.token();
+      EXPECT_TRUE(until([&] {
+        std::pmr::monotonic_buffer_resource arena;
+        api::ReplicationStatus stats;
+        follower->getFollower()->stats(stats, arena);
+        return !stats.collections.empty() && stats.collections[0].source_commit == next;
+      }));
+    } else release.wait();
+    return nullptr;
+  });
+  // Start the node before the server starts its follower threads.
+  auto cleanup = scope_guard([&] { release.count_down(); stopFollower(); });
+  startFollower();
+  ASSERT_TRUE(until([&] { return installs.load() >= 2; }));
+  EXPECT_TRUE(until([&] {
+    auto rows = source->getReplication().stats(*source);
+    return std::ranges::any_of(rows, [&](const auto& row) { return row.commit == first; });
+  }));
+}
+
 TEST_F(ReplicationFollowerTest, watchOnlyFollowersDoNotCountForAll) {
   startSource();
   httpRequest(sourcePort, http::verb::get, "/_replication/watch?follower=watcher&timeout_ms=0");
