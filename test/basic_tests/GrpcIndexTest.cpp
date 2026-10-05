@@ -1002,3 +1002,34 @@ TEST_F(GrpcIndexTest, replicaBarrierAndSearchFloor) {
   EXPECT_EQ("commit_incarnation_mismatch", response.msg.error->code);
   EXPECT_TRUE(stream.Finish().ok());
 }
+
+TEST_F(GrpcIndexTest, pipelinedUpdatesEnableReplicaWaitAfterAdmission) {
+  // Each stream starts without a wait, then enables cancellation while earlier
+  // updates can still complete on indexing threads.
+  for (int round = 0; round < 16; round++) {
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+    HppClientReaderWriter<api::UpdateRequest, api::UpdateResponse> stream(channel.get(), rpc::UpdateStream, &context);
+    for (int i = 0; i < 8; i++) {
+      api::UpdateRequest update;
+      update.commit.emplace();
+      if (i % 2) {
+        update.commit->wait_for_replicas = "1";
+        update.commit->replication_timeout_ms = 0;
+      }
+      ASSERT_TRUE(stream.Write(update));
+    }
+    stream.WritesDone();
+    Reply<api::UpdateResponse> reply;
+    int responses = 0, waits = 0;
+    while (stream.Read(&reply)) {
+      EXPECT_FALSE(reply.msg.error);
+      EXPECT_FALSE(reply.msg.commit.empty());
+      if (reply.msg.replicas) { waits++; EXPECT_EQ(true, reply.msg.replicas->timed_out); }
+      responses++;
+    }
+    EXPECT_TRUE(stream.Finish().ok());
+    EXPECT_EQ(8, responses);
+    EXPECT_EQ(4, waits);
+  }
+}

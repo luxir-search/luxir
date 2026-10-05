@@ -681,8 +681,12 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   public:
     std::unique_ptr<HppRequestState<UpdateReqProto>> request;
     GenericCallData* parent;
+    const std::stop_token waitToken;
     Update(std::unique_ptr<HppRequestState<UpdateReqProto>> requestState, GenericCallData* parent)
-      : ProtoUpdateMessage(&requestState->proto), request(std::move(requestState)), parent(parent) {}
+      : ProtoUpdateMessage(&requestState->proto), request(std::move(requestState)), parent(parent),
+        // Admission runs on the completion queue thread, as does enabling
+        // cancellation. Worker completions never read the mutable stop source.
+        waitToken(parent->waitCancellation.get_token()) {}
     virtual void done(IndexWriter& iw) override {
       unused(iw);
       complete(parent->server.getLuxirNode(), [this] {
@@ -696,7 +700,7 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
           }
           delete this;
         });
-      }, parent->waitCancellation.get_token());
+      }, waitToken);
     }
   };
 
