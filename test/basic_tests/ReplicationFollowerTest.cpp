@@ -66,6 +66,7 @@ protected:
     return until([&] {
       try { return follower->getCollection(name)->getShard()->getSnapshots().snapshot()->id == target; }
       catch (const CollectionNotFoundError&) { return false; }
+      catch (const CollectionUnavailableError&) { return false; }
     });
   }
   std::string status() { return httpRequest(followerServer->getPort(), http::verb::get, "/_replication/status").body(); }
@@ -90,6 +91,16 @@ protected:
     // Both requested server ports are occupied by the source: pull must not bind.
     return command({"luxir", "--server.http.port", std::to_string(sourcePort),
         "--server.grpc.port", std::to_string(sourcePort), "pull", url, followerConfig.store.data_dir});
+  }
+  std::filesystem::path makeLocalUnreadable() {
+    auto id = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
+    stopFollower();
+    auto dir = path / "follower" / "c" / "main" / id.incarnation;
+    auto root = dir / Manifest::name(id.index_gen);
+    std::filesystem::rename(root, root.string() + ".saved");
+    // ELOOP is independent of the test process's filesystem privileges.
+    std::filesystem::create_symlink(root.filename(), root);
+    return dir;
   }
   void exerciseSnapshots() {
     startSource(); startFollower();
@@ -458,6 +469,66 @@ TEST_F(ReplicationFollowerTest, corruptLocalCollectionIsFetchedAgain) {
   std::filesystem::remove(path / "follower" / "c" / "main" / id.incarnation / Manifest::name(id.index_gen));
   startFollower();
   ASSERT_TRUE(caughtUp());
+}
+
+TEST_F(ReplicationFollowerTest, unreadableStartupPreservesDataUntilEligibleInstall) {
+  sourceConfig.store.backend = "ram";
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto retained = makeLocalUnreadable();
+  stopSource(); startFollower();
+  EXPECT_THROW(follower->getCollection("main"), CollectionUnavailableError);
+  EXPECT_TRUE(std::filesystem::exists(retained));
+  EXPECT_NE(std::string::npos, httpRequest(followerServer->getPort(), http::verb::get, "/_stats").body().find("collection_unavailable"));
+  EXPECT_NE(std::string::npos, follower->getReplication().catalog(*follower).find("unavailable"));
+  startSource();
+  ASSERT_TRUE(until([&] { return stateIs("waiting"); }));
+  stopFollower(); startFollower();
+  ASSERT_TRUE(until([&] { return stateIs("waiting"); }));
+  EXPECT_THROW(follower->getCollection("main"), CollectionUnavailableError);
+  EXPECT_TRUE(std::filesystem::exists(retained));
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(until([&] {
+    try { return follower->getCollection("main")->getReaderManager().getReader()->liveDocs() == 1; }
+    catch (const CollectionUnavailableError&) { return false; }
+  }));
+  EXPECT_TRUE(until([&] { return !std::filesystem::exists(retained); }));
+}
+
+TEST_F(ReplicationFollowerTest, abandonedRepairKeepsUnreadableIncarnation) {
+  sourceConfig.store.backend = "ram";
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto retained = makeLocalUnreadable();
+  Signal::listen("replicationRootWritten", [](void*, void*, void*) -> void* { throw std::runtime_error("interrupted repair"); });
+  startFollower();
+  ASSERT_TRUE(until([&] { return status().find("interrupted repair") != std::string::npos; }));
+  stopSource(); startSource();
+  ASSERT_TRUE(until([&] { return stateIs("waiting"); }));
+  EXPECT_TRUE(std::filesystem::exists(retained));
+  EXPECT_THROW(follower->getCollection("main"), CollectionUnavailableError);
+}
+
+TEST_F(ReplicationFollowerTest, unreadableStartupCanBeDeletedBySourceOrAsOrphan) {
+  for (bool orphan : {false, true}) {
+    startSource(); startFollower();
+    ASSERT_TRUE(caughtUp());
+    auto retained = makeLocalUnreadable();
+    source->deleteCollection("main");
+    if (orphan) { stopSource(); startSource(); source->deleteCollection("main"); }
+    startFollower();
+    if (orphan) {
+      ASSERT_TRUE(until([&] { return stateIs("orphan"); }));
+      EXPECT_TRUE(std::filesystem::exists(retained));
+      follower->deleteCollection("main");
+    }
+    ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));
+    EXPECT_FALSE(std::filesystem::exists(retained));
+    stopFollower(); stopSource();
+    std::filesystem::remove_all(path);
+  }
 }
 
 TEST_F(ReplicationFollowerTest, sameBootAbsenceSurvivesFollowerRestart) {

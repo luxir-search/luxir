@@ -233,6 +233,8 @@ struct ReplicationFollower::Impl {
     bool busy = false, waiting = false, remove = false, unavailable = false;
     std::string seenBoot;
     bool replaceEmpty = true;
+    bool localUnavailable = false;
+    std::string localIncarnation;
     unsigned failures = 0;
     uint64_t progress = 0;
     Clock::time_point readySince = Clock::now();
@@ -291,9 +293,10 @@ struct ReplicationFollower::Impl {
     }
     if (binding.follower.empty() || binding.follower.size() > 255) throw std::invalid_argument("invalid follower id");
     for (const auto& name : node.dirFactory->listDirectories()) {
+      DirectoryFactory::Selection selection;
       try {
         LuxirNode::validateCollectionName(name);
-        auto selection = DirectoryFactory::current(*node.dirFactory->create(name));
+        selection = DirectoryFactory::current(*node.dirFactory->create(name));
         if (selection.incarnation.empty()) {
           std::vector<Directory::FileInfo> files;
           node.dirFactory->create(name)->listFiles(files);
@@ -312,15 +315,22 @@ struct ReplicationFollower::Impl {
         node.observeCollection(name, *col);
         auto& state = states[name];
         state.serving = snapshots.snapshot()->id.token();
-        auto& saved = binding.collections[name];
-        state.seenBoot = saved.boot;
-        state.source = saved.source;
-        state.replaceEmpty = saved.replace_empty;
       } catch (const std::exception& e) {
-        LOG_WARN("Discarding local replica '{}': {}", name, errorMessage(e));
-        try { node.dirFactory->remove(name); }
-        catch (const std::exception& cleanup) { LOG_WARN("Replica cleanup '{}' failed: {}", name, errorMessage(cleanup)); }
+        LOG_WARN("Local replica '{}' unavailable: {}", name, errorMessage(e));
+        auto tombstone = std::make_shared<Collection>();
+        tombstone->name = name;
+        tombstone->unavailableReason = "failed to load: " + errorMessage(e);
+        node.root->collections.getOrCreate(name, [&] { return tombstone; });
+        auto& state = states[name];
+        state.localUnavailable = true;
+        state.localIncarnation = selection.incarnation;
+        state.error = tombstone->unavailableReason;
       }
+      auto& state = states[name];
+      auto& saved = binding.collections[name];
+      state.seenBoot = saved.boot;
+      state.source = saved.source;
+      state.replaceEmpty = saved.replace_empty;
     }
     persistState();
   }
@@ -355,7 +365,7 @@ struct ReplicationFollower::Impl {
     auto old = node.root->collections.get(name);
     if (old) {
       node.root->collections.erase(name, old);
-      old->getShard()->getSnapshots().detach();
+      if (auto shard = old->getShard()) shard->getSnapshots().detach();
       node.replication->remove(name);
     }
     std::shared_ptr<Collection> candidate;
@@ -365,6 +375,7 @@ struct ReplicationFollower::Impl {
     std::lock_guard lock(mutex);
     auto& state = states[name];
     state.serving.clear(); state.acknowledged.clear();
+    state.localUnavailable = false; state.localIncarnation.clear();
     state.verified.clear(); state.candidateIncarnation.clear(); state.remove = false;
   }
 
@@ -415,7 +426,7 @@ struct ReplicationFollower::Impl {
           }
           std::erase_if(states, [](const auto& entry) {
             const auto& state = entry.second;
-            return !state.unavailable && state.source.empty() && state.serving.empty() && !state.candidate && !state.busy;
+            return !state.localUnavailable && !state.unavailable && state.source.empty() && state.serving.empty() && !state.candidate && !state.busy;
           });
         }
         persistState();
@@ -503,17 +514,21 @@ struct ReplicationFollower::Impl {
         throw std::runtime_error("source incarnation changed; retry snapshot");
       for (const auto& file : snapshot->files) state.total += file.size;
       auto active = node.root->collections.get(name);
-      bool sameIncarnation = active && active->getShard()->getSnapshots().snapshot()->id.incarnation == snapshot->id.incarnation;
-      if (sameIncarnation && snapshot->id.index_gen <= active->getShard()->getSnapshots().snapshot()->id.index_gen) {
+      auto shard = active ? active->getShard() : nullptr;
+      bool sameIncarnation = shard ? shard->getSnapshots().snapshot()->id.incarnation == snapshot->id.incarnation
+          : state.localIncarnation == snapshot->id.incarnation;
+      if (shard && sameIncarnation && snapshot->id.index_gen <= shard->getSnapshots().snapshot()->id.index_gen) {
         if (snapshot->id.token() == state.serving) {
           state.reused = state.total;
           return;
         }
         throw std::runtime_error("source went backwards");
       }
-      bool populated = false;
-      if (active) {
-        auto serving = active->getShard()->getSnapshots().snapshot();
+      // An unreadable copy may contain data. Only a known same incarnation,
+      // same-boot replacement, or populated source can replace it with certainty.
+      bool populated = state.localUnavailable;
+      if (shard) {
+        auto serving = shard->getSnapshots().snapshot();
         auto servingInfo = Manifest::decode(serving->bytes, arena);
         populated = std::ranges::any_of(servingInfo.segments, [](const auto& segment) { return segment.live_docs != 0; });
       }
@@ -523,16 +538,22 @@ struct ReplicationFollower::Impl {
       // An older empty snapshot must not park a newer eligible publication.
       state.waiting = !eligible && state.source == snapshot->id.token();
       if (state.candidateIncarnation != snapshot->id.incarnation) {
-        if (state.candidate != active) { obsoleteCandidate = state.candidate; obsoleteIncarnation = state.candidateIncarnation; }
+        if (state.candidate != active) {
+          obsoleteCandidate = state.candidate;
+          // A failed repair can share the unreadable local directory. Retain
+          // it until a verified install can sweep all obsolete incarnations.
+          if (!state.localUnavailable || (!state.localIncarnation.empty() && state.candidateIncarnation != state.localIncarnation))
+            obsoleteIncarnation = state.candidateIncarnation;
+        }
         state.verified.clear();
         state.candidateIncarnation = snapshot->id.incarnation;
-        state.candidate = sameIncarnation ? active : nullptr;
+        state.candidate = sameIncarnation && shard ? active : nullptr;
       }
       candidate = state.candidate;
     }
     if (obsoleteCandidate) {
       obsoleteCandidate->getShard()->getSnapshots().close();
-      node.dirFactory->remove(name + "/" + obsoleteIncarnation);
+      if (!obsoleteIncarnation.empty()) node.dirFactory->remove(name + "/" + obsoleteIncarnation);
     }
     if (!eligible) return;
     if (!candidate) {
@@ -610,10 +631,12 @@ struct ReplicationFollower::Impl {
       if (old != candidate) {
         if (old) {
           if (!node.root->collections.replace(name, old, candidate)) throw std::runtime_error("collection changed during installation");
-          auto oldIncarnation = old->getShard()->getSnapshots().snapshot()->id.incarnation;
-          old->getShard()->getSnapshots().detach();
-          try { node.dirFactory->remove(name + "/" + oldIncarnation); }
-          catch (const std::exception& e) { LOG_WARN("Retired incarnation cleanup failed: {}", e.what()); }
+          if (auto shard = old->getShard()) {
+            auto oldIncarnation = shard->getSnapshots().snapshot()->id.incarnation;
+            shard->getSnapshots().detach();
+            try { node.dirFactory->remove(name + "/" + oldIncarnation); }
+            catch (const std::exception& e) { LOG_WARN("Retired incarnation cleanup failed: {}", e.what()); }
+          }
         } else node.root->collections.getOrCreate(name, [&] { return candidate; });
         node.observeCollection(name, *candidate);
         node.replication->changed(name, snapshot->id.incarnation);
@@ -633,7 +656,8 @@ struct ReplicationFollower::Impl {
     } catch (const std::exception& e) { LOG_WARN("Follower retirement failed: {}", e.what()); }
     {
       std::lock_guard lock(mutex);
-      auto& state = states[name]; state.serving = snapshot->id.token(); state.error.clear(); state.verified.clear();
+      auto& state = states[name]; state.localUnavailable = false; state.localIncarnation.clear();
+      state.serving = snapshot->id.token(); state.error.clear(); state.verified.clear();
       if (!state.source.empty()) {
         auto advertised = CommitId::parse(state.source);
         if (advertised.incarnation == snapshot->id.incarnation && advertised.index_gen < snapshot->id.index_gen) state.source = state.serving;
@@ -750,7 +774,7 @@ struct ReplicationFollower::Impl {
           auto delay = std::chrono::seconds(std::min(60u, 1u << std::min(6u, state.failures)));
           state.failures++; state.retry = Clock::now() + delay;
         }
-        if (state.source.empty() && state.serving.empty() && !state.candidate && error.empty()) states.erase(name);
+        if (!state.localUnavailable && state.source.empty() && state.serving.empty() && !state.candidate && error.empty()) states.erase(name);
       }
       changed.notify_all();
     }

@@ -25,6 +25,10 @@ incarnation, including with an empty snapshot. Across a source restart, a new
 empty incarnation keeps a populated local copy serving until the source commits
 data. A source collection that becomes unavailable never means deletion.
 
+If a local collection cannot be opened at startup, the follower keeps its files
+and reports it unavailable. A later verified install can replace it. Until then,
+the unreadable copy is treated as populated for the empty-replacement rule.
+
 ## Write, then read your write
 
 ```sh
