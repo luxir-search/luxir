@@ -247,6 +247,7 @@ struct ReplicationFollower::Impl {
   };
   LuxirNode& node;
   Source source;
+  const std::vector<std::string> tenants;
   ReplicationState binding;
   std::mutex metadataMutex;
   std::string persisted;
@@ -261,7 +262,8 @@ struct ReplicationFollower::Impl {
   std::stop_source stopping;
   std::vector<std::jthread> threads;
 
-  explicit Impl(LuxirNode& node) : node(node), source(node.getConfig().replication.source) {
+  explicit Impl(LuxirNode& node) : node(node), source(node.getConfig().replication.source),
+      tenants(node.getConfig().replication.tenantFilter()) {
     if (node.getConfig().replication.downloads < 1 || node.getConfig().replication.downloads > 64) {
       throw std::invalid_argument("replication.downloads must be between 1 and 64");
     }
@@ -289,6 +291,10 @@ struct ReplicationFollower::Impl {
       binding.write(*metadata);
     }
     if (binding.follower.empty() || binding.follower.size() > 255) throw std::invalid_argument("invalid follower id");
+  }
+
+  bool includes(const CollectionId& id) const {
+    return tenants.empty() || std::ranges::find(tenants, id.tenant) != tenants.end();
   }
 
   void seed(const std::vector<Collections::Opened>& opened) {
@@ -349,15 +355,19 @@ struct ReplicationFollower::Impl {
   }
 
   api::ReplicationCatalog fetchCatalog(Client& client, const std::string& cursor, std::chrono::milliseconds timeout, std::pmr::memory_resource& arena) {
-    auto response = request(client, http::verb::get, "/_replication/watch?" + followerQuery()
+    std::string subscription;
+    for (const auto& tenant : tenants) subscription += "&tenant=" + escape(tenant);
+    auto response = request(client, http::verb::get, "/_replication/watch?" + followerQuery() + subscription
         + "&since=" + escape(cursor) + "&timeout_ms=" + std::to_string(timeout.count()), {}, timeout + 10s);
     api::ReplicationCatalog catalog;
     if (!api::read_json(catalog, api::build::arenaStr(arena, response.body()), arena) || catalog.boot.empty() || catalog.cursor.empty()) throw std::runtime_error("invalid source catalog");
+    Signal::emit("replicationCatalogReceived", &catalog);
     std::set<CollectionId> seen;
     for (const auto& entry : catalog.collections) {
       CollectionId id{std::string(entry.tenant), std::string(entry.collection)};
       Collections::validate(id);
       if (!seen.insert(std::move(id)).second) throw std::runtime_error("duplicate collection in source catalog");
+      if (entry.available && entry.commit.empty()) throw std::runtime_error("available source collection has no commit");
       if (!entry.commit.empty()) validateIncarnation(CommitId::parse(entry.commit).incarnation);
     }
     return catalog;
@@ -399,10 +409,12 @@ struct ReplicationFollower::Impl {
           std::map<CollectionId, const api::ReplicationCatalogEntry*> entries;
           for (const auto& entry : catalog.collections) {
             CollectionId id{std::string(entry.tenant), std::string(entry.collection)};
+            if (!includes(id)) continue;
             states.try_emplace(id);
             entries.emplace(std::move(id), &entry);
           }
           for (auto& [id, state] : states) {
+            if (!includes(id)) continue;
             auto it = entries.find(id);
             auto* found = it == entries.end() ? nullptr : it->second;
             bool present = found != nullptr;
@@ -412,9 +424,9 @@ struct ReplicationFollower::Impl {
               state.error.clear(); state.failures = 0; state.retry = {};
             }
           }
-          std::erase_if(states, [](const auto& entry) {
+          std::erase_if(states, [&](const auto& entry) {
             const auto& state = entry.second;
-            return !state.unreadable && !state.unavailable && !state.advertised && !state.serving && !state.candidate && !state.busy;
+            return includes(entry.first) && !state.unreadable && !state.unavailable && !state.advertised && !state.serving && !state.candidate && !state.busy;
           });
         }
         persistState();
@@ -660,6 +672,7 @@ struct ReplicationFollower::Impl {
     uint64_t transferred = 0, reused = 0;
     for (const auto& entry : catalog.collections) {
       CollectionId name{std::string(entry.tenant), std::string(entry.collection)};
+      if (!includes(name)) continue;
       auto& state = states[name];
       observe(state, advertisedCommit(entry), true, std::string(catalog.boot));
       state.downloaded = state.reused = 0;
@@ -697,6 +710,7 @@ struct ReplicationFollower::Impl {
           if (!connected) return false;
           State* selected = nullptr;
           for (auto& [key, state] : states) {
+            if (!includes(key)) continue;
             bool work = state.remove || (state.advertised && ((state.advertised != state.serving && !state.waiting)
                     || state.needsAck()));
             if (!state.busy && !state.unavailable && work && Clock::now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
@@ -782,8 +796,8 @@ void ReplicationFollower::deleteOrphan(const CollectionId& key) {
   Collections::validate(key);
   {
     std::unique_lock lock(impl->mutex);
-    if (!impl->connected || !impl->discovered || (impl->states.contains(key) && (impl->states.at(key).advertised || impl->states.at(key).unavailable))) {
-      throw ReadOnlyError("only a local orphan absent from the connected source may be deleted");
+    if (impl->includes(key) && (!impl->connected || !impl->discovered || (impl->states.contains(key) && (impl->states.at(key).advertised || impl->states.at(key).unavailable)))) {
+      throw ReadOnlyError("only an excluded local copy or an orphan absent from the connected source may be deleted");
     }
     if (impl->states.contains(key) && impl->states.at(key).busy) throw CollectionUnavailableError("local orphan is busy");
     if (!impl->node.collections().get(key)) throw CollectionNotFoundError("local orphan does not exist");
@@ -793,9 +807,12 @@ void ReplicationFollower::deleteOrphan(const CollectionId& key) {
   catch (...) {
     std::lock_guard lock(impl->mutex); impl->states[key].busy = false; impl->changed.notify_all(); throw;
   }
-  std::lock_guard lock(impl->mutex);
-  impl->states[key].busy = false;
-  if (!impl->states[key].advertised) impl->states.erase(key);
+  {
+    std::lock_guard lock(impl->mutex);
+    impl->states[key].busy = false;
+    if (!impl->includes(key) || !impl->states[key].advertised) impl->states.erase(key);
+  }
+  impl->persistState();
   impl->changed.notify_all();
 }
 void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_resource& arena) {
@@ -809,7 +826,7 @@ void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_re
     auto token = [&](const std::optional<CommitId>& id) { return id ? str(id->token()) : std::string_view(); };
     auto& row = rows[i++]; row.name = str(id.name); row.tenant = str(id.tenant); row.source_commit = token(state.advertised); row.serving_commit = token(state.serving);
     using State = api::ReplicationCollectionStatus::State;
-    row.state = (!impl->connected || state.unavailable) ? State::STALE : !state.advertised ? State::ORPHAN : !state.error.empty() ? State::ERROR
+    row.state = !impl->includes(id) ? State::ORPHAN : (!impl->connected || state.unavailable) ? State::STALE : !state.advertised ? State::ORPHAN : !state.error.empty() ? State::ERROR
         : state.waiting ? State::WAITING : state.advertised == state.serving ? State::SERVING : State::SYNCING;
     auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(state.retry - Clock::now()).count();
     if (!state.error.empty() && remaining > 0) row.next_retry = wallTime() + (uint64_t)remaining;

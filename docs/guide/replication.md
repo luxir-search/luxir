@@ -13,7 +13,11 @@ luxir --replicate-from http://writer:9400 --store.backend=fs --store.data-dir=/d
 curl http://reader:9400/_replication/status
 ```
 
-A follower follows the whole source namespace and serves ordinary local searches.
+A follower serves ordinary local searches and follows every tenant by default.
+Use `--replication.tenants alpha,beta` to follow only those tenants. The subscription
+is fixed for the process; restart to change it. An empty setting follows all tenants.
+Tenant names use the same lowercase naming rules as collections; empty elements
+inside a nonempty list are rejected.
 Start it with an empty directory or an existing follower directory. Repointing
 `--replicate-from` to another source reuses files whose name, size and xxh3 digest
 match, including across incarnations. An existing data directory must be a
@@ -55,7 +59,10 @@ Completed update bodies are released before the visibility wait.
 `all` captures live followers already serving some commit of that collection's
 incarnation when the commit completes. Watch-only and still-syncing followers
 are excluded; later arrivals do not join. Captured followers that expire stop
-being required. A dead follower remains live for
+being required, as do followers whose next watch unsubscribes from the collection's
+tenant. Subscription changes discard acknowledgments outside the new subscription;
+re-inclusion requires a fresh acknowledgment and never rejoins an already captured
+wait. A dead follower remains live for
 `replication.follower-timeout-ms`, so `all` can time out before it expires.
 A numeric N can exceed the live count and waits until timeout.
 
@@ -141,13 +148,18 @@ and node/per-collection RAM storage usage.
 | `serving` | The advertised snapshot is installed. |
 | `waiting` | A new source boot has an empty replacement for populated local data. Commit source data to replace it. |
 | `stale` | Source unreachable or collection unavailable. Repair the source/network; local searches continue. |
-| `orphan` | Name absent after a source boot change. Keep it, or delete it through the normal collection-delete API while connected. |
+| `orphan` | Local copy outside the tenant subscription, or name absent after a source boot change. Excluded copies can be deleted while disconnected; other orphans require a connected source. |
 | `error` | Inspect `last_error`; fix storage/network/corruption, then let `next_retry` run (backoff 1-60 s). A backwards generation requires restoring/promoting the source under a new incarnation. |
 
-Absence in the same source boot deletes the local collection. Absence after a
-boot change leaves an orphan: a restart can hide a deletion. Failed installs
-leave the old reader serving. Broken local replicas are discarded and fetched
-again. Fully verified candidate files survive restart and are checked for reuse;
+Automatic deletion requires current subscription membership, absence from a complete
+catalog for that tenant, and the same remembered source boot. Absence after a
+boot change leaves an orphan: a restart can hide a deletion. Narrowing the filter
+makes excluded local copies orphans immediately, even while disconnected. They
+are never synced, acknowledged or automatically deleted. Their source-boot and
+empty-replacement history is retained, so re-inclusion resumes normal recovery
+rules. Use `/tenants/TENANT/collections/_delete` to delete an excluded copy.
+Failed installs leave the old reader serving. Broken local replicas are discarded
+and fetched again. Fully verified candidate files survive restart and are checked for reuse;
 partial-file Range resume lasts only within a process.
 
 Use `--store.backend=ram` for a RAM writer or follower. RAM data and generated
@@ -168,6 +180,8 @@ All replication settings use `--replication.` (configuration keys use underscore
 |---|---:|---|
 | `source` | empty | Source HTTP URL; `--replicate-from` is shorthand |
 | `follower-id` | generated | Persisted FS follower identity |
+| `tenants` | empty (all) | Comma-separated tenant subscription; immutable until restart |
+| `max-acknowledgments` | 262144 | Node-wide follower/collection acknowledgment row budget |
 | `downloads` | 2 | Concurrent collection transfers |
 | `follower-timeout-ms` | 90000 | Live-follower window; watches are clamped to one third |
 | `pin-idle-timeout-ms` | 60000 | Pin expires without byte progress |
@@ -186,21 +200,30 @@ another client renews their shared pin. Followers back off after a lost
 pin.
 
 Storage layout is `c/tenant/name/incarnation/`, with `CURRENT` containing
-only the selected incarnation. A follower follows every tenant's collections. `replication.json` stores follower identity,
+only the selected incarnation. `replication.json` stores follower identity,
 last source URL and discovery/recovery state; it does not bind the source URL.
 
 | Endpoint | Contract |
 |---|---|
-| `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Full `{boot, cursor, collections}` catalog, one `{tenant, collection, commit, available}` entry per collection; echo the opaque cursor. Unknown cursors return immediately. Requested timeout is clamped to one third of the source follower timeout; followers request one third of their own. |
+| `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Full catalog for the subscription (`tenant=alpha&tenant=beta`, omit for all), one `{tenant, collection, commit, available}` entry per collection in `{boot, cursor, collections}`; echo the opaque node-wide cursor. Publications in other tenants neither wake the watch nor force an immediate response. Foreign-boot, malformed and future cursors return immediately. Empty/invalid tenant parameters are rejected. Requested timeout is clamped to one third of the source follower timeout; followers request one third of their own. |
 | `GET /tenants/TENANT/collections/COLLECTION/_snapshot` | Pins the current snapshot; binary manifest and `X-Luxir-Commit`. Add `?format=json` to inspect files/sizes/digests. HEAD has no side effects. |
 | `GET /tenants/TENANT/collections/COLLECTION/_snapshot/files/NAME?commit=TOKEN` | File from a pin; optional single byte Range (206/416), HEAD supported. Malformed/multiple ranges return full 200. Missing membership: 404 `file_not_in_snapshot`; expired pin: 410 `snapshot_expired`. |
 | `POST /_replication/installed` | JSON `{follower, tenant, collection, commit}` acknowledges a serving snapshot. |
 | `GET /_replication/status` | Status described above. |
 
+Sources allow up to 4096 live follower identities, independently of the
+acknowledgment budget. Each acknowledged `(follower, tenant, collection)` consumes
+one row. Watch-only followers consume no acknowledgment rows. At the budget,
+existing rows can still advance, while new rows return HTTP 429
+`too_many_acknowledgments`. Follower capacity returns 429 `too_many_followers`.
+Expiry, unsubscription, collection deletion and incarnation replacement free rows.
+An acknowledgment outside the follower's latest watch subscription is rejected.
+
 Snapshot/file GETs accept `follower=ID`; these, watches and installed acks renew
 liveness. On 410, back off, fetch a new snapshot and reuse verified files. Transfers send
 from the pinned mmap with advisory readahead and socket backpressure.
-The catalog uses the `ReplicationCatalog` proto message. Entries contain
-`commit` when known and `available` (false when absent). Installed acknowledgments
-use `ReplicationInstalled`; status states are the `ReplicationCollectionStatus.State`
+The catalog uses the `ReplicationCatalog` proto message. Available entries always
+carry a commit; unavailable entries may omit it. Followers reject malformed entries
+and duplicate collection identities before applying any catalog changes.
+Installed acknowledgments use `ReplicationInstalled`; status states are the `ReplicationCollectionStatus.State`
 enum, rendered as lowercase JSON names. Acknowledgments never move backwards within an incarnation.

@@ -589,6 +589,7 @@ private:
   std::string bufferedBody_;
   std::shared_ptr<HttpStreamUpdateState> streamUpdate_;
   std::optional<net::steady_timer> replicationTimer_;
+  std::vector<std::string> replicationTenants_;
   uint64_t replicationWatch_ = 0;
   uint64_t replicationWatchEpoch_ = 0;
   uint64_t replicationTransferEpoch_ = 0;
@@ -1894,7 +1895,7 @@ private:
     if (replicationStopped_) return;
     try {
       std::pmr::monotonic_buffer_resource arena;
-      auto catalog = node_.getReplication().catalog(arena);
+      auto catalog = node_.getReplication().catalog(arena, replicationTenants_);
       std::string body;
       if (!api::write_json(catalog, body)) throw std::runtime_error("failed to serialize catalog");
       respondJson(http::status::ok, std::move(body));
@@ -1908,6 +1909,11 @@ private:
       auto maximum = node_.getConfig().replication.follower_timeout_ms / 3;
       uint64_t timeout = (uint64_t)maximum;
       std::string cursor, follower;
+      replicationTenants_.clear();
+      for (const auto& param : urlParams_) if (param.key == "tenant") {
+        Collections::validateName(param.value, "tenant");
+        replicationTenants_.push_back(param.value);
+      }
       if (auto value = findParam(urlParams_, "since")) cursor = *value;
       if (auto value = findParam(urlParams_, "follower")) follower = *value;
       if (auto value = findParam(urlParams_, "timeout_ms")) timeout = replicationNumber(*value);
@@ -1924,7 +1930,7 @@ private:
             net::post(executor, [weak, pin, epoch] {
               if (auto session = weak.lock()) session->finishReplicationWatch(epoch);
             });
-          });
+          }, replicationTenants_);
       replicationTimer_->async_wait([self = shared_from_this(), epoch](beast::error_code ec) {
         if (!ec) self->finishReplicationWatch(epoch);
       });

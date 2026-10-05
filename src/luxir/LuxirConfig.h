@@ -144,7 +144,10 @@ struct ReplicationConfig {
   int64_t follower_timeout_ms = 90'000;
   std::string source;
   std::string follower_id;
+  std::string tenants; // comma-separated; empty subscribes to every tenant
+  uint64_t max_acknowledgments = 262144; // node-wide follower/collection rows
   int downloads = 2; // node-wide concurrent collection downloads
+  std::vector<std::string> tenantFilter() const;
   void validate() const;
 };
 

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ReplicationSource.h"
+#include "Collections.h"
+#include <charconv>
 #include "luxir/util/Uuid.h"
 #include "luxir/api/build.h"
 #include "luxir/util/log.h"
@@ -30,29 +32,58 @@ void fullTable() {
 }
 }
 
-ReplicationSource::ReplicationSource(std::chrono::milliseconds liveness, Now now)
-    : boot(newUuid()), liveness(liveness), now(std::move(now)) {}
+ReplicationSource::ReplicationSource(std::chrono::milliseconds liveness, Now now, uint64_t maxAcknowledgments)
+    : boot(newUuid()), maxAcknowledgments(maxAcknowledgments), liveness(liveness), now(std::move(now)) {}
+
+ReplicationSource::Watch ReplicationSource::takeWatchLocked(uint64_t id) {
+  auto entry = watches.extract(id);
+  auto& watch = entry.mapped();
+  if (watch.tenants.empty()) allWatches.erase(id);
+  else for (const auto& tenant : watch.tenants) {
+    auto it = tenantWatches.find(tenant);
+    it->second.watches.erase(id);
+    if (!it->second.revision && it->second.watches.empty()) tenantWatches.erase(it);
+  }
+  return std::move(watch);
+}
+
+std::map<uint64_t, std::function<void()>> ReplicationSource::changedLocked(const std::string& tenant) {
+  auto& state = tenantWatches[tenant];
+  state.revision = ++revision;
+  std::map<uint64_t, std::function<void()>> ready;
+  while (!allWatches.empty()) {
+    auto id = *allWatches.begin();
+    ready.emplace(id, takeWatchLocked(id).completion);
+  }
+  while (!state.watches.empty()) {
+    auto id = *state.watches.begin();
+    ready.emplace(id, takeWatchLocked(id).completion);
+  }
+  return ready;
+}
 
 void ReplicationSource::pruneLocked(const CollectionId& name) {
   auto current = collections.find(name);
   for (auto& [id, follower] : followers) {
     auto it = follower.commits.find(name);
     if (it != follower.commits.end() && (current == collections.end() || !current->second.commit
-        || current->second.commit->incarnation != it->second.incarnation)) follower.commits.erase(it);
+        || current->second.commit->incarnation != it->second.commit.incarnation)) {
+      follower.commits.erase(it);
+      acknowledgments--;
+    }
   }
 }
 
 void ReplicationSource::registered(const CollectionId& name, const std::shared_ptr<Collection>& collection) noexcept {
   try {
-    decltype(watches) ready;
+    std::map<uint64_t, std::function<void()>> ready;
     {
       std::lock_guard lock(mutex);
       auto& state = collections[name];
       if (state.collection.lock() != collection) state = {collection, {}, {}};
       state.refresh();
       pruneLocked(name);
-      revision++;
-      ready.swap(watches);
+      ready = changedLocked(name.tenant);
     }
     notify(ready);
   } catch (...) { LOG_ERROR("Replication registration notification failed"); }
@@ -60,15 +91,14 @@ void ReplicationSource::registered(const CollectionId& name, const std::shared_p
 
 void ReplicationSource::updated(const CollectionId& name, const Collection& collection) noexcept {
   try {
-    decltype(watches) ready;
+    std::map<uint64_t, std::function<void()>> ready;
     {
       std::lock_guard lock(mutex);
       auto it = collections.find(name);
       if (it == collections.end() || it->second.collection.lock().get() != &collection) return;
       it->second.refresh();
       pruneLocked(name);
-      revision++;
-      ready.swap(watches);
+      ready = changedLocked(name.tenant);
     }
     notify(ready);
   } catch (...) { LOG_ERROR("Replication publication notification failed"); }
@@ -76,13 +106,12 @@ void ReplicationSource::updated(const CollectionId& name, const Collection& coll
 
 void ReplicationSource::removed(const CollectionId& name) noexcept {
   try {
-    decltype(watches) ready;
+    std::map<uint64_t, std::function<void()>> ready;
     {
       std::lock_guard lock(mutex);
       collections.erase(name);
       pruneLocked(name);
-      revision++;
-      ready.swap(watches);
+      ready = changedLocked(name.tenant);
     }
     notify(ready);
   } catch (...) { LOG_ERROR("Replication deletion notification failed"); }
@@ -90,13 +119,11 @@ void ReplicationSource::removed(const CollectionId& name) noexcept {
 
 void ReplicationSource::expireLocked() {
   auto time = now();
-  std::erase_if(followers, [&](const auto& entry) { return time - entry.second.seen >= liveness; });
-}
-
-size_t ReplicationSource::rowsLocked() const {
-  size_t rows = 0;
-  for (const auto& [id, follower] : followers) rows += std::max((size_t)1, follower.commits.size());
-  return rows;
+  std::erase_if(followers, [&](const auto& entry) {
+    if (time - entry.second.seen < liveness) return false;
+    acknowledgments -= entry.second.commits.size();
+    return true;
+  });
 }
 
 void ReplicationSource::seenLocked(std::string_view follower) {
@@ -104,7 +131,7 @@ void ReplicationSource::seenLocked(std::string_view follower) {
   validateFollower(follower);
   auto it = followers.find(follower);
   if (it == followers.end()) {
-    if (rowsLocked() >= 4096) fullTable();
+    if (followers.size() >= 4096) fullTable();
     it = followers.emplace(std::string(follower), LiveFollower{}).first;
   }
   it->second.seen = now();
@@ -112,25 +139,56 @@ void ReplicationSource::seenLocked(std::string_view follower) {
 }
 
 uint64_t ReplicationSource::watch(std::string_view cursor, std::string_view follower,
-                                 std::function<void()> completion) {
+                                 std::function<void()> completion, std::span<const std::string> tenants) {
+  std::set<std::string> subscription;
+  for (const auto& tenant : tenants) {
+    Collections::validateName(tenant, "tenant");
+    subscription.insert(tenant);
+  }
+  uint64_t parked = 0;
+  bool membershipChanged = false;
   {
     std::lock_guard lock(mutex);
     expireLocked();
     seenLocked(follower);
-    if (cursor == boot + ":" + std::to_string(revision)) {
-      auto id = ++nextWatch;
-      watches.emplace(id, std::move(completion));
-      return id;
+    if (!follower.empty()) {
+      auto& live = followers.find(follower)->second;
+      membershipChanged = live.tenants != subscription;
+      live.tenants = subscription;
+      acknowledgments -= std::erase_if(live.commits, [&](const auto& entry) { return !live.includes(entry.first); });
+    }
+    uint64_t relevant = revision;
+    if (!subscription.empty()) {
+      relevant = 0;
+      for (const auto& tenant : subscription) {
+        auto it = tenantWatches.find(tenant);
+        if (it != tenantWatches.end()) relevant = std::max(relevant, it->second.revision);
+      }
+    }
+    auto prefix = boot + ":";
+    uint64_t since = 0;
+    bool current = false;
+    if (cursor.starts_with(prefix)) {
+      auto number = cursor.substr(prefix.size());
+      auto [end, error] = std::from_chars(number.data(), number.data() + number.size(), since);
+      current = error == std::errc() && end == number.data() + number.size() && since >= relevant && since <= revision;
+    }
+    if (current) {
+      parked = ++nextWatch;
+      watches.emplace(parked, Watch{subscription, std::move(completion)});
+      if (subscription.empty()) allWatches.insert(parked);
+      else for (const auto& tenant : subscription) tenantWatches[tenant].watches.insert(parked);
     }
   }
-  completion();
-  return 0;
+  if (membershipChanged && acknowledgmentsChanged) acknowledgmentsChanged(nullptr);
+  if (!parked) completion();
+  return parked;
 }
 
 void ReplicationSource::cancel(uint64_t watch) {
   if (!watch) return;
   std::lock_guard lock(mutex);
-  watches.erase(watch);
+  if (watches.contains(watch)) takeWatchLocked(watch);
 }
 
 api::ReplicationCatalog ReplicationSource::catalog(std::pmr::memory_resource& arena, std::span<const std::string> tenants) {
@@ -167,11 +225,18 @@ void ReplicationSource::installed(const api::ReplicationInstalled& request) {
     if (id.incarnation != current.incarnation || id.index_gen > current.index_gen)
       throw std::invalid_argument("installed commit does not belong to the current collection");
     auto follower = followers.find(request.follower);
-    bool extraRow = follower == followers.end() ||
-        (!follower->second.commits.empty() && !follower->second.commits.contains(target));
-    if (extraRow && rowsLocked() >= 4096) fullTable();
+    if (follower != followers.end() && !follower->second.includes(target))
+      throw std::invalid_argument("installed collection is outside follower subscription");
+    bool extraRow = follower == followers.end() || !follower->second.commits.contains(target);
+    if (extraRow && acknowledgments >= maxAcknowledgments)
+      throw ApiError(ErrorKind::RESOURCE_EXHAUSTED, "too_many_acknowledgments", "acknowledgment row budget is full");
     seenLocked(request.follower);
-    auto& installed = followers.find(request.follower)->second.commits[target];
+    auto [entry, added] = followers.find(request.follower)->second.commits.try_emplace(target);
+    if (added) {
+      acknowledgments++;
+      entry->second.membership = ++nextMembership;
+    }
+    auto& installed = entry->second.commit;
     if (installed.incarnation != id.incarnation || installed.index_gen < id.index_gen) installed = std::move(id);
   }
   if (acknowledgmentsChanged) acknowledgmentsChanged(&target);
@@ -184,7 +249,7 @@ std::vector<ReplicationSource::Follower> ReplicationSource::status() {
   for (const auto& [id, follower] : followers) {
     if (follower.commits.empty()) result.push_back({id, {}, {}, follower.lastSeen, {}});
     for (const auto& [name, commit] : follower.commits)
-      result.push_back({id, name, commit, follower.lastSeen, collections.at(name).commit->index_gen - commit.index_gen});
+      result.push_back({id, name, commit.commit, follower.lastSeen, collections.at(name).commit->index_gen - commit.commit.index_gen});
   }
   return result;
 }
@@ -220,7 +285,8 @@ ReplicationSource::Barrier ReplicationSource::capture(const api::ReplicaRequirem
     expireLocked();
     for (const auto& [id, follower] : followers) {
       auto serving = follower.commits.find(collection);
-      if (serving != follower.commits.end() && serving->second.incarnation == commit.incarnation) result.members.insert(id);
+      if (follower.includes(collection) && serving != follower.commits.end()
+          && serving->second.commit.incarnation == commit.incarnation) result.members.emplace(id, serving->second.membership);
     }
   }
   return result;
@@ -231,14 +297,16 @@ api::ReplicaResult ReplicationSource::progress(const Barrier& barrier, const Col
   expireLocked();
   uint32_t wanted = barrier.all ? 0 : barrier.wanted, serving = 0;
   for (const auto& [name, follower] : followers) {
+    if (!follower.includes(collection)) continue;
+    auto commit = follower.commits.find(collection);
     if (barrier.all) {
       auto member = barrier.members.find(name);
-      if (member == barrier.members.end()) continue;
+      if (member == barrier.members.end() || commit == follower.commits.end()
+          || member->second != commit->second.membership) continue;
       wanted++;
     }
-    auto commit = follower.commits.find(collection);
-    if (commit != follower.commits.end() && commit->second.incarnation == id.incarnation
-        && commit->second.index_gen >= id.index_gen) serving++;
+    if (commit != follower.commits.end() && commit->second.commit.incarnation == id.incarnation
+        && commit->second.commit.index_gen >= id.index_gen) serving++;
   }
   return {wanted, serving, api::ReplicaResult::Outcome::SATISFIED};
 }

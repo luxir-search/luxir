@@ -681,4 +681,104 @@ TEST_F(ReplicationHttpTest, halfClosedClientStillReceivesSatisfiedWait) {
   EXPECT_EQ("satisfied", result["replicas"]["outcome"].get<std::string>());
 }
 
+
+TEST_F(ReplicationHttpTest, watchParsesEveryTenantAndFiltersCatalog) {
+  node->createCollection(CollectionId{"alpha", "docs"});
+  node->createCollection(CollectionId{"beta", "docs"});
+  auto result = catalog("/_replication/watch?tenant=alpha&tenant=beta&timeout_ms=0");
+  ASSERT_EQ(2u, result["collections"].get<Json::array_t>().size());
+  for (const auto& row : result["collections"].get<Json::array_t>())
+    EXPECT_NE("default", row["tenant"].get<std::string>());
+  for (auto query : {"tenant=", "tenant=alpha&tenant=", "tenant=&tenant=alpha",
+                     "tenant=alpha&tenant=Bad", "tenant=alpha,beta", "tenant=.."})
+    EXPECT_EQ(400, get(std::string("/_replication/watch?timeout_ms=0&") + query).result_int()) << query;
+}
+
+TEST_F(ReplicationHttpTest, filteredWatchesTrackOnlyRelevantRevisions) {
+  auto& source = node->getReplication();
+  std::array<std::string, 1> alpha{"alpha"}, beta{"beta"};
+  std::array<std::string, 2> both{"alpha", "beta"};
+  std::pmr::monotonic_buffer_resource arena;
+  auto cursor = std::string(source.catalog(arena).cursor);
+  int alphaDone = 0, betaDone = 0, bothDone = 0, allDone = 0;
+  auto a = source.watch(cursor, {}, [&] { alphaDone++; }, alpha);
+  auto b = source.watch(cursor, {}, [&] { betaDone++; }, beta);
+  auto ab = source.watch(cursor, {}, [&] { bothDone++; }, both);
+  auto all = source.watch(cursor, {}, [&] { allDone++; });
+  ASSERT_NE(0u, a); ASSERT_NE(0u, b); ASSERT_NE(0u, ab); ASSERT_NE(0u, all);
+  node->createCollection(CollectionId{"beta", "docs"});
+  EXPECT_EQ(0, alphaDone); EXPECT_EQ(1, betaDone); EXPECT_EQ(1, bothDone); EXPECT_EQ(1, allDone);
+  // The node cursor advanced, but alpha's old cursor still parks.
+  auto another = source.watch(cursor, {}, [&] { alphaDone++; }, alpha);
+  EXPECT_NE(0u, another);
+  source.cancel(another);
+  node->createCollection(CollectionId{"alpha", "docs"});
+  EXPECT_EQ(1, alphaDone); EXPECT_EQ(1, bothDone);
+  EXPECT_EQ(0u, source.watch(cursor, {}, [&] { alphaDone++; }, alpha));
+  EXPECT_EQ(2, alphaDone);
+  cursor = source.catalog(arena).cursor;
+  auto removed = source.watch(cursor, {}, [&] { alphaDone++; }, alpha);
+  ASSERT_NE(0u, removed);
+  node->deleteCollection(CollectionId{"alpha", "docs"});
+  EXPECT_EQ(3, alphaDone);
+  EXPECT_EQ(0u, source.watch(cursor, {}, [&] { alphaDone++; }, alpha));
+  EXPECT_EQ(4, alphaDone);
+  auto foreign = "other:" + std::string(source.catalog(arena).cursor);
+  EXPECT_EQ(0u, source.watch(foreign, {}, [] {}, alpha));
+}
+
+TEST_F(ReplicationHttpTest, filteredHttpWatchParksAcrossUnrelatedPublication) {
+  auto initial = catalog();
+  auto beta = node->createCollection(CollectionId{"beta", "docs"});
+  std::promise<void> parked;
+  Signal::listen("replicationWatchParked", [&](void*, void*, void*) -> void* { parked.set_value(); return nullptr; });
+  auto watch = std::async(std::launch::async, [&] {
+    return catalog("/_replication/watch?tenant=alpha&since=" + cursor(initial) + "&timeout_ms=2000");
+  });
+  ASSERT_EQ(std::future_status::ready, parked.get_future().wait_for(1s));
+  std::atomic<int> notifications{0};
+  Signal::listen("replicationWatchNotify", [&](void*, void*, void*) -> void* { notifications++; return nullptr; });
+  node->getReplication().updated(beta->getId(), *beta);
+  EXPECT_EQ(0, notifications.load());
+  EXPECT_EQ(std::future_status::timeout, watch.wait_for(0ms));
+  node->createCollection(CollectionId{"alpha", "docs"});
+  EXPECT_EQ(1, notifications.load());
+  auto result = watch.get();
+  ASSERT_EQ(1u, result["collections"].get<Json::array_t>().size());
+  EXPECT_EQ("alpha", result["collections"][0]["tenant"].get<std::string>());
+}
+
+TEST_F(ReplicationHttpTest, acknowledgmentBudgetIsIndependentOfFollowerCount) {
+  auto time = ReplicationSource::Clock::now();
+  ReplicationSource source(90s, [&] { return time; }, 2);
+  auto first = node->getCollection("main");
+  auto second = node->createCollection(CollectionId{"alpha", "docs"});
+  auto third = node->createCollection(CollectionId{"beta", "docs"});
+  source.registered(CollectionId::of("main"), first);
+  source.registered(second->getId(), second);
+  source.registered(third->getId(), third);
+  auto ack = [&](std::string follower, const std::shared_ptr<Collection>& collection) {
+    auto id = collection->getId();
+    source.installed({follower, id.tenant, id.name, collection->getShard()->getSnapshots().snapshot()->id.token()});
+  };
+  ack("f", first); ack("f", second);
+  EXPECT_THROW(ack("f", third), ApiError);
+  EXPECT_THROW(ack("new", third), ApiError);
+  ASSERT_TRUE(h->index(flatdoc("id", "budget"), UpdateMessage::COMMIT).success);
+  source.updated(first->getId(), *first);
+  EXPECT_NO_THROW(ack("f", first)); // an existing row can advance at the budget
+  EXPECT_NO_THROW(source.watch({}, "watch-only", [] {}));
+  EXPECT_EQ(3u, source.status().size()); // two acknowledgments plus a live follower
+  std::array<std::string, 1> alpha{"alpha"};
+  source.watch({}, "f", [] {}, alpha); // pruning frees the default row
+  EXPECT_THROW(ack("f", first), std::invalid_argument);
+  EXPECT_NO_THROW(ack("new", third));
+  EXPECT_THROW(ack("watch-only", first), ApiError);
+  source.removed(third->getId());
+  EXPECT_NO_THROW(ack("watch-only", first));
+  time += 90s;
+  EXPECT_NO_THROW(ack("after-expiry", first));
+  EXPECT_EQ(1u, source.status().size());
+}
+
 }

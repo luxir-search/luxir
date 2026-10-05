@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "LuxirConfig.h"
+#include "luxir/server/Collections.h"
 #include <unistd.h>
 #include <algorithm>
 #include <fstream>
@@ -53,7 +54,26 @@ Rough hierarchy:
 */
 
 
+std::vector<std::string> ReplicationConfig::tenantFilter() const {
+  std::vector<std::string> result;
+  if (tenants.empty()) return result;
+  std::string_view remaining = tenants;
+  for (;;) {
+    auto comma = remaining.find(',');
+    auto tenant = remaining.substr(0, comma);
+    Collections::validateName(tenant, "tenant");
+    result.emplace_back(tenant);
+    if (comma == std::string_view::npos) break;
+    remaining.remove_prefix(comma + 1);
+  }
+  std::ranges::sort(result);
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+
 void ReplicationConfig::validate() const {
+  tenantFilter();
+  if (!max_acknowledgments) throw std::invalid_argument("replication.max-acknowledgments must be positive");
   if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
     throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
   }
@@ -61,6 +81,9 @@ void ReplicationConfig::validate() const {
 
 void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--replicate-from,--replication.source", replication.source, "Follow this HTTP source namespace");
+  app.add_option("--replication.tenants", replication.tenants, "Comma-separated tenant subscription (empty follows all)");
+  app.add_option("--replication.max-acknowledgments", replication.max_acknowledgments,
+      "Node-wide follower/collection acknowledgment row budget")->default_val(replication.max_acknowledgments);
   app.add_option("--replication.follower-id", replication.follower_id, "Stable follower id (generated when omitted)");
   app.add_option("--replication.downloads", replication.downloads, "Concurrent collection downloads per follower")->check(CLI::Range(1, 64));
   app.add_flag("--read-only", read_only,

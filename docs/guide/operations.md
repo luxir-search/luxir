@@ -65,8 +65,11 @@ offline without risking a stray write. Current limitations:
 
 Restart the read-only node to pick up newer commits and release pinned files.
 For a continuously refreshed copy with its own storage, use
-[`--replicate-from http://writer:9400`](replication.md). Followers own their local
-data directory and install verified snapshots without constructing an index writer.
+[`--replicate-from http://writer:9400`](replication.md). Add
+`--replication.tenants alpha,beta` to restrict the subscription; restart to change
+it. Excluded local copies become orphans and can be deleted even while disconnected.
+Followers own their local data directory and install verified snapshots without
+constructing an index writer.
 
 ## Collection lifecycle
 

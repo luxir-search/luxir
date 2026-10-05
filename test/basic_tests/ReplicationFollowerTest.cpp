@@ -71,6 +71,18 @@ protected:
       catch (const CollectionUnavailableError&) { return false; }
     });
   }
+  bool caughtUp(const CollectionId& id) {
+    auto target = source->getCollection(id)->getShard()->getSnapshots().snapshot()->id;
+    return until([&] {
+      try { return follower->getCollection(id)->getShard()->getSnapshots().snapshot()->id == target; }
+      catch (const CollectionResolutionError&) { return false; }
+    });
+  }
+  bool acknowledged(const CollectionId& id) {
+    return until([&] {
+      return std::ranges::any_of(source->getReplication().status(), [&](const auto& row) { return row.collection == id; });
+    });
+  }
   std::string status() { return httpRequest(followerServer->getPort(), http::verb::get, "/_replication/status").body(); }
   bool stateIs(std::string_view state) {
     glz::generic json;
@@ -588,6 +600,13 @@ TEST_F(ReplicationFollowerTest, sweepKeepsInstalledRootAfterInterruptedNewerRoot
   Signal::unlisten("snapshotRootDurable");
   registry.publish(middle);
   ASSERT_TRUE(caughtUp());
+  // Publication precedes orphan sweeping; wait for the worker's post-sweep state.
+  ASSERT_TRUE(until([&] {
+    std::pmr::monotonic_buffer_resource arena;
+    api::ReplicationStatus stats;
+    follower->getFollower()->stats(stats, arena);
+    return stats.collections.front().serving_commit == middle->id.token();
+  }));
   auto& local = follower->getCollection("main")->getShard()->getSnapshots().dir;
   EXPECT_EQ(middle->id.index_gen, Manifest::load(local).generation);
   stopFollower(); startFollower();
@@ -1399,6 +1418,149 @@ TEST_F(ReplicationFollowerTest, followsCollectionsOfEveryTenant) {
   ASSERT_TRUE(until([&] {
     return std::ranges::any_of(source->getReplication().status(), [&](const auto& row) { return row.collection == docs; });
   }));
+}
+
+
+TEST_F(ReplicationFollowerTest, tenantFilterConfig) {
+  LuxirConfig config;
+  CLI::App app;
+  config.addOptions(app);
+  app.parse("--replication.tenants beta,alpha,beta --replication.max-acknowledgments 17");
+  EXPECT_EQ((std::vector<std::string>{"alpha", "beta"}), config.replication.tenantFilter());
+  EXPECT_EQ(17u, config.replication.max_acknowledgments);
+  config.replication.tenants.clear();
+  EXPECT_TRUE(config.replication.tenantFilter().empty());
+  for (auto tenants : {",alpha", "alpha,", "alpha,,beta", "Alpha", "alpha/beta", "alpha, beta"}) {
+    config.replication.tenants = tenants;
+    EXPECT_THROW(config.replication.validate(), InvalidCollectionNameError) << tenants;
+  }
+  config.replication.tenants.clear();
+  config.replication.max_acknowledgments = 0;
+  EXPECT_THROW(config.replication.validate(), std::invalid_argument);
+}
+
+TEST_F(ReplicationFollowerTest, filteredFollowerIgnoresOtherTenants) {
+  startSource();
+  CollectionId alpha{"alpha", "docs"}, beta{"beta", "docs"};
+  source->createCollection(alpha); source->createCollection(beta);
+  followerConfig.replication.tenants = "alpha";
+  std::pmr::monotonic_buffer_resource received;
+  auto join = scope_guard([&] { stopFollower(); });
+  Signal::listen("replicationCatalogReceived", [&](void* value, void*, void*) -> void* {
+    // Also enforce membership locally if a peer returns an unfiltered catalog.
+    *(api::ReplicationCatalog*)value = source->getReplication().catalog(received);
+    return nullptr;
+  });
+  startFollower();
+  ASSERT_TRUE(caughtUp(alpha)); ASSERT_TRUE(acknowledged(alpha));
+  EXPECT_THROW(follower->getCollection(beta), CollectionNotFoundError);
+  EXPECT_THROW(follower->getCollection("main"), CollectionNotFoundError);
+  source->deleteCollection(beta);
+  { CollectionHelper h(*source, alpha); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp(alpha));
+  std::pmr::monotonic_buffer_resource arena;
+  api::ReplicationStatus stats;
+  follower->getFollower()->stats(stats, arena);
+  ASSERT_EQ(1u, stats.collections.size());
+  EXPECT_EQ("alpha", stats.collections[0].tenant);
+  for (const auto& row : source->getReplication().status()) EXPECT_EQ(alpha, row.collection);
+}
+
+TEST_F(ReplicationFollowerTest, narrowerRestartOrphansCopiesAndDropsBarrierMembership) {
+  // Retain source liveness throughout restart so subscription change, not expiry, releases membership.
+  sourceConfig.replication.follower_timeout_ms = 60000;
+  startSource();
+  CollectionId alpha{"alpha", "docs"}, beta{"beta", "docs"};
+  source->createCollection(alpha); source->createCollection(beta);
+  startFollower();
+  ASSERT_TRUE(caughtUp(alpha)); ASSERT_TRUE(caughtUp(beta)); ASSERT_TRUE(acknowledged(beta));
+  auto token = source->getCollection(beta)->getShard()->getSnapshots().snapshot()->id;
+  auto barrier = source->getReplication().capture({api::AllReplicas{}}, beta, token);
+  ASSERT_EQ(1u, barrier.members.size());
+  stopFollower();
+  followerConfig.replication.tenants = "alpha";
+  startFollower();
+  ASSERT_TRUE(until([&] { return source->getReplication().progress(barrier, beta, token).wanted == 0; }));
+  ASSERT_TRUE(stateIs("orphan"));
+  auto before = follower->getCollection(beta)->getShard()->getSnapshots().snapshot()->id;
+  source->deleteCollection(beta);
+  { CollectionHelper h(*source, alpha); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp(alpha));
+  EXPECT_EQ(before, follower->getCollection(beta)->getShard()->getSnapshots().snapshot()->id);
+  // Restart disconnected: the filter alone authorizes orphan deletion.
+  stopFollower(); sourceServer.reset();
+  startFollower();
+  EXPECT_TRUE(stateIs("orphan"));
+  EXPECT_NO_THROW(follower->getFollower()->deleteOrphan(beta));
+  EXPECT_THROW(follower->getCollection(beta), CollectionNotFoundError);
+  EXPECT_THROW(follower->getFollower()->deleteOrphan(alpha), ReadOnlyError);
+  std::pmr::monotonic_buffer_resource arena;
+  api::ReplicationStatus stats;
+  follower->getFollower()->stats(stats, arena);
+  EXPECT_FALSE(std::ranges::any_of(stats.collections, [](const auto& row) { return row.tenant == "beta"; }));
+  FSDirectory dir(followerConfig.store.data_dir);
+  EXPECT_FALSE(ReplicationState::read(*dir.openFile("replication.json")).tenants.contains("beta"));
+}
+
+TEST_F(ReplicationFollowerTest, excludedHistorySurvivesUntilReinclusion) {
+  startSource();
+  CollectionId beta{"beta", "docs"};
+  { CollectionHelper h(*source, beta); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
+  startFollower(); ASSERT_TRUE(caughtUp(beta));
+  auto saved = [&] {
+    FSDirectory dir(followerConfig.store.data_dir);
+    return ReplicationState::read(*dir.openFile("replication.json")).collection(beta);
+  };
+  ASSERT_TRUE(until([&] { return !saved().boot.empty(); }));
+  stopFollower();
+  auto history = saved();
+  followerConfig.replication.tenants = "default";
+  source->deleteCollection(beta);
+  startFollower(); ASSERT_TRUE(caughtUp()); ASSERT_TRUE(stateIs("orphan"));
+  stopFollower();
+  EXPECT_EQ(history.boot, saved().boot);
+  EXPECT_EQ(history.replace_empty, saved().replace_empty);
+  EXPECT_EQ(history.advertised, saved().advertised);
+  followerConfig.replication.tenants.clear();
+  startFollower();
+  ASSERT_TRUE(until([&] {
+    try { follower->getCollection(beta); return false; }
+    catch (const CollectionNotFoundError&) { return true; }
+  })); // same-boot catalog absence becomes authoritative again
+}
+
+TEST_F(ReplicationFollowerTest, invalidCatalogIsRejectedBeforeApplyingAnyEntry) {
+  startSource(); startFollower(); ASSERT_TRUE(caughtUp());
+  stopFollower();
+  auto serving = source->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
+  source->deleteCollection("main");
+  std::array<api::ReplicationCatalogEntry, 2> entries;
+  std::string token = serving.token();
+  std::atomic<int> mode{0};
+  auto join = scope_guard([&] { stopFollower(); });
+  Signal::listen("replicationCatalogReceived", [&](void* value, void*, void*) -> void* {
+    // Fault injection into a real HTTP catalog: no partial absence or entry can be applied.
+    entries = {{{.commit = token, .tenant = "alpha", .collection = "docs", .available = true},
+                {.commit = token, .tenant = "alpha", .collection = "docs", .available = true}}};
+    if (mode == 1) entries[1].tenant = "Bad";
+    if (mode == 2) entries[1] = {.commit = "malformed", .tenant = "beta", .collection = "docs", .available = true};
+    if (mode == 3) entries[1] = {.commit = "not-a-uuid:1", .tenant = "beta", .collection = "docs", .available = true};
+    if (mode == 4) entries[1] = {.commit = {}, .tenant = "beta", .collection = "docs", .available = true};
+    ((api::ReplicationCatalog*)value)->collections = entries;
+    return nullptr;
+  });
+  for (mode = 0; mode < 5; mode++) {
+    startFollower();
+    ASSERT_TRUE(until([&] {
+      std::pmr::monotonic_buffer_resource arena;
+      api::ReplicationStatus stats;
+      follower->getFollower()->stats(stats, arena);
+      return !stats.connected.value_or(false) && !stats.collections.empty() && !stats.collections[0].last_error.empty();
+    }));
+    EXPECT_EQ(serving, follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id);
+    EXPECT_THROW(follower->getCollection(CollectionId{"alpha", "docs"}), CollectionNotFoundError);
+    stopFollower();
+  }
 }
 
 }

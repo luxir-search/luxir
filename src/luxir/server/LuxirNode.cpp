@@ -19,7 +19,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   auto& replicationConfig = this->config.replication;
   replicationConfig.validate();
   replication = std::make_shared<ReplicationSource>(std::chrono::milliseconds(
-      replicationConfig.follower_timeout_ms));
+      replicationConfig.follower_timeout_ms), ReplicationSource::Clock::now, replicationConfig.max_acknowledgments);
   commitWaits = std::make_shared<CommitWaits>(*replication, following());
   replication->onAcknowledgmentsChanged([weak = std::weak_ptr(commitWaits)](const CollectionId* id) {
     if (auto waits = weak.lock()) waits->acknowledged(id);
