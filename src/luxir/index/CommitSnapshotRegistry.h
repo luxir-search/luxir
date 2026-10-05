@@ -51,7 +51,6 @@ private:
     uint64_t pins = 0;
     bool retired = false;
   };
-  std::atomic<std::shared_ptr<const CommitSnapshot>> current;
   std::mutex mutex;
   std::mutex retirementMutex; // joins directory access before close returns
   Policy policy;
@@ -77,7 +76,7 @@ private:
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
 public:
   explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now)
-      : now(std::move(now)), dir(dir), readers(dir, current, config) {}
+      : now(std::move(now)), dir(dir), readers(dir, config) {}
   ~CommitSnapshotRegistry() { close(); }
   void close() noexcept;
   // The owning writer failed after durable publication: close and notify.
@@ -85,7 +84,11 @@ public:
   // Stop reservations and join retirement while admitted searches retain readers.
   void detach() noexcept;
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
-  std::shared_ptr<const CommitSnapshot> snapshot() const { return current.load(); }
+  // Installers other than the writer: make `snapshot`'s root durable, publish it
+  // with the prepared reader, then retire the previous root and the files only
+  // it referenced. Throws before publication if the root may not be durable.
+  void commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened);
+  std::shared_ptr<const CommitSnapshot> snapshot() const { return readers.snapshot(); }
   void openLocalSnapshot();
   void sweepOrphans(const Manifest& manifest);
   void sweepOrphans();

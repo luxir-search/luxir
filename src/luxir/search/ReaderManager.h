@@ -11,13 +11,13 @@
 
 namespace luxir {
 
-// A collection's search view, independent of who installs its snapshots.
-// A writer or follower serializes install() after making a snapshot durable.
+// A collection's search view, independent of who publishes its snapshots.
+// A writer or follower serializes publish() after making a snapshot durable.
 // Recreating a collection uses a new manager and cache for its new incarnation.
 class ReaderManager {
   Directory& dir;
   std::mutex indexReaderMutex;
-  std::atomic<std::shared_ptr<const CommitSnapshot>>& published;
+  std::atomic<std::shared_ptr<const CommitSnapshot>> published;
   // These read-only query hints must not share the snapshot or reader lock bit.
   alignas(64) std::atomic<bool> closed = false;
   std::atomic<uint64_t> publishedSchemaGen = 0;
@@ -88,16 +88,15 @@ private:
 public:
   Stats stats(bool includeSegments);
   void cacheStats(CacheStats& out) const;
-  explicit ReaderManager(Directory& dir, std::atomic<std::shared_ptr<const CommitSnapshot>>& published,
-                         FilterCacheConfig config = {});
+  explicit ReaderManager(Directory& dir, FilterCacheConfig config = {});
   std::shared_ptr<IndexReader> getReader(uint64_t freshness_us = 0);
   std::shared_ptr<const CommitSnapshot> snapshot() const { return published.load(); }
   std::shared_ptr<Schema> getSchema() const { return snapshot()->schema; }
-  // Local writers install durable metadata and reopen lazily on demand.
-  void install(std::shared_ptr<const CommitSnapshot> snapshot) noexcept;
-  // Installers open first, persist the local root, then install the opened view.
+  // Opens a reader for a snapshot before it is published.
   std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot);
-  void installOpened(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> reader);
+  // Publishes a durable snapshot. With a reader from prepare() searches switch
+  // to it now; without one, readers reopen lazily on demand (local writers).
+  void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   std::string resolvedSchema();
   void close() noexcept { closed.store(true, std::memory_order_release); }
   // Quiescent tests only: clear the physical namespace and cache together.

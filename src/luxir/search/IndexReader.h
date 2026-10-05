@@ -24,6 +24,7 @@ class FieldType;
 class FilterCache;
 class OrdMap;
 class Schema;
+struct CommitSnapshot;
 
 /// LiveDocs holds the live document bitmap for a segment
 class LiveDocs {
@@ -302,11 +303,12 @@ public:
   // Names and types remain valid while the caller holds the reader.
   std::span<const RetrievableField> retrievableFields();
 
-  // Direct tools/tests may omit the schema if they only use physical state.
-  IndexReader(Directory& dir, IndexReader* previousReader = nullptr,
-              std::shared_ptr<FilterCache> filterCache = nullptr,
-              std::shared_ptr<Schema> schema = nullptr,
-              std::shared_ptr<const std::vector<std::byte>> manifest = {});
+  // Opens a published snapshot, reusing what it shares with previousReader.
+  IndexReader(Directory& dir, const CommitSnapshot& snapshot, IndexReader* previousReader = nullptr,
+              std::shared_ptr<FilterCache> filterCache = nullptr);
+  // Direct tools/tests: the newest durable root, or an empty index.
+  explicit IndexReader(Directory& dir, IndexReader* previousReader = nullptr,
+                       std::shared_ptr<FilterCache> filterCache = nullptr);
 };
 
 }

@@ -3,6 +3,7 @@
 
 #include "IndexReader.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/index/CommitSnapshot.h"
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/StoredFieldsReader.h"
@@ -126,10 +127,14 @@ IndexReader::IndexReader(Snapshot snapshot, std::shared_ptr<FilterCache> filterC
     core(std::move(snapshot.core)), sharedSchema(std::move(snapshot.schema)),
     sharedFilterCache(std::move(filterCache)) {}
 
-IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
-                         std::shared_ptr<FilterCache> filterCache, std::shared_ptr<Schema> schema,
-                         std::shared_ptr<const std::vector<std::byte>> manifest)
-  : IndexReader(openSnapshot(dir, previousReader, std::move(schema), std::move(manifest)),
+IndexReader::IndexReader(Directory& dir, const CommitSnapshot& snapshot, IndexReader* previousReader,
+                         std::shared_ptr<FilterCache> filterCache)
+  : IndexReader(openSnapshot(dir, previousReader, snapshot.schema, snapshot.bytes),
+                filterCache ? std::move(filterCache)
+                    : (previousReader ? previousReader->sharedFilterCache : nullptr)) {}
+
+IndexReader::IndexReader(Directory& dir, IndexReader* previousReader, std::shared_ptr<FilterCache> filterCache)
+  : IndexReader(openSnapshot(dir, previousReader, nullptr, nullptr),
                 filterCache ? std::move(filterCache)
                     : (previousReader ? previousReader->sharedFilterCache : nullptr)) {}
 

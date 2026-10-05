@@ -8,27 +8,18 @@
 
 namespace luxir {
 
-ReaderManager::ReaderManager(Directory& dir, std::atomic<std::shared_ptr<const CommitSnapshot>>& published,
-                             FilterCacheConfig config)
-    : dir(dir), published(published), originalFilterCacheConfig(config), filterCache(std::make_shared<FilterCache>(config)) {}
+ReaderManager::ReaderManager(Directory& dir, FilterCacheConfig config)
+    : dir(dir), originalFilterCacheConfig(config), filterCache(std::make_shared<FilterCache>(config)) {}
 
 void ReaderManager::throwClosed() {
   throw ApiError(ErrorKind::UNAVAILABLE, "reader_closed", "reader manager is closed");
-}
-
-void ReaderManager::install(std::shared_ptr<const CommitSnapshot> snapshot) noexcept {
-  // Hints precede the owning state: a fast-path miss may reopen early, but
-  // satisfied searches acquire only the reader and plain scalar atomics.
-  lastAdvertisedCommitTime.store(snapshot->commitTime, std::memory_order_relaxed);
-  publishedSchemaGen.store(snapshot->schema->gen_, std::memory_order_relaxed);
-  published.store(std::move(snapshot), std::memory_order_release);
 }
 
 std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot) {
   std::lock_guard lock(indexReaderMutex);
   checkOpen();
   auto previous = indexReader.load();
-  return std::make_shared<IndexReader>(dir, previous.get(), filterCache, snapshot.schema, snapshot.bytes);
+  return std::make_shared<IndexReader>(dir, snapshot, previous.get(), filterCache);
 }
 
 void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {
@@ -37,17 +28,25 @@ void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {
   indexReader.store(std::move(reader), std::memory_order_release);
 }
 
-void ReaderManager::installOpened(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> reader) {
-  std::lock_guard lock(indexReaderMutex);
-  checkOpen();
-  assert(reader->commitId() == snapshot->id.index_gen && reader->schema() == snapshot->schema);
-  publishReader(std::move(reader));
-  install(std::move(snapshot));
+void ReaderManager::publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened) {
+  std::unique_lock lock(indexReaderMutex, std::defer_lock);
+  if (opened) {
+    lock.lock();
+    checkOpen();
+    assert(opened->commitId() == snapshot->id.index_gen && opened->schema() == snapshot->schema);
+    publishReader(std::move(opened));
+  }
+  // Hints precede the owning state: a fast-path miss may reopen early, but
+  // satisfied searches acquire only the reader and plain scalar atomics.
+  lastAdvertisedCommitTime.store(snapshot->commitTime, std::memory_order_relaxed);
+  publishedSchemaGen.store(snapshot->schema->gen_, std::memory_order_relaxed);
+  published.store(std::move(snapshot), std::memory_order_release);
 }
 
 void ReaderManager::testReset() {
   std::lock_guard lock(indexReaderMutex);
   closed.store(false);
+  published.store(nullptr);
   indexReader.store(nullptr, std::memory_order_release);
   filterCache = std::make_shared<FilterCache>(originalFilterCacheConfig);
 }
@@ -84,7 +83,7 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
         if (!snapshot) throw ApiError(ErrorKind::UNAVAILABLE, "snapshot_unavailable", "no snapshot installed");
         try {
           Signal::emit("indexReaderOpening", this);
-          return std::make_shared<IndexReader>(dir, previous, filterCache, snapshot->schema, snapshot->bytes);
+          return std::make_shared<IndexReader>(dir, *snapshot, previous, filterCache);
         } catch (...) {
           if (snapshot == published.load()) throw;
         }

@@ -131,7 +131,8 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     lastCommitTime = indexInfo.commit_time;
     lastSnapshot.store(std::make_shared<const CommitSnapshot>(manifest.bytes,
         Schema::fromStored(*indexInfo.schema, indexInfo.schema_gen),
-        CommitId{incarnation, indexInfo.index_gen}, indexInfo.commit_time, filesOf(indexInfo)));
+        CommitId{incarnation, indexInfo.index_gen}, indexInfo.commit_time, filesOf(indexInfo),
+        CommitSnapshot::populatedOf(indexInfo)));
     snapshots.publish(lastSnapshot.load());
     indexGen = indexInfo.index_gen;
     coreGen = indexInfo.core_gen;
@@ -1897,7 +1898,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
 
   auto snapshot = std::make_shared<const CommitSnapshot>(
       std::make_shared<const std::vector<std::byte>>(std::move(serialized)), schema,
-      CommitId{incarnation, info.index_gen}, info.commit_time, filesOf(info));
+      CommitId{incarnation, info.index_gen}, info.commit_time, filesOf(info), CommitSnapshot::populatedOf(info));
   std::pmr::monotonic_buffer_resource retirementArena;
   api::IndexInfo obsolete;
   if (previous) obsolete = Manifest::decode(previous->bytes, retirementArena);
@@ -1920,13 +1921,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   auto failure = std::make_shared<const std::string>("snapshot publication failed");
   bool durable = false;
   try {
-    Manifest::write(dir, info.index_gen, *snapshot->bytes);
-    Signal::emit("manifestWritten", this);
-    std::array<std::string, 1> syncFiles = {Manifest::name(info.index_gen)};
-    dir.sync(syncFiles);
-    Signal::emit("manifestSynced", this);
-    std::array<std::string, 1> syncDirectory = {"."};
-    dir.sync(syncDirectory);
+    Manifest::commit(dir, info.index_gen, *snapshot->bytes, this);
     durable = true;
     Signal::emit("manifestDurable", this);
     {

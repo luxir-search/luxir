@@ -449,11 +449,11 @@ TEST_F(ReplicationFollowerTest, rootBeforeCurrentCrashKeepsOldIncarnation) {
   auto old = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
   stopSource(); startSource();
   ASSERT_TRUE(until([&] { return stateIs("waiting"); }));
-  Signal::listen("replicationRootWritten", [](void*, void*, void*) -> void* { throw std::runtime_error("interrupted before CURRENT"); });
+  Signal::listen("snapshotRootDurable", [](void*, void*, void*) -> void* { throw std::runtime_error("interrupted before CURRENT"); });
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success); }
   ASSERT_TRUE(until([&] { return stateIs("error"); }));
   stopFollower(); stopSource();
-  Signal::unlisten("replicationRootWritten");
+  Signal::unlisten("snapshotRootDurable");
   startFollower();
   EXPECT_EQ(old, follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id);
   startSource();
@@ -503,7 +503,7 @@ TEST_F(ReplicationFollowerTest, abandonedRepairKeepsUnreadableIncarnation) {
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success); }
   ASSERT_TRUE(caughtUp());
   auto retained = makeLocalUnreadable();
-  Signal::listen("replicationRootWritten", [](void*, void*, void*) -> void* { throw std::runtime_error("interrupted repair"); });
+  Signal::listen("snapshotRootDurable", [](void*, void*, void*) -> void* { throw std::runtime_error("interrupted repair"); });
   startFollower();
   ASSERT_TRUE(until([&] { return status().find("interrupted repair") != std::string::npos; }));
   stopSource(); startSource();
@@ -577,10 +577,10 @@ TEST_F(ReplicationFollowerTest, sweepKeepsInstalledRootAfterInterruptedNewerRoot
   ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
   auto middle = registry.acquire();
   ASSERT_TRUE(h.index(flatdoc("id", "c"), UpdateMessage::COMMIT).success);
-  Signal::listen("replicationRootWritten", [](void*, void*, void*) -> void* { throw std::runtime_error("interrupted newer root"); });
+  Signal::listen("snapshotRootDurable", [](void*, void*, void*) -> void* { throw std::runtime_error("interrupted newer root"); });
   startFollower();
   ASSERT_TRUE(until([&] { return stateIs("error"); }));
-  Signal::unlisten("replicationRootWritten");
+  Signal::unlisten("snapshotRootDurable");
   registry.publish(middle);
   ASSERT_TRUE(caughtUp());
   auto& local = follower->getCollection("main")->getShard()->getSnapshots().dir;
@@ -1179,7 +1179,7 @@ TEST_F(ReplicationFollowerTest, pullReportsCollectionFailureAndInstallsOtherColl
     CollectionHelper h(*source, name); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
   }
   unsigned installs = 0;
-  Signal::listen("replicationRootWritten", [&](void*, void*, void*) -> void* {
+  Signal::listen("snapshotRootDurable", [&](void*, void*, void*) -> void* {
     if (installs++ == 0) throw std::runtime_error("interrupted installation");
     return nullptr;
   });
@@ -1263,7 +1263,7 @@ TEST_F(ReplicationFollowerTest, acknowledgesServingWhileDiscoveryAdvances) {
   auto first = h.collection().getShard()->getSnapshots().snapshot()->id;
   std::latch release(1);
   std::atomic<unsigned> installs{0};
-  Signal::listen("replicationRootWritten", [&](void*, void*, void*) -> void* {
+  Signal::listen("snapshotRootDurable", [&](void*, void*, void*) -> void* {
     if (++installs == 1) {
       h.index(flatdoc("id", "b"), UpdateMessage::COMMIT);
       auto next = h.collection().getShard()->getSnapshots().snapshot()->id.token();
@@ -1299,10 +1299,10 @@ TEST_F(ReplicationFollowerTest, watchOnlyFollowersDoNotCountForAll) {
 TEST_F(ReplicationFollowerTest, restartReusesVerifiedCandidateFiles) {
   startSource();
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
-  Signal::listen("replicationRootWritten", [](void*, void*, void*) -> void* { throw std::runtime_error("stop before CURRENT"); });
+  Signal::listen("snapshotRootDurable", [](void*, void*, void*) -> void* { throw std::runtime_error("stop before CURRENT"); });
   startFollower();
   ASSERT_TRUE(until([&] { return stateIs("error"); }));
-  stopFollower(); Signal::unlisten("replicationRootWritten");
+  stopFollower(); Signal::unlisten("snapshotRootDurable");
   startFollower(); ASSERT_TRUE(caughtUp());
   api::ReplicationStatus status; std::pmr::monotonic_buffer_resource arena;
   follower->getFollower()->stats(status, arena);

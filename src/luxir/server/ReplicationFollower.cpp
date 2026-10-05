@@ -500,9 +500,7 @@ struct ReplicationFollower::Impl {
     auto snapshot = CommitSnapshot::fromBytes(bytes);
     validateIncarnation(snapshot->id.incarnation);
     if (response["X-Luxir-Commit"] != snapshot->id.token()) throw std::runtime_error("snapshot commit mismatch");
-    std::pmr::monotonic_buffer_resource arena;
-    auto info = Manifest::decode(bytes, arena);
-    if (!info.core_gen) Signal::emit("replicationEmptySnapshotReceived");
+    if (!snapshot->populated) Signal::emit("replicationEmptySnapshotReceived");
     std::shared_ptr<Collection> candidate, obsoleteCandidate;
     std::string obsoleteIncarnation;
     bool eligible;
@@ -526,14 +524,8 @@ struct ReplicationFollower::Impl {
       }
       // An unreadable copy may contain data. Only a known same incarnation,
       // same-boot replacement, or populated source can replace it with certainty.
-      bool populated = state.localUnavailable;
-      if (shard) {
-        auto serving = shard->getSnapshots().snapshot();
-        auto servingInfo = Manifest::decode(serving->bytes, arena);
-        populated = std::ranges::any_of(servingInfo.segments, [](const auto& segment) { return segment.live_docs != 0; });
-      }
-      eligible = !populated || sameIncarnation || state.replaceEmpty
-          || std::ranges::any_of(info.segments, [](const auto& segment) { return segment.live_docs != 0; });
+      bool populated = shard ? shard->getSnapshots().snapshot()->populated : state.localUnavailable;
+      eligible = !populated || sameIncarnation || state.replaceEmpty || snapshot->populated;
       // Discovery may have advanced while this snapshot request was in flight.
       // An older empty snapshot must not park a newer eligible publication.
       state.waiting = !eligible && state.source == snapshot->id.token();
@@ -612,46 +604,36 @@ struct ReplicationFollower::Impl {
       if (!durableNames.contains(file.name)) names.push_back(file.name);
     }
     dir.sync(names); syncDir(dir);
-    auto opened = registry.readers.prepare(*snapshot);
+    // A candidate can already hold this root from an interrupted activation.
+    bool committed = previous && previous->id == snapshot->id;
+    auto opened = committed ? nullptr : registry.readers.prepare(*snapshot);
     {
       std::lock_guard lock(mutex);
       if (states[name].source.empty() || CommitId::parse(states[name].source).incarnation != snapshot->id.incarnation)
         throw std::runtime_error("source collection changed during transfer");
     }
     if (stopping.stop_requested()) return;
-    bool wroteRoot = false;
-    try {
-      Manifest::write(dir, snapshot->id.index_gen, *bytes);
-      std::array<std::string, 1> root{Manifest::name(snapshot->id.index_gen)};
-      dir.sync(root); syncDir(dir); wroteRoot = true;
-      Signal::emit("replicationRootWritten");
-      if (!previous) node.dirFactory->collection(name).select(snapshot->id.incarnation);
-      registry.publish(snapshot, std::move(opened));
-      auto old = node.root->collections.get(name);
-      if (old != candidate) {
-        if (old) {
-          if (!node.root->collections.replace(name, old, candidate)) throw std::runtime_error("collection changed during installation");
-        } else node.root->collections.getOrCreate(name, [&] { return candidate; });
-        node.observeCollection(name, *candidate);
-        node.events->registered(name, candidate);
-        if (auto shard = old ? old->getShard() : nullptr) {
-          auto oldIncarnation = shard->getSnapshots().snapshot()->id.incarnation;
-          shard->getSnapshots().detach();
-          try { node.dirFactory->collection(name).removeIncarnation(oldIncarnation); }
-          catch (const std::exception& e) { LOG_WARN("Retired incarnation cleanup failed: {}", e.what()); }
-        }
+    // An unregistered candidate's publication is invisible until activation.
+    if (!committed) registry.commit(snapshot, std::move(opened));
+    auto storage = node.dirFactory->collection(name);
+    if (storage.current() != snapshot->id.incarnation) storage.select(snapshot->id.incarnation);
+    auto old = node.root->collections.get(name);
+    if (old != candidate) {
+      if (old) {
+        if (!node.root->collections.replace(name, old, candidate)) throw std::runtime_error("collection changed during installation");
+      } else node.root->collections.getOrCreate(name, [&] { return candidate; });
+      node.observeCollection(name, *candidate);
+      node.events->registered(name, candidate);
+      if (auto shard = old ? old->getShard() : nullptr) {
+        auto oldIncarnation = shard->getSnapshots().snapshot()->id.incarnation;
+        shard->getSnapshots().detach();
+        try { storage.removeIncarnation(oldIncarnation); }
+        catch (const std::exception& e) { LOG_WARN("Retired incarnation cleanup failed: {}", e.what()); }
       }
-    } catch (...) {
-      if (!wroteRoot) {
-        try { dir.deleteFile(Manifest::name(snapshot->id.index_gen)); syncDir(dir); } catch (...) {}
-      }
-      throw;
     }
-    try {
-      if (previous) registry.retire(CommitSnapshotRegistry::obsoleteFiles(*previous, *snapshot));
-      registry.sweepOrphans();
-      node.dirFactory->collection(name).retainOnly(snapshot->id.incarnation);
-    } catch (const std::exception& e) { LOG_WARN("Follower retirement failed: {}", e.what()); }
+    try { registry.sweepOrphans(); }
+    catch (const std::exception& e) { LOG_WARN("Follower retirement failed: {}", e.what()); }
+    storage.retainOnly(snapshot->id.incarnation);
     {
       std::lock_guard lock(mutex);
       auto& state = states[name]; state.localUnavailable = false; state.localIncarnation.clear();

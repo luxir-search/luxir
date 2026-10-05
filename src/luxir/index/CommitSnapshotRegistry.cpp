@@ -11,9 +11,32 @@ namespace luxir {
 void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snapshot,
                                      std::shared_ptr<IndexReader> opened) {
   // No reservation lock: a large acquire or slow file open cannot stall publication.
-  if (opened) readers.installOpened(snapshot, std::move(opened));
-  else readers.install(snapshot);
+  readers.publish(std::move(snapshot), std::move(opened));
   notifyChange();
+}
+
+void CommitSnapshotRegistry::commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened) {
+  auto previous = this->snapshot();
+  try {
+    Manifest::commit(dir, snapshot->id.index_gen, *snapshot->bytes);
+  } catch (...) {
+    try {
+      dir.deleteFile(Manifest::name(snapshot->id.index_gen));
+      std::array<std::string, 1> directory{"."};
+      dir.sync(directory);
+    } catch (...) {}
+    throw;
+  }
+  Signal::emit("snapshotRootDurable", this);
+  publish(snapshot, std::move(opened));
+  // Best-effort: obsolete names that reappear after a crash are unreferenced.
+  try {
+    if (previous) {
+      auto names = obsoleteFiles(*previous, *snapshot);
+      if (previous->id.index_gen != snapshot->id.index_gen) names.push_back(Manifest::name(previous->id.index_gen));
+      retire(names);
+    }
+  } catch (const std::exception& e) { LOG_WARN("Snapshot retirement failed: {}", e.what()); }
 }
 
 void CommitSnapshotRegistry::notifyChange() noexcept {
@@ -87,7 +110,7 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::acquire(std::stop_
   auto cleanup = scope_guard([&] { unlink(retired); });
   std::lock_guard lock(mutex);
   expireLocked(retired);
-  auto commit = current.load();
+  auto commit = snapshot();
   if (closed || !commit) throw SnapshotExpiredError();
   if (auto it = reservations.find(commit->id); it != reservations.end()) {
     it->second.lastRead = now();
@@ -186,7 +209,7 @@ void CommitSnapshotRegistry::enforceBudgetLocked(std::vector<std::string>& retir
 auto CommitSnapshotRegistry::oldestReclaimableLocked() -> decltype(reservations)::iterator {
   auto oldest = reservations.end();
   if (closed || counters.retainedBytes == 0) return oldest;
-  auto published = current.load();
+  auto published = snapshot();
   for (auto it = reservations.begin(); it != reservations.end(); ++it) {
     const auto& reservation = it->second;
     if ((published && it->first == published->id) || reservation.openFiles.use_count() != 1) continue;
@@ -287,7 +310,7 @@ void CommitSnapshotRegistry::retire(std::span<const std::string> names) {
     if (closed) return;
     expireLocked(retired);
 #ifndef NDEBUG
-    auto published = current.load();
+    auto published = snapshot();
 #endif
     for (const auto& name : names) {
       assert(!published || std::ranges::none_of(published->files,
@@ -309,7 +332,6 @@ void CommitSnapshotRegistry::testReset() {
   std::lock_guard lock(mutex);
   closed = false;
   counters = {};
-  current.store(nullptr);
   readers.testReset();
 }
 

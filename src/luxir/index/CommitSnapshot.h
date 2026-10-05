@@ -7,6 +7,7 @@
 #include "luxir/store/OutputStream.h"
 
 namespace luxir {
+namespace api { struct IndexInfo; }
 
 // Owning snapshot identity for asynchronous completion and synchronous commits.
 struct CommitId {
@@ -26,8 +27,10 @@ struct CommitSnapshot {
   CommitId id;
   uint64_t commitTime;
   std::vector<FileDescriptor> files;
+  bool populated; // some segment has a live document
 
   static std::shared_ptr<const CommitSnapshot> fromBytes(Bytes bytes);
+  static bool populatedOf(const api::IndexInfo& info);
 };
 
 }
