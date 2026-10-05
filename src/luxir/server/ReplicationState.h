@@ -10,7 +10,7 @@ namespace luxir {
 // Node-local follower identity and discovery history. CURRENT only selects data.
 struct ReplicationState {
   struct Collection {
-    std::string source;
+    std::string advertised;
     std::string boot;
     bool replace_empty = true;
     // Durable promotion target, recorded before switching CURRENT. A restart

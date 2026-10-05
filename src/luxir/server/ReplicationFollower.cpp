@@ -229,12 +229,16 @@ struct ReservationGone : std::runtime_error { ReservationGone() : std::runtime_e
 
 struct ReplicationFollower::Impl {
   struct State {
-    std::string source, serving, acknowledged, error;
+    // advertised: the source's current commit; serving: installed locally;
+    // acknowledged: last serving commit the source accepted. Independent.
+    std::optional<CommitId> advertised, serving, acknowledged;
+    std::string error;
     bool busy = false, waiting = false, remove = false, unavailable = false;
     std::string seenBoot;
     bool replaceEmpty = true;
-    bool localUnavailable = false;
-    std::string localIncarnation;
+    // The local copy could not be opened; CURRENT, if it could be read, selects
+    // this incarnation ("" otherwise). It is retained until an install replaces it.
+    std::optional<std::string> unreadable;
     unsigned failures = 0;
     uint64_t progress = 0;
     Clock::time_point readySince = Clock::now();
@@ -246,8 +250,7 @@ struct ReplicationFollower::Impl {
     std::optional<Collections::Candidate> candidate;
     std::map<std::string, FileDescriptor> verified;
     bool needsAck() const {
-      return !serving.empty() && acknowledged != serving && !source.empty()
-          && CommitId::parse(source).incarnation == CommitId::parse(serving).incarnation;
+      return serving && acknowledged != serving && advertised && advertised->incarnation == serving->incarnation;
     }
   };
   LuxirNode& node;
@@ -302,15 +305,14 @@ struct ReplicationFollower::Impl {
       // restarted download; the next successful install sweeps them.
       if (!row.collection) continue;
       auto& state = states[row.name];
-      if (row.error.empty()) state.serving = row.collection->getShard()->getSnapshots().snapshot()->id.token();
+      if (row.error.empty()) state.serving = row.collection->getShard()->getSnapshots().snapshot()->id;
       else {
-        state.localUnavailable = true;
-        state.localIncarnation = row.incarnation.value_or("");
+        state.unreadable = row.incarnation.value_or("");
         state.error = row.error;
       }
       auto& saved = binding.collections[row.name];
       state.seenBoot = saved.boot;
-      state.source = saved.source;
+      if (!saved.advertised.empty()) state.advertised = CommitId::parse(saved.advertised);
       state.replaceEmpty = saved.replace_empty;
     }
     persistState();
@@ -325,7 +327,8 @@ struct ReplicationFollower::Impl {
       std::lock_guard lock(mutex);
       next.source = binding.source; next.follower = binding.follower;
       for (const auto& [name, state] : states)
-        next.collections.emplace(name, ReplicationState::Collection{state.source, state.seenBoot, state.replaceEmpty, {}});
+        next.collections.emplace(name, ReplicationState::Collection{
+            state.advertised ? state.advertised->token() : "", state.seenBoot, state.replaceEmpty, {}});
     }
     auto bytes = glz::write_json(next).value();
     if (bytes != persisted) { next.write(*metadata); persisted = std::move(bytes); }
@@ -349,8 +352,7 @@ struct ReplicationFollower::Impl {
     node.collections().remove(name, false);
     std::lock_guard lock(mutex);
     auto& state = states[name];
-    state.serving.clear(); state.acknowledged.clear();
-    state.localUnavailable = false; state.localIncarnation.clear();
+    state.serving.reset(); state.acknowledged.reset(); state.unreadable.reset();
     state.verified.clear(); state.targetIncarnation.clear(); state.remove = false;
   }
 
@@ -366,6 +368,25 @@ struct ReplicationFollower::Impl {
     return catalog;
   }
 
+  static std::optional<CommitId> advertisedCommit(const CatalogEntry& entry) {
+    if (entry.commit.empty()) return std::nullopt;
+    return CommitId::parse(entry.commit);
+  }
+
+  // Applies one collection's entry from a source catalog (absent: not in it).
+  // A new incarnation may replace a populated copy with an empty snapshot only
+  // if this follower saw the previous incarnation in the same source boot.
+  void observe(State& state, std::optional<CommitId> desired, bool present, const std::string& sourceBoot) {
+    if (desired && (!state.advertised || desired->incarnation != state.advertised->incarnation))
+      state.replaceEmpty = state.seenBoot == sourceBoot;
+    if (desired != state.advertised) {
+      if (!state.advertised || state.advertised == state.serving || state.waiting) state.readySince = Clock::now();
+      state.advertised = std::move(desired); state.waiting = false;
+    }
+    if (present) { state.seenBoot = sourceBoot; state.remove = false; }
+    else state.remove = state.seenBoot == sourceBoot;
+  }
+
   void watch() {
     Client client(source, stopping.get_token());
     bool refresh = true;
@@ -376,32 +397,22 @@ struct ReplicationFollower::Impl {
         refresh = false;
         {
           std::lock_guard lock(mutex);
-          if (boot != catalog.boot) for (auto& [name, state] : states) state.acknowledged.clear();
+          if (boot != catalog.boot) for (auto& [name, state] : states) state.acknowledged.reset();
           boot = catalog.boot; cursor = catalog.cursor;
           connected = discovered = true; discoveryError.clear();
           for (const auto& [name, entry] : catalog.collections) states.try_emplace(name);
           for (auto& [name, state] : states) {
             auto found = catalog.collections.find(name);
-            state.unavailable = found != catalog.collections.end() && found->second.state == "unavailable";
-            std::string desired = found == catalog.collections.end() ? "" : found->second.commit;
-            if (!desired.empty() && (state.source.empty() || CommitId::parse(desired).incarnation != CommitId::parse(state.source).incarnation)) {
-              state.replaceEmpty = state.seenBoot == boot;
-            }
-            if (desired != state.source) {
-              if (state.source.empty() || state.source == state.serving || state.waiting) state.readySince = Clock::now();
-              state.source = desired; state.waiting = false;
-            }
-            if (found != catalog.collections.end()) {
-              state.seenBoot = boot;
-              state.remove = false;
-            } else state.remove = state.seenBoot == boot;
-            if (!state.busy && !state.serving.empty() && state.source == state.serving && state.acknowledged == state.serving) {
+            bool present = found != catalog.collections.end();
+            state.unavailable = present && found->second.state == "unavailable";
+            observe(state, present ? advertisedCommit(found->second) : std::nullopt, present, boot);
+            if (!state.busy && state.serving && state.advertised == state.serving && state.acknowledged == state.serving) {
               state.error.clear(); state.failures = 0; state.retry = {};
             }
           }
           std::erase_if(states, [](const auto& entry) {
             const auto& state = entry.second;
-            return !state.localUnavailable && !state.unavailable && state.source.empty() && state.serving.empty() && !state.candidate && !state.busy;
+            return !state.unreadable && !state.unavailable && !state.advertised && !state.serving && !state.candidate && !state.busy;
           });
         }
         persistState();
@@ -490,8 +501,8 @@ struct ReplicationFollower::Impl {
     Decision decision;
     std::lock_guard lock(mutex);
     auto& state = states[name];
-    if (state.source.empty()) throw std::runtime_error("source collection disappeared during transfer");
-    if (CommitId::parse(state.source).incarnation != snapshot.id.incarnation)
+    if (!state.advertised) throw std::runtime_error("source collection disappeared during transfer");
+    if (state.advertised->incarnation != snapshot.id.incarnation)
       throw std::runtime_error("source incarnation changed; retry snapshot");
     for (const auto& file : snapshot.files) state.total += file.size;
     decision.active = node.collections().get(name);
@@ -499,19 +510,19 @@ struct ReplicationFollower::Impl {
     auto serving = shard ? shard->getSnapshots().snapshot() : nullptr;
     decision.advance = serving && serving->id.incarnation == snapshot.id.incarnation;
     if (decision.advance && snapshot.id.index_gen <= serving->id.index_gen) {
-      if (snapshot.id.token() != state.serving) throw std::runtime_error("source went backwards");
+      if (snapshot.id != state.serving) throw std::runtime_error("source went backwards");
       state.reused = state.total;
       decision.current = true;
       return decision;
     }
     // An unreadable copy may contain data. Only a known same incarnation,
     // same-boot replacement, or populated source can replace it with certainty.
-    bool sameIncarnation = decision.advance || (!shard && state.localIncarnation == snapshot.id.incarnation);
-    bool populated = serving ? serving->populated : state.localUnavailable;
+    bool sameIncarnation = decision.advance || (!shard && state.unreadable == snapshot.id.incarnation);
+    bool populated = serving ? serving->populated : state.unreadable.has_value();
     decision.eligible = !populated || sameIncarnation || state.replaceEmpty || snapshot.populated;
     // Discovery may have advanced while this snapshot request was in flight.
     // An older empty snapshot must not park a newer eligible publication.
-    state.waiting = !decision.eligible && state.source == snapshot.id.token();
+    state.waiting = !decision.eligible && state.advertised == snapshot.id;
     if (state.targetIncarnation != snapshot.id.incarnation) {
       decision.obsolete = std::move(state.candidate);
       state.candidate.reset();
@@ -601,7 +612,8 @@ struct ReplicationFollower::Impl {
     auto opened = committed ? nullptr : registry->readers.prepare(*snapshot);
     {
       std::lock_guard lock(mutex);
-      if (states[name].source.empty() || CommitId::parse(states[name].source).incarnation != snapshot->id.incarnation)
+      auto& advertised = states[name].advertised;
+      if (!advertised || advertised->incarnation != snapshot->id.incarnation)
         throw std::runtime_error("source collection changed during transfer");
     }
     if (stopping.stop_requested()) return;
@@ -616,12 +628,10 @@ struct ReplicationFollower::Impl {
     catch (const std::exception& e) { LOG_WARN("Follower retirement failed: {}", e.what()); }
     {
       std::lock_guard lock(mutex);
-      auto& state = states[name]; state.localUnavailable = false; state.localIncarnation.clear();
-      state.serving = snapshot->id.token(); state.error.clear(); state.verified.clear();
-      if (!state.source.empty()) {
-        auto advertised = CommitId::parse(state.source);
-        if (advertised.incarnation == snapshot->id.incarnation && advertised.index_gen < snapshot->id.index_gen) state.source = state.serving;
-      }
+      auto& state = states[name]; state.unreadable.reset();
+      state.serving = snapshot->id; state.error.clear(); state.verified.clear();
+      auto& advertised = state.advertised;
+      if (advertised && advertised->incarnation == snapshot->id.incarnation && advertised->index_gen < snapshot->id.index_gen) advertised = state.serving;
     }
   }
 
@@ -638,10 +648,8 @@ struct ReplicationFollower::Impl {
     uint64_t transferred = 0, reused = 0;
     for (const auto& [name, entry] : catalog.collections) {
       auto& state = states[name];
-      if (!entry.commit.empty() && (state.source.empty() || CommitId::parse(entry.commit).incarnation != CommitId::parse(state.source).incarnation))
-        state.replaceEmpty = state.seenBoot == catalog.boot;
-      state.source = entry.commit;
-      state.seenBoot = catalog.boot; state.downloaded = state.reused = 0;
+      observe(state, advertisedCommit(entry), true, catalog.boot);
+      state.downloaded = state.reused = 0;
       uint64_t downloaded = 0;
       try {
         if (entry.state == "unavailable") throw std::runtime_error("source collection unavailable");
@@ -650,9 +658,9 @@ struct ReplicationFollower::Impl {
           catch (const ReservationGone&) { if (attempt == 2) throw; downloaded += state.downloaded; }
         }
         persistState();
-        if (state.serving != state.source) throw std::runtime_error("waiting for source data before replacing the local snapshot");
+        if (state.serving != state.advertised) throw std::runtime_error("waiting for source data before replacing the local snapshot");
         installed++;
-        output << name << ' ' << state.serving << " transferred=" << downloaded + state.downloaded << " reused=" << state.reused << '\n';
+        output << name << ' ' << state.serving->token() << " transferred=" << downloaded + state.downloaded << " reused=" << state.reused << '\n';
       } catch (const std::exception& e) {
         client.reset(); failed++;
         output << name << ' ' << entry.commit << " transferred=" << downloaded + state.downloaded
@@ -676,7 +684,7 @@ struct ReplicationFollower::Impl {
           if (!connected) return false;
           State* selected = nullptr;
           for (auto& [key, state] : states) {
-            bool work = state.remove || (!state.source.empty() && ((state.source != state.serving && !state.waiting)
+            bool work = state.remove || (state.advertised && ((state.advertised != state.serving && !state.waiting)
                     || state.needsAck()));
             if (!state.busy && !state.unavailable && work && Clock::now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
               name = key; selected = &state;
@@ -693,11 +701,11 @@ struct ReplicationFollower::Impl {
       std::string error;
       try {
         bool remove, needsSync;
-        std::string serving;
+        std::optional<CommitId> serving;
         {
           std::lock_guard lock(mutex);
           auto& state = states[name]; remove = state.remove;
-          needsSync = !state.source.empty() && state.source != state.serving && !state.waiting;
+          needsSync = state.advertised && state.advertised != state.serving && !state.waiting;
         }
         if (remove) eraseLocal(name);
         else {
@@ -706,11 +714,11 @@ struct ReplicationFollower::Impl {
             {
               std::lock_guard lock(mutex);
               auto& state = states[name];
-              serving = state.needsAck() ? state.serving : "";
+              serving = state.needsAck() ? state.serving : std::nullopt;
               ackBoot = boot;
             }
-            if (serving.empty()) return;
-            request(client, http::verb::post, "/_replication/installed", glz::write_json(Ack{binding.follower, name, serving}).value());
+            if (!serving) return;
+            request(client, http::verb::post, "/_replication/installed", glz::write_json(Ack{binding.follower, name, serving->token()}).value());
             std::lock_guard lock(mutex);
             if (boot == ackBoot) states[name].acknowledged = serving;
           };
@@ -726,7 +734,7 @@ struct ReplicationFollower::Impl {
         std::lock_guard lock(mutex);
         auto& state = states[name];
         // Discovery may have superseded a failed target while this job ran.
-        if (!state.serving.empty() && state.source == state.serving && state.acknowledged == state.serving) error.clear();
+        if (state.serving && state.advertised == state.serving && state.acknowledged == state.serving) error.clear();
         state.busy = false; state.error = error; state.readySince = Clock::now();
         if (error.empty()) { state.failures = 0; state.retry = {}; }
         else {
@@ -734,7 +742,7 @@ struct ReplicationFollower::Impl {
           auto delay = std::chrono::seconds(std::min(60u, 1u << std::min(6u, state.failures)));
           state.failures++; state.retry = Clock::now() + delay;
         }
-        if (!state.localUnavailable && state.source.empty() && state.serving.empty() && !state.candidate && error.empty()) states.erase(name);
+        if (!state.unreadable && !state.advertised && !state.serving && !state.candidate && error.empty()) states.erase(name);
       }
       changed.notify_all();
     }
@@ -758,7 +766,7 @@ void ReplicationFollower::deleteOrphan(std::string_view name) {
   std::string key(name);
   {
     std::unique_lock lock(impl->mutex);
-    if (!impl->connected || !impl->discovered || (impl->states.contains(key) && (!impl->states.at(key).source.empty() || impl->states.at(key).unavailable))) {
+    if (!impl->connected || !impl->discovered || (impl->states.contains(key) && (impl->states.at(key).advertised || impl->states.at(key).unavailable))) {
       throw ReadOnlyError("only a local orphan absent from the connected source may be deleted");
     }
     if (impl->states.contains(key) && impl->states.at(key).busy) throw CollectionUnavailableError("local orphan is busy");
@@ -771,7 +779,7 @@ void ReplicationFollower::deleteOrphan(std::string_view name) {
   }
   std::lock_guard lock(impl->mutex);
   impl->states[key].busy = false;
-  if (impl->states[key].source.empty()) impl->states.erase(key);
+  if (!impl->states[key].advertised) impl->states.erase(key);
   impl->changed.notify_all();
 }
 void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_resource& arena) {
@@ -782,9 +790,10 @@ void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_re
   auto* rows = api::build::allocArray(out.collections, impl->states.size(), arena);
   size_t i = 0;
   for (const auto& [name, state] : impl->states) {
-    auto& row = rows[i++]; row.name = str(name); row.source_commit = str(state.source); row.serving_commit = str(state.serving);
-    row.state = (!impl->connected || state.unavailable) ? "stale" : state.source.empty() ? "orphan" : !state.error.empty() ? "error"
-        : state.waiting ? "waiting" : state.source == state.serving ? "serving" : "syncing";
+    auto token = [&](const std::optional<CommitId>& id) { return id ? str(id->token()) : std::string_view(); };
+    auto& row = rows[i++]; row.name = str(name); row.source_commit = token(state.advertised); row.serving_commit = token(state.serving);
+    row.state = (!impl->connected || state.unavailable) ? "stale" : !state.advertised ? "orphan" : !state.error.empty() ? "error"
+        : state.waiting ? "waiting" : state.advertised == state.serving ? "serving" : "syncing";
     auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(state.retry - Clock::now()).count();
     if (!state.error.empty() && remaining > 0) row.next_retry = wallTime() + (uint64_t)remaining;
     row.bytes_downloaded = state.downloaded; row.bytes_total = state.total; row.last_error = str(state.error.empty() && !impl->connected ? impl->discoveryError : state.error);
