@@ -35,6 +35,7 @@
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
 
 #define TEST_DEBUG LOG_TRACE
@@ -3102,4 +3103,32 @@ TEST_F(IndexWriterTest, readerRetriesAnyFailureOnlyWhenPublicationChanges) {
       EXPECT_THROW(writer.snapshots.readers.getReader(), std::runtime_error);
     }
   }
+}
+
+TEST_F(IndexWriterTest, storageLimitDiscardsPartialOutputBeforeRecovery) {
+  LuxirConfig config; config.store.ram_limit_mb = 2;
+  LuxirNode node(config);
+  test::CollectionHelper h(node, "main");
+  SchemaBuilder builder;
+  auto& field = builder.field("payload");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.index = api::FieldDef::IndexMode::NONE; field.column = false; field.stored = true;
+  h.collection().setSchema(builder.build(h.collection().getSchema().get()));
+  auto dir = h.collection().getShard()->getDirectory();
+  Directory::FileCreateOptions options;
+  options.expectedSize = 2 * 1024 * 1024 - node.storageBytes() - 128 * 1024;
+  auto pressure = dir->createFile("pressure", options);
+  std::string payload(512 * 1024, 'a');
+  std::mt19937 random(7);
+  for (auto& c : payload) c = (char)(' ' + random() % 95);
+  auto result = h.index(test::flatdoc("id", "large", "payload", payload));
+  // Stored fields can defer the large value until the following document.
+  if (result.success) result = h.index(test::flatdoc("id", "trigger", "payload", "trigger"));
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(ErrorKind::RESOURCE_EXHAUSTED, result.error_kind);
+  EXPECT_EQ("storage_memory_limit", result.error_code);
+  EXPECT_TRUE(result.errors.empty());
+  pressure.reset();
+  ASSERT_TRUE(h.index(test::flatdoc("id", "small", "payload", "small"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(1, h.collection().getReaderManager().getReader()->liveDocs());
 }

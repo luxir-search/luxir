@@ -6,7 +6,7 @@
 #include <memory>
 #include <functional>
 #include <utility>
-#include "luxir/util/ApiError.h"
+#include "FileIOException.h"
 
 namespace luxir {
 
@@ -30,7 +30,7 @@ public:
         // pays for reclamation; buffers remain charged until their last owner dies.
         if (reclaim && reclaim()) { current = used.load(std::memory_order_relaxed); continue; }
         if (parent) parent->release(bytes);
-        throw ApiError(ErrorKind::RESOURCE_EXHAUSTED, "storage_memory_limit", "RAM storage memory limit exceeded");
+        throw StorageMemoryLimitError();
       }
       if (used.compare_exchange_weak(current, current + bytes, std::memory_order_relaxed)) return;
     }
