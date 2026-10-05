@@ -432,6 +432,20 @@ void LuxirNode::createSingletons() {
           auto selection = DirectoryFactory::current(*dirFactory->create(name));
           if (selection.incarnation.empty()) continue;
           auto& promoted = state.collections[name].promoted;
+          if (!promoted.empty()) {
+            bool valid = false;
+            try {
+              auto incarnations = dirFactory->listDirectories(name);
+              if (isUuid(promoted) && std::ranges::find(incarnations, promoted) != incarnations.end()) {
+                auto target = dirFactory->create(name + "/" + promoted);
+                std::pmr::monotonic_buffer_resource arena;
+                valid = Manifest::decode(Manifest::load(*target).bytes, arena).incarnation == promoted;
+              }
+            } catch (const std::exception& e) {
+              LOG_WARN("Cannot validate promotion target for '{}': {}", name, e.what());
+            }
+            if (!valid) promoted.clear();
+          }
           if (promoted.empty()) {
             Signal::emit("replicationPromotingCollection", (void*)&name);
             auto old = dirFactory->create(name + "/" + selection.incarnation);

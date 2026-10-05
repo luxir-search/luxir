@@ -12,6 +12,7 @@
 #define XXH_STATIC_LINKING_ONLY
 #include <xxhash.h>
 #include "Directory.h"
+#include "luxir/util/Signal.h"
 
 namespace luxir {
 
@@ -471,6 +472,7 @@ public:
         throw std::runtime_error("FSDirectory::sync: fsync failed for " + name + ": " + strerror(errno));
       }
       ::close(fd);
+      Signal::emit("fsSynced", &basePath_, (void*)&name);
     }
   }
 

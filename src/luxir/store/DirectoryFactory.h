@@ -73,6 +73,7 @@ public:
     Manifest::write(*next, info.index_gen, bytes);
     std::array<std::string, 1> root{Manifest::name(info.index_gen)};
     next->sync(root); next->sync(directory);
+    create(name)->sync(directory); // persist the new incarnation entry before recording it
     return selection;
   }
 

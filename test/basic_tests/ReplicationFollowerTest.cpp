@@ -8,6 +8,7 @@
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/ReplicationFollower.h"
 #include "luxir/server/ReplicationCatalog.h"
+#include "luxir/server/ReplicationState.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
 #include "luxir/store/Manifest.h"
@@ -776,6 +777,53 @@ TEST_F(ReplicationFollowerTest, emptySnapshotCannotParkANewerCommit) {
   resume.count_down();
   EXPECT_TRUE(caughtUp());
   stopFollower();
+}
+
+TEST_F(ReplicationFollowerTest, promotionPersistsParentBeforeRecordingTarget) {
+  startSource();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  ASSERT_EQ(0, pull().first);
+  bool parentSynced = false, recorded = false;
+  Signal::listen("fsSynced", [&](void* directory, void* file, void*) -> void* {
+    auto& dir = *(std::filesystem::path*)directory;
+    auto& name = *(std::string*)file;
+    if (dir == path / "follower" / "c" / "main" && name == ".") parentSynced = true;
+    if (dir == path / "follower" && name == "replication.json.pending") {
+      EXPECT_TRUE(parentSynced);
+      recorded = true;
+    }
+    return nullptr;
+  });
+  auto config = followerConfig; config.replication.source.clear(); config.promote = true;
+  auto unlisten = scope_guard([] { Signal::unlisten("fsSynced"); });
+  LuxirNode promoted(config);
+  EXPECT_TRUE(recorded);
+  EXPECT_EQ(1, promoted.getCollection("main")->getReaderManager().getReader()->liveDocs());
+}
+
+TEST_F(ReplicationFollowerTest, promotionRebuildsInvalidRecordedTargets) {
+  startSource();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  for (auto damage : {"missing", "empty", "corrupt", "wrong_incarnation"}) {
+    followerConfig.store.data_dir = (path / damage).string();
+    ASSERT_EQ(0, pull().first);
+    FSDirectory metadata(followerConfig.store.data_dir);
+    auto state = ReplicationState::read(*metadata.openFile("replication.json"));
+    auto target = newUuid();
+    state.collections["main"].promoted = target;
+    state.write(metadata);
+    if (std::string_view(damage) != "missing") {
+      FSDirectory dir(std::filesystem::path(followerConfig.store.data_dir) / "c" / "main" / target);
+      auto snapshot = source->getCollection("main")->getShard()->getSnapshots().snapshot();
+      if (std::string_view(damage) == "wrong_incarnation") Manifest::write(dir, snapshot->id.index_gen, *snapshot->bytes);
+      if (std::string_view(damage) == "corrupt") Manifest::write(dir, 1, {});
+    }
+    auto config = followerConfig; config.replication.source.clear(); config.promote = true;
+    LuxirNode promoted(config);
+    auto col = promoted.getCollection("main");
+    EXPECT_NE(target, col->getShard()->getSnapshots().snapshot()->id.incarnation);
+    EXPECT_EQ(1, col->getReaderManager().getReader()->liveDocs());
+  }
 }
 
 TEST_F(ReplicationFollowerTest, promotionRetriesOnlyUnpromotedCollections) {
