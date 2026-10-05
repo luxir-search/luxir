@@ -120,18 +120,21 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
   response.storage_ram.limit_bytes = node.getConfig().store.backend == "ram" ? node.getConfig().store.ram_limit_mb * 1024 * 1024 : 0;
   std::vector<LuxirNode::CollectionEntry> entries;
   if (!request.collection.empty()) {
-    auto collection = node.resolveCollection(request.collection);
-    entries.push_back({std::string(request.collection), std::move(collection), {}});
+    auto collection = node.resolveCollection(request.collection, request.tenant);
+    entries.push_back({collection->getId(), std::move(collection), {}});
   } else {
     entries = node.collectionEntries();
+    // An empty tenant covers every tenant (administration).
+    if (!request.tenant.empty()) std::erase_if(entries, [&](const auto& entry) { return entry.id.tenant != request.tenant; });
   }
 
   auto* collections = api::build::allocArray(response.collections, entries.size(), resource);
   for (std::size_t i = 0; i < entries.size(); i++) {
     const auto& entry = entries[i];
     auto& collectionStats = collections[i];
-    collectionStats.name = api::build::arenaStr(resource, entry.name);
-    collectionStats.storage_ram_bytes = node.storageBytes(entry.name);
+    collectionStats.name = api::build::arenaStr(resource, entry.id.name);
+    collectionStats.tenant = api::build::arenaStr(resource, entry.id.tenant);
+    collectionStats.storage_ram_bytes = node.storageBytes(entry.id);
     if (!entry.error.empty()) {
       collectionStats.error = api::build::arenaError(
           resource, {ErrorKind::UNAVAILABLE, "collection_unavailable", entry.error});
@@ -185,7 +188,7 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
   std::vector<LuxirNode::CollectionEntry> entries;
   if (!request.collection.empty()) {
     auto collection = node.resolveCollection(request.collection);
-    entries.push_back({std::string(request.collection), std::move(collection), {}});
+    entries.push_back({collection->getId(), std::move(collection), {}});
   } else {
     entries = node.collectionEntries();
   }
@@ -196,7 +199,7 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
   for (std::size_t i = 0; i < entries.size(); i++) {
     const auto& entry = entries[i];
     auto& collectionControl = collections[i];
-    collectionControl.name = api::build::arenaStr(resource, entry.name);
+    collectionControl.name = api::build::arenaStr(resource, entry.id.label());
     if (!entry.error.empty()) {
       collectionControl.error = api::build::arenaError(
           resource, {ErrorKind::UNAVAILABLE, "collection_unavailable", entry.error});

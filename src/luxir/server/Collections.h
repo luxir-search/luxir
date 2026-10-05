@@ -39,14 +39,14 @@ public:
   enum class Role { WRITER, READ_ONLY, FOLLOWER };
 
   struct Entry {
-    std::string name;
+    CollectionId id;
     std::shared_ptr<Collection> collection;
     std::string error;
   };
   // A startup row. A follower collection without CURRENT has neither a
   // collection nor an error: its incarnations are retained download candidates.
   struct Opened {
-    std::string name;
+    CollectionId id;
     std::shared_ptr<Collection> collection; // null for a staged-only follower collection
     std::optional<std::string> incarnation; // CURRENT, when it could be read
     std::string error;
@@ -56,21 +56,22 @@ private:
   // Keeps a staged incarnation directory from retirement until released.
   struct Lease {
     Collections& owner;
-    std::string name, incarnation;
+    CollectionId id;
+    std::string incarnation;
     bool active = false;
-    ~Lease() { if (active) owner.release(name, incarnation); }
+    ~Lease() { if (active) owner.release(id, incarnation); }
   };
 
 public:
   // An unregistered incarnation of a collection for an installer to fill.
   class Candidate {
-    std::string name_;
+    CollectionId id_;
     std::string incarnation_;
     std::shared_ptr<Collection> collection_;
     std::unique_ptr<Lease> lease;
     friend class Collections;
-    Candidate(std::string name, std::string incarnation, std::shared_ptr<Collection> collection, std::unique_ptr<Lease> lease)
-        : name_(std::move(name)), incarnation_(std::move(incarnation)), collection_(std::move(collection)), lease(std::move(lease)) {}
+    Candidate(CollectionId id, std::string incarnation, std::shared_ptr<Collection> collection, std::unique_ptr<Lease> lease)
+        : id_(std::move(id)), incarnation_(std::move(incarnation)), collection_(std::move(collection)), lease(std::move(lease)) {}
   public:
     Candidate(Candidate&&) = default;
     Candidate& operator=(Candidate&&) = default;
@@ -99,9 +100,9 @@ private:
   // Owns a name for one transition; fails fast if another transition does.
   class Transition {
     Collections& owner;
-    std::string name;
+    CollectionId name;
   public:
-    Transition(Collections& owner, std::string name);
+    Transition(Collections& owner, CollectionId name);
     ~Transition();
   };
 
@@ -109,25 +110,27 @@ private:
   CollectionEvents& events;
   IndexRamBudget& indexRamBudget;
   std::unique_ptr<DirectoryFactory> factory;
-  SharedLazyMap<std::string, Collection> map;
+  SharedLazyMap<CollectionId, Collection> map;
   std::mutex slotsMutex;
-  std::map<std::string, Slot, std::less<>> slots;
+  std::map<CollectionId, Slot> slots;
 
-  std::shared_ptr<Collection> makeCollection(const std::string& name, std::shared_ptr<Directory> directory);
-  std::shared_ptr<Collection> openCollection(const std::string& name, Role role, const std::optional<std::string>& selected);
-  std::shared_ptr<Collection> initWriter(const std::string& name, std::shared_ptr<Schema> initialSchema = {});
-  void observe(const std::string& name, Collection& collection);
+  std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
+  std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected);
+  std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {});
+  void observe(const CollectionId& id, Collection& collection);
   bool reclaimStorage();
-  void release(const std::string& name, const std::string& incarnation) noexcept;
+  void release(const CollectionId& id, const std::string& incarnation) noexcept;
   // Removes incarnation directories that nothing selects, leases or retains.
   // The caller owns the name's transition.
-  void retire(const std::string& name, const std::string& selected) noexcept;
+  void retire(const CollectionId& id, const std::string& selected) noexcept;
 
 public:
   Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget);
   ~Collections();
 
-  static void validateName(std::string_view name);
+  // A tenant or collection name: [a-z][a-z0-9_]*, at most 255 bytes.
+  static void validateName(std::string_view name, std::string_view kind = "collection");
+  static void validate(const CollectionId& id);
   DirectoryFactory& storage() { return *factory; }
 
   // The single startup discovery path. Writers recover identities, remove
@@ -137,18 +140,18 @@ public:
   std::vector<Opened> open(Role role);
 
   // The registered entry, which may be an unavailable placeholder.
-  std::shared_ptr<Collection> get(std::string_view name) { return map.get(std::string(name)); }
+  std::shared_ptr<Collection> get(const CollectionId& id) { return map.get(id); }
   std::vector<Entry> entries();
 
   // Writers. getOrCreate() creates only when `autoCreate`.
-  std::shared_ptr<Collection> getOrCreate(std::string_view name, bool autoCreate);
-  std::shared_ptr<Collection> create(std::string_view name, const api::SchemaDef* schema = nullptr);
+  std::shared_ptr<Collection> getOrCreate(const CollectionId& id, bool autoCreate);
+  std::shared_ptr<Collection> create(const CollectionId& id, const api::SchemaDef* schema = nullptr);
 
   // Removes the entry and all storage. Without `mustExist`, an absent entry
   // still removes leftover storage. Refused while a candidate is staged.
-  void remove(std::string_view name, bool mustExist = true);
+  void remove(const CollectionId& id, bool mustExist = true);
 
-  Candidate stage(std::string_view name, std::string_view incarnation);
+  Candidate stage(const CollectionId& id, std::string_view incarnation);
   // Makes `snapshot` durable in the candidate's directory, whose files the
   // caller verified and synced, and opens its readers. On failure the
   // candidate stays staged.
@@ -161,9 +164,9 @@ public:
   // selects, leases or retains it.
   void discard(Candidate& candidate) noexcept;
   // After a same-incarnation advance: retire leftover candidates of earlier runs.
-  void retainSelected(const std::string& name) noexcept;
+  void retainSelected(const CollectionId& id) noexcept;
   // Registers an unavailable placeholder unless something is already registered.
-  std::shared_ptr<Collection> unavailable(const std::string& name, std::string reason);
+  std::shared_ptr<Collection> unavailable(const CollectionId& id, std::string reason);
 };
 
 }

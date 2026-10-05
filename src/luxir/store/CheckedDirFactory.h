@@ -148,13 +148,13 @@ class CheckedDirFactory : public DirectoryFactory {
   bool verbose_;
   std::mutex mu_;
   // Reopening a directory must not forget which of its files are unsynced, so
-  // wrappers live until their namespace is removed. Keys are collection or
-  // collection/incarnation.
-  std::map<std::string, std::shared_ptr<CheckedDirectory>, std::less<>> opened_;
+  // wrappers live until their namespace is removed. An empty incarnation key
+  // is the collection's container.
+  std::map<std::pair<CollectionId, std::string>, std::shared_ptr<CheckedDirectory>> opened_;
 
-  std::shared_ptr<Directory> wrap(std::string key, std::shared_ptr<Directory> dir) {
+  std::shared_ptr<Directory> wrap(const CollectionId& id, std::string_view incarnation, std::shared_ptr<Directory> dir) {
     std::lock_guard lock(mu_);
-    auto& checked = opened_[std::move(key)];
+    auto& checked = opened_[{id, std::string(incarnation)}];
     if (!checked) checked = std::make_shared<CheckedDirectory>(std::move(dir), mode_, verbose_);
     return checked;
   }
@@ -163,27 +163,26 @@ public:
   CheckedDirFactory(std::unique_ptr<DirectoryFactory> delegate, CheckedDirMode mode, bool verbose = false)
       : delegate_(std::move(delegate)), mode_(mode), verbose_(verbose) {}
 
-  uint64_t storageBytes(std::string_view collection = {}) override { return delegate_->storageBytes(collection); }
-  std::vector<std::string> collections() override { return delegate_->collections(); }
-  std::shared_ptr<Directory> container(std::string_view name, bool create) override {
-    return wrap(std::string(name), delegate_->container(name, create));
+  uint64_t storageBytes() override { return delegate_->storageBytes(); }
+  uint64_t collectionBytes(const CollectionId& id) override { return delegate_->collectionBytes(id); }
+  std::vector<CollectionId> collections() override { return delegate_->collections(); }
+  std::shared_ptr<Directory> container(const CollectionId& id, bool create) override {
+    return wrap(id, {}, delegate_->container(id, create));
   }
-  std::shared_ptr<Directory> incarnation(std::string_view name, std::string_view incarnation, bool create) override {
-    return wrap(std::string(name) + "/" + std::string(incarnation), delegate_->incarnation(name, incarnation, create));
+  std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) override {
+    return wrap(id, incarnation, delegate_->incarnation(id, incarnation, create));
   }
-  void createCollection(std::string_view name) override { delegate_->createCollection(name); }
-  std::vector<std::string> incarnations(std::string_view name) override { return delegate_->incarnations(name); }
-  void removeIncarnation(std::string_view name, std::string_view incarnation) override {
-    delegate_->removeIncarnation(name, incarnation);
+  void createCollection(const CollectionId& id) override { delegate_->createCollection(id); }
+  std::vector<std::string> incarnations(const CollectionId& id) override { return delegate_->incarnations(id); }
+  void removeIncarnation(const CollectionId& id, std::string_view incarnation) override {
+    delegate_->removeIncarnation(id, incarnation);
     std::lock_guard lock(mu_);
-    opened_.erase(std::string(name) + "/" + std::string(incarnation));
+    opened_.erase({id, std::string(incarnation)});
   }
-  void remove(std::string_view name) override {
-    delegate_->remove(name);
+  void remove(const CollectionId& id) override {
+    delegate_->remove(id);
     std::lock_guard lock(mu_);
-    std::erase_if(opened_, [&](const auto& entry) {
-      return entry.first == name || (entry.first.starts_with(name) && entry.first[name.size()] == '/');
-    });
+    std::erase_if(opened_, [&](const auto& entry) { return entry.first.first == id; });
   }
 };
 

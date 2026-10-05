@@ -100,7 +100,7 @@ protected:
   std::filesystem::path makeLocalUnreadable() {
     auto id = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
     stopFollower();
-    auto dir = path / "follower" / "c" / "main" / id.incarnation;
+    auto dir = path / "follower" / "c" / "default" / "main" / id.incarnation;
     auto root = dir / Manifest::name(id.index_gen);
     std::filesystem::rename(root, root.string() + ".saved");
     // ELOOP is independent of the test process's filesystem privileges.
@@ -399,7 +399,7 @@ TEST_F(ReplicationFollowerTest, deleteWhileDownloadIsPendingCannotResurrectColle
   resume.count_down();
   ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));
   stopFollower();
-  EXPECT_TRUE(std::filesystem::is_empty(path / "follower" / "c"));
+  EXPECT_TRUE(std::filesystem::is_empty(path / "follower" / "c" / "default"));
 }
 
 TEST_F(ReplicationFollowerTest, writerAndReadOnlyOpenFollowerLayout) {
@@ -424,7 +424,7 @@ TEST_F(ReplicationFollowerTest, writerAndReadOnlyOpenFollowerLayout) {
     auto promoted = h.collection().getShard()->getSnapshots().snapshot()->id;
     EXPECT_NE(id.incarnation, promoted.incarnation);
     EXPECT_FALSE(std::filesystem::exists(path / "follower" / "replication.json"));
-    EXPECT_FALSE(std::filesystem::exists(path / "follower" / "c" / "main" / id.incarnation));
+    EXPECT_FALSE(std::filesystem::exists(path / "follower" / "c" / "default" / "main" / id.incarnation));
     EXPECT_EQ(1, h.collection().getReaderManager().getReader()->liveDocs());
     ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
     EXPECT_EQ(2, h.collection().getReaderManager().getReader()->liveDocs());
@@ -470,7 +470,7 @@ TEST_F(ReplicationFollowerTest, corruptLocalCollectionIsFetchedAgain) {
   ASSERT_TRUE(caughtUp());
   auto id = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
   stopFollower();
-  std::filesystem::remove(path / "follower" / "c" / "main" / id.incarnation / Manifest::name(id.index_gen));
+  std::filesystem::remove(path / "follower" / "c" / "default" / "main" / id.incarnation / Manifest::name(id.index_gen));
   startFollower();
   ASSERT_TRUE(caughtUp());
 }
@@ -486,7 +486,7 @@ TEST_F(ReplicationFollowerTest, unreadableStartupPreservesDataUntilEligibleInsta
   EXPECT_TRUE(std::filesystem::exists(retained));
   EXPECT_NE(std::string::npos, httpRequest(followerServer->getPort(), http::verb::get, "/_stats").body().find("collection_unavailable"));
   std::pmr::monotonic_buffer_resource arena;
-  EXPECT_FALSE(follower->getReplication().catalog(arena).collections.at("main").available);
+  EXPECT_FALSE(follower->getReplication().catalog(arena).collections.front().available);
   startSource();
   ASSERT_TRUE(until([&] { return stateIs("waiting"); }));
   stopFollower(); startFollower();
@@ -563,7 +563,7 @@ TEST_F(ReplicationFollowerTest, sourceCatalogNeverRegresses) {
   }));
   sourceRegistry.publish(old);
   std::pmr::monotonic_buffer_resource arena;
-  EXPECT_EQ(latest->id.token(), source->getReplication().catalog(arena).collections.at("main").commit);
+  EXPECT_EQ(latest->id.token(), source->getReplication().catalog(arena).collections.front().commit);
   EXPECT_TRUE(stateIs("serving"));
   EXPECT_EQ(served, follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id);
   sourceRegistry.publish(latest);
@@ -680,7 +680,7 @@ TEST_F(ReplicationFollowerTest, allDropsExpiredMembersAndDoesNotAddNewOnes) {
   ASSERT_TRUE(caughtUp());
   auto prior = source->getCollection("main")->getShard()->getSnapshots().snapshot()->id.token();
   httpRequest(sourcePort, http::verb::post, "/_replication/installed",
-      "{\"follower\":\"leaving\",\"collection\":\"main\",\"commit\":\"" + prior + "\"}");
+      "{\"follower\":\"leaving\",\"tenant\":\"default\",\"collection\":\"main\",\"commit\":\"" + prior + "\"}");
   std::atomic<bool> parked{false};
   Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* { parked = true; return nullptr; });
   auto pending = std::async(std::launch::async, [&] {
@@ -793,7 +793,7 @@ TEST_F(ReplicationFollowerTest, promotionPersistsParentBeforeRecordingTarget) {
   Signal::listen("fsSynced", [&](void* directory, void* file, void*) -> void* {
     auto& dir = *(std::filesystem::path*)directory;
     auto& name = *(std::string*)file;
-    if (dir == path / "follower" / "c" / "main" && name == ".") parentSynced = true;
+    if (dir == path / "follower" / "c" / "default" / "main" && name == ".") parentSynced = true;
     if (dir == path / "follower" && name == "replication.json.pending") {
       EXPECT_TRUE(parentSynced);
       recorded = true;
@@ -817,10 +817,10 @@ TEST_F(ReplicationFollowerTest, promotionRebuildsInvalidRecordedTargets) {
     FSDirectory metadata(followerConfig.store.data_dir);
     auto state = ReplicationState::read(*metadata.openFile("replication.json"));
     auto target = newUuid();
-    state.collections["main"].promoted = target;
+    state.collection(CollectionId::of("main")).promoted = target;
     state.write(metadata);
     if (std::string_view(damage) != "missing") {
-      FSDirectory dir(std::filesystem::path(followerConfig.store.data_dir) / "c" / "main" / target);
+      FSDirectory dir(std::filesystem::path(followerConfig.store.data_dir) / "c" / "default" / "main" / target);
       auto snapshot = source->getCollection("main")->getShard()->getSnapshots().snapshot();
       if (std::string_view(damage) == "wrong_incarnation") Manifest::write(dir, snapshot->id.index_gen, *snapshot->bytes);
       if (std::string_view(damage) == "corrupt") Manifest::write(dir, 1, {});
@@ -856,7 +856,7 @@ TEST_F(ReplicationFollowerTest, promotionRetriesOnlyUnpromotedCollections) {
   ASSERT_TRUE(std::filesystem::exists(path / "follower" / "replication.json"));
   EXPECT_THROW(LuxirNode writer(config), std::runtime_error);
   FSDirectory metadata(followerConfig.store.data_dir);
-  auto target = ReplicationState::read(*metadata.openFile("replication.json")).collections["main"].promoted;
+  auto target = ReplicationState::read(*metadata.openFile("replication.json")).collection(CollectionId::of("main")).promoted;
   ASSERT_FALSE(target.empty());
   fail = false;
   ASSERT_EQ(0, promote().first);
@@ -1085,7 +1085,7 @@ TEST_F(ReplicationFollowerTest, ramLimitKeepsOldSnapshotAndChargesReadersUntilRe
   EXPECT_NE(std::string::npos, status().find("RAM storage memory limit exceeded"));
   EXPECT_LE(follower->storageBytes(), 1024 * 1024);
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
-  auto memory = follower->storageBytes("main");
+  auto memory = follower->storageBytes(CollectionId::of("main"));
   EXPECT_GT(memory, 0);
   auto stats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats");
   glz::generic json; ASSERT_FALSE(glz::read_json(json, stats.body()));
@@ -1093,9 +1093,9 @@ TEST_F(ReplicationFollowerTest, ramLimitKeepsOldSnapshotAndChargesReadersUntilRe
   EXPECT_EQ(memory, json["collections"][0]["storage_ram_bytes"].get<double>());
   source->deleteCollection("main");
   ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));
-  EXPECT_GT(follower->storageBytes("main"), 0); // Only the old reader now owns the data.
+  EXPECT_GT(follower->storageBytes(CollectionId::of("main")), 0); // Only the old reader now owns the data.
   old.reset();
-  ASSERT_TRUE(until([&] { return follower->storageBytes("main") == 0; }));
+  ASSERT_TRUE(until([&] { return follower->storageBytes(CollectionId::of("main")) == 0; }));
 }
 
 class ReplicationPullTest : public ReplicationFollowerTest, public ::testing::WithParamInterface<std::string> {
@@ -1133,7 +1133,7 @@ TEST_P(ReplicationPullTest, copiesEmptyAndPopulatedCollectionsThenSeedsAndPromot
   auto current = source->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
   ASSERT_TRUE(until([&] {
     return std::ranges::any_of(source->getReplication().status(), [&](const auto& row) {
-      return row.collection == "main" && row.commit == current;
+      return row.collection == CollectionId::of("main") && row.commit == current;
     });
   }));
   api::ReplicationStatus status; std::pmr::monotonic_buffer_resource arena;
@@ -1381,6 +1381,24 @@ TEST_F(ReplicationFollowerTest, pullReportsIncarnationChangeDuringTransfer) {
   EXPECT_NE(0, interrupted.first);
   EXPECT_NE(std::string::npos, interrupted.second.find("source incarnation changed"));
   EXPECT_EQ(0, pull().first);
+}
+
+TEST_F(ReplicationFollowerTest, followsCollectionsOfEveryTenant) {
+  startSource();
+  CollectionId docs{"acme", "docs"};
+  { CollectionHelper h(*source, docs); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
+  startFollower();
+  auto target = source->getCollection(docs)->getShard()->getSnapshots().snapshot()->id;
+  ASSERT_TRUE(until([&] {
+    try { return follower->getCollection(docs)->getShard()->getSnapshots().snapshot()->id == target; }
+    catch (const CollectionResolutionError&) { return false; }
+  })) << status();
+  EXPECT_EQ(1, follower->getCollection(docs)->getReaderManager().getReader()->liveDocs());
+  EXPECT_TRUE(std::filesystem::exists(path / "follower" / "c" / "acme" / "docs" / target.incarnation));
+  EXPECT_NE(std::string::npos, status().find("\"tenant\":\"acme\""));
+  ASSERT_TRUE(until([&] {
+    return std::ranges::any_of(source->getReplication().status(), [&](const auto& row) { return row.collection == docs; });
+  }));
 }
 
 }

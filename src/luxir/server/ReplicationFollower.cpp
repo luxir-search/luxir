@@ -253,7 +253,7 @@ struct ReplicationFollower::Impl {
   std::shared_ptr<Directory> metadata;
   std::mutex mutex; // status/scheduling only, never held across storage or network I/O
   std::condition_variable_any changed;
-  std::map<std::string, State> states;
+  std::map<CollectionId, State> states;
   bool connected = false, discovered = false;
   uint64_t lastContact = 0;
   std::string boot, discoveryError;
@@ -281,7 +281,7 @@ struct ReplicationFollower::Impl {
       if (fs) for (const auto& entry : std::filesystem::directory_iterator(node.getConfig().store.data_dir)) {
         auto name = entry.path().filename().string();
         if (name == "write.lock" || name == "replication.json.pending") continue;
-        if (name == "c" && std::filesystem::is_empty(entry.path())) continue;
+        if (name == "c" && FSDirFactory::holdsNoCollections(entry.path())) continue;
         throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
       }
       if (binding.follower.empty()) binding.follower = newUuid();
@@ -296,13 +296,13 @@ struct ReplicationFollower::Impl {
       // A collection without CURRENT keeps verified candidate files for a
       // restarted download; the next successful install sweeps them.
       if (!row.collection) continue;
-      auto& state = states[row.name];
+      auto& state = states[row.id];
       if (row.error.empty()) state.serving = row.collection->getShard()->getSnapshots().snapshot()->id;
       else {
         state.unreadable = row.incarnation.value_or("");
         state.error = row.error;
       }
-      auto& saved = binding.collections[row.name];
+      auto& saved = binding.collection(row.id);
       state.seenBoot = saved.boot;
       if (!saved.advertised.empty()) state.advertised = CommitId::parse(saved.advertised);
       state.replaceEmpty = saved.replace_empty;
@@ -318,9 +318,9 @@ struct ReplicationFollower::Impl {
     {
       std::lock_guard lock(mutex);
       next.source = binding.source; next.follower = binding.follower;
-      for (const auto& [name, state] : states)
-        next.collections.emplace(name, ReplicationState::Collection{
-            state.advertised ? state.advertised->token() : "", state.seenBoot, state.replaceEmpty, {}});
+      for (const auto& [id, state] : states)
+        next.collection(id) = ReplicationState::Collection{
+            state.advertised ? state.advertised->token() : "", state.seenBoot, state.replaceEmpty, {}};
     }
     auto bytes = glz::write_json(next).value();
     if (bytes != persisted) { next.write(*metadata); persisted = std::move(bytes); }
@@ -337,7 +337,7 @@ struct ReplicationFollower::Impl {
   }
   // The worker (or orphan admin) owns this collection's busy flag. Discovery
   // only updates desired state, and never waits for storage operations.
-  void eraseLocal(const std::string& name) {
+  void eraseLocal(const CollectionId& name) {
     std::optional<Collections::Candidate> candidate;
     { std::lock_guard lock(mutex); candidate = std::exchange(states[name].candidate, std::nullopt); }
     if (candidate) node.collections().discard(*candidate);
@@ -353,8 +353,11 @@ struct ReplicationFollower::Impl {
         + "&since=" + escape(cursor) + "&timeout_ms=" + std::to_string(timeout.count()), {}, timeout + 10s);
     api::ReplicationCatalog catalog;
     if (!api::read_json(catalog, api::build::arenaStr(arena, response.body()), arena) || catalog.boot.empty() || catalog.cursor.empty()) throw std::runtime_error("invalid source catalog");
-    for (const auto& [name, entry] : catalog.collections) {
-      Collections::validateName(name);
+    std::set<CollectionId> seen;
+    for (const auto& entry : catalog.collections) {
+      CollectionId id{std::string(entry.tenant), std::string(entry.collection)};
+      Collections::validate(id);
+      if (!seen.insert(std::move(id)).second) throw std::runtime_error("duplicate collection in source catalog");
       if (!entry.commit.empty()) validateIncarnation(CommitId::parse(entry.commit).incarnation);
     }
     return catalog;
@@ -393,9 +396,15 @@ struct ReplicationFollower::Impl {
           if (boot != catalog.boot) for (auto& [name, state] : states) state.acknowledged.reset();
           boot = catalog.boot; cursor = catalog.cursor;
           connected = discovered = true; discoveryError.clear();
-          for (const auto& [name, entry] : catalog.collections) states.try_emplace(std::string(name));
-          for (auto& [name, state] : states) {
-            auto found = catalog.collections.find(name);
+          std::map<CollectionId, const api::ReplicationCatalogEntry*> entries;
+          for (const auto& entry : catalog.collections) {
+            CollectionId id{std::string(entry.tenant), std::string(entry.collection)};
+            states.try_emplace(id);
+            entries.emplace(std::move(id), &entry);
+          }
+          for (auto& [id, state] : states) {
+            auto it = entries.find(id);
+            auto* found = it == entries.end() ? nullptr : it->second;
             bool present = found != nullptr;
             state.unavailable = present && !found->available;
             observe(state, present ? advertisedCommit(*found) : std::nullopt, present, boot);
@@ -422,7 +431,7 @@ struct ReplicationFollower::Impl {
     }
   }
 
-  void download(Client& client, const std::string& collection, Directory& dir, const CommitSnapshot& snapshot,
+  void download(Client& client, const CollectionId& collection, Directory& dir, const CommitSnapshot& snapshot,
                 const FileDescriptor& descriptor) {
     Signal::emit("replicationDownloadStart", (void*)&descriptor);
     Directory::FileCreateOptions options; options.expectedSize = descriptor.size;
@@ -433,7 +442,7 @@ struct ReplicationFollower::Impl {
     while (offset < descriptor.size || (descriptor.size == 0 && failures == 0)) {
       if (stopping.stop_requested()) throw std::runtime_error("follower stopped");
       try {
-        auto path = "/collections/" + collection + "/_snapshot/files/" + escape(descriptor.name) + "?commit=" + escape(snapshot.id.token()) + "&" + followerQuery();
+        auto path = snapshotPath(collection) + "/files/" + escape(descriptor.name) + "?commit=" + escape(snapshot.id.token()) + "&" + followerQuery();
         client.send(http::verb::get, path, {}, offset);
         http::response_parser<http::buffer_body> parser;
         // Error bodies (especially 410 for a tiny file) can exceed file size.
@@ -469,8 +478,12 @@ struct ReplicationFollower::Impl {
     Signal::emit("replicationFileVerified", &file);
   }
 
-  std::shared_ptr<const CommitSnapshot> fetchSnapshot(Client& client, const std::string& name) {
-    auto response = request(client, http::verb::get, "/collections/" + name + "/_snapshot?" + followerQuery());
+  static std::string snapshotPath(const CollectionId& id) {
+    return "/tenants/" + id.tenant + "/collections/" + id.name + "/_snapshot";
+  }
+
+  std::shared_ptr<const CommitSnapshot> fetchSnapshot(Client& client, const CollectionId& name) {
+    auto response = request(client, http::verb::get, snapshotPath(name) + "?" + followerQuery());
     auto& body = response.body();
     auto bytes = std::make_shared<const std::vector<std::byte>>((const std::byte*)body.data(), (const std::byte*)body.data() + body.size());
     auto snapshot = CommitSnapshot::fromBytes(bytes);
@@ -490,7 +503,7 @@ struct ReplicationFollower::Impl {
     std::optional<Collections::Candidate> obsolete;
   };
 
-  Decision decide(const std::string& name, const CommitSnapshot& snapshot) {
+  Decision decide(const CollectionId& name, const CommitSnapshot& snapshot) {
     Decision decision;
     std::lock_guard lock(mutex);
     auto& state = states[name];
@@ -526,7 +539,7 @@ struct ReplicationFollower::Impl {
 
   // Verifies every file of `snapshot` in the target directory, downloading what
   // is missing, and makes them durable. Returns the target's prior snapshot.
-  void stageFiles(Client& client, const std::string& name, Directory& dir, const std::shared_ptr<const CommitSnapshot>& previous,
+  void stageFiles(Client& client, const CollectionId& name, Directory& dir, const std::shared_ptr<const CommitSnapshot>& previous,
                   const CommitSnapshot& snapshot, const std::shared_ptr<Collection>& active) {
     std::map<std::string, FileDescriptor> verified;
     { std::lock_guard lock(mutex); verified = states[name].verified; }
@@ -582,7 +595,7 @@ struct ReplicationFollower::Impl {
     dir.sync(names); syncDir(dir);
   }
 
-  void sync(Client& client, const std::string& name) {
+  void sync(Client& client, const CollectionId& name) {
     { std::lock_guard lock(mutex);
       auto& state = states[name]; state.total = state.downloaded = state.reused = 0;
     }
@@ -645,24 +658,25 @@ struct ReplicationFollower::Impl {
     }
     size_t installed = 0, failed = 0;
     uint64_t transferred = 0, reused = 0;
-    for (const auto& [name, entry] : catalog.collections) {
-      auto& state = states[std::string(name)];
+    for (const auto& entry : catalog.collections) {
+      CollectionId name{std::string(entry.tenant), std::string(entry.collection)};
+      auto& state = states[name];
       observe(state, advertisedCommit(entry), true, std::string(catalog.boot));
       state.downloaded = state.reused = 0;
       uint64_t downloaded = 0;
       try {
         if (!entry.available) throw std::runtime_error("source collection unavailable");
         for (unsigned attempt = 0;; attempt++) {
-          try { sync(client, std::string(name)); break; }
+          try { sync(client, name); break; }
           catch (const PinGone&) { if (attempt == 2) throw; downloaded += state.downloaded; }
         }
         persistState();
         if (state.serving != state.advertised) throw std::runtime_error("waiting for source data before replacing the local snapshot");
         installed++;
-        output << name << ' ' << state.serving->token() << " transferred=" << downloaded + state.downloaded << " reused=" << state.reused << '\n';
+        output << name.label() << ' ' << state.serving->token() << " transferred=" << downloaded + state.downloaded << " reused=" << state.reused << '\n';
       } catch (const std::exception& e) {
         client.reset(); failed++;
-        output << name << ' ' << entry.commit << " transferred=" << downloaded + state.downloaded
+        output << name.label() << ' ' << entry.commit << " transferred=" << downloaded + state.downloaded
                << " reused=" << state.reused << " ERROR: " << errorMessage(e) << '\n';
       }
       transferred += downloaded + state.downloaded; reused += state.reused;
@@ -675,7 +689,7 @@ struct ReplicationFollower::Impl {
   void worker() {
     Client client(source, stopping.get_token());
     while (!stopping.stop_requested()) {
-      std::string name;
+      CollectionId name;
       uint64_t progress = 0;
       {
         std::unique_lock lock(mutex);
@@ -695,7 +709,7 @@ struct ReplicationFollower::Impl {
         };
         changed.wait_for(lock, stopping.get_token(), 200ms, ready);
         if (stopping.stop_requested()) break;
-        if (name.empty()) continue;
+        if (name.name.empty()) continue;
       }
       std::string error;
       try {
@@ -718,7 +732,7 @@ struct ReplicationFollower::Impl {
             }
             if (!serving) return;
             auto token = serving->token();
-            api::ReplicationInstalled ack{binding.follower, name, token};
+            api::ReplicationInstalled ack{binding.follower, name.tenant, name.name, token};
             std::string body;
             if (!api::write_json(ack, body)) throw std::runtime_error("failed to serialize acknowledgment");
             request(client, http::verb::post, "/_replication/installed", body);
@@ -764,9 +778,8 @@ void ReplicationFollower::start() {
 void ReplicationFollower::stop() {
   impl->stopping.request_stop(); impl->changed.notify_all(); impl->threads.clear();
 }
-void ReplicationFollower::deleteOrphan(std::string_view name) {
-  Collections::validateName(name);
-  std::string key(name);
+void ReplicationFollower::deleteOrphan(const CollectionId& key) {
+  Collections::validate(key);
   {
     std::unique_lock lock(impl->mutex);
     if (!impl->connected || !impl->discovered || (impl->states.contains(key) && (impl->states.at(key).advertised || impl->states.at(key).unavailable))) {
@@ -792,9 +805,9 @@ void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_re
   out.connected = impl->connected; out.last_contact = impl->lastContact;
   auto* rows = api::build::allocArray(out.collections, impl->states.size(), arena);
   size_t i = 0;
-  for (const auto& [name, state] : impl->states) {
+  for (const auto& [id, state] : impl->states) {
     auto token = [&](const std::optional<CommitId>& id) { return id ? str(id->token()) : std::string_view(); };
-    auto& row = rows[i++]; row.name = str(name); row.source_commit = token(state.advertised); row.serving_commit = token(state.serving);
+    auto& row = rows[i++]; row.name = str(id.name); row.tenant = str(id.tenant); row.source_commit = token(state.advertised); row.serving_commit = token(state.serving);
     using State = api::ReplicationCollectionStatus::State;
     row.state = (!impl->connected || state.unavailable) ? State::STALE : !state.advertised ? State::ORPHAN : !state.error.empty() ? State::ERROR
         : state.waiting ? State::WAITING : state.advertised == state.serving ? State::SERVING : State::SYNCING;

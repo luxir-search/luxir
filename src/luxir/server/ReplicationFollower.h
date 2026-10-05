@@ -29,7 +29,7 @@ public:
   bool pull(std::ostream& output);
   void start();
   void stop();
-  void deleteOrphan(std::string_view name);
+  void deleteOrphan(const CollectionId& id);
   void stats(api::ReplicationStatus& out, std::pmr::memory_resource& arena);
 };
 }

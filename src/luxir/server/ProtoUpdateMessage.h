@@ -51,6 +51,9 @@ public:
   void clearIds() { ids_.clear(); }
 
   const RequestProto* req;  // The request object may become unavailable after the callback is called
+  // The collection the transport resolved and submitted to; replica waits
+  // target it rather than re-resolving req->collection.
+  CollectionId target;
   const int64_t dateMathNowEpochMillis;
 
   ProtoUpdateMessage(const RequestProto* req, ResponseProto* rsp=nullptr)

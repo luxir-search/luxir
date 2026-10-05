@@ -744,6 +744,7 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 
     if (request->proto.commit && request->proto.commit->wait_for_replicas.has_value()) call.enableWaitCancellation();
     Update* updateMessage = new Update(std::move(request), &call);
+    updateMessage->target = collection->getId();
     try {
       if (!iw->submitUpdate(updateMessage)) {
         throw std::runtime_error("update was not admitted");
@@ -770,7 +771,7 @@ static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& read
     call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
       try {
         auto created = call.server.getLuxirNode().createCollection(
-            request->proto.name,
+            LuxirNode::adminTarget(request->proto.tenant, request->proto.name),
             request->proto.schema ? &*request->proto.schema : nullptr);
         CreateCollectionRespProto response;
         response.name = request->proto.name;
@@ -798,7 +799,7 @@ static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& read
   try {
     call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
       try {
-        call.server.getLuxirNode().deleteCollection(request->proto.name);
+        call.server.getLuxirNode().deleteCollection(LuxirNode::adminTarget(request->proto.tenant, request->proto.name));
         DeleteCollectionRespProto response;
         response.name = request->proto.name;
         call.respondRaw(serializeToByteBuffer(response), 1);
@@ -925,7 +926,7 @@ static void handleWaitForReplicas(GenericCallData& call, grpc::ByteBuffer& readB
   try {
     if (!request.proto.wait_for_replicas) throw RequestError("wait_for_replicas is required");
     auto id = CommitId::parse(request.proto.commit);
-    auto name = request.proto.collection.empty() ? std::string(LuxirNode::kDefaultCollectionName) : std::string(request.proto.collection);
+    auto name = LuxirNode::target({}, request.proto.collection);
     auto& node = call.server.getLuxirNode();
     call.enableWaitCancellation();
     { std::lock_guard lock(call.mutex); call.requestActive = true; }

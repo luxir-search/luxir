@@ -83,6 +83,9 @@ class SearchRequest {
 
 public:
   std::stop_source waitCancellation{std::nostopstate};
+  // The request's tenant, owned for asynchronous resolution; empty is the
+  // default tenant.
+  std::string tenant;
   std::shared_ptr<Collection> floorCollection;
   SearchEngine& engine;
   const SearchConfig searchConfig;

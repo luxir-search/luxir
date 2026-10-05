@@ -33,7 +33,7 @@ void fullTable() {
 ReplicationSource::ReplicationSource(std::chrono::milliseconds liveness, Now now)
     : boot(newUuid()), liveness(liveness), now(std::move(now)) {}
 
-void ReplicationSource::pruneLocked(const std::string& name) {
+void ReplicationSource::pruneLocked(const CollectionId& name) {
   auto current = collections.find(name);
   for (auto& [id, follower] : followers) {
     auto it = follower.commits.find(name);
@@ -42,7 +42,7 @@ void ReplicationSource::pruneLocked(const std::string& name) {
   }
 }
 
-void ReplicationSource::registered(const std::string& name, const std::shared_ptr<Collection>& collection) noexcept {
+void ReplicationSource::registered(const CollectionId& name, const std::shared_ptr<Collection>& collection) noexcept {
   try {
     decltype(watches) ready;
     {
@@ -58,7 +58,7 @@ void ReplicationSource::registered(const std::string& name, const std::shared_pt
   } catch (...) { LOG_ERROR("Replication registration notification failed"); }
 }
 
-void ReplicationSource::updated(const std::string& name, const Collection& collection) noexcept {
+void ReplicationSource::updated(const CollectionId& name, const Collection& collection) noexcept {
   try {
     decltype(watches) ready;
     {
@@ -74,7 +74,7 @@ void ReplicationSource::updated(const std::string& name, const Collection& colle
   } catch (...) { LOG_ERROR("Replication publication notification failed"); }
 }
 
-void ReplicationSource::removed(const std::string& name) noexcept {
+void ReplicationSource::removed(const CollectionId& name) noexcept {
   try {
     decltype(watches) ready;
     {
@@ -133,18 +133,22 @@ void ReplicationSource::cancel(uint64_t watch) {
   watches.erase(watch);
 }
 
-api::ReplicationCatalog ReplicationSource::catalog(std::pmr::memory_resource& arena) {
+api::ReplicationCatalog ReplicationSource::catalog(std::pmr::memory_resource& arena, std::span<const std::string> tenants) {
   std::lock_guard lock(mutex);
   api::ReplicationCatalog response;
   response.boot = api::build::arenaStr(arena, boot);
   response.cursor = api::build::arenaStr(arena, boot + ":" + std::to_string(revision));
-  auto* entries = api::build::allocArray(response.collections, collections.size(), arena);
+  auto wanted = [&](const CollectionId& id) { return tenants.empty() || std::ranges::find(tenants, id.tenant) != tenants.end(); };
+  auto* entries = api::build::allocArray(response.collections,
+      (size_t)std::ranges::count_if(collections, [&](const auto& entry) { return wanted(entry.first); }), arena);
   size_t i = 0;
-  for (const auto& [name, state] : collections) {
+  for (const auto& [id, state] : collections) {
+    if (!wanted(id)) continue;
     auto& entry = entries[i++];
-    entry.first = api::build::arenaStr(arena, name);
-    entry.second.available = state.error.empty();
-    if (state.commit) entry.second.commit = api::build::arenaStr(arena, state.commit->token());
+    entry.tenant = api::build::arenaStr(arena, id.tenant);
+    entry.collection = api::build::arenaStr(arena, id.name);
+    entry.available = state.error.empty();
+    if (state.commit) entry.commit = api::build::arenaStr(arena, state.commit->token());
   }
   return response;
 }
@@ -152,23 +156,25 @@ api::ReplicationCatalog ReplicationSource::catalog(std::pmr::memory_resource& ar
 void ReplicationSource::installed(const api::ReplicationInstalled& request) {
   validateFollower(request.follower);
   auto id = CommitId::parse(request.commit);
+  if (request.tenant.empty() || request.collection.empty()) throw std::invalid_argument("expected follower, tenant, collection and commit");
+  CollectionId target(std::string(request.tenant), std::string(request.collection));
   {
     std::lock_guard lock(mutex);
     expireLocked();
-    auto collection = collections.find(request.collection);
+    auto collection = collections.find(target);
     if (collection == collections.end() || !collection->second.commit) throw std::invalid_argument("unknown installed collection");
     const auto& current = *collection->second.commit;
     if (id.incarnation != current.incarnation || id.index_gen > current.index_gen)
       throw std::invalid_argument("installed commit does not belong to the current collection");
     auto follower = followers.find(request.follower);
     bool extraRow = follower == followers.end() ||
-        (!follower->second.commits.empty() && !follower->second.commits.contains(request.collection));
+        (!follower->second.commits.empty() && !follower->second.commits.contains(target));
     if (extraRow && rowsLocked() >= 4096) fullTable();
     seenLocked(request.follower);
-    auto& installed = followers.find(request.follower)->second.commits[std::string(request.collection)];
+    auto& installed = followers.find(request.follower)->second.commits[target];
     if (installed.incarnation != id.incarnation || installed.index_gen < id.index_gen) installed = std::move(id);
   }
-  if (acknowledgmentsChanged) acknowledgmentsChanged(request.collection);
+  if (acknowledgmentsChanged) acknowledgmentsChanged(&target);
 }
 
 std::vector<ReplicationSource::Follower> ReplicationSource::status() {
@@ -201,11 +207,11 @@ std::optional<ReplicationSource::Clock::time_point> ReplicationSource::nextExpir
 
 void ReplicationSource::expire() {
   { std::lock_guard lock(mutex); expireLocked(); }
-  if (acknowledgmentsChanged) acknowledgmentsChanged({});
+  if (acknowledgmentsChanged) acknowledgmentsChanged(nullptr);
 }
 
 ReplicationSource::Barrier ReplicationSource::capture(const api::ReplicaRequirement& requirement,
-                                                       std::string_view collection, const CommitId& commit) {
+                                                       const CollectionId& collection, const CommitId& commit) {
   if (requirement.kind.index() == 0) throw RequestError("wait_for_replicas requires count or all");
   Barrier result{std::holds_alternative<api::AllReplicas>(requirement.kind), 0, {}};
   if (!result.all) result.wanted = std::get<uint32_t>(requirement.kind);
@@ -220,7 +226,7 @@ ReplicationSource::Barrier ReplicationSource::capture(const api::ReplicaRequirem
   return result;
 }
 
-api::ReplicaResult ReplicationSource::progress(const Barrier& barrier, std::string_view collection, const CommitId& id) {
+api::ReplicaResult ReplicationSource::progress(const Barrier& barrier, const CollectionId& collection, const CommitId& id) {
   std::lock_guard lock(mutex);
   expireLocked();
   uint32_t wanted = barrier.all ? 0 : barrier.wanted, serving = 0;

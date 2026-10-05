@@ -279,6 +279,7 @@ struct HttpStreamUpdateState {
   std::string defaultCollectionName;
   HttpStreamGroup group;
   std::map<std::string, HttpStreamWriterTarget> writerCache;
+  std::string tenant; // the stream's, fixed when it starts
   std::unique_ptr<HttpStreamBatchState> batch;
   bool batchReady = false;
   std::map<std::uint64_t, std::shared_ptr<HttpStreamBatchState>> inFlightBatches;
@@ -530,7 +531,7 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, HEALTH, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
+    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
     REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED, WAIT_FOR_REPLICAS
   };
 
@@ -540,6 +541,10 @@ private:
     std::string_view hint;   // appended to a 405 message when the verb choice needs teaching
     std::string coll;
     std::string file;
+    // /tenants/{tenant}/...: an administration or replication route naming its
+    // tenant. Other routes act in the request's own tenant.
+    std::string tenant;
+    bool tenantRoute = false;
     // /collections//{endpoint}: a collection route whose {c} segment is empty.  That
     // is a malformed URL, not a request for the default collection (which is the
     // omitted body field), so dispatch rejects it before any handler resolves it.
@@ -593,6 +598,10 @@ private:
   unsigned httpVersion_ = 11;
   bool keepAlive_ = false;
   std::string requestId_;  // URL param, then the parsed body
+  // The current request's tenant: named by a /tenants route, otherwise the
+  // caller's (the default tenant until credentials carry one). Asynchronous
+  // work captures it by value.
+  std::string tenant_;
   std::vector<UrlParam> urlParams_;
   RouteMatch route_;
   UpdateUrlParams updateUrl_;
@@ -823,6 +832,10 @@ private:
   // storage refuses them again (see ReadOnlyDirectory), but only this gate can
   // produce a decent error, and only it stops the work before it starts.
   static bool isMutatingRequest(http::verb method, std::string_view target) {
+    if (target.starts_with("/tenants/")) {
+      auto slash = target.find('/', 9);
+      target = slash == std::string_view::npos ? std::string_view{} : target.substr(slash);
+    }
     if (target == "/collections/_create" || target == "/collections/_delete") return true;
     if (method != http::verb::post) return false;
     std::string coll;
@@ -1181,7 +1194,34 @@ private:
     return true;
   }
 
+  // Routes that may name a tenant: administration and replication. Search,
+  // update and replica waits always act in the caller's own tenant.
+  static bool tenantRoute(Route route) {
+    return route == Route::COLLECTION_LIST || route == Route::COLLECTION_CREATE || route == Route::COLLECTION_DELETE ||
+           route == Route::STATS || route == Route::SCHEMA || route == Route::REPLICATION_SNAPSHOT ||
+           route == Route::REPLICATION_FILE;
+  }
+
   static RouteMatch matchRoute(std::string_view target) {
+    if (target == "/tenants") {
+      RouteMatch m;
+      m.route = Route::TENANT_LIST; m.allow = "GET"; m.prettyDefault = true;
+      return m;
+    }
+    if (target.starts_with("/tenants/")) {
+      auto rest = target.substr(9);
+      auto slash = rest.find('/');
+      if (slash == std::string_view::npos) return {};
+      auto m = matchUnscopedRoute(rest.substr(slash));
+      if (!tenantRoute(m.route)) return {};
+      m.tenant = rest.substr(0, slash);
+      m.tenantRoute = true;
+      return m;
+    }
+    return matchUnscopedRoute(target);
+  }
+
+  static RouteMatch matchUnscopedRoute(std::string_view target) {
     RouteMatch m;
     if (target == "/health") {
       m.route = Route::HEALTH; m.allow = "GET";
@@ -1263,8 +1303,15 @@ private:
       return;
     }
 
+    if (match.tenantRoute) {
+      try { Collections::validateName(match.tenant, "tenant"); }
+      catch (const std::exception& e) { respondError(classifyException(e, ErrorKind::INVALID_REQUEST)); return; }
+      tenant_ = match.tenant;
+    } else tenant_ = CollectionId::kDefaultTenant;
+
     const std::string& coll = match.coll;
     switch (match.route) {
+      case Route::TENANT_LIST: handleTenantList(); break;
       case Route::REPLICATION_STATUS: {
         std::pmr::monotonic_buffer_resource arena;
         api::ReplicationStatus status;
@@ -1273,7 +1320,8 @@ private:
         auto* rows = api::build::allocArray(status.followers, followers.size(), arena);
         for (size_t i = 0; i < followers.size(); i++) {
           const auto& src = followers[i];
-          rows[i] = {api::build::arenaStr(arena, src.follower), api::build::arenaStr(arena, src.collection),
+          rows[i] = {api::build::arenaStr(arena, src.follower), api::build::arenaStr(arena, src.collection.tenant),
+              api::build::arenaStr(arena, src.collection.name),
               api::build::arenaStr(arena, src.commit.index_gen ? src.commit.token() : ""), src.lastSeen, src.lag};
         }
         std::string body;
@@ -1354,8 +1402,9 @@ private:
             return;
           }
         }
-        handleStats(target == "/_stats" ? std::nullopt : std::optional<std::string>(coll),
-                    includeSegments);
+        // /_stats covers every tenant; a tenant route or a collection is scoped.
+        handleStats(coll.empty() ? std::nullopt : std::optional<std::string>(coll),
+                    match.tenantRoute || !coll.empty() ? tenant_ : std::string(), includeSegments);
         break;
       }
       case Route::SCHEMA: {
@@ -1538,6 +1587,7 @@ private:
     // Pin the io_context: shutdown drains until this query finishes, and the
     // context survives the request's teardown on the task-arena thread.
     sreq->shardPin = makeShardPin();
+    sreq->tenant = tenant_;
 
     // Route by max_parallel: the default (0) deliberately runs the whole
     // query right here on the shard thread - serial, no scheduler, blocking
@@ -1607,9 +1657,10 @@ private:
       if (state->proto.commit && state->proto.commit->wait_for_replicas) watchWaitDisconnect();
       auto admission = std::make_unique<Update>(shared_from_this(), std::move(state), shardPin);
       auto* msg = admission.get();
-      node_.getTaskArena().enqueue([self = shared_from_this(), msg, shardPin] {
+      node_.getTaskArena().enqueue([self = shared_from_this(), msg, tenant = tenant_, shardPin] {
         try {
-          auto collection = self->node_.resolveOrCreateCollection(msg->req->collection);
+          auto collection = self->node_.resolveOrCreateCollection(msg->req->collection, tenant);
+          msg->target = collection->getId();
           auto iw = collection->getShard()->requireIndexWriter();
           if (!iw->submitUpdate(msg)) throw std::runtime_error("update was not admitted");
         } catch (...) {
@@ -1632,8 +1683,8 @@ private:
     std::optional<ErrorInfo> failure;
     try {
       auto entries = node_.collectionEntries();
-      std::vector<std::string_view> names(entries.size());
-      for (std::size_t i = 0; i < entries.size(); i++) names[i] = entries[i].name;
+      std::vector<std::string_view> names;
+      for (const auto& entry : entries) if (entry.id.tenant == tenant_) names.push_back(entry.id.name);
       luxir::api::ListCollectionsResponse response;
       response.collections = names;
       if (!luxir::api::write_json(response, out)) {
@@ -1644,6 +1695,29 @@ private:
     }
     if (failure) respondError(*failure);
     else respondJson(http::status::ok, std::move(out));
+  }
+
+  // Tenants that own a registered collection, not leftover directories.
+  void handleTenantList() {
+    std::string out;
+    std::set<std::string> tenants;
+    for (const auto& entry : node_.collectionEntries()) tenants.insert(entry.id.tenant);
+    std::vector<std::string_view> names(tenants.begin(), tenants.end());
+    luxir::api::ListTenantsResponse response;
+    response.tenants = names;
+    if (!luxir::api::write_json(response, out)) {
+      respondError(ErrorInfo::of(ErrorKind::INTERNAL, "failed to serialize list tenants response"));
+      return;
+    }
+    respondJson(http::status::ok, std::move(out));
+  }
+
+  // An administration body may repeat the route's tenant, never name another.
+  CollectionId adminTarget(std::string_view bodyTenant, std::string_view name) const {
+    if (!bodyTenant.empty() && bodyTenant != tenant_) {
+      throw RequestError("tenant '" + std::string(bodyTenant) + "' belongs in a /tenants/" + std::string(bodyTenant) + " route");
+    }
+    return {tenant_, std::string(name)};
   }
 
   void handleCollectionCreate(std::string body) {
@@ -1663,14 +1737,16 @@ private:
       respondException(e, ErrorKind::INVALID_REQUEST);
       return;
     }
+    CollectionId id;
+    try { id = adminTarget(state->request.tenant, state->request.name); }
+    catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
 
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin] {
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, id, shardPin] {
       std::string out;
       std::optional<ErrorInfo> failure;
       try {
-        auto created = self->node_.createCollection(
-            state->request.name,
+        auto created = self->node_.createCollection(id,
             state->request.schema ? &*state->request.schema : nullptr);
         luxir::api::CreateCollectionResponse response;
         response.name = state->request.name;
@@ -1706,13 +1782,16 @@ private:
       respondException(e, ErrorKind::INVALID_REQUEST);
       return;
     }
+    CollectionId id;
+    try { id = adminTarget(state->request.tenant, state->request.name); }
+    catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
 
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin] {
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, id, shardPin] {
       std::string out;
       std::optional<ErrorInfo> failure;
       try {
-        self->node_.deleteCollection(state->request.name);
+        self->node_.deleteCollection(id);
         luxir::api::DeleteCollectionResponse response;
         response.name = state->request.name;
         if (!luxir::api::write_json(response, out)) {
@@ -1750,11 +1829,11 @@ private:
   void handleSchemaGet(const std::string& coll, bool resolved) {
     if (resolved) {
       auto shardPin = makeShardPin();
-      node_.getTaskArena().enqueue([self = shared_from_this(), coll, shardPin] {
+      node_.getTaskArena().enqueue([self = shared_from_this(), coll, tenant = tenant_, shardPin] {
         std::string out;
         std::optional<ErrorInfo> failure;
         try {
-          auto collection = self->node_.resolveCollection(coll);
+          auto collection = self->node_.resolveCollection(coll, tenant);
           out = collection->getReaderManager().resolvedSchema();
         } catch (const std::exception& e) {
           failure = classifyException(e, ErrorKind::INTERNAL);
@@ -1772,7 +1851,7 @@ private:
     std::string out;
     std::optional<ErrorInfo> failure;
     try {
-      auto collection = node_.resolveCollection(coll);
+      auto collection = node_.resolveCollection(coll, tenant_);
       auto schema = collection->getSchema();
       out = renderSchemaBody(*schema);
     } catch (const std::exception& e) {
@@ -1898,7 +1977,7 @@ private:
       auto pin = makeShardPin();
       watchWaitDisconnect();
       auto& waits = node_.getCommitWaits();
-      waits.awaitReplicas(std::string(request.collection), id, *request.wait_for_replicas,
+      waits.awaitReplicas(LuxirNode::target(tenant_, request.collection), id, *request.wait_for_replicas,
           waits.deadlineAfter(request.wait_for_replicas_timeout_ms.value_or(30000)), waitCancellation.get_token(),
           [self = shared_from_this(), pin, token = id.token()](api::ReplicaResult replicas) {
             net::post(self->stream_.get_executor(), [self, pin, token, replicas] {
@@ -2024,14 +2103,14 @@ private:
       }
     } catch (const std::exception& e) { respondError(classifyException(e, ErrorKind::INVALID_REQUEST), requestId_, head); return; }
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), coll, name, id, range, head, json, shardPin] {
+    node_.getTaskArena().enqueue([self = shared_from_this(), coll, tenant = tenant_, name, id, range, head, json, shardPin] {
       auto transfer = std::make_shared<ReplicationTransfer>();
       transfer->head = head;
       transfer->json = json;
       std::optional<ErrorInfo> failure;
       http::status status = http::status::ok;
       try {
-        transfer->collection = self->node_.getCollection(coll);
+        transfer->collection = self->node_.getCollection(CollectionId(tenant, coll));
         auto& snapshots = transfer->collection->getShard()->getSnapshots();
         if (name.empty()) {
           auto snapshot = head ? snapshots.snapshot() : snapshots.acquire(&transfer->cancellation);
@@ -2094,16 +2173,17 @@ private:
     });
   }
 
-  void handleStats(std::optional<std::string> coll, bool includeSegments) {
+  void handleStats(std::optional<std::string> coll, std::string tenant, bool includeSegments) {
     auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue(
-        [self = shared_from_this(), coll = std::move(coll), includeSegments, shardPin] {
+        [self = shared_from_this(), coll = std::move(coll), tenant = std::move(tenant), includeSegments, shardPin] {
           std::string out;
           std::optional<ErrorInfo> failure;
           try {
             std::pmr::monotonic_buffer_resource resource;
             luxir::api::StatsRequest request;
             request.segments = includeSegments;
+            request.tenant = tenant;
             if (coll) request.collection = *coll;
 
             luxir::api::StatsResponse response;
@@ -2431,6 +2511,7 @@ private:
         (std::size_t)ingest.max_request_body,
         maxInFlight);
     state->defaultCollectionName = std::move(coll);
+    state->tenant = tenant_;
     state->group.collectionName = state->defaultCollectionName;
     state->url = std::move(url);
     state->shardPin = makeShardPin();
@@ -2683,7 +2764,7 @@ private:
     if (!inserted) return &it->second;
 
     try {
-      it->second.collection = node_.resolveOrCreateCollection(collectionName);
+      it->second.collection = node_.resolveOrCreateCollection(collectionName, state->tenant);
       it->second.indexWriter = it->second.collection->getShard()->requireIndexWriter();
     } catch (...) {
       err = currentExceptionInfo(ErrorKind::INTERNAL);
@@ -2735,6 +2816,7 @@ private:
     auto iw = target->indexWriter;
     auto message = std::make_shared<StreamingUpdateMessage>(
         &batch->proto, shared_from_this(), state, ordinal, batch);
+    message->target = target->collection->getId();
     batch->message = message;
     auto [entry, inserted] = state->inFlightBatches.emplace(ordinal, batch);
     unused(entry);
@@ -3212,7 +3294,7 @@ private:
     enqueueLine("", true);
   }
 
-  using UrlWriters = std::vector<std::pair<std::string, std::shared_ptr<IndexWriter>>>;
+  using UrlWriters = std::vector<std::pair<std::string, HttpStreamWriterTarget>>;
 
   void onUrlCommitDone(const std::shared_ptr<HttpStreamUpdateState>& state, const std::string& name,
                        const std::optional<CommitId>& id, std::optional<api::ReplicaResult> replicas,
@@ -3262,7 +3344,8 @@ private:
           }
         };
         auto* msg = new Commit(std::move(request), self, state, writers, index);
-        try { if (!(*writers)[index].second->submitUpdate(msg)) throw std::runtime_error("update was not admitted"); }
+        msg->target = (*writers)[index].second.collection->getId();
+        try { if (!(*writers)[index].second.indexWriter->submitUpdate(msg)) throw std::runtime_error("update was not admitted"); }
         catch (...) { delete msg; throw; }
       } catch (...) {
         auto error = currentExceptionInfo(ErrorKind::INTERNAL);
@@ -3278,7 +3361,7 @@ private:
     auto state = streamUpdate_;
     assert(state != nullptr && !state->urlCommitInFlight);
     auto writers = std::make_shared<UrlWriters>();
-    for (const auto& [name, target] : state->writerCache) writers->emplace_back(name, target.indexWriter);
+    for (const auto& [name, target] : state->writerCache) writers->emplace_back(name, target);
     state->url.commit = false;
     state->interval.commit.reset();
     state->interval.replicas.reset();

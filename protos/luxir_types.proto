@@ -1067,6 +1067,9 @@ message ColDouble {
 message CreateCollectionRequest {
   string name = 1;
   SchemaDef schema = 2;
+  // Administration only: the owning tenant. Empty is the caller's tenant
+  // (the default tenant until credentials carry one).
+  string tenant = 3;
 }
 
 message CreateCollectionResponse {
@@ -1076,24 +1079,35 @@ message CreateCollectionResponse {
 
 message DeleteCollectionRequest {
   string name = 1;
+  string tenant = 2; // as CreateCollectionRequest.tenant
 }
 
 message DeleteCollectionResponse {
   string name = 1;
 }
 
-// Names of every collection on the node, sorted. HTTP-only: GET or POST
-// /collections/_list, also available as GET /collections.
+// Names of every collection of one tenant, sorted. HTTP-only: GET or POST
+// /collections/_list (also GET /collections) for the caller's tenant, or
+// /tenants/{tenant}/collections/_list.
 message ListCollectionsResponse {
   repeated string collections = 1;
+}
+
+// Tenants that own at least one collection, sorted. HTTP-only: GET /tenants.
+message ListTenantsResponse {
+  repeated string tenants = 1;
 }
 
 // Operational statistics. An empty collection requests every
 // collection on the node; per-segment records are opt-in because they are the
 // only unbounded part of the response.
 message StatsRequest {
-  string collection = 1; // empty selects every collection
+  // Empty selects every collection of `tenant`, or of every tenant when
+  // `tenant` is also empty (administration).
+  string collection = 1;
   bool segments = 2;
+  // Administration only. With a collection, empty is the caller's tenant.
+  string tenant = 3;
 }
 
 message StatsResponse {
@@ -1107,16 +1121,19 @@ message StatsResponse {
 message ReplicationCatalog {
   string boot = 1;
   string cursor = 2;
-  map<string, ReplicationCatalogEntry> collections = 3;
+  repeated ReplicationCatalogEntry collections = 3;
 }
 message ReplicationCatalogEntry {
   string commit = 1;
   bool available = 2;
+  string tenant = 3;
+  string collection = 4;
 }
 message ReplicationInstalled {
   string follower = 1;
   string collection = 2;
   string commit = 3;
+  string tenant = 4;
 }
 
 message ReplicationCollectionStatus {
@@ -1129,6 +1146,7 @@ message ReplicationCollectionStatus {
     ERROR = 5;
   }
   string name = 1;
+  string tenant = 9;
   string source_commit = 2;
   string serving_commit = 3;
   optional State state = 4;
@@ -1148,6 +1166,7 @@ message ReplicationStatus {
 
 message FollowerStatus {
   string follower = 1;
+  string tenant = 6;
   string collection = 2;
   string commit = 3;
   uint64 last_seen = 4; // Unix milliseconds
@@ -1175,6 +1194,7 @@ message StorageRamStats {
 
 message CollectionStats {
   string name = 1;
+  string tenant = 7;
   StatsTotals totals = 2;
   uint64 schema_gen = 3; // Schema generation
   repeated ShardStats shards = 4;

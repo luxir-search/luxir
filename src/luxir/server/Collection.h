@@ -9,6 +9,7 @@
 #include "luxir/util/ApiError.h"
 #include "luxir/store/Directory.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/store/CollectionId.h"
 
 namespace luxir {
 
@@ -98,16 +99,16 @@ namespace api::SchemaRequest_ { enum class Mode; }
 // A single logical collection of docs which may
 // consist of multiple shards.
 class Collection {
-  std::string name;
+  CollectionId id;
   std::string unavailableReason;  // non-empty means resolution rejects the collection
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
 public:
-  const std::string& getName() const { return name; }
+  const CollectionId& getId() const { return id; }
   std::string getUnavailableReason() const;
   // An unavailable entry: a failed load, delete or create, or a deletion in
   // progress. Resolution rejects it with `reason`.
-  static std::shared_ptr<Collection> placeholder(std::string name, std::string reason);
+  static std::shared_ptr<Collection> placeholder(CollectionId id, std::string reason);
 
   std::shared_ptr<Shard> getShard() const {
     return shard;

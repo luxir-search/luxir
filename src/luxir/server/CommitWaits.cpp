@@ -75,7 +75,7 @@ void CommitWaits::retireLocked(const Wait& wait) {
   if (auto replicas = std::get_if<Replicas>(&wait.kind); replicas && replicas->barrier.all) allWaits--;
 }
 
-void CommitWaits::checkLocked(std::string_view name, Pending& ready, bool removed) {
+void CommitWaits::checkLocked(const CollectionId& name, Pending& ready, bool removed) {
   auto it = waits.find(name);
   if (it == waits.end()) return;
   std::erase_if(it->second, [&](const auto& wait) {
@@ -105,7 +105,7 @@ void CommitWaits::admit(std::shared_ptr<Wait> wait, std::stop_token stop) {
   Signal::emit("replicationWaitParked");
 }
 
-void CommitWaits::awaitCommit(std::string name, CommitId floor, Clock::time_point deadline,
+void CommitWaits::awaitCommit(CollectionId name, CommitId floor, Clock::time_point deadline,
                               std::stop_token stop, std::function<void(CommitResult)> complete) {
   auto wait = std::make_shared<Wait>();
   wait->name = std::move(name); wait->commit = std::move(floor); wait->deadline = deadline;
@@ -113,13 +113,13 @@ void CommitWaits::awaitCommit(std::string name, CommitId floor, Clock::time_poin
   admit(std::move(wait), stop);
 }
 
-CommitWaits::ReplicaWait CommitWaits::prepareReplicas(std::string name, CommitId commit,
+CommitWaits::ReplicaWait CommitWaits::prepareReplicas(CollectionId name, CommitId commit,
     const api::ReplicaRequirement& requirement, Clock::time_point deadline) {
   auto captured = source.capture(requirement, name, commit);
   return {std::move(name), std::move(commit), deadline, std::move(captured)};
 }
 
-void CommitWaits::awaitReplicas(std::string name, CommitId commit, const api::ReplicaRequirement& requirement,
+void CommitWaits::awaitReplicas(CollectionId name, CommitId commit, const api::ReplicaRequirement& requirement,
     Clock::time_point deadline, std::stop_token stop, std::function<void(api::ReplicaResult)> complete) {
   awaitReplicas(prepareReplicas(std::move(name), std::move(commit), requirement, deadline), stop, std::move(complete));
 }
@@ -131,7 +131,7 @@ void CommitWaits::awaitReplicas(ReplicaWait spec, std::stop_token stop, std::fun
   admit(std::move(wait), stop);
 }
 
-void CommitWaits::registered(const std::string& name, const std::shared_ptr<Collection>& collection) noexcept {
+void CommitWaits::registered(const CollectionId& name, const std::shared_ptr<Collection>& collection) noexcept {
   try {
     Pending ready;
     {
@@ -145,7 +145,7 @@ void CommitWaits::registered(const std::string& name, const std::shared_ptr<Coll
   } catch (...) { LOG_ERROR("Commit wait registration notification failed"); }
 }
 
-void CommitWaits::updated(const std::string& name, const Collection& collection) noexcept {
+void CommitWaits::updated(const CollectionId& name, const Collection& collection) noexcept {
   try {
     Pending ready;
     {
@@ -159,7 +159,7 @@ void CommitWaits::updated(const std::string& name, const Collection& collection)
   } catch (...) { LOG_ERROR("Commit wait publication notification failed"); }
 }
 
-void CommitWaits::removed(const std::string& name) noexcept {
+void CommitWaits::removed(const CollectionId& name) noexcept {
   try {
     Pending ready;
     {
@@ -171,7 +171,7 @@ void CommitWaits::removed(const std::string& name) noexcept {
   } catch (...) { LOG_ERROR("Commit wait deletion notification failed"); }
 }
 
-void CommitWaits::cancel(std::string_view name, uint64_t id) {
+void CommitWaits::cancel(const CollectionId& name, uint64_t id) {
   Pending ready;
   {
     std::lock_guard lock(mutex);
@@ -189,12 +189,12 @@ void CommitWaits::cancel(std::string_view name, uint64_t id) {
   finish(ready);
 }
 
-void CommitWaits::acknowledged(std::string_view name) {
-  if (name.empty()) { poll(); return; }
+void CommitWaits::acknowledged(const CollectionId* name) {
+  if (!name) { poll(); return; }
   Pending ready;
   {
     std::lock_guard lock(mutex);
-    checkLocked(name, ready);
+    checkLocked(*name, ready);
   }
   finish(ready);
 }

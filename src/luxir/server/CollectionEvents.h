@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <string>
+#include "luxir/store/CollectionId.h"
 
 namespace luxir {
 class Collection;
@@ -15,14 +16,14 @@ class Collection;
 class CollectionEvents {
 public:
   virtual ~CollectionEvents() = default;
-  // `collection` is now registered under `name`: created, replaced, or an
+  // `collection` is now registered under `id`: created, replaced, or an
   // unavailable placeholder.
-  virtual void registered(const std::string& name, const std::shared_ptr<Collection>& collection) noexcept = 0;
+  virtual void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection) noexcept = 0;
   // `collection` published a snapshot or changed availability. Consumers re-read
-  // it, and ignore it unless it is the collection registered under `name`.
-  virtual void updated(const std::string& name, const Collection& collection) noexcept = 0;
-  // Nothing is registered under `name`.
-  virtual void removed(const std::string& name) noexcept = 0;
+  // it, and ignore it unless it is the collection registered under `id`.
+  virtual void updated(const CollectionId& id, const Collection& collection) noexcept = 0;
+  // Nothing is registered under `id`.
+  virtual void removed(const CollectionId& id) noexcept = 0;
 };
 
 }

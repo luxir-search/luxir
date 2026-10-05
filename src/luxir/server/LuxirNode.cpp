@@ -21,8 +21,8 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   replication = std::make_shared<ReplicationSource>(std::chrono::milliseconds(
       replicationConfig.follower_timeout_ms));
   commitWaits = std::make_shared<CommitWaits>(*replication, following());
-  replication->onAcknowledgmentsChanged([weak = std::weak_ptr(commitWaits)](std::string_view name) {
-    if (auto waits = weak.lock()) waits->acknowledged(name);
+  replication->onAcknowledgmentsChanged([weak = std::weak_ptr(commitWaits)](const CollectionId* id) {
+    if (auto waits = weak.lock()) waits->acknowledged(id);
   });
   class Events final : public CollectionEvents {
     std::shared_ptr<ReplicationSource> source;
@@ -30,14 +30,14 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   public:
     Events(std::shared_ptr<ReplicationSource> source, std::shared_ptr<CommitWaits> waits)
         : source(std::move(source)), waits(std::move(waits)) {}
-    void registered(const std::string& name, const std::shared_ptr<Collection>& collection) noexcept override {
-      waits->registered(name, collection); source->registered(name, collection);
+    void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection) noexcept override {
+      waits->registered(id, collection); source->registered(id, collection);
     }
-    void updated(const std::string& name, const Collection& collection) noexcept override {
-      waits->updated(name, collection); source->updated(name, collection);
+    void updated(const CollectionId& id, const Collection& collection) noexcept override {
+      waits->updated(id, collection); source->updated(id, collection);
     }
-    void removed(const std::string& name) noexcept override {
-      waits->removed(name); source->removed(name);
+    void removed(const CollectionId& id) noexcept override {
+      waits->removed(id); source->removed(id);
     }
   };
   events = std::make_shared<Events>(replication, commitWaits);
@@ -71,42 +71,39 @@ std::shared_ptr<Collection> LuxirNode::checkLoaded(std::shared_ptr<Collection> c
   if (collection) {
     auto reason = collection->getUnavailableReason();
     if (!reason.empty()) throw CollectionUnavailableError(
-        "collection '" + collection->getName() + "' is unavailable: " + reason);
+        "collection '" + collection->getId().label() + "' is unavailable: " + reason);
   }
   return collection;
 }
 
-std::shared_ptr<Collection> LuxirNode::getCollection(std::string_view name) {
+CollectionId LuxirNode::target(std::string_view tenant, std::string_view name) {
+  return {std::string(tenant.empty() ? CollectionId::kDefaultTenant : tenant),
+          std::string(name.empty() ? kDefaultCollectionName : name)};
+}
+
+std::shared_ptr<Collection> LuxirNode::getCollection(const CollectionId& id) {
   // Resolution is lookup-only on the hot path: an invalid name can never be in
   // the map, so the validation scan runs only on a miss, to tell "you wrote a
   // name that cannot exist" (INVALID_REQUEST) from "no such collection"
   // (NOT_FOUND) the same way every route does.
-  if (auto collection = collections_->get(name)) return checkLoaded(std::move(collection));
-  Collections::validateName(name);
-  throw CollectionNotFoundError("collection '" + std::string(name) + "' does not exist");
+  if (auto collection = collections_->get(id)) return checkLoaded(std::move(collection));
+  Collections::validate(id);
+  throw CollectionNotFoundError("collection '" + id.label() + "' does not exist");
 }
 
-std::shared_ptr<Collection> LuxirNode::resolveCollection(std::string_view name) {
-  return getCollection(name.empty() ? kDefaultCollectionName : name);
+std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(const CollectionId& id) {
+  if (following()) return getCollection(id);
+  return checkLoaded(collections_->getOrCreate(id, config.ingest.auto_create_collection));
 }
 
-std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(std::string_view name) {
-  if (following()) return getCollection(name);
-  return checkLoaded(collections_->getOrCreate(name, config.ingest.auto_create_collection));
-}
-
-std::shared_ptr<Collection> LuxirNode::resolveOrCreateCollection(std::string_view name) {
-  return getOrCreateCollection(name.empty() ? kDefaultCollectionName : name);
-}
-
-std::shared_ptr<Collection> LuxirNode::createCollection(std::string_view name, const api::SchemaDef* schema) {
+std::shared_ptr<Collection> LuxirNode::createCollection(const CollectionId& id, const api::SchemaDef* schema) {
   if (following()) throw ReadOnlyError("cannot create collections on a follower");
-  return collections_->create(name, schema);
+  return collections_->create(id, schema);
 }
 
-void LuxirNode::deleteCollection(std::string_view name) {
-  if (follower) follower->deleteOrphan(name);
-  else collections_->remove(name);
+void LuxirNode::deleteCollection(const CollectionId& id) {
+  if (follower) follower->deleteOrphan(id);
+  else collections_->remove(id);
 }
 
 } // namespace luxir

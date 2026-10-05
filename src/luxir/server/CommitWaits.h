@@ -14,7 +14,7 @@ public:
   using Clock = ReplicationSource::Clock;
   using Now = ReplicationSource::Now;
   struct ReplicaWait {
-    std::string name;
+    CollectionId name;
     CommitId commit;
     Clock::time_point deadline;
     ReplicationSource::Barrier barrier;
@@ -35,7 +35,7 @@ private:
   };
   struct Wait {
     uint64_t id = 0;
-    std::string name;
+    CollectionId name;
     CommitId commit;
     Clock::time_point deadline;
     std::variant<Local, Replicas> kind;
@@ -43,9 +43,9 @@ private:
   };
   using Pending = std::vector<std::shared_ptr<Wait>>;
   std::mutex mutex;
-  std::map<std::string, CollectionPublication, std::less<>> collections;
-  std::map<std::string, Pending, std::less<>> waits;
-  std::map<std::pair<Clock::time_point, uint64_t>, std::string> deadlines;
+  std::map<CollectionId, CollectionPublication> collections;
+  std::map<CollectionId, Pending> waits;
+  std::map<std::pair<Clock::time_point, uint64_t>, CollectionId> deadlines;
   ReplicationSource& source;
   bool following;
   Now now;
@@ -55,9 +55,9 @@ private:
   DeadlineScheduler::Slot timer{[this] { poll(); }};
   bool evaluate(Wait& wait, bool cancelled = false, bool removed = false);
   void retireLocked(const Wait& wait);
-  void checkLocked(std::string_view name, Pending& ready, bool removed = false);
+  void checkLocked(const CollectionId& name, Pending& ready, bool removed = false);
   void admit(std::shared_ptr<Wait> wait, std::stop_token stop);
-  void cancel(std::string_view name, uint64_t id);
+  void cancel(const CollectionId& name, uint64_t id);
   void armLocked();
   static void finish(Pending& ready);
 public:
@@ -65,18 +65,19 @@ public:
       : source(source), following(following), now(std::move(now)) {}
   ~CommitWaits();
   Clock::time_point deadlineAfter(uint64_t timeoutMs) const;
-  void awaitCommit(std::string name, CommitId floor, Clock::time_point deadline,
+  void awaitCommit(CollectionId name, CommitId floor, Clock::time_point deadline,
                    std::stop_token stop, std::function<void(CommitResult)> complete);
-  ReplicaWait prepareReplicas(std::string name, CommitId commit, const api::ReplicaRequirement& requirement,
+  ReplicaWait prepareReplicas(CollectionId name, CommitId commit, const api::ReplicaRequirement& requirement,
                              Clock::time_point deadline);
   void awaitReplicas(ReplicaWait spec, std::stop_token stop, std::function<void(api::ReplicaResult)> complete);
-  void awaitReplicas(std::string name, CommitId commit, const api::ReplicaRequirement& requirement,
+  void awaitReplicas(CollectionId name, CommitId commit, const api::ReplicaRequirement& requirement,
                      Clock::time_point deadline, std::stop_token stop, std::function<void(api::ReplicaResult)> complete);
-  void registered(const std::string& name, const std::shared_ptr<Collection>& collection) noexcept override;
-  void updated(const std::string& name, const Collection& collection) noexcept override;
-  void removed(const std::string& name) noexcept override;
+  void registered(const CollectionId& name, const std::shared_ptr<Collection>& collection) noexcept override;
+  void updated(const CollectionId& name, const Collection& collection) noexcept override;
+  void removed(const CollectionId& name) noexcept override;
   // Called for acks and expiry, and after advancing an injected clock in tests.
-  void acknowledged(std::string_view name);
+  // `name` null: acknowledgments of any collection changed (e.g. expiry).
+  void acknowledged(const CollectionId* name);
   void poll();
   void close();
 };

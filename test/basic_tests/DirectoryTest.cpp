@@ -429,12 +429,12 @@ TEST_F(DirectoryTest, checkedDirPreExistingFilesAssumedSynced) {
 TEST_F(DirectoryTest, collectionStorageOpensWithoutCreating) {
   auto path = getTempDir();
   FSDirFactory factory(path);
-  auto storage = factory.collection("main");
+  auto storage = factory.collection(CollectionId::of("main"));
   EXPECT_THROW(storage.open("first"), std::runtime_error);
   EXPECT_THROW(storage.current(), std::runtime_error);
   EXPECT_TRUE(factory.collections().empty());
   storage.create("first");
-  EXPECT_EQ(std::vector<std::string>{"main"}, factory.collections());
+  EXPECT_EQ(std::vector<CollectionId>{CollectionId::of("main")}, factory.collections());
   EXPECT_EQ(std::vector<std::string>{"first"}, storage.incarnations());
   EXPECT_FALSE(storage.current());
   storage.select("first");
@@ -445,7 +445,7 @@ TEST_F(DirectoryTest, collectionStorageOpensWithoutCreating) {
 
 TEST_F(DirectoryTest, checkedStorageRemembersUnsyncedFilesAcrossOpens) {
   CheckedDirFactory factory(std::make_unique<RAMDirFactory>(), CheckedDirMode::THROW);
-  auto storage = factory.collection("main");
+  auto storage = factory.collection(CollectionId::of("main"));
   addFile(*storage.create("first"), "data", "bytes");
   EXPECT_THROW(storage.open("first")->openFile("data", true), std::runtime_error);
   std::array<std::string, 1> names{"data"};

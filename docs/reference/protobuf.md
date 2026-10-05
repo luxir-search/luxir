@@ -118,6 +118,7 @@ defaults and constraints are described in the comments and guides.
 - [`KnnQuery`](#message-luxir.knnquery)
 - [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf)
 - [`ListCollectionsResponse`](#message-luxir.listcollectionsresponse)
+- [`ListTenantsResponse`](#message-luxir.listtenantsresponse)
 - [`Map`](#message-luxir.map)
 - [`Match`](#message-luxir.match)
 - [`MultiVector`](#message-luxir.multivector)
@@ -512,6 +513,7 @@ Single-valued vector column. Each Vector slot is independently nullable via its 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.collectionstats.name"></a>[`name`](#field-luxir.collectionstats.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.collectionstats.tenant"></a>[`tenant`](#field-luxir.collectionstats.tenant) | 7 | `string` | singular |  |
 | <a id="field-luxir.collectionstats.totals"></a>[`totals`](#field-luxir.collectionstats.totals) | 2 | [`StatsTotals`](#message-luxir.statstotals) | singular |  |
 | <a id="field-luxir.collectionstats.schema_gen"></a>[`schema_gen`](#field-luxir.collectionstats.schema_gen) | 3 | `uint64` | singular | Schema generation |
 | <a id="field-luxir.collectionstats.shards"></a>[`shards`](#field-luxir.collectionstats.shards) | 4 | [`ShardStats`](#message-luxir.shardstats) | repeated |  |
@@ -581,6 +583,7 @@ Parameters governing how a commit is performed. Presence of this message in an U
 |---|---|---|---|---|
 | <a id="field-luxir.createcollectionrequest.name"></a>[`name`](#field-luxir.createcollectionrequest.name) | 1 | `string` | singular |  |
 | <a id="field-luxir.createcollectionrequest.schema"></a>[`schema`](#field-luxir.createcollectionrequest.schema) | 2 | [`SchemaDef`](#message-luxir.schemadef) | singular |  |
+| <a id="field-luxir.createcollectionrequest.tenant"></a>[`tenant`](#field-luxir.createcollectionrequest.tenant) | 3 | `string` | singular | Administration only: the owning tenant. Empty is the caller's tenant (the default tenant until credentials carry one). |
 
 <a id="message-luxir.createcollectionresponse"></a>
 
@@ -602,6 +605,7 @@ Parameters governing how a commit is performed. Presence of this message in an U
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.deletecollectionrequest.name"></a>[`name`](#field-luxir.deletecollectionrequest.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.deletecollectionrequest.tenant"></a>[`tenant`](#field-luxir.deletecollectionrequest.tenant) | 2 | `string` | singular | as CreateCollectionRequest.tenant |
 
 <a id="message-luxir.deletecollectionresponse"></a>
 
@@ -843,6 +847,7 @@ Alternate representations of the same input value, keyed by local label. Absent 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.followerstatus.follower"></a>[`follower`](#field-luxir.followerstatus.follower) | 1 | `string` | singular |  |
+| <a id="field-luxir.followerstatus.tenant"></a>[`tenant`](#field-luxir.followerstatus.tenant) | 6 | `string` | singular |  |
 | <a id="field-luxir.followerstatus.collection"></a>[`collection`](#field-luxir.followerstatus.collection) | 2 | `string` | singular |  |
 | <a id="field-luxir.followerstatus.commit"></a>[`commit`](#field-luxir.followerstatus.commit) | 3 | `string` | singular |  |
 | <a id="field-luxir.followerstatus.last_seen"></a>[`last_seen`](#field-luxir.followerstatus.last_seen) | 4 | `uint64` | singular | Unix milliseconds |
@@ -991,13 +996,25 @@ Search effort for IVF indexes.
 
 ### luxir.ListCollectionsResponse
 
-Names of every collection on the node, sorted. HTTP-only: GET or POST /collections/\_list, also available as GET /collections.
+Names of every collection of one tenant, sorted. HTTP-only: GET or POST /collections/\_list (also GET /collections) for the caller's tenant, or /tenants/{tenant}/collections/\_list.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.listcollectionsresponse.collections"></a>[`collections`](#field-luxir.listcollectionsresponse.collections) | 1 | `string` | repeated |  |
+
+<a id="message-luxir.listtenantsresponse"></a>
+
+### luxir.ListTenantsResponse
+
+Tenants that own at least one collection, sorted. HTTP-only: GET /tenants.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.listtenantsresponse.tenants"></a>[`tenants`](#field-luxir.listtenantsresponse.tenants) | 1 | `string` | repeated |  |
 
 <a id="message-luxir.map"></a>
 
@@ -1258,7 +1275,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 |---|---|---|---|---|
 | <a id="field-luxir.replicationcatalog.boot"></a>[`boot`](#field-luxir.replicationcatalog.boot) | 1 | `string` | singular |  |
 | <a id="field-luxir.replicationcatalog.cursor"></a>[`cursor`](#field-luxir.replicationcatalog.cursor) | 2 | `string` | singular |  |
-| <a id="field-luxir.replicationcatalog.collections"></a>[`collections`](#field-luxir.replicationcatalog.collections) | 3 | map&lt;`string`, [`ReplicationCatalogEntry`](#message-luxir.replicationcatalogentry)&gt; | map |  |
+| <a id="field-luxir.replicationcatalog.collections"></a>[`collections`](#field-luxir.replicationcatalog.collections) | 3 | [`ReplicationCatalogEntry`](#message-luxir.replicationcatalogentry) | repeated |  |
 
 <a id="message-luxir.replicationcatalogentry"></a>
 
@@ -1270,6 +1287,8 @@ Full catalog for a discovery cursor, scoped to this source boot.
 |---|---|---|---|---|
 | <a id="field-luxir.replicationcatalogentry.commit"></a>[`commit`](#field-luxir.replicationcatalogentry.commit) | 1 | `string` | singular |  |
 | <a id="field-luxir.replicationcatalogentry.available"></a>[`available`](#field-luxir.replicationcatalogentry.available) | 2 | `bool` | singular |  |
+| <a id="field-luxir.replicationcatalogentry.tenant"></a>[`tenant`](#field-luxir.replicationcatalogentry.tenant) | 3 | `string` | singular |  |
+| <a id="field-luxir.replicationcatalogentry.collection"></a>[`collection`](#field-luxir.replicationcatalogentry.collection) | 4 | `string` | singular |  |
 
 <a id="message-luxir.replicationcollectionstatus"></a>
 
@@ -1280,6 +1299,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.replicationcollectionstatus.name"></a>[`name`](#field-luxir.replicationcollectionstatus.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.replicationcollectionstatus.tenant"></a>[`tenant`](#field-luxir.replicationcollectionstatus.tenant) | 9 | `string` | singular |  |
 | <a id="field-luxir.replicationcollectionstatus.source_commit"></a>[`source_commit`](#field-luxir.replicationcollectionstatus.source_commit) | 2 | `string` | singular |  |
 | <a id="field-luxir.replicationcollectionstatus.serving_commit"></a>[`serving_commit`](#field-luxir.replicationcollectionstatus.serving_commit) | 3 | `string` | singular |  |
 | <a id="field-luxir.replicationcollectionstatus.state"></a>[`state`](#field-luxir.replicationcollectionstatus.state) | 4 | [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state) | optional |  |
@@ -1299,6 +1319,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.replicationinstalled.follower"></a>[`follower`](#field-luxir.replicationinstalled.follower) | 1 | `string` | singular |  |
 | <a id="field-luxir.replicationinstalled.collection"></a>[`collection`](#field-luxir.replicationinstalled.collection) | 2 | `string` | singular |  |
 | <a id="field-luxir.replicationinstalled.commit"></a>[`commit`](#field-luxir.replicationinstalled.commit) | 3 | `string` | singular |  |
+| <a id="field-luxir.replicationinstalled.tenant"></a>[`tenant`](#field-luxir.replicationinstalled.tenant) | 4 | `string` | singular |  |
 
 <a id="message-luxir.replicationstatus"></a>
 
@@ -1521,8 +1542,9 @@ Operational statistics. An empty collection requests every collection on the nod
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.statsrequest.collection"></a>[`collection`](#field-luxir.statsrequest.collection) | 1 | `string` | singular | empty selects every collection |
+| <a id="field-luxir.statsrequest.collection"></a>[`collection`](#field-luxir.statsrequest.collection) | 1 | `string` | singular | Empty selects every collection of \`tenant\`, or of every tenant when \`tenant\` is also empty (administration). |
 | <a id="field-luxir.statsrequest.segments"></a>[`segments`](#field-luxir.statsrequest.segments) | 2 | `bool` | singular |  |
+| <a id="field-luxir.statsrequest.tenant"></a>[`tenant`](#field-luxir.statsrequest.tenant) | 3 | `string` | singular | Administration only. With a collection, empty is the caller's tenant. |
 
 <a id="message-luxir.statsresponse"></a>
 

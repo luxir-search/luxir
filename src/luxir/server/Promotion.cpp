@@ -50,7 +50,7 @@ bool validTarget(CollectionStorage& storage, const std::string& incarnation) {
     }
     return true;
   } catch (const std::exception& e) {
-    LOG_WARN("Cannot validate promotion target for '{}': {}", storage.name(), e.what());
+    LOG_WARN("Cannot validate promotion target for '{}': {}", storage.id().label(), e.what());
     return false;
   }
 }
@@ -65,15 +65,15 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output) {
   FSDirectory metadata(dataDir);
   auto state = ReplicationState::read(*metadata.openFile("replication.json"));
   size_t promotedCount = 0, failed = 0;
-  for (const auto& name : factory.collections()) {
+  for (const auto& id : factory.collections()) {
     try {
-      auto storage = factory.collection(name);
+      auto storage = factory.collection(id);
       auto selected = storage.current();
       if (!selected) continue;
-      auto& promoted = state.collections[name].promoted;
+      auto& promoted = state.collection(id).promoted;
       if (!promoted.empty() && !validTarget(storage, promoted)) promoted.clear();
       if (promoted.empty()) {
-        Signal::emit("replicationPromotingCollection", (void*)&name);
+        Signal::emit("replicationPromotingCollection", (void*)&id.name);
         promoted = copySnapshot(storage, *selected, Manifest::load(*storage.open(*selected)));
         state.write(metadata);
       }
@@ -82,10 +82,10 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output) {
       storage.select(promoted);
       storage.retainOnly(promoted);
       promotedCount++;
-      output << name << ' ' << promoted << '\n';
+      output << id.label() << ' ' << promoted << '\n';
     } catch (const std::exception& e) {
       failed++;
-      output << name << " ERROR: " << e.what() << '\n';
+      output << id.label() << " ERROR: " << e.what() << '\n';
     }
   }
   if (!failed) {

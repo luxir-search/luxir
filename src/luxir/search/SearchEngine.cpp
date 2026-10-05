@@ -117,7 +117,7 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
   if (!req.proto.min_commit.empty()) {
     try {
       auto floor = CommitId::parse(req.proto.min_commit);
-      auto collection = req.proto.collection.empty() ? std::string(LuxirNode::kDefaultCollectionName) : std::string(req.proto.collection);
+      auto collection = LuxirNode::target(req.tenant, req.proto.collection);
       auto& waits = node.getCommitWaits();
       waits.awaitCommit(std::move(collection), std::move(floor),
           waits.deadlineAfter(req.proto.min_commit_timeout_ms.value_or(30000)), req.waitCancellation.get_token(),
@@ -164,7 +164,7 @@ void SearchEngine::getResources(SearchRequest& req) {
   // look up the correct index reader and the associated schema
   auto& request = req.proto;
   auto& node = req.engine.node;
-  auto collection = req.floorCollection ? req.floorCollection : node.resolveCollection(request.collection);
+  auto collection = req.floorCollection ? req.floorCollection : node.resolveCollection(request.collection, req.tenant);
 
   // get the index reader
   // The API freshness tolerance is milliseconds; the reader clock domain is

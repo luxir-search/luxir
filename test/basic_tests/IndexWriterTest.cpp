@@ -2952,7 +2952,7 @@ TEST_F(IndexWriterTest, fatalPublicationMakesCollectionUnavailable) {
   EXPECT_FALSE(helper.collection().getUnavailableReason().empty());
   EXPECT_THROW(node.getCollection("failed_publication"), CollectionUnavailableError);
   auto entries = node.collectionEntries();
-  auto failed = std::ranges::find_if(entries, [](const auto& e) { return e.name == "failed_publication"; });
+  auto failed = std::ranges::find_if(entries, [](const auto& e) { return e.id.name == "failed_publication"; });
   ASSERT_NE(entries.end(), failed);
   EXPECT_FALSE(failed->error.empty());
 }

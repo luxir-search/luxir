@@ -99,6 +99,13 @@ protected:
     EXPECT_FALSE(glz::read_json(json, response.body()));
     return json;
   }
+  static bool lists(const Json& catalog, std::string_view name) {
+    if (!catalog.contains("collections")) return false;
+    for (const auto& entry : catalog["collections"].get<Json::array_t>()) {
+      if (entry["collection"].get<std::string>() == name) return true;
+    }
+    return false;
+  }
   static std::string cursor(const Json& json) {
     return json["cursor"].get<std::string>();
   }
@@ -160,7 +167,7 @@ TEST_F(ReplicationHttpTest, watchPublishCreateDeleteAndTimeout) {
   install.set_value();
   ASSERT_EQ(std::future_status::ready, created.wait_for(1s));
   initial = created.get();
-  ASSERT_TRUE(initial["collections"].contains("other"));
+  ASSERT_TRUE(lists(initial, "other"));
   EXPECT_EQ(200, get("/collections/other/_snapshot").result_int());
   creation.get();
   Signal::unlisten("collectionInitialized");
@@ -169,7 +176,7 @@ TEST_F(ReplicationHttpTest, watchPublishCreateDeleteAndTimeout) {
   ASSERT_EQ(std::future_status::ready, removed.wait_for(1s));
   removed.get(); // deletion announces its placeholder, then the removal
   initial = catalog();
-  EXPECT_FALSE(initial["collections"].contains("other"));
+  EXPECT_FALSE(lists(initial, "other"));
   Signal::unlisten("replicationWatchParked");
   auto start = std::chrono::steady_clock::now();
   auto timeout = catalog("/_replication/watch?since=" + cursor(initial) + "&timeout_ms=30");
@@ -249,7 +256,7 @@ TEST_F(ReplicationHttpTest, expiryBudgetAndInstalledStats) {
   EXPECT_EQ(410, get(fileUrl(*first, first->files.front().name)).result_int());
   auto current = snapshot();
   auto installed = httpRequest(server->getPort(), http::verb::post, "/_replication/installed",
-      "{\"follower\":\"f1\",\"collection\":\"main\",\"commit\":\"" + current->id.token() + "\"}");
+      "{\"follower\":\"f1\",\"tenant\":\"default\",\"collection\":\"main\",\"commit\":\"" + current->id.token() + "\"}");
   ASSERT_EQ(200, installed.result_int()) << installed.body();
   h->getIndexWriter()->setSchema(Schema::createDefaultSchema());
   auto stats = get("/_replication/status");
@@ -265,9 +272,9 @@ TEST_F(ReplicationHttpTest, expiryBudgetAndInstalledStats) {
 TEST_F(ReplicationHttpTest, fullAcknowledgmentTableKeepsExistingFollowers) {
   auto current = snapshot();
   auto body = [&](int follower) {
-    return "{\"follower\":\"f" + std::to_string(follower) + "\",\"collection\":\"main\",\"commit\":\"" + current->id.token() + "\"}";
+    return "{\"follower\":\"f" + std::to_string(follower) + "\",\"tenant\":\"default\",\"collection\":\"main\",\"commit\":\"" + current->id.token() + "\"}";
   };
-  for (int i = 0; i < 4096; i++) node->getReplication().installed({"f" + std::to_string(i), "main", current->id.token()});
+  for (int i = 0; i < 4096; i++) node->getReplication().installed({"f" + std::to_string(i), "default", "main", current->id.token()});
   EXPECT_EQ(429, httpRequest(server->getPort(), http::verb::post, "/_replication/installed", body(4096)).result_int());
   EXPECT_EQ(200, httpRequest(server->getPort(), http::verb::post, "/_replication/installed", body(0)).result_int());
   EXPECT_EQ(4096u, node->getReplication().status().size());
@@ -358,7 +365,7 @@ TEST_F(ReplicationHttpTest, installedRejectsInvalidAcknowledgments) {
   auto id = snapshot()->id;
   auto post = [&](std::string follower, std::string collection, std::string token) {
     return httpRequest(server->getPort(), http::verb::post, "/_replication/installed",
-        "{\"follower\":\"" + follower + "\",\"collection\":\"" + collection + "\",\"commit\":\"" + token + "\"}");
+        "{\"follower\":\"" + follower + "\",\"tenant\":\"default\",\"collection\":\"" + collection + "\",\"commit\":\"" + token + "\"}");
   };
   EXPECT_EQ(400, post("", "main", id.token()).result_int());
   EXPECT_EQ(400, post(std::string(256, 'x'), "main", id.token()).result_int());
@@ -378,7 +385,7 @@ TEST_F(ReplicationHttpTest, nameDeletionSurvivesIncarnationChange) {
   EXPECT_NE(old.incarnation, snapshot()->id.incarnation);
   node->deleteCollection("main");
   auto removed = catalog("/_replication/watch?since=" + cursor(first));
-  EXPECT_FALSE(removed["collections"].contains("main"));
+  EXPECT_FALSE(lists(removed, "main"));
   EXPECT_NE(cursor(removed), cursor(recreated));
   EXPECT_FALSE(removed.contains("deleted"));
 }
@@ -386,21 +393,21 @@ TEST_F(ReplicationHttpTest, nameDeletionSurvivesIncarnationChange) {
 TEST_F(ReplicationHttpTest, acknowledgmentsExpireAndWatchRenewsLiveness) {
   auto time = ReplicationSource::Clock::now();
   ReplicationSource catalog(90s, [&] { return time; });
-  catalog.registered("main", node->getCollection("main"));
+  catalog.registered(CollectionId::of("main"), node->getCollection("main"));
   auto id = snapshot()->id;
-  for (int i = 0; i < 4096; i++) catalog.installed({"f" + std::to_string(i), "main", id.token()});
+  for (int i = 0; i < 4096; i++) catalog.installed({"f" + std::to_string(i), "default", "main", id.token()});
   time += 60s;
   catalog.watch({}, "f0", [] {});
   time += 30s;
-  catalog.installed({"f4096", "main", id.token()});
+  catalog.installed({"f4096", "default", "main", id.token()});
   EXPECT_EQ(2u, catalog.status().size());
-  catalog.removed("main");
-  for (const auto& row : catalog.status()) EXPECT_TRUE(row.collection.empty());
-  catalog.registered("main", node->getCollection("main"));
-  catalog.installed({"f0", "main", id.token()});
+  catalog.removed(CollectionId::of("main"));
+  for (const auto& row : catalog.status()) EXPECT_TRUE(row.collection.name.empty());
+  catalog.registered(CollectionId::of("main"), node->getCollection("main"));
+  catalog.installed({"f0", "default", "main", id.token()});
   h->getIndexWriter()->testDeleteAllData();
-  catalog.updated("main", h->collection());
-  for (const auto& row : catalog.status()) EXPECT_TRUE(row.collection.empty());
+  catalog.updated(CollectionId::of("main"), h->collection());
+  for (const auto& row : catalog.status()) EXPECT_TRUE(row.collection.name.empty());
   auto response = get("/_replication/watch?follower=watch-only&timeout_ms=0");
   EXPECT_EQ(200, response.result_int());
   auto live = node->getReplication().status();
@@ -484,7 +491,7 @@ TEST_F(ReplicationHttpTest, headAndMonotonicAcknowledgment) {
   ASSERT_TRUE(h->index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
   auto current = registry.snapshot()->id;
   auto ack = [&](const CommitId& id) {
-    node->getReplication().installed({"f", "main", id.token()});
+    node->getReplication().installed({"f", "default", "main", id.token()});
   };
   ack(current);
   ack(old);
@@ -566,7 +573,7 @@ TEST_F(ReplicationHttpTest, standaloneWaitRetriesAnExistingToken) {
   };
   auto first = wait("1");
   EXPECT_EQ("timed_out", first["replicas"]["outcome"].get<std::string>());
-  node->getReplication().installed({"f", "main", token});
+  node->getReplication().installed({"f", "default", "main", token});
   auto second = wait("1");
   EXPECT_EQ(token, second["commit"].get<std::string>());
   EXPECT_EQ("satisfied", second["replicas"]["outcome"].get<std::string>());
@@ -620,7 +627,7 @@ TEST_F(ReplicationHttpTest, updateBodiesAreReleasedBeforeReplicaWait) {
     });
     ASSERT_EQ(std::future_status::ready, parked.get_future().wait_for(3s));
     EXPECT_EQ(std::future_status::timeout, response.wait_for(0ms));
-    node->getReplication().installed({"f", "main", snapshot()->id.token()});
+    node->getReplication().installed({"f", "default", "main", snapshot()->id.token()});
     auto result = response.get();
     EXPECT_EQ(200, result.result_int()) << result.body();
     EXPECT_NE(std::string::npos, result.body().find("satisfied"));
@@ -665,7 +672,7 @@ TEST_F(ReplicationHttpTest, halfClosedClientStillReceivesSatisfiedWait) {
   http::write(socket, request);
   socket.shutdown(tcp::socket::shutdown_send);
   ASSERT_EQ(std::future_status::ready, parked.get_future().wait_for(3s));
-  node->getReplication().installed({"f", "main", token});
+  node->getReplication().installed({"f", "default", "main", token});
   beast::flat_buffer buffer;
   http::response<http::string_body> response;
   http::read(socket, buffer, response);

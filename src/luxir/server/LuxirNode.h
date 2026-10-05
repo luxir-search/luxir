@@ -54,21 +54,38 @@ public:
   // guarantee is enforced by ReadOnlyDirectory, not by this flag.
   bool readOnly() const { return config.read_only; }
 
-  uint64_t storageBytes(std::string_view collection = {}) const { return collections_->storage().storageBytes(collection); }
+  uint64_t storageBytes() const { return collections_->storage().storageBytes(); }
+  uint64_t storageBytes(const CollectionId& id) const { return collections_->storage().collectionBytes(id); }
+
+  // A request's target: an empty tenant is the default tenant (the request
+  // scope supplies it), and an empty name the default collection.
+  static CollectionId target(std::string_view tenant, std::string_view name);
+  // An administration target: the tenant defaults, the name never does.
+  static CollectionId adminTarget(std::string_view tenant, std::string_view name) {
+    return {std::string(tenant.empty() ? CollectionId::kDefaultTenant : tenant), std::string(name)};
+  }
 
   // Resolution: an unavailable collection throws CollectionUnavailableError.
-  std::shared_ptr<Collection> getCollection(std::string_view name);
-  std::shared_ptr<Collection> getOrCreateCollection(std::string_view name);
-  // As above, with an empty name selecting the default collection.
-  std::shared_ptr<Collection> resolveCollection(std::string_view name);
-  std::shared_ptr<Collection> resolveOrCreateCollection(std::string_view name);
+  // Overloads taking only a name address the default tenant.
+  std::shared_ptr<Collection> getCollection(const CollectionId& id);
+  std::shared_ptr<Collection> getCollection(std::string_view name) { return getCollection(CollectionId::of(name)); }
+  std::shared_ptr<Collection> getOrCreateCollection(const CollectionId& id);
+  std::shared_ptr<Collection> getOrCreateCollection(std::string_view name) { return getOrCreateCollection(CollectionId::of(name)); }
+  std::shared_ptr<Collection> resolveCollection(std::string_view name, std::string_view tenant = {}) { return getCollection(target(tenant, name)); }
+  std::shared_ptr<Collection> resolveOrCreateCollection(std::string_view name, std::string_view tenant = {}) {
+    return getOrCreateCollection(target(tenant, name));
+  }
 
   // Snapshot fully-created collections without waiting for creations in
   // flight. Unavailable placeholders retain their recorded error.
   std::vector<CollectionEntry> collectionEntries() { return collections_->entries(); }
 
-  std::shared_ptr<Collection> createCollection(std::string_view name, const api::SchemaDef* schema = nullptr);
-  void deleteCollection(std::string_view name);
+  std::shared_ptr<Collection> createCollection(const CollectionId& id, const api::SchemaDef* schema = nullptr);
+  std::shared_ptr<Collection> createCollection(std::string_view name, const api::SchemaDef* schema = nullptr) {
+    return createCollection(CollectionId::of(name), schema);
+  }
+  void deleteCollection(const CollectionId& id);
+  void deleteCollection(std::string_view name) { deleteCollection(CollectionId::of(name)); }
 
   oneapi::tbb::task_arena& getTaskArena() {
     return taskArena;

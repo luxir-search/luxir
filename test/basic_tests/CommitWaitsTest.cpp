@@ -18,7 +18,7 @@ TEST_F(CommitWaitsTest, satisfiedFloorRetainsOriginalCollectionAcrossReplacement
   id.index_gen++;
   std::optional<CommitWaits::CommitResult> result;
   auto& waits = node.getCommitWaits();
-  waits.awaitCommit("main", id, waits.deadlineAfter(30000), {}, [&](auto value) { result = std::move(value); });
+  waits.awaitCommit(CollectionId::of("main"), id, waits.deadlineAfter(30000), {}, [&](auto value) { result = std::move(value); });
   ASSERT_FALSE(result);
   CollectionHelper h(node, "main");
   ASSERT_TRUE(h.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success);
@@ -39,15 +39,15 @@ TEST_F(CommitWaitsTest, injectedClockDrivesFloorsReplicasAndCapturedLiveness) {
   auto now = [&] { return start + std::chrono::seconds(elapsed.load()); };
   ReplicationSource source(10s, now);
   CommitWaits waits(source, true, now);
-  source.onAcknowledgmentsChanged([&](std::string_view name) { waits.acknowledged(name); });
-  source.registered("main", collection); waits.registered("main", collection);
-  source.installed({"first", "main", id.token()});
+  source.onAcknowledgmentsChanged([&](const CollectionId* id) { waits.acknowledged(id); });
+  source.registered(CollectionId::of("main"), collection); waits.registered(CollectionId::of("main"), collection);
+  source.installed({"first", "default", "main", id.token()});
   auto future = id; future.index_gen++;
   std::optional<CommitWaits::CommitResult> floor;
   std::optional<api::ReplicaResult> count, all;
-  waits.awaitCommit("main", future, waits.deadlineAfter(2000), {}, [&](auto result) { floor = std::move(result); });
-  waits.awaitReplicas("main", id, {uint32_t{2}}, waits.deadlineAfter(2000), {}, [&](auto result) { count = result; });
-  waits.awaitReplicas("main", future, {api::AllReplicas{}}, waits.deadlineAfter(30000), {}, [&](auto result) { all = result; });
+  waits.awaitCommit(CollectionId::of("main"), future, waits.deadlineAfter(2000), {}, [&](auto result) { floor = std::move(result); });
+  waits.awaitReplicas(CollectionId::of("main"), id, {uint32_t{2}}, waits.deadlineAfter(2000), {}, [&](auto result) { count = result; });
+  waits.awaitReplicas(CollectionId::of("main"), future, {api::AllReplicas{}}, waits.deadlineAfter(30000), {}, [&](auto result) { all = result; });
   EXPECT_FALSE(floor); EXPECT_FALSE(count); EXPECT_FALSE(all);
   elapsed = 2; waits.poll();
   ASSERT_TRUE(floor); EXPECT_EQ("stale_replica", floor->error->code);
@@ -95,12 +95,12 @@ TEST_F(CommitWaitsTest, oldIdentityCannotOverwriteCatalogOrSatisfyFloor) {
   auto replacement = node.createCollection("main");
   auto current = replacement->getShard()->getSnapshots().snapshot()->id;
   auto& source = node.getReplication();
-  source.updated("main", *original);
-  node.getCommitWaits().updated("main", *original);
+  source.updated(CollectionId::of("main"), *original);
+  node.getCommitWaits().updated(CollectionId::of("main"), *original);
   std::pmr::monotonic_buffer_resource arena;
-  EXPECT_EQ(current.token(), source.catalog(arena).collections.at("main").commit);
+  EXPECT_EQ(current.token(), source.catalog(arena).collections.front().commit);
   std::optional<CommitWaits::CommitResult> result;
-  node.getCommitWaits().awaitCommit("main", id, node.getCommitWaits().deadlineAfter(30000), {},
+  node.getCommitWaits().awaitCommit(CollectionId::of("main"), id, node.getCommitWaits().deadlineAfter(30000), {},
       [&](auto value) { result = std::move(value); });
   ASSERT_TRUE(result); ASSERT_TRUE(result->error);
   EXPECT_EQ("commit_incarnation_mismatch", result->error->code);
@@ -117,7 +117,7 @@ TEST_F(CommitWaitsTest, allMembershipIsCapturedAtLocalCompletion) {
   message->resultingCommit = h.collection().getShard()->getSnapshots().snapshot()->id;
   auto completed = message->takeCompletion(node);
   message.reset();
-  node.getReplication().installed({"late", "main", old.token()});
+  node.getReplication().installed({"late", "default", "main", old.token()});
   bool delivered = false;
   completed->await(node, [&](auto result) {
     delivered = true;
@@ -133,11 +133,11 @@ TEST_F(CommitWaitsTest, allExpiryCompletesWithoutHttpMaintenance) {
   auto id = collection->getShard()->getSnapshots().snapshot()->id;
   ReplicationSource source(30ms);
   CommitWaits waits(source, false);
-  source.registered("main", collection); waits.registered("main", collection);
-  source.installed({"f", "main", id.token()});
+  source.registered(CollectionId::of("main"), collection); waits.registered(CollectionId::of("main"), collection);
+  source.installed({"f", "default", "main", id.token()});
   id.index_gen++;
   std::promise<api::ReplicaResult> completed;
-  waits.awaitReplicas("main", id, {api::AllReplicas{}}, waits.deadlineAfter(30000), {},
+  waits.awaitReplicas(CollectionId::of("main"), id, {api::AllReplicas{}}, waits.deadlineAfter(30000), {},
       [&](auto result) { completed.set_value(result); });
   auto result = completed.get_future();
   ASSERT_EQ(std::future_status::ready, result.wait_for(2s));

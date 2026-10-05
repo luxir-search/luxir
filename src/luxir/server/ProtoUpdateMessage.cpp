@@ -284,7 +284,7 @@ std::shared_ptr<ProtoUpdateMessage::Completion> ProtoUpdateMessage::takeCompleti
   completed->commit = resultingCommit;
   if (resultingCommit && req->commit && req->commit->wait_for_replicas && !result.errored()) {
     auto& waits = node.getCommitWaits();
-    auto collection = req->collection.empty() ? std::string(LuxirNode::kDefaultCollectionName) : std::string(req->collection);
+    auto collection = target.name.empty() ? LuxirNode::target({}, req->collection) : target;
     completed->wait = waits.prepareReplicas(std::move(collection), *resultingCommit, *req->commit->wait_for_replicas,
         waits.deadlineAfter(req->commit->wait_for_replicas_timeout_ms.value_or(30000)));
   }

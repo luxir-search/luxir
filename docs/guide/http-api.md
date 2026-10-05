@@ -4,6 +4,11 @@ The HTTP surface is plain JSON for bounded messages and NDJSON for streams.
 Collection names live in the path, and the request body uses the same field
 names as the protobuf messages.
 
+Collections belong to a tenant. Search, update and replica-wait routes act in
+the caller's own tenant, which is the `default` tenant until requests carry
+credentials. Administration and snapshot routes may name another tenant under
+`/tenants/{tenant}`.
+
 ## Endpoints
 
 | Method and path | Purpose |
@@ -22,6 +27,8 @@ names as the protobuf messages.
 | `GET /collections/{collection}/_stats` | Operational statistics for one collection. |
 | `GET /collections/{collection}/_snapshot` | Pin the current snapshot for copying; see [Replication](replication.md). |
 | `GET /collections/{collection}/_snapshot/files/{name}` | One file of a pinned snapshot. |
+| `GET /tenants` | Tenants that own a collection. |
+| `/tenants/{tenant}/collections/...` | The administration and snapshot routes above (`_list`, `_create`, `_delete`, `_schema`, `_stats`, `_snapshot`) for a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
 | `GET /_replication/watch`, `POST /_replication/installed`, `GET /_replication/status` | Replication discovery, acknowledgments and status; see [Replication](replication.md). |
 
 Collection names occupy one URL path component. Names beginning with `_` are

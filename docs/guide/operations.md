@@ -85,8 +85,11 @@ executing keep their index view and complete normally.
 Deletion waits for indexing work already accepted, including a running merge,
 so deleting a collection mid-merge can take as long as that merge.
 
-On the filesystem backend collections use `c/<name>/<incarnation>/`, selected
-by an atomically replaced `CURRENT` file in `c/<name>/`. Deletion removes and
+On the filesystem backend collections use
+`c/<tenant>/<name>/<incarnation>/`, selected by an atomically replaced `CURRENT`
+file in `c/<tenant>/<name>/`. Single-tenant deployments use the `default`
+tenant. `c/LAYOUT` names this layout; a data directory written in another layout
+is refused at startup and must be reindexed. Deletion removes and
 syncs `CURRENT` before removing the directory tree, so an interrupted deletion
 cannot reopen the partially deleted index. If
 deletion fails partway (for example an I/O error), the name stays unavailable

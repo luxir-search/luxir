@@ -83,35 +83,36 @@ public:
 class ReadOnlyDirFactory : public DirectoryFactory {
   std::unique_ptr<DirectoryFactory> delegate_;
 
-  [[noreturn]] static void refuse(std::string_view what, std::string_view name) {
-    throw ReadOnlyError("read-only data directory: cannot " + std::string(what) + " '" + std::string(name) + "'");
+  [[noreturn]] static void refuse(std::string_view what, const CollectionId& id) {
+    throw ReadOnlyError("read-only data directory: cannot " + std::string(what) + " '" + id.label() + "'");
   }
 
 public:
   explicit ReadOnlyDirFactory(std::unique_ptr<DirectoryFactory> delegate)
       : delegate_(std::move(delegate)) {}
 
-  uint64_t storageBytes(std::string_view collection = {}) override { return delegate_->storageBytes(collection); }
-  std::vector<std::string> collections() override { return delegate_->collections(); }
+  uint64_t storageBytes() override { return delegate_->storageBytes(); }
+  uint64_t collectionBytes(const CollectionId& id) override { return delegate_->collectionBytes(id); }
+  std::vector<CollectionId> collections() override { return delegate_->collections(); }
 
   // Every namespace mutation is refused before it reaches the backend, and
   // opening never creates.
-  std::shared_ptr<Directory> container(std::string_view name, bool create) override {
-    if (create) refuse("create collection", name);
-    return std::make_shared<ReadOnlyDirectory>(delegate_->container(name, false), std::string(name));
+  std::shared_ptr<Directory> container(const CollectionId& id, bool create) override {
+    if (create) refuse("create collection", id);
+    return std::make_shared<ReadOnlyDirectory>(delegate_->container(id, false), id.label());
   }
-  std::shared_ptr<Directory> incarnation(std::string_view name, std::string_view incarnation, bool create) override {
-    if (create) refuse("create collection", name);
-    return std::make_shared<ReadOnlyDirectory>(delegate_->incarnation(name, incarnation, false),
-                                               std::string(name) + "/" + std::string(incarnation));
+  std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) override {
+    if (create) refuse("create collection", id);
+    return std::make_shared<ReadOnlyDirectory>(delegate_->incarnation(id, incarnation, false),
+                                               id.label() + "/" + std::string(incarnation));
   }
-  void createCollection(std::string_view name) override { refuse("create collection", name); }
-  std::vector<std::string> incarnations(std::string_view name) override { return delegate_->incarnations(name); }
-  void removeIncarnation(std::string_view name, std::string_view incarnation) override {
+  void createCollection(const CollectionId& id) override { refuse("create collection", id); }
+  std::vector<std::string> incarnations(const CollectionId& id) override { return delegate_->incarnations(id); }
+  void removeIncarnation(const CollectionId& id, std::string_view incarnation) override {
     unused(incarnation);
-    refuse("remove an incarnation of", name);
+    refuse("remove an incarnation of", id);
   }
-  void remove(std::string_view name) override { refuse("remove collection", name); }
+  void remove(const CollectionId& id) override { refuse("remove collection", id); }
 };
 
 } // namespace luxir

@@ -79,7 +79,7 @@ struct ColFloat; struct ColDouble; struct AnalyzerComponent; struct AnalyzerDef;
 struct FieldVariants; struct FieldDefaults; struct NormalizerDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
-struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse;
+struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
 struct QueryCacheStats; struct IndexRamStats;
@@ -337,14 +337,16 @@ struct ShardStats {
 struct CollectionStats {
   uint64_t storage_ram_bytes = 0;
   std::string_view name;
+  std::string_view tenant;
   StatsTotals totals;
   uint64_t schema_gen = 0;
   std::span<const ShardStats> shards;
   std::optional<Error> error;
 };
-struct StatsRequest { std::string_view collection; bool segments = false; };
+struct StatsRequest { std::string_view collection; std::string_view tenant; bool segments = false; };
 struct FollowerStatus {
   std::string_view follower;
+  std::string_view tenant;
   std::string_view collection;
   std::string_view commit;
   uint64_t last_seen = 0;
@@ -352,15 +354,18 @@ struct FollowerStatus {
 };
 struct ReplicationCatalogEntry {
   std::string_view commit;
+  std::string_view tenant;
+  std::string_view collection;
   bool available = false;
 };
 struct ReplicationCatalog {
   std::string_view boot;
   std::string_view cursor;
-  map_view<std::string_view, ReplicationCatalogEntry> collections;
+  std::span<const ReplicationCatalogEntry> collections;
 };
 struct ReplicationInstalled {
   std::string_view follower;
+  std::string_view tenant;
   std::string_view collection;
   std::string_view commit;
 };
@@ -368,6 +373,7 @@ namespace ReplicationCollectionStatus_ { enum class State { SYNCING = 0, SERVING
 struct ReplicationCollectionStatus {
   using State = ReplicationCollectionStatus_::State;
   std::string_view name;
+  std::string_view tenant;
   std::string_view source_commit;
   std::string_view serving_commit;
   std::optional<State> state;
@@ -453,12 +459,13 @@ struct SchemaRequest {                                           // needs Schema
   std::optional<SchemaDef> schema;
   Mode mode = Mode::SET;                                      // align 4 (enum)
 };
-struct CreateCollectionRequest { std::string_view name; std::optional<SchemaDef> schema; };
+struct CreateCollectionRequest { std::string_view name; std::optional<SchemaDef> schema; std::string_view tenant; };
 struct CreateCollectionResponse {
   std::string_view commit; std::string_view name; };
-struct DeleteCollectionRequest { std::string_view name; };
+struct DeleteCollectionRequest { std::string_view name; std::string_view tenant; };
 struct DeleteCollectionResponse { std::string_view name; };
 struct ListCollectionsResponse { std::span<const std::string_view> collections; };
+struct ListTenantsResponse { std::span<const std::string_view> tenants; };
 struct MultiVector { std::span<const ArrVector> v; };
 struct ArrVal { std::span<const Val> v; };                       // span<incomplete Val> OK
 
@@ -773,6 +780,7 @@ LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
 LUXIR_ENTRY(ListCollectionsResponse)
+LUXIR_ENTRY(ListTenantsResponse)
 LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStatus) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
