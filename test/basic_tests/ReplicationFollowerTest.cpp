@@ -93,6 +93,9 @@ protected:
     return command({"luxir", "--server.http.port", std::to_string(sourcePort),
         "--server.grpc.port", std::to_string(sourcePort), "pull", url, followerConfig.store.data_dir});
   }
+  std::pair<int, std::string> promote(std::string dir = {}) {
+    return command({"luxir", "promote", dir.empty() ? followerConfig.store.data_dir : dir});
+  }
   std::filesystem::path makeLocalUnreadable() {
     auto id = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
     stopFollower();
@@ -413,7 +416,7 @@ TEST_F(ReplicationFollowerTest, writerAndReadOnlyOpenFollowerLayout) {
   }
   config.read_only = false;
   EXPECT_THROW(LuxirNode writer(config), std::runtime_error);
-  config.promote = true;
+  ASSERT_EQ(0, promote().first);
   {
     LuxirNode writer(config);
     CollectionHelper h(writer, "main");
@@ -795,10 +798,11 @@ TEST_F(ReplicationFollowerTest, promotionPersistsParentBeforeRecordingTarget) {
     }
     return nullptr;
   });
-  auto config = followerConfig; config.replication.source.clear(); config.promote = true;
   auto unlisten = scope_guard([] { Signal::unlisten("fsSynced"); });
-  LuxirNode promoted(config);
+  ASSERT_EQ(0, promote().first);
   EXPECT_TRUE(recorded);
+  auto config = followerConfig; config.replication.source.clear();
+  LuxirNode promoted(config);
   EXPECT_EQ(1, promoted.getCollection("main")->getReaderManager().getReader()->liveDocs());
 }
 
@@ -819,7 +823,8 @@ TEST_F(ReplicationFollowerTest, promotionRebuildsInvalidRecordedTargets) {
       if (std::string_view(damage) == "wrong_incarnation") Manifest::write(dir, snapshot->id.index_gen, *snapshot->bytes);
       if (std::string_view(damage) == "corrupt") Manifest::write(dir, 1, {});
     }
-    auto config = followerConfig; config.replication.source.clear(); config.promote = true;
+    ASSERT_EQ(0, promote().first);
+    auto config = followerConfig; config.replication.source.clear();
     LuxirNode promoted(config);
     auto col = promoted.getCollection("main");
     EXPECT_NE(target, col->getShard()->getSnapshots().snapshot()->id.incarnation);
@@ -841,25 +846,25 @@ TEST_F(ReplicationFollowerTest, promotionRetriesOnlyUnpromotedCollections) {
     if (fail && *(std::string*)name == "broken") throw std::runtime_error("transient promotion failure");
     return nullptr;
   });
-  auto config = followerConfig; config.replication.source.clear(); config.promote = true;
-  CommitId main;
-  {
-    LuxirNode promoted(config);
-    auto collection = promoted.getCollection("main");
-    main = collection->getShard()->getSnapshots().snapshot()->id;
-    EXPECT_EQ(1, collection->getReaderManager().getReader()->liveDocs());
-    EXPECT_THROW(promoted.getCollection("broken"), CollectionUnavailableError);
-    EXPECT_TRUE(std::filesystem::exists(path / "follower" / "replication.json"));
-  }
+  auto config = followerConfig; config.replication.source.clear();
+  auto first = promote();
+  EXPECT_NE(0, first.first);
+  EXPECT_NE(std::string::npos, first.second.find("broken ERROR: transient promotion failure")) << first.second;
+  // No writer opens any collection until every one is promoted.
+  ASSERT_TRUE(std::filesystem::exists(path / "follower" / "replication.json"));
+  EXPECT_THROW(LuxirNode writer(config), std::runtime_error);
+  FSDirectory metadata(followerConfig.store.data_dir);
+  auto target = ReplicationState::read(*metadata.openFile("replication.json")).collections["main"].promoted;
+  ASSERT_FALSE(target.empty());
   fail = false;
-  for (int retry = 0; retry < 2; retry++) {
-    LuxirNode promoted(config);
-    EXPECT_EQ(main, promoted.getCollection("main")->getShard()->getSnapshots().snapshot()->id);
-    auto collection = promoted.getCollection("broken");
-    EXPECT_NE(old.incarnation, collection->getShard()->getSnapshots().snapshot()->id.incarnation);
-    EXPECT_EQ(1, collection->getReaderManager().getReader()->liveDocs());
-    EXPECT_FALSE(std::filesystem::exists(path / "follower" / "replication.json"));
-  }
+  ASSERT_EQ(0, promote().first);
+  EXPECT_FALSE(std::filesystem::exists(path / "follower" / "replication.json"));
+  EXPECT_NE(0, promote().first); // no longer a follower directory
+  LuxirNode promoted(config);
+  EXPECT_EQ(target, promoted.getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation);
+  auto collection = promoted.getCollection("broken");
+  EXPECT_NE(old.incarnation, collection->getShard()->getSnapshots().snapshot()->id.incarnation);
+  EXPECT_EQ(1, collection->getReaderManager().getReader()->liveDocs());
 }
 
 
@@ -895,7 +900,8 @@ TEST_F(ReplicationFollowerTest, promotionReusesFilesAcrossIncarnations) {
   ASSERT_TRUE(until([&] { return ram.collectionEntries().size() == 1 && fs.collectionEntries().size() == 1; }));
   auto ramFile = ram.getCollection("main")->getShard()->getSnapshots().dir.openFile(old->files.front().name);
   stopFollower(); stopSource();
-  sourceConfig = followerConfig; sourceConfig.replication.source.clear(); sourceConfig.promote = true;
+  ASSERT_EQ(0, promote().first);
+  sourceConfig = followerConfig; sourceConfig.replication.source.clear();
   source = std::make_unique<LuxirNode>(sourceConfig);
   auto promoted = source->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
   sourceServer = std::make_unique<HttpServer>(*source, 1, sourcePort); sourceServer->start();
@@ -1127,7 +1133,8 @@ TEST_P(ReplicationPullTest, copiesEmptyAndPopulatedCollectionsThenSeedsAndPromot
   for (const auto& row : status.collections) EXPECT_EQ(0, row.bytes_downloaded);
   EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
   stopFollower();
-  auto config = followerConfig; config.replication.source.clear(); config.promote = true;
+  ASSERT_EQ(0, promote().first);
+  auto config = followerConfig; config.replication.source.clear();
   LuxirNode writer(config);
   CollectionHelper h(writer, "main");
   EXPECT_NE(snapshot->id.incarnation, h.collection().getShard()->getSnapshots().snapshot()->id.incarnation);
@@ -1143,7 +1150,8 @@ TEST_F(ReplicationFollowerTest, pullReusesFilesAfterSourcePromotion) {
   followerConfig.store.data_dir = (path / "promoted").string();
   ASSERT_EQ(0, pull().first);
   stopSource();
-  sourceConfig.store.data_dir = followerConfig.store.data_dir; sourceConfig.promote = true;
+  ASSERT_EQ(0, promote().first);
+  sourceConfig.store.data_dir = followerConfig.store.data_dir;
   startSource();
   followerConfig.store.data_dir = destination;
   auto result = pull();
@@ -1246,14 +1254,11 @@ TEST_F(ReplicationFollowerTest, waitingSurvivesFollowerRestartThenSameBootRecrea
   EXPECT_EQ(0, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
 }
 
-TEST_F(ReplicationFollowerTest, refusesInvalidPromotionModes) {
-  LuxirConfig config;
-  config.promote = true;
-  EXPECT_THROW(LuxirNode node(config), std::invalid_argument);
-  config.store.backend = "fs"; config.store.data_dir = (path / "invalid").string();
-  config.replication.source = "http://127.0.0.1:1";
-  EXPECT_THROW(LuxirNode node(config), std::invalid_argument);
-  EXPECT_FALSE(std::filesystem::exists(config.store.data_dir));
+TEST_F(ReplicationFollowerTest, promoteRequiresAFollowerDirectory) {
+  auto missing = (path / "invalid").string();
+  EXPECT_NE(0, promote(missing).first);
+  EXPECT_NE(0, command({"luxir", "--replicate-from", "http://127.0.0.1:1", "promote", missing}).first);
+  EXPECT_FALSE(std::filesystem::exists(missing));
 }
 
 TEST_F(ReplicationFollowerTest, acknowledgesServingWhileDiscoveryAdvances) {

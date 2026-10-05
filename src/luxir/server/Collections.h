@@ -88,7 +88,7 @@ public:
   // unselected leftovers and create the default collection; read-only nodes
   // never mutate; followers retain incomplete downloads. A collection that
   // cannot be opened is registered unavailable and its data is kept.
-  std::vector<Opened> open(Role role, const std::map<std::string, std::string>& failures = {});
+  std::vector<Opened> open(Role role);
 
   // The registered entry, which may be an unavailable placeholder.
   std::shared_ptr<Collection> get(std::string_view name) { return map.get(std::string(name)); }

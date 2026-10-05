@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <filesystem>
+#include <iosfwd>
 #include <map>
 #include <string>
 #include <string_view>
@@ -15,13 +17,13 @@ namespace luxir {
 // is unchanged. Promotion and recovery both start a new identity this way.
 std::string copySnapshot(CollectionStorage& storage, std::string_view from, const Manifest& manifest);
 
-struct ReplicationState;
-
-// Gives every selected collection of a follower data directory a new identity.
-// Resumable: each target is recorded in `state` (persisted to `metadata`) before
-// CURRENT selects it, and a recorded target is reused only if its newest root and
-// every file it references are present. Returns per-collection failures; on
-// success the follower binding is removed.
-std::map<std::string, std::string> promote(DirectoryFactory& factory, Directory& metadata, ReplicationState& state);
+// Offline promotion of a follower data directory to an independent writer:
+// every selected collection gets a new identity. Resumable: each target is
+// recorded in the follower binding before CURRENT selects it, and a recorded
+// target is reused only if its newest root and every file it references are
+// present. The binding is removed only when every collection succeeded, and a
+// writer refuses to start while it exists. Prints one line per collection and a
+// summary; returns false on any failure.
+bool promote(const std::filesystem::path& dataDir, std::ostream& output);
 
 }

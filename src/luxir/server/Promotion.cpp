@@ -49,8 +49,15 @@ bool validTarget(CollectionStorage& storage, const std::string& incarnation) {
 }
 }
 
-std::map<std::string, std::string> promote(DirectoryFactory& factory, Directory& metadata, ReplicationState& state) {
-  std::map<std::string, std::string> errors;
+bool promote(const std::filesystem::path& dataDir, std::ostream& output) {
+  if (!std::filesystem::exists(dataDir / "replication.json")) {
+    output << "Promote failed: " << dataDir.string() << " is not a follower data directory\n";
+    return false;
+  }
+  FSDirFactory factory(dataDir);
+  FSDirectory metadata(dataDir);
+  auto state = ReplicationState::read(*metadata.openFile("replication.json"));
+  size_t promotedCount = 0, failed = 0;
   for (const auto& name : factory.collections()) {
     try {
       auto storage = factory.collection(name);
@@ -64,16 +71,23 @@ std::map<std::string, std::string> promote(DirectoryFactory& factory, Directory&
         state.write(metadata);
       }
       if (*selected != promoted) storage.select(promoted);
+      storage.retainOnly(promoted);
+      promotedCount++;
+      output << name << ' ' << promoted << '\n';
     } catch (const std::exception& e) {
-      errors.emplace(name, "promotion failed: " + std::string(e.what()));
+      failed++;
+      output << name << " ERROR: " << e.what() << '\n';
     }
   }
-  if (errors.empty()) {
+  if (!failed) {
     metadata.deleteFile("replication.json");
     std::array<std::string, 1> directory{"."};
     metadata.sync(directory);
   }
-  return errors;
+  output << "Promote: " << promotedCount << " promoted, " << failed << " failed";
+  if (!failed) output << "; promoted from follower of " << state.source;
+  output << '\n';
+  return !failed;
 }
 
 }

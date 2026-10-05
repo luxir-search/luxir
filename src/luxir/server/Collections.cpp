@@ -176,7 +176,7 @@ std::shared_ptr<Collection> Collections::openCollection(const std::string& name,
   return col;
 }
 
-std::vector<Collections::Opened> Collections::open(Role role, const std::map<std::string, std::string>& failures) {
+std::vector<Collections::Opened> Collections::open(Role role) {
   std::vector<Opened> rows;
   auto names = factory->collections();
   bool createDefault = names.empty() && role != Role::FOLLOWER;
@@ -185,7 +185,6 @@ std::vector<Collections::Opened> Collections::open(Role role, const std::map<std
     Opened row{name, nullptr, std::nullopt, {}};
     try {
       validateName(name);
-      if (auto failed = failures.find(name); failed != failures.end()) throw std::runtime_error(failed->second);
       auto storage = factory->collection(name);
       if (!createDefault) {
         row.incarnation = storage.current();

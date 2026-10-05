@@ -3,17 +3,13 @@
 
 #include "luxir/server/ReplicationCatalog.h"
 #include "LuxirNode.h"
-#include "Promotion.h"
 #include "ReplicationFollower.h"
-#include "ReplicationState.h"
 #include "luxir/util/DateTime.h"
 
 namespace luxir {
 
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   : config(std::move(config)) {
-  if (this->config.promote && !this->config.replication.source.empty()) throw std::invalid_argument("--promote cannot be combined with --replicate-from");
-  if (this->config.promote && this->config.store.backend == "ram") throw std::invalid_argument("--promote requires the FS backend");
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers
@@ -33,26 +29,13 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
     follower = std::make_unique<ReplicationFollower>(*this);
     follower->seed(collections_->open(Collections::Role::FOLLOWER));
   } else {
-    std::map<std::string, std::string> promotionErrors;
-    // Promotion is a storage operation before any writer opens the replicas.
-    // Hard links retain immutable data without copying it. CURRENT still selects
-    // the old complete snapshot until the new root and directory are durable.
-    if (!this->config.read_only && this->config.store.backend == "fs") {
-      FSDirectory metadata(this->config.store.data_dir);
-      if (auto binding = metadata.openFile("replication.json")) {
-        if (!this->config.promote) throw std::runtime_error("Follower-bound data directory: use --promote to start a writer");
-        auto state = ReplicationState::read(*binding);
-        promotionErrors = promote(collections_->storage(), metadata, state);
-        if (promotionErrors.empty()) {
-          LOG_INFO("promoted from follower of {}", state.source);
-        } else {
-          LOG_WARN("Promotion from follower of {} incomplete; restart with --promote to retry failed collections", state.source);
-        }
-      } else if (this->config.promote) {
-        LOG_INFO("No follower binding; nothing to promote");
-      }
+    // A follower directory becomes a writer only through offline promotion,
+    // which completes for every collection before any writer opens one.
+    if (!this->config.read_only && this->config.store.backend == "fs"
+        && std::filesystem::exists(std::filesystem::path(this->config.store.data_dir) / "replication.json")) {
+      throw std::runtime_error("Follower data directory: run 'luxir promote " + this->config.store.data_dir + "' to make it a writer");
     }
-    collections_->open(this->config.read_only ? Collections::Role::READ_ONLY : Collections::Role::WRITER, promotionErrors);
+    collections_->open(this->config.read_only ? Collections::Role::READ_ONLY : Collections::Role::WRITER);
   }
   searchEngine = std::make_unique<SearchEngine>(*this);
   if (follower && mode == Mode::SERVE) follower->start();

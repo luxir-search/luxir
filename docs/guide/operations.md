@@ -34,7 +34,7 @@ A commit makes updates durable and visible to searches. After a crash, Luxir
 reopens the last durable commit. Updates accepted since that commit can be lost.
 
 Use [`luxir pull`](replication.md#copy-restore-or-promote) for an online copy,
-then `--promote` to restore it as a writer under new collection incarnations.
+then `luxir promote` to restore it as a writer under new collection incarnations.
 Do not restore a raw directory copy over an existing writer identity.
 
 ## Read-only nodes
@@ -357,7 +357,7 @@ features it does not yet supply:
 
 - no automatic failover, leader election, or distributed query execution;
 - no built-in TLS/authentication/authorization;
-- no scheduled backups or automatic restore (use `luxir pull` and `--promote`);
+- no scheduled backups or automatic restore (use `luxir pull` and `luxir promote`);
 - no application-level signal-driven graceful shutdown;
 - pre-1.0 wire and schema interfaces that may change.
 

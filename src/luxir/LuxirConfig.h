@@ -156,7 +156,6 @@ struct LuxirConfig {
   // current when this node started; there is no reopen yet, so later commits by the
   // writer are not picked up until restart.
   bool read_only = false;
-  bool promote = false;
 
   // Node-wide RAM budget (MiB): what this process may use for the memory it
   // manages explicitly - indexing structures today, caches as they are folded

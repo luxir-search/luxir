@@ -73,7 +73,8 @@ luxir pull http://writer:9400 /data/seed
 # Seed a follower:
 luxir --replicate-from http://writer:9400 --store.backend=fs --store.data-dir=/data/seed
 # Restore as an independent writer:
-luxir --promote --store.backend=fs --store.data-dir=/data/seed
+luxir promote /data/seed
+luxir --store.backend=fs --store.data-dir=/data/seed
 ```
 
 Pull starts no server. It prints each collection's commit, transferred/reused
@@ -82,13 +83,15 @@ may use a different source URL. Membership is captured once, with each snapshot
 fetched when reached; this is not an atomic namespace-wide backup. Absent local
 collections are retained. Pull does not acknowledge serving traffic.
 
-For manual failover, stop the old writer and the chosen FS follower, then start
-that follower's directory with `--promote` and without `--replicate-from`.
-Promotion gives every collection a new incarnation, reusing immutable files.
-Restart other followers with `--replicate-from http://new-writer:9400` and their
-existing directories. A failed promotion leaves that collection unavailable;
-restart with `--promote` to finish. Completed promotions are not repeated.
-Promotion requires FS and cannot be combined with following.
+For manual failover, stop the old writer and the chosen FS follower, run
+`luxir promote DIR` on that follower's directory, then start it as a writer
+without `--replicate-from`. Promotion starts no server. It gives every
+collection a new incarnation, reusing immutable files, and prints each
+collection's new incarnation and a summary. Any failure gives a nonzero exit and
+keeps the directory follower-bound: a writer refuses to start on it, so no
+collection serves until all are promoted. Re-run `luxir promote` to finish;
+completed promotions are not repeated. Restart other followers with
+`--replicate-from http://new-writer:9400` and their existing directories.
 Use **pull plus promote** to restore, rather than copying a writer directory
 back over a live identity. Writer recovery from an older valid root also mints
 a new incarnation. Read-only nodes can open a follower directory directly.

@@ -10,6 +10,7 @@
 #include <malloc.h>
 #endif
 #include "luxir/luxir_main.h"
+#include "luxir/server/Promotion.h"
 #include "luxir/util/MappedAlloc.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/luxir_util.h"
@@ -32,6 +33,8 @@ int luxir_main(int argc, char** argv) {
   auto* pull = app.add_subcommand("pull", "Copy current source snapshots to a follower data directory");
   pull->add_option("source", config.replication.source, "HTTP source URL")->required();
   pull->add_option("dir", config.store.data_dir, "Destination data directory")->required();
+  auto* promote = app.add_subcommand("promote", "Make a stopped follower data directory an independent writer");
+  promote->add_option("dir", config.store.data_dir, "Follower data directory")->required();
 
   try {
     app.parse(argc, argv);
@@ -43,11 +46,17 @@ int luxir_main(int argc, char** argv) {
       std::cerr << "pull requires nonempty source and directory arguments\n";
       return 1;
     }
-    if (config.read_only || config.promote) {
-      std::cerr << "pull cannot be combined with --read-only or --promote\n";
+    if (config.read_only) {
+      std::cerr << "pull cannot be combined with --read-only\n";
       return 1;
     }
     config.store.backend = "fs";
+    if (!app.get_option("--log-level")->count()) config.log_level = "warn";
+  } else if (*promote) {
+    if (config.store.data_dir.empty() || config.read_only || !config.replication.source.empty()) {
+      std::cerr << "promote takes a nonempty directory, without --read-only or --replicate-from\n";
+      return 1;
+    }
     if (!app.get_option("--log-level")->count()) config.log_level = "warn";
   } else std::cout << luxir_banner() << std::endl;
 
@@ -79,6 +88,15 @@ int luxir_main(int argc, char** argv) {
       return node.getFollower()->pull(std::cout) ? 0 : 1;
     } catch (const std::exception& e) {
       std::cerr << "Pull failed: " << e.what() << '\n';
+      return 1;
+    }
+  }
+
+  if (*promote) {
+    try {
+      return luxir::promote(config.store.data_dir, std::cout) ? 0 : 1;
+    } catch (const std::exception& e) {
+      std::cerr << "Promote failed: " << e.what() << '\n';
       return 1;
     }
   }
