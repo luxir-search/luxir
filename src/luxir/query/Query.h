@@ -447,6 +447,20 @@ public:
     DYNAMIC_TERMS,
   };
 
+  // An inclusive range of encoded numeric column values (the column's
+  // order-preserving int64 encoding: INT raw, FLOAT/DOUBLE sortable bits,
+  // DATE epoch millis). lo > hi is empty.
+  struct ValueEnvelope {
+    int64_t lo;
+    int64_t hi;
+
+    bool empty() const noexcept { return lo > hi; }
+
+    ValueEnvelope intersect(ValueEnvelope other) const noexcept {
+      return {std::max(lo, other.lo), std::min(hi, other.hi)};
+    }
+  };
+
   enum class ClauseShape : uint8_t {
     DIRECT,
     FLAT_DISJUNCTION,
@@ -578,6 +592,18 @@ public:
       PlanningContext& context) const {
     unused(context);
     return FieldSortConjunction::NOT_FLAT;
+  }
+
+  // The values this query requires of the numeric column `field` (a
+  // physical field name): every doc it matches has a value of `field`
+  // inside the returned envelope (some value, for a multi-valued field).
+  // An empty envelope means the query matches nothing. nullopt claims
+  // nothing, which is always legal. A pure function of the logical tree:
+  // answers must hold for every execution of the query.
+  virtual std::optional<ValueEnvelope> requiredValueEnvelope(
+      std::string_view field) const {
+    unused(field);
+    return std::nullopt;
   }
 
   // Validate the complete logical tree once during serial request planning,

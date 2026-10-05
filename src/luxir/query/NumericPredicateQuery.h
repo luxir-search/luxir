@@ -131,6 +131,14 @@ public:
         && found->lo <= min && max <= found->hi;
   }
 
+  // A matching doc has a value inside a range or equal to a set member, so
+  // either way inside [lo, hi] (the set's first and last values).
+  std::optional<ValueEnvelope> requiredValueEnvelope(
+      std::string_view target) const override {
+    if (target != field) return std::nullopt;
+    return ValueEnvelope{envelope.lo, envelope.hi};
+  }
+
   float valueMatchCost() const {
     if (!isExactSet()) return 1.0f;
     return (float)(std::bit_width(exactIntervals.size()) + 1);
@@ -613,6 +621,10 @@ public:
           outDocs(pool.make_arr<int32_t>(WINDOW_SIZE), WINDOW_SIZE),
           outScores(pool.make_arr<float>(WINDOW_SIZE), WINDOW_SIZE),
           maxDoc(maxDoc), constantScore(constantScore) {}
+
+    // Bounded windows of exact matches: the default matchNextWindow serves
+    // them, as the bulk plan declares.
+    bool supportsMatchWindows() const override { return true; }
 
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {

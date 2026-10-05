@@ -38,6 +38,11 @@ public:
     child->validateLogical(context, multiplier);
   }
 
+  std::optional<ValueEnvelope> requiredValueEnvelope(
+      std::string_view field) const override {
+    return child->requiredValueEnvelope(field);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);

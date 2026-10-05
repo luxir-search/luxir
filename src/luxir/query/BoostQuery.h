@@ -43,6 +43,11 @@ public:
     return child->fieldSortConjunction(context);
   }
 
+  std::optional<ValueEnvelope> requiredValueEnvelope(
+      std::string_view field) const override {
+    return child->requiredValueEnvelope(field);
+  }
+
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     child->validateLogical(

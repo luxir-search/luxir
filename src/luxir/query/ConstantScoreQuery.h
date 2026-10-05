@@ -179,6 +179,10 @@ public:
       PlanningContext& context) const override {
     return child->fieldSortConjunction(context);
   }
+  std::optional<ValueEnvelope> requiredValueEnvelope(
+      std::string_view field) const override {
+    return child->requiredValueEnvelope(field);
+  }
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     if (!std::isfinite(constantScore)) {

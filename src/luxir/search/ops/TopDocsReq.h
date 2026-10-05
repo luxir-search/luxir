@@ -121,8 +121,15 @@ public:
   // sub-saturating (2 * floor < leafCount). Past that the bounds skip too
   // little to repay the driver's per-leaf sweep, and the ladder's coarse-range
   // walk serves a sparse domain faster (measured up to 2x on 0.1-1%
-  // memberships). The route then picks the driver's phases by cost
-  // (ExactDomainSortCosts).
+  // memberships). Leaves bounded before the domain's key floor (a range on
+  // the sort field itself; FieldSortCollector::leavesBeforeKeyFloor) are
+  // visited whatever the density, so the route prices max(floor, clip). The
+  // clip demotes only an ARRAY domain to the ladder: with every leaf visited
+  // and nothing skipped, the ladder walks an array in 0.53-0.91 of the
+  // sweep's time, while the sweep's fused masked gather serves a BITSET
+  // domain in 0.75-0.88 of the ladder's (5M benchgame range board, cached
+  // memberships, k = 10-1000). The route then picks the driver's phases by
+  // cost (ExactDomainSortCosts).
   struct FieldSortBestFirstPlan {
     FieldSortCollector::KeyBlockPlan keys;
     ExactDomainSortRoute route;
@@ -141,7 +148,8 @@ public:
   };
 
   static FieldSortBestFirstPlan planFieldSortBestFirst(
-      FieldSortCollector& collector, int64_t card, int32_t maxDoc) {
+      FieldSortCollector& collector, int64_t card, int32_t maxDoc,
+      bool bitsetDomain) {
     if (disableFieldSortPruning || disableFieldSortBestFirst || card <= 0) {
       return {};
     }
@@ -150,19 +158,50 @@ public:
     int64_t expectedFloor = std::min<int64_t>(
         keys.leafCount,
         (collector.topCount * (int64_t)maxDoc + card - 1) / card);
-    if (2 * expectedFloor >= keys.leafCount
-        && !forceFieldSortBestFirst) {
+    int64_t clip = collector.leavesBeforeKeyFloor;
+    int64_t floor = std::max(expectedFloor, clip);
+    int64_t gateFloor = bitsetDomain ? expectedFloor : floor;
+    if (2 * gateFloor >= keys.leafCount && !forceFieldSortBestFirst) {
       return {};
     }
     ExactDomainSortRoute route;
     route.card = card;
     route.expectedFloor = expectedFloor;
+    route.clipLeaves = clip;
     route.boundOrder = forceFieldSortBestFirst
-        || ExactDomainSortCosts::boundOrderPays(
-            expectedFloor, card, keys.leafCount);
+        || ExactDomainSortCosts::boundOrderPays(floor, card, keys.leafCount);
     route.checkProgress = !forceFieldSortBestFirst;
     route.gatherCapForTests = forceFieldSortWorkCapForTests;
     return {keys, route};
+  }
+
+  // The values every collected doc holds in the primary sort column: what
+  // the main query and each op-level filter require of that field
+  // (Query::requiredValueEnvelope), intersected. Every route collects only
+  // docs that match the query and pass every filter (folded into the query,
+  // or composed into the default domain, which includes them all), and a
+  // parent domain only narrows that, so the envelope holds for whatever
+  // domain source a route reads: a resident whole membership, a cached exact
+  // set, a collector filter, or the query's own matches. The comparator
+  // decides whether its key follows from it (KeyBatch::keyFloor).
+  static std::optional<Query::ValueEnvelope> sortValueEnvelope(
+      const SortPlan& sortPlan, const Query* query,
+      std::span<const ParsedFilter> filters) {
+    if (!sortPlan.useFieldSort || sortPlan.clauses.empty()
+        || sortPlan.clauses[0].getKind() != SortClause::COLUMN) {
+      return std::nullopt;
+    }
+    std::string_view field = sortPlan.clauses[0].getSortField().getFieldName();
+    std::optional<Query::ValueEnvelope> result;
+    auto require = [&](const Query* restriction) {
+      if (restriction == nullptr) return;
+      auto envelope = restriction->requiredValueEnvelope(field);
+      if (!envelope.has_value()) return;
+      result = result.has_value() ? result->intersect(*envelope) : *envelope;
+    };
+    require(query);
+    for (const ParsedFilter& filter : filters) require(filter.query);
+    return result;
   }
 
   static bool fieldSortCanUseMaskedBestFirst(const SortPlan& sortPlan) {
@@ -236,6 +275,9 @@ public:
     }
     FieldSortCollector collector(
         topCount, sortPlan.clauses, &reader, false);
+    // Whole membership is planned only with every filter folded into the
+    // query, so the query alone carries the envelope.
+    collector.primaryValues = sortValueEnvelope(sortPlan, &query, {});
     MemPool pool;
     bool anyRouted = false;
     for (auto& segment : reader.segments()) {
@@ -259,8 +301,13 @@ public:
                 != Query::ClauseShape::FLAT_CONJUNCTION) {
           collector.setSegment(
               segment.ord, &segment.postingsReader(), &pool, estimatedCard);
+          // The membership would materialize as an array at or below the
+          // builder's promotion limit.
+          bool bitsetDomain = estimatedCard
+              > (int64_t)DocSetBuilder::arrayLimitFor(segment.maxDoc());
           routed = planFieldSortBestFirst(
-              collector, estimatedCard, segment.maxDoc()).available();
+              collector, estimatedCard, segment.maxDoc(), bitsetDomain)
+              .available();
         }
       }
       routes[(size_t)segment.ord] = (uint8_t)routed;
@@ -346,6 +393,8 @@ public:
   QueryPrep::WholeMembershipPlan wholeMembershipPlan;
   QueryPrep::ExactDomainPlan exactDomainPlan;
   SortPlan sortPlan;
+  // Every field-sort collector's primaryValues (see sortValueEnvelope).
+  std::optional<Query::ValueEnvelope> sortValues;
 
   // Optional sink for the merged top-K collector.  If set, the Calc invokes
   // it instead of self-emitting via fillQueryTopNResponse, letting another
@@ -373,9 +422,13 @@ public:
       : SearchOp::Calculator(op, parent, slot, numSlots), collectorMerger(nullptr, nullptr) {
 
       collectorMerger.creator = [&op]() -> MergeableCollector* {
-        return new MergeableCollector(
+        auto* collector = new MergeableCollector(
             op.topCount, op.sortPlan, op.req.reader.get(),
             op.requestNeedsScores);
+        if (collector->useFieldSort) {
+          collector->fieldCollector->primaryValues = op.sortValues;
+        }
+        return collector;
       };
       collectorMerger.destroyer = [](MergeableCollector* data) {
         delete data;
@@ -1781,7 +1834,8 @@ public:
             // no other filter or sub-op domain restriction), an explicit
             // collectorFilter under a true match-all weight, or every doc.
             // Activation requires the expected visit floor (ceil(k/d)
-            // leaves) to be sub-saturating.
+            // leaves, or the leaves clipped by the domain's key floor) to
+            // be sub-saturating.
             if (maySkipNoncompetitiveDocs
                 && (!requiresWholeIndexPrepare || wholeFieldSortAvailable)
                 && !data->fieldCollector->needsScores
@@ -1809,10 +1863,12 @@ public:
                           || domainSet->type == DocSet::ARRAY))) {
                 int64_t card =
                     allDocs ? (int64_t)seg.maxDoc() : domainSet->card();
+                bool arrayDomain =
+                    !allDocs && domainSet->type == DocSet::ARRAY;
                 auto bestFirst = planFieldSortBestFirst(
-                    *data->fieldCollector, card, seg.maxDoc());
+                    *data->fieldCollector, card, seg.maxDoc(), !arrayDomain);
                 if (bestFirst.available()) {
-                  if (!allDocs && domainSet->type == DocSet::ARRAY) {
+                  if (arrayDomain) {
                     collectTopKArrayBestFirst(
                         segnum, ((ArrDocSet*)domainSet)->docs(),
                         *data->fieldCollector, poolGuard.pool(),
@@ -1885,9 +1941,12 @@ public:
                 // BETTER than preserving the coarse-era activation envelope:
                 // it admits the 1% band, where seeding takes the walk from
                 // 1.66x the leaf floor to floor+O(1) and the second scorer
-                // costs far less than the excess it removes.
-                int64_t leafFloor =
-                    std::min<int64_t>(plan.leafCount, expectedDepth);
+                // costs far less than the excess it removes. Leaves before
+                // the key floor are enumerated whatever the density.
+                int64_t leafFloor = std::min<int64_t>(
+                    plan.leafCount,
+                    std::max(expectedDepth,
+                             data->fieldCollector->leavesBeforeKeyFloor));
                 bool material =
                     4 * leafFloor + 64 < plan.leafCount
                     && sortSourceCost >= plan.leafCount;
@@ -2293,7 +2352,8 @@ public:
       topCount(topCount), filters(filters), filterWeights(filterWeights),
       domainVariants(std::move(domainVariants)),
       requirements(requirements),
-      sortPlan(std::move(sortPlan)) {
+      sortPlan(std::move(sortPlan)),
+      sortValues(sortValueEnvelope(this->sortPlan, query, filters)) {
     auto wholeConsumer = this->sortPlan.useFieldSort
         ? QueryPrep::WholeMembershipConsumer::FIELD_SORT
         : requirements.needRankedDocs

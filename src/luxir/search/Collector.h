@@ -978,11 +978,20 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
 // crossover (k=100 sits at the gate, k=1000 has no sub-saturating sweep
 // win), so the sweep cost keeps its earlier fit and the visit cost is fitted
 // alone: these costs cross at 3022 (k=10) and at the gate (k=100), and
-// choosing by them loses 0.3% against the per-query best phase. A domain
-// correlated with the sort key (a range on the sort field itself, whose
-// members sit below every leaf bound) breaks the independence premise: bound
-// order then visits every leaf without proof, never beating the sweep, and
-// the progress checkpoints below hand such a domain to the sweep.
+// choosing by them loses 0.3% against the per-query best phase.
+//
+// A domain correlated with the sort key breaks the independence premise. When
+// the correlation is known - a range on the sort field itself puts every
+// member's key at or past a key floor (FieldSortCollector::primaryValues) -
+// the leaves bounded before that floor (clipLeaves) can never be proven out,
+// so bound order visits all of them before its first proof and the visit
+// floor is at least clipLeaves: uniform wide zones clip nearly every leaf and
+// sweep from the start, while tight (doc-order correlated) zones clip only
+// the leaves lying past the range's edge, and bound order keeps paying when
+// those are few. A correlation nothing announces
+// (a filter on another field holding the same data) shows up only as missing
+// proofs at the progress checkpoints below, which hand such a domain to the
+// sweep.
 struct ExactDomainSortCosts {
   static constexpr double kBoundOrderLeafCost = 8.5;
   static constexpr double kSweepLeafCost = 2;
@@ -1010,20 +1019,42 @@ struct ExactDomainSortCosts {
   // Checkpoint verdict after `gathers` bound-order leaves hold `proofs` final
   // heap entries. No proof at all is the signature of a domain correlated
   // with the key (its members sit below every leaf bound); otherwise the
-  // proof rate projects a floor of gathers*k/proofs.
+  // proofs, all made past the clipLeaves visited first, project a floor of
+  // clipLeaves + (gathers - clipLeaves)*k/proofs.
   static bool boundOrderKeepsPaying(int64_t gathers, int64_t proofs,
                                     int64_t topCount, int64_t card,
-                                    int64_t leafCount) {
+                                    int64_t leafCount,
+                                    int64_t clipLeaves = 0) {
     if (proofs <= 0) return false;
-    int64_t observedFloor = (gathers * topCount + proofs - 1) / proofs;
+    int64_t beyond = std::max<int64_t>(0, gathers - clipLeaves);
+    int64_t observedFloor = clipLeaves
+        + (beyond * topCount + proofs - 1) / proofs;
     return boundOrderPays(observedFloor / kProgressMargin, card, leafCount);
+  }
+
+  // First progress checkpoint, in bound-order leaf gathers: the clipped
+  // leaves (no proof can precede them), then enough leaves to expect
+  // kCheckpointExpectedProofs proofs at the independence premise's rate of
+  // k/expectedFloor per leaf.
+  static int64_t firstCheckpoint(int64_t expectedFloor, int64_t clipLeaves,
+                                 int64_t topCount) {
+    return std::max<int64_t>(
+        kMinCheckpointLeaves,
+        clipLeaves
+            + (kCheckpointExpectedProofs * expectedFloor + topCount - 1)
+                / topCount);
   }
 };
 
 // How a materialized domain is served; see ExactDomainSortCosts.
 struct ExactDomainSortRoute {
   int64_t card = 0;
+  // Leaves the independence premise expects a bounded traversal to visit,
+  // ceil(k/d), and the leaves bounded before the domain's key floor
+  // (FieldSortCollector::leavesBeforeKeyFloor), which any bounded traversal
+  // visits. The router prices max(expectedFloor, clipLeaves).
   int64_t expectedFloor = 0;
+  int64_t clipLeaves = 0;
   // Start in bound order; false sweeps the whole domain in doc order.
   bool boundOrder = false;
   // Judge the proof progress bound order actually makes at checkpoints
@@ -1082,9 +1113,9 @@ void sweepLeavesInDocOrder(int32_t segnum, Collector& collector,
 // improves); a SKIP_TIE leaf is skipped alone. Returns true when the phase
 // settled the segment (proof, or every leaf visited); false hands the
 // unvisited leaves to the sweep. The hand-off comes from progress
-// checkpoints (at kCheckpointExpectedProofs expected proofs, then at
-// doubling gather counts): heap entries below the next leaf's bound are
-// final, and boundOrderKeepsPaying judges how many there are.
+// checkpoints (firstCheckpoint, past any clipped leaves, then at doubling
+// gather counts): heap entries below the next leaf's bound are final, and
+// boundOrderKeepsPaying judges how many there are.
 template <typename Collector, typename GatherLeaf>
 bool collectTopKBoundOrder(int32_t segnum, Collector& collector,
                            const typename Collector::KeyBlockPlan& plan,
@@ -1097,10 +1128,8 @@ bool collectTopKBoundOrder(int32_t segnum, Collector& collector,
   int64_t topCount = collector.topCount;
   int64_t checkpoint = std::numeric_limits<int64_t>::max();
   if (route.checkProgress) {
-    checkpoint = std::max<int64_t>(
-        Costs::kMinCheckpointLeaves,
-        (Costs::kCheckpointExpectedProofs * route.expectedFloor + topCount - 1)
-            / topCount);
+    checkpoint = Costs::firstCheckpoint(route.expectedFloor, route.clipLeaves,
+                                        topCount);
   }
   int64_t leafGathers = 0;
   for (int64_t rank = 0; rank < plan.leafCount; rank++) {
@@ -1135,7 +1164,8 @@ bool collectTopKBoundOrder(int32_t segnum, Collector& collector,
       int64_t proofs = collector.countKeysBelow(
           plan.batch->boundOrderLeaf(rank + 1).bound, plan.batch);
       if (!Costs::boundOrderKeepsPaying(leafGathers, proofs, topCount,
-                                        route.card, plan.leafCount)) {
+                                        route.card, plan.leafCount,
+                                        route.clipLeaves)) {
         return false;
       }
       checkpoint = 2 * leafGathers;

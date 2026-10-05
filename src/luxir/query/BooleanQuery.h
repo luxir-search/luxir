@@ -896,6 +896,24 @@ public:
                     : FieldSortConjunction::FLAT_LITERAL_CONJUNCTION;
   }
 
+  // Every match satisfies every MUST and FILTER clause, so their envelopes
+  // intersect. Optional clauses (even under minShouldMatch) and prohibited
+  // clauses require nothing of a single field here. Normalization only
+  // rearranges the same constraints, so the raw tree answers for it.
+  std::optional<ValueEnvelope> requiredValueEnvelope(
+      std::string_view field) const override {
+    std::optional<ValueEnvelope> result;
+    for (auto clauses : {mandatory, filter}) {
+      for (Query* clause : clauses) {
+        auto envelope = clause->requiredValueEnvelope(field);
+        if (!envelope.has_value()) continue;
+        result = result.has_value() ? result->intersect(*envelope)
+                                    : *envelope;
+      }
+    }
+    return result;
+  }
+
   bool shapeCanOmitWeightForCacheFirstMembership() const {
     auto allSupported = [](std::span<Query*> clauses) {
       return std::all_of(

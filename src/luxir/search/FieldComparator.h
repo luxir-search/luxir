@@ -76,6 +76,18 @@ public:
       return {0, std::numeric_limits<int64_t>::min()};
     }
 
+    // Key floor of a value envelope: when every eligible doc has a value
+    // inside `values` (Query::requiredValueEnvelope), every eligible doc in
+    // this segment has a transformed key at or past the result - the
+    // envelope's best-side edge, transformed. nullopt when a doc's key need
+    // not come from a value inside the envelope (a multi-valued column keys
+    // on its first stored value while a predicate matches any value).
+    virtual std::optional<int64_t> keyFloor(
+        Query::ValueEnvelope values) const {
+      unused(values);
+      return std::nullopt;
+    }
+
     // Order-independent fused leaf gather: extract one leaf's in-domain docs
     // and transformed keys straight from the domain bitset, without a
     // doc-array round trip. `words` is the whole-segment bitset (word w
@@ -367,6 +379,15 @@ public:
     }
     int64_t leaf = reader->leafByMinAscending(rank);
     return {leaf, reader->leafZone(leaf).min};
+  }
+
+  // Envelope bounds are inclusive encoded values, the same encoding the
+  // column stores (FLOAT/DOUBLE sortable bits included), so the best edge
+  // is lo ascending and hi descending. A missing value never satisfies an
+  // envelope, so the missing substitute plays no part.
+  std::optional<int64_t> keyFloor(Query::ValueEnvelope values) const override {
+    if (!reader.has_value() || multiValued) return std::nullopt;
+    return transformPresent(sortMultiplier < 0 ? values.hi : values.lo);
   }
 
   // Dense single-valued only: doc == value rank and no forward-only landing

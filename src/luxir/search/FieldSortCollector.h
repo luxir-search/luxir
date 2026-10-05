@@ -183,6 +183,19 @@ public:
   int64_t candidateHi = -1;
   int64_t segmentSourceCost = 0;
   int32_t segmentMaxDoc = 0;
+  // Key floor of the domain: every doc this collector will see has a value
+  // of the primary sort column inside primaryValues (a request fact, from
+  // the query and filters; see TopDocsReq::sortValueEnvelope), so its
+  // primary key is at or past the comparator's KeyBatch::keyFloor of it.
+  // Per segment that clips the leaf bounds: leavesBeforeKeyFloor counts the
+  // leaves whose bound lies strictly before the floor. The heap bottom is
+  // always at or past the floor, so no bound-driven traversal can prove one
+  // of those leaves out: whatever the domain's density, each is visited.
+  // The clip only ever widens what is collected (visit-floor estimates, and
+  // one competitive range over a segment whose every leaf is clipped); it is
+  // never a skip rule, so an envelope can cost time but never results.
+  std::optional<Query::ValueEnvelope> primaryValues;
+  int64_t leavesBeforeKeyFloor = 0;
   bool leafDescentEnabled = false;
   int32_t nextProbeDoc = 0;
   bool candidatesDisabled = false;
@@ -285,17 +298,51 @@ public:
     // (measured at floor/leafCount ~0.99: a reproducible ~30% regression)
     // the few skippable leaves fragment producer ranges without paying for
     // the classifications. The 2x margin keeps the whole win at 1% and off
-    // through the boundary band.
+    // through the boundary band. Leaves before the key floor are visited
+    // whatever the density, so they floor the estimate.
     leafDescentEnabled = false;
+    leavesBeforeKeyFloor = 0;
     FieldComparator::KeyBatch* batch;
-    if (topCount > 0 && sourceCost > 0 && clauses[0].comparator != nullptr
+    if (topCount > 0 && clauses[0].comparator != nullptr
         && (batch = clauses[0].comparator->keyBatch()) != nullptr
         && batch->leafBlockSize() != 0) {
-      int64_t depth = (topCount * (int64_t)segmentMaxDoc + sourceCost - 1)
-          / sourceCost;
-      leafDescentEnabled = 2 * depth < batch->leafBlockCount();
+      leavesBeforeKeyFloor = countLeavesBeforeKeyFloor(*batch);
+      if (sourceCost > 0) {
+        int64_t depth = (topCount * (int64_t)segmentMaxDoc + sourceCost - 1)
+            / sourceCost;
+        leafDescentEnabled = 2 * std::max(depth, leavesBeforeKeyFloor)
+            < batch->leafBlockCount();
+      }
     }
     if (topCount > 0 && pq.size() == (size_t)topCount) setBottom();
+  }
+
+  // The primary key every doc of the current segment is at or past, in the
+  // comparator's transformed key space. Any other floor source (a key the
+  // request itself starts after) would combine here by max.
+  std::optional<int64_t> domainKeyFloor(
+      const FieldComparator::KeyBatch& batch) const {
+    if (!primaryValues.has_value()) return std::nullopt;
+    return batch.keyFloor(*primaryValues);
+  }
+
+  // Bound order ascends by bound, so the leaves bounded strictly before the
+  // key floor are a prefix of it: binary-search its length.
+  int64_t countLeavesBeforeKeyFloor(
+      const FieldComparator::KeyBatch& batch) const {
+    std::optional<int64_t> floor = domainKeyFloor(batch);
+    if (!floor.has_value()) return 0;
+    int64_t lo = 0;
+    int64_t hi = batch.leafBlockCount();
+    while (lo < hi) {
+      int64_t mid = lo + (hi - lo) / 2;
+      if (batch.boundOrderLeaf(mid).bound < *floor) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    return lo;
   }
 
   // COLUMN comparators bake direction into their stored values (sortMultiplier).
@@ -488,6 +535,13 @@ public:
       blockSize = batch->keyBlockSize();
     }
     if (blockSize == 0) return candidateRange(segment, from);
+    // Every leaf bounded before the key floor: no bound in this segment can
+    // prove anything, so the rest of it is one competitive range, and range
+    // ends need no re-consulting.
+    if (leavesBeforeKeyFloor != 0
+        && leavesBeforeKeyFloor == batch->leafBlockCount()) {
+      return {from, PostingsReader::END};
+    }
 
     int64_t block = (int64_t)from / blockSize;
     int64_t blockCount = batch->keyBlockCount();

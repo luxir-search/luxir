@@ -154,6 +154,10 @@ struct PointsMaterialize {
           outScores(pool.make_span<float>(docs.size())),
           constantScore(constantScore) {}
 
+    // Bounded windows of exact matches: the default matchNextWindow serves
+    // them, as the numeric predicate's bulk plan declares.
+    bool supportsMatchWindows() const override { return true; }
+
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {
       if (docs.empty() || min >= max
@@ -296,6 +300,8 @@ struct PointsMaterialize {
           outDocs(pool.make_span<int32_t>(WINDOW_SIZE)),
           outScores(pool.make_span<float>(WINDOW_SIZE)),
           constantScore(constantScore) {}
+
+    bool supportsMatchWindows() const override { return true; }
 
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {

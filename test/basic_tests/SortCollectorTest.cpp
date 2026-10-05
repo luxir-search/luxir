@@ -6,18 +6,21 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/search/FieldSortCollector.h"
 #include "luxir/search/SortField.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/schema/FieldType.h"
+#include "luxir/util/NumericUtils.h"
 #include "luxir/util/random.h"
 #include <algorithm>
 #include <array>
 #include <charconv>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <optional>
 #include <utility>
 
@@ -2769,6 +2772,104 @@ TEST_F(SortCollectorTest, boundOrderLeavesAscendByBoundThenLeaf) {
   }
 }
 
+// KeyBatch::keyFloor maps a value envelope to the best-side edge in the
+// comparator's key space (lo ascending, ~hi descending, FLOAT as sortable
+// bits), every doc inside the envelope gathers a key at or past it, and a
+// multi-valued column claims nothing. The collector's leavesBeforeKeyFloor
+// counts exactly the leaves whose bound lies before that floor, and a
+// segment with every leaf clipped is one competitive range.
+TEST_F(SortCollectorTest, keyFloorClipsValueEnvelopes) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 3 * 4096 + 300; doc++) {
+    int64_t key = (int64_t)(((uint32_t)doc * 2654435761u) % 100000) - 50000;
+    docs.push_back(flatdoc("id", std::to_string(doc), "key_i", key,
+                           "p_f", (double)key / 8.0, "mono_i", (int64_t)doc,
+                           "m_is", vec_i(key, key + 1)));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto& segment = reader->segments()[0];
+
+  auto floorOf = [&](std::string_view field, bool reversed,
+                     Query::ValueEnvelope values) {
+    SimpleNumericFieldComparator comparator(
+        std::string(field), reversed, FieldComparator::MISSING_LAST);
+    comparator.setSegment(segment.ord, &segment.postingsReader());
+    return comparator.keyBatch()->keyFloor(values);
+  };
+  EXPECT_EQ(std::optional<int64_t>(-100), floorOf("key_i", false, {-100, 700}));
+  EXPECT_EQ(std::optional<int64_t>(~(int64_t)700),
+            floorOf("key_i", true, {-100, 700}));
+  Query::ValueEnvelope prices{(int64_t)floatToSortableInt32(-12.5f),
+                              (int64_t)floatToSortableInt32(87.5f)};
+  EXPECT_EQ(std::optional<int64_t>(prices.lo), floorOf("p_f", false, prices));
+  EXPECT_EQ(std::optional<int64_t>(~prices.hi), floorOf("p_f", true, prices));
+  EXPECT_FALSE(floorOf("m_is", false, {-100, 700}).has_value());
+  EXPECT_FALSE(floorOf("absent_i", false, {-100, 700}).has_value());
+
+  // Uniform keys clip every leaf; doc-ordered keys clip only the leaves
+  // past the envelope's best edge (docs 0-4999 ascending, 9001+ descending).
+  struct Case {
+    std::string_view field;
+    Query::ValueEnvelope values;
+  };
+  for (Case c : {Case{"key_i", {-20000, 9000}}, Case{"p_f", prices},
+                 Case{"mono_i", {5000, 9000}}}) {
+    for (bool reversed : {false, true}) {
+      std::string_view field = c.field;
+      Query::ValueEnvelope values = c.values;
+      bool isFloat = field == "p_f";
+      FloatFieldType floatType(field);
+      IntFieldType intType(field);
+      SortField sortField(field,
+                          isFloat ? (FieldType&)floatType : (FieldType&)intType,
+                          reversed ? SortField::DESC : SortField::ASC);
+      FieldSortCollector collector(10, columnPlan(sortField));
+      collector.primaryValues = values;
+      collector.setSegment(segment.ord, &segment.postingsReader());
+      auto* batch = collector.clauses[0].comparator->keyBatch();
+      ASSERT_NE(0, batch->leafBlockSize());
+      int64_t floor = *batch->keyFloor(values);
+      int64_t clipped = 0;
+      for (int64_t leaf = 0; leaf < batch->leafBlockCount(); leaf++) {
+        clipped += batch->leafBestKey(leaf) < floor;
+      }
+      EXPECT_EQ(clipped, collector.leavesBeforeKeyFloor)
+          << field << " reversed=" << reversed;
+      int64_t leaves = batch->leafBlockCount();
+      int64_t expected = field != "mono_i" ? leaves
+          : reversed ? leaves - 9001 / 512 : (5000 + 511) / 512;
+      EXPECT_EQ(expected, clipped) << field << " reversed=" << reversed;
+      // A fully clipped segment is one competitive range; otherwise the
+      // empty heap warms up block by block.
+      EXPECT_EQ(clipped == leaves ? PostingsReader::END : 4096,
+                collector.nextCompetitiveRange(segment.ord, 0).end)
+          << field << " reversed=" << reversed;
+      // Every in-envelope doc's key is at or past the floor.
+      std::vector<int32_t> all(segment.maxDoc());
+      std::iota(all.begin(), all.end(), 0);
+      std::vector<int64_t> keys(all.size());
+      batch->gatherKeys(all, keys);
+      SimpleNumericFieldComparator raw(std::string(field), false,
+                                       FieldComparator::MISSING_LAST);
+      raw.setSegment(segment.ord, &segment.postingsReader());
+      std::vector<int64_t> stored(all.size());
+      raw.keyBatch()->gatherKeys(all, stored);
+      for (size_t doc = 0; doc < all.size(); doc++) {
+        if (stored[doc] < values.lo || stored[doc] > values.hi) continue;
+        ASSERT_GE(keys[doc], floor) << field << " doc=" << doc;
+      }
+    }
+  }
+  // Without an envelope nothing is clipped.
+  IntFieldType intType("key_i");
+  SortField sortField("key_i", intType, SortField::DESC);
+  FieldSortCollector collector(10, columnPlan(sortField));
+  collector.setSegment(segment.ord, &segment.postingsReader());
+  EXPECT_EQ(0, collector.leavesBeforeKeyFloor);
+}
+
 // The best-first exact-domain driver must return exactly what the doc-order
 // windowed path and exhaustive collection return. Its bitset domain arrives
 // two ways: the folded filter-only Boolean's cached set (delete-free
@@ -2981,6 +3082,16 @@ TEST_F(SortCollectorTest, exactDomainSortCostsCrossover) {
   EXPECT_TRUE(Costs::boundOrderKeepsPaying(252, 4, 10, 100000, kLeaves));
   EXPECT_TRUE(Costs::boundOrderKeepsPaying(252, 1, 10, 100000, kLeaves));
   EXPECT_FALSE(Costs::boundOrderKeepsPaying(2000, 1, 10, 100000, kLeaves));
+  // Clipped leaves precede every proof: the first checkpoint waits past
+  // them, and the projection counts them once instead of scaling them by
+  // the proof rate.
+  EXPECT_EQ(16, Costs::firstCheckpoint(2, 0, 1));
+  EXPECT_EQ(136, Costs::firstCheckpoint(2, 128, 1));
+  EXPECT_EQ(1007, Costs::firstCheckpoint(2517, 0, 10));
+  EXPECT_EQ(3007, Costs::firstCheckpoint(2517, 2000, 10));
+  EXPECT_FALSE(Costs::boundOrderKeepsPaying(2252, 1, 10, 100000, kLeaves));
+  EXPECT_TRUE(
+      Costs::boundOrderKeepsPaying(2252, 1, 10, 100000, kLeaves, 2000));
 }
 
 // The exact-domain driver picks its phases by cost (ExactDomainSortCosts).
@@ -3066,6 +3177,126 @@ TEST_F(SortCollectorTest, bestFirstRouteFollowsCostModel) {
             << value << " limit=" << limit;
         EXPECT_EQ(exhaustive.ids, run(value, dir, limit, false, true).ids)
             << value << " limit=" << limit;
+      }
+    }
+  }
+}
+
+// A range on the sort field itself puts every domain key at or past the
+// range's best-side edge, so leaves bounded before it can never be proven
+// out (k = 1, one 256-leaf segment, values over [0, 2^20)). Uniform keys
+// under a DESC sort over the lower half clip every leaf: a BITSET domain
+// sweeps in doc order from the start, and an ARRAY domain (a 1.5% range)
+// leaves the exact-domain driver for the ladder. Doc-ordered keys over the
+// same range clip only the upper half's leaves: bound order still visits
+// them first, and its first progress checkpoint waits past them, so it
+// proves instead of handing off. ASC over the same range clips nothing. The
+// clip holds for the points-indexed and the column-only field, for a folded
+// filter (the cached range set) and an unfolded one (a collector filter
+// under match-all), and for a query's resident whole membership; every
+// route matches exhaustive collection.
+TEST_F(SortCollectorTest, rangeOnSortFieldClipsBoundOrder) {
+  WholeMembershipPlanGuard wholeGuard(true);
+  CollectionHelper helper("range_clip");
+  SchemaBuilder schema;
+  for (std::string_view name : {"rnd_pt", "mono_pt"}) {
+    auto& field = schema.field(name);
+    field.type = luxir::api::FieldDef::FieldClass::INT;
+    field.index = luxir::api::FieldDef::IndexMode::RANGE;
+  }
+  schema.set(helper.collection());
+  constexpr int32_t kDocs = 256 * 512;
+  constexpr int64_t kHalf = 1 << 19;
+  for (int32_t docId = 0; docId < kDocs; docId++) {
+    int64_t rnd = (int64_t)(((uint32_t)docId * 2654435761u) >> 12);
+    int64_t mono = (int64_t)docId * 8;
+    helper.index(flatdoc("id", std::to_string(docId),
+                         "id_s", std::to_string(docId),
+                         "body_w", docId % 2 == 0 ? "even" : "odd",
+                         "rnd_i", rnd, "rnd_pt", rnd,
+                         "mono_i", mono, "mono_pt", mono),
+                 UpdateMessage::NO_COMMIT);
+  }
+  helper.commit();
+
+  struct Result {
+    std::vector<std::string> ids;
+    int64_t sweeps = 0;
+    int64_t boundOrder = 0;
+    int64_t proofs = 0;
+    int64_t handoffs = 0;
+  };
+  enum class Domain { FOLDED, UNFOLDED, WHOLE };
+  auto run = [&](std::string_view field, qb::SortDir dir, int64_t hi,
+                 int32_t limit, Domain domain = Domain::FOLDED,
+                 bool disablePruning = false) {
+    SortPruningGuard pruningGuard(disablePruning);
+    TopDocsFilterFoldGuard foldGuard(domain == Domain::UNFOLDED);
+    WholeMembershipPlanGuard whole(domain != Domain::WHOLE);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("range_clip");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    if (domain == Domain::WHOLE) {
+      cur.matchQuery("body_w", "even");
+    } else {
+      cur.allQuery();
+    }
+    cur.filter(qb::range(cur.mr(), field, qb::valI64(cur.mr(), 0), nullptr,
+                         qb::valI64(cur.mr(), hi - 1), nullptr));
+    qb::sort(cur, field, dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{resultIds(*req), SkipStats::fieldSortDocOrderSweeps,
+                  SkipStats::fieldSortBestFirstActivations,
+                  SkipStats::fieldSortBestFirstTerminations,
+                  SkipStats::fieldSortBestFirstFallbacks};
+  };
+  constexpr int64_t kSparse = kHalf / 32;  // a 1.5% range: an ARRAY domain
+  for (std::string_view field : {"rnd_i", "rnd_pt", "mono_i", "mono_pt"}) {
+    for (int64_t hi : {kHalf, kSparse}) {
+      run(field, qb::DESC, hi, 1);  // two sightings admit the filter
+      run(field, qb::DESC, hi, 1);
+    }
+  }
+
+  for (std::string_view field : {"rnd_i", "rnd_pt"}) {
+    auto bitset = run(field, qb::DESC, kHalf, 1);
+    EXPECT_EQ(1, bitset.sweeps) << field;
+    EXPECT_EQ(0, bitset.boundOrder) << field;
+    auto unfolded = run(field, qb::DESC, kHalf, 1, Domain::UNFOLDED);
+    EXPECT_EQ(1, unfolded.sweeps) << field;
+    EXPECT_EQ(0, unfolded.boundOrder) << field;
+    auto array = run(field, qb::DESC, kSparse, 1);
+    EXPECT_EQ(0, array.sweeps) << field;
+    EXPECT_EQ(0, array.boundOrder) << field;
+    auto ascending = run(field, qb::ASC, kHalf, 1);
+    EXPECT_EQ(1, ascending.boundOrder) << field;
+    EXPECT_EQ(1, ascending.proofs) << field;
+  }
+  for (std::string_view field : {"mono_i", "mono_pt"}) {
+    auto correlated = run(field, qb::DESC, kHalf, 1);
+    EXPECT_EQ(0, correlated.sweeps) << field;
+    EXPECT_EQ(1, correlated.boundOrder) << field;
+    EXPECT_EQ(1, correlated.proofs) << field;
+    EXPECT_EQ(0, correlated.handoffs) << field;
+  }
+  run("rnd_i", qb::DESC, kHalf, 1, Domain::WHOLE);
+  auto resident = run("rnd_i", qb::DESC, kHalf, 1, Domain::WHOLE);
+  EXPECT_EQ(1, resident.sweeps);
+  EXPECT_EQ(0, resident.boundOrder);
+
+  for (std::string_view field : {"rnd_i", "rnd_pt", "mono_i", "mono_pt"}) {
+    for (int64_t hi : {kHalf, kSparse}) {
+      for (qb::SortDir dir : {qb::DESC, qb::ASC}) {
+        for (Domain domain : {Domain::FOLDED, Domain::UNFOLDED, Domain::WHOLE}) {
+          for (int32_t limit : {1, 10, 300}) {
+            auto exhaustive = run(field, dir, hi, limit, domain, true);
+            EXPECT_EQ(exhaustive.ids, run(field, dir, hi, limit, domain).ids)
+                << field << " hi=" << hi << " limit=" << limit
+                << " domain=" << (int)domain;
+          }
+        }
       }
     }
   }
