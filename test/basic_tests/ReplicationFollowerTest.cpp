@@ -1619,4 +1619,35 @@ TEST_F(ReplicationFollowerTest, followersFetchFilesFromPeersAndVerifyAnnouncemen
   EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
 }
 
+TEST_F(ReplicationFollowerTest, corruptPeerCopiesAreFetchedAgainFromTheSource) {
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto installed = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+  auto largest = std::ranges::max_element(installed->files, {}, &FileDescriptor::size);
+  {
+    // Same size, different bytes: the peer still offers it by identity.
+    std::fstream file(path / "follower" / "c" / "default" / "main" / installed->id.incarnation / largest->name,
+                      std::ios::in | std::ios::out | std::ios::binary);
+    char byte = 0;
+    file.read(&byte, 1);
+    file.seekp(0);
+    byte = (char)~byte;
+    file.write(&byte, 1);
+  }
+  std::atomic<int> fromSource{0};
+  Signal::listen("replicationFileOpened", [&](void*, void*, void*) -> void* { fromSource++; return nullptr; });
+  auto unlisten = scope_guard([] { Signal::unlisten("replicationFileOpened"); });
+  auto second = followerConfig;
+  second.store.data_dir = (path / "second").string();
+  second.replication.peers = "http://127.0.0.1:" + std::to_string(followerServer->getPort());
+  LuxirNode peerFed(second);
+  ASSERT_TRUE(until([&] {
+    try { return peerFed.getCollection("main")->getShard()->getSnapshots().snapshot()->id == installed->id; }
+    catch (const CollectionResolutionError&) { return false; }
+  }));
+  EXPECT_EQ(2, peerFed.getCollection("main")->getReaderManager().getReader()->liveDocs());
+  EXPECT_GT(fromSource.load(), 0);
+}
+
 }
