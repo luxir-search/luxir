@@ -16,6 +16,13 @@ std::string copySnapshot(CollectionStorage& storage, std::string_view from, cons
   auto info = Manifest::decode(manifest.bytes, arena);
   auto files = filesOf(info);
   next->reuseFiles(*old, files, files);
+  // The new root may reference only files that are present in full.
+  std::vector<Directory::FileInfo> listing;
+  next->listFiles(listing);
+  for (const auto& file : files) {
+    auto present = std::ranges::find_if(listing, [&](const auto& entry) { return entry.name == file.name; });
+    if (present == listing.end() || present->size != file.size) throw std::runtime_error("snapshot copy is missing " + file.name);
+  }
   std::array<std::string, 1> directory{"."};
   next->sync(directory);
   info.incarnation = incarnation;

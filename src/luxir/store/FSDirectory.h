@@ -340,8 +340,14 @@ public:
     std::filesystem::create_hard_link(fs.filePath(name), filePath(name));
   }
 
-  explicit FSDirectory(const std::filesystem::path& path) : basePath_(path) {
-    std::filesystem::create_directories(basePath_);
+  // Without `create`, the directory must already exist: opening never
+  // re-creates a directory removed concurrently.
+  explicit FSDirectory(const std::filesystem::path& path, bool create = true) : basePath_(path) {
+    if (create) std::filesystem::create_directories(basePath_);
+    else if (!std::filesystem::is_directory(basePath_)) {
+      throw std::filesystem::filesystem_error("directory does not exist", basePath_,
+          std::make_error_code(std::errc::no_such_file_or_directory));
+    }
   }
 
   void listFiles(std::vector<FileInfo>& target) override {
@@ -365,15 +371,19 @@ public:
   std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
     unused(expectSynced);
     auto path = filePath(name);
+    // Only absence is a null result; an unreadable file is an error, never
+    // evidence that the file does not exist.
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
-      return {};
+      if (errno == ENOENT) return {};
+      throw FileIOException("FSDirectory::openFile: open failed for " + path.string() + ": " + strerror(errno));
     }
 
     struct stat st;
     if (fstat(fd, &st) < 0) {
+      int error = errno;
       ::close(fd);
-      return {};
+      throw FileIOException("FSDirectory::openFile: fstat failed for " + path.string() + ": " + strerror(error));
     }
 
     auto sz = (size_t)st.st_size;
@@ -384,8 +394,9 @@ public:
 
     void* mapped = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
     if (mapped == MAP_FAILED) {
+      int error = errno;
       ::close(fd);
-      return {};
+      throw FileIOException("FSDirectory::openFile: mmap failed for " + path.string() + ": " + strerror(error));
     }
 
     ::close(fd);

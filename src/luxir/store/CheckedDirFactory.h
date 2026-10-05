@@ -147,16 +147,15 @@ class CheckedDirFactory : public DirectoryFactory {
   CheckedDirMode mode_;
   bool verbose_;
   std::mutex mu_;
-  // Reopening a directory must not forget which of its files are unsynced.
-  // Keys are collection or collection/incarnation; removal forgets them.
-  std::map<std::string, std::weak_ptr<CheckedDirectory>, std::less<>> opened_;
+  // Reopening a directory must not forget which of its files are unsynced, so
+  // wrappers live until their namespace is removed. Keys are collection or
+  // collection/incarnation.
+  std::map<std::string, std::shared_ptr<CheckedDirectory>, std::less<>> opened_;
 
   std::shared_ptr<Directory> wrap(std::string key, std::shared_ptr<Directory> dir) {
     std::lock_guard lock(mu_);
-    auto& weak = opened_[std::move(key)];
-    if (auto existing = weak.lock()) return existing;
-    auto checked = std::make_shared<CheckedDirectory>(std::move(dir), mode_, verbose_);
-    weak = checked;
+    auto& checked = opened_[std::move(key)];
+    if (!checked) checked = std::make_shared<CheckedDirectory>(std::move(dir), mode_, verbose_);
     return checked;
   }
 

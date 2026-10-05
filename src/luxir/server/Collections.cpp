@@ -85,8 +85,42 @@ Collections::Collections(const LuxirConfig& config, CollectionEvents& events, In
 
 Collections::~Collections() = default;
 
-std::mutex& Collections::lifecycleLock(std::string_view name) {
-  return lifecycleLocks[std::hash<std::string_view>{}(name) % lifecycleLocks.size()];
+Collections::Transition::Transition(Collections& owner, std::string name) : owner(owner), name(std::move(name)) {
+  std::lock_guard lock(owner.slotsMutex);
+  auto& slot = owner.slots[this->name];
+  if (slot.busy) throw CollectionUnavailableError("collection '" + this->name + "' is changing");
+  slot.busy = true;
+}
+
+Collections::Transition::~Transition() {
+  std::lock_guard lock(owner.slotsMutex);
+  auto it = owner.slots.find(name);
+  it->second.busy = false;
+  if (it->second.leased.empty() && it->second.retained.empty()) owner.slots.erase(it);
+}
+
+void Collections::release(const std::string& name, const std::string& incarnation) noexcept {
+  std::lock_guard lock(slotsMutex);
+  auto it = slots.find(name);
+  if (it == slots.end()) return;
+  if (auto leased = it->second.leased.find(incarnation); leased != it->second.leased.end()) it->second.leased.erase(leased);
+  if (!it->second.busy && it->second.leased.empty() && it->second.retained.empty()) slots.erase(it);
+}
+
+void Collections::retire(const std::string& name, const std::string& selected) noexcept {
+  try {
+    auto storage = factory->collection(name);
+    for (const auto& incarnation : storage.incarnations()) {
+      if (incarnation == selected) continue;
+      {
+        std::lock_guard lock(slotsMutex);
+        auto it = slots.find(name);
+        if (it != slots.end() && (it->second.leased.contains(incarnation) || it->second.retained.contains(incarnation))) continue;
+      }
+      try { storage.removeIncarnation(incarnation); }
+      catch (const std::exception& e) { LOG_WARN("Incarnation cleanup '{}/{}' failed: {}", name, incarnation, e.what()); }
+    }
+  } catch (const std::exception& e) { LOG_WARN("Incarnation cleanup '{}' failed: {}", name, e.what()); }
 }
 
 bool Collections::reclaimStorage() {
@@ -158,7 +192,7 @@ std::shared_ptr<Collection> Collections::initWriter(const std::string& name, std
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
   if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
   if (creating) storage.select(*selected);
-  storage.retainOnly(*selected);
+  retire(name, *selected);
   observe(name, *col);
   Signal::emit("collectionInitialized", col.get());
   return col;
@@ -203,8 +237,9 @@ std::vector<Collections::Opened> Collections::open(Role role) {
           continue;
         }
       }
-      std::lock_guard lock(lifecycleLock(name));
-      row.collection = map.getOrCreate(name, [&] { return openCollection(name, role, row.incarnation); });
+      auto collection = openCollection(name, role, row.incarnation);
+      if (!map.insert(name, collection)) throw std::logic_error("collection opened twice");
+      row.collection = std::move(collection);
       events.registered(name, row.collection);
       LOG_INFO("Loaded collection: {}", name);
     } catch (const std::exception& e) {
@@ -213,6 +248,13 @@ std::vector<Collections::Opened> Collections::open(Role role) {
       LOG_ERROR("Failed to load collection '{}': {}", name, e.what());
       row.error = "failed to load: " + std::string(e.what());
       row.collection = unavailable(name, row.error);
+      // Whatever CURRENT selects (or failed to say) is kept until an
+      // installation replaces the copy.
+      if (role == Role::FOLLOWER) try {
+        auto incarnations = factory->collection(name).incarnations();
+        std::lock_guard lock(slotsMutex);
+        slots[name].retained.insert(incarnations.begin(), incarnations.end());
+      } catch (const std::exception& listing) { LOG_WARN("Cannot list incarnations of '{}': {}", name, listing.what()); }
     }
     rows.push_back(std::move(row));
   }
@@ -220,11 +262,10 @@ std::vector<Collections::Opened> Collections::open(Role role) {
 }
 
 std::shared_ptr<Collection> Collections::unavailable(const std::string& name, std::string reason) {
-  std::lock_guard lock(lifecycleLock(name));
-  bool created = false;
-  auto collection = map.getOrCreate(name, [&] { created = true; return Collection::placeholder(name, std::move(reason)); });
-  if (created) events.registered(name, collection);
-  return collection;
+  auto placeholder = Collection::placeholder(name, std::move(reason));
+  if (!map.insert(name, placeholder)) return map.get(name);
+  events.registered(name, placeholder);
+  return placeholder;
 }
 
 std::shared_ptr<Collection> Collections::getOrCreate(std::string_view name, bool autoCreate) {
@@ -232,9 +273,6 @@ std::shared_ptr<Collection> Collections::getOrCreate(std::string_view name, bool
   validateName(key);
   if (auto existing = map.get(key)) return existing;
   if (!autoCreate) throw CollectionNotFoundError("collection '" + key + "' does not exist");
-  // Take the lifecycle lock outside the map's creation slot, as every
-  // transition does, so the two can never be acquired in opposite orders.
-  std::lock_guard lock(lifecycleLock(key));
   bool created = false;
   auto collection = map.getOrCreate(key, [&] {
     auto col = initWriter(key);
@@ -249,7 +287,6 @@ std::shared_ptr<Collection> Collections::getOrCreate(std::string_view name, bool
 std::shared_ptr<Collection> Collections::create(std::string_view name, const api::SchemaDef* schema) {
   std::string key(name);
   validateName(key);
-  std::lock_guard lock(lifecycleLock(key));
   bool createdHere = false;
   std::exception_ptr createFailure;
   auto collection = map.getOrCreate(key, [&]() {
@@ -292,31 +329,27 @@ void Collections::remove(std::string_view name, bool mustExist) {
   // and a tombstoned legacy-named collection must stay deletable.
   std::string key(name);
   auto storage = factory->collection(key);
-  std::shared_ptr<Collection> collection, deleting;
+  Transition transition(*this, key);
   {
-    std::lock_guard lock(lifecycleLock(key));
-    collection = map.get(key);
-    if (!collection) {
-      if (mustExist) {
-        validateName(key);
-        throw CollectionNotFoundError("collection '" + key + "' does not exist");
-      }
-      storage.remove();
-      return;
-    }
-    if (collection->unavailableReason == DELETING_REASON) {
-      throw CollectionUnavailableError("collection '" + key + "' is unavailable: being deleted");
-    }
-    // The placeholder holds the name through the slow part: every other
-    // transition sees it and stays out.
-    deleting = Collection::placeholder(key, std::string(DELETING_REASON));
-    if (!map.replace(key, collection, deleting)) {
-      throw CollectionUnavailableError("collection '" + key + "' changed while deletion started");
-    }
-    events.registered(key, deleting);
+    std::lock_guard lock(slotsMutex);
+    if (!slots[key].leased.empty()) throw CollectionUnavailableError("collection '" + key + "' has a staged replacement");
   }
+  auto collection = map.get(key);
+  if (!collection) {
+    if (mustExist) {
+      validateName(key);
+      throw CollectionNotFoundError("collection '" + key + "' does not exist");
+    }
+    storage.remove();
+    return;
+  }
+  // The placeholder answers resolution while the transition holds the name.
+  auto deleting = Collection::placeholder(key, std::string(DELETING_REASON));
+  if (!map.replace(key, collection, deleting)) {
+    throw CollectionUnavailableError("collection '" + key + "' changed while deletion started");
+  }
+  events.registered(key, deleting);
   auto fail = [&](std::string reason) {
-    std::lock_guard lock(lifecycleLock(key));
     auto failed = Collection::placeholder(key, "delete failed: " + reason);
     if (map.replace(key, deleting, failed)) events.registered(key, failed);
   };
@@ -333,7 +366,10 @@ void Collections::remove(std::string_view name, bool mustExist) {
     fail("unknown non-standard exception");
     throw;
   }
-  std::lock_guard lock(lifecycleLock(key));
+  {
+    std::lock_guard lock(slotsMutex);
+    slots[key].retained.clear();
+  }
   if (!map.erase(key, deleting)) {
     throw std::runtime_error("collection '" + key + "' tombstone disappeared during deletion");
   }
@@ -342,49 +378,88 @@ void Collections::remove(std::string_view name, bool mustExist) {
 
 Collections::Candidate Collections::stage(std::string_view name, std::string_view incarnation) {
   std::string key(name);
-  return Candidate(key, std::string(incarnation), makeCollection(key, factory->collection(key).create(incarnation)));
+  {
+    std::lock_guard lock(slotsMutex);
+    slots[key].leased.insert(std::string(incarnation));
+  }
+  auto lease = std::unique_ptr<Lease>(new Lease{*this, key, std::string(incarnation)});
+  auto collection = makeCollection(key, factory->collection(key).create(incarnation));
+  return Candidate(key, std::string(incarnation), std::move(collection), std::move(lease));
 }
 
-std::shared_ptr<Collection> Collections::install(Candidate candidate, const std::shared_ptr<Collection>& expected) {
+Collections::Prepared Collections::prepare(Candidate& candidate, std::shared_ptr<const CommitSnapshot> snapshot) {
+  if (snapshot->id.incarnation != candidate.incarnation_) throw std::logic_error("snapshot of another incarnation");
+  auto& registry = candidate.collection_->getShard()->getSnapshots();
+  // An interrupted activation may already have committed this snapshot.
+  auto committed = registry.snapshot();
+  if (!committed || committed->id != snapshot->id) {
+    auto opened = registry.readers.prepare(*snapshot);
+    registry.commit(std::move(snapshot), std::move(opened));
+  }
+  return Prepared(std::move(candidate));
+}
+
+std::shared_ptr<Collection> Collections::install(Prepared prepared, const std::shared_ptr<Collection>& expected) {
+  auto& candidate = prepared.candidate;
   const auto& name = candidate.name_;
-  auto collection = std::move(candidate.collection_);
-  auto snapshot = collection->shard->snapshots->snapshot();
-  if (!snapshot || snapshot->id.incarnation != candidate.incarnation_) {
-    throw std::logic_error("installing a candidate without its committed snapshot");
-  }
+  const auto& incarnation = candidate.incarnation_;
+  auto collection = candidate.collection_;
   auto storage = factory->collection(name);
-  {
-    std::lock_guard lock(lifecycleLock(name));
-    if (map.get(name) != expected) throw std::runtime_error("collection changed during installation");
-    // The commit point: nothing changed before it if selection fails.
-    if (storage.current() != candidate.incarnation_) storage.select(candidate.incarnation_);
-    observe(name, *collection);
-    bool registered = expected ? map.replace(name, expected, collection)
-                               : map.getOrCreate(name, [&] { return collection; }) == collection;
-    if (!registered) throw std::runtime_error("collection changed during installation");
-    events.registered(name, collection);
+  Transition transition(*this, name);
+  if (map.get(name) != expected) throw std::runtime_error("collection changed during installation");
+  // Allocate what registration needs before the commit point.
+  observe(name, *collection);
+  std::shared_ptr<Collection> reserved;
+  if (!expected) {
+    reserved = Collection::placeholder(name, "being installed");
+    if (!map.insert(name, reserved)) throw std::runtime_error("collection changed during installation");
   }
+  // The commit point. Selection is rewritten and synced even if CURRENT
+  // already names the candidate: an earlier attempt may have renamed it into
+  // place without making it durable. On failure nothing is retired.
+  try { storage.select(incarnation); }
+  catch (...) {
+    if (reserved) map.erase(name, reserved);
+    throw;
+  }
+  // The transition owns the name, so the entry is still the expected one.
+  map.replace(name, reserved ? reserved : expected, collection);
+  events.registered(name, collection);
   if (auto shard = expected ? expected->getShard() : nullptr) shard->snapshots->detach();
-  storage.retainOnly(candidate.incarnation_);
+  {
+    std::lock_guard lock(slotsMutex);
+    slots[name].retained.clear();
+  }
+  candidate.lease.reset();
+  retire(name, incarnation);
   return collection;
 }
 
 void Collections::retainSelected(const std::string& name) noexcept {
   try {
-    auto storage = factory->collection(name);
-    if (auto selected = storage.current()) storage.retainOnly(*selected);
-  } catch (const std::exception& e) { LOG_WARN("Incarnation cleanup '{}' failed: {}", name, e.what()); }
+    Transition transition(*this, name);
+    if (auto selected = factory->collection(name).current()) retire(name, *selected);
+  } catch (const std::exception& e) { LOG_WARN("Incarnation cleanup '{}' skipped: {}", name, e.what()); }
 }
 
 void Collections::discard(Candidate& candidate) noexcept {
   if (!candidate.collection_) return;
   candidate.collection_->shard->snapshots->close();
   candidate.collection_.reset();
+  candidate.lease.reset();
   try {
+    Transition transition(*this, candidate.name_);
     auto storage = factory->collection(candidate.name_);
-    if (storage.current() != candidate.incarnation_) storage.removeIncarnation(candidate.incarnation_);
+    // An unreadable CURRENT keeps the directory: it may be the selected one.
+    if (storage.current() == candidate.incarnation_) return;
+    {
+      std::lock_guard lock(slotsMutex);
+      auto it = slots.find(candidate.name_);
+      if (it != slots.end() && (it->second.leased.contains(candidate.incarnation_) || it->second.retained.contains(candidate.incarnation_))) return;
+    }
+    storage.removeIncarnation(candidate.incarnation_);
   } catch (const std::exception& e) {
-    LOG_WARN("Candidate cleanup '{}/{}' failed: {}", candidate.name_, candidate.incarnation_, e.what());
+    LOG_WARN("Candidate cleanup '{}/{}' skipped: {}", candidate.name_, candidate.incarnation_, e.what());
   }
 }
 

@@ -260,16 +260,14 @@ public:
 
   std::shared_ptr<Directory> container(std::string_view name, bool create) override {
     auto path = collectionsPath_ / name;
-    if (create) makeDirectory(path);
-    else if (!std::filesystem::is_directory(path)) throw std::runtime_error("collection directory does not exist: " + path.string());
-    return std::make_shared<FSDirectory>(path);
+    if (create) ensureDirectory(path);
+    return std::make_shared<FSDirectory>(path, false);
   }
 
   std::shared_ptr<Directory> incarnation(std::string_view name, std::string_view incarnation, bool create) override {
     auto path = collectionsPath_ / name / incarnation;
-    if (create) { makeDirectory(path.parent_path()); makeDirectory(path); }
-    else if (!std::filesystem::is_directory(path)) throw std::runtime_error("incarnation directory does not exist: " + path.string());
-    return std::make_shared<FSDirectory>(path);
+    if (create) { ensureDirectory(path.parent_path()); ensureDirectory(path); }
+    return std::make_shared<FSDirectory>(path, false);
   }
 
   void createCollection(std::string_view name) override {
@@ -279,7 +277,12 @@ public:
       throw std::filesystem::filesystem_error("collection directory already exists", path,
           std::make_error_code(std::errc::file_exists));
     }
-    syncDirectory(collectionsPath_);
+    try { syncDirectory(collectionsPath_); }
+    catch (...) {
+      std::error_code ignored;
+      std::filesystem::remove(path, ignored); // not created, as far as the caller knows
+      throw;
+    }
   }
 
   std::vector<std::string> incarnations(std::string_view name) override { return directoriesIn(collectionsPath_ / name); }
@@ -292,7 +295,7 @@ public:
   void remove(std::string_view name) override {
     auto path = collectionsPath_ / name;
     if (std::filesystem::exists(path / "CURRENT")) {
-      FSDirectory container(path);
+      FSDirectory container(path, false);
       container.deleteFile("CURRENT");
       syncDirectory(path);
     }
@@ -303,13 +306,18 @@ public:
 private:
   static void syncDirectory(const std::filesystem::path& path) {
     std::array<std::string, 1> directory{"."};
-    FSDirectory(path).sync(directory);
+    FSDirectory(path, false).sync(directory);
   }
-  // Creates `path` if missing and makes its entry in the parent durable.
-  void makeDirectory(const std::filesystem::path& path) {
-    if (std::filesystem::is_directory(path)) return;
-    if (unowned) throw ReadOnlyError("directory does not exist: " + path.string());
-    if (std::filesystem::create_directory(path)) syncDirectory(path.parent_path());
+  // Creates `path` if missing and makes its entry in the parent durable. The
+  // parent is synced even for an existing entry: an earlier creation may have
+  // failed after mkdir, before its entry was durable.
+  void ensureDirectory(const std::filesystem::path& path) {
+    if (unowned) {
+      if (std::filesystem::is_directory(path)) return;
+      throw ReadOnlyError("directory does not exist: " + path.string());
+    }
+    std::filesystem::create_directory(path);
+    syncDirectory(path.parent_path());
   }
   static std::vector<std::string> directoriesIn(const std::filesystem::path& path) {
     std::vector<std::string> result;

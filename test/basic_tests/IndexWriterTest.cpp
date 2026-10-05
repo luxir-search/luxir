@@ -2874,7 +2874,7 @@ TEST_F(IndexWriterTest, manifestEnospcLeavesWriterUsable) {
   CommitSnapshotRegistry writerSnapshots(dir);
   IndexWriter writer(writerSnapshots);
   auto before = test::readDurableIndexInfo(dir);
-  std::filesystem::create_symlink("/dev/full", path / (Manifest::name(before->index_gen + 1) + ".tmp"));
+  std::filesystem::create_symlink("/dev/full", path / (Manifest::name(before->index_gen + 1) + ".pending.tmp"));
   addDoc(writer);
   EXPECT_THROW(writer.commit(), std::runtime_error);
   EXPECT_FALSE(writer.isClosed());

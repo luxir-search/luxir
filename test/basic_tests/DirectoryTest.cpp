@@ -10,6 +10,9 @@
 #include "luxir/store/Directory.h"
 #include "luxir/store/FSDirectory.h"
 #include "luxir/store/CheckedDirFactory.h"
+#include "luxir/store/Manifest.h"
+#include "luxir/util/Signal.h"
+#include <unistd.h>
 #include "test/LuxirTest.h"
 
 using namespace luxir;
@@ -443,10 +446,33 @@ TEST_F(DirectoryTest, collectionStorageOpensWithoutCreating) {
 TEST_F(DirectoryTest, checkedStorageRemembersUnsyncedFilesAcrossOpens) {
   CheckedDirFactory factory(std::make_unique<RAMDirFactory>(), CheckedDirMode::THROW);
   auto storage = factory.collection("main");
-  auto first = storage.create("first"); // the owner keeps it open
-  addFile(*first, "data", "bytes");
+  addFile(*storage.create("first"), "data", "bytes");
   EXPECT_THROW(storage.open("first")->openFile("data", true), std::runtime_error);
   std::array<std::string, 1> names{"data"};
   storage.open("first")->sync(names);
   EXPECT_NE(nullptr, storage.open("first")->openFile("data", true));
+}
+
+TEST_F(DirectoryTest, unreadableFileIsAnErrorNotAbsence) {
+  auto path = getTempDir();
+  FSDirectory dir(path);
+  addFile(dir, "secret", "bytes");
+  std::filesystem::permissions(path / "secret", std::filesystem::perms::none);
+  if (::access((path / "secret").c_str(), R_OK) != 0) { // not as root
+    EXPECT_THROW(dir.openFile("secret"), FileIOException);
+  }
+  EXPECT_EQ(nullptr, dir.openFile("absent"));
+  std::filesystem::remove_all(path);
+}
+
+TEST_F(DirectoryTest, manifestCommitKeepsAnExistingRootOnFailure) {
+  RAMDir dir;
+  std::vector<std::byte> original(8, std::byte{1}), replacement(8, std::byte{2});
+  Manifest::write(dir, 3, original);
+  Signal::listen("manifestWritten", [](void*, void*, void*) -> void* { throw std::runtime_error("injected"); });
+  EXPECT_THROW(Manifest::commit(dir, 3, replacement), std::runtime_error);
+  Signal::unlisten("manifestWritten");
+  auto input = dir.openFile(Manifest::name(3))->getInputStream();
+  EXPECT_EQ(std::byte{1}, *(const std::byte*)input.ptr());
+  EXPECT_EQ(nullptr, dir.openFile(Manifest::name(3) + ".pending"));
 }

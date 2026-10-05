@@ -347,7 +347,7 @@ struct ReplicationFollower::Impl {
   // only updates desired state, and never waits for storage operations.
   void eraseLocal(const std::string& name) {
     std::optional<Collections::Candidate> candidate;
-    { std::lock_guard lock(mutex); candidate = std::move(states[name].candidate); }
+    { std::lock_guard lock(mutex); candidate = std::exchange(states[name].candidate, std::nullopt); }
     if (candidate) node.collections().discard(*candidate);
     node.collections().remove(name, false);
     std::lock_guard lock(mutex);
@@ -524,8 +524,7 @@ struct ReplicationFollower::Impl {
     // An older empty snapshot must not park a newer eligible publication.
     state.waiting = !decision.eligible && state.advertised == snapshot.id;
     if (state.targetIncarnation != snapshot.id.incarnation) {
-      decision.obsolete = std::move(state.candidate);
-      state.candidate.reset();
+      decision.obsolete = std::exchange(state.candidate, std::nullopt);
       state.verified.clear();
       state.targetIncarnation = snapshot.id.incarnation;
     }
@@ -534,12 +533,10 @@ struct ReplicationFollower::Impl {
 
   // Verifies every file of `snapshot` in the target directory, downloading what
   // is missing, and makes them durable. Returns the target's prior snapshot.
-  std::shared_ptr<const CommitSnapshot> stageFiles(Client& client, const std::string& name, CommitSnapshotRegistry& registry,
-                                                   const CommitSnapshot& snapshot, const std::shared_ptr<Collection>& active) {
-    auto& dir = registry.dir;
+  void stageFiles(Client& client, const std::string& name, Directory& dir, const std::shared_ptr<const CommitSnapshot>& previous,
+                  const CommitSnapshot& snapshot, const std::shared_ptr<Collection>& active) {
     std::map<std::string, FileDescriptor> verified;
     { std::lock_guard lock(mutex); verified = states[name].verified; }
-    auto previous = registry.snapshot();
     if (!previous) {
       if (auto shard = active ? active->getShard() : nullptr) {
         auto& source = shard->getSnapshots();
@@ -583,7 +580,6 @@ struct ReplicationFollower::Impl {
       if (!durableNames.contains(file.name)) names.push_back(file.name);
     }
     dir.sync(names); syncDir(dir);
-    return previous;
   }
 
   void sync(Client& client, const std::string& name) {
@@ -594,37 +590,39 @@ struct ReplicationFollower::Impl {
     auto decision = decide(name, *snapshot);
     if (decision.obsolete) node.collections().discard(*decision.obsolete);
     if (decision.current || !decision.eligible) return;
-    // This worker owns the name's state while busy, including its candidate.
-    CommitSnapshotRegistry* registry;
-    if (decision.advance) registry = &decision.active->getShard()->getSnapshots();
-    else {
-      bool staged;
-      { std::lock_guard lock(mutex); staged = states[name].candidate.has_value(); }
-      if (!staged) {
-        auto candidate = node.collections().stage(name, snapshot->id.incarnation);
-        std::lock_guard lock(mutex); states[name].candidate = std::move(candidate);
-      }
-      registry = &states[name].candidate->snapshots();
-    }
-    auto previous = stageFiles(client, name, *registry, *snapshot, decision.active);
-    // A candidate can already hold this root from an interrupted activation.
-    bool committed = previous && previous->id == snapshot->id;
-    auto opened = committed ? nullptr : registry->readers.prepare(*snapshot);
-    {
+    auto stillAdvertised = [&] {
       std::lock_guard lock(mutex);
       auto& advertised = states[name].advertised;
       if (!advertised || advertised->incarnation != snapshot->id.incarnation)
         throw std::runtime_error("source collection changed during transfer");
+    };
+    // This worker owns the name's state while busy, including its candidate.
+    std::shared_ptr<Collection> installed;
+    if (decision.advance) {
+      auto& registry = decision.active->getShard()->getSnapshots();
+      auto previous = registry.snapshot();
+      stageFiles(client, name, registry.dir, previous, *snapshot, decision.active);
+      auto opened = registry.readers.prepare(*snapshot);
+      stillAdvertised();
+      if (stopping.stop_requested()) return;
+      registry.commit(snapshot, std::move(opened));
+      node.collections().retainSelected(name);
+      installed = decision.active;
+    } else {
+      auto& state = states[name];
+      if (!state.candidate) {
+        auto candidate = node.collections().stage(name, snapshot->id.incarnation);
+        std::lock_guard lock(mutex); state.candidate = std::move(candidate);
+      }
+      stageFiles(client, name, state.candidate->dir(), state.candidate->committed(), *snapshot, decision.active);
+      stillAdvertised();
+      if (stopping.stop_requested()) return;
+      // An unregistered candidate's publication is invisible until activation.
+      auto prepared = node.collections().prepare(*state.candidate, snapshot);
+      { std::lock_guard lock(mutex); state.candidate.reset(); }
+      installed = node.collections().install(std::move(prepared), decision.active);
     }
-    if (stopping.stop_requested()) return;
-    // An unregistered candidate's publication is invisible until activation.
-    if (!committed) registry->commit(snapshot, std::move(opened));
-    if (!decision.advance) {
-      std::optional<Collections::Candidate> candidate;
-      { std::lock_guard lock(mutex); candidate = std::move(states[name].candidate); states[name].candidate.reset(); }
-      node.collections().install(std::move(*candidate), decision.active);
-    } else node.collections().retainSelected(name);
-    try { registry->sweepOrphans(); }
+    try { installed->getShard()->getSnapshots().sweepOrphans(); }
     catch (const std::exception& e) { LOG_WARN("Follower retirement failed: {}", e.what()); }
     {
       std::lock_guard lock(mutex);

@@ -86,7 +86,8 @@ public:
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   // Installers other than the writer: make `snapshot`'s root durable, publish it
   // with the prepared reader, then retire the previous root and the files only
-  // it referenced. Throws before publication if the root may not be durable.
+  // it referenced. Throws before publication if the root may not be durable,
+  // without removing a root that already existed.
   void commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened);
   std::shared_ptr<const CommitSnapshot> snapshot() const { return readers.snapshot(); }
   void openLocalSnapshot();

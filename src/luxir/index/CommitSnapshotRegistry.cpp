@@ -17,16 +17,7 @@ void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snaps
 
 void CommitSnapshotRegistry::commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened) {
   auto previous = this->snapshot();
-  try {
-    Manifest::commit(dir, snapshot->id.index_gen, *snapshot->bytes);
-  } catch (...) {
-    try {
-      dir.deleteFile(Manifest::name(snapshot->id.index_gen));
-      std::array<std::string, 1> directory{"."};
-      dir.sync(directory);
-    } catch (...) {}
-    throw;
-  }
+  Manifest::commit(dir, snapshot->id.index_gen, *snapshot->bytes);
   Signal::emit("snapshotRootDurable", this);
   publish(snapshot, std::move(opened));
   // Best-effort: obsolete names that reappear after a crash are unreferenced.

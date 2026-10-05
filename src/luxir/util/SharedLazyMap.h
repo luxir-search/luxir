@@ -70,6 +70,11 @@ public:
     return replaced;
   }
 
+  /** Inserts `value` unless the key is present or being created. Never waits. */
+  bool insert(const Key& key, Pointer value) {
+    return dataMap.try_emplace(key, MapVal{std::move(value)});
+  }
+
   /** Erases the key only if it still maps to the exact expected pointer. */
   bool erase(const Key& key, const Pointer& expected) {
     return dataMap.erase_if(key, [&](const auto& elem) {
