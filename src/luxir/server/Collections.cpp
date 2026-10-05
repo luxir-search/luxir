@@ -141,15 +141,52 @@ bool Collections::reclaimStorage() {
   return true; // A concurrent drop also warrants retrying the allocation.
 }
 
+void Collections::registered(const CollectionId& id, const std::shared_ptr<Collection>& collection) {
+  {
+    std::lock_guard lock(listingMutex);
+    listing[id.tenant].insert_or_assign(id.name, collection);
+  }
+  events.registered(id, collection);
+}
+
+void Collections::removed(const CollectionId& id) {
+  {
+    std::lock_guard lock(listingMutex);
+    if (auto tenant = listing.find(id.tenant); tenant != listing.end()) {
+      tenant->second.erase(id.name);
+      if (tenant->second.empty()) listing.erase(tenant);
+    }
+  }
+  events.removed(id);
+}
+
 std::vector<Collections::Entry> Collections::entries() {
   std::vector<Entry> result;
-  using Pointer = SharedLazyMap<std::string, Collection>::Pointer;
-  map.dataMap.cvisit_all([&](const auto& elem) {
-    if (auto* collection = std::get_if<Pointer>(&elem.second)) {
-      result.push_back({elem.first, *collection, (*collection)->getUnavailableReason()});
-    }
-  });
-  std::sort(result.begin(), result.end(), [](const Entry& a, const Entry& b) { return a.id < b.id; });
+  {
+    std::lock_guard lock(listingMutex);
+    for (const auto& [tenant, collections] : listing)
+      for (const auto& [name, collection] : collections) result.push_back({{tenant, name}, collection, {}});
+  }
+  for (auto& entry : result) entry.error = entry.collection->getUnavailableReason();
+  return result;
+}
+
+std::vector<Collections::Entry> Collections::entries(std::string_view tenant) {
+  std::vector<Entry> result;
+  {
+    std::lock_guard lock(listingMutex);
+    if (auto it = listing.find(tenant); it != listing.end())
+      for (const auto& [name, collection] : it->second) result.push_back({{it->first, name}, collection, {}});
+  }
+  for (auto& entry : result) entry.error = entry.collection->getUnavailableReason();
+  return result;
+}
+
+std::vector<std::string> Collections::tenants() {
+  std::lock_guard lock(listingMutex);
+  std::vector<std::string> result;
+  result.reserve(listing.size());
+  for (const auto& entry : listing) result.push_back(entry.first);
   return result;
 }
 
@@ -246,7 +283,7 @@ std::vector<Collections::Opened> Collections::open(Role role) {
       auto collection = openCollection(name, role, row.incarnation);
       if (!map.insert(name, collection)) throw std::logic_error("collection opened twice");
       row.collection = std::move(collection);
-      events.registered(name, row.collection);
+      registered(name, row.collection);
       LOG_INFO("Loaded collection: {}", name.label());
     } catch (const std::exception& e) {
       // Keep the node up and the data: the name resolves to a clear error
@@ -270,7 +307,7 @@ std::vector<Collections::Opened> Collections::open(Role role) {
 std::shared_ptr<Collection> Collections::unavailable(const CollectionId& name, std::string reason) {
   auto placeholder = Collection::placeholder(name, std::move(reason));
   if (!map.insert(name, placeholder)) return map.get(name);
-  events.registered(name, placeholder);
+  registered(name, placeholder);
   return placeholder;
 }
 
@@ -285,7 +322,7 @@ std::shared_ptr<Collection> Collections::getOrCreate(const CollectionId& key, bo
     Transition transition(*this, key);
     auto col = initWriter(key);
     LOG_INFO("Created collection: {}", key.label());
-    events.registered(key, col);
+    registered(key, col);
     return col;
   });
   // A removal can follow the creation before this caller re-reads the entry.
@@ -309,7 +346,7 @@ std::shared_ptr<Collection> Collections::create(const CollectionId& key, const a
       stored = true;
       created = initWriter(key, std::move(initialSchema));
       LOG_INFO("Created collection: {}", key.label());
-      events.registered(key, created);
+      registered(key, created);
       return created;
     } catch (...) {
       createFailure = std::current_exception();
@@ -323,7 +360,7 @@ std::shared_ptr<Collection> Collections::create(const CollectionId& key, const a
         failed = Collection::placeholder(key, "create failed and cleanup failed: unknown non-standard exception");
       }
       if (!failed) std::rethrow_exception(createFailure);
-      events.registered(key, failed);
+      registered(key, failed);
       return failed;
     }
   });
@@ -360,10 +397,10 @@ void Collections::remove(const CollectionId& key, bool mustExist) {
   if (!map.replace(key, collection, deleting)) {
     throw CollectionUnavailableError("collection '" + key.label() + "' changed while deletion started");
   }
-  events.registered(key, deleting);
+  registered(key, deleting);
   auto fail = [&](std::string reason) {
     auto failed = Collection::placeholder(key, "delete failed: " + reason);
-    if (map.replace(key, deleting, failed)) events.registered(key, failed);
+    if (map.replace(key, deleting, failed)) registered(key, failed);
   };
   try {
     if (auto shard = collection->getShard()) {
@@ -385,7 +422,7 @@ void Collections::remove(const CollectionId& key, bool mustExist) {
   if (!map.erase(key, deleting)) {
     throw std::runtime_error("collection '" + key.label() + "' tombstone disappeared during deletion");
   }
-  events.removed(key);
+  removed(key);
 }
 
 Collections::Candidate Collections::stage(const CollectionId& key, std::string_view incarnation) {
@@ -440,7 +477,7 @@ std::shared_ptr<Collection> Collections::install(Prepared prepared, const std::s
   }
   // The transition owns the name, so the entry is still the expected one.
   map.replace(name, reserved ? reserved : expected, collection);
-  events.registered(name, collection);
+  registered(name, collection);
   if (auto shard = expected ? expected->getShard() : nullptr) shard->snapshots->detach();
   {
     std::lock_guard lock(slotsMutex);

@@ -1688,9 +1688,9 @@ private:
     std::string out;
     std::optional<ErrorInfo> failure;
     try {
-      auto entries = node_.collectionEntries();
+      auto entries = node_.collectionEntries(tenant_);
       std::vector<std::string_view> names;
-      for (const auto& entry : entries) if (entry.id.tenant == tenant_) names.push_back(entry.id.name);
+      for (const auto& entry : entries) names.push_back(entry.id.name);
       luxir::api::ListCollectionsResponse response;
       response.collections = names;
       if (!luxir::api::write_json(response, out)) {
@@ -1706,8 +1706,7 @@ private:
   // Tenants that own a registered collection, not leftover directories.
   void handleTenantList() {
     std::string out;
-    std::set<std::string> tenants;
-    for (const auto& entry : node_.collectionEntries()) tenants.insert(entry.id.tenant);
+    auto tenants = node_.tenants();
     std::vector<std::string_view> names(tenants.begin(), tenants.end());
     luxir::api::ListTenantsResponse response;
     response.tenants = names;

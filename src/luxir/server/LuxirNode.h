@@ -76,6 +76,8 @@ public:
   // Snapshot fully-created collections without waiting for creations in
   // flight. Unavailable placeholders retain their recorded error.
   std::vector<CollectionEntry> collectionEntries() { return collections_->entries(); }
+  std::vector<CollectionEntry> collectionEntries(std::string_view tenant) { return collections_->entries(tenant); }
+  std::vector<std::string> tenants() { return collections_->tenants(); }
 
   std::shared_ptr<Collection> createCollection(const CollectionId& id, const api::SchemaDef* schema = nullptr);
   std::shared_ptr<Collection> createCollection(std::string_view name, const api::SchemaDef* schema = nullptr) {

@@ -463,12 +463,13 @@ TEST_F(CollectionAdminApiTest, tenantRoutesAdministerNamedTenants) {
     return std::pair{response.result_int(), std::string(response.body())};
   };
 
+  EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_create", R"({"name":"zeta"})").first);
   EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_create", R"({"name":"docs"})").first);
   EXPECT_TRUE(std::filesystem::exists(data.path() / "t" / "acme" / "docs"));
   EXPECT_EQ(400, body(http::verb::post, "/tenants/acme/collections/_create", R"({"name":"more","tenant":"other"})").first);
   EXPECT_EQ(400, body(http::verb::post, "/tenants/Bad/collections/_create", R"({"name":"docs"})").first);
   EXPECT_NE(std::string::npos, body(http::verb::get, "/tenants?pretty=false").second.find(R"(["acme","t0"])"));
-  EXPECT_NE(std::string::npos, body(http::verb::get, "/tenants/acme/collections?pretty=false").second.find(R"(["docs"])"));
+  EXPECT_NE(std::string::npos, body(http::verb::get, "/tenants/acme/collections?pretty=false").second.find(R"(["docs","zeta"])"));
   EXPECT_EQ(std::string::npos, body(http::verb::get, "/collections?pretty=false").second.find("docs"));
   auto stats = body(http::verb::get, "/tenants/acme/_stats?pretty=false").second;
   EXPECT_NE(std::string::npos, stats.find(R"("tenant":"acme")"));
@@ -480,6 +481,11 @@ TEST_F(CollectionAdminApiTest, tenantRoutesAdministerNamedTenants) {
   EXPECT_EQ(404, body(http::verb::post, "/collections/docs/_search", "{}").first);
   EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_delete", R"({"name":"docs"})").first);
   EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "acme" / "docs"));
+  EXPECT_NE(std::string::npos, body(http::verb::get, "/tenants?pretty=false").second.find(R"(["acme","t0"])"));
+  // A tenant is listed while it has a collection.
+  EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_delete", R"({"name":"zeta"})").first);
+  EXPECT_NE(std::string::npos, body(http::verb::get, "/tenants?pretty=false").second.find(R"("tenants":["t0"])"));
+  EXPECT_EQ("{}\n", body(http::verb::get, "/tenants/acme/collections?pretty=false").second);
   server.shutdown();
 }
 

@@ -113,11 +113,18 @@ private:
   SharedLazyMap<CollectionId, Collection> map;
   std::mutex slotsMutex;
   std::map<CollectionId, Slot> slots;
+  // Announced collections by tenant and name, changed only with their
+  // announcements, so a listing reads its tenant without visiting the others.
+  std::mutex listingMutex;
+  std::map<std::string, std::map<std::string, std::shared_ptr<Collection>, std::less<>>, std::less<>> listing;
 
   std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
   std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected);
   std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {});
   void observe(const CollectionId& id, Collection& collection);
+  // Lists and announces a registration, or a removal.
+  void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection);
+  void removed(const CollectionId& id);
   bool reclaimStorage();
   void release(const CollectionId& id, const std::string& incarnation) noexcept;
   // Removes incarnation directories that nothing selects, leases or retains.
@@ -141,7 +148,11 @@ public:
 
   // The registered entry, which may be an unavailable placeholder.
   std::shared_ptr<Collection> get(const CollectionId& id) { return map.get(id); }
+  // Announced collections in tenant and name order: all, or one tenant's.
   std::vector<Entry> entries();
+  std::vector<Entry> entries(std::string_view tenant);
+  // Tenants with an announced collection, in order.
+  std::vector<std::string> tenants();
 
   // Writers. getOrCreate() creates only when `autoCreate`.
   std::shared_ptr<Collection> getOrCreate(const CollectionId& id, bool autoCreate);

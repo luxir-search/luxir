@@ -123,9 +123,8 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     auto collection = node.getCollection(LuxirNode::target(request.tenant, request.collection));
     entries.push_back({collection->getId(), std::move(collection), {}});
   } else {
-    entries = node.collectionEntries();
     // An empty tenant covers every tenant (administration).
-    if (!request.tenant.empty()) std::erase_if(entries, [&](const auto& entry) { return entry.id.tenant != request.tenant; });
+    entries = request.tenant.empty() ? node.collectionEntries() : node.collectionEntries(request.tenant);
   }
 
   auto* collections = api::build::allocArray(response.collections, entries.size(), resource);
@@ -190,8 +189,7 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
     auto collection = node.getCollection(LuxirNode::target(request.tenant, request.collection));
     entries.push_back({collection->getId(), std::move(collection), {}});
   } else {
-    entries = node.collectionEntries();
-    if (!request.tenant.empty()) std::erase_if(entries, [&](const auto& entry) { return entry.id.tenant != request.tenant; });
+    entries = request.tenant.empty() ? node.collectionEntries() : node.collectionEntries(request.tenant);
   }
 
   size_t dumpLimit = request.dump_limit != 0 ? request.dump_limit : 100;
