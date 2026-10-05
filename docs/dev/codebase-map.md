@@ -10,7 +10,11 @@ locations, browse `src/luxir/<area>/`.
 1. **Server Layer** (`src/luxir/server/`)
    - `GRPCServer`: Manages gRPC services and thread pool
    - `HttpServer`: JSON/HTTP API (Boost.Beast), including NDJSON streaming ingest
-   - `LuxirNode`: Central coordinator managing collections and services
+   - `LuxirNode`: Central coordinator wiring collections and services
+   - `Collections`: Owns the name -> collection map and every transition of it
+     (startup discovery, creation, activation of a new incarnation, removal),
+     announced in order through `CollectionEvents`
+   - `ReplicationFollower`: Discovery and transfer protocol; installs through `Collections`
 
 2. **Search Engine** (`src/luxir/search/`)
    - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
@@ -93,7 +97,9 @@ locations, browse `src/luxir/<area>/`.
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
    - `InputStream` / `OutputStream`: segment I/O primitives
-   - `DirectoryFactory`: constructs directories (`RAMDirFactory`, `FSDirFactory`, `CheckedDirFactory`)
+   - `DirectoryFactory`: storage backends (`RAMDirFactory`, `FSDirFactory`) and wrappers
+     (`CheckedDirFactory`, `ReadOnlyDirFactory`); `CollectionStorage` is a collection's
+     handle: CURRENT selects one of its incarnation directories
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)
@@ -109,8 +115,8 @@ locations, browse `src/luxir/<area>/`.
 
 ## Data Organization
 
-- **Library**: Top-level multi-tenancy container
-- **Collection**: Logical document group with schema
+- **Collection**: Logical document group with schema; its storage is a sequence of
+  incarnations (identities), one selected by CURRENT
 - **Shard**: Physical collection partition, consists of a single **Index**
 - **Segment**: Immutable index unit
   - Flush records the pinned schema generation; merge records the minimum input

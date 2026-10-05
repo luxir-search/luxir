@@ -240,8 +240,10 @@ struct ReplicationFollower::Impl {
     Clock::time_point readySince = Clock::now();
     Clock::time_point retry{};
     uint64_t downloaded = 0, reused = 0, total = 0;
-    std::shared_ptr<Collection> candidate;
-    std::string candidateIncarnation;
+    // The incarnation `verified` describes, and its staged candidate when
+    // that is not the active collection's incarnation.
+    std::string targetIncarnation;
+    std::optional<Collections::Candidate> candidate;
     std::map<std::string, FileDescriptor> verified;
     bool needsAck() const {
       return !serving.empty() && acknowledged != serving && !source.empty()
@@ -264,14 +266,14 @@ struct ReplicationFollower::Impl {
   std::stop_source stopping;
   std::vector<std::jthread> threads;
 
-  explicit Impl(LuxirNode& node) : node(node), source(node.config.replication.source) {
-    if (node.config.replication.downloads < 1 || node.config.replication.downloads > 64) {
+  explicit Impl(LuxirNode& node) : node(node), source(node.getConfig().replication.source) {
+    if (node.getConfig().replication.downloads < 1 || node.getConfig().replication.downloads > 64) {
       throw std::invalid_argument("replication.downloads must be between 1 and 64");
     }
     binding.source = "http://" + source.authority;
-    binding.follower = node.config.replication.follower_id;
-    bool fs = node.config.store.backend == "fs";
-    metadata = fs ? std::shared_ptr<Directory>(std::make_shared<FSDirectory>(node.config.store.data_dir))
+    binding.follower = node.getConfig().replication.follower_id;
+    bool fs = node.getConfig().store.backend == "fs";
+    metadata = fs ? std::shared_ptr<Directory>(std::make_shared<FSDirectory>(node.getConfig().store.data_dir))
                   : std::make_shared<RAMDir>();
     if (auto stored = metadata->openFile("replication.json")) {
       auto existing = ReplicationState::read(*stored);
@@ -281,7 +283,7 @@ struct ReplicationFollower::Impl {
       existing.source = binding.source;
       binding = std::move(existing);
     } else {
-      if (fs) for (const auto& entry : std::filesystem::directory_iterator(node.config.store.data_dir)) {
+      if (fs) for (const auto& entry : std::filesystem::directory_iterator(node.getConfig().store.data_dir)) {
         auto name = entry.path().filename().string();
         if (name == "write.lock" || name == "replication.json.pending") continue;
         if (name == "c" && std::filesystem::is_empty(entry.path())) continue;
@@ -292,42 +294,21 @@ struct ReplicationFollower::Impl {
       binding.write(*metadata);
     }
     if (binding.follower.empty() || binding.follower.size() > 255) throw std::invalid_argument("invalid follower id");
-    for (const auto& name : node.dirFactory->collections()) {
-      std::optional<std::string> selection;
-      try {
-        LuxirNode::validateCollectionName(name);
-        auto storage = node.dirFactory->collection(name);
-        selection = storage.current();
-        if (!selection) {
-          if (storage.hasFiles()) throw std::runtime_error("Collection has files without CURRENT");
-          for (const auto& incarnation : storage.incarnations()) validateIncarnation(incarnation);
-          continue; // retain completed candidate files for a restarted download
-        }
-        validateIncarnation(*selection);
-        auto col = node.makeCollection(name, storage.open(*selection));
-        auto& snapshots = col->getShard()->getSnapshots();
-        snapshots.openLocalSnapshot();
-        if (snapshots.snapshot()->id.incarnation != *selection) throw std::runtime_error("local incarnation does not match CURRENT");
-        // Candidates can contain verified files from an interrupted transfer.
-        // The next successful install sweeps them against its installed root.
-        node.root->collections.getOrCreate(name, [&] { return col; });
-        node.observeCollection(name, *col);
-        node.events->registered(name, col);
-        auto& state = states[name];
-        state.serving = snapshots.snapshot()->id.token();
-      } catch (const std::exception& e) {
-        LOG_WARN("Local replica '{}' unavailable: {}", name, errorMessage(e));
-        auto tombstone = std::make_shared<Collection>();
-        tombstone->name = name;
-        tombstone->unavailableReason = "failed to load: " + errorMessage(e);
-        node.events->registered(name, node.root->collections.getOrCreate(name, [&] { return tombstone; }));
-        auto& state = states[name];
+  }
+
+  void seed(const std::vector<Collections::Opened>& opened) {
+    for (const auto& row : opened) {
+      // A collection without CURRENT keeps verified candidate files for a
+      // restarted download; the next successful install sweeps them.
+      if (!row.collection) continue;
+      auto& state = states[row.name];
+      if (row.error.empty()) state.serving = row.collection->getShard()->getSnapshots().snapshot()->id.token();
+      else {
         state.localUnavailable = true;
-        state.localIncarnation = selection.value_or("");
-        state.error = tombstone->unavailableReason;
+        state.localIncarnation = row.incarnation.value_or("");
+        state.error = row.error;
       }
-      auto& state = states[name];
-      auto& saved = binding.collections[name];
+      auto& saved = binding.collections[row.name];
       state.seenBoot = saved.boot;
       state.source = saved.source;
       state.replaceEmpty = saved.replace_empty;
@@ -362,21 +343,15 @@ struct ReplicationFollower::Impl {
   // The worker (or orphan admin) owns this collection's busy flag. Discovery
   // only updates desired state, and never waits for storage operations.
   void eraseLocal(const std::string& name) {
-    auto old = node.root->collections.get(name);
-    if (old) {
-      node.root->collections.erase(name, old);
-      node.events->removed(name);
-      if (auto shard = old->getShard()) shard->getSnapshots().detach();
-    }
-    std::shared_ptr<Collection> candidate;
+    std::optional<Collections::Candidate> candidate;
     { std::lock_guard lock(mutex); candidate = std::move(states[name].candidate); }
-    if (candidate && candidate != old) candidate->getShard()->getSnapshots().close();
-    node.dirFactory->collection(name).remove();
+    if (candidate) node.collections().discard(*candidate);
+    node.collections().remove(name, false);
     std::lock_guard lock(mutex);
     auto& state = states[name];
     state.serving.clear(); state.acknowledged.clear();
     state.localUnavailable = false; state.localIncarnation.clear();
-    state.verified.clear(); state.candidateIncarnation.clear(); state.remove = false;
+    state.verified.clear(); state.targetIncarnation.clear(); state.remove = false;
   }
 
   Catalog fetchCatalog(Client& client, const std::string& cursor, std::chrono::milliseconds timeout) {
@@ -385,7 +360,7 @@ struct ReplicationFollower::Impl {
     Catalog catalog;
     if (glz::read_json(catalog, response.body()) || catalog.boot.empty() || catalog.cursor.empty()) throw std::runtime_error("invalid source catalog");
     for (const auto& [name, entry] : catalog.collections) {
-      LuxirNode::validateCollectionName(name);
+      Collections::validateName(name);
       if (!entry.commit.empty()) validateIncarnation(CommitId::parse(entry.commit).incarnation);
     }
     return catalog;
@@ -394,7 +369,7 @@ struct ReplicationFollower::Impl {
   void watch() {
     Client client(source, stopping.get_token());
     bool refresh = true;
-    auto timeout = std::chrono::milliseconds(node.config.replication.follower_timeout_ms / 3);
+    auto timeout = std::chrono::milliseconds(node.getConfig().replication.follower_timeout_ms / 3);
     while (!stopping.stop_requested()) {
       try {
         auto catalog = fetchCatalog(client, refresh ? "" : cursor, timeout);
@@ -490,10 +465,7 @@ struct ReplicationFollower::Impl {
     Signal::emit("replicationFileVerified", &file);
   }
 
-  void sync(Client& client, const std::string& name) {
-    { std::lock_guard lock(mutex);
-      auto& state = states[name]; state.total = state.downloaded = state.reused = 0;
-    }
+  std::shared_ptr<const CommitSnapshot> fetchSnapshot(Client& client, const std::string& name) {
     auto response = request(client, http::verb::get, "/_replication/" + name + "/snapshot?" + followerQuery());
     auto& body = response.body();
     auto bytes = std::make_shared<const std::vector<std::byte>>((const std::byte*)body.data(), (const std::byte*)body.data() + body.size());
@@ -501,71 +473,67 @@ struct ReplicationFollower::Impl {
     validateIncarnation(snapshot->id.incarnation);
     if (response["X-Luxir-Commit"] != snapshot->id.token()) throw std::runtime_error("snapshot commit mismatch");
     if (!snapshot->populated) Signal::emit("replicationEmptySnapshotReceived");
-    std::shared_ptr<Collection> candidate, obsoleteCandidate;
-    std::string obsoleteIncarnation;
-    bool eligible;
-    {
-      std::lock_guard lock(mutex);
-      auto& state = states[name];
-      if (state.source.empty()) throw std::runtime_error("source collection disappeared during transfer");
-      if (CommitId::parse(state.source).incarnation != snapshot->id.incarnation)
-        throw std::runtime_error("source incarnation changed; retry snapshot");
-      for (const auto& file : snapshot->files) state.total += file.size;
-      auto active = node.root->collections.get(name);
-      auto shard = active ? active->getShard() : nullptr;
-      bool sameIncarnation = shard ? shard->getSnapshots().snapshot()->id.incarnation == snapshot->id.incarnation
-          : state.localIncarnation == snapshot->id.incarnation;
-      if (shard && sameIncarnation && snapshot->id.index_gen <= shard->getSnapshots().snapshot()->id.index_gen) {
-        if (snapshot->id.token() == state.serving) {
-          state.reused = state.total;
-          return;
-        }
-        throw std::runtime_error("source went backwards");
-      }
-      // An unreadable copy may contain data. Only a known same incarnation,
-      // same-boot replacement, or populated source can replace it with certainty.
-      bool populated = shard ? shard->getSnapshots().snapshot()->populated : state.localUnavailable;
-      eligible = !populated || sameIncarnation || state.replaceEmpty || snapshot->populated;
-      // Discovery may have advanced while this snapshot request was in flight.
-      // An older empty snapshot must not park a newer eligible publication.
-      state.waiting = !eligible && state.source == snapshot->id.token();
-      if (state.candidateIncarnation != snapshot->id.incarnation) {
-        if (state.candidate != active) {
-          obsoleteCandidate = state.candidate;
-          // A failed repair can share the unreadable local directory. Retain
-          // it until a verified install can sweep all obsolete incarnations.
-          if (!state.localUnavailable || (!state.localIncarnation.empty() && state.candidateIncarnation != state.localIncarnation))
-            obsoleteIncarnation = state.candidateIncarnation;
-        }
-        state.verified.clear();
-        state.candidateIncarnation = snapshot->id.incarnation;
-        state.candidate = sameIncarnation && shard ? active : nullptr;
-      }
-      candidate = state.candidate;
+    return snapshot;
+  }
+
+  // What to do with a fetched snapshot. `advance` targets the active
+  // collection's own incarnation; otherwise a staged candidate replaces it.
+  struct Decision {
+    bool current = false; // already serving it
+    bool eligible = false;
+    bool advance = false;
+    std::shared_ptr<Collection> active;
+    std::optional<Collections::Candidate> obsolete;
+  };
+
+  Decision decide(const std::string& name, const CommitSnapshot& snapshot) {
+    Decision decision;
+    std::lock_guard lock(mutex);
+    auto& state = states[name];
+    if (state.source.empty()) throw std::runtime_error("source collection disappeared during transfer");
+    if (CommitId::parse(state.source).incarnation != snapshot.id.incarnation)
+      throw std::runtime_error("source incarnation changed; retry snapshot");
+    for (const auto& file : snapshot.files) state.total += file.size;
+    decision.active = node.collections().get(name);
+    auto shard = decision.active ? decision.active->getShard() : nullptr;
+    auto serving = shard ? shard->getSnapshots().snapshot() : nullptr;
+    decision.advance = serving && serving->id.incarnation == snapshot.id.incarnation;
+    if (decision.advance && snapshot.id.index_gen <= serving->id.index_gen) {
+      if (snapshot.id.token() != state.serving) throw std::runtime_error("source went backwards");
+      state.reused = state.total;
+      decision.current = true;
+      return decision;
     }
-    if (obsoleteCandidate) {
-      obsoleteCandidate->getShard()->getSnapshots().close();
-      if (!obsoleteIncarnation.empty()) node.dirFactory->collection(name).removeIncarnation(obsoleteIncarnation);
+    // An unreadable copy may contain data. Only a known same incarnation,
+    // same-boot replacement, or populated source can replace it with certainty.
+    bool sameIncarnation = decision.advance || (!shard && state.localIncarnation == snapshot.id.incarnation);
+    bool populated = serving ? serving->populated : state.localUnavailable;
+    decision.eligible = !populated || sameIncarnation || state.replaceEmpty || snapshot.populated;
+    // Discovery may have advanced while this snapshot request was in flight.
+    // An older empty snapshot must not park a newer eligible publication.
+    state.waiting = !decision.eligible && state.source == snapshot.id.token();
+    if (state.targetIncarnation != snapshot.id.incarnation) {
+      decision.obsolete = std::move(state.candidate);
+      state.candidate.reset();
+      state.verified.clear();
+      state.targetIncarnation = snapshot.id.incarnation;
     }
-    if (!eligible) return;
-    if (!candidate) {
-      // Selected only after a durable root.
-      candidate = node.makeCollection(name, node.dirFactory->collection(name).create(snapshot->id.incarnation));
-    }
-    auto& registry = candidate->getShard()->getSnapshots();
+    return decision;
+  }
+
+  // Verifies every file of `snapshot` in the target directory, downloading what
+  // is missing, and makes them durable. Returns the target's prior snapshot.
+  std::shared_ptr<const CommitSnapshot> stageFiles(Client& client, const std::string& name, CommitSnapshotRegistry& registry,
+                                                   const CommitSnapshot& snapshot, const std::shared_ptr<Collection>& active) {
     auto& dir = registry.dir;
     std::map<std::string, FileDescriptor> verified;
-    {
-      std::lock_guard lock(mutex);
-      auto& state = states[name]; state.candidate = candidate;
-      verified = state.verified;
-    }
+    { std::lock_guard lock(mutex); verified = states[name].verified; }
     auto previous = registry.snapshot();
     if (!previous) {
-      if (auto active = node.root->collections.get(name); active && active->getShard()) {
-        auto& source = active->getShard()->getSnapshots();
+      if (auto shard = active ? active->getShard() : nullptr) {
+        auto& source = shard->getSnapshots();
         if (auto serving = source.snapshot()) {
-          for (auto& file : dir.reuseFiles(source.dir, serving->files, snapshot->files))
+          for (auto& file : dir.reuseFiles(source.dir, serving->files, snapshot.files))
             verified.insert_or_assign(file.name, std::move(file));
         }
       }
@@ -577,7 +545,7 @@ struct ReplicationFollower::Impl {
     }
     std::vector<std::string> names;
     std::set<std::string> unique;
-    for (const auto& file : snapshot->files) {
+    for (const auto& file : snapshot.files) {
       if (file.name.empty() || file.name == "." || file.name == ".." || file.name.find_first_of("/\\") != std::string::npos
           || file.name.starts_with("s.olux") || file.name.ends_with(".tmp") || !unique.insert(file.name).second) throw std::runtime_error("invalid snapshot file name");
       bool reuse = verified.contains(file.name) && verified.at(file.name) == file;
@@ -587,12 +555,12 @@ struct ReplicationFollower::Impl {
         if (auto local = dir.openFile(file.name)) {
           auto data = local->read();
           reuse = data.size() == file.size && XXH3_64bits(data.data(), data.size()) == file.xxh3;
-          if (!reuse && registry.snapshot()) {
-            for (const auto& live : registry.snapshot()->files) if (live.name == file.name) throw std::runtime_error("source changed immutable file: " + file.name);
+          if (!reuse && previous) {
+            for (const auto& live : previous->files) if (live.name == file.name) throw std::runtime_error("source changed immutable file: " + file.name);
           }
         }
       }
-      if (!reuse) download(client, name, dir, *snapshot, file);
+      if (!reuse) download(client, name, dir, snapshot, file);
       { std::lock_guard lock(mutex);
         auto& state = states[name];
         if (reuse) state.reused += file.size;
@@ -604,9 +572,33 @@ struct ReplicationFollower::Impl {
       if (!durableNames.contains(file.name)) names.push_back(file.name);
     }
     dir.sync(names); syncDir(dir);
+    return previous;
+  }
+
+  void sync(Client& client, const std::string& name) {
+    { std::lock_guard lock(mutex);
+      auto& state = states[name]; state.total = state.downloaded = state.reused = 0;
+    }
+    auto snapshot = fetchSnapshot(client, name);
+    auto decision = decide(name, *snapshot);
+    if (decision.obsolete) node.collections().discard(*decision.obsolete);
+    if (decision.current || !decision.eligible) return;
+    // This worker owns the name's state while busy, including its candidate.
+    CommitSnapshotRegistry* registry;
+    if (decision.advance) registry = &decision.active->getShard()->getSnapshots();
+    else {
+      bool staged;
+      { std::lock_guard lock(mutex); staged = states[name].candidate.has_value(); }
+      if (!staged) {
+        auto candidate = node.collections().stage(name, snapshot->id.incarnation);
+        std::lock_guard lock(mutex); states[name].candidate = std::move(candidate);
+      }
+      registry = &states[name].candidate->snapshots();
+    }
+    auto previous = stageFiles(client, name, *registry, *snapshot, decision.active);
     // A candidate can already hold this root from an interrupted activation.
     bool committed = previous && previous->id == snapshot->id;
-    auto opened = committed ? nullptr : registry.readers.prepare(*snapshot);
+    auto opened = committed ? nullptr : registry->readers.prepare(*snapshot);
     {
       std::lock_guard lock(mutex);
       if (states[name].source.empty() || CommitId::parse(states[name].source).incarnation != snapshot->id.incarnation)
@@ -614,26 +606,14 @@ struct ReplicationFollower::Impl {
     }
     if (stopping.stop_requested()) return;
     // An unregistered candidate's publication is invisible until activation.
-    if (!committed) registry.commit(snapshot, std::move(opened));
-    auto storage = node.dirFactory->collection(name);
-    if (storage.current() != snapshot->id.incarnation) storage.select(snapshot->id.incarnation);
-    auto old = node.root->collections.get(name);
-    if (old != candidate) {
-      if (old) {
-        if (!node.root->collections.replace(name, old, candidate)) throw std::runtime_error("collection changed during installation");
-      } else node.root->collections.getOrCreate(name, [&] { return candidate; });
-      node.observeCollection(name, *candidate);
-      node.events->registered(name, candidate);
-      if (auto shard = old ? old->getShard() : nullptr) {
-        auto oldIncarnation = shard->getSnapshots().snapshot()->id.incarnation;
-        shard->getSnapshots().detach();
-        try { storage.removeIncarnation(oldIncarnation); }
-        catch (const std::exception& e) { LOG_WARN("Retired incarnation cleanup failed: {}", e.what()); }
-      }
-    }
-    try { registry.sweepOrphans(); }
+    if (!committed) registry->commit(snapshot, std::move(opened));
+    if (!decision.advance) {
+      std::optional<Collections::Candidate> candidate;
+      { std::lock_guard lock(mutex); candidate = std::move(states[name].candidate); states[name].candidate.reset(); }
+      node.collections().install(std::move(*candidate), decision.active);
+    } else node.collections().retainSelected(name);
+    try { registry->sweepOrphans(); }
     catch (const std::exception& e) { LOG_WARN("Follower retirement failed: {}", e.what()); }
-    storage.retainOnly(snapshot->id.incarnation);
     {
       std::lock_guard lock(mutex);
       auto& state = states[name]; state.localUnavailable = false; state.localIncarnation.clear();
@@ -764,16 +744,17 @@ struct ReplicationFollower::Impl {
 
 ReplicationFollower::ReplicationFollower(LuxirNode& node) : impl(std::make_unique<Impl>(node)) {}
 ReplicationFollower::~ReplicationFollower() { stop(); }
+void ReplicationFollower::seed(const std::vector<Collections::Opened>& opened) { impl->seed(opened); }
 bool ReplicationFollower::pull(std::ostream& output) { return impl->pull(output); }
 void ReplicationFollower::start() {
   impl->threads.emplace_back([this] { impl->watch(); });
-  for (int i = 0; i < impl->node.config.replication.downloads; i++) impl->threads.emplace_back([this] { impl->worker(); });
+  for (int i = 0; i < impl->node.getConfig().replication.downloads; i++) impl->threads.emplace_back([this] { impl->worker(); });
 }
 void ReplicationFollower::stop() {
   impl->stopping.request_stop(); impl->changed.notify_all(); impl->threads.clear();
 }
 void ReplicationFollower::deleteOrphan(std::string_view name) {
-  LuxirNode::validateCollectionName(name);
+  Collections::validateName(name);
   std::string key(name);
   {
     std::unique_lock lock(impl->mutex);
@@ -781,7 +762,7 @@ void ReplicationFollower::deleteOrphan(std::string_view name) {
       throw ReadOnlyError("only a local orphan absent from the connected source may be deleted");
     }
     if (impl->states.contains(key) && impl->states.at(key).busy) throw CollectionUnavailableError("local orphan is busy");
-    if (!impl->node.root->collections.get(key)) throw CollectionNotFoundError("local orphan does not exist");
+    if (!impl->node.collections().get(key)) throw CollectionNotFoundError("local orphan does not exist");
     impl->states[key].busy = true;
   }
   try { impl->eraseLocal(key); }

@@ -6,6 +6,8 @@
 #include <memory>
 #include <memory_resource>
 #include <string_view>
+#include <vector>
+#include "Collections.h"
 
 namespace luxir {
 class LuxirNode;
@@ -17,8 +19,11 @@ class ReplicationFollower {
   struct Impl;
   std::unique_ptr<Impl> impl;
 public:
+  // Binds the data directory to this follower; refuses one it does not own.
   explicit ReplicationFollower(LuxirNode& node);
   ~ReplicationFollower();
+  // Adopts the collections opened from that directory, with their history.
+  void seed(const std::vector<Collections::Opened>& opened);
   // One catalog pass, before start(), with the same installation rules.
   // Does not acknowledge serving traffic. Returns false if any collection failed.
   bool pull(std::ostream& output);

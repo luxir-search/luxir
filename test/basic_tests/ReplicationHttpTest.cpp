@@ -154,7 +154,7 @@ TEST_F(ReplicationHttpTest, watchPublishCreateDeleteAndTimeout) {
   Signal::listen("collectionInitialized", [&](void*, void*, void*) -> void* {
     initialized.set_value(); resume.wait(); return nullptr;
   });
-  auto creation = std::async(std::launch::async, [&] { node->createCollection(nullptr, "other"); });
+  auto creation = std::async(std::launch::async, [&] { node->createCollection("other"); });
   EXPECT_EQ(std::future_status::ready, initialized.get_future().wait_for(1s));
   EXPECT_EQ(std::future_status::timeout, created.wait_for(20ms));
   install.set_value();

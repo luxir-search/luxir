@@ -253,7 +253,7 @@ TEST_F(CollectionAdminApiTest, heldReaderSearchSurvivesDelete) {
   auto config = fsConfig(data);
   config.ingest.auto_create_collection = false;
   LuxirNode node(config);
-  node.createCollection(nullptr, "admin_held_reader");
+  node.createCollection("admin_held_reader");
   CollectionHelper helper(node, "admin_held_reader");
   auto indexed = helper.index(flatdoc("id", "held"), UpdateMessage::COMMIT);
   ASSERT_TRUE(indexed.success) << indexed.error_message;
@@ -286,7 +286,7 @@ TEST_F(CollectionAdminApiTest, restartKeepsDeletedCollectionAbsentAndPurgesTrash
 
   {
     LuxirNode node(config);
-    node.createCollection(nullptr, "admin_restart");
+    node.createCollection("admin_restart");
     CollectionHelper helper(node, "admin_restart");
     ASSERT_TRUE(helper.index(flatdoc("id", "restart"), UpdateMessage::COMMIT).success);
     node.deleteCollection("admin_restart");
@@ -307,7 +307,7 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
 
   {
     LuxirNode node(config);
-    node.createCollection(nullptr, "admin_corrupt");
+    node.createCollection("admin_corrupt");
     CollectionHelper helper(node, "admin_corrupt");
     ASSERT_TRUE(helper.index(flatdoc("id", "corrupt"), UpdateMessage::COMMIT).success);
   }
@@ -388,7 +388,7 @@ TEST_F(CollectionAdminApiTest, manifestsOwnSchemaAndIncarnation) {
       }
       auto previous = std::string(manifest->incarnation);
       reopened.deleteCollection("main");
-      reopened.createCollection(nullptr, "main");
+      reopened.createCollection("main");
       auto recreated = readDurableIndexInfo(*reopened.getCollection("main")->getShard()->getDirectory());
       EXPECT_NE(previous, recreated->incarnation);
       EXPECT_TRUE(recreated->segments.empty());
@@ -403,7 +403,7 @@ TEST_F(CollectionAdminApiTest, initialSchemaPublishesOneManifest) {
   api::SchemaDef schema;
   std::pmr::monotonic_buffer_resource arena;
   ASSERT_TRUE(api::read_json(schema, R"({"fields":{"title":{"type":"string"}}})", arena));
-  auto collection = node.createCollection(nullptr, "initial_schema", &schema);
+  auto collection = node.createCollection("initial_schema", &schema);
   auto manifest = readDurableIndexInfo(*collection->getShard()->getDirectory());
   EXPECT_EQ(1u, manifest->index_gen);
   EXPECT_EQ(1u, manifest->schema_gen);
@@ -425,7 +425,7 @@ TEST_F(CollectionAdminApiTest, createPreservesUnregisteredStorage) {
     IndexWriter writer(writerSnapshots);
     incarnation = test::readDurableIndexInfo(existing)->incarnation;
   }
-  EXPECT_THROW(node.createCollection(nullptr, "unregistered"), std::filesystem::filesystem_error);
+  EXPECT_THROW(node.createCollection("unregistered"), std::filesystem::filesystem_error);
   EXPECT_EQ(incarnation, test::readDurableIndexInfo(existing)->incarnation);
 }
 

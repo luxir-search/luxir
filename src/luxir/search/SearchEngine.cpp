@@ -137,6 +137,10 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
             return true;
           }
         } catch (const CollectionNotFoundError&) {}
+        catch (const CollectionUnavailableError& e) {
+          // A follower's removal or replacement is transient; wait it out.
+          if (!node.following()) { *error = classifyException(e, ErrorKind::INTERNAL); return true; }
+        }
         catch (const std::exception& e) { *error = classifyException(e, ErrorKind::INTERNAL); return true; }
         if (event != Event::DEADLINE) return false;
         *error = ErrorInfo{ErrorKind::UNAVAILABLE, "stale_replica", "min_commit was not available before min_commit_timeout_ms"};

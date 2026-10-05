@@ -1668,7 +1668,7 @@ private:
       std::optional<ErrorInfo> failure;
       try {
         self->node_.createCollection(
-            nullptr, state->request.name,
+            state->request.name,
             state->request.schema ? &*state->request.schema : nullptr);
         luxir::api::CreateCollectionResponse response;
         response.name = state->request.name;

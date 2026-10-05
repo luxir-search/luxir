@@ -115,7 +115,7 @@ protected:
     HttpReq search(followerServer->getPort());
     search.matchQuery("id", "a").withStats().execute();
     EXPECT_EQ(200, search.status()); EXPECT_EQ(1, search.found());
-    EXPECT_THROW(follower->createCollection(nullptr, "blocked"), ReadOnlyError);
+    EXPECT_THROW(follower->createCollection("blocked"), ReadOnlyError);
     EXPECT_THROW(follower->deleteCollection("main"), ReadOnlyError);
     EXPECT_THROW(col->setSchema(col->getSchema()), ReadOnlyError);
     EXPECT_EQ(403, httpRequest(followerServer->getPort(), http::verb::post, "/collections/main/_update", "{\"id\":\"x\"}\n", "application/x-ndjson").result_int());
@@ -743,7 +743,7 @@ TEST_F(ReplicationFollowerTest, eofCommitsOnlyTouchedCollections) {
   CollectionHelper h(*source, "main");
   ASSERT_TRUE(h.index(flatdoc("id", "main"), UpdateMessage::COMMIT).success);
   ASSERT_TRUE(caughtUp());
-  source->createCollection(nullptr, "other");
+  source->createCollection("other");
   std::latch resume(1);
   auto join = scope_guard([&] { resume.count_down(); stopFollower(); });
   Signal::listen("replicationFileVerified", [&](void*, void*, void*) -> void* { resume.wait(); return nullptr; });
@@ -876,7 +876,7 @@ TEST_F(ReplicationFollowerTest, deleteAndRecreateCompletesPendingWaits) {
     return httpRequest(sourcePort, http::verb::post, "/collections/main/_update", R"({"commit":{"wait_for_replicas":1}})");
   });
   ASSERT_TRUE(until([&] { return parked == 2; }));
-  source->deleteCollection("main"); source->createCollection(nullptr, "main");
+  source->deleteCollection("main"); source->createCollection("main");
   EXPECT_EQ(std::future_status::ready, floor.wait_for(1s));
   EXPECT_EQ(std::future_status::ready, barrier.wait_for(1s));
   EXPECT_EQ(503, floor.get().result_int());
@@ -1094,7 +1094,7 @@ INSTANTIATE_TEST_SUITE_P(Storage, ReplicationPullTest, ::testing::Values("fs", "
 
 TEST_P(ReplicationPullTest, copiesEmptyAndPopulatedCollectionsThenSeedsAndPromotes) {
   startSource();
-  source->createCollection(nullptr, "empty");
+  source->createCollection("empty");
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
   auto snapshot = source->getCollection("main")->getShard()->getSnapshots().snapshot();
   uint64_t bytes = 0; for (const auto& file : snapshot->files) bytes += file.size;
@@ -1224,7 +1224,7 @@ TEST_F(ReplicationFollowerTest, emptyCreateAndSameBootRecreateInstallImmediately
   ASSERT_TRUE(caughtUp());
   auto old = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
   source->deleteCollection("main");
-  source->createCollection(nullptr, "main");
+  source->createCollection("main");
   ASSERT_TRUE(caughtUp());
   auto current = follower->getCollection("main");
   EXPECT_NE(old.incarnation, current->getShard()->getSnapshots().snapshot()->id.incarnation);
@@ -1241,7 +1241,7 @@ TEST_F(ReplicationFollowerTest, waitingSurvivesFollowerRestartThenSameBootRecrea
   stopFollower(); startFollower();
   ASSERT_TRUE(until([&] { return stateIs("waiting"); }));
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
-  source->deleteCollection("main"); source->createCollection(nullptr, "main");
+  source->deleteCollection("main"); source->createCollection("main");
   ASSERT_TRUE(caughtUp());
   EXPECT_EQ(0, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
 }
@@ -1361,7 +1361,7 @@ TEST_F(ReplicationFollowerTest, pullReportsIncarnationChangeDuringTransfer) {
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
   bool recreate = true;
   Signal::listen("replicationDownloadStart", [&](void*, void*, void*) -> void* {
-    if (std::exchange(recreate, false)) { source->deleteCollection("main"); source->createCollection(nullptr, "main"); }
+    if (std::exchange(recreate, false)) { source->deleteCollection("main"); source->createCollection("main"); }
     return nullptr;
   });
   auto interrupted = pull();

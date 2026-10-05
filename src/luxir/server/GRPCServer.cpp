@@ -737,7 +737,7 @@ static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& read
     call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
       try {
         call.server.getLuxirNode().createCollection(
-            nullptr, request->proto.name,
+            request->proto.name,
             request->proto.schema ? &*request->proto.schema : nullptr);
         CreateCollectionRespProto response;
         response.name = request->proto.name;
