@@ -119,7 +119,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   nextManifestGen = manifest.highestGeneration;
   manifestNames = std::move(manifest.names);
   if (!manifest.bytes) {
-    incarnation = initialIncarnation.empty() ? newUuid() : std::move(initialIncarnation);
+    incarnation = initialIncarnation.empty() ? CommitId::newIncarnation() : std::move(initialIncarnation);
     lastSegId = 0;
   } else {
     std::pmr::monotonic_buffer_resource iiArena;
@@ -186,7 +186,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   } else if (manifest.generation != manifest.highestGeneration) {
     // A recovered older root must not advertise a regressed generation under
     // the old identity. Collection storage also switches incarnation directories.
-    incarnation = newUuid();
+    incarnation = CommitId::newIncarnation();
     std::pmr::monotonic_buffer_resource arena;
     auto recovered = Manifest::decode(manifest.bytes, arena);
     publish(recovered, arena);
@@ -2656,7 +2656,7 @@ void IndexWriter::testDeleteAllData() {
     // swap or epoch the filter cache before reusing those namespaces.
     lastSegId = 0;
     indexGen = 0;
-    incarnation = newUuid();
+    incarnation = CommitId::newIncarnation();
     coreGen = 0;
     lastCommittedSegIds.clear();
     currentAuxIndexes_.clear();

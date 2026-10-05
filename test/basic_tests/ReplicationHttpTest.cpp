@@ -257,7 +257,7 @@ TEST_F(ReplicationHttpTest, expiryBudgetAndInstalledStats) {
   EXPECT_EQ(410, get(fileUrl(*first, first->files.front().name)).result_int());
   auto current = snapshot();
   auto installed = httpRequest(server->getPort(), http::verb::post, "/_replication/installed",
-      "{\"follower\":\"f1\",\"tenant\":\"default\",\"collection\":\"main\",\"commit\":\"" + current->id.token() + "\"}");
+      "{\"follower\":\"f1\",\"tenant\":\"t0\",\"collection\":\"main\",\"commit\":\"" + current->id.token() + "\"}");
   ASSERT_EQ(200, installed.result_int()) << installed.body();
   h->getIndexWriter()->setSchema(Schema::createDefaultSchema());
   auto stats = get("/_replication/status");
@@ -273,9 +273,9 @@ TEST_F(ReplicationHttpTest, expiryBudgetAndInstalledStats) {
 TEST_F(ReplicationHttpTest, fullAcknowledgmentTableKeepsExistingFollowers) {
   auto current = snapshot();
   auto body = [&](int follower) {
-    return "{\"follower\":\"f" + std::to_string(follower) + "\",\"tenant\":\"default\",\"collection\":\"main\",\"commit\":\"" + current->id.token() + "\"}";
+    return "{\"follower\":\"f" + std::to_string(follower) + "\",\"tenant\":\"t0\",\"collection\":\"main\",\"commit\":\"" + current->id.token() + "\"}";
   };
-  for (int i = 0; i < 4096; i++) node->getReplication().installed({"f" + std::to_string(i), "default", "main", current->id.token()});
+  for (int i = 0; i < 4096; i++) node->getReplication().installed({"f" + std::to_string(i), "t0", "main", current->id.token()});
   EXPECT_EQ(429, httpRequest(server->getPort(), http::verb::post, "/_replication/installed", body(4096)).result_int());
   EXPECT_EQ(200, httpRequest(server->getPort(), http::verb::post, "/_replication/installed", body(0)).result_int());
   EXPECT_EQ(4096u, node->getReplication().status().size());
@@ -366,7 +366,7 @@ TEST_F(ReplicationHttpTest, installedRejectsInvalidAcknowledgments) {
   auto id = snapshot()->id;
   auto post = [&](std::string follower, std::string collection, std::string token) {
     return httpRequest(server->getPort(), http::verb::post, "/_replication/installed",
-        "{\"follower\":\"" + follower + "\",\"tenant\":\"default\",\"collection\":\"" + collection + "\",\"commit\":\"" + token + "\"}");
+        "{\"follower\":\"" + follower + "\",\"tenant\":\"t0\",\"collection\":\"" + collection + "\",\"commit\":\"" + token + "\"}");
   };
   EXPECT_EQ(400, post("", "main", id.token()).result_int());
   EXPECT_EQ(400, post(std::string(256, 'x'), "main", id.token()).result_int());
@@ -396,16 +396,16 @@ TEST_F(ReplicationHttpTest, acknowledgmentsExpireAndWatchRenewsLiveness) {
   ReplicationSource catalog(90s, [&] { return time; });
   catalog.registered(CollectionId::of("main"), node->getCollection("main"));
   auto id = snapshot()->id;
-  for (int i = 0; i < 4096; i++) catalog.installed({"f" + std::to_string(i), "default", "main", id.token()});
+  for (int i = 0; i < 4096; i++) catalog.installed({"f" + std::to_string(i), "t0", "main", id.token()});
   time += 60s;
   catalog.watch({}, "f0", [] {});
   time += 30s;
-  catalog.installed({"f4096", "default", "main", id.token()});
+  catalog.installed({"f4096", "t0", "main", id.token()});
   EXPECT_EQ(2u, catalog.status().size());
   catalog.removed(CollectionId::of("main"));
   for (const auto& row : catalog.status()) EXPECT_TRUE(row.collection.name.empty());
   catalog.registered(CollectionId::of("main"), node->getCollection("main"));
-  catalog.installed({"f0", "default", "main", id.token()});
+  catalog.installed({"f0", "t0", "main", id.token()});
   h->getIndexWriter()->testDeleteAllData();
   catalog.updated(CollectionId::of("main"), h->collection());
   for (const auto& row : catalog.status()) EXPECT_TRUE(row.collection.name.empty());
@@ -492,7 +492,7 @@ TEST_F(ReplicationHttpTest, headAndMonotonicAcknowledgment) {
   ASSERT_TRUE(h->index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
   auto current = registry.snapshot()->id;
   auto ack = [&](const CommitId& id) {
-    node->getReplication().installed({"f", "default", "main", id.token()});
+    node->getReplication().installed({"f", "t0", "main", id.token()});
   };
   ack(current);
   ack(old);
@@ -574,7 +574,7 @@ TEST_F(ReplicationHttpTest, standaloneWaitRetriesAnExistingToken) {
   };
   auto first = wait("1");
   EXPECT_EQ("timed_out", first["replicas"]["outcome"].get<std::string>());
-  node->getReplication().installed({"f", "default", "main", token});
+  node->getReplication().installed({"f", "t0", "main", token});
   auto second = wait("1");
   EXPECT_EQ(token, second["commit"].get<std::string>());
   EXPECT_EQ("satisfied", second["replicas"]["outcome"].get<std::string>());
@@ -628,7 +628,7 @@ TEST_F(ReplicationHttpTest, updateBodiesAreReleasedBeforeReplicaWait) {
     });
     ASSERT_EQ(std::future_status::ready, parked.get_future().wait_for(3s));
     EXPECT_EQ(std::future_status::timeout, response.wait_for(0ms));
-    node->getReplication().installed({"f", "default", "main", snapshot()->id.token()});
+    node->getReplication().installed({"f", "t0", "main", snapshot()->id.token()});
     auto result = response.get();
     EXPECT_EQ(200, result.result_int()) << result.body();
     EXPECT_NE(std::string::npos, result.body().find("satisfied"));
@@ -673,7 +673,7 @@ TEST_F(ReplicationHttpTest, halfClosedClientStillReceivesSatisfiedWait) {
   http::write(socket, request);
   socket.shutdown(tcp::socket::shutdown_send);
   ASSERT_EQ(std::future_status::ready, parked.get_future().wait_for(3s));
-  node->getReplication().installed({"f", "default", "main", token});
+  node->getReplication().installed({"f", "t0", "main", token});
   beast::flat_buffer buffer;
   http::response<http::string_body> response;
   http::read(socket, buffer, response);
@@ -689,7 +689,7 @@ TEST_F(ReplicationHttpTest, watchParsesEveryTenantAndFiltersCatalog) {
   auto result = catalog("/_replication/watch?tenant=alpha&tenant=beta&timeout_ms=0");
   ASSERT_EQ(2u, result["collections"].get<Json::array_t>().size());
   for (const auto& row : result["collections"].get<Json::array_t>())
-    EXPECT_NE("default", row["tenant"].get<std::string>());
+    EXPECT_NE("t0", row["tenant"].get<std::string>());
   for (auto query : {"tenant=", "tenant=alpha&tenant=", "tenant=&tenant=alpha",
                      "tenant=alpha&tenant=Bad", "tenant=alpha,beta", "tenant=.."})
     EXPECT_EQ(400, get(std::string("/_replication/watch?timeout_ms=0&") + query).result_int()) << query;
@@ -789,7 +789,7 @@ TEST_F(ReplicationHttpTest, filesAndAnnouncementsCarryIdentity) {
   EXPECT_EQ(CommitSnapshot::digestText(pinned->digest), announced["collections"][0]["manifest_xxh3"].get<std::string>());
   const auto& file = pinned->files.front();
   auto byIdentity = [&](uint64_t digest) {
-    return "/tenants/default/collections/main/_snapshot/files/" + file.name + "?size=" + std::to_string(file.size)
+    return "/tenants/t0/collections/main/_snapshot/files/" + file.name + "?size=" + std::to_string(file.size)
         + "&xxh3=" + CommitSnapshot::digestText(digest);
   };
   auto direct = get(byIdentity(file.xxh3));
@@ -797,7 +797,7 @@ TEST_F(ReplicationHttpTest, filesAndAnnouncementsCarryIdentity) {
   EXPECT_EQ(get(fileUrl(*pinned, file.name)).body(), direct.body());
   EXPECT_TRUE(direct["X-Luxir-Commit"].empty());
   EXPECT_EQ(404, get(byIdentity(file.xxh3 + 1)).result_int());
-  EXPECT_EQ(400, get("/tenants/default/collections/main/_snapshot/files/" + file.name + "?size=1&xxh3=zz").result_int());
+  EXPECT_EQ(400, get("/tenants/t0/collections/main/_snapshot/files/" + file.name + "?size=1&xxh3=zz").result_int());
 }
 
 }

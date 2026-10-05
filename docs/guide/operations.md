@@ -89,9 +89,10 @@ Deletion waits for indexing work already accepted, including a running merge,
 so deleting a collection mid-merge can take as long as that merge.
 
 On the filesystem backend collections use
-`c/<tenant>/<name>/<incarnation>/`, selected by an atomically replaced `CURRENT`
-file in `c/<tenant>/<name>/`. Single-tenant deployments use the `default`
-tenant. `c/LAYOUT` names this layout; a data directory written in another layout
+`t/<tenant>/<name>/<incarnation>/`, selected by an atomically replaced `CURRENT`
+file in `t/<tenant>/<name>/`. Single-tenant deployments use the default tenant
+`t0`, so the default collection lives in `t/t0/main/`. An incarnation is 16 hex
+digits. `t/LAYOUT` names this layout; a data directory written in another layout
 is refused at startup and must be reindexed. Deletion removes and
 syncs `CURRENT` before removing the directory tree, so an interrupted deletion
 cannot reopen the partially deleted index. If

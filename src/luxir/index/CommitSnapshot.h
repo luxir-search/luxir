@@ -15,6 +15,10 @@ struct CommitId {
   uint64_t index_gen = 0;
   std::string token() const;
   static CommitId parse(std::string_view token);
+  // A collection identity: 64 random bits as 16 lowercase hex digits. It also
+  // names the incarnation's directory.
+  static std::string newIncarnation();
+  static bool validIncarnation(std::string_view value);
   auto operator<=>(const CommitId&) const = default;
 };
 

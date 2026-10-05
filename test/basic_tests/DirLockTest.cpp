@@ -139,18 +139,25 @@ TEST(DirLockTest, readOnlyDecoratorWorksOverRam) {
 TEST(DirLockTest, refusesDataFromAnotherLayout) {
   TempDir tempDir;
   { FSDirFactory writer(tempDir.path()); }
-  EXPECT_TRUE(std::filesystem::exists(tempDir.path() / "c" / "LAYOUT"));
-  std::filesystem::remove(tempDir.path() / "c" / "LAYOUT");
-  std::filesystem::create_directories(tempDir.path() / "c" / "main");
+  EXPECT_TRUE(std::filesystem::exists(tempDir.path() / "t" / "LAYOUT"));
+  std::filesystem::remove(tempDir.path() / "t" / "LAYOUT");
+  std::filesystem::create_directories(tempDir.path() / "t" / "main");
   EXPECT_THROW(FSDirFactory writer(tempDir.path()), std::runtime_error);
   EXPECT_THROW(FSDirFactory reader(tempDir.path(), /*unowned=*/true), std::runtime_error);
 }
 
 TEST(DirLockTest, resumesAnInterruptedLayoutMarker) {
   TempDir tempDir;
-  std::filesystem::create_directories(tempDir.path() / "c");
-  std::ofstream(tempDir.path() / "c" / "LAYOUT.pending") << "partial";
+  std::filesystem::create_directories(tempDir.path() / "t");
+  std::ofstream(tempDir.path() / "t" / "LAYOUT.pending") << "partial";
   { FSDirFactory writer(tempDir.path()); }
-  EXPECT_TRUE(std::filesystem::exists(tempDir.path() / "c" / "LAYOUT"));
+  EXPECT_TRUE(std::filesystem::exists(tempDir.path() / "t" / "LAYOUT"));
   EXPECT_NO_THROW({ FSDirFactory writer(tempDir.path()); });
+}
+
+TEST(DirLockTest, refusesTheEarlierCollectionsDirectory) {
+  TempDir tempDir;
+  std::filesystem::create_directories(tempDir.path() / "c" / "default" / "main");
+  EXPECT_THROW(FSDirFactory writer(tempDir.path()), std::runtime_error);
+  EXPECT_THROW(FSDirFactory reader(tempDir.path(), /*unowned=*/true), std::runtime_error);
 }

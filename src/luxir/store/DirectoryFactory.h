@@ -65,8 +65,8 @@ public:
   uint64_t bytes();
 };
 
-/// Opens collection storage under c/: c/tenant/name holds CURRENT, which
-/// selects c/tenant/name/incarnation. Lives on LuxirNode - one per instance.
+/// Opens collection storage under t/: t/tenant/name holds CURRENT, which
+/// selects t/tenant/name/incarnation. Lives on LuxirNode - one per instance.
 /// The virtual members are backend primitives behind CollectionStorage; wrapping
 /// factories override every one of them.
 class DirectoryFactory {
@@ -79,12 +79,12 @@ public:
   virtual uint64_t storageBytes() { return 0; }
   virtual uint64_t collectionBytes(const CollectionId& id) { unused(id); return 0; }
 
-  // Opens c/tenant/name. Without `create` a missing directory is an error and
+  // Opens t/tenant/name. Without `create` a missing directory is an error and
   // nothing is created; with it, created directory entries are durable on return.
   virtual std::shared_ptr<Directory> container(const CollectionId& id, bool create) = 0;
-  // As container(), for c/tenant/name/incarnation; creation includes the container.
+  // As container(), for t/tenant/name/incarnation; creation includes the container.
   virtual std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) = 0;
-  // Exclusive, durable creation of c/tenant/name; throws if it already exists.
+  // Exclusive, durable creation of t/tenant/name; throws if it already exists.
   virtual void createCollection(const CollectionId& id) = 0;
   virtual std::vector<std::string> incarnations(const CollectionId& id) = 0;
   virtual void removeIncarnation(const CollectionId& id, std::string_view incarnation) = 0;
@@ -225,7 +225,7 @@ public:
 };
 
 
-/// Factory that opens FSDirectory instances under basePath_/c/tenant/.
+/// Factory that opens FSDirectory instances under basePath_/t/tenant/.
 /// Shared resources (dictionaries, etc.) live directly under basePath_.
 ///
 /// `unowned` opens an existing data directory without claiming it: no
@@ -235,14 +235,15 @@ public:
 /// job, and the two are meant to be composed (see Collections).
 class FSDirFactory : public DirectoryFactory {
   std::filesystem::path basePath_;
-  std::filesystem::path collectionsPath_;  // basePath_/c
+  std::filesystem::path collectionsPath_;  // basePath_/t
   std::optional<FileLock> lock_;
   bool unowned;
 
   std::filesystem::path pathOf(const CollectionId& id) const { return collectionsPath_ / id.tenant / id.name; }
 
-  // c/LAYOUT names the directory layout, so data from an incompatible layout is
-  // refused as a whole instead of misread collection by collection.
+  // t/LAYOUT names the directory layout, so data from an incompatible layout is
+  // refused as a whole instead of misread collection by collection. Collections
+  // of earlier layouts lived under c/.
   static constexpr std::string_view kLayoutFile = "LAYOUT";
   static constexpr std::string_view kLayout = "tenant/collection/incarnation 1\n";
   void checkLayout() {
@@ -253,7 +254,7 @@ class FSDirFactory : public DirectoryFactory {
       if (text != kLayout) throw std::runtime_error("unsupported data directory layout in " + marker.string() + "; reindex it");
       return;
     }
-    if (!holdsNoCollections(collectionsPath_)) {
+    if (!holdsNoCollections(collectionsPath_) || std::filesystem::exists(basePath_ / "c")) {
       throw std::runtime_error("data directory " + basePath_.string() + " predates the tenant layout; reindex it");
     }
     if (unowned) return;
@@ -272,9 +273,12 @@ class FSDirFactory : public DirectoryFactory {
 public:
   explicit FSDirFactory(std::filesystem::path path, bool unowned = false)
       : basePath_(std::move(path)),
-        collectionsPath_(basePath_ / "c"), unowned(unowned) {
+        collectionsPath_(basePath_ / "t"), unowned(unowned) {
     if (unowned) {
       if (!std::filesystem::is_directory(collectionsPath_)) {
+        if (std::filesystem::exists(basePath_ / "c")) {
+          throw std::runtime_error("data directory " + basePath_.string() + " predates the tenant layout; reindex it");
+        }
         throw ReadOnlyError("data directory does not exist (or holds no collections): " +
                             basePath_.string());
       }
@@ -291,7 +295,7 @@ public:
       LOG_INFO("Using existing data directory: {}", basePath_.string());
     }
     lock_.emplace(basePath_ / "write.lock");
-    // Every owned open re-syncs the entry for c/: an earlier creation may have
+    // Every owned open re-syncs the entry for t/: an earlier creation may have
     // failed after mkdir, before the entry was durable.
     if (!baseExisted && basePath_.has_parent_path()) syncDirectory(basePath_.parent_path());
     syncDirectory(basePath_);

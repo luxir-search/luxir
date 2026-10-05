@@ -157,7 +157,8 @@ Commit whichever way fits:
 
 An empty commit object commits immediately and the response waits for
 publication. The response's optional `commit` field identifies the resulting
-snapshot as the token `"<collection UUID>:42"` (`incarnation:index_gen`). The
+snapshot as the token `"9f3c2a71d04be6a5:42"` (`incarnation:index_gen`, where the
+incarnation is 16 hex digits). The
 incarnation is part of the identity: deleting and recreating a collection changes its incarnation. Updates acknowledged before publication
 (including deferred commits) omit it. A forced merge returns the final merged
 snapshot's id. An NDJSON URL EOF commit always returns

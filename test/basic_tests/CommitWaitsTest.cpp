@@ -41,7 +41,7 @@ TEST_F(CommitWaitsTest, injectedClockDrivesFloorsReplicasAndCapturedLiveness) {
   CommitWaits waits(source, true, now);
   source.onAcknowledgmentsChanged([&](const CollectionId* id) { waits.acknowledged(id); });
   source.registered(CollectionId::of("main"), collection); waits.registered(CollectionId::of("main"), collection);
-  source.installed({"first", "default", "main", id.token()});
+  source.installed({"first", "t0", "main", id.token()});
   auto future = id; future.index_gen++;
   std::optional<CommitWaits::CommitResult> floor;
   std::optional<api::ReplicaResult> count, all;
@@ -117,7 +117,7 @@ TEST_F(CommitWaitsTest, allMembershipIsCapturedAtLocalCompletion) {
   message->resultingCommit = h.collection().getShard()->getSnapshots().snapshot()->id;
   auto completed = message->takeCompletion(node);
   message.reset();
-  node.getReplication().installed({"late", "default", "main", old.token()});
+  node.getReplication().installed({"late", "t0", "main", old.token()});
   bool delivered = false;
   completed->await(node, [&](auto result) {
     delivered = true;
@@ -134,7 +134,7 @@ TEST_F(CommitWaitsTest, allExpiryCompletesWithoutHttpMaintenance) {
   ReplicationSource source(30ms);
   CommitWaits waits(source, false);
   source.registered(CollectionId::of("main"), collection); waits.registered(CollectionId::of("main"), collection);
-  source.installed({"f", "default", "main", id.token()});
+  source.installed({"f", "t0", "main", id.token()});
   id.index_gen++;
   std::promise<api::ReplicaResult> completed;
   waits.awaitReplicas(CollectionId::of("main"), id, {api::AllReplicas{}}, waits.deadlineAfter(30000), {},
@@ -150,7 +150,7 @@ TEST_F(CommitWaitsTest, subscriptionChangePrunesAcksAndReleasesCapturedAll) {
   auto id = node.getCollection("main")->getShard()->getSnapshots().snapshot()->id;
   auto& source = node.getReplication();
   auto& waits = node.getCommitWaits();
-  source.installed({"f", "default", "main", id.token()});
+  source.installed({"f", "t0", "main", id.token()});
   std::optional<api::ReplicaResult> result;
   auto future = id; future.index_gen++;
   waits.awaitReplicas(CollectionId::of("main"), future, {api::AllReplicas{}}, waits.deadlineAfter(30000), {},
@@ -161,13 +161,13 @@ TEST_F(CommitWaitsTest, subscriptionChangePrunesAcksAndReleasesCapturedAll) {
   ASSERT_TRUE(result);
   EXPECT_EQ(Outcome::SATISFIED, result->outcome);
   EXPECT_EQ(0u, result->wanted);
-  EXPECT_THROW(source.installed({"f", "default", "main", id.token()}), std::invalid_argument);
+  EXPECT_THROW(source.installed({"f", "t0", "main", id.token()}), std::invalid_argument);
   EXPECT_TRUE(source.capture({api::AllReplicas{}}, CollectionId::of("main"), id).members.empty());
   EXPECT_EQ(0u, source.progress(source.capture({uint32_t{1}}, CollectionId::of("main"), id), CollectionId::of("main"), id).serving);
   // Re-inclusion needs a fresh acknowledgment; old rows do not resurrect.
   source.watch({}, "f", [] {});
   EXPECT_TRUE(source.capture({api::AllReplicas{}}, CollectionId::of("main"), id).members.empty());
-  source.installed({"f", "default", "main", id.token()});
+  source.installed({"f", "t0", "main", id.token()});
   EXPECT_EQ(1u, source.capture({api::AllReplicas{}}, CollectionId::of("main"), id).members.size());
 }
 
@@ -177,8 +177,8 @@ TEST_F(CommitWaitsTest, unsubscribeAndRejoinDoesNotReenterCapturedAll) {
   auto id = node.getCollection("main")->getShard()->getSnapshots().snapshot()->id;
   auto& source = node.getReplication();
   auto& waits = node.getCommitWaits();
-  source.installed({"f", "default", "main", id.token()});
-  source.installed({"g", "default", "main", id.token()});
+  source.installed({"f", "t0", "main", id.token()});
+  source.installed({"g", "t0", "main", id.token()});
   auto future = id; future.index_gen++;
   std::optional<api::ReplicaResult> result;
   waits.awaitReplicas(CollectionId::of("main"), future, {api::AllReplicas{}}, waits.deadlineAfter(30000), {},
@@ -187,11 +187,11 @@ TEST_F(CommitWaitsTest, unsubscribeAndRejoinDoesNotReenterCapturedAll) {
   source.watch({}, "f", [] {}, alpha);
   EXPECT_FALSE(result);
   source.watch({}, "f", [] {});
-  source.installed({"f", "default", "main", id.token()});
+  source.installed({"f", "t0", "main", id.token()});
   EXPECT_FALSE(result);
   CollectionHelper h(node, "main");
   ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
-  source.installed({"g", "default", "main", future.token()});
+  source.installed({"g", "t0", "main", future.token()});
   ASSERT_TRUE(result);
   EXPECT_EQ(Outcome::SATISFIED, result->outcome);
   EXPECT_EQ(1u, result->wanted);

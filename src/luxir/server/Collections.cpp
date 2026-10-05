@@ -178,7 +178,7 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   bool creating = !selected;
   if (creating) {
     if (storage.hasFiles() || !storage.incarnations().empty()) throw std::runtime_error("Collection files exist without CURRENT");
-    selected = newUuid();
+    selected = CommitId::newIncarnation();
   } else {
     auto manifest = Manifest::load(*storage.open(*selected));
     if (manifest.bytes && manifest.generation != manifest.highestGeneration) {
@@ -228,16 +228,16 @@ std::vector<Collections::Opened> Collections::open(Role role) {
       auto storage = factory->collection(name);
       if (!createDefault) {
         row.incarnation = storage.current();
-        if (row.incarnation && !isUuid(*row.incarnation)) throw std::runtime_error("CURRENT selects an invalid incarnation");
+        if (row.incarnation && !CommitId::validIncarnation(*row.incarnation)) throw std::runtime_error("CURRENT selects an invalid incarnation");
         if (!row.incarnation && role == Role::FOLLOWER) {
           if (storage.hasFiles()) throw std::runtime_error("Collection has files without CURRENT");
           for (const auto& incarnation : storage.incarnations()) {
-            if (!isUuid(incarnation)) throw std::runtime_error("Collection has an invalid incarnation directory");
+            if (!CommitId::validIncarnation(incarnation)) throw std::runtime_error("Collection has an invalid incarnation directory");
           }
           rows.push_back(std::move(row)); // completed candidate files survive a restarted download
           continue;
         }
-        if (!row.incarnation && role == Role::WRITER && !storage.hasFiles() && std::ranges::all_of(storage.incarnations(), isUuid)) {
+        if (!row.incarnation && role == Role::WRITER && !storage.hasFiles() && std::ranges::all_of(storage.incarnations(), CommitId::validIncarnation)) {
           storage.remove();
           LOG_INFO("Removed unselected collection: {}", name.label());
           continue;

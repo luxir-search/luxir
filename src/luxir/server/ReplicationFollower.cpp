@@ -40,13 +40,7 @@ std::string escape(std::string_view value) {
   return out;
 }
 void validateIncarnation(std::string_view value) {
-  if (value.size() != 36) throw std::invalid_argument("invalid source incarnation");
-  for (size_t i = 0; i < value.size(); i++) {
-    bool dash = i == 8 || i == 13 || i == 18 || i == 23;
-    if (dash ? value[i] != '-' : !std::isxdigit((unsigned char)value[i])) {
-      throw std::invalid_argument("invalid source incarnation");
-    }
-  }
+  if (!CommitId::validIncarnation(value)) throw std::invalid_argument("invalid source incarnation");
 }
 void syncDir(Directory& dir) {
   std::array<std::string, 1> names{"."};
@@ -290,7 +284,7 @@ struct ReplicationFollower::Impl {
       if (fs) for (const auto& entry : std::filesystem::directory_iterator(node.getConfig().store.data_dir)) {
         auto name = entry.path().filename().string();
         if (name == "write.lock" || name == "replication.json.pending") continue;
-        if (name == "c" && FSDirFactory::holdsNoCollections(entry.path())) continue;
+        if (name == "t" && FSDirFactory::holdsNoCollections(entry.path())) continue;
         throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
       }
       if (binding.follower.empty()) binding.follower = newUuid();

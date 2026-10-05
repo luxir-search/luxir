@@ -4,13 +4,13 @@
 #include "Promotion.h"
 #include "ReplicationState.h"
 #include "luxir/util/Signal.h"
-#include "luxir/util/Uuid.h"
+#include "luxir/index/CommitSnapshot.h"
 
 namespace luxir {
 
 std::string copySnapshot(CollectionStorage& storage, std::string_view from, const Manifest& manifest) {
   auto old = storage.open(from);
-  auto incarnation = newUuid();
+  auto incarnation = CommitId::newIncarnation();
   auto next = storage.create(incarnation);
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(manifest.bytes, arena);
@@ -38,7 +38,7 @@ namespace {
 bool validTarget(CollectionStorage& storage, const std::string& incarnation) {
   try {
     auto incarnations = storage.incarnations();
-    if (!isUuid(incarnation) || std::ranges::find(incarnations, incarnation) == incarnations.end()) return false;
+    if (!CommitId::validIncarnation(incarnation) || std::ranges::find(incarnations, incarnation) == incarnations.end()) return false;
     auto target = Manifest::load(*storage.open(incarnation));
     if (!target.bytes) return false;
     std::pmr::monotonic_buffer_resource arena;

@@ -5,7 +5,7 @@ Collection names live in the path, and the request body uses the same field
 names as the protobuf messages.
 
 Collections belong to a tenant. Search, update and replica-wait routes act in
-the caller's own tenant, which is the `default` tenant until requests carry
+the caller's own tenant, which is the default tenant `t0` until requests carry
 credentials. Administration and snapshot routes may name another tenant under
 `/tenants/{tenant}`.
 

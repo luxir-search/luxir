@@ -4,6 +4,7 @@
 #include "CommitSnapshot.h"
 #include <charconv>
 #include <format>
+#include <random>
 #include "luxir/api/index_files.h"
 #include "luxir/store/Manifest.h"
 
@@ -31,6 +32,15 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshot::fromBytes(Bytes bytes) {
       Schema::fromStored(*info.schema, info.schema_gen),
       CommitId{std::string(info.incarnation), info.index_gen}, info.commit_time, filesOf(info), populatedOf(info),
       digestOf(*bytes));
+}
+
+std::string CommitId::newIncarnation() {
+  std::random_device random;
+  return std::format("{:016x}", ((uint64_t)random() << 32) | (uint32_t)random());
+}
+
+bool CommitId::validIncarnation(std::string_view value) {
+  return value.size() == 16 && std::ranges::all_of(value, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
 
 std::string CommitSnapshot::digestText(uint64_t digest) { return std::format("{:016x}", digest); }

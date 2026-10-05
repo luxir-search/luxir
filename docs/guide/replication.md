@@ -211,7 +211,7 @@ per socket write, so one stalled client cannot hold a transfer indefinitely whil
 another client renews their shared pin. Followers back off after a lost
 pin.
 
-Storage layout is `c/tenant/name/incarnation/`, with `CURRENT` containing
+Storage layout is `t/tenant/name/incarnation/`, with `CURRENT` containing
 only the selected incarnation. `replication.json` stores follower identity,
 last source URL and discovery/recovery state; it does not bind the source URL.
 

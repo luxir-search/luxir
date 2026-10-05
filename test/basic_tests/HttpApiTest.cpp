@@ -935,7 +935,7 @@ TEST_F(HttpApiTest, unsafeCollectionNamesAreRejectedBeforeCreate) {
 
   localServer.shutdown();
 
-  EXPECT_FALSE(std::filesystem::exists(base / "c" / "default" / "unsafe"));
+  EXPECT_FALSE(std::filesystem::exists(base / "t" / "t0" / "unsafe"));
   EXPECT_FALSE(std::filesystem::exists(absolute));
   std::filesystem::remove_all(base);
 }
@@ -962,9 +962,9 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
     localServer.shutdown();
   }
 
-  FSDirectory container(base / "c" / "default" / "bad");
+  FSDirectory container(base / "t" / "t0" / "bad");
   auto incarnation = *CollectionStorage::current(container);
-  for (const auto& file : std::filesystem::directory_iterator(base / "c" / "default" / "bad" / incarnation)) {
+  for (const auto& file : std::filesystem::directory_iterator(base / "t" / "t0" / "bad" / incarnation)) {
     if (!Manifest::generationOf(file.path().filename().string())) continue;
     std::ofstream out(file.path(), std::ios::binary | std::ios::trunc);
     out << "\xff\xff\xff\xff\xff\xff\xff\xff";
@@ -4130,7 +4130,7 @@ TEST_F(HttpApiTest, ndjsonEofKeepsDurableTokensAfterReplicaWaitFailure) {
   auto removed = failed.collection().getShard()->getSnapshots().snapshot()->id.token();
   auto kept = other.collection().getShard()->getSnapshots().snapshot()->id.token();
   node.deleteCollection("failed");
-  node.getReplication().installed({"test", "default", "kept", kept});
+  node.getReplication().installed({"test", "t0", "kept", kept});
   auto result = response.get();
   ASSERT_EQ(200, result.result_int()) << result.body();
   auto lines = splitLines(result.body());
