@@ -712,6 +712,8 @@ public:
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
+      // TODO: stream into FieldBucketFinalizer instead of collecting every
+      // counted value (see finalizeFieldBuckets in FacetEmit.h).
       std::vector<FacetCandidate<int64_t>> candidates;
       // Both storage types (monostate -> neither -> empty result, e.g. empty index).
       if (auto* countMap = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
@@ -1083,6 +1085,8 @@ public:
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
+      // TODO: stream into FieldBucketFinalizer instead of collecting every
+      // counted value (see finalizeFieldBuckets in FacetEmit.h).
       std::vector<FacetCandidate<std::string>> candidates;
       for (auto [val, count] : merged.counts) {
         candidates.push_back({std::move(val), count, {}});

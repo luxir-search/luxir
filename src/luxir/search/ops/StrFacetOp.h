@@ -46,23 +46,24 @@ inline const char* domainDesc(DocSet* domain) {
                                             : "bitset domain";
 }
 
-template<typename Counter>
+// `out` takes add(ord, count) per counted ord and reports size(), the number
+// added so far.
+template<typename Counter, typename Sink>
 inline void collectSparseCounts(
-    Counter& counter, int64_t min, int64_t limit,
-    std::vector<std::pair<int64_t, int64_t>>& ordCounts,
+    Counter& counter, int64_t min, int64_t limit, Sink& out,
     bool allowEarlyStop = true) {
   // Overflowed ords are guaranteed to outrank every non-overflowed ord. Fold
   // their low bits first and clear those slots so a later scan cannot count
   // them twice.
   counter.foldOverflow([&](int64_t ord, int64_t total) {
     if (total >= min) {
-      ordCounts.emplace_back(ord, total);
+      out.add(ord, total);
     }
   });
 
   bool sortingByCountDesc = true;  // FUTURE
   if (allowEarlyStop && sortingByCountDesc && limit != -1
-      && (int64_t)ordCounts.size() >= limit) {
+      && (int64_t)out.size() >= limit) {
     // The top-K is already in hand, so release the potentially large sparse
     // table instead of scanning it.
     counter.releaseStorage();
@@ -71,7 +72,7 @@ inline void collectSparseCounts(
 
   counter.forEachCount([&](int64_t ord, int64_t count) {
     if (count >= min) {
-      ordCounts.emplace_back(ord, count);
+      out.add(ord, count);
     }
   });
 }
@@ -97,6 +98,33 @@ inline void collectSparseCounts(
 //    segments will actually be more important.
 //
 
+// A field facet over a string field returns one page: the `limit` buckets with
+// the highest counts in the request's domain, ties going to the smaller global
+// ord (countFieldBucketOrder). Selected values are merged into the page with
+// their own counts, and mincount=0 pads a short page with zero-count values.
+//
+// The common route, through Calc:
+//   1. Count (countSegment, per segment): each matching document's value ords
+//      bump a counter whose representation follows the note above (vector,
+//      skinny byte counter with an overflow map, or hash). A whole-segment,
+//      delete-free domain can instead use the field's global docFreq top
+//      terms without counting.
+//   2. Merge: segments contribute into one MergeableStrData through the
+//      SegmentMergeDriver.
+//   3. Select (facetResult): every counted ord streams through OrdCountSink
+//      into a bounded FieldBucketFinalizer. Nothing holds one entry per
+//      counted ord; once the page is full, an ord that cannot beat its worst
+//      bucket costs one comparison.
+//   4. Emit (emitPage): ords become labels, the page is written to the
+//      response, and deferred sub-ops run per returned bucket.
+//
+// Two other routes: a facet sorted by a sub-op, or one whose inlinable sub-ops
+// must be computed for every bucket anyway, aggregates per bucket inline and
+// selects in facetResult2. A string facet nested under a string facet
+// (ColumnReplayExecutor) walks the parent's ord column once per segment,
+// routing each document's child ords to the row of the returned parent
+// bucket that holds it; each row's page is then selected through
+// finalizeOrdCounts.
 class StrFacetOp : public FieldFacetReq {
   // Refittable AUTO crossover. With ten buckets and three metrics, inline-all
   // won at 100K matching docs and lost at 10K; 48K is the initial bracketed
@@ -367,50 +395,101 @@ public:
            });
   }
 
-  // pinCounts carries the count each selected value was found to have, read by
-  // point lookup from the counter while it was still alive (see facetResult).
-  // Selection never sees the pins, so nothing here scales with how many are set.
-  std::vector<FinalizedFacetBucket<int64_t>> finalizeOrdCounts(
-      std::vector<std::pair<int64_t, int64_t>>& ordCounts,
-      bool allowZeroPadding,
-      std::span<const int64_t> pinCounts = {}) const {
-    // ordCounts holds one entry per counted ord, which for a high-cardinality
-    // field is most of the domain's distinct values. Stream it through the
-    // finalizer's bounded heap rather than copying it into a candidate vector
-    // first: a uniform 2M-value field over a 10M-doc domain would otherwise
-    // allocate and fill tens of MB per request to return one page.
+  // Selects one facet's page from its counted ords as the counter yields them.
+  // A high-cardinality field counts most of the domain's distinct values, so
+  // nothing here holds one entry per counted ord: a uniform 2M-value field
+  // over a 10M-doc domain would otherwise allocate and fill tens of MB per
+  // request to return one page.
+  class OrdCountSink {
+    const StrFacetOp& op;
     FieldBucketFinalizer<int64_t, std::monostate,
-                         decltype(countFieldBucketOrder)>
-        finalizer(minCount, 0, limit, countFieldBucketOrder);
-    finalizer.addRange(ordCounts.begin(), ordCounts.end(),
-        [](const std::pair<int64_t, int64_t>& entry) {
-          return FacetCandidate<int64_t>{entry.first, entry.second, {}};
-        });
+                         decltype(countFieldBucketOrder)> finalizer;
+    // Zero-count padding (mincount=0) is only needed while the counted ords do
+    // not fill the page, so only that many of them are remembered.
+    size_t paddingTarget = 0;
+    std::vector<int64_t> countedOrds;
+    size_t counted = 0;
+    // Once the page is full, the bucket a newcomer must beat. Nearly every
+    // counted ord of a high-cardinality field loses to it, so that comparison
+    // is the per-ord cost; only admissions reach the finalizer.
+    bool full = false;
+    int64_t floorCount = 0;
+    int64_t floorOrd = 0;
 
-    // Zero-count padding can only be needed when the counted ords do not
-    // already fill the page, so sizes decide that before anything is built -
-    // and when they do not fill it there are fewer of them than the page.
-    if (allowZeroPadding && minCount == 0) {
-      int64_t numGlobalOrds = ordMap ? ordMap->numOrds() : 0;
-      size_t target = limit < 0 ? (size_t)numGlobalOrds : (size_t)limit;
-      if (ordCounts.size() < target) {
-        boost::unordered_flat_set<int64_t> present;
-        present.reserve(ordCounts.size());
-        for (auto [ord, count] : ordCounts) {
-          unused(count);
-          present.insert(ord);
-        }
-        size_t emitted = ordCounts.size();
+    LUXIR_NOINLINE void admit(int64_t ord, int64_t count) {
+      finalizer.add({ord, count, {}});
+      if (const auto* worst = finalizer.worst()) {
+        full = true;
+        floorCount = worst->count;
+        floorOrd = worst->key;
+      }
+    }
+
+  public:
+    OrdCountSink(const StrFacetOp& op, bool allowZeroPadding)
+      : op(op),
+        finalizer(op.minCount, 0, op.limit, countFieldBucketOrder) {
+      if (allowZeroPadding && op.minCount == 0) {
+        int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
+        paddingTarget = op.limit < 0 ? (size_t)numGlobalOrds : (size_t)op.limit;
+      }
+    }
+
+    LUXIR_INLINE void add(int64_t ord, int64_t count) {
+      if (counted < paddingTarget) countedOrds.push_back(ord);
+      counted++;
+      // countFieldBucketOrder: a newcomer must beat the page's worst bucket
+      // on count, or tie it with a smaller ord.
+      if (full && (count < floorCount
+                   || (count == floorCount && ord > floorOrd))) {
+        return;
+      }
+      admit(ord, count);
+    }
+
+    // Counted ords added so far.
+    size_t size() const { return counted; }
+
+    // pinCounts carries the count each selected value was found to have, read
+    // by point lookup from the counter while it was still alive (see
+    // facetResult). Selection never sees the pins, so nothing here scales with
+    // how many are set.
+    std::vector<FinalizedFacetBucket<int64_t>> finish(
+        std::span<const int64_t> pinCounts = {}) {
+      if (counted < paddingTarget) {
+        boost::unordered_flat_set<int64_t> present(
+            countedOrds.begin(), countedOrds.end());
+        int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
+        size_t emitted = counted;
         for (int64_t ord = 0;
-             ord < numGlobalOrds && emitted < target; ord++) {
+             ord < numGlobalOrds && emitted < paddingTarget; ord++) {
           if (present.contains(ord)) continue;
           finalizer.add({ord, 0, {}});
           emitted++;
         }
       }
+      return op.finishPage(finalizer.finish(), pinCounts);
     }
+  };
 
-    auto page = finalizer.finish();
+  OrdCountSink ordCountSink(bool allowZeroPadding) const {
+    return OrdCountSink(*this, allowZeroPadding);
+  }
+
+  // TODO: the nested replay still hands each parent bucket's child counts over
+  // as a vector; have the replay bank stream its rows into an OrdCountSink and
+  // delete this wrapper.
+  std::vector<FinalizedFacetBucket<int64_t>> finalizeOrdCounts(
+      const std::vector<std::pair<int64_t, int64_t>>& ordCounts,
+      bool allowZeroPadding) const {
+    auto sink = ordCountSink(allowZeroPadding);
+    for (auto [ord, count] : ordCounts) sink.add(ord, count);
+    return sink.finish();
+  }
+
+  std::vector<FinalizedFacetBucket<int64_t>> finishPage(
+      std::vector<FinalizedFacetBucket<int64_t>> page,
+      std::span<const int64_t> pinCounts) const {
     if (!pinnedBuckets.empty()) {
       std::vector<std::optional<int64_t>> pinKeys;
       std::vector<PinnedBucketValue<>> pinValues;
@@ -1149,7 +1228,6 @@ public:
       auto limit = thisOp().limit;
 
       auto missing_count = mergedData->missing_num;
-      std::vector<std::pair<int64_t, int64_t>> ordCounts;
 
       int64_t numSegments = (int64_t)thisOp().reader.segments().size();
       bool allTopTerms =
@@ -1178,6 +1256,7 @@ public:
       bool haveOrdCounts =
           allTopTerms
           || !std::holds_alternative<std::monostate>(mergedData->counts);
+      auto ordCounts = thisOp().ordCountSink(haveOrdCounts);
       if (haveOrdCounts) {
         auto* mapCounts = std::get_if<MergeableStrData::OrdHash>(&mergedData->counts);
         auto* skinnyCounts = std::get_if<SkinnyCounter8>(&mergedData->counts);
@@ -1231,18 +1310,18 @@ public:
           for (const auto& entry : thisOp().ordMap->topTerms().entries) {
             if (entry.df < min) break;
             if ((int64_t)ordCounts.size() == limit) break;
-            ordCounts.emplace_back(entry.ord, entry.df);
+            ordCounts.add(entry.ord, entry.df);
           }
         } else if (mapCounts) {
           for (auto& [val, count] : *mapCounts) {
             if (count >= min) {
-              ordCounts.emplace_back(val, count);
+              ordCounts.add(val, count);
             }
           }
         } else if (vecCounts) {
           for (size_t i = 0; i < vecCounts->size(); i++) {
             if ((*vecCounts)[i] >= min) {
-              ordCounts.emplace_back(i, (*vecCounts)[i]);
+              ordCounts.add(i, (*vecCounts)[i]);
             }
           }
         } else if (skinnyCounts) {
@@ -1251,7 +1330,7 @@ public:
             count += skinnyCounts->counts[ord];
             skinnyCounts->counts[ord] = 0;
             if (count >= min) {
-              ordCounts.emplace_back(ord, count);
+              ordCounts.add(ord, count);
             }
           }
 
@@ -1266,7 +1345,7 @@ public:
             for (size_t ord = 0; ord < skinnyCounts->counts.size(); ord++) {
               auto count = skinnyCounts->counts[ord];
               if (count >= min) {
-                ordCounts.emplace_back(ord, count);
+                ordCounts.add(ord, count);
               }
             }
           }
@@ -1307,16 +1386,11 @@ public:
       }
 
       mergedData.reset();
-      finishOrdCounts(std::move(ordCounts), missing_count, haveOrdCounts,
-                      pinCounts);
+      emitPage(ordCounts.finish(pinCounts), missing_count);
     }
 
-    void finishOrdCounts(
-        std::vector<std::pair<int64_t, int64_t>> ordCounts,
-        int64_t missingCount, bool allowZeroPadding = true,
-        std::span<const int64_t> pinCounts = {}) {
-      auto finalized = thisOp().finalizeOrdCounts(ordCounts, allowZeroPadding,
-                                                  pinCounts);
+    void emitPage(std::vector<FinalizedFacetBucket<int64_t>> finalized,
+                  int64_t missingCount) {
 
       std::vector<std::pair<std::string, int64_t>> countVec;
       std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
