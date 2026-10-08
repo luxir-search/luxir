@@ -3,8 +3,6 @@
 
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/util/MappedAlloc.h"
-#include "luxir/util/DeadlineScheduler.h"
-#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -135,42 +133,6 @@ extent_hooks_t* hugePageHooks(bool wholePurge) {
 #endif
 } // namespace
 
-struct AllocatorArena::IdleDecay {
-#if LUXIR_JEMALLOC
-  using Clock = DeadlineScheduler::Clock;
-  AllocatorArena& owner;
-  std::chrono::milliseconds interval;
-  std::chrono::milliseconds decayTime;
-  std::atomic<Clock::duration::rep> lastFree{Clock::now().time_since_epoch().count()};
-  DeadlineScheduler& scheduler = DeadlineScheduler::global();
-  DeadlineScheduler::Slot slot{[this] { tick(); }};
-
-  IdleDecay(AllocatorArena& owner, int64_t decayMs)
-      : owner(owner), interval(std::min(decayMs, (int64_t)1000)), decayTime(decayMs) {
-    // Register and start the worker here, so freeing a buffer cannot allocate
-    // scheduler storage or create a thread. Later arms only tighten its deadline.
-    try { arm(); }
-    catch (...) { scheduler.detach(slot); throw; }
-  }
-  ~IdleDecay() { scheduler.detach(slot); }
-
-  void arm() { scheduler.arm(slot, Clock::now() + interval); }
-
-  void freed() {
-    lastFree.fetch_max(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
-    arm();
-  }
-
-  void tick() {
-    owner.arenaControl("decay");
-    auto last = Clock::time_point(Clock::duration(lastFree.load(std::memory_order_relaxed)));
-    // Keep ticking through the decay window. A concurrent free also arms, so
-    // stopping here cannot lose a wakeup.
-    if (Clock::now() - last <= decayTime + interval) arm();
-  }
-#endif
-};
-
 AllocatorArena::AllocatorArena(const char* name, AllocatorArenaOptions options)
     : hugePages(options.hugePages || options.wholeHugePagePurge) {
 #if LUXIR_JEMALLOC
@@ -200,12 +162,10 @@ AllocatorArena::AllocatorArena(const char* name, AllocatorArenaOptions options)
         }
       }
     }
-    // In 5.4, a non-background caller's arena.decay defers purging when
-    // background threads are enabled. Their early wakes are threshold-based,
-    // so ticks cannot enforce this arena's decay deadline in that mode.
-    if (options.dirtyDecayMs && *options.dirtyDecayMs > 0 && !allocatorBackgroundThreadsEnabled()) {
-      idleDecay = std::make_unique<IdleDecay>(*this, *options.dirtyDecayMs);
-    }
+    // jemalloc 5.4 assigns even explicit arenas to background workers by index
+    // modulo max_background_threads. Epoch advances and deferred frees wake
+    // indefinite sleepers; timed early wakes are threshold-based. The wake
+    // trylock can fail: idle return is best effort, not bounded by dirty_decay_ms.
   } catch (...) {
     arenaControl("destroy");
     throw;
@@ -216,7 +176,6 @@ AllocatorArena::AllocatorArena(const char* name, AllocatorArenaOptions options)
 }
 
 AllocatorArena::~AllocatorArena() {
-  idleDecay.reset();
   arenaControl("destroy");
 }
 
@@ -272,7 +231,6 @@ void* AllocatorArena::allocateImpl(size_t bytes, size_t alignment, bool zero) {
 void AllocatorArena::do_deallocate(void* ptr, size_t bytes, size_t alignment) {
 #if LUXIR_JEMALLOC
   sdallocx(ptr, std::max(bytes, (size_t)1), allocationFlags(bytes, alignment));
-  if (idleDecay) idleDecay->freed();
 #else
   (void)bytes;
   (void)alignment;
@@ -367,6 +325,8 @@ std::string allocatorName() {
   appendControl<ssize_t>(out, "opt.dirty_decay_ms");
   appendControl<ssize_t>(out, "opt.muzzy_decay_ms");
   appendControl<bool>(out, "opt.disable_large_size_classes");
+  appendControl<bool>(out, "opt.background_thread");
+  appendControl<bool>(out, "opt.cache_oblivious");
   appendControl<bool>(out, "config.prof");
   appendControl<bool>(out, "opt.prof");
   return out.str();

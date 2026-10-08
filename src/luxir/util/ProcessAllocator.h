@@ -6,7 +6,6 @@
 #include <array>
 #include <cstdint>
 #include <memory_resource>
-#include <memory>
 #include <utility>
 #include <optional>
 #include <string>
@@ -27,9 +26,8 @@ constexpr std::pair<size_t, size_t> hugePageInterior(uintptr_t start, size_t len
 struct AllocatorArenaOptions {
   bool hugePages = false;
   bool wholeHugePagePurge = false;
-  // An explicit positive decay disables eager oversize purging and enables
-  // idle ticks if background threads are disabled at construction. Otherwise
-  // jemalloc schedules decay, without a per-arena idle deadline.
+  // An explicit positive decay also disables eager oversize purging.
+  // Background decay is best effort, not a per-arena idle deadline.
   // Unset keeps jemalloc's default decay and oversize-purge settings.
   std::optional<int64_t> dirtyDecayMs = std::nullopt;
 };
@@ -38,8 +36,6 @@ class AllocatorArena final : public std::pmr::memory_resource {
   std::array<unsigned, 2> arenas{};
   unsigned arenaCount = 0;
   bool hugePages;
-  struct IdleDecay;
-  std::unique_ptr<IdleDecay> idleDecay;
 
   void* do_allocate(size_t bytes, size_t alignment) override;
   void do_deallocate(void* ptr, size_t bytes, size_t alignment) override;

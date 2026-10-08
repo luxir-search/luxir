@@ -8,6 +8,7 @@
 #include "luxir/index/SortedDeletes.h"
 #include "luxir/server/Stats.h"
 #include <array>
+#include <chrono>
 #include <thread>
 #include <cstdio>
 #include <fstream>
@@ -382,37 +383,40 @@ TEST(ProcessAllocatorTest, wholeHugePagePurgeAndReuse) {
   arena.purge();
 }
 
-TEST(ProcessAllocatorTest, idleDecayAndRearm) {
-  AllocatorArena arena("test-idle-big-buffers",
-      {.wholeHugePagePurge = true, .dirtyDecayMs = 50});
+TEST(ProcessAllocatorTest, backgroundDecayAndReuse) {
+  AllocatorArena arena("test-background-decay",
+      {.wholeHugePagePurge = true, .dirtyDecayMs = 250});
   auto start = arena.stats();
-  if (!start) GTEST_SKIP() << "Arena decay requires jemalloc";
-  bool backgroundThreads = allocatorBackgroundThreadsEnabled();
+  if (!start) GTEST_SKIP() << "Arena decay requires jemalloc with stats enabled";
+  if (!allocatorBackgroundThreadsEnabled()) {
+    GTEST_SKIP() << "Background decay requires background_thread:true (MALLOC_CONF overrides it)";
+  }
   constexpr size_t size = 8 * hugePageSize;
+  constexpr size_t regularSize = size + 4096;
   for (int burst = 0; burst < 2; ++burst) {
-    void* block = arena.allocateZeroed(size, hugePageSize);
-    std::memset(block, 1, size);
-    constexpr size_t regularSize = hugePageSize / 2;
-    std::array<void*, 4> regular;
-    for (auto& small : regular) {
-      small = arena.allocate(regularSize);
-      std::memset(small, 1, regularSize);
+    SCOPED_TRACE(burst);
+    std::array<void*, 4> huge, regular;
+    for (size_t i = 0; i < huge.size(); ++i) {
+      huge[i] = arena.allocateZeroed(size, hugePageSize);
+      regular[i] = arena.allocateZeroed(regularSize, alignof(std::max_align_t));
+      std::memset(huge[i], 1, size);
+      std::memset(regular[i], 1, regularSize);
     }
-    arena.deallocate(block, size, hugePageSize);
-    for (auto small : regular) arena.deallocate(small, regularSize);
+    // Both arenas exceed the 1024-page wake threshold. Spread frees across
+    // epochs so a missed trylock has further wake opportunities, including
+    // after a worker's 100 ms minimum sleep. Then observe with no arena work.
+    for (size_t i = 0; i < huge.size(); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(110));
+      arena.deallocate(huge[i], size, hugePageSize);
+      arena.deallocate(regular[i], regularSize);
+    }
     EXPECT_EQ(arena.stats()->allocated, start->allocated);
-    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    // Allow multiple decay windows and scheduling delay, not a hard deadline.
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (arena.stats()->resident >= start->resident + hugePageSize &&
            std::chrono::steady_clock::now() < deadline) {
-      // Background scheduling has no per-arena idle deadline. Test explicit
-      // purge instead, retrying if it yields to a purge already in flight.
-      if (backgroundThreads) arena.purge();
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     EXPECT_LT(arena.stats()->resident, start->resident + hugePageSize);
-    if (!backgroundThreads) {
-      // Let the timer stop before the next burst has to arm it again.
-      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    }
   }
 }

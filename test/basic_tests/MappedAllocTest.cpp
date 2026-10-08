@@ -6,6 +6,9 @@
 #include "luxir/server/Stats.h"
 #include "luxir/server/LuxirNode.h"
 #include <algorithm>
+#include <array>
+#include <chrono>
+#include <thread>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -78,4 +81,34 @@ TEST(MappedAllocTest, hugePageAdviceAndBackend) {
     EXPECT_EQ(mincore(address, 4096, &resident), -1);
     EXPECT_EQ(errno, ENOMEM);
   }
+}
+
+TEST(MappedAllocTest, backgroundDecay) {
+  auto& arena = bigBufferArena();
+  auto start = arena.stats();
+  if (!start) GTEST_SKIP() << "Arena decay requires jemalloc with stats enabled";
+  if (!allocatorBackgroundThreadsEnabled()) {
+    GTEST_SKIP() << "Background decay requires background_thread:true (MALLOC_CONF overrides it)";
+  }
+  constexpr size_t size = 8 * hugePageSize;
+  std::array buffers{MappedAlloc(size), MappedAlloc(size), MappedAlloc(size), MappedAlloc(size)};
+  for (auto& buffer : buffers) {
+    std::memset(buffer.data(), 1, size);
+  }
+  auto live = *arena.stats();
+  // Exceed the 1024-page wake threshold and give a skipped trylock subsequent
+  // epoch advances to signal on. No explicit purge, even during setup.
+  for (auto& buffer : buffers) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(110));
+    buffer = MappedAlloc();
+  }
+  EXPECT_EQ(arena.stats()->allocated, start->allocated);
+  // The arena's 5 s decay is approximate; allow two windows plus scheduling
+  // margin. Background stats reads don't advance this arena's decay epoch.
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+  size_t target = live.resident - buffers.size() * size + hugePageSize;
+  while (arena.stats()->resident >= target && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  EXPECT_LT(arena.stats()->resident, target);
 }
