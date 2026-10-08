@@ -352,6 +352,21 @@ TEST_F(MemPoolTest, align) {
 }
 
 #ifndef MEMPOOL_MALLOC
+TEST_F(MemPoolTest, blockSizeIncludesHeader) {
+  for (size_t trailing : {1, 2}) {
+    MemPool pool;
+    pool.alloc(MemPool::BYTE_BLOCK_SIZE - MemPool::HEADER_SIZE);
+    auto previousBlock = pool.bufferIdx;
+    size_t size = MemPool::BYTE_BLOCK_SIZE - trailing;
+    char* bytes = pool.alloc(size);
+    std::memset(bytes, 'x', size);
+    EXPECT_EQ(pool.bufferIdx, previousBlock + 1);
+    EXPECT_EQ(bytes, pool.buffer + MemPool::HEADER_SIZE);
+    EXPECT_GE(pool.bufferSize(pool.buffer), size + MemPool::HEADER_SIZE);
+    EXPECT_EQ(bytes[size - 1], 'x');
+  }
+}
+
 // test page boundary conditions efficiently using rewind
 TEST_F(MemPoolTest, boundary) {
   MemPool pool;

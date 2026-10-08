@@ -27,7 +27,7 @@ MemPool::~MemPool() {
 void MemPool::nextBuffer(size_t sz) {
   auto currSize = bufferSize(buffer);
   auto nextSize = std::min(currSize * 2, BYTE_BLOCK_SIZE);  // double the size of the next buffer
-  if (sz > nextSize) {
+  if (sz + HEADER_SIZE > nextSize) {
     nextSize = std::bit_ceil(sz + HEADER_SIZE);  // round up to the next block size
   }
 
