@@ -19,6 +19,11 @@ public:
   }
 
 
+  void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+    domainVariants.releaseSegmentState(segment);
+    SearchOp::releaseSegmentState(segment);
+  }
+
   class Calc final : public SearchOp::Calculator {
     std::vector<std::unique_ptr<Calculator>> subCalcs;
     std::vector<size_t> subCalcVariants;
@@ -101,6 +106,11 @@ public:
         tg != nullptr
       };
       std::vector<QueryPrep::PreparedSource> prepared(weights.size());
+      auto release = scope_guard([&]() noexcept {
+        for (auto& segment : op.req.reader->segments()) {
+          for (const auto& source : prepared) source.releaseSegmentState(segment);
+        }
+      });
       std::vector<size_t> extraSources;
       std::vector<size_t> resetExtraSources;
       std::vector<Query::Weight*> extraWeights;
@@ -181,6 +191,9 @@ public:
       produced.reserve(domains.size());
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
         auto& segment = op.req.reader->segments()[segnum];
+        auto releaseSegment = scope_guard([&]() noexcept {
+          for (const auto& source : prepared) source.releaseSegmentState(segment);
+        });
         auto reservation = reservations[segnum];
 
         auto materialize = [&](size_t source) {

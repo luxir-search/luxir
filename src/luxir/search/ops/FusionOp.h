@@ -79,6 +79,13 @@ public:
     }
   }
 
+  void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+    if (segmentStateRetained(segment)) return;
+    for (auto* weight : filterWeights) weight->releaseSegmentState(segment);
+    for (auto* source : sources) source->releaseSegmentState(segment);
+    SearchOp::releaseSegmentState(segment);
+  }
+
   // Sources are not in `subOps` (different lifecycle: they deliver via
   // rankingSink rather than emit), so SearchOp::init() does not reach
   // them - walk them explicitly here.
@@ -177,6 +184,13 @@ public:
       doCalc(tg, segnum, domain);
     }
 
+    void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+      if (op.segmentStateRetained(segment)) return;
+      for (const auto& source : preparedFilterSources) source.releaseSegmentState(segment);
+      for (auto& source : sourceCalcs) source->releaseSegmentState(segment);
+      op.releaseSegmentState(segment);
+    }
+
     DomainHandle buildSharedFilter(int32_t segnum, DocSet* domain) {
       auto& op = thisOp();
       if (op.filterWeights.empty()) return {};
@@ -186,6 +200,11 @@ public:
       filterDocSets.reserve(op.filterWeights.size());
       filterPtrs.reserve(op.filterWeights.size());
       auto& seg = op.req.reader->segments()[segnum];
+      auto release = scope_guard([&]() noexcept {
+        if (op.segmentStateRetained(seg)) return;
+        for (const auto& source : preparedFilterSources) source.releaseSegmentState(seg);
+        for (auto* weight : op.filterWeights) weight->releaseSegmentState(seg);
+      });
       for (size_t i = 0; i < op.filterWeights.size(); i++) {
         if (i < preparedFilterSources.size()) {
           filterDocSets.push_back(QueryPrep::materializeEffectiveFilter(

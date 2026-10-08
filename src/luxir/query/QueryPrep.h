@@ -62,6 +62,11 @@ struct PreparedSource {
     return *weight;
   }
 
+  void releaseSegmentState(IndexReader::Segment& segment) const noexcept {
+    if (prepared) prepared->releaseSegmentState(segment);
+    if (weight) weight->releaseSegmentState(segment);
+  }
+
   void setPrepared(std::unique_ptr<Query::Weight::PreparedWeight> value) {
     prepared = std::move(value);
     domainDependence = prepared == nullptr
@@ -901,6 +906,10 @@ public:
         AcceptedExistingTag{}, cacheUse, std::move(lifetime), consumer);
   }
 
+  void releaseSegmentState(IndexReader::Segment& segment) const noexcept {
+    if (weight) weight->releaseSegmentState(segment);
+  }
+
   bool empty() const { return source == Source::EMPTY; }
   bool hasCacheUse() const { return cacheUse != nullptr; }
   bool isTopKCount() const {
@@ -1292,6 +1301,12 @@ public:
     }
     sources.push_back({
         ExactDomainSource::Source::ACCEPTED_EXISTING, nullptr, &cacheUse});
+  }
+
+  void releaseSegmentState(IndexReader::Segment& segment) const noexcept {
+    for (const auto& source : sources) {
+      if (source.weight) source.weight->releaseSegmentState(segment);
+    }
   }
 
   bool empty() const { return sources.empty(); }

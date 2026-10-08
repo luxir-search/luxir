@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "Stats.h"
+#include "luxir/query/QueryStats.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "ReplicationFollower.h"
 
@@ -177,6 +178,8 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     response.totals.collections++;
   }
 
+  response.multiterm_expansion_refills =
+      multitermExpansionRefills.load(std::memory_order_relaxed);
   auto& ram = node.getIndexRamBudget();
   response.indexing_ram.limit_bytes = (uint64_t)ram.totalBytes();
   response.indexing_ram.reserved_bytes = (uint64_t)ram.reservedBytes();

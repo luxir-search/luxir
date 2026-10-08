@@ -427,6 +427,19 @@ public:
   std::function<void(Calc&, MergeableCollector*)> rankingSink;
 
 
+  void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+    if (segmentStateRetained(segment)) return;
+    for (auto* source : {weight, variantMembershipWeight, countWeight,
+                         rankingWeight, wholeRankingWeight}) {
+      if (source) source->releaseSegmentState(segment);
+    }
+    for (auto* source : filterWeights) source->releaseSegmentState(segment);
+    wholeMembershipPlan.releaseSegmentState(segment);
+    exactDomainPlan.releaseSegmentState(segment);
+    domainVariants.releaseSegmentState(segment);
+    SearchOp::releaseSegmentState(segment);
+  }
+
   class Calc : public SearchOp::Calculator {
   public:
     luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
@@ -1110,6 +1123,18 @@ public:
     }
 
     void prepareAndDispatch(oneapi::tbb::task_group* tg) {
+      {
+        auto release = scope_guard([&]() noexcept {
+          for (auto& segment : thisOp().req.reader->segments()) releaseSegmentState(segment);
+        });
+        prepareDomains(tg);
+      }
+      dispatch(tg, thisOp().domainVariants.empty()
+          ? std::span<const DomainHandle>(effectiveDomains)
+          : std::span<const DomainHandle>(inputDomains));
+    }
+
+    void prepareDomains(oneapi::tbb::task_group* tg) {
       auto& op = thisOp();
       auto baseDomains = std::span<DocSet* const>(
           inputDomainViews.data(), inputDomainViews.size());
@@ -1194,10 +1219,6 @@ public:
           effectiveDomainViews.clear();
           effectiveDomains.clear();
         }
-        dispatch(
-            tg,
-            std::span<const DomainHandle>(
-                inputDomains.data(), inputDomains.size()));
         return;
       }
 
@@ -1224,10 +1245,6 @@ public:
         preparedWeight = op.weight->prepare(queryCtx);
       }
 
-      dispatch(
-          tg,
-          std::span<const DomainHandle>(
-              effectiveDomains.data(), effectiveDomains.size()));
     }
 
     void dispatch(
@@ -1537,6 +1554,17 @@ public:
       return result;
     }
 
+    void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+      auto& op = thisOp();
+      if (op.segmentStateRetained(segment)) return;
+      if (preparedWeight) preparedWeight->releaseSegmentState(segment);
+      for (const auto* sources : {&preparedFilterSources, &preparedResetFilterSources,
+                                  &preparedDomainSources}) {
+        for (const auto& source : *sources) source.releaseSegmentState(segment);
+      }
+      op.releaseSegmentState(segment);
+    }
+
     void doCollect(
         oneapi::tbb::task_group* tg, int32_t segnum,
         DomainHandle domainHandle) {
@@ -1559,8 +1587,9 @@ public:
       int64_t numSegs = (int64_t)op.req.reader->segments().size();
 
       {
-        auto poolGuard = MemPool::threadLocalPoolGuard();
         auto& seg = op.planning.topReader.segments()[segnum];
+        auto release = scope_guard([&]() noexcept { releaseSegmentState(seg); });
+        auto poolGuard = MemPool::threadLocalPoolGuard();
         if (!op.domainVariants.empty()) {
           routedBaseDomain = domain;
           routedProduction.emplace(prepareRoutedProduction(

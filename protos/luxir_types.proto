@@ -1115,6 +1115,7 @@ message StatsResponse {
   repeated CollectionStats collections = 2;
   IndexRamStats indexing_ram = 3;
   AllocatorStats big_buffer_ram = 7;
+  uint64 multiterm_expansion_refills = 8;
   StorageRamStats storage_ram = 6;
 }
 

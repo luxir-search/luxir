@@ -3026,6 +3026,174 @@ TEST_F(FacetTest, wideNumericChildKeepsSharedBindingBlock) {
   }
 }
 
+namespace {
+
+// Live bindings and domains seen by bucket-block executor probe children.
+struct BlockProbe {
+  struct Feed {
+    int32_t segnum;
+    int64_t slot;
+    int liveBindings;
+    int liveDomains;
+  };
+
+  size_t residentBytes = 1;
+  int liveBindings = 0;
+  int maxLiveBindings = 0;
+  int liveDomains = 0;
+  int maxLiveDomains = 0;
+  std::vector<Feed> feeds;
+};
+
+class ProbeDocSet : public ArrDocSet {
+  BlockProbe& probe;
+
+public:
+  explicit ProbeDocSet(BlockProbe& probe) : ArrDocSet({}), probe(probe) {
+    probe.maxLiveDomains = std::max(probe.maxLiveDomains, ++probe.liveDomains);
+  }
+  ~ProbeDocSet() override { probe.liveDomains--; }
+};
+
+class ProbeOp : public SearchOp {
+public:
+  BlockProbe& probe;
+
+  ProbeOp(SearchRequest& req, BlockProbe& probe)
+    : SearchOp(req, "probe"), probe(probe) {}
+
+  class Calc : public Calculator {
+    BlockProbe& probe;
+
+  public:
+    Calc(ProbeOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
+      : Calculator(op, parent, slot, numSlots), probe(op.probe) {
+      probe.maxLiveBindings =
+          std::max(probe.maxLiveBindings, ++probe.liveBindings);
+    }
+    ~Calc() override { probe.liveBindings--; }
+
+    api::Val* getTargetForSub(SearchResponse*, Calculator*) override {
+      return nullptr;
+    }
+
+    void calc(oneapi::tbb::task_group*, int32_t segnum,
+              DomainHandle) override {
+      probe.feeds.push_back(
+          {segnum, getSlot(), probe.liveBindings, probe.liveDomains});
+    }
+  };
+
+  Calculator* createCalculator(
+      Calculator* parent, int64_t slot, int64_t numSlots) override {
+    return new Calc(*this, parent, slot, numSlots);
+  }
+
+  size_t facetBucketResidentBytes() const override {
+    return probe.residentBytes;
+  }
+};
+
+} // namespace
+
+// Bindings open at their bucket's first feed and close after its last
+// segment, and the executor keeps no fed domain: an independent producer has
+// one domain alive at a time, a joint producer one chunk, handed over bucket
+// by bucket.
+TEST_F(FacetTest, bucketBlockExecutorBindingAndDomainLifetimes) {
+  CollectionHelper helper;
+  for (int seg = 0; seg < 3; seg++) {
+    ASSERT_TRUE(helper.index(flatdoc("id", std::to_string(seg)),
+                             UpdateMessage::COMMIT).success);
+  }
+  auto req = localReq(helper.getSearchEngine());
+  req->reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(3u, req->reader->segments().size());
+
+  BlockProbe parentProbe;
+  BlockProbe probe;
+  ProbeOp parentOp(*req, parentProbe);
+  ProbeOp first(*req, probe);
+  ProbeOp second(*req, probe);
+  std::unique_ptr<SearchOp::Calculator> parent(
+      parentOp.createCalculator(nullptr, -1, -1));
+  std::array<SearchOp*, 2> children{&first, &second};
+  std::vector<SelectedFacetBucket<int64_t>> buckets;
+  for (int32_t i = 0; i < 4; i++) {
+    buckets.push_back({.key = i, .id = FacetBucketId{i}, .count = 1,
+                       .owner = FacetOwnerSlot{i},
+                       .output = FacetOutputSlot{i}});
+  }
+
+  auto run = [&](auto&& source) {
+    probe.feeds.clear();
+    probe.maxLiveBindings = 0;
+    probe.maxLiveDomains = 0;
+    size_t blocks = 0;
+    FacetBucketBlockExecutor::execute<int64_t>(
+        *parent, children,
+        std::span<const SelectedFacetBucket<int64_t>>(buckets), *req->reader,
+        source, FacetBucketBlockExecutor::BINDING_BYTES,
+        [&]() { blocks++; });
+    EXPECT_EQ(0, probe.liveBindings);
+    EXPECT_EQ(0, probe.liveDomains);
+    EXPECT_EQ(3u * buckets.size() * children.size(), probe.feeds.size());
+    return blocks;
+  };
+  // Feeds of one block are segment-major, then bucket, then child.
+  auto bucketOf = [&](size_t feed) {
+    return (int64_t)(feed / children.size() % buckets.size());
+  };
+  auto independent = [&](size_t, auto block, FacetBucketFeed feed) {
+    for (size_t i = 0; i < block.size(); i++) {
+      feed(i, DomainHandle(std::make_unique<ProbeDocSet>(probe)));
+    }
+  };
+
+  EXPECT_EQ(1u, run(independent));
+  EXPECT_EQ(1, probe.maxLiveDomains);
+  EXPECT_EQ(8, probe.maxLiveBindings);
+  for (size_t i = 0; i < probe.feeds.size(); i++) {
+    const auto& feed = probe.feeds[i];
+    int64_t bucket = bucketOf(i);
+    SCOPED_TRACE(std::format("feed {}", i));
+    EXPECT_EQ((int32_t)(i / (children.size() * buckets.size())), feed.segnum);
+    EXPECT_EQ(bucket, feed.slot);
+    EXPECT_EQ(1, feed.liveDomains);
+    int liveBuckets = feed.segnum == 0 ? (int)bucket + 1
+        : feed.segnum == 2 ? 4 - (int)bucket : 4;
+    EXPECT_EQ(2 * liveBuckets, feed.liveBindings);
+  }
+
+  // Two children at a quarter of the binding budget each: two buckets per
+  // block.
+  probe.residentBytes = FacetBucketBlockExecutor::BINDING_BYTES / 4;
+  EXPECT_EQ(2u, run(independent));
+  EXPECT_EQ(4, probe.maxLiveBindings);
+  probe.residentBytes = 1;
+
+  for (size_t budget : {(size_t)1, FACET_BUCKET_DOMAIN_BYTES}) {
+    SCOPED_TRACE(std::format("budget {}", budget));
+    run([&](size_t segnum, auto block, FacetBucketFeed feed) {
+      feedFacetBucketDomainChunks(
+          req->reader->segments()[segnum].maxDoc(), block, budget, feed,
+          [&](auto chunk) {
+            std::vector<DomainHandle> domains;
+            for (size_t i = 0; i < chunk.size(); i++) {
+              domains.emplace_back(std::make_unique<ProbeDocSet>(probe));
+            }
+            return domains;
+          });
+    });
+    bool oneChunk = budget == FACET_BUCKET_DOMAIN_BYTES;
+    EXPECT_EQ(oneChunk ? 4 : 1, probe.maxLiveDomains);
+    for (size_t i = 0; i < probe.feeds.size(); i++) {
+      EXPECT_EQ(oneChunk ? 4 - (int)bucketOf(i) : 1,
+                probe.feeds[i].liveDomains) << "feed " << i;
+    }
+  }
+}
+
 TEST_F(FacetTest, textFacetSubOpsSortPinsAndDomains) {
   CollectionHelper helper;
   helper.indexAll(std::array{
@@ -3681,6 +3849,147 @@ TEST_F(FacetTest, nestedStringFacet) {
   ASSERT_EQ(1, (int)sfyIds.v.size()) << req->toString();
   EXPECT_EQ("p", sfyIds.v[0]);
   EXPECT_EQ(1, sfy.counts[0]);
+}
+
+// Nested string facets over several segments, through each bucket-domain
+// construction, feed and inline mode, against a brute-force oracle. With
+// metrics, the middle facet keeps its incoming domains for its own result
+// children; without, it keeps none.
+TEST_F(FacetTest, nestedStringFacetsAcrossSegmentsMatchOracle) {
+  struct Row {
+    std::string cat;
+    std::optional<std::string> sub;
+    std::optional<int64_t> value;
+    bool selected;
+    bool deleted;
+  };
+  std::vector<Row> rows;
+  CollectionHelper helper;
+  helper.clear();
+  for (int seg = 0; seg < 4; seg++) {
+    std::vector<Doc> docs;
+    for (int i = seg * 16; i < seg * 16 + 16; i++) {
+      // Segments missing a value remap their ords.
+      int cat = i * 7 % 5;
+      int sub = i * 3 % 4;
+      if (seg == 1 && cat == 1) cat = 4;
+      if (seg == 2 && sub == 0) sub = 3;
+      Row row{"c" + std::to_string(cat), std::nullopt, std::nullopt,
+              i % 3 != 0, i == 21};
+      Doc doc = flatdoc("id", std::to_string(i), "cat_s", row.cat,
+                        "sel_s", row.selected ? "yes" : "no");
+      if (i % 11 != 0) {
+        row.sub = "s" + std::to_string(sub);
+        doc.push_back({"sub_s", *row.sub});
+      }
+      if (i % 5 != 0) {
+        row.value = i;
+        doc.push_back({"v_i", (int64_t)i});
+      }
+      rows.push_back(std::move(row));
+      docs.push_back(std::move(doc));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteById("21", UpdateMessage::COMMIT).success);
+  ASSERT_EQ(4u, helper.durableSegmentCount());
+
+  // Count descending, ties by value; map order is value order.
+  auto page = [](const std::map<std::string, int64_t>& counts) {
+    std::vector<std::pair<std::string, int64_t>> top(counts.begin(), counts.end());
+    std::stable_sort(top.begin(), top.end(), [](const auto& a, const auto& b) {
+      return a.second > b.second;
+    });
+    if (top.size() > 3) top.resize(3);
+    return top;
+  };
+
+  auto check = [&](const api::FacetResult& outer, bool filtered, bool metrics) {
+    auto live = [&](const Row& row) {
+      return !row.deleted && (!filtered || row.selected);
+    };
+    std::map<std::string, int64_t> catCounts;
+    for (const auto& row : rows) {
+      if (live(row)) catCounts[row.cat]++;
+    }
+    auto cats = page(catCounts);
+    ASSERT_EQ(cats, stringFacetRows(outer));
+    auto subs = metricValues(outer, "sub");
+    ASSERT_EQ(cats.size(), subs.size());
+    for (size_t i = 0; i < cats.size(); i++) {
+      std::map<std::string, int64_t> subCounts;
+      std::map<std::string, std::pair<int64_t, int64_t>> sums;
+      for (const auto& row : rows) {
+        if (!live(row) || row.cat != cats[i].first || !row.sub) continue;
+        subCounts[*row.sub]++;
+        if (row.value) {
+          sums[*row.sub].first += *row.value;
+          sums[*row.sub].second++;
+        }
+      }
+      auto expected = page(subCounts);
+      const auto& sub = *subs[i].facetResult();
+      ASSERT_EQ(expected, stringFacetRows(sub)) << cats[i].first;
+      if (!metrics) continue;
+      auto totals = metricValues(sub, "total");
+      auto means = metricValues(sub, "mean");
+      ASSERT_EQ(expected.size(), totals.size());
+      ASSERT_EQ(expected.size(), means.size());
+      for (size_t j = 0; j < expected.size(); j++) {
+        auto [sum, n] = sums[expected[j].first];
+        if (n == 0) {
+          EXPECT_TRUE(totals[j].isNull());
+          EXPECT_TRUE(means[j].isNull());
+        } else {
+          EXPECT_EQ(sum, totals[j].asInt());
+          EXPECT_DOUBLE_EQ((double)sum / (double)n, means[j].asDouble());
+        }
+      }
+    }
+  };
+
+  SearchOverridesGuard guard(forcedFacetBucketDomainSource,
+                             forcedFacetFeedStrategy, forcedFacetSubOpInline);
+  for (auto source : {FacetBucketDomainSource::POSTINGS,
+                      FacetBucketDomainSource::ORD_COLUMN}) {
+    for (auto feed : {FacetFeedStrategy::BUCKET_DOMAINS,
+                      FacetFeedStrategy::AUTO}) {
+      for (auto inlineMode : {FacetSubOpInlineMode::SORT_KEY_ONLY,
+                              FacetSubOpInlineMode::ALL}) {
+        for (bool filtered : {false, true}) {
+          for (bool metrics : {false, true}) {
+            SCOPED_TRACE(std::format(
+                "source={} feed={} inline={} filtered={} metrics={}",
+                (int)source, (int)feed, (int)inlineMode, filtered, metrics));
+            forcedFacetBucketDomainSource = source;
+            forcedFacetFeedStrategy = feed;
+            forcedFacetSubOpInline = inlineMode;
+            auto req = localReq(helper.getSearchEngine());
+            req->collection("main");
+            auto addFacets = [&](auto& cursor) {
+              auto& middle = cursor.facet("f", "cat_s").limit(3).mincount(1)
+                  .facet("sub", "sub_s").limit(3).mincount(1);
+              if (metrics) {
+                middle.sum("total", "v_i").avg("mean", "v_i");
+              }
+            };
+            if (filtered) {
+              auto& top = req->topDocs("q");
+              top.getNumber(true).matchQuery("sel_s", "yes");
+              addFacets(top);
+            } else {
+              addFacets(*req);
+            }
+            req->execute(false);
+            ASSERT_OK(req);
+            check(filtered ? topFacetResult(*req, "q", "f")
+                           : rootFacetResult(*req, "f"),
+                  filtered, metrics);
+          }
+        }
+      }
+    }
+  }
 }
 
 TEST_F(FacetTest, forcedTopTermsAndBucketDomainFeedMatchColumnPlan) {

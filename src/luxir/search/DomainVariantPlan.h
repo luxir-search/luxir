@@ -297,6 +297,12 @@ public:
   size_t inheritBaseCount() const { return inheritBases.size() + 1; }
   size_t sourceCount() const { return querySources.size(); }
 
+  void releaseSegmentState(IndexReader::Segment& segment) const noexcept {
+    for (const auto& source : querySources) {
+      if (source.weight) source.weight->releaseSegmentState(segment);
+    }
+  }
+
   Query::Weight* sourceWeight(size_t source) const {
     assert(source < querySources.size());
     return querySources[source].weight;

@@ -76,6 +76,10 @@ public:
             targetPool, segment, executionMode);
       }
 
+      void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+        child.releaseSegmentState(segment);
+      }
+
       bool outputIsSubsetOfDomain() const noexcept override {
         return child.prepared != nullptr && child.prepared->outputIsSubsetOfDomain();
       }
@@ -112,6 +116,10 @@ public:
         Query::SupplierExecutionMode executionMode) override {
       return childWeight->scorerSupplier(
           targetPool, segment, executionMode);
+    }
+
+    void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+      childWeight->releaseSegmentState(segment);
     }
 
     std::optional<int64_t> constantCount(

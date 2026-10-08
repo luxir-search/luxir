@@ -228,6 +228,10 @@ public:
         return targetPool.make<ConstantScoreQuery::Supplier>(childSupplier, constantScore);
       }
 
+      void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+        child.releaseSegmentState(segment);
+      }
+
       bool outputIsSubsetOfDomain() const noexcept override {
         return child.prepared != nullptr && child.prepared->outputIsSubsetOfDomain();
       }
@@ -269,6 +273,10 @@ public:
           targetPool, segment, executionMode);
       if (childSupplier == nullptr) return nullptr;
       return targetPool.make<ConstantScoreQuery::Supplier>(childSupplier, constantScore);
+    }
+
+    void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+      childWeight->releaseSegmentState(segment);
     }
 
     std::optional<int64_t> constantCount(

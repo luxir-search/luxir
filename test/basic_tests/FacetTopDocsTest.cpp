@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "luxir/reader/SkipStats.h"
+#include "luxir/query/QueryStats.h"
 #include "luxir/search/FilterCache.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/server/JsonRequest.h"
@@ -568,4 +569,82 @@ TEST_F(FacetTopDocsTest, offsetBucketChildren) {
                             : std::vector<std::string>{}, ids(*docs));
     }
   }
+}
+
+TEST_F(FacetTopDocsTest, multitermStateRetainedAcrossBucketBlock) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "a", "body_s", "qa", "cat_s", "a", "price_i", (int64_t)1),
+    flatdoc("id", "b", "body_s", "qb", "cat_s", "b", "price_i", (int64_t)2),
+    flatdoc("id", "c", "body_s", "qc", "cat_s", "c", "price_i", (int64_t)3),
+  }, UpdateMessage::COMMIT);
+  helper.indexAll(std::array{
+    flatdoc("id", "d", "body_s", "qd", "cat_s", "a", "price_i", (int64_t)1),
+    flatdoc("id", "e", "body_s", "qe", "cat_s", "b", "price_i", (int64_t)2),
+    flatdoc("id", "f", "body_s", "qf", "cat_s", "c", "price_i", (int64_t)3),
+  }, UpdateMessage::COMMIT);
+  ASSERT_EQ(2u, helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+  for (bool prepared : {false, true}) {
+    for (auto facet : {R"({"field_facet":{"field":"cat_s","limit":-1}})",
+                       R"({"range_facet":{"field":"price_i","start":0,"end":4,"gap":1}})",
+                       R"({"query_facet":{"buckets":{"a":"cat_s:a","b":"cat_s:b","c":"cat_s:c"}}})"}) {
+      SCOPED_TRACE(facet);
+      auto req = localReq(helper.getSearchEngine());
+      req->testForcePrepare = prepared;
+      parseQueryRequest(std::string("{\"ops\":{\"cats\":") + facet + "}}", req->rawRequest(), req->mr);
+      auto& op = const_cast<api::SearchOp&>(*req->rawRequest().ops.at("cats"));
+      std::visit([&](auto& value) {
+        if constexpr (requires { value.ops; }) {
+          auto* child = api::build::mapSlot<api::SearchOp>(value.ops, 1, "hits", req->mr);
+          EXPECT_TRUE(api::read_json(*child,
+              R"({"top_docs":{"query":"body_s:q*","limit":1,"get_number":true,"fields":["id"]}})", req->mr));
+        }
+      }, op.kind);
+      req->collection("main");
+      uint64_t before = multitermExpansionRefills.load(std::memory_order_relaxed);
+      req->execute(false);
+      ASSERT_OK(req);
+      EXPECT_EQ(before, multitermExpansionRefills.load(std::memory_order_relaxed));
+      const auto& result = rootFacet(*req, "cats");
+      for (size_t i = 0; i < result.counts.size(); i++) {
+        auto* docs = bucketDocs(result, "hits", i);
+        ASSERT_NE(nullptr, docs);
+        EXPECT_EQ(result.counts[i], docs->found.value_or(-1));
+      }
+    }
+  }
+}
+
+TEST_F(FacetTopDocsTest, multitermRefillsForSelectedQueryFacetChildren) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "a", "body_s", "qa", "cat_s", "a"),
+    flatdoc("id", "b", "body_s", "qb", "cat_s", "b"),
+  }, UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  parseQueryRequest(R"({"ops":{"cats":{"query_facet":{
+    "buckets":{"q":"body_s:q*"},
+    "ops":{"hits":{"top_docs":{"limit":1,"get_number":true}}}}}}})",
+    req->rawRequest(), req->mr);
+  req->collection("main");
+  uint64_t before = multitermExpansionRefills.load(std::memory_order_relaxed);
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ(before + 1, multitermExpansionRefills.load(std::memory_order_relaxed));
+  const auto& result = rootFacet(*req, "cats");
+  ASSERT_EQ(1u, result.counts.size());
+  EXPECT_EQ(2, result.counts[0]);
+  ASSERT_NE(nullptr, bucketDocs(result, "hits", 0));
+  EXPECT_EQ(2, bucketDocs(result, "hits", 0)->found.value_or(-1));
+
+  auto plain = localReq(helper.getSearchEngine());
+  parseQueryRequest(R"({"query":"body_s:q*","limit":1,"get_number":true,
+    "ops":{"cats":{"field_facet":{"field":"cat_s","limit":-1}}}})",
+    plain->rawRequest(), plain->mr);
+  plain->collection("main");
+  before = multitermExpansionRefills.load(std::memory_order_relaxed);
+  plain->execute(false);
+  ASSERT_OK(plain);
+  EXPECT_EQ(before, multitermExpansionRefills.load(std::memory_order_relaxed));
+  EXPECT_EQ(2, plain->docList("q")->found.value_or(-1));
 }

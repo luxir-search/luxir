@@ -273,8 +273,7 @@ public:
       for (auto& [name, child] : fieldOp().subOps) children.push_back(child);
       FacetBucketBlockExecutor::execute<Key>(
           *this, children, buckets, fieldOp().reader, source,
-          FacetBucketBlockExecutor::BINDING_BYTES,
-          FacetBucketBlockExecutor::DOMAIN_BYTES, []() {});
+          FacetBucketBlockExecutor::BINDING_BYTES, []() {});
     }
 
     template <typename Key, typename Buckets, typename KeyAt, typename IdAt>
@@ -812,7 +811,12 @@ public:
 
     void executeResultChildren(std::span<const SelectedFacetBucket<int64_t>> buckets) {
       executeBucketChildren<int64_t>(buckets,
-          [this](size_t segnum, auto chunk) { return bucketDomains(segnum, chunk); });
+          [this](size_t segnum, auto block, FacetBucketFeed feed) {
+            feedFacetBucketDomainChunks(
+                thisOp().reader.segments()[segnum].maxDoc(), block,
+                FACET_BUCKET_DOMAIN_BYTES, feed,
+                [&](auto chunk) { return bucketDomains(segnum, chunk); });
+          });
     }
 
   };
@@ -1067,14 +1071,11 @@ public:
     void executeResultChildren(
         std::span<const SelectedFacetBucket<std::string_view>> buckets) {
       executeBucketChildren<std::string_view>(buckets,
-          [this](size_t segnum, auto chunk) {
-            std::vector<DomainHandle> domains;
-            domains.reserve(chunk.size());
-            for (const auto& bucket : chunk) {
-              domains.push_back(materializeTermDomain((int32_t)segnum, bucket.key,
-                                                       input[segnum].get()));
+          [this](size_t segnum, auto block, FacetBucketFeed feed) {
+            for (size_t i = 0; i < block.size(); i++) {
+              feed(i, materializeTermDomain((int32_t)segnum, block[i].key,
+                                            input[segnum].get()));
             }
-            return domains;
           });
     }
 
@@ -1178,9 +1179,6 @@ public:
   virtual size_t bindingStateChunkBytes() const {
     return FacetBucketBlockExecutor::BINDING_BYTES;
   }
-  virtual size_t bucketDomainByteBudget() const {
-    return FacetBucketBlockExecutor::DOMAIN_BYTES;
-  }
   virtual void bindingBlockStarted() const {}
 
   virtual bool requiresWholeReaderDomain() const { return false; }
@@ -1207,8 +1205,9 @@ public:
     std::atomic<int32_t> gatheredDomainsSeen{0};
 
   protected:
-    // Per-segment incoming domains stay retained through result-stage sub-op
-    // execution, where the producer intersects them with each bucket.
+    // Per-segment incoming domains, kept only while something later reads
+    // them: the whole-reader gather, and result-stage sub-op execution, where
+    // the producer intersects them with each bucket.
     std::vector<DomainHandle> input;
 
     FixedBucketFacetReq& fixedOp() {
@@ -1217,15 +1216,15 @@ public:
 
     virtual void collectSegment(
         MergeableFixedBuckets& data, int32_t segnum, DocSet* domain) = 0;
-    virtual std::vector<DomainHandle> bucketDomains(
-        size_t segnum,
-        std::span<const SelectedFacetBucket<size_t>> buckets) = 0;
+    // The FacetBucketBlockExecutor domain source for result children.
+    virtual void feedBucketDomains(
+        size_t segnum, std::span<const SelectedFacetBucket<size_t>> block,
+        FacetBucketFeed feed) = 0;
     virtual void prepareGatheredDomains(oneapi::tbb::task_group* tg) {
       unused(tg);
     }
 
-    void collectInputSegment(int32_t segnum) {
-      DocSet* domain = input[(size_t)segnum].get();
+    void collectInputSegment(int32_t segnum, DocSet* domain) {
       driver.contribute([&](MergeableFixedBuckets& data) {
         if (data.counts.empty()) {
           data.counts.assign(fixedOp().bucketCount(), 0);
@@ -1238,7 +1237,7 @@ public:
       prepareGatheredDomains(tg);
       for (int32_t segnum = 0; segnum < (int32_t)input.size(); segnum++) {
         task_group_run(tg, [this, segnum]() {
-          collectInputSegment(segnum);
+          collectInputSegment(segnum, input[(size_t)segnum].get());
         });
       }
     }
@@ -1263,9 +1262,9 @@ public:
     }
 
     // Post-selection sub-op execution sizes each bucket block from the child
-    // plans' retained bytes, feeds every segment, and destroys the bindings
-    // before opening the next block. Within a segment, the domain byte budget
-    // may split the binding block further.
+    // plans' retained bytes and feeds every segment; a bucket's bindings close
+    // after its last segment. The subclass producer decides how many of a
+    // segment's bucket domains are alive at once.
     void executeResultChildren(
         const MergeableFixedBuckets& merged,
         std::span<const size_t> emitted,
@@ -1295,8 +1294,10 @@ public:
 
       FacetBucketBlockExecutor::execute<size_t>(
           *this, children, buckets, fixedOp().reader,
-          [this](size_t segnum, auto chunk) { return bucketDomains(segnum, chunk); },
-          fixedOp().bindingStateChunkBytes(), fixedOp().bucketDomainByteBudget(),
+          [this](size_t segnum, auto block, FacetBucketFeed feed) {
+            feedBucketDomains(segnum, block, feed);
+          },
+          fixedOp().bindingStateChunkBytes(),
           [this]() { fixedOp().bindingBlockStarted(); });
     }
 
@@ -1307,7 +1308,9 @@ public:
                [this](std::unique_ptr<MergeableFixedBuckets> merged) {
                  facetResult(*merged);
                }) {
-      input.resize(op.req.reader->segments().size());
+      if (!fixedOp().subOps.empty() || fixedOp().requiresWholeReaderDomain()) {
+        input.resize(op.req.reader->segments().size());
+      }
     }
 
     luxir::api::Val* getTargetForSub(
@@ -1329,9 +1332,10 @@ public:
         driver.completeEmpty();
         return;
       }
-      input[(size_t)segnum] = std::move(domainHandle);
+      DocSet* domain = domainHandle.get();
+      if (!input.empty()) input[(size_t)segnum] = std::move(domainHandle);
       if (!fixedOp().requiresWholeReaderDomain()) {
-        collectInputSegment(segnum);
+        collectInputSegment(segnum, domain);
         return;
       }
       int32_t seen = gatheredDomainsSeen.fetch_add(
@@ -1398,10 +1402,10 @@ public:
         : FixedBucketFacetReq::bindingStateChunkBytes();
   }
 
-  size_t bucketDomainByteBudget() const override {
+  size_t bucketDomainByteBudget() const {
     return forcedRangeFacetBucketDomainByteBudget != 0
         ? forcedRangeFacetBucketDomainByteBudget
-        : FixedBucketFacetReq::bucketDomainByteBudget();
+        : FACET_BUCKET_DOMAIN_BYTES;
   }
 
   void bindingBlockStarted() const override {
@@ -1528,7 +1532,7 @@ public:
     // a repeat of the docid it just added.
     std::vector<DomainHandle> bucketDomains(
         size_t segnum,
-        std::span<const SelectedFacetBucket<size_t>> buckets) override {
+        std::span<const SelectedFacetBucket<size_t>> buckets) {
       std::vector<int32_t> builderOfBucket(rangeOp().bucketCount(), -1);
       for (size_t i = 0; i < buckets.size(); i++) {
         builderOfBucket[buckets[i].key] = (int32_t)i;
@@ -1546,6 +1550,15 @@ public:
             return value < start || value >= end
                 ? -1 : builderOfBucket[rangeOp().bucketOf(value)];
           });
+    }
+
+    void feedBucketDomains(
+        size_t segnum, std::span<const SelectedFacetBucket<size_t>> block,
+        FacetBucketFeed feed) override {
+      feedFacetBucketDomainChunks(
+          rangeOp().reader.segments()[segnum].maxDoc(), block,
+          rangeOp().bucketDomainByteBudget(), feed,
+          [&](auto chunk) { return bucketDomains(segnum, chunk); });
     }
 
   public:
@@ -1577,6 +1590,12 @@ public:
       preparedBuckets(QueryPrep::anyNeedsPrepare(bucketWeights)) {
     assert(bucketQueries.size() == queryFacet.buckets.size());
     assert(bucketWeights.size() == queryFacet.buckets.size());
+  }
+
+  void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+    if (segmentStateRetained(segment)) return;
+    for (auto* weight : bucketWeights) weight->releaseSegmentState(segment);
+    SearchOp::releaseSegmentState(segment);
   }
 
   bool requiresWholeReaderDomain() const override {
@@ -1612,9 +1631,14 @@ public:
           : preparedSources[bucket].segmentSource();
     }
 
-    DomainHandle materializeBucket(size_t segnum, size_t bucket) {
+    void releaseBucketState(IndexReader::Segment& segment, size_t bucket) noexcept {
+      if (queryOp().segmentStateRetained(segment)) return;
+      if (!preparedSources.empty()) preparedSources[bucket].releaseSegmentState(segment);
+      queryOp().bucketWeights[bucket]->releaseSegmentState(segment);
+    }
+
+    DomainHandle materializeBucket(size_t segnum, size_t bucket, DocSet* domain) {
       auto& segment = queryOp().reader.segments()[segnum];
-      DocSet* domain = input[segnum].get();
       return DomainHandle(QueryPrep::materialize(
           bucketSource(bucket), segment, domain,
           Query::SupplierExecutionMode::ORDINARY,
@@ -1646,6 +1670,7 @@ public:
       // whole segment is the domain.
       bool countOnly = domain == nullptr;
       for (size_t bucket = 0; bucket < queryOp().bucketCount(); bucket++) {
+        auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
         if (countOnly && !queryOp().bucketWeights[bucket]->needsPrepare()) {
           int64_t count = queryOp().bucketWeights[bucket]->count(segment);
           if (count >= 0) {
@@ -1653,25 +1678,39 @@ public:
             continue;
           }
         }
-        DomainHandle matches = materializeBucket((size_t)segnum, bucket);
+        DomainHandle matches = materializeBucket((size_t)segnum, bucket, domain);
         data.counts[bucket] += matches.get()->card();
       }
     }
 
-    std::vector<DomainHandle> bucketDomains(
-        size_t segnum,
-        std::span<const SelectedFacetBucket<size_t>> buckets) override {
-      std::vector<DomainHandle> domains;
-      domains.reserve(buckets.size());
-      for (const auto& bucket : buckets) {
-        domains.push_back(materializeBucket(segnum, bucket.key));
+    // Bucket queries are independent: one domain is alive at a time, and the
+    // bucket's query state is released before its children run.
+    void feedBucketDomains(
+        size_t segnum, std::span<const SelectedFacetBucket<size_t>> block,
+        FacetBucketFeed feed) override {
+      auto& segment = queryOp().reader.segments()[segnum];
+      for (size_t i = 0; i < block.size(); i++) {
+        DomainHandle domain;
+        {
+          auto release = scope_guard([&]() noexcept {
+            releaseBucketState(segment, block[i].key);
+          });
+          domain = materializeBucket(
+              segnum, block[i].key, input[segnum].get());
+        }
+        feed(i, std::move(domain));
       }
-      return domains;
     }
 
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
       : FixedBucketFacetReq::Calc(op, parent, slot, numSlots) {}
+
+    void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+      if (queryOp().segmentStateRetained(segment)) return;
+      for (const auto& source : preparedSources) source.releaseSegmentState(segment);
+      queryOp().releaseSegmentState(segment);
+    }
   };
 
   Calculator* createCalculator(

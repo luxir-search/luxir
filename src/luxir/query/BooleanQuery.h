@@ -4885,6 +4885,7 @@ public:
     }
 
     class BooleanPreparedWeight final : public Query::Weight::PreparedWeight {
+      std::span<Query::Weight*> filterWeights;
       IndexReader& reader;
       std::vector<QueryPrep::PreparedSource> mandatorySources;
       std::vector<uint8_t> mandatoryScores;
@@ -4900,7 +4901,8 @@ public:
       bool uniformConstantCandidate = false;
 
     public:
-      BooleanPreparedWeight(IndexReader& reader,
+      BooleanPreparedWeight(std::span<Query::Weight*> filterWeights,
+                            IndexReader& reader,
                             std::vector<QueryPrep::PreparedSource>&& mandatorySources,
                             std::span<const uint8_t> mandatoryScores,
                             std::vector<QueryPrep::PreparedSource>&& optionalSources,
@@ -4911,7 +4913,8 @@ public:
                             int minShouldMatch, bool needsScores,
                             bool allowsPruning,
                             bool uniformConstantCandidate)
-        : reader(reader), mandatorySources(std::move(mandatorySources)),
+        : filterWeights(filterWeights), reader(reader),
+          mandatorySources(std::move(mandatorySources)),
           mandatoryScores(mandatoryScores.begin(), mandatoryScores.end()),
           optionalSources(std::move(optionalSources)),
           prohibitedSources(std::move(prohibitedSources)),
@@ -4966,6 +4969,13 @@ public:
             std::numeric_limits<int64_t>::max());
         return supplier->resolve(
             targetPool, supplier->makePlanContext(demand))->build(targetPool);
+      }
+
+      void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+        for (const auto& source : mandatorySources) source.releaseSegmentState(segment);
+        for (const auto& source : optionalSources) source.releaseSegmentState(segment);
+        for (const auto& source : prohibitedSources) source.releaseSegmentState(segment);
+        for (auto* weight : filterWeights) weight->releaseSegmentState(segment);
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {
@@ -5144,6 +5154,14 @@ public:
       }
     }
 
+    void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+      for (auto weights : {mandatoryWeights, optionalWeights, prohibitedWeights, filterWeights}) {
+        for (auto* weight : weights) {
+          if (weight) weight->releaseSegmentState(segment);
+        }
+      }
+    }
+
     // Membership count free from index stats, composed from the clauses.
     // Two shapes answer: a lone required clause delegates (optional clauses
     // beside it never gate membership while minShouldMatch is unset, whether
@@ -5211,7 +5229,7 @@ public:
           prohibitedWeights, prohibitedUses, ctx);
 
       return std::make_unique<BooleanPreparedWeight>(
-        ctx.reader, std::move(mandatorySources), mandatoryScores,
+        filterWeights, ctx.reader, std::move(mandatorySources), mandatoryScores,
         std::move(optionalSources),
         std::move(prohibitedSources), std::move(filterDomains),
         prohibitedCacheRoutes, !filterSources.empty(),

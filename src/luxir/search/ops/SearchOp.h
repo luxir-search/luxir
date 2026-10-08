@@ -76,6 +76,8 @@ T& optMut(std::optional<T>& opt) {
 }
 
 class SearchOp {
+  std::vector<uint32_t> segmentStateRetentions;
+
 public:
   SearchRequest& req;
   std::string_view name;
@@ -86,7 +88,8 @@ public:
   // We can't pass both the parent and children to constructors (and have them fully formed)
   // one has to come before the other.  The parser currently sets subOps and parent
   // after construction, so do not inspect these fields in the constructor.
-  SearchOp(SearchRequest& req, std::string_view name) : req(req), name(name) {
+  SearchOp(SearchRequest& req, std::string_view name)
+    : segmentStateRetentions(req.reader->segments().size()), req(req), name(name) {
   }
 
   virtual void init() {
@@ -94,6 +97,42 @@ public:
       subOp->init();
     }
   }
+
+  // Bucket blocks execute synchronously. Segment tasks otherwise own distinct
+  // slots; a retained ancestor also covers Fusion sources and nested children.
+  bool segmentStateRetained(IndexReader::Segment& segment) const noexcept {
+    for (auto* owner = this; owner != nullptr; owner = owner->parent) {
+      if (owner->segmentStateRetentions[(size_t)segment.ord] != 0) return true;
+    }
+    return false;
+  }
+
+  virtual void releaseSegmentState(IndexReader::Segment& segment) noexcept {
+    if (segmentStateRetained(segment)) return;
+    for (auto& [name, child] : subOps) child->releaseSegmentState(segment);
+  }
+
+  class SegmentStateRetention {
+    std::span<SearchOp* const> ops;
+    std::span<IndexReader::Segment> segments;
+
+  public:
+    SegmentStateRetention(std::span<SearchOp* const> ops,
+                          std::span<IndexReader::Segment> segments)
+      : ops(ops), segments(segments) {
+      for (auto& segment : segments) {
+        for (auto* op : ops) ++op->segmentStateRetentions[(size_t)segment.ord];
+      }
+    }
+    SegmentStateRetention(const SegmentStateRetention&) = delete;
+    SegmentStateRetention& operator=(const SegmentStateRetention&) = delete;
+    ~SegmentStateRetention() {
+      for (auto& segment : segments) {
+        for (auto* op : ops) --op->segmentStateRetentions[(size_t)segment.ord];
+        for (auto* op : ops) op->releaseSegmentState(segment);
+      }
+    }
+  };
 
   class Calculator;
   class InlineCalculator;
@@ -178,6 +217,10 @@ public:
     };
 
     Calculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : op(op), parent(parent), slot(slot), numSlots(numSlots) {}
+
+    virtual void releaseSegmentState(IndexReader::Segment& segment) noexcept {
+      op.releaseSegmentState(segment);
+    }
 
     // The Val this calculator fills: `val` itself for an ordinary op, or its
     // bucket slot in val's ArrayArm (created on first use, sized to numSlots).

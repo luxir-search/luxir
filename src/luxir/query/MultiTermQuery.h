@@ -13,6 +13,7 @@
 #include "DocSetBulkScorer.h"
 #include "PostingsUnion.h"
 #include "Query.h"
+#include "QueryStats.h"
 #include "luxir/reader/FilteredTermsEnum.h"
 #include "luxir/util/screaming.h"
 
@@ -100,6 +101,10 @@ public:
     struct ExpansionFacts {
       using States = ExpansionStates;
       MemPool statePool;
+      MemPool::save_point stateStart = statePool.getSavePoint();
+      bool populated = false;
+      bool released = false;
+      uint64_t refills = 0;
       std::variant<States, BitsetPayload> payload;
       int64_t sumDocFreq = 0;
       size_t termCount = 0;
@@ -124,8 +129,9 @@ public:
     };
 
     // Segment tasks use distinct slots; preparation precedes dispatch and
-    // facet bucket bindings sharing a weight run serially. Each budget is
-    // filled once, then its facts (including statePool) are read-only.
+    // facet bucket bindings sharing a weight run serially. Concurrent use of
+    // the same (weight, segment), including fill and release, is unsupported.
+    // Populated facts are immutable until the executor releases the segment.
     struct ExpansionMemo {
       ExpansionFacts* facts = nullptr;
     };
@@ -251,16 +257,21 @@ public:
       assert(segment.ord >= 0
              && (size_t) segment.ord < expansionMemos.size());
       ExpansionMemo& memo = expansionMemos[(size_t) segment.ord];
-      if (findExpansionFacts(
-              memo, buildContext.multiTermMaxLazyStateBytes) != nullptr) {
-        return false;
+      auto* facts = findExpansionFacts(memo, buildContext.multiTermMaxLazyStateBytes);
+      if (facts != nullptr && facts->populated) return false;
+      if (facts == nullptr) {
+        facts = luxir::arenaCreate<ExpansionFacts>(
+            memoArena, buildContext.multiTermMaxLazyStateBytes);
+        facts->next = memo.facts;
+        memo.facts = facts;
       }
+      // Keep the record on failure, but never publish partial state.
+      auto cleanup = scope_guard([&]() noexcept {
+        if (!facts->populated) facts->statePool.rewind(facts->stateStart, 0);
+      });
 
       size_t maxStates = buildContext.multiTermMaxLazyStateBytes
           / sizeof(TermsEnum::PostingsState);
-      auto* facts = luxir::arenaCreate<ExpansionFacts>(
-          memoArena, buildContext.multiTermMaxLazyStateBytes);
-      auto stateStart = facts->statePool.getSavePoint();
       ChunkedArray<TermsEnum::PostingsState> states(facts->statePool, maxStates);
       uint64_t* bitWords = nullptr;
       size_t termCount = 0;
@@ -299,7 +310,7 @@ public:
             }
             addPostingsToBitset(bits, state);
             // No state views have escaped; return all heap blocks at spill.
-            facts->statePool.rewind(stateStart, 0);
+            facts->statePool.rewind(facts->stateStart, 0);
           }
         }
       }
@@ -315,8 +326,11 @@ public:
       facts->termCount = termCount;
       facts->matchState = termCount == 0 ? Query::MatchState::EMPTY
                                        : Query::MatchState::NONEMPTY;
-      facts->next = memo.facts;
-      memo.facts = facts;
+      facts->populated = true;
+      if (facts->released) {
+        ++facts->refills;
+        multitermExpansionRefills.fetch_add(1, std::memory_order_relaxed);
+      }
       return true;
     }
 
@@ -448,6 +462,7 @@ public:
       int64_t cost() override {
         ExpansionFacts* facts =
             weight.expansionMemos[(size_t) segment.ord].facts;
+        while (facts != nullptr && !facts->populated) facts = facts->next;
         if (disableTruthfulCostForTests || facts == nullptr) {
           return segment.maxDoc();
         }
@@ -460,6 +475,7 @@ public:
         ExpansionFacts* facts = findExpansionFacts(
             weight.expansionMemos[(size_t) segment.ord],
             buildContext.multiTermMaxLazyStateBytes);
+        if (facts != nullptr && !facts->populated) facts = nullptr;
         if (weight.cachedFieldInfo == nullptr
             || weight.cachedFieldInfo->segInfos[segment.ord] == nullptr) {
           matchState = Query::MatchState::EMPTY;
@@ -592,11 +608,33 @@ public:
       return supplier->resolve(targetPool, planContext)->build(targetPool);
     }
 
+    void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+      for (auto* facts = expansionMemos[(size_t)segment.ord].facts;
+           facts != nullptr; facts = facts->next) {
+        if (!facts->populated || facts->hasBitset()) continue;
+        facts->payload = ExpansionFacts::States{};
+        facts->statePool.rewind(facts->stateStart, 0);
+        facts->populated = false;
+        facts->released = true;
+      }
+    }
+
+    // Read after segment tasks drain; each segment updates only its own facts.
+    uint64_t expansionRefillsForTests() const {
+      uint64_t total = 0;
+      for (const auto& memo : expansionMemos) {
+        for (auto* facts = memo.facts; facts != nullptr; facts = facts->next) {
+          total += facts->refills;
+        }
+      }
+      return total;
+    }
+
     bool expansionMemoUsesBitsetForTests(
         const IndexReader::Segment& segment) const {
       ExpansionFacts* facts =
           expansionMemos[(size_t) segment.ord].facts;
-      return facts != nullptr && facts->hasBitset();
+      return facts != nullptr && facts->populated && facts->hasBitset();
     }
 
     size_t expansionMemoRetainedStatesForTests(
@@ -609,14 +647,27 @@ public:
 
     size_t expansionMemoPoolBytesForTests(
         const IndexReader::Segment& segment) const {
-      ExpansionFacts* facts =
-          expansionMemos[(size_t) segment.ord].facts;
+      auto* facts = expansionMemos[(size_t)segment.ord].facts;
       assert(facts != nullptr);
       const auto& pool = facts->statePool;
       size_t bytes = pool.allocatedSize();
-      // allocatedSize() excludes spare blocks kept after a rewind.
       for (size_t i = (size_t)pool.bufferIdx + 1; i < pool.buffers.size(); i++) {
         bytes += pool.bufferSize(pool.buffers[i]);
+      }
+      return bytes;
+    }
+
+    size_t expansionMemoHeapBytesForTests(
+        const IndexReader::Segment& segment) const {
+      size_t bytes = 0;
+      for (auto* facts = expansionMemos[(size_t)segment.ord].facts;
+           facts != nullptr; facts = facts->next) {
+        const auto& pool = facts->statePool;
+        bytes += pool.allocatedSize() - MemPool::STATIC_BUFFER_SIZE;
+        // allocatedSize() excludes spare blocks kept after a rewind.
+        for (size_t i = (size_t)pool.bufferIdx + 1; i < pool.buffers.size(); i++) {
+          bytes += pool.bufferSize(pool.buffers[i]);
+        }
       }
       return bytes;
     }

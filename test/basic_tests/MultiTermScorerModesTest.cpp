@@ -18,6 +18,11 @@
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
 #include "luxir/query/BooleanQuery.h"
+#include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/ForcePrepareQuery.h"
+#include "luxir/query/RescoreQuery.h"
+#include "luxir/server/Stats.h"
+#include "luxir/value/ValueExprParser.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/query/TermQuery.h"
@@ -1111,4 +1116,203 @@ TEST_F(MultiTermScorerModesTest, firstDocLowerBound) {
   EXPECT_GT(pulsed, 0);
   EXPECT_GT(tails, 20);
   EXPECT_GT(packed, 5);
+}
+
+TEST_F(MultiTermScorerModesTest, releaseAndRefillSegmentState) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, mixedShapeDocs());
+  auto& segment = ti.reader->segments()[0];
+  for (auto mode : {ScorerMode::FORCE_HEAP, ScorerMode::FORCE_WINDOWED,
+                    ScorerMode::FORCE_EAGER}) {
+    SCOPED_TRACE((int)mode);
+    ScorerModeGuard modeGuard(mode);
+    Query::Context context(ti.pool, *ti.reader);
+    PrefixQuery prefix("body_w", "q");
+    auto* weight = (MultiTermQuery::Weight*)prefix.createWeight(
+        context, Query::NEED_SCORES | Query::ALLOW_PRUNING, 2.5f);
+    auto collect = [&]() {
+      MemPool scratch;
+      auto* scorer = weight->createScorer(scratch, segment);
+      EXPECT_NE(nullptr, scorer);
+      if (mode == ScorerMode::FORCE_HEAP) {
+        EXPECT_NE(nullptr, dynamic_cast<UnionHeapScorer*>(scorer));
+      }
+      if (mode == ScorerMode::FORCE_WINDOWED) {
+        EXPECT_NE(nullptr, dynamic_cast<UnionLazyScorer*>(scorer));
+      }
+      if (mode == ScorerMode::FORCE_EAGER) {
+        EXPECT_NE(nullptr, dynamic_cast<MultiTermQuery::Scorer*>(scorer));
+      }
+      std::vector<std::pair<int32_t, float>> docs;
+      if (scorer) {
+        for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+          docs.emplace_back(doc, scorer->score());
+        }
+      }
+      return docs;
+    };
+    auto expected = collect();
+    ASSERT_FALSE(expected.empty());
+    EXPECT_EQ(2.5f, expected.front().second);
+    EXPECT_GT(weight->expansionMemoHeapBytesForTests(segment), 0u);
+    auto arenaBytes = context.arena().SpaceUsed();
+    uint64_t processRefills = multitermExpansionRefills.load(std::memory_order_relaxed);
+    for (uint64_t cycle = 1; cycle <= 3; cycle++) {
+      weight->releaseSegmentState(segment);
+      weight->releaseSegmentState(segment);
+      EXPECT_EQ(0u, weight->expansionMemoHeapBytesForTests(segment));
+      EXPECT_EQ(expected, collect());
+      EXPECT_EQ(arenaBytes, context.arena().SpaceUsed());
+      EXPECT_EQ(cycle, weight->expansionRefillsForTests());
+      EXPECT_EQ(processRefills + cycle, multitermExpansionRefills.load(std::memory_order_relaxed));
+    }
+    weight->releaseSegmentState(segment);
+    auto matches = QueryPrep::materialize(*weight, segment, nullptr);
+    EXPECT_EQ(expected.size(), matches->card());
+    weight->releaseSegmentState(segment);
+    EXPECT_EQ(0u, weight->expansionMemoHeapBytesForTests(segment));
+    EXPECT_EQ(expected.size(), matches->card());
+  }
+}
+
+TEST_F(MultiTermScorerModesTest, releaseAllBudgetsPreservesSpillAndEmptyExpansion) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, mixedShapeDocs());
+  Query::Context context(ti.pool, *ti.reader);
+  auto& segment = ti.reader->segments()[0];
+  PrefixQuery prefix("body_w", "q");
+  auto* weight = (MultiTermQuery::Weight*)prefix.createWeight(context, 0);
+  MemPool scratch;
+  auto* supplier = weight->scorerSupplier(scratch, segment);
+  auto large = supplier->makePlanContext(Query::Demand::fromLeadCost(1));
+  auto medium = large;
+  medium.multiTermMaxLazyStateBytes /= 2;
+  auto spilled = large;
+  spilled.multiTermMaxLazyStateBytes = 0;
+  for (auto build : {large, medium, spilled}) EXPECT_TRUE(supplier->fillExpansionMemo(build));
+  auto* spillScorer = supplier->resolve(scratch, spilled)->build(scratch);
+  ASSERT_NE(nullptr, spillScorer);
+  auto* spillWords = ((MultiTermQuery::Scorer*)spillScorer)->bitWordsForTests();
+  int32_t count = 0;
+  while (spillScorer->next() != PostingsReader::END) ++count;
+  EXPECT_EQ(3000, count);
+  weight->releaseSegmentState(segment);
+  EXPECT_EQ(0u, weight->expansionMemoHeapBytesForTests(segment));
+  EXPECT_FALSE(supplier->fillExpansionMemo(spilled));
+  auto* refill = (MultiTermQuery::Scorer*)supplier->resolve(scratch, spilled)->build(scratch);
+  EXPECT_EQ(spillWords, refill->bitWordsForTests());
+  for (auto build : {large, medium}) EXPECT_TRUE(supplier->fillExpansionMemo(build));
+  EXPECT_EQ(2u, weight->expansionRefillsForTests());
+  weight->releaseSegmentState(segment);
+
+  PrefixQuery empty("body_w", "unmatched");
+  auto* emptyWeight = (MultiTermQuery::Weight*)empty.createWeight(context, 0);
+  auto* emptySupplier = emptyWeight->scorerSupplier(scratch, segment);
+  EXPECT_TRUE(emptySupplier->fillExpansionMemo(large));
+  EXPECT_FALSE(emptySupplier->fillExpansionMemo(large));
+  EXPECT_EQ(Query::MatchState::EMPTY, emptySupplier->describeScorer(large).matchState);
+  EXPECT_EQ(0, emptySupplier->cost());
+  emptyWeight->releaseSegmentState(segment);
+  EXPECT_EQ(Query::MatchState::UNKNOWN, emptySupplier->describeScorer(large).matchState);
+  EXPECT_EQ(segment.maxDoc(), emptySupplier->cost());
+  EXPECT_TRUE(emptySupplier->fillExpansionMemo(large));
+  EXPECT_EQ(1u, emptyWeight->expansionRefillsForTests());
+  EXPECT_EQ(nullptr, emptySupplier->resolve(scratch, large)->build(scratch));
+}
+
+TEST_F(MultiTermScorerModesTest, materializationDoesNotReleaseLiveHeapScorer) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, mixedShapeDocs());
+  ScorerModeGuard mode(ScorerMode::FORCE_HEAP);
+  Query::Context context(ti.pool, *ti.reader);
+  auto& segment = ti.reader->segments()[0];
+  PrefixQuery prefix("body_w", "q");
+  auto* weight = (MultiTermQuery::Weight*)prefix.createWeight(
+      context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  {
+    auto release = scope_guard([&]() noexcept { weight->releaseSegmentState(segment); });
+    MemPool scratch;
+    auto* scorer = weight->createScorer(scratch, segment);
+    ASSERT_NE(nullptr, dynamic_cast<UnionHeapScorer*>(scorer));
+    EXPECT_EQ(0, scorer->next());
+    auto matches = QueryPrep::materialize(*weight, segment, nullptr);
+    int32_t count = 1;
+    while (scorer->next() != PostingsReader::END) ++count;
+    EXPECT_EQ(matches->card(), count);
+    EXPECT_EQ(0u, weight->expansionRefillsForTests());
+  }
+  EXPECT_EQ(0u, weight->expansionMemoHeapBytesForTests(segment));
+}
+
+TEST_F(MultiTermScorerModesTest, wrapperReleasePreservesPreparedResults) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, mixedShapeDocs());
+  Query::Context context(ti.pool, *ti.reader);
+  auto& segment = ti.reader->segments()[0];
+  PrefixQuery mandatory("body_w", "q"), optional("body_w", "qmid");
+  PrefixQuery prohibited("body_w", "qlast"), filter("body_w", "qdense");
+  std::array<Query*, 1> must{&mandatory}, should{&optional}, mustNot{&prohibited}, filters{&filter};
+  BooleanQuery boolean(must, should, mustNot, filters, 1);
+  ConstantScoreQuery constant(&boolean, 2.0f);
+  ForcePrepareQuery force(&constant);
+  ValueExprOptions options{ti.reader->schema().get(), {}};
+  auto* program = ValueExprParser(options, context.arena()).parse("3.0");
+  RescoreQuery rescore(&force, program, 3.0f);
+  auto* weight = rescore.createWeight(context, Query::NEED_SCORES);
+  Query::Weight::PrepareContext prepareContext{*ti.reader, {}, false};
+  QueryPrep::PreparedSource source;
+  source.weight = weight;
+  source.setPrepared(weight->prepare(prepareContext));
+  ASSERT_NE(nullptr, source.prepared);
+  auto collect = [&](Query::SegmentSource& from) {
+    MemPool scratch;
+    std::vector<std::pair<int32_t, float>> docs;
+    auto* scorer = QueryPrep::createScorer(scratch, segment, from);
+    if (scorer) {
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        docs.emplace_back(doc, scorer->score());
+      }
+    }
+    return docs;
+  };
+  auto expected = collect(source.segmentSource());
+  ASSERT_FALSE(expected.empty());
+  EXPECT_EQ(3.0f, expected.front().second);
+  uint64_t before = multitermExpansionRefills.load(std::memory_order_relaxed);
+  source.prepared->releaseSegmentState(segment);
+  EXPECT_EQ(expected, collect(source.segmentSource()));
+  EXPECT_GT(multitermExpansionRefills.load(std::memory_order_relaxed), before);
+  source.releaseSegmentState(segment);
+  EXPECT_EQ(expected, collect(*weight));
+  weight->releaseSegmentState(segment);
+  EXPECT_EQ(expected, collect(source.segmentSource()));
+
+  api::StatsResponse stats;
+  std::pmr::monotonic_buffer_resource memory;
+  gatherStats(*luxirNode, {}, stats, memory);
+  EXPECT_EQ(multitermExpansionRefills.load(std::memory_order_relaxed), stats.multiterm_expansion_refills);
+}
+
+TEST_F(MultiTermScorerModesTest, exceptionalSegmentExitReleasesState) {
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  buildCorpus(field, mixedShapeDocs());
+  Query::Context context(ti.pool, *ti.reader);
+  auto& segment = ti.reader->segments()[0];
+  PrefixQuery prefix("body_w", "q");
+  auto* weight = (MultiTermQuery::Weight*)prefix.createWeight(context, 0);
+  EXPECT_THROW({
+    auto release = scope_guard([&]() noexcept { weight->releaseSegmentState(segment); });
+    MemPool scratch;
+    auto* supplier = weight->scorerSupplier(scratch, segment);
+    supplier->resolve(scratch, supplier->makePlanContext(Query::Demand::fromLeadCost(1)));
+    throw std::runtime_error("abandon resolved plan");
+  }, std::runtime_error);
+  EXPECT_EQ(0u, weight->expansionMemoHeapBytesForTests(segment));
+  EXPECT_EQ(3000, QueryPrep::materialize(*weight, segment, nullptr)->card());
+  EXPECT_EQ(1u, weight->expansionRefillsForTests());
 }

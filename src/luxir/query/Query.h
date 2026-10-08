@@ -929,6 +929,11 @@ public:
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
   class SegmentSource {
   public:
+    /// Drop refillable transient state only; preserve semantics and prepared
+    /// results. Idempotent. No plan or scorer from this source for the segment
+    /// may still be in use, including plans abandoned during route selection.
+    virtual void releaseSegmentState(IndexReader::Segment&) noexcept {}
+
     /// Return temporary per-segment planning state allocated from targetPool.
     /// A null supplier means this source cannot match the segment.
     Query::ScorerSupplier* scorerSupplier(

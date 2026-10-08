@@ -61,8 +61,9 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // Once execution is under way it is the engine's.  Throw sites that know
   // better say so with an ApiError, which classifies itself in either phase.
   ErrorKind fallback = ErrorKind::INVALID_REQUEST;
+  RootOp* root = nullptr;
   try {
-    auto* root = prepare(req);
+    root = prepare(req);
     root->init();
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
@@ -92,6 +93,10 @@ void SearchEngine::submitBody(SearchRequest& req) {
       LOG_WARN("Search request rejected ({}): {}", info.code, info.message);
     }
     req.setError(info);
+  }
+
+  if (root != nullptr) {
+    for (auto& segment : req.reader->segments()) root->releaseSegmentState(segment);
   }
 
   // Profile slots are written only by segment tasks. Materialize the shared

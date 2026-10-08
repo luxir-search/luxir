@@ -506,6 +506,8 @@ public:
 
   class Calc : public FieldFacetReq::Calc {
     ExecutionProfileRun* profileRun;
+    // Incoming segment domains, kept only while something later reads them:
+    // the inline-all gather and the result-child feed.
     std::vector<DomainHandle> input;
     std::vector<std::pair<const std::string_view, SearchOp*>> inlineOps;
     std::vector<std::pair<const std::string_view, SearchOp*>> feedOps;
@@ -536,7 +538,10 @@ public:
                [this](std::unique_ptr<MergeableStrData> m){ facetResult(std::move(m)); }),
         inlineDriver(op.req.reader->segments().size(),
                      [this](std::unique_ptr<MergeableFieldFacetInline> m){ facetResult2(std::move(m)); }) {
-      input.resize(op.req.reader->segments().size());
+      // An inline-all candidate always starts with feed ops, so this also
+      // covers its gather.
+      assert(!thisOp().inlineAllCandidate || !feedOps.empty());
+      if (!feedOps.empty()) input.resize(op.req.reader->segments().size());
       topTermsSegments.resize(op.req.reader->segments().size());
       inlineDriver.setCreator([this]() {
         return createInlineData(inlineOps,
@@ -635,6 +640,8 @@ public:
         assert(seen <= (int32_t)input.size());
         if (seen == (int32_t)input.size()) {
           calcAll(tg, input);
+          // Every feed op went inline, so no result child reads them.
+          if (feedOps.empty()) input.clear();
         }
         return;
       }
@@ -654,7 +661,7 @@ public:
 
       assert(domainHandle.isDeliverable());
       DocSet* domain = domainHandle.get();
-      input[(size_t)segnum] = std::move(domainHandle);
+      if (!feedOps.empty()) input[(size_t)segnum] = std::move(domainHandle);
 
       if (profileRun != nullptr) {
         auto profile = profilePiece(profileRun, segnum);
@@ -1612,18 +1619,22 @@ public:
         children.push_back(child);
       }
 
+      // Each bucket domain has a single use: table entries are handed over,
+      // and postings domains are materialized one at a time.
       std::vector<DomainHandle> built;
       if (ordColumnDomains) built = ordColumnBucketDomains(buckets);
 
-      FacetBucketDomainExecutor::execute(
-          *this, children, buckets, (int32_t)input.size(),
-          [&](int32_t segment, const auto& bucket) {
-            if (ordColumnDomains) {
-              return built[(size_t)segment * buckets.size()
-                           + (size_t)bucket.owner.value];
+      FacetBucketBlockExecutor::execute<std::string_view>(
+          *this, children, buckets, *op.req.reader,
+          [&](size_t segnum, auto block, FacetBucketFeed feed) {
+            for (size_t i = 0; i < block.size(); i++) {
+              feed(i, ordColumnDomains
+                  ? std::move(built[segnum * buckets.size()
+                                    + (size_t)block[i].owner.value])
+                  : materializeTermDomain((int32_t)segnum, block[i].key,
+                                          input[segnum].get()));
             }
-            return materializeTermDomain(segment, bucket.key, input[(size_t)segment].get());
-          });
+          }, FacetBucketBlockExecutor::BINDING_BYTES, []() {});
     }
   };
 
@@ -1936,6 +1947,49 @@ public:
 
   Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots) override {
     return new Calc(*this, parent, slot, numSlots);
+  }
+
+  // Retained by one bucket binding while its segments are fed: the
+  // calculator, the count state merged across segments, and the per-segment
+  // handles its result children read. Count storage is bounded over the
+  // representations countSegment may pick for this ord space: a vector only
+  // when forced or when some segment is large enough for the column walk's
+  // R >= 16 crossover, otherwise skinny's byte per ord. Hash and span
+  // counters grow with the bucket's own values and, as for IntFacetReq's
+  // hash, are not charged.
+  size_t facetBucketResidentBytes() const override {
+    int64_t numOrds = ordMap ? ordMap->numOrds() : 0;
+    size_t bytes = sizeof(Calc);
+    if (inlineSubOps.empty()) {
+      int64_t maxDoc = 0;
+      for (auto& segment : reader.segments()) {
+        maxDoc = std::max<int64_t>(maxDoc, segment.maxDoc());
+      }
+      bool vector = forcedFacetCounterMode == FacetCounterMode::FORCE_VECTOR
+          || (maxDoc >> 4) >= numOrds;
+      bytes = saturatingAdd(bytes, saturatingMultiply((size_t)numOrds,
+          vector ? sizeof(int64_t) : sizeof(uint8_t)));
+    } else {
+      size_t stride = sizeof(int64_t);
+      for (auto& [name, child] : inlineSubOps) {
+        stride = saturatingAdd(stride, child->inlineEntryBytes());
+      }
+      if (inlineAllCandidate) {
+        // calcAll may promote the remaining inlinable sub-ops.
+        for (auto& [name, child] : subOps) {
+          if (child->canInline()) {
+            stride = saturatingAdd(stride, child->inlineEntryBytes());
+          }
+        }
+      }
+      bytes = saturatingAdd(bytes,
+          FacetEntryTable::residentBytes(stride, numOrds));
+    }
+    if (!subOps.empty()) {
+      bytes = saturatingAdd(bytes,
+          saturatingMultiply(reader.segments().size(), sizeof(DomainHandle)));
+    }
+    return bytes;
   }
 };
 

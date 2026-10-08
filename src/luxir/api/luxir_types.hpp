@@ -406,6 +406,7 @@ struct StatsResponse {
   std::span<const CollectionStats> collections;
   IndexRamStats indexing_ram;
   AllocatorStats big_buffer_ram;
+  uint64_t multiterm_expansion_refills = 0;
 };
 struct CacheControlRequest {
   std::string_view collection;
