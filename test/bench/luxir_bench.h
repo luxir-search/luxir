@@ -5,8 +5,8 @@
 #include <chrono>
 #include <sys/resource.h>
 #include <fstream>
-#include <malloc.h>
 #include "benchmark/benchmark.h"
+#include "luxir/util/ProcessAllocator.h"
 #include "test/LuxirTest.h"
 
 
@@ -80,7 +80,7 @@ public:
   }
 
   RSSWatcher(size_t sleepNs = 1000000) {
-    malloc_trim(0);
+    releaseFreeMemory();
     sleepns = sleepNs;
     page_size_kb = sysconf(_SC_PAGESIZE) / 1024;
     startRSS = getRSSKB();

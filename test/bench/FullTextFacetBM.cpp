@@ -964,7 +964,7 @@ void buildFullTextBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<
   helper.commit();
 
   if (!luxir::unit_tests) {
-    malloc_trim(0);
+    releaseFreeMemory();
     std::println(std::cerr, "Post buildFullTextBenchIndex - Peak RSS: {} KB, current RSS: {} KB", peakRSSKB(), currentRSSKB());
   }
 }

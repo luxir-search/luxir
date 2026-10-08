@@ -32,17 +32,21 @@ export LUXIR_NATIVE_CPU=${native_cpu%% *}
 # Manifest reconciliation owns each prefix. Keep normal, ASan and legacy
 # classic-mode installs separate. Host code generators always run unsanitized.
 # ASan's separate host packages need only Release; normal builds reuse their
-# target packages for host tools.
+# target packages for host tools. Only normal builds link jemalloc; ASan
+# supplies its own allocator.
 export VCPKG_MAX_CONCURRENCY=${VCPKG_MAX_CONCURRENCY:-12}
 for variant in native native-asan; do
   host_triplet=x64-linux-luxir-native
+  features=(--x-feature=jemalloc)
   if [[ $variant == native-asan ]]; then
     host_triplet=x64-linux-luxir-native-host
+    features=()
   fi
   "$vcpkg_root/vcpkg" install \
     --x-manifest-root="$deps_dir" \
     --x-install-root="$vcpkg_root/installed-$variant" \
     --triplet="x64-linux-luxir-$variant" \
     --host-triplet="$host_triplet" \
+    "${features[@]}" \
     --clean-buildtrees-after-build --clean-packages-after-build
 done

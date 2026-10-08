@@ -5,14 +5,9 @@
 #include <optional>
 #include <sstream>
 #include <thread>
-#include <climits>
-#ifdef __GLIBC__
-#include <malloc.h>
-#endif
 #include "luxir/luxir_main.h"
 #include "luxir/server/Promotion.h"
-#include "luxir/util/MappedAlloc.h"
-#include "luxir/util/MemPool.h"
+#include "luxir/util/ProcessAllocator.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/HttpServer.h"
@@ -59,20 +54,6 @@ int luxir_main(int argc, char** argv) {
     }
     if (!app.get_option("--log-level")->count()) config.log_level = "warn";
   } else std::cout << luxir_banner() << std::endl;
-
-#ifdef __GLIBC__
-  // An explicit mallopt permanently disables glibc's dynamic mmap-threshold
-  // ratchet (freeing an mmap'd chunk raises the threshold to its size, up to
-  // 32M, after which mid-size allocations are arena-retained on free and
-  // cross-thread frees serialize on arena mutexes).  See the config comment
-  // for the tradeoff; 0 leaves glibc untouched.
-  if (config.malloc_mmap_threshold != 0) {
-    int64_t t = config.malloc_mmap_threshold < 0 ? (int64_t)MemPool::BYTE_BLOCK_SIZE
-                                                 : config.malloc_mmap_threshold;
-    mappedAllocationFloor = (size_t)t;
-    mallopt(M_MMAP_THRESHOLD, (int)std::min(t, (int64_t)INT_MAX));
-  }
-#endif
 
   try {
     config.normalize();
@@ -172,7 +153,8 @@ std::string luxir_banner() {
 #endif
 
   ss << std::endl;
-  ss << "\thw_threads=" << std::thread::hardware_concurrency();
+  ss << "\tallocator=" << allocatorName();
+  ss << " hw_threads=" << std::thread::hardware_concurrency();
   ss << " cwd=" << fs::current_path();
   ss << " tmp=" << fs::temp_directory_path();
 

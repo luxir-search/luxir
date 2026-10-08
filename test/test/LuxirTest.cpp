@@ -8,7 +8,6 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
-#include <new>
 #include <thread>
 #include <typeinfo>
 #include "LuxirTest.h"
@@ -390,48 +389,3 @@ TEST(Benchmarks, all) {
   benchmark::Initialize(&myargc, &(myargv[0]));
   benchmark::RunSpecifiedBenchmarks();
 }
-
-
-// Global operator new/delete overrides for the test+benchmark binary. Every
-// allocation bumps a per-thread counter (see LuxirTest.h / AllocScope), which
-// lets tests assert "this code path performs N allocations" - notably the
-// allocation-free Unicode segmentation check. Cost is one thread-local increment
-// per allocation; BM_AllocSmall_std measures it. Under MEM_SCRIBBLE we also
-// scribble freshly-allocated bytes (heap use-before-init aid).
-namespace luxir::memtrack {
-thread_local long allocCount = 0;
-thread_local long allocBytes = 0;
-}
-
-#ifndef LUXIR_ASAN  // under ASan, ASan owns operator new/delete (see LuxirTest.h)
-static inline void* luxirTrackAlloc(std::size_t n, std::size_t align) {
-  ++luxir::memtrack::allocCount;
-  luxir::memtrack::allocBytes += (long) n;
-  void* p;
-  if (align <= alignof(std::max_align_t)) {
-    p = std::malloc(n ? n : 1);
-  } else {
-    std::size_t sz = (n + align - 1) & ~(align - 1);  // aligned_alloc needs size % align == 0
-    p = std::aligned_alloc(align, sz ? sz : align);
-  }
-  if (!p) throw std::bad_alloc();
-#ifdef MEM_SCRIBBLE
-  std::memset(p, 'z', n);
-#endif
-  return p;
-}
-
-void* operator new(std::size_t n) { return luxirTrackAlloc(n, alignof(std::max_align_t)); }
-void* operator new[](std::size_t n) { return luxirTrackAlloc(n, alignof(std::max_align_t)); }
-void* operator new(std::size_t n, std::align_val_t a) { return luxirTrackAlloc(n, (std::size_t) a); }
-void* operator new[](std::size_t n, std::align_val_t a) { return luxirTrackAlloc(n, (std::size_t) a); }
-
-void operator delete(void* p) noexcept { std::free(p); }
-void operator delete[](void* p) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
-void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
-void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
-void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
-#endif  // !LUXIR_ASAN

@@ -19,15 +19,22 @@ in `/opt/vcpkg/installed-native` and `/opt/vcpkg/installed-native-asan`.
 - vcpkg (toolchain files expected at `/opt/vcpkg/`)
 - Host tools: pkg-config, Python 3, curl, zip, unzip, and tar
 - Dependencies: Protobuf, gRPC, Intel TBB, Boost, xxHash, spdlog, CLI11,
-  LZ4, FAISS, glaze, GTL, GoogleTest, and Google Benchmark. The compiler
-  supplies OpenMP; FastPFOR is fetched and uni-algo is vendored
+  LZ4, FAISS, glaze, GTL, jemalloc, GoogleTest, and Google Benchmark. The
+  compiler supplies OpenMP; FastPFOR is fetched and uni-algo is vendored
 
 The build uses `-march=native`; a release binary is intended for the machine
 class on which its dependencies and Luxir itself were built.
-TBB and its internal tbbmalloc allocator are static vcpkg libraries. Application
-malloc/free remain glibc's. OpenBLAS supplies C LAPACK, so neither a Fortran
-compiler nor a Fortran runtime is required. Native builds retain shared GCC
-runtimes; the container's static runtime setting is a separate packaging choice.
+TBB and its internal tbbmalloc allocator are static vcpkg libraries. Static
+jemalloc replaces malloc/free and operator new/delete process-wide in every
+build by default unless sanitizer flags are present (`LUXIR_JEMALLOC` then
+defaults to `OFF`); explicitly enabling both is an error. The startup banner
+reports the allocator version and effective configuration. The jemalloc overlay
+embeds allocator defaults; see [dependency settings](../../deps/README.txt).
+For Valgrind, configure a build with `-DLUXIR_JEMALLOC=OFF` or run with
+`--soname-synonyms=somalloc=NONE`. OpenBLAS supplies C LAPACK, so neither a
+Fortran compiler nor a Fortran runtime is required. Native builds retain shared
+GCC runtimes; the container's static runtime setting is a separate packaging
+choice.
 
 ## Prepare a checkout
 

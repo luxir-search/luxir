@@ -74,7 +74,7 @@ RUN --mount=type=cache,target=/opt/vcpkg/downloads \
     --mount=type=cache,target=/var/cache/vcpkg \
     /opt/vcpkg/vcpkg install --x-manifest-root=/opt/luxir-deps \
       --x-install-root=/opt/vcpkg/installed --triplet=x64-linux-luxir-v2 \
-      --host-triplet=x64-linux-luxir-v2 \
+      --host-triplet=x64-linux-luxir-v2 --x-feature=jemalloc \
       --clean-buildtrees-after-build --clean-packages-after-build
 
 FROM normal-dependencies AS dependencies

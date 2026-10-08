@@ -523,13 +523,13 @@ TEST_F(AnalysisTest, caseFoldingConformance) {
 // assertion below cannot pass by a no-op/broken counter. The fold path returns a
 // std::string and must allocate for a long non-ASCII token.
 TEST_F(AnalysisTest, allocCounterObservesFoldAllocation) {
-  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter disabled under ASan";
+  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter needs jemalloc or a sanitizer";
   std::string longUni;
   for (int i = 0; i < 500; i++) longUni += "Ä";  // long, non-SSO, non-ASCII
   memtrack::AllocScope s;
   std::string folded = una::cases::to_casefold_utf8(longUni);
-  long allocs = s.count();  // capture before any EXPECT (gtest macros allocate)
-  EXPECT_GT(allocs, 0);
+  long allocated = s.bytes();  // capture before any EXPECT (gtest macros allocate)
+  EXPECT_GT(allocated, 0);
   EXPECT_FALSE(folded.empty());
 }
 
@@ -744,7 +744,7 @@ TEST_F(AnalysisTest, unicodeWordOffsets) {
 // bulk lowercase reuses `lowered`, DFA tokens are views into it, and no
 // uni-algo view or NFKC scratch is touched for pure-ASCII regions.
 TEST_F(AnalysisTest, standardAsciiPathAllocationFree) {
-  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter disabled under ASan";
+  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter needs jemalloc or a sanitizer";
   auto t = makeStandardTokenizer();
   Tokenizer& head = *t;
   std::unique_ptr<TokenStream> tail = std::move(t);
@@ -758,8 +758,8 @@ TEST_F(AnalysisTest, standardAsciiPathAllocationFree) {
   run();  // warm the lowered-value buffer
   memtrack::AllocScope s;
   run();
-  long allocs = s.count();  // capture before any EXPECT (gtest macros allocate)
-  EXPECT_EQ(0, allocs);
+  long allocated = s.bytes();  // capture before any EXPECT (gtest macros allocate)
+  EXPECT_EQ(0, allocated);
   EXPECT_GT(bytes, 0u);
 }
 
@@ -786,15 +786,15 @@ TEST_F(AnalysisTest, unicodeWordReuseAcrossValues) {
 // must not allocate - the hot-path property the real tokenizer relies on. Checked
 // for both ASCII and multibyte input.
 TEST_F(AnalysisTest, wordSegmentationIsAllocationFree) {
-  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter disabled under ASan";
-  // Returns {heap allocations, total segment bytes}; the byte count keeps the
+  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter needs jemalloc or a sanitizer";
+  // Returns {heap bytes allocated, total segment bytes}; the byte count keeps the
   // loop observable and lets us assert it actually produced segments.
   auto segAllocs = [](std::string_view in) {
     size_t bytes = 0;
     memtrack::AllocScope s;
     for (std::string_view w : una::views::word_only::utf8(in)) bytes += w.size();
-    long allocs = s.count();
-    return std::pair<long, size_t>(allocs, bytes);
+    long allocated = s.bytes();
+    return std::pair<long, size_t>(allocated, bytes);
   };
   std::string ascii = "the quick brown fox jumps over the lazy dog";
   std::string uni = "café 中文 naïve Ärger test";

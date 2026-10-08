@@ -157,7 +157,7 @@ TEST_F(MemPoolTest, alloc) {
 // shrink leaves a large current buffer), OUTSIDE the measured scope, so the
 // counter sees only the container's own allocations - which must be zero.
 TEST_F(MemPoolTest, poolAllocatorsAvoidHeap) {
-  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter disabled under ASan";
+  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter needs jemalloc or a sanitizer";
   int cc = 0, dc = 0;
   auto reserve = [](MemPool& pool, size_t n) { pool.alloc(n); pool.shrink(n); };
 
@@ -170,8 +170,8 @@ TEST_F(MemPoolTest, poolAllocatorsAvoidHeap) {
     m.try_emplace(1, cc, dc);
     m.try_emplace(2, cc, dc);
     m.try_emplace(3, cc, dc);
-    long heap = s.count();  // capture before EXPECT (gtest allocates) and before ~m
-    EXPECT_EQ(0, heap) << "std::map<MemPool::allocator> made " << heap << " heap allocations";
+    long heap = s.bytes();  // capture before EXPECT (gtest allocates) and before ~m
+    EXPECT_EQ(0, heap) << "std::map<MemPool::allocator> allocated " << heap << " heap bytes";
   }
 
   // 2. std::pmr::vector with the pool as a memory_resource.
@@ -183,8 +183,8 @@ TEST_F(MemPoolTest, poolAllocatorsAvoidHeap) {
     v.reserve(8);
     v.emplace_back(cc, dc);
     v.emplace_back(cc, dc);
-    long heap = s.count();
-    EXPECT_EQ(0, heap) << "std::pmr::vector<MemPool> made " << heap << " heap allocations";
+    long heap = s.bytes();
+    EXPECT_EQ(0, heap) << "std::pmr::vector<MemPool> allocated " << heap << " heap bytes";
   }
 
   // 3. boost::unordered_node_map of nested pool-vectors of pool unique_ptrs - the
@@ -203,8 +203,8 @@ TEST_F(MemPoolTest, poolAllocatorsAvoidHeap) {
     valtype& vec = map.try_emplace("hi", std::move(v1)).first->second;
     vec.resize(10);
     vec[3] = pool.make_unique<X>(cc, dc);
-    long heap = s.count();
-    EXPECT_EQ(0, heap) << "boost::unordered_node_map<MemPool::allocator> made " << heap << " heap allocations";
+    long heap = s.bytes();
+    EXPECT_EQ(0, heap) << "boost::unordered_node_map<MemPool::allocator> allocated " << heap << " heap bytes";
   }
 
   // Contrast: the same map with the default allocator DOES hit the heap, so the
@@ -214,7 +214,7 @@ TEST_F(MemPoolTest, poolAllocatorsAvoidHeap) {
     std::map<int, X, std::less<>> m;
     m.try_emplace(1, cc, dc);
     m.try_emplace(2, cc, dc);
-    long heap = s.count();
+    long heap = s.bytes();
     EXPECT_GT(heap, 0) << "default-allocator map made no heap allocations (counter broken?)";
   }
 }

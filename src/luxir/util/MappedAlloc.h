@@ -14,10 +14,8 @@
 
 namespace luxir {
 
-// glibc's dynamic-ratchet maximum (DEFAULT_MMAP_THRESHOLD_MAX): the
-// steady-state mmap threshold when malloc is left untouched. Test binaries
-// never override it; the server replaces it with its resolved mallopt value.
-inline size_t mappedAllocationFloor = 32 * 1024 * 1024;
+// Derived from glibc's dynamic mmap-threshold maximum; needs re-deriving for jemalloc.
+inline constexpr size_t mappedAllocationFloor = 32 * 1024 * 1024;
 
 // Owns one zero-filled anonymous private mapping. Mapping sizes are rounded to
 // transparent-huge-page granularity; huge-page advice and eager population are

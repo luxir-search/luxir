@@ -45,8 +45,10 @@ Ubuntu base is pinned by image digest. The compiler is a prebuilt Compiler
 Explorer archive. Ubuntu packages receive current security updates when that
 apt layer is rebuilt; the Dockerfile is not a bit-for-bit reproducibility claim.
 The vcpkg source pin is `builtin-baseline` in [the manifest](../../deps/vcpkg.json).
-The FAISS and OpenBLAS overlays retain the upstream port structure and patches;
-the copied port files use [vcpkg's MIT license](../../deps/ports/LICENSE.vcpkg).
+The FAISS and OpenBLAS overlays retain the upstream port structure and patches.
+The jemalloc overlay uses the release tarball, embeds allocator defaults, and
+enables profiling and debug checks; see [dependency settings](../../deps/README.txt).
+The copied port files use [vcpkg's MIT license](../../deps/ports/LICENSE.vcpkg).
 
 ## Build and test Luxir
 
@@ -99,10 +101,13 @@ excludes AVX-512 OpenBLAS kernels because GCC cannot instrument their inline
 assembly; FAISS retains its own AVX-512 kernels.
 
 Product libraries and GCC runtimes are static; glibc and libm remain dynamic.
-Static TBB retains tbbmalloc for TBB's own allocation. Application malloc/free
-remain glibc's; the image does not select a global replacement allocator.
-ASan has its usual diagnostic allocator interception. No system TBB or Fortran
-runtime is needed by the resulting Luxir executable.
+Static TBB retains tbbmalloc for TBB's own allocation. Static jemalloc serves
+application malloc/free and operator new/delete in debug and release builds.
+The jemalloc overlay embeds allocator defaults; the startup banner reports its
+version and effective configuration. Sanitizer flags default
+`LUXIR_JEMALLOC` to `OFF`; the ASan install omits jemalloc and ASan supplies its
+own allocator. No system TBB or Fortran runtime is needed by the resulting
+Luxir executable.
 
 Debug and ASan builds contain debug information and frame pointers, including
 dependency debug information. Release retains full Luxir debug information so
