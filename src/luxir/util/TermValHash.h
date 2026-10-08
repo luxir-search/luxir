@@ -94,9 +94,18 @@ public:
   using entry_type = TermValRef<T>; // should normally be the size of a single pointer
   using iterator = entry_type*;
 
+  struct TableDeleter {
+    std::pmr::memory_resource* resource;
+    size_t bytes;
+    void operator()(entry_type* ptr) const { resource->deallocate(ptr, bytes, alignof(entry_type)); }
+  };
+  using Table = std::unique_ptr<entry_type[], TableDeleter>;
+
 private:
   entry_type* table_;
   MemPool& pool_;
+  // A failed SortedDeletes transfer can destroy the pool before this table.
+  std::pmr::memory_resource* upstream_;
   int elements_ = 0;   // how many slots used
   int capacity_;       // how many slots may be used before rehashing
   unsigned tableSize_; // size of the hash table, always a power of two
@@ -111,12 +120,12 @@ private:
   };
 
 public:
-  TermValHash(MemPool &pool, unsigned initialSizePowerOfTwo) : pool_(pool) {
+  TermValHash(MemPool &pool, unsigned initialSizePowerOfTwo) : pool_(pool), upstream_(pool.upstream_resource()) {
     newTable(initialSizePowerOfTwo);
   }
 
   TermValHash(TermValHash&& other) :
-    table_(other.table_), pool_(other.pool_), elements_(other.elements_),
+    table_(other.table_), pool_(other.pool_), upstream_(other.upstream_), elements_(other.elements_),
     capacity_(other.capacity_), tableSize_(other.tableSize_)
   {
     other.table_ = nullptr;
@@ -129,20 +138,16 @@ public:
   // free up what memory we can early (i.e. before normal destructor would be called)
   void free() {
     if (table_ != nullptr) {
-      delete[] reinterpret_cast<char *>(table_);
+      upstream_->deallocate(table_, tableSize_ * sizeof(entry_type), alignof(entry_type));
       table_ = nullptr;
     }
   }
 
-  /// Release ownership of the internal table array without freeing it.
-  /// After this call, the caller owns the memory and must eventually
-  /// delete[] reinterpret_cast<char*>(ptr).
-  /// Typically called after destructiveCompress() + sort so the sorted
-  /// array can be transferred to another owner (e.g. SortedDeletes).
-  iterator detachTable() {
-    auto* t = table_;
+  /// Transfer the table with its allocation size and resource, e.g. to SortedDeletes.
+  Table detachTable() {
+    Table table(table_, TableDeleter{upstream_, tableSize_ * sizeof(entry_type)});
     table_ = nullptr;
-    return t;
+    return table;
   }
 
   [[nodiscard]] MemPool& getMemPool() const { return pool_; }
@@ -220,7 +225,9 @@ void TermValHash<T,Hasher>::newTable(unsigned newSize) {
   assert(newSize > 0 && std::has_single_bit(newSize));
 
   // this was often twice as fast in some cases - zeroing is not as well optimized for some types it seems
-  table_ = reinterpret_cast<TermValHash<T,Hasher>::entry_type *>( new char[newSize * sizeof(TermValHash<T,Hasher>::entry_type)]() );
+  size_t bytes = newSize * sizeof(entry_type);
+  table_ = (entry_type*)upstream_->allocate(bytes, alignof(entry_type));
+  std::memset((void*)table_, 0, bytes);
   capacity_ = newSize - (newSize >> 2);  // .75 load factor
   tableSize_ = newSize;
 }
@@ -249,7 +256,7 @@ void TermValHash<T,Hasher>::rehash() {
     }
   }
 
-  delete[] reinterpret_cast<char *>(oldTable);
+  upstream_->deallocate(oldTable, oldTableSize * sizeof(entry_type), alignof(entry_type));
 }
 
 } // end namespace

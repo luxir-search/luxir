@@ -66,7 +66,7 @@ protected:
       docsWithVal(inverter.pool),
       valSizeStream(inverter.pool),
       valCountStream(inverter.pool),
-      valuesFile(fieldName),
+      valuesFile(fieldName, {}, inverter.pool.upstream_resource()),
       bufferedValuesOut(&valuesFile),
       valueStorage(valueStorage)
   {

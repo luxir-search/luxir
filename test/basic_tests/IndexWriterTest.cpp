@@ -59,6 +59,18 @@ public:
   }
 };
 
+TEST_F(IndexWriterTest, closePreservesBorrowedInverter) {
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
+  auto& inverter = writer.obtainInverter();
+  char* bytes = inverter.pool.alloc(1024);
+  std::memset(bytes, 'x', 1024);
+  writer.close();
+  EXPECT_EQ(bytes[1023], 'x');
+  EXPECT_NO_THROW(writer.releaseInverter(inverter));
+}
+
 TEST_F(IndexWriterTest, closeIsIdempotentAndRejectsNewEntryPoints) {
   class NoopUpdate final : public UpdateMessage {
   public:

@@ -50,7 +50,7 @@ class IdHandler final : public Inverter::IndexHandler {
 public:
   IdHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
-      idPool(std::make_unique<MemPool>()),
+      idPool(std::make_unique<MemPool>(&indexingArena())),
       termsHash(*idPool, 4) {
   }
 
@@ -189,9 +189,9 @@ private:
   }
 
   /// Sort a TermValHash, detach its table, and compute version range.
-  /// Returns {detached table pointer, count, minVersion, maxVersion}.
+  /// Returns {owned table, count, minVersion, maxVersion}.
   struct SortResult {
-    SortedDeletes::Entry* entries;
+    SortedDeletes::Table entries;
     int32_t count;
     uint64_t minVersion;
     uint64_t maxVersion;
@@ -211,8 +211,7 @@ private:
       if (v > maxV) maxV = v;
     }
 
-    auto* detached = hash.detachTable();
-    return {detached, count, minV, maxV};
+    return {hash.detachTable(), count, minV, maxV};
   }
 
 public:
@@ -275,7 +274,7 @@ public:
     if (hasOverwrites) {
       // termsHash is already sorted from the segment writing above, just detach.
       // Compute version range.
-      auto* terms = termsHash.detachTable();
+      auto terms = termsHash.detachTable();
       uint64_t minV = terms[0].val().version;
       uint64_t maxV = minV;
       for (int32_t i = 1; i < uniqueVals; i++) {
@@ -283,14 +282,14 @@ public:
         if (v < minV) minV = v;
         if (v > maxV) maxV = v;
       }
-      sortedDeletes->addList(terms, uniqueVals, minV, maxV);
+      sortedDeletes->addList(std::move(terms), uniqueVals, minV, maxV);
     } else {
       termsHash.free();
     }
 
     if (hasDeletes) {
       auto result = sortAndDetach(*deleteHash);
-      sortedDeletes->addList(result.entries, result.count, result.minVersion, result.maxVersion);
+      sortedDeletes->addList(std::move(result.entries), result.count, result.minVersion, result.maxVersion);
     }
 
     inverter.sortedDeletes = std::move(sortedDeletes);

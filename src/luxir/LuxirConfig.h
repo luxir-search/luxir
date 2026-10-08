@@ -57,6 +57,7 @@ struct StoreConfig {
 };
 
 struct IndexConfig {
+  bool huge_pages = false;
   // An inverter's MemPool can address at most 4 GiB.  The per-inverter cap is
   // clamped below that, leaving ~282 MiB of headroom for the overshoot of the
   // batch that trips the check (it is evaluated once per batch, not per doc).

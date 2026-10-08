@@ -18,8 +18,9 @@ MemPool::~MemPool() {
       allocSize -= bufferSize(buf);
     }
 #endif
-    assert(scribble(buf, bufferSize(buf)));
-    delete[] buf;
+    auto size = bufferSize(buf);
+    assert(scribble(buf, size));
+    upstream->deallocate(buf, size);
   }
   assert(allocSize == STATIC_BUFFER_SIZE);
 }
@@ -32,17 +33,18 @@ void MemPool::nextBuffer(size_t sz) {
   }
 
   if ((uint32_t)bufferIdx + 1 < buffers.size()) {
-    bufferIdx++;
-    buffer = buffers[bufferIdx];
-    pos = HEADER_SIZE;
-    auto blockSize = bufferSize(buffer);
+    auto nextBuffer = buffers[bufferIdx + 1];
+    auto blockSize = bufferSize(nextBuffer);
     if (sz + HEADER_SIZE > blockSize) {
       // buffer wasn't big enough, so replace it.
-      delete[] buffer;
-      buffers[bufferIdx] = nullptr;
-      buffer = buffers[bufferIdx] = new char[nextSize];
-      storeUnaligned<uint32_t>(buffer, nextSize);
+      auto replacement = (char*)upstream->allocate(nextSize);
+      upstream->deallocate(nextBuffer, blockSize);
+      nextBuffer = buffers[bufferIdx + 1] = replacement;
+      storeUnaligned<uint32_t>(nextBuffer, nextSize);
     }
+    buffer = nextBuffer;
+    bufferIdx++;
+    pos = HEADER_SIZE;
     allocSize += bufferSize(buffer);
   } else {
     if (buffers.size() >= MAX_BUFFERS) {
@@ -50,7 +52,13 @@ void MemPool::nextBuffer(size_t sz) {
       // indexing.max-inverter-ram-mb keeps inverters from ever getting here.
       throw std::length_error("MemPool exceeded its 4GiB addressability limit");
     }
-    initNewBuffer(new char[nextSize], nextSize);  // not 0 initialized.
+    auto nextBuffer = (char*)upstream->allocate(nextSize);
+    try {
+      initNewBuffer(nextBuffer, nextSize);  // not 0 initialized.
+    } catch (...) {
+      upstream->deallocate(nextBuffer, nextSize);
+      throw;
+    }
   }
   // for new allocations, we want to let memory checkers find reads from uninitialized memory
   // assert(scribble(buffer,BYTE_BLOCK_SIZE));
@@ -115,8 +123,9 @@ void MemPool::_rewind(const MemPool::save_point& savePoint, uint32_t buffersToSa
     if (idx <= (size_t)bufferIdx) {
       allocSize -= bufferSize(buf);
     }
-    assert(scribble(buf, bufferSize(buf)));
-    delete[] buf;
+    auto size = bufferSize(buf);
+    assert(scribble(buf, size));
+    upstream->deallocate(buf, size);
     buffers.pop_back();
   }
 

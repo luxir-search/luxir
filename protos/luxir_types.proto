@@ -1290,6 +1290,9 @@ message QueryCacheStats {
 message IndexRamStats {
   uint64 limit_bytes = 1;
   uint64 reserved_bytes = 2;
+  // Indexing arena only; zero when allocator statistics are unavailable.
+  uint64 allocated_bytes = 3;
+  uint64 resident_bytes = 4;
 }
 
 // Admin control over the per-collection query cache. Actions compose and

@@ -287,7 +287,12 @@ struct QueryCacheStats {
   bool enabled = false;
 };
 struct StorageRamStats { uint64_t used_bytes = 0; uint64_t limit_bytes = 0; };
-struct IndexRamStats { uint64_t limit_bytes = 0; uint64_t reserved_bytes = 0; };
+struct IndexRamStats {
+  uint64_t limit_bytes = 0;
+  uint64_t reserved_bytes = 0;
+  uint64_t allocated_bytes = 0;
+  uint64_t resident_bytes = 0;
+};
 struct StatsTotals {
   uint64_t collections = 0;
   uint64_t shards = 0;

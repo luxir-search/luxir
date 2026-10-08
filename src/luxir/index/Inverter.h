@@ -8,6 +8,7 @@
 #include <limits>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include "luxir/util/MemPool.h"
+#include "luxir/util/ProcessAllocator.h"
 #include "luxir/schema/Schema.h"
 #include "IndexRamBudget.h"
 #include "PostingsWriter.h"
@@ -42,7 +43,7 @@ private:
   std::exception_ptr failure_;
 
 public:
-  MemPool pool;
+  MemPool pool{&indexingArena()};
 
   // Running total of RAM held OUTSIDE `pool` (heap hash tables, IdHandler's idPool,
   // string column RAMFiles). Handlers that hold such memory bump this via

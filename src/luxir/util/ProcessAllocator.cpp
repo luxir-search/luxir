@@ -4,6 +4,12 @@
 #include "luxir/util/ProcessAllocator.h"
 
 #include <cstdlib>
+#include <algorithm>
+#include <cstdio>
+#include <mutex>
+#include <stdexcept>
+#include <system_error>
+#include <sys/mman.h>
 
 #ifndef LUXIR_JEMALLOC
 #error "CMake must define LUXIR_JEMALLOC to 0 or 1"
@@ -62,7 +68,156 @@ void countAllocation(const volatile void*, size_t size) {
 }
 #endif
 
+struct IndexingArenaState {
+  std::mutex mutex;
+  bool hugePages = false;
+  AllocatorArena* arena = nullptr;
+};
+
+IndexingArenaState& indexingArenaState() {
+  static auto* state = new IndexingArenaState;
+  return *state;
+}
+
+#if LUXIR_JEMALLOC
+constexpr size_t HUGE_PAGE_SIZE = 2 * 1024 * 1024;
+
+struct HugePageHooks {
+  extent_hooks_t hooks;
+  extent_hooks_t* defaults;
+
+  HugePageHooks() {
+    size_t size = sizeof(defaults);
+    int error = mallctl("arena.0.extent_hooks", &defaults, &size, nullptr, 0);
+    if (error) throw std::system_error(error, std::generic_category(), "arena.0.extent_hooks");
+    hooks = *defaults;
+    hooks.alloc = allocate;
+  }
+
+  static void* allocate(extent_hooks_t* hooks, void* addr, size_t size,
+                        size_t alignment, bool* zero, bool* commit, unsigned arena) {
+    auto* self = reinterpret_cast<HugePageHooks*>(hooks);
+    void* result = self->defaults->alloc(self->defaults, addr, size, alignment, zero, commit, arena);
+    // With retain, jemalloc 5.4 calls this for the growth region before splitting
+    // it, so advice also covers the retained tails reused by later allocations.
+    if (result) (void)madvise(result, size, MADV_HUGEPAGE);
+    return result;
+  }
+};
+
+extent_hooks_t* hugePageHooks() {
+  static auto* hooks = new HugePageHooks;
+  return &hooks->hooks;
+}
+#endif
 } // namespace
+
+AllocatorArena::AllocatorArena(const char* name, bool hugePages) : hugePages(hugePages) {
+#if LUXIR_JEMALLOC
+  extent_hooks_t* hooks = hugePages ? hugePageHooks() : nullptr;
+  size_t size = sizeof(arena);
+  int error = mallctl("arenas.create", &arena, &size,
+                      hooks ? &hooks : nullptr, hooks ? sizeof(hooks) : 0);
+  if (error) throw std::system_error(error, std::generic_category(), "arenas.create");
+  char control[64];
+  std::snprintf(control, sizeof(control), "arena.%u.name", arena);
+  error = mallctl(control, nullptr, nullptr, &name, sizeof(name));
+  if (error) {
+    std::snprintf(control, sizeof(control), "arena.%u.destroy", arena);
+    (void)mallctl(control, nullptr, nullptr, nullptr, 0);
+    throw std::system_error(error, std::generic_category(), "arena name");
+  }
+#else
+  (void)name;
+#endif
+}
+
+AllocatorArena::~AllocatorArena() {
+#if LUXIR_JEMALLOC
+  char name[64];
+  std::snprintf(name, sizeof(name), "arena.%u.destroy", arena);
+  if (mallctl(name, nullptr, nullptr, nullptr, 0)) std::abort();
+#endif
+}
+
+int AllocatorArena::allocationFlags(size_t bytes, size_t alignment) const {
+#if LUXIR_JEMALLOC
+  // Page alignment suppresses cache-oblivious address randomization in 5.4,
+  // but NOT its extra page of extent padding. The payload is huge-page aligned;
+  // the pad page can share a huge page with a neighbor, so purging the block
+  // can split that one neighbor huge page.
+  if (hugePages && bytes >= HUGE_PAGE_SIZE) alignment = std::max(alignment, HUGE_PAGE_SIZE);
+  return MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE | MALLOCX_ALIGN(alignment);
+#else
+  (void)bytes;
+  (void)alignment;
+  return 0;
+#endif
+}
+
+void* AllocatorArena::do_allocate(size_t bytes, size_t alignment) {
+#if LUXIR_JEMALLOC
+  void* ptr = mallocx(std::max(bytes, (size_t)1), allocationFlags(bytes, alignment));
+#else
+  void* ptr = nullptr;
+  if (alignment <= alignof(std::max_align_t)) ptr = std::malloc(std::max(bytes, (size_t)1));
+  else if (posix_memalign(&ptr, alignment, std::max(bytes, (size_t)1))) ptr = nullptr;
+#endif
+  if (!ptr) throw std::bad_alloc();
+  return ptr;
+}
+
+void AllocatorArena::do_deallocate(void* ptr, size_t bytes, size_t alignment) {
+#if LUXIR_JEMALLOC
+  sdallocx(ptr, std::max(bytes, (size_t)1), allocationFlags(bytes, alignment));
+#else
+  (void)bytes;
+  (void)alignment;
+  std::free(ptr);
+#endif
+}
+
+void AllocatorArena::purge() noexcept {
+#if LUXIR_JEMALLOC
+  char name[64];
+  std::snprintf(name, sizeof(name), "arena.%u.purge", arena);
+  if (mallctl(name, nullptr, nullptr, nullptr, 0)) std::abort();
+#endif
+}
+
+std::optional<AllocatorArena::Stats> AllocatorArena::stats() const {
+#if LUXIR_JEMALLOC
+  uint64_t epoch = 1;
+  if (mallctl("epoch", nullptr, nullptr, &epoch, sizeof(epoch))) return std::nullopt;
+  auto read = [this](const char* stat, size_t& value) {
+    char name[96];
+    std::snprintf(name, sizeof(name), "stats.arenas.%u.%s", arena, stat);
+    size_t size = sizeof(value);
+    return mallctl(name, &value, &size, nullptr, 0) == 0;
+  };
+  size_t small, large, resident;
+  if (read("small.allocated", small) && read("large.allocated", large) && read("resident", resident)) {
+    return Stats{small + large, resident};
+  }
+#endif
+  return std::nullopt;
+}
+
+void configureIndexingArena(bool hugePages) {
+  auto& state = indexingArenaState();
+  std::lock_guard lock(state.mutex);
+  if (state.arena && state.hugePages != hugePages) {
+    throw std::logic_error("indexing.huge-pages must be configured before indexing arena use");
+  }
+  state.hugePages = hugePages;
+}
+
+AllocatorArena& indexingArena() {
+  auto& state = indexingArenaState();
+  std::lock_guard lock(state.mutex);
+  if (!state.arena) state.arena = new AllocatorArena("indexing", state.hugePages);
+  return *state.arena;
+}
 
 std::string allocatorName() {
 #if LUXIR_JEMALLOC

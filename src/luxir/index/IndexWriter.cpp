@@ -338,6 +338,10 @@ IndexWriter::~IndexWriter() {
   // A submit racing close() is rejected by startUpdateNode, but that rejection is
   // still a graph task; wait for it before the nodes are destroyed.
   updateGraph.wait_for_all();
+  idleInverters.clear();
+  busyInverters.clear();
+  flushingInverters.clear();
+  indexingArena().purge();
 }
 
 void IndexWriter::close() {
@@ -1113,6 +1117,8 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segmentsToDelete.push_back(std::move(segInfo));
   }
 
+  // Declared before the owner so unwinding also purges after destruction.
+  auto purge = scope_guard([] { indexingArena().purge(); });
   std::unique_ptr<Inverter> inverterPtr;
   std::shared_ptr<const SortedDeletes> deletes;
   if (!aborted && inverter.hasDeletions()) {
@@ -1172,19 +1178,16 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     }
   }
 
+  // Destroy before purging, and before removing an aborted segment's files.
+  uint64_t segId = inverterPtr->getPostingsWriter().segId;
+  inverterPtr.reset();
   if (aborted) {
-    // Destroy first to close any partially written file, then remove every
-    // finished or temporary file belonging to this never-published segment.
-    uint64_t segId = inverterPtr->getPostingsWriter().segId;
-    inverterPtr.reset();
     try {
       dir.deletePrefix(Postings::getIndexFileNamePrefix(segId));
     } catch (const std::exception& e) {
       LOG_ERROR("Failed to clean files for aborted segment {}: {}", segId, e.what());
     }
   }
-
-  // inverterPtr goes out of scope here on a successful flush.
 }
 
 // This applies deletes and writes out the new segments file.
@@ -2639,6 +2642,7 @@ void IndexWriter::testDeleteAllData() {
 
     // drop all idle inverters (unflushed segments)
     idleInverters.clear();
+    indexingArena().purge();
 
     // drop all segments
     segInfos.clear();
