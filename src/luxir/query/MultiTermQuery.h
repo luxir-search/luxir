@@ -9,7 +9,6 @@
 #include <limits>
 #include <string_view>
 #include <variant>
-#include <vector>
 
 #include "DocSetBulkScorer.h"
 #include "PostingsUnion.h"
@@ -99,7 +98,7 @@ public:
     // first test context win. EAGER/WINDOWED/HEAP is selected per resolve and
     // exists only in ScorerPlan.
     struct ExpansionFacts {
-      using States = std::vector<TermsEnum::PostingsState>;
+      using States = ExpansionStates;
       std::variant<States, BitsetPayload> payload;
       int64_t sumDocFreq;
       size_t termCount;
@@ -107,11 +106,11 @@ public:
       Query::MatchState matchState;
       ExpansionFacts* next = nullptr;
 
-      ExpansionFacts(States&& states, int64_t sumDocFreq,
+      ExpansionFacts(States states, int64_t sumDocFreq,
                      size_t maxLazyStateBytes)
-        : payload(std::in_place_type<States>, std::move(states)),
+        : payload(states),
           sumDocFreq(sumDocFreq),
-          termCount(std::get<States>(payload).size()),
+          termCount(states.size()),
           maxLazyStateBytes(maxLazyStateBytes),
           matchState(termCount == 0 ? Query::MatchState::EMPTY
                                    : Query::MatchState::NONEMPTY) {}
@@ -138,6 +137,8 @@ public:
         return std::get<BitsetPayload>(payload).words;
       }
     };
+
+    static_assert(std::is_trivially_destructible_v<ExpansionFacts>);
 
     struct ExpansionMemo {
       ExpansionFacts* facts = nullptr;
@@ -269,9 +270,10 @@ public:
         return false;
       }
 
-      ExpansionFacts::States states;
       size_t maxStates = buildContext.multiTermMaxLazyStateBytes
           / sizeof(TermsEnum::PostingsState);
+      ArenaResource resource(&memoArena);
+      ChunkedArray<TermsEnum::PostingsState> states(resource, maxStates);
       uint64_t* bitWords = nullptr;
       size_t termCount = 0;
       int64_t sumDocFreq = 0;
@@ -295,14 +297,6 @@ public:
               continue;
             }
             if (states.size() < maxStates) {
-              if (states.size() == states.capacity()) {
-                size_t nextCapacity = states.empty()
-                    ? std::min<size_t>(8, maxStates)
-                    : states.capacity() > maxStates / 2
-                        ? maxStates
-                        : states.capacity() * 2;
-                states.reserve(nextCapacity);
-              }
               states.push_back(state);
               continue;
             }
@@ -312,11 +306,10 @@ public:
                 &memoArena, nWords);
             memset(bitWords, 0, nWords * sizeof(uint64_t));
             FixedBitSet bits(bitWords, segment.maxDoc());
-            for (const auto& retained : states) {
+            for (const auto& retained : states.view()) {
               addPostingsToBitset(bits, retained);
             }
             addPostingsToBitset(bits, state);
-            ExpansionFacts::States().swap(states);
           }
         }
       }
@@ -330,7 +323,7 @@ public:
             buildContext.multiTermMaxLazyStateBytes);
       } else {
         facts = luxir::arenaCreate<ExpansionFacts>(
-            memoArena, std::move(states), sumDocFreq,
+            memoArena, states.view(), sumDocFreq,
             buildContext.multiTermMaxLazyStateBytes);
       }
       facts->next = memo.facts;
@@ -388,15 +381,15 @@ public:
         auto windowBits = targetPool.make_span<uint64_t>(
             (size_t) UnionHeapScorer::WINDOW_WORDS);
         return targetPool.make<UnionHeapScorer>(
-            std::span<const TermsEnum::PostingsState>(states),
-            enums, heap, windowBits, targetPool, maxDoc, boost);
+            states, enums, heap, windowBits, targetPool, maxDoc, boost);
       }
       if (mode == ExpansionMode::WINDOWED) {
         static_assert(std::is_trivially_destructible_v<DocsOnlyEnum>);
         auto* docsEnums = (DocsOnlyEnum*) targetPool.alloc(
             facts.termCount * sizeof(DocsOnlyEnum), alignof(DocsOnlyEnum));
-        for (size_t i = 0; i < facts.termCount; i++) {
-          new (&docsEnums[i]) DocsOnlyEnum(states[i]);
+        auto* nextEnum = docsEnums;
+        for (const auto& state : states) {
+          new (nextEnum++) DocsOnlyEnum(state);
         }
         auto windowBits =
             targetPool.make_span<uint64_t>((size_t) UnionLazyScorer::WINDOW_WORDS);

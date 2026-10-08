@@ -11,8 +11,12 @@
 #include "Query.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/TermsEnum.h"
+#include "luxir/util/ChunkedArray.h"
 
 namespace luxir {
+
+using ExpansionStates = ChunkedArrayView<TermsEnum::PostingsState>;
+static_assert(ExpansionStates::CHUNK_SIZE * sizeof(TermsEnum::PostingsState) == 64 * 1024);
 
 // Windowed docs-only unions over a set of terms' postings, shared by
 // multi-term query expansion (MultiTermQuery) and string-sort competitive
@@ -170,7 +174,7 @@ public:
 class UnionHeapScorer final : public UnionWindowScorer<UnionHeapScorer> {
   friend class UnionWindowScorer<UnionHeapScorer>;
 
-  std::span<const TermsEnum::PostingsState> states;
+  ExpansionStates states;
   std::span<DocsOnlyEnum*> enums;  // per-term cursor, built on activation
   std::span<uint64_t> heap;        // (next doc << 32) | state index
   size_t heapSize = 0;
@@ -258,7 +262,7 @@ class UnionHeapScorer final : public UnionWindowScorer<UnionHeapScorer> {
   }
 
 public:
-  UnionHeapScorer(std::span<const TermsEnum::PostingsState> states,
+  UnionHeapScorer(ExpansionStates states,
                   std::span<DocsOnlyEnum*> enums, std::span<uint64_t> heap,
                   std::span<uint64_t> windowBits, MemPool& enumPool,
                   int32_t maxDoc, float constantScore)

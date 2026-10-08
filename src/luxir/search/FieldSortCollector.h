@@ -859,11 +859,11 @@ private:
       sum += te.docFreq();
       if (sum > limit) return false;
     }
-    auto states =
-        segmentPool->make_span<TermsEnum::PostingsState>((size_t)termCount);
+    ChunkedArray<TermsEnum::PostingsState> states(*segmentPool, (size_t)termCount);
+    states.reserve((size_t)termCount);
     for (int64_t i = 0; i < termCount; i++) {
       te.seekOrd(state.lo - 1 + i);
-      states[(size_t)i] = te.postingsState();
+      states.push_back(te.postingsState());
     }
     auto enums = segmentPool->make_span<DocsOnlyEnum*>((size_t)termCount);
     std::fill(enums.begin(), enums.end(), nullptr);
@@ -871,7 +871,7 @@ private:
     auto windowBits = segmentPool->make_span<uint64_t>(
         (size_t)UnionHeapScorer::WINDOW_WORDS);
     candidates = segmentPool->make<UnionHeapScorer>(
-        states, enums, heap, windowBits, *segmentPool, segmentMaxDoc, 0.0f);
+        states.view(), enums, heap, windowBits, *segmentPool, segmentMaxDoc, 0.0f);
     candidateLo = state.lo;
     candidateHi = state.hi;
     // narrow() speaks 0-based term ordinals (PostingsState::termOrdinal).
