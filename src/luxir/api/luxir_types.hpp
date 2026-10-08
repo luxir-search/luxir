@@ -82,7 +82,7 @@ struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
-struct QueryCacheStats; struct IndexRamStats;
+struct QueryCacheStats; struct IndexRamStats; struct AllocatorStats;
 struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
@@ -287,6 +287,10 @@ struct QueryCacheStats {
   bool enabled = false;
 };
 struct StorageRamStats { uint64_t used_bytes = 0; uint64_t limit_bytes = 0; };
+struct AllocatorStats {
+  uint64_t allocated_bytes = 0;
+  uint64_t resident_bytes = 0;
+};
 struct IndexRamStats {
   uint64_t limit_bytes = 0;
   uint64_t reserved_bytes = 0;
@@ -401,6 +405,7 @@ struct StatsResponse {
   StatsTotals totals;
   std::span<const CollectionStats> collections;
   IndexRamStats indexing_ram;
+  AllocatorStats big_buffer_ram;
 };
 struct CacheControlRequest {
   std::string_view collection;
@@ -749,7 +754,7 @@ LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
-LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats)
+LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(AllocatorStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
 LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(WaitForReplicasRequest) LUXIR_TD(WaitForReplicasResponse) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationInstalled)
@@ -793,7 +798,7 @@ LUXIR_ENTRY(ListTenantsResponse)
 LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStatus) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
-LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats)
+LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(AllocatorStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
 LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(WaitForReplicasRequest) LUXIR_ENTRY(WaitForReplicasResponse) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationInstalled)

@@ -184,6 +184,10 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     response.indexing_ram.allocated_bytes = stats->allocated;
     response.indexing_ram.resident_bytes = stats->resident;
   }
+  if (auto stats = bigBufferArena().stats()) {
+    response.big_buffer_ram.allocated_bytes = stats->allocated;
+    response.big_buffer_ram.resident_bytes = stats->resident;
+  }
 }
 
 void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request,

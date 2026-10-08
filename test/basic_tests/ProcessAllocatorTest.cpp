@@ -8,14 +8,35 @@
 #include "luxir/index/SortedDeletes.h"
 #include "luxir/server/Stats.h"
 #include <array>
+#include <thread>
 #include <cstdio>
 #include <fstream>
 #include <map>
 #include <sstream>
+#include <sys/mman.h>
+#include <unistd.h>
 
 using namespace luxir;
 
 namespace {
+std::optional<bool> hugePageAdvice(void* block) {
+  std::ifstream smaps("/proc/self/smaps");
+  bool containing = false;
+  std::string line;
+  while (std::getline(smaps, line)) {
+    unsigned long begin, end;
+    if (std::sscanf(line.c_str(), "%lx-%lx", &begin, &end) == 2) {
+      containing = begin <= (uintptr_t)block && (uintptr_t)block < end;
+    } else if (containing && line.starts_with("VmFlags:")) {
+      std::istringstream flags(line);
+      std::string flag;
+      while (flags >> flag) if (flag == "hg") return true;
+      return false;
+    }
+  }
+  return std::nullopt;
+}
+
 class CountingResource : public std::pmr::memory_resource {
   struct Allocation { size_t bytes; size_t alignment; };
   std::map<void*, Allocation> allocations;
@@ -123,28 +144,76 @@ TEST(ProcessAllocatorTest, arenaReclaimsBlocks) {
 }
 
 TEST(ProcessAllocatorTest, hugePageAdvice) {
-  AllocatorArena arena("test-huge-pages", true);
+  AllocatorArena arena("test-huge-pages", {.hugePages = true});
   if (!arena.stats()) GTEST_SKIP() << "Huge-page arena hooks require jemalloc";
   constexpr size_t blockSize = 4 * 1024 * 1024;
   void* block = arena.allocate(blockSize);
   EXPECT_EQ((uintptr_t)block % (2 * 1024 * 1024), 0);
-  std::ifstream smaps("/proc/self/smaps");
-  bool containing = false;
-  bool advised = false;
-  std::string line;
-  while (std::getline(smaps, line)) {
-    unsigned long begin, end;
-    if (std::sscanf(line.c_str(), "%lx-%lx", &begin, &end) == 2) {
-      containing = begin <= (uintptr_t)block && (uintptr_t)block < end;
-    } else if (containing && line.starts_with("VmFlags:")) {
-      std::istringstream flags(line);
-      std::string flag;
-      while (flags >> flag) if (flag == "hg") advised = true;
-      break;
-    }
-  }
+  auto advised = hugePageAdvice(block);
   arena.deallocate(block, blockSize);
-  EXPECT_TRUE(advised);
+  EXPECT_EQ(advised, std::optional<bool>(true));
+}
+
+TEST(ProcessAllocatorTest, hugePageAllocationRouting) {
+  for (bool wholePurge : {false, true}) {
+    AllocatorArena arena("test-routing", {.hugePages = true, .wholeHugePagePurge = wholePurge});
+    bool jemalloc = arena.stats().has_value();
+    for (size_t size : {size_t{0}, size_t{1024}, hugePageSize - 1, hugePageSize,
+                        hugePageSize + 1, hugePageSize * 3 / 2, hugePageSize * 2}) {
+      for (size_t alignment : {alignof(std::max_align_t), 2 * hugePageSize}) {
+        SCOPED_TRACE(::testing::Message() << "size=" << size << " alignment=" << alignment
+                                        << " wholePurge=" << wholePurge);
+        void* block = arena.allocateZeroed(size, alignment);
+        EXPECT_EQ((uintptr_t)block % alignment, 0);
+        EXPECT_TRUE(std::all_of((char*)block, (char*)block + size, [](char c) { return c == 0; }));
+        if (jemalloc) {
+          bool huge = size != 0 && size % hugePageSize == 0;
+          EXPECT_EQ(hugePageAdvice(block), std::optional<bool>(huge));
+          if (huge) {
+            EXPECT_EQ((uintptr_t)block % hugePageSize, 0);
+          }
+        }
+        std::memset(block, 1, size);
+        arena.deallocate(block, size, alignment);
+      }
+    }
+    if (jemalloc) {
+      EXPECT_EQ(arena.stats()->allocated, 0);
+    }
+    arena.purge();
+  }
+}
+
+TEST(ProcessAllocatorTest, companionStatsAndPurge) {
+  AllocatorArena arena("test-companion", {.hugePages = true, .dirtyDecayMs = 60000});
+  auto start = arena.stats();
+  if (!start) GTEST_SKIP() << "Arena statistics require jemalloc with stats enabled";
+  constexpr size_t hugeSize = 4 * hugePageSize;
+  constexpr size_t regularSize = hugePageSize / 2;
+  void* huge = arena.allocate(hugeSize);
+  std::memset(huge, 1, hugeSize);
+  std::array<void*, 8> regular;
+  for (auto& block : regular) {
+    block = arena.allocate(regularSize);
+    std::memset(block, 2, regularSize);
+  }
+  auto live = *arena.stats();
+  EXPECT_EQ(live.allocated, start->allocated + hugeSize + regular.size() * regularSize);
+  EXPECT_GE(live.resident, start->resident + hugeSize + regular.size() * regularSize);
+  arena.deallocate(huge, hugeSize);
+  arena.purge();
+  auto regularLive = *arena.stats();
+  EXPECT_EQ(regularLive.allocated, start->allocated + regular.size() * regularSize);
+  EXPECT_LT(regularLive.resident, live.resident - hugeSize + hugePageSize);
+  for (auto block : regular) {
+    EXPECT_TRUE(std::all_of((char*)block, (char*)block + regularSize, [](char c) { return c == 2; }));
+    arena.deallocate(block, regularSize);
+  }
+  arena.purge();
+  auto purged = *arena.stats();
+  EXPECT_EQ(purged.allocated, start->allocated);
+  EXPECT_LT(purged.resident, regularLive.resident - regular.size() * regularSize + hugePageSize);
+  EXPECT_LT(purged.resident, start->resident + hugePageSize);
 }
 
 TEST(ProcessAllocatorTest, inverterFlushReclaimsArena) {
@@ -258,4 +327,92 @@ TEST(ProcessAllocatorTest, purgePreservesLiveAllocations) {
   EXPECT_TRUE(std::all_of(warm, warm + blockSize, [](char v) { return v == 23; }));
   arena.deallocate(live, blockSize);
   other.deallocate(warm, blockSize);
+}
+
+TEST(ProcessAllocatorTest, wholeHugePageInterior) {
+  constexpr size_t H = hugePageSize;
+  for (size_t start : {0u, 4096u, 2u * 1024 * 1024 - 4096u}) {
+    for (size_t length : {size_t{0}, size_t{4096}, H - 4096, H, H + 4096, 2 * H + 4096}) {
+      auto [skip, interior] = allocator_detail::hugePageInterior(start, length);
+      EXPECT_LE(skip + interior, length);
+      EXPECT_EQ(interior % H, 0);
+      if (interior) {
+        EXPECT_EQ((start + skip) % H, 0);
+      }
+      // Every complete huge page, and no partial page, must be included.
+      for (size_t page = 0; page <= start + length; page += H) {
+        bool whole = page >= start && page + H <= start + length;
+        bool purged = page >= start + skip && page + H <= start + skip + interior;
+        EXPECT_EQ(whole, purged);
+      }
+    }
+  }
+}
+
+TEST(ProcessAllocatorTest, wholeHugePagePurgeAndReuse) {
+  AllocatorArena arena("test-big-buffers",
+      {.wholeHugePagePurge = true, .dirtyDecayMs = 60000});
+  if (!arena.stats()) GTEST_SKIP() << "Arena hooks require jemalloc";
+  constexpr size_t size = 8 * hugePageSize; // Above the default eager-purge threshold.
+  void* first = arena.allocateZeroed(size, hugePageSize);
+  void* live = arena.allocateZeroed(size, hugePageSize);
+  std::memset(first, 0x55, size);
+  std::memset(live, 0x33, size);
+  auto resident = arena.stats()->resident;
+  arena.deallocate(first, size, hugePageSize);
+  EXPECT_GE(arena.stats()->resident, resident);
+  void* reused = arena.allocateZeroed(size, hugePageSize);
+  EXPECT_EQ(reused, first);
+  EXPECT_TRUE(std::all_of((char*)reused, (char*)reused + size, [](char c) { return c == 0; }));
+  std::memset(reused, 0x55, size);
+  arena.deallocate(reused, size, hugePageSize);
+  arena.purge();
+  EXPECT_LT(arena.stats()->resident, resident);
+  std::vector<unsigned char> pages(size / (size_t)sysconf(_SC_PAGESIZE));
+  EXPECT_EQ(mincore(reused, size, pages.data()), 0);
+  EXPECT_TRUE(std::all_of(pages.begin(), pages.end(), [](auto p) { return !(p & 1); }));
+  EXPECT_EQ(mincore(live, size, pages.data()), 0);
+  EXPECT_TRUE(std::all_of(pages.begin(), pages.end(), [](auto p) { return p & 1; }));
+  EXPECT_TRUE(std::all_of((char*)live, (char*)live + size, [](char c) { return c == 0x33; }));
+  // Retained extents that were only partially purged must also be re-zeroed.
+  reused = arena.allocateZeroed(size, hugePageSize);
+  EXPECT_TRUE(std::all_of((char*)reused, (char*)reused + size, [](char c) { return c == 0; }));
+  arena.deallocate(reused, size, hugePageSize);
+  arena.deallocate(live, size, hugePageSize);
+  arena.purge();
+}
+
+TEST(ProcessAllocatorTest, idleDecayAndRearm) {
+  AllocatorArena arena("test-idle-big-buffers",
+      {.wholeHugePagePurge = true, .dirtyDecayMs = 50});
+  auto start = arena.stats();
+  if (!start) GTEST_SKIP() << "Arena decay requires jemalloc";
+  bool backgroundThreads = allocatorBackgroundThreadsEnabled();
+  constexpr size_t size = 8 * hugePageSize;
+  for (int burst = 0; burst < 2; ++burst) {
+    void* block = arena.allocateZeroed(size, hugePageSize);
+    std::memset(block, 1, size);
+    constexpr size_t regularSize = hugePageSize / 2;
+    std::array<void*, 4> regular;
+    for (auto& small : regular) {
+      small = arena.allocate(regularSize);
+      std::memset(small, 1, regularSize);
+    }
+    arena.deallocate(block, size, hugePageSize);
+    for (auto small : regular) arena.deallocate(small, regularSize);
+    EXPECT_EQ(arena.stats()->allocated, start->allocated);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (arena.stats()->resident >= start->resident + hugePageSize &&
+           std::chrono::steady_clock::now() < deadline) {
+      // Background scheduling has no per-arena idle deadline. Test explicit
+      // purge instead, retrying if it yields to a purge already in flight.
+      if (backgroundThreads) arena.purge();
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_LT(arena.stats()->resident, start->resident + hugePageSize);
+    if (!backgroundThreads) {
+      // Let the timer stop before the next burst has to arm it again.
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+  }
 }

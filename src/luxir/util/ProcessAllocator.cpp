@@ -2,6 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/util/MappedAlloc.h"
+#include "luxir/util/DeadlineScheduler.h"
+#include <atomic>
+#include <cerrno>
+#include <cstring>
+#include <limits>
 
 #include <cstdlib>
 #include <algorithm>
@@ -80,18 +86,34 @@ IndexingArenaState& indexingArenaState() {
 }
 
 #if LUXIR_JEMALLOC
-constexpr size_t HUGE_PAGE_SIZE = 2 * 1024 * 1024;
-
 struct HugePageHooks {
   extent_hooks_t hooks;
   extent_hooks_t* defaults;
 
-  HugePageHooks() {
+  explicit HugePageHooks(bool wholePurge) {
     size_t size = sizeof(defaults);
     int error = mallctl("arena.0.extent_hooks", &defaults, &size, nullptr, 0);
     if (error) throw std::system_error(error, std::generic_category(), "arena.0.extent_hooks");
     hooks = *defaults;
     hooks.alloc = allocate;
+    if (wholePurge) {
+      hooks.purge_forced = purge<true>;
+      hooks.purge_lazy = purge<false>;
+    }
+  }
+
+  template<bool forced>
+  static bool purge(extent_hooks_t* hooks, void* addr, size_t size,
+                    size_t offset, size_t length, unsigned arena) {
+    auto* self = reinterpret_cast<HugePageHooks*>(hooks);
+    auto fn = forced ? self->defaults->purge_forced : self->defaults->purge_lazy;
+    auto [skip, interior] = allocator_detail::hugePageInterior((uintptr_t)addr + offset, length);
+    if (!fn || !interior) return true;
+    bool failed = fn(self->defaults, addr, size, offset + skip, interior, arena);
+    // In 5.4, pac decay (muzzy_decay_ms=0) and arena.purge reach
+    // extent_dalloc_wrapper: failed purges retain the extent with zeroed=false.
+    // Reuse must zero it again; only this interior was returned to the OS.
+    return failed || interior != length;
   }
 
   static void* allocate(extent_hooks_t* hooks, void* addr, size_t size,
@@ -105,27 +127,88 @@ struct HugePageHooks {
   }
 };
 
-extent_hooks_t* hugePageHooks() {
-  static auto* hooks = new HugePageHooks;
-  return &hooks->hooks;
+extent_hooks_t* hugePageHooks(bool wholePurge) {
+  static auto* regular = new HugePageHooks(false);
+  static auto* whole = new HugePageHooks(true);
+  return wholePurge ? &whole->hooks : &regular->hooks;
 }
 #endif
 } // namespace
 
-AllocatorArena::AllocatorArena(const char* name, bool hugePages) : hugePages(hugePages) {
+struct AllocatorArena::IdleDecay {
 #if LUXIR_JEMALLOC
-  extent_hooks_t* hooks = hugePages ? hugePageHooks() : nullptr;
-  size_t size = sizeof(arena);
-  int error = mallctl("arenas.create", &arena, &size,
-                      hooks ? &hooks : nullptr, hooks ? sizeof(hooks) : 0);
-  if (error) throw std::system_error(error, std::generic_category(), "arenas.create");
-  char control[64];
-  std::snprintf(control, sizeof(control), "arena.%u.name", arena);
-  error = mallctl(control, nullptr, nullptr, &name, sizeof(name));
-  if (error) {
-    std::snprintf(control, sizeof(control), "arena.%u.destroy", arena);
-    (void)mallctl(control, nullptr, nullptr, nullptr, 0);
-    throw std::system_error(error, std::generic_category(), "arena name");
+  using Clock = DeadlineScheduler::Clock;
+  AllocatorArena& owner;
+  std::chrono::milliseconds interval;
+  std::chrono::milliseconds decayTime;
+  std::atomic<Clock::duration::rep> lastFree{Clock::now().time_since_epoch().count()};
+  DeadlineScheduler& scheduler = DeadlineScheduler::global();
+  DeadlineScheduler::Slot slot{[this] { tick(); }};
+
+  IdleDecay(AllocatorArena& owner, int64_t decayMs)
+      : owner(owner), interval(std::min(decayMs, (int64_t)1000)), decayTime(decayMs) {
+    // Register and start the worker here, so freeing a buffer cannot allocate
+    // scheduler storage or create a thread. Later arms only tighten its deadline.
+    try { arm(); }
+    catch (...) { scheduler.detach(slot); throw; }
+  }
+  ~IdleDecay() { scheduler.detach(slot); }
+
+  void arm() { scheduler.arm(slot, Clock::now() + interval); }
+
+  void freed() {
+    lastFree.fetch_max(Clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+    arm();
+  }
+
+  void tick() {
+    owner.arenaControl("decay");
+    auto last = Clock::time_point(Clock::duration(lastFree.load(std::memory_order_relaxed)));
+    // Keep ticking through the decay window. A concurrent free also arms, so
+    // stopping here cannot lose a wakeup.
+    if (Clock::now() - last <= decayTime + interval) arm();
+  }
+#endif
+};
+
+AllocatorArena::AllocatorArena(const char* name, AllocatorArenaOptions options)
+    : hugePages(options.hugePages || options.wholeHugePagePurge) {
+#if LUXIR_JEMALLOC
+  try {
+    for (unsigned i = 0; i < (hugePages ? 2u : 1u); ++i) {
+      extent_hooks_t* hooks = hugePages && i == 0 ? hugePageHooks(options.wholeHugePagePurge) : nullptr;
+      size_t size = sizeof(arenas[i]);
+      int error = mallctl("arenas.create", &arenas[i], &size,
+                          hooks ? &hooks : nullptr, hooks ? sizeof(hooks) : 0);
+      if (error) throw std::system_error(error, std::generic_category(), "arenas.create");
+      ++arenaCount;
+      auto set = [&](const char* key, auto value) {
+        char control[96];
+        std::snprintf(control, sizeof(control), "arena.%u.%s", arenas[i], key);
+        int error = mallctl(control, nullptr, nullptr, &value, sizeof(value));
+        if (error) throw std::system_error(error, std::generic_category(), control);
+      };
+      std::string arenaName = i == 0 ? name : std::string(name) + "-regular";
+      set("name", arenaName.c_str());
+      if (options.wholeHugePagePurge) set("muzzy_decay_ms", (ssize_t)0);
+      if (options.dirtyDecayMs) {
+        set("dirty_decay_ms", (ssize_t)*options.dirtyDecayMs);
+        if (*options.dirtyDecayMs > 0) {
+          // 5.4 otherwise purges coalesced extents >= 8 MiB on free, ignoring
+          // the reuse window when background threads are disabled.
+          set("oversize_threshold", std::numeric_limits<size_t>::max());
+        }
+      }
+    }
+    // In 5.4, a non-background caller's arena.decay defers purging when
+    // background threads are enabled. Their early wakes are threshold-based,
+    // so ticks cannot enforce this arena's decay deadline in that mode.
+    if (options.dirtyDecayMs && *options.dirtyDecayMs > 0 && !allocatorBackgroundThreadsEnabled()) {
+      idleDecay = std::make_unique<IdleDecay>(*this, *options.dirtyDecayMs);
+    }
+  } catch (...) {
+    arenaControl("destroy");
+    throw;
   }
 #else
   (void)name;
@@ -133,20 +216,32 @@ AllocatorArena::AllocatorArena(const char* name, bool hugePages) : hugePages(hug
 }
 
 AllocatorArena::~AllocatorArena() {
+  idleDecay.reset();
+  arenaControl("destroy");
+}
+
+void AllocatorArena::arenaControl(const char* command) noexcept {
 #if LUXIR_JEMALLOC
-  char name[64];
-  std::snprintf(name, sizeof(name), "arena.%u.destroy", arena);
-  if (mallctl(name, nullptr, nullptr, nullptr, 0)) std::abort();
+  for (unsigned i = 0; i < arenaCount; ++i) {
+    char name[64];
+    std::snprintf(name, sizeof(name), "arena.%u.%s", arenas[i], command);
+    if (mallctl(name, nullptr, nullptr, nullptr, 0)) std::abort();
+  }
+#else
+  (void)command;
 #endif
 }
 
 int AllocatorArena::allocationFlags(size_t bytes, size_t alignment) const {
 #if LUXIR_JEMALLOC
   // Page alignment suppresses cache-oblivious address randomization in 5.4,
-  // but NOT its extra page of extent padding. The payload is huge-page aligned;
-  // the pad page can share a huge page with a neighbor, so purging the block
-  // can split that one neighbor huge page.
-  if (hugePages && bytes >= HUGE_PAGE_SIZE) alignment = std::max(alignment, HUGE_PAGE_SIZE);
+  // but NOT its extra page of extent padding. For whole-huge-page-sized
+  // buffers the pad starts the next huge page; whole-page purge hooks leave
+  // this fringe alone. The indexing arena keeps the default purge policy.
+  bool useHugePages = hugePages && bytes != 0 && bytes % hugePageSize == 0;
+  // Partial huge pages can strand resident memory outside the purged extent.
+  unsigned arena = arenas[hugePages && !useHugePages ? 1 : 0];
+  if (useHugePages) alignment = std::max(alignment, hugePageSize);
   return MALLOCX_ARENA(arena) | MALLOCX_TCACHE_NONE | MALLOCX_ALIGN(alignment);
 #else
   (void)bytes;
@@ -156,20 +251,28 @@ int AllocatorArena::allocationFlags(size_t bytes, size_t alignment) const {
 }
 
 void* AllocatorArena::do_allocate(size_t bytes, size_t alignment) {
+  return allocateImpl(bytes, alignment, false);
+}
+
+void* AllocatorArena::allocateImpl(size_t bytes, size_t alignment, bool zero) {
 #if LUXIR_JEMALLOC
-  void* ptr = mallocx(std::max(bytes, (size_t)1), allocationFlags(bytes, alignment));
+  void* ptr = mallocx(std::max(bytes, (size_t)1), allocationFlags(bytes, alignment) | (zero ? MALLOCX_ZERO : 0));
 #else
   void* ptr = nullptr;
   if (alignment <= alignof(std::max_align_t)) ptr = std::malloc(std::max(bytes, (size_t)1));
   else if (posix_memalign(&ptr, alignment, std::max(bytes, (size_t)1))) ptr = nullptr;
 #endif
   if (!ptr) throw std::bad_alloc();
+#if !LUXIR_JEMALLOC
+  if (zero) std::memset(ptr, 0, bytes);
+#endif
   return ptr;
 }
 
 void AllocatorArena::do_deallocate(void* ptr, size_t bytes, size_t alignment) {
 #if LUXIR_JEMALLOC
   sdallocx(ptr, std::max(bytes, (size_t)1), allocationFlags(bytes, alignment));
+  if (idleDecay) idleDecay->freed();
 #else
   (void)bytes;
   (void)alignment;
@@ -178,27 +281,29 @@ void AllocatorArena::do_deallocate(void* ptr, size_t bytes, size_t alignment) {
 }
 
 void AllocatorArena::purge() noexcept {
-#if LUXIR_JEMALLOC
-  char name[64];
-  std::snprintf(name, sizeof(name), "arena.%u.purge", arena);
-  if (mallctl(name, nullptr, nullptr, nullptr, 0)) std::abort();
-#endif
+  arenaControl("purge");
 }
 
 std::optional<AllocatorArena::Stats> AllocatorArena::stats() const {
 #if LUXIR_JEMALLOC
   uint64_t epoch = 1;
   if (mallctl("epoch", nullptr, nullptr, &epoch, sizeof(epoch))) return std::nullopt;
-  auto read = [this](const char* stat, size_t& value) {
-    char name[96];
-    std::snprintf(name, sizeof(name), "stats.arenas.%u.%s", arena, stat);
-    size_t size = sizeof(value);
-    return mallctl(name, &value, &size, nullptr, 0) == 0;
-  };
-  size_t small, large, resident;
-  if (read("small.allocated", small) && read("large.allocated", large) && read("resident", resident)) {
-    return Stats{small + large, resident};
+  Stats total{};
+  for (unsigned i = 0; i < arenaCount; ++i) {
+    auto read = [&](const char* stat, size_t& value) {
+      char name[96];
+      std::snprintf(name, sizeof(name), "stats.arenas.%u.%s", arenas[i], stat);
+      size_t size = sizeof(value);
+      return mallctl(name, &value, &size, nullptr, 0) == 0;
+    };
+    size_t small, large, resident;
+    if (!read("small.allocated", small) || !read("large.allocated", large) || !read("resident", resident)) {
+      return std::nullopt;
+    }
+    total.allocated += small + large;
+    total.resident += resident;
   }
+  return total;
 #endif
   return std::nullopt;
 }
@@ -215,8 +320,40 @@ void configureIndexingArena(bool hugePages) {
 AllocatorArena& indexingArena() {
   auto& state = indexingArenaState();
   std::lock_guard lock(state.mutex);
-  if (!state.arena) state.arena = new AllocatorArena("indexing", state.hugePages);
+  if (!state.arena) state.arena = new AllocatorArena("indexing", {.hugePages = state.hugePages});
   return *state.arena;
+}
+
+AllocatorArena& bigBufferArena() {
+  static auto* arena = new AllocatorArena("big-buffers",
+      {.hugePages = true, .wholeHugePagePurge = true, .dirtyDecayMs = 5000});
+  return *arena;
+}
+
+MappedAlloc::MappedAlloc(size_t bytes) : mappingSize(roundedSize(bytes)) {
+  if (mappingSize == 0) return;
+#if LUXIR_JEMALLOC
+  mapping = bigBufferArena().allocateZeroed(mappingSize, hugePageSize);
+#else
+  mapping = ::mmap(nullptr, mappingSize, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (mapping == MAP_FAILED) {
+    throw std::system_error(errno, std::generic_category(), "mmap");
+  }
+  (void)::madvise(mapping, mappingSize, MADV_HUGEPAGE);
+#endif
+  (void)::madvise(mapping, mappingSize, MADV_POPULATE_WRITE);
+}
+
+void MappedAlloc::reset() noexcept {
+  if (!mapping) return;
+#if LUXIR_JEMALLOC
+  bigBufferArena().deallocate(mapping, mappingSize, hugePageSize);
+#else
+  (void)::munmap(mapping, mappingSize);
+#endif
+  mapping = nullptr;
+  mappingSize = 0;
 }
 
 std::string allocatorName() {
@@ -239,6 +376,20 @@ std::string allocatorName() {
   return std::string("glibc ") + gnu_get_libc_version();
 #else
   return "system";
+#endif
+}
+
+bool allocatorBackgroundThreadsEnabled() {
+#if LUXIR_JEMALLOC
+  bool enabled = false;
+  size_t size = sizeof(enabled);
+  int error = mallctl("background_thread", &enabled, &size, nullptr, 0);
+  if (error && error != ENOENT) {
+    throw std::system_error(error, std::generic_category(), "background_thread");
+  }
+  return enabled;
+#else
+  return false;
 #endif
 }
 

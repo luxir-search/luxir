@@ -3,35 +3,66 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory_resource>
+#include <memory>
+#include <utility>
 #include <optional>
 #include <string>
 
 namespace luxir {
 
+inline constexpr size_t hugePageSize = 2 * 1024 * 1024;
+
+namespace allocator_detail {
+// Return the skipped prefix and length of the whole huge pages in this range.
+constexpr std::pair<size_t, size_t> hugePageInterior(uintptr_t start, size_t length) {
+  size_t skip = (hugePageSize - start % hugePageSize) % hugePageSize;
+  if (skip > length) return {length, 0};
+  return {skip, (length - skip) & ~(hugePageSize - 1)};
+}
+}
+
+struct AllocatorArenaOptions {
+  bool hugePages = false;
+  bool wholeHugePagePurge = false;
+  // An explicit positive decay disables eager oversize purging and enables
+  // idle ticks if background threads are disabled at construction. Otherwise
+  // jemalloc schedules decay, without a per-arena idle deadline.
+  // Unset keeps jemalloc's default decay and oversize-purge settings.
+  std::optional<int64_t> dirtyDecayMs = std::nullopt;
+};
+
 class AllocatorArena final : public std::pmr::memory_resource {
-  unsigned arena = 0;
+  std::array<unsigned, 2> arenas{};
+  unsigned arenaCount = 0;
   bool hugePages;
+  struct IdleDecay;
+  std::unique_ptr<IdleDecay> idleDecay;
 
   void* do_allocate(size_t bytes, size_t alignment) override;
   void do_deallocate(void* ptr, size_t bytes, size_t alignment) override;
   bool do_is_equal(const memory_resource& other) const noexcept override { return this == &other; }
+  void* allocateImpl(size_t bytes, size_t alignment, bool zero);
   int allocationFlags(size_t bytes, size_t alignment) const;
+  void arenaControl(const char* command) noexcept;
 
 public:
   struct Stats {
     // allocated: live size-class bytes; resident: allocator estimate including
     // metadata, active pages and dirty pages, not a measurement of process RSS.
+    // Unpurged fringes of retained extents are excluded.
     size_t allocated;
     size_t resident;
   };
 
-  explicit AllocatorArena(const char* name, bool hugePages = false);
+  explicit AllocatorArena(const char* name, AllocatorArenaOptions options = {});
   ~AllocatorArena() override;
   AllocatorArena(const AllocatorArena&) = delete;
   AllocatorArena& operator=(const AllocatorArena&) = delete;
 
+  void* allocateZeroed(size_t bytes, size_t alignment) { return allocateImpl(bytes, alignment, true); }
   void purge() noexcept;
   std::optional<Stats> stats() const;
 };
@@ -39,9 +70,13 @@ public:
 // Configure before first use. The process-wide indexing arena is never destroyed.
 void configureIndexingArena(bool hugePages);
 AllocatorArena& indexingArena();
+AllocatorArena& bigBufferArena();
 
 // Process allocator, version and effective configuration for the startup banner.
 std::string allocatorName();
+
+// Current process allocator background-purging state; false without jemalloc.
+bool allocatorBackgroundThreadsEnabled();
 
 // Returns free allocator memory to the OS where the allocator supports it.
 void releaseFreeMemory();

@@ -1114,6 +1114,7 @@ message StatsResponse {
   StatsTotals totals = 1;
   repeated CollectionStats collections = 2;
   IndexRamStats indexing_ram = 3;
+  AllocatorStats big_buffer_ram = 7;
   StorageRamStats storage_ram = 6;
 }
 
@@ -1285,6 +1286,12 @@ message QueryCacheStats {
   uint64 reader_stable_hits = 14;
   uint64 reader_stable_refreshes = 15;
   uint64 reader_stable_retires = 16;
+}
+
+// Arena statistics; zero when unavailable. Resident is an allocator estimate.
+message AllocatorStats {
+  uint64 allocated_bytes = 1;
+  uint64 resident_bytes = 2;
 }
 
 message IndexRamStats {
