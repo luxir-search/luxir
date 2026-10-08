@@ -294,6 +294,11 @@ the node unlimited. The resolved values are logged at startup.
   peak RSS: smaller flushes land sooner and cost less at once, at the price of
   more segments to merge.
 
+`--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
+transparent huge pages for whole-huge-page indexing allocations; disable it
+with `--no-indexing.huge-pages` (or `--indexing.huge-pages=false`). This is a
+best-effort hint: a host with THP set to `never` still works using ordinary pages.
+
 The HTTP request limits distinguish bounded material from streams:
 
 ```bash

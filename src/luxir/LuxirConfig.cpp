@@ -154,8 +154,10 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(store.checked_dir.sync)
       ->check(CLI::IsMember({"off", "warn", "throw"}));
 
-  app.add_flag("--indexing.huge-pages", index.huge_pages,
-               "Advise transparent huge pages for the indexing arena (jemalloc builds)");
+  app.add_flag("--indexing.huge-pages,!--no-indexing.huge-pages", index.huge_pages,
+               "Advise transparent huge pages for the indexing arena (jemalloc builds; "
+               "no effect when host THP is disabled)")
+      ->default_val(index.huge_pages);
   app.add_option("--indexing.max-inverter-ram-mb", index.max_inverter_ram_mb,
                  "Per-inverter RAM cap (MiB) before an auto-flush to a segment")
       ->check(CLI::PositiveNumber)
