@@ -80,8 +80,11 @@ The script fingerprints the selected GCC compilers' effective native CPU options
 for vcpkg's binary cache, so a package built on one CPU is not reused on another
 with different native settings. Use this script when updating dependencies;
 direct native-triplet installs require that fingerprint. `CC` and `CXX` default
-to `gcc` and `g++`, matching the presets. If overriding them, select the same
-compilers when configuring Luxir.
+to `gcc-16` and `g++-16`; the native presets pin those same compiler names.
+If overriding them, select the same compilers when configuring Luxir.
+Existing build directories need a fresh configure (`cmake --preset <name> --fresh`)
+because CMake cannot switch compilers in an existing cache. Reapply local CMake
+options when refreshing.
 
 After changing the manifest or overlays, rerun the script. To update vcpkg itself,
 change the manifest baseline, check out that revision in `/opt/vcpkg`, bootstrap
@@ -101,7 +104,7 @@ Reapply local CMake options such as `-DLUXIR_LOCAL_TARGETS=ON` when refreshing.
 The new installs do not modify `/opt/vcpkg/installed` or `/opt/vcpkg_asan`.
 Those legacy installations can be removed after migrating their consumers.
 See [deps/README.txt](../../deps/README.txt) for the dependency configuration.
-The host compiler and system packages are not pinned by this workflow.
+The exact host compiler build and system packages are not pinned by this workflow.
 
 ### Deferring the Release-only host migration
 
