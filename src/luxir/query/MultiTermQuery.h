@@ -608,6 +608,8 @@ public:
       return supplier->resolve(targetPool, planContext)->build(targetPool);
     }
 
+    bool hasReleasableSegmentState() const noexcept override { return true; }
+
     void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
       for (auto* facts = expansionMemos[(size_t)segment.ord].facts;
            facts != nullptr; facts = facts->next) {

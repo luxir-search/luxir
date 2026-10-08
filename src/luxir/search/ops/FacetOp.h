@@ -266,14 +266,15 @@ public:
 
     template <typename Key, typename DomainSource>
     void executeBucketChildren(std::span<const SelectedFacetBucket<Key>> buckets,
+                               FacetBucketProducer producer,
                                DomainSource&& source) {
       if (fieldOp().subOps.empty()) return;
       std::vector<SearchOp*> children;
       children.reserve(fieldOp().subOps.size());
       for (auto& [name, child] : fieldOp().subOps) children.push_back(child);
       FacetBucketBlockExecutor::execute<Key>(
-          *this, children, buckets, fieldOp().reader, source,
-          FacetBucketBlockExecutor::BINDING_BYTES, []() {});
+          *this, children, buckets, fieldOp().reader, producer, source,
+          FacetBucketBlockExecutor::BINDING_BYTES);
     }
 
     template <typename Key, typename Buckets, typename KeyAt, typename IdAt>
@@ -810,7 +811,7 @@ public:
     }
 
     void executeResultChildren(std::span<const SelectedFacetBucket<int64_t>> buckets) {
-      executeBucketChildren<int64_t>(buckets,
+      executeBucketChildren<int64_t>(buckets, FacetBucketProducer::JOINT,
           [this](size_t segnum, auto block, FacetBucketFeed feed) {
             feedFacetBucketDomainChunks(
                 thisOp().reader.segments()[segnum].maxDoc(), block,
@@ -1071,6 +1072,7 @@ public:
     void executeResultChildren(
         std::span<const SelectedFacetBucket<std::string_view>> buckets) {
       executeBucketChildren<std::string_view>(buckets,
+          FacetBucketProducer::INDEPENDENT,
           [this](size_t segnum, auto block, FacetBucketFeed feed) {
             for (size_t i = 0; i < block.size(); i++) {
               feed(i, materializeTermDomain((int32_t)segnum, block[i].key,
@@ -1179,7 +1181,7 @@ public:
   virtual size_t bindingStateChunkBytes() const {
     return FacetBucketBlockExecutor::BINDING_BYTES;
   }
-  virtual void bindingBlockStarted() const {}
+  virtual FacetBucketProducer bucketProducer() const = 0;
 
   virtual bool requiresWholeReaderDomain() const { return false; }
 
@@ -1294,11 +1296,11 @@ public:
 
       FacetBucketBlockExecutor::execute<size_t>(
           *this, children, buckets, fixedOp().reader,
+          fixedOp().bucketProducer(),
           [this](size_t segnum, auto block, FacetBucketFeed feed) {
             feedBucketDomains(segnum, block, feed);
           },
-          fixedOp().bindingStateChunkBytes(),
-          [this]() { fixedOp().bindingBlockStarted(); });
+          fixedOp().bindingStateChunkBytes());
     }
 
   public:
@@ -1408,10 +1410,8 @@ public:
         : FACET_BUCKET_DOMAIN_BYTES;
   }
 
-  void bindingBlockStarted() const override {
-    if (rangeFacetBindingBlockCounter != nullptr) {
-      (*rangeFacetBindingBlockCounter)++;
-    }
+  FacetBucketProducer bucketProducer() const override {
+    return FacetBucketProducer::JOINT;
   }
 
   std::vector<size_t> emittedBuckets(
@@ -1596,6 +1596,17 @@ public:
     if (segmentStateRetained(segment)) return;
     for (auto* weight : bucketWeights) weight->releaseSegmentState(segment);
     SearchOp::releaseSegmentState(segment);
+  }
+
+  bool facetBucketSharesSegmentState() const override {
+    return std::ranges::any_of(bucketWeights, [](const auto* weight) {
+             return weight->hasReleasableSegmentState();
+           })
+        || SearchOp::facetBucketSharesSegmentState();
+  }
+
+  FacetBucketProducer bucketProducer() const override {
+    return FacetBucketProducer::INDEPENDENT;
   }
 
   bool requiresWholeReaderDomain() const override {

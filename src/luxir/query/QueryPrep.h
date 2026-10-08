@@ -910,6 +910,10 @@ public:
     if (weight) weight->releaseSegmentState(segment);
   }
 
+  bool hasReleasableSegmentState() const noexcept {
+    return weight && weight->hasReleasableSegmentState();
+  }
+
   bool empty() const { return source == Source::EMPTY; }
   bool hasCacheUse() const { return cacheUse != nullptr; }
   bool isTopKCount() const {
@@ -1307,6 +1311,12 @@ public:
     for (const auto& source : sources) {
       if (source.weight) source.weight->releaseSegmentState(segment);
     }
+  }
+
+  bool hasReleasableSegmentState() const noexcept {
+    return std::ranges::any_of(sources, [](const auto& source) {
+      return source.weight && source.weight->hasReleasableSegmentState();
+    });
   }
 
   bool empty() const { return sources.empty(); }

@@ -14,6 +14,7 @@
 #include "SearchOp.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/search/OrdMap.h"
+#include "luxir/search/SearchOverrides.h"
 
 namespace luxir {
 
@@ -89,34 +90,62 @@ public:
 // (feedFacetBucketDomainChunks) and hands each domain over as it feeds it.
 using FacetBucketFeed = std::function_ref<void(size_t, DomainHandle)>;
 
-// Block bindings by retained child state, then feed each segment's bucket
-// domains to that bucket's children. A bucket's bindings open at its first
-// feed and close after its last, so whatever a completed child holds does not
-// accumulate across the block.
+// How a parent produces one segment's bucket domains for a block. A joint
+// producer builds a chunk's domains in one column pass, so every block repeats
+// that pass; an independent producer builds each domain on its own.
+enum class FacetBucketProducer : uint8_t {
+  INDEPENDENT,
+  JOINT
+};
+
+// Block bindings, then feed each segment's bucket domains to that bucket's
+// children. A bucket's bindings open at its first feed and close after its
+// last, so whatever a completed child holds does not accumulate across the
+// block.
+//
+// The block width trades per-bucket locality for per-segment sharing. A
+// segment pass cycles through the state of every binding in the block, while
+// each extra block repeats the segment work its buckets share: a joint
+// producer's column pass, and the per-segment query state children release
+// after each segment (multiterm expansions). With shared work, only the
+// binding byte budget bounds a block. Without it, the block keeps its
+// bindings' state within CACHE_BYTES, so a heavy child (a nested facet's
+// counts) runs a bucket at a time and keeps its state hot across segments.
 class FacetBucketBlockExecutor {
 public:
   static constexpr size_t BINDING_BYTES = 64 * 1024 * 1024;
+  // A share of a 1 MiB L2: a segment pass also touches the bucket's domain
+  // and the child's column and ord-map decoding.
+  static constexpr size_t CACHE_BYTES = 256 * 1024;
 
-  template <typename Key, typename DomainSource, typename BlockStarted>
+  template <typename Key, typename DomainSource>
   static void execute(
       SearchOp::Calculator& parent, std::span<SearchOp* const> children,
       std::span<const SelectedFacetBucket<Key>> buckets,
-      IndexReader& reader, DomainSource&& bucketDomains,
-      size_t bindingStateBytes, BlockStarted&& blockStarted) {
+      IndexReader& reader, FacetBucketProducer producer,
+      DomainSource&& bucketDomains, size_t bindingStateBytes) {
     if (children.empty() || buckets.empty()) return;
     size_t residentBytesPerBucket = 0;
+    bool sharedSegmentWork = producer == FacetBucketProducer::JOINT;
     for (SearchOp* child : children) {
       residentBytesPerBucket = saturatingAdd(
           residentBytesPerBucket, child->facetBucketResidentBytes());
+      sharedSegmentWork = sharedSegmentWork
+          || child->facetBucketSharesSegmentState();
     }
+    size_t blockBytes = sharedSegmentWork ? bindingStateBytes
+        : std::min(bindingStateBytes, forcedFacetBucketCacheBytes != 0
+              ? forcedFacetBucketCacheBytes : CACHE_BYTES);
     size_t bindingBlockSize = std::max<size_t>(
-        1, bindingStateBytes
-               / std::max<size_t>(1, residentBytesPerBucket));
+        1, blockBytes / std::max<size_t>(1, residentBytesPerBucket));
+    if (forcedFacetBucketBlockBuckets != 0) {
+      bindingBlockSize = forcedFacetBucketBlockBuckets;
+    }
     auto segments = reader.segments();
 
     for (size_t blockBegin = 0; blockBegin < buckets.size();
          blockBegin += bindingBlockSize) {
-      blockStarted();
+      if (facetBucketBlockCounter != nullptr) (*facetBucketBlockCounter)++;
       size_t blockSize = std::min(
           bindingBlockSize, buckets.size() - blockBegin);
       auto block = std::span<const SelectedFacetBucket<Key>>(buckets)

@@ -26,6 +26,7 @@
 #include "luxir/util/proto.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/query/QueryStats.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/ops/FacetOp.h"
 #include "luxir/search/ops/StrFacetOp.h"
@@ -2936,7 +2937,7 @@ TEST_F(FacetTest, numericFacetInlineMemoryBreaker) {
 
 TEST_F(FacetTest, nestedNumericFacetBindingsRespectResidentBudget) {
   SearchOverridesGuard guard(forcedRangeFacetBindingStateChunkBytes,
-                             rangeFacetBindingBlockCounter);
+                             facetBucketBlockCounter);
   CollectionHelper helper;
   helper.indexAll(std::array{
       flatdoc("parent_i", 0, "n_i", 0, "score_i", 10),
@@ -2950,13 +2951,14 @@ TEST_F(FacetTest, nestedNumericFacetBindingsRespectResidentBudget) {
   // must finish all segments before the next binding opens.
   forcedRangeFacetBindingStateChunkBytes = 64 * 1024;
   size_t blocks = 0;
-  rangeFacetBindingBlockCounter = &blocks;
+  facetBucketBlockCounter = &blocks;
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").rangeFacet("outer", "parent_i").range(0, 2, 1)
       .facet("inner", "n_i").limit(2).sum("total", "score_i");
   req->execute(false);
   ASSERT_OK(req);
-  EXPECT_EQ(2u, blocks);
+  // Two outer blocks, plus each inner facet's block for its sum binding.
+  EXPECT_EQ(4u, blocks);
   auto children = metricValues(rootFacetResult(*req, "outer"), "inner");
   ASSERT_EQ(2u, children.size());
   for (size_t i = 0; i < children.size(); i++) {
@@ -2997,7 +2999,7 @@ TEST_F(FacetTest, numericFacetDuplicateOccurrencesAndUniqueFeedDomains) {
 
 TEST_F(FacetTest, wideNumericChildKeepsSharedBindingBlock) {
   SearchOverridesGuard guard(forcedRangeFacetBindingStateChunkBytes,
-                             rangeFacetBindingBlockCounter);
+                             facetBucketBlockCounter);
   CollectionHelper helper;
   for (int seg = 0; seg < 2; seg++) {
     std::vector<Doc> docs;
@@ -3008,7 +3010,7 @@ TEST_F(FacetTest, wideNumericChildKeepsSharedBindingBlock) {
   }
   forcedRangeFacetBindingStateChunkBytes = 64 * 1024;
   size_t blocks = 0;
-  rangeFacetBindingBlockCounter = &blocks;
+  facetBucketBlockCounter = &blocks;
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").rangeFacet("outer", "parent_i").range(0, 4, 1)
       .facet("inner", "wide_i").limit(1);
@@ -3026,6 +3028,74 @@ TEST_F(FacetTest, wideNumericChildKeepsSharedBindingBlock) {
   }
 }
 
+// A nested string facet shares no segment work across its parent's buckets,
+// so their bindings open in blocks that keep its counts within the cache
+// budget. A sibling child whose query holds releasable per-segment state
+// (a prefix expansion) keeps the whole block, so that state is built once per
+// segment; a term query holds none and does not. An int parent builds its
+// bucket domains in one column pass per block and keeps the whole block.
+TEST_F(FacetTest, stringFacetChildBlocksFollowSharedSegmentWork) {
+  CollectionHelper helper;
+  for (int seg = 0; seg < 2; seg++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 40; i++) {
+      docs.push_back(flatdoc("id", std::format("{}-{}", seg, i),
+          "parent_s", std::format("p{}", i % 4), "parent_i", i % 4,
+          "child_s", std::format("c{}", (i * 7 + seg) % 9),
+          "body_w", i % 3 == 0 ? "apple" : "apricot"));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  SearchOverridesGuard guard(forcedFacetFeedStrategy,
+                             forcedFacetBucketCacheBytes,
+                             facetBucketBlockCounter);
+  forcedFacetFeedStrategy = FacetFeedStrategy::BUCKET_DOMAINS;
+  size_t blocks = 0;
+  facetBucketBlockCounter = &blocks;
+  enum class Hits { NONE, PREFIX, TERM };
+  auto run = [&](size_t cacheBytes, Hits hits,
+                 std::string_view parentField = "parent_s") {
+    forcedFacetBucketCacheBytes = cacheBytes;
+    blocks = 0;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& facet = req->facet("f", parentField).limit(4);
+    facet.facet("sub", "child_s").limit(3);
+    if (hits == Hits::PREFIX) {
+      facet.topDocs("hits").prefixQuery("body_w", "ap").limit(1)
+          .fields({"id"});
+    } else if (hits == Hits::TERM) {
+      facet.topDocs("hits").matchQuery("body_w", "apple").limit(1)
+          .fields({"id"});
+    }
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return encodeFacetResult(*req, "f");
+  };
+
+  auto expected = run(0, Hits::NONE);
+  EXPECT_EQ(1u, blocks);
+  EXPECT_EQ(expected, run(1, Hits::NONE));
+  EXPECT_EQ(4u, blocks);
+
+  auto expectedPrefix = run(0, Hits::PREFIX);
+  EXPECT_EQ(1u, blocks);
+  uint64_t refills = multitermExpansionRefills.load(std::memory_order_relaxed);
+  EXPECT_EQ(expectedPrefix, run(1, Hits::PREFIX));
+  EXPECT_EQ(1u, blocks);
+  EXPECT_EQ(refills, multitermExpansionRefills.load(std::memory_order_relaxed));
+
+  auto expectedTerm = run(0, Hits::TERM);
+  EXPECT_EQ(1u, blocks);
+  EXPECT_EQ(expectedTerm, run(1, Hits::TERM));
+  EXPECT_EQ(4u, blocks);
+
+  auto expectedInt = run(0, Hits::NONE, "parent_i");
+  EXPECT_EQ(1u, blocks);
+  EXPECT_EQ(expectedInt, run(1, Hits::NONE, "parent_i"));
+  EXPECT_EQ(1u, blocks);
+}
+
 namespace {
 
 // Live bindings and domains seen by bucket-block executor probe children.
@@ -3038,6 +3108,7 @@ struct BlockProbe {
   };
 
   size_t residentBytes = 1;
+  bool sharesSegmentState = false;
   int liveBindings = 0;
   int maxLiveBindings = 0;
   int liveDomains = 0;
@@ -3092,6 +3163,10 @@ public:
   size_t facetBucketResidentBytes() const override {
     return probe.residentBytes;
   }
+
+  bool facetBucketSharesSegmentState() const override {
+    return probe.sharesSegmentState;
+  }
 };
 
 } // namespace
@@ -3125,16 +3200,18 @@ TEST_F(FacetTest, bucketBlockExecutorBindingAndDomainLifetimes) {
                        .output = FacetOutputSlot{i}});
   }
 
-  auto run = [&](auto&& source) {
+  SearchOverridesGuard guard(facetBucketBlockCounter);
+  auto run = [&](FacetBucketProducer producer, auto&& source) {
     probe.feeds.clear();
     probe.maxLiveBindings = 0;
     probe.maxLiveDomains = 0;
     size_t blocks = 0;
+    facetBucketBlockCounter = &blocks;
     FacetBucketBlockExecutor::execute<int64_t>(
         *parent, children,
         std::span<const SelectedFacetBucket<int64_t>>(buckets), *req->reader,
-        source, FacetBucketBlockExecutor::BINDING_BYTES,
-        [&]() { blocks++; });
+        producer, source, FacetBucketBlockExecutor::BINDING_BYTES);
+    facetBucketBlockCounter = nullptr;
     EXPECT_EQ(0, probe.liveBindings);
     EXPECT_EQ(0, probe.liveDomains);
     EXPECT_EQ(3u * buckets.size() * children.size(), probe.feeds.size());
@@ -3150,7 +3227,7 @@ TEST_F(FacetTest, bucketBlockExecutorBindingAndDomainLifetimes) {
     }
   };
 
-  EXPECT_EQ(1u, run(independent));
+  EXPECT_EQ(1u, run(FacetBucketProducer::INDEPENDENT, independent));
   EXPECT_EQ(1, probe.maxLiveDomains);
   EXPECT_EQ(8, probe.maxLiveBindings);
   for (size_t i = 0; i < probe.feeds.size(); i++) {
@@ -3165,16 +3242,8 @@ TEST_F(FacetTest, bucketBlockExecutorBindingAndDomainLifetimes) {
     EXPECT_EQ(2 * liveBuckets, feed.liveBindings);
   }
 
-  // Two children at a quarter of the binding budget each: two buckets per
-  // block.
-  probe.residentBytes = FacetBucketBlockExecutor::BINDING_BYTES / 4;
-  EXPECT_EQ(2u, run(independent));
-  EXPECT_EQ(4, probe.maxLiveBindings);
-  probe.residentBytes = 1;
-
-  for (size_t budget : {(size_t)1, FACET_BUCKET_DOMAIN_BYTES}) {
-    SCOPED_TRACE(std::format("budget {}", budget));
-    run([&](size_t segnum, auto block, FacetBucketFeed feed) {
+  auto joint = [&](size_t budget) {
+    return [&, budget](size_t segnum, auto block, FacetBucketFeed feed) {
       feedFacetBucketDomainChunks(
           req->reader->segments()[segnum].maxDoc(), block, budget, feed,
           [&](auto chunk) {
@@ -3184,7 +3253,36 @@ TEST_F(FacetTest, bucketBlockExecutorBindingAndDomainLifetimes) {
             }
             return domains;
           });
-    });
+    };
+  };
+
+  // Without shared segment work, a block keeps its bindings' state within
+  // the cache budget: two children at a quarter of it each fit two buckets,
+  // and children over it run a bucket at a time.
+  probe.residentBytes = FacetBucketBlockExecutor::CACHE_BYTES / 4;
+  EXPECT_EQ(2u, run(FacetBucketProducer::INDEPENDENT, independent));
+  EXPECT_EQ(4, probe.maxLiveBindings);
+  probe.residentBytes = FacetBucketBlockExecutor::CACHE_BYTES;
+  EXPECT_EQ(4u, run(FacetBucketProducer::INDEPENDENT, independent));
+  EXPECT_EQ(2, probe.maxLiveBindings);
+  // A joint producer's column pass, or a child's per-segment query state,
+  // is shared by the whole block: only the binding budget bounds it.
+  EXPECT_EQ(1u, run(FacetBucketProducer::JOINT,
+                    joint(FACET_BUCKET_DOMAIN_BYTES)));
+  probe.sharesSegmentState = true;
+  EXPECT_EQ(1u, run(FacetBucketProducer::INDEPENDENT, independent));
+  EXPECT_EQ(8, probe.maxLiveBindings);
+  // Two children at a quarter of the binding budget each: two buckets per
+  // block.
+  probe.residentBytes = FacetBucketBlockExecutor::BINDING_BYTES / 4;
+  EXPECT_EQ(2u, run(FacetBucketProducer::INDEPENDENT, independent));
+  EXPECT_EQ(4, probe.maxLiveBindings);
+  probe.sharesSegmentState = false;
+  probe.residentBytes = 1;
+
+  for (size_t budget : {(size_t)1, FACET_BUCKET_DOMAIN_BYTES}) {
+    SCOPED_TRACE(std::format("budget {}", budget));
+    run(FacetBucketProducer::JOINT, joint(budget));
     bool oneChunk = budget == FACET_BUCKET_DOMAIN_BYTES;
     EXPECT_EQ(oneChunk ? 4 : 1, probe.maxLiveDomains);
     for (size_t i = 0; i < probe.feeds.size(); i++) {

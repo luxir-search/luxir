@@ -1626,6 +1626,7 @@ public:
 
       FacetBucketBlockExecutor::execute<std::string_view>(
           *this, children, buckets, *op.req.reader,
+          FacetBucketProducer::INDEPENDENT,
           [&](size_t segnum, auto block, FacetBucketFeed feed) {
             for (size_t i = 0; i < block.size(); i++) {
               feed(i, ordColumnDomains
@@ -1634,7 +1635,7 @@ public:
                   : materializeTermDomain((int32_t)segnum, block[i].key,
                                           input[segnum].get()));
             }
-          }, FacetBucketBlockExecutor::BINDING_BYTES, []() {});
+          }, FacetBucketBlockExecutor::BINDING_BYTES);
     }
   };
 

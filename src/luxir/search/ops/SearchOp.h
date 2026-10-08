@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
@@ -156,6 +157,16 @@ public:
   // segments are fed. Stateless operations keep the default zero estimate.
   virtual size_t facetBucketResidentBytes() const {
     return 0;
+  }
+
+  // Whether this subtree runs query weights whose per-segment state is
+  // released and rebuilt (Weight::hasReleasableSegmentState): bucket bindings
+  // fed in one segment pass share it. Ops holding weights override this to
+  // check the weights their releaseSegmentState releases.
+  virtual bool facetBucketSharesSegmentState() const {
+    return std::ranges::any_of(subOps, [](const auto& entry) {
+      return entry.second->facetBucketSharesSegmentState();
+    });
   }
 
   // Result-stage facet children may bind to parent-produced sources. The

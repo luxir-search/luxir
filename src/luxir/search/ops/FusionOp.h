@@ -86,6 +86,16 @@ public:
     SearchOp::releaseSegmentState(segment);
   }
 
+  bool facetBucketSharesSegmentState() const override {
+    return std::ranges::any_of(filterWeights, [](const auto* weight) {
+             return weight->hasReleasableSegmentState();
+           })
+        || std::ranges::any_of(sources, [](const TopDocsReq* source) {
+             return source->facetBucketSharesSegmentState();
+           })
+        || SearchOp::facetBucketSharesSegmentState();
+  }
+
   // Sources are not in `subOps` (different lifecycle: they deliver via
   // rankingSink rather than emit), so SearchOp::init() does not reach
   // them - walk them explicitly here.

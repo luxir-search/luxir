@@ -41,7 +41,7 @@ auto facetAggregateOverrides() {
       forcedInlineFacetEntryMode,
       forcedRangeFacetBucketDomainByteBudget,
       forcedRangeFacetBindingStateChunkBytes,
-      rangeFacetBindingBlockCounter);
+      facetBucketBlockCounter);
 }
 
 AggregateProgram* parseAggregate(ArenaOwner& memory, Schema& schema,
@@ -1077,7 +1077,7 @@ TEST_F(AggregateExprTest, rangeFacetFeedsExprChildrenInBindingBlocks) {
   auto guard = facetAggregateOverrides();
   forcedRangeFacetBucketDomainByteBudget = 1;
   forcedRangeFacetBindingStateChunkBytes = 64 * 1024;
-  rangeFacetBindingBlockCounter = &blocks;
+  facetBucketBlockCounter = &blocks;
   auto run = [&](std::string_view expression, int64_t multiplier) {
     auto req = localReq(helper.getSearchEngine());
     auto& facet = req->collection("main").rangeFacet("ranges", "bucket_i")

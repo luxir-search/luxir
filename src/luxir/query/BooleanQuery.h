@@ -5162,6 +5162,15 @@ public:
       }
     }
 
+    bool hasReleasableSegmentState() const noexcept override {
+      for (auto weights : {mandatoryWeights, optionalWeights, prohibitedWeights, filterWeights}) {
+        for (auto* weight : weights) {
+          if (weight && weight->hasReleasableSegmentState()) return true;
+        }
+      }
+      return false;
+    }
+
     // Membership count free from index stats, composed from the clauses.
     // Two shapes answer: a lone required clause delegates (optional clauses
     // beside it never gate membership while minShouldMatch is unset, whether

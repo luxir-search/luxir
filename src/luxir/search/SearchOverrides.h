@@ -34,9 +34,22 @@ inline bool disableFieldSortBulk = false;
 inline std::size_t forcedRangeFacetBucketDomainByteBudget = 0;
 
 // Test override for the range-facet result-child state chunk. Zero selects the
-// production ceiling. The optional counter observes opened blocks.
+// production ceiling.
 inline std::size_t forcedRangeFacetBindingStateChunkBytes = 0;
-inline std::size_t* rangeFacetBindingBlockCounter = nullptr;
+
+// Test override for the facet bucket-child cache budget. Zero selects the
+// production constant. The optional counter observes opened binding blocks.
+inline std::size_t forcedFacetBucketCacheBytes = 0;
+inline std::size_t* facetBucketBlockCounter = nullptr;
+
+// Bench override for the facet bucket-child block width: the number of
+// buckets whose bindings are open together across a segment pass, bypassing
+// both the cache and the binding byte budgets. Zero keeps the executor's own
+// sizing.
+inline std::size_t forcedFacetBucketBlockBuckets = [] {
+  const char* e = std::getenv("LUXIR_FACET_BUCKET_BLOCK");
+  return e != nullptr ? (std::size_t)std::strtoull(e, nullptr, 10) : 0;
+}();
 
 // Test override for the per-request query-memory breaker ceiling. Zero uses
 // LuxirConfig.

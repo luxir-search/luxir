@@ -1552,6 +1552,13 @@ public:
     /// Advisory: false is always safe.
     bool matchesAllDocs() const noexcept { return (traits & MATCHES_ALL_DOCS) != 0; }
 
+    /// True when releaseSegmentState() can drop per-segment state that a later
+    /// execution on that segment rebuilds (multiterm expansions). A caller
+    /// running this weight for many domains of a segment shares that state by
+    /// running them in one segment pass. Composites forward to the weights
+    /// they release.
+    virtual bool hasReleasableSegmentState() const noexcept { return false; }
+
     /// True when the request permits scorer-level competitive pruning.
     bool allowsPruning() const noexcept { return (inputFlags & ALLOW_PRUNING) != 0; }
     bool needsScores() const noexcept { return (inputFlags & NEED_SCORES) != 0; }

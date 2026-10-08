@@ -250,9 +250,9 @@ TEST_F(FacetTopDocsTest, rangeFacetBucketTopDocsAgreeAcrossBindingBlocks) {
   }, UpdateMessage::COMMIT);
 
   SearchOverridesGuard guard(forcedRangeFacetBindingStateChunkBytes,
-                             rangeFacetBindingBlockCounter);
+                             facetBucketBlockCounter);
   std::size_t blocks = 0;
-  rangeFacetBindingBlockCounter = &blocks;
+  facetBucketBlockCounter = &blocks;
   auto run = [&](std::size_t chunkBytes) {
     forcedRangeFacetBindingStateChunkBytes = chunkBytes;
     blocks = 0;

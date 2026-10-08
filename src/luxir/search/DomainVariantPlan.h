@@ -303,6 +303,12 @@ public:
     }
   }
 
+  bool hasReleasableSegmentState() const noexcept {
+    return std::ranges::any_of(querySources, [](const auto& source) {
+      return source.weight && source.weight->hasReleasableSegmentState();
+    });
+  }
+
   Query::Weight* sourceWeight(size_t source) const {
     assert(source < querySources.size());
     return querySources[source].weight;

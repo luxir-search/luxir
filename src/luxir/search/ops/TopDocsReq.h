@@ -440,6 +440,20 @@ public:
     SearchOp::releaseSegmentState(segment);
   }
 
+  bool facetBucketSharesSegmentState() const override {
+    for (auto* source : {weight, variantMembershipWeight, countWeight,
+                         rankingWeight, wholeRankingWeight}) {
+      if (source && source->hasReleasableSegmentState()) return true;
+    }
+    return std::ranges::any_of(filterWeights, [](const auto* source) {
+             return source->hasReleasableSegmentState();
+           })
+        || wholeMembershipPlan.hasReleasableSegmentState()
+        || exactDomainPlan.hasReleasableSegmentState()
+        || domainVariants.hasReleasableSegmentState()
+        || SearchOp::facetBucketSharesSegmentState();
+  }
+
   class Calc : public SearchOp::Calculator {
   public:
     luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
