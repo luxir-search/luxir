@@ -99,31 +99,16 @@ public:
     // exists only in ScorerPlan.
     struct ExpansionFacts {
       using States = ExpansionStates;
+      MemPool statePool;
       std::variant<States, BitsetPayload> payload;
-      int64_t sumDocFreq;
-      size_t termCount;
+      int64_t sumDocFreq = 0;
+      size_t termCount = 0;
       size_t maxLazyStateBytes;
-      Query::MatchState matchState;
+      Query::MatchState matchState = Query::MatchState::EMPTY;
       ExpansionFacts* next = nullptr;
 
-      ExpansionFacts(States states, int64_t sumDocFreq,
-                     size_t maxLazyStateBytes)
-        : payload(states),
-          sumDocFreq(sumDocFreq),
-          termCount(states.size()),
-          maxLazyStateBytes(maxLazyStateBytes),
-          matchState(termCount == 0 ? Query::MatchState::EMPTY
-                                   : Query::MatchState::NONEMPTY) {}
-
-      ExpansionFacts(BitsetPayload bitset, int64_t sumDocFreq,
-                     size_t termCount, size_t maxLazyStateBytes)
-        : payload(bitset), sumDocFreq(sumDocFreq), termCount(termCount),
-          maxLazyStateBytes(maxLazyStateBytes),
-          matchState(termCount == 0 ? Query::MatchState::EMPTY
-                                   : Query::MatchState::NONEMPTY) {
-        assert(termCount != 0);
-        assert(bitset.words != nullptr);
-      }
+      explicit ExpansionFacts(size_t maxLazyStateBytes)
+        : maxLazyStateBytes(maxLazyStateBytes) {}
 
       bool hasBitset() const {
         return std::holds_alternative<BitsetPayload>(payload);
@@ -138,8 +123,9 @@ public:
       }
     };
 
-    static_assert(std::is_trivially_destructible_v<ExpansionFacts>);
-
+    // Segment tasks use distinct slots; preparation precedes dispatch and
+    // facet bucket bindings sharing a weight run serially. Each budget is
+    // filled once, then its facts (including statePool) are read-only.
     struct ExpansionMemo {
       ExpansionFacts* facts = nullptr;
     };
@@ -272,8 +258,10 @@ public:
 
       size_t maxStates = buildContext.multiTermMaxLazyStateBytes
           / sizeof(TermsEnum::PostingsState);
-      ArenaResource resource(&memoArena);
-      ChunkedArray<TermsEnum::PostingsState> states(resource, maxStates);
+      auto* facts = luxir::arenaCreate<ExpansionFacts>(
+          memoArena, buildContext.multiTermMaxLazyStateBytes);
+      auto stateStart = facts->statePool.getSavePoint();
+      ChunkedArray<TermsEnum::PostingsState> states(facts->statePool, maxStates);
       uint64_t* bitWords = nullptr;
       size_t termCount = 0;
       int64_t sumDocFreq = 0;
@@ -310,22 +298,23 @@ public:
               addPostingsToBitset(bits, retained);
             }
             addPostingsToBitset(bits, state);
+            // No state views have escaped; return all heap blocks at spill.
+            facts->statePool.rewind(stateStart, 0);
           }
         }
       }
 
       // The request arena survives every segment-local pool rewind. Each
       // segment publishes into its preallocated ordinal memo.
-      ExpansionFacts* facts;
       if (bitWords != nullptr) {
-        facts = luxir::arenaCreate<ExpansionFacts>(
-            memoArena, BitsetPayload{bitWords}, sumDocFreq, termCount,
-            buildContext.multiTermMaxLazyStateBytes);
+        facts->payload = BitsetPayload{bitWords};
       } else {
-        facts = luxir::arenaCreate<ExpansionFacts>(
-            memoArena, states.view(), sumDocFreq,
-            buildContext.multiTermMaxLazyStateBytes);
+        facts->payload = states.view();
       }
+      facts->sumDocFreq = sumDocFreq;
+      facts->termCount = termCount;
+      facts->matchState = termCount == 0 ? Query::MatchState::EMPTY
+                                       : Query::MatchState::NONEMPTY;
       facts->next = memo.facts;
       memo.facts = facts;
       return true;
@@ -616,6 +605,20 @@ public:
           expansionMemos[(size_t) segment.ord].facts;
       assert(facts != nullptr);
       return facts->hasBitset() ? 0 : facts->states().size();
+    }
+
+    size_t expansionMemoPoolBytesForTests(
+        const IndexReader::Segment& segment) const {
+      ExpansionFacts* facts =
+          expansionMemos[(size_t) segment.ord].facts;
+      assert(facts != nullptr);
+      const auto& pool = facts->statePool;
+      size_t bytes = pool.allocatedSize();
+      // allocatedSize() excludes spare blocks kept after a rewind.
+      for (size_t i = (size_t)pool.bufferIdx + 1; i < pool.buffers.size(); i++) {
+        bytes += pool.bufferSize(pool.buffers[i]);
+      }
+      return bytes;
     }
   };
 };

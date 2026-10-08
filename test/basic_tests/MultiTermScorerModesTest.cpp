@@ -598,6 +598,54 @@ TEST_F(MultiTermScorerModesTest, stateBudgetSpillsToEager) {
   EXPECT_EQ(eager, collectDocs(ti, ScorerMode::AUTO, {0, 0}));
 }
 
+TEST_F(MultiTermScorerModesTest, stateBudgetReleasesPoolAtSpill) {
+  constexpr int32_t numTerms = 514;
+  TestIndex ti;
+  TestField field(ti, "body_w");
+  std::map<int32_t, std::string> docs;
+  for (int32_t i = 0; i < numTerms; i++) docs[i] = "q" + std::to_string(i);
+  buildCorpus(field, docs);
+
+  Query::Context context(ti.pool, *ti.reader);
+  PrefixQuery prefix("body_w", "q");
+  auto& segment = ti.reader->segments()[0];
+  ScorerModeGuard mode(ScorerMode::FORCE_HEAP);
+  StateBudgetGuard budget(numTerms * sizeof(TermsEnum::PostingsState));
+  auto* weight = (MultiTermQuery::Weight*) prefix.createWeight(
+      context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+  auto* supplier = weight->scorerSupplier(ti.pool, segment);
+  auto retainedContext = MultiTermQuery::Weight::scorerBuildContext(1);
+  auto* retainedPlan = supplier->resolve(ti.pool, retainedContext);
+  EXPECT_FALSE(weight->expansionMemoUsesBitsetForTests(segment));
+  EXPECT_EQ(numTerms, weight->expansionMemoRetainedStatesForTests(segment));
+  EXPECT_GT(weight->expansionMemoPoolBytesForTests(segment),
+            numTerms * sizeof(TermsEnum::PostingsState));
+
+  // Cross a chunk boundary, spill from the first chunk, and retain no states.
+  for (size_t maxStates : {513u, 8u, 0u}) {
+    SCOPED_TRACE(maxStates);
+    StateBudgetGuard spillBudget(maxStates * sizeof(TermsEnum::PostingsState));
+    auto buildContext = MultiTermQuery::Weight::scorerBuildContext(1);
+    EXPECT_TRUE(supplier->fillExpansionMemo(buildContext));
+    EXPECT_TRUE(weight->expansionMemoUsesBitsetForTests(segment));
+    EXPECT_EQ(0u, weight->expansionMemoRetainedStatesForTests(segment));
+    EXPECT_EQ(MemPool::STATIC_BUFFER_SIZE,
+              weight->expansionMemoPoolBytesForTests(segment));
+    EXPECT_FALSE(supplier->fillExpansionMemo(buildContext));
+    auto* scorer = supplier->resolve(ti.pool, buildContext)->build(ti.pool);
+    ASSERT_NE(nullptr, dynamic_cast<MultiTermQuery::Scorer*>(scorer));
+    for (int32_t doc = 0; doc < numTerms; doc++) EXPECT_EQ(doc, scorer->next());
+    EXPECT_EQ(PostingsReader::END, scorer->next());
+  }
+
+  // Spilling other budgets must preserve the original plan's retained states.
+  EXPECT_FALSE(supplier->fillExpansionMemo(retainedContext));
+  auto* retained = retainedPlan->build(ti.pool);
+  ASSERT_NE(nullptr, dynamic_cast<UnionHeapScorer*>(retained));
+  for (int32_t doc = 0; doc < numTerms; doc++) EXPECT_EQ(doc, retained->next());
+  EXPECT_EQ(PostingsReader::END, retained->next());
+}
+
 // A conjunction-driven supplier (finite leadCost) keeps the lazy union;
 // unscored and non-pruning contexts stay eager.
 TEST_F(MultiTermScorerModesTest, drivenSupplierSelection) {
