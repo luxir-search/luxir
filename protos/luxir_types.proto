@@ -1108,15 +1108,29 @@ message StatsRequest {
   bool segments = 2;
   // Administration only. With a collection, empty is the caller's tenant.
   string tenant = 3;
+  // Return only node memory statistics (StatsResponse.memory), without
+  // collections or totals. Node-wide: invalid with a collection, a tenant, or
+  // segments.
+  bool memory = 4;
 }
 
 message StatsResponse {
+  reserved 3, 6, 7;
+  reserved "indexing_ram", "storage_ram", "big_buffer_ram";
   StatsTotals totals = 1;
   repeated CollectionStats collections = 2;
-  IndexRamStats indexing_ram = 3;
-  AllocatorStats big_buffer_ram = 7;
   uint64 multiterm_expansion_refills = 8;
-  StorageRamStats storage_ram = 6;
+  // Set only by a StatsRequest.memory request, which returns nothing else.
+  MemoryStats memory = 9;
+}
+
+// Node memory: Luxir's own budgets and usage, and the process allocator's
+// statistics where the allocator reports them.
+message MemoryStats {
+  IndexRamStats indexing_budget = 1;
+  StorageRamStats storage_ram = 2;
+  // Present only when Luxir runs on jemalloc.
+  JemallocStats jemalloc = 3;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.
@@ -1195,7 +1209,7 @@ message StatsTotals {
 
 message StorageRamStats {
   uint64 used_bytes = 1; // Allocated RAM file buffers, including output and retained readers.
-  uint64 limit_bytes = 2; // Zero is unlimited. Independent of indexing_ram.
+  uint64 limit_bytes = 2; // Zero is unlimited. Independent of the indexing budget.
 }
 
 message CollectionStats {
@@ -1289,18 +1303,41 @@ message QueryCacheStats {
   uint64 reader_stable_retires = 16;
 }
 
-// Arena statistics; zero when unavailable. Resident is an allocator estimate.
-message AllocatorStats {
-  uint64 allocated_bytes = 1;
-  uint64 resident_bytes = 2;
-}
-
+// Indexing RAM budget: the configured limit and the bytes reserved against it.
 message IndexRamStats {
   uint64 limit_bytes = 1;
   uint64 reserved_bytes = 2;
-  // Indexing arena only; zero when allocator statistics are unavailable.
-  uint64 allocated_bytes = 3;
-  uint64 resident_bytes = 4;
+}
+
+// jemalloc's process-wide statistics (stats.*), read at one statistics epoch
+// per request. allocated counts live bytes allocated through jemalloc,
+// including objects cached by threads; active adds page-level fragmentation;
+// resident is jemalloc's upper bound on its resident pages, including metadata
+// and dirty pages awaiting decay. The process RssAnon also counts memory
+// jemalloc does not manage.
+message JemallocStats {
+  string version = 1;
+  uint64 allocated_bytes = 2;
+  uint64 active_bytes = 3;
+  uint64 metadata_bytes = 4;
+  uint64 resident_bytes = 5;
+  uint64 mapped_bytes = 6;
+  // Virtual mappings kept for reuse instead of unmapped. Mostly purged; the
+  // huge-page arenas can leave fringe pages resident.
+  uint64 retained_bytes = 7;
+  // Freed pages awaiting decay, across all arenas.
+  uint64 dirty_bytes = 8;
+  // Dedicated arena for indexing memory.
+  ArenaStats indexing = 9;
+  // Dedicated huge-page arena for big buffers (MappedAlloc).
+  ArenaStats big_buffer = 10;
+}
+
+// One dedicated allocator arena (a huge-page arena sums its two jemalloc
+// arenas). Resident is jemalloc's upper bound.
+message ArenaStats {
+  uint64 allocated_bytes = 1;
+  uint64 resident_bytes = 2;
 }
 
 // Admin control over the per-collection query cache. Actions compose and

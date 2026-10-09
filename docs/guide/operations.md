@@ -157,13 +157,24 @@ liveness, not a deep read/write check of every collection or storage device.
 Use `GET /_stats` for node-wide operational state or
 `GET /collections/{collection}/_stats` for one collection. The response
 distinguishes writer-visible segments from committed segments and reports
-document counts, generations, merge activity, query-cache counters, and the
-node-wide indexing RAM budget. Per-segment records are omitted by default; add
-`?segments=true` when diagnosing segment layout. A node-wide sample includes
+document counts, generations, merge activity, and query-cache counters.
+Per-segment records are omitted by default; add `?segments=true` when
+diagnosing segment layout. A node-wide sample includes
 load-failure tombstones with their `error` and excludes them from totals. Each
 collection index is sampled coherently, but a node-wide response is not one
 transaction across collections. The same payload is available through unary
 `luxir.Admin/Stats`; omit its collection target for the node-wide view.
+
+`GET /_stats?memory=true` (`StatsRequest.memory`) returns only node memory,
+without walking collections, so it is cheap enough to poll: the indexing RAM
+budget, RAM storage usage, and, when Luxir runs on jemalloc, a `jemalloc`
+block with the allocator's process-wide statistics (allocated, active,
+resident, retained, dirty) and its dedicated indexing and big-buffer arenas.
+It is node-wide, so it is rejected on a collection or tenant route and with
+`segments`. `jemalloc.allocated_bytes` counts live bytes allocated through
+jemalloc; `resident_bytes` is jemalloc's upper bound including fragmentation
+and freed pages awaiting decay; the process RssAnon also counts memory
+jemalloc does not manage.
 
 Counts follow the JSON dialect: a zero-valued field is omitted rather than
 emitted, so a scraper must read an absent field as zero. Totals appear at the

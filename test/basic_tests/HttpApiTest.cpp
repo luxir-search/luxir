@@ -27,6 +27,7 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/ReplicationSource.h"
+#include "luxir/util/ProcessAllocator.h"
 
 namespace luxir::test {
 
@@ -615,7 +616,37 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   ASSERT_FALSE(glz::read_json(nodeJson, nodeStats.body())) << nodeStats.body();
   EXPECT_TRUE(nodeJson.contains("totals"));
   EXPECT_TRUE(nodeJson.contains("collections"));
-  EXPECT_TRUE(nodeJson.contains("indexing_ram"));
+  EXPECT_FALSE(nodeJson.contains("memory"));
+
+  // Node memory is a separate request that returns nothing else; the jemalloc
+  // block is present only on jemalloc.
+  auto memoryStats = httpRequest(port(), http::verb::get, "/_stats?memory=true");
+  ASSERT_EQ(200, memoryStats.result_int()) << memoryStats.body();
+  glz::generic_i64 memoryJson;
+  ASSERT_FALSE(glz::read_json(memoryJson, memoryStats.body())) << memoryStats.body();
+  ASSERT_TRUE(memoryJson.contains("memory"));
+  EXPECT_FALSE(memoryJson.contains("collections"));
+  EXPECT_FALSE(memoryJson.contains("totals"));
+  EXPECT_TRUE(memoryJson["memory"].contains("indexing_budget"));
+  EXPECT_EQ(processAllocatorStats().has_value(),
+            memoryJson["memory"].contains("jemalloc"));
+  if (memoryJson["memory"].contains("jemalloc")) {
+    EXPECT_TRUE(memoryJson["memory"]["jemalloc"].contains("allocated_bytes"));
+    EXPECT_TRUE(memoryJson["memory"]["jemalloc"].contains("version"));
+  }
+  auto badMemory = httpRequest(port(), http::verb::get, "/_stats?memory=yes");
+  EXPECT_EQ(400, badMemory.result_int()) << badMemory.body();
+  auto noMemory = httpRequest(port(), http::verb::get, "/_stats?memory=false");
+  ASSERT_EQ(200, noMemory.result_int()) << noMemory.body();
+  glz::generic_i64 noMemoryJson;
+  ASSERT_FALSE(glz::read_json(noMemoryJson, noMemory.body())) << noMemory.body();
+  EXPECT_FALSE(noMemoryJson.contains("memory"));
+  // Memory is node-wide: no collection route, and no per-segment records.
+  for (const char* target : {"/collections/main/_stats?memory=true",
+                             "/_stats?memory=true&segments=true"}) {
+    auto rejected = httpRequest(port(), http::verb::get, target);
+    EXPECT_EQ(400, rejected.result_int()) << target << ": " << rejected.body();
+  }
 
   auto collectionStats =
       httpRequest(port(), http::verb::get, "/collections/main/_stats");

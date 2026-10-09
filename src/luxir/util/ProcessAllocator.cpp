@@ -246,6 +246,13 @@ std::optional<AllocatorArena::Stats> AllocatorArena::stats() const {
 #if LUXIR_JEMALLOC
   uint64_t epoch = 1;
   if (mallctl("epoch", nullptr, nullptr, &epoch, sizeof(epoch))) return std::nullopt;
+  return readStats();
+#endif
+  return std::nullopt;
+}
+
+std::optional<AllocatorArena::Stats> AllocatorArena::readStats() const {
+#if LUXIR_JEMALLOC
   Stats total{};
   for (unsigned i = 0; i < arenaCount; ++i) {
     auto read = [&](const char* stat, size_t& value) {
@@ -350,6 +357,39 @@ bool allocatorBackgroundThreadsEnabled() {
   return enabled;
 #else
   return false;
+#endif
+}
+
+std::optional<ProcessAllocatorStats> processAllocatorStats() {
+#if LUXIR_JEMALLOC
+  // Create the dedicated arenas first: one created after the epoch refresh is
+  // missing from that snapshot.
+  auto& indexing = indexingArena();
+  auto& bigBuffer = bigBufferArena();
+  uint64_t epoch = 1;
+  if (mallctl("epoch", nullptr, nullptr, &epoch, sizeof(epoch))) return std::nullopt;
+  auto read = [](const char* name, auto& value) {
+    size_t size = sizeof(value);
+    return mallctl(name, &value, &size, nullptr, 0) == 0;
+  };
+  ProcessAllocatorStats stats{};
+  size_t page = 0, dirtyPages = 0;
+  if (!read("version", stats.version) || !read("stats.allocated", stats.allocated)
+      || !read("stats.active", stats.active) || !read("stats.metadata", stats.metadata)
+      || !read("stats.resident", stats.resident) || !read("stats.mapped", stats.mapped)
+      || !read("stats.retained", stats.retained) || !read("arenas.page", page)
+      || !read("stats.arenas." LUXIR_STRINGIFY(MALLCTL_ARENAS_ALL) ".pdirty", dirtyPages)) {
+    return std::nullopt;
+  }
+  stats.dirty = dirtyPages * page;
+  auto indexingStats = indexing.readStats();
+  auto bigBufferStats = bigBuffer.readStats();
+  if (!indexingStats || !bigBufferStats) return std::nullopt;
+  stats.indexing = *indexingStats;
+  stats.bigBuffer = *bigBufferStats;
+  return stats;
+#else
+  return std::nullopt;
 #endif
 }
 

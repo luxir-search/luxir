@@ -1107,9 +1107,11 @@ TEST_F(ReplicationFollowerTest, ramLimitKeepsOldSnapshotAndChargesReadersUntilRe
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
   auto memory = follower->storageBytes(CollectionId::of("main"));
   EXPECT_GT(memory, 0);
+  auto memoryStats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats?memory=true");
+  glz::generic memoryJson; ASSERT_FALSE(glz::read_json(memoryJson, memoryStats.body()));
+  EXPECT_EQ(1024 * 1024, memoryJson["memory"]["storage_ram"]["limit_bytes"].get<double>());
   auto stats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats");
   glz::generic json; ASSERT_FALSE(glz::read_json(json, stats.body()));
-  EXPECT_EQ(1024 * 1024, json["storage_ram"]["limit_bytes"].get<double>());
   EXPECT_EQ(memory, json["collections"][0]["storage_ram_bytes"].get<double>());
   source->deleteCollection("main");
   ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));

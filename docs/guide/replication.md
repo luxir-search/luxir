@@ -181,7 +181,8 @@ buffers independently of indexing memory. Pressure first drops the oldest
 pins retaining retired files, excluding current snapshots and open file
 transfers, then reports `storage_memory_limit` if space is still insufficient. Allow
 room for current data plus changed files; old readers can delay reclamation.
-Node/per-collection storage usage remains in `_stats`.
+Per-collection storage usage remains in `_stats`; node storage usage and
+its limit are in `_stats?memory=true` under `memory.storage_ram`.
 
 ## Reference
 

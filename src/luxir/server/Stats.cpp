@@ -3,6 +3,7 @@
 
 #include "Stats.h"
 #include "luxir/query/QueryStats.h"
+#include "luxir/util/ApiError.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "ReplicationFollower.h"
 
@@ -24,6 +25,28 @@ namespace {
 std::string_view sortableGen(uint64_t gen, std::pmr::memory_resource& resource) {
   if (gen == 0) return {};
   return api::build::arenaStr(resource, Postings::getSortableString(gen));
+}
+
+void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
+  auto& ram = node.getIndexRamBudget();
+  memory.indexing_budget.limit_bytes = (uint64_t)ram.totalBytes();
+  memory.indexing_budget.reserved_bytes = (uint64_t)ram.reservedBytes();
+  memory.storage_ram.used_bytes = node.storageBytes();
+  memory.storage_ram.limit_bytes = node.getConfig().store.backend == "ram"
+      ? node.getConfig().store.ram_limit_mb * 1024 * 1024 : 0;
+  auto process = processAllocatorStats();
+  if (!process) return;
+  auto& jemalloc = memory.jemalloc.emplace();
+  jemalloc.version = process->version;
+  jemalloc.allocated_bytes = process->allocated;
+  jemalloc.active_bytes = process->active;
+  jemalloc.metadata_bytes = process->metadata;
+  jemalloc.resident_bytes = process->resident;
+  jemalloc.mapped_bytes = process->mapped;
+  jemalloc.retained_bytes = process->retained;
+  jemalloc.dirty_bytes = process->dirty;
+  jemalloc.indexing = {process->indexing.allocated, process->indexing.resident};
+  jemalloc.big_buffer = {process->bigBuffer.allocated, process->bigBuffer.resident};
 }
 
 void addTotals(api::StatsTotals& dst, const api::StatsTotals& src) {
@@ -118,8 +141,15 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
 
 void gatherStats(LuxirNode& node, const api::StatsRequest& request,
                  api::StatsResponse& response, std::pmr::memory_resource& resource) {
-  response.storage_ram.used_bytes = node.storageBytes();
-  response.storage_ram.limit_bytes = node.getConfig().store.backend == "ram" ? node.getConfig().store.ram_limit_mb * 1024 * 1024 : 0;
+  if (request.memory) {
+    // Node memory alone: no collection walk, so it is cheap to poll.
+    if (!request.collection.empty() || !request.tenant.empty() || request.segments) {
+      throw RequestError("memory stats are node-wide: request them without a collection, "
+                         "tenant, or segments");
+    }
+    fillMemoryStats(node, response.memory.emplace());
+    return;
+  }
   std::vector<LuxirNode::CollectionEntry> entries;
   if (!request.collection.empty()) {
     auto collection = node.getCollection(LuxirNode::target(request.tenant, request.collection));
@@ -129,6 +159,7 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     entries = request.tenant.empty() ? node.collectionEntries() : node.collectionEntries(request.tenant);
   }
 
+  auto& totals = response.totals.emplace();
   auto* collections = api::build::allocArray(response.collections, entries.size(), resource);
   for (std::size_t i = 0; i < entries.size(); i++) {
     const auto& entry = entries[i];
@@ -174,23 +205,12 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
 
     collectionStats.totals = shardStats.index.totals;
     collectionStats.totals.shards = 1;
-    addTotals(response.totals, collectionStats.totals);
-    response.totals.collections++;
+    addTotals(totals, collectionStats.totals);
+    totals.collections++;
   }
 
   response.multiterm_expansion_refills =
       multitermExpansionRefills.load(std::memory_order_relaxed);
-  auto& ram = node.getIndexRamBudget();
-  response.indexing_ram.limit_bytes = (uint64_t)ram.totalBytes();
-  response.indexing_ram.reserved_bytes = (uint64_t)ram.reservedBytes();
-  if (auto stats = indexingArena().stats()) {
-    response.indexing_ram.allocated_bytes = stats->allocated;
-    response.indexing_ram.resident_bytes = stats->resident;
-  }
-  if (auto stats = bigBufferArena().stats()) {
-    response.big_buffer_ram.allocated_bytes = stats->allocated;
-    response.big_buffer_ram.resident_bytes = stats->resident;
-  }
 }
 
 void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request,

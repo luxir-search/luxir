@@ -236,9 +236,17 @@ TEST(ProcessAllocatorTest, inverterFlushReclaimsArena) {
   EXPECT_GT(arena.stats()->allocated, start.allocated + 1024 * 1024);
   api::StatsResponse response;
   std::pmr::monotonic_buffer_resource responseMemory;
-  gatherStats(node, {}, response, responseMemory);
-  EXPECT_EQ(response.indexing_ram.allocated_bytes, arena.stats()->allocated);
-  EXPECT_GE(response.indexing_ram.resident_bytes, response.indexing_ram.allocated_bytes);
+  gatherStats(node, {.memory = true}, response, responseMemory);
+  ASSERT_TRUE(response.memory.has_value() && response.memory->jemalloc.has_value());
+  const auto& jemalloc = *response.memory->jemalloc;
+  EXPECT_EQ(jemalloc.indexing.allocated_bytes, arena.stats()->allocated);
+  EXPECT_GE(jemalloc.indexing.resident_bytes, jemalloc.indexing.allocated_bytes);
+  // The indexing arena is part of the process-wide totals.
+  EXPECT_GE(jemalloc.allocated_bytes, jemalloc.indexing.allocated_bytes);
+  EXPECT_LE(jemalloc.allocated_bytes, jemalloc.active_bytes);
+  EXPECT_LE(jemalloc.active_bytes, jemalloc.resident_bytes);
+  EXPECT_LE(jemalloc.active_bytes, jemalloc.mapped_bytes);
+  EXPECT_FALSE(jemalloc.version.empty());
   writer.releaseInverter(inverter, true);
   writer.updateGraph.wait_for_all();
   auto flushed = *arena.stats();  // No test-side purge: the flush must do it.

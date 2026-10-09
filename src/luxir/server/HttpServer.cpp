@@ -741,14 +741,11 @@ private:
     // streaming paths split; nothing carries over from an earlier request.
     tenant_ = route_.tenantRoute ? route_.tenant : std::string(CollectionId::kDefaultTenant);
     pretty_ = route_.prettyDefault;
-    if (const std::string* pretty = findParam(params, "pretty")) {
-      if (pretty->empty() || *pretty == "true") pretty_ = true;
-      else if (*pretty == "false") pretty_ = false;
-      else {
-        respondBeforeBodyError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
-            "invalid URL parameter 'pretty': expected true or false, got '" + *pretty + "'"));
-        return;
-      }
+    if (const std::string* pretty = findParam(params, "pretty"); pretty && pretty->empty()) {
+      pretty_ = true;  // A bare ?pretty also means true.
+    } else if (std::string err; !parseBoolParam(params, "pretty", pretty_, err)) {
+      respondBeforeBodyError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
+      return;
     }
 
     // /update URL options are validated at header admission for both encodings,
@@ -1032,6 +1029,20 @@ private:
     return nullptr;
   }
 
+  // A boolean URL parameter: absent leaves `out` unchanged.
+  static bool parseBoolParam(const std::vector<UrlParam>& params, std::string_view name,
+                             bool& out, std::string& err) {
+    const std::string* text = findParam(params, name);
+    if (text == nullptr) return true;
+    if (*text != "true" && *text != "false") {
+      err = "invalid URL parameter '" + std::string(name) +
+            "': expected true or false, got '" + *text + "'";
+      return false;
+    }
+    out = *text == "true";
+    return true;
+  }
+
   template <typename T>
   static bool appendIntegerParam(const std::vector<UrlParam>& params, std::string_view name,
                                  std::string_view expected, bool topDocs,
@@ -1054,14 +1065,10 @@ private:
   static bool appendBoolParam(const std::vector<UrlParam>& params, std::string_view name,
                               bool topDocs, OverlayJsonBuilder& json,
                               SearchUrlOverlay& overlay, std::string& err) {
-    const std::string* text = findParam(params, name);
-    if (text == nullptr) return true;
-    if (*text != "true" && *text != "false") {
-      err = "invalid URL parameter '" + std::string(name) +
-            "': expected true or false, got '" + *text + "'";
-      return false;
-    }
-    json.raw(name, *text);
+    if (findParam(params, name) == nullptr) return true;
+    bool value = false;
+    if (!parseBoolParam(params, name, value, err)) return false;
+    json.raw(name, value ? "true" : "false");
     overlay.hasTopDocs |= topDocs;
     return true;
   }
@@ -1398,19 +1405,17 @@ private:
         break;
       case Route::STATS: {
         bool includeSegments = false;
-        if (const std::string* value = findParam(params, "segments")) {
-          if (*value == "true") {
-            includeSegments = true;
-          } else if (*value != "false") {
-            respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
-                                       "invalid segments value '" + *value +
-                                           "' (valid: true, false)"));
-            return;
-          }
+        bool includeMemory = false;
+        std::string err;
+        if (!parseBoolParam(params, "segments", includeSegments, err) ||
+            !parseBoolParam(params, "memory", includeMemory, err)) {
+          respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
+          return;
         }
         // /_stats covers every tenant; a tenant route or a collection is scoped.
         handleStats(coll.empty() ? std::nullopt : std::optional<std::string>(coll),
-                    match.tenantRoute || !coll.empty() ? tenant_ : std::string(), includeSegments);
+                    match.tenantRoute || !coll.empty() ? tenant_ : std::string(),
+                    includeSegments, includeMemory);
         break;
       }
       case Route::SCHEMA: {
@@ -2194,16 +2199,19 @@ private:
     });
   }
 
-  void handleStats(std::optional<std::string> coll, std::string tenant, bool includeSegments) {
+  void handleStats(std::optional<std::string> coll, std::string tenant, bool includeSegments,
+                   bool includeMemory) {
     auto shardPin = makeShardPin();
     node_.getTaskArena().enqueue(
-        [self = shared_from_this(), coll = std::move(coll), tenant = std::move(tenant), includeSegments, shardPin] {
+        [self = shared_from_this(), coll = std::move(coll), tenant = std::move(tenant), includeSegments,
+         includeMemory, shardPin] {
           std::string out;
           std::optional<ErrorInfo> failure;
           try {
             std::pmr::monotonic_buffer_resource resource;
             luxir::api::StatsRequest request;
             request.segments = includeSegments;
+            request.memory = includeMemory;
             request.tenant = tenant;
             if (coll) request.collection = *coll;
 
@@ -2346,21 +2354,6 @@ private:
     return true;
   }
 
-  static bool parseDropUnmappedParam(const std::vector<UrlParam>& params, bool& out,
-                                     std::string& err) {
-    if (const std::string* value = findParam(params, "drop_unmapped")) {
-      if (*value == "true") {
-        out = true;
-      } else if (*value == "false") {
-        out = false;
-      } else {
-        err = "invalid drop_unmapped value '" + *value + "' (valid: true, false)";
-        return false;
-      }
-    }
-    return true;
-  }
-
   static bool parseCommitParam(const std::vector<UrlParam>& params, bool& out,
                                std::string& err) {
     if (const std::string* value = findParam(params, "commit")) {
@@ -2389,7 +2382,7 @@ private:
     if (!out.waitForReplicas.empty() && !findParam(params, "commit")) { err = "wait_for_replicas requires commit=true"; return false; }
     return parseCommitParam(params, out.commit, err) &&
            parseFieldMapParams(params, out.fieldMap, err) &&
-           parseDropUnmappedParam(params, out.dropUnmapped, err);
+           parseBoolParam(params, "drop_unmapped", out.dropUnmapped, err);
   }
 
   static void copyFieldMap(luxir::api::UpdateRequest& proto,

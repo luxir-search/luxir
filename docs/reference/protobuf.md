@@ -60,6 +60,7 @@ defaults and constraints are described in the comments and guides.
 - [`AnalyzerComponent`](#message-luxir.analyzercomponent)
 - [`AnalyzerDef`](#message-luxir.analyzerdef)
 - [`AnyOfQuery`](#message-luxir.anyofquery)
+- [`ArenaStats`](#message-luxir.arenastats)
 - [`ArrArrDouble`](#message-luxir.arrarrdouble)
 - [`ArrArrFloat`](#message-luxir.arrarrfloat)
 - [`ArrArrInt`](#message-luxir.arrarrint)
@@ -115,12 +116,14 @@ defaults and constraints are described in the comments and guides.
 - [`GeoDistanceQuery`](#message-luxir.geodistancequery)
 - [`IndexRamStats`](#message-luxir.indexramstats)
 - [`IndexStats`](#message-luxir.indexstats)
+- [`JemallocStats`](#message-luxir.jemallocstats)
 - [`KnnQuery`](#message-luxir.knnquery)
 - [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf)
 - [`ListCollectionsResponse`](#message-luxir.listcollectionsresponse)
 - [`ListTenantsResponse`](#message-luxir.listtenantsresponse)
 - [`Map`](#message-luxir.map)
 - [`Match`](#message-luxir.match)
+- [`MemoryStats`](#message-luxir.memorystats)
 - [`MultiVector`](#message-luxir.multivector)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
 - [`PhraseQuery`](#message-luxir.phrasequery)
@@ -209,6 +212,19 @@ Constant-score exact value-set membership using the field's value binding. TEXT 
 |---|---|---|---|---|
 | <a id="field-luxir.anyofquery.field"></a>[`field`](#field-luxir.anyofquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.anyofquery.values"></a>[`values`](#field-luxir.anyofquery.values) | 2 | [`Val`](#message-luxir.val) | singular | Required scalar or array of scalars. Null and nested arrays are errors. An empty array matches nothing; duplicate values are ignored. |
+
+<a id="message-luxir.arenastats"></a>
+
+### luxir.ArenaStats
+
+One dedicated allocator arena (a huge-page arena sums its two jemalloc arenas). Resident is jemalloc's upper bound.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.arenastats.allocated_bytes"></a>[`allocated_bytes`](#field-luxir.arenastats.allocated_bytes) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.arenastats.resident_bytes"></a>[`resident_bytes`](#field-luxir.arenastats.resident_bytes) | 2 | `uint64` | singular |  |
 
 <a id="message-luxir.arrarrdouble"></a>
 
@@ -934,6 +950,8 @@ Geographic distance query with a center in degrees and radius in meters. Matches
 
 ### luxir.IndexRamStats
 
+Indexing RAM budget: the configured limit and the bytes reserved against it.
+
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
@@ -963,6 +981,27 @@ Geographic distance query with a center in degrees and radius in meters. Matches
 | <a id="field-luxir.indexstats.pin_retained_bytes"></a>[`pin_retained_bytes`](#field-luxir.indexstats.pin_retained_bytes) | 12 | `uint64` | singular | bytes whose only remaining owners are pins |
 | <a id="field-luxir.indexstats.pin_idle_drops"></a>[`pin_idle_drops`](#field-luxir.indexstats.pin_idle_drops) | 13 | `uint64` | singular |  |
 | <a id="field-luxir.indexstats.pin_budget_drops"></a>[`pin_budget_drops`](#field-luxir.indexstats.pin_budget_drops) | 14 | `uint64` | singular |  |
+
+<a id="message-luxir.jemallocstats"></a>
+
+### luxir.JemallocStats
+
+jemalloc's process-wide statistics (stats.\*), read at one statistics epoch per request. allocated counts live bytes allocated through jemalloc, including objects cached by threads; active adds page-level fragmentation; resident is jemalloc's upper bound on its resident pages, including metadata and dirty pages awaiting decay. The process RssAnon also counts memory jemalloc does not manage.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.jemallocstats.version"></a>[`version`](#field-luxir.jemallocstats.version) | 1 | `string` | singular |  |
+| <a id="field-luxir.jemallocstats.allocated_bytes"></a>[`allocated_bytes`](#field-luxir.jemallocstats.allocated_bytes) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.jemallocstats.active_bytes"></a>[`active_bytes`](#field-luxir.jemallocstats.active_bytes) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.jemallocstats.metadata_bytes"></a>[`metadata_bytes`](#field-luxir.jemallocstats.metadata_bytes) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.jemallocstats.resident_bytes"></a>[`resident_bytes`](#field-luxir.jemallocstats.resident_bytes) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.jemallocstats.mapped_bytes"></a>[`mapped_bytes`](#field-luxir.jemallocstats.mapped_bytes) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.jemallocstats.retained_bytes"></a>[`retained_bytes`](#field-luxir.jemallocstats.retained_bytes) | 7 | `uint64` | singular | Virtual mappings kept for reuse instead of unmapped. Mostly purged; the huge-page arenas can leave fringe pages resident. |
+| <a id="field-luxir.jemallocstats.dirty_bytes"></a>[`dirty_bytes`](#field-luxir.jemallocstats.dirty_bytes) | 8 | `uint64` | singular | Freed pages awaiting decay, across all arenas. |
+| <a id="field-luxir.jemallocstats.indexing"></a>[`indexing`](#field-luxir.jemallocstats.indexing) | 9 | [`ArenaStats`](#message-luxir.arenastats) | singular | Dedicated arena for indexing memory. |
+| <a id="field-luxir.jemallocstats.big_buffer"></a>[`big_buffer`](#field-luxir.jemallocstats.big_buffer) | 10 | [`ArenaStats`](#message-luxir.arenastats) | singular | Dedicated huge-page arena for big buffers (MappedAlloc). |
 
 <a id="message-luxir.knnquery"></a>
 
@@ -1042,6 +1081,20 @@ Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolea
 | <a id="field-luxir.match.val"></a>[`val`](#field-luxir.match.val) | 2 | [`Val`](#message-luxir.val) | singular |  |
 | <a id="field-luxir.match.operator"></a>[`operator`](#field-luxir.match.operator) | 3 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How to combine the multiple terms an analyzed text field can produce. Unset = OR. |
 | <a id="field-luxir.match.min_match"></a>[`min_match`](#field-luxir.match.min_match) | 4 | `int32` | singular | Minimum number of the analyzed terms that must match (the OR..AND middle ground). When set it overrides \`operator\`; clamped to the term count. Mirrors BooleanQuery.min\_match. |
+
+<a id="message-luxir.memorystats"></a>
+
+### luxir.MemoryStats
+
+Node memory: Luxir's own budgets and usage, and the process allocator's statistics where the allocator reports them.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.memorystats.indexing_budget"></a>[`indexing_budget`](#field-luxir.memorystats.indexing_budget) | 1 | [`IndexRamStats`](#message-luxir.indexramstats) | singular |  |
+| <a id="field-luxir.memorystats.storage_ram"></a>[`storage_ram`](#field-luxir.memorystats.storage_ram) | 2 | [`StorageRamStats`](#message-luxir.storageramstats) | singular |  |
+| <a id="field-luxir.memorystats.jemalloc"></a>[`jemalloc`](#field-luxir.memorystats.jemalloc) | 3 | [`JemallocStats`](#message-luxir.jemallocstats) | singular | Present only when Luxir runs on jemalloc. |
 
 <a id="message-luxir.multivector"></a>
 
@@ -1549,6 +1602,7 @@ Operational statistics. An empty collection requests every collection on the nod
 | <a id="field-luxir.statsrequest.collection"></a>[`collection`](#field-luxir.statsrequest.collection) | 1 | `string` | singular | Empty selects every collection of \`tenant\`, or of every tenant when \`tenant\` is also empty (administration). |
 | <a id="field-luxir.statsrequest.segments"></a>[`segments`](#field-luxir.statsrequest.segments) | 2 | `bool` | singular |  |
 | <a id="field-luxir.statsrequest.tenant"></a>[`tenant`](#field-luxir.statsrequest.tenant) | 3 | `string` | singular | Administration only. With a collection, empty is the caller's tenant. |
+| <a id="field-luxir.statsrequest.memory"></a>[`memory`](#field-luxir.statsrequest.memory) | 4 | `bool` | singular | Return only node memory statistics (StatsResponse.memory), without collections or totals. Node-wide: invalid with a collection, a tenant, or segments. |
 
 <a id="message-luxir.statsresponse"></a>
 
@@ -1560,8 +1614,8 @@ Operational statistics. An empty collection requests every collection on the nod
 |---|---|---|---|---|
 | <a id="field-luxir.statsresponse.totals"></a>[`totals`](#field-luxir.statsresponse.totals) | 1 | [`StatsTotals`](#message-luxir.statstotals) | singular |  |
 | <a id="field-luxir.statsresponse.collections"></a>[`collections`](#field-luxir.statsresponse.collections) | 2 | [`CollectionStats`](#message-luxir.collectionstats) | repeated |  |
-| <a id="field-luxir.statsresponse.indexing_ram"></a>[`indexing_ram`](#field-luxir.statsresponse.indexing_ram) | 3 | [`IndexRamStats`](#message-luxir.indexramstats) | singular |  |
-| <a id="field-luxir.statsresponse.storage_ram"></a>[`storage_ram`](#field-luxir.statsresponse.storage_ram) | 6 | [`StorageRamStats`](#message-luxir.storageramstats) | singular |  |
+| <a id="field-luxir.statsresponse.multiterm_expansion_refills"></a>[`multiterm_expansion_refills`](#field-luxir.statsresponse.multiterm_expansion_refills) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.statsresponse.memory"></a>[`memory`](#field-luxir.statsresponse.memory) | 9 | [`MemoryStats`](#message-luxir.memorystats) | singular | Set only by a StatsRequest.memory request, which returns nothing else. |
 
 <a id="message-luxir.statstotals"></a>
 
@@ -1591,7 +1645,7 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.storageramstats.used_bytes"></a>[`used_bytes`](#field-luxir.storageramstats.used_bytes) | 1 | `uint64` | singular | Allocated RAM file buffers, including output and retained readers. |
-| <a id="field-luxir.storageramstats.limit_bytes"></a>[`limit_bytes`](#field-luxir.storageramstats.limit_bytes) | 2 | `uint64` | singular | Zero is unlimited. Independent of indexing\_ram. |
+| <a id="field-luxir.storageramstats.limit_bytes"></a>[`limit_bytes`](#field-luxir.storageramstats.limit_bytes) | 2 | `uint64` | singular | Zero is unlimited. Independent of the indexing budget. |
 
 <a id="message-luxir.topdocs"></a>
 

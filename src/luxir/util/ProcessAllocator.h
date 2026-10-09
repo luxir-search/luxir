@@ -32,6 +32,8 @@ struct AllocatorArenaOptions {
   std::optional<int64_t> dirtyDecayMs = std::nullopt;
 };
 
+struct ProcessAllocatorStats;
+
 class AllocatorArena final : public std::pmr::memory_resource {
   std::array<unsigned, 2> arenas{};
   unsigned arenaCount = 0;
@@ -60,7 +62,13 @@ public:
 
   void* allocateZeroed(size_t bytes, size_t alignment) { return allocateImpl(bytes, alignment, true); }
   void purge() noexcept;
+  // Refreshes jemalloc's statistics epoch, then reads this arena.
   std::optional<Stats> stats() const;
+
+private:
+  // Reads this arena at the current statistics epoch.
+  std::optional<Stats> readStats() const;
+  friend std::optional<ProcessAllocatorStats> processAllocatorStats();
 };
 
 // Configure before first use. The process-wide indexing arena is never destroyed.
@@ -73,6 +81,26 @@ std::string allocatorName();
 
 // Current process allocator background-purging state; false without jemalloc.
 bool allocatorBackgroundThreadsEnabled();
+
+// jemalloc's process-wide statistics and the dedicated arenas, read at one
+// statistics epoch; nullopt without jemalloc. allocated: live size-class bytes,
+// including objects cached by threads; active: their pages; resident:
+// jemalloc's upper bound on its resident pages, including metadata and dirty
+// pages; retained: virtual mappings kept instead of unmapped; dirty: freed
+// pages awaiting decay.
+struct ProcessAllocatorStats {
+  const char* version;
+  size_t allocated;
+  size_t active;
+  size_t metadata;
+  size_t resident;
+  size_t mapped;
+  size_t retained;
+  size_t dirty;
+  AllocatorArena::Stats indexing;
+  AllocatorArena::Stats bigBuffer;
+};
+std::optional<ProcessAllocatorStats> processAllocatorStats();
 
 // Returns free allocator memory to the OS where the allocator supports it.
 void releaseFreeMemory();

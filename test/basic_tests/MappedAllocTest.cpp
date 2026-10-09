@@ -65,14 +65,16 @@ TEST(MappedAllocTest, hugePageAdviceAndBackend) {
     LuxirNode node;
     api::StatsResponse response;
     std::pmr::monotonic_buffer_resource memory;
-    gatherStats(node, {}, response, memory);
+    gatherStats(node, {.memory = true}, response, memory);
+    ASSERT_TRUE(response.memory.has_value());
     if (auto stats = bigBufferArena().stats()) {
-      EXPECT_EQ(response.big_buffer_ram.allocated_bytes, stats->allocated);
-      EXPECT_GE(response.big_buffer_ram.allocated_bytes, buffer.size());
-      EXPECT_GE(response.big_buffer_ram.resident_bytes, stats->allocated);
+      ASSERT_TRUE(response.memory->jemalloc.has_value());
+      const auto& bigBuffer = response.memory->jemalloc->big_buffer;
+      EXPECT_EQ(bigBuffer.allocated_bytes, stats->allocated);
+      EXPECT_GE(bigBuffer.allocated_bytes, buffer.size());
+      EXPECT_GE(bigBuffer.resident_bytes, stats->allocated);
     } else {
-      EXPECT_EQ(response.big_buffer_ram.allocated_bytes, 0);
-      EXPECT_EQ(response.big_buffer_ram.resident_bytes, 0);
+      EXPECT_FALSE(response.memory->jemalloc.has_value());
     }
   }
   if (!bigBufferArena().stats()) {
