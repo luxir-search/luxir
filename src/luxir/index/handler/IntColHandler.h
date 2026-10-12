@@ -170,7 +170,8 @@ public:
     // push values
     {
       auto outputPtr = postingsWriter.getOutputStream();
-      IntColWriter writer(*outputPtr);
+      IntColWriter writer(*outputPtr,
+                          FieldType::sortsByIntColumn(fieldType->type()));
       // TODO: not having the docids here makes it impossible to do a dense field encoding!  Of course that's
       // not really possible if we're writing the column directly and incrementally since we don't know
       // min, max, numbits, gcd, etc.  But we *could* know that stuff when merging segments!

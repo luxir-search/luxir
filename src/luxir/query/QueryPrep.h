@@ -62,6 +62,11 @@ struct PreparedSource {
     return *weight;
   }
 
+  void releaseSegmentState(IndexReader::Segment& segment) const noexcept {
+    if (prepared) prepared->releaseSegmentState(segment);
+    if (weight) weight->releaseSegmentState(segment);
+  }
+
   void setPrepared(std::unique_ptr<Query::Weight::PreparedWeight> value) {
     prepared = std::move(value);
     domainDependence = prepared == nullptr
@@ -164,6 +169,11 @@ public:
     }
   }
 
+  [[gnu::cold]] void reset() override {
+    doc = arrIdx = -1;
+    windowArrIdx = 0;
+  }
+
   DocSet* docSet() const { return docs; }
 
   int32_t next() override {
@@ -197,9 +207,23 @@ public:
 
   int32_t docId() override { return doc; }
 
+  // Membership seek. Every member is exact, so there is nothing to verify
+  // and landing past max is navigation, which the bounded protocol allows:
+  // the next member is the caller's lookahead resume point. Answer here
+  // rather than through the base class's virtual docId()/advance() pair.
+  int32_t advanceWindow(int32_t min, int32_t max) override {
+    if (min >= max) return max;
+    return doc >= min ? doc : advance(min);
+  }
+
   // Window fills OR membership into caller-owned scratch; the caller clears
   // separate clause scratch and ANDs across conjunctive scorers. The array
   // resume cursor requires windows to arrive in nondecreasing order.
+  void fillScoredWindowBits(std::span<uint64_t> words,
+                            int32_t start, int32_t end) override {
+    fillWindowBits(words, start, end);
+  }
+
   void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                       int32_t windowEnd) override {
     assert(windowStart >= 0 && windowEnd >= windowStart && windowEnd <= maxDoc);
@@ -249,6 +273,10 @@ class DocSetSupplier final : public Query::ScorerSupplier {
     }
 
   public:
+    [[gnu::cold]] bool supportsReset() const noexcept override {
+      return unscoredResetUse();
+    }
+
     Plan(DocSetSupplier& supplier,
          const Query::PlanContext& planContext,
          const Query::ScorerShape& shape, int64_t cost)
@@ -292,7 +320,6 @@ public:
 
   BulkPlan planBulk(
       BulkUse use, const BulkScorerContext& bulkContext) override {
-    unused(use);
     if (bulkContext.requireConstantCount) {
       return {
         BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
@@ -301,12 +328,16 @@ public:
     }
     bool available = cost() != 0
         && !bulkContext.requireFilterConsumption;
-    return {
+    BulkPlan plan{
       available ? BulkAnswer::YES : BulkAnswer::NO,
       available ? BulkAnswer::YES : BulkAnswer::NO,
       BulkAnswer::NO,
       BulkAnswer::NO,
     };
+    if (available && isMembershipWindowUse(use)) {
+      plan.statelessReposition = BulkAnswer::YES;
+    }
+    return plan;
   }
 
   BulkScorer* buildBulk(
@@ -417,6 +448,10 @@ public:
   }
 
   int64_t cost() override { return delegate->cost(); }
+
+  MembershipWork membershipWork(int32_t maxDoc) override {
+    return delegate->membershipWork(maxDoc);
+  }
 
   Query::ScorerShape describeScorer(
       const Query::PlanContext& buildContext) const override {
@@ -901,6 +936,14 @@ public:
         AcceptedExistingTag{}, cacheUse, std::move(lifetime), consumer);
   }
 
+  void releaseSegmentState(IndexReader::Segment& segment) const noexcept {
+    if (weight) weight->releaseSegmentState(segment);
+  }
+
+  bool hasReleasableSegmentState() const noexcept {
+    return weight && weight->hasReleasableSegmentState();
+  }
+
   bool empty() const { return source == Source::EMPTY; }
   bool hasCacheUse() const { return cacheUse != nullptr; }
   bool isTopKCount() const {
@@ -1292,6 +1335,18 @@ public:
     }
     sources.push_back({
         ExactDomainSource::Source::ACCEPTED_EXISTING, nullptr, &cacheUse});
+  }
+
+  void releaseSegmentState(IndexReader::Segment& segment) const noexcept {
+    for (const auto& source : sources) {
+      if (source.weight) source.weight->releaseSegmentState(segment);
+    }
+  }
+
+  bool hasReleasableSegmentState() const noexcept {
+    return std::ranges::any_of(sources, [](const auto& source) {
+      return source.weight && source.weight->hasReleasableSegmentState();
+    });
   }
 
   bool empty() const { return sources.empty(); }

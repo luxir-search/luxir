@@ -3,6 +3,7 @@
 
 #include "IndexReader.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/index/CommitSnapshot.h"
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/StoredFieldsReader.h"
@@ -14,6 +15,7 @@
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_index.hpp"
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <algorithm>
 #include <map>
 #include <memory_resource>
 #include <span>
@@ -126,16 +128,22 @@ IndexReader::IndexReader(Snapshot snapshot, std::shared_ptr<FilterCache> filterC
     core(std::move(snapshot.core)), sharedSchema(std::move(snapshot.schema)),
     sharedFilterCache(std::move(filterCache)) {}
 
-IndexReader::IndexReader(Directory& dir, IndexReader* previousReader,
-                         std::shared_ptr<FilterCache> filterCache, std::shared_ptr<Schema> schema,
-                         std::shared_ptr<const std::vector<std::byte>> manifest)
-  : IndexReader(openSnapshot(dir, previousReader, std::move(schema), std::move(manifest)),
+IndexReader::IndexReader(Directory& dir, const CommitSnapshot& snapshot, IndexReader* previousReader,
+                         std::shared_ptr<FilterCache> filterCache)
+  : IndexReader(openSnapshot(dir, previousReader, snapshot.schema, snapshot.bytes, snapshot.openReaders),
+                filterCache ? std::move(filterCache)
+                    : (previousReader ? previousReader->sharedFilterCache : nullptr)) {}
+
+IndexReader::IndexReader(Directory& dir, IndexReader* previousReader, std::shared_ptr<FilterCache> filterCache)
+  : IndexReader(openSnapshot(dir, previousReader, nullptr, nullptr),
                 filterCache ? std::move(filterCache)
                     : (previousReader ? previousReader->sharedFilterCache : nullptr)) {}
 
 IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReader* previousReader,
                                                 std::shared_ptr<Schema> preferredSchema,
-                                                std::shared_ptr<const std::vector<std::byte>> manifest) {
+                                                std::shared_ptr<const std::vector<std::byte>> manifest,
+                                                std::span<const std::weak_ptr<PostingsReader>> published) {
+  assert(published.empty() || manifest);  // aligned with that manifest's segments
   auto core = std::make_shared<PhysicalCore>();
   const auto* previous = previousReader ? previousReader->core.get() : nullptr;
   auto& segs = core->segs;
@@ -148,7 +156,6 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
   // because old segments could be merged away before we have a chance to read them, we need
   // to check if there is a new index info file and retry the open if so.
   // This could be optimized by saving the segments we did read properly in case they are still in the index.
-  // But we should really have a postings getter abstraction that can provide already opened readers and livedocs
   uint64_t lastCommitTime = 0;
   bool retry = false;
 
@@ -158,6 +165,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
   boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevAuxByName;
   boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevSegAuxByKey;
   if (previous) {
+    assert(previous->segmentFiles.size() == previous->segs.size());
     for (const auto& r : previous->auxReadersList) {
       prevAuxByName.emplace(std::string(r->getName()), r);
     }
@@ -210,7 +218,12 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
       for (const auto& segment : indexInfo.segments) {
         auto& files = core->segmentFiles.emplace_back();
         files.segId = segment.seg_id;
-        files.files = fromWire(segment.files);
+        std::string liveName = segment.live_gen == 0 ? std::string()
+            : Postings::getLiveDocsFileName(Postings::getSortableString(segment.seg_id), segment.live_gen);
+        for (const auto& file : segment.files) {
+          (file.name == liveName ? files.liveDocs : files.files)
+              .push_back({std::string(file.name), file.size, file.xxh3});
+        }
         for (const auto& overlay : segment.overlays) files.overlays.push_back(fromWire(overlay.files));
       }
       for (const auto& aux : indexInfo.aux_indexes) core->auxFiles.push_back(fromWire(aux.files));
@@ -235,12 +248,27 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         uint64_t segId = segment.seg_id;
         uint64_t liveGen = segment.live_gen;
         int32_t nDocs = segment.max_doc;
-        unused(nDocs);
+        const auto& files = core->segmentFiles[i];
 
-        // TODO: reuse PostingsReaders from the previous physical core on commit reopen.
-        // Also, to be more flexible, we should probably pass in a provider interface that can provide PostingsReaders and LiveDocs
-        // from other sources (like cached in IndexWriter, or from previous IndexReader).
-        auto postingsReader = PostingsReader::create(dir, segId, missingFileOK, true);
+        // Every holder of a physical segment shares one open PostingsReader.
+        // The publisher's (the writer's) comes first: it opened the segment for
+        // deletes, a merge or an overlay build, possibly while a reader opened
+        // it too, so preferring it converges all holders by the next reopen.
+        // Then the previous snapshot's, when the base files are identical (a
+        // delete or overlay commit leaves them unchanged); without descriptors
+        // the identity is unknown and nothing is shared. Live docs carry over
+        // when the generation's file is unchanged.
+        const Segment* prevSeg = previous ? previous->segment(segId) : nullptr;
+        const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
+        std::shared_ptr<PostingsReader> postingsReader;
+        if ((size_t)i < published.size()) {
+          postingsReader = published[i].lock();
+          if (postingsReader && postingsReader->maxDoc() != nDocs) postingsReader = nullptr;
+        }
+        if (!postingsReader && prevSeg && !files.files.empty() && prevFiles->files == files.files) {
+          postingsReader = prevSeg->sharedPostingsReader;
+        }
+        if (!postingsReader) postingsReader = PostingsReader::create(dir, segId, missingFileOK, true);
         if (!postingsReader) {
           // Failed to create PostingsReader (segment files not found) - trigger retry
           retry = true;
@@ -248,7 +276,10 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         }
 
         std::shared_ptr<LiveDocs> liveDocs;
-        if (liveGen > 0) {
+        if (liveGen > 0 && prevSeg && prevSeg->sharedLiveDocs && !files.liveDocs.empty()
+            && prevFiles->liveDocs == files.liveDocs) {
+          liveDocs = prevSeg->sharedLiveDocs;
+        } else if (liveGen > 0) {
           liveDocs = LiveDocs::create(dir, segId, liveGen, nDocs, missingFileOK, true);
           if (!liveDocs) {
             // Failed to create LiveDocs (delete file not found) - trigger retry
@@ -344,6 +375,10 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
   }
   while (retry);
 
+  core->segOrds.reserve(segs.size());
+  for (const auto& seg : segs) core->segOrds.emplace_back(seg.segInfo.seg_id, seg.ord);
+  std::ranges::sort(core->segOrds);
+
   // Check if we can share ordMaps from the previous reader
   if (previous && previous->coreGeneration == core->coreGeneration) {
     IREADER_DEBUG("Sharing ordMaps from previous IndexReader (coreGen={})", core->coreGeneration);
@@ -359,6 +394,11 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
 
 
+
+const Segment* IndexReader::PhysicalCore::segment(uint64_t segId) const {
+  auto it = std::ranges::lower_bound(segOrds, segId, {}, &std::pair<uint64_t, int32_t>::first);
+  return it != segOrds.end() && it->first == segId ? &segs[(size_t)it->second] : nullptr;
+}
 
 std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projectableFields() {
   std::call_once(projectableOnce, [this] {

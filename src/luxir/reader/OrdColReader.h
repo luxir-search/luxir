@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <span>
 #include <ranges>
 #include <string_view>
 #include <utility>
@@ -31,9 +32,6 @@ class OrdColReader {
 public:
   static constexpr uint32_t BLOCK_SIZE = OrdColumnFormat::BLOCK_SIZE;
   static constexpr uint32_t BULK_SIZE = OrdColumnFormat::BULK_SIZE;
-  // Four decode blocks are examined together to amortize loop overhead, but
-  // each 128-value block makes its own bulk-versus-point decision.
-  static constexpr int32_t ORD_BATCH_SIZE = (int32_t)BULK_SIZE * 4;
   // The measured point-to-bulk cost ratio spans 5.5x to 10x, putting the raw
   // 128-value crossover at 13-24 hits. Use the conservative end by default.
   static constexpr int32_t DEFAULT_BULK_MIN_HITS = 24;
@@ -69,11 +67,14 @@ private:
     return info;
   }
 
-  uint32_t valueAt(int64_t index) const {
+  uint32_t directValueAt(int64_t index) const {
     assert(index >= 0 && index < encodedValues());
-    if (format == SegFieldInfo::ORD_DIRECT) {
-      return LinearPack::select32(blocks, (uint64_t)index, bits, mask);
-    }
+    assert(format == SegFieldInfo::ORD_DIRECT);
+    return LinearPack::select32(blocks, (uint64_t)index, bits, mask);
+  }
+
+  uint32_t predictedValueAt(int64_t index) const {
+    assert(index >= 0 && index < encodedValues());
     assert(format == SegFieldInfo::ORD_PREDICTED);
     uint64_t block = (uint64_t)index / BLOCK_SIZE;
     uint32_t rankInBlock = (uint32_t)((uint64_t)index % BLOCK_SIZE);
@@ -84,6 +85,45 @@ private:
     int64_t value = OrdColumnFormat::predict(info, rankInBlock) + residual;
     assert(value >= 0 && value <= INT32_MAX);
     return (uint32_t)value;
+  }
+
+  uint32_t valueAt(int64_t index) const {
+    return format == SegFieldInfo::ORD_DIRECT ? directValueAt(index)
+                                              : predictedValueAt(index);
+  }
+
+  // Point-decodes each doc `visitDocs` hands its visitor (ascending, in a
+  // docid-indexed column) and keeps the docs with a value: docsOut and
+  // ordsOut get the present pairs in order, and their count is returned. The
+  // format dispatch sits outside the visit, and the loads do not depend on
+  // each other, so a sparse domain's column misses overlap.
+  template <class VisitDocs>
+  int32_t presentOrds(VisitDocs&& visitDocs, int32_t* docsOut,
+                      int32_t* ordsOut) const {
+    assert(indexing == SegFieldInfo::ORD_DOCID);
+    int32_t present = 0;
+    auto keep = [&](int32_t doc, uint32_t ord) LUXIR_INLINE {
+      assert(ord <= INT32_MAX);
+      docsOut[present] = doc;
+      ordsOut[present] = (int32_t)ord;
+      present += ord != 0;
+    };
+    if (format == SegFieldInfo::ORD_DIRECT) {
+      // Locals, not members: the output stores could alias the reader, which
+      // would reload the mask on every doc.
+      const char* base = blocks;
+      uint8_t width = bits;
+      uint32_t valueMask = mask;
+      visitDocs([&](int32_t doc) LUXIR_INLINE {
+        assert(doc >= 0 && doc < encodedValues());
+        keep(doc, LinearPack::select32(base, (uint64_t)doc, width, valueMask));
+      });
+    } else {
+      visitDocs([&](int32_t doc) LUXIR_INLINE {
+        keep(doc, predictedValueAt(doc));
+      });
+    }
+    return present;
   }
 
 public:
@@ -191,6 +231,51 @@ public:
     }
   };
 
+  // The `count` values from index `start`, a multiple of BULK_SIZE, in one
+  // bulk unpack (count <= BULK_SIZE).
+  void unpack(int64_t start, uint32_t count, uint32_t* out) const {
+    assert(start >= 0 && start % BULK_SIZE == 0 && count <= BULK_SIZE);
+    assert(start + count <= encodedValues());
+    if (format == SegFieldInfo::ORD_DIRECT) {
+      LinearPack::unpack128(blocks, (uint64_t)start, count, bits, mask, out);
+      return;
+    }
+    uint64_t block = (uint64_t)start / BLOCK_SIZE;
+    uint32_t rankInBlock = (uint32_t)((uint64_t)start % BLOCK_SIZE);
+    PredictedBlockInfo info = blockInfo(block);
+    LinearPack::unpack128(blocks + info.payloadOffset, rankInBlock, count,
+                          info.bits, LinearPack::mask32(info.bits), out);
+    for (uint32_t i = 0; i < count; i++) {
+      int64_t value = OrdColumnFormat::predict(info, rankInBlock + i) + out[i];
+      assert(value >= 0 && value <= INT32_MAX);
+      out[i] = (uint32_t)value;
+    }
+  }
+
+  // presentOrds over ascending `docs`.
+  int32_t presentOrdsAt(std::span<const int32_t> docs, int32_t* docsOut,
+                        int32_t* ordsOut) const {
+    return presentOrds([&](auto&& visit) LUXIR_INLINE {
+      for (int32_t doc : docs) visit(doc);
+    }, docsOut, ordsOut);
+  }
+
+  // presentOrds over the docs set in `words`, where bit i of words[w] is doc
+  // docBase + 64 * w + i: the bit scan feeds the decode directly, with no
+  // list of docs in between.
+  int32_t presentOrdsAtBits(std::span<const uint64_t> words, int32_t docBase,
+                            int32_t* docsOut, int32_t* ordsOut) const {
+    return presentOrds([&](auto&& visit) LUXIR_INLINE {
+      for (size_t w = 0; w < words.size(); w++) {
+        int32_t wordBase = docBase + (int32_t)(w * 64);
+        for (uint64_t bitsLeft = words[w]; bitsLeft != 0;
+             bitsLeft &= bitsLeft - 1) {
+          visit(wordBase + std::countr_zero(bitsLeft));
+        }
+      }
+    }, docsOut, ordsOut);
+  }
+
   class BulkOrds {
     const OrdColReader& col;
     int64_t decodedStart = -1;
@@ -200,22 +285,7 @@ public:
     void decode(int64_t index) {
       decodedStart = (index / BULK_SIZE) * BULK_SIZE;
       decodedEnd = std::min(decodedStart + BULK_SIZE, col.encodedValues());
-      uint32_t count = (uint32_t)(decodedEnd - decodedStart);
-      if (col.format == SegFieldInfo::ORD_DIRECT) {
-        LinearPack::unpack128(col.blocks, (uint64_t)decodedStart, count,
-                              col.bits, col.mask, decoded);
-        return;
-      }
-      uint64_t block = (uint64_t)decodedStart / BLOCK_SIZE;
-      uint32_t rankInBlock = (uint32_t)((uint64_t)decodedStart % BLOCK_SIZE);
-      PredictedBlockInfo info = col.blockInfo(block);
-      LinearPack::unpack128(col.blocks + info.payloadOffset, rankInBlock, count,
-                            info.bits, LinearPack::mask32(info.bits), decoded);
-      for (uint32_t i = 0; i < count; i++) {
-        int64_t value = OrdColumnFormat::predict(info, rankInBlock + i) + decoded[i];
-        assert(value >= 0 && value <= INT32_MAX);
-        decoded[i] = (uint32_t)value;
-      }
+      col.unpack(decodedStart, (uint32_t)(decodedEnd - decodedStart), decoded);
     }
 
   public:
@@ -229,90 +299,6 @@ public:
       return (int32_t)ord;
     }
   };
-
-private:
-  static uint64_t lowBitsMask(int32_t bits) {
-    assert(bits >= 0 && bits <= 64);
-    if (bits == 0) return 0;
-    if (bits == 64) return ~0ULL;
-    return (1ULL << bits) - 1;
-  }
-
-  // invertMask (0 or ~0ULL) XORs each domain word before use, so the same walk
-  // serves a domain and its complement. The window mask is applied after the
-  // inversion, so inverted garbage past maxDoc is never visited.
-  static uint64_t windowWord(const screaming::FixedBitSet& domainBits,
-                             int32_t word,
-                             int32_t windowEnd, uint64_t invertMask) {
-    uint64_t bits = domainBits.words[word] ^ invertMask;
-    int32_t validBits = windowEnd - (word << 6);
-    if (validBits < 64) bits &= lowBitsMask(validBits);
-    return bits;
-  }
-
-  static void visitSetBits(const screaming::FixedBitSet& domainBits,
-                           int32_t windowStart, int32_t windowEnd,
-                           uint64_t invertMask, auto&& visitor) {
-    int32_t wordStart = windowStart >> 6;
-    int32_t wordEnd = (windowEnd + 63) >> 6;
-    for (int32_t word = wordStart; word < wordEnd; word++) {
-      uint64_t bits = windowWord(domainBits, word, windowEnd, invertMask);
-      int32_t docBase = word << 6;
-      while (bits != 0) {
-        int32_t bit = (int32_t)std::countr_zero(bits);
-        visitor(docBase + bit);
-        bits &= bits - 1;
-      }
-    }
-  }
-
-  static bool bulkBlock(int32_t cardinality, int32_t blockBits,
-                        int32_t bulkMinHits) {
-    return (int64_t)cardinality * BULK_SIZE
-        >= (int64_t)bulkMinHits * blockBits;
-  }
-
-  void forEachPointOrd(auto&& visitDocs, int64_t& missing_num,
-                       auto&& callback, ForEachOrdStats* stats) const {
-    PointOrds values(*this);
-    if (indexing == SegFieldInfo::ORD_DOCID) {
-      assert(!multi);
-      visitDocs([&](int32_t docid) {
-        int32_t ord = values.valueAt(docid);
-        if (stats) stats->pointLoads++;
-        if (ord != 0) callback(docid, ord);
-        else missing_num++;
-      });
-      return;
-    }
-
-    screaming::BitSet::Iterator docsIter(docs.bitset());
-    bool dense = !docs.hasBitset();
-    int32_t found = -1;
-    visitDocs([&](int32_t docid) {
-      int32_t docRank;
-      if (dense) {
-        docRank = docid;
-      } else {
-        if (found < docid) found = docsIter.advance(docid);
-        if (found != docid) {
-          missing_num++;
-          return;
-        }
-        docRank = docsIter.rank();
-      }
-      if (!multi) {
-        callback(docid, values.valueAt(docRank));
-        if (stats) stats->pointLoads++;
-        return;
-      }
-      auto [start, end] = getStartEndValueRank(docRank);
-      for (int64_t rank = start; rank < end; rank++) {
-        callback(docid, values.valueAt(rank));
-        if (stats) stats->pointLoads++;
-      }
-    });
-  }
 
 public:
   static int32_t configuredBulkMinHits() {
@@ -341,95 +327,10 @@ public:
     return bulkMinHitsOverride.exchange(value);
   }
 
-  void forEachOrd(std::span<int32_t> domainDocs, int64_t& missing_num,
-                  auto&& callback, ForEachOrdStats* stats = nullptr) const {
-    forEachPointOrd(
-        [&](auto&& visitor) {
-          for (int32_t docid : domainDocs) visitor(docid);
-        },
-        missing_num, callback, stats);
-  }
-
-  // invertMask ~0ULL walks the domain's complement without materializing a
-  // second bitset; the adaptive bulk/point decisions see complement
-  // cardinalities through the same inverted word reads.
-  void LUXIR_NOINLINE forEachDocIdBitOrd(
-      const screaming::FixedBitSet& domainBits, int32_t maxDoc,
-      int32_t bulkMinHits, int64_t& missing_num,
-      auto&& callback, ForEachOrdStats* stats = nullptr,
-      uint64_t invertMask = 0) const {
-    assert(maxDoc == maxdoc);
-    assert(bulkMinHits >= 0 && bulkMinHits <= (int32_t)BULK_SIZE);
-    assert(domainBits.size() >= maxDoc);
-    assert(indexing == SegFieldInfo::ORD_DOCID);
-    assert(!multi);
-    PointOrds pointValues(*this);
-    BulkOrds bulkValues(*this);
-    auto visitRange = [&](int32_t start, int32_t end, bool useBulk) {
-      visitSetBits(domainBits, start, end, invertMask, [&](int32_t docid) {
-        int32_t ord = useBulk
-            ? bulkValues.valueAt(docid) : pointValues.valueAt(docid);
-        if (stats) {
-          if (useBulk) stats->bulkLoads++;
-          else stats->pointLoads++;
-        }
-        if (ord != 0) callback(docid, ord);
-        else missing_num++;
-      });
-    };
-
-    for (int32_t batchStart = 0; batchStart < maxDoc;
-         batchStart += ORD_BATCH_SIZE) {
-      int32_t batchEnd = std::min(batchStart + ORD_BATCH_SIZE, maxDoc);
-      std::array<int32_t, 4> cardinalities{};
-      std::array<int32_t, 4> blockEnds;
-      std::array<bool, 4> useBulk;
-      int32_t wordStart = batchStart >> 6;
-      int32_t wordEnd = (batchEnd + 63) >> 6;
-      for (int32_t word = wordStart; word < wordEnd; word++) {
-        cardinalities[(word - wordStart) >> 1] += (int32_t)std::popcount(
-            windowWord(domainBits, word, batchEnd, invertMask));
-      }
-      int32_t nonemptyBlocks = 0;
-      int32_t bulkBlocks = 0;
-      for (int32_t i = 0; i < 4; i++) {
-        int32_t blockStart = batchStart + i * (int32_t)BULK_SIZE;
-        int32_t blockEnd = std::min(
-            blockStart + (int32_t)BULK_SIZE, batchEnd);
-        blockEnds[i] = blockEnd;
-        if (blockStart >= batchEnd) {
-          useBulk[i] = false;
-          continue;
-        }
-        int32_t cardinality = cardinalities[i];
-        useBulk[i] = cardinality != 0 && bulkBlock(
-            cardinality, blockEnd - blockStart, bulkMinHits);
-        if (cardinality != 0) {
-          nonemptyBlocks++;
-          if (useBulk[i]) bulkBlocks++;
-        }
-      }
-
-      if (stats) {
-        stats->bulkBlocks += bulkBlocks;
-        stats->pointBlocks += nonemptyBlocks - bulkBlocks;
-      }
-      if (bulkBlocks == 0) {
-        visitRange(batchStart, batchEnd, false);
-        continue;
-      }
-      if (bulkBlocks == nonemptyBlocks) {
-        visitRange(batchStart, batchEnd, true);
-        continue;
-      }
-
-      for (int32_t i = 0; i < 4; i++) {
-        int32_t blockStart = batchStart + i * (int32_t)BULK_SIZE;
-        int32_t blockEnd = blockEnds[i];
-        if (blockStart >= blockEnd) break;
-        visitRange(blockStart, blockEnd, useBulk[i]);
-      }
-    }
+  // Whether `hits` docs of a `span`-doc block (span <= BULK_SIZE; a tail
+  // block is shorter) decode cheaper with one bulk unpack than by point.
+  static bool bulkBlock(int32_t hits, int32_t span, int32_t bulkMinHits) {
+    return (int64_t)hits * BULK_SIZE >= (int64_t)bulkMinHits * span;
   }
 
   class Iterator {

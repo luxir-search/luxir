@@ -27,6 +27,191 @@ namespace luxir {
 
 class FieldComparator {
 public:
+  struct RankedLeaf {
+    int64_t leaf;
+    int64_t bound;
+  };
+
+  // One segment's primary sort keys as a planner sees them, in a
+  // comparator's transformed key space (smaller is better; descending keys
+  // are ~value): the leaves in bound order, and how the keys of the
+  // column's values inside a value envelope are distributed (the column's
+  // value sketch, NumColumnFormat::ValueSketch). A view over the mapped
+  // column, so a planner can hold one per segment.
+  class SegmentKeys {
+    NumColumnFormat::LeafMeta leaves;
+    bool descending = false;
+    // The envelope, in values, and the sketch's count of values below it
+    // and inside it.
+    int64_t lo = std::numeric_limits<int64_t>::min();
+    int64_t hi = std::numeric_limits<int64_t>::max();
+    double below = 0;
+    double inside = 0;
+
+    const NumColumnFormat::ValueSketch& sketch() const {
+      return leaves.valueSketch();
+    }
+
+    double atOrBelow(int64_t v) const {
+      return v == std::numeric_limits<int64_t>::max()
+          ? (double)sketch().values() : sketch().countBelow(v + 1);
+    }
+
+  public:
+    SegmentKeys(const NumColumnFormat::LeafMeta& leaves, bool descending,
+                std::optional<Query::ValueEnvelope> envelope)
+        : leaves(leaves), descending(descending) {
+      if (envelope.has_value()) {
+        lo = envelope->lo;
+        hi = envelope->hi;
+      }
+      if (sketch().empty() || lo > hi) return;
+      below = sketch().countBelow(lo);
+      inside = std::max(0.0, atOrBelow(hi) - below);
+    }
+
+    int64_t leafCount() const { return leaves.numLeafZones(); }
+
+    int64_t leafBestKey(int64_t leaf) const {
+      NumBlockZone zone = leaves.leafZone(leaf);
+      return descending ? ~zone.max : zone.min;
+    }
+
+    bool leafIntersectsValues(int64_t leaf) const {
+      NumBlockZone zone = leaves.leafZone(leaf);
+      return lo <= hi && zone.max >= lo && zone.min <= hi;
+    }
+
+    // The leaf at `rank` of bound order (boundOrderLeaf), without its bound.
+    int64_t leafAt(int64_t rank) const {
+      return descending ? leaves.leafByMaxDescending(rank)
+                        : leaves.leafByMinAscending(rank);
+    }
+
+    // The leaf at `rank` ascending by (leafBestKey, leaf), with that bound:
+    // the column persists both directions' orders, and descending zone.max
+    // with ties by leaf is ascending (~max, leaf).
+    RankedLeaf boundOrderLeaf(int64_t rank) const {
+      int64_t leaf = leafAt(rank);
+      return {leaf, leafBestKey(leaf)};
+    }
+
+    // How much later in doc order the best keys sit than the worst: the
+    // mean leaf of the kTrendLeaves best-bounded leaves less that of the
+    // kTrendLeaves worst, over the most it could be. Near 1 for keys that
+    // improve with doc order sorted newest first (time-ordered keys), near
+    // -1 sorted oldest first, and 0 +- 0.08 for keys in random order. Both
+    // ends of the persisted order are contiguous: a few cache lines.
+    static constexpr int64_t kTrendLeaves = 32;
+    double docOrderTrend() const {
+      int64_t n = leafCount();
+      int64_t m = std::min(kTrendLeaves, n / 2);
+      if (m == 0) return 0;
+      int64_t sum = 0;
+      for (int64_t r = 0; r < m; r++) sum += leafAt(r) - leafAt(n - 1 - r);
+      return (double)sum / (double)(m * (n - m));
+    }
+
+    // Leaves bounded strictly before `key`: a prefix of bound order,
+    // galloped from its head (most prefixes a top-k asks about are short).
+    int64_t leavesBoundedBefore(int64_t key) const {
+      int64_t n = leafCount();
+      int64_t lo = 0;
+      int64_t probe = 0;
+      while (probe < n && boundOrderLeaf(probe).bound < key) {
+        lo = probe + 1;
+        probe = 2 * probe + 1;
+      }
+      int64_t hi = std::min(probe, n);
+      while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (boundOrderLeaf(mid).bound < key) lo = mid + 1;
+        else hi = mid;
+      }
+      return lo;
+    }
+
+    // Leaves bounded at or before `key`.
+    int64_t leavesBoundedAtOrBefore(int64_t key) const {
+      return key == std::numeric_limits<int64_t>::max()
+          ? leafCount() : leavesBoundedBefore(key + 1);
+    }
+
+    // The envelope's best edge as a key: every value inside the envelope
+    // keys at or past it, so no leaf bounded before it can be proven out.
+    int64_t keyFloor() const { return descending ? ~hi : lo; }
+
+    // Leaves holding no value inside the envelope, on its best side (their
+    // every key is before keyFloor, so bound order visits them first) and on
+    // its worst side: zones wholly below lo or wholly above hi. With no
+    // envelope, none. No domain doc lies in either.
+    struct Outside {
+      int64_t best = 0;
+      int64_t worst = 0;
+    };
+    Outside leavesOutside() const {
+      Outside out;
+      int64_t n = leafCount();
+      if (lo > hi) return {n, 0};
+      // Leaves whose max reaches lo are a prefix of the max-descending
+      // order, and leaves whose min reaches no further than hi a prefix of
+      // the min-ascending one.
+      auto prefix = [&](auto&& keep) {
+        int64_t a = 0;
+        int64_t b = n;
+        while (a < b) {
+          int64_t mid = a + (b - a) / 2;
+          if (keep(mid)) a = mid + 1;
+          else b = mid;
+        }
+        return a;
+      };
+      int64_t below = lo == std::numeric_limits<int64_t>::min() ? 0
+          : n - prefix([&](int64_t r) {
+              return leaves.leafZone(leaves.leafByMaxDescending(r)).max >= lo;
+            });
+      int64_t above = hi == std::numeric_limits<int64_t>::max() ? 0
+          : n - prefix([&](int64_t r) {
+              return leaves.leafZone(leaves.leafByMinAscending(r)).min <= hi;
+            });
+      out.best = descending ? above : below;
+      out.worst = descending ? below : above;
+      return out;
+    }
+
+    // Expected number of the segment's values inside the envelope.
+    double values() const { return inside; }
+
+    // Expected fraction of the in-envelope values keyed strictly before
+    // `key`.
+    double fractionBefore(int64_t key) const {
+      if (inside <= 0) return 0;
+      double before;
+      if (!descending) {
+        if (key <= lo) return 0;
+        before = key > hi ? inside : sketch().countBelow(key) - below;
+      } else {
+        // key < x for value v means v > ~x.
+        int64_t value = ~key;
+        if (value >= hi) return 0;
+        before = value < lo ? inside : below + inside - atOrBelow(value);
+      }
+      return std::clamp(before / inside, 0.0, 1.0);
+    }
+
+    // The key of the in-envelope value ranked `fraction` of the way from
+    // the best: the last of the best fraction * values() (the best one when
+    // that is under one value). Requires values() > 0.
+    int64_t keyAt(double fraction) const {
+      assert(inside > 0);
+      double offset = std::max(0.0, std::clamp(fraction, 0.0, 1.0) * inside - 1);
+      if (!descending) {
+        return std::clamp(sketch().valueAt(below + offset), lo, hi);
+      }
+      return ~std::clamp(sketch().valueAt(below + inside - 1 - offset), lo, hi);
+    }
+  };
+
   // Optional batch sort-key capability for comparators whose complete sort
   // order is an ascending transformed int64 key. Valid for the current segment
   // only; setSegment resets its cursors. Implementations must not depend on
@@ -49,7 +234,10 @@ public:
     // coarse level; leaves nest exactly in coarse blocks) refines the same
     // contract at leaf granularity: leafBestKey(l) lower-bounds every doc in
     // leaf l. Coarse bounds are the min over their leaves, so a coarse skip
-    // proves every child skips.
+    // proves every child skips. With leaves comes their bound order:
+    // boundOrderLeaf(r) is the leaf at rank r ascending by (leafBestKey,
+    // leaf), with that bound - for every r < leafBlockCount().
+    using RankedLeaf = FieldComparator::RankedLeaf;
     virtual int32_t keyBlockSize() const { return 0; }
     virtual int64_t keyBlockCount() const { return 0; }
     virtual int64_t blockBestKey(int64_t block) const {
@@ -63,6 +251,22 @@ public:
       unused(leaf);
       assert(false);
       return std::numeric_limits<int64_t>::min();
+    }
+    virtual RankedLeaf boundOrderLeaf(int64_t rank) const {
+      unused(rank);
+      assert(false);
+      return {0, std::numeric_limits<int64_t>::min()};
+    }
+
+    // The segment's keys (SegmentKeys) for docs whose values lie inside
+    // `values` (Query::requiredValueEnvelope; none: every value), offered
+    // with the leaf bounds. nullopt when there are none, or when a doc's key
+    // need not come from a value inside the envelope (a multi-valued column
+    // keys on its first stored value while a predicate matches any value).
+    virtual std::optional<SegmentKeys> segmentKeys(
+        std::optional<Query::ValueEnvelope> values) const {
+      unused(values);
+      return std::nullopt;
     }
 
     // Order-independent fused leaf gather: extract one leaf's in-domain docs
@@ -126,11 +330,19 @@ public:
   // segdoc(segment, doc) >= segdoc(segment, from). The boundary (equal to
   // bottom) term is excluded only for a sole-clause sort with an exact
   // bottom whose segdoc tie-break every remaining doc loses.
+  //
+  // The interval is anchored at the sort's best end: lo == 1 ascending,
+  // hi == nTerms descending. Within a segment only the other end moves, and
+  // only toward the anchor: the bottom only improves, and the boundary
+  // exclusion, once earned, holds for every later bottom (one with the same
+  // term has an earlier segdoc).
   enum class OrdIntervalStatus { UNSUPPORTED, PENDING, READY };
   struct CompetitiveOrdState {
     int64_t lo = 0;
     int64_t hi = -1;
     int64_t nTerms = 0;
+    // The anchored end: hi when descending, lo otherwise.
+    bool descending = false;
     PostingsReader* postingsReader = nullptr;
     const SegFieldInfo* fieldInfo = nullptr;
   };
@@ -172,6 +384,14 @@ class SimpleNumericFieldComparator : public FieldComparator,
   int32_t landedDoc = -1;
   int32_t landedRank = -1;
   bool multiValued = false;
+  // Bound order and leaf bounds (no envelope), when keyBlockSize() offers
+  // leaves.
+  std::optional<SegmentKeys> leaves;
+
+  const SegmentKeys& leafKeys() const {
+    assert(leaves.has_value());
+    return *leaves;
+  }
 
   int64_t transformPresent(int64_t value) const {
     return sortMultiplier < 0 ? ~value : value;
@@ -267,6 +487,7 @@ public:
     pointValues.reset();
     docsIter.reset();
     reader.reset();
+    leaves.reset();
     multiValued = false;
     decodedStart = -1;
     decodedEnd = -1;
@@ -288,6 +509,9 @@ public:
         if (!reader->denseDocsWithValue()) {
           docsIter.emplace(reader->docsWithValueBitSet());
         }
+        if (keyBlockSize() != 0) {
+          leaves.emplace(reader->leafMeta(), sortMultiplier < 0, std::nullopt);
+        }
       }
     }
   }
@@ -306,7 +530,7 @@ public:
   // zone maps are exact per-doc-block key bounds. Sparse and multi-valued
   // columns mix ranks and docs, so no bounds are offered there.
   int32_t keyBlockSize() const override {
-    if (!reader.has_value() || multiValued || docsIter.has_value()) return 0;
+    if (!reader.has_value() || !reader->leafBounded()) return 0;
     return (int32_t)NumColumnFormat::BLOCK_SIZE;
   }
 
@@ -342,8 +566,20 @@ public:
   }
 
   int64_t leafBestKey(int64_t leaf) const override {
-    NumBlockZone zone = reader->leafZone(leaf);
-    return sortMultiplier < 0 ? ~zone.max : zone.min;
+    return leafKeys().leafBestKey(leaf);
+  }
+
+  FieldComparator::RankedLeaf boundOrderLeaf(int64_t rank) const override {
+    return leafKeys().boundOrderLeaf(rank);
+  }
+
+  // Envelope bounds are inclusive encoded values, the same encoding the
+  // column stores (FLOAT/DOUBLE sortable bits included). A missing value
+  // never satisfies an envelope, so the missing substitute plays no part.
+  std::optional<SegmentKeys> segmentKeys(
+      std::optional<Query::ValueEnvelope> values) const override {
+    if (keyBlockSize() == 0) return std::nullopt;
+    return SegmentKeys(reader->leafMeta(), sortMultiplier < 0, values);
   }
 
   // Dense single-valued only: doc == value rank and no forward-only landing
@@ -417,24 +653,26 @@ public:
     return out;
   }
 
-  virtual int64_t getDocValue(int32_t docid) {
+  int64_t getDocValue(int32_t docid) {
     if (!iter.has_value()) {
       return missingValueSubstitute;
     }
 
-    if (iter->docId() < docid) {
-      iter->advance(docid);
-    }
-    if (iter->docId() > docid) {
-      return missingValueSubstitute;
+    // Dense presence maps doc ids directly to value ordinals. Avoid moving
+    // a presence cursor for each lookup; the value decoder caches by ordinal.
+    int32_t rank = docid;
+    if (docsIter.has_value()) {
+      if (iter->docId() < docid) iter->advance(docid);
+      if (iter->docId() > docid) return missingValueSubstitute;
+      rank = iter->rank();
     }
     // Multi-valued numeric columns store per-doc values unsorted, so the
     // cheap deterministic sort key is the FIRST stored value (storage order).
     // min/max over unsorted values would scan every value per doc; callers
     // that want that spell it explicitly (min(f)/max(f) sort expressions).
     int64_t value = multiValued
-        ? iter->values().valueAt(reader->getStartValueRank(iter->rank()))
-        : iter->value();
+        ? iter->values().valueAt(reader->getStartValueRank(rank))
+        : iter->values().valueAt(rank);
     // For descending sort, negate the value.
     // if we wanted to make this branchless, we could have a an adder and multiplier
     // but this will be a predictable branch anyway.
@@ -619,6 +857,7 @@ public:
       out.hi = segmentMapping.numOrds;
     }
     out.nTerms = segmentMapping.numOrds;
+    out.descending = sortMultiplier < 0;
     out.postingsReader = postingsReader;
     out.fieldInfo = &fieldInfo;
     return OrdIntervalStatus::READY;
@@ -828,6 +1067,7 @@ public:
       out.hi = nTerms;
     }
     out.nTerms = nTerms;
+    out.descending = sortMultiplier < 0;
     out.postingsReader = postingsReader;
     out.fieldInfo = &fieldInfo;
     return OrdIntervalStatus::READY;

@@ -38,6 +38,11 @@ public:
     child->validateLogical(context, multiplier);
   }
 
+  std::optional<ValueEnvelope> requiredValueEnvelope(
+      std::string_view field) const override {
+    return child->requiredValueEnvelope(field);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
@@ -69,6 +74,10 @@ public:
           Query::SupplierExecutionMode executionMode) override {
         return child.segmentSource().scorerSupplier(
             targetPool, segment, executionMode);
+      }
+
+      void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+        child.releaseSegmentState(segment);
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {
@@ -107,6 +116,14 @@ public:
         Query::SupplierExecutionMode executionMode) override {
       return childWeight->scorerSupplier(
           targetPool, segment, executionMode);
+    }
+
+    void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+      childWeight->releaseSegmentState(segment);
+    }
+
+    bool hasReleasableSegmentState() const noexcept override {
+      return childWeight->hasReleasableSegmentState();
     }
 
     std::optional<int64_t> constantCount(

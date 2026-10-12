@@ -58,6 +58,10 @@ public:
       assert(docs.hasBitset());
     }
 
+    [[gnu::cold]] void reset() override {
+      iterator.reset();
+    }
+
     int32_t next() override {
       return iterator.next();
     }
@@ -68,6 +72,23 @@ public:
     }
 
     int32_t docId() override { return iterator.val(); }
+
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t min, int32_t max) override {
+      fillWindowBits(words, min, max);
+    }
+
+    void fillWindowBits(std::span<uint64_t> words, int32_t min,
+                        int32_t max) override {
+      if (min >= max) return;
+      int32_t doc = iterator.val();
+      if (doc < min) doc = iterator.advance(min);
+      while (doc < max) {
+        int32_t bit = doc - min;
+        words[(size_t)bit >> 6] |= 1ULL << (bit & 63);
+        doc = iterator.next();
+      }
+    }
   };
 
   class Weight final : public Query::Weight {
@@ -107,6 +128,7 @@ public:
       IndexReader::Segment& segment;
       SegFieldInfo& fieldInfo;
       float constantScore;
+      bool needsScores;
 
       class Plan final : public Query::ScorerPlan {
         Supplier& supplier;
@@ -124,21 +146,30 @@ public:
         }
 
       public:
+        [[gnu::cold]] bool supportsReset() const noexcept override {
+          return unscoredResetUse() && !supplier.needsScores;
+        }
+
         Plan(Supplier& supplier,
              const Query::PlanContext& planContext,
              const Query::ScorerShape& shape, int64_t cost)
-          : Query::ScorerPlan(
-                planContext, shape, cost),
+          : Query::ScorerPlan(planContext, shape, cost),
             supplier(supplier) {}
       };
 
     public:
       Supplier(IndexReader::Segment& segment, SegFieldInfo& fieldInfo,
-               float constantScore)
+               float constantScore, bool needsScores)
           : segment(segment), fieldInfo(fieldInfo),
-            constantScore(constantScore) {}
+            constantScore(constantScore), needsScores(needsScores) {}
 
       int64_t cost() override { return fieldInfo.docsWithField; }
+
+      MembershipWork membershipWork(int32_t maxDoc) override {
+        unused(maxDoc);
+        double matches = (double)cost();
+        return {matches, 4 * matches, 0, 32, 64};
+      }
 
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
@@ -189,7 +220,7 @@ public:
       unused(executionMode);
       SegFieldInfo* info = segmentInfo(segment);
       if (info == nullptr || info->docsWithField == 0) return nullptr;
-      return targetPool.make<Supplier>(segment, *info, constantScore);
+      return targetPool.make<Supplier>(segment, *info, constantScore, needsScores());
     }
 
     Query::Scorer* createScorer(

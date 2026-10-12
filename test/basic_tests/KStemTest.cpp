@@ -99,7 +99,7 @@ TEST_F(KStemTest, passThroughAndLengthLimits) {
 }
 
 TEST_F(KStemTest, sharedDictionaryAndNoTokenAllocations) {
-  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter disabled under ASan";
+  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter needs jemalloc or a sanitizer";
   KStemmer warm;
   warm.stem("ponies");
   size_t bytes = 0;
@@ -113,7 +113,7 @@ TEST_F(KStemTest, sharedDictionaryAndNoTokenAllocations) {
     bytes += stemmer.stem<true>("american's").size();
     bytes += stemmer.stem<true>("ponies\xe2\x80\x99s").size();
   }
-  long allocs = scope.count();
-  EXPECT_EQ(0, allocs);
+  long allocated = scope.bytes();
+  EXPECT_EQ(0, allocated);
   EXPECT_GT(bytes, 0u);
 }

@@ -10,12 +10,33 @@ namespace luxir {
 
 void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snapshot,
                                      std::shared_ptr<IndexReader> opened) {
-  // No reservation lock: a large acquire or slow file open cannot stall publication.
-  if (opened) readers.installOpened(snapshot, std::move(opened));
-  else readers.install(snapshot);
-  try { if (onPublish) onPublish(*snapshot); }
-  catch (const std::exception& e) { LOG_ERROR("Snapshot observer failed: {}", e.what()); }
-  catch (...) { LOG_ERROR("Snapshot observer failed"); }
+  // No pin lock: a large acquire or slow file open cannot stall publication.
+  readers.publish(std::move(snapshot), std::move(opened));
+  notifyChange();
+}
+
+void CommitSnapshotRegistry::commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened) {
+  auto previous = this->snapshot();
+  Manifest::commit(dir, snapshot->id.index_gen, *snapshot->bytes);
+  Signal::emit("snapshotRootDurable", this);
+  publish(snapshot, std::move(opened));
+  // Best-effort: obsolete names that reappear after a crash are unreferenced.
+  try {
+    if (previous) {
+      auto names = obsoleteFiles(*previous, *snapshot);
+      if (previous->id.index_gen != snapshot->id.index_gen) names.push_back(Manifest::name(previous->id.index_gen));
+      retire(names);
+    }
+  } catch (const std::exception& e) { LOG_WARN("Snapshot retirement failed: {}", e.what()); }
+}
+
+void CommitSnapshotRegistry::notifyChange() noexcept {
+  if (onChange) onChange();
+}
+
+void CommitSnapshotRegistry::fail() noexcept {
+  close();
+  notifyChange();
 }
 
 void CommitSnapshotRegistry::openLocalSnapshot() {
@@ -80,28 +101,28 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::acquire(std::stop_
   auto cleanup = scope_guard([&] { unlink(retired); });
   std::lock_guard lock(mutex);
   expireLocked(retired);
-  auto commit = current.load();
+  auto commit = snapshot();
   if (closed || !commit) throw SnapshotExpiredError();
-  if (auto it = reservations.find(commit->id); it != reservations.end()) {
+  if (auto it = pins.find(commit->id); it != pins.end()) {
     it->second.lastRead = now();
     if (cancellation) *cancellation = it->second.cancellation.get_token();
     return commit;
   }
   auto time = now();
-  Reservation reservation{commit, {}, time, time, {}};
-  if (cancellation) *cancellation = reservation.cancellation.get_token();
+  Pin pin{commit, {}, time, time, {}};
+  if (cancellation) *cancellation = pin.cancellation.get_token();
   size_t added = 0;
   try {
-    // Transfer lookup belongs to the reservation, so local publications pay
+    // Transfer lookup belongs to the pin, so local publications pay
     // nothing for it. Views borrow immutable names from its owning snapshot.
-    reservation.fileNames.reserve(commit->files.size());
+    pin.files.reserve(commit->files.size());
     for (const auto& file : commit->files) {
-      reservation.fileNames.insert(file.name);
+      pin.files.emplace(file.name, &file);
       auto [it, inserted] = files.try_emplace(file.name, FileRef{file.size});
       it->second.pins++;
       added++;
     }
-    reservations.emplace(commit->id, std::move(reservation));
+    pins.emplace(commit->id, std::move(pin));
   } catch (...) {
     for (size_t i = 0; i < added; i++) {
       auto it = files.find(commit->files[i].name);
@@ -113,37 +134,61 @@ std::shared_ptr<const CommitSnapshot> CommitSnapshotRegistry::acquire(std::stop_
 }
 
 std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, std::string_view name, std::stop_token* cancellation) {
-  struct ReservedFile {
+  struct PinnedFile {
     std::shared_ptr<InputFile> file;
-    std::shared_ptr<Reservation::OpenFiles> lease;
+    std::shared_ptr<Pin::OpenFiles> lease;
   };
-  auto owner = std::make_shared<ReservedFile>();
+  auto owner = std::make_shared<PinnedFile>();
   // Validate against revocation before opening; eviction may then revoke the
-  // reservation, but cannot unlink until this in-flight open owns its file.
+  // pin, but cannot unlink until this in-flight open owns its file.
   std::lock_guard retirementLock(retirementMutex);
   std::vector<std::string> retired;
   auto cleanup = scope_guard([&] { unlinkFiles(retired); });
   {
     std::lock_guard lock(mutex);
     expireLocked(retired);
-    auto it = reservations.find(id);
-    if (closed || it == reservations.end()) throw SnapshotExpiredError();
-    if (!it->second.fileNames.contains(name)) {
-      throw ApiError(ErrorKind::NOT_FOUND, "file_not_in_snapshot", "file is not in the reserved snapshot");
+    auto it = pins.find(id);
+    if (closed || it == pins.end()) throw SnapshotExpiredError();
+    if (!it->second.files.contains(name)) {
+      throw ApiError(ErrorKind::NOT_FOUND, "file_not_in_snapshot", "file is not in the pinned snapshot");
     }
     if (cancellation) *cancellation = it->second.cancellation.get_token();
     owner->lease = it->second.openFiles;
   }
   auto file = dir.openFile(name, true);
-  if (!file) throw std::runtime_error("reserved snapshot file is missing");
+  if (!file) throw std::runtime_error("pinned snapshot file is missing");
   owner->file = file;
   return std::shared_ptr<InputFile>(std::move(owner), file.get());
 }
 
+std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const FileDescriptor& descriptor) {
+  // Joined with retirement, so a referenced file cannot be unlinked between
+  // the check and the open; once open, its bytes outlive an unlink.
+  std::lock_guard retirementLock(retirementMutex);
+  {
+    std::lock_guard lock(mutex);
+    auto published = snapshot();
+    if (published != indexed) {
+      indexedFiles.clear();
+      if (published) for (const auto& file : published->files) indexedFiles.emplace(file.name, &file);
+      indexed = published;
+    }
+    auto holds = [&](const auto& files) {
+      auto it = files.find(descriptor.name);
+      return it != files.end() && *it->second == descriptor;
+    };
+    bool held = !closed && (holds(indexedFiles) || std::ranges::any_of(pins, [&](const auto& pin) { return holds(pin.second.files); }));
+    if (!held) throw ApiError(ErrorKind::NOT_FOUND, "file_not_held", "no current or pinned snapshot holds this file");
+  }
+  auto file = dir.openFile(descriptor.name, true);
+  if (!file) throw std::runtime_error("held snapshot file is missing");
+  return file;
+}
+
 bool CommitSnapshotRegistry::touch(const CommitId& id, uint64_t bytes) {
   std::lock_guard lock(mutex);
-  auto it = reservations.find(id);
-  if (closed || it == reservations.end()) return false;
+  auto it = pins.find(id);
+  if (closed || it == pins.end()) return false;
   auto time = now();
   if (time - it->second.lastRead >= policy.idleTimeout) return false;
   if (bytes != 0) it->second.lastRead = time;
@@ -151,8 +196,8 @@ bool CommitSnapshotRegistry::touch(const CommitId& id, uint64_t bytes) {
 }
 
 void CommitSnapshotRegistry::releaseLocked(const CommitId& id, std::vector<std::string>& retired) {
-  auto pin = reservations.find(id);
-  if (pin == reservations.end()) return;
+  auto pin = pins.find(id);
+  if (pin == pins.end()) return;
   retired.reserve(retired.size() + pin->second.snapshot->files.size());
   for (const auto& file : pin->second.snapshot->files) {
     auto it = files.find(file.name);
@@ -165,26 +210,26 @@ void CommitSnapshotRegistry::releaseLocked(const CommitId& id, std::vector<std::
     }
   }
   pin->second.cancellation.request_stop();
-  reservations.erase(pin);
+  pins.erase(pin);
 }
 
 void CommitSnapshotRegistry::enforceBudgetLocked(std::vector<std::string>& retired) {
-  while (counters.retainedBytes > policy.retainedBytes && !reservations.empty()) {
-    auto oldest = std::ranges::min_element(reservations, {}, [](const auto& entry) { return entry.second.created; });
+  while (counters.retainedBytes > policy.retainedBytes && !pins.empty()) {
+    auto oldest = std::ranges::min_element(pins, {}, [](const auto& entry) { return entry.second.created; });
     releaseLocked(oldest->first, retired);
     counters.budgetDrops++;
   }
 }
 
-auto CommitSnapshotRegistry::oldestReclaimableLocked() -> decltype(reservations)::iterator {
-  auto oldest = reservations.end();
+auto CommitSnapshotRegistry::oldestReclaimableLocked() -> decltype(pins)::iterator {
+  auto oldest = pins.end();
   if (closed || counters.retainedBytes == 0) return oldest;
-  auto published = current.load();
-  for (auto it = reservations.begin(); it != reservations.end(); ++it) {
-    const auto& reservation = it->second;
-    if ((published && it->first == published->id) || reservation.openFiles.use_count() != 1) continue;
-    if (oldest != reservations.end() && reservation.created >= oldest->second.created) continue;
-    for (const auto& file : reservation.snapshot->files) {
+  auto published = snapshot();
+  for (auto it = pins.begin(); it != pins.end(); ++it) {
+    const auto& pin = it->second;
+    if ((published && it->first == published->id) || pin.openFiles.use_count() != 1) continue;
+    if (oldest != pins.end() && pin.created >= oldest->second.created) continue;
+    for (const auto& file : pin.snapshot->files) {
       auto ref = files.find(file.name);
       if (ref != files.end() && ref->second.retired && ref->second.size) {
         oldest = it;
@@ -195,19 +240,19 @@ auto CommitSnapshotRegistry::oldestReclaimableLocked() -> decltype(reservations)
   return oldest;
 }
 
-std::optional<CommitSnapshotRegistry::Clock::time_point> CommitSnapshotRegistry::oldestReclaimableReservation() {
+std::optional<CommitSnapshotRegistry::Clock::time_point> CommitSnapshotRegistry::oldestReclaimablePin() {
   std::lock_guard lock(mutex);
   auto oldest = oldestReclaimableLocked();
-  if (oldest == reservations.end()) return {};
+  if (oldest == pins.end()) return {};
   return oldest->second.created;
 }
 
-bool CommitSnapshotRegistry::reclaimOldestReservation() {
+bool CommitSnapshotRegistry::reclaimOldestPin() {
   std::vector<std::string> retired;
   {
     std::lock_guard lock(mutex);
     auto oldest = oldestReclaimableLocked();
-    if (oldest == reservations.end()) return false;
+    if (oldest == pins.end()) return false;
     releaseLocked(oldest->first, retired);
     counters.budgetDrops++;
   }
@@ -215,24 +260,24 @@ bool CommitSnapshotRegistry::reclaimOldestReservation() {
   return true;
 }
 
-bool CommitSnapshotRegistry::evictOldest() {
+bool CommitSnapshotRegistry::testEvictOldest() {
   std::vector<std::string> retired;
   {
     std::lock_guard lock(mutex);
-    if (closed || reservations.empty()) return false;
-    auto oldest = std::ranges::min_element(reservations, {}, [](const auto& entry) { return entry.second.created; });
+    if (closed || pins.empty()) return false;
+    auto oldest = std::ranges::min_element(pins, {}, [](const auto& entry) { return entry.second.created; });
     releaseLocked(oldest->first, retired);
     counters.budgetDrops++;
   }
-  Signal::emit("snapshotReservationDropped", this);
+  Signal::emit("snapshotPinDropped", this);
   unlink(retired);
   return true;
 }
 
 void CommitSnapshotRegistry::expireLocked(std::vector<std::string>& retired) {
-  if (closed || reservations.empty()) return;
+  if (closed || pins.empty()) return;
   auto time = now();
-  for (auto it = reservations.begin(); it != reservations.end();) {
+  for (auto it = pins.begin(); it != pins.end();) {
     auto pin = it++;
     if (time - pin->second.lastRead >= policy.idleTimeout) {
       releaseLocked(pin->first, retired);
@@ -268,7 +313,7 @@ CommitSnapshotRegistry::Stats CommitSnapshotRegistry::stats() {
   std::lock_guard lock(mutex);
   expireLocked(retired);
   auto result = counters;
-  result.pins = reservations.size();
+  result.pins = pins.size();
   return result;
 }
 
@@ -280,7 +325,7 @@ void CommitSnapshotRegistry::retire(std::span<const std::string> names) {
     if (closed) return;
     expireLocked(retired);
 #ifndef NDEBUG
-    auto published = current.load();
+    auto published = snapshot();
 #endif
     for (const auto& name : names) {
       assert(!published || std::ranges::none_of(published->files,
@@ -302,7 +347,6 @@ void CommitSnapshotRegistry::testReset() {
   std::lock_guard lock(mutex);
   closed = false;
   counters = {};
-  current.store(nullptr);
   readers.testReset();
 }
 
@@ -315,9 +359,9 @@ void CommitSnapshotRegistry::retirePrefix(std::string_view prefix) {
     {
       std::lock_guard lock(mutex);
       if (closed) return;
-      unpinned = reservations.empty();
+      unpinned = pins.empty();
     }
-    // New reservations can only acquire current, which cannot contain this dead
+    // New pins can only acquire current, which cannot contain this dead
     // segment. Preserve the backend's cheap prefix erase with no pins.
     if (unpinned) {
       dir.deletePrefix(prefix);
@@ -367,8 +411,8 @@ void CommitSnapshotRegistry::detach() noexcept {
   decltype(files) retired;
   {
     std::lock_guard lock(mutex);
-    for (auto& [id, reservation] : reservations) reservation.cancellation.request_stop();
-    reservations.clear();
+    for (auto& [id, pin] : pins) pin.cancellation.request_stop();
+    pins.clear();
     retired.swap(files);
     counters.retainedBytes = 0;
     // Admitted metadata requests can still hold the collection after close.

@@ -215,7 +215,10 @@ public:
       }
     }
 
-    float scoreFrontier(std::span<const uint8_t> norms, std::span<const char> tfBytes,
+    // Keep the vector and reduction loop alignment stable when unrelated cold
+    // functions move. Otherwise gcc can add a retired padding instruction on
+    // every frontier evaluation, despite generating identical scoring code.
+    [[gnu::aligned(64)]] float scoreFrontier(std::span<const uint8_t> norms, std::span<const char> tfBytes,
                         uint32_t tfWidth, float boost) const {
       assert(tfWidth == 2 || tfWidth == 4);
       int32_t count = (int32_t) norms.size();

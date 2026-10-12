@@ -896,6 +896,24 @@ public:
                     : FieldSortConjunction::FLAT_LITERAL_CONJUNCTION;
   }
 
+  // Every match satisfies every MUST and FILTER clause, so their envelopes
+  // intersect. Optional clauses (even under minShouldMatch) and prohibited
+  // clauses require nothing of a single field here. Normalization only
+  // rearranges the same constraints, so the raw tree answers for it.
+  std::optional<ValueEnvelope> requiredValueEnvelope(
+      std::string_view field) const override {
+    std::optional<ValueEnvelope> result;
+    for (auto clauses : {mandatory, filter}) {
+      for (Query* clause : clauses) {
+        auto envelope = clause->requiredValueEnvelope(field);
+        if (!envelope.has_value()) continue;
+        result = result.has_value() ? result->intersect(*envelope)
+                                    : *envelope;
+      }
+    }
+    return result;
+  }
+
   bool shapeCanOmitWeightForCacheFirstMembership() const {
     auto allSupported = [](std::span<Query*> clauses) {
       return std::all_of(
@@ -1934,6 +1952,12 @@ public:
                 leadCost, parentContext.demand.horizon));
       }
 
+      static bool resettableChildren(const auto& children) {
+        return std::all_of(children.begin(), children.end(), [](const auto& child) {
+          return child.plan != nullptr && child.plan->supportsReset();
+        });
+      }
+
       class PullScorerPlan final : public Query::ScorerPlan {
         Supplier& supplier;
         std::span<PullChildPlan> required;
@@ -1963,6 +1987,13 @@ public:
         }
 
       public:
+        [[gnu::cold]] bool supportsReset() const noexcept override {
+          return unscoredResetUse() && !supplier.needsScores && !requiredUnsatisfiable
+              && resettableChildren(required)
+              && resettableChildren(optional)
+              && resettableChildren(prohibited);
+        }
+
         PullScorerPlan(
             Supplier& supplier,
             const Query::PlanContext& planContext,
@@ -2039,6 +2070,46 @@ public:
           costs.push_back(supplier == nullptr ? 0 : supplier->cost());
         }
         return optionalCost(costs, minShouldMatch, maxDoc);
+      }
+
+      MembershipWork membershipWork(int32_t maxDoc) override {
+        MembershipWork work{(double)maxDoc, 0, 0, 42, 128};
+        double universe = (double)std::max(1, maxDoc);
+        bool required = !mandatoryShapeSuppliers.empty() || !filterSuppliers.empty();
+        auto intersect = [&](auto suppliers) {
+          for (auto* child : suppliers) {
+            if (child == nullptr) { work.matches = 0; continue; }
+            auto childWork = child->membershipWork(maxDoc);
+            work.matches *= childWork.matches / universe;
+            work.addWork(childWork);
+          }
+        };
+        intersect(mandatoryShapeSuppliers);
+        intersect(filterSuppliers);
+        if (!required || minShouldMatch > 0) {
+          double missing = 1;
+          double sum = 0;
+          for (auto* child : optionalShapeSuppliers) {
+            if (child == nullptr) continue;
+            auto childWork = child->membershipWork(maxDoc);
+            missing *= 1 - childWork.matches / universe;
+            sum += childWork.matches;
+            work.addWork(childWork);
+          }
+          double optional = universe * (1 - missing);
+          if (minShouldMatch > 1) optional = std::min(optional, sum / minShouldMatch);
+          work.matches *= optional / universe;
+        }
+        for (auto* child : prohibitedShapeSuppliers) {
+          if (child == nullptr) continue;
+          auto childWork = child->membershipWork(maxDoc);
+          work.matches *= 1 - childWork.matches / universe;
+          work.addWork(childWork);
+        }
+        // Child independence is a yield prior, never a membership claim.
+        // Round observations replace it when correlation makes it optimistic.
+        work.produce += 8 * work.matches;
+        return work;
       }
 
       Query::ScorerShape describeScorer(
@@ -2641,17 +2712,17 @@ public:
             candidates, span, use);
       }
 
-      ConjunctionPlanningResult planConjunctionOnce(
+      ConjunctionPlanningResult planConjunctionEntries(
           MemPool& targetPool, ConjunctionMode mode,
           AcceptedConjunctionRoutes acceptedRoutes,
           BulkUse use,
           std::span<Query::ScorerSupplier* const>
-              enclosingFilterSuppliers,
-          bool perEntryDemand = false) {
+              enclosingFilterSuppliers) {
         ConjunctionPlan plan;
         plan.mode = mode;
         plan.use = use;
-        assert(!perEntryDemand || use == BulkUse::COUNT_WINDOWS);
+        bool perEntryDemand = mode == ConjunctionMode::EXHAUSTIVE
+            && use == BulkUse::COUNT_WINDOWS;
         plan.enclosingFilters = enclosingFilterSuppliers.empty()
             ? EnclosingFilters::NOT_SUPPLIED
             : EnclosingFilters::CONSUMED;
@@ -3127,24 +3198,6 @@ public:
         return finishRoute(ConjunctionRoute::GENERIC, true);
       }
 
-      ConjunctionPlanningResult refreshConjunctionShapes(
-          MemPool& targetPool, ConjunctionMode mode,
-          AcceptedConjunctionRoutes acceptedRoutes,
-          std::span<Query::ScorerSupplier* const> enclosingFilterSuppliers,
-          const ConjunctionPlanningResult& original) {
-        assert(original.plan.use == BulkUse::COUNT_WINDOWS);
-        ConjunctionPlanningResult refreshed = planConjunctionOnce(
-            targetPool, mode, acceptedRoutes, original.plan.use,
-            enclosingFilterSuppliers, true);
-        if (refreshed.status == ConjunctionPlanStatus::READY
-            && refreshed.plan.route == original.plan.route) {
-          assert(refreshed.plan.leadCost == original.plan.leadCost);
-          assert(refreshed.plan.nonLeadCost == original.plan.nonLeadCost);
-          return refreshed;
-        }
-        return original;
-      }
-
       ConjunctionPlanningResult planConjunction(
           MemPool& targetPool, ConjunctionMode mode,
           AcceptedConjunctionRoutes acceptedRoutes,
@@ -3152,7 +3205,7 @@ public:
           std::span<Query::ScorerSupplier* const>
               enclosingFilterSuppliers = {}) {
         // Expansion capture does not depend on leadCost. Resolve it before
-        // planConjunctionOnce reads supplier costs and sorts the entries, so
+        // planConjunctionEntries reads supplier costs and sorts the entries, so
         // memo-backed costs determine both entry order and the build context.
         Query::PlanContext buildContext =
             scorerBuildContext(segment.maxDoc(), use);
@@ -3161,17 +3214,10 @@ public:
         fillExpansionMemos(optionalShapeSuppliers, buildContext);
         fillExpansionMemos(prohibitedShapeSuppliers, buildContext);
         fillExpansionMemos(enclosingFilterSuppliers, buildContext);
-        ConjunctionPlanningResult planning = planConjunctionOnce(
-            targetPool, mode, acceptedRoutes, use,
-            enclosingFilterSuppliers);
-        if (use == BulkUse::COUNT_WINDOWS
-            && planning.status == ConjunctionPlanStatus::READY
-            && planning.plan.leadCost != segment.maxDoc()) {
-          return refreshConjunctionShapes(
-              targetPool, mode, acceptedRoutes, enclosingFilterSuppliers,
-              planning);
-        }
-        return planning;
+        // A membership producer consumes physical spans, not just candidate
+        // docids. Choose child arms and the route from that demand together.
+        return planConjunctionEntries(targetPool, mode, acceptedRoutes, use,
+                                    enclosingFilterSuppliers);
       }
 
       void resolveConjunctionChildren(
@@ -3205,6 +3251,58 @@ public:
         for (PlannedSupplier& child : plan.prohibited) {
           resolveChild(child);
         }
+      }
+
+      static bool resettableConjunction(const ConjunctionPlan& plan) {
+        for (const auto& entry : plan.entries) {
+          if (!entry.optionalGroup && !entry.plan->supportsReset()) return false;
+        }
+        return resettableChildren(plan.optionalGroup)
+            && resettableChildren(plan.prohibited)
+            && (plan.independentLeadPlan == nullptr
+                || plan.independentLeadPlan->supportsReset());
+      }
+
+      [[gnu::cold]] bool bulkStateSupportsReposition(const BulkBuildState& state) const noexcept override {
+        assert(state.owner == this);
+        if (needsScores) return false;
+        // These child plans preserve the bulk request's horizon. Reuse that
+        // resolved fact instead of capturing the use again in the parent.
+        switch (static_cast<const BooleanBulkBuildState&>(state).kind) {
+          case BooleanBulkBuildState::Kind::CONJUNCTION: {
+            const auto& plan = static_cast<const ConjunctionPlan&>(state);
+            return isMembershipWindowUse(plan.use) && resettableConjunction(plan);
+          }
+          case BooleanBulkBuildState::Kind::MAND_OPT: {
+            const auto& plan = static_cast<const MandOptPlan&>(state);
+            return isMembershipWindowUse(plan.mandatory.plan->demand().horizon)
+                && plan.mandatory.plan->supportsReset() && resettableChildren(plan.optional);
+          }
+          case BooleanBulkBuildState::Kind::MAX_SCORE: {
+            const auto& plan = static_cast<const MaxScorePlan&>(state);
+            return isMembershipWindowUse(plan.optional[0].plan->demand().horizon)
+                && resettableChildren(plan.optional) && resettableChildren(plan.prohibited);
+          }
+          case BooleanBulkBuildState::Kind::FILTERED_DISJUNCTION: {
+            const auto& plan = static_cast<const FilteredDisjunctionPlan&>(state);
+            return isMembershipWindowUse(plan.optional[0].plan->demand().horizon)
+                && (plan.filter.plan == nullptr || plan.filter.plan->supportsReset())
+                && resettableChildren(plan.optional);
+          }
+          case BooleanBulkBuildState::Kind::FILTER_ONLY: {
+            const auto& plan = static_cast<const FilterOnlyPlan&>(state);
+            // The other filters are materialized once during construction.
+            return !plan.filters.empty()
+                && plan.filters[0].plan.supportsReposition() == BulkAnswer::YES;
+          }
+          case BooleanBulkBuildState::Kind::DELEGATE_FILTERED_CHILD:
+            return static_cast<const DelegateFilteredChildPlan&>(state)
+                .childPlan.supportsReposition() == BulkAnswer::YES;
+          case BooleanBulkBuildState::Kind::EXACT_FILTERED_MAND_OPT:
+          case BooleanBulkBuildState::Kind::FILTERED_BODY:
+            return false;
+        }
+        std::unreachable();
       }
 
       static BulkPlan knownBulkPlan(
@@ -3308,7 +3406,7 @@ public:
         }
         auto assertBuildDemand = [&](const Query::Demand& demand) {
           assert(demand.horizon == plan.use);
-          if (plan.use == BulkUse::COUNT_WINDOWS) {
+          if (isMembershipWindowUse(plan.use)) {
             assert(demand.candidates >= plan.leadCost);
             assert(demand.candidates <= segment.maxDoc());
             assert(demand.span >= demand.candidates);
@@ -4077,6 +4175,9 @@ public:
         BulkPlan plan = knownBulkPlan(
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::YES);
         plan.buildState = state;
+        // The resolved context already retains the use. Do not keep another
+        // copy live across child planning and its virtual calls.
+
         return {plan, FilteredDisjunctionDisposition::BULK};
       }
 
@@ -4867,6 +4968,7 @@ public:
     }
 
     class BooleanPreparedWeight final : public Query::Weight::PreparedWeight {
+      std::span<Query::Weight*> filterWeights;
       IndexReader& reader;
       std::vector<QueryPrep::PreparedSource> mandatorySources;
       std::vector<uint8_t> mandatoryScores;
@@ -4882,7 +4984,8 @@ public:
       bool uniformConstantCandidate = false;
 
     public:
-      BooleanPreparedWeight(IndexReader& reader,
+      BooleanPreparedWeight(std::span<Query::Weight*> filterWeights,
+                            IndexReader& reader,
                             std::vector<QueryPrep::PreparedSource>&& mandatorySources,
                             std::span<const uint8_t> mandatoryScores,
                             std::vector<QueryPrep::PreparedSource>&& optionalSources,
@@ -4893,7 +4996,8 @@ public:
                             int minShouldMatch, bool needsScores,
                             bool allowsPruning,
                             bool uniformConstantCandidate)
-        : reader(reader), mandatorySources(std::move(mandatorySources)),
+        : filterWeights(filterWeights), reader(reader),
+          mandatorySources(std::move(mandatorySources)),
           mandatoryScores(mandatoryScores.begin(), mandatoryScores.end()),
           optionalSources(std::move(optionalSources)),
           prohibitedSources(std::move(prohibitedSources)),
@@ -4948,6 +5052,13 @@ public:
             std::numeric_limits<int64_t>::max());
         return supplier->resolve(
             targetPool, supplier->makePlanContext(demand))->build(targetPool);
+      }
+
+      void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+        for (const auto& source : mandatorySources) source.releaseSegmentState(segment);
+        for (const auto& source : optionalSources) source.releaseSegmentState(segment);
+        for (const auto& source : prohibitedSources) source.releaseSegmentState(segment);
+        for (auto* weight : filterWeights) weight->releaseSegmentState(segment);
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {
@@ -5126,6 +5237,23 @@ public:
       }
     }
 
+    void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+      for (auto weights : {mandatoryWeights, optionalWeights, prohibitedWeights, filterWeights}) {
+        for (auto* weight : weights) {
+          if (weight) weight->releaseSegmentState(segment);
+        }
+      }
+    }
+
+    bool hasReleasableSegmentState() const noexcept override {
+      for (auto weights : {mandatoryWeights, optionalWeights, prohibitedWeights, filterWeights}) {
+        for (auto* weight : weights) {
+          if (weight && weight->hasReleasableSegmentState()) return true;
+        }
+      }
+      return false;
+    }
+
     // Membership count free from index stats, composed from the clauses.
     // Two shapes answer: a lone required clause delegates (optional clauses
     // beside it never gate membership while minShouldMatch is unset, whether
@@ -5193,14 +5321,13 @@ public:
           prohibitedWeights, prohibitedUses, ctx);
 
       return std::make_unique<BooleanPreparedWeight>(
-        ctx.reader, std::move(mandatorySources), mandatoryScores,
+        filterWeights, ctx.reader, std::move(mandatorySources), mandatoryScores,
         std::move(optionalSources),
         std::move(prohibitedSources), std::move(filterDomains),
         prohibitedCacheRoutes, !filterSources.empty(),
         prohibitedCacheEnabled, minShouldMatch, needsScores, allowsPruning,
         uniformConstantCandidate);
     }
-
 
     Query::ScorerSupplier* scorerSupplierImpl(
         luxir::MemPool& targetPool,
@@ -5281,36 +5408,18 @@ public:
       return sparseFilteredTopKFamilyKind;
     }
 
-    Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
+    Query::Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
       Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
       Query::Demand demand = Query::Demand::fromLeadCost(
           std::numeric_limits<int64_t>::max());
-      return static_cast<Scorer*>(supplier->resolve(
-          targetPool, supplier->makePlanContext(demand))->build(targetPool));
+      return supplier->resolve(
+          targetPool, supplier->makePlanContext(demand))->build(targetPool);
     }
 
     // Single-clause boolean shapes delegate to the wrapped clause. Filtered
     // count-only conjunctions exhaust the same per-window bulk intersection
     // used by collection, with filter clauses kept as lazy zero-score members.
   };  // BooleanQuery::Weight
-
-  class Scorer final : public Query::Scorer {
-  public:
-    Scorer() {}
-
-    int32_t next() override {
-      return -1;
-    }
-
-    /// doc we are positioned on
-    int32_t docId() override {
-      return -1;
-    }
-
-    float score() override {
-      return -1;
-    }
-  };
 
   class MandOptScorer final : public Query::Scorer {
     struct ApproxSlot {
@@ -5550,6 +5659,42 @@ public:
     }
 
   public:
+    int32_t advanceApproximationWindow(int32_t min, int32_t max) override {
+      return id = mand.scorer->advanceApproximationWindow(min, max);
+    }
+
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      // Optionals contribute scores only; membership does not need to visit
+      // them or inherit the scored iterator's competitive restrictions.
+      return id = mand.scorer->advanceWindow(min, max);
+    }
+
+    void fillWindowBits(std::span<uint64_t> words, int32_t min,
+                        int32_t max) override {
+      mand.scorer->fillWindowBits(words, min, max);
+      id = max;
+    }
+
+    [[gnu::cold]] void prepareMembership() override {
+      mand.scorer->prepareMembership();
+      opt.scorer->prepareMembership();
+    }
+
+    [[gnu::cold]] void reset() override {
+      mand.scorer->reset();
+      opt.scorer->reset();
+      id = windowUpTo = optCheckedDoc = -1;
+      minCompetitiveScore = 0.0f;
+      reqMaxScore = mand.scorer->getMaxScoreForSetup(PostingsReader::END);
+      windowReqMaxScore = windowMaxScore = std::numeric_limits<float>::infinity();
+      optIsRequired = optCheckedMatch = windowWalkDisabled = false;
+      uselessWindowEvals = 0;
+      windowWalkDisabledAtTheta = 0.0f;
+#ifndef NDEBUG
+      iterationProtocol = IterationProtocol::NONE;
+#endif
+    }
+
     MandOptScorer(luxir::MemPool& targetPool,
                   Scorer* mandScorer, bool mandTwoPhase,
                   Scorer* optScorer, bool optTwoPhase,
@@ -5782,6 +5927,17 @@ public:
     }
 
   public:
+    [[gnu::cold]] void prepareMembership() override {
+      lead->prepareMembership();
+    }
+
+    [[gnu::cold]] void reposition(int32_t target) override {
+      lead->reposition(target);
+      combinedWith = nullptr;
+      combinedCard = 0;
+      combinedReady = false;
+    }
+
     FilterOnlyBulkScorer(BulkScorer* lead,
                          std::span<uint64_t> filterWords,
                          std::span<uint64_t> combinedWords,
@@ -6226,6 +6382,24 @@ public:
     }
 
   public:
+    [[gnu::cold]] void prepareMembership() override {
+      mand->prepareMembership();
+      for (auto* scorer : opts) scorer->prepareMembership();
+      if (windowFilter != nullptr) windowFilter->prepareMembership();
+    }
+
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      mand->reset();
+      for (auto* scorer : opts) scorer->reset();
+      if (windowFilter != nullptr) windowFilter->reset();
+      windowStart = windowEnd = liveOptCount = 0;
+      minCompetitiveScore = std::numeric_limits<float>::lowest();
+      mandWindowMax = std::numeric_limits<float>::infinity();
+      optWindowMaxSum = 0.0;
+    }
+
     MandOptBulkScorer(luxir::MemPool& pool, Query::Scorer* mand,
                       std::span<Query::Scorer*> opts, std::span<int64_t> optCosts,
                       int32_t maxDoc, int64_t mandCost)
@@ -6312,48 +6486,51 @@ public:
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 
-    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
-                            DocSet* filter, int32_t min, int32_t max) override {
+    int32_t matchNextWindow(ScoreWindow& out, DocSet* filter,
+                            int32_t min, int32_t max) override {
       max = std::min(max, maxDoc);
-      if (min >= max) {
-        return PostingsReader::END;
-      }
-      if (filter != nullptr && filter->card() == 0) {
-        return PostingsReader::END;
-      }
-      if (domainOut != nullptr) {
-        skipCount(SkipStats::bulkDomainWindowsFed);
-      }
       setWindowBounds(min, max);
+      prepareOutputWindow(out);
+      if (windowStart >= windowEnd
+          || (filter != nullptr && filter->card() == 0)) {
+        return PostingsReader::END;
+      }
       skipCount(SkipStats::mandOptBulkWindows);
       if (windowFilter != nullptr
           && windowFilter->prepare(windowStart, windowEnd) == 0) {
         return windowEnd >= max ? PostingsReader::END : windowEnd;
       }
-      if (mand->docId() < windowStart && mand->advance(windowStart) == PostingsReader::END) {
-        return PostingsReader::END;
-      }
-
-      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
-      float blockScores[Postings::DOCS_BLOCK_SIZE];
-      int32_t n;
-      while ((n = mand->fillScoreBlock(blockDocs, blockScores,
-                                       Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
-        unused(blockScores);
-        for (int32_t i = 0; i < n; i++) {
-          int32_t doc = blockDocs[i];
-          if (acceptsDoc(filter, doc)) {
-            count++;
-            if (domainOut != nullptr) {
-              domainOut->add(doc);
-            }
-          }
+      clearWindowBits();
+      // Optionals never change membership. Use the mandatory producer's
+      // bounded fill instead of its scored block fill, which may verify an
+      // arbitrarily long suffix while looking for the next exact hit.
+      mand->fillWindowBits(windowBits, windowStart, windowEnd);
+      for (size_t word = 0; word < windowBits.size(); word++) {
+        uint64_t bits = windowBits[word];
+        while (bits != 0) {
+          int32_t doc = windowStart + (int32_t)(word << 6)
+              + (int32_t)std::countr_zero(bits);
+          if (doc >= windowEnd) break;
+          if (acceptsDoc(filter, doc)) out.docs[(size_t)out.size++] = doc;
+          bits &= bits - 1;
         }
       }
-      if (mand->docId() == PostingsReader::END) {
-        return PostingsReader::END;
+      // The fill leaves the mandatory cursor at a lower bound on its next
+      // match, possibly END: resume there rather than at the window end.
+      int32_t resume = std::max(windowEnd, mand->docId());
+      return resume >= max ? PostingsReader::END : resume;
+    }
+
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* filter, int32_t min, int32_t max) override {
+      ScoreWindow out;
+      int32_t next = matchNextWindow(out, filter, min, max);
+      count += out.size;
+      if (domainOut != nullptr) {
+        skipCount(SkipStats::bulkDomainWindowsFed);
+        for (int32_t doc : out.docs.first((size_t)out.size)) domainOut->add(doc);
       }
-      return windowEnd >= max ? PostingsReader::END : windowEnd;
+      return next;
     }
   }; // MandOptBulkScorer
 
@@ -6368,6 +6545,16 @@ public:
     std::span<Query::Scorer*> optional;
 
   public:
+    [[gnu::cold]] void prepareMembership() override {
+      required->prepareMembership();
+      for (auto* scorer : optional) scorer->prepareMembership();
+    }
+
+    [[gnu::cold]] void reposition(int32_t target) override {
+      required->reposition(target);
+      for (auto* scorer : optional) scorer->reset();
+    }
+
     OptionalScoreBulkScorer(BulkScorer* required,
                             std::span<Query::Scorer*> optional)
         : required(required), optional(optional) {
@@ -6428,6 +6615,28 @@ public:
     int32_t notid = -1;
     bool notTwoPhase;
   public:
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      while (min < max) {
+        id = mandScorer->advanceWindow(min, max);
+        if (id >= max) return id;
+        notid = notScorer->advanceWindow(id, id + 1);
+        if (notid != id) return id;
+        min = id + 1;
+      }
+      return id = max;
+    }
+
+    [[gnu::cold]] void prepareMembership() override {
+      mandScorer->prepareMembership();
+      notScorer->prepareMembership();
+    }
+
+    [[gnu::cold]] void reset() override {
+      mandScorer->reset();
+      notScorer->reset();
+      id = notid = -1;
+    }
+
     static inline bool disableNotTwoPhaseForTests = false;
 
     MandNotScorer(luxir::MemPool& targetPool,
@@ -6834,6 +7043,18 @@ public:
     }
 
   public:
+    [[gnu::cold]] void prepareMembership() override {
+      for (auto* scorer : conjunctionClauses) scorer->prepareMembership();
+    }
+
+    [[gnu::cold]] void reset() override {
+      for (auto* scorer : conjunctionClauses) scorer->reset();
+      docid = competitiveUpTo = -1;
+      minCompetitiveScore = 0.0f;
+      failStreak = 0;
+      skipSeen = false;
+    }
+
     // Test hook: disable block-max range skipping. The default evaluates each
     // scorer's natural bound horizon without imposing a minimum stride.
     static inline bool disablePruningForTests = false;
@@ -6912,6 +7133,10 @@ public:
                 });
       if (!competitivePruning
           && !disableExactDirectApproximationsForTests) {
+        // These leaves are final, so exact type equality identifies the
+        // specialization without walking their inheritance trees.
+        static_assert(std::is_final_v<DirectTermScorer>
+                      && std::is_final_v<PreparedDocSetScorer>);
         auto kinds =
             pool.make_span<ExactApproxKind>(approximations.size());
         bool supported = true;
@@ -6919,24 +7144,64 @@ public:
           const ApproxSlot& approximation = approximations[i];
           if (approximation.kind == ApproxSlot::Kind::DOCS_ENUM) {
             kinds[i] = ExactApproxKind::DOCS_ENUM;
-          } else if (approximation.kind == ApproxSlot::Kind::SINGLE_PHASE
-                     && dynamic_cast<DirectTermScorer*>(
-                            approximation.scorer) != nullptr) {
-            kinds[i] = ExactApproxKind::TERM_SCORER;
-          } else if (approximation.kind == ApproxSlot::Kind::SINGLE_PHASE
-                     && dynamic_cast<PreparedDocSetScorer*>(
-                            approximation.scorer) != nullptr) {
-            kinds[i] = ExactApproxKind::DOC_SET;
-          } else {
-            supported = false;
-            break;
+            continue;
           }
+          if (approximation.kind == ApproxSlot::Kind::SINGLE_PHASE) {
+            const std::type_info& type = typeid(*approximation.scorer);
+            if (type == typeid(DirectTermScorer)) {
+              kinds[i] = ExactApproxKind::TERM_SCORER;
+              continue;
+            }
+            if (type == typeid(PreparedDocSetScorer)) {
+              kinds[i] = ExactApproxKind::DOC_SET;
+              continue;
+            }
+          }
+          supported = false;
+          break;
         }
         if (supported) {
           exactApproxKinds = kinds;
           skipCount(SkipStats::conjExactDirectApproxEngagements);
         }
       }
+    }
+
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      // Keep ownership of flattened approximation enums after a scored
+      // prefix. Their phrase verifier's local docid can lag those cursors.
+      while (min < max) {
+        bool aligned = true;
+        for (const auto& slot : approximations) {
+          int32_t doc;
+          if (slot.kind == ApproxSlot::Kind::DOCS_ENUM) {
+            doc = slot.docsEnum->docId();
+            if (doc < min) doc = slot.docsEnum->advance(min);
+          } else if (slot.kind == ApproxSlot::Kind::TWO_PHASE) {
+            doc = slot.scorer->advanceApproximationWindow(min, max);
+          } else {
+            doc = slot.scorer->advanceWindow(min, max);
+          }
+          if (doc >= max) return docid = doc;
+          if (doc != min) {
+            min = doc;
+            aligned = false;
+            break;
+          }
+        }
+        if (!aligned) continue;
+        for (const auto& verifier : verifiers) {
+          bool matched = verifier.externallyDriven ? verifier.matches(min)
+              : verifier.scorer->advanceWindow(min, min + 1) == min;
+          if (!matched) {
+            aligned = false;
+            break;
+          }
+        }
+        if (aligned) return docid = min;
+        min++;
+      }
+      return docid = max;
     }
 
     int32_t next() override {
@@ -7232,6 +7497,13 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      for (auto* term : terms) term->reset();
+      nextLeadDoc = -1;
+    }
+
     ExactDocsOnlyTermConjunctionBulkScorer(
         MemPool& pool, std::span<DocsOnlyEnum*> terms,
         int32_t maxDoc)
@@ -7478,6 +7750,8 @@ public:
     int64_t denseSampleLead = 0;
     int64_t denseSampleSurvivors = 0;
     int32_t denseScoredTopK = 0;
+    CandidateCountAdmission initialCandidateCountAdmission =
+        CandidateCountAdmission::NONE;
 
     // Dense-scored admission considers requested depth, an initial survivor
     // sample, and non-lead cost. Keep the parameters together.
@@ -7542,21 +7816,24 @@ public:
     }
 
     int32_t denseClauseCountAdvance(
-        const DenseClause& clause, int32_t target) {
+        const DenseClause& clause, int32_t target, int32_t max) {
       if (clause.term != nullptr) {
-        return clause.term->docsEnum.advanceDocOnly(target);
+        int32_t doc = clause.term->docsEnum.docId();
+        return doc < target ? clause.term->docsEnum.advanceDocOnly(target) : doc;
       }
       if (clause.docSet != nullptr) {
-        return clause.docSet->advance(target);
+        int32_t doc = clause.docSet->docId();
+        return doc < target ? clause.docSet->advance(target) : doc;
       }
       int32_t doc = PostingsReader::END;
       for (Query::Scorer* member : clause.members) {
         DocsFreqEnum* probe = member->windowFilterProbeDocsEnum();
-        int32_t memberDoc = probe != nullptr ? probe->docId() : member->docId();
-        if (memberDoc < target) {
-          memberDoc = probe != nullptr
-              ? probe->advanceDocOnly(target)
-              : member->advance(target);
+        int32_t memberDoc;
+        if (probe == nullptr) {
+          memberDoc = member->advanceWindow(target, max);
+        } else {
+          memberDoc = probe->docId();
+          if (memberDoc < target) memberDoc = probe->advanceDocOnly(target);
         }
         doc = std::min(doc, memberDoc);
       }
@@ -7590,8 +7867,11 @@ public:
         }
         const DenseClause& denseClause = prohibitedDenseClauses[clause];
         int32_t doc = denseClauseDocId(denseClause);
-        if (doc < windowBase) {
-          doc = denseClauseCountAdvance(denseClause, windowBase);
+        // General fills own their bounded verification. Pre-driving their
+        // exact cursors would inspect the suffix before a single bit is used.
+        if (doc < windowBase
+            && (denseClause.term != nullptr || denseClause.docSet != nullptr)) {
+          doc = denseClauseCountAdvance(denseClause, windowBase, windowEnd);
         }
         if (doc == PostingsReader::END) {
           prohibitedExhausted[clause] = 1;
@@ -7814,22 +8094,6 @@ public:
     }
 
     template <bool TermFast, bool TermTailFast = false>
-    int32_t scorerAdvanceForClauseProbe(size_t index, int32_t target) {
-      if constexpr (TermFast) {
-        return disableScoredProbeForTests
-            ? termScorers[index]->docsEnum.advance(target)
-            : termScorers[index]->advanceScoredProbe(target);
-      } else if constexpr (TermTailFast) {
-        assert(index > 0);
-        return disableScoredProbeForTests
-            ? termScorers[index]->docsEnum.advance(target)
-            : termScorers[index]->advanceScoredProbe(target);
-      } else {
-        return scorers[index]->advance(target);
-      }
-    }
-
-    template <bool TermFast, bool TermTailFast = false>
     int32_t scorerAdvanceLead(int32_t target) {
       const int64_t before =
           SkipStats::enabled ? SkipStats::tfreqBlocksDecoded : 0;
@@ -7842,38 +8106,25 @@ public:
     }
 
     template <bool TermFast, bool TermTailFast = false>
-    int32_t scorerCountDocId(size_t index) {
+    int32_t scorerCountSeek(size_t index, int32_t target, int32_t max) {
+      auto seekTerm = [&](size_t termIndex) {
+        auto& docs = termScorers[termIndex]->docsEnum;
+        int32_t doc = docs.docId();
+        return doc < target ? docs.advanceDocOnly(target) : doc;
+      };
       if constexpr (TermFast) {
-        return termScorers[index]->docsEnum.docId();
-      } else if constexpr (TermTailFast) {
-        return index == 0 ? scorers[0]->docId()
-                          : termScorers[index]->docsEnum.docId();
-      } else {
-        // Mirror scorerCountAdvance: term clauses in a mixed shape answer
-        // from the docs-only enum directly.
-        if (termScorers[index] != nullptr) {
-          return termScorers[index]->docsEnum.docId();
-        }
-        return scorers[index]->docId();
-      }
-    }
-
-    template <bool TermFast, bool TermTailFast = false>
-    int32_t scorerCountAdvance(size_t index, int32_t target) {
-      if constexpr (TermFast) {
-        return termScorers[index]->docsEnum.advanceDocOnly(target);
+        return seekTerm(index);
       } else if constexpr (TermTailFast) {
         return index == 0
-            ? scorers[0]->advance(target)
-            : termScorers[index]->docsEnum.advanceDocOnly(target);
+            ? scorers[0]->advanceWindow(target, max) : seekTerm(index);
       } else {
         // A DocSet clause makes allTermScorers false, but it must not demote
         // the remaining terms to generic Scorer::advance (which can decode
         // frequencies). Preserve the docs-only word-probe route per clause.
         if (termScorers[index] != nullptr) {
-          return termScorers[index]->docsEnum.advanceDocOnly(target);
+          return seekTerm(index);
         }
-        return scorers[index]->advance(target);
+        return scorers[index]->advanceWindow(target, max);
       }
     }
 
@@ -7911,26 +8162,18 @@ public:
       }
     }
 
-    template <bool TermFast, bool TermTailFast = false>
-    float scorerScore(size_t index) {
-      if constexpr (TermFast) {
-        return termScorers[index]->score();
-      } else if constexpr (TermTailFast) {
-        return index == 0 ? scorers[0]->score()
-                          : termScorers[index]->score();
-      } else {
-        return scorers[index]->score();
-      }
-    }
-
     template <bool CheckBound>
     int32_t LUXIR_INLINE applyScoredProbeToCandidates(
         TermQuery::Scorer* scorer, int32_t size,
         double remaining) {
+      // Child probes mutate postings, never the parent's scratch bindings.
+      // Retain the bases across probes instead of reloading each candidate.
+      int32_t* docs = candDocs.data();
+      float* scores = candScores.data();
       int32_t write = 0;
       for (int32_t i = 0; i < size; i++) {
-        int32_t doc = candDocs[(size_t) i];
-        float sum = candScores[(size_t) i];
+        int32_t doc = docs[(size_t) i];
+        float sum = scores[(size_t) i];
         if constexpr (CheckBound) {
           if (((double) sum + remaining) * scoreBoundFactor
               < (double) minCompetitiveScore) {
@@ -7939,8 +8182,8 @@ public:
         }
         float clauseScore;
         if (!scorer->matchScoredProbe(doc, clauseScore)) continue;
-        candDocs[(size_t) write] = doc;
-        candScores[(size_t) write] = sum + clauseScore;
+        docs[(size_t) write] = doc;
+        scores[(size_t) write] = sum + clauseScore;
         write++;
       }
       return write;
@@ -7949,7 +8192,19 @@ public:
     template <bool CheckBound, bool TermFast, bool TermTailFast = false>
     int32_t LUXIR_INLINE applyScorerToCandidates(
         size_t clause, int32_t size, double remaining) {
-      int32_t scorerDoc = scorerDocId<TermFast, TermTailFast>(clause);
+      // A batch probes one child. Retain that binding across its calls rather
+      // than recovering it from the parent's span and clause index per doc.
+      auto* scorer = [&] {
+        if constexpr (TermFast || TermTailFast) return termScorers[clause];
+        else return scorers[clause];
+      }();
+      int32_t scorerDoc;
+      if constexpr (TermFast || TermTailFast) {
+        assert(!TermTailFast || clause > 0);
+        scorerDoc = scorer->docsEnum.docId();
+      } else {
+        scorerDoc = scorer->docId();
+      }
       int32_t write = 0;
       for (int32_t i = 0; i < size; i++) {
         int32_t doc = candDocs[(size_t) i];
@@ -7961,13 +8216,16 @@ public:
           }
         }
         if (scorerDoc < doc) {
-          scorerDoc = scorerAdvanceForClauseProbe<TermFast, TermTailFast>(
-              clause, doc);
+          if constexpr (TermFast || TermTailFast) {
+            scorerDoc = disableScoredProbeForTests
+                ? scorer->docsEnum.advance(doc) : scorer->advanceScoredProbe(doc);
+          } else {
+            scorerDoc = scorer->advance(doc);
+          }
         }
         if (scorerDoc != doc) continue;
         candDocs[(size_t) write] = doc;
-        candScores[(size_t) write] =
-            sum + scorerScore<TermFast, TermTailFast>(clause);
+        candScores[(size_t) write] = sum + scorer->score();
         write++;
       }
       return write;
@@ -8149,7 +8407,10 @@ public:
           // blocks. A filter is a zero-score required clause: it owns
           // membership and may own the candidate feed, but contributes no
           // score bound and must not parse frequency/impact data here.
-          for (size_t c = 0; c < scorers.size(); c++) {
+          // Child calls cannot change the parent's clause count. Keep it
+          // local across shallow probes rather than reloading after each one.
+          const size_t numScorers = scorers.size();
+          for (size_t c = 0; c < numScorers; c++) {
             if (scoringClauses[c] != 0) {
               upTo = std::min(
                   upTo,
@@ -8159,8 +8420,8 @@ public:
           if (upTo < leadDoc) {
             upTo = leadDoc;
           }
-          suffixMax[scorers.size()] = 0.0;
-          for (size_t c = scorers.size(); c-- > 0; ) {
+          suffixMax[numScorers] = 0.0;
+          for (size_t c = numScorers; c-- > 0; ) {
             windowMax[c] = scoringClauses[c] != 0
                 ? scorerGetMaxScore<TermFast, TermTailFast>(c, upTo)
                 : 0.0f;
@@ -8246,6 +8507,8 @@ public:
                 windowFilter != nullptr && !windowFilter->probes();
             if (filter != nullptr || fillFilter) {
               int32_t w = 0;
+              // Candidate batches benefit from amortizing filter-loop control.
+              #pragma GCC unroll 2
               for (int32_t i = 0; i < n; i++) {
                 int32_t doc = candDocs[(size_t) i];
                 if (filter != nullptr && !filter->get(doc)) continue;
@@ -8467,9 +8730,16 @@ public:
 
     int32_t ratchetDenseWindow(int32_t min, int32_t max) {
       for (size_t c = 0; c < denseClauses.size(); c++) {
-        int32_t doc = denseClauseDocId(denseClauses[c]);
-        if (doc < min) {
-          doc = denseClauseCountAdvance(denseClauses[c], min);
+        // A bounded exact seek retains late-range jumps without verifying
+        // past the caller's span. Its approximation may be unconfirmed at the
+        // previous bound, so generic leaves must re-enter the bounded API.
+        int32_t doc;
+        if (denseClauses[c].term == nullptr
+            && denseClauses[c].docSet == nullptr) {
+          doc = denseClauseCountAdvance(denseClauses[c], min, max);
+        } else {
+          doc = denseClauseDocId(denseClauses[c]);
+          if (doc < min) doc = denseClauseCountAdvance(denseClauses[c], min, max);
         }
         if (doc > min) {
           min = doc;
@@ -8497,13 +8767,14 @@ public:
           int32_t doc = windowBase + index;
           bool matched = true;
           for (size_t c = firstClause; c < denseClauses.size(); c++) {
-            int32_t scorerDoc = termScorers[c] != nullptr
-                ? termScorers[c]->docsEnum.docId()
-                : denseClauseDocId(denseClauses[c]);
-            if (scorerDoc < doc) {
-              scorerDoc = termScorers[c] != nullptr
-                  ? termScorers[c]->docsEnum.advanceDocOnly(doc)
-                  : denseClauseCountAdvance(denseClauses[c], doc);
+            int32_t scorerDoc;
+            if (termScorers[c] != nullptr) {
+              scorerDoc = termScorers[c]->docsEnum.docId();
+              if (scorerDoc < doc) {
+                scorerDoc = termScorers[c]->docsEnum.advanceDocOnly(doc);
+              }
+            } else {
+              scorerDoc = denseClauseCountAdvance(denseClauses[c], doc, doc + 1);
             }
             if (scorerDoc != doc) {
               matched = false;
@@ -8794,10 +9065,8 @@ public:
       }
       int32_t target = min;
       while (target < windowEnd) {
-        int32_t doc = scorerCountDocId<TermFast, TermTailFast>(0);
-        if (doc < target) {
-          doc = scorerCountAdvance<TermFast, TermTailFast>(0, target);
-        }
+        int32_t doc = scorerCountSeek<TermFast, TermTailFast>(
+            0, target, windowEnd);
         if (doc >= windowEnd) {
           return doc;  // sound resume point (or END); covers doc == END
         }
@@ -8805,11 +9074,8 @@ public:
 
         bool matched = true;
         for (size_t c = 1; c < scorers.size(); c++) {
-          int32_t scorerDoc = scorerCountDocId<TermFast, TermTailFast>(c);
-          if (scorerDoc < target) {
-            scorerDoc =
-                scorerCountAdvance<TermFast, TermTailFast>(c, target);
-          }
+          int32_t scorerDoc = scorerCountSeek<TermFast, TermTailFast>(
+              c, target, windowEnd);
           if (scorerDoc != target) {
             target = scorerDoc;
             matched = false;
@@ -8879,6 +9145,9 @@ public:
           size = write;
         }
       } else {
+        // This route is admitted only for a direct materialized DocSet lead;
+        // generic verification-bearing leads use bounded window production.
+        assert(countLeadIsDocSet);
         doc = scorers[0]->docId();
         if (doc < min) {
           doc = scorers[0]->advance(min);
@@ -8946,6 +9215,42 @@ public:
     }
 
   public:
+    [[gnu::cold]] void prepareMembership() override {
+      for (auto* scorer : scorers) scorer->prepareMembership();
+      for (auto* scorer : prohibitedScorers) scorer->prepareMembership();
+      for (auto* term : candidateProhibitedTerms) term->prepareMembership();
+      if (candidateLeadScoreScorer != nullptr) candidateLeadScoreScorer->prepareMembership();
+      if (windowFilter != nullptr) windowFilter->prepareMembership();
+    }
+
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      for (auto* scorer : scorers) scorer->reset();
+      for (auto* scorer : prohibitedScorers) scorer->reset();
+      for (auto* term : candidateProhibitedTerms) term->reset();
+      if (candidateLeadScoreScorer != nullptr) candidateLeadScoreScorer->reset();
+      if (windowFilter != nullptr) windowFilter->reset();
+      for (size_t i = 0; i < candidateFilterProbes.size(); i++) {
+        candidateFilterProbes[i].reset(candidateFilterDocSets[i]);
+      }
+      for (size_t i = 0; i < candidateProhibitedDocSetProbes.size(); i++) {
+        candidateProhibitedDocSetProbes[i].reset(candidateProhibitedDocSets[i]);
+      }
+      for (auto& term : leadGroupTerms) term.index = term.size = 0;
+      std::fill(prohibitedExhausted.begin(), prohibitedExhausted.end(), 0);
+      nextCandidatePostingsLeadDoc = -1;
+      candidateCountAdmission = initialCandidateCountAdmission;
+      if (candidateCountAdmission == CandidateCountAdmission::SAMPLING) {
+        // A failed sample clears this alias to select dense execution.
+        candidatePostingsLead = termScorers[0];
+      }
+      denseScoredAdmission = DenseScoredAdmission::SCORE_FIRST;
+      denseSampleWindows = 0;
+      denseSampleLead = denseSampleSurvivors = 0;
+      minCompetitiveScore = std::numeric_limits<float>::lowest();
+    }
+
     ConjunctionBulkScorer(luxir::MemPool& pool, std::span<Query::Scorer*> scorers,
                           std::span<Query::Scorer*> prohibitedScorers,
                           std::span<TermQuery::Scorer*>
@@ -9143,6 +9448,7 @@ public:
       if (candidatePostingsLead != nullptr && !scoredConstruction) {
         assert(denseCountPath);
         candidateCountAdmission = CandidateCountAdmission::SAMPLING;
+        initialCandidateCountAdmission = candidateCountAdmission;
       }
       denseScoredEligible = scoredConstruction && denseCountPath
           && !negatedCountPath && allTermScorers
@@ -9215,6 +9521,7 @@ public:
       // iteration; sparse execution already checks WindowFilter per match.
       if (candidateCountAdmission == CandidateCountAdmission::SAMPLING) {
         candidateCountAdmission = CandidateCountAdmission::DENSE;
+        initialCandidateCountAdmission = candidateCountAdmission;
         candidatePostingsLead = nullptr;
       }
       // The dense scored path fills every clause before applying the filter,
@@ -9447,6 +9754,47 @@ public:
     }
 
   public:
+    int32_t advanceApproximationWindow(int32_t min, int32_t max) override {
+      int32_t doc = PostingsReader::END;
+      for (auto& member : members) {
+        member.doc = member.scorer->advanceApproximationWindow(min, max);
+        doc = std::min(doc, member.doc);
+      }
+      return docid = doc;
+    }
+
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      int32_t doc = PostingsReader::END;
+      for (auto& member : members) {
+        member.doc = member.scorer->advanceWindow(min, max);
+        doc = std::min(doc, member.doc);
+      }
+      return docid = doc;
+    }
+
+    void fillWindowBits(std::span<uint64_t> words, int32_t min,
+                        int32_t max) override {
+      for (auto& member : members) {
+        member.scorer->fillWindowBits(words, min, max);
+        member.doc = member.scorer->docId();
+      }
+      docid = max;
+    }
+
+    [[gnu::cold]] void prepareMembership() override {
+      for (auto& member : members) member.scorer->prepareMembership();
+    }
+
+    [[gnu::cold]] void reset() override {
+      for (size_t i = 0; i < members.size(); i++) {
+        members[i].scorer->reset();
+        members[i].doc = -1;
+        heap[i] = &members[i];
+      }
+      pq.reset(members.size());
+      docid = -1;
+    }
+
     static inline bool disableDisjTwoPhaseForTests = false;
     static inline bool disableTwoWayForTests = false;
 
@@ -9649,7 +9997,6 @@ public:
 
 
   class MaxScoreDisjunctionScorer final : public Query::Scorer {
-    MemPool& pool;
     std::span<Scorer*> scorers;  // stable global-max order, used for deterministic scoring
     std::span<float> clauseMax;
     std::span<float> windowMax;
@@ -9665,7 +10012,7 @@ public:
     // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
     constexpr static auto idComparator = [](Query::Scorer& a, Query::Scorer& b) { return b.docId() < a.docId(); };
 
-    luxir::IndirectPQ<Scorer, decltype(idComparator)>* pq = nullptr;
+    luxir::IndirectPQ<Scorer, decltype(idComparator)> pq;
 
     int32_t maxDoc;
     int32_t windowSize;
@@ -9748,7 +10095,7 @@ public:
         acc += (double) clauseMax[s];
         nePrefix[s] = acc;
       }
-      pq = pool.make<luxir::IndirectPQ<Scorer, decltype(idComparator)>>(essentialPointers, essentialCount);
+      pq.reset(essentialCount);
     }
 
     void updateGlobalSplit() {
@@ -9802,7 +10149,7 @@ public:
         acc += (double) windowMax[(size_t) windowOrder[s]];
         nePrefix[s] = acc;
       }
-      pq = pool.make<luxir::IndirectPQ<Scorer, decltype(idComparator)>>(essentialPointers, essentialCount);
+      pq.reset(essentialCount);
     }
 
     void setupWindow(int32_t start) {
@@ -9879,26 +10226,26 @@ public:
     int32_t nextGlobal() {
       int32_t currid = docid;
       for (;;) {
-        if (pq->size() == 0) {
+        if (pq.size() == 0) {
           docid = luxir::PostingsReader::END;
           currentScore = 0.0f;
           return docid;
         }
-        int32_t topDoc = pq->top().docId();
+        int32_t topDoc = pq.top().docId();
         if (topDoc == luxir::PostingsReader::END) {
-          pq->removeTop();
+          pq.removeTop();
           continue;
         }
         if (topDoc <= currid) {
-          int32_t nextDoc = pq->top().next();
+          int32_t nextDoc = pq.top().next();
           if (nextDoc == luxir::PostingsReader::END) {
-            pq->removeTop();
+            pq.removeTop();
           } else {
-            pq->updateTop();
+            pq.updateTop();
           }
           continue;
         }
-        docid = pq->top().docId();
+        docid = pq.top().docId();
         scoreCurrentDoc();
         return docid;
       }
@@ -9916,22 +10263,22 @@ public:
         }
 
         for (;;) {
-          if (pq->size() == 0) {
+          if (pq.size() == 0) {
             nextWindowStart = windowEnd;
             windowReady = false;
             break;
           }
-          int32_t topDoc = pq->top().docId();
+          int32_t topDoc = pq.top().docId();
           if (topDoc == luxir::PostingsReader::END) {
-            pq->removeTop();
+            pq.removeTop();
             continue;
           }
           if (topDoc < windowStart) {
-            topDoc = pq->top().advance(windowStart);
+            topDoc = pq.top().advance(windowStart);
             if (topDoc == luxir::PostingsReader::END) {
-              pq->removeTop();
+              pq.removeTop();
             } else {
-              pq->updateTop();
+              pq.updateTop();
             }
             continue;
           }
@@ -9941,11 +10288,11 @@ public:
             break;
           }
           if (topDoc <= docid) {
-            int32_t nextDoc = pq->top().next();
+            int32_t nextDoc = pq.top().next();
             if (nextDoc == luxir::PostingsReader::END) {
-              pq->removeTop();
+              pq.removeTop();
             } else {
-              pq->updateTop();
+              pq.updateTop();
             }
             continue;
           }
@@ -9957,11 +10304,14 @@ public:
     }
 
   public:
+    [[gnu::cold]] void prepareMembership() override {
+      for (auto* scorer : scorers) scorer->prepareMembership();
+    }
+
     // The passed in span of scorers will be modified (rearranged).
     MaxScoreDisjunctionScorer(luxir::MemPool& pool, std::span<Scorer*> scorers,
                               int32_t maxDoc, int32_t windowSize = DocsEnumMeta::L1_DOCS)
-            : pool(pool),
-              scorers(scorers),
+            : scorers(scorers),
               clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
               windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
               windowOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
@@ -9969,6 +10319,7 @@ public:
               essentialPointers(pool.make_arr<Scorer*>(scorers.size()), scorers.size()),
               neOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
               nePrefix(pool.make_arr<double>(scorers.size()), scorers.size()),
+              pq(essentialPointers, (size_t) 0),
               maxDoc(maxDoc),
               windowSize(normalizeWindowSize(windowSize)),
               globalMode(normalizeWindowSize(windowSize) >= maxDoc) {
@@ -10080,18 +10431,29 @@ public:
     size_t nextFilterIndex = 0;
     int32_t candidateCount = 0;
 
-    int32_t gatherPostingsCandidates(int32_t min, int32_t max) {
+    int32_t gatherPostingsCandidates(DocSet* externalFilter, int32_t min,
+                                      int32_t max) {
       int32_t upTo = std::min(max, maxDoc);
       PostingsCandidateBatch batch = copyPostingsCandidates(
           postingsScorer->docsEnum, outDocs, nextFilterDoc, min, upTo);
       candidateCount = batch.size;
       nextFilterDoc = batch.nextDoc;
+      if (externalFilter != nullptr) {
+        int32_t retained = 0;
+        for (int32_t i = 0; i < candidateCount; i++) {
+          int32_t doc = outDocs[(size_t) i];
+          if (externalFilter->get(doc)) outDocs[(size_t) retained++] = doc;
+        }
+        candidateCount = retained;
+      }
       return nextFilterDoc >= upTo
           ? PostingsReader::END : nextFilterDoc;
     }
 
     int32_t gatherScorerCandidates(DocSet* externalFilter, int32_t min,
                                    int32_t max) {
+      // Planning admits only direct DocSets here, or a direct term when the
+      // block-gather test control is disabled. These advances never verify.
       int32_t doc = nextFilterDoc;
       if (doc < min) {
         doc = filterScorer->docId();
@@ -10145,9 +10507,11 @@ public:
 
     int32_t gatherCandidates(DocSet* externalFilter, int32_t min,
                              int32_t max) {
-      if (externalFilter == nullptr && postingsScorer != nullptr
+      // A caller may change domains between windows. Keep the postings feed
+      // docs-only throughout; filtering the batch must not resume scored next().
+      if (postingsScorer != nullptr
           && !disableFilteredDisjunctionPostingsBlockGatherForTests) {
-        return gatherPostingsCandidates(min, max);
+        return gatherPostingsCandidates(externalFilter, min, max);
       }
       return filterDocs.empty()
           ? gatherScorerCandidates(externalFilter, min, max)
@@ -10246,6 +10610,21 @@ public:
     }
 
   public:
+    [[gnu::cold]] void prepareMembership() override {
+      if (filterScorer != nullptr) filterScorer->prepareMembership();
+      for (auto* term : termScorers) term->prepareMembership();
+    }
+
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      if (filterScorer != nullptr) filterScorer->reset();
+      for (auto* term : termScorers) term->reset();
+      nextFilterDoc = -1;
+      nextFilterIndex = 0;
+      candidateCount = 0;
+    }
+
     FilteredDisjunctionBulkScorer(
         MemPool& pool, Query::Scorer* filterScorer,
         std::span<const int32_t> filterDocs,
@@ -10407,6 +10786,8 @@ public:
     std::span<uint64_t> countTermBits;
     std::span<TermQuery::Scorer*> disjCountIdentityOthers;
     TermQuery::Scorer* disjCountIdentityLargest = nullptr;
+    // Immutable admission metadata across traversal-local fallbacks. Zero
+    // means the identity was not configured, or an attachment disabled it.
     int64_t disjCountIdentityLargestDf = 0;
     std::span<Query::Scorer*> exclusionScorers;  // flattened OR
     std::span<uint64_t> exclusionBits;           // current production window
@@ -11101,34 +11482,7 @@ public:
       return true;
     }
 
-    bool fillArrayFilterWindowBits(DocSet* filter, int32_t min, int32_t max) {
-      assert(filter != nullptr && filter->type == DocSet::ARRAY);
-      if (!prepareExhaustiveWindow(min, max)) {
-        return false;
-      }
-      clearWindowBits();
-      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
-      float blockScores[Postings::DOCS_BLOCK_SIZE];
-      for (size_t i = 0; i < scorers.size(); i++) {
-        auto* scorer = scorers[i];
-        if (scorer->docId() < windowStart) {
-          scorer->advance(windowStart);
-        }
-        int32_t n;
-        while ((n = scorer->fillScoreBlock(blockDocs, blockScores,
-                                           Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
-          for (int32_t j = 0; j < n; j++) {
-            if (acceptsDoc(filter, nullptr, blockDocs[j])) {
-              setWindowBit(blockDocs[j] - windowStart);
-            }
-          }
-        }
-      }
-      return true;
-    }
-
     bool fillPlainWindowBits(DocSet* filter, int32_t min, int32_t max) {
-      assert(filter == nullptr || filter->type == DocSet::BITSET);
       if (!prepareExhaustiveWindow(min, max)) {
         return false;
       }
@@ -11136,8 +11490,10 @@ public:
       for (size_t i = 0; i < scorers.size(); i++) {
         scorers[i]->fillWindowBits(windowBits, windowStart, windowEnd);
       }
-      if (filter != nullptr) {
+      if (filter != nullptr && filter->type == DocSet::BITSET) {
         applyDomainBits(&((BitDocSet*) filter)->bits());
+      } else if (filter != nullptr) {
+        applyDocSetToWindow(windowBits, windowStart, windowEnd, filter);
       }
       if (windowFilter != nullptr) {
         windowFilter->intersect(windowBits);
@@ -11149,9 +11505,6 @@ public:
     bool fillExhaustiveWindowBits(DocSet* filter, int32_t min, int32_t max) {
       if (disjConjCountPath) {
         return fillDisjConjWindowBits(filter, min, max);
-      }
-      if (filter != nullptr && filter->type == DocSet::ARRAY) {
-        return fillArrayFilterWindowBits(filter, min, max);
       }
       return fillPlainWindowBits(filter, min, max);
     }
@@ -11314,7 +11667,7 @@ public:
       const FixedBitSet& bits = ((BitDocSet*) filter)->bits();
       int32_t doc = windowStart - 1;
       while (doc + 1 < windowEnd) {
-        doc = bits.nextSetBit(doc + 1);
+        doc = bits.nextSetBit(doc + 1, windowEnd);
         if (doc >= windowEnd) {
           break;
         }
@@ -11335,10 +11688,7 @@ public:
     bool matchesAnyClause(int32_t doc) {
       for (size_t i = 0; i < scorers.size(); i++) {
         auto* scorer = scorers[i];
-        if (scorer->docId() < doc) {
-          scorer->advance(doc);
-        }
-        if (scorer->docId() == doc && verifyMatch(scorer, doc)) {
+        if (scorer->advanceWindow(doc, doc + 1) == doc) {
           return true;
         }
       }
@@ -11546,7 +11896,7 @@ public:
       assert(required.size() == scorers.size() - firstRequired);
       prepareOutputWindow(out);
       skipCount(SkipStats::maxScoreRequiredIntersectionWindows);
-      int32_t card = requiredIntersection.prepare(required, windowStart, windowEnd);
+      int32_t card = requiredIntersection.prepareScored(required, windowStart, windowEnd);
       skipCount(SkipStats::maxScoreRequiredIntersectionBitsetWindows);
       if (card == 0) {
         return;
@@ -11676,6 +12026,45 @@ public:
     }
 
   public:
+    [[gnu::cold]] void prepareMembership() override {
+      for (auto* scorer : scorers) scorer->prepareMembership();
+      for (auto* scorer : exclusionScorers) scorer->prepareMembership();
+      if (windowFilter != nullptr) windowFilter->prepareMembership();
+    }
+
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      for (auto* scorer : scorers) scorer->reset();
+      for (auto* scorer : exclusionScorers) scorer->reset();
+      if (windowFilter != nullptr) windowFilter->reset();
+      arrayCursorFilter = nullptr;
+      arrayCursor = 0;
+      arrayCursorLastWindowStart = -1;
+      windowStart = windowEnd = outerWindowStart = outerWindowEnd = 0;
+      outerWindowReady = false;
+      splitIndex = firstRequired = 0;
+      minWindowSize = 1;
+      minCompetitiveScore = std::numeric_limits<float>::lowest();
+      nextPartitionMcs = std::numeric_limits<float>::infinity();
+      std::fill(compactThresholdReady.begin(), compactThresholdReady.end(), false);
+      for (size_t i = 0; i < windowOrder.size(); i++) windowOrder[i] = (int32_t) i;
+      disjCountIdentityLargest = nullptr;
+      if (disjCountIdentityLargestDf > 0) {
+        // Admission requires the largest df to dominate all the others, so
+        // it identifies exactly one retained child. Recover it on this cold
+        // path instead of growing every bulk product with a saved pointer.
+        for (size_t i = 0; i < clauseCosts.size(); i++) {
+          if (clauseCosts[i] == disjCountIdentityLargestDf) {
+            assert(disjCountIdentityLargest == nullptr);
+            disjCountIdentityLargest =
+                static_cast<TermQuery::Scorer*>(scorers[i]);
+          }
+        }
+        assert(disjCountIdentityLargest != nullptr);
+      }
+    }
+
     // The passed in span of scorers will be modified (rearranged).
     MaxScoreBulkScorer(luxir::MemPool& pool, std::span<Query::Scorer*> scorers,
                        std::span<int64_t> clauseCosts,
@@ -11749,6 +12138,11 @@ public:
     bool attachWindowFilter(WindowFilter* filter) override {
       assert(windowFilter == nullptr);
       windowFilter = filter;
+      // The identity counts the full largest term without consulting the
+      // filter. Attachment survives every traversal, unlike a per-call
+      // domain's temporary fallback to ordinary enumeration.
+      disjCountIdentityLargest = nullptr;
+      disjCountIdentityLargestDf = 0;
       return true;
     }
 
@@ -12246,6 +12640,10 @@ public:
     }
 
   public:
+    [[gnu::cold]] void prepareMembership() override {
+      for (auto* scorer : scorers) scorer->prepareMembership();
+    }
+
     MinShouldMatchWandScorer(luxir::MemPool& pool, std::span<Scorer*> scorers, int32_t minMatch)
             : scorers(scorers),
               clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
@@ -12428,6 +12826,32 @@ public:
     }
 
   public:
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      while (min < max) {
+        int32_t candidate = max;
+        for (auto* child : leads()) {
+          candidate = std::min(candidate, child->advanceWindow(min, max));
+        }
+        if (candidate >= max) return docid = candidate;
+        int32_t matches = 0;
+        for (auto* child : scorers) {
+          matches += child->advanceWindow(candidate, candidate + 1) == candidate;
+          if (matches >= minMatch) return docid = candidate;
+        }
+        min = candidate + 1;
+      }
+      return docid = max;
+    }
+
+    [[gnu::cold]] void prepareMembership() override {
+      for (auto* scorer : scorers) scorer->prepareMembership();
+    }
+
+    [[gnu::cold]] void reset() override {
+      for (auto* scorer : scorers) scorer->reset();
+      docid = -1;
+    }
+
     MinShouldMatchScorer(luxir::MemPool& pool, std::span<Scorer*> costAscendingScorers, int32_t minMatch)
             : scorers(costAscendingScorers), minMatch(minMatch),
               leadCount((int32_t)costAscendingScorers.size() - minMatch + 1) {

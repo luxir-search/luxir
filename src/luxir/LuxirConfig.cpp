@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "LuxirConfig.h"
+#include "luxir/util/ProcessAllocator.h"
+#include "luxir/server/Collections.h"
 #include <unistd.h>
 #ifdef __APPLE__
 #include <sys/sysctl.h>
@@ -68,7 +70,40 @@ Rough hierarchy:
 */
 
 
+std::vector<std::string> ReplicationConfig::tenantFilter() const {
+  std::vector<std::string> result;
+  if (tenants.empty()) return result;
+  std::string_view remaining = tenants;
+  for (;;) {
+    auto comma = remaining.find(',');
+    auto tenant = remaining.substr(0, comma);
+    Collections::validateName(tenant, "tenant");
+    result.emplace_back(tenant);
+    if (comma == std::string_view::npos) break;
+    remaining.remove_prefix(comma + 1);
+  }
+  std::ranges::sort(result);
+  result.erase(std::unique(result.begin(), result.end()), result.end());
+  return result;
+}
+
+std::vector<std::string> ReplicationConfig::peerList() const {
+  std::vector<std::string> result;
+  std::string_view remaining = peers;
+  while (!remaining.empty()) {
+    auto comma = remaining.find(',');
+    auto peer = remaining.substr(0, comma);
+    if (peer.empty()) throw std::invalid_argument("replication.peers has an empty entry");
+    result.emplace_back(peer);
+    if (comma == std::string_view::npos) break;
+    remaining.remove_prefix(comma + 1);
+  }
+  return result;
+}
+
 void ReplicationConfig::validate() const {
+  tenantFilter();
+  if (!max_acknowledgments) throw std::invalid_argument("replication.max-acknowledgments must be positive");
   if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
     throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
   }
@@ -76,9 +111,12 @@ void ReplicationConfig::validate() const {
 
 void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--replicate-from,--replication.source", replication.source, "Follow this HTTP source namespace");
+  app.add_option("--replication.tenants", replication.tenants, "Comma-separated tenant subscription (empty follows all)");
+  app.add_option("--replication.peers", replication.peers, "Comma-separated http:// nodes serving file copies, tried before the source");
+  app.add_option("--replication.max-acknowledgments", replication.max_acknowledgments,
+      "Node-wide follower/collection acknowledgment row budget")->default_val(replication.max_acknowledgments);
   app.add_option("--replication.follower-id", replication.follower_id, "Stable follower id (generated when omitted)");
   app.add_option("--replication.downloads", replication.downloads, "Concurrent collection downloads per follower")->check(CLI::Range(1, 64));
-  app.add_flag("--promote", promote, "Promote a follower directory to an independent writer");
   app.add_flag("--read-only", read_only,
                "Serve an existing data directory without the write lock; rejects all updates");
   app.add_option("--log-level", log_level, "Log level (trace, debug, info, warn, error, critical)")
@@ -94,12 +132,6 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "(0 = unlimited)")
       ->check(CLI::NonNegativeNumber)
       ->default_str("25% of system RAM");
-  app.add_option("--malloc-mmap-threshold", malloc_mmap_threshold,
-                 "glibc malloc mmap threshold in bytes (0 = glibc dynamic default, "
-                 "-1 = pin at the MemPool block size; recommended for "
-                 "memory-constrained nodes)")
-      ->check(CLI::Number)
-      ->default_str("0");
 
   // No default_val: leaving the bound field at its sentinel (<0) lets normalize()
   // derive the gRPC port as http.port + 1 unless the user sets one explicitly.
@@ -120,9 +152,9 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(server.stream_buffer_bytes);
 
   app.add_option("--replication.pin-idle-timeout-ms", replication.pin_idle_timeout_ms,
-                 "Replication reservation idle timeout in milliseconds")->default_val(replication.pin_idle_timeout_ms);
+                 "Snapshot pin idle timeout in milliseconds")->default_val(replication.pin_idle_timeout_ms);
   app.add_option("--replication.pin-retained-bytes", replication.pin_retained_bytes,
-                 "Per-collection bytes retained only by reservations")->transform(CLI::AsSizeValue(false))
+                 "Per-collection bytes retained only by snapshot pins")->transform(CLI::AsSizeValue(false))
       ->default_val(replication.pin_retained_bytes);
   app.add_option("--replication.follower-timeout-ms", replication.follower_timeout_ms,
                  "Follower liveness in milliseconds (watch timeout at most one third)")->default_val(replication.follower_timeout_ms);
@@ -137,6 +169,10 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(store.checked_dir.sync)
       ->check(CLI::IsMember({"off", "warn", "throw"}));
 
+  app.add_flag("--indexing.huge-pages,!--no-indexing.huge-pages", index.huge_pages,
+               "Advise transparent huge pages for the indexing arena (jemalloc builds; "
+               "no effect when host THP is disabled)")
+      ->default_val(index.huge_pages);
   app.add_option("--indexing.max-inverter-ram-mb", index.max_inverter_ram_mb,
                  "Per-inverter RAM cap (MiB) before an auto-flush to a segment")
       ->check(CLI::PositiveNumber)
@@ -257,6 +293,7 @@ void LuxirConfig::normalize() {
 }
 
 void LuxirConfig::apply() const {
+  configureIndexingArena(index.huge_pages);
   auto level = spdlog::level::from_str(log_level);
   spdlog::set_level(level);
 }

@@ -91,7 +91,7 @@ TEST_F(ExecutionHierarchyTest, termPlanBuildsAllRecordedProducts) {
 TEST_F(ExecutionHierarchyTest, allPlanSnapshotsDenseControlAtSupplierCreation) {
   DenseClauseGuard guard;
   AllQuery::disableDenseClauseForTests = false;
-  AllQuery::Supplier supplier(reader->segments()[0], 0.0f);
+  AllQuery::Supplier supplier(reader->segments()[0], 0.0f, false);
   Query::PlanContext context = Query::PlanContext::fromLeadCost(
       std::numeric_limits<int64_t>::max());
   auto* plan = supplier.resolve(pool, context);

@@ -6,8 +6,13 @@
 #include <cstring>
 #include <filesystem>
 #include <format>
+#include <memory>
 #include <stdexcept>
+#include <utility>
+#include "FieldReader.h"
+#include "IntColReader.h"
 #include "Postings.h"
+#include "luxir/util/MemPool.h"
 
 namespace luxir {
 
@@ -100,14 +105,51 @@ std::shared_ptr<PostingsReader> PostingsReader::create(Directory& dir, uint64_t 
 }
 
 PostingsReader::PostingsReader(Directory& dir, uint64_t segId) {
-  auto reader = create(dir, segId, false);
-  // This should never fail (should throw exception on failure) since missingFileOK=false, but just in case
-  if (!reader) {
-    throw std::filesystem::filesystem_error(
-            "Failed to create PostingsReader",
-            std::make_error_code(std::errc::no_such_file_or_directory));
+  // missingFileOK=false throws on a missing file rather than returning false
+  initializeFromFiles(dir, segId, false);
+}
+
+PostingsReader::~PostingsReader() {
+  for (auto* node = leafMetas.load(std::memory_order_relaxed); node != nullptr;) {
+    delete std::exchange(node, node->next);
   }
-  *this = std::move(*reader);
+}
+
+std::optional<NumColumnFormat::LeafMeta> PostingsReader::readLeafMeta(std::string_view field) {
+  auto poolGuard = MemPool::threadLocalPoolGuard();
+  FieldReader fieldReader(*this);
+  if (!fieldReader.seek(field)) return std::nullopt;
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  if (fieldInfo.columnLoc.offset() <= 0) return std::nullopt;
+  IntColReader column(*this, fieldInfo);
+  if (!column.leafBounded()) return std::nullopt;
+  return column.leafMeta();
+}
+
+const NumColumnFormat::LeafMeta* PostingsReader::numericLeafMeta(std::string_view field) {
+  // The nodes from `node` up to (not including) `stop` that hold `field`.
+  auto find = [field](LeafMetaNode* node, LeafMetaNode* stop) -> LeafMetaNode* {
+    for (; node != stop; node = node->next) {
+      if (node->field == field) return node;
+    }
+    return nullptr;
+  };
+  auto view = [](LeafMetaNode* node) {
+    return node->meta.has_value() ? &*node->meta : nullptr;
+  };
+  LeafMetaNode* head = leafMetas.load(std::memory_order_acquire);
+  if (auto* found = find(head, nullptr)) return view(found);
+  auto node = std::unique_ptr<LeafMetaNode>(
+      new LeafMetaNode{std::string(field), readLeafMeta(field), head});
+  while (!leafMetas.compare_exchange_weak(node->next, node.get(),
+                                          std::memory_order_acq_rel,
+                                          std::memory_order_acquire)) {
+    // Only the nodes pushed since `head` can hold a racing build of `field`.
+    if (auto* found = find(node->next, head)) return view(found);
+    head = node->next;
+  }
+  return view(node.release());
 }
 
 } // namespace luxir

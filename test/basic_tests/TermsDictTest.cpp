@@ -433,6 +433,17 @@ TEST_F(TermsDictTest, RangeTableSeeksAcross64BitTermOrdinals) {
   terms.seekOrd((int64_t) HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE - 1);
   EXPECT_EQ(terms.ord(), (int64_t) HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE - 1);
   EXPECT_EQ((std::string_view) terms.term(), "t063");
+
+  // Block docFreqs step down across the 64-bit row boundary.
+  TermsEnum blocks(pool, *reader, fieldInfo);
+  auto last = blocks.docFreqBlock(fieldInfo.nTerms - 1);
+  EXPECT_EQ(last.firstOrd, (int64_t) HIGH_RANGE_ORD + Postings::TERMS_BLOCK_SIZE);
+  EXPECT_EQ(last.docFreqs.size(), (size_t) Postings::TERMS_BLOCK_SIZE);
+  auto previous = blocks.docFreqBlock(last.firstOrd - 1);
+  EXPECT_EQ(previous.firstOrd, (int64_t) HIGH_RANGE_ORD);
+  EXPECT_EQ(previous.docFreqs[5], 1u);
+  blocks.seekOrd((int64_t) HIGH_RANGE_ORD + 5);
+  EXPECT_EQ((std::string_view) blocks.term(), "t037");
 }
 
 TEST_F(TermsDictTest, DecodesEscapedPrefixAndSuffixLengths) {

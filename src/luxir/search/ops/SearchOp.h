@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
@@ -20,7 +21,7 @@
 #include "luxir/search/DocSet.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/search/SearchOverrides.h"
-#include "luxir/util/MappedAlloc.h"
+#include "luxir/util/BigBuffer.h"
 #include "luxir/util/thread.h"
 
 
@@ -78,6 +79,8 @@ T& optMut(std::optional<T>& opt) {
 }
 
 class SearchOp {
+  std::vector<uint32_t> segmentStateRetentions;
+
 public:
   SearchRequest& req;
   std::string_view name;
@@ -88,7 +91,8 @@ public:
   // We can't pass both the parent and children to constructors (and have them fully formed)
   // one has to come before the other.  The parser currently sets subOps and parent
   // after construction, so do not inspect these fields in the constructor.
-  SearchOp(SearchRequest& req, std::string_view name) : req(req), name(name) {
+  SearchOp(SearchRequest& req, std::string_view name)
+    : segmentStateRetentions(req.reader->segments().size()), req(req), name(name) {
   }
 
   virtual void init() {
@@ -96,6 +100,42 @@ public:
       subOp->init();
     }
   }
+
+  // Bucket blocks execute synchronously. Segment tasks otherwise own distinct
+  // slots; a retained ancestor also covers Fusion sources and nested children.
+  bool segmentStateRetained(IndexReader::Segment& segment) const noexcept {
+    for (auto* owner = this; owner != nullptr; owner = owner->parent) {
+      if (owner->segmentStateRetentions[(size_t)segment.ord] != 0) return true;
+    }
+    return false;
+  }
+
+  virtual void releaseSegmentState(IndexReader::Segment& segment) noexcept {
+    if (segmentStateRetained(segment)) return;
+    for (auto& [name, child] : subOps) child->releaseSegmentState(segment);
+  }
+
+  class SegmentStateRetention {
+    std::span<SearchOp* const> ops;
+    std::span<IndexReader::Segment> segments;
+
+  public:
+    SegmentStateRetention(std::span<SearchOp* const> ops,
+                          std::span<IndexReader::Segment> segments)
+      : ops(ops), segments(segments) {
+      for (auto& segment : segments) {
+        for (auto* op : ops) ++op->segmentStateRetentions[(size_t)segment.ord];
+      }
+    }
+    SegmentStateRetention(const SegmentStateRetention&) = delete;
+    SegmentStateRetention& operator=(const SegmentStateRetention&) = delete;
+    ~SegmentStateRetention() {
+      for (auto& segment : segments) {
+        for (auto* op : ops) --op->segmentStateRetentions[(size_t)segment.ord];
+        for (auto* op : ops) op->releaseSegmentState(segment);
+      }
+    }
+  };
 
   class Calculator;
   class InlineCalculator;
@@ -119,6 +159,16 @@ public:
   // segments are fed. Stateless operations keep the default zero estimate.
   virtual size_t facetBucketResidentBytes() const {
     return 0;
+  }
+
+  // Whether this subtree runs query weights whose per-segment state is
+  // released and rebuilt (Weight::hasReleasableSegmentState): bucket bindings
+  // fed in one segment pass share it. Ops holding weights override this to
+  // check the weights their releaseSegmentState releases.
+  virtual bool facetBucketSharesSegmentState() const {
+    return std::ranges::any_of(subOps, [](const auto& entry) {
+      return entry.second->facetBucketSharesSegmentState();
+    });
   }
 
   // Result-stage facet children may bind to parent-produced sources. The
@@ -186,6 +236,10 @@ public:
     };
 
     Calculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : op(op), parent(parent), slot(slot), numSlots(numSlots) {}
+
+    virtual void releaseSegmentState(IndexReader::Segment& segment) noexcept {
+      op.releaseSegmentState(segment);
+    }
 
     // The Val this calculator fills: `val` itself for an ordinary op, or its
     // bucket slot in val's ArrayArm (created on first use, sized to numSlots).
@@ -386,16 +440,14 @@ class FacetEntryTable {
       2 * (sizeof(std::pair<int64_t, char*>) + 1);
   static constexpr std::string_view BREAKER = "facet aggregate state";
 
-  boost::unordered_flat_map<int64_t, char*> sparseEntries;
+  BigFlatMap<int64_t, char*> sparseEntries;
   // The entry header counts documents delivered to metrics. Repeated values
   // add only facet occurrences, without changing compact metric denominators.
   boost::unordered_flat_map<char*, int64_t> extraOccurrences;
   std::vector<int64_t> touchedKeys;
   std::vector<uint32_t> calcEntryBytes;
   MemPool entryPool;
-  MappedAlloc denseMapping;
-  char* denseMalloc = nullptr;
-  char* denseBase = nullptr;
+  BigVector<char> denseEntries;
   std::span<SearchOp::InlineCalculator*> calcs;
   RequestMemTracker* tracker = nullptr;
   InlineFacetEntryStats* stats = nullptr;
@@ -439,13 +491,11 @@ class FacetEntryTable {
   }
 
   char* denseEntryForIndex(size_t index) {
-    return denseBase + index * stride;
+    return denseEntries.data() + index * stride;
   }
 
   bool tryInitializeDense(size_t logicalBytes, size_t expectedTouched) {
-    bool mapped = logicalBytes >= mappedAllocationFloor;
-    size_t storageBytes = mapped ? MappedAlloc::roundedSize(logicalBytes)
-                                 : logicalBytes;
+    size_t storageBytes = bigBufferStorage(logicalBytes);
     if (expectedTouched > std::numeric_limits<size_t>::max()
                               / sizeof(int64_t)) {
       return false;
@@ -458,20 +508,8 @@ class FacetEntryTable {
     if (!tracker->tryCharge(reservation)) return false;
     try {
       if (expectedTouched != 0) touchedKeys.reserve(expectedTouched);
-      if (!mapped) {
-        denseMalloc = (char*)std::malloc(logicalBytes);
-        if (denseMalloc == nullptr) throw std::bad_alloc();
-        denseBase = denseMalloc;
-        memset(denseBase, 0, logicalBytes);
-      } else {
-        denseMapping = MappedAlloc(logicalBytes);
-        assert(denseMapping.size() == storageBytes);
-        denseBase = (char*)denseMapping.data();
-      }
+      denseEntries.resize(logicalBytes);
     } catch (...) {
-      std::free(denseMalloc);
-      denseMalloc = nullptr;
-      denseBase = nullptr;
       releaseCharge(reservation);
       std::vector<int64_t>().swap(touchedKeys);
       throw;
@@ -584,7 +622,6 @@ public:
   FacetEntryTable& operator=(const FacetEntryTable&) = delete;
 
   ~FacetEntryTable() {
-    std::free(denseMalloc);
     if (tracker != nullptr) {
       releaseCharge(denseStorageBytesCharged + sparseBytesCharged
                     + touchedCapacityCharged);
@@ -756,7 +793,7 @@ public:
     if (rep == Rep::DENSE) {
       for (int64_t key : touchedKeys) {
         size_t index = (size_t)key;
-        accept(key, denseBase + index * stride);
+        accept(key, denseEntries.data() + index * stride);
       }
       return;
     }

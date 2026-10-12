@@ -4,12 +4,18 @@ The HTTP surface is plain JSON for bounded messages and NDJSON for streams.
 Collection names live in the path, and the request body uses the same field
 names as the protobuf messages.
 
+Collections belong to a tenant. Search, update and replica-wait routes act in
+the caller's own tenant, which is the default tenant `t0` until requests carry
+credentials. Administration and snapshot routes may name another tenant under
+`/tenants/{tenant}`.
+
 ## Endpoints
 
 | Method and path | Purpose |
 |---|---|
 | `GET /health` | Process liveness. |
 | `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
+| `POST /collections/{collection}/_wait_for_replicas` | Wait on an existing commit token; see [Replication](replication.md#write-then-read-your-write). |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
 | `GET /collections/{collection}/_schema?view=resolved` | Read physical representations, bindings, and conservative schema coverage; HTTP only. |
@@ -19,13 +25,22 @@ names as the protobuf messages.
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
 | `GET /_stats` | Node totals and per-collection operational statistics. |
 | `GET /collections/{collection}/_stats` | Operational statistics for one collection. |
+| `GET /collections/{collection}/_snapshot` | Pin the current snapshot for copying; see [Replication](replication.md). |
+| `GET /collections/{collection}/_snapshot/files/{name}` | One file of a pinned snapshot. |
+| `GET /tenants` | Tenants that own a collection. |
+| `/tenants/{tenant}/collections/...` | The administration and snapshot routes above (`_list`, `_create`, `_delete`, `_schema`, `_stats`, `_snapshot`) for a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
+| `GET /_replication/watch`, `POST /_replication/installed`, `GET /_replication/status` | Replication discovery, acknowledgments and status; see [Replication](replication.md). |
 
 Collection names occupy one URL path component. Names beginning with `_` are
 reserved. Search and schema reads never create a missing collection; an update
 does by default unless `--no-indexing.auto-create-collection` is set.
 
 `_create` installs the optional `schema` (same shape as a `_schema` set)
-before the collection becomes visible. See
+before the collection becomes visible and returns `{name, commit}`. Schema
+writes return `{schema, commit}`; schema GET still returns the authored schema
+directly, suitable for posting back. Each token identifies the exact snapshot
+published by that operation. Search response envelopes include the token of the
+reader they used. See
 [Collection lifecycle](operations.md#collection-lifecycle) for deletion
 semantics under concurrent use.
 
@@ -185,7 +200,13 @@ update returns HTTP success with `status: "partial"` and per-document
 `status: "error"` and a top-level `error`. Clients must inspect the body. NDJSON
 ingest reports a request-level failure as a terminal response line after
 earlier group acknowledgements; no later records from that connection are
-accepted. See [Indexing](indexing.md#per-document-failures).
+accepted. URL EOF commits always return a `commits` map, even for a single
+collection, and collect every admitted collection outcome before responding.
+Entries contain `commit`, optional `replicas`, and `error` when that collection's
+local commit failed. Replica wait outcomes (`satisfied`, `timed_out`,
+`cancelled`) retain the token and do not change local commit success. A local
+failure sets overall `status: "error"` and a top-level `error`, with HTTP 200,
+consistent with unary commit failures. See [Indexing](indexing.md#per-document-failures).
 
 Search warnings are successful results with a bounded declared degradation.
 Use `warnings[].code` as the machine key and the message as diagnostic detail;

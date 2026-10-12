@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <memory_resource>
+
 #include "StorageMemory.h"
 
 #include <stdexcept>
@@ -59,14 +61,6 @@ public:
 };
 
 class RAMFile;
-
-// A filesystem output failure may leave the current append-only value partially
-// written. Indexing code distinguishes this from a document error
-// and aborts the in-progress segment instead of reusing its streams.
-class FileIOException : public std::runtime_error {
-public:
-  using std::runtime_error::runtime_error;
-};
 
 struct FileDescriptor {
   std::string name;
@@ -357,20 +351,30 @@ class RAMFile : public File {
   friend class FSFile;
   friend class RAMDelegatingFile;
 
+  struct BufferDeleter {
+    std::pmr::memory_resource* resource;
+    size_t size;
+    void operator()(char* ptr) const { resource->deallocate(ptr, size); }
+  };
+  using BufferPtr = std::unique_ptr<char[], BufferDeleter>;
+
   struct Buffer {
     StorageCharge charge;
-    std::unique_ptr<char[]> data;
+    BufferPtr data;
     size_t used;
     size_t capacity;
   };
 
   std::shared_ptr<StorageMemory> memory;
+  std::pmr::memory_resource* upstream;
   std::vector<Buffer> buffers;
   size_t fileSize = 0;
   size_t allocatedSize = 0;
 
   void newBuffer(size_t size) {
-    buffers.push_back({StorageCharge(memory, size), std::make_unique_for_overwrite<char[]>(size), 0, size});
+    StorageCharge charge(memory, size);
+    BufferPtr data((char*)upstream->allocate(size), BufferDeleter{upstream, size});
+    buffers.push_back({std::move(charge), std::move(data), 0, size});
     allocatedSize += size;
   }
 
@@ -406,7 +410,9 @@ class RAMFile : public File {
 public:
   constexpr static uint32_t START_BUFFER_SIZE = 1024;  // size of first allocated buffer (subsequent buffers may be bigger)... mostly for testing.
 
-  RAMFile(std::string_view name, std::shared_ptr<StorageMemory> memory = {}) : File(name), memory(std::move(memory)) {
+  RAMFile(std::string_view name, std::shared_ptr<StorageMemory> memory = {},
+          std::pmr::memory_resource* upstream = std::pmr::new_delete_resource())
+      : File(name), memory(std::move(memory)), upstream(upstream) {
   }
 
   ~RAMFile() override = default;

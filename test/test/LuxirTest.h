@@ -4,14 +4,12 @@
 #pragma once
 #include <memory>
 #include <gtest/gtest.h>
+#include "luxir/util/ProcessAllocator.h"
 #include "luxir/util/random.h"
 #include "luxir/util/luxir_util.h"
 
 namespace luxir {
 
-// AddressSanitizer ships its own operator new/delete; our counting override in
-// LuxirTest.cpp would clash with it (alloc-dealloc-mismatch), so the override is
-// compiled out under ASan and allocation counting is disabled there.
 #if defined(__SANITIZE_ADDRESS__)
 #  define LUXIR_ASAN 1
 #elif defined(__has_feature)
@@ -21,28 +19,20 @@ namespace luxir {
 #endif
 
 namespace memtrack {
-// Per-thread allocation counters, updated by the global operator new/new[]
-// overrides in LuxirTest.cpp. One thread-local increment per allocation. Lets a
-// test assert how many heap allocations a code path makes.
-// (Named memtrack, not testing, so it does not shadow gtest's ::testing.)
-extern thread_local long allocCount;
-extern thread_local long allocBytes;
+// Heap bytes the calling thread allocates (malloc and operator new alike), read
+// from jemalloc's per-thread counter or a sanitizer malloc hook. Lets a test
+// assert that a code path does not allocate. (Named memtrack, not testing, so
+// it does not shadow gtest's ::testing.)
+//
+// False only in builds with neither jemalloc nor a sanitizer.
+// Counting-based tests should GTEST_SKIP when this is false.
+inline const bool counting_enabled = threadAllocatedBytes().has_value();
 
-// False under ASan (counting override disabled). Counting-based tests should
-// GTEST_SKIP when this is false.
-#ifdef LUXIR_ASAN
-inline constexpr bool counting_enabled = false;
-#else
-inline constexpr bool counting_enabled = true;
-#endif
-
-// RAII window: AllocScope s; ...code...; EXPECT_EQ(0, s.count());
+// RAII window: AllocScope s; ...code...; EXPECT_EQ(0, s.bytes());
 // Capture the delta into a local BEFORE any EXPECT (gtest macros allocate).
 struct AllocScope {
-  long startCount = allocCount;
-  long startBytes = allocBytes;
-  long count() const { return allocCount - startCount; }
-  long bytes() const { return allocBytes - startBytes; }
+  uint64_t startBytes = threadAllocatedBytes().value_or(0);
+  long bytes() const { return (long)(threadAllocatedBytes().value_or(0) - startBytes); }
 };
 }  // namespace memtrack
 

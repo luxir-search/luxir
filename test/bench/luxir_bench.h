@@ -7,13 +7,11 @@
 #include <sys/resource.h>
 #include <fstream>
 #include <unistd.h>
-#ifdef __GLIBC__
-#include <malloc.h>
-#endif
 #ifdef __APPLE__
 #include <mach/mach.h>
 #endif
 #include "benchmark/benchmark.h"
+#include "luxir/util/ProcessAllocator.h"
 #include "test/LuxirTest.h"
 
 
@@ -53,12 +51,6 @@ inline bool skipBenchIfDataMissing(benchmark::State& state, bool present, std::s
   if (present) return false;
   state.SkipWithMessage(std::string(what) + " not available; see the test-data setup");
   return true;
-}
-
-inline void trimHeap() {
-#ifdef __GLIBC__
-  malloc_trim(0);
-#endif
 }
 
 inline size_t currentRSSKB() {
@@ -101,7 +93,7 @@ public:
   }
 
   RSSWatcher(size_t sleepNs = 1000000) {
-    trimHeap();
+    releaseFreeMemory();
     sleepns = sleepNs;
     page_size_kb = sysconf(_SC_PAGESIZE) / 1024;
     startRSS = getRSSKB();

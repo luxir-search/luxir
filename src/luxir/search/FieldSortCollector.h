@@ -23,6 +23,8 @@ class FieldSortCollector {
 
 public:
   inline static bool disableKeyGatherForTests = false;
+  // Overrides the priced leaf-descent decision (descendsToLeaves).
+  inline static std::optional<bool> forceLeafDescentForTests;
 
   struct SortDoc {
     segdoc doc;
@@ -167,23 +169,61 @@ public:
 
   // String-sort candidate pruning state, all segment-local. The union is a
   // conservative candidate superset built from the primary comparator's
-  // competitive ord interval; it and every allocation behind it live in
-  // segmentPool, which the dispatching op owns for the segment's lifetime.
+  // competitive ord interval; it, the activation gate's state, and every
+  // allocation behind them live in segmentPool, which the dispatching op
+  // owns for the segment's lifetime.
   static constexpr int32_t CANDIDATE_PROBE_INTERVAL = 4096;
-  static constexpr int64_t CANDIDATE_COST_RATIO = 8;
   static constexpr int64_t CANDIDATE_STATE_BYTES = 8 << 20;
-  // Docs-equivalent charge per captured term: the activation walk pays a
-  // dictionary seek, a stats decode, and a postings-state capture per term,
-  // and the union pays heap traffic per term after that. Charging it keeps
-  // wide intervals from activating against small filtered domains.
-  static constexpr int64_t CANDIDATE_TERM_CAPTURE_COST = 16;
+  // The union's costs in walked source docs: per captured term (a dictionary
+  // seek, a stats decode, a postings-state capture, and heap traffic after
+  // that) and per posting it reads (a heap cycle on sparse terms, a candidate
+  // consult on dense ones). Both sit above what they measure (about 1.5x
+  // and 2x), where activations fell closest to the measured best; an active
+  // union is never abandoned.
+  static constexpr int64_t CANDIDATE_TERM_CAPTURE_COST = 20;
+  static constexpr int64_t CANDIDATE_POSTING_COST = 8;
   MemPool* segmentPool = nullptr;
   UnionHeapScorer* candidates = nullptr;
   int64_t candidateLo = 0;
   int64_t candidateHi = -1;
+  // The activation gate's docFreq totals, walked outward from the competitive
+  // interval's anchored end (CompetitiveOrdState): candidateDocFreqs[j] sums
+  // the docFreqs of the j + 1 ords nearest it, the first candidateReach of
+  // them filled. The interval only shrinks toward its anchor within a
+  // segment, so every later total is an entry here or, past the reach, at
+  // least the last one: no docFreq is read twice in a segment. The gate and
+  // the capture walk share candidateTerms; the comparator's own enum backs
+  // setBottom/copy caching and must not be repositioned here.
+  TermsEnum* candidateTerms = nullptr;
+  std::span<int64_t> candidateDocFreqs;
+  int64_t candidateReach = 0;
   int64_t segmentSourceCost = 0;
+  // Source docs of the segments collected before this one: the heap's
+  // bottom already ranks k among them.
+  int64_t priorSourceDocs = 0;
+  // The docs a walk over the segment expects to collect (setWalkCard); 0
+  // until a walk names it, when the source cost stands in.
+  int64_t segmentWalkCard = 0;
   int32_t segmentMaxDoc = 0;
-  bool leafDescentEnabled = false;
+  // The values every doc this collector will see holds in the primary sort
+  // column (a request fact, from the query and filters; see
+  // TopDocsReq::sortValueEnvelope). Per segment it shapes primaryKeys: the
+  // domain's keys follow the column's in-envelope values, and none lies
+  // before the envelope's best edge (SegmentKeys::keyFloor), so no
+  // bound-driven traversal can prove out a leaf bounded before that edge
+  // (leavesBeforeKeyFloor). Either only ever widens what is collected; an
+  // envelope can cost time but never results.
+  std::optional<Query::ValueEnvelope> primaryValues;
+  // The current segment's primary keys, when its column offers leaf
+  // bounds.
+  std::optional<FieldComparator::SegmentKeys> primaryKeys;
+  int64_t leavesBeforeKeyFloor = 0;
+  // Leaves holding no value inside primaryValues (SegmentKeys::leavesOutside).
+  FieldComparator::SegmentKeys::Outside leavesOutsideValues;
+  // Whether nextCompetitiveRange descends to leaves (descendsToLeaves),
+  // decided at its first full-heap consult of a segment.
+  enum class LeafDescent : uint8_t { UNDECIDED, ON, OFF };
+  LeafDescent leafDescent = LeafDescent::UNDECIDED;
   int32_t nextProbeDoc = 0;
   bool candidatesDisabled = false;
 
@@ -267,9 +307,16 @@ public:
     candidates = nullptr;
     candidateLo = 0;
     candidateHi = -1;
+    candidateTerms = nullptr;
+    candidateDocFreqs = {};
+    candidateReach = 0;
     nextProbeDoc = 0;
     candidatesDisabled = false;
+    if (segmentSourceCost > 0) {
+      priorSourceDocs += std::min<int64_t>(segmentSourceCost, segmentMaxDoc);
+    }
     segmentSourceCost = sourceCost;
+    segmentWalkCard = 0;
     segmentMaxDoc = reader != nullptr ? reader->maxDoc() : 0;
     for (auto& clause : clauses) {
       clause.resetCache();
@@ -277,25 +324,176 @@ public:
         clause.comparator->setSegment(segment, reader);
       }
     }
-    // Leaf descent in nextCompetitiveRange only pays when the expected leaf
-    // visit floor (ceil(k * maxDoc / sourceCost) leaves) is MATERIALLY
-    // sub-saturating. At saturation every leaf classifies COLLECT under the
-    // final bottom, so descending would only split producer calls eight ways
-    // and classify eight bounds per block for nothing - and near saturation
-    // (measured at floor/leafCount ~0.99: a reproducible ~30% regression)
-    // the few skippable leaves fragment producer ranges without paying for
-    // the classifications. The 2x margin keeps the whole win at 1% and off
-    // through the boundary band.
-    leafDescentEnabled = false;
+    leafDescent = LeafDescent::UNDECIDED;
+    leavesBeforeKeyFloor = 0;
+    primaryKeys.reset();
     FieldComparator::KeyBatch* batch;
-    if (topCount > 0 && sourceCost > 0 && clauses[0].comparator != nullptr
+    if (topCount > 0 && clauses[0].comparator != nullptr
         && (batch = clauses[0].comparator->keyBatch()) != nullptr
         && batch->leafBlockSize() != 0) {
-      int64_t depth = (topCount * (int64_t)segmentMaxDoc + sourceCost - 1)
-          / sourceCost;
-      leafDescentEnabled = 2 * depth < batch->leafBlockCount();
+      primaryKeys = batch->segmentKeys(primaryValues);
+    }
+    leavesOutsideValues = {};
+    if (primaryKeys.has_value() && primaryValues.has_value()) {
+      leavesBeforeKeyFloor =
+          primaryKeys->leavesBoundedBefore(primaryKeys->keyFloor());
+      leavesOutsideValues = primaryKeys->leavesOutside();
     }
     if (topCount > 0 && pq.size() == (size_t)topCount) setBottom();
+  }
+
+  // The docs a walk over the current segment expects to collect, which
+  // prices its leaf descent (descendsToLeaves). The source cost overstates
+  // them for a conjunction (its lead's cost), and the domain decides both
+  // how far the bottom matures and how many docs a skipped leaf holds.
+  void setWalkCard(int64_t card) { segmentWalkCard = card; }
+
+  // The predicted heap bottom once a segment's domain - `card` docs whose
+  // keys follow `segment`'s in-envelope values - is collected
+  // into a heap of `heapSize` of topCount entries (bottomKey: the bottom of
+  // a full one): the topCount-th best key of the heap's and the domain's,
+  // estimated from the value sketch with the domain independent of the key
+  // within the envelope. nullopt when the heap does not fill. The heap's
+  // entries are read as following the segment's distribution: a heap that
+  // is not full holds heapSize more docs drawn from it, and a full one with
+  // e domain docs before its bottom (fraction f_b of the domain) keeps the
+  // entries the merge leaves it as its own f_b-quantile does, which puts
+  // the new bottom at fraction f_b * k / (k + e). Both are exact for
+  // segments drawn alike, and a domain wholly past a full bottom leaves it.
+  // This is the one prior every field-sort decision prices: the leaves
+  // bounded at or before the predicted bottom are the visit floor
+  // (predictedVisitFloor), whatever the leaf geometry - wide zones give the
+  // density floor k * maxDoc / card, tight (doc-order correlated) zones
+  // about k / m leaves in either direction, and a range on the sort field
+  // itself puts the bottom inside it.
+  static std::optional<int64_t> predictBottom(
+      const FieldComparator::SegmentKeys& segment, int64_t card,
+      int64_t topCount, int64_t heapSize, int64_t bottomKey) {
+    assert(topCount > 0 && card > 0 && segment.values() > 0);
+    double k = (double)topCount;
+    if (heapSize < topCount) {
+      double fraction = k / ((double)heapSize + (double)card);
+      if (fraction >= 1) return std::nullopt;
+      return segment.keyAt(fraction);
+    }
+    double before = segment.fractionBefore(bottomKey);
+    if (before <= 0) return bottomKey;
+    double entering = (double)card * before;
+    return std::min(bottomKey, segment.keyAt(before * k / (k + entering)));
+  }
+
+  // The leaves a bound-driven traversal visits when the bottom settles at
+  // `bottom` over a domain of `card` docs: those bounded strictly before it,
+  // and of those bounded exactly at it only enough to hold the domain docs
+  // still needed at that key - the tie rule skips a leaf whose best key ties
+  // the bottom once the heap's tied entries come first in segdoc order, so
+  // a heavily tied bottom needs its first few tied leaves, not all of them.
+  static int64_t visitFloorAt(const FieldComparator::SegmentKeys& segment,
+                              int64_t bottom, int64_t card, int64_t topCount) {
+    int64_t strict = segment.leavesBoundedBefore(bottom);
+    int64_t tied = segment.leavesBoundedAtOrBefore(bottom) - strict;
+    if (tied <= 1) return strict + tied;
+    double before = segment.fractionBefore(bottom);
+    double through = bottom == std::numeric_limits<int64_t>::max()
+        ? 1.0 : segment.fractionBefore(bottom + 1);
+    double needed = std::max(1.0, (double)topCount - (double)card * before);
+    double perLeaf = (double)card * (through - before) / (double)tied;
+    if (perLeaf <= 0) return strict + tied;
+    // Clamped before the cast: a vanishing perLeaf sends the quotient past
+    // int64's range.
+    return strict
+        + (int64_t)std::clamp(std::ceil(needed / perLeaf), 1.0, (double)tied);
+  }
+
+  // Leaves of the current segment bounded at or before the predicted
+  // bottom (predictBottom) once its `card` domain docs are collected into
+  // the heap as it stands: the leaves a bound-driven traversal is expected
+  // to visit. Every leaf when the heap does not fill; none for an empty
+  // domain. A `depth` past topCount predicts that deeper key instead, the
+  // heap read as holding the same share of it.
+  int64_t predictedVisitFloor(int64_t card, int64_t depth = 0) const {
+    assert(primaryKeys.has_value());
+    if (card <= 0 || primaryKeys->values() <= 0) return 0;
+    if (depth <= 0) depth = topCount;
+    int64_t bottomKey = heapFull() ? bottomPrimaryKey() : 0;
+    int64_t heapSize = (int64_t)pq.size() * depth / topCount;
+    auto bottom = predictBottom(*primaryKeys, card, depth, heapSize,
+                                bottomKey);
+    return bottom.has_value()
+        ? visitFloorAt(*primaryKeys, *bottom, card, depth)
+        : primaryKeys->leafCount();
+  }
+
+  // Where a doc-order walk of the current segment meets its best keys: the
+  // earliest leaf among the floor's best-bounded ones (the head of the
+  // persisted bound order past the leaves outside the envelope, which hold
+  // no domain doc; up to kHeadLeaves of them), or -1 when the floor holds
+  // none. The column's bound order announces it; no traversal does.
+  static constexpr int64_t kHeadLeaves = 64;
+  int64_t headLeaf(int64_t floor) const {
+    assert(primaryKeys.has_value());
+    int64_t from = std::min(leavesOutsideValues.best, floor);
+    int64_t to = std::min(floor, from + kHeadLeaves);
+    int64_t head = -1;
+    for (int64_t rank = from; rank < to; rank++) {
+      int64_t leaf = primaryKeys->leafAt(rank);
+      if (head < 0 || leaf < head) head = leaf;
+    }
+    return head;
+  }
+
+  // Whether the segment's keys improve with doc order, so a doc-order walk
+  // meets them late and each doc it gathers beats the ones before it
+  // (SegmentKeys::docOrderTrend past half its range).
+  bool keysImproveWithDocOrder() const {
+    return primaryKeys.has_value() && primaryKeys->docOrderTrend() > 0.5;
+  }
+
+  int64_t bottomPrimaryKey() const {
+    assert(heapFull());
+    return clauses[0].comparator->keyBatch()->slotKeys[pq.top().slot];
+  }
+
+  // Leaves bounded at or before the heap bottom's key (a tie may still win
+  // on segdoc): once the heap is full, no doc in any other leaf of the
+  // current segment can enter it, and the bottom only improves, so no
+  // traversal from here on visits more leaves. Every leaf while the heap is
+  // not full. A heap filled by earlier segments makes this the visit
+  // bound a per-segment estimate cannot see.
+  int64_t leavesWithinBottom() const {
+    assert(primaryKeys.has_value());
+    if (!heapFull()) return primaryKeys->leafCount();
+    return primaryKeys->leavesBoundedAtOrBefore(bottomPrimaryKey());
+  }
+
+  // The current segment, whole, as the field-sort costs read it
+  // (ExactDomainSortCosts::Rest) for a domain of `card` docs spanning
+  // [firstDoc, lastDoc] with visit floor `floor` (predictedVisitFloor):
+  // the leaves the bottom admits, those outside the domain's value
+  // envelope, and the walk's lead. On keys that improve with doc order the
+  // walk meets the best keys a share of the way through the domain's span,
+  // and gathers that share of the inside leaves first; on keys in random
+  // order the best keys' places say nothing of the ones the walk meets
+  // before them. Every whole-segment field-sort decision prices this.
+  ExactDomainSortCosts::Rest segmentRest(int64_t card, int64_t floor,
+                                         int32_t firstDoc,
+                                         int32_t lastDoc) const {
+    assert(primaryKeys.has_value());
+    int64_t leaves = primaryKeys->leafCount();
+    int64_t inside = leaves - std::min(
+        leaves, leavesOutsideValues.best + leavesOutsideValues.worst);
+    int64_t lead = 0;
+    int64_t head = lastDoc >= firstDoc && keysImproveWithDocOrder()
+        ? headLeaf(floor) : -1;
+    if (head >= 0) {
+      int64_t leafSize = clauses[0].comparator->keyBatch()->leafBlockSize();
+      int64_t firstLeaf = firstDoc / leafSize;
+      int64_t spanLeaves = lastDoc / leafSize - firstLeaf + 1;
+      lead = std::clamp<int64_t>(head - firstLeaf, 0, spanLeaves) * inside
+          / spanLeaves;
+    }
+    return {card, leaves, floor, leavesWithinBottom(),
+            leavesOutsideValues.best, inside, lead, topCount};
   }
 
   // COLUMN comparators bake direction into their stored values (sortMultiplier).
@@ -425,6 +623,19 @@ public:
     return topCount > 0 && pq.size() == (size_t)topCount;
   }
 
+  // Heap entries whose primary key is strictly below `bound`. When `bound`
+  // lower-bounds every doc not yet seen, no later doc can displace them, so
+  // they are final. Slots are minted densely, so slotKeys[0, size) is the
+  // heap.
+  int64_t countKeysBelow(int64_t bound,
+                         FieldComparator::KeyBatch* batch) const {
+    int64_t below = 0;
+    for (size_t slot = 0; slot < pq.size(); slot++) {
+      below += batch->slotKeys[slot] < bound;
+    }
+    return below;
+  }
+
   struct KeyBlockPlan {
     FieldComparator::KeyBatch* batch = nullptr;
     int32_t blockSize = 0;
@@ -475,6 +686,13 @@ public:
       blockSize = batch->keyBlockSize();
     }
     if (blockSize == 0) return candidateRange(segment, from);
+    // Every leaf bounded before the key floor: no bound in this segment can
+    // prove anything, so the rest of it is one competitive range, and range
+    // ends need no re-consulting.
+    if (leavesBeforeKeyFloor != 0
+        && leavesBeforeKeyFloor == batch->leafBlockCount()) {
+      return {from, PostingsReader::END};
+    }
 
     int64_t block = (int64_t)from / blockSize;
     int64_t blockCount = batch->keyBlockCount();
@@ -488,7 +706,7 @@ public:
     int64_t bottomKey = batch->slotKeys[pq.top().slot];
     segdoc bottomDoc = pq.top().doc;
     bool soleSort = clauses.size() == 1;
-    int32_t leafSize = leafDescentEnabled ? batch->leafBlockSize() : 0;
+    int32_t leafSize = descendsToLeaves() ? batch->leafBlockSize() : 0;
     int32_t doc = from;
     for (; block < blockCount; block++) {
       if (classifyKeyBlock(segment, doc, batch->blockBestKey(block),
@@ -635,7 +853,10 @@ private:
   // Warmup fill then bottom-gated replacement over one gathered chunk.
   // Shared by the in-order window path (which gathers keys per chunk) and
   // the masked block driver (which gathers fused with the domain bits).
-  void admitChunk(int32_t segment, std::span<const int32_t> docs,
+  // Pin the start alignment: the replacement loop is one tight compare per
+  // doc, and a 32-byte shift from unrelated code moving cost resident
+  // field sorts about 5% more cycles at identical instruction counts.
+  [[gnu::aligned(64)]] void admitChunk(int32_t segment, std::span<const int32_t> docs,
                   std::span<const int64_t> keys,
                   FieldComparator::KeyBatch* batch) {
     size_t i = 0;
@@ -673,6 +894,27 @@ private:
       SkipStats::fieldSortGatherAtLastAdmission =
           SkipStats::fieldSortDocsGathered - (int64_t)(windowSize - i) + 1;
     }
+  }
+
+  // Whether nextCompetitiveRange descends to leaves: priced by the docs the
+  // leaves it would skip hold against classifying them
+  // (ExactDomainSortCosts::walkDescends, over segmentRest of the walk's
+  // card). Decided once per segment, against the heap at the first consult
+  // that can prune.
+  bool descendsToLeaves() {
+    if (leafDescent == LeafDescent::UNDECIDED) {
+      bool descend = false;
+      if (forceLeafDescentForTests.has_value()) {
+        descend = *forceLeafDescentForTests;
+      } else if (int64_t card = segmentWalkCard > 0 ? segmentWalkCard
+                                                    : segmentSourceCost;
+                 primaryKeys.has_value() && card > 0) {
+        descend = ExactDomainSortCosts::walkDescends(segmentRest(
+            card, predictedVisitFloor(card), 0, segmentMaxDoc - 1));
+      }
+      leafDescent = descend ? LeafDescent::ON : LeafDescent::OFF;
+    }
+    return leafDescent == LeafDescent::ON;
   }
 
   static int32_t blockEnd(int64_t block, int32_t blockSize) {
@@ -746,38 +988,90 @@ private:
     return {c, c + 1};
   }
 
+public:
+  // The docFreq total a competitive interval of `termCount` terms may have
+  // for the postings union to take over at docid `from` of a segment of
+  // `maxDoc` docs whose source produces `sourceCost` docs, after `priorSource`
+  // source docs of earlier segments; -1 when no total qualifies. Costs are
+  // in walked source docs.
+  //
+  // By the next probe the heap has seen `seen` source docs: the earlier
+  // segments' and those walked here (on a sparse filtered domain, its
+  // cardinality, not the doc space, sets the pace). The bottom ranks k among
+  // them, so the interval's terms c and docFreq total S shrink about as
+  // 1/seen, and once active the union narrows behind the bottom as the walk
+  // would. Waiting for the next probe, a walk of s source docs, captures about
+  // c*s/seen fewer terms and skips the interval's S*s/sourceCost postings
+  // over it: worth it while those cost more than the walk, i.e. while
+  // K*S + CAP*c*sourceCost/seen > sourceCost. The union must also undercut
+  // walking the `left` source docs to the end without narrowing further,
+  // CAP*c + K*S*left/sourceCost <= left: the same form with `left` for
+  // `seen`, binding once fewer are left than seen.
+  static int64_t candidateBudget(int64_t sourceCost, int64_t priorSource,
+                                 int32_t maxDoc, int32_t from,
+                                 int64_t termCount) {
+    if (sourceCost <= 0 || maxDoc <= 0 || from >= maxDoc) return -1;
+    // A source cannot produce more docs than the segment holds; the clamp
+    // also keeps every product below within 2^62.
+    int64_t src = std::min<int64_t>(sourceCost, maxDoc);
+    int64_t next = std::min<int64_t>(
+        (int64_t)from + CANDIDATE_PROBE_INTERVAL, maxDoc);
+    int64_t seen = priorSource + src * next / maxDoc;
+    int64_t left = src * ((int64_t)maxDoc - from) / maxDoc;
+    int64_t m = std::min(seen, left);
+    int64_t capture = termCount * CANDIDATE_TERM_CAPTURE_COST;
+    if (capture >= m) return -1;
+    return src * (m - capture) / m / CANDIDATE_POSTING_COST;
+  }
+
+private:
   // The state-byte gate is free (interval width is known without touching
-  // the dictionary); the docFreq sum costs one stats decode per 128 terms
-  // and aborts at the profitability limit. The capture walk uses its own
-  // TermsEnum: the comparator's leaf enum backs setBottom/copy caching and
-  // must not be repositioned here.
+  // the dictionary); the docFreq total comes from candidateDocFreqs, which
+  // reads each ord's docFreq at most once per segment and stops past the
+  // budget.
   LUXIR_NOINLINE bool tryActivateCandidates(
       const FieldComparator::CompetitiveOrdState& state, int32_t from) {
+    skipCount(SkipStats::fieldSortCandidateProbes);
     int64_t termCount = state.hi - state.lo + 1;
-    if (segmentSourceCost < 0
-        || termCount * (int64_t)sizeof(DocsOnlyEnum) > CANDIDATE_STATE_BYTES) {
+    if (termCount * (int64_t)sizeof(DocsOnlyEnum) > CANDIDATE_STATE_BYTES) {
       return false;
     }
-    // Prorate the source estimate by the fraction of the segment left, then
-    // require the union (postings plus per-term capture) to undercut it by
-    // the cost ratio. The exhaustive baseline on a sparse filtered domain is
-    // its cardinality, not the doc space.
-    int64_t remaining = segmentMaxDoc <= 0 ? 0
-        : segmentSourceCost * ((int64_t)segmentMaxDoc - from) / segmentMaxDoc;
-    int64_t limit = remaining / CANDIDATE_COST_RATIO;
-    int64_t sum = termCount * CANDIDATE_TERM_CAPTURE_COST;
-    if (sum > limit) return false;
-    TermsEnum te(*segmentPool, *state.postingsReader, *state.fieldInfo);
-    for (int64_t ord = state.lo; ord <= state.hi; ord++) {
-      te.seekOrd(ord - 1);
-      sum += te.docFreq();
-      if (sum > limit) return false;
+    int64_t budget = candidateBudget(segmentSourceCost, priorSourceDocs,
+                                     segmentMaxDoc, from, termCount);
+    if (budget < 0) return false;
+    // The interval only shrinks within a segment, so the first walk sized
+    // candidateDocFreqs for every later one. Should that ever break, give up
+    // on candidates for the segment, as candidateRange does when narrow()
+    // refuses, rather than walk past the span.
+    bool widened = candidateTerms != nullptr
+        && termCount > (int64_t)candidateDocFreqs.size();
+    assert(!widened);
+    if (widened) {
+      candidatesDisabled = true;
+      return false;
     }
-    auto states =
-        segmentPool->make_span<TermsEnum::PostingsState>((size_t)termCount);
+    bool profitable = candidateDocFreq(state, termCount, budget) <= budget;
+#ifndef NDEBUG
+    {
+      // Check: the anchored totals reach the verdict a direct walk over the
+      // interval does.
+      MemPool::ScopeGuard scope(*segmentPool);
+      TermsEnum direct(*segmentPool, *state.postingsReader, *state.fieldInfo);
+      int64_t sum = 0;
+      for (int64_t ord = state.lo; ord <= state.hi && sum <= budget; ord++) {
+        direct.seekOrd(ord - 1);
+        sum += direct.docFreq();
+      }
+      assert((sum <= budget) == profitable);
+    }
+#endif
+    if (!profitable) return false;
+    TermsEnum& te = *candidateTerms;
+    ChunkedArray<TermsEnum::PostingsState> states(*segmentPool, (size_t)termCount);
+    states.reserve((size_t)termCount);
     for (int64_t i = 0; i < termCount; i++) {
       te.seekOrd(state.lo - 1 + i);
-      states[(size_t)i] = te.postingsState();
+      states.push_back(te.postingsState());
     }
     auto enums = segmentPool->make_span<DocsOnlyEnum*>((size_t)termCount);
     std::fill(enums.begin(), enums.end(), nullptr);
@@ -785,13 +1079,60 @@ private:
     auto windowBits = segmentPool->make_span<uint64_t>(
         (size_t)UnionHeapScorer::WINDOW_WORDS);
     candidates = segmentPool->make<UnionHeapScorer>(
-        states, enums, heap, windowBits, *segmentPool, segmentMaxDoc, 0.0f);
+        states.view(), enums, heap, windowBits, *segmentPool, segmentMaxDoc, 0.0f);
     candidateLo = state.lo;
     candidateHi = state.hi;
     // narrow() speaks 0-based term ordinals (PostingsState::termOrdinal).
     candidates->narrow(candidateLo - 1, candidateHi - 1);
     skipCount(SkipStats::fieldSortCandidateActivations);
     return true;
+  }
+
+  // The docFreq total of the `count` ords nearest the anchored end of
+  // `state`'s interval, or, when that passes `budget`, a partial total that
+  // already does.
+  int64_t candidateDocFreq(const FieldComparator::CompetitiveOrdState& state,
+                           int64_t count, int64_t budget) {
+    assert(count > 0);
+    if (count > candidateReach
+        && (candidateReach == 0
+            || candidateDocFreqs[(size_t)candidateReach - 1] <= budget)) {
+      extendCandidateDocFreqs(state, count, budget);
+    }
+    return candidateDocFreqs[(size_t)std::min(count, candidateReach) - 1];
+  }
+
+  // Extends candidateDocFreqs outward from the anchor, one term block's
+  // stats decode at a time, until it covers `count` ords or its total passes
+  // `budget`. The first call sizes it: no later interval is wider.
+  LUXIR_NOINLINE void extendCandidateDocFreqs(
+      const FieldComparator::CompetitiveOrdState& state, int64_t count,
+      int64_t budget) {
+    assert(state.descending ? state.hi == state.nTerms : state.lo == 1);
+    if (candidateTerms == nullptr) {
+      candidateTerms = segmentPool->make<TermsEnum>(
+          *segmentPool, *state.postingsReader, *state.fieldInfo);
+      candidateDocFreqs = segmentPool->make_span<int64_t>((size_t)count);
+    }
+    assert(count <= (int64_t)candidateDocFreqs.size());
+    int64_t reach = candidateReach;
+    int64_t total = reach == 0 ? 0 : candidateDocFreqs[(size_t)reach - 1];
+    while (reach < count && total <= budget) {
+      // 0-based ord of the next term outward from the anchor.
+      int64_t ord = state.descending ? state.nTerms - 1 - reach : reach;
+      auto [firstOrd, docFreqs] = candidateTerms->docFreqBlock(ord);
+      int64_t i = ord - firstOrd;
+      int64_t step = state.descending ? -1 : 1;
+      for (; i >= 0 && i < (int64_t)docFreqs.size() && reach < count;
+           i += step) {
+        total += docFreqs[(size_t)i];
+        candidateDocFreqs[(size_t)reach++] = total;
+      }
+    }
+    if (SkipStats::enabled) {
+      SkipStats::fieldSortCandidateDocFreqs += reach - candidateReach;
+    }
+    candidateReach = reach;
   }
 
   // Grow every clause's slot storage in lockstep, doubling up to topCount.

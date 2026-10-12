@@ -6,8 +6,11 @@
 #include "luxir/reader/DocsReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/OrdColReader.h"
+#include "luxir/search/IndexReader.h"
+#include "luxir/search/OrdMap.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/luxir_util.h"
+#include <optional>
 
 namespace luxir {
 
@@ -284,100 +287,114 @@ void forEachIntColValue(DocSet* domain, IntColReader& intColReader,
   }
 }
 
-template <bool TrackStats, bool Complement, class F>
-void forEachOrdValueImpl(DocSet* domain, OrdColReader& ordColReader,
-                         int32_t maxDoc, int64_t& missing_num, F&& callback,
-                         OrdColReader::ForEachOrdStats* stats) {
-  if constexpr (!Complement) {
-    if (domain != nullptr && domain->type == DocSet::Type::ARRAY) {
-      auto* arrayDomain = dynamic_cast<ArrDocSet*>(domain);
-      if (arrayDomain == nullptr) {
-        throw std::logic_error("ARRAY DocSet has a non-array dynamic type");
-      }
-      ordColReader.forEachOrd(
-          arrayDomain->docs(), missing_num, callback, stats);
-      return;
-    }
-  }
+// A domain's walk over an ord column, decoded BATCH_SIZE values at a time.
+// The walk over the domain's shape and the column's format and indexing lives
+// here, out of line and independent of what consumes the values: every
+// caller shares this one copy of it and keeps only its own loop over a
+// decoded batch. Values arrive in doc order with a document's values
+// consecutive (a batch may end inside a multi-valued document); in-domain
+// documents without a value are counted, not produced. Each batch's ords are
+// mapped once, into the 0-based ord space the walk was asked for: a segment's
+// SegToGlobal for global ords, or SegToGlobal::identity() for the segment's
+// own term ords.
+//
+// Docid-indexed columns decode an array domain by point, a bitset domain
+// (or its complement) per 128-doc block by point or one bulk unpack as
+// OrdColReader::bulkBlock prices the block's hits, and a null domain in
+// bulk. Rank-indexed columns decode an array domain by point and every
+// other domain through bulk frames: domain density is in doc-id space and
+// cannot price a value-rank decode.
+class OrdValueBatches {
+public:
+  static constexpr int32_t BATCH_SIZE = 256;
+  struct Batch {
+    int32_t size = 0;
+    int32_t docs[BATCH_SIZE];
+    // As the column stores them: 1-based segment ords.
+    int32_t stored[BATCH_SIZE];
+    // In the walk's ord space.
+    int64_t ords[BATCH_SIZE];
+  };
 
-  // Complement mode is only entered with a bitset domain: a null domain's
-  // complement is empty and array domains expand dense complement words first
-  // (forEachComplementOrdValue).
-  const FixedBitSet* bits = domain ? &((BitDocSet*)domain)->bits() : nullptr;
-  assert(!Complement || bits != nullptr);
-  if (bits != nullptr && ordColReader.docIdIndexed()) {
-    ordColReader.forEachDocIdBitOrd(
-        *bits, maxDoc, OrdColReader::configuredBulkMinHits(),
-        missing_num, callback, stats, Complement ? ~0ULL : 0);
-    return;
-  }
+  // complement walks the docs not in `domain`, which must then be a bitset.
+  OrdValueBatches(DocSet* domain, const OrdColReader& column,
+                  const OrdMap::SegToGlobal& ordSpace, int32_t maxDoc,
+                  bool complement, OrdColReader::ForEachOrdStats* stats);
 
-  if (ordColReader.docIdIndexed()) {
-    assert(!ordColReader.multiValued());
-    OrdColReader::BulkOrds values(ordColReader);
-    int32_t docid = -1;
-    while (docid + 1 < maxDoc) {
-      docid = bits ? bits->nextSetBit(docid + 1) : docid + 1;
-      if (docid >= maxDoc) break;
-      int32_t ord = values.valueAt(docid);
-      if constexpr (TrackStats) stats->bulkLoads++;
-      if (ord != 0) callback(docid, ord);
-      else missing_num++;
-    }
-    return;
-  }
+  // Refills `batch` with the walk's next values; false once none are left.
+  LUXIR_NOINLINE bool next(Batch& batch);
 
-  // Preserve the pre-adaptive fixed-bulk route for RANK columns. Domain
-  // density is in doc-id space and cannot select a value-rank decode policy.
-  OrdColReader::Iterator iter(ordColReader);
-  int32_t docid = -1;
-  while (docid + 1 < maxDoc) {
-    if constexpr (Complement) {
-      docid = (int32_t)bits->nextClearBit(docid + 1);
-    } else {
-      docid = bits ? bits->nextSetBit(docid + 1) : docid + 1;
-    }
-    if (docid >= maxDoc) break;
-    if (iter.docId() < docid) iter.advance(docid);
-    if (iter.docId() != docid) {
-      missing_num++;
-      continue;
-    }
-    if (!ordColReader.multiValued()) {
-      callback(docid, iter.value());
-      if constexpr (TrackStats) stats->bulkLoads++;
-    } else {
-      auto [start, end] = ordColReader.getStartEndValueRank(iter.rank());
-      for (int64_t rank = start; rank < end; rank++) {
-        callback(docid, iter.values().valueAt(rank));
-        if constexpr (TrackStats) stats->bulkLoads++;
-      }
+  // In-domain documents without a value, so far.
+  int64_t missing() const { return missingCount; }
+
+private:
+  enum class Walk : uint8_t { DOCID_ARRAY, DOCID_BITS, DOCID_ALL, RANK };
+  // Where a rank walk takes its domain docs from.
+  enum class Source : uint8_t { ARRAY, BITS, COMPLEMENT, ALL };
+
+  const OrdColReader& column;
+  OrdMap::SegToGlobal ordSpace;
+  OrdColReader::ForEachOrdStats* stats;
+  const FixedBitSet* bits = nullptr;
+  const int32_t* arrayNext = nullptr;
+  const int32_t* arrayEnd = nullptr;
+  int32_t maxDoc;
+  // The next doc (or block start) a bits or all-docs walk visits.
+  int32_t cursor = 0;
+  int32_t bulkMinHits = 0;
+  uint64_t invertMask = 0;
+  Walk walk;
+  Source source = Source::ALL;
+  int64_t missingCount = 0;
+  // A rank walk's position in the docs with the field, and what remains of
+  // a multi-valued document a full batch cut short.
+  std::optional<OrdColReader::Iterator> rankIter;
+  int32_t pendingDoc = -1;
+  int64_t pendingRank = 0;
+  int64_t pendingEnd = 0;
+
+  void fillDocIdArray(Batch& batch);
+  void fillDocIdBits(Batch& batch);
+  void fillDocIdAll(Batch& batch);
+  template <Source S> void fillRank(Batch& batch);
+  template <Source S> int32_t nextRankDoc();
+};
+
+// The consuming half of a walk: the caller's callback, once per decoded
+// value, in a loop over each batch.
+template <class F>
+void consumeOrdValues(OrdValueBatches& values, int64_t& missing_num,
+                      F& callback) {
+  OrdValueBatches::Batch batch;
+  while (values.next(batch)) {
+    for (int32_t i = 0; i < batch.size; i++) {
+      callback(batch.docs[i], batch.ords[i]);
     }
   }
+  missing_num += values.missing();
 }
 
+// callback(int32_t docid, int64_t ord) is invoked once per value of each
+// in-domain doc that has the field, in doc order; ord is the value's 0-based
+// ord in `ordSpace` (OrdValueBatches). In-domain docs with no value bump
+// missing_num. Mark the callback LUXIR_INLINE at the call site, as for
+// forEachIntColValue: it is the body of the loop over each decoded batch.
 template <class F>
 void forEachOrdValue(DocSet* domain, OrdColReader& ordColReader,
-                     int32_t maxDoc, int64_t& missing_num, F&& callback) {
-  forEachOrdValueImpl<false, false>(
-      domain, ordColReader, maxDoc, missing_num,
-      std::forward<F>(callback), nullptr);
-}
-
-template <class F>
-void forEachOrdValue(DocSet* domain, OrdColReader& ordColReader,
-                     int32_t maxDoc, int64_t& missing_num, F&& callback,
-                     OrdColReader::ForEachOrdStats* stats) {
-  forEachOrdValueImpl<true, false>(
-      domain, ordColReader, maxDoc, missing_num,
-      std::forward<F>(callback), stats);
+                     const OrdMap::SegToGlobal& ordSpace, int32_t maxDoc,
+                     int64_t& missing_num, F&& callback,
+                     OrdColReader::ForEachOrdStats* stats = nullptr) {
+  OrdValueBatches values(domain, ordColReader, ordSpace, maxDoc, false, stats);
+  consumeOrdValues(values, missing_num, callback);
 }
 
 // Walk the complement of a resolved facet domain over the ord column. Bitset
 // domains drive the shared adaptive machinery through inverted word reads, so
 // no second bitset is materialized. Array domains (reachable only when a
 // complement strategy is forced; the cost model never picks complement for a
-// sparse domain) expand dense complement words into the pool first.
+// sparse domain) expand dense complement words into the pool first. ords are
+// the segment's own 0-based term ords: complement counts stage against the
+// segment's docFreqs.
 template <class F>
 void forEachComplementOrdValue(DomainView& view, MemPool& pool,
                                OrdColReader& ordColReader,
@@ -397,17 +414,18 @@ void forEachComplementOrdValue(DomainView& view, MemPool& pool,
     }
     FixedBitSet complementBits(words, view.maxDoc);
     BitDocSet complement(complementBits, view.compCard);
-    forEachOrdValue(&complement, ordColReader, view.maxDoc, missing_num,
-                    std::forward<F>(callback));
+    forEachOrdValue(&complement, ordColReader, OrdMap::SegToGlobal::identity(),
+                    view.maxDoc, missing_num, std::forward<F>(callback));
     return;
   }
   // Word-wise inversion reads the domain's whole word array, so it must cover
   // the same doc space (liveDocs and every DocSetBuilder output are sized at
   // maxDoc).
   assert(view.bits->size() == view.maxDoc);
-  forEachOrdValueImpl<false, true>(
-      view.domain, ordColReader, view.maxDoc, missing_num,
-      std::forward<F>(callback), nullptr);
+  OrdValueBatches values(view.domain, ordColReader,
+                         OrdMap::SegToGlobal::identity(), view.maxDoc, true,
+                         nullptr);
+  consumeOrdValues(values, missing_num, callback);
 }
 
 }

@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 #include <iostream>
 #include <vector>
+#include <random>
 #include "test/LuxirTest.h"
 #include "luxir/util/screaming.h"
 #include "luxir/index/ScreamingBuilder.h"
@@ -305,6 +306,39 @@ public:
 
 
 };
+
+TEST_F(ScreamingTest, fixedRangeOr) {
+  std::mt19937_64 random(0x5b83);
+  for (int32_t size : {1, 63, 64, 65, 137, 4099}) {
+    int32_t words = (int32_t) screaming::FixedBitSet::sizeInWords(size);
+    for (int32_t sourceOffset = 0; sourceOffset < 8; sourceOffset++) {
+      std::vector<uint64_t> source((size_t) (words + sourceOffset));
+      for (auto& word : source) word = random();
+      screaming::FixedBitSet bits(source.data() + sourceOffset, size);
+      for (int32_t destinationOffset = 0; destinationOffset < 8; destinationOffset++) {
+        for (int32_t trial = 0; trial < 20; trial++) {
+          int32_t from = trial == 0 ? 0 : (int32_t) (random() % (uint32_t) (size + 1));
+          int32_t to = trial < 2 ? size : from + (int32_t) (random() % (uint32_t) (size - from + 1));
+          if (trial == 2 && size >= 65) {
+            from = 1;
+            to = 65;
+          }
+          std::vector<uint64_t> actual((size_t) (words + destinationOffset + 1));
+          for (auto& word : actual) word = random();
+          auto expected = actual;
+          for (int32_t bit = from; bit < to; bit++) {
+            if (bits.get(bit)) {
+              expected[(size_t) (destinationOffset + ((bit - from) >> 6))]
+                  |= 1ULL << ((bit - from) & 63);
+            }
+          }
+          bits.orRange(std::span<uint64_t>(actual).subspan((size_t) destinationOffset), from, to);
+          EXPECT_EQ(expected, actual);
+        }
+      }
+    }
+  }
+}
 
 TEST_F(ScreamingTest, debug) {
 }

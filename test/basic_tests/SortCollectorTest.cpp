@@ -4,21 +4,29 @@
 #include <gtest/gtest.h>
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/search/FieldSortCollector.h"
+#include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/search/SortField.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/reader/SkipStats.h"
+#include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/schema/FieldType.h"
+#include "luxir/util/NumericUtils.h"
 #include "luxir/util/random.h"
 #include <algorithm>
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <filesystem>
 #include <limits>
+#include <numeric>
 #include <optional>
+#include <tuple>
 #include <utility>
 
 using namespace luxir;
@@ -64,6 +72,19 @@ public:
   }
   ~KeyGatherGuard() {
     FieldSortCollector::disableKeyGatherForTests = saved;
+  }
+};
+
+class LeafDescentGuard {
+  std::optional<bool> saved;
+
+public:
+  explicit LeafDescentGuard(std::optional<bool> descend)
+      : saved(FieldSortCollector::forceLeafDescentForTests) {
+    FieldSortCollector::forceLeafDescentForTests = descend;
+  }
+  ~LeafDescentGuard() {
+    FieldSortCollector::forceLeafDescentForTests = saved;
   }
 };
 
@@ -389,6 +410,107 @@ TEST_F(SortCollectorTest, numericKeyGatherMatchesFallbackAcrossColumnShapes) {
       }
     }
   }
+
+  // Field-sort planning reads the same leaf metadata from each segment's
+  // PostingsReader, once: the dense single-valued column offers it in every
+  // segment, the sparse and multi-valued ones in none.
+  ASSERT_EQ(2u, reader->segments().size());
+  for (std::string_view field :
+       {"dense_i", "sparse_i", "dense_is", "sparse_is"}) {
+    SimpleNumericFieldComparator comparator(std::string(field), true,
+                                            FieldComparator::MISSING_LAST);
+    for (auto& segment : reader->segments()) {
+      comparator.setSegment(segment.ord, &segment.postingsReader());
+      auto keys = comparator.keyBatch()->segmentKeys(std::nullopt);
+      const auto* meta = segment.postingsReader().numericLeafMeta(field);
+      EXPECT_EQ(meta, segment.postingsReader().numericLeafMeta(field));
+      EXPECT_EQ(field == "dense_i", meta != nullptr) << field;
+      ASSERT_EQ(keys.has_value(), meta != nullptr) << field;
+      if (meta == nullptr) continue;
+      FieldComparator::SegmentKeys cached(*meta, true, std::nullopt);
+      ASSERT_EQ(keys->leafCount(), cached.leafCount());
+      for (int64_t rank = 0; rank < cached.leafCount(); rank++) {
+        EXPECT_EQ(keys->boundOrderLeaf(rank).leaf,
+                  cached.boundOrderLeaf(rank).leaf);
+        EXPECT_EQ(keys->boundOrderLeaf(rank).bound,
+                  cached.boundOrderLeaf(rank).bound);
+      }
+    }
+  }
+}
+
+// A delete-only or an overlay-only commit opens a new snapshot core under
+// the same core generation. The leaf metadata a field sort plans from points
+// into the mapped column bytes, so it lives on the segment's PostingsReader,
+// which the new core shares: a multi-segment field sort after the old reader
+// is released must read only mappings a live holder keeps. A file-backed
+// directory unmaps with the last holder; RAMDir buffers would hide a stale
+// view.
+TEST_F(SortCollectorTest, fieldSortLeafMetaLivesWithItsSegment) {
+  bool savedOverlays = TestOverlayAuxReader::enabledForTests;
+  TestOverlayAuxReader::enabledForTests = true;
+  auto path = std::filesystem::temp_directory_path() / "luxir-fieldsort-reopen";
+  std::filesystem::remove_all(path);
+  auto cleanup = scope_guard([&] {
+    TestOverlayAuxReader::enabledForTests = savedOverlays;
+    std::filesystem::remove_all(path);
+  });
+  LuxirConfig config;
+  config.store.backend = "fs";
+  config.store.data_dir = path.string();
+  LuxirNode node(config);
+  CollectionHelper helper(node, "reopen");
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  int32_t docId = 0;
+  for (int32_t docs : {3 * 512 + 17, 2 * 512, 700}) {
+    std::vector<Doc> batch;
+    for (int32_t i = 0; i < docs; i++, docId++) {
+      batch.push_back(flatdoc("id", std::to_string(docId), "id_s",
+                              std::to_string(docId), "time_i",
+                              (int64_t)docId));
+    }
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::COMMIT).success);
+  }
+  auto newest = [&] {
+    auto req = localReq(node.getSearchEngine());
+    req->collection("reopen");
+    auto& cur = req->topDocs("q").limit(5).fields({"id_s"});
+    cur.allQuery();
+    qb::sort(cur, "time_i", qb::DESC);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return resultIds(*req);
+  };
+  std::vector<std::string> expected;
+  for (int32_t doc = docId - 1; doc >= docId - 5; doc--) {
+    expected.push_back(std::to_string(doc));
+  }
+  auto reopen = [&](auto&& commit) {
+    std::weak_ptr<IndexReader> old = writer->snapshots.readers.getReader();
+    ASSERT_EQ(3u, old.lock()->segments().size());
+    uint64_t coreGen = old.lock()->coreGen();
+    EXPECT_EQ(expected, newest());  // reads each segment's leaf metadata
+    const auto* meta =
+        old.lock()->segments()[0].postingsReader().numericLeafMeta("time_i");
+    ASSERT_NE(nullptr, meta);
+    commit();
+    auto current = writer->snapshots.readers.getReader();
+    EXPECT_EQ(coreGen, current->coreGen());
+    EXPECT_TRUE(old.expired());
+    EXPECT_EQ(meta,
+              current->segments()[0].postingsReader().numericLeafMeta("time_i"));
+    current.reset();
+    EXPECT_EQ(expected, newest());
+  };
+  reopen([&] {
+    ASSERT_TRUE(helper.deleteById("1", UpdateMessage::COMMIT).success);
+  });
+  reopen([&] {
+    helper.commit({std::string(TestOverlayAuxReader::NAME)});
+    ASSERT_FALSE(readDurableIndexInfo(writer->dir)->segments[0]
+                     .overlays.empty());
+  });
 }
 
 TEST_F(SortCollectorTest, keyGatherTieBreaksAcrossReversedSegments) {
@@ -2425,6 +2547,7 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
       int64_t found = 0;
       int64_t blocksSkipped = 0;
       int64_t bulkCollections = 0;
+      int64_t exactDomainRuns = 0;
       int64_t externalActivations = 0;
       int64_t externalCandidates = 0;
       int64_t externalDomainRejects = 0;
@@ -2435,8 +2558,11 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
     result.ids = resultIds(*req);
     const auto* docs = req->docList("q");
     if (docs != nullptr && docs->found) result.found = *docs->found;
-    result.blocksSkipped = SkipStats::fieldSortBlocksSkipped;
+    result.blocksSkipped = SkipStats::fieldSortBlocksSkipped
+        + SkipStats::fieldSortLeavesSkipped;
     result.bulkCollections = SkipStats::fieldSortBulkCollections;
+    result.exactDomainRuns = SkipStats::fieldSortBestFirstActivations
+        + SkipStats::fieldSortDocOrderSweeps + SkipStats::fieldSortDomainScans;
     result.externalActivations =
         SkipStats::fieldSortExternalApproxActivations;
     result.externalCandidates = SkipStats::fieldSortExternalApproxCandidates;
@@ -2457,38 +2583,53 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   Sorts monoAsc{{{"mono_i", qb::ASC}}};
   Sorts revDesc{{{"rev_i", qb::DESC}}};
 
-  for (bool matchAll : {true, false}) {
-    for (const Sorts& sorts :
-         {randAsc, randDesc, tiesAsc, tiesThenRand, monoAsc, revDesc}) {
-      for (int32_t limit : {1, 9, 987, 4500}) {
-        for (bool forcePull : {false, true}) {
-          auto exhaustive = run(true, forcePull, matchAll, sorts, limit, false);
-          auto pruned = run(false, forcePull, matchAll, sorts, limit, false);
-          EXPECT_EQ(exhaustive.ids, pruned.ids)
-              << "matchAll=" << matchAll << " limit=" << limit
-              << " forcePull=" << forcePull
-              << " sort=" << sorts.clauses[0].first;
+  // The walk's leaf descent is priced (descendsToLeaves); both arms must
+  // match exhaustive collection whichever the pricing picks here.
+  for (std::optional<bool> descend :
+       {std::optional<bool>{}, std::optional<bool>{false},
+        std::optional<bool>{true}}) {
+    LeafDescentGuard descentGuard(descend);
+    for (bool matchAll : {true, false}) {
+      for (const Sorts& sorts :
+           {randAsc, randDesc, tiesAsc, tiesThenRand, monoAsc, revDesc}) {
+        for (int32_t limit : {1, 9, 987, 4500}) {
+          for (bool forcePull : {false, true}) {
+            auto exhaustive =
+                run(true, forcePull, matchAll, sorts, limit, false);
+            auto pruned = run(false, forcePull, matchAll, sorts, limit, false);
+            EXPECT_EQ(exhaustive.ids, pruned.ids)
+                << "matchAll=" << matchAll << " limit=" << limit
+                << " forcePull=" << forcePull
+                << " sort=" << sorts.clauses[0].first
+                << " descend=" << (descend ? (int)*descend : -1);
+          }
         }
       }
     }
   }
 
-  // Shallow sole-clause sorts must actually skip blocks. The random column
-  // cannot skip strictly at this corpus size (the k-th-smallest bottom sits
-  // above a 4096-value block's expected min until tens of thousands of docs
-  // have been seen), so the deterministic assertions use doc-order-monotonic
-  // columns in each direction plus the segdoc-guarded equality rule on the
-  // tie column.
+  // Shallow sole-clause sorts must actually skip blocks or leaves. The
+  // random column cannot skip strictly at this corpus size (the
+  // k-th-smallest bottom sits above a 4096-value block's expected min until
+  // tens of thousands of docs have been seen), so the deterministic
+  // assertions use doc-order-monotonic columns in each direction plus the
+  // segdoc-guarded equality rule on the tie column.
   EXPECT_GT(run(false, true, true, monoAsc, 9, false).blocksSkipped, 0);
   EXPECT_GT(run(false, true, true, revDesc, 9, false).blocksSkipped, 0);
   EXPECT_GT(run(false, false, false, monoAsc, 9, false).blocksSkipped, 0);
-  // Match-all rides the null-source bulk scorer's match windows (with zone
-  // skips intact); forcing pull keeps the scorer loop.
+  // Match-all is a materialized domain (every doc, or the live docs), so
+  // the exact-domain driver serves it with its zone skips; a term query
+  // rides the bulk scorer's match windows, and forcing pull keeps the
+  // scorer loop.
   {
-    auto matchAllBulk = run(false, false, true, monoAsc, 9, false);
-    EXPECT_GT(matchAllBulk.bulkCollections, 0);
-    EXPECT_GT(matchAllBulk.blocksSkipped, 0);
-    EXPECT_EQ(run(false, true, true, monoAsc, 9, false).bulkCollections, 0);
+    auto matchAll = run(false, false, true, monoAsc, 9, false);
+    EXPECT_GT(matchAll.exactDomainRuns, 0);
+    EXPECT_EQ(matchAll.bulkCollections, 0);
+    EXPECT_GT(matchAll.blocksSkipped, 0);
+    auto termBulk = run(false, false, false, monoAsc, 9, false);
+    EXPECT_GT(termBulk.bulkCollections, 0);
+    EXPECT_EQ(termBulk.exactDomainRuns, 0);
+    EXPECT_EQ(run(false, true, false, monoAsc, 9, false).bulkCollections, 0);
   }
   EXPECT_GT(run(false, true, true, tiesAsc, 5, false).blocksSkipped, 0);
   // A secondary clause forbids equality skipping; an all-ties primary then
@@ -2729,6 +2870,146 @@ TEST_F(SortCollectorTest, phraseFieldSortPruningMatchesExhaustive) {
   }
 }
 
+// The bound-ordered drivers walk KeyBatch::boundOrderLeaf as the leaf visit
+// order. In both directions it must be a permutation of the leaves, carry
+// each leaf's leafBestKey as its bound, and ascend by (bound, leaf). Keys
+// rise by block with coarse noise, so neighboring leaves tie on min and max.
+TEST_F(SortCollectorTest, boundOrderLeavesAscendByBoundThenLeaf) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 3 * 4096 + 300; doc++) {
+    int64_t key = (int64_t)(((uint32_t)doc * 2654435761u) % 1000) / 100
+        + doc / 2048;
+    docs.push_back(flatdoc("id", std::to_string(doc), "key_i", key));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  for (bool reversed : {false, true}) {
+    for (auto& segment : reader->segments()) {
+      SimpleNumericFieldComparator comparator(
+          "key_i", reversed, FieldComparator::MISSING_LAST);
+      comparator.setSegment(segment.ord, &segment.postingsReader());
+      FieldComparator::KeyBatch* batch = comparator.keyBatch();
+      ASSERT_NE(0, batch->leafBlockSize());
+      int64_t leaves = batch->leafBlockCount();
+      std::vector<bool> seen((size_t)leaves);
+      std::pair<int64_t, int64_t> previous{
+          std::numeric_limits<int64_t>::min(), -1};
+      for (int64_t rank = 0; rank < leaves; rank++) {
+        auto [leaf, bound] = batch->boundOrderLeaf(rank);
+        ASSERT_TRUE(leaf >= 0 && leaf < leaves);
+        EXPECT_FALSE(seen[(size_t)leaf]) << "leaf=" << leaf;
+        seen[(size_t)leaf] = true;
+        EXPECT_EQ(batch->leafBestKey(leaf), bound) << "leaf=" << leaf;
+        std::pair<int64_t, int64_t> current{bound, leaf};
+        EXPECT_LT(previous, current) << "reversed=" << reversed
+                                     << " rank=" << rank;
+        previous = current;
+      }
+    }
+  }
+}
+
+// SegmentKeys::keyFloor maps a value envelope to the best-side edge in the
+// comparator's key space (lo ascending, ~hi descending, FLOAT as sortable
+// bits), every doc inside the envelope gathers a key at or past it, and a
+// multi-valued column offers no keys. The collector's leavesBeforeKeyFloor
+// counts exactly the leaves whose bound lies before that floor, and a
+// segment with every leaf clipped is one competitive range.
+TEST_F(SortCollectorTest, keyFloorClipsValueEnvelopes) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 3 * 4096 + 300; doc++) {
+    int64_t key = (int64_t)(((uint32_t)doc * 2654435761u) % 100000) - 50000;
+    docs.push_back(flatdoc("id", std::to_string(doc), "key_i", key,
+                           "p_f", (double)key / 8.0, "mono_i", (int64_t)doc,
+                           "m_is", vec_i(key, key + 1)));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto& segment = reader->segments()[0];
+
+  auto floorOf = [&](std::string_view field, bool reversed,
+                     Query::ValueEnvelope values) {
+    SimpleNumericFieldComparator comparator(
+        std::string(field), reversed, FieldComparator::MISSING_LAST);
+    comparator.setSegment(segment.ord, &segment.postingsReader());
+    auto keys = comparator.keyBatch()->segmentKeys(values);
+    return keys.has_value() ? std::optional<int64_t>(keys->keyFloor())
+                            : std::nullopt;
+  };
+  EXPECT_EQ(std::optional<int64_t>(-100), floorOf("key_i", false, {-100, 700}));
+  EXPECT_EQ(std::optional<int64_t>(~(int64_t)700),
+            floorOf("key_i", true, {-100, 700}));
+  Query::ValueEnvelope prices{(int64_t)floatToSortableInt32(-12.5f),
+                              (int64_t)floatToSortableInt32(87.5f)};
+  EXPECT_EQ(std::optional<int64_t>(prices.lo), floorOf("p_f", false, prices));
+  EXPECT_EQ(std::optional<int64_t>(~prices.hi), floorOf("p_f", true, prices));
+  EXPECT_FALSE(floorOf("m_is", false, {-100, 700}).has_value());
+  EXPECT_FALSE(floorOf("absent_i", false, {-100, 700}).has_value());
+
+  // Uniform keys clip every leaf; doc-ordered keys clip only the leaves
+  // past the envelope's best edge (docs 0-4999 ascending, 9001+ descending).
+  struct Case {
+    std::string_view field;
+    Query::ValueEnvelope values;
+  };
+  for (Case c : {Case{"key_i", {-20000, 9000}}, Case{"p_f", prices},
+                 Case{"mono_i", {5000, 9000}}}) {
+    for (bool reversed : {false, true}) {
+      std::string_view field = c.field;
+      Query::ValueEnvelope values = c.values;
+      bool isFloat = field == "p_f";
+      FloatFieldType floatType(field);
+      IntFieldType intType(field);
+      SortField sortField(field,
+                          isFloat ? (FieldType&)floatType : (FieldType&)intType,
+                          reversed ? SortField::DESC : SortField::ASC);
+      FieldSortCollector collector(10, columnPlan(sortField));
+      collector.primaryValues = values;
+      collector.setSegment(segment.ord, &segment.postingsReader());
+      auto* batch = collector.clauses[0].comparator->keyBatch();
+      ASSERT_NE(0, batch->leafBlockSize());
+      int64_t floor = collector.primaryKeys->keyFloor();
+      int64_t clipped = 0;
+      for (int64_t leaf = 0; leaf < batch->leafBlockCount(); leaf++) {
+        clipped += batch->leafBestKey(leaf) < floor;
+      }
+      EXPECT_EQ(clipped, collector.leavesBeforeKeyFloor)
+          << field << " reversed=" << reversed;
+      int64_t leaves = batch->leafBlockCount();
+      int64_t expected = field != "mono_i" ? leaves
+          : reversed ? leaves - 9001 / 512 : (5000 + 511) / 512;
+      EXPECT_EQ(expected, clipped) << field << " reversed=" << reversed;
+      // A fully clipped segment is one competitive range; otherwise the
+      // empty heap warms up block by block.
+      EXPECT_EQ(clipped == leaves ? PostingsReader::END : 4096,
+                collector.nextCompetitiveRange(segment.ord, 0).end)
+          << field << " reversed=" << reversed;
+      // Every in-envelope doc's key is at or past the floor.
+      std::vector<int32_t> all(segment.maxDoc());
+      std::iota(all.begin(), all.end(), 0);
+      std::vector<int64_t> keys(all.size());
+      batch->gatherKeys(all, keys);
+      SimpleNumericFieldComparator raw(std::string(field), false,
+                                       FieldComparator::MISSING_LAST);
+      raw.setSegment(segment.ord, &segment.postingsReader());
+      std::vector<int64_t> stored(all.size());
+      raw.keyBatch()->gatherKeys(all, stored);
+      for (size_t doc = 0; doc < all.size(); doc++) {
+        if (stored[doc] < values.lo || stored[doc] > values.hi) continue;
+        ASSERT_GE(keys[doc], floor) << field << " doc=" << doc;
+      }
+    }
+  }
+  // Without an envelope nothing is clipped.
+  IntFieldType intType("key_i");
+  SortField sortField("key_i", intType, SortField::DESC);
+  FieldSortCollector collector(10, columnPlan(sortField));
+  collector.setSegment(segment.ord, &segment.postingsReader());
+  EXPECT_EQ(0, collector.leavesBeforeKeyFloor);
+}
+
 // The best-first exact-domain driver must return exactly what the doc-order
 // windowed path and exhaustive collection return. Its bitset domain arrives
 // two ways: the folded filter-only Boolean's cached set (delete-free
@@ -2773,11 +3054,15 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
   struct Sorts {
     std::vector<std::pair<std::string_view, qb::SortDir>> clauses;
   };
-  auto run = [&](bool bestFirst, bool disablePruning, bool foldFilters,
+  // The driver off (the doc-order ladder), on by cost, or forced into
+  // bound order.
+  enum class Route { LADDER, COST, FORCED };
+  using enum Route;
+  auto run = [&](Route route, bool disablePruning, bool foldFilters,
                  const Sorts& sorts, int32_t limit, bool exactCount,
                  std::string_view field = "body_w",
                  std::string_view value = "alpha") {
-    BestFirstGuard bfGuard(!bestFirst, bestFirst);
+    BestFirstGuard bfGuard(route == LADDER, route == FORCED);
     SortPruningGuard pruningGuard(disablePruning);
     TopDocsFilterFoldGuard foldGuard(!foldFilters);
     SortSkipStatsGuard statsGuard;
@@ -2794,11 +3079,14 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
       std::vector<std::string> ids;
       int64_t found = 0;
       int64_t activations = 0;
+      int64_t walks = 0;
     } result;
     result.ids = resultIds(*req);
     const auto* docs = req->docList("q");
     if (docs != nullptr && docs->found) result.found = *docs->found;
     result.activations = SkipStats::fieldSortBestFirstActivations;
+    result.walks = SkipStats::fieldSortDocOrderSweeps
+        + SkipStats::fieldSortDomainScans;
     return result;
   };
 
@@ -2809,25 +3097,27 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
   Sorts monoAsc{{{"mono_i", qb::ASC}}};
 
   // Two sightings admit and materialize the filter; the route serves hits.
-  run(false, true, true, randAsc, 9, false);
-  run(false, true, true, randAsc, 9, false);
+  run(LADDER, true, true, randAsc, 9, false);
+  run(LADDER, true, true, randAsc, 9, false);
 
   for (const Sorts& sorts :
        {randAsc, randDesc, tiesAsc, tiesThenRand, monoAsc}) {
     for (int32_t limit : {1, 9, 987, 4500}) {
-      auto exhaustive = run(false, true, true, sorts, limit, false);
-      auto docOrder = run(false, false, true, sorts, limit, false);
-      auto bestFirst = run(true, false, true, sorts, limit, false);
-      EXPECT_EQ(exhaustive.ids, docOrder.ids)
-          << "limit=" << limit << " sort=" << sorts.clauses[0].first;
-      EXPECT_EQ(exhaustive.ids, bestFirst.ids)
-          << "limit=" << limit << " sort=" << sorts.clauses[0].first;
+      auto exhaustive = run(LADDER, true, true, sorts, limit, false);
+      for (Route route : {LADDER, COST, FORCED}) {
+        EXPECT_EQ(exhaustive.ids,
+                  run(route, false, true, sorts, limit, false).ids)
+            << "limit=" << limit << " sort=" << sorts.clauses[0].first
+            << " route=" << (int)route;
+      }
       // Pure match-all: no filter at all, the empty-mask domain form.
-      auto allExhaustive = run(false, true, true, sorts, limit, false, "");
-      auto allBestFirst = run(true, false, true, sorts, limit, false, "");
-      EXPECT_EQ(allExhaustive.ids, allBestFirst.ids)
-          << "match-all limit=" << limit
-          << " sort=" << sorts.clauses[0].first;
+      auto allExhaustive = run(LADDER, true, true, sorts, limit, false, "");
+      for (Route route : {COST, FORCED}) {
+        EXPECT_EQ(allExhaustive.ids,
+                  run(route, false, true, sorts, limit, false, "").ids)
+            << "match-all limit=" << limit
+            << " sort=" << sorts.clauses[0].first << " route=" << (int)route;
+      }
     }
   }
 
@@ -2838,12 +3128,12 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
     SortSkipStatsGuard statsGuard;
     for (const Sorts& sorts : {randAsc, randDesc, tiesAsc, monoAsc}) {
       for (int32_t limit : {9, 987}) {
-        auto exhaustive = run(false, true, true, sorts, limit, false);
-        auto capped = run(true, false, true, sorts, limit, false);
+        auto exhaustive = run(LADDER, true, true, sorts, limit, false);
+        auto capped = run(FORCED, false, true, sorts, limit, false);
         EXPECT_EQ(exhaustive.ids, capped.ids)
             << "capped limit=" << limit << " sort=" << sorts.clauses[0].first;
-        auto allExhaustive = run(false, true, true, sorts, limit, false, "");
-        auto allCapped = run(true, false, true, sorts, limit, false, "");
+        auto allExhaustive = run(LADDER, true, true, sorts, limit, false, "");
+        auto allCapped = run(FORCED, false, true, sorts, limit, false, "");
         EXPECT_EQ(allExhaustive.ids, allCapped.ids)
             << "capped match-all limit=" << limit
             << " sort=" << sorts.clauses[0].first;
@@ -2853,18 +3143,24 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
   }
 
   // Route engagement and gates, proven by the activation counter.
-  EXPECT_GT(run(true, false, true, randAsc, 9, false).activations, 0);
+  EXPECT_GT(run(FORCED, false, true, randAsc, 9, false).activations, 0);
   // Pure match-all with no deletes rides the empty-mask domain form.
-  EXPECT_GT(run(true, false, true, randAsc, 9, false, "").activations, 0);
-  // Without the force override the expected floor saturates this corpus's
-  // two key blocks per segment, so the gate declines.
-  EXPECT_EQ(run(false, false, true, randAsc, 9, false).activations, 0);
+  EXPECT_GT(run(FORCED, false, true, randAsc, 9, false, "").activations, 0);
+  // Unforced, the costs serve this domain without bound order: the
+  // predicted floor saturates the first segment's ten leaves, so the walk
+  // takes it. The second segment's keys are missing on some docs, so its
+  // column offers no masked leaf gather and the ladder serves it.
+  {
+    auto cost = run(COST, false, true, randAsc, 9, false);
+    EXPECT_EQ(0, cost.activations);
+    EXPECT_EQ(1, cost.walks);
+  }
   // Secondary clause: no sole column, no masked plan.
-  EXPECT_EQ(run(true, false, true, tiesThenRand, 9, false).activations, 0);
+  EXPECT_EQ(run(FORCED, false, true, tiesThenRand, 9, false).activations, 0);
   // Exact count keeps every pruning route off and stays exact.
   {
-    auto exact = run(true, false, true, randAsc, 9, true);
-    auto exactExh = run(false, true, true, randAsc, 9, true);
+    auto exact = run(FORCED, false, true, randAsc, 9, true);
+    auto exactExh = run(LADDER, true, true, randAsc, 9, true);
     EXPECT_EQ(exact.activations, 0);
     EXPECT_EQ(exact.ids, exactExh.ids);
     EXPECT_EQ(exact.found, exactExh.found);
@@ -2875,13 +3171,13 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
   // exhaustive collection.
   for (auto [field, value] : {std::pair<std::string_view, std::string_view>
                                   {"arr_s", "y"}, {"id_s", "42"}}) {
-    run(true, false, true, randAsc, 9, false, field, value);
-    run(true, false, true, randAsc, 9, false, field, value);
+    run(FORCED, false, true, randAsc, 9, false, field, value);
+    run(FORCED, false, true, randAsc, 9, false, field, value);
     for (int32_t limit : {1, 9, 987}) {
       auto arrBestFirst =
-          run(true, false, true, randAsc, limit, false, field, value);
+          run(FORCED, false, true, randAsc, limit, false, field, value);
       auto arrExhaustive =
-          run(false, true, true, randAsc, limit, false, field, value);
+          run(LADDER, true, true, randAsc, limit, false, field, value);
       EXPECT_GT(arrBestFirst.activations, 0)
           << field << " limit=" << limit;
       EXPECT_EQ(arrExhaustive.ids, arrBestFirst.ids)
@@ -2896,27 +3192,1166 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
   // stays usable - and both remain correct.
   ASSERT_TRUE(helper.deleteByIds({"42", "1000", "7003"},
                                  UpdateMessage::COMMIT).success);
-  auto deletedExhaustive = run(false, true, true, randAsc, 987, false);
-  auto deletedFolded = run(true, false, true, randAsc, 987, false);
+  auto deletedExhaustive = run(LADDER, true, true, randAsc, 987, false);
+  auto deletedFolded = run(FORCED, false, true, randAsc, 987, false);
   EXPECT_EQ(deletedFolded.activations, 0);
   EXPECT_EQ(deletedExhaustive.ids, deletedFolded.ids);
-  auto deletedUnfolded = run(true, false, false, randAsc, 987, false);
+  auto deletedUnfolded = run(FORCED, false, false, randAsc, 987, false);
   EXPECT_GT(deletedUnfolded.activations, 0);
   EXPECT_EQ(deletedExhaustive.ids, deletedUnfolded.ids);
   // Pure match-all with deletes: liveDocs becomes the domain bitset per the
   // root domain contract, so the route still activates and stays correct.
-  auto deletedAllExhaustive = run(false, true, true, randAsc, 987, false, "");
-  auto deletedAllBestFirst = run(true, false, true, randAsc, 987, false, "");
+  auto deletedAllExhaustive = run(LADDER, true, true, randAsc, 987, false, "");
+  auto deletedAllBestFirst = run(FORCED, false, true, randAsc, 987, false, "");
   EXPECT_GT(deletedAllBestFirst.activations, 0);
   EXPECT_EQ(deletedAllExhaustive.ids, deletedAllBestFirst.ids);
   // Array domain with deletes (doc 1000 is an arr_s member): the folded raw
   // borrow declines, the unfolded effective set stays an array and correct.
   auto deletedArrExhaustive =
-      run(false, true, true, randAsc, 987, false, "arr_s", "y");
+      run(LADDER, true, true, randAsc, 987, false, "arr_s", "y");
   auto deletedArrUnfolded =
-      run(true, false, false, randAsc, 987, false, "arr_s", "y");
+      run(FORCED, false, false, randAsc, 987, false, "arr_s", "y");
   EXPECT_GT(deletedArrUnfolded.activations, 0);
   EXPECT_EQ(deletedArrExhaustive.ids, deletedArrUnfolded.ids);
+}
+
+// The exact-domain economics on the 5M benchgame geometry (9829 leaves):
+// the plan over a whole segment, bound order's reading at a checkpoint, and
+// the one re-decision rule over the rest.
+TEST_F(SortCollectorTest, exactDomainSortCostsDecide) {
+  using Costs = ExactDomainSortCosts;
+  using Phase = ExactDomainSortPhase;
+  constexpr int64_t kLeaves = 9829;
+  auto planWithin = [&](int64_t card, int64_t floor, int64_t admitted,
+                        bool unskippable) {
+    return Costs::plan({card, kLeaves, floor, admitted, 0, kLeaves, 0},
+                       unskippable);
+  };
+  auto plan = [&](int64_t card, int64_t floor) {
+    return planWithin(card, floor, kLeaves, false);
+  };
+  // Every leaf before the key floor: nothing can be skipped, so scan.
+  EXPECT_EQ(Phase::SCAN, planWithin(2000000, 1, kLeaves, true));
+  // Saturated: a sparse domain is scanned, its few docs per leaf not worth
+  // classifying.
+  EXPECT_EQ(Phase::SCAN, plan(20000, kLeaves));
+  // A small floor on a dense domain goes to bound order; on a domain too
+  // sparse for a visit to repay itself, to the scan.
+  EXPECT_EQ(Phase::BOUND_ORDER, plan(1000000, 50));
+  EXPECT_EQ(Phase::SCAN, plan(5000, 2000));
+  // A bottom admitting few leaves bounds bound order's visits whatever the
+  // prior; one admitting none leaves it nothing to visit.
+  EXPECT_EQ(Phase::BOUND_ORDER, planWithin(100000, kLeaves, 30, false));
+  EXPECT_EQ(Phase::BOUND_ORDER, planWithin(20000, kLeaves, 0, false));
+
+  // Bound order's reading: among the empty leaves that lead its order, or
+  // with the heap still filling, no proof can be expected, and the prior
+  // stands; past them a full heap without one leaves only the admitted
+  // leaves to bound it; proofs, read twice over, project
+  // (walked - empty)*k/(2p) past the empty leaves.
+  auto read = [&](int64_t prior, int64_t walked, int64_t proofs,
+                  int64_t admitted, int64_t empty, bool full) {
+    return Costs::readBoundOrder(prior, walked, proofs, 10, admitted, empty,
+                                 full);
+  };
+  EXPECT_EQ(400, read(400, 100, 0, 5000, 300, true));
+  EXPECT_EQ(400, read(400, 160, 0, 5000, 0, false));
+  EXPECT_EQ(5000, read(400, 160, 0, 5000, 0, true));
+  EXPECT_EQ(125, read(400, 100, 4, 5000, 0, true));
+  EXPECT_EQ(425, read(400, 400, 4, 5000, 300, true));
+  EXPECT_EQ(900, read(400, 400, 1, 900, 0, true));
+  EXPECT_EQ(16, Costs::firstCheckpoint(2, 10, 0));
+  EXPECT_EQ(2014, Costs::firstCheckpoint(2517, 10, 0));
+  EXPECT_EQ(8847, Costs::firstCheckpoint(8847, 10, 8843));
+
+  // The re-decision: the incumbent keeps the rest unless the cheapest phase
+  // costs less - by kProgressMargin for the walk. A dense domain bound order
+  // walks without proofs prices every admitted leaf and hands the rest to
+  // the walk.
+  Costs::Rest dense{2000000, kLeaves - 600, kLeaves, kLeaves, 0,
+                    kLeaves - 600, 0};
+  auto denseCosts = Costs::costs(dense);
+  EXPECT_NE(Phase::BOUND_ORDER, denseCosts.cheapest());
+  EXPECT_NE(Phase::BOUND_ORDER,
+            denseCosts.redecide(Phase::BOUND_ORDER, 1));
+  // A walk whose bottom admits few leaves hands the rest to bound order.
+  Costs::Rest tight{500000, 6000, 20, 20, 0, 6000, 0};
+  EXPECT_EQ(Phase::BOUND_ORDER,
+            Costs::costs(tight).redecide(Phase::SCAN, Costs::kProgressMargin));
+  EXPECT_EQ(Phase::BOUND_ORDER,
+            Costs::costs(tight).redecide(Phase::SWEEP,
+                                         Costs::kProgressMargin));
+  // A loose bottom keeps the walk.
+  Costs::Rest loose{500000, 6000, 6000, 6000, 0, 6000, 0};
+  EXPECT_EQ(Phase::SCAN,
+            Costs::costs(loose).redecide(Phase::SCAN, Costs::kProgressMargin));
+
+  // The oldest tenth of a time-ordered segment sorted newest first: bound
+  // order's floor covers the 8843 leaves past the range, all empty, and the
+  // four holding its newest docs, while the walk would gather the whole
+  // range (its lead) before meeting them - bound order. The same domain met
+  // at its start (no lead) still walks nothing but its first leaves.
+  Costs::Rest window{418682, kLeaves, 8847, kLeaves, 8843, 986, 982};
+  auto windowCosts = Costs::costs(window);
+  EXPECT_EQ(Phase::BOUND_ORDER, windowCosts.cheapest());
+  EXPECT_GT(windowCosts.sweep, 10 * windowCosts.boundOrder);
+  window.lead = 0;
+  EXPECT_LT(Costs::costs(window).sweep, windowCosts.sweep / 10);
+
+  // A small domain sorted newest first at k = 1000 on a time-ordered
+  // segment: a walk admits every doc of its lead, each a sift through the
+  // heap, so bound order wins over 6000 of the 9829 leaves; on uniform keys
+  // the walk admits a few thousand and is the cheaper.
+  Costs::Rest late{14000, kLeaves, 6000, kLeaves, 0, kLeaves, 9765, 1000};
+  EXPECT_EQ(Phase::BOUND_ORDER, Costs::costs(late).cheapest());
+  late.lead = 0;
+  EXPECT_NE(Phase::BOUND_ORDER, Costs::costs(late).cheapest());
+
+  // The doc-order walk's leaf descent (walkDescends) on a 10M-doc segment
+  // (19532 leaves) under uniform keys at k = 10: a 0.1% domain's bottom
+  // admits 40% of the leaves with half a domain doc in each, so the 2.3k
+  // docs the skipped leaves hold cannot pay for classifying every leaf; at
+  // 1% it admits 5% and skips 80k docs. The boundary falls near 1.4 docs a
+  // leaf: 0.24% stays off, 0.3% descends.
+  constexpr int64_t kGridLeaves = 19532;
+  auto descends = [&](int64_t card, int64_t floor) {
+    return Costs::walkDescends({card, kGridLeaves, floor, kGridLeaves, 0,
+                                kGridLeaves, 0, 10});
+  };
+  EXPECT_FALSE(descends(10000, 7829));
+  EXPECT_TRUE(descends(100000, 975));
+  EXPECT_FALSE(descends(24000, 3752));
+  EXPECT_TRUE(descends(30000, 3065));
+  // Best keys last in doc order (a lead over every inside leaf) leave the
+  // walk nothing to skip, however dense the domain.
+  EXPECT_FALSE(Costs::walkDescends({100000, kGridLeaves, 975, kGridLeaves, 0,
+                                    kGridLeaves, kGridLeaves, 10}));
+}
+
+// The walk prices leaf descent on the docs it expects to collect
+// (TopDocsReq::walkMembershipWork), not on what its source costs. One
+// 256-leaf segment under uniform keys at k = 1: a 10% term alone admits few
+// leaves and holds 51 docs in each, so the walk descends; ANDed with an
+// independent 2.5% term its lead costs the same, but it collects 0.25% - 1.3
+// docs a leaf over the 80% of leaves the bottom admits - and does not.
+TEST_F(SortCollectorTest, walkDescentPricesTheCollectedDomain) {
+  WholeMembershipPlanGuard wholeGuard(true);
+  SeededGuard seededGuard(true, false);
+  CollectionHelper helper("walk_descent");
+  constexpr int32_t kDocs = 256 * 512;
+  for (int32_t docId = 0; docId < kDocs; docId++) {
+    SplitMix64 r((uint64_t)docId);
+    helper.index(flatdoc("id", std::to_string(docId),
+                         "id_s", std::to_string(docId),
+                         "rnd_i", r.rint(1 << 30),
+                         "lead_s", r.rint(10) == 0 ? "y" : "n",
+                         "rare_s", r.rint(40) == 0 ? "y" : "n"),
+                 UpdateMessage::NO_COMMIT);
+  }
+  helper.commit();
+
+  auto leavesSkipped = [&](bool conjunction) {
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("walk_descent");
+    auto& cur = req->topDocs("q").limit(1).fields({"id_s"});
+    auto& mr = cur.mr();
+    cur.rawQuery() = conjunction
+        ? qb::boolean(mr, {qb::match(mr, "lead_s", "y"),
+                           qb::match(mr, "rare_s", "y")})
+        : qb::match(mr, "lead_s", "y");
+    qb::sort(cur, "rnd_i", qb::ASC);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return SkipStats::fieldSortLeavesSkipped;
+  };
+  EXPECT_GT(leavesSkipped(false), 0);
+  EXPECT_EQ(0, leavesSkipped(true));
+}
+
+// Every exact-domain phase over every representation matches unpruned
+// collection of the same docs. One segment of 24 full leaves and a 300-doc
+// last leaf (four coarse blocks, the last partial); one key column ties
+// heavily, the other ascends with the doc. The domains walk the forward
+// cursor through runs of empty leaves, docs on both sides of leaf and
+// coarse-block boundaries, the last partial leaf alone, a lone last doc, and
+// every doc (also as the empty every-doc bitset). Each phase runs pure; bound
+// order also runs capped at two gathers, so the walk resumes past its
+// visited leaves; and each runs with its checkpoints on a prior far from the
+// truth (a one-leaf floor under a walk, every leaf under bound order), so
+// re-decisions hand the rest between bound order and the walk's levels.
+TEST_F(SortCollectorTest, exactDomainPhasesMatchExhaustive) {
+  CollectionHelper helper;
+  constexpr int32_t kDocs = 24 * 512 + 300;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < kDocs; doc++) {
+    int64_t key = (int64_t)(((uint32_t)doc * 2654435761u) % 1000);
+    docs.push_back(flatdoc("id", std::to_string(doc), "key_i", key,
+                           "mono_i", (int64_t)doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto& segment = reader->segments()[0];
+  ASSERT_EQ(kDocs, segment.maxDoc());
+
+  auto leafDocs = [&](std::initializer_list<int32_t> leaves) {
+    std::vector<int32_t> out;
+    for (int32_t leaf : leaves) {
+      for (int32_t doc = leaf * 512; doc < std::min(leaf * 512 + 512, kDocs);
+           doc++) {
+        out.push_back(doc);
+      }
+    }
+    return out;
+  };
+  std::vector<int32_t> every(kDocs);
+  std::iota(every.begin(), every.end(), 0);
+  std::vector<int32_t> sparse;
+  for (int32_t doc = 5; doc < kDocs; doc += 37) sparse.push_back(doc);
+  std::vector<std::vector<int32_t>> domains = {
+      {0, 1, 511, 512, 1023, 1024, 4095, 4096, 4097, 8191, 8192, 12287,
+       12288, kDocs - 1},
+      leafDocs({24}),
+      leafDocs({0, 7, 8, 23}),
+      {kDocs - 1},
+      sparse,
+      every,
+  };
+
+  // rep: 0 array, 1 bitset, 2 the empty every-doc bitset.
+  using Phase = ExactDomainSortPhase;
+  auto collect = [&](const SortField& sortField,
+                     const std::vector<int32_t>& domain, int rep,
+                     int64_t topCount, std::optional<Phase> phase,
+                     int64_t cap, bool checkProgress, int64_t floor) {
+    MemPool pool;
+    FieldSortCollector collector(topCount, columnPlan(sortField));
+    collector.setSegment(0, &segment.postingsReader(), &pool,
+                         (int64_t)domain.size());
+    if (!phase.has_value()) {
+      collector.collectWindow(0, domain);
+    } else {
+      ExactDomainSortRoute route;
+      route.card = (int64_t)domain.size();
+      route.floor = floor;
+      route.phase = *phase;
+      route.checkProgress = checkProgress;
+      route.gatherCapForTests = cap;
+      std::vector<uint64_t> words((size_t)(kDocs + 63) / 64);
+      for (int32_t doc : domain) words[(size_t)doc >> 6] |= 1ULL << (doc & 63);
+      if (rep == 0) {
+        collectTopKArrayDomain(0, domain, collector, pool, route);
+      } else {
+        collectTopKBitSetDomain(
+            0, rep == 1 ? std::span<const uint64_t>(words)
+                        : std::span<const uint64_t>(),
+            collector, pool, route);
+      }
+    }
+    std::vector<segdoc> docs;
+    for (const auto& doc : collector.sort()) docs.push_back(doc.doc);
+    return docs;
+  };
+  for (std::string_view field : {"key_i", "mono_i"}) {
+    IntFieldType fieldType(field);
+    for (auto order : {SortField::ASC, SortField::DESC}) {
+      SortField sortField(field, fieldType, order,
+                          FieldComparator::MISSING_LAST);
+      for (const auto& domain : domains) {
+        for (int64_t topCount : {int64_t(1), int64_t(7), int64_t(100)}) {
+          auto expected = collect(sortField, domain, 0, topCount,
+                                  std::nullopt, 0, false, 0);
+          for (int rep = 0; rep < 3; rep++) {
+            if (rep == 2 && domain.size() != every.size()) continue;
+            // {phase, cap, checkpoints, prior floor}
+            for (auto [phase, cap, check, floor] :
+                 {std::tuple{Phase::BOUND_ORDER, int64_t(0), false, int64_t(1)},
+                  std::tuple{Phase::BOUND_ORDER, int64_t(2), false, int64_t(1)},
+                  std::tuple{Phase::SCAN, int64_t(0), false, int64_t(1)},
+                  std::tuple{Phase::SWEEP, int64_t(0), false, int64_t(1)},
+                  std::tuple{Phase::BOUND_ORDER, int64_t(0), true, int64_t(25)},
+                  std::tuple{Phase::SCAN, int64_t(0), true, int64_t(1)},
+                  std::tuple{Phase::SWEEP, int64_t(0), true, int64_t(1)}}) {
+              EXPECT_EQ(expected, collect(sortField, domain, rep, topCount,
+                                          phase, cap, check, floor))
+                  << field << " order=" << order << " card=" << domain.size()
+                  << " k=" << topCount << " phase=" << (int)phase
+                  << " cap=" << cap << " check=" << check << " rep=" << rep;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // leavesWithinBottom: every leaf until the heap fills, then exactly the
+  // leaves bounded at or before the bottom's key.
+  IntFieldType monoType("mono_i");
+  for (auto order : {SortField::ASC, SortField::DESC}) {
+    SortField sortField("mono_i", monoType, order,
+                        FieldComparator::MISSING_LAST);
+    MemPool pool;
+    FieldSortCollector collector(7, columnPlan(sortField));
+    collector.setSegment(0, &segment.postingsReader(), &pool, kDocs);
+    auto* batch = collector.maskedKeyBlockPlan().batch;
+    ASSERT_NE(nullptr, batch);
+    collector.collectWindow(0, std::span(sparse).first(3));
+    EXPECT_EQ(batch->leafBlockCount(), collector.leavesWithinBottom());
+    collector.collectWindow(0, std::span(sparse).subspan(3));
+    std::vector<int64_t> keys;
+    for (int32_t doc : sparse) {
+      keys.push_back(order == SortField::DESC ? ~(int64_t)doc : doc);
+    }
+    std::sort(keys.begin(), keys.end());
+    int64_t within = 0;
+    for (int64_t leaf = 0; leaf < batch->leafBlockCount(); leaf++) {
+      within += batch->leafBestKey(leaf) <= keys[6];
+    }
+    EXPECT_GT(within, 0);
+    EXPECT_LT(within, batch->leafBlockCount());
+    EXPECT_EQ(within, collector.leavesWithinBottom()) << order;
+  }
+}
+
+// The exact-domain driver picks its phases by cost (ExactDomainSortCosts).
+// One 256-leaf segment, k = 1: a small ARRAY filter (4 docs per leaf) at half
+// the leaves' floor is scanned, its few docs per leaf not worth a visit or a
+// classification; a half-corpus BITSET filter proves in bound order; a
+// filter of only the lowest keys, sorted descending, makes every leaf bound
+// beat every member, so bound order starts on the uniform-key floor, makes
+// no proof by its first checkpoint, and hands the rest to the scan. At
+// k = 300 both filters saturate the floor and are scanned. A filter of only
+// the lowest keys, sorted ascending, beats the prior, which plans a scan:
+// the scan's first checkpoint hands the rest to bound order, which proves.
+// Keys in doc order (ascending) are tight zones the value sketch reads, so
+// the predicted bottom plans bound order, which proves after the leaves
+// holding the first matches. Every route matches exhaustive collection, the
+// ladder, and forced bound order.
+TEST_F(SortCollectorTest, bestFirstRouteFollowsCostModel) {
+  WholeMembershipPlanGuard wholeGuard(true);
+  CollectionHelper helper("best_first_cost");
+  constexpr int32_t kDocs = 256 * 512;
+  constexpr int64_t kLowKeys = 0x7fffffff / 4;
+  for (int32_t docId = 0; docId < kDocs; docId++) {
+    int64_t key = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
+    std::string body = docId % 2 == 0 ? "large" : "odd";
+    if (docId % 127 == 0) body += " small";
+    if (key < kLowKeys) body += " low";
+    if (key < kLowKeys && docId % 16 == 0) body += " lowsparse";
+    if (key < kLowKeys / 16 && docId % 2 == 0) body += " favored";
+    helper.index(flatdoc("id", std::to_string(docId),
+                         "id_s", std::to_string(docId), "body_w", body,
+                         "key_i", key, "mono_i", (int64_t)docId),
+                 UpdateMessage::NO_COMMIT);
+  }
+  helper.commit();
+
+  struct Result {
+    std::vector<std::string> ids;
+    int64_t sweeps = 0;
+    int64_t boundOrder = 0;
+    int64_t proofs = 0;
+    int64_t handoffs = 0;
+    int64_t scans = 0;
+    int64_t walkHandoffs = 0;
+    int64_t sweptLeaves = 0;
+    int64_t gathered = 0;
+    int64_t ladder = 0;
+  };
+  auto run = [&](std::string_view value, qb::SortDir dir, int32_t limit,
+                 bool disableBestFirst = false, bool forceBestFirst = false,
+                 bool disablePruning = false,
+                 std::string_view field = "key_i") {
+    BestFirstGuard bfGuard(disableBestFirst, forceBestFirst);
+    SortPruningGuard pruningGuard(disablePruning);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("best_first_cost");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    cur.allQuery().matchFilter("body_w", value);
+    qb::sort(cur, field, dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{resultIds(*req), SkipStats::fieldSortDocOrderSweeps,
+                  SkipStats::fieldSortBestFirstActivations,
+                  SkipStats::fieldSortBestFirstTerminations,
+                  SkipStats::fieldSortBestFirstFallbacks,
+                  SkipStats::fieldSortDomainScans,
+                  SkipStats::fieldSortWalkHandOffs,
+                  SkipStats::fieldSortSweepLeaves,
+                  SkipStats::fieldSortDocsGathered,
+                  SkipStats::fieldSortBulkCollections};
+  };
+  for (std::string_view value :
+       {"small", "large", "low", "lowsparse", "favored"}) {
+    run(value, qb::DESC, 1);  // two sightings admit the filter
+    run(value, qb::DESC, 1);
+  }
+
+  auto small = run("small", qb::DESC, 1);
+  EXPECT_EQ(1, small.scans);
+  EXPECT_EQ(0, small.boundOrder + small.sweeps + small.walkHandoffs);
+  auto large = run("large", qb::DESC, 1);
+  EXPECT_EQ(0, large.sweeps + large.scans);
+  EXPECT_EQ(1, large.boundOrder);
+  EXPECT_EQ(1, large.proofs);
+  EXPECT_EQ(0, large.handoffs);
+  auto low = run("low", qb::DESC, 1);
+  EXPECT_EQ(1, low.boundOrder);
+  EXPECT_EQ(0, low.proofs);
+  EXPECT_EQ(1, low.handoffs);
+  EXPECT_EQ(1, low.scans);
+  // Ascending, the same filter holds the best keys and bound order proves.
+  auto lowAsc = run("low", qb::ASC, 1);
+  EXPECT_EQ(1, lowAsc.proofs);
+  EXPECT_EQ(0, lowAsc.handoffs);
+  {
+    WorkCapGuard capGuard(2);
+    auto lowSparse = run("lowsparse", qb::DESC, 1);
+    EXPECT_EQ(1, lowSparse.boundOrder);
+    EXPECT_EQ(1, lowSparse.handoffs);
+    EXPECT_EQ(1, lowSparse.scans);
+    EXPECT_EQ(0, lowSparse.sweptLeaves);
+  }
+  for (std::string_view value : {"small", "large"}) {
+    auto saturated = run(value, qb::DESC, 300);
+    EXPECT_EQ(0, saturated.ladder) << value;
+    EXPECT_EQ(0, saturated.boundOrder) << value;
+    EXPECT_EQ(1, saturated.scans) << value;
+  }
+  // The lowest keys only, ascending: the prior plans a scan, whose first
+  // checkpoint finds a bottom admitting few leaves and hands the rest to
+  // bound order, which proves at once.
+  auto favored = run("favored", qb::ASC, 1);
+  EXPECT_EQ(1, favored.scans);
+  EXPECT_EQ(1, favored.walkHandoffs);
+  EXPECT_EQ(1, favored.boundOrder);
+  EXPECT_EQ(1, favored.proofs);
+  EXPECT_LE(favored.gathered, 512);
+  auto docOrdered = run("small", qb::ASC, 10, false, false, false, "mono_i");
+  EXPECT_EQ(0, docOrdered.scans + docOrdered.handoffs);
+  EXPECT_EQ(1, docOrdered.boundOrder);
+  EXPECT_EQ(1, docOrdered.proofs);
+  EXPECT_LT(docOrdered.gathered, 1032 * 3 / 4);
+
+  for (std::string_view value :
+       {"small", "large", "low", "lowsparse", "favored"}) {
+    for (std::string_view field : {"key_i", "mono_i"}) {
+      for (qb::SortDir dir : {qb::DESC, qb::ASC}) {
+        for (int32_t limit : {1, 10, 300}) {
+          auto exhaustive =
+              run(value, dir, limit, false, false, true, field);
+          EXPECT_EQ(exhaustive.ids,
+                    run(value, dir, limit, false, false, false, field).ids)
+              << value << " " << field << " limit=" << limit;
+          EXPECT_EQ(exhaustive.ids,
+                    run(value, dir, limit, true, false, false, field).ids)
+              << value << " " << field << " limit=" << limit;
+          EXPECT_EQ(exhaustive.ids,
+                    run(value, dir, limit, false, true, false, field).ids)
+              << value << " " << field << " limit=" << limit;
+        }
+      }
+    }
+  }
+}
+
+// The unforced cost route over three segments with deletes in each: 128, 64
+// (small) and 96 leaves, the last leaf partial. Match-all serves each
+// segment's liveDocs domain, an unfolded filter its live effective set. Keys:
+// uniform; doc order across segments (time_i, both directions); three values
+// tying across segments; and perm_i, which in the first segment gives each
+// leaf one disjoint key range, the first 48 leaves mid-ranked, and in later
+// segments only keys worse than all of those. Every route matches
+// exhaustive collection, and the counters show what single-segment uniform
+// data cannot. The predicted bottom (FieldSortCollector::predictBottom)
+// reads each segment's key distribution, so every correlated shape below is
+// planned as bound order from its first leaf, and segments are visited best
+// first (TopDocsReq::fieldSortVisitOrder), so the first one visited fills
+// the heap and each later one settles at its first bound:
+// - a 2.5% ARRAY domain sorted by perm_i gathers one leaf, in the first
+//   segment;
+// - time_i ascending over a sparse domain (oldest first) gathers two leaves
+//   of the oldest segment, descending over a dense one (newest first) one
+//   leaf of the newest, and so does descending at k = 1 over every51;
+// - a range on time_i clips half of the last segment's leaves, which bound
+//   order walks before it proves;
+// - ties across segments: the prior counts only the tied leaves the heap
+//   still needs (the tie rule skips the rest in segdoc order), so bound
+//   order gathers one leaf of the first segment and every other one is
+//   skipped.
+TEST_F(SortCollectorTest, exactDomainCostRouteAcrossSegments) {
+  WholeMembershipPlanGuard wholeGuard(true);
+  TopDocsFilterFoldGuard foldGuard(true);
+  CollectionHelper helper("cost_route_segments");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  constexpr std::array<int32_t, 3> kSegDocs{128 * 512, 64 * 512,
+                                            96 * 512 - 200};
+  int32_t docId = 0;
+  std::vector<std::string> deletes;
+  for (int32_t seg = 0; seg < 3; seg++) {
+    for (int32_t i = 0; i < kSegDocs[(size_t)seg]; i++, docId++) {
+      int64_t leaf = i / 512;
+      int64_t permLeaf = leaf < 48 ? 27 + leaf : leaf < 75 ? leaf - 48 : leaf;
+      std::string body = docId % 2 == 0 ? "half" : "odd";
+      if (docId % 40 == 0) body += " every40";
+      if (docId % 51 == 0) body += " every51";
+      if (docId % 101 == 0) body += " sparse";
+      helper.index(
+          flatdoc("id", std::to_string(docId), "id_s", std::to_string(docId),
+                  "body_w", body,
+                  "rnd_i",
+                  (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff,
+                  "time_i", (int64_t)docId, "tie_i", (int64_t)(docId % 3),
+                  "perm_i",
+                  seg == 0 ? permLeaf * 512 + i % 512
+                           : (int64_t)(1 << 20) + docId),
+          UpdateMessage::NO_COMMIT);
+      if (docId % 1009 == 7) deletes.push_back(std::to_string(docId));
+    }
+    helper.commit();
+  }
+  ASSERT_TRUE(helper.deleteByIds(deletes, UpdateMessage::COMMIT).success);
+  ASSERT_EQ(3u, helper.getIndexWriter()
+                    ->snapshots.readers.getReader()
+                    ->segments()
+                    .size());
+
+  struct Result {
+    std::vector<std::string> ids;
+    int64_t boundOrder = 0;
+    int64_t proofs = 0;
+    int64_t fallbacks = 0;
+    int64_t scans = 0;
+    int64_t walkHandOffs = 0;
+    int64_t sweptLeaves = 0;
+    int64_t boundOrderLeaves = 0;
+    int64_t leavesSkipped = 0;
+  };
+  using Range = std::optional<std::pair<int64_t, int64_t>>;
+  // filter: a body_w term, or empty for none; range: on time_i.
+  auto run = [&](std::string_view field, qb::SortDir dir, int32_t limit,
+                 std::string_view filter, Range range = {},
+                 bool exhaustive = false) {
+    SortPruningGuard pruningGuard(exhaustive);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("cost_route_segments");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    cur.allQuery();
+    if (!filter.empty()) cur.matchFilter("body_w", filter);
+    if (range.has_value()) {
+      cur.filter(qb::range(cur.mr(), "time_i",
+                           qb::valI64(cur.mr(), range->first), nullptr,
+                           qb::valI64(cur.mr(), range->second), nullptr));
+    }
+    qb::sort(cur, field, dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{resultIds(*req),
+                  SkipStats::fieldSortBestFirstActivations,
+                  SkipStats::fieldSortBestFirstTerminations,
+                  SkipStats::fieldSortBestFirstFallbacks,
+                  SkipStats::fieldSortDomainScans,
+                  SkipStats::fieldSortWalkHandOffs,
+                  SkipStats::fieldSortSweepLeaves,
+                  SkipStats::fieldSortBestFirstLeaves,
+                  SkipStats::fieldSortLeavesSkipped};
+  };
+  // Half the last segment's leaves lie above the range's top, half of the
+  // first segment's below its bottom.
+  constexpr int64_t kSplit = 128 * 512 + 64 * 512 + 48 * 512;
+  const std::array<Range, 2> ranges{Range{{0, kSplit - 1}},
+                                    Range{{kSplit, 1 << 30}}};
+  const std::array<std::string_view, 5> filters{"", "half", "every40",
+                                                "every51", "sparse"};
+  for (std::string_view filter : filters) {  // two sightings cache it
+    run("rnd_i", qb::ASC, 10, filter);
+    run("rnd_i", qb::ASC, 10, filter);
+  }
+  for (const Range& range : ranges) {
+    run("rnd_i", qb::ASC, 10, "", range);
+    run("rnd_i", qb::ASC, 10, "", range);
+  }
+
+  for (std::string_view field : {"rnd_i", "time_i", "tie_i", "perm_i"}) {
+    for (qb::SortDir dir : {qb::ASC, qb::DESC}) {
+      for (int32_t limit : {1, 10, 100, 1000}) {
+        for (std::string_view filter : filters) {
+          EXPECT_EQ(run(field, dir, limit, filter, {}, true).ids,
+                    run(field, dir, limit, filter).ids)
+              << field << " " << (int)dir << " limit=" << limit << " "
+              << filter;
+        }
+        if (field != "time_i" && field != "rnd_i") continue;
+        for (const Range& range : ranges) {
+          EXPECT_EQ(run(field, dir, limit, "", range, true).ids,
+                    run(field, dir, limit, "", range).ids)
+              << field << " " << (int)dir << " limit=" << limit
+              << " range " << range->first;
+        }
+      }
+    }
+  }
+
+  for (auto [field, dir, limit, filter, leaves] :
+       {std::tuple{"perm_i", qb::ASC, 10, "every40", 1},
+        std::tuple{"time_i", qb::ASC, 10, "sparse", 2},
+        std::tuple{"time_i", qb::DESC, 10, "half", 1},
+        std::tuple{"time_i", qb::DESC, 1, "every51", 1}}) {
+    auto result = run(field, dir, limit, filter);
+    EXPECT_EQ(3, result.boundOrder) << field << " " << filter;
+    EXPECT_EQ(3, result.proofs) << field << " " << filter;
+    EXPECT_EQ(leaves, result.boundOrderLeaves) << field << " " << filter;
+    EXPECT_EQ(0, result.fallbacks + result.scans
+                     + result.sweptLeaves)
+        << field << " " << filter;
+  }
+
+  auto clipped = run("time_i", qb::DESC, 10, "", ranges[0]);
+  EXPECT_EQ(3, clipped.boundOrder);
+  EXPECT_EQ(3, clipped.proofs);
+  EXPECT_EQ(0, clipped.fallbacks);
+  EXPECT_GE(clipped.boundOrderLeaves, 48);
+
+  auto ties = run("tie_i", qb::ASC, 10, "");
+  EXPECT_EQ(1, ties.boundOrderLeaves);
+  EXPECT_EQ(0, ties.sweptLeaves + ties.scans);
+}
+
+// A range on the sort field itself puts every domain key at or past the
+// range's best-side edge, so leaves bounded before it can never be proven
+// out (k = 1, one 256-leaf segment, values over [0, 2^20)). Uniform keys
+// under a DESC sort over the lower half clip every leaf, so nothing can be
+// skipped: the exact-domain driver scans a BITSET domain and an ARRAY
+// domain (a 1.5% range) whole. Doc-ordered keys over the same range clip
+// only the upper half's leaves: bound order still visits them first, and
+// its first progress checkpoint waits past them, so it proves instead of
+// handing off. ASC over the same range clips nothing. The
+// clip holds for the points-indexed and the column-only field, for a folded
+// filter (the cached range set) and an unfolded one (a collector filter
+// under match-all), and for a query's resident whole membership; every
+// route matches exhaustive collection.
+TEST_F(SortCollectorTest, rangeOnSortFieldClipsBoundOrder) {
+  WholeMembershipPlanGuard wholeGuard(true);
+  CollectionHelper helper("range_clip");
+  SchemaBuilder schema;
+  for (std::string_view name : {"rnd_pt", "mono_pt"}) {
+    auto& field = schema.field(name);
+    field.type = luxir::api::FieldDef::FieldClass::INT;
+    field.index = luxir::api::FieldDef::IndexMode::RANGE;
+  }
+  schema.set(helper.collection());
+  constexpr int32_t kDocs = 256 * 512;
+  constexpr int64_t kHalf = 1 << 19;
+  for (int32_t docId = 0; docId < kDocs; docId++) {
+    int64_t rnd = (int64_t)(((uint32_t)docId * 2654435761u) >> 12);
+    int64_t mono = (int64_t)docId * 8;
+    helper.index(flatdoc("id", std::to_string(docId),
+                         "id_s", std::to_string(docId),
+                         "body_w", docId % 2 == 0 ? "even" : "odd",
+                         "rnd_i", rnd, "rnd_pt", rnd,
+                         "mono_i", mono, "mono_pt", mono),
+                 UpdateMessage::NO_COMMIT);
+  }
+  helper.commit();
+
+  struct Result {
+    std::vector<std::string> ids;
+    int64_t sweeps = 0;
+    int64_t boundOrder = 0;
+    int64_t proofs = 0;
+    int64_t handoffs = 0;
+    int64_t scans = 0;
+  };
+  enum class Domain { FOLDED, UNFOLDED, WHOLE };
+  auto run = [&](std::string_view field, qb::SortDir dir, int64_t hi,
+                 int32_t limit, Domain domain = Domain::FOLDED,
+                 bool disablePruning = false) {
+    SortPruningGuard pruningGuard(disablePruning);
+    TopDocsFilterFoldGuard foldGuard(domain == Domain::UNFOLDED);
+    WholeMembershipPlanGuard whole(domain != Domain::WHOLE);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("range_clip");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    if (domain == Domain::WHOLE) {
+      cur.matchQuery("body_w", "even");
+    } else {
+      cur.allQuery();
+    }
+    cur.filter(qb::range(cur.mr(), field, qb::valI64(cur.mr(), 0), nullptr,
+                         qb::valI64(cur.mr(), hi - 1), nullptr));
+    qb::sort(cur, field, dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{resultIds(*req), SkipStats::fieldSortDocOrderSweeps,
+                  SkipStats::fieldSortBestFirstActivations,
+                  SkipStats::fieldSortBestFirstTerminations,
+                  SkipStats::fieldSortBestFirstFallbacks,
+                  SkipStats::fieldSortDomainScans};
+  };
+  constexpr int64_t kSparse = kHalf / 32;  // a 1.5% range: an ARRAY domain
+  for (std::string_view field : {"rnd_i", "rnd_pt", "mono_i", "mono_pt"}) {
+    for (int64_t hi : {kHalf, kSparse}) {
+      run(field, qb::DESC, hi, 1);  // two sightings admit the filter
+      run(field, qb::DESC, hi, 1);
+    }
+  }
+
+  for (std::string_view field : {"rnd_i", "rnd_pt"}) {
+    for (int64_t hi : {kHalf, kSparse}) {
+      for (Domain domain : {Domain::FOLDED, Domain::UNFOLDED}) {
+        auto clipped = run(field, qb::DESC, hi, 1, domain);
+        EXPECT_EQ(1, clipped.scans) << field << " hi=" << hi;
+        EXPECT_EQ(0, clipped.sweeps + clipped.boundOrder)
+            << field << " hi=" << hi;
+      }
+    }
+    auto ascending = run(field, qb::ASC, kHalf, 1);
+    EXPECT_EQ(1, ascending.boundOrder) << field;
+    EXPECT_EQ(1, ascending.proofs) << field;
+  }
+  for (std::string_view field : {"mono_i", "mono_pt"}) {
+    auto correlated = run(field, qb::DESC, kHalf, 1);
+    EXPECT_EQ(0, correlated.sweeps) << field;
+    EXPECT_EQ(1, correlated.boundOrder) << field;
+    EXPECT_EQ(1, correlated.proofs) << field;
+    EXPECT_EQ(0, correlated.handoffs) << field;
+  }
+  // A fully clipped domain cannot bound the driver's visits, so the field
+  // sort builds its membership only when forced to.
+  {
+    BestFirstGuard force(false, true);
+    run("rnd_i", qb::DESC, kHalf, 1, Domain::WHOLE);  // two sightings
+    run("rnd_i", qb::DESC, kHalf, 1, Domain::WHOLE);
+  }
+  auto resident = run("rnd_i", qb::DESC, kHalf, 1, Domain::WHOLE);
+  EXPECT_EQ(1, resident.scans);
+  EXPECT_EQ(0, resident.sweeps + resident.boundOrder);
+
+  for (std::string_view field : {"rnd_i", "rnd_pt", "mono_i", "mono_pt"}) {
+    for (int64_t hi : {kHalf, kSparse}) {
+      for (qb::SortDir dir : {qb::DESC, qb::ASC}) {
+        for (Domain domain : {Domain::FOLDED, Domain::UNFOLDED, Domain::WHOLE}) {
+          for (int32_t limit : {1, 10, 300}) {
+            auto exhaustive = run(field, dir, hi, limit, domain, true);
+            EXPECT_EQ(exhaustive.ids, run(field, dir, hi, limit, domain).ids)
+                << field << " hi=" << hi << " limit=" << limit
+                << " domain=" << (int)domain;
+          }
+        }
+      }
+    }
+  }
+}
+
+// SegmentKeys reads a segment's sort keys off the persisted value sketch:
+// in both directions, with and without a value envelope, keyAt(f) is the key
+// of the in-envelope value ranked f of the way from the best and
+// fractionBefore inverts it, exactly in the sketch's exact tails and within
+// a few percent between them; keyFloor is the envelope's best edge; the
+// galloped leavesBoundedBefore counts the leaves a linear scan does; and
+// docOrderTrend tells keys rising with doc order (near 1 sorted descending,
+// -1 ascending) from keys in random order (near 0).
+TEST_F(SortCollectorTest, segmentKeysEstimateKeysWithinEnvelopes) {
+  CollectionHelper helper;
+  constexpr int32_t kDocs = 96 * 512 + 100;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < kDocs; doc++) {
+    docs.push_back(flatdoc(
+        "id", std::to_string(doc),
+        "key_i", (int64_t)(((uint32_t)doc * 2654435761u) % 1000003),
+        "mono_i", (int64_t)doc * 3));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto& segment = reader->segments()[0];
+  using Envelope = std::optional<Query::ValueEnvelope>;
+  for (std::string_view field : {"key_i", "mono_i"}) {
+    SimpleNumericFieldComparator raw(std::string(field), false,
+                                     FieldComparator::MISSING_LAST);
+    raw.setSegment(segment.ord, &segment.postingsReader());
+    std::vector<int32_t> all(kDocs);
+    std::iota(all.begin(), all.end(), 0);
+    std::vector<int64_t> values(kDocs);
+    raw.keyBatch()->gatherKeys(all, values);
+    for (bool reversed : {false, true}) {
+      for (Envelope envelope :
+           {Envelope{}, Envelope{{40000, 250000}}, Envelope{{-5, 9}}}) {
+        SCOPED_TRACE(std::string(field) + (reversed ? " desc" : " asc")
+                     + (envelope ? " env " + std::to_string(envelope->lo)
+                                 : " all"));
+        SimpleNumericFieldComparator comparator(
+            std::string(field), reversed, FieldComparator::MISSING_LAST);
+        comparator.setSegment(segment.ord, &segment.postingsReader());
+        auto keys = comparator.keyBatch()->segmentKeys(envelope);
+        ASSERT_TRUE(keys.has_value());
+        if (field == "mono_i") {
+          EXPECT_GT(reversed ? keys->docOrderTrend() : -keys->docOrderTrend(),
+                    0.9);
+        } else {
+          EXPECT_LT(std::abs(keys->docOrderTrend()), 0.5);
+        }
+        std::vector<int64_t> oracle;  // in-envelope keys, best first
+        for (int64_t v : values) {
+          if (envelope && (v < envelope->lo || v > envelope->hi)) continue;
+          oracle.push_back(reversed ? ~v : v);
+        }
+        std::sort(oracle.begin(), oracle.end());
+        double n = (double)oracle.size();
+        EXPECT_NEAR(n, keys->values(), std::max(1.0, n / 25));
+        int64_t lo = envelope ? envelope->lo
+                              : std::numeric_limits<int64_t>::min();
+        int64_t hi = envelope ? envelope->hi
+                              : std::numeric_limits<int64_t>::max();
+        EXPECT_EQ(reversed ? ~hi : lo, keys->keyFloor());
+        if (oracle.empty()) continue;
+        auto rankOf = [&](int64_t key) {
+          return (double)(std::lower_bound(oracle.begin(), oracle.end(), key)
+                          - oracle.begin());
+        };
+        // An envelope edge inside the column brings the sketch's spacing
+        // there into every in-envelope rank.
+        std::vector<int64_t> sortedValues = values;
+        std::sort(sortedValues.begin(), sortedValues.end());
+        auto spacingAt = [&](int64_t v) {
+          double rank = (double)(std::lower_bound(sortedValues.begin(),
+                                                  sortedValues.end(), v)
+                                 - sortedValues.begin());
+          double fromEnd = std::min(rank, (double)kDocs - rank);
+          return fromEnd < NumColumnFormat::SKETCH_TAIL
+              ? std::max(1.0, fromEnd / 32) : (double)kDocs / 25;
+        };
+        double edges = envelope
+            ? spacingAt(envelope->lo) + spacingAt(envelope->hi) : 0;
+        for (double f : {0.0, 0.0002, 0.001, 0.01, 0.1, 0.5, 0.9, 1.0}) {
+          double rank = std::max(0.0, f * n - 1);
+          double fromEnd = std::min(rank, n - rank);
+          double tolerance = edges
+              + (fromEnd < NumColumnFormat::SKETCH_TAIL
+                     ? std::max(2.0, fromEnd / 16) : n / 20);
+          int64_t key = keys->keyAt(f);
+          EXPECT_NEAR(rank, rankOf(key), tolerance) << "f=" << f;
+          int64_t truth = oracle[(size_t)rank];
+          EXPECT_NEAR(rank / n, keys->fractionBefore(truth),
+                      tolerance / n + 1e-9)
+              << "f=" << f;
+        }
+        for (int64_t key : {oracle.front(), oracle[oracle.size() / 3],
+                            oracle.back(), oracle.back() + 1}) {
+          int64_t linear = 0;
+          for (int64_t leaf = 0; leaf < keys->leafCount(); leaf++) {
+            linear += keys->leafBestKey(leaf) < key;
+          }
+          EXPECT_EQ(linear, keys->leavesBoundedBefore(key)) << key;
+        }
+      }
+    }
+  }
+}
+
+// The predicted bottom (FieldSortCollector::predictBottom) as a heap moves
+// across segments: from an empty heap, a segment's own k-th best; a full
+// heap merged with a segment drawn alike moves to the k-th best of both,
+// with one wholly better (newer keys, descending) to that segment's own
+// k-th, and with one wholly worse not at all; a domain that cannot fill
+// the heap predicts none. Two equal uniform segments and a time-ordered
+// pair, one leaf each side of the boundary.
+TEST_F(SortCollectorTest, predictedBottomFollowsHeapAcrossSegments) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  constexpr int32_t kSegDocs = 64 * 512;
+  int32_t docId = 0;
+  for (int32_t seg = 0; seg < 2; seg++) {
+    std::vector<Doc> docs;
+    for (int32_t i = 0; i < kSegDocs; i++, docId++) {
+      docs.push_back(flatdoc(
+          "id", std::to_string(docId),
+          "key_i", (int64_t)(((uint32_t)docId * 2654435761u) % 1000003),
+          "mono_i", (int64_t)docId));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(2u, reader->segments().size());
+  auto keysOf = [&](std::string_view field, bool reversed, size_t seg) {
+    SimpleNumericFieldComparator comparator(std::string(field), reversed,
+                                            FieldComparator::MISSING_LAST);
+    auto& segment = reader->segments()[seg];
+    comparator.setSegment(segment.ord, &segment.postingsReader());
+    return *comparator.keyBatch()->segmentKeys(std::nullopt);
+  };
+  constexpr int64_t k = 100;
+  constexpr int64_t card = kSegDocs / 2;
+  auto predict = [&](const FieldComparator::SegmentKeys& keys, int64_t heap,
+                     int64_t bottom) {
+    return FieldSortCollector::predictBottom(keys, card, k, heap, bottom);
+  };
+
+  // Uniform, alike: k / card, then k / (2 * card).
+  auto a = keysOf("key_i", false, 0);
+  auto b = keysOf("key_i", false, 1);
+  auto first = predict(a, 0, 0);
+  ASSERT_TRUE(first.has_value());
+  EXPECT_NEAR((double)k / card, a.fractionBefore(*first), 0.2 * k / card);
+  auto both = predict(b, k, *first);
+  ASSERT_TRUE(both.has_value());
+  EXPECT_LT(*both, *first);
+  EXPECT_NEAR((double)k / (2 * card), b.fractionBefore(*both),
+              0.2 * k / card);
+  // A domain smaller than the heap's room fills nothing.
+  EXPECT_FALSE(FieldSortCollector::predictBottom(a, k - 10, k, 9, 0));
+
+  // Time-ordered, newest first: segment 1 is wholly newer.
+  auto older = keysOf("mono_i", true, 0);
+  auto newer = keysOf("mono_i", true, 1);
+  auto olderBottom = predict(older, 0, 0);
+  ASSERT_TRUE(olderBottom.has_value());
+  auto newerAfter = predict(newer, k, *olderBottom);
+  auto newerAlone = predict(newer, 0, 0);
+  ASSERT_TRUE(newerAfter.has_value() && newerAlone.has_value());
+  EXPECT_NEAR((double)k / card, newer.fractionBefore(*newerAfter),
+              0.05 * k / card);
+  EXPECT_EQ(1, newer.leavesBoundedAtOrBefore(*newerAlone));
+  // Visited the other way, the older segment leaves the bottom alone.
+  EXPECT_EQ(*newerAlone, predict(older, k, *newerAlone));
+  EXPECT_EQ(0, older.leavesBoundedAtOrBefore(*newerAlone));
+}
+
+// Segments of 64, 8 and 1 leaves and two of 64 and 8 docs, oldest and
+// largest first (the shape a merge policy leaves): every segment saturates
+// its own visit floor at k = 100 over a half-density domain, but the
+// index-wide plan (TopDocsReq::fieldSortVisitsBounded) visits segments
+// newest first for a descending time-ordered key, and past the small ones
+// the heap's bottom bounds the rest: the planned floors cover a few leaves,
+// so the router builds the whole membership and later requests serve every
+// segment from it. A uniform key at the same depth stays saturated
+// index-wide and builds nothing; at k = 10 it builds. The visit order puts
+// the newest segment first for that sort and the oldest first ascending.
+// Every request matches exhaustive collection.
+TEST_F(SortCollectorTest, indexWidePlanBuildsAcrossSmallSegments) {
+  WholeMembershipPlanGuard wholeGuard(false);
+  CollectionHelper helper("index_wide_plan");
+  helper.getIndexWriter()->snapshots.readers.filterCache =
+      std::make_shared<FilterCache>(
+          FilterCacheConfig{.minSegmentDocs = 0, .admissionThreshold = 1});
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  constexpr std::array<int32_t, 5> kSegDocs{64 * 512, 8 * 512, 512, 64, 8};
+  int32_t docId = 0;
+  for (int32_t docs : kSegDocs) {
+    std::vector<Doc> batch;
+    for (int32_t i = 0; i < docs; i++, docId++) {
+      batch.push_back(flatdoc(
+          "id", std::to_string(docId), "id_s", std::to_string(docId),
+          "body_w", docId % 4 == 0 ? "half quarter"
+                    : docId % 2 == 0 ? "half" : "odd",
+          "time_i", (int64_t)docId,
+          "rnd_i", (int64_t)(((uint32_t)docId * 2654435761u) % 1000003)));
+    }
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::COMMIT).success);
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(kSegDocs.size(), reader->segments().size());
+
+  // The planner's view, from the per-segment estimates the router uses.
+  auto plan = [&](std::string_view field, qb::SortDir dir, int64_t k) {
+    IntFieldType type(field);
+    SortField sortField(field, type,
+                        dir == qb::DESC ? SortField::DESC : SortField::ASC);
+    SortPlan sortPlan;
+    sortPlan.useFieldSort = true;
+    sortPlan.clauses = columnPlan(sortField);
+    std::vector<int64_t> cards;
+    for (int32_t docs : kSegDocs) cards.push_back(docs / 2);
+    auto keys = TopDocsReq::fieldSortSegmentKeys(*reader, sortPlan, {});
+    auto order = TopDocsReq::fieldSortVisitOrder(keys, k, false);
+    bool bounded = TopDocsReq::fieldSortVisitsBounded(
+        *reader, sortPlan, {}, cards, k);
+    return std::pair(order, bounded);
+  };
+  auto [newestFirst, timeBounded] = plan("time_i", qb::DESC, 100);
+  EXPECT_EQ((std::vector<int32_t>{4, 3, 2, 1, 0}), newestFirst);
+  EXPECT_TRUE(timeBounded);
+  EXPECT_EQ((std::vector<int32_t>{0, 1, 2, 3, 4}),
+            plan("time_i", qb::ASC, 100).first);
+  EXPECT_FALSE(plan("rnd_i", qb::DESC, 100).second);
+  EXPECT_TRUE(plan("rnd_i", qb::DESC, 10).second);
+
+  struct Result {
+    std::vector<std::string> ids;
+    int64_t builds = 0;
+    int64_t hits = 0;
+    int64_t bypasses = 0;
+  };
+  auto run = [&](std::string_view field, qb::SortDir dir, int32_t limit,
+                 bool exhaustive = false) {
+    SortPruningGuard pruningGuard(exhaustive);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("index_wide_plan");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    // A union (half or quarter, which is half), a shape whose membership
+    // the field sort itself may build.
+    cur.rawQuery() = qb::boolean(
+        cur.mr(), {}, {qb::match(cur.mr(), "body_w", "half"),
+                       qb::match(cur.mr(), "body_w", "quarter")});
+    qb::sort(cur, field, dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{resultIds(*req), SkipStats::wholeFieldSortBuilds,
+                  SkipStats::wholeFieldSortHits,
+                  SkipStats::wholeFieldSortRoutingBypasses};
+  };
+  // The membership is the query's, whatever the sort: a uniform sort that
+  // cannot bound its visits builds nothing, a time-ordered one builds it,
+  // and then any sort is served from it.
+  auto uniform = run("rnd_i", qb::DESC, 100);
+  EXPECT_EQ(0, uniform.builds);
+  EXPECT_EQ((int64_t)kSegDocs.size(), uniform.bypasses);
+  auto built = run("time_i", qb::DESC, 100);
+  EXPECT_EQ((int64_t)kSegDocs.size(), built.builds);
+  auto served = run("time_i", qb::DESC, 100);
+  EXPECT_EQ((int64_t)kSegDocs.size(), served.hits);
+  EXPECT_EQ(run("time_i", qb::DESC, 100, true).ids, served.ids);
+  EXPECT_EQ((int64_t)kSegDocs.size(), run("rnd_i", qb::DESC, 100).hits);
+  for (std::string_view field : {"time_i", "rnd_i"}) {
+    for (qb::SortDir dir : {qb::DESC, qb::ASC}) {
+      for (int32_t limit : {1, 10, 100, 3000}) {
+        EXPECT_EQ(run(field, dir, limit, true).ids,
+                  run(field, dir, limit).ids)
+            << field << " " << (int)dir << " limit=" << limit;
+      }
+    }
+  }
+}
+
+// A segment without keys - here the sort field is absent from it - holds
+// docs without a value, which MISSING_FIRST sorts before every key: the
+// visit order takes it first. Under MISSING_LAST, or with an envelope (no
+// missing value satisfies one), it goes last.
+TEST_F(SortCollectorTest, visitOrderPlacesSegmentsWithoutKeysAtMissingEdge) {
+  CollectionHelper helper("missing_edge");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  int32_t docId = 0;
+  for (bool keyed : {true, false, true}) {
+    std::vector<Doc> batch;
+    for (int32_t i = 0; i < 2 * 512; i++, docId++) {
+      Doc doc = flatdoc("id", std::to_string(docId));
+      if (keyed) doc.push_back({"time_i", (int64_t)docId});
+      batch.push_back(std::move(doc));
+    }
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::COMMIT).success);
+  }
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(3u, reader->segments().size());
+  auto order = [&](FieldComparator::MissingValue missing,
+                   std::optional<Query::ValueEnvelope> envelope) {
+    IntFieldType type("time_i");
+    SortField sortField("time_i", type, SortField::DESC, missing);
+    SortPlan sortPlan;
+    sortPlan.useFieldSort = true;
+    sortPlan.clauses = columnPlan(sortField);
+    auto keys = TopDocsReq::fieldSortSegmentKeys(*reader, sortPlan, envelope);
+    return TopDocsReq::fieldSortVisitOrder(
+        keys, 10, TopDocsReq::fieldSortMissingFirst(sortPlan, envelope));
+  };
+  using Order = std::vector<int32_t>;
+  EXPECT_EQ((Order{1, 2, 0}), order(FieldComparator::MISSING_FIRST, {}));
+  EXPECT_EQ((Order{2, 0, 1}), order(FieldComparator::MISSING_LAST, {}));
+  EXPECT_EQ((Order{2, 0, 1}),
+            order(FieldComparator::MISSING_FIRST,
+                  Query::ValueEnvelope{0, 1 << 20}));
+}
+
+// Sequential field sorts visit segments in fieldSortVisitOrder; the kept
+// top K must not depend on it. Five segments in time order with keys that
+// tie across segments (time_i / 4096 and three-valued tie_i), deletes in
+// each, and match-all (liveDocs domains), a dense filter and a sparse one:
+// every sort, direction and depth matches exhaustive (unordered) collection
+// and a parallel request, and an exact count stays exact. Newest first on
+// match-all, the newest segment fills the heap and every older one settles
+// at its first bound: only the newest segment's leaves are gathered.
+TEST_F(SortCollectorTest, segmentVisitOrderKeepsTopKExact) {
+  WholeMembershipPlanGuard wholeGuard(true);
+  TopDocsFilterFoldGuard foldGuard(true);
+  CollectionHelper helper("visit_order");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  constexpr std::array<int32_t, 5> kSegDocs{16 * 512, 16 * 512 - 77, 4 * 512,
+                                            512 + 40, 300};
+  int32_t docId = 0;
+  std::vector<std::string> deletes;
+  for (int32_t docs : kSegDocs) {
+    std::vector<Doc> batch;
+    for (int32_t i = 0; i < docs; i++, docId++) {
+      std::string body = docId % 2 == 0 ? "half" : "odd";
+      if (docId % 97 == 0) body += " sparse";
+      batch.push_back(flatdoc(
+          "id", std::to_string(docId), "id_s", std::to_string(docId),
+          "body_w", body, "time_i", (int64_t)docId,
+          "coarse_i", (int64_t)(docId / 4096), "tie_i", (int64_t)(docId % 3),
+          "rnd_i", (int64_t)(((uint32_t)docId * 2654435761u) % 1000003)));
+      if (docId % 811 == 5) deletes.push_back(std::to_string(docId));
+    }
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteByIds(deletes, UpdateMessage::COMMIT).success);
+  ASSERT_EQ(kSegDocs.size(), helper.getIndexWriter()
+                                 ->snapshots.readers.getReader()
+                                 ->segments()
+                                 .size());
+
+  struct Result {
+    std::vector<std::string> ids;
+    int64_t found = -1;
+    int64_t gathered = 0;
+  };
+  auto run = [&](std::string_view field, qb::SortDir dir, int32_t limit,
+                 std::string_view filter, bool exhaustive = false,
+                 bool parallel = false, bool exactCount = false) {
+    SortPruningGuard pruningGuard(exhaustive);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("visit_order");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    cur.allQuery();
+    if (!filter.empty()) cur.matchFilter("body_w", filter);
+    if (exactCount) cur.getNumber();
+    qb::sort(cur, field, dir);
+    req->execute(parallel);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    Result result{resultIds(*req), -1, SkipStats::fieldSortDocsGathered};
+    const auto* list = req->docList("q");
+    if (list != nullptr && list->found) result.found = *list->found;
+    return result;
+  };
+  for (std::string_view filter : {"half", "sparse"}) {  // admit the filters
+    run("time_i", qb::DESC, 10, filter);
+    run("time_i", qb::DESC, 10, filter);
+  }
+  for (std::string_view field : {"time_i", "coarse_i", "tie_i", "rnd_i"}) {
+    for (qb::SortDir dir : {qb::DESC, qb::ASC}) {
+      for (int32_t limit : {1, 7, 100, 3000}) {
+        for (std::string_view filter : {"", "half", "sparse"}) {
+          auto exhaustive = run(field, dir, limit, filter, true);
+          EXPECT_EQ(exhaustive.ids, run(field, dir, limit, filter).ids)
+              << field << " " << (int)dir << " limit=" << limit << " "
+              << filter;
+          EXPECT_EQ(exhaustive.ids,
+                    run(field, dir, limit, filter, false, true).ids)
+              << "parallel " << field << " " << (int)dir
+              << " limit=" << limit << " " << filter;
+          auto counted = run(field, dir, limit, filter, false, false, true);
+          EXPECT_EQ(exhaustive.ids, counted.ids);
+          EXPECT_EQ(run(field, dir, limit, filter, true, false, true).found,
+                    counted.found)
+              << field << " limit=" << limit << " " << filter;
+        }
+      }
+    }
+  }
+  EXPECT_LE(run("time_i", qb::DESC, 10, "").gathered, 512);
 }
 
 // Seeded two-pass query-driven collection must match doc-order pruning and
@@ -2942,6 +4377,7 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
       std::string body = (docId & 1) == 0 ? "alpha" : "other";
       if (docId < 500) body = "head";
       if (docId >= 9000) body = "tail";
+      if (docId % 7 == 0) body += " excluded";
       if (seg == 1 && i % 13 == 0) {
         helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
                              "ties_i", (int64_t)(docId % 7),
@@ -2961,7 +4397,7 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
   struct Sorts {
     std::vector<std::pair<std::string_view, qb::SortDir>> clauses;
   };
-  enum class Main { TERM, BOOLEAN };
+  enum class Main { TERM, BOOLEAN, UNION, PHRASE_UNION };
   auto run = [&](bool seeded, bool disablePruning, const Sorts& sorts,
                  int32_t limit, bool exactCount,
                  std::string_view value = "alpha",
@@ -2974,10 +4410,18 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
     if (main == Main::TERM) {
       cur.matchQuery("body_w", value);
+    } else if (main == Main::UNION) {
+      cur.rawQuery() = qb::boolean(
+          cur.mr(), {}, {qb::match(cur.mr(), "body_w", value),
+                         qb::match(cur.mr(), "body_w", "head")});
+    } else if (main == Main::PHRASE_UNION) {
+      cur.rawQuery() = qb::boolean(
+          cur.mr(), {}, {qb::match(cur.mr(), "body_w", value),
+                         qb::phraseWords(cur.mr(), "body_w", {"alpha", "alpha"})});
     } else {
       cur.rawQuery() = qb::boolean(
           cur.mr(), {qb::match(cur.mr(), "body_w", value)}, {},
-          {qb::match(cur.mr(), "body_w", "tail")});
+          {qb::match(cur.mr(), "body_w", "excluded")});
     }
     if (exactCount) cur.getNumber();
     for (const auto& [f, dir] : sorts.clauses) qb::sort(cur, f, dir);
@@ -3036,13 +4480,28 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
   // Without the force override the two-block corpus can never clear the
   // materiality gate.
   EXPECT_EQ(run(false, false, randAsc, 9, false).activations, 0);
-  // A compound main query offers no independentReplan capability.
-  EXPECT_EQ(run(true, false, randAsc, 9, false, "alpha", 0,
-                Main::BOOLEAN).activations, 0);
-  // Exact count keeps every pruning route off and stays exact.
+  // Supported compound products reuse the same graph for seeds and sweep.
+  for (Main main : {Main::BOOLEAN, Main::UNION}) {
+    for (const Sorts& sorts : {randAsc, randDesc, tiesAsc, monoAsc}) {
+      for (int32_t limit : {9, 987, 4500}) {
+        auto seeded = run(true, false, sorts, limit, false, "alpha", 500, main);
+        auto exhaustive = run(false, true, sorts, limit, false, "alpha", 0, main);
+        EXPECT_GT(seeded.activations, 0);
+        EXPECT_EQ(exhaustive.ids, seeded.ids);
+      }
+    }
+  }
+  // An unsupported executing child keeps the ordinary forward-only route.
   {
-    auto exact = run(true, false, randAsc, 9, true);
-    auto exactExh = run(false, true, randAsc, 9, true);
+    auto mixed = run(true, false, randAsc, 9, false, "alpha", 0, Main::PHRASE_UNION);
+    EXPECT_EQ(0, mixed.activations);
+    EXPECT_EQ(run(false, true, randAsc, 9, false, "alpha", 0, Main::PHRASE_UNION).ids,
+              mixed.ids);
+  }
+  // Exact count keeps every pruning route off and stays exact.
+  for (Main main : {Main::TERM, Main::UNION}) {
+    auto exact = run(true, false, randAsc, 9, true, "alpha", 0, main);
+    auto exactExh = run(false, true, randAsc, 9, true, "alpha", 0, main);
     EXPECT_EQ(exact.activations, 0);
     EXPECT_EQ(exact.ids, exactExh.ids);
     EXPECT_EQ(exact.found, exactExh.found);
@@ -3071,12 +4530,14 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
   // Deletes arrive as the liveDocs domain bitset and intersect both passes.
   ASSERT_TRUE(helper.deleteByIds({"600", "1042", "7003"},
                                  UpdateMessage::COMMIT).success);
-  for (const Sorts& sorts : {randAsc, tiesAsc}) {
-    auto exhaustive = run(false, true, sorts, 987, false);
-    auto seeded = run(true, false, sorts, 987, false);
-    EXPECT_GT(seeded.activations, 0);
-    EXPECT_EQ(exhaustive.ids, seeded.ids)
-        << "deletes sort=" << sorts.clauses[0].first;
+  for (Main main : {Main::TERM, Main::UNION}) {
+    for (const Sorts& sorts : {randAsc, tiesAsc}) {
+      auto exhaustive = run(false, true, sorts, 987, false, "alpha", 0, main);
+      auto seeded = run(true, false, sorts, 987, false, "alpha", 0, main);
+      EXPECT_GT(seeded.activations, 0);
+      EXPECT_EQ(exhaustive.ids, seeded.ids)
+          << "deletes sort=" << sorts.clauses[0].first;
+    }
   }
 }
 
@@ -3110,8 +4571,9 @@ TEST_F(SortCollectorTest, seededFieldSortAntiCorrelationAborts) {
   }
   helper.commit();
 
-  auto run = [&](bool seeded, bool disablePruning) {
-    SeededGuard seededGuard(!seeded, seeded);
+  auto run = [&](bool seeded, bool disablePruning,
+                 int32_t budgetPerMille = 0) {
+    SeededGuard seededGuard(!seeded, seeded, budgetPerMille);
     SortPruningGuard pruningGuard(disablePruning);
     SortSkipStatsGuard statsGuard;
     auto req = localReq(luxirNode->getSearchEngine());
@@ -3133,10 +4595,78 @@ TEST_F(SortCollectorTest, seededFieldSortAntiCorrelationAborts) {
   };
 
   auto exhaustive = run(false, true);
-  auto seeded = run(true, false);
+  // The predicted floor plans a single seed leaf; twenty times that
+  // schedule reaches the abort.
+  auto seeded = run(true, false, 20000);
   EXPECT_GT(seeded.activations, 0);
   EXPECT_GT(seeded.fillAborts, 0);
   EXPECT_EQ(exhaustive.ids, seeded.ids);
+}
+
+// A term confined to the older half falsifies the newest-first yield prior.
+// A late head must still abandon empty rounds within the common budget and
+// let the sweep finish. Oldest-first over the newer half does the same.
+// Both terms and unions must retain exhaustive ranked-ID parity.
+TEST_F(SortCollectorTest, seededLateHeadObeysAbortBudget) {
+  WholeMembershipPlanGuard wholeGuard(true);
+  CollectionHelper helper("seeded_rounds");
+  constexpr int32_t kDocs = 256 * 512;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < kDocs; doc++) {
+    docs.push_back(flatdoc("id", std::to_string(doc), "id_s",
+                           std::to_string(doc), "body_w",
+                           doc < kDocs / 2
+                               ? (doc % 2 == 0 ? "early first" : "early second")
+                               : "late",
+                           "mono_i", (int64_t)doc));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  struct Result {
+    std::vector<std::string> ids;
+    int64_t rounds = 0;
+    int64_t aborts = 0;
+    int64_t gathered = 0;
+  };
+  auto run = [&](std::string_view term, qb::SortDir dir, int32_t limit,
+                 bool disablePruning, bool unionQuery = false) {
+    SortPruningGuard pruningGuard(disablePruning);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("seeded_rounds");
+    auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
+    if (unionQuery) {
+      cur.rawQuery() = qb::boolean(
+          cur.mr(), {}, {qb::match(cur.mr(), "body_w", "first"),
+                         qb::match(cur.mr(), "body_w", "second")});
+    } else {
+      // Optionals retain the query-driven route while preserving term matches.
+      cur.rawQuery() = qb::boolean(
+          cur.mr(), {qb::match(cur.mr(), "body_w", term)},
+          {qb::match(cur.mr(), "body_w", "early"),
+           qb::match(cur.mr(), "body_w", "late")});
+    }
+    qb::sort(cur, "mono_i", dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{resultIds(*req), SkipStats::fieldSortSeedRounds,
+                  SkipStats::fieldSortSeedFillAborts,
+                  SkipStats::fieldSortDocsGathered};
+  };
+  for (int32_t limit : {1, 10, 100}) {
+    auto newest = run("early", qb::DESC, limit, false);
+    EXPECT_EQ(run("early", qb::DESC, limit, true).ids, newest.ids);
+    // The newer half is empty. Late-head benefit cannot excuse repeated
+    // production against a falsified yield prior; the sweep completes it.
+    EXPECT_LE(newest.rounds, 1) << limit;
+    EXPECT_GT(newest.aborts, 0) << limit;
+    auto unionNewest = run("early", qb::DESC, limit, false, true);
+    EXPECT_EQ(run("early", qb::DESC, limit, true, true).ids, unionNewest.ids);
+    EXPECT_LE(unionNewest.rounds, 1);
+    EXPECT_GT(unionNewest.aborts, 0);
+    auto oldest = run("late", qb::ASC, limit, false);
+    EXPECT_EQ(run("late", qb::ASC, limit, true).ids, oldest.ids);
+    EXPECT_EQ(0, oldest.rounds) << limit;
+  }
 }
 
 // String candidate pruning (postings-union over the competitive ord interval)
@@ -3229,11 +4759,13 @@ void SortCollectorTest::runStringCandidatePruning(int32_t nSegs) {
     // Shallow high-cardinality sorts must activate the candidate union in
     // both directions and drivers; the sole-clause tie column empties its
     // interval and terminates instead of activating.
-    EXPECT_GT(run(false, true, true, randAsc, 9).activations, 0);
-    EXPECT_GT(run(false, true, true, randDesc, 9).activations, 0);
-    // The windowed (term query) route only clears the cost gate once the
-    // interval is very tight relative to the filtered remainder: k=1.
-    EXPECT_GT(run(false, false, false, randAsc, 1).activations, 0);
+    // Every segment: a later one starts with the bottom the earlier ones
+    // set, so it can activate at its first docid.
+    EXPECT_EQ(nSegs, run(false, true, true, randAsc, 9).activations);
+    EXPECT_EQ(nSegs, run(false, true, true, randDesc, 9).activations);
+    // So must the windowed (term query) route.
+    EXPECT_GT(run(false, false, false, randAsc, 9).activations, 0);
+    EXPECT_GT(run(false, false, false, randDesc, 9).activations, 0);
     auto ties = run(false, true, true, tiesAsc, 5);
     EXPECT_EQ(ties.activations, 0);
     EXPECT_GT(ties.terminations, 0);
@@ -3281,6 +4813,111 @@ TEST_F(SortCollectorTest, stringCandidatePruningSingleSegment) {
 
 TEST_F(SortCollectorTest, stringCandidatePruningTwoSegments) {
   runStringCandidatePruning(2);
+}
+
+// The candidate gate reads each docFreq at most once per segment, however
+// many probes consult it. The first domain docs carry the ten best values in
+// either direction, so the bottom settles at once and every later probe sees
+// the same nine-term interval; each of those terms is heavy outside the 10%
+// domain, so the union never pays. Re-reading the interval per probe would
+// read at least one docFreq on every probe the capture charge admits.
+TEST_F(SortCollectorTest, stringCandidateGateReadsEachDocFreqOnce) {
+  WholeMembershipPlanGuard wholeGuard(true);
+  CollectionHelper helper;
+  constexpr int32_t kDocs = 65536;
+  constexpr int32_t kDomainEvery = 10;
+  SplitMix64 rng(42);
+  std::vector<Doc> docs;
+  docs.reserve(kDocs);
+  for (int32_t docId = 0; docId < kDocs; docId++) {
+    int32_t rank = docId / kDomainEvery;
+    bool inDomain = docId % kDomainEvery == 0;
+    std::string value;
+    if (inDomain && rank < 10) {
+      value = "a" + std::to_string(rank);
+    } else if (inDomain && rank < 20) {
+      value = "z" + std::to_string(rank - 10);
+    } else if (!inDomain && rng.rint(2) == 0) {
+      value = (rng.rint(2) == 0 ? "a" : "z") + std::to_string(rng.rint(10));
+    } else {
+      value = std::format("m{:05}", rng.rint(100000));
+    }
+    std::string id = std::to_string(docId);
+    docs.push_back(flatdoc("id_s", id, "body_w", inDomain ? "alpha" : "other",
+                           "rand_s", value));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT, false, 1).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+
+  struct Result {
+    std::vector<std::string> ids;
+    int64_t activations = 0;
+    int64_t probes = 0;
+    int64_t docFreqs = 0;
+  };
+  auto run = [&](bool disablePruning, bool forcePull, qb::SortDir dir) {
+    SortPruningGuard pruningGuard(disablePruning);
+    FieldSortBulkGuard bulkGuard(forcePull);
+    SortSkipStatsGuard statsGuard;
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").limit(10).fields({"id_s"});
+    cur.rawQuery() = qb::match(cur.mr(), "body_w", "alpha");
+    qb::sort(cur, "rand_s", dir);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    Result result;
+    result.ids = resultIds(*req);
+    result.activations = SkipStats::fieldSortCandidateActivations;
+    result.probes = SkipStats::fieldSortCandidateProbes;
+    result.docFreqs = SkipStats::fieldSortCandidateDocFreqs;
+    return result;
+  };
+
+  for (qb::SortDir dir : {qb::ASC, qb::DESC}) {
+    for (bool forcePull : {false, true}) {
+      auto exhaustive = run(true, forcePull, dir);
+      auto pruned = run(false, forcePull, dir);
+      std::string context = "dir=" + std::to_string((int)dir)
+          + " forcePull=" + std::to_string(forcePull);
+      EXPECT_EQ(exhaustive.ids, pruned.ids) << context;
+      ASSERT_EQ(10u, pruned.ids.size()) << context;
+      EXPECT_EQ(0, pruned.activations) << context;
+      // A probe every 4096 docids past the heap fill, most of them within
+      // the capture charge's limit.
+      EXPECT_GE(pruned.probes, 12) << context;
+      EXPECT_LE(pruned.docFreqs, 9) << context;
+    }
+  }
+}
+
+// The candidate gate's budget waits while capture still shrinks with the
+// source docs seen, counts earlier segments' docs as seen, refuses where too
+// few docs are left, and stays in range for any source cost.
+TEST_F(SortCollectorTest, stringCandidateBudget) {
+  constexpr int32_t M = 1 << 20;
+  constexpr int64_t src = M / 10;
+  auto budget = &FieldSortCollector::candidateBudget;
+  // A wide interval at the first probe waits; the same interval pays later.
+  EXPECT_EQ(-1, budget(src, 0, M, 4096, 500));
+  EXPECT_GT(budget(src, 0, M, M / 4, 500), 0);
+  // A later segment can take over at docid 0; a first one cannot.
+  EXPECT_EQ(-1, budget(src, 0, M, 0, 50));
+  EXPECT_GT(budget(src, 10 * src, M, 0, 50), 0);
+  // Near the end the docs left bound it, however many were seen.
+  EXPECT_EQ(-1, budget(src, 100 * src, M, M - 4096, 50));
+  EXPECT_LE(budget(src, 100 * src, M, M / 2, 1), src);
+  EXPECT_LT(budget(src, 100 * src, M, M / 2, 1000),
+            budget(src, 100 * src, M, M / 2, 1));
+  // A disjunction's cost can exceed the segment's docs.
+  constexpr int32_t big = std::numeric_limits<int32_t>::max();
+  int64_t huge = int64_t{1} << 40;
+  int64_t wide = budget(huge, huge, big, big / 2, 1);
+  EXPECT_GT(wide, 0);
+  EXPECT_LE(wide, (int64_t)big);
+  EXPECT_EQ(-1, budget(huge, 0, big, big, 1));
+  EXPECT_EQ(-1, budget(-1, 0, M, M / 2, 1));
 }
 
 TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {

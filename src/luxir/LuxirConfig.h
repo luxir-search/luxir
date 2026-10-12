@@ -57,6 +57,7 @@ struct StoreConfig {
 };
 
 struct IndexConfig {
+  bool huge_pages = true;
   // An inverter's MemPool can address at most 4 GiB.  The per-inverter cap is
   // clamped below that, leaving ~282 MiB of headroom for the overshoot of the
   // batch that trips the check (it is evaluated once per batch, not per doc).
@@ -144,7 +145,14 @@ struct ReplicationConfig {
   int64_t follower_timeout_ms = 90'000;
   std::string source;
   std::string follower_id;
+  std::string tenants; // comma-separated; empty subscribes to every tenant
+  // Comma-separated http:// nodes that serve verified file copies, tried in
+  // order before the source; they never decide which commit is current.
+  std::string peers;
+  uint64_t max_acknowledgments = 262144; // node-wide follower/collection rows
   int downloads = 2; // node-wide concurrent collection downloads
+  std::vector<std::string> tenantFilter() const;
+  std::vector<std::string> peerList() const;
   void validate() const;
 };
 
@@ -156,7 +164,6 @@ struct LuxirConfig {
   // current when this node started; there is no reopen yet, so later commits by the
   // writer are not picked up until restart.
   bool read_only = false;
-  bool promote = false;
 
   // Node-wide RAM budget (MiB): what this process may use for the memory it
   // manages explicitly - indexing structures today, caches as they are folded
@@ -164,16 +171,6 @@ struct LuxirConfig {
   // container); 0 = unlimited.  Subsystem budgets left at their own auto
   // sentinel take a share of this.  Resolved by resolveRamBudgets().
   int64_t max_ram_mb = -1;
-
-  // glibc malloc mmap threshold (bytes): allocations at or above it are mmap'd
-  // and returned to the OS on free.  0 = leave glibc's dynamic default (no
-  // mallopt call); -1 = pin at MemPool::BYTE_BLOCK_SIZE so pool blocks and
-  // large buffers bypass malloc arenas - arenas retain freed memory and
-  // serialize cross-thread frees, so pinning cuts indexing RSS and wall-clock
-  // sharply on memory-constrained nodes, at some cost to queries that malloc
-  // above the threshold per request (large facet counters); > 0 = explicit
-  // bytes.  Applied once at startup by luxir_main.
-  int64_t malloc_mmap_threshold = 0;
 
   std::string log_level = "info";
   size_t queryCacheBytes = 64ULL * 1024 * 1024;

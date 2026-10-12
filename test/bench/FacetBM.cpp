@@ -222,9 +222,10 @@ static AggregateFacetRunStats measureFacetRuns(
     fieldReader.readFieldInfo(info);
     OrdColReader column(postings, info);
     int64_t missing = 0;
-    int32_t previous = -1;
-    forEachOrdValue(nullptr, column, postings.maxDoc(), missing,
-                    [&](int32_t docid, int32_t ord) {
+    int64_t previous = -1;
+    forEachOrdValue(nullptr, column, OrdMap::SegToGlobal::identity(),
+                    postings.maxDoc(), missing,
+                    [&](int32_t docid, int64_t ord) {
       unused(docid);
       stats.values++;
       if (ord != previous) stats.runs++;

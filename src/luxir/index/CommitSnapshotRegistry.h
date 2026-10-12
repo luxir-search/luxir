@@ -3,6 +3,7 @@
 #pragma once
 
 #include <chrono>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <functional>
 #include <map>
@@ -17,7 +18,7 @@ struct Manifest;
 
 class SnapshotExpiredError : public ApiError {
 public:
-  SnapshotExpiredError() : ApiError(ErrorKind::NOT_FOUND, "snapshot_expired", "snapshot reservation expired") {}
+  SnapshotExpiredError() : ApiError(ErrorKind::NOT_FOUND, "snapshot_expired", "snapshot pin expired") {}
 };
 
 // Per-collection snapshot owner. Publishers serialize publish(), then retire
@@ -37,9 +38,10 @@ public:
     uint64_t budgetDrops = 0;
   };
 private:
-  struct Reservation {
+  struct Pin {
     std::shared_ptr<const CommitSnapshot> snapshot;
-    boost::unordered_flat_set<std::string_view> fileNames;
+    // Views borrow the owning snapshot's descriptors.
+    boost::unordered_flat_map<std::string_view, const FileDescriptor*> files;
     Clock::time_point created;
     Clock::time_point lastRead;
     std::stop_source cancellation;
@@ -52,53 +54,69 @@ private:
     uint64_t pins = 0;
     bool retired = false;
   };
-  AtomicSharedPtr<const CommitSnapshot> current;
   std::mutex mutex;
   std::mutex retirementMutex; // joins directory access before close returns
   Policy policy;
   Stats counters;
   Now now;
   bool closed = false;
-  std::map<CommitId, Reservation> reservations;
+  std::map<CommitId, Pin> pins;
+  // The current snapshot's descriptors by name, rebuilt once per publication
+  // on the first lookup by identity.
+  std::shared_ptr<const CommitSnapshot> indexed;
+  boost::unordered_flat_map<std::string_view, const FileDescriptor*> indexedFiles;
   std::unordered_map<std::string, FileRef> files;
 public:
   Directory& dir;
   ReaderManager readers;
-  // Set once by the collection before admitting requests.
-  std::function<void(const CommitSnapshot&)> onPublish;
+  // Set once by the collection owner before admitting requests. Runs after
+  // each publication and after fail(); it must not throw.
+  std::function<void()> onChange;
 private:
   void releaseLocked(const CommitId& id, std::vector<std::string>& retired);
   void expireLocked(std::vector<std::string>& retired);
   void enforceBudgetLocked(std::vector<std::string>& retired);
-  decltype(reservations)::iterator oldestReclaimableLocked();
+  decltype(pins)::iterator oldestReclaimableLocked();
   void unlink(std::span<const std::string> names) noexcept;
   void unlinkFiles(std::span<const std::string> names) noexcept;
+  void notifyChange() noexcept;
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
 public:
   explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now)
-      : now(std::move(now)), dir(dir), readers(dir, current, config) {}
+      : now(std::move(now)), dir(dir), readers(dir, config) {}
   ~CommitSnapshotRegistry() { close(); }
   void close() noexcept;
-  // Stop reservations and join retirement while admitted searches retain readers.
+  // The owning writer failed after durable publication: close and notify.
+  void fail() noexcept;
+  // Stop pins and join retirement while admitted searches retain readers.
   void detach() noexcept;
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
-  std::shared_ptr<const CommitSnapshot> snapshot() const { return current.load(); }
+  // Installers other than the writer: make `snapshot`'s root durable, publish it
+  // with the prepared reader, then retire the previous root and the files only
+  // it referenced. Throws before publication if the root may not be durable,
+  // without removing a root that already existed.
+  void commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened);
+  std::shared_ptr<const CommitSnapshot> snapshot() const { return readers.snapshot(); }
   void openLocalSnapshot();
   void sweepOrphans(const Manifest& manifest);
   void sweepOrphans();
   static std::vector<std::string> obsoleteFiles(const CommitSnapshot& previous,
       const CommitSnapshot& next, boost::unordered_flat_set<std::string> retained = {});
-  // Reservations outlive requests and are shared by all clients of a commit.
-  // Stop callbacks run under the reservation mutex: only schedule cancellation;
+  // Pins outlive requests and are shared by all clients of a commit.
+  // Stop callbacks run under the pin mutex: only schedule cancellation;
   // never re-enter the registry or perform I/O from a callback.
   std::shared_ptr<const CommitSnapshot> acquire(std::stop_token* cancellation = nullptr);
   std::shared_ptr<InputFile> openFile(const CommitId& id, std::string_view name, std::stop_token* cancellation = nullptr);
+  // A file by identity (name, size and digest) from the current or any pinned
+  // snapshot, without pinning: peers serve verified copies this way.
+  std::shared_ptr<InputFile> openFile(const FileDescriptor& descriptor);
   bool touch(const CommitId& id, uint64_t bytes);
   // Storage pressure skips current snapshots and open transfers. Retention
-  // budget eviction can still revoke any reservation to enforce its bound.
-  std::optional<Clock::time_point> oldestReclaimableReservation();
-  bool reclaimOldestReservation();
-  bool evictOldest();
+  // budget eviction can still revoke any pin to enforce its bound.
+  std::optional<Clock::time_point> oldestReclaimablePin();
+  bool reclaimOldestPin();
+  // Tests only: revoke the oldest pin as budget enforcement would.
+  bool testEvictOldest();
   void setPolicy(Policy value);
   Stats stats();
   void expire();

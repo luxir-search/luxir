@@ -241,8 +241,11 @@ public:
     : CollectionHelper(*LuxirTest::luxirNode, name) {}
 
   CollectionHelper(LuxirNode& node, std::string_view name = "main")
+    : CollectionHelper(node, CollectionId::of(name)) {}
+
+  CollectionHelper(LuxirNode& node, const CollectionId& id)
     : node_(&node) {
-    collection_ = node.getOrCreateCollection(name);
+    collection_ = node.getOrCreateCollection(id);
     getIndexWriter()->mergePolicy->setMergeFactor(node.getConfig().index.merge_factor);
   }
 

@@ -84,6 +84,18 @@ template<typename F> scope_guard(F&& frv) -> scope_guard<F>;
 #  define LUXIR_RESTRICT
 #endif
 
+// Opts a per-document or per-block function over index data out of
+// -fstack-protector (see CMakeLists.txt). Its stack buffers must be bounded by
+// the index format, never sized or filled from request bytes.
+#if defined(__has_attribute)
+#  if __has_attribute(no_stack_protector)
+#    define LUXIR_NO_STACK_PROTECTOR __attribute__((no_stack_protector))
+#  endif
+#endif
+#ifndef LUXIR_NO_STACK_PROTECTOR
+#  define LUXIR_NO_STACK_PROTECTOR
+#endif
+
 // Load/store a scalar through bytes that may be unaligned - mapped file data at
 // an offset we do not control, or a MemPool entry that starts wherever the
 // previous entry ended.  A plain `*(T*)p` on such bytes is UB even on x86:

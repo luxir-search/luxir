@@ -1284,6 +1284,38 @@ protected:
   explicit DocsEnumImpl(TermsEnum& termsEnum)
       : DocsEnumImpl(termsEnum.postingsState()) {}
 
+public:
+  // Reuse the inline decode buffers. Pulsed postings never decode another
+  // block, so their one immutable doc/frequency remains in those buffers.
+  // Positions have a separate cursor and are not resettable yet.
+  [[gnu::cold]] void reset() {
+    assert(!positionTrackingEnabled);
+    // Pulsed terms carry their document in metadata and have no stream.
+    if (docsSize != 0) docIS.seek(startOfDocs);
+    posOrdStart = cumulativeTermFreq = 0;
+    positionBatchActive = false;
+    docOrd = docBufIdx = tfreqOrd = tfreqBufIdx = 0;
+    docBufEnd = tfreqBufEnd = docsSize == 0 ? 1 : 0;
+    docid = -1;
+    tfreq = docsSize == 0 ? 1 : -1;
+    blockMode = docsOnlyConsumed = docBlockResident = scoredProbeActive = false;
+    residentWordsPtr = scoredProbeWordsPtr = nullptr;
+    residentDocBase = residentBlockLast = scoredProbeDocBase = scoredProbeBlockLast = 0;
+    residentBlockStartOrd = residentNumWords = scoredProbeBlockStartOrd = 0;
+    scoredProbeState = 0;
+    pendingPosBlockOrd = pendingPosAbsoluteOffset = 0;
+    pendingPosSeekValid = false;
+    nextL0Block = nextL1Group = 0;
+    nextL0Base = nextL1Base = readyBlockBodyBytes = 0;
+    nextL0CumTf = 0;
+    bodyReady = false;
+    l0CheckpointEntries = l0CheckpointGroupBody = nullptr;
+    l0CheckpointGroupStartBlock = -1;
+    l0CheckpointCount = 0;
+    posRepairDirty = false;
+    posRepairStart = posRepairEnd = 0;
+  }
+
   DocsEnumImpl(const DocsEnumImpl& other) = delete;
 
 public:
@@ -1496,6 +1528,13 @@ private:
   }
 
 public:
+  // One-way handoff after exhaustive scoring. Preserve the current posting
+  // and normalize at most one pending probe block into the existing buffers.
+  // Docs-only advance and window fills keep their branch-free protocol.
+  [[gnu::cold]] void prepareMembership() {
+    if (scoredProbeActive) materializeScoredProbeBlock();
+  }
+
   int32_t nextDoc() {
     assert(!docBlockResident);
     assert(!docsOnlyConsumed);
@@ -1939,6 +1978,20 @@ private:
     return consumed;
   }
 
+  // A resident block left by the previous window may end below this window's
+  // base: the same boundary intoBitSet's entry check jumps from. Without the
+  // jump the loop streams every block of the gap, which seeding's scattered
+  // leaves and competitive-range walks over dense word-coded terms pay in
+  // full. Out of line: it runs once per window at most.
+  [[gnu::noinline]] void jumpPastResidentBlock(int32_t bitsBase) {
+    assert(!docBlockResident && docBufEnd == Postings::DOCS_BLOCK_SIZE);
+    if (docid != PostingsReader::END && nextL0Block < numDocBlocks
+        && docBuf[Postings::DOCS_BLOCK_SIZE - 1] < bitsBase) {
+      skipToBlock(bitsBase);
+      blockMode = true;
+    }
+  }
+
 public:
   // Bulk count fill (the Lucene PostingsEnum#intoBitSet shape): consume every
   // remaining doc below upTo, setting bit (doc - bitsBase) for docs at or past
@@ -1968,6 +2021,7 @@ public:
     for (;;) {
       if (docBlockResident) {
         if (orDocOnlyResidentIntoBitSet(bits, bitsBase, upTo)) {
+          jumpPastResidentBlock(bitsBase);
           continue;
         }
         return;
@@ -3540,6 +3594,21 @@ public:
 
   BasicDocsEnum(const BasicDocsEnum&) = delete;
 
+  [[gnu::cold]] void reset() {
+    if (docsSize != 0) docIS.seek(startOfDocs);
+    residentWordsPtr = nullptr;
+    residentDocBase = residentBlockLast = 0;
+    residentBlockStartOrd = residentNumWords = 0;
+    docOrd = docBufIdx = nextL0Block = 0;
+    docBufEnd = docsSize == 0 ? 1 : 0;
+    docid = -1;
+    nextL0Base = 0;
+    blockMode = docBlockResident = bodyReady = false;
+    l0CheckpointEntries = l0CheckpointGroupBody = nullptr;
+    l0CheckpointGroupStartBlock = -1;
+    l0CheckpointCount = 0;
+  }
+
   // Cheap lower bound on the first doc of a term's postings: no enum
   // construction, no block decode. Exact for pulsed terms and for terms
   // whose docs fit one StreamVByte tail (docFreq < DOCS_BLOCK_SIZE); terms
@@ -3711,6 +3780,18 @@ public:
     blockMode = true;
   }
 
+private:
+  // See DocsEnumImpl::jumpPastResidentBlock.
+  [[gnu::noinline]] void jumpPastResidentBlock(int32_t bitsBase) {
+    assert(!docBlockResident && docBufEnd == Postings::DOCS_BLOCK_SIZE);
+    if (docid != PostingsReader::END && nextL0Block < numDocBlocks
+        && db[Postings::DOCS_BLOCK_SIZE - 1] < bitsBase) {
+      skipToBlock(bitsBase);
+      blockMode = true;
+    }
+  }
+
+public:
   void intoBitSet(std::span<uint64_t> bits, int32_t bitsBase, int32_t upTo) {
     // Same jumped-window block-level repositioning as
     // DocsEnumImpl::intoBitSet: skip data moves the block cursor, no doc is
@@ -3724,6 +3805,7 @@ public:
     for (;;) {
       if (docBlockResident) {
         if (orResidentIntoBitSet(bits, bitsBase, upTo)) {
+          jumpPastResidentBlock(bitsBase);
           continue;
         }
         return;
@@ -3848,6 +3930,7 @@ class BasicDocsEnum<DocsEnumTier::POSITIONS> final : public DocsEnumImpl {
   using DocsEnumImpl::nextDocOnly;
   using DocsEnumImpl::peekDocBlock;
   using DocsEnumImpl::peekDocOnlyBlock;
+  using DocsEnumImpl::reset;
 
 public:
   static constexpr DocsEnumTier TIER = DocsEnumTier::POSITIONS;

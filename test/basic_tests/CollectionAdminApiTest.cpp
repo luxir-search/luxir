@@ -109,7 +109,7 @@ TEST_F(CollectionAdminApiTest, httpLifecycleAndValidation) {
   auto deleted = httpRequest(port, http::verb::post, "/collections/_delete",
                              R"({"name":"admin_lifecycle"})");
   ASSERT_EQ(200, deleted.result_int()) << deleted.body();
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "admin_lifecycle"));
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "admin_lifecycle"));
 
   HttpReq missingSearch(port);
   missingSearch.collection("admin_lifecycle").matchQuery("title_w", "old").withStats().execute();
@@ -125,7 +125,7 @@ TEST_F(CollectionAdminApiTest, httpLifecycleAndValidation) {
   auto deleteMain = httpRequest(port, http::verb::post, "/collections/_delete",
                                 R"({"name":"main"})");
   EXPECT_EQ(200, deleteMain.result_int()) << deleteMain.body();
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "main"));
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "main"));
 
   server.shutdown();
 }
@@ -244,7 +244,7 @@ TEST_F(CollectionAdminApiTest, deleteWhileIndexingRejectsRacingBatchesCleanly) {
   ASSERT_EQ(200, deleted.result_int()) << deleted.body();
   EXPECT_TRUE(sawFailure.load());
   EXPECT_EQ(0, unexpectedStatus.load());
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "admin_race"));
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "admin_race"));
   server.shutdown();
 }
 
@@ -253,7 +253,7 @@ TEST_F(CollectionAdminApiTest, heldReaderSearchSurvivesDelete) {
   auto config = fsConfig(data);
   config.ingest.auto_create_collection = false;
   LuxirNode node(config);
-  node.createCollection(nullptr, "admin_held_reader");
+  node.createCollection("admin_held_reader");
   CollectionHelper helper(node, "admin_held_reader");
   auto indexed = helper.index(flatdoc("id", "held"), UpdateMessage::COMMIT);
   ASSERT_TRUE(indexed.success) << indexed.error_message;
@@ -263,7 +263,7 @@ TEST_F(CollectionAdminApiTest, heldReaderSearchSurvivesDelete) {
   node.deleteCollection("admin_held_reader");
 
   EXPECT_THROW(writer->snapshots.readers.getReader(), ApiError);
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "admin_held_reader"));
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "admin_held_reader"));
 
   MemPool pool;
   Query::Context context(pool, *reader);
@@ -286,11 +286,11 @@ TEST_F(CollectionAdminApiTest, restartKeepsDeletedCollectionAbsentAndPurgesTrash
 
   {
     LuxirNode node(config);
-    node.createCollection(nullptr, "admin_restart");
+    node.createCollection("admin_restart");
     CollectionHelper helper(node, "admin_restart");
     ASSERT_TRUE(helper.index(flatdoc("id", "restart"), UpdateMessage::COMMIT).success);
     node.deleteCollection("admin_restart");
-    EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "admin_restart"));
+    EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "admin_restart"));
   }
 
 
@@ -307,13 +307,13 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
 
   {
     LuxirNode node(config);
-    node.createCollection(nullptr, "admin_corrupt");
+    node.createCollection("admin_corrupt");
     CollectionHelper helper(node, "admin_corrupt");
     ASSERT_TRUE(helper.index(flatdoc("id", "corrupt"), UpdateMessage::COMMIT).success);
   }
-  FSDirectory container(data.path() / "c" / "admin_corrupt");
-  auto incarnation = DirectoryFactory::current(container).incarnation;
-  auto indexPath = data.path() / "c" / "admin_corrupt" / incarnation;
+  FSDirectory container(data.path() / "t" / "t0" / "admin_corrupt");
+  auto incarnation = *CollectionStorage::current(container);
+  auto indexPath = data.path() / "t" / "t0" / "admin_corrupt" / incarnation;
   for (const auto& file : std::filesystem::directory_iterator(indexPath)) {
     if (Manifest::generationOf(file.path().filename().string())) std::filesystem::remove(file.path());
   }
@@ -324,7 +324,7 @@ TEST_F(CollectionAdminApiTest, deleteRecoversLoadFailureTombstone) {
   LuxirNode node(config);
   EXPECT_THROW(node.getCollection("admin_corrupt"), CollectionUnavailableError);
   EXPECT_NO_THROW(node.deleteCollection("admin_corrupt"));
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "admin_corrupt"));
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "admin_corrupt"));
 }
 
 } // namespace luxir::test
@@ -348,7 +348,7 @@ TEST_F(CollectionAdminApiTest, manifestsOwnSchemaAndIncarnation) {
       EXPECT_TRUE(manifestFiles(*initial).empty());
       EXPECT_GT(initial->index_gen, 0u);
       incarnation = initial->incarnation;
-      EXPECT_EQ(36u, incarnation.size());
+      EXPECT_TRUE(CommitId::validIncarnation(incarnation));
 
       ASSERT_TRUE(helper.index(flatdoc("id", "published"), UpdateMessage::COMMIT).success);
       auto old = writer->snapshots.readers.getReader();
@@ -388,7 +388,7 @@ TEST_F(CollectionAdminApiTest, manifestsOwnSchemaAndIncarnation) {
       }
       auto previous = std::string(manifest->incarnation);
       reopened.deleteCollection("main");
-      reopened.createCollection(nullptr, "main");
+      reopened.createCollection("main");
       auto recreated = readDurableIndexInfo(*reopened.getCollection("main")->getShard()->getDirectory());
       EXPECT_NE(previous, recreated->incarnation);
       EXPECT_TRUE(recreated->segments.empty());
@@ -403,12 +403,12 @@ TEST_F(CollectionAdminApiTest, initialSchemaPublishesOneManifest) {
   api::SchemaDef schema;
   std::pmr::monotonic_buffer_resource arena;
   ASSERT_TRUE(api::read_json(schema, R"({"fields":{"title":{"type":"string"}}})", arena));
-  auto collection = node.createCollection(nullptr, "initial_schema", &schema);
+  auto collection = node.createCollection("initial_schema", &schema);
   auto manifest = readDurableIndexInfo(*collection->getShard()->getDirectory());
   EXPECT_EQ(1u, manifest->index_gen);
   EXPECT_EQ(1u, manifest->schema_gen);
   EXPECT_TRUE(manifest->segments.empty());
-  EXPECT_NE(nullptr, collection->getSchema()->getFieldTypePtr("title"));
+  EXPECT_NE(nullptr, collection->getSchema()->getFieldTypePtr("title_i"));
   EXPECT_NE(nullptr, collection->getSchema()->getFieldTypePtr("id"));
 }
 
@@ -418,14 +418,14 @@ namespace luxir::test {
 TEST_F(CollectionAdminApiTest, createPreservesUnregisteredStorage) {
   CollectionAdminDataDir data("luxir_collection_admin_existing");
   LuxirNode node(fsConfig(data));
-  FSDirectory existing(data.path() / "c" / "unregistered");
+  FSDirectory existing(data.path() / "t" / "t0" / "unregistered");
   std::string incarnation;
   {
     CommitSnapshotRegistry writerSnapshots(existing);
     IndexWriter writer(writerSnapshots);
     incarnation = test::readDurableIndexInfo(existing)->incarnation;
   }
-  EXPECT_THROW(node.createCollection(nullptr, "unregistered"), std::filesystem::filesystem_error);
+  EXPECT_THROW(node.createCollection("unregistered"), std::filesystem::filesystem_error);
   EXPECT_EQ(incarnation, test::readDurableIndexInfo(existing)->incarnation);
 }
 
@@ -437,18 +437,99 @@ TEST_F(CollectionAdminApiTest, missingCurrentDiscardsUnselectedIncarnations) {
     LuxirNode node(config);
     incarnation = node.getCollection("main")->getShard()->getSnapshots().snapshot()->id.incarnation;
   }
-  std::filesystem::remove(data.path() / "c" / "main" / "CURRENT");
+  std::filesystem::remove(data.path() / "t" / "t0" / "main" / "CURRENT");
   LuxirNode reopened(config);
   EXPECT_THROW(reopened.getCollection("main"), CollectionNotFoundError);
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "main"));
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "main"));
 }
 
 TEST_F(CollectionAdminApiTest, emptyUnselectedCollectionIsNotRecreatedAtStartup) {
   CollectionAdminDataDir data("luxir_collection_interrupted_delete");
-  FSDirectory empty(data.path() / "c" / "gone");
+  { LuxirNode first(fsConfig(data)); }
+  FSDirectory empty(data.path() / "t" / "t0" / "gone");
   LuxirNode node(fsConfig(data));
   EXPECT_THROW(node.getCollection("gone"), CollectionNotFoundError);
-  EXPECT_FALSE(std::filesystem::exists(data.path() / "c" / "gone" / "CURRENT"));
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "t0" / "gone" / "CURRENT"));
+}
+
+TEST_F(CollectionAdminApiTest, tenantRoutesAdministerNamedTenants) {
+  CollectionAdminDataDir data("luxir_collection_admin_tenants");
+  LuxirNode node(fsConfig(data));
+  HttpServer server(node, 2, 0);
+  server.start();
+  int port = server.getPort();
+  auto body = [&](http::verb verb, std::string target, std::string request = {}) {
+    auto response = httpRequest(port, verb, target, std::move(request));
+    return std::pair{response.result_int(), std::string(response.body())};
+  };
+
+  EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_create", R"({"name":"zeta"})").first);
+  EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_create", R"({"name":"docs"})").first);
+  EXPECT_TRUE(std::filesystem::exists(data.path() / "t" / "acme" / "docs"));
+  EXPECT_EQ(400, body(http::verb::post, "/tenants/acme/collections/_create", R"({"name":"more","tenant":"other"})").first);
+  EXPECT_EQ(400, body(http::verb::post, "/tenants/Bad/collections/_create", R"({"name":"docs"})").first);
+  EXPECT_NE(std::string::npos, body(http::verb::get, "/tenants?pretty=false").second.find(R"(["acme","t0"])"));
+  EXPECT_NE(std::string::npos, body(http::verb::get, "/tenants/acme/collections?pretty=false").second.find(R"(["docs","zeta"])"));
+  EXPECT_EQ(std::string::npos, body(http::verb::get, "/collections?pretty=false").second.find("docs"));
+  auto stats = body(http::verb::get, "/tenants/acme/_stats?pretty=false").second;
+  EXPECT_NE(std::string::npos, stats.find(R"("tenant":"acme")"));
+  EXPECT_EQ(std::string::npos, stats.find(R"("tenant":"t0")"));
+  EXPECT_NE(std::string::npos, body(http::verb::get, "/_stats?pretty=false").second.find(R"("tenant":"t0")"));
+  // Node memory is node-wide, not a tenant's view.
+  EXPECT_EQ(400, body(http::verb::get, "/tenants/acme/_stats?memory=true").first);
+  // Searching and indexing act in the caller's own tenant only.
+  EXPECT_EQ(404, body(http::verb::post, "/tenants/acme/collections/docs/_search", "{}").first);
+  EXPECT_EQ(404, body(http::verb::post, "/tenants/acme/collections/docs/_update", "{}").first);
+  EXPECT_EQ(404, body(http::verb::post, "/collections/docs/_search", "{}").first);
+  EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_delete", R"({"name":"docs"})").first);
+  EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "acme" / "docs"));
+  EXPECT_NE(std::string::npos, body(http::verb::get, "/tenants?pretty=false").second.find(R"(["acme","t0"])"));
+  // A tenant is listed while it has a collection.
+  EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_delete", R"({"name":"zeta"})").first);
+  EXPECT_NE(std::string::npos, body(http::verb::get, "/tenants?pretty=false").second.find(R"("tenants":["t0"])"));
+  EXPECT_EQ("{}\n", body(http::verb::get, "/tenants/acme/collections?pretty=false").second);
+  server.shutdown();
+}
+
+TEST_F(CollectionAdminApiTest, requestScopeNeverOutlivesItsRequest) {
+  CollectionAdminDataDir data("luxir_collection_admin_scope");
+  LuxirNode node(fsConfig(data));
+  HttpServer server(node, 1, 0);
+  server.start();
+  ASSERT_EQ(200, httpRequest(server.getPort(), http::verb::post, "/tenants/acme/collections/_create", R"({"name":"docs"})").result_int());
+  // A tenant-qualified schema write changes that tenant's collection only.
+  auto schema = httpRequest(server.getPort(), http::verb::post, "/tenants/acme/collections/docs/_schema",
+      R"({"fields":{"title_i":{"type":"int"}}})");
+  ASSERT_EQ(200, schema.result_int()) << schema.body();
+  EXPECT_THROW(node.getCollection("docs"), CollectionNotFoundError);
+  EXPECT_NE(nullptr, node.getCollection(CollectionId{"acme", "docs"})->getSchema()->getFieldTypePtr("title_i"));
+
+  // On one keep-alive connection, an NDJSON update after a tenant route acts in
+  // the caller's own tenant.
+  net::io_context ioc;
+  beast::tcp_stream stream(ioc);
+  stream.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"), (unsigned short)server.getPort()));
+  auto send = [&](http::verb verb, std::string target, std::string body, std::string_view type) {
+    http::request<http::string_body> req(verb, target, 11);
+    req.set(http::field::host, "127.0.0.1");
+    req.set(http::field::content_type, type);
+    req.keep_alive(true);
+    req.body() = std::move(body);
+    req.prepare_payload();
+    http::write(stream, req);
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+    return res;
+  };
+  EXPECT_EQ(200, send(http::verb::get, "/tenants/acme/collections", {}, "application/json").result_int());
+  auto update = send(http::verb::post, "/collections/docs/_update?commit=true", "{\"id\":\"x\"}\n", "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_EQ(1, node.getCollection("docs")->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(0, node.getCollection(CollectionId{"acme", "docs"})->getReaderManager().getReader()->liveDocs());
+  beast::error_code ec;
+  stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+  server.shutdown();
 }
 
 } // namespace luxir::test

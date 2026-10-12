@@ -1506,27 +1506,52 @@ public:
       }
     }
 
-    void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
-                        int32_t windowEnd) override {
+    // Bounded membership protocol. It never routes through the competitive
+    // gate, which is licensed to drop sub-threshold docs. Both entry points
+    // share one out-of-line verification loop: another inlined copy changed
+    // gcc's inlining of the scored next()/score() paths (phrase TOP_k +0.1-
+    // 0.2% instructions), and a per-match call from the fill cost COUNT ~10%.
+    [[gnu::noinline]] int32_t membershipScan(int32_t min, int32_t max,
+                                             uint64_t* words, int32_t base) {
 #ifndef NDEBUG
-      markSinglePhase();
+      // A terminal membership drain may follow either locally owned
+      // iteration protocol. Externally driven enums remain with their owner.
+      assert(protocol != 3);
 #endif
-      skipCount(SkipStats::countBulkFillCalls);
-      if (windowEnd <= windowStart || docid == PostingsReader::END) {
-        return;
+      if (min >= max) return max;
+      if (docid < min) {
+        // The successor of a reported match: step instead of seeking.
+        doNext(min == docid + 1 ? conjunctionEnums[0]->next()
+                                : conjunctionEnums[0]->advance(min));
       }
-      // Membership fill: never route through the competitive gate, which is
-      // licensed to drop sub-threshold docs.
-      if (docid < windowStart) {
-        doNext(conjunctionEnums[0]->advance(windowStart));
-      }
-      while (docid < windowEnd) {
+      while (docid < max) {
         if (doMatches()) {
-          int32_t index = docid - windowStart;
-          windowBits[(size_t) (index >> 6)] |= 1ULL << (index & 63);
+          if (words == nullptr) return docid;
+          int32_t index = docid - base;
+          words[(size_t) (index >> 6)] |= 1ULL << (index & 63);
         }
         doNext(conjunctionEnums[0]->next());
       }
+      return docid;
+    }
+
+    void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
+                        int32_t windowEnd) override {
+      skipCount(SkipStats::countBulkFillCalls);
+      membershipScan(windowStart, windowEnd, windowBits.data(), windowStart);
+    }
+
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      return membershipScan(min, max, nullptr, 0);
+    }
+
+    int32_t advanceApproximationWindow(int32_t min, int32_t max) override {
+#ifndef NDEBUG
+      assert(protocol != 3);
+#endif
+      if (min >= max) return max;
+      if (docid < min) doNext(conjunctionEnums[0]->advance(min));
+      return docid;
     }
 
     int32_t next() override {

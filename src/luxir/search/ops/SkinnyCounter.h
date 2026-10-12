@@ -6,6 +6,7 @@
 #include <vector>
 #include <boost/unordered/unordered_flat_map.hpp>
 
+#include "luxir/util/BigBuffer.h"
 #include "luxir/util/luxir_util.h"
 
 namespace luxir {
@@ -13,7 +14,7 @@ template<typename SkinnyType=uint8_t, typename KeyType=int64_t, typename ValType
 class SkinnyCounter {
 public:
   size_t max;
-  std::vector<SkinnyType> counts;
+  BigVector<SkinnyType> counts;
   boost::unordered_flat_map<KeyType, ValType> overflow;
 
   /// "max" is the maximum number of values to expect, from 0 to max-1
@@ -23,8 +24,8 @@ public:
 
   void LUXIR_INLINE increment(KeyType key) {
     assert(key >=0 && (size_t)key < max);
-    if (++counts[key] == 0) {
-      overflow[key] += std::numeric_limits<SkinnyType>::max() + 1;
+    if (++counts[key] == 0) [[unlikely]] {
+      addOverflow(key, std::numeric_limits<SkinnyType>::max() + 1);
     };
   }
 
@@ -36,10 +37,16 @@ public:
       // just contains the high bits. This would exmand
       // the max val we could store.
       counts[key] = 0;
-      overflow[key] += tot;
+      addOverflow(key, (ValType)tot);
     } else {
       counts[key] = (SkinnyType)tot;
     }
+  }
+
+  // Out of line and by value: inlined, the map's by-reference key makes
+  // every increment spill the key to the stack, wrap or not.
+  LUXIR_NOINLINE void addOverflow(KeyType key, ValType val) {
+    overflow[key] += val;
   }
 
   /// Count for one key, without enumerating. Selected facet values are

@@ -10,6 +10,9 @@
 #include "luxir/store/Directory.h"
 #include "luxir/store/FSDirectory.h"
 #include "luxir/store/CheckedDirFactory.h"
+#include "luxir/store/Manifest.h"
+#include "luxir/util/Signal.h"
+#include <unistd.h>
 #include "test/LuxirTest.h"
 
 using namespace luxir;
@@ -360,6 +363,37 @@ TEST_F(DirectoryTest, checkedDirThrowsOnUnsyncedExpectSynced) {
   ASSERT_NO_THROW(dir.openFile("foo", true));
 }
 
+// Readers share open segments instead of reopening their files, so it is
+// publication that checks a root references only synced files.
+TEST_F(DirectoryTest, checkedDirThrowsOnPublishingUnsyncedFiles) {
+  auto ram = std::make_shared<RAMDir>();
+  CheckedDirectory dir(ram, CheckedDirMode::THROW);
+  auto f = dir.createFile("s01_00");
+  OutputStream os;
+  os.setFile(f.get());
+  os.write("data", 4);
+  os.close();
+  dir.finishFile(*f);
+
+  api::FileDescriptor file{"s01_00", 4, 0};
+  api::SegmentInfo segment;
+  segment.seg_id = 1;
+  segment.max_doc = 1;
+  segment.files = std::span<const api::FileDescriptor>(&file, 1);
+  api::IndexInfo info;
+  info.incarnation = "0123456789abcdef";
+  info.index_gen = 1;
+  info.segments = std::span<const api::SegmentInfo>(&segment, 1);
+  std::vector<std::byte> bytes;
+  ASSERT_TRUE(api::encode(info, bytes));
+  EXPECT_THROW(Manifest::commit(dir, 1, bytes), std::runtime_error);
+  EXPECT_EQ(nullptr, dir.openFile(Manifest::name(1)));
+
+  std::vector<std::string> syncFiles = {"s01_00"};
+  dir.sync(syncFiles);
+  EXPECT_NO_THROW(Manifest::commit(dir, 1, bytes));
+}
+
 TEST_F(DirectoryTest, checkedDirWarnMode) {
   auto ram = std::make_shared<RAMDir>();
   CheckedDirectory dir(ram, CheckedDirMode::WARN);
@@ -421,4 +455,55 @@ TEST_F(DirectoryTest, checkedDirPreExistingFilesAssumedSynced) {
 
   // Pre-existing files should be assumed synced
   ASSERT_NO_THROW(dir.openFile("pre_existing", true));
+}
+
+TEST_F(DirectoryTest, collectionStorageOpensWithoutCreating) {
+  auto path = getTempDir();
+  FSDirFactory factory(path);
+  auto storage = factory.collection(CollectionId::of("main"));
+  EXPECT_THROW(storage.open("first"), std::runtime_error);
+  EXPECT_THROW(storage.current(), std::runtime_error);
+  EXPECT_TRUE(factory.collections().empty());
+  storage.create("first");
+  EXPECT_EQ(std::vector<CollectionId>{CollectionId::of("main")}, factory.collections());
+  EXPECT_EQ(std::vector<std::string>{"first"}, storage.incarnations());
+  EXPECT_FALSE(storage.current());
+  storage.select("first");
+  EXPECT_EQ("first", storage.current());
+  EXPECT_THROW(storage.createExclusive(), std::filesystem::filesystem_error);
+  std::filesystem::remove_all(path);
+}
+
+TEST_F(DirectoryTest, checkedStorageRemembersUnsyncedFilesAcrossOpens) {
+  CheckedDirFactory factory(std::make_unique<RAMDirFactory>(), CheckedDirMode::THROW);
+  auto storage = factory.collection(CollectionId::of("main"));
+  addFile(*storage.create("first"), "data", "bytes");
+  EXPECT_THROW(storage.open("first")->openFile("data", true), std::runtime_error);
+  std::array<std::string, 1> names{"data"};
+  storage.open("first")->sync(names);
+  EXPECT_NE(nullptr, storage.open("first")->openFile("data", true));
+}
+
+TEST_F(DirectoryTest, unreadableFileIsAnErrorNotAbsence) {
+  auto path = getTempDir();
+  FSDirectory dir(path);
+  addFile(dir, "secret", "bytes");
+  std::filesystem::permissions(path / "secret", std::filesystem::perms::none);
+  if (::access((path / "secret").c_str(), R_OK) != 0) { // not as root
+    EXPECT_THROW(dir.openFile("secret"), FileIOException);
+  }
+  EXPECT_EQ(nullptr, dir.openFile("absent"));
+  std::filesystem::remove_all(path);
+}
+
+TEST_F(DirectoryTest, manifestCommitKeepsAnExistingRootOnFailure) {
+  RAMDir dir;
+  std::vector<std::byte> original(8, std::byte{1}), replacement(8, std::byte{2});
+  Manifest::write(dir, 3, original);
+  Signal::listen("manifestWritten", [](void*, void*, void*) -> void* { throw std::runtime_error("injected"); });
+  EXPECT_THROW(Manifest::commit(dir, 3, replacement), std::runtime_error);
+  Signal::unlisten("manifestWritten");
+  auto input = dir.openFile(Manifest::name(3))->getInputStream();
+  EXPECT_EQ(std::byte{1}, *(const std::byte*)input.ptr());
+  EXPECT_EQ(nullptr, dir.openFile(Manifest::name(3) + ".pending"));
 }

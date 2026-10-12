@@ -174,6 +174,10 @@ class RescoreQuery final : public Query {
       composeBounds(PostingsReader::END, false);
     }
 
+    [[gnu::cold]] void prepareMembership() override {
+      child->prepareMembership();
+    }
+
     int32_t next() override {
       return skipUncompetitive(false, child->next());
     }
@@ -473,6 +477,10 @@ public:
                             needsChildScore, pruning, executionMode);
       }
 
+      void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+        child.releaseSegmentState(segment);
+      }
+
       bool outputIsSubsetOfDomain() const noexcept override {
         return child.prepared != nullptr
             && child.prepared->outputIsSubsetOfDomain();
@@ -529,6 +537,14 @@ public:
       return wrapSupplier(targetPool, segment, *childWeight, *program,
                           multiplier, needsChildScore, allowsPruning(),
                           executionMode);
+    }
+
+    void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+      childWeight->releaseSegmentState(segment);
+    }
+
+    bool hasReleasableSegmentState() const noexcept override {
+      return childWeight->hasReleasableSegmentState();
     }
 
     std::optional<int64_t> constantCount(

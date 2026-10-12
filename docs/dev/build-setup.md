@@ -37,15 +37,22 @@ in `/opt/vcpkg/installed-native` and `/opt/vcpkg/installed-native-asan`.
 - vcpkg (toolchain files expected at `/opt/vcpkg/`)
 - Host tools: pkg-config, Python 3, curl, zip, unzip, and tar
 - Dependencies: Protobuf, gRPC, Intel TBB, Boost, xxHash, spdlog, CLI11,
-  LZ4, FAISS, glaze, GTL, GoogleTest, and Google Benchmark. The compiler
-  supplies OpenMP; FastPFOR is fetched and uni-algo is vendored
+  LZ4, FAISS, glaze, GTL, jemalloc, GoogleTest, and Google Benchmark. The
+  compiler supplies OpenMP; FastPFOR is fetched and uni-algo is vendored
 
 The build uses `-march=native`; a release binary is intended for the machine
 class on which its dependencies and Luxir itself were built.
-TBB and its internal tbbmalloc allocator are static vcpkg libraries. Application
-malloc/free remain glibc's. OpenBLAS supplies C LAPACK, so neither a Fortran
-compiler nor a Fortran runtime is required. Native builds retain shared GCC
-runtimes; the container's static runtime setting is a separate packaging choice.
+TBB and its internal tbbmalloc allocator are static vcpkg libraries. Static
+jemalloc replaces malloc/free and operator new/delete process-wide in every
+build by default unless sanitizer flags are present (`LUXIR_JEMALLOC` then
+defaults to `OFF`); explicitly enabling both is an error. The startup banner
+reports the allocator version and effective configuration. The jemalloc overlay
+embeds allocator defaults; see [dependency settings](../../deps/README.txt).
+For Valgrind, configure a build with `-DLUXIR_JEMALLOC=OFF` or run with
+`--soname-synonyms=somalloc=NONE`. OpenBLAS supplies C LAPACK, so neither a
+Fortran compiler nor a Fortran runtime is required. Native builds retain shared
+GCC runtimes; the container's static runtime setting is a separate packaging
+choice.
 
 ## Prepare a checkout
 
@@ -91,8 +98,11 @@ The script fingerprints the selected GCC compilers' effective native CPU options
 for vcpkg's binary cache, so a package built on one CPU is not reused on another
 with different native settings. Use this script when updating dependencies;
 direct native-triplet installs require that fingerprint. `CC` and `CXX` default
-to `gcc` and `g++`, matching the presets. If overriding them, select the same
-compilers when configuring Luxir.
+to `gcc-16` and `g++-16`; the native presets pin those same compiler names.
+If overriding them, select the same compilers when configuring Luxir.
+Existing build directories need a fresh configure (`cmake --preset <name> --fresh`)
+because CMake cannot switch compilers in an existing cache. Reapply local CMake
+options when refreshing.
 
 After changing the manifest or overlays, rerun the script. To update vcpkg itself,
 change the manifest baseline, check out that revision in `/opt/vcpkg`, bootstrap
@@ -112,7 +122,7 @@ Reapply local CMake options such as `-DLUXIR_LOCAL_TARGETS=ON` when refreshing.
 The new installs do not modify `/opt/vcpkg/installed` or `/opt/vcpkg_asan`.
 Those legacy installations can be removed after migrating their consumers.
 See [deps/README.txt](../../deps/README.txt) for the dependency configuration.
-The host compiler and system packages are not pinned by this workflow.
+The exact host compiler build and system packages are not pinned by this workflow.
 
 ### Deferring the Release-only host migration
 

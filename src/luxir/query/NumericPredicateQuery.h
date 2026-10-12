@@ -34,6 +34,11 @@ class NumericPredicateQuery final : public Query {
 
 public:
   static inline bool disableShapesForTests = false;
+#ifndef NDEBUG
+  // Observe actual verification, not column decoding or metadata navigation.
+  // Tests install this only after the product has been built.
+  static inline thread_local void (*verificationObserver)(int32_t) = nullptr;
+#endif
 
   NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi)
     : Query(QueryKind::NUMERIC_PREDICATE), field(field), envelope{lo, hi} {}
@@ -131,6 +136,14 @@ public:
         && found->lo <= min && max <= found->hi;
   }
 
+  // A matching doc has a value inside a range or equal to a set member, so
+  // either way inside [lo, hi] (the set's first and last values).
+  std::optional<ValueEnvelope> requiredValueEnvelope(
+      std::string_view target) const override {
+    if (target != field) return std::nullopt;
+    return ValueEnvelope{envelope.lo, envelope.hi};
+  }
+
   float valueMatchCost() const {
     if (!isExactSet()) return 1.0f;
     return (float)(std::bit_width(exactIntervals.size()) + 1);
@@ -170,6 +183,9 @@ public:
 
     bool valueMatches() {
       if (docid == PostingsReader::END) return false;
+#ifndef NDEBUG
+      if (verificationObserver != nullptr) verificationObserver(docid);
+#endif
       if (!multi) {
         if (allMatch) return true;
         return query.matchesValue(iter.value());
@@ -188,6 +204,11 @@ public:
                 float constantScore)
       : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
         query(query), allMatch(allMatch), multi(reader.multiValued()) {}
+
+    [[gnu::cold]] void reset() override {
+      iter.reset();
+      docid = -1;
+    }
 
     int32_t approximationNext() override {
       docid = iter.next();
@@ -223,6 +244,33 @@ public:
       return docid;
     }
     int32_t docId() override { return docid; }
+
+    int32_t advanceApproximationWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      if (docid < min) docid = iter.advance(min);
+      return docid;
+    }
+
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      if (docid < min) docid = iter.advance(min);
+      while (docid < max && !valueMatches()) docid = iter.next();
+      return docid;
+    }
+
+    void fillWindowBits(std::span<uint64_t> words, int32_t min,
+                        int32_t max) override {
+      skipCount(SkipStats::countBulkFillCalls);
+      if (min >= max) return;
+      if (docid < min) docid = iter.advance(min);
+      while (docid < max) {
+        if (valueMatches()) {
+          int32_t index = docid - min;
+          words[(size_t)(index >> 6)] |= 1ULL << (index & 63);
+        }
+        docid = iter.next();
+      }
+    }
   };
 
   enum class BlockRelation : uint8_t {
@@ -326,6 +374,7 @@ public:
     int32_t docid = -1;
     int32_t iterWindowStart = 0;
     int32_t iterWindowEnd = 0;
+    const int32_t initialMaxDoc;
 
     static void setBit(std::span<uint64_t> words, int32_t windowStart,
                        int32_t doc) {
@@ -396,6 +445,11 @@ public:
         while (rank < limit) {
           doc = docForRank(rank);
           if (doc >= max) return;
+#ifndef NDEBUG
+          if (plan.relation == BlockRelation::CROSSES && verificationObserver != nullptr) {
+            verificationObserver(doc);
+          }
+#endif
           if (plan.relation == BlockRelation::INSIDE
               || crossing.matches(rank, plan, query)) {
             setBit(words, min, doc);
@@ -430,6 +484,9 @@ public:
       auto [doc, docRank] = firstDocRank(min);
       while (doc < max && docRank < reader.docsWithValue()) {
         auto [start, end] = reader.getStartEndValueRank(docRank);
+#ifndef NDEBUG
+        if (verificationObserver != nullptr) verificationObserver(doc);
+#endif
         if (start < end && docValuesMatch(start, end)) {
           setBit(words, min, doc);
         }
@@ -478,6 +535,12 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reset() override {
+      docid = -1;
+      maxDoc = initialMaxDoc;
+      iterWindowStart = iterWindowEnd = 0;
+    }
+
     ZoneMapScorer(MemPool& pool, IntColReader& reader,
                   std::span<const BlockPlan> plans,
                   const NumericPredicateQuery& query,
@@ -485,13 +548,18 @@ public:
       : Query::ConstantScorer(constantScore), reader(reader), plans(plans),
           crossing(reader),
           iterBits(pool.make_arr<uint64_t>(ITER_WINDOW_WORDS), ITER_WINDOW_WORDS),
-          query(query), maxDoc(maxDoc) {
+          query(query), maxDoc(maxDoc), initialMaxDoc(maxDoc) {
       if (!reader.denseDocsWithValue()) {
         const auto& bits = reader.docsWithValueBitSet();
         selector = pool.make<screaming::BitSet::Selector>(
             bits, pool.make_span<int32_t>((size_t)bits.nBuckets + 1));
       }
       std::fill(iterBits.begin(), iterBits.end(), 0);
+    }
+
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t start, int32_t end) override {
+      fillWindowBits(words, start, end);
     }
 
     void fillWindowBits(std::span<uint64_t> words, int32_t min,
@@ -513,6 +581,31 @@ public:
       return seek(target);
     }
     int32_t docId() override { return docid; }
+
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      if (min >= maxDoc) return docid = PostingsReader::END;
+      int32_t limit = std::min(max, maxDoc);
+      int32_t found = findInIterationWindow(min);
+      if (found < limit) return docid = found;
+      // The cached window is complete from its start; continue after it
+      // only when it covers min. Fill no further than the caller's bound,
+      // clearing just the words that bound uses: point probes stay O(1).
+      int32_t target = min >= iterWindowStart && min < iterWindowEnd
+          ? iterWindowEnd : min;
+      while (target < limit) {
+        iterWindowStart = target;
+        iterWindowEnd = (int32_t)std::min<int64_t>(limit,
+            (int64_t)target + ITER_WINDOW_SIZE);
+        std::fill_n(iterBits.begin(),
+                    (iterWindowEnd - iterWindowStart + 63) >> 6, 0);
+        fillWindowBits(iterBits, iterWindowStart, iterWindowEnd);
+        found = findInIterationWindow(target);
+        if (found < limit) return docid = found;
+        target = iterWindowEnd;
+      }
+      return docid = limit == maxDoc ? PostingsReader::END : max;
+    }
 
   protected:
     // The current iteration window is behind docid, so emptying the doc
@@ -606,6 +699,13 @@ public:
     }
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= maxDoc);
+      scorer->reset();
+      windowStart = windowEnd = 0;
+    }
+
     PredicateBulkScorer(MemPool& pool, ZoneMapScorer* scorer, int32_t maxDoc,
                     float constantScore)
         : scorer(scorer),
@@ -613,6 +713,10 @@ public:
           outDocs(pool.make_arr<int32_t>(WINDOW_SIZE), WINDOW_SIZE),
           outScores(pool.make_arr<float>(WINDOW_SIZE), WINDOW_SIZE),
           maxDoc(maxDoc), constantScore(constantScore) {}
+
+    // Bounded windows of exact matches: the default matchNextWindow serves
+    // them, as the bulk plan declares.
+    bool supportsMatchWindows() const override { return true; }
 
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {
@@ -994,6 +1098,10 @@ public:
         }
 
       public:
+        [[gnu::cold]] bool supportsReset() const noexcept override {
+          return unscoredResetUse() && !supplier.weight.needsScores();
+        }
+
         Plan(Supplier& supplier, const Query::PlanContext& planContext,
              const Query::ScorerShape& shape, int64_t cost, ScorerArm arm,
              bool complement)
@@ -1009,9 +1117,10 @@ public:
 
         Arm arm;
         bool complement = false;
+        BulkUse use;
 
-        BulkState(const Supplier* owner, Arm arm)
-          : arm(arm) {
+        BulkState(const Supplier* owner, Arm arm, BulkUse use)
+          : arm(arm), use(use) {
           this->owner = owner;
         }
       };
@@ -1097,6 +1206,29 @@ public:
 
       int64_t cost() override { return estimatedCost; }
 
+      MembershipWork membershipWork(int32_t maxDoc) override {
+        unused(maxDoc);
+        double matches = (double)estimatedCost;
+        const auto& sketch = reader.leafMeta().valueSketch();
+        if (points == nullptr && !sketch.empty()) {
+          matches = 0;
+          for (auto range : weight.query.intervals()) {
+            double end = range.hi == INT64_MAX ? (double)reader.numValues()
+                : sketch.countBelow(range.hi + 1);
+            matches += end - sketch.countBelow(range.lo);
+          }
+          matches = std::min(matches, (double)reader.docsWithValue());
+        }
+        // A sparse verifier can touch every value in its requested span.
+        // Price that work independently of the values that pass. The sketch
+        // refines yield without changing cost()'s lead-selection upper bound.
+        // Points may still resolve to sparse verification under a parent's
+        // bounded demand. Only a resolved materialized supplier can claim the
+        // cheaper retained-set price; this prior must cover either arm.
+        double production = 64.0 * reader.numValues();
+        return {matches, production, 0, 64, 192};
+      }
+
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
         if (buildContext.numericPredicateDisableShapesForTests) return {};
@@ -1164,25 +1296,31 @@ public:
         }
         if (points != nullptr) {
           auto* state = planPool.make<BulkState>(
-              this, BulkState::Arm::POINTS);
+              this, BulkState::Arm::POINTS, use);
           state->complement = useComplement(pointValueCount);
           return {
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
-            BulkAnswer::NO, state,
+            BulkAnswer::NO, state, -1, BulkAnswer::NO,
           };
         }
         if (useZoneMap) {
           auto* state = planPool.make<BulkState>(
-              this, BulkState::Arm::ZONE_MAP);
+              this, BulkState::Arm::ZONE_MAP, use);
           return {
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
-            BulkAnswer::NO, state,
+            BulkAnswer::NO, state, -1, BulkAnswer::NO,
           };
         }
         return {
           BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
           BulkAnswer::NO,
         };
+      }
+
+      [[gnu::cold]] bool bulkStateSupportsReposition(const BulkBuildState& state) const noexcept override {
+        assert(state.owner == this);
+        const auto& plan = static_cast<const BulkState&>(state);
+        return !weight.needsScores() && isMembershipWindowUse(plan.use);
       }
 
       BulkScorer* buildBulk(

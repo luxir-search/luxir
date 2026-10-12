@@ -3,17 +3,82 @@
 
 #include "luxir/index/Inverter.h"
 #include "luxir/index/PostingsWriter.h"
+#include "luxir/reader/FieldReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "gtest/gtest.h"
+#include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
+#include <numeric>
 #include <vector>
 
 #include "luxir/index/IntColWriter.h"
 
 using namespace luxir;
 using namespace luxir::test;
+
+// The persisted leaf visit orders against an independent oracle: a stable
+// sort of leaf ids by zone.min ascending, and by zone.max descending, so ties
+// keep ascending leaf order.
+static void expectLeafVisitOrders(const IntColReader& reader) {
+  const auto& meta = reader.leafMeta();
+  int64_t leaves = meta.numLeafZones();
+  for (bool byMax : {false, true}) {
+    std::vector<int64_t> oracle((size_t)leaves);
+    std::iota(oracle.begin(), oracle.end(), 0);
+    std::stable_sort(oracle.begin(), oracle.end(), [&](int64_t a, int64_t b) {
+      NumBlockZone za = meta.leafZone(a);
+      NumBlockZone zb = meta.leafZone(b);
+      return byMax ? za.max > zb.max : za.min < zb.min;
+    });
+    for (int64_t rank = 0; rank < leaves; rank++) {
+      int64_t leaf = byMax ? meta.leafByMaxDescending(rank)
+                           : meta.leafByMinAscending(rank);
+      EXPECT_EQ(oracle[(size_t)rank], leaf) << "byMax=" << byMax
+                                            << " rank=" << rank;
+    }
+  }
+}
+
+// The persisted value sketch against the sorted values: ranks strictly
+// increase from 0 to n - 1 and values never decrease; within SKETCH_TAIL of
+// either end every point holds its rank's exact value, every rank within
+// SKETCH_DENSE of an end is kept, and kept ranks are spaced at most 1/32 of
+// their distance from the end. Returns the sorted values.
+static std::vector<int64_t> expectValueSketch(
+    const IntColReader& reader, std::span<const int64_t> values) {
+  constexpr int64_t kTail = NumColumnFormat::SKETCH_TAIL;
+  std::vector<int64_t> sorted(values.begin(), values.end());
+  std::sort(sorted.begin(), sorted.end());
+  int64_t n = (int64_t)sorted.size();
+  auto sketch = reader.leafMeta().valueSketch();
+  EXPECT_EQ(n, sketch.values());
+  if (n == 0) {
+    EXPECT_TRUE(sketch.empty());
+    return sorted;
+  }
+  EXPECT_EQ(0, sketch.point(0).rank);
+  EXPECT_EQ(n - 1, sketch.point(sketch.size() - 1).rank);
+  for (int64_t i = 0; i < sketch.size(); i++) {
+    auto p = sketch.point(i);
+    if (i > 0) {
+      auto q = sketch.point(i - 1);
+      EXPECT_LT(q.rank, p.rank) << "i=" << i;
+      EXPECT_LE(q.value, p.value) << "i=" << i;
+      // Spacing within a tail (the bulk's sampled ranks are estimates).
+      int64_t fromEnd = std::min(q.rank, n - 1 - p.rank);
+      if (p.rank < kTail || q.rank >= n - kTail) {
+        EXPECT_LE(p.rank - q.rank, std::max<int64_t>(1, fromEnd / 32))
+            << "i=" << i;
+      }
+    }
+    if (p.rank < kTail || p.rank >= n - kTail) {
+      EXPECT_EQ(sorted[(size_t)p.rank], p.value) << "rank=" << p.rank;
+    }
+  }
+  return sorted;
+}
 
 class IntColTest : public LuxirTest {
 protected:
@@ -237,7 +302,7 @@ TEST_F(IntColTest, linearPackFormatCorners) {
     auto file = dir.createFile("numeric");
     OutputStream out(file.get());
     out.writeStr("odd");
-    IntColWriter writer(out);
+    IntColWriter writer(out, true);
     for (int64_t value : expected) writer.addInt64(value);
     auto data = writer.finish();
     out.close();
@@ -276,10 +341,16 @@ TEST_F(IntColTest, linearPackFormatCorners) {
       int64_t end = std::min<int64_t>(start + kLeaf, expected.size());
       auto [minIt, maxIt] = std::minmax_element(
           expected.begin() + start, expected.begin() + end);
-      NumBlockZone zone = reader.leafZone(leaf);
+      NumBlockZone zone = reader.leafMeta().leafZone(leaf);
       EXPECT_EQ(zone.min, *minIt) << "leaf=" << leaf;
       EXPECT_EQ(zone.max, *maxIt) << "leaf=" << leaf;
     }
+    expectLeafVisitOrders(reader);
+    expectValueSketch(reader, expected);
+    // The bounds trailer follows the leaf orders and the value sketch.
+    auto [minIt, maxIt] = std::minmax_element(expected.begin(), expected.end());
+    EXPECT_EQ(reader.getMin(), *minIt);
+    EXPECT_EQ(reader.getMax(), *maxIt);
     return reader.blockInfo(0);
   };
 
@@ -346,6 +417,214 @@ TEST_F(IntColTest, linearPackFormatCorners) {
     }
     check(ramp);
   }
+}
+
+// Leaf visit orders over ten leaves spanning two blocks (the last one
+// partial), with tied mins and tied maxes: ascending by (min, leaf), and
+// descending by max with ties by ascending leaf.
+TEST_F(IntColTest, leafVisitOrders) {
+  constexpr int64_t kLeaf = NumColumnFormat::LEAF_ZONE_SIZE;
+  std::vector<NumBlockZone> zones = {{5, 9},  {3, 9}, {5, 7}, {3, 12},
+                                     {1, 7},  {5, 12}, {-2, 0}, {8, 8},
+                                     {3, 12}, {5, 9}};
+  std::vector<int64_t> values;
+  for (size_t leaf = 0; leaf < zones.size(); leaf++) {
+    int64_t count = leaf + 1 == zones.size() ? 100 : kLeaf;
+    auto [min, max] = zones[leaf];
+    for (int64_t i = 0; i < count; i++) {
+      values.push_back(i == count - 1 ? max : min + i % (max - min + 1));
+    }
+  }
+
+  RAMDir dir;
+  auto file = dir.createFile("numeric");
+  OutputStream out(file.get());
+  IntColWriter writer(out);
+  for (int64_t value : values) writer.addInt64(value);
+  auto data = writer.finish();
+  out.close();
+  dir.finishFile(*file);
+  auto in = dir.openFile("numeric");
+  InputStream input(in->getInputStream());
+  IntColReader reader(input, data.columnLoc, data.columnMetaOff,
+                      data.numValues);
+
+  ASSERT_EQ((int64_t)zones.size(), reader.numLeafZones());
+  std::vector<int64_t> ascending;
+  std::vector<int64_t> descending;
+  for (int64_t rank = 0; rank < reader.numLeafZones(); rank++) {
+    const auto& meta = reader.leafMeta();
+    EXPECT_EQ(zones[(size_t)rank].min, meta.leafZone(rank).min);
+    EXPECT_EQ(zones[(size_t)rank].max, meta.leafZone(rank).max);
+    ascending.push_back(meta.leafByMinAscending(rank));
+    descending.push_back(meta.leafByMaxDescending(rank));
+  }
+  EXPECT_EQ((std::vector<int64_t>{6, 4, 1, 3, 8, 0, 2, 5, 9, 7}), ascending);
+  EXPECT_EQ((std::vector<int64_t>{3, 5, 8, 0, 1, 9, 7, 2, 4, 6}), descending);
+  EXPECT_EQ(-2, reader.getMin());
+  EXPECT_EQ(12, reader.getMax());
+}
+
+// Merges rewrite columns through the writer, so a merged column carries
+// orders over its merged leaves, not either input's.
+TEST_F(IntColTest, leafVisitOrdersAfterMerge) {
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_i");
+  for (int32_t seg = 0; seg < 2; seg++) {
+    f.startIndexing();
+    for (int32_t doc = 0; doc < 3000 + 700 * seg; doc++) {
+      f.add(doc, (int64_t)(((uint32_t)(doc + 5000 * seg) * 2654435761u)
+                           % 100000));
+    }
+    testIndex.flush();
+  }
+  testIndex.iw->mergeSegments();
+  f.startReading();
+  ASSERT_TRUE(f.nextSegment());
+  ASSERT_EQ(1, testIndex.reader->segments().size());
+  ASSERT_EQ(6700, f.colReader->numValues());
+  expectLeafVisitOrders(*f.colReader);
+  std::vector<int64_t> merged;
+  IntColReader::SparseValues values(*f.colReader);
+  for (int64_t rank = 0; rank < 6700; rank++) {
+    merged.push_back(values.valueAt(rank));
+  }
+  expectValueSketch(*f.colReader, merged);
+}
+
+// Sketch estimates: exact on a column the tails cover, ties included; on a
+// larger one, within the tails' spacing of the truth there and within a
+// few percent in the bulk, for a ramp, a uniform scatter, and a third of the
+// values tied (the tie keeps its mass at its value). Monotone, and inverse:
+// countBelow(valueAt(r)) <= r < countBelow(valueAt(r) + 1) up to rounding.
+TEST_F(IntColTest, valueSketchEstimates) {
+  constexpr int64_t kTail = NumColumnFormat::SKETCH_TAIL;
+  auto check = [&](std::span<const int64_t> values, auto&& more) {
+    RAMDir dir;
+    auto file = dir.createFile("numeric");
+    OutputStream out(file.get());
+    IntColWriter writer(out, true);
+    for (int64_t value : values) writer.addInt64(value);
+    auto data = writer.finish();
+    out.close();
+    dir.finishFile(*file);
+    auto in = dir.openFile("numeric");
+    InputStream input(in->getInputStream());
+    IntColReader reader(input, data.columnLoc, data.columnMetaOff,
+                        data.numValues);
+    auto sorted = expectValueSketch(reader, values);
+    auto sketch = reader.leafMeta().valueSketch();
+    int64_t n = (int64_t)sorted.size();
+    auto trueBelow = [&](int64_t v) {
+      return (double)(std::lower_bound(sorted.begin(), sorted.end(), v)
+                      - sorted.begin());
+    };
+    auto tolerance = [&](double rank) {
+      double fromEnd = std::min(rank, (double)n - rank);
+      return fromEnd < (double)kTail ? std::max(1.0, fromEnd / 32) + 1
+                                     : (double)n / 25;
+    };
+    double previous = -1;
+    int64_t step = std::max<int64_t>(1, (sorted.back() - sorted.front()) / 4999);
+    for (int64_t v = sorted.front() - 2; v <= sorted.back() + 2; v += step) {
+      double truth = trueBelow(v);
+      double below = sketch.countBelow(v);
+      EXPECT_NEAR(truth, below, tolerance(truth)) << "v=" << v;
+      EXPECT_GE(below, previous) << "v=" << v;
+      previous = below;
+    }
+    for (double r = 0; r < (double)n; r += std::max(1.0, (double)n / 1001)) {
+      int64_t v = sketch.valueAt(r);
+      EXPECT_LE(sketch.countBelow(v), r + 1) << "r=" << r;
+      EXPECT_GT(sketch.countBelow(v + 1), r - 1) << "r=" << r;
+    }
+    more(sketch, trueBelow);
+  };
+  auto none = [](auto&, auto&) {};
+
+  // The tails cover every value: exact, ties at 7 and at the extremes.
+  std::vector<int64_t> small = {9, 7, 3, 7, 7, -4, 12, 7, 3, 12};
+  check(small, [&](auto& sketch, auto&) {
+    EXPECT_EQ(10, sketch.size());
+    EXPECT_EQ(3, sketch.countBelow(7));
+    EXPECT_EQ(7, sketch.countBelow(8));
+    EXPECT_EQ(-4, sketch.valueAt(0));
+    EXPECT_EQ(7, sketch.valueAt(3));
+    EXPECT_EQ(7, sketch.valueAt(6.5));
+    EXPECT_EQ(9, sketch.valueAt(7));
+    EXPECT_EQ(12, sketch.valueAt(9.9));
+  });
+
+  constexpr int64_t kN = 300000;
+  std::vector<int64_t> ramp(kN);
+  std::iota(ramp.begin(), ramp.end(), 1000000);
+  check(ramp, none);
+
+  std::vector<int64_t> scatter(kN);
+  for (int64_t i = 0; i < kN; i++) {
+    scatter[(size_t)i] = (int64_t)(((uint32_t)i * 2654435761u) % 1000003);
+  }
+  check(scatter, none);
+
+  // A third of the values tie at 500000; the rest ramp around them.
+  std::vector<int64_t> tied(kN);
+  for (int64_t i = 0; i < kN; i++) {
+    tied[(size_t)i] = i % 3 == 0 ? 500000 : i * 5;
+  }
+  check(tied, [&](auto& sketch, auto& trueBelow) {
+    double mass = sketch.countBelow(500001) - sketch.countBelow(500000);
+    EXPECT_NEAR(trueBelow(500001) - trueBelow(500000), mass, kN / 25);
+    EXPECT_EQ(500000, sketch.valueAt(trueBelow(500000) + mass / 2));
+  });
+
+  // Rising and falling streams fill the high or the low tail on every
+  // value; the selection trims keep them exact.
+  std::vector<int64_t> falling(ramp.rbegin(), ramp.rend());
+  check(falling, none);
+}
+
+// Only the columns field-sort planning reads persist a value sketch: a
+// single-valued INT column, flushed or merged. A multi-valued one writes an
+// empty sketch, its bounds trailer still in place.
+TEST_F(IntColTest, valueSketchOnlyForSortableColumns) {
+  CollectionHelper helper("sketch_presence");
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  for (int32_t seg = 0; seg < 2; seg++) {
+    std::vector<Doc> docs;
+    for (int64_t v = 0; v < 700; v++) {
+      docs.push_back(flatdoc("id", std::to_string(seg * 700 + v), "one_i",
+                             v * 3 + seg, "many_is",
+                             std::vector<int64_t>{v, -v}));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  auto expectSketches = [&](size_t segments) {
+    auto reader = writer->snapshots.readers.getReader();
+    ASSERT_EQ(segments, reader->segments().size());
+    for (auto& segment : reader->segments()) {
+      for (std::string_view field : {"one_i", "many_is"}) {
+        FieldReader fieldReader(segment.postingsReader());
+        ASSERT_TRUE(fieldReader.seek(field));
+        SegFieldInfo fieldInfo;
+        fieldReader.readFieldInfo(fieldInfo);
+        IntColReader column(segment.postingsReader(), fieldInfo);
+        const auto& sketch = column.leafMeta().valueSketch();
+        EXPECT_EQ(field == "one_i", !sketch.empty()) << field;
+        if (field == "one_i") {
+          EXPECT_EQ(column.numValues(), sketch.values());
+        } else {
+          EXPECT_EQ(-699, column.getMin());
+          EXPECT_EQ(699, column.getMax());
+        }
+      }
+    }
+  };
+  expectSketches(2);
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(helper.submit(merge).success);
+  expectSketches(1);
 }
 
 TEST_F(IntColTest, wrappingBaseBitPattern) {

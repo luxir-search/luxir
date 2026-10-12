@@ -148,7 +148,7 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
   helper.commit();
 
   if (!luxir::unit_tests) {
-    trimHeap();
+    releaseFreeMemory();
     std::println(std::cerr,"Post buildBenchIndex - Peak RSS: {} KB, current RSS: KB {}", peakRSSKB(), currentRSSKB());
   }
 }

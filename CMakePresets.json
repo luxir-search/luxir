@@ -70,6 +70,8 @@
       "inherits": ["base", "base-gcc"],
       "toolchainFile": "/opt/vcpkg/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc-16",
+        "CMAKE_CXX_COMPILER": "g++-16",
         "VCPKG_MANIFEST_MODE": "OFF",
         "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed-native",
         "VCPKG_TARGET_TRIPLET": "x64-linux-luxir-native",

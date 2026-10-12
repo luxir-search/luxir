@@ -211,14 +211,15 @@ public:
     return std::visit(std::forward<F>(visitor), map);
   }
 
-  static int32_t owner(const Dense& selected, int32_t storedOrd) {
-    int32_t localOrd = storedOrd - 1;
-    return localOrd >= 0 && localOrd < (int32_t)selected.size()
+  // The owner of the segment's 0-based term ord `localOrd`, or -1.
+  static int32_t owner(const Dense& selected, int64_t localOrd) {
+    assert(localOrd >= 0);
+    return localOrd < (int64_t)selected.size()
         ? selected[(size_t)localOrd] : -1;
   }
 
-  static int32_t owner(const Sparse& selected, int32_t storedOrd) {
-    auto found = selected.find(storedOrd - 1);
+  static int32_t owner(const Sparse& selected, int64_t localOrd) {
+    auto found = selected.find((int32_t)localOrd);
     return found == selected.end() ? -1 : found->second;
   }
 };
@@ -234,10 +235,11 @@ void forEachSelectedBucketDoc(
   int64_t parentMissing = 0;
   if (!parentColumn.multiValued()) {
     forEachOrdValue(
-        domain, parentColumn, maxDoc, parentMissing,
-        [&](int32_t docid, int32_t storedOrd) LUXIR_INLINE {
+        domain, parentColumn, OrdMap::SegToGlobal::identity(), maxDoc,
+        parentMissing,
+        [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
           int32_t owner = StrFacetSelectedOrdMap::owner(
-              selectedMap, storedOrd);
+              selectedMap, localOrd);
           if (owner >= 0) {
             callback(docid, std::span<const int32_t>(&owner, 1));
           }
@@ -253,13 +255,14 @@ void forEachSelectedBucketDoc(
     owners.clear();
   };
   forEachOrdValue(
-      domain, parentColumn, maxDoc, parentMissing,
-      [&](int32_t docid, int32_t storedOrd) LUXIR_INLINE {
+      domain, parentColumn, OrdMap::SegToGlobal::identity(), maxDoc,
+      parentMissing,
+      [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
         if (docid != currentDoc) {
           flush();
           currentDoc = docid;
         }
-        int32_t owner = StrFacetSelectedOrdMap::owner(selectedMap, storedOrd);
+        int32_t owner = StrFacetSelectedOrdMap::owner(selectedMap, localOrd);
         if (owner >= 0) owners.push_back(owner);
       });
   flush();
@@ -294,7 +297,7 @@ public:
   };
 
   struct Vector {
-    std::vector<int64_t> counts;
+    BigVector<int64_t> counts;
   };
 
   struct Skinny {
@@ -303,8 +306,8 @@ public:
     explicit Skinny(size_t slots) : counts(slots) {}
   };
 
-  using PackedHash = boost::unordered_flat_map<uint64_t, int64_t>;
-  using WideHash = boost::unordered_flat_map<WideKey, int64_t, WideHashFn>;
+  using PackedHash = BigFlatMap<uint64_t, int64_t>;
+  using WideHash = BigFlatMap<WideKey, int64_t, WideHashFn>;
 
 private:
   int32_t numOwners;
@@ -321,12 +324,12 @@ private:
 
   bool canAllocateVector() const {
     return totalSlots
-        <= (__int128)std::vector<int64_t>().max_size();
+        <= (__int128)BigVector<int64_t>().max_size();
   }
 
   bool canAllocateSkinny() const {
     return totalSlots <= (__int128)std::numeric_limits<int64_t>::max()
-        && totalSlots <= (__int128)std::vector<uint8_t>().max_size();
+        && totalSlots <= (__int128)BigVector<uint8_t>().max_size();
   }
 
   bool withinAutoFlatBudget(size_t bytesPerSlot) const {

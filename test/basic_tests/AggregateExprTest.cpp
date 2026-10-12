@@ -41,7 +41,7 @@ auto facetAggregateOverrides() {
       forcedInlineFacetEntryMode,
       forcedRangeFacetBucketDomainByteBudget,
       forcedRangeFacetBindingStateChunkBytes,
-      rangeFacetBindingBlockCounter);
+      facetBucketBlockCounter);
 }
 
 AggregateProgram* parseAggregate(ArenaOwner& memory, Schema& schema,
@@ -1077,7 +1077,7 @@ TEST_F(AggregateExprTest, rangeFacetFeedsExprChildrenInBindingBlocks) {
   auto guard = facetAggregateOverrides();
   forcedRangeFacetBucketDomainByteBudget = 1;
   forcedRangeFacetBindingStateChunkBytes = 64 * 1024;
-  rangeFacetBindingBlockCounter = &blocks;
+  facetBucketBlockCounter = &blocks;
   auto run = [&](std::string_view expression, int64_t multiplier) {
     auto req = localReq(helper.getSearchEngine());
     auto& facet = req->collection("main").rangeFacet("ranges", "bucket_i")
@@ -1110,4 +1110,27 @@ TEST_F(AggregateExprTest, rangeFacetFeedsExprChildrenInBindingBlocks) {
   blocks = 0;
   run(heavyExpression, 100);
   EXPECT_GT(blocks, 1u);
+}
+
+TEST_F(AggregateExprTest, denseTableHugePageBoundaryAndReuse) {
+  RequestMemTracker tracker(0);
+  for (size_t bytes : {bigBufferFloor - 8, bigBufferFloor, bigBufferFloor + 8}) {
+    for (int reuse = 0; reuse < 2; ++reuse) {
+      {
+        FacetEntryTable table;
+        int64_t keys = (int64_t)(bytes / sizeof(int64_t));
+        table.configure({}, tracker, keys, "dense boundary", nullptr);
+        table.initialize(3, true, false);
+        EXPECT_EQ(tracker.bytes(), bigBufferStorage(bytes) + 3 * sizeof(int64_t));
+        for (int64_t key : {int64_t{0}, keys / 2, keys - 1}) {
+          auto* entry = table.resolveEntry(key);
+          EXPECT_EQ(table.occurrenceCount(entry), 0);
+          table.touchEntry(entry, 0);
+          table.touchEntry(entry, 1);
+          EXPECT_EQ(table.occurrenceCount(entry), 2);
+        }
+      }
+      EXPECT_EQ(tracker.bytes(), 0);
+    }
+  }
 }

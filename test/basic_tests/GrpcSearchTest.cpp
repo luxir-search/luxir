@@ -70,7 +70,8 @@ TEST_F(GrpcSearchTest, statsUnary) {
   Reply<luxir::api::StatsResponse> response;
   auto status = hppUnaryCall(channel.get(), rpc::Stats, &context, request, &response);
   ASSERT_TRUE(status.ok()) << status.error_message();
-  EXPECT_GT(response.msg.totals.collections, 0);
+  ASSERT_TRUE(response.msg.totals.has_value());
+  EXPECT_GT(response.msg.totals->collections, 0);
   EXPECT_FALSE(response.msg.collections.empty());
 }
 

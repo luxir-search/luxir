@@ -78,17 +78,22 @@ public:
         StringSortMode override = stringSortModeOverride.load();
         if (override != StringSortMode::DEFAULT) return override;
 
-        const char* configured = std::getenv("LUXIR_STRING_SORT");
-        if (configured == nullptr || *configured == '\0' ||
-            std::string_view(configured) == "segment") {
+        // Environment overrides are process settings. Resolve once instead
+        // of scanning the environment for every sort specification.
+        static const StringSortMode environmentMode = [] {
+            const char* configured = std::getenv("LUXIR_STRING_SORT");
+            if (configured == nullptr || *configured == '\0' ||
+                std::string_view(configured) == "segment") {
+                return StringSortMode::SEGMENT;
+            }
+            if (std::string_view(configured) == "global") {
+                return StringSortMode::GLOBAL;
+            }
+            LOG_WARN("Ignoring invalid LUXIR_STRING_SORT='{}'; expected global or segment",
+                     configured);
             return StringSortMode::SEGMENT;
-        }
-        if (std::string_view(configured) == "global") {
-            return StringSortMode::GLOBAL;
-        }
-        LOG_WARN("Ignoring invalid LUXIR_STRING_SORT='{}'; expected global or segment",
-                 configured);
-        return StringSortMode::SEGMENT;
+        }();
+        return environmentMode;
     }
 
     static StringSortMode setStringSortModeForTests(StringSortMode value) {
@@ -97,19 +102,17 @@ public:
     
     std::unique_ptr<FieldComparator> createComparator(IndexReader* reader = nullptr) const {
         // Handle regular field types based on FieldType
-        switch (const_cast<FieldType*>(fieldType)->type()) {
-            case FieldType::Type::INT:
-            case FieldType::Type::DATE:
-            case FieldType::Type::FLOAT:
-            case FieldType::Type::DOUBLE:
-                // INT and DATE (epoch millis) sort on the raw column values.
-                // FLOAT/DOUBLE columns store sortable bits whose int64 order
-                // matches the floating point order, so the int comparator
-                // works on the encoded values as-is for all four.
-                return std::make_unique<SimpleNumericFieldComparator>(
-                    fieldName, isReversed(), missingValue
-                );
-
+        FieldType::Type type = const_cast<FieldType*>(fieldType)->type();
+        if (FieldType::sortsByIntColumn(type)) {
+            // INT and DATE (epoch millis) sort on the raw column values.
+            // FLOAT/DOUBLE columns store sortable bits whose int64 order
+            // matches the floating point order, so the int comparator
+            // works on the encoded values as-is for all four.
+            return std::make_unique<SimpleNumericFieldComparator>(
+                fieldName, isReversed(), missingValue
+            );
+        }
+        switch (type) {
             case FieldType::Type::ID:
             case FieldType::Type::STRING: {
                 // Use FieldType information to determine if this is an indexed string field

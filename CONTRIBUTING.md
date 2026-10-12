@@ -55,9 +55,19 @@ adds a Copy as curl button; GitHub highlights the fence as-is.
 
 ## License
 
-Luxir is licensed under the [Apache License 2.0](LICENSE). By contributing,
-you agree that your contributions are licensed under the same terms. No
-separate contributor agreement is required at this time.
+Luxir is licensed under the [Apache License 2.0](LICENSE). Every commit
+author must accept the [Contributor License Agreement](CLA.md) once before a
+pull request can be merged. It is adapted from the Apache Software
+Foundation's individual CLA and keeps the project eligible to move to a
+foundation such as the ASF later. To accept it, comment on your pull request
+with exactly:
+
+    I have read the Luxir CLA and I hereby sign it.
+
+A check on each pull request lists any commit authors who still need to sign.
+Commit with an email address linked to your GitHub account so your commits
+can be matched to your signature. If your employer may hold rights in your
+work, see section 4 of the CLA and get in touch before submitting.
 
 ## Conduct
 

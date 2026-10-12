@@ -7,6 +7,7 @@
 #include "Directory.h"
 #include "luxir/api/index_files.h"
 #include "luxir/api/padded_input.h"
+#include "luxir/util/Signal.h"
 
 namespace luxir {
 
@@ -20,16 +21,18 @@ struct Manifest {
   uint64_t generation = 0;
   uint64_t highestGeneration = 0;
 
+  // commit_<index_gen>: the generation in decimal, as in commit tokens.
+  static constexpr std::string_view kPrefix = "commit_";
+
   static bool indexFile(std::string_view name) {
-    return name.starts_with("s.olux") || (name.starts_with("s") && name.find('_') != std::string_view::npos);
+    return name.starts_with(kPrefix) || (name.starts_with("s") && name.find('_') != std::string_view::npos);
   }
 
-  static std::string name(uint64_t gen) { return "s.olux_" + std::to_string(gen); }
+  static std::string name(uint64_t gen) { return std::string(kPrefix) + std::to_string(gen); }
 
   static uint64_t generationOf(std::string_view name) {
-    constexpr std::string_view prefix = "s.olux_";
-    if (!name.starts_with(prefix)) return 0;
-    name.remove_prefix(prefix.size());
+    if (!name.starts_with(kPrefix)) return 0;
+    name.remove_prefix(kPrefix.size());
     uint64_t gen = 0;
     auto [end, error] = std::from_chars(name.data(), name.data() + name.size(), gen);
     return error == std::errc() && end == name.data() + name.size() ? gen : 0;
@@ -84,7 +87,7 @@ struct Manifest {
       bool indexFiles = false;
       for (const auto& f : listing) {
         sizes.emplace(f.name, f.size);
-        if (f.name.starts_with("s.olux_")) result.names.push_back(f.name);
+        if (f.name.starts_with(kPrefix)) result.names.push_back(f.name);
         if (auto gen = generationOf(f.name)) generations.push_back(gen);
         if (indexFile(f.name)) indexFiles = true;
       }
@@ -119,9 +122,47 @@ struct Manifest {
     }
   }
 
+  // A root is durable only after its file and directory entry are synced. It
+  // is written and synced under a pending name and renamed into place, so a failure
+  // never leaves a partial root and never removes one that already existed; an
+  // identical existing root (an interrupted earlier commit) is only re-synced.
+  // After a failure the root's durability is unknown. `source` identifies the
+  // committer to failure-injection signals. Every file the root references
+  // must already be synced (Directory::expectSynced).
+  static void commit(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes, void* source = nullptr) {
+    {
+      std::pmr::monotonic_buffer_resource arena;
+      api::IndexInfo info;
+      if (api::decode(info, api::copyToPaddedInput(bytes, arena), arena)) dir.expectSynced(filesOf(info));
+    }
+    Bytes existing;
+    try { existing = read(dir, gen); }
+    catch (const FileIOException&) {} // an unreadable root is what a repair replaces
+    std::array<std::string, 1> root{name(gen)};
+    if (!existing || *existing != bytes) {
+      auto pending = name(gen) + ".pending";
+      try {
+        write(dir, pending, bytes);
+        Signal::emit("manifestWritten", source);
+        std::array<std::string, 1> written{pending};
+        dir.sync(written);
+        Signal::emit("manifestSynced", source);
+        dir.renameFile(pending, root[0]);
+      } catch (...) {
+        try { dir.deleteFile(pending); } catch (...) {}
+        throw;
+      }
+    } else dir.sync(root);
+    std::array<std::string, 1> directory{"."};
+    dir.sync(directory);
+  }
+
   static void write(Directory& dir, uint64_t gen, const std::vector<std::byte>& bytes) {
+    write(dir, name(gen), bytes);
+  }
+  static void write(Directory& dir, const std::string& fileName, const std::vector<std::byte>& bytes) {
     Directory::FileCreateOptions options; options.expectedSize = bytes.size() + 16;
-    auto file = dir.createFile(name(gen), options);
+    auto file = dir.createFile(fileName, options);
     OutputStream out(file.get());
     out.write(bytes.data(), bytes.size());
     out.writeLong(bytes.size());

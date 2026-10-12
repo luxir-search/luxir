@@ -39,6 +39,15 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   else()
     add_compile_options("-march=${LUXIR_CPU_TARGET}" -mtune=generic)
   endif()
+  # Plain -fstack-protector instead of the distro-default -strong. -strong also
+  # instruments functions with any array or address-taken local, putting canary
+  # loads in per-document loops (up to 9% on facet loops). The canary lives at
+  # a fixed page offset in the thread's TCB, so pushes in a hot frame can
+  # 4K-alias it and move timing by ~3% on unrelated frame-size changes. Plain
+  # still covers functions with character buffers, where overflows of request
+  # bytes would occur. Index-data hot paths that keep one opt out with
+  # LUXIR_NO_STACK_PROTECTOR.
+  add_compile_options(-fstack-protector)
 endif()
 
 option(LUXIR_STATIC_RUNTIME "Link GCC runtimes statically, retaining dynamic glibc" OFF)
@@ -55,6 +64,29 @@ if(LUXIR_STATIC_RUNTIME)
     message(FATAL_ERROR "The selected GCC does not supply libgomp.a")
   endif()
   set(OpenMP_gomp_LIBRARY "${_luxir_gomp}" CACHE FILEPATH "OpenMP runtime" FORCE)
+endif()
+
+# Sanitizers replace malloc; default to jemalloc only without one.
+string(TOUPPER "${CMAKE_BUILD_TYPE}" _luxir_config)
+set(_luxir_build_flags " ${CMAKE_C_FLAGS} ${CMAKE_CXX_FLAGS} ${CMAKE_EXE_LINKER_FLAGS} ")
+string(APPEND _luxir_build_flags
+       "${CMAKE_C_FLAGS_${_luxir_config}} ${CMAKE_CXX_FLAGS_${_luxir_config}} "
+       "${CMAKE_EXE_LINKER_FLAGS_${_luxir_config}} ")
+set(_luxir_sanitizer "")
+set(_luxir_jemalloc_default ON)
+if(APPLE)
+  set(_luxir_jemalloc_default OFF)
+endif()
+if(_luxir_build_flags MATCHES
+   " -fsanitize=([a-z,-]*,)?(address|hwaddress|thread|memory|leak)[ ,]")
+  set(_luxir_sanitizer "${CMAKE_MATCH_2}")
+  set(_luxir_jemalloc_default OFF)
+endif()
+# Valgrind needs --soname-synonyms=somalloc=NONE for static jemalloc, or OFF.
+option(LUXIR_JEMALLOC "Link jemalloc as the process allocator" ${_luxir_jemalloc_default})
+if(LUXIR_JEMALLOC AND _luxir_sanitizer)
+  message(FATAL_ERROR "LUXIR_JEMALLOC=ON conflicts with -fsanitize=${_luxir_sanitizer}, "
+                      "which replaces malloc. Configure with -DLUXIR_JEMALLOC=OFF.")
 endif()
 
 option(LUXIR_PROBE_CONSTANT_HOOKS
@@ -116,6 +148,35 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 include_directories(SYSTEM ./src)
 
 include(cmake/Dependencies.cmake)
+if(LUXIR_JEMALLOC)
+  # The vcpkg port installs a static archive and pkg-config metadata only.
+  set(_luxir_triplet_dir "${VCPKG_INSTALLED_DIR}/${VCPKG_TARGET_TRIPLET}")
+  find_path(LUXIR_JEMALLOC_INCLUDE_DIR jemalloc/jemalloc.h
+    PATHS "${_luxir_triplet_dir}/include" NO_DEFAULT_PATH)
+  find_library(LUXIR_JEMALLOC_RELEASE_LIBRARY NAMES libjemalloc.a
+    PATHS "${_luxir_triplet_dir}/lib" NO_DEFAULT_PATH)
+  find_library(LUXIR_JEMALLOC_DEBUG_LIBRARY NAMES libjemalloc.a
+    PATHS "${_luxir_triplet_dir}/debug/lib" NO_DEFAULT_PATH)
+  if(_luxir_config STREQUAL "DEBUG")
+    set(_luxir_jemalloc_library "${LUXIR_JEMALLOC_DEBUG_LIBRARY}")
+  else()
+    set(_luxir_jemalloc_library "${LUXIR_JEMALLOC_RELEASE_LIBRARY}")
+  endif()
+  if(NOT LUXIR_JEMALLOC_INCLUDE_DIR OR NOT _luxir_jemalloc_library)
+    message(FATAL_ERROR "LUXIR_JEMALLOC=ON requires the jemalloc feature of deps/vcpkg.json "
+                        "(deps/make_deps.sh installs it). Or configure with -DLUXIR_JEMALLOC=OFF.")
+  endif()
+  find_package(Threads REQUIRED)
+  add_library(luxir_jemalloc STATIC IMPORTED)
+  set_target_properties(luxir_jemalloc PROPERTIES
+    IMPORTED_CONFIGURATIONS "DEBUG;RELEASE"
+    IMPORTED_LOCATION_DEBUG "${LUXIR_JEMALLOC_DEBUG_LIBRARY}"
+    IMPORTED_LOCATION_RELEASE "${LUXIR_JEMALLOC_RELEASE_LIBRARY}"
+    MAP_IMPORTED_CONFIG_RELWITHDEBINFO Release
+    MAP_IMPORTED_CONFIG_MINSIZEREL Release
+    INTERFACE_INCLUDE_DIRECTORIES "${LUXIR_JEMALLOC_INCLUDE_DIR}"
+    INTERFACE_LINK_LIBRARIES "Threads::Threads;m;${CMAKE_DL_LIBS}")
+endif()
 
 include_directories(deps)
 
@@ -158,7 +219,6 @@ set_target_properties(fastpfor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # sanitizer settings.. can leave this first one on while developing for linux
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2b -g -O1 -fno-omit-frame-pointer -fsanitize=address")
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2b -g -O0 -fno-omit-frame-pointer -fsanitize=address")     #don't optimize stuff out
-#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2b -g -O0 -fno-omit-frame-pointer -fsanitize=address -DMEM_SCRIBBLE") #scribble over heap allocations before use
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2b -g -O1 -fno-omit-frame-pointer -fsanitize=address -DMEMPOOL_MALLOC")  #use separate allocations
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2b -g -O0 -fno-omit-frame-pointer -DMEMPOOL_MALLOC")  #use separate allocations, for valgrind
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2b -g -O1 -fno-omit-frame-pointer -fsanitize=thread -fPIE -pie")
@@ -208,7 +268,7 @@ if(NOT DEFINED LUXIR_COMPILE_JOBS)
       endif()
     endif()
   endforeach()
-  if(CMAKE_CXX_FLAGS MATCHES "-fsanitize=address")
+  if(_luxir_sanitizer)
     set(_ram_per_job 4000)
   else()
     set(_ram_per_job 3000)
@@ -312,6 +372,19 @@ if(ROBIN_HOOD_HASHING)
 endif()
 
 target_include_directories(luxir_lib PUBLIC ${GTL_INCLUDE_DIRS})
+
+# Link the whole archive so every executable using luxir_lib defines the malloc
+# family and operator new/delete regardless of link order. The executable then
+# exports them, and calls from shared libraries (libstdc++, glibc) bind there.
+# Such executables cannot define their own global operator new/delete.
+if(LUXIR_JEMALLOC)
+  target_link_libraries(luxir_lib PUBLIC "$<LINK_LIBRARY:WHOLE_ARCHIVE,luxir_jemalloc>")
+endif()
+set_property(SOURCE src/luxir/util/ProcessAllocator.cpp APPEND PROPERTY
+  COMPILE_DEFINITIONS
+    "LUXIR_JEMALLOC=$<BOOL:${LUXIR_JEMALLOC}>"
+    "LUXIR_SANITIZER=$<BOOL:${_luxir_sanitizer}>"
+    "LUXIR_SANITIZER_NAME=\"${_luxir_sanitizer}\"")
 
 target_link_libraries(luxir_lib PRIVATE TBB::tbb)
 get_target_property(_luxir_tbb_type TBB::tbb TYPE)

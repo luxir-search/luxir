@@ -44,11 +44,12 @@ class SortedDeletes {
 public:
   using Entry = TermValRef<IdEntry>;
   using EntrySpan = std::span<const Entry>;
+  using Table = TermValHash<IdEntry>::Table;
 
 private:
   std::unique_ptr<MemPool> pool_;
   boost::container::small_vector<EntrySpan, 2> lists_;
-  boost::container::small_vector<char*, 2> ownedTables_;  // raw allocations to free on destruction
+  boost::container::small_vector<Table, 2> ownedTables_;
   uint64_t minVersion_ = 0;
   uint64_t maxVersion_ = 0;
 
@@ -61,17 +62,11 @@ public:
   SortedDeletes(SortedDeletes&&) = default;
   SortedDeletes& operator=(SortedDeletes&&) = default;
 
-  ~SortedDeletes() {
-    for (char* p : ownedTables_) {
-      delete[] p;
-    }
-  }
-
-  /// Add a sorted list. The entries pointer must have been allocated with new char[]
-  /// (e.g. via TermValHash::detachTable()). SortedDeletes takes ownership.
-  void addList(Entry* entries, int32_t count, uint64_t minVersion, uint64_t maxVersion) {
+  /// Take ownership of a sorted table, keeping its original allocation size.
+  void addList(Table table, int32_t count, uint64_t minVersion, uint64_t maxVersion) {
     if (count == 0) return;
-    ownedTables_.push_back(reinterpret_cast<char*>(entries));
+    auto* entries = table.get();
+    ownedTables_.push_back(std::move(table));
     lists_.emplace_back(entries, (size_t)count);
     if (lists_.size() == 1) {
       minVersion_ = minVersion;

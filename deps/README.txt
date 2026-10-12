@@ -43,7 +43,11 @@ Libraries
 ---------
 
 - TBB and tbbmalloc come from the pinned vcpkg port. Luxir retains the static
-  allocator entry points needed by TBB. Application malloc/free remain glibc's.
+  allocator entry points needed by TBB.
+- jemalloc is the process allocator, installed via the manifest's jemalloc
+  feature for normal builds only; ASan installs omit it. Luxir links the whole
+  static archive, so each executable exports malloc/free and operator new/delete.
+  See ports/jemalloc/portfile.cmake for the version and embedded configuration.
 - The FAISS overlay enables runtime SIMD dispatch (FAISS_OPT_LEVEL=dd) and
   checks the CPU features required by each dispatched kernel.
 - OpenBLAS includes C LAPACK with 32-bit LAPACK integers. No Fortran compiler

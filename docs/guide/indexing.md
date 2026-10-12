@@ -157,13 +157,17 @@ Commit whichever way fits:
 
 An empty commit object commits immediately and the response waits for
 publication. The response's optional `commit` field identifies the resulting
-snapshot as the token `"<collection UUID>:42"` (`incarnation:index_gen`). The
+snapshot as the token `"9f3c2a71d04be6a5:42"` (`incarnation:index_gen`, where the
+incarnation is 16 hex digits). The
 incarnation is part of the identity: deleting and recreating a collection changes its incarnation. Updates acknowledged before publication
 (including deferred commits) omit it. A forced merge returns the final merged
-snapshot's id. For an NDJSON URL EOF commit spanning multiple touched collections, the result is
-`commits: {name: {commit, replicas?}}`; `replicas` appears only when requested.
-A single touched collection keeps the ordinary `commit`/`replicas` shape.
-Explicit group commits report their own collection's identity.
+snapshot's id. An NDJSON URL EOF commit always returns
+`commits: {name: {commit?, replicas?, error?}}`, including for one collection.
+`replicas` appears only when requested. Each entry retains its durable token
+if a subsequent replica wait times out or is cancelled. The wait reports
+`replicas.outcome` independently of local commit success. All admitted outcomes
+are collected; a local collection commit failure sets `status: "error"` and a top-level `error`, with HTTP 200.
+Unary updates and explicit group commits keep `commit`/`replicas`.
 
 The request's `commit` object may contain:
 
@@ -172,6 +176,8 @@ The request's `commit` object may contain:
 | `commit_within_ms` | Publish within this many milliseconds. `0` is immediate; a positive value lets the update response return before publication. |
 | `build_aux_indexes` | Missing vector overlays to build, such as `["*"]` or `["vec.embedding_v"]`. Existing overlays are retained; empty requests no builds. |
 | `wait_for_merges` | Wait for in-flight merges before publishing. |
+| `wait_for_replicas` | Typed requirement: `{"count": N}` or `{"all": {}}`. Forces an immediate commit; see [Replication](replication.md#write-then-read-your-write). |
+| `wait_for_replicas_timeout_ms` | Visibility wait deadline; absent = 30000, zero checks immediately. Does not undo the local commit. |
 | `max_segments` | Force the committed data down to at most this many segments before returning. `0` means no forced merge. |
 
 On the HTTP path, `?commit=true` guarantees the request is published before

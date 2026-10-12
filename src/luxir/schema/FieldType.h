@@ -128,6 +128,15 @@ public:
 
   bool multiValued() { return (bool) (flags_ & MULTI_VALUED); }
 
+  // Whether a sort on a field of this type orders by its int64 column
+  // values: raw integers for INT, epoch millis for DATE, sortable bits for
+  // FLOAT and DOUBLE (SimpleNumericFieldComparator). Single-valued columns
+  // of these types are the ones field-sort planning reads, so only they
+  // persist a value sketch (NumColumnWriter).
+  static bool sortsByIntColumn(Type type) {
+    return type == INT || type == DATE || type == FLOAT || type == DOUBLE;
+  }
+
   bool isAnalyzerFieldSpecific() { return (bool) (flags_ & FIELD_SPECIFIC_ANALYZER); }
 
   bool hasColumn() { return (bool) (flags_ & COLUMN_STORED); }

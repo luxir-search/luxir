@@ -262,6 +262,44 @@ void verifySeeks(MemPool& pool, PostingsReader& reader, const SegFieldInfo& info
       EXPECT_EQ(expected.terms[(size_t) nextOrd].term, (std::string_view) cross.term());
     }
   }
+
+  // docFreqBlock, stepped block to block in both directions: every ord's
+  // docFreq, blocks that never span a range row's first ord, and seekOrd
+  // still positioning within each block afterwards.
+  std::vector<int64_t> rowStarts;
+  if (!info.rangeTableLoc.isNull()) {
+    InputStream table = reader.getInputStreamSeek(info.rangeTableLoc);
+    const auto* header = reinterpret_cast<const TermRangeTableHeader*>(table.ptr());
+    const auto* rows = reinterpret_cast<const TermRangeRow*>(header + 1);
+    for (uint32_t i = 1; i < header->nRanges; i++) {
+      rowStarts.push_back((int64_t) rows[i].firstTermOrd);
+    }
+  }
+  int64_t nTerms = (int64_t) expected.terms.size();
+  for (bool descending : {false, true}) {
+    TermsEnum blocks(pool, reader, info);
+    int64_t next = descending ? nTerms - 1 : 0;
+    while (next >= 0 && next < nTerms) {
+      auto [firstOrd, docFreqs] = blocks.docFreqBlock(next);
+      int64_t endOrd = firstOrd + (int64_t) docFreqs.size();
+      ASSERT_LE(firstOrd, next);
+      ASSERT_LT(next, endOrd);
+      ASSERT_LE(endOrd, nTerms);
+      ASSERT_LE(docFreqs.size(), (size_t) Postings::TERMS_BLOCK_SIZE);
+      for (int64_t start : rowStarts) {
+        EXPECT_FALSE(start > firstOrd && start < endOrd) << start;
+      }
+      for (int64_t i = firstOrd; i < endOrd; i++) {
+        EXPECT_EQ(expected.terms[(size_t) i].docFreq,
+                  (int32_t) docFreqs[(size_t) (i - firstOrd)]) << i;
+      }
+      blocks.seekOrd(endOrd - 1);
+      EXPECT_EQ(expected.terms[(size_t) endOrd - 1].term, (std::string_view) blocks.term());
+      EXPECT_EQ(firstOrd, blocks.docFreqBlock(firstOrd).firstOrd);
+      EXPECT_EQ(endOrd - 1, blocks.ord());
+      next = descending ? firstOrd - 1 : endOrd;
+    }
+  }
 }
 
 FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,

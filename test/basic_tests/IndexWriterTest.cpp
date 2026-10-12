@@ -35,6 +35,7 @@
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
 
 #define TEST_DEBUG LOG_TRACE
@@ -57,6 +58,18 @@ public:
     iw.releaseInverter(*inverter);
   }
 };
+
+TEST_F(IndexWriterTest, closePreservesBorrowedInverter) {
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
+  auto& inverter = writer.obtainInverter();
+  char* bytes = inverter.pool.alloc(1024);
+  std::memset(bytes, 'x', 1024);
+  writer.close();
+  EXPECT_EQ(bytes[1023], 'x');
+  EXPECT_NO_THROW(writer.releaseInverter(inverter));
+}
 
 TEST_F(IndexWriterTest, closeIsIdempotentAndRejectsNewEntryPoints) {
   class NoopUpdate final : public UpdateMessage {
@@ -2669,6 +2682,8 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
   IndexWriter writer(writerSnapshots);
   auto before = test::readDurableIndexInfo(dir);
   auto originalSchema = writer.getSchema();
+  int changes = 0;
+  writerSnapshots.onChange = [&]() noexcept { changes++; };
   Signal::listen("manifestDurable", [&](void*, void*, void*) -> void* {
     EXPECT_NE(nullptr, dir.openFile(Manifest::name(before->index_gen + 1), true));
     throw std::runtime_error("injected publication failure");
@@ -2676,6 +2691,7 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
   auto unlisten = scope_guard([] { Signal::unlisten("manifestDurable"); });
   EXPECT_THROW(writer.setSchema(Schema::createDefaultSchema()), std::runtime_error);
   EXPECT_TRUE(writer.isClosed());
+  EXPECT_EQ(1, changes); // the failure itself is announced
   EXPECT_EQ(originalSchema, writer.getSchema());
   EXPECT_THROW(writer.setSchema(originalSchema), IndexWriterClosedError);
   EXPECT_THROW(writer.snapshots.readers.getReader(), ApiError);
@@ -2847,7 +2863,7 @@ TEST_F(IndexWriterTest, newestManifestSelectionDoesNotReadData) {
 }
 
 TEST_F(IndexWriterTest, refusesIndexFilesWithoutManifest) {
-  for (auto name : {"s01_00", "s.olux", "s.olux_3.tmp"}) {
+  for (auto name : {"s01_00", "commit_x", "commit_3.tmp"}) {
     RAMDir dir;
     auto file = dir.createFile(name);
     OutputStream out(file.get());
@@ -2870,7 +2886,7 @@ TEST_F(IndexWriterTest, manifestEnospcLeavesWriterUsable) {
   CommitSnapshotRegistry writerSnapshots(dir);
   IndexWriter writer(writerSnapshots);
   auto before = test::readDurableIndexInfo(dir);
-  std::filesystem::create_symlink("/dev/full", path / (Manifest::name(before->index_gen + 1) + ".tmp"));
+  std::filesystem::create_symlink("/dev/full", path / (Manifest::name(before->index_gen + 1) + ".pending.tmp"));
   addDoc(writer);
   EXPECT_THROW(writer.commit(), std::runtime_error);
   EXPECT_FALSE(writer.isClosed());
@@ -2948,7 +2964,7 @@ TEST_F(IndexWriterTest, fatalPublicationMakesCollectionUnavailable) {
   EXPECT_FALSE(helper.collection().getUnavailableReason().empty());
   EXPECT_THROW(node.getCollection("failed_publication"), CollectionUnavailableError);
   auto entries = node.collectionEntries();
-  auto failed = std::ranges::find_if(entries, [](const auto& e) { return e.name == "failed_publication"; });
+  auto failed = std::ranges::find_if(entries, [](const auto& e) { return e.id.name == "failed_publication"; });
   ASSERT_NE(entries.end(), failed);
   EXPECT_FALSE(failed->error.empty());
 }
@@ -3102,4 +3118,32 @@ TEST_F(IndexWriterTest, readerRetriesAnyFailureOnlyWhenPublicationChanges) {
       EXPECT_THROW(writer.snapshots.readers.getReader(), std::runtime_error);
     }
   }
+}
+
+TEST_F(IndexWriterTest, storageLimitDiscardsPartialOutputBeforeRecovery) {
+  LuxirConfig config; config.store.ram_limit_mb = 2;
+  LuxirNode node(config);
+  test::CollectionHelper h(node, "main");
+  SchemaBuilder builder;
+  auto& field = builder.field("payload");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.index = api::FieldDef::IndexMode::NONE; field.column = false; field.stored = true;
+  h.collection().setSchema(builder.build(h.collection().getSchema().get()));
+  auto dir = h.collection().getShard()->getDirectory();
+  Directory::FileCreateOptions options;
+  options.expectedSize = 2 * 1024 * 1024 - node.storageBytes() - 128 * 1024;
+  auto pressure = dir->createFile("pressure", options);
+  std::string payload(512 * 1024, 'a');
+  std::mt19937 random(7);
+  for (auto& c : payload) c = (char)(' ' + random() % 95);
+  auto result = h.index(test::flatdoc("id", "large", "payload", payload));
+  // Stored fields can defer the large value until the following document.
+  if (result.success) result = h.index(test::flatdoc("id", "trigger", "payload", "trigger"));
+  EXPECT_FALSE(result.success);
+  EXPECT_EQ(ErrorKind::RESOURCE_EXHAUSTED, result.error_kind);
+  EXPECT_EQ("storage_memory_limit", result.error_code);
+  EXPECT_TRUE(result.errors.empty());
+  pressure.reset();
+  ASSERT_TRUE(h.index(test::flatdoc("id", "small", "payload", "small"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(1, h.collection().getReaderManager().getReader()->liveDocs());
 }

@@ -29,8 +29,8 @@ class CheckedDirectory : public Directory {
   boost::unordered_flat_set<std::string> unsyncedFiles_;
   std::mutex mu_;
 
-  void reportUnsyncedRead(const std::string& name) {
-    std::string msg = "CheckedDirectory: expectSynced openFile on unsynced file: " + name;
+  void reportUnsynced(std::string_view operation, const std::string& name) {
+    std::string msg = "CheckedDirectory: " + std::string(operation) + " of unsynced file: " + name;
     if (mode_ == CheckedDirMode::THROW) {
       throw std::runtime_error(msg);
     } else {
@@ -51,11 +51,20 @@ public:
       std::lock_guard lock(mu_);
       auto it = unsyncedFiles_.find(std::string(name));
       if (it != unsyncedFiles_.end()) {
-        reportUnsyncedRead(*it);
+        reportUnsynced("expectSynced openFile", *it);
       }
     }
     if (verbose_) LOG_DEBUG("CheckedDirectory: openFile({}, expectSynced={})", name, expectSynced);
     return delegate_->openFile(name, expectSynced);
+  }
+
+  // Readers share an open segment rather than reopening it, so most reads
+  // never reach openFile(expectSynced): publication checks every file.
+  void expectSynced(std::span<const FileDescriptor> files) override {
+    std::lock_guard lock(mu_);
+    for (const auto& file : files) {
+      if (unsyncedFiles_.contains(file.name)) reportUnsynced("publication", file.name);
+    }
   }
 
   std::unique_ptr<File> createFile(std::string_view name) override {
@@ -146,24 +155,43 @@ class CheckedDirFactory : public DirectoryFactory {
   std::unique_ptr<DirectoryFactory> delegate_;
   CheckedDirMode mode_;
   bool verbose_;
+  std::mutex mu_;
+  // Reopening a directory must not forget which of its files are unsynced, so
+  // wrappers live until their namespace is removed. An empty incarnation key
+  // is the collection's container.
+  std::map<std::pair<CollectionId, std::string>, std::shared_ptr<CheckedDirectory>> opened_;
+
+  std::shared_ptr<Directory> wrap(const CollectionId& id, std::string_view incarnation, std::shared_ptr<Directory> dir) {
+    std::lock_guard lock(mu_);
+    auto& checked = opened_[{id, std::string(incarnation)}];
+    if (!checked) checked = std::make_shared<CheckedDirectory>(std::move(dir), mode_, verbose_);
+    return checked;
+  }
 
 public:
   CheckedDirFactory(std::unique_ptr<DirectoryFactory> delegate, CheckedDirMode mode, bool verbose = false)
       : delegate_(std::move(delegate)), mode_(mode), verbose_(verbose) {}
 
-  std::shared_ptr<Directory> create(std::string_view collectionName, bool exclusive = false) override {
-    auto dir = delegate_->create(collectionName, exclusive);
-    return std::make_shared<CheckedDirectory>(std::move(dir), mode_, verbose_);
+  uint64_t storageBytes() override { return delegate_->storageBytes(); }
+  uint64_t collectionBytes(const CollectionId& id) override { return delegate_->collectionBytes(id); }
+  std::vector<CollectionId> collections() override { return delegate_->collections(); }
+  std::shared_ptr<Directory> container(const CollectionId& id, bool create) override {
+    return wrap(id, {}, delegate_->container(id, create));
   }
-
-  uint64_t storageBytes(std::string_view collection = {}) override { return delegate_->storageBytes(collection); }
-
-  std::vector<std::string> listDirectories(std::string_view parent = {}) override {
-    return delegate_->listDirectories(parent);
+  std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) override {
+    return wrap(id, incarnation, delegate_->incarnation(id, incarnation, create));
   }
-
-  void remove(std::string_view collectionName) override {
-    delegate_->remove(collectionName);
+  void createCollection(const CollectionId& id) override { delegate_->createCollection(id); }
+  std::vector<std::string> incarnations(const CollectionId& id) override { return delegate_->incarnations(id); }
+  void removeIncarnation(const CollectionId& id, std::string_view incarnation) override {
+    delegate_->removeIncarnation(id, incarnation);
+    std::lock_guard lock(mu_);
+    opened_.erase({id, std::string(incarnation)});
+  }
+  void remove(const CollectionId& id) override {
+    delegate_->remove(id);
+    std::lock_guard lock(mu_);
+    std::erase_if(opened_, [&](const auto& entry) { return entry.first.first == id; });
   }
 };
 

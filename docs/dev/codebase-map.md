@@ -10,13 +10,25 @@ locations, browse `src/luxir/<area>/`.
 1. **Server Layer** (`src/luxir/server/`)
    - `GRPCServer`: Manages gRPC services and thread pool
    - `HttpServer`: JSON/HTTP API (Boost.Beast), including NDJSON streaming ingest
-   - `LuxirNode`: Central coordinator managing collections and services
+   - `LuxirNode`: Central coordinator wiring collections and services
+   - `Collections`: Owns the name -> collection map and every transition of it
+     (startup discovery, creation, activation of a new incarnation, removal),
+     announced in order through `CollectionEvents`
+   - `ReplicationFollower`: Discovery and transfer protocol; installs through `Collections`
+   - `ReplicationSource`: Local discovery catalog, cursors, follower liveness and acknowledgments,
+     fed by the ordered `CollectionEvents` interface.
+   - `CommitWaits`: Node-local publication floors and replica barriers; owns deadlines,
+     cancellation and captured follower expiry. Satisfied floors retain their exact collection.
+   - `ProtoUpdateMessage::Completion`: Owning local result plus copied replica-wait specification;
+     transports release indexing bodies before waiting for visibility.
 
 2. **Search Engine** (`src/luxir/search/`)
    - `ReaderManager`: Per-collection snapshot publication, reader refresh, and filter cache;
      searches do not require an `IndexWriter`. Schema-only snapshots share physical cores.
    - `ResolvedSchema.cpp`: Declared representations and segment-generation coverage
-   - `IndexReader` is for reading a whole index and contains a `PostingsReader` per index segment
+   - `IndexReader` is for reading a whole index and contains a `PostingsReader` per index segment;
+     a reopen shares each unchanged segment's `PostingsReader` and live docs with the previous
+     snapshot, and the writer's open segments in both directions
      - Physical field catalog records available columns and stored resources;
        logical retrieval discovery is cached per reader and schema identity
    - `SearchEngine`: Coordinates query parsing, execution, and result collection
@@ -27,7 +39,9 @@ locations, browse `src/luxir/<area>/`.
      read source; wildcard discovery returns logical primaries only
 
 3. **Segment Reading** (`src/luxir/reader/`)
-   - `PostingsReader` reads a single segment and owns the open files for that segment
+   - `PostingsReader` reads a single segment and owns the open files for that segment, plus
+     views derived from its immutable bytes (numeric leaf metadata), which therefore live
+     exactly as long as the mapped files
    - `FieldReader` finds metadata for a field in the segment (`SegFieldInfo`)
    - `TermsEnum` enumerates or finds indexed terms for a field found by `FieldReader`
    - `DocsEnum` returns the documents for a term found with the `TermsEnum`. Optionally returns term positions for each document.
@@ -69,10 +83,10 @@ locations, browse `src/luxir/<area>/`.
      - Manages `Inverter` instances, flushing, merging, and commits.
      - Atomically pins schema at update admission; stale inverters flush at
        checkout or release, keeping one schema per segment
-   - `CommitSnapshotRegistry`: Shard-owned current snapshot and commit-ID reservations,
+   - `CommitSnapshotRegistry`: Shard-owned current snapshot and commit-ID pins,
      lazy idle expiry, and retained-byte eviction. Publishes into its ReaderManager;
      accepts retirement from a writer or installer independently. Retirement preserves
-     both snapshot reservations and writer/merge ownership.
+     both snapshot pins and writer/merge ownership.
    - `Inverter`: Single-threaded document processing under one pinned schema.
      - `InputHandler`: One logical dispatcher per document key; stores source once
        when the primary enables it and sends the submitted value to every branch
@@ -93,7 +107,9 @@ locations, browse `src/luxir/<area>/`.
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
    - `InputStream` / `OutputStream`: segment I/O primitives
-   - `DirectoryFactory`: constructs directories (`RAMDirFactory`, `FSDirFactory`, `CheckedDirFactory`)
+   - `DirectoryFactory`: storage backends (`RAMDirFactory`, `FSDirFactory`) and wrappers
+     (`CheckedDirFactory`, `ReadOnlyDirFactory`); `CollectionStorage` is a collection's
+     handle: CURRENT selects one of its incarnation directories
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)
@@ -109,8 +125,8 @@ locations, browse `src/luxir/<area>/`.
 
 ## Data Organization
 
-- **Library**: Top-level multi-tenancy container
-- **Collection**: Logical document group with schema
+- **Collection**: Logical document group with schema; its storage is a sequence of
+  incarnations (identities), one selected by CURRENT
 - **Shard**: Physical collection partition, consists of a single **Index**
 - **Segment**: Immutable index unit
   - Flush records the pinned schema generation; merge records the minimum input

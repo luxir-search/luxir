@@ -34,9 +34,22 @@ inline bool disableFieldSortBulk = false;
 inline std::size_t forcedRangeFacetBucketDomainByteBudget = 0;
 
 // Test override for the range-facet result-child state chunk. Zero selects the
-// production ceiling. The optional counter observes opened blocks.
+// production ceiling.
 inline std::size_t forcedRangeFacetBindingStateChunkBytes = 0;
-inline std::size_t* rangeFacetBindingBlockCounter = nullptr;
+
+// Test override for the facet bucket-child cache budget. Zero selects the
+// production constant. The optional counter observes opened binding blocks.
+inline std::size_t forcedFacetBucketCacheBytes = 0;
+inline std::size_t* facetBucketBlockCounter = nullptr;
+
+// Bench override for the facet bucket-child block width: the number of
+// buckets whose bindings are open together across a segment pass, bypassing
+// both the cache and the binding byte budgets. Zero keeps the executor's own
+// sizing.
+inline std::size_t forcedFacetBucketBlockBuckets = [] {
+  const char* e = std::getenv("LUXIR_FACET_BUCKET_BLOCK");
+  return e != nullptr ? (std::size_t)std::strtoull(e, nullptr, 10) : 0;
+}();
 
 // Test override for the per-request query-memory breaker ceiling. Zero uses
 // LuxirConfig.
@@ -85,21 +98,24 @@ inline InlineFacetEntryMode forcedInlineFacetEntryMode =
 inline bool disableFieldSortPruning =
     std::getenv("LUXIR_DISABLE_FIELD_SORT_PRUNING") != nullptr;
 
-// A/B baseline for the best-first exact-bitset field-sort driver. Default
-// false means eligible match-all + cached-bitset field sorts visit key
-// blocks in bound order with proof termination instead of doc order.
+// A/B baseline for the exact-domain field-sort driver. Default false means
+// materialized-domain field sorts take the driver (bound order, a doc-order
+// leaf sweep, or an unclassified scan, chosen by cost) instead of the
+// query-driven ladder.
 inline bool disableFieldSortBestFirst =
     std::getenv("LUXIR_DISABLE_FIELD_SORT_BEST_FIRST") != nullptr;
-// Test-only: bypass the expected-floor activation gate so small corpora
-// (too few key blocks to ever pass it) still drive the best-first arm.
+// Test-only: bypass the driver's phase economics (cost gate and progress
+// checkpoints) and the whole-membership build floor, so small corpora (too
+// few leaves to ever pass them) still drive the bound-order phase.
 inline bool forceFieldSortBestFirst = false;
-// Test-only: override the best-first leaf work cap (0 = production formula)
-// so the cap-crossing forward-sweep fallback is reachable on small corpora.
+// Test-only: hand the bound-order phase off (to the sweep or the scan, as at
+// a progress checkpoint) after this many leaf gathers (0 = production
+// progress checkpoints only), so the hand-off is reachable on small corpora.
 inline int64_t forceFieldSortWorkCapForTests = 0;
 
 // A/B baseline for the seeded two-pass query-driven field-sort driver.
 // Default false means eligible query-driven field sorts fill the heap from
-// the best-bounded key blocks first, then sweep the complement.
+// the best-bounded leaves first, then sweep the complement.
 inline bool disableFieldSortSeeding =
     std::getenv("LUXIR_DISABLE_FIELD_SORT_SEEDING") != nullptr;
 // Test-only: bypass the economic gates (materiality and matches-per-block)

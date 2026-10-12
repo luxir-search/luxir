@@ -49,25 +49,28 @@ public:
       return bits != 0 && encoding == DeltaEncoding::SINGLE_FIT;
     }
 
-    int64_t deltaAt(int64_t segmentOrd) const {
-      assert(segmentOrd >= 0 && segmentOrd < numOrds);
-      if (bits == 0) return 0;
-      if (encoding == DeltaEncoding::FLAT) {
-        return (int64_t)LinearPack::select64(
-            deltas, (uint64_t)segmentOrd, bits, mask);
-      }
+    // Local ords map to themselves.
+    static SegToGlobal identity() { return {}; }
 
-      if (encoding == DeltaEncoding::SINGLE_FIT) {
-        uint64_t residual = LinearPack::select64(
-            deltas, (uint64_t)segmentOrd, residualBits, mask);
-        __int128 delta = (__int128)OrdColumnFormat::predict(
-            intercept, scaledSlope, (uint64_t)segmentOrd,
-            OrdColumnFormat::SINGLE_FIT_SLOPE_SHIFT) + residual;
-        assert(delta >= 0 && delta <= LinearPack::mask64(bits));
-        return (int64_t)delta;
-      }
+    int64_t flatDeltaAt(int64_t segmentOrd) const {
+      assert(bits != 0 && encoding == DeltaEncoding::FLAT);
+      return (int64_t)LinearPack::select64(
+          deltas, (uint64_t)segmentOrd, bits, mask);
+    }
 
-      assert(encoding == DeltaEncoding::PREDICTED);
+    int64_t singleFitDeltaAt(int64_t segmentOrd) const {
+      assert(singleFit());
+      uint64_t residual = LinearPack::select64(
+          deltas, (uint64_t)segmentOrd, residualBits, mask);
+      __int128 delta = (__int128)OrdColumnFormat::predict(
+          intercept, scaledSlope, (uint64_t)segmentOrd,
+          OrdColumnFormat::SINGLE_FIT_SLOPE_SHIFT) + residual;
+      assert(delta >= 0 && delta <= LinearPack::mask64(bits));
+      return (int64_t)delta;
+    }
+
+    int64_t predictedDeltaAt(int64_t segmentOrd) const {
+      assert(predicted());
       uint64_t block = (uint64_t)segmentOrd / OrdColumnFormat::BLOCK_SIZE;
       uint32_t rankInBlock =
           (uint32_t)((uint64_t)segmentOrd % OrdColumnFormat::BLOCK_SIZE);
@@ -80,6 +83,51 @@ public:
                       (int64_t)residual;
       assert(delta >= 0 && (uint64_t)delta <= LinearPack::mask64(bits));
       return delta;
+    }
+
+    int64_t deltaAt(int64_t segmentOrd) const {
+      assert(segmentOrd >= 0 && segmentOrd < numOrds);
+      if (bits == 0) return 0;
+      if (encoding == DeltaEncoding::FLAT) return flatDeltaAt(segmentOrd);
+      if (encoding == DeltaEncoding::SINGLE_FIT) {
+        return singleFitDeltaAt(segmentOrd);
+      }
+      return predictedDeltaAt(segmentOrd);
+    }
+
+    // The 0-based ords of `count` stored column ords (1-based segment ords,
+    // never 0) under this mapping: out[i] = globalOrd(stored[i] - 1). The
+    // encoding dispatch sits outside the loop; an identity mapping only
+    // rebases.
+    void globalOrdsOfStored(const int32_t* stored, int32_t count,
+                            int64_t* out) const {
+      auto rebase = [&](auto&& delta) LUXIR_INLINE {
+        for (int32_t i = 0; i < count; i++) {
+          int64_t segmentOrd = (int64_t)stored[i] - 1;
+          assert(segmentOrd >= 0 && (bits == 0 || segmentOrd < numOrds));
+          out[i] = segmentOrd + delta(segmentOrd);
+        }
+      };
+      if (bits == 0) {
+        rebase([](int64_t) LUXIR_INLINE { return (int64_t)0; });
+      } else if (encoding == DeltaEncoding::FLAT) {
+        // Locals, not members: the output stores could alias the mapping.
+        const char* base = deltas;
+        uint8_t width = bits;
+        uint64_t deltaMask = mask;
+        rebase([=](int64_t segmentOrd) LUXIR_INLINE {
+          return (int64_t)LinearPack::select64(
+              base, (uint64_t)segmentOrd, width, deltaMask);
+        });
+      } else if (encoding == DeltaEncoding::SINGLE_FIT) {
+        rebase([this](int64_t segmentOrd) LUXIR_INLINE {
+          return singleFitDeltaAt(segmentOrd);
+        });
+      } else {
+        rebase([this](int64_t segmentOrd) LUXIR_INLINE {
+          return predictedDeltaAt(segmentOrd);
+        });
+      }
     }
 
     int64_t globalOrd(int64_t segmentOrd) const {

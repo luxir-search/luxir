@@ -35,5 +35,13 @@
       "name": "date",
       "platform": "osx"
     }
-  ]
+  ],
+  "features": {
+    "jemalloc": {
+      "description": "jemalloc as the process allocator; sanitizer installs omit it",
+      "dependencies": [
+        "jemalloc"
+      ]
+    }
+  }
 }

@@ -76,6 +76,8 @@ struct PointsMaterialize {
     PointsArrayScorer(std::span<const int32_t> docs, float constantScore)
       : Query::ConstantScorer(constantScore), docs(docs) {}
 
+    [[gnu::cold]] void reset() override { index = docid = -1; }
+
     int32_t next() override {
       assert(docid != PostingsReader::END);
       index++;
@@ -99,6 +101,26 @@ struct PointsMaterialize {
     }
 
     int32_t docId() override { return docid; }
+
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t min, int32_t max) override {
+      fillWindowBits(words, min, max);
+    }
+
+    void fillWindowBits(std::span<uint64_t> words, int32_t min,
+                        int32_t max) override {
+      if (min >= max) return;
+      if (docid < min) advance(min);
+      // The retained array is already exact. Walk it directly instead of
+      // invoking the generic bounded seek for each member of the window.
+      while (docid < max) {
+        int32_t bit = docid - min;
+        words[(size_t)bit >> 6] |= 1ULL << (bit & 63);
+        ++index;
+        docid = index < (int64_t)docs.size()
+            ? docs[(size_t)index] : PostingsReader::END;
+      }
+    }
   protected:
     void exhaust() override { index = (int64_t)docs.size(); }
   };
@@ -119,6 +141,11 @@ struct PointsMaterialize {
     PointsBitScorer(FixedBitSet bits, float constantScore)
       : Query::ConstantScorer(constantScore), bits(bits), limit(bits.size()) {}
 
+    [[gnu::cold]] void reset() override {
+      docid = -1;
+      limit = bits.size();
+    }
+
     int32_t next() override {
       assert(docid != PostingsReader::END);
       return seek(docid + 1);
@@ -128,6 +155,17 @@ struct PointsMaterialize {
       return seek(target);
     }
     int32_t docId() override { return docid; }
+    // Exact members need no verification; the next one past max is a
+    // lookahead resume point (see QueryPrep::DocSetScorer::advanceWindow).
+    int32_t advanceWindow(int32_t min, int32_t max) override {
+      if (min >= max) return max;
+      return docid >= min ? docid : seek(min);
+    }
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t start, int32_t end) override {
+      fillWindowBits(words, start, end);
+    }
+
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {
       assert(windowStart >= 0 && windowEnd >= windowStart
@@ -153,6 +191,16 @@ struct PointsMaterialize {
         : docs(docs), outDocs(pool.make_span<int32_t>(docs.size())),
           outScores(pool.make_span<float>(docs.size())),
           constantScore(constantScore) {}
+
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0);
+      windowIndex = 0;
+    }
+
+    // Bounded windows of exact matches: the default matchNextWindow serves
+    // them, as the numeric predicate's bulk plan declares.
+    bool supportsMatchWindows() const override { return true; }
 
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {
@@ -290,12 +338,20 @@ struct PointsMaterialize {
     }
 
   public:
+    [[gnu::cold]] void reposition(int32_t target) override {
+      unused(target);
+      assert(target >= 0 && target <= bits.size());
+      windowStart = windowEnd = 0;
+    }
+
     PointsBitBulkScorer(MemPool& pool, FixedBitSet bits, float constantScore)
         : bits(bits),
           windowBits(pool.make_span<uint64_t>(WINDOW_WORDS)),
           outDocs(pool.make_span<int32_t>(WINDOW_SIZE)),
           outScores(pool.make_span<float>(WINDOW_SIZE)),
           constantScore(constantScore) {}
+
+    bool supportsMatchWindows() const override { return true; }
 
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {

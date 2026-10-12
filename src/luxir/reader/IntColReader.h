@@ -343,12 +343,23 @@ private:
   InputStream columnIS;
   NumColumn values;
   const char* zoneMeta = nullptr;
-  const char* leafZoneMeta = nullptr;
+  NumColumnFormat::LeafMeta leaves;
   std::optional<MonoReader> endValueRankReader;  // exists if multi-valued.
   int64_t nvals;
   int32_t docsWithField = 0;
   int64_t columnMin = 0;
   int64_t columnMax = 0;
+
+  // Zone metadata follows the block descriptors: block zones, then the leaf
+  // metadata (NumColumnFormat::LeafMeta). Returns where the bounds trailer
+  // starts.
+  const char* locateZoneMeta(const char* blockMeta) {
+    zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
+    const char* trailer = nullptr;
+    leaves = NumColumnFormat::LeafMeta(
+        zoneMeta + numBlocks() * sizeof(NumBlockZone), nvals, trailer);
+    return trailer;
+  }
 
 public:
   /// The fieldInfo is only used in the constructor and can be discarded after.
@@ -361,13 +372,10 @@ public:
     const char* blocks = columnIS.ptr();
     const char* blockMeta = blocks + fieldInfo.columnMetaOff;
     values = NumColumn(blocks, blockMeta, nvals);
-    zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
-    leafZoneMeta = zoneMeta + numBlocks() * sizeof(NumBlockZone);
+    const char* minMaxPtr = locateZoneMeta(blockMeta);
 
     // Read min/max values that come after the zone arrays
     if (nvals > 0) {
-      const char* minMaxPtr =
-          leafZoneMeta + numLeafZones() * sizeof(NumBlockZone);
       const char* endPtr = columnIS.ptr(0) + columnIS.size();
       columnMin = InputStream::readVlong(minMaxPtr, endPtr);
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
@@ -395,13 +403,10 @@ public:
     const char* blocks = columnIS.ptr();
     const char* blockMeta = blocks + columnMetaOff;
     values = NumColumn(blocks, blockMeta, nvals);
-    zoneMeta = blockMeta + numBlocks() * sizeof(NumBlockInfo);
-    leafZoneMeta = zoneMeta + numBlocks() * sizeof(NumBlockZone);
+    const char* minMaxPtr = locateZoneMeta(blockMeta);
 
     // Read min/max values that come after the zone arrays
     if (nvals > 0) {
-      const char* minMaxPtr =
-          leafZoneMeta + numLeafZones() * sizeof(NumBlockZone);
       const char* endPtr = columnIS.ptr(0) + columnIS.size();
       columnMin = InputStream::readVlong(minMaxPtr, endPtr);
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
@@ -461,16 +466,16 @@ public:
   // Leaf `l` covers value ranks [l * LEAF_ZONE_SIZE,
   // min((l + 1) * LEAF_ZONE_SIZE, numValues)).
   int64_t numLeafZones() const {
-    return (nvals + NumColumnFormat::LEAF_ZONE_SIZE - 1)
-        / NumColumnFormat::LEAF_ZONE_SIZE;
+    return leaves.numLeafZones();
   }
 
-  NumBlockZone leafZone(int64_t leaf) const {
-    assert(leaf >= 0 && leaf < numLeafZones());
-    NumBlockZone zone;
-    memcpy(&zone, leafZoneMeta + leaf * sizeof(zone), sizeof(zone));
-    return zone;
-  }
+  // The leaf zones, the persisted leaf visit orders and the value sketch
+  // as one copyable view (NumColumnFormat::LeafMeta).
+  const NumColumnFormat::LeafMeta& leafMeta() const { return leaves; }
+
+  // Whether the leaf zones bound docs' keys: a dense single-valued column,
+  // where doc == value rank.
+  bool leafBounded() const { return !multiValued() && denseDocsWithValue(); }
 
   int32_t valuesInBlock(int64_t blockNum) const {
     return values.valuesInBlock(blockNum);
@@ -617,6 +622,12 @@ public:
       dense = !col.docs.hasBitset();
     }
 
+    [[gnu::cold]] void reset() {
+      docsIter.reset();
+      docRank = doc = -1;
+      // Value blocks are keyed by ordinal and remain valid across rewinds.
+    }
+
     ValuesImpl& values() {
       return valueIter;
     }
@@ -644,7 +655,7 @@ public:
         } else {
           doc = docRank = target;
         }
-      } else { // Would a sparse-only iterator (so we don't have the dense code in here) improve performance?
+      } else {
         doc = docsIter.advance(target);
         docRank = docsIter.rank();
       }

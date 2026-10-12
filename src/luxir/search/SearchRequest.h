@@ -16,6 +16,7 @@
 #include "luxir/api/build.h"
 #include "luxir/LuxirConfig.h"
 #include "IndexReader.h"
+#include "luxir/index/CommitSnapshot.h"
 #include "FilterCache.h"
 #include "RequestMemTracker.h"
 #include "luxir/schema/Schema.h"
@@ -82,6 +83,9 @@ class SearchRequest {
 
 public:
   std::stop_source waitCancellation{std::nostopstate};
+  // The request's tenant, owned for asynchronous resolution; empty is the
+  // default tenant.
+  std::string tenant;
   std::shared_ptr<Collection> floorCollection;
   SearchEngine& engine;
   const SearchConfig searchConfig;
@@ -262,6 +266,7 @@ public:
     : req(req), arena(arena), mr(&arena), last(last) {
     // echo the request id: non-owning view over the (kept-alive) request bytes, no copy.
     proto.request_id = req.proto.request_id;
+    if (req.reader) proto.commit = api::build::arenaStr(mr, CommitId{std::string(req.reader->incarnation()), req.reader->commitId()}.token());
   }
 
   // Arena allocate a Response wrapper object.

@@ -5,6 +5,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <span>
@@ -13,6 +14,7 @@
 #include "SearchOp.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/search/OrdMap.h"
+#include "luxir/search/SearchOverrides.h"
 
 namespace luxir {
 
@@ -81,134 +83,181 @@ public:
   virtual ~FacetChildExecutor() = default;
 };
 
-// Baseline post-selection binding. The parent supplies the selected buckets
-// and the concrete source that materializes one repeatable domain per segment.
-// SearchOp::createCalculator remains the child-owned binding factory.
-//
-// Execution is deliberately synchronous and segment-at-a-time within an owner
-// block. Each freshly materialized domain reaches all children while it is hot;
-// children that need cross-segment state retain the owned handles through their
-// ordinary calc contract. A null task group keeps submitted work inline so the
-// calculator bindings cannot outlive the executor.
-class FacetBucketDomainExecutor {
+// A producer delivers one segment's domain for every bucket of a block, each
+// exactly once, as feed(index in block, domain). Granularity is the
+// producer's: an independent producer materializes, feeds and drops one domain
+// at a time; a joint column producer builds byte-bounded chunks
+// (feedFacetBucketDomainChunks) and hands each domain over as it feeds it.
+#if defined(__cpp_lib_function_ref) && __cpp_lib_function_ref >= 202306L
+using FacetBucketFeed = std::function_ref<void(size_t, DomainHandle)>;
+#else
+class FacetBucketFeed {
+  void* context;
+  void (*invoke)(void*, size_t, DomainHandle);
+
 public:
-  template <typename Key, typename DomainSource>
-  static void execute(
-      SearchOp::Calculator& parent,
-      std::span<SearchOp* const> children,
-      std::span<const SelectedFacetBucket<Key>> buckets,
-      int32_t numSegments,
-      DomainSource&& materializeDomain) {
-    if (children.empty()) return;
+  template <typename F>
+  explicit FacetBucketFeed(F& callback) noexcept
+      : context(std::addressof(callback)),
+        invoke([](void* context, size_t bucket, DomainHandle domain) {
+          (*static_cast<F*>(context))(bucket, domain);
+        }) {}
 
-    for (const auto& bucket : buckets) {
-      assert(bucket.owner.value >= 0);
-      assert(bucket.output.value >= 0);
-      assert(bucket.output.value < (int32_t)buckets.size());
-
-      std::vector<std::unique_ptr<SearchOp::Calculator>> bindings;
-      bindings.reserve(children.size());
-      for (SearchOp* child : children) {
-        bindings.emplace_back(child->createCalculator(
-            &parent, bucket.output.value, (int64_t)buckets.size()));
-      }
-
-      if (numSegments == 0) {
-        std::span<const DomainHandle> noDomains;
-        for (auto& binding : bindings) {
-          binding->calcAll(nullptr, noDomains);
-        }
-        continue;
-      }
-
-      for (int32_t segment = 0; segment < numSegments; segment++) {
-        DomainHandle domain = materializeDomain(segment, bucket);
-        assert(domain.isDeliverable());
-        for (auto& binding : bindings) {
-          binding->calc(nullptr, segment, domain);
-        }
-      }
-    }
+  void operator()(size_t bucket, DomainHandle domain) const {
+    invoke(context, bucket, domain);
   }
 };
+#endif
 
-// Block bindings by retained child state, then chunk each segment's domain
-// builders by bytes. A column producer scans once per chunk and feeds every
-// child before releasing those domains.
+// How a parent produces one segment's bucket domains for a block. A joint
+// producer builds a chunk's domains in one column pass, so every block repeats
+// that pass; an independent producer builds each domain on its own.
+enum class FacetBucketProducer : uint8_t {
+  INDEPENDENT,
+  JOINT
+};
+
+// Block bindings, then feed each segment's bucket domains to that bucket's
+// children. A bucket's bindings open at its first feed and close after its
+// last, so whatever a completed child holds does not accumulate across the
+// block.
+//
+// The block width trades per-bucket locality for per-segment sharing. A
+// segment pass cycles through the state of every binding in the block, while
+// each extra block repeats the segment work its buckets share: a joint
+// producer's column pass, and the per-segment query state children release
+// after each segment (multiterm expansions). With shared work, only the
+// binding byte budget bounds a block. Without it, the block keeps its
+// bindings' state within CACHE_BYTES, so a heavy child (a nested facet's
+// counts) runs a bucket at a time and keeps its state hot across segments.
 class FacetBucketBlockExecutor {
-  static constexpr size_t BUCKET_BUILDER_FIXED_BYTES = 128;
 public:
-  static constexpr size_t DOMAIN_BYTES = 64 * 1024 * 1024;
   static constexpr size_t BINDING_BYTES = 64 * 1024 * 1024;
+  // A share of a 1 MiB L2: a segment pass also touches the bucket's domain
+  // and the child's column and ord-map decoding.
+  static constexpr size_t CACHE_BYTES = 256 * 1024;
 
-  template <typename Key, typename DomainSource, typename BlockStarted>
+  template <typename Key, typename DomainSource>
   static void execute(
       SearchOp::Calculator& parent, std::span<SearchOp* const> children,
       std::span<const SelectedFacetBucket<Key>> buckets,
-      IndexReader& reader, DomainSource&& bucketDomains,
-      size_t bindingStateBytes, size_t domainBytes,
-      BlockStarted&& blockStarted) {
+      IndexReader& reader, FacetBucketProducer producer,
+      DomainSource&& bucketDomains, size_t bindingStateBytes) {
     if (children.empty() || buckets.empty()) return;
     size_t residentBytesPerBucket = 0;
+    bool sharedSegmentWork = producer == FacetBucketProducer::JOINT;
     for (SearchOp* child : children) {
       residentBytesPerBucket = saturatingAdd(
           residentBytesPerBucket, child->facetBucketResidentBytes());
+      sharedSegmentWork = sharedSegmentWork
+          || child->facetBucketSharesSegmentState();
     }
+    size_t blockBytes = sharedSegmentWork ? bindingStateBytes
+        : std::min(bindingStateBytes, forcedFacetBucketCacheBytes != 0
+              ? forcedFacetBucketCacheBytes : CACHE_BYTES);
     size_t bindingBlockSize = std::max<size_t>(
-        1, bindingStateBytes
-               / std::max<size_t>(1, residentBytesPerBucket));
+        1, blockBytes / std::max<size_t>(1, residentBytesPerBucket));
+    if (forcedFacetBucketBlockBuckets != 0) {
+      bindingBlockSize = forcedFacetBucketBlockBuckets;
+    }
+    auto segments = reader.segments();
 
     for (size_t blockBegin = 0; blockBegin < buckets.size();
          blockBegin += bindingBlockSize) {
-      blockStarted();
+      if (facetBucketBlockCounter != nullptr) (*facetBucketBlockCounter)++;
       size_t blockSize = std::min(
           bindingBlockSize, buckets.size() - blockBegin);
       auto block = std::span<const SelectedFacetBucket<Key>>(buckets)
                        .subspan(blockBegin, blockSize);
 
-      std::vector<std::unique_ptr<SearchOp::Calculator>> bindings;
-      bindings.reserve(blockSize * children.size());
-      for (const auto& bucket : block) {
-        assert(bucket.output.value >= 0);
-        assert(bucket.output.value < (int32_t)buckets.size());
-        for (SearchOp* child : children) {
-          bindings.emplace_back(child->createCalculator(
-              &parent, bucket.output.value, (int64_t)buckets.size()));
+      std::vector<std::unique_ptr<SearchOp::Calculator>> bindings(
+          blockSize * children.size());
+      auto open = [&](size_t bucket) {
+        assert(block[bucket].output.value >= 0);
+        assert(block[bucket].output.value < (int32_t)buckets.size());
+        for (size_t child = 0; child < children.size(); child++) {
+          auto& binding = bindings[bucket * children.size() + child];
+          assert(binding == nullptr);
+          binding.reset(children[child]->createCalculator(
+              &parent, block[bucket].output.value, (int64_t)buckets.size()));
         }
-      }
+      };
+      auto close = [&](size_t bucket) {
+        for (size_t child = 0; child < children.size(); child++) {
+          bindings[bucket * children.size() + child].reset();
+        }
+      };
 
-      if (reader.segments().empty()) {
+      if (segments.empty()) {
         std::span<const DomainHandle> noDomains;
-        for (auto& binding : bindings) {
-          binding->calcAll(nullptr, noDomains);
+        for (size_t bucket = 0; bucket < blockSize; bucket++) {
+          open(bucket);
+          for (size_t child = 0; child < children.size(); child++) {
+            bindings[bucket * children.size() + child]
+                ->calcAll(nullptr, noDomains);
+          }
+          close(bucket);
         }
         continue;
       }
 
-      for (size_t segnum = 0; segnum < reader.segments().size(); segnum++) {
-        int32_t maxDoc = reader.segments()[segnum].maxDoc();
-        size_t builderBytes =
-            (size_t)(((uint64_t)maxDoc + 63) / 64) * 8
-            + BUCKET_BUILDER_FIXED_BYTES;
-        size_t bucketsPerChunk = std::max<size_t>(
-            1, domainBytes / builderBytes);
-        for (size_t chunkBegin = 0; chunkBegin < block.size();
-             chunkBegin += bucketsPerChunk) {
-          size_t chunkSize = std::min(
-              bucketsPerChunk, block.size() - chunkBegin);
-          auto chunk = block.subspan(chunkBegin, chunkSize);
-          std::vector<DomainHandle> domains = bucketDomains(segnum, chunk);
-          for (size_t bucket = 0; bucket < chunkSize; bucket++) {
-            for (size_t child = 0; child < children.size(); child++) {
-              bindings[(chunkBegin + bucket) * children.size() + child]
-                  ->calc(nullptr, (int32_t)segnum, domains[bucket]);
+      for (size_t segnum = 0; segnum < segments.size(); segnum++) {
+        bool first = segnum == 0;
+        bool last = segnum + 1 == segments.size();
+        // Final delivery can synchronously execute all segments of a prepared
+        // binding or its result children. Retain those refills across bindings.
+        auto retained = last ? segments : segments.subspan(segnum, 1);
+        auto release = scope_guard([&]() noexcept {
+          for (auto& segment : retained) {
+            for (auto& binding : bindings) {
+              if (binding != nullptr) binding->releaseSegmentState(segment);
             }
           }
-        }
+        });
+        SearchOp::SegmentStateRetention retain(children, retained);
+        [[maybe_unused]] size_t fed = 0;
+        auto deliver = [&](size_t bucket, DomainHandle domain) {
+          assert(bucket < blockSize);
+          assert(domain.isDeliverable());
+          if (first) open(bucket);
+          for (size_t child = 0; child < children.size(); child++) {
+            bindings[bucket * children.size() + child]
+                ->calc(nullptr, (int32_t)segnum, domain);
+          }
+          if (last) close(bucket);
+          fed++;
+        };
+        bucketDomains(segnum, block, FacetBucketFeed(deliver));
+        assert(fed == blockSize);
       }
     }
   }
 };
+
+// Joint producers build every domain of a chunk in one column pass, so a
+// chunk's builders are alive together. Chunks are bounded by worst-case
+// builder bytes; a block wider than the budget rescans the column per chunk.
+inline constexpr size_t FACET_BUCKET_DOMAIN_BYTES = 64 * 1024 * 1024;
+
+template <typename Key, typename BuildChunk>
+void feedFacetBucketDomainChunks(
+    int32_t maxDoc, std::span<const SelectedFacetBucket<Key>> block,
+    size_t domainBytes, FacetBucketFeed feed, BuildChunk&& buildChunk) {
+  constexpr size_t BUILDER_FIXED_BYTES = 128;
+  size_t builderBytes = (size_t)(((uint64_t)maxDoc + 63) / 64) * 8
+      + BUILDER_FIXED_BYTES;
+  size_t chunkBuckets = std::max<size_t>(1, domainBytes / builderBytes);
+  for (size_t chunkBegin = 0; chunkBegin < block.size();
+       chunkBegin += chunkBuckets) {
+    auto chunk = block.subspan(
+        chunkBegin, std::min(chunkBuckets, block.size() - chunkBegin));
+    std::vector<DomainHandle> domains = buildChunk(chunk);
+    assert(domains.size() == chunk.size());
+    for (size_t i = 0; i < chunk.size(); i++) {
+      feed(chunkBegin + i, std::move(domains[i]));
+    }
+  }
+}
 
 // Values arrive in document order, but a multi-valued column may route the
 // same document to a bucket more than once. Domains contain each document once.

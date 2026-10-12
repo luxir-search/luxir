@@ -34,7 +34,7 @@ A commit makes updates durable and visible to searches. After a crash, Luxir
 reopens the last durable commit. Updates accepted since that commit can be lost.
 
 Use [`luxir pull`](replication.md#copy-restore-or-promote) for an online copy,
-then `--promote` to restore it as a writer under new collection incarnations.
+then `luxir promote` to restore it as a writer under new collection incarnations.
 Do not restore a raw directory copy over an existing writer identity.
 
 ## Read-only nodes
@@ -65,8 +65,11 @@ offline without risking a stray write. Current limitations:
 
 Restart the read-only node to pick up newer commits and release pinned files.
 For a continuously refreshed copy with its own storage, use
-[`--replicate-from http://writer:9400`](replication.md). Followers own their local
-data directory and install verified snapshots without constructing an index writer.
+[`--replicate-from http://writer:9400`](replication.md). Add
+`--replication.tenants alpha,beta` to restrict the subscription; restart to change
+it. Excluded local copies become orphans and can be deleted even while disconnected.
+Followers own their local data directory and install verified snapshots without
+constructing an index writer.
 
 ## Collection lifecycle
 
@@ -85,8 +88,12 @@ executing keep their index view and complete normally.
 Deletion waits for indexing work already accepted, including a running merge,
 so deleting a collection mid-merge can take as long as that merge.
 
-On the filesystem backend collections use `c/<name>/<incarnation>/`, selected
-by an atomically replaced `CURRENT` file in `c/<name>/`. Deletion removes and
+On the filesystem backend collections use
+`t/<tenant>/<name>/<incarnation>/`, selected by an atomically replaced `CURRENT`
+file in `t/<tenant>/<name>/`. Single-tenant deployments use the default tenant
+`t0`, so the default collection lives in `t/t0/main/`. An incarnation is 16 hex
+digits. `t/LAYOUT` names this layout; a data directory written in another layout
+is refused at startup and must be reindexed. Deletion removes and
 syncs `CURRENT` before removing the directory tree, so an interrupted deletion
 cannot reopen the partially deleted index. If
 deletion fails partway (for example an I/O error), the name stays unavailable
@@ -150,13 +157,24 @@ liveness, not a deep read/write check of every collection or storage device.
 Use `GET /_stats` for node-wide operational state or
 `GET /collections/{collection}/_stats` for one collection. The response
 distinguishes writer-visible segments from committed segments and reports
-document counts, generations, merge activity, query-cache counters, and the
-node-wide indexing RAM budget. Per-segment records are omitted by default; add
-`?segments=true` when diagnosing segment layout. A node-wide sample includes
+document counts, generations, merge activity, and query-cache counters.
+Per-segment records are omitted by default; add `?segments=true` when
+diagnosing segment layout. A node-wide sample includes
 load-failure tombstones with their `error` and excludes them from totals. Each
 collection index is sampled coherently, but a node-wide response is not one
 transaction across collections. The same payload is available through unary
 `luxir.Admin/Stats`; omit its collection target for the node-wide view.
+
+`GET /_stats?memory=true` (`StatsRequest.memory`) returns only node memory,
+without walking collections, so it is cheap enough to poll: the indexing RAM
+budget, RAM storage usage, and, when Luxir runs on jemalloc, a `jemalloc`
+block with the allocator's process-wide statistics (allocated, active,
+resident, retained, dirty) and its dedicated indexing and big-buffer arenas.
+It is node-wide, so it is rejected on a collection or tenant route and with
+`segments`. `jemalloc.allocated_bytes` counts live bytes allocated through
+jemalloc; `resident_bytes` is jemalloc's upper bound including fragmentation
+and freed pages awaiting decay; the process RssAnon also counts memory
+jemalloc does not manage.
 
 Counts follow the JSON dialect: a zero-valued field is omitted rather than
 emitted, so a scraper must read an absent field as zero. Totals appear at the
@@ -176,20 +194,20 @@ the response correlates directly with a directory listing: each segment's
 are the sortable strings embedded in filenames (segment `s0a` with `live_gen`
 `01` has its deletes in `s0a__L01`). These strings sort in generation order,
 and an absent field means none. `schema_gen`, `index_gen`, `core_gen`, and
-`update_version` are numeric. The schema and its history are embedded in each `s.olux_<index_gen>` manifest.
+`update_version` are numeric. The schema and its history are embedded in each `commit_<index_gen>` manifest.
 
 Filesystem publication syncs new data files and then the directory before
-writing a new `s.olux_<index_gen>` manifest with a length and xxh3 checksum
+writing a new `commit_<index_gen>` manifest with a length and xxh3 checksum
 footer. It syncs that manifest and then the directory before acknowledging
 the commit. Startup checks the newest manifest's footer and decodes its payload;
 it does not hash data files. Torn candidates are skipped. Fallback candidates
 also require their referenced files to be present with matching sizes.
 
 Once the new root is durable, obsolete manifests and unreferenced data are removed.
-Replication reservation counters are described in the
-[replication reference](replication.md#reference). Every HTTP response has a fixed
-60 s idle deadline per socket write, reset as writes complete. Waiting for a
-query, commit barrier or catalog change does not start a write deadline.
+Replication pin counters are described in the
+[replication reference](replication.md#reference). Replication file transfers have
+a fixed 60 s idle deadline per socket write, reset as writes complete. Ordinary
+HTTP responses have no write deadline.
 
 Writer startup removes leftover unreferenced
 index files using the directory listing, without reading their contents. If
@@ -201,7 +219,9 @@ newest durable manifest does not reference them. Failed publication candidates
 are removed and the directory is synced best-effort. An error response does not
 guarantee that the commit is absent: a crash or cleanup failure can leave a
 complete, unacknowledged candidate recoverable at startup. The local filename is not part
-of the commit identity: clients use the `incarnation:index_gen` token.
+of the commit identity: clients use the `incarnation:index_gen` token. That
+token's manifest is `<incarnation>/commit_<index_gen>`, with the generation in
+decimal; tools that list manifests in order sort by the parsed generation.
 
 Set log verbosity with:
 
@@ -285,6 +305,11 @@ the node unlimited. The resolved values are logged at startup.
   peak RSS: smaller flushes land sooner and cost less at once, at the price of
   more segments to merge.
 
+`--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
+transparent huge pages for whole-huge-page indexing allocations; disable it
+with `--no-indexing.huge-pages` (or `--indexing.huge-pages=false`). This is a
+best-effort hint: a host with THP set to `never` still works using ordinary pages.
+
 The HTTP request limits distinguish bounded material from streams:
 
 ```bash
@@ -357,7 +382,7 @@ features it does not yet supply:
 
 - no automatic failover, leader election, or distributed query execution;
 - no built-in TLS/authentication/authorization;
-- no scheduled backups or automatic restore (use `luxir pull` and `--promote`);
+- no scheduled backups or automatic restore (use `luxir pull` and `luxir promote`);
 - no application-level signal-driven graceful shutdown;
 - pre-1.0 wire and schema interfaces that may change.
 

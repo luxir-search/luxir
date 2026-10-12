@@ -49,7 +49,7 @@ TEST_F(CommitSnapshotTest, slowTransferSurvivesDeletesAndMerge) {
   EXPECT_EQ(bytes, w->snapshots.stats().retainedBytes);
   auto names = pin->files;
   auto inFlight = w->snapshots.openFile(pin->id, names.front().name);
-  w->snapshots.evictOldest();
+  w->snapshots.testEvictOldest();
   EXPECT_EQ(0u, w->snapshots.stats().retainedBytes);
   for (const auto& file : names) EXPECT_EQ(nullptr, w->dir.openFile(file.name));
   auto data = inFlight->read();
@@ -105,7 +105,7 @@ TEST_F(CommitSnapshotTest, idleExpiryIsLazyAndOnlyBytesRenew) {
   EXPECT_EQ(0u, snapshots.stats().pins);
 }
 
-TEST_F(CommitSnapshotTest, reacquireRenewsSharedReservation) {
+TEST_F(CommitSnapshotTest, reacquireRenewsSharedPin) {
   RAMDir dir;
   auto time = CommitSnapshotRegistry::Clock::now();
   CommitSnapshotRegistry snapshots(dir, {}, [&] { return time; });
@@ -133,7 +133,7 @@ TEST_F(CommitSnapshotTest, currentAndSchemaOnlySnapshotsDoNotConsumeBudget) {
   EXPECT_EQ(0u, w->snapshots.stats().budgetDrops);
   EXPECT_EQ(0u, w->snapshots.stats().retainedBytes);
   EXPECT_THROW(w->snapshots.openFile(pin->id, "../write.lock"), ApiError);
-  w->snapshots.evictOldest();
+  w->snapshots.testEvictOldest();
   EXPECT_THROW(w->snapshots.openFile(pin->id, pin->files.front().name), SnapshotExpiredError);
   EXPECT_EQ(1, reader->liveDocs());
 }
@@ -172,7 +172,7 @@ TEST_F(CommitSnapshotTest, writerlessManagerInstallsExplicitSnapshots) {
   EXPECT_EQ(second, readers.getReader()); // a failed install leaves the old view serving
 }
 
-TEST_F(CommitSnapshotTest, restartReclaimsFilesOfLostReservations) {
+TEST_F(CommitSnapshotTest, restartReclaimsFilesOfLostPins) {
   RAMDir persisted;
   {
     LuxirNode node;
@@ -182,7 +182,7 @@ TEST_F(CommitSnapshotTest, restartReclaimsFilesOfLostReservations) {
     auto pin = w->snapshots.acquire();
     ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
     ASSERT_GT(w->snapshots.stats().retainedBytes, 0u);
-    // Capture the real directory before orderly shutdown releases reservations.
+    // Capture the real directory before orderly shutdown releases pins.
     std::vector<Directory::FileInfo> files;
     w->dir.listFiles(files);
     for (const auto& info : files) {
@@ -204,7 +204,7 @@ TEST_F(CommitSnapshotTest, restartReclaimsFilesOfLostReservations) {
   expectValidInventory(persisted, *readDurableIndexInfo(persisted));
 }
 
-TEST_F(CommitSnapshotTest, droppedReservationCannotUnlinkRecreatedCollection) {
+TEST_F(CommitSnapshotTest, droppedPinCannotUnlinkRecreatedCollection) {
   auto path = std::filesystem::temp_directory_path() / "luxir-pin-recreation";
   std::filesystem::remove_all(path);
   auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });
@@ -219,29 +219,29 @@ TEST_F(CommitSnapshotTest, droppedReservationCannotUnlinkRecreatedCollection) {
   auto name = pin->files.front().name;
   ASSERT_TRUE(old.index(flatdoc("id", "merged"), UpdateMessage::COMMIT, false, 1).success);
   std::latch collected(1), resume(1);
-  Signal::listen("snapshotReservationDropped", [&](void* source, void*, void*) -> void* {
+  Signal::listen("snapshotPinDropped", [&](void* source, void*, void*) -> void* {
     if (source == &writer->snapshots) {
       collected.count_down();
       resume.wait();
     }
     return nullptr;
   });
-  auto unlisten = scope_guard([] { Signal::unlisten("snapshotReservationDropped"); });
-  std::thread release([&] { writer->snapshots.evictOldest(); });
+  auto unlisten = scope_guard([] { Signal::unlisten("snapshotPinDropped"); });
+  std::thread release([&] { writer->snapshots.testEvictOldest(); });
   collected.wait();
   node.deleteCollection("main");
   CollectionHelper fresh(node, "main");
   auto result = fresh.index(flatdoc("id", "new"), UpdateMessage::COMMIT);
   resume.count_down();
   release.join();
-  Signal::unlisten("snapshotReservationDropped");
+  Signal::unlisten("snapshotPinDropped");
   ASSERT_TRUE(result.success);
   auto current = fresh.getIndexWriter();
   EXPECT_NE(nullptr, current->dir.openFile(name));
   EXPECT_EQ(1, fresh.collection().getReaderManager().getReader()->liveDocs());
 }
 
-TEST_F(CommitSnapshotTest, twoRequestsShareOneReservation) {
+TEST_F(CommitSnapshotTest, twoRequestsShareOnePin) {
   LuxirNode node;
   CollectionHelper h(node, "main");
   ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
@@ -249,13 +249,13 @@ TEST_F(CommitSnapshotTest, twoRequestsShareOneReservation) {
   auto first = snapshots.acquire();
   auto id = first->id;
   auto name = first->files.front().name;
-  first.reset(); // End of the snapshot request does not release the reservation.
+  first.reset(); // End of the snapshot request does not release the pin.
   auto second = snapshots.acquire();
   EXPECT_EQ(id, second->id);
   EXPECT_EQ(1u, snapshots.stats().pins);
   EXPECT_NE(nullptr, snapshots.openFile(id, name));
   EXPECT_TRUE(snapshots.touch(second->id, 1));
-  snapshots.evictOldest();
+  snapshots.testEvictOldest();
   EXPECT_THROW(snapshots.openFile(second->id, name), SnapshotExpiredError);
 }
 
@@ -267,7 +267,7 @@ TEST_F(CommitSnapshotTest, concurrentBudgetEviction) {
   auto first = snapshots.acquire();
   ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT, false, 1).success);
   std::latch start(2);
-  std::thread release([&] { start.count_down(); start.wait(); snapshots.evictOldest(); });
+  std::thread release([&] { start.count_down(); start.wait(); snapshots.testEvictOldest(); });
   start.count_down();
   start.wait();
   snapshots.setPolicy({60s, 0});
@@ -334,18 +334,7 @@ TEST_F(CommitSnapshotTest, segmentNamesSurviveEmptySnapshotAndRestart) {
   EXPECT_GT(info->segments.front().seg_id, oldSegment);
 }
 
-TEST_F(CommitSnapshotTest, observerFailureDoesNotFailDurablePublication) {
-  LuxirNode node;
-  CollectionHelper h(node, "main");
-  auto writer = h.getIndexWriter();
-  writer->snapshots.onPublish = [](const CommitSnapshot&) { throw std::runtime_error("observer failure"); };
-  auto before = writer->snapshots.snapshot()->id;
-  ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
-  EXPECT_GT(writer->snapshots.snapshot()->id.index_gen, before.index_gen);
-  EXPECT_FALSE(writer->isClosed());
-}
-
-TEST_F(CommitSnapshotTest, storagePressureDropsOldestReservation) {
+TEST_F(CommitSnapshotTest, storagePressureDropsOldestPin) {
   LuxirConfig config; config.store.ram_limit_mb = 2;
   LuxirNode node(config);
   CollectionHelper first(node, "main"), second(node, "other");
@@ -381,7 +370,7 @@ TEST_F(CommitSnapshotTest, storagePressureSkipsOpenTransfersAndCurrent) {
     h->collection().getReaderManager().getReader();
   }
   auto& snapshots = first.collection().getShard()->getSnapshots();
-  snapshots.acquire(); // The current reservation must also survive allocation failure.
+  snapshots.acquire(); // The current pin must also survive allocation failure.
   auto allocate = [&] {
     Directory::FileCreateOptions options; options.expectedSize = 2 * 1024 * 1024 - node.storageBytes() + 1;
     return snapshots.dir.createFile("download", options);

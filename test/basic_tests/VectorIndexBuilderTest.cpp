@@ -681,7 +681,7 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
   ASSERT_NE(desc, pin->files.end());
   EXPECT_EQ(desc->xxh3, XXH3_64bits(bytes.data(), bytes.size()));
   EXPECT_EQ(desc->size, h.getIndexWriter()->snapshots.stats().retainedBytes);
-  h.getIndexWriter()->snapshots.evictOldest();
+  h.getIndexWriter()->snapshots.testEvictOldest();
   EXPECT_EQ(h.getIndexWriter()->dir.openFile(firstFile), nullptr);
 
   auto ids = runKnnIds(h.getSearchEngine(), "embedding_v",

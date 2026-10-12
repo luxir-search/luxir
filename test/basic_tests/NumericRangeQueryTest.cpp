@@ -281,3 +281,92 @@ TEST_F(NumericPredicateQueryTest, int64Extremes) {
   // full span matches all with a value.
   EXPECT_EQ(sorted({"hi", "lo", "mid"}), idsFor(i64Range("num_i", IMIN, IMAX)));
 }
+
+// What a query requires of one numeric field: MUST and FILTER clauses
+// intersect, optional and prohibited clauses require nothing, wrappers
+// delegate, an exact set spans its first and last values, a range on another
+// field or a non-numeric clause claims nothing, and disjoint requirements
+// intersect to an empty envelope. Built ranges carry the folded inclusive
+// encoded bounds (exclusive ends folded, FLOAT as sortable bits).
+TEST(NumericPredicateEnvelope, requiredValueEnvelopeComposes) {
+  using Envelope = Query::ValueEnvelope;
+  auto schema = Schema::createDefaultSchema();
+  MemPool pool;
+  QueryBuilder builder(pool, *schema, CoerceContext{});
+  auto range = [&](std::string_view field, int64_t lo, int64_t hi) -> Query* {
+    return pool.make<NumericPredicateQuery>(field, lo, hi);
+  };
+  auto clauses = [&](std::initializer_list<Query*> list) {
+    auto span = pool.make_span<Query*>(list.size());
+    std::copy(list.begin(), list.end(), span.begin());
+    return span;
+  };
+  auto boolean = [&](std::initializer_list<Query*> must,
+                     std::initializer_list<Query*> should,
+                     std::initializer_list<Query*> mustNot,
+                     std::initializer_list<Query*> filter,
+                     int minShouldMatch = 0) -> Query* {
+    return pool.make<BooleanQuery>(clauses(must), clauses(should),
+                                   clauses(mustNot), clauses(filter),
+                                   minShouldMatch);
+  };
+  auto envelope = [](Query* query) {
+    return query->requiredValueEnvelope("n_i");
+  };
+  auto is = [](std::optional<Envelope> got, int64_t lo, int64_t hi) {
+    return got.has_value() && got->lo == lo && got->hi == hi;
+  };
+  Query* term = pool.make<TermQuery>("text_w", "red");
+
+  EXPECT_TRUE(is(envelope(range("n_i", 10, 20)), 10, 20));
+  EXPECT_FALSE(envelope(range("other_i", 10, 20)).has_value());
+  EXPECT_FALSE(envelope(term).has_value());
+  int64_t values[] = {3, 7, 9};
+  PointsReader::ValueRange intervals[] = {{3, 3}, {7, 7}, {9, 9}};
+  EXPECT_TRUE(is(envelope(pool.make<NumericPredicateQuery>(
+                     "n_i", std::span<const int64_t>(values),
+                     std::span<const PointsReader::ValueRange>(intervals))),
+                 3, 9));
+
+  // MUST and FILTER intersect, through nesting and wrappers.
+  EXPECT_TRUE(is(envelope(boolean({term, range("n_i", 0, 50)}, {}, {},
+                                  {range("n_i", 10, 100)})),
+                 10, 50));
+  Query* nested = boolean(
+      {pool.make<BoostQuery>(boolean({range("n_i", 5, 40)}, {}, {}, {}), 2.0f)},
+      {}, {}, {pool.make<ConstantScoreQuery>(range("n_i", 20, 60))});
+  EXPECT_TRUE(is(envelope(nested), 20, 40));
+  // A range on another field leaves the envelope alone.
+  EXPECT_TRUE(is(envelope(boolean({range("n_i", 0, 50)}, {}, {},
+                                  {range("other_i", 60, 70)})),
+                 0, 50));
+  // Optional (even required by minShouldMatch) and prohibited clauses do not
+  // restrict the field.
+  EXPECT_FALSE(envelope(boolean({}, {range("n_i", 0, 5)}, {}, {})).has_value());
+  EXPECT_FALSE(envelope(boolean({term}, {range("n_i", 0, 5)}, {}, {}, 1))
+                   .has_value());
+  EXPECT_FALSE(envelope(boolean({term}, {}, {range("n_i", 0, 5)}, {}))
+                   .has_value());
+  EXPECT_TRUE(is(envelope(boolean({term, range("n_i", 0, 50)},
+                                  {range("n_i", 0, 5)},
+                                  {range("n_i", 10, 20)}, {})),
+                 0, 50));
+  // Disjoint requirements: the query matches nothing.
+  auto empty = envelope(boolean({range("n_i", 0, 10)}, {}, {},
+                                {range("n_i", 20, 30)}));
+  ASSERT_TRUE(empty.has_value());
+  EXPECT_TRUE(empty->empty());
+
+  // Built ranges: exclusive bounds fold to the inclusive encoded envelope.
+  api::Val five; five.kind = (int64_t)5;
+  api::Val ten; ten.kind = (int64_t)10;
+  EXPECT_TRUE(is(envelope(builder.createRangeQuery(
+                     "n_i", nullptr, &five, nullptr, &ten)),
+                 6, 9));
+  api::Val low; low.kind = -1.5;
+  api::Val high; high.kind = 2.5;
+  auto floats = builder.createRangeQuery("p_f", &low, nullptr, &high, nullptr)
+                    ->requiredValueEnvelope("p_f");
+  EXPECT_TRUE(is(floats, (int64_t)floatToSortableInt32(-1.5f),
+                 (int64_t)floatToSortableInt32(2.5f)));
+}

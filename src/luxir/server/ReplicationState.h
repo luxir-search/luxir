@@ -4,13 +4,14 @@
 
 #include <glaze/glaze.hpp>
 #include "luxir/store/Directory.h"
+#include "luxir/store/CollectionId.h"
 
 namespace luxir {
 
 // Node-local follower identity and discovery history. CURRENT only selects data.
 struct ReplicationState {
   struct Collection {
-    std::string source;
+    std::string advertised;
     std::string boot;
     bool replace_empty = true;
     // Durable promotion target, recorded before switching CURRENT. A restart
@@ -19,11 +20,14 @@ struct ReplicationState {
   };
   std::string source;
   std::string follower;
-  std::map<std::string, Collection> collections;
+  std::map<std::string, std::map<std::string, Collection>> tenants;
+
+  Collection& collection(const CollectionId& id) { return tenants[id.tenant][id.name]; }
 
   static ReplicationState read(InputFile& file) {
     ReplicationState state;
-    if (glz::read_json(state, file.read()) || state.follower.empty() || state.follower.size() > 255)
+    std::string text(file.read()); // the parser reads up to a terminator
+    if (glz::read_json(state, text) || state.follower.empty() || state.follower.size() > 255)
       throw std::runtime_error("Invalid follower state");
     return state;
   }

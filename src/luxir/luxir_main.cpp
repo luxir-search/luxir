@@ -5,13 +5,9 @@
 #include <optional>
 #include <sstream>
 #include <thread>
-#include <climits>
-#ifdef __GLIBC__
-#include <malloc.h>
-#endif
 #include "luxir/luxir_main.h"
-#include "luxir/util/MappedAlloc.h"
-#include "luxir/util/MemPool.h"
+#include "luxir/server/Promotion.h"
+#include "luxir/util/ProcessAllocator.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/HttpServer.h"
@@ -32,6 +28,8 @@ int luxir_main(int argc, char** argv) {
   auto* pull = app.add_subcommand("pull", "Copy current source snapshots to a follower data directory");
   pull->add_option("source", config.replication.source, "HTTP source URL")->required();
   pull->add_option("dir", config.store.data_dir, "Destination data directory")->required();
+  auto* promote = app.add_subcommand("promote", "Make a stopped follower data directory an independent writer");
+  promote->add_option("dir", config.store.data_dir, "Follower data directory")->required();
 
   try {
     app.parse(argc, argv);
@@ -43,27 +41,19 @@ int luxir_main(int argc, char** argv) {
       std::cerr << "pull requires nonempty source and directory arguments\n";
       return 1;
     }
-    if (config.read_only || config.promote) {
-      std::cerr << "pull cannot be combined with --read-only or --promote\n";
+    if (config.read_only) {
+      std::cerr << "pull cannot be combined with --read-only\n";
       return 1;
     }
     config.store.backend = "fs";
     if (!app.get_option("--log-level")->count()) config.log_level = "warn";
+  } else if (*promote) {
+    if (config.store.data_dir.empty() || config.read_only || !config.replication.source.empty()) {
+      std::cerr << "promote takes a nonempty directory, without --read-only or --replicate-from\n";
+      return 1;
+    }
+    if (!app.get_option("--log-level")->count()) config.log_level = "warn";
   } else std::cout << luxir_banner() << std::endl;
-
-#ifdef __GLIBC__
-  // An explicit mallopt permanently disables glibc's dynamic mmap-threshold
-  // ratchet (freeing an mmap'd chunk raises the threshold to its size, up to
-  // 32M, after which mid-size allocations are arena-retained on free and
-  // cross-thread frees serialize on arena mutexes).  See the config comment
-  // for the tradeoff; 0 leaves glibc untouched.
-  if (config.malloc_mmap_threshold != 0) {
-    int64_t t = config.malloc_mmap_threshold < 0 ? (int64_t)MemPool::BYTE_BLOCK_SIZE
-                                                 : config.malloc_mmap_threshold;
-    mappedAllocationFloor = (size_t)t;
-    mallopt(M_MMAP_THRESHOLD, (int)std::min(t, (int64_t)INT_MAX));
-  }
-#endif
 
   try {
     config.normalize();
@@ -79,6 +69,15 @@ int luxir_main(int argc, char** argv) {
       return node.getFollower()->pull(std::cout) ? 0 : 1;
     } catch (const std::exception& e) {
       std::cerr << "Pull failed: " << e.what() << '\n';
+      return 1;
+    }
+  }
+
+  if (*promote) {
+    try {
+      return luxir::promote(config.store.data_dir, std::cout) ? 0 : 1;
+    } catch (const std::exception& e) {
+      std::cerr << "Promote failed: " << e.what() << '\n';
       return 1;
     }
   }
@@ -154,7 +153,8 @@ std::string luxir_banner() {
 #endif
 
   ss << std::endl;
-  ss << "\thw_threads=" << std::thread::hardware_concurrency();
+  ss << "\tallocator=" << allocatorName();
+  ss << " hw_threads=" << std::thread::hardware_concurrency();
   ss << " cwd=" << fs::current_path();
   ss << " tmp=" << fs::temp_directory_path();
 

@@ -60,8 +60,11 @@ public:
 
     bool merging = false;     // set to true when a merge is in progress with this segment as input.
 
-    // atomic shared pointer since it could be set / mutated by either the IW (setting or clearing),
-    // or by IndexReader opening code.
+    // The segment's open PostingsReader once the writer needed one (deletes, a merge, an overlay
+    // build); kept until the segment is retired. Shared both ways with readers: filled from the
+    // published IndexReader when that holds the segment, and handed to readers that open a
+    // snapshot this writer published (CommitSnapshot::openReaders). Atomic: commit and merge
+    // threads fill it without a lock (IndexWriter::getSegmentPostingsReader).
     AtomicSharedPtr<PostingsReader> sharedPostingsReader = nullptr;
 
     // Schema generation this segment was indexed under.
@@ -291,6 +294,7 @@ public:
   std::atomic_uint64_t lastSegId;
 
   CommitSnapshotRegistry& snapshots;
+  CommitId openingCommit; // Captured before this writer becomes externally visible.
   AtomicSharedPtr<const CommitSnapshot> lastSnapshot;
 
   std::unique_ptr<MergePolicy> mergePolicy;
@@ -527,8 +531,9 @@ public:
   Inverter& obtainInverter(uint64_t updateVersion = 0, std::shared_ptr<Schema> pinned = {});
 
   // Publish over the last physical snapshot without waiting for commit preparation.
+  const CommitId& initialCommit() const { return openingCommit; }
   void setSchema(std::shared_ptr<Schema> schema);
-  std::shared_ptr<Schema> updateSchema(std::function<std::shared_ptr<Schema>(const Schema*)> change);
+  std::shared_ptr<const CommitSnapshot> updateSchema(std::function<std::shared_ptr<Schema>(const Schema*)> change);
   std::shared_ptr<Schema> getSchema() const { return lastSnapshot.load()->schema; }
 
   // Releases an inverter back to the pool.
@@ -677,6 +682,10 @@ private:
   void buildSegmentOverlays(const UpdateMessage& msg,
                             std::span<SegInfo*> segsToKeep,
                             std::vector<std::string>& outFilesToSync);
+  // The published reader's copy of `seg`, or null; `reader` keeps it valid.
+  const Segment* publishedSegment(const SegInfo& seg, std::shared_ptr<IndexReader>& reader);
+  // The segment's PostingsReader: its slot's, else the published reader's, else a new one; the
+  // slot keeps it.
   std::shared_ptr<PostingsReader> getSegmentPostingsReader(SegInfo& seg);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
@@ -691,7 +700,7 @@ private:
       std::vector<std::string>& outFiles);
   void deleteStagedOverlayFiles(std::span<const std::string> files,
                                 std::string_view context) noexcept;
-  // Release writer ownership; reservations can retain the retired files.
+  // Release writer ownership; snapshot pins can retain the retired files.
   void tryDeleteSegments();
   void moveSegmentToDelete(uint64_t segId);
   void applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData);

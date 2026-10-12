@@ -42,6 +42,11 @@ public:
         lastDoc(segment.postingsReader().maxDoc() - 1) {
     }
 
+    [[gnu::cold]] void reset() override {
+      docid = -1;
+      lastDoc = segment.maxDoc() - 1;
+    }
+
     int32_t next() override {
       if (docid >= lastDoc) {
         docid = PostingsReader::END;
@@ -63,6 +68,11 @@ public:
     }
 
     void exhaust() override { lastDoc = -1; }
+
+    void fillScoredWindowBits(std::span<uint64_t> words,
+                              int32_t start, int32_t end) override {
+      fillWindowBits(words, start, end);
+    }
 
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {
@@ -98,6 +108,7 @@ public:
     // The test control is supplier-fixed so resolve and its later build cannot
     // observe different global values.
     bool denseClause;
+    bool needsScores;
 
     class Plan final : public Query::ScorerPlan {
       Supplier& supplier;
@@ -115,6 +126,10 @@ public:
       }
 
     public:
+      [[gnu::cold]] bool supportsReset() const noexcept override {
+        return unscoredResetUse() && !supplier.needsScores;
+      }
+
       Plan(Supplier& supplier, const Query::PlanContext& planContext,
            const Query::ScorerShape& shape, int64_t cost)
         : Query::ScorerPlan(planContext, shape, cost),
@@ -122,11 +137,17 @@ public:
     };
 
   public:
-    Supplier(luxir::IndexReader::Segment& segment, float score)
+    Supplier(luxir::IndexReader::Segment& segment, float score, bool needsScores)
       : segment(segment), score(score),
-        denseClause(!disableDenseClauseForTests) {}
+        denseClause(!disableDenseClauseForTests), needsScores(needsScores) {}
 
     int64_t cost() override { return segment.maxDoc(); }
+
+    MembershipWork membershipWork(int32_t maxDoc) override {
+      unused(maxDoc);
+      double matches = (double)cost();
+      return {matches, 4 * matches, 0, 32, 64};
+    }
 
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
@@ -155,7 +176,6 @@ public:
 
     BulkPlan planBulk(
         BulkUse use, const BulkScorerContext& bulkContext) override {
-      unused(use);
       if (bulkContext.requireConstantCount) {
         if (segment.liveDocs() != nullptr) {
           return {
@@ -169,12 +189,16 @@ public:
         };
       }
       bool available = !bulkContext.requireFilterConsumption;
-      return {
+      BulkPlan plan{
         available ? BulkAnswer::YES : BulkAnswer::NO,
         available ? BulkAnswer::YES : BulkAnswer::NO,
         BulkAnswer::NO,
         BulkAnswer::NO,
       };
+      if (available && !needsScores && isMembershipWindowUse(use)) {
+        plan.statelessReposition = BulkAnswer::YES;
+      }
+      return plan;
     }
 
     // The null-source form of DocSetBulkScorer: all docs in [0, maxDoc), so
@@ -202,7 +226,7 @@ public:
         MemPool& targetPool, luxir::IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {
       unused(executionMode);
-      return targetPool.make<AllQuery::Supplier>(segment, score);
+      return targetPool.make<AllQuery::Supplier>(segment, score, needsScores());
     }
 
     AllQuery::Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {

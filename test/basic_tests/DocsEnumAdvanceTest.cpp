@@ -1086,6 +1086,45 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleWordBlockStaysResidentAcrossWindow
   SkipStats::reset();
 }
 
+// A window ending inside a word block leaves it resident. When the next
+// window opens many blocks later, the finished resident block is the same
+// boundary intoBitSet's entry check jumps from: skip data reaches the window
+// instead of streaming every block of the gap.
+TEST_F(DocsEnumAdvanceTest, intoBitSetJumpsGapAfterResidentWordBlock) {
+  const std::vector<int32_t> docs = makeWordProbeDocs(64);
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "wordgap", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("wordgap"));
+
+  DocsOnlyEnum denum(tenum);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+
+  std::vector<int32_t> got;
+  int32_t firstEnd = docs[(size_t) Postings::DOCS_BLOCK_SIZE + 7];
+  appendIntoBitSetWindow(denum, docs, 0, firstEnd, got);
+  int32_t far = docs[(size_t) 48 * Postings::DOCS_BLOCK_SIZE + 3];
+  int32_t farEnd = docs[(size_t) 48 * Postings::DOCS_BLOCK_SIZE + 40];
+  SkipStats::reset();
+  appendIntoBitSetWindow(denum, docs, far, farEnd, got);
+  std::vector<int32_t> expected = modelWindow(docs, 0, firstEnd);
+  std::vector<int32_t> farDocs = modelWindow(docs, far, farEnd);
+  expected.insert(expected.end(), farDocs.begin(), farDocs.end());
+  EXPECT_EQ(got, expected);
+  EXPECT_LE(SkipStats::countBulkFillWordBlocks, 3);
+  SkipStats::enabled = savedStats;
+  SkipStats::reset();
+}
+
 TEST_F(DocsEnumAdvanceTest, intoBitSetFirstStraddleWithNoEmitDoesNotConsume) {
   std::vector<int32_t> docs;
   docs.reserve((size_t) Postings::DOCS_BLOCK_SIZE);

@@ -115,6 +115,14 @@ public:
     return !bounded || retain != 0;
   }
 
+  // Once the bounded page is full, the retained candidate a newcomer must be
+  // better than to enter it; null while the page can still grow or when it is
+  // unbounded.
+  const Candidate* worst() const {
+    return bounded && retain != 0 && regular.size() == retain
+        ? &regular.front() : nullptr;
+  }
+
   std::vector<Final> finish() {
     std::sort(regular.begin(), regular.end(), better);
     size_t begin = std::min(offset, regular.size());
@@ -173,6 +181,11 @@ void mergePinnedBuckets(
   }
 }
 
+// TODO: callers of these vector-taking wrappers (the int facet and the
+// non-ordinal string facet in FacetOp.h) first build one candidate per counted
+// value, which on a high-cardinality field is tens of MB per request to return
+// one page. Stream their counters into FieldBucketFinalizer as
+// StrFacetOp::OrdCountSink does, then delete both wrappers.
 template<typename Key, typename Payload, typename Better>
 std::vector<FinalizedFacetBucket<Key, Payload>> finalizeFieldBuckets(
     std::vector<FacetCandidate<Key, Payload>> candidates,

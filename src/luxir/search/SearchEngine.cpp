@@ -5,7 +5,7 @@
 #include "luxir/api/padded_input.h"
 
 #include "SearchEngine.h"
-#include "luxir/server/ReplicationCatalog.h"
+#include "luxir/server/CommitWaits.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
 
@@ -30,7 +30,7 @@ RootOp* SearchEngine::prepare(SearchRequest& req) {
   return parser.parse();
 }
 
-std::vector<std::string> SearchEngine::explain(const ReqProto& proto) {
+std::vector<std::string> SearchEngine::explain(const ReqProto& proto, std::string tenant) {
   class ExplainRequest final : public SearchRequest {
   public:
     using SearchRequest::SearchRequest;
@@ -49,6 +49,7 @@ std::vector<std::string> SearchEngine::explain(const ReqProto& proto) {
   google::protobuf::Arena arena;
   auto* req = arenaCreate<ExplainRequest>(arena, *this, copy, arena);
   req->maxParallel = proto.max_parallel;
+  req->tenant = std::move(tenant);
   req->resolvedFields = &notes;
   prepare(*req);
   return notes;
@@ -60,8 +61,9 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // Once execution is under way it is the engine's.  Throw sites that know
   // better say so with an ApiError, which classifies itself in either phase.
   ErrorKind fallback = ErrorKind::INVALID_REQUEST;
+  RootOp* root = nullptr;
   try {
-    auto* root = prepare(req);
+    root = prepare(req);
     root->init();
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
@@ -93,6 +95,10 @@ void SearchEngine::submitBody(SearchRequest& req) {
     req.setError(info);
   }
 
+  if (root != nullptr) {
+    for (auto& segment : req.reader->segments()) root->releaseSegmentState(segment);
+  }
+
   // Profile slots are written only by segment tasks. Materialize the shared
   // wire view after those tasks have drained (including the error path above).
   req.fillExecutionProfile(*req.lastResponse);
@@ -117,41 +123,17 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
   if (!req.proto.min_commit.empty()) {
     try {
       auto floor = CommitId::parse(req.proto.min_commit);
-      auto error = std::make_shared<std::optional<ErrorInfo>>();
-      using Event = ReplicationCatalog::Event;
-      auto ready = [this, &req, floor, error](Event event) {
-        if (event == Event::CANCELLED || (event == Event::REMOVED && !node.following())) {
-          *error = ErrorInfo{ErrorKind::UNAVAILABLE, "stale_replica", "search floor wait cancelled or collection deleted"};
-          return true;
-        }
-        try {
-          auto collection = node.resolveCollection(req.proto.collection);
-          auto snapshot = collection->getShard()->getSnapshots().snapshot();
-          if (snapshot && snapshot->id.incarnation != floor.incarnation) {
-            if (!node.following() || event == Event::DEADLINE) {
-              *error = ErrorInfo{ErrorKind::FAILED_PRECONDITION, "commit_incarnation_mismatch", "min_commit belongs to a different collection incarnation"};
-              return true;
-            }
-          } else if (snapshot && snapshot->id.index_gen >= floor.index_gen) {
-            req.floorCollection = std::move(collection);
-            return true;
-          }
-        } catch (const CollectionNotFoundError&) {}
-        catch (const std::exception& e) { *error = classifyException(e, ErrorKind::INTERNAL); return true; }
-        if (event != Event::DEADLINE) return false;
-        *error = ErrorInfo{ErrorKind::UNAVAILABLE, "stale_replica", "min_commit was not available before min_commit_timeout_ms"};
-        return true;
-      };
-      auto collection = req.proto.collection.empty() ? std::string(LuxirNode::kDefaultCollectionName) : std::string(req.proto.collection);
-      bool immediate = node.getReplication().await(std::move(collection), std::move(ready),
-          [this, &req, error, maxParallel] {
-            node.getTaskArena().enqueue([this, &req, error, maxParallel] {
-              if (*error) { req.setError(**error); req.bodyDone(); }
-              else submit(req, maxParallel);
+      auto collection = LuxirNode::target(req.tenant, req.proto.collection);
+      auto& waits = node.getCommitWaits();
+      waits.awaitCommit(std::move(collection), std::move(floor),
+          waits.deadlineAfter(req.proto.min_commit_timeout_ms.value_or(30000)), req.waitCancellation.get_token(),
+          [this, &req, maxParallel](CommitWaits::CommitResult result) {
+            node.getTaskArena().enqueue([this, &req, maxParallel, result = std::move(result)] {
+              if (result.error) { req.setError(*result.error); req.bodyDone(); }
+              else { req.floorCollection = result.collection; submit(req, maxParallel); }
             });
-          }, req.proto.min_commit_timeout_ms.value_or(30000), req.waitCancellation.get_token());
-      if (!immediate) return;
-      if (*error) { req.setError(**error); req.bodyDone(); return; }
+          });
+      return;
 
     } catch (const std::exception& e) {
       req.setError(classifyException(e, ErrorKind::INVALID_REQUEST));
@@ -188,7 +170,7 @@ void SearchEngine::getResources(SearchRequest& req) {
   // look up the correct index reader and the associated schema
   auto& request = req.proto;
   auto& node = req.engine.node;
-  auto collection = req.floorCollection ? req.floorCollection : node.resolveCollection(request.collection);
+  auto collection = req.floorCollection ? req.floorCollection : node.getCollection(LuxirNode::target(req.tenant, request.collection));
 
   // get the index reader
   // The API freshness tolerance is milliseconds; the reader clock domain is

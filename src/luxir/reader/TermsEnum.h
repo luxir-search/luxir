@@ -13,6 +13,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -999,16 +1000,43 @@ protected:
     }
   }
 
+  // Loads the term block holding 0-based targetOrd, positioned on its first
+  // term.
+  void seekBlockOf(int64_t targetOrd) {
+    const TermRangeRow* selected = rowForTerm(targetOrd);
+    termBlockIndex = (int32_t) ((int64_t) selected->firstBlockOrd
+        + (targetOrd - (int64_t) selected->firstTermOrd) / Postings::TERMS_BLOCK_SIZE);
+    readTermBlock();
+  }
+
 public:
+  struct DocFreqBlock {
+    int64_t firstOrd;  // 0-based ord of docFreqs[0]
+    std::span<const uint32_t> docFreqs;
+  };
+
+  // The docFreqs of the whole term block holding 0-based targetOrd. Stats are
+  // bulk-decoded once per block and no term bytes are rebuilt, so a walk over
+  // consecutive blocks in either direction costs one decode per block. The
+  // enum stays on a term of that block (its first, after a block load), so
+  // seekOrd and nextTerm work as usual afterwards. The span is valid until
+  // the enum moves to another block.
+  DocFreqBlock docFreqBlock(int64_t targetOrd) {
+    assert(targetOrd >= 0 && targetOrd < fieldInfo.nTerms);
+    if (targetOrd < startingOrd || targetOrd > startingOrd + maxOrdInBlock) {
+      seekBlockOf(targetOrd);
+    }
+    decodeStats();
+    return {startingOrd, std::span<const uint32_t>(
+        docFreqs.data(), (size_t) maxOrdInBlock + 1)};
+  }
+
   // 0-based ords
   void seekOrd(int64_t targetOrd) {
     assert(targetOrd >= 0 && targetOrd < fieldInfo.nTerms);
     if (targetOrd < ord() || targetOrd > startingOrd + maxOrdInBlock) {
       // even if we were in the right block, we don't have the capability to go backwards or rewind
-      const TermRangeRow* selected = rowForTerm(targetOrd);
-      termBlockIndex = (int32_t) ((int64_t) selected->firstBlockOrd
-          + (targetOrd - (int64_t) selected->firstTermOrd) / Postings::TERMS_BLOCK_SIZE);
-      readTermBlock();
+      seekBlockOf(targetOrd);
     }
     while (ord() < targetOrd) {
       // nextTerm();

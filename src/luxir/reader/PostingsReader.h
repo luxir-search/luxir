@@ -3,8 +3,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <limits>
+#include <optional>
+#include <string>
+#include <string_view>
 #include <vector>
+#include "luxir/codec/NumColumnFormat.h"
 #include "luxir/store/Directory.h"
 #include "luxir/store/InputStream.h"
 
@@ -18,7 +23,9 @@ class DocsEnum;
 
 // Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
 // PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
-// This does not contain deleted docs, so instances can be shared by different index versions.
+// This does not contain deleted docs, so one instance serves every index snapshot that holds the segment
+// (IndexReader::openSnapshot shares it from the writer or the previous snapshot, and the writer from
+// the published snapshot), and with it the views derived from the segment's bytes that it caches.
 class PostingsReader {
   // Indexed by physical filenum and intentionally sparse. Segment finalize
   // folds buffered streams without renaming survivors, which keeps already
@@ -27,6 +34,20 @@ class PostingsReader {
   std::vector<InputStream> inputStreams;
   int64_t segInfoOffset;  // after this is segInfo, before this is the field index
   int32_t maxdoc;
+
+  // Numeric columns' leaf metadata, by field, read on first use. The views
+  // point into the files this reader maps, so they live exactly as long as
+  // the mappings. Append-only and lock-free: a lookup is an acquire load and
+  // a walk over the few fields ever asked for; a racing build is identical
+  // and the loser's node is discarded.
+  struct LeafMetaNode {
+    std::string field;
+    std::optional<NumColumnFormat::LeafMeta> meta;
+    LeafMetaNode* next;
+  };
+  std::atomic<LeafMetaNode*> leafMetas{nullptr};
+
+  std::optional<NumColumnFormat::LeafMeta> readLeafMeta(std::string_view field);
 public:
 
   // used as a sentinel value for docs and positions iterators in a single segment.
@@ -53,6 +74,9 @@ public:
   static std::shared_ptr<PostingsReader> create(Directory& dir, uint64_t segId, bool missingFileOK = false, bool expectSynced = false);
 
   explicit PostingsReader(Directory& dir, uint64_t segId);
+  ~PostingsReader();
+  PostingsReader(const PostingsReader&) = delete;
+  PostingsReader& operator=(const PostingsReader&) = delete;
 
 private:
   // Private default constructor for factory method
@@ -66,6 +90,15 @@ public:
   int32_t maxDoc() const noexcept {
     return maxdoc;
   }
+
+  // Numeric column `field`'s leaf metadata (NumColumnFormat::LeafMeta: leaf
+  // zones, persisted bound orders and value sketch), or null where this
+  // segment has no such column or its leaves do not bound docs' keys
+  // (IntColReader::leafBounded). Read once per segment, not per request:
+  // field-sort planning reads every segment's, which on many small segments
+  // otherwise costs as much as the collection. `field` must sort by an int
+  // column (FieldType::sortsByIntColumn). Valid while this reader lives.
+  const NumColumnFormat::LeafMeta* numericLeafMeta(std::string_view field);
 
   // Total bytes in the physical base-segment files this reader can merge.
   uint64_t sizeInBytes() const noexcept {

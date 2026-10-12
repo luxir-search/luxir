@@ -79,10 +79,10 @@ struct ColFloat; struct ColDouble; struct AnalyzerComponent; struct AnalyzerDef;
 struct FieldVariants; struct FieldDefaults; struct NormalizerDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
-struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse;
+struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
-struct QueryCacheStats; struct IndexRamStats;
+struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct MemoryStats;
 struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
@@ -146,13 +146,21 @@ struct PhraseQuery {
   int32_t slop = 0;
   std::span<const std::int32_t> positions;
 };
+struct AllReplicas {};
+struct ReplicaRequirement { std::variant<std::monostate, uint32_t, AllReplicas> kind; };
+struct WaitForReplicasRequest {
+  std::string_view collection;
+  std::string_view commit;
+  std::optional<ReplicaRequirement> wait_for_replicas;
+  std::optional<uint64_t> wait_for_replicas_timeout_ms;
+};
 struct CommitParams {
   uint64_t commit_within_ms = 0;
   std::span<const std::string_view> build_aux_indexes;
   bool wait_for_merges = false;
   uint32_t max_segments = 0;
-  std::string_view wait_for_replicas;
-  std::optional<uint64_t> replication_timeout_ms;
+  std::optional<ReplicaRequirement> wait_for_replicas;
+  std::optional<uint64_t> wait_for_replicas_timeout_ms;
 };
 
 struct Error {
@@ -166,15 +174,23 @@ namespace UpdateResponse_ {
 struct DocError { std::string_view id; std::optional<Error> error; int32_t index = 0; };
 } // namespace UpdateResponse_
 
+namespace ReplicaResult_ { enum class Outcome { SATISFIED = 0, TIMED_OUT = 1, CANCELLED = 2 }; }
 struct ReplicaResult {
+  using Outcome = ReplicaResult_::Outcome;
   std::optional<uint32_t> wanted;
   std::optional<uint32_t> serving;
-  std::optional<bool> timed_out;
+  std::optional<Outcome> outcome;
+};
+
+struct WaitForReplicasResponse {
+  std::string_view commit;
+  std::optional<ReplicaResult> replicas;
 };
 
 struct CollectionCommit {
   std::string_view commit;
   std::optional<ReplicaResult> replicas;
+  std::optional<Error> error;
 };
 
 struct UpdateResponse {
@@ -271,7 +287,31 @@ struct QueryCacheStats {
   bool enabled = false;
 };
 struct StorageRamStats { uint64_t used_bytes = 0; uint64_t limit_bytes = 0; };
-struct IndexRamStats { uint64_t limit_bytes = 0; uint64_t reserved_bytes = 0; };
+struct IndexRamStats {
+  uint64_t limit_bytes = 0;
+  uint64_t reserved_bytes = 0;
+};
+struct ArenaStats {
+  uint64_t allocated_bytes = 0;
+  uint64_t resident_bytes = 0;
+};
+struct JemallocStats {
+  std::string_view version;
+  uint64_t allocated_bytes = 0;
+  uint64_t active_bytes = 0;
+  uint64_t metadata_bytes = 0;
+  uint64_t resident_bytes = 0;
+  uint64_t mapped_bytes = 0;
+  uint64_t retained_bytes = 0;
+  uint64_t dirty_bytes = 0;
+  ArenaStats indexing;
+  ArenaStats big_buffer;
+};
+struct MemoryStats {
+  IndexRamStats indexing_budget;
+  StorageRamStats storage_ram;
+  std::optional<JemallocStats> jemalloc;
+};
 struct StatsTotals {
   uint64_t collections = 0;
   uint64_t shards = 0;
@@ -321,31 +361,54 @@ struct ShardStats {
 struct CollectionStats {
   uint64_t storage_ram_bytes = 0;
   std::string_view name;
+  std::string_view tenant;
   StatsTotals totals;
   uint64_t schema_gen = 0;
   std::span<const ShardStats> shards;
   std::optional<Error> error;
 };
-struct StatsRequest { std::string_view collection; bool segments = false; };
-struct FollowerStats {
+struct StatsRequest { std::string_view collection; std::string_view tenant; bool segments = false; bool memory = false; };
+struct FollowerStatus {
   std::string_view follower;
+  std::string_view tenant;
   std::string_view collection;
   std::string_view commit;
   uint64_t last_seen = 0;
   std::optional<uint64_t> lag;
 };
+struct ReplicationCatalogEntry {
+  std::string_view manifest_xxh3;
+  std::string_view commit;
+  std::string_view tenant;
+  std::string_view collection;
+  bool available = false;
+};
+struct ReplicationCatalog {
+  std::string_view boot;
+  std::string_view cursor;
+  std::span<const ReplicationCatalogEntry> collections;
+};
+struct ReplicationInstalled {
+  std::string_view follower;
+  std::string_view tenant;
+  std::string_view collection;
+  std::string_view commit;
+};
+namespace ReplicationCollectionStatus_ { enum class State { SYNCING = 0, SERVING = 1, WAITING = 2, STALE = 3, ORPHAN = 4, ERROR = 5 }; }
 struct ReplicationCollectionStatus {
+  using State = ReplicationCollectionStatus_::State;
   std::string_view name;
+  std::string_view tenant;
   std::string_view source_commit;
   std::string_view serving_commit;
-  std::string_view state;
+  std::optional<State> state;
   uint64_t bytes_downloaded = 0;
   uint64_t bytes_total = 0;
   std::string_view last_error;
   uint64_t next_retry = 0;
 };
 struct ReplicationStatus {
-  std::span<const FollowerStats> followers;
+  std::span<const FollowerStatus> followers;
   std::string_view source;
   std::string_view follower;
   std::optional<bool> connected;
@@ -353,13 +416,14 @@ struct ReplicationStatus {
   std::span<const ReplicationCollectionStatus> collections;
 };
 struct StatsResponse {
-  StorageRamStats storage_ram;
-  StatsTotals totals;
+  std::optional<StatsTotals> totals;
   std::span<const CollectionStats> collections;
-  IndexRamStats indexing_ram;
+  uint64_t multiterm_expansion_refills = 0;
+  std::optional<MemoryStats> memory;
 };
 struct CacheControlRequest {
   std::string_view collection;
+  std::string_view tenant;
   uint32_t dump_limit = 0;
   bool flush = false;
   bool reset_admission = false;
@@ -385,6 +449,7 @@ struct ShardCacheControl {                                      // needs QueryCa
 };
 struct CollectionCacheControl {                                 // needs ShardCacheControl
   std::string_view name;
+  std::string_view tenant;
   std::span<const ShardCacheControl> shards;
   std::optional<Error> error;
 };
@@ -413,18 +478,22 @@ struct SchemaDef {
 };
 struct ColVector { std::span<const Vector> v; };
 struct ArrVector { std::span<const Vector> v; };
-struct SchemaResponse { std::optional<SchemaDef> schema; };      // needs SchemaDef
+struct SchemaResponse {
+  std::string_view commit; std::optional<SchemaDef> schema; };      // needs SchemaDef
 struct SchemaRequest {                                           // needs SchemaDef
   using Mode = luxir::api::SchemaRequest_::Mode;
   std::string_view collection;
+  std::string_view tenant;
   std::optional<SchemaDef> schema;
   Mode mode = Mode::SET;                                      // align 4 (enum)
 };
-struct CreateCollectionRequest { std::string_view name; std::optional<SchemaDef> schema; };
-struct CreateCollectionResponse { std::string_view name; };
-struct DeleteCollectionRequest { std::string_view name; };
+struct CreateCollectionRequest { std::string_view name; std::optional<SchemaDef> schema; std::string_view tenant; };
+struct CreateCollectionResponse {
+  std::string_view commit; std::string_view name; };
+struct DeleteCollectionRequest { std::string_view name; std::string_view tenant; };
 struct DeleteCollectionResponse { std::string_view name; };
 struct ListCollectionsResponse { std::span<const std::string_view> collections; };
+struct ListTenantsResponse { std::span<const std::string_view> tenants; };
 struct MultiVector { std::span<const ArrVector> v; };
 struct ArrVal { std::span<const Val> v; };                       // span<incomplete Val> OK
 
@@ -588,6 +657,7 @@ struct ExecutionProfileOp {
 };
 struct ExecutionProfile { std::span<const ExecutionProfileOp> ops; };
 struct SearchResponse {
+  std::string_view commit;
   std::string_view request_id;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
   std::optional<Error> error;
@@ -696,11 +766,13 @@ LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocEr
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
-LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStats) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
+LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
-LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats)
+LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
+LUXIR_TD(JemallocStats) LUXIR_TD(MemoryStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
+LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(WaitForReplicasRequest) LUXIR_TD(WaitForReplicasResponse) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationInstalled)
 #undef LUXIR_TD
 
 // ===================== out-of-line codec entry-point declarations =====================
@@ -737,12 +809,15 @@ LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
 LUXIR_ENTRY(ListCollectionsResponse)
-LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStats) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
+LUXIR_ENTRY(ListTenantsResponse)
+LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStatus) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
-LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats)
+LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)
+LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(MemoryStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
+LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(WaitForReplicasRequest) LUXIR_ENTRY(WaitForReplicasResponse) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationInstalled)
 #undef LUXIR_ENTRY
 
 } // namespace luxir::api

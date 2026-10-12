@@ -66,7 +66,7 @@ state, and commits are crash-safe on immutable segments.
     boundary.
 
 15. [Index replication](guide/replication.md) - following a source, discovery,
-    reserved snapshots, resumable downloads, and installation status.
+    pinned snapshots, resumable downloads, and installation status.
 
 ## Reference
 

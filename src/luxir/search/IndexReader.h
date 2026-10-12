@@ -6,6 +6,7 @@
 #include <mutex>
 #include <span>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "DocSet.h"
@@ -24,6 +25,7 @@ class FieldType;
 class FilterCache;
 class OrdMap;
 class Schema;
+struct CommitSnapshot;
 
 /// LiveDocs holds the live document bitmap for a segment
 class LiveDocs {
@@ -102,6 +104,12 @@ public:
       return *sharedPostingsReader;
     }
 
+    // shared form of postingsReader(): every snapshot holding this physical
+    // segment, and the writer, use the one instance
+    std::shared_ptr<PostingsReader> postingsReaderShared() const noexcept {
+      return sharedPostingsReader;
+    }
+
     // returns null if all docs are live (no deletes)
     LiveDocs* liveDocs() const noexcept {
       return sharedLiveDocs.get();
@@ -176,15 +184,28 @@ private:
     uint64_t coreGeneration = 0;
     int64_t totalMaxDoc = 0;
     int64_t livedocs = 0;
+    // A segment's physical identity, which decides what a reopen reuses: the
+    // base files its PostingsReader maps, the live-docs file of this
+    // snapshot's generation (none without deletes), and each overlay's files
+    // (aux readers, reused by their own gen rule). Within an incarnation an
+    // equal (segId, files) is the same mapped content, as is an equal
+    // liveDocs; descriptors carry size and digest, so a segment id reused by
+    // diverged history never matches.
     struct SegmentFiles {
       uint64_t segId;
       std::vector<FileDescriptor> files;
+      std::vector<FileDescriptor> liveDocs;
       std::vector<std::vector<FileDescriptor>> overlays;
       bool operator==(const SegmentFiles&) const = default;
     };
     std::vector<SegmentFiles> segmentFiles;
     std::vector<std::vector<FileDescriptor>> auxFiles;
     std::string incarnation;
+    // (segId, ord) of each segment, by segId.
+    std::vector<std::pair<uint64_t, int32_t>> segOrds;
+
+    // The segment `segId`, or null.
+    const Segment* segment(uint64_t segId) const;
 
     std::span<const ProjectableField> projectableFields();
   };
@@ -203,9 +224,15 @@ private:
   std::once_flag retrievableOnce;
   std::vector<RetrievableField> retrievable;
 
+  // Opens the snapshot `manifest` (the newest durable root when null). Each
+  // segment's PostingsReader comes from `published` (the publisher's open
+  // readers, by manifest segment order), else from `previous` when its files
+  // are identical, else is opened; its live docs come from `previous` when
+  // their file is identical.
   static Snapshot openSnapshot(Directory& dir, const IndexReader* previous,
                                std::shared_ptr<Schema> schema,
-                               std::shared_ptr<const std::vector<std::byte>> manifest);
+                               std::shared_ptr<const std::vector<std::byte>> manifest,
+                               std::span<const std::weak_ptr<PostingsReader>> published = {});
 
   IndexReader(Snapshot snapshot,
               std::shared_ptr<FilterCache> filterCache);
@@ -270,7 +297,10 @@ public:
       return OrdMap::build(field, *this);
     });
   }
-  
+
+  // This reader's segment `segId`, or null.
+  const Segment* findSegment(uint64_t segId) const { return core->segment(segId); }
+
   // Get the number of cached OrdMaps (for testing)
   size_t getOrdMapCacheSize() const {
     return core->ordMaps->dataMap.size();
@@ -302,11 +332,13 @@ public:
   // Names and types remain valid while the caller holds the reader.
   std::span<const RetrievableField> retrievableFields();
 
-  // Direct tools/tests may omit the schema if they only use physical state.
-  IndexReader(Directory& dir, IndexReader* previousReader = nullptr,
-              std::shared_ptr<FilterCache> filterCache = nullptr,
-              std::shared_ptr<Schema> schema = nullptr,
-              std::shared_ptr<const std::vector<std::byte>> manifest = {});
+  // Opens a published snapshot, reusing what it shares with previousReader
+  // and the readers its publisher holds open (CommitSnapshot::openReaders).
+  IndexReader(Directory& dir, const CommitSnapshot& snapshot, IndexReader* previousReader = nullptr,
+              std::shared_ptr<FilterCache> filterCache = nullptr);
+  // Direct tools/tests: the newest durable root, or an empty index.
+  explicit IndexReader(Directory& dir, IndexReader* previousReader = nullptr,
+                       std::shared_ptr<FilterCache> filterCache = nullptr);
 };
 
 }

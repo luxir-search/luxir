@@ -40,7 +40,7 @@ public:
     OutputStream out(deleteFile.get());
 
     // Write header - this is the standard format for live docs files
-    out.writeBytes(Postings::LUXIR_HEADER); // "LUXIR002"
+    out.writeBytes(Postings::LUXIR_HEADER);
     out.writeLong(1); // format version
     out.writeInt(maxDoc);
     out.writeInt(numLiveDocs);

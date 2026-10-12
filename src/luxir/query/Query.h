@@ -140,6 +140,9 @@ public:
   // Attach a lazy, window-local filter to scored execution. The filter is
   // prepared by the bulk scorer only after it has selected the final
   // production-window bounds. Unsupported bulk scorers reject the attach.
+  // A late attachment expands the executing graph: before repositioning,
+  // the caller must AND the filter's child-plan capabilities with the bulk
+  // plan's answer. An earlier YES alone does not cover the new filter.
   virtual bool attachWindowFilter(WindowFilter* filter) {
     unused(filter);
     return false;
@@ -161,6 +164,12 @@ public:
   // an exhaustion latch, and the caller may keep issuing later bounded
   // requests (which must return empty windows once the underlying stream is
   // truly exhausted). Only an unbounded request's END means exhaustion.
+  // A lookahead resume beyond max has the same bounded continuation rule:
+  // the next range may begin at max. Within a range, honor the returned
+  // resume; across ranges, the forward frontier is min(resume, previous max).
+  // Reposition-capable membership producers bound exact verification to
+  // [min, max), including their children and attached window filters. An
+  // approximation may navigate beyond max without verifying that document.
   virtual int32_t matchNextWindow(ScoreWindow& out, DocSet* filter,
                                   int32_t min, int32_t max) {
     return scoreNextWindow(out, filter, min, max,
@@ -185,6 +194,21 @@ public:
     }
     count += window.size;
     return next;
+  }
+
+  // Cold, one-way handoff from an exhaustive scored prefix to membership
+  // windows. Preserves position; it cannot recover competitively pruned docs.
+  // Fresh membership products and repositioned products need no handoff.
+  [[gnu::cold]] virtual void prepareMembership() {}
+
+  // Cold boundary between forward-only traversals. Invalidates prior output
+  // and resume points; subsequent windows start at min >= target. Only call
+  // when the resolved plan (including attached filters) supports reposition.
+  // Thresholds and adaptive state start fresh; immutable caches survive.
+  [[gnu::cold]] virtual void reposition(int32_t target) {
+    unused(target);
+    assert(false);
+    std::unreachable();
   }
 };
 
@@ -447,6 +471,20 @@ public:
     DYNAMIC_TERMS,
   };
 
+  // An inclusive range of encoded numeric column values (the column's
+  // order-preserving int64 encoding: INT raw, FLOAT/DOUBLE sortable bits,
+  // DATE epoch millis). lo > hi is empty.
+  struct ValueEnvelope {
+    int64_t lo;
+    int64_t hi;
+
+    bool empty() const noexcept { return lo > hi; }
+
+    ValueEnvelope intersect(ValueEnvelope other) const noexcept {
+      return {std::max(lo, other.lo), std::min(hi, other.hi)};
+    }
+  };
+
   enum class ClauseShape : uint8_t {
     DIRECT,
     FLAT_DISJUNCTION,
@@ -580,6 +618,18 @@ public:
     return FieldSortConjunction::NOT_FLAT;
   }
 
+  // The values this query requires of the numeric column `field` (a
+  // physical field name): every doc it matches has a value of `field`
+  // inside the returned envelope (some value, for a multi-valued field).
+  // An empty envelope means the query matches nothing. nullopt claims
+  // nothing, which is always legal. A pure function of the logical tree:
+  // answers must hold for every execution of the query.
+  virtual std::optional<ValueEnvelope> requiredValueEnvelope(
+      std::string_view field) const {
+    unused(field);
+    return std::nullopt;
+  }
+
   // Validate the complete logical tree once during serial request planning,
   // before cache lookup or Weight construction. Every concrete query must
   // make an explicit validation decision. A composite MUST override
@@ -685,6 +735,10 @@ public:
   public:
     using BulkUse = ExecutionUse;
 
+    static bool isMembershipWindowUse(BulkUse use) noexcept {
+      return use == BulkUse::MATCH_WINDOWS || use == BulkUse::COUNT_WINDOWS;
+    }
+
     enum class BulkAnswer : uint8_t {
       YES,
       NO,
@@ -725,14 +779,16 @@ public:
       const BulkBuildState* buildState = nullptr;
       int64_t constantCount = -1;
       BulkAnswer acceptsWindowFilter = BulkAnswer::NO;
-      // YES declares that another planBulk() call on this supplier with an
-      // identical context may coexist with this plan: neither call
-      // invalidates the other, their build states are disjoint, each plan is
-      // built at most once, and both products enumerate the same exact
-      // matches under the same filter contract. Consumers that need two
-      // independent forward executions (the seeded field-sort driver) require
-      // YES and build both products before either runs.
-      BulkAnswer independentReplan = BulkAnswer::NO;
+      // Stateful arms derive capability from their resolved graph through
+      // the owner hook. Stateless leaves record their complete answer here.
+      // Neither route is consulted during ordinary forward iteration.
+      BulkAnswer statelessReposition = BulkAnswer::NO;
+
+      [[gnu::cold]] BulkAnswer supportsReposition() const noexcept {
+        if (buildState == nullptr) return statelessReposition;
+        return buildState->owner->bulkStateSupportsReposition(*buildState)
+            ? BulkAnswer::YES : BulkAnswer::NO;
+      }
 
       bool hasConstantCount() const noexcept {
         return constantCount >= 0;
@@ -760,6 +816,42 @@ public:
     /// to compute; an upper bound is safe. Compound suppliers use it to choose
     /// lead iterators before creating scorers.
     virtual int64_t cost() = 0;
+
+    // Cold membership economics, separate from reset availability and from
+    // cost(), whose upper bound serves lead selection. Instructions are used
+    // here so the linear L1 prefix walk is priced in the same units as fills.
+    struct MembershipWork {
+      double matches = 0;
+      double produce = 0;       // one complete traversal, excluding collection
+      double seekSteps = 0;     // L1 prefix steps through the complete segment
+      double reset = 0;
+      double window = 0;        // dispatch/initialization for a bounded fill
+      // Savings need a conservative credit, separate from the debit prior. Unknown
+      // routes earn no production credit; a parent cannot sum child credits
+      // because candidate-driven execution may never produce their full dfs.
+      double savedProduce = 0;
+
+      void addWork(const MembershipWork& child) {
+        produce += child.produce;
+        seekSteps += child.seekSteps;
+        reset += child.reset;
+        window += child.window;
+      }
+
+      double seek(double fraction) const {
+        // Dense-term late seeks cost about 68 instructions per L1 prefix
+        // step above first-leaf production; round upward for admission.
+        return reset + 74 * seekSteps * std::clamp(fraction, 0.0, 1.0);
+      }
+    };
+
+    virtual MembershipWork membershipWork(int32_t maxDoc) {
+      double matches = (double)std::min<int64_t>(cost(), maxDoc);
+      // Unknown producers get a conservative scalar-verification price.
+      // Materialized membership has no verifier or postings-prefix restart.
+      if (exactDocSet() != nullptr) return {matches, 4 * matches, 0, 32, 64};
+      return {matches, 128.0 * maxDoc, 0, 1024, 256};
+    }
 
     /// Pure description of the scorer returned by resolve() for this exact build
     /// context. Implementations must not construct scorers, increment counters,
@@ -898,11 +990,24 @@ public:
         bulk != nullptr && plan.consumesFilters == BulkAnswer::YES,
       };
     }
+
+  protected:
+    // Interpret this resolved plan's state, without planning again. The
+    // owning supplier graph must outlive both construction and inspection.
+    [[gnu::cold]] virtual bool bulkStateSupportsReposition(const BulkBuildState& state) const noexcept {
+      unused(state);
+      return false;
+    }
   };
 
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
   class SegmentSource {
   public:
+    /// Drop refillable transient state only; preserve semantics and prepared
+    /// results. Idempotent. No plan or scorer from this source for the segment
+    /// may still be in use, including plans abandoned during route selection.
+    virtual void releaseSegmentState(IndexReader::Segment&) noexcept {}
+
     /// Return temporary per-segment planning state allocated from targetPool.
     /// A null supplier means this source cannot match the segment.
     Query::ScorerSupplier* scorerSupplier(
@@ -1521,6 +1626,13 @@ public:
     /// Advisory: false is always safe.
     bool matchesAllDocs() const noexcept { return (traits & MATCHES_ALL_DOCS) != 0; }
 
+    /// True when releaseSegmentState() can drop per-segment state that a later
+    /// execution on that segment rebuilds (multiterm expansions). A caller
+    /// running this weight for many domains of a segment shares that state by
+    /// running them in one segment pass. Composites forward to the weights
+    /// they release.
+    virtual bool hasReleasableSegmentState() const noexcept { return false; }
+
     /// True when the request permits scorer-level competitive pruning.
     bool allowsPruning() const noexcept { return (inputFlags & ALLOW_PRUNING) != 0; }
     bool needsScores() const noexcept { return (inputFlags & NEED_SCORES) != 0; }
@@ -1735,23 +1847,13 @@ public:
     virtual void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                                 int32_t windowEnd) {
       skipCount(SkipStats::countBulkFillCalls);
-      if (windowEnd <= windowStart) {
-        return;
-      }
-      int32_t doc = docId();
-      if (doc < windowStart) {
-        doc = advance(windowStart);
-      }
-      unused(doc);
-      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
-      float blockScores[Postings::DOCS_BLOCK_SIZE];
-      int32_t n;
-      while ((n = fillScoreBlock(blockDocs, blockScores,
-                                 Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
-        for (int32_t i = 0; i < n; i++) {
-          int32_t index = blockDocs[i] - windowStart;
-          windowBits[(size_t) (index >> 6)] |= 1ULL << (index & 63);
-        }
+      int32_t target = windowStart;
+      while (target < windowEnd) {
+        int32_t doc = advanceWindow(target, windowEnd);
+        if (doc >= windowEnd) break;
+        int32_t index = doc - windowStart;
+        windowBits[(size_t) (index >> 6)] |= 1ULL << (index & 63);
+        target = doc + 1;
       }
     }
     virtual void setMinCompetitiveScore(float minScore) {
@@ -1785,6 +1887,60 @@ public:
     }
     virtual std::string_view pruningBlockerForDebug() const {
       return {};
+    }
+
+    // Frequency-preserving bit production for a consumer that keeps scoring.
+    // Membership fills may discard frequency state; this default retains it.
+    virtual void fillScoredWindowBits(std::span<uint64_t> words,
+                                      int32_t start, int32_t end) {
+      if (start >= end) return;
+      if (docId() < start) advance(start);
+      int32_t docs[Postings::DOCS_BLOCK_SIZE];
+      float scores[Postings::DOCS_BLOCK_SIZE];
+      int32_t n;
+      while ((n = fillScoreBlock(docs, scores, Postings::DOCS_BLOCK_SIZE, end)) > 0) {
+        for (int32_t i = 0; i < n; i++) {
+          int32_t bit = docs[i] - start;
+          words[(size_t) bit >> 6] |= 1ULL << (bit & 63);
+        }
+      }
+    }
+
+    // Normalize a pending scored probe once before a terminal membership
+    // drain. Only exhaustive scored prefixes may enter this protocol; scoring
+    // can resume only after reset. Owners forward to their owned children,
+    // never to separately exposed approximation aliases.
+    [[gnu::cold]] virtual void prepareMembership() {}
+
+    // Restore unpositioned state for a new protocol epoch, without matching
+    // or allocating. The resolved plan owns the capability; resetting an
+    // owner also resets its exposed approximation/probe aliases.
+    [[gnu::cold]] virtual void reset() {
+      assert(false);
+      std::unreachable();
+    }
+
+    // Membership-window protocol: return a confirmed match in [min, max),
+    // or a resume point >= max. Verification must not inspect docs outside
+    // that span. Navigation may leave an unverified approximation at/after
+    // max, so consumers must call this again even when docId() >= min.
+    // This protocol composes with fillWindowBits. After prepareMembership it
+    // can drain an exhaustive scored prefix; scoring resumes only after reset. A
+    // composite retains ownership of externally driven aliases while draining.
+    // Verification-bearing scorers and composites override
+    // this single-phase default; ordinary next()/advance() remain unchanged.
+    virtual int32_t advanceWindow(int32_t min, int32_t max) {
+      if (min >= max) return max;
+      int32_t doc = docId();
+      return doc < min ? advance(min) : doc;
+    }
+
+    // Bounded private approximation for membership conjunctions. An exact
+    // bounded result is a valid default; cheap approximations override this
+    // so other clauses can reject a candidate before verification. Confirm
+    // via advanceWindow(doc, doc + 1), not competitive matches() state.
+    virtual int32_t advanceApproximationWindow(int32_t min, int32_t max) {
+      return advanceWindow(min, max);
     }
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
@@ -1825,6 +1981,11 @@ public:
 
     const PlanContext& context() const noexcept { return planContext; }
 
+    bool unscoredResetUse() const noexcept {
+      return planContext.demand.horizon != ExecutionUse::SCORED_WINDOWS
+          && planContext.demand.horizon != ExecutionUse::EXACT_CANDIDATE_SCORING;
+    }
+
   public:
     ScorerPlan(const ScorerPlan&) = delete;
     ScorerPlan& operator=(const ScorerPlan&) = delete;
@@ -1834,6 +1995,11 @@ public:
     const ScorerShape& shape() const noexcept { return recordedShape; }
     const Demand& demand() const noexcept { return planContext.demand; }
     int64_t cost() const noexcept { return resolvedCost; }
+    // Inspect the resolved graph only when reuse is requested. Computing
+    // this recursively during construction taxes ordinary forward searches.
+    // Like build(), this borrows the originating supplier graph; keep that
+    // graph alive while consulting the plan, including after consumption.
+    [[gnu::cold]] virtual bool supportsReset() const noexcept { return false; }
 
     Scorer* build(MemPool& targetPool) {
       consume();
@@ -1937,17 +2103,40 @@ public:
   }
 
   int32_t prepare(std::span<Query::Scorer*> scorers, int32_t start, int32_t end) {
+    return intersect<false>(scorers, start, end);
+  }
+
+  // Scored intersections may return to ordinary score production in the
+  // next window: keep frequencies and child iteration ownership intact,
+  // where membership fills may discard them. Rare, so out of line; the
+  // membership kernel above keeps its own inlining at its call sites.
+  [[gnu::noinline]] int32_t prepareScored(std::span<Query::Scorer*> scorers,
+                                          int32_t start, int32_t end) {
+    return intersect<true>(scorers, start, end);
+  }
+
+private:
+  template <bool scored>
+  LUXIR_INLINE int32_t intersect(std::span<Query::Scorer*> scorers,
+                                 int32_t start, int32_t end) {
     assert(!scorers.empty());
     assert(currentBits.size() == kWindowWords);
     assert(start >= 0);
     assert(end >= start);
     assert(end - start <= kWindowSize);
 
+    auto fill = [&](Query::Scorer* scorer, std::span<uint64_t> words) {
+      if constexpr (!scored) {
+        scorer->fillWindowBits(words, start, end);
+      } else {
+        scorer->fillScoredWindowBits(words, start, end);
+      }
+    };
     std::fill(currentBits.begin(), currentBits.end(), 0);
-    scorers[0]->fillWindowBits(currentBits, start, end);
+    fill(scorers[0], currentBits);
     for (size_t i = 1; i < scorers.size(); i++) {
       std::fill(scratchBits.begin(), scratchBits.end(), 0);
-      scorers[i]->fillWindowBits(scratchBits, start, end);
+      fill(scorers[i], scratchBits);
       for (size_t word = 0; word < currentBits.size(); word++) {
         currentBits[word] &= scratchBits[word];
       }
@@ -1960,6 +2149,7 @@ public:
     return card;
   }
 
+public:
   std::span<const uint64_t> bits() const {
     return currentBits;
   }
@@ -1996,6 +2186,15 @@ class WindowFilter {
   int64_t filterCost = 0;
 
 public:
+  [[gnu::cold]] void prepareMembership() {
+    for (Query::Scorer* scorer : scorers) scorer->prepareMembership();
+  }
+
+  [[gnu::cold]] void reset() {
+    for (Query::Scorer* scorer : scorers) scorer->reset();
+    windowStart = windowEnd = 0;
+  }
+
   WindowFilter(MemPool& pool, std::span<Query::Scorer*> scorers,
                bool probeMode = false, int64_t filterCost = 0)
       : scorers(scorers),
@@ -2034,17 +2233,18 @@ public:
   // Candidates must arrive in ascending order. Each filter scorer advances
   // monotonically, so a later fill resumes from the resulting cursor without
   // materializing any skipped probe window. Term scorers expose their
-  // postings enum for the docs-only fast path; other capable scorers use exact
-  // Scorer::advance().
+  // postings enum for the docs-only fast path; other scorers verify only
+  // the candidate, through the same bounded protocol as window fill.
   bool acceptsProbe(int32_t doc) {
     assert(probeEnums.size() == scorers.size());
     for (size_t i = 0; i < scorers.size(); i++) {
       DocsFreqEnum* docsEnum = probeEnums[i];
-      int32_t filterDoc = docsEnum == nullptr
-          ? scorers[i]->docId() : docsEnum->docId();
-      if (filterDoc < doc) {
-        filterDoc = docsEnum == nullptr
-            ? scorers[i]->advance(doc) : docsEnum->advanceDocOnly(doc);
+      int32_t filterDoc;
+      if (docsEnum == nullptr) {
+        filterDoc = scorers[i]->advanceWindow(doc, doc + 1);
+      } else {
+        filterDoc = docsEnum->docId();
+        if (filterDoc < doc) filterDoc = docsEnum->advanceDocOnly(doc);
       }
       if (filterDoc != doc) {
         return false;

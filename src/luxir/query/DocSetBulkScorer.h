@@ -193,6 +193,12 @@ public:
     }
   }
 
+  [[gnu::cold]] void reposition(int32_t target) override {
+    unused(target);
+    assert(target >= 0 && target <= maxDoc);
+    sourceArrIdx = 0;
+  }
+
   bool willCountDense() const override { return true; }
 
   bool supportsMatchWindows() const override { return true; }

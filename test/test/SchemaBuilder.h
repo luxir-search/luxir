@@ -96,10 +96,10 @@ public:
 
   // Apply through the collection's schema transaction.
   std::shared_ptr<Schema> set(Collection& c) {
-    return c.updateSchema(def(), api::SchemaRequest_::Mode::SET);
+    return c.updateSchema(def(), api::SchemaRequest_::Mode::SET)->schema;
   }
   std::shared_ptr<Schema> replaceAll(Collection& c) {
-    return c.updateSchema(def(), api::SchemaRequest_::Mode::REPLACE_ALL);
+    return c.updateSchema(def(), api::SchemaRequest_::Mode::REPLACE_ALL)->schema;
   }
 };
 

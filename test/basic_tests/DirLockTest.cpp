@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <fstream>
 #include <gtest/gtest.h>
 
 #include <filesystem>
@@ -67,10 +68,10 @@ TEST(DirLockTest, allowsMultipleRAMDirFactories) {
 TEST(DirLockTest, unownedFactoryOpensAlongsideTheWriter) {
   TempDir tempDir;
   FSDirFactory writer(tempDir.path());
-  writer.create("main");
+  writer.container(CollectionId::of("main"), true);
 
   FSDirFactory reader(tempDir.path(), /*unowned=*/true);
-  EXPECT_EQ(reader.listDirectories(), std::vector<std::string>{"main"});
+  EXPECT_EQ(reader.collections(), std::vector<CollectionId>{CollectionId::of("main")});
   // The reader must not have left a lock behind either.
   EXPECT_NO_THROW({ FSDirFactory alsoUnowned(tempDir.path(), /*unowned=*/true); });
 }
@@ -88,13 +89,13 @@ TEST(DirLockTest, readOnlyDecoratorRejectsEveryMutator) {
   TempDir tempDir;
   {
     FSDirFactory writer(tempDir.path());
-    auto dir = writer.create("main");
+    auto dir = writer.container(CollectionId::of("main"), true);
     auto file = dir->createFile("hello");
     dir->finishFile(*file);
   }
 
   ReadOnlyDirFactory reader(std::make_unique<FSDirFactory>(tempDir.path(), /*unowned=*/true));
-  auto dir = reader.create("main");
+  auto dir = reader.container(CollectionId::of("main"), false);
 
   EXPECT_TRUE(dir->openFile("hello") != nullptr);
   std::vector<Directory::FileInfo> files;
@@ -109,12 +110,15 @@ TEST(DirLockTest, readOnlyDecoratorRejectsEveryMutator) {
   EXPECT_THROW(dir->clear(), ReadOnlyError);
   std::vector<std::string> syncNames{"hello"};
   EXPECT_THROW(dir->sync(syncNames), ReadOnlyError);
-  EXPECT_THROW(reader.remove("main"), ReadOnlyError);
-  EXPECT_THROW(reader.create("absent"), ReadOnlyError);
+  EXPECT_THROW(reader.remove(CollectionId::of("main")), ReadOnlyError);
+  EXPECT_THROW(reader.container(CollectionId::of("absent"), true), ReadOnlyError);
+  EXPECT_THROW(reader.collection(CollectionId::of("main")).create("incarnation"), ReadOnlyError);
+  EXPECT_THROW(reader.collection(CollectionId::of("main")).select("incarnation"), ReadOnlyError);
+  EXPECT_THROW(reader.removeIncarnation(CollectionId::of("main"), "incarnation"), ReadOnlyError);
 
   // finishFile needs a File, which only a writable directory can hand out.
   FSDirFactory writer2(tempDir.path());
-  auto writableDir = writer2.create("main");
+  auto writableDir = writer2.container(CollectionId::of("main"), false);
   auto staged = writableDir->createFile("staged");
   EXPECT_THROW(dir->finishFile(*staged), ReadOnlyError);
 
@@ -128,6 +132,32 @@ TEST(DirLockTest, readOnlyDecoratorRejectsEveryMutator) {
 // The decorator carries the guarantee for any backend, not just the fs one.
 TEST(DirLockTest, readOnlyDecoratorWorksOverRam) {
   ReadOnlyDirFactory reader(std::make_unique<RAMDirFactory>());
-  EXPECT_THROW(reader.create("main"), ReadOnlyError);
-  EXPECT_THROW(reader.remove("main"), ReadOnlyError);
+  EXPECT_THROW(reader.container(CollectionId::of("main"), true), ReadOnlyError);
+  EXPECT_THROW(reader.remove(CollectionId::of("main")), ReadOnlyError);
+}
+
+TEST(DirLockTest, refusesDataFromAnotherLayout) {
+  TempDir tempDir;
+  { FSDirFactory writer(tempDir.path()); }
+  EXPECT_TRUE(std::filesystem::exists(tempDir.path() / "t" / "LAYOUT"));
+  std::filesystem::remove(tempDir.path() / "t" / "LAYOUT");
+  std::filesystem::create_directories(tempDir.path() / "t" / "main");
+  EXPECT_THROW(FSDirFactory writer(tempDir.path()), std::runtime_error);
+  EXPECT_THROW(FSDirFactory reader(tempDir.path(), /*unowned=*/true), std::runtime_error);
+}
+
+TEST(DirLockTest, resumesAnInterruptedLayoutMarker) {
+  TempDir tempDir;
+  std::filesystem::create_directories(tempDir.path() / "t");
+  std::ofstream(tempDir.path() / "t" / "LAYOUT.pending") << "partial";
+  { FSDirFactory writer(tempDir.path()); }
+  EXPECT_TRUE(std::filesystem::exists(tempDir.path() / "t" / "LAYOUT"));
+  EXPECT_NO_THROW({ FSDirFactory writer(tempDir.path()); });
+}
+
+TEST(DirLockTest, refusesTheEarlierCollectionsDirectory) {
+  TempDir tempDir;
+  std::filesystem::create_directories(tempDir.path() / "c" / "default" / "main");
+  EXPECT_THROW(FSDirFactory writer(tempDir.path()), std::runtime_error);
+  EXPECT_THROW(FSDirFactory reader(tempDir.path(), /*unowned=*/true), std::runtime_error);
 }

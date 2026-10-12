@@ -17,8 +17,6 @@
 
 // #define MEMPOOL_MALLOC true   // use malloc/new for each individual allocation for better memory checking with checkers
 
-// TODO: allocate in large enough chunks so that we use MMAP so it can be released back to OS?
-// Could start allocating pages in groups of 4 after some limit (128K is default to go to mmap in glibc at least)
 // TODO: separate 16 byte aligned pool
 // Streams could be allocated in a pool with 16 byte alignment (all block pointers would be aligned, thus
 // We could use the 16 byte aligned pool for new fields
@@ -95,6 +93,7 @@ public:
     // if you want to avoid that, use alloc() instead.
 private:
   static thread_local std::unique_ptr<MemPool> pool;
+  std::pmr::memory_resource* upstream;
 
   void *do_allocate(size_t __bytes, size_t __alignment) override {
     return alloc(__bytes, __alignment);
@@ -154,12 +153,8 @@ public:
 // TODO - make a lot of this stuff private
   static constexpr uint32_t STATIC_BUFFER_SIZE = 256; // number of bytes allocated with this pool before using heap
 
-  // BYTE_BLOCK_SHIFT of 15 gives 32K blocks, 18 gives 256K, 22 gives 4M.  Blocks
-  // this large are mmap-eligible; --malloc-mmap-threshold=-1 pins malloc's
-  // threshold at this size so freed blocks return to the OS, and bigger blocks
-  // mean fewer mmap round-trips under that pin.  Pools double from 256 bytes up
-  // to this cap, so only heavy pools (inverters, hot query threads) ever reach
-  // it: max tail waste is half a block per pool.
+  // Pools double from 256 bytes up to 4 MiB. Only heavy pools (inverters, hot
+  // query threads) reach this cap; max tail waste is half a block per pool.
   static constexpr uint32_t BYTE_BLOCK_SHIFT = 22;
   static constexpr uint32_t BYTE_BLOCK_SIZE = 1 << BYTE_BLOCK_SHIFT;
   static constexpr uint32_t BYTE_BLOCK_MASK = BYTE_BLOCK_SIZE - 1;
@@ -278,21 +273,35 @@ public:
 
 #ifdef MEMPOOL_MALLOC
   // pointers[bbAddr] -> heap pointer
-  std::vector< std::unique_ptr<char[]> > pointers;
+  struct AllocationDeleter {
+    std::pmr::memory_resource* resource;
+    size_t size;
+    size_t alignment;
+    void operator()(char* ptr) const { resource->deallocate(ptr, size, alignment); }
+  };
+  std::vector<std::unique_ptr<char[], AllocationDeleter>> pointers;
+
+  void allocateSeparate(size_t size, size_t alignment = alignof(std::max_align_t)) {
+    std::unique_ptr<char[], AllocationDeleter> ptr(
+        (char*)upstream->allocate(size, alignment), AllocationDeleter{upstream, size, alignment});
+    pointers.push_back(std::move(ptr));
+    allocated += size;
+  }
   size_t allocated = 0;
 #endif
-
-  // TODO: accept an upstream allocator / memory resource
 
   MemPool(const MemPool &) = delete;
 
   MemPool &operator=(const MemPool &) = delete;
 
-  MemPool() {
+  explicit MemPool(std::pmr::memory_resource* upstream = std::pmr::new_delete_resource())
+      : upstream(upstream) {
     initNewBuffer(staticBuffer, STATIC_BUFFER_SIZE);
   }
 
   ~MemPool();
+
+  std::pmr::memory_resource* upstream_resource() const { return upstream; }
 
   void initNewBuffer(char* newBuffer, uint32_t size) {
     buffers.push_back(newBuffer);
@@ -398,8 +407,7 @@ public:
     pos = newEnd;
     return bbAddr;
 #else
-    pointers.emplace_back( new char[size] );
-    allocated += size;
+    allocateSeparate(size);
     // if (pointers.size() < 100) { std::cout << "PTR=" << (void*)(pointers.back().get()) << "\tnum="  << (pointers.size()-1) << std::endl; }
     // we could scribble over memory, but that would confuse other memory checkers
     return (uint32_t)pointers.size() - 1;
@@ -445,7 +453,7 @@ public:
       return backupAlloc(size, alignment);
     }
 #else
-    allocateBBP(size);
+    allocateSeparate(size, alignment);
     return pointers.back().get();
 #endif
   }

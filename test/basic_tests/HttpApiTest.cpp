@@ -8,6 +8,7 @@
 #include <thread>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <map>
 #include <optional>
 #include <set>
@@ -25,6 +26,8 @@
 #include "luxir/reader/Postings.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/server/HttpServer.h"
+#include "luxir/server/ReplicationSource.h"
+#include "luxir/util/ProcessAllocator.h"
 
 namespace luxir::test {
 
@@ -46,6 +49,19 @@ protected:
   }
 
   int port() { return server->getPort(); }
+
+  std::string withCommit(std::string body) {
+    auto token = luxirNode->getCollection("main")->getShard()->getSnapshots().snapshot()->id.token();
+    return "{\"commit\":\"" + token + "\"," + body.substr(1);
+  }
+
+  static std::string explicitQuery(const std::string& body) {
+    auto split = body.find(',', body.find("\"commit\":"));
+    EXPECT_NE(std::string::npos, split);
+    if (split == std::string::npos) return {};
+    return body.substr(0, split + 1) + "\"ops\":{\"q\":{" +
+        body.substr(split + 1, body.size() - split - 2) + "}}\n";
+  }
 
   static bool waitForShardThreads(HttpServer& server, int expected,
                                   std::chrono::milliseconds timeout) {
@@ -225,7 +241,7 @@ TEST_F(HttpApiTest, prettySearch) {
     EXPECT_EQ("application/json", res[http::field::content_type]);
     EXPECT_TRUE(res.chunked());
     expectJsonObject(res.body(), true);
-    EXPECT_TRUE(res.body().starts_with("{\n  \"docs\": ")) << res.body();
+    EXPECT_TRUE(res.body().starts_with("{\n  \"commit\": ")) << res.body();
   }
 }
 
@@ -600,7 +616,37 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   ASSERT_FALSE(glz::read_json(nodeJson, nodeStats.body())) << nodeStats.body();
   EXPECT_TRUE(nodeJson.contains("totals"));
   EXPECT_TRUE(nodeJson.contains("collections"));
-  EXPECT_TRUE(nodeJson.contains("indexing_ram"));
+  EXPECT_FALSE(nodeJson.contains("memory"));
+
+  // Node memory is a separate request that returns nothing else; the jemalloc
+  // block is present only on jemalloc.
+  auto memoryStats = httpRequest(port(), http::verb::get, "/_stats?memory=true");
+  ASSERT_EQ(200, memoryStats.result_int()) << memoryStats.body();
+  glz::generic_i64 memoryJson;
+  ASSERT_FALSE(glz::read_json(memoryJson, memoryStats.body())) << memoryStats.body();
+  ASSERT_TRUE(memoryJson.contains("memory"));
+  EXPECT_FALSE(memoryJson.contains("collections"));
+  EXPECT_FALSE(memoryJson.contains("totals"));
+  EXPECT_TRUE(memoryJson["memory"].contains("indexing_budget"));
+  EXPECT_EQ(processAllocatorStats().has_value(),
+            memoryJson["memory"].contains("jemalloc"));
+  if (memoryJson["memory"].contains("jemalloc")) {
+    EXPECT_TRUE(memoryJson["memory"]["jemalloc"].contains("allocated_bytes"));
+    EXPECT_TRUE(memoryJson["memory"]["jemalloc"].contains("version"));
+  }
+  auto badMemory = httpRequest(port(), http::verb::get, "/_stats?memory=yes");
+  EXPECT_EQ(400, badMemory.result_int()) << badMemory.body();
+  auto noMemory = httpRequest(port(), http::verb::get, "/_stats?memory=false");
+  ASSERT_EQ(200, noMemory.result_int()) << noMemory.body();
+  glz::generic_i64 noMemoryJson;
+  ASSERT_FALSE(glz::read_json(noMemoryJson, noMemory.body())) << noMemory.body();
+  EXPECT_FALSE(noMemoryJson.contains("memory"));
+  // Memory is node-wide: no collection route, and no per-segment records.
+  for (const char* target : {"/collections/main/_stats?memory=true",
+                             "/_stats?memory=true&segments=true"}) {
+    auto rejected = httpRequest(port(), http::verb::get, target);
+    EXPECT_EQ(400, rejected.result_int()) << target << ": " << rejected.body();
+  }
 
   auto collectionStats =
       httpRequest(port(), http::verb::get, "/collections/main/_stats");
@@ -729,8 +775,8 @@ TEST_F(HttpApiTest, facetResponseUsesBucketRows) {
   auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"ops":{"cats":{"field_facet":{"field":"http_facet_s","limit":-1,"missing":true}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
-  EXPECT_EQ(
-      R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1}}})" "\n",
+  EXPECT_EQ(withCommit(
+      R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1}}})" "\n"),
       response.body());
 }
 
@@ -745,10 +791,10 @@ TEST_F(HttpApiTest, facetBucketsCarryTopDocs) {
       R"("ops":{"hits":{"top_docs":{"limit":1,"get_number":true,"fields":["id"],)"
       R"("sort":[{"field":"price_i","dir":"desc"}]}}}}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
-  EXPECT_EQ(
+  EXPECT_EQ(withCommit(
       R"({"ops":{"cats":{"buckets":[)"
       R"({"val":"x","count":2,"hits":{"found":2,"docs":[{"id":"pb2"}]}},)"
-      R"({"val":"y","count":1,"hits":{"found":1,"docs":[{"id":"pb3"}]}}]}}})" "\n",
+      R"({"val":"y","count":1,"hits":{"found":1,"docs":[{"id":"pb3"}]}}]}}})" "\n"),
       response.body());
 }
 
@@ -783,8 +829,8 @@ TEST_F(HttpApiTest, maxParallelModesAllAnswer) {
         R"({"max_parallel":)" + mp +
         R"(,"ops":{"cats":{"field_facet":{"field":"http_mp_s","limit":-1}}}})");
     ASSERT_EQ(200, response.result_int()) << response.body();
-    EXPECT_EQ(
-        R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})" "\n",
+    EXPECT_EQ(withCommit(
+        R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})" "\n"),
         response.body()) << "max_parallel=" << mp;
   }
 }
@@ -920,7 +966,7 @@ TEST_F(HttpApiTest, unsafeCollectionNamesAreRejectedBeforeCreate) {
 
   localServer.shutdown();
 
-  EXPECT_FALSE(std::filesystem::exists(base / "c" / "unsafe"));
+  EXPECT_FALSE(std::filesystem::exists(base / "t" / "t0" / "unsafe"));
   EXPECT_FALSE(std::filesystem::exists(absolute));
   std::filesystem::remove_all(base);
 }
@@ -947,9 +993,9 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
     localServer.shutdown();
   }
 
-  FSDirectory container(base / "c" / "bad");
-  auto incarnation = DirectoryFactory::current(container).incarnation;
-  for (const auto& file : std::filesystem::directory_iterator(base / "c" / "bad" / incarnation)) {
+  FSDirectory container(base / "t" / "t0" / "bad");
+  auto incarnation = *CollectionStorage::current(container);
+  for (const auto& file : std::filesystem::directory_iterator(base / "t" / "t0" / "bad" / incarnation)) {
     if (!Manifest::generationOf(file.path().filename().string())) continue;
     std::ofstream out(file.path(), std::ios::binary | std::ios::trunc);
     out << "\xff\xff\xff\xff\xff\xff\xff\xff";
@@ -2091,7 +2137,7 @@ TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
   auto lines = splitLines(update.body());
   glz::generic_i64 eof;
   ASSERT_FALSE(glz::read_json(eof, lines.back()));
-  EXPECT_EQ((uint64_t)CommitId::parse(eof["commit"].get<std::string>()).index_gen, writer->snapshots.readers.getReader()->commitId());
+  EXPECT_EQ((uint64_t)CommitId::parse(eof["commits"]["main"]["commit"].get<std::string>()).index_gen, writer->snapshots.readers.getReader()->commitId());
   EXPECT_GT(writer->snapshots.readers.getReader()->commitTime(), before);
 }
 
@@ -2248,7 +2294,7 @@ TEST_F(HttpApiTest, rootShorthand) {
   HttpReq full(port());
   full.matchQuery("status_s", "active").fields({"id"}).execute();
   ASSERT_EQ(200, full.status());
-  EXPECT_EQ("{\"ops\":{\"q\":" + res.body().substr(0, res.body().size() - 1) + "}}\n",
+  EXPECT_EQ(explicitQuery(res.body()),
             full.rawResponse());
   EXPECT_EQ(2u, idsOf(full.getDocs()).size());
 
@@ -2324,7 +2370,7 @@ TEST_F(HttpApiTest, urlOverlaysPreserveExplicitResponseShape) {
   for (const char* body : {"{}", R"({"time_zone":"UTC"})", R"({"query":"id:1"})"}) {
     auto res = httpRequest(port(), http::verb::post, target, body);
     ASSERT_EQ(200, res.result_int()) << res.body();
-    EXPECT_EQ("{\"docs\":[{\"id\":\"1\"}]}\n", res.body());
+    EXPECT_EQ(withCommit("{\"docs\":[{\"id\":\"1\"}]}\n"), res.body());
   }
   for (const char* body : {R"({"ops":{"q":{"top_docs":{}}}})",
                            R"json({"ops":{"q":{"top_docs":{}},"metric":"sum(1)"}})json"}) {
@@ -2398,7 +2444,7 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
   auto viaEcho = httpRequest(port(), http::verb::post, "/collections/main/_search", canonical);
   ASSERT_EQ(200, viaEcho.result_int()) << viaEcho.body();
-  EXPECT_EQ("{\"ops\":{\"q\":" + direct.body().substr(0, direct.body().size() - 1) + "}}\n",
+  EXPECT_EQ(explicitQuery(direct.body()),
             viaEcho.body());
 
   // Fixpoint: echoing the echo is byte-identical.
@@ -2514,7 +2560,7 @@ TEST_F(HttpApiTest, searchUrlOverlayEchoPostbackEquivalent) {
   ASSERT_EQ(200, echo.result_int()) << echo.body();
   auto postback = httpRequest(port(), http::verb::post, "/collections/main/_search", echo.body());
   ASSERT_EQ(200, postback.result_int()) << postback.body();
-  EXPECT_EQ("{\"ops\":{\"q\":" + direct.body().substr(0, direct.body().size() - 1) + "}}\n",
+  EXPECT_EQ(explicitQuery(direct.body()),
             postback.body());
 
   auto echo2 = httpRequest(port(), http::verb::post,
@@ -2895,17 +2941,23 @@ TEST_F(HttpApiTest, schemaSetGetRoundTrip) {
 
   auto get = httpRequest(port(), http::verb::get, "/collections/main/_schema");
   ASSERT_EQ(200, get.result_int());
-  EXPECT_EQ(set.body(), get.body()) << "write response and GET speak the same shape";
+  glz::generic written, fetched;
+  ASSERT_FALSE(glz::read_json(written, set.body()));
+  ASSERT_FALSE(glz::read_json(fetched, get.body()));
+  EXPECT_EQ(glz::write_json(written["schema"]).value(), glz::write_json(fetched).value());
+  EXPECT_FALSE(written["commit"].get<std::string>().empty());
 
   // Echo doctrine: GET output is a valid write body, and posting it back is a
   // no-op under BOTH modes (set of identical defs is identity).
   auto setBack = httpRequest(port(), http::verb::post, "/collections/main/_schema", get.body());
   ASSERT_EQ(200, setBack.result_int()) << setBack.body();
-  EXPECT_EQ(get.body(), setBack.body());
+  ASSERT_FALSE(glz::read_json(written, setBack.body()));
+  EXPECT_EQ(glz::write_json(written["schema"]).value(), glz::write_json(fetched).value());
   auto replaceBack = httpRequest(port(), http::verb::post,
                                  "/collections/main/_schema?mode=replace_all", get.body());
   ASSERT_EQ(200, replaceBack.result_int()) << replaceBack.body();
-  EXPECT_EQ(get.body(), replaceBack.body());
+  ASSERT_FALSE(glz::read_json(written, replaceBack.body()));
+  EXPECT_EQ(glz::write_json(written["schema"]).value(), glz::write_json(fetched).value());
 }
 
 TEST_F(HttpApiTest, schemaBodiesRetainVariantDefaultsAcrossAsyncDispatch) {
@@ -3995,7 +4047,7 @@ TEST_F(HttpApiTest, explainResolvedFieldVariantsKeepsRequestAndReportsPhysicalTa
   auto direct = httpRequest(port(), http::verb::post, "/collections/main/_search", body);
   auto replay = httpRequest(port(), http::verb::post, "/collections/main/_search", explainedRequest(echo));
   ASSERT_EQ(200, direct.result_int()) << direct.body();
-  EXPECT_EQ("{\"ops\":{\"q\":" + direct.body().substr(0, direct.body().size() - 1) + "}}\n",
+  EXPECT_EQ(explicitQuery(direct.body()),
             replay.body());
   auto again = httpRequest(port(), http::verb::post,
       "/collections/main/_search?explain=resolved", explainedRequest(echo));
@@ -4048,9 +4100,80 @@ TEST_F(HttpApiTest, commitResponseIdentifiesSnapshot) {
   auto lines = splitLines(streamed.body());
   ASSERT_FALSE(lines.empty());
   ASSERT_FALSE(glz::read_json(eof, lines.back())) << streamed.body();
-  EXPECT_GT(CommitId::parse(eof["commit"].get<std::string>()).index_gen, commit);
-  EXPECT_EQ((uint64_t)CommitId::parse(eof["commit"].get<std::string>()).index_gen,
+  EXPECT_GT(CommitId::parse(eof["commits"]["main"]["commit"].get<std::string>()).index_gen, commit);
+  EXPECT_EQ((uint64_t)CommitId::parse(eof["commits"]["main"]["commit"].get<std::string>()).index_gen,
             readDurableIndexInfo(helper.getIndexWriter()->dir)->index_gen);
+}
+
+TEST_F(HttpApiTest, ndjsonEofKeepsAllCommitOutcomesOnFailure) {
+  CollectionHelper other(*luxirNode, "eof_failure_other");
+  auto cleanup = scope_guard([&] { luxirNode->deleteCollection("eof_failure_other"); });
+  auto writer = helper.getIndexWriter();
+  Signal::listen("manifestWritten", [&](void* source, void*, void*) -> void* {
+    if (source == writer.get()) throw FileIOException("commit failed");
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("manifestWritten"); });
+  for (bool multiple : {false, true}) {
+    std::string body = "{\"id\":\"first\"}\n";
+    if (multiple) body += "{\"_update_\":{\"collection\":\"eof_failure_other\"}}\n{\"id\":\"second\"}\n";
+    auto response = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=true", body, "application/x-ndjson");
+    ASSERT_EQ(200, response.result_int()) << response.body();
+    auto lines = splitLines(response.body());
+    ASSERT_FALSE(lines.empty());
+    glz::generic_i64 eof;
+    ASSERT_FALSE(glz::read_json(eof, lines.back()));
+    EXPECT_EQ("error", eof["status"].get<std::string>());
+    EXPECT_EQ("internal", eof["error"]["code"].get<std::string>());
+    EXPECT_FALSE(eof.contains("commit"));
+    EXPECT_FALSE(eof["commits"]["main"].contains("commit"));
+    EXPECT_EQ("internal", eof["commits"]["main"]["error"]["code"].get<std::string>());
+    EXPECT_EQ(multiple ? 2u : 1u, eof["commits"].get<glz::generic_i64::object_t>().size());
+    if (multiple) {
+      EXPECT_EQ(other.collection().getShard()->getSnapshots().snapshot()->id.token(),
+                eof["commits"]["eof_failure_other"]["commit"].get<std::string>());
+      EXPECT_FALSE(eof["commits"]["eof_failure_other"].contains("error"));
+      EXPECT_EQ(1, other.collection().getReaderManager().getReader()->liveDocs());
+    }
+  }
+  auto unary = httpRequest(port(), http::verb::post, "/collections/main/_update", R"({"commit":{}})");
+  ASSERT_EQ(200, unary.result_int());
+  glz::generic_i64 result; ASSERT_FALSE(glz::read_json(result, unary.body()));
+  EXPECT_EQ("error", result["status"].get<std::string>());
+}
+
+TEST_F(HttpApiTest, ndjsonEofKeepsDurableTokensAfterReplicaWaitFailure) {
+  LuxirNode node;
+  CollectionHelper failed(node, "failed"), other(node, "kept");
+  HttpServer localServer(node, 2, 0); localServer.start();
+  std::atomic<unsigned> parked{0};
+  Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* { parked++; return nullptr; });
+  auto unlisten = scope_guard([] { Signal::unlisten("replicationWaitParked"); });
+  auto response = std::async(std::launch::async, [&] {
+    return httpRequest(localServer.getPort(), http::verb::post,
+        "/collections/failed/_update?commit=true&wait_for_replicas=1&wait_for_replicas_timeout_ms=5000",
+        "{\"id\":\"first\"}\n{\"_update_\":{\"collection\":\"kept\"}}\n{\"id\":\"second\"}\n",
+        "application/x-ndjson");
+  });
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+  while (parked < 2 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  ASSERT_EQ(2u, parked.load());
+  auto removed = failed.collection().getShard()->getSnapshots().snapshot()->id.token();
+  auto kept = other.collection().getShard()->getSnapshots().snapshot()->id.token();
+  node.deleteCollection("failed");
+  node.getReplication().installed({"test", "t0", "kept", kept});
+  auto result = response.get();
+  ASSERT_EQ(200, result.result_int()) << result.body();
+  auto lines = splitLines(result.body());
+  glz::generic_i64 eof; ASSERT_FALSE(glz::read_json(eof, lines.back()));
+  EXPECT_EQ("ok", eof["status"].get<std::string>());
+  EXPECT_FALSE(eof.contains("error"));
+  EXPECT_EQ(removed, eof["commits"]["failed"]["commit"].get<std::string>());
+  EXPECT_EQ("cancelled", eof["commits"]["failed"]["replicas"]["outcome"].get<std::string>());
+  EXPECT_FALSE(eof["commits"]["failed"].contains("error"));
+  EXPECT_EQ(kept, eof["commits"]["kept"]["commit"].get<std::string>());
+  EXPECT_EQ(1, eof["commits"]["kept"]["replicas"]["serving"].get<int64_t>());
+  EXPECT_FALSE(eof["commits"]["kept"].contains("error"));
 }
 
 } // namespace luxir::test

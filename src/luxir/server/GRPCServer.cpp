@@ -28,6 +28,8 @@
 #include "luxir/util/TaggedPtr.h"
 #include "luxir/util/thread.h"
 #include "luxir/util/proto.h"
+#include "luxir/util/Signal.h"
+#include "luxir/server/CommitWaits.h"
 #include "luxir/util/ApiError.h"
 #include "RpcStatus.h"
 #include "ProtoUpdateMessage.h"
@@ -179,6 +181,9 @@ struct HppRequestState {
   std::vector<std::byte> wire;
   std::pmr::monotonic_buffer_resource resource;
   Message proto;
+  ~HppRequestState() {
+    if constexpr (std::is_same_v<Message, api::UpdateRequest>) Signal::emit("grpcUpdateBodyDestroyed");
+  }
 };
 
 static grpc::Status dumpByteBuffer(grpc::ByteBuffer& buf, std::vector<std::byte>& wire) {
@@ -230,6 +235,7 @@ static grpc::Status grpcStatus(const ErrorInfo& info) {
 template <typename Message>
 static bool parseRequest(grpc::ByteBuffer& buf, HppRequestState<Message>& state, std::string_view method) {
   auto grpcStatus = dumpByteBuffer(buf, state.wire);
+  buf.Clear(); // state.wire now owns the request; do not retain duplicate transport slices.
   if (!grpcStatus.ok()) {
     LOG_ERROR("{}: failed to read request ByteBuffer: {}", method, grpcStatus.error_message());
     return false;
@@ -293,6 +299,7 @@ public:
   std::vector<std::function<void()>> drainWaiters;  // parked producer resumes
   bool errored = false;
   bool readsDone = false;
+  bool readOutstanding = false;
   bool writeOutstanding = false;
   bool finishSent = false;
   // Serializes async request execution per call: while a dispatched request is
@@ -310,11 +317,14 @@ public:
   // the in-flight alarm tag can never dangle.
   std::optional<grpc::Alarm> finishKick;
 
-  enum CallTags { READ = 1, WRITE = 2, FINISH = 3, CONNECT = 4, KICK = 5 };
+  bool doneReceived = false;
+  bool finishReceived = false;
+  enum CallTags { READ = 1, WRITE = 2, FINISH = 3, CONNECT = 4, KICK = 5, DONE = 6 };
 
   GenericCallData(GRPCServer& server, grpc::AsyncGenericService& genericService, GRPCServer::ThreadInfo& threadInfo)
       : CallData(server, threadInfo), genericService(genericService), readerWriter(&genericCtx),
         highWater(server.streamBufferBytes()), lowWater(server.streamBufferBytes() / 2) {
+    genericCtx.AsyncNotifyWhenDone(make_tag(DONE));
     genericService.RequestCall(&genericCtx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
   }
 
@@ -322,6 +332,7 @@ public:
     if (serverCancellation) return;
     waitCancellation = std::stop_source{};
     serverCancellation.emplace(server.stopToken(), [this] { waitCancellation.request_stop(); });
+    if (doneReceived && genericCtx.IsCancelled()) waitCancellation.request_stop();
   }
 
   void createNew() {
@@ -474,9 +485,20 @@ public:
     }
   }
 
+  // mutex held, or initial CONNECT before dispatching any work.
   void readRequest() {
+    assert(!readOutstanding);
+    readOutstanding = true;
     readBuf.Clear();
     readerWriter.Read(&readBuf, make_tag(READ));
+  }
+
+  // CQ thread only. An early error can finish while a stream read is pending;
+  // its tag still owns the call even after DONE and FINISH have arrived.
+  void deleteIfFinished() {
+    if (!doneReceived || !finishReceived) return;
+    { const std::lock_guard<std::mutex> lock(mutex); if (readOutstanding) return; }
+    delete this;
   }
 
   virtual void proceed(bool ok, uint32_t tag) override {
@@ -505,15 +527,18 @@ public:
         }
         readRequest();
         break;
-      case READ:
-        if (!ok) {
-          readsDone = true;
-          { const std::lock_guard<std::mutex> lock(mutex); maybeSendFinish(); }
-          break;
+      case READ: {
+        bool discard;
+        {
+          const std::lock_guard<std::mutex> lock(mutex);
+          readOutstanding = false;
+          if (!ok) readsDone = true;
+          discard = readsDone || finishSent;
+          if (discard) maybeSendFinish();
+          // A response may arrive from another thread before handle returns.
+          else responsesExpected++;
         }
-        // respondRaw() can be called (possibly from another thread) before handle()
-        // returns, so account for the expected response before dispatching.
-        { const std::lock_guard<std::mutex> lock(mutex); responsesExpected++; }
+        if (discard) { deleteIfFinished(); break; }
         methodEntry->handle(*this, readBuf);
         {
           const std::lock_guard<std::mutex> lock(mutex);
@@ -525,9 +550,10 @@ public:
             rearmPending = true;
             break;
           }
+          readRequest();
         }
-        readRequest();
         break;
+      }
       case WRITE:
         writeFinished(ok);
         break;
@@ -539,8 +565,14 @@ public:
         maybeSendFinish();
         break;
       }
+      case DONE:
+        doneReceived = true;
+        if (genericCtx.IsCancelled()) waitCancellation.request_stop();
+        deleteIfFinished();
+        break;
       case FINISH:
-        delete this;
+        finishReceived = true;
+        deleteIfFinished();
         break;
       default:
         LOG_ERROR("Unknown tag {} on generic call {}", tag, (void*)this);
@@ -550,19 +582,13 @@ public:
 };
 
 
-static std::shared_ptr<Collection> resolveCollection(GRPCServer& server,
-                                                     std::string_view collection) {
-  return server.getLuxirNode().resolveCollection(collection);
-}
+// Data-plane calls act in the caller's tenant: the default tenant until calls
+// carry credentials. Administration requests may name a tenant.
+static constexpr std::string_view kCallerTenant = {};
 
 template <typename Request>
 static std::shared_ptr<Collection> resolveUpdateCollection(GRPCServer& server, const Request& request) {
-  return server.getLuxirNode().resolveOrCreateCollection(request.collection);
-}
-
-static std::shared_ptr<Collection> resolveSetSchemaCollection(GRPCServer& server,
-                                                              std::string_view collection) {
-  return server.getLuxirNode().resolveOrCreateCollection(collection);
+  return server.getLuxirNode().getOrCreateCollection(LuxirNode::target(kCallerTenant, request.collection));
 }
 
 static void finishWithError(GenericCallData& call, const ErrorInfo& info) {
@@ -681,22 +707,27 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   public:
     std::unique_ptr<HppRequestState<UpdateReqProto>> request;
     GenericCallData* parent;
+    const std::stop_token waitToken;
     Update(std::unique_ptr<HppRequestState<UpdateReqProto>> requestState, GenericCallData* parent)
-      : ProtoUpdateMessage(&requestState->proto), request(std::move(requestState)), parent(parent) {}
+      : ProtoUpdateMessage(&requestState->proto), request(std::move(requestState)), parent(parent),
+        // Admission runs on the completion queue thread, as does enabling
+        // cancellation. Worker completions never read the mutable stop source.
+        waitToken(parent->waitCancellation.get_token()) {}
     virtual void done(IndexWriter& iw) override {
       unused(iw);
-      complete(parent->server.getLuxirNode(), [this] {
-        auto* response = finishResponse();
-        request.reset(); // Keep the response arena, release the update body.
-        parent->server.getLuxirNode().getTaskArena().enqueue([this, response] {
+      auto completed = takeCompletion(parent->server.getLuxirNode());
+      auto* call = parent;
+      auto stop = waitToken;
+      delete this;
+      completed->await(call->server.getLuxirNode(), [call](auto result) {
+        call->server.getLuxirNode().getTaskArena().enqueue([call, result] {
           try {
-            parent->respondRaw(serializeToByteBuffer(*response), 1);
+            call->respondRaw(serializeToByteBuffer(result->response), 1);
           } catch (const std::exception& e) {
-            parent->finishWithError(grpcStatus(classifyException(e, ErrorKind::INTERNAL)));
+            call->finishWithError(grpcStatus(classifyException(e, ErrorKind::INTERNAL)));
           }
-          delete this;
         });
-      }, parent->waitCancellation.get_token());
+      }, stop);
     }
   };
 
@@ -705,8 +736,9 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     auto shard = collection->getShard();
     auto iw = shard->requireIndexWriter();
 
-    if (request->proto.commit && !request->proto.commit->wait_for_replicas.empty()) call.enableWaitCancellation();
+    if (request->proto.commit && request->proto.commit->wait_for_replicas.has_value()) call.enableWaitCancellation();
     Update* updateMessage = new Update(std::move(request), &call);
+    updateMessage->target = collection->getId();
     try {
       if (!iw->submitUpdate(updateMessage)) {
         throw std::runtime_error("update was not admitted");
@@ -732,11 +764,13 @@ static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& read
   try {
     call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
       try {
-        call.server.getLuxirNode().createCollection(
-            nullptr, request->proto.name,
+        auto created = call.server.getLuxirNode().createCollection(
+            LuxirNode::adminTarget(request->proto.tenant, request->proto.name),
             request->proto.schema ? &*request->proto.schema : nullptr);
         CreateCollectionRespProto response;
         response.name = request->proto.name;
+        auto token = created->getShard()->requireIndexWriter()->initialCommit().token();
+        response.commit = token;
         call.respondRaw(serializeToByteBuffer(response), 1);
       } catch (const std::exception& e) {
         finishWithException(call, e);
@@ -759,7 +793,7 @@ static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& read
   try {
     call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
       try {
-        call.server.getLuxirNode().deleteCollection(request->proto.name);
+        call.server.getLuxirNode().deleteCollection(LuxirNode::adminTarget(request->proto.tenant, request->proto.name));
         DeleteCollectionRespProto response;
         response.name = request->proto.name;
         call.respondRaw(serializeToByteBuffer(response), 1);
@@ -787,9 +821,11 @@ static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     SchemaRespProto response;
     std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
 
-    auto collection = resolveSetSchemaCollection(call.server, request.proto.collection);
+    auto collection = call.server.getLuxirNode().getOrCreateCollection(
+        LuxirNode::target(request.proto.tenant, request.proto.collection));
     auto newSchema = collection->updateSchema(*request.proto.schema, request.proto.mode);
-    newSchema->toProto(&response.schema.emplace(), respArena);
+    newSchema->schema->toProto(&response.schema.emplace(), respArena);
+    response.commit = api::build::arenaStr(respArena, newSchema->id.token());
 
     grpc::ByteBuffer buf = serializeToByteBuffer(response);
     call.respondRaw(std::move(buf), 1);
@@ -809,7 +845,8 @@ static void handleGetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     SchemaRespProto response;
     std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
 
-    auto collection = resolveCollection(call.server, request.proto.collection);
+    auto collection = call.server.getLuxirNode().getCollection(
+        LuxirNode::target(request.proto.tenant, request.proto.collection));
     auto schema = collection->getSchema();
     schema->toProto(&response.schema.emplace(), respArena);
 
@@ -876,6 +913,32 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
   }
 }
 
+static void handleWaitForReplicas(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  HppRequestState<api::WaitForReplicasRequest> request;
+  if (!parseRequest(readBuf, request, "WaitForReplicas")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "WaitForReplicas: malformed request"));
+    return;
+  }
+  try {
+    if (!request.proto.wait_for_replicas) throw RequestError("wait_for_replicas is required");
+    auto id = CommitId::parse(request.proto.commit);
+    auto name = LuxirNode::target({}, request.proto.collection);
+    auto& node = call.server.getLuxirNode();
+    call.enableWaitCancellation();
+    { std::lock_guard lock(call.mutex); call.requestActive = true; }
+    node.getCommitWaits().awaitReplicas(std::move(name), id, *request.proto.wait_for_replicas,
+        node.getCommitWaits().deadlineAfter(request.proto.wait_for_replicas_timeout_ms.value_or(30000)),
+        call.waitCancellation.get_token(), [&call, token = id.token()](api::ReplicaResult replicas) {
+          call.server.getLuxirNode().getTaskArena().enqueue([&call, token, replicas] {
+            try {
+              api::WaitForReplicasResponse response{token, replicas};
+              call.respondRaw(serializeToByteBuffer(response), 1);
+            } catch (const std::exception& e) { finishWithException(call, e); }
+          });
+        });
+  } catch (const std::exception& e) { finishWithException(call, e); }
+}
+
 // ---- method routing ------------------------------------------------------
 
 static const MethodEntry* lookupMethod(const std::string& method) {
@@ -887,6 +950,7 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/luxir.Admin/GetSchema",          {handleGetSchema}},
     {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true}},
     {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true}},
+    {"/luxir.Admin/WaitForReplicas",     {handleWaitForReplicas}},
     {"/luxir.Admin/Stats",              {handleStats}},
     {"/luxir.Admin/CacheControl",       {handleCacheControl}},
   };

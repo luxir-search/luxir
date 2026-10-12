@@ -55,6 +55,10 @@ public:
   // index).  CheckedDirectory uses this flag to detect missing fsyncs.
   virtual std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) = 0;
 
+  // The caller asserts that `files` were fsynced: a root about to be published
+  // references them (Manifest::commit). CheckedDirectory verifies it.
+  virtual void expectSynced(std::span<const FileDescriptor> files) { unused(files); }
+
   virtual std::unique_ptr<File> createFile(const std::string_view name) = 0;
 
   // Backends that support delayed materialization may honor these options.
@@ -121,8 +125,11 @@ public:
     for (const auto& file : wanted) {
       auto it = byName.find(file.name);
       if (it == byName.end() || *it->second != file) continue;
-      if (!openFile(file.name)) linkFile(source, file.name);
-      else continue; // An unpublished candidate must be verified by its caller.
+      // An existing (even unreadable) candidate must be verified by its caller.
+      bool present = true;
+      try { present = openFile(file.name) != nullptr; } catch (const std::exception&) {}
+      if (present) continue;
+      linkFile(source, file.name);
       reused.push_back(file);
     }
     return reused;

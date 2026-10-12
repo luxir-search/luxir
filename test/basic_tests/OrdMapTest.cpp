@@ -684,6 +684,27 @@ TEST_F(OrdMapTest, FlatPredictedAndFitParityAcrossBlockBoundary) {
                 flatMapping.globalOrd(localOrd));
     }
 
+    // The batch map agrees with the point map in any order, across the
+    // predicted block boundary, and rebases alone under identity.
+    std::vector<int32_t> stored;
+    for (int64_t i = 0; i < nTermsPerSegment; i++) {
+      stored.push_back((int32_t)((i * 769) % nTermsPerSegment) + 1);
+    }
+    std::vector<int64_t> mapped(stored.size());
+    for (const OrdMap::SegToGlobal* mapping :
+         {&flatMapping, &predictedMapping, &fitMapping}) {
+      mapping->globalOrdsOfStored(stored.data(), (int32_t)stored.size(),
+                                  mapped.data());
+      for (size_t i = 0; i < stored.size(); i++) {
+        ASSERT_EQ(mapping->globalOrd(stored[i] - 1), mapped[i]) << i;
+      }
+    }
+    OrdMap::SegToGlobal::identity().globalOrdsOfStored(
+        stored.data(), (int32_t)stored.size(), mapped.data());
+    for (size_t i = 0; i < stored.size(); i++) {
+      ASSERT_EQ(stored[i] - 1, mapped[i]) << i;
+    }
+
     for (uint64_t start : {3968u, 4096u}) {
       uint64_t flatDeltas[128];
       uint64_t predictedDeltas[128];

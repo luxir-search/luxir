@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 
+#include <future>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -955,23 +956,23 @@ TEST_F(GrpcIndexTest, replicaBarrierAndSearchFloor) {
   helper.index(flatdoc("id", "floor"), UpdateMessage::COMMIT);
   api::UpdateRequest update;
   update.commit.emplace();
-  update.commit->wait_for_replicas = "all";
+  update.commit->wait_for_replicas = api::ReplicaRequirement{api::AllReplicas{}};
   update.commit->commit_within_ms = 60000;
   Reply<api::UpdateResponse> reply;
   grpc::ClientContext unary;
   ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::Update, &unary, update, &reply).ok());
   ASSERT_TRUE(reply.msg.replicas.has_value());
-  EXPECT_EQ(false, reply.msg.replicas->timed_out);
+  EXPECT_EQ(api::ReplicaResult::Outcome::SATISFIED, reply.msg.replicas->outcome);
   ASSERT_FALSE(reply.msg.commit.empty());
   std::string token(reply.msg.commit);
 
-  update.commit->wait_for_replicas = "1";
-  update.commit->replication_timeout_ms = 0;
+  update.commit->wait_for_replicas = api::ReplicaRequirement{uint32_t{1}};
+  update.commit->wait_for_replicas_timeout_ms = 0;
   grpc::ClientContext updates;
   HppClientReaderWriter<api::UpdateRequest, api::UpdateResponse> updateStream(channel.get(), rpc::UpdateStream, &updates);
   ASSERT_TRUE(updateStream.Write(update)); updateStream.WritesDone();
   ASSERT_TRUE(updateStream.Read(&reply));
-  ASSERT_TRUE(reply.msg.replicas); EXPECT_EQ(true, reply.msg.replicas->timed_out);
+  ASSERT_TRUE(reply.msg.replicas); EXPECT_EQ(api::ReplicaResult::Outcome::TIMED_OUT, reply.msg.replicas->outcome);
   EXPECT_TRUE(updateStream.Finish().ok());
 
   TrivialSearchRequest fixture;
@@ -1000,5 +1001,110 @@ TEST_F(GrpcIndexTest, replicaBarrierAndSearchFloor) {
   ASSERT_TRUE(stream.Write(fixture.request)); stream.WritesDone();
   ASSERT_TRUE(stream.Read(&response)); ASSERT_TRUE(response.msg.error);
   EXPECT_EQ("commit_incarnation_mismatch", response.msg.error->code);
+  EXPECT_TRUE(stream.Finish().ok());
+}
+
+TEST_F(GrpcIndexTest, pipelinedUpdatesEnableReplicaWaitAfterAdmission) {
+  // Each stream starts without a wait, then enables cancellation while earlier
+  // updates can still complete on indexing threads.
+  for (int round = 0; round < 16; round++) {
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+    HppClientReaderWriter<api::UpdateRequest, api::UpdateResponse> stream(channel.get(), rpc::UpdateStream, &context);
+    for (int i = 0; i < 8; i++) {
+      api::UpdateRequest update;
+      update.commit.emplace();
+      if (i % 2) {
+        update.commit->wait_for_replicas = api::ReplicaRequirement{uint32_t{1}};
+        update.commit->wait_for_replicas_timeout_ms = 0;
+      }
+      ASSERT_TRUE(stream.Write(update));
+    }
+    stream.WritesDone();
+    Reply<api::UpdateResponse> reply;
+    int responses = 0, waits = 0;
+    while (stream.Read(&reply)) {
+      EXPECT_FALSE(reply.msg.error);
+      EXPECT_FALSE(reply.msg.commit.empty());
+      if (reply.msg.replicas) { waits++; EXPECT_EQ(api::ReplicaResult::Outcome::TIMED_OUT, reply.msg.replicas->outcome); }
+      responses++;
+    }
+    EXPECT_TRUE(stream.Finish().ok());
+    EXPECT_EQ(8, responses);
+    EXPECT_EQ(4, waits);
+  }
+}
+
+TEST_F(GrpcIndexTest, standaloneWaitReturnsTokenWithoutCommitting) {
+  CollectionHelper helper("main");
+  auto id = helper.collection().getShard()->getSnapshots().snapshot()->id;
+  auto token = id.token();
+  api::WaitForReplicasRequest request;
+  request.commit = token;
+  request.wait_for_replicas = api::ReplicaRequirement{uint32_t{1}};
+  request.wait_for_replicas_timeout_ms = 0;
+  Reply<api::WaitForReplicasResponse> response;
+  grpc::ClientContext first;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::WaitForReplicas, &first, request, &response).ok());
+  EXPECT_EQ(token, response.msg.commit);
+  EXPECT_EQ(api::ReplicaResult::Outcome::TIMED_OUT, response.msg.replicas->outcome);
+  request.wait_for_replicas = api::ReplicaRequirement{api::AllReplicas{}};
+  grpc::ClientContext second;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::WaitForReplicas, &second, request, &response).ok());
+  EXPECT_EQ(api::ReplicaResult::Outcome::SATISFIED, response.msg.replicas->outcome);
+  EXPECT_EQ(id, helper.collection().getShard()->getSnapshots().snapshot()->id);
+}
+
+TEST_F(GrpcIndexTest, updateBodyReleasedBeforeWaitAndClientCancellationDrains) {
+  std::atomic<int> destroyed{0};
+  Signal::listen("grpcUpdateBodyDestroyed", [&](void*, void*, void*) -> void* { destroyed++; return nullptr; });
+  std::promise<void> parked;
+  std::promise<api::ReplicaResult> completed;
+  Signal::listen("replicaWaitCompleted", [&](void* value, void*, void*) -> void* {
+    completed.set_value(*(api::ReplicaResult*)value); return nullptr;
+  });
+  Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* {
+    EXPECT_GT(destroyed.load(), 0); parked.set_value(); return nullptr;
+  });
+  api::UpdateRequest update;
+  update.commit.emplace().wait_for_replicas = api::ReplicaRequirement{uint32_t{1}};
+  update.commit->wait_for_replicas_timeout_ms = 600000;
+  grpc::ClientContext context;
+  auto call = std::async(std::launch::async, [&] {
+    Reply<api::UpdateResponse> response;
+    return hppUnaryCall(channel.get(), rpc::Update, &context, update, &response);
+  });
+  ASSERT_EQ(std::future_status::ready, parked.get_future().wait_for(std::chrono::seconds(3)));
+  context.TryCancel();
+  EXPECT_EQ(grpc::StatusCode::CANCELLED, call.get().error_code());
+  auto outcome = completed.get_future();
+  ASSERT_EQ(std::future_status::ready, outcome.wait_for(std::chrono::seconds(3)));
+  EXPECT_EQ(api::ReplicaResult::Outcome::CANCELLED, outcome.get().outcome);
+}
+
+TEST_F(GrpcIndexTest, createSchemaAndSearchReturnExactTokens) {
+  api::CreateCollectionRequest create;
+  create.name = "grpc_tokens";
+  Reply<api::CreateCollectionResponse> created;
+  grpc::ClientContext creation;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::CreateCollection, &creation, create, &created).ok());
+  auto initial = CommitId::parse(created.msg.commit);
+  api::SchemaRequest schema;
+  schema.collection = create.name;
+  schema.schema.emplace();
+  Reply<api::SchemaResponse> changed;
+  grpc::ClientContext update;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::SetSchema, &update, schema, &changed).ok());
+  auto publication = CommitId::parse(changed.msg.commit);
+  EXPECT_EQ(initial.incarnation, publication.incarnation);
+  EXPECT_GT(publication.index_gen, initial.index_gen);
+  api::SearchRequest search;
+  search.collection = create.name;
+  grpc::ClientContext context;
+  HppClientReaderWriter<api::SearchRequest, api::SearchResponse> stream(channel.get(), rpc::Search, &context);
+  ASSERT_TRUE(stream.Write(search)); stream.WritesDone();
+  Reply<api::SearchResponse> result;
+  ASSERT_TRUE(stream.Read(&result));
+  EXPECT_EQ(publication.token(), result.msg.commit);
   EXPECT_TRUE(stream.Finish().ok());
 }

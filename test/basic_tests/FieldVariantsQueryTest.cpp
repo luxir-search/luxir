@@ -605,7 +605,7 @@ TEST_F(FieldVariantsQueryTest, exactVariablesAndExplainDoNotMutateInput) {
     data[1] = "George R.R. Martin";
     vars[0] = {"values", values};
     vars[1] = {"one", qb::valStr(req->mr, "Ursula K. Le Guin")};
-    auto notes = helper.getSearchEngine().explain(req->rawRequest());
+    auto notes = helper.getSearchEngine().explain(req->rawRequest(), {});
     EXPECT_TRUE(std::ranges::contains(notes, std::string("q: author -> author__s")));
     ASSERT_TRUE(std::holds_alternative<api::ExprQuery>(top.rawQuery().kind));
     EXPECT_EQ(expression, std::get<api::ExprQuery>(top.rawQuery().kind).q);

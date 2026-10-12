@@ -75,6 +75,14 @@ class IndirectPQ {
     }
   }
 public:
+  // Reuse the pointer storage after its owner repopulates it. In particular,
+  // removed/exhausted members may rejoin after a scorer reset.
+  void reset(size_t count) {
+    assert(count <= pointers.size());
+    end = pointers.data() + count;
+    makeHeap();
+  }
+
   /// Form a priority queue over the span of pre-filled pointers to T.  The pointers do not need to point to
   /// contiguous elements.  The size of the span is never modified, but it's pointers are swapped to make a heap.
   /// This form does not have a valid reference pointer to the original array, so indexOfTop() should not be used.

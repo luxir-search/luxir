@@ -93,7 +93,7 @@ TEST_F(AllQueryCapabilityShapeTest,
   Segment zeroSegment(
       std::move(postings), std::shared_ptr<LiveDocs>{},
       std::vector<std::shared_ptr<AuxReader>>{}, info, 0, 0);
-  AllQuery::Supplier supplier(zeroSegment, 0.0f);
+  AllQuery::Supplier supplier(zeroSegment, 0.0f, false);
   MemPool pool;
 
   EXPECT_EQ(0, supplier.cost());
@@ -113,7 +113,7 @@ TEST_F(AllQueryCapabilityShapeTest, disableSwitchGatesDenseClauseProtocol) {
 
   {
     DenseClauseGuard enabled(false);
-    AllQuery::Supplier supplier(segment, 0.0f);
+    AllQuery::Supplier supplier(segment, 0.0f, false);
     expectExactAllShape(
         supplier.describeScorer({}), Query::ClauseShape::DIRECT);
     EXPECT_EQ(Query::ClauseShape::DIRECT,
@@ -122,7 +122,7 @@ TEST_F(AllQueryCapabilityShapeTest, disableSwitchGatesDenseClauseProtocol) {
   }
   {
     DenseClauseGuard disabled(true);
-    AllQuery::Supplier supplier(segment, 0.0f);
+    AllQuery::Supplier supplier(segment, 0.0f, false);
     expectExactAllShape(
         supplier.describeScorer({}), Query::ClauseShape::NONE);
     EXPECT_EQ(Query::ClauseShape::NONE,
@@ -193,7 +193,7 @@ TEST_F(AllQueryCapabilityShapeTest,
 
   auto collect = [&](ConstantScoreDrain drain) -> int64_t {
     MemPool pool;
-    AllQuery::Supplier supplier(segment, 1.0f);
+    AllQuery::Supplier supplier(segment, 1.0f, true);
     Query::ScorerSupplier::BulkScorerContext context;
     auto plan = supplier.planBulk(
         Query::ExecutionUse::SCORED_WINDOWS, context);

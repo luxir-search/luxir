@@ -359,7 +359,7 @@ private:
     // survivor filenums sparse instead of densely renumbering them: a stream
     // that already spilled can retain its storage key, avoiding rename/copy
     // work on filesystems and future object stores.
-    // A stream holding only the LUXIR002 header carried no data.  If nothing
+    // A stream holding only the file header carried no data.  If nothing
     // references it, drop it outright instead of folding eight bytes plus
     // alignment pad into file 0.  A zero-length structure can still park a
     // FieldInfo base at a header-only file's tail, so referenced ones are
