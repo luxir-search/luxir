@@ -105,6 +105,48 @@ deserialization step and no buffer copies between the page cache and query
 execution. The OS page cache is the caching layer - a hot index is served
 from memory, a cold one faults in on demand.
 
+### Index sidecars
+
+Every committed snapshot carries compact metadata beside its immutable files
+(`Sidecar` in `protos/luxir_index.proto`). A segment sidecar (`s<seg>__M`) is
+written with the segment, at flush or merge; the snapshot sidecar
+(`IndexInfo.sidecar`) covers what changes per commit: live docs, segment
+overlays and index-level aux files. Both are listed in the manifest like any
+other file, so replication copies and verifies them and retirement sweeps
+them with the snapshot.
+
+- **Byte-range map.** Each file is partitioned into ranges labelled with a
+  structure kind (field directory, term index, postings, positions,
+  columns, points, stored fields, IVF header and lists, ...), the field, and
+  a priority tier: 0 is what opening a segment and planning a query reads,
+  1 is what most queries read, 2 is bulk payload (positions, stored fields,
+  full-precision vectors). The writer records it as it finishes the segment:
+  every structure start it already keeps, plus exact extents for structures
+  that have no start pointer (docs-with-field bitsets, the later ranges of a
+  partitioned term merge). Bytes no recorded structure starts at are kept as
+  `STRUCTURE_UNKNOWN` rather than guessed.
+- **Chunk hashes.** XXH3-64 of every 1 MiB chunk of every file, so a reader
+  that fetches part of a file can verify each chunk on its own. 1 MiB is one
+  fast object-store request while the hash list stays at 8 bytes per MiB.
+  The manifest's whole-file digests verify the sidecars themselves.
+- **Persisted global ordinals.** A commit that changes the segment set
+  builds the OrdMaps a reader would otherwise build on the first facet or
+  string sort, and stores them as the index-level aux entry `ordmaps`, keyed
+  by `core_gen` and bound to the segments' digests. Deletes-only commits
+  carry the file forward. Readers whose segment set matches load a field's
+  map on first use (a copy and a digest check instead of a merge of every
+  terms dictionary) and otherwise build it. `--indexing.persist-ordmaps`
+  chooses the fields: `used` (default: those the published reader needed,
+  kept across restarts), `all` (every indexed string field with an ordinal column, for deployments
+  where only replicas serve queries), or `off`. This moves the build into
+  commit latency, which is why `used` is the default.
+
+Sidecars are hints: a missing, stale or corrupt one is detected by its
+digest, logged and ignored, and nothing a query returns depends on it. The
+replication follower uses them now, fetching sidecars first and then files
+by the lowest tier they hold; the same data is what a future range-reading
+hydrator needs to fetch routing structures first and verify each fetch.
+
 ### SIMD and branch discipline
 
 - Postings and numeric data are compressed with SIMD codecs (FastPFOR-based
