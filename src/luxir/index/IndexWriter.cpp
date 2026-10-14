@@ -27,6 +27,7 @@
 #include "SegmentMerger.h"
 #include "VectorIndexBuilder.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
+#include "luxir/search/OrdMapStore.h"
 
 
 namespace luxir {
@@ -176,6 +177,22 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     currentAuxIndexes_.reserve(indexInfo.aux_indexes.size());
     for (const auto& aux : indexInfo.aux_indexes) {
       currentAuxIndexes_.push_back(fromWire(aux));
+    }
+    // Seed the snapshot sidecar so the next commit reuses its file entries;
+    // an unreadable one is simply rewritten by that commit.
+    if (indexInfo.sidecar) {
+      publishedSidecar = FileDescriptor{std::string(indexInfo.sidecar->name), indexInfo.sidecar->size,
+                                        indexInfo.sidecar->xxh3};
+      if (auto reader = SidecarReader::open(dir, *publishedSidecar)) {
+        for (const auto& file : reader->files) {
+          sidecar::FileMap map{file.name, file.size, file.xxh3, file.chunks, {}};
+          for (const auto& range : file.ranges) {
+            uint32_t field = range.field.empty() ? 0 : publishedSidecarContents.fieldId(range.field);
+            map.extents.push_back({range.offset, range.length, range.kind, field});
+          }
+          publishedSidecarContents.files.push_back(std::move(map));
+        }
+      }
     }
   }
   if (!manifest.bytes) {
@@ -1067,6 +1084,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
       // uncomment to serialize inverter flushing (for testing purposes)
       // const std::lock_guard<std::mutex> lock(indexMutex);
       success = inverter.flush(&flushedFiles, &descriptors);
+      if (success) addSegmentSidecar(inverter.getPostingsWriter(), flushedFiles, descriptors);
     } catch (const std::exception& e) {
       LOG_ERROR("Exception caught while flushing inverter: {}", e.what());
       inverter.fail(std::current_exception());
@@ -1424,6 +1442,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // kinds only.
   auto auxIndexInfos = buildAuxIndexes(msg, segsToKeep, filesToSync);
   buildSegmentOverlays(msg, segsToKeep, filesToSync);
+  auto sidecarContents = snapshotSidecarContents(segsToKeep, auxIndexInfos);
 
   // Make all dependencies durable before a root can reference them. Keep data
   // I/O outside publicationMutex so schema updates can publish independently.
@@ -1437,7 +1456,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // The schema may have advanced while these segments/overlays were built.
   std::unique_lock publicationLock(publicationMutex);
   CommitId result{incarnation, 0};
-  writeIndexInfoFile(segsToKeep, *msg.commitInfo, auxIndexInfos);
+  writeIndexInfoFile(segsToKeep, *msg.commitInfo, auxIndexInfos, sidecarContents);
   for (auto* seg : segsToKeep) seg->unsyncedFiles.clear();
   result.index_gen = indexGen;
   msg.resultingCommit = std::move(result);
@@ -1556,36 +1575,174 @@ void IndexWriter::moveSegmentToDelete(uint64_t segId) {
 }
 
 
+// Hashes a just-finished segment's data files and writes its sidecar beside
+// them, as one more unsynced segment file.
+void IndexWriter::addSegmentSidecar(const PostingsWriter& writer, std::vector<std::string>& unsynced,
+                                    std::vector<FileDescriptor>& files) {
+  auto contents = writer.layout();
+  for (auto& file : contents.files) {
+    auto input = dir.openFile(file.name);
+    if (!input) throw std::runtime_error("Missing segment file " + file.name);
+    sidecar::hash(input->read(), file);
+  }
+  auto descriptor = sidecar::write(dir, sidecar::segmentFileName(writer.segId), contents);
+  unsynced.push_back(descriptor.name);
+  files.push_back(std::move(descriptor));
+}
+
 // Produce the index-level aux list to publish in this commit's IndexInfo.
 // Vectors are not built here; they are segment overlays handled by
-// buildSegmentOverlays.  The old built_core_gen filter remains only for
-// future index-level aux kinds that choose to use it.
+// buildSegmentOverlays.  Entries stamped with a built_core_gen are carried
+// only while the segment set is unchanged; persisted OrdMaps are rebuilt
+// when it changes.
 std::vector<AuxInfo> IndexWriter::buildAuxIndexes(
     const UpdateMessage& msg,
     std::span<SegInfo*> segsToKeep,
     std::vector<std::string>& outFilesToSync) {
-  unused(segsToKeep, outFilesToSync);
   // Physical composition is fixed before aux preparation.
   assert(msg.commitInfo);
   uint64_t newCoreGen = msg.commitInfo->coreGen;
 
-  // Step 1: filter previous list by core gen.  Build a set of "still valid"
-  // names (segment-dependent entries whose built_core_gen matches the new
-  // core gen) - rebuilding those would produce identical output, so we tell
-  // the builder to skip them.
-  std::lock_guard lock(indexMutex);
   std::vector<AuxInfo> carried;
-  carried.reserve(currentAuxIndexes_.size());
-  for (const auto& prev : currentAuxIndexes_) {
-    if (prev.kind == VectorIndexBuilder::KIND) {
-      continue;
-    }
-    if (prev.built_core_gen == 0 || prev.built_core_gen == newCoreGen) {
-      carried.push_back(prev);
+  std::vector<std::string> persistedOrdMapFields;
+  bool ordMapsCarried = false;
+  {
+    std::lock_guard lock(indexMutex);
+    carried.reserve(currentAuxIndexes_.size());
+    for (const auto& prev : currentAuxIndexes_) {
+      if (prev.kind == VectorIndexBuilder::KIND) {
+        continue;
+      }
+      if (prev.kind == OrdMapStore::KIND) {
+        persistedOrdMapFields = ordMapFieldsOf(prev);
+        if (persistOrdMaps == OrdMapPersistence::OFF) continue;
+        ordMapsCarried = prev.built_core_gen == newCoreGen;
+      }
+      if (prev.built_core_gen == 0 || prev.built_core_gen == newCoreGen) {
+        carried.push_back(prev);
+      }
     }
   }
-
+  // A deletes-only commit keeps the segment set, so the maps stay valid.
+  if (!ordMapsCarried && persistOrdMaps != OrdMapPersistence::OFF && !segsToKeep.empty()) {
+    if (auto ordMaps = buildOrdMaps(newCoreGen, segsToKeep, persistedOrdMapFields)) {
+      outFilesToSync.push_back(ordMaps->files[0].name);
+      carried.push_back(std::move(*ordMaps));
+    }
+  }
   return carried;
+}
+
+std::vector<std::string> IndexWriter::ordMapFieldsOf(const AuxInfo& info) {
+  std::vector<std::string> fields;
+  std::string_view meta((const char*)info.opaque_meta.data(), info.opaque_meta.size());
+  while (!meta.empty()) {
+    auto end = meta.find('\0');
+    fields.emplace_back(meta.substr(0, end));
+    meta.remove_prefix(end == std::string_view::npos ? meta.size() : end + 1);
+  }
+  return fields;
+}
+
+// Persists global-ordinal maps for the new segment set. USED covers fields
+// the published reader built or loaded maps for since the last change of
+// segment set, plus the fields persisted before (so the set survives
+// restarts); ALL covers every indexed string field with an ord column. Building here moves the
+// first facet/sort query's map build into the commit, and lets every reader
+// of this snapshot, local or replicated, load the maps instead.
+std::optional<AuxInfo> IndexWriter::buildOrdMaps(uint64_t newCoreGen, std::span<SegInfo*> segs,
+                                                 std::vector<std::string> fields) {
+  if (persistOrdMaps == OrdMapPersistence::USED) {
+    std::shared_ptr<IndexReader> published = snapshots.readers.indexReader.load(std::memory_order_acquire);
+    if (published && published->incarnation() == incarnation) {
+      auto used = published->cachedOrdMapFields();
+      fields.insert(fields.end(), used.begin(), used.end());
+    }
+    if (fields.empty()) return std::nullopt;
+  }
+  std::vector<std::shared_ptr<PostingsReader>> readers;
+  std::vector<PostingsReader*> segReaders;
+  std::vector<OrdMapStore::Segment> segments;
+  int64_t maxDoc = 0;
+  for (auto* seg : segs) {
+    readers.push_back(getSegmentPostingsReader(*seg));
+    segReaders.push_back(readers.back().get());
+    segments.push_back({seg->segId, seg->maxDoc, OrdMapStore::segmentDigest(seg->files)});
+    maxDoc += seg->maxDoc;
+  }
+  if (persistOrdMaps == OrdMapPersistence::ALL) {
+    auto schema = getSchema();
+    auto isKey = [&](std::string_view name) {
+      try {
+        auto* type = schema->getFieldTypePtr(name);
+        return type != nullptr && type->type() == FieldType::ID;
+      } catch (const std::exception&) {
+        return false;
+      }
+    };
+    for (auto* reader : segReaders) {
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      FieldReader fieldReader(*reader);
+      while (fieldReader.readNextField()) {
+        SegFieldInfo fi;
+        fieldReader.readFieldInfo(fi);
+        std::string_view name(fi.fieldname.data(), fi.fieldname.size());
+        // Facets and string sorts map ord columns. Unique keys are left to
+        // USED: an all-unique map costs most and is rarely faceted.
+        if (fi.type == FieldType::STRING && (fi.flags & FieldType::INDEX_DOCS)
+            && fi.ordFormat != SegFieldInfo::ORD_NONE && !name.starts_with('_') && !isKey(name)) {
+          fields.emplace_back(name);
+        }
+      }
+    }
+  }
+  std::ranges::sort(fields);
+  fields.erase(std::unique(fields.begin(), fields.end()), fields.end());
+  std::vector<std::pair<std::string, std::shared_ptr<OrdMap>>> maps;
+  std::string meta;
+  for (auto& field : fields) {
+    auto map = OrdMap::build(field, segReaders, maxDoc);
+    if (!map) continue;
+    meta.append(field).push_back('\0');
+    maps.emplace_back(std::move(field), std::move(map));
+  }
+  if (maps.empty()) return std::nullopt;
+  AuxInfo info;
+  info.kind = OrdMapStore::KIND;
+  info.name = OrdMapStore::NAME;
+  info.gen = newCoreGen;
+  info.built_core_gen = newCoreGen;
+  info.files.push_back(OrdMapStore::write(dir, OrdMapStore::fileName(newCoreGen), newCoreGen, segments, maps));
+  info.opaque_meta.assign((const std::byte*)meta.data(), (const std::byte*)meta.data() + meta.size());
+  return info;
+}
+
+// The snapshot sidecar's contents for this commit: every live-docs, overlay
+// and index-level aux file it publishes. Files the published sidecar already
+// describes are not read again.
+sidecar::Contents IndexWriter::snapshotSidecarContents(std::span<SegInfo*> segs, std::span<const AuxInfo> aux) {
+  sidecar::Contents contents;
+  auto add = [&](const FileDescriptor& file, std::string_view kind) {
+    for (const auto& known : publishedSidecarContents.files) {
+      if (known.name == file.name && known.size == file.size && known.xxh3 == file.xxh3) {
+        contents.files.push_back(known);
+        return;
+      }
+    }
+    contents.files.push_back(sidecar::describe(dir, file, kind));
+  };
+  for (auto* seg : segs) {
+    for (const auto& file : seg->files) {
+      if (file.name.find("__L") != std::string::npos) add(file, {});
+    }
+    for (const auto& overlay : seg->auxOverlays) {
+      for (const auto& file : overlay.files) add(file, overlay.kind);
+    }
+  }
+  for (const auto& entry : aux) {
+    for (const auto& file : entry.files) add(file, entry.kind);
+  }
+  return contents;
 }
 
 namespace {
@@ -1862,7 +2019,8 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
 }
 
 // Caller holds publicationMutex (or is constructing this writer).
-void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena, std::shared_ptr<Schema> schema) {
+void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena, std::shared_ptr<Schema> schema,
+                          const sidecar::Contents* sidecarContents) {
   if (failed.load(std::memory_order_acquire)) throw IndexWriterClosedError("index writer has failed");
   auto previous = lastSnapshot.load();
   auto previousSchema = previous ? previous->schema : nullptr;
@@ -1905,6 +2063,33 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
     for (const auto& overlay : segment.overlays) overlays.push_back({segment.seg_id, fromWire(overlay)});
   }
   for (const auto& aux : info.aux_indexes) auxIndexes.push_back(fromWire(aux));
+
+  // The snapshot sidecar is named for this generation, which is assigned
+  // above, so it is written here. Unchanged contents keep the published file.
+  std::string sidecarName;
+  if (sidecarContents) {
+    if (*sidecarContents == publishedSidecarContents) {
+      info.sidecar.reset();
+      if (publishedSidecar) {
+        info.sidecar = api::FileDescriptor{publishedSidecar->name, publishedSidecar->size, publishedSidecar->xxh3};
+      }
+    } else if (sidecarContents->files.empty()) {
+      info.sidecar.reset();
+    } else {
+      sidecarName = sidecar::snapshotFileName(info.index_gen);
+      try {
+        auto written = sidecar::write(dir, sidecarName, *sidecarContents);
+        std::array<std::string, 1> names{sidecarName};
+        dir.sync(names);
+        std::array<std::string, 1> syncDirectory{"."};
+        dir.sync(syncDirectory);
+        info.sidecar = api::FileDescriptor{sidecarName, written.size, written.xxh3};
+      } catch (...) {
+        try { dir.deleteFile(sidecarName); } catch (...) {}
+        throw;
+      }
+    }
+  }
   std::vector<std::byte> serialized;
   if (!api::encode(info, serialized)) throw std::runtime_error("Failed to serialize IndexInfo");
   auto digest = CommitSnapshot::digestOf(serialized);
@@ -1975,6 +2160,13 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       lastCommittedSegIds.swap(segmentIds);
       currentAuxIndexes_.swap(auxIndexes);
       currentSegmentOverlays_.swap(overlays);
+      if (sidecarContents) {
+        // info.sidecar may view the current descriptor: copy before replacing it.
+        std::optional<FileDescriptor> next;
+        if (info.sidecar) next = FileDescriptor{std::string(info.sidecar->name), info.sidecar->size, info.sidecar->xxh3};
+        publishedSidecar = std::move(next);
+        publishedSidecarContents = *sidecarContents;
+      }
       lastCommitTime = info.commit_time;
       commitCount.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1992,6 +2184,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       try {
         dir.deleteFile(Manifest::name(info.index_gen));
         dir.deleteFile(Manifest::name(info.index_gen) + ".tmp");
+        if (!sidecarName.empty()) dir.deleteFile(sidecarName);
         std::array<std::string, 1> syncDirectory = {"."};
         dir.sync(syncDirectory);
       } catch (const std::exception& e) {
@@ -2024,7 +2217,8 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
 }
 
 uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& commitInfo,
-                                         std::span<AuxInfo> auxIndexes) {
+                                         std::span<AuxInfo> auxIndexes,
+                                         const sidecar::Contents& sidecarContents) {
   assert(std::is_sorted(segs.begin(), segs.end(),
                         [](const SegInfo* a, const SegInfo* b) { return a->segId < b->segId; }));
   assert(commitInfo.highestUpdateVersion >= commitInfo.updateMessage->updateVersion);
@@ -2053,7 +2247,7 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
   }
   auto* aux = api::build::allocArray(info.aux_indexes, auxIndexes.size(), arena);
   for (size_t i = 0; i < auxIndexes.size(); i++) aux[i] = toWire(auxIndexes[i], arena);
-  publish(info, arena);
+  publish(info, arena, {}, &sidecarContents);
   return info.commit_time;
 }
 
@@ -2339,6 +2533,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       }
       phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
+      phase = "segment_sidecar";
+      addSegmentSidecar(pwriter, newSegInfo->unsyncedFiles, newSegInfo->files);
 
       phase = "active_overlay_snapshot";
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();
@@ -2676,6 +2872,8 @@ void IndexWriter::testDeleteAllData() {
     lastCommittedSegIds.clear();
     currentAuxIndexes_.clear();
     currentSegmentOverlays_.clear();
+    publishedSidecar.reset();
+    publishedSidecarContents = {};
     activeVectorOverlayNames.clear();
     lastMergeFailure.reset();
     pendingDeletes.clear();

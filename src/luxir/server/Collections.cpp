@@ -233,6 +233,9 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
     config.index.merge_factor, creating ? *selected : std::string{});
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
+  col->shard->iw->persistOrdMaps = config.index.persist_ordmaps == "off" ? IndexWriter::OrdMapPersistence::OFF
+      : config.index.persist_ordmaps == "all" ? IndexWriter::OrdMapPersistence::ALL
+      : IndexWriter::OrdMapPersistence::USED;
   if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
   if (creating) storage.select(*selected);
   retire(name, *selected);

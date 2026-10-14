@@ -168,6 +168,10 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(index.merge_factor)
       ->check(CLI::PositiveNumber)
       ->check(CLI::Range(2, (std::numeric_limits<int>::max)()));
+  app.add_option("--indexing.persist-ordmaps", index.persist_ordmaps,
+                 "Global-ordinal maps to build at commit for readers: off, used, all")
+      ->default_val(index.persist_ordmaps)
+      ->check(CLI::IsMember({"off", "used", "all"}));
   app.add_option("--indexing.max-ram-mb", index.max_ram_mb,
                  "Shared indexing RAM cap for merge admission and inverter flushing (MiB, 0 = unlimited)")
       ->check(CLI::NonNegativeNumber)

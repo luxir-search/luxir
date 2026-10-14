@@ -7,6 +7,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "IndexReader.h"
@@ -327,6 +328,12 @@ public:
   /// Build an OrdMap for the given field across all segments in the reader.
   static std::shared_ptr<OrdMap> build(std::string_view field, IndexReader& reader);
 
+  /// Build an OrdMap over `segs` in segment order; `maxDoc` is their total.
+  /// IndexWriter uses this to persist maps for a commit before any reader
+  /// opens it.
+  static std::shared_ptr<OrdMap> build(std::string_view field, std::span<PostingsReader* const> segs,
+                                       int64_t maxDoc);
+
   static DeltaEncoding configuredDeltaEncoding();
 
   static DeltaEncoding setDeltaEncodingForTests(DeltaEncoding value) {
@@ -364,6 +371,13 @@ public:
 
   size_t sizeInBytes() {
     return end - start;
+  }
+
+  // The serialized mapping (layout in OrdMapImpl.h); empty when one segment
+  // holds every ord and the mapping is the identity.
+  std::span<const char> bytes() const {
+    if (!data) return {};
+    return {data.get() + start, (size_t)end};
   }
   // TODO: create some convenience mapping classes to handle all the "null" and full-segment edge cases.
 
