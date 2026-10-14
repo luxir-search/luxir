@@ -1652,6 +1652,43 @@ TEST_F(ReplicationFollowerTest, corruptPeerCopiesAreFetchedAgainFromTheSource) {
   EXPECT_GT(fromSource.load(), 0);
 }
 
+// Full verification at startup refuses a damaged local copy, the follower
+// fetches the file again, and promotion never links a damaged file.
+TEST_F(ReplicationFollowerTest, corruptLocalFilesAreRefetchedAndNeverPromoted) {
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto installed = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+  auto largest = *std::ranges::max_element(installed->files, {}, &FileDescriptor::size);
+  auto flip = [&] {
+    std::fstream file(path / "follower" / "t" / "t0" / "main" / installed->id.incarnation / largest.name,
+                      std::ios::in | std::ios::out | std::ios::binary);
+    char byte = 0;
+    file.read(&byte, 1);
+    file.seekp(0);
+    byte = (char)~byte;
+    file.write(&byte, 1);
+  };
+  stopFollower();
+  flip();
+  followerConfig.store.verify_on_open = "full";
+  std::atomic<int> refetched{0};
+  Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    if (((FileDescriptor*)descriptor)->name == largest.name) refetched++;
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("replicationDownloadStart"); });
+  startFollower();
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(1, refetched.load());
+  EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+  stopFollower(); stopSource();
+  flip();
+  auto [code, output] = promote();
+  EXPECT_NE(0, code);
+  EXPECT_NE(std::string::npos, output.find("checksum mismatch: " + largest.name)) << output;
+}
+
 // A replica reopens each installed snapshot from the reader it serves: an
 // unchanged segment keeps its PostingsReader and live docs, a changed one
 // only its PostingsReader, and a new one is opened.

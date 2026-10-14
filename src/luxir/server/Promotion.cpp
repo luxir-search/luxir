@@ -5,6 +5,7 @@
 #include "ReplicationState.h"
 #include "luxir/util/Signal.h"
 #include "luxir/index/CommitSnapshot.h"
+#include "luxir/store/FileVerifier.h"
 
 namespace luxir {
 
@@ -15,7 +16,11 @@ std::string copySnapshot(CollectionStorage& storage, std::string_view from, cons
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(manifest.bytes, arena);
   auto files = filesOf(info);
-  next->reuseFiles(*old, files, files);
+  // Every file is hashed as it is linked: a promoted writer must never build
+  // on bytes that differ from what the follower verified when it installed them.
+  std::vector<std::string> corrupt;
+  next->reuseFiles(*old, files, files, &corrupt);
+  if (!corrupt.empty()) throw ChecksumMismatchError(corrupt.front());
   // The new root may reference only files that are present in full.
   std::vector<Directory::FileInfo> listing;
   next->listFiles(listing);

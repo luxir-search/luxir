@@ -6,6 +6,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/CheckedDirFactory.h"
+#include "luxir/store/FileVerifier.h"
 #include "luxir/store/ReadOnlyDirectory.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
@@ -21,8 +22,19 @@ std::shared_ptr<Collection> Collection::placeholder(CollectionId id, std::string
   return collection;
 }
 
+void Collection::markCorrupt(const std::string& reason) {
+  std::lock_guard lock(corruptionMutex);
+  if (corrupt.load(std::memory_order_relaxed)) return;
+  corruption = reason;
+  corrupt.store(true, std::memory_order_release);
+}
+
 std::string Collection::getUnavailableReason() const {
   if (!unavailableReason.empty()) return unavailableReason;
+  if (isCorrupt()) {
+    std::lock_guard lock(corruptionMutex);
+    return corruption;
+  }
   if (shard && shard->iw) {
     if (auto failure = shard->iw->getFailureReason()) return *failure;
   }
@@ -74,7 +86,8 @@ void Collections::validate(const CollectionId& id) {
 }
 
 Collections::Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget)
-    : config(config), events(events), indexRamBudget(indexRamBudget) {
+    : config(config), events(events), indexRamBudget(indexRamBudget), verifyOnOpen(config.store.verify_on_open == "full") {
+  if (!verifyOnOpen && config.store.verify_on_open != "none") throw std::invalid_argument("store.verify-on-open must be none or full");
   if (config.store.backend == "fs") {
     factory = std::make_unique<FSDirFactory>(config.store.data_dir, config.read_only);
   } else {
@@ -227,7 +240,12 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
     }
   }
   auto col = makeCollection(name, creating ? storage.create(*selected) : storage.open(*selected));
-  if (!creating && !Manifest::load(*col->shard->dir).bytes) throw std::runtime_error("CURRENT selects an empty index directory");
+  if (!creating) {
+    auto manifest = Manifest::load(*col->shard->dir);
+    if (!manifest.bytes) throw std::runtime_error("CURRENT selects an empty index directory");
+    // Before the writer opens, merges or publishes anything over these files.
+    if (verifyOnOpen) verifyFiles(*col->shard->dir, Manifest::files(manifest.bytes));
+  }
   col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
     std::move(initialSchema), &indexRamBudget,
     config.index.merge_factor, creating ? *selected : std::string{});
@@ -247,7 +265,7 @@ std::shared_ptr<Collection> Collections::openCollection(const CollectionId& name
   if (role == Role::WRITER) return initWriter(name);
   if (!selected) throw ReadOnlyError("Collection has no CURRENT");
   auto col = makeCollection(name, factory->collection(name).open(*selected));
-  col->shard->snapshots->openLocalSnapshot();
+  col->shard->snapshots->openLocalSnapshot(verifyOnOpen);
   if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
   observe(name, *col);
   return col;

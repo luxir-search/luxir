@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "luxir/util/ApiError.h"
@@ -103,9 +105,17 @@ class Collection {
   std::string unavailableReason;  // non-empty means resolution rejects the collection
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
+  // Set once by a scrub that found a published file whose bytes no longer
+  // match its manifest; resolution then rejects the collection.
+  std::atomic<bool> corrupt{false};
+  mutable std::mutex corruptionMutex;
+  std::string corruption;
 public:
   const CollectionId& getId() const { return id; }
   std::string getUnavailableReason() const;
+  // Records the first corruption found; later ones keep the original reason.
+  void markCorrupt(const std::string& reason);
+  bool isCorrupt() const { return corrupt.load(std::memory_order_acquire); }
   // An unavailable entry: a failed load, delete or create, or a deletion in
   // progress. Resolution rejects it with `reason`.
   static std::shared_ptr<Collection> placeholder(CollectionId id, std::string reason);

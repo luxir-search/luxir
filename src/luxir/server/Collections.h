@@ -109,6 +109,7 @@ private:
   const LuxirConfig& config;
   CollectionEvents& events;
   IndexRamBudget& indexRamBudget;
+  bool verifyOnOpen; // store.verify-on-open=full
   std::unique_ptr<DirectoryFactory> factory;
   SharedLazyMap<CollectionId, Collection> map;
   std::mutex slotsMutex;

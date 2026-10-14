@@ -54,6 +54,14 @@ struct StoreConfig {
   std::string data_dir = "luxir_data";
   uint64_t ram_limit_mb = 0; // RAM storage only; zero is unlimited.
   CheckedDirConfig checked_dir;
+  // Before a collection serves at startup: none trusts the manifest footer and
+  // file sizes; full also reads every file the committed snapshot lists and
+  // checks its size and xxh3, failing only that collection on a mismatch.
+  std::string verify_on_open = "none";   // none, full
+  // Background re-verification of every published snapshot's files; a
+  // mismatch makes the collection unavailable. Zero disables it.
+  uint64_t scrub_interval_s = 0;
+  uint64_t scrub_max_bytes_per_sec = 64ULL * 1024 * 1024; // zero is unthrottled
 };
 
 struct IndexConfig {
