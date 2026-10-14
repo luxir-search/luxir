@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "CommitSnapshotRegistry.h"
+#include "luxir/store/FileVerifier.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/luxir_util.h"
@@ -39,12 +40,15 @@ void CommitSnapshotRegistry::fail() noexcept {
   notifyChange();
 }
 
-void CommitSnapshotRegistry::openLocalSnapshot() {
+void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
   auto manifest = Manifest::load(dir);
   for (;;) {
     if (!manifest.bytes) throw ReadOnlyError("collection has no snapshot");
     auto snapshot = CommitSnapshot::fromBytes(manifest.bytes);
     try {
+      // A writer sharing the directory may retire these files meanwhile; the
+      // retry below then moves to its newer root.
+      if (verify) verifyFiles(dir, snapshot->files);
       auto reader = readers.prepare(*snapshot);
       publish(std::move(snapshot), std::move(reader));
       return;

@@ -116,24 +116,13 @@ public:
   virtual void linkFile(Directory& source, std::string_view name) = 0;
 
   // Only descriptors from a published snapshot authorize reuse; filenames alone
-  // are not identities across collection incarnations.
+  // are not identities across collection incarnations. Each linked file is
+  // hashed against its descriptor before it counts as reused: a copy whose
+  // bytes no longer match is unlinked again and described in `corrupt`, so the
+  // caller fetches it elsewhere or fails. Defined in FileVerifier.cpp.
   std::vector<FileDescriptor> reuseFiles(Directory& source, std::span<const FileDescriptor> available,
-                                        std::span<const FileDescriptor> wanted) {
-    std::map<std::string_view, const FileDescriptor*> byName;
-    for (const auto& file : available) byName.emplace(file.name, &file);
-    std::vector<FileDescriptor> reused;
-    for (const auto& file : wanted) {
-      auto it = byName.find(file.name);
-      if (it == byName.end() || *it->second != file) continue;
-      // An existing (even unreadable) candidate must be verified by its caller.
-      bool present = true;
-      try { present = openFile(file.name) != nullptr; } catch (const std::exception&) {}
-      if (present) continue;
-      linkFile(source, file.name);
-      reused.push_back(file);
-    }
-    return reused;
-  }
+                                        std::span<const FileDescriptor> wanted,
+                                        std::vector<std::string>* corrupt = nullptr);
   virtual ~Directory() = default;
 };
 

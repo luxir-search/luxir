@@ -82,7 +82,7 @@ struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
-struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct MemoryStats;
+struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct MemoryStats; struct ScrubStats;
 struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
@@ -415,11 +415,19 @@ struct ReplicationStatus {
   uint64_t last_contact = 0;
   std::span<const ReplicationCollectionStatus> collections;
 };
+struct ScrubStats {
+  uint64_t passes = 0;
+  uint64_t files = 0;
+  uint64_t bytes = 0;
+  uint64_t mismatches = 0;
+  uint64_t last_pass_end = 0;
+};
 struct StatsResponse {
   std::optional<StatsTotals> totals;
   std::span<const CollectionStats> collections;
   uint64_t multiterm_expansion_refills = 0;
   std::optional<MemoryStats> memory;
+  std::optional<ScrubStats> scrub;
 };
 struct CacheControlRequest {
   std::string_view collection;

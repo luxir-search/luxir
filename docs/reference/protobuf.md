@@ -147,6 +147,7 @@ defaults and constraints are described in the comments and guides.
 - [`SchemaDef`](#message-luxir.schemadef)
 - [`SchemaRequest`](#message-luxir.schemarequest)
 - [`SchemaResponse`](#message-luxir.schemaresponse)
+- [`ScrubStats`](#message-luxir.scrubstats)
 - [`SearchOp`](#message-luxir.searchop)
 - [`SearchRequest`](#message-luxir.searchrequest)
 - [`SearchResponse`](#message-luxir.searchresponse)
@@ -1451,6 +1452,22 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of 1 / (k + rank\_s
 | <a id="field-luxir.schemaresponse.commit"></a>[`commit`](#field-luxir.schemaresponse.commit) | 2 | `string` | singular | exact snapshot published by a schema update |
 | <a id="field-luxir.schemaresponse.schema"></a>[`schema`](#field-luxir.schemaresponse.schema) | 1 | [`SchemaDef`](#message-luxir.schemadef) | singular | the resulting schema after the operation |
 
+<a id="message-luxir.scrubstats"></a>
+
+### luxir.ScrubStats
+
+Background checksum scrub of published snapshot files. A mismatch also makes its collection unavailable with the failing file in its error.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.scrubstats.passes"></a>[`passes`](#field-luxir.scrubstats.passes) | 1 | `uint64` | singular | completed passes over every collection |
+| <a id="field-luxir.scrubstats.files"></a>[`files`](#field-luxir.scrubstats.files) | 2 | `uint64` | singular | files checked |
+| <a id="field-luxir.scrubstats.bytes"></a>[`bytes`](#field-luxir.scrubstats.bytes) | 3 | `uint64` | singular | bytes read |
+| <a id="field-luxir.scrubstats.mismatches"></a>[`mismatches`](#field-luxir.scrubstats.mismatches) | 4 | `uint64` | singular | files that did not match their manifest |
+| <a id="field-luxir.scrubstats.last_pass_end"></a>[`last_pass_end`](#field-luxir.scrubstats.last_pass_end) | 5 | `uint64` | singular | Unix milliseconds; absent before the first pass |
+
 <a id="message-luxir.searchop"></a>
 
 ### luxir.SearchOp
@@ -1616,6 +1633,7 @@ Operational statistics. An empty collection requests every collection on the nod
 | <a id="field-luxir.statsresponse.collections"></a>[`collections`](#field-luxir.statsresponse.collections) | 2 | [`CollectionStats`](#message-luxir.collectionstats) | repeated |  |
 | <a id="field-luxir.statsresponse.multiterm_expansion_refills"></a>[`multiterm_expansion_refills`](#field-luxir.statsresponse.multiterm_expansion_refills) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.statsresponse.memory"></a>[`memory`](#field-luxir.statsresponse.memory) | 9 | [`MemoryStats`](#message-luxir.memorystats) | singular | Set only by a StatsRequest.memory request, which returns nothing else. |
+| <a id="field-luxir.statsresponse.scrub"></a>[`scrub`](#field-luxir.statsresponse.scrub) | 10 | [`ScrubStats`](#message-luxir.scrubstats) | singular | Node-wide checksum scrub counters; set when store.scrub-interval-s is. |
 
 <a id="message-luxir.statstotals"></a>
 

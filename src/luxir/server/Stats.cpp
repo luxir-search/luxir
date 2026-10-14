@@ -6,6 +6,7 @@
 #include "luxir/util/ApiError.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "ReplicationFollower.h"
+#include "Scrubber.h"
 
 #include <cassert>
 #include <string_view>
@@ -211,6 +212,10 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
 
   response.multiterm_expansion_refills =
       multitermExpansionRefills.load(std::memory_order_relaxed);
+  if (node.getScrubber().enabled() && request.collection.empty()) {
+    auto scrub = node.getScrubber().stats();
+    response.scrub = api::ScrubStats{scrub.passes, scrub.files, scrub.bytes, scrub.mismatches, scrub.lastPassEnd};
+  }
 }
 
 void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request,

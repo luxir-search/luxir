@@ -1123,6 +1123,18 @@ message StatsResponse {
   uint64 multiterm_expansion_refills = 8;
   // Set only by a StatsRequest.memory request, which returns nothing else.
   MemoryStats memory = 9;
+  // Node-wide checksum scrub counters; set when store.scrub-interval-s is.
+  ScrubStats scrub = 10;
+}
+
+// Background checksum scrub of published snapshot files. A mismatch also
+// makes its collection unavailable with the failing file in its error.
+message ScrubStats {
+  uint64 passes = 1;          // completed passes over every collection
+  uint64 files = 2;           // files checked
+  uint64 bytes = 3;           // bytes read
+  uint64 mismatches = 4;      // files that did not match their manifest
+  uint64 last_pass_end = 5;   // Unix milliseconds; absent before the first pass
 }
 
 // Node memory: Luxir's own budgets and usage, and the process allocator's

@@ -12,7 +12,8 @@
 namespace luxir {
 
 // Copies a snapshot of incarnation `from` into a fresh incarnation, linking its
-// immutable files and writing a durable root under the new identity at a
+// immutable files (each checked against its manifest size and xxh3; a mismatch
+// throws ChecksumMismatchError) and writing a durable root under the new identity at a
 // generation above any root `from` held. Returns the new incarnation; CURRENT
 // is unchanged. Promotion and recovery both start a new identity this way.
 std::string copySnapshot(CollectionStorage& storage, std::string_view from, const Manifest& manifest);

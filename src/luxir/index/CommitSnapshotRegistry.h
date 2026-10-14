@@ -96,7 +96,9 @@ public:
   // without removing a root that already existed.
   void commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened);
   std::shared_ptr<const CommitSnapshot> snapshot() const { return readers.snapshot(); }
-  void openLocalSnapshot();
+  // Publishes the newest valid local root. With `verify`, every file it lists
+  // is first checked against its manifest size and xxh3 (ChecksumMismatchError).
+  void openLocalSnapshot(bool verify = false);
   void sweepOrphans(const Manifest& manifest);
   void sweepOrphans();
   static std::vector<std::string> obsoleteFiles(const CommitSnapshot& previous,

@@ -43,6 +43,10 @@ data. A source collection that becomes unavailable never means deletion.
 If a local collection cannot be opened at startup, the follower keeps its files
 and reports it unavailable. A later verified install can replace it. Until then,
 the unreadable copy is treated as populated for the empty-replacement rule.
+With `--store.verify-on-open=full` a local file whose bytes no longer match its
+manifest digest also makes the copy unreadable; the next install keeps the
+files that still verify and fetches only the damaged ones. See
+[file integrity checks](operations.md#file-integrity-checks).
 
 ## Write, then read your write
 
@@ -134,7 +138,8 @@ collections are retained. Pull does not acknowledge serving traffic.
 For manual failover, stop the old writer and the chosen FS follower, run
 `luxir promote DIR` on that follower's directory, then start it as a writer
 without `--replicate-from`. Promotion starts no server. It gives every
-collection a new incarnation, reusing immutable files, and prints each
+collection a new incarnation, reusing immutable files after checking each
+one's size and xxh3 digest against the manifest, and prints each
 collection's new incarnation and a summary. Any failure gives a nonzero exit and
 keeps the directory follower-bound: a writer refuses to start on it, so no
 collection serves until all are promoted. Re-run `luxir promote` to finish;

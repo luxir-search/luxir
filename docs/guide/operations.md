@@ -200,8 +200,10 @@ Filesystem publication syncs new data files and then the directory before
 writing a new `commit_<index_gen>` manifest with a length and xxh3 checksum
 footer. It syncs that manifest and then the directory before acknowledging
 the commit. Startup checks the newest manifest's footer and decodes its payload;
-it does not hash data files. Torn candidates are skipped. Fallback candidates
-also require their referenced files to be present with matching sizes.
+by default it does not hash data files (see
+[file integrity checks](#file-integrity-checks)). Torn candidates are skipped.
+Fallback candidates also require their referenced files to be present with
+matching sizes.
 
 Once the new root is durable, obsolete manifests and unreferenced data are removed.
 Replication pin counters are described in the
@@ -379,7 +381,38 @@ kept as a tombstone rather than preventing healthy collections from loading.
 Queries and updates to that collection return the recorded load error as an
 `unavailable` error (HTTP `503`, code `collection_unavailable`) and the server
 will not silently recreate storage over it. Other segment corruption is
-detected when the affected reader is opened.
+detected when the affected reader is opened, or earlier with the
+[file integrity checks](#file-integrity-checks) below.
+
+## File integrity checks
+
+Every committed manifest records each file it references with its size and
+xxh3-64 digest, computed while the file is written. Three checks use them:
+
+- **Transfers and copies** always verify. A replicated file is hashed while it
+  streams in and is installed only if it matches; a local file reused across
+  incarnations (a repointed follower, `luxir promote`, or writer recovery from
+  an older root) is hashed when it is linked. A follower fetches a mismatching
+  file again; promotion fails for that collection and names the file.
+- **`--store.verify-on-open=full`** reads every file of each collection's
+  committed snapshot at startup, on up to 8 threads per collection, before the
+  collection serves. The default, `none`, trusts the manifest footer and file
+  sizes. A mismatching, missing or unreadable file fails only that collection:
+  it loads as unavailable (HTTP `503`, code `collection_unavailable`) with an
+  error naming the file and its expected and actual size and digest, and its
+  data is kept. A follower then fetches the damaged files from its source.
+  Startup reads the whole index, so expect it to take as long as reading the
+  data directory once.
+- **`--store.scrub-interval-s=N`** (default `0`, off) re-reads the files of
+  every published snapshot every `N` seconds on one low-priority thread,
+  paced to `--store.scrub-max-bytes-per-sec` (default `64MB`, `0` for
+  unthrottled). A mismatch is logged at error level and makes the collection
+  unavailable with the same error until the node restarts; repair it by
+  restoring from a follower (`luxir pull` and `luxir promote`), or on a
+  follower by restarting with `--store.verify-on-open=full`. `GET /_stats`
+  reports node-wide `scrub` counters (`passes`, `files`, `bytes`,
+  `mismatches`, `last_pass_end` in Unix milliseconds) while scrubbing is
+  enabled.
 
 ## Current production boundary
 
