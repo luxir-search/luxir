@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "IndexReader.h"
+#include "OrdMapStore.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
 #include "luxir/reader/FieldReader.h"
@@ -41,6 +42,9 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
   }
   if (info.kind == TestOverlayAuxReader::KIND) {
     return TestOverlayAuxReader::open(dir, info, missingFileOK);
+  }
+  if (info.kind == OrdMapStore::KIND) {
+    return OrdMapStore::open(dir, info, missingFileOK);
   }
   IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind, info.name);
   return nullptr;
@@ -359,7 +363,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
           // binaries can read indexes that contain newer aux kinds.
           std::shared_ptr<AuxReader> aux = openKnownAux(dir, info, missingFileOK);
           if (!aux && info.kind != VectorAuxReader::KIND
-                   && info.kind != TestOverlayAuxReader::KIND) {
+                   && info.kind != TestOverlayAuxReader::KIND && info.kind != OrdMapStore::KIND) {
             continue;
           }
 
@@ -387,6 +391,23 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
     IREADER_DEBUG("Creating new ordMaps cache (coreGen={})", core->coreGeneration);
     core->ordMaps = std::make_shared<SharedLazyMap<std::string, OrdMap>>();
   }
+  // Persisted maps serve this core only if built for exactly its segments.
+  for (const auto& aux : auxReadersList) {
+    if (aux->getKind() != OrdMapStore::KIND) continue;
+    std::vector<OrdMapStore::Segment> segments;
+    segments.reserve(segs.size());
+    for (size_t i = 0; i < segs.size(); i++) {
+      segments.push_back({segs[i].segInfo.seg_id, segs[i].maxDoc(),
+                          OrdMapStore::segmentDigest(core->segmentFiles[i].files)});
+    }
+    auto store = std::static_pointer_cast<OrdMapStore>(aux);
+    if (store->matches(core->coreGeneration, segments)) {
+      core->ordMapStore = std::move(store);
+    } else {
+      LOG_WARN("Ignoring persisted OrdMaps '{}': built for another segment set (coreGen={})",
+               aux->getName(), core->coreGeneration);
+    }
+  }
 
   IREADER_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), totalMaxDoc, commitTimeUs);
   return {std::move(core), std::move(schema), commitTimeUs, indexGen};
@@ -394,6 +415,24 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
 
 
+
+std::shared_ptr<OrdMap> IndexReader::getOrdMap(std::string_view field) {
+  return core->ordMaps->getOrCreate(std::string(field), [this, field]() {
+    if (core->ordMapStore && core->ordMapStore->contains(field)) {
+      if (auto loaded = core->ordMapStore->load(field)) return loaded;
+    }
+    return OrdMap::build(field, *this);
+  });
+}
+
+std::vector<std::string> IndexReader::cachedOrdMapFields() const {
+  std::vector<std::string> fields;
+  core->ordMaps->dataMap.cvisit_all([&](const auto& entry) {
+    if (std::holds_alternative<std::shared_ptr<OrdMap>>(entry.second)) fields.push_back(entry.first);
+  });
+  std::ranges::sort(fields);
+  return fields;
+}
 
 const Segment* IndexReader::PhysicalCore::segment(uint64_t segId) const {
   auto it = std::ranges::lower_bound(segOrds, segId, {}, &std::pair<uint64_t, int32_t>::first);

@@ -265,7 +265,7 @@ TEST_F(VectorColTest, indexingStreamsReuseAndCollapse) {
   testIndex.dir.listFiles(files);
   std::string dataPrefix = Postings::getIndexFileNamePrefix(segId) + "_";
   size_t dataFiles = std::count_if(files.begin(), files.end(), [&](const Directory::FileInfo& file) {
-    return file.name.starts_with(dataPrefix);
+    return file.name.starts_with(dataPrefix) && file.name != sidecar::segmentFileName(segId);
   });
   EXPECT_EQ(1u, dataFiles);
 }

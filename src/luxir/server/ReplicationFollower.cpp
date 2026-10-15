@@ -6,6 +6,7 @@
 #include "CollectionEvents.h"
 #include "ReplicationState.h"
 #include "luxir/api/build.h"
+#include "luxir/reader/SidecarReader.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
@@ -615,7 +616,7 @@ struct ReplicationFollower::Impl {
     }
     std::vector<std::string> names;
     std::set<std::string> unique;
-    for (const auto& file : snapshot.files) {
+    auto stage = [&](const FileDescriptor& file) {
       if (file.name.empty() || file.name == "." || file.name == ".." || file.name.find_first_of("/\\") != std::string::npos
           || file.name.starts_with(Manifest::kPrefix) || file.name.ends_with(".tmp") || !unique.insert(file.name).second) throw std::runtime_error("invalid snapshot file name");
       bool reuse = verified.contains(file.name) && verified.at(file.name) == file;
@@ -651,6 +652,19 @@ struct ReplicationFollower::Impl {
       // Files in the serving snapshot are already durable. Retried candidates
       // may have been verified but not synced before their pin vanished.
       if (!durableNames.contains(file.name)) names.push_back(file.name);
+    };
+    // Sidecars first; their byte-range maps then order the rest by the
+    // lowest tier each file holds, so what a reader needs to open and plan
+    // arrives before bulk payloads. Without sidecars, manifest order.
+    std::pmr::monotonic_buffer_resource arena;
+    auto info = Manifest::decode(snapshot.bytes, arena);
+    std::set<std::string, std::less<>> sidecars;
+    for (const auto& file : SidecarReader::sidecarsOf(info)) sidecars.insert(file.name);
+    for (const auto& file : snapshot.files) {
+      if (sidecars.contains(file.name)) stage(file);
+    }
+    for (const auto& file : SidecarReader::transferOrder(dir, info, snapshot.files)) {
+      if (!sidecars.contains(file.name)) stage(file);
     }
     dir.sync(names); syncDir(dir);
   }

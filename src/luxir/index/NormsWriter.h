@@ -85,9 +85,11 @@ private:
     if (pad > 0) {
       out.write(zeros, pad);
     }
+    auto bitsetStart = out.slocation();
     out.write(bitsetBytes, bitsetLen);
     fieldInfo.docsWithField = docsWithField;
     fieldInfo.docsWithFieldEndLoc = out.slocation();
+    postingsWriter.noteExtent(fieldInfo, sidecar::Kind::DOCS_WITH_FIELD, bitsetStart, bitsetLen);
   }
 
 public:

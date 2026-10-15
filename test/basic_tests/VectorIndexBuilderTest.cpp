@@ -680,7 +680,12 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
   auto desc = std::ranges::find(pin->files, firstFile, &FileDescriptor::name);
   ASSERT_NE(desc, pin->files.end());
   EXPECT_EQ(desc->xxh3, XXH3_64bits(bytes.data(), bytes.size()));
-  EXPECT_EQ(desc->size, h.getIndexWriter()->snapshots.stats().retainedBytes);
+  // The pin also retains its snapshot sidecar, which described the old overlay.
+  uint64_t retained = desc->size;
+  for (const auto& file : pin->files) {
+    if (file.name.starts_with("s_sidecar_")) retained += file.size;
+  }
+  EXPECT_EQ(retained, h.getIndexWriter()->snapshots.stats().retainedBytes);
   h.getIndexWriter()->snapshots.testEvictOldest();
   EXPECT_EQ(h.getIndexWriter()->dir.openFile(firstFile), nullptr);
 

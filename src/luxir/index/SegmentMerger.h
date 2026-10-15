@@ -1339,6 +1339,12 @@ private:
         std::array<uint32_t, 3> rowFiles = {
             termsBase.filenum(), output.docsBase.filenum(), output.posBase.filenum()};
         merger.postingsWriter.protectOutputFiles(rowFiles);
+        // Later ranges live in their own streams, which no SegFieldInfo
+        // location points into; the row's lengths place them exactly.
+        merger.postingsWriter.noteExtent(*outputFieldInfo, sidecar::Kind::DOC_POSTINGS,
+                                         output.docsBase, result.docsBytes);
+        merger.postingsWriter.noteExtent(*outputFieldInfo, sidecar::Kind::POSITIONS,
+                                         output.posBase, result.posBytes);
         termsOut.appendFile(output.termsFile);
         blockOffsets.insert(blockOffsets.end(), result.termBlockOffsets.begin(),
                             result.termBlockOffsets.end());

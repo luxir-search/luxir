@@ -416,7 +416,9 @@ TEST_F(ReplicationFollowerTest, deleteWhileDownloadIsPendingCannotResurrectColle
   std::latch downloading(1), resume(1);
   auto join = scope_guard([&] { if (!resume.try_wait()) resume.count_down(); stopFollower(); });
   Signal::listen("replicationFileVerified", [&](void*, void*, void*) -> void* {
-    downloading.count_down(); resume.wait(); return nullptr;
+    // A commit transfers several files (data and sidecar); hold the first.
+    if (!downloading.try_wait()) downloading.count_down();
+    resume.wait(); return nullptr;
   });
   ASSERT_TRUE(h.index(flatdoc("id", "new"), UpdateMessage::COMMIT).success);
   ASSERT_TRUE(until([&] { return downloading.try_wait(); }));
@@ -1543,6 +1545,7 @@ TEST_F(ReplicationFollowerTest, excludedHistorySurvivesUntilReinclusion) {
   ASSERT_TRUE(until([&] {
     try { follower->getCollection(beta); return false; }
     catch (const CollectionNotFoundError&) { return true; }
+    catch (const CollectionUnavailableError&) { return false; } // still being deleted
   })); // same-boot catalog absence becomes authoritative again
 }
 
