@@ -577,8 +577,11 @@ What the policy means at query time:
 - A prefix query longer than the kept prefix falls back to that prefix and
   returns a superset. Wildcard and regex queries do the same when their common
   leading literal prefix exceeds the limit; other patterns operate on the
-  stored term bytes, hash suffix included. Fuzzy distance also compares
-  transformed bytes, so similarity between discarded tails is not measured.
+  stored term bytes, hash suffix included, so they can miss a long value or
+  match its hash characters. When such a pattern can match a term of 252 bytes
+  or more and a segment holds one for that field, the response carries a
+  `fitted_terms_pattern` warning. Fuzzy distance also compares transformed
+  bytes, so similarity between discarded tails is not measured.
 - The stored source, when enabled, keeps the full bytes before normalization
   or hashing and is used to return the exact value if its column representation
   was truncated.

@@ -434,6 +434,39 @@ TEST_F(FieldVariantsQueryTest, hash128LongPatternsUseKeptLiteralPrefix) {
       R"({{"regex":{{"field":"value_s","pattern":"{}.*"}}}})", utf8.substr(0, 234))));
 }
 
+TEST_F(FieldVariantsQueryTest, fittedTermPatternsWarn) {
+  auto warnings = [&](std::string_view query) {
+    auto req = run(std::format(R"({{"query":{},"fields":["id"],"limit":-1}})", query));
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return std::ranges::count(req->respWarnings(), std::string_view("fitted_terms_pattern"),
+                              &api::Warning::code);
+  };
+  auto infix = R"({"wildcard":{"field":"value_s","pattern":"*tail*"}})";
+  ASSERT_TRUE(helper.index(flatdoc("id", "short", "value_s", "short tail"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(0, warnings(infix));
+
+  ASSERT_TRUE(helper.index(flatdoc("id", "long", "value_s", std::string(300, 'x') + "tail"),
+                           UpdateMessage::COMMIT).success);
+  EXPECT_EQ(1, warnings(infix));
+  // Repeats on one field warn once.
+  EXPECT_EQ(1, warnings(std::format(
+      R"({{"boolean":{{"optional":[{},{{"regex":{{"field":"value_s","pattern":".*il"}}}}]}}}})", infix)));
+  // Prefixes see fitted terms correctly, and bounded patterns cannot reach them.
+  EXPECT_EQ(0, warnings(R"({"wildcard":{"field":"value_s","pattern":"xx*"}})"));
+  EXPECT_EQ(0, warnings(R"({"wildcard":{"field":"value_s","pattern":"?tail"}})"));
+
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(helper.submit(merge).success);
+  EXPECT_EQ(1, warnings(infix));
+
+  // The merge recomputes the flag from the terms it writes.
+  CollectionHelper::UpdateBuilder drop;
+  drop.remove("long").commit(true, 1);
+  ASSERT_TRUE(helper.submit(drop).success);
+  EXPECT_EQ(0, warnings(infix));
+}
+
 TEST_F(FieldVariantsQueryTest, scopesBindEachLeafAndSelectorsFreeze) {
   EXPECT_TRUE(expr("author:(Ursula AND <=M)").empty());
   EXPECT_EQ((std::vector<std::string>{"a", "c"}), expr("author__self:(Ursula AND <=M)"));

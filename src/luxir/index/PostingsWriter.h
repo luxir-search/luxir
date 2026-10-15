@@ -598,6 +598,7 @@ public:
     uint64_t posBytes = 0;
     int64_t nTerms = 0;
     int32_t nBlocks = 0;
+    bool mayHaveFitted = false;  // some kept term could be a fitted long value
   };
 
   static std::string separatorKey(std::string_view previous, std::string_view first) {
@@ -705,6 +706,7 @@ private:
   int64_t sumTotalTermFreq = 0; // updated in endTerm
   int64_t sumDocFreq = 0; // updated in endTerm
   int64_t numTerms; // currently only updated in flushTerms
+  bool mayHaveFitted = false; // set in endTerm for kept terms of MIN_FITTED_LEN bytes or more
 
   // TODO: pool allocate this
   std::vector<char> compressed_output;
@@ -1192,6 +1194,7 @@ public:
     docsLoc = docOutput.size();
     posLoc = posOutput.size();
     numTerms = 0;
+    mayHaveFitted = false;
     // nocommit fieldInfo->flags |= 0x01;  // text field
 
     termBlockOffsets.resize(0);
@@ -1622,6 +1625,9 @@ public:
       termList.pop_back();
       return;
     }
+    // Recorded from the terms actually written, so flush and merge (where
+    // deletes may drop the last long value) both derive the flag exactly.
+    if (termList.back().size() >= PackedTerm::MIN_FITTED_LEN) mayHaveFitted = true;
     if (totalTermFreq == 1) {
       assert(getDocFileSize()==0 && docs.size()==1 && tfreqs.size()==1);
       assert(posdeltas.size() == (hasPositions ? 1u : 0u));
@@ -1759,6 +1765,7 @@ public:
     result.posBytes = (uint64_t) (posOutput.size() - posLoc);
     result.nTerms = numTerms;
     result.nBlocks = (int32_t) result.termBlockOffsets.size();
+    result.mayHaveFitted = mayHaveFitted;
     assert((result.nTerms == 0) == (result.nBlocks == 0));
     return result;
   }
@@ -1774,7 +1781,8 @@ public:
     fieldInfo->nTerms = result.nTerms;
     fieldInfo->sumDocFreq = result.sumDocFreq;
     fieldInfo->sumTotalTermFreq = result.sumTotalTermFreq;
-    fieldInfo->flags &= ~FieldType::TERM_RANGES;
+    fieldInfo->flags &= ~(FieldType::TERM_RANGES | FieldType::MAY_HAVE_FITTED);
+    if (result.mayHaveFitted) fieldInfo->flags |= FieldType::MAY_HAVE_FITTED;
     fieldInfo->rangeTableLoc = {0, 0};
 
     if (result.nTerms == 0) {

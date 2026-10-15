@@ -649,7 +649,14 @@ private:
     std::string commonPrefix;
     std::string commonSuffix;
     automaton::ByteDfaView::State initialState = compiled.start();
+    std::optional<TermPolicy> fittedPolicy;
     if (kind == automaton::ByteDfaKind::NORMAL) {
+      // Exact and prefix shapes see fitted terms correctly; a general pattern
+      // that can reach the fitted length may test hash or truncation bytes.
+      TermPolicy policy = target.fieldType->longTerms;
+      if (policy != TermPolicy::REJECT && compiled.canAcceptLength(PackedTerm::MIN_FITTED_LEN)) {
+        fittedPolicy = policy;
+      }
       commonPrefix = std::move(prefixAndState.first);
       auto state = prefixAndState.second;
       commonSuffix = compiled.commonSuffix();
@@ -661,7 +668,7 @@ private:
     DfaScanPlan scanPlan{poolCopy(commonPrefix), poolCopy(commonSuffix), initialState};
     automaton::ByteDfaView frozen = compiled.freeze(pool);
     return pool.make<AutomatonQuery>(field, queryKind, patternCopy, frozen, kind,
-                                    exactOrPrefixCopy, scanPlan);
+                                    exactOrPrefixCopy, scanPlan, fittedPolicy);
   }
 
 public:

@@ -71,6 +71,10 @@ public:
   // Segment-format marker. It is never supplied by schema configuration.
   static constexpr flag_type TERM_RANGES = (1 << 12);
   static constexpr flag_type DERIVED = (1 << 13);  // named representation of a logical field
+  // Segment-format marker, never supplied by schema configuration: some term
+  // in this segment field is at least PackedTerm::MIN_FITTED_LEN bytes, so it
+  // may be a truncated or hashed (fitted) form of a longer value.
+  static constexpr flag_type MAY_HAVE_FITTED = (1 << 14);
 
   const FieldType::Type type_;
   const std::string name_;

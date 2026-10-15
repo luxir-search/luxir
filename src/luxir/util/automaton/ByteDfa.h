@@ -367,6 +367,43 @@ public:
     return reversed;
   }
   Kind classify(std::string* value = nullptr) const { return makeView().classify(value); }
+
+  // True when some accepted string is at least n bytes long. Built DFAs are
+  // trimmed (every state reachable and co-reachable), so any cycle accepts
+  // unboundedly long strings; otherwise compare the longest accepting path.
+  bool canAcceptLength(uint32_t n) const {
+    size_t count = accepts.size();
+    if (count == 0) return false;
+    ByteDfaView dfa = makeView();
+    std::vector<uint32_t> indegree(count);
+    for (State state = 0; state < (State)count; state++) {
+      for (const Range& range : dfa.transitions(state)) indegree[(size_t)range.dest]++;
+    }
+    // Kahn order; longest[s] is the longest path from the start to s.
+    std::vector<int64_t> longest(count, -1);
+    std::queue<State> pending;
+    for (State state = 0; state < (State)count; state++) {
+      if (indegree[(size_t)state] == 0) pending.push(state);
+    }
+    longest[0] = 0;
+    size_t removed = 0;
+    int64_t best = -1;
+    while (!pending.empty()) {
+      State state = pending.front();
+      pending.pop();
+      removed++;
+      int64_t length = longest[(size_t)state];
+      if (length >= 0 && accepts[(size_t)state]) best = std::max(best, length);
+      for (const Range& range : dfa.transitions(state)) {
+        if (length >= 0) {
+          longest[(size_t)range.dest] = std::max(longest[(size_t)range.dest], length + 1);
+        }
+        if (--indegree[(size_t)range.dest] == 0) pending.push(range.dest);
+      }
+    }
+    if (removed != count) return true;
+    return best >= (int64_t)n;
+  }
 };
 
 } // namespace luxir::automaton

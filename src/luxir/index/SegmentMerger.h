@@ -1314,6 +1314,7 @@ private:
       int32_t blockOrd = 0;
       int64_t sumDocFreq = 0;
       int64_t sumTotalTermFreq = 0;
+      bool mayHaveFitted = false;
 
       for (auto& outputPtr : outputs) {
         RangeOutput& output = *outputPtr;
@@ -1346,12 +1347,14 @@ private:
         blockOrd += result.nBlocks;
         sumDocFreq += result.sumDocFreq;
         sumTotalTermFreq += result.sumTotalTermFreq;
+        mayHaveFitted |= result.mayHaveFitted;
         previousLastTerm = result.lastTerm;
       }
 
       outputFieldInfo->nTerms = termOrd;
       outputFieldInfo->sumDocFreq = sumDocFreq;
       outputFieldInfo->sumTotalTermFreq = sumTotalTermFreq;
+      if (mayHaveFitted) outputFieldInfo->flags |= FieldType::MAY_HAVE_FITTED;
       if (termOrd == 0) {
         outputFieldInfo->flags &= ~FieldType::TERM_RANGES;
         outputFieldInfo->termBlockIndexLoc = {0, 0};
@@ -1450,7 +1453,9 @@ private:
         LOG_ERROR("Field types don't match! {} {}", (int)type, (int)field->segFieldInfo.type);
         // now what?
       }
-      allFlags |= field->segFieldInfo.flags & ~FieldType::TERM_RANGES;
+      // Segment-format markers are recomputed from what this merge writes.
+      allFlags |= field->segFieldInfo.flags
+          & ~(FieldType::TERM_RANGES | FieldType::MAY_HAVE_FITTED);
     }
     bool isText = type == FieldType::Type::TEXT;
     bool hasImpactNorms = isText && FieldType::hasPositions(allFlags);
