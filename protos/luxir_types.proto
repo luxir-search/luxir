@@ -213,6 +213,8 @@ message Query {
     WildcardQuery wildcard = 17;    // selects documents by wildcard term match
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
+    CombinedFieldsQuery combined_fields = 20; // BM25F: several text fields scored as one
+    MultiMatchQuery multi_match = 21; // one query text over several fields
   }
 }
 
@@ -296,6 +298,62 @@ message Match {
     OPERATOR_UNSPECIFIED = 0;  // treated as OR
     OR = 1;                    // a doc matches if any analyzed term matches
     AND = 2;                   // a doc must match every analyzed term
+  }
+}
+
+// Analyzes `query` and scores each term as if the listed TEXT fields were one
+// combined field (BM25F, as Lucene's CombinedFieldQuery and Elasticsearch's
+// combined_fields). A field's boost multiplies both its term frequency and
+// its document length; document frequency is the largest across the fields
+// and the average length is the boost-weighted sum of the fields' averages.
+// Every field must analyze `query` to the same terms; use MultiMatchQuery
+// with type CROSS_FIELDS to group fields with different analyzers.
+message CombinedFieldsQuery {
+  string query = 1;  // the text to analyze
+
+  // Required, non-empty TEXT fields. Each entry is a name or "name^boost";
+  // boosts must be finite and >= 1 (default 1).
+  repeated string fields = 2;
+
+  // How the analyzed terms combine. Unset = OR: a doc matches if any term
+  // appears in any listed field. AND requires every term in some field.
+  Match.Operator operator = 3;
+
+  // Minimum number of analyzed terms that must match; overrides `operator`
+  // and is clamped to the term count. Mirrors Match.min_match.
+  int32 min_match = 4;
+}
+
+// Elasticsearch-style multi_match: one query text over several fields.
+message MultiMatchQuery {
+  string query = 1;  // the text to analyze
+
+  // Required, non-empty fields. Each entry is a name or "name^boost"; boosts
+  // must be finite and > 0 (default 1).
+  repeated string fields = 2;
+
+  // Scoring strategy. Unset = BEST_FIELDS, as in Elasticsearch.
+  Type type = 3;
+
+  // How the analyzed terms combine (per field for MOST_FIELDS, per term
+  // across fields for CROSS_FIELDS). Unset = OR.
+  Match.Operator operator = 4;
+
+  // Minimum number of analyzed terms that must match; overrides `operator`.
+  int32 min_match = 5;
+
+  enum Type {
+    TYPE_UNSPECIFIED = 0; // treated as BEST_FIELDS
+    BEST_FIELDS = 1;      // not supported yet; rejected
+    // A match query per field; the field scores add up.
+    MOST_FIELDS = 2;
+    // Term-centric BM25F: TEXT fields that analyze `query` to the same terms
+    // are scored as one combined field, as in CombinedFieldsQuery; groups of
+    // fields with different analysis add their scores.
+    CROSS_FIELDS = 3;
+    PHRASE = 4;           // not supported yet; rejected
+    PHRASE_PREFIX = 5;    // not supported yet; rejected
+    BOOL_PREFIX = 6;      // not supported yet; rejected
   }
 }
 

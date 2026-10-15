@@ -87,6 +87,7 @@ defaults and constraints are described in the comments and guides.
 - [`CollectionCommit`](#message-luxir.collectioncommit)
 - [`CollectionStats`](#message-luxir.collectionstats)
 - [`Column`](#message-luxir.column)
+- [`CombinedFieldsQuery`](#message-luxir.combinedfieldsquery)
 - [`CommitParams`](#message-luxir.commitparams)
 - [`ConstantScoreQuery`](#message-luxir.constantscorequery)
 - [`CreateCollectionRequest`](#message-luxir.createcollectionrequest)
@@ -123,6 +124,7 @@ defaults and constraints are described in the comments and guides.
 - [`Map`](#message-luxir.map)
 - [`Match`](#message-luxir.match)
 - [`MemoryStats`](#message-luxir.memorystats)
+- [`MultiMatchQuery`](#message-luxir.multimatchquery)
 - [`MultiVector`](#message-luxir.multivector)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
 - [`PhraseQuery`](#message-luxir.phrasequery)
@@ -559,6 +561,21 @@ One slot per document, including missing values, aligned with DocList rows. Scal
 | <a id="field-luxir.column.multi_d"></a>[`multi_d`](#field-luxir.column.multi_d) | 8 | [`ArrArrDouble`](#message-luxir.arrarrdouble) | oneof [`kind`](#oneof-luxir.column.kind) |  |
 | <a id="field-luxir.column.col_vec"></a>[`col_vec`](#field-luxir.column.col_vec) | 16 | [`ColVector`](#message-luxir.colvector) | oneof [`kind`](#oneof-luxir.column.kind) | single-valued vector column: one Vector per doc; missing = unset oneof |
 | <a id="field-luxir.column.multi_vec"></a>[`multi_vec`](#field-luxir.column.multi_vec) | 17 | [`MultiVector`](#message-luxir.multivector) | oneof [`kind`](#oneof-luxir.column.kind) | multi-valued vector column: one ArrVector per doc; missing = empty list |
+
+<a id="message-luxir.combinedfieldsquery"></a>
+
+### luxir.CombinedFieldsQuery
+
+Analyzes \`query\` and scores each term as if the listed TEXT fields were one combined field (BM25F, as Lucene's CombinedFieldQuery and Elasticsearch's combined\_fields). A field's boost multiplies both its term frequency and its document length; document frequency is the largest across the fields and the average length is the boost-weighted sum of the fields' averages. Every field must analyze \`query\` to the same terms; use MultiMatchQuery with type CROSS\_FIELDS to group fields with different analyzers.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.combinedfieldsquery.query"></a>[`query`](#field-luxir.combinedfieldsquery.query) | 1 | `string` | singular | the text to analyze |
+| <a id="field-luxir.combinedfieldsquery.fields"></a>[`fields`](#field-luxir.combinedfieldsquery.fields) | 2 | `string` | repeated | Required, non-empty TEXT fields. Each entry is a name or "name^boost"; boosts must be finite and &gt;= 1 (default 1). |
+| <a id="field-luxir.combinedfieldsquery.operator"></a>[`operator`](#field-luxir.combinedfieldsquery.operator) | 3 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How the analyzed terms combine. Unset = OR: a doc matches if any term appears in any listed field. AND requires every term in some field. |
+| <a id="field-luxir.combinedfieldsquery.min_match"></a>[`min_match`](#field-luxir.combinedfieldsquery.min_match) | 4 | `int32` | singular | Minimum number of analyzed terms that must match; overrides \`operator\` and is clamped to the term count. Mirrors Match.min\_match. |
 
 <a id="message-luxir.commitparams"></a>
 
@@ -1096,6 +1113,22 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.storage_ram"></a>[`storage_ram`](#field-luxir.memorystats.storage_ram) | 2 | [`StorageRamStats`](#message-luxir.storageramstats) | singular |  |
 | <a id="field-luxir.memorystats.jemalloc"></a>[`jemalloc`](#field-luxir.memorystats.jemalloc) | 3 | [`JemallocStats`](#message-luxir.jemallocstats) | singular | Present only when Luxir runs on jemalloc. |
 
+<a id="message-luxir.multimatchquery"></a>
+
+### luxir.MultiMatchQuery
+
+Elasticsearch-style multi\_match: one query text over several fields.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.multimatchquery.query"></a>[`query`](#field-luxir.multimatchquery.query) | 1 | `string` | singular | the text to analyze |
+| <a id="field-luxir.multimatchquery.fields"></a>[`fields`](#field-luxir.multimatchquery.fields) | 2 | `string` | repeated | Required, non-empty fields. Each entry is a name or "name^boost"; boosts must be finite and &gt; 0 (default 1). |
+| <a id="field-luxir.multimatchquery.type"></a>[`type`](#field-luxir.multimatchquery.type) | 3 | [`MultiMatchQuery.Type`](#enum-luxir.multimatchquery.type) | singular | Scoring strategy. Unset = BEST\_FIELDS, as in Elasticsearch. |
+| <a id="field-luxir.multimatchquery.operator"></a>[`operator`](#field-luxir.multimatchquery.operator) | 4 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How the analyzed terms combine (per field for MOST\_FIELDS, per term across fields for CROSS\_FIELDS). Unset = OR. |
+| <a id="field-luxir.multimatchquery.min_match"></a>[`min_match`](#field-luxir.multimatchquery.min_match) | 5 | `int32` | singular | Minimum number of analyzed terms that must match; overrides \`operator\`. |
+
 <a id="message-luxir.multivector"></a>
 
 ### luxir.MultiVector
@@ -1182,6 +1215,8 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.wildcard"></a>[`wildcard`](#field-luxir.query.wildcard) | 17 | [`WildcardQuery`](#message-luxir.wildcardquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by wildcard term match |
 | <a id="field-luxir.query.regex"></a>[`regex`](#field-luxir.query.regex) | 18 | [`RegexQuery`](#message-luxir.regexquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by regular-expression term match |
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
+| <a id="field-luxir.query.combined_fields"></a>[`combined_fields`](#field-luxir.query.combined_fields) | 20 | [`CombinedFieldsQuery`](#message-luxir.combinedfieldsquery) | oneof [`kind`](#oneof-luxir.query.kind) | BM25F: several text fields scored as one |
+| <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 21 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one query text over several fields |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -1806,6 +1841,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
 - [`Match.Operator`](#enum-luxir.match.operator)
+- [`MultiMatchQuery.Type`](#enum-luxir.multimatchquery.type)
 - [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
 - [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
 - [`ResponseFormat`](#enum-luxir.responseformat)
@@ -1918,6 +1954,22 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.match.operator.operator_unspecified"></a>[`OPERATOR_UNSPECIFIED`](#value-luxir.match.operator.operator_unspecified) | 0 | treated as OR |
 | <a id="value-luxir.match.operator.or"></a>[`OR`](#value-luxir.match.operator.or) | 1 | a doc matches if any analyzed term matches |
 | <a id="value-luxir.match.operator.and"></a>[`AND`](#value-luxir.match.operator.and) | 2 | a doc must match every analyzed term |
+
+<a id="enum-luxir.multimatchquery.type"></a>
+
+### luxir.MultiMatchQuery.Type
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.multimatchquery.type.type_unspecified"></a>[`TYPE_UNSPECIFIED`](#value-luxir.multimatchquery.type.type_unspecified) | 0 | treated as BEST\_FIELDS |
+| <a id="value-luxir.multimatchquery.type.best_fields"></a>[`BEST_FIELDS`](#value-luxir.multimatchquery.type.best_fields) | 1 | not supported yet; rejected |
+| <a id="value-luxir.multimatchquery.type.most_fields"></a>[`MOST_FIELDS`](#value-luxir.multimatchquery.type.most_fields) | 2 | A match query per field; the field scores add up. |
+| <a id="value-luxir.multimatchquery.type.cross_fields"></a>[`CROSS_FIELDS`](#value-luxir.multimatchquery.type.cross_fields) | 3 | Term-centric BM25F: TEXT fields that analyze \`query\` to the same terms are scored as one combined field, as in CombinedFieldsQuery; groups of fields with different analysis add their scores. |
+| <a id="value-luxir.multimatchquery.type.phrase"></a>[`PHRASE`](#value-luxir.multimatchquery.type.phrase) | 4 | not supported yet; rejected |
+| <a id="value-luxir.multimatchquery.type.phrase_prefix"></a>[`PHRASE_PREFIX`](#value-luxir.multimatchquery.type.phrase_prefix) | 5 | not supported yet; rejected |
+| <a id="value-luxir.multimatchquery.type.bool_prefix"></a>[`BOOL_PREFIX`](#value-luxir.multimatchquery.type.bool_prefix) | 6 | not supported yet; rejected |
 
 <a id="enum-luxir.replicaresult.outcome"></a>
 

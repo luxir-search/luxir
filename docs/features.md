@@ -224,6 +224,10 @@ Anywhere a query goes, it can be a structured object or an expression string.
   each score with a value expression over columns and the original score
   (`score * def(popularity_i, 1)`).
 - `knn` vector search, `geo_box`, and `geo_distance`.
+- `combined_fields` and `multi_match` (`cross_fields`, `most_fields`):
+  search one text across several fields. `combined_fields` and
+  `cross_fields` score with BM25F, treating the fields as one combined field
+  with per-field boosts as term-frequency weights, as Elasticsearch does.
 - `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,
   quoted phrases with `~N` slop, grouping, trailing-`*` prefix, `~N` fuzzy
   terms, and `field:value` terms against an allowlist).
