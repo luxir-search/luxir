@@ -70,6 +70,9 @@ message SearchOp {
     RangeFacet range_facet = 9;
     QueryFacet query_facet = 10;
     ExprOp expr_op = 15;
+    Cardinality cardinality = 16;
+    Percentiles percentiles = 17;
+    PercentileRanks percentile_ranks = 18;
   }
   Domain domain = 20; // optional override of the incoming document domain
 }
@@ -79,6 +82,43 @@ message SearchOp {
 message ExprOp {
   string expr = 1;
   map<string, Val> vars = 2;
+}
+
+// Approximate count of the distinct values of a field over the operation's
+// incoming documents. The result is an int64. Supports STRING, ID, INT,
+// FLOAT, DOUBLE, and DATE fields; multi-valued documents contribute every
+// value, and documents without a value contribute nothing.
+message Cardinality {
+  string field = 1;
+
+  // Distinct counts up to this value are exact (up to 64-bit hash
+  // collisions); above it a HyperLogLog sketch with 2^p registers takes
+  // over, p = ceil(log2(threshold / 0.75)) clamped to [4, 18].
+  // Unset = 3000; must be in [0, 40000].
+  optional int64 precision_threshold = 2;
+}
+
+// Approximate percentiles of an INT, FLOAT, DOUBLE, or DATE field's values
+// over the operation's incoming documents, from a t-digest. Keyed results
+// are a Map from the formatted percent ("50.0", "99.9") to a double, in
+// request order; unkeyed results are an array of {key, value} Maps. Values
+// are null when no document has a value. NaN and infinite values are
+// skipped.
+message Percentiles {
+  string field = 1;
+  repeated double percents = 2;     // each in [0, 100], distinct; empty = 1,5,25,50,75,95,99
+  optional double compression = 3;  // t-digest compression; unset = 100; must be in [20, 1000]
+  optional bool keyed = 4;          // unset = true
+}
+
+// The percentile rank (0-100: the percentage of values <= v) of each of
+// `values` for an INT, FLOAT, DOUBLE, or DATE field, from the same sketch
+// as Percentiles. Result shape as Percentiles, keyed by the formatted value.
+message PercentileRanks {
+  string field = 1;
+  repeated double values = 2;       // required, nonempty, finite, distinct
+  optional double compression = 3;  // unset = 100; must be in [20, 1000]
+  optional bool keyed = 4;          // unset = true
 }
 
 // Placement preference for returned document fields: dense columns
