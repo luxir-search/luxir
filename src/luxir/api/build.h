@@ -38,7 +38,9 @@ static_assert((int)Error_::Kind::UNKNOWN == (int)ErrorKind::UNKNOWN &&
               (int)Error_::Kind::FAILED_PRECONDITION == (int)ErrorKind::FAILED_PRECONDITION &&
               (int)Error_::Kind::RESOURCE_EXHAUSTED == (int)ErrorKind::RESOURCE_EXHAUSTED &&
               (int)Error_::Kind::UNAVAILABLE == (int)ErrorKind::UNAVAILABLE &&
-              (int)Error_::Kind::INTERNAL == (int)ErrorKind::INTERNAL);
+              (int)Error_::Kind::INTERNAL == (int)ErrorKind::INTERNAL &&
+              (int)Error_::Kind::CANCELLED == (int)ErrorKind::CANCELLED &&
+              (int)Error_::Kind::DEADLINE_EXCEEDED == (int)ErrorKind::DEADLINE_EXCEEDED);
 
 template<class T>
 T* allocMessage(std::pmr::memory_resource& mr) {

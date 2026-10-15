@@ -215,6 +215,8 @@ static grpc::StatusCode grpcStatusCode(ErrorKind kind) {
     case ErrorKind::FAILED_PRECONDITION: return grpc::StatusCode::FAILED_PRECONDITION;
     case ErrorKind::RESOURCE_EXHAUSTED: return grpc::StatusCode::RESOURCE_EXHAUSTED;
     case ErrorKind::UNAVAILABLE: return grpc::StatusCode::UNAVAILABLE;
+    case ErrorKind::CANCELLED: return grpc::StatusCode::CANCELLED;
+    case ErrorKind::DEADLINE_EXCEEDED: return grpc::StatusCode::DEADLINE_EXCEEDED;
     case ErrorKind::INTERNAL:
     case ErrorKind::UNKNOWN: break;
   }
@@ -607,6 +609,16 @@ static void finishWithException(GenericCallData& call, const std::exception& e,
 
 // ---- per-method handlers -------------------------------------------------
 
+// A call deadline on the steady clock the search budget runs on; a call without
+// one (gRPC reports the infinite future) maps to no deadline.
+static std::chrono::steady_clock::time_point steadyDeadline(
+    std::chrono::system_clock::time_point deadline) {
+  auto remaining = deadline - std::chrono::system_clock::now();
+  if (remaining > std::chrono::hours(24 * 365)) return std::chrono::steady_clock::time_point::max();
+  return std::chrono::steady_clock::now()
+      + std::chrono::duration_cast<std::chrono::steady_clock::duration>(remaining);
+}
+
 //   rpc Search(stream SearchRequest) returns (stream SearchResponse)
 static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   // SearchRequest subclass whose reply() serializes to ByteBuffer and drops eagerly.
@@ -676,10 +688,12 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena);
   req.requestState = std::move(requestState);
   req.parent = &call;
-  if (!req.proto.min_commit.empty()) {
-    call.enableWaitCancellation();
-    req.waitCancellation = call.waitCancellation;
-  }
+  // Cancellation (the client cancels the RPC, or the server shuts down) ends a
+  // min_commit wait and stops execution at its next segment or window check.
+  // The call's deadline caps the search's own (SearchEngine::dispatch).
+  call.enableWaitCancellation();
+  req.waitCancellation = call.waitCancellation;
+  req.transportDeadline = steadyDeadline(call.genericCtx.deadline());
   // Route by max_parallel (via dispatch()): the default (0) runs the whole
   // query serially right here on this completion-queue thread - the cheapest
   // path, accepting that this cq's other calls wait for the query's duration

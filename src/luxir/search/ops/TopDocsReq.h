@@ -1757,11 +1757,36 @@ public:
       op.releaseSegmentState(segment);
     }
 
+    // Out of budget (SearchRequest::shouldStop): the segment collects nothing
+    // but still completes.  The domain cannot simply be swapped for an empty
+    // one here, since prepared sources may require the exact domain they were
+    // built for.  Sub-ops get an empty domain (a null one would mean every
+    // document), and the collector goes back to the merger so the last
+    // segment still runs doneCollecting.
+    void skipSegment(oneapi::tbb::task_group* tg, int32_t segnum) {
+      auto& op = thisOp();
+      releaseSegmentState(op.planning.topReader.segments()[segnum]);
+      DomainHandle empty = emptyDomain();
+      if (!output.empty()) output[(size_t)segnum] = empty;
+      for (int i = (int)subCalcs.size() - 1; i >= 0; i--) {
+        subCalcs[(size_t)i]->calc(tg, segnum, empty);
+      }
+      auto count = collectorMerger.release(collectorMerger.obtain());
+      if (count == (int64_t)op.req.reader->segments().size()) {
+        auto* tgFieldLoad = subCalcs.size() > 0 ? tg : nullptr;
+        task_group_run(tgFieldLoad, [this]() { doneCollecting(); });
+      }
+    }
+
     void doCollect(
         oneapi::tbb::task_group* tg, int32_t segnum,
         DomainHandle domainHandle) {
       auto& op = thisOp();
       assert(domainHandle.isDeliverable());
+      if (op.req.shouldStop()) {
+        skipSegment(tg, segnum);
+        return;
+      }
       DocSet* domain = domainHandle.get();
 
       // A constant-scoring match-all is the identity on its domain: every doc

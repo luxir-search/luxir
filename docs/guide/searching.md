@@ -553,6 +553,7 @@ The recognized request-level parameters are:
 | `time_zone` | String; validated by the search engine like the body field. |
 | `profile` | Exactly `true` or `false`. |
 | `max_parallel` | Signed 32-bit decimal integer; supported modes are validated by the search engine. |
+| `timeout_ms` | Unsigned 64-bit decimal integer. |
 
 The recognized top-document parameters are:
 
@@ -597,6 +598,7 @@ beside `ops` in the full form:
   "time_zone": "America/Denver",
   "profile": true,
   "max_parallel": 1,
+  "timeout_ms": 500,
   "query": "published_dt:>=NOW/DAY",
   "limit": 10
 }
@@ -618,6 +620,44 @@ beside `ops` in the full form:
   thread for its duration. The path collection overrides any collection
   target in the HTTP body.
 - `profile: true` returns an execution profile on the final response.
+- `timeout_ms` bounds how long the search runs, measured from when the node
+  receives it; `0`, the default, sets no limit of its own. The node's
+  `search.default-timeout-ms` and a gRPC call deadline also apply, and the
+  earliest wins, so a request can shorten the node limit but not extend it.
+  See [Timeouts and partial results](#timeouts-and-partial-results).
+
+### Timeouts and partial results
+
+A search that reaches its deadline stops collecting and answers with what it
+has, not with an error. The final response carries `"timed_out": true` and a
+`timed_out` warning:
+
+```json
+{
+  "found": 1830,
+  "docs": [{"id": "17"}, {"id": "42"}],
+  "timed_out": true,
+  "warnings": [
+    {"code": "timed_out", "message": "the search ran past its deadline; results are partial"}
+  ]
+}
+```
+
+The deadline is checked when each segment starts and between match windows
+within a segment, never per document, so a search can overrun it by about
+one window of work. Segments not yet started contribute nothing. Counts
+(`found`, facet buckets, metrics) then cover only the documents seen, and top
+documents are the best of those; the documents that were collected are still
+returned with their fields. Filter sets that may be cached are always built
+in full, so a timeout never leaves an incomplete set in the filter cache.
+
+Time spent waiting for `min_commit` or for an admission slot counts against
+the deadline. A search whose deadline passes while it waits in the admission
+queue answers `timed_out` with no op results, without running.
+
+When the client goes away (the connection closes or the gRPC call is
+cancelled), a running search stops at its next check and fails with kind
+`cancelled`; nobody is left to read partial results.
 
 Profiling is opt-in and request-wide, and operations adopt instrumentation
 independently; string field facets are the currently instrumented operation.

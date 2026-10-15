@@ -7,7 +7,9 @@
 #include "luxir/search/SearchRequest.h"
 
 #include <cassert>
+#include <condition_variable>
 #include <deque>
+#include <mutex>
 #include <span>
 #include <variant>
 
@@ -129,6 +131,10 @@ class LocalReq : private LocalReqViewHolder, public SearchRequest {
 public:
   luxir::ArenaResource mr;                  // pmr view over the base arena for build helpers
   std::vector<SearchResponse*> responses;   // retained (arenas kept alive until done())
+  // Signals the final response, for requests run asynchronously (dispatch()).
+  std::mutex finalMutex;
+  std::condition_variable finalCv;
+  bool finalSeen = false;
 
   static LocalReq* create(SearchEngine& engine, google::protobuf::Arena* arena = nullptr) {
     arena = arena ? arena : createArena();
@@ -140,7 +146,12 @@ public:
   }
 
   ReplyStatus reply(SearchResponse& response) override {
+    std::lock_guard<std::mutex> lock(finalMutex);
     responses.push_back(&response);  // retain; the response's arena stays alive until done()
+    if (response.last) {
+      finalSeen = true;
+      finalCv.notify_all();
+    }
     return ReplyStatus::OK;
   }
   void replyCallback(SearchResponse& response) override { unused(response); }
@@ -169,6 +180,15 @@ public:
     return *this;
   }
   ReqProto& rawRequest() { return view; }
+  LocalReq& timeoutMs(uint64_t ms) {
+    view.timeout_ms = ms;
+    return *this;
+  }
+  LocalReq& minCommit(std::string_view token, uint64_t timeoutMs) {
+    view.min_commit = build::arenaStr(mr, token);
+    view.min_commit_timeout_ms = timeoutMs;
+    return *this;
+  }
   LocalReq& requestId(std::string_view id) {
     view.request_id = build::arenaStr(mr, id);
     return *this;
@@ -208,6 +228,22 @@ public:
     return *this;
   }
 
+  // Through the transport entry point (admission, min_commit, lanes): the
+  // final response may arrive later, on another thread; see waitDone().
+  LocalReq& dispatch(int32_t maxParallel = 0) {
+    engine.dispatch(*this, maxParallel);
+    return *this;
+  }
+  bool isDone() {
+    std::lock_guard<std::mutex> lock(finalMutex);
+    return finalSeen;
+  }
+  LocalReq& waitDone() {
+    std::unique_lock<std::mutex> lock(finalMutex);
+    finalCv.wait(lock, [this] { return finalSeen; });
+    return *this;
+  }
+
   // --- result inspection (reads go through the concrete classes' accessors) ---
   bool ok() const { return !responses.empty() && !hasError(responses[0]->proto); }
   std::string errorMsg() const { return responses.empty() ? "(no response)" : errorMessage(responses[0]->proto); }
@@ -222,6 +258,7 @@ public:
     return responses.empty() ? std::span<const luxir::api::Warning>{}
                              : responses.back()->proto.warnings;
   }
+  bool timedOut() const { return !responses.empty() && responses.back()->proto.timed_out; }
   bool hasWarning(std::string_view code) const {
     for (const auto& w : respWarnings()) {
       if (w.code == code) return true;

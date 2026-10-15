@@ -1240,6 +1240,8 @@ struct from<JSON, luxir::api::SearchRequest> {
             util::from_json<O>(value.min_commit, ctx, vit, vend);
           } else if (key == "min_commit_timeout_ms") {
             util::from_json<O>(value.min_commit_timeout_ms, ctx, vit, vend);
+          } else if (key == "timeout_ms") {
+            util::from_json<O>(value.timeout_ms, ctx, vit, vend);
           } else if (key == "time_zone") {
             util::from_json<O>(value.time_zone, ctx, vit, vend);
           } else if (key == "response_format") {

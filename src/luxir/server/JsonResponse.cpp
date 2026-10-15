@@ -551,6 +551,10 @@ std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, boo
     appendKey("ops");
     appendOps(out, resp.ops);
   }
+  if (resp.timed_out) {
+    appendKey("timed_out");
+    out += "true";
+  }
   if (!resp.warnings.empty()) {
     // declared degradations (the request was served, but not exactly as written)
     appendKey("warnings");

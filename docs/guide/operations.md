@@ -344,12 +344,26 @@ Search has its own limits:
 ./luxir \
   --search.request-memory-max-bytes=0 \
   --search.max-op-depth=8 \
+  --search.default-timeout-ms=10000 \
+  --search.max-concurrent=32 \
+  --search.max-queued=1000 \
   --query-cache-bytes=64MB
 ```
 
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
+- `search.default-timeout-ms` is the node's search deadline; `0` (the default)
+  is none. A request's `timeout_ms` can shorten it but not extend it. A search
+  out of time returns partial results flagged `timed_out`; see
+  [Timeouts and partial results](searching.md#timeouts-and-partial-results).
+- `search.max-concurrent` caps the searches admitted to run at once; `0` (the
+  default) is unlimited. Further searches wait in a FIFO queue of up to
+  `search.max-queued` (default `1000`) and start as slots free; beyond that a
+  search is rejected with kind `resource_exhausted`, code `search_queue_full`
+  (HTTP 429). A search holds its slot from arrival, including any `min_commit`
+  wait, until its execution finishes; a streaming response paused by a slow
+  reader does not hold one. Queue time counts against the search's deadline.
 - `query-cache-bytes` caps each collection's filter cache (default `64MB`; `0`
   disables it). Cached filters are evicted by rebuild cost per byte, so under
   pressure the cache keeps expensive compound filters and drops cheap ones

@@ -87,7 +87,14 @@ response paths keep connection handling separate from long-running engine work.
   work-stealing scheduler (`max_parallel: 1`) so an expensive query does
   not occupy its connection thread, or parallelize (`max_parallel: -1`):
   it starts on the receiving thread, which enters the scheduler with a slot
-  reserved for transport threads, and idle workers steal its tasks. The gRPC
+  reserved for transport threads, and idle workers steal its tasks.
+  Optional admission control (`search.max-concurrent`) queues searches past
+  the cap in a bounded FIFO; a dequeued search runs on the scheduler, so a
+  finishing search never runs its successor inline. A search deadline is
+  polled at segment starts and between match windows, never per document,
+  and an expired one ends collection with partial results rather than an
+  error. Filter sets that may enter the shared cache are always built in
+  full, so a timeout cannot publish an incomplete set. The gRPC
   unary update path currently waits for indexing on its completion-queue
   handler.
 - Ingest is streaming and incremental: NDJSON bodies are parsed as bytes
