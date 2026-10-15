@@ -5,6 +5,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
+#include <random>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -16,6 +18,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/query/FieldResolver.h"
 #include "luxir/util/Cursor.h"
+#include "luxir/util/geo.h"
 #include "luxir/util/proto.h"
 #include "luxir/value/AggregateFunctionRegistry.h"
 #include "luxir/value/ValueExpr.h"
@@ -77,7 +80,7 @@ public:
                         std::span<const uint32_t> args) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
     assert(function != nullptr);
-    std::array<uint32_t, 2> children{};
+    std::array<uint32_t, VALUE_MAX_ARITY> children{};
     assert(args.size() <= children.size());
     std::copy(args.begin(), args.end(), children.begin());
     return appendFunction(function, pos, children, (uint8_t)args.size());
@@ -126,7 +129,7 @@ private:
           }
         }
       } else if (node.kind == ValueNodeKind::FUNCTION) {
-        std::array<ValueBounds, 2> children;
+        std::array<ValueBounds, VALUE_MAX_ARITY> children;
         bool independent = true;
         for (uint8_t child = 0; child < node.childCount; child++) {
           const auto& childBounds = bounds[node.children[child]];
@@ -330,6 +333,10 @@ private:
   template <class Grammar>
   uint32_t parseCall(Grammar& grammar, std::string_view name, size_t pos) {
     if (name == "col") return parseExplicitColumn(grammar, pos);
+    if (name == "geo_distance") return parseGeoDistance(grammar, pos);
+    if (name == "gauss" || name == "linear" || name == "exp") {
+      return parseDecayOrExp(grammar, name, pos);
+    }
     ExpressionFunctionLookup lookup = ExpressionFunctionRegistry::find(name);
     const ValueFunction* function = lookup.value;
     if (function == nullptr) {
@@ -341,7 +348,7 @@ private:
       fail(pos, fmt::format("unknown value function '{}()'", name));
     }
 
-    std::array<uint32_t, 2> args{};
+    std::array<uint32_t, VALUE_MAX_ARITY> args{};
     uint8_t count = grammar.parseArguments(
         name, pos, function->minArity, function->maxArity,
         [&](uint8_t argument) {
@@ -368,9 +375,9 @@ private:
   }
 
   uint32_t appendFunction(const ValueFunction* function, size_t pos,
-                          std::array<uint32_t, 2> args, uint8_t count) {
+                          std::array<uint32_t, VALUE_MAX_ARITY> args, uint8_t count) {
     assert(function != nullptr);
-    std::array<ResolvedValue, 2> resolvedArgs{};
+    std::array<ResolvedValue, VALUE_MAX_ARITY> resolvedArgs{};
     for (uint8_t i = 0; i < count; i++) {
       const ValueNode& arg = program->nodes[args[i]];
       resolvedArgs[i] = {arg.type, arg.nature};
@@ -392,7 +399,165 @@ private:
     } catch (const std::exception& error) {
       fail(pos, fmt::format("{}(): {}", function->name, error.what()));
     }
+    if (node.opcode == ValueOpcode::IF) {
+      markGuarded(args[1]);
+      markGuarded(args[2]);
+    } else if (node.opcode == ValueOpcode::AND || node.opcode == ValueOpcode::OR) {
+      markGuarded(args[1]);
+    } else if (node.opcode == ValueOpcode::RANDOM) {
+      // ES random_score without a seed: a fresh seed for every request.
+      node.intValue = count == 0
+          ? (int64_t)(((uint64_t)std::random_device{}() << 32) | std::random_device{}())
+          : (int64_t)constantArg(args[0], "random", "seed", true);
+    }
     return append(node);
+  }
+
+  void markGuarded(uint32_t index) {
+    ValueNode& node = program->nodes[index];
+    node.guarded = true;
+    for (uint8_t child = 0; child < node.childCount; child++) {
+      markGuarded(node.children[child]);
+    }
+  }
+
+  // A literal or scalar $variable argument, as a double. With integral, it
+  // must be an int64 literal or variable.
+  double constantArg(uint32_t index, std::string_view function,
+                     std::string_view argument, bool integral = false) {
+    const ValueNode& node = program->nodes[index];
+    bool constant = node.kind == ValueNodeKind::CONSTANT
+        || node.kind == ValueNodeKind::VARIABLE;
+    if (!constant || valueArray(node.type)
+        || (integral && node.type != ValueType::INT64)) {
+      fail(node.sourcePos, fmt::format(
+          "{}() {} must be a{} literal or scalar $variable", function, argument,
+          integral ? "n integer" : " numeric"));
+    }
+    return node.type == ValueType::DOUBLE ? node.doubleValue : (double)node.intValue;
+  }
+
+  uint32_t constantDouble(double value, size_t pos) {
+    ValueNode node;
+    node.kind = ValueNodeKind::CONSTANT;
+    node.type = ValueType::DOUBLE;
+    node.doubleValue = value;
+    node.sourcePos = pos;
+    node.text = program->copyString(fmt::format("{}", value));
+    return append(node);
+  }
+
+  uint32_t call(std::string_view name, size_t pos,
+                std::initializer_list<uint32_t> children) {
+    return makeFunction(name, pos, std::span<const uint32_t>(children.begin(), children.size()));
+  }
+
+  // geo_distance(field, lat, lon): meters from (lat, lon) to each point of a
+  // GEO_POINT field, by the haversine formula geo_distance queries use.
+  template <class Grammar>
+  uint32_t parseGeoDistance(Grammar& grammar, size_t pos) {
+    std::array<uint32_t, VALUE_MAX_ARITY> args{};
+    grammar.parseArguments("geo_distance", pos, 3, 3, [&](uint8_t argument) {
+      if (argument != 0) {
+        args[argument] = grammar.parseExpression();
+        return;
+      }
+      cur->skipWs();
+      size_t fieldPos = cur->position();
+      std::string_view name = cur->peek() == '"' || cur->peek() == '\''
+          ? value::lex::scanQuoted(
+                *cur, program->resource,
+                [&](size_t at, std::string_view message) { fail(at, message); })
+          : value::lex::scanIdentifier(*cur);
+      if (name.empty()) fail(fieldPos, "geo_distance() expects a GEO_POINT field name first");
+      args[0] = parseGeoColumn(name, fieldPos);
+    });
+    double latitude = constantArg(args[1], "geo_distance", "latitude");
+    double longitude = constantArg(args[2], "geo_distance", "longitude");
+    try {
+      geo::checkLatitude(latitude);
+      geo::checkLongitude(longitude);
+    } catch (const std::invalid_argument& error) {
+      fail(pos, fmt::format("geo_distance(): {}", error.what()));
+    }
+    return appendFunction(ValueFunctionRegistry::find("geo_distance"), pos, args, 3);
+  }
+
+  uint32_t parseGeoColumn(std::string_view name, size_t pos) {
+    ResolvedFieldHandle target;
+    try {
+      target = opts.fieldResolver ? opts.fieldResolver->resolve(name, OpClass::VALUE, opts.opName)
+          : opts.schema->resolveFor(name, OpClass::VALUE);
+    } catch (const RequestError& e) {
+      fail(pos, e.what());
+    }
+    FieldType* field = target.fieldType;
+    if (field->type() != FieldType::GEO_POINT || !field->hasColumn()) {
+      fail(pos, fmt::format("geo_distance(): field '{}' is not a GEO_POINT field with column values",
+                            name));
+    }
+    ValueNode node;
+    node.kind = ValueNodeKind::COLUMN;
+    node.columnType = FieldType::GEO_POINT;
+    node.columnMultiValued = field->multiValued();
+    node.type = field->multiValued() ? ValueType::INT64_ARRAY : ValueType::INT64;
+    node.sourcePos = pos;
+    node.text = program->copyString(target.physicalName);
+    return append(node);
+  }
+
+  // Elasticsearch decay functions over a numeric, DATE, or geo_distance()
+  // value, expanded into primitives:
+  //   d = max(0, |value - origin| - offset)   (min over a multi-valued field)
+  //   gauss:  exp(ln(decay) * (d / scale)^2)
+  //   exp:    exp(ln(decay) * d / scale)
+  //   linear: max(0, 1 - d / (scale / (1 - decay)))
+  // A document without a value scores 1, as in Elasticsearch. exp() with one
+  // argument is the exponential function.
+  template <class Grammar>
+  uint32_t parseDecayOrExp(Grammar& grammar, std::string_view name, size_t pos) {
+    std::array<uint32_t, 5> args{};
+    bool math = name == "exp";
+    uint8_t count = grammar.parseArguments(
+        name, pos, math ? 1 : 3, 5,
+        [&](uint8_t argument) { args[argument] = grammar.parseExpression(); });
+    if (math && count == 1) {
+      std::array<uint32_t, VALUE_MAX_ARITY> unary{args[0]};
+      return appendFunction(ValueFunctionRegistry::find("exp"), pos, unary, 1);
+    }
+    if (count < 3) {
+      fail(pos, "exp() expects 1 argument (the exponential) or 3 to 5 "
+                "(a decay: value, origin, scale, offset, decay)");
+    }
+    double scale = constantArg(args[2], name, "scale");
+    double offset = count > 3 ? constantArg(args[3], name, "offset") : 0.0;
+    double decay = count > 4 ? constantArg(args[4], name, "decay") : 0.5;
+    if (!(scale > 0.0)) fail(pos, fmt::format("{}() scale must be positive", name));
+    if (!(offset >= 0.0)) fail(pos, fmt::format("{}() offset must be non-negative", name));
+    if (!(decay > 0.0 && decay < 1.0)) {
+      fail(pos, fmt::format("{}() decay must be strictly between 0 and 1", name));
+    }
+    if (valueArray(program->nodes[args[1]].type)) {
+      fail(pos, fmt::format("{}() origin must be a scalar", name));
+    }
+
+    uint32_t distance = call("abs", pos, {call("sub", pos, {args[0], args[1]})});
+    if (valueArray(program->nodes[distance].type)) distance = call("min", pos, {distance});
+    if (offset > 0.0) {
+      distance = call("max", pos, {call("sub", pos, {distance, constantDouble(offset, pos)}),
+                                   constantDouble(0.0, pos)});
+    }
+    uint32_t score;
+    if (name == "linear") {
+      uint32_t ratio = call("div", pos, {distance, constantDouble(scale / (1.0 - decay), pos)});
+      score = call("max", pos, {call("sub", pos, {constantDouble(1.0, pos), ratio}),
+                                constantDouble(0.0, pos)});
+    } else {
+      uint32_t ratio = call("div", pos, {distance, constantDouble(scale, pos)});
+      if (name == "gauss") ratio = call("mul", pos, {ratio, ratio});
+      score = call("exp", pos, {call("mul", pos, {constantDouble(std::log(decay), pos), ratio})});
+    }
+    return call("def", pos, {score, constantDouble(1.0, pos)});
   }
 };
 

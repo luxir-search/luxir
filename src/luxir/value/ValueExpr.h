@@ -39,12 +39,16 @@ struct ValueNode {
   ValueNature nature = ValueNature::NUMBER;
   ValueOpcode opcode = ValueOpcode::NONE;
   const ValueFunction* function = nullptr;
-  std::array<uint32_t, 2> children{};
+  std::array<uint32_t, VALUE_MAX_ARITY> children{};
   uint32_t arrayOffset = 0;
   uint32_t arraySize = 0;
   uint8_t childCount = 0;
   FieldType::Type columnType = FieldType::NONE;
   bool columnMultiValued = false;
+  // Inside a lazily evaluated branch (an if() arm or the right side of && or
+  // ||). Bind-time proof of invalidity only widens such a node's bounds,
+  // because the branch may never run for a document that would fail.
+  bool guarded = false;
   size_t sourcePos = 0;
   std::string_view text;
   int64_t intValue = 0;
