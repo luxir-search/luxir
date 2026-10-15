@@ -288,37 +288,37 @@ public:
     return keys;
   }
 
-  // Whether a segment without keys may hold docs that beat every key: under
-  // MISSING_FIRST a doc without a value sorts first, and it is collected
-  // unless an envelope, which no missing value satisfies, keeps it out.
-  static bool fieldSortMissingFirst(
+  // The key a segment without keys ranks at: its docs without a value sort
+  // at the primary clause's missing key (an edge, or a literal's key), and
+  // are collected unless an envelope, which no missing value satisfies,
+  // keeps them out (then they rank last).
+  static int64_t fieldSortMissingKey(
       const SortPlan& sortPlan,
       const std::optional<Query::ValueEnvelope>& envelope) {
-    return !envelope.has_value() && !sortPlan.clauses.empty()
-        && sortPlan.clauses[0].getKind() == SortClause::COLUMN
-        && sortPlan.clauses[0].getSortField().getMissingValue()
-            == FieldComparator::MISSING_FIRST;
+    if (envelope.has_value() || sortPlan.clauses.empty()
+        || sortPlan.clauses[0].getKind() != SortClause::COLUMN) {
+      return std::numeric_limits<int64_t>::max();
+    }
+    return sortPlan.clauses[0].getSortField().missingKey();
   }
 
   // Field-sort segment visit order: best first by each segment's
   // topCount-th best in-envelope key (its worst when it holds fewer
   // values), ties in segment order. A segment without keys (its column
-  // absent, sparse, or multi-valued there) ranks at the missing value's
-  // edge: first when `missingFirst` (fieldSortMissingFirst), as its docs
-  // without a value beat every key, and last otherwise. The heap then
+  // absent, sparse, or multi-valued there) ranks at `missingKey`
+  // (fieldSortMissingKey), where its docs without a value sort. The heap then
   // fills from the segments holding the best keys, so later segments
   // settle at their first bounds: newest first for a descending sort on a
   // time-ordered key. The kept top K is order-independent (segdoc breaks
   // ties), so the order only moves work.
   static std::vector<int32_t> fieldSortVisitOrder(
       std::span<const std::optional<SegmentKeys>> keys, int64_t topCount,
-      bool missingFirst) {
+      int64_t missingKey) {
     std::vector<std::pair<int64_t, int32_t>> ranked;
     ranked.reserve(keys.size());
     for (size_t s = 0; s < keys.size(); s++) {
-      int64_t key = !keys[s].has_value() && missingFirst
-          ? std::numeric_limits<int64_t>::min()
-          : std::numeric_limits<int64_t>::max();
+      int64_t key = !keys[s].has_value()
+          ? missingKey : std::numeric_limits<int64_t>::max();
       if (keys[s].has_value() && keys[s]->values() > 0) {
         key = keys[s]->keyAt(
             std::min(1.0, (double)topCount / keys[s]->values()));
@@ -387,7 +387,7 @@ public:
     plannedVisitFloors(
         keys,
         fieldSortVisitOrder(keys, topCount,
-                            fieldSortMissingFirst(sortPlan, envelope)),
+                            fieldSortMissingKey(sortPlan, envelope)),
         cards, topCount, floors);
     int64_t visited = 0;
     int64_t leaves = 0;
@@ -1440,7 +1440,7 @@ public:
           && !disableFieldSortPruning) {
         order = fieldSortVisitOrder(
             fieldSortSegmentKeys(*op.req.reader, op.sortPlan, op.sortValues),
-            op.topCount, fieldSortMissingFirst(op.sortPlan, op.sortValues));
+            op.topCount, fieldSortMissingKey(op.sortPlan, op.sortValues));
       }
       for (size_t i = 0; i < domains.size(); i++) {
         size_t at = tg == nullptr ? i : domains.size() - 1 - i;

@@ -262,7 +262,7 @@ public:
     // `values` (Query::requiredValueEnvelope; none: every value), offered
     // with the leaf bounds. nullopt when there are none, or when a doc's key
     // need not come from a value inside the envelope (a multi-valued column
-    // keys on its first stored value while a predicate matches any value).
+    // keys on its min or max value while a predicate matches any value).
     virtual std::optional<SegmentKeys> segmentKeys(
         std::optional<Query::ValueEnvelope> values) const {
       unused(values);
@@ -357,6 +357,16 @@ public:
     MISSING_FIRST,
     MISSING_LAST
   };
+
+  // Which value of a multi-valued document keys the sort: its smallest or
+  // its largest (Elasticsearch's min and max modes). The default is MIN
+  // ascending and MAX descending, so either direction ranks a document by
+  // its best value.
+  enum class MultiPick : uint8_t { MIN, MAX };
+
+  static MultiPick defaultPick(bool reversed) {
+    return reversed ? MultiPick::MAX : MultiPick::MIN;
+  }
 };
 
 
@@ -384,6 +394,7 @@ class SimpleNumericFieldComparator : public FieldComparator,
   int32_t landedDoc = -1;
   int32_t landedRank = -1;
   bool multiValued = false;
+  bool pickMax = false;
   // Bound order and leaf bounds (no envelope), when keyBlockSize() offers
   // leaves.
   std::optional<SegmentKeys> leaves;
@@ -461,15 +472,34 @@ class SimpleNumericFieldComparator : public FieldComparator,
         keys[i] = missingValueSubstitute;
         continue;
       }
-      int64_t valueRank = reader->getStartValueRank(rank);
-      keys[i] = transformPresent(pointValues->valueAt(valueRank));
+      keys[i] = transformPresent(pickedValue(rank));
     }
   }
 
+  // The picked value (MultiPick) of the multi-valued doc at `rank`. Values
+  // are stored unsorted per doc, so this scans the doc's values.
+  int64_t pickedValue(int32_t rank) {
+    auto [start, end] = reader->getStartEndValueRank(rank);
+    assert(start < end);
+    int64_t value = pointValues->valueAt(start);
+    for (int64_t r = start + 1; r < end; r++) {
+      int64_t next = pointValues->valueAt(r);
+      value = pickMax ? std::max(value, next) : std::min(value, next);
+    }
+    return value;
+  }
+
 public:
-  SimpleNumericFieldComparator(const std::string& fieldName, bool reversed, MissingValue missingValue)
+  // `missingLiteral` (an encoded column value) is the value a doc without
+  // one sorts as, overriding `missingValue`'s edge. `pick` selects the key
+  // of a multi-valued doc (default: defaultPick).
+  SimpleNumericFieldComparator(const std::string& fieldName, bool reversed,
+                               MissingValue missingValue,
+                               std::optional<int64_t> missingLiteral = std::nullopt,
+                               std::optional<MultiPick> pick = std::nullopt)
     : fieldName(fieldName),
-      sortMultiplier(reversed ? -1 : 1) {
+      sortMultiplier(reversed ? -1 : 1),
+      pickMax(pick.value_or(defaultPick(reversed)) == MultiPick::MAX) {
 
     // Missing placement is a fixed edge regardless of direction (the string
     // comparators and expression sort keys follow the same convention), so
@@ -479,8 +509,13 @@ public:
     missingValueSubstitute = (missingValue == MISSING_FIRST)
                                ? std::numeric_limits<int64_t>::min()
                                : std::numeric_limits<int64_t>::max();
+    // A literal is an ordinary value: it takes the present-value transform,
+    // so it ties with docs holding that value (segdoc breaks the tie).
+    if (missingLiteral.has_value()) {
+      missingValueSubstitute = transformPresent(*missingLiteral);
+    }
   }
-  
+
   void setSegment(int32_t segment, PostingsReader* postingsReader) override {
     // Reset reader and iterator
     iter.reset();
@@ -666,13 +701,9 @@ public:
       if (iter->docId() > docid) return missingValueSubstitute;
       rank = iter->rank();
     }
-    // Multi-valued numeric columns store per-doc values unsorted, so the
-    // cheap deterministic sort key is the FIRST stored value (storage order).
-    // min/max over unsorted values would scan every value per doc; callers
-    // that want that spell it explicitly (min(f)/max(f) sort expressions).
-    int64_t value = multiValued
-        ? iter->values().valueAt(reader->getStartValueRank(rank))
-        : iter->values().valueAt(rank);
+    // A multi-valued doc keys on its picked value (MultiPick): a scan of
+    // its unsorted values.
+    int64_t value = multiValued ? pickedValue(rank) : iter->values().valueAt(rank);
     // For descending sort, negate the value.
     // if we wanted to make this branchless, we could have a an adder and multiplier
     // but this will be a predictable branch anyway.
@@ -742,12 +773,12 @@ public:
 
 // A comparator for string fields that uses global ordinals for efficient cross-segment comparison
 // Selected segment ord for sorting: single-valued docs read their one ord;
-// multi-valued docs sort by their smallest ord ascending and largest ord
-// descending (min/max term semantics). Returns 0 for missing.
+// multi-valued docs sort by their smallest ord, or their largest when
+// `pickMax` (min/max term semantics). Returns 0 for missing.
 inline int32_t selectedSortOrd(const OrdColReader& reader, int32_t docid,
-                               bool descending) {
+                               bool pickMax) {
   if (!reader.multiValued()) return reader.ordAt(docid);
-  if (!descending) return reader.firstOrdAt(docid);
+  if (!pickMax) return reader.firstOrdAt(docid);
   const DocsReader& docs = reader.docsReader();
   int32_t docRank;
   if (!docs.hasBitset()) {
@@ -773,13 +804,16 @@ class GlobalOrdComparator : public FieldComparator {
   SegFieldInfo fieldInfo{};
   int64_t sortMultiplier; // 1 for ascending, -1 for descending
   int64_t missingOrd;
+  bool pickMax;
 
 public:
   GlobalOrdComparator(const std::string& fieldName, std::shared_ptr<OrdMap> ordMap,
-                      bool reversed, MissingValue missingValue)
+                      bool reversed, MissingValue missingValue,
+                      std::optional<MultiPick> pick = std::nullopt)
     : fieldName(fieldName),
       ordMap(ordMap),
-      sortMultiplier(reversed ? -1 : 1) {
+      sortMultiplier(reversed ? -1 : 1),
+      pickMax(pick.value_or(defaultPick(reversed)) == MultiPick::MAX) {
     
     // For string fields, ordinal 0 means missing value
     // For MISSING_FIRST: missing values should sort before all other values
@@ -868,7 +902,7 @@ public:
       return missingOrd;
     }
 
-    int64_t segmentOrd = selectedSortOrd(*reader, docid, sortMultiplier < 0);
+    int64_t segmentOrd = selectedSortOrd(*reader, docid, pickMax);
     if (segmentOrd == 0) {
       // Ordinal 0 means missing value
       return missingOrd;
@@ -950,8 +984,17 @@ class SegmentOrdComparator : public FieldComparator {
   int32_t sortMultiplier;
   int32_t missingSortCmp;
   bool missingFirst;
+  bool pickMax;
   bool bottomMissing = true;
   bool bottomExact = false;
+  // A missing literal: docs without a value sort as this term. Their slots
+  // then carry the term like any other, with the term's ord when the
+  // current segment holds it (literalOrd != 0) and otherwise ordGen
+  // LITERAL_GEN, which no segment matches, so they compare by bytes.
+  std::optional<std::string> missingTerm;
+  int32_t literalOrd = 0;
+  static constexpr int32_t LITERAL_GEN = -2;
+  static constexpr int32_t LITERAL_ORD = -1;
 
   static int compareTerms(std::string_view a, std::string_view b) {
     size_t len = std::min(a.size(), b.size());
@@ -1001,18 +1044,30 @@ class SegmentOrdComparator : public FieldComparator {
 
   int32_t selectedOrd(int32_t docid) const {
     if (!reader.has_value()) return 0;
-    return selectedSortOrd(*reader, docid, sortMultiplier < 0);
+    return selectedSortOrd(*reader, docid, pickMax);
+  }
+
+  void setLiteral(Slot& slot) {
+    copyTerm(slot, *missingTerm);
+    slot.ord = literalOrd != 0 ? literalOrd : LITERAL_ORD;
+    slot.ordGen = literalOrd != 0 ? currentSegment : LITERAL_GEN;
   }
 
 public:
+  // `literal` is the term a doc without a value sorts as, overriding
+  // `missingValue`'s edge.
   SegmentOrdComparator(const std::string& fieldName,
-                       bool reversed, MissingValue missingValue)
+                       bool reversed, MissingValue missingValue,
+                       std::optional<std::string> literal = std::nullopt,
+                       std::optional<MultiPick> pick = std::nullopt)
     : fieldName(fieldName),
       enumPoolStart(enumPool.getSavePoint()),
       sortMultiplier(reversed ? -1 : 1),
       // GlobalOrdComparator keeps its missing sentinel at the requested edge.
       missingSortCmp((missingValue == MISSING_FIRST ? -1 : 1) * sortMultiplier),
-      missingFirst(missingValue == MISSING_FIRST) {}
+      missingFirst(missingValue == MISSING_FIRST),
+      pickMax(pick.value_or(defaultPick(reversed)) == MultiPick::MAX),
+      missingTerm(std::move(literal)) {}
 
   void setSegment(int32_t segment, PostingsReader* reader_) override {
     termsEnum.reset();
@@ -1021,6 +1076,7 @@ public:
     fieldInfo = {};
     currentSegment = segment;
     postingsReader = reader_;
+    literalOrd = 0;
 
     if (!postingsReader) return;
 
@@ -1033,6 +1089,10 @@ public:
     }
     reader.emplace(*postingsReader, fieldInfo);
     termsEnum.emplace(enumPool, *postingsReader, fieldInfo);
+    if (missingTerm.has_value() && termsEnum->seekCeil(*missingTerm)
+        && termsEnum->term() == std::string_view(*missingTerm)) {
+      literalOrd = (int32_t)termsEnum->ord() + 1;
+    }
   }
 
   void growSlots(int32_t capacity) override {
@@ -1053,7 +1113,10 @@ public:
     }
     // Missing-first: docs without the field beat any real-valued bottom but
     // have no postings, so a term interval can never represent them.
-    if (missingFirst || bottomMissing) return OrdIntervalStatus::PENDING;
+    // A missing literal likewise ranks docs without postings anywhere.
+    if (missingFirst || bottomMissing || missingTerm.has_value()) {
+      return OrdIntervalStatus::PENDING;
+    }
     int64_t nTerms = (int64_t)fieldInfo.nTerms;
     bool closable = soleSort && bottomExact
         && segdoc(segment, from) >= bottomDoc;
@@ -1117,8 +1180,15 @@ public:
     assert(bottomMissing == (slots[bottomSlot].ord == 0));
     int32_t docOrd = selectedOrd(newDoc.docId());
     bool docMissing = docOrd == 0;
+    if (docMissing && literalOrd != 0) {
+      docOrd = literalOrd;
+      docMissing = false;
+    }
     int cmp;
-    if (bottomMissing || docMissing) {
+    if (docMissing && missingTerm.has_value() && !bottomMissing) {
+      // The literal is absent from this segment: compare it by bytes.
+      cmp = compareTerms(term(slots[bottomSlot]), *missingTerm);
+    } else if (bottomMissing || docMissing) {
       cmp = compareMissing(bottomMissing, docMissing);
     } else if (bottomExact) {
       cmp = (bottomOrd > docOrd) - (bottomOrd < docOrd);
@@ -1133,7 +1203,8 @@ public:
     Slot& target = slots[slot];
     int32_t ord = selectedOrd(doc.docId());
     if (ord == 0) {
-      setMissing(target);
+      if (missingTerm.has_value()) setLiteral(target);
+      else setMissing(target);
       return;
     }
     assert(termsEnum.has_value());
@@ -1184,13 +1255,18 @@ class StrColComparator : public FieldComparator {
   std::string missingValueStr;
   
 public:
-  StrColComparator(const std::string& fieldName, bool reversed, MissingValue missingValue)
+  // `literal` is the value a doc without one sorts as, overriding
+  // `missingValue`'s edge.
+  StrColComparator(const std::string& fieldName, bool reversed, MissingValue missingValue,
+                   std::optional<std::string> literal = std::nullopt)
     : fieldName(fieldName),
       sortMultiplier(reversed ? -1 : 1) {
-    
+
     // For missing values, use empty string for MISSING_FIRST in ASC (sorts before all others)
     // or a very high value string for MISSING_LAST in ASC
-    if (missingValue == MISSING_FIRST) {
+    if (literal.has_value()) {
+      missingValueStr = std::move(*literal);
+    } else if (missingValue == MISSING_FIRST) {
       missingValueStr = reversed ? "\xFF\xFF\xFF\xFF" : "";
     } else {
       missingValueStr = reversed ? "" : "\xFF\xFF\xFF\xFF";
