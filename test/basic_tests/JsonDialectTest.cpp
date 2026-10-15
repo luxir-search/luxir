@@ -280,6 +280,11 @@ TEST(JsonDialect, MatchSugar) {
   EXPECT_EQ(m.operator_, P::Match::Operator::AND);
   EXPECT_EQ(m.min_match, 1);
 
+  m = {};
+  ASSERT_TRUE(P::read_json(m, R"({"title_t":"dune","analyzer":"whitespace"})", mr));
+  EXPECT_EQ(m.field, "title_t");
+  EXPECT_EQ(m.analyzer, "whitespace");
+
   // two unknown keys / sugar mixed with explicit field or val are rejected
   EXPECT_FALSE(P::read_json(m, R"({"a":"x","b":"y"})", mr));
   EXPECT_FALSE(P::read_json(m, R"({"field":"a","b":"y"})", mr));

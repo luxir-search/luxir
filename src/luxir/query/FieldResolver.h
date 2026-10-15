@@ -27,6 +27,9 @@ class FieldResolver {
   std::vector<std::string>* explanations;
   std::array<Handles, (size_t)OpClass::PRIMARY + 1> fields;  // one memo per OpClass
   boost::unordered_flat_map<FieldType*, std::unique_ptr<TokenChain>> chains;
+  // Query-named analyzers ("analyzer" option), memoized by spelling.
+  boost::unordered_flat_map<std::string, std::unique_ptr<TokenChain>,
+                            PackedTermHash, PackedTermEqual> namedChains;
 
 public:
   explicit FieldResolver(Schema& schema, std::vector<std::string>* explanations = nullptr)
@@ -60,6 +63,17 @@ public:
       }
     }
     return entry->second.get();
+  }
+
+  // The chain for a query-named analyzer (Schema::queryAnalyzer resolves the
+  // name and throws for an unknown one).
+  TokenChain& namedChain(std::string_view analyzer) {
+    auto found = namedChains.find(analyzer);
+    if (found == namedChains.end()) {
+      auto chain = schema.queryAnalyzer(analyzer).createChain();
+      found = namedChains.emplace(std::string(analyzer), std::move(chain)).first;
+    }
+    return *found->second;
   }
 };
 

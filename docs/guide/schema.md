@@ -306,6 +306,10 @@ A text analyzer is one tokenizer followed by a list of filters:
 | `english_possessive` | Filter: remove a trailing `'s`. |
 | `kstem` | Filter: KStem English stemming; the only component with parameters. |
 
+A field's analyzer runs at both index and query time. A query can analyze its
+text with another field's or template's analyzer, or a built-in one, through
+the [query-time analyzer](query-reference.md#query-time-analyzer) option.
+
 Prefer `nfkc_cf` to `lowercase` on Unicode-segmented text: bare lowercasing
 leaves equal-looking strings unequal (composed versus decomposed forms, final
 sigma), while NFKC case folding makes them compare equal. It also removes

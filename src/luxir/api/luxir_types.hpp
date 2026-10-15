@@ -145,6 +145,7 @@ struct PhraseQuery {
   std::span<const ::hpp_proto::bytes_view> terms_bin;
   int32_t slop = 0;
   std::span<const std::int32_t> positions;
+  std::string_view analyzer;
 };
 struct AllReplicas {};
 struct ReplicaRequirement { std::variant<std::monostate, uint32_t, AllReplicas> kind; };
@@ -661,6 +662,7 @@ struct SearchResponse {
 struct Match {
   using Operator = luxir::api::Match_::Operator;
   std::string_view field;
+  std::string_view analyzer;
   ::hpp_proto::optional_indirect_view<Val> val;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
@@ -687,6 +689,7 @@ struct SimpleQuery {
   std::string_view q;
   std::span<const std::string_view> fields;
   std::span<const std::string_view> allowed_fields;
+  std::string_view analyzer;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
 };

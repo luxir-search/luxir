@@ -342,6 +342,24 @@ TEST_F(HttpApiTest, prettySearchError) {
   EXPECT_NE(std::string::npos, res.body().find("\"error\":"));
 }
 
+TEST_F(HttpApiTest, matchAnalyzer) {
+  helper.index(flatdoc("id", "a1", "title_un", "Dune Messiah"), UpdateMessage::COMMIT);
+  auto search = [&](std::string_view analyzer) {
+    return httpRequest(port(), http::verb::post, "/collections/main/_search",
+        std::string(R"({"query":{"match":{"title_un":"DUNE","analyzer":")") +
+            std::string(analyzer) + R"("}}})");
+  };
+  auto res = search("standard");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_NE(std::string::npos, res.body().find("\"a1\"")) << res.body();
+  res = search("whitespace");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_EQ(std::string::npos, res.body().find("\"a1\"")) << res.body();
+  res = search("nope");
+  ASSERT_EQ(400, res.result_int()) << res.body();
+  EXPECT_NE(std::string::npos, res.body().find("Unknown analyzer 'nope'")) << res.body();
+}
+
 TEST_F(HttpApiTest, prettyNdjsonIngest) {
   // Each explicit group end emits an ack; EOF then closes without another record.
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_update?pretty",

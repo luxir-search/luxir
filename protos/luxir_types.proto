@@ -292,6 +292,13 @@ message Match {
   // Mirrors BooleanQuery.min_match.
   int32 min_match = 4;
 
+  // Analyzes TEXT query input with this analyzer instead of the field's.
+  // Names a text field, variant, or template in the collection schema
+  // ("title__un", "_wl"), or a built-in analyzer ("standard", "whitespace",
+  // "keyword"); a schema name takes precedence. Unset = the field's
+  // analyzer. An unknown name, or one set on a non-text field, is an error.
+  string analyzer = 5;
+
   enum Operator {
     OPERATOR_UNSPECIFIED = 0;  // treated as OR
     OR = 1;                    // a doc matches if any analyzed term matches
@@ -454,6 +461,10 @@ message PhraseQuery {
   // 2; this is not the number of words between terms. Zero is exact.
   int32 slop = 6;
   repeated int32 positions = 15; // optional positions of the terms
+
+  // Analyzes text or words with this analyzer instead of the field's; the
+  // same names as Match.analyzer. Not valid with terms or terms_bin.
+  string analyzer = 7;
 }
 
 // An expression in the Luxir query language, with strict syntax and precise
@@ -511,6 +522,12 @@ message SimpleQuery {
   // name the schema cannot query does not make it work.  A field: token
   // outside the allowed set is literal text, never an error.
   repeated string allowed_fields = 5;
+
+  // Analyzes clauses on TEXT fields with this analyzer instead of each
+  // field's; the same names as Match.analyzer. Clauses on other field types
+  // are unaffected. Prefix, wildcard, and fuzzy terms keep the field's
+  // normalization.
+  string analyzer = 6;
 }
 
 

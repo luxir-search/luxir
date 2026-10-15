@@ -383,5 +383,13 @@ private:
            std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical);
 };
 
+// Built-in analyzers a query can name without a schema definition (the
+// query-time "analyzer" option): "standard" (unicode_word + nfkc_cf),
+// "whitespace", and "keyword".  Compiled once, immutable, process-lifetime.
+// Null for any other name.
+const Analyzer* builtinAnalyzer(std::string_view name);
+// The built-in names, comma-separated, for teaching error messages.
+std::string_view builtinAnalyzerNames();
+
 
 } // end namespace

@@ -90,6 +90,12 @@ public:
   // Already-resolved physical access: no defaults or __self aliases.
   FieldType* physical(std::string_view name) const;
 
+  // The analyzer a query names with its "analyzer" option: a TEXT field,
+  // variant, or template of this schema by physical name, else a built-in
+  // analyzer (analysis/Analyzer.h).  Schema names take precedence.  Throws
+  // RequestError (unknown_analyzer) for anything else.
+  const Analyzer& queryAnalyzer(std::string_view name) const;
+
   FieldSignatures signatures(bool includeTemplates = false) const;
   void inheritIntroductions(const Schema* previous);
   uint64_t introduction(std::string_view physicalName) const;

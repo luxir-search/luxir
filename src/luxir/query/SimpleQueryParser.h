@@ -73,6 +73,9 @@ struct SimpleQueryOptions {
   // expansion; silently inapplicable when the top level cannot honor it
   // (that is contingent on user input, which must not cost warnings).
   int32_t min_match = 0;
+  // Query-named analyzer set on every TEXT leaf (Match / PhraseQuery);
+  // empty = each field's own.  Non-TEXT leaves never carry it.
+  std::string_view analyzer;
   // Used only while validating DATE field:value arms. Lowering receives this
   // same whole context through ParseContext/QueryBuilder.
   CoerceContext coerceContext;
@@ -280,6 +283,7 @@ private:
     // STRING/ID matches are single terms, so it would be echo noise there
     if (fieldType.type() == FieldType::Type::TEXT) {
       m.operator_ = opts.operator_;
+      m.analyzer = opts.analyzer;
     }
     api::Query q;
     q.kind = m;
@@ -309,6 +313,7 @@ private:
         p.field = f;
         p.text = text;  // already arena-backed (parsePhraseBody copies)
         p.slop = slop;
+        p.analyzer = opts.analyzer;
         api::Query q;
         q.kind = p;
         return q;
