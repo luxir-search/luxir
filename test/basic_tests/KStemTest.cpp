@@ -3,7 +3,10 @@
 
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 #include <string_view>
 
 #include "luxir/analysis/KStemmer.h"
@@ -19,8 +22,10 @@ TEST_F(KStemTest, luceneVocabulary) {
   ASSERT_TRUE(in.is_open());
   KStemmer stemmer;
   std::string word, expected;
+  std::vector<std::pair<std::string, std::string>> all;
   int count = 0;
   while (in >> word >> expected) {
+    all.emplace_back(word, expected);
     EXPECT_EQ(expected, stemmer.stem<false>(word)) << word;
     EXPECT_EQ(expected, stemmer.stem(word)) << word;
     for (auto suffix : {"'s", "'S", "\xe2\x80\x99s", "\xef\xbc\x87S"}) {
@@ -30,6 +35,11 @@ TEST_F(KStemTest, luceneVocabulary) {
   }
   EXPECT_TRUE(in.eof());
   EXPECT_EQ(12130, count);
+  // Again in reverse on the warm stemmer: memo hits and evictions in a
+  // different order must still give the reference stems.
+  for (auto it = all.rbegin(); it != all.rend(); ++it) {
+    EXPECT_EQ(it->second, stemmer.stem(it->first)) << it->first;
+  }
 }
 
 TEST_F(KStemTest, possessiveShorteningAndPassThrough) {
@@ -96,6 +106,11 @@ TEST_F(KStemTest, passThroughAndLengthLimits) {
     EXPECT_EQ(word, stemmer.stem(word));
   }
   EXPECT_EQ("pony", stemmer.stem("ponies")); // reuse after every pass-through path
+  // A memoized candidate that stemming leaves alone still borrows its input.
+  for (int pass = 0; pass < 2; ++pass) {
+    std::string happiness = "happiness";
+    EXPECT_EQ(happiness.data(), stemmer.stem(happiness).data()) << pass;
+  }
 }
 
 TEST_F(KStemTest, sharedDictionaryAndNoTokenAllocations) {
@@ -103,8 +118,16 @@ TEST_F(KStemTest, sharedDictionaryAndNoTokenAllocations) {
   KStemmer warm;
   warm.stem("ponies");
   size_t bytes = 0;
+  std::optional<KStemmer> owner;
+  {
+    memtrack::AllocScope ctorScope;
+    owner.emplace();  // the dictionary is shared; the memo is allocated lazily
+    long ctorAllocated = ctorScope.bytes();
+    EXPECT_EQ(0, ctorAllocated);
+  }
+  KStemmer& stemmer = *owner;
+  bytes += stemmer.stem("ponies").size();  // first candidate allocates the memo, once
   memtrack::AllocScope scope;
-  KStemmer stemmer;
   for (int i = 0; i < 10; ++i) {
     for (auto word : {"dog", "ponies", "canonic", "italians", "aided", "microcoding"}) {
       bytes += stemmer.stem<false>(word).size();

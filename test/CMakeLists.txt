@@ -58,6 +58,15 @@ target_compile_options(decoded_successor_scalar_test PRIVATE
 target_compile_definitions(decoded_successor_scalar_test PRIVATE
   LUXIR_EXPECT_SCALAR=1)
 
+# The analysis ASCII kernels (AsciiScan.h) with AVX2 unavailable, so AVX2 hosts
+# also exercise the SSE2 path the x86-64-v2 container build ships. The NEON
+# path is covered by the arm64 build's luxir_test, the SWAR path everywhere.
+add_executable(ascii_scan_sse2_test
+  basic_tests/AsciiScanTest.cpp)
+target_include_directories(ascii_scan_sse2_test PRIVATE .)
+target_link_libraries(ascii_scan_sse2_test PRIVATE GTest::gtest_main)
+target_compile_options(ascii_scan_sse2_test PRIVATE -mno-avx512f -mno-avx2)
+
 
 # (luxir_smoke removed: it was migration scaffolding to run SmokeTest while luxir_test was
 # still on the protobuf API. luxir_test now compiles SmokeTest.cpp on the concrete luxir::api,
