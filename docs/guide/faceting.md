@@ -82,6 +82,8 @@ The operation kinds on this page:
 | `range_facet` | Fixed-width or calendar buckets over a numeric or date field. |
 | `query_facet` | Named buckets you define with arbitrary queries. |
 | Expression metric (`"avg(price_f)"`) | Nothing; one number over the incoming documents. |
+| `cardinality` | Nothing; an approximate count of distinct field values. |
+| `percentiles` / `percentile_ranks` | Nothing; approximate percentiles or percentile ranks of a numeric field. |
 | `top_docs` / `fusion` | Nothing; a ranked document list per bucket. |
 
 ## Easy multi-select with `selected`
@@ -311,6 +313,126 @@ The typing rules:
 - `avg`, `min`, and `max` of a date keep their date meaning; `sum` requires
   numeric values. Multiplication, division, unary minus, and unary math turn
   a date into a plain number.
+
+## Distinct counts and percentiles
+
+`cardinality` counts the distinct values of a field, and `percentiles`
+estimates percentiles of a numeric or date field. Both use mergeable
+sketches, so memory stays bounded however many documents match, and both
+work anywhere a metric does: directly under a query's `ops`, at the root of
+a full-form request, or per bucket under a facet.
+
+```http
+POST /collections/logs/_search
+
+{
+  "query": {"all": true},
+  "limit": 0,
+  "ops": {
+    "clients": {"cardinality": {"field": "client_ip_s"}},
+    "latency": {"percentiles": {"field": "latency_ms_d", "percents": [50, 95, 99]}},
+    "fast": {"percentile_ranks": {"field": "latency_ms_d", "values": [100, 250]}}
+  }
+}
+```
+
+```json
+{
+  "docs": [],
+  "ops": {
+    "clients": 1873,
+    "latency": {
+      "50.0": 41.3,
+      "95.0": 212.9,
+      "99.0": 603.4
+    },
+    "fast": {
+      "100.0": 81.2,
+      "250.0": 96.1
+    }
+  }
+}
+```
+
+A multi-valued document contributes each of its values, and documents
+without a value contribute nothing. With no values at all, `cardinality` is
+`0` and every percentile or rank is `null`.
+
+| Operation | Field | Meaning |
+|---|---|---|
+| `cardinality` | `field` | STRING, ID, INT, FLOAT, DOUBLE, or DATE field. Required. String fields must be indexed. |
+| | `precision_threshold` | Counts up to this value are exact. Default `3000`, at most `40000`. |
+| `percentiles` | `field` | INT, FLOAT, DOUBLE, or DATE field. Required. |
+| | `percents` | Distinct percents in `[0, 100]`. Default `[1, 5, 25, 50, 75, 95, 99]`. |
+| | `compression` | t-digest compression in `[20, 1000]`. Default `100`. |
+| | `keyed` | Default `true`: an object keyed by percent. `false` returns `[{"key": 50, "value": 41.3}, ...]`. |
+| `percentile_ranks` | `field`, `compression`, `keyed` | As for `percentiles`. |
+| | `values` | Distinct finite values to rank. Required. |
+
+Keyed results follow request order. Keys are the percents (or values) as
+decimals: integral numbers keep one decimal place (`"50.0"`), others use
+their shortest form (`"99.9"`). A percentile rank is the percentage of values
+less than or equal to the given value. Date percentiles are epoch
+milliseconds. NaN and infinite values are skipped.
+
+Under a facet, each bucket gets its own result, like any other metric:
+
+```json
+"by_host": {
+  "field_facet": {
+    "field": "host_s",
+    "limit": 10,
+    "ops": {
+      "clients": {"cardinality": {"field": "client_ip_s"}},
+      "p99": {"percentiles": {"field": "latency_ms_d", "percents": [99]}}
+    }
+  }
+}
+```
+
+```json
+{
+  "buckets": [
+    {
+      "val": "web-1",
+      "count": 5120,
+      "clients": 811,
+      "p99": {
+        "99.0": 588.0
+      }
+    }
+  ]
+}
+```
+
+Facets cannot yet sort by a `cardinality` or `percentiles` sub-operation.
+
+### Accuracy and memory
+
+`cardinality` keeps the exact set of value hashes (64-bit) until it holds
+more than `precision_threshold` of them, so smaller counts are exact up to
+hash collisions. Beyond that it switches to a HyperLogLog sketch of
+2^p one-byte registers, with p = ceil(log2(precision_threshold / 0.75))
+clamped to `[4, 18]`: 4 KiB and a relative standard error of about 1.6% for
+the default threshold, 64 KiB and about 0.4% at 40000. The estimator is
+Ertl's improved raw estimator, which needs no bias-correction tables and
+stays unbiased from small to very large counts. Memory per sketch is at most
+about 18 bytes per hash in the exact phase, then the register array.
+
+`percentiles` and `percentile_ranks` use a merging t-digest. Up to
+5 x `compression` values (500 by default) are kept raw and answered
+exactly: a percentile interpolates linearly between the two closest ranks,
+so the 50th percentile of 1 to 100 is 50.5. Larger inputs fold into at most
+about `compression` weighted centroids whose size shrinks toward both ends of
+the distribution, so the error is smallest for extreme percentiles. The
+error is in rank: with the default compression, on a million log-normal
+values split over 16 segments, medians landed within 0.2% of the true rank
+and 99th percentiles within 0.1%. The minimum and maximum are exact. A larger `compression` trades memory (about
+16 bytes per centroid plus an 8-byte-per-value buffer) for accuracy.
+
+Both sketches are built per segment and merged, so the merge order of
+segments processed in parallel can change a large-input estimate slightly
+between requests.
 
 ## Nested facets
 
