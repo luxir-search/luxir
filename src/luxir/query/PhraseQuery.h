@@ -358,12 +358,15 @@ public:
     CachedFieldInfo* cachedFieldInfo;
     std::span<CachedTermInfo*> cachedTermInfos;
     Similarity::BM25Scorer* simScorer = nullptr;
+    Similarity::BM25Scorer* normFreeScorer = nullptr;  // segments without norms
 
     EstimateCalculation estimateScorer(
         IndexReader::Segment& segment, bool disableSort,
         bool disableRepeatDedup) const {
+      // A segment written without positions (an older index_options) has no phrase matches.
       if (cachedFieldInfo == nullptr
-          || cachedFieldInfo->segInfos[segment.ord] == nullptr) {
+          || cachedFieldInfo->segInfos[segment.ord] == nullptr
+          || !FieldType::hasPositions(cachedFieldInfo->segInfos[segment.ord]->flags)) {
         return {};
       }
       std::vector<const TermsEnum::PostingsState*> states;
@@ -448,6 +451,10 @@ public:
       if (needScores) {
         simScorer = context.pool.make<Similarity::BM25Scorer>(
             similarity.getScorer(multiplier, cachedFieldInfo->fieldStats, (float) idf));
+        if (cachedFieldInfo->anyNormFree()) {
+          normFreeScorer = context.pool.make<Similarity::BM25Scorer>(
+              similarity.getNormFreeScorer(multiplier, (float) idf));
+        }
       }
     }
 
@@ -534,13 +541,16 @@ public:
           conjunctionEnums, slotGroup, groups);
 #endif
 
-      NormsReader* normsReader = (inputFlags & NEED_SCORES) != 0
+      bool needScores = (inputFlags & NEED_SCORES) != 0;
+      bool normFree = CachedFieldInfo::normFree(*segFieldInfo);
+      NormsReader* normsReader = needScores && !normFree
           ? targetPool.make<NormsReader>(segment.postingsReader(), *segFieldInfo)
           : nullptr;
+      Similarity::BM25Scorer* segmentScorer = normFree ? normFreeScorer : simScorer;
 
       std::span<ImpactsIndex> impacts;
       std::span<int32_t> impactMultiplicities;
-      if (simScorer != nullptr && normsReader != nullptr) {
+      if (needScores && segmentScorer != nullptr) {
         auto built = targetPool.make_span<ImpactsIndex>(conjunctionEnums.size());
         auto multiplicities = targetPool.make_span<int32_t>(conjunctionEnums.size());
         bool allBuilt = true;
@@ -551,7 +561,7 @@ public:
             if (slotEnum == docsEnum) multiplicity++;
           }
           multiplicities[i] = multiplicity;
-          built[i].build(targetPool, *docsEnum, *simScorer, 1.0f, true);
+          built[i].build(targetPool, *docsEnum, *segmentScorer, 1.0f, true);
           allBuilt &= !built[i].empty();
         }
         impactMultiplicities = multiplicities;
@@ -562,14 +572,14 @@ public:
         return targetPool.make<SloppyScorer>(
             targetPool, slotEnums, slotPosEnums, positions, ordinals,
             conjunctionEnums, conjunctionPosEnums, normsReader,
-            simScorer, impacts, impactMultiplicities, slotGroup, groups,
+            segmentScorer, impacts, impactMultiplicities, slotGroup, groups,
             estimate.approximationCost, estimate.matchCost, query.getSlop(),
             (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
       }
       return targetPool.make<Scorer>(
           targetPool, slotEnums, slotPosEnums, positions, ordinals,
           conjunctionEnums, conjunctionPosEnums, normsReader,
-          simScorer, impacts, impactMultiplicities, slotGroup, groups,
+          segmentScorer, impacts, impactMultiplicities, slotGroup, groups,
           estimate.approximationCost, estimate.matchCost, 0,
           (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
     }
@@ -1362,6 +1372,7 @@ public:
 
     int64_t lookupNorm(int32_t doc) {
       if (flatNormsBase != nullptr) return flatNormsBase[doc];
+      if (!normsIter) return 0;  // norm-free segment: simScorer ignores the norm
       if (doc != cachedNormDoc) {
         int32_t normDoc = normsIter->advance(doc);
         assert(normDoc == doc);
@@ -1438,7 +1449,7 @@ public:
           exclusionWindowFill(exclusionWindowFill) {
       if (!groups.empty()) slotCursor = targetPool.make_span<int32_t>(slotEnums.size());
       assert(approximationCost == conjunctionEnums[0]->numDocs());
-      assert((simScorer == nullptr) == (normsReader == nullptr));
+      assert(simScorer != nullptr || normsReader == nullptr);
       if (normsReader != nullptr) {
         normsIter.emplace(*normsReader);
         flatNormsBase = normsReader->flatBase();

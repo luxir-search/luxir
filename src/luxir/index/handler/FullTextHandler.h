@@ -15,20 +15,25 @@
 using namespace luxir;
 namespace luxir::handler {
 
-// Indexes text field with frequencies and positions.
-class FullTextHandler : public Inverter::IndexHandler {
+// Indexes a text field. TermPostings is DocFreqPosStream when the field
+// records positions and DocFreqStream otherwise, so positionless fields never
+// buffer positions.
+template <class TermPostings>
+class FullTextHandlerT : public Inverter::IndexHandler {
   friend Inverter;
 
-  TermValHash<DocFreqPosStream> termsHash; // the set of terms contained in this field
+  TermValHash<TermPostings> termsHash; // the set of terms contained in this field
   std::unique_ptr<TokenChain> tokenChain;
   Stream normBytes;
   DocStream normDocsWithField;
   int32_t numDocsWithField = 0;
+  bool hasNorms;
 public:
-  FullTextHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
+  FullTextHandlerT(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
       termsHash(inverter.pool, 4),
-      normDocsWithField(inverter.pool) {
+      normDocsWithField(inverter.pool),
+      hasNorms(FieldType::hasNorms(fieldType->segmentFlags())) {
 
     // Future optimization: cache the analyzer for the type if it isn't field-specific
     // This can help with memory consumption when the same analyzer can be used for many fields.
@@ -38,7 +43,7 @@ public:
     tokenChain = textFieldType->createAnalyzer(fieldName);
   }
 
-  ~FullTextHandler() override = default;
+  ~FullTextHandlerT() override = default;
 
   // Positions jump by this between values of a multi-valued text field. The
   // gap discourages ordinary phrase matches but does not isolate values:
@@ -142,14 +147,15 @@ public:
 
 private:
   void finishValues(Inverter& inverter, int numTokens) {
-    // We index the length even if all tokens were removed somehow, because we still want
-    // to record that there was a doc for this field.
+    // We record the doc even if all tokens were removed somehow, because we still want
+    // to record that there was a doc for this field.  Fields without norms keep only that.
     // Store the SmallFloat-encoded norm byte, not the raw token count: the scorers index
     // invNorm[(uint8_t)encodedNorm], so the column must already hold the encoded byte
     // (identity for lengths 0..40, quantized above). Storing raw numTokens silently
     // mis-scores docs over 40 tokens and wraps mod 256 above 255.
-    uint8_t encodedNorm = SmallFloat::intToByte4(numTokens);
-    normBytes.writeByte(inverter.pool, encodedNorm);
+    if (hasNorms) {
+      normBytes.writeByte(inverter.pool, SmallFloat::intToByte4(numTokens));
+    }
     normDocsWithField.addDoc(inverter.pool, inverter.getDoc());
     numDocsWithField++;
 
@@ -176,7 +182,7 @@ public:
 
     auto preparedNorms = NormsWriter::prepare(inverter.pool, inverter.getPostingsWriter(),
                                               fieldInfo, normBytes, normDocsWithField,
-                                              numDocsWithField);
+                                              numDocsWithField, hasNorms);
     {
       // Either reduce the resource for these, or share across different fields (in the same thread)
       TextWriter textWriter(inverter.getPostingsWriter());
@@ -198,5 +204,8 @@ public:
   }
 
 };
+
+using FullTextHandler = FullTextHandlerT<DocFreqPosStream>;
+using PositionlessTextHandler = FullTextHandlerT<DocFreqStream>;
 
 }

@@ -4629,7 +4629,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
     TextWriter writer(postingsWriter);
     auto& finfo = postingsWriter.addField("f");
     finfo.type = FieldType::TEXT;
-    finfo.flags = FieldType::INDEX_DOCS_FREQS;
+    finfo.flags = FieldType::INDEX_DOCS_FREQS | FieldType::OMIT_NORMS;
     writer.startField(&finfo);
     TermRef hot(pool, "hot", 3);
     writer.startTerm(hot);

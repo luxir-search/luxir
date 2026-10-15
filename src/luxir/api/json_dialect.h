@@ -592,6 +592,10 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.index, ctx, vit, vend);
           } else if (key == "long_terms") {
             util::from_json<V>(value.long_terms, ctx, vit, vend);
+          } else if (key == "index_options") {
+            util::from_json<V>(value.index_options, ctx, vit, vend);
+          } else if (key == "norms") {
+            util::from_json<V>(value.norms, ctx, vit, vend);
           } else if (key == "column") {
             util::from_json<V>(value.column, ctx, vit, vend);
           } else if (key == "multi") {

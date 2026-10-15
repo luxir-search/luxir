@@ -130,6 +130,7 @@ public:
     int32_t pulsedPos = -1;
     bool hasFreqs = false;
     bool hasPositions = false;
+    bool hasNorms = false;
   };
 
   // fieldInfo is not copied and should remain valid throughout the lifetime of this TermsEnum and any related classes such as DocsEnum
@@ -390,7 +391,7 @@ public:
   }
 
   bool hasTermImpacts() const {
-    return FieldType::hasFreqs(fieldInfo.flags) && FieldType::hasPositions(fieldInfo.flags);
+    return FieldType::hasNorms(fieldInfo.flags);
   }
 
   EncodedImpactFrontier currentTermImpactFrontierSpan() {
@@ -417,6 +418,7 @@ public:
     PostingsState state;
     state.hasFreqs = FieldType::hasFreqs(fieldInfo.flags);
     state.hasPositions = FieldType::hasPositions(fieldInfo.flags);
+    state.hasNorms = FieldType::hasNorms(fieldInfo.flags);
     state.termOrdinal = ord();
     state.docFreq = docFreq();
     state.packedBlockCount = packedBlockCount();

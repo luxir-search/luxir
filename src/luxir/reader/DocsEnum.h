@@ -176,7 +176,7 @@ protected:
 
   explicit DocsEnumMeta(const TermsEnum::PostingsState& state)
       : docIS(state.docIS), hasFreqs(state.hasFreqs),
-        hasPositions(state.hasPositions), hasNorms(state.hasPositions),
+        hasPositions(state.hasPositions), hasNorms(state.hasNorms),
         docfreq(state.docFreq), ttf(state.totalTermFreq),
         docsSize(state.docsEnd - state.docsStart), startOfDocs(state.docsStart),
         endOfDocs(state.docsEnd),

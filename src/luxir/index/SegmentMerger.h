@@ -16,6 +16,7 @@
 #include "luxir/reader/PointsReader.h"
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/StrColReader.h"
+#include "luxir/schema/Schema.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/heap.h"
@@ -555,6 +556,8 @@ class SegmentMerger {
   int64_t termPartitionMinBytes;
   int64_t termPartitionMinRangeBytes;
   int32_t termPartitionMaxRanges;
+  // Current schema, if any: text merges drop postings levels and norms it no longer asks for.
+  std::shared_ptr<Schema> schema;
 
   std::vector<FieldReader> fieldReaders;  // todo - pool allocate (& use smart ptr on MergeSeg if destructors needed)
   std::vector<Segment> segs;
@@ -565,13 +568,14 @@ public:
   SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
-                int32_t termPartitionMaxRanges)
+                int32_t termPartitionMaxRanges, std::shared_ptr<Schema> schema = nullptr)
   : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
     estimatedOutputBytes(estimateOutputBytes(preaders)),
     streamBudget(MergeCostModel::streamBudgetForBytes(estimatedOutputBytes)),
     termPartitionMinBytes(termPartitionMinBytes),
     termPartitionMinRangeBytes(termPartitionMinRangeBytes),
-    termPartitionMaxRanges(termPartitionMaxRanges)
+    termPartitionMaxRanges(termPartitionMaxRanges),
+    schema(std::move(schema))
   {
     assert(preaders.size() == liveDocs.size());
     assert(termPartitionMinBytes >= 0 && termPartitionMinRangeBytes > 0);
@@ -915,8 +919,11 @@ private:
     }
   }
 
+  // Collects the merged presence set and, when the output keeps norms (every
+  // source then has them), the norm bytes.
   void buildMergedNorms(std::span<MergeFieldInfo*> compactFields, Stream& normBytes,
-                        DocStream& normDocsWithField, int32_t& numDocsWithField, MemPool& pool) {
+                        DocStream& normDocsWithField, int32_t& numDocsWithField, MemPool& pool,
+                        bool hasNorms) {
     numDocsWithField = 0;
     for (auto* field : compactFields) {
       auto& seg = *field->seg;
@@ -927,7 +934,10 @@ private:
         if (isDeleted) {
           continue;
         }
-        normBytes.writeByte(pool, iter.value());
+        if (hasNorms) {
+          // Only unindexed sources lack norms here; no posting reads their norm.
+          normBytes.writeByte(pool, reader.normsFormat() == SegFieldInfo::NORMS_NONE ? 0 : iter.value());
+        }
         normDocsWithField.addDoc(pool, mappedDoc);
         numDocsWithField++;
       }
@@ -1110,6 +1120,12 @@ private:
 
     for (size_t idx = 0; idx < compactFields.size(); idx++) {
       auto* field = compactFields[idx];
+      // Unindexed text postings are DOCS-only and never searched; they would
+      // not fit an indexed output's tier.
+      if (field->segFieldInfo.type == FieldType::TEXT
+          && !(field->segFieldInfo.flags & FieldType::INDEX_DOCS)) {
+        continue;
+      }
       tenums.emplace_back(TermsEnumIdx{
           TermsEnum(pool, *field->seg->postingsReader, field->segFieldInfo), idx});
       bool positioned = lower.has_value()
@@ -1222,14 +1238,14 @@ private:
                MergeAdmissionDriver::BatchAdmission& admission) {
       int32_t numNormDocsWithField = 0;
       merger.buildMergedNorms(compactFields, normBytes, normDocsWithField,
-                              numNormDocsWithField, pool);
+                              numNormDocsWithField, pool, FieldType::hasNorms(flags));
 
       outputFieldInfo = &merger.postingsWriter.addField(compactFields[0]->segFieldInfo.fieldname);
       outputFieldInfo->type = FieldType::TEXT;
       outputFieldInfo->flags = flags;
       preparedNorms = NormsWriter::prepare(pool, merger.postingsWriter, *outputFieldInfo,
                                            normBytes, normDocsWithField,
-                                           numNormDocsWithField);
+                                           numNormDocsWithField, FieldType::hasNorms(flags));
       // Terms are stitched into one shared stream because TermsEnum reuses a
       // single termsIS across range rows.  docsBase and posBase encode their
       // own file numbers, so range postings need no equivalent coordinator file.
@@ -1280,7 +1296,7 @@ private:
 
       TextWriter writer(merger.postingsWriter, termsOut, docsOut, posOut);
       writer.startField(&rangeFieldInfo);
-      if (FieldType::hasPositions(flags)) {
+      if (FieldType::hasNorms(flags)) {
         writer.setNorms(preparedNorms.textView());
       }
       merger.mergeTerms(writer, compactFields, false, FieldType::hasPositions(flags), nullptr,
@@ -1404,6 +1420,27 @@ private:
     }
   };
 
+  // Output flags for a text field. A level above DOCS (freqs, positions) and
+  // norms survive only when every indexed source has them: a source cannot
+  // supply positions or lengths it never recorded. indexedFlags and
+  // commonFlags are the union and intersection over indexed sources. The
+  // current schema can lower the result further, so merges downgrade
+  // segments written under an older definition.
+  int32_t textMergeFlags(std::string_view name, int32_t allFlags, int32_t indexedFlags,
+                         int32_t commonFlags) const {
+    constexpr int32_t upperLevels = FieldType::INDEX_DOCS_FREQS_POSITIONS & ~FieldType::INDEX_DOCS;
+    int32_t levels = (allFlags & FieldType::INDEX_DOCS) | (commonFlags & upperLevels);
+    bool norms = (indexedFlags & FieldType::OMIT_NORMS) == 0;
+    FieldType* current = schema ? schema->getFieldTypePtr(name) : nullptr;
+    if (current != nullptr && current->type() == FieldType::TEXT && current->indexed()) {
+      levels &= current->flags_ | ~upperLevels;
+      norms = norms && current->hasNorms();
+    }
+    int32_t flags = (allFlags & ~(FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::OMIT_NORMS)) | levels;
+    if (FieldType::hasFreqs(flags) && !norms) flags |= FieldType::OMIT_NORMS;
+    return flags;
+  }
+
   void mergeField(std::vector<MergeFieldInfo>& mergeFieldInfos,
                   MergeAdmissionDriver& admissionDriver,
                   MergeAdmissionDriver::BatchAdmission& admission) {
@@ -1442,6 +1479,8 @@ private:
     // TODO: check if fields are compatible!
     // TODO: gather other stats to help us build the field (like if it's a dense field!)
     int32_t allFlags = 0;
+    int32_t commonFlags = ~0;
+    int32_t indexedFlags = 0;
     FieldType::Type type = FieldType::Type::NONE;
     for (auto* field : compactFields) {
       if (type == FieldType::Type::NONE) {
@@ -1451,9 +1490,19 @@ private:
         // now what?
       }
       allFlags |= field->segFieldInfo.flags & ~FieldType::TERM_RANGES;
+      // A source whose field was not indexed (index=none text) contributes no
+      // postings, so it does not limit the levels or norms of indexed sources.
+      if (field->segFieldInfo.flags & FieldType::INDEX_DOCS) {
+        commonFlags &= field->segFieldInfo.flags;
+        indexedFlags |= field->segFieldInfo.flags;
+      }
     }
     bool isText = type == FieldType::Type::TEXT;
-    bool hasImpactNorms = isText && FieldType::hasPositions(allFlags);
+    if (isText) {
+      allFlags = textMergeFlags((std::string_view) compactFields[0]->segFieldInfo.fieldname,
+                                allFlags, indexedFlags, commonFlags);
+    }
+    bool hasImpactNorms = isText && FieldType::hasNorms(allFlags);
     if (isText && (allFlags & FieldType::INDEX_DOCS) != 0) {
       int64_t serialCost = estimateCost(mergeFieldInfos);
       int64_t coordinatorCost = partitionCoordinatorCost(compactFields);
@@ -1479,7 +1528,8 @@ private:
     DocStream normDocsWithField(pool);
     int32_t numNormDocsWithField = 0;
     if (isText) {
-      buildMergedNorms(compactFields, normBytes, normDocsWithField, numNormDocsWithField, pool);
+      buildMergedNorms(compactFields, normBytes, normDocsWithField, numNormDocsWithField, pool,
+                       hasImpactNorms);
     }
 
     // get/reserve a new fieldInfo from the postingsReader
@@ -1489,7 +1539,8 @@ private:
     NormsWriter::PreparedNorms preparedNorms;
     if (isText) {
       preparedNorms = NormsWriter::prepare(pool, postingsWriter, outputFieldInfo, normBytes,
-                                           normDocsWithField, numNormDocsWithField);
+                                           normDocsWithField, numNormDocsWithField,
+                                           hasImpactNorms);
     }
 
     // if this is an indexed string column, we need to collect the ordinals for each doc

@@ -56,8 +56,6 @@ public:
   static constexpr flag_type INDEX_DOCS = (1 << 0);
   static constexpr flag_type INDEX_DOCS_FREQS = INDEX_DOCS | (1 << 1);
   static constexpr flag_type INDEX_DOCS_FREQS_POSITIONS = INDEX_DOCS_FREQS | (1 << 2);
-  static constexpr flag_type NUM_TOKENS_APPROX = (1 << 3);
-  static constexpr flag_type NUM_TOKENS_EXACT = (1 << 4);
   static constexpr flag_type MULTI_VALUED = (1 << 5);  // Set if the field can have multiple values per document
   static constexpr flag_type FIELD_SPECIFIC_ANALYZER = (1 << 6);  // Set if different fields using the same type have different analyzers (i.e. don't cache across different fields)
 
@@ -71,6 +69,8 @@ public:
   // Segment-format marker. It is never supplied by schema configuration.
   static constexpr flag_type TERM_RANGES = (1 << 12);
   static constexpr flag_type DERIVED = (1 << 13);  // named representation of a logical field
+  // TEXT only: no per-doc length norms. Fields without freqs never carry norms.
+  static constexpr flag_type OMIT_NORMS = (1 << 15);
 
   const FieldType::Type type_;
   const std::string name_;
@@ -119,12 +119,14 @@ public:
   // bit-and would report a DOCS-only field as having freqs/positions.
   static bool hasFreqs(flag_type flags) { return (flags & INDEX_DOCS_FREQS) == INDEX_DOCS_FREQS; }
   static bool hasPositions(flag_type flags) { return (flags & INDEX_DOCS_FREQS_POSITIONS) == INDEX_DOCS_FREQS_POSITIONS; }
+  // Length norms (and the block impacts built from them) for TEXT postings.
+  static bool hasNorms(flag_type flags) { return hasFreqs(flags) && !(flags & OMIT_NORMS); }
 
   bool hasFreqs() { return hasFreqs(flags_); }
 
   bool hasPositions() { return hasPositions(flags_); }
 
-  bool hasNumTokens() { return (bool) (flags_ & (NUM_TOKENS_APPROX | NUM_TOKENS_EXACT)); }
+  bool hasNorms() { return hasNorms(flags_); }
 
   bool multiValued() { return (bool) (flags_ & MULTI_VALUED); }
 

@@ -2323,7 +2323,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       // Do the actual merge.
       SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
-                           termPartitionMaxRanges);
+                           termPartitionMaxRanges, getSchema());
       merger.merge();
 
       phase = "new_segment_info";

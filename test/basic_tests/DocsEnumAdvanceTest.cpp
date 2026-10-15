@@ -1644,8 +1644,9 @@ TEST_F(DocsEnumAdvanceTest, blockImpactHeadersRoundTrip) {
                                 &expectedFrontiers, &expectedGroupFrontiers);
   }
 
-  checkRawImpactHeaders(FieldType::INDEX_DOCS_FREQS, expectedFreqImpacts, expectedNoNorms, N,
-                        "docs+freqs", &expectedNoFrontiers, &expectedNoGroupFrontiers);
+  checkRawImpactHeaders(FieldType::INDEX_DOCS_FREQS | FieldType::OMIT_NORMS, expectedFreqImpacts,
+                        expectedNoNorms, N, "docs+freqs", &expectedNoFrontiers,
+                        &expectedNoGroupFrontiers);
   checkRawImpactHeaders(FieldType::INDEX_DOCS, expectedDocsOnlyImpacts, expectedNoNorms, N,
                         "docs-only", &expectedNoFrontiers, &expectedNoGroupFrontiers);
 }
