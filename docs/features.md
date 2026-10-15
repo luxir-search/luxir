@@ -222,7 +222,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
   window they name (`2024-06` is all of June), and date math
   (`NOW/DAY-30DAYS`, `2024-06-25||+2d/d`) with a request-stable `NOW`,
   evaluated in a request time zone (IANA name or fixed offset).
-- `prefix`, `wildcard` (`*` and `?`), `regex` (anchored whole-term), and
+- `prefix`, `wildcard` (`*` and `?`), `regex` (anchored whole-term; both,
+  like `match`, take an opt-in `case_insensitive` flag), and
   `fuzzy` (edit distance up to 2, with blended scoring so a rare misspelling
   never outranks the exact term; fuzzy clauses take part in block-max pruning
   like any other clause).

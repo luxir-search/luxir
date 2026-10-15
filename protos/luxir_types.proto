@@ -426,6 +426,12 @@ message Match {
   // Mirrors BooleanQuery.min_match.
   int32 min_match = 4;
 
+  // Match STRING and ID values, and TEXT tokens the field's folding does not
+  // already make case-blind, regardless of simple Unicode case. Such terms
+  // compile to a case-alternating automaton and score constantly. Ignored on
+  // numeric and DATE fields.
+  bool case_insensitive = 5;
+
   enum Operator {
     OPERATOR_UNSPECIFIED = 0;  // treated as OR
     OR = 1;                    // a doc matches if any analyzed term matches
@@ -624,6 +630,10 @@ message PrefixQuery {
 message WildcardQuery {
   string field = 1;
   string pattern = 2;
+
+  // Literal characters, after field folding, also match their simple Unicode
+  // case alternates (lower, upper and title forms).
+  bool case_insensitive = 3;
 }
 
 // Matches an anchored whole indexed term using `|`, concatenation, groups,
@@ -634,6 +644,11 @@ message WildcardQuery {
 message RegexQuery {
   string field = 1;
   string pattern = 2;
+
+  // Literal characters, after field folding, and every member of character
+  // classes and ranges also match their simple Unicode case alternates.
+  // Negated classes exclude all case forms of their members.
+  bool case_insensitive = 3;
 }
 
 // Matches indexed terms within byte-wise Levenshtein distance of `term`. TEXT

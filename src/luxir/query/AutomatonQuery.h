@@ -30,6 +30,9 @@ public:
 
 private:
   Kind automatonKind;
+  // Part of the identity: the same pattern with and without the flag compiles
+  // to different automata.
+  bool caseInsensitive;
   std::string_view pattern;
   automaton::ByteDfaView dfa;
   automaton::ByteDfaKind classification;
@@ -41,23 +44,24 @@ private:
   std::optional<TermPolicy> fittedPolicy;
 
 public:
-  AutomatonQuery(std::string_view field, Kind kind, std::string_view pattern,
+  AutomatonQuery(std::string_view field, Kind kind, bool caseInsensitive, std::string_view pattern,
                  automaton::ByteDfaView dfa, automaton::ByteDfaKind classification,
                  std::string_view exactOrPrefix, DfaScanPlan scanPlan,
                  std::optional<TermPolicy> fittedPolicy = std::nullopt)
       : MultiTermQuery(QueryKind::AUTOMATON, field), automatonKind(kind),
-        pattern(pattern), dfa(dfa),
+        caseInsensitive(caseInsensitive), pattern(pattern), dfa(dfa),
         classification(classification), exactOrPrefix(exactOrPrefix),
         scanPlan(scanPlan), fittedPolicy(fittedPolicy) {}
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const AutomatonQuery&>(other);
-    return automatonKind == rhs.automatonKind && field == rhs.field
-        && pattern == rhs.pattern;
+    return automatonKind == rhs.automatonKind && caseInsensitive == rhs.caseInsensitive
+        && field == rhs.field && pattern == rhs.pattern;
   }
 
   uint64_t hashImpl() const override {
     uint64_t value = mixHash(Query::hashImpl(), automatonKind);
+    value = mixHash(value, caseInsensitive);
     value = mixHash(value, field);
     return mixHash(value, pattern);
   }
@@ -66,6 +70,7 @@ public:
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
     out.appendByte((uint8_t)automatonKind);
+    out.appendByte((uint8_t)caseInsensitive);
     out.appendString(field);
     // A general pattern is not fitted to the term length a one-byte prefix holds.
     out.appendString(pattern);

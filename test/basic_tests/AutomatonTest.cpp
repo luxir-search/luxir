@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "luxir/util/automaton/ByteDfa.h"
+#include "luxir/util/automaton/CaseAlternates.h"
 #include "luxir/util/automaton/Utf32ToUtf8.h"
 #include "luxir/util/automaton/WildcardCompiler.h"
 #include "luxir/util/automaton/RegExpParser.h"
@@ -362,6 +363,47 @@ TEST(RegExpTest, literalAtomFolding) {
   EXPECT_FALSE(sharpS.matches("sssss"));
   Budget escapedBudget(10000000);
   EXPECT_TRUE(compileRegex("\\A", escapedBudget, &folder).matches("a"));
+}
+
+TEST(CaseAlternatesTest, simpleFoldClasses) {
+  auto alternates = [](int32_t cp) {
+    auto span = caseAlternates(cp);
+    return std::vector<int32_t>(span.begin(), span.end());
+  };
+  EXPECT_EQ((std::vector<int32_t>{'K', 'k', 0x212a}), alternates('k'));
+  EXPECT_EQ(alternates('k'), alternates(0x212a));
+  EXPECT_EQ((std::vector<int32_t>{0x3a3, 0x3c2, 0x3c3}), alternates(0x3c2));
+  EXPECT_EQ((std::vector<int32_t>{0x1c4, 0x1c5, 0x1c6}), alternates(0x1c5));
+  EXPECT_TRUE(alternates('1').empty());
+  std::vector<std::pair<int32_t, int32_t>> ranges;
+  appendCaseAlternates('a', 'c', ranges);
+  EXPECT_EQ((std::vector<std::pair<int32_t, int32_t>>{{'A', 'A'}, {'B', 'B'}, {'C', 'C'}}), ranges);
+}
+
+TEST(CaseAlternatesTest, compilersExpandLiteralsAndClasses) {
+  auto wildcard = [](std::string_view pattern, const CodepointFolder* folder = nullptr) {
+    Budget budget(10000000);
+    return compileWildcard(pattern, budget, folder, true);
+  };
+  auto regex = [](std::string_view pattern) {
+    Budget budget(10000000);
+    return compileRegex(pattern, budget, nullptr, true);
+  };
+  EXPECT_TRUE(wildcard("fo*").matches("FOOBAR"));
+  EXPECT_TRUE(wildcard("\\F?").matches("fx"));
+  EXPECT_FALSE(wildcard("fo").matches("fp"));
+  EXPECT_TRUE(regex("[a-c]x").matches("BX"));
+  EXPECT_FALSE(regex("[a-c]x").matches("dx"));
+  EXPECT_FALSE(regex("[^a]").matches("A"));
+  EXPECT_TRUE(regex("[^a]").matches("b"));
+  EXPECT_TRUE(regex("\\k").matches(utf8(0x212a)));
+  // Case alternation applies after field folding.
+  TestCodepointFolder folder;
+  ByteDfa sharpS = wildcard(utf8(0xdf), &folder);
+  EXPECT_TRUE(sharpS.matches("sS"));
+  EXPECT_FALSE(sharpS.matches(utf8(0xdf)));
+  EXPECT_TRUE(caseStable("a", folder));
+  EXPECT_FALSE(caseStable("b", folder));
 }
 
 TEST(RegExpTest, errorsHavePositions) {
