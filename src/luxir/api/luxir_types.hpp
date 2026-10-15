@@ -128,8 +128,16 @@ struct SortSpec {
 };
 struct ExistsQuery { std::string_view field; };
 struct PrefixQuery { std::string_view field; std::string_view prefix; };
-struct WildcardQuery { std::string_view field; std::string_view pattern; };
-struct RegexQuery { std::string_view field; std::string_view pattern; };
+struct WildcardQuery {
+  std::string_view field;
+  std::string_view pattern;
+  bool case_insensitive = false;
+};
+struct RegexQuery {
+  std::string_view field;
+  std::string_view pattern;
+  bool case_insensitive = false;
+};
 struct FuzzyQuery {
   std::string_view field;
   std::string_view term;
@@ -671,6 +679,7 @@ struct Match {
   ::hpp_proto::optional_indirect_view<Val> val;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
+  bool case_insensitive = false;
 };
 struct AnyOfQuery {
   std::string_view field;
@@ -696,6 +705,7 @@ struct SimpleQuery {
   std::span<const std::string_view> allowed_fields;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
+  bool case_insensitive = false;
 };
 struct RangeQuery {                                            // needs Val
   std::string_view field;

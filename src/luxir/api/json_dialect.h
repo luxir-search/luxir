@@ -203,6 +203,8 @@ struct from<JSON, luxir::api::Match> {
             util::from_json<O>(value.operator_, ctx, vit, vend);
           } else if (key == "min_match") {
             util::from_json<O>(value.min_match, ctx, vit, vend);
+          } else if (key == "case_insensitive") {
+            util::from_json<O>(value.case_insensitive, ctx, vit, vend);
           } else {
             // Sugar: one unknown key acts as field+val. Transfer its arena
             // storage so the next option key cannot overwrite the field name.

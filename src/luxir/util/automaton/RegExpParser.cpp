@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "luxir/util/automaton/CaseAlternates.h"
 #include "luxir/util/automaton/Utf32ToUtf8.h"
 
 namespace luxir::automaton {
@@ -21,6 +22,7 @@ class Parser {
   std::string_view pattern;
   Budget& budget;
   const CodepointFolder* folder;
+  bool caseInsensitive;
   size_t position = 0;
 
   int32_t next() {
@@ -60,7 +62,7 @@ class Parser {
   }
 
   Automaton literal(int32_t codepoint) {
-    return Automaton::literal(codepoint, folder, budget);
+    return Automaton::literal(codepoint, folder, caseInsensitive, budget);
   }
 
   Automaton repetition(Automaton a) {
@@ -132,6 +134,12 @@ class Parser {
       first = false;
     }
     if (ranges.empty()) error("empty character class", open, pattern);
+    if (caseInsensitive) {
+      size_t explicitRanges = ranges.size();
+      for (size_t i = 0; i < explicitRanges; i++) {
+        appendCaseAlternates(ranges[i].first, ranges[i].second, ranges);
+      }
+    }
     std::sort(ranges.begin(), ranges.end());
     std::vector<std::pair<int32_t, int32_t>> merged;
     for (auto [lo, hi] : ranges) {
@@ -195,8 +203,9 @@ class Parser {
   }
 
 public:
-  Parser(std::string_view pattern, Budget& budget, const CodepointFolder* folder)
-      : pattern(pattern), budget(budget), folder(folder) {}
+  Parser(std::string_view pattern, Budget& budget, const CodepointFolder* folder,
+         bool caseInsensitive)
+      : pattern(pattern), budget(budget), folder(folder), caseInsensitive(caseInsensitive) {}
   Automaton parse() {
     Automaton result = unionExpr();
     if (position != pattern.size()) error("unbalanced ')'", position, pattern);
@@ -206,10 +215,11 @@ public:
 
 } // namespace
 
-ByteDfa compileRegex(std::string_view pattern, Budget& budget, const CodepointFolder* folder) {
+ByteDfa compileRegex(std::string_view pattern, Budget& budget, const CodepointFolder* folder,
+                     bool caseInsensitive) {
   if (pattern.size() > 1000) error("pattern too complex", 1000, pattern);
   try {
-    Parser parser(pattern, budget, folder);
+    Parser parser(pattern, budget, folder, caseInsensitive);
     return ByteDfa(utf32ToUtf8(parser.parse(), budget), budget);
   } catch (const std::runtime_error& e) {
     if (std::string_view(e.what()) == "pattern too complex") error("pattern too complex", 0, pattern);

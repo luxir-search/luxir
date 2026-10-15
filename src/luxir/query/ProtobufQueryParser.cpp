@@ -67,9 +67,11 @@ luxir::Query* ProtobufQueryParser::parseMatch(const luxir::api::Match& matchQuer
     // Val goes through the coercion contract: a numeric val against a
     // text/string field matches its canonical rendering (it used to
     // silently match nothing).
-    return builder.createMatchQuery(field, *matchQuery.val, op, matchQuery.min_match);
+    return builder.createMatchQuery(field, *matchQuery.val, op, matchQuery.min_match,
+                                    matchQuery.case_insensitive);
   }
-  return builder.createMatchQuery(field, std::string_view{}, op, matchQuery.min_match);
+  return builder.createMatchQuery(field, std::string_view{}, op, matchQuery.min_match,
+                                  matchQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseAnyOf(
@@ -173,13 +175,15 @@ luxir::Query* ProtobufQueryParser::parsePrefix(const luxir::api::PrefixQuery& pr
 luxir::Query* ProtobufQueryParser::parseWildcard(const luxir::api::WildcardQuery& wildcardQuery) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
-  return builder.createWildcardQuery(wildcardQuery.field, wildcardQuery.pattern);
+  return builder.createWildcardQuery(wildcardQuery.field, wildcardQuery.pattern,
+                                     wildcardQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseRegex(const luxir::api::RegexQuery& regexQuery) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
-  return builder.createRegexQuery(regexQuery.field, regexQuery.pattern);
+  return builder.createRegexQuery(regexQuery.field, regexQuery.pattern,
+                                  regexQuery.case_insensitive);
 }
 
 luxir::Query* ProtobufQueryParser::parseExists(const luxir::api::ExistsQuery& existsQuery) {

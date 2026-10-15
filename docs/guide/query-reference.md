@@ -85,11 +85,21 @@ The HTTP dialect also accepts the field-name form:
 | `val` | Value to analyze or coerce. Required. |
 | `operator` | `or` (default) or `and` for several analyzed terms. |
 | `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
+| `case_insensitive` | Ignore letter case on term fields. Default `false`. |
 
 Text values are analyzed with the resolved field analyzer. String values use
 their normalizer, if configured, and match as exact terms. Numeric and date
 values are coerced through the same rules as indexing and matched through
 their columns.
+
+With `case_insensitive`, a STRING or ID value (after its normalizer) matches
+any indexed term that differs only in simple Unicode case: `FOO` matches
+`foo` and `Foo`, and `k` matches the Kelvin sign. Such a value is matched
+through the same automaton as an escaped `wildcard` and is constant-scoring.
+On TEXT fields, an analyzed term whose analyzer already folds case (such as
+`nfkc_cf`) stays a scored term query; other terms take the constant-scoring
+automaton path. Numeric and date fields ignore the flag. Simple case folding
+is one-to-one, so sharp s (U+00DF) does not match `SS`.
 
 ## Exact membership (`any_of`)
 
@@ -264,12 +274,17 @@ matches documents with at least one indexed term for the field.
 |---|---|
 | `field` | Indexed term field. Required. |
 | `pattern` | `*` matches any bytes, `?` matches one codepoint, `\` escapes the next character. Required. |
+| `case_insensitive` | Literal characters also match their other simple Unicode case forms. Default `false`. |
 
 The pattern matches an entire indexed term. On TEXT fields, literal characters
 fold the way the field folds text, while `*`, `?`, and escapes are syntax and
 never fold; STRING fields also normalize literal characters; ID fields use
-literals verbatim. Wildcard queries are constant-scoring. The expression form
-is `wildcard(du*, field=title_t)`.
+literals verbatim. With `case_insensitive`, each literal character, escaped or
+not, also matches the lower, upper, and title forms of its folded form, so
+`err*` matches `ERROR` and `Error` on a case-preserving field. Wildcard
+queries are constant-scoring. The expression form is
+`wildcard(du*, field=title_t)`, or
+`wildcard(du*, field=title_t, case_insensitive=true)`.
 
 ## Regex
 
@@ -281,13 +296,16 @@ is `wildcard(du*, field=title_t)`.
 |---|---|
 | `field` | Indexed term field. Required. |
 | `pattern` | Anchored whole-term regular expression: `\|`, concatenation, groups, repetition, `.`, and character classes. Required. |
+| `case_insensitive` | Literals and character classes also match their other simple Unicode case forms. Default `false`. |
 
 The match is anchored to the whole indexed term, so `mess` does not match
 `messiah` but `mess.*` does; `^` and `$` are literal characters. On TEXT
 fields, literal characters fold the way the field folds text; character
 classes and ranges are codepoint-exact. STRING fields also normalize literal
-characters; ID fields use literals verbatim. Regex queries are
-constant-scoring.
+characters; ID fields use literals verbatim. With `case_insensitive`, literals
+also match their other simple Unicode case forms, and character classes and
+ranges add the case forms of their members before negation: `[a-c]` matches
+`B`, and `[^a]` rejects both `a` and `A`. Regex queries are constant-scoring.
 The expression form is `regex(dune|kings, field=title_t)`.
 
 ## Fuzzy
