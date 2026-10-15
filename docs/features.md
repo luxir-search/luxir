@@ -222,7 +222,11 @@ Anywhere a query goes, it can be a structured object or an expression string.
   like any other clause).
 - `constant_score`, `boost`, and `rescore`: keep a query's matches and replace
   each score with a value expression over columns and the original score
-  (`score * def(popularity_i, 1)`).
+  (`score * def(popularity_i, 1)`). `rescore` takes an optional `min_score`
+  cut-off (the `function_score` / `script_score` counterpart).
+- Request `min_score` (Elasticsearch-style): documents scoring below it are
+  dropped from the returned list, the exact count, and facet and metric
+  domains alike.
 - `knn` vector search, `geo_box`, and `geo_distance`.
 - `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,
   quoted phrases with `~N` slop, grouping, trailing-`*` prefix, `~N` fuzzy
@@ -315,6 +319,9 @@ Anywhere a query goes, it can be a structured object or an expression string.
   carried through merges automatically, without reindexing documents.
 - Effort knobs: `k`, `refine_candidates`, `exact`, and per-engine knobs under
   `ivf` (`nprobe`, `min_scan_fraction`).
+- `similarity` threshold in the metric's own space (maximum L2 distance,
+  minimum dot product or cosine), with Elasticsearch `knn.similarity`
+  semantics: below-threshold neighbors leave results, counts, and facets.
 - Deterministic: parallel vector search returns bit-identical results to a
   serial run.
 

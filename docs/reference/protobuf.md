@@ -1114,6 +1114,7 @@ Nearest-neighbor query against a searchable vector field. Search is exact when n
 | <a id="field-luxir.knnquery.refine_candidates"></a>[`refine_candidates`](#field-luxir.knnquery.refine_candidates) | 5 | `int32` | singular | Candidate-document pool size for full-precision rescoring of ANN results, in both units. Group search caps the number of candidates per group so repeated keys cannot consume the whole pool. Clamped up to k; 0 selects an adaptive default. Larger pools can improve recall at a cost in memory and latency. Fewer candidates may be available. |
 | <a id="field-luxir.knnquery.ivf"></a>[`ivf`](#field-luxir.knnquery.ivf) | 6 | [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf) | singular | ignored for exact search and segments without an IVF index |
 | <a id="field-luxir.knnquery.unit"></a>[`unit`](#field-luxir.knnquery.unit) | 7 | `string` | singular | docs (default): k counts documents. groups: k counts nearest groups under the enclosing top\_docs collapse key and missing policy; requires collapse. The match set contains one best scored witness per selected group. |
+| <a id="field-luxir.knnquery.similarity"></a>[`similarity`](#field-luxir.knnquery.similarity) | 8 | `float` | optional | Minimum vector similarity for a hit, in the metric's own space (not the transformed score): for l2 the maximum L2 distance (not squared), for ip the minimum dot product, for cosine the minimum cosine similarity. Hits beyond it are dropped from the k nearest, so fewer than k may match. Compared before any enclosing boost. Must be finite; l2 requires &gt;= 0. |
 
 <a id="message-luxir.knnquery.ivf"></a>
 
@@ -1514,6 +1515,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.rescorequery.query"></a>[`query`](#field-luxir.rescorequery.query) | 1 | [`Query`](#message-luxir.query) | singular |  |
 | <a id="field-luxir.rescorequery.expr"></a>[`expr`](#field-luxir.rescorequery.expr) | 2 | `string` | singular |  |
 | <a id="field-luxir.rescorequery.vars"></a>[`vars`](#field-luxir.rescorequery.vars) | 3 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
+| <a id="field-luxir.rescorequery.min_score"></a>[`min_score`](#field-luxir.rescorequery.min_score) | 4 | `float` | optional | Minimum rescored value. Documents whose expression output is below it do not match, in scored and unscored (filter) positions alike. Compared before any enclosing boost. Must be finite. |
 
 <a id="message-luxir.rrffusion"></a>
 
@@ -1781,6 +1783,7 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 | <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
 | <a id="field-luxir.topdocs.diversify"></a>[`diversify`](#field-luxir.topdocs.diversify) | 12 | [`Diversify`](#message-luxir.diversify) | singular | Incompatible with collapse; found counts capped documents. |
 | <a id="field-luxir.topdocs.collapse"></a>[`collapse`](#field-luxir.topdocs.collapse) | 11 | [`Collapse`](#message-luxir.collapse) | singular | limit, offset and found count groups; found\_docs counts eligible documents. |
+| <a id="field-luxir.topdocs.min_score"></a>[`min_score`](#field-luxir.topdocs.min_score) | 13 | `float` | optional | Minimum score cut-off. When set, documents whose query score is below this value do not match: they are excluded from the returned documents, from the get\_number count, and from the domain of ops (facets and metrics). The score compared is the query's own relevance score (filters do not score), computed even when the request sorts by fields or does not return scores. Must be finite. As a Fusion source, the cut-off applies to that source's ranked list. |
 | <a id="field-luxir.topdocs.ops"></a>[`ops`](#field-luxir.topdocs.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed over docs that match this query. |
 
 <a id="message-luxir.updaterequest"></a>
