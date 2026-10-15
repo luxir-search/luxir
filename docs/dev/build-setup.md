@@ -11,6 +11,9 @@ revision recorded as `builtin-baseline` in [deps/vcpkg.json](../../deps/vcpkg.js
 the same manifest, and the same overlay ports. Native dependencies are installed
 in `/opt/vcpkg/installed-native` and `/opt/vcpkg/installed-native-asan`.
 
+For a Linux ARM64 executable built on an x86-64 host,
+use the [ARM64 cross-build workflow](arm64-build.md).
+
 ## Development Requirements
 
 - C++26-capable GCC and matching libstdc++; the currently verified environment

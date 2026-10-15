@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <cstring>
+#if defined(__AVX2__)
 #include <immintrin.h>
+#endif
 
 #include "luxir/reader/Postings.h"
 
@@ -434,12 +436,22 @@ void t4InverseDelta(uint32_t* p, uint32_t base) {
   uint32_t off[T4_LANES];
   off[0] = base;
   for (uint32_t j = 1; j < T4_LANES; ++j) off[j] = off[j - 1] + total[j - 1];
+#if !defined(__aarch64__)
   const __m128i offv = _mm_loadu_si128(reinterpret_cast<const __m128i*>(off));
+#endif
   // Add the lane base and un-transpose to natural order.  Each iteration adds the
   // base to 4 rows, then a 4x4 lane transpose turns those rows (lane-major) into
   // 4 vectors of consecutive rows per lane -- lane j's rows [mb, mb+4) land
   // contiguously at p[32j + mb], reconstructing ascending docids.
   for (uint32_t mb = 0; mb < T4_ROWS; mb += 4) {
+#if defined(__aarch64__)
+    // A deinterleaving NEON load transposes four rows into four docid lanes.
+    const uint32x4x4_t lanes = vld4q_u32((const uint32_t*) (rows + mb));
+    for (uint32_t j = 0; j < T4_LANES; ++j) {
+      vst1q_u32(p + T4_ROWS * j + mb,
+                vaddq_u32(lanes.val[j], vdupq_n_u32(off[j])));
+    }
+#else
     const __m128i r0 = _mm_add_epi32(rows[mb + 0], offv);
     const __m128i r1 = _mm_add_epi32(rows[mb + 1], offv);
     const __m128i r2 = _mm_add_epi32(rows[mb + 2], offv);
@@ -453,6 +465,7 @@ void t4InverseDelta(uint32_t* p, uint32_t base) {
     _mm_storeu_si128(op + 1 * (T4_ROWS / 4), _mm_unpackhi_epi64(t0, t2));  // lane 1
     _mm_storeu_si128(op + 2 * (T4_ROWS / 4), _mm_unpacklo_epi64(t1, t3));  // lane 2
     _mm_storeu_si128(op + 3 * (T4_ROWS / 4), _mm_unpackhi_epi64(t1, t3));  // lane 3
+#endif
   }
 }
 
