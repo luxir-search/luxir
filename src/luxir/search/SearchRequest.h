@@ -202,6 +202,11 @@ public:
     releaseArena(&arena);
   };
 
+  // Last resort when even building an error response fails. Transports must
+  // terminate their outstanding request before releasing this arena. Local
+  // callers retain ownership and can inspect the absence of a response.
+  virtual void failDelivery() noexcept {}
+
   // --- Streaming-emit completion protocol -----------------------------------
   //
   // A paused emitter outlives submitBody(): its op task returns after parking,

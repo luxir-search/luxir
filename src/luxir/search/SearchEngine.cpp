@@ -8,6 +8,8 @@
 #include "luxir/server/CommitWaits.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
+#include "luxir/util/ErrorLog.h"
+#include "luxir/util/Signal.h"
 
 namespace luxir {
 
@@ -79,19 +81,16 @@ void SearchEngine::submitBody(SearchRequest& req) {
       req.tg->wait();
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
     }
-  } catch (std::exception& e) {
+  } catch (...) {
     // Drain any in-flight tasks so they aren't writing into the response while
     // we tear down.  wait() rethrows the first exception, so swallow it here.
     if (req.tg) {
       // TODO: notify other tasks about the error?
       try { req.tg->wait(); } catch (...) {}
     }
-    ErrorInfo info = classifyException(e, fallback);
-    if (info.kind == ErrorKind::INTERNAL) {
-      LOG_ERROR("Search request failed: {}", info.message);
-    } else {
-      LOG_WARN("Search request rejected ({}): {}", info.code, info.message);
-    }
+    ErrorInfo info = currentExceptionInfo(fallback);
+    logError(info, {"search", req.tenant, req.proto.collection, req.proto.request_id},
+             info.kind == ErrorKind::INTERNAL ? "Search request failed" : "Search request rejected");
     req.setError(info);
   }
 
@@ -101,6 +100,7 @@ void SearchEngine::submitBody(SearchRequest& req) {
 
   // Profile slots are written only by segment tasks. Materialize the shared
   // wire view after those tasks have drained (including the error path above).
+  Signal::emit("searchFinalize");
   req.fillExecutionProfile(*req.lastResponse);
 
   // Declared degradations ride on the final response (streaming responses
@@ -120,56 +120,81 @@ void SearchEngine::submitBody(SearchRequest& req) {
 }
 
 void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
-  if (!req.proto.min_commit.empty()) {
-    try {
-      auto floor = CommitId::parse(req.proto.min_commit);
-      auto collection = LuxirNode::target(req.tenant, req.proto.collection);
-      auto& waits = node.getCommitWaits();
-      waits.awaitCommit(std::move(collection), std::move(floor),
-          waits.deadlineAfter(req.proto.min_commit_timeout_ms.value_or(30000)), req.waitCancellation.get_token(),
-          [this, &req, maxParallel](CommitWaits::CommitResult result) {
-            node.getTaskArena().enqueue([this, &req, maxParallel, result = std::move(result)] {
-              if (result.error) { req.setError(*result.error); req.bodyDone(); }
-              else { req.floorCollection = result.collection; submit(req, maxParallel); }
+  try {
+    if (!req.proto.min_commit.empty()) {
+      try {
+        auto floor = CommitId::parse(req.proto.min_commit);
+        auto collection = LuxirNode::target(req.tenant, req.proto.collection);
+        auto& waits = node.getCommitWaits();
+        waits.awaitCommit(std::move(collection), std::move(floor),
+            waits.deadlineAfter(req.proto.min_commit_timeout_ms.value_or(30000)), req.waitCancellation.get_token(),
+            [this, &req, maxParallel](CommitWaits::CommitResult result) {
+              auto complete = [this, &req, maxParallel, result = std::move(result)]() noexcept {
+                try {
+                  if (result.error) { req.setError(*result.error); req.bodyDone(); }
+                  else { req.floorCollection = result.collection; submit(req, maxParallel); }
+                } catch (...) { req.failDelivery(); }
+              };
+              try { node.getTaskArena().enqueue(complete); }
+              catch (...) { complete(); }
             });
-          });
-      return;
+        return;
 
-    } catch (const std::exception& e) {
-      req.setError(classifyException(e, ErrorKind::INVALID_REQUEST));
-      req.bodyDone();
-      return;
+      } catch (const std::exception& e) {
+        req.setError(classifyException(e, ErrorKind::INVALID_REQUEST));
+        req.bodyDone();
+        return;
+      }
     }
-  }
-  if (maxParallel == 0) {
-    // Default lane: the whole query runs serially right here on the receiving
-    // transport thread.  No scheduler hop, and the arena's parked width never
-    // wakes - the transport accepts that this thread is occupied for the
-    // query's duration.
-    submit(req, maxParallel);
-  } else if (maxParallel == -1) {
-    // Parallel lane: the request starts right here, inside the arena, so it
-    // pays no handoff; arena workers steal the tasks it spawns and this thread
-    // helps in its own waits.  Entry takes a reserved slot (never queues
-    // behind arena backlog).  Like the default lane, this transport thread is
-    // occupied for the query's (now parallel) duration.
-    node.executeIsolated([&] { submit(req, maxParallel); });
-  } else {
-    // 1 = serial off the receiving thread: the escape hatch for a query
-    // expected to be expensive, so it does not occupy this transport thread.
-    // Other values are rejected in prepare(), on the arena like 1.
-    node.getTaskArena().enqueue([this, &req, maxParallel] { submit(req, maxParallel); });
-  }
+    if (maxParallel == 0) {
+      // Default lane: the whole query runs serially right here on the receiving
+      // transport thread.  No scheduler hop, and the arena's parked width never
+      // wakes - the transport accepts that this thread is occupied for the
+      // query's duration.
+      submit(req, maxParallel);
+    } else if (maxParallel == -1) {
+      // Parallel lane: the request starts right here, inside the arena, so it
+      // pays no handoff; arena workers steal the tasks it spawns and this thread
+      // helps in its own waits.  Entry takes a reserved slot (never queues
+      // behind arena backlog).  Like the default lane, this transport thread is
+      // occupied for the query's (now parallel) duration.
+      node.executeIsolated([&] { submit(req, maxParallel); });
+    } else {
+      // 1 = serial off the receiving thread: the escape hatch for a query
+      // expected to be expensive, so it does not occupy this transport thread.
+      // Other values are rejected in prepare(), on the arena like 1.
+      Signal::emit("searchEnqueue");
+      node.getTaskArena().enqueue([this, &req, maxParallel] { submit(req, maxParallel); });
+    }
+  } catch (...) { req.failDelivery(); }
 }
 
 void SearchEngine::submit(SearchRequest& req, int32_t maxParallel) {
   // Ideas: we could keep track of executing requests here, and provide ways to list / cancel them?
   req.maxParallel = maxParallel;
   std::optional<oneapi::tbb::task_group> stackTg;
-  if (maxParallel == -1 && req.tg == nullptr) {
-    req.tg = &stackTg.emplace();
+  try {
+    if (maxParallel == -1 && req.tg == nullptr) {
+      req.tg = &stackTg.emplace();
+    }
+    submitBody(req);
+  } catch (...) {
+    if (req.tg) { req.tg->cancel(); try { req.tg->wait(); } catch (...) {} }
+    logCurrentException({"search.finish", req.tenant, req.proto.collection, req.proto.request_id});
+    // A paused emitter still owns callbacks into this request. Complete through
+    // bodyDone instead of freeing its arena; this error needs no allocation.
+    if (req.lastResponse) {
+      {
+        std::lock_guard lock(req.mutex);
+        auto& response = req.lastResponse->proto;
+        if (!response.error) response.error = api::Error{
+            "internal", "failed to complete search response", api::Error::Kind::INTERNAL};
+        response.ops = {};
+      }
+      try { req.bodyDone(); }
+      catch (...) { req.failDelivery(); }
+    } else req.failDelivery();
   }
-  submitBody(req);
 }
 
 void SearchEngine::getResources(SearchRequest& req) {

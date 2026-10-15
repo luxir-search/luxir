@@ -299,3 +299,55 @@ TEST_F(GrpcSearchTest, disconnectWhilePausedCancelsEmitter) {
   server.shutdown();  // hangs if the paused request was stranded
   serverThread.join();
 }
+
+
+TEST_F(GrpcSearchTest, unexpectedDispatchExceptionFinishesRequestAndKeepsServing) {
+  std::atomic<bool> fail{true};
+  Signal::listen("grpcRequestDispatch", [&](void*, void*, void*) -> void* {
+    if (fail.exchange(false)) throw 7;
+    return nullptr;
+  });
+  for (bool failed : {true, false}) {
+    api::StatsRequest request;
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+    Reply<api::StatsResponse> response;
+    auto status = hppUnaryCall(channel.get(), rpc::Stats, &context, request, &response);
+    EXPECT_EQ(failed ? grpc::StatusCode::INTERNAL : grpc::StatusCode::OK, status.error_code());
+  }
+}
+
+TEST_F(GrpcSearchTest, updateCompletionFailureFinishesAndEnqueueFailureFallsBack) {
+  for (auto signal : {"grpcUpdateCompletion", "grpcCompletionEnqueue"}) {
+    std::atomic<bool> fail{true};
+    Signal::listen(signal, [&](void*, void*, void*) -> void* {
+      if (fail.exchange(false)) throw std::bad_alloc();
+      return nullptr;
+    });
+    api::UpdateRequest request;
+    request.collection = "main";
+    request.commit.emplace();
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+    Reply<api::UpdateResponse> response;
+    auto status = hppUnaryCall(channel.get(), rpc::Update, &context, request, &response);
+    EXPECT_EQ(std::string_view(signal) == "grpcUpdateCompletion"
+        ? grpc::StatusCode::RESOURCE_EXHAUSTED : grpc::StatusCode::OK, status.error_code());
+    EXPECT_FALSE(fail.load());
+    Signal::unlisten(signal);
+  }
+}
+
+TEST_F(GrpcSearchTest, searchSchedulingFailureFinishesAndReleasesArena) {
+  Signal::listen("searchEnqueue", [](void*, void*, void*) -> void* { throw std::bad_alloc(); });
+  api::SearchRequest request;
+  request.max_parallel = 1;
+  grpc::ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(5));
+  HppClientReaderWriter<api::SearchRequest, api::SearchResponse> stream(channel.get(), rpc::Search, &context);
+  ASSERT_TRUE(stream.Write(request));
+  stream.WritesDone();
+  Reply<api::SearchResponse> response;
+  while (stream.Read(&response)) {}
+  EXPECT_EQ(grpc::StatusCode::RESOURCE_EXHAUSTED, stream.Finish().error_code());
+}

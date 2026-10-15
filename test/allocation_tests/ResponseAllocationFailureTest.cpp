@@ -3,6 +3,11 @@
 
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "luxir/util/ReservedHandler.h"
+#include <boost/asio/bind_allocator.hpp>
+#include <boost/asio/any_io_executor.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/post.hpp>
 
 #include <new>
 
@@ -80,4 +85,22 @@ TEST(ResponseAllocationFailureTest, releasesFreshArenaOnEveryAllocationFailure) 
 
   auto* final = luxir::SearchResponse::create(*request);
   EXPECT_EQ(&request->arena, &final->arena); // The request still owns the final arena.
+}
+
+TEST(ResponseAllocationFailureTest, reservedCompletionCanPostWithHeapExhausted) {
+  boost::asio::io_context context;
+  boost::asio::any_io_executor executor = context.get_executor();
+  luxir::ReservedHandlerAllocator<> allocator;
+  int completed = 0;
+  auto post = [&] {
+    AllocationFailure failure(0);
+    boost::asio::post(executor, boost::asio::bind_allocator(allocator, [&] { ++completed; }));
+    EXPECT_EQ(0, failure.remaining); // No operator new call was needed.
+  };
+  ASSERT_NO_THROW(post());
+  context.run();
+  context.restart();
+  ASSERT_NO_THROW(post()); // The first handler returned the reservation.
+  context.run();
+  EXPECT_EQ(2, completed);
 }

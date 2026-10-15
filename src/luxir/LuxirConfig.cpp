@@ -106,6 +106,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_flag("--read-only", read_only,
                "Serve an existing data directory without the write lock; rejects all updates");
   app.add_option("--log-level", log_level, "Log level (trace, debug, info, warn, error, critical)")
+      ->check(CLI::IsMember({"trace", "debug", "info", "warn", "error", "critical"}))
       ->default_val(log_level);
   app.add_option("--query-cache-bytes", queryCacheBytes,
                  "Per-shard query cache payload budget (0 disables it)")
@@ -284,8 +285,9 @@ void LuxirConfig::normalize() {
 }
 
 void LuxirConfig::apply() const {
-  configureIndexingArena(index.huge_pages);
   auto level = spdlog::level::from_str(log_level);
+  if (level == spdlog::level::off) throw std::invalid_argument("Invalid log level: " + log_level);
+  configureIndexingArena(index.huge_pages);
   spdlog::set_level(level);
 }
 

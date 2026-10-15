@@ -228,7 +228,15 @@ Set log verbosity with:
 ```
 
 Valid spdlog levels include `trace`, `debug`, `info`, `warn`, `error`, and
-`critical`. Startup logs include the loaded time-zone database version.
+`critical`. Invalid values fail startup instead of disabling diagnostics.
+Startup logs include the loaded time-zone database version.
+
+Server log records use UTC timestamps with the date, severity, thread ID and
+source location. Newlines and control characters in messages are escaped so
+each record occupies one physical line. Request failures include operation,
+tenant, collection, request ID and error code where available. Internal failures
+are errors; request rejections and resource limits are warnings. A failed server
+bind exits with a nonzero status.
 
 ## Threads and streaming backpressure
 
