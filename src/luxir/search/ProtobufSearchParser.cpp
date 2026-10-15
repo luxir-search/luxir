@@ -826,51 +826,161 @@ public:
         facetReq.missing, selected);
   }
 
+  static std::string_view sortModeName(api::SortSpec_::SortMode mode) {
+    using Mode = api::SortSpec_::SortMode;
+    switch (mode) {
+      case Mode::MIN: return "min";
+      case Mode::MAX: return "max";
+      case Mode::SUM: return "sum";
+      case Mode::AVG: return "avg";
+      case Mode::MEDIAN: return "median";
+      case Mode::MODE_UNSET: break;
+    }
+    return "";
+  }
+
+  // Parse `expr` wrapped in the reducer `reducer`, e.g. sum(prices_is).
+  ValueProgram* parseReduced(const ValueExprOptions& options, std::string_view reducer,
+                             std::string_view expr) {
+    size_t size = reducer.size() + expr.size() + 2;
+    auto text = req.requestPool.make_span<char>(size);
+    memcpy(text.data(), reducer.data(), reducer.size());
+    text[reducer.size()] = '(';
+    memcpy(text.data() + reducer.size() + 1, expr.data(), expr.size());
+    text[size - 1] = ')';
+    return ValueExprParser(options, req.arena).parse(std::string_view(text.data(), size));
+  }
+
+  // A sort clause's `missing`: "_first" or "_last" name an edge; anything
+  // else is a literal of the sort value's type (nullopt edge).
+  static std::optional<FieldComparator::MissingValue> missingEdge(const api::Val& missing) {
+    const auto* text = std::get_if<std::string_view>(&missing.kind);
+    if (text != nullptr && *text == "_first") return FieldComparator::MISSING_FIRST;
+    if (text != nullptr && *text == "_last") return FieldComparator::MISSING_LAST;
+    return std::nullopt;
+  }
+
   // Build the copyable sort plan. Schema lookups that may throw are resolved
   // here before the plan is passed to TopDocsReq.
+  //
+  // Elasticsearch sort options: `missing` places docs without a value at an
+  // edge or sorts them as a literal; `mode` picks the value of a multi-valued
+  // field (min/max stay on the column path; sum/avg/median reduce through
+  // the value-expression path, a bare field becoming e.g. sum(field)).
   SortPlan parseSorts(std::span<const luxir::api::SortSpec> sorts) {
+    using Mode = api::SortSpec_::SortMode;
     SortPlan out;
     if (sorts.empty()) return out;
     out.useFieldSort = true;
     out.rankNeedsScores = false;
+    CoerceContext coerceContext{req.dateMathNowEpochMillis, *req.timeZone};
     for (const auto& sortSpec : sorts) {
       ValueExprOptions options{req.schema.get(), sortSpec.vars};
       options.fieldResolver = &fields;
       options.opName = "sort";
       ValueProgram* program = ValueExprParser(options, req.arena).parse(sortSpec.expr);
-      const ValueNode& root = program->root();
-      bool scoreRoot = root.kind == ValueNodeKind::SCORE;
+      const ValueNode* root = &program->root();
+      bool scoreRoot = root->kind == ValueNodeKind::SCORE;
       bool defaultDesc = sortSpec.dir == luxir::api::SortSpec_::SortDir::UNKNOWN
         && scoreRoot;
       SortField::SortOrder order =
         sortSpec.dir == luxir::api::SortSpec_::SortDir::DESC || defaultDesc
           ? SortField::DESC : SortField::ASC;
-      // TODO: expose per-sort missing=first/last/custom. Numerics substitute custom
-      // values directly; string comparators binary-search global terms at setup and
-      // use the matching ord or insertion point.
-      FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
-      if (root.kind == ValueNodeKind::COLUMN) {
-        auto* fieldTypePtr = req.schema->physical(root.text);
-        out.clauses.emplace_back(SortField(root.text, *fieldTypePtr, order, missing));
-      } else if (root.kind == ValueNodeKind::SCORE) {
+
+      Mode mode = sortSpec.mode;
+      std::string_view modeName = sortModeName(mode);
+      bool reducing = mode == Mode::SUM || mode == Mode::AVG || mode == Mode::MEDIAN;
+      const api::Val* missing = sortSpec.missing.has_value() ? &*sortSpec.missing : nullptr;
+      std::optional<FieldComparator::MissingValue> edge =
+          missing != nullptr ? missingEdge(*missing) : FieldComparator::MISSING_LAST;
+      bool literal = missing != nullptr && !edge.has_value();
+
+      if (root->kind == ValueNodeKind::SCORE || root->kind == ValueNodeKind::DOCID) {
+        if (mode != Mode::MODE_UNSET || missing != nullptr) {
+          throw std::runtime_error(fmt::format(
+              "sort '{}': mode and missing apply to field values; '{}' has exactly one "
+              "value per document", sortSpec.expr, sortSpec.expr));
+        }
+      }
+
+      // The bare field a clause sorts on, when it reduces through an
+      // expression: DATE literals then parse as that field's dates.
+      FieldType* reducedField = nullptr;
+      if (root->kind == ValueNodeKind::COLUMN) {
+        auto* fieldType = req.schema->physical(root->text);
+        FieldType::Type type = fieldType->type();
+        if (reducing && !FieldType::sortsByIntColumn(type)) {
+          throw std::runtime_error(fmt::format(
+              "sort '{}': mode '{}' requires a numeric or date field; '{}' is not numeric",
+              sortSpec.expr, modeName, sortSpec.expr));
+        }
+        if (mode == Mode::SUM && type == FieldType::DATE) {
+          throw std::runtime_error(fmt::format(
+              "sort '{}': mode 'sum' cannot reduce DATE field '{}'",
+              sortSpec.expr, sortSpec.expr));
+        }
+        if (reducing && fieldType->multiValued()) {
+          reducedField = fieldType;
+          program = parseReduced(options, modeName, sortSpec.expr);
+          root = &program->root();
+        } else {
+          SortField field(root->text, *fieldType, order, edge.value_or(FieldComparator::MISSING_LAST));
+          if (mode == Mode::MIN) field.setPick(FieldComparator::MultiPick::MIN);
+          if (mode == Mode::MAX) field.setPick(FieldComparator::MultiPick::MAX);
+          if (literal) {
+            if (FieldType::sortsByIntColumn(type)) {
+              field.setMissingNumber(fieldType->coerceColInt64(*missing, root->text, coerceContext));
+            } else {
+              char buf[coerce::TEXT_BUF_SIZE];
+              field.setMissingString(fieldType->coerceTerm(*missing, root->text, buf));
+            }
+          }
+          out.clauses.emplace_back(std::move(field));
+          continue;
+        }
+      } else if (mode != Mode::MODE_UNSET && valueArray(root->type)) {
+        program = parseReduced(options, modeName, sortSpec.expr);
+        root = &program->root();
+      }
+
+      if (root->kind == ValueNodeKind::SCORE) {
         out.clauses.emplace_back(SortClause::SCORE, order);
         out.rankNeedsScores = true;
-      } else if (root.kind == ValueNodeKind::DOCID) {
+      } else if (root->kind == ValueNodeKind::DOCID) {
         out.clauses.emplace_back(SortClause::DOC, order);
-      } else if (root.kind == ValueNodeKind::CONSTANT) {
+      } else if (root->kind == ValueNodeKind::CONSTANT) {
         throw std::runtime_error(fmt::format(
             "sort expression '{}' reads as the numeric constant {}; to sort a numeric-looking "
             "field name, write col(\"{}\")",
-            sortSpec.expr, root.text, root.text));
+            sortSpec.expr, root->text, root->text));
       } else {
-        if (valueArray(root.type)) {
+        if (valueArray(root->type)) {
           throw std::runtime_error(fmt::format(
-              "sort expression '{}' produces a {}; choose an explicit reducer such as "
-              "{}",
-              sortSpec.expr, valueTypeName(root.type),
+              "sort expression '{}' produces a {}; set a sort mode or choose an explicit "
+              "reducer such as {}",
+              sortSpec.expr, valueTypeName(root->type),
               ValueFunctionRegistry::arrayReducerNames()));
         }
-        out.clauses.emplace_back(*program, order);
+        SortClause::ExprMissing exprMissing;
+        exprMissing.edge = edge.value_or(FieldComparator::MISSING_LAST);
+        if (literal) {
+          exprMissing.hasLiteral = true;
+          bool isDouble = root->type == ValueType::DOUBLE;
+          if (reducedField != nullptr && reducedField->type() == FieldType::DATE) {
+            int64_t millis = reducedField->coerceColInt64(*missing, sortSpec.expr, coerceContext);
+            exprMissing.intValue = millis;
+            exprMissing.doubleValue = (double)millis;
+          } else if (isDouble) {
+            exprMissing.doubleValue = coerce::toDouble(*missing, sortSpec.expr);
+            if (!std::isfinite(exprMissing.doubleValue)) {
+              throw std::runtime_error(fmt::format(
+                  "sort '{}': missing value must be finite", sortSpec.expr));
+            }
+          } else {
+            exprMissing.intValue = coerce::toInt64(*missing, sortSpec.expr);
+          }
+        }
+        out.clauses.emplace_back(*program, order, exprMissing);
         out.rankNeedsScores |= program->needsScore;
       }
     }

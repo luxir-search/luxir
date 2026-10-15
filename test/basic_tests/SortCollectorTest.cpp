@@ -4166,7 +4166,7 @@ TEST_F(SortCollectorTest, indexWidePlanBuildsAcrossSmallSegments) {
     std::vector<int64_t> cards;
     for (int32_t docs : kSegDocs) cards.push_back(docs / 2);
     auto keys = TopDocsReq::fieldSortSegmentKeys(*reader, sortPlan, {});
-    auto order = TopDocsReq::fieldSortVisitOrder(keys, k, false);
+    auto order = TopDocsReq::fieldSortVisitOrder(keys, k, std::numeric_limits<int64_t>::max());
     bool bounded = TopDocsReq::fieldSortVisitsBounded(
         *reader, sortPlan, {}, cards, k);
     return std::pair(order, bounded);
@@ -4255,7 +4255,7 @@ TEST_F(SortCollectorTest, visitOrderPlacesSegmentsWithoutKeysAtMissingEdge) {
     sortPlan.clauses = columnPlan(sortField);
     auto keys = TopDocsReq::fieldSortSegmentKeys(*reader, sortPlan, envelope);
     return TopDocsReq::fieldSortVisitOrder(
-        keys, 10, TopDocsReq::fieldSortMissingFirst(sortPlan, envelope));
+        keys, 10, TopDocsReq::fieldSortMissingKey(sortPlan, envelope));
   };
   using Order = std::vector<int32_t>;
   EXPECT_EQ((Order{1, 2, 0}), order(FieldComparator::MISSING_FIRST, {}));

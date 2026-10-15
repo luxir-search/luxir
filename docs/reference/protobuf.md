@@ -1605,7 +1605,9 @@ Forgiving end-user query for raw search-box input. Malformed query text degrades
 |---|---|---|---|---|
 | <a id="field-luxir.sortspec.expr"></a>[`expr`](#field-luxir.sortspec.expr) | 1 | `string` | singular |  |
 | <a id="field-luxir.sortspec.vars"></a>[`vars`](#field-luxir.sortspec.vars) | 2 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
+| <a id="field-luxir.sortspec.missing"></a>[`missing`](#field-luxir.sortspec.missing) | 3 | [`Val`](#message-luxir.val) | singular | Where documents without a sort value go: "\_last" (the default) or "\_first" under either direction, or a literal of the sort value's type (a number, a DATE string or epoch millis, or a string for STRING/ID fields) that such documents sort as. |
 | <a id="field-luxir.sortspec.dir"></a>[`dir`](#field-luxir.sortspec.dir) | 10 | [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir) | singular |  |
+| <a id="field-luxir.sortspec.mode"></a>[`mode`](#field-luxir.sortspec.mode) | 11 | [`SortSpec.SortMode`](#enum-luxir.sortspec.sortmode) | singular | value picked from a multi-valued field; unset is min asc, max desc |
 
 <a id="message-luxir.statsrequest"></a>
 
@@ -1828,6 +1830,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`SchemaRequest.Mode`](#enum-luxir.schemarequest.mode)
 - [`SelectionMode`](#enum-luxir.selectionmode)
 - [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir)
+- [`SortSpec.SortMode`](#enum-luxir.sortspec.sortmode)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
 - [`VectorMetric`](#enum-luxir.vectormetric)
 
@@ -2018,6 +2021,23 @@ How facet selections filter the enclosing TopDocs results and its sub-operations
 | <a id="value-luxir.sortspec.sortdir.unknown"></a>[`UNKNOWN`](#value-luxir.sortspec.sortdir.unknown) | 0 |  |
 | <a id="value-luxir.sortspec.sortdir.asc"></a>[`ASC`](#value-luxir.sortspec.sortdir.asc) | 1 |  |
 | <a id="value-luxir.sortspec.sortdir.desc"></a>[`DESC`](#value-luxir.sortspec.sortdir.desc) | 2 |  |
+
+<a id="enum-luxir.sortspec.sortmode"></a>
+
+### luxir.SortSpec.SortMode
+
+Which value of a multi-valued field keys the sort. Unset picks min for ascending and max for descending. SUM, AVG, and MEDIAN require a numeric value; SUM also rejects DATE.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.sortspec.sortmode.mode_unset"></a>[`MODE_UNSET`](#value-luxir.sortspec.sortmode.mode_unset) | 0 |  |
+| <a id="value-luxir.sortspec.sortmode.min"></a>[`MIN`](#value-luxir.sortspec.sortmode.min) | 1 |  |
+| <a id="value-luxir.sortspec.sortmode.max"></a>[`MAX`](#value-luxir.sortspec.sortmode.max) | 2 |  |
+| <a id="value-luxir.sortspec.sortmode.sum"></a>[`SUM`](#value-luxir.sortspec.sortmode.sum) | 3 |  |
+| <a id="value-luxir.sortspec.sortmode.avg"></a>[`AVG`](#value-luxir.sortspec.sortmode.avg) | 4 |  |
+| <a id="value-luxir.sortspec.sortmode.median"></a>[`MEDIAN`](#value-luxir.sortspec.sortmode.median) | 5 |  |
 
 <a id="enum-luxir.updateresponse.status"></a>
 

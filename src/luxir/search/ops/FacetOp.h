@@ -158,6 +158,11 @@ public:
             + "': multiple sort fields are not yet supported");
       }
       for (auto& sort : sorts) {
+        if (sort.missing.has_value()
+            || sort.mode != luxir::api::SortSpec_::SortMode::MODE_UNSET) {
+          throw std::runtime_error("facet '" + std::string(facetName)
+              + "': sort mode and missing apply to document sorts, not bucket sorts");
+        }
         auto iter = subOps.find(sort.expr);
         if (iter == subOps.end()) {
           throw std::runtime_error("facet '" + std::string(facetName)

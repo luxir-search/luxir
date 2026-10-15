@@ -53,7 +53,8 @@
 //   params writes the object form.
 // - SortSpec reads a bare STRING as a clause, "expr", "expr asc", or "expr desc"
 //   (the HTTP sort parameter grammar), and `field` as an alias for `expr`. A
-//   top-docs `sort` takes one clause or a list of them.
+//   top-docs `sort` takes one clause or a list of them. The object form also
+//   reads `missing` (a bare JSON value) and `mode` (a lowercase mode name).
 //   Writes stay canonical with `expr` because sort expressions are the underlying API.
 // - QueryFacet buckets are a name -> Query object on JSON reads and writes. The wire's
 //   repeated QueryBucket form preserves that object's document order for gRPC parity.
@@ -501,6 +502,11 @@ struct from<JSON, luxir::api::SortSpec> {
             glz::util::parse_repeated<V>(true, vars, ctx, vit, vend);
           } else if (key == "dir") {
             util::from_json<V>(value.dir, ctx, vit, vend);
+          } else if (key == "mode") {
+            util::from_json<V>(value.mode, ctx, vit, vend);
+          } else if (key == "missing") {
+            from<JSON, ::hpp_proto::optional_indirect_view<luxir::api::Val>>::template op<V>(
+                value.missing, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

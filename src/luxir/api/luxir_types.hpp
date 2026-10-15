@@ -96,7 +96,10 @@ enum class Kind {
 };
 }
 namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
-namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
+namespace SortSpec_ {
+enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 };
+enum class SortMode { MODE_UNSET = 0, MIN = 1, MAX = 2, SUM = 3, AVG = 4, MEDIAN = 5 };
+}
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
 namespace CalendarGap_ {
 enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR = 5 };
@@ -127,9 +130,12 @@ struct CalendarGap {
 };
 struct SortSpec {
   using SortDir = luxir::api::SortSpec_::SortDir;
+  using SortMode = luxir::api::SortSpec_::SortMode;
   std::string_view expr;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
+  ::hpp_proto::optional_indirect_view<Val> missing;
   SortDir dir = SortDir::UNKNOWN;
+  SortMode mode = SortMode::MODE_UNSET;
 };
 struct ExistsQuery { std::string_view field; };
 struct PrefixQuery { std::string_view field; std::string_view prefix; };

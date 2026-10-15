@@ -71,6 +71,10 @@ public:
       bool cacheValid = false;
       bool isDouble = false;
       bool desc = false;
+      bool missingFirst = false;
+      // A missing literal makes every slot valid: missing values take it.
+      bool hasLiteral = false;
+      ExprSlot literal;
     };
     std::unique_ptr<ExprState> expr;
 
@@ -83,7 +87,26 @@ public:
         expr->isDouble =
             descriptor.getValueProgram().root().type == ValueType::DOUBLE;
         expr->desc = descriptor.getOrder() == SortField::DESC;
+        const SortClause::ExprMissing& missing = descriptor.getExprMissing();
+        expr->missingFirst = missing.edge == FieldComparator::MISSING_FIRST;
+        expr->hasLiteral = missing.hasLiteral;
+        if (missing.hasLiteral) {
+          expr->literal.valid = true;
+          if (expr->isDouble) expr->literal.value.doubleValue = missing.doubleValue;
+          else expr->literal.value.intValue = missing.intValue;
+        }
       }
+    }
+
+    ExprSlot slotOf(const ValueResult& result) const {
+      if (!result.valid && expr->hasLiteral) return expr->literal;
+      ExprSlot slot;
+      slot.valid = result.valid;
+      if (result.valid) {
+        if (expr->isDouble) slot.value.doubleValue = result.doubleValue;
+        else slot.value.intValue = result.intValue;
+      }
+      return slot;
     }
 
     void resetCache() {
@@ -105,12 +128,7 @@ public:
     }
 
     LUXIR_NOINLINE void copyCurrent(int32_t slot, segdoc doc, float score) {
-      const ValueResult& result = current(doc, score);
-      ExprSlot& target = expr->slots[(size_t)slot];
-      target.valid = result.valid;
-      if (!result.valid) return;
-      if (expr->isDouble) target.value.doubleValue = result.doubleValue;
-      else target.value.intValue = result.intValue;
+      expr->slots[(size_t)slot] = slotOf(current(doc, score));
     }
 
     void copyFrom(int32_t slot, const RuntimeClause& other, int32_t otherSlot) {
@@ -118,7 +136,10 @@ public:
     }
 
     int compareValues(const ExprSlot& left, const ExprSlot& right) const {
-      if (left.valid != right.valid) return left.valid ? -1 : 1;
+      // Missing values sit at a fixed edge under either direction.
+      if (left.valid != right.valid) {
+        return (left.valid ? -1 : 1) * (expr->missingFirst ? -1 : 1);
+      }
       if (!left.valid) return 0;
       int cmp = expr->isDouble
           ? (left.value.doubleValue > right.value.doubleValue)
@@ -134,14 +155,7 @@ public:
     }
 
     LUXIR_NOINLINE int compareCurrent(int32_t left, segdoc doc, float score) const {
-      const ValueResult& result = current(doc, score);
-      ExprSlot candidate;
-      candidate.valid = result.valid;
-      if (result.valid) {
-        if (expr->isDouble) candidate.value.doubleValue = result.doubleValue;
-        else candidate.value.intValue = result.intValue;
-      }
-      return compareValues(expr->slots[(size_t)left], candidate);
+      return compareValues(expr->slots[(size_t)left], slotOf(current(doc, score)));
     }
   };
 

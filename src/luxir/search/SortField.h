@@ -9,6 +9,7 @@
 #include "luxir/util/log.h"
 #include <atomic>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -37,6 +38,11 @@ private:
     FieldComparator::MissingValue missingValue;
     const FieldType* fieldType;
     StringSortMode stringSortMode;
+    // Missing literal (overrides missingValue's edge): the encoded column
+    // value for numeric fields, the term for STRING/ID fields.
+    std::optional<int64_t> missingNumber;
+    std::optional<std::string> missingString;
+    FieldComparator::MultiPick pick;
     inline static std::atomic<StringSortMode> stringSortModeOverride =
         StringSortMode::DEFAULT;
     
@@ -49,7 +55,8 @@ public:
           order(order),
           missingValue(missing),
           fieldType(&fieldType),
-          stringSortMode(stringSortMode) {
+          stringSortMode(stringSortMode),
+          pick(FieldComparator::defaultPick(order == DESC)) {
         assert(stringSortMode != StringSortMode::DEFAULT);
         auto& type = const_cast<FieldType&>(fieldType);
         if (type.type() == FieldType::TEXT) {
@@ -72,6 +79,23 @@ public:
         return order == DESC; 
     }
     FieldComparator::MissingValue getMissingValue() const { return missingValue; }
+    const std::optional<int64_t>& getMissingNumber() const { return missingNumber; }
+    const std::optional<std::string>& getMissingString() const { return missingString; }
+    FieldComparator::MultiPick getPick() const { return pick; }
+    void setMissingNumber(int64_t encoded) { missingNumber = encoded; }
+    void setMissingString(std::string_view term) { missingString = std::string(term); }
+    void setPick(FieldComparator::MultiPick value) { pick = value; }
+
+    // The transformed key (FieldComparator::KeyBatch space: smaller is
+    // better) a doc without a value sorts as, for an int-column sort.
+    int64_t missingKey() const {
+        if (missingNumber.has_value()) {
+            return isReversed() ? ~*missingNumber : *missingNumber;
+        }
+        return missingValue == FieldComparator::MISSING_FIRST
+            ? std::numeric_limits<int64_t>::min()
+            : std::numeric_limits<int64_t>::max();
+    }
     StringSortMode getStringSortMode() const { return stringSortMode; }
 
     static StringSortMode configuredStringSortMode() {
@@ -109,7 +133,7 @@ public:
             // matches the floating point order, so the int comparator
             // works on the encoded values as-is for all four.
             return std::make_unique<SimpleNumericFieldComparator>(
-                fieldName, isReversed(), missingValue
+                fieldName, isReversed(), missingValue, missingNumber, pick
             );
         }
         switch (type) {
@@ -117,10 +141,13 @@ public:
             case FieldType::Type::STRING: {
                 // Use FieldType information to determine if this is an indexed string field
                 if (const_cast<FieldType*>(fieldType)->isSet(FieldType::INDEX_DOCS)) {
-                    if (stringSortMode == StringSortMode::SEGMENT &&
-                        (!reader || reader->segments().size() > 1)) {
+                    // Global ords cannot place a literal that no segment
+                    // holds, so a missing literal always compares per segment.
+                    if (missingString.has_value() ||
+                        (stringSortMode == StringSortMode::SEGMENT &&
+                         (!reader || reader->segments().size() > 1))) {
                         return std::make_unique<SegmentOrdComparator>(
-                            fieldName, isReversed(), missingValue
+                            fieldName, isReversed(), missingValue, missingString, pick
                         );
                     }
                     // Use GlobalOrdComparator for indexed string fields
@@ -130,12 +157,12 @@ public:
                         ordMap = reader->getOrdMap(fieldName);
                     }
                     return std::make_unique<GlobalOrdComparator>(
-                        fieldName, ordMap, isReversed(), missingValue
+                        fieldName, ordMap, isReversed(), missingValue, pick
                     );
                 } else {
                     // Use StrColComparator for non-indexed string columns
                     return std::make_unique<StrColComparator>(
-                        fieldName, isReversed(), missingValue
+                        fieldName, isReversed(), missingValue, missingString
                     );
                 }
             }
@@ -145,6 +172,15 @@ public:
                     std::to_string((int)const_cast<FieldType*>(fieldType)->type()));
         }
     }
+};
+
+// Where an EXPR sort clause's missing values sort: an edge, or a literal
+// substituted for them (in the expression's int or double type).
+struct SortExprMissing {
+    FieldComparator::MissingValue edge = FieldComparator::MISSING_LAST;
+    bool hasLiteral = false;
+    int64_t intValue = 0;
+    double doubleValue = 0.0;
 };
 
 class SortClause {
@@ -162,7 +198,11 @@ private:
     std::optional<SortField> sortField;
     const ValueProgram* valueProgram = nullptr;
 
+    SortExprMissing exprMissing;
+
 public:
+    using ExprMissing = SortExprMissing;
+
     explicit SortClause(SortField field)
         : kind(COLUMN), order(field.getOrder()), sortField(std::move(field)) {}
 
@@ -171,8 +211,15 @@ public:
         assert(kind == SCORE || kind == DOC);
     }
 
-    SortClause(const ValueProgram& valueProgram, SortField::SortOrder order)
-        : kind(EXPR), order(order), valueProgram(&valueProgram) {}
+    SortClause(const ValueProgram& valueProgram, SortField::SortOrder order,
+               SortExprMissing missing = {})
+        : kind(EXPR), order(order), valueProgram(&valueProgram),
+          exprMissing(missing) {}
+
+    const SortExprMissing& getExprMissing() const {
+        assert(kind == EXPR);
+        return exprMissing;
+    }
 
     Kind getKind() const { return kind; }
     SortField::SortOrder getOrder() const { return order; }

@@ -8,6 +8,7 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 #include <fmt/format.h>
 
@@ -144,6 +145,14 @@ ResolvedValue sumResolve(std::span<const ResolvedValue> args) {
     throw std::runtime_error("sum() cannot reduce a DATE array");
   }
   return {valueScalarType(args[0].type), ValueNature::NUMBER};
+}
+
+ResolvedValue medianResolve(std::span<const ResolvedValue> args) {
+  requireNumeric(args);
+  if (!valueArray(args[0].type)) {
+    throw std::runtime_error("median() requires a numeric array");
+  }
+  return {ValueType::DOUBLE, args[0].nature};
 }
 
 ResolvedValue countResolve(std::span<const ResolvedValue> args) {
@@ -474,6 +483,33 @@ ValueResult evalSumPoint(BoundValueProgram& program, const ValueNode& node,
                                         : ValueResult::integer(intSum);
 }
 
+// The middle present value, or the mean of the two middle values for an
+// even count (Elasticsearch's median sort mode).
+ValueResult evalMedianPoint(BoundValueProgram& program, const ValueNode& node,
+                            int32_t docid, float score) {
+  ValueResult input = program.evalNode(node.children[0], docid, score);
+  if (!input.valid || input.array.size == 0) {
+    return ValueResult::missing(node.type);
+  }
+  thread_local std::vector<double> values;
+  values.clear();
+  for (int64_t i = 0; i < input.array.size; i++) {
+    ValueResult value = program.evalArrayElement(input.array, i);
+    if (!value.valid) continue;
+    values.push_back(value.type == ValueType::DOUBLE ? value.doubleValue
+                                                     : (double)value.intValue);
+  }
+  if (values.empty()) return ValueResult::missing(node.type);
+  size_t mid = values.size() / 2;
+  std::nth_element(values.begin(), values.begin() + (ptrdiff_t)mid, values.end());
+  double upper = values[mid];
+  if (values.size() % 2 == 1) return ValueResult::floating(upper);
+  double lower = *std::max_element(values.begin(), values.begin() + (ptrdiff_t)mid);
+  double out = lower + (upper - lower) / 2;
+  if (!std::isfinite(out)) runtimeInvalid(node, docid, "produced NaN or infinity");
+  return ValueResult::floating(out);
+}
+
 ValueResult evalCountPoint(BoundValueProgram& program, const ValueNode& node,
                            int32_t docid, float score) {
   ValueResult input = program.evalNode(node.children[0], docid, score);
@@ -503,6 +539,11 @@ ValueResult evalSumElement(BoundValueProgram& program, const ValueNode& node,
 
 ValueResult evalCountElement(BoundValueProgram& program, const ValueNode& node,
                              const ValueArrayRef& array, int64_t index) {
+  return invalidReducerElement(program, node, array, index);
+}
+
+ValueResult evalMedianElement(BoundValueProgram& program, const ValueNode& node,
+                              const ValueArrayRef& array, int64_t index) {
   return invalidReducerElement(program, node, array, index);
 }
 
@@ -914,6 +955,19 @@ ValueBounds sumBounds(const ValueNode& node,
   return ValueBounds::unbounded(node.type, true, args[0].alwaysMissing);
 }
 
+// A median lies within its array's bounds.
+ValueBounds medianBounds(const ValueNode& node,
+                         std::span<const ValueBounds> args) {
+  if (invalid(args[0])) return retag(args[0], node.type);
+  ValueBounds out = args[0];
+  if (bounded(out)) {
+    out.doubleMin = boundMinAsDouble(args[0]);
+    out.doubleMax = boundMaxAsDouble(args[0]);
+  }
+  out.type = ValueType::DOUBLE;
+  return out;
+}
+
 ValueBounds countBounds(const ValueNode& node,
                         std::span<const ValueBounds> args) {
   if (invalid(args[0])) return retag(args[0], node.type);
@@ -975,6 +1029,8 @@ constexpr ValueFunction FUNCTIONS[] = {
      propagateBounds, evalFunctionElement, 1, 1, nullptr},
     {ValueOpcode::NONE, "sum", sumResolve, evalSumPoint, evalFunctionBatch,
      sumBounds, evalSumElement, 1, 1, nullptr},
+    {ValueOpcode::NONE, "median", medianResolve, evalMedianPoint,
+     evalFunctionBatch, medianBounds, evalMedianElement, 1, 1, nullptr},
     {ValueOpcode::NONE, "count", countResolve, evalCountPoint,
      evalFunctionBatch, countBounds, evalCountElement, 1, 1, nullptr},
 };
