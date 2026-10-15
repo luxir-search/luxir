@@ -19,8 +19,9 @@ in `/opt/vcpkg/installed-native` and `/opt/vcpkg/installed-native-asan`.
 - vcpkg (toolchain files expected at `/opt/vcpkg/`)
 - Host tools: pkg-config, Python 3, curl, zip, unzip, and tar
 - Dependencies: Protobuf, gRPC, Intel TBB, Boost, xxHash, spdlog, CLI11,
-  LZ4, FAISS, glaze, GTL, jemalloc, GoogleTest, and Google Benchmark. The
-  compiler supplies OpenMP; FastPFOR is fetched and uni-algo is vendored
+  LZ4, Zstandard, FAISS, glaze, GTL, jemalloc, GoogleTest, and Google
+  Benchmark. The compiler supplies OpenMP; FastPFOR is fetched and uni-algo is
+  vendored
 
 The build uses `-march=native`; a release binary is intended for the machine
 class on which its dependencies and Luxir itself were built.

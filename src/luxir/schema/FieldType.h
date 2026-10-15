@@ -333,30 +333,54 @@ public:
   bool knnSearchable() const { return metric_ != METRIC_NONE; }
 };
 
-// Describes a stored-fields resource (a per-segment column of LZ4-compressed
+// How a stored-fields resource compresses its chunks.  codec and the two chunk
+// limits are recorded in each segment's resource metadata; the level only
+// affects compression.
+struct StoredChunkFormat {
+  // Recorded on disk as one byte.
+  enum Codec : uint8_t { LZ4 = 0, ZSTD = 1 };
+  static constexpr int DEFAULT_ZSTD_LEVEL = 3;
+  static constexpr uint32_t DEFAULT_CHUNK_TARGET = 16 * 1024;
+  static constexpr uint32_t DEFAULT_MAX_DOCS_PER_CHUNK = 128;
+
+  Codec codec = LZ4;
+  int zstdLevel = DEFAULT_ZSTD_LEVEL;
+  // Target uncompressed bytes per chunk before flushing.
+  uint32_t chunkTarget = DEFAULT_CHUNK_TARGET;
+  // Hard cap on docs per chunk.  A chunk flushes when *either* the byte
+  // target or this doc count is reached, whichever comes first.
+  uint32_t maxDocsPerChunk = DEFAULT_MAX_DOCS_PER_CHUNK;
+
+  // Same chunk bytes and boundaries: compressed chunks of one format can be
+  // copied verbatim into a writer of the other.  The level is not part of it.
+  bool sameLayout(const StoredChunkFormat& o) const {
+    return codec == o.codec && chunkTarget == o.chunkTarget && maxDocsPerChunk == o.maxDocsPerChunk;
+  }
+  bool operator==(const StoredChunkFormat&) const = default;
+};
+
+// Describes a stored-fields resource (a per-segment column of compressed
 // whole-doc chunks).  Registered in the schema under the resource's own name
 // (e.g. "_stored_" for the default, "_stored_paragraphs_" for a named family).
 // FieldType::storedResource_ names which StoredFieldType a STORED field
-// flushes into.
+// flushes into.  Built from SchemaDef.stored_resources.
 class StoredFieldType : public FieldType {
 public:
-  // Codec name.  Only "lz4" is supported in v1; reserved slot for future
-  // codecs (e.g. zstd with a trained dictionary).
-  std::string codec_;
-  // Target uncompressed bytes per chunk before flushing.
-  size_t chunkTargetUncompressed_;
-  // Hard cap on docs per chunk.  A chunk flushes when *either* the byte
-  // target or this doc count is reached, whichever comes first.
-  size_t maxDocsPerChunk_;
+  StoredChunkFormat format_;
+  // When > 0, segments with fewer docs (and every flush, whose size is not
+  // known up front) use the default format; merges reaching it use format_.
+  int64_t recompressMinDocs_ = 0;
 
-  explicit StoredFieldType(std::string_view name,
-                           std::string_view codec = "lz4",
-                           size_t chunkTargetUncompressed = 16 * 1024,
-                           size_t maxDocsPerChunk = 128)
+  explicit StoredFieldType(std::string_view name, StoredChunkFormat format = {},
+                           int64_t recompressMinDocs = 0)
     : FieldType(name, FieldType::BIN, FieldType::STORED),
-      codec_(codec),
-      chunkTargetUncompressed_(chunkTargetUncompressed),
-      maxDocsPerChunk_(maxDocsPerChunk) {}
+      format_(format),
+      recompressMinDocs_(recompressMinDocs) {}
+
+  // Format for a segment of segmentDocs docs; flushes pass 0.
+  StoredChunkFormat formatFor(int64_t segmentDocs) const {
+    return segmentDocs < recompressMinDocs_ ? StoredChunkFormat{} : format_;
+  }
 };
 
 } // end namespace

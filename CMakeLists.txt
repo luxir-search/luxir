@@ -129,6 +129,7 @@ find_package(TBB CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(CLI11 CONFIG REQUIRED)
 find_package(lz4 CONFIG REQUIRED)
+find_package(zstd CONFIG REQUIRED)
 # JSON (both the proto-JSON dialect and the HTTP envelope) is glaze, which comes in
 # via luxir_proto_concrete. Boost.Beast/Asio (the HTTP transport) are header-only and
 # come with the Boost include dir found above.
@@ -407,6 +408,8 @@ target_link_libraries(luxir_lib PUBLIC gRPC::grpc++ gRPC::grpc++_reflection)
 target_link_libraries(luxir_lib PUBLIC spdlog::spdlog)
 target_link_libraries(luxir_lib PRIVATE CLI11::CLI11)
 target_link_libraries(luxir_lib PRIVATE lz4::lz4)
+# The stored-fields reader/writer headers include zstd.h.
+target_link_libraries(luxir_lib PUBLIC zstd::libzstd)
 target_link_libraries(luxir_lib PRIVATE faiss)
 # uni-algo (vendored): Unicode case folding / NFKC / UAX#29 segmentation, used by
 # the analysis chain (src/luxir/analysis/Analyzer.cpp).

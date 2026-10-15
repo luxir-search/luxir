@@ -16,6 +16,7 @@
 #include "luxir/reader/PointsReader.h"
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/StrColReader.h"
+#include "luxir/schema/Schema.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/heap.h"
@@ -550,6 +551,8 @@ class SegmentMerger {
   std::span<LiveDocs*> liveDocs; // parallel to preaders, nullptr if no deletes
   PostingsWriter& postingsWriter;
   IndexRamBudget& ramBudget;
+  // Current schema, for per-resource stored-fields formats; null uses defaults.
+  const Schema* schema;
   const uint64_t estimatedOutputBytes;
   const int32_t streamBudget;
   int64_t termPartitionMinBytes;
@@ -565,8 +568,9 @@ public:
   SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
-                int32_t termPartitionMaxRanges)
+                int32_t termPartitionMaxRanges, const Schema* schema = nullptr)
   : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
+    schema(schema),
     estimatedOutputBytes(estimateOutputBytes(preaders)),
     streamBudget(MergeCostModel::streamBudgetForBytes(estimatedOutputBytes)),
     termPartitionMinBytes(termPartitionMinBytes),
@@ -717,7 +721,8 @@ private:
   int64_t estimateCost(std::span<const MergeFieldInfo> fields) const {
     assert(!fields.empty());
     if (isStoredField(fields[0].segFieldInfo)) {
-      int64_t maxChunkBytes = 0;
+      StoredChunkFormat format = storedFormat(std::string_view(fields[0].segFieldInfo.fieldname));
+      int64_t maxChunkBytes = format.chunkTarget;
       for (const auto& field : fields) {
         maxChunkBytes = std::max(
             maxChunkBytes,
@@ -726,9 +731,11 @@ private:
       // Stored-field merge processes one source segment at a time.  The
       // value-scaled buffers are: source decompressed chunk, writer per-doc
       // staging, writer chunk body, writer assembled uncompressed chunk, and
-      // LZ4 compression output.  LIGHT_BYTES covers fixed stream/mono scratch
-      // and the small LZ4_compressBound overhead above 1x.
-      return MergeCostModel::storedFieldsBytes(maxChunkBytes);
+      // compression output.  LIGHT_BYTES covers fixed stream/mono scratch,
+      // the small compress-bound overhead above 1x and a ZSTD source's
+      // decompression context; a ZSTD output adds its compression context.
+      return MergeCostModel::storedFieldsBytes(maxChunkBytes)
+          + StoredFieldsWriter::compressionContextBytes(format, maxChunkBytes);
     }
 
     FieldType::Type type;
@@ -1555,12 +1562,21 @@ private:
   }
 
 
+  // Output format for a stored-fields resource: the schema's current setting
+  // for this merge's output size, else the defaults.
+  StoredChunkFormat storedFormat(std::string_view resourceName) const {
+    auto* type = schema ? dynamic_cast<const StoredFieldType*>(schema->getFieldTypePtr(resourceName))
+                        : nullptr;
+    return type ? type->formatFor(postingsWriter.getMaxDoc()) : StoredChunkFormat{};
+  }
+
   // Merge one stored-fields resource (default or named column family).
-  // Decompresses each source segment's live docs in merged-docID order and
-  // re-emits them via a fresh StoredFieldsWriter for the same resource name.
-  // Multi-valued fields are preserved as single addValues calls so the
-  // on-disk grouping survives the merge.  Verbatim chunk-copy optimization
-  // is a follow-up.
+  // Writes a fresh StoredFieldsWriter for the same resource name in the
+  // resource's current format.  Sources in that same layout are copied as
+  // compressed chunks; the rest are decompressed and their live docs re-added
+  // in merged-docID order, which converts them to the output codec and chunk
+  // size.  Multi-valued fields are preserved as single addValues calls so the
+  // on-disk grouping survives the merge.
   void mergeStoredFields(std::vector<MergeFieldInfo>& mergeFieldInfos) {
     // Resource name comes from the (identical across segments) field name.
     std::string_view resourceName(mergeFieldInfos[0].segFieldInfo.fieldname);
@@ -1574,10 +1590,7 @@ private:
       fieldInfos[mfi.seg->ord] = &mfi.segFieldInfo;
     }
 
-    // Config isn't threaded through the merger yet; writer uses defaults.
-    // When per-family codec/chunk-size becomes meaningful, look up the
-    // StoredFieldType in the current schema here.
-    StoredFieldsWriter writer(postingsWriter, resourceName);
+    StoredFieldsWriter writer(postingsWriter, resourceName, storedFormat(resourceName));
     std::vector<int64_t> srcChunkFirstDocs, srcChunkOffsets;
 
     for (auto& seg : segs) {
@@ -1589,10 +1602,12 @@ private:
       // base + localId, and compressed chunk bodies are position-independent,
       // so the whole source region is copied without decompression - the
       // dominant cost of a large merge is otherwise this resource's serial
-      // LZ4 recompression.  Bodies reference the source's field-id table, so
-      // it must adopt into ours; deletions or a table mismatch fall back to
+      // recompression.  The source must have the output's codec and chunk
+      // limits, and bodies reference its field-id table, so it must adopt
+      // into ours; deletions, another layout or a table mismatch fall back to
       // the doc-by-doc re-add below.
-      if (!seg.hasDeletes() && writer.adoptFieldTable(reader.fieldNames())) {
+      if (!seg.hasDeletes() && reader.format().sameLayout(writer.format())
+          && writer.adoptFieldTable(reader.fieldNames())) {
         writer.alignForRawAppend(seg.base);
         reader.readChunkDirectory(srcChunkFirstDocs, srcChunkOffsets);
         writer.appendRawChunkRegion(seg.base, reader.chunkRegionPtr(),

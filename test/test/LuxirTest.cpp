@@ -96,9 +96,8 @@ static bool fieldTypesEqual(const FieldType& lhs, const FieldType& rhs) {
   if (auto* l = dynamic_cast<const StoredFieldType*>(&lhs)) {
     auto* r = dynamic_cast<const StoredFieldType*>(&rhs);
     return r != nullptr
-           && l->codec_ == r->codec_
-           && l->chunkTargetUncompressed_ == r->chunkTargetUncompressed_
-           && l->maxDocsPerChunk_ == r->maxDocsPerChunk_;
+           && l->format_ == r->format_
+           && l->recompressMinDocs_ == r->recompressMinDocs_;
   }
   return typeid(lhs) == typeid(rhs);
 }

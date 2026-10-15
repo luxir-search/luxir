@@ -673,6 +673,99 @@ TEST_F(StoredFieldsTest, emptySegment) {
 }
 
 
+// makeSchema() with the default resource configured.
+static std::shared_ptr<Schema> withStoredFormat(StoredChunkFormat format, int64_t recompressMinDocs = 0) {
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
+      "body", FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::STORED, "whitespace");
+  schema->fieldTypeMap["_stored_"] =
+      std::make_shared<StoredFieldType>("_stored_", format, recompressMinDocs);
+  return schema;
+}
+
+// Flush one segment of "body" docs numbered [first, first + n).
+static void addBodySegment(IndexWriter& iw, int first, int n) {
+  auto& inv = iw.obtainInverter();
+  for (int i = first; i < first + n; i++) {
+    std::string body = "log line " + std::to_string(i) + " status=200 path=/api/v1/items";
+    inv.startDoc();
+    inv.getIndexHandler("body").index(inv, std::string_view(body));
+    inv.finishDoc();
+  }
+  iw.releaseInverter(inv, true);
+  iw.commit();
+}
+
+static void expectBodies(StoredFieldsReader& r, int n) {
+  ASSERT_EQ(r.maxDoc(), n);
+  for (int i = 0; i < n; i++) {
+    std::string body;
+    r.readField(i, "body", [&](std::span<const std::string_view> v) { body = v[0]; });
+    EXPECT_EQ("log line " + std::to_string(i) + " status=200 path=/api/v1/items", body);
+  }
+}
+
+TEST_F(StoredFieldsTest, zstdRoundTripHonorsChunkLimits) {
+  RAMDir dir;
+  StoredChunkFormat format{StoredChunkFormat::ZSTD, 5, 1024, 4};
+  {
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, withStoredFormat(format));
+    addBodySegment(iw, 0, 10);
+  }
+  auto reader = std::make_shared<IndexReader>(dir);
+  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  ASSERT_NE(sfr, nullptr);
+  EXPECT_TRUE(sfr->format().sameLayout(format));
+  EXPECT_EQ(3, sfr->numChunks());  // 4 + 4 + 2 docs
+  expectBodies(*sfr, 10);
+}
+
+TEST_F(StoredFieldsTest, mergeRecompressesOtherFormatsAndCopiesMatching) {
+  RAMDir dir;
+  StoredChunkFormat zstd{StoredChunkFormat::ZSTD};
+  {
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, withStoredFormat({}));
+    addBodySegment(iw, 0, 3);
+    addBodySegment(iw, 3, 3);
+    iw.setSchema(withStoredFormat(zstd));
+    addBodySegment(iw, 6, 3);
+    iw.mergeSegments();
+  }
+  auto reader = std::make_shared<IndexReader>(dir);
+  ASSERT_EQ(reader->segments().size(), 1u);
+  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  EXPECT_TRUE(sfr->format().sameLayout(zstd));
+  // The two LZ4 sources are re-added into one chunk; the ZSTD one is copied.
+  EXPECT_EQ(2, sfr->numChunks());
+  expectBodies(*sfr, 9);
+}
+
+TEST_F(StoredFieldsTest, recompressMinDocsKeepsSmallSegmentsOnDefaults) {
+  RAMDir dir;
+  StoredChunkFormat zstd{StoredChunkFormat::ZSTD, 3, 64 * 1024, 1024};
+  CommitSnapshotRegistry iwSnapshots(dir);
+  IndexWriter iw(iwSnapshots, withStoredFormat(zstd, 10));
+  // Format and chunk count of the single segment.
+  auto check = [&](const StoredChunkFormat& format, int32_t numChunks) {
+    auto reader = iw.snapshots.readers.getReader();
+    ASSERT_EQ(reader->segments().size(), 1u);
+    auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+    EXPECT_TRUE(sfr->format().sameLayout(format));
+    EXPECT_EQ(numChunks, sfr->numChunks());
+    expectBodies(*sfr, sfr->maxDoc());
+  };
+  addBodySegment(iw, 0, 3);
+  addBodySegment(iw, 3, 3);
+  iw.mergeSegments();
+  check({}, 2);  // flushes and a 6-doc merge keep the defaults; copied verbatim
+  addBodySegment(iw, 6, 4);
+  iw.mergeSegments();
+  check(zstd, 1);
+}
+
+
 // End-to-end: a STORED TEXT field should come back in search results when
 // requested via TopDocs.fields.
 class StoredFieldsSearchTest : public luxir::LuxirTest {};
@@ -921,11 +1014,10 @@ TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
 
   // Build a schema with two stored-fields resources and two TEXT fields
   // routed into them.  The "_stored_" default resource is auto-added by
-  // fromProto; the named resource must be registered explicitly.
+  // fromProto; the named one is declared with ZSTD chunks.
   auto schema = Schema::createDefaultSchema();
-  schema->fieldTypeMap["_stored_embeddings_"] =
-      std::make_shared<StoredFieldType>("_stored_embeddings_");
   SchemaBuilder b;
+  b.storedResource("_stored_embeddings_").codec = luxir::api::StoredResourceDef::Codec::ZSTD;
   auto& body = b.field("body");
   body.type = luxir::api::FieldDef::FieldClass::TEXT;
   body.index = IndexMode::MATCH;
@@ -937,6 +1029,9 @@ TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
   para.stored_resource = "_stored_embeddings_";
   schema = b.build(schema.get());
   ASSERT_EQ("_stored_embeddings_", schema->getFieldTypePtr("paragraphs")->storedResource_);
+  auto* resource = dynamic_cast<StoredFieldType*>(schema->getFieldTypePtr("_stored_embeddings_"));
+  ASSERT_NE(nullptr, resource);
+  ASSERT_EQ(StoredChunkFormat::ZSTD, resource->format_.codec);
   ch.collection().setSchema(schema);
 
   ch.index(flatdoc("id", std::string("d1"),

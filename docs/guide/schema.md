@@ -266,7 +266,7 @@ publication advances the schema generation.
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | multi-valued |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
-| `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_` |
+| `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_`; see [Stored resources](#stored-resources) |
 | `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
@@ -290,6 +290,42 @@ compressed chunks. Analyzed text has postings and stored retrieval but no
 per-document value column; use a `string` variant when the same source value
 must also sort or facet. Scalar types return their values from columns without
 a second stored copy.
+
+### Stored resources
+
+Stored values are grouped by `stored_resource`, and each group is compressed
+in chunks of whole documents. The top-level `stored_resources` map configures
+a group by name; a group without an entry, including the default `_stored_`,
+uses LZ4 with 16KB chunks of at most 128 documents.
+
+```http
+POST /collections/logs/_schema
+
+{
+  "fields": {"message": {"type": "text", "stored_resource": "_stored_logs_"}},
+  "stored_resources": {
+    "_stored_logs_": {"codec": "zstd", "zstd_level": 6, "chunk_size_bytes": 65536,
+                      "max_docs_per_chunk": 1024, "recompress_min_docs": 100000}
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `codec` | `lz4` (default): fast to write and read. `zstd`: much smaller for repetitive text such as logs, at more CPU per chunk |
+| `zstd_level` | `zstd` only: 1 (fastest) to 22 (smallest); default 3 |
+| `chunk_size_bytes` | target uncompressed bytes per chunk, 1024 to 4194304; default 16384 |
+| `max_docs_per_chunk` | most documents per chunk, 1 to 65536; default 128 |
+| `recompress_min_docs` | when positive, flushes and merges producing fewer documents keep the defaults, and only merges reaching this size apply the settings above |
+
+Larger chunks compress better, but returning one stored document decompresses
+its whole chunk. `recompress_min_docs` keeps indexing on fast LZ4 and spends the
+`zstd` cost once, when merges build large segments. Each segment records its
+codec and chunk limits, so a change applies to segments written afterwards.
+A merge copies compressed chunks from inputs that already match its output
+codec and chunk limits and recompresses the others; the level alone does not
+trigger recompression. `mode=set` replaces the named entries and keeps the
+others.
 
 ## Text analysis
 

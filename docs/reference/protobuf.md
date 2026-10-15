@@ -159,6 +159,7 @@ defaults and constraints are described in the comments and guides.
 - [`StatsResponse`](#message-luxir.statsresponse)
 - [`StatsTotals`](#message-luxir.statstotals)
 - [`StorageRamStats`](#message-luxir.storageramstats)
+- [`StoredResourceDef`](#message-luxir.storedresourcedef)
 - [`TopDocs`](#message-luxir.topdocs)
 - [`UpdateRequest`](#message-luxir.updaterequest)
 - [`UpdateResponse`](#message-luxir.updateresponse)
@@ -1426,6 +1427,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of 1 / (k + rank\_s
 |---|---|---|---|---|
 | <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
+| <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource (for example "\_stored\_" or "\_stored\_body\_"). A group without an entry uses the defaults. mode=set replaces the named entries and keeps the others. |
 
 <a id="message-luxir.schemarequest"></a>
 
@@ -1647,6 +1649,22 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 | <a id="field-luxir.storageramstats.used_bytes"></a>[`used_bytes`](#field-luxir.storageramstats.used_bytes) | 1 | `uint64` | singular | Allocated RAM file buffers, including output and retained readers. |
 | <a id="field-luxir.storageramstats.limit_bytes"></a>[`limit_bytes`](#field-luxir.storageramstats.limit_bytes) | 2 | `uint64` | singular | Zero is unlimited. Independent of the indexing budget. |
 
+<a id="message-luxir.storedresourcedef"></a>
+
+### luxir.StoredResourceDef
+
+Chunk settings for one stored-field group (a FieldDef stored\_resource). Every setting is optional; absent selects the default. Changes apply to segments written afterwards; existing segments keep their recorded codec and are recompressed only when a merge rewrites them.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.storedresourcedef.codec"></a>[`codec`](#field-luxir.storedresourcedef.codec) | 1 | [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec) | optional | Chunk compression; absent selects lz4. |
+| <a id="field-luxir.storedresourcedef.zstd_level"></a>[`zstd_level`](#field-luxir.storedresourcedef.zstd_level) | 2 | `int32` | optional | ZSTD level from 1 (fastest) to 22 (smallest). Absent selects 3. Only valid with codec zstd. |
+| <a id="field-luxir.storedresourcedef.chunk_size_bytes"></a>[`chunk_size_bytes`](#field-luxir.storedresourcedef.chunk_size_bytes) | 3 | `int32` | optional | Target uncompressed bytes per chunk, 1024 to 4194304; absent selects 16384. Larger chunks compress better, but each retrieval decompresses a whole chunk. |
+| <a id="field-luxir.storedresourcedef.max_docs_per_chunk"></a>[`max_docs_per_chunk`](#field-luxir.storedresourcedef.max_docs_per_chunk) | 4 | `int32` | optional | Most documents per chunk, 1 to 65536; absent selects 128. A chunk closes at whichever of the byte and document limits comes first. |
+| <a id="field-luxir.storedresourcedef.recompress_min_docs"></a>[`recompress_min_docs`](#field-luxir.storedresourcedef.recompress_min_docs) | 5 | `int64` | optional | When positive, flushes and merges producing fewer documents write lz4 with the default chunk limits, and only merges reaching this many documents apply the settings above. Absent or 0 applies them to every segment. |
+
 <a id="message-luxir.topdocs"></a>
 
 ### luxir.TopDocs
@@ -1833,6 +1851,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`SchemaRequest.Mode`](#enum-luxir.schemarequest.mode)
 - [`SelectionMode`](#enum-luxir.selectionmode)
 - [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir)
+- [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
 - [`VectorMetric`](#enum-luxir.vectormetric)
 
@@ -2013,6 +2032,17 @@ How facet selections filter the enclosing TopDocs results and its sub-operations
 | <a id="value-luxir.sortspec.sortdir.unknown"></a>[`UNKNOWN`](#value-luxir.sortspec.sortdir.unknown) | 0 |  |
 | <a id="value-luxir.sortspec.sortdir.asc"></a>[`ASC`](#value-luxir.sortspec.sortdir.asc) | 1 |  |
 | <a id="value-luxir.sortspec.sortdir.desc"></a>[`DESC`](#value-luxir.sortspec.sortdir.desc) | 2 |  |
+
+<a id="enum-luxir.storedresourcedef.codec"></a>
+
+### luxir.StoredResourceDef.Codec
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.storedresourcedef.codec.lz4"></a>[`LZ4`](#value-luxir.storedresourcedef.codec.lz4) | 0 | fast compression and decompression |
+| <a id="value-luxir.storedresourcedef.codec.zstd"></a>[`ZSTD`](#value-luxir.storedresourcedef.codec.zstd) | 1 | smaller chunks for repetitive text such as logs, at more CPU |
 
 <a id="enum-luxir.updateresponse.status"></a>
 

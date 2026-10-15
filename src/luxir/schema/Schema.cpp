@@ -22,6 +22,7 @@ namespace luxir {
 using FieldClass = luxir::api::FieldDef_::FieldClass;
 using IndexMode = luxir::api::FieldDef_::IndexMode;
 using LongTerms = luxir::api::FieldDef_::LongTerms;
+using StoredCodec = luxir::api::StoredResourceDef_::Codec;
 using VectorMetric = luxir::api::VectorMetric;
 
 // One authored (source) entry: a name plus its FieldDef view and which map it
@@ -597,6 +598,43 @@ static std::string binding(std::optional<std::string_view> label,
   return selected.empty() ? "self" : selected;
 }
 
+// Validate one stored_resources entry and build its StoredFieldType.
+static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name,
+                                                           const api::StoredResourceDef& def) {
+  auto fail = [&](const std::string& msg) {
+    throw SchemaError(msg + " (stored resource: " + std::string(name) + ")");
+  };
+  if (!Schema::validFieldName(name) && !Schema::validTemplateName(name)) {
+    fail("invalid stored resource name: ASCII letters, digits, and underscores");
+  }
+  StoredChunkFormat format;
+  StoredCodec codec = def.codec.value_or(StoredCodec::LZ4);
+  if (codec != StoredCodec::LZ4 && codec != StoredCodec::ZSTD) {
+    fail("unknown codec value " + std::to_string((int)codec) + "; valid: lz4, zstd");
+  }
+  format.codec = codec == StoredCodec::ZSTD ? StoredChunkFormat::ZSTD : StoredChunkFormat::LZ4;
+  if (def.zstd_level) {
+    if (codec != StoredCodec::ZSTD) fail("zstd_level requires codec zstd");
+    if (*def.zstd_level < 1 || *def.zstd_level > 22) fail("zstd_level must be 1 to 22");
+    format.zstdLevel = *def.zstd_level;
+  }
+  if (def.chunk_size_bytes) {
+    if (*def.chunk_size_bytes < 1024 || *def.chunk_size_bytes > 4 * 1024 * 1024) {
+      fail("chunk_size_bytes must be 1024 to 4194304");
+    }
+    format.chunkTarget = (uint32_t)*def.chunk_size_bytes;
+  }
+  if (def.max_docs_per_chunk) {
+    if (*def.max_docs_per_chunk < 1 || *def.max_docs_per_chunk > 65536) {
+      fail("max_docs_per_chunk must be 1 to 65536");
+    }
+    format.maxDocsPerChunk = (uint32_t)*def.max_docs_per_chunk;
+  }
+  int64_t recompressMinDocs = def.recompress_min_docs.value_or(0);
+  if (recompressMinDocs < 0) fail("recompress_min_docs must not be negative");
+  return std::make_shared<StoredFieldType>(name, format, recompressMinDocs);
+}
+
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
   auto schema = std::make_shared<Schema>();
 
@@ -631,6 +669,18 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
   }
   for (const auto& [name, fd] : def.fields) entries.push_back({name, *fd, false});
   for (const auto& [name, fd] : def.templates) entries.push_back({name, *fd, true});
+
+  // Stored resources merge the same way: a named entry replaces the base one.
+  using ResourcePair = std::pair<std::string_view, api::StoredResourceDef>;
+  std::vector<ResourcePair> resources;
+  for (const auto& [name, rd] : baseSrc.stored_resources) {
+    if (!def.stored_resources.contains(name)) resources.push_back({name, rd});
+  }
+  for (const auto& [name, rd] : def.stored_resources) {
+    std::erase_if(resources, [&](const ResourcePair& r) { return r.first == name; });  // last wins
+    resources.push_back({name, rd});
+  }
+  std::ranges::sort(resources, {}, &ResourcePair::first);
 
   // Materialize the reserved fields when absent: a REPLACE_ALL that omits them gets
   // working defaults instead of a silently broken collection.
@@ -687,6 +737,8 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(fieldPairs.data(), fieldPairs.size()));
     src.templates = luxir::api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(templatePairs.data(), templatePairs.size()));
+    src.stored_resources = luxir::api::map_view<std::string_view, api::StoredResourceDef>(
+      std::span<const ResourcePair>(resources.data(), resources.size()));
     schema->sourceDef_ = serializeSchemaDef(src);
   }
 
@@ -794,10 +846,16 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
     schema->logicalFields.emplace(e.name, std::move(logical));
   }
 
-  // Ensure the default stored-fields resource is available in every schema.
-  // StoredFieldType entries are not part of the authored source def, so we
-  // materialize the default unconditionally.  Users who have registered named
-  // column families must re-add them programmatically.
+  // Stored-fields resources share the field registry (a segment registers
+  // each under its own name), so they cannot reuse a field or template name.
+  for (const auto& [name, rd] : resources) {
+    auto type = storedResourceType(name, rd);
+    if (!schema->fieldTypeMap.emplace(std::string(name), std::move(type)).second) {
+      throw SchemaError("stored resource '" + std::string(name) + "' collides with a field or template name");
+    }
+  }
+  // The default resource is always available; without an entry it uses the
+  // default format.
   std::string defaultName(Postings::STORED_DEFAULT_RESOURCE);
   if (schema->fieldTypeMap.find(defaultName) == schema->fieldTypeMap.end()) {
     schema->fieldTypeMap[defaultName] = std::make_shared<StoredFieldType>(defaultName);

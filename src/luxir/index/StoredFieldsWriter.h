@@ -6,11 +6,15 @@
 #include <algorithm>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <lz4.h>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
+// For ZSTD_estimateCCtxSize_usingCParams (stable since 1.4; linked statically).
+#define ZSTD_STATIC_LINKING_ONLY
+#include <zstd.h>
 
 #include "IntColWriter.h"
 #include "PostingsWriter.h"
@@ -24,9 +28,11 @@ namespace luxir {
 
 // Segment-level writer for stored fields
 //
-// Accumulates raw field values per document into whole-doc chunks, LZ4-compresses
-// them (~16KB uncompressed target or 128 docs, whichever comes first), and records
-// two monotonic columns so the reader can locate the chunk for any docID:
+// Accumulates raw field values per document into whole-doc chunks, compresses
+// them with the resource's codec (LZ4 by default, or ZSTD) once a chunk reaches
+// its uncompressed byte target or doc cap (16KB / 128 docs by default, see
+// StoredChunkFormat), and records two monotonic columns so the reader can
+// locate the chunk for any docID:
 //   - chunk->firstDocID      (mono, numChunks entries)
 //                              Readers find the chunk for a target docID by
 //                              binary-searching this column for the largest
@@ -36,13 +42,17 @@ namespace luxir {
 //                              so the reader can compute every chunk's size)
 //
 // On-disk chunks file layout:
-//   <chunk 0: [int32 uncompressedSize][compressed LZ4 bytes]>
+//   <chunk 0: [int32 uncompressedSize][compressed bytes]>
 //   <chunk 1: ...>
 //   ...
-//   <metadata: [vlong maxChunkBytes][varint numFields] then numFields
+//   <metadata: [vlong maxChunkBytes][byte codec][varint chunkTarget]
+//              [varint maxDocsPerChunk][varint numFields] then numFields
 //              PackedTerms (field names keyed by segment-local stored-field id)>
 //
-// Uncompressed chunk body (after LZ4 decompress):
+// Every chunk of a resource uses the codec recorded in its metadata; the chunk
+// limits are recorded so merges can tell whether chunks may be copied verbatim.
+//
+// Uncompressed chunk body (after decompression):
 //   - an array of numDocs int32 byte offsets, one per doc, giving the doc's
 //     start position within the decompressed buffer.  numDocs is not stored
 //     here; the reader computes it from the mono column as
@@ -62,10 +72,13 @@ namespace luxir {
 // numFieldsInDoc=0 means "nothing stored for this doc".
 class StoredFieldsWriter {
 private:
+  struct ZstdCCtxFree {
+    void operator()(ZSTD_CCtx* c) const { ZSTD_freeCCtx(c); }
+  };
+
   PostingsWriter& postingsWriter;
   std::string resourceName_;
-  size_t chunkTargetUncompressed_;
-  size_t maxDocsPerChunk_;
+  StoredChunkFormat format_;
   OutputStreamPtr chunkOutput;
   int64_t chunksStart = 0;
 
@@ -97,29 +110,34 @@ private:
   // Reusable scratch buffers (avoid per-chunk reallocation).
   std::string uncompressedScratch;
   std::vector<char> compressScratch;
+  std::unique_ptr<ZSTD_CCtx, ZstdCCtxFree> zstdCtx;  // created on the first ZSTD chunk
 
 public:
-  // Flush trigger defaults.  Overridable per resource via StoredFieldType.
-  static constexpr size_t DEFAULT_CHUNK_TARGET = 16 * 1024;
-  static constexpr size_t DEFAULT_MAX_DOCS_PER_CHUNK = 128;
-
-  // Create a writer for the named resource.  If config is null, defaults are
-  // used.  resourceName is the field name under which the resource is
-  // registered in the segment's per-field index (caller holds the schema
-  // lookup).  See Postings::STORED_DEFAULT_RESOURCE for the canonical default.
+  // Create a writer for the named resource.  resourceName is the field name
+  // under which the resource is registered in the segment's per-field index;
+  // the caller resolves the format from the schema's StoredFieldType.  See
+  // Postings::STORED_DEFAULT_RESOURCE for the canonical default.
   explicit StoredFieldsWriter(PostingsWriter& pw,
                               std::string_view resourceName = Postings::STORED_DEFAULT_RESOURCE,
-                              const StoredFieldType* config = nullptr)
+                              const StoredChunkFormat& format = {})
     : postingsWriter(pw),
       resourceName_(resourceName),
-      chunkTargetUncompressed_(config ? config->chunkTargetUncompressed_ : DEFAULT_CHUNK_TARGET),
-      maxDocsPerChunk_(config ? config->maxDocsPerChunk_ : DEFAULT_MAX_DOCS_PER_CHUNK)
+      format_(format)
   {
     chunkOutput = postingsWriter.getOutputStream();
     chunksStart = (int64_t)chunkOutput->size();
   }
 
   std::string_view resourceName() const { return resourceName_; }
+  const StoredChunkFormat& format() const { return format_; }
+
+  // Bytes a writer's ZSTD compression context needs for chunks up to
+  // chunkBytes; 0 for LZ4.
+  static int64_t compressionContextBytes(const StoredChunkFormat& format, int64_t chunkBytes) {
+    if (format.codec != StoredChunkFormat::ZSTD) return 0;
+    return (int64_t)ZSTD_estimateCCtxSize_usingCParams(
+        ZSTD_getCParams(format.zstdLevel, (unsigned long long)chunkBytes, 0));
+  }
 
   // Append one value for (docID, fieldName).  docID must be non-decreasing
   // across calls; values for the same doc can be emitted across multiple
@@ -181,6 +199,9 @@ public:
 
     // Metadata block follows chunks in the same file.
     chunkOutput->writeVlong((uint64_t)maxChunkBytes);
+    chunkOutput->write((char)format_.codec);
+    chunkOutput->writeVint(format_.chunkTarget);
+    chunkOutput->writeVint(format_.maxDocsPerChunk);
     chunkOutput->writeVint((uint32_t)fieldNames.size());
     for (const auto& name : fieldNames) {
       chunkOutput->writePackedTerm(name);
@@ -234,7 +255,9 @@ public:
   // Compressed chunk bodies are position-independent (doc offsets are
   // chunk-relative) but reference the segment-local field-id table, so a
   // source segment's chunks may be appended verbatim only when its table maps
-  // identically into this writer's.  A merge of a no-deletions source calls:
+  // identically into this writer's, and only when the source was written with
+  // the same codec and chunk limits (StoredChunkFormat::sameLayout), so the
+  // output stays uniform.  A merge of such a no-deletions source calls:
   //   1. adoptFieldTable(source names)  - false means re-add doc by doc
   //   2. alignForRawAppend(docBase)     - seal/pad so chunks cover [0, docBase)
   //   3. appendRawChunkRegion(...)      - bulk-copy chunks, rebase directory
@@ -273,10 +296,11 @@ public:
   }
 
   // Append a source segment's entire chunks region verbatim.  region/bytes
-  // are the source chunks ([int32 uncompressedSize][LZ4 bytes] each, metadata
-  // excluded); firstDocs/offsets its chunk directory (offsets relative to the
-  // region start); srcMaxDoc its doc count and srcMaxChunkBytes its stored
-  // max uncompressed chunk size.
+  // are the source chunks ([int32 uncompressedSize][compressed bytes] each,
+  // metadata excluded), written in a format with this writer's layout;
+  // firstDocs/offsets its chunk directory (offsets relative to the region
+  // start); srcMaxDoc its doc count and srcMaxChunkBytes its stored max
+  // uncompressed chunk size.
   void appendRawChunkRegion(int32_t docBase, const char* region, int64_t regionBytes,
                             std::span<const int64_t> firstDocs,
                             std::span<const int64_t> offsets,
@@ -361,8 +385,8 @@ private:
 
   void maybeFlushChunk() {
     size_t uncompressedSize = chunkDocOffsets.size() * sizeof(int32_t) + chunkBody.size();
-    if (uncompressedSize >= chunkTargetUncompressed_
-        || chunkDocOffsets.size() >= maxDocsPerChunk_) {
+    if (uncompressedSize >= format_.chunkTarget
+        || chunkDocOffsets.size() >= format_.maxDocsPerChunk) {
       flushChunk();
     }
   }
@@ -384,14 +408,7 @@ private:
 
     int32_t uncompressedSize = (int32_t)uncompressedScratch.size();
     maxChunkBytes = std::max(maxChunkBytes, (int64_t)uncompressedSize);
-    int maxCompressed = LZ4_compressBound(uncompressedSize);
-    compressScratch.resize((size_t)maxCompressed);
-    int compressedSize = LZ4_compress_default(
-        uncompressedScratch.data(), compressScratch.data(),
-        uncompressedSize, maxCompressed);
-    if (compressedSize <= 0) {
-      throw std::runtime_error("StoredFieldsWriter: LZ4 compression failed");
-    }
+    size_t compressedSize = compress(uncompressedScratch);
 
     // Record chunk position before writing (offsets are relative to chunksStart).
     int64_t chunkFileOffset = (int64_t)chunkOutput->size() - chunksStart;
@@ -404,6 +421,31 @@ private:
     chunkDocOffsets.clear();
     chunkBody.clear();
     chunkFirstDoc = -1;
+  }
+
+  // Compress src into compressScratch; returns the compressed size.
+  size_t compress(const std::string& src) {
+    if (format_.codec == StoredChunkFormat::ZSTD) {
+      if (!zstdCtx) {
+        zstdCtx.reset(ZSTD_createCCtx());
+        if (!zstdCtx) throw std::bad_alloc();
+      }
+      compressScratch.resize(ZSTD_compressBound(src.size()));
+      size_t n = ZSTD_compressCCtx(zstdCtx.get(), compressScratch.data(), compressScratch.size(),
+                                   src.data(), src.size(), format_.zstdLevel);
+      if (ZSTD_isError(n)) {
+        throw std::runtime_error(std::string("StoredFieldsWriter: ZSTD compression failed: ")
+                                 + ZSTD_getErrorName(n));
+      }
+      return n;
+    }
+    int maxCompressed = LZ4_compressBound((int)src.size());
+    compressScratch.resize((size_t)maxCompressed);
+    int n = LZ4_compress_default(src.data(), compressScratch.data(), (int)src.size(), maxCompressed);
+    if (n <= 0) {
+      throw std::runtime_error("StoredFieldsWriter: LZ4 compression failed");
+    }
+    return (size_t)n;
   }
 
   static void appendVint(std::string& dest, uint32_t val) {

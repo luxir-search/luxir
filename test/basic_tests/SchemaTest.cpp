@@ -1201,6 +1201,78 @@ TEST_F(SchemaTest, longTermsRequiresEligibleTypeAndKnownPolicy) {
   EXPECT_NO_THROW(schemaJson(R"({"fields":{"body":{"type":"text","index":"none","long_terms":"reject"}}})"));
 }
 
+static const StoredFieldType& storedType(const Schema& s, std::string_view name) {
+  auto* type = dynamic_cast<const StoredFieldType*>(s.getFieldTypePtr(name));
+  if (!type) throw std::runtime_error("no stored resource " + std::string(name));
+  return *type;
+}
+
+TEST_F(SchemaTest, storedResourcesRoundTripAndSetMerge) {
+  auto s = schemaJson(R"({"fields":{"msg":{"type":"text","stored_resource":"_stored_logs_"}},
+    "stored_resources":{"_stored_logs_":{"codec":"zstd","zstd_level":9,"chunk_size_bytes":65536,
+      "max_docs_per_chunk":1024,"recompress_min_docs":100000}}})");
+  EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 9, 65536, 1024}), storedType(*s, "_stored_logs_").format_);
+  EXPECT_EQ(100000, storedType(*s, "_stored_logs_").recompressMinDocs_);
+  EXPECT_EQ(StoredChunkFormat{}, storedType(*s, "_stored_").format_);
+
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef out;
+  s->toProto(&out, arena);
+  std::vector<std::byte> bytes;
+  ASSERT_TRUE(api::encode(out, bytes));
+  api::SchemaDef decoded;
+  ASSERT_TRUE(api::decode(decoded, api::copyToPaddedInput(bytes, arena), arena));
+  EXPECT_EQ(s->sourceDef_, Schema::fromProto(decoded)->sourceDef_);
+  auto json = authoredJson(*s);
+  EXPECT_NE(std::string::npos, json.find("\"codec\":\"zstd\""));
+  EXPECT_EQ(s->sourceDef_, schemaJson(json)->sourceDef_);
+
+  // mode=set replaces named entries and keeps the rest; replace_all drops them.
+  auto set = schemaJson(R"({"stored_resources":{"_stored_":{"codec":"zstd"}}})", s.get());
+  EXPECT_EQ(StoredChunkFormat::ZSTD, storedType(*set, "_stored_").format_.codec);
+  EXPECT_EQ(9, storedType(*set, "_stored_logs_").format_.zstdLevel);
+  EXPECT_EQ(nullptr, schemaJson(R"({"fields":{}})")->getFieldTypePtr("_stored_logs_"));
+}
+
+TEST_F(SchemaTest, storedResourcesValidation) {
+  for (auto json : {
+      R"({"stored_resources":{"_stored_":{"zstd_level":3}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_level":0}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_level":23}}})",
+      R"({"stored_resources":{"_stored_":{"chunk_size_bytes":1023}}})",
+      R"({"stored_resources":{"_stored_":{"chunk_size_bytes":4194305}}})",
+      R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":0}}})",
+      R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":65537}}})",
+      R"({"stored_resources":{"_stored_":{"recompress_min_docs":-1}}})",
+      R"({"stored_resources":{"bad-name":{}}})",
+      R"({"fields":{"body":"text"},"stored_resources":{"body":{}}})"}) {
+    SCOPED_TRACE(json);
+    EXPECT_THROW(schemaJson(json), SchemaError);
+  }
+  EXPECT_THROW(schemaJson(R"({"stored_resources":{"_stored_":{"codec":"gzip"}}})"), std::runtime_error);
+}
+
+TEST_F(SchemaTest, storedResourcesSurviveRestart) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  LuxirNode node(config);
+  CollectionHelper ch(node);
+  {
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef def;
+    ASSERT_TRUE(api::read_json(def, R"({"stored_resources":{"_stored_":{"codec":"zstd","chunk_size_bytes":32768}}})", arena));
+    ch.collection().updateSchema(def, api::SchemaRequest_::Mode::SET);
+  }
+  ch.index(Doc{{"id", std::string("1")}, {"title_t", std::string("hello")}});
+  ch.commit();
+
+  ch.getIndexWriter()->close();
+  CommitSnapshotRegistry reopenedSnapshots(*ch.collection().getShard()->getDirectory());
+  IndexWriter reopened(reopenedSnapshots);
+  auto& stored = storedType(*reopened.getSchema(), "_stored_");
+  EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 3, 32768}), stored.format_);
+}
+
 TEST_F(SchemaTest, variantsResolveByOperationAndExplicitSelectors) {
   auto s = schemaJson(R"({"fields":{
     "author":{"type":"text","variants":{"s":"string"}},

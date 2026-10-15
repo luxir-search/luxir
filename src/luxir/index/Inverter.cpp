@@ -73,8 +73,9 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
       }
     }
     // resConfig == nullptr means the resource isn't in the schema; writer
-    // will use defaults.  fromProto auto-registers "_stored_", so this only
-    // happens for custom-named resources the user forgot to register.
+    // will use defaults.  fromProto registers "_stored_" and every
+    // stored_resources entry, so this only happens for a named resource
+    // without settings.
     writer = &getOrCreateStoredFields(resourceName, resConfig);
   }
 

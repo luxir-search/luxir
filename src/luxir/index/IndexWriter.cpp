@@ -2320,10 +2320,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       PostingsWriter pwriter(dir, outputSegId);
 
       phase = "segment_merge";
-      // Do the actual merge.
+      // Do the actual merge.  The current schema chooses each stored-fields
+      // resource's output format.
+      auto mergeSchema = getSchema();
       SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
-                           termPartitionMaxRanges);
+                           termPartitionMaxRanges, mergeSchema.get());
       merger.merge();
 
       phase = "new_segment_info";

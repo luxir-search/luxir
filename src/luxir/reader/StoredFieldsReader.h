@@ -4,13 +4,16 @@
 #pragma once
 
 #include <lz4.h>
+#include <memory>
 #include <string_view>
 #include <vector>
+#include <zstd.h>
 
 #include "FieldReader.h"
 #include "IntColReader.h"
 #include "Postings.h"
 #include "PostingsReader.h"
+#include "luxir/schema/FieldType.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
 
@@ -47,12 +50,17 @@ namespace luxir {
 ///
 class StoredFieldsReader {
 private:
+  struct ZstdDCtxFree {
+    void operator()(ZSTD_DCtx* c) const { ZSTD_freeDCtx(c); }
+  };
+
   InputStream chunkIS;
   int64_t chunksStart = 0;
   int64_t chunksRegionEnd = 0;
   int32_t numChunks_ = 0;
   int32_t maxDoc_ = 0;
   int64_t maxChunkBytes_ = 0;
+  StoredChunkFormat format_;  // zstdLevel is not recorded and stays the default
 
   std::vector<std::string_view> fieldNames_;
 
@@ -62,6 +70,7 @@ private:
   std::vector<char> scratch;
   std::vector<std::string_view> valueSpanScratch;
   int32_t cachedChunkNum = -1;
+  std::unique_ptr<ZSTD_DCtx, ZstdDCtxFree> zstdCtx;  // created on the first ZSTD chunk
 
   struct ChunkLookup {
     int32_t chunkNum;
@@ -80,11 +89,18 @@ public:
     chunksRegionEnd = chunksStart + fieldInfo.columnMetaOff;
     numChunks_ = (int32_t)fieldInfo.numValues;
 
-    // Read metadata block (resource stats and field names) which sits at
-    // chunksStart + columnMetaOff.
+    // Read metadata block (resource stats, chunk format and field names)
+    // which sits at chunksStart + columnMetaOff.
     const char* metaPtr = chunkIS.ptr(chunksRegionEnd);
     const char* end = chunkIS.ptr(chunkIS.size());
     maxChunkBytes_ = (int64_t)InputStream::readVlong(metaPtr, end);
+    uint8_t codec = (uint8_t)*metaPtr++;
+    if (codec != StoredChunkFormat::LZ4 && codec != StoredChunkFormat::ZSTD) {
+      throw std::runtime_error("StoredFieldsReader: unknown codec " + std::to_string(codec));
+    }
+    format_.codec = (StoredChunkFormat::Codec)codec;
+    format_.chunkTarget = InputStream::readVint(metaPtr, end);
+    format_.maxDocsPerChunk = InputStream::readVint(metaPtr, end);
     uint32_t numFields = InputStream::readVint(metaPtr, end);
     fieldNames_.reserve(numFields);
     for (uint32_t i = 0; i < numFields; i++) {
@@ -240,6 +256,8 @@ public:
   int32_t numChunks() const { return numChunks_; }
   int32_t maxDoc() const { return maxDoc_; }
   int64_t maxChunkBytes() const { return maxChunkBytes_; }
+  // Codec and chunk limits this resource was written with.
+  const StoredChunkFormat& format() const { return format_; }
 
   // Every field name this resource holds, in segment-local field-id order.
   // The views point into the resource's metadata in the segment file, so they
@@ -249,8 +267,9 @@ public:
   // copied verbatim.
   std::span<const std::string_view> fieldNames() const { return fieldNames_; }
 
-  // Raw access to the contiguous chunks region ([int32 uncompressedSize][LZ4
-  // bytes] per chunk, metadata excluded), for verbatim copy by merges.
+  // Raw access to the contiguous chunks region ([int32 uncompressedSize]
+  // [compressed bytes] per chunk, metadata excluded), for verbatim copy by
+  // merges.
   const char* chunkRegionPtr() const { return chunkIS.ptr(chunksStart); }
   int64_t chunkRegionBytes() const { return chunksRegionEnd - chunksStart; }
 
@@ -360,10 +379,22 @@ private:
     int32_t compressedSize = (int32_t)(nextOff - off) - (int32_t)sizeof(int32_t);
 
     scratch.resize((size_t)uncompressedSize);
-    int decoded = LZ4_decompress_safe(
-        chunkPtr, scratch.data(), compressedSize, uncompressedSize);
-    if (decoded != uncompressedSize) {
-      throw std::runtime_error("StoredFieldsReader: LZ4 decompression failed");
+    if (format_.codec == StoredChunkFormat::ZSTD) {
+      if (!zstdCtx) {
+        zstdCtx.reset(ZSTD_createDCtx());
+        if (!zstdCtx) throw std::bad_alloc();
+      }
+      size_t decoded = ZSTD_decompressDCtx(zstdCtx.get(), scratch.data(), scratch.size(),
+                                           chunkPtr, (size_t)compressedSize);
+      if (ZSTD_isError(decoded) || decoded != (size_t)uncompressedSize) {
+        throw std::runtime_error("StoredFieldsReader: ZSTD decompression failed");
+      }
+    } else {
+      int decoded = LZ4_decompress_safe(
+          chunkPtr, scratch.data(), compressedSize, uncompressedSize);
+      if (decoded != uncompressedSize) {
+        throw std::runtime_error("StoredFieldsReader: LZ4 decompression failed");
+      }
     }
     cachedChunkNum = chunkNum;
   }
