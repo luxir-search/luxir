@@ -54,7 +54,7 @@ static void BM_Tokenize(benchmark::State& state, std::string tokenizer,
 
   int64_t ntokens = 0;
   for (auto _ : state) {
-    chain->head.setValue(text);
+    chain->setValue(text);
     chain->reset();
     while (tail.incrementToken()) {
       if constexpr (ConsumeOffset) {
@@ -100,7 +100,7 @@ static void BM_KStem(benchmark::State& state) {
   TextFieldType ft("body", FieldType::INDEX_DOCS_FREQS_POSITIONS,
                    "unicode_word", {"nfkc_cf", "fold"});
   auto chain = ft.createAnalyzer("body");
-  chain->head.setValue(book.text());
+  chain->setValue(book.text());
   chain->reset();
   std::vector<std::string> terms;
   while (chain->tail->incrementToken()) terms.emplace_back(chain->head.getToken().text);

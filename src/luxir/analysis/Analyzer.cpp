@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -449,6 +450,110 @@ std::unique_ptr<TokenStream> makeAccentFoldFilter(std::unique_ptr<TokenStream> s
   return std::make_unique<AccentFoldFilter>(std::move(source));
 }
 
+namespace {
+class UnicodeCharFilter : public CharFilter {
+  std::string name;
+  std::string scratch;
+public:
+  explicit UnicodeCharFilter(std::string_view name) : name(name) {}
+private:
+  void filter() override {
+    if (name == "lowercase") {
+      auto lowered = applyLowercase(input, scratch);
+      if (lowered == input) return;
+      // Default Unicode lowercase has one contextual mapping (final sigma),
+      // whose UTF-8 length is the same as its non-contextual mapping. Compute
+      // text over the full value, then map each scalar's output length.
+      size_t out = 0;
+      auto decoded = una::views::utf8(input);
+      for (auto it = decoded.begin(); it != decoded.end(); ++it) {
+        size_t start = (size_t) (it.begin() - input.begin());
+        size_t end = (size_t) (it.end() - input.begin());
+        size_t len = *it < 128 ? 1 : una::cases::to_lowercase_utf8(input.substr(start, end - start)).size();
+        replace(start, end, lowered.substr(out, len));
+        out += len;
+      }
+      return;
+    }
+    if (name == "nfkc_cf" && applyNfkcCf(input, scratch) == input) return;
+    if (name == "fold" && std::all_of(input.begin(), input.end(), [](unsigned char c) { return c < 128; })) return;
+    // Split only at normalization-safe boundaries: a starter that cannot
+    // compose backwards and has no leading NFKD non-starters. This preserves
+    // Hangul composition, canonical reordering and stream-safe NFC behavior.
+    // Mapping a changed normalization segment to its source span also handles
+    // expansions, contractions, and reordered combining marks.
+    size_t start = 0;
+    auto emit = [&](size_t end) {
+      auto part = input.substr(start, end - start);
+      if (name == "nfkc_cf") replace(start, end, applyNfkcCf(part, scratch));
+      else {
+        scratch = una::norm::to_unaccent_utf8(part);
+        replace(start, end, scratch);
+      }
+      start = end;
+    };
+    auto decoded = una::views::utf8(input);
+    for (auto it = decoded.begin(); it != decoded.end(); ++it) {
+      uint32_t cp = (uint32_t) *it;
+      if (name == "nfkc_cf") {
+        auto mapping = nfkc_cf_data::lookup(cp).mapping;
+        if (mapping) {
+          std::string_view bytes((const char*) nfkc_cf_data::utf8 + (mapping & 0xFFFFFF),
+                                 (mapping >> 24) & 127);
+          if (bytes.empty()) continue;
+          cp = (uint32_t) *una::views::utf8(bytes).begin();
+        }
+      }
+      size_t offset = (size_t) (it.begin() - input.begin());
+      if (offset > start && !(nfkc_cf_data::lookup(cp).props & 0x7FF)) emit(offset);
+    }
+    emit(input.size());
+  }
+};
+
+// Correct only once, after the token filters, and only on configured chains.
+// With no char filters the original token hot path remains unchanged.
+class OffsetFilter : public TokenFilter {
+  const std::vector<std::unique_ptr<CharFilter>>& filters;
+public:
+  OffsetFilter(std::unique_ptr<TokenStream> source,
+               const std::vector<std::unique_ptr<CharFilter>>& filters)
+      : TokenFilter(std::move(source)), filters(filters) {}
+  bool incrementToken() override {
+    if (!source().incrementToken()) return false;
+    for (auto it = filters.rbegin(); it != filters.rend(); ++it) {
+      token.startOffset = (*it)->correctOffset(token.startOffset, false);
+      token.endOffset = (*it)->correctOffset(token.endOffset, true);
+    }
+    return true;
+  }
+};
+} // namespace
+
+std::unique_ptr<CharFilter> makeUnicodeCharFilter(std::string_view name) {
+  return std::make_unique<UnicodeCharFilter>(name);
+}
+
+TokenChain::TokenChain(Tokenizer& head, std::unique_ptr<TokenStream> tail, bool stateful,
+                       std::vector<std::unique_ptr<CharFilter>> cleanups)
+    : head(head), tail(std::move(tail)), stateful(stateful), charFilters(std::move(cleanups)) {
+  if (!charFilters.empty()) this->tail = std::make_unique<OffsetFilter>(std::move(this->tail), charFilters);
+}
+
+void TokenChain::setFilteredValue(std::string_view value) {
+  if (value.size() > (size_t) std::numeric_limits<int>::max())
+    throw std::length_error("Analysis input exceeds byte-offset limit");
+  for (auto& filter : charFilters) value = filter->apply(value);
+  head.setValue(value);
+}
+
+void TokenChain::normalizeTerm(std::string& term) {
+  std::string_view value = term;
+  for (auto& filter : charFilters) value = filter->apply(value);
+  if (value.data() != term.data()) term.assign(value);
+  tail->normalizeTerm(term);
+}
+
 // ---------------------------------------------------------------------------
 // Component registry
 
@@ -626,6 +731,8 @@ std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
   for (const auto& filter : def.filters) {
     filters.push_back(makeTokenFilterFactory(filter));
   }
+  std::vector<std::unique_ptr<const CharFilterFactory>> cleanups;
+  for (const auto& filter : def.char_filters) cleanups.push_back(makeCharFilterFactory(filter));
   api::AnalyzerDef effective = def;
   if (!effective.tokenizer) effective.tokenizer = whitespace;
   std::string json;
@@ -635,14 +742,16 @@ std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
   if (glz::read_json(value, json)) throw std::runtime_error("Cannot canonicalize analyzer");
   // Give the empty chain the same representation everywhere.
   if (def.filters.empty()) value["filters"] = glz::generic_sorted_u64::array_t{};
+  if (def.char_filters.empty()) value["char_filters"] = glz::generic_sorted_u64::array_t{};
   if (glz::write_json(value, json)) throw std::runtime_error("Cannot serialize canonical analyzer");
-  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters), std::move(json)));
+  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters), std::move(cleanups), std::move(json)));
 }
 
 Analyzer::Analyzer(std::unique_ptr<const TokenizerFactory> tok,
-                   std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical)
+                   std::vector<std::unique_ptr<const TokenFilterFactory>> fs,
+                   std::vector<std::unique_ptr<const CharFilterFactory>> cs, std::string canonical)
     : canonical(std::move(canonical)), tokenizer(std::move(tok)),
-      filters(std::move(fs)),
+      filters(std::move(fs)), charFilters(std::move(cs)),
       fusedHead(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "nfkc_cf"),
       stateful(tokenizer->stateful ||
                std::any_of(filters.begin(), filters.end(), [](const auto& f) { return f->stateful; })) {}
@@ -654,7 +763,9 @@ std::unique_ptr<TokenChain> Analyzer::createChain() const {
   for (size_t i = fusedHead ? 1 : 0; i < filters.size(); i++) {
     tail = filters[i]->create(std::move(tail));
   }
-  return std::make_unique<TokenChain>(headRef, std::move(tail), stateful);
+  std::vector<std::unique_ptr<CharFilter>> cleanups;
+  for (const auto& factory : charFilters) cleanups.push_back(factory->create());
+  return std::make_unique<TokenChain>(headRef, std::move(tail), stateful, std::move(cleanups));
 }
 
 }  // namespace luxir

@@ -166,6 +166,8 @@ whole machine. Designed from the start for parallelism on modern hardware.
 
 ## Text analysis
 
+- Ordered cleanup before tokenization: HTML stripping, Unicode character removal,
+  lowercase, NFKC case folding, and accent folding, with source-offset correction.
 - Tokenizers: Unicode word segmentation (UAX#29), whitespace, keyword.
 - Token filters: NFKC case folding, ASCII lowercase, accent and diacritic
   folding, English possessive removal, and KStem English stemming (the

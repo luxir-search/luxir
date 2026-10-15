@@ -10,6 +10,7 @@
 #include <cstring>
 #include <memory>
 #include "luxir/util/luxir_util.h"
+#include "luxir/analysis/CharFilter.h"
 
 namespace luxir {
 
@@ -331,12 +332,25 @@ public:
   Tokenizer &head;                   // owned via `tail` (the head is the bottom of the chain)
   std::unique_ptr<TokenStream> tail; // the top of the chain; pull from here
   bool stateful;                     // true iff any stage buffers state across tokens/values
+  std::vector<std::unique_ptr<CharFilter>> charFilters;
 
-  TokenChain(Tokenizer &head, std::unique_ptr<TokenStream> tail, bool stateful = false)
-          : head(head), tail(std::move(tail)), stateful(stateful) {}
+  TokenChain(Tokenizer &head, std::unique_ptr<TokenStream> tail, bool stateful = false,
+             std::vector<std::unique_ptr<CharFilter>> cleanups = {});
+
+  // OffsetFilter borrows this object's filter vector; chains stay at a fixed address.
+  TokenChain(const TokenChain&) = delete;
+  TokenChain& operator=(const TokenChain&) = delete;
+  TokenChain(TokenChain&&) = delete;
+  TokenChain& operator=(TokenChain&&) = delete;
+
+  // Keep unconfigured indexing on the existing borrowed-input fast path.
+  void setValue(std::string_view value) {
+    if (charFilters.empty()) head.setValue(value);
+    else setFilteredValue(value);
+  }
 
   // Begin analysis of a fresh value (the value itself is supplied via
-  // head.setValue). For the common stateless chain this is a single predictable
+  // setValue). For the common stateless chain this is a single predictable
   // branch with no virtual dispatch; only a chain that contains a stateful
   // filter pays the source-ward reset() walk.
   void reset() {
@@ -345,7 +359,9 @@ public:
 
   // Normalize a single term the way this chain folds token text, without
   // segmentation - the multiterm entry point (see TokenStream::normalizeTerm).
-  void normalizeTerm(std::string& term) { tail->normalizeTerm(term); }
+  void normalizeTerm(std::string& term);
+private:
+  void setFilteredValue(std::string_view value);
 };
 
 
@@ -365,6 +381,7 @@ public:
   // state below is always consistent with the components.
   const std::unique_ptr<const TokenizerFactory> tokenizer;
   const std::vector<std::unique_ptr<const TokenFilterFactory>> filters;
+  const std::vector<std::unique_ptr<const CharFilterFactory>> charFilters;
   // unicode_word + nfkc_cf (the common default) fuses into one StandardTokenizer
   // stage - segmentation and NFKC_CF in a single pass, remaining filters on top.
   // Equivalent output (see AnalysisTest); decided here, on validated components.
@@ -380,7 +397,8 @@ public:
 
 private:
   Analyzer(std::unique_ptr<const TokenizerFactory> tok,
-           std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical);
+           std::vector<std::unique_ptr<const TokenFilterFactory>> fs,
+           std::vector<std::unique_ptr<const CharFilterFactory>> cs, std::string canonical);
 };
 
 

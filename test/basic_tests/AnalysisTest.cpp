@@ -59,9 +59,19 @@ Analysis analyze(Tokenizer& head, TokenStream& tail, std::string_view val) {
 
 // Drive a full chain (TokenChain from createAnalyzer), honoring reset().
 Analysis analyze(TokenChain& tc, std::string_view val) {
-  tc.head.setValue(val);
+  tc.setValue(val);
   tc.reset();
-  return analyze(tc.head, *tc.tail, val);
+  Analysis out;
+  Token& tok = tc.head.getToken();
+  int pos = -1;
+  while (tc.tail->incrementToken()) {
+    pos += tok.positionIncrement;
+    out.terms.emplace_back(tok.text);
+    out.positions.push_back(pos);
+    out.starts.push_back(tok.startOffset);
+    out.ends.push_back(tok.endOffset);
+  }
+  return out;
 }
 
 }  // namespace
