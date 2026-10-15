@@ -16,6 +16,7 @@
 //   qb::sort(cur, "name_s", qb::ASC);
 
 #include <initializer_list>
+#include <optional>
 #include <span>
 #include <type_traits>
 #include <vector>
@@ -185,9 +186,11 @@ inline api::Query phraseText(std::pmr::memory_resource& mr, std::string_view fie
 
 inline api::Query knn(std::pmr::memory_resource& mr, std::string_view field,
                       std::span<const float> vec, int k, int nprobe = 0, bool exact = false,
-                      int refineCandidates = 0, float minScanFraction = 0) {
+                      int refineCandidates = 0, float minScanFraction = 0,
+                      std::optional<float> similarity = std::nullopt) {
   api::Query q;
   auto& kq = q.kind.emplace<api::KnnQuery>();
+  kq.similarity = similarity;
   kq.field = build::arenaStr(mr, field);
   auto& v = kq.query.emplace();
   auto& f32 = v.f32.emplace();

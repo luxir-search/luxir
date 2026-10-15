@@ -1152,6 +1152,8 @@ struct from<JSON, luxir::api::TopDocs> {
             util::from_json<O>(value.get_number, ctx, vit, vend);
           } else if (key == "get_scores") {
             util::from_json<O>(value.get_scores, ctx, vit, vend);
+          } else if (key == "min_score") {
+            util::from_json<O>(value.min_score, ctx, vit, vend);
           } else if (key == "fields") {
             decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.fields);
             glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
@@ -1463,6 +1465,8 @@ struct from<JSON, luxir::api::SearchRequest> {
             util::from_json<O>(shorthand().get_number, ctx, vit, vend);
           } else if (key == "get_scores") {
             util::from_json<O>(shorthand().get_scores, ctx, vit, vend);
+          } else if (key == "min_score") {
+            util::from_json<O>(shorthand().min_score, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

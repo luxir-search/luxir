@@ -155,6 +155,15 @@ message TopDocs {
   Diversify diversify = 12; // Incompatible with collapse; found counts capped documents.
   Collapse collapse = 11; // limit, offset and found count groups; found_docs counts eligible documents.
 
+  // Minimum score cut-off. When set, documents whose query score is below
+  // this value do not match: they are excluded from the returned documents,
+  // from the get_number count, and from the domain of ops (facets and
+  // metrics). The score compared is the query's own relevance score (filters
+  // do not score), computed even when the request sorts by fields or does not
+  // return scores. Must be finite. As a Fusion source, the cut-off applies to
+  // that source's ranked list.
+  optional float min_score = 14;
+
   map<string, SearchOp> ops = 15;  // sub-facets or search operations performed over docs that match this query.
 }
 
@@ -304,6 +313,11 @@ message RescoreQuery {
   Query query = 1;
   string expr = 2;
   map<string, Val> vars = 3;
+
+  // Minimum rescored value. Documents whose expression output is below it do
+  // not match, in scored and unscored (filter) positions alike. Compared
+  // before any enclosing boost. Must be finite.
+  optional float min_score = 4;
 }
 
 // Nearest-neighbor query against a searchable vector field. Search is exact
@@ -332,6 +346,13 @@ message KnnQuery {
   // the enclosing top_docs collapse key and missing policy; requires collapse.
   // The match set contains one best scored witness per selected group.
   string unit = 7;
+
+  // Minimum vector similarity for a hit, in the metric's own space (not the
+  // transformed score): for l2 the maximum L2 distance (not squared), for ip
+  // the minimum dot product, for cosine the minimum cosine similarity. Hits
+  // beyond it are dropped from the k nearest, so fewer than k may match.
+  // Compared before any enclosing boost. Must be finite; l2 requires >= 0.
+  optional float similarity = 8;
 
   // Search effort for IVF indexes.
   message Ivf {

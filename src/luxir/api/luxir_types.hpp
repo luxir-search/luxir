@@ -479,6 +479,7 @@ struct KnnQuery {                                                // needs Vector
   std::string_view field;
   std::optional<Vector> query;
   std::optional<Ivf> ivf;
+  std::optional<float> similarity;
   int32_t k = 0;
   int32_t refine_candidates = 0;
   bool exact = false;
@@ -559,6 +560,7 @@ struct TopDocs {                                                 // all indirect
   std::span<const std::string_view> fields;
   std::span<const SortSpec> sort;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+  std::optional<float> min_score;
   int32_t batch_size = 0;
   ::hpp_proto::optional_indirect_view<Collapse> collapse;
   ::hpp_proto::optional_indirect_view<Diversify> diversify;
@@ -752,6 +754,7 @@ struct RescoreQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::string_view expr;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
+  std::optional<float> min_score;
 };
 struct SimpleQuery {
   using Operator = luxir::api::Match_::Operator;
