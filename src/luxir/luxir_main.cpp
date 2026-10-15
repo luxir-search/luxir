@@ -13,6 +13,7 @@
 #include "luxir/luxir_main.h"
 #include "luxir/server/Promotion.h"
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/util/LogFormatter.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/HttpServer.h"
@@ -72,7 +73,7 @@ public:
 } // namespace
 
 int luxir_main(int argc, char** argv) {
-  spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");
+  spdlog::set_formatter(std::make_unique<LogFormatter>());
 
   CLI::App app{"Luxir search engine"};
   app.set_version_flag("--version", "Luxir " LUXIR_VERSION " (" LUXIR_CPU_NAME ")");

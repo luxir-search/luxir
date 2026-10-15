@@ -58,6 +58,7 @@ public:
 
   ProtoUpdateMessage(const RequestProto* req, ResponseProto* rsp=nullptr)
     : response(rsp), req(req), dateMathNowEpochMillis(currentEpochMillis()) {
+    result.context = {"update", {}, req->collection, req->request_id};
     if (response != nullptr) {
       // A caller-supplied response (unary path) gets the same initialization an
       // on-demand one gets in getResponse().
