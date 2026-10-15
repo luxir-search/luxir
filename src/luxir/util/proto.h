@@ -78,7 +78,8 @@ inline void releaseArena(google::protobuf::Arena* arena) {
 /// itself uses for map entries in CreateInArenaStorage).  If the ctor throws, C++ unwinds the
 /// subobjects that were already built and the only thing "leaked" is the raw sizeof(T) bump
 /// region, which the arena reclaims wholesale at reset.  So ctors of arena objects are free
-/// to throw - there is no nothrow requirement.
+/// to throw - there is no nothrow requirement. If registering cleanup fails after
+/// construction, destroy the object immediately so its owned resources are reclaimed.
 ///
 /// T is placement-new'd into arena storage and never freed with delete, so `arena` must be a
 /// real arena (the reference makes that a contract, not a runtime check).  Trivially
@@ -88,7 +89,12 @@ T* arenaCreate(google::protobuf::Arena& arena, Args&&... args) {
   void* p = arena.AllocateAligned(sizeof(T), alignof(T));
   T* obj = new (p) T(std::forward<Args>(args)...);
   if constexpr (!std::is_trivially_destructible_v<T>) {
-    arena.OwnDestructor(obj);
+    try {
+      arena.OwnDestructor(obj);
+    } catch (...) {
+      obj->~T();
+      throw;
+    }
   }
   return obj;
 }

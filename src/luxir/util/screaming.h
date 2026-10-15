@@ -1104,22 +1104,23 @@ protected:
   */
 };
 
-class StringStreamBuilder : public Builder<StringStreamBuilder> {
+// Construct storage before the Builder view, and release every allocation even
+// when construction or flush() throws. Descriptor blocks can outlive flush().
+class StringStreamStorage {
+protected:
+  std::pmr::monotonic_buffer_resource storage;
+  explicit StringStreamStorage(std::pmr::memory_resource* upstream) : storage(upstream) {}
+};
+
+class StringStreamBuilder : private StringStreamStorage, public Builder<StringStreamBuilder> {
   friend class screaming::Builder<StringStreamBuilder>;
-  std::pmr::memory_resource* resource;
   std::ostringstream& out;
 public:
   explicit StringStreamBuilder(std::ostringstream& target, std::pmr::memory_resource* resource = std::pmr::get_default_resource()) :
-          Builder(resource->allocate(BitSet::SPARSE_CONTAINER_SIZE), resource->allocate(BitSet::DENSE_CONTAINER_SIZE), resource->allocate(SCRATCH_SIZE), SCRATCH_SIZE),
-          resource(resource),
+          StringStreamStorage(resource),
+          Builder(storage.allocate(BitSet::SPARSE_CONTAINER_SIZE), storage.allocate(BitSet::DENSE_CONTAINER_SIZE), storage.allocate(SCRATCH_SIZE), SCRATCH_SIZE),
           out(target)
   {
-  }
-
-  ~StringStreamBuilder() {
-    resource->deallocate(startScratch, SCRATCH_SIZE);
-    resource->deallocate((void *) bits.words, BitSet::DENSE_CONTAINER_SIZE);
-    resource->deallocate(values, BitSet::SPARSE_CONTAINER_SIZE);
   }
 
 protected:
@@ -1129,12 +1130,11 @@ protected:
   }
 
   void *allocateScratch() {
-    return resource->allocate(scratchSize);
+    return storage.allocate(scratchSize);
   }
 
-  void deallocateScratch(void* ptr) {
-    resource->deallocate(ptr, scratchSize);
-  }
+  // The storage owner reclaims these even if flush() never completes.
+  void deallocateScratch(void*) {}
 
 };
 

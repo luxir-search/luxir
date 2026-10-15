@@ -25,7 +25,6 @@ defaults and constraints are described in the comments and guides.
 
 | Method | Request | Response | Description |
 |---|---|---|---|
-| <a id="method-luxir.admin.waitforreplicas"></a>[`WaitForReplicas`](#method-luxir.admin.waitforreplicas) | [`WaitForReplicasRequest`](#message-luxir.waitforreplicasrequest) | [`WaitForReplicasResponse`](#message-luxir.waitforreplicasresponse) |  |
 | <a id="method-luxir.admin.setschema"></a>[`SetSchema`](#method-luxir.admin.setschema) | [`SchemaRequest`](#message-luxir.schemarequest) | [`SchemaResponse`](#message-luxir.schemaresponse) |  |
 | <a id="method-luxir.admin.getschema"></a>[`GetSchema`](#method-luxir.admin.getschema) | [`SchemaRequest`](#message-luxir.schemarequest) | [`SchemaResponse`](#message-luxir.schemaresponse) |  |
 | <a id="method-luxir.admin.createcollection"></a>[`CreateCollection`](#method-luxir.admin.createcollection) | [`CreateCollectionRequest`](#message-luxir.createcollectionrequest) | [`CreateCollectionResponse`](#message-luxir.createcollectionresponse) |  |
@@ -119,6 +118,7 @@ defaults and constraints are described in the comments and guides.
 - [`JemallocStats`](#message-luxir.jemallocstats)
 - [`KnnQuery`](#message-luxir.knnquery)
 - [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf)
+- [`LinearFusion`](#message-luxir.linearfusion)
 - [`ListCollectionsResponse`](#message-luxir.listcollectionsresponse)
 - [`ListTenantsResponse`](#message-luxir.listtenantsresponse)
 - [`Map`](#message-luxir.map)
@@ -165,8 +165,6 @@ defaults and constraints are described in the comments and guides.
 - [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror)
 - [`Val`](#message-luxir.val)
 - [`Vector`](#message-luxir.vector)
-- [`WaitForReplicasRequest`](#message-luxir.waitforreplicasrequest)
-- [`WaitForReplicasResponse`](#message-luxir.waitforreplicasresponse)
 - [`Warning`](#message-luxir.warning)
 - [`WildcardQuery`](#message-luxir.wildcardquery)
 
@@ -602,6 +600,8 @@ Parameters governing how a commit is performed. Presence of this message in an U
 | <a id="field-luxir.createcollectionrequest.name"></a>[`name`](#field-luxir.createcollectionrequest.name) | 1 | `string` | singular |  |
 | <a id="field-luxir.createcollectionrequest.schema"></a>[`schema`](#field-luxir.createcollectionrequest.schema) | 2 | [`SchemaDef`](#message-luxir.schemadef) | singular |  |
 | <a id="field-luxir.createcollectionrequest.tenant"></a>[`tenant`](#field-luxir.createcollectionrequest.tenant) | 3 | `string` | singular | Administration only: the owning tenant. Empty is the caller's tenant (the default tenant until credentials carry one). |
+| <a id="field-luxir.createcollectionrequest.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.createcollectionrequest.wait_for_replicas) | 4 | [`ReplicaRequirement`](#message-luxir.replicarequirement) | singular | All counts live followers subscribed to the tenant that serve any collection, since none serves the new one yet. |
+| <a id="field-luxir.createcollectionrequest.wait_for_replicas_timeout_ms"></a>[`wait_for_replicas_timeout_ms`](#field-luxir.createcollectionrequest.wait_for_replicas_timeout_ms) | 5 | `uint64` | optional | absent = 30000 |
 
 <a id="message-luxir.createcollectionresponse"></a>
 
@@ -613,6 +613,7 @@ Parameters governing how a commit is performed. Presence of this message in an U
 |---|---|---|---|---|
 | <a id="field-luxir.createcollectionresponse.commit"></a>[`commit`](#field-luxir.createcollectionresponse.commit) | 2 | `string` | singular | exact snapshot published by creation |
 | <a id="field-luxir.createcollectionresponse.name"></a>[`name`](#field-luxir.createcollectionresponse.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.createcollectionresponse.replicas"></a>[`replicas`](#field-luxir.createcollectionresponse.replicas) | 3 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
 
 <a id="message-luxir.deletecollectionrequest"></a>
 
@@ -883,7 +884,7 @@ Hybrid-search fusion: run several source queries (each a full TopDocs spec) and 
 
 **oneof `method`:** at most one member can be set.
 
-Required fusion method.
+Required fusion method: exactly one.
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
@@ -891,6 +892,7 @@ Required fusion method.
 | <a id="field-luxir.fusion.filter"></a>[`filter`](#field-luxir.fusion.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated | Filters applied to every source. except\_ops is not supported here or in source filters. |
 | <a id="field-luxir.fusion.limit"></a>[`limit`](#field-luxir.fusion.limit) | 3 | `sint64` | optional | Maximum fused documents to return. Unset = 10; 0 = none; -1 = all remaining. |
 | <a id="field-luxir.fusion.rrf"></a>[`rrf`](#field-luxir.fusion.rrf) | 10 | [`RrfFusion`](#message-luxir.rrffusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
+| <a id="field-luxir.fusion.linear"></a>[`linear`](#field-luxir.fusion.linear) | 11 | [`LinearFusion`](#message-luxir.linearfusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
 | <a id="field-luxir.fusion.offset"></a>[`offset`](#field-luxir.fusion.offset) | 4 | `int64` | singular | Response shape (mirrors TopDocs). Zero-based rank of the first returned fused document; must be &gt;= 0. Return up to limit after skipping. Source limits remain candidate-pool sizes: paging cannot reach beyond the union of their ranked windows. Each response DocList.offset is the absolute rank of that batch's first row, or the requested offset for an empty page. |
 | <a id="field-luxir.fusion.get_number"></a>[`get_number`](#field-luxir.fusion.get_number) | 5 | `bool` | singular | return the number of distinct documents in the source union |
 | <a id="field-luxir.fusion.get_scores"></a>[`get_scores`](#field-luxir.fusion.get_scores) | 6 | `bool` | singular |  |
@@ -898,6 +900,7 @@ Required fusion method.
 | <a id="field-luxir.fusion.batch_size"></a>[`batch_size`](#field-luxir.fusion.batch_size) | 8 | `int32` | singular | same batching rules as TopDocs.batch\_size |
 | <a id="field-luxir.fusion.document_format"></a>[`document_format`](#field-luxir.fusion.document_format) | 9 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
 | <a id="field-luxir.fusion.ops"></a>[`ops`](#field-luxir.fusion.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Runs over the union of filtered source ranked lists, as counted by found. Fusion limit and offset do not affect this candidate domain. |
+| <a id="field-luxir.fusion.weights"></a>[`weights`](#field-luxir.fusion.weights) | 16 | map&lt;`string`, `double`&gt; | map | Per-source weights keyed by source name, used by the fusion method. A source without an entry has weight 1. Weights must be finite and &gt;= 0, every key must name a source, and at least one source must have a weight &gt; 0. A zero weight disables its source: it is not executed and its documents do not enter the fused list, found, or the ops domain. |
 
 <a id="message-luxir.fuzzyquery"></a>
 
@@ -1032,6 +1035,18 @@ Search effort for IVF indexes.
 |---|---|---|---|---|
 | <a id="field-luxir.knnquery.ivf.nprobe"></a>[`nprobe`](#field-luxir.knnquery.ivf.nprobe) | 1 | `int32` | singular | Merge-stable IVF effort: lists to probe if this field were one IVF index with nlist=sqrt(live vectors). 0 = adaptive default; positive values cap search effort. |
 | <a id="field-luxir.knnquery.ivf.min_scan_fraction"></a>[`min_scan_fraction`](#field-luxir.knnquery.ivf.min_scan_fraction) | 2 | `float` | singular | Minimum fraction of live vectors to scan, in \[0,1\]. 0 = no floor. |
+
+<a id="message-luxir.linearfusion"></a>
+
+### luxir.LinearFusion
+
+Weighted linear fusion of normalized scores: fused\_score(d) = sum over sources s of weight\_s \* normalized\_s(d), where weight\_s comes from Fusion.weights and sources without d contribute nothing. Each source's scores are normalized over its ranked list after merging across segments. Sources must rank by relevance score: a source with a sort other than score descending (optionally followed by \_docid\_ ascending) is rejected.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.linearfusion.normalization"></a>[`normalization`](#field-luxir.linearfusion.normalization) | 1 | [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization) | singular | unset selects MIN\_MAX |
 
 <a id="message-luxir.listcollectionsresponse"></a>
 
@@ -1408,13 +1423,13 @@ Full catalog for a discovery cursor, scoped to this source boot.
 
 ### luxir.RrfFusion
 
-Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of 1 / (k + rank\_s(d)), where rank\_s(d) is d's 1-based rank in source s (or omitted if d does not appear in s). k=60 is the standard default.
+Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k + rank\_s(d)), where rank\_s(d) is d's 1-based rank in source s (sources without d contribute nothing) and weight\_s comes from Fusion.weights.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.rrffusion.k"></a>[`k`](#field-luxir.rrffusion.k) | 1 | `int32` | singular | 0 means use default (60) |
+| <a id="field-luxir.rrffusion.k"></a>[`k`](#field-luxir.rrffusion.k) | 1 | `int32` | optional | rank-smoothing constant, &gt;= 0; unset selects 60 |
 
 <a id="message-luxir.schemadef"></a>
 
@@ -1439,6 +1454,8 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of 1 / (k + rank\_s
 | <a id="field-luxir.schemarequest.tenant"></a>[`tenant`](#field-luxir.schemarequest.tenant) | 4 | `string` | singular | Administration only: the owning tenant. Empty is the caller's tenant. |
 | <a id="field-luxir.schemarequest.mode"></a>[`mode`](#field-luxir.schemarequest.mode) | 2 | [`SchemaRequest.Mode`](#enum-luxir.schemarequest.mode) | singular |  |
 | <a id="field-luxir.schemarequest.schema"></a>[`schema`](#field-luxir.schemarequest.schema) | 3 | [`SchemaDef`](#message-luxir.schemadef) | singular |  |
+| <a id="field-luxir.schemarequest.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.schemarequest.wait_for_replicas) | 5 | [`ReplicaRequirement`](#message-luxir.replicarequirement) | singular | Updates only: as CommitParams.wait\_for\_replicas. |
+| <a id="field-luxir.schemarequest.wait_for_replicas_timeout_ms"></a>[`wait_for_replicas_timeout_ms`](#field-luxir.schemarequest.wait_for_replicas_timeout_ms) | 6 | `uint64` | optional | absent = 30000 |
 
 <a id="message-luxir.schemaresponse"></a>
 
@@ -1450,6 +1467,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of 1 / (k + rank\_s
 |---|---|---|---|---|
 | <a id="field-luxir.schemaresponse.commit"></a>[`commit`](#field-luxir.schemaresponse.commit) | 2 | `string` | singular | exact snapshot published by a schema update |
 | <a id="field-luxir.schemaresponse.schema"></a>[`schema`](#field-luxir.schemaresponse.schema) | 1 | [`SchemaDef`](#message-luxir.schemadef) | singular | the resulting schema after the operation |
+| <a id="field-luxir.schemaresponse.replicas"></a>[`replicas`](#field-luxir.schemaresponse.replicas) | 3 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
 
 <a id="message-luxir.searchop"></a>
 
@@ -1768,30 +1786,6 @@ A dense vector value. Dimensionality is the number of elements in f32.v.
 |---|---|---|---|---|
 | <a id="field-luxir.vector.f32"></a>[`f32`](#field-luxir.vector.f32) | 1 | [`ArrFloat`](#message-luxir.arrfloat) | oneof [`kind`](#oneof-luxir.vector.kind) |  |
 
-<a id="message-luxir.waitforreplicasrequest"></a>
-
-### luxir.WaitForReplicasRequest
-
-[Source](../../protos/luxir_types.proto)
-
-| Field | Number | Type | Cardinality / group | Description |
-|---|---|---|---|---|
-| <a id="field-luxir.waitforreplicasrequest.collection"></a>[`collection`](#field-luxir.waitforreplicasrequest.collection) | 1 | `string` | singular | empty selects main |
-| <a id="field-luxir.waitforreplicasrequest.commit"></a>[`commit`](#field-luxir.waitforreplicasrequest.commit) | 2 | `string` | singular | existing durable commit token |
-| <a id="field-luxir.waitforreplicasrequest.wait_for_replicas"></a>[`wait_for_replicas`](#field-luxir.waitforreplicasrequest.wait_for_replicas) | 3 | [`ReplicaRequirement`](#message-luxir.replicarequirement) | singular |  |
-| <a id="field-luxir.waitforreplicasrequest.wait_for_replicas_timeout_ms"></a>[`wait_for_replicas_timeout_ms`](#field-luxir.waitforreplicasrequest.wait_for_replicas_timeout_ms) | 4 | `uint64` | optional | absent = 30000 |
-
-<a id="message-luxir.waitforreplicasresponse"></a>
-
-### luxir.WaitForReplicasResponse
-
-[Source](../../protos/luxir_types.proto)
-
-| Field | Number | Type | Cardinality / group | Description |
-|---|---|---|---|---|
-| <a id="field-luxir.waitforreplicasresponse.commit"></a>[`commit`](#field-luxir.waitforreplicasresponse.commit) | 1 | `string` | singular |  |
-| <a id="field-luxir.waitforreplicasresponse.replicas"></a>[`replicas`](#field-luxir.waitforreplicasresponse.replicas) | 2 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
-
 <a id="message-luxir.warning"></a>
 
 ### luxir.Warning
@@ -1826,6 +1820,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`FieldDef.FieldClass`](#enum-luxir.fielddef.fieldclass)
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
+- [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
 - [`Match.Operator`](#enum-luxir.match.operator)
 - [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
 - [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
@@ -1927,6 +1922,16 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.fielddef.longterms.truncate"></a>[`TRUNCATE`](#value-luxir.fielddef.longterms.truncate) | 0 | keep a UTF-8-safe prefix of at most 255 bytes; values may merge |
 | <a id="value-luxir.fielddef.longterms.reject"></a>[`REJECT`](#value-luxir.fielddef.longterms.reject) | 1 | reject overlong terms |
 | <a id="value-luxir.fielddef.longterms.hash128"></a>[`HASH128`](#value-luxir.fielddef.longterms.hash128) | 2 | prefix of at most 230 bytes plus 25 base36 hash digits |
+
+<a id="enum-luxir.linearfusion.normalization"></a>
+
+### luxir.LinearFusion.Normalization
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.linearfusion.normalization.min_max"></a>[`MIN_MAX`](#value-luxir.linearfusion.normalization.min_max) | 0 | (score - min) / (max - min) over the source's ranked list, so its best document gets 1 and its worst gets 0. A list whose scores are all equal (including a single document) normalizes every document to 1. NaN scores contribute 0 and are left out of min and max; +inf normalizes to 1 and -inf to 0. |
 
 <a id="enum-luxir.match.operator"></a>
 

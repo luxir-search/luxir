@@ -24,6 +24,12 @@ struct ServerConfig {
     // An explicit --server.grpc.port / -p overrides.
     int port = -1;
     int threads = 0;  // 0 = auto
+    // Max size of one received gRPC message (a unary request or one message of
+    // a stream).  Larger messages fail with RESOURCE_EXHAUSTED before they are
+    // decoded.  0 = inherit ingest.max_request_body, so the gRPC and HTTP
+    // buffered-request ceilings move together.  Values above INT_MAX (gRPC's
+    // own ceiling) are clamped by the server.
+    int64_t max_receive_message_size = 0;
 
     /// Resolve threads: 0 means auto (affinity-aware concurrency / 2, minimum 1).
     int resolveThreads() const {
@@ -87,7 +93,8 @@ struct IngestConfig {
 
   // Max size of a single buffered (non-streaming) request body - e.g. a /update
   // carrying an all_or_none request, or a /query.  Oversized -> 413, rejected at the
-  // JSON layer (gRPC has its own max message size).  A whole such request lands in one
+  // JSON layer.  It is also the default gRPC max receive message size (see
+  // ServerConfig::Grpc::max_receive_message_size).  A whole such request lands in one
   // inverter, so this is also what bounds a single non-streaming update's RAM.
   // Keep it GENEROUS: a low limit is a trap - it passes in testing and fails fatally
   // in production on a larger doc or atomic batch.  A future goal is to GUARANTEE a
@@ -144,7 +151,7 @@ struct ReplicationConfig {
   uint64_t pin_retained_bytes = 1024ULL * 1024 * 1024;
   int64_t follower_timeout_ms = 90'000;
   std::string source;
-  std::string follower_id;
+  std::string follower_id; // empty: host:port of this node's listener
   std::string tenants; // comma-separated; empty subscribes to every tenant
   // Comma-separated http:// nodes that serve verified file copies, tried in
   // order before the source; they never decide which commit is current.

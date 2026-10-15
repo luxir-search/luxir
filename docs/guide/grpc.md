@@ -108,6 +108,17 @@ completion timing. Responses may complete out of request order.
 Send documents through the repeated `docs` row maps. Row maps use the field
 coercion, update, and commit semantics described in [Indexing](indexing.md).
 
+## Message size
+
+Each received message, a unary request or one message of a stream, is
+limited to `--server.grpc.max-receive-message-size`, which defaults to
+`--indexing.max-request-body` (32 MiB). A larger message is rejected before it
+is decoded: the call ends with `RESOURCE_EXHAUSTED` and a message naming both
+sizes, and nothing in it is applied. Batch documents so each `UpdateRequest`
+stays below the limit, or send many messages over `Indexer.UpdateStream`;
+there is no limit on the number of messages in a stream. See
+[Operating Luxir](operations.md#indexing-memory-and-request-limits).
+
 ## Errors
 
 A unary method fails with a gRPC status whose code follows the error's

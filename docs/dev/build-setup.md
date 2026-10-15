@@ -134,7 +134,8 @@ ASan build trees too, reapplying local CMake options. This clears cached paths
 to the old host tools. The disk-space saving occurs during this migration.
 
 The project uses CMake (Ninja generator) with vcpkg. ccache, a fast linker
-(mold), and a precompiled header are used when available. Each preset builds
+(mold 2.31.0 or newer, else lld or gold), and a precompiled header are used
+when available. Each preset builds
 into `build/<preset-name>/`, with binaries in `build/<preset-name>/bin/`.
 
 The presets are GCC-only. Clang presets existed but were never usable: FAISS and

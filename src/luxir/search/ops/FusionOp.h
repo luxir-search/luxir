@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
+#include <limits>
+#include <span>
 #include <vector>
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -25,10 +28,17 @@ namespace luxir {
 
 // Hybrid-search fusion: runs N named source queries (each a full TopDocs)
 // across all segments and merges their per-source ranked lists into one
-// fused list.  V1 implements Reciprocal Rank Fusion: fused_score(d) =
-// sum over sources s of 1 / (k + rank_s(d)), where rank_s(d) is d's
-// 1-based rank in source s's ranked output (0 if d does not appear).
-// Standard k = 60.
+// fused list.  Two methods, both weighted per source (sources without d
+// contribute nothing):
+//  - Reciprocal Rank Fusion: fused_score(d) = sum over sources s of
+//    weight_s / (k + rank_s(d)), where rank_s(d) is d's 1-based rank in
+//    source s's ranked output.  k defaults to 60.
+//  - Linear: fused_score(d) = sum over sources s of
+//    weight_s * normalized_s(d), where normalized_s rescales source s's
+//    scores over its merged ranked list (see minMaxNormalize).  Sources rank
+//    by relevance score; the parser rejects field-sorted sources.
+// Weights default to 1.  The parser resolves Fusion.weights by name and
+// drops zero-weight sources, so every source here has a weight > 0.
 //
 // Each source is a child TopDocsReq with its rankingSink wired to deliver
 // the merged top-K back here.  This means TopDocsReq's per-segment
@@ -49,25 +59,34 @@ namespace luxir {
 // canEmitAsBucketChild).
 class FusionOp : public SearchOp {
 public:
+  // LINEAR_* methods name their score normalization.
+  enum class Method { RRF, LINEAR_MIN_MAX };
+
   const ReqFusion& fusionProto;
   // Each source is a full TopDocsReq parented to this FusionOp.  Their
   // rankingSinks are set by the parser to deliver to FusionOp::Calc.
   std::vector<TopDocsReq*> sources;
+  // Fusion weight per source, parallel to `sources`; every entry is > 0.
+  std::vector<double> sourceWeights;
   int64_t topCount; // Collection depth (offset + page size, capped by maxDoc).
   std::span<ParsedFilter> filters;  // shared fusion-level filters
   std::span<Query::Weight*> filterWeights;
   std::span<FilterCache::Use*> filterUses;
-  int32_t rrfK = 60;
+  Method method = Method::RRF;
+  int32_t rrfK = 60;  // RRF only
 
   // ProtobufSearchParser builds each source TopDocsReq (with rankingSink wired)
   // and the filter weights, then passes them in (see TopDocsReq's ctor comment).
   FusionOp(SearchRequest& req, std::string_view name, const ReqFusion& fusionProto,
-           std::vector<TopDocsReq*>&& sources, int64_t topCount,
+           std::vector<TopDocsReq*>&& sources,
+           std::vector<double>&& sourceWeights, int64_t topCount,
            std::span<ParsedFilter> filters,
-           std::span<Query::Weight*> filterWeights, int32_t rrfK)
+           std::span<Query::Weight*> filterWeights, Method method, int32_t rrfK)
     : SearchOp(req, name), fusionProto(fusionProto),
-      sources(std::move(sources)), topCount(topCount), filters(filters),
-      filterWeights(filterWeights), rrfK(rrfK) {
+      sources(std::move(sources)), sourceWeights(std::move(sourceWeights)),
+      topCount(topCount), filters(filters),
+      filterWeights(filterWeights), method(method), rrfK(rrfK) {
+    assert(this->sourceWeights.size() == this->sources.size());
     if (!filterWeights.empty()) {
       assert(!this->sources.empty());
       assert(filterWeights.size() == filters.size());
@@ -75,6 +94,39 @@ public:
       filterUses = context.pool.make_span<FilterCache::Use*>(filters.size());
       for (size_t i = 0; i < filters.size(); i++) {
         filterUses[i] = context.getFilterUse(*filters[i].query);
+      }
+    }
+  }
+
+  // Min-max normalize one source's merged ranked scores in place:
+  // (score - min) / (max - min), so the source's best document gets 1 and its
+  // worst gets 0.  min and max cover the finite scores only.  When they are
+  // equal (a constant-score or single-document list) or absent, every finite
+  // score normalizes to 1: each listed document is a top match of its source.
+  // Non-finite scores are mapped before the arithmetic: NaN contributes 0
+  // (the document stays a candidate), +inf normalizes to 1 and -inf to 0.
+  // Callers pass the list after the cross-segment merge, never a per-segment
+  // list, so the result does not depend on how documents are partitioned.
+  static void minMaxNormalize(std::span<float> scores) {
+    float lo = std::numeric_limits<float>::infinity();
+    float hi = -lo;
+    for (float score : scores) {
+      if (std::isfinite(score)) {
+        lo = std::min(lo, score);
+        hi = std::max(hi, score);
+      }
+    }
+    // double: hi - lo can exceed the float range.
+    double range = (double)hi - (double)lo;
+    for (float& score : scores) {
+      if (std::isnan(score)) {
+        score = 0;
+      } else if (std::isinf(score)) {
+        score = score > 0 ? 1.0f : 0.0f;
+      } else if (range > 0) {
+        score = (float)(((double)score - (double)lo) / range);
+      } else {
+        score = 1;
       }
     }
   }
@@ -117,7 +169,7 @@ public:
     // Index parallel to op.sources.  Null entries mean the empty-index
     // path or an all-segments-empty source.
     std::vector<MergeableCollector*> deliveredCollectors;
-    // RRF-merged (segdoc, fused score) list, sorted; backs the emitter's
+    // Fused (segdoc, fused score) list, sorted; backs the emitter's
     // getDoc/getScore callbacks, which can outlive doFusion (paused emitter).
     std::vector<std::pair<segdoc, float>> fusedList;
 
@@ -324,38 +376,63 @@ public:
       }
     };
 
-    // RRF merge across the per-source ranked lists, then emit a fused
-    // DocList via the shared streaming emitter.
+    // Fuse the per-source ranked lists, then emit a fused DocList via the
+    // shared streaming emitter.
     void doFusion() {
       auto& op = thisOp();
-      int32_t k = op.rrfK;
+      bool linear = op.method != Method::RRF;
 
-      // Pull each source's ranked docs out of its delivered collector.
+      // Pull each source's ranked docs out of its delivered collector.  Each
+      // collector has already merged every segment, so linear fusion
+      // normalizes over the source's whole ranked list.  Field-sorted
+      // collectors carry no relevance score; only RRF accepts them.
       std::vector<std::vector<segdoc>> rankedPerSource;
+      std::vector<std::vector<float>> scoresPerSource;
       rankedPerSource.reserve(op.sources.size());
+      scoresPerSource.reserve(op.sources.size());
       for (size_t s = 0; s < op.sources.size(); s++) {
         auto* mc = deliveredCollectors[s];
         std::vector<segdoc> docs;
+        std::vector<float> scores;
         if (mc != nullptr) {
           if (mc->useFieldSort) {
+            assert(!linear);
             auto sortDocs = mc->fieldCollector->sort();
             docs.reserve(sortDocs.size());
             for (auto& sd : sortDocs) docs.push_back(sd.doc);
           } else {
             auto scoreDocs = mc->scoreCollector->sort();
             docs.reserve(scoreDocs.size());
-            for (auto& sd : scoreDocs) docs.push_back(sd.doc);
+            if (linear) scores.reserve(scoreDocs.size());
+            for (auto& sd : scoreDocs) {
+              docs.push_back(sd.doc);
+              if (linear) scores.push_back(sd.score);
+            }
           }
         }
+        if (op.method == Method::LINEAR_MIN_MAX) minMaxNormalize(scores);
         rankedPerSource.emplace_back(std::move(docs));
+        scoresPerSource.emplace_back(std::move(scores));
       }
 
-      // Accumulate fused scores by segdoc.
+      // Accumulate fused scores by segdoc.  Every listed doc enters `fused`,
+      // even with a zero contribution, so the candidate set (found and the
+      // ops domain) is the union of the source lists for every method.
       boost::unordered_flat_map<segdoc, float, SegdocHash> fused;
-      for (auto& ranked : rankedPerSource) {
+      for (size_t s = 0; s < rankedPerSource.size(); s++) {
+        auto& ranked = rankedPerSource[s];
+        if (linear) {
+          double weight = op.sourceWeights[s];
+          auto& normalized = scoresPerSource[s];
+          for (size_t i = 0; i < ranked.size(); i++) {
+            fused[ranked[i]] += (float)(weight * (double)normalized[i]);
+          }
+          continue;
+        }
+        float weight = (float)op.sourceWeights[s];
         for (int32_t rank = 0; rank < (int32_t)ranked.size(); rank++) {
-          // 1-based rank; RRF: 1 / (k + rank).
-          float contrib = 1.0f / (float)((int64_t)k + rank + 1);
+          // 1-based rank; weighted RRF: weight / (k + rank).
+          float contrib = weight / (float)((int64_t)op.rrfK + rank + 1);
           fused[ranked[rank]] += contrib;
         }
       }

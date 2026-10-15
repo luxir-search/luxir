@@ -228,3 +228,29 @@ TEST_F(UtilTest, arenaCreateExceptionSafe) {
   EXPECT_EQ(arenaDtors, 1);    // only ~Tracked, never ~Boom
   EXPECT_EQ(memberDtors, 2);   // Boom::m (unwind) + Tracked::m (reset)
 }
+
+TEST_F(UtilTest, arenaCreateCleanupRegistrationFailure) {
+  // The real protobuf allocator needs another block for its first cleanup node.
+  static thread_local bool rejectBlock = false;
+  google::protobuf::ArenaOptions options;
+  options.block_alloc = [](size_t bytes) -> void* {
+    if (rejectBlock) throw std::bad_alloc();
+    return ::operator new(bytes);
+  };
+  options.block_dealloc = [](void* ptr, size_t bytes) { ::operator delete(ptr, bytes); };
+  struct Owner {
+    std::unique_ptr<char[]> bytes = std::make_unique<char[]>(4096);
+    int& destroyed;
+    explicit Owner(int& destroyed) : destroyed(destroyed) { rejectBlock = true; }
+    ~Owner() { ++destroyed; }
+  };
+
+  int destroyed = 0;
+  {
+    google::protobuf::Arena arena(options);
+    auto reset = scope_guard([] { rejectBlock = false; });
+    EXPECT_THROW(arenaCreate<Owner>(arena, destroyed), std::bad_alloc);
+    EXPECT_EQ(1, destroyed);
+  }
+  EXPECT_EQ(1, destroyed); // Failed registration must not leave a second cleanup.
+}

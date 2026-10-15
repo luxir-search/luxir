@@ -63,7 +63,7 @@ namespace luxir::api {
 
 // ---- forward declarations (all messages) ----
 struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
-struct Fusion; struct RrfFusion; struct SortSpec; struct Query;
+struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning; struct Error;
@@ -95,6 +95,7 @@ enum class Kind {
   RESOURCE_EXHAUSTED = 5, UNAVAILABLE = 6, INTERNAL = 7
 };
 }
+namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
 namespace CalendarGap_ {
@@ -114,7 +115,11 @@ namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 
 // ===================== message definitions (strict topological order) =====================
 
-struct RrfFusion { int32_t k = 0; };
+struct RrfFusion { std::optional<int32_t> k; };
+struct LinearFusion {
+  using Normalization = luxir::api::LinearFusion_::Normalization;
+  Normalization normalization = Normalization::MIN_MAX;
+};
 struct CalendarGap {
   using Unit = luxir::api::CalendarGap_::Unit;
   int32_t n = 0;
@@ -148,12 +153,6 @@ struct PhraseQuery {
 };
 struct AllReplicas {};
 struct ReplicaRequirement { std::variant<std::monostate, uint32_t, AllReplicas> kind; };
-struct WaitForReplicasRequest {
-  std::string_view collection;
-  std::string_view commit;
-  std::optional<ReplicaRequirement> wait_for_replicas;
-  std::optional<uint64_t> wait_for_replicas_timeout_ms;
-};
 struct CommitParams {
   uint64_t commit_within_ms = 0;
   std::span<const std::string_view> build_aux_indexes;
@@ -180,11 +179,6 @@ struct ReplicaResult {
   std::optional<uint32_t> wanted;
   std::optional<uint32_t> serving;
   std::optional<Outcome> outcome;
-};
-
-struct WaitForReplicasResponse {
-  std::string_view commit;
-  std::optional<ReplicaResult> replicas;
 };
 
 struct CollectionCommit {
@@ -479,17 +473,21 @@ struct SchemaDef {
 struct ColVector { std::span<const Vector> v; };
 struct ArrVector { std::span<const Vector> v; };
 struct SchemaResponse {
-  std::string_view commit; std::optional<SchemaDef> schema; };      // needs SchemaDef
+  std::string_view commit; std::optional<SchemaDef> schema; std::optional<ReplicaResult> replicas; };  // needs SchemaDef
 struct SchemaRequest {                                           // needs SchemaDef
   using Mode = luxir::api::SchemaRequest_::Mode;
   std::string_view collection;
   std::string_view tenant;
   std::optional<SchemaDef> schema;
+  std::optional<ReplicaRequirement> wait_for_replicas;
+  std::optional<uint64_t> wait_for_replicas_timeout_ms;
   Mode mode = Mode::SET;                                      // align 4 (enum)
 };
-struct CreateCollectionRequest { std::string_view name; std::optional<SchemaDef> schema; std::string_view tenant; };
+struct CreateCollectionRequest {
+  std::string_view name; std::optional<SchemaDef> schema; std::string_view tenant;
+  std::optional<ReplicaRequirement> wait_for_replicas; std::optional<uint64_t> wait_for_replicas_timeout_ms; };
 struct CreateCollectionResponse {
-  std::string_view commit; std::string_view name; };
+  std::string_view commit; std::string_view name; std::optional<ReplicaResult> replicas; };
 struct DeleteCollectionRequest { std::string_view name; std::string_view tenant; };
 struct DeleteCollectionResponse { std::string_view name; };
 struct ListCollectionsResponse { std::span<const std::string_view> collections; };
@@ -527,14 +525,15 @@ struct TopDocs {                                                 // all indirect
   bool get_number = false;
   bool get_scores = false;
 };
-struct Fusion {                                                  // needs TopDocs, RrfFusion
+struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
   map_view<std::string_view, TopDocs> sources;
   std::span<const Filter> filter;
   std::optional<std::int64_t> limit;
   int64_t offset = 0;
   std::span<const std::string_view> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
-  std::optional<RrfFusion> rrf;                                  // align 4 (RrfFusion is one int32)
+  map_view<std::string_view, double> weights;
+  std::variant<std::monostate, RrfFusion, LinearFusion> method;  // align 4
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_number = false;
@@ -745,7 +744,7 @@ struct UpdateRequest {                                         // needs CommitPa
 // ===================== trivial-destructibility checks =====================
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
 LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
-LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
+LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
@@ -772,7 +771,7 @@ LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXI
 LUXIR_TD(JemallocStats) LUXIR_TD(MemoryStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
-LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(WaitForReplicasRequest) LUXIR_TD(WaitForReplicasResponse) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationInstalled)
+LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationInstalled)
 #undef LUXIR_TD
 
 // ===================== out-of-line codec entry-point declarations =====================
@@ -787,7 +786,7 @@ LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(WaitForReplicasReque
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,             \
                   std::string *error = nullptr);
 LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
-LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(SortSpec)
+LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(LinearFusion) LUXIR_ENTRY(SortSpec)
 LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
@@ -817,7 +816,7 @@ LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)
 LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(MemoryStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
-LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(WaitForReplicasRequest) LUXIR_ENTRY(WaitForReplicasResponse) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationInstalled)
+LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationInstalled)
 #undef LUXIR_ENTRY
 
 } // namespace luxir::api

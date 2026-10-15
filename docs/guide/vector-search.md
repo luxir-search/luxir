@@ -193,11 +193,13 @@ The same composition works under a boolean clause, so a vector query can be
 one required clause beside text and range clauses, or the query behind a
 [query facet](faceting.md#query-facets) bucket.
 
-## Hybrid search with RRF
+## Hybrid search
 
-A `fusion` operation ranks several sources independently and merges them with
-reciprocal rank fusion: each document scores `sum(1 / (k + rank))` over the
-sources that returned it, ranks starting at one. Rank fusion combines BM25 and
+A `fusion` operation ranks several sources independently and merges them into
+one list. It takes exactly one fusion method: `rrf` (reciprocal rank fusion,
+below) or `linear` (see [Linear fusion](#linear-fusion)). With reciprocal rank
+fusion each document scores `sum(weight / (k + rank))` over the sources that
+returned it, ranks starting at one. Rank fusion combines BM25 and
 vector similarity without converting them to a common score scale,
 and facets can be computed over the fused list:
 
@@ -288,7 +290,9 @@ has no root shorthand, so both request and response use named `ops`.
 |---|---|
 | `sources` | Named ranked inputs. Each takes its own `query`, `filter`, `sort`, and `limit`. |
 | `filter` | Shared by every source, computed once per segment; ANDed with each source's own filter. |
-| `rrf.k` | The rank-smoothing constant; `60` is the conventional choice. |
+| `weights` | Per-source weights keyed by source name; a source without an entry has weight `1`. |
+| `rrf.k` | The rank-smoothing constant, `>= 0`. Omitted selects `60`, the conventional choice. |
+| `linear.normalization` | Score normalization for [linear fusion](#linear-fusion); `min_max`, the default, is the only one today. |
 | `limit`, `offset`, `fields`, `get_scores`, `get_number`, `document_format` | Response shape, on the fusion, not on a source. |
 | `ops` | Facets and metrics over the fused candidate set. |
 
@@ -301,6 +305,93 @@ within the union of the source windows and does not enlarge them, so deep
 fusion paging needs larger source limits; per-source `offset` is ignored.
 Place `ops` on the fusion itself. For facets over a full text match set, put a
 sibling `top_docs` operation at the request root.
+
+### Source weights
+
+`weights` scales each source's contribution to `weight / (k + rank)`, so a
+source can count for more or less than the others without changing the
+candidate pools:
+
+```json
+{
+  "fusion": {
+    "sources": {
+      "lexical": {"query": {"match": {"title_t": "dune"}}, "limit": 100},
+      "semantic": {"query": {"knn": {"field": "embedding_v", "query": [0.75, 0.15, 0.10], "k": 100}}, "limit": 100}
+    },
+    "weights": {"lexical": 1, "semantic": 2},
+    "rrf": {}
+  }
+}
+```
+
+A document ranked first by both sources here scores `1/61 + 2/61`. Weights
+must be finite and `>= 0`, every key must name a source, and at least one
+source needs a weight above zero; anything else rejects the request. A weight
+of `0` disables its source: the source is not run, and its documents do not
+reach the fused list, `found`, or the fusion's `ops`. That lets a client turn
+a source off by configuration without rewriting the request.
+
+### Linear fusion
+
+`linear` combines the sources' scores instead of their ranks. Each source's
+scores are rescaled to `[0, 1]` over its ranked list, then summed with the
+source weights:
+
+```text
+normalized_s(d) = (score_s(d) - min_s) / (max_s - min_s)
+fused(d)        = sum over sources s of weight_s * normalized_s(d)
+```
+
+`min_s` and `max_s` are the lowest and highest scores in source `s`'s ranked
+list, that is its top `limit` documents after filters, merged across every
+segment. A source's best document gets `1` and its worst gets `0`, whatever
+the score scale: BM25, a dot product that can be negative, or a rescore
+expression. With two sources, weights `alpha` and `1 - alpha` give the
+familiar convex combination.
+
+```json
+{
+  "fusion": {
+    "sources": {
+      "lexical": {"query": {"match": {"title_t": "dune"}}, "limit": 100},
+      "semantic": {"query": {"knn": {"field": "embedding_v", "query": [0.75, 0.15, 0.10], "k": 100}}, "limit": 100}
+    },
+    "weights": {"lexical": 0.3, "semantic": 0.7},
+    "linear": {"normalization": "min_max"}
+  }
+}
+```
+
+`"linear": {}` selects the same `min_max` normalization. Edge cases:
+
+- A source that did not return a document contributes `0` to it.
+- A source with no documents contributes nothing.
+- A list whose scores are all equal, including a single document, normalizes
+  every document to `1`: each is the source's top match. A filter-like source
+  (say a `constant_score` query) therefore adds its full weight to every
+  document it returns.
+- Non-finite scores are mapped before `min_s` and `max_s` are taken, and
+  those cover only finite scores: `NaN` contributes `0` (the document stays a
+  candidate), `+inf` normalizes to `1`, and `-inf` to `0`.
+
+The candidate set is the same as with `rrf`: `found` and the fusion's `ops`
+see every document in any enabled source's list, including documents whose
+fused score is `0`. Ties in the fused score fall back to index order.
+
+Every source must rank by relevance score: a `sort` other than `score`
+descending (optionally followed by `_docid_` ascending) rejects the request,
+since a field-sorted list has no score to normalize. Use `rrf` to fuse sorted
+sources.
+
+Prefer `rrf` when the score distributions are unknown or unstable, when a
+source is field-sorted, or as a robust default that needs no tuning. Prefer
+`linear` when score magnitudes carry information that ranks discard (a clear
+winner in one source should beat a near tie in another) and you can tune the
+weights against relevance judgments. Min-max normalization is sensitive to
+outliers and to the pool size: one extreme score compresses the rest of its
+list, and a larger source `limit` usually lowers `min_s`, so retune weights
+after changing source limits.
 
 ## Approximate search
 

@@ -273,8 +273,11 @@ public:
   static SearchResponse* create(SearchRequest& req, bool last = true) {
     // If this is the last message, just use the same arena as the request since they will
     // have the same lifetimes.
-    auto* arena = last ? &req.arena : createArena();
-    return luxir::arenaCreate<SearchResponse>(*arena, req, *arena, last);
+    if (last) return luxir::arenaCreate<SearchResponse>(req.arena, req, req.arena, true);
+    std::unique_ptr<google::protobuf::Arena, decltype(&releaseArena)> arena(createArena(), releaseArena);
+    auto* response = luxir::arenaCreate<SearchResponse>(*arena, req, *arena, false);
+    arena.release(); // The completed response now carries ownership to reply().
+    return response;
   }
 
   // named columns, part of DocList or part of a FacetResult.

@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <limits>
 #include <map>
 #include <memory>
 #include <memory_resource>
@@ -16,6 +17,7 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/FilterCache.h"
+#include "luxir/search/ops/FusionOp.h"
 #include "luxir/server/LuxirNode.h"
 #include "luxir/server/JsonRequest.h"
 #include "test/CollectionHelper.h"
@@ -156,6 +158,13 @@ protected:
     for (float v : col->v) scores.push_back(v);
     return scores;
   }
+
+  // Bucket ids of the field facet "ids" on fusion "f".
+  static std::set<std::string_view> facetIds(LocalReq& req) {
+    const auto* ids = req.docList("f")->ops.at("ids")->facetResult();
+    const auto& v = std::get<api::ColStr>(ids->bucket_ids->kind).v;
+    return {v.begin(), v.end()};
+  }
 };
 
 
@@ -182,7 +191,7 @@ TEST_F(FusionOpTest, rrfTextAndKnn) {
   fusion.get_number = true;
   fusion.get_scores = true;
   addField(fusion, "id", mr);
-  fusion.rrf.emplace().k = 60;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
   setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
   setKnnSource(addSource(fusion, "vec", mr), mr, "embedding_v", {1, 0, 0}, 3);
 
@@ -235,7 +244,7 @@ TEST_F(FusionOpTest, sharedFilter) {
   fusion.get_number = true;
   fusion.get_scores = true;
   addField(fusion, "id", mr);
-  fusion.rrf.emplace().k = 60;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
 
   setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 10);
 
@@ -267,7 +276,7 @@ TEST_F(FusionOpTest, routedSharedFilterIsRejected) {
   lreq->collection("main");
   auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
-  fusion.rrf.emplace().k = 60;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
   setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 10);
   addFilter(fusion.filter, qb::match(mr, "color_s", "red"), mr, {"brands"});
 
@@ -287,7 +296,7 @@ TEST_F(FusionOpTest, routedSourceFilterHasNoTarget) {
   lreq->collection("main");
   auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
-  fusion.rrf.emplace().k = 60;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
   auto& source = addSource(fusion, "text", mr);
   setTextSource(source, mr, "foo_w", "apple", 10);
   addFilter(
@@ -338,7 +347,7 @@ TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
   fusion.limit = 10;
   fusion.get_number = true;
   addField(fusion, "id", mr);
-  fusion.rrf.emplace().k = 60;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
 
   auto& countSource = addSource(fusion, "count", mr);
   countSource.limit = 0;
@@ -379,7 +388,7 @@ TEST_F(FusionOpTest, defaultProjectionWhenNoFieldsNamed) {
       lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
-  fusion.rrf.emplace().k = 60;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
   setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "alpha", 10);
   lreq->execute(false);
   ASSERT_OK(lreq);
@@ -428,7 +437,7 @@ TEST_F(FusionOpTest, topKCountWholeHitComposesSharedDomainOnce) {
   fusion.limit = 10;
   fusion.get_number = true;
   addField(fusion, "id", mr);
-  fusion.rrf.emplace().k = 60;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
 
   auto& source = addSource(fusion, "ranked", mr);
   source.limit = 10;
@@ -471,7 +480,7 @@ TEST_F(FusionOpTest, sharedKnnFilter) {
   fusion.limit = 10;
   fusion.get_number = true;
   addField(fusion, "id", mr);
-  fusion.rrf.emplace().k = 60;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
 
   setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 10);
 
@@ -523,7 +532,7 @@ TEST_F(FusionOpTest, rrfMultiSegment) {
   fusion.get_number = true;
   fusion.get_scores = true;
   addField(fusion, "id", mr);
-  fusion.rrf.emplace().k = 60;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
   setTextSource(addSource(fusion, "apple", mr), mr, "foo_w", "apple", 10);
   auto& bananaSrc = addSource(fusion, "banana", mr);
   setTextSource(bananaSrc, mr, "foo_w", "banana", 10);
@@ -677,7 +686,7 @@ TEST_F(FusionOpTest, sharedAndPerSourceFilter) {
   fusion.limit = 10;
   fusion.get_number = true;
   addField(fusion, "id", mr);
-  fusion.rrf.emplace().k = 60;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
 
   // Shared filter: color_s = red.
   addFilter(fusion.filter, qb::match(mr, "color_s", "red"), mr);
@@ -718,7 +727,7 @@ TEST_F(FusionOpTest, validation) {
   {
     auto* lreq = buildBase();
     auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
-    fusion.rrf.emplace().k = 60;
+    fusion.method.emplace<api::RrfFusion>().k = 60;
     ExpectLog quiet("Search request rejected");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
@@ -744,7 +753,7 @@ TEST_F(FusionOpTest, validation) {
     auto* lreq = buildBase();
     auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
     auto& mr = lreq->mr;
-    fusion.rrf.emplace().k = -1;
+    fusion.method.emplace<api::RrfFusion>().k = -1;
     setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
     ExpectLog quiet("Search request rejected");
     lreq->execute();
@@ -767,7 +776,7 @@ TEST_F(FusionOpTest, emptyIndex) {
   auto& mr = lreq->mr;
   fusion.limit = 5;
   fusion.get_number = true;
-  fusion.rrf.emplace().k = 60;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
   setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
 
   auto* facet = build::mapSlot<api::SearchOp>(fusion.ops, 1, "colors", mr);
@@ -828,7 +837,7 @@ TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
     fusion.limit = -1;
     fusion.get_number = true;
     addField(fusion, "id", mr);
-    fusion.rrf.emplace().k = 60;
+    fusion.method.emplace<api::RrfFusion>().k = 60;
     // 10 sources, each a boolean of 2 optional kNN clauses => 20 kNN weights,
     // 10 source prepares running concurrently on the shared request pool.
     for (int s = 0; s < 10; s++) {
@@ -878,7 +887,7 @@ TEST_F(FusionOpTest, offsetPagesSourceWindows) {
     cursor.offset(offset).limit(limit);
     fusion.get_number = true;
     fusion.get_scores = true;
-    fusion.rrf.emplace();
+    fusion.method.emplace<api::RrfFusion>();
     addField(fusion, "id", req->mr);
     for (bool descending : {false, true}) {
       auto& src = addSource(fusion, descending ? "desc" : "asc", req->mr);
@@ -933,10 +942,303 @@ TEST_F(FusionOpTest, offsetNegativeRejected) {
   auto& cursor = req->collection("main").topDocs("f");
   auto& fusion = cursor.rawOp().kind.emplace<api::Fusion>();
   cursor.offset(-2);
-  fusion.rrf.emplace();
+  fusion.method.emplace<api::RrfFusion>();
   addSource(fusion, "all", req->mr).limit = 3;
   req->execute();
   EXPECT_FALSE(req->ok());
   EXPECT_NE(std::string::npos, req->errorMsg().find("fusion 'f': offset must be >= 0"))
       << req->errorMsg();
+}
+
+// Weighted RRF.  The corpus (three segments) gives deterministic ranks:
+//   apple matchers (BM25, field length): a, b, d, e -> ranks 1..4
+//   banana matchers (prio_i DESC):       d, c, e, b -> ranks 1..4
+class WeightedRrfTest : public FusionOpTest {
+protected:
+  void indexCorpus(CollectionHelper& h) {
+    h.index(flatdoc("id", "a", "foo_w", "apple", "prio_i", 50));
+    h.index(flatdoc("id", "b", "foo_w", "apple banana", "prio_i", 10));
+    h.commit();
+    h.index(flatdoc("id", "d", "foo_w", "apple banana d1", "prio_i", 50));
+    h.index(flatdoc("id", "c", "foo_w", "banana c1 c2 c3 c4", "prio_i", 40));
+    h.commit();
+    h.index(flatdoc("id", "e", "foo_w", "apple banana e1 e2", "prio_i", 20));
+    h.commit();
+  }
+
+  // `extra` is spliced into the fusion object (weights, rrf) and
+  // `moreSources` into its sources.
+  LocalReqHandle run(std::string_view extra, std::string_view moreSources = "") {
+    auto req = localReq(luxirNode->getSearchEngine());
+    parseQueryRequest(R"({"ops":{"f":{"fusion":{"sources":{)" + std::string(moreSources) + R"(
+        "apple":{"query":{"match":{"foo_w":"apple"}}},
+        "banana":{"query":{"match":{"foo_w":"banana"}},
+                  "sort":[{"expr":"prio_i","dir":"desc"}]}},
+        "get_number":true,"get_scores":true,"fields":["id"],
+        "ops":{"ids":{"field_facet":{"field":"id"}}},)"
+        + std::string(extra) + "}}}}", req->rawRequest(), req->mr);
+    req->execute();
+    return req;
+  }
+
+  void expectError(std::string_view extra, std::string_view msg) {
+    ExpectLog quiet("Search request rejected");
+    auto req = run(extra);
+    EXPECT_NE(std::string::npos, req->errorMsg().find(msg)) << req->errorMsg();
+  }
+};
+
+TEST_F(WeightedRrfTest, weightedScores) {
+  CollectionHelper h("main");
+  indexCorpus(h);
+  // Unlisted sources default to weight 1, and duplicate keys are last-wins.
+  for (auto weights : {R"("weights":{"apple":2,"banana":0.5},"rrf":{"k":60})",
+                       R"("weights":{"banana":1,"apple":2,"banana":0.5},"rrf":{})"}) {
+    auto req = run(weights);
+    ASSERT_OK(req);
+    EXPECT_EQ((std::vector<std::string>{"b", "d", "e", "a", "c"}), resultIds(*req));
+    auto s = resultScores(*req);
+    ASSERT_EQ(5u, s.size());
+    EXPECT_FLOAT_EQ(2.0f / 62 + 0.5f / 64, s[0]);
+    EXPECT_FLOAT_EQ(2.0f / 63 + 0.5f / 61, s[1]);
+    EXPECT_FLOAT_EQ(2.0f / 64 + 0.5f / 63, s[2]);
+    EXPECT_FLOAT_EQ(2.0f / 61, s[3]);
+    EXPECT_FLOAT_EQ(0.5f / 62, s[4]);
+  }
+  auto req = run(R"("weights":{"banana":1},"rrf":{})");
+  ASSERT_OK(req);
+  EXPECT_EQ((std::vector<std::string>{"d", "b", "e", "a", "c"}), resultIds(*req));
+  EXPECT_FLOAT_EQ(1.0f / 63 + 1.0f / 61, resultScores(*req)[0]);
+}
+
+// A zero-weight source is not parsed or executed: its documents are absent
+// from the fused list, found, and the fusion ops domain.  The disabled
+// "bad" source would be rejected if it were parsed.
+TEST_F(WeightedRrfTest, zeroWeightDisablesSource) {
+  CollectionHelper h("main");
+  indexCorpus(h);
+  auto req = run(R"("weights":{"banana":0,"bad":0},"rrf":{})",
+                 R"("bad":{"ops":{"x":{"field_facet":{"field":"id"}}}},)");
+  ASSERT_OK(req);
+  EXPECT_EQ((std::vector<std::string>{"a", "b", "d", "e"}), resultIds(*req));
+  EXPECT_EQ((std::vector<float>{1.0f / 61, 1.0f / 62, 1.0f / 63, 1.0f / 64}),
+            resultScores(*req));
+  EXPECT_EQ(4, req->docList("f")->found.value_or(-1));
+  EXPECT_EQ((std::set<std::string_view>{"a", "b", "d", "e"}), facetIds(*req));
+
+  auto both = run(R"("rrf":{})");
+  ASSERT_OK(both);
+  EXPECT_EQ(5, both->docList("f")->found.value_or(-1));
+  EXPECT_EQ((std::set<std::string_view>{"a", "b", "c", "d", "e"}), facetIds(*both));
+}
+
+TEST_F(WeightedRrfTest, optionalK) {
+  CollectionHelper h("main");
+  indexCorpus(h);
+  auto omitted = run(R"("weights":{"banana":0},"rrf":{})");
+  ASSERT_OK(omitted);
+  EXPECT_FLOAT_EQ(1.0f / 61, resultScores(*omitted)[0]);
+  auto zero = run(R"("weights":{"banana":0},"rrf":{"k":0})");
+  ASSERT_OK(zero);
+  EXPECT_EQ((std::vector<float>{1.0f, 1.0f / 2, 1.0f / 3, 1.0f / 4}), resultScores(*zero));
+  expectError(R"("rrf":{"k":-1})", "RrfFusion.k must be >= 0");
+}
+
+TEST_F(WeightedRrfTest, validation) {
+  CollectionHelper h("main");
+  indexCorpus(h);
+  expectError(R"("weights":{"pear":1},"rrf":{})",
+              "fusion 'f': weights names unknown source 'pear'");
+  expectError(R"("weights":{"apple":-0.5},"rrf":{})",
+              "fusion 'f': weight for source 'apple' must be finite and >= 0");
+  expectError(R"("weights":{"apple":0,"banana":0},"rrf":{})",
+              "fusion 'f': at least one source weight must be > 0");
+  for (double bad : {std::numeric_limits<double>::quiet_NaN(),
+                     std::numeric_limits<double>::infinity(), 1e300}) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    auto& fusion = req->collection("main").topDocs("f").rawOp().kind.emplace<api::Fusion>();
+    fusion.method.emplace<api::RrfFusion>();
+    setTextSource(addSource(fusion, "apple", req->mr), req->mr, "foo_w", "apple", 5);
+    std::array<std::pair<std::string_view, double>, 1> weights{{{"apple", bad}}};
+    fusion.weights = api::map_view<std::string_view, double>(
+        std::span<const std::pair<std::string_view, double>>(weights));
+    ExpectLog quiet("Search request rejected");
+    req->execute();
+    EXPECT_NE(std::string::npos, req->errorMsg().find(
+        "weight for source 'apple' must be finite and >= 0")) << req->errorMsg();
+  }
+}
+
+// Linear fusion with min-max normalization.  Scores come from rescore (p_i)
+// and inner-product kNN (negative dot products), so they do not depend on
+// how documents fall into segments:
+//   lex = rescore(apple, p_i): b 30, c 20, a 10           -> b 1, c 0.5, a 0
+//   vec = knn IP [1,0,0], k 4: a -0.5, b -1, d -2, c -3   -> a 1, b 0.8, d 0.4, c 0
+class LinearFusionTest : public FusionOpTest {
+protected:
+  static constexpr std::string_view LEX =
+      R"("lex":{"query":{"rescore":{"query":{"match":{"foo_w":"apple"}},"expr":"p_i"}}})";
+  static constexpr std::string_view VEC =
+      R"("vec":{"query":{"knn":{"field":"embedding_v","query":[1,0,0],"k":4}},"limit":4})";
+
+  // Commit after every `perSegment` documents.
+  static void indexCorpus(std::string_view collection, int perSegment) {
+    CollectionHelper h(collection);
+    installVecSchema(h.collection(), api::VectorMetric::IP);
+    struct Doc { const char* id; const char* text; int p; float x; };
+    std::array<Doc, 5> docs{{{"a", "apple", 10, -0.5f}, {"b", "apple", 30, -1},
+                             {"c", "apple", 20, -3}, {"d", "pear", 5, -2},
+                             {"e", "pear", 15, -4}}};
+    for (size_t i = 0; i < docs.size(); i++) {
+      h.index(flatdoc("id", std::string(docs[i].id), "foo_w", docs[i].text, "p_i", docs[i].p,
+                      "embedding_v", std::vector<float>{docs[i].x, 0, 0}));
+      if ((i + 1) % (size_t)perSegment == 0 || i + 1 == docs.size()) h.commit();
+    }
+  }
+
+  // `sources` is the body of the sources object; `extra` is spliced into the
+  // fusion object (method, weights).
+  LocalReqHandle run(std::string_view sources, std::string_view extra = R"("linear":{})",
+                     std::string_view collection = "main") {
+    auto req = localReq(luxirNode->getSearchEngine());
+    parseQueryRequest(R"({"ops":{"f":{"fusion":{"sources":{)" + std::string(sources)
+        + R"(},"get_number":true,"get_scores":true,"fields":["id"],
+        "ops":{"ids":{"field_facet":{"field":"id"}}},)" + std::string(extra) + "}}}}",
+        req->rawRequest(), req->mr);
+    req->collection(collection);
+    req->execute();
+    return req;
+  }
+
+  static std::string join(std::string_view a, std::string_view b) {
+    return std::string(a) + "," + std::string(b);
+  }
+
+  void expectResult(LocalReq& req, std::vector<std::string> ids, std::vector<float> scores) {
+    ASSERT_OK(&req);
+    EXPECT_EQ(ids, resultIds(req));
+    auto got = resultScores(req);
+    ASSERT_EQ(scores.size(), got.size());
+    for (size_t i = 0; i < scores.size(); i++) EXPECT_FLOAT_EQ(scores[i], got[i]) << i;
+  }
+};
+
+TEST_F(LinearFusionTest, overlappingSources) {
+  indexCorpus("main", 5);
+  for (auto method : {R"("linear":{})", R"("linear":{"normalization":"min_max"})"}) {
+    auto req = run(join(LEX, VEC), method);
+    expectResult(*req, {"b", "a", "c", "d"}, {1 + 0.8f, 0 + 1, 0.5f + 0, 0.4f});
+    EXPECT_EQ(4, req->docList("f")->found.value_or(-1));
+    EXPECT_EQ((std::set<std::string_view>{"a", "b", "c", "d"}), facetIds(*req));
+  }
+}
+
+TEST_F(LinearFusionTest, weights) {
+  indexCorpus("main", 5);
+  auto req = run(join(LEX, VEC), R"("weights":{"lex":0.25,"vec":2},"linear":{})");
+  expectResult(*req, {"a", "b", "d", "c"}, {2, 0.25f + 1.6f, 0.8f, 0.125f});
+  // A zero weight disables vec: d leaves the list, found, and the ops domain.
+  auto off = run(join(LEX, VEC), R"("weights":{"vec":0},"linear":{})");
+  expectResult(*off, {"b", "c", "a"}, {1, 0.5f, 0});
+  EXPECT_EQ(3, off->docList("f")->found.value_or(-1));
+  EXPECT_EQ((std::set<std::string_view>{"a", "b", "c"}), facetIds(*off));
+}
+
+// Missing-source contribution is zero; a document scored 0 by its only
+// source is still a candidate.
+TEST_F(LinearFusionTest, disjointSources) {
+  indexCorpus("main", 5);
+  auto pear = R"("pear":{"query":{"rescore":{"query":{"match":{"foo_w":"pear"}},"expr":"p_i"}}})";
+  auto req = run(join(LEX, pear), R"("weights":{"pear":0.6},"linear":{})");
+  expectResult(*req, {"b", "e", "c", "a", "d"}, {1, 0.6f, 0.5f, 0, 0});
+  EXPECT_EQ(5, req->docList("f")->found.value_or(-1));
+}
+
+// Constant-score and single-document lists normalize every document to 1;
+// an empty list contributes nothing.
+TEST_F(LinearFusionTest, constantSingletonAndEmptySources) {
+  indexCorpus("main", 5);
+  auto constant =
+      R"("lex":{"query":{"constant_score":{"query":{"match":{"foo_w":"apple"}},"score":3}}})";
+  expectResult(*run(join(constant, VEC)), {"a", "b", "c", "d"}, {2, 1.8f, 1, 0.4f});
+  auto single = R"("one":{"query":{"rescore":{"query":{"match":{"foo_w":"pear"}},"expr":"p_i"}},"limit":1})";
+  expectResult(*run(single), {"e"}, {1});
+  auto empty = run(join(LEX, R"("none":{"query":{"match":{"foo_w":"zzz"}}})"));
+  expectResult(*empty, {"b", "c", "a"}, {1, 0.5f, 0});
+  EXPECT_EQ(3, empty->docList("f")->found.value_or(-1));
+}
+
+// Normalization runs over each source's merged list, so splitting the same
+// documents across segments changes neither scores nor order.
+TEST_F(LinearFusionTest, segmentPartitioningInvariant) {
+  indexCorpus("main", 5);
+  indexCorpus("split", 1);
+  indexCorpus("pairs", 2);
+  auto extra = R"("weights":{"lex":0.25,"vec":2},"linear":{})";
+  auto one = run(join(LEX, VEC), extra, "main");
+  ASSERT_OK(one);
+  for (auto collection : {"split", "pairs"}) {
+    auto req = run(join(LEX, VEC), extra, collection);
+    ASSERT_OK(req);
+    EXPECT_EQ(resultIds(*one), resultIds(*req)) << collection;
+    EXPECT_EQ(resultScores(*one), resultScores(*req)) << collection;
+  }
+}
+
+TEST_F(LinearFusionTest, minMaxNormalizeEdgeCases) {
+  auto norm = [](std::vector<float> scores) {
+    FusionOp::minMaxNormalize(scores);
+    return scores;
+  };
+  constexpr float inf = std::numeric_limits<float>::infinity();
+  constexpr float nan = std::numeric_limits<float>::quiet_NaN();
+  constexpr float big = std::numeric_limits<float>::max();
+  EXPECT_EQ((std::vector<float>{1, 0, 0, 1, 0, 0.5f}), norm({3, nan, 1, inf, -inf, 2}));
+  EXPECT_EQ((std::vector<float>{1, 1}), norm({7, 7}));
+  EXPECT_EQ((std::vector<float>{1}), norm({-5}));
+  EXPECT_EQ((std::vector<float>{0, 1, 0}), norm({nan, inf, -inf}));
+  EXPECT_EQ((std::vector<float>{0, 1, 0.5f}), norm({-big, big, 0}));
+  EXPECT_EQ((std::vector<float>{}), norm({}));
+}
+
+TEST_F(LinearFusionTest, validation) {
+  indexCorpus("main", 5);
+  auto sorted = [](std::string_view sort, std::string_view name = "lex") {
+    return "\"" + std::string(name) + R"(":{"query":{"match":{"foo_w":"apple"}},"sort":[)"
+        + std::string(sort) + "]}";
+  };
+  {
+    ExpectLog quiet("Search request rejected");
+    auto req = run(sorted(R"({"expr":"p_i","dir":"desc"})"));
+    EXPECT_NE(std::string::npos, req->errorMsg().find(
+        "fusion 'f': linear fusion source 'lex' must rank by score")) << req->errorMsg();
+  }
+  // Score order, and field sorts under RRF or on a disabled source, are fine.
+  auto byScore = run(sorted(R"({"expr":"score"})"));
+  ASSERT_OK(byScore);
+  auto rrf = run(sorted(R"({"expr":"p_i"})"), R"("rrf":{})");
+  ASSERT_OK(rrf);
+  auto disabled = run(join(LEX, sorted(R"({"expr":"p_i"})", "srt")),
+                      R"("weights":{"srt":0},"linear":{})");
+  ASSERT_OK(disabled);
+  // Exactly one method.
+  {
+    ExpectLog quiet("Search request rejected");
+    auto req = run(LEX, R"("limit":10)");
+    EXPECT_NE(std::string::npos, req->errorMsg().find(
+        "Fusion requires a fusion method (rrf or linear)")) << req->errorMsg();
+  }
+  EXPECT_ANY_THROW(run(LEX, R"("rrf":{},"linear":{})"));
+  EXPECT_ANY_THROW(run(LEX, R"("linear":{"normalization":"l2"})"));
+  {
+    auto req = localReq(luxirNode->getSearchEngine());
+    auto& fusion = req->collection("main").topDocs("f").rawOp().kind.emplace<api::Fusion>();
+    fusion.method.emplace<api::LinearFusion>().normalization =
+        (api::LinearFusion::Normalization)7;
+    setTextSource(addSource(fusion, "lex", req->mr), req->mr, "foo_w", "apple", 5);
+    ExpectLog quiet("Search request rejected");
+    req->execute();
+    EXPECT_NE(std::string::npos, req->errorMsg().find(
+        "fusion 'f': unsupported LinearFusion.normalization 7")) << req->errorMsg();
+  }
 }

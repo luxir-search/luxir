@@ -1191,6 +1191,8 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   INDEX_DEBUG("finishCommitBody: msg={}", (void*)&msg);
   if (failed.load(std::memory_order_acquire)) throw IndexWriterClosedError("index writer has failed");
   // TODO: if nothing actually changed, we could skip writing a new commit at this point.
+  // Not for a commit that waits for replicas: that wait relies on a generation
+  // newer than any follower has acknowledged, even after a follower restart.
 
   // Apply deletes from all segments that were part of this commit to all segments in the index.
   // This must be mutually exclusive with segment merging, or we must do some form of optimistic concurrency.

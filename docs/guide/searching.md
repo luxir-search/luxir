@@ -214,7 +214,7 @@ doubles. An empty metric domain renders as `null` in JSON.
 One request returned the documents, the facet counts for a sidebar, and the
 total for a header. See [Faceting](faceting.md) for
 terms, range, date, nested, and per-bucket operations, and
-[Vector Search](vector-search.md#hybrid-search-with-rrf) for a fusion operation
+[Vector Search](vector-search.md#hybrid-search) for a fusion operation
 that ranks several sources and carries facets of its own.
 
 For an interactive sidebar, put the user's choices in each facet's

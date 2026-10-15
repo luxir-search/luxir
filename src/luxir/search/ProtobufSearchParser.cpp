@@ -53,6 +53,38 @@ struct FacetParsePlan {
   bool refinerPlanned = true;
 };
 
+// Resolve Fusion.weights (named at the API boundary) into one weight per
+// source, aligned with `sourceNames` (the source execution order), so no
+// fusion method depends on map ordering. Shared by every fusion method.
+// Unlisted sources get weight 1. Rejects names that are not sources,
+// negative or non-finite weights, and a configuration with no weight > 0.
+// A zero entry means the caller should disable that source.
+std::vector<double> resolveSourceWeights(
+    std::string_view fusionName,
+    const luxir::api::map_view<std::string_view, double>& weights,
+    std::span<const std::string_view> sourceNames) {
+  auto prefix = [&]() { return "fusion '" + std::string(fusionName) + "': "; };
+  std::vector<double> resolved(sourceNames.size(), 1.0);
+  for (const auto& [key, weight] : lastWins(weights)) {
+    auto it = std::ranges::find(sourceNames, key);
+    if (it == sourceNames.end()) {
+      throw std::runtime_error(prefix() + "weights names unknown source '"
+          + std::string(key) + "'");
+    }
+    // Scores are float, so a weight must also be finite as a float.
+    if (!std::isfinite(*weight) || *weight < 0
+        || *weight > (double)std::numeric_limits<float>::max()) {
+      throw std::runtime_error(prefix() + "weight for source '"
+          + std::string(key) + "' must be finite and >= 0");
+    }
+    resolved[(size_t)(it - sourceNames.begin())] = *weight;
+  }
+  if (std::ranges::none_of(resolved, [](double w) { return w > 0; })) {
+    throw std::runtime_error(prefix() + "at least one source weight must be > 0");
+  }
+  return resolved;
+}
+
 struct SearchParserImpl {
   SearchRequest& req;
   FieldResolver fields;
@@ -1877,30 +1909,61 @@ public:
     if (fusionProto.sources.empty()) {
       throw std::runtime_error("Fusion requires at least one source");
     }
-    if (!fusionProto.rrf.has_value()) {
-      throw std::runtime_error("Fusion requires a fusion method (only RRF is supported)");
+    FusionOp::Method method = FusionOp::Method::RRF;
+    int32_t rrfK = 60;
+    if (const auto* rrf = std::get_if<luxir::api::RrfFusion>(&fusionProto.method)) {
+      if (rrf->k.has_value() && *rrf->k < 0) {
+        throw std::runtime_error("RrfFusion.k must be >= 0");
+      }
+      rrfK = rrf->k.value_or(60);
+    } else if (const auto* linear =
+                   std::get_if<luxir::api::LinearFusion>(&fusionProto.method)) {
+      using Normalization = luxir::api::LinearFusion::Normalization;
+      if (linear->normalization != Normalization::MIN_MAX) {
+        throw std::runtime_error("fusion '" + std::string(name)
+            + "': unsupported LinearFusion.normalization "
+            + std::to_string((int)linear->normalization));
+      }
+      method = FusionOp::Method::LINEAR_MIN_MAX;
+    } else {
+      throw std::runtime_error("Fusion requires a fusion method (rrf or linear)");
     }
-    if (fusionProto.rrf->k < 0) {
-      throw std::runtime_error("RrfFusion.k must be >= 0 (0 selects the default)");
-    }
-    int32_t rrfK = fusionProto.rrf->k > 0 ? fusionProto.rrf->k : 60;
+
+    auto sourceEntries = lastWins(fusionProto.sources);  // dedup duplicate source names, last-wins
+    std::vector<std::string_view> sourceNames;
+    sourceNames.reserve(sourceEntries.size());
+    for (const auto& entry : sourceEntries) sourceNames.push_back(entry.first);
+    auto weights = resolveSourceWeights(name, fusionProto.weights, sourceNames);
 
     // Build each source as a full TopDocsReq, wired to deliver its merged
     // collector back to the FusionOp::Calc instead of self-emitting.  The
     // sink closure captures nothing at parse time; it resolves the parent
     // FusionOp::Calc at runtime via the source Calc's parent pointer.
     // Fusion.sources is a map whose values are TopDocs directly (not
-    // indirect), so srcProto is the message itself.
+    // indirect), so srcProto is the message itself.  A zero-weight source is
+    // disabled: it is neither parsed nor executed, so its documents never
+    // reach the fused list, found, or the ops domain.
     std::vector<TopDocsReq*> sources;
-    sources.reserve(fusionProto.sources.size());
-    for (auto& [srcName, srcProto] : lastWins(fusionProto.sources)) {  // dedup duplicate source names, last-wins
+    std::vector<double> sourceWeights;
+    sources.reserve(sourceEntries.size());
+    sourceWeights.reserve(sourceEntries.size());
+    for (size_t i = 0; i < sourceEntries.size(); i++) {
+      if (weights[i] == 0) continue;
+      auto& [srcName, srcProto] = sourceEntries[i];
       size_t idx = sources.size();
       auto* src = parseTopDocs(
           srcName, *srcProto, TopDocsPlacement::FUSION_SOURCE);
+      // Linear fusion normalizes relevance scores; a field-sorted source
+      // ranks by something else and carries no score to normalize.
+      if (method != FusionOp::Method::RRF && src->sortPlan.useFieldSort) {
+        throw std::runtime_error("fusion '" + std::string(name) + "': linear fusion source '"
+            + std::string(srcName) + "' must rank by score; use rrf for sorted sources");
+      }
       src->rankingSink = [idx](TopDocsReq::Calc& calc, MergeableCollector* mc) {
         static_cast<FusionOp::Calc*>(calc.getParent())->acceptSourceRanking(idx, mc);
       };
       sources.push_back(src);
+      sourceWeights.push_back(weights[i]);
     }
 
     ParseContext parseContext{
@@ -1935,8 +1998,9 @@ public:
         : offset >= maxDoc ? maxDoc : offset + std::min(limit, maxDoc - offset);
 
     auto* fusion = luxir::arenaCreate<FusionOp>(
-      req.arena, req, name, fusionProto, std::move(sources), topCount,
-      sharedFilters, sharedFilterWeights, rrfK);
+      req.arena, req, name, fusionProto, std::move(sources),
+      std::move(sourceWeights), topCount, sharedFilters, sharedFilterWeights,
+      method, rrfK);
 
     // Sources are children of this FusionOp in the SearchOp tree but not
     // in `subOps` (different lifecycle - they deliver via rankingSink

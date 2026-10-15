@@ -3435,7 +3435,7 @@ TEST_F(SearchEngineTest, wholeFieldSortHitComposesFusionDomainOnce) {
     auto& mr = req->mr;
     fusion.limit = 9;
     fusion.get_number = true;
-    fusion.rrf.emplace().k = 60;
+    fusion.method.emplace<api::RrfFusion>().k = 60;
 
     std::string_view* fields = build::allocArray(fusion.fields, 1, mr);
     fields[0] = build::arenaStr(mr, "id");

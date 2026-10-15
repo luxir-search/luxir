@@ -2185,7 +2185,7 @@ TEST_F(KnnQueryTest, fusionFieldSortDoesNotSightWholeReaderCache) {
     auto& fusion = req->topDocs("f").rawOp().kind.emplace<api::Fusion>();
     fusion.limit = 4;
     fusion.get_number = true;
-    fusion.rrf.emplace().k = 60;
+    fusion.method.emplace<api::RrfFusion>().k = 60;
     auto* fields = build::allocArray(fusion.fields, 1, req->mr);
     fields[0] = build::arenaStr(req->mr, "id");
 

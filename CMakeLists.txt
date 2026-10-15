@@ -97,6 +97,14 @@ endif()
 # automatically and we fall back to the next option, ending at the system
 # default. NOTE: results are cached; after installing a new linker, reconfigure
 # from a clean cache (or unset the LUXIR_LD_WORKS_* cache vars) to re-detect.
+#
+# mold before 2.31.0 is skipped. When input sections share a name but differ
+# in flags, it ORs in the flags of only the first such section each worker
+# thread sees, so the output flags depend on thread scheduling (fixed upstream
+# in 6463a7c). upb's linkarr_upb_AllExts mixes a read-only sentinel with
+# writable extension entries, so some links put the entries in a read-only
+# segment and the binary segfaults in ld.so before main(). A test link cannot
+# catch a race, so check the version. It is not cached, so old caches get it.
 include(CheckLinkerFlag)
 set(LUXIR_LINKER "")
 # Cross builds use their toolchain's linker. A host linker can pass the small
@@ -105,6 +113,18 @@ set(LUXIR_LINKER "")
 if(NOT CMAKE_CROSSCOMPILING)
   foreach(_cand mold lld gold)
     check_linker_flag(CXX "-fuse-ld=${_cand}" LUXIR_LD_WORKS_${_cand})
+    if(LUXIR_LD_WORKS_${_cand} AND _cand STREQUAL "mold")
+      execute_process(
+        COMMAND "${CMAKE_CXX_COMPILER}" -fuse-ld=mold -Wl,--version
+        OUTPUT_VARIABLE _luxir_mold_out ERROR_QUIET)
+      string(REGEX MATCH "mold ([0-9]+\\.[0-9]+(\\.[0-9]+)?)" _ "${_luxir_mold_out}")
+      set(_luxir_mold_version "${CMAKE_MATCH_1}")
+      if(NOT _luxir_mold_version OR _luxir_mold_version VERSION_LESS 2.31.0)
+        message(STATUS "Luxir: skipping mold ${_luxir_mold_version} "
+                       "(before 2.31.0 its output section flags are nondeterministic)")
+        continue()
+      endif()
+    endif()
     if(LUXIR_LD_WORKS_${_cand})
       add_link_options("-fuse-ld=${_cand}")
       set(LUXIR_LINKER "${_cand}")

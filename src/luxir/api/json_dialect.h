@@ -1040,8 +1040,23 @@ struct from<JSON, luxir::api::Fusion> {
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
-          } else if (key == "rrf") {
-            util::from_json<O>(value.rrf, ctx, vit, vend);
+          } else if (key == "weights") {
+            decltype(auto) weights = ::hpp_proto::detail::as_modifiable(ctx, value.weights);
+            glz::util::parse_repeated<O>(true, weights, ctx, vit, vend);
+          } else if (key == "rrf" || key == "linear") {
+            // one method arm: a second one is an error (proto3 canonical
+            // JSON), not a silent last-wins
+            if (value.method.index() != 0) {
+              ctx.error = error_code::unknown_key;
+              return true;
+            }
+            if (key == "rrf") {
+              util::from_json<O>(value.method.template emplace<luxir::api::RrfFusion>(),
+                                 ctx, vit, vend);
+            } else {
+              util::from_json<O>(value.method.template emplace<luxir::api::LinearFusion>(),
+                                 ctx, vit, vend);
+            }
           } else {
             ctx.error = error_code::unknown_key;
             return true;

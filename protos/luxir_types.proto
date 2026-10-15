@@ -149,9 +149,10 @@ message Fusion {
   // Maximum fused documents to return. Unset = 10; 0 = none; -1 = all remaining.
   optional sint64 limit = 3;
 
-  // Required fusion method.
+  // Required fusion method: exactly one.
   oneof method {
     RrfFusion rrf = 10;
+    LinearFusion linear = 11;
   }
 
   // Response shape (mirrors TopDocs).
@@ -170,13 +171,39 @@ message Fusion {
   // Runs over the union of filtered source ranked lists, as counted by found.
   // Fusion limit and offset do not affect this candidate domain.
   map<string, SearchOp> ops = 15;
+
+  // Per-source weights keyed by source name, used by the fusion method.
+  // A source without an entry has weight 1. Weights must be finite and
+  // >= 0, every key must name a source, and at least one source must have a
+  // weight > 0. A zero weight disables its source: it is not executed and
+  // its documents do not enter the fused list, found, or the ops domain.
+  map<string, double> weights = 16;
 }
 
 // Reciprocal Rank Fusion: fused_score(d) = sum over sources s of
-// 1 / (k + rank_s(d)), where rank_s(d) is d's 1-based rank in source s
-// (or omitted if d does not appear in s).  k=60 is the standard default.
+// weight_s / (k + rank_s(d)), where rank_s(d) is d's 1-based rank in source
+// s (sources without d contribute nothing) and weight_s comes from
+// Fusion.weights.
 message RrfFusion {
-  int32 k = 1;  // 0 means use default (60)
+  optional int32 k = 1;  // rank-smoothing constant, >= 0; unset selects 60
+}
+
+// Weighted linear fusion of normalized scores: fused_score(d) = sum over
+// sources s of weight_s * normalized_s(d), where weight_s comes from
+// Fusion.weights and sources without d contribute nothing. Each source's
+// scores are normalized over its ranked list after merging across segments.
+// Sources must rank by relevance score: a source with a sort other than
+// score descending (optionally followed by _docid_ ascending) is rejected.
+message LinearFusion {
+  enum Normalization {
+    // (score - min) / (max - min) over the source's ranked list, so its best
+    // document gets 1 and its worst gets 0. A list whose scores are all
+    // equal (including a single document) normalizes every document to 1.
+    // NaN scores contribute 0 and are left out of min and max; +inf
+    // normalizes to 1 and -inf to 0.
+    MIN_MAX = 0;
+  }
+  Normalization normalization = 1;  // unset selects MIN_MAX
 }
 
 message SortSpec {
@@ -780,17 +807,6 @@ message ReplicaRequirement {
 }
 message AllReplicas {}
 
-message WaitForReplicasRequest {
-  string collection = 1; // empty selects main
-  string commit = 2; // existing durable commit token
-  ReplicaRequirement wait_for_replicas = 3;
-  optional uint64 wait_for_replicas_timeout_ms = 4; // absent = 30000
-}
-message WaitForReplicasResponse {
-  string commit = 1;
-  ReplicaResult replicas = 2;
-}
-
 message ReplicaResult {
   enum Outcome {
     SATISFIED = 0;
@@ -1071,11 +1087,16 @@ message CreateCollectionRequest {
   // Administration only: the owning tenant. Empty is the caller's tenant
   // (the default tenant until credentials carry one).
   string tenant = 3;
+  // All counts live followers subscribed to the tenant that serve any
+  // collection, since none serves the new one yet.
+  ReplicaRequirement wait_for_replicas = 4;
+  optional uint64 wait_for_replicas_timeout_ms = 5; // absent = 30000
 }
 
 message CreateCollectionResponse {
   string commit = 2; // exact snapshot published by creation
   string name = 1;
+  ReplicaResult replicas = 3;
 }
 
 message DeleteCollectionRequest {
@@ -1576,9 +1597,13 @@ message SchemaRequest {
   }
   Mode mode = 2;
   SchemaDef schema = 3;
+  // Updates only: as CommitParams.wait_for_replicas.
+  ReplicaRequirement wait_for_replicas = 5;
+  optional uint64 wait_for_replicas_timeout_ms = 6; // absent = 30000
 }
 
 message SchemaResponse {
   string commit = 2; // exact snapshot published by a schema update
   SchemaDef schema = 1;         // the resulting schema after the operation
+  ReplicaResult replicas = 3;
 }
