@@ -209,6 +209,18 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Per-request query-memory breaker ceiling (0 = unlimited)")
       ->default_val(search.request_memory_max_bytes)
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.default-timeout-ms", search.default_timeout_ms,
+                 "Search deadline in ms; requests may shorten it (0 = none)")
+      ->default_val(search.default_timeout_ms)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.max-concurrent", search.max_concurrent,
+                 "Searches running at once; more wait in a queue (0 = unlimited)")
+      ->default_val(search.max_concurrent)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.max-queued", search.max_queued,
+                 "Searches waiting for a slot before new ones are rejected")
+      ->default_val(search.max_queued)
+      ->check(CLI::NonNegativeNumber);
 }
 
 void LuxirConfig::resolveRamBudgets() {

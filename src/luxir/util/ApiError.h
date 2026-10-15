@@ -29,6 +29,8 @@ namespace luxir {
 //   RESOURCE_EXHAUSTED   HTTP 429  gRPC RESOURCE_EXHAUSTED
 //   UNAVAILABLE          HTTP 503  gRPC UNAVAILABLE
 //   INTERNAL             HTTP 500  gRPC INTERNAL
+//   CANCELLED            HTTP 499  gRPC CANCELLED
+//   DEADLINE_EXCEEDED    HTTP 504  gRPC DEADLINE_EXCEEDED
 enum class ErrorKind : uint8_t {
   UNKNOWN = 0,
   INVALID_REQUEST = 1,
@@ -38,6 +40,12 @@ enum class ErrorKind : uint8_t {
   RESOURCE_EXHAUSTED = 5,
   UNAVAILABLE = 6,
   INTERNAL = 7,
+  // The client abandoned the request (disconnect or RPC cancellation) or the
+  // node is shutting down; nobody is left to read the answer.
+  CANCELLED = 8,
+  // Reserved for parity with the gRPC status space: a search that runs out of
+  // time answers with partial results and SearchResponse.timed_out instead.
+  DEADLINE_EXCEEDED = 9,
 };
 
 // The kind's wire spelling; doubles as the code of an unclassified failure.
@@ -50,6 +58,8 @@ constexpr std::string_view errorKindName(ErrorKind kind) {
     case ErrorKind::RESOURCE_EXHAUSTED: return "resource_exhausted";
     case ErrorKind::UNAVAILABLE: return "unavailable";
     case ErrorKind::INTERNAL: return "internal";
+    case ErrorKind::CANCELLED: return "cancelled";
+    case ErrorKind::DEADLINE_EXCEEDED: return "deadline_exceeded";
     case ErrorKind::UNKNOWN: break;
   }
   return "unknown";

@@ -22,6 +22,7 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
+#include "luxir/util/ExecutionBudget.h"
 #include "luxir/util/proto.h"
 
 namespace luxir {
@@ -82,7 +83,20 @@ class SearchRequest {
   friend class SearchEngine;
 
 public:
+  // Fires when the client goes away (or the node shuts down): ends a
+  // min_commit wait, and aborts execution through the budget.
   std::stop_source waitCancellation{std::nostopstate};
+  // Execution deadline and cancellation, armed by SearchEngine::dispatch (or
+  // submit) from proto.timeout_ms, search.default_timeout_ms and
+  // transportDeadline.  Checked at segment and match-window boundaries.
+  ExecutionBudget budget;
+  // A deadline the transport imposes (a gRPC call deadline); max() is none.
+  std::chrono::steady_clock::time_point transportDeadline =
+      std::chrono::steady_clock::time_point::max();
+  bool budgetArmed = false;
+  // Admitted under search.max_concurrent: the request owns a running slot
+  // (or a queue place that becomes one) until its body finishes.
+  bool holdsSearchSlot = false;
   // The request's tenant, owned for asynchronous resolution; empty is the
   // default tenant.
   std::string tenant;
@@ -166,6 +180,13 @@ public:
 
   void fillExecutionProfile(SearchResponse& response);
   void warnOnce(std::string_view code, std::string_view message);
+
+  // Execution should stop: the deadline passed (results so far are kept and
+  // the response says timed_out) or the client went away (the request fails
+  // with CANCELLED).  Cheap; call at segment and window boundaries.
+  bool shouldStop() { return budget.exhausted(); }
+  // Flag the final response timed_out, with a timed_out warning.  Takes `mutex`.
+  void markTimedOut();
 
   /// Flow-control advice returned by reply().  The response is always accepted
   /// (or dropped, for CANCEL); the status only tells a streaming producer what

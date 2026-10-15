@@ -11,6 +11,7 @@
 
 #include "luxir/query/Query.h"
 #include "luxir/search/DocSet.h"
+#include "luxir/util/ExecutionBudget.h"
 
 namespace luxir {
 
@@ -762,12 +763,19 @@ inline void collectConstantTopKAndDomain(
 
 // Exhaust the windowed bulk path, counting matches and optionally building the
 // complete domain. No docs or scores are otherwise materialized.
+//
+// Every window driver below stops early once the calling thread's execution
+// budget is exhausted (ExecutionBudget): the count, domain and collector then
+// cover the windows produced so far, consistently with one another.  Only
+// per-request results are built here; filter sets that may be cached or used
+// as exclusions (QueryPrep::materialize) always run to completion.
 inline int64_t countMatchesWindowed(BulkScorer* bulk, DocSet* filter,
                                     DocSetBuilder* builder, int32_t maxDoc) {
   assert(bulk != nullptr);
   int64_t count = 0;
   int32_t cursor = 0;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
+    if (ExecutionBudget::currentExhausted()) break;
     int32_t next = bulk->countNextWindow(count, builder, filter, cursor, maxDoc);
     if (next == PostingsReader::END) {
       break;
@@ -814,6 +822,7 @@ inline void collectFirstKConstantWindowed(
   ScoreWindow window;
   while (cursor != PostingsReader::END && cursor < maxDoc
          && collected < collector.topCount) {
+    if (ExecutionBudget::currentExhausted()) return;
     int32_t next = bulk->scoreNextWindow(window, filter, cursor, maxDoc,
                                          std::numeric_limits<float>::lowest());
     if (builder != nullptr) {
@@ -850,6 +859,7 @@ inline void collectFirstKConstantWindowed(
   }
   int64_t count = 0;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
+    if (ExecutionBudget::currentExhausted()) break;
     int32_t next = bulk->countNextWindow(count, builder, filter, cursor, maxDoc);
     if (next == PostingsReader::END) {
       break;
@@ -876,6 +886,7 @@ int64_t feedMatchWindows(int32_t segnum, BulkScorer* bulk, DocSet* filter,
   int32_t cursor = begin;
   int64_t emitted = 0;
   while (cursor < end) {
+    if (ExecutionBudget::currentExhausted()) break;
     int32_t next = bulk->matchNextWindow(window, filter, cursor, end);
     emitted += window.size;
     if (builder != nullptr) {
@@ -942,6 +953,7 @@ void collectTopKMatchWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
     sortPrune = allowPruning && builder == nullptr;
   }
   while (cursor < maxDoc) {
+    if (ExecutionBudget::currentExhausted()) break;
     int32_t rangeEnd = maxDoc;
     if constexpr (hasSortRanges) {
       if (sortPrune) {
@@ -1904,6 +1916,7 @@ void collectTopKMatchWindowedSeeded(
   int64_t round = std::max<int64_t>(1, seedCount);
   int64_t rounds = 0;
   for (;;) {
+    if (ExecutionBudget::currentExhausted()) break;
     // A completed round can spend the last underfull leaf without triggering
     // the in-round guard. Do not pay another selection, sort and restart.
     if (!collector.heapFull() && enumerated >= fillAbortBudget) {
@@ -2033,6 +2046,7 @@ void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
   int32_t cursor = 0;
   ScoreWindow window;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
+    if (ExecutionBudget::currentExhausted()) break;
     float localTheta;
     if constexpr (requires {
         collector.minCompetitiveScoreForNextDoc(segnum, cursor);

@@ -54,6 +54,14 @@ message SearchRequest {
   string min_commit = 9;
   // Search floor deadline. Absent defaults to 30000; zero checks immediately.
   optional uint64 min_commit_timeout_ms = 10;
+
+  // Execution deadline in milliseconds, measured from receipt. 0 (the default)
+  // sets none of its own. The effective deadline is the earliest of this, the
+  // node's search.default-timeout-ms and a gRPC call deadline; time spent
+  // waiting for min_commit or in the admission queue counts against it. A
+  // search that runs out of time stops collecting and answers with what it
+  // has: SearchResponse.timed_out and a timed_out warning, not an error.
+  uint64 timeout_ms = 11;
 }
 
 enum ResponseFormat {
@@ -643,9 +651,11 @@ message Error {
     NOT_FOUND = 2;            // the addressed collection or route does not exist (404)
     ALREADY_EXISTS = 3;       // the request would create what already exists (409)
     FAILED_PRECONDITION = 4;  // the node's state forbids the operation, e.g. --read-only (403)
-    RESOURCE_EXHAUSTED = 5;   // a size or memory ceiling was exceeded (429; 413 for request_too_large)
+    RESOURCE_EXHAUSTED = 5;   // a size, memory or concurrency ceiling was exceeded (429; 413 for request_too_large)
     UNAVAILABLE = 6;          // the target exists but cannot serve now: shutting down, being deleted, failed to load (503)
     INTERNAL = 7;             // a server-side failure the request did not cause (500)
+    CANCELLED = 8;            // the client went away or the node is shutting down (499)
+    DEADLINE_EXCEEDED = 9;    // reserved: a search past its deadline returns partial results instead (504)
   }
   Kind kind = 1;
   string code = 2;
@@ -690,6 +700,12 @@ message SearchResponse {
   Error error = 3;
   repeated Warning warnings = 4; // final response only, on success or failure
   ExecutionProfile profile = 5; // final response only, when SearchRequest.profile is true
+
+  // Final response only: the search ran out of time (SearchRequest.timeout_ms)
+  // and stopped early. Ops hold what was collected by then: counts and facet
+  // buckets may be low, and top documents are the best of the documents seen.
+  // A timed_out warning accompanies it.
+  bool timed_out = 6;
   bool more = 15;  // if true, expect at least one more streaming response to the logical request.
 }
 

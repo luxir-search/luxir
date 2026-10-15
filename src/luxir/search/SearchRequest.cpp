@@ -31,6 +31,13 @@ void SearchRequest::warnOnce(std::string_view code, std::string_view message) {
                       build::arenaStr(requestPool, message)});
 }
 
+void SearchRequest::markTimedOut() {
+  warnOnce("timed_out", "the search ran past its deadline; results are partial");
+  std::lock_guard<std::mutex> lock(mutex);
+  if (lastResponse == nullptr) lastResponse = SearchResponse::create(*this, true);
+  lastResponse->proto.timed_out = true;
+}
+
 void SearchRequest::maybeSendFinal(bool endingStream) {
   bool send;
   {

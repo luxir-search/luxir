@@ -114,6 +114,10 @@ static http::status httpStatusFor(const ErrorInfo& info) {
     case ErrorKind::FAILED_PRECONDITION: return http::status::forbidden;
     case ErrorKind::RESOURCE_EXHAUSTED: return http::status::too_many_requests;
     case ErrorKind::UNAVAILABLE: return http::status::service_unavailable;
+    // 499 is the de facto "client closed request" status; beast has no
+    // enumerator for it, and the client is usually gone before it is written.
+    case ErrorKind::CANCELLED: return (http::status)499;
+    case ErrorKind::DEADLINE_EXCEEDED: return http::status::gateway_timeout;
     case ErrorKind::INTERNAL:
     case ErrorKind::UNKNOWN: break;
   }
@@ -1208,6 +1212,8 @@ private:
     appendStringParam(params, "min_commit", false, json, overlay);
     if (!appendIntegerParam<std::uint64_t>(params, "min_commit_timeout_ms", "unsigned 64-bit decimal integer",
                                           false, json, overlay, err)) return false;
+    if (!appendIntegerParam<std::uint64_t>(params, "timeout_ms", "unsigned 64-bit decimal integer",
+                                          false, json, overlay, err)) return false;
     if (!appendBoolParam(params, "profile", false, json, overlay, err)) return false;
     if (!appendIntegerParam<std::int32_t>(params, "max_parallel",
                                          "signed 32-bit decimal integer", false,
@@ -1627,9 +1633,10 @@ private:
     auto& engine = node_.getSearchEngine();
     auto* sreq = luxir::arenaCreate<HttpSearchRequest>(
         *arena, engine, std::move(requestState), shared_from_this(), *arena);
-    if (!sreq->proto.min_commit.empty()) {
-      sreq->waitCancellation = waitCancellation;
-    }
+    // The session's stop source fires when the connection closes or the
+    // server shuts down: a min_commit wait gives up, and execution stops at
+    // its next segment or window check (SearchEngine::dispatch).
+    sreq->waitCancellation = waitCancellation;
     sreq->format = format;
     sreq->docsState.multiOp = docsMultiOp;
     sreq->docsState.requestId = sreq->proto.request_id;
