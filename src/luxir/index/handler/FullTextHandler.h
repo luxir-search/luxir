@@ -113,7 +113,7 @@ public:
         pos += POSITION_INCREMENT_GAP;
       }
       first = false;
-      tc.head.setValue(val);
+      tc.setValue(val);
       tc.reset();
       for (;;) {
         bool hasNext = tail.incrementToken();

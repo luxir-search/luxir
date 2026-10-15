@@ -311,7 +311,7 @@ private:
     Token& tok = tc.head.getToken();
     TokenStream& tail = *tc.tail;
     std::vector<std::string_view> terms;
-    tc.head.setValue(text);
+    tc.setValue(text);
     tc.reset();
     while (tail.incrementToken()) {
       terms.push_back(poolCopy(fitTerm(target, tok.text)));
@@ -469,7 +469,7 @@ public:
         char buf[coerce::TEXT_BUF_SIZE];
         std::string_view term = coerceAnyOfTerm(fieldType, field, value, buf);
         if (fieldType.type() == FieldType::Type::TEXT) {
-          normalizer->head.setValue(term);
+          normalizer->setValue(term);
           normalizer->reset();
           if (!normalizer->tail->incrementToken()) continue;
           // Token bytes are borrowed only until the next pull, including EOF.
@@ -1226,7 +1226,7 @@ public:
     if (valuePositions.empty()) {
       int64_t pos = -1;  // first token's positionIncrement (>= 1) lands it at >= 0
       for (std::string_view value : values) {
-        tc.head.setValue(value);
+        tc.setValue(value);
         tc.reset();
         while (tail.incrementToken()) {
           pos += (int64_t) tok.positionIncrement;
@@ -1238,7 +1238,7 @@ public:
       for (size_t i = 0; i < values.size(); i++) {
         int64_t base = (int64_t) valuePositions[i] + carry;
         int64_t relPos = -1;  // position within this value, relative to base
-        tc.head.setValue(values[i]);
+        tc.setValue(values[i]);
         tc.reset();
         while (tail.incrementToken()) {
           relPos += (int64_t) tok.positionIncrement;

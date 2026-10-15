@@ -151,7 +151,8 @@ static void parseSchemaDef(std::string_view bytes, luxir::api::SchemaDef& def,
 // and gets the whitespace tokenizer.
 static bool analyzerSet(const luxir::api::FieldDef& def) {
   return def.analyzer.has_value() &&
-         (def.analyzer->tokenizer.has_value() || !def.analyzer->filters.empty());
+         (def.analyzer->tokenizer.has_value() || !def.analyzer->filters.empty() ||
+          !def.analyzer->char_filters.empty());
 }
 
 // Pass 1: physical settings only. Variant parent edges consult this completed

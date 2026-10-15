@@ -272,7 +272,7 @@ publication advances the schema generation.
 | `multi` | multi-valued |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_`; see [Stored resources](#stored-resources) |
-| `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`; see [Text analysis](#text-analysis) |
+| `analyzer` | `text` only: `{"char_filters": [...], "tokenizer": <component>, "filters": [...]}`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
@@ -291,7 +291,7 @@ type's default", and the schema you read back stays as sparse as the one you
 wrote.
 
 `analyzer` inherits as one unit: an empty `{}` inherits the parent's analyzer,
-while naming a tokenizer or listing any filter replaces the whole chain
+while naming a tokenizer or listing any character or token filter replaces the whole chain
 (filters alone get the `whitespace` tokenizer).
 
 `column` and `stored` solve different problems. A column is a typed,
@@ -369,7 +369,80 @@ live segment carrying one is used.
 
 ## Text analysis
 
-A text analyzer is one tokenizer followed by a list of filters:
+A text analyzer applies an ordered list of `char_filters` to the whole value,
+then one tokenizer, then an ordered list of token `filters`. Both lists are
+optional. Existing analyzers without `char_filters` retain their behavior.
+
+### Cleanup before tokenization
+
+```json
+{
+  "fields": {
+    "body": {
+      "type": "text",
+      "analyzer": {
+        "char_filters": [
+          "html_strip",
+          "nfkc_cf",
+          "fold",
+          {"name": "remove_chars", "params": {"chars": ["-", "\u2014"]}}
+        ],
+        "tokenizer": "unicode_word",
+        "filters": ["kstem"]
+      }
+    }
+  }
+}
+```
+
+Character filters run in the written order, separately for each field value.
+For example, HTML stripping followed by character removal can decode `&#45;`
+and then delete the resulting hyphen. Reversing those filters leaves that
+hyphen in the tokenizer's input. Removing `-` from `foo-bar` produces one
+`foobar` token, instead of two words separated by punctuation.
+
+| Character filter | Behavior |
+|---|---|
+| `lowercase` | Existing Unicode lowercase method, applied to the whole value. |
+| `nfkc_cf` | Existing Unicode NFKC case folding, including default-ignorable removal, before segmentation. |
+| `fold` | Existing accent/diacritic folding, applied before segmentation. |
+| `remove_chars` | Delete Unicode scalars listed in `params.chars`. Each entry must be exactly one character; supplementary characters are supported. An empty list is a no-op; duplicates have no effect. |
+| `html_strip` | Extract text, remove tags/comments/declarations and script/style contents, and decode named and numeric HTML character references once. |
+
+These are the supported character filters; stemming and English possessive
+removal remain token filters. All except `remove_chars` take no parameters.
+The same lowercase and folding methods can still be placed in `filters` to
+retain their existing per-token behavior. Moving a fold before segmentation
+can change word boundaries, so the two placements are not interchangeable.
+
+`html_strip` uses a forward scan with bounded named-reference lookup. It does
+not build a DOM, execute scripts, fetch resources, or expand document-defined
+entities. Each removed tag or markup region becomes a space, including inline
+tags: `one<b>two</b>` yields separate words. Attribute quotes are respected.
+Unterminated tags, comments, and script/style regions consume the remaining
+markup. Unknown references remain literal; invalid numeric scalars become
+U+FFFD. The named-reference table includes HTML's legacy semicolonless names.
+Decoded markup such as `&lt;b&gt;` remains text rather than being parsed again.
+This is a deterministic indexing text extractor, not a browser rendering model
+or an HTML sanitizer for safe display.
+
+Cleanup also runs for analyzed queries and before the existing normalization
+of prefix/fuzzy terms. Wildcard/regex queries retain per-codepoint literal
+normalization: character removal and folding apply, but multi-character HTML
+markup and entities are not decoded inside patterns. Already-analyzed phrase
+`terms` remain verbatim. Stored source values retain the submitted text.
+Token offsets map back to source byte spans, including through multiple cleanup
+stages; bytes introduced by a replacement refer to the source span that
+produced them. With no character filters, analysis still borrows the original
+input without a cleanup buffer or an offset-correction stage.
+
+An analyzer specifying only `char_filters` replaces the inherited analyzer
+and uses the default `whitespace` tokenizer. Schema changes affect future
+indexing; reindex existing documents to apply new cleanup rules to them.
+
+### Tokenizers and token filters
+
+A tokenizer is followed by the configured token filters:
 
 | Component | Meaning |
 |---|---|
