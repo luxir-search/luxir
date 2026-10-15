@@ -764,7 +764,27 @@ to its following value. The function spellings remain available:
 
 - Arithmetic: `add`, `sub`, `mul`, and `div`.
 - Defaults: `def(value, fallback)` substitutes only when `value` is missing.
-- Unary math: `neg`, `abs`, `sqrt`, `log`, `log1p`, and `floor`.
+- Unary math: `neg`, `abs`, `sqrt`, `log`, `log1p`, `floor`, and `exp`.
+  `pow(base, exponent)` always returns a double.
+- Comparisons: `<`, `<=`, `>`, `>=`, `==`, and `!=` (function spellings `lt`,
+  `lte`, `gt`, `gte`, `eq`, `ne`) return 1 or 0 and do not chain. Logical
+  `&&`, `||`, and `!` (`and`, `or`, `not`) treat any nonzero value as true and
+  return 1 or 0; `&&` and `||` evaluate their right side only when the left
+  side does not decide the result. Operands must be scalars.
+- Conditionals: `cond ? then : else`, or `if(cond, then, else)`, evaluates
+  only the selected branch, so `x_i > 0 ? log(x_i) : 0` is safe for
+  non-positive values. Both branches must be numbers or both DATE values.
+- `random(seed, value)` is a deterministic per-document number in `[0, 1)`
+  hashed from an integer seed and the value's first element (a field such as
+  `id_i`), like Elasticsearch `random_score` with `seed` and `field`. A
+  document without the value is missing. `random(seed)` hashes the document's
+  position in the index instead, which changes when segments merge, and
+  `random()` picks a fresh seed for every request.
+- `geo_distance(field, lat, lon)` is the haversine distance in meters from a
+  point to each value of a GEO_POINT field, the same distance `geo_distance`
+  queries use.
+- Decay functions `gauss`, `exp`, and `linear` (see
+  [Decay functions](#decay-functions)).
 - Multi-valued reducers: `min`, `max`, `avg`, `sum`, and `count`. Missing or
   empty arrays reduce to missing except for `count`, which returns zero (and
   one or zero for a present or missing scalar). Integer `sum` overflow makes
@@ -799,9 +819,69 @@ Multiplication, division, unary minus, and unary math such as `floor` demote a
 DATE to a number (`floor(when_dt / 86400000)` is an epoch-day number); adding
 two DATE values or subtracting a DATE from a number is rejected.
 
+A missing operand makes a comparison, logical operator, or condition
+missing; `def()` chooses a fallback.
+
 A rescore expression must produce a finite value for every matched document.
 Handle missing values with `def()` or exclude them with an `exists()` child
 query.
+
+### Decay functions
+
+`gauss`, `exp`, and `linear` follow Elasticsearch's `function_score` decay
+functions. Each takes a value, an `origin`, a `scale`, and optionally an
+`offset` (default 0) and a `decay` (default 0.5):
+
+```
+gauss(value, origin, scale, offset, decay)
+exp(value, origin, scale, offset, decay)
+linear(value, origin, scale, offset, decay)
+```
+
+With `d = max(0, |value - origin| - offset)`, the score is `decay` at
+distance `scale` beyond the offset and 1 within it:
+
+| Function | Score |
+|---|---|
+| `gauss` | `exp(ln(decay) * (d / scale)^2)` |
+| `exp` | `exp(ln(decay) * d / scale)` |
+| `linear` | `max(0, 1 - d * (1 - decay) / scale)` |
+
+The value is usually a numeric field, a DATE field (origin in epoch
+milliseconds, scale and offset in milliseconds), or `geo_distance(...)` with
+origin 0 and the scale and offset in meters. A multi-valued field uses its
+closest value (Elasticsearch's default `multi_value_mode` of `min`), and a
+document without a value scores 1, as in Elasticsearch. `scale`, `offset`,
+and `decay` must be literals or `$name` values; `scale` is positive, `offset`
+non-negative, and `decay` strictly between 0 and 1. `exp` with a single
+argument is the exponential function.
+
+Combine decays with the query score in a [rescore](query-reference.md#rescore)
+expression. This is the Elasticsearch request
+`{"function_score": {"query": ..., "functions": [{"gauss": {"published_dt":
+{"origin": "now", "scale": "7d"}}}, {"gauss": {"location": {"origin":
+"40.7,-74.0", "scale": "2km"}}}], "boost_mode": "multiply"}}`:
+
+```json
+{
+  "rescore": {
+    "query": {"match": {"title_t": "pizza"}},
+    "expr": "score * gauss(published_dt, $now, 604800000) * gauss(geo_distance(location, 40.7, -74.0), 0, 2000)",
+    "vars": {"now": 1767225600000}
+  }
+}
+```
+
+Elasticsearch's `function_score` maps onto value expressions as follows:
+
+| Elasticsearch | Value expression |
+|---|---|
+| `gauss`, `exp`, `linear` decay | `gauss(...)`, `exp(...)`, `linear(...)`; `geo_distance(...)` for geo fields |
+| `field_value_factor` | `def(field, missing) * factor` inside the modifier: `sqrt(...)`, `pow(..., 2)`, or `log(...) / log(10)` for the base-10 `log` |
+| `random_score` with `seed` and `field` | `random(seed, field)` |
+| `script_score` | the expression itself, with `?:`, comparisons, `exp`, and `pow` |
+| `weight`, `boost_mode`, `score_mode` | arithmetic over `score` and the function terms, `min`, `max` |
+| `filter` on a function | `cond ? f : 1` over column values |
 
 ## Field retrieval and result shape
 
