@@ -1187,7 +1187,7 @@ public:
     fieldInfo = finfo;
     hasFreqs = FieldType::hasFreqs(finfo->flags);
     hasPositions = FieldType::hasPositions(finfo->flags);
-    hasNorms = hasPositions;
+    hasNorms = FieldType::hasNorms(finfo->flags);
     termsLoc = termOutput.size();
     docsLoc = docOutput.size();
     posLoc = posOutput.size();

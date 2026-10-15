@@ -113,6 +113,7 @@ public:
     luxir::CachedFieldInfo* cachedFieldInfo = nullptr;
     luxir::CachedTermInfo* cachedTermInfo = nullptr;
     luxir::Similarity::BM25Scorer* simScorer = nullptr;
+    luxir::Similarity::BM25Scorer* normFreeScorer = nullptr;  // segments without norms
     float boost;
   public:
     Weight(Context& context, TermQuery& query, int32_t flags, float multiplier)
@@ -141,6 +142,12 @@ public:
           }
           simScorer = cachedTermInfo->simScorer;
         }
+        if (cachedFieldInfo->anyNormFree()) {
+          luxir::Similarity similarity;
+          normFreeScorer = context.pool.make<luxir::Similarity::BM25Scorer>(
+              similarity.getNormFreeScorer(1.0f, similarity.idf(
+                  cachedFieldInfo->fieldStats, query.scoringTermStats(*cachedTermInfo))));
+        }
       }
     }
 
@@ -168,7 +175,10 @@ public:
       luxir::NormsReader* normsReader = nullptr;
       luxir::IntColReader* valueReader = nullptr;
       luxir::OrdColReader* ordReader = nullptr;
-      if (segFieldInfo->type == FieldType::TEXT) {
+      if (CachedFieldInfo::normFree(*segFieldInfo)) {
+        return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normFreeScorer, boost,
+                                                  query.shouldUseFrontierBound());
+      } else if (segFieldInfo->type == FieldType::TEXT) {
         normsReader = targetPool.make<luxir::NormsReader>(segment.postingsReader(), *segFieldInfo);
       } else if (segFieldInfo->ordFormat != SegFieldInfo::ORD_NONE) {
         ordReader = targetPool.make<luxir::OrdColReader>(segment.postingsReader(), *segFieldInfo);
@@ -340,6 +350,8 @@ public:
     std::optional<luxir::IntColReader::Iterator> valueIter;
     luxir::OrdColReader* ordReader = nullptr;
     const uint8_t* flatNormsBase = nullptr;
+    // Text segment without norms: simScorer ignores the norm, so every doc reads 0.
+    bool normFree = false;
     luxir::Similarity::BM25Scorer* simScorer;
     ImpactsIndex impacts;
     float minCompetitiveScore = 0.0f;
@@ -424,6 +436,16 @@ public:
            float boost = 1.0f, bool useFrontierBound = true)
             : Scorer(docsEnum, ordReader, simScorer, boost, useFrontierBound) {
       buildImpacts(pool, ordReader != nullptr, useFrontierBound);
+    }
+
+    // Norm-free text segment; normFreeScorer comes from Similarity::getNormFreeScorer.
+    // Impacts come from the block max tf alone.
+    Scorer(luxir::MemPool& pool, luxir::DocsFreqEnum& docsEnum,
+           luxir::Similarity::BM25Scorer* normFreeScorer, float boost, bool useFrontierBound)
+            : docsEnum(docsEnum), normFree(true), simScorer(normFreeScorer), boost(boost) {
+      assert(normFreeScorer != nullptr);
+      competitiveBound = std::numeric_limits<float>::infinity();
+      buildImpacts(pool, true, useFrontierBound);
     }
 
     [[gnu::cold]] void prepareMembership() override {
@@ -599,6 +621,7 @@ public:
         return normsIter->value();
       }
       if (ordReader != nullptr) return ordReader->firstOrdAt(doc);
+      if (normFree) return 0;
       int32_t normDoc = valueIter->advance(doc);
       assert(normDoc == doc);
       return valueIter->value();
@@ -794,6 +817,11 @@ public:
           int32_t doc = blockDocs[(size_t) i];
           normBuf[i] = flatNormsBase[doc];
         }
+        simScorer->scoreBlock(blockFreqs.data(), normBuf, boost, scores, count);
+        return;
+      }
+      if (normFree) {
+        uint8_t normBuf[Postings::DOCS_BLOCK_SIZE] = {};
         simScorer->scoreBlock(blockFreqs.data(), normBuf, boost, scores, count);
         return;
       }

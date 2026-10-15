@@ -275,6 +275,12 @@ public:
     return BM25Scorer(boost, k1, b, idf_, avgdl);
   }
 
+  // BM25 for text segments without norms: b = 0 scores every document as if it
+  // had the average field length, so any encoded norm maps to the same factor.
+  BM25Scorer getNormFreeScorer(float boost, float idf_) {
+    return BM25Scorer(boost, k1, 0.0f, idf_, 1.0f);
+  }
+
   float idf(int64_t docFreq, int64_t docCount) {
     return (float) std::log1p( (docCount - docFreq + 0.5L) / (docFreq + 0.5L) );
   }

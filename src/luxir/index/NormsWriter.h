@@ -91,13 +91,15 @@ private:
   }
 
 public:
+  // Without norms only the presence set is written; normsFormat stays NORMS_NONE
+  // and normBytes must be empty.
   static PreparedNorms prepare(MemPool& pool, PostingsWriter& postingsWriter,
                                PostingsWriter::IndexFieldInfo& fieldInfo,
                                const Stream& normBytes, DocStream& docsWithVal,
-                               int32_t docsWithField) {
+                               int32_t docsWithField, bool hasNorms = true) {
     int32_t maxDoc = postingsWriter.getMaxDoc();
     assert(maxDoc >= docsWithField);
-    assert(normBytes.size(pool) == docsWithField);
+    assert(normBytes.size(pool) == (hasNorms ? docsWithField : 0));
 
     PreparedNorms prepared;
     prepared.docsWithField = docsWithField;
@@ -112,8 +114,13 @@ public:
       return prepared;
     }
 
+    fieldInfo.normsFormat = SegFieldInfo::NORMS_NONE;
+    fieldInfo.normsLoc = {0, 0};
+    fieldInfo.normsLen = 0;
     prepared.flat = useDocIdIndexing(docsWithField, maxDoc);
-    prepared.ordinalNorms = materializeOrdinalNorms(pool, normBytes, docsWithField);
+    if (hasNorms) {
+      prepared.ordinalNorms = materializeOrdinalNorms(pool, normBytes, docsWithField);
+    }
 
     if (docsWithField < maxDoc) {
       writePresenceBitset(pool, postingsWriter, fieldInfo, docsWithVal, docsWithField, prepared);
@@ -132,7 +139,7 @@ public:
     assert(maxDoc == postingsWriter.getMaxDoc());
     assert(maxDoc >= docsWithField);
 
-    if (docsWithField == 0) {
+    if (docsWithField == 0 || prepared.ordinalNorms.empty()) {
       return;
     }
 

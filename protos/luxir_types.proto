@@ -1544,6 +1544,22 @@ message FieldDef {
     HASH128 = 2;  // prefix of at most 230 bytes plus 25 base36 hash digits
   }
   optional LongTerms long_terms = 16; // absent: inherit from parent, else hash128
+
+  // TEXT only: what the postings record per term. Lower levels are smaller and
+  // index faster. Phrase queries need POSITIONS; at DOCS every match scores
+  // with term frequency 1. A change applies to newly indexed documents; a merge
+  // keeps only what both the current schema and every merged segment have.
+  enum IndexOptions {
+    DOCS = 0;      // doc ids only; every match has term frequency 1, no norms
+    FREQS = 1;     // doc ids and term frequencies
+    POSITIONS = 2; // doc ids, term frequencies and positions
+  }
+  optional IndexOptions index_options = 17; // absent: inherit from parent, else positions
+
+  // TEXT only: keep per-document length norms for BM25. false scores every
+  // document as if it had the average field length. Requires FREQS or
+  // POSITIONS. Absent: inherit from parent, else true (false at DOCS).
+  optional bool norms = 18;
 }
 
 message SchemaDef {

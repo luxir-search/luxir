@@ -25,9 +25,13 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
       case TermPolicy::REJECT: properties["long_terms"] = "\"reject\""; break;
     }
   }
+  if (type.type() == FieldType::TEXT && type.indexed()) {
+    properties["index_options"] = type.hasPositions() ? "\"positions\"" : type.hasFreqs() ? "\"freqs\"" : "\"docs\"";
+    properties["norms"] = type.hasNorms() ? "true" : "false";
+  }
   // Include the term recording and norm choices for hand-built field types too.
   properties["posting_flags"] = std::to_string(type.flags_ &
-      (FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::NUM_TOKENS_APPROX | FieldType::NUM_TOKENS_EXACT));
+      (FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::OMIT_NORMS));
   if (auto* text = dynamic_cast<TextFieldType*>(&type)) properties["analyzer"] = text->analyzer_->canonical;
   if (auto* str = dynamic_cast<StrFieldType*>(&type)) {
     properties["normalizer"] = "[]";
