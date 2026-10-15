@@ -683,6 +683,12 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
       (e.isTemplate ? templatePairs : fieldPairs).push_back({e.name, &e.def});
     }
     luxir::api::SchemaDef src;
+    // A SET without index_sort keeps the base setting; an empty field clears it.
+    auto indexSort = def.index_sort ? def.index_sort : baseSrc.index_sort;
+    if (indexSort && !indexSort->field.empty()) {
+      src.index_sort = indexSort;
+      schema->indexSortField = indexSort->field;
+    }
     src.fields = luxir::api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(fieldPairs.data(), fieldPairs.size()));
     src.templates = luxir::api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
@@ -792,6 +798,18 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
       for (const auto& [label, ft] : logical->variants) schema->fieldTypeMap.emplace(ft->name(), ft);
     }
     schema->logicalFields.emplace(e.name, std::move(logical));
+  }
+
+  if (!schema->indexSortField.empty()) {
+    const auto& field = schema->indexSortField;
+    auto* ft = schema->findPhysical(field);
+    if (ft == nullptr) {
+      throw SchemaError("index_sort field is not defined by a field or template: " + field);
+    }
+    auto type = (*ft)->type();
+    if ((type != FieldType::INT && type != FieldType::DATE) || !(*ft)->hasColumn()) {
+      throw SchemaError("index_sort field must be an int or date field with a column: " + field);
+    }
   }
 
   // Ensure the default stored-fields resource is available in every schema.

@@ -87,6 +87,7 @@ struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
 namespace KnnQuery_ { struct Ivf; }
+namespace SchemaDef_ { struct IndexSort; }
 
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
 namespace Error_ {
@@ -472,9 +473,14 @@ struct KnnQuery {                                                // needs Vector
   int32_t refine_candidates = 0;
   bool exact = false;
 };
+namespace SchemaDef_ {
+struct IndexSort { std::string_view field; };
+} // namespace SchemaDef_
 struct SchemaDef {
+  using IndexSort = luxir::api::SchemaDef_::IndexSort;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> templates;
+  std::optional<IndexSort> index_sort;
 };
 struct ColVector { std::span<const Vector> v; };
 struct ArrVector { std::span<const Vector> v; };
@@ -763,7 +769,7 @@ LUXIR_TD(ColFloat) LUXIR_TD(ColDouble)
 LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
 LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
-LUXIR_TD(KnnQuery_::Ivf)
+LUXIR_TD(KnnQuery_::Ivf) LUXIR_TD(SchemaDef_::IndexSort)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)

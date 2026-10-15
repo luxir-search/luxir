@@ -686,6 +686,9 @@ private:
   // The segment's PostingsReader: its slot's, else the published reader's, else a new one; the
   // slot keeps it.
   std::shared_ptr<PostingsReader> getSegmentPostingsReader(SegInfo& seg);
+  // Merge source order: segId, or ascending per-source minimum of the schema's
+  // index sort field (sources without values last, ties by segId).
+  void sortMergeSources(std::vector<SegInfo*>& segs, const std::string& indexSortField);
   void seedActiveVectorOverlayNamesFromManifestLocked();
   void activateVectorOverlayNames(std::span<const std::string> names);
   std::vector<std::string> snapshotActiveVectorOverlayNames();

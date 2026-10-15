@@ -1201,6 +1201,50 @@ TEST_F(SchemaTest, longTermsRequiresEligibleTypeAndKnownPolicy) {
   EXPECT_NO_THROW(schemaJson(R"({"fields":{"body":{"type":"text","index":"none","long_terms":"reject"}}})"));
 }
 
+TEST_F(SchemaTest, indexSortValidationRoundTripAndSetSemantics) {
+  auto s = schemaJson(R"({"templates":{"_i":"int"},"fields":{"ts":"date","name":"string","price":"float"},
+    "index_sort":{"field":"ts"}})");
+  EXPECT_EQ("ts", s->indexSortField);
+  auto json = authoredJson(*s);
+  EXPECT_NE(std::string::npos, json.find(R"("index_sort":{"field":"ts"})"));
+  EXPECT_EQ(s->sourceDef_, schemaJson(json)->sourceDef_);
+  std::pmr::monotonic_buffer_resource arena;
+  EXPECT_EQ("ts", Schema::fromStored(s->storedInfo(arena), 1)->indexSortField);
+
+  // A SET without index_sort keeps it, a template instance is accepted, and
+  // an empty field clears it.
+  EXPECT_EQ("ts", schemaJson(R"({"fields":{"n":"int"}})", s.get())->indexSortField);
+  EXPECT_EQ("n_i", schemaJson(R"({"index_sort":{"field":"n_i"}})", s.get())->indexSortField);
+  auto cleared = schemaJson(R"({"index_sort":{}})", s.get());
+  EXPECT_EQ("", cleared->indexSortField);
+  EXPECT_EQ(std::string::npos, authoredJson(*cleared).find("index_sort"));
+  EXPECT_EQ("", schemaJson(R"({"fields":{"n":"int"}})", cleared.get())->indexSortField);
+
+  for (auto field : {"missing", "_i", "name", "price"}) {
+    SCOPED_TRACE(field);
+    EXPECT_THROW(schemaJson(std::format(R"({{"index_sort":{{"field":"{}"}}}})", field), s.get()), SchemaError);
+  }
+  // Removing the sort field must also clear or move the index sort.
+  EXPECT_THROW(schemaJson(R"({"fields":{"ts":"string"}})", s.get()), SchemaError);
+}
+
+TEST_F(SchemaTest, indexSortSurvivesRestart) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  LuxirNode node(config);
+  CollectionHelper ch(node);
+  SchemaBuilder b;
+  b.indexSort("ts_dt");
+  b.set(ch.collection());
+  ch.index(flatdoc("id", "1", "ts_dt", (int64_t)1000));
+  ch.commit();
+
+  ch.getIndexWriter()->close();
+  CommitSnapshotRegistry reopenedSnapshots(*ch.collection().getShard()->getDirectory());
+  IndexWriter reopened(reopenedSnapshots);
+  EXPECT_EQ("ts_dt", reopened.getSchema()->indexSortField);
+}
+
 TEST_F(SchemaTest, variantsResolveByOperationAndExplicitSelectors) {
   auto s = schemaJson(R"({"fields":{
     "author":{"type":"text","variants":{"s":"string"}},
