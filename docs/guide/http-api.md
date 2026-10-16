@@ -17,6 +17,7 @@ credentials. Administration and snapshot routes may name another tenant under
 | `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
+| `GET /collections/{collection}/_schema?view=fields` | List the retrievable fields (`name`, `type`, `derived`), including dynamic fields; the HTTP form of `Admin/ListFields`. |
 | `GET /collections/{collection}/_schema?view=resolved` | Read physical representations, bindings, and conservative schema coverage; HTTP only. |
 | `POST /collections/{collection}/_schema` | Set definitions or replace the schema; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |
 | `GET /collections/_list` (or `POST`) | List collection names; `GET /collections` is a synonym. |

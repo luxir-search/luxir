@@ -25,6 +25,7 @@ struct CollapsedPageSettings {
   bool getNumber;
   bool getScores;
   api::DocFormat documentFormat;
+  bool discoveredAsColumns;
   Query::SegmentSource* members;
   std::span<const DomainHandle> domains;
   api::GroupTable*& pageGroups;

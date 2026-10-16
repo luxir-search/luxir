@@ -27,6 +27,7 @@ defaults and constraints are described in the comments and guides.
 |---|---|---|---|
 | <a id="method-luxir.admin.setschema"></a>[`SetSchema`](#method-luxir.admin.setschema) | [`SchemaRequest`](#message-luxir.schemarequest) | [`SchemaResponse`](#message-luxir.schemaresponse) |  |
 | <a id="method-luxir.admin.getschema"></a>[`GetSchema`](#method-luxir.admin.getschema) | [`SchemaRequest`](#message-luxir.schemarequest) | [`SchemaResponse`](#message-luxir.schemaresponse) |  |
+| <a id="method-luxir.admin.listfields"></a>[`ListFields`](#method-luxir.admin.listfields) | [`FieldsRequest`](#message-luxir.fieldsrequest) | [`FieldsResponse`](#message-luxir.fieldsresponse) | The retrievable fields of a collection, including dynamically created ones. |
 | <a id="method-luxir.admin.createcollection"></a>[`CreateCollection`](#method-luxir.admin.createcollection) | [`CreateCollectionRequest`](#message-luxir.createcollectionrequest) | [`CreateCollectionResponse`](#message-luxir.createcollectionresponse) |  |
 | <a id="method-luxir.admin.deletecollection"></a>[`DeleteCollection`](#method-luxir.admin.deletecollection) | [`DeleteCollectionRequest`](#message-luxir.deletecollectionrequest) | [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse) |  |
 | <a id="method-luxir.admin.stats"></a>[`Stats`](#method-luxir.admin.stats) | [`StatsRequest`](#message-luxir.statsrequest) | [`StatsResponse`](#message-luxir.statsresponse) |  |
@@ -108,7 +109,11 @@ defaults and constraints are described in the comments and guides.
 - [`FieldDef`](#message-luxir.fielddef)
 - [`FieldDefaults`](#message-luxir.fielddefaults)
 - [`FieldFacet`](#message-luxir.fieldfacet)
+- [`FieldInfo`](#message-luxir.fieldinfo)
+- [`FieldMetadataStats`](#message-luxir.fieldmetadatastats)
 - [`FieldVariants`](#message-luxir.fieldvariants)
+- [`FieldsRequest`](#message-luxir.fieldsrequest)
+- [`FieldsResponse`](#message-luxir.fieldsresponse)
 - [`Filter`](#message-luxir.filter)
 - [`FollowerStatus`](#message-luxir.followerstatus)
 - [`Fusion`](#message-luxir.fusion)
@@ -680,7 +685,7 @@ A document cap, applied before paging in the list's ordinary rank order.
 
 ### luxir.DocList
 
-A batch of returned documents. Document i is the merge of columns row i and docs\[i\]; all-columns (docs absent) and all-docs (columns empty) are just the degenerate cases. Which fields land where is a function of the request (see DocFormat), never of the data.
+A batch of returned documents. Document i is the merge of columns row i and docs\[i\]; all-columns (docs absent) and all-docs (columns empty) are just the degenerate cases. Which fields land where is a function of the request (see DocFormat), never of the data, except that with discovered\_as\_columns the discovered columns present are per batch.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -879,6 +884,38 @@ Buckets of distinct field values, using the field's value binding. STRING/ID sup
 | <a id="field-luxir.fieldfacet.count_unit"></a>[`count_unit`](#field-luxir.fieldfacet.count_unit) | 9 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Unset inherits a parent facet's measure, or counts groups beneath a collapsed list; entering group ops defaults to docs. Explicit GROUPS uses the nearest enclosing collapse, including inside a group. Controls count, count order, mincount, and missing; metrics still fold documents. |
 | <a id="field-luxir.fieldfacet.count_distinct"></a>[`count_distinct`](#field-luxir.fieldfacet.count_distinct) | 10 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys per bucket, also usable without collapse. Same key types and missing policies as Collapse. Conflicting measures are errors. |
 
+<a id="message-luxir.fieldinfo"></a>
+
+### luxir.FieldInfo
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.fieldinfo.name"></a>[`name`](#field-luxir.fieldinfo.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.fieldinfo.type"></a>[`type`](#field-luxir.fieldinfo.type) | 2 | `string` | singular | One of: text, string, id, int, float, double, date. |
+| <a id="field-luxir.fieldinfo.derived"></a>[`derived`](#field-luxir.fieldinfo.derived) | 3 | `bool` | singular | True for a derived representation of a logical field (named root\_\_variant) rather than the logical field itself. |
+
+<a id="message-luxir.fieldmetadatastats"></a>
+
+### luxir.FieldMetadataStats
+
+Cached field metadata payload, excluding allocator overhead and unused hash-table capacity.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.fieldmetadatastats.bytes"></a>[`bytes`](#field-luxir.fieldmetadatastats.bytes) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.directories"></a>[`directories`](#field-luxir.fieldmetadatastats.directories) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.directory_bytes"></a>[`directory_bytes`](#field-luxir.fieldmetadatastats.directory_bytes) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.pages"></a>[`pages`](#field-luxir.fieldmetadatastats.pages) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.page_bytes"></a>[`page_bytes`](#field-luxir.fieldmetadatastats.page_bytes) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.entries"></a>[`entries`](#field-luxir.fieldmetadatastats.entries) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.entry_bytes"></a>[`entry_bytes`](#field-luxir.fieldmetadatastats.entry_bytes) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.names"></a>[`names`](#field-luxir.fieldmetadatastats.names) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.name_bytes"></a>[`name_bytes`](#field-luxir.fieldmetadatastats.name_bytes) | 9 | `uint64` | singular |  |
+
 <a id="message-luxir.fieldvariants"></a>
 
 ### luxir.FieldVariants
@@ -890,6 +927,29 @@ Alternate representations of the same input value, keyed by local label. Absent 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.fieldvariants.entries"></a>[`entries`](#field-luxir.fieldvariants.entries) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Each representation is addressed as &lt;field&gt;\_\_&lt;label&gt;. Variant definitions may inherit physical settings through parent, but cannot set multi, stored, stored\_resource, variants, or defaults. All representations share the logical field's scalar, vector, or geographic shape. |
+
+<a id="message-luxir.fieldsrequest"></a>
+
+### luxir.FieldsRequest
+
+The fields a collection can return, as the engine sees them at query time: the retrievable catalog of its current snapshot. Unlike the authored schema (SchemaDef) it includes fields created from dynamic-field templates, and it grows as new dynamic fields are indexed. These are the names an empty or wildcard TopDocs.fields selector can return.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.fieldsrequest.collection"></a>[`collection`](#field-luxir.fieldsrequest.collection) | 1 | `string` | singular | empty selects the default collection, "main" |
+| <a id="field-luxir.fieldsrequest.tenant"></a>[`tenant`](#field-luxir.fieldsrequest.tenant) | 2 | `string` | singular | Administration only: the owning tenant. Empty is the caller's tenant. |
+
+<a id="message-luxir.fieldsresponse"></a>
+
+### luxir.FieldsResponse
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.fieldsresponse.fields"></a>[`fields`](#field-luxir.fieldsresponse.fields) | 1 | [`FieldInfo`](#message-luxir.fieldinfo) | repeated | sorted by name |
 
 <a id="message-luxir.filter"></a>
 
@@ -921,7 +981,7 @@ Alternate representations of the same input value, keyed by local label. Absent 
 
 ### luxir.Fusion
 
-Hybrid-search fusion: run several source queries (each a full TopDocs spec) and merge their results into a single ranked list.<br><br>Per-source response-shape fields (\`fields\`, \`batch\_size\`, \`offset\`, \`get\_scores\`, \`get\_number\`, \`document\_format\`) are ignored - Fusion controls response shape at the top level. Per-source \`ops\` are rejected; put facets and metrics in Fusion.ops. Each source's \`query\`, \`sort\`, \`limit\`, and any per-source \`filter\` are used to produce that source's ranked list. A source collapse accepts only field and missing, and its limit counts groups; the head documents enter document fusion. Source collapse head\_sort, sort, get\_number and ops are errors.<br><br>The fusion-level \`filter\` is ANDed with each source's own filters.
+Hybrid-search fusion: run several source queries (each a full TopDocs spec) and merge their results into a single ranked list.<br><br>Per-source response-shape fields (\`fields\`, \`batch\_size\`, \`offset\`, \`get\_scores\`, \`get\_number\`, \`document\_format\`, \`discovered\_as\_columns\`) are ignored - Fusion controls response shape at the top level. Per-source \`ops\` are rejected; put facets and metrics in Fusion.ops. Each source's \`query\`, \`sort\`, \`limit\`, and any per-source \`filter\` are used to produce that source's ranked list. A source collapse accepts only field and missing, and its limit counts groups; the head documents enter document fusion. Source collapse head\_sort, sort, get\_number and ops are errors.<br><br>The fusion-level \`filter\` is ANDed with each source's own filters.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -944,6 +1004,7 @@ Required fusion method: exactly one.
 | <a id="field-luxir.fusion.fields"></a>[`fields`](#field-luxir.fusion.fields) | 7 | `string` | repeated | as TopDocs.fields: empty returns every retrievable field, '\*' patterns expand |
 | <a id="field-luxir.fusion.batch_size"></a>[`batch_size`](#field-luxir.fusion.batch_size) | 8 | `int32` | singular | same batching rules as TopDocs.batch\_size |
 | <a id="field-luxir.fusion.document_format"></a>[`document_format`](#field-luxir.fusion.document_format) | 9 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
+| <a id="field-luxir.fusion.discovered_as_columns"></a>[`discovered_as_columns`](#field-luxir.fusion.discovered_as_columns) | 12 | `bool` | singular | as TopDocs.discovered\_as\_columns |
 | <a id="field-luxir.fusion.collapse"></a>[`collapse`](#field-luxir.fusion.collapse) | 17 | [`Collapse`](#message-luxir.collapse) | singular | Collapse the fused document list before paging. Source windows never refill. found counts eligible groups; found\_docs counts eligible fused documents. |
 | <a id="field-luxir.fusion.ops"></a>[`ops`](#field-luxir.fusion.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Runs over the union of filtered source ranked lists, even with collapse. Fusion limit and offset do not affect this candidate domain. |
 | <a id="field-luxir.fusion.weights"></a>[`weights`](#field-luxir.fusion.weights) | 16 | map&lt;`string`, `double`&gt; | map | Per-source weights keyed by source name, used by the fusion method. A source without an entry has weight 1. Weights must be finite, &gt;= 0, and within float range, every key must name a source, and at least one source must have a weight &gt; 0. A zero weight disables its source: it is not executed and its documents do not enter the fused list, found, or the ops domain. |
@@ -1202,6 +1263,7 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.indexing_budget"></a>[`indexing_budget`](#field-luxir.memorystats.indexing_budget) | 1 | [`IndexRamStats`](#message-luxir.indexramstats) | singular |  |
 | <a id="field-luxir.memorystats.storage_ram"></a>[`storage_ram`](#field-luxir.memorystats.storage_ram) | 2 | [`StorageRamStats`](#message-luxir.storageramstats) | singular |  |
 | <a id="field-luxir.memorystats.jemalloc"></a>[`jemalloc`](#field-luxir.memorystats.jemalloc) | 3 | [`JemallocStats`](#message-luxir.jemallocstats) | singular | Present only when Luxir runs on jemalloc. |
+| <a id="field-luxir.memorystats.field_metadata"></a>[`field_metadata`](#field-luxir.memorystats.field_metadata) | 4 | [`FieldMetadataStats`](#message-luxir.fieldmetadatastats) | singular |  |
 
 <a id="message-luxir.multivector"></a>
 
@@ -1775,13 +1837,14 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 | <a id="field-luxir.topdocs.limit"></a>[`limit`](#field-luxir.topdocs.limit) | 4 | `sint64` | optional | Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining. |
 | <a id="field-luxir.topdocs.get_number"></a>[`get_number`](#field-luxir.topdocs.get_number) | 5 | `bool` | singular | return the number of matching documents |
 | <a id="field-luxir.topdocs.get_scores"></a>[`get_scores`](#field-luxir.topdocs.get_scores) | 6 | `bool` | singular | return the relevancy score for each document returned |
-| <a id="field-luxir.topdocs.fields"></a>[`fields`](#field-luxir.topdocs.fields) | 7 | `string` | repeated | Fields to return for each document. Empty returns every retrievable field (stored or column-backed; not vectors or engine fields such as \_version\_), discovered from the index and placed in per-document rows (DocList.docs). A name containing '\*' is a pattern expanded the same way: the matching retrievable fields, in rows; matching nothing is not an error. Explicitly named fields win on collision and may name anything, vectors and engine fields included. |
+| <a id="field-luxir.topdocs.fields"></a>[`fields`](#field-luxir.topdocs.fields) | 7 | `string` | repeated | Fields to return for each document. Empty returns every retrievable field (stored or column-backed; not vectors or engine fields such as \_version\_), discovered from the index and placed in per-document rows (DocList.docs), or in dense columns when discovered\_as\_columns is set under COLUMNS. A name containing '\*' is a pattern expanded the same way: the matching retrievable fields; matching nothing is not an error. Explicitly named fields win on collision and may name anything, vectors and engine fields included. |
 | <a id="field-luxir.topdocs.sort"></a>[`sort`](#field-luxir.topdocs.sort) | 8 | [`SortSpec`](#message-luxir.sortspec) | repeated |  |
 | <a id="field-luxir.topdocs.batch_size"></a>[`batch_size`](#field-luxir.topdocs.batch_size) | 9 | `int32` | singular | Maximum documents per streaming batch. Nonpositive = default (100); the server caps positive values at 256. More documents produce more batches. Ignored beneath a facet bucket, where all rows return together. |
 | <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
 | <a id="field-luxir.topdocs.diversify"></a>[`diversify`](#field-luxir.topdocs.diversify) | 12 | [`Diversify`](#message-luxir.diversify) | singular | Incompatible with collapse; found counts capped documents. |
 | <a id="field-luxir.topdocs.collapse"></a>[`collapse`](#field-luxir.topdocs.collapse) | 11 | [`Collapse`](#message-luxir.collapse) | singular | limit, offset and found count groups; found\_docs counts eligible documents. |
 | <a id="field-luxir.topdocs.ops"></a>[`ops`](#field-luxir.topdocs.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed over docs that match this query. |
+| <a id="field-luxir.topdocs.discovered_as_columns"></a>[`discovered_as_columns`](#field-luxir.topdocs.discovered_as_columns) | 13 | `bool` | singular | Under COLUMNS, also return discovered fields (empty or wildcard selectors) as dense columns rather than in docs. The column set then depends on the batch's documents, not only on the request: a discovered column with no present value in a batch is omitted from that batch, and a column's type can differ between batches. Readers must treat each batch's columns keys as authoritative. Fields with no column representation stay in docs. Explicitly named fields keep their always-present columns. Ignored under ROWS; rejected with response\_format DOCS. |
 
 <a id="message-luxir.updaterequest"></a>
 
@@ -1963,7 +2026,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 
 ### luxir.DocFormat
 
-Placement preference for returned document fields: dense columns (DocList.columns) vs per-document maps (DocList.docs). DEFAULT resolves per transport: HTTP/JSON -&gt; ROWS, gRPC -&gt; COLUMNS. Under COLUMNS, explicitly named fields are returned as dense columns while discovered fields (empty or wildcard selectors) use docs; under ROWS everything is returned in docs.
+Placement preference for returned document fields: dense columns (DocList.columns) vs per-document maps (DocList.docs). DEFAULT resolves per transport: HTTP/JSON -&gt; ROWS, gRPC -&gt; COLUMNS. Under COLUMNS, explicitly named fields are returned as dense columns while discovered fields (empty or wildcard selectors) use docs, unless the request sets discovered\_as\_columns; under ROWS everything is returned in docs.
 
 [Source](../../protos/luxir_types.proto)
 

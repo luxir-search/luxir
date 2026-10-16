@@ -249,13 +249,14 @@ void emitPage(const CollapsedPageSettings& settings,
     groupCount, settings.fields,
     settings.batchSize, settings.offset,
     settings.getNumber, settings.getScores,
-    settings.documentFormat, emission, std::move(metadata));
+    settings.documentFormat, settings.discoveredAsColumns, emission, std::move(metadata));
 }
 CollapsedPageSettings pageSettings(TopDocsReq& op, TopDocsReq::CalcBase& calc) {
   return {op, *op.collapse, *op.topDocsProto.collapse, op.sortPlan,
       op.headSort, op.groupOps, op.topDocsProto.fields, op.topDocsProto.batch_size,
       op.topDocsProto.offset, op.topDocsProto.get_number, op.topDocsProto.get_scores,
       op.topDocsProto.document_format,
+      op.topDocsProto.discovered_as_columns,
       calc.memberReplay ? (calc.preparedWeight
           ? static_cast<Query::SegmentSource*>(calc.preparedWeight.get()) : op.weight) : nullptr,
       calc.memberReplay ? std::span<const DomainHandle>(calc.memberReplay->domains)
@@ -316,6 +317,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.topDocsProto.get_number,
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
+        qr.topDocsProto.discovered_as_columns,
         emission);
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
@@ -331,6 +333,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.topDocsProto.get_number,
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
+        qr.topDocsProto.discovered_as_columns,
         emission);
     }
   }

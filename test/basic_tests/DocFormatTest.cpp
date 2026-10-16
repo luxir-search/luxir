@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <map>
 #include <string>
 
 #include "luxir/util/Signal.h"
@@ -306,6 +307,94 @@ TEST_F(DocFormatTest, wildcardFieldsDiscoverIntoRows) {
                                     "tags_ss", vecs("classic", "scifi")));
   EXPECT_CONTAINS_DOC(docs, flatdoc("id", std::string("b5"),
                                     "title_t", std::string("wildcards")));
+}
+
+// discovered_as_columns places discovered fields in dense columns; the
+// merged documents decode the same as the rows placement.
+TEST_F(DocFormatTest, discoveredAsColumnsPlacesDiscoveredFieldsInColumns) {
+  CollectionHelper ch;
+  indexBooks(ch);
+
+  auto run = [&](std::initializer_list<std::string> fields, bool flag) {
+    auto req = localReq(ch.getSearchEngine());
+    auto& op = req->collection("main").topDocs("q").allQuery().fields(fields).limit(-1);
+    op.documentFormat(api::DocFormat::COLUMNS).discoveredAsColumns(flag);
+    req->execute();
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    return req;
+  };
+
+  for (auto fields : {std::initializer_list<std::string>{}, {"*"}}) {
+    auto off = run(fields, false);
+    auto on = run(fields, true);
+    const auto* dl = on->docList("q");
+    ASSERT_NE(dl, nullptr);
+    EXPECT_EQ(3, dl->row_count);
+    EXPECT_TRUE(dl->docs.empty());
+    for (auto name : {"id", "title_t", "year_i", "rating_f", "price_d", "tags_ss"}) {
+      EXPECT_NE(nullptr, dl->columns.find(name)) << name;
+    }
+    EXPECT_EQ(nullptr, dl->columns.find("_version_"));
+    EXPECT_FALSE(off->docList("q")->docs.empty());
+    auto rowDocs = off->getDocs();
+    auto colDocs = on->getDocs();
+    ASSERT_EQ(rowDocs.size(), colDocs.size());
+    for (const auto& doc : rowDocs) EXPECT_TRUE(containsDoc(colDocs, doc));
+  }
+}
+
+// A discovered column with no value in the batch is dropped; a named column
+// stays even when every slot is missing.
+TEST_F(DocFormatTest, discoveredAsColumnsDropsAbsentDiscoveredColumns) {
+  CollectionHelper ch;
+  indexBooks(ch);
+
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("title_t", "messiah")
+      .fields({"price_d", "*"})
+      .documentFormat(api::DocFormat::COLUMNS).discoveredAsColumns().limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  const auto* dl = req->docList("q");
+  ASSERT_NE(dl, nullptr);
+  EXPECT_EQ(1, dl->row_count);
+  EXPECT_NE(nullptr, dl->columns.find("price_d"));  // named: always present
+  EXPECT_NE(nullptr, dl->columns.find("id"));
+  EXPECT_NE(nullptr, dl->columns.find("title_t"));
+  for (auto name : {"year_i", "rating_f", "tags_ss"}) {
+    EXPECT_EQ(nullptr, dl->columns.find(name)) << name;
+  }
+}
+
+// Under ROWS the flag has no effect.
+TEST_F(DocFormatTest, discoveredAsColumnsIgnoredUnderRows) {
+  CollectionHelper ch;
+  indexBooks(ch);
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery()
+      .documentFormat(api::DocFormat::ROWS).discoveredAsColumns().limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  const auto* dl = req->docList("q");
+  ASSERT_NE(dl, nullptr);
+  EXPECT_TRUE(dl->columns.empty());
+  EXPECT_EQ(3u, dl->docs.size());
+}
+
+// ListFields reports the retrievable catalog, including dynamic fields that
+// the authored schema never names.
+TEST_F(DocFormatTest, listFieldsIncludesDynamicFields) {
+  CollectionHelper ch;
+  indexBooks(ch);
+  std::pmr::monotonic_buffer_resource arena;
+  api::FieldsResponse response;
+  ch.collection().getReaderManager().listFields(response, arena);
+  std::map<std::string, std::string> byName;
+  for (const auto& f : response.fields) byName[std::string(f.name)] = std::string(f.type);
+  EXPECT_EQ("int", byName["year_i"]);
+  EXPECT_EQ("text", byName["title_t"]);
+  EXPECT_EQ("string", byName["tags_ss"]);
+  EXPECT_EQ(0u, byName.count("_version_"));
 }
 
 // Patterns with literal prefix/suffix parts select just the matching fields;

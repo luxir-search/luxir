@@ -86,6 +86,7 @@ public:
   OpCursor& getNumber(bool v = true);
   OpCursor& getScores(bool v = true);
   OpCursor& documentFormat(luxir::api::DocFormat v);
+  OpCursor& discoveredAsColumns(bool v = true);
   OpCursor& withStats() { return getNumber().getScores(); }
 
   // --- configure a facet op ---
@@ -631,6 +632,7 @@ inline OpCursor& OpCursor::fields(std::span<const std::string> fieldNames) {
 inline OpCursor& OpCursor::batchSize(int32_t n) { asTopDocs().batch_size = n; return *this; }
 inline OpCursor& OpCursor::getNumber(bool v) { asTopDocs().get_number = v; return *this; }
 inline OpCursor& OpCursor::getScores(bool v) { asTopDocs().get_scores = v; return *this; }
+inline OpCursor& OpCursor::discoveredAsColumns(bool v) { asTopDocs().discovered_as_columns = v; return *this; }
 inline OpCursor& OpCursor::documentFormat(luxir::api::DocFormat v) { asTopDocs().document_format = v; return *this; }
 
 inline OpCursor& OpCursor::limit(int64_t n) {
