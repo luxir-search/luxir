@@ -1216,27 +1216,300 @@ message ListTenantsResponse {
 // Operational statistics. An empty collection requests every
 // collection on the node; per-segment records are opt-in because they are the
 // only unbounded part of the response.
+// Which statistics to gather. The node scope (no collection, no tenant) always
+// returns the cheap counters: service activity and node memory, read from
+// atomics and allocator statistics. Anything that walks collections, lists
+// directories, or reads the operating system is opt-in. A tenant or a
+// collection scope always walks its collections and returns no node blocks.
 message StatsRequest {
+  reserved 4;
+  reserved "memory";
   // Empty selects every collection of `tenant`, or of every tenant when
   // `tenant` is also empty (administration).
   string collection = 1;
+  // Per-segment records. Implies `files`, and `collections` at node scope.
   bool segments = 2;
   // Administration only. With a collection, empty is the caller's tenant.
   string tenant = 3;
-  // Return only node memory statistics (StatsResponse.memory), without
-  // collections or totals. Node-wide: invalid with a collection, a tenant, or
-  // segments.
-  bool memory = 4;
+  // Node scope: also walk every collection (totals, index state, query cache,
+  // snapshot pins, inverters). Takes each writer's index lock briefly; no
+  // file I/O. Implied by a tenant or collection scope.
+  bool collections = 5;
+  // Also list index directories, filling the `bytes` totals, segment bytes and
+  // aux index bytes. Implies `collections` at node scope.
+  bool files = 6;
+  // Node scope only: process, host, network, disk, data filesystem, pressure
+  // and cgroup v2 statistics, read from procfs and cgroupfs (Linux only).
+  bool system = 7;
 }
 
 message StatsResponse {
   reserved 3, 6, 7;
   reserved "indexing_ram", "storage_ram", "big_buffer_ram";
+  // Set when collections are walked.
   StatsTotals totals = 1;
   repeated CollectionStats collections = 2;
   uint64 multiterm_expansion_refills = 8;
-  // Set only by a StatsRequest.memory request, which returns nothing else.
+  // Node scope only.
   MemoryStats memory = 9;
+  // Node scope only.
+  ServiceStats service = 10;
+  // Set by StatsRequest.system.
+  SystemStats system = 11;
+  // Collections whose statistics could not be read (for example, deleted
+  // while being walked). They are left out of the response.
+  uint64 collection_errors = 12;
+  // Time spent gathering this response, excluding serialization.
+  double duration_seconds = 13;
+}
+
+// Cumulative duration histogram. counts[i] is the number of observations at or
+// below ServiceStats.duration_bounds[i]; the last entry (+Inf) equals count.
+// counts is empty when count is zero.
+message HistogramStats {
+  repeated uint64 counts = 1;
+  double sum = 2;  // seconds
+  uint64 count = 3;
+}
+
+// One kind of work: currently running, completed by outcome, and the duration
+// of completed work (failed and cancelled work included).
+message ActivityStats {
+  int64 in_flight = 1;
+  uint64 ok = 2;
+  uint64 error = 3;
+  uint64 cancelled = 4;
+  HistogramStats duration = 5;
+}
+
+// Request traffic on one transport. Replication routes are not counted.
+message TransportStats {
+  // Keyed by operation: search, update, schema, collections, stats, health, other.
+  map<string, ActivityStats> operations = 1;
+  // First application error per HTTP request or gRPC call, including errors
+  // carried inside a successful transport response, keyed by error kind.
+  map<string, uint64> errors = 2;
+  uint64 received_bytes = 3; // application payload, excluding transport framing
+  uint64 sent_bytes = 4;     // application payload submitted for sending
+  uint64 stream_pauses = 5;  // response producers paused by flow control
+  uint64 connections = 6;    // HTTP only: live sessions, including idle keep-alive
+  int64 io_threads = 7;      // HTTP only: running connection shard threads
+}
+
+// Process-wide service counters since start. Counters reset on restart and
+// cache-control reset_counters does not touch them.
+message ServiceStats {
+  string version = 1;
+  bool read_only = 2;
+  // Upper bounds, in seconds, shared by every HistogramStats in the response.
+  repeated double duration_bounds = 3;
+  TransportStats http = 4;
+  TransportStats grpc = 5;
+  ActivityStats search = 6;
+  // Search body execution, excluding scheduler waits and streaming drains.
+  HistogramStats search_execution = 7;
+  uint64 search_resource_exhausted = 8;
+  uint64 search_warnings = 9;
+  ActivityStats index_batches = 10;
+  // Accepted into indexing (not durably acknowledged) or rejected/rolled back.
+  uint64 documents_accepted = 11;
+  uint64 documents_rejected = 12;
+  uint64 delete_ids_accepted = 13;
+  ActivityStats flush = 14;
+  ActivityStats commit = 15;
+  ActivityStats merge = 16;
+  ActivityStats vector_build = 17;
+  ActivityStats reader_refresh = 18;
+}
+
+// Operating system statistics. Collectors whose sources cannot be read are
+// listed in `unavailable` and their fields are omitted.
+message SystemStats {
+  ProcessStats process = 1;
+  HostCpuStats cpu = 2;
+  HostMemoryStats memory = 3;
+  repeated NetworkInterfaceStats network = 4;
+  TcpStats tcp = 5;
+  repeated DiskStats disks = 6;
+  // The data directory's filesystem; set only for the fs store backend.
+  FilesystemStats filesystem = 7;
+  repeated PressureStats pressure = 8;
+  CgroupStats cgroup = 9;
+  repeated string unavailable = 10;
+}
+
+message ProcessStats {
+  uint64 resident_bytes = 1;
+  uint64 virtual_bytes = 2;
+  uint64 swap_bytes = 3;
+  uint64 resident_anonymous_bytes = 4;
+  uint64 resident_file_bytes = 5;
+  uint64 resident_shared_bytes = 6;
+  uint64 resident_peak_bytes = 7;
+  uint64 threads = 8;
+  double cpu_seconds = 9;
+  uint64 voluntary_context_switches = 10;
+  uint64 involuntary_context_switches = 11;
+  uint64 minor_page_faults = 12;
+  uint64 major_page_faults = 13;
+  int64 max_fds = 14; // soft limit; -1 is unlimited
+  uint64 open_fds = 15;
+  double start_time_seconds = 16; // since the Unix epoch
+  uint64 disk_read_bytes = 17;
+  uint64 disk_written_bytes = 18;
+  uint64 io_read_bytes = 19;
+  uint64 io_written_bytes = 20;
+  uint64 io_read_calls = 21;
+  uint64 io_write_calls = 22;
+}
+
+message CpuTimes {
+  string cpu = 1;
+  double user = 2; // seconds; includes guest time
+  double nice = 3;
+  double system = 4;
+  double idle = 5;
+  double iowait = 6;
+  double irq = 7;
+  double softirq = 8;
+  double steal = 9;
+}
+
+message HostCpuStats {
+  repeated CpuTimes cpus = 1;
+  uint64 context_switches = 2;
+  uint64 forks = 3;
+  uint64 procs_running = 4;
+  uint64 procs_blocked = 5;
+  double boot_time_seconds = 6;
+  double load1 = 7;
+  double load5 = 8;
+  double load15 = 9;
+  uint64 filefd_allocated = 10;
+  uint64 filefd_maximum = 11;
+}
+
+// Host memory from /proc/meminfo and VM events from /proc/vmstat.
+message HostMemoryStats {
+  uint64 total_bytes = 1;
+  uint64 free_bytes = 2;
+  uint64 available_bytes = 3;
+  uint64 buffers_bytes = 4;
+  uint64 cached_bytes = 5;
+  uint64 swap_cached_bytes = 6;
+  uint64 swap_total_bytes = 7;
+  uint64 swap_free_bytes = 8;
+  uint64 dirty_bytes = 9;
+  uint64 writeback_bytes = 10;
+  uint64 mapped_bytes = 11;
+  uint64 shmem_bytes = 12;
+  uint64 slab_bytes = 13;
+  uint64 slab_reclaimable_bytes = 14;
+  uint64 slab_unreclaimable_bytes = 15;
+  uint64 page_tables_bytes = 16;
+  uint64 kernel_stack_bytes = 17;
+  uint64 anon_pages_bytes = 18;
+  uint64 page_faults = 19;
+  uint64 major_page_faults = 20;
+  uint64 swap_in_pages = 21;
+  uint64 swap_out_pages = 22;
+  uint64 oom_kills = 23;
+}
+
+// One interface in this network namespace (/proc/net/dev).
+message NetworkInterfaceStats {
+  string device = 1;
+  uint64 receive_bytes = 2;
+  uint64 receive_packets = 3;
+  uint64 receive_errs = 4;
+  uint64 receive_drop = 5;
+  uint64 receive_fifo = 6;
+  uint64 receive_frame = 7;
+  uint64 receive_compressed = 8;
+  uint64 receive_multicast = 9;
+  uint64 transmit_bytes = 10;
+  uint64 transmit_packets = 11;
+  uint64 transmit_errs = 12;
+  uint64 transmit_drop = 13;
+  uint64 transmit_fifo = 14;
+  uint64 transmit_colls = 15;
+  uint64 transmit_carrier = 16;
+  uint64 transmit_compressed = 17;
+}
+
+// TCP counters for this network namespace (/proc/net/snmp).
+message TcpStats {
+  uint64 curr_estab = 1;
+  uint64 retrans_segs = 2;
+  uint64 in_errs = 3;
+  uint64 out_rsts = 4;
+  uint64 attempt_fails = 5;
+}
+
+// One block device or partition (/proc/diskstats).
+message DiskStats {
+  string device = 1;
+  uint64 reads_completed = 2;
+  uint64 reads_merged = 3;
+  uint64 read_bytes = 4;
+  double read_time_seconds = 5;
+  uint64 writes_completed = 6;
+  uint64 writes_merged = 7;
+  uint64 written_bytes = 8;
+  double write_time_seconds = 9;
+  uint64 io_now = 10;
+  double io_time_seconds = 11;
+  double io_time_weighted_seconds = 12;
+}
+
+message FilesystemStats {
+  string path = 1;
+  uint64 size_bytes = 2;
+  uint64 free_bytes = 3;  // including reserved blocks
+  uint64 avail_bytes = 4; // available to this process
+  uint64 files = 5;
+  uint64 files_free = 6;
+  bool readonly = 7;
+}
+
+// Pressure stall information for one resource (/proc/pressure).
+message PressureStats {
+  string resource = 1;
+  double some_seconds = 2;
+  optional double full_seconds = 3;
+}
+
+// This process's cgroup v2. Limits are local to the cgroup; ancestors may
+// impose stricter ones. Controllers that are not enabled are omitted.
+message CgroupStats {
+  string path = 1;
+  CgroupMemoryStats memory = 2;
+  CgroupCpuStats cpu = 3;
+  CgroupTaskStats tasks = 4;
+}
+
+message CgroupMemoryStats {
+  uint64 current_bytes = 1; // including page cache and descendants
+  int64 max_bytes = 2;      // -1 is unlimited
+  int64 high_bytes = 3;     // -1 is unlimited
+  uint64 low_events = 4;
+  uint64 high_events = 5;
+  uint64 max_events = 6;
+  uint64 oom_events = 7;
+  uint64 oom_kill_events = 8;
+}
+
+message CgroupCpuStats {
+  double usage_seconds = 1;
+  double throttled_seconds = 2;
+  uint64 periods = 3;
+  uint64 throttled_periods = 4;
+  double quota_cores = 5; // -1 is unlimited
+}
+
+message CgroupTaskStats {
+  uint64 current = 1; // including threads
+  int64 max = 2;      // -1 is unlimited
 }
 
 // Cached field metadata payload, excluding allocator overhead and unused
@@ -1261,6 +1534,11 @@ message MemoryStats {
   // Present only when Luxir runs on jemalloc.
   JemallocStats jemalloc = 3;
   FieldMetadataStats field_metadata = 4;
+  // Configured budget for managed memory (max_ram_mb); not an RSS ceiling.
+  // Zero is unlimited.
+  uint64 node_budget_bytes = 5;
+  // Per-request tracked search memory ceiling; zero disables rejection.
+  uint64 search_request_limit_bytes = 6;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.
@@ -1334,7 +1612,14 @@ message StatsTotals {
   uint64 max_docs = 5;
   uint64 live_docs = 6;
   uint64 deleted_docs = 7;
-  uint64 bytes = 8;  // on-disk bytes; the index level reports the whole directory including metadata and in-flight files
+  // On-disk bytes from a directory listing (StatsRequest.files): the whole
+  // index directory, including metadata and in-flight files. Compare
+  // committed_bytes.
+  uint64 bytes = 8;
+  // Bytes referenced by the current published snapshot, summed from its file
+  // descriptors without touching the filesystem. Excludes in-flight and
+  // pin-retained files, so it is normally below `bytes`.
+  uint64 committed_bytes = 9;
 }
 
 message StorageRamStats {
@@ -1375,6 +1660,11 @@ message IndexStats {
   uint64 pin_retained_bytes = 12; // bytes whose only remaining owners are pins
   uint64 pin_idle_drops = 13;
   uint64 pin_budget_drops = 14;
+  // Writer only: indexing inverters by state.
+  uint64 inverters_busy = 15;
+  uint64 inverters_idle = 16;
+  uint64 inverters_flushing = 17;
+  uint64 commits = 18; // writer only: commits since the writer opened
 }
 
 // Ids and generations that appear in filenames are reported in their
@@ -1431,12 +1721,19 @@ message QueryCacheStats {
   uint64 reader_stable_hits = 14;
   uint64 reader_stable_refreshes = 15;
   uint64 reader_stable_retires = 16;
+  uint64 build_attempts = 17;
+  uint64 capacity_dead_builds = 18;
+  uint64 thrash_build_skips = 19;
+  uint64 reader_dead_builds = 20;
+  uint64 reader_thrash_build_skips = 21;
 }
 
 // Indexing RAM budget: the configured limit and the bytes reserved against it.
 message IndexRamStats {
-  uint64 limit_bytes = 1;
-  uint64 reserved_bytes = 2;
+  uint64 limit_bytes = 1;     // zero is unlimited
+  uint64 reserved_bytes = 2;  // may temporarily exceed the soft limit
+  uint64 draining_bytes = 3;  // reserved bytes currently draining through flushes
+  uint64 pending_merge_bytes = 4; // pending merge demand, capped at the limit when limited
 }
 
 // jemalloc's process-wide statistics (stats.*), read at one statistics epoch

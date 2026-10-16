@@ -614,9 +614,18 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   ASSERT_EQ(200, nodeStats.result_int()) << nodeStats.body();
   glz::generic_i64 nodeJson;
   ASSERT_FALSE(glz::read_json(nodeJson, nodeStats.body())) << nodeStats.body();
-  EXPECT_TRUE(nodeJson.contains("totals"));
-  EXPECT_TRUE(nodeJson.contains("collections"));
-  EXPECT_FALSE(nodeJson.contains("memory"));
+  // The default node response is the cheap counters only: no collection walk.
+  EXPECT_FALSE(nodeJson.contains("totals"));
+  EXPECT_FALSE(nodeJson.contains("collections"));
+  EXPECT_TRUE(nodeJson.contains("memory"));
+  EXPECT_TRUE(nodeJson.contains("service"));
+  EXPECT_FALSE(nodeJson.contains("system"));
+  auto walked = httpRequest(port(), http::verb::get, "/_stats?collections=true");
+  ASSERT_EQ(200, walked.result_int()) << walked.body();
+  glz::generic_i64 walkedJson;
+  ASSERT_FALSE(glz::read_json(walkedJson, walked.body())) << walked.body();
+  EXPECT_TRUE(walkedJson.contains("totals"));
+  EXPECT_TRUE(walkedJson.contains("collections"));
 
   CollectionHelper metadataHelper("metadata");
   ASSERT_TRUE(metadataHelper.index(flatdoc("id", "one", "n_i", 7), UpdateMessage::COMMIT).success);
@@ -624,15 +633,12 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   auto metadataField = metadataReader->field("n_i");
   ASSERT_NE(nullptr, metadataField.at(0));
 
-  // Node memory is a separate request that returns nothing else; the jemalloc
-  // block is present only on jemalloc.
-  auto memoryStats = httpRequest(port(), http::verb::get, "/_stats?memory=true");
+  // The jemalloc block is present only on jemalloc.
+  auto memoryStats = httpRequest(port(), http::verb::get, "/_stats");
   ASSERT_EQ(200, memoryStats.result_int()) << memoryStats.body();
   glz::generic_i64 memoryJson;
   ASSERT_FALSE(glz::read_json(memoryJson, memoryStats.body())) << memoryStats.body();
   ASSERT_TRUE(memoryJson.contains("memory"));
-  EXPECT_FALSE(memoryJson.contains("collections"));
-  EXPECT_FALSE(memoryJson.contains("totals"));
   EXPECT_TRUE(memoryJson["memory"].contains("indexing_budget"));
   EXPECT_EQ(processAllocatorStats().has_value(),
             memoryJson["memory"].contains("jemalloc"));
@@ -650,7 +656,7 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   for (int i = 0; i < 100; i++) {
     EXPECT_FALSE(metadataReader->field(std::format("absent_{}_i", i)).exists());
   }
-  auto afterMissing = httpRequest(port(), http::verb::get, "/_stats?memory=true");
+  auto afterMissing = httpRequest(port(), http::verb::get, "/_stats");
   ASSERT_EQ(200, afterMissing.result_int()) << afterMissing.body();
   glz::generic_i64 afterMissingJson;
   ASSERT_FALSE(glz::read_json(afterMissingJson, afterMissing.body()));
@@ -658,16 +664,9 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
             afterMissingJson["memory"]["field_metadata"]["names"].get<int64_t>());
   EXPECT_EQ(metadata["name_bytes"].get<int64_t>(),
             afterMissingJson["memory"]["field_metadata"]["name_bytes"].get<int64_t>());
-  auto badMemory = httpRequest(port(), http::verb::get, "/_stats?memory=yes");
-  EXPECT_EQ(400, badMemory.result_int()) << badMemory.body();
-  auto noMemory = httpRequest(port(), http::verb::get, "/_stats?memory=false");
-  ASSERT_EQ(200, noMemory.result_int()) << noMemory.body();
-  glz::generic_i64 noMemoryJson;
-  ASSERT_FALSE(glz::read_json(noMemoryJson, noMemory.body())) << noMemory.body();
-  EXPECT_FALSE(noMemoryJson.contains("memory"));
-  // Memory is node-wide: no collection route, and no per-segment records.
-  for (const char* target : {"/collections/main/_stats?memory=true",
-                             "/_stats?memory=true&segments=true"}) {
+  // Flags are strict booleans; system stats are node-wide.
+  for (const char* target : {"/_stats?collections=yes", "/_stats?format=xml",
+                             "/collections/main/_stats?system=true"}) {
     auto rejected = httpRequest(port(), http::verb::get, target);
     EXPECT_EQ(400, rejected.result_int()) << target << ": " << rejected.body();
   }
@@ -685,6 +684,8 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   auto* name = (*collections)[0]["name"].get_if<std::string>();
   ASSERT_NE(nullptr, name);
   EXPECT_EQ("main", *name);
+  EXPECT_FALSE(collectionJson.contains("memory"));
+  EXPECT_FALSE(collectionJson.contains("service"));
 
   auto* shards = (*collections)[0]["shards"].get_if<glz::generic_i64::array_t>();
   ASSERT_NE(nullptr, shards);

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/util/Metrics.h"
 
 #include <atomic>
 #include <mutex>
@@ -24,6 +25,7 @@ class ReaderManager {
   std::atomic<uint64_t> lastAdvertisedCommitTime = 0;
   FilterCacheConfig originalFilterCacheConfig;
 public:
+  std::shared_ptr<Metrics> metrics;
   std::shared_ptr<FilterCache> filterCache;
   alignas(64) std::atomic<std::shared_ptr<IndexReader>> indexReader;
 
@@ -86,7 +88,7 @@ private:
   void publishReader(std::shared_ptr<IndexReader> reader);
 
 public:
-  Stats stats(bool includeSegments);
+  Stats stats(bool includeSegments, bool includeFiles = true);
   void cacheStats(CacheStats& out) const;
   explicit ReaderManager(Directory& dir, FilterCacheConfig config = {});
   std::shared_ptr<IndexReader> getReader(uint64_t freshness_us = 0);

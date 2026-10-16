@@ -13,7 +13,7 @@ namespace luxir {
 
 SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
                              google::protobuf::Arena& arena)
-    : engine(engine), searchConfig(engine.searchConfig()),
+    : metric(&engine.metrics().searches), engine(engine), searchConfig(engine.searchConfig()),
       memoryTracker(forcedRequestMemoryMaxBytes != 0
                         ? forcedRequestMemoryMaxBytes
                         : searchConfig.request_memory_max_bytes),
@@ -51,6 +51,8 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
     }
   }
   if (send) {
+    if (!warnings.empty()) engine.metrics().searchWarnings.fetch_add(1, std::memory_order_relaxed);
+    metric.finish(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK);
     reply(*lastResponse);  // may delete *this*; nothing after this call
   }
 }
@@ -59,6 +61,8 @@ void SearchRequest::setError(const ErrorInfo& info) {
   std::lock_guard<std::mutex> lock(mutex);
   if (lastResponse == nullptr) lastResponse = SearchResponse::create(*this, true);
   if (lastResponse->proto.error.has_value()) return;  // the first failure wins
+  if (info.kind == ErrorKind::RESOURCE_EXHAUSTED)
+    engine.metrics().searchResourceExhausted.fetch_add(1, std::memory_order_relaxed);
   lastResponse->proto.error = api::build::arenaError(lastResponse->mr, info);
   lastResponse->proto.ops = {};
 }

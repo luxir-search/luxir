@@ -174,7 +174,7 @@ protected:
     ASSERT_TRUE(h.submit(merge).success);
     ASSERT_TRUE(caughtUp());
     EXPECT_EQ(2, col->getReaderManager().getReader()->liveDocs());
-    EXPECT_EQ(200, httpRequest(followerServer->getPort(), http::verb::get, "/_stats").result_int());
+    EXPECT_EQ(200, httpRequest(followerServer->getPort(), http::verb::get, "/_stats?collections=true").result_int());
   }
 };
 
@@ -519,7 +519,7 @@ TEST_F(ReplicationFollowerTest, unreadableStartupPreservesDataUntilEligibleInsta
   stopSource(); startFollower();
   EXPECT_THROW(follower->getCollection("main"), CollectionUnavailableError);
   EXPECT_TRUE(std::filesystem::exists(retained));
-  EXPECT_NE(std::string::npos, httpRequest(followerServer->getPort(), http::verb::get, "/_stats").body().find("collection_unavailable"));
+  EXPECT_NE(std::string::npos, httpRequest(followerServer->getPort(), http::verb::get, "/_stats?collections=true").body().find("collection_unavailable"));
   std::pmr::monotonic_buffer_resource arena;
   EXPECT_FALSE(follower->getReplication().catalog(arena).collections.front().available);
   startSource();
@@ -1139,10 +1139,10 @@ TEST_F(ReplicationFollowerTest, ramLimitKeepsOldSnapshotAndChargesReadersUntilRe
   EXPECT_EQ(1, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
   auto memory = follower->storageBytes(CollectionId::of("main"));
   EXPECT_GT(memory, 0);
-  auto memoryStats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats?memory=true");
+  auto memoryStats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats");
   glz::generic memoryJson; ASSERT_FALSE(glz::read_json(memoryJson, memoryStats.body()));
   EXPECT_EQ(1024 * 1024, memoryJson["memory"]["storage_ram"]["limit_bytes"].get<double>());
-  auto stats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats");
+  auto stats = httpRequest(followerServer->getPort(), http::verb::get, "/_stats?collections=true");
   glz::generic json; ASSERT_FALSE(glz::read_json(json, stats.body()));
   EXPECT_EQ(memory, json["collections"][0]["storage_ram_bytes"].get<double>());
   source->deleteCollection("main");

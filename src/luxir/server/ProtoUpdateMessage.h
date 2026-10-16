@@ -114,6 +114,9 @@ public:
     return rsp;
   }
 
+  size_t metricErrors() const { return errors_.size(); }
+  bool metricFailed() const { return response && response->status == ResponseStatus::ERROR; }
+
   // This owns only response data and a copied wait specification. The transport
   // releases its request and message before starting the replica wait.
   struct Completion : std::enable_shared_from_this<Completion> {

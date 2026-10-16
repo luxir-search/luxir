@@ -287,6 +287,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     UpdateMessageMultiFunc::output_ports_type& op) {
       unused(op);
       bool dispatchCompletion = true;
+      MetricScope metric(metrics ? &metrics->commits : nullptr);
       try {
         dispatchCompletion = this->finishCommitBody(*msg);
       }
@@ -296,6 +297,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
         msg->result.setException(e);
       }
 
+      metric.finish(dispatchCompletion && msg->result.errored() ? MetricOutcome::ERROR : MetricOutcome::OK);
       if (dispatchCompletion) {
         try {
           msg->done(*this);
@@ -316,7 +318,6 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       unused(op);
       INDEX_DEBUG("mergeSegmentsNode: msg={}", (void*)&msg,  msg->commitNum);
       bool dispatchCompletion = this->mergeSegmentsBody(*msg);
-
       if (dispatchCompletion) {
         try {
           msg->done(*this);
@@ -1056,6 +1057,7 @@ void IndexWriter::_releaseToCommitSequencer(UpdateMessage* msg) {
 // Inverter for the segment should already be in the flushingInverters list.
 // This is called in parallel.  The inverter will be deleted.
 void IndexWriter::segmentFlushBody(Inverter& inverter) {
+  MetricWork metric(metrics ? &metrics->flushes : nullptr);
   INDEX_DEBUG("segmentFlushBody: inverter={} commitInfo={} msg.leftToFlush={}", inverter,
               (void*)inverter.commitInfo,
               inverter.commitInfo == nullptr ? -1 : inverter.commitInfo->leftToFlush);
@@ -1085,6 +1087,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     }
   }
 
+  metric.failed = aborted;
   std::unique_ptr<SegInfo> segInfo;
   if (!aborted) {
     segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
@@ -1732,6 +1735,7 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
                           schema, overlayGen);
     std::vector<std::string> oneSelector{overlayName};
+    MetricWork metric(metrics ? &metrics->vectorBuilds : nullptr);
     auto newlyBuilt = vb.build(oneSelector, existingNames, outFiles, buildSite);
     for (auto& info : newlyBuilt) {
       existingNames.emplace(info.name);
@@ -2114,6 +2118,7 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
 // those segments.
 // We also mark segments that are going to be merged, so the commit code knows about them.
 bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
+  MetricWork metric(metrics ? &metrics->merges : nullptr);
   std::vector<SegInfo*> segs;
   std::vector<uint64_t> sourceSegIds;
   bool clientOrigin = msg.forcedBy != nullptr;
@@ -2468,6 +2473,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   }
 
   if (mergeFailed) {
+    metric.failed = true;
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
       lastMergeFailure = failure;
@@ -2542,6 +2548,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       chainNextMerge = !mergeFailed;
     }
   } catch (const std::exception& e) {
+    metric.failed = true;
     LOG_ERROR("mergeSegmentsBody escaped exception: exception={}", e.what());
     if (!outputPublished && markedSegmentCount > 0) {
       const std::lock_guard<std::mutex> lock(indexMutex);
@@ -2563,6 +2570,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     allowSyntheticCommit = outputPublished;
     chainNextMerge = false;
   } catch (...) {
+    metric.failed = true;
     LOG_ERROR("mergeSegmentsBody escaped exception: unknown exception");
     if (!outputPublished && markedSegmentCount > 0) {
       const std::lock_guard<std::mutex> lock(indexMutex);
@@ -2756,7 +2764,7 @@ std::optional<IndexWriter::MergeFailureInfo> IndexWriter::testLastMergeFailure()
   return lastMergeFailure;
 }
 
-IndexWriter::Stats IndexWriter::stats(bool includeSegments) {
+IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   Stats out;
   std::vector<uint64_t> committedIds;
   std::vector<uint64_t> writerSegmentIds;
@@ -2781,6 +2789,9 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments) {
     out.schemaGen = schemaGen_;
     out.activeMerges = mergePolicy ? (uint64_t)mergePolicy->outstandingMerges : 0;
     out.segments = segInfos.size();
+    out.flushing = flushingInverters.size();
+    out.idle = idleInverters.size();
+    out.indexing = busyInverters.size();
     out.auxIndexes.reserve(currentAuxIndexes_.size());
     std::ranges::transform(currentAuxIndexes_, std::back_inserter(out.auxIndexes), copyAux);
 
@@ -2823,7 +2834,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments) {
   // (never hold indexMutex across statx).  A file that disappeared between the
   // segment snapshot above and this listing simply contributes 0.
   std::vector<Directory::FileInfo> files;
-  dir.listFiles(files);
+  if (includeFiles) dir.listFiles(files);
   for (const auto& file : files) {
     out.totalBytes += file.size;
   }
