@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstring>
 #include <format>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -18,6 +20,7 @@
 #include "luxir/query/AutomatonQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExistsQuery.h"
+#include "luxir/query/FacetTermFilter.h"
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
@@ -597,7 +600,76 @@ public:
                               nullptr, automaton::compileRegex);
   }
 
+  // Compile a FieldFacet term filter for a STRING or ID field. Literals are
+  // normalized as in prefix, regex, and any_of queries; an unset filter yields
+  // nullptr.
+  std::shared_ptr<const FacetTermFilter> createFacetTermFilter(
+      const ResolvedFieldHandle& target, const api::TermFilter& spec) {
+    auto filter = std::make_shared<FacetTermFilter>();
+    bool any = false;
+    if (!spec.prefix.empty()) {
+      auto prefix = normalizeLiteral(target, spec.prefix, false);
+      filter->prefix = PackedTerm::fitPrefix(target.fieldType->longTerms, prefix);
+      any = true;
+    }
+    if (!spec.regex.empty()) {
+      filter->regex = compileTermRegex(target, "regex", spec.regex);
+      any = true;
+    }
+    if (!spec.exclude_regex.empty()) {
+      filter->excludeRegex = compileTermRegex(target, "exclude_regex", spec.exclude_regex);
+      any = true;
+    }
+    auto collect = [&](std::span<const std::string_view> values) {
+      std::vector<std::string> out;
+      out.reserve(values.size());
+      for (std::string_view value : values) {
+        out.emplace_back(normalizeLiteral(target, value, true));
+      }
+      std::sort(out.begin(), out.end());
+      out.erase(std::unique(out.begin(), out.end()), out.end());
+      return out;
+    };
+    if (!spec.include.empty()) {
+      filter->include = collect(spec.include);
+      filter->hasInclude = true;
+      any = true;
+    }
+    if (!spec.exclude.empty()) {
+      filter->exclude = collect(spec.exclude);
+      any = true;
+    }
+    if (spec.num_partitions != 0) {
+      if (spec.partition >= spec.num_partitions) {
+        throw std::runtime_error(std::format(
+            "term_filter: partition {} must be less than num_partitions {}",
+            spec.partition, spec.num_partitions));
+      }
+      filter->partition = spec.partition;
+      filter->numPartitions = spec.num_partitions;
+      any = true;
+    } else if (spec.partition != 0) {
+      throw std::runtime_error("term_filter: partition requires num_partitions");
+    }
+    if (!any) return nullptr;
+    return filter;
+  }
+
 private:
+  automaton::ByteDfa compileTermRegex(const ResolvedFieldHandle& target, std::string_view what,
+                                      std::string_view pattern) {
+    try {
+      automaton::Budget budget;
+      if (auto* chain = fields.chain(target)) {
+        FieldCodepointFolder folder(chain);
+        return automaton::compileRegex(pattern, budget, &folder);
+      }
+      return automaton::compileRegex(pattern, budget, nullptr);
+    } catch (const std::runtime_error& e) {
+      throw std::runtime_error(std::format("term_filter {} '{}': {}", what, pattern, e.what()));
+    }
+  }
+
   FieldType* checkAutomatonField(std::string_view label, const ResolvedFieldHandle& target) {
     const auto& field = target.physicalName;
     FieldType& fieldType = *target.fieldType;

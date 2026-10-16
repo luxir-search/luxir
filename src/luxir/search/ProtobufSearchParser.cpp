@@ -755,6 +755,25 @@ public:
       }
     }
 
+    std::shared_ptr<const FacetTermFilter> termFilter;
+    if (facetReq.term_filter.has_value()) {
+      if (ftype->type() != FieldType::Type::ID
+          && ftype->type() != FieldType::Type::STRING) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': term_filter is supported only on STRING and ID fields");
+      }
+      if (ftype->indexed()) {
+        QueryBuilder builder(req.requestPool, *req.schema,
+                             CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
+                             facetName, &req.warnings, &fields);
+        try {
+          termFilter = builder.createFacetTermFilter(target, *facetReq.term_filter);
+        } catch (const std::runtime_error& e) {
+          throw std::runtime_error("facet '" + std::string(facetName) + "': " + e.what());
+        }
+      }
+    }
+
     FieldFacetReq* facet = nullptr;
     switch (ftype->type()) {
       // DATE is epoch millis in the int column; it terms-facets exactly like
@@ -786,7 +805,7 @@ public:
         auto ordMap = req.reader->getOrdMap(facetField);
         facet = luxir::arenaCreate<StrFacetOp>(req.arena, req, facetReq,
             facetField, facetName, limit, minCount, missing,
-            std::move(ordMap), selectedStrings);
+            std::move(ordMap), selectedStrings, std::move(termFilter));
         break;
       }
       case FieldType::Type::TEXT:
