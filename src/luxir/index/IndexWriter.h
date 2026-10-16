@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/util/Metrics.h"
 
 #include <atomic>
 #include <deque>
@@ -127,6 +128,7 @@ class IndexWriter {
 
 public:
 
+  std::shared_ptr<Metrics> metrics;
   struct MergeFailureInfo {
     std::vector<uint64_t> sourceSegIds;
     uint64_t outputSegId = 0;
@@ -144,6 +146,7 @@ public:
   struct Stats : ReaderManager::SnapshotStats<SegmentStats> {
     uint64_t commits = 0;
     uint64_t activeMerges = 0;
+    uint64_t flushing = 0, idle = 0, indexing = 0;
   };
 
   // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file
@@ -733,7 +736,7 @@ public:
   std::optional<MergeFailureInfo> testLastMergeFailure();
 
   // Coherent writer-visible and committed state for operational introspection.
-  Stats stats(bool includeSegments);
+  Stats stats(bool includeSegments, bool includeFiles = true);
 };
 
 

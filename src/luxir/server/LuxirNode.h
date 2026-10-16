@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include "luxir/util/Metrics.h"
 #include <cstdio>
 #include <memory>
 #include <mutex>
@@ -34,6 +35,8 @@ class ReplicationFollower;
 
 class LuxirNode {
 public:
+  // Shared with retained collections so instrumentation outlives their work.
+  const std::shared_ptr<Metrics> metrics = std::make_shared<Metrics>();
   static constexpr std::string_view kDefaultCollectionName = Collections::kDefaultCollectionName;
   using CollectionEntry = Collections::Entry;
 

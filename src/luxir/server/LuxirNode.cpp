@@ -64,7 +64,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
-  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget);
+  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget, metrics);
 
   if (following()) {
     // The follower first checks that it owns the data directory.

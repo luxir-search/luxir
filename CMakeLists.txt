@@ -312,6 +312,8 @@ file(GLOB_RECURSE Proj_SOURCES CONFIGURE_DEPENDS src/*.cpp src/*.h)
 list(FILTER Proj_SOURCES EXCLUDE REGEX .*/main.cpp)
 
 add_library(luxir_lib STATIC ${Proj_SOURCES})
+set_source_files_properties(src/luxir/server/Stats.cpp PROPERTIES
+  COMPILE_DEFINITIONS "LUXIR_VERSION=\"${PROJECT_VERSION}\"")
 target_compile_definitions(luxir_lib PUBLIC
   # oneTBB preview API for task_arena::leave_policy (LuxirNode). Global so
   # every translation unit, and the precompiled headers that include
