@@ -55,42 +55,11 @@ protected:
     col->setSchema(Schema::createDefaultSchema());
   }
 
-  struct IvfPqGuard {
-    bool savedIvfPq;
-    int32_t savedNList;
-    int32_t savedM;
-    int32_t savedBits;
-    int32_t savedNProbe;
-    int64_t savedMinTraining;
-    int64_t savedBuildThreshold;
-
-    IvfPqGuard(int32_t nlist, int32_t m, int32_t bits,
-               int32_t nprobe, int64_t minTraining)
-      : savedIvfPq(VectorIndexBuilder::buildFaissIvfPqAuxIndexes),
-        savedNList(VectorIndexBuilder::ivfPqNList),
-        savedM(VectorIndexBuilder::ivfPqM),
-        savedBits(VectorIndexBuilder::ivfPqBits),
-        savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
-        savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors),
-        savedBuildThreshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost) {
-      VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-      VectorIndexBuilder::ivfPqNList = nlist;
-      VectorIndexBuilder::ivfPqM = m;
-      VectorIndexBuilder::ivfPqBits = bits;
-      VectorIndexBuilder::ivfPqDefaultNProbe = nprobe;
-      VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
-      VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-    }
-
-    ~IvfPqGuard() {
-      VectorIndexBuilder::buildFaissIvfPqAuxIndexes = savedIvfPq;
-      VectorIndexBuilder::ivfPqNList = savedNList;
-      VectorIndexBuilder::ivfPqM = savedM;
-      VectorIndexBuilder::ivfPqBits = savedBits;
-      VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
-      VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
-      VectorIndexBuilder::ivfPqBuildThresholdScanCost = savedBuildThreshold;
-    }
+  // Pins the IVF+PQ codec; the per-field codec path is covered by the
+  // schema-configured tests below.
+  struct IvfPqGuard : IvfTestGuard {
+    IvfPqGuard(int32_t nlist, int32_t m, int32_t bits, int64_t minTraining)
+      : IvfTestGuard(pq(nlist, m, bits), minTraining) {}
   };
 };
 
@@ -212,16 +181,16 @@ bool commitForTest(CollectionHelper& h,
 }
 
 void resetVectorBuildCounters() {
-  VectorIndexBuilder::ivfPqBuildCountForTests.store(0, std::memory_order_relaxed);
-  VectorIndexBuilder::ivfPqMergeBuildCountForTests.store(0, std::memory_order_relaxed);
+  VectorIndexBuilder::ivfBuildCountForTests.store(0, std::memory_order_relaxed);
+  VectorIndexBuilder::ivfMergeBuildCountForTests.store(0, std::memory_order_relaxed);
 }
 
 int64_t vectorCommitBuildCount() {
-  return VectorIndexBuilder::ivfPqBuildCountForTests.load(std::memory_order_relaxed);
+  return VectorIndexBuilder::ivfBuildCountForTests.load(std::memory_order_relaxed);
 }
 
 int64_t vectorMergeBuildCount() {
-  return VectorIndexBuilder::ivfPqMergeBuildCountForTests.load(std::memory_order_relaxed);
+  return VectorIndexBuilder::ivfMergeBuildCountForTests.load(std::memory_order_relaxed);
 }
 
 const luxir::api::AuxIndexInfo& onlyVectorOverlay(const luxir::api::IndexInfo* info) {
@@ -286,7 +255,7 @@ TEST_F(VectorIndexBuilderTest, overlayFileNamesAreCaseSafe) {
 }
 
 TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -343,7 +312,7 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
 // open.  This is the FSDirectory leg of the zero-copy list path (the rest of
 // the suite runs on RAMDir).
 TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -414,7 +383,7 @@ TEST_F(VectorIndexBuilderTest, noBuildWhenSelectorsEmpty) {
 // Multiple segments - ntotal must equal the live-doc count across segments,
 // and the metric file's mapping should round-trip (segId, localDoc) correctly.
 TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -467,7 +436,7 @@ TEST_F(VectorIndexBuilderTest, selectorMiss) {
 // so the vector aux index built for the previous commit remains valid and is
 // carried forward (its files are not deleted).
 TEST_F(VectorIndexBuilderTest, carryForwardOnDeleteOnlyCommit) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -500,7 +469,7 @@ TEST_F(VectorIndexBuilderTest, carryForwardOnDeleteOnlyCommit) {
 // per-segment overlays.  The old segment carries its entry; the new segment
 // serves flat until a build is requested and passes thresholds.
 TEST_F(VectorIndexBuilderTest, segmentChangeCarriesExistingOverlay) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -532,7 +501,7 @@ TEST_F(VectorIndexBuilderTest, segmentChangeCarriesExistingOverlay) {
 // the merge-private phase.  Full auto-maintenance is the future background
 // builder's job.
 TEST_F(VectorIndexBuilderTest, plainCommitDoesNotAutoBuild) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -560,7 +529,7 @@ TEST_F(VectorIndexBuilderTest, plainCommitDoesNotAutoBuild) {
 }
 
 TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -610,7 +579,7 @@ TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
 }
 
 TEST_F(VectorIndexBuilderTest, littleCommitDoesNoAnnWorkAndMatchesExact) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -623,7 +592,7 @@ TEST_F(VectorIndexBuilderTest, littleCommitDoesNoAnnWorkAndMatchesExact) {
   auto info1 = readIndexInfo(h.getIndexWriter()->dir);
   std::string firstFile{onlyVectorOverlay(info1).files[0].name};
 
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 1000;
+  VectorIndexBuilder::ivfBuildThresholdScanCost = 1000;
   resetVectorBuildCounters();
   h.index(flatdoc("id", std::string("tiny"),
                   "embedding_v", std::vector<float>{100.0f, 0.0f, 0.0f, 0.0f}));
@@ -647,7 +616,7 @@ TEST_F(VectorIndexBuilderTest, littleCommitDoesNoAnnWorkAndMatchesExact) {
 }
 
 TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -693,7 +662,7 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
 
 // A merge drops old segment overlays and builds one for the merged segment.
 TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
   // No setMergeFactor(2) here: an automatic merge during setup could publish
@@ -734,7 +703,7 @@ TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
 }
 
 TEST_F(VectorIndexBuilderTest, forceMergeFlushesPendingIndexingAndBuildsOverlayBeforePublish) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -787,7 +756,7 @@ TEST_F(VectorIndexBuilderTest, forceMergeFlushesPendingIndexingAndBuildsOverlayB
 }
 
 TEST_F(VectorIndexBuilderTest, mergePromotesBelowThresholdSegmentsForActiveField) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
   auto iw = h.getIndexWriter();
@@ -799,7 +768,7 @@ TEST_F(VectorIndexBuilderTest, mergePromotesBelowThresholdSegmentsForActiveField
   }
   h.commit({"*"});
 
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 400;
+  VectorIndexBuilder::ivfBuildThresholdScanCost = 400;
   resetVectorBuildCounters();
   for (int seg = 0; seg < 2; seg++) {
     for (int i = 0; i < 79; i++) {
@@ -828,8 +797,8 @@ TEST_F(VectorIndexBuilderTest, mergePromotesBelowThresholdSegmentsForActiveField
 }
 
 TEST_F(VectorIndexBuilderTest, belowThresholdMergedOutputBuildsNoOverlay) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 400;
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
+  VectorIndexBuilder::ivfBuildThresholdScanCost = 400;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
   auto iw = h.getIndexWriter();
@@ -865,8 +834,8 @@ TEST_F(VectorIndexBuilderTest, belowThresholdMergedOutputBuildsNoOverlay) {
 }
 
 TEST_F(VectorIndexBuilderTest, explicitActivationBelowThresholdPromotesInProcessMerge) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 400;
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
+  VectorIndexBuilder::ivfBuildThresholdScanCost = 400;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -899,8 +868,8 @@ TEST_F(VectorIndexBuilderTest, explicitActivationBelowThresholdPromotesInProcess
 }
 
 TEST_F(VectorIndexBuilderTest, explicitActivationOnEmptyIndexPromotesLaterMerge) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 400;
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
+  VectorIndexBuilder::ivfBuildThresholdScanCost = 400;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
   auto iw = h.getIndexWriter();
@@ -930,7 +899,7 @@ TEST_F(VectorIndexBuilderTest, explicitActivationOnEmptyIndexPromotesLaterMerge)
 }
 
 TEST_F(VectorIndexBuilderTest, invalidExactVectorSelectorDoesNotActivate) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
   auto iw = h.getIndexWriter();
@@ -957,8 +926,8 @@ TEST_F(VectorIndexBuilderTest, invalidExactVectorSelectorDoesNotActivate) {
 }
 
 TEST_F(VectorIndexBuilderTest, intentOnlyActivationIsNotSeededAfterRestart) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 400;
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
+  VectorIndexBuilder::ivfBuildThresholdScanCost = 400;
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
   auto iw = h.getIndexWriter();
@@ -1001,7 +970,7 @@ TEST_F(VectorIndexBuilderTest, intentOnlyActivationIsNotSeededAfterRestart) {
 }
 
 TEST_F(VectorIndexBuilderTest, failedMultiFieldCommitDoesNotPublishPartialOverlays) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
   auto iw = h.getIndexWriter();
@@ -1034,7 +1003,7 @@ TEST_F(VectorIndexBuilderTest, failedMultiFieldCommitDoesNotPublishPartialOverla
 }
 
 TEST_F(VectorIndexBuilderTest, mergeOverlayFailurePublishesFlatAndClearsMergeGate) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
   auto iw = h.getIndexWriter();
@@ -1077,7 +1046,7 @@ TEST_F(VectorIndexBuilderTest, mergeOverlayFailurePublishesFlatAndClearsMergeGat
 }
 
 TEST_F(VectorIndexBuilderTest, mergedPostingsReaderFailureRestoresSourcesAndCleansOutput) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
   auto iw = h.getIndexWriter();
@@ -1127,7 +1096,7 @@ TEST_F(VectorIndexBuilderTest, mergedPostingsReaderFailureRestoresSourcesAndClea
 }
 
 TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
   auto iw = h.getIndexWriter();
@@ -1216,7 +1185,7 @@ TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {
 // Cosine metric normalizes on column write by default.  The FAISS builder can
 // add the already-normalized column bytes directly as inner-product vectors.
 TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
 
   // Schema: _v with metric=COSINE.
@@ -1245,7 +1214,7 @@ TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
 // normalized=true: writer and builder trust vectors are already unit-length and
 // skip renormalization.
 TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
 
   SchemaBuilder b;
@@ -1274,7 +1243,7 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
 // still valid) should NOT rewrite the file - the carried-forward entry's
 // existing files survive untouched.
 TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -1304,7 +1273,7 @@ TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
 // many vectors doesn't blow up memory.  Set a tiny chunk size and verify the
 // loop boundaries - every vector still ends up correctly normalized.
 TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
-  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*minTraining=*/2);
   // Force a chunk size of 2 vectors x 4 floats x 4 bytes = 32 bytes per chunk.
   // With 7 vectors this exercises 4 chunks (sizes 2, 2, 2, 1).
   size_t saved = VectorIndexBuilder::renormChunkBytes;
@@ -1341,7 +1310,7 @@ TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
 }
 
 TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {
-  IvfPqGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2, /*nprobe=*/4, /*minTraining=*/16);
+  IvfPqGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2, /*minTraining=*/16);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -1367,20 +1336,18 @@ TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {
   EXPECT_EQ(ivfpq->d, 4);
   EXPECT_EQ(ivfpq->ntotal, 160);
   EXPECT_EQ(ivfpq->nlist, 4u);
-  EXPECT_EQ(ivfpq->nprobe, 4u);
   EXPECT_EQ(ivfpq->pq.M, 2u);
   EXPECT_EQ(ivfpq->pq.nbits, 2u);
 
   auto meta = readVectorAuxMeta(aux);
   EXPECT_EQ(meta.engine, VectorAuxMeta::ENGINE_IVFPQ);
   EXPECT_EQ(meta.nlist, 4);
-  EXPECT_EQ(meta.defaultBreadth, 4);
   EXPECT_EQ(meta.pqM, 2);
   EXPECT_EQ(meta.pqBits, 2);
 }
 
 TEST_F(VectorIndexBuilderTest, ivfPqFallsBackWhenTooSmallToTrain) {
-  IvfPqGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/4, /*nprobe=*/4, /*minTraining=*/128);
+  IvfPqGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/4, /*minTraining=*/128);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
 
@@ -1410,7 +1377,7 @@ TEST_F(VectorIndexBuilderTest, metricNoneIsIneligible) {
 }
 
 TEST_F(VectorIndexBuilderTest, overlayGenerationSurvivesPublishedDropAndRestart) {
-  IvfPqGuard guard(2, 1, 1, 2, 2);
+  IvfPqGuard guard(2, 1, 1, 2);
   auto path = std::filesystem::temp_directory_path() / "luxir-overlay-restart";
   std::filesystem::remove_all(path);
   auto cleanup = scope_guard([&] { std::filesystem::remove_all(path); });

@@ -5,7 +5,10 @@
 
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
+#include <faiss/IndexIVFRaBitQ.h>
+#include <faiss/IndexPreTransform.h>
 #include <faiss/MetricType.h>
+#include <faiss/VectorTransform.h>
 #include <faiss/index_io.h>
 #include <faiss/impl/io.h>
 #include <faiss/utils/distances.h>
@@ -28,7 +31,7 @@ namespace luxir {
 
 namespace {
 
-constexpr int64_t MIN_TRAINING_POINTS_PER_PQ_CENTROID = 39;
+constexpr int64_t MIN_TRAINING_POINTS_PER_CENTROID = 39;
 
 // Adapter from faiss::IOWriter to luxir::OutputStream.
 class FaissOutAdapter : public faiss::IOWriter {
@@ -72,21 +75,20 @@ faiss::MetricType toFaissMetric(VectorFieldType::Metric m) {
   }
 }
 
-int32_t chooseIvfNList(int64_t ntotal) {
-  if (VectorIndexBuilder::ivfPqNList > 0) {
-    return (int32_t)std::min<int64_t>(VectorIndexBuilder::ivfPqNList, ntotal);
-  }
+int32_t chooseIvfNList(int32_t configured, int64_t ntotal) {
+  if (configured > 0) return (int32_t)std::min<int64_t>(configured, ntotal);
   return defaultIvfNList(ntotal);
 }
 
-int32_t choosePqM(int32_t dims) {
-  if (VectorIndexBuilder::ivfPqM > 0) {
-    if (dims % VectorIndexBuilder::ivfPqM != 0) {
+int32_t choosePqM(int32_t configured, int32_t dims) {
+  if (configured > 0) {
+    // The schema checks this when dims is pinned; an inferred dims can only
+    // be checked here.
+    if (dims % configured != 0) {
       throw std::runtime_error(fmt::format(
-        "VectorIndexBuilder: IVF+PQ M={} does not divide dims={}",
-        VectorIndexBuilder::ivfPqM, dims));
+        "VectorIndexBuilder: IVF+PQ M={} does not divide dims={}", configured, dims));
     }
-    return VectorIndexBuilder::ivfPqM;
+    return configured;
   }
 
   int32_t maxM = std::min<int32_t>(32, dims);
@@ -104,38 +106,15 @@ int32_t choosePqM(int32_t dims) {
   throw std::runtime_error("VectorIndexBuilder: vector dims must be positive");
 }
 
-int32_t effectivePqBits() {
-  return std::clamp(VectorIndexBuilder::ivfPqBits, 1, 8);
-}
-
-int32_t effectiveNProbe(int32_t nlist) {
-  int32_t configured = VectorIndexBuilder::ivfPqDefaultNProbe;
-  if (configured <= 0) configured = std::max<int32_t>(1, (int32_t)std::sqrt((double)nlist));
-  return std::clamp(configured, 1, nlist);
-}
-
 bool shouldNormalizeForFaiss(const VectorFieldType& ft) {
   return ft.metric_ == VectorFieldType::METRIC_COSINE && !ft.normalized_ && !ft.normalizeOnWrite_;
 }
 
-std::string makeVectorMeta(int32_t dims, const VectorFieldType& ft,
-                           int32_t engine, int32_t nlist = 0,
-                           int32_t nprobe = 0, int32_t pqM = 0,
-                           int32_t pqBits = 0) {
-  VectorAuxMeta meta;
-  meta.dims = dims;
-  meta.metric = (int32_t)ft.metric_;
-  meta.cosineNormalizeColumnOnRescore = shouldNormalizeForFaiss(ft) ? 1 : 0;
-  meta.engine = engine;
-  meta.nlist = nlist;
-  meta.defaultBreadth = nprobe;
-  meta.pqM = pqM;
-  meta.pqBits = pqBits;
-  return meta.toBytes();
-}
-
+// Vectors go to FAISS normalized (raw cosine column) and/or rotated (RaBitQ),
+// chunk by chunk so the working set stays bounded.
 void addVectorsToIndex(faiss::Index& index, VectorReader& vr, int32_t dims,
-                       bool normalizeForFaiss, std::vector<float>& scratch,
+                       bool normalizeForFaiss, const faiss::VectorTransform* rotation,
+                       std::vector<float>& scratch, std::vector<float>& rotated,
                        size_t chunkBytes) {
   int64_t numVals = vr.numVectors();
   if (numVals <= 0) return;
@@ -143,22 +122,23 @@ void addVectorsToIndex(faiss::Index& index, VectorReader& vr, int32_t dims,
   size_t bytesPerVec = (size_t)dims * sizeof(float);
   size_t chunkVecs = chunkBytes == 0 ? (size_t)numVals
                                      : std::max((size_t)1, chunkBytes / bytesPerVec);
-
-  if (!normalizeForFaiss) {
-    for (int64_t off = 0; off < numVals; off += (int64_t)chunkVecs) {
-      int64_t n = std::min((int64_t)chunkVecs, numVals - off);
-      index.add(n, base + off * dims);
-    }
-    return;
-  }
-
   size_t chunkFloats = chunkVecs * (size_t)dims;
-  if (scratch.size() < chunkFloats) scratch.resize(chunkFloats);
+  if (normalizeForFaiss && scratch.size() < chunkFloats) scratch.resize(chunkFloats);
+  if (rotation != nullptr && rotated.size() < chunkFloats) rotated.resize(chunkFloats);
+
   for (int64_t off = 0; off < numVals; off += (int64_t)chunkVecs) {
     int64_t n = std::min((int64_t)chunkVecs, numVals - off);
-    std::memcpy(scratch.data(), base + off * dims, (size_t)n * bytesPerVec);
-    faiss::fvec_renorm_L2((size_t)dims, (size_t)n, scratch.data());
-    index.add(n, scratch.data());
+    const float* x = base + off * dims;
+    if (normalizeForFaiss) {
+      std::memcpy(scratch.data(), x, (size_t)n * bytesPerVec);
+      faiss::fvec_renorm_L2((size_t)dims, (size_t)n, scratch.data());
+      x = scratch.data();
+    }
+    if (rotation != nullptr) {
+      rotation->apply_noalloc(n, x, rotated.data());
+      x = rotated.data();
+    }
+    index.add(n, x);
   }
 }
 
@@ -216,18 +196,23 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
 
 // Default 1 MiB.  Tests can override via VectorIndexBuilder::renormChunkBytes.
 size_t VectorIndexBuilder::renormChunkBytes = 1 * 1024 * 1024;
-bool VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-int32_t VectorIndexBuilder::ivfPqNList = 0;
-int32_t VectorIndexBuilder::ivfPqM = 0;
-int32_t VectorIndexBuilder::ivfPqBits = 8;
-int32_t VectorIndexBuilder::ivfPqDefaultNProbe = 0;
+bool VectorIndexBuilder::buildFaissAuxIndexes = true;
+std::optional<VectorAnnConfig> VectorIndexBuilder::annConfigOverrideForTests;
+// PQ trains 2^bits centroids per sub-quantizer: FAISS wants 39 points per
+// centroid, so 8-bit PQ needs ~10k vectors before its codebooks mean much.
 int64_t VectorIndexBuilder::ivfPqMinTrainingVectors =
-    MIN_TRAINING_POINTS_PER_PQ_CENTROID * 256;
-int64_t VectorIndexBuilder::ivfPqBuildThresholdScanCost = 1'000'000;
-std::atomic<int64_t> VectorIndexBuilder::ivfPqBuildCountForTests{0};
-std::atomic<int64_t> VectorIndexBuilder::ivfPqMergeBuildCountForTests{0};
-size_t VectorIndexBuilder::ivfPqTrainingSampleBytes = 64 * 1024 * 1024;
-size_t VectorIndexBuilder::ivfPqAddChunkBytes = 16 * 1024 * 1024;
+    MIN_TRAINING_POINTS_PER_CENTROID * 256;
+// RaBitQ trains no codebook, only the IVF centroids (nlist = sqrt(N) by
+// default, so 39 points per centroid holds from N ~ 1.5k).  Training is not
+// what binds: below ~8k vectors the exact column scan measured faster than an
+// IVF+RaBitQ probe plus rescore at 128 and 768 dims, and it is exact (see
+// docs/design/vector-search.md).
+int64_t VectorIndexBuilder::ivfRaBitQMinTrainingVectors = 8192;
+int64_t VectorIndexBuilder::ivfBuildThresholdScanCost = 1'000'000;
+std::atomic<int64_t> VectorIndexBuilder::ivfBuildCountForTests{0};
+std::atomic<int64_t> VectorIndexBuilder::ivfMergeBuildCountForTests{0};
+size_t VectorIndexBuilder::ivfTrainingSampleBytes = 64 * 1024 * 1024;
+size_t VectorIndexBuilder::ivfAddChunkBytes = 16 * 1024 * 1024;
 
 bool VectorIndexBuilder::selectorMatches(const std::vector<std::string>& selectors,
                                          std::string_view name) {
@@ -278,7 +263,7 @@ VectorIndexBuilder::build(const std::vector<std::string>& selectors,
                           BuildSite buildSite) {
   std::vector<AuxInfo> result;
   if (selectors.empty()) return result;
-  if (!buildFaissIvfPqAuxIndexes) {
+  if (!buildFaissAuxIndexes) {
     LOG_TRACE("VectorIndexBuilder: vector aux build disabled; flat kNN uses column scan");
     return result;
   }
@@ -331,16 +316,20 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
   // build-failure paths.  Args: the field name (std::string_view*) and the
   // build site, so a listener can target a specific field and/or site.
   Signal::emit("vectorBuildField", (void*)&fieldName, (void*)(intptr_t)buildSite);
-  return buildIvfPqField(fieldName, ft, outFilesToSync, buildSite);
+  const VectorAnnConfig& ann = annConfigOverrideForTests ? *annConfigOverrideForTests : ft.ann();
+  return buildIvfField(fieldName, ft, ann, outFilesToSync, buildSite);
 }
 
 std::optional<AuxInfo>
-VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
-                                    const VectorFieldType& ft,
-                                    std::vector<std::string>& outFilesToSync,
-                                    BuildSite buildSite) {
+VectorIndexBuilder::buildIvfField(std::string_view fieldName,
+                                  const VectorFieldType& ft,
+                                  const VectorAnnConfig& ann,
+                                  std::vector<std::string>& outFilesToSync,
+                                  BuildSite buildSite) {
   int32_t dims = ft.dims_;
   faiss::MetricType metric = toFaissMetric(ft.metric_);
+  bool rabitq = ann.codec == VectorAnnConfig::RABITQ;
+  const char* codecName = rabitq ? "IVF+RaBitQ" : "IVF+PQ";
   int64_t ntotal = 0;
 
   forEachVectorSegment(segments_, fieldName, dims,
@@ -354,29 +343,37 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
     return std::nullopt;
   }
 
-  int32_t nlist = chooseIvfNList(ntotal);
-  int32_t pqM = choosePqM(dims);
-  int32_t pqBits = effectivePqBits();
-  int32_t ksub = 1 << pqBits;
-  int64_t pqTrainingFloor = MIN_TRAINING_POINTS_PER_PQ_CENTROID * (int64_t)ksub;
-  int64_t requiredTraining = std::max<int64_t>(
-      std::max<int64_t>(ivfPqMinTrainingVectors, nlist), pqTrainingFloor);
+  int32_t nlist = chooseIvfNList(ann.nlist, ntotal);
+  // Training floor.  RaBitQ trains only the IVF centroids; PQ also trains
+  // 2^bits centroids per sub-quantizer, which sets its (higher) floor.
+  int32_t pqM = 0;
+  int32_t pqBits = 0;
+  int64_t requiredTraining;
+  if (rabitq) {
+    requiredTraining = std::max<int64_t>(ivfRaBitQMinTrainingVectors, nlist);
+  } else {
+    pqM = choosePqM(ann.pqM, dims);
+    pqBits = std::clamp(ann.pqBits, 1, 8);
+    int64_t pqTrainingFloor = MIN_TRAINING_POINTS_PER_CENTROID * ((int64_t)1 << pqBits);
+    requiredTraining = std::max<int64_t>(
+        std::max<int64_t>(ivfPqMinTrainingVectors, nlist), pqTrainingFloor);
+  }
   if (ntotal < requiredTraining) {
-    LOG_TRACE("VectorIndexBuilder: field {} has {} vectors, below IVF+PQ training floor {}; "
+    LOG_TRACE("VectorIndexBuilder: field {} has {} vectors, below {} training floor {}; "
               "using flat-over-column fallback",
-              fieldName, ntotal, requiredTraining);
+              fieldName, ntotal, codecName, requiredTraining);
     return std::nullopt;
   }
   int64_t scanCost = ntotal * (int64_t)dims;
-  if (scanCost < ivfPqBuildThresholdScanCost) {
-    LOG_TRACE("VectorIndexBuilder: field {} scan cost {} below IVF+PQ build threshold {}; "
+  if (scanCost < ivfBuildThresholdScanCost) {
+    LOG_TRACE("VectorIndexBuilder: field {} scan cost {} below IVF build threshold {}; "
               "using flat-over-column fallback",
-              fieldName, scanCost, ivfPqBuildThresholdScanCost);
+              fieldName, scanCost, ivfBuildThresholdScanCost);
     return std::nullopt;
   }
 
   size_t bytesPerVec = (size_t)dims * sizeof(float);
-  int64_t byteCap = bytesPerVec == 0 ? 0 : (int64_t)(ivfPqTrainingSampleBytes / bytesPerVec);
+  int64_t byteCap = bytesPerVec == 0 ? 0 : (int64_t)(ivfTrainingSampleBytes / bytesPerVec);
   int64_t sampleCap = std::min<int64_t>(
       ntotal, std::max<int64_t>(requiredTraining, std::max<int64_t>(1, byteCap)));
   std::vector<float> training;
@@ -402,49 +399,75 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
     faiss::fvec_renorm_L2((size_t)dims, (size_t)ntrain, training.data());
   }
 
+  // RaBitQ's error bound assumes the codes are taken in a randomly rotated
+  // space; FAISS leaves the rotation to the caller ("It is assumed that the
+  // Random Matrix Rotation is performed externally", RaBitQuantizer.h).  The
+  // rotation is orthonormal, so L2, inner product and cosine (unit vectors
+  // stay unit) are preserved and centroid distances stay comparable across
+  // segments of either codec.
+  std::unique_ptr<faiss::RandomRotationMatrix> rotation;
   auto quantizer = std::make_unique<faiss::IndexFlat>(dims, metric);
-  auto index = std::make_unique<faiss::IndexIVFPQ>(
-      quantizer.get(), (size_t)dims, (size_t)nlist, (size_t)pqM,
-      (size_t)pqBits, metric);
+  std::unique_ptr<faiss::IndexIVF> index;
+  if (rabitq) {
+    rotation = std::make_unique<faiss::RandomRotationMatrix>(dims, dims);
+    rotation->init(RABITQ_ROTATION_SEED);
+    std::vector<float> rotated(training.size());
+    rotation->apply_noalloc(ntrain, training.data(), rotated.data());
+    training.swap(rotated);
+    auto rq = std::make_unique<faiss::IndexIVFRaBitQ>(
+        quantizer.get(), (size_t)dims, (size_t)nlist, metric,
+        /*own_invlists=*/true, (uint8_t)std::clamp(ann.rabitqBits, 1, 9));
+    rq->qb = (uint8_t)std::clamp(ann.rabitqQueryBits, 0, 8);
+    index = std::move(rq);
+  } else {
+    auto pq = std::make_unique<faiss::IndexIVFPQ>(
+        quantizer.get(), (size_t)dims, (size_t)nlist, (size_t)pqM,
+        (size_t)pqBits, metric);
+    // See min_points_per_centroid below.
+    pq->pq.cp.min_points_per_centroid = 1;
+    index = std::move(pq);
+  }
   quantizer.release();
   index->own_fields = true;
-  int32_t nprobe = effectiveNProbe(nlist);
-  index->nprobe = (size_t)nprobe;
+  // Queries pass an explicit list selection to search_preassigned, so this
+  // only documents the build-time default in the serialized header.
+  index->nprobe = (size_t)std::clamp((int32_t)std::sqrt((double)nlist), 1, nlist);
 
-  LOG_TRACE("VectorIndexBuilder: training IVF+PQ {} ntotal={} ntrain={} dims={} "
-            "nlist={} M={} bits={} nprobe={}",
-            fieldName, ntotal, ntrain, dims, nlist, pqM, pqBits, nprobe);
+  LOG_TRACE("VectorIndexBuilder: training {} {} ntotal={} ntrain={} dims={} "
+            "nlist={} M={} pqBits={} rabitqBits={}",
+            codecName, fieldName, ntotal, ntrain, dims, nlist, pqM, pqBits,
+            rabitq ? ann.rabitqBits : 0);
   if (buildSite == BuildSite::MERGE) {
-    ivfPqMergeBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
+    ivfMergeBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
   } else {
-    ivfPqBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
+    ivfBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
   }
-  // Luxir gates IVF/PQ building on its own training-size policy
-  // (ivfPqMinTrainingVectors), so FAISS's separate under-training heuristic is
-  // redundant.  It is the one message FAISS prints unconditionally to stderr
-  // during train(); min_points_per_centroid only controls that warning (not the
-  // clustering itself), so drop it to 1 on both the coarse quantizer and the PQ
-  // to keep that policy decision ours.
+  // Luxir gates IVF building on its own training-size policy (the
+  // *MinTrainingVectors floors), so FAISS's separate under-training
+  // heuristic is redundant.  It is the one message FAISS prints
+  // unconditionally to stderr during train(); min_points_per_centroid only
+  // controls that warning (not the clustering itself), so drop it to 1 on
+  // the coarse quantizer (and the PQ, above) to keep that policy decision ours.
   index->cp.min_points_per_centroid = 1;
-  index->pq.cp.min_points_per_centroid = 1;
   index->train(ntrain, training.data());
   training.clear();
   training.shrink_to_fit();
 
   std::vector<float> scratch;
+  std::vector<float> rotatedChunk;
   forEachVectorSegment(segments_, fieldName, dims,
       [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
     if (vr.numVectors() > 0) {
-      addVectorsToIndex(*index, vr, dims, shouldNormalizeForFaiss(ft),
-                        scratch, ivfPqAddChunkBytes);
+      addVectorsToIndex(*index, vr, dims, shouldNormalizeForFaiss(ft), rotation.get(),
+                        scratch, rotatedChunk, ivfAddChunkBytes);
     }
     return true;
   });
 
   if (index->ntotal != ntotal) {
     throw std::runtime_error(fmt::format(
-      "VectorIndexBuilder: IVF+PQ ntotal mismatch for field {} (expected {}, built {})",
-      fieldName, ntotal, index->ntotal));
+      "VectorIndexBuilder: {} ntotal mismatch for field {} (expected {}, built {})",
+      codecName, fieldName, ntotal, index->ntotal));
   }
 
   std::string auxName(NAME_PREFIX);
@@ -466,7 +489,14 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
     int64_t faissHeaderBytes;
     {
       EmptyInvlistsSwap swap(*index);
-      faiss::write_index(index.get(), &adapter);
+      if (rotation != nullptr) {
+        // Serialized as the standard FAISS wrapper (own_fields false: the
+        // stack object borrows both); the reader takes it apart again.
+        faiss::IndexPreTransform wrapped(rotation.get(), index.get());
+        faiss::write_index(&wrapped, &adapter);
+      } else {
+        faiss::write_index(index.get(), &adapter);
+      }
       faissHeaderBytes = (int64_t)os.size();
     }
 
@@ -511,16 +541,24 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
   info.gen = overlayGen_;
   info.files.push_back(std::move(descriptor));
   {
-    std::string meta = makeVectorMeta(
-        dims, ft, VectorAuxMeta::ENGINE_IVFPQ, nlist, nprobe, pqM, pqBits);
-    info.opaque_meta.assign((const std::byte*)meta.data(),
-                            (const std::byte*)meta.data() + meta.size());
+    VectorAuxMeta meta;
+    meta.dims = dims;
+    meta.metric = (int32_t)ft.metric_;
+    meta.cosineNormalizeColumnOnRescore = shouldNormalizeForFaiss(ft) ? 1 : 0;
+    meta.engine = rabitq ? VectorAuxMeta::ENGINE_IVFRABITQ : VectorAuxMeta::ENGINE_IVFPQ;
+    meta.nlist = nlist;
+    meta.pqM = pqM;
+    meta.pqBits = pqBits;
+    meta.rabitqBits = rabitq ? std::clamp(ann.rabitqBits, 1, 9) : 0;
+    std::string bytes = meta.toBytes();
+    info.opaque_meta.assign((const std::byte*)bytes.data(),
+                            (const std::byte*)bytes.data() + bytes.size());
   }
 
-  LOG_TRACE("VectorIndexBuilder: built IVF+PQ {} ntotal={} dims={} metric={} "
-            "nlist={} M={} bits={} file={}",
-            info.name, index->ntotal, dims, (int)ft.metric_,
-            nlist, pqM, pqBits, faissFile);
+  LOG_TRACE("VectorIndexBuilder: built {} {} ntotal={} dims={} metric={} "
+            "nlist={} codeSize={} file={}",
+            codecName, info.name, index->ntotal, dims, (int)ft.metric_,
+            nlist, index->code_size, faissFile);
 
   return info;
 }

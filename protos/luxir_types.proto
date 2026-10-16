@@ -1660,6 +1660,43 @@ enum VectorMetric {
   COSINE = 3;
 }
 
+// Approximate nearest-neighbor index settings for a VECTOR field: the codec
+// and parameters of the per-segment IVF overlays built at commit and merge.
+// Read when an overlay is built; each overlay records what it was built
+// with, so a change applies to segments built afterwards. See
+// docs/guide/vector-search.md#index-settings.
+message VectorAnnDef {
+  enum Codec {
+    RABITQ = 0;  // IVF + RaBitQ (randomly rotated, centroid-relative bit codes)
+    PQ = 1;      // IVF + product quantization
+  }
+  optional Codec codec = 1;  // absent: rabitq
+
+  // IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors),
+  // capped at 4096. Clamped to the segment's vector count.
+  optional int32 nlist = 2;
+
+  message RaBitQ {
+    // Bits per dimension, 1..9. Absent: 1. Above 1 (extended RaBitQ) a
+    // 1-bit pass prunes with the error bound and survivors are re-estimated
+    // with the extra bits.
+    optional int32 bits = 1;
+    // Query quantization bits, 0..8; 0 scans with the float query.
+    // Absent: 4. Read at search time, so a change applies to existing
+    // overlays.
+    optional int32 query_bits = 2;
+  }
+  RaBitQ rabitq = 3;  // codec rabitq only
+
+  message Pq {
+    // Sub-quantizers; must divide dims. Absent or 0: the largest divisor of
+    // dims up to 32 that leaves at least 4 dimensions per sub-quantizer.
+    optional int32 m = 1;
+    optional int32 bits = 2;  // bits per sub-quantizer code, 1..8. Absent: 8.
+  }
+  Pq pq = 4;  // codec pq only
+}
+
 // A field, template, or variant definition, named by its enclosing map key.
 // Unset properties inherit from parent, then use type defaults, except as
 // documented on individual properties. HTTP JSON enum values are lowercase.
@@ -1743,6 +1780,10 @@ message FieldDef {
     HASH128 = 2;  // prefix of at most 230 bytes plus 25 base36 hash digits
   }
   optional LongTerms long_terms = 16; // absent: inherit from parent, else hash128
+
+  // VECTOR only: ANN overlay settings. Absent inherits the parent's whole
+  // definition (no per-property merge), else every VectorAnnDef default.
+  VectorAnnDef ann = 20;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

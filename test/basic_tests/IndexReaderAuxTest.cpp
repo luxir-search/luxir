@@ -46,41 +46,8 @@ protected:
     col->setSchema(Schema::createDefaultSchema());
   }
 
-  struct IvfPqGuard {
-    bool savedIvfPq;
-    int32_t savedNList;
-    int32_t savedM;
-    int32_t savedBits;
-    int32_t savedNProbe;
-    int64_t savedMinTraining;
-    int64_t savedBuildThreshold;
-
-    IvfPqGuard()
-      : savedIvfPq(VectorIndexBuilder::buildFaissIvfPqAuxIndexes),
-        savedNList(VectorIndexBuilder::ivfPqNList),
-        savedM(VectorIndexBuilder::ivfPqM),
-        savedBits(VectorIndexBuilder::ivfPqBits),
-        savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
-        savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors),
-        savedBuildThreshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost) {
-      VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-      VectorIndexBuilder::ivfPqNList = 2;
-      VectorIndexBuilder::ivfPqM = 1;
-      VectorIndexBuilder::ivfPqBits = 1;
-      VectorIndexBuilder::ivfPqDefaultNProbe = 2;
-      VectorIndexBuilder::ivfPqMinTrainingVectors = 2;
-      VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-    }
-
-    ~IvfPqGuard() {
-      VectorIndexBuilder::buildFaissIvfPqAuxIndexes = savedIvfPq;
-      VectorIndexBuilder::ivfPqNList = savedNList;
-      VectorIndexBuilder::ivfPqM = savedM;
-      VectorIndexBuilder::ivfPqBits = savedBits;
-      VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
-      VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
-      VectorIndexBuilder::ivfPqBuildThresholdScanCost = savedBuildThreshold;
-    }
+  struct IvfPqGuard : IvfTestGuard {
+    IvfPqGuard() : IvfTestGuard(pq(/*nlist=*/2, /*m=*/1, /*bits=*/1)) {}
   };
 
   // Install a schema where _v has metric=L2 so the suffix-rule fields

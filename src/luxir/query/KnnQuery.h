@@ -57,7 +57,7 @@ namespace luxir {
 ///   2. Build one engine slot per segment behind the VectorEngine seam:
 ///      SegmentFlatColumnVectorEngine (exact brute-force over the mmapped
 ///      column - the default and the below-IVF-threshold fallback) or
-///      SegmentFaissVectorEngine (IVF+PQ aux, approximate).  All slots are
+///      SegmentFaissVectorEngine (IVF+RaBitQ or IVF+PQ aux, approximate).  All slots are
 ///      wrapped in one CompositeVectorEngine, which owns global IVF list
 ///      allocation across segments (see its class comment).
 ///   3. WIDEN: the host loop below re-enters engine->search() until enough
@@ -825,6 +825,22 @@ public:
       std::vector<EngineSlot<Groups>> slots;
       slots.reserve(numSegs);
       bool approximateEngine = false;
+      // RaBitQ overlays index the rotated space: the query is rotated once
+      // per distinct rotation (overlays of one dims share one interned
+      // matrix) and outlives every engine built below.  Each inner buffer
+      // keeps its address when the outer vector grows.
+      std::vector<std::pair<const faiss::LinearTransform*, std::vector<float>>> rotatedQueries;
+      auto rotatedQuery = [&](const faiss::LinearTransform* rotation) -> const float* {
+        for (const auto& [rot, buf] : rotatedQueries) {
+          if (rot == rotation) return buf.data();
+        }
+        auto& entry = rotatedQueries.emplace_back(rotation, std::vector<float>((size_t)dims));
+        rotation->apply_noalloc(1, queryPtr, entry.second.data());
+        return entry.second.data();
+      };
+      // RaBitQ query quantization is a search-time knob: the current
+      // schema's value applies to every overlay.
+      int32_t rabitqQueryBits = query.getFieldType().ann().rabitqQueryBits;
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = segVectorCounts[i];
         if (segCount <= 0 || segInfos.at(i) == nullptr) continue;
@@ -856,15 +872,22 @@ public:
               "KnnQuery: segment FAISS ntotal={} != segment vector count={} for field '{}'",
               idx->ntotal, segCount, query.getField()));
           }
-          bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ;
+          // Both codecs are IVF; each segment is served by its own overlay's
+          // meta, so segments built with different codecs mix freely.
+          bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ
+            || vaux->getEngine() == VectorAuxMeta::ENGINE_IVFRABITQ;
           approximateEngine = approximateEngine || !vaux->scoresAreExact();
+          const float* indexQuery = vaux->getRotation() != nullptr
+            ? rotatedQuery(vaux->getRotation())
+            : nullptr;
           // rankLivePerSeg[i] is shared with the engine, NOT moved: the widen
           // loop's foldSeen() seeds the eligible bitmaps from it.
           auto faissEngine = std::make_unique<SegmentFaissVectorEngine<Groups>>(
             *idx, (int32_t)i, seg, v2dPerSeg[i], domain,
             rankLivePerSeg[i],
             metric, vaux->scoresAreExact(), isIvf,
-            vaux->getNList(), query.groups, v2dSpan);
+            vaux->getNList(), query.groups, v2dSpan, indexQuery,
+            vaux->isRaBitQ() ? rabitqQueryBits : -1);
           SegmentFaissVectorEngine<Groups>* ivfEngine = isIvf ? faissEngine.get() : nullptr;
           slots.push_back({
             .engine = std::move(faissEngine),
@@ -1046,7 +1069,7 @@ public:
       //   BREADTH - pool exhausted but more IVF lists remain: grow breadth
       //             (the engine allocates the next globally-best lists).
       // The whole loop runs on ENGINE scores (exact for column slots,
-      // approximate for IVF+PQ): the stopping condition is a distinct-doc
+      // approximate for IVF overlays): the stopping condition is a distinct-doc
       // COUNT, which approximate scores answer just as well, so exact rescore
       // is deferred to one terminal pass after the loop.  Deliberately not
       // overlapped with rescore: interleaving would re-read column vectors
@@ -1255,7 +1278,7 @@ public:
     /// liveListSize() to pick lists across ALL segments, then hands the chosen
     /// lists back through searchSelectedLists().  The plain search() override
     /// is the whole-index path for non-IVF FAISS kinds; no such aux kind
-    /// exists today (ENGINE_IVFPQ is the only one), so it is reserved seam
+    /// exists today (both codecs are IVF), so it is reserved seam
     /// surface, not a live code path.
     template <bool Groups> class SegmentFaissVectorEngine final : public VectorEngine {
       const CollapsePlan* groupPlan;
@@ -1316,6 +1339,16 @@ public:
       bool exactScores;
       bool isIvf;
       int32_t nlist;
+      // The query in the index's space (rotated for RaBitQ overlays), owned
+      // by prepare(); null = the request's query as is.
+      const float* indexQuery;
+      // RaBitQ query quantization bits (IVFRaBitQSearchParameters::qb);
+      // negative for other codecs.
+      int32_t rabitqQueryBits;
+
+      const float* queryFor(const float* requestQuery) const noexcept {
+        return indexQuery != nullptr ? indexQuery : requestQuery;
+      }
 
       /// The ONLY selector policy: built per scan call from (domain,
       /// domainIsLive, rankLive, request.eligible), so round 1 and deepen
@@ -1402,7 +1435,9 @@ public:
                                bool exactScores,
                                bool isIvf,
                                int32_t nlist, const CollapsePlan* groupPlan,
-                               std::span<const SegV2D> groupV2d)
+                               std::span<const SegV2D> groupV2d,
+                               const float* indexQuery = nullptr,
+                               int32_t rabitqQueryBits = -1)
         : groupPlan(groupPlan), groupV2d(groupV2d), index(index),
           ivf(isIvf ? dynamic_cast<faiss::IndexIVF*>(&index) : nullptr),
           segOrd(segOrd),
@@ -1415,7 +1450,9 @@ public:
           metric(metric),
           exactScores(exactScores),
           isIvf(isIvf),
-          nlist(nlist) {
+          nlist(nlist),
+          indexQuery(indexQuery),
+          rabitqQueryBits(rabitqQueryBits) {
         if (isIvf && ivf == nullptr) {
           throw std::runtime_error("KnnQuery: vector aux marked IVF but FAISS index is not IndexIVF");
         }
@@ -1433,7 +1470,9 @@ public:
         unused(dims);
         listIds.assign((size_t)nlist, (faiss::idx_t)-1);
         centroidDists.assign((size_t)nlist, 0.0f);
-        ivf->quantizer->search(1, query, nlist, centroidDists.data(), listIds.data());
+        // The rotation is orthonormal, so these distances compare directly
+        // with other segments' (rotated or not) in the global list ranking.
+        ivf->quantizer->search(1, queryFor(query), nlist, centroidDists.data(), listIds.data());
       }
 
       /// Live vector count of one IVF list - the unit the global allocator
@@ -1520,15 +1559,18 @@ public:
         // the segment needs no filtering this round, so the scanner
         // compiles the per-vector check out.
         RoundSelector roundSel(*this, request);
-        faiss::SearchParametersIVF ivfParams;
+        // IVFRaBitQSearchParameters is a SearchParametersIVF; IVF+PQ ignores
+        // the RaBitQ fields, which only RaBitQ scanners look up.
+        faiss::IVFRaBitQSearchParameters ivfParams;
         ivfParams.sel = roundSel.get();
         // max_codes remains 0: selected IVF lists are scanned in full.
         ivfParams.nprobe = listIds.size();
+        if (rabitqQueryBits >= 0) ivfParams.qb = (uint8_t)rabitqQueryBits;
         // Local stats sink, discarded: with a null stats argument FAISS does
         // plain non-atomic '+=' on the global faiss::indexIVF_stats, and
         // concurrent chunk tasks of one query would race on it.
         faiss::IndexIVFStats stats;
-        ivf->search_preassigned(1, request.query, request.candidates,
+        ivf->search_preassigned(1, queryFor(request.query), request.candidates,
                                 listIds.data(), centroidDists.data(),
                                 dists.data(), ids.data(), false, &ivfParams,
                                 &stats);
@@ -2733,7 +2775,10 @@ private:
   static float scoreFromDist(float dist, int32_t metric) {
     switch (metric) {
       case (int32_t)luxir::api::VectorMetric::L2:
-        return finiteScore(1.0f / (1.0f + dist));
+        // Exact and PQ distances are >= 0, but RaBitQ's unbiased estimate
+        // can dip below zero for near vectors; clamping keeps the
+        // conversion monotone (1 / (1 + d) flips sign past d = -1).
+        return finiteScore(1.0f / (1.0f + std::max(dist, 0.0f)));
       case (int32_t)luxir::api::VectorMetric::IP:
       case (int32_t)luxir::api::VectorMetric::COSINE:
       default:
