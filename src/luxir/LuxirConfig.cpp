@@ -138,6 +138,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.http.threads", server.http.threads,
                  "HTTP connection I/O shards (one thread each, plus one accept thread; 0 = auto)")
       ->default_val(server.http.threads);
+  app.add_option("--server.workers", server.workers,
+                 "Task-arena worker threads for indexing, merges and parallel search "
+                 "(0 = auto: all CPUs on nodes of up to 4, else all but one)")
+      ->default_val(server.workers)
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--server.stream_buffer_bytes", server.stream_buffer_bytes,
                  "Per-connection buffered response bytes before streaming producers pause")
       ->default_val(server.stream_buffer_bytes);

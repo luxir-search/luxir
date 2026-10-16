@@ -19,6 +19,21 @@ struct ServerConfig {
   // clamped to 1 by the servers.
   int64_t stream_buffer_bytes = 1 << 20;
 
+  // Worker threads of the node's task arena: indexing, merges, and parallel or
+  // dispatched search.  Transport threads (HTTP shards, gRPC) enter the arena
+  // through reserved slots and are not counted.  0 = auto: the affinity width
+  // less one, leaving a core for the transport threads, except on nodes of at
+  // most kSmallNodeCores, where holding a core back idles too much of the
+  // machine (half of a 2-vCPU node) and the transport threads share instead.
+  int workers = 0;
+  static constexpr int kSmallNodeCores = 4;
+
+  int resolveWorkers() const {
+    if (workers > 0) return workers;
+    int cores = std::max(1, oneapi::tbb::info::default_concurrency());
+    return cores <= kSmallNodeCores ? cores : cores - 1;
+  }
+
   struct Grpc {
     // <0 means "derive from the HTTP port" (http.port + 1), resolved in normalize().
     // An explicit --server.grpc.port / -p overrides.

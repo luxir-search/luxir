@@ -246,6 +246,18 @@ to 28 HTTP shards and 14 gRPC threads. Set explicit counts with:
 count; each shard owns one `io_context` and one runner. Connections are
 assigned round-robin at accept and remain pinned to their shard.
 
+Indexing, merges, and search work moved off a transport thread run on a shared
+pool of worker threads. `--server.workers` sets its size. The default (`0`) is
+one worker per available logical CPU less one, which leaves a CPU for the
+transport threads; on machines with 4 or fewer logical CPUs it is one worker per
+CPU, because holding one back would idle a large share of a small node (half of
+a 2-vCPU one). Transport threads are not counted: they share the CPUs with the
+workers.
+
+```bash
+./luxir --server.workers=2
+```
+
 Search requests default to serial execution directly on the transport thread
 that received them (an HTTP io shard or gRPC completion-queue thread). This
 avoids a scheduler handoff and idle-worker wakeups but occupies that

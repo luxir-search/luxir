@@ -7,6 +7,7 @@
 #include "ReplicationFollower.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/log.h"
+#include "oneapi/tbb/global_control.h"
 
 namespace luxir {
 
@@ -16,6 +17,27 @@ namespace luxir {
 static int reservedArenaSlots(const LuxirConfig& config) {
   const auto& server = config.server;
   return (server.http.enabled ? server.http.resolveThreads() : 0) + server.grpc.resolveThreads() + 1;
+}
+
+// TBB's global pool lends at most max_allowed_parallelism - 1 workers to all
+// arenas, and that defaults to the affinity width: one CPU is kept for a
+// master thread, as in a default arena.  Arena slots past it stay empty, so a
+// node whose workers fill every CPU (the small-node default) would still get
+// one fewer.  Raise the pool to the widest node's workers.  It is never
+// lowered: each arena caps its own concurrency, and a global_control lowers
+// the limit for every arena in the process (the smallest active value wins),
+// so a narrow node must not starve a wider one.  Leaked on purpose: a static
+// would be destroyed after the TBB runtime may have shut down.
+static void ensureWorkerPool(int workers) {
+  using oneapi::tbb::global_control;
+  static std::mutex mutex;
+  static global_control* control = nullptr;
+  std::lock_guard<std::mutex> lock(mutex);
+  std::size_t wanted = (std::size_t)workers + 1;
+  if (global_control::active_value(global_control::max_allowed_parallelism) >= wanted) return;
+  auto* raised = new global_control(global_control::max_allowed_parallelism, wanted);
+  delete control;  // the smaller limit holds until here
+  control = raised;
 }
 
 LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view server)
@@ -29,9 +51,11 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
 }
 
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
-  : config(std::move(config)), reservedSlots(reservedArenaSlots(this->config)),
-    taskArena(std::max(1, oneapi::tbb::info::default_concurrency() - 1) + reservedSlots, reservedSlots,
+  : config(std::move(config)), workers(std::max(1, this->config.server.resolveWorkers())),
+    reservedSlots(reservedArenaSlots(this->config)),
+    taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast) {
+  ensureWorkerPool(workers);
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers
