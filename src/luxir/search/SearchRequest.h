@@ -4,6 +4,7 @@
 #pragma once
 
 #include <stop_token>
+#include "luxir/util/Metrics.h"
 
 #include <atomic>
 #include <functional>
@@ -80,6 +81,7 @@ struct ExecutionProfileOpState {
 class Collection;
 class SearchRequest {
   friend class SearchEngine;
+  MetricScope metric;
 
 public:
   std::stop_source waitCancellation{std::nostopstate};

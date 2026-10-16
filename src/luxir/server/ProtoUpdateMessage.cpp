@@ -183,6 +183,24 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 
 
 void ProtoUpdateMessage::handle(IndexWriter& iw) {
+  MetricWork metric(iw.metrics ? &iw.metrics->updates : nullptr);
+  struct Count {
+    ProtoUpdateMessage& msg;
+    Metrics* metrics;
+    MetricWork& metric;
+    int exceptions = std::uncaught_exceptions();
+    ~Count() {
+      if (!metrics) return;
+      const auto& req = *msg.req;
+      bool failed = std::uncaught_exceptions() > exceptions || msg.metricFailed();
+      auto errors = msg.metricErrors();
+      uint64_t rejected = failed ? req.docs.size() : errors;
+      metrics->documentsAccepted.fetch_add(req.docs.size() - rejected, std::memory_order_relaxed);
+      metrics->documentsRejected.fetch_add(rejected, std::memory_order_relaxed);
+      if (!failed) metrics->deletesAccepted.fetch_add(req.delete_ids.size(), std::memory_order_relaxed);
+      metric.failed = failed || errors != 0;
+    }
+  } count{*this, iw.metrics.get(), metric};
   validateFieldMap(*req);
 
   // Check if we need an inverter for either deletes or adds

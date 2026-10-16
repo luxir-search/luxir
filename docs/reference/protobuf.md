@@ -55,6 +55,7 @@ defaults and constraints are described in the comments and guides.
 
 ## Messages
 
+- [`ActivityStats`](#message-luxir.activitystats)
 - [`AllReplicas`](#message-luxir.allreplicas)
 - [`AnalyzerComponent`](#message-luxir.analyzercomponent)
 - [`AnalyzerDef`](#message-luxir.analyzerdef)
@@ -78,6 +79,10 @@ defaults and constraints are described in the comments and guides.
 - [`CacheControlResponse`](#message-luxir.cachecontrolresponse)
 - [`CacheEntryDump`](#message-luxir.cacheentrydump)
 - [`CalendarGap`](#message-luxir.calendargap)
+- [`CgroupCpuStats`](#message-luxir.cgroupcpustats)
+- [`CgroupMemoryStats`](#message-luxir.cgroupmemorystats)
+- [`CgroupStats`](#message-luxir.cgroupstats)
+- [`CgroupTaskStats`](#message-luxir.cgrouptaskstats)
 - [`ColDouble`](#message-luxir.coldouble)
 - [`ColFloat`](#message-luxir.colfloat)
 - [`ColInt`](#message-luxir.colint)
@@ -89,10 +94,12 @@ defaults and constraints are described in the comments and guides.
 - [`Column`](#message-luxir.column)
 - [`CommitParams`](#message-luxir.commitparams)
 - [`ConstantScoreQuery`](#message-luxir.constantscorequery)
+- [`CpuTimes`](#message-luxir.cputimes)
 - [`CreateCollectionRequest`](#message-luxir.createcollectionrequest)
 - [`CreateCollectionResponse`](#message-luxir.createcollectionresponse)
 - [`DeleteCollectionRequest`](#message-luxir.deletecollectionrequest)
 - [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse)
+- [`DiskStats`](#message-luxir.diskstats)
 - [`DocList`](#message-luxir.doclist)
 - [`Domain`](#message-luxir.domain)
 - [`Error`](#message-luxir.error)
@@ -106,13 +113,18 @@ defaults and constraints are described in the comments and guides.
 - [`FieldDef`](#message-luxir.fielddef)
 - [`FieldDefaults`](#message-luxir.fielddefaults)
 - [`FieldFacet`](#message-luxir.fieldfacet)
+- [`FieldMetadataStats`](#message-luxir.fieldmetadatastats)
 - [`FieldVariants`](#message-luxir.fieldvariants)
+- [`FilesystemStats`](#message-luxir.filesystemstats)
 - [`Filter`](#message-luxir.filter)
 - [`FollowerStatus`](#message-luxir.followerstatus)
 - [`Fusion`](#message-luxir.fusion)
 - [`FuzzyQuery`](#message-luxir.fuzzyquery)
 - [`GeoBoxQuery`](#message-luxir.geoboxquery)
 - [`GeoDistanceQuery`](#message-luxir.geodistancequery)
+- [`HistogramStats`](#message-luxir.histogramstats)
+- [`HostCpuStats`](#message-luxir.hostcpustats)
+- [`HostMemoryStats`](#message-luxir.hostmemorystats)
 - [`IndexRamStats`](#message-luxir.indexramstats)
 - [`IndexStats`](#message-luxir.indexstats)
 - [`JemallocStats`](#message-luxir.jemallocstats)
@@ -125,9 +137,12 @@ defaults and constraints are described in the comments and guides.
 - [`Match`](#message-luxir.match)
 - [`MemoryStats`](#message-luxir.memorystats)
 - [`MultiVector`](#message-luxir.multivector)
+- [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
 - [`PhraseQuery`](#message-luxir.phrasequery)
 - [`PrefixQuery`](#message-luxir.prefixquery)
+- [`PressureStats`](#message-luxir.pressurestats)
+- [`ProcessStats`](#message-luxir.processstats)
 - [`Query`](#message-luxir.query)
 - [`QueryBucket`](#message-luxir.querybucket)
 - [`QueryCacheStats`](#message-luxir.querycachestats)
@@ -151,6 +166,7 @@ defaults and constraints are described in the comments and guides.
 - [`SearchRequest`](#message-luxir.searchrequest)
 - [`SearchResponse`](#message-luxir.searchresponse)
 - [`SegmentStats`](#message-luxir.segmentstats)
+- [`ServiceStats`](#message-luxir.servicestats)
 - [`ShardCacheControl`](#message-luxir.shardcachecontrol)
 - [`ShardStats`](#message-luxir.shardstats)
 - [`SimpleQuery`](#message-luxir.simplequery)
@@ -159,7 +175,10 @@ defaults and constraints are described in the comments and guides.
 - [`StatsResponse`](#message-luxir.statsresponse)
 - [`StatsTotals`](#message-luxir.statstotals)
 - [`StorageRamStats`](#message-luxir.storageramstats)
+- [`SystemStats`](#message-luxir.systemstats)
+- [`TcpStats`](#message-luxir.tcpstats)
 - [`TopDocs`](#message-luxir.topdocs)
+- [`TransportStats`](#message-luxir.transportstats)
 - [`UpdateRequest`](#message-luxir.updaterequest)
 - [`UpdateResponse`](#message-luxir.updateresponse)
 - [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror)
@@ -167,6 +186,22 @@ defaults and constraints are described in the comments and guides.
 - [`Vector`](#message-luxir.vector)
 - [`Warning`](#message-luxir.warning)
 - [`WildcardQuery`](#message-luxir.wildcardquery)
+
+<a id="message-luxir.activitystats"></a>
+
+### luxir.ActivityStats
+
+One kind of work: currently running, completed by outcome, and the duration of completed work (failed and cancelled work included).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.activitystats.in_flight"></a>[`in_flight`](#field-luxir.activitystats.in_flight) | 1 | `int64` | singular |  |
+| <a id="field-luxir.activitystats.ok"></a>[`ok`](#field-luxir.activitystats.ok) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.activitystats.error"></a>[`error`](#field-luxir.activitystats.error) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.activitystats.cancelled"></a>[`cancelled`](#field-luxir.activitystats.cancelled) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.activitystats.duration"></a>[`duration`](#field-luxir.activitystats.duration) | 5 | [`HistogramStats`](#message-luxir.histogramstats) | singular |  |
 
 <a id="message-luxir.allreplicas"></a>
 
@@ -439,6 +474,63 @@ One resident cache entry. key\_text is the printable-byte extraction from the se
 | <a id="field-luxir.calendargap.n"></a>[`n`](#field-luxir.calendargap.n) | 1 | `int32` | singular | number of civil units per bucket; must be positive |
 | <a id="field-luxir.calendargap.unit"></a>[`unit`](#field-luxir.calendargap.unit) | 2 | [`CalendarGap.Unit`](#enum-luxir.calendargap.unit) | singular |  |
 
+<a id="message-luxir.cgroupcpustats"></a>
+
+### luxir.CgroupCpuStats
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.cgroupcpustats.usage_seconds"></a>[`usage_seconds`](#field-luxir.cgroupcpustats.usage_seconds) | 1 | `double` | singular |  |
+| <a id="field-luxir.cgroupcpustats.throttled_seconds"></a>[`throttled_seconds`](#field-luxir.cgroupcpustats.throttled_seconds) | 2 | `double` | singular |  |
+| <a id="field-luxir.cgroupcpustats.periods"></a>[`periods`](#field-luxir.cgroupcpustats.periods) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.cgroupcpustats.throttled_periods"></a>[`throttled_periods`](#field-luxir.cgroupcpustats.throttled_periods) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.cgroupcpustats.quota_cores"></a>[`quota_cores`](#field-luxir.cgroupcpustats.quota_cores) | 5 | `double` | singular | -1 is unlimited |
+
+<a id="message-luxir.cgroupmemorystats"></a>
+
+### luxir.CgroupMemoryStats
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.cgroupmemorystats.current_bytes"></a>[`current_bytes`](#field-luxir.cgroupmemorystats.current_bytes) | 1 | `uint64` | singular | including page cache and descendants |
+| <a id="field-luxir.cgroupmemorystats.max_bytes"></a>[`max_bytes`](#field-luxir.cgroupmemorystats.max_bytes) | 2 | `int64` | singular | -1 is unlimited |
+| <a id="field-luxir.cgroupmemorystats.high_bytes"></a>[`high_bytes`](#field-luxir.cgroupmemorystats.high_bytes) | 3 | `int64` | singular | -1 is unlimited |
+| <a id="field-luxir.cgroupmemorystats.low_events"></a>[`low_events`](#field-luxir.cgroupmemorystats.low_events) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.cgroupmemorystats.high_events"></a>[`high_events`](#field-luxir.cgroupmemorystats.high_events) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.cgroupmemorystats.max_events"></a>[`max_events`](#field-luxir.cgroupmemorystats.max_events) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.cgroupmemorystats.oom_events"></a>[`oom_events`](#field-luxir.cgroupmemorystats.oom_events) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.cgroupmemorystats.oom_kill_events"></a>[`oom_kill_events`](#field-luxir.cgroupmemorystats.oom_kill_events) | 8 | `uint64` | singular |  |
+
+<a id="message-luxir.cgroupstats"></a>
+
+### luxir.CgroupStats
+
+This process's cgroup v2. Limits are local to the cgroup; ancestors may impose stricter ones. Controllers that are not enabled are omitted.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.cgroupstats.path"></a>[`path`](#field-luxir.cgroupstats.path) | 1 | `string` | singular |  |
+| <a id="field-luxir.cgroupstats.memory"></a>[`memory`](#field-luxir.cgroupstats.memory) | 2 | [`CgroupMemoryStats`](#message-luxir.cgroupmemorystats) | singular |  |
+| <a id="field-luxir.cgroupstats.cpu"></a>[`cpu`](#field-luxir.cgroupstats.cpu) | 3 | [`CgroupCpuStats`](#message-luxir.cgroupcpustats) | singular |  |
+| <a id="field-luxir.cgroupstats.tasks"></a>[`tasks`](#field-luxir.cgroupstats.tasks) | 4 | [`CgroupTaskStats`](#message-luxir.cgrouptaskstats) | singular |  |
+
+<a id="message-luxir.cgrouptaskstats"></a>
+
+### luxir.CgroupTaskStats
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.cgrouptaskstats.current"></a>[`current`](#field-luxir.cgrouptaskstats.current) | 1 | `uint64` | singular | including threads |
+| <a id="field-luxir.cgrouptaskstats.max"></a>[`max`](#field-luxir.cgrouptaskstats.max) | 2 | `int64` | singular | -1 is unlimited |
+
 <a id="message-luxir.coldouble"></a>
 
 ### luxir.ColDouble
@@ -589,6 +681,24 @@ Parameters governing how a commit is performed. Presence of this message in an U
 | <a id="field-luxir.constantscorequery.query"></a>[`query`](#field-luxir.constantscorequery.query) | 1 | [`Query`](#message-luxir.query) | singular |  |
 | <a id="field-luxir.constantscorequery.score"></a>[`score`](#field-luxir.constantscorequery.score) | 2 | `float` | optional | Score assigned to every match. Unset = 1.0; an explicit 0.0 is preserved. |
 
+<a id="message-luxir.cputimes"></a>
+
+### luxir.CpuTimes
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.cputimes.cpu"></a>[`cpu`](#field-luxir.cputimes.cpu) | 1 | `string` | singular |  |
+| <a id="field-luxir.cputimes.user"></a>[`user`](#field-luxir.cputimes.user) | 2 | `double` | singular | seconds; includes guest time |
+| <a id="field-luxir.cputimes.nice"></a>[`nice`](#field-luxir.cputimes.nice) | 3 | `double` | singular |  |
+| <a id="field-luxir.cputimes.system"></a>[`system`](#field-luxir.cputimes.system) | 4 | `double` | singular |  |
+| <a id="field-luxir.cputimes.idle"></a>[`idle`](#field-luxir.cputimes.idle) | 5 | `double` | singular |  |
+| <a id="field-luxir.cputimes.iowait"></a>[`iowait`](#field-luxir.cputimes.iowait) | 6 | `double` | singular |  |
+| <a id="field-luxir.cputimes.irq"></a>[`irq`](#field-luxir.cputimes.irq) | 7 | `double` | singular |  |
+| <a id="field-luxir.cputimes.softirq"></a>[`softirq`](#field-luxir.cputimes.softirq) | 8 | `double` | singular |  |
+| <a id="field-luxir.cputimes.steal"></a>[`steal`](#field-luxir.cputimes.steal) | 9 | `double` | singular |  |
+
 <a id="message-luxir.createcollectionrequest"></a>
 
 ### luxir.CreateCollectionRequest
@@ -635,6 +745,29 @@ Parameters governing how a commit is performed. Presence of this message in an U
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.deletecollectionresponse.name"></a>[`name`](#field-luxir.deletecollectionresponse.name) | 1 | `string` | singular |  |
+
+<a id="message-luxir.diskstats"></a>
+
+### luxir.DiskStats
+
+One block device or partition (/proc/diskstats).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.diskstats.device"></a>[`device`](#field-luxir.diskstats.device) | 1 | `string` | singular |  |
+| <a id="field-luxir.diskstats.reads_completed"></a>[`reads_completed`](#field-luxir.diskstats.reads_completed) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.diskstats.reads_merged"></a>[`reads_merged`](#field-luxir.diskstats.reads_merged) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.diskstats.read_bytes"></a>[`read_bytes`](#field-luxir.diskstats.read_bytes) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.diskstats.read_time_seconds"></a>[`read_time_seconds`](#field-luxir.diskstats.read_time_seconds) | 5 | `double` | singular |  |
+| <a id="field-luxir.diskstats.writes_completed"></a>[`writes_completed`](#field-luxir.diskstats.writes_completed) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.diskstats.writes_merged"></a>[`writes_merged`](#field-luxir.diskstats.writes_merged) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.diskstats.written_bytes"></a>[`written_bytes`](#field-luxir.diskstats.written_bytes) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.diskstats.write_time_seconds"></a>[`write_time_seconds`](#field-luxir.diskstats.write_time_seconds) | 9 | `double` | singular |  |
+| <a id="field-luxir.diskstats.io_now"></a>[`io_now`](#field-luxir.diskstats.io_now) | 10 | `uint64` | singular |  |
+| <a id="field-luxir.diskstats.io_time_seconds"></a>[`io_time_seconds`](#field-luxir.diskstats.io_time_seconds) | 11 | `double` | singular |  |
+| <a id="field-luxir.diskstats.io_time_weighted_seconds"></a>[`io_time_weighted_seconds`](#field-luxir.diskstats.io_time_weighted_seconds) | 12 | `double` | singular |  |
 
 <a id="message-luxir.doclist"></a>
 
@@ -834,6 +967,26 @@ Buckets of distinct field values, using the field's value binding. STRING/ID sup
 | <a id="field-luxir.fieldfacet.selected"></a>[`selected`](#field-luxir.fieldfacet.selected) | 7 | [`Val`](#message-luxir.val) | singular | Scalar or array of selected values, coerced as AnyOfQuery values. Selected buckets missing from the ordinary page append in input order with exact counts, even below mincount or absent from the index. Null is an error. |
 | <a id="field-luxir.fieldfacet.selection_mode"></a>[`selection_mode`](#field-luxir.fieldfacet.selection_mode) | 8 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | ALL requires a nonempty selection |
 
+<a id="message-luxir.fieldmetadatastats"></a>
+
+### luxir.FieldMetadataStats
+
+Cached field metadata payload, excluding allocator overhead and unused hash-table capacity.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.fieldmetadatastats.bytes"></a>[`bytes`](#field-luxir.fieldmetadatastats.bytes) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.directories"></a>[`directories`](#field-luxir.fieldmetadatastats.directories) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.directory_bytes"></a>[`directory_bytes`](#field-luxir.fieldmetadatastats.directory_bytes) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.pages"></a>[`pages`](#field-luxir.fieldmetadatastats.pages) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.page_bytes"></a>[`page_bytes`](#field-luxir.fieldmetadatastats.page_bytes) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.entries"></a>[`entries`](#field-luxir.fieldmetadatastats.entries) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.entry_bytes"></a>[`entry_bytes`](#field-luxir.fieldmetadatastats.entry_bytes) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.names"></a>[`names`](#field-luxir.fieldmetadatastats.names) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.name_bytes"></a>[`name_bytes`](#field-luxir.fieldmetadatastats.name_bytes) | 9 | `uint64` | singular |  |
+
 <a id="message-luxir.fieldvariants"></a>
 
 ### luxir.FieldVariants
@@ -845,6 +998,22 @@ Alternate representations of the same input value, keyed by local label. Absent 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.fieldvariants.entries"></a>[`entries`](#field-luxir.fieldvariants.entries) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Each representation is addressed as &lt;field&gt;\_\_&lt;label&gt;. Variant definitions may inherit physical settings through parent, but cannot set multi, stored, stored\_resource, variants, or defaults. All representations share the logical field's scalar, vector, or geographic shape. |
+
+<a id="message-luxir.filesystemstats"></a>
+
+### luxir.FilesystemStats
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.filesystemstats.path"></a>[`path`](#field-luxir.filesystemstats.path) | 1 | `string` | singular |  |
+| <a id="field-luxir.filesystemstats.size_bytes"></a>[`size_bytes`](#field-luxir.filesystemstats.size_bytes) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.filesystemstats.free_bytes"></a>[`free_bytes`](#field-luxir.filesystemstats.free_bytes) | 3 | `uint64` | singular | including reserved blocks |
+| <a id="field-luxir.filesystemstats.avail_bytes"></a>[`avail_bytes`](#field-luxir.filesystemstats.avail_bytes) | 4 | `uint64` | singular | available to this process |
+| <a id="field-luxir.filesystemstats.files"></a>[`files`](#field-luxir.filesystemstats.files) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.filesystemstats.files_free"></a>[`files_free`](#field-luxir.filesystemstats.files_free) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.filesystemstats.readonly"></a>[`readonly`](#field-luxir.filesystemstats.readonly) | 7 | `bool` | singular |  |
 
 <a id="message-luxir.filter"></a>
 
@@ -949,6 +1118,74 @@ Geographic distance query with a center in degrees and radius in meters. Matches
 | <a id="field-luxir.geodistancequery.lon"></a>[`lon`](#field-luxir.geodistancequery.lon) | 3 | `double` | singular | center longitude, degrees in \[-180, 180\] |
 | <a id="field-luxir.geodistancequery.radius_meters"></a>[`radius_meters`](#field-luxir.geodistancequery.radius_meters) | 4 | `double` | singular | inclusive radius, finite and non-negative |
 
+<a id="message-luxir.histogramstats"></a>
+
+### luxir.HistogramStats
+
+Cumulative duration histogram. counts\[i\] is the number of observations at or below ServiceStats.duration\_bounds\[i\]; the last entry (+Inf) equals count. counts is empty when count is zero.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.histogramstats.counts"></a>[`counts`](#field-luxir.histogramstats.counts) | 1 | `uint64` | repeated |  |
+| <a id="field-luxir.histogramstats.sum"></a>[`sum`](#field-luxir.histogramstats.sum) | 2 | `double` | singular | seconds |
+| <a id="field-luxir.histogramstats.count"></a>[`count`](#field-luxir.histogramstats.count) | 3 | `uint64` | singular |  |
+
+<a id="message-luxir.hostcpustats"></a>
+
+### luxir.HostCpuStats
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.hostcpustats.cpus"></a>[`cpus`](#field-luxir.hostcpustats.cpus) | 1 | [`CpuTimes`](#message-luxir.cputimes) | repeated |  |
+| <a id="field-luxir.hostcpustats.context_switches"></a>[`context_switches`](#field-luxir.hostcpustats.context_switches) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.hostcpustats.forks"></a>[`forks`](#field-luxir.hostcpustats.forks) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.hostcpustats.procs_running"></a>[`procs_running`](#field-luxir.hostcpustats.procs_running) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.hostcpustats.procs_blocked"></a>[`procs_blocked`](#field-luxir.hostcpustats.procs_blocked) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.hostcpustats.boot_time_seconds"></a>[`boot_time_seconds`](#field-luxir.hostcpustats.boot_time_seconds) | 6 | `double` | singular |  |
+| <a id="field-luxir.hostcpustats.load1"></a>[`load1`](#field-luxir.hostcpustats.load1) | 7 | `double` | singular |  |
+| <a id="field-luxir.hostcpustats.load5"></a>[`load5`](#field-luxir.hostcpustats.load5) | 8 | `double` | singular |  |
+| <a id="field-luxir.hostcpustats.load15"></a>[`load15`](#field-luxir.hostcpustats.load15) | 9 | `double` | singular |  |
+| <a id="field-luxir.hostcpustats.filefd_allocated"></a>[`filefd_allocated`](#field-luxir.hostcpustats.filefd_allocated) | 10 | `uint64` | singular |  |
+| <a id="field-luxir.hostcpustats.filefd_maximum"></a>[`filefd_maximum`](#field-luxir.hostcpustats.filefd_maximum) | 11 | `uint64` | singular |  |
+
+<a id="message-luxir.hostmemorystats"></a>
+
+### luxir.HostMemoryStats
+
+Host memory from /proc/meminfo and VM events from /proc/vmstat.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.hostmemorystats.total_bytes"></a>[`total_bytes`](#field-luxir.hostmemorystats.total_bytes) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.free_bytes"></a>[`free_bytes`](#field-luxir.hostmemorystats.free_bytes) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.available_bytes"></a>[`available_bytes`](#field-luxir.hostmemorystats.available_bytes) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.buffers_bytes"></a>[`buffers_bytes`](#field-luxir.hostmemorystats.buffers_bytes) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.cached_bytes"></a>[`cached_bytes`](#field-luxir.hostmemorystats.cached_bytes) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.swap_cached_bytes"></a>[`swap_cached_bytes`](#field-luxir.hostmemorystats.swap_cached_bytes) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.swap_total_bytes"></a>[`swap_total_bytes`](#field-luxir.hostmemorystats.swap_total_bytes) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.swap_free_bytes"></a>[`swap_free_bytes`](#field-luxir.hostmemorystats.swap_free_bytes) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.dirty_bytes"></a>[`dirty_bytes`](#field-luxir.hostmemorystats.dirty_bytes) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.writeback_bytes"></a>[`writeback_bytes`](#field-luxir.hostmemorystats.writeback_bytes) | 10 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.mapped_bytes"></a>[`mapped_bytes`](#field-luxir.hostmemorystats.mapped_bytes) | 11 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.shmem_bytes"></a>[`shmem_bytes`](#field-luxir.hostmemorystats.shmem_bytes) | 12 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.slab_bytes"></a>[`slab_bytes`](#field-luxir.hostmemorystats.slab_bytes) | 13 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.slab_reclaimable_bytes"></a>[`slab_reclaimable_bytes`](#field-luxir.hostmemorystats.slab_reclaimable_bytes) | 14 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.slab_unreclaimable_bytes"></a>[`slab_unreclaimable_bytes`](#field-luxir.hostmemorystats.slab_unreclaimable_bytes) | 15 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.page_tables_bytes"></a>[`page_tables_bytes`](#field-luxir.hostmemorystats.page_tables_bytes) | 16 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.kernel_stack_bytes"></a>[`kernel_stack_bytes`](#field-luxir.hostmemorystats.kernel_stack_bytes) | 17 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.anon_pages_bytes"></a>[`anon_pages_bytes`](#field-luxir.hostmemorystats.anon_pages_bytes) | 18 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.page_faults"></a>[`page_faults`](#field-luxir.hostmemorystats.page_faults) | 19 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.major_page_faults"></a>[`major_page_faults`](#field-luxir.hostmemorystats.major_page_faults) | 20 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.swap_in_pages"></a>[`swap_in_pages`](#field-luxir.hostmemorystats.swap_in_pages) | 21 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.swap_out_pages"></a>[`swap_out_pages`](#field-luxir.hostmemorystats.swap_out_pages) | 22 | `uint64` | singular |  |
+| <a id="field-luxir.hostmemorystats.oom_kills"></a>[`oom_kills`](#field-luxir.hostmemorystats.oom_kills) | 23 | `uint64` | singular |  |
+
 <a id="message-luxir.indexramstats"></a>
 
 ### luxir.IndexRamStats
@@ -959,8 +1196,10 @@ Indexing RAM budget: the configured limit and the bytes reserved against it.
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.indexramstats.limit_bytes"></a>[`limit_bytes`](#field-luxir.indexramstats.limit_bytes) | 1 | `uint64` | singular |  |
-| <a id="field-luxir.indexramstats.reserved_bytes"></a>[`reserved_bytes`](#field-luxir.indexramstats.reserved_bytes) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.indexramstats.limit_bytes"></a>[`limit_bytes`](#field-luxir.indexramstats.limit_bytes) | 1 | `uint64` | singular | zero is unlimited |
+| <a id="field-luxir.indexramstats.reserved_bytes"></a>[`reserved_bytes`](#field-luxir.indexramstats.reserved_bytes) | 2 | `uint64` | singular | may temporarily exceed the soft limit |
+| <a id="field-luxir.indexramstats.draining_bytes"></a>[`draining_bytes`](#field-luxir.indexramstats.draining_bytes) | 3 | `uint64` | singular | reserved bytes currently draining through flushes |
+| <a id="field-luxir.indexramstats.pending_merge_bytes"></a>[`pending_merge_bytes`](#field-luxir.indexramstats.pending_merge_bytes) | 4 | `uint64` | singular | pending merge demand, capped at the limit when limited |
 
 <a id="message-luxir.indexstats"></a>
 
@@ -984,6 +1223,10 @@ Indexing RAM budget: the configured limit and the bytes reserved against it.
 | <a id="field-luxir.indexstats.pin_retained_bytes"></a>[`pin_retained_bytes`](#field-luxir.indexstats.pin_retained_bytes) | 12 | `uint64` | singular | bytes whose only remaining owners are pins |
 | <a id="field-luxir.indexstats.pin_idle_drops"></a>[`pin_idle_drops`](#field-luxir.indexstats.pin_idle_drops) | 13 | `uint64` | singular |  |
 | <a id="field-luxir.indexstats.pin_budget_drops"></a>[`pin_budget_drops`](#field-luxir.indexstats.pin_budget_drops) | 14 | `uint64` | singular |  |
+| <a id="field-luxir.indexstats.inverters_busy"></a>[`inverters_busy`](#field-luxir.indexstats.inverters_busy) | 15 | `uint64` | singular | Writer only: indexing inverters by state. |
+| <a id="field-luxir.indexstats.inverters_idle"></a>[`inverters_idle`](#field-luxir.indexstats.inverters_idle) | 16 | `uint64` | singular |  |
+| <a id="field-luxir.indexstats.inverters_flushing"></a>[`inverters_flushing`](#field-luxir.indexstats.inverters_flushing) | 17 | `uint64` | singular |  |
+| <a id="field-luxir.indexstats.commits"></a>[`commits`](#field-luxir.indexstats.commits) | 18 | `uint64` | singular | writer only: commits since the writer opened |
 
 <a id="message-luxir.jemallocstats"></a>
 
@@ -1110,6 +1353,9 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.indexing_budget"></a>[`indexing_budget`](#field-luxir.memorystats.indexing_budget) | 1 | [`IndexRamStats`](#message-luxir.indexramstats) | singular |  |
 | <a id="field-luxir.memorystats.storage_ram"></a>[`storage_ram`](#field-luxir.memorystats.storage_ram) | 2 | [`StorageRamStats`](#message-luxir.storageramstats) | singular |  |
 | <a id="field-luxir.memorystats.jemalloc"></a>[`jemalloc`](#field-luxir.memorystats.jemalloc) | 3 | [`JemallocStats`](#message-luxir.jemallocstats) | singular | Present only when Luxir runs on jemalloc. |
+| <a id="field-luxir.memorystats.field_metadata"></a>[`field_metadata`](#field-luxir.memorystats.field_metadata) | 4 | [`FieldMetadataStats`](#message-luxir.fieldmetadatastats) | singular |  |
+| <a id="field-luxir.memorystats.node_budget_bytes"></a>[`node_budget_bytes`](#field-luxir.memorystats.node_budget_bytes) | 5 | `uint64` | singular | Configured budget for managed memory (max\_ram\_mb); not an RSS ceiling. Zero is unlimited. |
+| <a id="field-luxir.memorystats.search_request_limit_bytes"></a>[`search_request_limit_bytes`](#field-luxir.memorystats.search_request_limit_bytes) | 6 | `uint64` | singular | Per-request tracked search memory ceiling; zero disables rejection. |
 
 <a id="message-luxir.multivector"></a>
 
@@ -1122,6 +1368,34 @@ Multi-valued vector column. Empty ArrVector means "doc does not have the field";
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.multivector.v"></a>[`v`](#field-luxir.multivector.v) | 1 | [`ArrVector`](#message-luxir.arrvector) | repeated |  |
+
+<a id="message-luxir.networkinterfacestats"></a>
+
+### luxir.NetworkInterfaceStats
+
+One interface in this network namespace (/proc/net/dev).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.networkinterfacestats.device"></a>[`device`](#field-luxir.networkinterfacestats.device) | 1 | `string` | singular |  |
+| <a id="field-luxir.networkinterfacestats.receive_bytes"></a>[`receive_bytes`](#field-luxir.networkinterfacestats.receive_bytes) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.receive_packets"></a>[`receive_packets`](#field-luxir.networkinterfacestats.receive_packets) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.receive_errs"></a>[`receive_errs`](#field-luxir.networkinterfacestats.receive_errs) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.receive_drop"></a>[`receive_drop`](#field-luxir.networkinterfacestats.receive_drop) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.receive_fifo"></a>[`receive_fifo`](#field-luxir.networkinterfacestats.receive_fifo) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.receive_frame"></a>[`receive_frame`](#field-luxir.networkinterfacestats.receive_frame) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.receive_compressed"></a>[`receive_compressed`](#field-luxir.networkinterfacestats.receive_compressed) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.receive_multicast"></a>[`receive_multicast`](#field-luxir.networkinterfacestats.receive_multicast) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.transmit_bytes"></a>[`transmit_bytes`](#field-luxir.networkinterfacestats.transmit_bytes) | 10 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.transmit_packets"></a>[`transmit_packets`](#field-luxir.networkinterfacestats.transmit_packets) | 11 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.transmit_errs"></a>[`transmit_errs`](#field-luxir.networkinterfacestats.transmit_errs) | 12 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.transmit_drop"></a>[`transmit_drop`](#field-luxir.networkinterfacestats.transmit_drop) | 13 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.transmit_fifo"></a>[`transmit_fifo`](#field-luxir.networkinterfacestats.transmit_fifo) | 14 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.transmit_colls"></a>[`transmit_colls`](#field-luxir.networkinterfacestats.transmit_colls) | 15 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.transmit_carrier"></a>[`transmit_carrier`](#field-luxir.networkinterfacestats.transmit_carrier) | 16 | `uint64` | singular |  |
+| <a id="field-luxir.networkinterfacestats.transmit_compressed"></a>[`transmit_compressed`](#field-luxir.networkinterfacestats.transmit_compressed) | 17 | `uint64` | singular |  |
 
 <a id="message-luxir.normalizerdef"></a>
 
@@ -1163,6 +1437,51 @@ Matches documents where \`field\` has a term starting with \`prefix\`. TEXT fiel
 |---|---|---|---|---|
 | <a id="field-luxir.prefixquery.field"></a>[`field`](#field-luxir.prefixquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.prefixquery.prefix"></a>[`prefix`](#field-luxir.prefixquery.prefix) | 2 | `string` | singular |  |
+
+<a id="message-luxir.pressurestats"></a>
+
+### luxir.PressureStats
+
+Pressure stall information for one resource (/proc/pressure).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.pressurestats.resource"></a>[`resource`](#field-luxir.pressurestats.resource) | 1 | `string` | singular |  |
+| <a id="field-luxir.pressurestats.some_seconds"></a>[`some_seconds`](#field-luxir.pressurestats.some_seconds) | 2 | `double` | singular |  |
+| <a id="field-luxir.pressurestats.full_seconds"></a>[`full_seconds`](#field-luxir.pressurestats.full_seconds) | 3 | `double` | optional |  |
+
+<a id="message-luxir.processstats"></a>
+
+### luxir.ProcessStats
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.processstats.resident_bytes"></a>[`resident_bytes`](#field-luxir.processstats.resident_bytes) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.virtual_bytes"></a>[`virtual_bytes`](#field-luxir.processstats.virtual_bytes) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.swap_bytes"></a>[`swap_bytes`](#field-luxir.processstats.swap_bytes) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.resident_anonymous_bytes"></a>[`resident_anonymous_bytes`](#field-luxir.processstats.resident_anonymous_bytes) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.resident_file_bytes"></a>[`resident_file_bytes`](#field-luxir.processstats.resident_file_bytes) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.resident_shared_bytes"></a>[`resident_shared_bytes`](#field-luxir.processstats.resident_shared_bytes) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.resident_peak_bytes"></a>[`resident_peak_bytes`](#field-luxir.processstats.resident_peak_bytes) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.threads"></a>[`threads`](#field-luxir.processstats.threads) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.cpu_seconds"></a>[`cpu_seconds`](#field-luxir.processstats.cpu_seconds) | 9 | `double` | singular |  |
+| <a id="field-luxir.processstats.voluntary_context_switches"></a>[`voluntary_context_switches`](#field-luxir.processstats.voluntary_context_switches) | 10 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.involuntary_context_switches"></a>[`involuntary_context_switches`](#field-luxir.processstats.involuntary_context_switches) | 11 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.minor_page_faults"></a>[`minor_page_faults`](#field-luxir.processstats.minor_page_faults) | 12 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.major_page_faults"></a>[`major_page_faults`](#field-luxir.processstats.major_page_faults) | 13 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.max_fds"></a>[`max_fds`](#field-luxir.processstats.max_fds) | 14 | `int64` | singular | soft limit; -1 is unlimited |
+| <a id="field-luxir.processstats.open_fds"></a>[`open_fds`](#field-luxir.processstats.open_fds) | 15 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.start_time_seconds"></a>[`start_time_seconds`](#field-luxir.processstats.start_time_seconds) | 16 | `double` | singular | since the Unix epoch |
+| <a id="field-luxir.processstats.disk_read_bytes"></a>[`disk_read_bytes`](#field-luxir.processstats.disk_read_bytes) | 17 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.disk_written_bytes"></a>[`disk_written_bytes`](#field-luxir.processstats.disk_written_bytes) | 18 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.io_read_bytes"></a>[`io_read_bytes`](#field-luxir.processstats.io_read_bytes) | 19 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.io_written_bytes"></a>[`io_written_bytes`](#field-luxir.processstats.io_written_bytes) | 20 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.io_read_calls"></a>[`io_read_calls`](#field-luxir.processstats.io_read_calls) | 21 | `uint64` | singular |  |
+| <a id="field-luxir.processstats.io_write_calls"></a>[`io_write_calls`](#field-luxir.processstats.io_write_calls) | 22 | `uint64` | singular |  |
 
 <a id="message-luxir.query"></a>
 
@@ -1233,6 +1552,11 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.querycachestats.reader_stable_hits"></a>[`reader_stable_hits`](#field-luxir.querycachestats.reader_stable_hits) | 14 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.reader_stable_refreshes"></a>[`reader_stable_refreshes`](#field-luxir.querycachestats.reader_stable_refreshes) | 15 | `uint64` | singular |  |
 | <a id="field-luxir.querycachestats.reader_stable_retires"></a>[`reader_stable_retires`](#field-luxir.querycachestats.reader_stable_retires) | 16 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.build_attempts"></a>[`build_attempts`](#field-luxir.querycachestats.build_attempts) | 17 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.capacity_dead_builds"></a>[`capacity_dead_builds`](#field-luxir.querycachestats.capacity_dead_builds) | 18 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.thrash_build_skips"></a>[`thrash_build_skips`](#field-luxir.querycachestats.thrash_build_skips) | 19 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.reader_dead_builds"></a>[`reader_dead_builds`](#field-luxir.querycachestats.reader_dead_builds) | 20 | `uint64` | singular |  |
+| <a id="field-luxir.querycachestats.reader_thrash_build_skips"></a>[`reader_thrash_build_skips`](#field-luxir.querycachestats.reader_thrash_build_skips) | 21 | `uint64` | singular |  |
 
 <a id="message-luxir.queryfacet"></a>
 
@@ -1555,6 +1879,35 @@ Ids and generations that appear in filenames are reported in their filesystem sp
 | <a id="field-luxir.segmentstats.overlays"></a>[`overlays`](#field-luxir.segmentstats.overlays) | 13 | [`AuxStats`](#message-luxir.auxstats) | repeated |  |
 | <a id="field-luxir.segmentstats.bytes"></a>[`bytes`](#field-luxir.segmentstats.bytes) | 14 | `uint64` | singular |  |
 
+<a id="message-luxir.servicestats"></a>
+
+### luxir.ServiceStats
+
+Process-wide service counters since start. Counters reset on restart and cache-control reset\_counters does not touch them.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.servicestats.version"></a>[`version`](#field-luxir.servicestats.version) | 1 | `string` | singular |  |
+| <a id="field-luxir.servicestats.read_only"></a>[`read_only`](#field-luxir.servicestats.read_only) | 2 | `bool` | singular |  |
+| <a id="field-luxir.servicestats.duration_bounds"></a>[`duration_bounds`](#field-luxir.servicestats.duration_bounds) | 3 | `double` | repeated | Upper bounds, in seconds, shared by every HistogramStats in the response. |
+| <a id="field-luxir.servicestats.http"></a>[`http`](#field-luxir.servicestats.http) | 4 | [`TransportStats`](#message-luxir.transportstats) | singular |  |
+| <a id="field-luxir.servicestats.grpc"></a>[`grpc`](#field-luxir.servicestats.grpc) | 5 | [`TransportStats`](#message-luxir.transportstats) | singular |  |
+| <a id="field-luxir.servicestats.search"></a>[`search`](#field-luxir.servicestats.search) | 6 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.search_execution"></a>[`search_execution`](#field-luxir.servicestats.search_execution) | 7 | [`HistogramStats`](#message-luxir.histogramstats) | singular | Search body execution, excluding scheduler waits and streaming drains. |
+| <a id="field-luxir.servicestats.search_resource_exhausted"></a>[`search_resource_exhausted`](#field-luxir.servicestats.search_resource_exhausted) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.search_warnings"></a>[`search_warnings`](#field-luxir.servicestats.search_warnings) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.index_batches"></a>[`index_batches`](#field-luxir.servicestats.index_batches) | 10 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.documents_accepted"></a>[`documents_accepted`](#field-luxir.servicestats.documents_accepted) | 11 | `uint64` | singular | Accepted into indexing (not durably acknowledged) or rejected/rolled back. |
+| <a id="field-luxir.servicestats.documents_rejected"></a>[`documents_rejected`](#field-luxir.servicestats.documents_rejected) | 12 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.delete_ids_accepted"></a>[`delete_ids_accepted`](#field-luxir.servicestats.delete_ids_accepted) | 13 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.flush"></a>[`flush`](#field-luxir.servicestats.flush) | 14 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.commit"></a>[`commit`](#field-luxir.servicestats.commit) | 15 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.merge"></a>[`merge`](#field-luxir.servicestats.merge) | 16 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.vector_build"></a>[`vector_build`](#field-luxir.servicestats.vector_build) | 17 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.reader_refresh"></a>[`reader_refresh`](#field-luxir.servicestats.reader_refresh) | 18 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+
 <a id="message-luxir.shardcachecontrol"></a>
 
 ### luxir.ShardCacheControl
@@ -1611,16 +1964,18 @@ Forgiving end-user query for raw search-box input. Malformed query text degrades
 
 ### luxir.StatsRequest
 
-Operational statistics. An empty collection requests every collection on the node; per-segment records are opt-in because they are the only unbounded part of the response.
+Operational statistics. An empty collection requests every collection on the node; per-segment records are opt-in because they are the only unbounded part of the response. Which statistics to gather. The node scope (no collection, no tenant) always returns the cheap counters: service activity and node memory, read from atomics and allocator statistics. Anything that walks collections, lists directories, or reads the operating system is opt-in. A tenant or a collection scope always walks its collections and returns no node blocks.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.statsrequest.collection"></a>[`collection`](#field-luxir.statsrequest.collection) | 1 | `string` | singular | Empty selects every collection of \`tenant\`, or of every tenant when \`tenant\` is also empty (administration). |
-| <a id="field-luxir.statsrequest.segments"></a>[`segments`](#field-luxir.statsrequest.segments) | 2 | `bool` | singular |  |
+| <a id="field-luxir.statsrequest.segments"></a>[`segments`](#field-luxir.statsrequest.segments) | 2 | `bool` | singular | Per-segment records. Implies \`files\`, and \`collections\` at node scope. |
 | <a id="field-luxir.statsrequest.tenant"></a>[`tenant`](#field-luxir.statsrequest.tenant) | 3 | `string` | singular | Administration only. With a collection, empty is the caller's tenant. |
-| <a id="field-luxir.statsrequest.memory"></a>[`memory`](#field-luxir.statsrequest.memory) | 4 | `bool` | singular | Return only node memory statistics (StatsResponse.memory), without collections or totals. Node-wide: invalid with a collection, a tenant, or segments. |
+| <a id="field-luxir.statsrequest.collections"></a>[`collections`](#field-luxir.statsrequest.collections) | 5 | `bool` | singular | Node scope: also walk every collection (totals, index state, query cache, snapshot pins, inverters). Takes each writer's index lock briefly; no file I/O. Implied by a tenant or collection scope. |
+| <a id="field-luxir.statsrequest.files"></a>[`files`](#field-luxir.statsrequest.files) | 6 | `bool` | singular | Also list index directories, filling the \`bytes\` totals, segment bytes and aux index bytes. Implies \`collections\` at node scope. |
+| <a id="field-luxir.statsrequest.system"></a>[`system`](#field-luxir.statsrequest.system) | 7 | `bool` | singular | Node scope only: process, host, network, disk, data filesystem, pressure and cgroup v2 statistics, read from procfs and cgroupfs (Linux only). |
 
 <a id="message-luxir.statsresponse"></a>
 
@@ -1630,10 +1985,14 @@ Operational statistics. An empty collection requests every collection on the nod
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.statsresponse.totals"></a>[`totals`](#field-luxir.statsresponse.totals) | 1 | [`StatsTotals`](#message-luxir.statstotals) | singular |  |
+| <a id="field-luxir.statsresponse.totals"></a>[`totals`](#field-luxir.statsresponse.totals) | 1 | [`StatsTotals`](#message-luxir.statstotals) | singular | Set when collections are walked. |
 | <a id="field-luxir.statsresponse.collections"></a>[`collections`](#field-luxir.statsresponse.collections) | 2 | [`CollectionStats`](#message-luxir.collectionstats) | repeated |  |
 | <a id="field-luxir.statsresponse.multiterm_expansion_refills"></a>[`multiterm_expansion_refills`](#field-luxir.statsresponse.multiterm_expansion_refills) | 8 | `uint64` | singular |  |
-| <a id="field-luxir.statsresponse.memory"></a>[`memory`](#field-luxir.statsresponse.memory) | 9 | [`MemoryStats`](#message-luxir.memorystats) | singular | Set only by a StatsRequest.memory request, which returns nothing else. |
+| <a id="field-luxir.statsresponse.memory"></a>[`memory`](#field-luxir.statsresponse.memory) | 9 | [`MemoryStats`](#message-luxir.memorystats) | singular | Node scope only. |
+| <a id="field-luxir.statsresponse.service"></a>[`service`](#field-luxir.statsresponse.service) | 10 | [`ServiceStats`](#message-luxir.servicestats) | singular | Node scope only. |
+| <a id="field-luxir.statsresponse.system"></a>[`system`](#field-luxir.statsresponse.system) | 11 | [`SystemStats`](#message-luxir.systemstats) | singular | Set by StatsRequest.system. |
+| <a id="field-luxir.statsresponse.collection_errors"></a>[`collection_errors`](#field-luxir.statsresponse.collection_errors) | 12 | `uint64` | singular | Collections whose statistics could not be read (for example, deleted while being walked). They are left out of the response. |
+| <a id="field-luxir.statsresponse.duration_seconds"></a>[`duration_seconds`](#field-luxir.statsresponse.duration_seconds) | 13 | `double` | singular | Time spent gathering this response, excluding serialization. |
 
 <a id="message-luxir.statstotals"></a>
 
@@ -1652,7 +2011,8 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 | <a id="field-luxir.statstotals.max_docs"></a>[`max_docs`](#field-luxir.statstotals.max_docs) | 5 | `uint64` | singular |  |
 | <a id="field-luxir.statstotals.live_docs"></a>[`live_docs`](#field-luxir.statstotals.live_docs) | 6 | `uint64` | singular |  |
 | <a id="field-luxir.statstotals.deleted_docs"></a>[`deleted_docs`](#field-luxir.statstotals.deleted_docs) | 7 | `uint64` | singular |  |
-| <a id="field-luxir.statstotals.bytes"></a>[`bytes`](#field-luxir.statstotals.bytes) | 8 | `uint64` | singular | on-disk bytes; the index level reports the whole directory including metadata and in-flight files |
+| <a id="field-luxir.statstotals.bytes"></a>[`bytes`](#field-luxir.statstotals.bytes) | 8 | `uint64` | singular | On-disk bytes from a directory listing (StatsRequest.files): the whole index directory, including metadata and in-flight files. Compare committed\_bytes. |
+| <a id="field-luxir.statstotals.committed_bytes"></a>[`committed_bytes`](#field-luxir.statstotals.committed_bytes) | 9 | `uint64` | singular | Bytes referenced by the current published snapshot, summed from its file descriptors without touching the filesystem. Excludes in-flight and pin-retained files, so it is normally below \`bytes\`. |
 
 <a id="message-luxir.storageramstats"></a>
 
@@ -1664,6 +2024,43 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 |---|---|---|---|---|
 | <a id="field-luxir.storageramstats.used_bytes"></a>[`used_bytes`](#field-luxir.storageramstats.used_bytes) | 1 | `uint64` | singular | Allocated RAM file buffers, including output and retained readers. |
 | <a id="field-luxir.storageramstats.limit_bytes"></a>[`limit_bytes`](#field-luxir.storageramstats.limit_bytes) | 2 | `uint64` | singular | Zero is unlimited. Independent of the indexing budget. |
+
+<a id="message-luxir.systemstats"></a>
+
+### luxir.SystemStats
+
+Operating system statistics. Collectors whose sources cannot be read are listed in \`unavailable\` and their fields are omitted.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.systemstats.process"></a>[`process`](#field-luxir.systemstats.process) | 1 | [`ProcessStats`](#message-luxir.processstats) | singular |  |
+| <a id="field-luxir.systemstats.cpu"></a>[`cpu`](#field-luxir.systemstats.cpu) | 2 | [`HostCpuStats`](#message-luxir.hostcpustats) | singular |  |
+| <a id="field-luxir.systemstats.memory"></a>[`memory`](#field-luxir.systemstats.memory) | 3 | [`HostMemoryStats`](#message-luxir.hostmemorystats) | singular |  |
+| <a id="field-luxir.systemstats.network"></a>[`network`](#field-luxir.systemstats.network) | 4 | [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats) | repeated |  |
+| <a id="field-luxir.systemstats.tcp"></a>[`tcp`](#field-luxir.systemstats.tcp) | 5 | [`TcpStats`](#message-luxir.tcpstats) | singular |  |
+| <a id="field-luxir.systemstats.disks"></a>[`disks`](#field-luxir.systemstats.disks) | 6 | [`DiskStats`](#message-luxir.diskstats) | repeated |  |
+| <a id="field-luxir.systemstats.filesystem"></a>[`filesystem`](#field-luxir.systemstats.filesystem) | 7 | [`FilesystemStats`](#message-luxir.filesystemstats) | singular | The data directory's filesystem; set only for the fs store backend. |
+| <a id="field-luxir.systemstats.pressure"></a>[`pressure`](#field-luxir.systemstats.pressure) | 8 | [`PressureStats`](#message-luxir.pressurestats) | repeated |  |
+| <a id="field-luxir.systemstats.cgroup"></a>[`cgroup`](#field-luxir.systemstats.cgroup) | 9 | [`CgroupStats`](#message-luxir.cgroupstats) | singular |  |
+| <a id="field-luxir.systemstats.unavailable"></a>[`unavailable`](#field-luxir.systemstats.unavailable) | 10 | `string` | repeated |  |
+
+<a id="message-luxir.tcpstats"></a>
+
+### luxir.TcpStats
+
+TCP counters for this network namespace (/proc/net/snmp).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.tcpstats.curr_estab"></a>[`curr_estab`](#field-luxir.tcpstats.curr_estab) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.tcpstats.retrans_segs"></a>[`retrans_segs`](#field-luxir.tcpstats.retrans_segs) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.tcpstats.in_errs"></a>[`in_errs`](#field-luxir.tcpstats.in_errs) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.tcpstats.out_rsts"></a>[`out_rsts`](#field-luxir.tcpstats.out_rsts) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.tcpstats.attempt_fails"></a>[`attempt_fails`](#field-luxir.tcpstats.attempt_fails) | 5 | `uint64` | singular |  |
 
 <a id="message-luxir.topdocs"></a>
 
@@ -1684,6 +2081,24 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 | <a id="field-luxir.topdocs.batch_size"></a>[`batch_size`](#field-luxir.topdocs.batch_size) | 9 | `int32` | singular | Maximum documents per streaming batch. Nonpositive = default (100); the server caps positive values at 256. More documents produce more batches. Ignored beneath a facet bucket, where all rows return together. |
 | <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
 | <a id="field-luxir.topdocs.ops"></a>[`ops`](#field-luxir.topdocs.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed over docs that match this query. |
+
+<a id="message-luxir.transportstats"></a>
+
+### luxir.TransportStats
+
+Request traffic on one transport. Replication routes are not counted.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.transportstats.operations"></a>[`operations`](#field-luxir.transportstats.operations) | 1 | map&lt;`string`, [`ActivityStats`](#message-luxir.activitystats)&gt; | map | Keyed by operation: search, update, schema, collections, stats, health, other. |
+| <a id="field-luxir.transportstats.errors"></a>[`errors`](#field-luxir.transportstats.errors) | 2 | map&lt;`string`, `uint64`&gt; | map | First application error per HTTP request or gRPC call, including errors carried inside a successful transport response, keyed by error kind. |
+| <a id="field-luxir.transportstats.received_bytes"></a>[`received_bytes`](#field-luxir.transportstats.received_bytes) | 3 | `uint64` | singular | application payload, excluding transport framing |
+| <a id="field-luxir.transportstats.sent_bytes"></a>[`sent_bytes`](#field-luxir.transportstats.sent_bytes) | 4 | `uint64` | singular | application payload submitted for sending |
+| <a id="field-luxir.transportstats.stream_pauses"></a>[`stream_pauses`](#field-luxir.transportstats.stream_pauses) | 5 | `uint64` | singular | response producers paused by flow control |
+| <a id="field-luxir.transportstats.connections"></a>[`connections`](#field-luxir.transportstats.connections) | 6 | `uint64` | singular | HTTP only: live sessions, including idle keep-alive |
+| <a id="field-luxir.transportstats.io_threads"></a>[`io_threads`](#field-luxir.transportstats.io_threads) | 7 | `int64` | singular | HTTP only: running connection shard threads |
 
 <a id="message-luxir.updaterequest"></a>
 

@@ -11,6 +11,9 @@ locations, browse `src/luxir/<area>/`.
    - `GRPCServer`: Manages gRPC services and thread pool
    - `HttpServer`: JSON/HTTP API (Boost.Beast), including NDJSON streaming ingest
    - `LuxirNode`: Central coordinator wiring collections and services
+   - `Stats`: The one mapping from engine state (`IndexWriter`/`ReaderManager::stats`, RAM budgets,
+     allocator, `util/Metrics.h` service counters, `SystemStats` procfs/cgroup readers) into
+     `api::StatsResponse`; `Prometheus` renders that response as text for `_stats?format=prometheus`
    - `Collections`: Owns the name -> collection map and every transition of it
      (startup discovery, creation, activation of a new incarnation, removal),
      announced in order through `CollectionEvents`

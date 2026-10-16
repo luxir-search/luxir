@@ -8,6 +8,7 @@
 #include "ReplicationFollower.h"
 
 #include <cassert>
+#include <chrono>
 #include <string_view>
 #include <vector>
 
@@ -32,6 +33,10 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   auto& ram = node.getIndexRamBudget();
   memory.indexing_budget.limit_bytes = (uint64_t)ram.totalBytes();
   memory.indexing_budget.reserved_bytes = (uint64_t)ram.reservedBytes();
+  memory.indexing_budget.draining_bytes = (uint64_t)ram.drainingBytesCount();
+  memory.indexing_budget.pending_merge_bytes = (uint64_t)ram.pendingMergeDemandBytes();
+  memory.node_budget_bytes = node.getConfig().max_ram_mb * 1024 * 1024;
+  memory.search_request_limit_bytes = node.getConfig().search.request_memory_max_bytes;
   memory.storage_ram.used_bytes = node.storageBytes();
   memory.storage_ram.limit_bytes = node.getConfig().store.backend == "ram"
       ? node.getConfig().store.ram_limit_mb * 1024 * 1024 : 0;
@@ -69,6 +74,78 @@ void addTotals(api::StatsTotals& dst, const api::StatsTotals& src) {
   dst.live_docs += src.live_docs;
   dst.deleted_docs += src.deleted_docs;
   dst.bytes += src.bytes;
+  dst.committed_bytes += src.committed_bytes;
+}
+
+void fillHistogram(api::HistogramStats& dst, const MetricHistogram& src,
+                   std::pmr::memory_resource& resource) {
+  auto snapshot = src.snapshot();
+  uint64_t count = 0;
+  for (auto bucket : snapshot.buckets) count += bucket;
+  dst.sum = snapshot.sum;
+  dst.count = count;
+  if (count == 0) return;
+  auto* counts = api::build::allocArray(dst.counts, snapshot.buckets.size(), resource);
+  uint64_t cumulative = 0;
+  for (std::size_t i = 0; i < snapshot.buckets.size(); i++) counts[i] = cumulative += snapshot.buckets[i];
+}
+
+void fillActivity(api::ActivityStats& dst, const MetricActivity& src,
+                  std::pmr::memory_resource& resource) {
+  dst.in_flight = src.active.load(std::memory_order_relaxed);
+  dst.ok = src.completed[(size_t)MetricOutcome::OK].load(std::memory_order_relaxed);
+  dst.error = src.completed[(size_t)MetricOutcome::ERROR].load(std::memory_order_relaxed);
+  dst.cancelled = src.completed[(size_t)MetricOutcome::CANCELLED].load(std::memory_order_relaxed);
+  fillHistogram(dst.duration, src.duration, resource);
+}
+
+void fillTransport(api::TransportStats& dst, Metrics& metrics, MetricTransport transport,
+                   std::pmr::memory_resource& resource) {
+  auto t = (size_t)transport;
+  using Operation = std::pair<std::string_view, api::ActivityStats>;
+  std::span<const Operation> operations;
+  auto* ops = api::build::allocArray(operations, metricOperations.size(), resource);
+  for (std::size_t op = 0; op < metricOperations.size(); op++) {
+    ops[op].first = metricOperations[op];
+    fillActivity(ops[op].second, metrics.requests[t][op], resource);
+  }
+  dst.operations = {operations};
+  using Error = std::pair<std::string_view, uint64_t>;
+  std::span<const Error> errors;
+  auto* kinds = api::build::allocArray(errors, metrics.errors[t].size(), resource);
+  for (std::size_t kind = 0; kind < metrics.errors[t].size(); kind++) {
+    kinds[kind] = {errorKindName((ErrorKind)kind), metrics.errors[t][kind].load(std::memory_order_relaxed)};
+  }
+  dst.errors = {errors};
+  dst.received_bytes = metrics.receivedBytes[t].load(std::memory_order_relaxed);
+  dst.sent_bytes = metrics.sentBytes[t].load(std::memory_order_relaxed);
+  dst.stream_pauses = metrics.streamPauses[t].load(std::memory_order_relaxed);
+}
+
+void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_resource& resource) {
+  auto& metrics = *node.metrics;
+#ifdef LUXIR_VERSION
+  dst.version = LUXIR_VERSION;
+#endif
+  dst.read_only = node.readOnly();
+  dst.duration_bounds = MetricHistogram::bounds;
+  fillTransport(dst.http, metrics, MetricTransport::HTTP, resource);
+  dst.http.connections = metrics.httpConnections.load(std::memory_order_relaxed);
+  dst.http.io_threads = metrics.httpThreads.load(std::memory_order_relaxed);
+  fillTransport(dst.grpc, metrics, MetricTransport::GRPC, resource);
+  fillActivity(dst.search, metrics.searches, resource);
+  fillHistogram(dst.search_execution, metrics.searchExecution, resource);
+  dst.search_resource_exhausted = metrics.searchResourceExhausted.load(std::memory_order_relaxed);
+  dst.search_warnings = metrics.searchWarnings.load(std::memory_order_relaxed);
+  fillActivity(dst.index_batches, metrics.updates, resource);
+  dst.documents_accepted = metrics.documentsAccepted.load(std::memory_order_relaxed);
+  dst.documents_rejected = metrics.documentsRejected.load(std::memory_order_relaxed);
+  dst.delete_ids_accepted = metrics.deletesAccepted.load(std::memory_order_relaxed);
+  fillActivity(dst.flush, metrics.flushes, resource);
+  fillActivity(dst.commit, metrics.commits, resource);
+  fillActivity(dst.merge, metrics.merges, resource);
+  fillActivity(dst.vector_build, metrics.vectorBuilds, resource);
+  fillActivity(dst.reader_refresh, metrics.readerRefreshes, resource);
 }
 
 void copyAuxStats(api::AuxStats& dst, const ReaderManager::AuxStats& src,
@@ -103,6 +180,11 @@ void fillQueryCacheStats(api::QueryCacheStats& dst, const ReaderManager::CacheSt
   dst.reader_stable_hits = src.filterCacheCounters.readerStableHits;
   dst.reader_stable_refreshes = src.filterCacheCounters.readerStableRefreshes;
   dst.reader_stable_retires = src.filterCacheCounters.readerStableRetires;
+  dst.build_attempts = src.filterCacheCounters.buildAttempts;
+  dst.capacity_dead_builds = src.filterCacheCounters.capacityDeadBuilds;
+  dst.thrash_build_skips = src.filterCacheCounters.thrashBuildSkips;
+  dst.reader_dead_builds = src.filterCacheCounters.readerDeadBuilds;
+  dst.reader_thrash_build_skips = src.filterCacheCounters.readerThrashBuildSkips;
 }
 
 template<class Stats>
@@ -113,7 +195,13 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
   dst.core_gen = src.coreGen;
   dst.update_version = src.updateVersion;
   dst.schema_gen = src.schemaGen;
-  if constexpr (requires { src.activeMerges; }) dst.active_merges = src.activeMerges;
+  if constexpr (requires { src.activeMerges; }) {
+    dst.active_merges = src.activeMerges;
+    dst.inverters_busy = src.indexing;
+    dst.inverters_idle = src.idle;
+    dst.inverters_flushing = src.flushing;
+    dst.commits = src.commits;
+  }
 
   auto* aux = api::build::allocArray(dst.aux_indexes, src.auxIndexes.size(), resource);
   for (std::size_t i = 0; i < src.auxIndexes.size(); i++) {
@@ -152,76 +240,101 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
 
 void gatherStats(LuxirNode& node, const api::StatsRequest& request,
                  api::StatsResponse& response, std::pmr::memory_resource& resource) {
-  if (request.memory) {
-    // Node memory alone: no collection walk, so it is cheap to poll.
-    if (!request.collection.empty() || !request.tenant.empty() || request.segments) {
-      throw RequestError("memory stats are node-wide: request them without a collection, "
-                         "tenant, or segments");
-    }
+  auto start = std::chrono::steady_clock::now();
+  bool nodeScope = request.collection.empty() && request.tenant.empty();
+  bool files = request.files || request.segments;
+  if (!nodeScope && request.system) {
+    throw RequestError("system stats are node-wide: request them without a collection or tenant");
+  }
+  if (nodeScope) {
+    // Atomics and allocator statistics only: cheap enough to poll.
+    fillServiceStats(node, response.service.emplace(), resource);
     fillMemoryStats(node, response.memory.emplace());
-    return;
-  }
-  std::vector<LuxirNode::CollectionEntry> entries;
-  if (!request.collection.empty()) {
-    auto collection = node.getCollection(LuxirNode::target(request.tenant, request.collection));
-    entries.push_back({collection->getId(), std::move(collection), {}});
-  } else {
-    // An empty tenant covers every tenant (administration).
-    entries = request.tenant.empty() ? node.collectionEntries() : node.collectionEntries(request.tenant);
-  }
-
-  auto& totals = response.totals.emplace();
-  auto* collections = api::build::allocArray(response.collections, entries.size(), resource);
-  for (std::size_t i = 0; i < entries.size(); i++) {
-    const auto& entry = entries[i];
-    auto& collectionStats = collections[i];
-    collectionStats.name = api::build::arenaStr(resource, entry.id.name);
-    collectionStats.tenant = api::build::arenaStr(resource, entry.id.tenant);
-    collectionStats.storage_ram_bytes = node.storageBytes(entry.id);
-    if (!entry.error.empty()) {
-      collectionStats.error = api::build::arenaError(
-          resource, {ErrorKind::UNAVAILABLE, "collection_unavailable", entry.error});
-      continue;
+    if (request.system) {
+      const auto& store = node.getConfig().store;
+      gatherSystemStats(response.system.emplace(), store.backend == "fs" ? store.data_dir : "", resource);
     }
-
-    auto schema = entry.collection->getSchema();
-    collectionStats.schema_gen = schema ? schema->gen_ : 0;
-
-    auto shard = entry.collection->getShard();
-    assert(shard);
-    auto writer = shard->getIndexWriter();
-    auto* shards = api::build::allocArray(collectionStats.shards, 1, resource);
-    auto& shardStats = shards[0];
-    shardStats.shard_id = 0;
-    auto pins = shard->getSnapshots().stats();
-    shardStats.index.snapshot_pins = pins.pins;
-    shardStats.index.pin_retained_bytes = pins.retainedBytes;
-    shardStats.index.pin_idle_drops = pins.idleDrops;
-    shardStats.index.pin_budget_drops = pins.budgetDrops;
-    auto fill = [&](const auto& stats) {
-      fillIndexStats(shardStats.index, stats, resource);
-      // Counts for this index alone.  "collections" is meaningless below the node
-      // total and "shards" below the collection total, so neither is set here.
-      auto& indexTotals = shardStats.index.totals;
-      indexTotals.segments = stats.segments;
-      indexTotals.committed_segments = stats.committedSegments;
-      indexTotals.max_docs = stats.maxDocs;
-      indexTotals.live_docs = stats.liveDocs;
-      assert(stats.liveDocs <= stats.maxDocs);
-      indexTotals.deleted_docs = stats.maxDocs - stats.liveDocs;
-      indexTotals.bytes = stats.totalBytes;
-    };
-    if (writer) fill(writer->stats(request.segments));
-    else fill(shard->getReaderManager().stats(request.segments));
-
-    collectionStats.totals = shardStats.index.totals;
-    collectionStats.totals.shards = 1;
-    addTotals(totals, collectionStats.totals);
-    totals.collections++;
   }
-
   response.multiterm_expansion_refills =
       multitermExpansionRefills.load(std::memory_order_relaxed);
+
+  if (!nodeScope || request.collections || files) {
+    std::vector<LuxirNode::CollectionEntry> entries;
+    if (!request.collection.empty()) {
+      auto collection = node.getCollection(LuxirNode::target(request.tenant, request.collection));
+      entries.push_back({collection->getId(), std::move(collection), {}});
+    } else {
+      // An empty tenant covers every tenant (administration).
+      entries = request.tenant.empty() ? node.collectionEntries() : node.collectionEntries(request.tenant);
+    }
+
+    auto& totals = response.totals.emplace();
+    auto* collections = api::build::allocArray(response.collections, entries.size(), resource);
+    std::size_t filled = 0;
+    for (const auto& entry : entries) {
+      auto& collectionStats = collections[filled];
+      collectionStats = {};
+      collectionStats.name = api::build::arenaStr(resource, entry.id.name);
+      collectionStats.tenant = api::build::arenaStr(resource, entry.id.tenant);
+      collectionStats.storage_ram_bytes = node.storageBytes(entry.id);
+      if (!entry.error.empty()) {
+        collectionStats.error = api::build::arenaError(
+            resource, {ErrorKind::UNAVAILABLE, "collection_unavailable", entry.error});
+        filled++;
+        continue;
+      }
+      try {
+        auto schema = entry.collection->getSchema();
+        collectionStats.schema_gen = schema ? schema->gen_ : 0;
+
+        auto shard = entry.collection->getShard();
+        assert(shard);
+        auto writer = shard->getIndexWriter();
+        auto* shards = api::build::allocArray(collectionStats.shards, 1, resource);
+        auto& shardStats = shards[0];
+        shardStats.shard_id = 0;
+        // Never expire pins from a stats read: expiry can unlink files.
+        auto pins = shard->getSnapshots().stats(false);
+        shardStats.index.snapshot_pins = pins.pins;
+        shardStats.index.pin_retained_bytes = pins.retainedBytes;
+        shardStats.index.pin_idle_drops = pins.idleDrops;
+        shardStats.index.pin_budget_drops = pins.budgetDrops;
+        auto& indexTotals = shardStats.index.totals;
+        if (auto snapshot = shard->getReaderManager().snapshot()) {
+          for (const auto& file : snapshot->files) indexTotals.committed_bytes += file.size;
+        }
+        auto fill = [&](const auto& stats) {
+          fillIndexStats(shardStats.index, stats, resource);
+          // Counts for this index alone.  "collections" is meaningless below the node
+          // total and "shards" below the collection total, so neither is set here.
+          indexTotals.segments = stats.segments;
+          indexTotals.committed_segments = stats.committedSegments;
+          indexTotals.max_docs = stats.maxDocs;
+          indexTotals.live_docs = stats.liveDocs;
+          assert(stats.liveDocs <= stats.maxDocs);
+          indexTotals.deleted_docs = stats.maxDocs - stats.liveDocs;
+          indexTotals.bytes = stats.totalBytes;
+        };
+        if (writer) fill(writer->stats(request.segments, files));
+        else fill(shard->getReaderManager().stats(request.segments, files));
+      } catch (const std::exception&) {
+        // A collection deleted or closed while walking a node-wide listing must
+        // not fail the whole response; a named collection reports the failure.
+        if (!request.collection.empty()) throw;
+        response.collection_errors++;
+        continue;
+      }
+
+      collectionStats.totals = collectionStats.shards[0].index.totals;
+      collectionStats.totals.shards = 1;
+      addTotals(totals, collectionStats.totals);
+      totals.collections++;
+      filled++;
+    }
+    response.collections = response.collections.first(filled);
+  }
+  response.duration_seconds =
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 }
 
 void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request,

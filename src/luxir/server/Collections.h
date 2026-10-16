@@ -106,6 +106,7 @@ private:
     ~Transition();
   };
 
+  std::shared_ptr<Metrics> metrics;
   const LuxirConfig& config;
   CollectionEvents& events;
   IndexRamBudget& indexRamBudget;
@@ -132,7 +133,8 @@ private:
   void retire(const CollectionId& id, const std::string& selected) noexcept;
 
 public:
-  Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget);
+  Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget,
+              std::shared_ptr<Metrics> metrics = {});
   ~Collections();
 
   // A tenant or collection name: [a-z][a-z0-9_]*, at most 255 bytes.
