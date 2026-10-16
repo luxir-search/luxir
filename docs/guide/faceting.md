@@ -596,7 +596,9 @@ float, double, or date field:
 | Field | Meaning |
 |---|---|
 | `field` | Numeric or date field. Required; its value binding must be numeric or date. |
-| `start`, `end` | Bounds of the bucketed range. Required. |
+| `start`, `end` | Bounds of the bucketed range. Required unless `bounds` is `data`, where they only widen it. |
+| `bounds` | `explicit` (default) or `data`; see [Data-derived bounds](#data-derived-bounds). |
+| `origin` | With `bounds: data`, the alignment origin of fixed gaps. Default 0. |
 | `gap` | Fixed bucket width (milliseconds for dates). Exactly one of `gap` or `calendar_gap` is required. |
 | `calendar_gap` | `{"n": 1, "unit": "month"}` for civil buckets over dates; see [Date histograms](#date-histograms). |
 | `mincount` | `0` (default) keeps every bucket in order, zero counts included; a positive value filters after counting. |
@@ -617,6 +619,48 @@ same semantics as under a string bucket, so an empty range bucket yields
 For numeric and date fields declared with `index: "range"`, a points index can
 answer a whole-index range facet from indexed points instead of walking the
 column. The result is the same either way; only the cost differs.
+
+### Data-derived bounds
+
+Elasticsearch `histogram` and `date_histogram`, and Grafana time series, ask
+for buckets over the data rather than over bounds the client chose. Set
+`"bounds": "data"` and omit `start` and `end`:
+
+```json
+"per_hour": {
+  "range_facet": {
+    "field": "when_dt",
+    "bounds": "data",
+    "gap": 3600000,
+    "time_zone": "America/New_York"
+  }
+}
+```
+
+The buckets run from the one holding the field's smallest value to the one
+holding its largest. `start` and `end`, when given, only widen that span
+(Elasticsearch `extended_bounds`). A field with no values and no `start` and
+`end` returns no buckets. Bucket lower bounds are aligned, never taken from
+the minimum itself:
+
+- Fixed gaps: `origin + k * gap`, default origin 0. For date fields the
+  multiples are counted in local time in the facet time zone, so origin 0
+  aligns hourly and daily buckets to local midnight, and the same alignment
+  an Elasticsearch `date_histogram` with a fixed interval and `offset` gives
+  (`origin` is that offset). Across a daylight-saving change the fences follow
+  the local clock.
+- Calendar gaps: the start of the unit holding the smallest value in the
+  facet time zone, then every `n` units. `origin` does not apply.
+
+The value range comes from segment column metadata, so it covers every
+indexed value of the field and ignores the query and deleted documents. Leading
+and trailing buckets that are empty for the facet's own documents are then
+dropped, so the result matches a facet built from the exact range of the
+matching documents; a `start` or `end` keeps the buckets it asks for. A facet
+nested under another facet's bucket keeps the field-wide fences so every
+parent bucket shares them. `selected` is not supported. The bucket limits
+above apply to the field-wide span: when it needs more than 100,000 buckets
+the request fails, so use a larger gap.
 
 ## Date histograms
 
