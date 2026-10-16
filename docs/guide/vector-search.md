@@ -622,14 +622,18 @@ engines use and costs no measurable recall against `8`.
 
 **PQ** splits each vector into `m` sub-vectors and stores one learned
 codebook entry per sub-vector: 32 bytes for a 768-dimension vector at the
-defaults. It is the smallest codec, but its ranking is markedly coarser on
-high-dimensional embeddings, so it needs much larger `refine_candidates` for
-the same recall, and its codebooks are retrained for every segment build and
-merge.
+defaults. It is the smallest codec, but at the default `m` its ranking is
+markedly coarser on high-dimensional embeddings: on a 768-dimension corpus it
+stayed below 0.89 recall@10 even with 500 rescored candidates, where RaBitQ
+reached 0.96 to 0.99 (see the design notes). A larger `m`, such as `dims / 8`
+(one byte per 8 dimensions, close to RaBitQ's size), recovers most of that
+recall. PQ codebooks are retrained for every segment build and merge.
 
-Start with the default. If recall at your `refine_candidates` falls short,
-try `bits: 2` (twice the code bytes) before raising `refine_candidates`
-further. Choose `pq` when overlay size matters more than recall.
+Start with the default. With 1-bit RaBitQ, recall is usually limited by how
+many lists are probed rather than by the codes, so raise `ivf.nprobe` first;
+extra `bits` help mainly when `refine_candidates` is small. Choose `pq` when
+overlay size or scan speed matters more than recall: FAISS currently scans PQ
+lists faster than RaBitQ lists.
 
 Overlays record the settings they were built with, so a change applies to
 segments built afterwards: new flushes, merges, and segments without an
