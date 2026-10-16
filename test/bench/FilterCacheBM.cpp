@@ -285,7 +285,7 @@ LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheBeginUseHot, boolean_10k, 10'000);
 LUXIR_BENCHMARK(BM_FilterCacheProbePin);
 
 LUXIR_BENCHMARK(BM_FilterCacheHitConcurrent)
-    ->Threads(1)->Threads(8)->Threads(16)->Threads(28);
+    ->Threads(1)->Threads(8)->Threads(16)->ThreadPerCpu();
 
 BENCHMARK_CAPTURE(BM_FilterCacheEffectiveDocSet, raw_serve, false)
     ->UseManualTime()->Iterations(100);
