@@ -2276,12 +2276,16 @@ private:
 
     bool isVector = outputFieldInfo.type == FieldType::Type::VECTOR;
     VectorEncoding outEncoding = VectorEncoding::F32;
+    // The norm prefix follows the field's current settings too: inputs gain
+    // it (computed here) or drop it, like their encoding.
+    bool outNorms = false;
     bool renormalize = false;
     if (isVector) {
       auto* vtype = dynamic_cast<const VectorFieldType*>(
           schema.getFieldTypePtr(std::string_view(outputFieldInfo.fieldname)));
       if (vtype != nullptr) {
         outEncoding = vtype->encoding();
+        outNorms = vtype->storesNorms();
         renormalize = outEncoding == VectorEncoding::F32
             && vtype->metric() == VectorFieldType::METRIC_COSINE
             && (vtype->normalizeOnWrite() || vtype->normalized());
@@ -2289,11 +2293,13 @@ private:
         for (auto* f : sortedFields) {
           if (f == nullptr) continue;
           outEncoding = (VectorEncoding)f->segFieldInfo.vectorEncoding;
+          outNorms = f->segFieldInfo.vectorNorms;
           break;
         }
       }
     }
     outputFieldInfo.vectorEncoding = (int32_t)outEncoding;
+    outputFieldInfo.vectorNorms = outNorms;
     std::vector<float> transcodeFloats;
     std::vector<char> transcodeBytes;
 
@@ -2355,33 +2361,45 @@ private:
       StrColReader reader(*field->seg->postingsReader, field->segFieldInfo);
       StrColReader::Iterator iter(reader);
 
-      // Identity unless this input's vector encoding differs from the output's.
+      // Identity unless this input's vector encoding or norm prefix differs
+      // from the output's.  Only the prefix differing keeps the payload bytes.
       auto inEncoding = (VectorEncoding)field->segFieldInfo.vectorEncoding;
-      bool transcode = isVector && inEncoding != outEncoding && reader.numValues() > 0;
+      bool inNorms = field->segFieldInfo.vectorNorms;
+      bool transcode = isVector && (inEncoding != outEncoding || inNorms != outNorms)
+          && reader.numValues() > 0;
       int32_t transcodeDims = 0;
       if (transcode) {
-        transcodeDims = vcodec::dimsFromBytes(inEncoding, reader.fixedValueSize());
+        transcodeDims = vcodec::dimsFromRowBytes(inEncoding, reader.fixedValueSize(), inNorms);
         if (!reader.isFixedSize() || transcodeDims <= 0) {
           throw std::runtime_error("SegmentMerger: invalid vector column in field "
                                    + std::string((std::string_view)field->segFieldInfo.fieldname));
         }
         transcodeFloats.resize((size_t)transcodeDims);
-        transcodeBytes.resize((size_t)vcodec::bytesPerVector(outEncoding, transcodeDims));
+        transcodeBytes.resize((size_t)vcodec::rowBytes(outEncoding, transcodeDims, outNorms));
       }
       auto convert = [&](std::string_view value) {
         if (!transcode) return value;
-        vcodec::decode(inEncoding, value.data(), transcodeDims, transcodeFloats.data());
-        if (outEncoding == VectorEncoding::F16) {
-          for (auto& x : transcodeFloats) x = std::clamp(x, -vcodec::F16_MAX, vcodec::F16_MAX);
-        } else if (renormalize) {
-          double normSq = 0.0;
-          for (float x : transcodeFloats) normSq += (double)x * (double)x;
-          if (normSq > VectorFieldType::MIN_COSINE_NORM_SQ) {
-            float inv = (float)(1.0 / std::sqrt(normSq));
-            for (auto& x : transcodeFloats) x *= inv;
+        const char* payload = vcodec::rowPayload(value.data(), inNorms);
+        char* out = transcodeBytes.data();
+        char* outPayload = outNorms ? out + vcodec::NORM_BYTES : out;
+        if (inEncoding == outEncoding) {
+          // Same payload; only the norm prefix is added or dropped.
+          std::memcpy(outPayload, payload, (size_t)vcodec::bytesPerVector(inEncoding, transcodeDims));
+        } else {
+          vcodec::decode(inEncoding, payload, transcodeDims, transcodeFloats.data());
+          if (outEncoding == VectorEncoding::F16) {
+            for (auto& x : transcodeFloats) x = std::clamp(x, -vcodec::F16_MAX, vcodec::F16_MAX);
+          } else if (renormalize) {
+            double normSq = 0.0;
+            for (float x : transcodeFloats) normSq += (double)x * (double)x;
+            if (normSq > VectorFieldType::MIN_COSINE_NORM_SQ) {
+              float inv = (float)(1.0 / std::sqrt(normSq));
+              for (auto& x : transcodeFloats) x *= inv;
+            }
           }
+          vcodec::encode(outEncoding, transcodeFloats.data(), transcodeDims, outPayload);
         }
-        vcodec::encode(outEncoding, transcodeFloats.data(), transcodeDims, transcodeBytes.data());
+        if (outNorms) vcodec::writeRowNorm(outEncoding, out, transcodeDims);
         return std::string_view(transcodeBytes.data(), transcodeBytes.size());
       };
 

@@ -106,7 +106,12 @@ public:
       fieldInfo.mono2MetaOff = fieldIS.checkedVlong();
       fieldInfo.valDocLoc = seg_location::checkedRead(fieldIS);
       fieldInfo.valDocMetaOff = fieldIS.checkedVlong();
-      fieldInfo.vectorEncoding = fieldInfo.type == FieldType::VECTOR ? fieldIS.checkedVint() : 0;
+      fieldInfo.vectorEncoding = 0;
+      fieldInfo.vectorNorms = false;
+      if (fieldInfo.type == FieldType::VECTOR) {
+        fieldInfo.vectorEncoding = fieldIS.checkedVint();
+        fieldInfo.vectorNorms = fieldIS.checkedVint() != 0;
+      }
     }
   }
 

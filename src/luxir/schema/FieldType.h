@@ -702,6 +702,10 @@ public:
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
   VectorEncoding encoding() const { return encoding_; }
   bool keepOriginal() const { return keepOriginal_; }
+  // Whether column rows carry the |x|^2 norm prefix (see VectorCodec.h).
+  bool storesNorms() const {
+    return vcodec::needsNorms(encoding_, metric_ == METRIC_COSINE, normalized_ || normalizeOnWrite_);
+  }
   const VectorAnnConfig& ann() const { return ann_; }
 
   // The contract for every indexed and query vector: inputDims() components

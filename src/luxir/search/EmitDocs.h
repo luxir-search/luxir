@@ -606,12 +606,12 @@ inline void loadVersionRuns(SearchRequest& req, IndexReader& reader, std::span<c
 // of the source bytes (column storage is byte-packed and not guaranteed
 // 4-byte aligned).
 inline void fillVectorF32(luxir::api::Vector& vec, std::string_view bytes, VectorEncoding encoding,
-                          std::pmr::memory_resource& mr) {
-  int32_t dims = vcodec::dimsFromBytes(encoding, (int32_t)bytes.size());
+                          bool norms, std::pmr::memory_resource& mr) {
+  int32_t dims = vcodec::dimsFromRowBytes(encoding, (int32_t)bytes.size(), norms);
   assert(dims >= 0);
   vec.f32.emplace();
   float* fs = build::allocArray(vec.f32->v, dims, mr);
-  vcodec::decode(encoding, bytes.data(), dims, fs);
+  vcodec::decode(encoding, vcodec::rowPayload(bytes.data(), norms), dims, fs);
 }
 
 // Field info of the column to return for a vector field in one segment: the
@@ -636,11 +636,12 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, IndexReader& reade
   auto poolGuard = MemPool::threadLocalPoolGuard();
   SegFieldInfo segFieldInfo = vectorReturnColumn(postingsReader, *info);
   auto encoding = (VectorEncoding)segFieldInfo.vectorEncoding;
+  bool norms = segFieldInfo.vectorNorms;
 
   auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes) {
     assert(segDocs[idxSpan[idx]].docId() == doc);
     unused(doc);
-    fillVectorF32(target[idxSpan[idx]], bytes, encoding, mr);
+    fillVectorF32(target[idxSpan[idx]], bytes, encoding, norms, mr);
   };
   StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
 }
@@ -659,6 +660,7 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader
   auto poolGuard = MemPool::threadLocalPoolGuard();
   SegFieldInfo segFieldInfo = vectorReturnColumn(postingsReader, *info);
   auto encoding = (VectorEncoding)segFieldInfo.vectorEncoding;
+  bool norms = segFieldInfo.vectorNorms;
 
   // Multi-valued vectors: each doc's ArrVector holds numVals Vectors. numVals
   // is known at valIdx==0, so the inner Vector span is allocArray'd then filled
@@ -668,7 +670,8 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, IndexReader& reader
     unused(doc);
     luxir::api::ArrVector& outer = target[idxSpan[idx]];
     if (valIdx == 0) build::allocArray(outer.v, numVals, mr);
-    fillVectorF32(const_cast<luxir::api::Vector*>(outer.v.data())[valIdx], bytes, encoding, mr);
+    fillVectorF32(const_cast<luxir::api::Vector*>(outer.v.data())[valIdx], bytes, encoding, norms,
+                  mr);
   };
   StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
 }

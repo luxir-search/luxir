@@ -137,6 +137,8 @@ struct SegFieldInfo {
   // VECTOR only: the column's VectorEncoding, as written for this segment.
   // Serialized only for VECTOR fields.
   int32_t vectorEncoding = 0;
+  // VECTOR only: rows carry the |x|^2 prefix (see VectorCodec.h).
+  bool vectorNorms = false;
 
   void requireCompatibleType(const SegFieldInfo& other) const {
     if (type != other.type || FieldType::typeParameters(type, typeFlags)

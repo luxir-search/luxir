@@ -886,6 +886,8 @@ void BM_VectorIvfIncrementalBuild(benchmark::State& state) {
 void BM_VectorEncodingExact(benchmark::State& state) {
   auto encoding = (api::VectorEncoding)state.range(0);
   auto metric = (api::VectorMetric)state.range(1);
+  // raw: cosine over the stored (unnormalized) vectors, normalize_on_write off.
+  bool raw = state.range(2) != 0;
   int64_t nDocs = luxir::unit_tests ? LuxirTest::scaleTestWork(240) : 50'000;
   int32_t dims = luxir::unit_tests ? 16 : 768;
   int32_t nClusters = luxir::unit_tests ? 8 : 100;
@@ -901,6 +903,7 @@ void BM_VectorEncodingExact(benchmark::State& state) {
     f.dims = dims;
     f.metric = metric;
     f.encoding = encoding;
+    if (raw) f.normalize_on_write = false;
     b.set(helper.collection());
   }
 
@@ -1537,9 +1540,11 @@ LUXIR_BENCHMARK(BM_VectorKnnRecallParallel)->Apply(forceIvfBenchmark)->ArgNames(
     ->Args({0, 0, 10, RABITQ1})->Args({16, 0, 10, RABITQ1})->Args({1 << 20, 0, 10, RABITQ1})
     ->Args({0, 0, 1000, RABITQ1});
 
-// encoding: 0 = f32, 1 = f16, 2 = int8; metric: 1 = l2, 2 = ip, 3 = cosine.
-LUXIR_BENCHMARK(BM_VectorEncodingExact)->ArgNames({"encoding", "metric"})
-    ->ArgsProduct({{0, 1, 2}, {1, 2, 3}});
+// encoding: 0 = f32, 1 = f16, 2 = int8; metric: 1 = l2, 2 = ip, 3 = cosine;
+// raw: 1 = cosine with normalize_on_write off.
+LUXIR_BENCHMARK(BM_VectorEncodingExact)->ArgNames({"encoding", "metric", "raw"})
+    ->ArgsProduct({{0, 1, 2}, {1, 2, 3}, {0}})
+    ->Args({0, 3, 1})->Args({1, 3, 1})->Args({2, 3, 1});
 
 LUXIR_BENCHMARK(BM_VectorKnnRecallThreads)->Apply(forceIvfBenchmark)->ArgNames({"nprobe", "cand", "k", "codec"})
     ->Args({0, 0, 10, RABITQ1})->ThreadRange(1, 32);

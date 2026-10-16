@@ -26,6 +26,9 @@ namespace luxir::handler {
 /// binary-column path inherited from StrColHandler. The column's fixed-size
 /// fast path captures per-segment dims automatically (mono2MetaOff = the
 /// encoded value size); the encoding is recorded in the segment field info.
+/// Fields whose scoring needs each vector's norm (vcodec::needsNorms) store
+/// it once here, as the row's norm prefix, instead of every query
+/// recomputing it per vector.
 ///
 /// With keep_original, the submitted (pre-normalization) float32 vectors, cut
 /// to the truncate_dims prefix when set, are also appended, value for value,
@@ -64,6 +67,7 @@ class VectorHandler final : public StrColHandler {
   bool trustNormalized = false;
   bool normalizeOnWrite = false;
   VectorEncoding encoding = VectorEncoding::F32;
+  bool norms = false;
   std::vector<float> floats;
   std::vector<float> originals;   // pre-normalization copy of floats (keep_original)
   std::vector<int32_t> lens;
@@ -87,6 +91,7 @@ public:
     trustNormalized = vft->normalized_;
     normalizeOnWrite = vft->normalizeOnWrite_;
     encoding = vft->encoding_;
+    norms = vft->storesNorms();
     if (vft->keepOriginal_) {
       std::string name = VectorFieldType::originalColumnName(fieldName);
       int flags = FieldType::COLUMN_STORED | FieldType::FIXED_SIZE
@@ -107,6 +112,7 @@ protected:
 
   void describeField(PostingsWriter::IndexFieldInfo& fieldInfo) const override {
     fieldInfo.vectorEncoding = (int32_t)encoding;
+    fieldInfo.vectorNorms = norms;
   }
 
 public:
@@ -246,21 +252,21 @@ private:
     return true;
   }
 
-  // Fill views with the accepted vectors in the field's encoding.  F32 views
-  // point at the float buffer itself; other encodings encode into one
+  // Fill views with the accepted rows in the field's layout.  Plain F32
+  // views point at the float buffer itself; other layouts encode into one
   // buffer sized up front so the views stay valid.
   void encodeAccepted() {
     views.clear();
-    if (encoding == VectorEncoding::F32) {
+    if (encoding == VectorEncoding::F32 && !norms) {
       for (auto vec : accepted) views.push_back(bytesOf(vec));
       return;
     }
     int32_t dims = (int32_t)accepted[0].size();
-    size_t valueBytes = (size_t)vcodec::bytesPerVector(encoding, dims);
+    size_t valueBytes = (size_t)vcodec::rowBytes(encoding, dims, norms);
     encoded.resize(valueBytes * accepted.size());
     for (size_t i = 0; i < accepted.size(); i++) {
       char* out = encoded.data() + i * valueBytes;
-      vcodec::encode(encoding, accepted[i].data(), dims, out);
+      vcodec::encodeRow(encoding, norms, accepted[i].data(), dims, out);
       views.push_back(std::string_view(out, valueBytes));
     }
   }

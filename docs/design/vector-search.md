@@ -54,22 +54,90 @@ field converges to its declared encoding. Transcoding is lossy when it goes to
 a narrower encoding; it clamps to the f16 range and renormalizes unit-length
 cosine rows written as f32. Same-encoding merges are pure byte copies.
 
+### Norm prefix
+
+Cosine needs `|x|` of every stored vector unless the column holds `f32` unit
+vectors. Recomputing it costs a second
+reduction over every row on every query, while it is a property of the stored
+value, so the writer stores it once: the segment field metadata records
+`vectorNorms`, and each row then starts with a 4-byte float `|x|^2` of the
+vector the payload decodes to (for `int8`, of the exact `offset + scale *
+code` reconstruction), followed by the encoding's payload. Fields that need it
+(`vcodec::needsNorms`): cosine over `f16` or `int8`, and cosine over raw `f32`
+(`normalize_on_write: false`). At 768 dimensions that is 0.1%
+of an `f32` row and 0.5% of an `int8` row.
+
+A prefix in the row rather than a companion column (like `keep_original`'s):
+
+- Rows stay self-describing, so a same-layout merge is still a byte copy and
+  there is no second column to keep rank-aligned across merges and schema
+  changes.
+- The norm is in the first cache line the scorer touches for that row: a
+  rescore, which gathers scattered rows, does no extra random read.
+- `f32` payloads keep their 4-byte alignment relative to the row.
+
+A merge writes the prefix when the field's current settings need it, like
+its encoding: it computes it for the inputs that lack it and drops it from
+the inputs that no longer need it. A segment written under
+settings that did not need it (before a metric change, say) is still scored
+correctly: the scorer computes the same value per row until a merge adds it.
+
+### Scoring kernels
+
 Exact scoring means exact over the stored encoding. `VectorScorer` is the
 single place a float query is scored against a stored row, used by the flat
 column engine and the terminal candidate rescore. `int8` rows are scored
-without decoding to a float buffer, using per-query `sum(q)` and `|q|^2`:
+without decoding to a float buffer. Inner product and cosine use a per-query
+`sum(q)`:
 
 ```text
-q.x   = offset * sum(q) + scale * sum(q[i] * code[i])
-|x|^2 = dims * offset^2 + 2 * offset * scale * sum(code) + scale^2 * sum(code^2)
-|q-x|^2 = |q|^2 - 2 q.x + |x|^2
+q.x   = offset * sum(q) + scale * dot(q, code)
 ```
 
-The integer sums come out of the same pass. Cosine over `f16` and `int8`
-always divides by the stored vector's norm (also from the same pass), since a
-quantized unit vector is not exactly unit length. The scoring loops are
-scalar today; SIMD kernels and a per-vector norm sidecar can replace them
-behind `VectorScorer` without changing the format contract.
+so the per-element work is a pure `dot(q, code)`. L2 decodes
+`offset + scale * code` in registers and sums the squared differences
+directly: `|q|^2 - 2 q.x + |x|^2` cancels catastrophically when the offset is
+large. Cosine over `f16` and `int8`
+always divides by the stored vector's norm, since a quantized unit vector is
+not exactly unit length.
+
+The per-element loops are SIMD kernels (`codec/VectorKernels.cpp`): one pass
+over the stored bytes per row, with `f16` widened to float in registers
+(F16C `vcvtph2ps` on x86, `fcvtl` on AArch64) and fused into the FMA, and
+`uint8` codes zero-extended and converted in registers, with no conversion
+pass into a buffer. The instruction set is chosen at compile time from the
+build's CPU target (`LUXIR_CPU_TARGET`), like the project's other SIMD code:
+AVX2 + FMA + F16C on `x86-64-v3` and above, NEON on AArch64, and a portable
+fixed-width lane loop (which the compiler vectorizes for the baseline target)
+otherwise.
+
+The scorer is batched: the flat scan collects eligible ranks into blocks of
+64 rows and scores each block in one call, and the rescore scores each
+segment's rank-sorted candidate bucket in one call, prefetching rows ahead
+when they are not adjacent. Dispatch on encoding and metric happens once per
+block.
+
+Floating-point sums are not associative, so determinism is designed in. Every
+kernel uses one lane layout, accumulator count, tail handling (a zero-padded
+final vector; for `int8` L2 the query's padding lanes hold the offset, so they
+still contribute 0) and horizontal reduction order for a given `dims`, and the
+kernels live in one translation unit so contraction into FMAs cannot differ
+per call site. A row's score therefore depends only on the query and the row,
+never on its block, task, or thread: parallel and serial runs stay
+bit-identical, and a row scores the same in the scan and in the rescore.
+
+The kernels are shaped for memory-level parallelism, since a column larger
+than the cache makes the scan memory-bound: eight independent accumulators per
+row and a software prefetch a fixed distance ahead, which runs into the next
+row of a contiguous scan.
+
+`int8` keeps the float query. An integer kernel (query quantized to `int8`,
+`vpmaddubsw` / VNNI-style `u8 x s8` dot products) was measured against it on
+50k x 768 clustered vectors: about 20% faster per scan in a microbenchmark,
+but inner-product recall@10 against float32 ground truth fell from 0.976 to
+0.892, because the query's rounding adds to every score on top of the
+stored vectors' own. Exact search must not lose ranking quality for speed,
+so the integer path is not used.
 
 `keep_original` writes the submitted float32 vectors, before cosine
 normalization, to a companion column named `<field>__#orig` (an invalid
