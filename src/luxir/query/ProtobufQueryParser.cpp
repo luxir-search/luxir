@@ -257,11 +257,13 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
     throw std::runtime_error(std::format(
       "KnnQuery for field '{}' must have a non-empty query vector", field));
   }
-  if (vectorType.dims() > 0 && (int32_t)queryVec.size() != vectorType.dims()) {
+  // Clients send the full model output; truncate_dims cuts it to the stored
+  // prefix here, so the query is scored exactly like the indexed vectors.
+  if (std::string err = vectorType.inputDimsError(queryVec.size()); !err.empty()) {
     throw std::runtime_error(std::format(
-      "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
-      queryVec.size(), vectorType.dims(), field));
+      "KnnQuery: query vector for field '{}': {}", field, err));
   }
+  if (vectorType.truncateDims() > 0) queryVec = queryVec.first((size_t)vectorType.truncateDims());
 
   int32_t k = knnQuery.k;
   if (k <= 0) {

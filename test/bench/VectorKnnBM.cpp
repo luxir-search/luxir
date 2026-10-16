@@ -300,6 +300,49 @@ void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux,
     / (double)state.iterations();
 }
 
+// truncate_dims: exact cosine scan latency and index bytes per vector when
+// clients send inputDims-wide vectors and the field keeps a prefix
+// (truncate=0 stores the full vector).  Synthetic vectors, so this measures
+// cost only; retrieval quality depends on a Matryoshka-trained model.
+void BM_VectorKnnTruncate(benchmark::State& state) {
+  int64_t nDocs = luxir::unit_tests ? LuxirTest::scaleTestWork(240) : 100'000;
+  int32_t inputDims = luxir::unit_tests ? 16 : (int32_t)state.range(0);
+  int32_t truncate = luxir::unit_tests ? (state.range(1) ? 4 : 0) : (int32_t)state.range(1);
+  int32_t k = 10;
+
+  CollectionHelper helper("main");
+  helper.clear();
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = api::FieldDef_::FieldClass::VECTOR;
+  f.dims = inputDims;
+  f.metric = api::VectorMetric::COSINE;
+  if (truncate) f.truncate_dims = truncate;
+  b.set(helper.collection());
+  indexVectorBatch(helper, 0, nDocs, inputDims, 1, false);
+  helper.commit();
+
+  uint64_t indexBytes = 0;
+  for (const auto& seg : helper.getIndexWriter()->stats(true).segmentStats) indexBytes += seg.bytes;
+  std::vector<float> query = makeQueryVector(inputDims);
+  for (auto _ : state) {
+    auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v", query, k);
+    req->execute(false);
+    std::string error;
+    uint64_t fp = 0;
+    bool ok = fingerprint(*req, fp, error);
+    req->done();
+    if (!ok) {
+      state.SkipWithError(error.c_str());
+      break;
+    }
+    benchmark::DoNotOptimize(fp);
+  }
+  state.counters["nDocs"] = (double)nDocs;
+  state.counters["storedDims"] = (double)(truncate ? truncate : inputDims);
+  state.counters["indexBytesPerVec"] = (double)indexBytes / (double)nDocs;
+}
+
 // ---------------------------------------------------------------------------
 // IVF+PQ recall benchmark.
 //
@@ -727,6 +770,8 @@ BENCHMARK(BM_VectorIvfPqBuild)->UseManualTime()->Iterations(3);
 BENCHMARK(BM_VectorIvfPqIncrementalBuild)->ArgName("aboveThresholdFlush")
     ->Arg(0)->Arg(1)->UseManualTime()->Iterations(3);
 
+LUXIR_BENCHMARK(BM_VectorKnnTruncate)->ArgNames({"inputDims", "truncate"})
+    ->Args({1024, 0})->Args({1024, 256})->Args({1024, 128});
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, single_column, false, false)->Arg(50'000);
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, single_ivfpq, false, true)->Arg(50'000);
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_column, true, false)->Arg(50'000);

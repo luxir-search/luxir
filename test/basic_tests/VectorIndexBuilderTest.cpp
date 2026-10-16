@@ -269,6 +269,37 @@ std::vector<std::string> runKnnIds(SearchEngine& engine, std::string_view field,
 
 } // namespace
 
+// truncate_dims: the overlay builds over the stored prefix, and full-length
+// query vectors search it after the same truncation.
+TEST_F(VectorIndexBuilderTest, truncatedFieldBuildsOverlayOnPrefix) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  CollectionHelper h("main");
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
+  f.metric = luxir::api::VectorMetric::L2;
+  f.dims = 4;
+  f.truncate_dims = 2;
+  b.set(h.collection());
+
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "doc" + std::to_string(i), "embedding_v",
+                    std::vector<float>{(float)(i % 10), (float)(i / 10), (float)-i, 7.0f}));
+  }
+  h.commit({"*"});
+
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
+  const auto& aux = onlyVectorOverlay(info);
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0].name);
+  ASSERT_NE(idx, nullptr);
+  EXPECT_EQ(idx->d, 2);
+  EXPECT_EQ(idx->ntotal, 80);
+
+  auto ids = runKnnIds(h.getSearchEngine(), "embedding_v", {3.0f, 5.0f, 100.0f, -100.0f}, 1,
+                       /*nprobe=*/2, /*refineCandidates=*/80);
+  EXPECT_EQ(ids, std::vector<std::string>{"doc53"});
+}
+
 // One segment, one field, build all aux indexes via "*".  Verify a FAISS index file
 // is written with the expected ntotal / dims and that the IndexInfo references it.
 TEST_F(VectorIndexBuilderTest, overlayFileNamesAreCaseSafe) {

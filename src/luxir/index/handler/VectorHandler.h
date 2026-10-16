@@ -23,9 +23,11 @@ namespace luxir::handler {
 /// StrColHandler. The column's existing fixed-size fast path captures
 /// per-segment dims automatically (mono2MetaOff = dims*4).
 ///
-/// dims_ tracks the vector size observed so far in this segment.  If the
-/// owning VectorFieldType declares a non-zero dims, it seeds dims_ and any
-/// mismatched input is rejected.  Otherwise dims are learned from input, but
+/// dims_ tracks the stored vector size observed so far in this segment.  If
+/// the owning VectorFieldType declares a non-zero dims (or truncate_dims), it
+/// seeds dims_ and any mismatched input is rejected.  With truncate_dims, each
+/// input vector is validated against the input dims, then cut to its prefix
+/// before normalization and storage.  Otherwise dims are learned from input, but
 /// only committed to dims_ once a value is actually appended to the column:
 /// a doc that fails during validation (and is rolled back / marked deleted)
 /// must not constrain later docs, while an appended value makes the
@@ -33,6 +35,7 @@ namespace luxir::handler {
 class VectorHandler final : public StrColHandler {
   int32_t dims_ = 0;          // 0 until first value appended (or set from schema)
   int32_t pendingDims_ = 0;   // dims learned from the current value, not yet appended
+  const VectorFieldType* vft = nullptr;
   VectorFieldType::Metric metric = VectorFieldType::METRIC_NONE;
   bool trustNormalized = false;
   bool normalizeOnWrite = false;
@@ -46,8 +49,8 @@ public:
     : StrColHandler(inverter, fieldName, fieldType, ValueStorage::STREAMED) {
     // Caller (Inverter::createPhysicalHandler) only constructs us for VECTOR-typed
     // fields, which fromProto always builds as VectorFieldType.
-    auto* vft = (VectorFieldType*)(fieldType.get());
-    dims_ = vft->dims_;
+    vft = (const VectorFieldType*)(fieldType.get());
+    dims_ = vft->dims();
     metric = vft->metric_;
     trustNormalized = vft->normalized_;
     normalizeOnWrite = vft->normalizeOnWrite_;
@@ -116,12 +119,21 @@ private:
   }
 
   // Returns false for a zero / near-zero cosine vector. Otherwise validates
-  // dimensions and applies write-time normalization in place.
-  bool validate(std::span<float> vec, int32_t ordinal) {
+  // dimensions, applies truncate_dims (narrowing vec to the stored prefix) and
+  // write-time normalization in place.
+  bool validate(std::span<float>& vec, int32_t ordinal) {
     auto prefix = [&]() { return ordinal < 0 ? std::string() : fmt::format("vector {}: ", ordinal); };
     if (vec.empty()) {
       throw DocumentError(fmt::format(
           "field '{}': {}empty vector", std::string_view(fieldName), prefix()));
+    }
+    if (vft->truncateDims() > 0) {
+      std::string err = vft->inputDimsError(vec.size());
+      if (!err.empty()) {
+        throw DocumentError(fmt::format(
+            "field '{}': {}{}", std::string_view(fieldName), prefix(), err));
+      }
+      vec = vec.first((size_t)vft->truncateDims());
     }
     int32_t n = (int32_t)vec.size();
     int32_t expected = effectiveDims();

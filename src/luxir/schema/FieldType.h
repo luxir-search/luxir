@@ -286,9 +286,14 @@ public:
 };
 
 // Dense float vector field.  Values are stored as fixed-size byte blobs
-// through the standard binary-column path (see VectorHandler).  dims_ may be
-// 0, in which case the first indexed value in a segment fixes the segment's
-// per-vector size; a positive dims_ enforces validation at index time.
+// through the standard binary-column path (see VectorHandler).  inputDims_ may
+// be 0, in which case the first indexed value in a segment fixes the segment's
+// per-vector size; a positive inputDims_ enforces validation at index time.
+//
+// truncateDims_ > 0 keeps only the first truncateDims_ components of every
+// indexed and query vector (Matryoshka embeddings).  dims() is the stored
+// dimension the column, ANN overlays and kNN scoring see; inputDims() is the
+// dimension clients send.
 //
 // metric_ controls whether the field is searchable by kNN / ANN.  NONE means
 // storage-only; L2 / IP / COSINE pick the similarity metric for exact column
@@ -302,7 +307,8 @@ public:
     METRIC_COSINE = 3,
   };
 
-  int32_t dims_;
+  int32_t inputDims_;
+  int32_t truncateDims_;
   Metric metric_;
   // Caller asserts incoming vectors are unit-norm.  COSINE write and aux-build
   // paths trust the bytes as-is.  Ignored for non-COSINE metrics.
@@ -315,18 +321,28 @@ public:
                   int flags = COLUMN_STORED | FIXED_SIZE,
                   Metric metric = METRIC_NONE,
                   bool normalized = false,
-                  bool normalizeOnWrite = true)
+                  bool normalizeOnWrite = true,
+                  int32_t truncateDims = 0)
     : FieldType(name, FieldType::VECTOR, flags),
-      dims_(dims),
+      inputDims_(dims),
+      truncateDims_(truncateDims),
       metric_(metric),
       normalized_(normalized),
       normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized) {
   }
 
-  int32_t dims() const { return dims_; }
+  // Stored dimension (0 = inferred per segment).
+  int32_t dims() const { return truncateDims_ > 0 ? truncateDims_ : inputDims_; }
+  int32_t inputDims() const { return inputDims_; }
+  int32_t truncateDims() const { return truncateDims_; }
   Metric metric() const { return metric_; }
   bool normalized() const { return normalized_; }
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
+
+  // Error text for an input vector of n components that this field cannot
+  // accept (wrong dims, or shorter than truncate_dims); empty when n is valid.
+  // With truncation, a valid input then keeps its first dims() components.
+  std::string inputDimsError(size_t n) const;
 
   // True iff this field supports kNN / ANN search.  Exact flat search can run
   // directly over the column; real ANN engines may also build aux artifacts.

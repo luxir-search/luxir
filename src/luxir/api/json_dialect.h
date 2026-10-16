@@ -610,6 +610,8 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.stored_resource, ctx, vit, vend);
           } else if (key == "dims") {
             util::from_json<V>(value.dims, ctx, vit, vend);
+          } else if (key == "truncate_dims") {
+            util::from_json<V>(value.truncate_dims, ctx, vit, vend);
           } else if (key == "metric") {
             util::from_json<V>(value.metric, ctx, vit, vend);
           } else if (key == "normalized") {

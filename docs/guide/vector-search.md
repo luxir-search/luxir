@@ -92,6 +92,72 @@ A multi-valued vector field (`multi: true`, or the `_vs` suffix) holds many
 vectors per document, such as one per passage or chunk. Search collapses them
 to one hit per document, scored by that document's best vector.
 
+### Truncate Matryoshka embeddings
+
+Some embedding models are trained with
+[Matryoshka Representation Learning](https://arxiv.org/abs/2205.13147) (MRL):
+the leading components of their output are themselves a usable, lower
+dimensional embedding. `truncate_dims` keeps only that prefix:
+
+```http
+POST /collections/books/_schema
+
+{
+  "fields": {
+    "summary_v": {
+      "type": "vector",
+      "dims": 1024,
+      "truncate_dims": 256,
+      "metric": "cosine"
+    }
+  }
+}
+```
+
+Clients keep sending the full model output, for documents and for kNN
+queries. Luxir cuts every vector to its first `truncate_dims` components
+before it is stored or searched, so index and query vectors are always
+truncated the same way. The column, approximate indexes and scoring all work
+on the shorter vector: 256 dimensions here store and scan a quarter of the
+bytes of 1024.
+
+- `dims` is the input dimension: when set, every indexed and query vector
+  must have exactly `dims` components. `truncate_dims` is the stored and
+  searched dimension, and must be positive and less than `dims`.
+- Without `dims`, any input with at least `truncate_dims` components is
+  accepted. Shorter vectors are rejected (`expected at least
+  truncate_dims=256 components, got 128`).
+- `cosine` renormalizes the prefix to unit length (a prefix of a unit vector
+  is shorter than 1), so stored vectors and scores are those of the
+  truncated embedding. `normalized: true` is rejected with `truncate_dims` on
+  a cosine field, because the stored vectors are no longer the vectors the
+  assertion was about. `normalize_on_write: false` keeps the raw prefix and
+  normalizes at query time, as for any cosine field.
+- `l2` and `ip` store the prefix as-is. These metrics are defined on raw
+  values, magnitude included, and Luxir never rescales vectors for them;
+  quietly renormalizing would turn `ip` into cosine. Model providers that
+  return unit vectors (OpenAI, Gemini) document renormalizing after
+  truncation, and then dot product, cosine and L2 all rank the same. For
+  those models, use `cosine` with `truncate_dims` rather than `ip`.
+- Reading the field back returns the stored (truncated, and for cosine
+  normalized) vector, not the input.
+- Changing `truncate_dims` changes the stored dimension, so existing
+  segments must be reindexed, as for a `dims` change.
+
+Use it only with models trained for it. Models that document MRL truncation
+include OpenAI `text-embedding-3-small` and `-large` (the `dimensions`
+parameter), Google `gemini-embedding-001`, Jina `jina-embeddings-v3`, Nomic
+`nomic-embed-text-v1.5`, and mixedbread `mxbai-embed-large-v1`. Check the
+model card for the dimensions it was trained to support. Truncating an
+embedding from a model *not* trained with MRL discards information the model
+spread across all of its dimensions, and recall drops sharply; this option
+does nothing to compensate.
+
+Some models prescribe extra steps around truncation. Nomic's reference code
+applies a layer norm to the full embedding before cutting it; Luxir does not
+do that, so send vectors that already have any such pre-truncation step
+applied.
+
 ## Index vectors
 
 A vector is a bare number array. A multi-valued field takes an array of

@@ -297,7 +297,7 @@ VectorIndexBuilder::build(const std::vector<std::string>& selectors,
     }
 
     LOG_TRACE("VectorIndexBuilder: building {} (metric={}, dims_pinned={})",
-             auxName, (int)vft->metric_, vft->dims_);
+             auxName, (int)vft->metric_, vft->dims());
     auto info = buildField(fieldName, *vft, outFilesToSync, buildSite);
     if (info) {
       result.emplace_back(std::move(*info));
@@ -341,7 +341,7 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
                                     const VectorFieldType& ft,
                                     std::vector<std::string>& outFilesToSync,
                                     BuildSite buildSite) {
-  int32_t dims = ft.dims_;
+  int32_t dims = ft.dims();
   faiss::MetricType metric = toFaissMetric(ft.metric_);
   int64_t ntotal = 0;
 
