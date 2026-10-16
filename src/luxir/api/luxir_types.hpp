@@ -99,6 +99,7 @@ enum class Kind {
 namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
 namespace Collapse_ { enum class MissingPolicy { EXPAND = 0, GROUP = 1, DROP = 2 }; }
 namespace FieldFacet_ { enum class CountUnit { DOCS = 0, GROUPS = 1 }; }
+namespace RangeFacet_ { enum class Bounds { EXPLICIT = 0, DATA = 1 }; }
 namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
@@ -707,7 +708,9 @@ struct RangeFacet {                                             // needs Val,Cal
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   std::string_view time_zone;
   ::hpp_proto::optional_indirect_view<Val> selected;
+  ::hpp_proto::optional_indirect_view<Val> origin;
   SelectionMode selection_mode = SelectionMode::ANY;
+  RangeFacet_::Bounds bounds = RangeFacet_::Bounds::EXPLICIT;
   bool missing = false;
 };
 struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,Domain

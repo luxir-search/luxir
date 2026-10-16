@@ -96,6 +96,13 @@ public:
   OpCursor& range(int64_t start, int64_t end, int64_t gap);  // RangeFacet bounds
   OpCursor& rangeFp(double start, double end, double gap);
   OpCursor& range(std::string_view start, std::string_view end, int64_t gap);
+  // RangeFacet bounds=DATA: fixed gap, optional origin and widening bounds.
+  OpCursor& rangeData(int64_t gap, std::optional<int64_t> origin = std::nullopt,
+                      std::optional<int64_t> start = std::nullopt,
+                      std::optional<int64_t> end = std::nullopt);
+  OpCursor& rangeDataFp(double gap);
+  OpCursor& rangeDataCalendar(int32_t n, luxir::api::CalendarGap_::Unit unit,
+                              std::string_view timeZone = {});
   OpCursor& calendarRange(
       std::string_view start, std::string_view end, int32_t n,
       luxir::api::CalendarGap_::Unit unit, std::string_view timeZone = {});
@@ -686,6 +693,38 @@ inline OpCursor& OpCursor::range(
   r.start = startVal;
   r.end = endVal;
   r.gap_kind.emplace<luxir::api::Val>().kind = gap;
+  return *this;
+}
+inline OpCursor& OpCursor::rangeData(int64_t gap, std::optional<int64_t> origin,
+                                     std::optional<int64_t> start, std::optional<int64_t> end) {
+  auto& r = std::get<luxir::api::RangeFacet>(op_->kind);
+  r.bounds = luxir::api::RangeFacet_::Bounds::DATA;
+  r.gap_kind.emplace<luxir::api::Val>().kind = gap;
+  auto set = [&](auto& slot, std::optional<int64_t> v) {
+    if (!v) return;
+    auto* val = req_->arenaNew<luxir::api::Val>();
+    val->kind = *v;
+    slot = val;
+  };
+  set(r.origin, origin);
+  set(r.start, start);
+  set(r.end, end);
+  return *this;
+}
+inline OpCursor& OpCursor::rangeDataFp(double gap) {
+  auto& r = std::get<luxir::api::RangeFacet>(op_->kind);
+  r.bounds = luxir::api::RangeFacet_::Bounds::DATA;
+  r.gap_kind.emplace<luxir::api::Val>().kind = gap;
+  return *this;
+}
+inline OpCursor& OpCursor::rangeDataCalendar(int32_t n, luxir::api::CalendarGap_::Unit unit,
+                                             std::string_view timeZone) {
+  auto& r = std::get<luxir::api::RangeFacet>(op_->kind);
+  r.bounds = luxir::api::RangeFacet_::Bounds::DATA;
+  auto& gap = r.gap_kind.emplace<luxir::api::CalendarGap>();
+  gap.n = n;
+  gap.unit = unit;
+  r.time_zone = build::arenaStr(req_->mr, timeZone);
   return *this;
 }
 inline OpCursor& OpCursor::calendarRange(

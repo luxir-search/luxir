@@ -1383,8 +1383,8 @@ Numeric or DATE buckets using the field's value binding. Each bucket is inclusiv
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.rangefacet.field"></a>[`field`](#field-luxir.rangefacet.field) | 1 | `string` | singular |  |
-| <a id="field-luxir.rangefacet.start"></a>[`start`](#field-luxir.rangefacet.start) | 2 | [`Val`](#message-luxir.val) | singular | required inclusive start of the range |
-| <a id="field-luxir.rangefacet.end"></a>[`end`](#field-luxir.rangefacet.end) | 3 | [`Val`](#message-luxir.val) | singular | required exclusive end of the range |
+| <a id="field-luxir.rangefacet.start"></a>[`start`](#field-luxir.rangefacet.start) | 2 | [`Val`](#message-luxir.val) | singular | inclusive start of the range; required unless bounds is DATA |
+| <a id="field-luxir.rangefacet.end"></a>[`end`](#field-luxir.rangefacet.end) | 3 | [`Val`](#message-luxir.val) | singular | exclusive end of the range; required unless bounds is DATA |
 | <a id="field-luxir.rangefacet.gap"></a>[`gap`](#field-luxir.rangefacet.gap) | 4 | [`Val`](#message-luxir.val) | oneof [`gap_kind`](#oneof-luxir.rangefacet.gap_kind) | positive fixed width in field units; integer milliseconds for DATE |
 | <a id="field-luxir.rangefacet.calendar_gap"></a>[`calendar_gap`](#field-luxir.rangefacet.calendar_gap) | 10 | [`CalendarGap`](#message-luxir.calendargap) | oneof [`gap_kind`](#oneof-luxir.rangefacet.gap_kind) | civil gap for DATE fields only |
 | <a id="field-luxir.rangefacet.mincount"></a>[`mincount`](#field-luxir.rangefacet.mincount) | 5 | `int64` | optional | minimum bucket count; unset = 0; must be &gt;= 0 |
@@ -1395,6 +1395,8 @@ Numeric or DATE buckets using the field's value binding. Each bucket is inclusiv
 | <a id="field-luxir.rangefacet.selection_mode"></a>[`selection_mode`](#field-luxir.rangefacet.selection_mode) | 12 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | same filtering rules as FieldFacet; see SelectionMode |
 | <a id="field-luxir.rangefacet.count_unit"></a>[`count_unit`](#field-luxir.rangefacet.count_unit) | 13 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Inherits the parent measure; GROUPS uses the nearest collapse. |
 | <a id="field-luxir.rangefacet.count_distinct"></a>[`count_distinct`](#field-luxir.rangefacet.count_distinct) | 14 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys; same specification as Collapse. |
+| <a id="field-luxir.rangefacet.bounds"></a>[`bounds`](#field-luxir.rangefacet.bounds) | 15 | [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds) | singular |  |
+| <a id="field-luxir.rangefacet.origin"></a>[`origin`](#field-luxir.rangefacet.origin) | 16 | [`Val`](#message-luxir.val) | singular | DATA only: bucket lower bounds are origin + k \* gap for fixed gaps, and calendar unit starts in the time zone for calendar gaps. For DATE fields fixed gaps are counted in local time, so origin 0 aligns hourly and daily buckets to local midnight. Must be an integer (milliseconds) for DATE and INT fields, and a number for FLOAT and DOUBLE. Calendar gaps ignore it. Default: 0. |
 
 <a id="message-luxir.rangequery"></a>
 
@@ -1984,6 +1986,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
 - [`Match.Operator`](#enum-luxir.match.operator)
+- [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds)
 - [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
 - [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
 - [`ResponseFormat`](#enum-luxir.responseformat)
@@ -2143,6 +2146,19 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.match.operator.operator_unspecified"></a>[`OPERATOR_UNSPECIFIED`](#value-luxir.match.operator.operator_unspecified) | 0 | treated as OR |
 | <a id="value-luxir.match.operator.or"></a>[`OR`](#value-luxir.match.operator.or) | 1 | a doc matches if any analyzed term matches |
 | <a id="value-luxir.match.operator.and"></a>[`AND`](#value-luxir.match.operator.and) | 2 | a doc must match every analyzed term |
+
+<a id="enum-luxir.rangefacet.bounds"></a>
+
+### luxir.RangeFacet.Bounds
+
+How start and end are determined.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.rangefacet.bounds.explicit"></a>[`EXPLICIT`](#value-luxir.rangefacet.bounds.explicit) | 0 | start and end are required |
+| <a id="value-luxir.rangefacet.bounds.data"></a>[`DATA`](#value-luxir.rangefacet.bounds.data) | 1 | Buckets span the field's data: from the bucket holding the smallest value to the bucket holding the largest. start and end are optional and only widen that span (like Elasticsearch extended\_bounds). The data range is read from segment column metadata, so it covers every indexed value of the field and ignores the query and deleted documents; leading and trailing buckets that are empty for the facet's documents are then dropped, unless start or end widens past them (not under a parent facet bucket, which keeps the shared fences). An empty field with no start and end returns no buckets. selected is not supported. Exceeding the bucket cap is the same error as with EXPLICIT bounds: use a larger gap. |
 
 <a id="enum-luxir.replicaresult.outcome"></a>
 
