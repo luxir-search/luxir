@@ -51,6 +51,10 @@ struct FilterCacheConfig {
   uint32_t admissionThreshold = 2;
   size_t maxMetadataEntries = 8192;
   size_t maxMetadataBytes = 0;
+  // A metadata sweep started by exceeding maxMetadataBytes trims to this
+  // watermark, so steady slot growth does not start a sweep per request.
+  // Zero means 90% of maxMetadataBytes.
+  size_t lowWatermarkMetadataBytes = 0;
 };
 
 // SEGMENT_STABLE and CORE_STABLE keys name raw DocSet values, one per seg_id.

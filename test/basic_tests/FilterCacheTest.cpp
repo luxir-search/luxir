@@ -1805,6 +1805,36 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
   cache.validateForTest();
 }
 
+// A metadata sweep started at the byte cap trims to the low watermark, so
+// the admissions that follow do not each start another sweep.
+TEST(FilterCacheTest, metadataSweepTrimsToLowWatermark) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxMetadataEntries = 1000;
+  config.maxMetadataBytes = 16 * 1024;
+  config.lowWatermarkMetadataBytes = 8 * 1024;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+
+  size_t sweeps = 0;
+  size_t previous = 0;
+  for (int i = 0; i < 100; i++) {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    request.get(FilterKey("key:" + std::to_string(i) + std::string(200, 'k')));
+    size_t used = cache.metadataBytesUsed();
+    EXPECT_LE(used, config.maxMetadataBytes);
+    if (used < previous) {
+      sweeps++;
+      EXPECT_LE(used, config.lowWatermarkMetadataBytes);
+    }
+    previous = used;
+  }
+  EXPECT_GE(sweeps, 2u);
+  EXPECT_LE(sweeps, 15u);
+  cache.validateForTest();
+}
+
 TEST(FilterCacheTest, oversizedKeysBypassWithoutAffectingAdmission) {
   FilterCacheConfig config = testConfig();
   config.maxEntryBytes = 32;

@@ -943,6 +943,12 @@ FilterCache::FilterCache(FilterCacheConfig config)
     this->config.maxMetadataBytes = std::max<size_t>(1,
         this->config.maxBytes / 4);
   }
+  if (this->config.lowWatermarkMetadataBytes == 0) {
+    this->config.lowWatermarkMetadataBytes =
+        this->config.maxMetadataBytes * 9 / 10;
+  }
+  this->config.lowWatermarkMetadataBytes = std::min(
+      this->config.lowWatermarkMetadataBytes, this->config.maxMetadataBytes);
   this->config.minSegmentDocs = std::max(0, this->config.minSegmentDocs);
   activeSegments.store(std::make_shared<const ActiveSnapshot>(),
                        std::memory_order_release);
@@ -1760,7 +1766,7 @@ void FilterCache::sweepMetadata() {
   for (const auto& candidate : candidates) {
     bool overCount = entries.size() > config.maxMetadataEntries;
     bool overBytes = metadataBytes.load(std::memory_order_relaxed)
-        > config.maxMetadataBytes;
+        > config.lowWatermarkMetadataBytes;
     if (!overCount && !overBytes) break;
     bool canErase = true;
     {
@@ -1768,7 +1774,7 @@ void FilterCache::sweepMetadata() {
       if (!candidate.entry->resident) continue;
       overCount = entries.size() > config.maxMetadataEntries;
       overBytes = metadataBytes.load(std::memory_order_relaxed)
-          > config.maxMetadataBytes;
+          > config.lowWatermarkMetadataBytes;
       if (!overCount && !overBytes) break;
       auto readerValue = candidate.entry->readerValue.load(
           std::memory_order_acquire);
