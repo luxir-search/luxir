@@ -1497,6 +1497,47 @@ TEST_F(SchemaTest, variantShapeFamiliesAndVectorDimensions) {
   }
 }
 
+TEST_F(SchemaTest, vectorAnnSettings) {
+  auto s = schemaJson(R"({"templates":{"_e":{"type":"vector","dims":8,"metric":"l2",
+      "ann":{"codec":"pq","nlist":16,"pq":{"m":4,"bits":6}}}},"fields":{
+    "plain":{"type":"vector","dims":8,"metric":"ip"},
+    "rbq":{"type":"vector","dims":8,"metric":"ip","ann":{"rabitq":{"bits":4,"query_bits":0}}},
+    "inherits":{"parent":"_e"},
+    "replaces":{"parent":"_e","ann":{"nlist":4}}}})");
+  auto ann = [&](std::string_view name) { return ((VectorFieldType*)s->physical(name))->ann(); };
+  EXPECT_EQ(VectorAnnConfig::RABITQ, ann("plain").codec);
+  EXPECT_EQ(0, ann("plain").nlist);
+  EXPECT_EQ(1, ann("plain").rabitqBits);
+  EXPECT_EQ(4, ann("plain").rabitqQueryBits);
+  EXPECT_EQ(4, ann("rbq").rabitqBits);
+  EXPECT_EQ(0, ann("rbq").rabitqQueryBits);
+  EXPECT_EQ(VectorAnnConfig::PQ, ann("inherits").codec);
+  EXPECT_EQ(16, ann("inherits").nlist);
+  EXPECT_EQ(4, ann("inherits").pqM);
+  EXPECT_EQ(6, ann("inherits").pqBits);
+  // An authored ann replaces the parent's whole definition.
+  EXPECT_EQ(VectorAnnConfig::RABITQ, ann("replaces").codec);
+  EXPECT_EQ(4, ann("replaces").nlist);
+  EXPECT_NE(std::string::npos, authoredJson(*s).find(R"("pq":{"m":4,"bits":6})"));
+
+  for (auto field : {
+      R"({"type":"string","ann":{}})",
+      R"({"type":"vector","ann":{"codec":"pq","rabitq":{"bits":2}}})",
+      R"({"type":"vector","ann":{"pq":{"m":4}}})",
+      R"({"type":"vector","ann":{"rabitq":{"bits":0}}})",
+      R"({"type":"vector","ann":{"rabitq":{"bits":10}}})",
+      R"({"type":"vector","ann":{"rabitq":{"query_bits":9}}})",
+      R"({"type":"vector","ann":{"codec":"pq","pq":{"bits":9}}})",
+      R"({"type":"vector","dims":8,"ann":{"codec":"pq","pq":{"m":3}}})",
+      R"({"type":"vector","ann":{"nlist":-1}})",
+      R"({"type":"vector","ann":{"nlist":65537}})"}) {
+    SCOPED_TRACE(field);
+    EXPECT_THROW(schemaJson(std::string("{\"fields\":{\"a\":") + field + "}}"), SchemaError);
+  }
+  EXPECT_ANY_THROW(schemaJson(R"({"fields":{"a":{"type":"vector","ann":{"codec":"hnsw"}}}})"));
+  EXPECT_ANY_THROW(schemaJson(R"({"fields":{"a":{"type":"vector","ann":{"bits":1}}}})"));
+}
+
 TEST_F(SchemaTest, variantLabelGrammarAndReservedDelimiter) {
   for (auto label : {"", "_s", "1s", "s__x", "Self", "SELF", "self", "s-x", "s.x", "s!", "\xc3\xa9"}) {
     SCOPED_TRACE(label);

@@ -77,7 +77,7 @@ struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrA
 struct ArrArrDouble; struct Vector; struct ArrVector;
 struct ColStr; struct Column; struct ColVector; struct MultiVector; struct ColInt;
 struct ColFloat; struct ColDouble; struct AnalyzerComponent; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
-struct FieldVariants; struct FieldDefaults; struct NormalizerDef;
+struct FieldVariants; struct FieldDefaults; struct NormalizerDef; struct VectorAnnDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
@@ -88,6 +88,7 @@ struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
 namespace KnnQuery_ { struct Ivf; }
+namespace VectorAnnDef_ { struct RaBitQ; struct Pq; }
 
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
 namespace Error_ {
@@ -115,6 +116,7 @@ enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 }
+namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1 }; }
 namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 
 // ===================== message definitions (strict topological order) =====================
@@ -234,6 +236,19 @@ struct FieldDefaults {
 struct NormalizerDef {
   std::span<const AnalyzerComponent> filters;
 };
+namespace VectorAnnDef_ {
+struct RaBitQ { std::optional<int32_t> bits; std::optional<int32_t> query_bits; };
+struct Pq { std::optional<int32_t> m; std::optional<int32_t> bits; };
+} // namespace VectorAnnDef_
+struct VectorAnnDef {
+  using Codec = luxir::api::VectorAnnDef_::Codec;
+  using RaBitQ = luxir::api::VectorAnnDef_::RaBitQ;
+  using Pq = luxir::api::VectorAnnDef_::Pq;
+  std::optional<RaBitQ> rabitq;                                 // align 4
+  std::optional<Pq> pq;
+  std::optional<Codec> codec;
+  std::optional<int32_t> nlist;
+};
 struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
   using IndexMode = luxir::api::FieldDef_::IndexMode;
@@ -245,6 +260,7 @@ struct FieldDef {
   std::optional<FieldVariants> variants;
   std::optional<FieldDefaults> defaults;
   std::optional<NormalizerDef> normalizer;
+  std::optional<VectorAnnDef> ann;                              // align 4
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<LongTerms> long_terms;                          // align 4 (enum)
@@ -818,6 +834,7 @@ LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXI
 LUXIR_TD(ColFloat) LUXIR_TD(ColDouble)
 LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
 LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef)
+LUXIR_TD(VectorAnnDef) LUXIR_TD(VectorAnnDef_::RaBitQ) LUXIR_TD(VectorAnnDef_::Pq)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
@@ -863,6 +880,7 @@ LUXIR_ENTRY(ArrVector) LUXIR_ENTRY(ColStr) LUXIR_ENTRY(Column)
 LUXIR_ENTRY(ColVector) LUXIR_ENTRY(MultiVector) LUXIR_ENTRY(ColInt) LUXIR_ENTRY(ColFloat)
 LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(AnalyzerComponent) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
 LUXIR_ENTRY(FieldVariants) LUXIR_ENTRY(FieldDefaults) LUXIR_ENTRY(NormalizerDef)
+LUXIR_ENTRY(VectorAnnDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)

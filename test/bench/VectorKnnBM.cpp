@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -21,6 +22,7 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
+#include "test/TestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -29,8 +31,42 @@ namespace api = luxir::api;
 
 namespace {
 
+// Benchmark codec selector (the "codec" benchmark arg): the field's schema
+// ann settings, so the production path is what gets measured.
+enum BenchCodec : int32_t {
+  RABITQ1 = 0,  // schema default: 1-bit codes, 4-bit queries
+  PQ = 1,       // IVF+PQ with its defaults (M <= 32, 8 bits)
+  RABITQ4 = 2,  // extended RaBitQ, 4 bits per dimension
+  RABITQ2 = 3,
+};
+
+const char* benchCodecName(int32_t codec) {
+  switch (codec) {
+    case RABITQ1: return "rabitq1";
+    case PQ: return "pq";
+    case RABITQ4: return "rabitq4";
+    case RABITQ2: return "rabitq2";
+    default: return "?";
+  }
+}
+
+int32_t benchRaBitQBits(int32_t codec) {
+  return codec == RABITQ4 ? 4 : codec == RABITQ2 ? 2 : 1;
+}
+
+void setBenchAnn(api::FieldDef& f, int32_t codec) {
+  auto& ann = f.ann.emplace();
+  if (codec == PQ) {
+    ann.codec = api::VectorAnnDef::Codec::PQ;
+  } else {
+    ann.codec = api::VectorAnnDef::Codec::RABITQ;
+    ann.rabitq.emplace().bits = benchRaBitQBits(codec);
+  }
+}
+
 void installVectorBenchSchema(Collection& col, int32_t dims,
-                              api::VectorMetric metric = api::VectorMetric::IP) {
+                              api::VectorMetric metric = api::VectorMetric::IP,
+                              int32_t codec = RABITQ1) {
   SchemaBuilder b;
 
   auto& single = b.templ("_v");
@@ -38,6 +74,7 @@ void installVectorBenchSchema(Collection& col, int32_t dims,
   single.column = true;
   single.dims = dims;
   single.metric = metric;
+  setBenchAnn(single, codec);
 
   auto& multi = b.templ("_vs");
   multi.type = api::FieldDef_::FieldClass::VECTOR;
@@ -45,52 +82,40 @@ void installVectorBenchSchema(Collection& col, int32_t dims,
   multi.multi = true;
   multi.dims = dims;
   multi.metric = metric;
+  setBenchAnn(multi, codec);
 
   b.set(col);
+}
+
+// The overlay engine/bits a codec arg produces, for index-reuse checks.
+bool overlayMatchesCodec(const VectorAuxReader& vaux, int32_t codec) {
+  if (codec == PQ) return vaux.getEngine() == VectorAuxMeta::ENGINE_IVFPQ;
+  return vaux.isRaBitQ() && vaux.getRaBitQBits() == benchRaBitQBits(codec);
 }
 
 float nextFloat(SplitMix64& rng) {
   return ((float)((int32_t)rng.rint((int64_t)2001) - 1000)) / 1000.0f;
 }
 
-struct IvfPqBenchGuard {
-  bool savedIvfPq;
-  int32_t savedNList;
-  int32_t savedM;
-  int32_t savedBits;
-  int32_t savedNProbe;
-  int64_t savedMinTraining;
-  int64_t savedBuildThreshold;
+// Forces eligibility so the benchmark measures the aux path.  Real runs keep
+// the production training floors and the schema's ann settings; unit-test
+// mode shrinks the floors and nlist so the tiny corpus actually trains.
+struct IvfBenchGuard {
+  SearchOverridesGuard<bool, std::optional<VectorAnnConfig>, int64_t, int64_t, int64_t> saved{
+    VectorIndexBuilder::buildFaissAuxIndexes, VectorIndexBuilder::annConfigOverrideForTests,
+    VectorIndexBuilder::ivfPqMinTrainingVectors, VectorIndexBuilder::ivfRaBitQMinTrainingVectors,
+    VectorIndexBuilder::ivfBuildThresholdScanCost};
 
-  IvfPqBenchGuard()
-    : savedIvfPq(VectorIndexBuilder::buildFaissIvfPqAuxIndexes),
-      savedNList(VectorIndexBuilder::ivfPqNList),
-      savedM(VectorIndexBuilder::ivfPqM),
-      savedBits(VectorIndexBuilder::ivfPqBits),
-      savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
-      savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors),
-      savedBuildThreshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost) {
-    VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-    VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
+  explicit IvfBenchGuard(int32_t codec = RABITQ1) {
+    VectorIndexBuilder::buildFaissAuxIndexes = true;
+    VectorIndexBuilder::ivfBuildThresholdScanCost = 0;
     if (luxir::unit_tests) {
-      // Tiny corpus in unit-test mode: shrink so IVF+PQ actually trains and
-      // the ANN path gets coverage. Real runs keep production IVF+PQ params
-      // but force eligibility so the benchmark measures the aux path.
-      VectorIndexBuilder::ivfPqNList = 4;
-      VectorIndexBuilder::ivfPqM = 2;
-      VectorIndexBuilder::ivfPqBits = 1;
+      VectorIndexBuilder::annConfigOverrideForTests = codec == PQ
+        ? IvfTestGuard::pq(/*nlist=*/4, /*m=*/2, /*bits=*/1)
+        : VectorAnnConfig{.nlist = 4, .rabitqBits = benchRaBitQBits(codec)};
       VectorIndexBuilder::ivfPqMinTrainingVectors = 16;
+      VectorIndexBuilder::ivfRaBitQMinTrainingVectors = 16;
     }
-  }
-
-  ~IvfPqBenchGuard() {
-    VectorIndexBuilder::buildFaissIvfPqAuxIndexes = savedIvfPq;
-    VectorIndexBuilder::ivfPqNList = savedNList;
-    VectorIndexBuilder::ivfPqM = savedM;
-    VectorIndexBuilder::ivfPqBits = savedBits;
-    VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
-    VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
-    VectorIndexBuilder::ivfPqBuildThresholdScanCost = savedBuildThreshold;
   }
 };
 
@@ -196,7 +221,7 @@ void buildVectorBenchIndex(CollectionHelper& helper, int64_t nDocs, int32_t dims
   }
 
   if (buildFaissAux) {
-    IvfPqBenchGuard guard;
+    IvfBenchGuard guard;
     helper.commit({std::string("vec.")
                    + (valuesPerDoc == 1 && !skew ? "bench_v" : "bench_vs")});
   }
@@ -357,17 +382,17 @@ std::vector<int32_t> clusteredDocsPerSeg(int64_t nDocs) {
 
 // Reuse check (same pattern as QueryBM / FacetBM): segment shape must match,
 // but shape alone is ambiguous here - BM_VectorKnn builds same-sized indexes
-// with uniform IP data - so also verify the aux is our clustered IVF+PQ / L2
-// build via its metadata.
-bool clusteredIndexReusable(CollectionHelper& helper, std::span<const int32_t> docsPerSeg) {
+// with uniform IP data - so also verify the aux is our clustered L2 build of
+// the requested codec via its metadata.
+bool clusteredIndexReusable(CollectionHelper& helper, std::span<const int32_t> docsPerSeg,
+                            int32_t codec) {
   if (!helper.indexMatchesShape(docsPerSeg)) return false;
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   for (const auto& seg : reader->segments()) {
     auto aux = seg.getAuxReader("vec.bench_v");
     if (!aux) return false;
     auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
-    if (vaux == nullptr ||
-        vaux->getEngine() != VectorAuxMeta::ENGINE_IVFPQ ||
+    if (vaux == nullptr || !overlayMatchesCodec(*vaux, codec) ||
         vaux->getMetric() != (int32_t)api::VectorMetric::L2) {
       return false;
     }
@@ -375,10 +400,10 @@ bool clusteredIndexReusable(CollectionHelper& helper, std::span<const int32_t> d
   return true;
 }
 
-void buildClusteredVectorIndex(CollectionHelper& helper, int32_t dims,
-                               int32_t nClusters, std::span<const int32_t> docsPerSeg) {
+void buildClusteredVectorIndex(CollectionHelper& helper, int32_t dims, int32_t nClusters,
+                               std::span<const int32_t> docsPerSeg, int32_t codec) {
   helper.clear();
-  installVectorBenchSchema(helper.collection(), dims, api::VectorMetric::L2);
+  installVectorBenchSchema(helper.collection(), dims, api::VectorMetric::L2, codec);
 
   constexpr int64_t batchSize = 256;
   std::vector<Doc> docs;
@@ -452,6 +477,7 @@ void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec) {
   int32_t nprobe = (int32_t)state.range(0);
   int32_t cand = (int32_t)state.range(1);  // candidate pool size; 0 = adaptive default
   int32_t k = (int32_t)state.range(2);
+  int32_t codec = (int32_t)state.range(3);
 
   CollectionHelper helper("main");
   std::vector<int32_t> docsPerSeg = clusteredDocsPerSeg(nDocs);
@@ -471,10 +497,10 @@ void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec) {
   std::vector<std::vector<std::string>> truth;
   {
     std::lock_guard<std::mutex> lock(setupMutex);
-    reuseIndex = clusteredIndexReusable(helper, docsPerSeg);
+    reuseIndex = clusteredIndexReusable(helper, docsPerSeg, codec);
     if (!reuseIndex) {
-      IvfPqBenchGuard guard;
-      buildClusteredVectorIndex(helper, dims, nClusters, docsPerSeg);
+      IvfBenchGuard guard(codec);
+      buildClusteredVectorIndex(helper, dims, nClusters, docsPerSeg, codec);
     }
     auto it = truthByK.find(k);
     if (it == truthByK.end()) {
@@ -552,6 +578,8 @@ void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec) {
   state.counters["cand"] = Counter((double)cand, Counter::kAvgThreads);
   state.counters["reused"] = Counter(reuseIndex ? 1.0 : 0.0, Counter::kAvgThreads);
   state.counters["k"] = Counter((double)k, Counter::kAvgThreads);
+  state.counters["codec"] = Counter((double)codec, Counter::kAvgThreads);
+  state.SetLabel(benchCodecName(codec));
   state.counters["nDocs"] = Counter((double)nDocs, Counter::kAvgThreads);
   state.counters["dims"] = Counter((double)dims, Counter::kAvgThreads);
   state.counters["rate"] = Counter(state.iterations(), Counter::kIsRate);
@@ -585,19 +613,20 @@ void BM_VectorKnnRecallThreadsParallel(benchmark::State& state) {
   BM_VectorKnnRecallBody(state, /*parallelExec=*/true);
 }
 
-// Build-phase cost of the IVF+PQ aux index.  Manual timing covers ONLY the
-// aux commit (train + encode + serialize) - the marginal cost of the ANN
-// index over plain column storage.  Doc indexing wall time is reported as a
-// counter for context.  Fixed iteration count: each iteration is a full
-// rebuild, so let it be expensive but bounded.
-void BM_VectorIvfPqBuild(benchmark::State& state) {
+// Build-phase cost of the IVF aux index for the codec arg.  Manual timing
+// covers ONLY the aux commit (train + encode + serialize) - the marginal cost
+// of the ANN index over plain column storage.  Doc indexing wall time is
+// reported as a counter for context.  Fixed iteration count: each iteration
+// is a full rebuild, so let it be expensive but bounded.
+void BM_VectorIvfBuild(benchmark::State& state) {
   int64_t nDocs = luxir::unit_tests
       ? LuxirTest::scaleTestWork(240)
       : 50'000;
   int32_t dims = luxir::unit_tests ? 16 : 64;
   int32_t nClusters = luxir::unit_tests ? 8 : 100;
+  int32_t codec = (int32_t)state.range(0);
 
-  IvfPqBenchGuard guard;
+  IvfBenchGuard guard(codec);
   CollectionHelper helper("main");
   std::vector<int32_t> docsPerSeg = clusteredDocsPerSeg(nDocs);
 
@@ -608,7 +637,7 @@ void BM_VectorIvfPqBuild(benchmark::State& state) {
     // want isolated, so inline its steps here.
     auto wallStart = std::chrono::steady_clock::now();
     helper.clear();
-    installVectorBenchSchema(helper.collection(), dims, api::VectorMetric::L2);
+    installVectorBenchSchema(helper.collection(), dims, api::VectorMetric::L2, codec);
     constexpr int64_t batchSize = 256;
     std::vector<Doc> docs;
     docs.reserve((size_t)batchSize);
@@ -644,7 +673,7 @@ void BM_VectorIvfPqBuild(benchmark::State& state) {
       (double)nDocs * (double)state.iterations(), benchmark::Counter::kIsRate);
 }
 
-void BM_VectorIvfPqIncrementalBuild(benchmark::State& state) {
+void BM_VectorIvfIncrementalBuild(benchmark::State& state) {
   bool aboveThresholdFlush = state.range(0) != 0;
   int32_t dims = luxir::unit_tests ? 16 : 64;
   int32_t nClusters = luxir::unit_tests ? 8 : 100;
@@ -655,8 +684,8 @@ void BM_VectorIvfPqIncrementalBuild(benchmark::State& state) {
     ? (int64_t)dims * 64
     : 1'000'000;
 
-  IvfPqBenchGuard guard;
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = threshold;
+  IvfBenchGuard guard;
+  VectorIndexBuilder::ivfBuildThresholdScanCost = threshold;
   CollectionHelper helper("main");
   std::vector<int32_t> docsPerSeg = luxir::unit_tests
     ? std::vector<int32_t>{120, 120}
@@ -704,11 +733,11 @@ void BM_VectorIvfPqIncrementalBuild(benchmark::State& state) {
       docs.clear();
     }
 
-    VectorIndexBuilder::ivfPqBuildCountForTests.store(0, std::memory_order_relaxed);
-    VectorIndexBuilder::ivfPqMergeBuildCountForTests.store(0, std::memory_order_relaxed);
+    VectorIndexBuilder::ivfBuildCountForTests.store(0, std::memory_order_relaxed);
+    VectorIndexBuilder::ivfMergeBuildCountForTests.store(0, std::memory_order_relaxed);
     BenchTimer timer(state);
     helper.commit({"vec.bench_v"});
-    annBuilds += VectorIndexBuilder::ivfPqBuildCountForTests.load(std::memory_order_relaxed);
+    annBuilds += VectorIndexBuilder::ivfBuildCountForTests.load(std::memory_order_relaxed);
   }
 
   state.counters["flushDocs"] = (double)flushDocs;
@@ -719,48 +748,236 @@ void BM_VectorIvfPqIncrementalBuild(benchmark::State& state) {
       state.iterations() > 0 ? setupSecs / (double)state.iterations() : 0.0;
 }
 
+// ---------------------------------------------------------------------------
+// Codec comparison on a real embedding corpus.
+//
+// LUXIR_VECTOR_DATASET names a raw little-endian float32 file of rows
+// (LUXIR_VECTOR_DIMS, default 768); the last LUXIR_VECTOR_QUERIES rows
+// (default 200) are held-out queries and up to LUXIR_VECTOR_N (default: the
+// rest) leading rows are indexed into LUXIR_VECTOR_SEGMENTS (default 4)
+// segments under LUXIR_VECTOR_METRIC (l2, ip, cosine; default cosine).  Per
+// codec it reports the aux build time (train + encode + write over every
+// segment), overlay bytes per vector, recall@10 against the exact path, and
+// serial single-query latency.  Instances are grouped by codec so the built
+// index is reused across (nprobe, cand) points.
+struct VectorDataset {
+  int32_t dims = 0;
+  int64_t nBase = 0;
+  int32_t nQueries = 0;
+  api::VectorMetric metric = api::VectorMetric::COSINE;
+  int32_t segments = 4;
+  std::vector<float> data;  // nBase rows, then nQueries rows
+
+  static const VectorDataset* get() {
+    static std::optional<VectorDataset> loaded = []() -> std::optional<VectorDataset> {
+      const char* path = getenv("LUXIR_VECTOR_DATASET");
+      if (path == nullptr) return std::nullopt;
+      auto envInt = [](const char* name, int64_t dflt) {
+        const char* v = getenv(name);
+        return v ? std::stoll(v) : dflt;
+      };
+      VectorDataset ds;
+      ds.dims = (int32_t)envInt("LUXIR_VECTOR_DIMS", 768);
+      ds.nQueries = (int32_t)envInt("LUXIR_VECTOR_QUERIES", 200);
+      ds.segments = (int32_t)envInt("LUXIR_VECTOR_SEGMENTS", 4);
+      std::string metric = getenv("LUXIR_VECTOR_METRIC") ? getenv("LUXIR_VECTOR_METRIC") : "cosine";
+      ds.metric = metric == "l2" ? api::VectorMetric::L2
+                : metric == "ip" ? api::VectorMetric::IP : api::VectorMetric::COSINE;
+      FILE* f = fopen(path, "rb");
+      if (f == nullptr) return std::nullopt;
+      fseek(f, 0, SEEK_END);
+      int64_t rows = (int64_t)ftell(f) / (int64_t)(ds.dims * sizeof(float));
+      fseek(f, 0, SEEK_SET);
+      ds.nBase = std::min<int64_t>(envInt("LUXIR_VECTOR_N", rows - ds.nQueries), rows - ds.nQueries);
+      ds.data.resize((size_t)rows * (size_t)ds.dims);
+      size_t got = fread(ds.data.data(), sizeof(float) * (size_t)ds.dims, (size_t)rows, f);
+      fclose(f);
+      if ((int64_t)got != rows) return std::nullopt;
+      // Keep the base prefix and the trailing query rows contiguous.
+      std::copy(ds.data.end() - (ptrdiff_t)ds.nQueries * ds.dims, ds.data.end(),
+                ds.data.begin() + (ptrdiff_t)ds.nBase * ds.dims);
+      ds.data.resize((size_t)(ds.nBase + ds.nQueries) * (size_t)ds.dims);
+      return ds;
+    }();
+    return loaded ? &*loaded : nullptr;
+  }
+
+  std::vector<float> row(int64_t i) const {
+    return {data.begin() + (ptrdiff_t)i * dims, data.begin() + (ptrdiff_t)(i + 1) * dims};
+  }
+  std::vector<float> query(int32_t q) const { return row(nBase + q); }
+};
+
+void BM_VectorAnnDataset(benchmark::State& state) {
+  const VectorDataset* ds = VectorDataset::get();
+  if (skipBenchIfDataMissing(state, ds != nullptr, "LUXIR_VECTOR_DATASET")) return;
+  int32_t codec = (int32_t)state.range(0);
+  int32_t nprobe = (int32_t)state.range(1);
+  int32_t cand = (int32_t)state.range(2);
+  constexpr int32_t k = 10;
+
+  CollectionHelper helper("main");
+  static int32_t builtCodec = -1;
+  static double buildSecs = 0;
+  static double overlayBytes = 0;
+  static int32_t overlaySegments = 0;
+  static std::vector<std::vector<std::string>> truth;
+  if (builtCodec != codec) {
+    helper.clear();
+    installVectorBenchSchema(helper.collection(), ds->dims, ds->metric, codec);
+    int64_t perSeg = (ds->nBase + ds->segments - 1) / ds->segments;
+    std::vector<Doc> docs;
+    for (int64_t i = 0; i < ds->nBase; i++) {
+      docs.push_back(flatdoc("id", "d" + std::to_string(i), "bench_v", ds->row(i)));
+      if ((int64_t)docs.size() == 512 || i + 1 == ds->nBase) {
+        helper.indexAll(docs);
+        docs.clear();
+      }
+      if ((i + 1) % perSeg == 0 || i + 1 == ds->nBase) helper.commit();
+    }
+    // Production build policy and schema settings; only the aux commit is timed.
+    auto start = std::chrono::steady_clock::now();
+    helper.commit({"vec.bench_v"});
+    buildSecs = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+    overlayBytes = 0;
+    overlaySegments = 0;
+    for (const auto& seg : helper.getIndexWriter()->stats(true).segmentStats) {
+      for (const auto& overlay : seg.overlays) overlayBytes += (double)overlay.bytes;
+      overlaySegments += seg.overlays.empty() ? 0 : 1;
+    }
+    builtCodec = codec;
+    if (truth.empty()) {
+      for (int32_t q = 0; q < ds->nQueries; q++) {
+        auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v", ds->query(q), k,
+                                    /*nprobe=*/0, /*refineCandidates=*/0, /*exact=*/true);
+        req->execute(false);
+        std::vector<std::string> ids;
+        std::string error;
+        bool ok = responseIds(*req, ids, error);
+        req->done();
+        if (!ok) {
+          state.SkipWithError(error.c_str());
+          return;
+        }
+        truth.push_back(std::move(ids));
+      }
+    }
+  }
+
+  std::vector<std::vector<float>> queries;
+  for (int32_t q = 0; q < ds->nQueries; q++) queries.push_back(ds->query(q));
+  double recallSum = 0;
+  for (int32_t q = 0; q < ds->nQueries; q++) {
+    auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v", queries[(size_t)q], k,
+                                nprobe, cand);
+    req->execute(false);
+    std::vector<std::string> ids;
+    std::string error;
+    bool ok = responseIds(*req, ids, error);
+    req->done();
+    if (!ok) {
+      state.SkipWithError(error.c_str());
+      return;
+    }
+    int32_t hits = 0;
+    for (const auto& id : ids) hits += std::ranges::count(truth[(size_t)q], id) > 0 ? 1 : 0;
+    recallSum += (double)hits / (double)truth[(size_t)q].size();
+  }
+
+  int32_t queryOrd = 0;
+  for (auto _ : state) {
+    auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v", queries[(size_t)queryOrd],
+                                k, nprobe, cand);
+    req->execute(false);
+    std::vector<std::string> ids;
+    std::string error;
+    bool ok = responseIds(*req, ids, error);
+    req->done();
+    if (!ok) {
+      state.SkipWithError(error.c_str());
+      break;
+    }
+    queryOrd = (queryOrd + 1) % ds->nQueries;
+    benchmark::DoNotOptimize(ids);
+  }
+
+  state.SetLabel(benchCodecName(codec));
+  state.counters["recall"] = recallSum / (double)ds->nQueries;
+  state.counters["buildSecs"] = buildSecs;
+  state.counters["bytesPerVec"] = overlayBytes / (double)ds->nBase;
+  state.counters["overlaySegs"] = (double)overlaySegments;
+  state.counters["nBase"] = (double)ds->nBase;
+  state.counters["dims"] = (double)ds->dims;
+  state.counters["nprobe"] = (double)nprobe;
+  state.counters["cand"] = (double)cand;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
 }  // namespace
+
+// Real-corpus codec comparison (see BM_VectorAnnDataset); needs
+// LUXIR_VECTOR_DATASET, so it is a measurement-only benchmark.
+static void datasetSweep(benchmark::Benchmark* b, int64_t codec) {
+  for (int64_t nprobe : {0, 16, 32, 64}) {
+    for (int64_t cand : {0, 100, 200}) b->Args({codec, nprobe, cand});
+  }
+}
+TUNING_BENCHMARK(BM_VectorAnnDataset)->ArgNames({"codec", "nprobe", "cand"})
+    ->Apply([](benchmark::Benchmark* b) {
+      datasetSweep(b, RABITQ1);
+      datasetSweep(b, RABITQ2);
+      datasetSweep(b, RABITQ4);
+      datasetSweep(b, PQ);
+    })->UseRealTime()->MinTime(2.0);
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that
 // LUXIR_BENCHMARK appends.
-BENCHMARK(BM_VectorIvfPqBuild)->UseManualTime()->Iterations(3);
-BENCHMARK(BM_VectorIvfPqIncrementalBuild)->ArgName("aboveThresholdFlush")
+BENCHMARK(BM_VectorIvfBuild)->ArgName("codec")->Arg(RABITQ1)->Arg(PQ)->Arg(RABITQ4)
+    ->UseManualTime()->Iterations(3);
+BENCHMARK(BM_VectorIvfIncrementalBuild)->ArgName("aboveThresholdFlush")
     ->Arg(0)->Arg(1)->UseManualTime()->Iterations(3);
 
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, single_column, false, false)->Arg(50'000);
-LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, single_ivfpq, false, true)->Arg(50'000);
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, single_ivf, false, true)->Arg(50'000);
 LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_column, true, false)->Arg(50'000);
-LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivfpq, true, true)->Arg(50'000);
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivf, true, true)->Arg(50'000);
 // Deepen-latency point: the skew corpus (see makeVectorDoc) makes round-1
 // collapse underfill the doc target, forcing depth rounds (folds counter
 // == 1).  IVF-only: the flat column engine doc-collapses during its scan
 // and so never deepens on multiplicity.
-LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivfpq_skew, true, true, true)->Arg(50'000);
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivf_skew, true, true, true)->Arg(50'000);
 
 // Two sweeps over (nprobe, refine); 0 = production default for either knob.
 // nprobe sweep at default refine: breadth axis, up to exhaustive-over-lists.
-// refine sweep at default nprobe: PQ candidate-selection axis (the 2026-06
-// measurements showed the recall ceiling is refine-bound, not probe-bound).
-// The (exhaustive, 16) point checks how close the ceiling gets to 1.0 when
-// both knobs are generous.
-LUXIR_BENCHMARK(BM_VectorKnnRecall)->ArgNames({"nprobe", "cand", "k"})
-    ->Args({0, 0, 10})->Args({1, 0, 10})->Args({4, 0, 10})->Args({16, 0, 10})
-    ->Args({64, 0, 10})->Args({1 << 20, 0, 10})
-    ->Args({0, 10, 10})->Args({0, 80, 10})->Args({0, 100, 10})->Args({0, 120, 10})
-    ->Args({0, 140, 10})->Args({0, 160, 10})
-    ->Args({1 << 20, 160, 10})
+// refine sweep at default nprobe: candidate-selection axis (the 2026-06
+// IVF+PQ measurements showed the recall ceiling is refine-bound, not
+// probe-bound).  The (exhaustive, 160) point checks how close the ceiling
+// gets to 1.0 when both knobs are generous.  Registered per codec, grouped so
+// consecutive instances reuse the built index.
+static void recallSweep(benchmark::Benchmark* b, int64_t codec) {
+  b->Args({0, 0, 10, codec})->Args({1, 0, 10, codec})->Args({4, 0, 10, codec})
+    ->Args({16, 0, 10, codec})->Args({64, 0, 10, codec})->Args({1 << 20, 0, 10, codec})
+    ->Args({0, 10, 10, codec})->Args({0, 80, 10, codec})->Args({0, 100, 10, codec})
+    ->Args({0, 120, 10, codec})->Args({0, 140, 10, codec})->Args({0, 160, 10, codec})
+    ->Args({1 << 20, 160, 10, codec})
     // k sweep at default nprobe/refine: checks the affine sizing across k.
     // Note recall granularity is 1/(16*k): coarse at k=1.
-    ->Args({0, 0, 1})->Args({0, 0, 100})->Args({0, 0, 1000});
+    ->Args({0, 0, 1, codec})->Args({0, 0, 100, codec})->Args({0, 0, 1000, codec});
+}
+LUXIR_BENCHMARK(BM_VectorKnnRecall)->ArgNames({"nprobe", "cand", "k", "codec"})
+    ->Apply([](benchmark::Benchmark* b) {
+      recallSweep(b, RABITQ1);
+      recallSweep(b, PQ);
+    });
 
 // Parallel-execution latency points: default knobs, a wide-breadth probe
 // (more selected lists = more scan tasks), and a deep-k pool (bigger
 // rescore buckets).
-LUXIR_BENCHMARK(BM_VectorKnnRecallParallel)->ArgNames({"nprobe", "cand", "k"})
-    ->Args({0, 0, 10})->Args({16, 0, 10})->Args({1 << 20, 0, 10})
-    ->Args({0, 0, 1000});
+LUXIR_BENCHMARK(BM_VectorKnnRecallParallel)->ArgNames({"nprobe", "cand", "k", "codec"})
+    ->Args({0, 0, 10, RABITQ1})->Args({16, 0, 10, RABITQ1})->Args({1 << 20, 0, 10, RABITQ1})
+    ->Args({0, 0, 1000, RABITQ1});
 
-LUXIR_BENCHMARK(BM_VectorKnnRecallThreads)->ArgNames({"nprobe", "cand", "k"})
-    ->Args({0, 0, 10})->ThreadRange(1, 32);
-LUXIR_BENCHMARK(BM_VectorKnnRecallThreadsParallel)->ArgNames({"nprobe", "cand", "k"})
-    ->Args({0, 0, 10})->ThreadRange(1, 32);
+LUXIR_BENCHMARK(BM_VectorKnnRecallThreads)->ArgNames({"nprobe", "cand", "k", "codec"})
+    ->Args({0, 0, 10, RABITQ1})->ThreadRange(1, 32);
+LUXIR_BENCHMARK(BM_VectorKnnRecallThreadsParallel)->ArgNames({"nprobe", "cand", "k", "codec"})
+    ->Args({0, 0, 10, RABITQ1})->ThreadRange(1, 32);

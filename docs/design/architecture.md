@@ -164,8 +164,8 @@ is a single term.
 ## Vector search, natively integrated
 
 Vectors are stored as ordinary columns. Exact kNN scans the column;
-approximate search uses per-segment ANN indexes (currently IVF+PQ) built as
-segment overlays, which follow the segment lifecycle and are served
+approximate search uses per-segment ANN indexes (IVF with RaBitQ or PQ
+codes, chosen per field) built as segment overlays, which follow the segment lifecycle and are served
 zero-copy from memory-mapped files like everything else. Approximate
 candidates are rescored at full precision. Because the ANN index is part of
 the segment, there is no separate vector store to keep in sync with your
