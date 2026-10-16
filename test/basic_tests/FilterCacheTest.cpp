@@ -641,6 +641,15 @@ TEST(FilterCacheTest, flushPosturesAndDump) {
   EXPECT_GT(rows[0].bytes, 0u);
   EXPECT_GT(rows[0].hits, 0u);
 
+  // Hot hits keep recording sightings while cold keys roll the ring past the
+  // key's first two.
+  for (int i = 0; i < 40; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::HIT, probeOnce(true));
+    FilterCache::UseRegistry cold(cache, 1, segments);
+    EXPECT_FALSE(cold.get(FilterKey("flushposture:cold" + std::to_string(i)))
+                     ->wasAdmitted());
+  }
+
   // Refill posture: values gone, sightings kept, so the next probe claims a
   // build immediately rather than restarting the ladder.
   cache.clear();
@@ -1775,6 +1784,8 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
   FilterCache cache(config);
   FilterKey key("tenant:42");
   size_t steadyMetadata = 0;
+  // Aligned on the previous reader and not yet probed.
+  std::unique_ptr<FilterCache::UseRegistry> held;
 
   for (uint64_t gen = 1; gen <= 50; gen++) {
     // Each publication merges away the oldest segment and adds a new one.
@@ -1783,6 +1794,14 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
                         FilterCache::SegmentIdentity{gen + 2, 100}};
     ASSERT_TRUE(cache.onReaderPublished(gen, segments));
     EXPECT_LE(cache.slotCountForTest(key), segments.size());
+    if (held != nullptr) {
+      // The held Use still owns the pruned slot of the merged-away segment;
+      // it stays a miss, while the surviving segment still hits.
+      auto* stale = held->get(key);
+      EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, stale->probe(0).kind());
+      EXPECT_EQ(FilterCache::Probe::Kind::HIT, stale->probe(1).kind());
+      held.reset();
+    }
 
     FilterCache::UseRegistry request(cache, gen, segments);
     auto* use = request.get(key);
@@ -1794,10 +1813,22 @@ TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
       }
     }
     EXPECT_EQ(segments.size(), cache.slotCountForTest(key));
+
+    // Every segment has a slot now, so this Use aligns without inserting.
+    FilterCache::UseRegistry again(cache, gen, segments);
+    auto* hot = again.get(key);
+    for (size_t ord = 0; ord < segments.size(); ord++) {
+      EXPECT_EQ(FilterCache::Probe::Kind::HIT, hot->probe(ord).kind());
+    }
+    EXPECT_EQ(segments.size(), cache.slotCountForTest(key));
     if (gen == 1) steadyMetadata = cache.metadataBytesUsed();
     EXPECT_EQ(steadyMetadata, cache.metadataBytesUsed());
     cache.validateForTest();
+
+    held = std::make_unique<FilterCache::UseRegistry>(cache, gen, segments);
+    held->get(key);
   }
+  held.reset();
 
   cache.clear();
   EXPECT_EQ(0u, cache.metadataBytesUsed());
