@@ -1115,16 +1115,33 @@ FilterCache::alignSlots(const std::shared_ptr<FilterEntry>& entry,
   };
 
   std::vector<std::shared_ptr<SegmentSlot>> aligned(readerSegments.size());
-  // Fast path: an entry that already has a slot for every active reader
-  // segment is aligned from its COW snapshot without the entry mutex or a
-  // copy. Load slots before activeSegments: a snapshot that already lacks a
-  // pruned slot was stored after its publication's activeSegments, so the
-  // identity reads as inactive and is not re-inserted. resident is not
-  // checked here: a non-resident entry's slots are all inactive, so the
-  // active filter below aligns nothing, exactly like the locked early return.
+  // Aligns the active slots of a table; true when a reader segment has none.
+  auto gather = [&](const SlotVector& slots) {
+    bool missing = false;
+    for (size_t i = 0; i < readerSegments.size(); i++) {
+      const auto* slot = exactSlot(slots, readerSegments[i]);
+      if (slot == nullptr) {
+        missing = true;
+      } else if ((*slot)->active.load(std::memory_order_acquire)) {
+        aligned[i] = *slot;
+      }
+    }
+    return missing;
+  };
+
+  // Fast path: align from the entry's COW snapshot without the entry mutex or
+  // a copy. The cache-wide activeSegments snapshot is read only when a reader
+  // segment has no slot. Load slots before activeSegments: a snapshot that
+  // already lacks a pruned slot was stored after its publication's
+  // activeSegments, so the identity reads as inactive and is not re-inserted.
+  // resident is not checked here: a non-resident entry's slots are all
+  // inactive, so gather aligns nothing, exactly like the locked early return.
   auto current = entry->slots.load(std::memory_order_acquire);
-  if (needsInsert(*current, *activeSegments.load(std::memory_order_acquire))) {
+  if (gather(*current)
+      && needsInsert(*current,
+                     *activeSegments.load(std::memory_order_acquire))) {
     std::lock_guard<std::mutex> lock(entry->mutex);
+    std::fill(aligned.begin(), aligned.end(), nullptr);
     if (!entry->resident) return aligned;
     auto active = activeSegments.load(std::memory_order_acquire);
     current = entry->slots.load(std::memory_order_acquire);
@@ -1147,13 +1164,7 @@ FilterCache::alignSlots(const std::shared_ptr<FilterEntry>& entry,
       entry->slots.store(updated, std::memory_order_release);
       current = updated;
     }
-  }
-
-  for (size_t i = 0; i < readerSegments.size(); i++) {
-    const auto* slot = exactSlot(*current, readerSegments[i]);
-    if (slot != nullptr && (*slot)->active.load(std::memory_order_acquire)) {
-      aligned[i] = *slot;
-    }
+    gather(*current);
   }
   entry->lastUsed.store(nextEpoch(), std::memory_order_relaxed);
   return aligned;
