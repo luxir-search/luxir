@@ -100,6 +100,57 @@ void BM_FilterCacheKeyBuild(benchmark::State& state, size_t clauseCount) {
   state.SetItemsProcessed((int64_t)state.iterations() * (int64_t)clauseCount);
 }
 
+// A search-shaped pure-hit workload: every request opens one UseRegistry over
+// a many-segment reader and probes each of its filters on every segment, all
+// of which are resident. Run with several threads to expose per-hit shared
+// writes (epoch, counters, recency) and per-Use allocation.
+struct ConcurrentHitFixture {
+  static constexpr size_t SEGMENTS = 30;
+  static constexpr size_t FILTERS = 3;
+  static constexpr int32_t MAX_DOC = 4096;
+
+  FilterCache cache{cacheConfig()};
+  std::vector<FilterCache::SegmentIdentity> segments;
+  std::vector<FilterKey> keys;
+
+  ConcurrentHitFixture() {
+    for (size_t i = 0; i < SEGMENTS; i++) {
+      segments.push_back({(uint64_t)(i + 1), MAX_DOC});
+    }
+    cache.onReaderPublished(1, segments);
+    for (size_t f = 0; f < FILTERS; f++) {
+      keys.emplace_back("concurrent-hit-" + std::to_string(f));
+      FilterCache::UseRegistry request(cache, 1, segments);
+      auto* use = request.get(keys.back());
+      for (size_t i = 0; i < SEGMENTS; i++) {
+        auto probe = use->probe(i);
+        use->publishRaw(i, probe, denseDocs(MAX_DOC), 1);
+      }
+    }
+    // Population probes count as misses; the timed loop must see none.
+    cache.resetCounters();
+  }
+};
+
+void BM_FilterCacheHitConcurrent(benchmark::State& state) {
+  static ConcurrentHitFixture fixture;
+  for (auto _ : state) {
+    FilterCache::UseRegistry request(fixture.cache, 1, fixture.segments);
+    for (const auto& key : fixture.keys) {
+      auto* use = request.get(key);
+      for (size_t i = 0; i < fixture.segments.size(); i++) {
+        auto probe = use->probe(i);
+        benchmark::DoNotOptimize(probe.docSet());
+      }
+    }
+  }
+  if (state.thread_index() == 0
+      && fixture.cache.counters().misses != 0) {
+    state.SkipWithError("concurrent hit benchmark observed a miss");
+  }
+  state.SetItemsProcessed((int64_t)state.iterations());
+}
+
 void BM_FilterCacheBeginUseHot(benchmark::State& state, size_t clauseCount) {
   KeyShape shape(clauseCount);
   FilterKey key = buildKey(shape.query());
@@ -232,6 +283,9 @@ LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheBeginUseHot, boolean_100, 100);
 LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheBeginUseHot, boolean_10k, 10'000);
 
 LUXIR_BENCHMARK(BM_FilterCacheProbePin);
+
+LUXIR_BENCHMARK(BM_FilterCacheHitConcurrent)
+    ->Threads(1)->Threads(8)->Threads(16)->Threads(28);
 
 BENCHMARK_CAPTURE(BM_FilterCacheEffectiveDocSet, raw_serve, false)
     ->UseManualTime()->Iterations(100);
