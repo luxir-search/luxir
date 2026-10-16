@@ -517,7 +517,15 @@ private:
   // resident means the outer map still owns this key's metadata; false is
   // permanent. The entry mutex serializes value publication, COW slot-table
   // changes, reader purge, and the resident transition authorizing metadata
-  // erase.
+  // erase. resident is atomic only so admission can read it without the
+  // mutex; every write still happens under it. A non-resident entry's slots
+  // are all inactive, and no slot of it can become active again.
+  //
+  // The slot table holds only slots for the latest published reader once a
+  // publication completes: onReaderPublished prunes merged-away slots. Each
+  // slot is charged SLOT_METADATA_BYTES to metadataBytes; slotsCharge is the
+  // entry's share, changed under the mutex only while resident and released
+  // with metadataCharge when the entry leaves the map.
   struct FilterEntry {
     const FilterKeyScope scope;
     std::atomic<std::shared_ptr<const SlotVector>> slots;
@@ -531,7 +539,12 @@ private:
     std::mutex mutex;
     std::atomic<uint64_t> lastUsed{0};
     const size_t metadataCharge;
-    bool resident = true;
+    size_t slotsCharge = 0;
+    std::atomic<bool> resident{true};
+    // Lanes whose admission ring has admitted this key. Admission is per
+    // lane (WHOLE unlocks tiny-segment population), so only a Use on an
+    // already-admitted lane may skip the ring.
+    std::atomic<uint8_t> admittedLanes{0};
     std::atomic<bool> readerValueEverPublished{false};
 
     FilterEntry(FilterKeyScope scope, size_t metadataCharge, uint64_t epoch)
@@ -614,6 +627,10 @@ private:
   // Approximate value-object, shared_ptr control-block, and segment-slot share.
   // Metadata is added separately and amortized over resident values.
   static constexpr size_t VALUE_RESIDENCY_OVERHEAD_BYTES = 256;
+  // Approximate per-slot metadata: the slot with its make_shared control block
+  // plus the slot-vector element.
+  static constexpr size_t SLOT_METADATA_BYTES = sizeof(SegmentSlot)
+      + 2 * sizeof(std::shared_ptr<SegmentSlot>);
 
   uint64_t nextEpoch();
   size_t residentValueCount(const FilterEntry& entry) const;
@@ -709,6 +726,7 @@ public:
   const void* entryIdentityForTest(const FilterKey& key) {
     return findEntry(key).get();
   }
+  size_t slotCountForTest(const FilterKey& key);
   uint64_t readerPublicationsForTest() const {
     return readerPublications.load(std::memory_order_relaxed);
   }

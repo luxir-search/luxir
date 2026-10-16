@@ -1766,6 +1766,45 @@ TEST(FilterCacheTest, metadataBytesAreAccountedAndSweepNonemptyEntries) {
   EXPECT_EQ(0u, cache.metadataBytesUsed());
 }
 
+// A long-lived entry used across many merges keeps one slot per live
+// segment: merged-away slots are pruned on publication, and their metadata
+// charge is released.
+TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  FilterKey key("tenant:42");
+  size_t steadyMetadata = 0;
+
+  for (uint64_t gen = 1; gen <= 50; gen++) {
+    // Each publication merges away the oldest segment and adds a new one.
+    std::array segments{FilterCache::SegmentIdentity{gen, 100},
+                        FilterCache::SegmentIdentity{gen + 1, 100},
+                        FilterCache::SegmentIdentity{gen + 2, 100}};
+    ASSERT_TRUE(cache.onReaderPublished(gen, segments));
+    EXPECT_LE(cache.slotCountForTest(key), segments.size());
+
+    FilterCache::UseRegistry request(cache, gen, segments);
+    auto* use = request.get(key);
+    ASSERT_TRUE(use->wasAdmitted());
+    for (size_t ord = 0; ord < segments.size(); ord++) {
+      auto probe = use->probe(ord);
+      if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+        use->publishRaw(ord, probe, bitDocs(100, 7), 10);
+      }
+    }
+    EXPECT_EQ(segments.size(), cache.slotCountForTest(key));
+    if (gen == 1) steadyMetadata = cache.metadataBytesUsed();
+    EXPECT_EQ(steadyMetadata, cache.metadataBytesUsed());
+    cache.validateForTest();
+  }
+
+  cache.clear();
+  EXPECT_EQ(0u, cache.metadataBytesUsed());
+  EXPECT_EQ(0u, cache.bytesUsed());
+  cache.validateForTest();
+}
+
 TEST(FilterCacheTest, oversizedKeysBypassWithoutAffectingAdmission) {
   FilterCacheConfig config = testConfig();
   config.maxEntryBytes = 32;

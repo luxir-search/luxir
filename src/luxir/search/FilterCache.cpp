@@ -1073,7 +1073,10 @@ bool FilterCache::eraseEntry(
     entry->readerDeadBuildStreak.store(0, std::memory_order_relaxed);
     entry->readerBuildBypassesRemaining.store(0,
                                                std::memory_order_relaxed);
-    metadataBytes.fetch_sub(entry->metadataCharge, std::memory_order_relaxed);
+    // slotsCharge is frozen once resident is false, and every caller observed
+    // that transition under the entry mutex before erasing.
+    metadataBytes.fetch_sub(entry->metadataCharge + entry->slotsCharge,
+                            std::memory_order_relaxed);
     return true;
   }
   return false;
@@ -1082,50 +1085,74 @@ bool FilterCache::eraseEntry(
 std::vector<std::shared_ptr<FilterCache::SegmentSlot>>
 FilterCache::alignSlots(const std::shared_ptr<FilterEntry>& entry,
                         std::span<const SegmentIdentity> readerSegments) {
-  std::lock_guard<std::mutex> lock(entry->mutex);
-  std::vector<std::shared_ptr<SegmentSlot>> aligned(readerSegments.size());
-  if (!entry->resident) return aligned;
-
-  auto active = activeSegments.load(std::memory_order_acquire);
-  auto current = entry->slots.load(std::memory_order_acquire);
-  auto updated = std::make_shared<SlotVector>(*current);
-  bool changed = false;
-  for (const auto& identity : readerSegments) {
-    auto found = std::lower_bound(
-        updated->begin(), updated->end(), identity,
+  auto lowerBound = [](const SlotVector& slots,
+                       const SegmentIdentity& identity) {
+    return std::lower_bound(
+        slots.begin(), slots.end(), identity,
         [](const std::shared_ptr<SegmentSlot>& slot,
            const SegmentIdentity& target) {
           return std::tie(slot->segId, slot->maxDoc)
               < std::tie(target.segId, target.maxDoc);
         });
-    bool exact = found != updated->end()
-        && (*found)->segId == identity.segId
+  };
+  auto exactSlot = [&](const SlotVector& slots,
+                       const SegmentIdentity& identity)
+      -> const std::shared_ptr<SegmentSlot>* {
+    auto found = lowerBound(slots, identity);
+    bool exact = found != slots.end() && (*found)->segId == identity.segId
         && (*found)->maxDoc == identity.maxDoc;
-    if (!exact && isActive(*active, identity)) {
-      updated->insert(found,
-                      std::make_shared<SegmentSlot>(identity.segId,
-                                                    identity.maxDoc));
-      changed = true;
+    return exact ? &*found : nullptr;
+  };
+  auto needsInsert = [&](const SlotVector& slots,
+                         const ActiveSnapshot& active) {
+    for (const auto& identity : readerSegments) {
+      if (exactSlot(slots, identity) == nullptr
+          && isActive(active, identity)) {
+        return true;
+      }
     }
-  }
-  if (changed) {
-    entry->slots.store(updated, std::memory_order_release);
-    current = updated;
+    return false;
+  };
+
+  std::vector<std::shared_ptr<SegmentSlot>> aligned(readerSegments.size());
+  // Fast path: an entry that already has a slot for every active reader
+  // segment is aligned from its COW snapshot without the entry mutex or a
+  // copy. Load slots before activeSegments: a snapshot that already lacks a
+  // pruned slot was stored after its publication's activeSegments, so the
+  // identity reads as inactive and is not re-inserted. resident is not
+  // checked here: a non-resident entry's slots are all inactive, so the
+  // active filter below aligns nothing, exactly like the locked early return.
+  auto current = entry->slots.load(std::memory_order_acquire);
+  if (needsInsert(*current, *activeSegments.load(std::memory_order_acquire))) {
+    std::lock_guard<std::mutex> lock(entry->mutex);
+    if (!entry->resident.load(std::memory_order_relaxed)) return aligned;
+    auto active = activeSegments.load(std::memory_order_acquire);
+    current = entry->slots.load(std::memory_order_acquire);
+    if (needsInsert(*current, *active)) {
+      auto updated = std::make_shared<SlotVector>(*current);
+      size_t added = 0;
+      for (const auto& identity : readerSegments) {
+        if (exactSlot(*updated, identity) != nullptr
+            || !isActive(*active, identity)) {
+          continue;
+        }
+        updated->insert(lowerBound(*updated, identity),
+                        std::make_shared<SegmentSlot>(identity.segId,
+                                                      identity.maxDoc));
+        added++;
+      }
+      entry->slotsCharge += added * SLOT_METADATA_BYTES;
+      metadataBytes.fetch_add(added * SLOT_METADATA_BYTES,
+                              std::memory_order_relaxed);
+      entry->slots.store(updated, std::memory_order_release);
+      current = updated;
+    }
   }
 
   for (size_t i = 0; i < readerSegments.size(); i++) {
-    const auto& identity = readerSegments[i];
-    auto found = std::lower_bound(
-        current->begin(), current->end(), identity,
-        [](const std::shared_ptr<SegmentSlot>& slot,
-           const SegmentIdentity& target) {
-          return std::tie(slot->segId, slot->maxDoc)
-              < std::tie(target.segId, target.maxDoc);
-        });
-    if (found != current->end() && (*found)->segId == identity.segId
-        && (*found)->maxDoc == identity.maxDoc
-        && (*found)->active.load(std::memory_order_acquire)) {
-      aligned[i] = *found;
+    const auto* slot = exactSlot(*current, readerSegments[i]);
+    if (slot != nullptr && (*slot)->active.load(std::memory_order_acquire)) {
+      aligned[i] = *slot;
     }
   }
   entry->lastUsed.store(nextEpoch(), std::memory_order_relaxed);
@@ -1294,10 +1321,22 @@ void FilterCache::observeAdmissionLane(Use& use, AdmissionLane lane) {
     return;
   }
 
-  use.admitted = admissionFor(lane).record(use.key.hash()) || use.admitted;
   auto entry = use.entry != nullptr ? use.entry : findEntry(use.key);
-  if (entry == nullptr && use.admitted) {
-    entry = findOrCreateEntry(use.key, use.scope_);
+  if (entry != nullptr && entry->resident.load(std::memory_order_acquire)
+      && (entry->admittedLanes.load(std::memory_order_relaxed) & laneBit)
+          != 0) {
+    // A resident entry already admitted on this lane is proof of admission,
+    // so hot keys skip the shared ring mutex entirely.
+    use.admitted = true;
+  } else {
+    bool laneAdmitted = admissionFor(lane).record(use.key.hash());
+    use.admitted = laneAdmitted || use.admitted;
+    if (entry == nullptr && use.admitted) {
+      entry = findOrCreateEntry(use.key, use.scope_);
+    }
+    if (entry != nullptr && laneAdmitted) {
+      entry->admittedLanes.fetch_or(laneBit, std::memory_order_relaxed);
+    }
   }
   if (entry == nullptr) return;
   if (entry->scope != use.scope_) {
@@ -1540,12 +1579,23 @@ bool FilterCache::onReaderPublished(
                                               std::memory_order_relaxed);
       }
     }
+    // A non-resident entry is leaving the map: keep all of its slots
+    // inactive and its slot table (and slotsCharge) frozen.
+    bool resident = entry->resident.load(std::memory_order_relaxed);
     auto slots = entry->slots.load(std::memory_order_acquire);
-    for (const auto& slot : *slots) {
+    std::shared_ptr<SlotVector> kept;
+    for (size_t i = 0; i < slots->size(); i++) {
+      const auto& slot = (*slots)[i];
       std::lock_guard<SegmentSlot> feedbackLock(*slot);
       SegmentIdentity identity{slot->segId, slot->maxDoc};
-      bool active = isActive(*next, identity);
+      bool active = resident && isActive(*next, identity);
       slot->active.store(active, std::memory_order_release);
+      if (resident && !active && kept == nullptr) {
+        kept = std::make_shared<SlotVector>(slots->begin(),
+                                            slots->begin() + i);
+      } else if (active && kept != nullptr) {
+        kept->push_back(slot);
+      }
       if (!active) {
         slot->deadBuildStreak.store(0, std::memory_order_relaxed);
         slot->buildBypassesRemaining.store(0,
@@ -1557,6 +1607,19 @@ bool FilterCache::onReaderPublished(
           counter.purges.fetch_add(1, std::memory_order_relaxed);
         }
       }
+    }
+    if (kept != nullptr) {
+      // Drop merged-away slots so a long-lived entry does not accumulate one
+      // per segment it has ever seen. A Use already holding a pruned slot
+      // keeps it alive; it is permanently inactive (only this publication
+      // path could reactivate it, and it is no longer in the table), so
+      // probe and publish keep treating it as a miss. A segment that
+      // reappears gets a fresh slot from alignSlots.
+      size_t dropped = slots->size() - kept->size();
+      entry->slotsCharge -= dropped * SLOT_METADATA_BYTES;
+      metadataBytes.fetch_sub(dropped * SLOT_METADATA_BYTES,
+                              std::memory_order_relaxed);
+      entry->slots.store(kept, std::memory_order_release);
     }
   }
   maybeSweep();
@@ -1833,6 +1896,12 @@ void FilterCache::resetCounters() {
   counter.readerStableRetires.store(0, std::memory_order_relaxed);
 }
 
+size_t FilterCache::slotCountForTest(const FilterKey& key) {
+  auto entry = findEntry(key);
+  return entry == nullptr
+      ? 0 : entry->slots.load(std::memory_order_acquire)->size();
+}
+
 std::vector<FilterCache::EntryDump> FilterCache::dump(size_t limit,
                                                       size_t* totalResident) {
   std::vector<EntryDump> rows;
@@ -1973,6 +2042,11 @@ void FilterCache::validateForTest() {
     expectedMetadataBytes += entry.metadataCharge;
 
     auto slots = entry.slots.load(std::memory_order_acquire);
+    if (entry.slotsCharge != slots->size() * SLOT_METADATA_BYTES) {
+      throw std::logic_error(
+          "FilterCache validation: entry slot charge mismatch");
+    }
+    expectedMetadataBytes += entry.slotsCharge;
     auto readerValue = entry.readerValue.load(std::memory_order_acquire);
     uint32_t readerStreak = entry.readerDeadBuildStreak.load(
         std::memory_order_relaxed);
@@ -2046,10 +2120,9 @@ void FilterCache::validateForTest() {
         throw std::logic_error(
             "FilterCache validation: invalid segment build backoff");
       }
-      if (!slot->active.load(std::memory_order_acquire)
-          && (streak != 0 || bypasses != 0)) {
+      if (!slot->active.load(std::memory_order_acquire)) {
         throw std::logic_error(
-            "FilterCache validation: inactive slot retains build backoff");
+            "FilterCache validation: resident entry retains inactive slot");
       }
       auto value = slot->value.load(std::memory_order_acquire);
       if (value == nullptr) continue;
@@ -2062,10 +2135,6 @@ void FilterCache::validateForTest() {
       if (entry.scope == FilterKeyScope::READER_STABLE) {
         throw std::logic_error(
             "FilterCache validation: reader-stable entry has raw value");
-      }
-      if (!slot->active.load(std::memory_order_acquire)) {
-        throw std::logic_error(
-            "FilterCache validation: inactive slot retains resident value");
       }
       #ifndef NDEBUG
       if (value->identityForTest.segId != slot->segId
