@@ -38,6 +38,8 @@ enum BenchCodec : int32_t {
   PQ = 1,       // IVF+PQ with its defaults (M <= 32, 8 bits)
   RABITQ4 = 2,  // extended RaBitQ, 4 bits per dimension
   RABITQ2 = 3,
+  PQ_D8 = 4,    // IVF+PQ, dims/8 sub-quantizers: one code byte per 8 dims,
+                // about the bytes of 1-bit RaBitQ
 };
 
 const char* benchCodecName(int32_t codec) {
@@ -46,6 +48,7 @@ const char* benchCodecName(int32_t codec) {
     case PQ: return "pq";
     case RABITQ4: return "rabitq4";
     case RABITQ2: return "rabitq2";
+    case PQ_D8: return "pq_d8";
     default: return "?";
   }
 }
@@ -54,10 +57,11 @@ int32_t benchRaBitQBits(int32_t codec) {
   return codec == RABITQ4 ? 4 : codec == RABITQ2 ? 2 : 1;
 }
 
-void setBenchAnn(api::FieldDef& f, int32_t codec) {
+void setBenchAnn(api::FieldDef& f, int32_t dims, int32_t codec) {
   auto& ann = f.ann.emplace();
-  if (codec == PQ) {
+  if (codec == PQ || codec == PQ_D8) {
     ann.codec = api::VectorAnnDef::Codec::PQ;
+    if (codec == PQ_D8) ann.pq.emplace().m = dims / 8;
   } else {
     ann.codec = api::VectorAnnDef::Codec::RABITQ;
     ann.rabitq.emplace().bits = benchRaBitQBits(codec);
@@ -74,7 +78,7 @@ void installVectorBenchSchema(Collection& col, int32_t dims,
   single.column = true;
   single.dims = dims;
   single.metric = metric;
-  setBenchAnn(single, codec);
+  setBenchAnn(single, dims, codec);
 
   auto& multi = b.templ("_vs");
   multi.type = api::FieldDef_::FieldClass::VECTOR;
@@ -82,14 +86,17 @@ void installVectorBenchSchema(Collection& col, int32_t dims,
   multi.multi = true;
   multi.dims = dims;
   multi.metric = metric;
-  setBenchAnn(multi, codec);
+  setBenchAnn(multi, dims, codec);
 
   b.set(col);
 }
 
 // The overlay engine/bits a codec arg produces, for index-reuse checks.
 bool overlayMatchesCodec(const VectorAuxReader& vaux, int32_t codec) {
-  if (codec == PQ) return vaux.getEngine() == VectorAuxMeta::ENGINE_IVFPQ;
+  if (codec == PQ || codec == PQ_D8) {
+    return vaux.getEngine() == VectorAuxMeta::ENGINE_IVFPQ
+      && (codec == PQ_D8) == (vaux.getPqM() == vaux.getDims() / 8);
+  }
   return vaux.isRaBitQ() && vaux.getRaBitQBits() == benchRaBitQBits(codec);
 }
 
@@ -918,8 +925,8 @@ void BM_VectorAnnDataset(benchmark::State& state) {
 // Real-corpus codec comparison (see BM_VectorAnnDataset); needs
 // LUXIR_VECTOR_DATASET, so it is a measurement-only benchmark.
 static void datasetSweep(benchmark::Benchmark* b, int64_t codec) {
-  for (int64_t nprobe : {0, 16, 32, 64}) {
-    for (int64_t cand : {0, 100, 200}) b->Args({codec, nprobe, cand});
+  for (int64_t nprobe : {0, 32, 64, 128}) {
+    for (int64_t cand : {0, 200, 500}) b->Args({codec, nprobe, cand});
   }
 }
 TUNING_BENCHMARK(BM_VectorAnnDataset)->ArgNames({"codec", "nprobe", "cand"})
@@ -928,6 +935,7 @@ TUNING_BENCHMARK(BM_VectorAnnDataset)->ArgNames({"codec", "nprobe", "cand"})
       datasetSweep(b, RABITQ2);
       datasetSweep(b, RABITQ4);
       datasetSweep(b, PQ);
+      datasetSweep(b, PQ_D8);
     })->UseRealTime()->MinTime(2.0);
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that

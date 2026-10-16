@@ -105,6 +105,33 @@ codec is recorded per overlay, so FastScan can arrive as another engine id.
 **IVF+PQ** (`ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
 sub-quantizers of `pq.bits` bits each, unrotated, exactly as before.
 
+### Codec measurements
+
+`Tuning/BM_VectorAnnDataset` (test/bench/VectorKnnBM.cpp) indexes a real
+corpus through the normal request path into 4 segments, builds every overlay
+with the production policy, and measures recall@10 of 200 held-out queries
+against the exact path plus serial single-query latency (gcc-release,
+i7-14700KF, shared with other builds). Two corpora:
+
+- 485,659 Cohere `multilingual-22-12` embeddings of Simple English Wikipedia
+  (768 dims, cosine).
+- SIFT1M (1,000,000 x 128, L2).
+
+At 768 dims, recall with 1-bit RaBitQ is set by the probed lists alone: 1, 2,
+and 4 bits all give 0.893 / 0.911 / 0.960 / 0.986 at nprobe default / 32 / 64
+/ 128, at any rescore pool. PQ at its default `m=32` (32 code bytes) never
+passed 0.88, even with 500 rescored candidates; PQ with `m=96` (96 bytes,
+close to RaBitQ's 104) reached 0.886 / 0.902 / 0.950 / 0.970. FAISS's plain
+RaBitQ scanner is slower than its PQ scanner (default nprobe: 1.2 ms vs 0.66
+ms for `m=96`), which FastScan should largely close. At 128 dims (SIFT) the
+defaults are close in recall (0.953 vs 0.960 at the default nprobe; 0.989 vs
+0.999 at nprobe 128, where 2-bit RaBitQ or 500 candidates reach 0.9985 and
+0.9965) and PQ is again faster. Overlay builds, including training and
+coarse assignment, took 10.2 s (RaBitQ, 140 B/vector) vs 16.7 s (PQ m=32,
+55 B/vector) at 768 dims and 10.4 s vs 12.9 s at 128 dims. Bytes per vector
+include the 8-byte id and per-overlay headers (centroids, and for RaBitQ the
+stored d x d rotation).
+
 ## Build Policy
 
 Build policy is per segment and size based. An IVF overlay is attempted only
