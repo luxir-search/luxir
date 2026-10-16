@@ -126,7 +126,15 @@ TEST_F(KStemTest, sharedDictionaryAndNoTokenAllocations) {
     EXPECT_EQ(0, ctorAllocated);
   }
   KStemmer& stemmer = *owner;
-  bytes += stemmer.stem("ponies").size();  // first candidate allocates the memo, once
+  // The memo is allocated once, after enough dictionary misses: drive them with
+  // made-up words so the memo exists before the allocation scope below.
+  for (char a = 'a'; a <= 'z'; ++a) {
+    for (char b = 'a'; b <= 'l'; ++b) {  // 312 words, letters only
+      std::string made = std::string("zq") + a + b + "ing";
+      bytes += stemmer.stem(made).size();
+    }
+  }
+  bytes += stemmer.stem("ponies").size();
   memtrack::AllocScope scope;
   for (int i = 0; i < 10; ++i) {
     for (auto word : {"dog", "ponies", "canonic", "italians", "aided", "microcoding"}) {

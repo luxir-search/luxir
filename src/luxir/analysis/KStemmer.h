@@ -18,7 +18,7 @@ namespace luxir {
 // before those limits.
 // Each instance owns scratch space and is not thread-safe. The dictionary is
 // immutable and shared by all instances. No per-token allocations (the memo
-// is allocated once per instance).
+// is allocated once per instance, after enough dictionary misses).
 class KStemmer {
   struct Dictionary;
   const Dictionary& dictionary;
@@ -49,7 +49,12 @@ class KStemmer {
   };
   static_assert(sizeof(MemoEntry) == 32);
   static constexpr uint8_t Unchanged = 255;
-  std::unique_ptr<MemoEntry[]> memo;  // allocated on the first candidate
+  // Allocated after MemoAfterUnknown dictionary misses (rule-chain runs), so
+  // a short-lived chain (QueryBuilder makes one per request) never pays the
+  // ~1 us to allocate and zero it. 256 misses is about 9 us of rule-chain work.
+  std::unique_ptr<MemoEntry[]> memo;
+  static constexpr uint32_t MemoAfterUnknown = 256;
+  uint32_t unknownRuns = 0;
 
 public:
   KStemmer();
@@ -69,7 +74,10 @@ public:
     if (last >= 26 || previous >= 26 || third >= 26
         || !(possibleSuffixes[last * 26 + previous] & (1u << third))) return term;
     if (term.size() > MemoKeyMax) return stemCandidate(term);
-    if (!memo) [[unlikely]] memo.reset(new MemoEntry[(size_t) 1 << MemoBits]);
+    if (!memo) [[unlikely]] {
+      if (unknownRuns < MemoAfterUnknown) return stemCandidate(term);
+      memo.reset(new MemoEntry[(size_t) 1 << MemoBits]);
+    }
     MemoEntry& e = memo[memoSlot(term)];
     if (e.keyLen == term.size() && std::memcmp(e.key, term.data(), term.size()) == 0) {
       // keep borrowing the input when stemming leaves it alone
