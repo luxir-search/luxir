@@ -721,6 +721,7 @@ TEST_F(DateFieldTest, ingestRemainsUtcUnderZonedQueries) {
 }
 
 TEST_F(DateFieldTest, skippedQueryGranuleWarnsAndInvalidZoneIsEager) {
+  if (!apiaTzdbIsCorrect()) GTEST_SKIP() << "system tzdb mis-places the Apia 2011 dateline jump";
   CollectionHelper helper;
   helper.index(flatdoc("id", "apia", "when_dt", "2011-12-30T10:00:00Z"),
                UpdateMessage::COMMIT);  // 2011-12-31 local after the dateline jump

@@ -1581,6 +1581,7 @@ TEST_F(FacetTest, calendarDateRangeFromStartAndFoldProvenance) {
 
 // Pacific/Apia skipped 2011-12-30 when it moved across the dateline.
 TEST_F(FacetTest, calendarDateRangeApiaSkippedDayParityAndWarning) {
+  if (!apiaTzdbIsCorrect()) GTEST_SKIP() << "system tzdb mis-places the Apia 2011 dateline jump";
   CollectionHelper helper;
   helper.clear();
   const std::array fields = {

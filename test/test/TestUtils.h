@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <map>
 #include <string>
 #include <tuple>
@@ -15,6 +16,21 @@
 #include "luxir/util/Overloaded.h"
 
 namespace luxir::test {
+
+// libstdc++'s text-tzdb reader mis-places Pacific/Apia's 2011 dateline jump
+// with some tzdata releases (it should be +13 -> +14 at 2011-12-30T10:00:00Z).
+// Tests that depend on the skipped day skip when the loaded tzdb disagrees.
+inline bool apiaTzdbIsCorrect() {
+  using namespace std::chrono;
+  try {
+    auto* zone = get_tzdb().locate_zone("Pacific/Apia");
+    auto jump = sys_days{2011y / 12 / 30} + hours(10);
+    return zone->get_info(jump - seconds(1)).offset == hours(-10)
+        && zone->get_info(jump).offset == hours(14);
+  } catch (const std::exception&) {
+    return false;
+  }
+}
 
 template <class... Values>
 class SearchOverridesGuard {
