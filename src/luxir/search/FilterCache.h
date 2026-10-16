@@ -517,9 +517,8 @@ private:
   // resident means the outer map still owns this key's metadata; false is
   // permanent. The entry mutex serializes value publication, COW slot-table
   // changes, reader purge, and the resident transition authorizing metadata
-  // erase. resident is atomic only so admission can read it without the
-  // mutex; every write still happens under it. A non-resident entry's slots
-  // are all inactive, and no slot of it can become active again.
+  // erase. A non-resident entry's slots are all inactive, and no slot of it
+  // can become active again.
   //
   // The slot table holds only slots for the latest published reader once a
   // publication completes: onReaderPublished prunes merged-away slots. Each
@@ -540,11 +539,7 @@ private:
     std::atomic<uint64_t> lastUsed{0};
     const size_t metadataCharge;
     size_t slotsCharge = 0;
-    std::atomic<bool> resident{true};
-    // Lanes whose admission ring has admitted this key. Admission is per
-    // lane (WHOLE unlocks tiny-segment population), so only a Use on an
-    // already-admitted lane may skip the ring.
-    std::atomic<uint8_t> admittedLanes{0};
+    bool resident = true;
     std::atomic<bool> readerValueEverPublished{false};
 
     FilterEntry(FilterKeyScope scope, size_t metadataCharge, uint64_t epoch)

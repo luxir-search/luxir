@@ -1125,7 +1125,7 @@ FilterCache::alignSlots(const std::shared_ptr<FilterEntry>& entry,
   auto current = entry->slots.load(std::memory_order_acquire);
   if (needsInsert(*current, *activeSegments.load(std::memory_order_acquire))) {
     std::lock_guard<std::mutex> lock(entry->mutex);
-    if (!entry->resident.load(std::memory_order_relaxed)) return aligned;
+    if (!entry->resident) return aligned;
     auto active = activeSegments.load(std::memory_order_acquire);
     current = entry->slots.load(std::memory_order_acquire);
     if (needsInsert(*current, *active)) {
@@ -1321,22 +1321,10 @@ void FilterCache::observeAdmissionLane(Use& use, AdmissionLane lane) {
     return;
   }
 
+  use.admitted = admissionFor(lane).record(use.key.hash()) || use.admitted;
   auto entry = use.entry != nullptr ? use.entry : findEntry(use.key);
-  if (entry != nullptr && entry->resident.load(std::memory_order_acquire)
-      && (entry->admittedLanes.load(std::memory_order_relaxed) & laneBit)
-          != 0) {
-    // A resident entry already admitted on this lane is proof of admission,
-    // so hot keys skip the shared ring mutex entirely.
-    use.admitted = true;
-  } else {
-    bool laneAdmitted = admissionFor(lane).record(use.key.hash());
-    use.admitted = laneAdmitted || use.admitted;
-    if (entry == nullptr && use.admitted) {
-      entry = findOrCreateEntry(use.key, use.scope_);
-    }
-    if (entry != nullptr && laneAdmitted) {
-      entry->admittedLanes.fetch_or(laneBit, std::memory_order_relaxed);
-    }
+  if (entry == nullptr && use.admitted) {
+    entry = findOrCreateEntry(use.key, use.scope_);
   }
   if (entry == nullptr) return;
   if (entry->scope != use.scope_) {
@@ -1581,7 +1569,7 @@ bool FilterCache::onReaderPublished(
     }
     // A non-resident entry is leaving the map: keep all of its slots
     // inactive and its slot table (and slotsCharge) frozen.
-    bool resident = entry->resident.load(std::memory_order_relaxed);
+    bool resident = entry->resident;
     auto slots = entry->slots.load(std::memory_order_acquire);
     std::shared_ptr<SlotVector> kept;
     for (size_t i = 0; i < slots->size(); i++) {
