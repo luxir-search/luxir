@@ -101,6 +101,7 @@ struct IndexConfig {
   int64_t max_ram_mb = -1;
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
   int merge_factor = 10;
+  int max_concurrent_merges = 2;  // policy merges per collection that may run at once
 };
 
 struct IngestConfig {

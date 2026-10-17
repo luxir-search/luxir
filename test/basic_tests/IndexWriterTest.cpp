@@ -686,6 +686,58 @@ TEST_F(IndexWriterTest, autoMerge) {
   }
 }
 
+// Policy merges run concurrently up to maxConcurrentMerges, each over at most
+// mergeFactor sources that no other running merge holds.
+TEST_F(IndexWriterTest, concurrentMergesUseDisjointSources) {
+  RAMDir dir;
+  CommitSnapshotRegistry iwSnapshots(dir);
+  IndexWriter iw(iwSnapshots);
+  iw.mergePolicy->setMergeFactor(2);
+  iw.mergePolicy->maxConcurrentMerges = 3;
+
+  std::atomic<int> started = 0;
+  std::atomic<int> sources = 0;
+  std::atomic<bool> release = false;
+  luxir::Signal::listen("mergeStart", [&](void*, void* nSegs, void*) -> void* {
+    sources.fetch_add((int)(int64_t)nSegs);
+    started.fetch_add(1);
+    while (!release.load()) std::this_thread::yield();
+    return nullptr;
+  });
+  auto cleanup = luxir::scope_guard([&]() {
+    release.store(true);
+    iw.updateGraph->wait_for_all();
+    luxir::Signal::unlisten("mergeStart");
+  });
+
+  // Seven one-doc segments: three two-source merges run, one segment waits.
+  for (int i = 0; i < 7; i++) {
+    auto& inverter = iw.obtainInverter();
+    inverter.startDoc();
+    inverter.getIndexHandler(field).index(inverter, std::string_view("test"));
+    inverter.finishDoc();
+    iw.releaseInverter(inverter, true);
+  }
+  for (int i = 0; i < 5000 && started.load() < 3; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  ASSERT_EQ(3, started.load());
+  auto stats = iw.stats(true);
+  EXPECT_EQ(3u, stats.activeMerges);
+  int merging = 0;
+  for (const auto& seg : stats.segmentStats) merging += seg.merging ? 1 : 0;
+  EXPECT_EQ(6, sources.load());
+  EXPECT_EQ(6, merging) << "a segment counted by two merges is marked once";
+
+  release.store(true);
+  iw.updateGraph->wait_for_all();
+  iw.commit();
+  auto reader = iw.snapshots.readers.getReader();
+  EXPECT_EQ(7, reader->maxDoc());
+  EXPECT_LT(reader->segments().size(), 7u);
+}
+
 TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
   using namespace luxir::test;
 
