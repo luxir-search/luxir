@@ -69,7 +69,7 @@ struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct Rescore
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning; struct Error;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
-struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
+struct TermFilter; struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct Map;
 struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
@@ -581,6 +581,15 @@ struct ExprOp {
   std::string_view expr;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
+struct TermFilter {
+  std::string_view prefix;
+  std::string_view regex;
+  std::string_view exclude_regex;
+  std::span<const std::string_view> include;
+  std::span<const std::string_view> exclude;
+  uint32_t partition = 0;
+  uint32_t num_partitions = 0;
+};
 struct FieldFacet {
   std::optional<FieldFacet_::CountUnit> count_unit;
   ::hpp_proto::optional_indirect_view<Collapse> count_distinct;
@@ -590,6 +599,7 @@ struct FieldFacet {
   std::span<const SortSpec> sort;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   ::hpp_proto::optional_indirect_view<Val> selected;
+  std::optional<TermFilter> term_filter;
   SelectionMode selection_mode = SelectionMode::ANY;
   bool missing = false;
 };
@@ -807,7 +817,7 @@ LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_T
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
 LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery)
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
-LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
+LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(TermFilter) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
 LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult)
 LUXIR_TD(CollectionCommit) LUXIR_TD(ReplicaResult) LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
@@ -851,7 +861,7 @@ LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Fil
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(ExprQuery)
 LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)
-LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
+LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(TermFilter) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)
 LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(DocList)
 LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CollectionCommit) LUXIR_ENTRY(ReplicaResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
