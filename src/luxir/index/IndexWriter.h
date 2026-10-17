@@ -485,6 +485,23 @@ public:
   size_t perInverterRamBytes = 64 * 1024 * 1024;
   size_t perInverterMaxDocs = PostingsReader::MAX_SEGMENT_DOCS;
 
+  // Intra-request parallelism (ProtoUpdateMessage::handle): an update message
+  // that is not all_or_none and has at least 2x parallelUpdateChunkDocs docs is
+  // split into chunks of at least that many docs, each indexed into its own
+  // inverter in parallel, so a client that sends one large request at a time is
+  // not held to one core.  The chunk count is capped by parallelUpdateMaxChunks
+  // and by the task arena width shared among the messages being handled at once
+  // (updatesInHandle), so concurrent clients do not multiply busy inverters.
+  // Every chunk is a separate inverter and so a separate segment at flush; past
+  // ~8 chunks the single-request gain flattens (the request parse is serial)
+  // while CPU spent on idle workers and merges keeps growing (measured on 1.3KB
+  // text docs).  Servers set both from LuxirConfig (250 docs, 8 chunks); a
+  // directly constructed writer keeps each message in one inverter, as 0
+  // disables splitting.
+  size_t parallelUpdateChunkDocs = 0;
+  int32_t parallelUpdateMaxChunks = 8;
+  std::atomic<int32_t> updatesInHandle = 0;
+
   // Minimum memSize() for an idle inverter to be flushed under global RAM budget
   // pressure (releaseInverter). Shedding smaller inverters spams tiny segments
   // without meaningful RAM relief, e.g. when merge reservations hold the budget.

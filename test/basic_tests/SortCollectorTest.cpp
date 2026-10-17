@@ -458,6 +458,7 @@ TEST_F(SortCollectorTest, fieldSortLeafMetaLivesWithItsSegment) {
   LuxirConfig config;
   config.store.backend = "fs";
   config.store.data_dir = path.string();
+  config.index.parallel_update_chunk_docs = 0;  // one message per segment
   LuxirNode node(config);
   CollectionHelper helper(node, "reopen");
   auto writer = helper.getIndexWriter();

@@ -7,10 +7,18 @@
 #include "CommitWaits.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/schema/ValCoerce.h"
 
+#include <algorithm>
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <deque>
+#include <iterator>
 #include <new>
+#include <oneapi/tbb/blocked_range.h>
+#include <oneapi/tbb/parallel_for.h>
+#include <oneapi/tbb/task_arena.h>
 #include <optional>
+#include <ranges>
 #include <variant>
 
 namespace luxir {
@@ -84,20 +92,19 @@ static std::string_view docId(const luxir::api::Map& doc, const FieldNameMap& fi
 }
 
 
-static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::UndoMark& requestMark) {
-  auto& request = *msg.req;
-  const bool allOrNone = request.all_or_none;
-  const bool returnIds = request.return_ids;
-  const FieldNameMap fieldMap(request);
+// Indexes the request docs at `indices` (ascending request positions) into one
+// inverter.  A document's own failure is reported through
+// onFailure(docIndex, ErrorInfo&&); returning false rolls the doc back and
+// continues, true stops the batch (all_or_none: the caller rolls back the whole
+// request).  onSuccess(docIndex) reports an indexed doc.  Segment-fatal failures
+// propagate to the caller, which must discard the inverter.
+template <class Indices, class OnFailure, class OnSuccess>
+static void indexDocs(Inverter& inverter, const luxir::api::UpdateRequest& request,
+                      const FieldNameMap& fieldMap, const Indices& indices,
+                      OnFailure&& onFailure, OnSuccess&& onSuccess) {
   std::vector<Inverter::InputHandler*> handlers;
-
-  // first docid this request's adds will use; needed for all_or_none rollback.
-  const int32_t firstDoc = inverter.getMaxDoc();
-
-  int32_t failed = 0;
-  int32_t docIndex = -1;
-  for (const auto &doc : request.docs) {
-    docIndex++;
+  for (int32_t docIndex : indices) {
+    const auto& doc = request.docs[(size_t)docIndex];
     size_t nFields = doc.fields.size();
     if (handlers.size() < nFields) {
       handlers.resize(nFields);
@@ -136,28 +143,12 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       // announce themselves (DocumentError, RequestError from the handlers);
       // anything else is an engine fault, reported on the document it hit and
       // logged, while the document itself is rolled back like any other.
-      failed++;
       ErrorInfo info = currentExceptionInfo(ErrorKind::INTERNAL);
       if (info.kind == ErrorKind::INTERNAL) {
         LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, docId(doc, fieldMap),
                   info.message);
       }
-      auto* response = msg.getResponse();
-      auto& err = msg.addError();
-      err.id = luxir::api::build::arenaStr(msg.responseArena(), docId(doc, fieldMap));
-      err.index = docIndex;
-      err.error = luxir::api::build::arenaError(msg.responseArena(), info);
-
-      if (allOrNone) {
-        // Undo the id map mutations of the whole request (including queued
-        // delete_ids) and mark every doc it added as deleted.  Remaining docs
-        // are not attempted.
-        inverter.rollbackTo(requestMark);
-        for (int32_t docid = firstDoc; docid <= inverter.getDoc(); docid++) {
-          inverter.deleteDoc(docid);
-        }
-        msg.clearIds();
-        response->status = ProtoUpdateMessage::ResponseStatus::ERROR;
+      if (onFailure(docIndex, std::move(info))) {
         return;
       }
 
@@ -168,17 +159,277 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       continue;
     }
 
-    if (returnIds) {
-      msg.addId(docId(doc, fieldMap));
+    onSuccess(docIndex);
+  }
+}
+
+
+static void addDocError(ProtoUpdateMessage& msg, const FieldNameMap& fieldMap, int32_t docIndex,
+                        const ErrorInfo& info) {
+  auto& err = msg.addError();
+  err.id = luxir::api::build::arenaStr(msg.responseArena(), docId(msg.req->docs[(size_t)docIndex], fieldMap));
+  err.index = docIndex;
+  err.error = luxir::api::build::arenaError(msg.responseArena(), info);
+}
+
+
+static void setFailureStatus(ProtoUpdateMessage& msg, size_t failed) {
+  if (failed == 0) return;
+  // ERROR only if nothing in the request had any effect.
+  bool anySuccess = failed < msg.req->docs.size() || !msg.req->delete_ids.empty();
+  msg.getResponse()->status = anySuccess ? ProtoUpdateMessage::ResponseStatus::PARTIAL
+                                         : ProtoUpdateMessage::ResponseStatus::ERROR;
+}
+
+
+static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::UndoMark& requestMark) {
+  auto& request = *msg.req;
+  const bool allOrNone = request.all_or_none;
+  const bool returnIds = request.return_ids;
+  const FieldNameMap fieldMap(request);
+
+  // first docid this request's adds will use; needed for all_or_none rollback.
+  const int32_t firstDoc = inverter.getMaxDoc();
+
+  size_t failed = 0;
+  bool aborted = false;
+  indexDocs(inverter, request, fieldMap, std::views::iota(0, (int32_t)request.docs.size()),
+      [&](int32_t docIndex, ErrorInfo&& info) {
+        failed++;
+        addDocError(msg, fieldMap, docIndex, info);
+        if (!allOrNone) return false;
+        // Undo the id map mutations of the whole request (including queued
+        // delete_ids) and mark every doc it added as deleted.  Remaining docs
+        // are not attempted.
+        inverter.rollbackTo(requestMark);
+        for (int32_t docid = firstDoc; docid <= inverter.getDoc(); docid++) {
+          inverter.deleteDoc(docid);
+        }
+        msg.clearIds();
+        msg.getResponse()->status = ProtoUpdateMessage::ResponseStatus::ERROR;
+        aborted = true;
+        return true;
+      },
+      [&](int32_t docIndex) {
+        if (returnIds) {
+          msg.addId(docId(request.docs[(size_t)docIndex], fieldMap));
+        }
+      });
+
+  if (!aborted) {
+    setFailureStatus(msg, failed);
+  }
+}
+
+
+// Releases an inverter on all paths. If an exception escapes document-level
+// recovery, the append-only segment may contain a partial value. Mark it
+// failed and send it through the flush pipeline for commit accounting and
+// cleanup, but never reuse or publish it. The message-level catch in
+// processUpdateBody reports the error.
+// On the success path, flushOnRelease (set once at the end of the batch)
+// asks releaseInverter to flush the inverter to a segment if it has grown past
+// its cap.
+struct ReleaseGuard {
+  IndexWriter& iw;
+  Inverter& inverter;
+  bool flushOnRelease = false;
+  std::exception_ptr failure = nullptr;
+  ~ReleaseGuard() {
+    if (failure != nullptr) {
+      inverter.fail(failure);
+      iw.releaseInverter(inverter, true);
+      return;
+    }
+    iw.releaseInverter(inverter, flushOnRelease);
+  }
+};
+
+
+// Counts the messages inside handle() so concurrent large messages share the
+// arena instead of each splitting to its full width.
+struct InHandle {
+  std::atomic<int32_t>& count;
+  int32_t value;
+  explicit InHandle(std::atomic<int32_t>& c) : count(c), value(c.fetch_add(1) + 1) {}
+  ~InHandle() { count.fetch_sub(1); }
+};
+
+
+// The overwrite key IdHandler will index for this doc's id, or nullopt when the
+// doc has no id or its id is rejected (the doc then fails on its own).  Mirrors
+// IdHandler::index: string and bytes pass through, other scalars render through
+// the id field type, and the result is fitted to the term limit.  Rendered or
+// hashed keys are kept alive in `owned`; others view the request.
+static std::optional<std::string_view> overwriteKey(const luxir::api::Map& doc, const FieldNameMap& fieldMap,
+                                                    const FieldType& idType, std::deque<std::string>& owned) {
+  const IndexVal* val = nullptr;
+  for (const auto& [name, valView] : doc.fields) {
+    if (fieldMap.resolve(name) == std::string_view("id")) {
+      val = &*valView;  // last "id" wins, as in docId()
+    }
+  }
+  if (val == nullptr || coerce::isNull(*val)) return std::nullopt;
+
+  std::string_view id;
+  if (const auto* s = std::get_if<std::string_view>(&val->kind)) {
+    id = *s;
+  } else if (const auto* bin = std::get_if<BytesView>(&val->kind)) {
+    id = std::string_view((const char*)bin->data(), bin->size());
+  } else {
+    char buf[coerce::TEXT_BUF_SIZE];
+    try {
+      id = owned.emplace_back(idType.coerceTerm(*val, "id", buf));
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+  PackedTerm::TermBuffer scratch;
+  auto fitted = PackedTerm::fitTerm(idType.longTerms, id, scratch);
+  if (!fitted) return std::nullopt;
+  // A hashed key lives in scratch; a passthrough or truncated one views id.
+  if (fitted->data() < id.data() || fitted->data() >= id.data() + id.size()) {
+    return owned.emplace_back(*fitted);
+  }
+  return fitted;
+}
+
+
+// Assigns every doc to one of nChunks chunks, each an ascending list of request
+// positions.  Chunks are contiguous ranges, except that with overwrite every doc
+// sharing an id joins the chunk of that id's first occurrence.  All docs of one
+// request share one updateVersion, and a cross-inverter overwrite delete only
+// supersedes STRICTLY lower versions, so two copies of an id in different
+// inverters would both stay live.  In one inverter IdHandler resolves them in
+// request order exactly as the unsplit path does, including a failed later copy
+// leaving the earlier one in place.
+static std::vector<std::vector<int32_t>> partitionDocs(const luxir::api::UpdateRequest& request,
+                                                       const FieldNameMap& fieldMap, const Schema& schema,
+                                                       int32_t nChunks) {
+  const int32_t nDocs = (int32_t)request.docs.size();
+  const int32_t chunkSize = (nDocs + nChunks - 1) / nChunks;
+  std::vector<std::vector<int32_t>> chunks((size_t)nChunks);
+  for (auto& chunk : chunks) chunk.reserve((size_t)chunkSize);
+
+  const FieldType* idType = request.allow_dups ? nullptr : schema.getFieldTypePtr("id");
+  if (idType == nullptr) {
+    for (int32_t i = 0; i < nDocs; i++) chunks[(size_t)(i / chunkSize)].push_back(i);
+    return chunks;
+  }
+
+  std::deque<std::string> owned;
+  boost::unordered_flat_map<std::string_view, int32_t> chunkOfId;
+  chunkOfId.reserve((size_t)nDocs);
+  for (int32_t i = 0; i < nDocs; i++) {
+    int32_t chunk = i / chunkSize;
+    if (auto key = overwriteKey(request.docs[(size_t)i], fieldMap, *idType, owned)) {
+      chunk = chunkOfId.try_emplace(*key, chunk).first->second;
+    }
+    chunks[(size_t)chunk].push_back(i);
+  }
+  return chunks;
+}
+
+
+// Indexes one message across nChunks inverters in parallel.  Per-doc outcomes are
+// buffered per chunk (the response arena is not thread safe) and folded into the
+// response in request order afterwards, so errors, ids and status read exactly as
+// the single-inverter path would produce them.
+static void updateSplit(ProtoUpdateMessage& msg, IndexWriter& iw, const Schema& schema, int32_t nChunks) {
+  const auto& request = *msg.req;
+  const FieldNameMap fieldMap(request);
+  auto chunkDocs = partitionDocs(request, fieldMap, schema, nChunks);
+
+  struct DocFailure {
+    int32_t docIndex;
+    ErrorInfo info;
+  };
+  std::vector<std::vector<DocFailure>> failures((size_t)nChunks);
+  std::vector<uint8_t> indexed(request.docs.size(), 0);  // each slot written by one chunk only
+
+  std::vector<std::optional<ReleaseGuard>> guards((size_t)nChunks);
+  for (auto& guard : guards) {
+    Inverter& inverter = iw.obtainInverter(msg.updateVersion, msg.schema);
+    guard.emplace(iw, inverter);
+    inverter.overwrite = !request.allow_dups;
+    inverter.coerceContext.dateMathNowEpochMillis = msg.dateMathNowEpochMillis;
+  }
+
+  // delete_ids go to the first chunk's inverter.  They delete versions below this
+  // message's, so a doc re-added under a deleted id in any chunk survives, as in
+  // the single-inverter path.
+  {
+    Inverter& first = guards[0]->inverter;
+    auto requestMark = first.undoMark();
+    try {
+      for (const auto& id : request.delete_ids) {
+        first.deleteId(id, msg.updateVersion);
+      }
+    } catch (const DocumentError&) {
+      first.rollbackTo(requestMark);
+      throw;
+    } catch (...) {
+      guards[0]->failure = std::current_exception();
+      throw;
     }
   }
 
-  if (failed > 0) {
-    // ERROR only if nothing in the request had any effect.
-    bool anySuccess = failed < (int32_t)request.docs.size() || !request.delete_ids.empty();
-    msg.getResponse()->status = anySuccess ? ProtoUpdateMessage::ResponseStatus::PARTIAL
-                                           : ProtoUpdateMessage::ResponseStatus::ERROR;
+  // Isolated so a worker waiting here only runs this message's chunks, never an
+  // unrelated flow-graph task (a commit or flush body) that could wait on this
+  // message in turn.  A segment-fatal failure in one chunk fails only that chunk's
+  // inverter; parallel_for cancels unstarted chunks and rethrows it here.
+  oneapi::tbb::this_task_arena::isolate([&] {
+    oneapi::tbb::parallel_for(
+        oneapi::tbb::blocked_range<int32_t>(0, nChunks, 1),
+        [&](const oneapi::tbb::blocked_range<int32_t>& range) {
+          for (int32_t c = range.begin(); c != range.end(); c++) {
+            ReleaseGuard& guard = *guards[(size_t)c];
+            auto& chunkFailures = failures[(size_t)c];
+            try {
+              indexDocs(guard.inverter, request, fieldMap, chunkDocs[(size_t)c],
+                  [&](int32_t docIndex, ErrorInfo&& info) {
+                    chunkFailures.push_back({docIndex, std::move(info)});
+                    return false;
+                  },
+                  [&](int32_t docIndex) { indexed[(size_t)docIndex] = 1; });
+              // See the end-of-batch flush check in handle().
+              guard.flushOnRelease = guard.inverter.shouldFlush(iw.perInverterRamBytes, iw.perInverterMaxDocs);
+            } catch (...) {
+              guard.failure = std::current_exception();
+              throw;
+            }
+          }
+        },
+        oneapi::tbb::simple_partitioner());
+  });
+
+  std::vector<DocFailure> allFailures;
+  for (auto& chunk : failures) {
+    std::move(chunk.begin(), chunk.end(), std::back_inserter(allFailures));
   }
+  std::sort(allFailures.begin(), allFailures.end(),
+            [](const DocFailure& a, const DocFailure& b) { return a.docIndex < b.docIndex; });
+  for (const auto& failure : allFailures) {
+    addDocError(msg, fieldMap, failure.docIndex, failure.info);
+  }
+  if (request.return_ids) {
+    for (size_t i = 0; i < indexed.size(); i++) {
+      if (indexed[i]) msg.addId(docId(request.docs[i], fieldMap));
+    }
+  }
+  setFailureStatus(msg, allFailures.size());
+}
+
+
+// Chunks to split this message into; 1 keeps it in a single inverter.
+static int32_t splitChunks(const IndexWriter& iw, const luxir::api::UpdateRequest& request, int32_t inHandle) {
+  // all_or_none needs one undo scope to roll the whole request back.
+  if (request.all_or_none || iw.parallelUpdateChunkDocs == 0) return 1;
+  size_t byDocs = request.docs.size() / iw.parallelUpdateChunkDocs;
+  if (byDocs < 2) return 1;
+  int32_t width = oneapi::tbb::this_task_arena::max_concurrency();
+  int32_t share = std::max(1, width / std::max(1, inHandle));
+  return (int32_t)std::min<size_t>({byDocs, (size_t)share, (size_t)std::max(1, iw.parallelUpdateMaxChunks)});
 }
 
 
@@ -192,35 +443,21 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
     return;
   }
 
+  InHandle inHandle(iw.updatesInHandle);
+  int32_t nChunks = splitChunks(iw, *req, inHandle.value);
+  if (nChunks > 1) {
+    auto pinned = this->schema ? this->schema : iw.getSchema();
+    updateSplit(*this, iw, *pinned, nChunks);
+    return;
+  }
+
   Inverter& inverter = iw.obtainInverter(this->updateVersion, this->schema);
+  ReleaseGuard releaseGuard{iw, inverter};
   inverter.overwrite = !req->allow_dups;
   inverter.coerceContext.dateMathNowEpochMillis = dateMathNowEpochMillis;
 
   // Captured before deletes are queued so an all_or_none failure rolls them back too.
   auto requestMark = inverter.undoMark();
-
-  // Releases the inverter on all paths. If an exception escapes document-level
-  // recovery, the append-only segment may contain a partial value. Mark it
-  // failed and send it through the flush pipeline for commit accounting and
-  // cleanup, but never reuse or publish it. The message-level catch in
-  // processUpdateBody reports the error.
-  // On the success path, flushOnRelease (set once at the end of the batch below)
-  // asks releaseInverter to flush the inverter to a segment if it has grown past
-  // its cap.
-  struct ReleaseGuard {
-    IndexWriter& iw;
-    Inverter& inverter;
-    bool flushOnRelease = false;
-    std::exception_ptr failure = nullptr;
-    ~ReleaseGuard() {
-      if (failure != nullptr) {
-        inverter.fail(failure);
-        iw.releaseInverter(inverter, true);
-        return;
-      }
-      iw.releaseInverter(inverter, flushOnRelease);
-    }
-  } releaseGuard{iw, inverter};
 
   // Delete validation is recoverable and has no partial postings to discard.
   // Roll back this request's queued ids on rejection, preserving documents
@@ -247,17 +484,18 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
     }
 
     // Size-based auto-flush is checked ONCE here, at the end of the batch - never
-    // mid-request.  A whole update message stays in a single inverter, which keeps
-    // within-request id overwrites correct: IdHandler resolves a repeated id in
-    // memory by directly deleting the superseded doc.  Splitting a request across a
-    // mid-flush segment boundary would break that - every doc in one message shares
-    // one updateVersion, and a cross-segment overwrite delete only supersedes docs
-    // with a STRICTLY lower version (finishCommitBody gates on
-    // seg.minVersion < maxDeleteVersion), so a duplicate id straddling the split
-    // could not delete its earlier, same-version copy and both would stay live.
-    // Keeping the request whole avoids that.  The cost: a single message larger than
-    // the cap is not bounded here (bound those with a max-message-size reject -
-    // separate follow-up).  A non-stop stream is byte-batched into many messages that
+    // mid-request.  The docs this message put in one inverter stay in it, which
+    // keeps within-request id overwrites correct: IdHandler resolves a repeated id
+    // in memory by directly deleting the superseded doc.  Splitting the copies of an
+    // id across a mid-flush segment boundary (or across inverters) would break that -
+    // every doc in one message shares one updateVersion, and a cross-segment overwrite
+    // delete only supersedes docs with a STRICTLY lower version (finishCommitBody
+    // gates on seg.minVersion < maxDeleteVersion), so a duplicate id straddling the
+    // split could not delete its earlier, same-version copy and both would stay live.
+    // (A large message split across inverters by updateSplit keeps every copy of an
+    // id in one chunk for this reason.)  The cost: a single message larger than the
+    // cap is not bounded here (bound those with a max-message-size reject - separate
+    // follow-up).  A non-stop stream is byte-batched into many messages that
     // accumulate in one reused idle inverter, so the per-message check still bounds
     // the streaming OOM this feature targets.
     releaseGuard.flushOnRelease = inverter.shouldFlush(iw.perInverterRamBytes, iw.perInverterMaxDocs);

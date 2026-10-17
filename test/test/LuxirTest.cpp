@@ -256,6 +256,9 @@ int main(int argc, char **argv) {
   config.log_level = "debug";  // default to debug for tests
   config.server.grpc.port = 0;  // dynamic port for test server
   config.store.checked_dir.sync = "throw";  // catch missing fsyncs in tests
+  // Tests build segment layouts one update message per segment; ParallelUpdateTest
+  // turns request splitting on where it is under test.
+  config.index.parallel_update_chunk_docs = 0;
   config.addOptions(app);
 
   bool help = false;

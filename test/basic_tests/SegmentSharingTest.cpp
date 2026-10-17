@@ -51,6 +51,7 @@ protected:
     LuxirConfig config;
     config.store.backend = "fs";
     config.store.data_dir = path.string();
+    config.index.parallel_update_chunk_docs = 0;  // one message per segment
     node = std::make_unique<LuxirNode>(config);
     helper = std::make_unique<CollectionHelper>(*node, "share");
     writer = helper->getIndexWriter();
