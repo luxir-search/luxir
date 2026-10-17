@@ -202,6 +202,14 @@ When you know the incoming IDs are unique and do not already exist in the
 collection, set `allow_dups: true` to improve indexing performance by skipping
 ID overwrite/deduplication. This disables overwrites for that request.
 
+Overwrites cost memory until a commit: every flushed batch of documents
+indexed with IDs keeps those IDs (roughly 33 bytes plus the ID per document)
+so the next commit can delete older versions. When these batches pass
+`--indexing.max-pending-deletes-mb` (a quarter of the indexing budget by
+default), Luxir commits on its own, which also makes the data visible. A
+feed that never commits is therefore still bounded; `allow_dups: true` keeps
+no such batches.
+
 Delete by ID with no document body:
 
 ```http

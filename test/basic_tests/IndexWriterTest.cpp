@@ -254,6 +254,11 @@ TEST_F(IndexWriterTest, ramBudgetsDeriveFromNodeBudget) {
             IndexConfig::MAX_INVERTER_RAM_CAP_MB);
   EXPECT_EQ(parsed("--max-ram-mb 4096 --indexing.max-inverter-ram-mb 64").index.max_inverter_ram_mb, 64);
 
+  // Pending delete batches get a quarter of the indexing budget, none when it is unlimited.
+  EXPECT_EQ(parsed("--max-ram-mb 4096").index.max_pending_deletes_mb, 512);
+  EXPECT_EQ(parsed("--max-ram-mb 0").index.max_pending_deletes_mb, 0);
+  EXPECT_EQ(parsed("--max-ram-mb 4096 --indexing.max-pending-deletes-mb 7").index.max_pending_deletes_mb, 7);
+
   // A node built from a config that never saw normalize() still gets budgets.
   LuxirNode node{LuxirConfig{}};
   EXPECT_EQ(node.getIndexRamBudget().totalBytes(), autoConfig.index.max_ram_mb * 1024 * 1024);
@@ -2208,6 +2213,87 @@ TEST_F(IndexWriterTest, publicationSnapshotsDeletesAndRetainsUnflushedPrefix) {
   EXPECT_EQ(1, iw->snapshots.readers.getReader()->liveDocs());
   EXPECT_TRUE(iw->pendingDeletes.empty());
   EXPECT_TRUE(batch.expired());
+}
+
+// Waits for the node's indexing budget to drain: the last flushed inverter is
+// destroyed shortly after its commit is observable.
+static int64_t awaitReservedDrain(IndexRamBudget& budget) {
+  for (int i = 0; i < 5000 && budget.reservedBytes() > 0; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return budget.reservedBytes();
+}
+
+// Flushed overwrite batches are charged to the indexing budget until a commit
+// retires them, and past maxPendingDeleteBytes a flush commits on its own.
+TEST_F(IndexWriterTest, pendingDeletesAreChargedAndBoundedByCommits) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  iw->mergePolicy->setMergeFactor(1000);  // no merge pins a batch
+  iw->perInverterMaxDocs = 10;
+  const int nDocs = 200;
+  auto indexRange = [&](int from) {
+    for (int i = from; i < from + nDocs; i++) {
+      ASSERT_TRUE(helper.index(flatdoc("id", "id" + std::to_string(i)), UpdateMessage::NO_COMMIT, true).success);
+    }
+    iw->updateGraph->wait_for_all();
+  };
+
+  iw->maxPendingDeleteBytes = 0;
+  indexRange(0);
+  int64_t unbounded = iw->getPendingDeleteBytes();
+  ASSERT_GT(unbounded, 0);
+  EXPECT_EQ(unbounded, budget.deleteBatchBytesCount());
+  EXPECT_EQ(0u, iw->getPendingDeleteCommits());
+  helper.commit();
+  EXPECT_EQ(0, iw->getPendingDeleteBytes());
+  EXPECT_EQ(0, budget.deleteBatchBytesCount());
+  EXPECT_EQ(0, awaitReservedDrain(budget));
+
+  iw->maxPendingDeleteBytes = unbounded / 8;
+  indexRange(nDocs);
+  EXPECT_GT(iw->getPendingDeleteCommits(), 0u);
+  EXPECT_LT(iw->getPendingDeleteBytes(), unbounded / 2);
+  helper.commit();
+  EXPECT_EQ(0, iw->getPendingDeleteBytes());
+  EXPECT_EQ(0, budget.deleteBatchBytesCount());
+  EXPECT_EQ(0, awaitReservedDrain(budget));
+  EXPECT_EQ(2 * nDocs, iw->snapshots.readers.getReader()->liveDocs());
+}
+
+// allow_dups keeps no delete batches, and all_or_none (including a voided
+// batch) is unaffected by the trigger.
+TEST_F(IndexWriterTest, pendingDeletesTriggerSkipsAllowDupsAndKeepsAllOrNone) {
+  using namespace luxir::test;
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->perInverterMaxDocs = 4;
+  iw->maxPendingDeleteBytes = 1;
+  for (int i = 0; i < 40; i++) {
+    ASSERT_TRUE(helper.index(flatdoc("id", "dup" + std::to_string(i)), UpdateMessage::NO_COMMIT, false).success);
+  }
+  iw->updateGraph->wait_for_all();
+  EXPECT_EQ(0, iw->getPendingDeleteBytes());
+  EXPECT_EQ(0u, iw->getPendingDeleteCommits());
+
+  for (int i = 0; i < 10; i++) {
+    CollectionHelper::UpdateBuilder b;
+    b.add(flatdoc("id", "a" + std::to_string(i)));
+    b.add(flatdoc("id", "b" + std::to_string(i)));
+    if (i % 3 == 0) b.add(flatdoc("id", "bad" + std::to_string(i), "no_such_field", "boom"));
+    b.overwrite(true);
+    b.allOrNone(true);
+    EXPECT_EQ(i % 3 != 0, helper.submit(b).success);
+  }
+  iw->updateGraph->wait_for_all();
+  EXPECT_GT(iw->getPendingDeleteCommits(), 0u);
+  helper.commit();
+  EXPECT_EQ(0, iw->getPendingDeleteBytes());
+  EXPECT_EQ(40 + 2 * 6, iw->snapshots.readers.getReader()->liveDocs());
 }
 
 TEST_F(IndexWriterTest, failedDeleteApplicationRetainsDeletesForRetry) {

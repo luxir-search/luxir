@@ -902,6 +902,31 @@ void IndexWriter::autoCommitFinished() {
   }
 }
 
+void IndexWriter::retirePendingDeletesLocked(const std::shared_ptr<const SortedDeletes>& batch) {
+  if (pendingDeletes.deletes.erase(batch) != 0) {
+    pendingDeleteBytes -= (int64_t)batch->ramGuard.size();
+    assert(pendingDeleteBytes >= 0);
+  }
+}
+
+// Bounds flushed delete batches without client commits: retiring them is a
+// commit's job, so submit one.  One in flight at a time; a commit slower than
+// the flush rate degrades to back-to-back commits, never a queue of them.  The
+// next over-threshold flush after completion re-triggers, so a failing commit
+// is paced by flushes rather than retried in a loop.
+void IndexWriter::commitForPendingDeletes() noexcept {
+  if (deletesCommitInFlight.exchange(true, std::memory_order_acq_rel)) return;
+  try {
+    INDEX_DEBUG("commitForPendingDeletes: submitting commit");
+    commit([this] { deletesCommitInFlight.store(false, std::memory_order_release); },
+           UpdateMessage::COMMIT);
+    deletesCommits.fetch_add(1, std::memory_order_relaxed);
+  } catch (const std::exception& e) {
+    LOG_ERROR("pending-deletes commit submit failed: {}", e.what());
+    deletesCommitInFlight.store(false, std::memory_order_release);
+  }
+}
+
 std::optional<CommitId> IndexWriter::commit(UpdateMessage::CommitType commitType) {
   class BlockingUpdateMessage : public UpdateMessage {
   public:
@@ -1121,9 +1146,17 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
 
   std::unique_ptr<Inverter> inverterPtr;
   std::shared_ptr<const SortedDeletes> deletes;
+  int64_t deleteBytes = 0;
   if (!aborted && inverter.hasDeletions()) {
+    // The batch outlives the inverter (whose guard releases at its
+    // destruction below), so it takes its own reservation until a commit
+    // retires it.  Briefly double counted, never uncounted.
+    auto& batch = *inverter.sortedDeletes;
+    deleteBytes = (int64_t)batch.memSize();
+    batch.ramGuard = indexRamBudget->forceAcquireDeleteBatch(deleteBytes);
     deletes = std::move(inverter.sortedDeletes);
   }
+  bool commitForDeletes = false;
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
@@ -1135,7 +1168,13 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     // The delete-set insertion may allocate. Holding indexMutex across both
     // registrations keeps segment snapshots consistent with their deletes.
     if (success) segInfos.reserve(segInfos.size() + 1);
-    if (deletes) pendingDeletes.deletes.insert(std::move(deletes));
+    if (deletes) {
+      pendingDeletes.deletes.insert(std::move(deletes));
+      pendingDeleteBytes += deleteBytes;
+      // A flush that is part of a commit is retired by that commit.
+      commitForDeletes = maxPendingDeleteBytes > 0 && pendingDeleteBytes > maxPendingDeleteBytes
+          && inverter.commitInfo == nullptr;
+    }
 
     // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
     std::pair<SegMap::iterator, bool> iter;
@@ -1181,6 +1220,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   // Destroy before removing an aborted segment's files.
   uint64_t segId = inverterPtr->getPostingsWriter().segId;
   inverterPtr.reset();
+  if (commitForDeletes) commitForPendingDeletes();
   if (aborted) {
     try {
       dir.deletePrefix(Postings::getIndexFileNamePrefix(segId));
@@ -1455,7 +1495,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
       // more while deletes were applied. Merge catch-up owns its own references.
       for (const auto& batch : commitDeletes.deletes) {
         if (batch->getLargestVersion() <= msg.updateVersion) {
-          pendingDeletes.deletes.erase(batch);
+          retirePendingDeletesLocked(batch);
         }
       }
     }
@@ -2686,6 +2726,7 @@ void IndexWriter::testDeleteAllData() {
     activeVectorOverlayNames.clear();
     lastMergeFailure.reset();
     pendingDeletes.clear();
+    pendingDeleteBytes = 0;
     durableUpdateVersion = 0;
     nextManifestGen = 0;
     manifestNames.clear();
@@ -2955,6 +2996,9 @@ void IndexWriter::applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData&
   // Merge commit-level deletes once - reused across all segments
   std::vector<SortedDeletes::Entry> mergedBuf;
   SortedDeletes::EntrySpan commitDeletes = mergeDeleteSpans(commitSpans, mergedBuf);
+  // Transient, but sized by every pending id: count it against the budget.
+  auto mergedGuard = indexRamBudget->forceAcquire(
+      (int64_t)(mergedBuf.capacity() * sizeof(SortedDeletes::Entry)));
 
   // Apply deletes to segments in parallel.  Each task writes new liveDocs
   // filenames into its own segment's unsyncedFiles (single owner per task, no
@@ -2998,6 +3042,9 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     }
     deleteSpan = mergeDeleteSpans(allSpans, segMergedBuf);
   }
+  // Transient, but sized by every pending id: count it against the budget.
+  auto segMergedGuard = indexRamBudget->forceAcquire(
+      (int64_t)(segMergedBuf.capacity() * sizeof(SortedDeletes::Entry)));
 
   if (deleteSpan.empty()) {
     return;

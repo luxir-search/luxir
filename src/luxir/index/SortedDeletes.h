@@ -9,6 +9,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
+#include "luxir/index/IndexRamBudget.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/TermValHash.h"
 #include "luxir/util/luxir_util.h"
@@ -54,6 +55,10 @@ private:
   uint64_t maxVersion_ = 0;
 
 public:
+  // Holds memSize() against the indexing budget from flush until the last
+  // reference (pending commit or merge catch-up) drops.
+  IndexRamBudget::Guard ramGuard;
+
   SortedDeletes() = default;
   SortedDeletes(std::unique_ptr<MemPool> pool) : pool_(std::move(pool)) {}
 
@@ -78,6 +83,13 @@ public:
   }
 
   std::span<const EntrySpan> lists() const { return lists_; }
+
+  /// Bytes owned by this batch: the id pool plus the detached hash tables.
+  size_t memSize() const {
+    size_t bytes = pool_ ? pool_->capacity() : 0;
+    for (const auto& table : ownedTables_) bytes += table.get_deleter().bytes;
+    return bytes;
+  }
 
   uint64_t getLargestVersion() const { return maxVersion_; }
   uint64_t getSmallestVersion() const { return minVersion_; }

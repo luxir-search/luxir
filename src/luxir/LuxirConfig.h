@@ -100,6 +100,11 @@ struct IndexConfig {
   // Resolved by LuxirConfig::resolveRamBudgets().
   int64_t max_ram_mb = -1;
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
+  // Flushed delete-by-id batches (kept for overwrite-by-id until a commit
+  // retires them) past this many MiB per collection trigger a commit.
+  // -1 = auto: 25% of max_ram_mb (0 when that is unlimited).  0 = never.
+  // Resolved by LuxirConfig::resolveRamBudgets().
+  int64_t max_pending_deletes_mb = -1;
   int merge_factor = 10;
 };
 

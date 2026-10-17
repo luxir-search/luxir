@@ -288,6 +288,7 @@ struct StorageRamStats { uint64_t used_bytes = 0; uint64_t limit_bytes = 0; };
 struct IndexRamStats {
   uint64_t limit_bytes = 0;
   uint64_t reserved_bytes = 0;
+  uint64_t pending_deletes_bytes = 0;
 };
 struct ArenaStats {
   uint64_t allocated_bytes = 0;

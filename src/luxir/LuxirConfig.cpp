@@ -187,6 +187,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Min idle-inverter size (MiB) to flush when over the shared indexing RAM cap")
       ->default_val(index.pressure_flush_floor_mb)
       ->check(CLI::PositiveNumber);
+  app.add_option("--indexing.max-pending-deletes-mb", index.max_pending_deletes_mb,
+                 "Flushed overwrite/delete-by-id batches (MiB) awaiting a commit before one is "
+                 "triggered (0 = never)")
+      ->check(CLI::NonNegativeNumber)
+      ->default_str("25% of --indexing.max-ram-mb");
 
   app.add_option("--indexing.max-request-body", ingest.max_request_body,
                  "Max buffered (non-streaming) request body; oversized -> 413 (e.g. 32MB)")
@@ -247,6 +252,14 @@ void LuxirConfig::resolveRamBudgets() {
     index.max_inverter_ram_mb =
         index.max_ram_mb > 0 ? (std::min)(index.max_ram_mb, IndexConfig::MAX_INVERTER_RAM_CAP_MB)
                              : IndexConfig::MAX_INVERTER_RAM_CAP_MB;
+  }
+
+  if (index.max_pending_deletes_mb < 0) {
+    // Pending delete batches are charged to the indexing budget but cannot be
+    // shed by flushing; a quarter keeps most of it for inverters.  At least
+    // 1 MiB so a tiny budget still commits rather than never.
+    index.max_pending_deletes_mb =
+        index.max_ram_mb > 0 ? (std::max)((int64_t)1, index.max_ram_mb / 4) : 0;
   }
 }
 

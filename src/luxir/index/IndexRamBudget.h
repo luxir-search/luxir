@@ -192,6 +192,13 @@ public:
     IndexRamBudget* budget = nullptr;
     int64_t bytes = 0;
     bool draining = false;
+    // Also counted in deleteBatchBytes (see forceAcquireDeleteBatch).
+    bool deleteBatch = false;
+
+    Guard(IndexRamBudget& budget, int64_t bytes, bool deleteBatch)
+      : budget(&budget), bytes(bytes), deleteBatch(deleteBatch) {}
+
+    friend class IndexRamBudget;
 
   public:
     Guard() = default;
@@ -200,10 +207,12 @@ public:
     Guard& operator=(const Guard&) = delete;
 
     Guard(Guard&& other) noexcept
-      : budget(other.budget), bytes(other.bytes), draining(other.draining) {
+      : budget(other.budget), bytes(other.bytes), draining(other.draining),
+        deleteBatch(other.deleteBatch) {
       other.budget = nullptr;
       other.bytes = 0;
       other.draining = false;
+      other.deleteBatch = false;
     }
 
     Guard& operator=(Guard&& other) noexcept {
@@ -212,9 +221,11 @@ public:
         budget = other.budget;
         bytes = other.bytes;
         draining = other.draining;
+        deleteBatch = other.deleteBatch;
         other.budget = nullptr;
         other.bytes = 0;
         other.draining = false;
+        other.deleteBatch = false;
       }
       return *this;
     }
@@ -223,17 +234,19 @@ public:
 
     void release() noexcept {
       if (budget != nullptr) {
+        if (deleteBatch) budget->deleteBatchBytes.fetch_sub(bytes, std::memory_order_relaxed);
         budget->releaseReservation(bytes, draining);
         budget = nullptr;
         bytes = 0;
         draining = false;
+        deleteBatch = false;
       }
     }
 
     bool tryResize(int64_t newBytes) {
       assert(newBytes >= 0);
       assert(budget != nullptr);
-      assert(!draining);
+      assert(!draining && !deleteBatch);
       if (!budget->tryResize(bytes, newBytes)) return false;
       bytes = newBytes;
       return true;
@@ -246,7 +259,7 @@ public:
     bool forceResize(int64_t newBytes) {
       assert(newBytes >= 0);
       assert(budget != nullptr);
-      assert(!draining);
+      assert(!draining && !deleteBatch);
       bool over = budget->forceAdjust(newBytes - bytes);
       bytes = newBytes;
       return over;
@@ -297,6 +310,9 @@ public:
 private:
   std::atomic<int64_t> total = 0;
   std::atomic<int64_t> reserved = 0;
+  // The part of reserved held by flushed delete-by-id batches (a subset, for
+  // stats only: they are ordinary reservations for admission and pressure).
+  std::atomic<int64_t> deleteBatchBytes = 0;
   // Relaxed mirror of "any registered demand entry has nonzero bytes",
   // maintained under registryMutex, read lock-free by pressurePossible().
   std::atomic<int32_t> nonzeroDemands = 0;
@@ -525,6 +541,16 @@ public:
     return Guard(*this, bytes);
   }
 
+  // A flushed delete-by-id batch (SortedDeletes) waiting for a commit to retire
+  // it.  It is not reclaimable by flushing, so it overdraws like forceAcquire
+  // and is reported separately; the writer bounds it by committing.
+  Guard forceAcquireDeleteBatch(int64_t bytes) {
+    assert(bytes >= 0);
+    deleteBatchBytes.fetch_add(bytes, std::memory_order_relaxed);
+    forceAdjust(bytes);
+    return Guard(*this, bytes, true);
+  }
+
   void release(int64_t bytes) noexcept {
     assert(bytes >= 0);
     releaseReservation(bytes, false);
@@ -607,6 +633,10 @@ public:
 
   int64_t reservedBytes() const {
     return reserved.load(std::memory_order_relaxed);
+  }
+
+  int64_t deleteBatchBytesCount() const {
+    return deleteBatchBytes.load(std::memory_order_relaxed);
   }
 
   int64_t drainingBytesCount() const {
