@@ -99,7 +99,7 @@ locations, browse `src/luxir/<area>/`.
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
    - `VectorReader`: reads column-stored vectors for exact flat KNN
-   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF+PQ aux overlays for ANN
+   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (RaBitQ or PQ) aux overlays for ANN
    - Reuses column storage for exact search, cosine raw-column normalization, and full-precision rescoring
    - See [../guide/vector-search.md](../guide/vector-search.md) for the user contract (query knobs, scoring, recall) and [../design/vector-search.md](../design/vector-search.md) for the overlay/build/query internals
 

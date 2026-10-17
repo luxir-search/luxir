@@ -170,6 +170,9 @@ defaults and constraints are described in the comments and guides.
 - [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror)
 - [`Val`](#message-luxir.val)
 - [`Vector`](#message-luxir.vector)
+- [`VectorAnnDef`](#message-luxir.vectoranndef)
+- [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq)
+- [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq)
 - [`Warning`](#message-luxir.warning)
 - [`WildcardQuery`](#message-luxir.wildcardquery)
 
@@ -844,6 +847,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.defaults"></a>[`defaults`](#field-luxir.fielddef.defaults) | 14 | [`FieldDefaults`](#message-luxir.fielddefaults) | singular | default search and value representations |
 | <a id="field-luxir.fielddef.normalizer"></a>[`normalizer`](#field-luxir.fielddef.normalizer) | 15 | [`NormalizerDef`](#message-luxir.normalizerdef) | singular | whole-value STRING normalization |
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
+| <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 20 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1884,6 +1888,43 @@ A dense vector value. Dimensionality is the number of elements in f32.v.
 |---|---|---|---|---|
 | <a id="field-luxir.vector.f32"></a>[`f32`](#field-luxir.vector.f32) | 1 | [`ArrFloat`](#message-luxir.arrfloat) | oneof [`kind`](#oneof-luxir.vector.kind) |  |
 
+<a id="message-luxir.vectoranndef"></a>
+
+### luxir.VectorAnnDef
+
+Approximate nearest-neighbor index settings for a VECTOR field: the codec and parameters of the per-segment IVF overlays built at commit and merge. Read when an overlay is built; each overlay records what it was built with, so a change applies to segments built afterwards. See docs/guide/vector-search.md#index-settings.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.vectoranndef.codec"></a>[`codec`](#field-luxir.vectoranndef.codec) | 1 | [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec) | optional | absent: rabitq |
+| <a id="field-luxir.vectoranndef.nlist"></a>[`nlist`](#field-luxir.vectoranndef.nlist) | 2 | `int32` | optional | IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors), capped at 4096. Clamped to the segment's vector count. |
+| <a id="field-luxir.vectoranndef.rabitq"></a>[`rabitq`](#field-luxir.vectoranndef.rabitq) | 3 | [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq) | singular | codec rabitq only |
+| <a id="field-luxir.vectoranndef.pq"></a>[`pq`](#field-luxir.vectoranndef.pq) | 4 | [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq) | singular | codec pq only |
+
+<a id="message-luxir.vectoranndef.pq"></a>
+
+### luxir.VectorAnnDef.Pq
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.vectoranndef.pq.m"></a>[`m`](#field-luxir.vectoranndef.pq.m) | 1 | `int32` | optional | Sub-quantizers; must divide dims. Absent or 0: the largest divisor of dims up to 32 that leaves at least 4 dimensions per sub-quantizer. |
+| <a id="field-luxir.vectoranndef.pq.bits"></a>[`bits`](#field-luxir.vectoranndef.pq.bits) | 2 | `int32` | optional | bits per sub-quantizer code, 1..8. Absent: 8. |
+
+<a id="message-luxir.vectoranndef.rabitq"></a>
+
+### luxir.VectorAnnDef.RaBitQ
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.vectoranndef.rabitq.bits"></a>[`bits`](#field-luxir.vectoranndef.rabitq.bits) | 1 | `int32` | optional | Bits per dimension, 1..9. Absent: 1. Above 1 (extended RaBitQ) a 1-bit pass prunes with the error bound and survivors are re-estimated with the extra bits. |
+| <a id="field-luxir.vectoranndef.rabitq.query_bits"></a>[`query_bits`](#field-luxir.vectoranndef.rabitq.query_bits) | 2 | `int32` | optional | Query quantization bits, 0..8; 0 scans with the float query. Absent: 4. Read at search time, so a change applies to existing overlays. |
+
 <a id="message-luxir.warning"></a>
 
 ### luxir.Warning
@@ -1930,6 +1971,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`SelectionMode`](#enum-luxir.selectionmode)
 - [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
+- [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec)
 - [`VectorMetric`](#enum-luxir.vectormetric)
 
 <a id="enum-luxir.calendargap.unit"></a>
@@ -2168,6 +2210,17 @@ How facet selections filter the enclosing TopDocs results and its sub-operations
 | <a id="value-luxir.updateresponse.status.ok"></a>[`OK`](#value-luxir.updateresponse.status.ok) | 1 | the update was successful |
 | <a id="value-luxir.updateresponse.status.partial"></a>[`PARTIAL`](#value-luxir.updateresponse.status.partial) | 2 | part of the request took effect, part failed (see errors) |
 | <a id="value-luxir.updateresponse.status.error"></a>[`ERROR`](#value-luxir.updateresponse.status.error) | 3 | The request failed. If error is unset, the failure was per-document (see errors) and the request had no visible effect on the index. If error is set, the failure was request-level (e.g. commit pipeline) and the effect of individual documents is indeterminate beyond what errors lists. |
+
+<a id="enum-luxir.vectoranndef.codec"></a>
+
+### luxir.VectorAnnDef.Codec
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.vectoranndef.codec.rabitq"></a>[`RABITQ`](#value-luxir.vectoranndef.codec.rabitq) | 0 | IVF + RaBitQ (randomly rotated, centroid-relative bit codes) |
+| <a id="value-luxir.vectoranndef.codec.pq"></a>[`PQ`](#value-luxir.vectoranndef.codec.pq) | 1 | IVF + product quantization |
 
 <a id="enum-luxir.vectormetric"></a>
 

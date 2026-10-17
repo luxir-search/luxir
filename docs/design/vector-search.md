@@ -43,24 +43,128 @@ current public API cannot remove an existing per-segment overlay. The writer
 has an internal drop/rebuild seam; exposing a safe collection-level rebuild is
 future work.
 
+## Codecs
+
+Every overlay is an IVF index: k-means centroids route a query to inverted
+lists, and the lists hold one compact code per vector. The field's schema
+`ann` settings pick the code (see
+[guide/vector-search.md](../guide/vector-search.md#index-settings)); the
+builder reads them when it builds an overlay and records the codec and its
+build parameters in the overlay's `VectorAuxMeta`, so the reader and query
+path never consult the schema to interpret an overlay. A codec change applies
+to overlays built afterwards. Segments with different codecs for one field are
+supported, not merely tolerated: each segment engine is constructed from its
+own overlay's metadata, both codecs share the IVF list machinery, and the
+cross-segment list ranking compares centroid distances that are in the same
+metric space for both (see rotation below). RaBitQ query quantization
+(`query_bits`) is not an index property; it is read from the current schema at
+search time.
+
+**IVF+RaBitQ** (default, `ENGINE_IVFRABITQ`) uses FAISS `IndexIVFRaBitQ`.
+RaBitQ (Gao and Long, SIGMOD 2024) stores, per vector, the sign bits of its
+residual from the list centroid plus two float factors, and estimates
+distances from the code with a proven error bound; extended RaBitQ adds
+magnitude bits per dimension. There is no codebook to train: building trains
+only the IVF centroids, unlike PQ, which retrains per-subspace k-means
+codebooks on every segment build and merge.
+
+The error bound and unbiasedness assume the codes are taken in a randomly
+rotated space. FAISS does not rotate internally: `RaBitQuantizer.h` states "It
+is assumed that the Random Matrix Rotation is performed externally", and the
+FAISS RaBitQ benchmark and tests wrap the index in
+`IndexPreTransform(RandomRotationMatrix, ...)` themselves. Luxir therefore
+builds a `RandomRotationMatrix` (orthonormal, d x d, fixed seed), rotates the
+training sample and every added vector, and serializes the header as the
+standard `IndexPreTransform(rotation, IndexIVFRaBitQ)`. The reader takes the
+wrapper apart: it keeps the IVF index (whose lists it serves from the mmapped
+file as usual) and interns the rotation in a process-wide table keyed by
+content. Because every overlay of a given dims uses the same seed, all of them
+share one matrix in RAM (d^2 floats, 2.25 MiB at 768 dims), and a query is
+rotated once per distinct matrix rather than once per segment. The rotation is
+orthonormal, so L2, inner product, and cosine (unit vectors stay unit) are
+preserved, and centroid distances stay comparable across rotated and
+unrotated segments in the global list ranking. On one real embedding corpus
+the rotation made no measurable recall difference (the embeddings are close to
+isotropic already); it is kept because the guarantee, not that corpus, is what
+the codec is chosen for.
+
+RaBitQ's estimated L2 distance is unbiased and can be slightly negative for
+near vectors, so the approximate L2 score conversion clamps distances at zero
+(1 / (1 + d) would otherwise turn a negative estimate into a worse score).
+
+FAISS also ships `IndexIVFRaBitQFastScan`, which block-packs codes 32 vectors
+at a time for SIMD lookups and measured about 1.5 to 2 times faster list scans
+in a standalone FAISS test. It is not used yet: its lists are
+`BlockInvertedLists` (padded 32-vector blocks with per-block factor regions),
+which needs a second mmapped list layout; its `search_preassigned` rejects
+the per-call stats sink the parallel scan uses; and the vendored FAISS 1.14.3
+install omits `faiss/utils/popcount.h`, which its header includes, so it does
+not compile against the installed headers without patching the port. The
+codec is recorded per overlay, so FastScan can arrive as another engine id.
+
+**IVF+PQ** (`ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
+sub-quantizers of `pq.bits` bits each, unrotated, exactly as before.
+
+### Codec measurements
+
+`Tuning/BM_VectorAnnDataset` (test/bench/VectorKnnBM.cpp) indexes a real
+corpus through the normal request path into 4 segments, builds every overlay
+with the production policy, and measures recall@10 of 200 held-out queries
+against the exact path plus serial single-query latency (gcc-release,
+i7-14700KF, shared with other builds). Two corpora:
+
+- 485,659 Cohere `multilingual-22-12` embeddings of Simple English Wikipedia
+  (768 dims, cosine).
+- SIFT1M (1,000,000 x 128, L2).
+
+At 768 dims, recall with 1-bit RaBitQ is set by the probed lists alone: 1, 2,
+and 4 bits all give 0.893 / 0.911 / 0.960 / 0.986 at nprobe default / 32 / 64
+/ 128, at any rescore pool. PQ at its default `m=32` (32 code bytes) never
+passed 0.88, even with 500 rescored candidates; PQ with `m=96` (96 bytes,
+close to RaBitQ's 104) reached 0.886 / 0.902 / 0.950 / 0.970. FAISS's plain
+RaBitQ scanner is slower than its PQ scanner (default nprobe: 1.2 ms vs 0.66
+ms for `m=96`), which FastScan should largely close. At 128 dims (SIFT) the
+defaults are close in recall (0.953 vs 0.960 at the default nprobe; 0.989 vs
+0.999 at nprobe 128, where 2-bit RaBitQ or 500 candidates reach 0.9985 and
+0.9965) and PQ is again faster. Overlay builds, including training and
+coarse assignment, took 10.2 s (RaBitQ, 140 B/vector) vs 16.7 s (PQ m=32,
+55 B/vector) at 768 dims and 10.4 s vs 12.9 s at 128 dims. Bytes per vector
+include the 8-byte id and per-overlay headers (centroids, and for RaBitQ the
+stored d x d rotation).
+
 ## Build Policy
 
-Build policy is per segment and size based. IVF+PQ is attempted only when the
-segment has enough vectors to satisfy the training floor and enough
-`N * dims` scan cost to justify an ANN index. Segments below either threshold
-stay on the flat-over-column path. This mixed composition is normal: a query
-can use FAISS for large segments and exact column scan for small segments.
+Build policy is per segment and size based. An IVF overlay is attempted only
+when the segment has enough vectors to satisfy the codec's training floor and
+enough `N * dims` scan cost to justify an ANN index. Segments below either
+threshold stay on the flat-over-column path. This mixed composition is normal:
+a query can use FAISS for large segments and exact column scan for small
+segments.
 
-The IVF+PQ training set is a strided sample across the segment's vector
-values, not a prefix sample. This avoids training only on the oldest values
-when data inside a segment is time ordered. The builder normalizes vectors for
-FAISS when the field uses cosine and the stored column is raw.
+The floors differ per codec for different reasons. PQ must train 2^bits
+centroids per sub-quantizer, and FAISS wants 39 points per centroid, so 8-bit
+PQ needs about 10k vectors. RaBitQ trains only the IVF centroids, which 39
+points each cover from about 1.5k vectors, but training is not what binds: at
+the default effort (`nlist = sqrt(N)`, `sqrt(nlist)` lists probed at <= 128
+dims and `sqrt(dims / 128)` times that above (capped at 4x), about 194
+candidates rescored for k=10) a single-threaded standalone FAISS measurement
+found the exact scan faster than an IVF+RaBitQ probe plus rescore below
+roughly 8k vectors, at both 768 dims (4k vectors: 0.25 ms exact vs 0.61 ms
+IVF; 16k: 1.74 ms vs 0.38 ms) and 128 dims (4k: 0.04 ms vs 0.07 ms; 8k:
+0.10 ms vs 0.06 ms). The RaBitQ floor is therefore 8192 vectors, close to the
+PQ floor, and the exact path keeps small segments exact.
+
+The training set is a strided sample across the segment's vector values, not
+a prefix sample. This avoids training only on the oldest values when data
+inside a segment is time ordered. The builder normalizes vectors for FAISS
+when the field uses cosine and the stored column is raw.
 
 ## Memory-Mapped Index Layout
 
 Index data stays memory-mapped at query time. The aux file holds a small FAISS
-header (index parameters, IVF centroids, PQ codebooks) followed by the
-inverted-list payloads (PQ codes and vector ids) in Luxir's own layout; the
+header (index parameters, IVF centroids, and the PQ codebooks or RaBitQ
+rotation) followed by the inverted-list payloads (codes and vector ids) in
+Luxir's own layout; the
 reader decodes only the header into memory and serves list scans directly from
 the mmapped file. Residency of the bulk index data is therefore managed by the
 OS page cache, like the vector column itself, rather than forced into process
