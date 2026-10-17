@@ -1677,11 +1677,11 @@ message FieldDef {
 
   // VECTOR only. Keep the first truncate_dims components of every indexed
   // and query vector, for Matryoshka (MRL) embeddings whose prefixes are
-  // usable embeddings. dims stays the input dimension; the column, ANN
-  // overlays and kNN scoring use truncate_dims. COSINE fields renormalize the
-  // prefix (normalized=true is rejected); L2 and IP keep it as-is. Must be
-  // positive and < dims when dims is set. Unset inherits, falling back to 0
-  // (no truncation).
+  // usable embeddings. Requires dims (the full input dimension, which must be
+  // larger) and metric COSINE, which renormalizes the prefix; normalized=true
+  // is rejected. Inputs carry dims components, or truncate_dims for a vector
+  // already truncated. The column, ANN overlays and kNN scoring use
+  // truncate_dims. Unset inherits; 0 means no truncation.
   optional int32 truncate_dims = 17;
 }
 

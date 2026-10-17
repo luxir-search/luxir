@@ -277,14 +277,15 @@ TEST_F(VectorIndexBuilderTest, truncatedFieldBuildsOverlayOnPrefix) {
   SchemaBuilder b;
   auto& f = b.templ("_v");
   f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
-  f.metric = luxir::api::VectorMetric::L2;
+  f.metric = luxir::api::VectorMetric::COSINE;
   f.dims = 4;
   f.truncate_dims = 2;
   b.set(h.collection());
 
+  // Prefixes (1..10, 1..8); only doc42's (3, 5) points along the query's prefix.
   for (int i = 0; i < 80; i++) {
     h.index(flatdoc("id", "doc" + std::to_string(i), "embedding_v",
-                    std::vector<float>{(float)(i % 10), (float)(i / 10), (float)-i, 7.0f}));
+                    std::vector<float>{(float)(i % 10 + 1), (float)(i / 10 + 1), (float)-i, 7.0f}));
   }
   h.commit({"*"});
 
@@ -297,7 +298,7 @@ TEST_F(VectorIndexBuilderTest, truncatedFieldBuildsOverlayOnPrefix) {
 
   auto ids = runKnnIds(h.getSearchEngine(), "embedding_v", {3.0f, 5.0f, 100.0f, -100.0f}, 1,
                        /*nprobe=*/2, /*refineCandidates=*/80);
-  EXPECT_EQ(ids, std::vector<std::string>{"doc53"});
+  EXPECT_EQ(ids, std::vector<std::string>{"doc42"});
 }
 
 // One segment, one field, build all aux indexes via "*".  Verify a FAISS index file

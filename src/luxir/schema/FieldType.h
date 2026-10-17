@@ -298,9 +298,9 @@ public:
 // per-vector size; a positive inputDims_ enforces validation at index time.
 //
 // truncateDims_ > 0 keeps only the first truncateDims_ components of every
-// indexed and query vector (Matryoshka embeddings).  dims() is the stored
+// indexed and query vector (Matryoshka embeddings).  storedDims() is the
 // dimension the column, ANN overlays and kNN scoring see; inputDims() is the
-// dimension clients send.
+// declared dimension of the full vectors clients send.
 //
 // metric_ controls whether the field is searchable by kNN / ANN.  NONE means
 // storage-only; L2 / IP / COSINE pick the similarity metric for exact column
@@ -339,7 +339,7 @@ public:
   }
 
   // Stored dimension (0 = inferred per segment).
-  int32_t dims() const { return truncateDims_ > 0 ? truncateDims_ : inputDims_; }
+  int32_t storedDims() const { return truncateDims_ > 0 ? truncateDims_ : inputDims_; }
   int32_t inputDims() const { return inputDims_; }
   int32_t truncateDims() const { return truncateDims_; }
   Metric metric() const { return metric_; }
@@ -347,8 +347,9 @@ public:
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
 
   // Error text for an input vector of n components that this field cannot
-  // accept (wrong dims, or shorter than truncate_dims); empty when n is valid.
-  // With truncation, a valid input then keeps its first dims() components.
+  // accept; empty when n is valid.  With truncation, an input carries either
+  // inputDims() components or an already truncated truncateDims(), and keeps
+  // its first truncateDims().
   std::string inputDimsError(size_t n) const;
 
   // True iff this field supports kNN / ANN search.  Exact flat search can run

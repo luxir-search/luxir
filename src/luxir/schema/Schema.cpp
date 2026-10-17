@@ -214,10 +214,11 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorDims = parentResolved.vectorDims;
   }
 
-  // truncate_dims: explicit set on this field overrides; otherwise inherit.
+  // truncate_dims: explicit set on this field overrides (0 = no truncation);
+  // otherwise inherit.
   if (def.truncate_dims.has_value()) {
-    if (*def.truncate_dims <= 0) {
-      throw SchemaError("truncate_dims must be > 0 (field: " + std::string(name) + ")");
+    if (*def.truncate_dims < 0) {
+      throw SchemaError("truncate_dims must be >= 0 (field: " + std::string(name) + ")");
     }
     r.vectorTruncateDims = *def.truncate_dims;
   } else {
@@ -546,19 +547,30 @@ struct FieldCompiler {
       case FieldClass::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
         // dims may be 0, meaning "infer from first indexed value".
-        if (r.vectorTruncateDims > 0 && r.vectorDims > 0 && r.vectorTruncateDims >= r.vectorDims) {
-          throw SchemaError("truncate_dims (" + std::to_string(r.vectorTruncateDims) +
-                            ") must be < dims (" + std::to_string(r.vectorDims) +
-                            ") (field: " + std::string(name) + ")");
-        }
-        // normalized asserts unit-length input, but a truncated prefix of a
-        // unit vector is shorter than 1: cosine must renormalize after
-        // truncation, so the trust-only assertion is contradictory.
-        if (r.vectorTruncateDims > 0 && r.vectorNormalized &&
-            r.vectorMetric == VectorFieldType::METRIC_COSINE) {
-          throw SchemaError("normalized=true cannot be combined with truncate_dims on a cosine field "
-                            "(a truncated prefix is not unit length; it is renormalized on write) (field: " +
-                            std::string(name) + ")");
+        if (r.vectorTruncateDims > 0) {
+          // Every truncated input stores the same size, so the declared full
+          // dims is the only check that catches vectors from another model.
+          if (r.vectorDims == 0) {
+            throw SchemaError("truncate_dims requires dims (field: " + std::string(name) + ")");
+          }
+          if (r.vectorTruncateDims >= r.vectorDims) {
+            throw SchemaError("truncate_dims (" + std::to_string(r.vectorTruncateDims) +
+                              ") must be < dims (" + std::to_string(r.vectorDims) +
+                              ") (field: " + std::string(name) + ")");
+          }
+          // Matryoshka models compare renormalized prefixes.  Under cosine a
+          // prefix cut here and one the provider renormalized score the same;
+          // l2 and ip would score the raw prefix's shrunken length.
+          if (r.vectorMetric != VectorFieldType::METRIC_COSINE) {
+            throw SchemaError("truncate_dims requires metric cosine (field: " + std::string(name) + ")");
+          }
+          // normalized asserts unit-length input, but a truncated prefix of a
+          // unit vector is shorter than 1.
+          if (r.vectorNormalized) {
+            throw SchemaError("normalized=true cannot be combined with truncate_dims "
+                              "(a truncated prefix is not unit length; it is renormalized on write) (field: " +
+                              std::string(name) + ")");
+          }
         }
         bool normalizeOnWrite;
         normalizeOnWrite = !r.vectorNormalized && (r.hasVectorNormalizeOnWrite

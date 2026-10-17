@@ -11,11 +11,15 @@ raw-column normalization, full-precision rescoring, and creation of missing
 overlays all read or regenerate from the column.
 
 `truncate_dims` (Matryoshka prefix truncation) is applied before the column:
-the index handler validates the input length, cuts the vector to its prefix,
-then runs cosine normalization, and the query parser cuts the query vector
-the same way. `VectorFieldType::dims()` is the stored dimension and
-`inputDims()` the declared input one, so the column, overlays, exact scan
-and rescoring see only the truncated vector and need no special casing.
+the index handler validates the input length (`dims`, or `truncate_dims` for
+an already truncated vector), cuts the vector to its prefix, then runs cosine
+normalization, and the query parser cuts the query vector the same way.
+`VectorFieldType::storedDims()` is the stored dimension and `inputDims()` the
+declared input one, so the column, overlays, exact scan and rescoring see
+only the truncated vector and need no special casing. Truncation requires
+`dims`, since stored lengths can no longer tell models apart, and cosine,
+under which a prefix cut here and one renormalized by the provider score the
+same.
 
 ## Overlay Lifecycle
 

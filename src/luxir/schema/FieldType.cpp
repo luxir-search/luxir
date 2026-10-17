@@ -25,13 +25,10 @@ TextFieldType::TextFieldType(std::string_view name, int flags, std::string_view 
 }
 
 std::string VectorFieldType::inputDimsError(size_t n) const {
-  if (inputDims_ > 0 && n != (size_t)inputDims_) {
-    return std::format("expected dims={}, got {}", inputDims_, n);
-  }
-  if (truncateDims_ > 0 && n < (size_t)truncateDims_) {
-    return std::format("expected at least truncate_dims={} components, got {}", truncateDims_, n);
-  }
-  return {};
+  if (inputDims_ == 0 || n == (size_t)inputDims_) return {};
+  if (truncateDims_ == 0) return std::format("expected dims={}, got {}", inputDims_, n);
+  if (n == (size_t)truncateDims_) return {};
+  return std::format("expected dims={} or truncate_dims={}, got {}", inputDims_, truncateDims_, n);
 }
 
 }  // namespace luxir

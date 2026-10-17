@@ -6,6 +6,7 @@
 #include "gtest/gtest.h"
 
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <string>
 #include <vector>
@@ -30,24 +31,26 @@ protected:
     luxirNode->getCollection("main")->setSchema(Schema::createDefaultSchema());
   }
 
-  // `_v` (and `_vs` when multi) truncated to `truncate` of `dims` input components.
-  static void installSchema(Collection& col, api::VectorMetric metric, int32_t dims,
-                            int32_t truncate, bool multi = false) {
+  // Cosine `_v` (and `_vs` when multi) truncated to `truncate` of `dims` input components.
+  static void installSchema(Collection& col, int32_t dims, int32_t truncate, bool multi = false) {
     SchemaBuilder b;
     auto& f = b.templ(multi ? "_vs" : "_v");
     f.type = api::FieldDef::FieldClass::VECTOR;
     f.multi = multi;
-    f.metric = metric;
-    if (dims) f.dims = dims;
+    f.metric = api::VectorMetric::COSINE;
+    f.dims = dims;
     f.truncate_dims = truncate;
     b.set(col);
   }
 
-  // Schema compile error text, or "" when the def compiles.
+  // Schema compile error text for a cosine dims=8 field adjusted by setup, or
+  // "" when the def compiles.
   static std::string schemaError(void (*setup)(api::FieldDef&)) {
     SchemaBuilder b;
     auto& f = b.field("emb");
     f.type = api::FieldDef::FieldClass::VECTOR;
+    f.metric = api::VectorMetric::COSINE;
+    f.dims = 8;
     setup(f);
     try {
       b.build();
@@ -91,13 +94,13 @@ protected:
 };
 
 // Index and query vectors are both cut to the prefix: the tails disagree
-// wildly, but the prefixes match exactly, so the L2 score is 1.
+// wildly, but the prefixes match exactly, so the cosine score is 1.
 TEST_F(VectorTruncateTest, truncatesIndexAndQuery) {
   CollectionHelper h("main");
-  installSchema(h.collection(), api::VectorMetric::L2, 4, 2);
+  installSchema(h.collection(), 4, 2);
   auto* ft = dynamic_cast<VectorFieldType*>(h.collection().getSchema()->getFieldTypePtr("emb_v"));
   ASSERT_NE(nullptr, ft);
-  EXPECT_EQ(2, ft->dims());
+  EXPECT_EQ(2, ft->storedDims());
   EXPECT_EQ(4, ft->inputDims());
 
   h.index(flatdoc("id", std::string("a"), "emb_v", std::vector<float>{1, 0, 9, 9}));
@@ -115,7 +118,7 @@ TEST_F(VectorTruncateTest, truncatesIndexAndQuery) {
 // A truncated unit vector is shorter than 1; cosine renormalizes the prefix.
 TEST_F(VectorTruncateTest, cosineRenormalizesPrefix) {
   CollectionHelper h("main");
-  installSchema(h.collection(), api::VectorMetric::COSINE, 3, 2);
+  installSchema(h.collection(), 3, 2);
   float n = std::sqrt(3.0f * 3.0f + 4.0f * 4.0f + 12.0f * 12.0f);
   h.index(flatdoc("id", std::string("a"), "emb_v", std::vector<float>{3 / n, 4 / n, 12 / n}),
           UpdateMessage::COMMIT);
@@ -129,64 +132,122 @@ TEST_F(VectorTruncateTest, cosineRenormalizesPrefix) {
   EXPECT_NEAR(1.0f, hit->score, 1e-6);
 }
 
-TEST_F(VectorTruncateTest, multiValued) {
+// Full and already truncated inputs mix on index and query, and a stored
+// vector read back can be indexed again.
+TEST_F(VectorTruncateTest, acceptsFullOrTruncatedInput) {
   CollectionHelper h("main");
-  installSchema(h.collection(), api::VectorMetric::L2, 0, 2, true);
+  installSchema(h.collection(), 4, 2, true);
   h.index(flatdoc("id", std::string("a"), "emb_vs",
-                  std::vector<std::vector<float>>{{1, 0, 5}, {0, 2, 5, 6}}),
+                  std::vector<std::vector<float>>{{1, 0, 5, 5}, {0, 2}}),
           UpdateMessage::COMMIT);
 
   auto vecs = std::get<std::vector<std::vector<float>>>(storedVector(h.getSearchEngine(), "emb_vs"));
-  EXPECT_EQ((std::vector<std::vector<float>>{{1, 0}, {0, 2}}), vecs);
-  auto hit = topHit(h.getSearchEngine(), "emb_vs", {0, 2, -7});
-  ASSERT_TRUE(hit);
-  EXPECT_FLOAT_EQ(1.0f, hit->score);
+  EXPECT_EQ((std::vector<std::vector<float>>{{1, 0}, {0, 1}}), vecs);
+  for (const auto& query : {std::vector<float>{0, 2, -7, 1}, std::vector<float>{0, 2}}) {
+    auto hit = topHit(h.getSearchEngine(), "emb_vs", query);
+    ASSERT_TRUE(hit);
+    EXPECT_FLOAT_EQ(1.0f, hit->score);
+  }
+  auto r = h.index(flatdoc("id", std::string("a"), "emb_vs", vecs), UpdateMessage::COMMIT);
+  EXPECT_TRUE(r.errors.empty());
 }
 
 TEST_F(VectorTruncateTest, schemaValidation) {
-  EXPECT_EQ("", schemaError([](api::FieldDef& f) { f.dims = 8; f.truncate_dims = 4; }));
+  EXPECT_EQ("", schemaError([](api::FieldDef& f) { f.truncate_dims = 4; }));
   EXPECT_NE(std::string::npos, schemaError([](api::FieldDef& f) {
-    f.truncate_dims = 0;
-  }).find("truncate_dims must be > 0"));
+    f.truncate_dims = -1;
+  }).find("truncate_dims must be >= 0"));
   EXPECT_NE(std::string::npos, schemaError([](api::FieldDef& f) {
-    f.dims = 4;
+    f.dims = std::nullopt;
     f.truncate_dims = 4;
-  }).find("truncate_dims (4) must be < dims (4)"));
+  }).find("truncate_dims requires dims"));
   EXPECT_NE(std::string::npos, schemaError([](api::FieldDef& f) {
-    f.metric = api::VectorMetric::COSINE;
+    f.truncate_dims = 8;
+  }).find("truncate_dims (8) must be < dims (8)"));
+  EXPECT_NE(std::string::npos, schemaError([](api::FieldDef& f) {
+    f.metric = api::VectorMetric::IP;
+    f.truncate_dims = 4;
+  }).find("truncate_dims requires metric cosine"));
+  EXPECT_NE(std::string::npos, schemaError([](api::FieldDef& f) {
     f.normalized = true;
-    f.truncate_dims = 2;
+    f.truncate_dims = 4;
   }).find("normalized=true cannot be combined with truncate_dims"));
   EXPECT_NE(std::string::npos, schemaError([](api::FieldDef& f) {
     f.type = api::FieldDef::FieldClass::FLOAT;
-    f.truncate_dims = 2;
+    f.metric = std::nullopt;
+    f.dims = std::nullopt;
+    f.truncate_dims = 4;
   }).find("only valid for vector fields"));
 }
 
-// Inputs shorter than truncate_dims (or not matching a declared dims) are
-// rejected on index and query; dims-less fields accept any longer input.
-TEST_F(VectorTruncateTest, inputDimsValidation) {
+// truncate_dims: 0 turns off truncation inherited from a parent.
+TEST_F(VectorTruncateTest, zeroClearsInheritedTruncation) {
+  SchemaBuilder b;
+  auto& t = b.templ("_m4");
+  t.type = api::FieldDef::FieldClass::VECTOR;
+  t.metric = api::VectorMetric::COSINE;
+  t.dims = 8;
+  t.truncate_dims = 4;
+  auto& full = b.field("full");
+  full.parent = "_m4";
+  full.truncate_dims = 0;
+  b.field("short").parent = "_m4";
+  auto schema = b.build();
+  EXPECT_EQ(8, ((VectorFieldType*)schema->getFieldTypePtr("full"))->storedDims());
+  EXPECT_EQ(4, ((VectorFieldType*)schema->getFieldTypePtr("short"))->storedDims());
+}
+
+// Inputs must carry dims or truncate_dims components, and the whole input
+// must be finite, including the tail truncation drops.
+TEST_F(VectorTruncateTest, inputValidation) {
   CollectionHelper h("main");
-  installSchema(h.collection(), api::VectorMetric::IP, 0, 3);
-  auto r = h.index(flatdoc("id", std::string("a"), "emb_v", std::vector<float>{1, 2}));
+  installSchema(h.collection(), 5, 3);
+  float nan = std::numeric_limits<float>::quiet_NaN();
+  auto r = h.index(flatdoc("id", std::string("a"), "emb_v", std::vector<float>{1, 2, 3, 4}));
   ASSERT_EQ(1u, r.errors.size());
   EXPECT_NE(std::string::npos,
-            r.errors[0].error_message.find("expected at least truncate_dims=3 components, got 2"));
-  r = h.index(flatdoc("id", std::string("b"), "emb_v", std::vector<float>{1, 2, 3, 4, 5}),
+            r.errors[0].error_message.find("expected dims=5 or truncate_dims=3, got 4"));
+  r = h.index(flatdoc("id", std::string("a"), "emb_v", std::vector<float>{1, 2, 3, 4, nan}));
+  ASSERT_EQ(1u, r.errors.size());
+  EXPECT_NE(std::string::npos, r.errors[0].error_message.find("element 4 is not a finite float32"));
+  h.index(flatdoc("id", std::string("b"), "emb_v", std::vector<float>{1, 2, 3, 4, 5}));
+  r = h.index(flatdoc("id", std::string("c"), "emb_v", std::vector<float>{3, 2, 1}),
               UpdateMessage::COMMIT);
   EXPECT_TRUE(r.errors.empty());
 
   std::string error;
-  EXPECT_FALSE(topHit(h.getSearchEngine(), "emb_v", {1, 2}, &error));
-  EXPECT_NE(std::string::npos, error.find("expected at least truncate_dims=3 components, got 2"));
-  auto hit = topHit(h.getSearchEngine(), "emb_v", {1, 1, 1, 100});
-  ASSERT_TRUE(hit);
-  EXPECT_FLOAT_EQ(6.0f, hit->score);  // dot over the 3-component prefix
-
-  installSchema(h.collection(), api::VectorMetric::IP, 5, 3);
-  r = h.index(flatdoc("id", std::string("c"), "emb_v", std::vector<float>{1, 2, 3, 4}));
-  ASSERT_EQ(1u, r.errors.size());
-  EXPECT_NE(std::string::npos, r.errors[0].error_message.find("expected dims=5, got 4"));
   EXPECT_FALSE(topHit(h.getSearchEngine(), "emb_v", {1, 1, 1, 1}, &error));
-  EXPECT_NE(std::string::npos, error.find("expected dims=5, got 4"));
+  EXPECT_NE(std::string::npos, error.find("expected dims=5 or truncate_dims=3, got 4"));
+  EXPECT_FALSE(topHit(h.getSearchEngine(), "emb_v", {1, 2, 3, 0, nan}, &error));
+  EXPECT_NE(std::string::npos, error.find("must contain only finite values"));
+  auto hit = topHit(h.getSearchEngine(), "emb_v", {1, 2, 3, 100, -100});
+  ASSERT_TRUE(hit);
+  EXPECT_EQ("b", hit->id);
+  hit = topHit(h.getSearchEngine(), "emb_v", {3, 2, 1});
+  ASSERT_TRUE(hit);
+  EXPECT_EQ("c", hit->id);
+}
+
+// A truncated variant of a full field indexes the same input; each
+// representation is searched with the full query vector.
+TEST_F(VectorTruncateTest, truncatedVariant) {
+  CollectionHelper h("main");
+  SchemaBuilder b;
+  auto& f = b.field("emb");
+  f.type = api::FieldDef::FieldClass::VECTOR;
+  f.metric = api::VectorMetric::COSINE;
+  f.dims = 4;
+  auto& v = b.variant(f, "d2");
+  v.type = api::FieldDef::FieldClass::VECTOR;
+  v.metric = api::VectorMetric::COSINE;
+  v.dims = 4;
+  v.truncate_dims = 2;
+  b.set(h.collection());
+
+  h.index(flatdoc("id", std::string("a"), "emb", std::vector<float>{1, 0, 9, 9}));
+  h.index(flatdoc("id", std::string("b"), "emb", std::vector<float>{0, 1, -5, 7}),
+          UpdateMessage::COMMIT);
+  EXPECT_EQ(2, ((VectorFieldType*)h.collection().getSchema()->getFieldTypePtr("emb__d2"))->storedDims());
+  EXPECT_EQ("b", topHit(h.getSearchEngine(), "emb", {1, 0, -5, 7})->id);
+  EXPECT_EQ("a", topHit(h.getSearchEngine(), "emb__d2", {1, 0, -5, 7})->id);
 }
