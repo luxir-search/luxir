@@ -3,6 +3,7 @@
 
 
 #include <gtest/gtest.h>
+#include <tbb/parallel_for.h>
 
 #include "luxir/schema/Schema.h"
 #include "luxir/schema/FieldType.h"

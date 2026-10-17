@@ -46,9 +46,6 @@ public:
 
   class Weight;
 
-  Weight* createWeight(Context& context, int32_t flags,
-                       float multiplier = 1.0f) override;
-
   class Scorer final : public Query::ConstantScorer {
     DocsReader docs;
     screaming::BitSet::Iterator iterator;
@@ -231,6 +228,10 @@ public:
     }
 
   };
+
+  Weight* createWeight(Context& context, int32_t flags,
+                       float multiplier = 1.0f) override;
+
 };
 
 inline ExistsQuery::Weight* ExistsQuery::createWeight(

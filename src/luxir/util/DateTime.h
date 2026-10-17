@@ -16,6 +16,7 @@
 #include <utility>
 
 #include "luxir/util/Clock.h"
+#include "luxir/util/TimeZoneDatabase.h"
 #include "luxir/util/Cursor.h"
 #include "luxir/util/log.h"
 
@@ -120,10 +121,10 @@ public:
 private:
   Kind kind_;
   int offsetMinutes_;
-  const std::chrono::time_zone* zone_;
+  const time_zone_database::time_zone* zone_;
 
   constexpr TimeZone(Kind kind, int offsetMinutes,
-                     const std::chrono::time_zone* zone)
+                     const time_zone_database::time_zone* zone)
     : kind_(kind), offsetMinutes_(offsetMinutes), zone_(zone) {}
 
 public:
@@ -131,7 +132,7 @@ public:
   static constexpr TimeZone fixed(int offsetMinutes) {
     return offsetMinutes == 0 ? utc() : TimeZone(Kind::FIXED, offsetMinutes, nullptr);
   }
-  static constexpr TimeZone iana(const std::chrono::time_zone* zone) {
+  static constexpr TimeZone iana(const time_zone_database::time_zone* zone) {
     return TimeZone(Kind::IANA, 0, zone);
   }
 
@@ -140,7 +141,7 @@ public:
   constexpr bool isFixed() const { return kind_ == Kind::FIXED; }
   constexpr bool isIana() const { return kind_ == Kind::IANA; }
   constexpr int offsetMinutes() const { return offsetMinutes_; }
-  constexpr const std::chrono::time_zone* ianaZone() const { return zone_; }
+  constexpr const time_zone_database::time_zone* ianaZone() const { return zone_; }
 
   std::string name() const {
     if (isUtc()) return "UTC";
@@ -159,7 +160,7 @@ namespace datetime_detail {
 
 struct TzdbState {
   std::once_flag once;
-  const std::chrono::tzdb* database = nullptr;
+  const time_zone_database::tzdb* database = nullptr;
   std::string version = "unavailable";
   std::string error;
 };
@@ -173,7 +174,7 @@ inline void loadTzdbOnce() {
   TzdbState& state = tzdbState();
   std::call_once(state.once, [&] {
     try {
-      state.database = &std::chrono::get_tzdb();
+      state.database = &time_zone_database::get_tzdb();
       state.version = state.database->version;
       LOG_INFO("Loaded time-zone database version {}", state.version);
     } catch (const std::exception& e) {
@@ -322,11 +323,11 @@ inline std::optional<CivilTime> civilFromInstant(int64_t millis, const TimeZone&
 namespace datetime_detail {
 
 inline std::chrono::seconds offsetForLocalInfo(
-    int64_t civilMillis, const std::chrono::local_info& info,
+    int64_t civilMillis, const time_zone_database::local_info& info,
     std::optional<std::chrono::seconds> preferredOffset) {
   using namespace std::chrono;
-  if (info.result == local_info::unique) return info.first.offset;
-  if (info.result == local_info::ambiguous) {
+  if (info.result == time_zone_database::local_info::unique) return info.first.offset;
+  if (info.result == time_zone_database::local_info::ambiguous) {
     // libstdc++ 16 classifies the exact upper endpoint of some transition
     // intervals with the interval itself. Civil transition intervals are
     // half-open; at that endpoint only the post-transition offset is valid.
@@ -376,7 +377,7 @@ inline std::optional<int64_t> instantFromCivil(
   } else if (zone.isIana()) {
     try {
       auto info = zone.ianaZone()->get_info(
-          local_time<milliseconds>{milliseconds{civilMillis}});
+          timeZoneLocalMillis(civilMillis));
       offset = dd::offsetForLocalInfo(civilMillis, info, preferredOffset);
     } catch (const std::exception&) {
       return std::nullopt;
@@ -395,10 +396,10 @@ inline bool civilIntervalSkipped(
   if (!zone.isIana() || civilNext <= civilLo) return false;
   try {
     auto info = zone.ianaZone()->get_info(
-        local_time<milliseconds>{milliseconds{civilNext - 1}});
+        timeZoneLocalMillis(civilNext - 1));
     int64_t jump = duration_cast<milliseconds>(
         info.second.offset - info.first.offset).count();
-    return info.result == local_info::nonexistent
+    return info.result == time_zone_database::local_info::nonexistent
         && jump >= civilNext - civilLo;
   } catch (const std::exception&) {
     return false;
@@ -414,22 +415,22 @@ namespace datetime_detail {
 class LocalTimeResolver {
   TimeZone zone;
   std::optional<std::chrono::seconds> preferredOffset;
-  std::chrono::local_info cachedInfo;
+  time_zone_database::local_info cachedInfo;
   __int128 cachedBegin = 0;
   __int128 cachedEnd = 0;
   bool cached = false;
 
-  void cache(int64_t civilMillis, const std::chrono::local_info& info) {
+  void cache(int64_t civilMillis, const time_zone_database::local_info& info) {
     using namespace std::chrono;
     cachedInfo = info;
-    if (info.result == local_info::ambiguous) {
+    if (info.result == time_zone_database::local_info::ambiguous) {
       auto transition = duration_cast<milliseconds>(
           info.first.end.time_since_epoch()).count();
       cachedBegin = (__int128)transition
                   + duration_cast<milliseconds>(info.second.offset).count();
       cachedEnd = (__int128)transition
                 + duration_cast<milliseconds>(info.first.offset).count();
-    } else if (info.result == local_info::nonexistent) {
+    } else if (info.result == time_zone_database::local_info::nonexistent) {
       auto transition = duration_cast<milliseconds>(
           info.second.begin.time_since_epoch()).count();
       cachedBegin = (__int128)transition
@@ -466,7 +467,7 @@ public:
       if (!cached || (__int128)civilMillis < cachedBegin
           || (__int128)civilMillis >= cachedEnd) {
         auto info = zone.ianaZone()->get_info(
-            local_time<milliseconds>{milliseconds{civilMillis}});
+            timeZoneLocalMillis(civilMillis));
         cache(civilMillis, info);
       }
       seconds offset = offsetForLocalInfo(

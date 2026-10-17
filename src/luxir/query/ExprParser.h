@@ -410,7 +410,7 @@ private:
   float parseScoreNumber(std::string_view text, size_t pos) {
     if (text.empty()) fail(pos, "score decoration requires a number after '^' or '^='");
     float value = 0.0f;
-    auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+    auto [p, ec] = fromCharsFloat(text.data(), text.data() + text.size(), value);
     if (ec != std::errc() || p != text.data() + text.size() || !std::isfinite(value)) {
       fail(pos, fmt::format("score decoration expects a finite number (got '{}')", text));
     }
@@ -1217,7 +1217,13 @@ private:
     }
     std::string_view text = value::lex::scanNumber(cur);
     T out{};
-    auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
+    auto [p, ec] = [&] {
+      if constexpr (std::is_floating_point_v<T>) {
+        return fromCharsFloat(text.data(), text.data() + text.size(), out);
+      } else {
+        return std::from_chars(text.data(), text.data() + text.size(), out);
+      }
+    }();
     bool delimited = cur.atEnd() || cur.wsLen() > 0 || ARG_STOPS.find(cur.peek()) != std::string_view::npos;
     if (text.empty() || !delimited || ec != std::errc() || p != text.data() + text.size() ||
         (std::is_floating_point_v<T> && !std::isfinite(out))) {

@@ -54,6 +54,12 @@ if(VCPKG_TARGET_IS_EMSCRIPTEN)
     )
 endif()
 
+if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+    set(LUXIR_OPENBLAS_TARGET ARMV8)
+else()
+    set(LUXIR_OPENBLAS_TARGET NEHALEM)
+endif()
+
 vcpkg_cmake_configure(
     SOURCE_PATH "${SOURCE_PATH}"
     OPTIONS
@@ -62,7 +68,7 @@ vcpkg_cmake_configure(
         -DBUILD_TESTING=OFF
         -DBUILD_WITHOUT_LAPACK=OFF
         -DC_LAPACK=ON
-        -DTARGET=NEHALEM
+        "-DTARGET=${LUXIR_OPENBLAS_TARGET}"
         -DUSE_LOCKING=ON
         -DNOFORTRAN=ON
     MAYBE_UNUSED_VARIABLES

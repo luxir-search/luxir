@@ -9,6 +9,7 @@
 #include <map>
 #include <stop_token>
 #include <unordered_map>
+#include "luxir/util/AtomicSharedPtr.h"
 #include "luxir/search/ReaderManager.h"
 
 namespace luxir {

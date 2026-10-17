@@ -7,7 +7,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#if defined(__AVX2__)
 #include <immintrin.h>
+#endif
 #include <utility>
 #include <vector>
 

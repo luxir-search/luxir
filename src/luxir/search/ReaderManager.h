@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <mutex>
+#include "luxir/util/AtomicSharedPtr.h"
 #include "IndexReader.h"
 #include "FilterCache.h"
 #include "luxir/index/CommitSnapshot.h"
@@ -17,7 +18,7 @@ namespace luxir {
 class ReaderManager {
   Directory& dir;
   std::mutex indexReaderMutex;
-  std::atomic<std::shared_ptr<const CommitSnapshot>> published;
+  AtomicSharedPtr<const CommitSnapshot> published;
   // These read-only query hints must not share the snapshot or reader lock bit.
   alignas(64) std::atomic<bool> closed = false;
   std::atomic<uint64_t> publishedSchemaGen = 0;
@@ -25,7 +26,7 @@ class ReaderManager {
   FilterCacheConfig originalFilterCacheConfig;
 public:
   std::shared_ptr<FilterCache> filterCache;
-  alignas(64) std::atomic<std::shared_ptr<IndexReader>> indexReader;
+  alignas(64) AtomicSharedPtr<IndexReader> indexReader;
 
   struct AuxStats {
     std::string kind;

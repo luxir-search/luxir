@@ -378,7 +378,11 @@ TEST(ProcessAllocatorTest, wholeHugePagePurgeAndReuse) {
   arena.deallocate(reused, size, hugePageSize);
   arena.purge();
   EXPECT_LT(arena.stats()->resident, resident);
+#ifdef __APPLE__
+  std::vector<char> pages(size / (size_t)sysconf(_SC_PAGESIZE));
+#else
   std::vector<unsigned char> pages(size / (size_t)sysconf(_SC_PAGESIZE));
+#endif
   EXPECT_EQ(mincore(reused, size, pages.data()), 0);
   EXPECT_TRUE(std::all_of(pages.begin(), pages.end(), [](auto p) { return !(p & 1); }));
   EXPECT_EQ(mincore(live, size, pages.data()), 0);

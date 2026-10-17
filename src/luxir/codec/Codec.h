@@ -8,7 +8,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <bit>
-#include <emmintrin.h>  // __m128i, for the inline numeric decode loop
+#include "luxir/util/Simd128.h"
 #include "luxir/util/luxir_util.h"
 
 // Integer codecs, backed by FastPFOR's SIMD bit-packing kernels (which have

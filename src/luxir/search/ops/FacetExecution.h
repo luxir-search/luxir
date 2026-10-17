@@ -88,7 +88,26 @@ public:
 // producer's: an independent producer materializes, feeds and drops one domain
 // at a time; a joint column producer builds byte-bounded chunks
 // (feedFacetBucketDomainChunks) and hands each domain over as it feeds it.
+#if defined(__cpp_lib_function_ref) && __cpp_lib_function_ref >= 202306L
 using FacetBucketFeed = std::function_ref<void(size_t, DomainHandle)>;
+#else
+class FacetBucketFeed {
+  void* context;
+  void (*invoke)(void*, size_t, DomainHandle);
+
+public:
+  template <typename F>
+  explicit FacetBucketFeed(F& callback) noexcept
+      : context(std::addressof(callback)),
+        invoke([](void* context, size_t bucket, DomainHandle domain) {
+          (*static_cast<F*>(context))(bucket, domain);
+        }) {}
+
+  void operator()(size_t bucket, DomainHandle domain) const {
+    invoke(context, bucket, domain);
+  }
+};
+#endif
 
 // How a parent produces one segment's bucket domains for a block. A joint
 // producer builds a chunk's domains in one column pass, so every block repeats

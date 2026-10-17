@@ -27,6 +27,12 @@ if ("gpu" IN_LIST FEATURES)
     endif()
 endif()
 
+# Apple Silicon has NEON but no SVE; DD also builds SVE translation units.
+set(LUXIR_FAISS_OPT_LEVEL dd)
+if(VCPKG_TARGET_IS_OSX AND VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+    set(LUXIR_FAISS_OPT_LEVEL generic)
+endif()
+
 vcpkg_cmake_configure(
     SOURCE_PATH "${SOURCE_PATH}"
     OPTIONS
@@ -34,7 +40,7 @@ vcpkg_cmake_configure(
         -DFAISS_ENABLE_MKL=OFF
         -DFAISS_ENABLE_PYTHON=OFF  # Requires SWIG
         -DBUILD_TESTING=OFF
-        -DFAISS_OPT_LEVEL=dd
+        "-DFAISS_OPT_LEVEL=${LUXIR_FAISS_OPT_LEVEL}"
 )
 
 vcpkg_cmake_install()

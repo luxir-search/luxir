@@ -5,6 +5,7 @@
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/ApiError.h"
+#include "luxir/util/FloatParse.h"
 
 #include <fmt/format.h>
 
@@ -39,7 +40,7 @@ inline std::optional<int64_t> parseInt64(std::string_view s) {
 
 inline std::optional<double> parseDouble(std::string_view s) {
   double v;
-  auto [ptr, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+  auto [ptr, ec] = fromCharsFloat(s.data(), s.data() + s.size(), v);
   if (ec != std::errc() || ptr != s.data() + s.size()) return std::nullopt;
   return v;
 }

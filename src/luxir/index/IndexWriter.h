@@ -4,6 +4,7 @@
 #pragma once
 
 #include <atomic>
+#include "luxir/util/AtomicSharedPtr.h"
 #include <deque>
 #include <optional>
 #include <string>
@@ -65,7 +66,7 @@ public:
     // published IndexReader when that holds the segment, and handed to readers that open a
     // snapshot this writer published (CommitSnapshot::openReaders). Atomic: commit and merge
     // threads fill it without a lock (IndexWriter::getSegmentPostingsReader).
-    std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
+    AtomicSharedPtr<PostingsReader> sharedPostingsReader = nullptr;
 
     // Schema generation this segment was indexed under.
     uint64_t schemaGen = 0;
@@ -295,7 +296,7 @@ public:
 
   CommitSnapshotRegistry& snapshots;
   CommitId openingCommit; // Captured before this writer becomes externally visible.
-  std::atomic<std::shared_ptr<const CommitSnapshot>> lastSnapshot;
+  AtomicSharedPtr<const CommitSnapshot> lastSnapshot;
 
   std::unique_ptr<MergePolicy> mergePolicy;
 

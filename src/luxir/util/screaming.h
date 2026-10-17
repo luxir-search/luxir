@@ -239,7 +239,7 @@ public:
   }
 
   /// number of words needed to store nbit bits
-  static size_t sizeInWords(int32_t nbits) {
+  static constexpr size_t sizeInWords(int32_t nbits) {
     assert(nbits >= 0);
     // since we went from signed to unsigned, we can add to sz without overflow issues.
     uint32_t numWords = ((uint32_t)nbits + sizeof(uint64_t)*8 - 1) / (sizeof(uint64_t) * 8); // round up to nearest word

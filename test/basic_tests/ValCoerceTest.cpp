@@ -64,6 +64,13 @@ TEST_F(ValCoerceTest, parseDoubleStrict) {
   EXPECT_FALSE(coerce::parseDouble("abc"));
   EXPECT_FALSE(coerce::parseDouble("1.5x"));
   EXPECT_FALSE(coerce::parseDouble(" 1.5"));
+  EXPECT_FALSE(coerce::parseDouble("+1.5"));
+  EXPECT_FALSE(coerce::parseDouble("1.5 "));
+  EXPECT_FALSE(coerce::parseDouble("1e309"));
+  EXPECT_FALSE(coerce::parseDouble("1e-999"));
+  EXPECT_EQ(0.5, coerce::parseDouble(".5"));
+  ASSERT_TRUE(coerce::parseDouble("-0"));
+  EXPECT_TRUE(std::signbit(*coerce::parseDouble("-0")));
 }
 
 TEST_F(ValCoerceTest, toInt64Arms) {

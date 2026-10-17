@@ -1,8 +1,6 @@
 # Copyright 2020-2026 Yonik Seeley and Luxir contributors
 # SPDX-License-Identifier: Apache-2.0
 
-find_package(Protobuf CONFIG REQUIRED)
-find_package(gRPC CONFIG REQUIRED)
 find_package(Threads)
 
 # The protobuf/gRPC C++ codegen target (myproto) is gone with the concrete luxir::api
@@ -42,7 +40,7 @@ add_custom_target(luxir_fds_gen DEPENDS "${_fds_hdr}")
 # coexists with the templated luxir_proto_hpp (distinct namespace luxir::api) through the
 # migration. luxir_lib links it once engine TUs include the concrete headers; the concrete
 # round-trip tests (test_concrete_proto/) link it now.
-find_package(glaze CONFIG REQUIRED)   # concrete .json.cpp pulls <hpp_proto/json.hpp> -> glaze
+# Dependencies.cmake provides glaze::glaze for the concrete JSON codecs.
 set(_concrete_gen "${CMAKE_CURRENT_BINARY_DIR}/concrete")
 hpp_proto_generate(OUT_VAR _concrete_srcs OUT_DIR "${_concrete_gen}" CONCRETE SNAKE_JSON
   CONCRETE_NAMESPACE luxir.api   # -> namespace luxir::api (coexists with templated luxir::proto)

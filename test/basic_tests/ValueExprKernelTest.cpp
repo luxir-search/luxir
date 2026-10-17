@@ -375,7 +375,7 @@ TEST_F(ValueExprKernelTest, boundsFlagsSeparateUnknownInvalidAndMissing) {
   std::array<ValueBounds, 1> logInput{ValueBounds::integer(0, 10)};
   ValueBounds invalid = logarithm->boundsPropagate(logNode, logInput);
   EXPECT_EQ(BoundsCertainty::INVALID, invalid.certainty);
-  EXPECT_EQ(BoundsInvalidity::DOMAIN, invalid.invalidity);
+  EXPECT_EQ(BoundsInvalidity::DOMAIN_ERROR, invalid.invalidity);
 
   logInput[0].minAttained = false;
   ValueBounds unknown = logarithm->boundsPropagate(logNode, logInput);
