@@ -760,6 +760,33 @@ TEST_F(HttpApiTest, malformedJsonIs400) {
   EXPECT_NE(res.body().find(R"("error")"), std::string::npos);
 }
 
+// Elasticsearch-style top-level min_score in the shorthand body, as an
+// integer or a float, beside ops.
+TEST_F(HttpApiTest, searchMinScore) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"ms1","title_w":"cutoff","rank_i":1},)"
+      R"({"id":"ms2","title_w":"cutoff","rank_i":2},)"
+      R"({"id":"ms3","title_w":"cutoff","rank_i":3}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto search = [&](const std::string& query, const std::string& minScore) {
+    auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
+        R"({"query":)" + query + R"(,"min_score":)" + minScore
+        + R"j(,"get_number":true,"fields":["id"],"ops":{"s":"sum(rank_i)"}})j");
+    EXPECT_EQ(200, res.result_int()) << res.body();
+    return res.body();
+  };
+  const std::string rescored =
+      R"({"rescore":{"query":{"match":{"title_w":"cutoff"}},"expr":"rank_i"}})";
+  auto two = search(rescored, "2");
+  EXPECT_NE(two.find(R"("found":2)"), std::string::npos) << two;
+  EXPECT_NE(two.find(R"("s":5)"), std::string::npos) << two;
+  auto one = search(rescored, "2.5");
+  EXPECT_NE(one.find(R"("found":1)"), std::string::npos) << one;
+  const std::string match = R"({"match":{"title_w":"cutoff"}})";
+  EXPECT_NE(search(match, "0").find(R"("found":3)"), std::string::npos);
+  EXPECT_NE(search(match, "1000.0").find(R"("found":0)"), std::string::npos);
+}
+
 // No "fields" in the request: every retrievable field of each hit comes back
 // (engine fields such as _version_ only when named).
 TEST_F(HttpApiTest, searchWithoutFieldsReturnsEveryRetrievableField) {
