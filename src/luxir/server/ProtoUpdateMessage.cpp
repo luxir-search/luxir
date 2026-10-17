@@ -89,7 +89,11 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
   const bool allOrNone = request.all_or_none;
   const bool returnIds = request.return_ids;
   const FieldNameMap fieldMap(request);
+  // Handlers cached by raw field position: a request's docs usually share a shape,
+  // so a hit costs one name compare.
   std::vector<Inverter::InputHandler*> handlers;
+  // The current doc's fields after last-wins dedup, in first-seen order.
+  std::vector<std::pair<Inverter::InputHandler*, const IndexVal*>> fields;
 
   // first docid this request's adds will use; needed for all_or_none rollback.
   const int32_t firstDoc = inverter.getMaxDoc();
@@ -107,19 +111,26 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     inverter.startDoc();
 
     try {
-      int idx = 0;
-      // dedup duplicate field keys post-mapping, last-wins
-      for (const auto& [fname, fval] :
-           lastWins(doc.fields, [&](std::string_view name) { return fieldMap.resolve(name); })) {
+      // Duplicate keys post-mapping collapse last-wins (protobuf map semantics). The
+      // handler is a name's identity, so its claim finds an earlier occurrence without
+      // a per-doc map; a repeat replaces the value at the first occurrence's position.
+      fields.clear();
+      size_t raw = 0;
+      for (const auto& [name, val] : doc.fields) {
+        Inverter::InputHandler*& handler = handlers[raw++];
+        auto fname = fieldMap.resolve(name);
+        if (!fname) continue;
         // A cached handler proves its name was accepted; creation validates a
         // new name (a derived selector is not a document key).
-        auto handler = handlers[idx];
-        if (handler == nullptr || *handler != fname) {
-          handlers[idx] = handler = &inverter.getIndexHandler(fname);
+        if (handler == nullptr || *handler != *fname) {
+          handler = &inverter.getIndexHandler(*fname);
         }
-
-        handler->index(inverter, **fval);
-        idx++;
+        uint32_t slot = handler->claim(inverter, (uint32_t)fields.size());
+        if (slot == fields.size()) fields.emplace_back(handler, &*val);
+        else fields[slot].second = &*val;
+      }
+      for (const auto& [handler, val] : fields) {
+        handler->index(inverter, *val);
       }
 
       inverter.finishDoc();
@@ -267,10 +278,6 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   }
 }
 
-
-void ProtoUpdateMessage::validateReplicaWait(const api::ReplicaRequirement& value) {
-  if (value.kind.index() == 0) throw RequestError("wait_for_replicas requires count or all");
-}
 
 std::shared_ptr<ProtoUpdateMessage::Completion> ProtoUpdateMessage::takeCompletion(LuxirNode& node) {
   auto completed = std::make_shared<Completion>();

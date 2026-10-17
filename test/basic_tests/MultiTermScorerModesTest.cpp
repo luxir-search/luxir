@@ -1263,7 +1263,7 @@ TEST_F(MultiTermScorerModesTest, wrapperReleasePreservesPreparedResults) {
   auto* program = ValueExprParser(options, context.arena()).parse("3.0");
   RescoreQuery rescore(&force, program, 3.0f);
   auto* weight = rescore.createWeight(context, Query::NEED_SCORES);
-  Query::Weight::PrepareContext prepareContext{*ti.reader, {}, false};
+  Query::Weight::PrepareContext prepareContext{*ti.reader, {}, false, nullptr};
   QueryPrep::PreparedSource source;
   source.weight = weight;
   source.setPrepared(weight->prepare(prepareContext));

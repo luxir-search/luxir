@@ -233,7 +233,7 @@ a field at ingest can be used to match or bound that field later.
   requests may supply a query time zone. See [Dates](dates.md).
 - Geo points and vectors have array shapes described in their dedicated
   guides; they are not generic numeric multi-value fields. A vector is a
-  number array; integer elements are accepted, while doubles must narrow to
+  number array; integer elements are accepted, and every element must be a
   finite float32.
 
 Numeric primaries return their typed column; `stored` is ignored for them.

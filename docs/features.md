@@ -158,7 +158,7 @@ whole machine. Designed from the start for parallelism on modern hardware.
   per-operation default bindings so a bare field name does the right thing.
 - Per-field choices: index mode (match, or range acceleration), multi-valued,
   column-stored (sorting, faceting, analytics), stored source (retrieval, in
-  LZ4-compressed chunks).
+  LZ4- or ZSTD-compressed chunks, configurable per stored resource).
 - Numeric, date, and geo fields with `index: "range"` build a points index;
   without it the same queries run off the column with the same results.
 - Floats and doubles are stored order-preserving, so numeric sorting and
@@ -265,7 +265,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Stream every match: `limit: -1` with `?format=docs` returns one document
   per line over one connection, with no cursor, scroll state, or page size.
   The output pipes straight back into NDJSON ingest.
-- Hybrid fusion: reciprocal rank fusion over named sources with shared and
+- Hybrid fusion: weighted reciprocal rank fusion, or weighted linear fusion
+  of min-max normalized scores, over named sources with shared and
   per-source filters, `limit` and `offset` over the fused list, and facets and
   metrics over the fused candidate set.
 - A warnings channel: declared degradations (a clamped fuzzy distance, a

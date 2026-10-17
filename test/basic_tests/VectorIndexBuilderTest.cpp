@@ -808,7 +808,7 @@ TEST_F(VectorIndexBuilderTest, mergePromotesBelowThresholdSegmentsForActiveField
     }
     h.commit();
   }
-  iw->updateGraph.wait_for_all();
+  iw->updateGraph->wait_for_all();
   h.commit();
 
   EXPECT_EQ(vectorCommitBuildCount(), 0);
@@ -1202,7 +1202,7 @@ TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {
 
   releaseMerge.count_down();
   if (!buildDone.load()) buildDoneLatch.wait();
-  iw->updateGraph.wait_for_all();
+  iw->updateGraph->wait_for_all();
 
   auto afterApprox = runKnnIds(h.getSearchEngine(), "embedding_v",
                                {100.0f, 0.0f, 0.0f, 0.0f}, 3,

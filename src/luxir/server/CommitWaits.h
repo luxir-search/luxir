@@ -68,7 +68,8 @@ public:
   void awaitCommit(CollectionId name, CommitId floor, Clock::time_point deadline,
                    std::stop_token stop, std::function<void(CommitResult)> complete);
   ReplicaWait prepareReplicas(CollectionId name, CommitId commit, const api::ReplicaRequirement& requirement,
-                             Clock::time_point deadline);
+                             Clock::time_point deadline,
+                             ReplicationSource::Members members = ReplicationSource::Members::SERVING);
   void awaitReplicas(ReplicaWait spec, std::stop_token stop, std::function<void(api::ReplicaResult)> complete);
   void awaitReplicas(CollectionId name, CommitId commit, const api::ReplicaRequirement& requirement,
                      Clock::time_point deadline, std::stop_token stop, std::function<void(api::ReplicaResult)> complete);

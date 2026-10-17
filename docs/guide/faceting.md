@@ -74,6 +74,12 @@ price, a publisher breakdown, and the two best documents of every category.
 The whole tree executes as part of the original request rather than as a
 follow-up query per bucket.
 
+Bucket operation names cannot be `val`, `count`, `rank`, `singleton` or
+`missing`; these names identify bucket and group metadata. The same children
+can run per returned group through
+[`collapse.ops`](searching.md#collapsing-results). Facets there count the
+group's matching documents by default.
+
 The operation kinds on this page:
 
 | Operation | Groups by |
@@ -139,6 +145,88 @@ even when outside `limit`, so the UI can keep showing the checked choices.
 The same API works for field, range, and query facets directly under the
 query's `ops`. See [Multi-select navigation](#multi-select-navigation) for
 selection values, normalization, and the stricter `selection_mode: "all"`.
+
+## Counting groups and distinct keys
+
+Under a [collapsed list](searching.md#collapsing-results), field, range, and
+query facets count distinct groups by default. A product contributes once to a
+color bucket if a matching variant in that facet's document domain has that color.
+The count uses the collapse key and its missing policy, including tuple keys.
+
+```json
+{
+  "collapse": "product_id_s",
+  "limit": 10,
+  "ops": {
+    "colors": {"field_facet": {"field": "color_s", "limit": 20}},
+    "variant_colors": {
+      "field_facet": {"field": "color_s", "count_unit": "docs"}
+    },
+    "average_price": "avg(price_i)"
+  }
+}
+```
+
+`count_unit: "docs"` counts documents. `count_unit: "groups"` requires an
+enclosing collapsed list and uses the nearest one's key and missing policy.
+Nested facets inherit their parent's measure, including an explicit
+`docs` override. Each nested facet still sees only the documents in its
+parent bucket. An uncollapsed child `top_docs` remains a document list; its
+facets inherit the counting measure. A child list with its own collapse
+establishes a new key and default measure. Entering `collapse.ops` resets the
+default to docs; an explicit `count_unit: "groups"` there still uses the
+nearest enclosing collapse and counts one where that group has members.
+
+The measure governs bucket counts, their default order, `mincount`, and
+`missing`. The missing bucket counts a group when any document in the facet's
+domain lacks the facet value. That group can also occur in named buckets, so
+bucket counts need not sum to `found`. Selected buckets retain their exact
+counts, including zero, even below `mincount` or outside the ordinary page.
+
+Selections and `except_ops` still filter individual documents. With a size=M
+filter, a color bucket counts only variants of size M. A product with red/S
+and blue/M contributes to blue, not red. Metrics such as `avg(price_i)` fold
+the bucket's documents and remain document-weighted.
+
+Use `count_distinct` to count an independent key, including outside collapse:
+
+```json
+{
+  "limit": 0,
+  "ops": {
+    "authors": {
+      "field_facet": {
+        "field": "category_s",
+        "count_distinct": {"field": ["publisher_s", "author_s"], "missing": "drop"}
+      }
+    }
+  }
+}
+```
+
+The key specification accepts the same fields and missing policies as
+`collapse`; a field-name string is shorthand. An explicit `count_unit` and
+`count_distinct` must describe the same measure. `docs` conflicts with any
+distinct key. Counts are exact across segments, including scattered updates
+and deletes. Keys retain their exact values, including numeric extrema and every tuple
+null pattern. Missing keys under `expand` each form their own group. Group
+counting adds no work during indexing or reader reopen.
+
+A group can contribute to many buckets, and the engine must recognize it
+across segments and parallel workers. Memory grows with the number of matching
+groups, facet values, and distinct combinations, rather than only the number of
+returned buckets. Broad multi-valued and high-cardinality facets can cost
+substantially more than document counting. Tuple keys can also add work when
+their component ranges are large.
+
+Distinct counting uses the request memory budget. Exceeding the budget fails
+the request; counts never become estimates or document counts. Use
+`count_unit: "docs"` when document counts are the intended measure.
+
+Distinct counting supports STRING/ID and INT/DATE field facets, numeric/date
+range facets, and query facets, including overlapping query buckets and nested
+operations. TEXT field facets and metric sorts with distinct counts remain
+unsupported.
 
 ## Field facets
 
@@ -429,14 +517,43 @@ selects every document in the bucket, and without a `sort` that list is in
 index order. A text query's scores do not depend on the bucket, so repeating
 the outer query ranks each bucket the way the main result list is ranked.
 
+A bucket's `top_docs` can use its own `collapse`, under field, range, or query
+facets. For example, return the cheapest matching variant of each product
+within each category:
+
+```json
+{
+  "limit": 0,
+  "ops": {
+    "categories": {
+      "field_facet": {
+        "field": "category_s",
+        "ops": {
+          "products": {
+            "top_docs": {"collapse": "product_s", "sort": "price_i asc", "limit": 3}
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+The child list collapses only its bucket's documents. Its facets default to
+groups under its own key, and explicit `count_unit: "groups"` uses that
+nearest collapse. A descendant [domain reset](#bucket-domain-resets) keeps
+the enclosing bucket identities while replacing the matching query, as for
+other bucket children.
+
 Per-bucket lists work under field, range, and query facets. A per-bucket
 `top_docs` may carry its own `ops`, which see every document in the bucket
 that its query and filters match, regardless of its `limit`; a per-bucket
-`fusion` accepts no `ops`. Two differences from a top-level list: it is never
-streamed in batches (`batch_size` is ignored and every row arrives in the final
-response), and a `document_format` left at the default follows the transport
-default rather than the enclosing operation's. Each bucket is ranked
-independently, which costs one pass over the bucket's documents per bucket.
+`fusion` runs its `ops` over its fused candidate set. Two differences from a
+top-level list: it is never streamed in batches (`batch_size` is ignored and
+every row arrives in the final response), and a `document_format` left at the
+default follows the transport default rather than the enclosing operation's.
+Each bucket is ranked independently, which costs one pass over the bucket's
+documents per bucket.
 
 ## Range facets
 
@@ -780,3 +897,51 @@ primary, the bare field name counts words without needing `__self`.
   `fusion`, or on a nested facet.
 - Range facets with sub-operations are limited to 1,024 buckets; a range facet
   without them may request at most 100,000.
+
+## Bucket domain resets
+
+A bucket child can specify `domain` to change which documents it operates
+on. With `domain.query`, it starts from live documents that satisfy every
+enclosing bucket's identity, then applies its own query and filters. It
+drops the matching queries above the child. For example:
+
+```json
+"by_brand": {
+  "field_facet": {
+    "field": "brand_s",
+    "ops": {
+      "in_stock_colors": {
+        "field_facet": {"field": "color_s"},
+        "domain": {"query": {"all": true}, "filter": ["stock_i:>0"]}
+      }
+    }
+  }
+}
+```
+
+This counts all in-stock colors for each selected brand, even if the list's
+query matched fewer variants. A nested reset retains both the outer and
+inner bucket identities. Field buckets mean membership in that value,
+range buckets retain their bounds, query buckets retain their predicate,
+and [group buckets](searching.md#collapsing-results) retain exact key equality.
+The scalar `missing` count has no bucket row for child operations.
+
+The owning list's filters are dropped unless `apply_parent_filters: true`
+is set. That option requires `domain.query`, even when its value is false.
+Its filters keep the routing established at the list's child branch.
+Without `domain.query`, `domain.filter` simply adds filters to the existing
+bucket documents and does not widen the domain.
+
+A query-facet bucket containing kNN is re-evaluated inside a child's reset
+scope, so the child can see a different window from the parent's counted
+window. Nested selection buckets run outer to inner, each within the reset
+query/filters and the identities above it; identities below a selection
+apply after that window is chosen. A kNN in the reset's own query or filters
+also runs within the reset scope, and a kNN-ranked collapsed list retains
+key equality as its group identity.
+
+Resets may recover documents excluded by the original search, so their cost
+can exceed operations on matching members. Indexed keys and values can
+recover small buckets directly; other identities require column walks.
+Child execution is bounded in bucket blocks, including domains retained for
+queries that prepare over all segments.

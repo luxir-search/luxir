@@ -69,7 +69,7 @@ public:
       commit_within_ms = (int64_t)std::min<uint64_t>(
           params.commit_within_ms, (uint64_t)std::numeric_limits<int64_t>::max());
       if (params.wait_for_replicas.has_value()) {
-        validateReplicaWait(*params.wait_for_replicas);
+        ReplicationSource::validate(*params.wait_for_replicas);
         commit_within_ms = 0;
       }
       waitForMerges = params.wait_for_merges;
@@ -114,7 +114,6 @@ public:
     return rsp;
   }
 
-  static void validateReplicaWait(const api::ReplicaRequirement& value);
   // This owns only response data and a copied wait specification. The transport
   // releases its request and message before starting the replica wait.
   struct Completion : std::enable_shared_from_this<Completion> {

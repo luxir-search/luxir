@@ -89,9 +89,11 @@ std::vector<std::string> ReplicationConfig::peerList() const {
 void ReplicationConfig::validate() const {
   tenantFilter();
   if (!max_acknowledgments) throw std::invalid_argument("replication.max-acknowledgments must be positive");
+  if (follower_id.size() > 255) throw std::invalid_argument("replication.follower-id exceeds 255 bytes");
   if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
     throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
   }
+  if (retry_ms < 1) throw std::invalid_argument("replication.retry-ms must be positive");
 }
 
 void LuxirConfig::addOptions(CLI::App& app) {
@@ -100,7 +102,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--replication.peers", replication.peers, "Comma-separated http:// nodes serving file copies, tried before the source");
   app.add_option("--replication.max-acknowledgments", replication.max_acknowledgments,
       "Node-wide follower/collection acknowledgment row budget")->default_val(replication.max_acknowledgments);
-  app.add_option("--replication.follower-id", replication.follower_id, "Stable follower id (generated when omitted)");
+  app.add_option("--replication.follower-id", replication.follower_id, "Name the source knows this follower by (default host:port)");
   app.add_option("--replication.downloads", replication.downloads, "Concurrent collection downloads per follower")->check(CLI::Range(1, 64));
   app.add_flag("--read-only", read_only,
                "Serve an existing data directory without the write lock; rejects all updates");
@@ -123,6 +125,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.grpc.port", server.grpc.port, "gRPC listen port (default: HTTP port + 1)");
   app.add_option("--server.grpc.threads", server.grpc.threads, "Number of server threads (0 = auto)")
       ->default_val(server.grpc.threads);
+  app.add_option("--server.grpc.max-receive-message-size", server.grpc.max_receive_message_size,
+                 "Max received gRPC message; larger -> RESOURCE_EXHAUSTED (e.g. 64MB)")
+      ->transform(CLI::AsSizeValue(false))
+      ->check(CLI::NonNegativeNumber)
+      ->default_str("--indexing.max-request-body");
 
   app.add_flag("--server.http.enabled,!--no-http", server.http.enabled, "Enable the HTTP/JSON server")
       ->default_val(server.http.enabled);
@@ -132,6 +139,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.http.threads", server.http.threads,
                  "HTTP connection I/O shards (one thread each, plus one accept thread; 0 = auto)")
       ->default_val(server.http.threads);
+  app.add_option("--server.workers", server.workers,
+                 "Task-arena worker threads for indexing, merges and parallel search "
+                 "(0 = auto: all CPUs on nodes of up to 4, else all but one)")
+      ->default_val(server.workers)
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--server.stream_buffer_bytes", server.stream_buffer_bytes,
                  "Per-connection buffered response bytes before streaming producers pause")
       ->default_val(server.stream_buffer_bytes);
@@ -143,6 +155,9 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(replication.pin_retained_bytes);
   app.add_option("--replication.follower-timeout-ms", replication.follower_timeout_ms,
                  "Follower liveness in milliseconds (watch timeout at most one third)")->default_val(replication.follower_timeout_ms);
+  app.add_option("--replication.retry-ms", replication.retry_ms,
+                 "Follower reconnect and first sync retry delay in milliseconds (retries double, to 60 s)")
+      ->default_val(replication.retry_ms);
 
   app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
       ->default_val(store.backend)
@@ -204,7 +219,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(ingest.stream_batch_docs)
       ->check(CLI::PositiveNumber);
   app.add_option("--indexing.max-inflight-batches", ingest.max_inflight_batches,
-                 "Streaming NDJSON: batches in flight per connection (0 = task arena compute width + 2)")
+                 "Streaming NDJSON: batches in flight per connection (0 = server.workers + 2)")
       ->default_val(ingest.max_inflight_batches)
       ->check(CLI::NonNegativeNumber);
   app.add_flag("--indexing.auto-create-collection,!--no-indexing.auto-create-collection",

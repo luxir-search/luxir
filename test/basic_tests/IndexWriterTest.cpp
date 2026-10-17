@@ -27,7 +27,6 @@
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/reader/PostingsReader.h"
-#include "luxir/reader/FieldReader.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/Signal.h"
 #include <future>
@@ -278,7 +277,7 @@ TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
       fieldHandler.index(inverter, value);
       inverter.finishDoc();
       writer.releaseInverter(inverter, true);
-      writer.updateGraph.wait_for_all();
+      writer.updateGraph->wait_for_all();
     };
     flushAtVersion(9, "first higher version segment");
     flushAtVersion(10, "second higher version segment");
@@ -300,7 +299,7 @@ TEST_F(IndexWriterTest, firstCommitAfterReloadCompletes) {
     (void)dir.release();
     FAIL() << "first commit after reload did not complete";
   }
-  writer->updateGraph.wait_for_all();
+  writer->updateGraph->wait_for_all();
   EXPECT_FALSE(msg->result.errored());
   EXPECT_EQ(msg->updateVersion, 11u);
   EXPECT_EQ(luxir::test::readDurableIndexInfo(*dir)->update_version, 11u);
@@ -345,7 +344,7 @@ TEST_F(IndexWriterTest, failedCommitAdmissionDoesNotLeaveSequencerHole) {
     (void)dir.release();
     FAIL() << "commit after failed admission did not complete";
   }
-  writer->updateGraph.wait_for_all();
+  writer->updateGraph->wait_for_all();
   EXPECT_FALSE(subsequent->result.errored());
 }
 
@@ -676,7 +675,7 @@ TEST_F(IndexWriterTest, autoMerge) {
 
     // Now wait until the merge completes.
     // If the commit is run in the same thread, this call can work-steal the mergeSegments task and deadlock.
-    iw.updateGraph.wait_for_all();
+    iw.updateGraph->wait_for_all();
 
     // depending on if the merger does a commit on its own, we may not see the merged segment
     // yet.  Currently, if the merger detects no indexing activity, it will request a new commit.
@@ -1014,7 +1013,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
     }
 
     // wait for all IW activity to finish.
-    iw.updateGraph.wait_for_all();
+    iw.updateGraph->wait_for_all();
 
     // If request threads are failing to stop, but this block of code above tasks.wait() and uncomment the sleep
     // std::this_thread::sleep_for(std::chrono::milliseconds(1000));
@@ -1488,7 +1487,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
         LOG_ERROR("Deadlock detector: No Indexing activity for 1 second!");
         try {
           // If an uncaught exception occured in the updateGraph, waiting for all will throw it.
-          indexWriter->updateGraph.wait_for_all();
+          indexWriter->updateGraph->wait_for_all();
         } catch (const std::exception& e) {
           LOG_ERROR("Deadlock detector caught exception: {}", e.what());
         }
@@ -1664,7 +1663,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
 
   // make sure we don't leave any tasks in the updateGraph (drains in-flight
   // merges, including injected-failure ones, before we drop the listener).
-  indexWriter->updateGraph.wait_for_all();
+  indexWriter->updateGraph->wait_for_all();
   EXPECT_GT(forceMergesRequested.load(), 0);
   EXPECT_EQ(forceMergesRequested.load(), forceMergesCompleted.load());
   EXPECT_LE(forceMergeErrorResponses.load(), forceMergesCompleted.load());
@@ -1759,7 +1758,7 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
   helper.index(doc4, UpdateMessage::COMMIT, true);
   
   // Wait for merge to complete
-  indexWriter->updateGraph.wait_for_all();
+  indexWriter->updateGraph->wait_for_all();
   
   // Get fresh reader
   auto reader3 = indexWriter->snapshots.readers.getReader();
@@ -1855,7 +1854,7 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
   }
 
   // wait for previous merge to finish.
-  indexWriter->updateGraph.wait_for_all();
+  indexWriter->updateGraph->wait_for_all();
 
   // force another merge to squeeze out deletes
   indexWriter->mergeSegments();
@@ -2102,7 +2101,7 @@ TEST_F(IndexWriterTest, overwriteSurvivesCommitAheadOfOlderUpdate) {
   auto cleanup = scope_guard([&] {
     if (!releaseCommit.try_wait()) releaseCommit.count_down();
     if (!releaseOlder.try_wait()) releaseOlder.count_down();
-    iw->updateGraph.wait_for_all();
+    iw->updateGraph->wait_for_all();
     Signal::unlisten("initiateCommit");
   });
   Signal::listen("initiateCommit", [&](void* msg, void*, void*) -> void* {
@@ -2131,7 +2130,7 @@ TEST_F(IndexWriterTest, overwriteSurvivesCommitAheadOfOlderUpdate) {
     EXPECT_TRUE(iw->autoCommitPending);
   }
   releaseOlder.count_down();
-  iw->updateGraph.wait_for_all();
+  iw->updateGraph->wait_for_all();
   ASSERT_FALSE(older.result.errored());
   ASSERT_FALSE(newer.result.errored());
   helper.commit();
@@ -2190,7 +2189,7 @@ TEST_F(IndexWriterTest, publicationSnapshotsDeletesAndRetainsUnflushedPrefix) {
   }
   iw->releaseInverter(older);
   iw->releaseInverter(newer, true);
-  iw->updateGraph.wait_for_all();
+  iw->updateGraph->wait_for_all();
   ASSERT_EQ(1, iw->pendingDeletes.size());
   std::weak_ptr<const SortedDeletes> batch = *iw->pendingDeletes.deletes.begin();
 
@@ -2200,7 +2199,7 @@ TEST_F(IndexWriterTest, publicationSnapshotsDeletesAndRetainsUnflushedPrefix) {
     TimedCommitMessage publication;
     publication.publishOnly = true;
     ASSERT_TRUE(iw->submitUpdate(&publication));
-    iw->updateGraph.wait_for_all();
+    iw->updateGraph->wait_for_all();
     ASSERT_FALSE(publication.result.errored());
     EXPECT_EQ(1, iw->snapshots.readers.getReader()->liveDocs());
     EXPECT_FALSE(batch.expired());
@@ -2224,7 +2223,7 @@ TEST_F(IndexWriterTest, failedDeleteApplicationRetainsDeletesForRetry) {
     ExpectLog quiet("injected delete application failure");
     EXPECT_FALSE(helper.deleteById("dup", UpdateMessage::COMMIT).success);
   }
-  iw->updateGraph.wait_for_all();
+  iw->updateGraph->wait_for_all();
   Signal::unlisten("deleteAppliedToSegment");
   EXPECT_FALSE(iw->pendingDeletes.empty());
   EXPECT_EQ(1, iw->snapshots.readers.getReader()->liveDocs());
@@ -2247,7 +2246,7 @@ TEST_F(IndexWriterTest, durableVersionIncludesDeletesAndNeverRegresses) {
     // A later no-op request reuses the inverter and advances its envelope.
     auto& noOp = iw.obtainInverter(10);
     iw.releaseInverter(noOp, true);
-    iw.updateGraph.wait_for_all();
+    iw.updateGraph->wait_for_all();
     iw.commit();
     ASSERT_EQ(10, readDurableIndexInfo(dir)->update_version);
 
@@ -2263,7 +2262,7 @@ TEST_F(IndexWriterTest, durableVersionIncludesDeletesAndNeverRegresses) {
     auto& deleteOnly = iw.obtainInverter(20);
     deleteOnly.deleteId("absent", 20);
     iw.releaseInverter(deleteOnly, true);
-    iw.updateGraph.wait_for_all();
+    iw.updateGraph->wait_for_all();
     iw.commit();
     EXPECT_EQ(20, readDurableIndexInfo(dir)->update_version);
   }
@@ -2280,7 +2279,7 @@ TEST_F(IndexWriterTest, mergingDeleteListsPreservesSharedInputs) {
     CollectionHelper helper(node);
     auto iw = helper.getIndexWriter();
     ASSERT_TRUE(helper.index(flatdoc("id", "dup"), UpdateMessage::COMMIT, true).success);
-    iw->updateGraph.wait_for_all();
+    iw->updateGraph->wait_for_all();
     ASSERT_EQ(1, iw->segInfos.size());
 
     auto pool = std::make_unique<MemPool>();
@@ -2342,13 +2341,13 @@ TEST_F(IndexWriterTest, removeFields) {
   auto guard = MemPool::threadLocalPoolGuard();
   // Verify fields from deleted document are gone after merge
   for (const auto& segment : reader->segments()) {
-    FieldReader fieldsReader(segment.postingsReader());
-    EXPECT_TRUE(fieldsReader.seek("id")); // id field should remain
-    EXPECT_FALSE(fieldsReader.seek("text_w"));
-    EXPECT_FALSE(fieldsReader.seek("string_s"));
-    EXPECT_FALSE(fieldsReader.seek("string_ss"));
-    EXPECT_FALSE(fieldsReader.seek("int_i"));
-    EXPECT_FALSE(fieldsReader.seek("int_is"));
+    auto* fieldsReader = segment.postingsReader().fieldInfo("id");
+    EXPECT_TRUE((fieldsReader != nullptr)); // id field should remain
+    EXPECT_FALSE(((fieldsReader = segment.postingsReader().fieldInfo("text_w")) != nullptr));
+    EXPECT_FALSE(((fieldsReader = segment.postingsReader().fieldInfo("string_s")) != nullptr));
+    EXPECT_FALSE(((fieldsReader = segment.postingsReader().fieldInfo("string_ss")) != nullptr));
+    EXPECT_FALSE(((fieldsReader = segment.postingsReader().fieldInfo("int_i")) != nullptr));
+    EXPECT_FALSE(((fieldsReader = segment.postingsReader().fieldInfo("int_is")) != nullptr));
   }
 }
 
@@ -2684,7 +2683,8 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
   auto originalSchema = writer.getSchema();
   int changes = 0;
   writerSnapshots.onChange = [&]() noexcept { changes++; };
-  Signal::listen("manifestDurable", [&](void*, void*, void*) -> void* {
+  Signal::listen("manifestDurable", [&](void* source, void*, void*) -> void* {
+    if (source != &writer) return nullptr; // another test's background merge
     EXPECT_NE(nullptr, dir.openFile(Manifest::name(before->index_gen + 1), true));
     throw std::runtime_error("injected publication failure");
   });

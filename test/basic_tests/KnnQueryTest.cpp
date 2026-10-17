@@ -3,6 +3,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <algorithm>
 #include <bit>
 #include <cmath>
@@ -25,6 +26,7 @@
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
+#include "test/TaskSpawnCounter.h"
 #include "test/TestUtils.h"
 
 using namespace luxir;
@@ -2185,7 +2187,7 @@ TEST_F(KnnQueryTest, fusionFieldSortDoesNotSightWholeReaderCache) {
     auto& fusion = req->topDocs("f").rawOp().kind.emplace<api::Fusion>();
     fusion.limit = 4;
     fusion.get_number = true;
-    fusion.rrf.emplace().k = 60;
+    fusion.method.emplace<api::RrfFusion>().k = 60;
     auto* fields = build::allocArray(fusion.fields, 1, req->mr);
     fields[0] = build::arenaStr(req->mr, "id");
 
@@ -2348,28 +2350,34 @@ TEST_F(KnnQueryTest, nanQueryVectorReturnsErrorResponse) {
   req->done();
 }
 
-// A NaN stored vector must not poison the comparators (a non-total order
-// makes the sorts UB and the bounded cuts fold-order dependent); finiteScore
-// maps its score to the worst finite float so it deterministically ranks
-// last (still collected - unlike -infinity, which the score collectors'
-// sentinel would silently drop).
-TEST_F(KnnQueryTest, nanStoredVectorRanksLast) {
+// A NaN score must not poison the comparators (a non-total order makes the
+// sorts UB and the bounded cuts fold-order dependent); finiteScore maps it to
+// the worst finite float so the doc deterministically ranks last (still
+// collected - unlike -infinity, which the score collectors' sentinel would
+// silently drop). Stored vectors are finite, but opposite float32 overflows
+// accumulated in separate SIMD lanes still sum to inf + -inf = NaN (4 dims: a
+// shorter vector runs a sequential FMA chain, which saturates to inf instead).
+TEST_F(KnnQueryTest, nanScoreRanksLast) {
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::IP);
 
-  h.index(flatdoc("id", std::string("good1"), "embedding_v", std::vector<float>{3, 0, 0}));
+  h.index(flatdoc("id", std::string("good1"), "embedding_v", std::vector<float>{3, 0, 0, 0}));
   h.index(flatdoc("id", std::string("bad"), "embedding_v",
-                  std::vector<float>{std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f}));
-  h.index(flatdoc("id", std::string("good2"), "embedding_v", std::vector<float>{2, 0, 0}));
+                  std::vector<float>{3e38f, -3e38f, 0, 0}));
+  h.index(flatdoc("id", std::string("good2"), "embedding_v", std::vector<float>{2, 0, 0, 0}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*luxirNode, "embedding_v", {1, 0, 0}, 3);
+  auto* req = makeKnnReq(*luxirNode, "embedding_v", {2, 2, 0, 0}, 3);
   req->execute();
   auto ids = resultIds(*req);
   ASSERT_EQ(ids.size(), 3u);
   EXPECT_EQ(ids[0], "good1");
   EXPECT_EQ(ids[1], "good2");
   EXPECT_EQ(ids[2], "bad");
+  auto scores = resultScores(*req);
+  ASSERT_EQ(scores.size(), 3u);
+  EXPECT_EQ(scores[2], std::nextafter(std::numeric_limits<float>::lowest(), 0.0f))
+      << "bad must score NaN (mapped), not merely low";
   req->done();
 }
 
@@ -2996,4 +3004,103 @@ TEST_F(KnnQueryTest, cosineRawColumnRescoreNormalizes) {
   EXPECT_NEAR(scores[2], 0.6f, 1e-5);
 
   req->done();
+}
+
+TEST_F(KnnQueryTest, scanAndRescoreFanoutSpawnCounts) {
+  for (int segments : {1, 4}) {
+    CollectionHelper h("knn_spawn" + std::to_string(segments));
+    installVecSchema(h.collection(), api::VectorMetric::L2);
+    for (int seg = 0; seg < segments; seg++) {
+      std::vector<Doc> docs;
+      for (int i = 0; i < 16; i++) {
+        docs.push_back(flatdoc("id", std::to_string(seg * 16 + i), "embedding_v",
+                              std::vector<float>{(float)(seg * 16 + i), 0, 0, 0}));
+      }
+      h.indexAll(docs, UpdateMessage::COMMIT);
+    }
+    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ((size_t)segments, reader->segments().size());
+    auto schema = h.collection().getSchema();
+    auto& fieldType = *(VectorFieldType*)schema->getFieldTypePtr("embedding_v");
+    std::vector<float> queryVec{0, 0, 0, 0};
+    for (bool parallel : {false, true}) {
+      for (bool approximate : {false, true}) {
+        for (int64_t grain : {1, 1000}) {
+          SCOPED_TRACE(::testing::Message() << segments << " units, parallel=" << parallel
+                       << ", approximate=" << approximate << ", grain=" << grain);
+          ScanGrainGuard grains(1, grain);
+          EngineWrapperGuard wrapper([](VectorEngine& engine, int64_t) {
+            return std::make_unique<QuantizingEngine>(engine);
+          });
+          if (!approximate) KnnQuery::engineWrapperForTests = nullptr;
+          MemPool pool;
+          Query::Context context(pool, *reader);
+          KnnQuery query("embedding_v", fieldType, queryVec, segments * 16,
+                         0, segments * 16, 0, !approximate);
+          auto* weight = query.createWeight(context, Query::NEED_SCORES);
+          std::vector<DocSet*> domains(segments, nullptr);
+          Query::Weight::PrepareContext prepare(*reader, domains, parallel, nullptr);
+          std::unique_ptr<Query::Weight::PreparedWeight> prepared;
+          int64_t spawns;
+          {
+            TaskSpawnCounter counter;
+            prepared = weight->prepare(prepare);
+            spawns = counter.count();
+          }
+          int64_t expected = parallel ? segments - 1 : 0;
+          if (parallel && approximate && grain == 1) expected += segments - 1;
+          EXPECT_EQ(expected, spawns);
+          int hits = 0;
+          for (auto& segment : reader->segments()) {
+            auto* scorer = prepared->createScorer(pool, segment);
+            ASSERT_NE(nullptr, scorer);
+            while (scorer->next() != PostingsReader::END) hits++;
+          }
+          EXPECT_EQ(segments * 16, hits);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(KnnQueryTest, ivfScanGrainSpawnCounts) {
+  IvfPqAuxGuard guard(4, 2, 2, 4, 16, 8);
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc("id", std::to_string(i), "embedding_v",
+                    std::vector<float>{(float)i, 0, 0, 0}));
+  }
+  h.commit({"*"});
+  auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  ASSERT_NE(nullptr, reader->segments()[0].getAuxReader("vec.embedding_v"));
+  auto schema = h.collection().getSchema();
+  auto& fieldType = *(VectorFieldType*)schema->getFieldTypePtr("embedding_v");
+  std::vector<float> queryVec{0, 0, 0, 0};
+  for (bool parallel : {false, true}) {
+    for (int64_t grain : {1, 1000}) {
+      SCOPED_TRACE(::testing::Message() << "parallel=" << parallel << ", grain=" << grain);
+      ScanGrainGuard grains(grain, 1);
+      MemPool pool;
+      Query::Context context(pool, *reader);
+      KnnQuery query("embedding_v", fieldType, queryVec, 10, 4, 160, 1, false);
+      auto* weight = query.createWeight(context, Query::NEED_SCORES);
+      std::array<DocSet*, 1> domains{nullptr};
+      Query::Weight::PrepareContext prepare(*reader, domains, parallel, nullptr);
+      std::unique_ptr<Query::Weight::PreparedWeight> prepared;
+      int64_t spawns;
+      {
+        TaskSpawnCounter counter;
+        prepared = weight->prepare(prepare);
+        spawns = counter.count();
+      }
+      EXPECT_EQ(parallel && grain == 1 ? 3 : 0, spawns);
+      auto* scorer = prepared->createScorer(pool, reader->segments()[0]);
+      ASSERT_NE(nullptr, scorer);
+      int hits = 0;
+      while (scorer->next() != PostingsReader::END) hits++;
+      EXPECT_EQ(10, hits);
+    }
+  }
 }

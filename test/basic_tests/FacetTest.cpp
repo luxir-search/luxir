@@ -2274,7 +2274,7 @@ TEST_F(FacetTest, boundedSelectionMatchesOrderingEveryBucket) {
 // They differ only in cost, so this pins them equal across segment seams,
 // multi-values, deleted documents, an absent-field segment and both domain
 // shapes - a cost rule cannot be written on a path that answers differently.
-TEST_F(FacetTest, bucketDomainSourcesAgree) {
+static void checkBucketDomainSources(bool forced) {
   CollectionHelper helper;
   helper.clear();
   ASSERT_TRUE(helper.indexAll(std::array{
@@ -2296,7 +2296,13 @@ TEST_F(FacetTest, bucketDomainSourcesAgree) {
   ASSERT_TRUE(helper.deleteById("deleted", UpdateMessage::COMMIT).success);
   ASSERT_EQ(3u, helper.durableSegmentCount());
 
-  SearchOverridesGuard guard(forcedFacetBucketDomainSource);
+  SearchOverridesGuard guard(forcedFacetBucketDomainSource,
+      forcedFacetBucketBlockBuckets, forcedFacetBucketDomainByteBudget,
+      forcedFacetFeedStrategy, forcedFacetSubOpInline);
+  if (forced) {
+    forcedFacetFeedStrategy = FacetFeedStrategy::BUCKET_DOMAINS;
+    forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
+  }
   // A finite limit with no sort key keeps the metrics on the post-selection
   // feed, which is the stage under test.
   auto addFacets = [](auto& cursor) {
@@ -2345,7 +2351,22 @@ TEST_F(FacetTest, bucketDomainSourcesAgree) {
         << "domainKind=" << domainKind;
     EXPECT_EQ(expected, run(FacetBucketDomainSource::AUTO, domainKind))
         << "domainKind=" << domainKind;
+    if (forced) for (bool chunks : {false, true}) {
+      // Separate blocks, then several single-bucket chunks within one block.
+      forcedFacetBucketBlockBuckets = chunks ? 10 : 1;
+      forcedFacetBucketDomainByteBudget = chunks ? 1 : 0;
+      EXPECT_EQ(expected, run(FacetBucketDomainSource::ORD_COLUMN, domainKind))
+          << "domainKind=" << domainKind << " chunks=" << chunks;
+    }
   }
+}
+
+TEST_F(FacetTest, bucketDomainSourcesAgree) {
+  checkBucketDomainSources(false);
+}
+
+TEST_F(FacetTest, bucketDomainSourcesForcedBlocksAgree) {
+  checkBucketDomainSources(true);
 }
 
 // AUTO chooses the construction on coverage against selectivity, not on either
@@ -3260,8 +3281,9 @@ public:
     BlockProbe& probe;
 
   public:
-    Calc(ProbeOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : Calculator(op, parent, slot, numSlots), probe(op.probe) {
+    Calc(ProbeOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = {})
+      : Calculator(op, parent, slot, numSlots, structural), probe(op.probe) {
       probe.maxLiveBindings =
           std::max(probe.maxLiveBindings, ++probe.liveBindings);
     }
@@ -3279,8 +3301,9 @@ public:
   };
 
   Calculator* createCalculator(
-      Calculator* parent, int64_t slot, int64_t numSlots) override {
-    return new Calc(*this, parent, slot, numSlots);
+      Calculator* parent, int64_t slot, int64_t numSlots,
+      const StructuralConstraint* structural = {}) override {
+    return new Calc(*this, parent, slot, numSlots, structural);
   }
 
   size_t facetBucketResidentBytes() const override {
@@ -5998,4 +6021,158 @@ TEST_F(FacetTest, selectedAnyVariantsUseTheRoutedFilterCap) {
   EXPECT_NE(std::string::npos,
             req->errorMsg().find("routed filter variant cap 64 exceeded"))
       << req->errorMsg();
+}
+
+TEST_F(FacetTest, resetIdentityPostingsPointsAndColumnFallbackAgree) {
+  SearchOverridesGuard guard(forcedFacetBucketDomainSource, forcedFacetFeedStrategy,
+      forcedFacetBucketBlockBuckets, forcedFacetBucketDomainByteBudget);
+  forcedFacetFeedStrategy = FacetFeedStrategy::BUCKET_DOMAINS;
+  forcedFacetBucketDomainSource = FacetBucketDomainSource::ORD_COLUMN;
+  forcedFacetBucketBlockBuckets = 2;
+  forcedFacetBucketDomainByteBudget = 1; // Several span-local fallback chunks per block.
+  std::vector<std::vector<std::byte>> expected;
+  for (bool indexed : {true, false}) {
+    std::string collection = indexed ? "indexed" : "columns";
+    CollectionHelper helper(collection);
+    SchemaBuilder schema;
+    for (std::string_view name : {"value_s", "value_i"}) {
+      auto& field = schema.field(name);
+      field.type = name.ends_with("_s") ? api::FieldDef::FieldClass::STRING
+                                       : api::FieldDef::FieldClass::INT;
+      // String facets require indexing. Numeric fields exercise the joint
+      // column fallback when their points index is absent.
+      field.index = name.ends_with("_s") ? api::FieldDef::IndexMode::MATCH
+          : indexed ? api::FieldDef::IndexMode::RANGE : api::FieldDef::IndexMode::NONE;
+      field.multi = true;
+    }
+    schema.set(helper.collection());
+    for (int segment = 0; segment < 3; segment++) {
+      std::vector<Doc> docs;
+      for (int i = segment * 12; i < (segment + 1) * 12; i++) docs.push_back(flatdoc(
+          "id", std::to_string(i), "value_s", vecs("v" + std::to_string(i % 4),
+              "v" + std::to_string((i + 1) % 4)),
+          "value_i", std::vector<int64_t>{i % 4, (i + 1) % 4},
+          "stock_i", (int64_t)(i % 3), "eligible_s", i % 5 == 0 ? "yes" : "no"));
+      ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    }
+    ASSERT_TRUE(helper.deleteByIds({"0", "17"}, UpdateMessage::COMMIT).success);
+    for (int parallel : {1, -1}) {
+      auto req = localReq(helper.getSearchEngine());
+      auto json = R"({"collection":")" + collection + R"(",
+        "query":"eligible_s:yes","limit":0,"ops":{
+          "strings":{"field_facet":{"field":"value_s","limit":-1,"ops":{
+            "rows":{"top_docs":{"sort":"id asc","limit":-1,"fields":["id"],"document_format":"rows"},
+              "domain":{"query":"*:*","filter":["stock_i:>0"]}}}}},
+          "numbers":{"field_facet":{"field":"value_i","limit":-1,"ops":{
+            "rows":{"top_docs":{"sort":"id asc","limit":-1,"fields":["id"],"document_format":"rows"},
+              "domain":{"query":"*:*","filter":["stock_i:>0"]}}}}},
+          "ranges":{"range_facet":{"field":"value_i","start":0,"end":4,"gap":2,"ops":{
+            "rows":{"top_docs":{"sort":"id asc","limit":-1,"fields":["id"],"document_format":"rows"},
+              "domain":{"query":"*:*","filter":["stock_i:>0"]}}}}}
+        }})";
+      ASSERT_TRUE(api::read_json(req->rawRequest(), json, req->mr)) << json;
+      req->execute(parallel);
+      ASSERT_TRUE(req->ok()) << req->errorMsg();
+      std::vector<std::vector<std::byte>> actual;
+      for (std::string_view name : {"strings", "numbers", "ranges"}) {
+        actual.emplace_back();
+        const auto& result = topFacetResult(*req, "q", name);
+        EXPECT_TRUE(api::encode(result, actual.back()));
+        for (size_t bucket = 0; bucket < result.counts.size(); bucket++) {
+          int64_t lo, hi;
+          if (name == "strings") {
+            lo = std::get<api::ColStr>(result.bucket_ids->kind).v[bucket][1] - '0';
+            hi = lo + 1;
+          } else if (name == "numbers") {
+            lo = std::get<api::ColInt>(result.bucket_ids->kind).v[bucket];
+            hi = lo + 1;
+          } else {
+            lo = (int64_t)bucket * 2;
+            hi = lo + 2;
+          }
+          std::vector<std::string> expectedIds;
+          for (int doc = 0; doc < 36; doc++) {
+            if (doc == 0 || doc == 17 || doc % 3 == 0) continue;
+            if ((doc % 4 >= lo && doc % 4 < hi)
+                || ((doc + 1) % 4 >= lo && (doc + 1) % 4 < hi)) {
+              expectedIds.push_back(std::to_string(doc));
+            }
+          }
+          std::sort(expectedIds.begin(), expectedIds.end());
+          std::vector<std::string> ids;
+          for (const auto& doc : metricValues(result, "rows")[bucket].docList()->docs) {
+            ids.emplace_back(doc.fields.at("id")->asString());
+          }
+          EXPECT_EQ(expectedIds, ids) << name << ' ' << bucket;
+        }
+      }
+      if (expected.empty()) expected = actual;
+      else EXPECT_EQ(expected, actual) << indexed << ' ' << parallel;
+    }
+  }
+}
+
+TEST_F(FacetTest, floatingRangeResetIdentity) {
+  CollectionHelper helper;
+  setRangeFacetSchema(helper, std::array{
+      RangeSchemaField{"value_f", true, false, api::FieldDef::FieldClass::FLOAT},
+      RangeSchemaField{"value_d", true, false, api::FieldDef::FieldClass::DOUBLE}});
+  for (int i = 0; i < 8; i++) {
+    ASSERT_TRUE(helper.index(flatdoc("id", std::to_string(i),
+        "value_f", (float)(i % 4), "value_d", (double)(i % 4)), UpdateMessage::COMMIT).success);
+  }
+  for (int parallel : {1, -1}) {
+    auto req = localReq(helper.getSearchEngine());
+    ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","query":"id:0",
+      "limit":0,"ops":{"f":{"range_facet":{"field":"value_f","start":0,"end":4,"gap":2,
+        "ops":{"n":{"top_docs":{"limit":0,"get_number":true},"domain":{"query":"*:*"}}}}},
+      "d":{"range_facet":{"field":"value_d","start":0,"end":4,"gap":2,
+        "ops":{"n":{"top_docs":{"limit":0,"get_number":true},"domain":{"query":"*:*"}}}}}}})",
+      req->mr));
+    req->execute(parallel);
+    ASSERT_OK(req);
+    for (std::string_view name : {"f", "d"}) {
+      for (const auto& n : metricValues(topFacetResult(*req, "q", name), "n")) {
+        EXPECT_EQ(4, n.docList()->found.value_or(-1));
+      }
+    }
+  }
+}
+
+TEST_F(FacetTest, wideRangeResetPredicateOracle) {
+  CollectionHelper helper;
+  setRangeFacetSchema(helper, std::array{RangeSchemaField{
+      "price_i", true, false, api::FieldDef::FieldClass::INT}});
+  for (int segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int i = segment * 100; i < (segment + 1) * 100; i++) {
+      docs.push_back(flatdoc("id", std::to_string(i), "price_i", (int64_t)(i % 100),
+          "brand_s", i % 2 ? "a" : "b", "stock_i", (int64_t)(i % 3 != 0)));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteByIds({"10", "23"}, UpdateMessage::COMMIT).success);
+  for (int parallel : {1, -1}) for (bool nested : {false, true}) {
+    std::string ranges = R"({"prices":{"range_facet":{"field":"price_i","start":0,"end":50,
+      "gap":50,"ops":{"rows":{"top_docs":{"sort":"id asc","limit":-1,"fields":["id"],
+      "document_format":"rows"},"domain":{"query":"*:*","filter":["stock_i:>0"]}}}}}})";
+    auto req = localReq(helper.getSearchEngine());
+    std::string ops = nested ? R"({"brands":{"field_facet":{"field":"brand_s","ops":)"
+        + ranges + "}}}" : ranges;
+    ASSERT_TRUE(api::read_json(req->rawRequest(),
+        R"({"collection":"main","query":"id:1","limit":0,"ops":)" + ops + "}", req->mr));
+    req->execute(parallel);
+    ASSERT_OK(req);
+    const auto& top = topFacetResult(*req, "q", nested ? "brands" : "prices");
+    const auto& prices = nested ? *metricValues(top, "prices")[0].facetResult() : top;
+    const auto& rows = *metricValues(prices, "rows")[0].docList();
+    std::vector<std::string> expected, actual;
+    for (int i = 0; i < 300; i++) {
+      if (i == 10 || i == 23 || i % 100 >= 50 || i % 3 == 0 || (nested && i % 2 == 0)) continue;
+      expected.push_back(std::to_string(i));
+    }
+    std::sort(expected.begin(), expected.end());
+    for (const auto& doc : rows.docs) actual.emplace_back(doc.fields.at("id")->asString());
+    EXPECT_EQ(expected, actual);
+  }
 }

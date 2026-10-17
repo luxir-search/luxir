@@ -21,6 +21,8 @@ class GeoDistanceQuery final : public Query {
   double radiusMeters;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static constexpr std::string_view QUERY_NAME = "GeoDistanceQuery";
   using Weight = GeoQueryWeight<GeoDistanceQuery, BKDDistanceRelation>;
 

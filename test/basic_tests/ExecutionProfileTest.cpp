@@ -6,21 +6,27 @@
 #include <array>
 #include <chrono>
 #include <future>
+#include <latch>
 #include <memory_resource>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
+#include <oneapi/tbb/global_control.h>
 
 #include "luxir/api/padded_input.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/search/ops/SearchOp.h"
 #include "luxir/server/JsonRequest.h"
 #include "luxir/server/JsonResponse.h"
+#include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/LuxirTest.h"
+#include "test/TaskSpawnCounter.h"
 #include "test/TestUtils.h"
 
 namespace luxir::test {
@@ -527,6 +533,209 @@ TEST_F(ExecutionProfileTest, maxParallelMinusOneRunsOnCallingThreadInNodeArena) 
   EXPECT_EQ(helper.getNode().getTaskArena().max_concurrency(),
             static_cast<DispatchReq*>(req.get())->replyArenaConcurrency);
   ASSERT_OK(req);
+}
+
+TEST_F(ExecutionProfileTest, facetFanoutSpawnCounts) {
+  for (int segments : {1, 4}) {
+    CollectionHelper helper("fanout" + std::to_string(segments));
+    for (int seg = 0; seg < segments; seg++) {
+      std::vector<Doc> docs;
+      for (int i = 0; i < 64; i++) {
+        docs.push_back(flatdoc("id", std::to_string(seg * 64 + i),
+                              "sel01_s", i % 2 ? "t" : "f",
+                              "cat_s", "c" + std::to_string(i % 8),
+                              "unique_s", std::to_string(seg * 64 + i)));
+      }
+      helper.indexAll(docs, UpdateMessage::COMMIT);
+    }
+    ASSERT_EQ((size_t)segments,
+              helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+    for (const char* field : {"cat_s", "unique_s"}) {
+      for (bool filtered : {false, true}) {
+        for (int repeat = 0; repeat < 2; repeat++) {
+          SCOPED_TRACE(::testing::Message() << segments << " segments, " << field
+                       << ", filtered=" << filtered << ", repeat=" << repeat);
+          auto req = localReq(helper.getSearchEngine());
+          req->collection("fanout" + std::to_string(segments));
+          auto& top = req->topDocs("q").allQuery().limit(0).fields({"id"});
+          if (filtered) top.matchFilter("sel01_s", "t");
+          top.facet("facet", field).limit(10);
+          int64_t spawns;
+          {
+            TaskSpawnCounter counter;
+            helper.getSearchEngine().dispatch(*req.get(), -1);
+            spawns = counter.count();
+          }
+          ASSERT_OK(req);
+          EXPECT_EQ(segments - 1, spawns);
+          ASSERT_NE(nullptr, req->docList());
+          EXPECT_EQ(0, req->docList()->row_count);
+          const auto* facet = req->docList()->ops.at("facet")->facetResult();
+          ASSERT_NE(nullptr, facet);
+          if (std::string_view(field) == "cat_s") {
+            ASSERT_EQ(filtered ? 4u : 8u, facet->counts.size());
+            EXPECT_EQ((filtered ? 32 : 64) * segments,
+                      std::accumulate(facet->counts.begin(), facet->counts.end(), (int64_t)0));
+          } else {
+            ASSERT_EQ(10u, facet->counts.size());
+            for (auto count : facet->counts) EXPECT_EQ(1, count);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(ExecutionProfileTest, currentPerColumnFieldLoadSpawnCounts) {
+  CollectionHelper helper("fanout_columns");
+  helper.index(flatdoc("id", "1", "cat_s", "a", "value_i", (int64_t)7), UpdateMessage::COMMIT);
+  for (int columns : {1, 2, 3}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("fanout_columns");
+    std::vector<std::string> fields{"id", "cat_s", "value_i"};
+    fields.resize(columns);
+    req->topDocs("q").allQuery().limit(1).fields(fields);
+    int64_t spawns;
+    {
+      TaskSpawnCounter counter;
+      helper.getSearchEngine().dispatch(*req.get(), -1);
+      spawns = counter.count();
+    }
+    ASSERT_OK(req);
+    EXPECT_EQ(columns - 1, spawns);
+    EXPECT_EQ(1, req->docList()->row_count);
+  }
+}
+
+TEST_F(ExecutionProfileTest, topLevelOpsOverlap) {
+  CollectionHelper helper("fanout_overlap");
+  helper.indexAll(std::array{flatdoc("id", "1", "cat_s", "a"),
+                            flatdoc("id", "2", "cat_s", "b")}, UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("fanout_overlap");
+  req->facet("a", "cat_s");
+  req->facet("b", "cat_s");
+  std::promise<void> firstStarted, secondStarted;
+  auto first = firstStarted.get_future();
+  auto second = secondStarted.get_future();
+  std::latch release(1);
+  std::atomic<int> arrivals{0};
+  Signal::listen("searchRootChildStart", [&](void*, void*, void*) -> void* {
+    if (arrivals.fetch_add(1) == 0) {
+      firstStarted.set_value();
+      release.wait();
+    } else {
+      secondStarted.set_value();
+    }
+    return nullptr;
+  });
+  int64_t spawns;
+  {
+    TaskSpawnCounter counter;
+    std::thread search([&] { helper.getSearchEngine().dispatch(*req.get(), -1); });
+    // Timeouts bound a broken dispatch; both start signals must arrive while
+    // the first op is still held by the latch.
+    EXPECT_EQ(std::future_status::ready, first.wait_for(std::chrono::seconds(10)));
+    EXPECT_EQ(std::future_status::ready, second.wait_for(std::chrono::seconds(10)));
+    release.count_down();
+    search.join();
+    spawns = counter.count();
+  }
+  Signal::unlisten("searchRootChildStart");
+  ASSERT_OK(req);
+  EXPECT_EQ(1, spawns);
+  EXPECT_EQ(2, arrivals.load());
+}
+
+TEST_F(ExecutionProfileTest, rankedSubOpRunsOnCaller) {
+  CollectionHelper helper("fanout_ranked");
+  helper.index(flatdoc("id", "1", "cat_s", "a"), UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("fanout_ranked").topDocs("q").allQuery().limit(1).fields({"id"})
+      .facet("facet", "cat_s");
+  std::thread::id childThread;
+  Signal::listen("searchTopDocsChildStart", [&](void*, void*, void*) -> void* {
+    childThread = std::this_thread::get_id();
+    return nullptr;
+  });
+  int64_t spawns;
+  {
+    TaskSpawnCounter counter;
+    helper.getSearchEngine().dispatch(*req.get(), -1);
+    spawns = counter.count();
+  }
+  Signal::unlisten("searchTopDocsChildStart");
+  ASSERT_OK(req);
+  EXPECT_EQ(std::this_thread::get_id(), childThread);
+  EXPECT_EQ(0, spawns);
+  EXPECT_EQ(1, req->docList()->row_count);
+  EXPECT_EQ(1, req->docList()->ops.at("facet")->facetResult()->counts[0]);
+}
+
+TEST_F(ExecutionProfileTest, inlineFailureCancelsPublishedSiblings) {
+  CollectionHelper helper("fanout_cancel");
+  helper.index(flatdoc("id", "1", "cat_s", "a"), UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("fanout_cancel");
+  for (const char* name : {"a", "b", "c"}) req->facet(name, "cat_s");
+  oneapi::tbb::global_control serial(oneapi::tbb::global_control::max_allowed_parallelism, 1);
+  std::atomic<int> started{0};
+  Signal::listen("searchRootChildStart", [&](void*, void*, void*) -> void* {
+    if (started.fetch_add(1) == 0) throw RequestError("inline failure", "invalid_request");
+    return nullptr;
+  });
+  helper.getSearchEngine().dispatch(*req.get(), -1);
+  Signal::unlisten("searchRootChildStart");
+  EXPECT_FALSE(req->ok());
+  EXPECT_EQ("invalid_request", req->errorCode());
+  EXPECT_EQ("inline failure", req->errorMsg());
+  EXPECT_EQ(1, started.load());
+}
+
+TEST_F(ExecutionProfileTest, rankedFacetFanoutSpawnCounts) {
+  for (int segments : {1, 4}) {
+    CollectionHelper helper("ranked" + std::to_string(segments));
+    for (int seg = 0; seg < segments; seg++) {
+      std::vector<Doc> docs;
+      for (int i = 0; i < 64; i++) {
+        docs.push_back(flatdoc("id", std::to_string(seg * 64 + i), "cat_s", "a",
+                              "rank_i", (int64_t)(i * segments + seg)));
+      }
+      helper.indexAll(docs, UpdateMessage::COMMIT);
+    }
+    ASSERT_EQ((size_t)segments,
+              helper.getIndexWriter()->snapshots.readers.getReader()->segments().size());
+    for (int profile : {0, -1}) {
+      for (bool loadFields : {false, true}) {
+        for (int64_t offset : {0, 1000}) {
+          SCOPED_TRACE(::testing::Message() << segments << " segments, profile=" << profile
+                       << ", fields=" << loadFields << ", offset=" << offset);
+          auto req = localReq(helper.getSearchEngine());
+          req->collection("ranked" + std::to_string(segments));
+          auto& top = req->topDocs("q").allQuery().limit(10).offset(offset)
+              .fields({loadFields ? "id" : "_score_"});
+          qb::sort(top, "rank_i", qb::DESC);
+          top.facet("facet", "cat_s").limit(10);
+          int64_t spawns;
+          {
+            TaskSpawnCounter counter;
+            helper.getSearchEngine().dispatch(*req.get(), profile);
+            spawns = counter.count();
+          }
+          ASSERT_OK(req);
+          int64_t expected = profile == 0 ? 0 : segments - 1;
+          if (profile == -1 && loadFields && offset == 0) expected += segments - 1;
+          EXPECT_EQ(expected, spawns);
+          ASSERT_NE(nullptr, req->docList());
+          EXPECT_EQ(offset == 0 ? 10 : 0, req->docList()->row_count);
+          const auto* facet = req->docList()->ops.at("facet")->facetResult();
+          ASSERT_NE(nullptr, facet);
+          ASSERT_EQ(1u, facet->counts.size());
+          EXPECT_EQ(64 * segments, facet->counts[0]);
+        }
+      }
+    }
+  }
 }
 
 } // namespace luxir::test

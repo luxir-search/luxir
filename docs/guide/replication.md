@@ -1,7 +1,9 @@
 # Replication, copies and failover
 
-Luxir has no authentication or authorization. Restrict both ordinary APIs and
-replication endpoints to trusted networks. Replication uses HTTP, without TLS.
+A follower keeps a verified, continuously updated copy of a writer's
+collections and serves searches from it. Writes can wait until followers serve
+them, and reads can wait for a given commit, so a client can read its own
+writes from any node.
 
 ## Start a writer and a follower
 
@@ -13,32 +15,23 @@ luxir --replicate-from http://writer:9400 --store.backend=fs --store.data-dir=/d
 curl http://reader:9400/_replication/status
 ```
 
-A follower serves ordinary local searches and follows every tenant by default.
-Use `--replication.tenants alpha,beta` to follow only those tenants. The subscription
-is fixed for the process; restart to change it. An empty setting follows all tenants.
-Tenant names use the same lowercase naming rules as collections; empty elements
-inside a nonempty list are rejected.
+A follower follows every tenant by default. Use
+`--replication.tenants alpha,beta` to follow only those tenants.
+
+Start a follower with an empty directory or an existing follower directory.
+Repointing `--replicate-from` to another
+source reuses files that already match. Followers reject updates, schema changes
+and collection admin, except deleting an [orphan](#diagnose-status).
 
 `--replication.peers http://reader2:9400,http://reader3:9400` lets a follower
 fetch files from other nodes before the source, offloading the source's
-bandwidth. Peers serve files by identity from their current or pinned snapshots;
-they are tried in order, once each, and a transfer resumes at the same offset
-on the next peer or the source. Every file is verified against the manifest
-digest, and a copy that fails verification is fetched again from the source.
-Peers never decide which commit is current or that a collection is gone: the
-source's catalog does, and it announces each commit with the xxh3 digest of
-its manifest (16 lowercase hex digits, like the `xxh3` file parameter), which
-the follower checks.
-Start it with an empty directory or an existing follower directory. Repointing
-`--replicate-from` to another source reuses files whose name, size and xxh3 digest
-match, including across incarnations. An existing data directory must be a
-follower directory; ordinary writer data directories are refused. Updates, schema
-changes and collection admin are rejected, except deleting an orphan (below).
+bandwidth. Every file is verified against the manifest the source announced,
+and only the source decides which commit is current.
 
-New collections appear even when empty. A same-boot recreate replaces the old
-incarnation, including with an empty snapshot. Across a source restart, a new
-empty incarnation keeps a populated local copy serving until the source commits
-data. A source collection that becomes unavailable never means deletion.
+New, recreated and deleted collections on the source are followed
+automatically. A source that restarts without its data, such as a RAM writer,
+does not empty its followers: a follower keeps serving its copy until the source
+commits data to that collection.
 
 If a local collection cannot be opened at startup, the follower keeps its files
 and reports it unavailable. A later verified install can replace it. Until then,
@@ -48,146 +41,260 @@ manifest digest also makes the copy unreadable; the next install keeps the
 files that still verify and fetches only the damaged ones. See
 [file integrity checks](operations.md#file-integrity-checks).
 
+## Try it on one machine
+
+Start a writer on port 9400 and a follower on port 9500, each in its own
+terminal:
+
+```sh
+luxir -p 9400 --store.backend=fs --store.data-dir=/tmp/luxir/writer
+luxir -p 9500 --replicate-from http://localhost:9400 --store.backend=fs --store.data-dir=/tmp/luxir/reader
+```
+
+The follower picks up the writer's default `main` collection:
+
+```http
+GET /_replication/status
+Host: localhost:9500
+```
+
+```json
+{
+  "source": "http://localhost:9400",
+  "follower": "myhost:9500",
+  "connected": true,
+  "last_contact": 1791237685529,
+  "collections": [
+    {
+      "name": "main",
+      "tenant": "t0",
+      "source_commit": "1048a9465ba18ea6:1",
+      "serving_commit": "1048a9465ba18ea6:1",
+      "state": "serving"
+    }
+  ]
+}
+```
+
+`follower` is the name the writer knows this follower by, its host and HTTP
+port. Set `--replication.follower-id` when hostnames are not unique.
+
+The examples below use these two nodes.
+
 ## Write, then read your write
 
-```sh
-curl 'http://writer:9400/collections/main/_update?commit=true&wait_for_replicas=all&wait_for_replicas_timeout_ms=30000' \
-  -H 'Content-Type: application/x-ndjson' -d '{"id":"example"}'
-# Use the returned commit token:
-curl 'http://reader:9400/collections/main/_search?min_commit=INCARNATION:GEN&min_commit_timeout_ms=30000' \
-  -H 'Content-Type: application/json' -d '{"query":"id:example"}'
-```
-
-A commit token is `INCARNATION:GEN`. The URL syntax
-`wait_for_replicas=N|all` forces an immediate commit and returns `commit` plus
-`replicas: {wanted, serving, outcome}`. JSON/NDJSON commit objects and gRPC use
-one typed requirement: `"wait_for_replicas":{"count":2}` or
-`"wait_for_replicas":{"all":{}}`. An explicit count of zero checks immediately.
-`wait_for_replicas_timeout_ms` defaults to 30000; zero checks without parking.
-
-The outcome is `satisfied`, `timed_out`, or `cancelled`. It is separate from
-local commit success: timeout, client cancellation, server shutdown, and a
-collection removed or recreated after the commit all preserve the durable token.
-Cancellation never turns a successful local commit into an update error.
-Completed update bodies are released before the visibility wait.
-
-`all` captures live followers already serving some commit of that collection's
-incarnation when the commit completes. Watch-only and still-syncing followers
-are excluded; later arrivals do not join. Captured followers that expire stop
-being required, as do followers whose next watch unsubscribes from the collection's
-tenant. Subscription changes discard acknowledgments outside the new subscription;
-re-inclusion requires a fresh acknowledgment and never rejoins an already captured
-wait. A dead follower remains live for
-`replication.follower-timeout-ms`, so `all` can time out before it expires.
-A numeric N can exceed the live count and waits until timeout.
-
-Retry visibility without committing again:
+Add a document on the writer and schedule a commit within one second:
 
 ```sh
-curl 'http://writer:9400/collections/main/_wait_for_replicas?wait_for_replicas=all&wait_for_replicas_timeout_ms=30000' \
-  -H 'Content-Type: application/json' -d '{"commit":"INCARNATION:GEN"}'
+curl 'http://localhost:9400/collections/main/_update' \
+  -H 'Content-Type: application/json' \
+  -d '{"docs": [{"id": "example"}], "commit": {"commit_within_ms": 1000}}'
 ```
 
-The body may also supply `wait_for_replicas` and
-`wait_for_replicas_timeout_ms`; URL values override them. gRPC exposes the same
-operation as `Admin.WaitForReplicas`. The response is `{commit, replicas}`.
-For standalone waits, `all` captures membership when the request starts.
-Create-collection and schema-update responses return the snapshot they published.
-Search response envelopes return the token of the reader actually used; pass it
-as the next request's `min_commit` for monotonic reads.
+The update returns without waiting for the commit. Wait about a second for
+the commit and for the follower to pull the changes, then search the follower:
 
-`min_commit` waits for the requested generation or a descendant of the same
-incarnation, on either writers or followers. At timeout, an insufficient
-snapshot returns 503 `stale_replica`; a different incarnation returns 409
-`commit_incarnation_mismatch`. Writers/read-only nodes reject an incarnation
-mismatch immediately; followers allow time for an incarnation switch.
-Both timeout defaults are 30000 ms. Waits do not block later commits. A timeout
-never rolls back a committed write. Transport cancellation completes a parked
-wait as cancelled. HTTP observes socket failures while parked without consuming
-queued request bytes. A write-half-close is valid, so EOF alone is not proof of
-cancellation. Ambiguous EOF, or a disconnect behind queued pipelined bytes, may
-only be resolved by the next I/O operation or wait deadline.
+```sh
+sleep 1
+curl 'http://localhost:9500/collections/main/_search?query=id:example'
+```
 
-An NDJSON URL EOF commit covers only collections touched by that stream and
-always returns `commits: {name: {commit?, replicas?, error?}}`, even for one
-collection. An empty stream commits the URL's collection. `replicas` appears
-only when requested. A failed local commit sets that collection's `error`;
-replica wait outcomes preserve the durable `commit` token and local status. Every
-admitted outcome is returned. Any collection failure sets the overall
-`status: "error"` and a top-level `error`, with HTTP 200, as for a unary commit
-failure. Unary updates keep `commit`/`replicas`. A floor also protects reads
-sent to followers excluded from captured `all`.
+```json
+{"commit":"1048a9465ba18ea6:2","docs":[{"id":"example"}]}
+```
+
+## Guaranteed visibility
+
+Replication is asynchronous, so a follower can lag behind the writer. A commit
+token, `INCARNATION:GEN`, identifies a published snapshot: commit,
+create-collection and schema-update responses return the token they published,
+and search responses return the token they served. There are three ways to
+guarantee that a write is visible.
+
+### 1. Immediate commit
+
+An immediate commit on a writer guarantees that later searches on that writer
+see it. The default `freshness_ms=0` selects the latest local commit; a
+positive value allows an older view. A follower is not covered.
+
+```sh
+curl 'http://localhost:9400/collections/main/_update?commit=true' \
+  -H 'Content-Type: application/json' -d '{"docs": [{"id": "example"}]}'
+curl 'http://localhost:9400/collections/main/_search?query=id:example'
+```
+
+The update response carries the commit token, which the next two ways use:
+
+```json
+{"update_version": 2, "status": "ok", "commit": "1048a9465ba18ea6:3"}
+```
+
+### 2. Commit and wait for followers
+
+Adding `wait_for_replicas` to an immediate commit returns only once followers
+serve it:
+
+```http
+POST /collections/main/_update?commit=true&wait_for_replicas=all
+Host: localhost:9400
+
+{"docs": [{"id": "example2"}]}
+```
+
+```json
+{
+  "update_version": 3,
+  "status": "ok",
+  "commit": "1048a9465ba18ea6:4",
+  "replicas": {"wanted": 1, "serving": 1, "outcome": "satisfied"}
+}
+```
+
+`satisfied` means every counted follower already serves that commit or a newer
+one, so a search on one of them sees the write. `all` counts the followers
+serving that collection when the commit completes: one that is still syncing
+or joins later is not covered, and reads sent to it should use `min_commit`
+below. A dead follower counts until `replication.follower-timeout-ms` expires,
+so `all` can time out.
+
+The outcome is `satisfied`, `timed_out` or `cancelled`, and
+`wait_for_replicas_timeout_ms` defaults to 30000. The commit is durable
+whatever the outcome. To retry a wait that timed out, commit again with
+`wait_for_replicas` and no documents: the new commit includes the earlier one.
+
+Creating a collection or updating a schema takes the same parameters. For a
+new collection, which no follower serves yet, `all` counts the live followers
+of its tenant that already serve another collection:
+
+```http
+POST /collections/_create?wait_for_replicas=all
+Host: localhost:9400
+
+{"name": "products"}
+```
+
+```json
+{
+  "commit": "860d5c67e1670c94:1",
+  "name": "products",
+  "replicas": {"wanted": 1, "serving": 1, "outcome": "satisfied"}
+}
+```
+
+In gRPC, `CreateCollectionRequest` and `SchemaRequest` carry the same fields.
+
+### 3. Wait for a commit when reading
+
+A read can do the waiting instead: pass a commit token as `min_commit` and the
+search waits until the node serves that commit or a newer one.
+
+```sh
+curl 'http://localhost:9500/collections/main/_search?query=id:example&min_commit=1048a9465ba18ea6:4'
+```
+
+`min_commit` works on either a writer or a follower, and requires that
+generation or a later one of the same incarnation, even if `freshness_ms`
+allows an older view. `min_commit_timeout_ms` defaults to 30000; if the node is
+still behind at timeout, the search returns 503 `stale_replica` instead of
+stale results. A writer rejects a different incarnation immediately with 409
+`commit_incarnation_mismatch`; a follower waits for the incarnation to change
+and returns that error if it still differs at timeout.
+
+Passing a response's token as the next request's `min_commit` also keeps reads
+monotonic.
 
 ## Copy, restore or promote
 
+`luxir pull` copies every collection from a running node into a directory,
+without starting a server:
+
 ```sh
-luxir pull http://writer:9400 /data/seed
-# Seed a follower:
-luxir --replicate-from http://writer:9400 --store.backend=fs --store.data-dir=/data/seed
-# Restore as an independent writer:
-luxir promote /data/seed
-luxir --store.backend=fs --store.data-dir=/data/seed
+luxir pull http://localhost:9400 /tmp/luxir/seed
 ```
 
-Pull starts no server. It prints each collection's commit, transferred/reused
-bytes and a summary; errors give a nonzero exit. Re-running is incremental and
-may use a different source URL. Membership is captured once, with each snapshot
-fetched when reached; this is not an atomic namespace-wide backup. Absent local
-collections are retained. Pull does not acknowledge serving traffic.
+```text
+main 1048a9465ba18ea6:4 transferred=263 reused=0
+Pull: 1 installed, 0 failed, transferred=263 reused=0
+```
 
-For manual failover, stop the old writer and the chosen FS follower, run
-`luxir promote DIR` on that follower's directory, then start it as a writer
-without `--replicate-from`. Promotion starts no server. It gives every
-collection a new incarnation, reusing immutable files after checking each
-one's size and xxh3 digest against the manifest, and prints each
-collection's new incarnation and a summary. Any failure gives a nonzero exit and
-keeps the directory follower-bound: a writer refuses to start on it, so no
-collection serves until all are promoted. Re-run `luxir promote` to finish;
-completed promotions are not repeated. Restart other followers with
-`--replicate-from http://new-writer:9400` and their existing directories.
-Use **pull plus promote** to restore, rather than copying a writer directory
-back over a live identity. Writer recovery from an older valid root also mints
-a new incarnation. Read-only nodes can open a follower directory directly.
+Re-running it is incremental, and may use a different source. Each collection
+is a consistent snapshot, but the collections are not captured at one instant.
+
+The copy is a follower directory. Start it as a follower to catch up with the
+source, or promote it to restore an independent writer:
+
+```sh
+# Seed a follower:
+luxir -p 9600 --replicate-from http://localhost:9400 --store.backend=fs --store.data-dir=/tmp/luxir/seed
+# Or, with no server running on it, restore it as a writer:
+luxir promote /tmp/luxir/seed
+luxir -p 9600 --store.backend=fs --store.data-dir=/tmp/luxir/seed
+```
+
+Promotion gives every collection a new incarnation while reusing its files.
+The promoted copy starts an independent commit history: it may be older than
+the previous writer, and future writes can diverge. A new incarnation keeps
+its commit tokens distinct, so an old `min_commit` token cannot incorrectly
+confirm a write that is missing from the promoted copy.
+
+Followers repointed to the promoted writer can switch to this history even
+if their local snapshot is newer. Generation numbers are compared only
+within an incarnation. The protection against replacing populated data with
+an empty source still applies.
+
+The command prints each collection's new incarnation:
+
+```text
+main 46cc218822c58397
+Promote: 1 promoted, 0 failed; promoted from follower of http://localhost:9400
+```
+
+If promotion fails partway, re-run it; the directory will not start as a writer
+until every collection is promoted. To restore a backup, use pull plus promote
+rather than copying a writer directory back over a live one. Read-only nodes can
+open a follower directory directly.
+
+For manual failover, stop the writer and the follower, promote the follower's
+directory, and start it as a writer:
+
+```sh
+luxir promote /tmp/luxir/reader
+luxir -p 9500 --store.backend=fs --store.data-dir=/tmp/luxir/reader
+```
+
+Restart other followers with `--replicate-from http://localhost:9500` and their
+existing directories.
 
 ## Diagnose status
 
-`GET /_replication/status` is the replication status surface. On followers it
-shows source, connection/last-contact information and per-collection source and
-serving commits, byte progress, `last_error` and `next_retry` (Unix milliseconds).
-It also lists live downstream followers, their serving commits and generation
-lag. Follower state lives here; `_stats` retains writer-side pin counters
-and node/per-collection RAM storage usage.
+`GET /_replication/status` shows the follower's source and last contact, each
+collection's source and serving commits, byte progress, `last_error` and
+`next_retry` (Unix milliseconds), and on a source, its live followers and their
+lag.
 
 | State | Meaning and action |
 |---|---|
 | `syncing` | Download/install in progress; the previous snapshot keeps serving. |
 | `serving` | The advertised snapshot is installed. |
-| `waiting` | A new source boot has an empty replacement for populated local data. Commit source data to replace it. |
-| `stale` | Source unreachable or collection unavailable. Repair the source/network; local searches continue. |
-| `orphan` | Local copy outside the tenant subscription, or name absent after a source boot change. Excluded copies can be deleted while disconnected; other orphans require a connected source. |
-| `error` | Inspect `last_error`; fix storage/network/corruption, then let `next_retry` run (backoff 1-60 s). A backwards generation requires restoring/promoting the source under a new incarnation. |
+| `waiting` | The source restarted without data for this collection; the follower keeps serving its copy. Commit data on the source to resume syncing. |
+| `stale` | Source unreachable or collection unavailable. Repair the source or network; the follower keeps serving searches from its copy. |
+| `orphan` | Local copy the follower will not sync or delete on its own. See below. |
+| `error` | Inspect `last_error`, fix storage/network/corruption, and let `next_retry` run (backoff from `retry-ms`, doubling to 60 s). A generation that moved backwards requires restoring or promoting the source under a new incarnation. |
 
-Automatic deletion requires current subscription membership, absence from a complete
-catalog for that tenant, and the same remembered source boot. Absence after a
-boot change leaves an orphan: a restart can hide a deletion. Narrowing the filter
-makes excluded local copies orphans immediately, even while disconnected. They
-are never synced, acknowledged or automatically deleted. Their source-boot and
-empty-replacement history is retained, so re-inclusion resumes normal recovery
-rules. Use `/tenants/TENANT/collections/_delete` to delete an excluded copy.
-Failed installs leave the old reader serving. Broken local replicas are discarded
-and fetched again. Fully verified candidate files survive restart and are checked for reuse;
-partial-file Range resume lasts only within a process.
+A follower deletes a local collection only when the source it has followed
+since that source's last restart no longer lists it. A collection missing after
+a source restart, or outside a narrowed `--replication.tenants`, becomes an
+orphan instead. Delete orphans with `/tenants/TENANT/collections/_delete`;
+excluded tenants can be deleted while disconnected, other orphans need the
+source connected.
 
-Use `--store.backend=ram` for a RAM writer or follower. RAM data and generated
-follower ids disappear on restart. A RAM writer starts new incarnations;
-followers keep old populated data until the first data commit. RAM followers
-refetch on restart. `--store.ram-limit-mb` (default 0, unlimited) bounds storage
-buffers independently of indexing memory. Pressure first drops the oldest
-pins retaining retired files, excluding current snapshots and open file
-transfers, then reports `storage_memory_limit` if space is still insufficient. Allow
-room for current data plus changed files; old readers can delay reclamation.
-Per-collection storage usage remains in `_stats`; node storage usage and
-its limit are in `_stats?memory=true` under `memory.storage_ram`.
+Use `--store.backend=ram` for a RAM writer or follower. RAM data is lost on
+restart, and RAM followers refetch. `--store.ram-limit-mb`
+(default 0, unlimited) bounds storage buffers. Under pressure, pins on retired
+files are dropped first; if space is still short, writes fail with
+`storage_memory_limit`. Allow room for current data plus changed files.
+Per-collection storage usage is in `_stats`; node storage usage and its limit
+are in `_stats?memory=true` under `memory.storage_ram`.
 
 ## Reference
 
@@ -196,53 +303,49 @@ All replication settings use `--replication.` (configuration keys use underscore
 | Setting | Default | Purpose |
 |---|---:|---|
 | `source` | empty | Source HTTP URL; `--replicate-from` is shorthand |
-| `follower-id` | generated | Persisted FS follower identity |
-| `tenants` | empty (all) | Comma-separated tenant subscription; immutable until restart |
+| `follower-id` | host:port | Name the source knows this follower by |
+| `tenants` | empty (all) | Comma-separated tenant subscription |
 | `peers` | empty | Comma-separated nodes serving file copies, tried before the source |
-| `max-acknowledgments` | 262144 | Node-wide follower/collection acknowledgment row budget |
+| `max-acknowledgments` | 262144 | Node-wide follower/collection acknowledgment budget |
 | `downloads` | 2 | Concurrent collection transfers |
-| `follower-timeout-ms` | 90000 | Live-follower window; watches are clamped to one third |
+| `follower-timeout-ms` | 90000 | How long a silent follower still counts as live |
+| `retry-ms` | 1000 | Follower delay before reconnecting to a lost source, and before the first retry of a failed sync |
 | `pin-idle-timeout-ms` | 60000 | Pin expires without byte progress |
 | `pin-retained-bytes` | 1 GiB | Per-collection retired bytes retained only by pins |
 
-Pins are shared by commit and survive individual requests. The retained-byte
-budget counts unique retired files held only by pins; current/merge-owned
-files do not count. Oldest pins are revoked first when that budget is
-exceeded. Snapshot acquisition and byte progress renew them; idle expiry or
-revocation aborts their transfers. A server timer checks expiry; internal users
-also expire pins on activity. `_stats` exposes `snapshot_pins`,
-`pin_retained_bytes`, `pin_idle_drops`, and `pin_budget_drops`. Pins and
-acks are process-local. Replication file transfers have a fixed 60 s idle deadline
-per socket write, so one stalled client cannot hold a transfer indefinitely while
-another client renews their shared pin. Followers back off after a lost
-pin.
+Copying a snapshot pins it so its files stay readable. A pin expires after
+`pin-idle-timeout-ms` without progress, and the oldest pins are revoked when
+retired files held only by pins exceed `pin-retained-bytes`. The follower then
+fetches a new snapshot and reuses the files it already verified. `_stats`
+reports `snapshot_pins`, `pin_retained_bytes`, `pin_idle_drops` and
+`pin_budget_drops`.
 
-Storage layout is `t/tenant/name/incarnation/`, with `CURRENT` containing
-only the selected incarnation. `replication.json` stores follower identity,
-last source URL and discovery/recovery state; it does not bind the source URL.
+A source tracks up to 4096 live followers and `max-acknowledgments`
+(follower, tenant, collection) rows. Beyond either, it returns 429
+`too_many_followers` or `too_many_acknowledgments`; existing rows still advance.
 
 | Endpoint | Contract |
 |---|---|
-| `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Full catalog for the subscription (`tenant=alpha&tenant=beta`, omit for all), one `{tenant, collection, commit, manifest_xxh3, available}` entry per collection in `{boot, cursor, collections}`; echo the opaque node-wide cursor. Publications in other tenants neither wake the watch nor force an immediate response. Foreign-boot, malformed and future cursors return immediately. Empty/invalid tenant parameters are rejected. Requested timeout is clamped to one third of the source follower timeout; followers request one third of their own. |
-| `GET /tenants/TENANT/collections/COLLECTION/_snapshot` | Pins the current snapshot; binary manifest and `X-Luxir-Commit`. Add `?format=json` to inspect files/sizes/digests. HEAD has no side effects. |
-| `GET /tenants/TENANT/collections/COLLECTION/_snapshot/files/NAME?commit=TOKEN` | File from a pin; optional single byte Range (206/416), HEAD supported. Malformed/multiple ranges return full 200. Missing membership: 404 `file_not_in_snapshot`; expired pin: 410 `snapshot_expired`. |
-| `GET /tenants/TENANT/collections/COLLECTION/_snapshot/files/NAME?size=BYTES&xxh3=HEX16` | The file with exactly that identity, from the current or any pinned snapshot, without pinning; Range as above. Otherwise 404 `file_not_held`. Peers serve followers this way. |
-| `POST /_replication/installed` | JSON `{follower, tenant, collection, commit}` acknowledges a serving snapshot. |
+| `GET /_replication/watch?since=CURSOR&timeout_ms=30000&follower=ID` | Long-polls the catalog `{boot, cursor, collections}`, one `{tenant, collection, commit, manifest_xxh3, available}` entry per collection. Repeat `tenant=` to restrict it; pass the returned cursor back. |
+| `GET /tenants/TENANT/collections/COLLECTION/_snapshot` | Pins the current snapshot; binary manifest and `X-Luxir-Commit`. Add `?format=json` to inspect files, sizes and digests. |
+| `GET /tenants/TENANT/collections/COLLECTION/_snapshot/files/NAME?commit=TOKEN` | A file from a pinned snapshot; single byte Range supported. 410 `snapshot_expired` when the pin is gone. |
+| `GET /tenants/TENANT/collections/COLLECTION/_snapshot/files/NAME?size=BYTES&xxh3=HEX16` | The file with that identity from the current or a pinned snapshot, without pinning; 404 `file_not_held` otherwise. Peers serve followers this way. |
+| `POST /_replication/installed` | `{follower, tenant, collection, commit}` acknowledges a serving snapshot. |
 | `GET /_replication/status` | Status described above. |
 
-Sources allow up to 4096 live follower identities, independently of the
-acknowledgment budget. Each acknowledged `(follower, tenant, collection)` consumes
-one row. Watch-only followers consume no acknowledgment rows. At the budget,
-existing rows can still advance, while new rows return HTTP 429
-`too_many_acknowledgments`. Follower capacity returns 429 `too_many_followers`.
-Expiry, unsubscription, collection deletion and incarnation replacement free rows.
-An acknowledgment outside the follower's latest watch subscription is rejected.
+Snapshot and file requests accept `follower=ID`, which keeps the follower live.
+The message shapes are
+[`ReplicationCatalog`](../reference/protobuf.md#message-luxir.replicationcatalog),
+[`ReplicationInstalled`](../reference/protobuf.md#message-luxir.replicationinstalled)
+and
+[`ReplicationCollectionStatus`](../reference/protobuf.md#message-luxir.replicationcollectionstatus).
 
-Snapshot/file GETs accept `follower=ID`; these, watches and installed acks renew
-liveness. On 410, back off, fetch a new snapshot and reuse verified files. Transfers send
-from the pinned mmap with advisory readahead and socket backpressure.
-The catalog uses the `ReplicationCatalog` proto message. Available entries always
-carry a commit; unavailable entries may omit it. Followers reject malformed entries
-and duplicate collection identities before applying any catalog changes.
-Installed acknowledgments use `ReplicationInstalled`; status states are the `ReplicationCollectionStatus.State`
-enum, rendered as lowercase JSON names. Acknowledgments never move backwards within an incarnation.
+## Limits
+
+- Luxir has no authentication, authorization or TLS. Restrict both ordinary
+  APIs and replication endpoints to trusted networks.
+- Failover is manual (`luxir promote`).
+- The tenant subscription is fixed for the life of the process.
+- `luxir pull` does not capture all collections at one instant.
+- Pins and acknowledgments are process-local, and a partially downloaded file
+  resumes only within the same follower process.

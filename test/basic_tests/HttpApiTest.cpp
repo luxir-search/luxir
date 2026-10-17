@@ -618,6 +618,12 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   EXPECT_TRUE(nodeJson.contains("collections"));
   EXPECT_FALSE(nodeJson.contains("memory"));
 
+  CollectionHelper metadataHelper("metadata");
+  ASSERT_TRUE(metadataHelper.index(flatdoc("id", "one", "n_i", 7), UpdateMessage::COMMIT).success);
+  auto metadataReader = metadataHelper.getIndexWriter()->snapshots.readers.getReader();
+  auto metadataField = metadataReader->field("n_i");
+  ASSERT_NE(nullptr, metadataField.at(0));
+
   // Node memory is a separate request that returns nothing else; the jemalloc
   // block is present only on jemalloc.
   auto memoryStats = httpRequest(port(), http::verb::get, "/_stats?memory=true");
@@ -634,6 +640,24 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
     EXPECT_TRUE(memoryJson["memory"]["jemalloc"].contains("allocated_bytes"));
     EXPECT_TRUE(memoryJson["memory"]["jemalloc"].contains("version"));
   }
+  const auto& metadata = memoryJson["memory"]["field_metadata"];
+  EXPECT_GT(metadata["entries"].get<int64_t>(), 0);
+  EXPECT_GT(metadata["pages"].get<int64_t>(), 0);
+  EXPECT_GE(metadata["names"].get<int64_t>(), 1);
+  EXPECT_EQ(metadata["bytes"].get<int64_t>(),
+            metadata["directory_bytes"].get<int64_t>() + metadata["page_bytes"].get<int64_t>()
+                + metadata["entry_bytes"].get<int64_t>() + metadata["name_bytes"].get<int64_t>());
+  for (int i = 0; i < 100; i++) {
+    EXPECT_FALSE(metadataReader->field(std::format("absent_{}_i", i)).exists());
+  }
+  auto afterMissing = httpRequest(port(), http::verb::get, "/_stats?memory=true");
+  ASSERT_EQ(200, afterMissing.result_int()) << afterMissing.body();
+  glz::generic_i64 afterMissingJson;
+  ASSERT_FALSE(glz::read_json(afterMissingJson, afterMissing.body()));
+  EXPECT_EQ(metadata["names"].get<int64_t>(),
+            afterMissingJson["memory"]["field_metadata"]["names"].get<int64_t>());
+  EXPECT_EQ(metadata["name_bytes"].get<int64_t>(),
+            afterMissingJson["memory"]["field_metadata"]["name_bytes"].get<int64_t>());
   auto badMemory = httpRequest(port(), http::verb::get, "/_stats?memory=yes");
   EXPECT_EQ(400, badMemory.result_int()) << badMemory.body();
   auto noMemory = httpRequest(port(), http::verb::get, "/_stats?memory=false");
@@ -1517,6 +1541,104 @@ TEST_F(HttpApiTest, ndjsonPipelinedInputFailureDrainsSubmittedPrefix) {
   ASSERT_EQ(200, query.status()) << query.rawResponse();
   EXPECT_EQ((int64_t)kDocCount, query.found()) << query.rawResponse();
 
+  localServer.shutdown();
+}
+
+// Document records are decoded on the task arena, so a malformed one that
+// looks like a document fails its batch there.  With one batch in flight the
+// stream stops at that batch: the batch before it is indexed, nothing after.
+TEST_F(HttpApiTest, ndjsonDeferredMalformedRecordFailsItsBatch) {
+  LuxirConfig config;
+  config.ingest.stream_batch_docs = 2;
+  config.ingest.max_inflight_batches = 1;
+  LuxirNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  std::string body;
+  for (int i = 0; i < 3; i++) body += R"({"id":"dm)" + std::to_string(i) + R"(","title_w":"deferredmalformed"})" "\n";
+  body += R"({"id":"dm-bad","title_w":})" "\n";
+  for (int i = 4; i < 8; i++) body += R"({"id":"dm)" + std::to_string(i) + R"(","title_w":"deferredmalformed"})" "\n";
+
+  auto update = httpRequest(localServer.getPort(), http::verb::post,
+      "/collections/dm/_update", std::move(body), "application/x-ndjson");
+  ASSERT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find(R"("code":"invalid_json")")) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find("stream document 3")) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find("docs_indexed_so_far=2")) << update.body();
+
+  ASSERT_EQ(200, httpRequest(localServer.getPort(), http::verb::post, "/collections/dm/_update",
+                             R"({"commit":{}})").result_int());
+  HttpReq query(localServer.getPort());
+  query.collection("dm").matchQuery("title_w", "deferredmalformed").fields({"id"}).limit(10).execute();
+  ASSERT_EQ(200, query.status()) << query.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"dm0", "dm1"}), idsOf(query.getDocs())) << query.rawResponse();
+  localServer.shutdown();
+}
+
+// A malformed document inside an all_or_none group fails the whole group,
+// still as invalid_json, and indexes none of it.
+TEST_F(HttpApiTest, ndjsonMalformedRecordInAllOrNoneGroup) {
+  std::string body =
+      R"({"_update_":{"request_id":"aon","all_or_none":true}})" "\n"
+      R"({"id":"aonm1","title_w":"aonmalformed"})" "\n"
+      R"({"id":"aonm2","title_w":"aonmalformed",})" "\n"
+      R"({"_end_":{"commit":{}}})" "\n";
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+                            std::move(body), "application/x-ndjson");
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find(R"("code":"invalid_json")")) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find("docs_indexed_so_far=0")) << update.body();
+
+  ASSERT_EQ(200, httpRequest(port(), http::verb::post, "/collections/main/_update",
+                             R"({"commit":{}})").result_int());
+  HttpReq query(port());
+  query.collection("main").matchQuery("title_w", "aonmalformed").fields({"id"}).limit(10).withStats().execute();
+  ASSERT_EQ(200, query.status()) << query.rawResponse();
+  EXPECT_EQ((int64_t)0, query.found()) << query.rawResponse();
+}
+
+// Control records keep their stream position while documents around them are
+// decoded later and in parallel: each group's ids come back in stream order,
+// and documents whose first key merely starts with '_' or that open with
+// whitespace stay documents.
+TEST_F(HttpApiTest, ndjsonControlRecordsInterleavedWithDeferredDocs) {
+  LuxirConfig config;
+  config.ingest.stream_batch_docs = 1;
+  config.ingest.max_inflight_batches = 8;
+  LuxirNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  std::string body;
+  std::vector<std::string> expected[2];
+  for (int g = 0; g < 2; g++) {
+    body += R"({"_update_":{"request_id":"ig)" + std::to_string(g) + R"(","return_ids":true}})" "\n";
+    for (int i = 0; i < 12; i++) {
+      std::string id = "ig" + std::to_string(g) + "-" + std::to_string(i);
+      expected[g].push_back(id);
+      if (i == 5) body += R"({"_header_":{"found":1}})" "\n";
+      body += i % 3 == 0 ? R"( { "id":")" + id + R"(","title_w":"interleaved"})" "\n"
+                         : R"({"id":")" + id + R"(","title_w":"interleaved"})" "\n";
+    }
+    body += R"({"_end_":{}})" "\n";
+  }
+  body += R"({"_end_": {"commit":{}}})" "\n";
+
+  auto update = httpRequest(localServer.getPort(), http::verb::post,
+      "/collections/il/_update", std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto lines = splitLines(update.body());
+  ASSERT_EQ(3u, lines.size()) << update.body();
+  for (int g = 0; g < 2; g++) {
+    EXPECT_NE(std::string::npos, lines[g].find(R"("request_id":"ig)" + std::to_string(g) + "\"")) << lines[g];
+    EXPECT_EQ(expected[g], idsInUpdateLine(lines[g])) << lines[g];
+  }
+
+  HttpReq query(localServer.getPort());
+  query.collection("il").matchQuery("title_w", "interleaved").fields({"id"}).limit(100).withStats().execute();
+  ASSERT_EQ(200, query.status()) << query.rawResponse();
+  EXPECT_EQ((int64_t)24, query.found()) << query.rawResponse();
   localServer.shutdown();
 }
 
@@ -2968,7 +3090,7 @@ TEST_F(HttpApiTest, schemaBodiesRetainVariantDefaultsAcrossAsyncDispatch) {
     "variants":{"words_for_search":"text",
                 "folded_for_value":{"type":"string","normalizer":["nfkc_cf"]}},
     "defaults":{"search":"words_for_search","value":"folded_for_value"}
-  }}})";
+  }},"stored_resources":{"_stored_http_schema_":{}}})";
   auto created = httpRequest(port(), http::verb::post, "/collections/_create",
       R"({"name":"http_schema_body","schema":)" + schema + "}");
   ASSERT_EQ(200, created.result_int()) << created.body();
@@ -4174,6 +4296,52 @@ TEST_F(HttpApiTest, ndjsonEofKeepsDurableTokensAfterReplicaWaitFailure) {
   EXPECT_EQ(kept, eof["commits"]["kept"]["commit"].get<std::string>());
   EXPECT_EQ(1, eof["commits"]["kept"]["replicas"]["serving"].get<int64_t>());
   EXPECT_FALSE(eof["commits"]["kept"].contains("error"));
+}
+
+TEST_F(HttpApiTest, collapseOverlayRowsColumnsAndDocs) {
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "z", "key_s", "z"),
+      flatdoc("id", "b", "key_s", "a"), flatdoc("id", "c", "key_s", "a"),
+      flatdoc("id", "missing")}, UpdateMessage::COMMIT).success);
+  auto echo = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request&collapse=key_s", R"({"collapse":{"field":"id","missing":"drop"}})");
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+  glz::generic_i64 canonical;
+  ASSERT_FALSE(glz::read_json(canonical, echo.body()));
+  auto& collapse = canonical["ops"]["q"]["top_docs"]["collapse"];
+  EXPECT_EQ("key_s", collapse["field"].get_array()[0].get_string());
+  EXPECT_FALSE(collapse.contains("missing")); // default expand
+  for (std::string format : {"rows", "columns"}) {
+    auto response = httpRequest(port(), http::verb::post,
+        "/collections/main/_search?collapse=key_s",
+        R"({"fields":["id"],"get_number":true,"batch_size":2,"document_format":")" + format + "\"}");
+    ASSERT_EQ(200, response.result_int()) << response.body();
+    std::vector<std::string> ids;
+    for (const auto& line : splitLines(response.body())) {
+      glz::generic_i64 body;
+      ASSERT_FALSE(glz::read_json(body, line));
+      EXPECT_EQ(3, body["found"].get<int64_t>());
+      EXPECT_EQ(4, body["found_docs"].get<int64_t>());
+      for (const auto& row : body["docs"].get_array()) {
+        ids.push_back(row["id"].get_string());
+        EXPECT_TRUE(row.contains("_group_"));
+      }
+    }
+    EXPECT_EQ((std::vector<std::string>{"z", "b", "missing"}), ids);
+  }
+  auto response = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?format=docs&collapse=key_s",
+      R"({"fields":["id"],"get_number":true,"batch_size":1})");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  auto lines = splitLines(response.body());
+  ASSERT_EQ(4, lines.size());
+  glz::generic_i64 header;
+  ASSERT_FALSE(glz::read_json(header, lines[0]));
+  EXPECT_EQ(3, header["_header_"]["found"].get<int64_t>());
+  EXPECT_EQ(4, header["_header_"]["found_docs"].get<int64_t>());
+  glz::generic_i64 singleton;
+  ASSERT_FALSE(glz::read_json(singleton, lines.back()));
+  EXPECT_TRUE(singleton["_group_"]["val"].is_null());
+  EXPECT_TRUE(singleton["_group_"]["singleton"].get<bool>());
 }
 
 } // namespace luxir::test

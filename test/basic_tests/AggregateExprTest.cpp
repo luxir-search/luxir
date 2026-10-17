@@ -63,11 +63,11 @@ void expectParseError(ArenaOwner& memory, Schema& schema,
   }
 }
 
-BucketScalar evaluate(AggregateProgram& program, IndexReader::Segment& segment) {
+BucketScalar evaluate(AggregateProgram& program, IndexReader& reader, IndexReader::Segment& segment) {
   MemPool pool;
   AggregateAccumulator accumulator(program);
   std::vector<BoundAggregateInput> bindings =
-      bindAggregateInputs(program, pool, segment);
+      bindAggregateInputs(program, pool, segment, resolveAggregateFields(program, pool, reader));
   int32_t maxDoc = segment.postingsReader().maxDoc();
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     for (size_t leaf = 0; leaf < bindings.size(); leaf++) {
@@ -239,7 +239,7 @@ TEST_F(AggregateExprTest, exactSumsMissingDefAndPerDocReducers) {
   ArenaOwner memory;
   auto eval = [&](std::string_view expression) {
     return evaluate(*parseAggregate(memory, *schema, expression),
-                    reader->segments()[0]);
+                    *reader, reader->segments()[0]);
   };
 
   BucketScalar exact = eval("sum(x_i)");
@@ -320,7 +320,7 @@ TEST_F(AggregateExprTest, outputOverflowBecomesContainedFailure) {
   auto schema = helper.collection().getSchema();
   ArenaOwner memory;
   AggregateProgram* program = parseAggregate(memory, *schema, "sum(x_i)", "wide");
-  BucketScalar value = evaluate(*program, reader->segments()[0]);
+  BucketScalar value = evaluate(*program, *reader, reader->segments()[0]);
   EXPECT_FALSE(value.valid);
   EXPECT_EQ(AggregateFailure::INT64_OUTPUT_OVERFLOW, value.failure);
 
@@ -592,14 +592,14 @@ TEST_F(AggregateExprTest, stringFacetInlineEmitsNullAndWarningOnFailure) {
   auto req = localReq(helper.getSearchEngine());
   auto& facet = req->collection("main").facet("f", "cat_s").limit(2);
   facet.expr("root", "sqrt(sum(x_i))");
-  facet.expr("missing", "sum(absent_i)");
+  facet.expr("absent", "sum(absent_i)");
   req->execute(false);
 
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
   ASSERT_NE(nullptr, result);
   const auto& roots = std::get<api::ArrVal>(result->ops.at("root")->kind).v;
-  const auto& missing = std::get<api::ArrVal>(result->ops.at("missing")->kind).v;
+  const auto& missing = std::get<api::ArrVal>(result->ops.at("absent")->kind).v;
   ASSERT_EQ(2u, roots.size());
   EXPECT_TRUE(roots[0].isNull());
   EXPECT_DOUBLE_EQ(2.0, roots[1].asDouble());

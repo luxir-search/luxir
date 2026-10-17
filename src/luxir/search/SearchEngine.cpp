@@ -80,10 +80,10 @@ void SearchEngine::submitBody(SearchRequest& req) {
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
     }
   } catch (std::exception& e) {
-    // Drain any in-flight tasks so they aren't writing into the response while
-    // we tear down.  wait() rethrows the first exception, so swallow it here.
+    // Cancel and drain in-flight tasks before tearing down their response.
+    // Swallow any parked task exception so the original error is preserved.
     if (req.tg) {
-      // TODO: notify other tasks about the error?
+      req.tg->cancel();
       try { req.tg->wait(); } catch (...) {}
     }
     ErrorInfo info = classifyException(e, fallback);

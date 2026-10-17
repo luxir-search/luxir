@@ -26,6 +26,8 @@ class GeoBoxQuery final : public Query {
   bool empty = false;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static constexpr std::string_view QUERY_NAME = "GeoBoxQuery";
   using Weight = GeoQueryWeight<GeoBoxQuery, BKDBoxRelation>;
 

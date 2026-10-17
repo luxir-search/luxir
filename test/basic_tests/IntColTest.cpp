@@ -3,7 +3,6 @@
 
 #include "luxir/index/Inverter.h"
 #include "luxir/index/PostingsWriter.h"
-#include "luxir/reader/FieldReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "gtest/gtest.h"
 #include "test/CollectionHelper.h"
@@ -604,10 +603,9 @@ TEST_F(IntColTest, valueSketchOnlyForSortableColumns) {
     ASSERT_EQ(segments, reader->segments().size());
     for (auto& segment : reader->segments()) {
       for (std::string_view field : {"one_i", "many_is"}) {
-        FieldReader fieldReader(segment.postingsReader());
-        ASSERT_TRUE(fieldReader.seek(field));
-        SegFieldInfo fieldInfo;
-        fieldReader.readFieldInfo(fieldInfo);
+        auto* fieldReader = segment.postingsReader().fieldInfo(field);
+        ASSERT_TRUE((fieldReader != nullptr));
+        const auto& fieldInfo = *fieldReader;
         IntColReader column(segment.postingsReader(), fieldInfo);
         const auto& sketch = column.leafMeta().valueSketch();
         EXPECT_EQ(field == "one_i", !sketch.empty()) << field;
