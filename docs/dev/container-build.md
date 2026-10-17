@@ -66,9 +66,12 @@ The copied port files use [vcpkg's MIT license](../../deps/ports/LICENSE.vcpkg).
 ./tools/dev-container env ASAN_OPTIONS=detect_leaks=1:allow_addr2line=1 build/container-asan/bin/luxir_test --gtest_brief=1 --gtest_print_time=0
 ```
 
-Run builds sequentially. The compile job limit accounts for physical memory,
-container memory limits, and ASan's larger compiler processes. Override it with
-`-DLUXIR_COMPILE_JOBS=N` when configuring if necessary.
+The compile and link job limits account for physical cores, container CPU and
+memory limits, and ASan's larger compiler processes. Concurrent container and
+host builds share them through the build slots in the shared Luxir cache; see
+[Parallelism and shared caches](build-setup.md#parallelism-and-shared-caches).
+Override them with `-DLUXIR_COMPILE_JOBS=N` and `-DLUXIR_LINK_JOBS=N` when
+configuring if necessary.
 
 CMake downloads checksum-verified book and Unicode fixtures into each build's
 `test/data/` directory, so they survive between container commands. If a download
@@ -76,13 +79,16 @@ is unavailable, configure reports it and the affected tests/benchmarks skip.
 The image also includes the word list used by the dictionary benchmarks.
 
 With no arguments, `tools/dev-container` opens a shell. It mounts the checkout
-at `/workspace/luxir`, runs as your UID/GID, and puts its home and ccache under
-`build/container-cache/`. Native build directories and presets remain usable.
+at `/workspace/luxir`, runs as your UID/GID, and puts its home under
+`build/container-cache/`. It also mounts the shared Luxir cache
+(`LUXIR_CACHE_DIR`, default `~/.cache/luxir`) at `/luxir-cache`, which holds
+the container's ccache (shared by all worktrees) and the build slots.
+Native build directories and presets remain usable.
 The wrapper grants `SYS_PTRACE` for debugging within the container. It honors
 Docker's `DOCKER_CONTEXT`, `CONTAINER_ENGINE` (default `docker`), and
 `LUXIR_DEV_IMAGE` (default `luxir-dev:jammy-gcc16`).
-With a remote Docker context, the same checkout must be shared at the same
-absolute path on the daemon host so the bind mount resolves to your source.
+With a remote Docker context, the checkout and the shared cache must exist at
+the same absolute paths on the daemon host so the bind mounts resolve.
 
 ## CPU targets and runtime libraries
 

@@ -116,7 +116,7 @@
       "name": "arm64-release",
       "inherits": "base-release",
       "displayName": "Linux ARM64 release",
-      "toolchainFile": "${sourceDir}/build/arm64-vcpkg-src/scripts/buildsystems/vcpkg.cmake",
+      "toolchainFile": "${sourceDir}/build/arm64-vcpkg-root/scripts/buildsystems/vcpkg.cmake",
       "cacheVariables": {
         "VCPKG_MANIFEST_MODE": "OFF",
         "VCPKG_INSTALLED_DIR": "${sourceDir}/build/arm64-deps",
@@ -198,7 +198,7 @@
   ],
 
   "buildPresets": [
-    { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "description": "Native non-ASan debug build. Concurrent compilation is limited by the luxir_compile Ninja pool; override with LUXIR_COMPILE_JOBS when configuring." },
+    { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "description": "Native non-ASan debug build. Compile and link parallelism are capped automatically; override with LUXIR_COMPILE_JOBS / LUXIR_LINK_JOBS when configuring." },
     { "name": "gcc-debug-asan",   "configurePreset": "gcc-debug-asan",   "description": "Memory-check build (pre-commit)." },
     { "name": "gcc-release",      "configurePreset": "gcc-release" },
     { "name": "gcc-release-asan", "configurePreset": "gcc-release-asan" },

@@ -78,18 +78,99 @@ option(LUXIR_PROBE_WRAPPER_TRIMS
 # masked by a plausible zero (zero-init also blinds valgrind/MSan detection).
 
 # Build acceleration
+# ---- Build parallelism: compile and link limits sized from this machine ----
+# hpp-proto template instantiation makes each heavy TU expensive to compile, so the build
+# tool's default -j (logical cores) can exhaust memory. tools/build-jobs sizes each limit
+# from physical cores and memory (cgroup limits included): at most one compile per core,
+# never above 16 (hyperthreads add little compile throughput). Measured peak RSS of the
+# heaviest single compile: 2.7G at -O0, 3.1G at -Og, 3.9G at -Og with ASan. Linking
+# luxir_test is the largest single step, so links get their own smaller limit whose
+# memory is reserved from the compile budget. Override with -DLUXIR_COMPILE_JOBS=N and
+# -DLUXIR_LINK_JOBS=N. Both are caps, not a forced -j: a smaller -j still wins.
+if(_luxir_sanitizer)
+  set(_luxir_compile_mb 4000)
+  set(_luxir_link_mb 6000)
+else()
+  set(_luxir_compile_mb 3000)
+  set(_luxir_link_mb 4000)
+endif()
+function(luxir_build_jobs out per_job_mb reserve_mb fallback)
+  execute_process(COMMAND "${CMAKE_SOURCE_DIR}/tools/build-jobs" ${per_job_mb} ${reserve_mb}
+                  OUTPUT_VARIABLE _jobs OUTPUT_STRIP_TRAILING_WHITESPACE
+                  RESULT_VARIABLE _result ERROR_QUIET)
+  if(NOT _result EQUAL 0 OR NOT _jobs MATCHES "^[0-9]+$")
+    message(WARNING "tools/build-jobs failed; assuming ${fallback} jobs")
+    set(_jobs ${fallback})
+  endif()
+  set(${out} ${_jobs} PARENT_SCOPE)
+endfunction()
+if(NOT DEFINED LUXIR_LINK_JOBS)
+  # At most a quarter of memory for links, and at most two at once.
+  math(EXPR _luxir_link_quarter "${_luxir_link_mb} * 4")
+  luxir_build_jobs(LUXIR_LINK_JOBS ${_luxir_link_quarter} 0 1)
+  if(LUXIR_LINK_JOBS GREATER 2)
+    set(LUXIR_LINK_JOBS 2)
+  endif()
+endif()
+if(NOT DEFINED LUXIR_COMPILE_JOBS)
+  math(EXPR _luxir_link_reserve "${LUXIR_LINK_JOBS} * ${_luxir_link_mb}")
+  luxir_build_jobs(LUXIR_COMPILE_JOBS ${_luxir_compile_mb} ${_luxir_link_reserve} 4)
+  if(LUXIR_COMPILE_JOBS GREATER 16)
+    set(LUXIR_COMPILE_JOBS 16)
+  endif()
+endif()
+message(STATUS "Luxir build-job caps: ${LUXIR_COMPILE_JOBS} compile, ${LUXIR_LINK_JOBS} link")
+set_property(GLOBAL PROPERTY JOB_POOLS
+             luxir_compile=${LUXIR_COMPILE_JOBS} luxir_link=${LUXIR_LINK_JOBS})
+set(CMAKE_JOB_POOL_COMPILE luxir_compile)
+set(CMAKE_JOB_POOL_LINK luxir_link)
+
+# The Ninja pools only see this build. Compiles and links also hold one of
+# LUXIR_COMPILE_JOBS / LUXIR_LINK_JOBS machine-wide lock files (tools/build-slot), so
+# concurrent builds from other worktrees, presets, or the development container share
+# the limits instead of each assuming the whole machine. Set LUXIR_BUILD_SLOT_DIR to an
+# empty string to limit this build alone.
+if(DEFINED ENV{LUXIR_CACHE_DIR})
+  set(_luxir_cache_dir "$ENV{LUXIR_CACHE_DIR}")
+elseif(DEFINED ENV{XDG_CACHE_HOME})
+  set(_luxir_cache_dir "$ENV{XDG_CACHE_HOME}/luxir")
+else()
+  set(_luxir_cache_dir "$ENV{HOME}/.cache/luxir")
+endif()
+set(LUXIR_BUILD_SLOT_DIR "${_luxir_cache_dir}/build-slots" CACHE PATH
+    "Directory of machine-wide build slot locks shared by concurrent builds; empty disables")
+find_program(LUXIR_FLOCK flock)
+set(_luxir_compile_launcher "")
+set(_luxir_link_launcher "")
+if(LUXIR_BUILD_SLOT_DIR AND LUXIR_FLOCK)
+  file(MAKE_DIRECTORY "${LUXIR_BUILD_SLOT_DIR}")
+  set(_luxir_slot "${CMAKE_SOURCE_DIR}/tools/build-slot")
+  set(_luxir_compile_launcher "${_luxir_slot};${LUXIR_BUILD_SLOT_DIR}/compile;${LUXIR_COMPILE_JOBS}")
+  set(_luxir_link_launcher "${_luxir_slot};${LUXIR_BUILD_SLOT_DIR}/link;${LUXIR_LINK_JOBS}")
+  message(STATUS "Luxir: build slots shared through ${LUXIR_BUILD_SLOT_DIR}")
+endif()
+
 # ccache: transparent compiler cache. No-op if ccache is not installed.
 # pch_defines,time_macros sloppiness is required to get cache hits on TUs that
 # use a precompiled header (see target_precompile_headers below). Apply it in
 # the launcher rather than relying on each developer's global ccache config.
+# CCACHE_BASEDIR makes the paths ccache hashes relative, and the prefix map makes the
+# debug info's compilation directory relative to the checkout (sources resolve from the
+# checkout root), so objects are shared between worktrees at different paths.
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
-  set(_LUXIR_CCACHE_LAUNCHER
-      "${CMAKE_COMMAND};-E;env;CCACHE_SLOPPINESS=pch_defines,time_macros;${CCACHE_PROGRAM}")
-  set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
-  set(CMAKE_CXX_COMPILER_LAUNCHER "${_LUXIR_CCACHE_LAUNCHER}")
+  list(APPEND _luxir_compile_launcher "${CMAKE_COMMAND}" -E env
+       CCACHE_SLOPPINESS=pch_defines,time_macros "CCACHE_BASEDIR=${CMAKE_SOURCE_DIR}"
+       "${CCACHE_PROGRAM}")
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options("-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.")
+  endif()
   message(STATUS "Luxir: ccache enabled (${CCACHE_PROGRAM})")
 endif()
+set(CMAKE_C_COMPILER_LAUNCHER   "${_luxir_compile_launcher}")
+set(CMAKE_CXX_COMPILER_LAUNCHER "${_luxir_compile_launcher}")
+set(CMAKE_C_LINKER_LAUNCHER     "${_luxir_link_launcher}")
+set(CMAKE_CXX_LINKER_LAUNCHER   "${_luxir_link_launcher}")
 
 # Fast linker: prefer mold, then lld, then gold. Each candidate is verified with
 # a real test link, so a linker that cannot handle this toolchain (e.g. mold
@@ -210,7 +291,6 @@ include_directories(deps)
 # tokenizer/filter classes are built on top of it.
 add_library(uni_algo STATIC deps/uni-algo/src/data.cpp)
 target_include_directories(uni_algo PUBLIC deps/uni-algo/include)
-set_target_properties(uni_algo PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # FastPFOR (vendored under deps/FastPFOR, v0.5.0): SIMD bit-packing kernels with
 # native ARM NEON support (headers/fastpfor_neon.h). We compile the bit-packing
@@ -223,7 +303,6 @@ add_library(fastpfor STATIC
   deps/FastPFOR/src/simdunalignedbitpacking.cpp
   deps/FastPFOR/src/streamvbyte.c)
 target_include_directories(fastpfor PUBLIC deps/FastPFOR/headers)
-set_target_properties(fastpfor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 #Print out all env vars... useful while build system is in development
 get_cmake_property(_variableNames VARIABLES)
@@ -256,57 +335,6 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   #if debugging?
   #add_link_options("/nodefaultlib:msvcrt")
 endif()
-
-# ---- Adaptive compile-parallelism CAP (memory-aware, Ninja job pool) ----
-# hpp-proto template instantiation makes each heavy TU expensive to compile, so the build
-# tool's default -j (logical cores: 32 on a hyperthreaded 16-core box) OOMs.
-# This caps CONCURRENT COMPILES via a Ninja pool sized from THIS machine's physical cores
-# and RAM, never above 16 (hyperthreads add no compile throughput past real cores). It is a
-# cap, not a forced -j: a smaller -j still wins, and it adapts DOWN automatically on a
-# smaller laptop. Override explicitly with -DLUXIR_COMPILE_JOBS=N. Tune _ram_jobs divisor
-# (GB/job) down once the serializer is moved out-of-line and per-TU memory drops.
-# Measured peak RSS of the heaviest single compile: 2.7G at -O0, 3.1G at -Og, 3.9G at
-# -Og with ASan. The divisor covers the plain -Og case; an ASan build on a RAM-bound box
-# uses a 4G/job divisor. Both account for the container memory limit.
-# On a box with enough RAM per physical core the core count still binds.
-if(NOT DEFINED LUXIR_COMPILE_JOBS)
-  cmake_host_system_information(RESULT _ncores QUERY NUMBER_OF_PHYSICAL_CORES)
-  cmake_host_system_information(RESULT _rammb  QUERY TOTAL_PHYSICAL_MEMORY)
-  # Host memory may exceed Docker's allowance. Honor either cgroup version.
-  foreach(_limit_file /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes)
-    if(EXISTS "${_limit_file}")
-      file(READ "${_limit_file}" _memory_limit)
-      string(STRIP "${_memory_limit}" _memory_limit)
-      if(_memory_limit MATCHES "^[0-9]+$" AND _memory_limit LESS 9223372036854771712)
-        math(EXPR _limit_mb "${_memory_limit} / 1048576")
-        if(_limit_mb LESS _rammb)
-          set(_rammb ${_limit_mb})
-        endif()
-      endif()
-    endif()
-  endforeach()
-  if(_luxir_sanitizer)
-    set(_ram_per_job 4000)
-  else()
-    set(_ram_per_job 3000)
-  endif()
-  math(EXPR _ram_jobs "${_rammb} / ${_ram_per_job}")
-  set(LUXIR_COMPILE_JOBS ${_ncores})
-  if(_ram_jobs LESS LUXIR_COMPILE_JOBS)
-    set(LUXIR_COMPILE_JOBS ${_ram_jobs})
-  endif()
-  if(LUXIR_COMPILE_JOBS GREATER 16)
-    set(LUXIR_COMPILE_JOBS 16)
-  endif()
-  if(LUXIR_COMPILE_JOBS LESS 1)
-    set(LUXIR_COMPILE_JOBS 1)
-  endif()
-  message(STATUS "Luxir compile-job cap: ${LUXIR_COMPILE_JOBS} (physical cores=${_ncores}, RAM=${_rammb}MB)")
-else()
-  message(STATUS "Luxir compile-job cap: ${LUXIR_COMPILE_JOBS} (configured)")
-endif()
-set_property(GLOBAL PROPERTY JOB_POOLS luxir_compile=${LUXIR_COMPILE_JOBS})
-set(CMAKE_JOB_POOL_COMPILE luxir_compile)
 
 # Include protobuf/grpc generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")

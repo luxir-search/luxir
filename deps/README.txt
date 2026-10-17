@@ -14,7 +14,8 @@ This fetches pinned sources and installs normal and ASan dependencies
 sequentially into /opt/vcpkg/installed-native and installed-native-asan.
 An optional first argument selects another vcpkg checkout; adjust the CMake
 presets' toolchain and install paths accordingly. VCPKG_MAX_CONCURRENCY defaults
-to 12. Sources and binary caches are shared; completed build trees are cleaned.
+to the jobs the cores and memory allow (../tools/build-jobs). Sources and
+binary caches are shared; completed build trees are cleaned.
 
 Triplets
 --------
