@@ -15,7 +15,7 @@
 #include <string>
 #include <vector>
 
-#include "FieldReader.h"
+#include "PostingsReader.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/index/BKDWriter.h"
 #include "luxir/util/geo.h"

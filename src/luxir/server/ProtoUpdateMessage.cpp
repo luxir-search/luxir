@@ -268,10 +268,6 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
 }
 
 
-void ProtoUpdateMessage::validateReplicaWait(const api::ReplicaRequirement& value) {
-  if (value.kind.index() == 0) throw RequestError("wait_for_replicas requires count or all");
-}
-
 std::shared_ptr<ProtoUpdateMessage::Completion> ProtoUpdateMessage::takeCompletion(LuxirNode& node) {
   auto completed = std::make_shared<Completion>();
   completed->response = *finishResponse();

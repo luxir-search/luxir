@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include "luxir/util/Signal.h"
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
@@ -218,12 +219,12 @@ protected:
       bool disableGather, std::span<const int32_t> segmentOrder = {}) {
     IntFieldType fieldType(field);
     SortField sortField(field, fieldType, order, missing);
-    FieldSortCollector collector(topCount, columnPlan(sortField));
+    FieldSortCollector collector(topCount, columnPlan(sortField), &reader);
     KeyGatherGuard guard(disableGather);
 
     auto collectSegment = [&](int32_t segment) {
       auto& leaf = reader.segments()[(size_t)segment];
-      collector.setSegment(segment, &leaf.postingsReader());
+      collector.setSegment(leaf);
       std::vector<int32_t> docs;
       for (int32_t doc = 0; doc < leaf.maxDoc(); doc++) {
         if (leaf.liveDocs() == nullptr || leaf.liveDocs()->bitset().get(doc)) {
@@ -417,13 +418,12 @@ TEST_F(SortCollectorTest, numericKeyGatherMatchesFallbackAcrossColumnShapes) {
   ASSERT_EQ(2u, reader->segments().size());
   for (std::string_view field :
        {"dense_i", "sparse_i", "dense_is", "sparse_is"}) {
-    SimpleNumericFieldComparator comparator(std::string(field), true,
-                                            FieldComparator::MISSING_LAST);
+    SimpleNumericFieldComparator comparator(true, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
     for (auto& segment : reader->segments()) {
-      comparator.setSegment(segment.ord, &segment.postingsReader());
+      comparator.setSegment(segment);
       auto keys = comparator.keyBatch()->segmentKeys(std::nullopt);
-      const auto* meta = segment.postingsReader().numericLeafMeta(field);
-      EXPECT_EQ(meta, segment.postingsReader().numericLeafMeta(field));
+      const auto* meta = segment.postingsReader().fieldInfo(field)->numericLeafMeta();
+      EXPECT_EQ(meta, segment.postingsReader().fieldInfo(field)->numericLeafMeta());
       EXPECT_EQ(field == "dense_i", meta != nullptr) << field;
       ASSERT_EQ(keys.has_value(), meta != nullptr) << field;
       if (meta == nullptr) continue;
@@ -492,14 +492,14 @@ TEST_F(SortCollectorTest, fieldSortLeafMetaLivesWithItsSegment) {
     uint64_t coreGen = old.lock()->coreGen();
     EXPECT_EQ(expected, newest());  // reads each segment's leaf metadata
     const auto* meta =
-        old.lock()->segments()[0].postingsReader().numericLeafMeta("time_i");
+        old.lock()->segments()[0].postingsReader().fieldInfo("time_i")->numericLeafMeta();
     ASSERT_NE(nullptr, meta);
     commit();
     auto current = writer->snapshots.readers.getReader();
     EXPECT_EQ(coreGen, current->coreGen());
     EXPECT_TRUE(old.expired());
     EXPECT_EQ(meta,
-              current->segments()[0].postingsReader().numericLeafMeta("time_i"));
+              current->segments()[0].postingsReader().fieldInfo("time_i")->numericLeafMeta());
     current.reset();
     EXPECT_EQ(expected, newest());
   };
@@ -592,10 +592,10 @@ TEST_F(SortCollectorTest, sparseLandingReusesPresentCandidate) {
     IntFieldType fieldType(field);
     SortField sortField(
         field, fieldType, SortField::ASC, FieldComparator::MISSING_LAST);
-    FieldSortCollector collector(2, columnPlan(sortField));
+    FieldSortCollector collector(2, columnPlan(sortField), reader.get());
     KeyGatherGuard guard(disableGather);
     auto& segment = reader->segments()[0];
-    collector.setSegment(0, &segment.postingsReader());
+    collector.setSegment(segment);
     collector.collectWindow(0, candidates);
     WindowResult result;
     result.hitCount = collector.totalHits();
@@ -665,9 +665,9 @@ TEST_F(SortCollectorTest, collectWindowFallbackCountsEachHitOnce) {
       SortClause(SortField("primary_i", primaryType, SortField::ASC)),
       SortClause(SortField("secondary_i", secondaryType, SortField::ASC)),
   };
-  FieldSortCollector collector(4, clauses);
+  FieldSortCollector collector(4, clauses, reader.get());
   auto& segment = reader->segments()[0];
-  collector.setSegment(0, &segment.postingsReader());
+  collector.setSegment(segment);
   std::array<int32_t, 9> candidates = {0, 1, 2, 3, 4, 5, 6, 7, 8};
   collector.collectWindow(0, candidates);
 
@@ -1047,7 +1047,7 @@ TEST_F(SortCollectorTest, smallEdge) {
   auto collect = [&](FieldSortCollector& collector, int32_t seg) {
     auto* postingsReader = &reader->segments()[seg].postingsReader();
     auto nDocs = postingsReader->maxDoc();
-    collector.setSegment(seg, postingsReader);
+    collector.setSegment(reader->segments()[seg]);
     for (int32_t doc = 0; doc < nDocs; doc++) {
       collector.collect(seg, doc, 1.0f);
     }
@@ -1055,7 +1055,7 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test collecting segments in order
   {
-    FieldSortCollector collector(2, columnPlan(sf));
+    FieldSortCollector collector(2, columnPlan(sf), reader.get());
 
     // collect 2nd segment first: should have [doc2,doc1]
     collect(collector, 0);
@@ -1073,7 +1073,7 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test collecting segments out of order
   {
-    FieldSortCollector collector(2, columnPlan(sf));
+    FieldSortCollector collector(2, columnPlan(sf), reader.get());
 
     // collect 2nd segment first: should have [doc5, doc4]
     collect(collector, 1);
@@ -1091,8 +1091,8 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test merging collectors in different orders
   {
-    FieldSortCollector collector0(2, columnPlan(sf));
-    FieldSortCollector collector1(2, columnPlan(sf));
+    FieldSortCollector collector0(2, columnPlan(sf), reader.get());
+    FieldSortCollector collector1(2, columnPlan(sf), reader.get());
 
     collect(collector0, 0);
     collect(collector1, 1);
@@ -1106,8 +1106,8 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test merging collectors in reverse order this time
   {
-    FieldSortCollector collector0(2, columnPlan(sf));
-    FieldSortCollector collector1(2, columnPlan(sf));
+    FieldSortCollector collector0(2, columnPlan(sf), reader.get());
+    FieldSortCollector collector1(2, columnPlan(sf), reader.get());
 
     collect(collector0, 0);
     collect(collector1, 1);
@@ -1167,7 +1167,7 @@ TEST_F(SortCollectorTest, randomSmall) {
     auto collect = [&](FieldSortCollector& collector, int32_t seg) {
       auto* postingsReader = &reader->segments()[seg].postingsReader();
       auto nDocs = postingsReader->maxDoc();
-      collector.setSegment(seg, postingsReader);
+      collector.setSegment(reader->segments()[seg]);
       for (int32_t doc = 0; doc < nDocs; doc++) {
         collector.collect(seg, doc, 1.0f);
       }
@@ -1194,7 +1194,7 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test collecting segments in order
     {
-      FieldSortCollector collector(topK, columnPlan(sf));
+      FieldSortCollector collector(topK, columnPlan(sf), reader.get());
 
       // collect 2nd segment first: should have [doc5, doc4]
       collect(collector, 0);
@@ -1204,7 +1204,7 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test collecting segments out of order
     {
-      FieldSortCollector collector(topK, columnPlan(sf));
+      FieldSortCollector collector(topK, columnPlan(sf), reader.get());
 
       // collect 2nd segment first: should have [doc5, doc4]
       collect(collector, 1);
@@ -1214,8 +1214,8 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test merging collectors in different orders
     {
-      FieldSortCollector collector0(topK, columnPlan(sf));
-      FieldSortCollector collector1(topK, columnPlan(sf));
+      FieldSortCollector collector0(topK, columnPlan(sf), reader.get());
+      FieldSortCollector collector1(topK, columnPlan(sf), reader.get());
       collect(collector0, 0);
       collect(collector1, 1);
       collector0.merge(collector1);
@@ -1224,8 +1224,8 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test merging collectors in reverse order this time
     {
-      FieldSortCollector collector0(topK, columnPlan(sf));
-      FieldSortCollector collector1(topK, columnPlan(sf));
+      FieldSortCollector collector0(topK, columnPlan(sf), reader.get());
+      FieldSortCollector collector1(topK, columnPlan(sf), reader.get());
       collect(collector0, 0);
       collect(collector1, 1);
       collector1.merge(collector0);
@@ -1264,21 +1264,21 @@ TEST_F(SortCollectorTest, DeepLimitGrowsSlotStorageOnDemand) {
   SortField sortField("sort_i", fieldType, SortField::ASC);
   auto& leaf = reader->segments()[0];
   auto collect = [&](FieldSortCollector& collector, int32_t parity) {
-    collector.setSegment(0, &leaf.postingsReader());
+    collector.setSegment(leaf);
     for (int32_t doc = 0; doc < leaf.maxDoc(); doc++) {
       if (parity < 0 || doc % 2 == parity) collector.collect(0, doc, 1.0f);
     }
   };
 
   // collect() warmup path; capacity tracks the hits, not the limit.
-  FieldSortCollector whole(deepLimit, columnPlan(sortField));
+  FieldSortCollector whole(deepLimit, columnPlan(sortField), reader.get());
   collect(whole, -1);
   EXPECT_EQ(whole.size(), (uint64_t)nDocs);
   EXPECT_LE(whole.slotCapacity, (int64_t)nDocs * 2);
 
   // Underfull merge mints the merged-in slots.
-  FieldSortCollector even(deepLimit, columnPlan(sortField));
-  FieldSortCollector odd(deepLimit, columnPlan(sortField));
+  FieldSortCollector even(deepLimit, columnPlan(sortField), reader.get());
+  FieldSortCollector odd(deepLimit, columnPlan(sortField), reader.get());
   collect(even, 0);
   collect(odd, 1);
   even.merge(odd);
@@ -1439,14 +1439,18 @@ TEST_F(SortCollectorTest, SegmentModeIsParseBoundAndDoesNotBuildOrdMap) {
   helper.index(flatdoc("id_s", "b", "name_s", "a"), UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(2u, reader->segments().size());
-  size_t cacheSize = reader->getOrdMapCacheSize();
+  std::atomic<int> builds{0};
+  Signal::listen("ordMapBuild", [&](void*, void*, void*) -> void* {
+    builds++;
+    return nullptr;
+  });
 
   StrFieldType fieldType("name_s");
   StringSortModeGuard segmentGuard(StringSortMode::SEGMENT);
   SortField sortField("name_s", fieldType, SortField::ASC);
   {
     StringSortModeGuard globalGuard(StringSortMode::GLOBAL);
-    auto comparator = sortField.createComparator(reader.get());
+    auto comparator = sortField.createComparator(*reader);
     EXPECT_NE(nullptr, dynamic_cast<SegmentOrdComparator*>(comparator.get()));
   }
 
@@ -1457,7 +1461,7 @@ TEST_F(SortCollectorTest, SegmentModeIsParseBoundAndDoesNotBuildOrdMap) {
   req->execute(true);
   ASSERT_OK(req);
   EXPECT_EQ((std::vector<std::string>{"b", "a"}), resultIds(*req));
-  EXPECT_EQ(cacheSize, reader->getOrdMapCacheSize());
+  EXPECT_EQ(0, builds.load());
 }
 
 TEST_F(SortCollectorTest, SegmentOrdBottomAnchors) {
@@ -1484,12 +1488,11 @@ TEST_F(SortCollectorTest, SegmentOrdBottomAnchors) {
   auto compare = [&](int32_t pivotDoc, int32_t targetSegment, int32_t candidateDoc,
                      FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST,
                      bool reversed = false) {
-    SegmentOrdComparator comparator("name_s", reversed, missing);
+    SegmentOrdComparator comparator(reversed, missing, reader->field("name_s"));
     comparator.growSlots(1);
-    comparator.setSegment(0, &reader->segments()[0].postingsReader());
+    comparator.setSegment(reader->segments()[0]);
     comparator.copy(0, segdoc(0, pivotDoc));
-    comparator.setSegment(targetSegment,
-                          &reader->segments()[targetSegment].postingsReader());
+    comparator.setSegment(reader->segments()[targetSegment]);
     comparator.setBottom(0);
     return comparator.compareBottom(0, segdoc(0, pivotDoc),
                                     segdoc(targetSegment, candidateDoc));
@@ -1531,7 +1534,7 @@ TEST_F(SortCollectorTest, SegmentOrdCollectorReuseAcrossAdversarialSegments) {
   FieldSortCollector collector(4, columnPlan(field), reader.get());
   auto collectSegment = [&](int32_t segment) {
     auto& postings = reader->segments()[segment].postingsReader();
-    collector.setSegment(segment, &postings);
+    collector.setSegment(reader->segments()[segment]);
     for (int32_t doc = 0; doc < postings.maxDoc(); doc++) {
       collector.collect(segment, doc, 1.0f);
     }
@@ -1587,7 +1590,7 @@ TEST_F(SortCollectorTest, SegmentOrdPairwiseMergeOwnsCopiedTerms) {
     auto right = makeCollector();
     auto collect = [&](FieldSortCollector& collector, int32_t segment) {
       auto& postings = reader->segments()[segment].postingsReader();
-      collector.setSegment(segment, &postings);
+      collector.setSegment(reader->segments()[segment]);
       for (int32_t doc = 0; doc < postings.maxDoc(); doc++) {
         collector.collect(segment, doc, 1.0f);
       }
@@ -2886,9 +2889,8 @@ TEST_F(SortCollectorTest, boundOrderLeavesAscendByBoundThenLeaf) {
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   for (bool reversed : {false, true}) {
     for (auto& segment : reader->segments()) {
-      SimpleNumericFieldComparator comparator(
-          "key_i", reversed, FieldComparator::MISSING_LAST);
-      comparator.setSegment(segment.ord, &segment.postingsReader());
+      SimpleNumericFieldComparator comparator(reversed, FieldComparator::MISSING_LAST, reader->field("key_i"));
+      comparator.setSegment(segment);
       FieldComparator::KeyBatch* batch = comparator.keyBatch();
       ASSERT_NE(0, batch->leafBlockSize());
       int64_t leaves = batch->leafBlockCount();
@@ -2931,9 +2933,8 @@ TEST_F(SortCollectorTest, keyFloorClipsValueEnvelopes) {
 
   auto floorOf = [&](std::string_view field, bool reversed,
                      Query::ValueEnvelope values) {
-    SimpleNumericFieldComparator comparator(
-        std::string(field), reversed, FieldComparator::MISSING_LAST);
-    comparator.setSegment(segment.ord, &segment.postingsReader());
+    SimpleNumericFieldComparator comparator(reversed, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
+    comparator.setSegment(segment);
     auto keys = comparator.keyBatch()->segmentKeys(values);
     return keys.has_value() ? std::optional<int64_t>(keys->keyFloor())
                             : std::nullopt;
@@ -2965,9 +2966,9 @@ TEST_F(SortCollectorTest, keyFloorClipsValueEnvelopes) {
       SortField sortField(field,
                           isFloat ? (FieldType&)floatType : (FieldType&)intType,
                           reversed ? SortField::DESC : SortField::ASC);
-      FieldSortCollector collector(10, columnPlan(sortField));
+      FieldSortCollector collector(10, columnPlan(sortField), reader.get());
       collector.primaryValues = values;
-      collector.setSegment(segment.ord, &segment.postingsReader());
+      collector.setSegment(segment);
       auto* batch = collector.clauses[0].comparator->keyBatch();
       ASSERT_NE(0, batch->leafBlockSize());
       int64_t floor = collector.primaryKeys->keyFloor();
@@ -2991,9 +2992,8 @@ TEST_F(SortCollectorTest, keyFloorClipsValueEnvelopes) {
       std::iota(all.begin(), all.end(), 0);
       std::vector<int64_t> keys(all.size());
       batch->gatherKeys(all, keys);
-      SimpleNumericFieldComparator raw(std::string(field), false,
-                                       FieldComparator::MISSING_LAST);
-      raw.setSegment(segment.ord, &segment.postingsReader());
+      SimpleNumericFieldComparator raw(false, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
+      raw.setSegment(segment);
       std::vector<int64_t> stored(all.size());
       raw.keyBatch()->gatherKeys(all, stored);
       for (size_t doc = 0; doc < all.size(); doc++) {
@@ -3005,8 +3005,8 @@ TEST_F(SortCollectorTest, keyFloorClipsValueEnvelopes) {
   // Without an envelope nothing is clipped.
   IntFieldType intType("key_i");
   SortField sortField("key_i", intType, SortField::DESC);
-  FieldSortCollector collector(10, columnPlan(sortField));
-  collector.setSegment(segment.ord, &segment.postingsReader());
+  FieldSortCollector collector(10, columnPlan(sortField), reader.get());
+  collector.setSegment(segment);
   EXPECT_EQ(0, collector.leavesBeforeKeyFloor);
 }
 
@@ -3426,8 +3426,8 @@ TEST_F(SortCollectorTest, exactDomainPhasesMatchExhaustive) {
                      int64_t topCount, std::optional<Phase> phase,
                      int64_t cap, bool checkProgress, int64_t floor) {
     MemPool pool;
-    FieldSortCollector collector(topCount, columnPlan(sortField));
-    collector.setSegment(0, &segment.postingsReader(), &pool,
+    FieldSortCollector collector(topCount, columnPlan(sortField), reader.get());
+    collector.setSegment(segment, &pool,
                          (int64_t)domain.size());
     if (!phase.has_value()) {
       collector.collectWindow(0, domain);
@@ -3492,8 +3492,8 @@ TEST_F(SortCollectorTest, exactDomainPhasesMatchExhaustive) {
     SortField sortField("mono_i", monoType, order,
                         FieldComparator::MISSING_LAST);
     MemPool pool;
-    FieldSortCollector collector(7, columnPlan(sortField));
-    collector.setSegment(0, &segment.postingsReader(), &pool, kDocs);
+    FieldSortCollector collector(7, columnPlan(sortField), reader.get());
+    collector.setSegment(segment, &pool, kDocs);
     auto* batch = collector.maskedKeyBlockPlan().batch;
     ASSERT_NE(nullptr, batch);
     collector.collectWindow(0, std::span(sparse).first(3));
@@ -3970,9 +3970,8 @@ TEST_F(SortCollectorTest, segmentKeysEstimateKeysWithinEnvelopes) {
   auto& segment = reader->segments()[0];
   using Envelope = std::optional<Query::ValueEnvelope>;
   for (std::string_view field : {"key_i", "mono_i"}) {
-    SimpleNumericFieldComparator raw(std::string(field), false,
-                                     FieldComparator::MISSING_LAST);
-    raw.setSegment(segment.ord, &segment.postingsReader());
+    SimpleNumericFieldComparator raw(false, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
+    raw.setSegment(segment);
     std::vector<int32_t> all(kDocs);
     std::iota(all.begin(), all.end(), 0);
     std::vector<int64_t> values(kDocs);
@@ -3983,9 +3982,8 @@ TEST_F(SortCollectorTest, segmentKeysEstimateKeysWithinEnvelopes) {
         SCOPED_TRACE(std::string(field) + (reversed ? " desc" : " asc")
                      + (envelope ? " env " + std::to_string(envelope->lo)
                                  : " all"));
-        SimpleNumericFieldComparator comparator(
-            std::string(field), reversed, FieldComparator::MISSING_LAST);
-        comparator.setSegment(segment.ord, &segment.postingsReader());
+        SimpleNumericFieldComparator comparator(reversed, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
+        comparator.setSegment(segment);
         auto keys = comparator.keyBatch()->segmentKeys(envelope);
         ASSERT_TRUE(keys.has_value());
         if (field == "mono_i") {
@@ -4077,10 +4075,9 @@ TEST_F(SortCollectorTest, predictedBottomFollowsHeapAcrossSegments) {
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(2u, reader->segments().size());
   auto keysOf = [&](std::string_view field, bool reversed, size_t seg) {
-    SimpleNumericFieldComparator comparator(std::string(field), reversed,
-                                            FieldComparator::MISSING_LAST);
+    SimpleNumericFieldComparator comparator(reversed, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
     auto& segment = reader->segments()[seg];
-    comparator.setSegment(segment.ord, &segment.postingsReader());
+    comparator.setSegment(segment);
     return *comparator.keyBatch()->segmentKeys(std::nullopt);
   };
   constexpr int64_t k = 100;
@@ -4789,18 +4786,18 @@ TEST_F(SortCollectorTest, missingFirstBlocksCandidateIntervals) {
                                 : FieldComparator::MISSING_LAST;
     Status expected = missingFirst ? Status::PENDING : Status::READY;
 
-    SegmentOrdComparator seg("s_s", false, missing);
+    SegmentOrdComparator seg(false, missing, reader->field("s_s"));
     seg.growSlots(1);
-    seg.setSegment(0, &leaf.postingsReader());
+    seg.setSegment(leaf);
     seg.copy(0, segdoc(0, 0));
     seg.setBottom(0);
     FieldComparator::CompetitiveOrdState state;
     EXPECT_EQ(seg.competitiveOrdInterval(state, 0, segdoc(0, 0), 0, 1, true),
               expected);
 
-    GlobalOrdComparator glob("s_s", nullptr, false, missing);
+    GlobalOrdComparator glob(nullptr, false, missing, reader->field("s_s"));
     glob.growSlots(1);
-    glob.setSegment(0, &leaf.postingsReader());
+    glob.setSegment(leaf);
     glob.copy(0, segdoc(0, 0));
     EXPECT_EQ(glob.competitiveOrdInterval(state, 0, segdoc(0, 0), 0, 1, true),
               expected);

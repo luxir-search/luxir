@@ -27,7 +27,6 @@
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/reader/PostingsReader.h"
-#include "luxir/reader/FieldReader.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/Signal.h"
 #include <future>
@@ -2342,13 +2341,13 @@ TEST_F(IndexWriterTest, removeFields) {
   auto guard = MemPool::threadLocalPoolGuard();
   // Verify fields from deleted document are gone after merge
   for (const auto& segment : reader->segments()) {
-    FieldReader fieldsReader(segment.postingsReader());
-    EXPECT_TRUE(fieldsReader.seek("id")); // id field should remain
-    EXPECT_FALSE(fieldsReader.seek("text_w"));
-    EXPECT_FALSE(fieldsReader.seek("string_s"));
-    EXPECT_FALSE(fieldsReader.seek("string_ss"));
-    EXPECT_FALSE(fieldsReader.seek("int_i"));
-    EXPECT_FALSE(fieldsReader.seek("int_is"));
+    auto* fieldsReader = segment.postingsReader().fieldInfo("id");
+    EXPECT_TRUE((fieldsReader != nullptr)); // id field should remain
+    EXPECT_FALSE(((fieldsReader = segment.postingsReader().fieldInfo("text_w")) != nullptr));
+    EXPECT_FALSE(((fieldsReader = segment.postingsReader().fieldInfo("string_s")) != nullptr));
+    EXPECT_FALSE(((fieldsReader = segment.postingsReader().fieldInfo("string_ss")) != nullptr));
+    EXPECT_FALSE(((fieldsReader = segment.postingsReader().fieldInfo("int_i")) != nullptr));
+    EXPECT_FALSE(((fieldsReader = segment.postingsReader().fieldInfo("int_is")) != nullptr));
   }
 }
 

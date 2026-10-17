@@ -26,7 +26,6 @@ service Searcher {
 }
 
 service Admin {
-  rpc WaitForReplicas(WaitForReplicasRequest) returns (WaitForReplicasResponse) {}
   rpc SetSchema(SchemaRequest) returns (SchemaResponse) {}
   rpc GetSchema(SchemaRequest) returns (SchemaResponse) {}
   rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse) {}

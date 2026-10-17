@@ -17,7 +17,7 @@
 #include "test/TestUtils.h"
 #include "luxir/index/handler/VectorHandler.h"
 #include "luxir/reader/VectorReader.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/FSDirectory.h"
@@ -129,10 +129,9 @@ TEST_F(VectorColTest, singleValuedRoundTrip) {
   auto segments = testIndex.reader->segments();
   ASSERT_EQ(1u, segments.size());
   auto& seg = segments[0];
-  FieldReader fieldReader(seg.postingsReader());
-  ASSERT_TRUE(fieldReader.seek("vec_v"));
-  SegFieldInfo fi;
-  fieldReader.readFieldInfo(fi);
+  auto* fieldReader = seg.postingsReader().fieldInfo("vec_v");
+  ASSERT_TRUE((fieldReader != nullptr));
+  const auto& fi = *fieldReader;
 
   VectorReader vr(seg.postingsReader(), fi);
   ASSERT_EQ(4, vr.dims());
@@ -172,10 +171,9 @@ TEST_F(VectorColTest, payloadStreamsWithoutRamFile) {
   testIndex.flush();
   testIndex.initReader();
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fieldReader(seg.postingsReader());
-  ASSERT_TRUE(fieldReader.seek("vec_v"));
-  SegFieldInfo fi;
-  fieldReader.readFieldInfo(fi);
+  auto* fieldReader = seg.postingsReader().fieldInfo("vec_v");
+  ASSERT_TRUE((fieldReader != nullptr));
+  const auto& fi = *fieldReader;
   VectorReader reader(seg.postingsReader(), fi);
   ASSERT_EQ((int32_t)DIMS, reader.dims());
   EXPECT_FLOAT_EQ(0.0f, reader.singleVectorAt(0).front());
@@ -290,10 +288,9 @@ TEST_F(VectorColTest, multiValuedRoundTrip) {
 
   testIndex.initReader();
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fieldReader(seg.postingsReader());
-  ASSERT_TRUE(fieldReader.seek("emb_vs"));
-  SegFieldInfo fi;
-  fieldReader.readFieldInfo(fi);
+  auto* fieldReader = seg.postingsReader().fieldInfo("emb_vs");
+  ASSERT_TRUE((fieldReader != nullptr));
+  const auto& fi = *fieldReader;
 
   VectorReader vr(seg.postingsReader(), fi);
   ASSERT_EQ(3, vr.dims());
@@ -337,10 +334,9 @@ TEST_F(VectorColTest, coercesNumericArrayArms) {
   testIndex.flush();
   testIndex.initReader();
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fields(seg.postingsReader());
-  ASSERT_TRUE(fields.seek("vec_v"));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = seg.postingsReader().fieldInfo("vec_v");
+  ASSERT_NE(nullptr, fields);
+  const auto& info = *fields;
   VectorReader reader(seg.postingsReader(), info);
   ASSERT_EQ(3, reader.docsWithValue());
   auto vec0 = reader.singleVectorAt(0);
@@ -371,10 +367,9 @@ TEST_F(VectorColTest, coercesMultiVectorJsonShapes) {
   testIndex.flush();
   testIndex.initReader();
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fields(seg.postingsReader());
-  ASSERT_TRUE(fields.seek("emb_vs"));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = seg.postingsReader().fieldInfo("emb_vs");
+  ASSERT_NE(nullptr, fields);
+  const auto& info = *fields;
   VectorReader reader(seg.postingsReader(), info);
   EXPECT_EQ(2, reader.docsWithValue());
   EXPECT_EQ(3, reader.numVectors());
@@ -448,10 +443,9 @@ TEST_F(VectorColTest, coercedValidationPrecedesStreamingWrite) {
   testIndex.flush();
   testIndex.initReader();
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fields(seg.postingsReader());
-  ASSERT_TRUE(fields.seek("emb_vs"));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = seg.postingsReader().fieldInfo("emb_vs");
+  ASSERT_NE(nullptr, fields);
+  const auto& info = *fields;
   VectorReader reader(seg.postingsReader(), info);
   EXPECT_EQ(1, reader.docsWithValue());
   EXPECT_EQ(2, reader.numVectors());
@@ -480,10 +474,9 @@ TEST_F(VectorColTest, multiValuedValueRankToDoc) {
 
   testIndex.initReader();
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fieldReader(seg.postingsReader());
-  ASSERT_TRUE(fieldReader.seek("emb_vs"));
-  SegFieldInfo fi;
-  fieldReader.readFieldInfo(fi);
+  auto* fieldReader = seg.postingsReader().fieldInfo("emb_vs");
+  ASSERT_TRUE((fieldReader != nullptr));
+  const auto& fi = *fieldReader;
 
   VectorReader vr(seg.postingsReader(), fi);
   ASSERT_TRUE(vr.isMultiValued());
@@ -528,10 +521,9 @@ TEST_F(VectorColTest, multiValuedValDocSurvivesMerge) {
   testIndex.initReader();
   ASSERT_EQ(1u, testIndex.reader->segments().size());
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fieldReader(seg.postingsReader());
-  ASSERT_TRUE(fieldReader.seek("emb_vs"));
-  SegFieldInfo fi;
-  fieldReader.readFieldInfo(fi);
+  auto* fieldReader = seg.postingsReader().fieldInfo("emb_vs");
+  ASSERT_TRUE((fieldReader != nullptr));
+  const auto& fi = *fieldReader;
 
   VectorReader vr(seg.postingsReader(), fi);
   ASSERT_TRUE(vr.isMultiValued());

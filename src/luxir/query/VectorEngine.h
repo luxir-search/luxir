@@ -28,6 +28,7 @@ namespace luxir {
 struct VectorSearchRequest {
   const float* query = nullptr;
   int32_t dims = 0;
+  // Document/vector budget; group approximate cuts count documents.
   int64_t candidates = 0;
   // Domain filtering is supplied by engine construction today.  Flat FAISS
   // receives it through SearchParameters::sel instead of per request state.
@@ -57,6 +58,8 @@ struct VectorSearchRequest {
   //   - The spans are valid only for the duration of this search() call.
   //     The host mutates the backing bytes between rounds; never cache them.
   std::span<const std::span<const uint8_t>> eligible;
+  // Group policy only; docs engines ignore it. Exact cuts always use one.
+  int64_t perKey = 1;
 };
 
 /// Candidate from the vector engine seam.  score is exact for flat engines;
@@ -102,8 +105,10 @@ struct VectorSearchResult {
 /// segment-local identities and report the taxonomy above; everything
 /// cross-cutting stays in the host: candidate pooling and dedup across
 /// rounds, the deepen policy, exact rescore, multi-valued doc collapse, and
-/// the K-distinct-docs guarantee.  An engine therefore never needs to know
-/// about docs, only vectors.
+/// the selected-unit guarantee. Document-unit engines operate on vectors;
+/// group-unit engines resolve group identities before every bounded cut,
+/// retaining at most perKey documents per group. Exact cuts use one. Unit selection is a
+/// construction-time policy, never a per-candidate switch on document search.
 class VectorEngine {
 public:
   virtual ~VectorEngine() = default;

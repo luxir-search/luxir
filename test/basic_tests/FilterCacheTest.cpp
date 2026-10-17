@@ -641,6 +641,15 @@ TEST(FilterCacheTest, flushPosturesAndDump) {
   EXPECT_GT(rows[0].bytes, 0u);
   EXPECT_GT(rows[0].hits, 0u);
 
+  // Hot hits keep recording sightings while cold keys roll the ring past the
+  // key's first two.
+  for (int i = 0; i < 40; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::HIT, probeOnce(true));
+    FilterCache::UseRegistry cold(cache, 1, segments);
+    EXPECT_FALSE(cold.get(FilterKey("flushposture:cold" + std::to_string(i)))
+                     ->wasAdmitted());
+  }
+
   // Refill posture: values gone, sightings kept, so the next probe claims a
   // build immediately rather than restarting the ladder.
   cache.clear();
@@ -1766,6 +1775,97 @@ TEST(FilterCacheTest, metadataBytesAreAccountedAndSweepNonemptyEntries) {
   EXPECT_EQ(0u, cache.metadataBytesUsed());
 }
 
+// A long-lived entry used across many merges keeps one slot per live
+// segment: merged-away slots are pruned on publication, and their metadata
+// charge is released.
+TEST(FilterCacheTest, mergedAwaySlotsArePruned) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  FilterKey key("tenant:42");
+  size_t steadyMetadata = 0;
+  // Aligned on the previous reader and not yet probed.
+  std::unique_ptr<FilterCache::UseRegistry> held;
+
+  for (uint64_t gen = 1; gen <= 50; gen++) {
+    // Each publication merges away the oldest segment and adds a new one.
+    std::array segments{FilterCache::SegmentIdentity{gen, 100},
+                        FilterCache::SegmentIdentity{gen + 1, 100},
+                        FilterCache::SegmentIdentity{gen + 2, 100}};
+    ASSERT_TRUE(cache.onReaderPublished(gen, segments));
+    EXPECT_LE(cache.slotCountForTest(key), segments.size());
+    if (held != nullptr) {
+      // The held Use still owns the pruned slot of the merged-away segment;
+      // it stays a miss, while the surviving segment still hits.
+      auto* stale = held->get(key);
+      EXPECT_EQ(FilterCache::Probe::Kind::BYPASS, stale->probe(0).kind());
+      EXPECT_EQ(FilterCache::Probe::Kind::HIT, stale->probe(1).kind());
+      held.reset();
+    }
+
+    FilterCache::UseRegistry request(cache, gen, segments);
+    auto* use = request.get(key);
+    ASSERT_TRUE(use->wasAdmitted());
+    for (size_t ord = 0; ord < segments.size(); ord++) {
+      auto probe = use->probe(ord);
+      if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+        use->publishRaw(ord, probe, bitDocs(100, 7), 10);
+      }
+    }
+    EXPECT_EQ(segments.size(), cache.slotCountForTest(key));
+
+    // Every segment has a slot now, so this Use aligns without inserting.
+    FilterCache::UseRegistry again(cache, gen, segments);
+    auto* hot = again.get(key);
+    for (size_t ord = 0; ord < segments.size(); ord++) {
+      EXPECT_EQ(FilterCache::Probe::Kind::HIT, hot->probe(ord).kind());
+    }
+    EXPECT_EQ(segments.size(), cache.slotCountForTest(key));
+    if (gen == 1) steadyMetadata = cache.metadataBytesUsed();
+    EXPECT_EQ(steadyMetadata, cache.metadataBytesUsed());
+    cache.validateForTest();
+
+    held = std::make_unique<FilterCache::UseRegistry>(cache, gen, segments);
+    held->get(key);
+  }
+  held.reset();
+
+  cache.clear();
+  EXPECT_EQ(0u, cache.metadataBytesUsed());
+  EXPECT_EQ(0u, cache.bytesUsed());
+  cache.validateForTest();
+}
+
+// A metadata sweep started at the byte cap trims to the low watermark, so
+// the admissions that follow do not each start another sweep.
+TEST(FilterCacheTest, metadataSweepTrimsToLowWatermark) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  config.maxMetadataEntries = 1000;
+  config.maxMetadataBytes = 16 * 1024;
+  config.lowWatermarkMetadataBytes = 8 * 1024;
+  FilterCache cache(config);
+  std::array segments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(1, segments);
+
+  size_t sweeps = 0;
+  size_t previous = 0;
+  for (int i = 0; i < 100; i++) {
+    FilterCache::UseRegistry request(cache, 1, segments);
+    request.get(FilterKey("key:" + std::to_string(i) + std::string(200, 'k')));
+    size_t used = cache.metadataBytesUsed();
+    EXPECT_LE(used, config.maxMetadataBytes);
+    if (used < previous) {
+      sweeps++;
+      EXPECT_LE(used, config.lowWatermarkMetadataBytes);
+    }
+    previous = used;
+  }
+  EXPECT_GE(sweeps, 2u);
+  EXPECT_LE(sweeps, 15u);
+  cache.validateForTest();
+}
+
 TEST(FilterCacheTest, oversizedKeysBypassWithoutAffectingAdmission) {
   FilterCacheConfig config = testConfig();
   config.maxEntryBytes = 32;
@@ -2343,7 +2443,7 @@ TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
   EXPECT_EQ(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(supplier));
 }
 
-TEST(FilterCacheTest, weightConstantCountIsNarrowAndTransparent) {
+TEST(FilterCacheTest, weightCountShortcutsAreNarrowAndTransparent) {
   RAMDir dir;
   CommitSnapshotRegistry writerSnapshots(dir);
   IndexWriter writer(writerSnapshots);
@@ -2355,6 +2455,12 @@ TEST(FilterCacheTest, weightConstantCountIsNarrowAndTransparent) {
   auto& segment = reader->segments()[0];
   MemPool pool;
   Query::Context context(pool, *reader);
+
+  auto metadataCount = [&](Query::Weight* weight, DocSet* domain = nullptr) -> std::optional<int64_t> {
+    auto shortcut = weight->countShortcut(segment, domain);
+    if (shortcut.how != Query::CountHow::METADATA) return std::nullopt;
+    return shortcut.maxMatches;
+  };
 
   AllQuery all;
   MatchNoDocsQuery none;
@@ -2369,19 +2475,17 @@ TEST(FilterCacheTest, weightConstantCountIsNarrowAndTransparent) {
   auto* boostWeight = boost.createWeight(context, 0);
   auto* preparedWeight = prepared.createWeight(context, 0);
 
-  EXPECT_EQ(3, *allWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(0, *noneWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(2, *alphaWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(2, *constantWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(2, *boostWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(2, *preparedWeight->constantCount(segment, nullptr));
+  EXPECT_EQ(3, *metadataCount(allWeight, nullptr));
+  EXPECT_EQ(0, *metadataCount(noneWeight, nullptr));
+  EXPECT_EQ(2, *metadataCount(alphaWeight, nullptr));
+  EXPECT_EQ(2, *metadataCount(constantWeight, nullptr));
+  EXPECT_EQ(2, *metadataCount(boostWeight, nullptr));
+  EXPECT_EQ(2, *metadataCount(preparedWeight, nullptr));
 
   auto restricted = docs(3, {0, 2});
-  EXPECT_FALSE(allWeight->constantCount(
-      segment, restricted.get()).has_value());
-  EXPECT_EQ(0, *noneWeight->constantCount(segment, restricted.get()));
-  EXPECT_FALSE(alphaWeight->constantCount(
-      segment, restricted.get()).has_value());
+  EXPECT_EQ(2, metadataCount(allWeight, restricted.get()));
+  EXPECT_EQ(0, *metadataCount(noneWeight, restricted.get()));
+  EXPECT_FALSE(metadataCount(alphaWeight, restricted.get()).has_value());
 
   TermQuery beta("text_w", "beta");
   TermQuery ghost("text_w", "ghost");
@@ -2408,25 +2512,23 @@ TEST(FilterCacheTest, weightConstantCountIsNarrowAndTransparent) {
   // two live clauses have unknown overlap. Dropped (non-gating) optionals
   // leave the lone required clause's count; a gating optional group or a
   // prohibited clause needs execution.
-  EXPECT_EQ(2, *deadClauseUnionWeight->constantCount(segment, nullptr));
-  EXPECT_FALSE(liveUnionWeight->constantCount(segment, nullptr).has_value());
-  EXPECT_EQ(0, *deadUnionWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(0, *deadUnionWeight->constantCount(segment, restricted.get()));
-  EXPECT_EQ(2, *mandOptWeight->constantCount(segment, nullptr));
-  EXPECT_FALSE(gatedOptWeight->constantCount(segment, nullptr).has_value());
-  EXPECT_FALSE(excludedWeight->constantCount(segment, nullptr).has_value());
-  EXPECT_FALSE(deadClauseUnionWeight->constantCount(
-      segment, restricted.get()).has_value());
+  EXPECT_EQ(2, *metadataCount(deadClauseUnionWeight, nullptr));
+  EXPECT_FALSE(metadataCount(liveUnionWeight, nullptr).has_value());
+  EXPECT_EQ(0, *metadataCount(deadUnionWeight, nullptr));
+  EXPECT_EQ(0, *metadataCount(deadUnionWeight, restricted.get()));
+  EXPECT_EQ(2, *metadataCount(mandOptWeight, nullptr));
+  EXPECT_FALSE(metadataCount(gatedOptWeight, nullptr).has_value());
+  EXPECT_FALSE(metadataCount(excludedWeight, nullptr).has_value());
+  EXPECT_FALSE(metadataCount(deadClauseUnionWeight, restricted.get()).has_value());
 
   ExistsQuery exists("text_w");
   ExistsQuery absentField("other_w");
   auto* existsWeight = exists.createWeight(context, 0);
   auto* absentFieldWeight = absentField.createWeight(context, 0);
-  EXPECT_EQ(3, *existsWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(0, *absentFieldWeight->constantCount(segment, nullptr));
-  EXPECT_EQ(0, *absentFieldWeight->constantCount(segment, restricted.get()));
-  EXPECT_FALSE(existsWeight->constantCount(
-      segment, restricted.get()).has_value());
+  EXPECT_EQ(3, *metadataCount(existsWeight, nullptr));
+  EXPECT_EQ(0, *metadataCount(absentFieldWeight, nullptr));
+  EXPECT_EQ(0, *metadataCount(absentFieldWeight, restricted.get()));
+  EXPECT_FALSE(metadataCount(existsWeight, restricted.get()).has_value());
 }
 
 TEST(FilterCacheTest,
@@ -2458,7 +2560,7 @@ TEST(FilterCacheTest,
       query, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan firstPlan(
       *firstWeight, firstUse, firstContext.filterUses);
-  auto built = firstPlan.resolve(*reader, segment, incoming.get());
+  auto built = test::resolveWholeMembershipForTests(firstPlan, *reader, segment, incoming.get());
   ASSERT_TRUE(built.available);
   EXPECT_EQ(1, built.count);
   ASSERT_NE(nullptr, built.docs.get());
@@ -2475,7 +2577,7 @@ TEST(FilterCacheTest,
       query, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan hitPlan(
       *hitWeight, hitUse, hitContext.filterUses);
-  auto hit = hitPlan.resolve(*reader, segment, incoming.get());
+  auto hit = test::resolveWholeMembershipForTests(hitPlan, *reader, segment, incoming.get());
   ASSERT_TRUE(hit.available);
   EXPECT_EQ(1, hit.count);
   EXPECT_EQ(1, SkipStats::wholeCountHits);
@@ -2488,7 +2590,7 @@ TEST(FilterCacheTest,
   EXPECT_EQ(hit.docs.get()->card(), composed.get()->card());
 
   auto emptyDomain = docs(5, {});
-  auto allDeleted = hitPlan.resolve(
+  auto allDeleted = test::resolveWholeMembershipForTests(hitPlan,
       *reader, segment, emptyDomain.get());
   ASSERT_TRUE(allDeleted.available);
   EXPECT_EQ(0, allDeleted.count);
@@ -2505,7 +2607,7 @@ TEST(FilterCacheTest,
       *dependentWeight, dependentUse, dependentContext.filterUses,
       PreparedDomainDependence::PREPARE_DOMAIN);
   EXPECT_THROW(
-      dependentPlan.resolve(*reader, segment, nullptr), std::logic_error);
+      test::resolveWholeMembershipForTests(dependentPlan, *reader, segment, nullptr), std::logic_error);
 
   MemPool retryPool;
   Query::Context retryContext(retryPool, *reader);
@@ -2514,7 +2616,7 @@ TEST(FilterCacheTest,
       dependentQuery, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan retryPlan(
       *retryWeight, retryUse, retryContext.filterUses);
-  auto retry = retryPlan.resolve(*reader, segment, nullptr);
+  auto retry = test::resolveWholeMembershipForTests(retryPlan, *reader, segment, nullptr);
   ASSERT_TRUE(retry.available);
   EXPECT_EQ(1, retry.count);
 }
@@ -3428,7 +3530,7 @@ TEST(FilterCacheTest, preparedDomainProvenanceControlsQueryKeyPublication) {
   std::array<FilterCache::Use*, 1> canonicalUses{
       canonicalContext.getFilterUse(forcedTerm)};
   Query::Weight::PrepareContext canonicalPrepare{
-      *reader, std::span<DocSet* const>{}, false};
+      *reader, std::span<DocSet* const>{}, false, nullptr};
   auto canonical = QueryPrep::prepareFilterSources(
       canonicalWeights, canonicalUses, canonicalPrepare);
   ASSERT_EQ(1u, canonical.size());
@@ -3454,7 +3556,7 @@ TEST(FilterCacheTest, preparedDomainProvenanceControlsQueryKeyPublication) {
   std::array<FilterCache::Use*, 1> dependentUses{
       dependentContext.getFilterUse(domainDependent)};
   Query::Weight::PrepareContext dependentPrepare{
-      *reader, std::span<DocSet* const>{}, false};
+      *reader, std::span<DocSet* const>{}, false, nullptr};
   auto dependent = QueryPrep::prepareFilterSources(
       dependentWeights, dependentUses, dependentPrepare);
   ASSERT_EQ(1u, dependent.size());
@@ -3733,7 +3835,7 @@ TEST(FilterCacheTest, preparedProhibitedSourceBuildsThenHits) {
     BooleanQuery query(mandatory, {}, prohibited, {});
     auto* weight = query.createWeight(context, 0);
     Query::Weight::PrepareContext prepareContext{
-        *reader, std::span<DocSet* const>{}, false};
+        *reader, std::span<DocSet* const>{}, false, nullptr};
     auto prepared = weight->prepare(prepareContext);
     if (prepared == nullptr) {
       ADD_FAILURE() << "Boolean prohibited preparation returned null";
@@ -4115,10 +4217,10 @@ TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
       nestedDomains.push_back(ownedDomains.back().get());
     }
     Query::Weight::PrepareContext prepareContext{
-        *reader, nestedDomains, /*parallel=*/false};
+        *reader, nestedDomains, /*parallel=*/false, nullptr};
     auto prepared = plan.prepareMainWeight(prepareContext);
     ASSERT_NE(nullptr, prepared);
-    auto result = plan.resolve(
+    auto result = test::resolveWholeMembershipForTests(plan,
         *reader, reader->segments()[0], nestedDomains[0], prepared.get());
     EXPECT_FALSE(result.available);
   }
@@ -4136,7 +4238,7 @@ TEST(FilterCacheTest, wholeReaderPlanRejectsNestedDomainWithoutSighting) {
         QueryPrep::WholeMembershipConsumer::COUNT);
     auto rootDomains = canonicalDomains(*reader);
     Query::Weight::PrepareContext prepareContext{
-        *reader, rootDomains, /*parallel=*/false};
+        *reader, rootDomains, /*parallel=*/false, nullptr};
     EXPECT_THROW(plan.prepareMainWeight(prepareContext), std::logic_error);
   }
   EXPECT_EQ(prepares + 2,
@@ -4903,7 +5005,7 @@ TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
     for (auto& segment : reader->segments()) {
       DocSet* domain = segment.liveDocs() == nullptr
           ? nullptr : &segment.liveDocs()->docset();
-      auto resolved = plan.resolve(*reader, segment, domain);
+      auto resolved = test::resolveWholeMembershipForTests(plan, *reader, segment, domain);
       EXPECT_TRUE(resolved.available);
       result += resolved.count;
     }
@@ -5084,11 +5186,11 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
     QueryPrep::WholeMembershipPlan buildPlan(
         *buildWeight, buildUse, buildContext.filterUses);
     Query::Weight::PrepareContext buildPrepareContext{
-        *reader, domains, /*parallel=*/false};
+        *reader, domains, /*parallel=*/false, nullptr};
     auto buildPrepared = buildPlan.prepareMainWeight(buildPrepareContext);
     int64_t built = 0;
     for (auto& segment : reader->segments()) {
-      auto result = buildPlan.resolve(
+      auto result = test::resolveWholeMembershipForTests(buildPlan,
           *reader, segment, domains[(size_t)segment.ord],
           buildPrepared.get());
       ASSERT_TRUE(result.available);
@@ -5110,7 +5212,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   QueryPrep::WholeMembershipPlan plan(
       *weight, use, context.filterUses);
   Query::Weight::PrepareContext prepareContext{
-      *reader, domains, /*parallel=*/false};
+      *reader, domains, /*parallel=*/false, nullptr};
   uint64_t hitsBefore = cache->counters().readerStableHits;
   auto prepared = plan.prepareMainWeight(prepareContext);
   ASSERT_NE(nullptr, prepared);
@@ -5120,7 +5222,7 @@ TEST(FilterCacheIntegrationTest, knnReaderValueStaysPinnedDuringRetirement) {
   cachedMembership.reserve(reader->segments().size());
   int64_t cachedCount = 0;
   for (auto& segment : reader->segments()) {
-    auto result = plan.resolve(
+    auto result = test::resolveWholeMembershipForTests(plan,
         *reader, segment, domains[(size_t)segment.ord], prepared.get());
     ASSERT_TRUE(result.available);
     cachedCount += result.count;

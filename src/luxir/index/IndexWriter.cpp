@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "luxir/store/Manifest.h"
 
@@ -1191,6 +1192,8 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   INDEX_DEBUG("finishCommitBody: msg={}", (void*)&msg);
   if (failed.load(std::memory_order_acquire)) throw IndexWriterClosedError("index writer has failed");
   // TODO: if nothing actually changed, we could skip writing a new commit at this point.
+  // Not for a commit that waits for replicas: that wait relies on a generation
+  // newer than any follower has acknowledged, even after a follower restart.
 
   // Apply deletes from all segments that were part of this commit to all segments in the index.
   // This must be mutually exclusive with segment merging, or we must do some form of optimistic concurrency.
@@ -3028,23 +3031,18 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   int32_t newDeletesCount = 0;
 
   // Read the "id" field using TermsEnum
-  FieldReader fieldReader(reader);
-  if (!fieldReader.seek("id")) {
+  auto* idFieldInfo = reader.fieldInfo("id");
+  if (!idFieldInfo) {
     LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
     return;
   }
 
-  SegFieldInfo idFieldInfo;
-  fieldReader.readFieldInfo(idFieldInfo);
-  TermsEnum termsEnum(pool, reader, idFieldInfo);
+  TermsEnum termsEnum(pool, reader, *idFieldInfo);
 
   // Also get the "_version_" field for version comparison
-  FieldReader versionFieldReader(reader);
-  SegFieldInfo versionFieldInfo;
   std::optional<IntColReader> versionColReader;
-  if (versionFieldReader.seek("_version_")) {
-    versionFieldReader.readFieldInfo(versionFieldInfo);
-    versionColReader.emplace(reader, versionFieldInfo);
+  if (auto* versionFieldInfo = reader.fieldInfo("_version_")) {
+    versionColReader.emplace(reader, *versionFieldInfo);
     assert(!versionColReader->multiValued());
   }
 

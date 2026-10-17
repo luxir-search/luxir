@@ -26,8 +26,13 @@ public:
   struct Barrier {
     bool all;
     uint32_t wanted;
-    std::map<std::string, uint64_t> members; // follower -> acknowledgment membership
+    // follower -> acknowledgment membership; 0 admits the follower's first row
+    std::map<std::string, uint64_t> members;
   };
+  // Who "all" captures. SERVING: followers serving the collection's
+  // incarnation. SUBSCRIBED: also followers whose subscription includes it and
+  // that serve any collection, for a new collection that none serves yet.
+  enum class Members { SERVING, SUBSCRIBED };
 private:
   struct Acknowledgment {
     CommitId commit;
@@ -86,7 +91,10 @@ public:
   void seen(std::string_view follower);
   void expire();
   std::optional<Clock::time_point> nextExpiry();
-  Barrier capture(const api::ReplicaRequirement& requirement, const CollectionId& collection, const CommitId& id);
+  // Rejects a requirement without count or all, before any side effect.
+  static void validate(const api::ReplicaRequirement& requirement);
+  Barrier capture(const api::ReplicaRequirement& requirement, const CollectionId& collection, const CommitId& id,
+                  Members members = Members::SERVING);
   api::ReplicaResult progress(const Barrier& barrier, const CollectionId& collection, const CommitId& id);
 };
 }

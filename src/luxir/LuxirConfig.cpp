@@ -89,6 +89,7 @@ std::vector<std::string> ReplicationConfig::peerList() const {
 void ReplicationConfig::validate() const {
   tenantFilter();
   if (!max_acknowledgments) throw std::invalid_argument("replication.max-acknowledgments must be positive");
+  if (follower_id.size() > 255) throw std::invalid_argument("replication.follower-id exceeds 255 bytes");
   if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
     throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
   }
@@ -100,7 +101,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--replication.peers", replication.peers, "Comma-separated http:// nodes serving file copies, tried before the source");
   app.add_option("--replication.max-acknowledgments", replication.max_acknowledgments,
       "Node-wide follower/collection acknowledgment row budget")->default_val(replication.max_acknowledgments);
-  app.add_option("--replication.follower-id", replication.follower_id, "Stable follower id (generated when omitted)");
+  app.add_option("--replication.follower-id", replication.follower_id, "Name the source knows this follower by (default host:port)");
   app.add_option("--replication.downloads", replication.downloads, "Concurrent collection downloads per follower")->check(CLI::Range(1, 64));
   app.add_flag("--read-only", read_only,
                "Serve an existing data directory without the write lock; rejects all updates");
@@ -123,6 +124,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.grpc.port", server.grpc.port, "gRPC listen port (default: HTTP port + 1)");
   app.add_option("--server.grpc.threads", server.grpc.threads, "Number of server threads (0 = auto)")
       ->default_val(server.grpc.threads);
+  app.add_option("--server.grpc.max-receive-message-size", server.grpc.max_receive_message_size,
+                 "Max received gRPC message; larger -> RESOURCE_EXHAUSTED (e.g. 64MB)")
+      ->transform(CLI::AsSizeValue(false))
+      ->check(CLI::NonNegativeNumber)
+      ->default_str("--indexing.max-request-body");
 
   app.add_flag("--server.http.enabled,!--no-http", server.http.enabled, "Enable the HTTP/JSON server")
       ->default_val(server.http.enabled);

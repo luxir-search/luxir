@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "MergeCostModel.h"
 #include "OrdCollector.h"

@@ -512,7 +512,9 @@ public:
   /// 0 may be better if one has many pools.
   void rewind(const save_point &savePoint, uint32_t buffersToSave = 1) {
 #ifndef MEMPOOL_MALLOC
-    if (savePoint >= buffer && savePoint <= buffer + bufferSize(buffer)) {
+    // A save point is never before buffer + HEADER_SIZE. One equal to buffer is the end of
+    // the previous, exactly full buffer when upstream returned the two adjacently.
+    if (savePoint >= buffer + HEADER_SIZE && savePoint <= buffer + bufferSize(buffer)) {
       // fast path: same buffer
       assert(scribble(savePoint, ptr() - savePoint));  // scribble from the save point to the current point
       // if sp==buffer+pos, then pos=sp-buffer to restore.

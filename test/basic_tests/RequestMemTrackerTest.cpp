@@ -8,6 +8,7 @@
 #include <string>
 
 #include "luxir/search/RequestMemTracker.h"
+#include "luxir/search/DomainVariantPlan.h"
 
 using namespace luxir;
 
@@ -31,6 +32,7 @@ TEST(RequestMemTrackerTest, chargesReleasesAndNamesRejectedCharge) {
   EXPECT_EQ(6u, tracker.bytes());
   tracker.release(6);
   EXPECT_EQ(0u, tracker.bytes());
+  EXPECT_EQ(6u, tracker.peak());
 }
 
 TEST(RequestMemTrackerTest, partialChargePreservesReservationSemantics) {
@@ -39,6 +41,7 @@ TEST(RequestMemTrackerTest, partialChargePreservesReservationSemantics) {
   EXPECT_EQ(3u, tracker.chargeUpTo(5, 2, "test", "tail"));
   EXPECT_EQ(10u, tracker.bytes());
   tracker.release(10);
+  EXPECT_EQ(10u, tracker.peak());
 }
 
 TEST(RequestMemTrackerTest, nonThrowingChargeLeavesDeniedReservationAlone) {
@@ -49,6 +52,7 @@ TEST(RequestMemTrackerTest, nonThrowingChargeLeavesDeniedReservationAlone) {
   EXPECT_TRUE(tracker.tryCharge(4));
   EXPECT_EQ(10u, tracker.bytes());
   tracker.release(10);
+  EXPECT_EQ(10u, tracker.peak());
 }
 
 TEST(RequestMemTrackerTest, unlimitedTrackerStillRejectsCounterOverflow) {
@@ -68,4 +72,24 @@ TEST(RequestMemTrackerTest, unlimitedTrackerStillRejectsCounterOverflow) {
   }
   EXPECT_EQ(MAX, tracker.bytes());
   tracker.release(MAX);
+}
+
+TEST(RequestMemTrackerTest, domainAccountingFollowsItsOwnerOnce) {
+  RequestMemTracker tracker(1024);
+  DomainHandle survivor;
+  {
+    DomainHandle docs(std::make_unique<ArrDocSet>(std::vector<int32_t>{1, 3, 5}));
+    EXPECT_TRUE(docs.ownsStorage());
+    auto charged = DomainVariantPlan::account(std::move(docs), tracker, "bucket input");
+    size_t bytes = tracker.bytes();
+    EXPECT_GT(bytes, 0u);
+    auto retained = std::move(charged).retainedWith(std::make_shared<int>(7));
+    survivor = DomainVariantPlan::account(std::move(retained), tracker, "retained bucket input");
+    EXPECT_TRUE(survivor.isCharged());
+    EXPECT_EQ(bytes, tracker.bytes());
+    EXPECT_EQ(3, survivor.get()->card());
+  }
+  EXPECT_GT(tracker.bytes(), 0u);
+  survivor = {};
+  EXPECT_EQ(0u, tracker.bytes());
 }

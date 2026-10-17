@@ -331,6 +331,8 @@ struct from<JSON, luxir::api::QueryFacet> {
     bool sawOps = false;
     bool sawSelected = false;
     bool sawSelectionMode = false;
+    bool sawCountUnit = false;
+    bool sawCountDistinct = false;
     util::scan_object_fields<Opts, true>(
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
@@ -349,6 +351,12 @@ struct from<JSON, luxir::api::QueryFacet> {
           } else if (key == "selection_mode" && !sawSelectionMode) {
             sawSelectionMode = true;
             util::from_json<O>(value.selection_mode, ctx, vit, vend);
+          } else if (key == "count_unit" && !sawCountUnit) {
+            sawCountUnit = true;
+            util::from_json<O>(value.count_unit, ctx, vit, vend);
+          } else if (key == "count_distinct" && !sawCountDistinct) {
+            sawCountDistinct = true;
+            util::from_json<O>(value.count_distinct, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -392,6 +400,14 @@ struct to<JSON, luxir::api::QueryFacet> {
     if (value.selection_mode != luxir::api::SelectionMode::ANY) {
       dump<",\"selection_mode\":" >(b, ix);
       serialize<JSON>::template op<Opts>(value.selection_mode, ctx, b, ix);
+    }
+    if (value.count_unit) {
+      dump<",\"count_unit\":" >(b, ix);
+      serialize<JSON>::template op<Opts>(*value.count_unit, ctx, b, ix);
+    }
+    if (value.count_distinct) {
+      dump<",\"count_distinct\":" >(b, ix);
+      serialize<JSON>::template op<Opts>(*value.count_distinct, ctx, b, ix);
     }
     dump<'}'>(b, ix);
   }
@@ -956,6 +972,89 @@ struct to<JSON, luxir::api::Filter> {
 };
 
 template <>
+struct from<JSON, luxir::api::Collapse> {
+  template <auto Opts>
+  static void op(luxir::api::Collapse &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) return;
+    }
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    auto readFields = [&](auto &vit, auto &vend) {
+      value.field = {};
+      decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.field);
+      if (skip_ws<O>(ctx, vit, vend)) return;
+      if ((char)*vit == '[') glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
+      else {
+        fields.resize(1);
+        util::from_json<O>(fields[0], ctx, vit, vend);
+      }
+    };
+    if ((char)*it == '"') {
+      value.missing = luxir::api::Collapse_::MissingPolicy::EXPAND;
+      value.head_sort = {};
+      value.sort = {};
+      value.get_number = false;
+      value.ops = {};
+      readFields(it, end);
+      return;
+    }
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<Opts, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "field") readFields(vit, vend);
+          else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
+          else if (key == "get_number") util::from_json<O>(value.get_number, ctx, vit, vend);
+          else if (key == "ops") {
+            decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
+            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          }
+          else if (key == "head_sort" || key == "sort") {
+            decltype(auto) sort = ::hpp_proto::detail::as_modifiable(
+                ctx, key == "head_sort" ? value.head_sort : value.sort);
+            readSortList<O>(sort, ctx, vit, vend);
+          }
+          else { ctx.error = error_code::unknown_key; return true; }
+          return bool(ctx.error);
+        }, [](auto &, auto &) {});
+  }
+};
+
+template <>
+struct from<JSON, luxir::api::Diversify> {
+  template <auto Opts>
+  static void op(luxir::api::Diversify &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    auto readFields = [&](auto &vit, auto &vend) {
+      value.field = {};
+      decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.field);
+      if (skip_ws<O>(ctx, vit, vend)) return;
+      if ((char)*vit == '[') glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
+      else {
+        fields.resize(1);
+        util::from_json<O>(fields[0], ctx, vit, vend);
+      }
+    };
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<Opts, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "field") readFields(vit, vend);
+          else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
+          else if (key == "max_per_key") util::from_json<O>(value.max_per_key, ctx, vit, vend);
+          else { ctx.error = error_code::unknown_key; return true; }
+          return bool(ctx.error);
+        }, [](auto &, auto &) {});
+  }
+};
+
+template <>
 struct from<JSON, luxir::api::TopDocs> {
   template <auto Opts>
   static void op(luxir::api::TopDocs &value,
@@ -987,6 +1086,10 @@ struct from<JSON, luxir::api::TopDocs> {
           } else if (key == "sort") {
             decltype(auto) sort = ::hpp_proto::detail::as_modifiable(ctx, value.sort);
             readSortList<O>(sort, ctx, vit, vend);
+          } else if (key == "diversify") {
+            util::from_json<O>(value.diversify, ctx, vit, vend);
+          } else if (key == "collapse") {
+            util::from_json<O>(value.collapse, ctx, vit, vend);
           } else if (key == "batch_size") {
             util::from_json<O>(value.batch_size, ctx, vit, vend);
           } else if (key == "document_format") {
@@ -1040,8 +1143,26 @@ struct from<JSON, luxir::api::Fusion> {
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
-          } else if (key == "rrf") {
-            util::from_json<O>(value.rrf, ctx, vit, vend);
+          } else if (key == "weights") {
+            decltype(auto) weights = ::hpp_proto::detail::as_modifiable(ctx, value.weights);
+            glz::util::parse_repeated<O>(true, weights, ctx, vit, vend);
+          } else if (key == "collapse") {
+            util::from_json<O>(value.collapse, ctx, vit, vend);
+          } else if (key == "rrf" || key == "linear") {
+            // one method arm: a second one is an error (proto3 canonical
+            // JSON), not a silent last-wins
+            if (value.method.index() != 0) {
+              ctx.error = error_code::syntax_error;
+              ctx.custom_error_message = "fusion takes exactly one method: rrf or linear";
+              return true;
+            }
+            if (key == "rrf") {
+              util::from_json<O>(value.method.template emplace<luxir::api::RrfFusion>(),
+                                 ctx, vit, vend);
+            } else {
+              util::from_json<O>(value.method.template emplace<luxir::api::LinearFusion>(),
+                                 ctx, vit, vend);
+            }
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -1268,6 +1389,14 @@ struct from<JSON, luxir::api::SearchRequest> {
             if (reusedShorthand) topDocs.sort = {};
             decltype(auto) sort = ::hpp_proto::detail::as_modifiable(ctx, topDocs.sort);
             readSortList<O>(sort, ctx, vit, vend);
+          } else if (key == "diversify") {
+            auto &topDocs = shorthand();
+            topDocs.diversify.reset();
+            util::from_json<O>(topDocs.diversify, ctx, vit, vend);
+          } else if (key == "collapse") {
+            auto &topDocs = shorthand();
+            topDocs.collapse.reset();
+            util::from_json<O>(topDocs.collapse, ctx, vit, vend);
           } else if (key == "batch_size") {
             util::from_json<O>(shorthand().batch_size, ctx, vit, vend);
           } else if (key == "document_format") {

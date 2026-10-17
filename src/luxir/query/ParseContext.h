@@ -17,12 +17,15 @@
 
 namespace luxir {
 
+class CollapsePlan;
+
 // Request-scoped context threaded through query parsing and building: the
 // pool the query tree is built into, the schema, the warnings sink (declared
 // degradations, surfaced as SearchResponse.warnings), and the shared nesting
 // budget.  This is the request-scoped parse/build context from the
 // query-string design; the limits-config snapshot joins it later.
 struct ParseContext {
+  const CollapsePlan* collapse = nullptr;
   MemPool& pool;
   Schema& schema;
   google::protobuf::Arena& arena;

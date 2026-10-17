@@ -198,6 +198,10 @@ public:
     : Query(QueryKind::CONSTANT_SCORE), child(child),
       constantScore(constantScore) {}
 
+  bool recoverableAsPredicate() const noexcept override {
+    return child->recoverableAsPredicate();
+  }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const ConstantScoreQuery&>(other);
     return std::bit_cast<uint32_t>(constantScore)
@@ -272,6 +276,10 @@ public:
         child.releaseSegmentState(segment);
       }
 
+      size_t retainedBytes() const noexcept override {
+        return sizeof(*this) + (child.prepared ? child.prepared->retainedBytes() : 0);
+      }
+
       bool outputIsSubsetOfDomain() const noexcept override {
         return child.prepared != nullptr && child.prepared->outputIsSubsetOfDomain();
       }
@@ -324,9 +332,9 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    std::optional<int64_t> constantCount(
+    CountShortcut countShortcut(
         IndexReader::Segment& segment, DocSet* domain) override {
-      return childWeight->constantCount(segment, domain);
+      return childWeight->countShortcut(segment, domain);
     }
   };
 };

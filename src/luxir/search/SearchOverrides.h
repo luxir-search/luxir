@@ -21,6 +21,14 @@
 
 namespace luxir {
 
+// Page-member traversal overrides affect work, never membership.
+enum class CollapseMemberStrategy { AUTO, KEYS, DOMAIN };
+inline CollapseMemberStrategy collapseMemberStrategy = CollapseMemberStrategy::AUTO;
+struct CollapseMemberStats {
+  std::atomic<int64_t> keySegments{0}, domainSegments{0}, candidates{0}, members{0};
+};
+inline CollapseMemberStats* collapseMemberStats = nullptr;
+
 // A/B baseline for measuring folded Boolean filters against the former passive
 // TopDocs domain path. Default false means folding is enabled.
 inline bool disableTopDocsFilterFold = false;
@@ -32,6 +40,12 @@ inline bool disableFieldSortBulk = false;
 // Zero selects the production constant; tests set a tiny nonzero value to
 // force bucket chunking.
 inline std::size_t forcedRangeFacetBucketDomainByteBudget = 0;
+
+// Observe unexpected structural-prefix lifetime recomputation in tests.
+inline size_t* structuralPrefixRecomputations = nullptr;
+
+// Force identity producer chunks independently of the binding block width.
+inline std::size_t forcedFacetBucketDomainByteBudget = 0;
 
 // Test override for the range-facet result-child state chunk. Zero selects the
 // production ceiling.
@@ -54,6 +68,15 @@ inline std::size_t forcedFacetBucketBlockBuckets = [] {
 // Test override for the per-request query-memory breaker ceiling. Zero uses
 // LuxirConfig.
 inline std::size_t forcedRequestMemoryMaxBytes = 0;
+enum class DistinctFacetMode;
+extern DistinctFacetMode forcedDistinctFacetMode;
+// Test-only assertion: each group's matching docs form one run in exactly
+// one segment. Index sorting alone does not establish cross-segment ownership.
+inline bool distinctFacetRunContractForTests = false;
+struct DistinctFacetStats {
+  std::atomic<size_t> interned{0}, paged{0}, hash{0}, run{0}, refused{0};
+};
+inline DistinctFacetStats* distinctFacetStatsForTests = nullptr;
 inline std::atomic<size_t>* facetAggregateStateReservationCounterForTests =
     nullptr;
 
@@ -91,6 +114,10 @@ inline InlineFacetEntryMode initInlineFacetEntryMode() {
 }
 inline InlineFacetEntryMode forcedInlineFacetEntryMode =
     initInlineFacetEntryMode();
+
+// Test/bench baseline: visit every matching document under collapse, retaining
+// the same limit and admission policy. Totals and result order are unchanged.
+inline bool disableCollapsePruningForTests = false;
 
 // A/B baseline for field-sort competitive block pruning. Default false means
 // zone-based pruning runs wherever the primary sort clause offers block key

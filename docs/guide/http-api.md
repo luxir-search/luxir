@@ -4,8 +4,8 @@ The HTTP surface is plain JSON for bounded messages and NDJSON for streams.
 Collection names live in the path, and the request body uses the same field
 names as the protobuf messages.
 
-Collections belong to a tenant. Search, update and replica-wait routes act in
-the caller's own tenant, which is the default tenant `t0` until requests carry
+Collections belong to a tenant. Search and update routes act in the caller's
+own tenant, which is the default tenant `t0` until requests carry
 credentials. Administration and snapshot routes may name another tenant under
 `/tenants/{tenant}`.
 
@@ -15,13 +15,12 @@ credentials. Administration and snapshot routes may name another tenant under
 |---|---|
 | `GET /health` | Process liveness. |
 | `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
-| `POST /collections/{collection}/_wait_for_replicas` | Wait on an existing commit token; see [Replication](replication.md#write-then-read-your-write). |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
 | `GET /collections/{collection}/_schema?view=resolved` | Read physical representations, bindings, and conservative schema coverage; HTTP only. |
-| `POST /collections/{collection}/_schema` | Set definitions or replace the schema. |
+| `POST /collections/{collection}/_schema` | Set definitions or replace the schema; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |
 | `GET /collections/_list` (or `POST`) | List collection names; `GET /collections` is a synonym. |
-| `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`. |
+| `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
 | `GET /_stats` | Node totals and per-collection operational statistics. |
 | `GET /collections/{collection}/_stats` | Operational statistics for one collection. |

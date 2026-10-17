@@ -12,6 +12,8 @@ namespace luxir {
 // yields a null scorer for every segment.
 class MatchNoDocsQuery final : public luxir::Query {
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   MatchNoDocsQuery() : Query(QueryKind::NONE) {}
 
   bool equalsSameKind(const Query& other) const override {
@@ -55,10 +57,10 @@ public:
       return nullptr;  // never matches any doc
     }
 
-    std::optional<int64_t> constantCount(
+    CountShortcut countShortcut(
         IndexReader::Segment& segment, DocSet* domain) override {
       unused(segment, domain);
-      return 0;
+      return {0, CountHow::METADATA};
     }
   };
 };

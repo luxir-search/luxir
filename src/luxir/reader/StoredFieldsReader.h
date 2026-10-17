@@ -9,7 +9,6 @@
 #include <vector>
 #include <zstd.h>
 
-#include "FieldReader.h"
 #include "IntColReader.h"
 #include "Postings.h"
 #include "PostingsReader.h"
@@ -295,24 +294,6 @@ public:
     const char* metaPtr = chunkIS.ptr(metadataOffset);
     const char* end = chunkIS.ptr(chunkIS.size());
     return (int64_t)InputStream::readVlong(metaPtr, end);
-  }
-
-  // Try to open a StoredFieldsReader for the given resource name in the
-  // segment (default: Postings::STORED_DEFAULT_RESOURCE).  Returns nullptr
-  // if that resource isn't present in the segment.  The FieldReader used
-  // for the lookup is transient - no persistent pool allocations.
-  static std::unique_ptr<StoredFieldsReader> open(
-      PostingsReader& postingsReader,
-      std::string_view resourceName = Postings::STORED_DEFAULT_RESOURCE) {
-    auto& pool = MemPool::threadLocal();
-    auto guard = pool.rewindScopeGuard();
-    FieldReader fieldReader(postingsReader);
-    if (!fieldReader.seek(resourceName)) {
-      return nullptr;
-    }
-    SegFieldInfo fi;
-    fieldReader.readFieldInfo(fi);
-    return std::make_unique<StoredFieldsReader>(postingsReader, fi);
   }
 
 private:

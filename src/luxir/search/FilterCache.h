@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -51,6 +52,10 @@ struct FilterCacheConfig {
   uint32_t admissionThreshold = 2;
   size_t maxMetadataEntries = 8192;
   size_t maxMetadataBytes = 0;
+  // A metadata sweep started by exceeding maxMetadataBytes trims to this
+  // watermark, so steady slot growth does not start a sweep per request.
+  // Zero means 90% of maxMetadataBytes.
+  size_t lowWatermarkMetadataBytes = 0;
 };
 
 // SEGMENT_STABLE and CORE_STABLE keys name raw DocSet values, one per seg_id.
@@ -121,6 +126,26 @@ public:
     size_t metadataBytes = 0;
   };
 
+  // GDSF priority is the inflation clock plus a frozen density. The clock
+  // only moves forward, so a hit changes the priority only after a sweep has
+  // advanced it; skip the store otherwise to keep hot values' cache lines
+  // shared across cores. Concurrent relaxed touches may still overwrite one
+  // another; that race is a benign approximation in GDSF.
+  static void touchPriority(std::atomic<double>& priority, double next) {
+    if (priority.load(std::memory_order_relaxed) != next) {
+      priority.store(next, std::memory_order_relaxed);
+    }
+  }
+
+  // Recency only needs to be approximate. Skip the store when a Use with the
+  // same or a newer epoch already recorded it (all segments of one Use share
+  // an epoch), so a hot entry is written once per Use rather than per hit.
+  static void touchEpoch(std::atomic<uint64_t>& lastUsed, uint64_t epoch) {
+    if (lastUsed.load(std::memory_order_relaxed) < epoch) {
+      lastUsed.store(epoch, std::memory_order_relaxed);
+    }
+  }
+
   class SegmentValue {
     friend class FilterCache;
 
@@ -131,15 +156,16 @@ public:
     uint32_t buildCostMicros;
     const bool claimedBuild;
     mutable std::atomic<uint64_t> cacheHits{0};
+    // Set once capacity eviction has detached this value from its slot.
+    mutable std::atomic<bool> capacityDetached{false};
     double density = 0;
-    mutable std::atomic<uint64_t> lastUsed;
     mutable std::atomic<double> priority;
     #ifndef NDEBUG
     SegmentIdentity identityForTest;
     #endif
 
   public:
-    SegmentValue(std::unique_ptr<DocSet> docs, uint64_t epoch,
+    SegmentValue(std::unique_ptr<DocSet> docs,
                  SegmentIdentity identityForTest, uint32_t buildCostMicros,
                  bool claimedBuild);
 
@@ -150,14 +176,8 @@ public:
       return docs->cachedCard();
     }
     size_t ramBytesUsed() const { return charge; }
-    void touch(uint64_t epoch, double evictionClock) const {
-      lastUsed.store(epoch, std::memory_order_relaxed);
-      // Concurrent relaxed touches may overwrite one another; that race is a
-      // benign approximation in GDSF, while the sweeper's clock is monotonic.
-      priority.store(evictionClock + density, std::memory_order_relaxed);
-    }
-    uint64_t usedEpoch() const {
-      return lastUsed.load(std::memory_order_relaxed);
+    void touch(double evictionClock) const {
+      touchPriority(priority, evictionClock + density);
     }
     double evictionPriority() const {
       return priority.load(std::memory_order_relaxed);
@@ -184,24 +204,19 @@ public:
     const bool claimedBuild;
     mutable std::atomic<uint64_t> cacheHits{0};
     double density = 0;
-    mutable std::atomic<uint64_t> lastUsed;
     mutable std::atomic<double> priority;
 
     ReaderValue(uint64_t readerVersion,
                 std::span<const SegmentIdentity> identities,
-                std::vector<std::unique_ptr<DocSet>> docs, uint64_t epoch,
+                std::vector<std::unique_ptr<DocSet>> docs,
                 uint32_t buildCostMicros, bool claimedBuild);
 
   public:
     uint64_t readerVersion() const { return readerVersion_; }
     size_t ramBytesUsed() const { return charge; }
     DocSet* docSet(size_t segmentOrd, const SegmentIdentity& identity) const;
-    void touch(uint64_t epoch, double evictionClock) const {
-      lastUsed.store(epoch, std::memory_order_relaxed);
-      priority.store(evictionClock + density, std::memory_order_relaxed);
-    }
-    uint64_t usedEpoch() const {
-      return lastUsed.load(std::memory_order_relaxed);
+    void touch(double evictionClock) const {
+      touchPriority(priority, evictionClock + density);
     }
     double evictionPriority() const {
       return priority.load(std::memory_order_relaxed);
@@ -299,6 +314,9 @@ public:
       DocSet* raw = nullptr;
       bool rawOwned = false;
       std::unique_ptr<DocSet> ownedRaw;
+      // Almost every slot pins exactly one value; keep it inline so a pure
+      // hit allocates nothing. Further distinct values go to pins.
+      std::shared_ptr<const SegmentValue> firstPin;
       std::vector<std::shared_ptr<const SegmentValue>> pins;
       std::vector<std::shared_ptr<const SegmentValue>> requestOwnedPins;
       std::unique_ptr<DocSet> liveEffective;
@@ -331,7 +349,10 @@ public:
     std::vector<std::shared_ptr<const SegmentValue>> existingCandidates;
     std::shared_ptr<const ReaderValue> existingReaderCandidate;
     bool existingAccepted = false;
-    std::vector<std::unique_ptr<RequestSlot>> requestSlots;
+    // One allocation per Use; RequestSlot holds a mutex, so it is sized once
+    // and never moved.
+    std::unique_ptr<RequestSlot[]> requestSlots;
+    size_t requestSlotCount;
     std::vector<SegmentIdentity> readerSegments;
     uint64_t readerCoreGen;
     uint64_t readerVersion;
@@ -344,6 +365,8 @@ public:
     std::string readerRoutedDetail;
     uint8_t observedAdmissionLanes = 0;
     uint8_t readerAdmissionRecordedLanes = 0;
+    // One recency epoch for every hit this Use accepts.
+    uint64_t epoch;
 
     Use(FilterCache* cache, FilterKey key, FilterKeyScope scope,
         std::shared_ptr<FilterEntry> entry,
@@ -357,7 +380,7 @@ public:
     friend class UseRegistry;
 
     void pinValue(size_t segmentOrd,
-                  const std::shared_ptr<const SegmentValue>& value,
+                  std::shared_ptr<const SegmentValue> value,
                   bool requestOwned = false);
     void pinReaderValue(
         const std::shared_ptr<const ReaderValue>& value,
@@ -517,7 +540,14 @@ private:
   // resident means the outer map still owns this key's metadata; false is
   // permanent. The entry mutex serializes value publication, COW slot-table
   // changes, reader purge, and the resident transition authorizing metadata
-  // erase.
+  // erase. A non-resident entry's slots are all inactive, and no slot of it
+  // can become active again.
+  //
+  // The slot table holds only slots for the latest published reader once a
+  // publication completes: onReaderPublished prunes merged-away slots. Each
+  // slot is charged SLOT_METADATA_BYTES to metadataBytes; slotsCharge is the
+  // entry's share, changed under the mutex only while resident and released
+  // with metadataCharge when the entry leaves the map.
   struct FilterEntry {
     const FilterKeyScope scope;
     std::atomic<std::shared_ptr<const SlotVector>> slots;
@@ -531,6 +561,7 @@ private:
     std::mutex mutex;
     std::atomic<uint64_t> lastUsed{0};
     const size_t metadataCharge;
+    size_t slotsCharge = 0;
     bool resident = true;
     std::atomic<bool> readerValueEverPublished{false};
 
@@ -556,9 +587,39 @@ private:
     std::vector<SegmentIdentity> segments;
   };
 
+  // Exact counter bumped on every segment probe by every search thread.
+  // Each thread adds to its own cache-line stripe so hot hits do not
+  // serialize on one shared line; reads sum the stripes.
+  class StripedCounter {
+    static constexpr size_t STRIPES = 32;
+    struct alignas(64) Stripe {
+      std::atomic<uint64_t> value{0};
+    };
+    std::array<Stripe, STRIPES> stripes;
+
+    static size_t threadStripe();
+
+  public:
+    void add(uint64_t delta) {
+      stripes[threadStripe()].value.fetch_add(delta, std::memory_order_relaxed);
+    }
+    uint64_t load() const {
+      uint64_t total = 0;
+      for (const auto& stripe : stripes) {
+        total += stripe.value.load(std::memory_order_relaxed);
+      }
+      return total;
+    }
+    void reset() {
+      for (auto& stripe : stripes) {
+        stripe.value.store(0, std::memory_order_relaxed);
+      }
+    }
+  };
+
   struct AtomicCounters {
-    std::atomic<uint64_t> hits{0};
-    std::atomic<uint64_t> misses{0};
+    StripedCounter hits;
+    StripedCounter misses;
     std::atomic<uint64_t> admissions{0};
     std::atomic<uint64_t> buildAttempts{0};
     std::atomic<uint64_t> builds{0};
@@ -614,6 +675,10 @@ private:
   // Approximate value-object, shared_ptr control-block, and segment-slot share.
   // Metadata is added separately and amortized over resident values.
   static constexpr size_t VALUE_RESIDENCY_OVERHEAD_BYTES = 256;
+  // Approximate per-slot metadata: the slot with its make_shared control block
+  // plus the slot-vector element.
+  static constexpr size_t SLOT_METADATA_BYTES = sizeof(SegmentSlot)
+      + 2 * sizeof(std::shared_ptr<SegmentSlot>);
 
   uint64_t nextEpoch();
   size_t residentValueCount(const FilterEntry& entry) const;
@@ -641,7 +706,7 @@ private:
   void acceptSharedHit(
       Use& use, size_t segmentOrd,
       const std::shared_ptr<SegmentSlot>& slot,
-      const std::shared_ptr<const SegmentValue>& value);
+      std::shared_ptr<const SegmentValue> value);
   void acceptReaderSharedHit(
       Use& use, const std::shared_ptr<FilterEntry>& entry,
       const std::shared_ptr<const ReaderValue>& value);
@@ -709,6 +774,7 @@ public:
   const void* entryIdentityForTest(const FilterKey& key) {
     return findEntry(key).get();
   }
+  size_t slotCountForTest(const FilterKey& key);
   uint64_t readerPublicationsForTest() const {
     return readerPublications.load(std::memory_order_relaxed);
   }

@@ -12,6 +12,29 @@
 
 using namespace luxir;
 
+namespace {
+class ScratchResource : public std::pmr::memory_resource {
+public:
+  size_t live = 0;
+  int remaining = -1;
+
+private:
+  void* do_allocate(size_t bytes, size_t alignment) override {
+    if (remaining == 0) throw std::bad_alloc();
+    if (remaining > 0) --remaining;
+    auto* ptr = std::pmr::new_delete_resource()->allocate(bytes, alignment);
+    live += bytes;
+    return ptr;
+  }
+  void do_deallocate(void* ptr, size_t bytes, size_t alignment) override {
+    live -= bytes;
+    std::pmr::new_delete_resource()->deallocate(ptr, bytes, alignment);
+  }
+  bool do_is_equal(const memory_resource& other) const noexcept override { return this == &other; }
+
+};
+} // namespace
+
 class ScreamingTest : public luxir::LuxirTest {
 public:
 
@@ -306,6 +329,48 @@ public:
 
 
 };
+
+TEST_F(ScreamingTest, stringBuilderReclaimsUnflushedScratch) {
+  ScratchResource resource;
+  std::ostringstream out;
+  {
+    screaming::StringStreamBuilder builder(out, &resource);
+    // More descriptors than fit in the first scratch block.
+    for (int i = 0; i < 300; ++i) builder.add(i << 16);
+    EXPECT_GT(resource.live, 0u);
+  }
+  EXPECT_EQ(0u, resource.live);
+}
+
+TEST_F(ScreamingTest, stringBuilderReclaimsScratchAfterFailedFlush) {
+  ScratchResource resource;
+  std::ostringstream out;
+  {
+    screaming::StringStreamBuilder builder(out, &resource);
+    for (int i = 0; i < 300; ++i) builder.add(i << 16);
+    out.setstate(std::ios::badbit);
+    EXPECT_THROW(out.exceptions(std::ios::badbit), std::ios_base::failure);
+    EXPECT_THROW(builder.flush(), std::ios_base::failure);
+  }
+  EXPECT_EQ(0u, resource.live);
+}
+
+TEST_F(ScreamingTest, stringBuilderAllocationFailureUnwinds) {
+  bool succeeded = false;
+  for (int failAt = 0; failAt < 32 && !succeeded; ++failAt) {
+    ScratchResource resource;
+    resource.remaining = failAt;
+    std::ostringstream out;
+    try {
+      screaming::StringStreamBuilder builder(out, &resource);
+      for (int i = 0; i < 300; ++i) builder.add(i << 16);
+      builder.flush();
+      succeeded = true;
+    } catch (const std::bad_alloc&) {}
+    EXPECT_EQ(0u, resource.live) << "failure at allocation " << failAt;
+  }
+  EXPECT_TRUE(succeeded);
+}
 
 TEST_F(ScreamingTest, fixedRangeOr) {
   std::mt19937_64 random(0x5b83);

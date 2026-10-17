@@ -52,7 +52,7 @@ state, and commits are crash-safe on immutable segments.
 8. [Faceting](guide/faceting.md) - field, range, date, and query facets;
    nested facets, metrics, top documents per bucket, and multi-select.
 9. [Vector and hybrid search](guide/vector-search.md) - exact and approximate
-   kNN, filters inside the search, and reciprocal rank fusion.
+   kNN, filters inside the search, and rank or score fusion.
 10. [Geo search](guide/geo-search.md) - points, bounding boxes, distance
     queries, and the dateline.
 11. [Dates and time zones](guide/dates.md) - date values, date math, civil
