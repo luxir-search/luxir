@@ -1188,6 +1188,7 @@ Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolea
 | <a id="field-luxir.match.val"></a>[`val`](#field-luxir.match.val) | 2 | [`Val`](#message-luxir.val) | singular |  |
 | <a id="field-luxir.match.operator"></a>[`operator`](#field-luxir.match.operator) | 3 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How to combine the multiple terms an analyzed text field can produce. Unset = OR. |
 | <a id="field-luxir.match.min_match"></a>[`min_match`](#field-luxir.match.min_match) | 4 | `int32` | singular | Minimum number of the analyzed terms that must match (the OR..AND middle ground). When set it overrides \`operator\`; clamped to the term count. Mirrors BooleanQuery.min\_match. |
+| <a id="field-luxir.match.case_insensitive"></a>[`case_insensitive`](#field-luxir.match.case_insensitive) | 5 | `bool` | singular | Match STRING and ID values, and TEXT tokens the field's folding does not already make case-blind, regardless of simple Unicode case. Such terms compile to a case-alternating automaton and score constantly. Ignored on numeric and DATE fields. |
 
 <a id="message-luxir.memorystats"></a>
 
@@ -1399,6 +1400,7 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 |---|---|---|---|---|
 | <a id="field-luxir.regexquery.field"></a>[`field`](#field-luxir.regexquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.regexquery.pattern"></a>[`pattern`](#field-luxir.regexquery.pattern) | 2 | `string` | singular |  |
+| <a id="field-luxir.regexquery.case_insensitive"></a>[`case_insensitive`](#field-luxir.regexquery.case_insensitive) | 3 | `bool` | singular | Literal characters, after field folding, and every member of character classes and ranges also match their simple Unicode case alternates. Negated classes exclude all case forms of their members. |
 
 <a id="message-luxir.replicarequirement"></a>
 
@@ -1909,6 +1911,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 |---|---|---|---|---|
 | <a id="field-luxir.wildcardquery.field"></a>[`field`](#field-luxir.wildcardquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.wildcardquery.pattern"></a>[`pattern`](#field-luxir.wildcardquery.pattern) | 2 | `string` | singular |  |
+| <a id="field-luxir.wildcardquery.case_insensitive"></a>[`case_insensitive`](#field-luxir.wildcardquery.case_insensitive) | 3 | `bool` | singular | Literal characters, after field folding, also match their simple Unicode case alternates (lower, upper and title forms). |
 
 ## Enums
 

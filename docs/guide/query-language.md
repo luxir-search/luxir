@@ -330,8 +330,11 @@ anchored, so `regex(mess, ...)` does not match `messiah` but `regex(mess.*,
 ...)` does. On TEXT fields, literal characters fold the way the field folds
 text while the pattern syntax, escapes, character classes, and ranges are
 codepoint-exact and never fold; STRING fields normalize literal characters
-through their normalizer; ID fields use literals verbatim. Both queries are
-constant-scoring. Quote the pattern when it contains characters the argument
+through their normalizer; ID fields use literals verbatim. Add
+`case_insensitive=true` to also match other simple Unicode case forms of
+literals (and, for regex, of character-class members), as in
+`wildcard(err*, field=message_s, case_insensitive=true)`; `match(...)` accepts
+the same argument. Both queries are constant-scoring. Quote the pattern when it contains characters the argument
 grammar would otherwise see, such as a comma or a parenthesis. See the
 [structured reference](query-reference.md#wildcard) for the JSON arms.
 
