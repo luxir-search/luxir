@@ -191,11 +191,9 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
   for (const auto& seg : segments) {
     auto& pr = *seg.postingsReader;
     MemPool pool;
-    FieldReader fr(pr);
-    if (!fr.seek(fieldName)) continue;
-
-    SegFieldInfo fi;
-    fr.readFieldInfo(fi);
+    auto* info = pr.fieldInfo(fieldName);
+    if (!info) continue;
+    const auto& fi = *info;
     if (fi.type != FieldType::VECTOR) continue;
 
     VectorReader vr(pr, fi);

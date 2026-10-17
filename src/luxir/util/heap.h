@@ -8,6 +8,7 @@
 #include <numeric>
 #include <algorithm>
 #include <vector>
+#include <type_traits>
 
 namespace luxir {
 
@@ -265,6 +266,7 @@ public:
 
   /// If capacity has been reached, the largest element is removed (i.e. heap keeps smallest)
   /// If this is a min-heap (common in luxir), then we are keeping everything larger than the offered value.
+  /// Indexed replacements must reuse the evicted entry's stable slot.
   /// @returns true if the new element caused the previous top() to be ejected.
   bool insertWithOverflow(const T& elem) {
     if (heapSize < heap.size()) {
@@ -287,6 +289,9 @@ public:
 
 
 
+struct NoHeapPositions {};
+struct HeapPositions { std::vector<size_t> values; };
+
 /// A DirectPQ variant that owns its storage: the heap is backed by a std::vector that
 /// grows on demand (construction makes at most one small bounded reservation), so a
 /// large capacity bound (e.g. a deep or unbounded top-k) does not allocate or zero its
@@ -294,11 +299,33 @@ public:
 /// of growing, so the steady-state hot path never touches the vector's capacity logic.
 /// \tparam T
 /// \tparam Comp
-template <class T, class Comp>
+// Indexed heaps use stable payload slots. The default retains std's heap
+// operations and has no position storage or movement callbacks.
+template <class T, class Comp, bool Indexed = false>
 class ExpandingPQ {
   std::vector<T> heap;  // heap.size() is the current heap size; grows up to maxSize
   size_t maxSize;
   [[no_unique_address]] Comp comp{};  // Use [[no_unique_address]] to optimize away storage for empty comparators
+
+  [[no_unique_address]] std::conditional_t<Indexed, HeapPositions, NoHeapPositions> positions;
+
+  void place(size_t index, T value) requires Indexed {
+    heap[index] = std::move(value);
+    positions.values[(size_t)heap[index].slot] = index;
+  }
+
+  void siftDown(size_t index) requires Indexed {
+    T value = std::move(heap[index]);
+    for (;;) {
+      size_t child = 2 * index + 1;
+      if (child >= heap.size()) break;
+      if (child + 1 < heap.size() && comp(heap[child], heap[child + 1])) child++;
+      if (!comp(value, heap[child])) break;
+      place(index, std::move(heap[child]));
+      index = child;
+    }
+    place(index, std::move(value));
+  }
 
   // One allocation covers typical small top-k requests; deeper heaps double from here.
   static constexpr size_t initialReserve = 64;
@@ -351,9 +378,21 @@ public:
     return out;
   }
 
+  bool precedes(const T& a, const T& b) const { return comp(a, b); }
+
   /// Call this to re-heapify after top() was modified
   void updateTop() {
-    update_heap_top(heap.begin(), heap.end(), comp);
+    if constexpr (Indexed) siftDown(0);
+    else update_heap_top(heap.begin(), heap.end(), comp);
+  }
+
+  T& atSlot(size_t slot) requires Indexed {
+    return heap[positions.values[slot]];
+  }
+
+  // Re-establish the heap after a retained entry's rank improves.
+  void updateSlot(size_t slot) requires Indexed {
+    siftDown(positions.values[slot]);
   }
 
   /// Insert only if max size has not been reached.  Use insertWithOverflow otherwise.
@@ -366,7 +405,19 @@ public:
                             std::max(heap.capacity() * 2, initialReserve)));
     }
     heap.push_back(elem);
-    if (heap.size() > 1) {
+    if constexpr (Indexed) {
+      size_t slot = (size_t)elem.slot;
+      if (positions.values.size() <= slot) positions.values.resize(slot + 1);
+      size_t index = heap.size() - 1;
+      T value = heap[index];
+      while (index > 0) {
+        size_t parent = (index - 1) / 2;
+        if (!comp(heap[parent], value)) break;
+        place(index, std::move(heap[parent]));
+        index = parent;
+      }
+      place(index, std::move(value));
+    } else if (heap.size() > 1) {
       std::push_heap(heap.begin(), heap.end(), comp);
     }
   }

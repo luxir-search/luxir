@@ -352,8 +352,8 @@ The relevant server controls are:
 - `--indexing.stream-batch-size` and `--indexing.stream-batch-docs` for
   internal non-atomic handoff granularity.
 - `--indexing.max-inflight-batches` for the number of internal batches a
-  connection can submit concurrently (`0` selects an automatic limit based
-  on task-arena concurrency; `1` makes batch submission serial).
+  connection can submit concurrently (`0` selects the worker count plus two;
+  `1` makes batch submission serial).
 
 ## Limits
 

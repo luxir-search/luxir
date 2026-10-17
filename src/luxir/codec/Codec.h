@@ -8,7 +8,11 @@
 #include <cassert>
 #include <stdexcept>
 #include <bit>
+#if defined(__aarch64__)
+#include "FastPFOR/headers/fastpfor_neon.h"
+#else
 #include <emmintrin.h>  // __m128i, for the inline numeric decode loop
+#endif
 #include "luxir/util/luxir_util.h"
 
 // Integer codecs, backed by FastPFOR's SIMD bit-packing kernels (which have

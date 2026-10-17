@@ -266,7 +266,7 @@ publication advances the schema generation.
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | multi-valued |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
-| `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_` |
+| `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_`; see [Stored resources](#stored-resources) |
 | `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
@@ -290,6 +290,42 @@ compressed chunks. Analyzed text has postings and stored retrieval but no
 per-document value column; use a `string` variant when the same source value
 must also sort or facet. Scalar types return their values from columns without
 a second stored copy.
+
+### Stored resources
+
+Stored values are grouped by `stored_resource`, and each group is compressed
+in chunks of whole documents. The top-level `stored_resources` map declares
+the groups; the default `_stored_` always exists, and without an entry it uses
+LZ4 with 16KB chunks of at most 128 documents. A field may name only `_stored_`
+or a declared group, and a group name starts and ends with `_` (for example
+`_stored_logs_`), so it never collides with a field or template name.
+
+```http
+POST /collections/logs/_schema
+
+{
+  "fields": {"message": {"type": "text", "stored_resource": "_stored_logs_"}},
+  "stored_resources": {
+    "_stored_logs_": {"codec": "zstd"}
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `codec` | `lz4` (default): fast to write and read. `zstd`: much smaller for repetitive text such as logs, at more CPU per chunk |
+| `zstd_level` | `zstd` only: 1 (fastest) to 22 (smallest); default 3 |
+| `chunk_size_bytes` | target uncompressed bytes per chunk, 1024 to 4194304; default 16384, or 65536 with `zstd` |
+| `max_docs_per_chunk` | most documents per chunk, 1 to 65536; default 128, or 1024 with `zstd` |
+
+Larger chunks compress better, but returning one stored document decompresses
+its whole chunk. Chunks are compressed as documents are indexed, so the codec
+and level also set indexing cost; levels above the default compress much more
+slowly for little further gain. Each segment records its codec and chunk
+limits, so a change applies to segments written afterwards. A merge copies
+compressed chunks from inputs that already match its output codec and chunk
+limits and recompresses the others; the level alone does not trigger
+recompression. `mode=set` replaces the named entries and keeps the others.
 
 ## Text analysis
 
@@ -577,8 +613,11 @@ What the policy means at query time:
 - A prefix query longer than the kept prefix falls back to that prefix and
   returns a superset. Wildcard and regex queries do the same when their common
   leading literal prefix exceeds the limit; other patterns operate on the
-  stored term bytes, hash suffix included. Fuzzy distance also compares
-  transformed bytes, so similarity between discarded tails is not measured.
+  stored term bytes, hash suffix included, so they can miss a long value or
+  match its hash characters. Fuzzy distance also compares transformed bytes,
+  so similarity between discarded tails is not measured. When a wildcard,
+  regex, or fuzzy query can reach a term of 252 bytes or more and a segment
+  holds one for that field, the response carries a `fitted_terms` warning.
 - The stored source, when enabled, keeps the full bytes before normalization
   or hashing and is used to return the exact value if its column representation
   was truncated.

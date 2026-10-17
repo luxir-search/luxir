@@ -49,12 +49,12 @@ TEST_F(FieldVariantsIngestTest, authorFanoutAndOneStoredSource) {
 
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
-  FieldReader fields(reader->segments()[0].postingsReader());
-  ASSERT_TRUE(fields.seek("author__s"));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = reader->segments()[0].postingsReader().fieldInfo("author__s");
+  ASSERT_NE(nullptr, fields);
+  const auto& info = *fields;
   EXPECT_EQ(0, info.flags & (FieldType::ABSTRACT | FieldType::DERIVED));
-  auto stored = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  auto* storedField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto stored = storedField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *storedField) : nullptr;
   ASSERT_NE(nullptr, stored);
   int copies = 0;
   stored->readDoc(0, [&](std::string_view name, std::span<const std::string_view> values) {
@@ -89,7 +89,8 @@ TEST_F(FieldVariantsIngestTest, onlyStoredPrimariesWriteSourceValues) {
 
     auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     ASSERT_EQ(1u, reader->segments().size());
-    auto stored = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+    auto* storedField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+    auto stored = storedField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *storedField) : nullptr;
     if (!keepSource) {
       EXPECT_EQ(nullptr, stored);
       continue;
@@ -137,10 +138,9 @@ TEST_F(FieldVariantsIngestTest, dynamicTemplateUsesVariantPrototype) {
   EXPECT_TRUE(containsDoc(docs, flatdoc("book_t", "0042", "book_t__s", 42)));
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
-  FieldReader fields(reader->segments()[0].postingsReader());
-  ASSERT_TRUE(fields.seek("book_t__s"));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = reader->segments()[0].postingsReader().fieldInfo("book_t__s");
+  ASSERT_NE(nullptr, fields);
+  const auto& info = *fields;
   EXPECT_EQ(0, info.flags & (FieldType::ABSTRACT | FieldType::DERIVED));
 }
 

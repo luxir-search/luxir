@@ -66,6 +66,11 @@ void forEachPostingInDomain(DocsOnlyEnum& postings, int32_t docFreq,
   }
 }
 
+// Structural identity route: a sparse BITSET prefix can drive term seeks,
+// while ordinary facet production retains its existing representation choice.
+std::unique_ptr<DocSet> materializeIdentityPostingsIntersection(
+    DocsOnlyEnum& postings, int32_t docFreq, DocSet* domain, int32_t maxDoc);
+
 // Materialize the intersection of one term's postings and a segment domain.
 // The postings cursor is consumed. A null domain means all segment docs.
 //

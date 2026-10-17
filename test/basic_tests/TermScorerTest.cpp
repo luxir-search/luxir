@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/FieldReader.h"
 #include <luxir/query/AllQuery.h>
 #include <algorithm>
 #include <array>
@@ -4438,7 +4439,7 @@ TEST_F(TermScorerTest, mandOptBulkPreparedSourcesCanRouteToBulk) {
   BooleanQuery query(mandatory, optional, empty, empty);
   auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
   ASSERT_TRUE(weight->needsPrepare());
-  Query::Weight::PrepareContext pctx{*reader, std::span<DocSet* const>{}, false};
+  Query::Weight::PrepareContext pctx{*reader, std::span<DocSet* const>{}, false, nullptr};
   auto prepared = weight->prepare(pctx);
   auto& segment = qContext.topReader.segments()[0];
   auto* supplier = prepared->scorerSupplier(pool, segment);
@@ -5903,10 +5904,9 @@ TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
   auto poolFree = testIndex.pool.rewindScopeGuard();
   auto& segment = testIndex.reader->segments()[0];
   PostingsReader& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(postingsReader);
-  ASSERT_TRUE(fieldReader.seek("body_w"));
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  auto* fieldReader = postingsReader.fieldInfo("body_w");
+  ASSERT_TRUE((fieldReader != nullptr));
+  const auto& fieldInfo = *fieldReader;
   TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
   ASSERT_TRUE(tenum.seek("wordy"));
 
@@ -5987,10 +5987,9 @@ TEST_F(TermScorerTest, docsTierAdvanceCoversBlockEncodingsAndSkips) {
   auto poolFree = testIndex.pool.rewindScopeGuard();
   auto& segment = testIndex.reader->segments()[0];
   PostingsReader& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(postingsReader);
-  ASSERT_TRUE(fieldReader.seek("body_w"));
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  auto* fieldReader = postingsReader.fieldInfo("body_w");
+  ASSERT_TRUE((fieldReader != nullptr));
+  const auto& fieldInfo = *fieldReader;
 
   auto checkAdvance = [&](std::string_view term, const std::vector<int32_t>& expected,
                           std::initializer_list<int32_t> targets) {
@@ -7152,7 +7151,7 @@ TEST_F(TermScorerTest, queryPrepDomainDrivenBitsetReachesSegmentEnd) {
 
 // "+a b" without scores: the optional clause is a pure score add under a
 // mandatory clause, so a non-scoring weight drops it - membership is
-// unchanged and the single-clause count() shortcut engages (Lucene's
+// unchanged and the single-clause count shortcut engages (Lucene's
 // BooleanWeight simplification).
 TEST_F(TermScorerTest, nonScoringBooleanDropsOptionalUnderMandatory) {
   const int32_t N = 1500;
@@ -7182,7 +7181,7 @@ TEST_F(TermScorerTest, nonScoringBooleanDropsOptionalUnderMandatory) {
 
   // Non-scoring: optional dropped -> O(1) exact count, and iteration = df(a).
   auto* countWeight = q.createWeight(qContext, 0);
-  EXPECT_EQ(countWeight->count(segment), dfA);
+  EXPECT_EQ(countForTests(countWeight, segment), dfA);
   auto* countScorer = countWeight->createScorer(testIndex.pool, segment);
   ASSERT_NE(countScorer, nullptr);
   int32_t iterated = 0;
@@ -7196,7 +7195,7 @@ TEST_F(TermScorerTest, nonScoringBooleanDropsOptionalUnderMandatory) {
   Query::Context qContext2(testIndex.pool, *testIndex.reader);
   BooleanQuery q2(mand, opt, {}, {});
   auto* scoredWeight = q2.createWeight(qContext2, Query::NEED_SCORES);
-  EXPECT_EQ(scoredWeight->count(segment), -1);
+  EXPECT_EQ(countForTests(scoredWeight, segment), -1);
   auto* scoredScorer = scoredWeight->createScorer(testIndex.pool, segment);
   ASSERT_NE(scoredScorer, nullptr);
   int32_t scoredCount = 0;

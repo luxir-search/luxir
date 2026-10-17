@@ -51,6 +51,8 @@ struct ValueNode {
   double doubleValue = 0.0;
 };
 
+using ValueFieldInfos = std::span<const IndexReader::FieldSegments>;
+
 class BoundValueProgram;
 
 // Immutable after parsing. The object and all owned containers live on the
@@ -80,8 +82,22 @@ public:
     return {dest, text.size()};
   }
 
+  ValueFieldInfos resolveFields(MemPool& pool, IndexReader& reader) const {
+    auto fields = pool.make_span<IndexReader::FieldSegments>(nodes.size());
+    resolveFields(reader, fields);
+    return fields;
+  }
+
+  void resolveFields(IndexReader& reader, std::span<IndexReader::FieldSegments> fields) const {
+    for (size_t i = 0; i < nodes.size(); i++) {
+      fields[i] = nodes[i].kind == ValueNodeKind::COLUMN
+          ? reader.field(nodes[i].text) : IndexReader::FieldSegments{};
+    }
+  }
+
   const ValueNode& root() const { return nodes[rootNode]; }
-  BoundValueProgram* bind(MemPool& pool, IndexReader::Segment& segment) const;
+  BoundValueProgram* bind(MemPool& pool, IndexReader::Segment& segment,
+                          ValueFieldInfos fields) const;
 };
 
 struct BoundValueNode {
@@ -107,7 +123,7 @@ public:
   std::span<BoundValueNode> nodes;
 
   BoundValueProgram(MemPool& pool, const ValueProgram& program,
-                    IndexReader::Segment& segment);
+                    IndexReader::Segment& segment, ValueFieldInfos fields);
 
   ValueResult evalPoint(int32_t docid, float score);
   // Aggregate/facet scans call this with monotonically increasing document
@@ -136,27 +152,6 @@ private:
   void evalColumnBatch(uint32_t node, std::span<const int32_t> docids,
                        std::span<ValueResult> results);
   void propagateBounds(const ValueBounds& scoreBounds);
-};
-
-// A binding owns only segment-MemPool state. It also clears the caller's
-// runtime pointer before destructing/rewinding, including exceptional unwind.
-class BoundValueGuard {
-public:
-  MemPool::ScopeGuard scope;
-  BoundValueProgram*& runtime;
-
-  BoundValueGuard(MemPool& pool, const ValueProgram& program,
-                  IndexReader::Segment& segment, BoundValueProgram*& runtime)
-      : scope(pool), runtime(runtime) {
-    runtime = program.bind(pool, segment);
-  }
-
-  ~BoundValueGuard() {
-    runtime = nullptr;
-  }
-
-  BoundValueGuard(const BoundValueGuard&) = delete;
-  BoundValueGuard& operator=(const BoundValueGuard&) = delete;
 };
 
 } // namespace luxir

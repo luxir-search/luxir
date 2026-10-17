@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/FieldReader.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -431,12 +432,11 @@ uint64_t addStatsFingerprint(uint64_t fp, const Similarity::TermStats& stats) {
   return fp;
 }
 
-bool lookupTermStatsPostings(MemPool& pool, IndexReader& reader, CachedFieldInfo& cachedFieldInfo,
+bool lookupTermStatsPostings(std::span<TermsEnum*> terms,
                              std::string_view term, Similarity::TermStats& result) {
   result = {};
   bool found = false;
-  for (int i = 0; i < (int)reader.segments().size(); ++i) {
-    TermsEnum* termsEnum = cachedFieldInfo.termsEnums[i];
+  for (TermsEnum* termsEnum : terms) {
     if (termsEnum == nullptr || !termsEnum->seek(term)) {
       continue;
     }
@@ -578,6 +578,11 @@ static void BM_TermStats_postings(benchmark::State& state, TermSource source) {
   Query::Context context(pool, reader);
   CachedFieldInfo* cachedFieldInfo = context.getCachedFieldInfo(kStatsFieldName);
   ASSERT_NE(cachedFieldInfo, nullptr);
+  std::vector<TermsEnum*> terms;
+  for (auto& segment : reader.segments()) {
+    auto* field = cachedFieldInfo->segInfos.at(segment);
+    terms.push_back(field ? pool.make<TermsEnum>(pool, segment.postingsReader(), *field) : nullptr);
+  }
 
   uint64_t fingerprint = 0;
   for (auto _ : state) {
@@ -585,7 +590,7 @@ static void BM_TermStats_postings(benchmark::State& state, TermSource source) {
     for (int32_t ord : corpus->hitOrds) {
       std::string_view term = corpus->terms[(size_t)ord];
       Similarity::TermStats stats;
-      bool found = lookupTermStatsPostings(pool, reader, *cachedFieldInfo, term, stats);
+      bool found = lookupTermStatsPostings(terms, term, stats);
       assert(found);
       if (luxir::unit_tests) {
         Similarity::TermStats dictStats;

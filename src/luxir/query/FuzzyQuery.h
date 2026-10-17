@@ -6,12 +6,14 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
+#include "FittedTerms.h"
 #include "MatchNoDocsQuery.h"
 #include "Query.h"
 #include "TermQuery.h"
@@ -33,6 +35,10 @@ class FuzzyQuery final : public Query {
   int maxEdits;
   int prefixLength;   // clamped to <= term length
   int maxExpansions;  // 0/unset means DEFAULT_MAX_EXPANSIONS; also clause-budget capped
+  // The field's long-term policy when edits can reach a fitted (hashed or
+  // truncated) long value, whose discarded bytes distance cannot see;
+  // nullopt means no warning applies.
+  std::optional<TermPolicy> fittedPolicy;
 
   struct ExpansionCandidate {
     std::string_view term;
@@ -70,6 +76,8 @@ class FuzzyQuery final : public Query {
   }
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   // Default expansion cap when max_expansions is unset (Lucene parity).
   static constexpr int DEFAULT_MAX_EXPANSIONS = 50;
 
@@ -79,10 +87,12 @@ public:
   static constexpr int FUZZY_CLAUSE_BUDGET = 64;
 
   FuzzyQuery(std::string_view field, std::string_view term, int maxEdits,
-             int prefixLength = 0, int maxExpansions = 0, float boost = 1.0f)
+             int prefixLength = 0, int maxExpansions = 0, float boost = 1.0f,
+             std::optional<TermPolicy> fittedPolicy = std::nullopt)
     : Query(QueryKind::FUZZY), field(field), boost(boost), term(term),
       maxEdits(maxEdits),
-      prefixLength(std::min(prefixLength, (int)term.size())), maxExpansions(maxExpansions) {}
+      prefixLength(std::min(prefixLength, (int)term.size())), maxExpansions(maxExpansions),
+      fittedPolicy(fittedPolicy) {}
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const FuzzyQuery&>(other);
@@ -111,8 +121,9 @@ public:
 
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
-    unused(context);
     checkedBoostProduct(multiplier, boost);
+    if (!fittedPolicy) return;
+    warnIfFittedTermsReachable(context, field, *fittedPolicy, [] { return true; });
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
@@ -142,7 +153,7 @@ private:
 
     size_t nSegs = context.numSegments();
     for (size_t s = 0; s < nSegs; s++) {
-      auto* segFieldInfo = fieldInfo.segInfos[s];
+      auto* segFieldInfo = fieldInfo.segInfos.at(s);
       if (segFieldInfo == nullptr) continue;
       auto& postingsReader = context.topReader.segments()[s].postingsReader();
       TermsEnum te(scratch, postingsReader, *segFieldInfo);

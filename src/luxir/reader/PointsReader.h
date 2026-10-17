@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "FieldReader.h"
+#include "PostingsReader.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/index/PointsWriter.h"
 #include "luxir/util/screaming.h"
@@ -183,6 +183,19 @@ public:
     range.endOrdinal = leafOrdinalEnd(range.lastLeaf);
     range.empty = false;
     return range;
+  }
+
+  // Unordered document occurrences in an inclusive value range. Shared by
+  // key enumeration and bucket predicates; multi-valued callers deduplicate.
+  template <typename Visit>
+  void forEachRangeDoc(int64_t lo, int64_t hi, Visit&& visit) {
+    auto fence = fenceRange(lo, hi);
+    if (fence.empty) return;
+    for (uint32_t leaf = fence.firstLeaf; leaf <= fence.lastLeaf; leaf++) {
+      for (const auto& point : decodeLeaf(leaf)) {
+        if (point.value >= lo && point.value <= hi) visit(point.docid);
+      }
+    }
   }
 
   // Benchmark-only min-directory arm. It may include one extra left leaf.

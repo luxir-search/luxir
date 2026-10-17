@@ -18,6 +18,13 @@
 # common code in the library".
 
 set(need_target 0)
+# ARM cross builds use an explicit baseline and cannot use x86 host getarch.
+# Enable supported NEON/SVE kernels. OpenBLAS 0.3.33's ARMV9SME target references
+# an absent sgemm_kernel_sve_v2x4.S; none of these supported kernels require it.
+if(VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64" AND DYNAMIC_ARCH)
+    set(DYNAMIC_LIST "NEOVERSEN1;NEOVERSEV1;NEOVERSEN2;ARMV8SVE" CACHE STRING "ARM runtime kernels")
+endif()
+
 if(NOT "${TARGET}" STREQUAL "")
     message(STATUS "TARGET: ${TARGET} (user-defined)")
 elseif(DYNAMIC_ARCH)

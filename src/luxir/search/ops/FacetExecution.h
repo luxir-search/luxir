@@ -60,7 +60,7 @@ struct SelectedFacetBucket {
 // ids are global ordinals for this OrdMap epoch; domains are the parent's
 // incoming domains and remain pinned for synchronous binding execution.
 struct StringFacetColumnSource {
-  std::string_view field;
+  IndexReader::FieldSegments segInfos;
   const OrdMap& ordMap;
   std::span<const DomainHandle> domains;
   std::span<const SelectedFacetBucket<std::string_view>> buckets;
@@ -118,12 +118,65 @@ public:
   // and the child's column and ord-map decoding.
   static constexpr size_t CACHE_BYTES = 256 * 1024;
 
-  template <typename Key, typename DomainSource>
+  struct StructuralRoute {
+    bool scopeNeeded = false;
+    bool overrides = false;
+    bool selectionPath = false;
+    bool wholeReaderPrefixes = false;
+    bool complete = false;
+    bool needInherited = false;
+    size_t retainedBytesPerBucket = 0;
+    const StructuralConstraint* ancestor = nullptr;
+    std::vector<BucketDomainPlan*> plans;
+
+    StructuralRoute(SearchOp::Calculator& parent, std::span<SearchOp* const> children,
+                    IndexReader& reader, bool hasSelection);
+  };
+
+  using Bindings = std::span<std::unique_ptr<SearchOp::Calculator>>;
+  using SegmentSources = std::vector<std::pair<BucketDomainPlan*,
+      std::unique_ptr<DomainVariantPlan::SegmentSources>>>;
+  using Feed = std::function_ref<void(size_t, DomainHandle)>;
+  using BucketSource = std::function_ref<void(size_t, Feed)>;
+  using BucketAction = std::function_ref<void(size_t)>;
+
+  static void executeComplete(SearchOp::Calculator& parent,
+      std::span<SearchOp* const> children, IndexReader& reader, size_t blockSize,
+      std::span<BucketDomainPlan* const> plans, Bindings bindings, bool needInherited,
+      BucketAction open, BucketAction close, BucketSource bucketDomains);
+  static void deliverStructural(SearchOp::Calculator& parent,
+      std::span<SearchOp* const> children, IndexReader& reader, int32_t segnum,
+      Bindings bindings, const DomainHandle& domain, SegmentSources& sources);
+
+  template <typename Key, typename DomainSource, typename IdentitySource = std::nullptr_t,
+            typename SelectionSource = std::nullptr_t>
   static void execute(
       SearchOp::Calculator& parent, std::span<SearchOp* const> children,
       std::span<const SelectedFacetBucket<Key>> buckets,
       IndexReader& reader, FacetBucketProducer producer,
-      DomainSource&& bucketDomains, size_t bindingStateBytes) {
+      DomainSource&& bucketDomains, size_t bindingStateBytes,
+      std::span<const DomainHandle> input = {}, IdentitySource&& identityDomains = nullptr,
+      SelectionSource&& selection = nullptr) {
+    if (children.empty() || buckets.empty()) return;
+    bool structural = parent.structuralConstraint() != nullptr
+        || std::ranges::any_of(children, [](auto* child) {
+          return child->bucketDomain != nullptr || child->needsStructuralScope;
+        });
+    if (structural) executeRoute<true>(parent, children, buckets, reader, producer,
+        bucketDomains, bindingStateBytes, input, identityDomains, selection);
+    else executeRoute<false>(parent, children, buckets, reader, producer,
+        bucketDomains, bindingStateBytes, input, identityDomains, selection);
+  }
+
+  template <bool Structural, typename Key, typename DomainSource, typename IdentitySource,
+            typename SelectionSource>
+  static void executeRoute(
+      SearchOp::Calculator& parent, std::span<SearchOp* const> children,
+      std::span<const SelectedFacetBucket<Key>> buckets,
+      IndexReader& reader, FacetBucketProducer producer,
+      DomainSource&& bucketDomains, size_t bindingStateBytes,
+      std::span<const DomainHandle> input, IdentitySource&& identityDomains,
+      SelectionSource&& selection) {
     if (children.empty() || buckets.empty()) return;
     size_t residentBytesPerBucket = 0;
     bool sharedSegmentWork = producer == FacetBucketProducer::JOINT;
@@ -133,6 +186,32 @@ public:
       sharedSegmentWork = sharedSegmentWork
           || child->facetBucketSharesSegmentState();
     }
+    auto segments = reader.segments();
+    bool scopeNeeded = false, overrides = false;
+    bool wholeReaderPrefixes = false, complete = false, needInherited = false;
+    const StructuralConstraint* ancestor = nullptr;
+    auto selectionAt = [&](const auto& bucket) -> Query::Weight* {
+      if constexpr (std::is_same_v<std::remove_reference_t<SelectionSource>, std::nullptr_t>) return nullptr;
+      else return selection(bucket);
+    };
+    auto routing = [&] {
+      if constexpr (Structural) {
+        bool hasSelection = (parent.structuralConstraint() && parent.structuralConstraint()->hasSelection())
+            || std::ranges::any_of(buckets, [&](const auto& bucket) {
+              return selectionAt(bucket) != nullptr;
+            });
+        return StructuralRoute(parent, children, reader, hasSelection);
+      } else return nullptr;
+    }();
+    if constexpr (Structural) {
+      scopeNeeded = routing.scopeNeeded;
+      overrides = routing.overrides;
+      wholeReaderPrefixes = routing.wholeReaderPrefixes;
+      complete = routing.complete;
+      needInherited = routing.needInherited;
+      ancestor = routing.ancestor;
+      residentBytesPerBucket = saturatingAdd(residentBytesPerBucket, routing.retainedBytesPerBucket);
+    }
     size_t blockBytes = sharedSegmentWork ? bindingStateBytes
         : std::min(bindingStateBytes, forcedFacetBucketCacheBytes != 0
               ? forcedFacetBucketCacheBytes : CACHE_BYTES);
@@ -141,8 +220,7 @@ public:
     if (forcedFacetBucketBlockBuckets != 0) {
       bindingBlockSize = forcedFacetBucketBlockBuckets;
     }
-    auto segments = reader.segments();
-
+    auto& tracker = parent.getOp().req.memoryTracker;
     for (size_t blockBegin = 0; blockBegin < buckets.size();
          blockBegin += bindingBlockSize) {
       if (facetBucketBlockCounter != nullptr) (*facetBucketBlockCounter)++;
@@ -150,17 +228,60 @@ public:
           bindingBlockSize, buckets.size() - blockBegin);
       auto block = std::span<const SelectedFacetBucket<Key>>(buckets)
                        .subspan(blockBegin, blockSize);
+      // Recoverable identities have their own predicate producer. MEMBERS
+      // scheduling and cost rules remain independent of live-doc identity work.
+      using Block = decltype(block);
+      struct PrefixProducer final : StructuralConstraint::Producer {
+        std::remove_reference_t<IdentitySource> source;
+        RequestMemResource resource;
+        std::pmr::vector<SelectedFacetBucket<Key>> selected;
 
-      std::vector<std::unique_ptr<SearchOp::Calculator>> bindings(
-          blockSize * children.size());
+        PrefixProducer(std::remove_reference_t<IdentitySource>& source, Block block,
+                       SearchOp::Calculator& parent, size_t)
+            : StructuralConstraint::Producer(parent.getOp().req,
+                  parent.structuralConstraint(), block.size()), source(source),
+              resource(parent.getOp().req.memoryTracker, "bucket keys", "domain variants"),
+              selected(block.begin(), block.end(), &resource) {}
+
+        void produce(size_t segment, size_t begin, size_t count,
+                     DomainHandle base, Feed feed) override {
+          if constexpr (std::is_same_v<std::remove_reference_t<IdentitySource>, std::nullptr_t>) {
+            throw std::logic_error("bucket identity source is required for a reset");
+          } else {
+            // execute and every child feed are synchronous (tg == nullptr).
+            // The closure's borrowed column maps and group page outlive this call.
+            source(segment, Block(selected).subspan(begin, count), std::move(base), feed);
+          }
+        }
+      };
+      auto prefixes = [&] {
+        if constexpr (Structural) return std::unique_ptr<PrefixProducer>{};
+        else return nullptr;
+      }();
+      auto paths = [&] {
+        if constexpr (Structural) return std::vector<std::optional<StructuralConstraint>>(blockSize);
+        else return nullptr;
+      }();
+      if constexpr (Structural) if (scopeNeeded) {
+        // Own the closure and bucket span. Borrowed key payloads still follow
+        // the executor's synchronous result-stage lifetime.
+        prefixes = std::make_unique<PrefixProducer>(identityDomains, block, parent, segments.size());
+      }
+      std::vector<std::unique_ptr<SearchOp::Calculator>> bindings(blockSize * children.size());
       auto open = [&](size_t bucket) {
         assert(block[bucket].output.value >= 0);
         assert(block[bucket].output.value < (int32_t)buckets.size());
+        const StructuralConstraint* path = nullptr;
+        if constexpr (Structural) if (scopeNeeded) {
+          paths[bucket].emplace(StructuralConstraint{
+              ancestor, prefixes.get(), bucket, selectionAt(block[bucket])});
+          path = &*paths[bucket];
+        }
         for (size_t child = 0; child < children.size(); child++) {
           auto& binding = bindings[bucket * children.size() + child];
           assert(binding == nullptr);
-          binding.reset(children[child]->createCalculator(
-              &parent, block[bucket].output.value, (int64_t)buckets.size()));
+          binding.reset(children[child]->createCalculator(&parent,
+              block[bucket].output.value, (int64_t)buckets.size(), path));
         }
       };
       auto close = [&](size_t bucket) {
@@ -168,17 +289,39 @@ public:
           bindings[bucket * children.size() + child].reset();
         }
       };
-
       if (segments.empty()) {
         std::span<const DomainHandle> noDomains;
         for (size_t bucket = 0; bucket < blockSize; bucket++) {
           open(bucket);
           for (size_t child = 0; child < children.size(); child++) {
-            bindings[bucket * children.size() + child]
-                ->calcAll(nullptr, noDomains);
+            bindings[bucket * children.size() + child]->calcAll(nullptr, noDomains);
           }
           close(bucket);
         }
+        continue;
+      }
+      if constexpr (Structural) if (complete) {
+        auto ordinary = [&](size_t segnum, auto&& deliver, bool retained = false) {
+          [[maybe_unused]] size_t fed = 0;
+          auto feed = [&](size_t bucket, DomainHandle domain) {
+            assert(bucket == fed++);
+            assert(bucket < blockSize);
+            assert(domain.isDeliverable());
+            assert(input.empty() || !input[segnum].get() || domain.get());
+            if (retained && domain.ownsStorage()
+                && (input.empty() || domain.get() != input[segnum].get())) {
+              domain = DomainVariantPlan::account(std::move(domain), tracker, "retained bucket inputs");
+            }
+            deliver(bucket, std::move(domain));
+          };
+          bucketDomains(segnum, block, FacetBucketFeed(feed));
+          assert(fed == blockSize);
+        };
+
+        executeComplete(parent, children, reader, blockSize, routing.plans, bindings,
+            needInherited, open, close, [&](size_t segment, FacetBucketFeed feed) {
+              ordinary(segment, feed, needInherited);
+            });
         continue;
       }
 
@@ -195,21 +338,53 @@ public:
             }
           }
         });
+        auto sources = [&] {
+          if constexpr (Structural) return SegmentSources{};
+          else return nullptr;
+        }();
+        if constexpr (Structural) if (overrides) sources.reserve(children.size());
+        [[maybe_unused]] auto releasePlans = [&] {
+          if constexpr (Structural) {
+            return scope_guard([&]() noexcept {
+              // Release after this block's last bucket in the segment.
+              // Rebuilding next block bounds expansions to one segment.
+              for (auto& entry : sources) {
+                if (std::ranges::none_of(children, [&](auto* child) {
+                      return child->bucketDomain == entry.first
+                          && child->segmentStateRetained(segments[segnum]);
+                    })) entry.first->variants.releaseSegmentState(segments[segnum]);
+              }
+            });
+          } else return nullptr;
+        }();
         SearchOp::SegmentStateRetention retain(children, retained);
+        if constexpr (Structural) for (auto* plan : routing.plans) {
+          sources.emplace_back(plan, std::make_unique<DomainVariantPlan::SegmentSources>(
+              plan->variants, reader, *plan->planning, (int32_t)segnum, tracker));
+        }
         [[maybe_unused]] size_t fed = 0;
         auto deliver = [&](size_t bucket, DomainHandle domain) {
           assert(bucket < blockSize);
           assert(domain.isDeliverable());
           if (first) open(bucket);
-          for (size_t child = 0; child < children.size(); child++) {
-            bindings[bucket * children.size() + child]
-                ->calc(nullptr, (int32_t)segnum, domain);
+          if constexpr (!Structural) {
+            for (size_t child = 0; child < children.size(); child++) {
+              bindings[bucket * children.size() + child]
+                  ->calc(nullptr, (int32_t)segnum, domain);
+            }
+          } else {
+            deliverStructural(parent, children, reader, (int32_t)segnum,
+                std::span(bindings).subspan(bucket * children.size(), children.size()),
+                domain, sources);
           }
           if (last) close(bucket);
           fed++;
         };
         bucketDomains(segnum, block, FacetBucketFeed(deliver));
         assert(fed == blockSize);
+        if constexpr (Structural) {
+          if (prefixes && !wholeReaderPrefixes) prefixes->releaseSegment((int32_t)segnum);
+        }
       }
     }
   }
@@ -232,7 +407,7 @@ void feedFacetBucketDomainChunks(
        chunkBegin += chunkBuckets) {
     auto chunk = block.subspan(
         chunkBegin, std::min(chunkBuckets, block.size() - chunkBegin));
-    std::vector<DomainHandle> domains = buildChunk(chunk);
+    auto domains = buildChunk(chunk);
     assert(domains.size() == chunk.size());
     for (size_t i = 0; i < chunk.size(); i++) {
       feed(chunkBegin + i, std::move(domains[i]));

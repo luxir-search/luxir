@@ -32,6 +32,12 @@ protected:
   std::unique_ptr<LuxirNode> source, follower;
   std::unique_ptr<HttpServer> sourceServer, followerServer;
   int sourcePort = 0;
+  // Replication time for a node started with manualClock(): only advance() moves it,
+  // so its floors expire and its failed syncs retry exactly when a test says.
+  const LuxirNode::Clock::time_point epoch = LuxirNode::Clock::now();
+  std::atomic<int64_t> elapsedMs{0};
+  LuxirNode::Now manualClock() { return [this] { return epoch + std::chrono::milliseconds(elapsedMs.load()); }; }
+  void advance(std::chrono::milliseconds by) { elapsedMs += by.count(); }
   void SetUp() override {
     LuxirTest::SetUp();
     path = std::filesystem::temp_directory_path() / ("luxir-follower-" + newUuid());
@@ -40,6 +46,7 @@ protected:
     sourceConfig.store.data_dir = (path / "source").string();
     followerConfig.store.data_dir = (path / "follower").string();
     sourceConfig.replication.follower_timeout_ms = 1000;
+    followerConfig.replication.retry_ms = 10; // reconnect and retry without the production second
     followerConfig.server.http.port = 0; // no fixed listener: a name per process
   }
   void startSource() {
@@ -49,9 +56,9 @@ protected:
     sourcePort = sourceServer->getPort();
   }
   void stopSource() { sourceServer.reset(); source.reset(); }
-  void startFollower() {
+  void startFollower(LuxirNode::Now clock = LuxirNode::Clock::now) {
     followerConfig.replication.source = "http://127.0.0.1:" + std::to_string(sourcePort);
-    follower = std::make_unique<LuxirNode>(followerConfig);
+    follower = std::make_unique<LuxirNode>(followerConfig, LuxirNode::Mode::SERVE, std::move(clock));
     followerServer = std::make_unique<HttpServer>(*follower, 1, 0);
     followerServer->start();
   }
@@ -310,10 +317,11 @@ TEST_F(ReplicationFollowerTest, ramFollowerAndPinLossReuseVerifiedFiles) {
     return nullptr;
   });
   auto join = scope_guard([&] { stopFollower(); });
-  startFollower();
+  startFollower(manualClock()); // the failed sync waits for advance()
   ASSERT_TRUE(until([&] { return stateIs("error"); }));
   glz::generic retry; ASSERT_FALSE(glz::read_json(retry, status()));
   EXPECT_GT(retry["collections"][0]["next_retry"].get<double>(), 0);
+  advance(60s);
   ASSERT_TRUE(caughtUp());
   EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
   EXPECT_EQ(h.collection().getShard()->getSnapshots().snapshot()->files.size(), (size_t)verified.load());
@@ -370,7 +378,7 @@ TEST_P(ReplicationMatrixTest, connectionFailureResumesRangeAndDroppedTransferRef
 }
 
 TEST_P(ReplicationMatrixTest, corruptDownloadLeavesOldReaderServing) {
-  startSource(); startFollower();
+  startSource(); startFollower(manualClock()); // the failed sync waits for advance()
   CollectionHelper h(*source, "main");
   ASSERT_TRUE(h.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success);
   ASSERT_TRUE(caughtUp());
@@ -403,6 +411,7 @@ TEST_P(ReplicationMatrixTest, corruptDownloadLeavesOldReaderServing) {
   EXPECT_GT(retry.collections[0].next_retry, retry.last_contact);
   EXPECT_NE(std::string::npos, retry.collections[0].last_error.find("checksum mismatch"));
   { std::lock_guard lock(mutex); write(original); }
+  advance(60s);
   ASSERT_TRUE(caughtUp());
   EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
   EXPECT_EQ(1, old->liveDocs());
@@ -786,7 +795,7 @@ TEST_F(ReplicationFollowerTest, eofCommitsOnlyTouchedCollections) {
   auto join = scope_guard([&] { resume.count_down(); stopFollower(); });
   Signal::listen("replicationFileVerified", [&](void*, void*, void*) -> void* { resume.wait(); return nullptr; });
   auto response = httpRequest(sourcePort, http::verb::post,
-      "/collections/main/_update?commit=true&wait_for_replicas=1&wait_for_replicas_timeout_ms=500",
+      "/collections/main/_update?commit=true&wait_for_replicas=1&wait_for_replicas_timeout_ms=10",
       "{\"_update_\":{\"collection\":\"other\"}}\n{\"id\":\"other\"}\n", "application/x-ndjson");
   ASSERT_EQ(200, response.result_int()) << response.body();
   auto end = response.body().find_last_not_of("\r\n ");
@@ -1014,7 +1023,7 @@ TEST_F(ReplicationFollowerTest, followerFloorWaitsAcrossIncarnations) {
 }
 
 TEST_F(ReplicationFollowerTest, followerFloorSurvivesRemovalAndIncarnationSwitch) {
-  startSource(); startFollower();
+  startSource(); startFollower(manualClock());
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
   ASSERT_TRUE(caughtUp());
   auto old = source->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
@@ -1025,6 +1034,9 @@ TEST_F(ReplicationFollowerTest, followerFloorSurvivesRemovalAndIncarnationSwitch
     return httpRequest(followerServer->getPort(), http::verb::get,
         "/collections/main/_search?min_commit=" + old.token() + "&min_commit_timeout_ms=5000");
   });
+  // Stopping the follower fails a parked request, which the stopped clock never expires,
+  // so a failed assertion cannot block in the future's destructor.
+  auto abortRemoved = scope_guard([&] { stopFollower(); });
   ASSERT_TRUE(until([&] { return parked.load(); }));
   source->deleteCollection("main");
   ASSERT_TRUE(until([&] { return follower->collectionEntries().empty(); }));
@@ -1036,9 +1048,16 @@ TEST_F(ReplicationFollowerTest, followerFloorSurvivesRemovalAndIncarnationSwitch
   auto switched = std::async(std::launch::async, [&] {
     return httpRequest(followerServer->getPort(), http::verb::get, "/collections/main/_search?min_commit=" + next.token());
   });
+  auto abortSwitched = scope_guard([&] { stopFollower(); });
   ASSERT_TRUE(until([&] { return parked.load(); }));
   sourceServer = std::make_unique<HttpServer>(*source, 1, sourcePort); sourceServer->start();
+  ASSERT_EQ(std::future_status::ready, switched.wait_for(10s));
   EXPECT_EQ(200, switched.get().result_int());
+  // On a follower, only expiry ends a floor from the old incarnation.
+  EXPECT_EQ(std::future_status::timeout, removed.wait_for(0ms));
+  advance(5000ms);
+  follower->getCommitWaits().poll();
+  ASSERT_EQ(std::future_status::ready, removed.wait_for(10s));
   EXPECT_EQ(409, removed.get().result_int());
 }
 

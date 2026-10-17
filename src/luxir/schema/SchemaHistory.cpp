@@ -18,6 +18,9 @@ std::shared_ptr<Schema> Schema::withHistory(uint64_t gen, const Schema* previous
 FieldSignatures Schema::signatures(bool includeTemplates) const {
   FieldSignatures result;
   for (const auto& [name, type] : fieldTypeMap) {
+    // Stored resources are not fields: each segment records the codec and
+    // chunk limits it was written with, so changing them must not start a new
+    // introduction for the fields stored there.
     if (dynamic_cast<StoredFieldType*>(type.get()) || type->isDerived()) continue;
     if (type->isAbstract() && !includeTemplates) continue;
     result.emplace(name, FieldSignature(name, *type));

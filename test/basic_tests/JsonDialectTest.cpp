@@ -7,10 +7,17 @@
 // bare. Map is a plain object; Vector is a bare number array.
 #include <gtest/gtest.h>
 
+#include <bit>
+#include <cmath>
 #include <cstddef>
+#include <cstring>
 #include <memory_resource>
+#include <random>
 #include <string>
 #include <variant>
+#include <vector>
+
+#include <fmt/format.h>
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/api/build.h"
@@ -64,6 +71,98 @@ TEST(JsonDialect, ValReadsUntagged) {
     ASSERT_EQ(m.fields.size(), 2u);
     EXPECT_EQ(std::get<std::int64_t>((**m.fields.find("a")).kind), 1);
     EXPECT_EQ(std::get<std::string_view>((**m.fields.find("b")).kind), "x"); }
+}
+
+// Number arrays: typed arm, exact int64, promotion, and shortest-repr double round-trip.
+TEST(JsonDialect, ValNumberArrays) {
+  std::pmr::monotonic_buffer_resource mr;
+  auto ints = [&](std::string_view json) { return std::get<P::ArrInt>(readVal(json, mr).kind).v; };
+  auto dbls = [&](std::string_view json) { return std::get<P::ArrDouble>(readVal(json, mr).kind).v; };
+
+  { auto v = ints("[9223372036854775807,-9223372036854775808,9007199254740993,-0,0]");
+    ASSERT_EQ(v.size(), 5u);
+    EXPECT_EQ(v[0], INT64_MAX);
+    EXPECT_EQ(v[1], INT64_MIN);
+    EXPECT_EQ(v[2], 9007199254740993);  // 2^53 + 1 stays exact
+    EXPECT_EQ(v[3], 0); }
+  { auto v = dbls(" [ 1 ,\n2.5\t, -0.0 , 1e2, 1E-2, -2.5e+3, 0.12345 ] ");
+    ASSERT_EQ(v.size(), 7u);
+    EXPECT_EQ(v[0], 1.0);
+    EXPECT_EQ(v[1], 2.5);
+    EXPECT_TRUE(std::signbit(v[2]));
+    EXPECT_EQ(v[3], 100.0);
+    EXPECT_EQ(v[4], 0.01);
+    EXPECT_EQ(v[5], -2500.0);
+    EXPECT_EQ(v[6], 0.12345); }
+  // ints before and after the first double promote exactly like (double)int64
+  { auto v = dbls("[9007199254740993,0.5,9007199254740993]");
+    EXPECT_EQ(v[0], (double)9007199254740993);
+    EXPECT_EQ(v[2], (double)9007199254740993); }
+
+  // non-number elements keep the generic arm, whatever position they take
+  { auto v = readVal(R"([1,2.5,"a",null])", mr);
+    const auto& a = std::get<P::ArrVal>(v.kind).v;
+    ASSERT_EQ(a.size(), 4u);
+    EXPECT_EQ(std::get<std::int64_t>(a[0].kind), 1);
+    EXPECT_EQ(std::get<double>(a[1].kind), 2.5);
+    EXPECT_EQ(std::get<std::string_view>(a[2].kind), "a"); }
+  { auto v = readVal("[1.5,[2]]", mr);
+    const auto& a = std::get<P::ArrVal>(v.kind).v;
+    EXPECT_EQ(std::get<double>(a[0].kind), 1.5);
+    EXPECT_EQ(std::get<P::ArrInt>(a[1].kind).v[0], 2); }
+  { auto v = readVal("[[1,2.5],[3]]", mr);
+    const auto& a = std::get<P::ArrVal>(v.kind).v;
+    EXPECT_EQ(std::get<P::ArrDouble>(a[0].kind).v[0], 1.0);
+    EXPECT_EQ(std::get<P::ArrInt>(a[1].kind).v[0], 3); }
+  EXPECT_TRUE(std::holds_alternative<P::ArrVal>(readVal("[ ]", mr).kind));
+
+  // inside an object, and longer than any fixed-size buffer
+  { P::Map m;
+    std::string json = R"({"v":[)";
+    for (int i = 0; i < 3000; i++) json += (i ? "," : "") + std::to_string(i);
+    json += R"(],"x":1})";
+    ASSERT_TRUE(P::read_json(m, json, mr));
+    auto v = std::get<P::ArrInt>((**m.fields.find("v")).kind).v;
+    ASSERT_EQ(v.size(), 3000u);
+    EXPECT_EQ(v[2999], 2999);
+    EXPECT_EQ(std::get<std::int64_t>((**m.fields.find("x")).kind), 1); }
+
+  // shortest-repr doubles (random bits and short decimals) round-trip bit-exactly
+  std::mt19937_64 rng(7);
+  std::string json = "[";
+  std::vector<double> expected;
+  while (expected.size() < 3000) {
+    double d = expected.size() % 2 ? (double)(int64_t)(rng() % 200001) / 1e5 - 1.0
+                                   : std::bit_cast<double>(rng());
+    if (!std::isfinite(d)) continue;
+    std::string s = fmt::format("{}", d);
+    if (s.find_first_of(".e") == std::string::npos) s += ".0";
+    json += (expected.empty() ? "" : ",") + s;
+    expected.push_back(d);
+  }
+  json += "]";
+  auto v = dbls(json);
+  ASSERT_EQ(v.size(), expected.size());
+  for (size_t i = 0; i < v.size(); i++) {
+    EXPECT_EQ(std::bit_cast<uint64_t>(v[i]), std::bit_cast<uint64_t>(expected[i])) << expected[i];
+  }
+}
+
+// Malformed numbers stay JSON errors, as scalars and in any array position.
+TEST(JsonDialect, ValNumberRejects) {
+  std::pmr::monotonic_buffer_resource mr;
+  for (std::string bad : {"01", "-01", "1.", ".5", "+1", "-", "NaN", "Infinity", "1e", "1e+",
+                          "9223372036854775808", "-9223372036854775809",
+                          "123456789012345678901", "0x10", "1.5.2"}) {
+    for (const std::string& json : {bad, "[" + bad + "]", "[1," + bad + "]", "[1.5," + bad + ",2]"}) {
+      P::Val v;
+      EXPECT_FALSE(P::read_json(v, json, mr)) << json;
+    }
+  }
+  for (std::string_view bad : {"[1,]", "[1 2]", "[1,,2]", "[1,2", "[1", "[1.5}", "[,1]"}) {
+    P::Val v;
+    EXPECT_FALSE(P::read_json(v, bad, mr)) << bad;
+  }
 }
 
 TEST(JsonDialect, SearchRequestUnifiedRoot) {

@@ -271,7 +271,7 @@ lag.
 | `waiting` | The source restarted without data for this collection; the follower keeps serving its copy. Commit data on the source to resume syncing. |
 | `stale` | Source unreachable or collection unavailable. Repair the source or network; the follower keeps serving searches from its copy. |
 | `orphan` | Local copy the follower will not sync or delete on its own. See below. |
-| `error` | Inspect `last_error`, fix storage/network/corruption, and let `next_retry` run (backoff 1-60 s). A generation that moved backwards requires restoring or promoting the source under a new incarnation. |
+| `error` | Inspect `last_error`, fix storage/network/corruption, and let `next_retry` run (backoff from `retry-ms`, doubling to 60 s). A generation that moved backwards requires restoring or promoting the source under a new incarnation. |
 
 A follower deletes a local collection only when the source it has followed
 since that source's last restart no longer lists it. A collection missing after
@@ -301,6 +301,7 @@ All replication settings use `--replication.` (configuration keys use underscore
 | `max-acknowledgments` | 262144 | Node-wide follower/collection acknowledgment budget |
 | `downloads` | 2 | Concurrent collection transfers |
 | `follower-timeout-ms` | 90000 | How long a silent follower still counts as live |
+| `retry-ms` | 1000 | Follower delay before reconnecting to a lost source, and before the first retry of a failed sync |
 | `pin-idle-timeout-ms` | 60000 | Pin expires without byte progress |
 | `pin-retained-bytes` | 1 GiB | Per-collection retired bytes retained only by pins |
 

@@ -93,6 +93,7 @@ void ReplicationConfig::validate() const {
   if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
     throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
   }
+  if (retry_ms < 1) throw std::invalid_argument("replication.retry-ms must be positive");
 }
 
 void LuxirConfig::addOptions(CLI::App& app) {
@@ -138,6 +139,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.http.threads", server.http.threads,
                  "HTTP connection I/O shards (one thread each, plus one accept thread; 0 = auto)")
       ->default_val(server.http.threads);
+  app.add_option("--server.workers", server.workers,
+                 "Task-arena worker threads for indexing, merges and parallel search "
+                 "(0 = auto: all CPUs on nodes of up to 4, else all but one)")
+      ->default_val(server.workers)
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--server.stream_buffer_bytes", server.stream_buffer_bytes,
                  "Per-connection buffered response bytes before streaming producers pause")
       ->default_val(server.stream_buffer_bytes);
@@ -149,6 +155,9 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(replication.pin_retained_bytes);
   app.add_option("--replication.follower-timeout-ms", replication.follower_timeout_ms,
                  "Follower liveness in milliseconds (watch timeout at most one third)")->default_val(replication.follower_timeout_ms);
+  app.add_option("--replication.retry-ms", replication.retry_ms,
+                 "Follower reconnect and first sync retry delay in milliseconds (retries double, to 60 s)")
+      ->default_val(replication.retry_ms);
 
   app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
       ->default_val(store.backend)
@@ -199,7 +208,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(ingest.stream_batch_docs)
       ->check(CLI::PositiveNumber);
   app.add_option("--indexing.max-inflight-batches", ingest.max_inflight_batches,
-                 "Streaming NDJSON: batches in flight per connection (0 = task arena compute width + 2)")
+                 "Streaming NDJSON: batches in flight per connection (0 = server.workers + 2)")
       ->default_val(ingest.max_inflight_batches)
       ->check(CLI::NonNegativeNumber);
   app.add_flag("--indexing.auto-create-collection,!--no-indexing.auto-create-collection",

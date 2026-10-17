@@ -158,7 +158,7 @@ whole machine. Designed from the start for parallelism on modern hardware.
   per-operation default bindings so a bare field name does the right thing.
 - Per-field choices: index mode (match, or range acceleration), multi-valued,
   column-stored (sorting, faceting, analytics), stored source (retrieval, in
-  LZ4-compressed chunks).
+  LZ4- or ZSTD-compressed chunks, configurable per stored resource).
 - Numeric, date, and geo fields with `index: "range"` build a points index;
   without it the same queries run off the column with the same results.
 - Floats and doubles are stored order-preserving, so numeric sorting and

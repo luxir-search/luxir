@@ -18,7 +18,7 @@
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/QueryPrep.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
 #include "test/SchemaBuilder.h"
@@ -784,10 +784,9 @@ TEST_F(ScorerResetTest, freshProductsAcrossProtocolsAndEncodings) {
   }
 
   for (std::string_view field : {"body_w", "tags"}) {
-    FieldReader fieldReader(reader->segments()[0].postingsReader());
-    ASSERT_TRUE(fieldReader.seek(field));
-    SegFieldInfo info;
-    fieldReader.readFieldInfo(info);
+    auto* fieldReader = reader->segments()[0].postingsReader().fieldInfo(field);
+    ASSERT_TRUE((fieldReader != nullptr));
+    const auto& info = *fieldReader;
     TermsEnum terms(queries, reader->segments()[0].postingsReader(), info);
     for (std::string_view name : {"qdense", "qword", "qpacked", "qshort", "qpulse"}) {
       SCOPED_TRACE(::testing::Message() << field << ':' << name);

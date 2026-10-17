@@ -19,6 +19,7 @@
 #include "luxir/index/CommitSnapshot.h"
 #include "FilterCache.h"
 #include "RequestMemTracker.h"
+#include "luxir/query/ExecutionWarnings.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
@@ -78,7 +79,7 @@ struct ExecutionProfileOpState {
 
 // The top-level request for the SearchEngine.
 class Collection;
-class SearchRequest {
+class SearchRequest : public ExecutionWarnings {
   friend class SearchEngine;
 
 public:
@@ -165,7 +166,7 @@ public:
   }
 
   void fillExecutionProfile(SearchResponse& response);
-  void warnOnce(std::string_view code, std::string_view message);
+  void warnOnce(std::string_view code, std::string_view message) override;
 
   /// Flow-control advice returned by reply().  The response is always accepted
   /// (or dropped, for CANCEL); the status only tells a streaming producer what

@@ -176,6 +176,23 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
   std::unreachable();
 }
 
+inline bool hasRequiredConjunction(const Query& query) {
+  switch (query.getKind()) {
+    case QueryKind::BOOLEAN:
+      return static_cast<const BooleanQuery&>(query).shapeHasRequiredConjunction();
+    case QueryKind::BOOST:
+      return hasRequiredConjunction(*static_cast<const BoostQuery&>(query).getChild());
+    case QueryKind::CONSTANT_SCORE:
+      return hasRequiredConjunction(*static_cast<const ConstantScoreQuery&>(query).getChild());
+    case QueryKind::FORCE_PREPARE:
+      return hasRequiredConjunction(*static_cast<const ForcePrepareQuery&>(query).getChild());
+    case QueryKind::RESCORE:
+      return hasRequiredConjunction(*static_cast<const RescoreQuery&>(query).getChild());
+    default:
+      return false;
+  }
+}
+
 inline Query::VerificationWork membershipVerificationWork(const Query& query) {
   switch (query.getKind()) {
     case QueryKind::TERM:

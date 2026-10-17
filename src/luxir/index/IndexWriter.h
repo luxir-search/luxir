@@ -12,6 +12,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/flow_graph.h>
+#include <oneapi/tbb/task_arena.h>
 #include "luxir/index/AuxInfo.h"
 #include "CommitSnapshotRegistry.h"
 #include "luxir/index/IndexRamBudget.h"
@@ -426,7 +427,9 @@ public:
   // use a multfunction node when there is no downstream consumer (i.e. the output is dropped or can be dropped)
   // using a normal function node would cause buffering.
 
-  tbb::flow::graph updateGraph;
+  // A flow graph runs its tasks in the arena it is constructed in, so the ctor
+  // emplaces it inside the writer's arena.
+  std::optional<tbb::flow::graph> updateGraph;
   std::unique_ptr<UpdateMessageMultiFunc> startUpdateNode;
   std::unique_ptr<UpdateMessageFunc> processUpdateNode;
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > updateSequencerNode;
@@ -457,9 +460,12 @@ public:
   // reserve against; pass null for a private unlimited budget (tests, embedded).
   // The collection owns snapshots and closes it after draining this writer.
   // A nonnull schema is for creation only; reopening loads the manifest schema.
+  // arena runs the writer's batches, flushes and merges (the node's index
+  // arena, for a collection); null means the arena of the constructing thread.
   explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
-                       int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {});
+                       int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {},
+                       oneapi::tbb::task_arena* arena = nullptr);
   ~IndexWriter();
   void close();
 

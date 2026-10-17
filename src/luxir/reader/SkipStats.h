@@ -23,10 +23,17 @@ struct SkipStats {
 
   static inline bool enabled = false;
 
+  // Calls to TermsEnum::seek(), including unsuccessful seeks.
+  static inline int64_t termDictionarySeeks = 0;
+
   // Docs-block body decodes (full 128-doc blocks + the StreamVByte tail). This is
   // the real decode work; blocks_decoded(pruned) / blocks_decoded(exhaustive) is
   // the "% of blocks decoded vs total" headline.
   static inline int64_t docBlocksDecoded = 0;
+  // Documents pulled by collapsed bounded constant-score collection (added
+  // per pull), and retained-group remap probes (per segment switch).
+  static inline int64_t collapseDocsVisited = 0;
+  static inline int64_t collapseRemapProbes = 0;
   // Full 128-value tfreq block decodes. StreamVByte tails are excluded because
   // their docs/freq streams have no independently skippable block boundary.
   static inline int64_t tfreqBlocksDecoded = 0;
@@ -322,6 +329,7 @@ struct SkipStats {
   static inline int64_t numericPredicateComplementArms = 0;
   static inline int64_t numericPredicatePointsArms = 0;
   static inline int64_t numericPredicateZoneArms = 0;
+  static inline int64_t numericPredicateScanArms = 0;
   static inline int64_t rangeFacetPointsArms = 0;
   static inline int64_t geoBKDArms = 0;
   static inline int64_t geoScanArms = 0;
@@ -373,6 +381,9 @@ struct SkipStats {
 
   static void reset() {
     docBlocksDecoded = 0;
+    termDictionarySeeks = 0;
+    collapseDocsVisited = 0;
+    collapseRemapProbes = 0;
     tfreqBlocksDecoded = 0;
     l0HeaderSteps = 0;
     l0CheckpointJumps = 0;
@@ -610,6 +621,7 @@ struct SkipStats {
     numericPredicateComplementArms = 0;
     numericPredicatePointsArms = 0;
     numericPredicateZoneArms = 0;
+    numericPredicateScanArms = 0;
     rangeFacetPointsArms = 0;
     geoBKDArms = 0;
     geoScanArms = 0;

@@ -10,8 +10,10 @@
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/log.h"
 
+#include <bit>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <span>
 #include <vector>
 
@@ -119,8 +121,8 @@ private:
   }
 
   // Returns false for a zero / near-zero cosine vector. Otherwise validates
-  // dimensions, applies truncate_dims (narrowing vec to the stored prefix) and
-  // write-time normalization in place.
+  // dimensions, applies truncate_dims (narrowing vec to the stored prefix),
+  // checks finiteness and applies write-time normalization in place.
   bool validate(std::span<float>& vec, int32_t ordinal) {
     auto prefix = [&]() { return ordinal < 0 ? std::string() : fmt::format("vector {}: ", ordinal); };
     if (vec.empty()) {
@@ -144,13 +146,27 @@ private:
           "field '{}': {}expected dims={}, got {}",
           std::string_view(fieldName), prefix(), expected, n));
     }
+    // Every element must be finite, whatever arm it arrived in (a double past
+    // float32 range has narrowed to inf). One branch-free pass over the exponent
+    // bits; only a failure goes back for the first bad index.
+    uint32_t nonFinite = 0;
+    for (float x : vec) nonFinite |= (uint32_t)((std::bit_cast<uint32_t>(x) & 0x7f800000u) == 0x7f800000u);
+    if (nonFinite) [[unlikely]] {
+      for (size_t i = 0; i < vec.size(); i++) {
+        if (!std::isfinite(vec[i])) {
+          throw DocumentError(fmt::format("field '{}': {}element {} is not a finite float32",
+                                          std::string_view(fieldName), prefix(), i));
+        }
+      }
+    }
     if (metric == VectorFieldType::METRIC_COSINE && !trustNormalized) {
+      // Finite elements: the double sum of squares cannot overflow.
       double normSq = 0.0;
       for (float x : vec) {
         double d = (double)x;
         normSq += d * d;
       }
-      if (!std::isfinite(normSq) || normSq <= MIN_COSINE_NORM_SQ) {
+      if (normSq <= MIN_COSINE_NORM_SQ) {
         // No cosine direction - skip this value rather than abort the update.
         LOG_WARN("VectorHandler: cosine field '{}' skipping zero / near-zero vector",
                  std::string_view(fieldName));

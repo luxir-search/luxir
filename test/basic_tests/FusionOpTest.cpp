@@ -25,6 +25,7 @@
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "test/LuxirTest.h"
+#include "test/TaskSpawnCounter.h"
 #include "test/TestUtils.h"
 
 using namespace luxir;
@@ -796,6 +797,69 @@ TEST_F(FusionOpTest, emptyIndex) {
   lreq->done();
 }
 
+
+TEST_F(FusionOpTest, emptyIndexWithTwoSourcesSpawnsNoTasks) {
+  CollectionHelper h("main");
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main");
+  auto& fusion = req->topDocs("f").rawOp().kind.emplace<api::Fusion>();
+  fusion.limit = 5;
+  fusion.get_number = true;
+  fusion.method.emplace<api::RrfFusion>().k = 60;
+  setTextSource(addSource(fusion, "text", req->mr), req->mr, "foo_w", "apple", 5);
+  setTextSource(addSource(fusion, "other", req->mr), req->mr, "foo_w", "banana", 5);
+  auto* facet = build::mapSlot<api::SearchOp>(fusion.ops, 1, "colors", req->mr);
+  facet->kind.emplace<api::FieldFacet>().field = "color_s";
+  int64_t spawns;
+  {
+    TaskSpawnCounter counter;
+    luxirNode->getSearchEngine().dispatch(*req.get(), -1);
+    spawns = counter.count();
+  }
+  ASSERT_OK(req);
+  EXPECT_EQ(0, spawns);
+  ASSERT_NE(nullptr, req->docList("f"));
+  EXPECT_EQ(0, req->docList("f")->row_count);
+  EXPECT_EQ(0, req->docList("f")->found.value_or(-1));
+  EXPECT_TRUE(req->docList("f")->ops.at("colors")->facetResult()->counts.empty());
+}
+
+TEST_F(FusionOpTest, unarySubOpDoesNotSpawn) {
+  CollectionHelper h("main");
+  h.indexAll(std::array{flatdoc("id", "1", "foo_w", "apple", "color_s", "red"),
+                        flatdoc("id", "2", "foo_w", "banana", "color_s", "blue")},
+             UpdateMessage::COMMIT);
+  for (int profile : {0, -1}) {
+    for (bool loadFields : {false, true}) {
+      for (int64_t offset : {0, 10}) {
+        SCOPED_TRACE(::testing::Message() << "profile=" << profile
+                     << ", fields=" << loadFields << ", offset=" << offset);
+        auto req = localReq(luxirNode->getSearchEngine());
+        req->collection("main");
+        auto& fusion = req->topDocs("f").rawOp().kind.emplace<api::Fusion>();
+        fusion.limit = 10;
+        fusion.offset = offset;
+        fusion.method.emplace<api::RrfFusion>().k = 60;
+        addField(fusion, loadFields ? "id" : "_score_", req->mr);
+        setTextSource(addSource(fusion, "text", req->mr), req->mr, "foo_w", "apple", 5);
+        setTextSource(addSource(fusion, "other", req->mr), req->mr, "foo_w", "banana", 5);
+        auto* facet = build::mapSlot<api::SearchOp>(fusion.ops, 1, "colors", req->mr);
+        facet->kind.emplace<api::FieldFacet>().field = "color_s";
+        int64_t spawns;
+        {
+          TaskSpawnCounter counter;
+          luxirNode->getSearchEngine().dispatch(*req.get(), profile);
+          spawns = counter.count();
+        }
+        ASSERT_OK(req);
+        EXPECT_EQ(profile == 0 ? 0 : 1, spawns);
+        ASSERT_NE(nullptr, req->docList("f"));
+        EXPECT_EQ(offset == 0 ? 2 : 0, req->docList("f")->row_count);
+        EXPECT_EQ(2u, req->docList("f")->ops.at("colors")->facetResult()->counts.size());
+      }
+    }
+  }
+}
 
 // Concurrency coverage for the kNN prepare() path.
 //

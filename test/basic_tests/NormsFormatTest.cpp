@@ -31,10 +31,9 @@ struct ScoreHit {
 
 SegFieldInfo readFieldInfo(TestIndex& testIndex, std::string_view field) {
   auto& seg = testIndex.reader->segments()[0];
-  FieldReader fieldReader(seg.postingsReader());
-  EXPECT_TRUE(fieldReader.seek(field));
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  auto* fieldReader = seg.postingsReader().fieldInfo(field);
+  EXPECT_TRUE((fieldReader != nullptr));
+  const auto& fieldInfo = *fieldReader;
   return fieldInfo;
 }
 
@@ -56,10 +55,9 @@ void assertTermScores(TestIndex& testIndex, std::string_view field, std::string_
   auto& seg = testIndex.reader->segments()[0];
 
   MemPool expectedPool;
-  FieldReader fieldReader(seg.postingsReader());
-  ASSERT_TRUE(fieldReader.seek(field));
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  auto* fieldReader = seg.postingsReader().fieldInfo(field);
+  ASSERT_TRUE((fieldReader != nullptr));
+  const auto& fieldInfo = *fieldReader;
   TermsEnum termsEnum(expectedPool, seg.postingsReader(), fieldInfo);
   ASSERT_TRUE(termsEnum.seek(term));
   DocsFreqEnum docsEnum(termsEnum);

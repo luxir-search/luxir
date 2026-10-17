@@ -779,6 +779,13 @@ public:
             minShouldMatch(minShouldMatch) {
   }
 
+  bool recoverableAsPredicate() const noexcept override {
+    for (auto clauses : {mandatory, optional, prohibited, filter}) {
+      for (auto* clause : clauses) if (!clause->recoverableAsPredicate()) return false;
+    }
+    return true;
+  }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const BooleanQuery&>(other);
     if (minShouldMatch != rhs.minShouldMatch
@@ -926,6 +933,10 @@ public:
     return allSupported(mandatory) && allSupported(prohibited)
         && allSupported(filter)
         && (dropOptional || allSupported(optional));
+  }
+
+  bool shapeHasRequiredConjunction() const {
+    return mandatory.size() + filter.size() > 1;
   }
 
   bool shapeDirectCountAvailable(IndexReader& reader) const {
@@ -5009,6 +5020,21 @@ public:
           needsScores(needsScores), allowsPruning(allowsPruning),
           uniformConstantCandidate(uniformConstantCandidate) {}
 
+      size_t retainedBytes() const noexcept override {
+        size_t bytes = sizeof(*this) + mandatoryScores.capacity() * sizeof(uint8_t)
+            + filterDomains.capacity() * sizeof(DomainHandle);
+        // Only directly owned materializations belong to this prepared
+        // window. Borrowed cache primitives keep their external accounting.
+        for (const auto& domain : filterDomains) {
+          if (domain.ownsStorage()) bytes += domain.get()->ramBytesUsed();
+        }
+        for (const auto* sources : {&mandatorySources, &optionalSources, &prohibitedSources}) {
+          bytes += sources->capacity() * sizeof(QueryPrep::PreparedSource);
+          for (const auto& source : *sources) if (source.prepared) bytes += source.prepared->retainedBytes();
+        }
+        return bytes;
+      }
+
       Query::ScorerSupplier* scorerSupplierImpl(
           MemPool& targetPool, IndexReader::Segment& segment,
           Query::SupplierExecutionMode executionMode) override {
@@ -5111,7 +5137,7 @@ public:
       // a pure score add (MandOpt) - they never affect membership.  Without
       // scores they contribute nothing, so skip building their weights entirely
       // (Lucene's BooleanWeight scorer simplification).  This also exposes
-      // "+a b" count-only requests to the single-clause count() shortcut.
+      // "+a b" count-only requests to the single-clause count shortcut.
       // minShouldMatch >= 1 makes the optional group a membership constraint
       // even under a mandatory clause, so it must be kept.
       bool dropOptional = query.dropsOptional(needsScores);
@@ -5152,13 +5178,25 @@ public:
               || verificationWork == Query::VerificationWork::PARTIAL;
           bool anyRouted = false;
           for (auto& segment : context.topReader.segments()) {
-            auto constant = prohibitedWeight->constantCount(segment, nullptr);
-            if (constant.has_value() && *constant == segment.maxDoc()) {
-              continue;
-            }
             auto savepoint = routePool.getSavePoint();
-            auto* supplier = prohibitedWeight->scorerSupplier(
-                routePool, segment);
+            Query::ScorerSupplier* supplier = nullptr;
+            bool supplierBuilt = false;
+            auto shortcut = prohibitedWeight->countShortcut(segment, nullptr);
+            if (shortcut.maxMatches == segment.maxDoc()) {
+              auto constant = QueryPrep::resolveCount(shortcut, [&](Query::Weight& resolver) {
+                auto* resolved = resolver.scorerSupplier(routePool, segment);
+                if (&resolver == prohibitedWeight) {
+                  supplier = resolved;
+                  supplierBuilt = true;
+                }
+                return resolved;
+              });
+              if (constant && *constant == segment.maxDoc()) {
+                routePool.rewind(savepoint);
+                continue;
+              }
+            }
+            if (!supplierBuilt) supplier = prohibitedWeight->scorerSupplier(routePool, segment);
             QueryPrep::ProhibitedCacheRoute route =
                 QueryPrep::ProhibitedCacheRoute::NONE;
             if (supplier != nullptr) {
@@ -5254,38 +5292,45 @@ public:
       return false;
     }
 
-    // Membership count free from index stats, composed from the clauses.
-    // Two shapes answer: a lone required clause delegates (optional clauses
-    // beside it never gate membership while minShouldMatch is unset, whether
-    // or not their weights were dropped), and a pure disjunction whose
-    // clauses all report constant counts is exact when at most one clause is
-    // nonempty - a union with nothing has no overlap. Two or more live
-    // clauses have unknown overlap, and prohibited clauses need execution.
-    std::optional<int64_t> constantCount(
-        IndexReader::Segment& segment, DocSet* domain) override {
-      if (!prohibitedWeights.empty()) {
-        return std::nullopt;
-      }
+    // A lone required clause determines membership when optionals only score.
+    // A pure disjunction delegates when at most one clause has a nonzero bound:
+    // union with empty clauses introduces no overlap. More survivors, gating
+    // optionals and exclusions need execution. Required bounds intersect by
+    // minimum, and a constrained optional group's bound is its capped sum.
+    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+      auto bound = countBound(segment, domain, segment.maxDoc());
+      if (bound.maxMatches == 0) return bound;
       size_t required = mandatoryWeights.size() + filterWeights.size();
-      if (required == 1 && minShouldMatch < 1) {
-        Query::Weight* child = mandatoryWeights.empty()
-            ? filterWeights.front() : mandatoryWeights.front();
-        if (child == nullptr) return std::nullopt;
-        return child->constantCount(segment, domain);
+      if (prohibitedWeights.empty() && required == 1 && minShouldMatch < 1) {
+        auto* child = mandatoryWeights.empty() ? filterWeights.front() : mandatoryWeights.front();
+        return child ? child->countShortcut(segment, domain) : bound;
       }
-      if (required == 0 && minShouldMatch <= 1 && !optionalWeights.empty()) {
-        int64_t count = 0;
-        int liveClauses = 0;
-        for (Query::Weight* clause : optionalWeights) {
-          if (clause == nullptr) return std::nullopt;
-          auto clauseCount = clause->constantCount(segment, domain);
-          if (!clauseCount.has_value()) return std::nullopt;
-          if (*clauseCount != 0 && ++liveClauses > 1) return std::nullopt;
-          count += *clauseCount;
+      for (auto weights : {mandatoryWeights, filterWeights}) {
+        for (auto* child : weights) {
+          if (child) bound.maxMatches = std::min(bound.maxMatches,
+              child->countShortcut(segment, domain).maxMatches);
         }
-        return count;
       }
-      return std::nullopt;
+      if (!optionalWeights.empty() && (required == 0 || minShouldMatch > 0)) {
+        int64_t sum = 0;
+        size_t live = 0;
+        CountShortcut survivor{0, CountHow::METADATA};
+        for (auto* child : optionalWeights) {
+          auto shortcut = child ? child->countShortcut(segment, domain) : bound;
+          if (shortcut.maxMatches > 0) {
+            ++live;
+            survivor = shortcut;
+          }
+          sum = std::min<int64_t>(segment.maxDoc(), sum + shortcut.maxMatches);
+        }
+        if (minShouldMatch > (int64_t)live) return {0, CountHow::METADATA};
+        if (required == 0 && prohibitedWeights.empty() && minShouldMatch <= 1 && live <= 1) {
+          return survivor;
+        }
+        bound.maxMatches = std::min(bound.maxMatches, sum);
+      }
+      if (bound.maxMatches == 0) bound.how = CountHow::METADATA;
+      return bound;
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
@@ -5314,7 +5359,7 @@ public:
       Query::Weight::PrepareContext childCtx{
         ctx.reader,
         std::span<DocSet* const>(childDomainPtrs.data(), childDomainPtrs.size()),
-        ctx.parallel};
+        ctx.parallel, ctx.warnings};
       auto mandatorySources = QueryPrep::prepareSources(mandatoryWeights, childCtx);
       auto optionalSources = QueryPrep::prepareSources(optionalWeights, childCtx);
       auto prohibitedSources = QueryPrep::prepareFilterSources(

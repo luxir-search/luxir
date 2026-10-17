@@ -618,6 +618,12 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   EXPECT_TRUE(nodeJson.contains("collections"));
   EXPECT_FALSE(nodeJson.contains("memory"));
 
+  CollectionHelper metadataHelper("metadata");
+  ASSERT_TRUE(metadataHelper.index(flatdoc("id", "one", "n_i", 7), UpdateMessage::COMMIT).success);
+  auto metadataReader = metadataHelper.getIndexWriter()->snapshots.readers.getReader();
+  auto metadataField = metadataReader->field("n_i");
+  ASSERT_NE(nullptr, metadataField.at(0));
+
   // Node memory is a separate request that returns nothing else; the jemalloc
   // block is present only on jemalloc.
   auto memoryStats = httpRequest(port(), http::verb::get, "/_stats?memory=true");
@@ -634,6 +640,24 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
     EXPECT_TRUE(memoryJson["memory"]["jemalloc"].contains("allocated_bytes"));
     EXPECT_TRUE(memoryJson["memory"]["jemalloc"].contains("version"));
   }
+  const auto& metadata = memoryJson["memory"]["field_metadata"];
+  EXPECT_GT(metadata["entries"].get<int64_t>(), 0);
+  EXPECT_GT(metadata["pages"].get<int64_t>(), 0);
+  EXPECT_GE(metadata["names"].get<int64_t>(), 1);
+  EXPECT_EQ(metadata["bytes"].get<int64_t>(),
+            metadata["directory_bytes"].get<int64_t>() + metadata["page_bytes"].get<int64_t>()
+                + metadata["entry_bytes"].get<int64_t>() + metadata["name_bytes"].get<int64_t>());
+  for (int i = 0; i < 100; i++) {
+    EXPECT_FALSE(metadataReader->field(std::format("absent_{}_i", i)).exists());
+  }
+  auto afterMissing = httpRequest(port(), http::verb::get, "/_stats?memory=true");
+  ASSERT_EQ(200, afterMissing.result_int()) << afterMissing.body();
+  glz::generic_i64 afterMissingJson;
+  ASSERT_FALSE(glz::read_json(afterMissingJson, afterMissing.body()));
+  EXPECT_EQ(metadata["names"].get<int64_t>(),
+            afterMissingJson["memory"]["field_metadata"]["names"].get<int64_t>());
+  EXPECT_EQ(metadata["name_bytes"].get<int64_t>(),
+            afterMissingJson["memory"]["field_metadata"]["name_bytes"].get<int64_t>());
   auto badMemory = httpRequest(port(), http::verb::get, "/_stats?memory=yes");
   EXPECT_EQ(400, badMemory.result_int()) << badMemory.body();
   auto noMemory = httpRequest(port(), http::verb::get, "/_stats?memory=false");
@@ -2968,7 +2992,7 @@ TEST_F(HttpApiTest, schemaBodiesRetainVariantDefaultsAcrossAsyncDispatch) {
     "variants":{"words_for_search":"text",
                 "folded_for_value":{"type":"string","normalizer":["nfkc_cf"]}},
     "defaults":{"search":"words_for_search","value":"folded_for_value"}
-  }}})";
+  }},"stored_resources":{"_stored_http_schema_":{}}})";
   auto created = httpRequest(port(), http::verb::post, "/collections/_create",
       R"({"name":"http_schema_body","schema":)" + schema + "}");
   ASSERT_EQ(200, created.result_int()) << created.body();
@@ -4174,6 +4198,52 @@ TEST_F(HttpApiTest, ndjsonEofKeepsDurableTokensAfterReplicaWaitFailure) {
   EXPECT_EQ(kept, eof["commits"]["kept"]["commit"].get<std::string>());
   EXPECT_EQ(1, eof["commits"]["kept"]["replicas"]["serving"].get<int64_t>());
   EXPECT_FALSE(eof["commits"]["kept"].contains("error"));
+}
+
+TEST_F(HttpApiTest, collapseOverlayRowsColumnsAndDocs) {
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "z", "key_s", "z"),
+      flatdoc("id", "b", "key_s", "a"), flatdoc("id", "c", "key_s", "a"),
+      flatdoc("id", "missing")}, UpdateMessage::COMMIT).success);
+  auto echo = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?explain=request&collapse=key_s", R"({"collapse":{"field":"id","missing":"drop"}})");
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+  glz::generic_i64 canonical;
+  ASSERT_FALSE(glz::read_json(canonical, echo.body()));
+  auto& collapse = canonical["ops"]["q"]["top_docs"]["collapse"];
+  EXPECT_EQ("key_s", collapse["field"].get_array()[0].get_string());
+  EXPECT_FALSE(collapse.contains("missing")); // default expand
+  for (std::string format : {"rows", "columns"}) {
+    auto response = httpRequest(port(), http::verb::post,
+        "/collections/main/_search?collapse=key_s",
+        R"({"fields":["id"],"get_number":true,"batch_size":2,"document_format":")" + format + "\"}");
+    ASSERT_EQ(200, response.result_int()) << response.body();
+    std::vector<std::string> ids;
+    for (const auto& line : splitLines(response.body())) {
+      glz::generic_i64 body;
+      ASSERT_FALSE(glz::read_json(body, line));
+      EXPECT_EQ(3, body["found"].get<int64_t>());
+      EXPECT_EQ(4, body["found_docs"].get<int64_t>());
+      for (const auto& row : body["docs"].get_array()) {
+        ids.push_back(row["id"].get_string());
+        EXPECT_TRUE(row.contains("_group_"));
+      }
+    }
+    EXPECT_EQ((std::vector<std::string>{"z", "b", "missing"}), ids);
+  }
+  auto response = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?format=docs&collapse=key_s",
+      R"({"fields":["id"],"get_number":true,"batch_size":1})");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  auto lines = splitLines(response.body());
+  ASSERT_EQ(4, lines.size());
+  glz::generic_i64 header;
+  ASSERT_FALSE(glz::read_json(header, lines[0]));
+  EXPECT_EQ(3, header["_header_"]["found"].get<int64_t>());
+  EXPECT_EQ(4, header["_header_"]["found_docs"].get<int64_t>());
+  glz::generic_i64 singleton;
+  ASSERT_FALSE(glz::read_json(singleton, lines.back()));
+  EXPECT_TRUE(singleton["_group_"]["val"].is_null());
+  EXPECT_TRUE(singleton["_group_"]["singleton"].get<bool>());
 }
 
 } // namespace luxir::test

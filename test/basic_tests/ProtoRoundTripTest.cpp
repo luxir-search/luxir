@@ -292,7 +292,7 @@ void roundTripType(const char* nm) {
   X(DeleteCollectionRequest) X(DeleteCollectionResponse) X(ListCollectionsResponse)                \
   X(StatsRequest) X(StatsResponse) X(StatsTotals) X(CollectionStats) X(ShardStats) X(IndexStats)    \
   X(SegmentStats) X(AuxStats) X(QueryCacheStats) X(IndexRamStats) X(ArenaStats) X(JemallocStats)   \
-  X(MemoryStats) X(StorageRamStats)                                                                \
+  X(FieldMetadataStats) X(MemoryStats) X(StorageRamStats)                                                                \
   X(CacheControlRequest) X(CacheControlResponse) X(CacheEntryDump)                                \
   X(ShardCacheControl) X(CollectionCacheControl)
 

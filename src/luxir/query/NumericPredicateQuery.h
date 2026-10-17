@@ -33,6 +33,8 @@ class NumericPredicateQuery final : public Query {
   std::span<const PointsReader::ValueRange> exactIntervals;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static inline bool disableShapesForTests = false;
 #ifndef NDEBUG
   // Observe actual verification, not column decoding or metadata navigation.
@@ -103,8 +105,14 @@ public:
         : exactIntervals;
   }
 
-  bool matchesValue(int64_t value) const {
+  // The range test is inlined into every per-value loop; the exact-set
+  // search stays out of line.
+  LUXIR_INLINE bool matchesValue(int64_t value) const {
     if (exactValues.empty()) return envelope.lo <= value && value <= envelope.hi;
+    return matchesExact(value);
+  }
+
+  bool matchesExact(int64_t value) const {
     auto found = std::lower_bound(
         exactIntervals.begin(), exactIntervals.end(), value,
         [](const PointsReader::ValueRange& interval, int64_t target) {
@@ -181,21 +189,45 @@ public:
     bool multi;
     int32_t docid = -1;
 
-    bool valueMatches() {
-      if (docid == PostingsReader::END) return false;
+    LUXIR_INLINE void observe(int32_t doc) {
 #ifndef NDEBUG
-      if (verificationObserver != nullptr) verificationObserver(docid);
+      if (verificationObserver != nullptr) verificationObserver(doc);
+#else
+      unused(doc);
 #endif
+    }
+
+    bool matchesAt(int32_t doc, int32_t rank) {
+      observe(doc);
       if (!multi) {
         if (allMatch) return true;
-        return query.matchesValue(iter.value());
+        return query.matchesValue(iter.values().valueAt(rank));
       }
-      auto [start, end] = reader.getStartEndValueRank(iter.rank());
+      auto [start, end] = reader.getStartEndValueRank(rank);
       if (allMatch) return start < end;
       for (int64_t r = start; r < end; r++) {
         if (query.matchesValue(iter.values().valueAt(r))) return true;
       }
       return false;
+    }
+
+    bool valueMatches() {
+      return docid != PostingsReader::END && matchesAt(docid, iter.rank());
+    }
+
+    // Calls scan(test) with this column's per-document test. Scans step with
+    // iter.nextWhere, which keeps the cursor in registers, and store docid
+    // once per call; a single-valued predicate gets its own small loop so the
+    // value test inlines into it.
+    template <typename Scan>
+    LUXIR_INLINE int32_t withTest(Scan&& scan) {
+      if (!multi && !allMatch) {
+        return scan([this](int32_t doc, int32_t rank) LUXIR_INLINE {
+          observe(doc);
+          return query.matchesValue(iter.values().valueAt(rank));
+        });
+      }
+      return scan([this](int32_t doc, int32_t rank) { return matchesAt(doc, rank); });
     }
 
   public:
@@ -230,17 +262,16 @@ public:
     }
 
     int32_t next() override {
-      for (;;) {
-        docid = iter.next();
-        if (docid == PostingsReader::END || valueMatches()) return docid;
-      }
+      docid = withTest([this](auto test) { return iter.nextWhere(test); });
+      return docid;
     }
     int32_t advance(int32_t target) override {
       assert(docid < target);
       docid = iter.advance(target);
-      while (docid != PostingsReader::END && !valueMatches()) {
-        docid = iter.next();
-      }
+      if (docid == PostingsReader::END) return docid;
+      docid = withTest([this](auto test) {
+        return test(docid, iter.rank()) ? docid : iter.nextWhere(test);
+      });
       return docid;
     }
     int32_t docId() override { return docid; }
@@ -254,7 +285,13 @@ public:
     int32_t advanceWindow(int32_t min, int32_t max) override {
       if (min >= max) return max;
       if (docid < min) docid = iter.advance(min);
-      while (docid < max && !valueMatches()) docid = iter.next();
+      if (docid >= max) return docid;
+      docid = withTest([this, max](auto test) {
+        if (test(docid, iter.rank())) return docid;
+        return iter.nextWhere([&test, max](int32_t doc, int32_t rank) LUXIR_INLINE {
+          return doc >= max || test(doc, rank);
+        });
+      });
       return docid;
     }
 
@@ -263,13 +300,19 @@ public:
       skipCount(SkipStats::countBulkFillCalls);
       if (min >= max) return;
       if (docid < min) docid = iter.advance(min);
-      while (docid < max) {
-        if (valueMatches()) {
-          int32_t index = docid - min;
-          words[(size_t)(index >> 6)] |= 1ULL << (index & 63);
-        }
-        docid = iter.next();
-      }
+      if (docid >= max) return;
+      docid = withTest([this, words, min, max](auto test) {
+        auto mark = [&test, words, min, max](int32_t doc, int32_t rank) LUXIR_INLINE {
+          if (doc >= max) return true;
+          if (test(doc, rank)) {
+            int32_t index = doc - min;
+            words[(size_t)(index >> 6)] |= 1ULL << (index & 63);
+          }
+          return false;
+        };
+        mark(docid, iter.rank());
+        return iter.nextWhere(mark);
+      });
     }
   };
 
@@ -774,7 +817,7 @@ public:
   using PointsBitBulkScorer = PointsMaterialize::PointsBitBulkScorer;
   class Weight final : public Query::Weight {
     NumericPredicateQuery& query;
-    std::span<SegFieldInfo*> segInfos;
+    IndexReader::FieldSegments segInfos;
     float constantScore;
 
     static int64_t estimateCost(IntColReader& reader,
@@ -822,10 +865,9 @@ public:
       return count;
     }
 
-    bool segmentInfo(IndexReader::Segment& segment, SegFieldInfo*& segInfo) const {
-      if (segInfos.empty()) return false;
-      segInfo = segInfos[segment.ord];
-      return segInfo != nullptr && segInfo->columnLoc.offset() > 0;
+    const PostingsReader::Field* segmentInfo(IndexReader::Segment& segment) const {
+      auto* info = segInfos.at(segment.ord);
+      return info && info->columnLoc.offset() > 0 ? info : nullptr;
     }
 
   public:
@@ -834,48 +876,31 @@ public:
         : Query::Weight(context, query, flags), query(query),
           constantScore(constantScore) {
       traits |= IS_CONSTANT_SCORING;
-      segInfos = context.readSegInfos(query.getField());
+      segInfos = context.topReader.field(query.getField());
     }
 
-    // Exact count from predicate structures alone, never a column scan: a
-    // predicate covering the whole column counts every doc with a value, and
-    // a partial predicate over a single-valued points column sums its exact
-    // ordinal runs. Multi-valued partial predicates and points-less columns
-    // return null rather than run the crossing-block walk the bulk count path
-    // uses; that walk is the right cost at execution, not inside a per-segment
-    // constant probe.
-    std::optional<int64_t> constantCount(
-        IndexReader::Segment& segment, DocSet* domain) override {
-      SegFieldInfo* segInfo = nullptr;
-      if (!segmentInfo(segment, segInfo)) {
-        return 0;
+    // Bounds answer covering and disjoint ranges without opening points.
+    // Partial single-valued points counts resolve at supplier construction;
+    // multi-valued and points-less counts walk the column only at execution.
+    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+      if (query.getHi() < query.getLo()) return {0, CountHow::METADATA};
+      const auto* info = segmentInfo(segment);
+      if (!info) return {0, CountHow::METADATA};
+      if (!info->columnBounds) {
+        assert(false && "numeric column has no bounds");
+        return {countBound(segment, domain, info->docsWithField).maxMatches, CountHow::ITERATE};
       }
-      MemPool pool;
-      auto* reader = pool.make<IntColReader>(
-          segment.postingsReader(), *segInfo);
-      if (reader->numValues() == 0) return 0;
-      int64_t colMin = reader->getMin();
-      int64_t colMax = reader->getMax();
-      if (colMax < query.getLo() || query.getHi() < colMin) return 0;
-      if (domain != nullptr || segment.liveDocs() != nullptr) {
-        return std::nullopt;
+      if (info->numValues == 0
+          || !query.intersects(info->columnBounds->min, info->columnBounds->max)) {
+        return {0, CountHow::METADATA};
       }
-      if (query.covers(colMin, colMax)) {
-        return reader->docsWithValue();
-      }
-      if (segInfo->pointsMetaOff == 0 || reader->multiValued()) {
-        return std::nullopt;
-      }
-      auto* points = pool.make<PointsReader>(
-          segment.postingsReader(), *segInfo);
-      if (points->pointCount() != (uint64_t)reader->numValues()) {
-        throw std::runtime_error(
-            "NumericPredicateQuery: points/column value count mismatch");
-      }
-      auto ranges = pool.make_span<PointsReader::OrdinalRange>(
-          query.intervals().size());
-      size_t count = fillPointRanges(*points, query, ranges);
-      return (int64_t)pointCount(ranges.first(count));
+      CountHow how = query.covers(info->columnBounds->min, info->columnBounds->max)
+          ? CountHow::METADATA
+          : info->pointsMetaOff != 0 && info->monoLoc.offset() == 0
+              ? CountHow::SUPPLIER : CountHow::ITERATE;
+      auto shortcut = countBound(segment, domain, info->docsWithField, how);
+      if (shortcut.how == CountHow::SUPPLIER) shortcut.resolver = this;
+      return shortcut;
     }
 
     class Supplier final : public Query::ScorerSupplier {
@@ -1080,6 +1105,7 @@ public:
                 targetPool, reader, plans, weight.query,
                 segment.maxDoc(), weight.constantScore);
           case ScorerArm::SCAN:
+            skipCount(SkipStats::numericPredicateScanArms);
             return targetPool.make<PredicateScorer<IntColReader::Iterator>>(
                 reader, weight.query, allMatch,
                 weight.constantScore);
@@ -1128,6 +1154,13 @@ public:
       int64_t exactCount() {
         if (points != nullptr && !reader.multiValued()) {
           return (int64_t)pointValueCount;
+        }
+        if (plans.empty()) {
+          auto stored = planPool.make_span<BlockPlan>((size_t)reader.numBlocks());
+          for (int64_t i = 0; i < reader.numBlocks(); i++) {
+            stored[(size_t)i] = weight.query.classifyBlock(reader.blockInfo(i), reader.blockZone(i));
+          }
+          plans = stored;
         }
         CrossingValues crossing(reader);
         if (!reader.multiValued()) {
@@ -1192,6 +1225,8 @@ public:
             plans(plans), pointRanges(pointRanges),
             pointValueCount(pointValueCount), estimatedCost(estimatedCost),
             matchState(matchState), allMatch(allMatch) {
+        useZoneMap = false;
+        if (points != nullptr) return;
         int64_t prunableValues = 0;
         for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
           if (plans[(size_t)blockNum].relation != BlockRelation::CROSSES) {
@@ -1277,6 +1312,16 @@ public:
           BulkUse use, const BulkScorerContext& bulkContext) override {
         unused(use);
         if (bulkContext.requireConstantCount) {
+          auto shortcut = weight.countShortcut(segment, nullptr);
+          if (shortcut.how == CountHow::METADATA) {
+            return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+                    BulkAnswer::NO, nullptr, shortcut.maxMatches};
+          }
+          if (shortcut.how == CountHow::SUPPLIER) {
+            assert(points != nullptr && !reader.multiValued());
+            return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+                    BulkAnswer::NO, nullptr, (int64_t)pointValueCount};
+          }
           if (segment.liveDocs() != nullptr) {
             return {
               BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
@@ -1349,21 +1394,18 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {
       unused(executionMode);
-      SegFieldInfo* segInfo = nullptr;
-      if (!segmentInfo(segment, segInfo)) return nullptr;
+      if (query.getHi() < query.getLo()) return nullptr;
+      const auto* segInfo = segmentInfo(segment);
+      if (!segInfo) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
       if (reader->numValues() == 0) return nullptr;
       int64_t colMin = reader->getMin();
       int64_t colMax = reader->getMax();
       if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;
 
-      auto plans = targetPool.make_span<BlockPlan>((size_t)reader->numBlocks());
-      for (int64_t i = 0; i < reader->numBlocks(); i++) {
-        plans[(size_t)i] = query.classifyBlock(
-            reader->blockInfo(i), reader->blockZone(i));
-      }
+      std::span<BlockPlan> plans;
       bool allMatch = query.covers(colMin, colMax);
-      int64_t cost = estimateCost(*reader, plans, query.isExactSet());
+      int64_t cost = 0;
       PointsReader* points = nullptr;
       std::span<const PointsReader::OrdinalRange> pointRanges;
       uint64_t pointValueCount = 0;
@@ -1388,6 +1430,11 @@ public:
         matchState = pointValueCount == 0
             ? Query::MatchState::EMPTY : Query::MatchState::NONEMPTY;
       } else {
+        plans = targetPool.make_span<BlockPlan>((size_t)reader->numBlocks());
+        for (int64_t i = 0; i < reader->numBlocks(); i++) {
+          plans[(size_t)i] = query.classifyBlock(reader->blockInfo(i), reader->blockZone(i));
+        }
+        cost = estimateCost(*reader, plans, query.isExactSet());
         bool hasInside = false;
         bool hasCrosses = false;
         for (const BlockPlan& plan : plans) {
@@ -1431,8 +1478,8 @@ public:
     // Test/benchmark baseline: the exact pre-change full block-decode scan.
     Query::Scorer* createFullScanScorerForTests(MemPool& targetPool,
                                                 IndexReader::Segment& segment) {
-      SegFieldInfo* segInfo = nullptr;
-      if (!segmentInfo(segment, segInfo)) return nullptr;
+      const auto* segInfo = segmentInfo(segment);
+      if (!segInfo) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
       if (reader->numValues() == 0) return nullptr;
       int64_t colMin = reader->getMin();
@@ -1445,8 +1492,8 @@ public:
 
     Query::Scorer* createZoneMapScorerForTests(MemPool& targetPool,
                                                IndexReader::Segment& segment) {
-      SegFieldInfo* segInfo = nullptr;
-      if (!segmentInfo(segment, segInfo)) return nullptr;
+      const auto* segInfo = segmentInfo(segment);
+      if (!segInfo) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
       if (reader->numValues() == 0) return nullptr;
       if (reader->getMax() < query.getLo() || query.getHi() < reader->getMin()) {

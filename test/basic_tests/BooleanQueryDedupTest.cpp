@@ -13,6 +13,7 @@
 #include "gtest/gtest.h"
 #include "test/LuxirTest.h"
 #include "test/TestIndex.h"
+#include "test/TestUtils.h"
 #include "luxir/query/AllQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
@@ -68,7 +69,7 @@ protected:
     int64_t count = 0;
     auto segments = context.topReader.segments();
     for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
-      int64_t segCount = weight->count(segments[segnum]);
+      int64_t segCount = countForTests(weight, segments[segnum]);
       if (segCount < 0) return -1;
       count += segCount;
     }
