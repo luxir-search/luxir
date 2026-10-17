@@ -37,7 +37,8 @@ If a local collection cannot be opened at startup, the follower keeps its files
 and reports it unavailable. A later verified install can replace it. Until then,
 the unreadable copy is treated as populated for the empty-replacement rule.
 With `--store.verify-on-open=full` a local file whose bytes no longer match its
-manifest digest also makes the copy unreadable; the next install keeps the
+manifest digest also makes the copy unreadable, and a background scrub that
+finds one does the same while the follower runs; the next install keeps the
 files that still verify and fetches only the damaged ones. See
 [file integrity checks](operations.md#file-integrity-checks).
 

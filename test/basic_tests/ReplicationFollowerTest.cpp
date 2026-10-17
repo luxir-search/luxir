@@ -6,6 +6,7 @@
 #include "test/HttpReq.h"
 #include "test/SchemaBuilder.h"
 #include "luxir/server/HttpServer.h"
+#include "luxir/server/Scrubber.h"
 #include "luxir/server/ReplicationFollower.h"
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/server/CommitWaits.h"
@@ -116,8 +117,11 @@ protected:
     return command({"luxir", "--server.http.port", std::to_string(sourcePort),
         "--server.grpc.port", std::to_string(sourcePort), "pull", url, followerConfig.store.data_dir});
   }
-  std::pair<int, std::string> promote(std::string dir = {}) {
-    return command({"luxir", "promote", dir.empty() ? followerConfig.store.data_dir : dir});
+  std::pair<int, std::string> promote(std::string dir = {}, std::vector<std::string> options = {}) {
+    std::vector<std::string> args{"luxir"};
+    args.insert(args.end(), options.begin(), options.end());
+    args.insert(args.end(), {"promote", dir.empty() ? followerConfig.store.data_dir : dir});
+    return command(std::move(args));
   }
   std::filesystem::path makeLocalUnreadable() {
     auto id = follower->getCollection("main")->getShard()->getSnapshots().snapshot()->id;
@@ -1686,7 +1690,8 @@ TEST_F(ReplicationFollowerTest, corruptPeerCopiesAreFetchedAgainFromTheSource) {
 }
 
 // Full verification at startup refuses a damaged local copy, the follower
-// fetches the file again, and promotion never links a damaged file.
+// fetches the file again, and promotion under the same policy refuses to link
+// a damaged file.
 TEST_F(ReplicationFollowerTest, corruptLocalFilesAreRefetchedAndNeverPromoted) {
   startSource(); startFollower();
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success); }
@@ -1717,9 +1722,50 @@ TEST_F(ReplicationFollowerTest, corruptLocalFilesAreRefetchedAndNeverPromoted) {
   EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
   stopFollower(); stopSource();
   flip();
-  auto [code, output] = promote();
+  auto [code, output] = promote({}, {"--store.verify-on-open", "full"});
   EXPECT_NE(0, code);
   EXPECT_NE(std::string::npos, output.find("checksum mismatch: " + largest.name)) << output;
+}
+
+// A scrub hit on a follower repairs the copy in place: the collection is
+// unavailable until the next sync re-verifies the local files, fetches only
+// the damaged one and installs the same incarnation again.
+TEST_F(ReplicationFollowerTest, scrubHitIsRepairedByTheNextSync) {
+  followerConfig.store.scrub_max_bytes_per_sec = 0;
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto installed = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+  auto largest = *std::ranges::max_element(installed->files, {}, &FileDescriptor::size);
+  auto dir = path / "follower" / "t" / "t0" / "main" / installed->id.incarnation;
+  {
+    std::fstream file(dir / largest.name, std::ios::in | std::ios::out | std::ios::binary);
+    char byte = 0;
+    file.read(&byte, 1); file.seekp(0); byte = (char)~byte; file.write(&byte, 1);
+  }
+  std::atomic<int> downloads{0};
+  std::vector<std::string> names;
+  std::mutex namesMutex;
+  Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    std::lock_guard lock(namesMutex);
+    names.push_back(((FileDescriptor*)descriptor)->name); downloads++;
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("replicationDownloadStart"); });
+  EXPECT_EQ(1u, follower->getScrubber().scrub());
+  EXPECT_TRUE(until([&] {
+    try { return follower->getCollection("main")->getShard() != nullptr; }
+    catch (const CollectionUnavailableError&) { return false; }
+  }));
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+  EXPECT_EQ(1, downloads.load());
+  { std::lock_guard lock(namesMutex); EXPECT_EQ(std::vector<std::string>{largest.name}, names); }
+  EXPECT_TRUE(std::ranges::none_of(std::filesystem::directory_iterator(dir), [](const auto& entry) {
+    return entry.path().filename().string().starts_with("corrupted_");
+  }));
+  // Repaired, so a second pass finds nothing.
+  EXPECT_EQ(0u, follower->getScrubber().scrub());
 }
 
 // A replica reopens each installed snapshot from the reader it serves: an

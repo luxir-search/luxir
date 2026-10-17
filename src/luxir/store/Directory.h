@@ -3,13 +3,17 @@
 
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <map>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <vector>
 #include <string_view>
 #include <gtl/btree.hpp>
+#define XXH_STATIC_LINKING_ONLY
+#include <xxhash.h>
 #include "luxir/util/ApiError.h"
 #include "luxir/util/log.h"
 #include "OutputStream.h"
@@ -28,6 +32,21 @@ class ReadOnlyError : public ApiError {
 public:
   explicit ReadOnlyError(const std::string& message)
     : ApiError(ErrorKind::FAILED_PRECONDITION, "read_only", message) {}
+};
+
+// Size and xxh3 of a file's bytes, as a manifest FileDescriptor records them.
+struct FileCheck {
+  uint64_t size = 0;
+  uint64_t xxh3 = 0;
+  bool matches(const FileDescriptor& expected) const { return size == expected.size && xxh3 == expected.xxh3; }
+};
+
+// One file open for a sequential checksum pass; see Directory::openChecksum.
+class ChecksumReader {
+public:
+  virtual ~ChecksumReader() = default;
+  virtual uint64_t size() const = 0;
+  virtual FileCheck checksum(const std::function<void(size_t)>& progress = {}) = 0;
 };
 
 // Implementations of Directory are thread safe.
@@ -116,13 +135,43 @@ public:
   virtual void linkFile(Directory& source, std::string_view name) = 0;
 
   // Only descriptors from a published snapshot authorize reuse; filenames alone
-  // are not identities across collection incarnations. Each linked file is
-  // hashed against its descriptor before it counts as reused: a copy whose
-  // bytes no longer match is unlinked again and described in `corrupt`, so the
-  // caller fetches it elsewhere or fails. Defined in FileVerifier.cpp.
+  // are not identities across collection incarnations. A hard link cannot
+  // change bytes, so this compares descriptors only: whether the source bytes
+  // still match them is the at-rest question verify-on-open and the scrub ask.
   std::vector<FileDescriptor> reuseFiles(Directory& source, std::span<const FileDescriptor> available,
-                                        std::span<const FileDescriptor> wanted,
-                                        std::vector<std::string>* corrupt = nullptr);
+                                        std::span<const FileDescriptor> wanted) {
+    std::map<std::string_view, const FileDescriptor*> byName;
+    for (const auto& file : available) byName.emplace(file.name, &file);
+    std::vector<FileDescriptor> reused;
+    for (const auto& file : wanted) {
+      auto it = byName.find(file.name);
+      if (it == byName.end() || *it->second != file) continue;
+      // An existing (even unreadable) candidate must be verified by its caller.
+      bool present = true;
+      try { present = openFile(file.name) != nullptr; } catch (const std::exception&) {}
+      if (present) continue;
+      linkFile(source, file.name);
+      reused.push_back(file);
+    }
+    return reused;
+  }
+
+  // A file opened for one sequential checksum, apart from the mmap read path:
+  // no page faults on the request threads' address space, no SIGBUS on a bad
+  // sector, and the handle keeps the bytes readable after the name is
+  // unlinked. Null when the file does not exist. With `direct` an FS backend
+  // reads the media rather than the page cache where the filesystem allows.
+  virtual std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) = 0;
+
+  // Size and xxh3 of the file's bytes, or nullopt when it does not exist.
+  // `progress` runs after each chunk with its byte count; it may sleep to pace
+  // the read or throw to abandon it.
+  std::optional<FileCheck> checksum(std::string_view name, const std::function<void(size_t)>& progress = {},
+                                    bool direct = false) {
+    auto reader = openChecksum(name, direct);
+    if (!reader) return std::nullopt;
+    return reader->checksum(progress);
+  }
   virtual ~Directory() = default;
 };
 
@@ -170,6 +219,32 @@ public:
       DIR_DEBUG("DIR openFile: file {} not found", name);
       return {};
     }
+  }
+
+  std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
+    unused(direct);
+    auto file = openFile(name);
+    if (!file) return {};
+    // Hashes the shared buffer; the handle keeps it alive after a delete.
+    class RAMChecksumReader : public ChecksumReader {
+      std::shared_ptr<InputFile> file;
+    public:
+      explicit RAMChecksumReader(std::shared_ptr<InputFile> file) : file(std::move(file)) {}
+      uint64_t size() const override { return file->size(); }
+      FileCheck checksum(const std::function<void(size_t)>& progress) override {
+        auto data = file->read();
+        XXH3_state_t state;
+        XXH3_64bits_reset(&state);
+        constexpr size_t kChunk = 1 << 20;
+        for (size_t offset = 0; offset < data.size(); offset += kChunk) {
+          size_t length = std::min(kChunk, data.size() - offset);
+          XXH3_64bits_update(&state, data.data() + offset, length);
+          if (progress) progress(length);
+        }
+        return {(uint64_t)data.size(), XXH3_64bits_digest(&state)};
+      }
+    };
+    return std::make_shared<RAMChecksumReader>(std::move(file));
   }
 
   bool deleteFile(const std::string_view name) override {

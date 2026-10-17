@@ -80,6 +80,7 @@ private:
   void unlinkFiles(std::span<const std::string> names) noexcept;
   void notifyChange() noexcept;
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
+  void requireHeld(const FileDescriptor& descriptor);
 public:
   explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now)
       : now(std::move(now)), dir(dir), readers(dir, config) {}
@@ -97,8 +98,10 @@ public:
   void commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened);
   std::shared_ptr<const CommitSnapshot> snapshot() const { return readers.snapshot(); }
   // Publishes the newest valid local root. With `verify`, every file it lists
-  // is first checked against its manifest size and xxh3 (ChecksumMismatchError).
-  void openLocalSnapshot(bool verify = false);
+  // is first checked against its manifest size and xxh3 (ChecksumMismatchError),
+  // except those `verified` already records; a root that moves meanwhile (a
+  // writer sharing the directory) costs only its new files.
+  void openLocalSnapshot(bool verify = false, std::map<std::string, FileDescriptor>* verified = nullptr);
   void sweepOrphans(const Manifest& manifest);
   void sweepOrphans();
   static std::vector<std::string> obsoleteFiles(const CommitSnapshot& previous,
@@ -111,6 +114,9 @@ public:
   // A file by identity (name, size and digest) from the current or any pinned
   // snapshot, without pinning: peers serve verified copies this way.
   std::shared_ptr<InputFile> openFile(const FileDescriptor& descriptor);
+  // As openFile(descriptor), for a checksum pass (the scrub): the handle
+  // outlives a retirement, so a file retired mid-pass still hashes.
+  std::shared_ptr<ChecksumReader> openChecksum(const FileDescriptor& descriptor, bool direct);
   bool touch(const CommitId& id, uint64_t bytes);
   // Storage pressure skips current snapshots and open transfers. Retention
   // budget eviction can still revoke any pin to enforce its bound.

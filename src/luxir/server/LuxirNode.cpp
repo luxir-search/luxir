@@ -110,7 +110,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
     collections_->open(this->config.read_only ? Collections::Role::READ_ONLY : Collections::Role::WRITER);
   }
   searchEngine = std::make_unique<SearchEngine>(*this);
-  scrubber = std::make_unique<Scrubber>(*collections_, this->config.store);
+  scrubber = std::make_unique<Scrubber>(*this);
   if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
 }

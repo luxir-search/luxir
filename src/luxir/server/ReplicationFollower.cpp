@@ -239,6 +239,7 @@ struct ReplicationFollower::Impl {
     // The local copy could not be opened; CURRENT, if it could be read, selects
     // this incarnation ("" otherwise). It is retained until an install replaces it.
     std::optional<std::string> unreadable;
+    std::string corrupt; // the serving copy failed a scrub: unload and re-stage it
     uint64_t advertisedDigest = 0; // manifest digest announced with `advertised`
     unsigned failures = 0;
     uint64_t progress = 0;
@@ -370,6 +371,27 @@ struct ReplicationFollower::Impl {
     auto& state = states[name];
     state.serving.reset(); state.acknowledged.reset(); state.unreadable.reset();
     state.verified.clear(); state.targetIncarnation.clear(); state.remove = false;
+  }
+
+  // The serving copy failed a scrub. From here it is an unreadable local copy
+  // of its incarnation, which the next sync repairs in place: every local
+  // file is hashed, the damaged ones are fetched again, and the copy is
+  // installed over the placeholder.
+  void unloadCorrupt(const CollectionId& name, const std::string& reason) {
+    auto active = node.collections().get(name);
+    auto shard = active ? active->getShard() : nullptr;
+    if (shard) {
+      auto snapshot = shard->getSnapshots().snapshot();
+      node.collections().unload(name, active, reason);
+      std::lock_guard lock(mutex);
+      auto& state = states[name];
+      state.unreadable = snapshot ? snapshot->id.incarnation : "";
+      state.serving.reset(); state.acknowledged.reset();
+      state.verified.clear(); state.targetIncarnation.clear();
+      state.error = reason;
+    }
+    std::lock_guard lock(mutex);
+    states[name].corrupt.clear();
   }
 
   api::ReplicationCatalog fetchCatalog(Client& client, const std::string& cursor, std::chrono::milliseconds timeout, std::pmr::memory_resource& arena) {
@@ -628,14 +650,13 @@ struct ReplicationFollower::Impl {
         // After process restart only these candidates need to be hashed. An
         // unreadable unpublished file is downloaded again and replaced; a
         // serving file must stay readable.
-        std::shared_ptr<InputFile> local;
-        try { local = dir.openFile(file.name); }
+        std::optional<FileCheck> local;
+        try { local = dir.checksum(file.name); }
         catch (const FileIOException&) {
           if (durableNames.contains(file.name)) throw;
         }
         if (local) {
-          auto data = local->read();
-          reuse = data.size() == file.size && XXH3_64bits(data.data(), data.size()) == file.xxh3;
+          reuse = local->matches(file);
           if (!reuse && previous) {
             for (const auto& live : previous->files) if (live.name == file.name) throw std::runtime_error("source changed immutable file: " + file.name);
           }
@@ -763,7 +784,7 @@ struct ReplicationFollower::Impl {
           State* selected = nullptr;
           for (auto& [key, state] : states) {
             if (!includes(key)) continue;
-            bool work = state.remove || (state.advertised && ((state.advertised != state.serving && !state.waiting)
+            bool work = state.remove || !state.corrupt.empty() || (state.advertised && ((state.advertised != state.serving && !state.waiting)
                     || state.needsAck()));
             if (!state.busy && !state.unavailable && work && node.now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
               name = key; selected = &state;
@@ -784,10 +805,16 @@ struct ReplicationFollower::Impl {
       std::string error;
       try {
         bool remove, needsSync;
+        std::string corrupt;
         std::optional<CommitId> serving;
         {
           std::lock_guard lock(mutex);
-          auto& state = states[name]; remove = state.remove;
+          auto& state = states[name]; remove = state.remove; corrupt = state.corrupt;
+        }
+        if (!corrupt.empty()) unloadCorrupt(name, corrupt);
+        {
+          std::lock_guard lock(mutex);
+          auto& state = states[name];
           needsSync = state.advertised && state.advertised != state.serving && !state.waiting;
         }
         if (remove) eraseLocal(name);
@@ -874,6 +901,15 @@ void ReplicationFollower::deleteOrphan(const CollectionId& key) {
     if (!impl->includes(key) || !impl->states[key].advertised) impl->states.erase(key);
   }
   impl->persistState();
+  impl->changed.notify_all();
+}
+void ReplicationFollower::repair(const CollectionId& id, const std::string& reason) {
+  {
+    std::lock_guard lock(impl->mutex);
+    auto it = impl->states.find(id);
+    if (it == impl->states.end()) return;
+    it->second.corrupt = reason;
+  }
   impl->changed.notify_all();
 }
 void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_resource& arena) {

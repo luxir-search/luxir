@@ -12,11 +12,12 @@
 namespace luxir {
 
 // Copies a snapshot of incarnation `from` into a fresh incarnation, linking its
-// immutable files (each checked against its manifest size and xxh3; a mismatch
-// throws ChecksumMismatchError) and writing a durable root under the new identity at a
-// generation above any root `from` held. Returns the new incarnation; CURRENT
-// is unchanged. Promotion and recovery both start a new identity this way.
-std::string copySnapshot(CollectionStorage& storage, std::string_view from, const Manifest& manifest);
+// immutable files and writing a durable root under the new identity at a
+// generation above any root `from` held. With `verify` every linked file is
+// read and checked against its manifest size and xxh3 first (a mismatch throws
+// ChecksumMismatchError). Returns the new incarnation; CURRENT is unchanged.
+// Promotion and recovery both start a new identity this way.
+std::string copySnapshot(CollectionStorage& storage, std::string_view from, const Manifest& manifest, bool verify = false);
 
 // Offline promotion of a follower data directory to an independent writer:
 // every selected collection gets a new identity. Resumable: each target is
@@ -24,7 +25,8 @@ std::string copySnapshot(CollectionStorage& storage, std::string_view from, cons
 // target is reused only if its newest root and every file it references are
 // present. The binding is removed only when every collection succeeded, and a
 // writer refuses to start while it exists. Prints one line per collection and a
-// summary; returns false on any failure.
-bool promote(const std::filesystem::path& dataDir, std::ostream& output);
+// summary; returns false on any failure. `verify` is store.verify-on-open=full:
+// the linked files are read and checked, and a damaged one fails its collection.
+bool promote(const std::filesystem::path& dataDir, std::ostream& output, bool verify = false);
 
 }

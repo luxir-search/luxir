@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -51,6 +52,87 @@ public:
 
   InputStream getInputStream() override {
     return {data_, data_ + sz_};
+  }
+};
+
+
+/// Sequential checksum of a file through its own descriptor: pread in 1 MiB
+/// chunks, never the mmap path (see Directory::openChecksum). The fd keeps
+/// the inode readable after an unlink. With O_DIRECT the chunks come from the
+/// media and leave the page cache alone; a filesystem that refuses it (tmpfs)
+/// or a read it rejects falls back to buffered reads of the same fd offset.
+class FSChecksumReader : public ChecksumReader {
+  std::filesystem::path path;
+  int fd;
+  uint64_t size_;
+  bool direct;
+
+  static constexpr size_t kChunk = 1 << 20;
+  static constexpr size_t kAlignment = 4096; // covers every common logical block size
+
+  static int openPath(const std::filesystem::path& path, bool direct) {
+    int fd = ::open(path.c_str(), O_RDONLY | (direct ? O_DIRECT : 0));
+    if (fd < 0 && direct && errno == EINVAL) fd = ::open(path.c_str(), O_RDONLY);
+    return fd;
+  }
+  void reopenBuffered() {
+    int buffered = ::open(path.c_str(), O_RDONLY);
+    if (buffered < 0) throw FileIOException("FSChecksumReader: reopen failed for " + path.string() + ": " + strerror(errno));
+    ::close(fd);
+    fd = buffered;
+    direct = false;
+  }
+
+public:
+  // Null when the file does not exist.
+  static std::shared_ptr<FSChecksumReader> open(const std::filesystem::path& path, bool direct) {
+    int fd = openPath(path, direct);
+    if (fd < 0) {
+      if (errno == ENOENT) return {};
+      throw FileIOException("FSChecksumReader: open failed for " + path.string() + ": " + strerror(errno));
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+      int error = errno;
+      ::close(fd);
+      throw FileIOException("FSChecksumReader: fstat failed for " + path.string() + ": " + strerror(error));
+    }
+    // fcntl tells whether the direct open stuck (the fallback above cleared it).
+    int flags = fcntl(fd, F_GETFL);
+    return std::shared_ptr<FSChecksumReader>(new FSChecksumReader(path, fd, (uint64_t)st.st_size, flags >= 0 && (flags & O_DIRECT)));
+  }
+  FSChecksumReader(std::filesystem::path path, int fd, uint64_t size, bool direct)
+      : path(std::move(path)), fd(fd), size_(size), direct(direct) {}
+  ~FSChecksumReader() override { ::close(fd); }
+  FSChecksumReader(const FSChecksumReader&) = delete;
+  FSChecksumReader& operator=(const FSChecksumReader&) = delete;
+
+  uint64_t size() const override { return size_; }
+  bool isDirect() const { return direct; }
+
+  FileCheck checksum(const std::function<void(size_t)>& progress) override {
+    void* raw = nullptr;
+    if (posix_memalign(&raw, kAlignment, kChunk) != 0) throw std::bad_alloc();
+    std::unique_ptr<void, decltype(&std::free)> buffer(raw, &std::free);
+    auto* data = (char*)raw;
+    XXH3_state_t state;
+    XXH3_64bits_reset(&state);
+    uint64_t total = 0;
+    // Reads past the recorded size too: a file that grew hashes to a mismatch
+    // instead of silently verifying its first bytes.
+    for (;;) {
+      auto n = ::pread(fd, data, kChunk, (off_t)total);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        if (direct && errno == EINVAL) { reopenBuffered(); continue; }
+        throw FileIOException("FSChecksumReader: read failed for " + path.string() + ": " + strerror(errno));
+      }
+      if (n == 0) break;
+      XXH3_64bits_update(&state, data, (size_t)n);
+      total += (uint64_t)n;
+      if (progress) progress((size_t)n);
+    }
+    return {total, XXH3_64bits_digest(&state)};
   }
 };
 
@@ -406,6 +488,10 @@ public:
       munmap(mapped, sz);
       throw;
     }
+  }
+
+  std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
+    return FSChecksumReader::open(filePath(name), direct);
   }
 
   std::unique_ptr<File> createFile(std::string_view name) override {

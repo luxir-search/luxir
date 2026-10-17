@@ -30,6 +30,10 @@ public:
   void start();
   void stop();
   void deleteOrphan(const CollectionId& id);
+  // A scrub found a file of the serving copy damaged (Collections::fail with
+  // `reason`): a worker unloads the copy and stages the same incarnation
+  // again, which re-verifies every local file and fetches the damaged ones.
+  void repair(const CollectionId& id, const std::string& reason);
   void stats(api::ReplicationStatus& out, std::pmr::memory_resource& arena);
 };
 }

@@ -9,18 +9,18 @@
 
 namespace luxir {
 
-std::string copySnapshot(CollectionStorage& storage, std::string_view from, const Manifest& manifest) {
+std::string copySnapshot(CollectionStorage& storage, std::string_view from, const Manifest& manifest, bool verify) {
   auto old = storage.open(from);
   auto incarnation = CommitId::newIncarnation();
   auto next = storage.create(incarnation);
   std::pmr::monotonic_buffer_resource arena;
   auto info = Manifest::decode(manifest.bytes, arena);
   auto files = filesOf(info);
-  // Every file is hashed as it is linked: a promoted writer must never build
-  // on bytes that differ from what the follower verified when it installed them.
-  std::vector<std::string> corrupt;
-  next->reuseFiles(*old, files, files, &corrupt);
-  if (!corrupt.empty()) throw ChecksumMismatchError(corrupt.front());
+  next->reuseFiles(*old, files, files);
+  // Under verify-on-open=full the linked files are read once, here, before
+  // a writer builds on them. A mismatch names the file; the follower-bound
+  // directory keeps the damaged copy for a repair.
+  if (verify) verifyFiles(*next, files);
   // The new root may reference only files that are present in full.
   std::vector<Directory::FileInfo> listing;
   next->listFiles(listing);
@@ -61,7 +61,7 @@ bool validTarget(CollectionStorage& storage, const std::string& incarnation) {
 }
 }
 
-bool promote(const std::filesystem::path& dataDir, std::ostream& output) {
+bool promote(const std::filesystem::path& dataDir, std::ostream& output, bool verify) {
   if (!std::filesystem::exists(dataDir / "replication.json")) {
     output << "Promote failed: " << dataDir.string() << " is not a follower data directory\n";
     return false;
@@ -79,7 +79,7 @@ bool promote(const std::filesystem::path& dataDir, std::ostream& output) {
       if (!promoted.empty() && !validTarget(storage, promoted)) promoted.clear();
       if (promoted.empty()) {
         Signal::emit("replicationPromotingCollection", (void*)&id.name);
-        promoted = copySnapshot(storage, *selected, Manifest::load(*storage.open(*selected)));
+        promoted = copySnapshot(storage, *selected, Manifest::load(*storage.open(*selected)), verify);
         state.write(metadata);
       }
       // Re-select even if CURRENT already names the target: an earlier attempt

@@ -411,32 +411,48 @@ detected when the affected reader is opened, or earlier with the
 ## File integrity checks
 
 Every committed manifest records each file it references with its size and
-xxh3-64 digest, computed while the file is written. Three checks use them:
+xxh3-64 digest, computed while the file is written. Checks read a file with
+its own descriptor (never through the mapping queries use), so a bad sector
+fails the check instead of the process, and a check never touches the request
+threads' address space.
 
-- **Transfers and copies** always verify. A replicated file is hashed while it
-  streams in and is installed only if it matches; a local file reused across
-  incarnations (a repointed follower, `luxir promote`, or writer recovery from
-  an older root) is hashed when it is linked. A follower fetches a mismatching
-  file again; promotion fails for that collection and names the file.
-- **`--store.verify-on-open=full`** reads every file of each collection's
-  committed snapshot at startup, on up to 8 threads per collection, before the
-  collection serves. The default, `none`, trusts the manifest footer and file
-  sizes. A mismatching, missing or unreadable file fails only that collection:
-  it loads as unavailable (HTTP `503`, code `collection_unavailable`) with an
-  error naming the file and its expected and actual size and digest, and its
-  data is kept. A follower then fetches the damaged files from its source.
-  Startup reads the whole index, so expect it to take as long as reading the
-  data directory once.
+- **Transfers** always verify: a replicated file is hashed while it streams in
+  and is installed only if it matches, and a follower hashes a leftover local
+  candidate before reusing it. Reuse by hard link (a repointed follower,
+  `luxir promote`, writer recovery from an older root) compares manifest
+  descriptors only; whether the linked bytes still match is the at-rest
+  question the checks below answer.
+- **`--store.verify-on-open=full`** reads every file of every collection's
+  committed snapshot at startup, in one pool on the node's indexing threads,
+  before any collection serves. The default, `none`, trusts the manifest footer
+  and file sizes. A mismatching, missing or unreadable file fails only that
+  collection: it loads as unavailable (HTTP `503`, code `collection_unavailable`)
+  with an error naming the file (`checksum mismatch: <file>: expected size=..
+  xxh3=.., actual ..`, `missing file: <file>` or `unreadable file: <file>: ..`),
+  and its data is kept. A follower then fetches the damaged files from its
+  source. `luxir promote --store.verify-on-open=full` checks the files it links
+  the same way. Startup reads the whole index, so expect it to take as long as
+  reading the data directory once.
 - **`--store.scrub-interval-s=N`** (default `0`, off) re-reads the files of
-  every published snapshot every `N` seconds on one low-priority thread,
-  paced to `--store.scrub-max-bytes-per-sec` (default `64MB`, `0` for
-  unthrottled). A mismatch is logged at error level and makes the collection
-  unavailable with the same error until the node restarts; repair it by
-  restoring from a follower (`luxir pull` and `luxir promote`), or on a
-  follower by restarting with `--store.verify-on-open=full`. `GET /_stats`
-  reports node-wide `scrub` counters (`passes`, `files`, `bytes`,
-  `mismatches`, `last_pass_end` in Unix milliseconds) while scrubbing is
-  enabled.
+  every published snapshot every `N` seconds on one thread, with `O_DIRECT`
+  where the filesystem allows so the pass reads the media and leaves the page
+  cache to queries, paced to `--store.scrub-max-bytes-per-sec` (default
+  `64MB`, `0` for unthrottled; the rate is the throttle, the thread's low CPU
+  priority only yields the CPU). A mismatch is logged at error level and fails
+  the collection: it is unavailable with the same error, a writer publishes
+  nothing more over the damaged bytes (no further update, commit or merge), and
+  the suspect file is recorded in a `corrupted_<id>` marker in the incarnation
+  directory. `GET /_stats` reports node-wide `scrub` counters (`passes`,
+  `files`, `bytes`, `mismatches`, `last_pass_end` in Unix milliseconds) while
+  scrubbing is enabled.
+
+A marker survives restarts: at startup the files it names are re-verified
+whatever `--store.verify-on-open` says, the collection stays unavailable while
+one still fails, and the marker is removed once they pass. A follower repairs a
+scrub hit by itself: the next sync re-verifies its local files, fetches only
+the damaged ones and installs the copy again. Repair a writer by restoring from
+a follower (`luxir pull` and `luxir promote`) or by replacing the damaged file
+from a backup and restarting.
 
 ## Current production boundary
 

@@ -122,8 +122,13 @@ private:
   std::map<std::string, std::map<std::string, std::shared_ptr<Collection>, std::less<>>, std::less<>> listing;
 
   std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
-  std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected);
+  // `verified`: files of the selected incarnation already checked at startup.
+  std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected,
+                                             std::map<std::string, FileDescriptor>* verified);
   std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {});
+  // A writer whose newest root is invalid continues from the newest valid one
+  // under a new incarnation. Returns the incarnation to open.
+  std::string recoverWriter(const CollectionId& id, CollectionStorage& storage, const std::string& selected);
   void observe(const CollectionId& id, Collection& collection);
   // Lists and announces a registration, or a removal.
   void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection);
@@ -182,6 +187,17 @@ public:
   void retainSelected(const CollectionId& id) noexcept;
   // Registers an unavailable placeholder unless something is already registered.
   std::shared_ptr<Collection> unavailable(const CollectionId& id, std::string reason);
+
+  // A check found `suspects` of the registered `collection` damaged: the
+  // collection fails with `reason` (Collection::fail), the names are recorded
+  // in its incarnation directory so a restart re-verifies them before serving
+  // (CorruptionMarker), and the change is announced.
+  void fail(const CollectionId& id, const std::shared_ptr<Collection>& collection, const std::string& reason,
+            std::span<const std::string> suspects);
+  // Replaces the registered `expected` with an unavailable placeholder and
+  // retains its incarnation, as a failed load does: a follower then repairs
+  // it in place by staging the same incarnation again.
+  void unload(const CollectionId& id, const std::shared_ptr<Collection>& expected, std::string reason);
 };
 
 }
