@@ -7,8 +7,65 @@ knobs, scoring, recall) is in
 
 The stored vector column is the source of truth; ANN indexes are derived,
 per-segment aux overlays behind an engine seam. Exact flat KNN, cosine
-raw-column normalization, full-precision rescoring, and creation of missing
+raw-column normalization, candidate rescoring, and creation of missing
 overlays all read or regenerate from the column.
+
+## Column Encoding
+
+A vector field's column stores one fixed-size value per vector in the field's
+`encoding`: `f32` (4 bytes per dimension), `f16` (2), or `int8` (8 + dims
+bytes per vector). The encoding is recorded in each segment's field metadata
+rather than read from the schema, so a schema change never reinterprets an
+existing segment, and the column stays a plain fixed-size binary column
+(`dims` is derived from the value size and the encoding).
+
+`int8` follows the per-vector scaling of LVQ (Aguerrebere et al., "Similarity
+search in the blink of an eye with compressed indices", VLDB 2023,
+arXiv:2304.04759): each value is `offset, scale, codes[dims]` with
+`x[i] ~= offset + scale * code[i]`, where offset is the vector's minimum and
+scale is its range over 255. LVQ also centers the data on a dataset mean
+before quantizing; Luxir does not, because any shared statistic would tie a
+stored value to the segment it was written in. With purely per-vector
+parameters:
+
+- Each value is self-describing. Merges copy the encoded bytes verbatim, and
+  never re-quantize already-quantized data.
+- No per-segment or per-dimension statistics exist, so nothing has to be
+  recomputed or reconciled when immutable segments merge, and a vector's
+  bytes do not change when its neighbors are deleted.
+- Quantization error is bounded by each vector's own range: half a step,
+  `(max - min) / 510`, per element.
+
+A merge of inputs with different encodings (a schema change between them)
+writes the most precise input encoding and transcodes only the less precise
+inputs, so a merge never loses precision; same-encoding merges are pure byte
+copies.
+
+Exact scoring means exact over the stored encoding. `VectorScorer` is the
+single place a float query is scored against a stored row, used by the flat
+column engine and the terminal candidate rescore. `int8` rows are scored
+without decoding to a float buffer, using per-query `sum(q)` and `|q|^2`:
+
+```text
+q.x   = offset * sum(q) + scale * sum(q[i] * code[i])
+|x|^2 = dims * offset^2 + 2 * offset * scale * sum(code) + scale^2 * sum(code^2)
+|q-x|^2 = |q|^2 - 2 q.x + |x|^2
+```
+
+The integer sums come out of the same pass. Cosine over `f16` and `int8`
+always divides by the stored vector's norm (also from the same pass), since a
+quantized unit vector is not exactly unit length. The scoring loops are
+scalar today; SIMD kernels and a per-vector norm sidecar can replace them
+behind `VectorScorer` without changing the format contract.
+
+`keep_original` writes the submitted float32 vectors, before cosine
+normalization, to a companion column named `<field>__#orig` (an invalid
+variant label, so schema lookups and field discovery never resolve it). It is
+written in lockstep with the encoded column and merged like any column, so the
+two stay aligned rank for rank. The query path never reads it. Readers use it
+only when its value and document counts equal the encoded column's: enabling
+`keep_original` on an existing field leaves older segments without it, and a
+merge that mixes them produces a partial companion, which is ignored.
 
 ## Overlay Lifecycle
 
@@ -53,8 +110,11 @@ can use FAISS for large segments and exact column scan for small segments.
 
 The IVF+PQ training set is a strided sample across the segment's vector
 values, not a prefix sample. This avoids training only on the oldest values
-when data inside a segment is time ordered. The builder normalizes vectors for
-FAISS when the field uses cosine and the stored column is raw.
+when data inside a segment is time ordered. The builder reads the
+`keep_original` column when it is present and aligned, else decodes the
+encoded column, and normalizes vectors for FAISS when the field uses cosine
+and its input is raw (a raw column, the original column, or a quantized
+column).
 
 ## Memory-Mapped Index Layout
 
@@ -124,8 +184,8 @@ round's result heap is spent entirely on new candidates and each round
 requests only the projected shortfall rather than re-requesting the whole
 pool. The shared per-segment liveness cache itself is never modified by
 queries. Once widening finishes, the final candidate pool is rescanned from
-the full-precision column, sorted by exact score, and collapsed to one hit per
-document.
+the stored column (exact over its encoding), sorted by exact score, and
+collapsed to one hit per document.
 
 ## Parallel Execution
 
@@ -133,7 +193,7 @@ A single query's scan and rescore run in parallel when the request executes in
 parallel mode. The selected IVF lists are split into contiguous per-segment
 chunks sized by their actual vector counts, and each chunk (plus each
 column-scanned segment) is scanned as an independent task; the terminal
-full-precision rescore runs one task per segment whose candidate bucket
+column rescore runs one task per segment whose candidate bucket
 exceeds a small grain (smaller buckets, including the common small-`k`
 single-segment pool, fold inline on the calling thread). Task boundaries do
 not depend on the execution mode, and every bounded candidate cut uses a total

@@ -51,8 +51,9 @@ POST /collections/books/_search
 `k` is how many nearest documents the query node produces; `limit` is how
 many the request returns. The score is the similarity under the field's
 metric. Until you build an approximate index, every search scans the
-full-precision vector column, so a collection is searchable as soon as its
-vectors are indexed and the results are exact. [Approximate search](#approximate-search)
+stored vector column, so a collection is searchable as soon as its
+vectors are indexed and the results are exact over the stored vectors
+(see [Column encoding](#column-encoding)). [Approximate search](#approximate-search)
 is a commit-time option for large collections; the query does not change.
 
 A list's [diversify cap](searching.md#diversifying-a-document-list) applies
@@ -153,6 +154,61 @@ When omitted, the first vector in each segment establishes the dimension.
 A multi-valued vector field (`multi: true`, or the `_vs` suffix) holds many
 vectors per document, such as one per passage or chunk. Search collapses them
 to one hit per document, scored by that document's best vector.
+
+### Column encoding
+
+The vector column is the largest part of a vector field on disk and in the
+page cache, and every exact search and every approximate-search rescore reads
+it. `encoding` chooses how each vector is stored:
+
+| `encoding` | Bytes per vector | Stored value |
+|---|---|---|
+| `f32` (default) | `4 * dims` | the float32 values |
+| `f16` | `2 * dims` | IEEE half precision per element |
+| `int8` | `8 + dims` | per-vector scalar quantization: a float offset and scale, plus one byte per dimension |
+
+At 768 dimensions that is 3072, 1536, and 776 bytes per vector.
+
+```json
+{
+  "fields": {
+    "embedding_v": {
+      "type": "vector",
+      "dims": 768,
+      "metric": "cosine",
+      "encoding": "int8"
+    }
+  }
+}
+```
+
+`int8` quantizes each vector on its own, between its minimum and maximum
+element, so a stored vector never depends on other vectors, segments, or
+statistics. Merges copy stored vectors unchanged. Cosine vectors are
+normalized before they are quantized.
+
+Encoded fields reject vectors with non-finite elements (NaN or infinity), and
+`f16` also rejects elements whose magnitude exceeds 65504. A constant vector
+is valid under `int8`.
+
+Search scores the query, which stays float32, against the stored encoding:
+`exact: true`, the scan of segments without an overlay, and the rescore of
+approximate candidates are all exact over the stored vectors, not over the
+vectors you submitted. Cosine over `f16` and `int8` divides by the norm of the
+stored vector, so scores remain cosines. Vectors read back in `fields` are the
+stored values decoded to float32.
+
+Set `keep_original: true` to also keep the submitted float32 vectors in a
+separate column. Searches never read it; it costs `4 * dims` bytes per vector
+of disk but no page cache in normal operation. Approximate indexes are built
+from it when it is present, reading a field back returns the submitted values
+(before cosine normalization), and it lets you re-encode the field later from
+the exact input.
+
+`encoding` and `keep_original` apply to segments written after the change.
+Existing segments keep the encoding they were written with, and a merge of
+segments with different encodings writes the most precise of them, so a merge
+never loses precision. To re-encode existing data, reindex it.
 
 ## Index vectors
 
@@ -537,9 +593,10 @@ after changing source limits.
 
 Exact search costs one pass over the column per query. For large collections,
 a commit can build approximate nearest-neighbor indexes (IVF+PQ, via FAISS)
-as segment overlays. An overlay is built from the vector column, follows its
+as segment overlays. An overlay is built from the vector column (decoded from
+its encoding, or from the `keep_original` column when present), follows its
 segment through later commits and merges, and its candidates are always
-rescored from the full-precision column before they are returned. Building
+rescored from the stored column before they are returned. Building
 an overlay does not reindex documents.
 
 ### Build at commit
@@ -597,8 +654,8 @@ every index type.
 | `query` | Query vector; must match the field's dimension. Required. |
 | `k` | Nearest documents or groups the query node produces. Required, positive. |
 | `unit` | `docs` (default) or `groups`; groups requires an enclosing collapse. |
-| `exact` | Require the true top-k. Uses the full-precision column scan and ignores overlays and the knobs below. |
-| `refine_candidates` | Candidate documents collected before the full-precision rescore, in both units. Unset: sized from `k` (see below). Explicit: exactly that many, clamped up to `k`. |
+| `exact` | Require the true top-k over the stored vectors (exact over the field's `encoding`). Scans the column and ignores overlays and the knobs below. |
+| `refine_candidates` | Candidates collected before the column rescore, in both units. Unset: sized from `k` (see below). Explicit: exactly that many, clamped up to `k`. |
 | `ivf.nprobe` | IVF effort, merge-stable (see below). `0` or absent: adaptive, may deepen automatically. |
 | `ivf.min_scan_fraction` | A floor on the fraction of live vector values scanned, in `[0,1]`; `0.001` means 0.1%. |
 
@@ -609,7 +666,7 @@ by `k=1000`: quantization mis-ranks a true neighbor by a roughly constant
 number of positions regardless of `k`, so small `k` needs fixed headroom, while
 large-`k` requests are recall-oriented retrieval whose near-tied tail does not
 benefit from extra overfetch. The final pool is always rescored from the
-full-precision column, sorted by exact score, and collapsed to one hit per
+stored column, sorted by exact score, and collapsed to one hit per
 document (or per group with `unit: "groups"`).
 
 `ivf.nprobe` is interpreted as the number of lists
@@ -662,11 +719,14 @@ raise recall and latency. Setting `nprobe` to at least the reference
 exhaustive over IVF lists, but PQ ordering still decides which candidates are
 rescored.
 
-`exact: true` uses a path that guarantees the true top-k and does not
-consult overlays. Everything else about
+`exact: true` uses a path that guarantees the true top-k over the stored
+vectors and does not consult overlays. Everything else about
 the query is identical (filters, multi-valued collapse, score scale), which
 makes it the built-in ground truth for measuring your ANN settings. Run the
-same query twice, once with `exact: true`, and compare the two lists.
+same query twice, once with `exact: true`, and compare the two lists. With
+an `f16` or `int8` encoding this measures the approximate index against the
+encoding; to measure the encoding itself, compare against the same vectors
+in an `f32` field.
 
 Results are deterministic. A query run with intra-request parallelism returns
 bit-identical results to a serial run of the same query.
@@ -686,3 +746,5 @@ bit-identical results to a serial run of the same query.
   not in the update response.
 - Vector fields are returned only when named in `fields`; they are excluded
   from default projection.
+- Changing `encoding` does not re-encode existing segments; reindex to apply
+  it to existing documents.

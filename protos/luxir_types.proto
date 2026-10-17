@@ -1591,6 +1591,16 @@ enum VectorMetric {
   COSINE = 3;
 }
 
+// Storage encoding of a vector field's column.  Exact search and the
+// rescoring of ANN candidates score against the stored encoding.
+enum VectorEncoding {
+  F32 = 0;   // float32 per element (4 bytes per dimension)
+  F16 = 1;   // IEEE half precision per element (2 bytes per dimension)
+  // Per-vector scalar quantization: a float offset and scale per vector plus
+  // one uint8 code per dimension (8 + dims bytes).
+  INT8 = 2;
+}
+
 // A field, template, or variant definition, named by its enclosing map key.
 // Unset properties inherit from parent, then use type defaults, except as
 // documented on individual properties. HTTP JSON enum values are lowercase.
@@ -1673,6 +1683,16 @@ message FieldDef {
     HASH128 = 2;  // prefix of at most 230 bytes plus 25 base36 hash digits
   }
   optional LongTerms long_terms = 16; // absent: inherit from parent, else hash128
+
+  // VECTOR only. Column storage encoding. Unset inherits, falling back to
+  // F32. F16 and INT8 reject non-finite elements; F16 also rejects
+  // magnitudes above 65504. Applies to newly written segments.
+  optional VectorEncoding encoding = 17;
+
+  // VECTOR only. Also keep the submitted float32 vectors in a separate cold
+  // column that searches never read, so the field can be re-encoded later.
+  // Unset inherits, falling back to false.
+  optional bool keep_original = 18;
 }
 
 message SchemaDef {

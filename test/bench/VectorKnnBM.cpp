@@ -16,6 +16,7 @@
 #include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/query/KnnQuery.h"
 #include "luxir/reader/VectorAuxReader.h"
+#include "luxir/reader/VectorReader.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -719,6 +720,130 @@ void BM_VectorIvfPqIncrementalBuild(benchmark::State& state) {
       state.iterations() > 0 ? setupSecs / (double)state.iterations() : 0.0;
 }
 
+// ---------------------------------------------------------------------------
+// Column encoding benchmark.
+//
+// Exact search (KnnQuery.exact: a full scan of the stored column) over one
+// field stored as f32, f16, or int8, on a clustered corpus at a typical
+// embedding width.  Reports the stored column bytes per vector, recall@k of
+// exact search over the encoding against brute-force float32 ground truth
+// (computed here from the generated vectors in double precision), and the
+// serial exact-scan latency (rate = QPS on one thread).
+void BM_VectorEncodingExact(benchmark::State& state) {
+  auto encoding = (api::VectorEncoding)state.range(0);
+  auto metric = (api::VectorMetric)state.range(1);
+  int64_t nDocs = luxir::unit_tests ? LuxirTest::scaleTestWork(240) : 50'000;
+  int32_t dims = luxir::unit_tests ? 16 : 768;
+  int32_t nClusters = luxir::unit_tests ? 8 : 100;
+  int32_t nQueries = luxir::unit_tests ? 4 : 100;
+  int32_t k = 10;
+
+  CollectionHelper helper("main");
+  helper.clear();
+  {
+    SchemaBuilder b;
+    auto& f = b.field("enc_v");
+    f.type = api::FieldDef_::FieldClass::VECTOR;
+    f.dims = dims;
+    f.metric = metric;
+    f.encoding = encoding;
+    b.set(helper.collection());
+  }
+
+  std::vector<float> all((size_t)nDocs * (size_t)dims);
+  std::vector<Doc> docs;
+  int64_t nSegs = luxir::unit_tests ? 2 : 4;
+  for (int64_t docId = 0; docId < nDocs; docId++) {
+    auto v = makeClusteredVector(docId, dims, nClusters);
+    std::copy(v.begin(), v.end(), all.begin() + docId * dims);
+    docs.push_back(flatdoc("id", "d" + std::to_string(docId), "enc_v", std::move(v)));
+    if (docs.size() == 256 || docId + 1 == nDocs) {
+      helper.indexAll(docs);
+      docs.clear();
+    }
+    if ((docId + 1) % ((nDocs + nSegs - 1) / nSegs) == 0) helper.commit();
+  }
+  helper.commit();
+
+  int64_t columnBytes = 0;
+  int64_t numVectors = 0;
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  for (auto& seg : reader->segments()) {
+    const SegFieldInfo* fi = seg.postingsReader().fieldInfo("enc_v");
+    if (!fi) continue;
+    VectorReader vr(seg.postingsReader(), *fi);
+    columnBytes += vr.numVectors() * vr.valueBytes();
+    numVectors += vr.numVectors();
+  }
+
+  // Brute-force float32 ground truth, higher-is-better scores.
+  auto truthScore = [&](const float* q, const float* x) {
+    double dot = 0, qq = 0, xx = 0, dist = 0;
+    for (int32_t i = 0; i < dims; i++) {
+      dot += (double)q[i] * x[i];
+      qq += (double)q[i] * q[i];
+      xx += (double)x[i] * x[i];
+      dist += ((double)q[i] - x[i]) * ((double)q[i] - x[i]);
+    }
+    if (metric == api::VectorMetric::L2) return -dist;
+    if (metric == api::VectorMetric::IP) return dot;
+    return dot / std::sqrt(qq * xx);
+  };
+  std::vector<std::vector<float>> queries;
+  double recallSum = 0;
+  for (int32_t q = 0; q < nQueries; q++) {
+    queries.push_back(makeClusteredQuery(q, dims, nClusters));
+    std::vector<std::pair<double, int64_t>> scored((size_t)nDocs);
+    for (int64_t d = 0; d < nDocs; d++) {
+      scored[(size_t)d] = {truthScore(queries.back().data(), all.data() + d * dims), d};
+    }
+    std::partial_sort(scored.begin(), scored.begin() + k, scored.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    auto* req = makeKnnBenchReq(helper.getSearchEngine(), "enc_v", queries.back(), k,
+                                /*nprobe=*/0, /*refineCandidates=*/0, /*exact=*/true);
+    req->execute(false);
+    std::vector<std::string> ids;
+    std::string error;
+    bool ok = responseIds(*req, ids, error);
+    req->done();
+    if (!ok) {
+      state.SkipWithError(error.c_str());
+      return;
+    }
+    int32_t hits = 0;
+    for (int32_t i = 0; i < k; i++) {
+      std::string id = "d" + std::to_string(scored[(size_t)i].second);
+      if (std::find(ids.begin(), ids.end(), id) != ids.end()) hits++;
+    }
+    recallSum += (double)hits / (double)k;
+  }
+
+  int32_t queryOrd = 0;
+  for (auto _ : state) {
+    auto* req = makeKnnBenchReq(helper.getSearchEngine(), "enc_v", queries[(size_t)queryOrd],
+                                k, 0, 0, /*exact=*/true);
+    req->execute(false);
+    std::vector<std::string> ids;
+    std::string error;
+    bool ok = responseIds(*req, ids, error);
+    req->done();
+    if (!ok) {
+      state.SkipWithError(error.c_str());
+      break;
+    }
+    queryOrd = (queryOrd + 1) % nQueries;
+    benchmark::DoNotOptimize(ids);
+  }
+
+  state.counters["bytesPerVec"] = numVectors > 0 ? (double)columnBytes / (double)numVectors : 0.0;
+  state.counters["columnMB"] = (double)columnBytes / (1024.0 * 1024.0);
+  state.counters["recall"] = recallSum / (double)nQueries;
+  state.counters["nDocs"] = (double)nDocs;
+  state.counters["dims"] = (double)dims;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
 }  // namespace
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that
@@ -759,6 +884,10 @@ LUXIR_BENCHMARK(BM_VectorKnnRecall)->ArgNames({"nprobe", "cand", "k"})
 LUXIR_BENCHMARK(BM_VectorKnnRecallParallel)->ArgNames({"nprobe", "cand", "k"})
     ->Args({0, 0, 10})->Args({16, 0, 10})->Args({1 << 20, 0, 10})
     ->Args({0, 0, 1000});
+
+// encoding: 0 = f32, 1 = f16, 2 = int8; metric: 1 = l2, 2 = ip, 3 = cosine.
+LUXIR_BENCHMARK(BM_VectorEncodingExact)->ArgNames({"encoding", "metric"})
+    ->ArgsProduct({{0, 1, 2}, {1, 2, 3}});
 
 LUXIR_BENCHMARK(BM_VectorKnnRecallThreads)->ArgNames({"nprobe", "cand", "k"})
     ->Args({0, 0, 10})->ThreadRange(1, 32);

@@ -273,7 +273,7 @@ publication advances the schema generation.
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
-| `dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
+| `dims`, `metric`, `normalized`, `normalize_on_write`, `encoding`, `keep_original` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; `encoding`: `f32`, `f16`, `int8`; see [Vector search](vector-search.md) |
 
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you

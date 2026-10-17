@@ -844,6 +844,8 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.defaults"></a>[`defaults`](#field-luxir.fielddef.defaults) | 14 | [`FieldDefaults`](#message-luxir.fielddefaults) | singular | default search and value representations |
 | <a id="field-luxir.fielddef.normalizer"></a>[`normalizer`](#field-luxir.fielddef.normalizer) | 15 | [`NormalizerDef`](#message-luxir.normalizerdef) | singular | whole-value STRING normalization |
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
+| <a id="field-luxir.fielddef.encoding"></a>[`encoding`](#field-luxir.fielddef.encoding) | 17 | [`VectorEncoding`](#enum-luxir.vectorencoding) | optional | VECTOR only. Column storage encoding. Unset inherits, falling back to F32. F16 and INT8 reject non-finite elements; F16 also rejects magnitudes above 65504. Applies to newly written segments. |
+| <a id="field-luxir.fielddef.keep_original"></a>[`keep_original`](#field-luxir.fielddef.keep_original) | 18 | `bool` | optional | VECTOR only. Also keep the submitted float32 vectors in a separate cold column that searches never read, so the field can be re-encoded later. Unset inherits, falling back to false. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1930,6 +1932,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`SelectionMode`](#enum-luxir.selectionmode)
 - [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
+- [`VectorEncoding`](#enum-luxir.vectorencoding)
 - [`VectorMetric`](#enum-luxir.vectormetric)
 
 <a id="enum-luxir.calendargap.unit"></a>
@@ -2168,6 +2171,20 @@ How facet selections filter the enclosing TopDocs results and its sub-operations
 | <a id="value-luxir.updateresponse.status.ok"></a>[`OK`](#value-luxir.updateresponse.status.ok) | 1 | the update was successful |
 | <a id="value-luxir.updateresponse.status.partial"></a>[`PARTIAL`](#value-luxir.updateresponse.status.partial) | 2 | part of the request took effect, part failed (see errors) |
 | <a id="value-luxir.updateresponse.status.error"></a>[`ERROR`](#value-luxir.updateresponse.status.error) | 3 | The request failed. If error is unset, the failure was per-document (see errors) and the request had no visible effect on the index. If error is set, the failure was request-level (e.g. commit pipeline) and the effect of individual documents is indeterminate beyond what errors lists. |
+
+<a id="enum-luxir.vectorencoding"></a>
+
+### luxir.VectorEncoding
+
+Storage encoding of a vector field's column. Exact search and the rescoring of ANN candidates score against the stored encoding.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.vectorencoding.f32"></a>[`F32`](#value-luxir.vectorencoding.f32) | 0 | float32 per element (4 bytes per dimension) |
+| <a id="value-luxir.vectorencoding.f16"></a>[`F16`](#value-luxir.vectorencoding.f16) | 1 | IEEE half precision per element (2 bytes per dimension) |
+| <a id="value-luxir.vectorencoding.int8"></a>[`INT8`](#value-luxir.vectorencoding.int8) | 2 | Per-vector scalar quantization: a float offset and scale per vector plus one uint8 code per dimension (8 + dims bytes). |
 
 <a id="enum-luxir.vectormetric"></a>
 

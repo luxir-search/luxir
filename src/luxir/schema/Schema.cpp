@@ -56,6 +56,10 @@ struct ResolvedField {
   bool vectorNormalized = false;
   bool hasVectorNormalizeOnWrite = false;
   bool vectorNormalizeOnWrite = false;
+  bool hasVectorEncoding = false;
+  VectorEncoding vectorEncoding = VectorEncoding::F32;
+  bool hasVectorKeepOriginal = false;
+  bool vectorKeepOriginal = false;
 };
 
 struct ResolvedOwnership {
@@ -244,6 +248,28 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
   }
 
+  // encoding: explicit set on this field overrides; otherwise inherit.
+  if (def.encoding.has_value()) {
+    if (!vcodec::valid((int32_t)*def.encoding)) {
+      throw SchemaError("unknown encoding value " + std::to_string((int)*def.encoding) +
+                        " (field: " + std::string(name) + "); valid: f32, f16, int8");
+    }
+    r.hasVectorEncoding = true;
+    r.vectorEncoding = (VectorEncoding)*def.encoding;
+  } else {
+    r.hasVectorEncoding = parentResolved.hasVectorEncoding;
+    r.vectorEncoding = parentResolved.vectorEncoding;
+  }
+
+  // keep_original: explicit set on this field overrides; otherwise inherit.
+  if (def.keep_original.has_value()) {
+    r.hasVectorKeepOriginal = true;
+    r.vectorKeepOriginal = *def.keep_original;
+  } else {
+    r.hasVectorKeepOriginal = parentResolved.hasVectorKeepOriginal;
+    r.vectorKeepOriginal = parentResolved.vectorKeepOriginal;
+  }
+
   return r;
 }
 
@@ -326,10 +352,12 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
     throw SchemaError("normalizer is only valid for string fields (field: " + name + ")");
   }
   bool vectorProp = def.dims.has_value() || def.metric.has_value() ||
-                    def.normalized.has_value() || def.normalize_on_write.has_value();
+                    def.normalized.has_value() || def.normalize_on_write.has_value() ||
+                    def.encoding.has_value() || def.keep_original.has_value();
   if (vectorProp && r.type != FieldClass::VECTOR) {
     throw SchemaError(
-      "dims/metric/normalized/normalize_on_write are only valid for vector fields (field: " + name + ")");
+      "dims/metric/normalized/normalize_on_write/encoding/keep_original are only valid for "
+      "vector fields (field: " + name + ")");
   }
 }
 
@@ -537,7 +565,8 @@ struct FieldCompiler {
           ? r.vectorNormalizeOnWrite
           : (r.vectorMetric == VectorFieldType::METRIC_COSINE));
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
-                                               r.vectorMetric, r.vectorNormalized, normalizeOnWrite);
+                                               r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
+                                               r.vectorEncoding, r.vectorKeepOriginal);
         break;
       }
       default:
