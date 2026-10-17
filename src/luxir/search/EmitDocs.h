@@ -754,6 +754,7 @@ public:
   int32_t maxBatchSize;
   int64_t offset;
   bool getNumber;
+  bool foundIsLowerBound;
   bool getScores;
   // scoresInRows: the synthetic _score_ goes into the per-document maps;
   // otherwise it is a dense column even when fields land in rows (discovered
@@ -770,12 +771,12 @@ public:
   DocEmitterImpl(SearchRequest& req, GetDocList getDocList, GetDoc getDoc,
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
                  std::span<ReturnField> fields, int32_t maxBatchSize,
-                 int64_t offset, bool getNumber, bool getScores,
+                 int64_t offset, bool getNumber, bool foundIsLowerBound, bool getScores,
                  bool scoresInRows, bool parallel, size_t colCap, size_t rowCap, DocBatchMetadata metadata)
       : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
         metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
-        getScores(getScores), scoresInRows(scoresInRows),
+        foundIsLowerBound(foundIsLowerBound), getScores(getScores), scoresInRows(scoresInRows),
         parallel(parallel), colCap(colCap), rowCap(rowCap),
         batchStart(std::min(offset, numCollected)) {}
 
@@ -846,6 +847,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
 
     if (getNumber) {
       docListProto.found = totalHits;
+      docListProto.found_is_lower_bound = foundIsLowerBound;
     }
 
     // Materialize just this batch's docs from getDoc.  Field loaders need a
@@ -1264,7 +1266,8 @@ void emitDocsResponse(SearchRequest& req,
                       bool getScores,
                       luxir::api::DocFormat docFormat,
                       DocEmission emission,
-                      DocBatchMetadata metadata = {})
+                      DocBatchMetadata metadata = {},
+                      bool foundIsLowerBound = false)
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1316,7 +1319,7 @@ void emitDocsResponse(SearchRequest& req,
   auto* emitter = luxir::arenaCreate<Impl>(req.arena, req,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
-      maxBatchSize, offset, getNumber, getScores, scoresInRows,
+      maxBatchSize, offset, getNumber, foundIsLowerBound, getScores, scoresInRows,
       /*parallel=*/req.tg != nullptr, colCap, rowCap, std::move(metadata));
   req.streamStarted();
   emitter->produce();

@@ -320,18 +320,24 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
+      // A bounded count that reached its limit may have pruned uncounted
+      // matches: report the limit as a lower bound.
+      int64_t found = collector.totalHits();
+      bool foundIsLowerBound = qr.countLimit > 0
+          && (qr.countLimitProven || calc.scoreAccumulator.hitThresholdReached());
+      if (foundIsLowerBound) found = qr.countLimit;
       emitDocsResponse(qr.req, getDocList,
         (int64_t)scoreDocs.size(),
         [scoreDocs](int64_t i) { return scoreDocs[i].doc; },
         [scoreDocs](int64_t i) { return scoreDocs[i].score; },
-        collector.totalHits(),
+        found,
         qr.topDocsProto.fields,
         qr.topDocsProto.batch_size,
         qr.topDocsProto.offset,
         qr.topDocsProto.get_number,
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission);
+        emission, {}, foundIsLowerBound);
     }
   }
 
