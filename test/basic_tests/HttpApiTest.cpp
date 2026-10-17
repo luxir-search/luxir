@@ -1359,6 +1359,31 @@ TEST_F(HttpApiTest, foundIsOptInWithGetNumber) {
   EXPECT_EQ((int64_t)2, withCount.found()) << withCount.rawResponse();
 }
 
+// track_total_hits follows Elasticsearch: true counts exactly, false omits the
+// count, and N bounds it, flagging a found that stopped at N as a lower bound.
+TEST_F(HttpApiTest, trackTotalHits) {
+  std::vector<Doc> docs;
+  for (int i = 0; i < 30; i++) {
+    docs.push_back(flatdoc("id", "t" + std::to_string(i), "title_w", std::string("tracktoken")));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto search = [&](std::string_view track) {
+    auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
+        R"({"query":"title_w:tracktoken","fields":["id"],"track_total_hits":)"
+        + std::string(track) + "}");
+    EXPECT_EQ(200, res.result_int()) << res.body();
+    return res.body();
+  };
+  auto exact = search("true");
+  EXPECT_NE(std::string::npos, exact.find(R"("found":30,"docs")")) << exact;
+  auto none = search("false");
+  EXPECT_EQ(std::string::npos, none.find(R"("found")")) << none;
+  auto bounded = search("5");
+  EXPECT_NE(std::string::npos, bounded.find(R"("found":5,"found_is_lower_bound":true)")) << bounded;
+  auto above = search("100");
+  EXPECT_NE(std::string::npos, above.find(R"("found":30,"docs")")) << above;
+}
+
 TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
   static constexpr int kDocCount = 180;
   std::string payload(20 * 1024, 'x');

@@ -1238,8 +1238,25 @@ private:
       overlay.hasTopDocs = true;
     }
     if (!appendBoolParam(params, "get_number", true, json, overlay, err) ||
+        !appendIntegerParam<std::int64_t>(params, "count_limit",
+                                         "signed 64-bit decimal integer", true,
+                                         json, overlay, err) ||
         !appendBoolParam(params, "get_scores", true, json, overlay, err)) {
       return false;
+    }
+    if (const std::string* text = findParam(params, "track_total_hits")) {
+      std::int64_t value = 0;
+      auto [end, ec] = std::from_chars(text->data(), text->data() + text->size(), value);
+      if (*text == "true" || *text == "false") {
+        json.raw("track_total_hits", *text);
+      } else if (ec == std::errc{} && end == text->data() + text->size()) {
+        json.raw("track_total_hits", std::to_string(value));
+      } else {
+        err = "invalid URL parameter 'track_total_hits': expected true, false, or a signed "
+              "64-bit decimal integer, got '" + *text + "'";
+        return false;
+      }
+      overlay.hasTopDocs = true;
     }
 
     overlay.empty = json.first;

@@ -194,6 +194,12 @@ public:
       return countBound(segment, domain, docs, CountHow::METADATA);
     }
 
+    // Every deleted doc may hold the term, so df minus deletions is a floor.
+    int64_t matchLowerBound(IndexReader::Segment& segment) override {
+      int64_t docs = cachedTermInfo ? cachedTermInfo->docFreq(segment.ord) : 0;
+      return std::max<int64_t>(0, docs - (segment.maxDoc() - segment.numLive()));
+    }
+
     // Per-segment supplier that exposes the term's real cost (its number of docs
     // in this segment) so compound scorers can order leaders by cost. The
     // default supplier reports maxDoc for every clause, which is useless for

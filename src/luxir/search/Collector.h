@@ -398,8 +398,39 @@ public:
 class MaxScoreAccumulator {
 public:
   std::atomic<float> maxScore;
+  // Bounded hit count (Lucene's totalHitsThreshold): while a threshold is
+  // held, collection drivers keep the competitive score at lowest and report
+  // collected hits here; pruning opens once every stream together has
+  // collected hitThreshold hits.
+  int64_t hitThreshold = 0;
+  std::atomic<int64_t> hitsCounted{0};
+  std::atomic<bool> pruningOpen{true};
 
   MaxScoreAccumulator() : maxScore(std::numeric_limits<float>::lowest()) {
+  }
+
+  void holdUntilHits(int64_t threshold) {
+    hitThreshold = threshold;
+    pruningOpen.store(threshold <= 0, std::memory_order_relaxed);
+  }
+
+  bool canPrune() const {
+    return pruningOpen.load(std::memory_order_relaxed);
+  }
+
+  // True when a threshold was held and has been reached.
+  bool hitThresholdReached() const {
+    return hitThreshold > 0 && canPrune();
+  }
+
+  // Returns whether pruning is open after counting `hits` more.
+  bool countHits(int64_t hits) {
+    if (canPrune()) return true;
+    if (hitsCounted.fetch_add(hits, std::memory_order_relaxed) + hits >= hitThreshold) {
+      pruningOpen.store(true, std::memory_order_relaxed);
+      return true;
+    }
+    return false;
   }
 
   void accumulate(float score) {
@@ -412,6 +443,37 @@ public:
 
   float get() const {
     return maxScore.load(std::memory_order_acquire);
+  }
+};
+
+// One collection stream's view of a held hit threshold. Batches updates to
+// the shared counter; holding turns false once pruning opens for any stream.
+class HeldHitCounter {
+  static constexpr int64_t kBatch = 32;
+  MaxScoreAccumulator* accumulator;
+  int64_t pending = 0;
+
+public:
+  bool holding;
+
+  HeldHitCounter(MaxScoreAccumulator* accumulator, bool active)
+      : accumulator(accumulator),
+        holding(active && accumulator != nullptr && !accumulator->canPrune()) {}
+
+  HeldHitCounter(const HeldHitCounter&) = delete;
+  HeldHitCounter& operator=(const HeldHitCounter&) = delete;
+
+  ~HeldHitCounter() {
+    if (holding && pending > 0) accumulator->countHits(pending);
+  }
+
+  // Returns true when this call observed pruning open.
+  bool add(int64_t hits) {
+    pending += hits;
+    if (pending < kBatch) return false;
+    holding = !accumulator->countHits(pending);
+    pending = 0;
+    return !holding;
   }
 };
 
@@ -445,6 +507,8 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
   constexpr int32_t kAccumulatorPollPeriod = 1024;
   float lastPushedMinCompetitiveScore = std::numeric_limits<float>::lowest();
   int32_t accumulatorPollCount = 0;
+  // A bounded hit count holds theta at lowest until enough hits are counted.
+  HeldHitCounter held(accumulator, allowPruning && builder == nullptr);
   auto localMinCompetitiveScore = [&](int32_t nextDoc) {
     if constexpr (requires {
         collector.minCompetitiveScoreForNextDoc(segnum, nextDoc);
@@ -461,7 +525,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
   auto pushMinCompetitiveScore = [&](float localScore, bool localRise,
                                      bool periodicPoll) {
     if constexpr (requires { collector.minCompetitiveVal; }) {
-      if (!allowPruning || builder != nullptr) {
+      if (!allowPruning || builder != nullptr || held.holding) {
         return;
       }
       float minCompetitiveScore = localScore;
@@ -490,6 +554,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       collector.collect(segnum, doc, score);
       bool localRise = collector.minCompetitiveVal > oldMinCompetitiveVal;
       bool periodicPoll = false;
+      if (held.holding) periodicPoll = held.add(1);
       if (allowPruning && builder == nullptr && accumulator != nullptr) {
         accumulatorPollCount++;
         if (accumulatorPollCount >= kAccumulatorPollPeriod) {
@@ -500,7 +565,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       pushMinCompetitiveScore(localMinCompetitiveScore(doc + 1), localRise,
                               periodicPoll);
     } else {
-      unused(lastPushedMinCompetitiveScore, accumulatorPollCount, accumulator, allowPruning);
+      unused(lastPushedMinCompetitiveScore, accumulatorPollCount, accumulator, allowPruning, held);
       collector.collect(segnum, doc, score);
     }
   };
@@ -508,7 +573,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
   // Seed from both the local heap and the shared inclusive threshold so a
   // reused collector or a sibling segment can prune from the first doc.
   if constexpr (requires { collector.minCompetitiveVal; }) {
-    if (allowPruning && builder == nullptr) {
+    if (allowPruning && builder == nullptr && !held.holding) {
       float seed = localMinCompetitiveScore(0);
       if (accumulator != nullptr) {
         seed = std::max(seed, accumulator->get());
@@ -2105,6 +2170,7 @@ void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
 
   assert(bulk != nullptr);
   bulk->setTopKDepth(collector.topCount, allowPruning);
+  HeldHitCounter held(accumulator, allowPruning);
   int32_t cursor = 0;
   ScoreWindow window;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
@@ -2116,7 +2182,7 @@ void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
     } else {
       localTheta = collector.minCompetitiveVal;
     }
-    float theta = !allowPruning
+    float theta = !allowPruning || held.holding
       ? std::numeric_limits<float>::lowest()
       : accumulator != nullptr
         ? std::max(localTheta, accumulator->get())
@@ -2138,6 +2204,7 @@ void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
         accumulator->accumulate(collector.minCompetitiveVal);
       }
     }
+    if (held.holding) held.add(window.size);
 
     if (next == PostingsReader::END) {
       break;

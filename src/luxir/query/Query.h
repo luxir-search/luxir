@@ -1625,6 +1625,14 @@ public:
       return countBound(segment, domain, segment.maxDoc());
     }
 
+    /// Metadata-only lower bound on this weight's live matches in `segment`,
+    /// under no domain; 0 when metadata proves nothing. A bounded hit count
+    /// uses it to skip counting once the limit is proven.
+    virtual int64_t matchLowerBound(IndexReader::Segment& segment) {
+      unused(segment);
+      return 0;
+    }
+
     /// Policy family for choosing the sparse-filtered top-k density knee.
     /// Existing and ineligible weights retain the conjunction-family default.
     virtual SparseFilteredTopKFamily sparseFilteredTopKFamily() const noexcept {

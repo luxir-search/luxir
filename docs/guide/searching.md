@@ -95,7 +95,9 @@ one.
 | `filter` | Non-scoring queries ANDed with the main query: expression strings, query objects, or `{"query": ..., "except_ops": [...]}` wrappers that hide a filter from named sub-operations. |
 | `limit` | Maximum documents returned. Default `10`; `0` for count/analytics only; `-1` for all matches. |
 | `offset` | Zero-based rank of the first returned document. Default `0`. |
-| `get_number` | Compute and return the exact match count as `found`. |
+| `get_number` | Compute and return the match count as `found`. |
+| `count_limit` | With `get_number`, let the count stop at this many matches. See below. |
+| `track_total_hits` | Elasticsearch-style count switch: `true` is `get_number`, `false` omits the count, and an integer `N` is `get_number` with `count_limit: N`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `fields` | Fields to retrieve. Omitted: every retrievable field. |
 | `sort` | One sort clause or a list of them. Absent means relevance order. |
@@ -103,13 +105,38 @@ one.
 | `document_format` | `rows` or `columns`; HTTP defaults to rows, gRPC to columns. |
 | `ops` | Facets or metrics over this query's complete match set. |
 
-### Counts are exact, and opt-in
+### Counts are opt-in, exact or bounded
 
 `found` is opt-in, and the choice changes how the engine runs. Without
 `get_number`, a top-k request uses per-block score bounds and MaxScore-style
 skipping to avoid scoring documents that cannot enter the top k. With
 `get_number`, the engine counts the whole match set and returns the exact
 total, even when you retrieve only a few documents.
+
+`count_limit` (or `track_total_hits: N`) bounds that cost, like
+Elasticsearch's default of 10,000. A relevance-ranked list counts until it has
+seen `count_limit` matches and then switches to the same skipping as an
+uncounted request; the returned documents are identical either way. When the
+limit was reached, `found` is exactly `count_limit` and
+`found_is_lower_bound: true` says at least that many documents match.
+Otherwise `found` is exact and `found_is_lower_bound` is omitted. A single
+term or a pure disjunction whose index statistics already prove the limit
+(a term's document frequency minus deletions) skips the counting phase
+entirely.
+
+```http
+POST /collections/books/_search
+
+{"query": "title_t:the", "track_total_hits": 10000}
+```
+
+```json
+{"found": 10000, "found_is_lower_bound": true, "docs": [...]}
+```
+
+Lists that need their complete match set anyway count exactly and ignore the
+limit: lists with `ops`, `collapse`, or `diversify`, field sorts, nested
+lists, and `limit: 0` count-only requests. `count_limit` must be positive.
 
 For a count plus analytics with no documents at all, set `limit: 0`. No
 document fields are loaded:
@@ -886,6 +913,8 @@ The recognized top-document parameters are:
 | `batch_size` | Signed 32-bit decimal integer. |
 | `document_format` | Exactly `default`, `rows`, or `columns`. |
 | `get_number`, `get_scores` | Exactly `true` or `false`. |
+| `count_limit` | Signed 64-bit decimal integer. |
+| `track_total_hits` | `true`, `false`, or a signed 64-bit decimal integer. |
 
 URL form decoding happens before these grammars are applied, so `+` in a
 `sort` value is a space. `sort=` clears the body sort list; empty and non-empty
