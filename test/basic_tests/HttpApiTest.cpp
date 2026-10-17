@@ -1544,6 +1544,104 @@ TEST_F(HttpApiTest, ndjsonPipelinedInputFailureDrainsSubmittedPrefix) {
   localServer.shutdown();
 }
 
+// Document records are decoded on the task arena, so a malformed one that
+// looks like a document fails its batch there.  With one batch in flight the
+// stream stops at that batch: the batch before it is indexed, nothing after.
+TEST_F(HttpApiTest, ndjsonDeferredMalformedRecordFailsItsBatch) {
+  LuxirConfig config;
+  config.ingest.stream_batch_docs = 2;
+  config.ingest.max_inflight_batches = 1;
+  LuxirNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  std::string body;
+  for (int i = 0; i < 3; i++) body += R"({"id":"dm)" + std::to_string(i) + R"(","title_w":"deferredmalformed"})" "\n";
+  body += R"({"id":"dm-bad","title_w":})" "\n";
+  for (int i = 4; i < 8; i++) body += R"({"id":"dm)" + std::to_string(i) + R"(","title_w":"deferredmalformed"})" "\n";
+
+  auto update = httpRequest(localServer.getPort(), http::verb::post,
+      "/collections/dm/_update", std::move(body), "application/x-ndjson");
+  ASSERT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find(R"("code":"invalid_json")")) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find("stream document 3")) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find("docs_indexed_so_far=2")) << update.body();
+
+  ASSERT_EQ(200, httpRequest(localServer.getPort(), http::verb::post, "/collections/dm/_update",
+                             R"({"commit":{}})").result_int());
+  HttpReq query(localServer.getPort());
+  query.collection("dm").matchQuery("title_w", "deferredmalformed").fields({"id"}).limit(10).execute();
+  ASSERT_EQ(200, query.status()) << query.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"dm0", "dm1"}), idsOf(query.getDocs())) << query.rawResponse();
+  localServer.shutdown();
+}
+
+// A malformed document inside an all_or_none group fails the whole group,
+// still as invalid_json, and indexes none of it.
+TEST_F(HttpApiTest, ndjsonMalformedRecordInAllOrNoneGroup) {
+  std::string body =
+      R"({"_update_":{"request_id":"aon","all_or_none":true}})" "\n"
+      R"({"id":"aonm1","title_w":"aonmalformed"})" "\n"
+      R"({"id":"aonm2","title_w":"aonmalformed",})" "\n"
+      R"({"_end_":{"commit":{}}})" "\n";
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+                            std::move(body), "application/x-ndjson");
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find(R"("code":"invalid_json")")) << update.body();
+  EXPECT_NE(std::string::npos, update.body().find("docs_indexed_so_far=0")) << update.body();
+
+  ASSERT_EQ(200, httpRequest(port(), http::verb::post, "/collections/main/_update",
+                             R"({"commit":{}})").result_int());
+  HttpReq query(port());
+  query.collection("main").matchQuery("title_w", "aonmalformed").fields({"id"}).limit(10).withStats().execute();
+  ASSERT_EQ(200, query.status()) << query.rawResponse();
+  EXPECT_EQ((int64_t)0, query.found()) << query.rawResponse();
+}
+
+// Control records keep their stream position while documents around them are
+// decoded later and in parallel: each group's ids come back in stream order,
+// and documents whose first key merely starts with '_' or that open with
+// whitespace stay documents.
+TEST_F(HttpApiTest, ndjsonControlRecordsInterleavedWithDeferredDocs) {
+  LuxirConfig config;
+  config.ingest.stream_batch_docs = 1;
+  config.ingest.max_inflight_batches = 8;
+  LuxirNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  std::string body;
+  std::vector<std::string> expected[2];
+  for (int g = 0; g < 2; g++) {
+    body += R"({"_update_":{"request_id":"ig)" + std::to_string(g) + R"(","return_ids":true}})" "\n";
+    for (int i = 0; i < 12; i++) {
+      std::string id = "ig" + std::to_string(g) + "-" + std::to_string(i);
+      expected[g].push_back(id);
+      if (i == 5) body += R"({"_header_":{"found":1}})" "\n";
+      body += i % 3 == 0 ? R"( { "id":")" + id + R"(","title_w":"interleaved"})" "\n"
+                         : R"({"id":")" + id + R"(","title_w":"interleaved"})" "\n";
+    }
+    body += R"({"_end_":{}})" "\n";
+  }
+  body += R"({"_end_": {"commit":{}}})" "\n";
+
+  auto update = httpRequest(localServer.getPort(), http::verb::post,
+      "/collections/il/_update", std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto lines = splitLines(update.body());
+  ASSERT_EQ(3u, lines.size()) << update.body();
+  for (int g = 0; g < 2; g++) {
+    EXPECT_NE(std::string::npos, lines[g].find(R"("request_id":"ig)" + std::to_string(g) + "\"")) << lines[g];
+    EXPECT_EQ(expected[g], idsInUpdateLine(lines[g])) << lines[g];
+  }
+
+  HttpReq query(localServer.getPort());
+  query.collection("il").matchQuery("title_w", "interleaved").fields({"id"}).limit(100).withStats().execute();
+  ASSERT_EQ(200, query.status()) << query.rawResponse();
+  EXPECT_EQ((int64_t)24, query.found()) << query.rawResponse();
+  localServer.shutdown();
+}
+
 TEST_F(HttpApiTest, ndjsonHeaderNoopPreservesSingleBatchAndPipelineParity) {
   struct RunResult {
     std::string response;

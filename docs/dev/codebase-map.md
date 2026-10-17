@@ -138,6 +138,15 @@ locations, browse `src/luxir/<area>/`.
 
 **Indexing**: gRPC/HTTP Request -> IndexWriter -> Document Processing (Inverter) -> Segment Writing -> optional Commit
 
+HTTP update bodies are not decoded on the connection's I/O shard thread. A
+buffered JSON body is decoded in the task-arena task that submits it. An
+NDJSON stream is only framed on the shard: records that may be control
+records (`{}` or a first key shaped `"_name_"`) are decoded there, in stream
+order, and document records are copied raw into the batch
+(`HttpStreamBatchState::records`). `StreamingUpdateMessage::handle` decodes
+them on the update graph's process node, after `startUpdateNode` has fixed
+the batch's update version, so batches of one connection decode in parallel.
+
 ## Key Design Patterns
 
 - TBB flow graph for asynchronous indexing pipeline

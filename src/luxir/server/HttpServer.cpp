@@ -139,6 +139,7 @@ enum class HttpSearchFormat {
 struct HttpUpdateState {
   ~HttpUpdateState() { Signal::emit("httpUpdateBodyDestroyed"); }
   std::pmr::monotonic_buffer_resource resource;
+  std::string body;  // raw JSON until it is decoded on the task arena
   HttpUpdateReqProto proto;  // JSON readers copy update strings into resource
 };
 
@@ -175,7 +176,9 @@ struct HttpStreamBatchState {
   ~HttpStreamBatchState() { Signal::emit("httpBatchBodyDestroyed"); }
   std::pmr::monotonic_buffer_resource resource;
   HttpUpdateReqProto proto;  // non-owning; backed by `resource`
-  luxir::api::build::SpanBuilder<luxir::api::Map> docs;
+  // Raw document records, copied into `resource` by the I/O thread, which only
+  // frames them.  decodeDocs() turns them into proto.docs on the task arena.
+  luxir::api::build::SpanBuilder<std::string_view> records;
   std::shared_ptr<HttpStreamControlRequest> requestOwner;
   std::string collectionName;
   std::size_t sourceBytes = 0;
@@ -187,8 +190,31 @@ struct HttpStreamBatchState {
   // completion.
   std::shared_ptr<ProtoUpdateMessage> message;
 
-  explicit HttpStreamBatchState(std::size_t reserveDocs) : docs(resource) {
-    docs.reserve(reserveDocs);
+  explicit HttpStreamBatchState(std::size_t reserveDocs) : records(resource) {
+    records.reserve(reserveDocs);
+  }
+
+  // Decodes the raw records into proto.docs.  Called from the update message's
+  // handle() on an indexing worker, so a single connection's JSON decoding
+  // scales with the task arena instead of its I/O thread.  The I/O thread no
+  // longer touches the batch once it is submitted, and `resource` lives as long
+  // as the batch, which outlives the message.  A malformed record fails the
+  // whole batch before any of it is indexed.
+  void decodeDocs() {
+    auto raw = records.finish();
+    if (raw.empty()) return;
+    luxir::api::build::SpanBuilder<luxir::api::Map> docs(resource);
+    docs.reserve(raw.size());
+    std::string err;
+    for (std::size_t i = 0; i < raw.size(); i++) {
+      luxir::api::Map& map = docs.emplace_back();
+      if (!luxir::api::read_json(map, raw[i], resource, &err)) {
+        throw RequestError("malformed NDJSON record (stream document " + std::to_string(firstDocIndex + i) +
+                               "): " + (err.empty() ? std::string("invalid JSON") : err),
+                           "invalid_json");
+      }
+    }
+    proto.docs = docs.finish();
   }
 };
 
@@ -698,6 +724,14 @@ private:
       result_.docCount = batch->docCount;
       result_.deleteCount = batch->deleteCount;
       result_.firstDocIndex = batch->firstDocIndex;
+    }
+
+    // Runs on the update graph's unlimited-concurrency process node, so
+    // batches of one connection decode in parallel.  Submission order (and so
+    // updateVersion order) was fixed on the shard before any decoding.
+    void handle(IndexWriter& iw) override {
+      if (auto batch = batch_.lock()) batch->decodeDocs();
+      ProtoUpdateMessage::handle(iw);
     }
 
     void done(IndexWriter& iw) noexcept override {
@@ -1646,80 +1680,131 @@ private:
     engine.dispatch(*sreq, sreq->proto.max_parallel);
   }
 
+  // Decodes and normalizes a buffered /update body.  Runs on the task arena:
+  // a large JSON body (vectors especially) must not occupy the connection's
+  // I/O shard, which serves every other connection assigned to it.
+  static void prepareBufferedUpdate(HttpUpdateState& state, std::string_view coll,
+                                    const UpdateUrlParams& url) {
+    std::string err;
+    if (!luxir::api::read_json(state.proto, state.body, state.resource, &err)) {
+      throw RequestError(err.empty() ? "malformed update request" : err, "invalid_json");
+    }
+    std::string{}.swap(state.body); // Decoded request strings live in state.resource.
+    setCollectionTarget(state.proto.collection, coll, state.resource);
+    // Same unit rule as streaming groups: a body that sets either field-map knob
+    // owns the pair; otherwise the URL-param default applies.
+    if (state.proto.field_map.empty() && !state.proto.drop_unmapped &&
+        (!url.fieldMap.empty() || url.dropUnmapped)) {
+      copyFieldMap(state.proto, url.fieldMap, state.resource);
+      state.proto.drop_unmapped = url.dropUnmapped;
+    }
+    // ?commit=true is a publication guarantee, as at NDJSON EOF: the request
+    // commits before responding.  The body's other commit options survive.
+    if (url.commit) {
+      if (!state.proto.commit) state.proto.commit.emplace();
+      state.proto.commit->commit_within_ms = 0;
+      if (!url.waitForReplicas.empty()) state.proto.commit->wait_for_replicas = replicaRequirement(url.waitForReplicas);
+      if (url.waitForReplicasTimeoutMs) state.proto.commit->wait_for_replicas_timeout_ms = url.waitForReplicasTimeoutMs;
+    }
+  }
+
+  class BufferedUpdate final : public ProtoUpdateMessage {
+    std::shared_ptr<HttpSession> session;
+    std::shared_ptr<HttpUpdateState> state;
+    std::shared_ptr<ShardPin> pin;
+  public:
+    BufferedUpdate(std::shared_ptr<HttpSession> session, std::shared_ptr<HttpUpdateState> state, std::shared_ptr<ShardPin> pin)
+        : ProtoUpdateMessage(&state->proto), session(std::move(session)), state(std::move(state)), pin(std::move(pin)) {}
+    void done(IndexWriter&) override {
+      auto completed = takeCompletion(session->node_);
+      auto target = session;
+      auto guard = pin;
+      delete this;
+      completed->await(target->node_, [target, guard](auto result) {
+        net::post(target->stream_.get_executor(), [target, guard, result] {
+          try {
+            std::string out;
+            if (!api::write_json(result->response, out)) throw std::runtime_error("failed to serialize update response");
+            target->respondJson(http::status::ok, std::move(out));
+          } catch (...) { target->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
+        });
+      }, target->waitCancellation.get_token());
+    }
+  };
+
+  // Task arena: hands a decoded buffered update to its collection's writer.
+  static void submitBufferedUpdate(const std::shared_ptr<HttpSession>& self, std::shared_ptr<HttpUpdateState> state,
+                                   const std::string& tenant, const std::shared_ptr<ShardPin>& shardPin) {
+    BufferedUpdate* msg = nullptr;
+    ErrorKind fallback = ErrorKind::INVALID_REQUEST;  // the message validates its commit params
+    try {
+      auto admission = std::make_unique<BufferedUpdate>(self, std::move(state), shardPin);
+      fallback = ErrorKind::INTERNAL;
+      auto collection = self->node_.getOrCreateCollection(LuxirNode::target(tenant, admission->req->collection));
+      admission->target = collection->getId();
+      auto iw = collection->getShard()->requireIndexWriter();
+      msg = admission.release();
+      if (!iw->submitUpdate(msg)) throw std::runtime_error("update was not admitted");
+    } catch (...) {
+      delete msg;
+      auto failure = currentExceptionInfo(fallback);
+      net::post(self->stream_.get_executor(), [self, shardPin, failure] { self->respondError(failure); });
+    }
+  }
+
+  // task_arena::enqueue runs a const functor; the slot lets it hand its
+  // reference on, so the body is not pinned by a finished task.
+  struct UpdateStateSlot {
+    mutable std::shared_ptr<HttpUpdateState> state;
+  };
+
   void handleUpdate(std::string body, const std::string& coll,
                     const UpdateUrlParams& url) {
     auto state = std::make_shared<HttpUpdateState>();
-    try {
-      std::string err;
-      if (!luxir::api::read_json(state->proto, body, state->resource, &err)) {
-        throw RequestError(err.empty() ? "malformed update request" : err, "invalid_json");
-      }
-      setCollectionTarget(state->proto.collection, coll, state->resource);
-      // Same unit rule as streaming groups: a body that sets either field-map knob
-      // owns the pair; otherwise the URL-param default applies.
-      if (state->proto.field_map.empty() && !state->proto.drop_unmapped &&
-          (!url.fieldMap.empty() || url.dropUnmapped)) {
-        copyFieldMap(state->proto, url.fieldMap, state->resource);
-        state->proto.drop_unmapped = url.dropUnmapped;
-      }
-      // ?commit=true is a publication guarantee, as at NDJSON EOF: the request
-      // commits before responding.  The body's other commit options survive.
-      if (url.commit) {
-        if (!state->proto.commit) state->proto.commit.emplace();
-        state->proto.commit->commit_within_ms = 0;
-        if (!url.waitForReplicas.empty()) state->proto.commit->wait_for_replicas = replicaRequirement(url.waitForReplicas);
-        if (url.waitForReplicasTimeoutMs) state->proto.commit->wait_for_replicas_timeout_ms = url.waitForReplicasTimeoutMs;
-      }
-      requestId_ = std::string(state->proto.request_id);
-    } catch (const std::exception& e) {
-      respondException(e, ErrorKind::INVALID_REQUEST);
-      return;
-    }
-
-    std::string{}.swap(body); // Decoded request strings live in state->resource.
+    state->body = std::move(body);
     auto shardPin = makeShardPin();
-    class Update final : public ProtoUpdateMessage {
-      std::shared_ptr<HttpSession> session;
-      std::shared_ptr<HttpUpdateState> state;
-      std::shared_ptr<ShardPin> pin;
-    public:
-      Update(std::shared_ptr<HttpSession> session, std::shared_ptr<HttpUpdateState> state, std::shared_ptr<ShardPin> pin)
-          : ProtoUpdateMessage(&state->proto), session(std::move(session)), state(std::move(state)), pin(std::move(pin)) {}
-      void done(IndexWriter&) override {
-        auto completed = takeCompletion(session->node_);
-        auto target = session;
-        auto guard = pin;
-        delete this;
-        completed->await(target->node_, [target, guard](auto result) {
-          net::post(target->stream_.get_executor(), [target, guard, result] {
-            try {
-              std::string out;
-              if (!api::write_json(result->response, out)) throw std::runtime_error("failed to serialize update response");
-              target->respondJson(http::status::ok, std::move(out));
-            } catch (...) { target->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
-          });
-        }, target->waitCancellation.get_token());
-      }
-    };
     try {
-      if (state->proto.commit && state->proto.commit->wait_for_replicas) watchWaitDisconnect();
-      auto admission = std::make_unique<Update>(shared_from_this(), std::move(state), shardPin);
-      auto* msg = admission.get();
-      node_.getTaskArena().enqueue([self = shared_from_this(), msg, tenant = tenant_, shardPin] {
+      node_.getTaskArena().enqueue([self = shared_from_this(), slot = UpdateStateSlot{std::move(state)}, coll, url,
+                                    tenant = tenant_, shardPin] {
+        auto state = std::move(slot.state);
+        std::optional<ErrorInfo> failure;
         try {
-          auto collection = self->node_.getOrCreateCollection(LuxirNode::target(tenant, msg->req->collection));
-          msg->target = collection->getId();
-          auto iw = collection->getShard()->requireIndexWriter();
-          if (!iw->submitUpdate(msg)) throw std::runtime_error("update was not admitted");
+          prepareBufferedUpdate(*state, coll, url);
+        } catch (const std::exception& e) {
+          failure = classifyException(e, ErrorKind::INVALID_REQUEST);
         } catch (...) {
-          delete msg;
-          auto failure = currentExceptionInfo(ErrorKind::INTERNAL);
-          net::post(self->stream_.get_executor(), [self, shardPin, failure] { self->respondError(failure); });
+          failure = currentExceptionInfo(ErrorKind::INTERNAL);
         }
+        if (failure) {
+          net::post(self->stream_.get_executor(), [self, shardPin, failure = std::move(*failure)] { self->respondError(failure); });
+          return;
+        }
+        // A replica wait watches the socket for a client disconnect, which is
+        // shard work: hop back once for it, then submit from the arena.
+        if (state->proto.commit && state->proto.commit->wait_for_replicas) {
+          net::post(self->stream_.get_executor(), [self, state = std::move(state), tenant, shardPin]() mutable {
+            self->requestId_ = std::string(state->proto.request_id);
+            self->watchWaitDisconnect();
+            try {
+              self->node_.getTaskArena().enqueue([self, slot = UpdateStateSlot{std::move(state)}, tenant, shardPin] {
+                submitBufferedUpdate(self, std::move(slot.state), tenant, shardPin);
+              });
+            } catch (const std::exception& e) {
+              self->respondException(e, ErrorKind::INTERNAL);
+            }
+          });
+          return;
+        }
+        // The decoded request_id names the request in an error response.  This
+        // post precedes the submission, so it reaches the shard before any
+        // completion does.
+        net::post(self->stream_.get_executor(), [self, shardPin, id = std::string(state->proto.request_id)]() mutable {
+          self->requestId_ = std::move(id);
+        });
+        submitBufferedUpdate(self, std::move(state), tenant, shardPin);
       });
-      admission.release();
     } catch (const std::exception& e) {
-      respondException(e, ErrorKind::INVALID_REQUEST);
+      respondException(e, ErrorKind::INTERNAL);
     }
   }
 
@@ -2949,8 +3034,7 @@ private:
     assert(state->batch != nullptr);
     assert(!state->batchReady);
 
-    accountStreamSubmission(*state->batch, state->batch->docs.size(), 0);
-    state->batch->proto.docs = state->batch->docs.finish();
+    accountStreamSubmission(*state->batch, state->batch->records.size(), 0);
     state->batch->proto.allow_dups = state->group.allowDups();
     state->batch->proto.all_or_none = state->group.allOrNone();
     applyStreamBatchFieldMap(*state, *state->batch);
@@ -2981,7 +3065,7 @@ private:
                            "_update_ inline request exceeds indexing.max-request-body"});
       return false;
     }
-    if (state->batch->docs.size() != 0) {
+    if (state->batch->records.size() != 0) {
       failStreamingUpdate(ErrorInfo::of(ErrorKind::INTERNAL, "internal error: inline _update_ encountered a non-empty stream batch"));
       return false;
     }
@@ -3025,7 +3109,7 @@ private:
       commitParams = &*state->group.request->proto.commit;
     }
 
-    if (state->batch->docs.size() > 0 || commitParams != nullptr) {
+    if (state->batch->records.size() > 0 || commitParams != nullptr) {
       state->emitAfterBatch = true;
       state->resetGroupAfterBatch = true;
       bool submitted = submitStreamBatch(commitParams, true);
@@ -3068,7 +3152,7 @@ private:
     assert(control.kind != HttpStreamControlKind::Noop);
 
     if (control.kind == HttpStreamControlKind::Open) {
-      if (state->group.open || streamIntervalHasActivity(*state) || state->batch->docs.size() > 0) {
+      if (state->group.open || streamIntervalHasActivity(*state) || state->batch->records.size() > 0) {
         if (!closeCurrentStreamGroup(nullptr, state->group.open)) {
           state->pendingControl = std::move(control);
           return false;
@@ -3134,53 +3218,82 @@ private:
     return false;
   }
 
+  // Control records are `{}` or objects whose sole key is "_name_"
+  // (extractStreamControl).  So a record that opens as an object whose first
+  // key plainly does not have that shape is a document and can skip inline
+  // decoding.  Anything else - an underscore-delimited or escaped first key,
+  // an empty object, a non-object or garbage - is decoded inline, which also
+  // keeps the immediate error for input that is not an object at all.
+  static bool mayBeStreamControl(std::string_view record) {
+    auto isSpace = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+    std::size_t i = 0;
+    while (i < record.size() && isSpace(record[i])) i++;
+    if (i == record.size() || record[i] != '{') return true;
+    i++;
+    while (i < record.size() && isSpace(record[i])) i++;
+    if (i == record.size() || record[i] != '"') return true;
+    i++;
+    if (i == record.size() || record[i] != '_') return i == record.size() || record[i] == '\\';
+    for (std::size_t j = i + 1; j < record.size(); j++) {
+      if (record[j] == '\\') return true;
+      if (record[j] == '"') return record[j - 1] == '_' && j - 1 > i;
+    }
+    return true;
+  }
+
   bool processStreamRecord(std::string_view record) {
     auto state = streamUpdate_;
     assert(state != nullptr);
     assert(state->batch != nullptr);
     assert(!state->batchReady);
 
-    luxir::api::Map map;
-    std::string err;
-    if (!luxir::api::read_json(map, record, state->batch->resource, &err)) {
-      failStreamingInput({ErrorKind::INVALID_REQUEST, "invalid_json",
-                          err.empty() ? "malformed NDJSON record" : err});
-      return false;
-    }
+    // Only a record that may be a control record is decoded here, in stream
+    // order; documents are copied raw into the batch and decoded on the task
+    // arena (HttpStreamBatchState::decodeDocs), where a malformed one fails
+    // its batch with the same invalid_json error.
+    if (mayBeStreamControl(record)) {
+      // The decoded map is only inspected here (a control payload is
+      // re-decoded into its own request arena), so it needs no batch memory.
+      std::pmr::monotonic_buffer_resource scratch;
+      luxir::api::Map map;
+      std::string err;
+      if (!luxir::api::read_json(map, record, scratch, &err)) {
+        failStreamingInput({ErrorKind::INVALID_REQUEST, "invalid_json",
+                            err.empty() ? "malformed NDJSON record" : err});
+        return false;
+      }
 
-    HttpStreamControl control;
-    bool isControl = false;
-    if (!extractStreamControl(map, control, isControl, record.size(), err)) {
-      failStreamingInput(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
-      return false;
-    }
+      HttpStreamControl control;
+      bool isControl = false;
+      if (!extractStreamControl(map, control, isControl, record.size(), err)) {
+        failStreamingInput(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
+        return false;
+      }
 
-    if (isControl) {
-      // Noop meta record (e.g. _header_).  It was decoded into the batch
-      // arena, so it must count toward rotation or a stream of meta records
-      // would grow the arena without bound.  With no docs buffered an empty
-      // batch carries no state (proto/collection are populated at submission),
-      // so past the target it is simply replaced - the same rotation
-      // submitStreamBatch performs, minus the submit.  With docs pending the
-      // bytes stay in that batch, but the no-op itself never forces submission.
-      if (control.kind == HttpStreamControlKind::Noop) {
+      // Noop meta record (e.g. _header_).  Its bytes count toward rotation
+      // like a document's, so a stream of meta records cannot pin one batch
+      // forever.  With no docs buffered an empty batch carries no state
+      // (proto/collection are populated at submission), so past the target it
+      // is simply replaced - the same rotation submitStreamBatch performs,
+      // minus the submit.  With docs pending the bytes stay in that batch, but
+      // the no-op itself never forces submission.
+      if (isControl && control.kind == HttpStreamControlKind::Noop) {
         state->batch->sourceBytes += record.size();
         if (state->group.allOrNone() && state->batch->sourceBytes > state->maxRequestBody) {
           failStreamingInput({ErrorKind::RESOURCE_EXHAUSTED, "request_too_large",
                               "all_or_none NDJSON group exceeds indexing.max-request-body"});
           return false;
         }
-        if (state->batch->docs.size() == 0 &&
+        if (state->batch->records.size() == 0 &&
             state->batch->sourceBytes >= state->batchTargetBytes) {
           state->batch = std::make_unique<HttpStreamBatchState>(state->batchMaxDocs);
         }
         return true;
       }
-      return beginStreamControlBarrier(std::move(control));
-    } else {
-      startImplicitStreamGroup();
-      state->batch->docs.push_back(map);
+      if (isControl) return beginStreamControlBarrier(std::move(control));
     }
+    startImplicitStreamGroup();
+    state->batch->records.push_back(luxir::api::build::arenaStr(state->batch->resource, record));
     state->batch->sourceBytes += record.size();
     if (state->group.allOrNone()) {
       if (state->batch->sourceBytes > state->maxRequestBody) {
@@ -3191,7 +3304,7 @@ private:
       return true;
     }
     if (state->batch->sourceBytes >= state->batchTargetBytes ||
-        state->batch->docs.size() >= state->batchMaxDocs) {
+        state->batch->records.size() >= state->batchMaxDocs) {
       if (!submitStreamBatch(nullptr)) return false;
       return state->canAdmit();
     }
