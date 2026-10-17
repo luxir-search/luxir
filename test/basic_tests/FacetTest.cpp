@@ -2146,6 +2146,105 @@ TEST_F(FacetTest, subOpInlineModesAgree) {
   EXPECT_EQ(5, bar[1]);   // (7 + 3) / 2
 }
 
+// A low-cardinality facet whose sub-ops are all bare-column metrics folds them
+// into its ord pass as keyed batches. It must answer exactly what the
+// count-then-bucket-domain route (SORT_KEY_ONLY) and the per-document inline
+// route answer: across segments, deletes, missing facet and metric values,
+// filtered domains, mincount, selected values, and serial/parallel execution.
+TEST_F(FacetTest, fusedColumnMetricsMatchBucketDomains) {
+  CollectionHelper helper;
+  for (int32_t seg = 0; seg < 3; seg++) {
+    std::vector<Doc> docs;
+    for (int32_t i = 0; i < 3000; i++) {
+      int32_t n = seg * 3000 + i;
+      Doc doc = flatdoc("id", std::to_string(n), "dense_i", (int64_t)(n % 97),
+                        "flag_s", n % 3 == 0 ? "n" : "y");
+      // Interleaved values, except long runs of one value in the last
+      // segment (the keyed accumulators' run-length arm).
+      int32_t cat = seg < 2 ? n * 7 % 6 : i / 500 % 6;
+      if (n % 23 != 0) doc.push_back(NameVal{"cat_s", "c" + std::to_string(cat)});
+      if (n % 11 != 0) doc.push_back(NameVal{"size_i", (int64_t)(n * 31 % 1000)});
+      if (n % 13 != 0) doc.push_back(NameVal{"price_d", (double)(n % 50)});
+      docs.push_back(std::move(doc));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  std::vector<std::string> deleted;
+  for (int32_t n = 3000; n < 6000; n += 17) deleted.push_back(std::to_string(n));
+  ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
+
+  struct Shape {
+    bool filtered;
+    int64_t limit;
+    int64_t mincount;
+    bool selected;
+  };
+  auto run = [&](const Shape& shape, bool parallel, FacetSubOpInlineMode mode,
+                 bool perDoc, size_t* keyedBatches = nullptr) {
+    SearchOverridesGuard guard(forcedFacetSubOpInline,
+                               disableKeyedInlineBatchesForTests,
+                               inlineFacetEntryStatsForTests);
+    forcedFacetSubOpInline = mode;
+    disableKeyedInlineBatchesForTests = perDoc;
+    InlineFacetEntryStats stats;
+    inlineFacetEntryStatsForTests = &stats;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& top = req->topDocs("q").limit(0);
+    if (shape.filtered) top.matchQuery("flag_s", "y");
+    else top.allQuery();
+    auto& facet = top.facet("f", "cat_s").limit(shape.limit);
+    if (shape.mincount >= 0) facet.mincount(shape.mincount);
+    std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
+    if (shape.selected) {
+      std::array<std::string, 2> values{"c2", "absent"};
+      setSelected(facet, values);
+    }
+    facet.avg("avg_size", "size_i").sum("sum_size", "size_i")
+        .min("min_size", "size_i").max("max_size", "size_i")
+        .avg("avg_dense", "dense_i").avg("avg_price", "price_d")
+        .sum("sum_price", "price_d");
+    req->execute(parallel);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    std::vector<std::byte> encoded;
+    EXPECT_TRUE(api::encode(topFacetResult(*req, "q", "f"), encoded));
+    if (keyedBatches != nullptr) *keyedBatches = stats.keyedBatches.load();
+    return encoded;
+  };
+
+  for (bool filtered : {false, true}) {
+    for (int64_t limit : {3, 6, -1}) {
+      for (int64_t mincount : {-1, 1, 1100}) {  // -1: unset
+        for (bool selected : {false, true}) {
+          for (bool parallel : {false, true}) {
+            Shape shape{filtered, limit, mincount, selected};
+            SCOPED_TRACE(std::format("filtered={} limit={} mincount={} "
+                                     "selected={} parallel={}", filtered,
+                                     limit, mincount, selected, parallel));
+            size_t fusedBatches = 0, domainBatches = 0;
+            auto fused = run(shape, parallel, FacetSubOpInlineMode::AUTO,
+                             false, &fusedBatches);
+            auto domains = run(shape, parallel,
+                               FacetSubOpInlineMode::SORT_KEY_ONLY, false,
+                               &domainBatches);
+            EXPECT_EQ(fused, domains);
+            EXPECT_EQ(fused, run(shape, parallel, FacetSubOpInlineMode::AUTO,
+                                 true));
+            EXPECT_GT(fusedBatches, 0u);
+            EXPECT_EQ(domainBatches, 0u);
+          }
+        }
+      }
+    }
+  }
+
+  // mincount=0 pads zero-count buckets on the count route only, so it stays
+  // there.
+  size_t batches = 0;
+  run({false, 6, 0, false}, true, FacetSubOpInlineMode::AUTO, false, &batches);
+  EXPECT_EQ(batches, 0u);
+}
+
 // Finite full-bucket coverage is only a candidate for AUTO: a 10K matching
 // domain leaves the extra metrics on the feed, while the 48K threshold promotes
 // them. Forced modes remain authoritative on both sides of the crossover.
@@ -2389,6 +2488,10 @@ TEST_F(FacetTest, bucketDomainAutoFollowsCoverage) {
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
   auto sourceDetails = [&](std::string_view field, bool filtered) {
+    // The narrow facet's bare-column metric would otherwise fold into its
+    // ord pass and never build bucket domains.
+    SearchOverridesGuard guard(forcedFacetSubOpInline);
+    forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
     auto req = localReq(helper.getSearchEngine());
     req->collection("main").profile();
     auto addFacet = [&](auto& cursor) {

@@ -94,9 +94,14 @@ struct InlineFacetEntryStats {
   std::atomic<size_t> mixedMerges{0};
   std::atomic<size_t> denseFallbacks{0};
   std::atomic<size_t> entryStride{0};
+  // Ord batches accumulated through the keyed batch path.
+  std::atomic<size_t> keyedBatches{0};
 };
 inline InlineFacetEntryStats* inlineFacetEntryStatsForTests = nullptr;
 inline bool disableDenseFacetStateForTests = false;
+// A/B toggle: inline facet metrics take the per-document calculator calls
+// instead of keyed ord batches.
+inline bool disableKeyedInlineBatchesForTests = false;
 
 enum class InlineFacetEntryMode {
   AUTO, FORCE_DENSE, FORCE_SPARSE

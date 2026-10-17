@@ -222,6 +222,7 @@ public:
     const DenseFacetStateOps* denseFacetState;
     BucketValueType resultType;
     uint32_t entryBytes;
+    bool keyedBatches;
 
     ExprStatsOp& thisOp() { return (ExprStatsOp&)getOp(); }
 
@@ -325,7 +326,10 @@ public:
         : InlineCalculator(op, parent, slot, numSlots),
           denseFacetState(static_cast<ExprStatsOp&>(op).denseFacetState),
           resultType(static_cast<ExprStatsOp&>(op).aggregate.root().type),
-          entryBytes(op.inlineEntryBytes()) {
+          entryBytes(op.inlineEntryBytes()),
+          keyedBatches(static_cast<ExprStatsOp&>(op).inlinesAsColumnBatch()
+              && (denseFacetState == nullptr
+                  || denseFacetState->accumulateKeyedRawBatch != nullptr)) {
       if (inlineAggregateStatsForTests != nullptr) {
         inlineAggregateStatsForTests->stateBytesPerBucket.store(
             entryBytes, std::memory_order_relaxed);
@@ -353,6 +357,74 @@ public:
     void update(void* entry, int32_t docid) override {
       if (denseFacetState != nullptr) addDenseDoc(entry, docid);
       else addGenericDoc(entry, docid);
+    }
+
+    bool acceptsKeyedBatches() const override { return keyedBatches; }
+
+    void initEntry(void* entry) override {
+      if (denseFacetState != nullptr) {
+        denseFacetState->init(entry);
+      } else {
+        state(entry).init();
+      }
+    }
+
+    void updateKeyedBatch(char* states, size_t stride,
+                          std::span<const int64_t> keys,
+                          std::span<const int32_t> docs) override {
+      assert(keyedBatches);
+      if (segmentFailure != AggregateFailure::NONE) {
+        for (int64_t key : keys) {
+          void* entry = states + (size_t)key * stride;
+          if (denseFacetState != nullptr) {
+            denseFacetState->fail(entry, segmentFailure);
+          } else {
+            state(entry).fail(segmentFailure);
+          }
+        }
+        return;
+      }
+      // Values are staged in stack chunks: stores into members could alias
+      // the column iterator's own state and force reloads per document.
+      static constexpr size_t CHUNK = 256;
+      int64_t chunkKeys[CHUNK];
+      int64_t chunkValues[CHUNK];
+      for (BoundAggregateInput& binding : bindings) {
+        assert(binding.bareColumn);
+        for (size_t start = 0; start < docs.size(); start += CHUNK) {
+          size_t end = std::min(docs.size(), start + CHUNK);
+          const int64_t* runKeys = keys.data() + start;
+          size_t present = end - start;
+          if (denseFacetState != nullptr) {
+            // Present on every doc (resolveDenseFacetState): rank is doc id.
+            auto& column = binding.columnIterator->values();
+            for (size_t i = start; i < end; i++) {
+              chunkValues[i - start] = column.valueAt(docs[i]);
+            }
+          } else {
+            present = 0;
+            for (size_t i = start; i < end; i++) {
+              int64_t raw;
+              if (binding.readRawPoint(docs[i], raw)) {
+                chunkKeys[present] = keys[i];
+                chunkValues[present++] = raw;
+              }
+            }
+            runKeys = chunkKeys;
+          }
+          if (present == 0) continue;
+          std::span<const int64_t> keySpan(runKeys, present);
+          std::span<const int64_t> valueSpan(chunkValues, present);
+          if (denseFacetState != nullptr) {
+            denseFacetState->accumulateKeyedRawBatch(
+                states, stride, keySpan, valueSpan);
+          } else {
+            binding.leaf->resolved.state.accumulateKeyedRawBatch(
+                states + binding.leafStateOffset, stride, keySpan,
+                valueSpan, binding.columnType, binding.arguments);
+          }
+        }
+      }
     }
 
     void merge(void* target, void* from) override {
@@ -697,6 +769,16 @@ public:
   }
 
   bool canInline() override { return true; }
+
+  // Every leaf a bare scalar column with a keyed raw batch accumulator: the
+  // inline calculator then reads its values straight from the column per batch.
+  bool inlinesAsColumnBatch() const override {
+    return std::ranges::all_of(aggregate.leaves, [](const AggregateLeaf& leaf) {
+      const ValueNode& input = leaf.input->root();
+      return input.kind == ValueNodeKind::COLUMN && !valueArray(input.type)
+          && leaf.resolved.state.accumulateKeyedRawBatch != nullptr;
+    });
+  }
 
   uint32_t inlineEntryBytes() const override {
     return denseFacetState != nullptr ? denseFacetState->bytes

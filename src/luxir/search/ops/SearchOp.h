@@ -212,6 +212,11 @@ public:
 
   bool canInlineInBucket() { return bucketDomain == nullptr && canInline(); }
 
+  // Whether this op's inline calculator accumulates keyed batches
+  // (InlineCalculator::updateKeyedBatch) from bare column reads alone, so a
+  // low-cardinality facet can fold it into its single ord pass.
+  virtual bool inlinesAsColumnBatch() const { return false; }
+
   // Packed state size belongs to the resolved plan, so scheduling can budget
   // inline buckets without constructing their runtime calculators.
   virtual uint32_t inlineEntryBytes() const { return 0; }
@@ -483,6 +488,22 @@ public:
     virtual void rewind() {}
     virtual void insert(void* entry, int32_t docid) = 0;
     virtual void update(void* entry, int32_t docid) = 0;
+    // Keyed batches: the caller holds one entry per key in a dense array,
+    // `states` pointing at key 0's state for this calculator and `stride`
+    // apart. It initializes a key's state (initEntry) before its first batch;
+    // updateKeyedBatch then adds docs[i] to key keys[i] for every i, in doc
+    // order, exactly as update() per document would.
+    virtual bool acceptsKeyedBatches() const { return false; }
+    virtual void initEntry(void* entry) { unused(entry); }
+    virtual void updateKeyedBatch(char* states, size_t stride,
+                                  std::span<const int64_t> keys,
+                                  std::span<const int32_t> docs) {
+      unused(states);
+      unused(stride);
+      unused(keys);
+      unused(docs);
+      assert(false);
+    }
     virtual void merge(void* target, void* from) = 0;
     // mergeNew is called when entry did not exist for target
     virtual void mergeNew(void* target, void* from) = 0;
@@ -825,6 +846,68 @@ public:
       insertEntry(firstTouch(key), docid);
     } else {
       updateEntry(entry, docid);
+    }
+  }
+
+  // Whether addKeyedBatch applies: a dense table whose calculators all take
+  // keyed batches.
+  bool acceptsKeyedBatches() const {
+    if constexpr (!std::is_same_v<Key, int64_t> || Payload::BYTES != 0) {
+      return false;
+    } else {
+      return rep == Rep::DENSE && !disableKeyedInlineBatchesForTests
+          && std::ranges::all_of(calcs, [](auto* calc) {
+               return calc->acceptsKeyedBatches();
+             });
+    }
+  }
+
+  LUXIR_NOINLINE void firstKeyedTouch(int64_t key, char* entry) {
+    ensureTouchedCapacity();
+    touchedKeys.push_back(key);
+    char* ptr = entry + HEADER_BYTES;
+    for (size_t c = 0; c < calcs.size(); c++) {
+      calcs[c]->initEntry(ptr);
+      ptr += calcEntryBytes[c];
+    }
+  }
+
+  // add(keys[i], docs[i]) for every i, in doc order: entry counts first,
+  // then one keyed batch per calculator instead of a call per document.
+  void addKeyedBatch(std::span<const int64_t> keys,
+                     std::span<const int32_t> docs) {
+    assert(acceptsKeyedBatches());
+    assert(keys.size() == docs.size());
+    // Locals, not members: the unaligned entry stores below may alias any
+    // member, which would otherwise be reloaded for every document.
+    char* base = denseEntries.data();
+    size_t entryStride = stride;
+    // One update per run of equal keys when runs are long, else one per
+    // document (a run-detection branch mispredicts on interleaved keys).
+    size_t n = keys.size();
+    size_t changes = 0;
+    for (size_t i = 1; i < n; i++) changes += keys[i] != keys[i - 1];
+    bool runs = 4 * changes < n;
+    for (size_t i = 0; i < n;) {
+      int64_t key = keys[i];
+      assert(key >= 0 && key < keySpaceSize);
+      size_t j = i + 1;
+      if (runs) {
+        while (j < n && keys[j] == key) j++;
+      }
+      char* entry = base + (size_t)key * entryStride;
+      int64_t count = loadUnaligned<int64_t>(entry);
+      if (count == 0) [[unlikely]] firstKeyedTouch(key, entry);
+      storeUnaligned<int64_t>(entry, count + (int64_t)(j - i));
+      i = j;
+    }
+    char* states = denseEntries.data() + HEADER_BYTES;
+    for (size_t c = 0; c < calcs.size(); c++) {
+      calcs[c]->updateKeyedBatch(states, stride, keys, docs);
+      states += calcEntryBytes[c];
+    }
+    if (stats != nullptr) {
+      stats->keyedBatches.fetch_add(1, std::memory_order_relaxed);
     }
   }
 

@@ -104,6 +104,12 @@ struct AggregateStateOps {
                          std::span<const AggregateConstant> arguments);
   using Finish = BucketScalar (*)(
       const void* state, std::span<const AggregateConstant> arguments);
+  // accumulateRawPoint(states + keys[i] * stride, raw[i]) for every i: one
+  // call folds a batch whose values belong to different keyed states.
+  using AccumulateKeyedRawBatch = void (*)(
+      void* states, size_t stride, std::span<const int64_t> keys,
+      std::span<const int64_t> raw, FieldType::Type columnType,
+      std::span<const AggregateConstant> arguments);
 
   uint32_t bytes = 0;
   Init init = nullptr;
@@ -113,6 +119,7 @@ struct AggregateStateOps {
   AccumulateRawBatch accumulateRawBatch = nullptr;
   Merge merge = nullptr;
   Finish finish = nullptr;
+  AccumulateKeyedRawBatch accumulateKeyedRawBatch = nullptr;
 };
 
 // Optional packed state for a bare, single-valued column that is present on
@@ -121,6 +128,10 @@ struct AggregateStateOps {
 struct DenseFacetStateOps {
   using Init = void (*)(void* state);
   using AccumulateRawPoint = void (*)(void* state, int64_t raw);
+  // accumulateRawPoint(states + keys[i] * stride, raw[i]) for every i.
+  using AccumulateKeyedRawBatch = void (*)(void* states, size_t stride,
+                                           std::span<const int64_t> keys,
+                                           std::span<const int64_t> raw);
   using Fail = void (*)(void* state, AggregateFailure failure);
   using Merge = void (*)(void* target, const void* source);
   using Finish = BucketScalar (*)(const void* state, int64_t count);
@@ -131,6 +142,7 @@ struct DenseFacetStateOps {
   Fail fail = nullptr;
   Merge merge = nullptr;
   Finish finish = nullptr;
+  AccumulateKeyedRawBatch accumulateKeyedRawBatch = nullptr;
 };
 
 struct ResolvedAggregate {

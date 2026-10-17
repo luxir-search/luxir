@@ -134,6 +134,12 @@ class StrFacetOp : public FieldFacetReq {
   // while they fit COUNTER_LANE_BYTES (countSegment). Refittable.
   static constexpr int32_t COUNTER_LANES = 4;
   static constexpr int64_t COUNTER_LANE_BYTES = 32 * 1024;
+  // Fused column metrics (init): the largest ord space, and the largest
+  // multiple of the page size it may reach, for which bare-column metrics
+  // join the count pass as keyed batches instead of a post-selection
+  // bucket-domain feed. Refittable.
+  static constexpr int64_t FUSED_METRICS_MAX_ORDS = 256;
+  static constexpr int64_t FUSED_METRICS_MAX_PAGES = 4;
 
   std::shared_ptr<OrdMap> ordMap;
   struct PinnedBucket {
@@ -392,6 +398,24 @@ public:
     // that trade has not been measured. LUXIR_FACET_SUBOP_INLINE=all is how to
     // measure it.
     int64_t buckets = ordMap ? ordMap->numOrds() : 0;
+    // Fused column metrics: a low-cardinality facet whose sub-ops are all
+    // bare-column metrics (avg/sum/min/max of a numeric column) accumulates
+    // them in the one ord pass, a keyed batch per decoded ord batch into the
+    // dense ord-indexed entry table, instead of materializing a domain per
+    // returned bucket and walking the metric column once per bucket. Most of
+    // the domain lands in the returned buckets anyway at this cardinality.
+    // mincount=0 stays on the count route, whose page pads zero-count
+    // buckets the inline route never touches.
+    bool fusedMetrics = inlineSubOps.empty() && !subOps.empty()
+        && ordMap != nullptr && minCount != 0
+        && buckets <= FUSED_METRICS_MAX_ORDS
+        && (limit < 0 || buckets <= FUSED_METRICS_MAX_PAGES * limit)
+        && forcedFacetSubOpInline == FacetSubOpInlineMode::AUTO
+        && std::ranges::all_of(subOps, [](const auto& subOp) {
+             return subOp.second->canInlineInBucket()
+                 && subOp.second->inlinesAsColumnBatch();
+           });
+    if (fusedMetrics) inlineRemainingSubOps();
     inlineAllCandidate = limit != -1 && !inlineSubOps.empty()
         && limit >= buckets
         && forcedFacetSubOpInline == FacetSubOpInlineMode::AUTO
@@ -727,6 +751,25 @@ public:
         }
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
+        if (found && data.counts.acceptsKeyedBatches()) {
+          // Each decoded ord batch goes to the calculators whole: they read
+          // their columns for its docs and fold the values into the ords'
+          // entries in one call.
+          OrdColReader ordColReader(postingsReader, *segFieldInfo);
+          OrdValueBatches values(domain, ordColReader, mapping, maxDoc,
+                                 false, nullptr);
+          OrdValueBatches::Batch batch;
+          while (values.next(batch)) {
+            data.counts.addKeyedBatch(
+                std::span<const int64_t>(batch.ords, (size_t)batch.size),
+                std::span<const int32_t>(batch.docs, (size_t)batch.size));
+          }
+          data.missing_num += values.missing();
+          if (profile != nullptr) {
+            profile->details.emplace_back("keyed metric batches");
+          }
+          return;
+        }
         // Ords arrive in document order; a remapped segment's are mapped a
         // batch at a time by point decodes of its deltas (an identity
         // segment's need none). Local staging may still win with enough
