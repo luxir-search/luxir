@@ -556,7 +556,7 @@ private:
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
     NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
-    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED, WAIT_FOR_REPLICAS
+    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED
   };
 
   struct RouteMatch {
@@ -1214,6 +1214,7 @@ private:
                                          json, overlay, err)) return false;
 
     appendStringParam(params, "query", true, json, overlay);
+    appendStringParam(params, "collapse", true, json, overlay);
     if (!appendIntegerParam<std::int64_t>(params, "limit",
                                          "signed 64-bit decimal integer", true,
                                          json, overlay, err) ||
@@ -1287,8 +1288,6 @@ private:
       m.route = Route::COLLECTION_CREATE; m.allow = "POST, PUT";
     } else if (target == "/collections/_delete") {
       m.route = Route::COLLECTION_DELETE; m.allow = "POST";
-    } else if (parseCollectionPath(target, "/_wait_for_replicas", m.coll)) {
-      m.route = Route::WAIT_FOR_REPLICAS; m.allow = "POST";
     } else if (parseCollectionPath(target, "/_snapshot", m.coll)) {
       m.route = Route::REPLICATION_SNAPSHOT; m.allow = "GET, HEAD";
     } else if (parseSnapshotFilePath(target, m.coll, m.file)) {
@@ -1311,7 +1310,7 @@ private:
       return m;
     }
     bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE ||
-                           m.route == Route::STATS || m.route == Route::SCHEMA || m.route == Route::WAIT_FOR_REPLICAS ||
+                           m.route == Route::STATS || m.route == Route::SCHEMA ||
                            m.route == Route::REPLICATION_SNAPSHOT || m.route == Route::REPLICATION_FILE;
     m.emptyCollection = collectionRoute && m.coll.empty() && target.starts_with("/collections/");
     return m;
@@ -1386,7 +1385,6 @@ private:
         handleReplicationFile(coll, match.file, req.count(http::field::range) == 1 ? std::string(req[http::field::range]) : std::string(),
                               req.method() == http::verb::head); break;
       case Route::REPLICATION_INSTALLED: handleReplicationInstalled(std::move(req.body())); break;
-      case Route::WAIT_FOR_REPLICAS: handleWaitForReplicas(req.body(), coll); break;
       case Route::HEALTH:
         respondJson(http::status::ok, R"({"status":"ok"})");
         break;
@@ -1787,32 +1785,74 @@ private:
       return;
     }
     CollectionId id;
-    try { id = adminTarget(state->request.tenant, state->request.name); }
-    catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
+    std::optional<PublicationWait> wait;
+    try {
+      id = adminTarget(state->request.tenant, state->request.name);
+      wait = publicationWait(state->request.wait_for_replicas, state->request.wait_for_replicas_timeout_ms);
+    } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
 
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, id, shardPin] {
-      std::string out;
-      std::optional<ErrorInfo> failure;
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, id, shardPin, wait] {
       try {
         auto created = self->node_.createCollection(id,
             state->request.schema ? &*state->request.schema : nullptr);
-        luxir::api::CreateCollectionResponse response;
-        response.name = state->request.name;
-        auto token = created->getShard()->requireIndexWriter()->initialCommit().token();
-        response.commit = token;
-        if (!luxir::api::write_json(response, out)) {
-          throw std::runtime_error("failed to serialize create collection response");
-        }
+        auto commit = created->getShard()->requireIndexWriter()->initialCommit();
+        self->respondPublished(shardPin, id, commit, wait, ReplicationSource::Members::SUBSCRIBED,
+            [state, token = commit.token()](const std::optional<api::ReplicaResult>& replicas) {
+              luxir::api::CreateCollectionResponse response{token, state->request.name, replicas};
+              std::string out;
+              if (!luxir::api::write_json(response, out)) throw std::runtime_error("failed to serialize create collection response");
+              return out;
+            });
       } catch (const std::exception& e) {
-        failure = classifyException(e, ErrorKind::INTERNAL);
+        self->finishPublication(shardPin, wait.has_value(), classifyException(e, ErrorKind::INTERNAL));
       }
+    });
+  }
 
-      net::post(self->stream_.get_executor(),
-          [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
-            if (failure) self->respondError(*failure);
-            else self->respondJson(http::status::ok, std::move(body));
-          });
+  // A publication's requested replica wait; URL parameters override the body.
+  // Runs on the io thread before the publication, arming disconnect detection.
+  struct PublicationWait {
+    api::ReplicaRequirement requirement;
+    uint64_t timeoutMs;
+    std::stop_token stop;
+  };
+  std::optional<PublicationWait> publicationWait(std::optional<api::ReplicaRequirement> requirement,
+                                                 std::optional<uint64_t> timeoutMs) {
+    if (auto text = findParam(urlParams_, "wait_for_replicas")) requirement = replicaRequirement(*text);
+    if (auto text = findParam(urlParams_, "wait_for_replicas_timeout_ms")) timeoutMs = replicationNumber(*text);
+    if (!requirement) return std::nullopt;
+    ReplicationSource::validate(*requirement);
+    watchWaitDisconnect();
+    return PublicationWait{*requirement, timeoutMs.value_or(30000), waitCancellation.get_token()};
+  }
+
+  // Off the io thread, after `commit` was published: responds with
+  // render(replicas), once the requested followers serve it.
+  void respondPublished(std::shared_ptr<ShardPin> pin, CollectionId id, const CommitId& commit,
+                        const std::optional<PublicationWait>& wait, ReplicationSource::Members members,
+                        std::function<std::string(const std::optional<api::ReplicaResult>&)> render) {
+    auto respond = [self = shared_from_this(), pin, render = std::move(render), waiting = wait.has_value()]
+                   (std::optional<api::ReplicaResult> replicas) {
+      std::variant<std::string, ErrorInfo> result;
+      try { result = render(replicas); }
+      catch (const std::exception& e) { result = classifyException(e, ErrorKind::INTERNAL); }
+      self->finishPublication(pin, waiting, std::move(result));
+    };
+    if (!wait) { respond(std::nullopt); return; }
+    auto& waits = node_.getCommitWaits();
+    waits.awaitReplicas(waits.prepareReplicas(std::move(id), commit, wait->requirement,
+                                              waits.deadlineAfter(wait->timeoutMs), members),
+        wait->stop, [self = shared_from_this(), respond = std::move(respond)](api::ReplicaResult replicas) {
+          self->node_.getTaskArena().enqueue([respond, replicas] { respond(replicas); });
+        });
+  }
+
+  void finishPublication(std::shared_ptr<ShardPin> pin, bool waiting, std::variant<std::string, ErrorInfo> result) {
+    net::post(stream_.get_executor(), [self = shared_from_this(), pin, waiting, result = std::move(result)]() mutable {
+      if (waiting) self->stopWaitDisconnect();
+      if (auto* body = std::get_if<std::string>(&result)) self->respondJson(http::status::ok, std::move(*body));
+      else self->respondError(std::get<ErrorInfo>(result));
     });
   }
 
@@ -2015,35 +2055,6 @@ private:
   void stopWaitDisconnect() {
     ++waitDisconnectEpoch_;
     waitDisconnect_.emit(net::cancellation_type::terminal);
-  }
-
-  void handleWaitForReplicas(const std::string& body, const std::string& coll) {
-    try {
-      std::pmr::monotonic_buffer_resource arena;
-      api::WaitForReplicasRequest request;
-      std::string error;
-      if (!api::read_json(request, body, arena, &error)) throw RequestError(error);
-      setCollectionTarget(request.collection, coll, arena);
-      if (auto text = findParam(urlParams_, "wait_for_replicas")) request.wait_for_replicas = replicaRequirement(*text);
-      if (auto text = findParam(urlParams_, "wait_for_replicas_timeout_ms")) request.wait_for_replicas_timeout_ms = replicationNumber(*text);
-      if (!request.wait_for_replicas) throw RequestError("wait_for_replicas is required");
-      auto id = CommitId::parse(request.commit);
-      auto pin = makeShardPin();
-      watchWaitDisconnect();
-      auto& waits = node_.getCommitWaits();
-      waits.awaitReplicas(LuxirNode::target(tenant_, request.collection), id, *request.wait_for_replicas,
-          waits.deadlineAfter(request.wait_for_replicas_timeout_ms.value_or(30000)), waitCancellation.get_token(),
-          [self = shared_from_this(), pin, token = id.token()](api::ReplicaResult replicas) {
-            net::post(self->stream_.get_executor(), [self, pin, token, replicas] {
-              try {
-                api::WaitForReplicasResponse response{token, replicas};
-                std::string json;
-                if (!api::write_json(response, json)) throw std::runtime_error("failed to serialize replica wait");
-                self->respondJson(http::status::ok, std::move(json));
-              } catch (...) { self->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
-            });
-          });
-    } catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); }
   }
 
   void handleReplicationInstalled(std::string body) {
@@ -2283,11 +2294,13 @@ private:
     // JSON string views can borrow input bytes. Move them into the queued
     // state before parsing; the Beast request dies when dispatch returns.
     state->body = std::move(body);
+    std::optional<PublicationWait> wait;
     try {
       std::string err;
       if (!luxir::api::read_json(state->def, state->body, state->resource, &err)) {
         throw RequestError(err.empty() ? "malformed schema" : err, "invalid_json");
       }
+      wait = publicationWait({}, {});
     } catch (const std::exception& e) {
       respondException(e, ErrorKind::INVALID_REQUEST);
       return;
@@ -2296,26 +2309,24 @@ private:
     // updateSchema persists (fsync) under the publication mutex, so run
     // it off the io thread like handleUpdate.
     auto shardPin = makeShardPin();
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin, mode, target = LuxirNode::target(tenant_, coll)] {
-      std::string out;
-      std::optional<ErrorInfo> failure;
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin, mode, wait, target = LuxirNode::target(tenant_, coll)] {
       try {
         auto collection = self->node_.getOrCreateCollection(target);
         auto newSchema = collection->updateSchema(state->def, mode);
-        std::pmr::monotonic_buffer_resource arena;
-        api::SchemaResponse response;
-        newSchema->schema->toProto(&response.schema.emplace(), arena);
-        response.commit = api::build::arenaStr(arena, newSchema->id.token());
-        if (!api::write_json(response, out)) throw std::runtime_error("failed to serialize schema response");
+        self->respondPublished(shardPin, collection->getId(), newSchema->id, wait, ReplicationSource::Members::SERVING,
+            [newSchema](const std::optional<api::ReplicaResult>& replicas) {
+              std::pmr::monotonic_buffer_resource arena;
+              api::SchemaResponse response;
+              newSchema->schema->toProto(&response.schema.emplace(), arena);
+              response.commit = api::build::arenaStr(arena, newSchema->id.token());
+              response.replicas = replicas;
+              std::string out;
+              if (!api::write_json(response, out)) throw std::runtime_error("failed to serialize schema response");
+              return out;
+            });
       } catch (const std::exception& e) {
-        failure = classifyException(e, ErrorKind::INTERNAL);
+        self->finishPublication(shardPin, wait.has_value(), classifyException(e, ErrorKind::INTERNAL));
       }
-
-      net::post(self->stream_.get_executor(),
-          [self, shardPin, failure = std::move(failure), body = std::move(out)]() mutable {
-            if (failure) self->respondError(*failure);
-            else self->respondJson(http::status::ok, std::move(body));
-          });
     });
   }
 
@@ -2552,9 +2563,8 @@ private:
 
   void startStreamingUpdate(std::string coll, UpdateUrlParams url) {
     const auto& ingest = node_.getConfig().ingest;
-    std::size_t arenaWidth = (std::size_t)computeWidth(node_.getTaskArena().max_concurrency());
     std::size_t maxInFlight = ingest.max_inflight_batches == 0
-        ? arenaWidth + 2
+        ? (std::size_t)node_.getWorkers() + 2
         : (std::size_t)ingest.max_inflight_batches;
     auto state = std::make_shared<HttpStreamUpdateState>(
         (std::size_t)ingest.stream_batch_size,

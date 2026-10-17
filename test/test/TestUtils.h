@@ -11,6 +11,7 @@
 #include "LuxirTest.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/query/Query.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/util/Overloaded.h"
 
 namespace luxir::test {
@@ -50,6 +51,21 @@ inline Query::Scorer* buildScorerForTests(
     Query::ExecutionUse horizon = Query::ExecutionUse::PULL) {
   return resolveScorerPlanForTests(
       pool, supplier, candidates, horizon)->build(pool);
+}
+
+inline int64_t countForTests(Query::Weight* weight, IndexReader::Segment& segment) {
+  auto guard = MemPool::threadLocalPoolGuard();
+  return QueryPrep::supplierCount(weight->scorerSupplier(guard.pool(), segment)).value_or(-1);
+}
+
+inline QueryPrep::WholeMembershipResult resolveWholeMembershipForTests(
+    const QueryPrep::WholeMembershipPlan& plan, IndexReader& reader,
+    IndexReader::Segment& segment, DocSet* domain,
+    Query::Weight::PreparedWeight* prepared = nullptr) {
+  auto guard = MemPool::threadLocalPoolGuard();
+  return plan.resolve(reader, segment, domain, prepared, [&](Query::Weight& resolver) {
+    return resolver.scorerSupplier(guard.pool(), segment);
+  });
 }
 
 inline std::span<const uint8_t> singlePhaseScorersForTests(

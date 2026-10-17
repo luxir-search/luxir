@@ -20,6 +20,7 @@
 #include <latch>
 #include <future>
 #include <deque>
+#include <unistd.h>
 
 namespace luxir::test {
 using namespace std::chrono_literals;
@@ -39,6 +40,7 @@ protected:
     sourceConfig.store.data_dir = (path / "source").string();
     followerConfig.store.data_dir = (path / "follower").string();
     sourceConfig.replication.follower_timeout_ms = 1000;
+    followerConfig.server.http.port = 0; // no fixed listener: a name per process
   }
   void startSource() {
     source = std::make_unique<LuxirNode>(sourceConfig);
@@ -211,6 +213,7 @@ INSTANTIATE_TEST_SUITE_P(Storage, ReplicationMatrixTest,
     [](const auto& info) { return info.param.first + "_" + info.param.second; });
 
 TEST_F(ReplicationFollowerTest, restartsBindingAndAcknowledgment) {
+  followerConfig.server.http.port = 9500;
   startSource(); startFollower();
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success); }
   ASSERT_TRUE(caughtUp());
@@ -222,7 +225,17 @@ TEST_F(ReplicationFollowerTest, restartsBindingAndAcknowledgment) {
   ASSERT_TRUE(caughtUp());
   api::ReplicationStatus after;
   follower->getFollower()->stats(after, arena);
+  char host[256] = {};
+  ASSERT_EQ(0, ::gethostname(host, sizeof(host) - 1));
+  EXPECT_EQ(std::string(host) + ":9500", after.follower);
   EXPECT_EQ(before.follower, after.follower);
+  stopFollower();
+  followerConfig.replication.follower_id = "reader-a";
+  startFollower();
+  ASSERT_TRUE(until([&] {
+    return std::ranges::any_of(source->getReplication().status(), [](const auto& row) { return row.follower == "reader-a"; });
+  }));
+  followerConfig.replication.follower_id.clear();
   stopSource(); startSource();
   ASSERT_TRUE(until([&] { return !source->getReplication().status().empty() && !source->getReplication().status()[0].commit.incarnation.empty(); }));
   { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success); }
@@ -1472,6 +1485,7 @@ TEST_F(ReplicationFollowerTest, filteredFollowerIgnoresOtherTenants) {
 TEST_F(ReplicationFollowerTest, narrowerRestartOrphansCopiesAndDropsBarrierMembership) {
   // Retain source liveness throughout restart so subscription change, not expiry, releases membership.
   sourceConfig.replication.follower_timeout_ms = 60000;
+  followerConfig.server.http.port = 9500; // the restarted follower keeps its name
   startSource();
   CollectionId alpha{"alpha", "docs"}, beta{"beta", "docs"};
   source->createCollection(alpha); source->createCollection(beta);

@@ -6,7 +6,7 @@
 #include "luxir/index/SegmentMerger.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/PosEnum.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/luxir_util.h"
@@ -172,10 +172,9 @@ void buildWideDictionarySources(TestIndex& index,
 }
 
 SegFieldInfo readBodyInfo(MemPool& pool, Segment& segment) {
-  FieldReader fields(segment.postingsReader());
-  EXPECT_TRUE(fields.seek("body"));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = segment.postingsReader().fieldInfo("body");
+  EXPECT_NE(nullptr, fields);
+  const auto& info = *fields;
   return info;
 }
 
@@ -318,10 +317,9 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
 
   PostingsReader outputReader(outputDir, 900);
   MemPool pool;
-  FieldReader fields(outputReader);
-  EXPECT_TRUE(fields.seek("body"));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = outputReader.fieldInfo("body");
+  EXPECT_NE(nullptr, fields);
+  const auto& info = *fields;
   hasRangeTable = !info.rangeTableLoc.isNull();
   hasMidFieldTail = false;
   if (hasRangeTable) {
@@ -557,10 +555,9 @@ TEST(TermPartitionMergeTest, CoordinatorGrowthIgnoresOccupiedBudget) {
   writer.finish();
 
   PostingsReader outputReader(outputDir, 901);
-  FieldReader fields(outputReader);
-  ASSERT_TRUE(fields.seek("body"));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = outputReader.fieldInfo("body");
+  ASSERT_NE(nullptr, fields);
+  const auto& info = *fields;
   EXPECT_FALSE(info.rangeTableLoc.isNull());
   // Stitching keeps the marker that a range writer saw on its full-width terms.
   EXPECT_NE(0, info.flags & FieldType::MAY_HAVE_FITTED);

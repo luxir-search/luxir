@@ -17,6 +17,7 @@
 #include <thread>
 #include <set>
 #include <ostream>
+#include <unistd.h>
 
 namespace luxir {
 namespace {
@@ -211,6 +212,15 @@ std::string errorMessage(const std::exception& error) {
   if (auto* system = dynamic_cast<const boost::system::system_error*>(&error)) return system->code().message();
   return error.what();
 }
+// The name the source knows this follower by: host:port of its listener, so a
+// restart resumes the same acknowledgment rows. Without a fixed port, a
+// per-process id.
+std::string defaultFollowerName(const LuxirConfig& config) {
+  int port = config.server.http.enabled ? config.server.http.port : config.server.grpc.port;
+  char host[256] = {};
+  if (port <= 0 || ::gethostname(host, sizeof(host) - 1) != 0 || !*host) return newUuid();
+  return std::string(host) + ":" + std::to_string(port);
+}
 struct PinGone : std::runtime_error { PinGone() : std::runtime_error("source snapshot pin expired") {} };
 struct PeerMismatch : std::runtime_error {
   explicit PeerMismatch(const std::string& name) : std::runtime_error("peer file checksum mismatch: " + name) {}
@@ -249,6 +259,7 @@ struct ReplicationFollower::Impl {
   std::vector<Source> peers; // never resized after construction: clients reference them
   const std::vector<std::string> tenants;
   ReplicationState binding;
+  std::string follower; // set by start(); pull runs anonymously
   std::mutex metadataMutex;
   std::string persisted;
   std::shared_ptr<Directory> metadata;
@@ -269,15 +280,11 @@ struct ReplicationFollower::Impl {
       throw std::invalid_argument("replication.downloads must be between 1 and 64");
     }
     binding.source = "http://" + source.authority;
-    binding.follower = node.getConfig().replication.follower_id;
     bool fs = node.getConfig().store.backend == "fs";
     metadata = fs ? std::shared_ptr<Directory>(std::make_shared<FSDirectory>(node.getConfig().store.data_dir))
                   : std::make_shared<RAMDir>();
     if (auto stored = metadata->openFile("replication.json")) {
       auto existing = ReplicationState::read(*stored);
-      if (!binding.follower.empty() && binding.follower != existing.follower) {
-        throw std::invalid_argument("configured follower id differs from persisted follower id");
-      }
       existing.source = binding.source;
       binding = std::move(existing);
     } else {
@@ -287,11 +294,8 @@ struct ReplicationFollower::Impl {
         if (name == "t" && FSDirFactory::holdsNoCollections(entry.path())) continue;
         throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
       }
-      if (binding.follower.empty()) binding.follower = newUuid();
-      if (binding.follower.size() > 255) throw std::invalid_argument("invalid follower id");
       binding.write(*metadata);
     }
-    if (binding.follower.empty() || binding.follower.size() > 255) throw std::invalid_argument("invalid follower id");
   }
 
   // A worker's connections: the source, then each peer in configured order.
@@ -333,7 +337,7 @@ struct ReplicationFollower::Impl {
     ReplicationState next;
     {
       std::lock_guard lock(mutex);
-      next.source = binding.source; next.follower = binding.follower;
+      next.source = binding.source;
       for (const auto& [id, state] : states)
         next.collection(id) = ReplicationState::Collection{
             state.advertised ? state.advertised->token() : "", state.seenBoot, state.replaceEmpty, {}};
@@ -341,7 +345,7 @@ struct ReplicationFollower::Impl {
     auto bytes = glz::write_json(next).value();
     if (bytes != persisted) { next.write(*metadata); persisted = std::move(bytes); }
   }
-  std::string followerQuery() const { return "follower=" + escape(binding.follower); }
+  std::string followerQuery() const { return "follower=" + escape(follower); }
   http::response<http::string_body> request(Client& client, http::verb method, const std::string& path, const std::string& body = {}, std::chrono::milliseconds timeout = 40s) {
     http::response<http::string_body> response;
     try { client.send(method, path, body); response = client.response(timeout); }
@@ -790,7 +794,7 @@ struct ReplicationFollower::Impl {
             }
             if (!serving) return;
             auto token = serving->token();
-            api::ReplicationInstalled ack{binding.follower, name.tenant, name.name, token};
+            api::ReplicationInstalled ack{follower, name.tenant, name.name, token};
             std::string body;
             if (!api::write_json(ack, body)) throw std::runtime_error("failed to serialize acknowledgment");
             request(clients.source, http::verb::post, "/_replication/installed", body);
@@ -830,6 +834,11 @@ ReplicationFollower::~ReplicationFollower() { stop(); }
 void ReplicationFollower::seed(const std::vector<Collections::Opened>& opened) { impl->seed(opened); }
 bool ReplicationFollower::pull(std::ostream& output) { return impl->pull(output); }
 void ReplicationFollower::start() {
+  {
+    const auto& name = impl->node.getConfig().replication.follower_id;
+    std::lock_guard lock(impl->mutex);
+    impl->follower = name.empty() ? defaultFollowerName(impl->node.getConfig()) : name;
+  }
   impl->threads.emplace_back([this] { impl->watch(); });
   for (int i = 0; i < impl->node.getConfig().replication.downloads; i++) impl->threads.emplace_back([this] { impl->worker(); });
 }
@@ -862,7 +871,7 @@ void ReplicationFollower::deleteOrphan(const CollectionId& key) {
 void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_resource& arena) {
   std::lock_guard lock(impl->mutex);
   auto str = [&](std::string_view value) { return api::build::arenaStr(arena, value); };
-  out.source = str(impl->binding.source); out.follower = str(impl->binding.follower);
+  out.source = str(impl->binding.source); out.follower = str(impl->follower);
   out.connected = impl->connected; out.last_contact = impl->lastContact;
   auto* rows = api::build::allocArray(out.collections, impl->states.size(), arena);
   size_t i = 0;

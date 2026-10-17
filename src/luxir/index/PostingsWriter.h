@@ -27,7 +27,6 @@
 #include "luxir/store/Directory.h"
 #include "luxir/codec/StreamVByte.h"
 #include "luxir/reader/PostingsReader.h"
-#include "luxir/reader/FieldReader.h"
 #include "ScreamingBuilder.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/schema/FieldType.h"
@@ -453,7 +452,7 @@ private:
 
     auto fieldsStart = fieldOutput.size();  // where this index starts
 
-    // FieldReader::seek does a binary search over the field offsets array, so
+    // PostingsReader::findOrdinal does a binary search over the field offsets array, so
     // fields must be written in sorted name order.  Callers that flush fields
     // in sorted order already satisfy this, but some resources (like
     // stored-fields) are appended at the very end of flush; sort defensively

@@ -281,9 +281,16 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
     }
   }
 
+  bool groups = knnQuery.unit == "groups";
+  if (!knnQuery.unit.empty() && knnQuery.unit != "docs" && !groups) {
+    throw std::runtime_error("knn.unit must be docs or groups");
+  }
+  if (groups && context.collapse == nullptr) {
+    throw std::runtime_error("knn.unit groups requires an enclosing collapse");
+  }
   return pool.make<luxir::KnnQuery>(
     field, vectorType, queryVec, k, nprobe, knnQuery.refine_candidates,
-    minScanFraction, knnQuery.exact);
+    minScanFraction, knnQuery.exact, groups ? context.collapse : nullptr);
 }
 
 std::span<Query*> ProtobufQueryParser::parseQueryList(

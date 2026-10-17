@@ -338,11 +338,11 @@ namespace luxir::test {
         currSeg++;
 
         Segment &seg = segments[currSeg];
-        FieldReader fieldReader(seg.postingsReader());
-        auto found = fieldReader.seek(name);
+        auto* field = seg.postingsReader().fieldInfo(name);
+        auto found = (field != nullptr);
         if (!found) continue;
 
-        fieldReader.readFieldInfo(fieldInfo);
+        fieldInfo = *field;
         if (fieldInfo.type == FieldType::TEXT) {
           normsReader = std::make_unique<NormsReader>(seg.postingsReader(), fieldInfo);
           normsIter = std::make_unique<NormsReader::Iterator>(*normsReader);

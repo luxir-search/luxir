@@ -119,7 +119,8 @@ TEST_F(StoredFieldsTest, basicSingleValued) {
   ASSERT_EQ(reader->segments().size(), 1u);
   auto& seg = reader->segments()[0];
   MemPool pool;
-  auto sfr = StoredFieldsReader::open(seg.postingsReader());
+  auto* sfrField = seg.postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto sfr = sfrField ? std::make_unique<StoredFieldsReader>(seg.postingsReader(), *sfrField) : nullptr;
   ASSERT_NE(sfr, nullptr);
   EXPECT_EQ(sfr->maxDoc(), 4);
 
@@ -165,7 +166,8 @@ TEST_F(StoredFieldsTest, multiValued) {
   auto reader = std::make_shared<IndexReader>(dir);
   ASSERT_EQ(reader->segments().size(), 1u);
   MemPool pool;
-  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  auto* sfrField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto sfr = sfrField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *sfrField) : nullptr;
   ASSERT_NE(sfr, nullptr);
 
   auto d0 = readStored(*sfr, 0);
@@ -206,7 +208,8 @@ TEST_F(StoredFieldsTest, manyDocsMultipleChunks) {
   auto reader = std::make_shared<IndexReader>(dir);
   ASSERT_EQ(reader->segments().size(), 1u);
   MemPool pool;
-  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  auto* sfrField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto sfr = sfrField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *sfrField) : nullptr;
   ASSERT_NE(sfr, nullptr);
   EXPECT_EQ(sfr->maxDoc(), N);
   EXPECT_GE(sfr->numChunks(), 3);  // at least a few chunks
@@ -250,7 +253,8 @@ TEST_F(StoredFieldsTest, oversizeDoc) {
 
   auto reader = std::make_shared<IndexReader>(dir);
   MemPool pool;
-  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  auto* sfrField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto sfr = sfrField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *sfrField) : nullptr;
   ASSERT_NE(sfr, nullptr);
   EXPECT_GE(sfr->maxChunkBytes(), (int64_t)big.size());
   auto d0 = readStored(*sfr, 0).flat();
@@ -301,7 +305,8 @@ TEST_F(StoredFieldsTest, segmentMerge) {
   auto reader = std::make_shared<IndexReader>(dir);
   ASSERT_EQ(reader->segments().size(), 1u);
   MemPool pool;
-  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  auto* sfrField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto sfr = sfrField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *sfrField) : nullptr;
   ASSERT_NE(sfr, nullptr);
   EXPECT_EQ(sfr->maxDoc(), 4);
 
@@ -362,7 +367,8 @@ TEST_F(StoredFieldsTest, oversizeDocMaxChunkBytesRoundTripsThroughMerge) {
 
   auto reader = std::make_shared<IndexReader>(dir);
   ASSERT_EQ(reader->segments().size(), 1u);
-  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  auto* sfrField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto sfr = sfrField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *sfrField) : nullptr;
   ASSERT_NE(sfr, nullptr);
   EXPECT_GE(sfr->maxChunkBytes(), (int64_t)big.size());
   EXPECT_GT(maxReserved.load(std::memory_order_relaxed),
@@ -416,7 +422,8 @@ TEST_F(StoredFieldsTest, mergeOneSegmentHasNoStored) {
   auto reader = std::make_shared<IndexReader>(dir);
   ASSERT_EQ(reader->segments().size(), 1u);
   MemPool pool;
-  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  auto* sfrField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto sfr = sfrField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *sfrField) : nullptr;
   ASSERT_NE(sfr, nullptr);
   EXPECT_EQ(sfr->maxDoc(), 3);
 
@@ -458,7 +465,8 @@ TEST_F(StoredFieldsTest, mergePreservesMultiValuedGrouping) {
   auto reader = std::make_shared<IndexReader>(dir);
   ASSERT_EQ(reader->segments().size(), 1u);
   MemPool pool;
-  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  auto* sfrField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto sfr = sfrField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *sfrField) : nullptr;
   ASSERT_NE(sfr, nullptr);
 
   auto d0 = readStored(*sfr, 0);
@@ -515,7 +523,8 @@ TEST_F(StoredFieldsTest, mergeFieldTableMismatchFallsBack) {
 
   auto reader = std::make_shared<IndexReader>(dir);
   ASSERT_EQ(reader->segments().size(), 1u);
-  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  auto* sfrField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto sfr = sfrField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *sfrField) : nullptr;
   ASSERT_NE(sfr, nullptr);
   EXPECT_EQ(sfr->maxDoc(), 3);
   EXPECT_EQ(readStored(*sfr, 0).flat(),
@@ -580,9 +589,11 @@ TEST_F(StoredFieldsTest, columnFamilies) {
   auto& seg = reader->segments()[0];
 
   MemPool pool;
-  auto defaultReader = StoredFieldsReader::open(seg.postingsReader());
+  auto* defaultReaderField = seg.postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto defaultReader = defaultReaderField ? std::make_unique<StoredFieldsReader>(seg.postingsReader(), *defaultReaderField) : nullptr;
   ASSERT_NE(defaultReader, nullptr);
-  auto paraReader = StoredFieldsReader::open(seg.postingsReader(), "_stored_embeddings_");
+  auto* paraReaderField = seg.postingsReader().fieldInfo("_stored_embeddings_");
+  auto paraReader = paraReaderField ? std::make_unique<StoredFieldsReader>(seg.postingsReader(), *paraReaderField) : nullptr;
   ASSERT_NE(paraReader, nullptr);
 
   // Each resource sees all docs (including empties) and only its own fields.
@@ -630,7 +641,8 @@ TEST_F(StoredFieldsTest, manyFieldsVarintBoundary) {
   }
 
   auto reader = std::make_shared<IndexReader>(dir);
-  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  auto* sfrField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto sfr = sfrField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *sfrField) : nullptr;
   ASSERT_NE(sfr, nullptr);
   auto d0 = readStored(*sfr, 0).flat();
   ASSERT_EQ(d0.size(), (size_t)N_FIELDS);
@@ -668,7 +680,8 @@ TEST_F(StoredFieldsTest, emptySegment) {
   auto reader = std::make_shared<IndexReader>(dir);
   ASSERT_EQ(reader->segments().size(), 1u);
   MemPool pool;
-  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  auto* sfrField = reader->segments()[0].postingsReader().fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+  auto sfr = sfrField ? std::make_unique<StoredFieldsReader>(reader->segments()[0].postingsReader(), *sfrField) : nullptr;
   EXPECT_EQ(sfr, nullptr);
 }
 
@@ -1051,22 +1064,25 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
              UpdateMessage::COMMIT);
   }
 
-  auto req = localReq(ch.getSearchEngine());
-  req->collection("main").topDocs("q")
-      .allQuery()
-      .fields({"id", "name"})
-      .limit(-1);
-  req->execute();
-  ASSERT_OK(req);
-  auto docs = req->getDocs();
+  for (int parallel : {-1, 0, 1}) {
+    auto req = localReq(ch.getSearchEngine());
+    req->collection("main").topDocs("q")
+        .allQuery()
+        .fields({"id", "name"})
+        .limit(-1);
+    req->execute(parallel);
+    ASSERT_OK(req);
+    auto docs = req->getDocs();
 
-  ASSERT_EQ(2, docs.size());
-  // Old segment's "alpha" falls back to the ord column; new segment's "beta"
-  // comes from stored fields.
-  EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("a"),
-                                        "name", std::string("alpha"))));
-  EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("b"),
-                                        "name", std::string("beta"))));
+    ASSERT_EQ(2, docs.size());
+    // Old segment's "alpha" falls back to the ord column; new segment's "beta"
+    // comes from stored fields.
+    EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("a"),
+                                          "name", std::string("alpha"))));
+    EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("b"),
+                                          "name", std::string("beta"))));
+
+  }
 
   ch.collection().setSchema(Schema::createDefaultSchema());
 }

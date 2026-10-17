@@ -163,7 +163,7 @@ public:
     return term;
   }
 
-  PackedTerm readPackedTerm(int64_t location) {
+  PackedTerm readPackedTerm(int64_t location) const {
     return PackedTerm(const_cast<char *>(start + location));
   }
 

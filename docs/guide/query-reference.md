@@ -201,8 +201,8 @@ the result list is narrowed to one. Names must be distinct, nonempty keys in
 that map. Routing is supported by both JSON and protobuf; Fusion filters and
 Fusion source filters do not accept `except_ops`.
 
-An operation directly in `SearchRequest.ops` or `TopDocs.ops` may also set a
-`domain`:
+An operation in `SearchRequest.ops`, `TopDocs.ops`, or a bucket's `ops` may
+also set a `domain`:
 
 ```json
 "brands": {
@@ -214,11 +214,14 @@ An operation directly in `SearchRequest.ops` or `TopDocs.ops` may also set a
 `domain.query` replaces the incoming document set with that query's matches
 across the collection. Without it, the operation inherits its incoming set.
 `domain.filter` adds local constraints in either case. With a replacement
-query, `apply_parent_filters: true` reapplies the immediate parent's filters,
+query, `apply_parent_filters: true` reapplies the owning list's filters,
 including facet selections, while respecting `except_ops`. It defaults to
 false and requires `domain.query`; it does not restore the parent's query or
-ancestor domain. Domain overrides are not supported directly in `Fusion.ops`
-or beneath facet buckets.
+ancestor matching query. Beneath buckets, a reset preserves every enclosing
+bucket identity, including group key equality; see
+[bucket domain resets](faceting.md#bucket-domain-resets). Domain overrides
+are not supported directly in `Fusion.ops`. Selection queries in enclosing
+query-facet buckets are re-evaluated in the reset scope, outer to inner.
 
 ## Phrase
 

@@ -14,6 +14,7 @@
 #include "gtest/gtest.h"
 #include "test/LuxirTest.h"
 #include "test/TestIndex.h"
+#include "test/TestUtils.h"
 #include "luxir/query/AllQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
@@ -154,7 +155,7 @@ TEST_F(BooleanNormalizeTest, standalonePureNegativeSeedsAllAndStaysBoolean) {
   EXPECT_NE(dynamic_cast<BooleanQuery::Weight*>(weight), nullptr);
   EXPECT_TRUE(weight->isConstantScoring());
   EXPECT_FALSE(weight->needsPrepare());
-  EXPECT_EQ(-1, weight->count(context.topReader.segments()[0]));
+  EXPECT_EQ(-1, countForTests(weight, context.topReader.segments()[0]));
   for (const auto& [doc, score] : collectScores(*testIndex.reader, pureNegative)) {
     unused(doc);
     EXPECT_FLOAT_EQ(0.0f, score);
@@ -562,7 +563,7 @@ TEST_F(BooleanNormalizeTest, singleClauseUnwrapPreservesWeightTraitsAndCount) {
     check(&a, optional, 0, [](Query::Weight* weight, Query::Context& context) {
       ASSERT_NE(dynamic_cast<TermQuery::Weight*>(weight), nullptr);
       EXPECT_TRUE(weight->isConstantScoring());
-      EXPECT_EQ(2, weight->count(context.topReader.segments()[0]));
+      EXPECT_EQ(2, countForTests(weight, context.topReader.segments()[0]));
     });
   }
 

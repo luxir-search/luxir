@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "luxir/store/Manifest.h"
 
@@ -107,7 +108,8 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
 // Covered by IndexWriterTest.overwriteSurvivesCommitAheadOfOlderUpdate.
 
 IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema,
-                         IndexRamBudget* sharedIndexRamBudget, int mergeFactor, std::string initialIncarnation)
+                         IndexRamBudget* sharedIndexRamBudget, int mergeFactor, std::string initialIncarnation,
+                         oneapi::tbb::task_arena* arena)
   : dir(snapshots.dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
@@ -196,10 +198,13 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     seedActiveVectorOverlayNamesFromManifestLocked();
   }
 
+  if (arena) arena->execute([this] { updateGraph.emplace(); });
+  else updateGraph.emplace();
+
   // Create the updateGraph.  Start with a serial node that assigns an order to each update command
   // This could be done in a quick synchronized block instead... and could then be safely inspected by the client
   // if necessary before submitting to the actual processing graph.
-  startUpdateNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
+  startUpdateNode = std::make_unique<UpdateMessageMultiFunc>(*updateGraph, 1,
     [this](UpdateMessage* msg,
     UpdateMessageMultiFunc::output_ports_type& op) {
       try {
@@ -215,7 +220,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     });
 
   // next, the node to actually process the update, indexing documents, etc.
-  processUpdateNode = std::make_unique<UpdateMessageFunc>(updateGraph, tbb::flow::unlimited,
+  processUpdateNode = std::make_unique<UpdateMessageFunc>(*updateGraph, tbb::flow::unlimited,
     [this](UpdateMessage* msg) -> UpdateMessage* {
       // exceptions handled in processUpdateBody()
       this->processUpdateBody(*msg);
@@ -223,7 +228,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     });
 
   // then make sure that the updates are finished in order so all updates are done before a commit is processed.
-  updateSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(updateGraph,
+  updateSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(*updateGraph,
     [](UpdateMessage* msg) -> size_t {
       INDEX_DEBUG("updateSequencerNode: msg={} updateVersion={} updateOrdinal={}",
                   (void*)msg, msg->updateVersion, msg->updateOrdinal);
@@ -231,7 +236,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     });
 
   // updates flow into the updateFinishNode in order which is single threaded and ensures that updates are finished in order.
-  updateFinishNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
+  updateFinishNode = std::make_unique<UpdateMessageMultiFunc>(*updateGraph, 1,
     [this](UpdateMessage* msg,
     UpdateMessageMultiFunc::output_ports_type& op) {
       unused(op);
@@ -252,7 +257,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   // firehose (hundreds of batches in flight) a flush that waited its turn
   // behind them would let the budget overshoot by the whole queue; a merge
   // that waited would let segments pile up for the commit to pay for.
-  segmentFlushNode = std::make_unique<InverterMultiFunc>(updateGraph, tbb::flow::unlimited,
+  segmentFlushNode = std::make_unique<InverterMultiFunc>(*updateGraph, tbb::flow::unlimited,
     [this](Inverter* inverter,
     InverterMultiFunc::output_ports_type& op) {
       unused(op);
@@ -263,21 +268,21 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   // Budget callbacks never take indexMutex or flush inline.  They coalesce on
   // this elevated-priority graph node, whose body rechecks global pressure and
   // claims victims against the budget before changing writer state.
-  pressureCheckNode = std::make_unique<PressureCheckMultiFunc>(updateGraph, 1,
+  pressureCheckNode = std::make_unique<PressureCheckMultiFunc>(*updateGraph, 1,
     [this](tbb::flow::continue_msg,
            PressureCheckMultiFunc::output_ports_type& op) {
       unused(op);
       this->pressureCheckBody();
     }, FLUSH_PRIORITY);
 
-  commitSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(updateGraph,
+  commitSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(*updateGraph,
     [](UpdateMessage* msg) -> size_t {
       INDEX_DEBUG("commitSequencerNode: msg={} commitNum={}", (void*)&msg, msg->commitNum);
       return msg->commitNum;
     });
 
   // must be single-threaded
-  commitFinishNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
+  commitFinishNode = std::make_unique<UpdateMessageMultiFunc>(*updateGraph, 1,
     [this](UpdateMessage* msg,
     UpdateMessageMultiFunc::output_ports_type& op) {
       unused(op);
@@ -305,7 +310,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   tbb::flow::make_edge(*commitSequencerNode, *commitFinishNode);
 
   // must be single-threaded
-  mergeSegmentsNode = std::make_unique<MergeMessageMultiFunc>(updateGraph, 1,
+  mergeSegmentsNode = std::make_unique<MergeMessageMultiFunc>(*updateGraph, 1,
     [this](MergeMessage* msg,
     MergeMessageMultiFunc::output_ports_type& op) {
       unused(op);
@@ -336,7 +341,7 @@ IndexWriter::~IndexWriter() {
   DeadlineScheduler::global().detach(autoCommitSlot);
   // A submit racing close() is rejected by startUpdateNode, but that rejection is
   // still a graph task; wait for it before the nodes are destroyed.
-  updateGraph.wait_for_all();
+  updateGraph->wait_for_all();
   idleInverters.clear();
   busyInverters.clear();
   flushingInverters.clear();
@@ -360,7 +365,7 @@ void IndexWriter::close() {
   // without this, in gcc release mode we can get a crash when the IndexWriter is destroyed, even when
   // the graph wasn't used. Presumably because the test was so fast and there was some async initialization
   // of the graph still going on?
-  updateGraph.wait_for_all();
+  updateGraph->wait_for_all();
 
   std::vector<UpdateMessage*> abandoned;
   {
@@ -1191,6 +1196,8 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   INDEX_DEBUG("finishCommitBody: msg={}", (void*)&msg);
   if (failed.load(std::memory_order_acquire)) throw IndexWriterClosedError("index writer has failed");
   // TODO: if nothing actually changed, we could skip writing a new commit at this point.
+  // Not for a commit that waits for replicas: that wait relies on a generation
+  // newer than any follower has acknowledged, even after a follower restart.
 
   // Apply deletes from all segments that were part of this commit to all segments in the index.
   // This must be mutually exclusive with segment merging, or we must do some form of optimistic concurrency.
@@ -2635,7 +2642,7 @@ bool IndexWriter::testIsEmpty() {
 void IndexWriter::testDeleteAllData() {
   INDEX_DEBUG("testDeleteAllData: deleting all data.");
   // wait for things in the execution graph to finish.
-  updateGraph.wait_for_all();
+  updateGraph->wait_for_all();
   std::unique_lock publicationLock(publicationMutex);
 
   {
@@ -3026,23 +3033,18 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   int32_t newDeletesCount = 0;
 
   // Read the "id" field using TermsEnum
-  FieldReader fieldReader(reader);
-  if (!fieldReader.seek("id")) {
+  auto* idFieldInfo = reader.fieldInfo("id");
+  if (!idFieldInfo) {
     LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
     return;
   }
 
-  SegFieldInfo idFieldInfo;
-  fieldReader.readFieldInfo(idFieldInfo);
-  TermsEnum termsEnum(pool, reader, idFieldInfo);
+  TermsEnum termsEnum(pool, reader, *idFieldInfo);
 
   // Also get the "_version_" field for version comparison
-  FieldReader versionFieldReader(reader);
-  SegFieldInfo versionFieldInfo;
   std::optional<IntColReader> versionColReader;
-  if (versionFieldReader.seek("_version_")) {
-    versionFieldReader.readFieldInfo(versionFieldInfo);
-    versionColReader.emplace(reader, versionFieldInfo);
+  if (auto* versionFieldInfo = reader.fieldInfo("_version_")) {
+    versionColReader.emplace(reader, *versionFieldInfo);
     assert(!versionColReader->multiValued());
   }
 

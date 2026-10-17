@@ -404,4 +404,34 @@ TEST_F(MemPoolTest, boundary) {
   ASSERT_EQ(mem[0],'A');
   delete[] mem;
 }
+
+// A save point taken while a block is exactly full is that block's end address. When upstream
+// hands out the next block adjacently (jemalloc does), that is also the next block's header
+// address, and rewinding must return to the full block instead of writing over the header.
+TEST_F(MemPoolTest, rewindToFullBlockWithAdjacentNextBlock) {
+  // 1: the save point's block is just behind the current one; 2: it is further back.
+  for (int laterBlocks : {1, 2}) {
+    alignas(std::max_align_t) char arena[8192];
+    std::pmr::monotonic_buffer_resource adjacent(arena, sizeof(arena), std::pmr::null_memory_resource());
+    MemPool pool(&adjacent);
+    pool.alloc(pool.spaceLeft());  // fill the static block
+    pool.alloc(1);                 // move to the first upstream block
+    pool.alloc(pool.spaceLeft());  // and fill it exactly
+    int fullBlock = pool.bufferIdx;
+    char* end = pool.buffer + pool.bufferSize(pool.buffer);
+    auto savePoint = pool.getSavePoint();
+    ASSERT_EQ(end, savePoint);
+    for (int i = 0; i < laterBlocks; i++) pool.alloc(pool.spaceLeft() + 1);
+    ASSERT_EQ(end, pool.buffers[fullBlock + 1]);  // the blocks really are adjacent
+
+    pool.rewind(savePoint);
+    ASSERT_EQ(fullBlock, pool.bufferIdx) << "laterBlocks=" << laterBlocks;
+    EXPECT_EQ(0u, pool.spaceLeft());
+    uint32_t nextSize = pool.bufferSize(pool.buffers[fullBlock + 1]);
+    char* p = pool.alloc(8);
+    std::memset(p, 0xff, 8);
+    EXPECT_EQ(end + MemPool::HEADER_SIZE, p);
+    EXPECT_EQ(nextSize, pool.bufferSize(pool.buffers[fullBlock + 1]));
+  }
+}
 #endif

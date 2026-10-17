@@ -176,7 +176,7 @@ The request's `commit` object may contain:
 | `commit_within_ms` | Publish within this many milliseconds. `0` is immediate; a positive value lets the update response return before publication. |
 | `build_aux_indexes` | Missing vector overlays to build, such as `["*"]` or `["vec.embedding_v"]`. Existing overlays are retained; empty requests no builds. |
 | `wait_for_merges` | Wait for in-flight merges before publishing. |
-| `wait_for_replicas` | Typed requirement: `{"count": N}` or `{"all": {}}`. Forces an immediate commit; see [Replication](replication.md#write-then-read-your-write). |
+| `wait_for_replicas` | Typed requirement: `{"count": N}` or `{"all": {}}`. Forces an immediate commit; see [Replication](replication.md#2-commit-and-wait-for-followers). |
 | `wait_for_replicas_timeout_ms` | Visibility wait deadline; absent = 30000, zero checks immediately. Does not undo the local commit. |
 | `max_segments` | Force the committed data down to at most this many segments before returning. `0` means no forced merge. |
 
@@ -352,8 +352,8 @@ The relevant server controls are:
 - `--indexing.stream-batch-size` and `--indexing.stream-batch-docs` for
   internal non-atomic handoff granularity.
 - `--indexing.max-inflight-batches` for the number of internal batches a
-  connection can submit concurrently (`0` selects an automatic limit based
-  on task-arena concurrency; `1` makes batch submission serial).
+  connection can submit concurrently (`0` selects the worker count plus two;
+  `1` makes batch submission serial).
 
 ## Limits
 

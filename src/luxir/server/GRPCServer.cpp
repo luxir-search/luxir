@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <deque>
+#include <limits>
 #include <memory_resource>
 #include <mutex>
 #include <optional>
@@ -74,6 +75,16 @@ void luxir::GRPCServer::run() {
   // The actual port will be stored in serverPort
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(), &serverPort);
 
+  // gRPC's own default (4 MiB) is far below the HTTP buffered-body limit and
+  // rejects ordinary update batches.  The send size stays at gRPC's default
+  // (unlimited): search replies are streamed in bounded batches.
+  const auto& config = luxirNode.getConfig();
+  int64_t maxReceive = config.server.grpc.max_receive_message_size > 0
+                           ? config.server.grpc.max_receive_message_size
+                           : config.ingest.max_request_body;
+  maxReceive = std::clamp<int64_t>(maxReceive, 1, std::numeric_limits<int>::max());
+  builder.SetMaxReceiveMessageSize((int)maxReceive);
+
   // One generic service handles every method as raw bytes; dispatch is by RPC
   // path inside GenericCallData.  registerLuxirDescriptors() makes describe and
   // FileContainingSymbol work through the generated descriptor pool.  TODO:
@@ -99,7 +110,8 @@ void luxir::GRPCServer::run() {
     startLatchThreads.count_down(nthreads);
     return;
   }
-  LOG_INFO("GRPCServer listening on {}:{}", bindHost, serverPort);
+  LOG_INFO("GRPCServer listening on {}:{} (max receive message size {} bytes)", bindHost, serverPort,
+           maxReceive);
 
   threads.reserve(nthreads);
   for (int i=0; i<nthreads; i++) {
@@ -754,6 +766,27 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   }
 }
 
+// Responds with state->response once the publication `commit` satisfies the
+// requested replica wait, or at once without one. `state` owns the response
+// and the bytes it borrows.
+template<class State>
+static void respondPublished(GenericCallData& call, std::shared_ptr<State> state, CollectionId name,
+    const CommitId& commit, const std::optional<api::ReplicaRequirement>& requirement,
+    std::optional<uint64_t> timeoutMs, ReplicationSource::Members members, std::stop_token stop) {
+  if (!requirement) { call.respondRaw(serializeToByteBuffer(state->response), 1); return; }
+  auto& waits = call.server.getLuxirNode().getCommitWaits();
+  waits.awaitReplicas(waits.prepareReplicas(std::move(name), commit, *requirement,
+                                            waits.deadlineAfter(timeoutMs.value_or(30000)), members),
+      stop, [&call, state](api::ReplicaResult replicas) {
+        call.server.getLuxirNode().getTaskArena().enqueue([&call, state, replicas] {
+          try {
+            state->response.replicas = replicas;
+            call.respondRaw(serializeToByteBuffer(state->response), 1);
+          } catch (const std::exception& e) { finishWithException(call, e); }
+        });
+      });
+}
+
 //   rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse)  [unary]
 static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto request = std::make_shared<HppRequestState<CreateCollectionReqProto>>();
@@ -762,18 +795,25 @@ static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& read
     return;
   }
 
-  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   try {
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+    if (request->proto.wait_for_replicas) {
+      ReplicationSource::validate(*request->proto.wait_for_replicas);
+      call.enableWaitCancellation();
+    }
+    { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+    call.server.getLuxirNode().getTaskArena().enqueue([request, &call, stop = call.waitCancellation.get_token()] {
       try {
-        auto created = call.server.getLuxirNode().createCollection(
-            LuxirNode::adminTarget(request->proto.tenant, request->proto.name),
+        auto id = LuxirNode::adminTarget(request->proto.tenant, request->proto.name);
+        auto created = call.server.getLuxirNode().createCollection(id,
             request->proto.schema ? &*request->proto.schema : nullptr);
-        CreateCollectionRespProto response;
-        response.name = request->proto.name;
-        auto token = created->getShard()->requireIndexWriter()->initialCommit().token();
-        response.commit = token;
-        call.respondRaw(serializeToByteBuffer(response), 1);
+        struct State { std::shared_ptr<HppRequestState<CreateCollectionReqProto>> request; std::string token;
+                       CreateCollectionRespProto response; };
+        auto commit = created->getShard()->requireIndexWriter()->initialCommit();
+        auto state = std::make_shared<State>(State{request, commit.token(), {}});
+        state->response.name = request->proto.name;
+        state->response.commit = state->token;
+        respondPublished(call, state, std::move(id), commit, request->proto.wait_for_replicas,
+                         request->proto.wait_for_replicas_timeout_ms, ReplicationSource::Members::SUBSCRIBED, stop);
       } catch (const std::exception& e) {
         finishWithException(call, e);
       }
@@ -820,17 +860,25 @@ static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     return;
   }
   try {
-    SchemaRespProto response;
-    std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
+    struct State {
+      std::pmr::monotonic_buffer_resource arena;  // backs the non-owning response SchemaDef
+      SchemaRespProto response;
+    };
+    auto state = std::make_shared<State>();
+    if (request.proto.wait_for_replicas) {
+      ReplicationSource::validate(*request.proto.wait_for_replicas);
+      call.enableWaitCancellation();
+      const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true;
+    }
 
     auto collection = call.server.getLuxirNode().getOrCreateCollection(
         LuxirNode::target(request.proto.tenant, request.proto.collection));
     auto newSchema = collection->updateSchema(*request.proto.schema, request.proto.mode);
-    newSchema->schema->toProto(&response.schema.emplace(), respArena);
-    response.commit = api::build::arenaStr(respArena, newSchema->id.token());
-
-    grpc::ByteBuffer buf = serializeToByteBuffer(response);
-    call.respondRaw(std::move(buf), 1);
+    newSchema->schema->toProto(&state->response.schema.emplace(), state->arena);
+    state->response.commit = api::build::arenaStr(state->arena, newSchema->id.token());
+    respondPublished(call, state, collection->getId(), newSchema->id, request.proto.wait_for_replicas,
+                     request.proto.wait_for_replicas_timeout_ms, ReplicationSource::Members::SERVING,
+                     call.waitCancellation.get_token());
   } catch (const std::exception& e) {
     finishWithException(call, e);
   }
@@ -915,32 +963,6 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
   }
 }
 
-static void handleWaitForReplicas(GenericCallData& call, grpc::ByteBuffer& readBuf) {
-  HppRequestState<api::WaitForReplicasRequest> request;
-  if (!parseRequest(readBuf, request, "WaitForReplicas")) {
-    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "WaitForReplicas: malformed request"));
-    return;
-  }
-  try {
-    if (!request.proto.wait_for_replicas) throw RequestError("wait_for_replicas is required");
-    auto id = CommitId::parse(request.proto.commit);
-    auto name = LuxirNode::target({}, request.proto.collection);
-    auto& node = call.server.getLuxirNode();
-    call.enableWaitCancellation();
-    { std::lock_guard lock(call.mutex); call.requestActive = true; }
-    node.getCommitWaits().awaitReplicas(std::move(name), id, *request.proto.wait_for_replicas,
-        node.getCommitWaits().deadlineAfter(request.proto.wait_for_replicas_timeout_ms.value_or(30000)),
-        call.waitCancellation.get_token(), [&call, token = id.token()](api::ReplicaResult replicas) {
-          call.server.getLuxirNode().getTaskArena().enqueue([&call, token, replicas] {
-            try {
-              api::WaitForReplicasResponse response{token, replicas};
-              call.respondRaw(serializeToByteBuffer(response), 1);
-            } catch (const std::exception& e) { finishWithException(call, e); }
-          });
-        });
-  } catch (const std::exception& e) { finishWithException(call, e); }
-}
-
 // ---- method routing ------------------------------------------------------
 
 static const MethodEntry* lookupMethod(const std::string& method) {
@@ -952,7 +974,6 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/luxir.Admin/GetSchema",          {handleGetSchema}},
     {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true}},
     {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true}},
-    {"/luxir.Admin/WaitForReplicas",     {handleWaitForReplicas}},
     {"/luxir.Admin/Stats",              {handleStats}},
     {"/luxir.Admin/CacheControl",       {handleCacheControl}},
   };

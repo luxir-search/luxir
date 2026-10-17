@@ -14,7 +14,7 @@
 #include "luxir/index/PointsWriter.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryPrep.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/PointsReader.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
@@ -131,7 +131,11 @@ int64_t exactCount(IndexReader& reader, std::string_view field,
                    int64_t lo, int64_t hi) {
   MemPool pool;
   QueryState state(pool, reader, field, lo, hi);
-  return state.weight->count(reader.segments()[0]);
+  auto& segment = reader.segments()[0];
+  auto* supplier = state.weight->scorerSupplier(pool, segment);
+  auto count = QueryPrep::supplierCount(supplier);
+  if (count) return *count;
+  return (int64_t)collect(buildScorerForTests(pool, *supplier, INT64_MAX)).size();
 }
 
 std::optional<int64_t> weightConstantCount(IndexReader& reader,
@@ -140,16 +144,19 @@ std::optional<int64_t> weightConstantCount(IndexReader& reader,
                                            DocSet* domain = nullptr) {
   MemPool pool;
   QueryState state(pool, reader, field, lo, hi);
-  return state.weight->constantCount(reader.segments()[0], domain);
+  auto& segment = reader.segments()[0];
+  auto shortcut = state.weight->countShortcut(segment, domain);
+  return QueryPrep::resolveCount(shortcut, [&](Query::Weight& resolver) {
+    return resolver.scorerSupplier(pool, segment);
+  });
 }
 
 std::optional<SegFieldInfo> tryFieldInfo(IndexReader::Segment& segment,
                                          std::string_view field) {
   MemPool pool;
-  FieldReader fields(segment.postingsReader());
-  if (!fields.seek(field)) return std::nullopt;
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = segment.postingsReader().fieldInfo(field);
+  if (!fields) return std::nullopt;
+  const auto& info = *fields;
   return {info};
 }
 
@@ -272,7 +279,8 @@ TEST_F(NumericRangePointsTest, exactSetUsesCoalescedPointRunsForCostAndShape) {
   auto* supplier = state.weight->scorerSupplier(pool, segment);
   ASSERT_NE(nullptr, supplier);
   EXPECT_EQ(5, supplier->cost());
-  EXPECT_EQ(5, state.weight->constantCount(segment, nullptr));
+  EXPECT_EQ(Query::CountHow::SUPPLIER, state.weight->countShortcut(segment, nullptr).how);
+  EXPECT_EQ(5, QueryPrep::supplierCount(supplier));
 
   Query::PlanContext context;
   context.demand = Query::Demand::fromLeadCost(
@@ -383,7 +391,7 @@ TEST_F(NumericRangePointsTest, randomizedOracleAcrossScorerAndBulkPaths) {
     }
   }
 
-  // Shape coverage for the constant-count probe: all-match counts every doc
+  // Shape coverage for count shortcuts: all-match counts every doc
   // with a value even multi-valued, a multi-valued partial range needs
   // execution, a restricted domain always does, and an absent column is
   // zero under any domain.

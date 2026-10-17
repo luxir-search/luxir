@@ -7,6 +7,7 @@ find_package(benchmark REQUIRED)
 # CONFIGURE_DEPENDS: re-glob on build so a newly added test/helper .cpp is picked up
 # without a manual reconfigure (otherwise new files link as undefined symbols).
 file(GLOB_RECURSE Test_SOURCES CONFIGURE_DEPENDS *.cpp *.h)
+list(FILTER Test_SOURCES EXCLUDE REGEX "/allocation_tests/")
 
 add_executable(luxir_test ${Test_SOURCES})
 target_include_directories(luxir_test PRIVATE .)
@@ -24,6 +25,17 @@ target_precompile_headers(luxir_test PRIVATE
   <gtest/gtest.h>
   <benchmark/benchmark.h>
 )
+
+# Isolate allocation failure injection from the main tests and benchmarks. GNU
+# --wrap intercepts the real allocator without changing production code.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  add_executable(response_allocation_failure_test
+    allocation_tests/ResponseAllocationFailureTest.cpp)
+  target_include_directories(response_allocation_failure_test PRIVATE .)
+  target_link_libraries(response_allocation_failure_test PRIVATE luxir_lib GTest::gtest_main)
+  target_link_options(response_allocation_failure_test PRIVATE
+    -Wl,--wrap=_Znwm -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdlPvm)
+endif()
 
 # Compile the same exhaustive decoded-successor tests with AVX-512 forcibly
 # unavailable so AVX2 hosts exercise the AVX2 path.
@@ -45,6 +57,15 @@ target_compile_options(decoded_successor_scalar_test PRIVATE
   -mno-avx512f -mno-avx2)
 target_compile_definitions(decoded_successor_scalar_test PRIVATE
   LUXIR_EXPECT_SCALAR=1)
+
+# The analysis ASCII kernels (AsciiScan.h) with AVX2 unavailable, so AVX2 hosts
+# also exercise the SSE2 path the x86-64-v2 container build ships. The NEON
+# path is covered by the arm64 build's luxir_test, the SWAR path everywhere.
+add_executable(ascii_scan_sse2_test
+  basic_tests/AsciiScanTest.cpp)
+target_include_directories(ascii_scan_sse2_test PRIVATE .)
+target_link_libraries(ascii_scan_sse2_test PRIVATE GTest::gtest_main)
+target_compile_options(ascii_scan_sse2_test PRIVATE -mno-avx512f -mno-avx2)
 
 
 # (luxir_smoke removed: it was migration scaffolding to run SmokeTest while luxir_test was

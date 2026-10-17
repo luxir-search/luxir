@@ -114,8 +114,8 @@ void CommitWaits::awaitCommit(CollectionId name, CommitId floor, Clock::time_poi
 }
 
 CommitWaits::ReplicaWait CommitWaits::prepareReplicas(CollectionId name, CommitId commit,
-    const api::ReplicaRequirement& requirement, Clock::time_point deadline) {
-  auto captured = source.capture(requirement, name, commit);
+    const api::ReplicaRequirement& requirement, Clock::time_point deadline, ReplicationSource::Members members) {
+  auto captured = source.capture(requirement, name, commit, members);
   return {std::move(name), std::move(commit), deadline, std::move(captured)};
 }
 

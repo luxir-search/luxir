@@ -70,6 +70,8 @@ class FuzzyQuery final : public Query {
   }
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   // Default expansion cap when max_expansions is unset (Lucene parity).
   static constexpr int DEFAULT_MAX_EXPANSIONS = 50;
 
@@ -142,7 +144,7 @@ private:
 
     size_t nSegs = context.numSegments();
     for (size_t s = 0; s < nSegs; s++) {
-      auto* segFieldInfo = fieldInfo.segInfos[s];
+      auto* segFieldInfo = fieldInfo.segInfos.at(s);
       if (segFieldInfo == nullptr) continue;
       auto& postingsReader = context.topReader.segments()[s].postingsReader();
       TermsEnum te(scratch, postingsReader, *segFieldInfo);

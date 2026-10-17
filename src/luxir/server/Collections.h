@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <oneapi/tbb/task_arena.h>
 #include "Collection.h"
 #include "CollectionEvents.h"
 #include "luxir/LuxirConfig.h"
@@ -109,6 +110,7 @@ private:
   const LuxirConfig& config;
   CollectionEvents& events;
   IndexRamBudget& indexRamBudget;
+  oneapi::tbb::task_arena& arena;  // runs every writer's indexing (the node's index arena)
   std::unique_ptr<DirectoryFactory> factory;
   SharedLazyMap<CollectionId, Collection> map;
   std::mutex slotsMutex;
@@ -132,7 +134,8 @@ private:
   void retire(const CollectionId& id, const std::string& selected) noexcept;
 
 public:
-  Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget);
+  Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget,
+              oneapi::tbb::task_arena& arena);
   ~Collections();
 
   // A tenant or collection name: [a-z][a-z0-9_]*, at most 255 bytes.

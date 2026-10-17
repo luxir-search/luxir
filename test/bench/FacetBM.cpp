@@ -216,10 +216,9 @@ static AggregateFacetRunStats measureFacetRuns(
   AggregateFacetRunStats stats;
   for (auto& segment : reader.segments()) {
     auto& postings = segment.postingsReader();
-    FieldReader fieldReader(postings);
-    if (!fieldReader.seek(field)) continue;
-    SegFieldInfo info;
-    fieldReader.readFieldInfo(info);
+    auto* fieldReader = postings.fieldInfo(field);
+    if (!(fieldReader != nullptr)) continue;
+    const auto& info = *fieldReader;
     OrdColReader column(postings, info);
     int64_t missing = 0;
     int64_t previous = -1;

@@ -66,8 +66,11 @@ public:
       FastPForLib::usimdpackwithoutmask(&data[k][j], reinterpret_cast<__m128i*>(out), k + 1);
       out += 4 * (k + 1);
     }
-    // scalar fallback for the remainder (final partial group reads padding from
-    // data[k], harmless; the over-counted words are backed out below)
+    // scalar fallback for the remainder. The final partial group packs its
+    // padding slots unmasked into the last kept word, so zero them or that
+    // word carries stale stack bytes; whole over-counted words are backed out
+    // below.
+    std::fill(&data[k][sizes[k]], &data[k][(sizes[k] + 31u) / 32 * 32], 0u);
     for (; j < sizes[k]; j += 32) {
       FastPForLib::fastpackwithoutmask(&data[k][j], out, k + 1);
       out += k + 1;

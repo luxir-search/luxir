@@ -65,9 +65,7 @@ offline without risking a stray write. Current limitations:
 
 Restart the read-only node to pick up newer commits and release pinned files.
 For a continuously refreshed copy with its own storage, use
-[`--replicate-from http://writer:9400`](replication.md). Add
-`--replication.tenants alpha,beta` to restrict the subscription; restart to change
-it. Excluded local copies become orphans and can be deleted even while disconnected.
+[`--replicate-from http://writer:9400`](replication.md).
 Followers own their local data directory and install verified snapshots without
 constructing an index writer.
 
@@ -248,6 +246,18 @@ to 28 HTTP shards and 14 gRPC threads. Set explicit counts with:
 count; each shard owns one `io_context` and one runner. Connections are
 assigned round-robin at accept and remain pinned to their shard.
 
+Indexing, merges, and search work moved off a transport thread run on a shared
+pool of worker threads. `--server.workers` sets its size. The default (`0`) is
+one worker per available logical CPU less one, which leaves a CPU for the
+transport threads; on machines with 4 or fewer logical CPUs it is one worker per
+CPU, because holding one back would idle a large share of a small node (half of
+a 2-vCPU one). Transport threads are not counted: they share the CPUs with the
+workers.
+
+```bash
+./luxir --server.workers=2
+```
+
 Search requests default to serial execution directly on the transport thread
 that received them (an HTTP io shard or gRPC completion-queue thread). This
 avoids a scheduler handoff and idle-worker wakeups but occupies that
@@ -333,10 +343,22 @@ The HTTP request limits distinguish bounded material from streams:
 - `stream-batch-size` and `stream-batch-docs` are internal handoff thresholds,
   not limits on the number of documents in one HTTP stream.
 - `max-inflight-batches` bounds the number of internal batches one connection
-  can submit concurrently. `0` (the default) uses task-arena concurrency plus
-  two; `1` makes batch submission serial. Reads pause when the limit is
+  can submit concurrently. `0` (the default) uses the worker count
+  (`--server.workers`) plus two; `1` makes batch submission serial. Reads pause when the limit is
   reached and resume as batches complete. A larger limit uses more staging
   memory.
+
+gRPC has one request limit, on the size of each received message (a unary
+request or one message of a stream):
+
+```bash
+./luxir --server.grpc.max-receive-message-size=64MB
+```
+
+It defaults to `--indexing.max-request-body`, so the buffered HTTP and gRPC
+ceilings move together. A larger message fails with `RESOURCE_EXHAUSTED`
+before it is decoded; see [gRPC API](grpc.md#message-size). Replies have no
+size limit; search results are streamed in bounded batches.
 
 Search has its own limits:
 
@@ -364,11 +386,13 @@ across machines if requests must produce identical civil-time boundaries.
 
 ## Shutdown and recovery
 
-Engine/server components have drainable shutdown paths, but the current
-`luxir` executable does not install an application signal handler to invoke
-them. A normal `SIGTERM`/`SIGINT` therefore terminates the process rather than
-waiting for in-flight requests. Before a planned stop, quiesce producers and
-publish an immediate commit. After an unplanned stop, the filesystem backend
+On `SIGTERM` or `SIGINT` the server stops accepting connections, waits for
+in-flight gRPC and HTTP requests to finish, stops background work (scrubbing,
+replication), releases the data directory and exits with status `0`. Updates
+that were not yet committed are not committed by shutdown: only acknowledged
+commits are durable, so before a planned stop quiesce producers and publish an
+immediate commit. A second signal during the drain exits immediately with
+status `128 + signal`. After an unplanned stop, the filesystem backend
 reopens the last durable commit. If recovery selects an older valid root, a writer
 publishes it under a new incarnation so followers cannot confuse it with an
 older generation of their current source. File retirement does not fsync removals:
@@ -389,7 +413,6 @@ features it does not yet supply:
 - no automatic failover, leader election, or distributed query execution;
 - no built-in TLS/authentication/authorization;
 - no scheduled backups or automatic restore (use `luxir pull` and `luxir promote`);
-- no application-level signal-driven graceful shutdown;
 - pre-1.0 wire and schema interfaces that may change.
 
 None of these can be enabled by configuration. The pieces those layers will

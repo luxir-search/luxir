@@ -93,6 +93,34 @@ enum DocFormat {
   COLUMNS = 2;
 }
 
+// Partition matching documents by an exact, single-valued key.
+message Collapse {
+  repeated string field = 1; // One field, or an exact tuple. Uses value binding.
+  enum MissingPolicy {
+    EXPAND = 0; // Each document missing any component is a tagged singleton.
+    GROUP = 1;  // Preserve present tuple components and tag missing ones as null.
+    DROP = 2;   // Exclude documents missing any component.
+  }
+  MissingPolicy missing = 2;
+  repeated SortSpec head_sort = 3; // Display member order; defaults to the list sort.
+  bool get_number = 4; // Count members of each returned group in the finalized match set.
+  // Per-group operations on matching members; facet count units start at docs.
+  // Explicit group units still resolve to this nearest enclosing collapse.
+  map<string, SearchOp> ops = 5;
+  // Exhaustive group order by metrics in ops; missing/failed values last.
+  // Ties use the best member under the list sort, then document order.
+  repeated SortSpec sort = 6;
+}
+
+// A document cap, applied before paging in the list's ordinary rank order.
+message Diversify {
+  repeated string field = 1; // One field or an exact tuple, as in Collapse.
+  Collapse.MissingPolicy missing = 3;
+  oneof kind {
+    int64 max_per_key = 2; // Positive cap; keeps each key's best documents.
+  }
+}
+
 message TopDocs {
   Query query = 1;            // unset selects all documents (browse / filter-only search)
   repeated Filter filter = 2;
@@ -124,6 +152,9 @@ message TopDocs {
   int32 batch_size = 9;
   DocFormat document_format = 10;  // rows vs columns placement of returned fields (see DocFormat)
 
+  Diversify diversify = 12; // Incompatible with collapse; found counts capped documents.
+  Collapse collapse = 11; // limit, offset and found count groups; found_docs counts eligible documents.
+
   map<string, SearchOp> ops = 15;  // sub-facets or search operations performed over docs that match this query.
 }
 
@@ -135,7 +166,9 @@ message TopDocs {
 // response shape at the top level. Per-source `ops` are rejected; put facets
 // and metrics in Fusion.ops.
 // Each source's `query`, `sort`, `limit`, and any per-source `filter` are used
-// to produce that source's ranked list.
+// to produce that source's ranked list. A source collapse accepts only field
+// and missing, and its limit counts groups; the head documents enter document fusion.
+// Source collapse head_sort, sort, get_number and ops are errors.
 //
 // The fusion-level `filter` is ANDed with each source's own filters.
 message Fusion {
@@ -146,37 +179,69 @@ message Fusion {
   // in source filters.
   repeated Filter filter = 2;
 
-  // Maximum fused documents to return. Unset = 10; 0 = none; -1 = all remaining.
+  // Maximum fused rows (groups with collapse) to return. Unset = 10; 0 = none; -1 = all remaining.
   optional sint64 limit = 3;
 
-  // Required fusion method.
+  // Required fusion method: exactly one.
   oneof method {
     RrfFusion rrf = 10;
+    LinearFusion linear = 11;
   }
 
   // Response shape (mirrors TopDocs).
-  // Zero-based rank of the first returned fused document; must be >= 0.
+  // Zero-based rank of the first returned fused row; must be >= 0.
   // Return up to limit after skipping. Source limits remain candidate-pool
   // sizes: paging cannot reach beyond the union of their ranked windows.
   // Each response DocList.offset is the absolute rank of that batch's first
   // row, or the requested offset for an empty page.
   int64 offset = 4;
-  bool get_number = 5; // return the number of distinct documents in the source union
+  bool get_number = 5; // eligible groups with collapse, otherwise distinct source-union documents
   bool get_scores = 6;
   repeated string fields = 7;   // as TopDocs.fields: empty returns every retrievable field, '*' patterns expand
   int32 batch_size = 8; // same batching rules as TopDocs.batch_size
   DocFormat document_format = 9;  // rows vs columns placement of returned fields (see DocFormat)
 
-  // Runs over the union of filtered source ranked lists, as counted by found.
+  // Collapse the fused document list before paging. Source windows never refill.
+  // found counts eligible groups; found_docs counts eligible fused documents.
+  Collapse collapse = 17;
+
+  // Runs over the union of filtered source ranked lists, even with collapse.
   // Fusion limit and offset do not affect this candidate domain.
   map<string, SearchOp> ops = 15;
+
+  // Per-source weights keyed by source name, used by the fusion method.
+  // A source without an entry has weight 1. Weights must be finite, >= 0,
+  // and within float range, every key must name a source, and at least one
+  // source must have a weight > 0. A zero weight disables its source: it is
+  // not executed and its documents do not enter the fused list, found, or the
+  // ops domain.
+  map<string, double> weights = 16;
 }
 
 // Reciprocal Rank Fusion: fused_score(d) = sum over sources s of
-// 1 / (k + rank_s(d)), where rank_s(d) is d's 1-based rank in source s
-// (or omitted if d does not appear in s).  k=60 is the standard default.
+// weight_s / (k + rank_s(d)), where rank_s(d) is d's 1-based rank in source
+// s (sources without d contribute nothing) and weight_s comes from
+// Fusion.weights.
 message RrfFusion {
-  int32 k = 1;  // 0 means use default (60)
+  optional int32 k = 1;  // rank-smoothing constant, >= 0; unset selects 60
+}
+
+// Weighted linear fusion of normalized scores: fused_score(d) = sum over
+// sources s of weight_s * normalized_s(d), where weight_s comes from
+// Fusion.weights and sources without d contribute nothing. Each source's
+// scores are normalized over its ranked list after merging across segments.
+// Sources must rank by relevance score: a source with a sort other than
+// score descending (optionally followed by _docid_ ascending) is rejected.
+message LinearFusion {
+  enum Normalization {
+    // (score - min) / (max - min) over the source's ranked list, so its best
+    // document gets 1 and its worst gets 0. A list whose scores are all
+    // equal (including a single document) normalizes every document to 1.
+    // NaN scores contribute 0 and are left out of min and max; +inf
+    // normalizes to 1 and -inf to 0.
+    MIN_MAX = 0;
+  }
+  Normalization normalization = 1;  // unset selects MIN_MAX
 }
 
 message SortSpec {
@@ -249,18 +314,24 @@ message RescoreQuery {
 message KnnQuery {
   string field = 1;        // vector field name (e.g. "embedding_v")
   Vector query = 2;        // query vector - must match the field's dims
-  int32 k = 3;             // number of nearest-neighbor documents to return; must be positive
+  int32 k = 3;             // nearest documents (default) or groups to return; must be positive
 
   // Require exact top-k results by scanning stored vectors. Cost is linear
   // in the number of stored vectors; refine_candidates and ivf are ignored.
   bool exact = 4;
 
-  // Candidate-pool size for full-precision rescoring of ANN results, before
-  // collapsing multiple vectors to one hit per document. Clamped up to k;
+  // Candidate-document pool size for full-precision rescoring of ANN results,
+  // in both units. Group search caps the number of candidates per group so
+  // repeated keys cannot consume the whole pool. Clamped up to k;
   // 0 selects an adaptive default. Larger pools can improve recall at a cost
   // in memory and latency. Fewer candidates may be available.
   int32 refine_candidates = 5;
   Ivf ivf = 6; // ignored for exact search and segments without an IVF index
+
+  // docs (default): k counts documents. groups: k counts nearest groups under
+  // the enclosing top_docs collapse key and missing policy; requires collapse.
+  // The match set contains one best scored witness per selected group.
+  string unit = 7;
 
   // Search effort for IVF indexes.
   message Ivf {
@@ -530,6 +601,10 @@ enum SelectionMode {
 // STRING/ID support sub-operations and custom sorts. INT/DATE/TEXT support
 // counts, limits, mincount, missing, and selections.
 message FieldFacet {
+  enum CountUnit {
+    DOCS = 0; // Count documents.
+    GROUPS = 1; // Distinct keys of the nearest enclosing collapsed list.
+  }
   string field = 1;
 
   // Maximum ordinary buckets. Unset = 5; 0 = none; -1 = all.
@@ -540,7 +615,7 @@ message FieldFacet {
   // STRING/ID/TEXT also accept 0 to include indexed terms absent from the domain.
   // INT/DATE require a positive value when set.
   optional int64 mincount = 3;
-  bool missing = 4; // return the count of documents without a value
+  bool missing = 4; // Return the count without a value, in the chosen count unit.
 
   // One metric sub-operation name. Unset sorts by count
   // descending, then bucket value ascending.
@@ -552,6 +627,15 @@ message FieldFacet {
   // counts, even below mincount or absent from the index. Null is an error.
   Val selected = 7;
   SelectionMode selection_mode = 8; // ALL requires a nonempty selection
+
+  // Unset inherits a parent facet's measure, or counts groups beneath a
+  // collapsed list; entering group ops defaults to docs. Explicit GROUPS uses
+  // the nearest enclosing collapse, including inside a group. Controls count,
+  // count order, mincount, and missing; metrics still fold documents.
+  optional CountUnit count_unit = 9;
+  // Exact distinct keys per bucket, also usable without collapse. Same key
+  // types and missing policies as Collapse. Conflicting measures are errors.
+  Collapse count_distinct = 10;
 }
 
 message CalendarGap {
@@ -580,7 +664,7 @@ message RangeFacet {
     CalendarGap calendar_gap = 10; // civil gap for DATE fields only
   }
   optional int64 mincount = 5; // minimum bucket count; unset = 0; must be >= 0
-  bool missing = 6; // return the count of documents without a value
+  bool missing = 6; // Return the count without a value, in the chosen count unit.
   map<string, SearchOp> ops = 8;  // sub-facets or search operations performed per bucket
   string time_zone = 9; // empty inherits SearchRequest.time_zone; DATE fields only
 
@@ -589,6 +673,8 @@ message RangeFacet {
   // bounds after coercion are errors.
   Val selected = 11;
   SelectionMode selection_mode = 12; // same filtering rules as FieldFacet; see SelectionMode
+  optional FieldFacet.CountUnit count_unit = 13; // Inherits the parent measure; GROUPS uses the nearest collapse.
+  Collapse count_distinct = 14; // Exact distinct keys; same specification as Collapse.
 }
 
 message QueryBucket {
@@ -602,19 +688,24 @@ message QueryFacet {
   map<string, SearchOp> ops = 6; // sub-ops per bucket
   Val selected = 7; // bucket name or array of distinct existing names; null is an error
   SelectionMode selection_mode = 8; // same filtering rules as FieldFacet; see SelectionMode
+  optional FieldFacet.CountUnit count_unit = 9; // Inherits the parent measure; GROUPS uses the nearest collapse.
+  Collapse count_distinct = 10; // Exact distinct keys; same specification as Collapse.
 }
 
-// Overrides the incoming document set for an operation directly in
-// SearchRequest.ops or TopDocs.ops. Not supported directly in Fusion.ops
-// or beneath facet buckets.
+// Overrides an operation's incoming document set, including beneath facet
+// and group buckets. A reset retains the enclosing structural identities,
+// and re-evaluates selection-query identities outer to inner in the new
+// scope; child membership can differ from the parent's counted window.
+// Not supported directly in Fusion.ops.
 message Domain {
   // If present, replaces the incoming domain with this query's matches
-  // across the collection. If absent, inherits the incoming domain.
+  // within live documents and the enclosing structural bucket identities.
+  // If absent, inherits the incoming domain.
   Query query = 2;
 
-  // With query set, reapply the immediate parent's filters, including facet
+  // With query set, reapply the owning list's filters, including facet
   // selections, while respecting except_ops. Default false discards them.
-  // Requires query; does not restore the parent's query or ancestor domain.
+  // Requires query; does not restore matching queries above this operation.
   optional bool apply_parent_filters = 3;
 
   // Additional non-scoring constraints, ANDed with the inherited or reset
@@ -694,14 +785,43 @@ message SearchResponse {
 }
 
 
+// Typed collapse identity. Component types follow the resolved schema fields.
+message GroupComponent {
+  enum Type { STRING = 0; ID = 1; INT = 2; DATE = 3; } // INT carries signed int64 values.
+  Type type = 1;
+  oneof value {
+    google.protobuf.NullValue null = 2;
+    string s = 3;
+    sint64 i = 4;
+  }
+}
+message GroupKey {
+  repeated GroupComponent component = 1;
+  // Present for missing=expand: reader-local document identity, not a key value.
+  optional uint64 singleton = 2;
+}
+
+// Columns aligned with a collapsed list's returned rows. Absent columns were not requested.
+message GroupTable {
+  repeated GroupKey keys = 1;
+  repeated sint64 counts = 2;
+  // Metric sort values, or list rank values when head_sort chooses another member.
+  repeated ArrVal ranks = 3;
+  // Each operation is an array aligned with keys, as in FacetResult.ops.
+  map<string, Val> ops = 4;
+}
+
 // A batch of returned documents.  Document i is the merge of columns row i
 // and docs[i]; all-columns (docs absent) and all-docs (columns empty) are
 // just the degenerate cases.  Which fields land where is a function of the
 // request (see DocFormat), never of the data.
 message DocList {
-  // Exact match count when get_number was requested. For Fusion, counts
-  // distinct documents in the union of source ranked lists, before paging.
+  // Exact match count when get_number was requested. Counts groups with
+  // collapse; otherwise Fusion counts source-union documents before paging.
   optional sint64 found = 1;
+  optional sint64 found_docs = 2; // Collapse only, when get_number was requested, after missing=drop.
+  optional sint64 found_groups = 8; // Diversify only, with get_number: distinct eligible keys.
+  GroupTable groups = 7; // Collapse only: complete metadata aligned with this batch's rows.
 
   // Dense columns; each has exactly row_count slots.
   map<string, Column> columns = 3;
@@ -779,17 +899,6 @@ message ReplicaRequirement {
   }
 }
 message AllReplicas {}
-
-message WaitForReplicasRequest {
-  string collection = 1; // empty selects main
-  string commit = 2; // existing durable commit token
-  ReplicaRequirement wait_for_replicas = 3;
-  optional uint64 wait_for_replicas_timeout_ms = 4; // absent = 30000
-}
-message WaitForReplicasResponse {
-  string commit = 1;
-  ReplicaResult replicas = 2;
-}
 
 message ReplicaResult {
   enum Outcome {
@@ -1071,11 +1180,16 @@ message CreateCollectionRequest {
   // Administration only: the owning tenant. Empty is the caller's tenant
   // (the default tenant until credentials carry one).
   string tenant = 3;
+  // All counts live followers subscribed to the tenant that serve any
+  // collection, since none serves the new one yet.
+  ReplicaRequirement wait_for_replicas = 4;
+  optional uint64 wait_for_replicas_timeout_ms = 5; // absent = 30000
 }
 
 message CreateCollectionResponse {
   string commit = 2; // exact snapshot published by creation
   string name = 1;
+  ReplicaResult replicas = 3;
 }
 
 message DeleteCollectionRequest {
@@ -1125,6 +1239,20 @@ message StatsResponse {
   MemoryStats memory = 9;
 }
 
+// Cached field metadata payload, excluding allocator overhead and unused
+// hash-table capacity.
+message FieldMetadataStats {
+  uint64 bytes = 1;
+  uint64 directories = 2;
+  uint64 directory_bytes = 3;
+  uint64 pages = 4;
+  uint64 page_bytes = 5;
+  uint64 entries = 6;
+  uint64 entry_bytes = 7;
+  uint64 names = 8;
+  uint64 name_bytes = 9;
+}
+
 // Node memory: Luxir's own budgets and usage, and the process allocator's
 // statistics where the allocator reports them.
 message MemoryStats {
@@ -1132,6 +1260,7 @@ message MemoryStats {
   StorageRamStats storage_ram = 2;
   // Present only when Luxir runs on jemalloc.
   JemallocStats jemalloc = 3;
+  FieldMetadataStats field_metadata = 4;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.
@@ -1576,9 +1705,13 @@ message SchemaRequest {
   }
   Mode mode = 2;
   SchemaDef schema = 3;
+  // Updates only: as CommitParams.wait_for_replicas.
+  ReplicaRequirement wait_for_replicas = 5;
+  optional uint64 wait_for_replicas_timeout_ms = 6; // absent = 30000
 }
 
 message SchemaResponse {
   string commit = 2; // exact snapshot published by a schema update
   SchemaDef schema = 1;         // the resulting schema after the operation
+  ReplicaResult replicas = 3;
 }

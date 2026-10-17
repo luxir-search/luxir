@@ -163,7 +163,7 @@ class LuxirTestListener : public testing::EmptyTestEventListener {
         auto collection = LuxirTest::luxirNode->getCollection("main");
         auto writer = collection->getShard()->getIndexWriter();
         // An async update still queued from the previous test can be invisible here. This is the same
-        // exposure tests have today and is not worth an updateGraph.wait_for_all() on every clean check.
+        // exposure tests have today and is not worth an updateGraph->wait_for_all() on every clean check.
         bool dirty = !writer->testIsEmpty() || !LuxirTest::isDefaultSchema(collection->getSchema());
         if (dirty) {
           // Tests intentionally leave main populated; reset it silently before the next test.

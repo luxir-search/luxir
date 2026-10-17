@@ -253,7 +253,7 @@ TEST(ProcessAllocatorTest, inverterFlushReclaimsArena) {
   EXPECT_LE(jemalloc.active_bytes, jemalloc.mapped_bytes);
   EXPECT_FALSE(jemalloc.version.empty());
   writer.releaseInverter(inverter, true);
-  writer.updateGraph.wait_for_all();
+  writer.updateGraph->wait_for_all();
   auto flushed = *arena.stats();  // No test-side purge: the flush must do it.
   EXPECT_EQ(flushed.allocated, start.allocated);
   EXPECT_LT(flushed.resident, start.resident + 4 * 1024 * 1024);
@@ -305,7 +305,7 @@ TEST(ProcessAllocatorTest, abortedFlushAndDestructionFreeArenaMemory) {
       if (abortFlush) {
         inverter.fail(std::make_exception_ptr(std::runtime_error("aborted indexing")));
         writer.releaseInverter(inverter, true);
-        writer.updateGraph.wait_for_all();
+        writer.updateGraph->wait_for_all();
         EXPECT_EQ(arena.stats()->allocated, start.allocated);
       } else {
         writer.releaseInverter(inverter);
