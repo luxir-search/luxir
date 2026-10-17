@@ -32,6 +32,7 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   auto& ram = node.getIndexRamBudget();
   memory.indexing_budget.limit_bytes = (uint64_t)ram.totalBytes();
   memory.indexing_budget.reserved_bytes = (uint64_t)ram.reservedBytes();
+  memory.indexing_budget.pending_deletes_bytes = (uint64_t)ram.deleteBatchBytesCount();
   memory.storage_ram.used_bytes = node.storageBytes();
   memory.storage_ram.limit_bytes = node.getConfig().store.backend == "ram"
       ? node.getConfig().store.ram_limit_mb * 1024 * 1024 : 0;

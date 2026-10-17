@@ -320,6 +320,17 @@ the node unlimited. The resolved values are logged at startup.
 - Lower `indexing.max-inverter-ram-mb` to trade merge work for flush latency and
   peak RSS: smaller flushes land sooner and cost less at once, at the price of
   more segments to merge.
+- `indexing.max-pending-deletes-mb` bounds, per collection, the ID batches that
+  overwrites (the default unless `allow_dups`) and deletes by ID leave behind
+  at each flush until a commit applies them. They count against
+  `indexing.max-ram-mb` but flushing cannot shed them, so past this size a
+  flush triggers a commit (at most one in flight per collection). It defaults
+  to a quarter of `indexing.max-ram-mb`, and to `0` (never) when that is
+  unlimited. With `0` and a capped budget the batches crowd out inverters
+  until a client commits, so flushes get smaller. A feed faster than commits
+  complete can overshoot the limit by what it indexes during one commit.
+  `GET /_stats?memory=true` reports the node-wide total as
+  `indexing_budget.pending_deletes_bytes`.
 
 `--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
 transparent huge pages for whole-huge-page indexing allocations; disable it

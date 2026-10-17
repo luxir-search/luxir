@@ -393,7 +393,13 @@ public:
   // A batch survives until a normal commit has flushed every request through
   // its largest version. Protected by indexMutex.
   MultiDeletesData pendingDeletes;
+  int64_t pendingDeleteBytes = 0;  // sum of memSize() over pendingDeletes
   uint64_t durableUpdateVersion = 0;
+
+  // A commit submitted because pendingDeleteBytes passed maxPendingDeleteBytes
+  // is outstanding; at most one is in flight per writer.
+  std::atomic<bool> deletesCommitInFlight = false;
+  std::atomic<uint64_t> deletesCommits = 0;
 
   // In an update response, we could return an update number, or a commit number, or even a monotonic time.
   // This would allow a searching client to specify a time to search up to.
@@ -490,6 +496,12 @@ public:
   // without meaningful RAM relief, e.g. when merge reservations hold the budget.
   size_t pressureFlushFloorBytes = 4 * 1024 * 1024;
 
+  // Flushed delete-by-id batches (one per flushed inverter that indexed ids
+  // with overwrite, ~33 bytes plus the id per document) live until a commit
+  // retires them.  Past this many bytes a segment flush submits a commit so
+  // they stay bounded without client commits.  0 disables the trigger.
+  int64_t maxPendingDeleteBytes = 0;
+
   // TEXT merge partitioning thresholds. Tests and constrained deployments may
   // lower these without changing the on-disk behavior of flushes or serial merges.
   // Debug builds default the byte floors to 1 so every text merge with enough
@@ -570,6 +582,9 @@ private:
     void handle(IndexWriter& iw) override { unused(iw); }
     void done(IndexWriter& iw) override;
   };
+
+  void retirePendingDeletesLocked(const std::shared_ptr<const SortedDeletes>& batch);
+  void commitForPendingDeletes() noexcept;
 
   // Deferred-commit (commit_within_ms) machinery; see the state block above.
   void deferCommitWithin(int64_t withinMs, uint64_t updateVersion);
@@ -740,6 +755,14 @@ public:
 
   // Coherent writer-visible and committed state for operational introspection.
   Stats stats(bool includeSegments);
+
+  // Bytes of flushed delete batches not yet retired by a commit.
+  int64_t getPendingDeleteBytes() {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    return pendingDeleteBytes;
+  }
+  // Commits submitted by the maxPendingDeleteBytes trigger (process lifetime).
+  uint64_t getPendingDeleteCommits() const { return deletesCommits.load(std::memory_order_relaxed); }
 };
 
 
