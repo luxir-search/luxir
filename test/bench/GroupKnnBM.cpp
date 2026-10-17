@@ -70,22 +70,13 @@ void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t 
       }
       // Active overlay names otherwise build new segments automatically once
       // effort makes the last segment exceed the default training/work floor.
-      SearchOverridesGuard automaticBuild(VectorIndexBuilder::buildFaissIvfPqAuxIndexes);
-      if (segment == 3) VectorIndexBuilder::buildFaissIvfPqAuxIndexes = false;
+      SearchOverridesGuard automaticBuild(VectorIndexBuilder::buildFaissAuxIndexes);
+      if (segment == 3) VectorIndexBuilder::buildFaissAuxIndexes = false;
       helper.indexAll(docs, UpdateMessage::COMMIT);
       if (segment == 2) {
-        SearchOverridesGuard enabled(VectorIndexBuilder::buildFaissIvfPqAuxIndexes);
-        SearchOverridesGuard threshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost);
-        SearchOverridesGuard lists(VectorIndexBuilder::ivfPqNList);
-        SearchOverridesGuard m(VectorIndexBuilder::ivfPqM);
-        SearchOverridesGuard bits(VectorIndexBuilder::ivfPqBits);
-        SearchOverridesGuard training(VectorIndexBuilder::ivfPqMinTrainingVectors);
-        VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-        VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-        VectorIndexBuilder::ivfPqNList = unit_tests ? 2 : 16;
-        VectorIndexBuilder::ivfPqM = coarse ? 4 : 0;
-        VectorIndexBuilder::ivfPqBits = unit_tests ? 1 : coarse ? 4 : 8;
-        VectorIndexBuilder::ivfPqMinTrainingVectors = unit_tests ? 8 : 64;
+        IvfTestGuard ivf(IvfTestGuard::pq(unit_tests ? 2 : 16, coarse ? 4 : 0,
+                                          unit_tests ? 1 : coarse ? 4 : 8),
+                         unit_tests ? 8 : 64);
         helper.commit({"vec.vec_v"});
       }
     }

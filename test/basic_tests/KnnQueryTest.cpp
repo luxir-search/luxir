@@ -3030,7 +3030,7 @@ TEST_F(KnnQueryTest, scanAndRescoreFanoutSpawnCounts) {
 }
 
 TEST_F(KnnQueryTest, ivfScanGrainSpawnCounts) {
-  IvfPqAuxGuard guard(4, 2, 2, 4, 16, 8);
+  IvfPqAuxGuard guard(4, 2, 2, 16, 8);
   CollectionHelper h("main");
   installVecSchema(h.collection(), api::VectorMetric::L2);
   for (int i = 0; i < 160; i++) {
