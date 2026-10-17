@@ -1,7 +1,10 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <format>
 #include <limits>
+#include <type_traits>
+#include <variant>
 #include <string>
 #include <vector>
 
@@ -70,6 +73,26 @@ protected:
     api::Query q;
     q.kind.emplace<api::ExprQuery>().q = api::build::arenaStr(mr, text);
     return q;
+  }
+
+  static void checkJsonAndWire(SearchEngine& engine, const char* json,
+                               const std::vector<std::string>& expected) {
+    for (bool wire : {false, true}) {
+      auto req = localReq(engine);
+      parseQueryRequest(json, req->rawRequest(), req->mr);
+      req->collection("main");
+      auto run = localReq(engine);
+      std::vector<std::byte> data;  // decoded views point into it
+      if (wire) {
+        ASSERT_TRUE(api::encode(req->rawRequest(), data));
+        size_t size = data.size(); data.resize(size + 16);
+        ASSERT_TRUE(api::decode(run->rawRequest(), std::span(data).first(size), run->mr));
+      }
+      auto& target = wire ? *run : *req;
+      target.execute();
+      ASSERT_OK((&target));
+      EXPECT_EQ(expected, ids(target)) << json << " wire=" << wire;
+    }
   }
 
   static void installVec(Collection& col, api::VectorMetric metric) {
@@ -276,4 +299,81 @@ TEST_F(MinScoreTest, jsonShorthandAndFusionSource) {
   ASSERT_OK(fused);
   EXPECT_EQ((std::vector<std::string>{"d6", "d5"}), ids(*fused));
   EXPECT_EQ(2, fused->getMatchCount());
+}
+
+// Elasticsearch-style shorthand bodies as a gateway sends them: a match query
+// with a top-level min_score, as a float or an integer, beside ops.
+TEST_F(MinScoreTest, jsonShorthandMatchQueryWithOps) {
+  CollectionHelper h;
+  for (int i = 1; i <= 4; i++) {
+    std::string body = "gamma";
+    for (int j = 1; j < i; j++) body += " gamma";
+    for (int j = i; j < 4; j++) body += " pad";
+    h.index(flatdoc("id", "m" + std::to_string(i), "body_w", body,
+                    "cat_s", i % 2 == 0 ? "even" : "odd", "pop_i", (int64_t)i));
+  }
+  h.commit();
+
+  auto run = [&](const std::string& minScore) {
+    auto req = localReq(h.getSearchEngine());
+    parseQueryRequest(R"json({"query":{"match":{"body_w":"gamma"}},)json" + minScore
+        + R"json("get_number":true,"get_scores":true,"fields":["id"],"limit":-1,
+        "ops":{"f":{"field_facet":{"field":"cat_s","limit":-1}},"s":"sum(pop_i)"}})json",
+        req->rawRequest(), req->mr);
+    req->collection("main");
+    req->execute();
+    EXPECT_TRUE(req->ok()) << minScore << ": " << req->errorMsg();
+    return req;
+  };
+
+  // Unthresholded: higher term frequency at equal length scores higher.
+  auto all = run("");
+  ASSERT_EQ((std::vector<std::string>{"m4", "m3", "m2", "m1"}), ids(*all));
+  std::vector<double> scores;
+  std::visit([&](const auto& c) {
+    if constexpr (requires { c.v; }) {
+      for (auto v : c.v) {
+        if constexpr (std::is_arithmetic_v<std::decay_t<decltype(v)>>) scores.push_back((double)v);
+      }
+    }
+  }, all->docList("q")->columns.find("_score_")->kind);
+  ASSERT_EQ(4u, scores.size());
+
+  // A float cut-off between the second and third scores.
+  auto cut = run(std::format(R"("min_score":{},)", (scores[1] + scores[2]) / 2));
+  EXPECT_EQ((std::vector<std::string>{"m4", "m3"}), ids(*cut));
+  EXPECT_EQ(2, cut->getMatchCount());
+  EXPECT_EQ((std::vector<int64_t>{1, 1}), facetCounts(*cut));
+  EXPECT_DOUBLE_EQ(7.0, sumPop(*cut));
+
+  // Integer spellings: 0 keeps every match, a large one keeps none.
+  EXPECT_EQ(4, run(R"("min_score":0,)")->getMatchCount());
+  auto none = run(R"("min_score":1000,)");
+  EXPECT_EQ(0, none->getMatchCount());
+  EXPECT_TRUE(ids(*none).empty());
+}
+
+
+// rescore.min_score and knn.similarity through the JSON dialect, executed
+// from JSON and again after a protobuf wire round trip (the gRPC path):
+// the cut-offs keep their own tags beside collapse and knn.unit.
+TEST_F(MinScoreTest, jsonAndWireRescore) {
+  CollectionHelper h;
+  indexScored(h);
+  checkJsonAndWire(h.getSearchEngine(), R"json({"query":{"rescore":{"query":{"match":{"body_w":"alpha"}},
+    "expr":"pop_i","min_score":4.5}},"fields":["id"],"limit":-1})json", {"d6", "d5"});
+  checkJsonAndWire(h.getSearchEngine(), R"json({"query":"rescore(body_w:alpha, pop_i)",
+    "min_score":3.5,"fields":["id"],"limit":-1})json", {"d6", "d5", "d4"});
+}
+
+TEST_F(MinScoreTest, jsonAndWireKnnSimilarity) {
+  CollectionHelper v("main");
+  installVec(v.collection(), api::VectorMetric::L2);
+  for (int i = 0; i < 4; i++) {
+    v.index(flatdoc("id", "v" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0}));
+  }
+  v.commit();
+  checkJsonAndWire(v.getSearchEngine(), R"json({"query":{"knn":{"field":"embedding_v","query":[0,0],
+    "k":4,"unit":"docs","similarity":1.5}},"fields":["id"],"limit":-1})json", {"v0", "v1"});
 }
