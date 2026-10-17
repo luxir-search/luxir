@@ -5,20 +5,16 @@
 
 #include <algorithm>
 #include <boost/unordered/unordered_flat_map.hpp>
-#include <lz4.h>
-#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
-// For ZSTD_estimateCCtxSize_usingCParams (stable since 1.4; linked statically).
-#define ZSTD_STATIC_LINKING_ONLY
-#include <zstd.h>
 
 #include "IntColWriter.h"
 #include "PostingsWriter.h"
 #include "luxir/reader/Postings.h"
+#include "luxir/reader/StoredChunkCodec.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
@@ -72,10 +68,6 @@ namespace luxir {
 // numFieldsInDoc=0 means "nothing stored for this doc".
 class StoredFieldsWriter {
 private:
-  struct ZstdCCtxFree {
-    void operator()(ZSTD_CCtx* c) const { ZSTD_freeCCtx(c); }
-  };
-
   PostingsWriter& postingsWriter;
   std::string resourceName_;
   StoredChunkFormat format_;
@@ -110,7 +102,7 @@ private:
   // Reusable scratch buffers (avoid per-chunk reallocation).
   std::string uncompressedScratch;
   std::vector<char> compressScratch;
-  std::unique_ptr<ZSTD_CCtx, ZstdCCtxFree> zstdCtx;  // created on the first ZSTD chunk
+  StoredChunkCompressor compressor;
 
 public:
   // Create a writer for the named resource.  resourceName is the field name
@@ -130,14 +122,6 @@ public:
 
   std::string_view resourceName() const { return resourceName_; }
   const StoredChunkFormat& format() const { return format_; }
-
-  // Bytes a writer's ZSTD compression context needs for chunks up to
-  // chunkBytes; 0 for LZ4.
-  static int64_t compressionContextBytes(const StoredChunkFormat& format, int64_t chunkBytes) {
-    if (format.codec != StoredChunkFormat::ZSTD) return 0;
-    return (int64_t)ZSTD_estimateCCtxSize_usingCParams(
-        ZSTD_getCParams(format.zstdLevel, (unsigned long long)chunkBytes, 0));
-  }
 
   // Append one value for (docID, fieldName).  docID must be non-decreasing
   // across calls; values for the same doc can be emitted across multiple
@@ -408,7 +392,7 @@ private:
 
     int32_t uncompressedSize = (int32_t)uncompressedScratch.size();
     maxChunkBytes = std::max(maxChunkBytes, (int64_t)uncompressedSize);
-    size_t compressedSize = compress(uncompressedScratch);
+    size_t compressedSize = compressor.compress(format_, uncompressedScratch, compressScratch);
 
     // Record chunk position before writing (offsets are relative to chunksStart).
     int64_t chunkFileOffset = (int64_t)chunkOutput->size() - chunksStart;
@@ -421,31 +405,6 @@ private:
     chunkDocOffsets.clear();
     chunkBody.clear();
     chunkFirstDoc = -1;
-  }
-
-  // Compress src into compressScratch; returns the compressed size.
-  size_t compress(const std::string& src) {
-    if (format_.codec == StoredChunkFormat::ZSTD) {
-      if (!zstdCtx) {
-        zstdCtx.reset(ZSTD_createCCtx());
-        if (!zstdCtx) throw std::bad_alloc();
-      }
-      compressScratch.resize(ZSTD_compressBound(src.size()));
-      size_t n = ZSTD_compressCCtx(zstdCtx.get(), compressScratch.data(), compressScratch.size(),
-                                   src.data(), src.size(), format_.zstdLevel);
-      if (ZSTD_isError(n)) {
-        throw std::runtime_error(std::string("StoredFieldsWriter: ZSTD compression failed: ")
-                                 + ZSTD_getErrorName(n));
-      }
-      return n;
-    }
-    int maxCompressed = LZ4_compressBound((int)src.size());
-    compressScratch.resize((size_t)maxCompressed);
-    int n = LZ4_compress_default(src.data(), compressScratch.data(), (int)src.size(), maxCompressed);
-    if (n <= 0) {
-      throw std::runtime_error("StoredFieldsWriter: LZ4 compression failed");
-    }
-    return (size_t)n;
   }
 
   static void appendVint(std::string& dest, uint32_t val) {

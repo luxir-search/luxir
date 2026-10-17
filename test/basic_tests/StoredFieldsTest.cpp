@@ -687,12 +687,12 @@ TEST_F(StoredFieldsTest, emptySegment) {
 
 
 // makeSchema() with the default resource configured.
-static std::shared_ptr<Schema> withStoredFormat(StoredChunkFormat format, int64_t recompressMinDocs = 0) {
+static std::shared_ptr<Schema> withStoredFormat(StoredChunkFormat format) {
   auto schema = std::make_shared<Schema>();
   schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
       "body", FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::STORED, "whitespace");
   schema->fieldTypeMap["_stored_"] =
-      std::make_shared<StoredFieldType>("_stored_", format, recompressMinDocs);
+      std::make_shared<StoredFieldType>("_stored_", format);
   return schema;
 }
 
@@ -759,29 +759,6 @@ TEST_F(StoredFieldsTest, mergeRecompressesOtherFormatsAndCopiesMatching) {
   // The two LZ4 sources are re-added into one chunk; the ZSTD one is copied.
   EXPECT_EQ(2, sfr->numChunks());
   expectBodies(*sfr, 9);
-}
-
-TEST_F(StoredFieldsTest, recompressMinDocsKeepsSmallSegmentsOnDefaults) {
-  RAMDir dir;
-  StoredChunkFormat zstd{StoredChunkFormat::ZSTD, 3, 64 * 1024, 1024};
-  CommitSnapshotRegistry iwSnapshots(dir);
-  IndexWriter iw(iwSnapshots, withStoredFormat(zstd, 10));
-  // Format and chunk count of the single segment.
-  auto check = [&](const StoredChunkFormat& format, int32_t numChunks) {
-    auto reader = iw.snapshots.readers.getReader();
-    ASSERT_EQ(reader->segments().size(), 1u);
-    auto sfr = defaultStored(reader->segments()[0].postingsReader());
-    EXPECT_TRUE(sfr->format().sameLayout(format));
-    EXPECT_EQ(numChunks, sfr->numChunks());
-    expectBodies(*sfr, sfr->maxDoc());
-  };
-  addBodySegment(iw, 0, 3);
-  addBodySegment(iw, 3, 3);
-  iw.mergeSegments();
-  check({}, 2);  // flushes and a 6-doc merge keep the defaults; copied verbatim
-  addBodySegment(iw, 6, 4);
-  iw.mergeSegments();
-  check(zstd, 1);
 }
 
 

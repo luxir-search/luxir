@@ -342,6 +342,10 @@ struct StoredChunkFormat {
   static constexpr int DEFAULT_ZSTD_LEVEL = 3;
   static constexpr uint32_t DEFAULT_CHUNK_TARGET = 16 * 1024;
   static constexpr uint32_t DEFAULT_MAX_DOCS_PER_CHUNK = 128;
+  // ZSTD is chosen for size, so its defaults trade some per-document read
+  // cost for larger chunks.
+  static constexpr uint32_t DEFAULT_ZSTD_CHUNK_TARGET = 64 * 1024;
+  static constexpr uint32_t DEFAULT_ZSTD_MAX_DOCS_PER_CHUNK = 1024;
 
   Codec codec = LZ4;
   int zstdLevel = DEFAULT_ZSTD_LEVEL;
@@ -357,6 +361,12 @@ struct StoredChunkFormat {
     return codec == o.codec && chunkTarget == o.chunkTarget && maxDocsPerChunk == o.maxDocsPerChunk;
   }
   bool operator==(const StoredChunkFormat&) const = default;
+
+  // The defaults for a codec.
+  static StoredChunkFormat defaults(Codec codec) {
+    if (codec == LZ4) return {};
+    return {ZSTD, DEFAULT_ZSTD_LEVEL, DEFAULT_ZSTD_CHUNK_TARGET, DEFAULT_ZSTD_MAX_DOCS_PER_CHUNK};
+  }
 };
 
 // Describes a stored-fields resource (a per-segment column of compressed
@@ -367,20 +377,10 @@ struct StoredChunkFormat {
 class StoredFieldType : public FieldType {
 public:
   StoredChunkFormat format_;
-  // When > 0, segments with fewer docs (and every flush, whose size is not
-  // known up front) use the default format; merges reaching it use format_.
-  int64_t recompressMinDocs_ = 0;
 
-  explicit StoredFieldType(std::string_view name, StoredChunkFormat format = {},
-                           int64_t recompressMinDocs = 0)
+  explicit StoredFieldType(std::string_view name, StoredChunkFormat format = {})
     : FieldType(name, FieldType::BIN, FieldType::STORED),
-      format_(format),
-      recompressMinDocs_(recompressMinDocs) {}
-
-  // Format for a segment of segmentDocs docs; flushes pass 0.
-  StoredChunkFormat formatFor(int64_t segmentDocs) const {
-    return segmentDocs < recompressMinDocs_ ? StoredChunkFormat{} : format_;
-  }
+      format_(format) {}
 };
 
 } // end namespace

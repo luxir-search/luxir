@@ -406,9 +406,8 @@ private:
                                               const StoredFieldType* config) {
     auto it = storedFields_.find(resourceName);
     if (it != storedFields_.end()) return *it->second;
-    // A flush does not know its final size, so it counts as 0 docs.
-    StoredChunkFormat format = config ? config->formatFor(0) : StoredChunkFormat{};
-    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName, format);
+    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName,
+                                                       config ? config->format_ : StoredChunkFormat{});
     auto [newIt, _] = storedFields_.emplace(std::string(resourceName), std::move(writer));
     return *newIt->second;
   }

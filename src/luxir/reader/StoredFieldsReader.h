@@ -3,15 +3,13 @@
 
 #pragma once
 
-#include <lz4.h>
-#include <memory>
 #include <string_view>
 #include <vector>
-#include <zstd.h>
 
 #include "IntColReader.h"
 #include "Postings.h"
 #include "PostingsReader.h"
+#include "StoredChunkCodec.h"
 #include "luxir/schema/FieldType.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
@@ -49,10 +47,6 @@ namespace luxir {
 ///
 class StoredFieldsReader {
 private:
-  struct ZstdDCtxFree {
-    void operator()(ZSTD_DCtx* c) const { ZSTD_freeDCtx(c); }
-  };
-
   InputStream chunkIS;
   int64_t chunksStart = 0;
   int64_t chunksRegionEnd = 0;
@@ -69,7 +63,7 @@ private:
   std::vector<char> scratch;
   std::vector<std::string_view> valueSpanScratch;
   int32_t cachedChunkNum = -1;
-  std::unique_ptr<ZSTD_DCtx, ZstdDCtxFree> zstdCtx;  // created on the first ZSTD chunk
+  StoredChunkDecompressor decompressor;
 
   struct ChunkLookup {
     int32_t chunkNum;
@@ -360,23 +354,7 @@ private:
     int32_t compressedSize = (int32_t)(nextOff - off) - (int32_t)sizeof(int32_t);
 
     scratch.resize((size_t)uncompressedSize);
-    if (format_.codec == StoredChunkFormat::ZSTD) {
-      if (!zstdCtx) {
-        zstdCtx.reset(ZSTD_createDCtx());
-        if (!zstdCtx) throw std::bad_alloc();
-      }
-      size_t decoded = ZSTD_decompressDCtx(zstdCtx.get(), scratch.data(), scratch.size(),
-                                           chunkPtr, (size_t)compressedSize);
-      if (ZSTD_isError(decoded) || decoded != (size_t)uncompressedSize) {
-        throw std::runtime_error("StoredFieldsReader: ZSTD decompression failed");
-      }
-    } else {
-      int decoded = LZ4_decompress_safe(
-          chunkPtr, scratch.data(), compressedSize, uncompressedSize);
-      if (decoded != uncompressedSize) {
-        throw std::runtime_error("StoredFieldsReader: LZ4 decompression failed");
-      }
-    }
+    decompressor.decompress(format_.codec, chunkPtr, (size_t)compressedSize, scratch.data(), scratch.size());
     cachedChunkNum = chunkNum;
   }
 };

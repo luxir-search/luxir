@@ -486,7 +486,6 @@ struct KnnQuery {                                                // needs Vector
 };
 struct StoredResourceDef {
   using Codec = luxir::api::StoredResourceDef_::Codec;
-  std::optional<std::int64_t> recompress_min_docs;              // align 8
   std::optional<Codec> codec;                                   // align 4 (enum)
   std::optional<std::int32_t> zstd_level;                       // align 4
   std::optional<std::int32_t> chunk_size_bytes;

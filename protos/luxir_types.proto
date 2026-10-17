@@ -1634,8 +1634,9 @@ message FieldDef {
   // retrieval. Defaults to true for TEXT, false otherwise; unused on other types.
   optional bool stored = 7;
 
-  // Stored-field group for stored TEXT/STRING/ID values, e.g. "_stored_body_".
-  // Empty or unset inherits the parent's group, falling back to "_stored_".
+  // Stored-field group for stored TEXT/STRING/ID values, e.g. "_stored_body_",
+  // declared in SchemaDef.stored_resources. Empty or unset inherits the
+  // parent's group, falling back to "_stored_".
   optional string stored_resource = 8;
 
   // --- VECTOR fields ---
@@ -1677,8 +1678,8 @@ message FieldDef {
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).
 // Every setting is optional; absent selects the default. Changes apply to
-// segments written afterwards; existing segments keep their recorded codec and
-// are recompressed only when a merge rewrites them.
+// segments written afterwards. A merge recompresses its inputs unless their
+// codec and chunk limits already match; the level alone does not count.
 message StoredResourceDef {
   enum Codec {
     LZ4 = 0;  // fast compression and decompression
@@ -1691,18 +1692,15 @@ message StoredResourceDef {
   // with codec zstd.
   optional int32 zstd_level = 2;
 
-  // Target uncompressed bytes per chunk, 1024 to 4194304; absent selects 16384.
-  // Larger chunks compress better, but each retrieval decompresses a whole chunk.
+  // Target uncompressed bytes per chunk, 1024 to 4194304; absent selects 16384,
+  // or 65536 with zstd. Larger chunks compress better, but each retrieval
+  // decompresses a whole chunk.
   optional int32 chunk_size_bytes = 3;
 
-  // Most documents per chunk, 1 to 65536; absent selects 128. A chunk closes
-  // at whichever of the byte and document limits comes first.
+  // Most documents per chunk, 1 to 65536; absent selects 128, or 1024 with
+  // zstd. A chunk closes at whichever of the byte and document limits comes
+  // first.
   optional int32 max_docs_per_chunk = 4;
-
-  // When positive, flushes and merges producing fewer documents write lz4 with
-  // the default chunk limits, and only merges reaching this many documents apply
-  // the settings above. Absent or 0 applies them to every segment.
-  optional int64 recompress_min_docs = 5;
 }
 
 message SchemaDef {
@@ -1717,9 +1715,12 @@ message SchemaDef {
   // any field/template may name one as parent.  A name in both maps is an error.
   map<string, FieldDef> templates = 2;
 
-  // Stored-field groups, keyed by the name fields use as stored_resource (for
-  // example "_stored_" or "_stored_body_"). A group without an entry uses the
-  // defaults. mode=set replaces the named entries and keeps the others.
+  // Stored-field groups, keyed by the name fields use as stored_resource. A
+  // name is '_', ASCII letters, digits, or underscores, and a closing '_' (for
+  // example "_stored_body_"), so it never matches a field or suffix template.
+  // A field may name only an entry here or the default "_stored_", which uses
+  // the defaults without one. mode=set replaces the named entries and keeps
+  // the others.
   map<string, StoredResourceDef> stored_resources = 4;
 }
 

@@ -2992,7 +2992,7 @@ TEST_F(HttpApiTest, schemaBodiesRetainVariantDefaultsAcrossAsyncDispatch) {
     "variants":{"words_for_search":"text",
                 "folded_for_value":{"type":"string","normalizer":["nfkc_cf"]}},
     "defaults":{"search":"words_for_search","value":"folded_for_value"}
-  }}})";
+  }},"stored_resources":{"_stored_http_schema_":{}}})";
   auto created = httpRequest(port(), http::verb::post, "/collections/_create",
       R"({"name":"http_schema_body","schema":)" + schema + "}");
   ASSERT_EQ(200, created.result_int()) << created.body();

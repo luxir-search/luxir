@@ -428,8 +428,7 @@ target_link_libraries(luxir_lib PUBLIC gRPC::grpc++ gRPC::grpc++_reflection)
 target_link_libraries(luxir_lib PUBLIC spdlog::spdlog)
 target_link_libraries(luxir_lib PRIVATE CLI11::CLI11)
 target_link_libraries(luxir_lib PRIVATE lz4::lz4)
-# The stored-fields reader/writer headers include zstd.h.
-target_link_libraries(luxir_lib PUBLIC zstd::libzstd)
+target_link_libraries(luxir_lib PRIVATE zstd::libzstd)
 target_link_libraries(luxir_lib PRIVATE faiss)
 # uni-algo (vendored): Unicode case folding / NFKC / UAX#29 segmentation, used by
 # the analysis chain (src/luxir/analysis/Analyzer.cpp).

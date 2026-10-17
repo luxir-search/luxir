@@ -552,8 +552,8 @@ class SegmentMerger {
   std::span<LiveDocs*> liveDocs; // parallel to preaders, nullptr if no deletes
   PostingsWriter& postingsWriter;
   IndexRamBudget& ramBudget;
-  // Current schema, for per-resource stored-fields formats; null uses defaults.
-  const Schema* schema;
+  // Current schema, for per-resource stored-fields formats.
+  const Schema& schema;
   const uint64_t estimatedOutputBytes;
   const int32_t streamBudget;
   int64_t termPartitionMinBytes;
@@ -569,7 +569,7 @@ public:
   SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
-                int32_t termPartitionMaxRanges, const Schema* schema = nullptr)
+                int32_t termPartitionMaxRanges, const Schema& schema)
   : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
     schema(schema),
     estimatedOutputBytes(estimateOutputBytes(preaders)),
@@ -736,7 +736,7 @@ private:
       // the small compress-bound overhead above 1x and a ZSTD source's
       // decompression context; a ZSTD output adds its compression context.
       return MergeCostModel::storedFieldsBytes(maxChunkBytes)
-          + StoredFieldsWriter::compressionContextBytes(format, maxChunkBytes);
+          + StoredChunkCompressor::contextBytes(format, maxChunkBytes);
     }
 
     FieldType::Type type;
@@ -1563,12 +1563,11 @@ private:
   }
 
 
-  // Output format for a stored-fields resource: the schema's current setting
-  // for this merge's output size, else the defaults.
+  // Output format for a stored-fields resource: the schema's current setting,
+  // else the defaults.
   StoredChunkFormat storedFormat(std::string_view resourceName) const {
-    auto* type = schema ? dynamic_cast<const StoredFieldType*>(schema->getFieldTypePtr(resourceName))
-                        : nullptr;
-    return type ? type->formatFor(postingsWriter.getMaxDoc()) : StoredChunkFormat{};
+    auto* type = dynamic_cast<const StoredFieldType*>(schema.getFieldTypePtr(resourceName));
+    return type ? type->format_ : StoredChunkFormat{};
   }
 
   // Merge one stored-fields resource (default or named column family).

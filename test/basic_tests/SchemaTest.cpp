@@ -631,6 +631,7 @@ TEST_F(SchemaTest, storedResourceRoundtripsThroughProto) {
   // A custom stored_resource survives toProto -> fromProto; unset fields
   // keep the default "_stored_".
   SchemaBuilder b;
+  b.storedResource("_stored_embeddings_");
   auto& custom = b.field("paragraphs");
   custom.type = FieldClass::TEXT;
   custom.index = IndexMode::MATCH;
@@ -658,6 +659,8 @@ TEST_F(SchemaTest, storedResourceInheritedFromParent) {
   // A child inheriting from a parent with a non-default stored_resource
   // picks up the parent's choice.  Explicit override on the child wins.
   SchemaBuilder b;
+  b.storedResource("_stored_embeddings_");
+  b.storedResource("_stored_captions_");
   auto& parent = b.templ("_emb_");
   parent.type = FieldClass::TEXT;
   parent.index = IndexMode::MATCH;
@@ -681,6 +684,7 @@ TEST_F(SchemaTest, setPreservesStoredResource) {
   // doesn't mention the field.  (Programmatic FieldType mutations are NOT
   // preserved: the source def is the single source of truth.)
   SchemaBuilder baseB;
+  baseB.storedResource("_stored_embeddings_");
   auto& body = baseB.field("body");
   body.type = FieldClass::TEXT;
   body.index = IndexMode::MATCH;
@@ -1210,9 +1214,8 @@ static const StoredFieldType& storedType(const Schema& s, std::string_view name)
 TEST_F(SchemaTest, storedResourcesRoundTripAndSetMerge) {
   auto s = schemaJson(R"({"fields":{"msg":{"type":"text","stored_resource":"_stored_logs_"}},
     "stored_resources":{"_stored_logs_":{"codec":"zstd","zstd_level":9,"chunk_size_bytes":65536,
-      "max_docs_per_chunk":1024,"recompress_min_docs":100000}}})");
+      "max_docs_per_chunk":1024}}})");
   EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 9, 65536, 1024}), storedType(*s, "_stored_logs_").format_);
-  EXPECT_EQ(100000, storedType(*s, "_stored_logs_").recompressMinDocs_);
   EXPECT_EQ(StoredChunkFormat{}, storedType(*s, "_stored_").format_);
 
   std::pmr::monotonic_buffer_resource arena;
@@ -1229,7 +1232,8 @@ TEST_F(SchemaTest, storedResourcesRoundTripAndSetMerge) {
 
   // mode=set replaces named entries and keeps the rest; replace_all drops them.
   auto set = schemaJson(R"({"stored_resources":{"_stored_":{"codec":"zstd"}}})", s.get());
-  EXPECT_EQ(StoredChunkFormat::ZSTD, storedType(*set, "_stored_").format_.codec);
+  // zstd without chunk limits takes its own defaults: 64KB, 1024 docs.
+  EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 3, 65536, 1024}), storedType(*set, "_stored_").format_);
   EXPECT_EQ(9, storedType(*set, "_stored_logs_").format_.zstdLevel);
   EXPECT_EQ(nullptr, schemaJson(R"({"fields":{}})")->getFieldTypePtr("_stored_logs_"));
 }
@@ -1243,9 +1247,14 @@ TEST_F(SchemaTest, storedResourcesValidation) {
       R"({"stored_resources":{"_stored_":{"chunk_size_bytes":4194305}}})",
       R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":0}}})",
       R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":65537}}})",
-      R"({"stored_resources":{"_stored_":{"recompress_min_docs":-1}}})",
       R"({"stored_resources":{"bad-name":{}}})",
-      R"({"fields":{"body":"text"},"stored_resources":{"body":{}}})"}) {
+      // Names must be '_name_': neither a field name nor a suffix template.
+      R"({"stored_resources":{"cold":{}}})",
+      R"({"stored_resources":{"_cold":{}}})",
+      R"({"templates":{"_cold_":{"type":"text"}},"stored_resources":{"_cold_":{}}})",
+      // References must name a declared resource.
+      R"({"fields":{"body":{"type":"text","stored_resource":"_cold_"}}})",
+      R"({"templates":{"_t":{"type":"text","stored_resource":"_cold_"}}})"}) {
     SCOPED_TRACE(json);
     EXPECT_THROW(schemaJson(json), SchemaError);
   }
@@ -1270,7 +1279,7 @@ TEST_F(SchemaTest, storedResourcesSurviveRestart) {
   CommitSnapshotRegistry reopenedSnapshots(*ch.collection().getShard()->getDirectory());
   IndexWriter reopened(reopenedSnapshots);
   auto& stored = storedType(*reopened.getSchema(), "_stored_");
-  EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 3, 32768}), stored.format_);
+  EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 3, 32768, 1024}), stored.format_);
 }
 
 TEST_F(SchemaTest, variantsResolveByOperationAndExplicitSelectors) {
@@ -1486,14 +1495,14 @@ TEST_F(SchemaTest, variantsAtomicInheritanceAndDefaultsClearing) {
 
 TEST_F(SchemaTest, variantParentsBorrowOnlyPhysicalSettings) {
   auto s = schemaJson(R"({"templates":{
-    "_strings":{"type":"string","multi":true,"stored":true,"stored_resource":"cold",
+    "_strings":{"type":"string","multi":true,"stored":true,"stored_resource":"_cold_",
                 "normalizer":["lowercase"],"variants":{"i":"int"},"defaults":{"value":"i"}},
     "_text":{"type":"text","multi":true,"stored":true,"analyzer":{"filters":["fold"]}}
   },"fields":{
     "a":{"type":"text","variants":{"s":{"parent":"_strings"},"t":{"parent":"_text"}}},
     "b":{"type":"string","multi":true,"variants":{"t":{"parent":"_text"}}},
     "c":{"type":"text","variants":{"again":{"parent":"c"}}}
-  }})");
+  },"stored_resources":{"_cold_":{}}})");
   auto input = s->resolveInput("a");
   EXPECT_TRUE(input.fieldType->isStored());
   EXPECT_FALSE(input.owner->multi);
@@ -1741,10 +1750,11 @@ TEST_F(SchemaTest, stringNormalizerSchemaValidation) {
 }
 
 TEST_F(SchemaTest, storedResourceEmptyStillInheritsOnPrimary) {
-  auto s = schemaJson(R"({"templates":{"_t":{"type":"text","stored_resource":"cold"}},
-                         "fields":{"a":{"parent":"_t","stored_resource":""}}})");
-  EXPECT_EQ("cold", s->physical("a")->storedResource_);
-  EXPECT_EQ("cold", schemaJson(authoredJson(*s))->physical("a")->storedResource_);
+  auto s = schemaJson(R"({"templates":{"_t":{"type":"text","stored_resource":"_cold_"}},
+                         "fields":{"a":{"parent":"_t","stored_resource":""}},
+                         "stored_resources":{"_cold_":{}}})");
+  EXPECT_EQ("_cold_", s->physical("a")->storedResource_);
+  EXPECT_EQ("_cold_", schemaJson(authoredJson(*s))->physical("a")->storedResource_);
 }
 
 TEST_F(SchemaTest, resolvedHandlesUseHandBuiltFieldTypesWithoutOwners) {

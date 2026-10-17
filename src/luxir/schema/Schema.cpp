@@ -604,15 +604,17 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
   auto fail = [&](const std::string& msg) {
     throw SchemaError(msg + " (stored resource: " + std::string(name) + ")");
   };
-  if (!Schema::validFieldName(name) && !Schema::validTemplateName(name)) {
-    fail("invalid stored resource name: ASCII letters, digits, and underscores");
+  // '_' + name + '_' can be neither a document field nor a suffix template
+  // (suffix matching anchors on a field name's last underscore).
+  if (name.size() < 3 || name.back() != '_' || !Schema::validTemplateName(name)) {
+    fail("invalid stored resource name: '_', ASCII letters, digits, or underscores, and a closing '_'");
   }
-  StoredChunkFormat format;
   StoredCodec codec = def.codec.value_or(StoredCodec::LZ4);
   if (codec != StoredCodec::LZ4 && codec != StoredCodec::ZSTD) {
     fail("unknown codec value " + std::to_string((int)codec) + "; valid: lz4, zstd");
   }
-  format.codec = codec == StoredCodec::ZSTD ? StoredChunkFormat::ZSTD : StoredChunkFormat::LZ4;
+  auto format = StoredChunkFormat::defaults(codec == StoredCodec::ZSTD ? StoredChunkFormat::ZSTD
+                                                                       : StoredChunkFormat::LZ4);
   if (def.zstd_level) {
     if (codec != StoredCodec::ZSTD) fail("zstd_level requires codec zstd");
     if (*def.zstd_level < 1 || *def.zstd_level > 22) fail("zstd_level must be 1 to 22");
@@ -630,9 +632,7 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
     }
     format.maxDocsPerChunk = (uint32_t)*def.max_docs_per_chunk;
   }
-  int64_t recompressMinDocs = def.recompress_min_docs.value_or(0);
-  if (recompressMinDocs < 0) fail("recompress_min_docs must not be negative");
-  return std::make_shared<StoredFieldType>(name, format, recompressMinDocs);
+  return std::make_shared<StoredFieldType>(name, format);
 }
 
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
@@ -778,6 +778,16 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
   ownership_map ownership;
   for (const auto& e : entries) resolveOwnership(e.name, defMap, ownership);
   validateReservedFields(resolved, ownership);
+  // A stored_resource must be declared, so a typo cannot silently start a
+  // separate resource with default settings.
+  for (const auto& e : entries) {
+    const auto& name = ownership.at(e.name).storedResource;
+    if (!name.empty() && name != Postings::STORED_DEFAULT_RESOURCE
+        && !std::ranges::binary_search(resources, std::string_view(name), {}, &ResourcePair::first)) {
+      throw SchemaError("stored_resource '" + name + "' is not declared in stored_resources (field: " +
+                        std::string(e.name) + ")");
+    }
+  }
 
   FieldCompiler compiler;
   for (const auto& e : entries) {
