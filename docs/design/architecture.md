@@ -81,13 +81,16 @@ response paths keep connection handling separate from long-running engine work.
   shard with the fewest live connections and the connection stays pinned to
   that shard; an idle shard parks independently and does no per-request work
   for active shards. The gRPC server runs on completion queues.
-- Search work defaults to serial execution inline on the connection thread
-  that received it: cheap queries pay no scheduler handoff, and request rate
-  never wakes idle workers. A request can instead opt onto the shared
-  work-stealing scheduler (`max_parallel: 1`) so an expensive query does
-  not occupy its connection thread, or parallelize (`max_parallel: -1`):
-  it starts on the receiving thread, which enters the scheduler with a slot
-  reserved for transport threads, and idle workers steal its tasks. The gRPC
+- HTTP search work defaults to serial execution inline on the connection
+  thread that received it: cheap queries pay no scheduler handoff, and
+  request rate never wakes idle workers. A request can instead opt onto the
+  shared work-stealing scheduler (`max_parallel: 1`) so an expensive query
+  does not occupy its connection thread, or parallelize (`max_parallel:
+  -1`): it starts on the receiving thread, which enters the scheduler with
+  a slot reserved for transport threads, and idle workers steal its tasks.
+  gRPC hands every search to the scheduler instead, because one HTTP/2
+  connection (a gateway's, say) lands all its calls on one completion queue
+  and inline execution would serialize them. The gRPC
   unary update path currently waits for indexing on its completion-queue
   handler.
 - Ingest is streaming and incremental: NDJSON bodies are parsed as bytes

@@ -45,8 +45,9 @@ message SearchRequest {
   // Intra-request parallelism: 0 (default) lets the engine choose; 1 runs
   // serially on the shared executor; -1 permits unlimited parallelism,
   // starting on the receiving thread with shared workers joining in.
-  // Automatic execution is serial on the receiving thread. Other values
-  // are rejected.
+  // Automatic execution is serial on the receiving thread. gRPC never
+  // executes on the receiving thread: 0 and 1 run serially on the shared
+  // executor and -1 starts there. Other values are rejected.
   int32 max_parallel = 8;
 
   // Require a local snapshot at least this new (incarnation:index_gen).

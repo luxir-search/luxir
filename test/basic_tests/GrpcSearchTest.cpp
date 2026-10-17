@@ -3,11 +3,16 @@
 
 
 #include <chrono>
+#include <condition_variable>
 #include <iostream>
+#include <latch>
 #include <memory>
+#include <mutex>
 #include <thread>
 #include <variant>
+#include <pthread.h>
 #include <gtest/gtest.h>
+#include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
 #include "test/GrpcClient.h"
 #include "test/GrpcLuxirTest.h"
@@ -297,5 +302,127 @@ TEST_F(GrpcSearchTest, disconnectWhilePausedCancelsEmitter) {
   }
 
   server.shutdown();  // hangs if the paused request was stranded
+  serverThread.join();
+}
+
+namespace {
+
+// Holds every search that reaches searchRootChildStart until `expected` of
+// them are executing at once, recording the names of the threads they ran on
+// and how many gave up waiting for the others.
+struct SearchOverlap {
+  std::mutex mutex;
+  std::condition_variable cv;
+  int expected;
+  int entered = 0;
+  int timedOut = 0;
+  std::vector<std::string> threadNames;
+
+  explicit SearchOverlap(int expected) : expected(expected) {
+    Signal::listen("searchRootChildStart", [this](void*, void*, void*) -> void* {
+      char name[16] = {};
+      pthread_getname_np(pthread_self(), name, sizeof(name));
+      std::unique_lock lock(mutex);
+      threadNames.emplace_back(name);
+      entered++;
+      cv.notify_all();
+      if (!cv.wait_for(lock, std::chrono::seconds(10), [this] { return entered >= this->expected; })) {
+        timedOut++;
+      }
+      return nullptr;
+    });
+  }
+  ~SearchOverlap() { Signal::unlisten("searchRootChildStart"); }
+};
+
+grpc::Status searchToCompletion(grpc::Channel& channel, const luxir::api::SearchRequest& request,
+                                grpc::ClientContext& context) {
+  HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
+      &channel, rpc::Search, &context);
+  if (stream.Write(request)) stream.WritesDone();
+  Reply<luxir::api::SearchResponse> response;
+  while (stream.Read(&response)) {}
+  return stream.Finish();
+}
+
+} // namespace
+
+// One connection lands its calls on one completion queue.  Searches must not
+// execute on it, or concurrent calls on a connection run one at a time: here
+// every search on the single channel to a one-thread server must be executing
+// at once, each on a task-arena worker.
+TEST_F(GrpcSearchTest, concurrentSearchesOnOneChannelRunInParallel) {
+  const int n = std::min(4, luxirNode->getWorkers());
+  if (n < 2) GTEST_SKIP() << "needs at least two task-arena workers";
+  CollectionHelper ch("grpc_overlap");
+  ch.index(flatdoc("id", "1"), UpdateMessage::COMMIT);
+
+  GRPCServer server(*luxirNode, 1, 0);
+  std::thread serverThread([&] { server.run(); });
+  ASSERT_TRUE(server.waitForStart());
+  auto channel = grpc::CreateChannel("localhost:" + std::to_string(server.getPort()),
+                                     grpc::InsecureChannelCredentials());
+
+  std::vector<grpc::Status> statuses(n);
+  {
+    SearchOverlap overlap(n);
+    std::vector<std::thread> clients;
+    for (int i = 0; i < n; i++) {
+      clients.emplace_back([&, i] {
+        auto lreq = localReq(luxirNode->getSearchEngine());
+        lreq->collection("grpc_overlap").topDocs("q").allQuery();
+        lreq->rawRequest().max_parallel = i % 2;  // the default and the serial-on-arena lane
+        grpc::ClientContext context;
+        statuses[i] = searchToCompletion(*channel, lreq->proto, context);
+      });
+    }
+    for (auto& client : clients) client.join();
+    EXPECT_EQ(n, overlap.entered);
+    EXPECT_EQ(0, overlap.timedOut);
+    for (const auto& name : overlap.threadNames) EXPECT_EQ(0u, name.rfind("luxir_tbb_", 0)) << name;
+  }
+  for (const auto& status : statuses) EXPECT_TRUE(status.ok()) << status.error_message();
+
+  server.shutdown();
+  serverThread.join();
+}
+
+// A deadline that expires while the search runs on a worker completes the
+// call once, as DEADLINE_EXCEEDED; the worker's late reply is dropped and the
+// call is still released (a stranded call hangs server.shutdown()).
+TEST_F(GrpcSearchTest, deadlineWhileSearchRunsOnWorker) {
+  CollectionHelper ch("grpc_deadline");
+  ch.index(flatdoc("id", "1"), UpdateMessage::COMMIT);
+
+  GRPCServer server(*luxirNode, 1, 0);
+  std::thread serverThread([&] { server.run(); });
+  ASSERT_TRUE(server.waitForStart());
+  auto channel = grpc::CreateChannel("localhost:" + std::to_string(server.getPort()),
+                                     grpc::InsecureChannelCredentials());
+
+  std::latch started(1), release(1);
+  Signal::listen("searchRootChildStart", [&](void*, void*, void*) -> void* {
+    started.count_down();
+    release.wait();
+    return nullptr;
+  });
+  auto lreq = localReq(luxirNode->getSearchEngine());
+  lreq->collection("grpc_deadline").topDocs("q").allQuery();
+  std::thread searcher([&] {
+    grpc::ClientContext context;
+    context.set_deadline(std::chrono::system_clock::now() + std::chrono::milliseconds(300));
+    auto status = searchToCompletion(*channel, lreq->proto, context);
+    EXPECT_EQ(grpc::StatusCode::DEADLINE_EXCEEDED, status.error_code());
+    release.count_down();
+  });
+  started.wait();
+  searcher.join();
+  Signal::unlisten("searchRootChildStart");
+
+  // The channel still serves searches after the abandoned call.
+  grpc::ClientContext context;
+  EXPECT_TRUE(searchToCompletion(*channel, lreq->proto, context).ok());
+
+  server.shutdown();
   serverThread.join();
 }

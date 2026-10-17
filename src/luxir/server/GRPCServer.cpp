@@ -46,8 +46,7 @@ namespace luxir {
 // #define GRPC_DEBUG LOG_DEBUG
 
 GRPCServer::GRPCServer(LuxirNode& node, int nthreads, int port, int64_t streamBufferBytes)
-  : luxirNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads),
-    arenaEntrants(node, nthreads, "GRPCServer"), requestedPort(port),
+  : luxirNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads), requestedPort(port),
     // Clamp to >= 1: a non-positive high-water mark (misconfiguration) would
     // pause every reply while the drain check (queuedBytes <= low) never fires.
     streamBufferBytes_(std::max<int64_t>(1,
@@ -692,17 +691,18 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     call.enableWaitCancellation();
     req.waitCancellation = call.waitCancellation;
   }
-  // Route by max_parallel (via dispatch()): the default (0) runs the whole
-  // query serially right here on this completion-queue thread - the cheapest
-  // path, accepting that this cq's other calls wait for the query's duration
-  // (a paused streaming producer parks and returns, so flow control still
-  // advances).  -1 also runs here, entering the task arena so its workers
-  // parallelize the query; 1 runs on the task arena instead, keeping this
-  // cq thread free to process completions.  The call outlives the request
-  // because its outstanding-response count stays positive until the final
-  // reply, and requestActive keeps pipelined requests on this stream ordered.
+  // Every search leaves this completion-queue thread for the task arena (see
+  // SearchEngine::Receiver): one HTTP/2 connection lands its calls on one cq,
+  // so a query run here would serialize every concurrent call on that
+  // connection.  max_parallel keeps its parallelism meaning: 0 (the default)
+  // and 1 run serially on a worker, -1 fans out from one.  The reply and the
+  // final response come from that worker: respondRaw() is thread-safe and
+  // Finish is kicked back to this call's cq thread.  The call outlives the
+  // request because its outstanding-response count stays positive until the
+  // final reply, and requestActive keeps pipelined requests on this stream
+  // ordered.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
-  engine.dispatch(req, req.proto.max_parallel);
+  engine.dispatch(req, req.proto.max_parallel, SearchEngine::Receiver::OFFLOAD);
 }
 
 
@@ -993,10 +993,12 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
   // Used to test that a client request will still be handled correctly if it comes in before we've registered the calls
   // std::this_thread::sleep_for (std::chrono::seconds(10));
 
-  // Pre-arm several generic acceptors per CQ (each re-arms on accept, so the
-  // accept backlog stays at this depth).  Matches the previous depth of 8
-  // per-method acceptors.
-  constexpr int kGenericAcceptors = 8;
+  // Pre-arm generic acceptors per CQ (each re-arms on accept, so the accept
+  // backlog stays at this depth).  gRPC matches a connection's new calls to
+  // the acceptors armed on its cq, so this bounds how many calls one
+  // connection can start at once without waiting for a re-arm.  Handlers hand
+  // their work off, so the depth costs only an idle GenericCallData each.
+  constexpr int kGenericAcceptors = 64;
   for (int i = 0; i < kGenericAcceptors; i++) {
     new GenericCallData(*this, genericService, threadInfo);
   }
