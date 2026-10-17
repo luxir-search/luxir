@@ -545,3 +545,77 @@ TEST_F(QueryAnalysisTest, matchMinShouldMatchScoreIncludesAllMatches) {
 
   EXPECT_FLOAT_EQ(score(0), score(2));  // OR vs min-should-match, same matched set
 }
+
+// Set the query-named analyzer on whichever arm the cursor built.
+static void setAnalyzer(OpCursor& cur, std::string_view analyzer) {
+  std::visit([&](auto& arm) {
+    if constexpr (requires { arm.analyzer; }) arm.analyzer = analyzer;
+  }, cur.rawQuery().kind);
+}
+
+// A query-named analyzer replaces the field's for match, phrase, and
+// simple_query text. body_un folds case, so THOMAS matches by default but not
+// under case-preserving whitespace analysis; _wl (a template) lowercases.
+TEST_F(QueryAnalysisTest, queryAnalyzerOverridesFieldAnalyzer) {
+  auto count = [&](auto build, std::string_view analyzer) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = build(req->collection("main").topDocs("q"));
+    setAnalyzer(cur, analyzer);
+    cur.withStats();
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->getMatchCount();
+  };
+  auto match = [](OpCursor& c) -> OpCursor& { return c.matchQuery("body_un", "THOMAS"); };
+  auto phrase = [](OpCursor& c) -> OpCursor& { return c.phraseText("body_un", "THOMAS ANDERSON"); };
+  auto simple = [](OpCursor& c) -> OpCursor& { return c.simpleQuery("THOMAS", {"body_un"}); };
+  for (std::string_view analyzer : {"", "standard", "_wl", "body_un"}) {
+    EXPECT_EQ(2, count(match, analyzer)) << analyzer;
+    EXPECT_EQ(1, count(phrase, analyzer)) << analyzer;
+    EXPECT_EQ(2, count(simple, analyzer)) << analyzer;
+  }
+  for (std::string_view analyzer : {"whitespace", "keyword", "body_w"}) {
+    EXPECT_EQ(0, count(match, analyzer)) << analyzer;
+    EXPECT_EQ(0, count(phrase, analyzer)) << analyzer;
+    EXPECT_EQ(0, count(simple, analyzer)) << analyzer;
+  }
+  // keyword keeps the whole value as one term
+  auto exact = [](OpCursor& c) -> OpCursor& { return c.matchQuery("body_w", "Thomas"); };
+  EXPECT_EQ(2, count(exact, "keyword"));
+  auto twoWords = [](OpCursor& c) -> OpCursor& { return c.matchQuery("body_w", "Thomas met"); };
+  EXPECT_EQ(2, count(twoWords, ""));
+  EXPECT_EQ(0, count(twoWords, "keyword"));
+
+  auto expr = [&](std::string_view q) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").exprQuery(q).withStats();
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->getMatchCount();
+  };
+  EXPECT_EQ(2, expr("match(THOMAS, field=body_un)"));
+  EXPECT_EQ(0, expr("match(THOMAS, field=body_un, analyzer=whitespace)"));
+  EXPECT_EQ(0, expr("phrase(THOMAS ANDERSON, field=body_un, analyzer=whitespace)"));
+}
+
+TEST_F(QueryAnalysisTest, queryAnalyzerErrors) {
+  auto error = [&](auto build, std::string_view analyzer) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = build(req->collection("main").topDocs("q"));
+    setAnalyzer(cur, analyzer);
+    req->execute();
+    EXPECT_FALSE(req->ok());
+    EXPECT_EQ(ErrorKind::INVALID_REQUEST, req->errorKind()) << req->errorMsg();
+    return req->errorCode();
+  };
+  auto match = [](OpCursor& c) -> OpCursor& { return c.matchQuery("body_un", "x"); };
+  EXPECT_EQ("unknown_analyzer", error(match, "nope"));
+  EXPECT_EQ("unknown_analyzer", error(match, "id"));  // a field, but not text
+  auto onId = [](OpCursor& c) -> OpCursor& { return c.matchQuery("id", "d1"); };
+  EXPECT_EQ("invalid_analyzer", error(onId, "standard"));
+  auto terms = [](OpCursor& c) -> OpCursor& { return c.phraseTerms("body_un", {"a", "b"}); };
+  EXPECT_EQ("invalid_analyzer", error(terms, "standard"));
+  // validated even when no clause is analyzed
+  auto simple = [](OpCursor& c) -> OpCursor& { return c.simpleQuery("d1", {"id"}); };
+  EXPECT_EQ("unknown_analyzer", error(simple, "nope"));
+}

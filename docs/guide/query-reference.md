@@ -61,7 +61,8 @@ representation's presence.
 
 ## Match
 
-`match` applies the field's query-time conversion and analyzer:
+`match` applies the field's query-time conversion and analyzer (or a
+[query-time analyzer](#query-time-analyzer)):
 
 ```json
 {
@@ -85,6 +86,7 @@ The HTTP dialect also accepts the field-name form:
 | `val` | Value to analyze or coerce. Required. |
 | `operator` | `or` (default) or `and` for several analyzed terms. |
 | `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
+| `analyzer` | Optional [query-time analyzer](#query-time-analyzer) for the value. Text fields only. |
 
 Text values are analyzed with the resolved field analyzer. String values use
 their normalizer, if configured, and match as exact terms. Numeric and date
@@ -241,6 +243,7 @@ Set exactly one input form:
 | `terms_bin` | Already analyzed byte terms for typed protobuf callers. |
 | `positions` | Optional explicit positions aligned with `terms`/`terms_bin`. |
 | `slop` | Maximum spread of query-adjusted positions. Default `0`; must be non-negative. |
+| `analyzer` | Optional [query-time analyzer](#query-time-analyzer) for `text` or `words`; an error with `terms`/`terms_bin`. |
 
 Slop is not simply the number of intervening words. An adjacent transposition
 costs `2`, and multi-valued text fields have a position gap of `100`. See
@@ -420,6 +423,7 @@ bind from the surrounding expression's `vars` map.
 | `operator` | Default adjacency: `or` (default) or `and`. |
 | `min_match` | Minimum top-level optional clauses when the parsed shape can apply it. |
 | `allowed_fields` | Optional allowlist for `field:value`; empty permits every queryable schema field. |
+| `analyzer` | Optional [query-time analyzer](#query-time-analyzer) for term and phrase clauses on text fields; other fields and prefix, wildcard, and fuzzy clauses are unaffected. |
 
 Unsupported syntax in `q` degrades to literal terms or produces a search
 warning. The [Quickstart](quickstart.md#forgiving-end-user-search)
@@ -430,6 +434,38 @@ identity: `author_name` and `author_name__self` from the
 [author example](documents.md#field-variants) produce one expansion.
 `allowed_fields` restricts exact resolved search targets; allowing one
 representation does not grant access to its siblings.
+
+## Query-time analyzer
+
+By default, query text is analyzed with the analyzer of the field it
+searches, so it matches what indexing produced. `match`, `phrase`, and
+`simple_query` take an optional `analyzer` that analyzes the query text with
+a different analyzer instead:
+
+```json
+{"match":{"title_t":"Dune Messiah","analyzer":"whitespace"}}
+```
+
+The name is resolved in this order:
+
+1. A `text` field, variant, or template of the collection's schema, by its
+   physical name, such as `title_un`, or a template such as `_wl`.
+   Its analyzer is used.
+2. A built-in analyzer: `standard` (`unicode_word` + `nfkc_cf`), `whitespace`
+   (split on whitespace, no folding), or `keyword` (the whole value as one
+   term).
+
+An unknown name, or a name that resolves only to a non-text field, is a `400`
+with code `unknown_analyzer`. Setting `analyzer` on a `match` against a
+non-text field, or on a `phrase` with already analyzed `terms`, is a `400`
+with code `invalid_analyzer`.
+
+The override changes only how the query text is tokenized and folded; terms
+must still exist in the field's index to match. Use it to search with less
+or different folding than the field applies, for example `whitespace` on a
+stemmed field to require the exact indexed token, or `keyword` to match a
+single-token value as a whole. In the expression language it is a named
+argument: `match(Dune, field=title_t, analyzer=whitespace)`.
 
 ## Expression
 

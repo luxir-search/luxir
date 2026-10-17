@@ -1188,6 +1188,7 @@ Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolea
 | <a id="field-luxir.match.val"></a>[`val`](#field-luxir.match.val) | 2 | [`Val`](#message-luxir.val) | singular |  |
 | <a id="field-luxir.match.operator"></a>[`operator`](#field-luxir.match.operator) | 3 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How to combine the multiple terms an analyzed text field can produce. Unset = OR. |
 | <a id="field-luxir.match.min_match"></a>[`min_match`](#field-luxir.match.min_match) | 4 | `int32` | singular | Minimum number of the analyzed terms that must match (the OR..AND middle ground). When set it overrides \`operator\`; clamped to the term count. Mirrors BooleanQuery.min\_match. |
+| <a id="field-luxir.match.analyzer"></a>[`analyzer`](#field-luxir.match.analyzer) | 5 | `string` | singular | Analyzes TEXT query input with this analyzer instead of the field's. Names a text field, variant, or template in the collection schema ("title\_\_un", "\_wl"), or a built-in analyzer ("standard", "whitespace", "keyword"); a schema name takes precedence. Unset = the field's analyzer. An unknown name, or one set on a non-text field, is an error. |
 
 <a id="message-luxir.memorystats"></a>
 
@@ -1242,6 +1243,7 @@ Whole-value STRING normalization using a keyword input and only normalizing filt
 | <a id="field-luxir.phrasequery.terms_bin"></a>[`terms_bin`](#field-luxir.phrasequery.terms_bin) | 5 | `bytes` | repeated | analyzed list of binary (raw bytes) terms |
 | <a id="field-luxir.phrasequery.slop"></a>[`slop`](#field-luxir.phrasequery.slop) | 6 | `int32` | singular | Maximum spread of rebased positions: max(docPos-queryPos) minus min(docPos-queryPos). Must be nonnegative. Adjacent transposition costs 2; this is not the number of words between terms. Zero is exact. |
 | <a id="field-luxir.phrasequery.positions"></a>[`positions`](#field-luxir.phrasequery.positions) | 15 | `int32` | repeated | optional positions of the terms |
+| <a id="field-luxir.phrasequery.analyzer"></a>[`analyzer`](#field-luxir.phrasequery.analyzer) | 7 | `string` | singular | Analyzes text or words with this analyzer instead of the field's; the same names as Match.analyzer. Not valid with terms or terms\_bin. |
 
 <a id="message-luxir.prefixquery"></a>
 
@@ -1690,6 +1692,7 @@ Forgiving end-user query for raw search-box input. Malformed query text degrades
 | <a id="field-luxir.simplequery.operator"></a>[`operator`](#field-luxir.simplequery.operator) | 3 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How adjacent clauses combine. Unset = OR (any clause may match). |
 | <a id="field-luxir.simplequery.min_match"></a>[`min_match`](#field-luxir.simplequery.min_match) | 4 | `int32` | singular | Minimum number of top-level optional clauses that must match (mirrors BooleanQuery.min\_match). Silently inapplicable when the parsed top level cannot honor it (a single clause, required clauses from + or the AND operator). |
 | <a id="field-luxir.simplequery.allowed_fields"></a>[`allowed_fields`](#field-luxir.simplequery.allowed_fields) | 5 | `string` | repeated | Narrows which field names the field:value syntax may reach. Empty = every queryable schema field. It can only narrow that set - listing a name the schema cannot query does not make it work. A field: token outside the allowed set is literal text, never an error. |
+| <a id="field-luxir.simplequery.analyzer"></a>[`analyzer`](#field-luxir.simplequery.analyzer) | 6 | `string` | singular | Analyzes clauses on TEXT fields with this analyzer instead of each field's; the same names as Match.analyzer. Clauses on other field types are unaffected. Prefix, wildcard, and fuzzy terms keep the field's normalization. |
 
 <a id="message-luxir.sortspec"></a>
 
