@@ -657,8 +657,8 @@ message CalendarGap {
 // lower-bound order.
 message RangeFacet {
   string field = 1;
-  Val start = 2; // required inclusive start of the range
-  Val end = 3;   // required exclusive end of the range
+  Val start = 2; // inclusive start of the range; required unless bounds is DATA
+  Val end = 3;   // exclusive end of the range; required unless bounds is DATA
   oneof gap_kind {
     Val gap = 4; // positive fixed width in field units; integer milliseconds for DATE
     CalendarGap calendar_gap = 10; // civil gap for DATE fields only
@@ -675,6 +675,32 @@ message RangeFacet {
   SelectionMode selection_mode = 12; // same filtering rules as FieldFacet; see SelectionMode
   optional FieldFacet.CountUnit count_unit = 13; // Inherits the parent measure; GROUPS uses the nearest collapse.
   Collapse count_distinct = 14; // Exact distinct keys; same specification as Collapse.
+
+  // How start and end are determined.
+  enum Bounds {
+    EXPLICIT = 0; // start and end are required
+    // Buckets span the field's data: from the bucket holding the smallest
+    // value to the bucket holding the largest. start and end are optional
+    // and only widen that span (like Elasticsearch extended_bounds). The
+    // data range is read from segment column metadata, so it covers every
+    // indexed value of the field and ignores the query and deleted
+    // documents; leading and trailing buckets that are empty for the facet's
+    // documents are then dropped, unless start or end widens past them
+    // (not under a parent facet bucket, which keeps the shared fences).
+    // An empty field with no start and end returns no buckets. selected is
+    // not supported. Exceeding the bucket cap is the same error as with
+    // EXPLICIT bounds: use a larger gap.
+    DATA = 1;
+  }
+  Bounds bounds = 15;
+
+  // DATA only: bucket lower bounds are origin + k * gap for fixed gaps, and
+  // calendar unit starts in the time zone for calendar gaps. For DATE fields
+  // fixed gaps are counted in local time, so origin 0 aligns hourly and
+  // daily buckets to local midnight. Must be an integer (milliseconds) for
+  // DATE and INT fields, and a number for FLOAT and DOUBLE. Calendar gaps
+  // ignore it. Default: 0.
+  Val origin = 16;
 }
 
 message QueryBucket {

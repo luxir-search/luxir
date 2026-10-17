@@ -16,6 +16,8 @@
 #include "SearchOp.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/DocsReader.h"
+#include <limits>
+
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/reader/PointsReader.h"
@@ -1664,6 +1666,9 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
   int64_t affineGap;
   FieldType::Type valueType;
   bool affine;
+  bool trimEdges = false;
+  int64_t keepLo = std::numeric_limits<int64_t>::max();
+  int64_t keepHi = -1;
 
   // Bucket index for an in-range value (caller checks [front, back)).
   size_t bucketOf(int64_t val) const {
@@ -1707,12 +1712,32 @@ public:
     return FacetBucketProducer::JOINT;
   }
 
+  // bounds=DATA over the request's own domain: the fences cover the field's
+  // whole data range, so drop the empty buckets before the first and after the
+  // last nonempty one, except the span [keepLo, keepHi] an explicit start or
+  // end asks for.
+  void trimEmptyEdges(int64_t keepLo, int64_t keepHi) {
+    trimEdges = true;
+    this->keepLo = keepLo;
+    this->keepHi = keepHi;
+  }
+
   std::vector<size_t> emittedBuckets(
       CountView merged,
       std::span<const uint8_t> pinned) const override {
     std::vector<size_t> emitted;
     emitted.reserve(bucketCount());
+    int64_t lo = keepLo, hi = keepHi;
+    if (trimEdges) {
+      for (size_t i = 0; i < bucketCount(); i++) {
+        if (!merged.counts.empty() && merged.counts[i] > 0) {
+          lo = std::min(lo, (int64_t)i);
+          hi = std::max(hi, (int64_t)i);
+        }
+      }
+    }
     for (size_t i = 0; i < bucketCount(); i++) {
+      if (trimEdges && ((int64_t)i < lo || (int64_t)i > hi)) continue;
       int64_t count = merged.counts.empty() ? 0 : merged.counts[i];
       if (pinned[i] != 0 || count >= minCount) emitted.push_back(i);
     }

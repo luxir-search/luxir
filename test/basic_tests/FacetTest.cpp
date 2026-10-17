@@ -6176,3 +6176,194 @@ TEST_F(FacetTest, wideRangeResetPredicateOracle) {
     EXPECT_EQ(expected, actual);
   }
 }
+
+// ---- RangeFacet bounds=DATA -------------------------------------------------
+
+namespace {
+
+void indexInts(CollectionHelper& helper, std::initializer_list<int64_t> values,
+               api::FieldDef::FieldClass fieldClass = api::FieldDef::FieldClass::INT,
+               std::string_view field = "n_i") {
+  const std::array fields = {RangeSchemaField{field, false, false, fieldClass}};
+  setRangeFacetSchema(helper, fields);
+  size_t i = 0;
+  for (int64_t v : values) {
+    ASSERT_TRUE(helper.index(flatdoc("id", std::to_string(i), std::string(field), v),
+                             ++i == values.size() ? UpdateMessage::COMMIT
+                                                  : UpdateMessage::NO_COMMIT).success);
+  }
+}
+
+using Bounds = std::vector<std::pair<int64_t, int64_t>>;
+using Counts = std::vector<int64_t>;
+
+Bounds boundsOf(const api::FacetResult& result) {
+  Bounds out;
+  if (!result.bucket_ids) return out;
+  for (const auto& b : std::get<api::ArrArrInt>(result.bucket_ids->kind).v) {
+    out.emplace_back(b.v[0], b.v[1]);
+  }
+  return out;
+}
+
+Counts countsOf(const api::FacetResult& result) {
+  return {result.counts.begin(), result.counts.end()};
+}
+
+} // namespace
+
+TEST_F(FacetTest, dataBoundsSpanTheDataAlignedToGap) {
+  CollectionHelper helper;
+  indexInts(helper, {15, 27, 95});
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("h", "n_i").rangeData(10);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& result = rootFacetResult(*req, "h");
+  EXPECT_EQ((Bounds{{10, 20}, {20, 30}, {30, 40}, {40, 50}, {50, 60}, {60, 70},
+                    {70, 80}, {80, 90}, {90, 100}}), boundsOf(result));
+  EXPECT_EQ((Counts{1, 1, 0, 0, 0, 0, 0, 0, 1}), countsOf(result));
+}
+
+TEST_F(FacetTest, dataBoundsOriginShiftsAlignment) {
+  CollectionHelper helper;
+  indexInts(helper, {15, 27});
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("h", "n_i").rangeData(10, /*origin=*/5);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& result = rootFacetResult(*req, "h");
+  EXPECT_EQ((Bounds{{15, 25}, {25, 35}}), boundsOf(result));
+  EXPECT_EQ((Counts{1, 1}), countsOf(result));
+}
+
+TEST_F(FacetTest, dataBoundsStartAndEndOnlyWiden) {
+  CollectionHelper helper;
+  indexInts(helper, {15, 27});
+  auto run = [&](std::optional<int64_t> start, std::optional<int64_t> end) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main");
+    req->rangeFacet("h", "n_i").rangeData(10, std::nullopt, start, end);
+    req->execute(false);
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    return boundsOf(rootFacetResult(*req, "h"));
+  };
+  EXPECT_EQ((Bounds{{0, 10}, {10, 20}, {20, 30}}), run(0, std::nullopt));
+  EXPECT_EQ((Bounds{{10, 20}, {20, 30}, {30, 40}}), run(std::nullopt, 40));
+  EXPECT_EQ((Bounds{{0, 10}, {10, 20}, {20, 30}, {30, 40}}), run(0, 40));
+  // Inside the data range they change nothing.
+  EXPECT_EQ((Bounds{{10, 20}, {20, 30}}), run(20, 25));
+}
+
+TEST_F(FacetTest, dataBoundsTrimEmptyEdgesForTheFacetDomain) {
+  CollectionHelper helper;
+  indexInts(helper, {15, 27, 95});
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main");
+  auto& top = req->topDocs("q").matchQuery("n_i", "27").limit(0);
+  top.rangeFacet("h", "n_i").rangeData(10);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& result = topFacetResult(*req, "q", "h");
+  EXPECT_EQ((Bounds{{20, 30}}), boundsOf(result));
+  EXPECT_EQ((Counts{1}), countsOf(result));
+}
+
+TEST_F(FacetTest, dataBoundsEmptyFieldReturnsNoBuckets) {
+  CollectionHelper helper;
+  indexInts(helper, {});
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("h", "n_i").rangeData(10);
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_TRUE(boundsOf(rootFacetResult(*req, "h")).empty());
+
+  auto widened = localReq(luxirNode->getSearchEngine());
+  widened->collection("main");
+  widened->rangeFacet("h", "n_i").rangeData(10, std::nullopt, 0, 20);
+  widened->execute(false);
+  ASSERT_OK(widened);
+  EXPECT_EQ((Bounds{{0, 10}, {10, 20}}), boundsOf(rootFacetResult(*widened, "h")));
+}
+
+TEST_F(FacetTest, dataBoundsValidation) {
+  CollectionHelper helper;
+  indexInts(helper, {15});
+  // EXPLICIT (the default) still requires start and end; origin needs DATA.
+  auto explicitBounds = localReq(luxirNode->getSearchEngine());
+  explicitBounds->collection("main");
+  auto& facet = explicitBounds->rangeFacet("h", "n_i").rangeData(10);
+  std::get<api::RangeFacet>(facet.rawOp().kind).bounds = api::RangeFacet_::Bounds::EXPLICIT;
+  explicitBounds->execute(false);
+  EXPECT_TRUE(hasError(explicitBounds->responses[0]->proto));
+
+  auto cap = localReq(luxirNode->getSearchEngine());
+  cap->collection("main");
+  cap->rangeFacet("h", "n_i").rangeData(1, std::nullopt, 0, 1000000);
+  cap->execute(false);
+  EXPECT_TRUE(hasError(cap->responses[0]->proto));
+}
+
+TEST_F(FacetTest, dataBoundsDateFixedGapCountsInLocalTime) {
+  CollectionHelper helper;
+  // Denver springs forward on 2024-03-10: local days are 24h, 23h, 24h.
+  int64_t a = epoch("2024-03-09T15:00:00Z"), b = epoch("2024-03-10T15:00:00Z"),
+          c = epoch("2024-03-11T15:00:00Z");
+  indexInts(helper, {a, b, c}, api::FieldDef::FieldClass::DATE, "when_dt");
+  auto run = [&](std::string_view zoneName) {
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main").timeZone(zoneName);
+    req->rangeFacet("d", "when_dt").rangeData(86400000LL);
+    req->execute(false);
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    return std::pair{boundsOf(rootFacetResult(*req, "d")), countsOf(rootFacetResult(*req, "d"))};
+  };
+  auto [denver, denverCounts] = run("America/Denver");
+  EXPECT_EQ((Bounds{{epoch("2024-03-09T07:00:00Z"), epoch("2024-03-10T07:00:00Z")},
+                    {epoch("2024-03-10T07:00:00Z"), epoch("2024-03-11T06:00:00Z")},
+                    {epoch("2024-03-11T06:00:00Z"), epoch("2024-03-12T06:00:00Z")}}), denver);
+  EXPECT_EQ((Counts{1, 1, 1}), denverCounts);
+  // A fixed offset aligns to its own local midnight with plain arithmetic.
+  auto [fixed, fixedCounts] = run("-05:00");
+  EXPECT_EQ(epoch("2024-03-09T05:00:00Z"), fixed.front().first);
+}
+
+TEST_F(FacetTest, dataBoundsDateCalendarGapFloorsToUnitStart) {
+  CollectionHelper helper;
+  indexInts(helper, {epoch("2024-02-15T10:00:00Z"), epoch("2024-04-02T01:00:00Z")},
+            api::FieldDef::FieldClass::DATE, "when_dt");
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("m", "when_dt")
+      .rangeDataCalendar(1, api::CalendarGap_::Unit::MONTH, "UTC");
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& result = rootFacetResult(*req, "m");
+  EXPECT_EQ((Bounds{{epoch("2024-02-01T00:00:00Z"), epoch("2024-03-01T00:00:00Z")},
+                    {epoch("2024-03-01T00:00:00Z"), epoch("2024-04-01T00:00:00Z")},
+                    {epoch("2024-04-01T00:00:00Z"), epoch("2024-05-01T00:00:00Z")}}),
+            boundsOf(result));
+  EXPECT_EQ((Counts{1, 0, 1}), countsOf(result));
+}
+
+TEST_F(FacetTest, dataBoundsFloatingGap) {
+  CollectionHelper helper;
+  const std::array fields = {RangeSchemaField{"x_d", false, false, api::FieldDef::FieldClass::DOUBLE}};
+  setRangeFacetSchema(helper, fields);
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "x_d", 1.5), UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "x_d", 4.2), UpdateMessage::COMMIT).success);
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("x", "x_d").rangeDataFp(1.0);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& result = rootFacetResult(*req, "x");
+  const auto& bounds = std::get<api::ArrArrDouble>(result.bucket_ids->kind).v;
+  ASSERT_EQ(4u, bounds.size());
+  EXPECT_DOUBLE_EQ(1.0, bounds.front().v[0]);
+  EXPECT_DOUBLE_EQ(5.0, bounds.back().v[1]);
+  EXPECT_EQ((Counts{1, 0, 0, 1}), countsOf(result));
+}
