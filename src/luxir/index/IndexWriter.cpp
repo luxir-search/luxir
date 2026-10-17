@@ -309,8 +309,9 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
 
   tbb::flow::make_edge(*commitSequencerNode, *commitFinishNode);
 
-  // must be single-threaded
-  mergeSegmentsNode = std::make_unique<MergeMessageMultiFunc>(*updateGraph, 1,
+  // Admission is the merge policy's: up to maxConcurrentMerges policy merges
+  // over disjoint sources, or one client force merge alone.
+  mergeSegmentsNode = std::make_unique<MergeMessageMultiFunc>(*updateGraph, tbb::flow::unlimited,
     [this](MergeMessage* msg,
     MergeMessageMultiFunc::output_ports_type& op) {
       unused(op);
@@ -458,8 +459,11 @@ bool IndexWriter::_submitMergeLocked(MergeMessage* msg) {
 
 // Caller must hold indexMutex.  Rejected origins are returned to the caller so
 // their potentially re-entrant done() callbacks run after releasing the lock.
+// A force merge selects every live segment, so it starts only once no other
+// merge is running; the last merge's tail activates it (finishMergeTail).
 void IndexWriter::_activateNextForceMergeLocked(std::vector<UpdateMessage*>& rejectedOrigins) {
-  while (activeForceMerge == nullptr && !pendingForceMerges.empty()) {
+  while (activeForceMerge == nullptr && !pendingForceMerges.empty()
+         && mergePolicy->outstandingMerges == 0) {
     UpdateMessage* origin = pendingForceMerges.front();
     pendingForceMerges.pop_front();
     activeForceMerge = origin;
@@ -526,6 +530,14 @@ void IndexWriter::completeForceMerge(MergeMessage& msg) {
     assert(activeForceMerge == origin);
     activeForceMerge = nullptr;
     _activateNextForceMergeLocked(completedOrigins);
+    if (activeForceMerge == nullptr) {
+      // Policy merges were held back while this one was active.
+      try {
+        mergePolicy->_maybeMergeSegments(nullptr);
+      } catch (const std::exception& e) {
+        LOG_ERROR("Policy merge after force merge failed: exception={}", e.what());
+      }
+    }
   }
 
   completeForceMergeOrigins(completedOrigins);
@@ -690,12 +702,22 @@ bool IndexWriter::startIdleFlushLocked(Inverter& inverter, bool pressure) {
 // Caller holds indexMutex.  Largest-local-first minimizes segment count; the
 // budget-side claim prevents broadcasts to multiple writers from over-shedding
 // once the global pressure target is met.
+//
+// Pressure that only merge demand creates sheds an inverter only once it holds
+// a fair share of half the pool (budget / (2 * this writer's active
+// inverters)): the demand is waiting for merges that shrink the segment count,
+// and a stream of floor-sized flushes would grow it faster than they can.
 void IndexWriter::pressureShedIdleLocked() {
   if (!indexRamBudget->pressurePossible()) return;
+  size_t floor = pressureFlushFloorBytes;
+  if (!idleInverters.empty() && !indexRamBudget->liveOverBudget()) {
+    size_t active = idleInverters.size() + busyInverters.size();
+    floor = std::max(floor, (size_t)indexRamBudget->totalBytes() / (2 * active));
+  }
   for (;;) {
     Inverter* victim = nullptr;
     for (auto& entry : idleInverters) {
-      if (entry.first->memSize() < pressureFlushFloorBytes) continue;
+      if (entry.first->memSize() < floor) continue;
       if (victim == nullptr || entry.first->memSize() > victim->memSize()) {
         victim = entry.first;
       }
@@ -1322,19 +1344,12 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     }
 
     if (!startedMergingOldVersions.empty() || !finishedMergingOldVersions.empty()) {
-      // Since only one merge can happen at once, we only need to add personal deletes to
-      // one of the segments that are being merged to get them transferred to the new segment when it is done.
-      if (!startedMergingOldVersions.empty()) {
-        auto& seg = *startedMergingOldVersions.front();
-        // no segments were merged, so we can just apply deletes to the new segments.
-        INDEX_DEBUG("finishCommitBody: Added personal deletes currently merging {}", seg);
-        seg.personalDeletes.addAll(commitDeletes);
-
-#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_TRACE
-        for (auto& d : seg.personalDeletes.deletes) {
-          INDEX_TRACE("\tpersonal deletes: {}", d->toString());
-        }
-#endif
+      // Merges run concurrently, so these segments may feed different merges.
+      // Each merge copies its sources' personal deletes to its output, so give
+      // them to every one (the batches are shared, and the copy deduplicates).
+      for (SegInfo* seg : startedMergingOldVersions) {
+        INDEX_DEBUG("finishCommitBody: Added personal deletes currently merging {}", *seg);
+        seg->personalDeletes.addAll(commitDeletes);
       }
 
 
@@ -2066,6 +2081,7 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
 
 bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge) {
   bool triggerCommit = false;
+  std::vector<UpdateMessage*> rejectedForceMerges;
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
 
@@ -2093,6 +2109,13 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
       }
     }
 
+    // A queued force merge waits for the last running merge.
+    try {
+      _activateNextForceMergeLocked(rejectedForceMerges);
+    } catch (const std::exception& e) {
+      LOG_ERROR("Force merge activation failed: exception={}", e.what());
+    }
+
     _releaseMergeWaiterHoldsLocked();
 
     if (allowSyntheticCommit && !anotherMerge && mergePolicy->outstandingMerges == 0
@@ -2103,12 +2126,14 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
       }
     }
   }
+  completeForceMergeOrigins(rejectedForceMerges);
   return triggerCommit;
 }
 
 
-// called from the mergeSegmentsNode which has concurrency==1 (single-threaded)
-// Only one merge will be running at a time.
+// called from the mergeSegmentsNode.  Policy merges run concurrently with each
+// other (up to MergePolicy::maxConcurrentMerges) over disjoint, pre-marked
+// sources; a client force merge runs alone.
 // We do run concurrently with everything else, including commits and segment deletions.
 // So we don't delete segments that the commit code is about to use, the commit code marks
 // those segments.
@@ -2139,7 +2164,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   try {
 
     // We grab the list of segments to merge with the lock held, but use them outside of the lock.
-    // This is safe since the only place where segments are deleted is in a merge, and this has concurrency==1
+    // This is safe since segments marked merging are never deleted (tryDeleteSegments) and only
+    // the merge that marked them removes them from segInfos.
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
       if (clientOrigin) {
@@ -2169,17 +2195,18 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           segs.clear();
         }
       } else {
-        segs.reserve(mergePolicy->mergeFactor * 2);
-        for (auto& [segId, seg] : segInfos) {
-          unused(segId);
-          if (seg->mergeLevel == msg.mergeLevel) {
-            if (seg->liveDocs == 0) {
-              // This can occur after deletes are applied but before commit-time removal.
-              continue;
-            }
-            segs.push_back(seg.get());
+        // Chosen and marked merging at submission (MergePolicy::_selectMerge).
+        // A commit may have emptied a source since: it awaits commit-time removal.
+        segs.reserve(msg.segs.size());
+        for (SegInfo* seg : msg.segs) {
+          if (seg->liveDocs == 0) {
+            MergePolicy::_unmark(std::span(&seg, 1));
+            continue;
           }
+          segs.push_back(seg);
         }
+        msg.segs.clear();
+        markedSegmentCount = segs.size();  // an admission failure releases them all
       }
 
       // Segment-local ords are signed int32. Admit only sources whose summed
@@ -2227,14 +2254,25 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         mergedDocs += seg->liveDocs;
         admitted.push_back(seg);
       }
+      if (!clientOrigin) {
+        // Release policy-marked sources that were not admitted.
+        for (SegInfo* seg : segs) {
+          if (std::ranges::find(admitted, seg) == admitted.end()) {
+            MergePolicy::_unmark(std::span(&seg, 1));
+          }
+        }
+      }
       segs.swap(admitted);
+      markedSegmentCount = 0;
 
       // Selection must be complete before changing segment state.  Marking an
       // unselected candidate would permanently block its deletion.
       for (auto* seg : segs) {
         INDEX_DEBUG("mergeSegmentsBody: will merge {}", *seg);
-        seg->merging = true;
-        seg->mergedLiveGen = seg->liveGen;
+        if (clientOrigin) {
+          seg->merging = true;
+          seg->mergedLiveGen = seg->liveGen;
+        }
         markedSegmentCount++;
       }
 

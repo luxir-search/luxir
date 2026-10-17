@@ -179,6 +179,10 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(index.merge_factor)
       ->check(CLI::PositiveNumber)
       ->check(CLI::Range(2, (std::numeric_limits<int>::max)()));
+  app.add_option("--indexing.max-concurrent-merges", index.max_concurrent_merges,
+                 "Automatic merges per collection that may run at once")
+      ->default_val(index.max_concurrent_merges)
+      ->check(CLI::Range(1, 64));
   app.add_option("--indexing.max-ram-mb", index.max_ram_mb,
                  "Shared indexing RAM cap for merge admission and inverter flushing (MiB, 0 = unlimited)")
       ->check(CLI::NonNegativeNumber)
