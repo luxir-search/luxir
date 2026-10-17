@@ -154,6 +154,11 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
   EXPECT_EQ(ValueOpcode::MIN, bucketMinimum->root().function->opcode);
   expectParseError(memory, *schema, "def(sum(price_i), 0)",
                    "def() is a per-document value function");
+  expectParseError(memory, *schema, "sum(price_i) > 0 ? 1 : 2",
+                   "if() is a per-document value function");
+  AggregateProgram* comparison = parseAggregate(
+      memory, *schema, "sum(price_i) >= 1 && exp(avg(price_i)) > 0");
+  EXPECT_EQ(ValueOpcode::AND, comparison->root().function->opcode);
   expectParseError(memory, *schema, "avg(score)",
                    "op 'scored': scores are not available",
                    "scored");
@@ -355,13 +360,14 @@ TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
   }
   for (std::string_view name : {
            "add", "sub", "mul", "div", "neg", "abs", "sqrt", "log",
-           "log1p", "floor", "min", "max"}) {
+           "log1p", "floor", "min", "max", "exp", "pow", "lt", "lte",
+           "gt", "gte", "eq", "ne", "and", "or", "not"}) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
     ASSERT_NE(nullptr, function) << name;
     EXPECT_NE(nullptr, function->evalBucketScalar) << name;
   }
   for (std::string_view name : {
-           "def", "avg", "sum", "count"}) {
+           "def", "avg", "sum", "count", "if", "random", "geo_distance"}) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
     ASSERT_NE(nullptr, function) << name;
     EXPECT_EQ(nullptr, function->evalBucketScalar) << name;

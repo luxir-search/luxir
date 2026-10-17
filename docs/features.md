@@ -222,7 +222,10 @@ Anywhere a query goes, it can be a structured object or an expression string.
   like any other clause).
 - `constant_score`, `boost`, and `rescore`: keep a query's matches and replace
   each score with a value expression over columns and the original score
-  (`score * def(popularity_i, 1)`).
+  (`score * def(popularity_i, 1)`). Expressions cover arithmetic, `exp`,
+  `pow`, comparisons, `?:` conditionals, seeded `random`, `geo_distance`,
+  and Elasticsearch-style `gauss`, `exp`, and `linear` decay functions over
+  numeric, date, and geo values.
 - `knn` vector search, `geo_box`, and `geo_distance`.
 - `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,
   quoted phrases with `~N` slop, grouping, trailing-`*` prefix, `~N` fuzzy
