@@ -3,6 +3,7 @@
 
 #include "luxir/query/ProtobufQueryParser.h"
 
+#include <charconv>
 #include <cmath>
 #include <format>
 #include <limits>
@@ -471,6 +472,96 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
   return pool.make<luxir::RescoreQuery>(child, program, constant);
 }
 
+namespace {
+
+// Split "name^boost" entries (the Elasticsearch field-list syntax) into
+// names and boosts. minBoost is the inclusive lower bound when inclusive,
+// otherwise exclusive.
+std::vector<QueryBuilder::WeightedField> parseWeightedFields(
+    std::span<const std::string_view> fields, std::string_view label,
+    float minBoost, bool inclusive) {
+  if (fields.empty()) {
+    throw std::runtime_error(std::format("{} requires a non-empty 'fields' list", label));
+  }
+  std::vector<QueryBuilder::WeightedField> out;
+  out.reserve(fields.size());
+  for (std::string_view entry : fields) {
+    QueryBuilder::WeightedField wf{entry, 1.0f};
+    size_t caret = entry.rfind('^');
+    if (caret != std::string_view::npos) {
+      wf.name = entry.substr(0, caret);
+      std::string_view number = entry.substr(caret + 1);
+      auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), wf.boost);
+      if (ec != std::errc() || end != number.data() + number.size() || number.empty()) {
+        throw std::runtime_error(std::format(
+            "{}: cannot parse the boost in field '{}' (expected name^number)", label, entry));
+      }
+    }
+    if (wf.name.empty()) {
+      throw std::runtime_error(std::format("{}: empty field name in '{}'", label, entry));
+    }
+    if (!std::isfinite(wf.boost) || wf.boost < minBoost || (!inclusive && wf.boost == minBoost)) {
+      throw std::runtime_error(std::format(
+          "{}: boost of field '{}' must be finite and {} {} (got {})",
+          label, wf.name, inclusive ? ">=" : ">", minBoost, wf.boost));
+    }
+    out.push_back(wf);
+  }
+  return out;
+}
+
+QueryBuilder::Operator builderOperator(luxir::api::Match_::Operator op) {
+  return op == luxir::api::Match_::Operator::AND ? QueryBuilder::Operator::AND
+                                                  : QueryBuilder::Operator::OR;
+}
+
+} // namespace
+
+luxir::Query* ProtobufQueryParser::parseCombinedFields(
+    const luxir::api::CombinedFieldsQuery& query) {
+  if (query.min_match < 0) {
+    throw std::runtime_error("combined_fields 'min_match' must not be negative");
+  }
+  // Elasticsearch requires boosts >= 1: smaller weights break the BM25
+  // saturation that keeps a combined frequency from outscoring a real one.
+  auto fields = parseWeightedFields(query.fields, "combined_fields", 1.0f, true);
+  QueryBuilder builder(
+      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+  return builder.createCombinedFieldsQuery(
+      fields, query.query, builderOperator(query.operator_), query.min_match,
+      false, "combined_fields");
+}
+
+luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQuery& query) {
+  using Type = luxir::api::MultiMatchQuery_::Type;
+  if (query.min_match < 0) {
+    throw std::runtime_error("multi_match 'min_match' must not be negative");
+  }
+  auto fields = parseWeightedFields(query.fields, "multi_match", 0.0f, false);
+  QueryBuilder builder(
+      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+  auto op = builderOperator(query.operator_);
+  switch (query.type) {
+    case Type::CROSS_FIELDS:
+      return builder.createCombinedFieldsQuery(
+          fields, query.query, op, query.min_match, true, "multi_match");
+    case Type::MOST_FIELDS:
+      return builder.createMostFieldsQuery(fields, query.query, op, query.min_match);
+    case Type::TYPE_UNSPECIFIED:
+    case Type::BEST_FIELDS:
+      throw std::runtime_error(
+          "multi_match type best_fields (the default) is not supported yet; "
+          "set type to cross_fields or most_fields");
+    case Type::PHRASE:
+    case Type::PHRASE_PREFIX:
+    case Type::BOOL_PREFIX:
+      break;
+  }
+  throw std::runtime_error(
+      "multi_match supports type cross_fields or most_fields; "
+      "phrase, phrase_prefix, and bool_prefix are not supported yet");
+}
+
 luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
   // The one recursion choke point for structured trees: every nested node
   // passes through here, so the shared budget bounds tree depth no matter
@@ -501,6 +592,10 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     [&](const luxir::api::RescoreQuery& r) -> luxir::Query* {
       return parseRescore(r);
     },
+    [&](const luxir::api::CombinedFieldsQuery& c) -> luxir::Query* {
+      return parseCombinedFields(c);
+    },
+    [&](const luxir::api::MultiMatchQuery& m) -> luxir::Query* { return parseMultiMatch(m); },
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);
