@@ -46,6 +46,8 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
     properties["normalize_on_write"] = vector->normalizeOnWrite() ? "true" : "false";
     properties["normalized"] = vector->metric() == VectorFieldType::METRIC_COSINE && vector->normalized()
         ? "true" : "false";
+    properties["encoding"] = "\"" + std::string(vcodec::name(vector->encoding())) + "\"";
+    properties["keep_original"] = vector->keepOriginal() ? "true" : "false";
   }
 }
 

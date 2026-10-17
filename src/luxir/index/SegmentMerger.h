@@ -1706,6 +1706,12 @@ private:
   // Merges non-indexed string/binary columns written by StrColHandler.
   // Rebuilds the concatenated byte stream, the per-value endOffsetReader (if values are
   // variable-size), and the per-doc endValueRankReader (if the field is multi-valued).
+  //
+  // Vector columns: values are self-describing in their segment's encoding, so
+  // when every input shares one encoding the bytes are copied verbatim (never
+  // re-quantized).  Inputs with different encodings (a schema change between
+  // them) are written in the most precise of their encodings, transcoding only
+  // the less precise inputs, so a merge never loses precision.
   void mergeStrCol(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
                    PostingsWriter::IndexFieldInfo& outputFieldInfo) {
     assert(sortedFields.size() == segs.size());
@@ -1756,6 +1762,30 @@ private:
       valDocOut = postingsWriter.getOutputStream();
       valDocWriter = pool.make_unique_align<MonoWriter>(8, pool, *valDocOut);
     }
+
+    bool isVector = outputFieldInfo.type == FieldType::Type::VECTOR;
+    VectorEncoding outEncoding = VectorEncoding::F32;
+    bool firstEncoding = true;
+    for (auto* f : sortedFields) {
+      if (f == nullptr || !isVector) continue;
+      auto e = (VectorEncoding)f->segFieldInfo.vectorEncoding;
+      if (firstEncoding || vcodec::precision(e) > vcodec::precision(outEncoding)) outEncoding = e;
+      firstEncoding = false;
+    }
+    outputFieldInfo.vectorEncoding = (int32_t)outEncoding;
+    // Whether a column needs the norm prefix depends on its encoding (and the
+    // field settings), so the output keeps it when any input already in the
+    // output encoding has it.  Other inputs gain it (computed here) or drop it.
+    bool outNorms = false;
+    for (auto* f : sortedFields) {
+      if (f == nullptr || !isVector) continue;
+      if ((VectorEncoding)f->segFieldInfo.vectorEncoding == outEncoding) {
+        outNorms = outNorms || f->segFieldInfo.vectorNorms;
+      }
+    }
+    outputFieldInfo.vectorNorms = outNorms;
+    std::vector<float> transcodeFloats;
+    std::vector<char> transcodeBytes;
 
     int32_t docsWithField = 0;
     int64_t totalValues = 0;
@@ -1815,6 +1845,39 @@ private:
       StrColReader reader(*field->seg->postingsReader, field->segFieldInfo);
       StrColReader::Iterator iter(reader);
 
+      // Identity unless this input's vector encoding or norm prefix differs
+      // from the output's.  Only the prefix differing keeps the payload bytes.
+      auto inEncoding = (VectorEncoding)field->segFieldInfo.vectorEncoding;
+      bool inNorms = field->segFieldInfo.vectorNorms;
+      bool transcode = isVector && (inEncoding != outEncoding || inNorms != outNorms)
+          && reader.numValues() > 0;
+      int32_t transcodeDims = 0;
+      if (transcode) {
+        transcodeDims = vcodec::dimsFromRowBytes(inEncoding, reader.fixedValueSize(), inNorms);
+        if (!reader.isFixedSize() || transcodeDims <= 0) {
+          throw std::runtime_error("SegmentMerger: invalid vector column in field "
+                                   + std::string((std::string_view)field->segFieldInfo.fieldname));
+        }
+        transcodeFloats.resize((size_t)transcodeDims);
+        transcodeBytes.resize((size_t)vcodec::rowBytes(outEncoding, transcodeDims, outNorms));
+      }
+      auto convert = [&](std::string_view value) {
+        if (!transcode) return value;
+        const char* payload = vcodec::rowPayload(value.data(), inNorms);
+        char* out = transcodeBytes.data();
+        if (inEncoding == outEncoding) {
+          // Same payload; only the norm prefix is added (outNorms is the OR
+          // over the inputs of this encoding, so it is never dropped here).
+          std::memcpy(out + vcodec::NORM_BYTES, payload,
+                      (size_t)vcodec::bytesPerVector(inEncoding, transcodeDims));
+          vcodec::writeRowNorm(outEncoding, out, transcodeDims);
+        } else {
+          vcodec::decode(inEncoding, payload, transcodeDims, transcodeFloats.data());
+          vcodec::encodeRow(outEncoding, outNorms, transcodeFloats.data(), transcodeDims, out);
+        }
+        return std::string_view(transcodeBytes.data(), transcodeBytes.size());
+      };
+
       if (reader.docsReader().hasBitset() && !docsWriter) {
         isDense = false;
         docsWriter = pool.make_unique_align<DocsWithValWriter>(8, pool, postingsWriter, outputFieldInfo);
@@ -1834,12 +1897,12 @@ private:
         if (multiValued) {
           auto [startValueRank, endValueRank] = iter.valueRange();
           for (int64_t r = startValueRank; r < endValueRank; r++) {
-            emitValue(reader.valueAt(r));
+            emitValue(convert(reader.valueAt(r)));
             if (valDocWriter) valDocWriter->addInt64(mappedDoc);
           }
           endValueRankWriter->addInt64(totalValues);
         } else {
-          emitValue(iter.value());
+          emitValue(convert(iter.value()));
         }
 
         if (docsWriter) {

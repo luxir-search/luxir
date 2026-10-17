@@ -4,6 +4,7 @@
 #pragma once
 
 #include "luxir/analysis/Analyzer.h"
+#include "luxir/codec/VectorCodec.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/StrRef.h"
@@ -317,23 +318,48 @@ public:
   // COSINE fields normalize vectors before column storage by default.  Ignored
   // for non-COSINE metrics.
   bool normalizeOnWrite_;
+  // Column storage encoding (f32 / f16 / int8).  Recorded per segment, so a
+  // later schema change never reinterprets existing segments.
+  VectorEncoding encoding_;
+  // Also store the submitted float32 vectors in a cold companion column
+  // (originalColumnName) that the query path never reads.
+  bool keepOriginal_;
 
   VectorFieldType(std::string_view name, int32_t dims = 0,
                   int flags = COLUMN_STORED | FIXED_SIZE,
                   Metric metric = METRIC_NONE,
                   bool normalized = false,
-                  bool normalizeOnWrite = true)
+                  bool normalizeOnWrite = true,
+                  VectorEncoding encoding = VectorEncoding::F32,
+                  bool keepOriginal = false)
     : FieldType(name, FieldType::VECTOR, flags),
       dims_(dims),
       metric_(metric),
       normalized_(normalized),
-      normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized) {
+      normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized),
+      encoding_(encoding),
+      keepOriginal_(keepOriginal) {
+  }
+
+  // Physical name of the keep_original companion column.  The '#' makes it an
+  // invalid variant label, so schema lookups and field discovery never
+  // resolve it as a user field.
+  static constexpr std::string_view ORIGINAL_SUFFIX = "__#orig";
+  static std::string originalColumnName(std::string_view physicalName) {
+    std::string name(physicalName);
+    name.append(ORIGINAL_SUFFIX);
+    return name;
+  }
+  static bool isOriginalColumnName(std::string_view physicalName) {
+    return physicalName.ends_with(ORIGINAL_SUFFIX);
   }
 
   int32_t dims() const { return dims_; }
   Metric metric() const { return metric_; }
   bool normalized() const { return normalized_; }
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
+  VectorEncoding encoding() const { return encoding_; }
+  bool keepOriginal() const { return keepOriginal_; }
 
   // True iff this field supports kNN / ANN search.  Exact flat search can run
   // directly over the column; real ANN engines may also build aux artifacts.

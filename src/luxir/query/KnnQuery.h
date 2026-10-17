@@ -36,10 +36,12 @@
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/query/VectorEngine.h"
+#include "luxir/query/VectorScorer.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/Collapse.h"
 #include "luxir/util/AtomicMerger.h"
 #include "luxir/util/heap.h"
+#include "luxir/util/PagePrefetch.h"
 #include "luxir/util/log.h"
 #include "luxir/util/screaming.h"
 #include "luxir/util/thread.h"
@@ -1641,6 +1643,54 @@ public:
             "KnnQuery: query vector dims {} do not match segment dims {}",
             dims, vr.dims()));
         }
+        VectorScorer scorer(request.query, dims, metric, normalizeColumnOnCosineRescore,
+                            vr.encoding(), vr.hasNorms());
+        const char* rowsBase = vr.rowsBase();
+        int64_t rowStride = vr.valueBytes();
+        // Read-ahead for a column that is not resident (see PagePrefetcher).
+        // Unfiltered scans read every row, so they advise a byte window ahead
+        // of the cursor; filtered scans advise each block's rows before
+        // scoring it, which reads only eligible rows.
+        PagePrefetcher prefetch;
+        prefetch.probe(rowsBase);
+        prefetch.probe(rowsBase + numVals / 2 * rowStride);
+        const char* advisedEnd = rowsBase;
+        const char* columnEnd = rowsBase + numVals * rowStride;
+        auto adviseAhead = [&](int64_t rank) {
+          if (!prefetch.active() || domain != nullptr) return;
+          const char* at = rowsBase + rank * rowStride;
+          if (advisedEnd - at > (ptrdiff_t)(SCAN_PREFETCH_BYTES / 2)) return;
+          const char* end = std::min(columnEnd, at + SCAN_PREFETCH_BYTES);
+          if (end <= advisedEnd) return;
+          const char* from = std::max(advisedEnd, at);
+          prefetch.add(from, (size_t)(end - from));
+          prefetch.flush();
+          advisedEnd = end;
+        };
+        // Eligible ranks are scored in blocks through the batched kernels; the
+        // offers below then run in rank order exactly as a per-row loop would.
+        ScanBlock block;
+        auto scoreBlock = [&]() {
+          block.scores.resize(block.ranks.size());
+          if (scorer.scoresColumn()) {
+            block.rows.resize(block.ranks.size());
+            for (size_t j = 0; j < block.ranks.size(); j++) {
+              block.rows[j] = rowsBase + block.ranks[j] * rowStride;
+            }
+            if (prefetch.active()) {
+              if (domain == nullptr) {
+                adviseAhead(block.ranks.front());
+              } else {
+                for (const char* row : block.rows) prefetch.add(row, (size_t)rowStride);
+                prefetch.flush();
+              }
+            }
+            scorer.scoreRows(block.rows.data(), block.rows.size(), block.scores.data());
+            prefetch.refresh();
+          } else {
+            std::fill(block.scores.begin(), block.scores.end(), 0.0f);
+          }
+        };
 
         // Pooled-rank exclusion (request.eligible), honored at DOC level:
         // this engine's scores are exact and it emits each doc's max-sim
@@ -1667,48 +1717,57 @@ public:
         // monotonic; sparse select and dense identity likewise), so a doc's
         // vectors form a contiguous run and max-sim collapse falls out of one
         // pass.  liveDocs/domain are applied as a per-run predicate.
-        auto scan = [&](auto emit) {
-          if (v2d.mono != nullptr) {
-            MonoReader::BulkValues valDoc(*v2d.mono);
-            int64_t idx = valDoc.next();
-            int64_t rank = 0;
-            while (rank < numVals) {
-              int32_t docId = (int32_t)valDoc.value();
-              int64_t end = rank;
-              do {
-                end++;
-                idx = valDoc.next();
-              } while (end < numVals && (int32_t)valDoc.value() == docId);
-              unused(idx);
-              if (docEligible(docId) && !pooledInRun(rank, end)) {
+        if constexpr (Groups) {
+          // Group admission checks competitiveness per hit before the key
+          // lookup, so this path scores row by row.
+          int64_t scoredRows = 0;
+          auto rowScore = [&](int64_t r) {
+            if (!scorer.scoresColumn()) return 0.0f;
+            if ((++scoredRows & (SCAN_BLOCK_ROWS - 1)) == 0) {
+              prefetch.refresh();
+              adviseAhead(r);
+            }
+            return scorer.score(rowsBase + r * rowStride);
+          };
+          auto scan = [&](auto emit) {
+            if (v2d.mono != nullptr) {
+              MonoReader::BulkValues valDoc(*v2d.mono);
+              int64_t idx = valDoc.next();
+              int64_t rank = 0;
+              while (rank < numVals) {
+                int32_t docId = (int32_t)valDoc.value();
+                int64_t end = rank;
+                do {
+                  end++;
+                  idx = valDoc.next();
+                } while (end < numVals && (int32_t)valDoc.value() == docId);
+                unused(idx);
+                if (docEligible(docId) && !pooledInRun(rank, end)) {
+                  eligibleDocs++;
+                  emit(docId, [&]() LUXIR_INLINE {
+                    scanned += end - rank;
+                    auto [bestRank, bestScore] = bestInRun(rank, end, [&](int64_t r) {
+                      return rowScore(r);
+                    });
+                    return VectorEngineHit{bestScore, segOrd, bestRank};
+                  });
+                }
+                rank = end;
+              }
+            } else {
+              // Single-valued (dense identity or sparse select): one-vector runs.
+              for (int64_t rank = 0; rank < numVals; rank++) {
+                if (pooledInRun(rank, rank + 1)) continue;
+                int32_t docId = v2d.resolve(rank);
+                if (!docEligible(docId)) continue;
                 eligibleDocs++;
                 emit(docId, [&]() LUXIR_INLINE {
-                  if constexpr (Groups) scanned += end - rank;
-                  auto [bestRank, bestScore] = bestInRun(rank, end, [&](int64_t r) {
-                    return exactScore(request.query, vr.vectorAtRank(r), dims, metric,
-                                      normalizeColumnOnCosineRescore, 0.0f);
-                  });
-                  return VectorEngineHit{bestScore, segOrd, bestRank};
+                  scanned++;
+                  return VectorEngineHit{rowScore(rank), segOrd, rank};
                 });
               }
-              rank = end;
             }
-          } else {
-            // Single-valued (dense identity or sparse select): one-vector runs.
-            for (int64_t rank = 0; rank < numVals; rank++) {
-              if (pooledInRun(rank, rank + 1)) continue;
-              int32_t docId = v2d.resolve(rank);
-              if (!docEligible(docId)) continue;
-              eligibleDocs++;
-              emit(docId, [&]() LUXIR_INLINE {
-                if constexpr (Groups) scanned++;
-                return VectorEngineHit{exactScore(request.query, vr.vectorAtRank(rank), dims, metric,
-                    normalizeColumnOnCosineRescore, 0.0f), segOrd, rank};
-              });
-            }
-          }
-        };
-        if constexpr (Groups) {
+          };
           // Exact vectors arrive in doc order. Join one bulk key walk to
           // that stream; drop-policy members are rejected before scoring.
           CollapseKeyReader keys(*groupPlan);
@@ -1720,10 +1779,74 @@ public:
               if (key != nullptr) heap.offerKey(hit, *key, doc);
             });
           });
-        } else scan([&](int32_t doc, auto makeHit) LUXIR_INLINE {
-          unused(doc);
-          heap.offer(makeHit());
-        });
+        } else {
+          if (v2d.mono != nullptr) {
+            // Blocks hold whole runs: runStarts[j] is the block offset of the
+            // j-th eligible run, which ends where the next one starts.
+            auto flushRuns = [&]() {
+              if (block.ranks.empty()) return;
+              scoreBlock();
+              block.runStarts.push_back(block.ranks.size());
+              for (size_t j = 0; j + 1 < block.runStarts.size(); j++) {
+                int64_t begin = (int64_t)block.runStarts[j];
+                auto [bestPos, bestScore] = bestInRun(
+                    begin, (int64_t)block.runStarts[j + 1],
+                    [&](int64_t p) { return block.scores[(size_t)p]; });
+                heap.offer(VectorEngineHit{
+                               .score = bestScore,
+                               .segOrd = segOrd,
+                               .valueRank = block.ranks[(size_t)bestPos],
+                             });
+              }
+              block.clear();
+            };
+            MonoReader::BulkValues valDoc(*v2d.mono);
+            int64_t idx = valDoc.next();
+            int64_t rank = 0;
+            while (rank < numVals) {
+              int32_t docId = (int32_t)valDoc.value();
+              int64_t end = rank;
+              do {
+                end++;
+                idx = valDoc.next();
+              } while (end < numVals && (int32_t)valDoc.value() == docId);
+              unused(idx);
+
+              if (docEligible(docId) && !pooledInRun(rank, end)) {
+                eligibleDocs++;
+                block.runStarts.push_back(block.ranks.size());
+                for (int64_t r = rank; r < end; r++) block.ranks.push_back(r);
+                if (block.ranks.size() >= SCAN_BLOCK_ROWS) flushRuns();
+              }
+              rank = end;
+            }
+            flushRuns();
+          } else {
+            // Single-valued (dense identity or sparse select): runs are length
+            // 1 by construction.
+            auto flushRanks = [&]() {
+              if (block.ranks.empty()) return;
+              scoreBlock();
+              for (size_t j = 0; j < block.ranks.size(); j++) {
+                heap.offer(VectorEngineHit{
+                               .score = block.scores[j],
+                               .segOrd = segOrd,
+                               .valueRank = block.ranks[j],
+                             });
+              }
+              block.clear();
+            };
+            for (int64_t rank = 0; rank < numVals; rank++) {
+              if (pooledInRun(rank, rank + 1)) continue;
+              int32_t docId = v2d.resolve(rank);
+              if (!docEligible(docId)) continue;
+              eligibleDocs++;
+              block.ranks.push_back(rank);
+              if (block.ranks.size() >= SCAN_BLOCK_ROWS) flushRanks();
+            }
+            flushRanks();
+          }
+        }
 
         if (statsForTests) {
           int64_t count = Groups ? scanned : eligibleDocs;
@@ -1738,6 +1861,23 @@ public:
       }
 
     private:
+      // Rows per batched scoring call: enough to amortize the per-block
+      // dispatch, small enough that the block's scores stay in L1.
+      static constexpr size_t SCAN_BLOCK_ROWS = 64;
+      // Read-ahead window of an unfiltered scan over a cold column.
+      static constexpr size_t SCAN_PREFETCH_BYTES = 8 * 1024 * 1024;
+
+      struct ScanBlock {
+        std::vector<int64_t> ranks;
+        std::vector<const char*> rows;
+        std::vector<float> scores;
+        std::vector<size_t> runStarts;
+        void clear() {
+          ranks.clear();
+          runStarts.clear();
+        }
+      };
+
       // The domain, when present, is live-filtered and is the complete
       // eligibility predicate (PrepareContext contract); null means the
       // segment has no deletes and no filters.
@@ -2323,8 +2463,6 @@ public:
   };
 
 private:
-  static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
-
   /// Fill `bits` with the all-set pattern for n ranks: ceil(n/8) 0xFF bytes
   /// with the tail bits past n cleared.  Every rank bitmap in this file
   /// keeps that tail invariant, so popcount(bits) == set ranks (see
@@ -2525,9 +2663,38 @@ private:
       const SegV2D& v2d = v2dPerSeg[(size_t)segOrd];
       int64_t rescored = 0;
       bool keepEngineScores = !segApprox.empty() && !segApprox[(size_t)segOrd];
+      // Exact scores for the whole bucket in one batched pass: candidates are
+      // rank-sorted, so the gathered rows walk the column forward and the
+      // scorer prefetches ahead across the gaps.  Groups restores each
+      // witness's full per-document max, so it scores row by row below.
+      std::vector<float> exactScores;
       std::optional<VectorReader> vr;
+      std::optional<VectorScorer> scorer;
       if (!keepEngineScores) {
         vr.emplace(reader.segments()[(size_t)segOrd].postingsReader(), *info);
+        if (vr->dims() != dims) {
+          throw std::runtime_error(std::format(
+            "KnnQuery: query vector dims {} do not match segment dims {}", dims, vr->dims()));
+        }
+        scorer.emplace(queryPtr, dims, metric, normalizeColumnOnCosineRescore,
+                       vr->encoding(), vr->hasNorms());
+        if (!scorer->scoresColumn()) {
+          keepEngineScores = true;
+        } else if constexpr (!Groups) {
+          int64_t numVals = vr->numVectors();
+          const char* rowsBase = numVals > 0 ? vr->rowsBase() : nullptr;
+          int64_t rowStride = vr->valueBytes();
+          std::vector<const char*> rows(bucketEnd - bucketBegin);
+          for (size_t c = bucketBegin; c < bucketEnd; c++) {
+            int64_t rank = candidates[c].valueRank;
+            if (rank < 0 || rank >= numVals) {
+              throw std::runtime_error("KnnQuery: vector candidate rank out of range");
+            }
+            rows[c - bucketBegin] = rowsBase + rank * rowStride;
+          }
+          exactScores.resize(rows.size());
+          scoreRowsPrefetched(*scorer, rows, (size_t)rowStride, exactScores.data());
+        }
       }
 
       [[no_unique_address]] std::conditional_t<Groups,
@@ -2563,13 +2730,11 @@ private:
             }
             bestScore = bestInRun(begin, end, [&](int64_t rank) {
               rescored++;
-              return exactScore(queryPtr, vr->vectorAtRank(rank), dims, metric,
-                  normalizeColumnOnCosineRescore, 0.0f);
+              return scorer->score(vr->rowAtRank(rank).data());
             }).second;
           } else {
             bestScore = bestInRun((int64_t)i, (int64_t)runEnd, [&](int64_t c) {
-              return exactScore(queryPtr, vr->vectorAtRank(candidates[(size_t)c].valueRank),
-                  dims, metric, normalizeColumnOnCosineRescore, candidates[(size_t)c].score);
+              return exactScores[(size_t)c - bucketBegin];
             }).second;
           }
         }
@@ -2608,51 +2773,39 @@ private:
     std::sort(docHits.begin(), docHits.end(), betterDoc);
   }
 
-  // The query vector is validated finite at Weight construction, but stored
-  // vectors are not, so a distance can still come back NaN (a stored NaN, or
-  // inf - inf accumulation).  NaN scores would break the strict-total-order
-  // contract (betterHit/betterDoc) that makes the bounded cuts deterministic
-  // and std::sort defined, so map NaN to a worst-rank score at the point
-  // where scores are produced.  One ULP above lowest(): TopScoreCollector's
-  // minCompetitiveVal starts at lowest() and admits only strictly greater
-  // scores, and a kNN hit must rank last, not be counted in matches yet
-  // vanish from the returned docs.
-  static float finiteScore(float score) {
-    if (!std::isnan(score)) [[likely]] return score;
-    return std::nextafter(std::numeric_limits<float>::lowest(), 0.0f);
+  // Candidate rows ahead of the scoring cursor with read-ahead in flight on a
+  // cold column (each row is at most two pages), and rows per scoring call.
+  static constexpr size_t RESCORE_PREFETCH_ROWS = 1024;
+  static constexpr size_t RESCORE_CHUNK_ROWS = 64;
+
+  /// scorer.scoreRows over rank-sorted candidate rows, with read-ahead when
+  /// the column is not resident (see PagePrefetcher): the rows' pages are
+  /// advised RESCORE_PREFETCH_ROWS ahead so their reads overlap instead of
+  /// faulting one at a time.
+  static void scoreRowsPrefetched(const VectorScorer& scorer, std::span<const char* const> rows,
+                                  size_t rowBytes, float* out) {
+    if (rows.empty()) return;
+    PagePrefetcher prefetch;
+    prefetch.probe(rows.front());
+    prefetch.probe(rows[rows.size() / 2]);
+    size_t advised = 0;
+    for (size_t at = 0; at < rows.size(); at += RESCORE_CHUNK_ROWS) {
+      size_t n = std::min(RESCORE_CHUNK_ROWS, rows.size() - at);
+      if (prefetch.active() && advised < rows.size()
+          && advised < at + RESCORE_PREFETCH_ROWS / 2) {
+        size_t target = std::min(rows.size(), at + RESCORE_PREFETCH_ROWS);
+        for (advised = std::max(advised, at); advised < target; advised++) {
+          prefetch.add(rows[advised], rowBytes);
+        }
+        prefetch.flush();
+      }
+      scorer.scoreRows(rows.data() + at, n, out + at);
+      prefetch.refresh();
+    }
   }
 
-  // Keep L2/IP conversions in sync with scoreFromDist below.  COSINE has a
-  // separate stored-vector norm branch for raw-column rescore mode.
-  static float exactScore(const float* queryPtr,
-                          std::span<const float> vec,
-                          int32_t dims,
-                          int32_t metric,
-                          bool normalizeColumnOnCosineRescore,
-                          float fallbackScore) {
-    assert(queryPtr != nullptr);
-    assert((int32_t)vec.size() == dims);
-    switch (metric) {
-      case (int32_t)luxir::api::VectorMetric::L2: {
-        float dist = faiss::fvec_L2sqr(queryPtr, vec.data(), (size_t)dims);
-        return finiteScore(1.0f / (1.0f + dist));
-      }
-      case (int32_t)luxir::api::VectorMetric::IP:
-        return finiteScore(faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims));
-      case (int32_t)luxir::api::VectorMetric::COSINE: {
-        float sum = faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims);
-        if (!normalizeColumnOnCosineRescore) return finiteScore(sum);
-
-        // Raw-column cosine pays the vector norm at query time.  This is the
-        // explicit tradeoff for preserving the originally submitted bytes when
-        // normalize_on_write=false; the default cosine path stores unit vectors.
-        float normSq = faiss::fvec_norm_L2sqr(vec.data(), (size_t)dims);
-        if (!std::isfinite(normSq) || normSq <= MIN_COSINE_NORM_SQ) return 0.0f;
-        return finiteScore(sum / std::sqrt(normSq));
-      }
-      default:
-        return fallbackScore;
-    }
+  static float finiteScore(float score) {
+    return VectorScorer::finiteScore(score);
   }
 
   static void sortCandidatesByScore(std::vector<VectorEngineHit>& candidates) {
@@ -2684,7 +2837,8 @@ private:
   //   IP:    FAISS returns dot product - already higher-is-better.
   //   COSINE: stored as IP over normalized vectors (write path or builder),
   //           query is normalized at search time - same as IP.
-  // NaN distances map to the worst score (see finiteScore).
+  // NaN distances map to the worst score (see finiteScore).  Keep in sync
+  // with the column score conversions in VectorScorer.
   static float scoreFromDist(float dist, int32_t metric) {
     switch (metric) {
       case (int32_t)luxir::api::VectorMetric::L2:

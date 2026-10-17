@@ -134,17 +134,28 @@ std::string makeVectorMeta(int32_t dims, const VectorFieldType& ft,
   return meta.toBytes();
 }
 
+// Whether the vectors a segment feeds to FAISS need L2 normalization: cosine
+// over a raw column, over the raw keep_original column, or over a quantized
+// column (a quantized unit vector is only approximately unit length).
+bool normalizeSegmentForFaiss(const VectorFieldType& ft, const VectorReader& source,
+                              bool fromOriginal) {
+  if (ft.metric_ != VectorFieldType::METRIC_COSINE) return false;
+  if (source.encoding() != VectorEncoding::F32) return true;
+  return !ft.normalized_ && (fromOriginal || !ft.normalizeOnWrite_);
+}
+
 void addVectorsToIndex(faiss::Index& index, VectorReader& vr, int32_t dims,
                        bool normalizeForFaiss, std::vector<float>& scratch,
                        size_t chunkBytes) {
   int64_t numVals = vr.numVectors();
   if (numVals <= 0) return;
-  const float* base = (const float*)vr.vectorAtRank(0).data();
   size_t bytesPerVec = (size_t)dims * sizeof(float);
   size_t chunkVecs = chunkBytes == 0 ? (size_t)numVals
                                      : std::max((size_t)1, chunkBytes / bytesPerVec);
 
-  if (!normalizeForFaiss) {
+  if (!normalizeForFaiss && vr.encoding() == VectorEncoding::F32 && !vr.hasNorms()) {
+    // F32 straight from the mapped column, no copy.
+    const float* base = (const float*)vr.rowAtRank(0).data();
     for (int64_t off = 0; off < numVals; off += (int64_t)chunkVecs) {
       int64_t n = std::min((int64_t)chunkVecs, numVals - off);
       index.add(n, base + off * dims);
@@ -156,8 +167,8 @@ void addVectorsToIndex(faiss::Index& index, VectorReader& vr, int32_t dims,
   if (scratch.size() < chunkFloats) scratch.resize(chunkFloats);
   for (int64_t off = 0; off < numVals; off += (int64_t)chunkVecs) {
     int64_t n = std::min((int64_t)chunkVecs, numVals - off);
-    std::memcpy(scratch.data(), base + off * dims, (size_t)n * bytesPerVec);
-    faiss::fvec_renorm_L2((size_t)dims, (size_t)n, scratch.data());
+    vr.decodeRange(off, n, scratch.data());
+    if (normalizeForFaiss) faiss::fvec_renorm_L2((size_t)dims, (size_t)n, scratch.data());
     index.add(n, scratch.data());
   }
 }
@@ -167,17 +178,18 @@ void appendTrainingVectors(std::vector<float>& sample, int64_t sampleCap,
                            int64_t ntotal,
                            int64_t segmentGlobalStart,
                            VectorReader& vr,
-                           int32_t dims) {
+                           int32_t dims,
+                           bool normalizeForFaiss) {
   int64_t numVals = vr.numVectors();
   int64_t segmentGlobalEnd = segmentGlobalStart + numVals;
   while (nextSampleOrd < sampleCap) {
     int64_t targetGlobal = (nextSampleOrd * ntotal) / sampleCap;
     if (targetGlobal >= segmentGlobalEnd) break;
     if (targetGlobal >= segmentGlobalStart) {
-      auto vec = vr.vectorAtRank(targetGlobal - segmentGlobalStart);
       size_t old = sample.size();
       sample.resize(old + (size_t)dims);
-      std::memcpy(sample.data() + old, vec.data(), (size_t)dims * sizeof(float));
+      vr.decodeAtRank(targetGlobal - segmentGlobalStart, sample.data() + old);
+      if (normalizeForFaiss) faiss::fvec_renorm_L2((size_t)dims, 1, sample.data() + old);
     }
     nextSampleOrd++;
   }
@@ -196,7 +208,11 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
     const auto& fi = *info;
     if (fi.type != FieldType::VECTOR) continue;
 
-    VectorReader vr(pr, fi);
+    // The keep_original column, when aligned with the encoded one, is the
+    // full-precision input for training and adds.
+    SegFieldInfo originalInfo;
+    bool fromOriginal = findOriginalColumn(pr, fi, originalInfo);
+    VectorReader vr(pr, fromOriginal ? originalInfo : (const SegFieldInfo&)fi);
     int32_t segDims = vr.dims();
     if (segDims <= 0) continue;
     if (dims == 0) {
@@ -207,7 +223,7 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
         fieldName, dims, seg.segId, segDims));
     }
 
-    if (!fn(seg, vr)) return false;
+    if (!fn(seg, vr, fromOriginal)) return false;
   }
   return true;
 }
@@ -248,7 +264,9 @@ VectorIndexBuilder::collectEligibleFields() {
     while (fr.readNextField()) {
       SegFieldInfo fi;
       fr.readFieldInfo(fi);
-      if (fi.type == FieldType::VECTOR) {
+      // keep_original companions are inputs to their field's build, not fields.
+      if (fi.type == FieldType::VECTOR
+          && !VectorFieldType::isOriginalColumnName((std::string_view)fr.name())) {
         seen.emplace((std::string_view)fr.name());
       }
     }
@@ -344,7 +362,7 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
   int64_t ntotal = 0;
 
   forEachVectorSegment(segments_, fieldName, dims,
-      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
+      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr, bool) {
     ntotal += vr.numVectors();
     return true;
   });
@@ -385,9 +403,9 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
   int64_t globalStart = 0;
   int64_t nextSampleOrd = 0;
   forEachVectorSegment(segments_, fieldName, dims,
-      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
+      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr, bool fromOriginal) {
     appendTrainingVectors(training, sampleCap, nextSampleOrd, ntotal,
-                          globalStart, vr, dims);
+                          globalStart, vr, dims, normalizeSegmentForFaiss(ft, vr, fromOriginal));
     globalStart += vr.numVectors();
     return nextSampleOrd < sampleCap;
   });
@@ -397,9 +415,6 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
               "using flat-over-column fallback",
               fieldName, ntrain);
     return std::nullopt;
-  }
-  if (shouldNormalizeForFaiss(ft)) {
-    faiss::fvec_renorm_L2((size_t)dims, (size_t)ntrain, training.data());
   }
 
   auto quantizer = std::make_unique<faiss::IndexFlat>(dims, metric);
@@ -433,9 +448,9 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
 
   std::vector<float> scratch;
   forEachVectorSegment(segments_, fieldName, dims,
-      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
+      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr, bool fromOriginal) {
     if (vr.numVectors() > 0) {
-      addVectorsToIndex(*index, vr, dims, shouldNormalizeForFaiss(ft),
+      addVectorsToIndex(*index, vr, dims, normalizeSegmentForFaiss(ft, vr, fromOriginal),
                         scratch, ivfPqAddChunkBytes);
     }
     return true;
