@@ -53,6 +53,7 @@ private:
   int32_t numChunks_ = 0;
   int32_t maxDoc_ = 0;
   int64_t maxChunkBytes_ = 0;
+  int32_t numDirtyChunks_ = 0;
   StoredChunkFormat format_;  // zstdLevel is not recorded and stays the default
 
   std::vector<std::string_view> fieldNames_;
@@ -87,6 +88,7 @@ public:
     const char* metaPtr = chunkIS.ptr(chunksRegionEnd);
     const char* end = chunkIS.ptr(chunkIS.size());
     maxChunkBytes_ = (int64_t)InputStream::readVlong(metaPtr, end);
+    numDirtyChunks_ = (int32_t)InputStream::readVint(metaPtr, end);
     uint8_t codec = (uint8_t)*metaPtr++;
     if (codec != StoredChunkFormat::LZ4 && codec != StoredChunkFormat::ZSTD) {
       throw std::runtime_error("StoredFieldsReader: unknown codec " + std::to_string(codec));
@@ -249,6 +251,8 @@ public:
   int32_t numChunks() const { return numChunks_; }
   int32_t maxDoc() const { return maxDoc_; }
   int64_t maxChunkBytes() const { return maxChunkBytes_; }
+  // Chunks sealed before reaching the chunk limits (see StoredFieldsWriter).
+  int32_t numDirtyChunks() const { return numDirtyChunks_; }
   // Codec and chunk limits this resource was written with.
   const StoredChunkFormat& format() const { return format_; }
 

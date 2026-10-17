@@ -1590,8 +1590,8 @@ private:
 
   // Merge one stored-fields resource (default or named column family).
   // Writes a fresh StoredFieldsWriter for the same resource name in the
-  // resource's current format.  Sources in that same layout are copied as
-  // compressed chunks; the rest are decompressed and their live docs re-added
+  // resource's current format.  Clean sources in that same layout are copied
+  // as compressed chunks; the rest are decompressed and their live docs re-added
   // in merged-docID order, which converts them to the output codec and chunk
   // size.  Multi-valued fields are preserved as single addValues calls so the
   // on-disk grouping survives the merge.
@@ -1621,17 +1621,20 @@ private:
       // so the whole source region is copied without decompression - the
       // dominant cost of a large merge is otherwise this resource's serial
       // recompression.  The source must have the output's codec and chunk
-      // limits, and bodies reference its field-id table, so it must adopt
-      // into ours; deletions, another layout or a table mismatch fall back to
-      // the doc-by-doc re-add below.
+      // limits and few enough dirty (partially filled) chunks, and bodies
+      // reference its field-id table, so it must adopt into ours; deletions,
+      // another layout, too many dirty chunks or a table mismatch fall back to
+      // the doc-by-doc re-add below, which re-packs into full chunks.
       if (!seg.hasDeletes() && reader.format().sameLayout(writer.format())
+          && !StoredFieldsWriter::tooDirty(reader.numChunks(), reader.numDirtyChunks())
           && writer.adoptFieldTable(reader.fieldNames())) {
         writer.alignForRawAppend(seg.base);
         reader.readChunkDirectory(srcChunkFirstDocs, srcChunkOffsets);
         writer.appendRawChunkRegion(seg.base, reader.chunkRegionPtr(),
                                     reader.chunkRegionBytes(),
                                     srcChunkFirstDocs, srcChunkOffsets,
-                                    reader.maxDoc(), reader.maxChunkBytes());
+                                    reader.maxDoc(), reader.maxChunkBytes(),
+                                    reader.numDirtyChunks());
         continue;
       }
 

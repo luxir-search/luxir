@@ -740,25 +740,58 @@ TEST_F(StoredFieldsTest, zstdRoundTripHonorsChunkLimits) {
   expectBodies(*sfr, 10);
 }
 
+static std::vector<int64_t> chunkFirstDocs(StoredFieldsReader& r) {
+  std::vector<int64_t> firstDocs, offsets;
+  r.readChunkDirectory(firstDocs, offsets);
+  return firstDocs;
+}
+
 TEST_F(StoredFieldsTest, mergeRecompressesOtherFormatsAndCopiesMatching) {
   RAMDir dir;
-  StoredChunkFormat zstd{StoredChunkFormat::ZSTD};
+  StoredChunkFormat zstd{StoredChunkFormat::ZSTD, 3, 64 * 1024, 4};
   {
     CommitSnapshotRegistry iwSnapshots(dir);
     IndexWriter iw(iwSnapshots, withStoredFormat({}));
     addBodySegment(iw, 0, 3);
     addBodySegment(iw, 3, 3);
     iw.setSchema(withStoredFormat(zstd));
-    addBodySegment(iw, 6, 3);
+    addBodySegment(iw, 6, 4);  // one full chunk: clean
     iw.mergeSegments();
   }
   auto reader = std::make_shared<IndexReader>(dir);
   ASSERT_EQ(reader->segments().size(), 1u);
   auto sfr = defaultStored(reader->segments()[0].postingsReader());
   EXPECT_TRUE(sfr->format().sameLayout(zstd));
-  // The two LZ4 sources are re-added into one chunk; the ZSTD one is copied.
-  EXPECT_EQ(2, sfr->numChunks());
-  expectBodies(*sfr, 9);
+  // The two LZ4 sources are re-added (4 docs, then 2 sealed before the copy);
+  // the clean ZSTD source is copied.
+  EXPECT_EQ((std::vector<int64_t>{0, 4, 6}), chunkFirstDocs(*sfr));
+  EXPECT_EQ(1, sfr->numDirtyChunks());
+  expectBodies(*sfr, 10);
+}
+
+// Small flushes each end in a partial chunk; a merge re-packs them into full
+// chunks instead of copying the partial ones.
+TEST_F(StoredFieldsTest, mergeRepacksDirtyChunks) {
+  RAMDir dir;
+  StoredChunkFormat zstd{StoredChunkFormat::ZSTD, 3, 64 * 1024, 16};
+  {
+    CommitSnapshotRegistry iwSnapshots(dir);
+    IndexWriter iw(iwSnapshots, withStoredFormat(zstd));
+    for (int i = 0; i < 8; i++) {
+      addBodySegment(iw, i * 4, 4);
+    }
+    {
+      auto flushed = iw.snapshots.readers.getReader();
+      EXPECT_EQ(1, defaultStored(flushed->segments()[0].postingsReader())->numDirtyChunks());
+    }
+    iw.mergeSegments();
+  }
+  auto reader = std::make_shared<IndexReader>(dir);
+  ASSERT_EQ(reader->segments().size(), 1u);
+  auto sfr = defaultStored(reader->segments()[0].postingsReader());
+  EXPECT_EQ((std::vector<int64_t>{0, 16}), chunkFirstDocs(*sfr));
+  EXPECT_EQ(0, sfr->numDirtyChunks());
+  expectBodies(*sfr, 32);
 }
 
 

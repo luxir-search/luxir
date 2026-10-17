@@ -41,12 +41,17 @@ namespace luxir {
 //   <chunk 0: [int32 uncompressedSize][compressed bytes]>
 //   <chunk 1: ...>
 //   ...
-//   <metadata: [vlong maxChunkBytes][byte codec][varint chunkTarget]
-//              [varint maxDocsPerChunk][varint numFields] then numFields
-//              PackedTerms (field names keyed by segment-local stored-field id)>
+//   <metadata: [vlong maxChunkBytes][varint numDirtyChunks][byte codec]
+//              [varint chunkTarget][varint maxDocsPerChunk][varint numFields]
+//              then numFields PackedTerms (field names keyed by segment-local
+//              stored-field id)>
 //
 // Every chunk of a resource uses the codec recorded in its metadata; the chunk
 // limits are recorded so merges can tell whether chunks may be copied verbatim.
+// A dirty chunk was sealed before reaching either limit (a segment's last
+// chunk, or the chunk pending before a merge appended copied chunks); copied
+// chunks carry their source's count.  Merges recompress a source with too many
+// (see tooDirty) so small flushes do not keep their small chunks forever.
 //
 // Uncompressed chunk body (after decompression):
 //   - an array of numDocs int32 byte offsets, one per doc, giving the doc's
@@ -98,6 +103,7 @@ private:
   std::vector<int64_t> chunkFirstDocs;
   std::vector<int64_t> chunkFileOffsets;  // relative to chunksStart
   int64_t maxChunkBytes = 0;
+  int32_t numDirtyChunks = 0;
 
   // Reusable scratch buffers (avoid per-chunk reallocation).
   std::string uncompressedScratch;
@@ -173,6 +179,7 @@ public:
     }
     if (!chunkDocOffsets.empty()) {
       flushChunk();
+      numDirtyChunks++;
     }
 
     int32_t numChunks = (int32_t)chunkFirstDocs.size();
@@ -183,6 +190,7 @@ public:
 
     // Metadata block follows chunks in the same file.
     chunkOutput->writeVlong((uint64_t)maxChunkBytes);
+    chunkOutput->writeVint((uint32_t)numDirtyChunks);
     chunkOutput->write((char)format_.codec);
     chunkOutput->writeVint(format_.chunkTarget);
     chunkOutput->writeVint(format_.maxDocsPerChunk);
@@ -234,6 +242,17 @@ public:
     return (int32_t)chunkFirstDocs.size();
   }
 
+  // Would copying a source with these chunk counts verbatim leave too many
+  // dirty chunks behind?  Re-adding a source re-packs its docs together with
+  // its neighbors', so every chunk but the merge's last comes out full.  More
+  // than 1% dirty chunks costs more than recompressing: small segments
+  // (fewer than 100 chunks) are always re-packed, which is cheap at their
+  // size, and large ones are copied unless dirt has accumulated, which bounds
+  // the extra chunks in any segment to about 1%.
+  static bool tooDirty(int32_t numChunks, int32_t numDirtyChunks) {
+    return (int64_t)numDirtyChunks * 100 > (int64_t)numChunks;
+  }
+
   // --- Verbatim chunk-copy support (merges) -------------------------------
   //
   // Compressed chunk bodies are position-independent (doc offsets are
@@ -242,6 +261,7 @@ public:
   // identically into this writer's, and only when the source was written with
   // the same codec and chunk limits (StoredChunkFormat::sameLayout), so the
   // output stays uniform.  A merge of such a no-deletions source calls:
+  //   0. tooDirty(source counts)        - true means re-add doc by doc
   //   1. adoptFieldTable(source names)  - false means re-add doc by doc
   //   2. alignForRawAppend(docBase)     - seal/pad so chunks cover [0, docBase)
   //   3. appendRawChunkRegion(...)      - bulk-copy chunks, rebase directory
@@ -275,6 +295,7 @@ public:
     }
     if (!chunkDocOffsets.empty()) {
       flushChunk();
+      numDirtyChunks++;
     }
     assert(lastFinalizedDoc == nextDoc - 1);
   }
@@ -283,12 +304,13 @@ public:
   // are the source chunks ([int32 uncompressedSize][compressed bytes] each,
   // metadata excluded), written in a format with this writer's layout;
   // firstDocs/offsets its chunk directory (offsets relative to the region
-  // start); srcMaxDoc its doc count and srcMaxChunkBytes its stored max
-  // uncompressed chunk size.
+  // start); srcMaxDoc its doc count, srcMaxChunkBytes its stored max
+  // uncompressed chunk size and srcDirtyChunks its dirty chunk count.
   void appendRawChunkRegion(int32_t docBase, const char* region, int64_t regionBytes,
                             std::span<const int64_t> firstDocs,
                             std::span<const int64_t> offsets,
-                            int32_t srcMaxDoc, int64_t srcMaxChunkBytes) {
+                            int32_t srcMaxDoc, int64_t srcMaxChunkBytes,
+                            int32_t srcDirtyChunks) {
     assert(currentDoc < 0 && chunkDocOffsets.empty());
     assert(lastFinalizedDoc == docBase - 1);
     assert(firstDocs.size() == offsets.size() && !firstDocs.empty());
@@ -299,6 +321,7 @@ public:
     }
     chunkOutput->write(region, (size_t)regionBytes);
     maxChunkBytes = (std::max)(maxChunkBytes, srcMaxChunkBytes);
+    numDirtyChunks += srcDirtyChunks;
     lastFinalizedDoc = docBase + srcMaxDoc - 1;
   }
 
