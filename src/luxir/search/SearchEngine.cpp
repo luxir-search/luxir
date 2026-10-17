@@ -119,7 +119,22 @@ void SearchEngine::submitBody(SearchRequest& req) {
   req.bodyDone();
 }
 
-void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
+void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
+  try {
+    // Isolated: a -1 request waiting on its task group helps only with its own
+    // tasks, never picking up another request queued behind it.
+    node.getTaskArena().enqueue([this, &req, maxParallel] {
+      oneapi::tbb::this_task_arena::isolate([&] { submit(req, maxParallel); });
+    });
+  } catch (const std::exception& e) {
+    // Nothing was queued: complete the request here so its transport still
+    // sees exactly one final reply.
+    req.setError(classifyException(e, ErrorKind::INTERNAL));
+    req.bodyDone();
+  }
+}
+
+void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver) {
   if (!req.proto.min_commit.empty()) {
     try {
       auto floor = CommitId::parse(req.proto.min_commit);
@@ -141,24 +156,24 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
       return;
     }
   }
-  if (maxParallel == 0) {
+  if (receiver == Receiver::OFFLOAD || (maxParallel != 0 && maxParallel != -1)) {
+    // Off the receiving thread: always for an offloading transport, and for
+    // 1 (serial on the arena, the escape hatch for a query expected to be
+    // expensive).  Other values are rejected in prepare(), on the arena like 1.
+    enqueueSubmit(req, maxParallel);
+  } else if (maxParallel == 0) {
     // Default lane: the whole query runs serially right here on the receiving
     // transport thread.  No scheduler hop, and the arena's parked width never
     // wakes - the transport accepts that this thread is occupied for the
     // query's duration.
     submit(req, maxParallel);
-  } else if (maxParallel == -1) {
+  } else {
     // Parallel lane: the request starts right here, inside the arena, so it
     // pays no handoff; arena workers steal the tasks it spawns and this thread
     // helps in its own waits.  Entry takes a reserved slot (never queues
     // behind arena backlog).  Like the default lane, this transport thread is
     // occupied for the query's (now parallel) duration.
     node.executeIsolated([&] { submit(req, maxParallel); });
-  } else {
-    // 1 = serial off the receiving thread: the escape hatch for a query
-    // expected to be expensive, so it does not occupy this transport thread.
-    // Other values are rejected in prepare(), on the arena like 1.
-    node.getTaskArena().enqueue([this, &req, maxParallel] { submit(req, maxParallel); });
   }
 }
 

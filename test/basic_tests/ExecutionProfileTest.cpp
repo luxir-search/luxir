@@ -512,6 +512,30 @@ TEST_F(ExecutionProfileTest, maxParallelOneDispatchesOffCallingThread) {
   ASSERT_OK(req);
 }
 
+// An offloading transport (gRPC) keeps every lane off its thread; -1 still
+// parallelizes, from a worker of the node arena.
+TEST_F(ExecutionProfileTest, offloadRunsEveryLaneOffCallingThread) {
+  CollectionHelper helper("profile_offload");
+  std::vector<Doc> docs;
+  for (int i = 0; i < 32; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "v" + std::to_string(i % 4)));
+    if (i % 16 == 15) helper.indexAll(docs, UpdateMessage::COMMIT), docs.clear();
+  }
+  for (int32_t maxParallel : {0, 1, -1}) {
+    auto* arena = createArena();
+    auto req = LocalReqHandle(
+        luxir::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
+    auto* dispatchReq = static_cast<DispatchReq*>(req.get());
+    auto repliedOn = dispatchReq->replied.get_future();
+    req->collection("profile_offload").facet("cats", "cat_s").limit(-1);
+    helper.getSearchEngine().dispatch(*req.get(), maxParallel, SearchEngine::Receiver::OFFLOAD);
+    ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(60)));
+    EXPECT_NE(std::this_thread::get_id(), repliedOn.get()) << maxParallel;
+    EXPECT_EQ(helper.getNode().getTaskArena().max_concurrency(), dispatchReq->replyArenaConcurrency);
+    ASSERT_OK(req);
+  }
+}
+
 TEST_F(ExecutionProfileTest, maxParallelMinusOneRunsOnCallingThreadInNodeArena) {
   CollectionHelper helper("profile_parallel");
   std::vector<Doc> docs;

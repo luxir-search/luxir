@@ -234,7 +234,9 @@ Valid spdlog levels include `trace`, `debug`, `info`, `warn`, `error`, and
 
 HTTP defaults to one connection-I/O shard per available logical CPU, with a
 minimum of one, plus one dedicated accept thread. gRPC defaults to half the
-available logical CPUs, also with a minimum of one. Automatic sizing respects
+available logical CPUs, also with a minimum of one; its completion-queue
+threads only move bytes and hand requests off, so they need not match the
+query concurrency. Automatic sizing respects
 the process's CPU affinity, so a server restricted to 28 logical CPUs defaults
 to 28 HTTP shards and 14 gRPC threads. Set explicit counts with:
 
@@ -258,20 +260,24 @@ workers.
 ./luxir --server.workers=2
 ```
 
-Search requests default to serial execution directly on the transport thread
-that received them (an HTTP io shard or gRPC completion-queue thread). This
-avoids a scheduler handoff and idle-worker wakeups but occupies that
-connection's thread for the query's duration. The request-level
-`max_parallel` changes that: `1` moves the request onto the shared
-work-stealing scheduler, still serial (use this for requests expected to be
-expensive, so they do not delay other traffic on the same connection thread);
-`-1` keeps the request on its transport thread but lets the scheduler's
-workers join in with unlimited intra-request parallelism; values above `1` are
-reserved for a bounded parallelism budget and not implemented yet. No setting
-runs a request in parallel off its transport thread. Two paths leave the
-transport thread whatever the setting: a request with `min_commit` continues on
-a shared worker once its commit wait ends, and a gRPC search stream paused by
-flow control resumes on one. The current gRPC unary update handler waits for
+HTTP search requests default to serial execution directly on the io shard
+that received them. This avoids a scheduler handoff and idle-worker wakeups
+but occupies that connection's thread for the query's duration. The
+request-level `max_parallel` changes that: `1` moves the request onto the
+shared work-stealing scheduler, still serial (use this for requests expected
+to be expensive, so they do not delay other traffic on the same connection
+thread); `-1` keeps the request on its transport thread but lets the
+scheduler's workers join in with unlimited intra-request parallelism; values
+above `1` are reserved for a bounded parallelism budget and not implemented
+yet. A request with `min_commit` continues on a shared worker once its commit
+wait ends, whatever the setting.
+
+gRPC searches always run on the shared workers, never on the completion-queue
+thread: a client such as a gateway multiplexes many calls over one HTTP/2
+connection, and gRPC lands a connection's calls on one completion queue, so
+inline execution would run them one at a time. `max_parallel` keeps its
+parallelism meaning there: `0` and `1` run serially on a worker, and `-1` fans
+out from one. The current gRPC unary update handler waits for
 indexing on its completion-queue thread; streaming update and search use their
 separate flow-control paths.
 

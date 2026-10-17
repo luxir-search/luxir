@@ -12,11 +12,11 @@
 namespace luxir {
 
 // One arena slot per thread that enters the task arena from outside: each
-// HTTP shard and gRPC thread the configured servers run, plus the embedding
-// (main or test) thread.
+// HTTP shard the configured server runs, plus the embedding (main or test)
+// thread.  gRPC threads never enter: they enqueue their work.
 static int reservedArenaSlots(const LuxirConfig& config) {
   const auto& server = config.server;
-  return (server.http.enabled ? server.http.resolveThreads() : 0) + server.grpc.resolveThreads() + 1;
+  return (server.http.enabled ? server.http.resolveThreads() : 0) + 1;
 }
 
 // TBB's global pool lends at most max_allowed_parallelism - 1 workers to all
@@ -49,7 +49,7 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
   int total = node.arenaEntrants.fetch_add(n, std::memory_order_relaxed) + n;
   if (total > node.reservedSlots) {
     LOG_WARN("{} with {} threads brings task arena entrants to {}, past the {} slots reserved from "
-             "server.http.threads and server.grpc.threads; excess entrants can block behind arena work",
+             "server.http.threads; excess entrants can block behind arena work",
              server, n, total, node.reservedSlots);
   }
 }
