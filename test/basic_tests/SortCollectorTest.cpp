@@ -2647,9 +2647,33 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   // proves nothing, so no blocks may be skipped.
   EXPECT_EQ(run(false, true, true, tiesThenRand, 5, false).blocksSkipped, 0);
 
-  // An exact hit count disables pruning and stays exact.
-  auto exactExhaustive = run(true, true, true, randAsc, 9, true);
-  auto exactPruned = run(false, true, true, randAsc, 9, true);
+  // An exact hit count known without iterating (match-all: every doc or the
+  // live docs) keeps pruning on and stays exact, through both the
+  // exact-domain driver and the pull loop. A term query takes its count from
+  // postings metadata on the delete-free segment.
+  for (bool matchAll : {true, false}) {
+    for (bool forcePull : {false, true}) {
+      for (const Sorts& sorts : {monoAsc, revDesc, randAsc}) {
+        auto exhaustive = run(true, forcePull, matchAll, sorts, 9, true);
+        auto pruned = run(false, forcePull, matchAll, sorts, 9, true);
+        EXPECT_EQ(exhaustive.ids, pruned.ids);
+        EXPECT_EQ(exhaustive.found, pruned.found);
+        if (matchAll) {
+          EXPECT_EQ(pruned.found, 2 * kDocsPerSeg - (int64_t)deleted.size());
+        }
+        if (sorts.clauses[0].first != "rand_i") {
+          EXPECT_GT(pruned.blocksSkipped, 0)
+              << "matchAll=" << matchAll << " forcePull=" << forcePull
+              << " sort=" << sorts.clauses[0].first;
+        }
+      }
+    }
+  }
+  // A query whose count needs iterating still disables pruning.
+  auto exactExhaustive = run(true, true, false, monoAsc, 9, true,
+                             PhraseShape::EXACT);
+  auto exactPruned = run(false, true, false, monoAsc, 9, true,
+                         PhraseShape::EXACT);
   EXPECT_EQ(exactExhaustive.ids, exactPruned.ids);
   EXPECT_EQ(exactExhaustive.found, exactPruned.found);
   EXPECT_EQ(exactPruned.blocksSkipped, 0);
@@ -3164,11 +3188,12 @@ TEST_F(SortCollectorTest, bestFirstFieldSortMatchesExhaustive) {
   }
   // Secondary clause: no sole column, no masked plan.
   EXPECT_EQ(run(FORCED, false, true, tiesThenRand, 9, false).activations, 0);
-  // Exact count keeps every pruning route off and stays exact.
+  // A match-all's exact count is its domain cardinality, so pruning routes
+  // stay on and the count stays exact.
   {
     auto exact = run(FORCED, false, true, randAsc, 9, true);
     auto exactExh = run(LADDER, true, true, randAsc, 9, true);
-    EXPECT_EQ(exact.activations, 0);
+    EXPECT_GT(exact.activations, 0);
     EXPECT_EQ(exact.ids, exactExh.ids);
     EXPECT_EQ(exact.found, exactExh.found);
   }
@@ -4519,11 +4544,16 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
     EXPECT_EQ(run(false, true, randAsc, 9, false, "alpha", 0, Main::PHRASE_UNION).ids,
               mixed.ids);
   }
-  // Exact count keeps every pruning route off and stays exact.
+  // An exact count that needs iterating keeps every pruning route off; a
+  // term's metadata count does not. Both stay exact.
   for (Main main : {Main::TERM, Main::UNION}) {
     auto exact = run(true, false, randAsc, 9, true, "alpha", 0, main);
     auto exactExh = run(false, true, randAsc, 9, true, "alpha", 0, main);
-    EXPECT_EQ(exact.activations, 0);
+    if (main == Main::TERM) {
+      EXPECT_GT(exact.activations, 0);
+    } else {
+      EXPECT_EQ(exact.activations, 0);
+    }
     EXPECT_EQ(exact.ids, exactExh.ids);
     EXPECT_EQ(exact.found, exactExh.found);
   }

@@ -243,6 +243,77 @@ void addDenseFacetIntAvg(void* target, int64_t raw) {
   storeUnaligned<__int128>(bytes, sum + (__int128)raw);
 }
 
+// Calls add(state, sum, count) for the batch's values: once per run of equal
+// consecutive keys when runs are long (a filtered or clustered domain), where
+// summing a run in a register spares a store-and-reload of its state per
+// value; otherwise once per value, as a run-detection branch would
+// mispredict on interleaved keys.
+template <typename Add>
+void forEachKeyedRun(void* states, size_t stride,
+                     std::span<const int64_t> keys,
+                     std::span<const int64_t> raw, Add&& add) {
+  auto* base = static_cast<std::byte*>(states);
+  size_t n = raw.size();
+  size_t changes = 0;
+  for (size_t i = 1; i < n; i++) changes += keys[i] != keys[i - 1];
+  if (4 * changes >= n) {
+    for (size_t i = 0; i < n; i++) {
+      add(base + (size_t)keys[i] * stride, (__int128)raw[i], uint64_t{1});
+    }
+    return;
+  }
+  size_t i = 0;
+  while (i < n) {
+    int64_t key = keys[i];
+    __int128 sum = raw[i];
+    size_t j = i + 1;
+    for (; j < n && keys[j] == key; j++) sum += (__int128)raw[j];
+    add(base + (size_t)key * stride, sum, (uint64_t)(j - i));
+    i = j;
+  }
+}
+
+void addDenseFacetIntAvgKeyed(void* states, size_t stride,
+                              std::span<const int64_t> keys,
+                              std::span<const int64_t> raw) {
+  // As addDenseFacetIntAvg: one collector cannot overflow int128.
+  forEachKeyedRun(states, stride, keys, raw,
+      [](std::byte* bytes, __int128 sum, uint64_t count) LUXIR_INLINE {
+        unused(count);
+        storeUnaligned<__int128>(bytes, loadUnaligned<__int128>(bytes) + sum);
+      });
+}
+
+void addIntSumKeyed(void* states, size_t stride,
+                    std::span<const int64_t> keys,
+                    std::span<const int64_t> raw, FieldType::Type columnType,
+                    std::span<const AggregateConstant> arguments) {
+  unused(columnType);
+  unused(arguments);
+  // As addIntSumRaw: one collector cannot overflow either lane.
+  forEachKeyedRun(states, stride, keys, raw,
+      [](std::byte* bytes, __int128 sum, uint64_t count) LUXIR_INLINE {
+        std::byte* sumBytes = bytes + offsetof(IntSumState, sum);
+        std::byte* countBytes = bytes + offsetof(IntSumState, count);
+        storeUnaligned<__int128>(
+            sumBytes, loadUnaligned<__int128>(sumBytes) + sum);
+        storeUnaligned<uint64_t>(
+            countBytes, loadUnaligned<uint64_t>(countBytes) + count);
+      });
+}
+
+// The keyed form of a raw point accumulator, with the point folded into the
+// loop.
+template <auto RawPoint>
+void addKeyedRaw(void* states, size_t stride, std::span<const int64_t> keys,
+                 std::span<const int64_t> raw, FieldType::Type columnType,
+                 std::span<const AggregateConstant> arguments) {
+  auto* base = static_cast<std::byte*>(states);
+  for (size_t i = 0; i < raw.size(); i++) {
+    RawPoint(base + (size_t)keys[i] * stride, raw[i], columnType, arguments);
+  }
+}
+
 void failDenseFacetIntAvg(void* target, AggregateFailure failure) {
   auto* bytes = static_cast<std::byte*>(target);
   AggregateFailure existing = loadUnaligned<AggregateFailure>(
@@ -283,7 +354,7 @@ BucketScalar finishDenseFacetIntAvg(const void* source, int64_t count) {
 constexpr DenseFacetStateOps DENSE_FACET_INT_AVG{
     sizeof(DenseFacetIntAvgState), initDenseFacetIntAvg,
     addDenseFacetIntAvg, failDenseFacetIntAvg, mergeDenseFacetIntAvg,
-    finishDenseFacetIntAvg};
+    finishDenseFacetIntAvg, addDenseFacetIntAvgKeyed};
 
 template <bool Average>
 void addDoubleSumValue(void* target, double value,
@@ -664,7 +735,8 @@ AggregateStateOps intSumOps(bool average) {
   return {sizeof(IntSumState), initState<IntSumState>, addIntSum,
           addIntSumBatch, addIntSumRaw, addIntSumRawBatch,
           mergeIntSum,
-          average ? finishIntAvg : finishIntSum};
+          average ? finishIntAvg : finishIntSum,
+          addIntSumKeyed};
 }
 
 AggregateStateOps doubleSumOps(bool average) {
@@ -675,7 +747,9 @@ AggregateStateOps doubleSumOps(bool average) {
           average ? addDoubleSumRawBatch<true>
                   : addDoubleSumRawBatch<false>,
           average ? mergeDoubleSum<true> : mergeDoubleSum<false>,
-          average ? finishDoubleAvg : finishDoubleSum};
+          average ? finishDoubleAvg : finishDoubleSum,
+          average ? addKeyedRaw<addDoubleSumRaw<true>>
+                  : addKeyedRaw<addDoubleSumRaw<false>>};
 }
 
 AggregateStateOps intExtremeOps(bool minimum) {
@@ -686,7 +760,9 @@ AggregateStateOps intExtremeOps(bool minimum) {
           minimum ? addIntExtremeRawBatch<true>
                   : addIntExtremeRawBatch<false>,
           minimum ? mergeIntExtreme<true> : mergeIntExtreme<false>,
-          finishIntExtreme};
+          finishIntExtreme,
+          minimum ? addKeyedRaw<addIntExtremeRaw<true>>
+                  : addKeyedRaw<addIntExtremeRaw<false>>};
 }
 
 AggregateStateOps doubleExtremeOps(bool minimum) {
@@ -699,7 +775,9 @@ AggregateStateOps doubleExtremeOps(bool minimum) {
           minimum ? addDoubleExtremeRawBatch<true>
                   : addDoubleExtremeRawBatch<false>,
           minimum ? mergeDoubleExtreme<true> : mergeDoubleExtreme<false>,
-          finishDoubleExtreme};
+          finishDoubleExtreme,
+          minimum ? addKeyedRaw<addDoubleExtremeRaw<true>>
+                  : addKeyedRaw<addDoubleExtremeRaw<false>>};
 }
 
 ResolvedAggregate resolveAvg(

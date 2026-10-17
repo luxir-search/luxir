@@ -1973,13 +1973,39 @@ public:
               // facts. A known whole-membership card satisfies exact count, but
               // its borrowed set is not a produced sub-op domain.
               bool routedExactDomain = routedDomainsReady;
+              // An exact count known without iterating lets ranking prune:
+              // a resident whole membership, a routed exact domain, a
+              // match-all (its domain's cardinality: every doc or the live
+              // docs), the supplier's exact materialized set, or a
+              // constant-count (metadata) plan over an unfiltered segment.
+              std::optional<int64_t> knownExactCount;
+              if (!Collapsed && op.requirements.needExactCount) {
+                if (wholeFieldSortAvailable) {
+                  knownExactCount = wholeMembershipResult.count;
+                } else if (routedExactDomain) {
+                  knownExactCount = routedProduction->domains[0].get() == nullptr
+                      ? seg.maxDoc()
+                      : routedProduction->domains[0].get()->card();
+                } else if (builderPtr == nullptr && !requiresWholeIndexPrepare
+                           && supplier != nullptr) {
+                  if (matchEverything && op.domainVariants.empty()
+                      && collectorFilter == filter) {
+                    knownExactCount = filter == nullptr
+                        ? (int64_t)seg.maxDoc() : (int64_t)filter->card();
+                  } else if (collectorFilter == nullptr) {
+                    DocSet* exact = supplier->exactDocSet();
+                    knownExactCount = exact != nullptr
+                        ? std::optional<int64_t>((int64_t)exact->card())
+                        : QueryPrep::supplierCount(supplier);
+                  }
+                }
+              }
               // Known document cardinality cannot replace distinct key reads.
               // Collapse totals disable every skipping arm, even over an
               // exact cached domain.
               bool mustStreamForCompleteness =
                   (Collapsed && op.requirements.needExactCount)
-                  || (op.requirements.needExactCount && !wholeFieldSortAvailable
-                   && !routedExactDomain)
+                  || (op.requirements.needExactCount && !knownExactCount)
                   || builderPtr != nullptr;
               bool maySkipNoncompetitiveDocs =
                   !disableFieldSortPruning && !mustStreamForCompleteness
@@ -2249,17 +2275,11 @@ public:
                   fieldCollector->recordSegmentSkipStats(segnum);
                 }
               }
-              if (!Collapsed && op.requirements.needExactCount
-                  && (wholeFieldSortAvailable || routedExactDomain)) {
+              if (knownExactCount) {
                 int64_t collected =
                     fieldCollector->hitCount - fieldHitsBefore;
-                int64_t exactCount = wholeFieldSortAvailable
-                    ? wholeMembershipResult.count
-                    : routedProduction->domains[0].get() == nullptr
-                          ? seg.maxDoc()
-                          : routedProduction->domains[0].get()->card();
-                assert(exactCount >= collected);
-                data->addHits(exactCount - collected);
+                assert(*knownExactCount >= collected);
+                data->addHits(*knownExactCount - collected);
               }
             } else {
               assert(op.weight != nullptr);

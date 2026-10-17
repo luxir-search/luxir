@@ -197,6 +197,10 @@ TEST_F(ExecutionProfileTest, reportsGlobalTopTermsPath) {
       flatdoc("id", "4", "cat_s", "c", "metric_i", 40),
   }, UpdateMessage::COMMIT);
 
+  // Keep the metric on the bucket-domain feed: AUTO folds a bare-column
+  // metric of so small a facet into its ord pass.
+  SearchOverridesGuard guard(forcedFacetSubOpInline);
+  forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
   auto req = localReq(helper.getSearchEngine());
   auto& facet = req->collection("profile_top_terms").profile()
       .facet("cats", "cat_s").limit(2);
