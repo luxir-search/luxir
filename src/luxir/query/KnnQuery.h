@@ -216,6 +216,26 @@ public:
   static constexpr double REFINE_UNITY_K = 1000.0;
   static constexpr double REFINE_MIN_RATIO = 1.1;
 
+  // Dimension-aware default IVF effort.  The nprobe=0 scan fraction
+  // (1/sqrt(referenceBreadth), see defaultBudget) is scaled by
+  //   clamp(sqrt(dims / defaultAnnBreadthReferenceDims), 1, ANN_BREADTH_MAX_DIM_FACTOR).
+  // Coarse partitions localize neighbors worse as dimension grows (distances
+  // to centroids concentrate, so a query's true neighbors spill over many
+  // more lists), and when the codes rank well inside the probed lists (1-bit
+  // RaBitQ at >= 768 dims) recall is bounded by the lists probed, not by the
+  // candidate pool: on GIST-960 / Cohere-768 the unscaled default stops at
+  // 0.82-0.87 recall@10 whatever refine_candidates is, and ~2.5x the lists
+  // reaches ~0.95.  At <= 128 dims (SIFT, Deep) the unscaled default already
+  // reaches ~0.96 and is left unchanged.  Depends only on dims, so it stays
+  // merge-stable.  0 disables the scaling.  Mutable for tests / benches.
+  static inline int32_t defaultAnnBreadthReferenceDims = 128;
+  static constexpr double ANN_BREADTH_MAX_DIM_FACTOR = 4.0;
+  static double defaultAnnBreadthDimFactor(int32_t dims) {
+    if (defaultAnnBreadthReferenceDims <= 0 || dims <= defaultAnnBreadthReferenceDims) return 1.0;
+    return std::min(ANN_BREADTH_MAX_DIM_FACTOR,
+                    std::sqrt((double)dims / (double)defaultAnnBreadthReferenceDims));
+  }
+
   // Test seam: when set, prepare() wraps the production flat engine and runs
   // the host deepen loop against the wrapper instead.  Lets tests drive the
   // loop with non-flat engine behaviors (breadth rounds, approximate scores)
@@ -544,6 +564,7 @@ public:
     out.appendInt32(std::max(0, maxKnnBreadth));
     out.appendInt32(defaultAnnRefineCount);
     out.appendInt32(defaultAnnRefineRatio);
+    out.appendInt32(defaultAnnBreadthReferenceDims);
     // Test wrappers may alter candidate selection without a keyable semantic
     // contract. Production engines are deterministic for a pinned reader.
     return engineWrapperForTests || groups != nullptr ? FilterKeyScope::UNCACHEABLE
@@ -1983,9 +2004,10 @@ public:
         heapSize = (int32_t)heapIndexes.size();
       }
 
-      double defaultBudget() const {
+      double defaultBudget(int32_t dims) const {
         // nprobe=0 default: probe as many lists as a SINGLE IVF index of
-        // nlist=referenceBreadth would by its own default, i.e. sqrt(nlist).  As
+        // nlist=referenceBreadth would by its own default, i.e. sqrt(nlist),
+        // times the dimension factor (defaultAnnBreadthDimFactor).  As
         // a scan fraction that is sqrt(referenceBreadth) / referenceBreadth =
         // 1 / sqrt(referenceBreadth) (= N^-0.25 for referenceBreadth=sqrt(N)).
         // This depends only on the total live vector count, so it is
@@ -1997,13 +2019,14 @@ public:
         // sqrt(numSegments) >= 1, which clamps to a full scan; and even summing
         // per-segment defaults (sum_s sqrt(nlist_s) / sqrt(N) = S^0.75 * N^-0.25)
         // keeps an S-dependent term that drifts on merges.
-        return 1.0 / std::sqrt((double)std::max(1, referenceBreadth));
+        return defaultAnnBreadthDimFactor(dims)
+          / std::sqrt((double)std::max(1, referenceBreadth));
       }
 
       double budgetForRequest(const VectorSearchRequest& request) const {
         double p = request.breadth > 0
           ? (double)request.breadth / (double)std::max(1, referenceBreadth)
-          : defaultBudget();
+          : defaultBudget(request.dims);
         p = std::max(p, (double)request.minScanFraction);
         return std::clamp(p, 0.0, 1.0);
       }
