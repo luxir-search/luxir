@@ -69,8 +69,10 @@ stage lapack-check "$LUXIR_ARM64_TOOLCHAIN/bin/aarch64-unknown-linux-gnu-g++" \
     build/arm64-deps/arm64-linux-luxir/lib/libopenblas.a -lm \
     -o build/arm64-toolchain/check-lapack
 if [[ -n $qemu ]]; then
-    stage lapack-execute env OPENBLAS_NUM_THREADS=2 "$qemu" -cpu cortex-a53 \
-        -L "$LUXIR_ARM64_SYSROOT" build/arm64-toolchain/check-lapack
+    stage lapack-execute-single env OPENBLAS_NUM_THREADS=1 "$qemu" -cpu cortex-a53 \
+        -L "$LUXIR_ARM64_SYSROOT" build/arm64-toolchain/check-lapack 1
+    stage lapack-execute-threaded env OPENBLAS_NUM_THREADS=2 "$qemu" -cpu cortex-a53 \
+        -L "$LUXIR_ARM64_SYSROOT" build/arm64-toolchain/check-lapack 2
 fi
 stage generator "$CXX" -std=c++26 -O2 -g0 -pthread \
     -Ideps/hpp-proto/include -Ideps/is_utf8/include \

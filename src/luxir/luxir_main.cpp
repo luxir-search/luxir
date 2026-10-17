@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/util/NumericalLibraries.h"
 #include <atomic>
 #include <csignal>
 #include <cstring>
@@ -107,14 +108,17 @@ int luxir_main(int argc, char** argv) {
     }
     if (!app.get_option("--log-level")->count()) config.log_level = "warn";
   } else {
-    // Block the shutdown signals before any thread exists so every thread
-    // inherits the mask and only SignalWatcher's sigwait receives them.
+    // Block the shutdown signals before any engine thread exists so every
+    // thread inherits the mask and only SignalWatcher's sigwait receives
+    // them.  OpenBLAS's load-time worker pool predates this; it is restarted
+    // under the mask by initializeNumericalLibraries() below.
     sigset_t set = shutdownSignals();
     pthread_sigmask(SIG_BLOCK, &set, nullptr);
     std::cout << luxir_banner() << std::endl;
   }
 
   try {
+    initializeNumericalLibraries();
     config.normalize();
     config.apply();
   } catch (const std::exception &e) {

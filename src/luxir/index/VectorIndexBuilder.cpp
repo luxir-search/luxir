@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "VectorIndexBuilder.h"
+#include "luxir/util/NumericalLibraries.h"
 
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
@@ -326,6 +327,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
                                   const VectorAnnConfig& ann,
                                   std::vector<std::string>& outFilesToSync,
                                   BuildSite buildSite) {
+  VectorBuildThreads threadBudget;
   int32_t dims = ft.dims_;
   faiss::MetricType metric = toFaissMetric(ft.metric_);
   bool rabitq = ann.codec == VectorAnnConfig::RABITQ;

@@ -79,3 +79,10 @@ if(ANDROID)
         set(NO_AVX512 ON CACHE BOOL "")
     endif()
 endif()
+
+# THREAD_TIMEOUT: how long an idle pthread worker spins before sleeping,
+# 2^THREAD_TIMEOUT cycles (upstream default 28: tens of milliseconds). FAISS
+# vector builds alternate GEMMs with OpenMP loops on the same cores, and
+# spinning BLAS workers starve those OpenMP teams (and query threads); a short
+# spin halved some IVF build times. OPENBLAS_THREAD_TIMEOUT still overrides.
+add_compile_definitions(THREAD_TIMEOUT=12)

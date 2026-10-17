@@ -51,12 +51,17 @@ Libraries
 - The FAISS overlay enables runtime SIMD dispatch (FAISS_OPT_LEVEL=dd) and
   checks the CPU features required by each dispatched kernel.
 - OpenBLAS includes C LAPACK with 32-bit LAPACK integers. No Fortran compiler
-  or runtime is needed. BLAS is single-threaded with locking for concurrent
-  callers; CPU-specific kernels are selected at runtime. ASan disables the
-  AVX-512 OpenBLAS kernels whose inline assembly GCC cannot instrument.
+  or runtime is needed. The threads feature enables pthread workers with a
+  256-worker build ceiling; Luxir defaults to one worker per available CPU
+  unless explicitly configured. Idle workers spin for 2^12 cycles before
+  sleeping (THREAD_TIMEOUT=12, upstream 28) so they do not starve FAISS's
+  OpenMP team. CPU-specific kernels are selected at runtime on x86-64 and
+  ARM64. ASan disables the AVX-512 OpenBLAS kernels whose inline assembly GCC cannot instrument.
   The overlay preserves caller CPU flags for common code and C LAPACK; upstream
   otherwise strips -march=native as a workaround for older GCC versions.
 - The lapack overlay directs FAISS to the LAPACK routines inside OpenBLAS.
+  Luxir also supports selecting an external LP64 AOCL or ArmPL provider at
+  configure time. See ../docs/dev/blas.md for backend and thread controls.
 
 For dependency changes, rerun make_deps.sh, then rebuild and test Luxir. Old
 classic installs under /opt/vcpkg/installed and /opt/vcpkg_asan are not used by

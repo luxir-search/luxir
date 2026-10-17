@@ -68,7 +68,8 @@ COPY .devcontainer/check-lapack.cpp /opt/luxir-checks/
 RUN g++ -std=c++26 -O2 /opt/luxir-checks/check-lapack.cpp \
       /opt/vcpkg/installed/x64-linux-luxir-v2/lib/libopenblas.a \
       -lm -pthread -static-libstdc++ -static-libgcc -o /tmp/check-lapack \
-    && /tmp/check-lapack && rm /tmp/check-lapack
+    && OPENBLAS_NUM_THREADS=1 /tmp/check-lapack 1 \
+    && OPENBLAS_NUM_THREADS=2 /tmp/check-lapack 2 && rm /tmp/check-lapack
 
 RUN --mount=type=cache,target=/opt/vcpkg/downloads \
     --mount=type=cache,target=/var/cache/vcpkg \
