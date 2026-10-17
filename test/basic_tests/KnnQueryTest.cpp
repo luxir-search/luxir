@@ -9,6 +9,7 @@
 #include <cmath>
 #include <map>
 #include <memory>
+#include <random>
 #include <set>
 #include <string>
 #include <vector>
@@ -1498,6 +1499,55 @@ TEST_F(KnnQueryTest, defaultNProbeStaysLeanNotFullScan) {
   ASSERT_EQ(fullIds.size(), 5u);
   EXPECT_EQ(fullIds[0], "outlier")
       << "min_scan_fraction=1 forces the exhaustive scan the default must avoid";
+}
+
+// The nprobe=0 default scales with dims (defaultAnnBreadthDimFactor): 512
+// dims is factor 2 over the 128-dim reference, so the default scans about
+// twice the vectors of the unscaled rule, while an explicit nprobe is pinned.
+TEST_F(KnnQueryTest, defaultNProbeScalesWithDims) {
+  EXPECT_EQ(1.0, KnnQuery::defaultAnnBreadthDimFactor(96));
+  EXPECT_EQ(1.0, KnnQuery::defaultAnnBreadthDimFactor(128));
+  EXPECT_DOUBLE_EQ(2.0, KnnQuery::defaultAnnBreadthDimFactor(512));
+  EXPECT_EQ(KnnQuery::ANN_BREADTH_MAX_DIM_FACTOR, KnnQuery::defaultAnnBreadthDimFactor(8192));
+
+  IvfTestGuard guard(VectorAnnConfig{.nlist = 32});
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  constexpr int32_t dims = 512;
+  std::mt19937 rng(7);
+  std::normal_distribution<float> gauss;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 1024; i++) {
+    std::vector<float> v(dims);
+    for (auto& x : v) x = gauss(rng);
+    docs.push_back(flatdoc("id", std::to_string(i), "embedding_v", v));
+  }
+  h.indexAll(docs);
+  h.commit({"*"});
+  std::vector<float> query(dims);
+  for (auto& x : query) x = gauss(rng);
+
+  // Explicit refine_candidates keeps the pool below the probed vectors, so
+  // neither run deepens and the scanned count is the default budget itself.
+  auto scanned = [&](int32_t nprobe) {
+    KnnQuery::Stats stats;
+    SearchOverridesGuard statsGuard(KnnQuery::statsForTests);
+    KnnQuery::statsForTests = &stats;
+    auto* req = makeKnnReq(*luxirNode, "embedding_v", query, 5, nprobe, /*refineCandidates=*/20);
+    req->execute();
+    EXPECT_EQ(5u, resultIds(*req).size());
+    req->done();
+    EXPECT_EQ(1, stats.rounds.load());
+    return stats.vectors.load();
+  };
+  int64_t scaledDefault = scanned(0);
+  int64_t scaledPinned = scanned(4);
+  SearchOverridesGuard dimsGuard(KnnQuery::defaultAnnBreadthReferenceDims);
+  KnnQuery::defaultAnnBreadthReferenceDims = 0;
+  int64_t plainDefault = scanned(0);
+  EXPECT_EQ(scaledPinned, scanned(4));
+  EXPECT_GE(scaledDefault, plainDefault * 3 / 2) << plainDefault;
+  EXPECT_LE(scaledDefault, plainDefault * 3) << plainDefault;
 }
 
 TEST_F(KnnQueryTest, mixedIndexedAndBelowThresholdCompositionMatchesExact) {

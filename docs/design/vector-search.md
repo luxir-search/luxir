@@ -145,7 +145,8 @@ The floors differ per codec for different reasons. PQ must train 2^bits
 centroids per sub-quantizer, and FAISS wants 39 points per centroid, so 8-bit
 PQ needs about 10k vectors. RaBitQ trains only the IVF centroids, which 39
 points each cover from about 1.5k vectors, but training is not what binds: at
-the default effort (`nlist = sqrt(N)`, `sqrt(nlist)` lists probed, about 194
+the default effort (`nlist = sqrt(N)`, `sqrt(nlist)` lists probed at <= 128
+dims and `sqrt(dims / 128)` times that above (capped at 4x), about 194
 candidates rescored for k=10) a single-threaded standalone FAISS measurement
 found the exact scan faster than an IVF+RaBitQ probe plus rescore below
 roughly 8k vectors, at both 768 dims (4k vectors: 0.25 ms exact vs 0.61 ms
