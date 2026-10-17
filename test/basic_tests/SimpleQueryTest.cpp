@@ -91,6 +91,13 @@ TEST_F(SimpleQueryTest, fieldedTermStaysOnField) {
   EXPECT_EQ(0u, docs.size());
 }
 
+TEST_F(SimpleQueryTest, whitespaceAfterFieldColon) {
+  EXPECT_EQ(2u, search("tag_s: scifi", {"title_un"}).size());
+  auto docs = search("+tag_s:  scifi +title_un: \"blade runner\"", {"body_un"});
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_TRUE(hasId(docs, "d1"));
+}
+
 TEST_F(SimpleQueryTest, numericFieldExactMatch) {
   // popularity:10 style: field:value on a numeric column is an exact match
   // (a degenerate [10,10] range), lowered to a NumericPredicateQuery

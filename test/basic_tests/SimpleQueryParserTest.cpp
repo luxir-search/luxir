@@ -413,6 +413,31 @@ TEST_F(SimpleQueryParserTest, fieldedPhrase) {
   EXPECT_EQ("foo bar", p->text);
 }
 
+TEST_F(SimpleQueryParserTest, whitespaceAfterFieldColon) {
+  // Lucene accepts whitespace between 'field:' and its value
+  auto r = parse("title:  dune");
+  EXPECT_EQ("title", asMatch(*r.root).field);
+  EXPECT_EQ("dune", matchVal(*r.root));
+  EXPECT_EQ("200", matchVal(*parse("count: 200").root));
+
+  const auto* p = std::get_if<api::PhraseQuery>(&parse("title:  \"foo bar\"").root->kind);
+  ASSERT_NE(nullptr, p);
+  EXPECT_EQ("title", p->field);
+  EXPECT_EQ("foo bar", p->text);
+
+  const auto* pre = std::get_if<api::PrefixQuery>(&parse("title: ab*").root->kind);
+  ASSERT_NE(nullptr, pre);
+  EXPECT_EQ("title", pre->field);
+  EXPECT_NE(nullptr, std::get_if<api::ExistsQuery>(&parse("title: *").root->kind));
+
+  // nothing after the colon: the head stays literal text, as with 'title:'
+  EXPECT_EQ("title:", matchVal(*parse("title:  ").root));
+  // a space BEFORE the colon is not fielded (unchanged)
+  EXPECT_EQ(3u, asBool(*parse("title : dune").root).optional.size());
+  // a group after the colon is not fielded, same as 'title:(a b)'
+  EXPECT_EQ("title:", matchVal(asBool(*parse("title: (a b)").root).optional[0]));
+}
+
 TEST_F(SimpleQueryParserTest, unknownFieldDegradesToText) {
   // the Gmail rule: a colon token with an unknown head is literal text
   auto r = parse("price:10");

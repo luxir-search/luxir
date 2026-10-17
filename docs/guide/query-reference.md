@@ -419,7 +419,7 @@ bind from the surrounding expression's `vars` map.
 | `fields` | Required non-empty fields for unfielded terms; scores add across fields. |
 | `operator` | Default adjacency: `or` (default) or `and`. |
 | `min_match` | Minimum top-level optional clauses when the parsed shape can apply it. |
-| `allowed_fields` | Optional allowlist for `field:value`; empty permits every queryable schema field. |
+| `allowed_fields` | Optional allowlist for `field:value` (`field: value` also works); empty permits every queryable schema field. |
 
 Unsupported syntax in `q` degrades to literal terms or produces a search
 warning. The [Quickstart](quickstart.md#forgiving-end-user-search)
