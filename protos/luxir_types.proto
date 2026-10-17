@@ -1529,7 +1529,7 @@ message CacheControlResponse {
 // Schema
 //
 
-// One analysis-chain component - a tokenizer or a token filter - named by its
+// One analysis-chain component - a tokenizer, character filter, or token filter - named by its
 // registry name, plus its parameters.  params values are typed JSON values
 // (string, number, bool, string list), e.g. {"possessive": false} for kstem.
 // A component that takes no parameters rejects any. The JSON dialect accepts a
@@ -1541,7 +1541,8 @@ message AnalyzerComponent {
 
 message AnalyzerDef {
   AnalyzerComponent tokenizer = 1;         // "whitespace" (default when absent), "keyword", "unicode_word"
-  repeated AnalyzerComponent filters = 2;  // applied in order, e.g., ["nfkc_cf", "fold"]
+  repeated AnalyzerComponent filters = 2;  // applied after tokenization, in order
+  repeated AnalyzerComponent char_filters = 3; // whole-value cleanup before tokenization, in order
 }
 
 // Alternate representations of the same input value, keyed by local label.

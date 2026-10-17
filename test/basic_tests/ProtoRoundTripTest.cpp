@@ -308,7 +308,7 @@ TEST(ProtoRoundTrip, AnalyzerDefTypedParams) {
   // encode -> decode and come back as the same canonical JSON; an absent
   // tokenizer stays absent.
   constexpr std::string_view canon =
-      R"({"filters":[{"name":"stop","params":{"words":["a","the"],"ignore_case":true,"max":3,"lang":"en","opts":{"k":null}}},"fold"]})";
+      R"({"filters":[{"name":"stop","params":{"words":["a","the"],"ignore_case":true,"max":3,"lang":"en","opts":{"k":null}}},"fold"],"char_filters":["html_strip",{"name":"remove_chars","params":{"chars":["-"]}}]})";
   std::pmr::monotonic_buffer_resource mr;
   P::AnalyzerDef in;
   std::string err;
@@ -327,6 +327,9 @@ TEST(ProtoRoundTrip, AnalyzerDefTypedParams) {
   EXPECT_FALSE(out.tokenizer.has_value());
   ASSERT_EQ(2u, out.filters.size());
   EXPECT_EQ("fold", out.filters[1].name);
+  ASSERT_EQ(2u, out.char_filters.size());
+  EXPECT_EQ("html_strip", out.char_filters[0].name);
+  EXPECT_EQ("remove_chars", out.char_filters[1].name);
   EXPECT_EQ(3, std::get<std::int64_t>((**out.filters[0].params.find("max")).kind));
 }
 
