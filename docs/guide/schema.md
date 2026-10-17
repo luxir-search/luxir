@@ -591,6 +591,29 @@ or borrow it through their own `parent`; they do not inherit it from their
 logical primary. The policy applies only to ID, TEXT, and indexed STRING
 representations.
 
+## Index sort
+
+Merges concatenate their source segments. By default they keep segment
+creation order. Ingest that arrives out of time order, such as backfills or
+late log shippers, then produces merged segments whose time column jumps
+back and forth. Its value zones are wide, so time range filters and
+newest-first sorts skip less. `index_sort` names an `int` or `date` column
+field, either concrete or a template instance, and merges then order their
+sources by each source's minimum value of it:
+
+```json
+{"index_sort": {"field": "timestamp_dt"}}
+```
+
+- Only the order of whole source segments changes. Documents within a source
+  keep their arrival order, so a merged segment is roughly sorted, not exactly.
+- Sources without values for the field go last; ties keep creation order.
+- Results do not change, except for the order of hits with equal sort keys.
+- A `mode=set` request without `index_sort` keeps the current setting;
+  `{"index_sort": {}}` clears it. A change affects only future merges.
+- Changing the field's type to one that is not an `int` or `date` column is
+  rejected while it is the index sort.
+
 ## The operations
 
 | Request | Meaning |

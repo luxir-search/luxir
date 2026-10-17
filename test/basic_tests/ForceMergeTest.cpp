@@ -277,4 +277,44 @@ TEST_F(ForceMergeTest, emptyCommitIsResumeForm) {
   EXPECT_EQ(1u, helper.durableSegmentCount());
 }
 
+// Segments flushed out of time order (b, a, untimed n, c) force-merged into
+// one. Returns the merged doc order; documents within a source keep arrival order.
+static std::vector<std::string> mergedOrder(bool indexSort) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  LuxirNode node(config);
+  CollectionHelper helper(node);
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  if (indexSort) {
+    SchemaBuilder b;
+    b.indexSort("ts_i");
+    b.set(helper.collection());
+  }
+  const std::pair<std::string, int> segments[] = {{"b", 200}, {"a", 100}, {"n", 0}, {"c", 300}};
+  for (const auto& [prefix, base] : segments) {
+    CollectionHelper::UpdateBuilder request;
+    for (int i = 0; i < 2; i++) {
+      std::string id = prefix + std::to_string(i);
+      request.add(base ? flatdoc("id", id, "ts_i", (int64_t)(base - i)) : flatdoc("id", id));
+    }
+    request.commit();
+    EXPECT_TRUE(helper.submit(request).success);
+  }
+  EXPECT_TRUE(commit(helper, 1, true).success);
+  EXPECT_EQ(1u, helper.durableSegmentCount());
+
+  auto* req = LocalReq::create(helper.getSearchEngine());
+  req->topDocs("q").allQuery().fields({"id"}).limit(-1);
+  req->execute();
+  std::vector<std::string> ids;
+  for (const auto& doc : req->getDocs()) ids.push_back(std::get<std::string>(*find(doc, "id")));
+  req->done();
+  return ids;
+}
+
+TEST_F(ForceMergeTest, indexSortOrdersMergeSourcesByFieldMinimum) {
+  EXPECT_EQ(vecs("b0", "b1", "a0", "a1", "n0", "n1", "c0", "c1"), mergedOrder(false));
+  EXPECT_EQ(vecs("a0", "a1", "b0", "b1", "c0", "c1", "n0", "n1"), mergedOrder(true));
+}
+
 } // namespace luxir::test
