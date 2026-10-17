@@ -147,6 +147,7 @@ protected:
     EXPECT_NE(CommitId::parse(a.commit).incarnation, CommitId::parse(b.commit).incarnation);
     EXPECT_EQ(CommitId::parse(a.commit).index_gen, CommitId::parse(b.commit).index_gen);
     a.commit = b.commit = {};
+    a.took_us = b.took_us = 0;
     std::string normalizedA, normalizedB;
     ASSERT_TRUE(api::write_json(a, normalizedA));
     ASSERT_TRUE(api::write_json(b, normalizedB));
@@ -1148,6 +1149,30 @@ TEST_F(HttpApiTest, malformedUpdateJsonIs400) {
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_update", "{not json");
   EXPECT_EQ(400, res.result_int());
   EXPECT_NE(res.body().find(R"("error")"), std::string::npos) << res.body();
+}
+
+TEST_F(HttpApiTest, responsesReportTook) {
+  auto update = httpRequestRaw(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"t1"},{"id":"t2"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find(R"("took_us":)"), std::string::npos) << update.body();
+
+  auto stream = httpRequestRaw(port(), http::verb::post, "/collections/main/_update",
+      "{\"id\":\"t3\"}\n{\"_end_\":{}}\n{\"id\":\"t4\"}\n{\"_end_\":{}}\n", "application/x-ndjson");
+  ASSERT_EQ(200, stream.result_int()) << stream.body();
+  auto acks = splitLines(stream.body());
+  ASSERT_EQ(2u, acks.size()) << stream.body();
+  for (const auto& ack : acks) EXPECT_NE(ack.find(R"("took_us":)"), std::string::npos) << ack;
+
+  // Only the final line of a batched search carries took_us.
+  auto search = httpRequestRaw(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"all":true},"limit":-1,"batch_size":1,"fields":["id"]})");
+  ASSERT_EQ(200, search.result_int()) << search.body();
+  auto lines = splitLines(search.body());
+  ASSERT_GT(lines.size(), 1u) << search.body();
+  for (size_t i = 0; i < lines.size(); i++) {
+    EXPECT_EQ(i + 1 == lines.size(), lines[i].find(R"("took_us":)") != std::string::npos) << lines[i];
+  }
 }
 
 TEST_F(HttpApiTest, updateResponseUsesSnakeCase) {

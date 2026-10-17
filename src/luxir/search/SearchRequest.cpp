@@ -12,12 +12,14 @@
 namespace luxir {
 
 SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
-                             google::protobuf::Arena& arena)
+                             google::protobuf::Arena& arena,
+                             RequestClock::time_point startTime)
     : engine(engine), searchConfig(engine.searchConfig()),
       memoryTracker(forcedRequestMemoryMaxBytes != 0
                         ? forcedRequestMemoryMaxBytes
                         : searchConfig.request_memory_max_bytes),
       proto(proto), arena(arena), dateMathNowEpochMillis(currentEpochMillis()),
+      startTime(startTime),
       timeZone(resolveTimeZone(proto.time_zone)) {
   if (!timeZone) timeZoneError = timeZoneResolutionError(proto.time_zone);
 }
@@ -51,6 +53,9 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
     }
   }
   if (send) {
+    // The only clock read at the end of a request: no other thread touches
+    // lastResponse once finalSent is decided.
+    lastResponse->proto.took_us = elapsedMicros(startTime);
     reply(*lastResponse);  // may delete *this*; nothing after this call
   }
 }

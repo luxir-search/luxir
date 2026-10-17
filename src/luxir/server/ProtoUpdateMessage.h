@@ -29,7 +29,7 @@ public:
 private:
   // response is created on-demand.
   std::unique_ptr<ResponseProto> ownedResponse;
-  ResponseProto* response;
+  ResponseProto* response = nullptr;
   // The response is NON-OWNING; its message data (request_id, error strings, ids) and the
   // variable-count errors/ids arrays are backed by this monotonic arena. Update processing
   // for one message is single-threaded, so a plain monotonic resource suffices.
@@ -55,14 +55,12 @@ public:
   // target it rather than re-resolving req->collection.
   CollectionId target;
   const int64_t dateMathNowEpochMillis;
+  // When the transport received the request; the transport stamps took_us
+  // from it (carried by Completion) just before serializing the response.
+  const RequestClock::time_point startTime;
 
-  ProtoUpdateMessage(const RequestProto* req, ResponseProto* rsp=nullptr)
-    : response(rsp), req(req), dateMathNowEpochMillis(currentEpochMillis()) {
-    if (response != nullptr) {
-      // A caller-supplied response (unary path) gets the same initialization an
-      // on-demand one gets in getResponse().
-      initResponse(response);
-    }
+  explicit ProtoUpdateMessage(const RequestProto* req, RequestClock::time_point startTime = RequestClock::now())
+    : req(req), dateMathNowEpochMillis(currentEpochMillis()), startTime(startTime) {
     if (req->commit.has_value()) {
       commit = COMMIT;
       const auto& params = *req->commit;
@@ -121,6 +119,7 @@ public:
     ResponseProto response;
     std::optional<CommitId> commit;
     std::optional<CommitWaits::ReplicaWait> wait;
+    RequestClock::time_point startTime;
     void await(LuxirNode& node, std::function<void(std::shared_ptr<Completion>)> delivery, std::stop_token stop = {});
   };
   std::shared_ptr<Completion> takeCompletion(LuxirNode& node);

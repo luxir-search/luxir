@@ -108,6 +108,7 @@ defaults and constraints are described in the comments and guides.
 - [`FieldDef`](#message-luxir.fielddef)
 - [`FieldDefaults`](#message-luxir.fielddefaults)
 - [`FieldFacet`](#message-luxir.fieldfacet)
+- [`FieldMetadataStats`](#message-luxir.fieldmetadatastats)
 - [`FieldVariants`](#message-luxir.fieldvariants)
 - [`Filter`](#message-luxir.filter)
 - [`FollowerStatus`](#message-luxir.followerstatus)
@@ -880,6 +881,26 @@ Buckets of distinct field values, using the field's value binding. STRING/ID sup
 | <a id="field-luxir.fieldfacet.count_unit"></a>[`count_unit`](#field-luxir.fieldfacet.count_unit) | 9 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Unset inherits a parent facet's measure, or counts groups beneath a collapsed list; entering group ops defaults to docs. Explicit GROUPS uses the nearest enclosing collapse, including inside a group. Controls count, count order, mincount, and missing; metrics still fold documents. |
 | <a id="field-luxir.fieldfacet.count_distinct"></a>[`count_distinct`](#field-luxir.fieldfacet.count_distinct) | 10 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys per bucket, also usable without collapse. Same key types and missing policies as Collapse. Conflicting measures are errors. |
 
+<a id="message-luxir.fieldmetadatastats"></a>
+
+### luxir.FieldMetadataStats
+
+Cached field metadata payload, excluding allocator overhead and unused hash-table capacity.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.fieldmetadatastats.bytes"></a>[`bytes`](#field-luxir.fieldmetadatastats.bytes) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.directories"></a>[`directories`](#field-luxir.fieldmetadatastats.directories) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.directory_bytes"></a>[`directory_bytes`](#field-luxir.fieldmetadatastats.directory_bytes) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.pages"></a>[`pages`](#field-luxir.fieldmetadatastats.pages) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.page_bytes"></a>[`page_bytes`](#field-luxir.fieldmetadatastats.page_bytes) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.entries"></a>[`entries`](#field-luxir.fieldmetadatastats.entries) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.entry_bytes"></a>[`entry_bytes`](#field-luxir.fieldmetadatastats.entry_bytes) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.names"></a>[`names`](#field-luxir.fieldmetadatastats.names) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.name_bytes"></a>[`name_bytes`](#field-luxir.fieldmetadatastats.name_bytes) | 9 | `uint64` | singular |  |
+
 <a id="message-luxir.fieldvariants"></a>
 
 ### luxir.FieldVariants
@@ -1203,6 +1224,7 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.indexing_budget"></a>[`indexing_budget`](#field-luxir.memorystats.indexing_budget) | 1 | [`IndexRamStats`](#message-luxir.indexramstats) | singular |  |
 | <a id="field-luxir.memorystats.storage_ram"></a>[`storage_ram`](#field-luxir.memorystats.storage_ram) | 2 | [`StorageRamStats`](#message-luxir.storageramstats) | singular |  |
 | <a id="field-luxir.memorystats.jemalloc"></a>[`jemalloc`](#field-luxir.memorystats.jemalloc) | 3 | [`JemallocStats`](#message-luxir.jemallocstats) | singular | Present only when Luxir runs on jemalloc. |
+| <a id="field-luxir.memorystats.field_metadata"></a>[`field_metadata`](#field-luxir.memorystats.field_metadata) | 4 | [`FieldMetadataStats`](#message-luxir.fieldmetadatastats) | singular |  |
 
 <a id="message-luxir.multivector"></a>
 
@@ -1626,6 +1648,7 @@ Top-level response to a Search request
 | <a id="field-luxir.searchresponse.error"></a>[`error`](#field-luxir.searchresponse.error) | 3 | [`Error`](#message-luxir.error) | singular | Present on a failed request's final response; ops is then empty. A final error may follow earlier result batches. |
 | <a id="field-luxir.searchresponse.warnings"></a>[`warnings`](#field-luxir.searchresponse.warnings) | 4 | [`Warning`](#message-luxir.warning) | repeated | final response only, on success or failure |
 | <a id="field-luxir.searchresponse.profile"></a>[`profile`](#field-luxir.searchresponse.profile) | 5 | [`ExecutionProfile`](#message-luxir.executionprofile) | singular | final response only, when SearchRequest.profile is true |
+| <a id="field-luxir.searchresponse.took_us"></a>[`took_us`](#field-luxir.searchresponse.took_us) | 6 | `uint64` | singular | Server-side wall time in microseconds from receiving the complete request to sending its final response, including any min\_commit wait and earlier streamed batches. Final response only. |
 | <a id="field-luxir.searchresponse.more"></a>[`more`](#field-luxir.searchresponse.more) | 15 | `bool` | singular | if true, expect at least one more streaming response to the logical request. |
 
 <a id="message-luxir.segmentstats"></a>
@@ -1841,6 +1864,7 @@ The response to an update request. In streaming mode the server sends exactly on
 | <a id="field-luxir.updateresponse.commit"></a>[`commit`](#field-luxir.updateresponse.commit) | 8 | `string` | singular | Resulting snapshot identity; absent without a completed commit. Snapshot token: incarnation:index\_gen. |
 | <a id="field-luxir.updateresponse.replicas"></a>[`replicas`](#field-luxir.updateresponse.replicas) | 9 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
 | <a id="field-luxir.updateresponse.commits"></a>[`commits`](#field-luxir.updateresponse.commits) | 10 | map&lt;`string`, [`CollectionCommit`](#message-luxir.collectioncommit)&gt; | map | NDJSON URL EOF commit outcomes, including for a single collection. Any collection error sets the response status to ERROR and a top-level error; every admitted collection outcome is retained. HTTP status remains 200. |
+| <a id="field-luxir.updateresponse.took_us"></a>[`took_us`](#field-luxir.updateresponse.took_us) | 11 | `uint64` | singular | Server-side wall time in microseconds from receiving the complete request to sending this response, including any commit and replica wait. On an HTTP NDJSON stream each line counts from the stream's request headers. |
 
 <a id="message-luxir.updateresponse.docerror"></a>
 

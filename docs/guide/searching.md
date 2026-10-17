@@ -940,6 +940,12 @@ beside `ops` in the full form:
   target in the HTTP body.
 - `profile: true` returns an execution profile on the final response.
 
+Every final response carries `took_us`: the server-side wall time, in
+microseconds, from receiving the complete request to sending that response.
+It includes parsing, any `min_commit` wait, execution, and earlier streamed
+batches, but not network transfer. Responses with `more: true` omit it, as does
+the `format=docs` document stream, which has no envelope to carry it.
+
 Profiling is opt-in and request-wide, and operations adopt instrumentation
 independently; string field facets are the currently instrumented operation.
 Their profile contains one entry per executed segment:

@@ -280,6 +280,9 @@ struct HttpStreamUpdateState {
   HttpStreamGroup group;
   std::map<std::string, HttpStreamWriterTarget> writerCache;
   std::string tenant; // the stream's, fixed when it starts
+  // When the stream's request headers arrived; every response line's took_us
+  // is measured from here.
+  RequestClock::time_point startTime = RequestClock::now();
   std::unique_ptr<HttpStreamBatchState> batch;
   bool batchReady = false;
   std::map<std::uint64_t, std::shared_ptr<HttpStreamBatchState>> inFlightBatches;
@@ -350,8 +353,9 @@ public:
   bool outputCommitted = false;
 
   HttpSearchRequest(SearchEngine& engine, std::unique_ptr<HttpSearchRequestState> requestState,
-                    std::shared_ptr<HttpSession> s, google::protobuf::Arena& arena)
-    : SearchRequest(engine, requestState->proto, arena),
+                    std::shared_ptr<HttpSession> s, google::protobuf::Arena& arena,
+                    RequestClock::time_point startTime)
+    : SearchRequest(engine, requestState->proto, arena, startTime),
       requestState(std::move(requestState)),
       session(std::move(s)) {
     docFormatDefault = luxir::api::DocFormat::ROWS;
@@ -634,6 +638,8 @@ private:
   RouteMatch route_;
   UpdateUrlParams updateUrl_;
   bool pretty_ = false;  // fixed before submitting work for this request
+  // When the buffered request's body finished arriving: the start of its took_us.
+  RequestClock::time_point requestStart_;
 
   // Response flow control.  queuedBytes_ counts rendered bytes accepted from
   // producers but not yet written to the socket (earlyLines_ + pendingQ_ +
@@ -690,7 +696,7 @@ private:
                            std::shared_ptr<HttpStreamUpdateState> state,
                            std::uint64_t ordinal,
                            const std::shared_ptr<HttpStreamBatchState>& batch)
-      : ProtoUpdateMessage(req),
+      : ProtoUpdateMessage(req, state->startTime),  // no clock read per batch
         session_(std::move(session)),
         state_(std::move(state)),
         batch_(batch),
@@ -863,6 +869,7 @@ private:
   }
 
   void dispatchBufferedRequest() {
+    requestStart_ = RequestClock::now();
     http::request<http::string_body> req;
     req.base() = parser_->get().base();
     req.body() = std::move(bufferedBody_);
@@ -1624,7 +1631,7 @@ private:
 
     auto& engine = node_.getSearchEngine();
     auto* sreq = luxir::arenaCreate<HttpSearchRequest>(
-        *arena, engine, std::move(requestState), shared_from_this(), *arena);
+        *arena, engine, std::move(requestState), shared_from_this(), *arena, requestStart_);
     if (!sreq->proto.min_commit.empty()) {
       sreq->waitCancellation = waitCancellation;
     }
@@ -1683,8 +1690,9 @@ private:
       std::shared_ptr<HttpUpdateState> state;
       std::shared_ptr<ShardPin> pin;
     public:
-      Update(std::shared_ptr<HttpSession> session, std::shared_ptr<HttpUpdateState> state, std::shared_ptr<ShardPin> pin)
-          : ProtoUpdateMessage(&state->proto), session(std::move(session)), state(std::move(state)), pin(std::move(pin)) {}
+      Update(std::shared_ptr<HttpSession> session, std::shared_ptr<HttpUpdateState> state, std::shared_ptr<ShardPin> pin,
+             RequestClock::time_point startTime)
+          : ProtoUpdateMessage(&state->proto, startTime), session(std::move(session)), state(std::move(state)), pin(std::move(pin)) {}
       void done(IndexWriter&) override {
         auto completed = takeCompletion(session->node_);
         auto target = session;
@@ -1694,6 +1702,7 @@ private:
           net::post(target->stream_.get_executor(), [target, guard, result] {
             try {
               std::string out;
+              result->response.took_us = elapsedMicros(result->startTime);
               if (!api::write_json(result->response, out)) throw std::runtime_error("failed to serialize update response");
               target->respondJson(http::status::ok, std::move(out));
             } catch (...) { target->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
@@ -1703,7 +1712,7 @@ private:
     };
     try {
       if (state->proto.commit && state->proto.commit->wait_for_replicas) watchWaitDisconnect();
-      auto admission = std::make_unique<Update>(shared_from_this(), std::move(state), shardPin);
+      auto admission = std::make_unique<Update>(shared_from_this(), std::move(state), shardPin, requestStart_);
       auto* msg = admission.get();
       node_.getTaskArena().enqueue([self = shared_from_this(), msg, tenant = tenant_, shardPin] {
         try {
@@ -2699,6 +2708,7 @@ private:
     }
     resp.errors = errors.finish();
     resp.total_errors = (int64_t)interval.totalErrors;
+    resp.took_us = elapsedMicros(state.startTime);
 
     // Commit failures have the same in-band ERROR status as unary updates.
     // Keep every collection outcome, including durable tokens on failed waits.
@@ -3389,7 +3399,7 @@ private:
         public:
           Commit(std::shared_ptr<HttpUpdateState> request, std::shared_ptr<HttpSession> session,
                  std::shared_ptr<HttpStreamUpdateState> state, std::shared_ptr<UrlWriters> writers, size_t index)
-              : ProtoUpdateMessage(&request->proto), request(std::move(request)), session(std::move(session)),
+              : ProtoUpdateMessage(&request->proto, state->startTime), request(std::move(request)), session(std::move(session)),
                 state(std::move(state)), writers(std::move(writers)), index(index) {}
           void done(IndexWriter&) override {
             auto completed = takeCompletion(session->node_);

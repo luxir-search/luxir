@@ -289,6 +289,7 @@ std::shared_ptr<ProtoUpdateMessage::Completion> ProtoUpdateMessage::takeCompleti
   auto* copiedIds = api::build::allocArray(completed->response.ids, ids.size(), *mr_);
   std::copy(ids.begin(), ids.end(), copiedIds);
   completed->commit = resultingCommit;
+  completed->startTime = startTime;
   if (resultingCommit && req->commit && req->commit->wait_for_replicas && !result.errored()) {
     auto& waits = node.getCommitWaits();
     auto collection = target.name.empty() ? LuxirNode::target({}, req->collection) : target;

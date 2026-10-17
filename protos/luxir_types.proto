@@ -781,6 +781,10 @@ message SearchResponse {
   Error error = 3;
   repeated Warning warnings = 4; // final response only, on success or failure
   ExecutionProfile profile = 5; // final response only, when SearchRequest.profile is true
+  // Server-side wall time in microseconds from receiving the complete request
+  // to sending its final response, including any min_commit wait and earlier
+  // streamed batches. Final response only.
+  uint64 took_us = 6;
   bool more = 15;  // if true, expect at least one more streaming response to the logical request.
 }
 
@@ -1024,6 +1028,11 @@ message UpdateResponse {
   // Any collection error sets the response status to ERROR and a top-level error;
   // every admitted collection outcome is retained. HTTP status remains 200.
   map<string, CollectionCommit> commits = 10;
+
+  // Server-side wall time in microseconds from receiving the complete request
+  // to sending this response, including any commit and replica wait. On an
+  // HTTP NDJSON stream each line counts from the stream's request headers.
+  uint64 took_us = 11;
 }
 
 

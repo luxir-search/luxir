@@ -125,6 +125,8 @@ TEST_F(GrpcSearchTest, multiBatchStreaming) {
     responses++;
     EXPECT_FALSE(sawLast);  // nothing after the first response without more
     sawLast = !response.msg.more;
+    // took_us rides on the final response only.
+    EXPECT_EQ(sawLast, response.msg.took_us > 0);
     auto& rsp = *response.msg.ops.at("q");
     auto& docList = std::get<luxir::api::DocList>(rsp.kind);
     EXPECT_EQ(response.msg.more, docList.more);
