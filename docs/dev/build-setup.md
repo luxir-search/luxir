@@ -73,8 +73,9 @@ Build both native dependency variants:
 
 The script fetches pinned FastPFOR sources, checks the vcpkg revision, and installs
 the manifest sequentially with `x64-linux-luxir-native` and
-`x64-linux-luxir-native-asan`. It defaults to 12 dependency build jobs; override
-`VCPKG_MAX_CONCURRENCY` for the machine's memory budget. Both variants include
+`x64-linux-luxir-native-asan`. Dependency build jobs default to what the cores
+and memory allow (`tools/build-jobs`); `VCPKG_MAX_CONCURRENCY` overrides
+that. Both variants include
 Debug and Release libraries. ASan uses unsanitized host tools from the
 Release-only `x64-linux-luxir-native-host` triplet, avoiding duplicated normal
 Debug libraries in the ASan install. Normal native builds reuse their target
@@ -143,6 +144,48 @@ The presets are GCC-only. Clang presets existed but were never usable: FAISS and
 OpenMP are only set up in the GCC vcpkg roots, so configuring one failed at
 `find_package(OpenMP)`. Building for Clang means preparing a Clang vcpkg root
 with those dependencies first, then adding the preset back.
+
+## Parallelism and shared caches
+
+Configure sizes two limits from the machine with `tools/build-jobs`, which
+counts physical cores and memory, honoring cgroup CPU and memory limits:
+
+- `LUXIR_COMPILE_JOBS`: one compile per physical core, at most 16, and at most
+  one per 3 GB of memory (4 GB with ASan) left after the link reservation.
+- `LUXIR_LINK_JOBS`: at most two links, within a quarter of memory at 4 GB per
+  link (6 GB with ASan).
+
+Each limit is a Ninja pool, so a plain `cmake --build` needs no `-j`. Compiles
+and links also take one of that many machine-wide slots (lock files under
+`~/.cache/luxir/build-slots`, see `tools/build-slot`), so concurrent builds from
+other worktrees, presets, or the development container share the limits rather
+than each assuming the whole machine. A job waiting for a slot sleeps and uses no
+memory. Override the limits with `-DLUXIR_COMPILE_JOBS=N` and
+`-DLUXIR_LINK_JOBS=N` when configuring; set `-DLUXIR_BUILD_SLOT_DIR=` (empty) to
+limit a build only by its own pools.
+
+Shared state lives outside the checkout, so a new worktree reuses it:
+
+- Native vcpkg dependencies are installed once under `/opt/vcpkg`, with
+  vcpkg's default binary cache and downloads. vcpkg serializes installs that
+  share its root. The install directories follow the manifest of the most recent
+  `deps/make_deps.sh` run, so a branch that changes dependencies affects every
+  native worktree once it is installed.
+- ccache uses its normal cache directory. The launcher sets `CCACHE_BASEDIR` to
+  the checkout and maps the checkout to `.` in debug information, so worktrees at
+  different paths share objects. Debug information therefore names sources
+  relative to the checkout root: start GDB from the checkout root, or add it
+  with `directory`. `__FILE__` is relative too, so tests locate data through
+  `testDataPath()`, not their source path.
+- `LUXIR_CACHE_DIR` (default `~/.cache/luxir`, or `$XDG_CACHE_HOME/luxir`) holds
+  the build slots, the [ARM64](arm64-build.md) toolchain, vcpkg checkout,
+  downloads, and binary packages, and the development container's ccache.
+  Setup steps that write shared state take a lock, and vcpkg's binary cache
+  is keyed by package ABI, so concurrent builds and different branches do not
+  corrupt it.
+
+Build directories and per-build installs (such as `build/arm64-deps`) stay in
+each worktree.
 
 ## Fresh checkout / after `rm -rf build/`
 

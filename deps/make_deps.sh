@@ -34,15 +34,19 @@ export LUXIR_NATIVE_CPU=${native_cpu%% *}
 # ASan's separate host packages need only Release; normal builds reuse their
 # target packages for host tools. Only normal builds link jemalloc; ASan
 # supplies its own allocator.
-export VCPKG_MAX_CONCURRENCY=${VCPKG_MAX_CONCURRENCY:-12}
+# Dependency build jobs default to what the cores and memory allow
+# (tools/build-jobs); ASan compiles need more memory each.
+jobs=${VCPKG_MAX_CONCURRENCY:-}
 for variant in native native-asan; do
   host_triplet=x64-linux-luxir-native
   features=(--x-feature=jemalloc)
+  job_mb=2500
   if [[ $variant == native-asan ]]; then
     host_triplet=x64-linux-luxir-native-host
     features=()
+    job_mb=3500
   fi
-  "$vcpkg_root/vcpkg" install \
+  VCPKG_MAX_CONCURRENCY=${jobs:-$(../tools/build-jobs "$job_mb")} "$vcpkg_root/vcpkg" install \
     --x-manifest-root="$deps_dir" \
     --x-install-root="$vcpkg_root/installed-$variant" \
     --triplet="x64-linux-luxir-$variant" \

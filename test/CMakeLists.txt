@@ -120,6 +120,8 @@ set(LUXIR_TEST_DATA_DIR "${CMAKE_CURRENT_BINARY_DIR}/data")
 file(MAKE_DIRECTORY "${LUXIR_TEST_DATA_DIR}")
 set_property(SOURCE test/TestData.cpp APPEND PROPERTY COMPILE_DEFINITIONS
   "LUXIR_TEST_DATA_DIR=\"${LUXIR_TEST_DATA_DIR}\"")
+# In-repo fixtures are copied too: ccache's CCACHE_BASEDIR makes __FILE__ relative.
+configure_file(basic_tests/data/kstem_examples.txt "${LUXIR_TEST_DATA_DIR}/kstem_examples.txt" COPYONLY)
 download("${LUXIR_TEST_DATA_DIR}/book.txt" https://www.gutenberg.org/files/2600/2600-0.txt e4bcf9042609b62c7de72a6f1b311f54c412943a9d641b7efcf79a464b5f31c8)
 
 # Unicode 15.1.0 conformance files for AnalysisTest (must match uni-algo's
