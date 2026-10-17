@@ -652,11 +652,9 @@ private:
     std::optional<TermPolicy> fittedPolicy;
     if (kind == automaton::ByteDfaKind::NORMAL) {
       // Exact and prefix shapes see fitted terms correctly; a general pattern
-      // that can reach the fitted length may test hash or truncation bytes.
+      // may test hash or truncation bytes. Planning decides whether it can.
       TermPolicy policy = target.fieldType->longTerms;
-      if (policy != TermPolicy::REJECT && compiled.canAcceptLength(PackedTerm::MIN_FITTED_LEN)) {
-        fittedPolicy = policy;
-      }
+      if (policy != TermPolicy::REJECT) fittedPolicy = policy;
       commonPrefix = std::move(prefixAndState.first);
       auto state = prefixAndState.second;
       commonSuffix = compiled.commonSuffix();

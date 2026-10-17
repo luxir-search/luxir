@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <assert.h>
 #include <cstdint>
+#include <limits>
 #include <queue>
 #include <string>
 #include <string_view>
@@ -72,6 +73,35 @@ public:
   State start() const { return stateCount == 0 ? DEAD : 0; }
   bool canMatch(State state) const { return state != DEAD; }
   bool isMatch(State state) const { return state != DEAD && accepts[(size_t)state]; }
+
+  static constexpr int32_t UNBOUNDED = std::numeric_limits<int32_t>::max();
+
+  // Length of the longest accepted string: UNBOUNDED for an infinite
+  // language, -1 for an empty one. Built DFAs are trimmed (every state
+  // reachable and co-reachable), so any cycle lies on an accepting path, and
+  // an acyclic one has the start as its only state without predecessors.
+  int32_t maxAcceptedLength() const {
+    if (stateCount == 0) return -1;
+    std::vector<uint32_t> indegree(stateCount);
+    for (State state = 0; state < (State)stateCount; state++) {
+      for (const Range& range : transitions(state)) indegree[(size_t)range.dest]++;
+    }
+    if (indegree[0] != 0) return UNBOUNDED;
+    // Kahn order; longest[s] is the longest path from the start to s.
+    std::vector<int32_t> longest(stateCount);
+    std::vector<State> pending{0};
+    int32_t best = -1;
+    for (size_t i = 0; i < pending.size(); i++) {
+      State state = pending[i];
+      int32_t length = longest[(size_t)state];
+      if (accepts[(size_t)state]) best = std::max(best, length);
+      for (const Range& range : transitions(state)) {
+        longest[(size_t)range.dest] = std::max(longest[(size_t)range.dest], length + 1);
+        if (--indegree[(size_t)range.dest] == 0) pending.push_back(range.dest);
+      }
+    }
+    return pending.size() == stateCount ? best : UNBOUNDED;
+  }
 
   State step(State state, uint8_t byte) const {
     if (state == DEAD) return DEAD;
@@ -367,43 +397,7 @@ public:
     return reversed;
   }
   Kind classify(std::string* value = nullptr) const { return makeView().classify(value); }
-
-  // True when some accepted string is at least n bytes long. Built DFAs are
-  // trimmed (every state reachable and co-reachable), so any cycle accepts
-  // unboundedly long strings; otherwise compare the longest accepting path.
-  bool canAcceptLength(uint32_t n) const {
-    size_t count = accepts.size();
-    if (count == 0) return false;
-    ByteDfaView dfa = makeView();
-    std::vector<uint32_t> indegree(count);
-    for (State state = 0; state < (State)count; state++) {
-      for (const Range& range : dfa.transitions(state)) indegree[(size_t)range.dest]++;
-    }
-    // Kahn order; longest[s] is the longest path from the start to s.
-    std::vector<int64_t> longest(count, -1);
-    std::queue<State> pending;
-    for (State state = 0; state < (State)count; state++) {
-      if (indegree[(size_t)state] == 0) pending.push(state);
-    }
-    longest[0] = 0;
-    size_t removed = 0;
-    int64_t best = -1;
-    while (!pending.empty()) {
-      State state = pending.front();
-      pending.pop();
-      removed++;
-      int64_t length = longest[(size_t)state];
-      if (length >= 0 && accepts[(size_t)state]) best = std::max(best, length);
-      for (const Range& range : dfa.transitions(state)) {
-        if (length >= 0) {
-          longest[(size_t)range.dest] = std::max(longest[(size_t)range.dest], length + 1);
-        }
-        if (--indegree[(size_t)range.dest] == 0) pending.push(range.dest);
-      }
-    }
-    if (removed != count) return true;
-    return best >= (int64_t)n;
-  }
+  int32_t maxAcceptedLength() const { return makeView().maxAcceptedLength(); }
 };
 
 } // namespace luxir::automaton

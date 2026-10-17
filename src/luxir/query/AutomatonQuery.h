@@ -4,6 +4,7 @@
 #pragma once
 
 #include <format>
+#include <optional>
 #include <string_view>
 
 #include "MultiTermQuery.h"
@@ -34,9 +35,9 @@ private:
   automaton::ByteDfaKind classification;
   std::string_view exactOrPrefix;
   DfaScanPlan scanPlan;
-  // Set when the pattern can accept a term long enough to be a fitted (hashed
-  // or truncated) long value, whose discarded bytes it cannot see. Holds the
-  // field's policy for the warning text; nullopt means no warning applies.
+  // The field's long-term policy for a general pattern on a field that can
+  // hold fitted (hashed or truncated) long values, whose discarded bytes the
+  // pattern cannot see; nullopt means no warning applies.
   std::optional<TermPolicy> fittedPolicy;
 
 public:
@@ -91,22 +92,14 @@ public:
   const DfaScanPlan& getScanPlan() const { return scanPlan; }
 
 protected:
-  // Warn once per request and field when a segment holds possibly fitted terms.
+  // Warn once per request and field when a segment holds possibly fitted
+  // terms the pattern can reach. The reader's cached header flags rule out
+  // nearly every field before the DFA is walked.
   void validateLogicalImpl(PlanningContext& context, float multiplier) const override {
     checkedBoostProduct(multiplier, 1.0f);
     if (!fittedPolicy || context.warnings == nullptr) return;
-    bool found = false;
-    for (auto& segment : context.topReader.segments()) {
-      FieldReader reader(segment.postingsReader());
-      if (!reader.seek(field)) continue;
-      SegFieldInfo info;
-      reader.readFieldInfo(info);
-      if ((info.flags & FieldType::MAY_HAVE_FITTED) != 0) {
-        found = true;
-        break;
-      }
-    }
-    if (!found) return;
+    if ((context.topReader.field(field).flagsUnion() & FieldType::MAY_HAVE_FITTED) == 0) return;
+    if (dfa.maxAcceptedLength() < (int32_t)PackedTerm::MIN_FITTED_LEN) return;
     std::string message = std::format(
         "pattern on field {} may miss or falsely match values longer than {} bytes ({})",
         field, PackedTerm::MAX_LEN,

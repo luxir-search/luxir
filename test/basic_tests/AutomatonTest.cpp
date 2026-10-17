@@ -275,17 +275,17 @@ TEST(ByteDfaTest, TotalLiveTransitions) {
   EXPECT_FALSE(regex("[a-f0-9]{8,}"));
 }
 
-TEST(ByteDfaTest, CanAcceptLength) {
-  auto regex = [](std::string_view pattern, uint32_t n) {
+TEST(ByteDfaTest, MaxAcceptedLength) {
+  auto regex = [](std::string_view pattern) {
     Budget budget(10000000);
-    return compileRegex(pattern, budget).canAcceptLength(n);
+    return compileRegex(pattern, budget).maxAcceptedLength();
   };
 
-  EXPECT_TRUE(regex("a.*b", 252));
-  EXPECT_TRUE(regex("ab|c{3,5}", 5));
-  EXPECT_FALSE(regex("ab|c{3,5}", 6));
-  EXPECT_FALSE(regex("x?[a-z]{2}", 4));
-  EXPECT_TRUE(regex("x?[a-z]{2}", 3));
+  EXPECT_EQ(ByteDfaView::UNBOUNDED, regex("a.*b"));
+  EXPECT_EQ(ByteDfaView::UNBOUNDED, regex("(ab)+"));
+  EXPECT_EQ(5, regex("ab|c{3,5}"));
+  EXPECT_EQ(3, regex("x?[a-z]{2}"));
+  EXPECT_EQ(0, regex(""));
 }
 
 TEST(WildcardTest, errorsAreClean) {
