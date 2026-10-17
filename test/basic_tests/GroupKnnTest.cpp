@@ -211,15 +211,7 @@ TEST_F(GroupKnnTest, actualIvfAndFlatSegmentsStillFindDistinctGroups) {
     }
     helper.indexAll(docs, UpdateMessage::COMMIT);
   }
-  SearchOverridesGuard a(VectorIndexBuilder::ivfPqNList);
-  SearchOverridesGuard b(VectorIndexBuilder::ivfPqM);
-  SearchOverridesGuard c(VectorIndexBuilder::ivfPqBits);
-  SearchOverridesGuard d(VectorIndexBuilder::ivfPqMinTrainingVectors);
-  SearchOverridesGuard e(VectorIndexBuilder::ivfPqBuildThresholdScanCost);
-  SearchOverridesGuard f(VectorIndexBuilder::buildFaissIvfPqAuxIndexes);
-  VectorIndexBuilder::ivfPqNList = 4; VectorIndexBuilder::ivfPqM = 2;
-  VectorIndexBuilder::ivfPqBits = 2; VectorIndexBuilder::ivfPqMinTrainingVectors = 16;
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0; VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
+  IvfTestGuard ivf(IvfTestGuard::pq(4, 2, 2), 16);
   helper.commit({"vec.vec_vs"});
   // A later segment has no aux, and the same near group straddles all three.
   helper.indexAll({flatdoc("id", "flat", "key_s", "flat", "key_i", (int64_t)1000,
@@ -287,16 +279,7 @@ TEST_F(GroupKnnTest, identityIncludesResolvedKeyPolicyAndUnit) {
 }
 
 TEST_F(GroupKnnTest, annAdmissionPrecedesTheVectorCutForIpAndCosine) {
-  SearchOverridesGuard enabled(VectorIndexBuilder::buildFaissIvfPqAuxIndexes);
-  SearchOverridesGuard threshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost);
-  SearchOverridesGuard lists(VectorIndexBuilder::ivfPqNList);
-  SearchOverridesGuard m(VectorIndexBuilder::ivfPqM);
-  SearchOverridesGuard bits(VectorIndexBuilder::ivfPqBits);
-  SearchOverridesGuard training(VectorIndexBuilder::ivfPqMinTrainingVectors);
-  VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-  VectorIndexBuilder::ivfPqNList = 4; VectorIndexBuilder::ivfPqM = 2;
-  VectorIndexBuilder::ivfPqBits = 2; VectorIndexBuilder::ivfPqMinTrainingVectors = 16;
+  IvfTestGuard ivf(IvfTestGuard::pq(4, 2, 2), 16);
   for (auto metric : {api::VectorMetric::IP, api::VectorMetric::COSINE}) {
     std::string name = "group_metric_" + std::to_string((int)metric);
     CollectionHelper helper(name);
@@ -378,16 +361,7 @@ TEST_F(GroupKnnTest, approximateMemberCapRecoversExactRepresentative) {
     helper.index(flatdoc("id", std::to_string(group * 2 + member), "key_s", "g" + std::to_string(group),
         "vec_vs", std::vector<std::vector<float>>{{(float)group + (float)member * 0.1f, 0, 0, 0}}));
   }
-  SearchOverridesGuard enabled(VectorIndexBuilder::buildFaissIvfPqAuxIndexes);
-  SearchOverridesGuard threshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost);
-  SearchOverridesGuard lists(VectorIndexBuilder::ivfPqNList);
-  SearchOverridesGuard bits(VectorIndexBuilder::ivfPqBits);
-  SearchOverridesGuard training(VectorIndexBuilder::ivfPqMinTrainingVectors);
-  VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-  VectorIndexBuilder::ivfPqNList = 2;
-  VectorIndexBuilder::ivfPqBits = 1;
-  VectorIndexBuilder::ivfPqMinTrainingVectors = 8;
+  IvfTestGuard ivf(IvfTestGuard::pq(2, 0, 1), 8);
   helper.commit({"vec.vec_vs"});
   auto truth = rows(*run("main", R"("limit":-1,"collapse":"key_s","query":)" + knn(3, true)));
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
