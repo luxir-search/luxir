@@ -27,6 +27,7 @@
 #include <numeric>
 #include <ranges>
 #include <span>
+#include <variant>
 #include <vector>
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -692,6 +693,7 @@ struct ReturnField {
   bool rows;
   IndexReader::FieldSegments infos;
   IndexReader::FieldSegments storedInfos;
+  bool discovered = false;  // from an empty or wildcard selector (see discoveredAsColumns)
 };
 
 inline void resolveReturnFieldMetadata(IndexReader& reader, std::span<ReturnField> fields) {
@@ -1093,6 +1095,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     // missing_val and fill its missing slots.  (ROWS mode relies on the
     // exact sentinels for its presence checks.)
     finishPendingCols(pendingCols);
+    dropAbsentDiscovered(fields, docListProto.columns);
 
     // Scores bypass the scratch column: every doc has one, and a direct
     // write avoids the all-present column's sentinel ambiguity (a real
@@ -1168,18 +1171,20 @@ inline bool globMatch(std::string_view pattern, std::string_view name) {
 // repeat would re-emplace the same output Column and orphan the earlier
 // stored-field target).  Discovered entries are marked rows=true - the
 // response's column set is a property of the request, never of what the index
-// holds.  The plan is allocated from the protobuf request arena: emission
+// holds - unless discoveredAsColumns opts them into dense columns, whose set
+// then follows each batch's documents (see dropAbsentDiscovered).  The plan is allocated from the protobuf request arena: emission
 // starts on task-group threads and concurrent ops must not race (protobuf
 // Arena allocation is thread-safe; the request MemPool is not).  The names
 // are reader-catalog or request-proto views; generated read names are copied
 // into the request arena. The reader and schema are pinned for the request.
 inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
-                                                  std::span<const std::string_view> fields) {
+                                                  std::span<const std::string_view> fields,
+                                                  bool discoveredAsColumns) {
   auto isPattern = [](std::string_view f) { return f.find('*') != std::string_view::npos; };
   ArenaResource mr(&req.arena);
   std::vector<ReturnField> picked;
   auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
-    picked.push_back({field.name, field.name, field.type, true});
+    picked.push_back({field.name, field.name, field.type, !discoveredAsColumns, {}, {}, true});
   };
   auto pushExplicit = [&](std::string_view f) {
     for (auto& rf : picked) {
@@ -1247,6 +1252,54 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
   return {out, picked.size()};
 }
 
+// True when no slot of a finished column holds a value: single-valued columns
+// are filled with a missing_val chosen absent from the present values, so all
+// slots equal to it means none was present; multi-valued columns signal
+// missing with an empty array.  Other arms (vectors) are never dropped.
+inline bool columnAllMissing(const luxir::api::Column& col) {
+  using namespace luxir::api;
+  auto none = [](const auto& v, const auto& missing) {
+    return std::ranges::all_of(v, [&](const auto& x) { return x == missing; });
+  };
+  auto allEmpty = [](const auto& rows) {
+    return std::ranges::all_of(rows, [](const auto& r) { return r.v.empty(); });
+  };
+  return std::visit([&](const auto& c) -> bool {
+    using T = std::decay_t<decltype(c)>;
+    if constexpr (std::is_same_v<T, ColStr> || std::is_same_v<T, ColInt>
+                  || std::is_same_v<T, ColFloat> || std::is_same_v<T, ColDouble>) {
+      return none(c.v, c.missing_val);
+    } else if constexpr (std::is_same_v<T, ArrArrStr> || std::is_same_v<T, ArrArrInt>
+                         || std::is_same_v<T, ArrArrFloat> || std::is_same_v<T, ArrArrDouble>) {
+      return allEmpty(c.v);
+    } else {
+      return false;
+    }
+  }, col.kind);
+}
+
+// Remove the discovered columns that no document of the batch has a value
+// for, compacting the response column map in place.  Named columns keep their
+// always-present contract.  Call after finishPendingCols.
+inline void dropAbsentDiscovered(std::span<const ReturnField> fields,
+                                 luxir::api::map_view<std::string_view, luxir::api::Column>& columns) {
+  using Pair = std::pair<std::string_view, luxir::api::Column>;
+  if (columns.empty()) return;
+  boost::unordered_flat_set<std::string_view, PackedTermHash, PackedTermEqual> discovered;
+  for (const auto& rf : fields) {
+    if (rf.discovered && !rf.rows) discovered.insert(rf.outputKey);
+  }
+  if (discovered.empty()) return;
+  auto* arr = const_cast<Pair*>(columns.data());
+  size_t kept = 0;
+  for (size_t i = 0; i < columns.size(); i++) {
+    if (discovered.contains(arr[i].first) && columnAllMissing(arr[i].second)) continue;
+    if (kept != i) arr[kept] = std::move(arr[i]);
+    kept++;
+  }
+  columns = luxir::api::map_view<std::string_view, luxir::api::Column>(std::span<const Pair>(arr, kept));
+}
+
 // Entry point shared by TopDocsReq and FusionOp: creates a request-arena-owned
 // emitter and produces batches until done or paused.  See DocEmitter above for
 // the resumable-emission contract.
@@ -1263,6 +1316,7 @@ void emitDocsResponse(SearchRequest& req,
                       bool getNumber,
                       bool getScores,
                       luxir::api::DocFormat docFormat,
+                      bool discoveredAsColumns,
                       DocEmission emission,
                       DocBatchMetadata metadata = {})
 {
@@ -1284,9 +1338,10 @@ void emitDocsResponse(SearchRequest& req,
   // per field: explicitly requested -> dense columns, discovered -> docs[i]
   // (the column set is a property of the request, never of what the index
   // happens to hold) - except under ROWS format, where everything goes to
-  // rows.  _score_ (asked for by get_scores) always keeps the format's
+  // rows, and with discoveredAsColumns, where discovered fields become dense
+  // columns too and the ones absent from a batch are dropped from it.  _score_ (asked for by get_scores) always keeps the format's
   // placement - a column under columns format, beside any rows.
-  std::span<ReturnField> rfields = resolveReturnFields(req, fields);
+  std::span<ReturnField> rfields = resolveReturnFields(req, fields, discoveredAsColumns);
 
   // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
   // COLUMNS); an out-of-range wire value falls back to the default too.

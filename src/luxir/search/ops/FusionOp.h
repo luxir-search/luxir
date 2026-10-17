@@ -519,6 +519,7 @@ public:
         op.fusionProto.get_number,
         op.fusionProto.get_scores,
         op.fusionProto.document_format,
+        op.fusionProto.discovered_as_columns,
         emission);
     }
   };

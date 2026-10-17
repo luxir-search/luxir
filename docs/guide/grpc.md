@@ -28,6 +28,7 @@ The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 | [`luxir.Searcher/Search`](../reference/protobuf.md#method-luxir.searcher.search) | bidirectional stream | Several search requests per call, with one or more response batches per request. |
 | [`luxir.Admin/SetSchema`](../reference/protobuf.md#method-luxir.admin.setschema) | unary | Set named definitions or replace a collection schema. |
 | [`luxir.Admin/GetSchema`](../reference/protobuf.md#method-luxir.admin.getschema) | unary | Read a collection schema. |
+| [`luxir.Admin/ListFields`](../reference/protobuf.md#method-luxir.admin.listfields) | unary | List the retrievable fields of a collection, including dynamic fields the authored schema does not name. |
 | [`luxir.Admin/CreateCollection`](../reference/protobuf.md#method-luxir.admin.createcollection) | unary | Create a collection, optionally with a schema. |
 | [`luxir.Admin/DeleteCollection`](../reference/protobuf.md#method-luxir.admin.deletecollection) | unary | Delete a collection and its stored data. |
 | [`luxir.Admin/Stats`](../reference/protobuf.md#method-luxir.admin.stats) | unary | Read node-wide or collection index statistics. |
@@ -94,6 +95,28 @@ and its type-specific missing sentinel identifies absent values. `DocList.docs`
 contains per-row maps when row placement is requested or when a field is not
 placed in a dense column. A document row is the merge of `columns[i]` and
 `docs[i]`.
+
+### Discovered columns
+
+Fields returned by an empty or wildcard `fields` selector ("discovered"
+fields) are placed in `DocList.docs` by default. Set
+`TopDocs.discovered_as_columns` (or `Fusion.discovered_as_columns`) to return
+them as dense columns too, which decodes far faster in clients than a map of
+oneofs per document. Under this flag the column set is not fixed by the
+request:
+
+- A discovered column with no present value in a batch is omitted from that
+  batch. Explicitly named fields keep their always-present columns.
+- A column can be absent from one batch and present in the next, and its type
+  can differ between batches. Treat each batch's `columns` keys as
+  authoritative.
+- Fields with no column representation stay in `docs`; a field name never
+  appears in both.
+
+To list the fields a collection can return, call `Admin.ListFields`: it
+returns the engine's retrievable catalog, including fields created from
+dynamic-field templates, which `GetSchema` (the authored schema) leaves out.
+The list grows as new dynamic fields are indexed.
 
 ## Update streams
 

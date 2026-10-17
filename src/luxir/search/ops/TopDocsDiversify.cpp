@@ -58,6 +58,7 @@ void TopDocsReq::fillDiversifyResponse(CalcBase& calc, MergeableCollector& data)
         [docs](int64_t i) { return docs[i].score; }, collector.totalHits(),
         topDocsProto.fields, topDocsProto.batch_size, topDocsProto.offset,
         topDocsProto.get_number, topDocsProto.get_scores, topDocsProto.document_format,
+        topDocsProto.discovered_as_columns,
         calc.underBucketSlot() ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM);
   };
   if (data.useFieldSort) emit(*data.diverseFieldCollector);

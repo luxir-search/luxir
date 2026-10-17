@@ -1166,6 +1166,8 @@ struct from<JSON, luxir::api::TopDocs> {
             util::from_json<O>(value.batch_size, ctx, vit, vend);
           } else if (key == "document_format") {
             util::from_json<O>(value.document_format, ctx, vit, vend);
+          } else if (key == "discovered_as_columns") {
+            util::from_json<O>(value.discovered_as_columns, ctx, vit, vend);
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
@@ -1212,6 +1214,8 @@ struct from<JSON, luxir::api::Fusion> {
             util::from_json<O>(value.batch_size, ctx, vit, vend);
           } else if (key == "document_format") {
             util::from_json<O>(value.document_format, ctx, vit, vend);
+          } else if (key == "discovered_as_columns") {
+            util::from_json<O>(value.discovered_as_columns, ctx, vit, vend);
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
@@ -1459,6 +1463,8 @@ struct from<JSON, luxir::api::SearchRequest> {
             util::from_json<O>(shorthand().batch_size, ctx, vit, vend);
           } else if (key == "document_format") {
             util::from_json<O>(shorthand().document_format, ctx, vit, vend);
+          } else if (key == "discovered_as_columns") {
+            util::from_json<O>(shorthand().discovered_as_columns, ctx, vit, vend);
           } else if (key == "get_number") {
             util::from_json<O>(shorthand().get_number, ctx, vit, vend);
           } else if (key == "get_scores") {

@@ -3,6 +3,7 @@
 
 #include "luxir/search/ReaderManager.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/api/build.h"
 #include <glaze/glaze.hpp>
 
 namespace luxir {
@@ -47,6 +48,30 @@ std::string ReaderManager::resolvedSchema() {
   std::string json;
   if (glz::write_json(result, json)) throw std::runtime_error("Cannot serialize resolved schema");
   return json;
+}
+
+void ReaderManager::listFields(api::FieldsResponse& out, std::pmr::memory_resource& mr) {
+  auto reader = getReader();
+  auto catalog = reader->retrievableFields();
+  api::FieldInfo* items = nullptr;
+  if (!catalog.empty()) {
+    items = (api::FieldInfo*)mr.allocate(sizeof(api::FieldInfo) * catalog.size(), alignof(api::FieldInfo));
+  }
+  for (size_t i = 0; i < catalog.size(); i++) {
+    std::string_view type;
+    switch (catalog[i].type->type()) {
+      case FieldType::TEXT: type = "text"; break;
+      case FieldType::STRING: type = "string"; break;
+      case FieldType::ID: type = "id"; break;
+      case FieldType::INT: type = "int"; break;
+      case FieldType::FLOAT: type = "float"; break;
+      case FieldType::DOUBLE: type = "double"; break;
+      case FieldType::DATE: type = "date"; break;
+      default: type = "other"; break;
+    }
+    new (&items[i]) api::FieldInfo{api::build::arenaStr(mr, catalog[i].name), type, catalog[i].derived};
+  }
+  out.fields = std::span<const api::FieldInfo>(items, catalog.size());
 }
 
 } // namespace luxir

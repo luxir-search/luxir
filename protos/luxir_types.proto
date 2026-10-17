@@ -85,8 +85,8 @@ message ExprOp {
 // (DocList.columns) vs per-document maps (DocList.docs).  DEFAULT resolves
 // per transport: HTTP/JSON -> ROWS, gRPC -> COLUMNS.  Under COLUMNS,
 // explicitly named fields are returned as dense columns while discovered
-// fields (empty or wildcard selectors) use docs; under ROWS everything is
-// returned in docs.
+// fields (empty or wildcard selectors) use docs, unless the request sets
+// discovered_as_columns; under ROWS everything is returned in docs.
 enum DocFormat {
   DEFAULT = 0;
   ROWS = 1;
@@ -138,9 +138,10 @@ message TopDocs {
 
   // Fields to return for each document.  Empty returns every retrievable field
   // (stored or column-backed; not vectors or engine fields such as _version_),
-  // discovered from the index and placed in per-document rows (DocList.docs).
+  // discovered from the index and placed in per-document rows (DocList.docs),
+  // or in dense columns when discovered_as_columns is set under COLUMNS.
   // A name containing '*' is a pattern expanded the same way: the matching
-  // retrievable fields, in rows; matching nothing is not an error.  Explicitly
+  // retrievable fields; matching nothing is not an error.  Explicitly
   // named fields win on collision and may name anything, vectors and engine
   // fields included.
   repeated string fields = 7;
@@ -156,13 +157,24 @@ message TopDocs {
   Collapse collapse = 11; // limit, offset and found count groups; found_docs counts eligible documents.
 
   map<string, SearchOp> ops = 15;  // sub-facets or search operations performed over docs that match this query.
+
+  // Under COLUMNS, also return discovered fields (empty or wildcard
+  // selectors) as dense columns rather than in docs. The column set then
+  // depends on the batch's documents, not only on the request: a discovered
+  // column with no present value in a batch is omitted from that batch, and
+  // a column's type can differ between batches. Readers must treat each
+  // batch's columns keys as authoritative. Fields with no column
+  // representation stay in docs. Explicitly named fields keep their
+  // always-present columns. Ignored under ROWS; rejected with
+  // response_format DOCS.
+  bool discovered_as_columns = 13;
 }
 
 // Hybrid-search fusion: run several source queries (each a full TopDocs spec)
 // and merge their results into a single ranked list.
 //
 // Per-source response-shape fields (`fields`, `batch_size`, `offset`,
-// `get_scores`, `get_number`, `document_format`) are ignored - Fusion controls
+// `get_scores`, `get_number`, `document_format`, `discovered_as_columns`) are ignored - Fusion controls
 // response shape at the top level. Per-source `ops` are rejected; put facets
 // and metrics in Fusion.ops.
 // Each source's `query`, `sort`, `limit`, and any per-source `filter` are used
@@ -200,6 +212,7 @@ message Fusion {
   repeated string fields = 7;   // as TopDocs.fields: empty returns every retrievable field, '*' patterns expand
   int32 batch_size = 8; // same batching rules as TopDocs.batch_size
   DocFormat document_format = 9;  // rows vs columns placement of returned fields (see DocFormat)
+  bool discovered_as_columns = 12; // as TopDocs.discovered_as_columns
 
   // Collapse the fused document list before paging. Source windows never refill.
   // found counts eligible groups; found_docs counts eligible fused documents.
@@ -814,7 +827,8 @@ message GroupTable {
 // A batch of returned documents.  Document i is the merge of columns row i
 // and docs[i]; all-columns (docs absent) and all-docs (columns empty) are
 // just the degenerate cases.  Which fields land where is a function of the
-// request (see DocFormat), never of the data.
+// request (see DocFormat), never of the data, except that with
+// discovered_as_columns the discovered columns present are per batch.
 message DocList {
   // Exact match count when get_number was requested. Counts groups with
   // collapse; otherwise Fusion counts source-union documents before paging.
@@ -1206,6 +1220,30 @@ message DeleteCollectionResponse {
 // /tenants/{tenant}/collections/_list.
 message ListCollectionsResponse {
   repeated string collections = 1;
+}
+
+// The fields a collection can return, as the engine sees them at query time:
+// the retrievable catalog of its current snapshot. Unlike the authored
+// schema (SchemaDef) it includes fields created from dynamic-field
+// templates, and it grows as new dynamic fields are indexed. These are the
+// names an empty or wildcard TopDocs.fields selector can return.
+message FieldsRequest {
+  string collection = 1; // empty selects the default collection, "main"
+  // Administration only: the owning tenant. Empty is the caller's tenant.
+  string tenant = 2;
+}
+
+message FieldInfo {
+  string name = 1;
+  // One of: text, string, id, int, float, double, date.
+  string type = 2;
+  // True for a derived representation of a logical field (named
+  // root__variant) rather than the logical field itself.
+  bool derived = 3;
+}
+
+message FieldsResponse {
+  repeated FieldInfo fields = 1; // sorted by name
 }
 
 // Tenants that own at least one collection, sorted. HTTP-only: GET /tenants.

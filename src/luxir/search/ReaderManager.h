@@ -98,6 +98,9 @@ public:
   // to it now; without one, readers reopen lazily on demand (local writers).
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   std::string resolvedSchema();
+  // The retrievable field catalog of the current reader, with names copied
+  // into mr (see api::FieldsResponse).
+  void listFields(api::FieldsResponse& out, std::pmr::memory_resource& mr);
   void close() noexcept { closed.store(true, std::memory_order_release); }
   // Quiescent tests only: clear the physical namespace and cache together.
   void testReset();

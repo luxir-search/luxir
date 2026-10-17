@@ -907,6 +907,26 @@ static void handleGetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   }
 }
 
+//   rpc ListFields(FieldsRequest) returns (FieldsResponse)  [unary]
+static void handleListFields(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  HppRequestState<luxir::api::FieldsRequest> request;
+  if (!parseRequest(readBuf, request, "ListFields")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "ListFields: malformed request"));
+    return;
+  }
+  try {
+    luxir::api::FieldsResponse response;
+    std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response
+
+    auto collection = call.server.getLuxirNode().getCollection(
+        LuxirNode::target(request.proto.tenant, request.proto.collection));
+    collection->getReaderManager().listFields(response, respArena);
+    call.respondRaw(serializeToByteBuffer(response), 1);
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
+}
+
 //   rpc Stats(StatsRequest) returns (StatsResponse)  [unary]
 static void handleStats(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto request = std::make_shared<HppRequestState<StatsReqProto>>();
@@ -972,6 +992,7 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/luxir.Indexer/UpdateStream",     {handleUpdate, true}},
     {"/luxir.Admin/SetSchema",          {handleSetSchema, true}},
     {"/luxir.Admin/GetSchema",          {handleGetSchema}},
+    {"/luxir.Admin/ListFields",         {handleListFields}},
     {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true}},
     {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true}},
     {"/luxir.Admin/Stats",              {handleStats}},

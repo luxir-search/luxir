@@ -124,7 +124,7 @@ public:
     CollapsedPageSettings settings{op, *op.collapse, *op.fusionProto.collapse, rankSort,
         op.headSort, op.groupOps, op.fusionProto.fields, op.fusionProto.batch_size,
         op.fusionProto.offset, op.fusionProto.get_number, op.fusionProto.get_scores,
-        op.fusionProto.document_format, enrich ? members.get() : nullptr,
+        op.fusionProto.document_format, op.fusionProto.discovered_as_columns, enrich ? members.get() : nullptr,
         fusedDomains, pageGroups, true};
     emitCollapsedPage(settings, *this, *groups);
   }

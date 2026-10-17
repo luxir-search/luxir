@@ -764,8 +764,12 @@ dynamic suffix fields appear under their concrete names), `id` first and the
 rest in name order. Vector fields and engine fields such as `_version_` are
 returned only when named. A `fields` entry containing `*` is a wildcard
 pattern (`"attr_*"`, `"*_s"`, `"t*s"`) that expands through the same
-discovery. Discovered fields are always placed in row documents, whatever
-`document_format` says; naming fields produces dense columns. A field both
+discovery. Discovered fields are placed in row documents, whatever
+`document_format` says, and naming fields produces dense columns. Set
+`discovered_as_columns: true` under `COLUMNS` (the gRPC default) to place
+discovered fields in dense columns too; see
+[columnar results](grpc.md#discovered-columns). It is rejected with
+`format=docs`. A field both
 named and matched by a pattern is
 returned once, in its explicit placement, so `"fields": ["id", "*"]` returns
 an `id` column beside rows of everything else. `_score_` is requested

@@ -1461,10 +1461,14 @@ private:
         // mode=replace_all must be typed.  PUT/PATCH are reserved.
         if (req.method() == http::verb::get) {
           const auto* view = findParam(params, "view");
-          if (view && *view != "authored" && *view != "resolved") {
+          if (view && *view != "authored" && *view != "resolved" && *view != "fields") {
             respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
-                "unknown schema view '" + *view + "' (valid: authored, resolved)"));
+                "unknown schema view '" + *view + "' (valid: authored, resolved, fields)"));
             return;
+          }
+          if (view && *view == "fields") {
+            handleFieldList(coll);
+            break;
           }
           handleSchemaGet(coll, view && *view == "resolved");
           break;
@@ -1576,6 +1580,9 @@ private:
         if (td->document_format == luxir::api::DocFormat::COLUMNS) {
           return "format=docs emits row documents; document_format COLUMNS conflicts";
         }
+        if (td->discovered_as_columns) {
+          return "format=docs emits row documents; discovered_as_columns conflicts";
+        }
       } else if (const auto* f = std::get_if<luxir::api::Fusion>(&op.kind)) {
         if (!f->ops.empty()) return "format=docs does not support nested ops";
         for (const auto& [srcName, src] : f->sources) {
@@ -1583,6 +1590,9 @@ private:
         }
         if (f->document_format == luxir::api::DocFormat::COLUMNS) {
           return "format=docs emits row documents; document_format COLUMNS conflicts";
+        }
+        if (f->discovered_as_columns) {
+          return "format=docs emits row documents; discovered_as_columns conflicts";
         }
       } else {
         return "format=docs requires top_docs or fusion ops";
@@ -1943,6 +1953,25 @@ private:
       auto collection = node_.getCollection(LuxirNode::target(tenant_, coll));
       auto schema = collection->getSchema();
       out = renderSchemaBody(*schema);
+    } catch (const std::exception& e) {
+      failure = classifyException(e, ErrorKind::INTERNAL);
+    }
+    if (failure) respondError(*failure);
+    else respondJson(http::status::ok, std::move(out));
+  }
+
+  // The retrievable field catalog, dynamic fields included (view=fields).
+  void handleFieldList(const std::string& coll) {
+    std::string out;
+    std::optional<ErrorInfo> failure;
+    try {
+      std::pmr::monotonic_buffer_resource arena;
+      luxir::api::FieldsResponse response;
+      auto collection = node_.getCollection(LuxirNode::target(tenant_, coll));
+      collection->getReaderManager().listFields(response, arena);
+      if (!luxir::api::write_json(response, out)) {
+        throw std::runtime_error("failed to serialize fields response");
+      }
     } catch (const std::exception& e) {
       failure = classifyException(e, ErrorKind::INTERNAL);
     }
