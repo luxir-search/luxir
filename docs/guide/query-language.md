@@ -170,7 +170,9 @@ most values need no escaping. Outside the exact-value forms above:
 Whitespace and parentheses are always structural; when a value contains
 them - or anything else you don't want the grammar to see - quote the whole
 value. Inside quotes, nothing is special except the closing quote and the
-three escapes above.
+three escapes above. Whitespace after `field:` is skipped, as in Lucene:
+`title_t: dune` is `title_t:dune`, but `title_t : dune` is not a field
+clause.
 
 Coming from Lucene or Solr: `?` and mid-word `*` are **not** wildcards in a
 term, and `/re/` is not a regex; all three are ordinary characters.

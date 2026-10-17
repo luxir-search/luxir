@@ -664,6 +664,22 @@ TEST_F(ExprParserTest, emptyAndTrailing) {
   expectContains(parseErr(":x"), "expected a field name before ':'");
 }
 
+TEST_F(ExprParserTest, whitespaceAfterFieldColon) {
+  // Lucene accepts whitespace between 'field:' and any value form
+  EXPECT_EQ("dune", matchVal(*parse("title:  dune")));
+  EXPECT_EQ("a phrase", asPhrase(*parse("title:  \"a phrase\"")).text);
+  EXPECT_EQ(2u, asBool(*parse("title: (dune OR messiah)")).optional.size());
+  EXPECT_EQ("5", valStr(asRange(*parse("count: [1 TO 5]")).lte));
+  EXPECT_EQ("10", valStr(asRange(*parse("count: >10")).gt));
+  EXPECT_EQ("title", asExists(*parse("title: *")).field);
+  EXPECT_EQ(2u, asBool(*parse("status: 200 AND title: dune")).required.size());
+
+  // nothing after the colon still errors; a space BEFORE it is not fielded
+  expectContains(parseErr("title:   "), "expected a value after 'title:'");
+  expectContains(parseErr("(title: )"), "expected a value after 'title:'");
+  expectContains(parseErr("title : dune"), "unfielded term 'title'");
+}
+
 TEST_F(ExprParserTest, unicodeAndBinarySafety) {
   // U+3000 is whitespace; other multi-byte sequences pass through opaquely
   const auto& b = asBool(*parse("title:a\xE3\x80\x80title:b"));

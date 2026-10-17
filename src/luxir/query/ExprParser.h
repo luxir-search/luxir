@@ -726,6 +726,7 @@ private:
   // ---- fielded value forms ----
 
   const api::Query* parseValueForm(const FieldScope& scope, std::string_view stops) {
+    cur.skipWs();  // field: value, as in Lucene
     auto field = scope.field;
     char c = cur.peek();
     size_t pos = cur.position();

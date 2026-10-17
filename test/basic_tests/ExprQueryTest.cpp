@@ -380,6 +380,14 @@ TEST_F(ExprQueryTest, fieldedTermAndPhrase) {
   EXPECT_EQ(2u, docs.size());
 }
 
+TEST_F(ExprQueryTest, whitespaceAfterFieldColon) {
+  auto docs = search("tag_s: scifi AND title_un:  \"blade runner\"");
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_TRUE(hasId(docs, "d1"));
+  EXPECT_EQ(2u, search("year_i: [1982 TO 1987]").size());
+  EXPECT_NE(std::string::npos, searchErr("tag_s: ").find("expected a value after 'tag_s:'"));
+}
+
 TEST_F(ExprQueryTest, booleanComposition) {
   auto docs = search("tag_s:scifi AND NOT title_un:blade");
   ASSERT_EQ(1u, docs.size());

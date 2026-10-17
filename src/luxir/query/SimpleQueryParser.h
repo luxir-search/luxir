@@ -536,6 +536,19 @@ private:
     return c == '(' || c == ')' || scan.wsLen() > 0;
   }
 
+  // At whitespace after a token that is exactly 'head:' (buf): skip the
+  // whitespace when a value follows and head names a field.  Nothing after
+  // the colon, or a group, leaves 'head:' as it would be without the space.
+  bool skipColonSpace() {
+    Cursor scan = cur;
+    while (scan.position() < end && scan.wsLen() > 0) scan.advance(scan.wsLen());
+    if (scan.position() >= end || scan.peek() == '(' || scan.peek() == ')') return false;
+    std::string_view head(buf.data(), buf.size() - 1);
+    if (!fieldFor(head, OpClass::SEARCH) && !fieldFor(head, OpClass::EXISTS)) return false;
+    cur.seek(scan.position());
+    return true;
+  }
+
   // Is the '~' at tildePos a clean trailing fuzzy operator: '~' then optional
   // ASCII digits then a token boundary (or end)?  If not - '~' with non-digit
   // junk after it, e.g. abc~2+d or abc~xyz - the '~' is a literal term byte,
@@ -916,7 +929,14 @@ private:
           cur.advance();
           continue;
         }
-        if (tokenFinished(cur)) break;
+        if (tokenFinished(cur)) {
+          // whitespace right after a field head's colon is skipped, as in
+          // Lucene (title: dune, status: "in stock"); a head that is not a
+          // known field keeps the boundary (re: your email)
+          if (!firstColon || *firstColon == 0 || *firstColon != buf.size() - 1
+              || cur.wsLen() == 0 || !skipColonSpace()) break;
+          continue;
+        }
         if (c == '"') {
           // A quote is special mid-token only right after the token's first
           // ':' - the fielded-value position (status:"in stock"; for a
