@@ -154,6 +154,82 @@ A multi-valued vector field (`multi: true`, or the `_vs` suffix) holds many
 vectors per document, such as one per passage or chunk. Search collapses them
 to one hit per document, scored by that document's best vector.
 
+### Truncate Matryoshka embeddings
+
+Some embedding models are trained with
+[Matryoshka Representation Learning](https://arxiv.org/abs/2205.13147) (MRL):
+the leading components of their output are themselves a usable, lower
+dimensional embedding. `truncate_dims` keeps only that prefix:
+
+```http
+POST /collections/books/_schema
+
+{
+  "fields": {
+    "summary_v": {
+      "type": "vector",
+      "dims": 1024,
+      "truncate_dims": 256,
+      "metric": "cosine"
+    }
+  }
+}
+```
+
+Clients send either the full model output or a vector already truncated to
+`truncate_dims` (for example with the provider's `dimensions` option), for
+documents and for kNN queries. Luxir cuts every vector to its first
+`truncate_dims` components before it is stored or searched, so index and
+query vectors are always truncated the same way. The column, approximate
+indexes and scoring all work on the shorter vector: 256 dimensions here store
+and scan a quarter of the bytes of 1024.
+
+- `dims` is the full input dimension and is required. `truncate_dims` is the
+  stored and searched dimension, and must be less than `dims`.
+- Every indexed and query vector must have exactly `dims` or exactly
+  `truncate_dims` components (`expected dims=1024 or truncate_dims=256, got
+  768`). Once truncated, vectors from different models have the same length,
+  so this check is what keeps another model's output out of the field.
+- `truncate_dims` requires `metric: cosine`. The prefix of a unit vector is
+  shorter than 1, and MRL models compare renormalized prefixes, so Luxir
+  renormalizes it. Cosine ignores length, so a full vector cut by Luxir and a
+  prefix renormalized by the provider score the same. `normalized: true` is
+  rejected, because the stored vectors are no longer the vectors the assertion
+  was about. `normalize_on_write: false` keeps the raw prefix and normalizes
+  at query time, as for any cosine field.
+- Reading the field back returns the stored (truncated and normalized)
+  vector, which can be sent back as input.
+- `truncate_dims: 0` turns off truncation inherited from a parent.
+- Changing `truncate_dims` changes the stored dimension, so existing
+  segments must be reindexed, as for a `dims` change.
+
+To compare sizes without reindexing, keep the full vector and add truncated
+[variants](schema.md#field-variants). Each one indexes the same input, and a
+query selects one by name, such as `summary_v__d256`:
+
+```json
+"summary_v": {
+  "type": "vector", "dims": 1024, "metric": "cosine",
+  "variants": {
+    "d256": { "type": "vector", "dims": 1024, "truncate_dims": 256, "metric": "cosine" }
+  }
+}
+```
+
+Use it only with models trained for it. Models that document MRL truncation
+include OpenAI `text-embedding-3-small` and `-large` (the `dimensions`
+parameter), Google `gemini-embedding-001`, Jina `jina-embeddings-v3`, Nomic
+`nomic-embed-text-v1.5`, and mixedbread `mxbai-embed-large-v1`. Check the
+model card for the dimensions it was trained to support. Truncating an
+embedding from a model *not* trained with MRL discards information the model
+spread across all of its dimensions, and recall drops sharply; this option
+does nothing to compensate.
+
+Some models prescribe extra steps around truncation. Nomic's reference code
+applies a layer norm to the full embedding before cutting it; Luxir does not
+do that, so send full vectors that already have any such pre-truncation step
+applied. Otherwise they will not match vectors the provider truncated.
+
 ## Index vectors
 
 A vector is a bare number array. A multi-valued field takes an array of

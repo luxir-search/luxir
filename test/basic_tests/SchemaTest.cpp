@@ -1558,7 +1558,7 @@ TEST_F(SchemaTest, variantShapeFamiliesAndVectorDimensions) {
     "g":{"type":"geo_point","multi":true,"variants":{"range":{"type":"geo_point","index":"range"}}}
   }})");
   EXPECT_EQ(LogicalField::Shape::VECTOR, s->resolveInput("v").owner->shape);
-  EXPECT_EQ(3, ((VectorFieldType*)s->physical("v__same"))->dims());
+  EXPECT_EQ(3, ((VectorFieldType*)s->physical("v__same"))->storedDims());
   EXPECT_TRUE(s->physical("v__l2")->multiValued());
   EXPECT_EQ(LogicalField::Shape::GEO, s->resolveInput("g").owner->shape);
   EXPECT_TRUE(s->physical("g__range")->rangeIndexed());

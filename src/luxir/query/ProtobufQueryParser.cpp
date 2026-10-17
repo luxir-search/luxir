@@ -257,10 +257,22 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
     throw std::runtime_error(std::format(
       "KnnQuery for field '{}' must have a non-empty query vector", field));
   }
-  if (vectorType.dims() > 0 && (int32_t)queryVec.size() != vectorType.dims()) {
+  // Clients send the full model output or its truncate_dims prefix; either is
+  // cut to the stored prefix here, so the query is scored exactly like the
+  // indexed vectors.  KnnQuery checks the prefix is finite; check the tail it
+  // never sees here.
+  if (std::string err = vectorType.inputDimsError(queryVec.size()); !err.empty()) {
     throw std::runtime_error(std::format(
-      "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
-      queryVec.size(), vectorType.dims(), field));
+      "KnnQuery: query vector for field '{}': {}", field, err));
+  }
+  if (vectorType.truncateDims() > 0) {
+    for (float value : queryVec.subspan((size_t)vectorType.truncateDims())) {
+      if (!std::isfinite(value)) {
+        throw std::runtime_error(std::format(
+          "KnnQuery: query vector for field '{}' must contain only finite values", field));
+      }
+    }
+    queryVec = queryVec.first((size_t)vectorType.truncateDims());
   }
 
   int32_t k = knnQuery.k;

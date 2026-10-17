@@ -25,9 +25,11 @@ namespace luxir::handler {
 /// StrColHandler. The column's existing fixed-size fast path captures
 /// per-segment dims automatically (mono2MetaOff = dims*4).
 ///
-/// dims_ tracks the vector size observed so far in this segment.  If the
-/// owning VectorFieldType declares a non-zero dims, it seeds dims_ and any
-/// mismatched input is rejected.  Otherwise dims are learned from input, but
+/// dims_ tracks the stored vector size observed so far in this segment.  If
+/// the owning VectorFieldType declares a non-zero dims, its stored dims seed
+/// dims_ and any mismatched input is rejected.  With truncate_dims, an input
+/// carries dims or truncate_dims components and is cut to its truncate_dims
+/// prefix before normalization and storage.  Otherwise dims are learned from input, but
 /// only committed to dims_ once a value is actually appended to the column:
 /// a doc that fails during validation (and is rolled back / marked deleted)
 /// must not constrain later docs, while an appended value makes the
@@ -35,6 +37,7 @@ namespace luxir::handler {
 class VectorHandler final : public StrColHandler {
   int32_t dims_ = 0;          // 0 until first value appended (or set from schema)
   int32_t pendingDims_ = 0;   // dims learned from the current value, not yet appended
+  int32_t truncateDims = 0;
   VectorFieldType::Metric metric = VectorFieldType::METRIC_NONE;
   bool trustNormalized = false;
   bool normalizeOnWrite = false;
@@ -49,7 +52,8 @@ public:
     // Caller (Inverter::createPhysicalHandler) only constructs us for VECTOR-typed
     // fields, which fromProto always builds as VectorFieldType.
     auto* vft = (VectorFieldType*)(fieldType.get());
-    dims_ = vft->dims_;
+    dims_ = vft->storedDims();
+    truncateDims = vft->truncateDims();
     metric = vft->metric_;
     trustNormalized = vft->normalized_;
     normalizeOnWrite = vft->normalizeOnWrite_;
@@ -118,25 +122,18 @@ private:
   }
 
   // Returns false for a zero / near-zero cosine vector. Otherwise validates
-  // dimensions and finiteness and applies write-time normalization in place.
-  bool validate(std::span<float> vec, int32_t ordinal) {
+  // finiteness and dimensions, narrows vec to the truncate_dims prefix, and
+  // applies write-time normalization in place.
+  bool validate(std::span<float>& vec, int32_t ordinal) {
     auto prefix = [&]() { return ordinal < 0 ? std::string() : fmt::format("vector {}: ", ordinal); };
     if (vec.empty()) {
       throw DocumentError(fmt::format(
           "field '{}': {}empty vector", std::string_view(fieldName), prefix()));
     }
-    int32_t n = (int32_t)vec.size();
-    int32_t expected = effectiveDims();
-    if (expected == 0) {
-      pendingDims_ = n;
-    } else if (n != expected) {
-      throw DocumentError(fmt::format(
-          "field '{}': {}expected dims={}, got {}",
-          std::string_view(fieldName), prefix(), expected, n));
-    }
     // Every element must be finite, whatever arm it arrived in (a double past
-    // float32 range has narrowed to inf). One branch-free pass over the exponent
-    // bits; only a failure goes back for the first bad index.
+    // float32 range has narrowed to inf), including a tail truncate_dims drops.
+    // One branch-free pass over the exponent bits; only a failure goes back for
+    // the first bad index.
     uint32_t nonFinite = 0;
     for (float x : vec) nonFinite |= (uint32_t)((std::bit_cast<uint32_t>(x) & 0x7f800000u) == 0x7f800000u);
     if (nonFinite) [[unlikely]] {
@@ -146,6 +143,23 @@ private:
                                           std::string_view(fieldName), prefix(), i));
         }
       }
+    }
+    if (truncateDims > 0) {
+      std::string err = ((const VectorFieldType&)*fieldType).inputDimsError(vec.size());
+      if (!err.empty()) {
+        throw DocumentError(fmt::format(
+            "field '{}': {}{}", std::string_view(fieldName), prefix(), err));
+      }
+      vec = vec.first((size_t)truncateDims);
+    }
+    int32_t n = (int32_t)vec.size();
+    int32_t expected = effectiveDims();
+    if (expected == 0) {
+      pendingDims_ = n;
+    } else if (n != expected) {
+      throw DocumentError(fmt::format(
+          "field '{}': {}expected dims={}, got {}",
+          std::string_view(fieldName), prefix(), expected, n));
     }
     if (metric == VectorFieldType::METRIC_COSINE && !trustNormalized) {
       // Finite elements: the double sum of squares cannot overflow.
