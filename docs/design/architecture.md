@@ -145,7 +145,9 @@ that does not ask for an exact total runs with block-max pruning: postings
 carry per-block score upper bounds, and a MaxScore-based scorer skips
 blocks and documents that cannot reach the current top k. A request that
 consumes an exact count runs exhaustively, because an exact count requires
-it. The choice is made per request from what the request asks for; there is
+it, unless the count is known without iterating: a match-all's live document
+count, postings metadata for an unfiltered term, or a cached membership set
+lets a field-sorted request keep its sort pruning. The choice is made per request from what the request asks for; there is
 no separate accuracy setting.
 
 Vector search composes the same way. A kNN query is just a query, with a
