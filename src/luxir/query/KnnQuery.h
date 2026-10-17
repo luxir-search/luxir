@@ -122,6 +122,9 @@ class KnnQuery final : public luxir::Query {
     return true;
   }
 
+  // Minimum similarity in the metric's own space (see similarityScoreFloor).
+  std::optional<float> similarity;
+
   void validateKnnLogical() const {
     if (!fieldType.knnSearchable()) {
       throw std::runtime_error(std::format(
@@ -411,11 +414,13 @@ public:
            std::span<const float> queryVec, int32_t k,
            int32_t nprobe = 0, int32_t refineCandidates = 0,
            float minScanFraction = 0.0f, bool exact = false,
-           const CollapsePlan* groups = nullptr)
+           const CollapsePlan* groups = nullptr,
+           std::optional<float> similarity = std::nullopt)
     : Query(QueryKind::KNN), field(field), fieldType(fieldType),
       queryVec(queryVec), k(k),
       nprobe(nprobe), refineCandidates(refineCandidates),
-      minScanFraction(minScanFraction), exact(exact), groups(groups) {}
+      minScanFraction(minScanFraction), exact(exact), groups(groups),
+      similarity(similarity) {}
 
   bool recoverableAsPredicate() const noexcept override { return false; }
 
@@ -426,7 +431,12 @@ public:
         && refineCandidates == rhs.refineCandidates
         && std::bit_cast<uint32_t>(minScanFraction)
             == std::bit_cast<uint32_t>(rhs.minScanFraction)
-        && exact == rhs.exact && queryVec.size() == rhs.queryVec.size()
+        && exact == rhs.exact
+        && similarity.has_value() == rhs.similarity.has_value()
+        && (!similarity.has_value()
+            || std::bit_cast<uint32_t>(*similarity)
+                == std::bit_cast<uint32_t>(*rhs.similarity))
+        && queryVec.size() == rhs.queryVec.size()
         && fieldType.dims() == rhs.fieldType.dims()
         && fieldType.metric() == rhs.fieldType.metric()
         && fieldType.normalized() == rhs.fieldType.normalized()
@@ -452,6 +462,9 @@ public:
         value = mixHash(value, (int32_t)component.type);
       }
     }
+    if (similarity.has_value()) {
+      value = mixHash(value, std::bit_cast<uint32_t>(*similarity));
+    }
     value = mixSampledSequence(
         value, std::as_bytes(queryVec),
         [](uint64_t seed, std::byte byte) {
@@ -471,6 +484,25 @@ public:
   int32_t getRefineCandidates() const noexcept { return refineCandidates; }
   float getMinScanFraction() const noexcept { return minScanFraction; }
   bool getExact() const noexcept { return exact; }
+  const std::optional<float>& getSimilarity() const noexcept {
+    return similarity;
+  }
+
+  /// The similarity threshold as a floor in score space, or -inf when unset.
+  /// L2 similarity is a maximum (non-squared) distance d, scored as
+  /// 1 / (1 + d^2); IP and COSINE scores are the similarity itself. The float
+  /// expression mirrors scoreFromDist, so a hit at exactly distance d keeps
+  /// its place.
+  float similarityScoreFloor() const noexcept {
+    if (!similarity.has_value()) {
+      return -std::numeric_limits<float>::infinity();
+    }
+    float value = *similarity;
+    if (fieldType.metric() == VectorFieldType::METRIC_L2) {
+      return 1.0f / (1.0f + value * value);
+    }
+    return value;
+  }
 
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
@@ -500,6 +532,10 @@ public:
         out.appendInt32((int32_t)component.type);
       }
     }
+    // Membership is score dependent, but only through the raw similarity
+    // (boost applies after the cut), so the threshold is a semantic key part.
+    out.appendBool(similarity.has_value());
+    if (similarity.has_value()) out.appendFloat(*similarity);
     // The mutable execution policies are resolved into the semantic key
     // directly. This is intentionally the MVP alternative to maintaining a
     // policy-generation counter: every value that can change candidate
@@ -1156,6 +1192,17 @@ public:
               "field '{}': returned {} of k={} groups; candidates_exhausted={}",
               query.field, docHits.size(), kDocs, candidatesExhausted));
         }
+      }
+
+      // The similarity threshold drops hits from the k nearest rather than
+      // reaching past them, so fewer than k docs may remain (Elasticsearch
+      // knn.similarity semantics). Scores are exact here: the refine pass
+      // (or an all-exact pool) produced them.
+      if (query.getSimilarity().has_value()) {
+        float floor = query.similarityScoreFloor();
+        std::erase_if(docHits, [floor](const DocHit& hit) {
+          return !(hit.score >= floor);
+        });
       }
 
       // Boost is applied only after the raw-similarity top-k cut, so it can

@@ -26,6 +26,7 @@
 #include "luxir/query/ParseContext.h"
 #include "luxir/query/Query.h"
 #include "luxir/query/RescoreQuery.h"
+#include "luxir/query/MinScoreQuery.h"
 #include "luxir/query/SimpleQueryParser.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/schema/Schema.h"
@@ -288,9 +289,24 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
   if (groups && context.collapse == nullptr) {
     throw std::runtime_error("knn.unit groups requires an enclosing collapse");
   }
+  std::optional<float> similarity = knnQuery.similarity;
+  if (similarity.has_value()) {
+    if (!std::isfinite(*similarity)) {
+      throw std::runtime_error(std::format(
+        "KnnQuery for field '{}' must have a finite similarity", field));
+    }
+    if (vectorType.metric() == VectorFieldType::METRIC_L2
+        && *similarity < 0.0f) {
+      throw std::runtime_error(std::format(
+        "KnnQuery for l2 field '{}' must have similarity >= 0 (a maximum distance), got {}",
+        field, *similarity));
+    }
+  }
+
   return pool.make<luxir::KnnQuery>(
     field, vectorType, queryVec, k, nprobe, knnQuery.refine_candidates,
-    minScanFraction, knnQuery.exact, groups ? context.collapse : nullptr);
+    minScanFraction, knnQuery.exact, groups ? context.collapse : nullptr,
+    similarity);
 }
 
 std::span<Query*> ProtobufQueryParser::parseQueryList(
@@ -459,16 +475,24 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
         "RescoreQuery expression must produce a scalar numeric value");
   }
 
+  if (rescoreQuery.min_score.has_value()
+      && !std::isfinite(*rescoreQuery.min_score)) {
+    throw std::runtime_error("RescoreQuery min_score must be finite");
+  }
   luxir::Query* child = parse(*rescoreQuery.query);
+  luxir::Query* rescored;
+  std::optional<float> constant;
   if (program->root().kind == ValueNodeKind::SCORE) {
-    return child;
+    rescored = child;
+  } else if (constant = constantOutput(*program);
+             constant.has_value()
+             && exactlyRepresented(*program->constantScalar, *constant)) {
+    rescored = pool.make<luxir::ConstantScoreQuery>(child, *constant);
+  } else {
+    rescored = pool.make<luxir::RescoreQuery>(child, program, constant);
   }
-  std::optional<float> constant = constantOutput(*program);
-  if (constant.has_value()
-      && exactlyRepresented(*program->constantScalar, *constant)) {
-    return pool.make<luxir::ConstantScoreQuery>(child, *constant);
-  }
-  return pool.make<luxir::RescoreQuery>(child, program, constant);
+  if (!rescoreQuery.min_score.has_value()) return rescored;
+  return pool.make<luxir::MinScoreQuery>(rescored, *rescoreQuery.min_score);
 }
 
 luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {

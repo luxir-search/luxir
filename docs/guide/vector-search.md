@@ -598,6 +598,7 @@ every index type.
 | `k` | Nearest documents or groups the query node produces. Required, positive. |
 | `unit` | `docs` (default) or `groups`; groups requires an enclosing collapse. |
 | `exact` | Require the true top-k. Uses the full-precision column scan and ignores overlays and the knobs below. |
+| `similarity` | Minimum similarity of a hit, in the metric's own space; see [Similarity threshold](#similarity-threshold). |
 | `refine_candidates` | Candidate documents collected before the full-precision rescore, in both units. Unset: sized from `k` (see below). Explicit: exactly that many, clamped up to `k`. |
 | `ivf.nprobe` | IVF effort, merge-stable (see below). `0` or absent: adaptive, may deepen automatically. |
 | `ivf.min_scan_fraction` | A floor on the fraction of live vector values scanned, in `[0,1]`; `0.001` means 0.1%. |
@@ -627,6 +628,29 @@ L2 scores are `1 / (1 + squared_distance)`. Inner product scores are the dot
 product. Cosine is inner product over normalized vectors. The score
 distribution depends on the embedding model and corpus, so calibrate
 thresholds per deployment.
+
+### Similarity threshold
+
+`similarity` drops the nearest neighbors that are not similar enough, with the
+semantics of Elasticsearch's `knn.similarity`. The value is in the metric's
+space, not the score's:
+
+| Metric | `similarity` means | Hit kept when |
+|---|---|---|
+| `l2` | Maximum L2 distance (not squared); must be `>= 0` | `distance <= similarity` |
+| `ip` | Minimum dot product | `dot >= similarity` |
+| `cosine` | Minimum cosine similarity | `cosine >= similarity` |
+
+```json
+{"query": {"knn": {"field": "embedding_v", "query": [0.75, 0.15, 0.10], "k": 20, "similarity": 0.8}}}
+```
+
+The threshold trims the `k` nearest documents after the full-precision
+rescore; it does not search past them, so a request can match fewer than `k`
+documents. The comparison uses each document's best vector, before any
+enclosing `boost`. Trimmed documents are not matches: they leave `found`,
+facets, and metrics as well as the returned list, on exact and approximate
+segments and in parallel execution alike.
 
 Cosine fields normalize on write by default (`normalize_on_write: true`), so
 reading the vector column back returns the unit vector rather than the bytes

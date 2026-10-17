@@ -25,6 +25,7 @@
 #include "luxir/query/AllQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
+#include "luxir/query/MinScoreQuery.h"
 #include "luxir/query/ProtobufQueryParser.h"
 #include "luxir/query/QueryBuilder.h"
 #include "luxir/query/QueryShape.h"
@@ -1586,6 +1587,17 @@ public:
     Query* query = topDocsReq.query.has_value()
       ? parser.parse(*topDocsReq.query)
       : req.requestPool.make<AllQuery>();
+    // A minimum score turns the query's score into part of its membership,
+    // so the cut-off wraps the query before filters fold in beside it: every
+    // ranking, count, and ops-domain route below then sees the same matches.
+    if (topDocsReq.min_score.has_value()) {
+      if (!std::isfinite(*topDocsReq.min_score)) {
+        throw std::runtime_error(
+            "top_docs '" + std::string(name) + "': min_score must be finite");
+      }
+      query = req.requestPool.make<MinScoreQuery>(
+          query, *topDocsReq.min_score);
+    }
     Query* domainQuery = query;
     int64_t offset = topDocsReq.offset;
     if (offset < 0) {
