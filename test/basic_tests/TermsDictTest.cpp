@@ -7,6 +7,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -22,8 +23,11 @@
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/schema/FieldType.h"
+#include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/TestIndex.h"
+#include "test/TestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -155,6 +159,8 @@ struct MetadataRunCodes {
   uint32_t posOff = 0;
   uint32_t termImpact = 0;
   uint32_t pulsed = 0;
+  uint32_t pulsedGaps = 0;
+  uint8_t pulsedMaskCode = 0;
 };
 
 int64_t expectedTtf(FieldType::flag_type flags, const RawTermSpec& term) {
@@ -300,18 +306,23 @@ MetadataRunCodes readFirstBlockMetadataRunCodes(PostingsReader& reader, const Se
   InputStream termsIS = reader.getInputStreamSeek(fieldInfo.termsLoc);
   int32_t nTerms = (int32_t)std::min<int64_t>(Postings::TERMS_BLOCK_SIZE,
                                                fieldInfo.nTerms);
+  MetadataRunCodes codes;
   termsIS.readPackedTerm();
   termsIS.readVlong();
-  termsIS.readVlong();
+  if (FieldType::hasPositions(fieldInfo.flags)) {
+    termsIS.readVlong();
+  }
   termsIS.readByte();
-  termsIS.skip((int64_t) sizeof(uint32_t));
+  codes.pulsedMaskCode = (uint8_t) termsIS.readByte();
+  if (codes.pulsedMaskCode == Postings::PULSED_MASK_EXPLICIT) {
+    termsIS.skip((int64_t) sizeof(uint32_t));
+  }
   uint32_t suffixBytesTotal = termsIS.readVint();
   termsIS.skip(nTerms);
   termsIS.skip(nTerms - 1);
   termsIS.skip(nTerms - 1);
   termsIS.skip(suffixBytesTotal);
 
-  MetadataRunCodes codes;
   codes.docsEnd = termsIS.readVint();
   codes.packedBlocks = termsIS.readVint();
   codes.df = termsIS.readVint();
@@ -326,6 +337,9 @@ MetadataRunCodes readFirstBlockMetadataRunCodes(PostingsReader& reader, const Se
     codes.termImpact = termsIS.readVint();
   }
   codes.pulsed = termsIS.readVint();
+  if (!FieldType::hasFreqs(fieldInfo.flags)) {
+    codes.pulsedGaps = termsIS.readVint();
+  }
   return codes;
 }
 
@@ -624,8 +638,11 @@ TEST_F(TermsDictTest, MixedMetadataRunsKeepNonUniformRowsExplicit) {
   SegFieldInfo fieldInfo;
   buildRawField(dir, pool, FieldType::INDEX_DOCS_FREQS_POSITIONS, terms, reader, fieldInfo);
 
+  // Every term has one doc, so every term pulses whatever its tf; the tf 2
+  // terms keep their positions in the positions stream.
   MetadataRunCodes codes = readFirstBlockMetadataRunCodes(*reader, fieldInfo);
-  EXPECT_NE(codes.docsEnd, 0u);
+  EXPECT_EQ(codes.pulsedMaskCode, Postings::PULSED_MASK_ALL);
+  EXPECT_EQ(codes.docsEnd, 0u);
   EXPECT_EQ(codes.packedBlocks, 0u);
   EXPECT_EQ(codes.df, 0u);
   EXPECT_NE(codes.ttfCode, 0u);
@@ -994,4 +1011,250 @@ TEST_F(TermsDictTest, MergedSegmentsRoundTripAllIndexLevels) {
     EXPECT_EQ(stats.df, 7);
     EXPECT_EQ(stats.ttf, expectedTtf);
   }
+}
+
+// Docs-only terms pulse up to PULSED_MAX_DOCS docs, with the docs after the
+// first stored as gaps in the dictionary; longer terms keep the docs stream.
+TEST_F(TermsDictTest, DocsOnlyTermsPulseUpToMaxDocs) {
+  std::vector<RawTermSpec> terms;
+  for (int32_t df = 1; df <= Postings::PULSED_MAX_DOCS + 2; df++) {
+    RawTermSpec term{"k" + std::to_string(df), {}};
+    int32_t doc = df;
+    for (int32_t i = 0; i < df; i++) {
+      term.docs.push_back({doc, 1});
+      doc += i % 3 == 0 ? 3 : i % 3 == 1 ? 300 : 70000;  // 1, 2 and 3 byte gaps
+    }
+    terms.push_back(std::move(term));
+  }
+  std::sort(terms.begin(), terms.end(),
+            [](const RawTermSpec& a, const RawTermSpec& b) { return a.name < b.name; });
+
+  RAMDir dir;
+  MemPool pool;
+  std::unique_ptr<PostingsReader> reader;
+  SegFieldInfo fieldInfo;
+  buildRawField(dir, pool, FieldType::INDEX_DOCS, terms, reader, fieldInfo);
+
+  MetadataRunCodes codes = readFirstBlockMetadataRunCodes(*reader, fieldInfo);
+  EXPECT_EQ(codes.pulsedMaskCode, Postings::PULSED_MASK_EXPLICIT);
+  EXPECT_NE(codes.docsEnd, 0u);
+  EXPECT_NE(codes.pulsedGaps, 0u);
+
+  TermsEnum tenum(pool, *reader, fieldInfo);
+  for (const RawTermSpec& term : terms) {
+    SCOPED_TRACE(term.name);
+    ASSERT_TRUE(tenum.nextTerm());
+    ASSERT_EQ((std::string_view) tenum.term(), term.name);
+    std::vector<int32_t> expected;
+    for (const RawDocSpec& doc : term.docs) expected.push_back(doc.docid);
+    auto state = tenum.postingsState();
+    EXPECT_EQ(state.docsStart == state.docsEnd,
+              (int32_t) expected.size() <= Postings::PULSED_MAX_DOCS);
+    EXPECT_EQ(DocsOnlyEnum::firstDocLowerBound(state), expected[0]);
+
+    DocsOnlyEnum docsEnum(state);
+    std::vector<int32_t> seen;
+    for (int32_t doc = docsEnum.nextDoc(); doc != DocsEnumMeta::END; doc = docsEnum.nextDoc()) {
+      seen.push_back(doc);
+    }
+    EXPECT_EQ(seen, expected);
+
+    // advance into the middle, then a bitset fill of the rest
+    docsEnum.reset();
+    int32_t middle = expected[expected.size() / 2];
+    EXPECT_EQ(docsEnum.advance(middle), middle);
+    std::vector<uint64_t> words(FixedBitSet::sizeInWords(1000000), 0);
+    docsEnum.intoBitSet(words, 0, 1000000);
+    FixedBitSet bits(words.data(), 1000000);
+    for (size_t i = 0; i < expected.size(); i++) {
+      EXPECT_EQ(bits.get(expected[i]), i >= expected.size() / 2) << expected[i];
+    }
+
+    DocsFreqEnum freqEnum(state);
+    seen.clear();
+    for (int32_t doc = freqEnum.nextDoc(); doc != DocsEnumMeta::END; doc = freqEnum.nextDoc()) {
+      EXPECT_EQ(freqEnum.termFreq(), 1);
+      seen.push_back(doc);
+    }
+    EXPECT_EQ(seen, expected);
+  }
+}
+
+// Single-doc terms pulse whatever their tf: the tf comes from ttf, and the
+// positions (here up to two positions blocks) stay in the positions stream.
+TEST_F(TermsDictTest, SingleDocTermsPulseWithAnyTf) {
+  std::vector<RawTermSpec> terms = {
+    {"t001", {{5, 1}}},
+    {"t002", {{9, 2}}},
+    {"t005", {{12, 5}}},
+    {"t200", {{40, 200}}},
+    {"two", {{3, 2}, {8, 1}}}
+  };
+  for (FieldType::flag_type flags : {
+           FieldType::INDEX_DOCS_FREQS,
+           FieldType::INDEX_DOCS_FREQS_POSITIONS}) {
+    SCOPED_TRACE(::testing::Message() << "flags=" << flags);
+    RAMDir dir;
+    MemPool pool;
+    std::unique_ptr<PostingsReader> reader;
+    SegFieldInfo fieldInfo;
+    buildRawField(dir, pool, flags, terms, reader, fieldInfo);
+    bool hasPositions = FieldType::hasPositions(flags);
+
+    TermsEnum tenum(pool, *reader, fieldInfo);
+    for (const RawTermSpec& term : terms) {
+      SCOPED_TRACE(term.name);
+      ASSERT_TRUE(tenum.nextTerm());
+      auto state = tenum.postingsState();
+      EXPECT_EQ(state.docsStart == state.docsEnd, term.docs.size() == 1);
+      if (hasPositions) {
+        std::vector<int32_t> norms;
+        std::vector<int32_t> tfs;
+        ASSERT_GT(tenum.readTermImpactFrontier(norms, tfs), 0);
+        int32_t maxTf = 0;
+        for (const RawDocSpec& doc : term.docs) maxTf = std::max(maxTf, doc.tf);
+        EXPECT_EQ(tfs.back(), maxTf);
+      }
+
+      DocsPosEnum docsEnum(state);
+      std::unique_ptr<PosEnum> posEnum;
+      if (hasPositions) posEnum = std::make_unique<PosEnum>(docsEnum);
+      for (const RawDocSpec& doc : term.docs) {
+        ASSERT_EQ(docsEnum.nextDoc(), doc.docid);
+        ASSERT_EQ(docsEnum.termFreq(), doc.tf);
+        if (hasPositions) {
+          // buildRawField writes positions 0, 2, 4, ...
+          posEnum->startPositions();
+          for (int32_t i = 0; i < doc.tf; i++) {
+            ASSERT_EQ(posEnum->nextPosition(), 2 * i);
+          }
+          EXPECT_EQ(posEnum->nextPosition(), PosEnum::END);
+        }
+      }
+      EXPECT_EQ(docsEnum.nextDoc(), DocsEnumMeta::END);
+    }
+  }
+}
+
+// A StreamVByte tail whose tfs are all 1 drops its freq run; the reader
+// restores tf 1 from ttfCode == 0, also behind full blocks that keep theirs.
+TEST_F(TermsDictTest, AllOnesTailOmitsFreqs) {
+  std::vector<RawTermSpec> terms = {
+    {"blocks_ones", {}}, {"tail_mixed", {}}, {"tail_ones", {}}
+  };
+  for (int32_t i = 0; i < 2 * Postings::DOCS_BLOCK_SIZE + 40; i++) {
+    terms[0].docs.push_back({i * 3, 1});
+  }
+  for (int32_t i = 0; i < 50; i++) {
+    terms[1].docs.push_back({i * 7, i == 49 ? 2 : 1});
+    terms[2].docs.push_back({i * 7, 1});
+  }
+
+  for (FieldType::flag_type flags : {
+           FieldType::INDEX_DOCS_FREQS,
+           FieldType::INDEX_DOCS_FREQS_POSITIONS}) {
+    SCOPED_TRACE(::testing::Message() << "flags=" << flags);
+    RAMDir dir;
+    MemPool pool;
+    std::unique_ptr<PostingsReader> reader;
+    SegFieldInfo fieldInfo;
+    buildRawField(dir, pool, flags, terms, reader, fieldInfo);
+
+    TermsEnum tenum(pool, *reader, fieldInfo);
+    int64_t tailBytes[3];
+    for (size_t t = 0; t < terms.size(); t++) {
+      const RawTermSpec& term = terms[t];
+      SCOPED_TRACE(term.name);
+      ASSERT_TRUE(tenum.nextTerm());
+      ASSERT_EQ((std::string_view) tenum.term(), term.name);
+      auto state = tenum.postingsState();
+      tailBytes[t] = state.docsEnd - state.docsStart;
+
+      DocsFreqEnum freqEnum(state);
+      for (const RawDocSpec& doc : term.docs) {
+        ASSERT_EQ(freqEnum.nextDoc(), doc.docid);
+        ASSERT_EQ(freqEnum.termFreq(), doc.tf);
+      }
+      EXPECT_EQ(freqEnum.nextDoc(), DocsEnumMeta::END);
+
+      DocsOnlyEnum docsEnum(state);
+      for (const RawDocSpec& doc : term.docs) {
+        ASSERT_EQ(docsEnum.nextDoc(), doc.docid);
+      }
+      EXPECT_EQ(docsEnum.nextDoc(), DocsEnumMeta::END);
+    }
+    // Same docs: the mixed tail pays a freq run (13 key bytes + 50 values).
+    EXPECT_GE(tailBytes[1], tailBytes[2] + 13 + 50);
+  }
+}
+
+// Low-df keyword terms through the whole engine: search before and after a
+// merge, with deletes applied to committed segments in between.  Each tag kN
+// holds N docs per segment, so per-segment and merged docFreqs cross
+// PULSED_MAX_DOCS in both directions.
+TEST_F(TermsDictTest, LowDfKeywordsSearchAcrossDeletesAndMerge) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  constexpr int32_t MAX_TAG = Postings::PULSED_MAX_DOCS + 3;
+  std::map<std::string, std::vector<std::string>> tagIds;
+  std::vector<std::string> deletes;
+  for (int32_t seg = 0; seg < 2; seg++) {
+    std::vector<Doc> docs;
+    for (int32_t tag = 1; tag <= MAX_TAG; tag++) {
+      for (int32_t i = 0; i < tag; i++) {
+        std::string id = "s" + std::to_string(seg) + "_k" + std::to_string(tag)
+            + "_" + std::to_string(i);
+        std::string tagName = "k" + std::to_string(tag);
+        docs.push_back(flatdoc("id", id, "tag_s", tagName,
+                               "body_w", i == 0 ? tagName + " " + tagName + " end" : "end"));
+        // Segment 0 loses two docs of every odd tag.
+        if (seg == 0 && tag % 2 == 1 && i < 2) {
+          deletes.push_back(id);
+        } else {
+          tagIds[tagName].push_back(id);
+        }
+      }
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteByIds(deletes, UpdateMessage::COMMIT).success);
+
+  auto search = [&](auto&& configure) {
+    auto request = localReq(helper.getSearchEngine());
+    configure(request->collection("main").topDocs("q").fields({"id"}).limit(-1));
+    request->execute();
+    std::vector<std::string> ids;
+    for (const auto& doc : request->getDocs()) {
+      ids.push_back(std::get<std::string>(*find(doc, "id")));
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+  };
+  auto verify = [&](std::string_view label) {
+    SCOPED_TRACE(label);
+    size_t live = 0;
+    for (auto& [tagName, ids] : tagIds) {
+      SCOPED_TRACE(tagName);
+      std::sort(ids.begin(), ids.end());
+      live += ids.size();
+      EXPECT_EQ(search([&](OpCursor& op) { op.matchQuery("tag_s", tagName); }), ids);
+      // the tf 2 single-doc text term, through a phrase over its positions
+      std::vector<std::string> phraseIds;
+      for (const auto& id : ids) {
+        if (id.substr(id.rfind('_')) == "_0") phraseIds.push_back(id);
+      }
+      EXPECT_EQ(search([&](OpCursor& op) {
+                  op.phraseText("body_w", tagName + " " + tagName + " end");
+                }), phraseIds);
+    }
+    EXPECT_EQ(search([&](OpCursor& op) { op.prefixQuery("tag_s", "k"); }).size(), live);
+  };
+
+  ASSERT_EQ(2u, helper.durableSegmentCount());
+  verify("segments");
+  CollectionHelper::UpdateBuilder merge;
+  merge.commit(true, 1);
+  ASSERT_TRUE(helper.submit(merge).success);
+  ASSERT_EQ(1u, helper.durableSegmentCount());
+  verify("merged");
 }

@@ -79,6 +79,7 @@ class TermsEnum {
   const char* posOffRun = nullptr;
   const char* termImpactRun = nullptr;
   const char* pulsedRun = nullptr;
+  const char* pulsedGapsRun = nullptr;
   uint32_t docsEndRunLen = 0;
   uint32_t packedBlocksRunLen = 0;
   uint32_t dfRunLen = 0;
@@ -86,6 +87,7 @@ class TermsEnum {
   uint32_t posOffRunLen = 0;
   uint32_t termImpactRunLen = 0;
   uint32_t pulsedRunLen = 0;
+  uint32_t pulsedGapsRunLen = 0;
 
   std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> docsEnds{};
   std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> packedBlockCounts{};
@@ -93,6 +95,8 @@ class TermsEnum {
   std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> ttfCodes{};
   std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> posOffsets{};
   std::array<uint32_t, Postings::TERMS_BLOCK_SIZE * 2> pulsedValues{};
+  // Byte offset of each pulsed term's doc gaps within pulsedGapsRun.
+  std::array<uint16_t, Postings::TERMS_BLOCK_SIZE> pulsedGapOffsets{};
   bool statsDecoded = false;
   bool postingsDecoded = false;
   bool metadataRunsParsed = false;
@@ -130,6 +134,12 @@ public:
   // Immutable state captured from a positioned TermsEnum.  It is sufficient
   // to construct independent DocsEnums without retaining this mutable enum or
   // seeking the term dictionary again.
+  //
+  // A pulsed term (docsStart == docsEnd, see Postings::pulses) has no docs
+  // stream: pulsedDoc is its first doc and docIS spans its remaining
+  // docFreq - 1 vint doc gaps in place in the term dictionary.  Its single
+  // position is pulsedPos when ttf == 1; otherwise its positions are read
+  // from posIS like any other term's.
   struct PostingsState {
     InputStream docIS;
     InputStream posIS;
@@ -264,7 +274,8 @@ public:
         PackedTerm first = input.readPackedTerm();
         blocks.push_back({std::string(first.data(), first.size()), 0, 0});
         docsOffsets[(size_t) i] = input.readVlong();
-        posOffsets[(size_t) i] = input.readVlong();
+        posOffsets[(size_t) i] =
+            FieldType::hasPositions(fieldInfo.flags) ? input.readVlong() : 0;
       }
 
       uint64_t precedingBytes = 0;
@@ -445,23 +456,29 @@ public:
     state.docsStart = locOfDocsForTermBlock + (int64_t) startOffset;
     state.docsEnd = locOfDocsForTermBlock + (int64_t) endOffset;
 
-    if (state.docsStart == state.docsEnd) {
+    bool pulsed = state.docsStart == state.docsEnd;
+    if (pulsed) {
       assert((pulsedMask & (1u << (uint32_t) ordInBlock)) != 0);
+      assert(Postings::pulses(state.hasFreqs, state.docFreq));
       uint32_t pulsedOrd = std::popcount(
           pulsedMask & ((1u << (uint32_t) ordInBlock) - 1));
       uint32_t valueIndex = pulsedOrd * (state.hasPositions ? 2u : 1u);
       state.pulsedDoc = (int32_t) pulsedValues[valueIndex];
-      if (state.hasPositions) {
+      if (state.hasPositions && state.totalTermFreq == 1) {
         state.pulsedPos = (int32_t) pulsedValues[valueIndex + 1];
+      }
+      if (state.docFreq > 1) {
+        const char* gaps = pulsedGapsRun + pulsedGapOffsets[(size_t) ordInBlock];
+        state.docIS = InputStream(gaps, pulsedGapsRun + pulsedGapsRunLen);
       }
     } else {
       state.docIS = postingsReader.getInputStream(rowDocsFile);
       state.docIS.seek(state.docsStart);
-      if (state.hasPositions) {
-        state.posStart = locOfPositionsForTermBlock + (int64_t) posOffsets[(size_t) ordInBlock];
-        state.posIS = postingsReader.getInputStream(rowPosFile);
-        state.posIS.seek(state.posStart);
-      }
+    }
+    if (state.hasPositions && !(pulsed && state.totalTermFreq == 1)) {
+      state.posStart = locOfPositionsForTermBlock + (int64_t) posOffsets[(size_t) ordInBlock];
+      state.posIS = postingsReader.getInputStream(rowPosFile);
+      state.posIS.seek(state.posStart);
     }
     return state;
   }
@@ -509,6 +526,7 @@ protected:
     posOffRunLen = FieldType::hasPositions(fieldInfo.flags) ? readMetadataRunLen(p, blockEnd) : 0;
     termImpactRunLen = hasTermImpacts() ? readMetadataRunLen(p, blockEnd) : 0;
     pulsedRunLen = readMetadataRunLen(p, blockEnd);
+    pulsedGapsRunLen = FieldType::hasFreqs(fieldInfo.flags) ? 0 : readMetadataRunLen(p, blockEnd);
 
     docsEndRun = p;
     p += docsEndRunLen;
@@ -542,6 +560,9 @@ protected:
     }
     pulsedRun = p;
     p += pulsedRunLen;
+    assert(p <= blockEnd);
+    pulsedGapsRun = p;
+    p += pulsedGapsRunLen;
     assert(p <= blockEnd);
     metadataRunsParsed = true;
   }
@@ -637,6 +658,24 @@ protected:
     uint32_t pulsedTerms = std::popcount(pulsedMask & validPulsedMask());
     uint32_t pulsedCount = pulsedTerms * (FieldType::hasPositions(fieldInfo.flags) ? 2u : 1u);
     decodeSVBRun(pulsedRun, pulsedRunLen, pulsedValues.data(), pulsedCount);
+
+    if (pulsedGapsRunLen != 0) {
+      // Locate each multi-doc pulsed term's gaps: a walk over at most
+      // TERMS_BLOCK_SIZE * (PULSED_MAX_DOCS - 1) vints, once per block.
+      decodeStats();
+      const char* p = pulsedGapsRun;
+      const char* end = pulsedGapsRun + pulsedGapsRunLen;
+      for (uint32_t i = 0; i < n; i++) {
+        if ((pulsedMask & (1u << i)) == 0) {
+          continue;
+        }
+        pulsedGapOffsets[i] = (uint16_t) (p - pulsedGapsRun);
+        for (uint32_t gap = 1; gap < docFreqs[i]; gap++) {
+          InputStream::readVint(p, end);
+        }
+      }
+      assert(p == end);
+    }
     postingsDecoded = true;
   }
 
@@ -792,10 +831,20 @@ protected:
     // see PostingsWriter.flushTerms
     startingTerm = termsIS.readPackedTerm();
     locOfDocsForTermBlock = rowDocsBase + (int64_t) termsIS.readVlong();
-    locOfPositionsForTermBlock = rowPosBase + (int64_t) termsIS.readVlong();
+    locOfPositionsForTermBlock = rowPosBase;
+    if (FieldType::hasPositions(fieldInfo.flags)) {
+      locOfPositionsForTermBlock += (int64_t) termsIS.readVlong();
+    }
     blockPrefixLen = (uint8_t) termsIS.readByte();
-    memcpy(&pulsedMask, termsIS.ptr(), sizeof(pulsedMask));
-    termsIS.skip(sizeof(pulsedMask));
+    uint8_t pulsedMaskCode = (uint8_t) termsIS.readByte();
+    if (pulsedMaskCode == Postings::PULSED_MASK_EXPLICIT) {
+      memcpy(&pulsedMask, termsIS.ptr(), sizeof(pulsedMask));
+      termsIS.skip(sizeof(pulsedMask));
+    } else {
+      assert(pulsedMaskCode == Postings::PULSED_MASK_NONE
+             || pulsedMaskCode == Postings::PULSED_MASK_ALL);
+      pulsedMask = pulsedMaskCode == Postings::PULSED_MASK_ALL ? validPulsedMask() : 0;
+    }
     suffixBytesTotal = termsIS.readVint();
 
     copyIntoTerm((char*) currTerm.ptr(), (const char*) startingTerm.ptr(), startingTerm.memorySize());

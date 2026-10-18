@@ -196,6 +196,26 @@ protected:
     return (numDocBlocks + L1_PERIOD - 1) / L1_PERIOD;
   }
 
+  // The StreamVByte tail block carries a freq run unless every tf is 1
+  // (ttf == docFreq; see PostingsWriter::endTerm).  Full blocks always do.
+  bool tailHasFreqs() const {
+    return hasFreqs && ttf != docfreq;
+  }
+
+  // Fill out[0, docfreq) with a pulsed term's docs: the first from the state,
+  // the rest from the vint gaps docIS spans in the term dictionary.
+  void decodePulsedDocs(const TermsEnum::PostingsState& state, int32_t* out) const {
+    assert(docsSize == 0);
+    assert(docfreq >= 1 && docfreq <= Postings::PULSED_MAX_DOCS);
+    assert(state.pulsedDoc >= 0);
+    out[0] = state.pulsedDoc;
+    const char* p = docIS.ptr();
+    const char* end = p + docIS.left();
+    for (int32_t i = 1; i < docfreq; i++) {
+      out[i] = out[i - 1] + (int32_t) InputStream::readVint(p, end);
+    }
+  }
+
   static uint32_t readVint15(const char*& pos, const char* end) {
     assert(pos + 2 <= end);
     uint16_t s = (uint16_t) (uint8_t) pos[0]
@@ -1228,7 +1248,7 @@ private:
     }
     if (docsSize == 0) {
       // Pulsed postings have no block header to re-anchor from; the dirty range
-      // is one doc, so materializing is still cheap.
+      // is a few docs at most, so materializing is still cheap.
       materializePendingPositionRepair();
       return;
     }
@@ -1247,15 +1267,17 @@ protected:
     docid = -1;
 
     if (docsSize == 0) {
-      // postings pulsed
-      assert(docfreq == 1);
+      // postings pulsed: fill the doc/freq buffers once; they are never
+      // overwritten since no block follows. A multi-doc pulsed term is
+      // docs-only, so its tfs are 1; a single-doc term's tf is its ttf.
+      // PosEnum initializes the pulsed position lazily.
       tfreq = 1;
-      assert(ttf == 1);
-      // Fill the doc/freq buffers. PosEnum initializes the pulsed position lazily.
-      docBuf[0] = state.pulsedDoc;
-      docBufEnd = 1;
-      tfreqBuf[0] = 1;
-      tfreqBufEnd = 1;
+      decodePulsedDocs(state, docBuf);
+      docBufEnd = docfreq;
+      assert(docfreq == 1 || ttf == docfreq);
+      std::fill_n(tfreqBuf, docfreq, 1);
+      tfreqBuf[0] = docfreq == 1 ? (int32_t) ttf : 1;
+      tfreqBufEnd = docfreq;
       cumulativeTermFreq = 0;  // this will be incremented in nextDoc()
 
     } else {
@@ -1286,7 +1308,7 @@ protected:
 
 public:
   // Reuse the inline decode buffers. Pulsed postings never decode another
-  // block, so their one immutable doc/frequency remains in those buffers.
+  // block, so their immutable docs/frequencies remain in those buffers.
   // Positions have a separate cursor and are not resettable yet.
   [[gnu::cold]] void reset() {
     assert(!positionTrackingEnabled);
@@ -1295,7 +1317,7 @@ public:
     posOrdStart = cumulativeTermFreq = 0;
     positionBatchActive = false;
     docOrd = docBufIdx = tfreqOrd = tfreqBufIdx = 0;
-    docBufEnd = tfreqBufEnd = docsSize == 0 ? 1 : 0;
+    docBufEnd = tfreqBufEnd = docsSize == 0 ? docfreq : 0;
     docid = -1;
     tfreq = docsSize == 0 ? 1 : -1;
     blockMode = docsOnlyConsumed = docBlockResident = scoredProbeActive = false;
@@ -1448,7 +1470,8 @@ private:
       }
     } else {
       // StreamVByte tail layout written by PostingsWriter::endTerm:
-      //   [docKeys][docData] followed, for fields with freqs, by [tfreqKeys][tfreqData].
+      //   [docKeys][docData] followed, for fields with freqs, by [tfreqKeys][tfreqData]
+      //   unless every tf is 1 (tailHasFreqs).
       // Docs are d1 decoded; freqs are plain StreamVByte values with no length
       // prefix, so even docs-only consumption decodes them. The AVX decoders
       // may read up to SVB_OVERREAD_PAD bytes past the encoded data, covered by
@@ -1458,7 +1481,11 @@ private:
       uint8_t* p = (uint8_t*) docIS.ptr();
       uint8_t* dataEnd = svb_decode_avx_d1_init((uint32_t*) docBuf, p, p + kb, n, base);
       if (hasFreqs) {
-        dataEnd = svb_decode_avx_simple((uint32_t*) tfreqBuf, dataEnd, dataEnd + kb, n);
+        if (tailHasFreqs()) {
+          dataEnd = svb_decode_avx_simple((uint32_t*) tfreqBuf, dataEnd, dataEnd + kb, n);
+        } else {
+          std::fill_n(tfreqBuf, n, 1);
+        }
         tfreqBufIdx = 0;
         tfreqBufEnd = leftToRead;
       }
@@ -3580,10 +3607,8 @@ public:
   explicit BasicDocsEnum(const TermsEnum::PostingsState& state)
       : DocsEnumMeta(state) {
     if (docsSize == 0) {
-      assert(docfreq == 1);
-      assert(ttf == 1);
-      db[0] = state.pulsedDoc;
-      docBufEnd = 1;
+      decodePulsedDocs(state, db);
+      docBufEnd = docfreq;
     } else {
       assert(docIS.offset() == startOfDocs);
     }
@@ -3600,7 +3625,7 @@ public:
     residentDocBase = residentBlockLast = 0;
     residentBlockStartOrd = residentNumWords = 0;
     docOrd = docBufIdx = nextL0Block = 0;
-    docBufEnd = docsSize == 0 ? 1 : 0;
+    docBufEnd = docsSize == 0 ? docfreq : 0;
     docid = -1;
     nextL0Base = 0;
     blockMode = docBlockResident = bodyReady = false;
@@ -3693,7 +3718,7 @@ public:
       uint8_t* p = (uint8_t*) docIS.ptr();
       uint8_t* dataEnd = svb_decode_avx_d1_init((uint32_t*) db, p, p + keyBytes,
                                                 n, base);
-      if (hasFreqs) {
+      if (tailHasFreqs()) {
         dataEnd += svbEncodedBytes(dataEnd, n);
       }
       docIS.skip(dataEnd - p);

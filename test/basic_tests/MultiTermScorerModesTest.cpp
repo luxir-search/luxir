@@ -275,10 +275,11 @@ ConstantTopKRun runPrefixDisjunctionTopK(
 }
 
 std::vector<int32_t> collectDocs(TestIndex& ti, ScorerMode mode,
-                                 DrivePattern pattern) {
+                                 DrivePattern pattern,
+                                 std::string_view field = "body_w") {
   ScorerModeGuard guard(mode);
   auto g = ti.pool.rewindScopeGuard();
-  PrefixQuery pq("body_w", "q");
+  PrefixQuery pq(field, "q");
   Query::Context ctx(ti.pool, *ti.reader);
   auto* weight = pq.createWeight(ctx, Query::NEED_SCORES | Query::ALLOW_PRUNING);
   auto* scorer = weight->createScorer(ti.pool, ctx.topReader.segments()[0]);
@@ -298,12 +299,12 @@ std::vector<int32_t> collectDocs(TestIndex& ti, ScorerMode mode,
   return docs;
 }
 
-void expectModeParity(TestIndex& ti) {
+void expectModeParity(TestIndex& ti, std::string_view field = "body_w") {
   for (const auto& pattern : kPatterns) {
-    auto eager = collectDocs(ti, ScorerMode::FORCE_EAGER, pattern);
-    EXPECT_EQ(eager, collectDocs(ti, ScorerMode::FORCE_WINDOWED, pattern))
+    auto eager = collectDocs(ti, ScorerMode::FORCE_EAGER, pattern, field);
+    EXPECT_EQ(eager, collectDocs(ti, ScorerMode::FORCE_WINDOWED, pattern, field))
         << "windowed, stride=" << pattern.stride;
-    EXPECT_EQ(eager, collectDocs(ti, ScorerMode::FORCE_HEAP, pattern))
+    EXPECT_EQ(eager, collectDocs(ti, ScorerMode::FORCE_HEAP, pattern, field))
         << "heap, stride=" << pattern.stride;
   }
 }
@@ -389,6 +390,44 @@ TEST_F(MultiTermScorerModesTest, pulsedSparseParity) {
   EXPECT_EQ(6000u, collectDocs(ti, ScorerMode::FORCE_EAGER, {0, 0}).size());
   expectModeParity(ti);
   expectSelectionAndEarlyExit(ti);
+}
+
+// Docs-only keyword terms with docFreq 1..PULSED_MAX_DOCS + 1, whose docs sit
+// thousands of docs apart: multi-doc pulsed terms span several union windows,
+// so the heap parks and re-advances them like docs-stream terms.
+TEST_F(MultiTermScorerModesTest, pulsedMultiDocKeywordParity) {
+  constexpr int32_t TERMS = 3000;
+  std::map<int32_t, std::string> docs;
+  int32_t total = 0;
+  for (int32_t i = 0; i < TERMS; i++) {
+    int32_t df = 1 + i % (Postings::PULSED_MAX_DOCS + 1);
+    for (int32_t k = 0; k < df; k++) {
+      docs[k * TERMS + i] = "q" + std::to_string(i);
+    }
+    total += df;
+  }
+  TestIndex ti;
+  TestField field(ti, "tag_s");
+  field.startIndexing();
+  for (auto& [doc, value] : docs) {
+    field.add(doc, value);
+  }
+  ti.flush();
+  field.startReading();
+
+  auto g = ti.pool.rewindScopeGuard();
+  TermsEnum te(g.pool(), field.currentSegment()->postingsReader(), field.fieldInfo);
+  int32_t multiDocPulsed = 0;
+  while (te.nextTerm()) {
+    auto state = te.postingsState();
+    bool pulsed = state.docsEnd == state.docsStart;
+    ASSERT_EQ(state.docFreq <= Postings::PULSED_MAX_DOCS, pulsed) << (std::string_view) te.term();
+    multiDocPulsed += pulsed && state.docFreq > 1;
+  }
+  EXPECT_GT(multiDocPulsed, 0);
+
+  EXPECT_EQ((size_t) total, collectDocs(ti, ScorerMode::FORCE_EAGER, {0, 0}, "tag_s").size());
+  expectModeParity(ti, "tag_s");
 }
 
 TEST_F(MultiTermScorerModesTest, mixedShapeParity) {
