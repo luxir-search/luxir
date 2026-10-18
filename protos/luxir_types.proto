@@ -1661,9 +1661,9 @@ message FieldDef {
     // (RANK_FEATURE). Weights must be positive and finite; they are stored as
     // term frequencies with 9 significant bits, truncated (at most 0.4%
     // low). Always index=MATCH, single-valued, no column, not stored.
-    SPARSE_VECTOR = 11; // learned sparse vector (SPLADE, ELSER tokens)
-    RANK_FEATURE = 12;  // one static ranking signal, e.g. pagerank
-    RANK_FEATURES = 13; // named ranking signals, e.g. topic scores
+    SPARSE_VECTOR = 14; // learned sparse vector (SPLADE, ELSER tokens)
+    RANK_FEATURES = 15; // named ranking signals, e.g. topic scores
+    RANK_FEATURE = 16;  // one static ranking signal, e.g. pagerank
   }
   optional FieldClass type = 2; // required unless inherited from parent
 

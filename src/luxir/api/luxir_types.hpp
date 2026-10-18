@@ -114,7 +114,7 @@ enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
 enum class FieldClass {
   STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9,
-  SPARSE_VECTOR = 11, RANK_FEATURE = 12, RANK_FEATURES = 13
+  SPARSE_VECTOR = 14, RANK_FEATURES = 15, RANK_FEATURE = 16
 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };

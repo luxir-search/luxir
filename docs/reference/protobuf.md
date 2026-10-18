@@ -2136,9 +2136,9 @@ Placement preference for returned document fields: dense columns (DocList.column
 | <a id="value-luxir.fielddef.fieldclass.vector"></a>[`VECTOR`](#value-luxir.fielddef.fieldclass.vector) | 7 | dense float vector |
 | <a id="value-luxir.fielddef.fieldclass.date"></a>[`DATE`](#value-luxir.fielddef.fieldclass.date) | 8 | timestamp, stored as int64 milliseconds since the Unix epoch |
 | <a id="value-luxir.fielddef.fieldclass.geo_point"></a>[`GEO_POINT`](#value-luxir.fielddef.fieldclass.geo_point) | 9 | latitude/longitude point |
-| <a id="value-luxir.fielddef.fieldclass.sparse_vector"></a>[`SPARSE_VECTOR`](#value-luxir.fielddef.fieldclass.sparse_vector) | 11 | Feature fields (Lucene FeatureField). A document value is a JSON object of feature name -&gt; weight (SPARSE\_VECTOR, RANK\_FEATURES) or one number (RANK\_FEATURE). Weights must be positive and finite; they are stored as term frequencies with 9 significant bits, truncated (at most 0.4% low). Always index=MATCH, single-valued, no column, not stored.<br><br>learned sparse vector (SPLADE, ELSER tokens) |
-| <a id="value-luxir.fielddef.fieldclass.rank_feature"></a>[`RANK_FEATURE`](#value-luxir.fielddef.fieldclass.rank_feature) | 12 | one static ranking signal, e.g. pagerank |
-| <a id="value-luxir.fielddef.fieldclass.rank_features"></a>[`RANK_FEATURES`](#value-luxir.fielddef.fieldclass.rank_features) | 13 | named ranking signals, e.g. topic scores |
+| <a id="value-luxir.fielddef.fieldclass.sparse_vector"></a>[`SPARSE_VECTOR`](#value-luxir.fielddef.fieldclass.sparse_vector) | 14 | Feature fields (Lucene FeatureField). A document value is a JSON object of feature name -&gt; weight (SPARSE\_VECTOR, RANK\_FEATURES) or one number (RANK\_FEATURE). Weights must be positive and finite; they are stored as term frequencies with 9 significant bits, truncated (at most 0.4% low). Always index=MATCH, single-valued, no column, not stored.<br><br>learned sparse vector (SPLADE, ELSER tokens) |
+| <a id="value-luxir.fielddef.fieldclass.rank_features"></a>[`RANK_FEATURES`](#value-luxir.fielddef.fieldclass.rank_features) | 15 | named ranking signals, e.g. topic scores |
+| <a id="value-luxir.fielddef.fieldclass.rank_feature"></a>[`RANK_FEATURE`](#value-luxir.fielddef.fieldclass.rank_feature) | 16 | one static ranking signal, e.g. pagerank |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 
