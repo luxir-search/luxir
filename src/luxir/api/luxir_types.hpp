@@ -63,7 +63,8 @@ namespace luxir::api {
 
 // ---- forward declarations (all messages) ----
 struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
-struct Fusion; struct RrfFusion; struct SortSpec; struct Query;
+struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struct GroupTable;
+struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct CombinedFieldsQuery; struct MultiMatchQuery;
@@ -77,13 +78,13 @@ struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrA
 struct ArrArrDouble; struct Vector; struct ArrVector;
 struct ColStr; struct Column; struct ColVector; struct MultiVector; struct ColInt;
 struct ColFloat; struct ColDouble; struct AnalyzerComponent; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
-struct FieldVariants; struct FieldDefaults; struct NormalizerDef;
+struct FieldVariants; struct FieldDefaults; struct NormalizerDef; struct StoredResourceDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
-struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct MemoryStats;
+struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
 struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
@@ -96,6 +97,10 @@ enum class Kind {
   RESOURCE_EXHAUSTED = 5, UNAVAILABLE = 6, INTERNAL = 7
 };
 }
+namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
+namespace Collapse_ { enum class MissingPolicy { EXPAND = 0, GROUP = 1, DROP = 2 }; }
+namespace FieldFacet_ { enum class CountUnit { DOCS = 0, GROUPS = 1 }; }
+namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
 namespace MultiMatchQuery_ {
@@ -117,11 +122,16 @@ enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 }
+namespace StoredResourceDef_ { enum class Codec { LZ4 = 0, ZSTD = 1 }; }
 namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 
 // ===================== message definitions (strict topological order) =====================
 
-struct RrfFusion { int32_t k = 0; };
+struct RrfFusion { std::optional<int32_t> k; };
+struct LinearFusion {
+  using Normalization = luxir::api::LinearFusion_::Normalization;
+  Normalization normalization = Normalization::MIN_MAX;
+};
 struct CalendarGap {
   using Unit = luxir::api::CalendarGap_::Unit;
   int32_t n = 0;
@@ -303,10 +313,22 @@ struct JemallocStats {
   ArenaStats indexing;
   ArenaStats big_buffer;
 };
+struct FieldMetadataStats {
+  uint64_t bytes = 0;
+  uint64_t directories = 0;
+  uint64_t directory_bytes = 0;
+  uint64_t pages = 0;
+  uint64_t page_bytes = 0;
+  uint64_t entries = 0;
+  uint64_t entry_bytes = 0;
+  uint64_t names = 0;
+  uint64_t name_bytes = 0;
+};
 struct MemoryStats {
   IndexRamStats indexing_budget;
   StorageRamStats storage_ram;
   std::optional<JemallocStats> jemalloc;
+  FieldMetadataStats field_metadata;
 };
 struct StatsTotals {
   uint64_t collections = 0;
@@ -411,11 +433,20 @@ struct ReplicationStatus {
   uint64_t last_contact = 0;
   std::span<const ReplicationCollectionStatus> collections;
 };
+struct ScrubStats {
+  uint64_t passes = 0;
+  uint64_t files = 0;
+  uint64_t bytes = 0;
+  uint64_t mismatches = 0;
+  uint64_t errors = 0;
+  uint64_t last_pass_end = 0;
+};
 struct StatsResponse {
   std::optional<StatsTotals> totals;
   std::span<const CollectionStats> collections;
   uint64_t multiterm_expansion_refills = 0;
   std::optional<MemoryStats> memory;
+  std::optional<ScrubStats> scrub;
 };
 struct CacheControlRequest {
   std::string_view collection;
@@ -464,13 +495,23 @@ struct KnnQuery {                                                // needs Vector
   std::string_view field;
   std::optional<Vector> query;
   std::optional<Ivf> ivf;
+  std::optional<float> similarity;
   int32_t k = 0;
   int32_t refine_candidates = 0;
   bool exact = false;
+  std::string_view unit;
 };
-struct SchemaDef {
+struct StoredResourceDef {
+  using Codec = luxir::api::StoredResourceDef_::Codec;
+  std::optional<Codec> codec;                                   // align 4 (enum)
+  std::optional<std::int32_t> zstd_level;                       // align 4
+  std::optional<std::int32_t> chunk_size_bytes;
+  std::optional<std::int32_t> max_docs_per_chunk;
+};
+struct SchemaDef {                                                // needs StoredResourceDef
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> templates;
+  map_view<std::string_view, StoredResourceDef> stored_resources;
 };
 struct ColVector { std::span<const Vector> v; };
 struct ArrVector { std::span<const Vector> v; };
@@ -514,6 +555,19 @@ struct Filter {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const std::string_view> except_ops;
 };
+struct Collapse {
+  std::span<const std::string_view> field;
+  Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
+  std::span<const SortSpec> head_sort;
+  std::span<const SortSpec> sort;
+  bool get_number = false;
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+};
+struct Diversify {
+  std::span<const std::string_view> field;
+  Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
+  std::optional<int64_t> max_per_key;
+};
 struct TopDocs {                                                 // all indirect/span/opt-scalar
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Filter> filter;
@@ -522,19 +576,24 @@ struct TopDocs {                                                 // all indirect
   std::span<const std::string_view> fields;
   std::span<const SortSpec> sort;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+  std::optional<float> min_score;
   int32_t batch_size = 0;
+  ::hpp_proto::optional_indirect_view<Collapse> collapse;
+  ::hpp_proto::optional_indirect_view<Diversify> diversify;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_number = false;
   bool get_scores = false;
 };
-struct Fusion {                                                  // needs TopDocs, RrfFusion
+struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
   map_view<std::string_view, TopDocs> sources;
   std::span<const Filter> filter;
   std::optional<std::int64_t> limit;
   int64_t offset = 0;
   std::span<const std::string_view> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
-  std::optional<RrfFusion> rrf;                                  // align 4 (RrfFusion is one int32)
+  map_view<std::string_view, double> weights;
+  ::hpp_proto::optional_indirect_view<Collapse> collapse;
+  std::variant<std::monostate, RrfFusion, LinearFusion> method;  // align 4
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_number = false;
@@ -550,6 +609,8 @@ struct ExprOp {
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
 struct FieldFacet {
+  std::optional<FieldFacet_::CountUnit> count_unit;
+  ::hpp_proto::optional_indirect_view<Collapse> count_distinct;
   std::string_view field;
   std::optional<std::int64_t> limit;
   std::optional<std::int64_t> mincount;
@@ -564,6 +625,8 @@ struct QueryBucket {
   ::hpp_proto::optional_indirect_view<Query> query;
 };
 struct QueryFacet {
+  ::hpp_proto::optional_indirect_view<Collapse> count_distinct;
+  std::optional<FieldFacet_::CountUnit> count_unit;
   std::span<const QueryBucket> buckets;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   ::hpp_proto::optional_indirect_view<Val> selected;
@@ -586,8 +649,25 @@ struct SearchRequest {
   bool json_shorthand = false;
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
+struct GroupComponent {
+  std::variant<std::monostate, google::protobuf::NullValue, std::string_view, std::int64_t> value;
+  GroupComponent_::Type type = GroupComponent_::Type::STRING;
+};
+struct GroupKey {
+  std::span<const GroupComponent> component;
+  std::optional<uint64_t> singleton;
+};
+struct GroupTable {
+  std::span<const GroupKey> keys;
+  std::span<const int64_t> counts;
+  std::span<const ArrVal> ranks;
+  map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
+};
 struct DocList {                                                // needs Column (map by value)
   std::optional<std::int64_t> found;
+  std::optional<std::int64_t> found_docs;
+  std::optional<std::int64_t> found_groups;
+  ::hpp_proto::optional_indirect_view<GroupTable> groups;
   map_view<std::string_view, Column> columns;
   // Per-document field maps: docs[i] holds document i's fields not in
   // columns (row_count entries when present).  See the .proto contract.
@@ -624,6 +704,8 @@ struct Val {                                                   // needs Map,ArrV
   std::string_view asString() const { return std::get<std::string_view>(kind); }
 };
 struct RangeFacet {                                             // needs Val,CalendarGap
+  ::hpp_proto::optional_indirect_view<Collapse> count_distinct;
+  std::optional<FieldFacet_::CountUnit> count_unit;
   std::variant<std::monostate, Val, CalendarGap> gap_kind;
   std::string_view field;
   ::hpp_proto::optional_indirect_view<Val> start;
@@ -688,6 +770,7 @@ struct RescoreQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::string_view expr;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
+  std::optional<float> min_score;
 };
 struct SimpleQuery {
   using Operator = luxir::api::Match_::Operator;
@@ -761,7 +844,8 @@ struct UpdateRequest {                                         // needs CommitPa
 // ===================== trivial-destructibility checks =====================
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
 LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
-LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
+LUXIR_TD(Diversify) LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey) LUXIR_TD(GroupTable)
+LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
@@ -777,7 +861,7 @@ LUXIR_TD(ArrArrDouble) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
 LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXIR_TD(ColInt)
 LUXIR_TD(ColFloat) LUXIR_TD(ColDouble)
 LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
-LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef)
+LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef) LUXIR_TD(StoredResourceDef)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
@@ -785,7 +869,7 @@ LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(Li
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
-LUXIR_TD(JemallocStats) LUXIR_TD(MemoryStats)
+LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
 LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationInstalled)
@@ -803,7 +887,9 @@ LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) 
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,             \
                   std::string *error = nullptr);
 LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
-LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(SortSpec)
+LUXIR_ENTRY(Diversify) LUXIR_ENTRY(Collapse) LUXIR_ENTRY(GroupComponent)
+LUXIR_ENTRY(GroupKey) LUXIR_ENTRY(GroupTable)
+LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(LinearFusion) LUXIR_ENTRY(SortSpec)
 LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
@@ -821,7 +907,7 @@ LUXIR_ENTRY(ArrArrFloat) LUXIR_ENTRY(ArrArrDouble) LUXIR_ENTRY(Vector)
 LUXIR_ENTRY(ArrVector) LUXIR_ENTRY(ColStr) LUXIR_ENTRY(Column)
 LUXIR_ENTRY(ColVector) LUXIR_ENTRY(MultiVector) LUXIR_ENTRY(ColInt) LUXIR_ENTRY(ColFloat)
 LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(AnalyzerComponent) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
-LUXIR_ENTRY(FieldVariants) LUXIR_ENTRY(FieldDefaults) LUXIR_ENTRY(NormalizerDef)
+LUXIR_ENTRY(FieldVariants) LUXIR_ENTRY(FieldDefaults) LUXIR_ENTRY(NormalizerDef) LUXIR_ENTRY(StoredResourceDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
@@ -831,7 +917,7 @@ LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_EN
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
 LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)
-LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(MemoryStats)
+LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(FieldMetadataStats) LUXIR_ENTRY(MemoryStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
 LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationInstalled)

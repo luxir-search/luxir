@@ -21,10 +21,12 @@
 #include <luxir/util/heap.h>
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
+#include "ExecutionWarnings.h"
+#include "Warnings.h"
 #include "luxir/util/proto.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/search/IndexReader.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/search/DocSet.h"
@@ -63,6 +65,7 @@ enum class QueryKind : uint8_t {
   NONE,
   RESCORE,
   COMBINED_FIELDS,
+  MIN_SCORE,
   TEST,
 };
 
@@ -327,7 +330,7 @@ struct CachedTermInfo {
 };
 
 struct CachedFieldInfo {
-  std::span<SegFieldInfo*> segInfos = {};
+  IndexReader::FieldSegments segInfos;
   Similarity::FieldStats fieldStats = {};
   std::span<TermsEnum*> termsEnums = {};  // TODO: cache align if they will be used in multiple threads
   boost::unordered_node_map<std::string_view, CachedTermInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
@@ -375,6 +378,11 @@ private:
 
 public:
   QueryKind getKind() const { return kind; }
+
+  // Predicates recover structural membership segmentwise. Selection queries
+  // choose a window and need fresh preparation over the reset's complete
+  // input. Preparation/caching provenance is a separate property.
+  virtual bool recoverableAsPredicate() const noexcept { return false; }
 
   void markPlannerGenerated() {
 #ifndef NDEBUG
@@ -729,6 +737,27 @@ public:
     return (flags & NEED_SCORES) != 0 ? multiplier * local : 0.0f;
   }
 
+  enum class CountHow : uint8_t { METADATA, SUPPLIER, INDEX_WALK, ITERATE };
+  static constexpr CountHow COUNT_PROBE_LIMIT = CountHow::SUPPLIER;
+  static constexpr CountHow COUNT_EXECUTION_LIMIT = CountHow::INDEX_WALK;
+  struct CountShortcut {
+    int64_t maxMatches;
+    CountHow how;
+    Weight* resolver = nullptr;
+  };
+
+  // Restrict header totals by cheap eligibility bounds; restrictions need iteration.
+  static CountShortcut countBound(IndexReader::Segment& segment, DocSet* domain,
+                                  int64_t docs, CountHow how = CountHow::ITERATE) {
+    int64_t bound = std::min<int64_t>(docs, segment.numLive());
+    if (domain && domain->cachedCard() >= 0) {
+      bound = std::min<int64_t>(bound, domain->cachedCard());
+    }
+    if (bound == 0) return {0, CountHow::METADATA};
+    if (domain || segment.liveDocs()) how = CountHow::ITERATE;
+    return {bound, how};
+  }
+
   /// Per-segment planning state. Suppliers are allocated from the segment-local
   /// targetPool and only need to live until their resolved plans are built.
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
@@ -1011,6 +1040,7 @@ public:
 
     /// Return temporary per-segment planning state allocated from targetPool.
     /// A null supplier means this source cannot match the segment.
+    /// The source and segment must outlive the supplier and its plans.
     Query::ScorerSupplier* scorerSupplier(
         MemPool& targetPool, IndexReader::Segment& segment,
         SupplierExecutionMode executionMode =
@@ -1233,12 +1263,9 @@ public:
       return result;
     }
 
-    // code must have static storage duration.
+    // code must have static storage duration. Repeats are dropped.
     void warn(std::string_view code, std::string_view message) {
-      if (warnings == nullptr) return;
-      char* copy = pool.alloc(message.size());
-      std::memcpy(copy, message.data(), message.size());
-      warnings->push_back({code, std::string_view(copy, message.size())});
+      if (warnings != nullptr) addWarning(*warnings, pool, code, message);
     }
 
   };
@@ -1261,22 +1288,21 @@ public:
     std::shared_ptr<FilterCache::UseRegistry>& filterUses;
     FilterKeyContext& filterKeyContext;
     Limits& limits;
-    std::span<FieldReader> fieldReaders;
     FieldInfoMap fieldInfoMap;
 
     Context(google::protobuf::Arena& arena, PlanningContext& planning,
-            std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap)
+            FieldInfoMap&& fieldInfoMap)
       : planning(planning), allocationArena(&arena),
         pool(planning.pool), topReader(planning.topReader),
         filterUses(planning.filterUses),
         filterKeyContext(planning.filterKeyContext), limits(planning.limits),
-        fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)) {}
+        fieldInfoMap(std::move(fieldInfoMap)) {}
 
     // Arena-owned form used by standalone embedders that do not already have
     // serial planning state.
     Context(google::protobuf::Arena& arena, MemPool& pool,
             IndexReader& topReader,
-            std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap,
+            FieldInfoMap&& fieldInfoMap,
             Limits limits = {}, std::vector<api::Warning>* warnings = nullptr,
             FilterKeyContext filterKeyContext = {},
             std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr)
@@ -1286,7 +1312,7 @@ public:
         pool(planning.pool), topReader(planning.topReader),
         filterUses(planning.filterUses),
         filterKeyContext(planning.filterKeyContext), limits(planning.limits),
-        fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)) {}
+        fieldInfoMap(std::move(fieldInfoMap)) {}
 
     // Convenience ctor for stack-allocated Contexts (tests, non-arena code).
     Context(MemPool& pool, IndexReader& topReader, Limits limits = {},
@@ -1302,31 +1328,13 @@ public:
         filterUses(planning.filterUses),
         filterKeyContext(planning.filterKeyContext), limits(planning.limits),
         fieldInfoMap(4, pool.getAllocator()) {
-      auto numSegs = topReader.segments().size();
-      fieldReaders = {
-        (FieldReader*)pool.alloc(
-            sizeof(FieldReader) * numSegs, alignof(FieldReader)),
-        numSegs
-      };
-      for (size_t i = 0; i < numSegs; i++) {
-        new (&fieldReaders[i]) FieldReader(
-            topReader.segments()[i].postingsReader());
-      }
     }
 
     static Context* create(google::protobuf::Arena* arena,
                            PlanningContext& planning) {
-      auto numSegs = planning.topReader.segments().size();
-      auto* readers = (FieldReader*)planning.pool.alloc(
-          sizeof(FieldReader) * numSegs, alignof(FieldReader));
-      for (size_t i = 0; i < numSegs; i++) {
-        new (&readers[i]) FieldReader(
-            planning.topReader.segments()[i].postingsReader());
-      }
       FieldInfoMap map(4, planning.pool.getAllocator());
       return luxir::arenaCreate<Context>(
-          *arena, *arena, planning,
-          std::span<FieldReader>(readers, numSegs), std::move(map));
+          *arena, *arena, planning, std::move(map));
     }
 
     static Context* create(
@@ -1335,17 +1343,9 @@ public:
         std::vector<api::Warning>* warnings = nullptr,
         FilterKeyContext filterKeyContext = {},
         std::shared_ptr<FilterCache::UseRegistry> filterUses = nullptr) {
-      auto numSegs = topReader.segments().size();
-      auto* readers = (FieldReader*)pool.alloc(
-          sizeof(FieldReader) * numSegs, alignof(FieldReader));
-      for (size_t i = 0; i < numSegs; i++) {
-        new (&readers[i]) FieldReader(
-            topReader.segments()[i].postingsReader());
-      }
       FieldInfoMap map(4, pool.getAllocator());
       return luxir::arenaCreate<Context>(
-          *arena, *arena, pool, topReader,
-          std::span<FieldReader>(readers, numSegs), std::move(map),
+          *arena, *arena, pool, topReader, std::move(map),
           limits, warnings, filterKeyContext, std::move(filterUses));
     }
 
@@ -1393,65 +1393,34 @@ public:
       return topReader.segments().size();
     }
 
-    std::span<SegFieldInfo*> readSegInfos(std::string_view field) {
-      auto numSegs = numSegments();
-      int foundCount = 0;
-      auto savepoint = pool.getSavePoint();
-      std::span<SegFieldInfo*> segInfos = {pool.make_arr<SegFieldInfo*>(numSegs), numSegs};
-      for (int i = 0; i < numSegs; ++i) {
-        if (fieldReaders[i].seek(field)) {
-          segInfos[i] = pool.make<SegFieldInfo>();
-          fieldReaders[i].readFieldInfo(*segInfos[i]);
-          foundCount++;
-        } else {
-          segInfos[i] = nullptr;
-        }
-      }
-      if (foundCount == 0) {
-        // no segments have this field, so we can rewind the pool to deallocate the arr
-        pool.rewind(savepoint);
-        return {};
-      }
-      return segInfos;
-    }
-
-    /// Returns nullptr if the field is not found in any segment
+    /// Returns nullptr if the field is not found in any segment.
     CachedFieldInfo* getCachedFieldInfo(std::string_view field) {
       auto [iter, inserted] = fieldInfoMap.try_emplace(field, pool, 4);
       CachedFieldInfo& result = iter->second;
-      if (!inserted) {
-        return &result;
-      }
-
-      result.segInfos = readSegInfos(field);
-      if (result.segInfos.empty()) {
-        // field doesn't exist in any segment.
-        fieldInfoMap.erase(iter);
-        // we can't rewind the pool here because we still emplaced on the map.  We could do a lookup first if it's important.
-        return nullptr;
-      }
-
-      // TODO: make caching of the terms enums optional?
-      auto numSegs = numSegments();
-      result.termsEnums = {pool.make_arr<TermsEnum *>(numSegs), numSegs};
-      for (int i = 0; i < numSegs; ++i) {
-        auto &segFieldInfo = result.segInfos[i];
-        if (!segFieldInfo) {
-          result.termsEnums[i] = nullptr;
-          continue;
+      if (inserted) {
+        result.segInfos = topReader.field(field);
+        if (result.segInfos.exists()) {
+          result.fieldStats = result.segInfos.stats();
+          result.termsEnums = pool.make_span_zeroed<TermsEnum*>(numSegments());
         }
-        TermsEnum *termsEnum = pool.make<TermsEnum>(pool, topReader.segments()[i].postingsReader(), *segFieldInfo);
-        result.termsEnums[i] = termsEnum;
-
-        // add the stats from this termsEnum to fieldStats
-        result.fieldStats.sumTotalTermFreq += termsEnum->sumTotalTermFreq();
-        result.fieldStats.sumDocFreq += termsEnum->sumDocFreq();
-        result.fieldStats.docsWithField += termsEnum->docsWithField();
       }
-
-      return &result;
+      return result.segInfos.exists() ? &result : nullptr;
     }
 
+  private:
+    // The cached dictionary outlives temporary pool rewinds. Call only before
+    // taking a savepoint that may be rewound, or outside any rewind scope.
+    TermsEnum* getTermsEnum(CachedFieldInfo& field, size_t segnum) {
+      auto*& terms = field.termsEnums[segnum];
+      if (!terms) {
+        if (auto* info = field.segInfos.at(segnum)) {
+          terms = pool.make<TermsEnum>(pool, topReader.segments()[segnum].postingsReader(), *info);
+        }
+      }
+      return terms;
+    }
+
+  public:
     CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term) {
       auto [iter, inserted] = cachedFieldInfo.termInfos.try_emplace(term);
       CachedTermInfo& result = iter->second;
@@ -1459,13 +1428,16 @@ public:
         return &result;
       }
 
-      auto savepoint = pool.getSavePoint();
       auto numSegs = numSegments();
+      // TermsEnums survive missing-term lookups; allocate them before the
+      // temporary postings states that can be rewound below.
+      for (size_t i = 0; i < numSegs; i++) getTermsEnum(cachedFieldInfo, i);
+      auto savepoint = pool.getSavePoint();
       int foundInSegCount = 0;
       result.postingsStates = {
           pool.make_arr<const TermsEnum::PostingsState*>(numSegs), numSegs};
       for (int i = 0; i < numSegs; ++i) {
-        auto& termsEnum = cachedFieldInfo.termsEnums[i];
+        auto* termsEnum = cachedFieldInfo.termsEnums[i];
         if (!termsEnum || !termsEnum->seek(term)) {
           result.postingsStates[i] = nullptr;
           continue;
@@ -1490,7 +1462,7 @@ public:
       result = {};
       bool found = false;
       for (int i = 0; i < (int)numSegments(); ++i) {
-        auto& termsEnum = cachedFieldInfo.termsEnums[i];
+        auto* termsEnum = getTermsEnum(cachedFieldInfo, (size_t)i);
         if (!termsEnum || !termsEnum->seek(term)) {
           continue;
         }
@@ -1557,10 +1529,11 @@ public:
       IndexReader& reader;
       std::span<DocSet* const> domainPerSeg;
       bool parallel;
+      ExecutionWarnings* warnings;
 
       PrepareContext(IndexReader& reader, std::span<DocSet* const> domainPerSeg,
-                     bool parallel) noexcept
-        : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel) {}
+                     bool parallel, ExecutionWarnings* warnings) noexcept
+        : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel), warnings(warnings) {}
     };
 
     /// Immutable result of prepare() for segment-scorer creation after
@@ -1583,6 +1556,10 @@ public:
       virtual PreparedDomainDependence domainDependence() const noexcept {
         return PreparedDomainDependence::PREPARE_DOMAIN;
       }
+      // Owned retained state only; borrowed input and cache primitives have
+      // their own lifetimes/accounting. Callers retaining a selection window
+      // can charge its actual size instead of reserving maxDoc-sized sets.
+      virtual size_t retainedBytes() const noexcept { return sizeof(PreparedWeight); }
       virtual ~PreparedWeight() = default;
     };
 
@@ -1638,12 +1615,14 @@ public:
     bool allowsPruning() const noexcept { return (inputFlags & ALLOW_PRUNING) != 0; }
     bool needsScores() const noexcept { return (inputFlags & NEED_SCORES) != 0; }
 
-    /// Exact O(1) per-segment membership count without constructing a
-    /// supplier. A null result means the caller must execute the query.
-    virtual std::optional<int64_t> constantCount(
-        IndexReader::Segment& segment, DocSet* domain) {
-      unused(segment, domain);
-      return std::nullopt;
+    /// Metadata-only: no supplier, index walks, locks or cardinality counts.
+    /// METADATA is exact; SUPPLIER resolves at supplier construction;
+    /// INDEX_WALK may decode crossing index leaves; ITERATE is a bound.
+    /// Resolvable non-metadata shortcuts name the leaf that resolves them.
+    /// Execution may resolve more than this metadata proves.
+    virtual CountShortcut countShortcut(IndexReader::Segment& segment,
+                                         DocSet* domain) {
+      return countBound(segment, domain, segment.maxDoc());
     }
 
     /// Policy family for choosing the sparse-filtered top-k density knee.
@@ -1688,22 +1667,6 @@ public:
     /// allocate scorer state from target, and do not allocate from context.pool
     /// or populate/mutate Query::Context caches.
     virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
-
-    /// Return a constant-count plan result, or -1 when this segment requires
-    /// execution to count.
-    virtual int64_t count(IndexReader::Segment& segment) {
-      auto guard = MemPool::threadLocalPoolGuard();
-      ScorerSupplier* supplier = scorerSupplier(guard.pool(), segment);
-      if (supplier == nullptr) return 0;
-      ScorerSupplier::BulkScorerContext constantContext;
-      constantContext.requireConstantCount = true;
-      auto constantPlan = supplier->planBulk(
-          ExecutionUse::COUNT_WINDOWS, constantContext);
-      if (constantPlan.hasConstantCount()) {
-        return constantPlan.constantCount;
-      }
-      return -1;
-    }
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };

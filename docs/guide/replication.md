@@ -33,6 +33,19 @@ automatically. A source that restarts without its data, such as a RAM writer,
 does not empty its followers: a follower keeps serving its copy until the source
 commits data to that collection.
 
+If a local collection cannot be opened at startup, the follower keeps its files
+and reports it unavailable. A later verified install can replace it. Until then,
+the unreadable copy is treated as populated for the empty-replacement rule.
+With `--store.verify-on-open=full` a local file whose bytes no longer match its
+manifest digest also makes the copy unreadable, and a background scrub that
+finds one does the same while the follower runs; the next install keeps the
+files that still verify and re-downloads every file named by a corruption
+marker, even when its buffered hash matches. Suspect files are excluded from
+hard-link reuse from the serving copy; a failed serving collection supplies no
+such reuse. A repair unloads the failed collection before replacing files in
+its incarnation. See
+[file integrity checks](operations.md#file-integrity-checks).
+
 ## Try it on one machine
 
 Start a writer on port 9400 and a follower on port 9500, each in its own
@@ -224,6 +237,10 @@ luxir -p 9600 --store.backend=fs --store.data-dir=/tmp/luxir/seed
 ```
 
 Promotion gives every collection a new incarnation while reusing its files.
+Promotion and writer recovery preserve corruption markers for files in the
+copied manifest. The new writer re-checks those suspects at startup even with
+`--store.verify-on-open=none`; promotion does not erase a pending scrub hit.
+
 The promoted copy starts an independent commit history: it may be older than
 the previous writer, and future writes can diverge. A new incarnation keeps
 its commit tokens distinct, so an old `min_commit` token cannot incorrectly
@@ -271,7 +288,7 @@ lag.
 | `waiting` | The source restarted without data for this collection; the follower keeps serving its copy. Commit data on the source to resume syncing. |
 | `stale` | Source unreachable or collection unavailable. Repair the source or network; the follower keeps serving searches from its copy. |
 | `orphan` | Local copy the follower will not sync or delete on its own. See below. |
-| `error` | Inspect `last_error`, fix storage/network/corruption, and let `next_retry` run (backoff 1-60 s). A generation that moved backwards requires restoring or promoting the source under a new incarnation. |
+| `error` | Inspect `last_error`, fix storage/network/corruption, and let `next_retry` run (backoff from `retry-ms`, doubling to 60 s). A generation that moved backwards requires restoring or promoting the source under a new incarnation. |
 
 A follower deletes a local collection only when the source it has followed
 since that source's last restart no longer lists it. A collection missing after
@@ -301,6 +318,7 @@ All replication settings use `--replication.` (configuration keys use underscore
 | `max-acknowledgments` | 262144 | Node-wide follower/collection acknowledgment budget |
 | `downloads` | 2 | Concurrent collection transfers |
 | `follower-timeout-ms` | 90000 | How long a silent follower still counts as live |
+| `retry-ms` | 1000 | Follower delay before reconnecting to a lost source, and before the first retry of a failed sync |
 | `pin-idle-timeout-ms` | 60000 | Pin expires without byte progress |
 | `pin-retained-bytes` | 1 GiB | Per-collection retired bytes retained only by pins |
 

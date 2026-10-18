@@ -15,6 +15,8 @@ locations, browse `src/luxir/<area>/`.
      (startup discovery, creation, activation of a new incarnation, removal),
      announced in order through `CollectionEvents`
    - `ReplicationFollower`: Discovery and transfer protocol; installs through `Collections`
+   - `Scrubber`: Paced background re-verification of published snapshot files; a mismatch
+     fails the collection (`Collections::fail`) and a follower repairs it
    - `ReplicationSource`: Local discovery catalog, cursors, follower liveness and acknowledgments,
      fed by the ordered `CollectionEvents` interface.
    - `CommitWaits`: Node-local publication floors and replica barriers; owns deadlines,
@@ -107,6 +109,9 @@ locations, browse `src/luxir/<area>/`.
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
    - `InputStream` / `OutputStream`: segment I/O primitives
+   - `FileVerifier`: size + xxh3 checks of files against manifest `FileDescriptor`s over
+     `Directory::openChecksum` (pread, optional O_DIRECT; never mmap): verify-on-open, scrub
+   - `CorruptionMarker`: `corrupted_<id>` files naming suspect index files, re-verified at open
    - `DirectoryFactory`: storage backends (`RAMDirFactory`, `FSDirFactory`) and wrappers
      (`CheckedDirFactory`, `ReadOnlyDirFactory`); `CollectionStorage` is a collection's
      handle: CURRENT selects one of its incarnation directories
@@ -137,6 +142,16 @@ locations, browse `src/luxir/<area>/`.
 **Search**: gRPC/HTTP Request -> SearchEngine -> Query Parsing -> Weight Creation -> Per-Segment Plan Resolution and Execution -> Result Collection -> Response
 
 **Indexing**: gRPC/HTTP Request -> IndexWriter -> Document Processing (Inverter) -> Segment Writing -> optional Commit
+
+HTTP update bodies are not decoded on the connection's I/O shard thread. A
+buffered JSON body is decoded in the task-arena task that submits it. An
+NDJSON stream is only framed on the shard: records that may be control
+records (`{}` or a first key shaped `"_name_"`) are decoded there, in stream
+order, and document records stay where the body was read: `NdjsonFramer`
+reads the body straight into chunks and returns views, and the batch
+(`HttpStreamBatchState::records`) holds the chunks until it has decoded them. `StreamingUpdateMessage::handle` decodes
+them on the update graph's process node, after `startUpdateNode` has fixed
+the batch's update version, so batches of one connection decode in parallel.
 
 ## Key Design Patterns
 

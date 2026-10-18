@@ -181,11 +181,10 @@ void mergePinnedBuckets(
   }
 }
 
-// TODO: callers of these vector-taking wrappers (the int facet and the
-// non-ordinal string facet in FacetOp.h) first build one candidate per counted
-// value, which on a high-cardinality field is tens of MB per request to return
-// one page. Stream their counters into FieldBucketFinalizer as
-// StrFacetOp::OrdCountSink does, then delete both wrappers.
+// TODO: the non-ordinal string facet in FacetOp.h still builds one candidate
+// per counted value, which on a high-cardinality field is tens of MB per
+// request to return one page. Stream its counter into FieldBucketFinalizer
+// as StrFacetOp::OrdCountSink does, then delete both wrappers.
 template<typename Key, typename Payload, typename Better>
 std::vector<FinalizedFacetBucket<Key, Payload>> finalizeFieldBuckets(
     std::vector<FacetCandidate<Key, Payload>> candidates,

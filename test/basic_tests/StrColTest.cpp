@@ -10,7 +10,7 @@
 #include "test/LocalReq.h"
 #include "luxir/index/handler/StrColHandler.h"
 #include "luxir/reader/StrColReader.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include <vector>
 
 using namespace luxir;
@@ -339,12 +339,11 @@ TEST_F(StrColTest, strColReaderBasic) {
   testIndex.initReader();
   auto& segment = testIndex.reader->segments()[0];
   auto& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(postingsReader);
-  bool found = fieldReader.seek("description_sc");
+  auto* fieldReader = postingsReader.fieldInfo("description_sc");
+  bool found = (fieldReader != nullptr);
   ASSERT_TRUE(found);
   
-  SegFieldInfo segFieldInfo;
-  fieldReader.readFieldInfo(segFieldInfo);
+  const auto& segFieldInfo = *fieldReader;
   
   StrColReader strReader(postingsReader, segFieldInfo);
   ASSERT_EQ(4, strReader.docsWithValue());  // 4 docs have values (0, 2, 3, 5)
@@ -415,12 +414,11 @@ TEST_F(StrColTest, fixedSizeOptimization) {
     testIndex.initReader();
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek("fixed_sc");
+    auto* fieldReader = postingsReader.fieldInfo("fixed_sc");
+    bool found = (fieldReader != nullptr);
     ASSERT_TRUE(found);
 
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *fieldReader;
 
     // Test reading with StrColReader
     StrColReader strReader(postingsReader, segFieldInfo);
@@ -459,10 +457,9 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     testIndex.initReader();
     auto& seg1 = testIndex.reader->segments()[0];
     auto& pr1 = seg1.postingsReader();
-    FieldReader fr1(pr1);
-    ASSERT_TRUE(fr1.seek("simple_sc"));
-    SegFieldInfo sfi1;
-    fr1.readFieldInfo(sfi1);
+    auto* fr1 = pr1.fieldInfo("simple_sc");
+    ASSERT_TRUE((fr1 != nullptr));
+    const auto& sfi1 = *fr1;
     // Check the field type and flags
     ASSERT_EQ(FieldType::Type::STRING, sfi1.type) << "Field type should be STRING";
     ASSERT_EQ(FieldType::COLUMN_STORED, sfi1.flags) << "Field flags should be COLUMN_STORED only";
@@ -482,12 +479,11 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     ASSERT_EQ(1, testIndex.reader->segments().size());  // Should have 1 merged segment
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek("simple_sc");
+    auto* fieldReader = postingsReader.fieldInfo("simple_sc");
+    bool found = (fieldReader != nullptr);
     ASSERT_TRUE(found) << "Field simple_sc not found after merge";
     
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *fieldReader;
     
     StrColReader strReader(postingsReader, segFieldInfo);
     ASSERT_EQ(2, strReader.docsWithValue()) << "Expected 2 docs with values after merge";
@@ -527,12 +523,11 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     testIndex.initReader();
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek("content_sc");
+    auto* fieldReader = postingsReader.fieldInfo("content_sc");
+    bool found = (fieldReader != nullptr);
     ASSERT_TRUE(found);
     
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *fieldReader;
     
     StrColReader strReader(postingsReader, segFieldInfo);
     ASSERT_EQ(4, strReader.docsWithValue());
@@ -578,12 +573,11 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     testIndex.initReader();
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek("sparse_sc");
+    auto* fieldReader = postingsReader.fieldInfo("sparse_sc");
+    bool found = (fieldReader != nullptr);
     ASSERT_TRUE(found);
     
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *fieldReader;
     
     StrColReader strReader(postingsReader, segFieldInfo);
     ASSERT_EQ(4, strReader.docsWithValue());
@@ -630,12 +624,11 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     testIndex.initReader();
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek("delete_sc");
+    auto* fieldReader = postingsReader.fieldInfo("delete_sc");
+    bool found = (fieldReader != nullptr);
     ASSERT_TRUE(found);
     
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *fieldReader;
     
     StrColReader strReader(postingsReader, segFieldInfo);
     ASSERT_EQ(3, strReader.docsWithValue());  // Only 3 docs (deleted one excluded)
@@ -678,12 +671,11 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     testIndex.initReader();
     auto& segment = testIndex.reader->segments()[0];
     auto& postingsReader = segment.postingsReader();
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek("fixed_merge_sc");
+    auto* fieldReader = postingsReader.fieldInfo("fixed_merge_sc");
+    bool found = (fieldReader != nullptr);
     ASSERT_TRUE(found);
     
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *fieldReader;
     
     StrColReader strReader(postingsReader, segFieldInfo);
     ASSERT_EQ(nullptr, strReader.getEndValueRankReader());  // Should still have no end rank reader
@@ -876,12 +868,11 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
   
   auto& segment = reader->segments()[0];
   auto& postingsReader = segment.postingsReader();
-  FieldReader fieldReader(postingsReader);
-  bool found = fieldReader.seek("uniform_ssc");
+  auto* fieldReader = postingsReader.fieldInfo("uniform_ssc");
+  bool found = (fieldReader != nullptr);
   ASSERT_TRUE(found);
   
-  SegFieldInfo segFieldInfo;
-  fieldReader.readFieldInfo(segFieldInfo);
+  const auto& segFieldInfo = *fieldReader;
   
   // Fixed-size multi-valued: endOffsetReader (mono2Loc) is absent, endValueRankReader (monoLoc) is present.
   ASSERT_EQ(0, segFieldInfo.mono2Loc.offset());
@@ -961,10 +952,9 @@ TEST_F(StrColTest, DocValuesManyValuesPerDoc) {
 
   // Variable-size path: endOffsetReader present; BulkValues wraps MonoReader::BulkValues.
   {
-    FieldReader fr(postingsReader);
-    ASSERT_TRUE(fr.seek("chunks_ssc"));
-    SegFieldInfo sfi;
-    fr.readFieldInfo(sfi);
+    auto* fr = postingsReader.fieldInfo("chunks_ssc");
+    ASSERT_TRUE((fr != nullptr));
+    const auto& sfi = *fr;
     ASSERT_NE(0, sfi.mono2Loc.offset()) << "expected endOffsetReader for variable-size";
 
     StrColReader strReader(postingsReader, sfi);
@@ -984,10 +974,9 @@ TEST_F(StrColTest, DocValuesManyValuesPerDoc) {
 
   // Fixed-size path: no endOffsetReader; BulkValues uses pointer arithmetic.
   {
-    FieldReader fr(postingsReader);
-    ASSERT_TRUE(fr.seek("uniform_ssc"));
-    SegFieldInfo sfi;
-    fr.readFieldInfo(sfi);
+    auto* fr = postingsReader.fieldInfo("uniform_ssc");
+    ASSERT_TRUE((fr != nullptr));
+    const auto& sfi = *fr;
     ASSERT_EQ(0, sfi.mono2Loc.offset()) << "expected no endOffsetReader for fixed-size";
     ASSERT_EQ(8, sfi.mono2MetaOff);
 

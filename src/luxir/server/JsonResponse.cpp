@@ -250,6 +250,7 @@ void appendBucketId(std::string& out, const luxir::api::Column& col, size_t i) {
 }
 
 void appendOpVal(std::string& out, const luxir::api::Val& val);
+void appendFacetSlot(std::string& out, const luxir::api::Val& val, size_t i);
 
 // Document i is the merge of columns row i and docs[i] (see the DocList
 // contract); pure-rows and pure-columns are the degenerate cases.  Column
@@ -283,6 +284,7 @@ std::vector<ColPlan> buildColPlan(const luxir::api::DocList& docs) {
 
 // One document object: the merge of the planned dense columns and doc i's
 // sparse row map (a field name never appears in both).
+template <bool Collapsed>
 void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
                      const luxir::api::DocList& docs, size_t i) {
   out += '{';
@@ -300,6 +302,43 @@ void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
       appendOpVal(out, *val);
     }
   }
+  if constexpr (Collapsed) {
+    assert(i < docs.groups->keys.size());
+    if (!first) out += ',';
+    const auto& group = docs.groups->keys[i];
+    out += R"("_group_":{"val":)";
+    if (group.singleton) {
+      out += R"(null,"singleton":true)";
+    } else {
+      bool tuple = group.component.size() != 1;
+      if (tuple) out += '[';
+      for (size_t c = 0; c < group.component.size(); c++) {
+        if (c) out += ',';
+        const auto& value = group.component[c].value;
+        if (const auto* str = std::get_if<std::string_view>(&value)) appendJsonString(out, *str);
+        else if (const auto* number = std::get_if<int64_t>(&value)) appendInt(out, *number);
+        else out += "null";
+      }
+      if (tuple) out += ']';
+    }
+    if (!docs.groups->counts.empty()) {
+      out += R"(,"count":)";
+      appendInt(out, docs.groups->counts[i]);
+    }
+    if (!docs.groups->ranks.empty() && !docs.groups->ranks[i].v.empty()) {
+      out += R"(,"rank":)";
+      luxir::api::Val rank;
+      rank.kind = docs.groups->ranks[i];
+      appendOpVal(out, rank);
+    }
+    for (const auto& [name, column] : docs.groups->ops) {
+      out += ',';
+      appendJsonString(out, name);
+      out += ':';
+      appendFacetSlot(out, *column, i);
+    }
+    out += '}';
+  }
   out += '}';
 }
 
@@ -311,10 +350,14 @@ void appendDocs(std::string& out, const luxir::api::DocList& docs) {
     return;
   }
   auto plan = buildColPlan(docs);
-  for (size_t i = 0; i < numDocs; i++) {
-    if (i) out += ',';
-    appendDocObject(out, plan, docs, i);
-  }
+  auto appendRows = [&]<bool Collapsed>() {
+    for (size_t i = 0; i < numDocs; i++) {
+      if (i) out += ',';
+      appendDocObject<Collapsed>(out, plan, docs, i);
+    }
+  };
+  if (!docs.groups) appendRows.template operator()<false>();
+  else appendRows.template operator()<true>();
   out += ']';
 }
 
@@ -415,6 +458,16 @@ void appendDocListMembers(std::string& out, const luxir::api::DocList& docs) {
   if (docs.found.has_value()) {
     out += R"("found":)";
     appendInt(out, *docs.found);
+    out += ',';
+  }
+  if (docs.found_docs.has_value()) {
+    out += R"("found_docs":)";
+    appendInt(out, *docs.found_docs);
+    out += ',';
+  }
+  if (docs.found_groups.has_value()) {
+    out += R"("found_groups":)";
+    appendInt(out, *docs.found_groups);
     out += ',';
   }
   out += R"("docs":)";
@@ -575,10 +628,14 @@ std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp) {
       auto& run = runs.emplace_back(DocRun{name, dl, {}});
       if (dl->row_count > 0) {
         auto plan = buildColPlan(*dl);
-        for (size_t i = 0; i < (size_t)dl->row_count; i++) {
-          appendDocObject(run.body, plan, *dl, i);
-          run.body += '\n';
-        }
+        auto appendRows = [&]<bool Collapsed>() {
+          for (size_t i = 0; i < (size_t)dl->row_count; i++) {
+            appendDocObject<Collapsed>(run.body, plan, *dl, i);
+            run.body += '\n';
+          }
+        };
+        if (!dl->groups) appendRows.template operator()<false>();
+        else appendRows.template operator()<true>();
       }
     }
   }
@@ -596,11 +653,13 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
   // and neither may correlation, so either forces a header even without
   // get_number.
   bool haveFound = firstForOp && docs.found.has_value();
+  bool haveFoundDocs = firstForOp && docs.found_docs.has_value();
+  bool haveFoundGroups = firstForOp && docs.found_groups.has_value();
   bool haveWarnings = !state.anyHeaderEmitted && !warnings.empty();
   bool haveRequestId = !state.anyHeaderEmitted && !state.requestId.empty();
   // Multi-op framing: any change of op needs a marker for attribution.
   bool needMarker = state.multiOp && (firstForOp || run.op != state.currentOp);
-  bool haveContent = haveFound || haveWarnings || haveRequestId;
+  bool haveContent = haveFound || haveFoundDocs || haveFoundGroups || haveWarnings || haveRequestId;
   if (run.body.empty() && !haveContent) return false;  // nothing to say
 
   if (haveContent || needMarker) {
@@ -620,6 +679,18 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
       if (!first) marker += ',';
       marker += R"("found":)";
       appendInt(marker, *docs.found);
+      first = false;
+    }
+    if (haveFoundDocs) {
+      if (!first) marker += ',';
+      marker += R"("found_docs":)";
+      appendInt(marker, *docs.found_docs);
+      first = false;
+    }
+    if (haveFoundGroups) {
+      if (!first) marker += ',';
+      marker += R"("found_groups":)";
+      appendInt(marker, *docs.found_groups);
       first = false;
     }
     if (haveWarnings) {

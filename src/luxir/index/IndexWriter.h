@@ -12,6 +12,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/flow_graph.h>
+#include <oneapi/tbb/task_arena.h>
 #include "luxir/index/AuxInfo.h"
 #include "CommitSnapshotRegistry.h"
 #include "luxir/index/IndexRamBudget.h"
@@ -426,7 +427,9 @@ public:
   // use a multfunction node when there is no downstream consumer (i.e. the output is dropped or can be dropped)
   // using a normal function node would cause buffering.
 
-  tbb::flow::graph updateGraph;
+  // A flow graph runs its tasks in the arena it is constructed in, so the ctor
+  // emplaces it inside the writer's arena.
+  std::optional<tbb::flow::graph> updateGraph;
   std::unique_ptr<UpdateMessageMultiFunc> startUpdateNode;
   std::unique_ptr<UpdateMessageFunc> processUpdateNode;
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > updateSequencerNode;
@@ -457,9 +460,12 @@ public:
   // reserve against; pass null for a private unlimited budget (tests, embedded).
   // The collection owns snapshots and closes it after draining this writer.
   // A nonnull schema is for creation only; reopening loads the manifest schema.
+  // arena runs the writer's batches, flushes and merges (the node's index
+  // arena, for a collection); null means the arena of the constructing thread.
   explicit IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema = {},
                        IndexRamBudget* indexRamBudget = nullptr,
-                       int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {});
+                       int mergeFactor = MergePolicy::DEFAULT_MERGE_FACTOR, std::string initialIncarnation = {},
+                       oneapi::tbb::task_arena* arena = nullptr);
   ~IndexWriter();
   void close();
 
@@ -517,6 +523,12 @@ public:
   std::shared_ptr<const std::string> getFailureReason() const {
     return failed.load(std::memory_order_acquire) ? failureReason : nullptr;
   }
+
+  // An external check found a committed file damaged (Collection::fail): no
+  // further update, flush, merge or commit may read those bytes or publish
+  // over them. Admission, commit and publication all consult `failed`; a
+  // publication in flight completes first, and the registry closes.
+  void fail(std::string reason);
 
   // Advisory, for callers that would rather give up than submit (a streaming update
   // holding a cached writer).  Closing is terminal, so false may be stale but true
@@ -624,7 +636,9 @@ private:
   void finishUpdateBody(UpdateMessage& msg) {
     INDEX_DEBUG("finishUpdateBody: msg={}", (void*)&msg);
     bool doneWithMessage = true;
-    if (msg.commit != UpdateMessage::NO_COMMIT) {
+    // A failed request has no effects, including its commit.  Commit numbers are
+    // taken in initiateCommit, so skipping it leaves the commit sequencer dense.
+    if (msg.commit != UpdateMessage::NO_COMMIT && msg.result.ok()) {
       doneWithMessage = false;
       try {
         initiateCommit(msg);

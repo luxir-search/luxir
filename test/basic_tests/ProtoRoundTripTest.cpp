@@ -276,7 +276,7 @@ void roundTripType(const char* nm) {
 
 // The one hand-maintained list: every message type. Add a message -> add a line.
 #define LUXIR_MSGS(X)                                                                              \
-  X(SearchRequest) X(SearchOp) X(ExprOp) X(TopDocs) X(Fusion) X(RrfFusion) X(SortSpec)             \
+  X(SearchRequest) X(SearchOp) X(ExprOp) X(TopDocs) X(Fusion) X(RrfFusion) X(LinearFusion) X(SortSpec)             \
   X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(AnyOfQuery) X(Filter)    \
   X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(RegexQuery) X(FuzzyQuery) X(PhraseQuery)       \
   X(SimpleQuery) X(RangeQuery) X(GeoBoxQuery) X(GeoDistanceQuery) X(ExprQuery) X(Warning)           \
@@ -293,7 +293,7 @@ void roundTripType(const char* nm) {
   X(DeleteCollectionRequest) X(DeleteCollectionResponse) X(ListCollectionsResponse)                \
   X(StatsRequest) X(StatsResponse) X(StatsTotals) X(CollectionStats) X(ShardStats) X(IndexStats)    \
   X(SegmentStats) X(AuxStats) X(QueryCacheStats) X(IndexRamStats) X(ArenaStats) X(JemallocStats)   \
-  X(MemoryStats) X(StorageRamStats)                                                                \
+  X(FieldMetadataStats) X(MemoryStats) X(StorageRamStats)                                                                \
   X(CacheControlRequest) X(CacheControlResponse) X(CacheEntryDump)                                \
   X(ShardCacheControl) X(CollectionCacheControl)
 

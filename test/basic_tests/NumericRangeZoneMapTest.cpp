@@ -12,7 +12,7 @@
 
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryPrep.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
@@ -75,7 +75,9 @@ RangeRun runRange(IndexReader& reader, std::string_view field,
   for (int32_t doc = 0; doc < segment.maxDoc(); doc++) {
     if (materialized->get(doc)) run.bulk.push_back(doc);
   }
-  run.count = weight->count(segment);
+  auto count = QueryPrep::supplierCount(sparseSupplier);
+  EXPECT_TRUE(count.has_value());
+  run.count = count.value_or(-1);
   return run;
 }
 
@@ -335,7 +337,7 @@ TEST_F(NumericRangeZoneMapTest, countDeclinesDeletedSegment) {
   NumericPredicateQuery query("deleted_i", 0, 100);
   auto* weight = query.createWeight(context, 0);
   ASSERT_NE(index.reader->segments()[0].liveDocs(), nullptr);
-  EXPECT_EQ(weight->count(index.reader->segments()[0]), -1);
+  EXPECT_EQ(countForTests(weight, index.reader->segments()[0]), -1);
 }
 
 TEST_F(NumericRangeZoneMapTest, windowFilterFillAndProbeUseZoneMapScorer) {
@@ -498,10 +500,9 @@ TEST_F(NumericRangeZoneMapTest, predictedCrossingBlockComparesDecodedValues) {
   index.initReader();
 
   auto& segment = index.reader->segments()[0];
-  FieldReader fields(segment.postingsReader());
-  ASSERT_TRUE(fields.seek("predicted_cross_i"));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = segment.postingsReader().fieldInfo("predicted_cross_i");
+  ASSERT_NE(nullptr, fields);
+  const auto& info = *fields;
   IntColReader column(segment.postingsReader(), info);
   ASSERT_EQ(column.numBlocks(), 1);
   EXPECT_NE(column.blockInfo(0).scaledSlope, 0);

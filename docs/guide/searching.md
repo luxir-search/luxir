@@ -97,6 +97,7 @@ one.
 | `offset` | Zero-based rank of the first returned document. Default `0`. |
 | `get_number` | Compute and return the exact match count as `found`. |
 | `get_scores` | Add `_score_` to every returned document. |
+| `min_score` | Minimum relevance score. Documents scoring below it do not match; see [Minimum score](#minimum-score). |
 | `fields` | Fields to retrieve. Omitted: every retrievable field. |
 | `sort` | One sort clause or a list of them. Absent means relevance order. |
 | `batch_size` | Maximum documents in one streaming response batch. |
@@ -151,6 +152,354 @@ POST /collections/books/_search
   }
 }
 ```
+
+### Minimum score
+
+`min_score` drops documents whose query score is below the given value, the
+same contract as Elasticsearch's top-level `min_score`. A dropped document is
+not a match at all: it is absent from `docs`, from `found`, and from the
+domain of every entry in `ops`, so facet counts and metrics describe only the
+documents that passed. The score compared is the query's own score (filters
+do not score), and it is computed even when the request sorts by fields or
+does not return scores:
+
+```http
+POST /collections/books/_search
+
+{
+  "query": "title_t:dune",
+  "min_score": 0.5,
+  "get_number": true,
+  "ops": {"categories": {"field_facet": {"field": "category_s"}}}
+}
+```
+
+The value must be finite. A boundary score equal to `min_score` matches.
+Scores depend on the corpus, so calibrate thresholds per collection. A
+`min_score` on a fusion source applies to that source's ranked list before
+fusion. Any query can carry its own cut-off through
+[`rescore`](query-reference.md#rescore) `min_score`, and `knn` has a
+similarity threshold of its own ([Vector search](vector-search.md#similarity-threshold)).
+
+## Diversifying a document list
+
+Use `diversify` to keep at most a fixed number of documents per key:
+
+```json
+{
+  "query": "title_t:jacket",
+  "sort": "price_i asc",
+  "diversify": {"field": "product_id_s", "max_per_key": 2, "missing": "expand"},
+  "limit": 10,
+  "get_number": true,
+  "fields": ["id", "price_i"]
+}
+```
+
+This returns documents in the ordinary list order (sort values, then document
+order), keeping each key's best `max_per_key` documents. The cap applies before
+`offset`, so concatenating pages gives the same result as one large page.
+`limit: -1` returns the entire capped list; `limit: 0` returns only requested
+counts and operations. With `get_number`, `found` counts capped documents and
+`found_groups` counts distinct eligible keys. Exact totals read every matching
+key and retain per-key counts in request memory. Without totals, competitive
+pruning remains available.
+
+`field` accepts a field name or an exact tuple, for example
+`["product_id_s", "shop_s"]`. It uses the same single-valued key types and
+`missing` policies as collapse: `expand` gives each keyless document its own key,
+`group` preserves each missing tuple component as null, and `drop` excludes that
+row from the capped list and its counts. `max_per_key` must be positive.
+
+Diversify produces ordinary document rows, without `_group_` metadata. It works
+in facet buckets, in streaming responses and with `format=docs`. Ordinary `ops`
+see the full query/filter match set, including rows excluded by the cap or by
+`missing: drop`. Diversify does not change inherited facet count units; without
+an enclosing collapse they default to documents. A child domain reset keeps
+its enclosing bucket identities, as usual.
+
+A fusion source can diversify its own ranked document window. Its capped heads
+enter document fusion normally, and source windows never refill implicitly. With
+document-unit kNN the cap applies to its selected document window, without
+increasing `k`. Diversify does not establish a collapse scope for group-unit kNN;
+that unit still requires an enclosing collapse. Where one exists, it selects its
+group witnesses first and diversify independently caps those documents.
+
+`collapse` and `diversify` cannot appear on the same list. Use collapse for one
+row per group with group metadata and operations; use diversify for a capped
+document list. MMR, windowed caps and soft caps are not implemented.
+
+## Collapsing results
+
+Use `collapse` to return one document per distinct key, such as one result
+per product when several matching documents describe the same product.
+Groups rank by their best matching document according to `sort`, or by
+score when no sort is specified. That member is displayed unless `head_sort`
+selects another member. For example:
+
+```json
+{
+  "query": "title_t:jacket",
+  "collapse": "product_id_s",
+  "sort": "price_i asc",
+  "limit": 2,
+  "get_number": true,
+  "fields": ["id", "title_t", "price_i"]
+}
+```
+
+If five matching documents describe three products, a response might be:
+
+```json
+{
+  "found": 3,
+  "found_docs": 5,
+  "docs": [
+    {"id": "a", "title_t": "Rain jacket", "price_i": 49, "_group_": {"val": "P17"}},
+    {"id": "c", "title_t": "Winter jacket", "price_i": 89, "_group_": {"val": "P23"}}
+  ]
+}
+```
+
+`limit` and `offset` count groups. With `get_number: true`, `found` is the
+exact number of groups and `found_docs` is the number of eligible matching
+documents, both before paging. `limit: 0` returns totals without documents;
+`limit: -1` returns every group. Exact totals require examining all matching
+keys. Returning all groups or paging deeply also requires keeping more group
+heads in memory. Without totals, Luxir can skip documents whose ranking
+cannot reach the requested page.
+
+To order groups by their metrics, use `collapse.sort`. Its clauses name
+metric operations in `collapse.ops`, in priority order:
+
+```json
+{
+  "query": "title_t:jacket",
+  "sort": "score desc",
+  "get_scores": true,
+  "collapse": {
+    "field": "product_s",
+    "sort": ["from_price asc", "average_rating desc"],
+    "ops": {
+      "from_price": "min(price_f)",
+      "average_rating": "avg(rating_i)"
+    }
+  },
+  "limit": 10
+}
+```
+
+Each metric folds the group's eligible matching documents. Missing or failed
+metric values sort last in either direction; equal values continue to the
+next clause. Groups still tied follow their best member under the list's
+`sort`, then that member's document order. The displayed member is unchanged:
+it follows `head_sort`, defaulting to the list sort. With `get_scores: true`,
+`_group_.rank` contains the typed metric values in clause order, including
+nulls; the row's `_score_` remains its own relevance score.
+
+Metric order is exhaustive: every eligible group is accumulated before
+paging, even for a small `limit`. `offset`, `limit`, and `found` count groups;
+`limit: 0` returns requested totals without rows. Memory grows with all
+matching groups and metric states, and exceeding the request budget fails
+the request. Page member counts, display heads, operations and domain resets
+then run on the selected page as usual.
+
+Sort clauses must name metrics in `collapse.ops`. Sort metrics with their
+own `domain` override are currently unsupported; other page operations may
+reset their domains normally. Metric-ordered lists also work beneath facet
+and group buckets and in `Fusion.ops`; Fusion itself has no collapse order.
+With group-unit kNN, kNN first selects its candidate groups and their scored
+witnesses, then the metrics order those witnesses' groups. Metric ordering
+does not enlarge the kNN window.
+
+To display a different member while keeping the group's rank, set
+`collapse.head_sort`. It accepts the same clauses and expressions as `sort`,
+with document order resolving ties. For example, rank products by relevance
+and show their cheapest matching variant:
+
+```json
+{
+  "query": "title_t:jacket",
+  "get_scores": true,
+  "collapse": {
+    "field": "product_id_s",
+    "head_sort": ["price_i asc", "id asc"],
+    "get_number": true
+  },
+  "fields": ["id", "price_i"],
+  "limit": 10
+}
+```
+
+`collapse.get_number` adds `_group_.count`, the number of members in each
+returned group. This differs from the list's `get_number`, which returns
+totals before paging. When `head_sort` picks another member and `get_scores`
+is true, `_group_.rank` contains the group's original sort values as a typed
+array in clause order. The row's `_score_` is the displayed member's own score.
+Omitting `head_sort` displays the ranking member and omits `_group_.rank`.
+
+Use `collapse.ops` for operations on each returned group's matching members.
+The results appear by name inside `_group_`, alongside `val`, `count` and
+`rank`. For example:
+
+```json
+"collapse": {
+  "field": "product_id_s",
+  "ops": {
+    "from_price": "min(price_i)",
+    "variants": {"top_docs": {"sort": "price_i asc", "limit": 3}},
+    "swatches": {"field_facet": {"field": "color_s", "limit": -1}}
+  }
+}
+```
+
+Group operations support the same metrics, facets, nested operations and
+`top_docs` as [facet bucket operations](faceting.md). Facets inside a group
+count documents by default, including nested facets; `count_distinct` can
+request another measure explicitly. An omitted child `top_docs.query` selects
+all members without relevance scores. Repeat the query in that child to rank
+members by relevance; the owning list's scores are not inherited. A child
+`knn.unit: "groups"` and explicit `count_unit: "groups"` resolve to the
+nearest enclosing collapse, including within one of its group buckets.
+Within one group these yield its best member and a count of one where it
+has members; the default facet unit inside a group remains documents.
+
+The names `val`, `count`, `rank`, `singleton` and `missing` are reserved in
+both group and facet bucket operations.
+
+A child `domain` can search beyond the members that matched the list. For
+example, this returns every in-stock color of each page product, even when
+the list query matched only one color:
+
+```json
+"collapse": {
+  "field": "product_s",
+  "ops": {
+    "swatches": {
+      "field_facet": {"field": "color_s", "limit": -1},
+      "domain": {"query": {"all": true}, "filter": ["stock_i:>0"]}
+    }
+  }
+}
+```
+
+The reset keeps the group's key, including tuple null components or an
+expanded singleton's document identity, and every enclosing facet bucket.
+It drops the matching queries above it. Set `apply_parent_filters: true` to
+also keep the owning list's routed filters; this requires `domain.query`.
+Without `domain.query`, extra `domain.filter` clauses only narrow the
+ordinary member domain. See [bucket domain resets](faceting.md#bucket-domain-resets)
+for nesting. A reset below a kNN query-facet bucket re-evaluates its window
+in the reset scope, so child membership may differ from the parent's count;
+nested selections run outer to inner.
+
+Without a reset, members come from this list's matching documents, including
+its filters and deletes. For kNN, only documents admitted into that query's candidate window
+are members; enrichment does not run another neighbor search or find the
+other indexed documents with the same key. In group-unit kNN the window
+contains one witness per group, so every returned member count is one.
+
+Counts and head selection run only for groups on the returned page. Indexed
+keys can look up those groups directly; other keys or selective matches may
+require walking the matching documents. Cost grows with the page and its
+members. A request using only `collapse` performs no enrichment pass. Each
+streaming batch includes complete group metadata and operation results for its rows.
+
+A key field uses value binding and must be single-valued. Supported types
+are STRING or ID with an index and column, INT (signed 64-bit), and DATE with
+a column. Use an object to group by a tuple of fields:
+
+```json
+"collapse": {"field": ["shop_s", "product_i"], "missing": "group"}
+```
+
+`missing` controls documents with any missing key component:
+
+- `expand` (the default) gives each such document its own group.
+- `group` treats each missing component as null and keeps present components,
+  so `["shop-A", null]` and `["shop-B", null]` are different groups.
+- `drop` excludes such documents, including from `found_docs`.
+
+Each returned document has `_group_`: `{"val":"P17"}` for one field,
+`{"val":["shop-A",null]}` for a tuple, or
+`{"val":null,"singleton":true}` for a document grouped separately by
+`expand`. String keys use indexed values; date keys use epoch milliseconds.
+Groups tied on all sort values follow their best member's document order,
+including documents grouped separately by `expand`. The best member within a
+group uses the same sort and document tiebreak. With the default
+`head_sort`, a collapsed list is the ordinary sorted list with later
+documents of the same key removed, before
+applying offset and limit. To order tied groups by key, add an explicit sort
+clause on the key field, for example `"sort": ["score desc", "product_s asc"]`.
+
+For hybrid retrieval, `fusion.collapse` applies this same best-member rule
+after document fusion. Its counts, display heads and group operations use the
+source-window union. Sources may also collapse independently for diversity;
+only their head documents enter fusion. For example:
+
+```json
+{"ops":{"hybrid":{"fusion":{
+  "rrf":{},
+  "sources":{"text":{"query":"title_t:jacket","collapse":"product_s","limit":100}},
+  "collapse":{"field":"product_s","get_number":true},
+  "limit":10,"get_number":true
+}}}}
+```
+
+Fusion heads retain their own fused document scores, while `_group_.rank`
+holds the best member's fused score. Group metric sort on fusion is currently
+rejected. See [hybrid search](vector-search.md#hybrid-search) for source
+options, evidence domains and resets.
+
+For vector retrieval, set `knn.unit: "groups"` to select `k` nearest groups
+before list paging. The default `docs` unit selects `k` documents and can
+underfill after collapse. `refine_candidates` counts candidate documents in
+both units; group search limits each group's share before rescoring several
+members and selecting its best. Each selected group contributes one scored witness
+to the query's match set; child operations see those witnesses. See
+[Nearest groups](vector-search.md#nearest-groups) for exact/ANN behavior and
+underfill diagnostics. Wrapping the kNN node in boolean or rescore queries
+does not change its unit, and list offset/limit do not enlarge its window.
+
+Streaming batches preserve the association between each document and its
+group. The protobuf `DocList.groups` table contains typed keys aligned with
+the returned rows. With `format=docs`, every document includes `_group_` and
+the `_header_` includes requested totals.
+
+The URL parameter `collapse=<field>` replaces the `q` operation's collapse
+specification with that field. `explain=request` shows the canonical object
+form. See [Limits](#limits) for unsupported combinations.
+
+Facets under the list count distinct groups in their own routed
+document domains by default. `count_unit: "docs"` restores document counts;
+expression metrics remain document-weighted. See
+[Counting groups and distinct keys](faceting.md#counting-groups-and-distinct-keys)
+for nested facets, selections, independent distinct keys, and memory costs.
+
+A `fusion` in the list's ordinary `ops` ranks matching documents, including
+members omitted from the collapsed page. Fusion's sources and result remain
+document lists; the enclosing collapse does not group Fusion's ranking:
+
+```json
+{
+  "query": "title_t:jacket",
+  "collapse": "product_s",
+  "limit": 10,
+  "ops": {
+    "recent": {
+      "fusion": {
+        "rrf": {},
+        "sources": {"newest": {"sort": "created_dt desc", "limit": 50}},
+        "limit": 5
+      }
+    }
+  }
+}
+```
+
+Collapsed child lists also work [inside facet buckets](faceting.md#top-documents-per-bucket)
+and [in Fusion's operations](vector-search.md#hybrid-search). Each
+child uses its own key and sort over the documents its parent supplies.
 
 ## One request, several results
 
@@ -214,7 +563,7 @@ doubles. An empty metric domain renders as `null` in JSON.
 One request returned the documents, the facet counts for a sidebar, and the
 total for a header. See [Faceting](faceting.md) for
 terms, range, date, nested, and per-bucket operations, and
-[Vector Search](vector-search.md#hybrid-search-with-rrf) for a fusion operation
+[Vector Search](vector-search.md#hybrid-search) for a fusion operation
 that ranks several sources and carries facets of its own.
 
 For an interactive sidebar, put the user's choices in each facet's
@@ -561,6 +910,7 @@ The recognized top-document parameters are:
 | Parameter | Value |
 |---|---|
 | `query` | Expression query string, exactly like a JSON string in the body `query` position. |
+| `collapse` | One key field, replacing the body collapse specification. |
 | `limit`, `offset` | Signed 64-bit decimal integer. |
 | `fields` | Comma-separated field names. An empty value clears the body list. |
 | `sort` | One sort clause per parameter, in the body's string form: `expr`, `expr asc`, or `expr desc`. Repeat to form an ordered sort list. |
@@ -704,7 +1054,8 @@ output began aborts the chunked body so a conforming client sees truncation
 rather than a plausible partial success.
 
 Docs format uses row documents and accepts only `top_docs` and fusion
-operations without nested operations.
+operations without list-level operations. Per-group `collapse.ops` results
+stay inside each row's `_group_` object.
 
 ## Warnings and errors
 
@@ -739,9 +1090,17 @@ preparation without collecting results. See
 
 ## Limits
 
+- Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
+  Per-group `collapse.ops` uses the page's matching member domains.
+  Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date
+  ranges, and query facets. TEXT distinct facets and metric facet sorts with
+  distinct counts are unsupported.
+- Document-unit kNN selects `k` documents before collapse, so repeated keys
+  can produce fewer than `k` groups. Group-unit kNN selects groups, with ANN
+  recall and underfill subject to candidate and IVF effort limits.
 - Ordered page-after pagination is not implemented. `offset` skips the first
-  matching documents in ranked order, and collection retains up to
-  `offset + limit` documents, so deep pages cost more. An offset past the
+  matching documents (or collapsed groups) in ranked order, and collection
+  retains up to `offset + limit` documents or group heads, so deep pages cost more. An offset past the
   matches returns one empty final batch. Use document-per-line export when the
   goal is to consume every match.
 - The `(segment, docid)` tiebreak is reader-local and can change after segment

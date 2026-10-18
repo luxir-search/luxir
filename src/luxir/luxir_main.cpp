@@ -1,8 +1,13 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <atomic>
+#include <csignal>
+#include <cstring>
 #include <filesystem>
 #include <optional>
+#include <pthread.h>
+#include <semaphore>
 #include <sstream>
 #include <thread>
 #include "luxir/luxir_main.h"
@@ -17,6 +22,54 @@
 namespace fs = std::filesystem;
 
 using namespace luxir;
+
+namespace {
+
+sigset_t shutdownSignals() {
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGTERM);
+  sigaddset(&set, SIGINT);
+  return set;
+}
+
+// Turns SIGTERM/SIGINT into a graceful stop.  The signals must already be
+// blocked in every thread (see luxir_main), so only sigwait here sees them.
+// The first signal releases `stop`; a second one while draining force-exits.
+class SignalWatcher {
+  std::binary_semaphore& stop;
+  std::atomic<bool> done{false};
+  std::thread thread;
+
+  void run() {
+    pthread_setname_np(pthread_self(), "luxir_signals");
+    sigset_t set = shutdownSignals();
+    bool stopping = false;
+    for (;;) {
+      int sig = 0;
+      if (sigwait(&set, &sig) != 0) continue;
+      if (done.load(std::memory_order_acquire)) return;
+      if (stopping) {
+        LOG_WARN("Received {} while shutting down; exiting immediately", strsignal(sig));
+        std::_Exit(128 + sig);
+      }
+      LOG_INFO("Received {}; shutting down", strsignal(sig));
+      stopping = true;
+      stop.release();
+    }
+  }
+
+public:
+  explicit SignalWatcher(std::binary_semaphore& stop) : stop(stop), thread([this] { run(); }) {}
+
+  ~SignalWatcher() {
+    done.store(true, std::memory_order_release);
+    pthread_kill(thread.native_handle(), SIGTERM);  // wake sigwait
+    thread.join();
+  }
+};
+
+} // namespace
 
 int luxir_main(int argc, char** argv) {
   spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");
@@ -53,7 +106,13 @@ int luxir_main(int argc, char** argv) {
       return 1;
     }
     if (!app.get_option("--log-level")->count()) config.log_level = "warn";
-  } else std::cout << luxir_banner() << std::endl;
+  } else {
+    // Block the shutdown signals before any thread exists so every thread
+    // inherits the mask and only SignalWatcher's sigwait receives them.
+    sigset_t set = shutdownSignals();
+    pthread_sigmask(SIG_BLOCK, &set, nullptr);
+    std::cout << luxir_banner() << std::endl;
+  }
 
   try {
     config.normalize();
@@ -75,7 +134,7 @@ int luxir_main(int argc, char** argv) {
 
   if (*promote) {
     try {
-      return luxir::promote(config.store.data_dir, std::cout) ? 0 : 1;
+      return luxir::promote(config.store.data_dir, std::cout, config.store.verify_on_open == "full") ? 0 : 1;
     } catch (const std::exception& e) {
       std::cerr << "Promote failed: " << e.what() << '\n';
       return 1;
@@ -96,11 +155,14 @@ int luxir_main(int argc, char** argv) {
            spdlog::level::to_string_view((spdlog::level::level_enum)SPDLOG_ACTIVE_LEVEL),
            spdlog::level::to_string_view(spdlog::get_level()));
 
+  bool started = false;
   try {
+    // Released by the first SIGTERM/SIGINT, or when gRPC run() returns early.
+    std::binary_semaphore stop{0};
     LuxirNode node{config};
 
     // The HTTP/JSON server runs on its own connection-I/O shards and accept
-    // thread; start it (non-blocking) before the blocking gRPC run().
+    // thread; start it (non-blocking) before gRPC.
     std::optional<HttpServer> httpServer;
     if (config.server.http.enabled) {
       httpServer.emplace(node, config.server.http.resolveThreads(), config.server.http.port);
@@ -108,13 +170,22 @@ int luxir_main(int argc, char** argv) {
     }
 
     GRPCServer server(node, config.server.grpc.resolveThreads(), config.server.grpc.port);
-    server.run();
+    // Declared after the servers so it is joined before they are destroyed.
+    SignalWatcher signals{stop};
+    std::thread grpcThread([&] { server.run(); stop.release(); });
+    started = server.waitForStart();
+    if (started) stop.acquire();
 
+    // Drain: stop accepting, let in-flight requests finish, then join threads.
+    server.shutdown();
+    grpcThread.join();
     if (httpServer) httpServer->shutdown();
   } catch (const std::exception &e) {
     LOG_ERROR("Startup failed: {}", e.what());
     return 1;
   }
+  if (!started) return 1;
+  LOG_INFO("Shutdown complete");
   return 0;
 }
 

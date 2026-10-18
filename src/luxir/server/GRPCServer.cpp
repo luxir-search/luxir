@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <deque>
+#include <limits>
 #include <memory_resource>
 #include <mutex>
 #include <optional>
@@ -74,6 +75,16 @@ void luxir::GRPCServer::run() {
   // The actual port will be stored in serverPort
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(), &serverPort);
 
+  // gRPC's own default (4 MiB) is far below the HTTP buffered-body limit and
+  // rejects ordinary update batches.  The send size stays at gRPC's default
+  // (unlimited): search replies are streamed in bounded batches.
+  const auto& config = luxirNode.getConfig();
+  int64_t maxReceive = config.server.grpc.max_receive_message_size > 0
+                           ? config.server.grpc.max_receive_message_size
+                           : config.ingest.max_request_body;
+  maxReceive = std::clamp<int64_t>(maxReceive, 1, std::numeric_limits<int>::max());
+  builder.SetMaxReceiveMessageSize((int)maxReceive);
+
   // One generic service handles every method as raw bytes; dispatch is by RPC
   // path inside GenericCallData.  registerLuxirDescriptors() makes describe and
   // FileContainingSymbol work through the generated descriptor pool.  TODO:
@@ -99,7 +110,8 @@ void luxir::GRPCServer::run() {
     startLatchThreads.count_down(nthreads);
     return;
   }
-  LOG_INFO("GRPCServer listening on {}:{}", bindHost, serverPort);
+  LOG_INFO("GRPCServer listening on {}:{} (max receive message size {} bytes)", bindHost, serverPort,
+           maxReceive);
 
   threads.reserve(nthreads);
   for (int i=0; i<nthreads; i++) {

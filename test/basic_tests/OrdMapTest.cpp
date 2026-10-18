@@ -4,8 +4,11 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
+#include <barrier>
+#include <latch>
 #include <bit>
 #include <format>
+#include <thread>
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -13,6 +16,8 @@
 #include "luxir/search/OrdMap.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/reader/IntColReader.h"
+#include "luxir/reader/FieldMetadataMemory.h"
+#include "luxir/util/Signal.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -51,22 +56,95 @@ TEST_F(OrdMapTest, EmptyIndex) {
   
   auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
 
-  EXPECT_EQ(reader->getOrdMapCacheSize(), 0);
+  auto checkAbsent = [&] {
+    auto names = fieldMetadataMemory.names.load();
+    auto bytes = fieldMetadataMemory.nameBytes.load();
+    for (int i = 0; i < 20; i++) {
+      EXPECT_EQ(nullptr, reader->getOrdMap("missing" + std::to_string(i) + "_s"));
+    }
+    EXPECT_EQ(names, fieldMetadataMemory.names.load());
+    EXPECT_EQ(bytes, fieldMetadataMemory.nameBytes.load());
+  };
+  checkAbsent();
 
-  auto ordMap = reader->getOrdMap("field1_s");
-
-  // OrdMap should be null for empty index
-  EXPECT_EQ(ordMap, nullptr);
-  // Make sure the null wasn't cached.
-  EXPECT_EQ(reader->getOrdMapCacheSize(), 0);
-
-  // If field doesn't exist, same thing.
   helper->index({{"otherfield_s", "apple"}, {"id", "1"}}, UpdateMessage::COMMIT);
   helper->index({{"otherfield_s", "banana"}, {"id", "2"}}, UpdateMessage::COMMIT);
-  ordMap = reader->getOrdMap("field1_s");
-  EXPECT_EQ(ordMap, nullptr);
-  // Make sure the null wasn't cached.
-  EXPECT_EQ(reader->getOrdMapCacheSize(), 0);
+  reader = helper->getIndexWriter()->snapshots.readers.getReader();
+  checkAbsent();
+}
+
+TEST_F(OrdMapTest, concurrentBuildAndCoreGenerationSharing) {
+  auto writer = helper->getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  helper->index({{"field1_s", "apple"}, {"id", "1"}}, UpdateMessage::NO_COMMIT);
+  helper->index({{"field1_s", "apple"}, {"id", "keep"}}, UpdateMessage::COMMIT);
+  helper->index({{"field1_s", "banana"}, {"id", "2"}}, UpdateMessage::COMMIT);
+  auto reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(2u, reader->segments().size());
+
+  std::atomic<int> builds{0};
+  std::latch attached(15);
+  Signal::listen("sharedLazyBuildWait", [&](void*, void*, void*) -> void* {
+    attached.count_down();
+    return nullptr;
+  });
+  Signal::listen("ordMapBuild", [&](void*, void*, void*) -> void* {
+    if (builds.fetch_add(1) == 0) attached.wait();
+    return nullptr;
+  });
+  std::array<std::shared_ptr<OrdMap>, 16> maps;
+  std::barrier start((int)maps.size());
+  {
+    std::vector<std::jthread> threads;
+    for (size_t i = 0; i < maps.size(); i++) {
+      threads.emplace_back([&, i] {
+        start.arrive_and_wait();
+        maps[i] = reader->getOrdMap("field1_s");
+      });
+    }
+  }
+  Signal::unlisten("sharedLazyBuildWait");
+  ASSERT_NE(nullptr, maps[0]);
+  EXPECT_EQ(1, builds.load());
+  for (const auto& map : maps) EXPECT_EQ(maps[0], map);
+
+  auto same = std::make_shared<IndexReader>(writer->dir, reader.get());
+  EXPECT_EQ(maps[0], same->getOrdMap("field1_s"));
+  ASSERT_TRUE(helper->deleteById("1", UpdateMessage::COMMIT).success);
+  auto deleted = writer->snapshots.readers.getReader();
+  EXPECT_EQ(reader->coreGen(), deleted->coreGen());
+  EXPECT_EQ(maps[0], deleted->getOrdMap("field1_s"));
+  EXPECT_EQ(1, builds.load());
+
+  helper->index({{"field1_s", "cherry"}, {"id", "3"}}, UpdateMessage::COMMIT);
+  auto changed = writer->snapshots.readers.getReader();
+  EXPECT_NE(reader->coreGen(), changed->coreGen());
+  auto rebuilt = changed->getOrdMap("field1_s");
+  ASSERT_NE(nullptr, rebuilt);
+  EXPECT_NE(maps[0], rebuilt);
+  EXPECT_EQ(2, builds.load());
+  EXPECT_EQ(3, rebuilt->numOrds());
+}
+
+TEST_F(OrdMapTest, failedBuildIsRetried) {
+  helper->index({{"field1_s", "apple"}, {"id", "1"}}, UpdateMessage::COMMIT);
+  auto reader = helper->getIndexWriter()->snapshots.readers.getReader();
+  int builds = 0;
+  auto error = std::make_exception_ptr(std::runtime_error("original OrdMap error"));
+  Signal::listen("ordMapBuild", [&](void*, void*, void*) -> void* {
+    if (++builds == 1) std::rethrow_exception(error);
+    return nullptr;
+  });
+  try {
+    reader->getOrdMap("field1_s");
+    FAIL() << "Expected the build to fail";
+  } catch (...) {
+    EXPECT_EQ(error, std::current_exception());
+  }
+  auto map = reader->getOrdMap("field1_s");
+  ASSERT_NE(nullptr, map);
+  EXPECT_EQ(map, reader->getOrdMap("field1_s"));
+  EXPECT_EQ(2, builds);
 }
 
 // Single Segment with Simple Terms

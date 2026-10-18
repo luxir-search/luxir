@@ -5,11 +5,13 @@
 
 #include <atomic>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 #include "luxir/codec/NumColumnFormat.h"
+#include "SegFieldInfo.h"
 #include "luxir/store/Directory.h"
 #include "luxir/store/InputStream.h"
 
@@ -35,20 +37,28 @@ class PostingsReader {
   int64_t segInfoOffset;  // after this is segInfo, before this is the field index
   int32_t maxdoc;
 
-  // Numeric columns' leaf metadata, by field, read on first use. The views
-  // point into the files this reader maps, so they live exactly as long as
-  // the mappings. Append-only and lock-free: a lookup is an acquire load and
-  // a walk over the few fields ever asked for; a racing build is identical
-  // and the loser's node is discarded.
-  struct LeafMetaNode {
-    std::string field;
-    std::optional<NumColumnFormat::LeafMeta> meta;
-    LeafMetaNode* next;
-  };
-  std::atomic<LeafMetaNode*> leafMetas{nullptr};
+  // Ordinals follow the sorted field index. Only the directory is allocated
+  // at open; slot pages and immutable headers are published on first use.
+  struct FieldPage;
+  static constexpr size_t FIELDS_PER_PAGE = 64;
+  int32_t nFields = 0;
+  const uint32_t* fieldOffsets = nullptr;
+  int64_t fieldOffsetsLoc = 0;
+  std::unique_ptr<std::atomic<FieldPage*>[]> fieldPages;
 
-  std::optional<NumColumnFormat::LeafMeta> readLeafMeta(std::string_view field);
 public:
+  struct Field : SegFieldInfo {
+    struct ColumnBounds {
+      int64_t min, max;
+    };
+    std::optional<ColumnBounds> columnBounds;
+    // Field-sort planning reads every segment's leaf bounds. Keep the view
+    // with the header rather than rebuilding it for each request.
+    std::optional<NumColumnFormat::LeafMeta> leafMeta;
+    const NumColumnFormat::LeafMeta* numericLeafMeta() const noexcept {
+      return leafMeta ? &*leafMeta : nullptr;
+    }
+  };
 
   // used as a sentinel value for docs and positions iterators in a single segment.
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
@@ -91,14 +101,20 @@ public:
     return maxdoc;
   }
 
-  // Numeric column `field`'s leaf metadata (NumColumnFormat::LeafMeta: leaf
-  // zones, persisted bound orders and value sketch), or null where this
-  // segment has no such column or its leaves do not bound docs' keys
-  // (IntColReader::leafBounded). Read once per segment, not per request:
-  // field-sort planning reads every segment's, which on many small segments
-  // otherwise costs as much as the collection. `field` must sort by an int
-  // column (FieldType::sortsByIntColumn). Valid while this reader lives.
-  const NumColumnFormat::LeafMeta* numericLeafMeta(std::string_view field);
+  int32_t numFields() const noexcept { return nFields; }
+
+  // Immutable headers, decoded on first use and shared by all snapshots.
+  // Missing names and ordinals outside the field index return nullptr.
+  int32_t findOrdinal(std::string_view field) const;
+  const Field* fieldInfo(std::string_view field);
+  const Field* fieldInfo(int32_t ordinal);
+
+  struct FieldCacheStats {
+    size_t pages = 0;
+    size_t entries = 0;
+    size_t bytes = 0;
+  };
+  FieldCacheStats fieldCacheStats() const noexcept;
 
   // Total bytes in the physical base-segment files this reader can merge.
   uint64_t sizeInBytes() const noexcept {

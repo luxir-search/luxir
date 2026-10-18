@@ -26,6 +26,8 @@ protected:
   std::string_view field;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static inline bool disableDenseFillForTests = false;
   static inline bool disableTruthfulCostForTests = false;
 
@@ -293,7 +295,7 @@ public:
       size_t termCount = 0;
       int64_t sumDocFreq = 0;
       if (cachedFieldInfo != nullptr) {
-        auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord];
+        auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord);
         if (segFieldInfo != nullptr) {
           auto scratchGuard = scratchPool.rewindScopeGuard();
           auto* termsEnum = scratchPool.make<TermsEnum>(
@@ -503,7 +505,7 @@ public:
             buildContext.multiTermMaxLazyStateBytes);
         if (facts != nullptr && !facts->populated) facts = nullptr;
         if (weight.cachedFieldInfo == nullptr
-            || weight.cachedFieldInfo->segInfos[segment.ord] == nullptr) {
+            || weight.cachedFieldInfo->segInfos.at(segment.ord) == nullptr) {
           matchState = Query::MatchState::EMPTY;
         } else if (facts != nullptr) {
           matchState = facts->matchState;

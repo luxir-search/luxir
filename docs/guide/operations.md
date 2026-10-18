@@ -198,8 +198,10 @@ Filesystem publication syncs new data files and then the directory before
 writing a new `commit_<index_gen>` manifest with a length and xxh3 checksum
 footer. It syncs that manifest and then the directory before acknowledging
 the commit. Startup checks the newest manifest's footer and decodes its payload;
-it does not hash data files. Torn candidates are skipped. Fallback candidates
-also require their referenced files to be present with matching sizes.
+by default it does not hash data files (see
+[file integrity checks](#file-integrity-checks)). Torn candidates are skipped.
+Fallback candidates also require their referenced files to be present with
+matching sizes.
 
 Once the new root is durable, obsolete manifests and unreferenced data are removed.
 Replication pin counters are described in the
@@ -245,6 +247,18 @@ to 28 HTTP shards and 14 gRPC threads. Set explicit counts with:
 `--server.http.threads` sets the number of shards, not the total HTTP thread
 count; each shard owns one `io_context` and one runner. Connections are
 assigned round-robin at accept and remain pinned to their shard.
+
+Indexing, merges, and search work moved off a transport thread run on a shared
+pool of worker threads. `--server.workers` sets its size. The default (`0`) is
+one worker per available logical CPU less one, which leaves a CPU for the
+transport threads; on machines with 4 or fewer logical CPUs it is one worker per
+CPU, because holding one back would idle a large share of a small node (half of
+a 2-vCPU one). Transport threads are not counted: they share the CPUs with the
+workers.
+
+```bash
+./luxir --server.workers=2
+```
 
 Search requests default to serial execution directly on the transport thread
 that received them (an HTTP io shard or gRPC completion-queue thread). This
@@ -331,10 +345,22 @@ The HTTP request limits distinguish bounded material from streams:
 - `stream-batch-size` and `stream-batch-docs` are internal handoff thresholds,
   not limits on the number of documents in one HTTP stream.
 - `max-inflight-batches` bounds the number of internal batches one connection
-  can submit concurrently. `0` (the default) uses task-arena concurrency plus
-  two; `1` makes batch submission serial. Reads pause when the limit is
+  can submit concurrently. `0` (the default) uses the worker count
+  (`--server.workers`) plus two; `1` makes batch submission serial. Reads pause when the limit is
   reached and resume as batches complete. A larger limit uses more staging
   memory.
+
+gRPC has one request limit, on the size of each received message (a unary
+request or one message of a stream):
+
+```bash
+./luxir --server.grpc.max-receive-message-size=64MB
+```
+
+It defaults to `--indexing.max-request-body`, so the buffered HTTP and gRPC
+ceilings move together. A larger message fails with `RESOURCE_EXHAUSTED`
+before it is decoded; see [gRPC API](grpc.md#message-size). Replies have no
+size limit; search results are streamed in bounded batches.
 
 Search has its own limits:
 
@@ -362,11 +388,13 @@ across machines if requests must produce identical civil-time boundaries.
 
 ## Shutdown and recovery
 
-Engine/server components have drainable shutdown paths, but the current
-`luxir` executable does not install an application signal handler to invoke
-them. A normal `SIGTERM`/`SIGINT` therefore terminates the process rather than
-waiting for in-flight requests. Before a planned stop, quiesce producers and
-publish an immediate commit. After an unplanned stop, the filesystem backend
+On `SIGTERM` or `SIGINT` the server stops accepting connections, waits for
+in-flight gRPC and HTTP requests to finish, stops background work (scrubbing,
+replication), releases the data directory and exits with status `0`. Updates
+that were not yet committed are not committed by shutdown: only acknowledged
+commits are durable, so before a planned stop quiesce producers and publish an
+immediate commit. A second signal during the drain exits immediately with
+status `128 + signal`. After an unplanned stop, the filesystem backend
 reopens the last durable commit. If recovery selects an older valid root, a writer
 publishes it under a new incarnation so followers cannot confuse it with an
 older generation of their current source. File retirement does not fsync removals:
@@ -377,7 +405,75 @@ kept as a tombstone rather than preventing healthy collections from loading.
 Queries and updates to that collection return the recorded load error as an
 `unavailable` error (HTTP `503`, code `collection_unavailable`) and the server
 will not silently recreate storage over it. Other segment corruption is
-detected when the affected reader is opened.
+detected when the affected reader is opened, or earlier with the
+[file integrity checks](#file-integrity-checks) below.
+
+## File integrity checks
+
+Every committed manifest records each file it references with its size and
+xxh3-64 digest, computed while the file is written. Checks read a file with
+its own descriptor (never through the mapping queries use), so a bad sector
+fails the check instead of the process, and a check never touches the request
+threads' address space.
+
+- **Transfers** always verify: a replicated file is hashed while it streams in
+  and is installed only if it matches, and a follower hashes a leftover local
+  candidate before reusing it. Reuse by hard link (a repointed follower,
+  `luxir promote`, writer recovery from an older root) compares manifest
+  descriptors only; whether the linked bytes still match is the at-rest
+  question the checks below answer.
+- **`--store.verify-on-open=full`** reads every file of every collection's
+  committed snapshot at startup, one collection at a time on the node's
+  indexing threads. Within a collection, files hash in parallel, largest first;
+  checksum descriptors are held for at most one collection at a time. Checked
+  files are verified before any reader maps or parses them. Readers map those
+  same descriptors, so a file retired during hashing remains readable. The
+  default, `none`, trusts the manifest footer and file sizes. A mismatching, missing or unreadable file fails only that
+  collection: it loads as unavailable (HTTP `503`, code `collection_unavailable`)
+  with an error naming the file (`checksum mismatch: <file>: expected size=..
+  xxh3=.., actual ..`, `missing file: <file>` or `unreadable file: <file>: ..` for EIO),
+  and its data is kept. Other verification errors also fail the load, with
+  `could not verify file: <file>: ..`; verification never creates corruption
+  markers. A follower then fetches the damaged files from its source. `luxir promote --store.verify-on-open=full` checks the files it links
+  the same way. Startup reads the whole index, so expect it to take as long as
+  reading the data directory once.
+- **`--store.scrub-interval-s=N`** (default `0`, off) re-reads the files of
+  every published snapshot every `N` seconds on one thread, with `O_DIRECT`
+  where the filesystem allows so the pass reads the media and leaves the page
+  cache to queries, paced to `--store.scrub-max-bytes-per-sec` (default
+  `64MB`, `0` for unthrottled; the rate is the throttle, the thread's low CPU
+  priority only yields the CPU). A size/digest mismatch, EIO, or a held file
+  missing on a writer or follower is logged at error level and fails
+  the collection: it is unavailable with the same error, a writer publishes
+  nothing more over the damaged bytes (no further update, commit or merge), and
+  the suspect file is recorded in a `corrupted_<id>` marker in the incarnation
+  directory. `GET /_stats` reports node-wide `scrub` counters (`passes`,
+  `files`, `bytes`, `mismatches`, `errors`, `last_pass_end` in Unix milliseconds)
+  while scrubbing is enabled. `mismatches` includes EIO and unexpectedly missing
+  files. Other errors (such as descriptor exhaustion, allocation failures or
+  permission errors) are warnings counted in `errors`; they leave the collection
+  available and the next pass retries. On a read-only node a live writer can
+  retire files still served through mappings: the scrub skips missing files.
+
+On a writable node a marker survives restarts: at startup the files it names
+are re-verified with `O_DIRECT` where supported, whatever
+`--store.verify-on-open` says. Under `full` other files use buffered reads.
+The collection stays unavailable while a suspect file still fails; the marker
+is removed once its files pass or are replaced. Read-only nodes honor existing
+markers but cannot persist new ones or clear them, so their scrub failures do
+not survive a restart unless another process recorded a marker.
+
+Markers travel with `luxir promote` and writer recovery into a new incarnation,
+restricted to files in the copied manifest. A promoted or recovered writer
+therefore re-checks known suspects even under the default policy. A follower
+repairs a scrub hit by itself: the next sync re-downloads every marker-named
+file even if its buffered hash matches, checks other local candidates as usual,
+and installs the copy again. Suspect files are never linked from the serving
+copy, and a failed serving collection supplies no hard-link reuse. An advance
+cannot replace a suspect serving file in place; repair first unloads the failed
+collection and re-stages it. Repair a writer by restoring from a follower
+(`luxir pull` and `luxir promote`) or by replacing the damaged file from a
+backup and restarting.
 
 ## Current production boundary
 
@@ -387,7 +483,6 @@ features it does not yet supply:
 - no automatic failover, leader election, or distributed query execution;
 - no built-in TLS/authentication/authorization;
 - no scheduled backups or automatic restore (use `luxir pull` and `luxir promote`);
-- no application-level signal-driven graceful shutdown;
 - pre-1.0 wire and schema interfaces that may change.
 
 None of these can be enabled by configuration. The pieces those layers will

@@ -275,6 +275,7 @@ class RescoreQuery final : public Query {
   class Supplier final : public Query::ScorerSupplier {
     Query::ScorerSupplier* childSupplier;
     ValueProgram* program;
+    ValueFieldInfos fieldInfos;
     IndexReader::Segment* segment;
     float multiplier;
     bool needsChildScore;
@@ -283,6 +284,7 @@ class RescoreQuery final : public Query {
     class Plan final : public Query::ScorerPlan {
       Query::ScorerPlan* childPlan;
       ValueProgram* program;
+      ValueFieldInfos fieldInfos;
       IndexReader::Segment* segment;
       float multiplier;
       bool needsChildScore;
@@ -293,7 +295,7 @@ class RescoreQuery final : public Query {
         Query::Scorer* childScorer = childPlan->build(targetPool);
         if (childScorer == nullptr) return nullptr;
         BoundValueProgram* expression =
-            program->bind(targetPool, *segment);
+            program->bind(targetPool, *segment, fieldInfos);
         const ValueBounds& root =
             expression->bounds(program->rootNode);
         if (root.alwaysMissing) {
@@ -315,17 +317,17 @@ class RescoreQuery final : public Query {
            bool needsChildScore, bool pruning)
         : Query::ScorerPlan(
               planContext, shape, cost),
-          childPlan(childPlan), program(program), segment(segment),
+          childPlan(childPlan), program(program), fieldInfos(supplier.fieldInfos), segment(segment),
           multiplier(multiplier), needsChildScore(needsChildScore),
           pruning(pruning) {}
     };
 
   public:
     Supplier(Query::ScorerSupplier* childSupplier,
-             ValueProgram* program, IndexReader::Segment* segment,
+             ValueProgram* program, ValueFieldInfos fieldInfos, IndexReader::Segment* segment,
              float multiplier,
              bool needsChildScore, bool pruning)
-      : childSupplier(childSupplier), program(program), segment(segment),
+      : childSupplier(childSupplier), program(program), fieldInfos(fieldInfos), segment(segment),
         multiplier(multiplier), needsChildScore(needsChildScore),
         pruning(pruning) {}
 
@@ -388,14 +390,14 @@ class RescoreQuery final : public Query {
 
   static Query::ScorerSupplier* wrapSupplier(
       MemPool& targetPool, IndexReader::Segment& segment,
-      Query::SegmentSource& childSource, ValueProgram& program,
+      Query::SegmentSource& childSource, ValueProgram& program, ValueFieldInfos fieldInfos,
       float multiplier, bool needsChildScore, bool pruning,
       Query::SupplierExecutionMode executionMode) {
     Query::ScorerSupplier* childSupplier =
         childSource.scorerSupplier(targetPool, segment, executionMode);
     if (childSupplier == nullptr) return nullptr;
     return targetPool.make<Supplier>(
-        childSupplier, &program, &segment, multiplier, needsChildScore, pruning);
+        childSupplier, &program, fieldInfos, &segment, multiplier, needsChildScore, pruning);
   }
 
 public:
@@ -403,6 +405,10 @@ public:
                std::optional<float> constantOutput = std::nullopt)
     : Query(QueryKind::RESCORE), child(child), program(program),
       constantOutput(constantOutput) {}
+
+  bool recoverableAsPredicate() const noexcept override {
+    return child->recoverableAsPredicate();
+  }
 
   bool equalsSameKind(const Query& other) const override {
     unused(other);
@@ -437,6 +443,7 @@ public:
   class Weight final : public Query::Weight {
     Query::Weight* childWeight;
     ValueProgram* program;
+    ValueFieldInfos fieldInfos;
     float multiplier;
     bool scored;
     bool needsChildScore;
@@ -444,16 +451,17 @@ public:
     class Prepared final : public Query::Weight::PreparedWeight {
       QueryPrep::PreparedSource child;
       ValueProgram* program;
+      ValueFieldInfos fieldInfos;
       float multiplier;
       bool scored;
       bool needsChildScore;
       bool pruning;
 
     public:
-      Prepared(QueryPrep::PreparedSource&& child, ValueProgram* program,
+      Prepared(QueryPrep::PreparedSource&& child, ValueProgram* program, ValueFieldInfos fieldInfos,
                float multiplier, bool scored, bool needsChildScore,
                bool pruning)
-        : child(std::move(child)), program(program), multiplier(multiplier),
+        : child(std::move(child)), program(program), fieldInfos(fieldInfos), multiplier(multiplier),
           scored(scored), needsChildScore(needsChildScore), pruning(pruning) {}
 
       Query::Scorer* createScorer(
@@ -473,12 +481,16 @@ public:
         if (!scored) {
           return source.scorerSupplier(targetPool, segment, executionMode);
         }
-        return wrapSupplier(targetPool, segment, source, *program, multiplier,
+        return wrapSupplier(targetPool, segment, source, *program, fieldInfos, multiplier,
                             needsChildScore, pruning, executionMode);
       }
 
       void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
         child.releaseSegmentState(segment);
+      }
+
+      size_t retainedBytes() const noexcept override {
+        return sizeof(*this) + (child.prepared ? child.prepared->retainedBytes() : 0);
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {
@@ -497,6 +509,7 @@ public:
       : Query::Weight(context, query, flags), program(query.program),
         multiplier(multiplier), scored((flags & NEED_SCORES) != 0),
         needsChildScore(scored && program->needsScore) {
+      if (scored) fieldInfos = program->resolveFields(context.pool, context.topReader);
       int32_t childFlags = needsChildScore ? flags : flags & ~NEED_SCORES;
       childWeight = query.child->createWeight(context, childFlags, 1.0f);
       traits = childWeight->getFlags() & ~IS_CONSTANT_SCORING;
@@ -513,7 +526,7 @@ public:
         source.setPrepared(childWeight->prepare(ctx));
       }
       return std::make_unique<Prepared>(
-          std::move(source), program, multiplier, scored, needsChildScore,
+          std::move(source), program, fieldInfos, multiplier, scored, needsChildScore,
           allowsPruning());
     }
 
@@ -534,7 +547,7 @@ public:
         return childWeight->scorerSupplier(
             targetPool, segment, executionMode);
       }
-      return wrapSupplier(targetPool, segment, *childWeight, *program,
+      return wrapSupplier(targetPool, segment, *childWeight, *program, fieldInfos,
                           multiplier, needsChildScore, allowsPruning(),
                           executionMode);
     }
@@ -547,9 +560,9 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    std::optional<int64_t> constantCount(
+    CountShortcut countShortcut(
         IndexReader::Segment& segment, DocSet* domain) override {
-      return childWeight->constantCount(segment, domain);
+      return childWeight->countShortcut(segment, domain);
     }
 
 

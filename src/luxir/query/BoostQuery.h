@@ -26,6 +26,10 @@ public:
     }
   }
 
+  bool recoverableAsPredicate() const noexcept override {
+    return child->recoverableAsPredicate();
+  }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const BoostQuery&>(other);
     return sameScoringClause(this, &rhs);

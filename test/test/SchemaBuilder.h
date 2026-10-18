@@ -34,6 +34,7 @@ class SchemaBuilder {
   std::deque<Pair> templates_;
   std::vector<Pair> fieldsFlat_;
   std::vector<Pair> templatesFlat_;
+  std::vector<std::pair<std::string_view, api::StoredResourceDef>> resources_;
 
   api::FieldDef& add(std::deque<Pair>& out, std::string_view name) {
     auto* def = api::build::allocMessage<api::FieldDef>(arena_);
@@ -47,6 +48,11 @@ public:
   // Add a concrete field / a template (abstract suffix or parent) definition.
   api::FieldDef& field(std::string_view name) { return add(fields_, name); }
   api::FieldDef& templ(std::string_view name) { return add(templates_, name); }
+
+  // Add a stored_resources entry; the reference is valid until the next call.
+  api::StoredResourceDef& storedResource(std::string_view name) {
+    return resources_.emplace_back(api::build::arenaStr(arena_, name), api::StoredResourceDef{}).second;
+  }
 
   api::FieldDef& variant(api::FieldDef& field, std::string_view label) {
     auto* def = api::build::allocMessage<api::FieldDef>(arena_);
@@ -87,6 +93,8 @@ public:
       std::span<const Pair>(fieldsFlat_.data(), fieldsFlat_.size()));
     d.templates = api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
       std::span<const Pair>(templatesFlat_.data(), templatesFlat_.size()));
+    d.stored_resources = api::map_view<std::string_view, api::StoredResourceDef>(
+      std::span<const std::pair<std::string_view, api::StoredResourceDef>>(resources_.data(), resources_.size()));
     return d;
   }
 

@@ -158,7 +158,7 @@ whole machine. Designed from the start for parallelism on modern hardware.
   per-operation default bindings so a bare field name does the right thing.
 - Per-field choices: index mode (match, or range acceleration), multi-valued,
   column-stored (sorting, faceting, analytics), stored source (retrieval, in
-  LZ4-compressed chunks).
+  LZ4- or ZSTD-compressed chunks, configurable per stored resource).
 - Numeric, date, and geo fields with `index: "range"` build a points index;
   without it the same queries run off the column with the same results.
 - Floats and doubles are stored order-preserving, so numeric sorting and
@@ -222,7 +222,11 @@ Anywhere a query goes, it can be a structured object or an expression string.
   like any other clause).
 - `constant_score`, `boost`, and `rescore`: keep a query's matches and replace
   each score with a value expression over columns and the original score
-  (`score * def(popularity_i, 1)`).
+  (`score * def(popularity_i, 1)`). `rescore` takes an optional `min_score`
+  cut-off (the `function_score` / `script_score` counterpart).
+- Request `min_score` (Elasticsearch-style): documents scoring below it are
+  dropped from the returned list, the exact count, and facet and metric
+  domains alike.
 - `knn` vector search, `geo_box`, and `geo_distance`.
 - `combined_fields` and `multi_match` (`cross_fields`, `most_fields`):
   search one text across several fields. `combined_fields` and
@@ -269,7 +273,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Stream every match: `limit: -1` with `?format=docs` returns one document
   per line over one connection, with no cursor, scroll state, or page size.
   The output pipes straight back into NDJSON ingest.
-- Hybrid fusion: reciprocal rank fusion over named sources with shared and
+- Hybrid fusion: weighted reciprocal rank fusion, or weighted linear fusion
+  of min-max normalized scores, over named sources with shared and
   per-source filters, `limit` and `offset` over the fused list, and facets and
   metrics over the fused candidate set.
 - A warnings channel: declared degradations (a clamped fuzzy distance, a
@@ -318,6 +323,9 @@ Anywhere a query goes, it can be a structured object or an expression string.
   carried through merges automatically, without reindexing documents.
 - Effort knobs: `k`, `refine_candidates`, `exact`, and per-engine knobs under
   `ivf` (`nprobe`, `min_scan_fraction`).
+- `similarity` threshold in the metric's own space (maximum L2 distance,
+  minimum dot product or cosine), with Elasticsearch `knn.similarity`
+  semantics: below-threshold neighbors leave results, counts, and facets.
 - Deterministic: parallel vector search returns bit-identical results to a
   serial run.
 

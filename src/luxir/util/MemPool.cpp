@@ -103,7 +103,9 @@ void MemPool::_rewind(const MemPool::save_point& savePoint, uint32_t buffersToSa
   // find index of matching buffer
   while (i>=0) {
     char* buf = buffers[i];
-    if (savePoint >= buf && savePoint <= buf + bufferSize(buf)) {
+    // Same bound as rewind(): the end of an exactly full buffer must not match the start of
+    // an adjacent later buffer.
+    if (savePoint >= buf + HEADER_SIZE && savePoint <= buf + bufferSize(buf)) {
       break;
     }
     i--;

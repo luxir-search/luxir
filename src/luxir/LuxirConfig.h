@@ -19,11 +19,32 @@ struct ServerConfig {
   // clamped to 1 by the servers.
   int64_t stream_buffer_bytes = 1 << 20;
 
+  // Worker threads of the node's task arena: indexing, merges, and parallel or
+  // dispatched search.  Transport threads (HTTP shards, gRPC) enter the arena
+  // through reserved slots and are not counted.  0 = auto: the affinity width
+  // less one, leaving a core for the transport threads, except on nodes of at
+  // most kSmallNodeCores, where holding a core back idles too much of the
+  // machine (half of a 2-vCPU node) and the transport threads share instead.
+  int workers = 0;
+  static constexpr int kSmallNodeCores = 4;
+
+  int resolveWorkers() const {
+    if (workers > 0) return workers;
+    int cores = std::max(1, oneapi::tbb::info::default_concurrency());
+    return cores <= kSmallNodeCores ? cores : cores - 1;
+  }
+
   struct Grpc {
     // <0 means "derive from the HTTP port" (http.port + 1), resolved in normalize().
     // An explicit --server.grpc.port / -p overrides.
     int port = -1;
     int threads = 0;  // 0 = auto
+    // Max size of one received gRPC message (a unary request or one message of
+    // a stream).  Larger messages fail with RESOURCE_EXHAUSTED before they are
+    // decoded.  0 = inherit ingest.max_request_body, so the gRPC and HTTP
+    // buffered-request ceilings move together.  Values above INT_MAX (gRPC's
+    // own ceiling) are clamped by the server.
+    int64_t max_receive_message_size = 0;
 
     /// Resolve threads: 0 means auto (affinity-aware concurrency / 2, minimum 1).
     int resolveThreads() const {
@@ -54,6 +75,14 @@ struct StoreConfig {
   std::string data_dir = "luxir_data";
   uint64_t ram_limit_mb = 0; // RAM storage only; zero is unlimited.
   CheckedDirConfig checked_dir;
+  // Before a collection serves at startup: none trusts the manifest footer and
+  // file sizes; full also reads every file the committed snapshot lists and
+  // checks its size and xxh3, failing only that collection on a mismatch.
+  std::string verify_on_open = "none";   // none, full
+  // Background re-verification of every published snapshot's files; a
+  // mismatch makes the collection unavailable. Zero disables it.
+  uint64_t scrub_interval_s = 0;
+  uint64_t scrub_max_bytes_per_sec = 64ULL * 1024 * 1024; // zero is unthrottled
 };
 
 struct IndexConfig {
@@ -87,7 +116,8 @@ struct IngestConfig {
 
   // Max size of a single buffered (non-streaming) request body - e.g. a /update
   // carrying an all_or_none request, or a /query.  Oversized -> 413, rejected at the
-  // JSON layer (gRPC has its own max message size).  A whole such request lands in one
+  // JSON layer.  It is also the default gRPC max receive message size (see
+  // ServerConfig::Grpc::max_receive_message_size).  A whole such request lands in one
   // inverter, so this is also what bounds a single non-streaming update's RAM.
   // Keep it GENEROUS: a low limit is a trap - it passes in testing and fails fatally
   // in production on a larger doc or atomic batch.  A future goal is to GUARANTEE a
@@ -112,9 +142,9 @@ struct IngestConfig {
   int64_t stream_batch_docs = 10000;
 
   // Maximum number of streaming NDJSON batches submitted by one connection at
-  // once.  0 derives the window from the node task arena's compute width; 1 is
-  // strict serial batch submission.  Staging memory grows roughly with this
-  // window, and live inverter memory grows with min(window, arena width).
+  // once.  0 derives the window from the node's workers (server.workers) plus
+  // two; 1 is strict serial batch submission.  Staging memory grows roughly
+  // with this window, and live inverter memory grows with min(window, workers).
   int64_t max_inflight_batches = 0;
 
   // Effective per-record cap: max_record if set, else the buffered-body cap.
@@ -143,6 +173,9 @@ struct ReplicationConfig {
   int64_t pin_idle_timeout_ms = 60'000;
   uint64_t pin_retained_bytes = 1024ULL * 1024 * 1024;
   int64_t follower_timeout_ms = 90'000;
+  // A follower's delay before reconnecting to a lost source, and before its first
+  // retry of a failed collection sync (doubling per consecutive failure, to 60 s).
+  int64_t retry_ms = 1000;
   std::string source;
   std::string follower_id; // empty: host:port of this node's listener
   std::string tenants; // comma-separated; empty subscribes to every tenant

@@ -100,7 +100,9 @@ public:
         return stringSortModeOverride.exchange(value);
     }
     
-    std::unique_ptr<FieldComparator> createComparator(IndexReader* reader = nullptr) const {
+    std::unique_ptr<FieldComparator> createComparator(
+        IndexReader& reader) const {
+        auto fields = reader.field(fieldName);
         // Handle regular field types based on FieldType
         FieldType::Type type = const_cast<FieldType*>(fieldType)->type();
         if (FieldType::sortsByIntColumn(type)) {
@@ -109,7 +111,7 @@ public:
             // matches the floating point order, so the int comparator
             // works on the encoded values as-is for all four.
             return std::make_unique<SimpleNumericFieldComparator>(
-                fieldName, isReversed(), missingValue
+                isReversed(), missingValue, fields
             );
         }
         switch (type) {
@@ -118,24 +120,24 @@ public:
                 // Use FieldType information to determine if this is an indexed string field
                 if (const_cast<FieldType*>(fieldType)->isSet(FieldType::INDEX_DOCS)) {
                     if (stringSortMode == StringSortMode::SEGMENT &&
-                        (!reader || reader->segments().size() > 1)) {
+                        reader.segments().size() > 1) {
                         return std::make_unique<SegmentOrdComparator>(
-                            fieldName, isReversed(), missingValue
+                            isReversed(), missingValue, fields
                         );
                     }
                     // Use GlobalOrdComparator for indexed string fields
                     // Build OrdMap only if needed (multi-segment case)
                     std::shared_ptr<OrdMap> ordMap;
-                    if (reader && reader->segments().size() > 1) {
-                        ordMap = reader->getOrdMap(fieldName);
+                    if (reader.segments().size() > 1) {
+                        ordMap = reader.getOrdMap(fieldName);
                     }
                     return std::make_unique<GlobalOrdComparator>(
-                        fieldName, ordMap, isReversed(), missingValue
+                        ordMap, isReversed(), missingValue, fields
                     );
                 } else {
                     // Use StrColComparator for non-indexed string columns
                     return std::make_unique<StrColComparator>(
-                        fieldName, isReversed(), missingValue
+                        isReversed(), missingValue, fields
                     );
                 }
             }

@@ -6,6 +6,7 @@
 #include "luxir/util/ApiError.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "ReplicationFollower.h"
+#include "Scrubber.h"
 
 #include <cassert>
 #include <string_view>
@@ -15,6 +16,7 @@
 #include "luxir/api/build.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/reader/Postings.h"
+#include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/schema/Schema.h"
 
 namespace luxir {
@@ -34,6 +36,16 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   memory.storage_ram.used_bytes = node.storageBytes();
   memory.storage_ram.limit_bytes = node.getConfig().store.backend == "ram"
       ? node.getConfig().store.ram_limit_mb * 1024 * 1024 : 0;
+  auto& fields = memory.field_metadata;
+  fields.directories = fieldMetadataMemory.directories.load(std::memory_order_relaxed);
+  fields.directory_bytes = fieldMetadataMemory.directoryBytes.load(std::memory_order_relaxed);
+  fields.pages = fieldMetadataMemory.pages.load(std::memory_order_relaxed);
+  fields.page_bytes = fieldMetadataMemory.pageBytes.load(std::memory_order_relaxed);
+  fields.entries = fieldMetadataMemory.entries.load(std::memory_order_relaxed);
+  fields.entry_bytes = fieldMetadataMemory.entryBytes.load(std::memory_order_relaxed);
+  fields.names = fieldMetadataMemory.names.load(std::memory_order_relaxed);
+  fields.name_bytes = fieldMetadataMemory.nameBytes.load(std::memory_order_relaxed);
+  fields.bytes = fields.directory_bytes + fields.page_bytes + fields.entry_bytes + fields.name_bytes;
   auto process = processAllocatorStats();
   if (!process) return;
   auto& jemalloc = memory.jemalloc.emplace();
@@ -211,6 +223,10 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
 
   response.multiterm_expansion_refills =
       multitermExpansionRefills.load(std::memory_order_relaxed);
+  if (node.getScrubber().enabled() && request.collection.empty()) {
+    auto scrub = node.getScrubber().stats();
+    response.scrub = api::ScrubStats{scrub.passes, scrub.files, scrub.bytes, scrub.mismatches, scrub.errors, scrub.lastPassEnd};
+  }
 }
 
 void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request,

@@ -85,6 +85,7 @@ public:
   OpCursor& batchSize(int32_t n);
   OpCursor& getNumber(bool v = true);
   OpCursor& getScores(bool v = true);
+  OpCursor& minScore(float v);
   OpCursor& documentFormat(luxir::api::DocFormat v);
   OpCursor& withStats() { return getNumber().getScores(); }
 
@@ -631,6 +632,7 @@ inline OpCursor& OpCursor::fields(std::span<const std::string> fieldNames) {
 inline OpCursor& OpCursor::batchSize(int32_t n) { asTopDocs().batch_size = n; return *this; }
 inline OpCursor& OpCursor::getNumber(bool v) { asTopDocs().get_number = v; return *this; }
 inline OpCursor& OpCursor::getScores(bool v) { asTopDocs().get_scores = v; return *this; }
+inline OpCursor& OpCursor::minScore(float v) { asTopDocs().min_score = v; return *this; }
 inline OpCursor& OpCursor::documentFormat(luxir::api::DocFormat v) { asTopDocs().document_format = v; return *this; }
 
 inline OpCursor& OpCursor::limit(int64_t n) {
