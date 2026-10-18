@@ -1238,7 +1238,7 @@ message StatsResponse {
   // Set only by a StatsRequest.memory request, which returns nothing else.
   MemoryStats memory = 9;
   // Node-wide checksum scrub counters; set when store.scrub-interval-s is.
-  ScrubStats scrub = 10;
+  ScrubStats scrub = 14;
 }
 
 // Background checksum scrub of published snapshot files. A mismatch also

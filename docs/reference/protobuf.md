@@ -1749,7 +1749,7 @@ Operational statistics. An empty collection requests every collection on the nod
 | <a id="field-luxir.statsresponse.collections"></a>[`collections`](#field-luxir.statsresponse.collections) | 2 | [`CollectionStats`](#message-luxir.collectionstats) | repeated |  |
 | <a id="field-luxir.statsresponse.multiterm_expansion_refills"></a>[`multiterm_expansion_refills`](#field-luxir.statsresponse.multiterm_expansion_refills) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.statsresponse.memory"></a>[`memory`](#field-luxir.statsresponse.memory) | 9 | [`MemoryStats`](#message-luxir.memorystats) | singular | Set only by a StatsRequest.memory request, which returns nothing else. |
-| <a id="field-luxir.statsresponse.scrub"></a>[`scrub`](#field-luxir.statsresponse.scrub) | 10 | [`ScrubStats`](#message-luxir.scrubstats) | singular | Node-wide checksum scrub counters; set when store.scrub-interval-s is. |
+| <a id="field-luxir.statsresponse.scrub"></a>[`scrub`](#field-luxir.statsresponse.scrub) | 14 | [`ScrubStats`](#message-luxir.scrubstats) | singular | Node-wide checksum scrub counters; set when store.scrub-interval-s is. |
 
 <a id="message-luxir.statstotals"></a>
 
