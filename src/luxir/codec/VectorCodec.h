@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +24,12 @@ namespace luxir {
 ///         with x[i] ~= offset + scale * code[i] (8 + dims bytes).  offset and
 ///         scale are the vector's own min and (max - min) / 255, so a value
 ///         needs no per-segment or per-dimension statistics.
+///   BF16: dims bfloat16 values (2 * dims bytes): the high 16 bits of each
+///         float32, rounded to nearest even.  float32's exponent range with an
+///         8-bit significand, so it needs no range check (unlike F16).
+///   BIT:  one bit per dimension (dims / 8 bytes; dims a multiple of 8), set
+///         when the element is > 0, most significant bit first within a byte.
+///         Binary embeddings; scored only by Hamming similarity.
 ///
 /// The numeric values are persisted in segment field metadata; do not renumber.
 ///
@@ -35,7 +42,7 @@ namespace luxir {
 /// prefix keeps f32 payloads 4-byte aligned relative to the row, travels with
 /// the row through merges (rows stay self-describing), and sits in the same
 /// cache line the scorer reads first.
-enum class VectorEncoding : uint8_t { F32 = 0, F16 = 1, INT8 = 2 };
+enum class VectorEncoding : uint8_t { F32 = 0, F16 = 1, INT8 = 2, BF16 = 3, BIT = 4 };
 
 namespace vcodec {
 
@@ -46,13 +53,15 @@ inline constexpr int32_t INT8_LEVELS = 255;
 inline constexpr float F16_MAX = 65504.0f;
 
 inline bool valid(int32_t encoding) {
-  return encoding >= (int32_t)VectorEncoding::F32 && encoding <= (int32_t)VectorEncoding::INT8;
+  return encoding >= (int32_t)VectorEncoding::F32 && encoding <= (int32_t)VectorEncoding::BIT;
 }
 
 inline const char* name(VectorEncoding e) {
   switch (e) {
     case VectorEncoding::F16: return "f16";
     case VectorEncoding::INT8: return "int8";
+    case VectorEncoding::BF16: return "bf16";
+    case VectorEncoding::BIT: return "bit";
     case VectorEncoding::F32:
     default: return "f32";
   }
@@ -62,6 +71,8 @@ inline int32_t bytesPerVector(VectorEncoding e, int32_t dims) {
   switch (e) {
     case VectorEncoding::F16: return dims * 2;
     case VectorEncoding::INT8: return INT8_HEADER_BYTES + dims;
+    case VectorEncoding::BF16: return dims * 2;
+    case VectorEncoding::BIT: return dims / 8;
     case VectorEncoding::F32:
     default: return dims * (int32_t)sizeof(float);
   }
@@ -74,9 +85,26 @@ inline int32_t dimsFromBytes(VectorEncoding e, int32_t bytes) {
   switch (e) {
     case VectorEncoding::F16: return bytes % 2 == 0 ? bytes / 2 : -1;
     case VectorEncoding::INT8: return bytes > INT8_HEADER_BYTES ? bytes - INT8_HEADER_BYTES : -1;
+    case VectorEncoding::BF16: return bytes % 2 == 0 ? bytes / 2 : -1;
+    case VectorEncoding::BIT: return bytes * 8;
     case VectorEncoding::F32:
     default: return bytes % (int32_t)sizeof(float) == 0 ? bytes / (int32_t)sizeof(float) : -1;
   }
+}
+
+/// float32 -> bfloat16 bits, rounded to nearest even.  A finite value that
+/// would round up to infinity truncates to the largest finite bfloat16.
+inline uint16_t toBf16(float x) {
+  uint32_t bits = std::bit_cast<uint32_t>(x);
+  uint32_t rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+  if ((rounded & 0x7f800000u) == 0x7f800000u && (bits & 0x7f800000u) != 0x7f800000u) {
+    return (uint16_t)(bits >> 16);
+  }
+  return (uint16_t)(rounded >> 16);
+}
+
+inline float fromBf16(uint16_t h) {
+  return std::bit_cast<float>((uint32_t)h << 16);
 }
 
 struct Int8Header {
@@ -128,6 +156,18 @@ inline void encode(VectorEncoding e, const float* in, int32_t dims, char* out) {
       std::memcpy(out + sizeof(float), &h.scale, sizeof(float));
       return;
     }
+    case VectorEncoding::BF16:
+      for (int32_t i = 0; i < dims; i++) {
+        uint16_t h = toBf16(in[i]);
+        std::memcpy(out + 2 * i, &h, 2);
+      }
+      return;
+    case VectorEncoding::BIT:
+      std::memset(out, 0, (size_t)(dims / 8));
+      for (int32_t i = 0; i < dims; i++) {
+        if (in[i] > 0.0f) out[i >> 3] = (char)((uint8_t)out[i >> 3] | (uint8_t)(0x80u >> (i & 7)));
+      }
+      return;
     case VectorEncoding::F32:
     default:
       std::memcpy(out, in, (size_t)dims * sizeof(float));
@@ -151,6 +191,18 @@ inline void decode(VectorEncoding e, const char* in, int32_t dims, float* out) {
       for (int32_t i = 0; i < dims; i++) out[i] = h.offset + h.scale * (float)codes[i];
       return;
     }
+    case VectorEncoding::BF16:
+      for (int32_t i = 0; i < dims; i++) {
+        uint16_t h;
+        std::memcpy(&h, in + 2 * i, 2);
+        out[i] = fromBf16(h);
+      }
+      return;
+    case VectorEncoding::BIT:
+      for (int32_t i = 0; i < dims; i++) {
+        out[i] = (((uint8_t)in[i >> 3] >> (7 - (i & 7))) & 1u) ? 1.0f : 0.0f;
+      }
+      return;
     case VectorEncoding::F32:
     default:
       std::memcpy(out, in, (size_t)dims * sizeof(float));
@@ -187,6 +239,17 @@ inline double payloadNormSq(VectorEncoding e, const char* in, int32_t dims) {
       return (double)dims * offset * offset + 2.0 * offset * scale * (double)sumC
           + scale * scale * (double)sumCC;
     }
+    case VectorEncoding::BF16:
+      for (int32_t i = 0; i < dims; i++) {
+        uint16_t h;
+        std::memcpy(&h, in + 2 * i, 2);
+        double d = (double)fromBf16(h);
+        sum += d * d;
+      }
+      return sum;
+    case VectorEncoding::BIT:
+      for (int32_t i = 0; i < dims / 8; i++) sum += (double)std::popcount((uint8_t)in[i]);
+      return sum;
     case VectorEncoding::F32:
     default:
       for (int32_t i = 0; i < dims; i++) {
@@ -201,7 +264,7 @@ inline double payloadNormSq(VectorEncoding e, const char* in, int32_t dims) {
 /// Whether a field stores the norm prefix: cosine needs |x| unless the
 /// column holds f32 unit vectors (normalized on write, or trusted normalized).
 inline bool needsNorms(VectorEncoding e, bool cosine, bool unitF32Column) {
-  return cosine && (e != VectorEncoding::F32 || !unitF32Column);
+  return cosine && e != VectorEncoding::BIT && (e != VectorEncoding::F32 || !unitF32Column);
 }
 
 inline int32_t rowBytes(VectorEncoding e, int32_t dims, bool norms) {

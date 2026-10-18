@@ -4,6 +4,8 @@
 #include "VectorScorer.h"
 
 #include <algorithm>
+#include <format>
+#include <stdexcept>
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/codec/VectorKernels.h"
@@ -32,8 +34,22 @@ VectorScorer::VectorScorer(const float* query, int32_t dims, int32_t metric,
   bool l2 = metric == (int32_t)luxir::api::VectorMetric::L2;
   bool ip = metric == (int32_t)luxir::api::VectorMetric::IP;
   bool cosine = metric == (int32_t)luxir::api::VectorMetric::COSINE;
-  if (!l2 && !ip && !cosine) return;
+  bool hamming = metric == (int32_t)luxir::api::VectorMetric::HAMMING;
+  if (!l2 && !ip && !cosine && !hamming) return;
+  if (hamming != (encoding == VectorEncoding::BIT)) {
+    throw std::runtime_error(std::format(
+        "vector segment encoding {} cannot be scored with metric {}; reindex the field",
+        vcodec::name(encoding), metric));
+  }
   switch (encoding) {
+    case VectorEncoding::BIT:
+      kind = Kind::BIT_HAMMING;
+      queryBits.resize((size_t)vcodec::bytesPerVector(encoding, dims));
+      vcodec::encode(encoding, query, dims, (char*)queryBits.data());
+      break;
+    case VectorEncoding::BF16:
+      kind = l2 ? Kind::BF16_L2 : ip ? Kind::BF16_DOT : Kind::BF16_COS;
+      break;
     case VectorEncoding::F16:
       kind = l2 ? Kind::F16_L2 : ip ? Kind::F16_DOT : Kind::F16_COS;
       break;
@@ -76,6 +92,16 @@ inline float VectorScorer::scoreRow(const char* row) const {
     return finiteScore(vkernel::dotF16(query, x, dims));
   } else if constexpr (K == Kind::F16_COS) {
     return cosineScore((double)vkernel::dotF16(query, x, dims), normSq(row, VectorEncoding::F16));
+  } else if constexpr (K == Kind::BF16_L2) {
+    float dist = vkernel::l2sqBF16(query, x, dims);
+    return finiteScore(1.0f / (1.0f + dist));
+  } else if constexpr (K == Kind::BF16_DOT) {
+    return finiteScore(vkernel::dotBF16(query, x, dims));
+  } else if constexpr (K == Kind::BF16_COS) {
+    return cosineScore((double)vkernel::dotBF16(query, x, dims), normSq(row, VectorEncoding::BF16));
+  } else if constexpr (K == Kind::BIT_HAMMING) {
+    int32_t distance = vkernel::hamming(queryBits.data(), (const uint8_t*)x, (int32_t)queryBits.size());
+    return 1.0f - (float)distance / (float)dims;
   } else {
     vcodec::Int8Header h = vcodec::readInt8Header(x);
     auto* codes = (const uint8_t*)(x + vcodec::INT8_HEADER_BYTES);
@@ -113,6 +139,10 @@ void VectorScorer::scoreRows(const char* const* rows, size_t n, float* out) cons
     case Kind::I8_L2: return scoreRowsAs<Kind::I8_L2>(rows, n, out);
     case Kind::I8_DOT: return scoreRowsAs<Kind::I8_DOT>(rows, n, out);
     case Kind::I8_COS: return scoreRowsAs<Kind::I8_COS>(rows, n, out);
+    case Kind::BF16_L2: return scoreRowsAs<Kind::BF16_L2>(rows, n, out);
+    case Kind::BF16_DOT: return scoreRowsAs<Kind::BF16_DOT>(rows, n, out);
+    case Kind::BF16_COS: return scoreRowsAs<Kind::BF16_COS>(rows, n, out);
+    case Kind::BIT_HAMMING: return scoreRowsAs<Kind::BIT_HAMMING>(rows, n, out);
     case Kind::NONE:
     default:
       std::fill(out, out + n, 0.0f);

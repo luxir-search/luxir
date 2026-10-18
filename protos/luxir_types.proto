@@ -2427,12 +2427,14 @@ message NormalizerDef {
 
 // Vector similarity metric.  NONE = storage-only, not kNN-searchable;
 // L2 / IP / COSINE select the metric for exact column search and any
-// ANN index.
+// ANN index.  HAMMING scores BIT-encoded binary vectors by
+// 1 - hamming distance / dims, by exact search only (no ANN index).
 enum VectorMetric {
   NONE = 0;
   L2 = 1;
   IP = 2;
   COSINE = 3;
+  HAMMING = 4;
 }
 
 // Storage encoding of a vector field's column.  Exact search and the
@@ -2443,6 +2445,11 @@ enum VectorEncoding {
   // Per-vector scalar quantization: a float offset and scale per vector plus
   // one uint8 code per dimension (8 + dims bytes).
   INT8 = 2;
+  BF16 = 3;  // bfloat16 per element: float32 rounded to its high 16 bits (2 bytes per dimension)
+  // One bit per dimension, set when the element is > 0 (dims / 8 bytes; dims
+  // a multiple of 8). Searchable only with metric HAMMING, whose default
+  // encoding it is.
+  BIT = 4;
 }
 
 // Approximate nearest-neighbor index settings for a VECTOR field: the codec
@@ -2611,8 +2618,9 @@ message FieldDef {
   optional int32 truncate_dims = 19;
 
   // VECTOR only. Column storage encoding. Unset inherits, falling back to
-  // F32. F16 and INT8 reject non-finite elements; F16 also rejects
-  // magnitudes above 65504. Applies to newly written segments.
+  // BIT for metric HAMMING and F32 otherwise. F16 and INT8 reject non-finite
+  // elements; F16 also rejects magnitudes above 65504. Applies to newly
+  // written segments.
   optional VectorEncoding encoding = 20;
 
   // VECTOR only. Also keep the submitted float32 vectors in a separate cold

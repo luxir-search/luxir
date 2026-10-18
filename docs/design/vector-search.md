@@ -25,8 +25,8 @@ same.
 ## Column Encoding
 
 A vector field's column stores one fixed-size value per vector in the field's
-`encoding`: `f32` (4 bytes per dimension), `f16` (2), or `int8` (8 + dims
-bytes per vector). The encoding is recorded in each segment's field metadata
+`encoding`: `f32` (4 bytes per dimension), `f16` or `bf16` (2), `int8` (8 +
+dims bytes per vector), or `bit` (dims / 8 bytes per vector). The encoding is recorded in each segment's field metadata
 rather than read from the schema, so a schema change never reinterprets an
 existing segment, and the column stays a plain fixed-size binary column
 (`dims` is derived from the value size and the encoding).
@@ -97,15 +97,25 @@ q.x   = offset * sum(q) + scale * dot(q, code)
 so the per-element work is a pure `dot(q, code)`. L2 decodes
 `offset + scale * code` in registers and sums the squared differences
 directly: `|q|^2 - 2 q.x + |x|^2` cancels catastrophically when the offset is
-large. Cosine over `f16` and `int8`
+large. Cosine over `f16`, `bf16` and `int8`
 always divides by the stored vector's norm, since a quantized unit vector is
 not exactly unit length.
 
+`bf16` stores the high half of each float32, rounded to nearest even: the
+float32 exponent range with an 8-bit significand, so encoding needs no range
+check, and decoding is a 16-bit shift. `bit` stores the sign of each element
+(`x > 0`) for binary embeddings and is scored only by `hamming`
+(`1 - popcount(q ^ x) / dims`, the query packed once per segment). Bit
+columns get no ANN overlay: at 1/32 of `f32` the exact scan is the index.
+
 The per-element loops are SIMD kernels (`codec/VectorKernels.cpp`): one pass
 over the stored bytes per row, with `f16` widened to float in registers
-(F16C `vcvtph2ps` on x86, `fcvtl` on AArch64) and fused into the FMA, and
-`uint8` codes zero-extended and converted in registers, with no conversion
-pass into a buffer. The instruction set is chosen at compile time from the
+(F16C `vcvtph2ps` on x86, `fcvtl` on AArch64) and fused into the FMA, `bf16`
+widened by a 16-bit shift, and `uint8` codes zero-extended and converted in
+registers, with no conversion pass into a buffer. Hamming XORs the packed
+bits and counts them with a nibble-table `vpshufb` popcount on AVX2 (Mula,
+Kurz and Lemire, arXiv:1611.07612), `cnt` on NEON, and 64-bit `popcnt`
+otherwise. The instruction set is chosen at compile time from the
 build's CPU target (`LUXIR_CPU_TARGET`), like the project's other SIMD code:
 AVX2 + FMA + F16C on `x86-64-v3` and above, NEON on AArch64, and a portable
 fixed-width lane loop (which the compiler vectorizes for the baseline target)

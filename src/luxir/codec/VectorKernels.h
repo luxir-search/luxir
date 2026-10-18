@@ -13,11 +13,15 @@ namespace luxir::vkernel {
 ///   F32:  dot(q, x), |q - x|^2 over float32 x.
 ///   F16:  dot(q, x), |q - x|^2 over IEEE binary16 x, widened in registers
 ///         (no conversion pass to a buffer).
+///   BF16: dot(q, x), |q - x|^2 over bfloat16 x, widened in registers (a
+///         16-bit shift).
 ///   U8:   dot(q, c) over uint8 codes c widened to float in registers (the
 ///         int8 encoding's offset / scale are applied by the caller), and
 ///         |q - x|^2 over x = offset + scale * c decoded in registers (the
 ///         difference is taken directly: |q|^2 - 2 q.x + |x|^2 cancels
 ///         catastrophically when the offset is large).
+///   Hamming: popcount(a ^ b) over n bytes of packed bits (the bit encoding),
+///         in integers, so it is exact.
 ///
 /// The instruction set is chosen at compile time from the target flags the
 /// project builds with (LUXIR_CPU_TARGET): AVX2 + FMA + F16C on x86-64-v3 and
@@ -32,8 +36,11 @@ float dotF32(const float* q, const void* x, int32_t n);
 float l2sqF32(const float* q, const void* x, int32_t n);
 float dotF16(const float* q, const void* x, int32_t n);
 float l2sqF16(const float* q, const void* x, int32_t n);
+float dotBF16(const float* q, const void* x, int32_t n);
+float l2sqBF16(const float* q, const void* x, int32_t n);
 float dotU8(const float* q, const uint8_t* c, int32_t n);
 float l2sqU8(const float* q, const uint8_t* c, float offset, float scale, int32_t n);
+int32_t hamming(const uint8_t* a, const uint8_t* b, int32_t n);
 
 /// Name of the compiled kernel path ("avx2-f16c", "neon", "scalar").
 const char* isa();

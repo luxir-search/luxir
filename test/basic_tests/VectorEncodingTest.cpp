@@ -5,10 +5,13 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <string>
 #include <vector>
@@ -101,6 +104,20 @@ std::vector<std::string> knnIds(std::string_view field, int32_t k, bool exact = 
   return ids;
 }
 
+// (id, score) of an executed request's "q" list; finishes the request.
+std::vector<std::pair<std::string, float>> scoredHits(LocalReq* req) {
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  std::vector<std::pair<std::string, float>> hits;
+  if (req->ok()) {
+    const auto* dl = req->docList("q");
+    const auto* ids = std::get_if<api::ColStr>(&dl->columns.find("id")->kind);
+    const auto* scores = std::get_if<api::ColFloat>(&dl->columns.find("_score_")->kind);
+    for (size_t i = 0; i < ids->v.size(); i++) hits.emplace_back(ids->v[i], scores->v[i]);
+  }
+  req->done();
+  return hits;
+}
+
 // (id, score) of a kNN request, serial or parallel.
 std::vector<std::pair<std::string, float>> knnHits(std::string_view field, int32_t k, bool exact,
                                                    int32_t refine, bool parallel) {
@@ -109,14 +126,7 @@ std::vector<std::pair<std::string, float>> knnHits(std::string_view field, int32
   cur.getScores().countLimit().fields({"id"});
   cur.rawQuery() = qb::knn(cur.mr(), field, QUERY, k, /*nprobe=*/0, exact, refine);
   req->execute(parallel);
-  EXPECT_TRUE(req->ok()) << req->errorMsg();
-  std::vector<std::pair<std::string, float>> hits;
-  const auto* dl = req->docList("q");
-  const auto* ids = std::get_if<api::ColStr>(&dl->columns.find("id")->kind);
-  const auto* scores = std::get_if<api::ColFloat>(&dl->columns.find("_score_")->kind);
-  for (size_t i = 0; i < ids->v.size(); i++) hits.emplace_back(ids->v[i], scores->v[i]);
-  req->done();
-  return hits;
+  return scoredHits(req);
 }
 
 std::shared_ptr<IndexReader> reader(CollectionHelper& h) {
@@ -184,6 +194,20 @@ TEST_F(VectorEncodingTest, codecRoundTrip) {
   EXPECT_EQ(16, vcodec::bytesPerVector(VectorEncoding::INT8, DIMS));
   EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::INT8, 16));
   EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::F16, 16));
+
+  vcodec::encode(VectorEncoding::BF16, v.data(), DIMS, buf.data());
+  vcodec::decode(VectorEncoding::BF16, buf.data(), DIMS, out.data());
+  EXPECT_EQ(v, out);  // all exactly representable in bfloat16
+  EXPECT_EQ(1.0f, vcodec::fromBf16(vcodec::toBf16(1.0f + 0x1p-8f)));  // tie to even
+  EXPECT_EQ(1.0f + 0x1p-7f, vcodec::fromBf16(vcodec::toBf16(1.0f + 0x1.8p-8f)));
+  EXPECT_TRUE(std::isfinite(vcodec::fromBf16(vcodec::toBf16(std::numeric_limits<float>::max()))));
+
+  vcodec::encode(VectorEncoding::BIT, v.data(), DIMS, buf.data());
+  EXPECT_EQ(0x6b, (uint8_t)buf[0]);  // 0 1 1 0 1 0 1 1, most significant bit first
+  vcodec::decode(VectorEncoding::BIT, buf.data(), DIMS, out.data());
+  EXPECT_EQ((Vec{0, 1, 1, 0, 1, 0, 1, 1}), out);
+  EXPECT_EQ(1, vcodec::bytesPerVector(VectorEncoding::BIT, DIMS));
+  EXPECT_EQ(DIMS, vcodec::dimsFromBytes(VectorEncoding::BIT, 1));
 }
 
 // The int8 decomposition (no decode buffer) agrees with scoring the decoded
@@ -250,7 +274,8 @@ TEST_F(VectorEncodingTest, storedRoundTripPerEncoding) {
 // metric.
 TEST_F(VectorEncodingTest, exactKnnMatchesF32Ranking) {
   for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
-    for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::INT8}) {
+    for (auto encoding : {api::VectorEncoding::F16, api::VectorEncoding::BF16,
+                          api::VectorEncoding::INT8}) {
       CollectionHelper h("main");
       h.clear();
       installFields(h.collection(), {.metric = metric, .encoding = encoding});
@@ -447,7 +472,8 @@ TEST_F(VectorEncodingTest, kernelsMatchScalarReference) {
   for (int32_t dims : {1, 3, 7, 15, 16, 17, 768, 1023}) {
     Vec q((size_t)dims);
     for (auto& x : q) x = uniform(rng);
-    for (auto encoding : {VectorEncoding::F32, VectorEncoding::F16, VectorEncoding::INT8}) {
+    for (auto encoding : {VectorEncoding::F32, VectorEncoding::F16, VectorEncoding::BF16,
+                          VectorEncoding::INT8}) {
       int32_t bytes = vcodec::rowBytes(encoding, dims, true);
       // Row r starts r bytes past an 8-byte boundary.
       std::vector<std::vector<char>> bufs(ROWS, std::vector<char>((size_t)bytes + 16));
@@ -493,6 +519,86 @@ TEST_F(VectorEncodingTest, kernelsMatchScalarReference) {
       }
     }
   }
+}
+
+// The Hamming kernel matches a bytewise popcount at every length around the
+// SIMD widths and at unaligned addresses.
+TEST_F(VectorEncodingTest, hammingKernelMatchesPopcount) {
+  std::mt19937 rng(7);
+  std::vector<uint8_t> a(300), b(300);
+  for (auto& x : a) x = (uint8_t)rng();
+  for (auto& x : b) x = (uint8_t)rng();
+  for (int32_t n = 0; n < 260; n++) {
+    int32_t expected = 0;
+    for (int32_t i = 0; i < n; i++) expected += std::popcount((uint8_t)(a[(size_t)i + 1] ^ b[(size_t)i + 3]));
+    EXPECT_EQ(expected, vkernel::hamming(a.data() + 1, b.data() + 3, n)) << n;
+  }
+}
+
+// metric hamming stores bit vectors (the default encoding) and scores
+// 1 - hamming / dims by exact scan; schemas that mix bit and float scoring are
+// rejected.
+TEST_F(VectorEncodingTest, bitVectorsScoreByHamming) {
+  CollectionHelper h("main");
+  SchemaBuilder b;
+  auto& def = b.field("bits_v");
+  def.type = api::FieldDef::FieldClass::VECTOR;
+  def.metric = api::VectorMetric::HAMMING;
+  def.dims = 16;
+  b.set(h.collection());
+  Vec q(16, -1.0f);
+  for (int i = 0; i < 4; i++) {
+    Vec v = q;
+    for (int j = 0; j < 3 * i; j++) v[(size_t)j] = 0.5f;  // 3 * i bits differ
+    h.index(flatdoc("id", "b" + std::to_string(i), "bits_v", v));
+  }
+  ExpectLog quiet({"expected dims", "Ignoring vector aux selector"});
+  EXPECT_EQ(1, h.index(flatdoc("id", std::string("short"), "bits_v", Vec(12, 1.0f))).total_errors);
+  h.commit({"vec.bits_v"});
+  EXPECT_EQ(nullptr, reader(h)->segments()[0].getAuxReader("vec.bits_v"));
+  VectorEncoding encoding;
+  EXPECT_EQ(2u, rows(h, "bits_v", &encoding)[0].size());
+  EXPECT_EQ(VectorEncoding::BIT, encoding);
+
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.getScores().fields({"id"});
+  cur.rawQuery() = qb::knn(cur.mr(), "bits_v", q, 3);
+  req->execute();
+  EXPECT_EQ((std::vector<std::pair<std::string, float>>{
+                {"b0", 1.0f}, {"b1", 1.0f - 3.0f / 16}, {"b2", 1.0f - 6.0f / 16}}),
+            scoredHits(req));
+
+  auto reject = [](api::VectorMetric metric, std::optional<api::VectorEncoding> encoding, int32_t dims) {
+    SchemaBuilder sb;
+    auto& f = sb.field("x_v");
+    f.type = api::FieldDef::FieldClass::VECTOR;
+    f.metric = metric;
+    f.encoding = encoding;
+    f.dims = dims;
+    EXPECT_THROW(Schema::fromProto(sb.def()), SchemaError);
+  };
+  reject(api::VectorMetric::HAMMING, api::VectorEncoding::F32, 16);
+  reject(api::VectorMetric::COSINE, api::VectorEncoding::BIT, 16);
+  reject(api::VectorMetric::HAMMING, std::nullopt, 12);
+}
+
+// An f16 segment merged after a switch to bf16 converges to bf16.
+TEST_F(VectorEncodingTest, f16MergesIntoBf16) {
+  CollectionHelper h("main");
+  installFields(h.collection(), {.encoding = api::VectorEncoding::F16});
+  indexDocs(h, 0, 15);
+  h.commit();
+  installFields(h.collection(), {.encoding = api::VectorEncoding::BF16});
+  indexDocs(h, 15, 30);
+  h.commit();
+  auto before = knnIds("enc_v", 10);
+  h.getIndexWriter()->mergeSegments();
+  h.commit();
+  VectorEncoding encoding;
+  EXPECT_EQ(30u, rows(h, "enc_v", &encoding).size());
+  EXPECT_EQ(VectorEncoding::BF16, encoding);
+  EXPECT_EQ(before, knnIds("enc_v", 10));
 }
 
 // Cosine over a column that is not unit length stores |x|^2 once per vector

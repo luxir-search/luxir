@@ -3,6 +3,7 @@
 
 #include "VectorKernels.h"
 
+#include <bit>
 #include <cstring>
 
 #if defined(__AVX2__) && defined(__FMA__) && defined(__F16C__)
@@ -44,6 +45,13 @@ struct LoadF32 {
 struct LoadF16 {
   static constexpr int32_t BYTES = 2;
   Vec load(const char* p) const { return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)p)); }
+};
+struct LoadBF16 {
+  static constexpr int32_t BYTES = 2;
+  Vec load(const char* p) const {
+    __m256i wide = _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)p));
+    return _mm256_castsi256_ps(_mm256_slli_epi32(wide, 16));
+  }
 };
 struct LoadU8 {
   static constexpr int32_t BYTES = 1;
@@ -94,6 +102,12 @@ struct LoadF16 {
   static constexpr int32_t BYTES = 2;
   Vec load(const char* p) const {
     return vcvt_f32_f16(vreinterpret_f16_u8(vld1_u8((const uint8_t*)p)));
+  }
+};
+struct LoadBF16 {
+  static constexpr int32_t BYTES = 2;
+  Vec load(const char* p) const {
+    return vreinterpretq_f32_u32(vshll_n_u16(vreinterpret_u16_u8(vld1_u8((const uint8_t*)p)), 16));
   }
 };
 struct LoadU8 {
@@ -152,6 +166,16 @@ struct LoadF16 {
     std::memcpy(h, p, sizeof(h));
     Vec r;
     for (int32_t j = 0; j < W; j++) r.v[j] = (float)h[j];
+    return r;
+  }
+};
+struct LoadBF16 {
+  static constexpr int32_t BYTES = 2;
+  Vec load(const char* p) const {
+    uint16_t h[W];
+    std::memcpy(h, p, sizeof(h));
+    Vec r;
+    for (int32_t j = 0; j < W; j++) r.v[j] = std::bit_cast<float>((uint32_t)h[j] << 16);
     return r;
   }
 };
@@ -236,6 +260,62 @@ float kernel(const float* q, const char* x, int32_t n, Load load = {}, float qPa
   return hsum(add(add(s01, s23), add(s45, s67)));
 }
 
+// popcount(a ^ b) of the bytes past the SIMD body, a 64-bit word at a time.
+inline int64_t hammingTail(const uint8_t* a, const uint8_t* b, int32_t i, int32_t n) {
+  int64_t count = 0;
+  for (; i + 8 <= n; i += 8) {
+    uint64_t x;
+    uint64_t y;
+    std::memcpy(&x, a + i, 8);
+    std::memcpy(&y, b + i, 8);
+    count += std::popcount(x ^ y);
+  }
+  for (; i < n; i++) count += std::popcount((uint8_t)(a[i] ^ b[i]));
+  return count;
+}
+
+#if defined(LUXIR_VKERNEL_AVX2)
+
+// AVX2 has no vector popcount: count each nibble through a 16-entry shuffle
+// table (Mula, Kurz and Lemire, "Faster Population Counts Using AVX2
+// Instructions", 2018) and sum the byte counts with vpsadbw.
+int64_t hammingBody(const uint8_t* a, const uint8_t* b, int32_t n, int32_t& i) {
+  const __m256i table = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+                                         0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4);
+  const __m256i low = _mm256_set1_epi8(0x0f);
+  __m256i acc = _mm256_setzero_si256();
+  for (; i + 32 <= n; i += 32) {
+    __m256i x = _mm256_xor_si256(_mm256_loadu_si256((const __m256i*)(a + i)),
+                                 _mm256_loadu_si256((const __m256i*)(b + i)));
+    __m256i lo = _mm256_shuffle_epi8(table, _mm256_and_si256(x, low));
+    __m256i hi = _mm256_shuffle_epi8(table, _mm256_and_si256(_mm256_srli_epi16(x, 4), low));
+    acc = _mm256_add_epi64(acc, _mm256_sad_epu8(_mm256_add_epi8(lo, hi), _mm256_setzero_si256()));
+  }
+  return _mm256_extract_epi64(acc, 0) + _mm256_extract_epi64(acc, 1)
+      + _mm256_extract_epi64(acc, 2) + _mm256_extract_epi64(acc, 3);
+}
+
+#elif defined(LUXIR_VKERNEL_NEON)
+
+int64_t hammingBody(const uint8_t* a, const uint8_t* b, int32_t n, int32_t& i) {
+  uint32x4_t acc = vdupq_n_u32(0);
+  for (; i + 16 <= n; i += 16) {
+    uint8x16_t counts = vcntq_u8(veorq_u8(vld1q_u8(a + i), vld1q_u8(b + i)));
+    acc = vpadalq_u16(acc, vpaddlq_u8(counts));
+  }
+  return (int64_t)vaddvq_u32(acc);
+}
+
+#else
+
+// The 64-bit word loop of hammingTail is the portable body (POPCNT on
+// x86-64-v2).
+int64_t hammingBody(const uint8_t*, const uint8_t*, int32_t, int32_t&) {
+  return 0;
+}
+
+#endif
+
 } // namespace
 
 float dotF32(const float* q, const void* x, int32_t n) {
@@ -252,6 +332,20 @@ float dotF16(const float* q, const void* x, int32_t n) {
 
 float l2sqF16(const float* q, const void* x, int32_t n) {
   return kernel<LoadF16, true>(q, (const char*)x, n);
+}
+
+float dotBF16(const float* q, const void* x, int32_t n) {
+  return kernel<LoadBF16, false>(q, (const char*)x, n);
+}
+
+float l2sqBF16(const float* q, const void* x, int32_t n) {
+  return kernel<LoadBF16, true>(q, (const char*)x, n);
+}
+
+int32_t hamming(const uint8_t* a, const uint8_t* b, int32_t n) {
+  int32_t i = 0;
+  int64_t count = hammingBody(a, b, n, i);
+  return (int32_t)(count + hammingTail(a, b, i, n));
 }
 
 float dotU8(const float* q, const uint8_t* c, int32_t n) {

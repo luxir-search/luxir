@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <vector>
 
 #include "luxir/codec/VectorCodec.h"
 
@@ -20,7 +21,9 @@ namespace luxir {
 /// stored encoding.
 ///
 /// Scores are higher-is-better: L2 -> 1 / (1 + squared distance), IP -> dot,
-/// COSINE -> dot / |x|.  The query is already unit length for COSINE; an F32
+/// COSINE -> dot / |x|, HAMMING -> 1 - hamming distance / dims.  HAMMING
+/// scores BIT columns only (the query is binarized the same way, x > 0), and
+/// a BIT column scores only under HAMMING.  The query is already unit length for COSINE; an F32
 /// column of unit vectors skips the division (normalizeColumn false).  Every
 /// other cosine column, and int8 L2, reads |x|^2 from the row's norm prefix
 /// (written once at index time, see VectorCodec.h) instead of recomputing it.
@@ -48,6 +51,8 @@ public:
     F32_L2, F32_DOT, F32_COS,
     F16_L2, F16_DOT, F16_COS,
     I8_L2, I8_DOT, I8_COS,
+    BF16_L2, BF16_DOT, BF16_COS,
+    BIT_HAMMING,
   };
 
 private:
@@ -57,11 +62,15 @@ private:
   bool norms;
   Kind kind = Kind::NONE;
   double querySum = 0.0;
+  // BIT_HAMMING: the query packed like a stored row.
+  std::vector<uint8_t> queryBits;
 
 public:
   static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
 
-  /// norms: the segment's rows carry the norm prefix.
+  /// norms: the segment's rows carry the norm prefix.  Throws when the
+  /// segment's encoding cannot be scored under the metric (BIT without
+  /// HAMMING or the reverse, after a schema change; reindex to fix).
   VectorScorer(const float* query, int32_t dims, int32_t metric, bool normalizeColumn,
                VectorEncoding encoding, bool norms);
 

@@ -222,6 +222,11 @@ private:
           "field '{}': {}expected dims={}, got {}",
           std::string_view(fieldName), prefix(), expected, n));
     }
+    if (encoding == VectorEncoding::BIT && n % 8 != 0) {
+      throw DocumentError(fmt::format(
+          "field '{}': {}bit vectors need dims that are a multiple of 8, got {}",
+          std::string_view(fieldName), prefix(), n));
+    }
     if (metric == VectorFieldType::METRIC_COSINE && !trustNormalized) {
       // Finite elements: the double sum of squares cannot overflow.
       double normSq = 0.0;
