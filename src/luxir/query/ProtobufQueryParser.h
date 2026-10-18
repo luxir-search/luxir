@@ -28,6 +28,7 @@
 
 namespace luxir {
 
+class FeatureFieldType;
 class MemPool;
 class Query;
 class Schema;
@@ -75,6 +76,15 @@ class ProtobufQueryParser {
   Query* parseConstantScore(const luxir::api::ConstantScoreQuery& constantScoreQuery);
   Query* parseBoost(const luxir::api::BoostQuery& boostQuery);
   Query* parseRescore(const luxir::api::RescoreQuery& rescoreQuery);
+  // Resolve a feature field (FeatureFieldType) or throw; physicalName gets a
+  // pool copy of its physical name.
+  FeatureFieldType& featureField(std::string_view field, std::string_view label,
+                                 std::string_view& physicalName);
+  // A feature name in indexed term bytes, as FeatureHandler fits it.
+  std::string_view featureTerm(const FeatureFieldType& type, std::string_view field,
+                               std::string_view feature);
+  Query* parseSparseVector(const luxir::api::SparseVectorQuery& query);
+  Query* parseRankFeature(const luxir::api::RankFeatureQuery& query);
 
   static std::optional<float> constantOutput(const ValueProgram& program);
   static bool exactlyRepresented(const ValueResult& result, float value);

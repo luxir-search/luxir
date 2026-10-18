@@ -60,6 +60,9 @@ private:
   MemPool* pool = nullptr;
   const DocsEnumMeta* docsEnum = nullptr;
   Similarity::BM25Scorer* simScorer = nullptr;
+  // Set instead of simScorer for feature fields, whose blocks carry max tf
+  // only (no norms): a block's bound is the feature score of its max tf.
+  const FeatureScorer* featureScorer = nullptr;
   float boost = 1.0f;
   bool useFrontierBound = true;
   bool lazyGroupHeaders = false;
@@ -85,11 +88,12 @@ private:
   }
 
   float scoreImpact(int32_t tf, int32_t norm) const {
+    if (featureScorer != nullptr) return featureScorer->bound(tf);
     return boost * simScorer->score((float) tf, (int64_t) norm);
   }
 
   float scoreFrontier(const DocsEnumMeta::GroupImpactHeader& header) const {
-    if (useFrontierBound && !header.frontierNorms.empty()) {
+    if (useFrontierBound && !header.frontierNorms.empty() && featureScorer == nullptr) {
       return simScorer->scoreFrontier(header.frontierNorms, header.frontierTfBytes,
                                       header.frontierTfWidth, boost);
     }
@@ -216,11 +220,24 @@ private:
 public:
   static inline bool forceEagerForTests = false;
 
+  // Feature-field impacts: the eager path, since norm-free postings have no
+  // term-level frontier in the dictionary.
+  void build(MemPool& pool_, DocsEnumMeta& docsEnum_, const FeatureScorer& featureScorer_) {
+    featureScorer = &featureScorer_;
+    build(pool_, docsEnum_, nullptr, 1.0f, false);
+  }
+
   void build(MemPool& pool_, DocsEnumMeta& docsEnum_, Similarity::BM25Scorer& simScorer_,
              float boost_, bool useFrontierBound_ = true) {
+    build(pool_, docsEnum_, &simScorer_, boost_, useFrontierBound_);
+  }
+
+private:
+  void build(MemPool& pool_, DocsEnumMeta& docsEnum_, Similarity::BM25Scorer* simScorer_,
+             float boost_, bool useFrontierBound_) {
     pool = &pool_;
     docsEnum = &docsEnum_;
-    simScorer = &simScorer_;
+    simScorer = simScorer_;
     boost = boost_;
     useFrontierBound = useFrontierBound_;
     lazyGroupHeaders = false;
@@ -300,6 +317,7 @@ public:
     groupHeadersParsed = groupCount;
   }
 
+public:
   bool empty() const {
     return count == 0;
   }

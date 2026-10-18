@@ -52,6 +52,7 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
     case QueryKind::KNN:
+    case QueryKind::FEATURE:
     case QueryKind::NONE:
     case QueryKind::TEST:
       return Query::ScoreProfile::variable();
@@ -88,6 +89,7 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
     case QueryKind::GEO_DISTANCE:
     case QueryKind::ALL:
     case QueryKind::NONE:
+    case QueryKind::FEATURE:
       return true;
     case QueryKind::FORCE_PREPARE:
     case QueryKind::TEST:
@@ -126,6 +128,7 @@ inline bool exactDomainIdentity(const Query& query) {
     case QueryKind::EXISTS:
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
+    case QueryKind::FEATURE:
     case QueryKind::NONE:
     case QueryKind::TEST:
       return false;
@@ -169,6 +172,7 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::EXISTS:
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
+    case QueryKind::FEATURE:
     case QueryKind::TEST:
       return false;
   }
@@ -196,6 +200,7 @@ inline bool hasRequiredConjunction(const Query& query) {
 inline Query::VerificationWork membershipVerificationWork(const Query& query) {
   switch (query.getKind()) {
     case QueryKind::TERM:
+    case QueryKind::FEATURE:
       return Query::VerificationWork::ABSENT;
     case QueryKind::PHRASE:
       return Query::VerificationWork::PRESENT;

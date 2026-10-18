@@ -455,14 +455,19 @@ in their own guides:
 
 - [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
   `exact`, and the per-engine `ivf` object (`nprobe`, `min_scan_fraction`).
+- [`sparse_vector`](vector-search.md#sparse-vectors) and
+  [`rank_feature`](vector-search.md#rank-features) score
+  [feature fields](schema.md#feature-fields): a weighted token dot product,
+  and one feature through a saturation, log, sigmoid, or linear function.
 - [`geo_box` and `geo_distance`](geo-search.md) cover coordinate order,
   inclusive boundaries, dateline crossing, and distance units.
 
 ## Limits
 
-- `knn`, `geo_box`, and `geo_distance` are structured-only: expression
-  functions cannot currently represent vector or coordinate-list arguments,
-  so use the objects shown in the vector and geo guides.
+- `knn`, `sparse_vector`, `rank_feature`, `geo_box`, and `geo_distance` are
+  structured-only: expression functions cannot currently represent vector,
+  token-map, function, or coordinate-list arguments, so use the objects shown
+  in the vector and geo guides.
 - New structured arms are not automatically callable from the query language
   until their expression behavior is declared.
 - `except_ops` routing is not accepted on Fusion filters or Fusion source

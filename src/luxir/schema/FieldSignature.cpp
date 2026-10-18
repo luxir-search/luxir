@@ -13,7 +13,9 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
   static constexpr const char* types[] = {
     "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point"
   };
-  properties["type"] = "\"" + std::string(types[type.type()]) + "\"";
+  auto* feature = dynamic_cast<FeatureFieldType*>(&type);
+  std::string_view typeName = feature ? feature->kindName() : types[type.type()];
+  properties["type"] = "\"" + std::string(typeName) + "\"";
   properties["multi"] = type.multiValued() ? "true" : "false";
   properties["index"] = type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";
   properties["column"] = type.hasColumn() ? "true" : "false";
@@ -28,7 +30,9 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
   // Include the term recording and norm choices for hand-built field types too.
   properties["posting_flags"] = std::to_string(type.flags_ &
       (FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::NUM_TOKENS_APPROX | FieldType::NUM_TOKENS_EXACT));
-  if (auto* text = dynamic_cast<TextFieldType*>(&type)) properties["analyzer"] = text->analyzer_->canonical;
+  if (auto* text = dynamic_cast<TextFieldType*>(&type); text && !feature) {
+    properties["analyzer"] = text->analyzer_->canonical;
+  }
   if (auto* str = dynamic_cast<StrFieldType*>(&type)) {
     properties["normalizer"] = "[]";
     if (str->normalizer) {

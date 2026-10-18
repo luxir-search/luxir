@@ -278,6 +278,8 @@ message Query {
     WildcardQuery wildcard = 17;    // selects documents by wildcard term match
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
+    SparseVectorQuery sparse_vector = 22; // learned sparse retrieval: weighted feature dot product
+    RankFeatureQuery rank_feature = 23;   // scores one stored feature through a function
   }
 }
 
@@ -381,6 +383,53 @@ message AnyOfQuery {
   // Required scalar or array of scalars. Null and nested arrays are errors.
   // An empty array matches nothing; duplicate values are ignored.
   Val values = 2;
+}
+
+// Learned sparse retrieval (SPLADE, ELSER) over a SPARSE_VECTOR or
+// RANK_FEATURES field. Matches documents that have at least one query token
+// and scores the dot product sum(query weight * stored weight) over the
+// shared tokens. Stored weights are quantized (see FieldDef.SPARSE_VECTOR).
+// Scoring uses block-max pruning when only the top hits are needed.
+message SparseVectorQuery {
+  string field = 1;
+
+  // Required, non-empty. Token -> weight; weights must be finite and > 0.
+  // Tokens are matched exactly, without analysis.
+  map<string, float> query_vector = 2;
+}
+
+// Scores the documents that have a feature in a RANK_FEATURE, RANK_FEATURES
+// or SPARSE_VECTOR field by a monotonic function of the stored value S, as
+// Elasticsearch's rank_feature query. Documents without the feature do not
+// match, so use it as an optional (should) clause to boost a main query.
+// Every function only grows with S; the bounded functions score in [0, 1).
+message RankFeatureQuery {
+  // A RANK_FEATURE field, or a RANK_FEATURES / SPARSE_VECTOR field together
+  // with `feature`. "field.feature" also names a feature of a RANK_FEATURES
+  // or SPARSE_VECTOR field.
+  string field = 1;
+  string feature = 2;  // feature name; empty for a RANK_FEATURE field
+
+  // Unset = saturation with the default pivot.
+  oneof function {
+    Saturation saturation = 3;
+    Log log = 4;
+    Sigmoid sigmoid = 5;
+    Linear linear = 6;
+  }
+
+  // S / (S + pivot). Unset pivot = an approximate geometric mean of the
+  // feature's values over the index, so a typical value scores about 0.5.
+  message Saturation { optional float pivot = 1; }
+  // ln(scaling_factor + S); scaling_factor must be >= 1, so scores are >= 0.
+  message Log { float scaling_factor = 1; }
+  // S^exponent / (S^exponent + pivot^exponent); both must be finite and > 0.
+  message Sigmoid {
+    float pivot = 1;
+    float exponent = 2;
+  }
+  // S itself.
+  message Linear {}
 }
 
 // Matches documents whose field value falls in the given range.  All bounds
@@ -1607,6 +1656,14 @@ message FieldDef {
     VECTOR = 7;    // dense float vector
     DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
     GEO_POINT = 9; // latitude/longitude point
+    // Feature fields (Lucene FeatureField). A document value is a JSON object
+    // of feature name -> weight (SPARSE_VECTOR, RANK_FEATURES) or one number
+    // (RANK_FEATURE). Weights must be positive and finite; they are stored as
+    // term frequencies with 9 significant bits, truncated (at most 0.4%
+    // low). Always index=MATCH, single-valued, no column, not stored.
+    SPARSE_VECTOR = 11; // learned sparse vector (SPLADE, ELSER tokens)
+    RANK_FEATURE = 12;  // one static ranking signal, e.g. pagerank
+    RANK_FEATURES = 13; // named ranking signals, e.g. topic scores
   }
   optional FieldClass type = 2; // required unless inherited from parent
 

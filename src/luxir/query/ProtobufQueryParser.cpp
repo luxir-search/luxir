@@ -3,6 +3,7 @@
 
 #include "luxir/query/ProtobufQueryParser.h"
 
+#include <algorithm>
 #include <cmath>
 #include <format>
 #include <limits>
@@ -20,6 +21,7 @@
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExprParser.h"
+#include "luxir/query/FeatureQuery.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
 #include "luxir/query/KnnQuery.h"
@@ -471,6 +473,129 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
   return pool.make<luxir::RescoreQuery>(child, program, constant);
 }
 
+namespace {
+
+// Field names never contain '.', so "field.feature" names a feature of a
+// sparse_vector or rank_features field (the Elasticsearch rank_feature form).
+std::pair<std::string_view, std::string_view> splitFeature(std::string_view field,
+                                                           std::string_view feature) {
+  if (!feature.empty()) return {field, feature};
+  auto dot = field.find('.');
+  if (dot == std::string_view::npos) return {field, feature};
+  return {field.substr(0, dot), field.substr(dot + 1)};
+}
+
+} // namespace
+
+FeatureFieldType& ProtobufQueryParser::featureField(std::string_view field, std::string_view label,
+                                                    std::string_view& physicalName) {
+  const auto& target = context.fields.resolve(field, OpClass::PRIMARY, context.opName);
+  auto* featureType = dynamic_cast<FeatureFieldType*>(target.fieldType);
+  if (featureType == nullptr) {
+    throw std::runtime_error(std::format(
+        "{} query requires a sparse_vector, rank_features or rank_feature field: {}",
+        label, field));
+  }
+  physicalName = api::build::arenaStr(pool, target.physicalName);
+  return *featureType;
+}
+
+std::string_view ProtobufQueryParser::featureTerm(const FeatureFieldType& type,
+                                                  std::string_view field,
+                                                  std::string_view feature) {
+  PackedTerm::TermBuffer scratch;
+  auto term = PackedTerm::fitTerm(type.longTerms, feature, scratch);
+  if (!term || term->empty()) {
+    throw std::runtime_error(std::format(
+        "Field '{}': feature name must be 1 to {} bytes (got {})",
+        field, PackedTerm::MAX_LEN, feature.size()));
+  }
+  return term->data() == scratch.data() ? api::build::arenaStr(pool, *term) : *term;
+}
+
+luxir::Query* ProtobufQueryParser::parseSparseVector(const luxir::api::SparseVectorQuery& query) {
+  std::string_view field;
+  FeatureFieldType& type = featureField(query.field, "sparse_vector", field);
+  if (type.kind == FeatureFieldType::RANK_FEATURE) {
+    throw std::runtime_error(std::format(
+        "sparse_vector query requires a sparse_vector or rank_features field: {}", query.field));
+  }
+  if (query.query_vector.empty()) {
+    throw std::runtime_error("sparse_vector query requires a non-empty 'query_vector'");
+  }
+  std::vector<luxir::Query*> clauses;
+  clauses.reserve(query.query_vector.size());
+  for (const auto& entry : query.query_vector) {
+    // A repeated token keeps its last weight, as map semantics do.
+    if (query.query_vector.find(entry.first) != &entry.second) continue;
+    if (!std::isfinite(entry.second) || !(entry.second > 0.0f)) {
+      throw std::runtime_error(std::format(
+          "sparse_vector query weight of '{}' must be finite and > 0 (got {})",
+          entry.first, entry.second));
+    }
+    FeatureScorer scorer;
+    scorer.weight = entry.second;
+    clauses.push_back(pool.make<luxir::FeatureQuery>(
+        field, featureTerm(type, query.field, entry.first), scorer));
+  }
+  if (clauses.size() == 1) return clauses[0];
+  auto optional = pool.make_span<luxir::Query*>(clauses.size());
+  std::copy(clauses.begin(), clauses.end(), optional.begin());
+  std::span<luxir::Query*> none{};
+  return pool.make<luxir::BooleanQuery>(none, optional, none, none);
+}
+
+luxir::Query* ProtobufQueryParser::parseRankFeature(const luxir::api::RankFeatureQuery& query) {
+  using RankFeature = luxir::api::RankFeatureQuery;
+  auto [fieldName, feature] = splitFeature(query.field, query.feature);
+  std::string_view field;
+  FeatureFieldType& type = featureField(fieldName, "rank_feature", field);
+  if (type.kind == FeatureFieldType::RANK_FEATURE) {
+    if (!feature.empty()) {
+      throw std::runtime_error(std::format(
+          "rank_feature query on rank_feature field '{}' takes no feature name", fieldName));
+    }
+    feature = FeatureFieldType::SINGLE_FEATURE;
+  } else if (feature.empty()) {
+    throw std::runtime_error(std::format(
+        "rank_feature query on {} field '{}' requires a feature name", type.kindName(), fieldName));
+  }
+
+  auto positive = [](float value) { return std::isfinite(value) && value > 0.0f; };
+  FeatureScorer scorer;
+  std::visit(luxir::overloaded{
+    [&](std::monostate) { scorer.function = FeatureScorer::SATURATION; scorer.pivot = 0.0f; },
+    [&](const RankFeature::Saturation& f) {
+      scorer.function = FeatureScorer::SATURATION;
+      // 0 asks the weight for the index-derived default pivot.
+      scorer.pivot = 0.0f;
+      if (f.pivot.has_value()) {
+        if (!positive(*f.pivot)) {
+          throw std::runtime_error("rank_feature saturation pivot must be finite and > 0");
+        }
+        scorer.pivot = *f.pivot;
+      }
+    },
+    [&](const RankFeature::Log& f) {
+      if (!std::isfinite(f.scaling_factor) || f.scaling_factor < 1.0f) {
+        throw std::runtime_error("rank_feature log scaling_factor must be finite and >= 1");
+      }
+      scorer.function = FeatureScorer::LOG;
+      scorer.scalingFactor = f.scaling_factor;
+    },
+    [&](const RankFeature::Sigmoid& f) {
+      if (!positive(f.pivot) || !positive(f.exponent)) {
+        throw std::runtime_error("rank_feature sigmoid pivot and exponent must be finite and > 0");
+      }
+      scorer.function = FeatureScorer::SIGMOID;
+      scorer.pivot = f.pivot;
+      scorer.exponent = f.exponent;
+    },
+    [&](const RankFeature::Linear&) { scorer.function = FeatureScorer::LINEAR; },
+  }, query.function);
+  return pool.make<luxir::FeatureQuery>(field, featureTerm(type, fieldName, feature), scorer);
+}
+
 luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
   // The one recursion choke point for structured trees: every nested node
   // passes through here, so the shared budget bounds tree depth no matter
@@ -501,6 +626,8 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     [&](const luxir::api::RescoreQuery& r) -> luxir::Query* {
       return parseRescore(r);
     },
+    [&](const luxir::api::SparseVectorQuery& v) -> luxir::Query* { return parseSparseVector(v); },
+    [&](const luxir::api::RankFeatureQuery& r) -> luxir::Query* { return parseRankFeature(r); },
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);
