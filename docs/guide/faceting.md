@@ -622,6 +622,13 @@ For numeric and date fields declared with `index: "range"`, a points index can
 answer a whole-index range facet from indexed points instead of walking the
 column. The result is the same either way; only the cost differs.
 
+Otherwise the column walk reads the min/max bounds the column keeps per block
+and per 512 values. A run of values whose bounds fall inside one bucket is
+counted without decoding, so histograms over time-ordered data cost about one
+step per run rather than one per value. Filtered facets, sub-operation facets
+and segments with deleted documents get this when the field is single-valued
+and present in every document of the segment; other shapes walk documents.
+
 ### Data-derived bounds
 
 Set `"bounds": "data"` to derive the histogram's extent from values in the

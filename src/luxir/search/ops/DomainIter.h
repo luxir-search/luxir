@@ -319,6 +319,146 @@ void forEachIntColValue(DocSet* domain, IntColReader& intColReader,
   }
 }
 
+// What a zone-pruned int column walk does with one zone (a block, or one of
+// its leaves).
+enum class IntZoneVerdict : uint8_t {
+  SKIP,    // no value of the zone contributes
+  WHOLE,   // every value contributes alike: one visitor.run(), no decode
+  VALUES   // decode: a block retries leaf by leaf, a leaf calls visitor.value()
+};
+
+// The in-domain values of one WHOLE zone. [begin, end) are value ranks; a walk
+// with a domain is over a leafBounded() column, where they are also the docs.
+struct IntZoneRun {
+  enum class Kind : uint8_t { ALL, BITS, ARRAY };
+  int64_t begin;
+  int64_t end;
+  int64_t count;  // in-domain values, > 0
+  Kind kind;
+  const uint64_t* words;          // BITS: the domain words from doc begin
+  std::span<const int32_t> docs;  // ARRAY: the domain docs in [begin, end)
+};
+
+// Walk an int column zone by zone: visitor.zone(min, max) classifies each
+// block zone, and each leaf zone of a block it answers VALUES for. A WHOLE
+// zone reaches visitor.run(IntZoneRun) with its in-domain count and no decode;
+// a VALUES leaf decodes and calls visitor.value(rank, value) per in-domain
+// value. In-domain docs without a value bump missing_num.
+//
+// A domain needs value ranks to be docs, so with one the column must be
+// leafBounded(); otherwise this returns false having visited nothing and the
+// caller walks docs (forEachIntColValue). Bitset domains decode a 128-value
+// frame only when the frame has domain docs, array domains decode by point.
+template <class V>
+bool forEachIntColZone(DocSet* domain, const IntColReader& col, int32_t maxDoc,
+                       int64_t& missing_num, V& visitor) {
+  constexpr int64_t BLOCK = NumColumnFormat::BLOCK_SIZE;
+  constexpr int64_t LEAF = NumColumnFormat::LEAF_ZONE_SIZE;
+  constexpr int64_t FRAME = NumColumnFormat::BULK_SIZE;
+  if (domain != nullptr && !col.leafBounded()) return false;
+  // A dense column has a value for every doc, so only a null domain (any
+  // shape) can see docs without one.
+  if (domain == nullptr) missing_num += maxDoc - col.docsWithValue();
+
+  using Kind = IntZoneRun::Kind;
+  Kind kind = domain == nullptr ? Kind::ALL
+      : domain->type == DocSet::Type::ARRAY ? Kind::ARRAY : Kind::BITS;
+  const uint64_t* words = kind == Kind::BITS
+      ? ((BitDocSet*)domain)->bits().words : nullptr;
+  const int32_t* arrNext = nullptr;
+  const int32_t* arrEnd = nullptr;
+  if (kind == Kind::ARRAY) {
+    std::span<int32_t> docs = ((ArrDocSet*)domain)->docs();
+    arrNext = docs.data();
+    arrEnd = arrNext + docs.size();
+  }
+  // Domain word `word` of a zone ending at `end`, masked there.
+  auto wordAt = [&](int64_t word, int64_t end) LUXIR_INLINE {
+    uint64_t w = words[word];
+    int64_t validBits = end - word * 64;
+    if (validBits < 64) w &= (1ULL << validBits) - 1;
+    return w;
+  };
+  int64_t frame[FRAME];
+  IntColReader::SparseValues points(col);
+
+  auto visitZone = [&](int64_t begin, int64_t end, IntZoneVerdict verdict) {
+    const int32_t* arrBegin = arrNext;
+    if (kind == Kind::ARRAY) {
+      arrNext = screaming::gallopLowerBound(arrNext, arrEnd, (int32_t)end);
+    }
+    if (verdict == IntZoneVerdict::SKIP) return;
+    if (verdict == IntZoneVerdict::WHOLE) {
+      IntZoneRun run{begin, end, 0, kind, nullptr, {}};
+      if (kind == Kind::ALL) {
+        run.count = end - begin;
+      } else if (kind == Kind::BITS) {
+        run.words = words + begin / 64;
+        for (int64_t w = begin / 64; w * 64 < end; w++) {
+          run.count += std::popcount(wordAt(w, end));
+        }
+      } else {
+        run.docs = {arrBegin, arrNext};
+        run.count = (int64_t)run.docs.size();
+      }
+      if (run.count > 0) visitor.run(run);
+      return;
+    }
+    if (kind == Kind::ARRAY) {
+      for (const int32_t* p = arrBegin; p != arrNext; p++) {
+        visitor.value((int64_t)*p, points.valueAt(*p));
+      }
+      return;
+    }
+    for (int64_t start = begin; start < end; start += FRAME) {
+      uint64_t lowWord = 0;
+      uint64_t highWord = 0;
+      if (kind == Kind::BITS) {
+        lowWord = wordAt(start / 64, end);
+        if (start + 64 < end) highWord = wordAt(start / 64 + 1, end);
+        if ((lowWord | highWord) == 0) continue;
+      }
+      uint32_t count;
+      [[maybe_unused]] int64_t decoded =
+          col.decodeValueSubBlock(start, frame, count);
+      assert(decoded == start);
+      if (kind == Kind::ALL) {
+        for (uint32_t i = 0; i < count; i++) visitor.value(start + i, frame[i]);
+        continue;
+      }
+      for (; lowWord != 0; lowWord &= lowWord - 1) {
+        int32_t i = std::countr_zero(lowWord);
+        visitor.value(start + i, frame[i]);
+      }
+      for (; highWord != 0; highWord &= highWord - 1) {
+        int32_t i = 64 + std::countr_zero(highWord);
+        visitor.value(start + i, frame[i]);
+      }
+    }
+  };
+
+  int64_t numValues = col.numValues();
+  const auto& leaves = col.leafMeta();
+  for (int64_t block = 0; block < col.numBlocks(); block++) {
+    int64_t begin = block * BLOCK;
+    int64_t end = std::min(begin + BLOCK, numValues);
+    // An array domain with no doc in the block skips it unread.
+    if (kind == Kind::ARRAY && (arrNext == arrEnd || *arrNext >= end)) continue;
+    NumBlockZone zone = col.blockZone(block);
+    IntZoneVerdict verdict = visitor.zone(zone.min, zone.max);
+    if (verdict != IntZoneVerdict::VALUES) {
+      visitZone(begin, end, verdict);
+      continue;
+    }
+    for (int64_t leafBegin = begin; leafBegin < end; leafBegin += LEAF) {
+      int64_t leafEnd = std::min(leafBegin + LEAF, end);
+      NumBlockZone leaf = leaves.leafZone(leafBegin / LEAF);
+      visitZone(leafBegin, leafEnd, visitor.zone(leaf.min, leaf.max));
+    }
+  }
+  return true;
+}
+
 // A domain's walk over an ord column, decoded BATCH_SIZE values at a time.
 // The walk over the domain's shape and the column's format and indexing lives
 // here, out of line and independent of what consumes the values: every

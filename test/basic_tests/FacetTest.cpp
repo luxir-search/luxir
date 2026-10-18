@@ -1364,6 +1364,134 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
   }
 }
 
+// The zone walk (whole blocks and leaves counted from their zones, straddling
+// zones bucketed against their own fences) must reproduce the doc walk exactly
+// across column shapes, domains, deletions, sub-ops and fence kinds.
+TEST_F(FacetTest, zoneRangeFacetMatchesDocWalk) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {
+    RangeSchemaField{"when_dt", false, false, api::FieldDef::FieldClass::DATE},
+    RangeSchemaField{"step_i", false, false},
+    RangeSchemaField{"rand_i", false, false},
+    RangeSchemaField{"sparse_i", false, false},
+    RangeSchemaField{"multi_is", false, true}
+  };
+  setRangeFacetSchema(helper, fields);
+
+  // Three segments of time-ordered docs, 7 minutes apart from 2024-01-15 UTC.
+  const int64_t base = 1705276800000LL;
+  const int64_t step = 7 * 60 * 1000LL;
+  std::mt19937_64 rng(42);
+  std::vector<std::string> deleted;
+  int32_t doc = 0;
+  for (int32_t segDocs : {12000, 10000, 3000}) {
+    std::vector<Doc> docs;
+    for (int32_t i = 0; i < segDocs; i++, doc++) {
+      Doc d = flatdoc("id", std::to_string(doc), "when_dt", base + doc * step,
+                      "step_i", (int64_t)doc,
+                      "rand_i", (int64_t)(rng() % 100'000));
+      if (doc % 3 == 0) appendFlat(d, "tag_s", "third");
+      if (doc % 97 == 0) appendFlat(d, "tag_s", "rare");
+      if (doc % 10 != 0) appendFlat(d, "sparse_i", (int64_t)doc);
+      if (doc % 4 != 0) {
+        appendFlat(d, "multi_is", vec_i(doc, doc + 700 * (doc % 3)));
+      }
+      if (segDocs == 10000 && doc % 11 == 0) deleted.push_back(std::to_string(doc));
+      docs.push_back(std::move(d));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteByIds(std::span<const std::string>(deleted),
+                                 UpdateMessage::COMMIT).success);
+
+  struct Guard {
+    bool saved = IntFacetRangeReq::disableZoneRangeFacetForTests;
+    bool savedStats = SkipStats::enabled;
+    Guard() { SkipStats::enabled = true; }
+    ~Guard() {
+      IntFacetRangeReq::disableZoneRangeFacetForTests = saved;
+      SkipStats::enabled = savedStats;
+    }
+  } guard;
+  const int64_t lastWhen = base + (doc - 1) * step;
+  const int64_t hour = 60 * 60 * 1000LL;
+  const std::array names = {
+    "hours", "days", "months", "step512", "step500", "step_wide", "rand_few",
+    "rand_many", "sparse", "multi", "sub_step", "sub_month"
+  };
+  auto addFacets = [&](auto&& facet) {
+    // Fixed gap clipped inside the data at both ends.
+    facet("hours", "when_dt").range(base + 12'345'678, lastWhen - 9'876'543, hour);
+    facet("days", "when_dt").calendarRange("2024-01-20", "2024-05-10", 1,
+        api::CalendarGap_::Unit::DAY, "America/Denver");
+    facet("months", "when_dt").calendarRange("2024-02-01", "2024-05-01", 1,
+        api::CalendarGap_::Unit::MONTH, "America/Denver");
+    // Fences on and off the 512-value leaf grid, and buckets spanning blocks.
+    facet("step512", "step_i").range(0, 30'000, 512);
+    facet("step500", "step_i").range(7, 24'000, 500);
+    facet("step_wide", "step_i").range(-5, 100'000, 9000);
+    // Unclustered values: straddling zones reach a few or many fences.
+    facet("rand_few", "rand_i").range(1000, 99'000, 24'000);
+    facet("rand_many", "rand_i").range(0, 100'000, 1000);
+    facet("sparse", "sparse_i").range(100, 24'000, 1024);
+    facet("multi", "multi_is").range(0, 26'000, 2048);
+    facet("sub_step", "step_i").range(100, 20'000, 4000).avg("a", "rand_i");
+    facet("sub_month", "when_dt").calendarRange("2024-02-01", "2024-05-01", 1,
+        api::CalendarGap_::Unit::MONTH, "UTC").avg("a", "rand_i");
+  };
+  auto missing = [](OpCursor& cursor) -> OpCursor& {
+    std::get<api::RangeFacet>(cursor.rawOp().kind).missing = true;
+    return cursor;
+  };
+
+  // Domains: all live docs (a liveDocs bitset in the segment with deletions),
+  // a bitset filter, and an array filter.
+  for (std::string_view filter : {"", "third", "rare"}) {
+    auto run = [&](bool disableZones) {
+      IntFacetRangeReq::disableZoneRangeFacetForTests = disableZones;
+      SkipStats::reset();
+      auto req = localReq(luxirNode->getSearchEngine());
+      req->collection("main");
+      if (filter.empty()) {
+        addFacets([&](std::string_view name, std::string_view field) -> OpCursor& {
+          return missing(req->rangeFacet(name, field));
+        });
+      } else {
+        auto& top = req->topDocs("q");
+        top.matchQuery("tag_s", filter).limit(0);
+        addFacets([&](std::string_view name, std::string_view field) -> OpCursor& {
+          return missing(top.rangeFacet(name, field));
+        });
+      }
+      req->execute(false);
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
+      std::vector<std::vector<std::byte>> encoded;
+      for (auto* name : names) {
+        const auto& result = filter.empty() ? rootFacetResult(*req, name)
+                                            : topFacetResult(*req, "q", name);
+        std::vector<std::byte> bytes;
+        EXPECT_TRUE(api::encode(result, bytes));
+        encoded.push_back(std::move(bytes));
+      }
+      if (filter.empty()) {
+        const auto& wide = rootFacetResult(*req, "step_wide");
+        EXPECT_EQ(doc - (int64_t)deleted.size(),
+                  std::accumulate(wide.counts.begin(), wide.counts.end(), 0LL));
+      }
+      return std::pair{std::move(encoded), SkipStats::rangeFacetZoneRuns};
+    };
+    auto [zoneResults, zoneRuns] = run(false);
+    auto [walkResults, walkRuns] = run(true);
+    EXPECT_GT(zoneRuns, 0) << filter;
+    EXPECT_EQ(0, walkRuns) << filter;
+    for (size_t i = 0; i < names.size(); i++) {
+      EXPECT_EQ(zoneResults[i], walkResults[i]) << filter << " " << names[i];
+    }
+  }
+}
+
+
 // Historical transition expectations depend on the process tzdb snapshot.
 TEST_F(FacetTest, calendarDateRangeDenverDstAndPointsParity) {
   CollectionHelper helper;
