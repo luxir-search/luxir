@@ -1073,7 +1073,7 @@ Indexing RAM budget: the configured limit and the bytes reserved against it.
 |---|---|---|---|---|
 | <a id="field-luxir.indexramstats.limit_bytes"></a>[`limit_bytes`](#field-luxir.indexramstats.limit_bytes) | 1 | `uint64` | singular |  |
 | <a id="field-luxir.indexramstats.reserved_bytes"></a>[`reserved_bytes`](#field-luxir.indexramstats.reserved_bytes) | 2 | `uint64` | singular |  |
-| <a id="field-luxir.indexramstats.pending_deletes_bytes"></a>[`pending_deletes_bytes`](#field-luxir.indexramstats.pending_deletes_bytes) | 3 | `uint64` | singular | Part of reserved\_bytes held by flushed delete-by-id batches awaiting a commit (see indexing.max-pending-deletes-mb). |
+| <a id="field-luxir.indexramstats.pending_deletes_bytes"></a>[`pending_deletes_bytes`](#field-luxir.indexramstats.pending_deletes_bytes) | 5 | `uint64` | singular | Part of reserved\_bytes held by flushed delete-by-id batches awaiting a commit (see indexing.max-pending-deletes-mb). |
 
 <a id="message-luxir.indexstats"></a>
 

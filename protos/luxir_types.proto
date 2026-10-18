@@ -1439,7 +1439,7 @@ message IndexRamStats {
   uint64 reserved_bytes = 2;
   // Part of reserved_bytes held by flushed delete-by-id batches awaiting a
   // commit (see indexing.max-pending-deletes-mb).
-  uint64 pending_deletes_bytes = 3;
+  uint64 pending_deletes_bytes = 5;
 }
 
 // jemalloc's process-wide statistics (stats.*), read at one statistics epoch
