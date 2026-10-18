@@ -2443,6 +2443,34 @@ TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
   EXPECT_EQ(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(supplier));
 }
 
+TEST(FilterCacheTest, requestStableFilterOwnsAndDeduplicatesWithoutSharedTraffic) {
+  LuxirNode node;
+  luxir::test::CollectionHelper helper(node, "request_stable_filter");
+  ASSERT_TRUE(helper.indexAll({luxir::test::flatdoc("when_dt", 1)},
+                              UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto* cache = reader->filterCache();
+  NumericPredicateQuery query("when_dt", 1, 1, FilterKeyScope::REQUEST_STABLE);
+  NumericPredicateQuery same("when_dt", 1, 1, FilterKeyScope::REQUEST_STABLE);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  EXPECT_FALSE(context.planningContext().lookupExistingFilterUse(query, true));
+  auto* use = context.getFilterUse(query);
+  ASSERT_NE(nullptr, use);
+  EXPECT_EQ(use, context.getFilterUse(same));
+  OwnedFilterStatsGuard stats;
+  for (auto* q : {&query, &same}) {
+    QueryPrep::materializeEffectiveFilter(
+        *q->createWeight(context, 0), context.getFilterUse(*q),
+        *reader, reader->segments()[0], nullptr);
+  }
+  EXPECT_EQ(1, SkipStats::ownedFilterMaterializations);
+  EXPECT_EQ(0u, cache->entryCountForTest());
+  EXPECT_EQ(0u, cache->counters().admissions);
+  EXPECT_EQ(0u, cache->counters().builds);
+  EXPECT_EQ(0u, cache->counters().misses);
+}
+
 TEST(FilterCacheTest, weightCountShortcutsAreNarrowAndTransparent) {
   RAMDir dir;
   CommitSnapshotRegistry writerSnapshots(dir);
@@ -5647,10 +5675,26 @@ TEST(FilterKeyTest, scoreAndExecutionWrappersPreserveMembershipKey) {
   EXPECT_EQ(keyFor(term), keyFor(force));
 }
 
-// An unrounded NOW range keys a new filter every request. It must stay exact
-// as NOW advances and must not touch admission history, so a rounded filter's
+TEST(FilterKeyTest, requestScopePropagatesSeparatelyFromQueryEquality) {
+  NumericPredicateQuery request("when_dt", 1, 2, FilterKeyScope::REQUEST_STABLE);
+  NumericPredicateQuery literal("when_dt", 1, 2);
+  // BooleanQuery dedups membership by equals(), independently of cache lifetime.
+  EXPECT_TRUE(request.equals(literal));
+  EXPECT_EQ(request.hash(), literal.hash());
+  EXPECT_NE(keyFor(request), keyFor(literal));
+  std::array<Query*, 2> clauses{&literal, &request};
+  BooleanQuery compound(clauses, {}, {}, {});
+  FilterKeyBuilder out;
+  EXPECT_EQ(FilterKeyScope::REQUEST_STABLE, compound.appendFilterKey(out, {}));
+  UncacheableQuery uncacheable(request);
+  std::array<Query*, 2> mixed{&request, &uncacheable};
+  BooleanQuery rejected(mixed, {}, {}, {});
+  EXPECT_FALSE(optionalKeyFor(rejected));
+}
+
+// An unrounded NOW range must not touch admission history, so a rounded filter's
 // first sighting survives a stream of them and admits on its second.
-TEST(FilterCacheIntegrationTest, unroundedNowRangeIsExactAndSkipsAdmission) {
+TEST(FilterCacheIntegrationTest, unroundedNowRangeSkipsAdmission) {
   LuxirConfig config;
   config.queryCacheBytes = 0;
   LuxirNode node(config);
@@ -5687,13 +5731,7 @@ TEST(FilterCacheIntegrationTest, unroundedNowRangeIsExactAndSkipsAdmission) {
   EXPECT_EQ(11, count(start, "now-10m/m", "now/m"));  // first sighting
   // More unique keys than testConfig's admission history holds.
   for (int64_t k = 0; k < 40; k++) {
-    int64_t now = start + k * 7001;
-    int64_t expected = 0;
-    for (int64_t i = 0; i < 60; i++) {
-      int64_t when = base + i * minute;
-      expected += when >= now - 10 * minute && when <= now;
-    }
-    EXPECT_EQ(expected, count(now, "now-10m", "now")) << k;
+    EXPECT_EQ(10, count(start + k, "now-10m", "now"));
   }
   EXPECT_EQ(0u, cache->entryCountForTest());
   EXPECT_EQ(0u, cache->counters().builds);

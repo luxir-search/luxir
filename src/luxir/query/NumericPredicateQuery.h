@@ -31,11 +31,12 @@ class NumericPredicateQuery final : public Query {
   PointsReader::ValueRange envelope;
   std::span<const int64_t> exactValues;
   std::span<const PointsReader::ValueRange> exactIntervals;
-  // A bound came from unrounded NOW date math (now-1h, not now-1h/m). Its
-  // filter key is unique per request millisecond, so it never hits; declaring
-  // it uncacheable keeps it out of the admission history instead of flushing
-  // out the sightings of filters that do repeat.
-  bool unroundedNow = false;
+  // Normally SEGMENT_STABLE; REQUEST_STABLE when a bound came from the request
+  // clock (unrounded NOW). Such keys never repeat across requests, so skip the
+  // shared cache and admission history while still deduplicating in the request.
+  // equals()/hash() ignore this: BooleanQuery dedups by equals(), and cache
+  // lifetime must not change membership.
+  FilterKeyScope filterKeyScope = FilterKeyScope::SEGMENT_STABLE;
 
 public:
   bool recoverableAsPredicate() const noexcept override { return true; }
@@ -48,9 +49,9 @@ public:
 #endif
 
   NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi,
-                        bool unroundedNow = false)
+                        FilterKeyScope filterKeyScope = FilterKeyScope::SEGMENT_STABLE)
     : Query(QueryKind::NUMERIC_PREDICATE), field(field), envelope{lo, hi},
-      unroundedNow(unroundedNow) {}
+      filterKeyScope(filterKeyScope) {}
 
   NumericPredicateQuery(std::string_view field,
                         std::span<const int64_t> exactValues,
@@ -176,8 +177,7 @@ public:
       out.appendSize(exactValues.size());
       for (int64_t value : exactValues) out.appendInt64(value);
     }
-    return unroundedNow ? FilterKeyScope::UNCACHEABLE
-                        : FilterKeyScope::SEGMENT_STABLE;
+    return filterKeyScope;
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags,

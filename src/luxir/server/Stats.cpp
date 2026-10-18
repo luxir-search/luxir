@@ -292,11 +292,13 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
       out.key_hash = row.keyHash;
       out.key_bytes = (uint32_t)row.keyBytes;
       out.key_text = api::build::arenaStr(resource, row.keyText);
-      std::string_view scope = row.scope == FilterKeyScope::READER_STABLE
-          ? "READER_STABLE"
-          : row.scope == FilterKeyScope::CORE_STABLE ? "CORE_STABLE"
-                                                     : "SEGMENT_STABLE";
-      out.scope = scope;
+      switch (row.scope) {
+        case FilterKeyScope::SEGMENT_STABLE: out.scope = "SEGMENT_STABLE"; break;
+        case FilterKeyScope::CORE_STABLE: out.scope = "CORE_STABLE"; break;
+        case FilterKeyScope::READER_STABLE: out.scope = "READER_STABLE"; break;
+        case FilterKeyScope::REQUEST_STABLE: out.scope = "REQUEST_STABLE"; break;
+        case FilterKeyScope::UNCACHEABLE: out.scope = "UNCACHEABLE"; break;
+      }
       out.reader_value = row.readerValue;
       out.bytes = row.bytes;
       out.segments_resident = row.segmentsResident;

@@ -183,9 +183,9 @@ TEST(DateMathQueryBuilder, usesOneExplicitNowAndRoundingWindow) {
   EXPECT_EQ(*parseDateToEpochMillis("2024-06-25T23:59:59.999Z"), range->getHi());
 }
 
-// Only NOW math with no rounding command moves with every request millisecond;
-// such a range keeps exact bounds but is never cached.
-TEST(DateMathQueryBuilder, unroundedNowRangesAreUncacheable) {
+// NOW math with no rounding coarser than a millisecond moves with every
+// request, so its range is request-stable; the bounds stay exact.
+TEST(DateMathQueryBuilder, unroundedNowRangesAreRequestStable) {
   auto schema = Schema::createDefaultSchema();
   MemPool pool;
   int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
@@ -197,18 +197,21 @@ TEST(DateMathQueryBuilder, unroundedNowRangesAreUncacheable) {
     return dynamic_cast<NumericPredicateQuery*>(
         builder.createRangeQuery("when_dt", &lo, nullptr, &hi, nullptr));
   };
-  auto scope = [&](std::string_view lower, std::string_view upper) {
+  auto expectScope = [&](FilterKeyScope expected, std::string_view lower,
+                         std::string_view upper) {
     auto* range = build(lower, upper);
-    EXPECT_NE(nullptr, range);
+    ASSERT_NE(nullptr, range);
     FilterKeyBuilder out;
-    return range->appendFilterKey(out, FilterKeyContext{});
+    EXPECT_EQ(expected, range->appendFilterKey(out, FilterKeyContext{}));
   };
-  EXPECT_EQ(FilterKeyScope::UNCACHEABLE, scope("now-1h", "now"));
-  EXPECT_EQ(FilterKeyScope::UNCACHEABLE, scope("now-1h/m", "NOW"));
-  EXPECT_EQ(FilterKeyScope::UNCACHEABLE, scope("2024-06-01", "now+1d"));
-  EXPECT_EQ(FilterKeyScope::SEGMENT_STABLE, scope("now-1h/m", "now/m"));
-  EXPECT_EQ(FilterKeyScope::SEGMENT_STABLE, scope("NOW/DAY-7DAYS", "NOW/DAY"));
-  EXPECT_EQ(FilterKeyScope::SEGMENT_STABLE, scope("2024-06-01", "2024-06-01||+1d"));
+  expectScope(FilterKeyScope::REQUEST_STABLE, "now-1h", "now");
+  expectScope(FilterKeyScope::REQUEST_STABLE, "now-1h/m", "NOW");
+  expectScope(FilterKeyScope::REQUEST_STABLE, "2024-06-01", "now+1d");
+  expectScope(FilterKeyScope::REQUEST_STABLE, "now-1h/MILLI", "now/MILLI");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "now-1h/m", "now/m");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "now-1h/m/MILLI", "now/MILLI/m");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "NOW/DAY-7DAYS", "NOW/DAY");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "2024-06-01", "2024-06-01||+1d");
 
   auto* exact = build("now-1h", "now");
   ASSERT_NE(nullptr, exact);

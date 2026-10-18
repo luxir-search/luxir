@@ -270,8 +270,8 @@ struct DateRange {
   int64_t lo;
   int64_t hiExclusive;
   bool granuleSkipped = false;
-  // NOW-anchored with no rounding command: the window moves with every
-  // request millisecond, so a filter built from it never repeats.
+  // NOW-anchored with no rounding coarser than a millisecond: the window
+  // moves with every request millisecond.
   bool unroundedNow = false;
 };
 
@@ -846,16 +846,23 @@ inline std::optional<std::pair<int64_t, int64_t>> roundedInterval(
   return std::pair{*lo, *last};
 }
 
+struct DateMathResult {
+  DateRange range;
+  bool rounded;
+};
+
 // Evaluate once for the lower edge and once for the upper edge. A slash floors
 // the lower edge and rounds the upper edge to the unit's last millisecond;
 // later commands transform both. This is exactly the interval the existing
-// DATE range fold needs for gte/gt/lte/lt semantics.
-inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view math,
-                                              const TimeZone& zone) {
+// DATE range fold needs for gte/gt/lte/lt semantics. rounded is true when some
+// /unit coarser than a millisecond was applied.
+inline std::optional<DateMathResult> applyDateMath(
+    int64_t anchor, std::string_view math, const TimeZone& zone) {
   Cursor cur{math};
   if (cur.atEnd()) return std::nullopt;
   int64_t lo = anchor;
   int64_t hi = anchor;
+  bool rounded = false;
   while (!cur.atEnd()) {
     char op = cur.peek();
     cur.advance();
@@ -881,6 +888,7 @@ inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view m
       if (!lowWindow || !highWindow) return std::nullopt;
       lo = lowWindow->first;
       hi = highWindow->second;
+      rounded |= *unit != DateMathUnit::MILLISECOND;
     } else {
       auto newLo = addUnit(lo, amount, *unit, zone);
       auto newHi = addUnit(hi, amount, *unit, zone);
@@ -890,7 +898,7 @@ inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view m
     }
   }
   if (!supportedInstant(lo) || !supportedInstant(hi) || lo > hi) return std::nullopt;
-  return DateRange{lo, hi + 1};
+  return DateMathResult{.range = {lo, hi + 1}, .rounded = rounded};
 }
 
 inline bool startsWithNow(const Cursor& input) {
@@ -962,15 +970,16 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
   // Solr and OpenSearch clients share the same endpoint.
   if (dd::startsWithNow(input)) {
     if (input.size() == 3) {
-      return DateRange{nowEpochMillis, nowEpochMillis + 1, false, true};
+      return DateRange{.lo = nowEpochMillis, .hiExclusive = nowEpochMillis + 1,
+                       .unroundedNow = true};
     }
     input.advance(3);
     input.consume("||");  // harmless union convenience
-    std::string_view math = input.slice(input.position(), input.size());
-    auto result = dd::applyDateMath(nowEpochMillis, math, zone);
-    // Any '/unit' command makes the result step with that unit.
-    if (result) result->unroundedNow = math.find('/') == std::string_view::npos;
-    return result;
+    auto result = dd::applyDateMath(
+        nowEpochMillis, input.slice(input.position(), input.size()), zone);
+    if (!result) return std::nullopt;
+    result->range.unroundedNow = !result->rounded;
+    return result->range;
   }
 
   // A literal without math retains Luxir's existing granularity window.
@@ -990,8 +999,9 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     if (!anchor) return std::nullopt;
     auto result = dd::applyDateMath(
         anchor->range.lo, input.slice(mathStart, input.size()), zone);
-    if (result) result->granuleSkipped = anchor->range.granuleSkipped;
-    return result;
+    if (!result) return std::nullopt;
+    result->range.granuleSkipped = anchor->range.granuleSkipped;
+    return result->range;
   }
 
   // Solr appends math directly. Try operator positions from right to left so
@@ -1008,8 +1018,8 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     if (!anchor) continue;
     if (auto result = dd::applyDateMath(
             anchor->range.lo, input.slice(separator, input.size()), zone)) {
-      result->granuleSkipped = anchor->range.granuleSkipped;
-      return result;
+      result->range.granuleSkipped = anchor->range.granuleSkipped;
+      return result->range;
     }
   }
   return std::nullopt;

@@ -868,8 +868,8 @@ public:
   // window end, so [2024-01 TO 2024-06] covers January through June inclusive
   // and {2024-01 TO 2024-06} excludes both whole months.  Match on a DATE
   // field routes through here with gte == lte, so equality on a day matches
-  // the whole day.  A bound from unrounded NOW math makes the range
-  // uncacheable (see NumericPredicateQuery::unroundedNow).
+  // the whole day.  A bound from unrounded NOW math restricts filter reuse
+  // to this request, keeping it out of shared-cache admission history.
   //
   // Term-backed fields (TEXT/STRING/ID) build a constant-scoring
   // TermRangeQuery over the terms dictionary in byte order: bounds coerce to
@@ -984,7 +984,9 @@ public:
       hi = *hiEnc - 1;
     }
     if (lo > hi) return matchNoDocs();  // empty range
-    return pool.make<NumericPredicateQuery>(field, lo, hi, unroundedNow);
+    return pool.make<NumericPredicateQuery>(field, lo, hi,
+        unroundedNow ? FilterKeyScope::REQUEST_STABLE
+                     : FilterKeyScope::SEGMENT_STABLE);
   }
 
   // Build a phrase query from un-analyzed input by running the field's analyzer.

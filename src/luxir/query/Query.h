@@ -1188,7 +1188,7 @@ public:
         const Query& query, bool allowReaderStable = false) {
       if (filterUses == nullptr) return std::nullopt;
       const auto& identity = filterIdentity(query);
-      if (identity.scope == FilterKeyScope::UNCACHEABLE
+      if (!usesSharedFilterCache(identity.scope)
           || (identity.scope == FilterKeyScope::READER_STABLE
               && !allowReaderStable)) {
         return std::nullopt;
@@ -1226,7 +1226,7 @@ public:
       auto uniqueByQuery = pool.make_span<size_t>(queries.size());
       for (size_t i = 0; i < queries.size(); i++) {
         const auto& identity = filterIdentity(*queries[i]);
-        if (identity.scope == FilterKeyScope::UNCACHEABLE
+        if (!usesSharedFilterCache(identity.scope)
             || (identity.scope == FilterKeyScope::READER_STABLE
                 && !allowReaderStable)
             || !identity.key) {
