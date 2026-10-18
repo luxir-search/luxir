@@ -218,6 +218,7 @@ blocks.
 | `collections=true` | `totals` and per-collection `collections`: documents, segments, committed bytes, commit time, generations, merges, inverters, snapshot pins and drops, query cache, availability. Implied on tenant and collection routes. | Briefly takes each writer's index lock and decodes each reader-only manifest. No file I/O. |
 | `files=true` | `bytes` from an index directory listing; aux index and segment bytes. Implies `collections`. | Lists every index directory. |
 | `segments=true` | Per-segment records. Implies `files`. | Iterates segments. |
+| `columns=true` | Per-segment column zone statistics for INT and DATE columns, see [Column zone statistics](#column-zone-statistics). Implies `segments`. | Reads block metadata, O(blocks) per column. |
 | `system=true` | `system`: process, host CPU/memory, network, disk, data filesystem, pressure and cgroup v2. Node scope only. | About 20 procfs/cgroupfs reads and a scan of `/proc/self/fd`. |
 | `format=prometheus` | Text exposition instead of JSON (`text/plain; version=0.0.4`). | Rendering only. |
 
@@ -400,6 +401,34 @@ There are no replication metrics in `_stats`; see
 [replication status](replication.md#diagnose-status). Search admission queues,
 deadline-driven partial results, and checksum scrubbing are not implemented on
 this revision, so no statistics exist for those features.
+
+### Column zone statistics
+
+`?columns=true` (`StatsRequest.columns`, implies `segments`) adds a `columns`
+list to each segment of the current search snapshot: one entry per INT or
+DATE column with values. Numeric columns are stored in blocks of 4096 values,
+each with a min/max zone. Range filters skip a block whose zone misses the
+range and take one whole when the zone is inside it, so how tightly the zones
+cluster decides how much of a column a range query reads. For timestamps that
+depends on arrival order: late shippers and backfills mix old and new values
+in one segment and widen every zone. The statistics come from block metadata,
+cost O(blocks) per column, and decode nothing.
+
+| Field | Meaning |
+| --- | --- |
+| `field`, `values`, `blocks`, `min`, `max` | Column identity and size in this segment. |
+| `zone_overlap` | Sum of block span / column span: the expected number of block zones that hold a value in [min, max]. About 1 when values arrive in order, whatever the block count; about `blocks` when they arrive in random order; under 1 when they cluster with gaps between them. |
+| `mean_block_span` | Mean block span / column span. About 1 / `blocks` when ordered, close to 1 when random. |
+| `tight_blocks` | Fraction of blocks spanning at most 1% of the column span. Needs about 100 blocks (409,600 values) to reach 1 even for perfectly ordered data, so read it on large segments. |
+| `constant_blocks`, `linear_blocks`, `raw_blocks` | Block encodings: frame of reference (offsets from the block minimum), linear fit (offsets from a line, how ordered timestamps encode), and raw 64-bit. |
+| `bits_per_value` | Packed width averaged over values, raw blocks at 64. |
+
+`zone_overlap` is the number to watch. Near 1, a range query reads about the
+blocks its range covers plus one at each edge; near `blocks`, the zones prune
+nothing and a 1-hour range over a segment holding a day of shuffled logs
+reads every block. A column holding a
+single distinct value reports a `zone_overlap` of 0 and `tight_blocks` of 1.
+Values are in the stored representation, epoch milliseconds for DATE.
 
 ## Threads and streaming backpressure
 

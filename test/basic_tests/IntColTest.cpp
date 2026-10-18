@@ -9,7 +9,9 @@
 #include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
+#include <algorithm>
 #include <numeric>
+#include <random>
 #include <vector>
 
 #include "luxir/index/IntColWriter.h"
@@ -623,6 +625,69 @@ TEST_F(IntColTest, valueSketchOnlyForSortableColumns) {
   merge.commit(true, 1);
   ASSERT_TRUE(helper.submit(merge).success);
   expectSketches(1);
+}
+
+// Zone statistics separate time-ordered from shuffled timestamps whatever the
+// block count, and count the block encodings.
+TEST_F(IntColTest, zoneStats) {
+  auto statsOf = [](std::span<const int64_t> values) {
+    RAMDir dir;
+    auto file = dir.createFile("numeric");
+    OutputStream out(file.get());
+    IntColWriter writer(out);
+    for (int64_t value : values) writer.addInt64(value);
+    auto data = writer.finish();
+    out.close();
+    dir.finishFile(*file);
+    auto in = dir.openFile("numeric");
+    InputStream input(in->getInputStream());
+    IntColReader reader(input, data.columnLoc, data.columnMetaOff, data.numValues);
+    return reader.zoneStats();
+  };
+
+  // Millisecond timestamps about a second apart, with jitter.
+  int64_t blocks = 200;
+  std::vector<int64_t> times;
+  for (int64_t i = 0; i < blocks * (int64_t)IntColReader::BLOCK_SIZE; i++) {
+    times.push_back(1700000000000 + i * 1000 + (i * 7919) % 500);
+  }
+  auto sorted = statsOf(times);
+  EXPECT_NEAR(1.0, sorted.zoneOverlap, 0.05);
+  EXPECT_NEAR(1.0 / (double)blocks, sorted.meanBlockSpan, 0.001);
+  EXPECT_EQ(1.0, sorted.tightBlocks);
+  EXPECT_EQ(blocks, sorted.linearBlocks);
+  EXPECT_LE(sorted.bitsPerValue, 10);  // the 500 ms jitter
+
+  std::mt19937_64 rng(42);
+  std::shuffle(times.begin(), times.end(), rng);
+  auto shuffled = statsOf(times);
+  EXPECT_GT(shuffled.zoneOverlap, 0.99 * (double)blocks);
+  EXPECT_GT(shuffled.meanBlockSpan, 0.99);
+  EXPECT_EQ(0.0, shuffled.tightBlocks);
+  EXPECT_EQ(blocks, shuffled.constantBlocks);
+  EXPECT_GT(shuffled.bitsPerValue, 25);
+
+  // A few sorted blocks are still recognizably ordered by their overlap,
+  // though no block is under 1% of the span.
+  times.resize(3 * IntColReader::BLOCK_SIZE);
+  std::sort(times.begin(), times.end());
+  auto few = statsOf(times);
+  EXPECT_NEAR(1.0, few.zoneOverlap, 0.05);
+  EXPECT_EQ(0.0, few.tightBlocks);
+
+  std::vector<int64_t> same(5000, 42);
+  auto constant = statsOf(same);
+  EXPECT_EQ(0.0, constant.zoneOverlap);
+  EXPECT_EQ(1.0, constant.tightBlocks);
+  EXPECT_EQ(2, constant.constantBlocks);
+  EXPECT_EQ(0.0, constant.bitsPerValue);
+
+  std::vector<int64_t> wide = {std::numeric_limits<int64_t>::min(), 0,
+                               std::numeric_limits<int64_t>::max()};
+  auto raw = statsOf(wide);
+  EXPECT_EQ(1, raw.rawBlocks);
+  EXPECT_EQ(64.0, raw.bitsPerValue);
+  EXPECT_EQ(1.0, raw.zoneOverlap);
 }
 
 TEST_F(IntColTest, wrappingBaseBitPattern) {

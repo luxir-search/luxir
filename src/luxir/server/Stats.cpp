@@ -7,6 +7,7 @@
 #include "luxir/util/ProcessAllocator.h"
 #include "ReplicationFollower.h"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <string_view>
@@ -15,6 +16,7 @@
 #include "LuxirNode.h"
 #include "luxir/api/build.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/reader/IntColReader.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/schema/Schema.h"
@@ -187,8 +189,39 @@ void fillQueryCacheStats(api::QueryCacheStats& dst, const ReaderManager::CacheSt
   dst.reader_thrash_build_skips = src.filterCacheCounters.readerThrashBuildSkips;
 }
 
+// Zone statistics of every INT and DATE column of `segment` holding values.
+void fillColumnStats(api::SegmentStats& dst, const IndexReader::Segment& segment,
+                     std::pmr::memory_resource& resource) {
+  auto& postings = segment.postingsReader();
+  std::vector<api::ColumnZoneStats> columns;
+  for (int32_t ord = 0; ord < postings.numFields(); ord++) {
+    const auto* info = postings.fieldInfo(ord);
+    if (info == nullptr || (info->type != FieldType::INT && info->type != FieldType::DATE)
+        || info->columnLoc.offset() <= 0 || info->numValues == 0) {
+      continue;
+    }
+    IntColReader column(postings, *info);
+    auto zones = column.zoneStats();
+    auto& out = columns.emplace_back();
+    out.field = api::build::arenaStr(resource, (std::string_view)info->fieldname);
+    out.values = (uint64_t)column.numValues();
+    out.blocks = (uint64_t)column.numBlocks();
+    out.min = column.getMin();
+    out.max = column.getMax();
+    out.mean_block_span = zones.meanBlockSpan;
+    out.tight_blocks = zones.tightBlocks;
+    out.zone_overlap = zones.zoneOverlap;
+    out.constant_blocks = (uint64_t)zones.constantBlocks;
+    out.linear_blocks = (uint64_t)zones.linearBlocks;
+    out.raw_blocks = (uint64_t)zones.rawBlocks;
+    out.bits_per_value = zones.bitsPerValue;
+  }
+  auto* array = api::build::allocArray(dst.columns, columns.size(), resource);
+  std::copy(columns.begin(), columns.end(), array);
+}
+
 template<class Stats>
-void fillIndexStats(api::IndexStats& dst, const Stats& src,
+void fillIndexStats(api::IndexStats& dst, const Stats& src, const IndexReader* columnsReader,
                     std::pmr::memory_resource& resource) {
   dst.commit_time = src.commitTime;
   dst.index_gen = src.indexGen;
@@ -233,6 +266,11 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
     for (std::size_t oi = 0; oi < in.overlays.size(); oi++) {
       copyAuxStats(overlays[oi], in.overlays[oi], resource);
     }
+    if (columnsReader) {
+      if (const auto* segment = columnsReader->findSegment(in.segId)) {
+        fillColumnStats(out, *segment, resource);
+      }
+    }
   }
 }
 
@@ -242,7 +280,8 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
                  api::StatsResponse& response, std::pmr::memory_resource& resource) {
   auto start = std::chrono::steady_clock::now();
   bool nodeScope = request.collection.empty() && request.tenant.empty();
-  bool files = request.files || request.segments;
+  bool segments = request.segments || request.columns;
+  bool files = request.files || segments;
   if (!nodeScope && request.system) {
     throw RequestError("system stats are node-wide: request them without a collection or tenant");
   }
@@ -303,8 +342,12 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
         if (auto snapshot = shard->getReaderManager().snapshot()) {
           for (const auto& file : snapshot->files) indexTotals.committed_bytes += file.size;
         }
+        // Column statistics read the search snapshot's segments; a segment the
+        // writer has not yet published has none.
+        std::shared_ptr<IndexReader> columnsReader;
+        if (request.columns) columnsReader = shard->getReaderManager().getReader();
         auto fill = [&](const auto& stats) {
-          fillIndexStats(shardStats.index, stats, resource);
+          fillIndexStats(shardStats.index, stats, columnsReader.get(), resource);
           // Counts for this index alone.  "collections" is meaningless below the node
           // total and "shards" below the collection total, so neither is set here.
           indexTotals.segments = stats.segments;
@@ -315,8 +358,8 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
           indexTotals.deleted_docs = stats.maxDocs - stats.liveDocs;
           indexTotals.bytes = stats.totalBytes;
         };
-        if (writer) fill(writer->stats(request.segments, files));
-        else fill(shard->getReaderManager().stats(request.segments, files));
+        if (writer) fill(writer->stats(segments, files));
+        else fill(shard->getReaderManager().stats(segments, files));
       } catch (const std::exception&) {
         // A collection deleted or closed while walking a node-wide listing must
         // not fail the whole response; a named collection reports the failure.

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/store/Manifest.h"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <future>
 #include <map>
 #include <optional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -23,6 +25,7 @@
 #include "test/HttpReq.h"
 #include "test/SchemaBuilder.h"
 #include "luxir/api/build.h"
+#include "luxir/reader/IntColReader.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/server/HttpServer.h"
@@ -737,6 +740,43 @@ TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
   ASSERT_EQ(1u, reader->segments().size());
   EXPECT_EQ(Postings::getIndexFileNamePrefix(reader->segments()[0].segInfo.seg_id), *seg);
   EXPECT_FALSE((*segments)[0].contains("live_gen"));
+}
+
+// ?columns=true adds per-segment zone statistics for INT and DATE columns,
+// which tell time-ordered from shuffled timestamps.
+TEST_F(HttpApiTest, statsColumnZones) {
+  auto overlap = [&](const char* name, bool shuffle) {
+    CollectionHelper zones(name);
+    std::vector<int64_t> times;
+    for (int64_t i = 0; i < 4 * (int64_t)IntColReader::BLOCK_SIZE; i++) {
+      times.push_back(1700000000000 + i * 1000);
+    }
+    std::mt19937_64 rng(7);
+    if (shuffle) std::shuffle(times.begin(), times.end(), rng);
+    std::vector<Doc> docs;
+    for (size_t i = 0; i < times.size(); i++) {
+      docs.push_back(flatdoc("id", std::to_string(i), "ts_dt", times[i]));
+    }
+    EXPECT_TRUE(zones.indexAll(docs, UpdateMessage::COMMIT).success);
+    auto response = httpRequest(port(), http::verb::get,
+                                std::format("/collections/{}/_stats?columns=true", name));
+    EXPECT_EQ(200, response.result_int()) << response.body();
+    glz::generic_i64 root;
+    EXPECT_FALSE(glz::read_json(root, response.body())) << response.body();
+    auto& segments = root["collections"][0]["shards"][0]["index"]["segments"];
+    EXPECT_EQ(1u, segments.get<glz::generic_i64::array_t>().size()) << response.body();
+    for (auto& column : segments[0]["columns"].get<glz::generic_i64::array_t>()) {
+      if (column["field"].get<std::string>() != "ts_dt") continue;
+      EXPECT_EQ((int64_t)times.size(), column["values"].get<int64_t>());
+      EXPECT_EQ(4, column["blocks"].get<int64_t>());
+      EXPECT_EQ(1700000000000, column["min"].get<int64_t>());
+      return column["zone_overlap"].get<double>();
+    }
+    ADD_FAILURE() << "no ts_dt column: " << response.body();
+    return 0.0;
+  };
+  EXPECT_NEAR(1.0, overlap("zones_sorted", false), 0.01);
+  EXPECT_GT(overlap("zones_shuffled", true), 3.9);
 }
 
 TEST_F(HttpApiTest, statsRoutingErrors) {

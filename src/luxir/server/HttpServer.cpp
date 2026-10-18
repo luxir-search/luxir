@@ -1562,7 +1562,8 @@ private:
             !parseBoolParam(params, "segments", stats.segments, err) ||
             !parseBoolParam(params, "collections", stats.collections, err) ||
             !parseBoolParam(params, "files", stats.files, err) ||
-            !parseBoolParam(params, "system", stats.system, err)) {
+            !parseBoolParam(params, "system", stats.system, err) ||
+            !parseBoolParam(params, "columns", stats.columns, err)) {
           respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
           return;
         }
@@ -2414,6 +2415,7 @@ private:
     bool collections = false;
     bool files = false;
     bool system = false;
+    bool columns = false;
     bool prometheus = false;
   };
 
@@ -2430,6 +2432,7 @@ private:
             request.collections = params.collections;
             request.files = params.files;
             request.system = params.system;
+            request.columns = params.columns;
             request.tenant = tenant;
             if (coll) request.collection = *coll;
 
