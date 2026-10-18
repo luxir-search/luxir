@@ -369,6 +369,55 @@ public:
     return plan;
   }
 
+  BlockRelation relationTo(const NumBlockZone& zone) const {
+    if (!intersects(zone.min, zone.max)) return BlockRelation::OUTSIDE;
+    return covers(zone.min, zone.max)
+        ? BlockRelation::INSIDE : BlockRelation::CROSSES;
+  }
+
+  // Visits the column's value ranks in order as runs [start, end) with their
+  // relation to the predicate: a whole block when its zone decides it, else
+  // each of its leaf zones. CROSSES marks only leaves that still cross, so a
+  // tight column leaves about one crossing leaf per interval bound.
+  template <typename Visit>
+  void forEachZoneRun(const IntColReader& reader, Visit&& visit) const {
+    constexpr int64_t LEAF = NumColumnFormat::LEAF_ZONE_SIZE;
+    const auto& leaves = reader.leafMeta();
+    for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
+      int64_t start = blockNum * (int64_t)IntColReader::BLOCK_SIZE;
+      int64_t end = start + reader.valuesInBlock(blockNum);
+      BlockRelation relation = relationTo(reader.blockZone(blockNum));
+      if (relation != BlockRelation::CROSSES) {
+        visit(start, end, relation);
+        continue;
+      }
+      for (int64_t leafStart = start; leafStart < end; leafStart += LEAF) {
+        visit(leafStart, std::min(end, leafStart + LEAF),
+              relationTo(leaves.leafZone(leafStart / LEAF)));
+      }
+    }
+  }
+
+  // Value counts the zone metadata decides: values in INSIDE runs, and values
+  // in leaves that cross (each may or may not match).
+  struct ZoneTally {
+    int64_t insideValues = 0;
+    int64_t crossingValues = 0;
+  };
+
+  ZoneTally tallyZones(const IntColReader& reader) const {
+    ZoneTally tally;
+    forEachZoneRun(reader,
+        [&tally](int64_t start, int64_t end, BlockRelation relation) {
+          if (relation == BlockRelation::INSIDE) {
+            tally.insideValues += end - start;
+          } else if (relation == BlockRelation::CROSSES) {
+            tally.crossingValues += end - start;
+          }
+        });
+    return tally;
+  }
+
   class CrossingValues {
     IntColReader& reader;
     int64_t residualStart = -1;
@@ -820,30 +869,24 @@ public:
     IndexReader::FieldSegments segInfos;
     float constantScore;
 
-    static int64_t estimateCost(IntColReader& reader,
-                                std::span<const BlockPlan> plans,
-                                bool exactSet) {
-      int64_t estimate = 0;
-      for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
-        int64_t count = reader.valuesInBlock(blockNum);
-        switch (plans[(size_t)blockNum].relation) {
-          case BlockRelation::INSIDE:
-            estimate += count;
-            break;
-          case BlockRelation::CROSSES:
-            // A crossing zone gives no exact cardinality. A range crosses a
-            // block at one end and matches part of it, so charge the measured
-            // half-block heuristic. A value set has gaps throughout the block
-            // and no comparable midpoint, so charge its full value count as a
-            // conservative upper bound. Points-backed fields replace both with
-            // exact point ordinal counts below.
-            estimate += exactSet ? count : (count + 1) / 2;
-            break;
-          case BlockRelation::OUTSIDE:
-            break;
-        }
-      }
-      return std::min<int64_t>(estimate, reader.docsWithValue());
+    // A single-valued column-only count may decode this many crossing values
+    // per interval at supplier construction. Points decode up to two 512-value
+    // boundary leaves per interval there; two blocks leave room for a few
+    // jittered leaves around each bound before the count waits for execution.
+    static constexpr int64_t SUPPLIER_CROSSING_VALUES_PER_INTERVAL =
+        2 * (int64_t)IntColReader::BLOCK_SIZE;
+
+    static int64_t estimateCost(const IntColReader& reader,
+                                const ZoneTally& tally, bool exactSet) {
+      // A crossing leaf gives no exact cardinality. A range crosses a leaf
+      // at one end and matches part of it, so charge half. A value set has
+      // gaps throughout the leaf and no comparable midpoint, so charge its
+      // full value count as a conservative upper bound. Points-backed fields
+      // replace both with exact point ordinal counts below.
+      int64_t crossing = exactSet
+          ? tally.crossingValues : (tally.crossingValues + 1) / 2;
+      return std::min<int64_t>(tally.insideValues + crossing,
+                               reader.docsWithValue());
     }
 
     static size_t fillPointRanges(
@@ -880,8 +923,11 @@ public:
     }
 
     // Bounds answer covering and disjoint ranges without opening points.
-    // Partial single-valued points counts resolve at supplier construction;
-    // multi-valued and points-less counts walk the column only at execution.
+    // Partial single-valued points counts resolve at supplier construction.
+    // A single-valued column without points counts from its zones: exact
+    // when no leaf crosses, else resolved by decoding the crossing leaves, at
+    // supplier construction while they are few. Multi-valued counts walk the
+    // column only at execution.
     CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
       if (query.getHi() < query.getLo()) return {0, CountHow::METADATA};
       const auto* info = segmentInfo(segment);
@@ -894,12 +940,30 @@ public:
           || !query.intersects(info->columnBounds->min, info->columnBounds->max)) {
         return {0, CountHow::METADATA};
       }
+      bool singleValued = info->monoLoc.offset() == 0;
       CountHow how = query.covers(info->columnBounds->min, info->columnBounds->max)
           ? CountHow::METADATA
-          : info->pointsMetaOff != 0 && info->monoLoc.offset() == 0
-              ? CountHow::SUPPLIER : CountHow::ITERATE;
+          : info->pointsMetaOff != 0 && singleValued
+              ? CountHow::SUPPLIER
+              : singleValued ? CountHow::INDEX_WALK : CountHow::ITERATE;
       auto shortcut = countBound(segment, domain, info->docsWithField, how);
-      if (shortcut.how == CountHow::SUPPLIER) shortcut.resolver = this;
+      if (shortcut.how == CountHow::INDEX_WALK) {
+        IntColReader reader(segment.postingsReader(), *info);
+        ZoneTally tally = query.tallyZones(reader);
+        if (tally.crossingValues == 0) {
+          return {tally.insideValues, CountHow::METADATA};
+        }
+        shortcut.maxMatches = std::min(
+            shortcut.maxMatches, tally.insideValues + tally.crossingValues);
+        if (tally.crossingValues <= SUPPLIER_CROSSING_VALUES_PER_INTERVAL
+                * (int64_t)query.intervals().size()) {
+          shortcut.how = CountHow::SUPPLIER;
+        }
+      }
+      if (shortcut.how == CountHow::SUPPLIER
+          || shortcut.how == CountHow::INDEX_WALK) {
+        shortcut.resolver = this;
+      }
       return shortcut;
     }
 
@@ -1164,22 +1228,21 @@ public:
         }
         CrossingValues crossing(reader);
         if (!reader.multiValued()) {
+          // Single-valued: a value is a document. Zone-decided runs count
+          // from metadata; only leaves that still cross are decoded.
           int64_t count = 0;
-          for (int64_t blockNum = 0;
-               blockNum < reader.numBlocks(); blockNum++) {
-            const BlockPlan& plan = plans[(size_t)blockNum];
-            int64_t start =
-                blockNum * (int64_t)IntColReader::BLOCK_SIZE;
-            int64_t end = start + reader.valuesInBlock(blockNum);
-            if (plan.relation == BlockRelation::INSIDE) {
-              count += end - start;
-            } else if (plan.relation == BlockRelation::CROSSES) {
-              for (int64_t rank = start; rank < end; rank++) {
-                count += crossing.matches(
-                    rank, plan, weight.query);
-              }
-            }
-          }
+          weight.query.forEachZoneRun(reader,
+              [&](int64_t start, int64_t end, BlockRelation relation) {
+                if (relation == BlockRelation::INSIDE) {
+                  count += end - start;
+                } else if (relation == BlockRelation::CROSSES) {
+                  const BlockPlan& plan = plans[
+                      (size_t)(start / IntColReader::BLOCK_SIZE)];
+                  for (int64_t rank = start; rank < end; rank++) {
+                    count += crossing.matches(rank, plan, weight.query);
+                  }
+                }
+              });
           return count;
         }
 
@@ -1312,15 +1375,19 @@ public:
           BulkUse use, const BulkScorerContext& bulkContext) override {
         unused(use);
         if (bulkContext.requireConstantCount) {
-          auto shortcut = weight.countShortcut(segment, nullptr);
-          if (shortcut.how == CountHow::METADATA) {
-            return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
-                    BulkAnswer::NO, nullptr, shortcut.maxMatches};
-          }
-          if (shortcut.how == CountHow::SUPPLIER) {
-            assert(points != nullptr && !reader.multiValued());
-            return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
-                    BulkAnswer::NO, nullptr, (int64_t)pointValueCount};
+          // A single-valued column without points counts from the zones
+          // in exactCount(); its shortcut would walk the same zones first.
+          if (points != nullptr || reader.multiValued()) {
+            auto shortcut = weight.countShortcut(segment, nullptr);
+            if (shortcut.how == CountHow::METADATA) {
+              return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+                      BulkAnswer::NO, nullptr, shortcut.maxMatches};
+            }
+            if (shortcut.how == CountHow::SUPPLIER) {
+              assert(points != nullptr && !reader.multiValued());
+              return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+                      BulkAnswer::NO, nullptr, (int64_t)pointValueCount};
+            }
           }
           if (segment.liveDocs() != nullptr) {
             return {
@@ -1434,16 +1501,11 @@ public:
         for (int64_t i = 0; i < reader->numBlocks(); i++) {
           plans[(size_t)i] = query.classifyBlock(reader->blockInfo(i), reader->blockZone(i));
         }
-        cost = estimateCost(*reader, plans, query.isExactSet());
-        bool hasInside = false;
-        bool hasCrosses = false;
-        for (const BlockPlan& plan : plans) {
-          hasInside |= plan.relation == BlockRelation::INSIDE;
-          hasCrosses |= plan.relation == BlockRelation::CROSSES;
-        }
-        matchState = hasInside ? Query::MatchState::NONEMPTY
-            : hasCrosses ? Query::MatchState::UNKNOWN
-                         : Query::MatchState::EMPTY;
+        ZoneTally tally = query.tallyZones(*reader);
+        cost = estimateCost(*reader, tally, query.isExactSet());
+        matchState = tally.insideValues > 0 ? Query::MatchState::NONEMPTY
+            : tally.crossingValues > 0 ? Query::MatchState::UNKNOWN
+                                       : Query::MatchState::EMPTY;
       }
       return targetPool.make<Supplier>(*this, targetPool, segment, *reader,
                                        plans, cost, matchState,

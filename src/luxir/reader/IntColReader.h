@@ -351,6 +351,7 @@ private:
   int32_t docsWithField = 0;
   int64_t columnMin = 0;
   int64_t columnMax = 0;
+  int64_t columnBytes = 0;
 
   // Zone metadata follows the block descriptors: block zones, then the leaf
   // metadata (NumColumnFormat::LeafMeta). Returns where the bounds trailer
@@ -382,6 +383,7 @@ public:
       columnMin = InputStream::readVlong(minMaxPtr, endPtr);
       columnMax = InputStream::readVlong(minMaxPtr, endPtr);
     }
+    columnBytes = minMaxPtr - blocks;
 
     if (fieldInfo.monoLoc.offset() > 0) {
       endValueRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
@@ -451,6 +453,12 @@ public:
 
   int64_t numBlocks() const {
     return values.numBlocks();
+  }
+
+  // Bytes of the value column: blocks, block and leaf metadata and the
+  // bounds trailer. Excludes docsWithValue and the multi-valued offsets.
+  int64_t sizeInBytes() const {
+    return columnBytes;
   }
 
   NumericBlockInfo blockInfo(int64_t blockNum) const {

@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <format>
 #include <limits>
+#include <numeric>
 #include <span>
 #include <vector>
 
@@ -519,4 +521,84 @@ TEST_F(NumericRangeZoneMapTest, predictedCrossingBlockComparesDecodedValues) {
       query.createWeight(context, 0));
   EXPECT_EQ(collect(weight->createZoneMapScorerForTests(pool, segment)),
             expected);
+}
+
+// Without points, a single-valued count comes from the zones: exact from
+// metadata when no leaf crosses, else by decoding the crossing leaves.
+TEST_F(NumericRangeZoneMapTest, columnOnlyCountsFromZones) {
+  constexpr int32_t N = 3 * IntColReader::BLOCK_SIZE + 100;
+  constexpr int64_t B = IntColReader::BLOCK_SIZE;
+  constexpr int64_t L = NumColumnFormat::LEAF_ZONE_SIZE;
+  std::vector<int32_t> perm((size_t)N);
+  std::iota(perm.begin(), perm.end(), 0);
+  SplitMix64 rng(0x2c0ffee);
+  for (int32_t i = N - 1; i > 0; i--) std::swap(perm[(size_t)i], perm[(size_t)rng.rint(i + 1)]);
+
+  std::vector<std::vector<int64_t>> sorted((size_t)N), shuffled((size_t)N),
+      sparse((size_t)N), multi((size_t)N);
+  for (bool deleted : {false, true}) {
+    TestIndex index;
+    Inverter& inverter = index.getInverter();
+    for (int32_t doc = 0; doc < N; doc++) {
+      sorted[(size_t)doc] = {doc * 10LL};
+      shuffled[(size_t)doc] = {perm[(size_t)doc] * 10LL};
+      sparse[(size_t)doc].clear();
+      if (doc % 3) sparse[(size_t)doc] = {doc * 10LL};
+      multi[(size_t)doc].clear();
+      if (doc % 5) multi[(size_t)doc] = {doc * 10LL, doc * 10LL + 5};
+      inverter.startDoc();
+      inverter.getIndexHandler("sorted_i").index(inverter, sorted[(size_t)doc][0]);
+      inverter.getIndexHandler("shuffled_i").index(inverter, shuffled[(size_t)doc][0]);
+      if (doc % 3) inverter.getIndexHandler("sparse_i").index(inverter, sparse[(size_t)doc][0]);
+      inverter.getIndexHandler("multi_is").index(
+          inverter, std::span<const int64_t>(multi[(size_t)doc]));
+      inverter.finishDoc();
+    }
+    if (deleted) {
+      for (int32_t doc = 0; doc < N; doc += 7) index.deleteDoc(doc);
+    }
+    index.flush();
+    index.initReader();
+    auto& segment = index.reader->segments()[0];
+    ASSERT_EQ(deleted, segment.liveDocs() != nullptr);
+
+    using How = Query::CountHow;
+    struct Case {
+      std::string_view field;
+      const std::vector<std::vector<int64_t>>* values;
+      int64_t lo, hi;
+      How how;
+    };
+    const std::array<Case, 9> cases{{
+        {"sorted_i", &sorted, B * 10, (2 * B - 1) * 10, How::METADATA},
+        {"sorted_i", &sorted, L * 10, (3 * L - 1) * 10, How::METADATA},
+        {"sorted_i", &sorted, 1000 * 10 + 5, 9000 * 10, How::SUPPLIER},
+        {"sorted_i", &sorted, 15, 15, How::SUPPLIER},
+        {"sparse_i", &sparse, 1000 * 10 + 5, 9000 * 10, How::SUPPLIER},
+        {"sparse_i", &sparse, 0, (N - 1) * 10LL, How::METADATA},
+        {"shuffled_i", &shuffled, 1000 * 10 + 5, 9000 * 10, How::INDEX_WALK},
+        {"multi_is", &multi, 1000 * 10 + 5, 9000 * 10, How::ITERATE},
+        {"multi_is", &multi, B * 10, (2 * B - 1) * 10, How::ITERATE},
+    }};
+    for (const auto& test : cases) {
+      SCOPED_TRACE(std::format("{} [{},{}] deleted={}", test.field, test.lo, test.hi, deleted));
+      int64_t expected = 0;
+      for (int32_t doc : oracle(*test.values, test.lo, test.hi)) {
+        expected += !segment.liveDocs() || segment.liveDocs()->docset().get(doc);
+      }
+      MemPool pool;
+      Query::Context context(pool, *index.reader);
+      NumericPredicateQuery query(test.field, test.lo, test.hi);
+      auto* weight = query.createWeight(context, 0);
+      auto shortcut = weight->countShortcut(segment, nullptr);
+      EXPECT_EQ(deleted ? How::ITERATE : test.how, shortcut.how);
+      EXPECT_GE(shortcut.maxMatches, expected);
+      auto resolved = QueryPrep::resolveCount(shortcut, [&](Query::Weight& resolver) {
+        return resolver.scorerSupplier(pool, segment);
+      }, How::INDEX_WALK);
+      EXPECT_EQ(shortcut.how != How::ITERATE, resolved.has_value());
+      if (resolved) { EXPECT_EQ(expected, *resolved); }
+      EXPECT_EQ(deleted ? -1 : expected, countForTests(weight, segment));
+    }
+  }
 }

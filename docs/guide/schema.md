@@ -135,7 +135,8 @@ The built-in templates are:
 Text fields are **stored** in the default compressed **stored_resource**.
 Numeric suffixes are column-backed but do not build a points index by default;
 range and exact-match queries still work by quickly scanning the column. Define a
-concrete field with `index: "range"` when those operations need a points index.
+concrete field with `index: "range"` when those operations need a points index;
+[Dates](dates.md#range-index-for-timestamps) measures the trade-off for timestamps.
 There is no default geo suffix; define geo fields explicitly.
 
 ## Field templates for dynamic fields
