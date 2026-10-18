@@ -134,7 +134,7 @@ int luxir_main(int argc, char** argv) {
 
   if (*promote) {
     try {
-      return luxir::promote(config.store.data_dir, std::cout) ? 0 : 1;
+      return luxir::promote(config.store.data_dir, std::cout, config.store.verify_on_open == "full") ? 0 : 1;
     } catch (const std::exception& e) {
       std::cerr << "Promote failed: " << e.what() << '\n';
       return 1;

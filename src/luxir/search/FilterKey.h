@@ -37,10 +37,10 @@ inline FilterKeyScope strongestFilterKeyScope(FilterKeyScope a,
 // In-memory keys cannot outlive their process-local encoder, so tags only need
 // to be distinct within a build. Renumbering them is therefore harmless.
 enum class FilterKeyTag : uint8_t {
-  BOOLEAN_MANDATORY = 21,
-  BOOLEAN_OPTIONAL = 22,
-  BOOLEAN_PROHIBITED = 23,
-  BOOLEAN_FILTER = 24,
+  BOOLEAN_MANDATORY = 40,
+  BOOLEAN_OPTIONAL = 41,
+  BOOLEAN_PROHIBITED = 42,
+  BOOLEAN_FILTER = 43,
 };
 
 // Correctness envelope: schemaGen and timeZone always, plus coreGen for CORE_STABLE scope.

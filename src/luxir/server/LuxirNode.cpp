@@ -5,6 +5,7 @@
 #include "CommitWaits.h"
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
+#include "Scrubber.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/log.h"
 #include "oneapi/tbb/global_control.h"
@@ -109,10 +110,13 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
     collections_->open(this->config.read_only ? Collections::Role::READ_ONLY : Collections::Role::WRITER);
   }
   searchEngine = std::make_unique<SearchEngine>(*this);
+  scrubber = std::make_unique<Scrubber>(*this);
+  if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
 }
 
 LuxirNode::~LuxirNode() {
+  scrubber->stop();
   if (follower) follower->stop();
   commitWaits->close();
 }

@@ -168,6 +168,17 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--store.checked-dir.sync", store.checked_dir.sync, "Check fsync correctness: off, warn, throw")
       ->default_val(store.checked_dir.sync)
       ->check(CLI::IsMember({"off", "warn", "throw"}));
+  app.add_option("--store.verify-on-open", store.verify_on_open,
+                 "Startup check of committed files: none, or full (size and xxh3 of every file)")
+      ->default_val(store.verify_on_open)
+      ->check(CLI::IsMember({"none", "full"}));
+  app.add_option("--store.scrub-interval-s", store.scrub_interval_s,
+                 "Seconds between background checksum scrubs of published snapshots (0 = off)")
+      ->default_val(store.scrub_interval_s);
+  app.add_option("--store.scrub-max-bytes-per-sec", store.scrub_max_bytes_per_sec,
+                 "Background scrub read rate limit (0 = unthrottled)")
+      ->transform(CLI::AsSizeValue(false))
+      ->default_str("64MB");
 
   app.add_flag("--indexing.huge-pages,!--no-indexing.huge-pages", index.huge_pages,
                "Advise transparent huge pages for the indexing arena (jemalloc builds; "

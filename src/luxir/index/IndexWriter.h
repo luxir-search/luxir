@@ -524,6 +524,12 @@ public:
     return failed.load(std::memory_order_acquire) ? failureReason : nullptr;
   }
 
+  // An external check found a committed file damaged (Collection::fail): no
+  // further update, flush, merge or commit may read those bytes or publish
+  // over them. Admission, commit and publication all consult `failed`; a
+  // publication in flight completes first, and the registry closes.
+  void fail(std::string reason);
+
   // Advisory, for callers that would rather give up than submit (a streaming update
   // holding a cached writer).  Closing is terminal, so false may be stale but true
   // is final; the rejection that matters happens in the graph.
@@ -630,7 +636,9 @@ private:
   void finishUpdateBody(UpdateMessage& msg) {
     INDEX_DEBUG("finishUpdateBody: msg={}", (void*)&msg);
     bool doneWithMessage = true;
-    if (msg.commit != UpdateMessage::NO_COMMIT) {
+    // A failed request has no effects, including its commit.  Commit numbers are
+    // taken in initiateCommit, so skipping it leaves the commit sequencer dense.
+    if (msg.commit != UpdateMessage::NO_COMMIT && msg.result.ok()) {
       doneWithMessage = false;
       try {
         initiateCommit(msg);

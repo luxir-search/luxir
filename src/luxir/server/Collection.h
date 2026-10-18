@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "luxir/util/ApiError.h"
@@ -100,12 +102,22 @@ namespace api::SchemaRequest_ { enum class Mode; }
 // consist of multiple shards.
 class Collection {
   CollectionId id;
-  std::string unavailableReason;  // non-empty means resolution rejects the collection
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
+  // Set once, by placeholder() or fail(): resolution then rejects the
+  // collection with `failure`.
+  std::atomic<bool> failed{false};
+  mutable std::mutex failureMutex;
+  std::string failure;
 public:
   const CollectionId& getId() const { return id; }
   std::string getUnavailableReason() const;
+  // The one way a collection becomes unavailable while registered: a
+  // placeholder's reason, or a failure found while serving (a scrub mismatch).
+  // The first reason sticks. On a writer the IndexWriter fails too, so nothing
+  // more is read from or published over its files.
+  void fail(const std::string& reason);
+  bool isFailed() const { return failed.load(std::memory_order_acquire); }
   // An unavailable entry: a failed load, delete or create, or a deletion in
   // progress. Resolution rejects it with `reason`.
   static std::shared_ptr<Collection> placeholder(CollectionId id, std::string reason);

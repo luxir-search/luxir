@@ -15,11 +15,11 @@ void ReaderManager::throwClosed() {
   throw ApiError(ErrorKind::UNAVAILABLE, "reader_closed", "reader manager is closed");
 }
 
-std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot) {
+std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot, Directory& source) {
   std::lock_guard lock(indexReaderMutex);
   checkOpen();
   auto previous = indexReader.load();
-  return std::make_shared<IndexReader>(dir, snapshot, previous.get(), filterCache);
+  return std::make_shared<IndexReader>(source, snapshot, previous.get(), filterCache);
 }
 
 void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {

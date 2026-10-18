@@ -83,7 +83,7 @@ struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
-struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats;
+struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
 struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
@@ -427,11 +427,20 @@ struct ReplicationStatus {
   uint64_t last_contact = 0;
   std::span<const ReplicationCollectionStatus> collections;
 };
+struct ScrubStats {
+  uint64_t passes = 0;
+  uint64_t files = 0;
+  uint64_t bytes = 0;
+  uint64_t mismatches = 0;
+  uint64_t errors = 0;
+  uint64_t last_pass_end = 0;
+};
 struct StatsResponse {
   std::optional<StatsTotals> totals;
   std::span<const CollectionStats> collections;
   uint64_t multiterm_expansion_refills = 0;
   std::optional<MemoryStats> memory;
+  std::optional<ScrubStats> scrub;
 };
 struct CacheControlRequest {
   std::string_view collection;
@@ -480,6 +489,7 @@ struct KnnQuery {                                                // needs Vector
   std::string_view field;
   std::optional<Vector> query;
   std::optional<Ivf> ivf;
+  std::optional<float> similarity;
   int32_t k = 0;
   int32_t refine_candidates = 0;
   bool exact = false;
@@ -560,6 +570,7 @@ struct TopDocs {                                                 // all indirect
   std::span<const std::string_view> fields;
   std::span<const SortSpec> sort;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+  std::optional<float> min_score;
   int32_t batch_size = 0;
   ::hpp_proto::optional_indirect_view<Collapse> collapse;
   ::hpp_proto::optional_indirect_view<Diversify> diversify;
@@ -754,6 +765,7 @@ struct RescoreQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::string_view expr;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
+  std::optional<float> min_score;
 };
 struct SimpleQuery {
   using Operator = luxir::api::Match_::Operator;

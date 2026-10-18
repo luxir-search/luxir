@@ -148,6 +148,18 @@ request-level failure ends the stream: its response line carries
 `status: "error"` and the `error` object alongside whatever the group had
 already reported, and no later records from that connection are accepted.
 
+A malformed document record also ends the stream, with error code
+`invalid_json`. Document records are decoded by the indexing workers, not as
+they are read, so the failure is reported when the internal batch carrying the
+record is processed: earlier batches stay indexed, the batch holding the bad
+record indexes nothing and runs no commit it carried (an `_end_` commit, for
+example), and batches the connection had already submitted behind it (at most
+`--indexing.max-inflight-batches`) are still processed, so they are normally
+indexed. The error line's `docs_indexed_so_far` counts what was. Inside an
+`all_or_none` group the whole group fails. Control records are decoded in stream order as
+they arrive, so a malformed control record fails before anything after it is
+submitted.
+
 The document-per-line [search export](searching.md#stream-every-match) uses
 this same framing, and its `_header_` records are recognized and skipped, so
 an export can pipe straight back into `_update`.
@@ -163,7 +175,9 @@ Commit whichever way fits:
 - With no documents at all: `{"commit": {}}` as the whole body.
 
 An empty commit object commits immediately and the response waits for
-publication. The response's optional `commit` field identifies the resulting
+publication. A request that fails as a whole (`status: "error"`) runs no
+immediate commit, though a positive `commit_within_ms` it set may still
+publish other updates. The response's optional `commit` field identifies the resulting
 snapshot as the token `"9f3c2a71d04be6a5:42"` (`incarnation:index_gen`, where the
 incarnation is 16 hex digits). The
 incarnation is part of the identity: deleting and recreating a collection changes its incarnation. Updates acknowledged before publication

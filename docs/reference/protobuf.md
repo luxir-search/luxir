@@ -153,6 +153,7 @@ defaults and constraints are described in the comments and guides.
 - [`SchemaDef`](#message-luxir.schemadef)
 - [`SchemaRequest`](#message-luxir.schemarequest)
 - [`SchemaResponse`](#message-luxir.schemaresponse)
+- [`ScrubStats`](#message-luxir.scrubstats)
 - [`SearchOp`](#message-luxir.searchop)
 - [`SearchRequest`](#message-luxir.searchrequest)
 - [`SearchResponse`](#message-luxir.searchresponse)
@@ -1136,6 +1137,7 @@ Nearest-neighbor query against a searchable vector field. Search is exact when n
 | <a id="field-luxir.knnquery.refine_candidates"></a>[`refine_candidates`](#field-luxir.knnquery.refine_candidates) | 5 | `int32` | singular | Candidate-document pool size for full-precision rescoring of ANN results, in both units. Group search caps the number of candidates per group so repeated keys cannot consume the whole pool. Clamped up to k; 0 selects an adaptive default. Larger pools can improve recall at a cost in memory and latency. Fewer candidates may be available. |
 | <a id="field-luxir.knnquery.ivf"></a>[`ivf`](#field-luxir.knnquery.ivf) | 6 | [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf) | singular | ignored for exact search and segments without an IVF index |
 | <a id="field-luxir.knnquery.unit"></a>[`unit`](#field-luxir.knnquery.unit) | 7 | `string` | singular | docs (default): k counts documents. groups: k counts nearest groups under the enclosing top\_docs collapse key and missing policy; requires collapse. The match set contains one best scored witness per selected group. |
+| <a id="field-luxir.knnquery.similarity"></a>[`similarity`](#field-luxir.knnquery.similarity) | 8 | `float` | optional | Minimum vector similarity for a hit, in the metric's own space (not the transformed score): for l2 the maximum L2 distance (not squared), for ip the minimum dot product, for cosine the minimum cosine similarity. Hits beyond it are dropped from the k nearest, so fewer than k may match. Compared before any enclosing boost. Must be finite; l2 requires &gt;= 0. |
 
 <a id="message-luxir.knnquery.ivf"></a>
 
@@ -1537,6 +1539,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.rescorequery.query"></a>[`query`](#field-luxir.rescorequery.query) | 1 | [`Query`](#message-luxir.query) | singular |  |
 | <a id="field-luxir.rescorequery.expr"></a>[`expr`](#field-luxir.rescorequery.expr) | 2 | `string` | singular |  |
 | <a id="field-luxir.rescorequery.vars"></a>[`vars`](#field-luxir.rescorequery.vars) | 3 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
+| <a id="field-luxir.rescorequery.min_score"></a>[`min_score`](#field-luxir.rescorequery.min_score) | 4 | `float` | optional | Minimum rescored value. Documents whose expression output is below it do not match, in scored and unscored (filter) positions alike. Compared before any enclosing boost. Must be finite. |
 
 <a id="message-luxir.rrffusion"></a>
 
@@ -1588,6 +1591,23 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 | <a id="field-luxir.schemaresponse.commit"></a>[`commit`](#field-luxir.schemaresponse.commit) | 2 | `string` | singular | exact snapshot published by a schema update |
 | <a id="field-luxir.schemaresponse.schema"></a>[`schema`](#field-luxir.schemaresponse.schema) | 1 | [`SchemaDef`](#message-luxir.schemadef) | singular | the resulting schema after the operation |
 | <a id="field-luxir.schemaresponse.replicas"></a>[`replicas`](#field-luxir.schemaresponse.replicas) | 3 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
+
+<a id="message-luxir.scrubstats"></a>
+
+### luxir.ScrubStats
+
+Background checksum scrub of published snapshot files. A mismatch also makes its collection unavailable with the failing file in its error.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.scrubstats.passes"></a>[`passes`](#field-luxir.scrubstats.passes) | 1 | `uint64` | singular | completed passes over every collection |
+| <a id="field-luxir.scrubstats.files"></a>[`files`](#field-luxir.scrubstats.files) | 2 | `uint64` | singular | files checked |
+| <a id="field-luxir.scrubstats.bytes"></a>[`bytes`](#field-luxir.scrubstats.bytes) | 3 | `uint64` | singular | bytes read |
+| <a id="field-luxir.scrubstats.mismatches"></a>[`mismatches`](#field-luxir.scrubstats.mismatches) | 4 | `uint64` | singular | checksum mismatches, EIO, or unexpectedly missing files |
+| <a id="field-luxir.scrubstats.last_pass_end"></a>[`last_pass_end`](#field-luxir.scrubstats.last_pass_end) | 5 | `uint64` | singular | Unix milliseconds; absent before the first pass |
+| <a id="field-luxir.scrubstats.errors"></a>[`errors`](#field-luxir.scrubstats.errors) | 6 | `uint64` | singular | other file check errors; retried on the next pass |
 
 <a id="message-luxir.searchop"></a>
 
@@ -1755,6 +1775,7 @@ Operational statistics. An empty collection requests every collection on the nod
 | <a id="field-luxir.statsresponse.collections"></a>[`collections`](#field-luxir.statsresponse.collections) | 2 | [`CollectionStats`](#message-luxir.collectionstats) | repeated |  |
 | <a id="field-luxir.statsresponse.multiterm_expansion_refills"></a>[`multiterm_expansion_refills`](#field-luxir.statsresponse.multiterm_expansion_refills) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.statsresponse.memory"></a>[`memory`](#field-luxir.statsresponse.memory) | 9 | [`MemoryStats`](#message-luxir.memorystats) | singular | Set only by a StatsRequest.memory request, which returns nothing else. |
+| <a id="field-luxir.statsresponse.scrub"></a>[`scrub`](#field-luxir.statsresponse.scrub) | 14 | [`ScrubStats`](#message-luxir.scrubstats) | singular | Node-wide checksum scrub counters; set when store.scrub-interval-s is. |
 
 <a id="message-luxir.statstotals"></a>
 
@@ -1821,6 +1842,7 @@ Chunk settings for one stored-field group (a FieldDef stored\_resource). Every s
 | <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
 | <a id="field-luxir.topdocs.diversify"></a>[`diversify`](#field-luxir.topdocs.diversify) | 12 | [`Diversify`](#message-luxir.diversify) | singular | Incompatible with collapse; found counts capped documents. |
 | <a id="field-luxir.topdocs.collapse"></a>[`collapse`](#field-luxir.topdocs.collapse) | 11 | [`Collapse`](#message-luxir.collapse) | singular | limit, offset and found count groups; found\_docs counts eligible documents. |
+| <a id="field-luxir.topdocs.min_score"></a>[`min_score`](#field-luxir.topdocs.min_score) | 14 | `float` | optional | Minimum score cut-off. When set, documents whose query score is below this value do not match: they are excluded from the returned documents, from the get\_number count, and from the domain of ops (facets and metrics). The score compared is the query's own relevance score (filters do not score), computed even when the request sorts by fields or does not return scores. Must be finite. As a Fusion source, the cut-off applies to that source's ranked list. |
 | <a id="field-luxir.topdocs.ops"></a>[`ops`](#field-luxir.topdocs.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed over docs that match this query. |
 
 <a id="message-luxir.updaterequest"></a>

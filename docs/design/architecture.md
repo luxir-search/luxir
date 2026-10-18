@@ -90,10 +90,14 @@ response paths keep connection handling separate from long-running engine work.
   reserved for transport threads, and idle workers steal its tasks. The gRPC
   unary update path currently waits for indexing on its completion-queue
   handler.
-- Ingest is streaming and incremental: NDJSON bodies are parsed as bytes
+- Ingest is streaming and incremental: NDJSON bodies are framed as bytes
   arrive and each document enters the indexing pipeline immediately - a
   document can be getting inverted while the request that carried it is
-  still on the wire. Responses stream back the same way, a chunk at a time.
+  still on the wire. The connection thread only splits records, recognizes
+  control records, and cuts batches; JSON decoding of documents happens on
+  the indexing workers, so one connection can keep several cores busy.
+  Buffered JSON update bodies are likewise decoded on the task arena.
+  Responses stream back the same way, a chunk at a time.
   For HTTP/JSON clients, there is no maximum stream size and no required
   user-visible bulk-request boundary.
 

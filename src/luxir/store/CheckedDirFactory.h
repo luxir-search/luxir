@@ -58,6 +58,10 @@ public:
     return delegate_->openFile(name, expectSynced);
   }
 
+  std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
+    return delegate_->openChecksum(name, direct);
+  }
+
   // Readers share an open segment rather than reopening it, so most reads
   // never reach openFile(expectSynced): publication checks every file.
   void expectSynced(std::span<const FileDescriptor> files) override {
