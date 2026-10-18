@@ -168,9 +168,9 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   // (gRPC), so range-check before the value can be persisted or drive flags.
   if (def.index.has_value()) {
     if (*def.index != IndexMode::NONE && *def.index != IndexMode::MATCH &&
-        *def.index != IndexMode::RANGE) {
+        *def.index != IndexMode::RANGE && *def.index != IndexMode::MATCH_RANGE) {
       throw SchemaError("unknown index mode value " + std::to_string((int)*def.index) +
-                        " (field: " + std::string(name) + "); valid: none, match, range");
+                        " (field: " + std::string(name) + "); valid: none, match, range, match_range");
     }
     r.hasIndex = true;
     r.index = *def.index;
@@ -428,10 +428,18 @@ struct FieldCompiler {
 
     // Reject index modes the engine cannot honor. RANGE covers 1-D numeric
     // ranges and 2-D GEO_POINT boxes; both require a column in this phase.
+    // Numeric MATCH adds one docs-only term per value beside the column, which
+    // still answers ranges and segments written without the terms.
     bool numericClass = r.type == FieldClass::INT || r.type == FieldClass::FLOAT ||
                         r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE;
     bool geoClass = r.type == FieldClass::GEO_POINT;
-    if (index == IndexMode::RANGE) {
+    bool matchIndex = index == IndexMode::MATCH || index == IndexMode::MATCH_RANGE;
+    bool rangeIndex = index == IndexMode::RANGE || index == IndexMode::MATCH_RANGE;
+    if (index == IndexMode::MATCH_RANGE && !numericClass) {
+      throw SchemaError("index=match_range is only supported for int, float, double and date "
+                        "fields (field: " + std::string(name) + ")");
+    }
+    if (rangeIndex) {
       if (!numericClass && !geoClass) {
         throw SchemaError(
           "index=range is not supported for this type (field: " + std::string(name) +
@@ -441,13 +449,12 @@ struct FieldCompiler {
         throw SchemaError("index=range requires column=true for field: " + std::string(name));
       }
     }
-    if (index == IndexMode::MATCH) {
-      if (numericClass || geoClass) {
-        throw SchemaError(
-          "index=match (numeric term postings) is not yet implemented for field: " + std::string(name));
-      }
-      if (r.type == FieldClass::VECTOR) {
+    if (matchIndex) {
+      if (geoClass || r.type == FieldClass::VECTOR) {
         throw SchemaError("index=match is not supported for this type (field: " + std::string(name) + ")");
+      }
+      if (numericClass && !column) {
+        throw SchemaError("index=match on a numeric field requires column=true for field: " + std::string(name));
       }
     }
     if (!logical.hasMulti) {
@@ -462,14 +469,14 @@ struct FieldCompiler {
 
     // Build flags
     FieldType::flag_type flags = 0;
-    if (index == IndexMode::MATCH) {
+    if (matchIndex) {
       if (r.type == FieldClass::TEXT) {
         flags |= FieldType::INDEX_DOCS_FREQS_POSITIONS;
       } else {
         flags |= FieldType::INDEX_DOCS;
       }
     }
-    if (index == IndexMode::RANGE) flags |= FieldType::INDEX_RANGE;
+    if (rangeIndex) flags |= FieldType::INDEX_RANGE;
     if (column) flags |= FieldType::COLUMN_STORED;
     if (multi) flags |= FieldType::MULTI_VALUED;
     if (stored && !derived) flags |= FieldType::STORED;

@@ -1938,6 +1938,36 @@ public:
 
 };
 
+// Writes the docs-only terms of a MATCH-indexed numeric field from its
+// (value, docid) pairs sorted by value, then docid: one term per distinct
+// value (FieldType::numericTerm), so term order is value order. Flush and
+// merge both build the terms from the column's values this way.
+template <class Point>
+void writeNumericTerms(PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo,
+                       std::span<const Point> points) {
+  if (points.empty()) return;
+  TextWriter textWriter(postingsWriter);
+  textWriter.startField(&fieldInfo);
+  char packed[PackedTerm::getMemSize(FieldType::NUMERIC_TERM_BYTES)];
+  std::array<char, FieldType::NUMERIC_TERM_BYTES> bytes;
+  size_t i = 0;
+  while (i < points.size()) {
+    int64_t value = points[i].value;
+    PackedTerm::write(packed, FieldType::numericTerm(value, bytes).data(), FieldType::NUMERIC_TERM_BYTES);
+    PackedTerm term(packed);
+    textWriter.startTerm(term);
+    int32_t lastDoc = -1;
+    for (; i < points.size() && points[i].value == value; i++) {
+      // A multi-valued doc may repeat a value; postings hold each doc once.
+      if (points[i].docid == lastDoc) continue;
+      lastDoc = points[i].docid;
+      textWriter.addDoc(lastDoc, 1);
+    }
+    textWriter.endTerm(term);
+  }
+  textWriter.endField();
+}
+
 
 class DocsWriter {
   friend class DocsWithValWriter;

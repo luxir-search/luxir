@@ -772,6 +772,12 @@ private:
       // byte per doc-with-field plus its DocStream).
       return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
+    if (FieldType::sortsByIntColumn(type) && (allFlags & FieldType::INDEX_DOCS) != 0) {
+      // Numeric terms sort every live (value, docid) pair after the column
+      // and points are written, plus one source run at a time.
+      return numValues * 2 * MergeCostModel::SYNTHESIZED_POINT_BYTES
+          + MergeCostModel::LIGHT_BYTES + pointsBytes;
+    }
     // Int/str/vector columns and stored fields stream through fixed block buffers.
     return MergeCostModel::LIGHT_BYTES + pointsBytes;
   }
@@ -1514,7 +1520,9 @@ private:
       ordCollector.emplace(ordPool.value(), nDocs);
     }
 
-    if (allFlags & FieldType::INDEX_DOCS) {
+    // Numeric terms are rebuilt from the merged column instead (see below).
+    bool numericTerms = FieldType::sortsByIntColumn(type) && (allFlags & FieldType::INDEX_DOCS);
+    if ((allFlags & FieldType::INDEX_DOCS) && !numericTerms) {
       // nocommit outputFieldInfo.flags |= 0x01;
       TextWriter textWriter(postingsWriter);
       textWriter.startField(&outputFieldInfo);
@@ -1562,7 +1570,25 @@ private:
       } else if (hasOneDimensionalPoints(type, allFlags)) {
         mergePoints(sortedFields, postingsWriter, outputFieldInfo);
       }
+      if (numericTerms) mergeNumericTerms(sortedFields, postingsWriter, outputFieldInfo);
     }
+  }
+
+  // Rebuilds a MATCH-indexed numeric field's terms from the live values of
+  // every source, so sources flushed before the field gained terms are
+  // covered too.
+  void mergeNumericTerms(std::span<MergeFieldInfo*> sortedFields,
+                         PostingsWriter& postingsWriter,
+                         PostingsWriter::IndexFieldInfo& outputFieldInfo) {
+    std::vector<MergePoint> points;
+    points.reserve((size_t)outputFieldInfo.numValues);
+    for (MergeFieldInfo* field : sortedFields) {
+      if (field == nullptr) continue;
+      auto run = synthesizePointRun(*field);
+      points.insert(points.end(), run.begin(), run.end());
+    }
+    sortPointsByValueDocid(std::span<MergePoint>(points));
+    writeNumericTerms(postingsWriter, outputFieldInfo, std::span<const MergePoint>(points));
   }
 
 

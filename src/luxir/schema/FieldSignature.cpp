@@ -15,7 +15,8 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
   };
   properties["type"] = "\"" + std::string(types[type.type()]) + "\"";
   properties["multi"] = type.multiValued() ? "true" : "false";
-  properties["index"] = type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";
+  properties["index"] = type.rangeIndexed() && type.indexed() ? "\"match_range\""
+      : type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";
   properties["column"] = type.hasColumn() ? "true" : "false";
   if (type.type() == FieldType::TEXT || type.type() == FieldType::ID
       || (type.type() == FieldType::STRING && type.indexed())) {

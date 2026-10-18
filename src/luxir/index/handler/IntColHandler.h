@@ -20,8 +20,9 @@
 using namespace luxir;
 namespace luxir::handler {
 
-// RANGE flush adds this 16-byte-per-value peak outside inverter.pool, so the
-// inverter autoflush cap must leave headroom for the transient sort array.
+// RANGE and numeric MATCH flushes add this 16-byte-per-value peak outside
+// inverter.pool, so the inverter autoflush cap must leave headroom for the
+// transient sort array.
 struct FlushPoint {
   int64_t value;
   int32_t docid;
@@ -29,16 +30,23 @@ struct FlushPoint {
 
 static_assert(sizeof(FlushPoint) == 16);
 
-inline void writePoints(PostingsWriter& postingsWriter,
-                        PostingsWriter::IndexFieldInfo& fieldInfo,
-                        std::vector<FlushPoint>& points) {
+// Builds the value-sorted structures of a numeric field from its (value,
+// docid) pairs: the points index (RANGE) and the docs-only terms (MATCH).
+inline void writeValueIndexes(PostingsWriter& postingsWriter,
+                              PostingsWriter::IndexFieldInfo& fieldInfo,
+                              FieldType& fieldType, std::vector<FlushPoint>& points) {
   sortPointsByValueDocid(std::span<FlushPoint>(points));
-  auto output = postingsWriter.getOutputStream();
-  PointsWriter writer(*output, PointsWriter::Options{});
-  for (const auto& point : points) writer.addPoint(point.value, point.docid);
-  auto data = writer.finish();
-  fieldInfo.pointsLoc = data.pointsLoc;
-  fieldInfo.pointsMetaOff = data.pointsMetaOff;
+  if (fieldType.rangeIndexed()) {
+    auto output = postingsWriter.getOutputStream();
+    PointsWriter writer(*output, PointsWriter::Options{});
+    for (const auto& point : points) writer.addPoint(point.value, point.docid);
+    auto data = writer.finish();
+    fieldInfo.pointsLoc = data.pointsLoc;
+    fieldInfo.pointsMetaOff = data.pointsMetaOff;
+  }
+  if (fieldType.indexed()) {
+    writeNumericTerms(postingsWriter, fieldInfo, std::span<const FlushPoint>(points));
+  }
 }
 
 inline void writeGeoPoints(PostingsWriter& postingsWriter,
@@ -186,7 +194,7 @@ public:
       writer.finish(fieldInfo);
     }
 
-    if (fieldType->rangeIndexed()) {
+    if (fieldType->rangeIndexed() || fieldType->indexed()) {
       if (fieldType->type() == FieldType::GEO_POINT) {
         std::vector<BKDWriter::Point> points;
         points.reserve((size_t)numVals);
@@ -215,7 +223,7 @@ public:
           points[pointIndex++].docid = docid;
         });
         assert(pointIndex == points.size());
-        writePoints(postingsWriter, fieldInfo, points);
+        writeValueIndexes(postingsWriter, fieldInfo, *fieldType, points);
       }
     }
 
@@ -343,7 +351,7 @@ public:
       writer.finish(fieldInfo);
     }
 
-    if (fieldType->rangeIndexed()) {
+    if (fieldType->rangeIndexed() || fieldType->indexed()) {
       if (fieldType->type() == FieldType::GEO_POINT) {
         std::vector<BKDWriter::Point> points;
         points.reserve((size_t)numVals);
@@ -387,7 +395,7 @@ public:
         });
         assert(lengths.eof());
         assert(pointIndex == points.size());
-        writePoints(postingsWriter, fieldInfo, points);
+        writeValueIndexes(postingsWriter, fieldInfo, *fieldType, points);
       }
     }
 

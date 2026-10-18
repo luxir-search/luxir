@@ -135,7 +135,9 @@ The built-in templates are:
 Text fields are **stored** in the default compressed **stored_resource**.
 Numeric suffixes are column-backed but do not build a points index by default;
 range and exact-match queries still work by quickly scanning the column. Define a
-concrete field with `index: "range"` when those operations need a points index.
+concrete field with `index: "range"` when those operations need a points index,
+or `index: "match"` for equality filters on enum-like values; see
+[Numeric indexes](#numeric-indexes).
 There is no default geo suffix; define geo fields explicitly.
 
 ## Field templates for dynamic fields
@@ -262,7 +264,7 @@ publication advances the schema generation.
 | Key | Meaning |
 |---|---|
 | `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
-| `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
+| `index` | `match`, `range`, `match_range` (numerics only: both), or `none`; absent = the type's default (`text`/`string` index for match, numerics don't); see [Numeric indexes](#numeric-indexes) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | multi-valued |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
@@ -290,6 +292,32 @@ compressed chunks. Analyzed text has postings and stored retrieval but no
 per-document value column; use a `string` variant when the same source value
 must also sort or facet. Scalar types return their values from columns without
 a second stored copy.
+
+### Numeric indexes
+
+`int`, `float`, `double`, and `date` fields always keep their column, and
+every numeric query can run from it. The `index` setting adds structures
+that answer some queries faster:
+
+| `index` | Adds | Faster for |
+|---|---|---|
+| `none` (default) | nothing | |
+| `range` | a points index sorted by value | ranges, and exact values over many distinct values |
+| `match` | one indexed term per distinct value, like a `string` field | exact values and value sets (`code:404`, `code:=(200, 404)`, `any_of`), and ranges that span few distinct values |
+| `match_range` | both | each query uses the structure that suits it |
+
+`match` suits low-cardinality fields used as filters, such as status codes,
+enum values, or years: a filter on one value reads that value's postings
+list, intersects cheaply with other clauses, and is cheap to cache. A range
+uses the terms only on a field without a points index and when at most 64
+distinct values fall inside it; otherwise it reads the points index or the
+column. A `date` match on a day is a range over that day's milliseconds, so it
+uses the terms while the day holds few distinct timestamps. Numeric `match`
+requires `column: true`. Search results, sorting, and facets read the column
+as before.
+
+Segments written before a field gained `match` have no terms and keep using
+the column; merges rebuild the terms for all merged documents.
 
 ### Stored resources
 

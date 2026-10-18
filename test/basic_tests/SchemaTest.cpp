@@ -833,8 +833,8 @@ TEST_F(SchemaTest, fieldClassDefaults) {
 }
 
 
-// RANGE is accepted only for numeric columns. MATCH on numerics (no numeric
-// term postings) and on VECTOR remains rejected. Absence = the type default.
+// RANGE is accepted only for numeric and geo columns. MATCH on GEO_POINT and
+// VECTOR is rejected (numerics: NumericMatchIndexTest). Absence = the type default.
 TEST_F(SchemaTest, indexModeValidation) {
   auto trySchema = [](const char* name, FieldClass fc, std::optional<IndexMode> mode) {
     SchemaBuilder b;
@@ -851,8 +851,6 @@ TEST_F(SchemaTest, indexModeValidation) {
   EXPECT_TRUE(trySchema("location", FieldClass::GEO_POINT, IndexMode::RANGE)->getFieldTypePtr("location")->rangeIndexed());
   EXPECT_THROW(trySchema("title", FieldClass::TEXT, IndexMode::RANGE), SchemaError);
   EXPECT_THROW(trySchema("tag", FieldClass::STRING, IndexMode::RANGE), SchemaError);
-  EXPECT_THROW(trySchema("price", FieldClass::INT, IndexMode::MATCH), SchemaError);
-  EXPECT_THROW(trySchema("score", FieldClass::FLOAT, IndexMode::MATCH), SchemaError);
   EXPECT_THROW(trySchema("location", FieldClass::GEO_POINT, IndexMode::MATCH), SchemaError);
   EXPECT_THROW(trySchema("emb", FieldClass::VECTOR, IndexMode::MATCH), SchemaError);
 
