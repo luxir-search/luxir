@@ -420,6 +420,41 @@ void forEachOrdValue(DocSet* domain, OrdColReader& ordColReader,
   consumeOrdValues(values, missing_num, callback);
 }
 
+// Counting by whole runs of a run-length ord column: count(localOrd, n) adds
+// n to the segment's own 0-based term ord, once per in-domain stretch of a
+// run, and in-domain docs with no value bump missing_num, as forEachOrdValue
+// would count them value by value. Covers every doc (any indexing: each
+// encoded value is then one doc-value pair) and, in a docid-indexed column, a
+// bitset domain, whose run counts are popcounts. Returns false, having done
+// nothing, for any other column or domain.
+template <class F>
+bool countOrdRuns(DocSet* domain, const OrdColReader& column, int32_t maxDoc,
+                  int64_t& missing_num, F&& count) {
+  if (!column.runLength()) return false;
+  if (domain == nullptr) {
+    if (!column.docIdIndexed()) {
+      missing_num += maxDoc - column.docsReader().numDocs();
+    }
+    column.forEachRun([&](int64_t first, int64_t end, int32_t ord) {
+      if (ord == 0) missing_num += end - first;
+      else count((int64_t)ord - 1, end - first);
+    });
+    return true;
+  }
+  if (domain->type != DocSet::Type::BITSET || !column.docIdIndexed()) {
+    return false;
+  }
+  const FixedBitSet& bits = ((BitDocSet*)domain)->bits();
+  assert(bits.size() >= maxDoc && column.encodedValues() == maxDoc);
+  column.forEachRun([&](int64_t first, int64_t end, int32_t ord) {
+    int32_t hits = bits.cardRange((int32_t)first, (int32_t)end);
+    if (hits == 0) return;
+    if (ord == 0) missing_num += hits;
+    else count((int64_t)ord - 1, (int64_t)hits);
+  });
+  return true;
+}
+
 // Walk the complement of a resolved facet domain over the ord column. Bitset
 // domains drive the shared adaptive machinery through inverted word reads, so
 // no second bitset is materialized. Array domains (reachable only when a

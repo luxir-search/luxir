@@ -4,8 +4,13 @@
 #include <algorithm>
 #include <cstdio>
 #include <iterator>
+#include <map>
 #include <numeric>
+#include <span>
 #include <string>
+#include <tuple>
+#include <type_traits>
+#include <variant>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -15,6 +20,7 @@
 #include "luxir/index/OrdColWriter.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/search/ops/DomainIter.h"
+#include "luxir/server/JsonRequest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -390,7 +396,9 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
   constexpr int32_t straddleDoc = 301;
   enum class Shape { DOCID, RANK, MULTI };
   for (auto format : {OrdColWriter::FormatOverride::DIRECT,
-                      OrdColWriter::FormatOverride::PREDICTED}) {
+                      OrdColWriter::FormatOverride::PREDICTED,
+                      OrdColWriter::FormatOverride::RLE}) {
+    bool rle = format == OrdColWriter::FormatOverride::RLE;
     for (Shape shape : {Shape::DOCID, Shape::RANK, Shape::MULTI}) {
       SCOPED_TRACE(::testing::Message()
                    << "format=" << (int)format << " shape=" << (int)shape);
@@ -399,10 +407,12 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
       TestField field(index, shape == Shape::MULTI ? "f_ss" : "f_s");
       field.startIndexing();
       for (int32_t doc = 0; doc < numDocs; doc++) {
+        // Run-length columns get runs of 50 docs (rank shape: a few values).
+        int32_t key = rle ? doc / 50 : doc;
         if (shape == Shape::DOCID) {
-          if (doc % 9 != 4) field.add(doc, ordinalTerm((doc * 37) % 500));
+          if (doc % 9 != 4) field.add(doc, ordinalTerm((key * 37) % 500));
         } else if (shape == Shape::RANK) {
-          if (doc % 11 == 0) field.add(doc, ordinalTerm((doc * 37) % 500));
+          if (doc % 11 == 0) field.add(doc, ordinalTerm((key * 37) % 500));
         } else if (doc == straddleDoc || doc % 5 != 0) {
           int32_t count = doc == straddleDoc ? 400 : 1 + doc % 4;
           std::vector<std::string> terms;
@@ -419,7 +429,8 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
       ASSERT_EQ(shape == Shape::DOCID ? SegFieldInfo::ORD_DOCID
                                       : SegFieldInfo::ORD_RANK,
                 field.fieldInfo.ordIndexing);
-      ASSERT_EQ(format == OrdColWriter::FormatOverride::PREDICTED
+      ASSERT_EQ(rle ? SegFieldInfo::ORD_RLE
+                : format == OrdColWriter::FormatOverride::PREDICTED
                     ? SegFieldInfo::ORD_PREDICTED : SegFieldInfo::ORD_DIRECT,
                 field.fieldInfo.ordFormat);
       ASSERT_EQ(shape == Shape::MULTI, field.ordReader->multiValued());
@@ -474,6 +485,21 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
           int64_t expectedMissing = 0;
           EXPECT_EQ(expected(walked, expectedMissing), got);
           EXPECT_EQ(expectedMissing, missing);
+
+          // Whole-run counting, where it applies, counts what the walk saw.
+          std::map<int64_t, int64_t> walkCounts;
+          for (auto [doc, ord] : got) walkCounts[ord]++;
+          std::map<int64_t, int64_t> runCounts;
+          int64_t runMissing = 0;
+          bool counted = !complement && countOrdRuns(domain, reader, maxDoc,
+              runMissing, [&](int64_t ord, int64_t n) { runCounts[ord] += n; });
+          EXPECT_EQ(rle && (domain == nullptr
+                            || (domain->type == DocSet::Type::BITSET
+                                && shape == Shape::DOCID)), counted);
+          if (counted) {
+            EXPECT_EQ(walkCounts, runCounts);
+            EXPECT_EQ(expectedMissing, runMissing);
+          }
         };
 
         std::vector<int32_t> all(maxDoc);
@@ -551,8 +577,9 @@ TEST_F(OrdColFormatTest, directAndPredictedFacetsMatch) {
   shapes.emplace_back(std::move(sparse), "cat_s");
   shapes.emplace_back(std::move(multi), "cat_ss");
   for (const auto& [docs, field] : shapes) {
-    EXPECT_EQ(run(docs, field, OrdColWriter::FormatOverride::DIRECT),
-              run(docs, field, OrdColWriter::FormatOverride::PREDICTED));
+    FacetOutput direct = run(docs, field, OrdColWriter::FormatOverride::DIRECT);
+    EXPECT_EQ(direct, run(docs, field, OrdColWriter::FormatOverride::PREDICTED));
+    EXPECT_EQ(direct, run(docs, field, OrdColWriter::FormatOverride::RLE));
   }
 }
 
@@ -592,8 +619,9 @@ TEST_F(OrdColFormatTest, directAndPredictedFacetsMatchAcrossBlocksAndSparseDomai
     return out;
   };
 
-  EXPECT_EQ(run(OrdColWriter::FormatOverride::DIRECT),
-            run(OrdColWriter::FormatOverride::PREDICTED));
+  FacetOutput direct = run(OrdColWriter::FormatOverride::DIRECT);
+  EXPECT_EQ(direct, run(OrdColWriter::FormatOverride::PREDICTED));
+  EXPECT_EQ(direct, run(OrdColWriter::FormatOverride::RLE));
 }
 
 TEST_F(OrdColFormatTest, automaticSelectionRequiresBothSavingsGates) {
@@ -711,4 +739,157 @@ TEST_F(OrdColFormatTest, predictedInputSegmentsMergeWithFacetAndSortParity) {
   request.commit(true, 1);
   ASSERT_TRUE(helper.submit(request).success);
   EXPECT_EQ(before, snapshot());
+}
+
+// Runs of equal ords pick the run-length format on their own, single- and
+// multi-valued, and decode to what a direct column holds.
+TEST_F(OrdColFormatTest, automaticSelectionPicksRunsAndDecodesLikeDirect) {
+  constexpr int32_t count = 40'000;
+  using Values = std::vector<std::tuple<int32_t, int32_t, int64_t>>;
+  auto build = [&](std::string_view name, OrdColWriter::FormatOverride format,
+                   int32_t& ordFormat) {
+    OrdFormatGuard guard(format);
+    TestIndex index;
+    TestField field(index, name);
+    field.startIndexing();
+    for (int32_t doc = 0; doc < count; doc++) {
+      std::string value = ordinalTerm((doc / 500 * 7) % 13);
+      if (name == "runs_s") {
+        field.add(doc, value);
+      } else if (doc % 100 == 0) {
+        field.addStrings(doc, {value, "zz"});
+      } else {
+        field.addStrings(doc, {value});
+      }
+    }
+    index.flush();
+    field.startReading();
+    EXPECT_EQ(0, field.nextDoc());
+    ordFormat = field.fieldInfo.ordFormat;
+    std::vector<int32_t> docs(count);
+    std::iota(docs.begin(), docs.end(), 0);
+    Values values;
+    OrdColReader::getValues(index.pool, field.currentSegment()->postingsReader(),
+                            field.fieldInfo, docs,
+        [&](size_t, int32_t doc, int32_t ord, int64_t valIdx, int64_t) {
+          values.emplace_back(doc, ord, valIdx);
+        });
+    return values;
+  };
+  for (std::string_view name : {"runs_s", "runs_ss"}) {
+    SCOPED_TRACE(name);
+    int32_t autoFormat = 0;
+    int32_t directFormat = 0;
+    Values automatic = build(name, OrdColWriter::FormatOverride::AUTO, autoFormat);
+    Values direct = build(name, OrdColWriter::FormatOverride::DIRECT, directFormat);
+    EXPECT_EQ(SegFieldInfo::ORD_RLE, autoFormat);
+    EXPECT_EQ(SegFieldInfo::ORD_DIRECT, directFormat);
+    EXPECT_EQ(direct, automatic);
+  }
+}
+
+// Facets over every doc, a bitset domain and an array domain, string sort,
+// value retrieval and collapse read a run-length column as they read a direct
+// one, across segments and after merging them.
+TEST_F(OrdColFormatTest, runLengthReadersAndMergeMatchDirect) {
+  constexpr int32_t perSegment = 4'500;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 2 * perSegment; doc++) {
+    std::string value = ordinalTerm((doc / 300 * 7) % 13);
+    Doc d = flatdoc("id_s", ordinalTerm(doc), "seq_i", (int64_t)doc,
+                    "dense_s", doc % 3 != 0 ? "yes" : "no",
+                    "sparse_s", doc % 97 == 0 ? "yes" : "no");
+    // A stretch of docs without the field makes runs of missing ords.
+    if (doc / 300 % 5 != 2) d.emplace_back("cat_s", value);
+    d.emplace_back("tags_ss", doc % 100 == 0
+        ? std::vector<std::string>{value, "zz"} : std::vector<std::string>{value});
+    docs.push_back(std::move(d));
+  }
+
+  using Snapshot = std::vector<std::string>;
+  auto snapshot = [&]() {
+    Snapshot out;
+    for (std::string_view field : {"cat_s", "tags_ss"}) {
+      for (std::string_view gate : {"", "dense_s", "sparse_s"}) {
+        auto req = localReq(luxirNode->getSearchEngine());
+        req->collection("main");
+        auto& top = req->topDocs("q").getNumber(true).limit(0);
+        if (gate.empty()) top.allQuery();
+        else top.rawQuery() = qb::match(top.mr(), gate, "yes");
+        auto& facet = top.facet("f", field).limit(-1);
+        std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
+        req->execute(false);
+        EXPECT_OK(req);
+        const auto* result = req->docList("q")->ops.at("f")->facetResult();
+        const auto& ids = std::get<luxir::api::ColStr>(result->bucket_ids->kind).v;
+        for (size_t i = 0; i < ids.size(); i++) {
+          out.push_back(std::string(ids[i]) + "=" + std::to_string(result->counts[i]));
+        }
+        out.push_back("missing=" + std::to_string(result->missing.value_or(0)));
+      }
+    }
+
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main");
+    auto& top = req->topDocs("q").getNumber(true).allQuery().limit(200)
+        .fields({"id_s", "cat_s", "tags_ss"});
+    qb::sort(top, "tags_ss", qb::DESC);
+    qb::sort(top, "cat_s", qb::ASC);
+    qb::sort(top, "seq_i", qb::ASC);
+    req->execute(false);
+    EXPECT_OK(req);
+    for (const Doc& doc : req->getDocs()) {
+      std::string row;
+      for (const NameVal& field : doc) {
+        row += field.name + ":";
+        std::visit([&](const auto& value) {
+          using T = std::decay_t<decltype(value)>;
+          if constexpr (std::is_same_v<T, std::string>) {
+            row += value;
+          } else if constexpr (std::is_same_v<T, std::vector<std::string>>) {
+            for (const std::string& v : value) row += v + ",";
+          }
+        }, field.val);
+        row += " ";
+      }
+      out.push_back(row);
+    }
+
+    auto collapse = localReq(luxirNode->getSearchEngine());
+    parseQueryRequest(R"JSON({"query":"*:*","get_number":true,"limit":-1,
+        "document_format":"rows","batch_size":1000,"fields":["id_s"],
+        "sort":"seq_i asc",
+        "collapse":{"field":["cat_s"],"missing":"group","head_sort":"seq_i desc"}})JSON",
+        collapse->rawRequest(), collapse->mr);
+    collapse->collection("main");
+    collapse->execute(false);
+    EXPECT_OK(collapse);
+    const auto& list = *collapse->docList("q");
+    for (size_t i = 0; i < list.docs.size(); i++) {
+      out.push_back(std::string(list.docs[i].fields.at("id_s")->asString()) + "#"
+                    + std::to_string(list.groups->counts[i]));
+    }
+    return out;
+  };
+
+  CollectionHelper helper;
+  auto build = [&](OrdColWriter::FormatOverride format, bool merge) {
+    OrdFormatGuard guard(format);
+    helper.clear();
+    for (int32_t segment = 0; segment < 2; segment++) {
+      EXPECT_TRUE(helper.indexAll(std::span<const Doc>(docs).subspan(
+          (size_t)segment * perSegment, perSegment), UpdateMessage::COMMIT).success);
+    }
+    if (merge) {
+      CollectionHelper::UpdateBuilder request;
+      request.commit(true, 1);
+      EXPECT_TRUE(helper.submit(request).success);
+    }
+    return snapshot();
+  };
+
+  Snapshot direct = build(OrdColWriter::FormatOverride::DIRECT, false);
+  EXPECT_EQ(direct, build(OrdColWriter::FormatOverride::RLE, false));
+  EXPECT_EQ(direct, build(OrdColWriter::FormatOverride::RLE, true));
+  EXPECT_EQ(direct, build(OrdColWriter::FormatOverride::AUTO, true));
 }

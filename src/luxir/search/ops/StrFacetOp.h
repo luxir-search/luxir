@@ -1122,11 +1122,13 @@ public:
               });
           } else {
             std::vector<uint32_t> localCounts(segFieldInfo.nTerms);
-            facetReq.facetSegOrdCol(domain, segnum, missing_num,
-              OrdMap::SegToGlobal::identity(),
+            facetReq.facetSegOrdCounts(domain, segnum, missing_num,
               [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
                 unused(docid);
                 localCounts[(size_t)localOrd]++;
+              },
+              [&](int64_t localOrd, int64_t n) {
+                localCounts[(size_t)localOrd] += (uint32_t)n;
               });
             forEachMappedOrd(localCounts.size(),
                              [&](size_t localOrd, int64_t globalOrd) {
@@ -1161,11 +1163,13 @@ public:
           std::vector<int64_t> localCounts(
               stage ? (size_t)segTerms * (size_t)(laneMask + 1) : 0);
           int64_t* counts = stage ? localCounts.data() : countVec->data();
-          facetReq.facetSegOrdCol(domain, segnum, missing_num,
-            stage ? OrdMap::SegToGlobal::identity() : mapping,
+          // Unstaged means an identity mapping, so the walk's ords are the
+          // segment's own either way; whole runs count into lane 0.
+          facetReq.facetSegOrdCounts(domain, segnum, missing_num,
             [&](int32_t docid, int64_t ord) LUXIR_INLINE {
               counts[(int64_t)(docid & laneMask) * segTerms + ord]++;
-            });
+            },
+            [&](int64_t ord, int64_t n) { counts[ord] += n; });
           if (stage) {
             forEachMappedOrd((size_t)segTerms,
                              [&](size_t localOrd, int64_t globalOrd) {

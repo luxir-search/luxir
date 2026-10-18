@@ -32,10 +32,12 @@ class OrdColReader {
 public:
   static constexpr uint32_t BLOCK_SIZE = OrdColumnFormat::BLOCK_SIZE;
   static constexpr uint32_t BULK_SIZE = OrdColumnFormat::BULK_SIZE;
+  static_assert(BLOCK_SIZE % BULK_SIZE == 0);
   // The measured point-to-bulk cost ratio spans 5.5x to 10x, putting the raw
   // 128-value crossover at 13-24 hits. Use the conservative end by default.
   static constexpr int32_t DEFAULT_BULK_MIN_HITS = 24;
   using PredictedBlockInfo = OrdColumnFormat::PredictedBlockInfo;
+  using RunBlockInfo = OrdColumnFormat::RunBlockInfo;
   static constexpr int32_t ENDDOC = std::numeric_limits<int32_t>::max();
   static constexpr int64_t ENDINDEX = std::numeric_limits<int64_t>::max();
 
@@ -87,9 +89,69 @@ private:
     return (uint32_t)value;
   }
 
+  RunBlockInfo runInfo(uint64_t block) const {
+    RunBlockInfo info;
+    memcpy(&info, blockMeta + block * sizeof(RunBlockInfo), sizeof(info));
+    return info;
+  }
+
+  // A run-length block's decoder: run i's start, end and value.
+  struct RunBlock {
+    RunBlockInfo info;
+    const char* starts;
+    const char* values;
+    uint32_t count;  // values in the block
+
+    RunBlock(const OrdColReader& col, uint64_t block) : info(col.runInfo(block)) {
+      starts = col.blocks + info.payloadOffset;
+      values = starts + OrdColumnFormat::runStartsByteSize(info);
+      count = (uint32_t)std::min<int64_t>(
+          BLOCK_SIZE, col.encodedValues() - (int64_t)(block * BLOCK_SIZE));
+    }
+
+    uint32_t start(uint32_t run) const {
+      return run == 0 ? 0 : LinearPack::select32(
+          starts, run - 1, info.startBits, LinearPack::mask32(info.startBits));
+    }
+
+    uint32_t end(uint32_t run) const {
+      return run + 1 == info.runs ? count : start(run + 1);
+    }
+
+    uint32_t value(uint32_t run) const {
+      return info.base + LinearPack::select32(
+          values, run, info.valueBits, LinearPack::mask32(info.valueBits));
+    }
+
+    // The run holding `rank`: the count of stored starts at or below it.
+    uint32_t find(uint32_t rank) const {
+      assert(rank < count);
+      uint32_t low = 0;
+      uint32_t high = info.runs - 1u;
+      while (low < high) {
+        uint32_t mid = low + (high - low + 1) / 2;
+        if (start(mid) <= rank) low = mid;
+        else high = mid - 1;
+      }
+      return low;
+    }
+  };
+
+  uint32_t runValueAt(int64_t index) const {
+    assert(index >= 0 && index < encodedValues());
+    assert(format == SegFieldInfo::ORD_RLE);
+    RunBlock block(*this, (uint64_t)index / BLOCK_SIZE);
+    uint32_t value = block.value(block.find((uint32_t)((uint64_t)index % BLOCK_SIZE)));
+    assert(value <= INT32_MAX);
+    return value;
+  }
+
   uint32_t valueAt(int64_t index) const {
-    return format == SegFieldInfo::ORD_DIRECT ? directValueAt(index)
-                                              : predictedValueAt(index);
+    switch (format) {
+      case SegFieldInfo::ORD_DIRECT: return directValueAt(index);
+      case SegFieldInfo::ORD_PREDICTED: return predictedValueAt(index);
+      default: return runValueAt(index);
+    }
   }
 
   // Point-decodes each doc `visitDocs` hands its visitor (ascending, in a
@@ -118,9 +180,13 @@ private:
         assert(doc >= 0 && doc < encodedValues());
         keep(doc, LinearPack::select32(base, (uint64_t)doc, width, valueMask));
       });
-    } else {
+    } else if (format == SegFieldInfo::ORD_PREDICTED) {
       visitDocs([&](int32_t doc) LUXIR_INLINE {
         keep(doc, predictedValueAt(doc));
+      });
+    } else {
+      visitDocs([&](int32_t doc) LUXIR_INLINE {
+        keep(doc, runValueAt(doc));
       });
     }
     return present;
@@ -136,12 +202,13 @@ public:
     bits = (uint8_t)fieldInfo.ordBits;
     mask = LinearPack::mask32(bits);
     multi = fieldInfo.monoLoc.offset() > 0;
-    assert(format == SegFieldInfo::ORD_DIRECT || format == SegFieldInfo::ORD_PREDICTED);
+    assert(format == SegFieldInfo::ORD_DIRECT || format == SegFieldInfo::ORD_PREDICTED
+           || format == SegFieldInfo::ORD_RLE);
     assert(indexing == SegFieldInfo::ORD_DOCID || indexing == SegFieldInfo::ORD_RANK);
     assert(!multi || indexing == SegFieldInfo::ORD_RANK);
     columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
     blocks = columnIS.ptr();
-    if (format == SegFieldInfo::ORD_PREDICTED) {
+    if (format != SegFieldInfo::ORD_DIRECT) {
       blockMeta = blocks + fieldInfo.columnMetaOff;
     }
     if (multi) {
@@ -166,6 +233,10 @@ public:
 
   bool multiValued() const noexcept {
     return multi;
+  }
+
+  bool runLength() const noexcept {
+    return format == SegFieldInfo::ORD_RLE;
   }
 
   bool docIdIndexed() const noexcept {
@@ -240,6 +311,19 @@ public:
       LinearPack::unpack128(blocks, (uint64_t)start, count, bits, mask, out);
       return;
     }
+    if (format == SegFieldInfo::ORD_RLE) {
+      // A bulk frame never crosses a block (BLOCK_SIZE % BULK_SIZE == 0).
+      RunBlock block(*this, (uint64_t)start / BLOCK_SIZE);
+      uint32_t rank = (uint32_t)((uint64_t)start % BLOCK_SIZE);
+      uint32_t run = block.find(rank);
+      for (uint32_t i = 0; i < count;) {
+        uint32_t end = std::min(block.end(run) - rank, count);
+        std::fill(out + i, out + end, block.value(run));
+        i = end;
+        run++;
+      }
+      return;
+    }
     uint64_t block = (uint64_t)start / BLOCK_SIZE;
     uint32_t rankInBlock = (uint32_t)((uint64_t)start % BLOCK_SIZE);
     PredictedBlockInfo info = blockInfo(block);
@@ -249,6 +333,26 @@ public:
       int64_t value = OrdColumnFormat::predict(info, rankInBlock + i) + out[i];
       assert(value >= 0 && value <= INT32_MAX);
       out[i] = (uint32_t)value;
+    }
+  }
+
+  // Calls visit(first, end, ord) for each run of equal values in a
+  // run-length column, in order, covering encoded values [0, encodedValues()).
+  // A run that spans blocks is visited once per block.
+  template <class Visit>
+  void forEachRun(Visit&& visit) const {
+    assert(format == SegFieldInfo::ORD_RLE);
+    int64_t total = encodedValues();
+    for (int64_t blockStart = 0; blockStart < total; blockStart += BLOCK_SIZE) {
+      RunBlock block(*this, (uint64_t)blockStart / BLOCK_SIZE);
+      uint32_t first = 0;
+      for (uint32_t run = 0; run < block.info.runs; run++) {
+        uint32_t end = block.end(run);
+        uint32_t ord = block.value(run);
+        assert(ord <= INT32_MAX);
+        visit(blockStart + first, blockStart + end, (int32_t)ord);
+        first = end;
+      }
     }
   }
 

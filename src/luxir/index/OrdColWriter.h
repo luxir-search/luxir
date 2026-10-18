@@ -32,11 +32,13 @@ public:
   enum class FormatOverride : uint8_t {
     AUTO,
     DIRECT,
-    PREDICTED
+    PREDICTED,
+    RLE
   };
 
 private:
   using BlockPlan = OrdColumnFormat::PredictedBlockPlan;
+  using RunPlan = OrdColumnFormat::RunBlockInfo;
 
   MemPool& pool;
   PostingsWriter& postingsWriter;
@@ -102,21 +104,28 @@ private:
     assert(slot == ords.size());
   }
 
-  std::vector<BlockPlan> planPredicted(int32_t indexing,
-                                       std::span<const int32_t> rankToDoc,
-                                       uint64_t& byteSize) const {
+  // Plans both block formats in one pass: predicted plans and the predicted
+  // format's byte size, and run-length plans and theirs.
+  std::vector<BlockPlan> planBlocks(int32_t indexing,
+                                    std::span<const int32_t> rankToDoc,
+                                    uint64_t& predictedSize,
+                                    std::vector<RunPlan>& runPlans,
+                                    uint64_t& runSize) const {
     std::vector<BlockPlan> plans;
     std::array<uint32_t, OrdColumnFormat::BLOCK_SIZE> block;
     uint32_t count = 0;
     auto flush = [&]() {
       if (count == 0) return;
-      BlockPlan plan = OrdColumnFormat::planBlock(
-          std::span<const uint32_t>(block.data(), count));
-      byteSize += sizeof(OrdColumnFormat::PredictedBlockInfo);
+      std::span<const uint32_t> values(block.data(), count);
+      BlockPlan plan = OrdColumnFormat::planBlock(values);
+      predictedSize += sizeof(OrdColumnFormat::PredictedBlockInfo);
       if (plan.info.bits != 0) {
-        byteSize += LinearPack::packedByteSize(count, plan.info.bits);
+        predictedSize += LinearPack::packedByteSize(count, plan.info.bits);
       }
       plans.push_back(plan);
+      RunPlan runPlan = OrdColumnFormat::planRunBlock(values);
+      runSize += sizeof(RunPlan) + OrdColumnFormat::runPayloadByteSize(runPlan);
+      runPlans.push_back(runPlan);
       count = 0;
     };
     forEachEncodedValue(indexing, rankToDoc, [&](uint32_t ord) {
@@ -173,6 +182,49 @@ private:
     }
   }
 
+  void writeRuns(OutputStream& out, int32_t indexing,
+                 std::span<const int32_t> rankToDoc,
+                 std::vector<RunPlan>& plans, uint64_t start) const {
+    std::array<uint32_t, OrdColumnFormat::BLOCK_SIZE> block;
+    uint32_t count = 0;
+    size_t planIndex = 0;
+    auto flush = [&]() {
+      if (count == 0) return;
+      assert(planIndex < plans.size());
+      RunPlan& plan = plans[planIndex++];
+      plan.payloadOffset = out.size() - start;
+      LinearPack::Writer starts(out, plan.startBits);
+      for (uint32_t i = 1; i < count; i++) {
+        if (block[i] != block[i - 1]) starts.append(i);
+      }
+      starts.finish(false);  // blocks are contiguous; file reserves the pad
+      LinearPack::Writer values(out, plan.valueBits);
+      uint32_t runs = 0;
+      for (uint32_t i = 0; i < count; i++) {
+        if (i == 0 || block[i] != block[i - 1]) {
+          values.append(block[i] - plan.base);
+          runs++;
+        }
+      }
+      assert(runs == plan.runs);
+      values.finish(false);
+      assert(out.size() - start - plan.payloadOffset
+             == OrdColumnFormat::runPayloadByteSize(plan));
+      count = 0;
+    };
+    forEachEncodedValue(indexing, rankToDoc, [&](uint32_t ord) {
+      block[count++] = ord;
+      if (count == OrdColumnFormat::BLOCK_SIZE) flush();
+    });
+    flush();
+    assert(planIndex == plans.size());
+
+    fieldInfo.columnMetaOff = out.size() - start;
+    for (const RunPlan& plan : plans) {
+      out.write(&plan, sizeof(plan));
+    }
+  }
+
 public:
   OrdColWriter(MemPool& pool, PostingsWriter& postingsWriter,
                PostingsWriter::IndexFieldInfo& fieldInfo, OrdCollector& ords)
@@ -217,25 +269,42 @@ public:
     int64_t encodedValues = indexing == SegFieldInfo::ORD_DOCID ? maxDoc : nValues;
     uint64_t directSize = LinearPack::packedByteSize((uint64_t)encodedValues, bits);
     uint64_t predictedSize = 0;
-    std::vector<BlockPlan> plans = planPredicted(indexing, rankToDoc, predictedSize);
+    uint64_t runSize = 0;
+    std::vector<RunPlan> runPlans;
+    std::vector<BlockPlan> plans = planBlocks(indexing, rankToDoc, predictedSize,
+                                              runPlans, runSize);
 
+    // A block format must halve the size of the format it replaces and save
+    // at least 4KB: runs against the better of direct and predicted.
+    auto smaller = [](uint64_t size, uint64_t than) {
+      return size <= than / 2 && than >= size + 4096;
+    };
     FormatOverride override = formatOverride.load();
-    bool predicted = override == FormatOverride::PREDICTED ||
-        (override == FormatOverride::AUTO && predictedSize <= directSize / 2 &&
-         directSize >= predictedSize + 4096);
-    if (override == FormatOverride::DIRECT) predicted = false;
+    int32_t format = SegFieldInfo::ORD_DIRECT;
+    if (override == FormatOverride::AUTO) {
+      bool predicted = smaller(predictedSize, directSize);
+      if (predicted) format = SegFieldInfo::ORD_PREDICTED;
+      if (smaller(runSize, predicted ? predictedSize : directSize)) {
+        format = SegFieldInfo::ORD_RLE;
+      }
+    } else if (override == FormatOverride::PREDICTED) {
+      format = SegFieldInfo::ORD_PREDICTED;
+    } else if (override == FormatOverride::RLE) {
+      format = SegFieldInfo::ORD_RLE;
+    }
 
     auto output = postingsWriter.getOutputStream();
     OutputStream& out = *output;
     uint64_t start = out.size();
     fieldInfo.columnLoc = out.slocation();
     fieldInfo.columnMetaOff = 0;
-    fieldInfo.ordFormat = predicted ? SegFieldInfo::ORD_PREDICTED
-                                    : SegFieldInfo::ORD_DIRECT;
+    fieldInfo.ordFormat = format;
     fieldInfo.ordIndexing = indexing;
     fieldInfo.ordBits = bits;
-    if (predicted) {
+    if (format == SegFieldInfo::ORD_PREDICTED) {
       writePredicted(out, indexing, rankToDoc, plans, start);
+    } else if (format == SegFieldInfo::ORD_RLE) {
+      writeRuns(out, indexing, rankToDoc, runPlans, start);
     } else {
       writeDirect(out, indexing, rankToDoc, bits);
     }

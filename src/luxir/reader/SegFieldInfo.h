@@ -42,7 +42,8 @@ struct SegFieldInfo {
   enum OrdFormat : uint8_t {
     ORD_NONE = 0,
     ORD_DIRECT = 1,
-    ORD_PREDICTED = 2
+    ORD_PREDICTED = 2,
+    ORD_RLE = 3
   };
 
   enum OrdIndexing : uint8_t {
