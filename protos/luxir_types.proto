@@ -1247,8 +1247,9 @@ message ScrubStats {
   uint64 passes = 1;          // completed passes over every collection
   uint64 files = 2;           // files checked
   uint64 bytes = 3;           // bytes read
-  uint64 mismatches = 4;      // files that did not match their manifest
+  uint64 mismatches = 4;      // checksum mismatches, EIO, or unexpectedly missing files
   uint64 last_pass_end = 5;   // Unix milliseconds; absent before the first pass
+  uint64 errors = 6;          // other file check errors; retried on the next pass
 }
 
 // Cached field metadata payload, excluding allocator overhead and unused

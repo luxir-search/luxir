@@ -108,6 +108,7 @@ defaults and constraints are described in the comments and guides.
 - [`FieldDef`](#message-luxir.fielddef)
 - [`FieldDefaults`](#message-luxir.fielddefaults)
 - [`FieldFacet`](#message-luxir.fieldfacet)
+- [`FieldMetadataStats`](#message-luxir.fieldmetadatastats)
 - [`FieldVariants`](#message-luxir.fieldvariants)
 - [`Filter`](#message-luxir.filter)
 - [`FollowerStatus`](#message-luxir.followerstatus)
@@ -881,6 +882,26 @@ Buckets of distinct field values, using the field's value binding. STRING/ID sup
 | <a id="field-luxir.fieldfacet.count_unit"></a>[`count_unit`](#field-luxir.fieldfacet.count_unit) | 9 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Unset inherits a parent facet's measure, or counts groups beneath a collapsed list; entering group ops defaults to docs. Explicit GROUPS uses the nearest enclosing collapse, including inside a group. Controls count, count order, mincount, and missing; metrics still fold documents. |
 | <a id="field-luxir.fieldfacet.count_distinct"></a>[`count_distinct`](#field-luxir.fieldfacet.count_distinct) | 10 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys per bucket, also usable without collapse. Same key types and missing policies as Collapse. Conflicting measures are errors. |
 
+<a id="message-luxir.fieldmetadatastats"></a>
+
+### luxir.FieldMetadataStats
+
+Cached field metadata payload, excluding allocator overhead and unused hash-table capacity.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.fieldmetadatastats.bytes"></a>[`bytes`](#field-luxir.fieldmetadatastats.bytes) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.directories"></a>[`directories`](#field-luxir.fieldmetadatastats.directories) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.directory_bytes"></a>[`directory_bytes`](#field-luxir.fieldmetadatastats.directory_bytes) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.pages"></a>[`pages`](#field-luxir.fieldmetadatastats.pages) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.page_bytes"></a>[`page_bytes`](#field-luxir.fieldmetadatastats.page_bytes) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.entries"></a>[`entries`](#field-luxir.fieldmetadatastats.entries) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.entry_bytes"></a>[`entry_bytes`](#field-luxir.fieldmetadatastats.entry_bytes) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.names"></a>[`names`](#field-luxir.fieldmetadatastats.names) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.name_bytes"></a>[`name_bytes`](#field-luxir.fieldmetadatastats.name_bytes) | 9 | `uint64` | singular |  |
+
 <a id="message-luxir.fieldvariants"></a>
 
 ### luxir.FieldVariants
@@ -1204,6 +1225,7 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.indexing_budget"></a>[`indexing_budget`](#field-luxir.memorystats.indexing_budget) | 1 | [`IndexRamStats`](#message-luxir.indexramstats) | singular |  |
 | <a id="field-luxir.memorystats.storage_ram"></a>[`storage_ram`](#field-luxir.memorystats.storage_ram) | 2 | [`StorageRamStats`](#message-luxir.storageramstats) | singular |  |
 | <a id="field-luxir.memorystats.jemalloc"></a>[`jemalloc`](#field-luxir.memorystats.jemalloc) | 3 | [`JemallocStats`](#message-luxir.jemallocstats) | singular | Present only when Luxir runs on jemalloc. |
+| <a id="field-luxir.memorystats.field_metadata"></a>[`field_metadata`](#field-luxir.memorystats.field_metadata) | 4 | [`FieldMetadataStats`](#message-luxir.fieldmetadatastats) | singular |  |
 
 <a id="message-luxir.multivector"></a>
 
@@ -1581,8 +1603,9 @@ Background checksum scrub of published snapshot files. A mismatch also makes its
 | <a id="field-luxir.scrubstats.passes"></a>[`passes`](#field-luxir.scrubstats.passes) | 1 | `uint64` | singular | completed passes over every collection |
 | <a id="field-luxir.scrubstats.files"></a>[`files`](#field-luxir.scrubstats.files) | 2 | `uint64` | singular | files checked |
 | <a id="field-luxir.scrubstats.bytes"></a>[`bytes`](#field-luxir.scrubstats.bytes) | 3 | `uint64` | singular | bytes read |
-| <a id="field-luxir.scrubstats.mismatches"></a>[`mismatches`](#field-luxir.scrubstats.mismatches) | 4 | `uint64` | singular | files that did not match their manifest |
+| <a id="field-luxir.scrubstats.mismatches"></a>[`mismatches`](#field-luxir.scrubstats.mismatches) | 4 | `uint64` | singular | checksum mismatches, EIO, or unexpectedly missing files |
 | <a id="field-luxir.scrubstats.last_pass_end"></a>[`last_pass_end`](#field-luxir.scrubstats.last_pass_end) | 5 | `uint64` | singular | Unix milliseconds; absent before the first pass |
+| <a id="field-luxir.scrubstats.errors"></a>[`errors`](#field-luxir.scrubstats.errors) | 6 | `uint64` | singular | other file check errors; retried on the next pass |
 
 <a id="message-luxir.searchop"></a>
 

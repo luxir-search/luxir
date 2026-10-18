@@ -7,6 +7,7 @@
 #include "ReplicationState.h"
 #include "luxir/api/build.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/store/CorruptionMarker.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
 #include <boost/asio.hpp>
@@ -228,6 +229,11 @@ struct PeerMismatch : std::runtime_error {
 }
 
 struct ReplicationFollower::Impl {
+  struct Repair {
+    std::weak_ptr<Collection> collection;
+    std::vector<FileDescriptor> suspects;
+    std::string reason;
+  };
   struct State {
     // advertised: the source's current commit; serving: installed locally;
     // acknowledged: last serving commit the source accepted. Independent.
@@ -239,7 +245,7 @@ struct ReplicationFollower::Impl {
     // The local copy could not be opened; CURRENT, if it could be read, selects
     // this incarnation ("" otherwise). It is retained until an install replaces it.
     std::optional<std::string> unreadable;
-    std::string corrupt; // the serving copy failed a scrub: unload and re-stage it
+    std::shared_ptr<const Repair> corrupt; // a failed copy or a replacement sharing its suspects
     uint64_t advertisedDigest = 0; // manifest digest announced with `advertised`
     unsigned failures = 0;
     uint64_t progress = 0;
@@ -373,25 +379,34 @@ struct ReplicationFollower::Impl {
     state.verified.clear(); state.targetIncarnation.clear(); state.remove = false;
   }
 
-  // The serving copy failed a scrub. From here it is an unreadable local copy
-  // of its incarnation, which the next sync repairs in place: every local
-  // file is hashed, the damaged ones are fetched again, and the copy is
-  // installed over the placeholder.
-  void unloadCorrupt(const CollectionId& name, const std::string& reason) {
+  // A delayed scrub result applies only to its collection or a replacement
+  // holding the same suspect bytes. Other replacements keep serving.
+  void unloadCorrupt(const CollectionId& name, const std::shared_ptr<const Repair>& repair) {
     auto active = node.collections().get(name);
     auto shard = active ? active->getShard() : nullptr;
-    if (shard) {
-      auto snapshot = shard->getSnapshots().snapshot();
-      node.collections().unload(name, active, reason);
+    auto snapshot = shard ? shard->getSnapshots().snapshot() : nullptr;
+    auto failed = repair->collection.lock();
+    std::vector<std::string> suspects;
+    if (snapshot) for (const auto& file : repair->suspects) {
+      if (std::ranges::find(snapshot->files, file) != snapshot->files.end()) suspects.push_back(file.name);
+    }
+    if (shard && (active == failed || !suspects.empty())) {
+      // A replacement may have linked the bad file before the original failed.
+      // Mark it too, so staging cannot trust a matching buffered hash.
+      if (active != failed) node.collections().fail(name, active, repair->reason, suspects);
+      node.collections().unload(name, active, repair->reason);
       std::lock_guard lock(mutex);
       auto& state = states[name];
       state.unreadable = snapshot ? snapshot->id.incarnation : "";
       state.serving.reset(); state.acknowledged.reset();
       state.verified.clear(); state.targetIncarnation.clear();
-      state.error = reason;
+      state.error = repair->reason;
     }
-    std::lock_guard lock(mutex);
-    states[name].corrupt.clear();
+    {
+      std::lock_guard lock(mutex);
+      if (states[name].corrupt == repair) states[name].corrupt.reset();
+    }
+    Signal::emit("replicationRepairProcessed", (void*)&name);
   }
 
   api::ReplicationCatalog fetchCatalog(Client& client, const std::string& cursor, std::chrono::milliseconds timeout, std::pmr::memory_resource& arena) {
@@ -620,16 +635,22 @@ struct ReplicationFollower::Impl {
   }
 
   // Verifies every file of `snapshot` in the target directory, downloading what
-  // is missing, and makes them durable. Returns the target's prior snapshot.
+  // is missing or suspect, and makes them durable.
   void stageFiles(Clients& clients, const CollectionId& name, Directory& dir, const std::shared_ptr<const CommitSnapshot>& previous,
                   const CommitSnapshot& snapshot, const std::shared_ptr<Collection>& active) {
+    auto suspects = CorruptionMarker::read(dir);
     std::map<std::string, FileDescriptor> verified;
     { std::lock_guard lock(mutex); verified = states[name].verified; }
-    if (!previous) {
-      if (auto shard = active ? active->getShard() : nullptr) {
+    if (!previous && active && !active->isFailed()) {
+      if (auto shard = active->getShard()) {
         auto& source = shard->getSnapshots();
         if (auto serving = source.snapshot()) {
-          for (auto& file : dir.reuseFiles(source.dir, serving->files, snapshot.files))
+          auto sourceSuspects = CorruptionMarker::read(source.dir);
+          std::vector<FileDescriptor> available;
+          for (const auto& file : serving->files)
+            if (!std::ranges::binary_search(sourceSuspects, file.name)
+                && !std::ranges::binary_search(suspects, file.name)) available.push_back(file);
+          for (auto& file : dir.reuseFiles(source.dir, available, snapshot.files))
             verified.insert_or_assign(file.name, std::move(file));
         }
       }
@@ -644,8 +665,11 @@ struct ReplicationFollower::Impl {
     for (const auto& file : snapshot.files) {
       if (file.name.empty() || file.name == "." || file.name == ".." || file.name.find_first_of("/\\") != std::string::npos
           || file.name.starts_with(Manifest::kPrefix) || file.name.ends_with(".tmp") || !unique.insert(file.name).second) throw std::runtime_error("invalid snapshot file name");
-      bool reuse = verified.contains(file.name) && verified.at(file.name) == file;
-      if (!reuse) {
+      bool suspect = std::ranges::binary_search(suspects, file.name);
+      if (suspect && durableNames.contains(file.name))
+        throw std::runtime_error("cannot replace suspect file in serving snapshot: " + file.name + "; unload and repair the collection");
+      bool reuse = !suspect && verified.contains(file.name) && verified.at(file.name) == file;
+      if (!reuse && !suspect) {
         // Unpublished verified files can survive a reconnect or failed install.
         // After process restart only these candidates need to be hashed. An
         // unreadable unpublished file is downloaded again and replaced; a
@@ -784,7 +808,7 @@ struct ReplicationFollower::Impl {
           State* selected = nullptr;
           for (auto& [key, state] : states) {
             if (!includes(key)) continue;
-            bool work = state.remove || !state.corrupt.empty() || (state.advertised && ((state.advertised != state.serving && !state.waiting)
+            bool work = state.remove || (bool)state.corrupt || (state.advertised && ((state.advertised != state.serving && !state.waiting)
                     || state.needsAck()));
             if (!state.busy && !state.unavailable && work && node.now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
               name = key; selected = &state;
@@ -805,13 +829,13 @@ struct ReplicationFollower::Impl {
       std::string error;
       try {
         bool remove, needsSync;
-        std::string corrupt;
+        std::shared_ptr<const Repair> corrupt;
         std::optional<CommitId> serving;
         {
           std::lock_guard lock(mutex);
           auto& state = states[name]; remove = state.remove; corrupt = state.corrupt;
         }
-        if (!corrupt.empty()) unloadCorrupt(name, corrupt);
+        if (corrupt) unloadCorrupt(name, corrupt);
         {
           std::lock_guard lock(mutex);
           auto& state = states[name];
@@ -903,12 +927,14 @@ void ReplicationFollower::deleteOrphan(const CollectionId& key) {
   impl->persistState();
   impl->changed.notify_all();
 }
-void ReplicationFollower::repair(const CollectionId& id, const std::string& reason) {
+void ReplicationFollower::repair(const CollectionId& id, const std::shared_ptr<Collection>& collection,
+                                 const std::string& reason, std::span<const FileDescriptor> suspects) {
+  auto repair = std::make_shared<const Impl::Repair>(Impl::Repair{collection, {suspects.begin(), suspects.end()}, reason});
   {
     std::lock_guard lock(impl->mutex);
     auto it = impl->states.find(id);
     if (it == impl->states.end()) return;
-    it->second.corrupt = reason;
+    it->second.corrupt = std::move(repair);
   }
   impl->changed.notify_all();
 }

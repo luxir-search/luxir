@@ -122,10 +122,8 @@ private:
   std::map<std::string, std::map<std::string, std::shared_ptr<Collection>, std::less<>>, std::less<>> listing;
 
   std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
-  // `verified`: files of the selected incarnation already checked at startup.
-  std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected,
-                                             std::map<std::string, FileDescriptor>* verified);
-  std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {});
+  std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected);
+  std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false);
   // A writer whose newest root is invalid continues from the newest valid one
   // under a new incarnation. Returns the incarnation to open.
   std::string recoverWriter(const CollectionId& id, CollectionStorage& storage, const std::string& selected);
@@ -189,9 +187,9 @@ public:
   std::shared_ptr<Collection> unavailable(const CollectionId& id, std::string reason);
 
   // A check found `suspects` of the registered `collection` damaged: the
-  // collection fails with `reason` (Collection::fail), the names are recorded
-  // in its incarnation directory so a restart re-verifies them before serving
-  // (CorruptionMarker), and the change is announced.
+  // names are recorded durably in its incarnation directory first, then the
+  // collection fails with `reason` and the change is announced. A failed
+  // marker write is warned but does not prevent failing the collection.
   void fail(const CollectionId& id, const std::shared_ptr<Collection>& collection, const std::string& reason,
             std::span<const std::string> suspects);
   // Replaces the registered `expected` with an unavailable placeholder and

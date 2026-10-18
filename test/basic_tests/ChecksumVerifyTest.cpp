@@ -8,6 +8,9 @@
 #include "luxir/server/Scrubber.h"
 #include "luxir/store/CorruptionMarker.h"
 #include "luxir/store/FileVerifier.h"
+#include "luxir/store/VerifiedDirectory.h"
+#include "luxir/store/CheckedDirFactory.h"
+#include "luxir/reader/VectorAuxReader.h"
 #include "luxir/util/Uuid.h"
 #include <filesystem>
 #include <fstream>
@@ -77,6 +80,17 @@ protected:
   }
 };
 
+TEST_F(ChecksumVerifyTest, scrubPacingDoesNotAccumulateCredit) {
+  using namespace std::chrono_literals;
+  auto start = Scrubber::Clock::time_point{};
+  auto due = Scrubber::nextDeadline(start, start, 256, 1024);
+  EXPECT_EQ(start + 250ms, due);
+  EXPECT_EQ(start + 500ms, Scrubber::nextDeadline(due, start + 100ms, 256, 1024));
+  EXPECT_EQ(start + 500ms, Scrubber::nextDeadline(due, due, 256, 1024));
+  EXPECT_EQ(start + 10s + 250ms, Scrubber::nextDeadline(due, start + 10s, 256, 1024));
+  EXPECT_EQ(start + 10s, Scrubber::nextDeadline(due, start + 10s, 256, 0));
+}
+
 TEST_F(ChecksumVerifyTest, fullVerifyOnOpenFailsOnlyTheCorruptCollection) {
   populate();
   config.store.verify_on_open = "full";
@@ -98,6 +112,83 @@ TEST_F(ChecksumVerifyTest, fullVerifyOnOpenFailsOnlyTheCorruptCollection) {
   EXPECT_NO_THROW(reader.getCollection("other"));
 }
 
+TEST_F(ChecksumVerifyTest, readOnlyVerifiesMagicBeforeParsing) {
+  populate();
+  FileDescriptor damaged;
+  std::filesystem::path dir;
+  {
+    LuxirNode node(config);
+    dir = dirOf(node, "main");
+    damaged = node.getCollection("main")->getShard()->getSnapshots().snapshot()->files.front();
+  }
+  {
+    std::fstream file(dir / damaged.name, std::ios::in | std::ios::out | std::ios::binary);
+    file.put('!');
+  }
+  config.read_only = true;
+  config.store.verify_on_open = "full";
+  {
+    LuxirNode reader(config);
+    expectUnavailable(reader, "main", damaged);
+  }
+  FSDirectory marked(dir, false);
+  std::array<std::string, 1> suspects{damaged.name};
+  CorruptionMarker::write(marked, suspects, "damaged magic header");
+  config.store.verify_on_open = "none";
+  LuxirNode reader(config);
+  expectUnavailable(reader, "main", damaged);
+}
+
+TEST_F(ChecksumVerifyTest, verifiedReaderSurvivesUnlinkAndViewLifetime) {
+  LuxirNode node;
+  CollectionHelper h(node, "main");
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "a", "embedding_v", std::vector<float>{1, 0}),
+                          flatdoc("id", "b", "embedding_v", std::vector<float>{0, 1})}, UpdateMessage::NO_COMMIT).success);
+  h.commit({"*"});
+  ASSERT_TRUE(h.deleteById("a", UpdateMessage::COMMIT).success);
+  auto& registry = node.getCollection("main")->getShard()->getSnapshots();
+  // Drop the writer's reusable readers so preparation must open through the view.
+  auto snapshot = CommitSnapshot::fromBytes(registry.snapshot()->bytes);
+  for (const auto& target : {std::shared_ptr<Directory>(std::make_shared<FSDirectory>(path)),
+                            std::shared_ptr<Directory>(std::make_shared<RAMDir>())}) {
+    CheckedDirectory dir(target, CheckedDirMode::THROW);
+    std::vector<std::string> names;
+    for (const auto& descriptor : snapshot->files) {
+      auto input = registry.dir.openFile(descriptor.name);
+      auto bytes = input->read();
+      auto file = dir.createFile(descriptor.name);
+      OutputStream out(file.get()); out.write(bytes.data(), bytes.size()); out.close();
+      dir.finishFile(*file);
+      names.push_back(descriptor.name);
+    }
+    std::shared_ptr<IndexReader> reader;
+    {
+      FileVerification verification;
+      verification.open(dir, snapshot->files);
+      verification.run();
+      VerifiedDirectory source(dir, verification);
+      EXPECT_THROW(source.openFile(names.front(), true), std::runtime_error);
+      dir.sync(names);
+      for (const auto& name : names) ASSERT_TRUE(dir.deleteFile(name));
+      ReaderManager readers(dir);
+      reader = readers.prepare(*snapshot, source);
+    }
+    EXPECT_EQ(1, reader->liveDocs());
+    for (const auto& segment : reader->segments()) for (const auto& aux : segment.auxReaders()) {
+      if (auto vector = std::dynamic_pointer_cast<VectorAuxReader>(aux)) {
+        EXPECT_NE(nullptr, vector->getFaissIndex());
+      }
+    }
+    registry.publish(snapshot, std::move(reader));
+    auto req = localReq(node.getSearchEngine());
+    req->collection("main").topDocs("q").matchQuery("id", "b").withStats().fields({"id", "embedding_v"});
+    req->execute();
+    ASSERT_OK(req);
+    EXPECT_EQ(1, req->getMatchCount());
+    EXPECT_EQ(1u, req->getDocs().size());
+  }
+}
+
 // A scrub hit fails the collection: the writer publishes nothing more, the
 // suspect file is recorded, and only that file is re-verified at the next
 // start, with the default verify-on-open=none, until it passes.
@@ -114,6 +205,7 @@ TEST_F(ChecksumVerifyTest, scrubFailsTheWriterAndTheFailureSurvivesRestart) {
     EXPECT_EQ(node.getCollection("main")->getShard()->getSnapshots().snapshot()->files.size()
               + node.getCollection("other")->getShard()->getSnapshots().snapshot()->files.size(), clean.files);
     EXPECT_GT(clean.bytes, 0u);
+    EXPECT_EQ(0u, clean.errors);
     EXPECT_GT(clean.lastPassEnd, 0u);
     // A stopped pass does nothing.
     std::stop_source stopped; stopped.request_stop();
@@ -150,6 +242,107 @@ TEST_F(ChecksumVerifyTest, scrubFailsTheWriterAndTheFailureSurvivesRestart) {
   EXPECT_EQ(0u, count(dir, CorruptionMarker::kPrefix));
 }
 
+TEST_F(ChecksumVerifyTest, writerRecoveryPreservesSuspectFiles) {
+  populate();
+  std::filesystem::path dir;
+  FileDescriptor suspect;
+  {
+    LuxirNode node(config);
+    dir = dirOf(node, "main");
+    suspect = *std::ranges::max_element(node.getCollection("main")->getShard()->getSnapshots().snapshot()->files, {}, &FileDescriptor::size);
+  }
+  {
+    FSDirectory old(dir, false);
+    auto manifest = Manifest::load(old);
+    auto torn = old.createFile(Manifest::name(manifest.generation + 1));
+    OutputStream out(torn.get()); out.write((char)0); out.close(); old.finishFile(*torn);
+    std::array<std::string, 2> suspects{suspect.name, "s0_absent"};
+    CorruptionMarker::write(old, suspects, "pending scrub hit");
+    flip(dir, suspect);
+  }
+  LuxirNode node(config);
+  expectUnavailable(node, "main", suspect);
+  auto storage = node.collections().storage().collection(CollectionId::of("main"));
+  auto selected = storage.current();
+  ASSERT_TRUE(selected);
+  EXPECT_NE(dir.filename().string(), *selected);
+  EXPECT_EQ(std::vector<std::string>{suspect.name}, CorruptionMarker::read(*storage.open(*selected)));
+  EXPECT_NO_THROW(node.getCollection("other"));
+}
+
+TEST_F(ChecksumVerifyTest, readOnlyScrubSkipsRetiredFiles) {
+  populate();
+  config.store.scrub_max_bytes_per_sec = 0;
+  LuxirNode writer(config);
+  config.read_only = true;
+  LuxirNode reader(config);
+  auto snapshot = reader.getCollection("main")->getShard()->getSnapshots().snapshot();
+  CollectionHelper h(writer, "main");
+  ASSERT_TRUE(h.deleteById("b", UpdateMessage::COMMIT).success);
+  auto dir = dirOf(reader, "main");
+  ASSERT_TRUE(std::ranges::any_of(snapshot->files, [&](const auto& file) { return !std::filesystem::exists(dir / file.name); }));
+  EXPECT_EQ(0u, reader.getScrubber().scrub());
+  EXPECT_EQ(0u, reader.getScrubber().stats().mismatches);
+  EXPECT_EQ(0u, reader.getScrubber().stats().errors);
+  EXPECT_EQ(1, reader.getCollection("main")->getReaderManager().getReader()->liveDocs());
+}
+
+TEST_F(ChecksumVerifyTest, scrubFailsOnMissingHeldFileOnWriter) {
+  populate();
+  config.store.scrub_max_bytes_per_sec = 0;
+  LuxirNode node(config);
+  auto collection = node.getCollection("main");
+  auto file = collection->getShard()->getSnapshots().snapshot()->files.front();
+  auto dir = dirOf(node, "main");
+  std::filesystem::remove(dir / file.name);
+  EXPECT_EQ(1u, node.getScrubber().scrub());
+  EXPECT_EQ(1u, node.getScrubber().stats().mismatches);
+  EXPECT_EQ(0u, node.getScrubber().stats().errors);
+  EXPECT_EQ("missing file: " + file.name, collection->getUnavailableReason());
+  EXPECT_THROW(node.getCollection("main"), CollectionUnavailableError);
+  EXPECT_EQ(std::vector<std::string>{file.name}, CorruptionMarker::read(*collection->getShard()->getDirectory()));
+}
+
+// ELOOP is deterministic regardless of the process's filesystem privileges.
+TEST_F(ChecksumVerifyTest, scrubRetriesOtherIOErrorsWithoutFailingTheCollection) {
+  populate();
+  config.store.scrub_max_bytes_per_sec = 0;
+  LuxirNode node(config);
+  ASSERT_EQ(1, node.getCollection("main")->getReaderManager().getReader()->liveDocs());
+  auto snapshot = node.getCollection("main")->getShard()->getSnapshots().snapshot();
+  auto file = dirOf(node, "main") / snapshot->files.front().name;
+  auto saved = file.string() + ".saved";
+  std::filesystem::rename(file, saved);
+  std::filesystem::create_symlink(file.filename(), file);
+  EXPECT_EQ(0u, node.getScrubber().scrub());
+  EXPECT_EQ(0u, node.getScrubber().stats().mismatches);
+  EXPECT_EQ(1u, node.getScrubber().stats().errors);
+  EXPECT_EQ(0u, count(file.parent_path(), CorruptionMarker::kPrefix));
+  EXPECT_EQ(1, node.getCollection("main")->getReaderManager().getReader()->liveDocs());
+  std::filesystem::remove(file);
+  std::filesystem::rename(saved, file);
+  EXPECT_EQ(0u, node.getScrubber().scrub());
+  EXPECT_EQ(1u, node.getScrubber().stats().errors);
+}
+
+TEST_F(ChecksumVerifyTest, startupReportsOtherIOErrorsWithoutRecordingCorruption) {
+  populate();
+  config.store.verify_on_open = "full";
+  std::filesystem::path file;
+  {
+    LuxirNode node(config);
+    file = dirOf(node, "main") / node.getCollection("main")->getShard()->getSnapshots().snapshot()->files.front().name;
+  }
+  std::filesystem::rename(file, file.string() + ".saved");
+  std::filesystem::create_symlink(file.filename(), file);
+  LuxirNode node(config);
+  auto entry = node.collections().get(CollectionId::of("main"));
+  EXPECT_NE(std::string::npos, entry->getUnavailableReason().find("could not verify file: " + file.filename().string()));
+  EXPECT_THROW(node.getCollection("main"), CollectionUnavailableError);
+  EXPECT_NO_THROW(node.getCollection("other"));
+  EXPECT_EQ(0u, count(file.parent_path(), CorruptionMarker::kPrefix));
+}
+
 TEST_F(ChecksumVerifyTest, statsReportScrubCountersWhileEnabled) {
   populate();
   {
@@ -166,7 +359,13 @@ TEST_F(ChecksumVerifyTest, statsReportScrubCountersWhileEnabled) {
   LuxirNode node(config);
   node.getScrubber().scrub();
   auto damaged = corrupt(node, "main");
+  auto other = dirOf(node, "other") / node.getCollection("other")->getShard()->getSnapshots().snapshot()->files.front().name;
+  auto saved = other.string() + ".saved";
+  std::filesystem::rename(other, saved);
+  std::filesystem::create_symlink(other.filename(), other);
   node.getScrubber().scrub();
+  std::filesystem::remove(other);
+  std::filesystem::rename(saved, other);
   HttpServer server(node, 1, 0); server.start();
   auto response = httpRequest(server.getPort(), http::verb::get, "/_stats");
   ASSERT_EQ(200, response.result_int()) << response.body();
@@ -179,6 +378,7 @@ TEST_F(ChecksumVerifyTest, statsReportScrubCountersWhileEnabled) {
   EXPECT_GT(scrub["files"].get<int64_t>(), 0);
   EXPECT_GT(scrub["bytes"].get<int64_t>(), 0);
   EXPECT_GT(scrub["last_pass_end"].get<int64_t>(), 0);
+  EXPECT_EQ(1, scrub["errors"].get<int64_t>());
   auto collection = httpRequest(server.getPort(), http::verb::get, "/collections/main/_stats");
   EXPECT_EQ(503, collection.result_int()) << collection.body();
   EXPECT_NE(std::string::npos, collection.body().find(damaged.name)) << collection.body();
@@ -210,12 +410,15 @@ TEST_F(ChecksumVerifyTest, checksumPrimitiveAndVerification) {
     dir->checksum("s0_a", [&](size_t) { chunks++; });
     EXPECT_EQ(4u, chunks);
     // The handle outlives the name.
-    auto reader = dir->openChecksum("s0_a");
+    auto reader = dir->openChecksum("s0_a", true);
     dir->deleteFile("s0_a");
+    EXPECT_EQ(bytes, reader->map()->read()); // mmap also accepts the O_DIRECT descriptor
     EXPECT_TRUE(reader->checksum().matches(good));
 
     FileDescriptor missing{"s0_none", 1, 1};
-    std::vector<FileDescriptor> files{bad, missing};
+    auto alsoBad = write(*dir, "s0_c");
+    alsoBad.xxh3 ^= 1;
+    std::vector<FileDescriptor> files{bad, alsoBad};
     try {
       verifyFiles(*dir, files);
       FAIL() << "verified a damaged file";
@@ -224,10 +427,8 @@ TEST_F(ChecksumVerifyTest, checksumPrimitiveAndVerification) {
       EXPECT_NE(std::string::npos, std::string(e.what()).find("(and 1 more files)")) << e.what();
     }
     FileVerification verification;
-    verification.open(*dir, std::span(&missing, 1));
-    verification.run();
-    EXPECT_EQ("missing file: s0_none", verification.problem(0));
-    std::vector<FileDescriptor> okay{write(*dir, "s0_c")};
+    EXPECT_THROW(verification.open(*dir, std::span(&missing, 1)), ChecksumMismatchError);
+    std::vector<FileDescriptor> okay{write(*dir, "s0_d")};
     EXPECT_NO_THROW(verifyFiles(*dir, okay));
   }
 }

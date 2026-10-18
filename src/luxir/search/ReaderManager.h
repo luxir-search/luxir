@@ -93,7 +93,8 @@ public:
   std::shared_ptr<const CommitSnapshot> snapshot() const { return published.load(); }
   std::shared_ptr<Schema> getSchema() const { return snapshot()->schema; }
   // Opens a reader for a snapshot before it is published.
-  std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot);
+  std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot) { return prepare(snapshot, dir); }
+  std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot, Directory& source);
   // Publishes a durable snapshot. With a reader from prepare() searches switch
   // to it now; without one, readers reopen lazily on demand (local writers).
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});

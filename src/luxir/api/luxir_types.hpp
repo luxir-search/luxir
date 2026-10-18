@@ -431,6 +431,7 @@ struct ScrubStats {
   uint64_t files = 0;
   uint64_t bytes = 0;
   uint64_t mismatches = 0;
+  uint64_t errors = 0;
   uint64_t last_pass_end = 0;
 };
 struct StatsResponse {

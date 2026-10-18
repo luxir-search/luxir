@@ -46,6 +46,9 @@ class ChecksumReader {
 public:
   virtual ~ChecksumReader() = default;
   virtual uint64_t size() const = 0;
+  // Maps this held file, without reopening its name. The InputFile outlives
+  // this handle; callers verify before mapping potentially corrupt bytes.
+  virtual std::shared_ptr<InputFile> map() = 0;
   virtual FileCheck checksum(const std::function<void(size_t)>& progress = {}) = 0;
 };
 
@@ -231,6 +234,7 @@ public:
     public:
       explicit RAMChecksumReader(std::shared_ptr<InputFile> file) : file(std::move(file)) {}
       uint64_t size() const override { return file->size(); }
+      std::shared_ptr<InputFile> map() override { return file; }
       FileCheck checksum(const std::function<void(size_t)>& progress) override {
         auto data = file->read();
         XXH3_state_t state;

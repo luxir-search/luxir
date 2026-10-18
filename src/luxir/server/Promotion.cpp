@@ -6,6 +6,7 @@
 #include "luxir/util/Signal.h"
 #include "luxir/index/CommitSnapshot.h"
 #include "luxir/store/FileVerifier.h"
+#include "luxir/store/CorruptionMarker.h"
 
 namespace luxir {
 
@@ -17,6 +18,11 @@ std::string copySnapshot(CollectionStorage& storage, std::string_view from, cons
   auto info = Manifest::decode(manifest.bytes, arena);
   auto files = filesOf(info);
   next->reuseFiles(*old, files, files);
+  auto suspects = CorruptionMarker::read(*old);
+  std::erase_if(suspects, [&](const auto& name) {
+    return std::ranges::none_of(files, [&](const auto& file) { return file.name == name; });
+  });
+  if (!suspects.empty()) CorruptionMarker::write(*next, suspects, "copied snapshot suspect files");
   // Under verify-on-open=full the linked files are read once, here, before
   // a writer builds on them. A mismatch names the file; the follower-bound
   // directory keeps the damaged copy for a repair.

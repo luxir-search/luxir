@@ -14,6 +14,7 @@
 #include <xxhash.h>
 #include "Directory.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/luxir_util.h"
 
 namespace luxir {
 
@@ -26,6 +27,23 @@ class MMapInputFile : public InputFile {
   size_t sz_;
 
 public:
+  // The caller retains ownership of fd. O_DIRECT affects pread, not mmap.
+  static std::shared_ptr<InputFile> map(int fd, const std::filesystem::path& path) {
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+      throw FileIOException("MMapInputFile: fstat failed for " + path.string() + ": " + strerror(errno));
+    }
+    auto size = (size_t)st.st_size;
+    if (!size) return std::make_shared<MMapInputFile>(nullptr, 0);
+    void* mapped = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapped == MAP_FAILED) {
+      throw FileIOException("MMapInputFile: mmap failed for " + path.string() + ": " + strerror(errno));
+    }
+    try {
+      return std::make_shared<MMapInputFile>((char*)mapped, size);
+    } catch (...) { munmap(mapped, size); throw; }
+  }
+
   MMapInputFile(char* data, size_t size) : data_(data), sz_(size) {}
 
   ~MMapInputFile() override {
@@ -75,11 +93,14 @@ class FSChecksumReader : public ChecksumReader {
     if (fd < 0 && direct && errno == EINVAL) fd = ::open(path.c_str(), O_RDONLY);
     return fd;
   }
-  void reopenBuffered() {
-    int buffered = ::open(path.c_str(), O_RDONLY);
-    if (buffered < 0) throw FileIOException("FSChecksumReader: reopen failed for " + path.string() + ": " + strerror(errno));
-    ::close(fd);
-    fd = buffered;
+  [[noreturn]] static void fail(const std::filesystem::path& path, const char* operation, int error) {
+    auto message = "FSChecksumReader: " + std::string(operation) + " failed for " + path.string() + ": " + strerror(error);
+    if (error == EIO) throw FileEIOError(message);
+    throw FileIOException(message);
+  }
+  void useBuffered() {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_DIRECT) < 0) fail(path, "fcntl", errno);
     direct = false;
   }
 
@@ -89,17 +110,19 @@ public:
     int fd = openPath(path, direct);
     if (fd < 0) {
       if (errno == ENOENT) return {};
-      throw FileIOException("FSChecksumReader: open failed for " + path.string() + ": " + strerror(errno));
+      fail(path, "open", errno);
     }
     struct stat st;
     if (fstat(fd, &st) < 0) {
       int error = errno;
       ::close(fd);
-      throw FileIOException("FSChecksumReader: fstat failed for " + path.string() + ": " + strerror(error));
+      fail(path, "fstat", error);
     }
     // fcntl tells whether the direct open stuck (the fallback above cleared it).
     int flags = fcntl(fd, F_GETFL);
-    return std::shared_ptr<FSChecksumReader>(new FSChecksumReader(path, fd, (uint64_t)st.st_size, flags >= 0 && (flags & O_DIRECT)));
+    try {
+      return std::make_shared<FSChecksumReader>(path, fd, (uint64_t)st.st_size, flags >= 0 && (flags & O_DIRECT));
+    } catch (...) { ::close(fd); throw; }
   }
   FSChecksumReader(std::filesystem::path path, int fd, uint64_t size, bool direct)
       : path(std::move(path)), fd(fd), size_(size), direct(direct) {}
@@ -108,6 +131,7 @@ public:
   FSChecksumReader& operator=(const FSChecksumReader&) = delete;
 
   uint64_t size() const override { return size_; }
+  std::shared_ptr<InputFile> map() override { return MMapInputFile::map(fd, path); }
   bool isDirect() const { return direct; }
 
   FileCheck checksum(const std::function<void(size_t)>& progress) override {
@@ -124,8 +148,8 @@ public:
       auto n = ::pread(fd, data, kChunk, (off_t)total);
       if (n < 0) {
         if (errno == EINTR) continue;
-        if (direct && errno == EINVAL) { reopenBuffered(); continue; }
-        throw FileIOException("FSChecksumReader: read failed for " + path.string() + ": " + strerror(errno));
+        if (direct && errno == EINVAL) { useBuffered(); continue; }
+        fail(path, "read", errno);
       }
       if (n == 0) break;
       XXH3_64bits_update(&state, data, (size_t)n);
@@ -461,33 +485,8 @@ public:
       throw FileIOException("FSDirectory::openFile: open failed for " + path.string() + ": " + strerror(errno));
     }
 
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-      int error = errno;
-      ::close(fd);
-      throw FileIOException("FSDirectory::openFile: fstat failed for " + path.string() + ": " + strerror(error));
-    }
-
-    auto sz = (size_t)st.st_size;
-    if (sz == 0) {
-      ::close(fd);
-      return std::make_shared<MMapInputFile>(nullptr, 0);
-    }
-
-    void* mapped = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mapped == MAP_FAILED) {
-      int error = errno;
-      ::close(fd);
-      throw FileIOException("FSDirectory::openFile: mmap failed for " + path.string() + ": " + strerror(error));
-    }
-
-    ::close(fd);
-    try {
-      return std::make_shared<MMapInputFile>((char*)mapped, sz);
-    } catch (...) {
-      munmap(mapped, sz);
-      throw;
-    }
+    auto close = scope_guard([&] { ::close(fd); });
+    return MMapInputFile::map(fd, path);
   }
 
   std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {

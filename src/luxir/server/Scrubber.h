@@ -27,11 +27,13 @@ class LuxirNode;
 // and runs instead; the background pass resumes with its next interval.
 class Scrubber {
 public:
+  using Clock = std::chrono::steady_clock;
   struct Stats {
     uint64_t passes = 0;
     uint64_t files = 0;
     uint64_t bytes = 0;
     uint64_t mismatches = 0;
+    uint64_t errors = 0; // other failures to check a file; retried next pass
     uint64_t lastPassEnd = 0; // Unix milliseconds; zero before the first pass
   };
 
@@ -43,7 +45,7 @@ private:
   std::atomic<unsigned> waiting{0}; // on-demand callers waiting for the pass mutex
   std::condition_variable_any wake;
   std::mutex wakeMutex;
-  std::atomic<uint64_t> passes{0}, files{0}, bytes{0}, mismatches{0}, lastPassEnd{0};
+  std::atomic<uint64_t> passes{0}, files{0}, bytes{0}, mismatches{0}, errors{0}, lastPassEnd{0};
   std::jthread thread;
 
   void run(std::stop_token stop);
@@ -61,6 +63,9 @@ public:
   size_t scrub(std::stop_token stop = {});
   bool enabled() const { return interval.count() > 0; }
   Stats stats() const;
+  // Pure pacing step: a slow read earns no credit against later chunks.
+  static Clock::time_point nextDeadline(Clock::time_point due, Clock::time_point now,
+                                        size_t length, uint64_t bytesPerSecond);
 };
 
 }

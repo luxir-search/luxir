@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "CommitSnapshotRegistry.h"
-#include "luxir/store/FileVerifier.h"
+#include "luxir/store/VerifiedDirectory.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/luxir_util.h"
@@ -40,36 +40,40 @@ void CommitSnapshotRegistry::fail() noexcept {
   notifyChange();
 }
 
-void CommitSnapshotRegistry::openLocalSnapshot(bool verify, std::map<std::string, FileDescriptor>* verified) {
+void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
   auto manifest = Manifest::load(dir);
-  std::map<std::string, FileDescriptor> done;
-  if (!verified) verified = &done;
+  auto changed = [&] {
+    auto latest = Manifest::load(dir);
+    if (!latest.bytes || *latest.bytes == *manifest.bytes) return false;
+    manifest = std::move(latest);
+    return true;
+  };
   for (;;) {
     if (!manifest.bytes) throw ReadOnlyError("collection has no snapshot");
     auto snapshot = CommitSnapshot::fromBytes(manifest.bytes);
-    try {
-      if (verify) {
-        std::vector<FileDescriptor> pending;
-        for (const auto& file : snapshot->files) {
-          auto it = verified->find(file.name);
-          if (it == verified->end() || it->second != file) pending.push_back(file);
-        }
-        // Handles first, then hashing: a file the writer retires meanwhile
-        // still verifies, and the retry below only pays for new files.
-        FileVerification verification;
-        verification.open(dir, pending);
-        verification.run();
-        if (auto problem = verification.problem(0); !problem.empty()) throw ChecksumMismatchError(problem);
-        verification.verified(0, *verified);
+    std::shared_ptr<IndexReader> reader;
+    {
+      FileVerification verification;
+      try { verification.open(dir, snapshot->files, verify); }
+      catch (...) {
+        if (!changed()) throw;
+        continue;
       }
-      auto reader = readers.prepare(*snapshot);
-      publish(std::move(snapshot), std::move(reader));
-      return;
-    } catch (...) {
-      auto latest = Manifest::load(dir);
-      if (!latest.bytes || *latest.bytes == *manifest.bytes) throw;
-      manifest = std::move(latest);
+      // Verify before mapping or parsing any checked file. A hash failure is
+      // final; successful handles survive retirement and supply the mappings.
+      verification.run();
+      try {
+        VerifiedDirectory source(dir, verification);
+        reader = readers.prepare(*snapshot, source);
+      } catch (...) {
+        // Full holds every file: a prepare failure is final. Under none an
+        // unchecked file may have been retired while hashing, so retry it.
+        if (verify || !changed()) throw;
+        continue;
+      }
     }
+    publish(std::move(snapshot), std::move(reader));
+    return;
   }
 }
 
@@ -207,9 +211,7 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const FileDescriptor
 std::shared_ptr<ChecksumReader> CommitSnapshotRegistry::openChecksum(const FileDescriptor& descriptor, bool direct) {
   std::lock_guard retirementLock(retirementMutex);
   requireHeld(descriptor);
-  auto reader = dir.openChecksum(descriptor.name, direct);
-  if (!reader) throw std::runtime_error("held snapshot file is missing");
-  return reader;
+  return dir.openChecksum(descriptor.name, direct);
 }
 
 bool CommitSnapshotRegistry::touch(const CommitId& id, uint64_t bytes) {

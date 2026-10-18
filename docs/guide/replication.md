@@ -39,7 +39,11 @@ the unreadable copy is treated as populated for the empty-replacement rule.
 With `--store.verify-on-open=full` a local file whose bytes no longer match its
 manifest digest also makes the copy unreadable, and a background scrub that
 finds one does the same while the follower runs; the next install keeps the
-files that still verify and fetches only the damaged ones. See
+files that still verify and re-downloads every file named by a corruption
+marker, even when its buffered hash matches. Suspect files are excluded from
+hard-link reuse from the serving copy; a failed serving collection supplies no
+such reuse. A repair unloads the failed collection before replacing files in
+its incarnation. See
 [file integrity checks](operations.md#file-integrity-checks).
 
 ## Try it on one machine
@@ -233,6 +237,10 @@ luxir -p 9600 --store.backend=fs --store.data-dir=/tmp/luxir/seed
 ```
 
 Promotion gives every collection a new incarnation while reusing its files.
+Promotion and writer recovery preserve corruption markers for files in the
+copied manifest. The new writer re-checks those suspects at startup even with
+`--store.verify-on-open=none`; promotion does not erase a pending scrub hit.
+
 The promoted copy starts an independent commit history: it may be older than
 the previous writer, and future writes can diverge. A new incarnation keeps
 its commit tokens distinct, so an old `min_commit` token cannot incorrectly

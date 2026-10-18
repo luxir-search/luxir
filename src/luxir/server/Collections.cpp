@@ -245,7 +245,7 @@ static void clearMarkers(const CollectionId& name, Directory& dir) {
   catch (const std::exception& e) { LOG_WARN("Cannot clear corruption markers of '{}': {}", name.label(), e.what()); }
 }
 
-std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, std::shared_ptr<Schema> initialSchema) {
+std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, std::shared_ptr<Schema> initialSchema, bool startup) {
   auto storage = factory->collection(name);
   auto selected = CollectionStorage::current(*factory->container(name, true));
   bool creating = !selected;
@@ -256,7 +256,11 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
     selected = recoverWriter(name, storage, *selected);
   }
   auto col = makeCollection(name, creating ? storage.create(*selected) : storage.open(*selected));
-  if (!creating && !Manifest::load(*col->shard->dir).bytes) throw std::runtime_error("CURRENT selects an empty index directory");
+  if (!creating) {
+    auto manifest = Manifest::load(*col->shard->dir);
+    if (!manifest.bytes) throw std::runtime_error("CURRENT selects an empty index directory");
+    if (startup) arena.execute([&] { verifyFiles(*col->shard->dir, Manifest::files(manifest.bytes), verifyOnOpen); });
+  }
   col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
     std::move(initialSchema), &indexRamBudget,
     config.index.merge_factor, creating ? *selected : std::string{}, &arena);
@@ -272,15 +276,14 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
 
 // Read-only and follower collections serve their selected local snapshot.
 std::shared_ptr<Collection> Collections::openCollection(const CollectionId& name, Role role,
-                                                        const std::optional<std::string>& selected,
-                                                        std::map<std::string, FileDescriptor>* verified) {
+                                                        const std::optional<std::string>& selected) {
   std::shared_ptr<Collection> col;
   if (role == Role::WRITER) {
-    col = initWriter(name);
+    col = initWriter(name, {}, true);
   } else {
     if (!selected) throw ReadOnlyError("Collection has no CURRENT");
     col = makeCollection(name, factory->collection(name).open(*selected));
-    col->shard->snapshots->openLocalSnapshot(verifyOnOpen, verified);
+    arena.execute([&] { col->shard->snapshots->openLocalSnapshot(verifyOnOpen); });
     if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
     observe(name, *col);
   }
@@ -290,12 +293,7 @@ std::shared_ptr<Collection> Collections::openCollection(const CollectionId& name
 }
 
 std::vector<Collections::Opened> Collections::open(Role role) {
-  struct Planned {
-    Opened row;
-    bool open = false; // false: the row is complete
-    std::map<std::string, FileDescriptor> verified;
-  };
-  std::vector<Planned> planned;
+  std::vector<Opened> rows;
   auto names = factory->collections();
   bool createDefault = names.empty() && role != Role::FOLLOWER;
   if (createDefault) names.push_back(CollectionId::of(kDefaultCollectionName));
@@ -313,14 +311,8 @@ std::vector<Collections::Opened> Collections::open(Role role) {
       slots[row.id].retained.insert(incarnations.begin(), incarnations.end());
     } catch (const std::exception& listing) { LOG_WARN("Cannot list incarnations of '{}': {}", row.id.label(), listing.what()); }
   };
-  // Every collection's files hash in one pool before any collection opens:
-  // all of them with verify-on-open=full, otherwise only the files a
-  // corruption marker names.
-  FileVerification verification;
   for (const auto& name : names) {
-    Planned plan;
-    plan.row = Opened{name, nullptr, std::nullopt, {}};
-    auto& row = plan.row;
+    Opened row{name, nullptr, std::nullopt, {}};
     try {
       validate(name);
       auto storage = factory->collection(name);
@@ -332,7 +324,7 @@ std::vector<Collections::Opened> Collections::open(Role role) {
           for (const auto& incarnation : storage.incarnations()) {
             if (!CommitId::validIncarnation(incarnation)) throw std::runtime_error("Collection has an invalid incarnation directory");
           }
-          planned.push_back(std::move(plan)); // completed candidate files survive a restarted download
+          rows.push_back(std::move(row)); // completed candidate files survive a restarted download
           continue;
         }
         if (!row.incarnation && role == Role::WRITER && !storage.hasFiles() && std::ranges::all_of(storage.incarnations(), CommitId::validIncarnation)) {
@@ -340,37 +332,8 @@ std::vector<Collections::Opened> Collections::open(Role role) {
           LOG_INFO("Removed unselected collection: {}", name.label());
           continue;
         }
-        if (row.incarnation) {
-          if (role == Role::WRITER) row.incarnation = recoverWriter(name, storage, *row.incarnation);
-          auto dir = storage.open(*row.incarnation);
-          auto manifest = Manifest::load(*dir);
-          std::vector<FileDescriptor> check;
-          if (manifest.bytes) {
-            auto files = Manifest::files(manifest.bytes);
-            if (verifyOnOpen) check = std::move(files);
-            else {
-              auto suspects = CorruptionMarker::read(*dir);
-              for (const auto& file : files) if (std::ranges::binary_search(suspects, file.name)) check.push_back(file);
-            }
-          }
-          verification.open(*dir, check, planned.size());
-        }
       }
-      plan.open = true;
-    } catch (const std::exception& e) {
-      failLoad(row, e);
-    }
-    planned.push_back(std::move(plan));
-  }
-  if (verification.size()) arena.execute([&] { verification.run(); });
-  for (size_t i = 0; i < planned.size(); i++) {
-    auto& plan = planned[i];
-    auto& row = plan.row;
-    if (!plan.open) continue;
-    try {
-      if (auto problem = verification.problem(i); !problem.empty()) throw ChecksumMismatchError(problem);
-      verification.verified(i, plan.verified);
-      auto collection = openCollection(row.id, role, row.incarnation, &plan.verified);
+      auto collection = openCollection(row.id, role, row.incarnation);
       if (!map.insert(row.id, collection)) throw std::logic_error("collection opened twice");
       row.collection = std::move(collection);
       registered(row.id, row.collection);
@@ -378,10 +341,8 @@ std::vector<Collections::Opened> Collections::open(Role role) {
     } catch (const std::exception& e) {
       failLoad(row, e);
     }
+    rows.push_back(std::move(row));
   }
-  std::vector<Opened> rows;
-  rows.reserve(planned.size());
-  for (auto& plan : planned) rows.push_back(std::move(plan.row));
   return rows;
 }
 
@@ -394,11 +355,12 @@ std::shared_ptr<Collection> Collections::unavailable(const CollectionId& name, s
 
 void Collections::fail(const CollectionId& name, const std::shared_ptr<Collection>& collection, const std::string& reason,
                        std::span<const std::string> suspects) {
-  collection->fail(reason);
   if (auto shard = collection->getShard(); shard && !suspects.empty()) {
     try { CorruptionMarker::write(*shard->dir, suspects, reason); }
+    catch (const ReadOnlyError&) {}
     catch (const std::exception& e) { LOG_WARN("Cannot record suspect files of '{}': {}", name.label(), e.what()); }
   }
+  collection->fail(reason);
   events.updated(name, *collection);
 }
 

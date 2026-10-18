@@ -97,11 +97,10 @@ public:
   // without removing a root that already existed.
   void commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened);
   std::shared_ptr<const CommitSnapshot> snapshot() const { return readers.snapshot(); }
-  // Publishes the newest valid local root. With `verify`, every file it lists
-  // is first checked against its manifest size and xxh3 (ChecksumMismatchError),
-  // except those `verified` already records; a root that moves meanwhile (a
-  // writer sharing the directory) costs only its new files.
-  void openLocalSnapshot(bool verify = false, std::map<std::string, FileDescriptor>* verified = nullptr);
+  // Verifies held files before mapping them into a reader, then publishes.
+  // With verify, checks all files; otherwise only marker-named files.
+  // Only opening failures retry against a newer root, never hash failures.
+  void openLocalSnapshot(bool verify = false);
   void sweepOrphans(const Manifest& manifest);
   void sweepOrphans();
   static std::vector<std::string> obsoleteFiles(const CommitSnapshot& previous,
@@ -115,7 +114,8 @@ public:
   // snapshot, without pinning: peers serve verified copies this way.
   std::shared_ptr<InputFile> openFile(const FileDescriptor& descriptor);
   // As openFile(descriptor), for a checksum pass (the scrub): the handle
-  // outlives a retirement, so a file retired mid-pass still hashes.
+  // outlives a retirement, so a file retired mid-pass still hashes. Null when
+  // the file is held but missing on disk (expected on a read-only node).
   std::shared_ptr<ChecksumReader> openChecksum(const FileDescriptor& descriptor, bool direct);
   bool touch(const CommitId& id, uint64_t bytes);
   // Storage pressure skips current snapshots and open transfers. Retention

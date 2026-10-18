@@ -225,7 +225,7 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
       multitermExpansionRefills.load(std::memory_order_relaxed);
   if (node.getScrubber().enabled() && request.collection.empty()) {
     auto scrub = node.getScrubber().stats();
-    response.scrub = api::ScrubStats{scrub.passes, scrub.files, scrub.bytes, scrub.mismatches, scrub.lastPassEnd};
+    response.scrub = api::ScrubStats{scrub.passes, scrub.files, scrub.bytes, scrub.mismatches, scrub.errors, scrub.lastPassEnd};
   }
 }
 

@@ -7,6 +7,7 @@
 #include "ReplicationFollower.h"
 #include "luxir/store/FileVerifier.h"
 #include "luxir/util/thread.h"
+#include <algorithm>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -60,20 +61,24 @@ size_t Scrubber::scrub(std::stop_token stop) {
   return pass(stop, false);
 }
 
+Scrubber::Clock::time_point Scrubber::nextDeadline(Clock::time_point due, Clock::time_point now,
+                                                   size_t length, uint64_t bytesPerSecond) {
+  if (!bytesPerSecond) return now;
+  auto duration = std::chrono::duration_cast<Clock::duration>(
+      std::chrono::duration<double>((double)length / (double)bytesPerSecond));
+  return std::max(due, now) + duration;
+}
+
 // Caller holds `mutex`.
 size_t Scrubber::pass(std::stop_token stop, bool preemptible) {
-  using Clock = std::chrono::steady_clock;
-  auto start = Clock::now();
-  uint64_t read = 0;
+  auto due = Clock::now();
   auto preempted = [&] { return preemptible && waiting.load(std::memory_order_relaxed) > 0; };
-  // Sleeps while the pass is ahead of the byte rate; throws Stopped to end it.
+  // Pace each chunk without accumulating credit; throws Stopped to end it.
   auto pace = [&](size_t length) {
-    read += length;
     bytes.fetch_add(length, std::memory_order_relaxed);
     if (stop.stop_requested() || preempted()) throw Stopped();
     if (!bytesPerSecond) return;
-    auto due = start + std::chrono::microseconds((uint64_t)((double)read * 1e6 / (double)bytesPerSecond));
-    if (due <= Clock::now()) return;
+    due = nextDeadline(due, Clock::now(), length, bytesPerSecond);
     std::unique_lock lock(wakeMutex);
     wake.wait_until(lock, stop, due, [&] { return preempted(); });
     if (stop.stop_requested() || preempted()) throw Stopped();
@@ -89,31 +94,34 @@ size_t Scrubber::pass(std::stop_token stop, bool preemptible) {
       auto snapshot = registry.snapshot();
       if (!snapshot) continue;
       for (const auto& file : snapshot->files) {
-        std::shared_ptr<ChecksumReader> reader;
         std::string problem;
-        bool held = true;
-        try { reader = registry.openChecksum(file, true); }
-        catch (const ApiError& e) {
-          // Not held: retired by a newer publication, or the collection closed.
-          held = e.kind != ErrorKind::NOT_FOUND;
-          if (held) problem = "unreadable file: " + file.name + ": " + e.what();
-        }
-        catch (const std::exception& e) { problem = "unreadable file: " + file.name + ": " + e.what(); }
-        if (!held) continue;
-        if (reader) {
-          try { problem = checksumMismatch(file, reader->checksum(pace)); }
-          catch (const std::exception& e) { problem = "unreadable file: " + file.name + ": " + e.what(); }
-          reader.reset();
+        try {
+          auto reader = registry.openChecksum(file, true);
+          if (!reader) {
+            if (node.readOnly()) continue; // the live writer retired this name
+            problem = "missing file: " + file.name;
+          } else {
+            problem = checksumMismatch(file, reader->checksum(pace));
+          }
+        } catch (const FileEIOError& e) {
+          problem = "unreadable file: " + file.name + ": " + e.what();
+        } catch (const std::exception& e) {
+          // A newer publication retired it, or the collection closed.
+          auto* api = dynamic_cast<const ApiError*>(&e);
+          if (api && api->code == "file_not_held") continue;
+          errors.fetch_add(1, std::memory_order_relaxed);
+          LOG_WARN("Could not scrub file '{}' of collection '{}': {}", file.name, entry.id.label(), e.what());
+          continue;
         }
         files.fetch_add(1, std::memory_order_relaxed);
         if (problem.empty()) continue;
         mismatches.fetch_add(1, std::memory_order_relaxed);
         corrupted++;
-        LOG_ERROR("Collection '{}' (commit {}) is corrupt and no longer serves: {}",
-                  entry.id.label(), snapshot->id.token(), problem);
         std::array<std::string, 1> suspects{file.name};
         collections.fail(entry.id, entry.collection, problem, suspects);
-        if (auto* follower = node.getFollower()) follower->repair(entry.id, problem);
+        LOG_ERROR("Collection '{}' (commit {}) is corrupt and no longer serves: {}",
+                  entry.id.label(), snapshot->id.token(), problem);
+        if (auto* follower = node.getFollower()) follower->repair(entry.id, entry.collection, problem, std::span(&file, 1));
         break;
       }
     }
@@ -126,7 +134,7 @@ size_t Scrubber::pass(std::stop_token stop, bool preemptible) {
 
 Scrubber::Stats Scrubber::stats() const {
   return {passes.load(std::memory_order_relaxed), files.load(std::memory_order_relaxed),
-          bytes.load(std::memory_order_relaxed), mismatches.load(std::memory_order_relaxed),
+          bytes.load(std::memory_order_relaxed), mismatches.load(std::memory_order_relaxed), errors.load(std::memory_order_relaxed),
           lastPassEnd.load(std::memory_order_relaxed)};
 }
 

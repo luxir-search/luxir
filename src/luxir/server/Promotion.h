@@ -16,7 +16,8 @@ namespace luxir {
 // generation above any root `from` held. With `verify` every linked file is
 // read and checked against its manifest size and xxh3 first (a mismatch throws
 // ChecksumMismatchError). Returns the new incarnation; CURRENT is unchanged.
-// Promotion and recovery both start a new identity this way.
+// Promotion and recovery both start a new identity this way. Markers naming
+// files of the copied manifest are durable in the new incarnation on return.
 std::string copySnapshot(CollectionStorage& storage, std::string_view from, const Manifest& manifest, bool verify = false);
 
 // Offline promotion of a follower data directory to an independent writer:

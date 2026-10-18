@@ -423,14 +423,18 @@ threads' address space.
   descriptors only; whether the linked bytes still match is the at-rest
   question the checks below answer.
 - **`--store.verify-on-open=full`** reads every file of every collection's
-  committed snapshot at startup, in one pool on the node's indexing threads,
-  before any collection serves. The default, `none`, trusts the manifest footer
-  and file sizes. A mismatching, missing or unreadable file fails only that
+  committed snapshot at startup, one collection at a time on the node's
+  indexing threads. Within a collection, files hash in parallel, largest first;
+  checksum descriptors are held for at most one collection at a time. Checked
+  files are verified before any reader maps or parses them. Readers map those
+  same descriptors, so a file retired during hashing remains readable. The
+  default, `none`, trusts the manifest footer and file sizes. A mismatching, missing or unreadable file fails only that
   collection: it loads as unavailable (HTTP `503`, code `collection_unavailable`)
   with an error naming the file (`checksum mismatch: <file>: expected size=..
-  xxh3=.., actual ..`, `missing file: <file>` or `unreadable file: <file>: ..`),
-  and its data is kept. A follower then fetches the damaged files from its
-  source. `luxir promote --store.verify-on-open=full` checks the files it links
+  xxh3=.., actual ..`, `missing file: <file>` or `unreadable file: <file>: ..` for EIO),
+  and its data is kept. Other verification errors also fail the load, with
+  `could not verify file: <file>: ..`; verification never creates corruption
+  markers. A follower then fetches the damaged files from its source. `luxir promote --store.verify-on-open=full` checks the files it links
   the same way. Startup reads the whole index, so expect it to take as long as
   reading the data directory once.
 - **`--store.scrub-interval-s=N`** (default `0`, off) re-reads the files of
@@ -438,21 +442,38 @@ threads' address space.
   where the filesystem allows so the pass reads the media and leaves the page
   cache to queries, paced to `--store.scrub-max-bytes-per-sec` (default
   `64MB`, `0` for unthrottled; the rate is the throttle, the thread's low CPU
-  priority only yields the CPU). A mismatch is logged at error level and fails
+  priority only yields the CPU). A size/digest mismatch, EIO, or a held file
+  missing on a writer or follower is logged at error level and fails
   the collection: it is unavailable with the same error, a writer publishes
   nothing more over the damaged bytes (no further update, commit or merge), and
   the suspect file is recorded in a `corrupted_<id>` marker in the incarnation
   directory. `GET /_stats` reports node-wide `scrub` counters (`passes`,
-  `files`, `bytes`, `mismatches`, `last_pass_end` in Unix milliseconds) while
-  scrubbing is enabled.
+  `files`, `bytes`, `mismatches`, `errors`, `last_pass_end` in Unix milliseconds)
+  while scrubbing is enabled. `mismatches` includes EIO and unexpectedly missing
+  files. Other errors (such as descriptor exhaustion, allocation failures or
+  permission errors) are warnings counted in `errors`; they leave the collection
+  available and the next pass retries. On a read-only node a live writer can
+  retire files still served through mappings: the scrub skips missing files.
 
-A marker survives restarts: at startup the files it names are re-verified
-whatever `--store.verify-on-open` says, the collection stays unavailable while
-one still fails, and the marker is removed once they pass. A follower repairs a
-scrub hit by itself: the next sync re-verifies its local files, fetches only
-the damaged ones and installs the copy again. Repair a writer by restoring from
-a follower (`luxir pull` and `luxir promote`) or by replacing the damaged file
-from a backup and restarting.
+On a writable node a marker survives restarts: at startup the files it names
+are re-verified with `O_DIRECT` where supported, whatever
+`--store.verify-on-open` says. Under `full` other files use buffered reads.
+The collection stays unavailable while a suspect file still fails; the marker
+is removed once its files pass or are replaced. Read-only nodes honor existing
+markers but cannot persist new ones or clear them, so their scrub failures do
+not survive a restart unless another process recorded a marker.
+
+Markers travel with `luxir promote` and writer recovery into a new incarnation,
+restricted to files in the copied manifest. A promoted or recovered writer
+therefore re-checks known suspects even under the default policy. A follower
+repairs a scrub hit by itself: the next sync re-downloads every marker-named
+file even if its buffered hash matches, checks other local candidates as usual,
+and installs the copy again. Suspect files are never linked from the serving
+copy, and a failed serving collection supplies no hard-link reuse. An advance
+cannot replace a suspect serving file in place; repair first unloads the failed
+collection and re-stages it. Repair a writer by restoring from a follower
+(`luxir pull` and `luxir promote`) or by replacing the damaged file from a
+backup and restarting.
 
 ## Current production boundary
 
