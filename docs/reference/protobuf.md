@@ -1081,7 +1081,7 @@ Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolea
 | <a id="field-luxir.match.val"></a>[`val`](#field-luxir.match.val) | 2 | [`Val`](#message-luxir.val) | singular |  |
 | <a id="field-luxir.match.operator"></a>[`operator`](#field-luxir.match.operator) | 3 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How to combine the multiple terms an analyzed text field can produce. Unset = OR. |
 | <a id="field-luxir.match.min_match"></a>[`min_match`](#field-luxir.match.min_match) | 4 | `int32` | singular | Minimum number of the analyzed terms that must match (the OR..AND middle ground). When set it overrides \`operator\`; clamped to the term count. Mirrors BooleanQuery.min\_match. |
-| <a id="field-luxir.match.analyzer"></a>[`analyzer`](#field-luxir.match.analyzer) | 5 | `string` | singular | Analyzes TEXT query input with this analyzer instead of the field's. Names a text field, variant, or template in the collection schema ("title\_\_un", "\_wl"), or a built-in analyzer ("standard", "whitespace", "keyword"); a schema name takes precedence. Unset = the field's analyzer. An unknown name, or one set on a non-text field, is an error. |
+| <a id="field-luxir.match.analyzer"></a>[`analyzer`](#field-luxir.match.analyzer) | 6 | `string` | singular | Analyzes TEXT query input with this analyzer instead of the field's. Names a text field, variant, or template in the collection schema ("title\_\_un", "\_wl"), or a built-in analyzer ("standard", "whitespace", "keyword"); a schema name takes precedence. Unset = the field's analyzer. An unknown name, or one set on a non-text field, is an error. |
 
 <a id="message-luxir.memorystats"></a>
 

@@ -297,7 +297,7 @@ message Match {
   // ("title__un", "_wl"), or a built-in analyzer ("standard", "whitespace",
   // "keyword"); a schema name takes precedence. Unset = the field's
   // analyzer. An unknown name, or one set on a non-text field, is an error.
-  string analyzer = 5;
+  string analyzer = 6;
 
   enum Operator {
     OPERATOR_UNSPECIFIED = 0;  // treated as OR
