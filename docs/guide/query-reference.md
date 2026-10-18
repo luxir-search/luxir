@@ -246,6 +246,10 @@ Slop is not simply the number of intervening words. An adjacent transposition
 costs `2`, and multi-valued text fields have a position gap of `100`. See
 [Query language: terms and phrases](query-language.md#terms-and-phrases).
 
+On a field with a `shingle` variant, an exact phrase uses the variant's
+word-pair terms; see
+[Prefix and phrase acceleration](schema.md#prefix-and-phrase-acceleration).
+
 ## Prefix
 
 ```json
@@ -256,6 +260,37 @@ costs `2`, and multi-valued text fields have a position gap of `100`. See
 apply their multi-term normalization/folding but do not tokenize it; STRING
 uses its normalizer if present, and ID uses the bytes verbatim. An empty prefix
 matches documents with at least one indexed term for the field.
+
+On a text field with an `edge_ngram` variant, a prefix within the variant's
+gram lengths is a single term lookup; see
+[Prefix and phrase acceleration](schema.md#prefix-and-phrase-acceleration).
+
+### Search as you type
+
+For a search box over a `_sayt` field, send the finished words as a `match`
+and the word being typed as a `prefix` (the "bool prefix" pattern):
+
+```json
+{
+  "boolean": {
+    "required": [
+      {"match": {"title_sayt": "quick brown"}},
+      {"prefix": {"field": "title_sayt", "prefix": "fo"}}
+    ],
+    "optional": [
+      {"phrase": {"field": "title_sayt", "text": "quick brown"}}
+    ]
+  }
+}
+```
+
+The `match` is AND-ed with the prefix by `required`; set
+`"operator": "and"` on it when every finished word must match. The prefix
+uses the `prefix` variant at 2 to 5 code points, and the optional exact
+phrase ranks hits with the words in order higher through the `shingle`
+variant. In `simple_query` and `expr`, a trailing `*` is the same prefix
+query, so `title_sayt:quick AND title_sayt:fo*` in `expr` uses the variant
+too. A `wildcard` query does not, even for `fo*`.
 
 ## Wildcard
 

@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <array>
 #include <format>
+#include <limits>
+#include <optional>
 #include <memory>
 #include <vector>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -27,10 +29,30 @@ class FieldResolver {
   std::vector<std::string>* explanations;
   std::array<Handles, (size_t)OpClass::PRIMARY + 1> fields;  // one memo per OpClass
   boost::unordered_flat_map<FieldType*, std::unique_ptr<TokenChain>> chains;
+  // The oldest schema generation of the searched documents, once the caller
+  // knows the reader (see coversAll). Unset: no representation is assumed
+  // complete, so query building never substitutes one for another.
+  std::optional<uint64_t> coveredGen;
 
 public:
   explicit FieldResolver(Schema& schema, std::vector<std::string>* explanations = nullptr)
       : schema(schema), explanations(explanations) {}
+
+  // Pass IndexReader::oldestSchemaGen(); absent (no live documents) covers everything.
+  void setCoverage(std::optional<uint64_t> oldestSchemaGen) {
+    coveredGen = oldestSchemaGen.value_or(std::numeric_limits<uint64_t>::max());
+  }
+
+  // Every searched document was indexed with this physical representation.
+  // A variant added later is missing from older documents (no backfill).
+  bool coversAll(std::string_view physicalName) const {
+    return coveredGen && schema.introduction(physicalName) <= *coveredGen;
+  }
+
+  // Record a request-level rewrite for ?explain=resolved.
+  void explain(std::string note) {
+    if (explanations && !std::ranges::contains(*explanations, note)) explanations->push_back(std::move(note));
+  }
 
   const ResolvedFieldHandle& resolve(std::string_view name, OpClass op,
                                      std::string_view context = {}) {

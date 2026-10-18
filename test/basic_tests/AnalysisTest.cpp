@@ -1019,3 +1019,71 @@ TEST_F(AnalysisTest, wordSegmentationIsAllocationFree) {
   EXPECT_GT(asciiBytes, 0u);  // the loops really produced segments
   EXPECT_GT(uniBytes, 0u);
 }
+
+namespace {
+
+std::shared_ptr<const Analyzer> compileJson(std::string_view json) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::AnalyzerDef def;
+  if (!api::read_json(def, json, arena)) throw std::runtime_error("bad analyzer json");
+  return Analyzer::compile(def);
+}
+
+}  // namespace
+
+TEST_F(AnalysisTest, edgeNGramEmitsCodepointPrefixesAtTheTokenPosition) {
+  auto analyzer = compileJson(R"({"filters":[{"name":"edge_ngram","params":{"min_gram":2,"max_gram":4}}]})");
+  auto chain = analyzer->createChain();
+  auto out = analyze(*chain, "I quick ab caf\xc3\xa9");
+  EXPECT_EQ((std::vector<std::string>{"qu", "qui", "quic", "ab", "ca", "caf", "caf\xc3\xa9"}), out.terms);
+  EXPECT_EQ((std::vector<int>{1, 1, 1, 2, 3, 3, 3}), out.positions);  // the dropped "I" keeps its position
+  EXPECT_EQ((std::vector<int>{2, 2, 2, 8, 11, 11, 11}), out.starts);
+  EXPECT_EQ((std::vector<int>{7, 7, 7, 10, 16, 16, 16}), out.ends);
+  EXPECT_EQ((std::vector<std::string>{"he", "hel", "hell", "hello"}),
+            analyze(*compileJson(R"({"filters":["edge_ngram"]})")->createChain(), "hello").terms);
+  EXPECT_EQ(Analyzer::Accel::Kind::PREFIXES, analyzer->accel.kind);
+  EXPECT_EQ(compileJson("{}")->canonical, analyzer->accel.baseCanonical);
+  std::string term = "Quick";
+  chain->normalizeTerm(term);
+  EXPECT_EQ("Quick", term);
+  for (auto params : {R"({"min_gram":0})", R"({"min_gram":3,"max_gram":2})", R"({"max_gram":51})",
+                      R"({"min_gram":"2"})", R"({"size":2})"}) {
+    EXPECT_THROW(compileJson(std::string(R"({"filters":[{"name":"edge_ngram","params":)") + params + "}]}"),
+                 std::invalid_argument) << params;
+  }
+}
+
+TEST_F(AnalysisTest, shingleJoinsConsecutivePositionsOnly) {
+  auto pairs = compileJson(R"({"tokenizer":"unicode_word","filters":["nfkc_cf","shingle"]})");
+  auto chain = pairs->createChain();
+  auto out = analyze(*chain, "The quick, Brown");
+  EXPECT_EQ((std::vector<std::string>{"the quick", "quick brown"}), out.terms);
+  EXPECT_EQ((std::vector<int>{0, 1}), out.positions);
+  EXPECT_EQ((std::vector<int>{0, 4}), out.starts);
+  EXPECT_EQ((std::vector<int>{9, 16}), out.ends);
+  EXPECT_TRUE(analyze(*chain, "solo").terms.empty());
+  EXPECT_EQ((std::vector<std::string>{"a b"}), analyze(*chain, "a b").terms);  // reset per value
+  EXPECT_EQ(Analyzer::Accel::Kind::SHINGLES, pairs->accel.kind);
+  EXPECT_EQ(compileJson(R"({"tokenizer":"unicode_word","filters":["nfkc_cf"]})")->canonical,
+            pairs->accel.baseCanonical);
+
+  auto all = compileJson(R"({"filters":[{"name":"shingle","params":{"max_shingle_size":3,
+    "output_unigrams":true,"token_separator":"_"}}]})")->createChain();
+  out = analyze(*all, "a b c");
+  EXPECT_EQ((std::vector<std::string>{"a", "a_b", "a_b_c", "b", "b_c", "c"}), out.terms);
+  EXPECT_EQ((std::vector<int>{0, 0, 0, 1, 1, 2}), out.positions);
+
+  // The 2-gram filter drops "c", leaving a position gap no shingle spans.
+  auto gaps = compileJson(R"({"filters":[{"name":"edge_ngram","params":{"min_gram":2,"max_gram":2}},
+    "shingle"]})");
+  out = analyze(*gaps->createChain(), "ab c de fg");
+  EXPECT_EQ((std::vector<std::string>{"de fg"}), out.terms);
+  EXPECT_EQ((std::vector<int>{2}), out.positions);
+  EXPECT_EQ(Analyzer::Accel::Kind::NONE, gaps->accel.kind);  // stacked base: never routed
+  for (auto params : {R"({"min_shingle_size":1})", R"({"max_shingle_size":6})",
+                      R"({"min_shingle_size":3,"max_shingle_size":2})", R"({"output_unigrams":1})",
+                      R"({"token_separator":2})", R"({"size":2})"}) {
+    EXPECT_THROW(compileJson(std::string(R"({"filters":[{"name":"shingle","params":)") + params + "}]}"),
+                 std::invalid_argument) << params;
+  }
+}

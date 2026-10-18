@@ -1056,6 +1056,22 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   names.parent = "_name";
   names.multi = true;
 
+  // Search-as-you-type: folded words without stemming (a typed prefix of an
+  // unstemmed word still matches), plus hidden variants that index 2-5 code
+  // point word prefixes and adjacent word pairs. Prefix and exact phrase
+  // queries on the field route to them (QueryBuilder::routePrefix/routePhrase).
+  auto& sayt = add(templates, "_sayt", FieldClass::TEXT);
+  setAnalyzer(sayt, "unicode_word", {"nfkc_cf", "fold"});
+  auto* prefixes = api::build::allocMessage<api::FieldDef>(arena);
+  prefixes->type = FieldClass::TEXT;
+  setAnalyzer(*prefixes, "unicode_word", {"nfkc_cf", "fold", "edge_ngram"});
+  auto* pairs = api::build::allocMessage<api::FieldDef>(arena);
+  pairs->type = FieldClass::TEXT;
+  setAnalyzer(*pairs, "unicode_word", {"nfkc_cf", "fold", "shingle"});
+  auto* saytVariants = api::build::allocArray(sayt.variants.emplace().entries, 2, arena);
+  saytVariants[0] = {"prefix", prefixes};
+  saytVariants[1] = {"shingle", pairs};
+
   // VECTOR suffixes: single-valued (_v) and multi-valued (_vs).  dims is left
   // unset on the template; concrete fields may pin it.
   add(templates, "_v", FieldClass::VECTOR);

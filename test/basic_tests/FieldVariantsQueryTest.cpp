@@ -704,3 +704,95 @@ TEST_F(FieldVariantsQueryTest, knnGeoAndExistsUsePrimaryUnlessExplicit) {
   }
   EXPECT_EQ((std::vector<std::string>{"v1"}), hits(R"({"geo_distance":{"field":"point__self","lat":10,"lon":20,"radius_meters":100}})"));
 }
+
+// Prefix and exact phrase queries route to edge_ngram / shingle variants of
+// the same base analysis (Analyzer::Accel) only when every searched document
+// was indexed with the variant; results never change, only the plan.
+class TextVariantRoutingTest : public LuxirTest {
+protected:
+  CollectionHelper helper{"routing"};
+
+  std::vector<std::string> hits(std::string_view query) {
+    auto req = localReq(helper.getSearchEngine());
+    auto kept = api::build::arenaStr(req->mr, std::format(R"({{"query":{},"fields":["id"],"limit":-1}})", query));
+    parseQueryRequest(kept, req->rawRequest(), req->mr);
+    req->collection("routing").execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    std::vector<std::string> out;
+    for (const auto& doc : req->getDocs()) out.push_back(std::get<std::string>(*find(doc, "id")));
+    std::sort(out.begin(), out.end());
+    return out;
+  }
+
+  // The ?explain=resolved notes for a query, one per line.
+  std::string notes(std::string_view query) {
+    auto req = localReq(helper.getSearchEngine());
+    auto kept = api::build::arenaStr(req->mr, std::format(R"({{"query":{}}})", query));
+    parseQueryRequest(kept, req->rawRequest(), req->mr);
+    req->collection("routing");
+    std::string out;
+    for (const auto& note : helper.getSearchEngine().explain(req->rawRequest(), "")) out += note + "\n";
+    return out;
+  }
+
+  static std::string prefix(std::string_view field, std::string_view text) {
+    return std::format(R"({{"prefix":{{"field":"{}","prefix":"{}"}}}})", field, text);
+  }
+
+  static std::string phrase(std::string_view field, std::string_view text, int slop = 0) {
+    return std::format(R"({{"phrase":{{"field":"{}","text":"{}","slop":{}}}}})", field, text, slop);
+  }
+};
+
+TEST_F(TextVariantRoutingTest, saytTemplateRoutesPrefixesAndPhrases) {
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "s1", "blurb_sayt", "Quick brown foxes"),
+    flatdoc("id", "s2", "blurb_sayt", "the quick brown fox"),
+    flatdoc("id", "s3", "blurb_sayt", "brown quick fox Café quickly"),
+  }, UpdateMessage::COMMIT).success);
+  std::string f = "blurb_sayt";
+  EXPECT_EQ(vecs("s1", "s2", "s3"), hits(prefix(f, "QU")));
+  EXPECT_EQ(vecs("s1", "s2", "s3"), hits(prefix(f, "q")));
+  EXPECT_EQ(vecs("s3"), hits(prefix(f, "quickl")));
+  EXPECT_EQ(vecs("s3"), hits(prefix(f, "café")));
+  EXPECT_EQ(vecs("s1", "s2"), hits(phrase(f, "Quick Brown")));
+  EXPECT_EQ(vecs("s3"), hits(phrase(f, "brown quick")));
+  EXPECT_EQ(vecs("s2"), hits(phrase(f, "quick brown fox")));
+  EXPECT_EQ(vecs("s3"), hits(phrase(f, "quick fox")));
+  EXPECT_EQ(vecs("s2", "s3"), hits(phrase(f, "quick fox", 1)));
+  EXPECT_TRUE(hits(phrase(f, "fox quick")).empty());
+  // The bool-prefix pattern: whole words as terms, the last as a prefix.
+  EXPECT_EQ(vecs("s1", "s2", "s3"),
+            hits(std::format(R"({{"boolean":{{"required":[{{"match":{{"{}":"quick"}}}},{}]}}}})", f, prefix(f, "fo"))));
+
+  auto routed = notes(std::format(R"({{"boolean":{{"required":[{},{},{}]}}}})",
+                                  prefix(f, "qu"), phrase(f, "quick brown"), phrase(f, "the quick brown")));
+  EXPECT_NE(std::string::npos, routed.find("prefix: blurb_sayt -> blurb_sayt__prefix")) << routed;
+  EXPECT_NE(std::string::npos, routed.find("phrase: blurb_sayt -> blurb_sayt__shingle")) << routed;
+  auto fallback = notes(std::format(R"({{"boolean":{{"required":[{},{},{}]}}}})",
+                                    prefix(f, "q"), prefix(f, "quickl"), phrase(f, "quick brown", 1)));
+  EXPECT_EQ(std::string::npos, fallback.find("blurb_sayt__")) << fallback;
+}
+
+TEST_F(TextVariantRoutingTest, variantAddedLaterRoutesOnlyOnceItCoversEveryDocument) {
+  SchemaBuilder b;
+  auto& field = b.field("tagline");
+  field.type = api::FieldDef::FieldClass::TEXT;
+  b.analyzer(field, "unicode_word", {"nfkc_cf"});
+  b.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "old", "tagline", "Quick start"), UpdateMessage::COMMIT).success);
+
+  auto& grams = b.variant(field, "grams");
+  grams.type = api::FieldDef::FieldClass::TEXT;
+  b.analyzer(grams, "unicode_word", {"nfkc_cf", "edge_ngram"});
+  b.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "new", "tagline", "Quick finish"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(vecs("new"), hits(prefix("tagline__grams", "qu")));
+  EXPECT_EQ(vecs("new", "old"), hits(prefix("tagline", "qu")));
+  EXPECT_EQ(std::string::npos, notes(prefix("tagline", "qu")).find("tagline__grams"));
+
+  // Reindexing the old document leaves no live document without the variant.
+  ASSERT_TRUE(helper.index(flatdoc("id", "old", "tagline", "Quick start"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(vecs("new", "old"), hits(prefix("tagline", "qu")));
+  EXPECT_NE(std::string::npos, notes(prefix("tagline", "qu")).find("tagline -> tagline__grams"));
+}

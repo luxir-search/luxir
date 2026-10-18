@@ -7,6 +7,7 @@
 #include "luxir/analysis/NfkcCfData.h"
 
 #include <algorithm>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -566,6 +567,243 @@ std::unique_ptr<const TokenFilterFactory> kstemFilter(const api::AnalyzerCompone
   return factory;
 }
 
+// Byte length of the UTF-8 sequence starting at `i`: the lead byte plus its
+// continuation bytes. Ill-formed input still advances by at least one byte.
+size_t nextCodepoint(std::string_view text, size_t i) {
+  i++;
+  while (i < text.size() && ((unsigned char) text[i] & 0xC0) == 0x80) i++;
+  return i;
+}
+
+// Emits the leading min_gram..max_gram code points of each token, all at the
+// token's position and with its source offsets. A token shorter than
+// min_gram is dropped, and its position increment carries to the next token
+// so later positions match the unfiltered chain.
+class EdgeNGramFilter : public TokenFilter {
+  const int minGram;
+  const int maxGram;
+  std::string_view word;  // the current source token; the source is not pulled until its grams are out
+  size_t gramEnd = 0;     // byte end of the last emitted gram
+  int grams = 0;          // code points in the last emitted gram; 0 = no current token
+public:
+  EdgeNGramFilter(std::unique_ptr<TokenStream> source, int minGram, int maxGram)
+      : TokenFilter(std::move(source)), minGram(minGram), maxGram(maxGram) {}
+
+  void reset() override {
+    TokenFilter::reset();
+    grams = 0;
+  }
+
+  bool incrementToken() override {
+    if (grams > 0 && grams < maxGram && gramEnd < word.size()) {
+      gramEnd = nextCodepoint(word, gramEnd);
+      grams++;
+      token.text = word.substr(0, gramEnd);
+      token.positionIncrement = 0;
+      return true;
+    }
+    int gap = 0;
+    while (source().incrementToken()) {
+      word = token.text;
+      gramEnd = 0;
+      grams = 0;
+      while (grams < minGram && gramEnd < word.size()) {
+        gramEnd = nextCodepoint(word, gramEnd);
+        grams++;
+      }
+      if (grams < minGram) {
+        gap += token.positionIncrement;
+        continue;
+      }
+      token.text = word.substr(0, gramEnd);
+      token.positionIncrement += gap;
+      return true;
+    }
+    grams = 0;
+    return false;
+  }
+
+  // Grams are an indexing expansion; multiterm input is folded, never split.
+};
+
+// Joins runs of min_shingle_size..max_shingle_size consecutive tokens with
+// token_separator, optionally emitting the single tokens too. Every output
+// sits at the position of its first token, spanning the source offsets of
+// its first through last token. Tokens join only at consecutive positions: a
+// position gap (or a stacked token) starts a new run, and runs never cross
+// values. Shingles from one start position come out before the next start.
+class ShingleFilter : public TokenFilter {
+  struct Word {
+    std::string text;
+    int position;
+    int startOffset;
+    int endOffset;
+  };
+  const int minSize;
+  const int maxSize;
+  const bool unigrams;
+  const std::string separator;
+  std::deque<Word> window;      // consecutive words; window[0] is the current start
+  std::optional<Word> pending;  // the word after a position break; starts the next run
+  bool exhausted = false;
+  int position = -1;            // position of the last word pulled from the source
+  int emitted = -1;             // position of the last token emitted
+  int size = 0;                 // words in the next output from window[0]; 0 = not started
+  std::string out;              // the emitted token's bytes
+
+  void pull() {
+    if (!source().incrementToken()) {
+      exhausted = true;
+      return;
+    }
+    position += token.positionIncrement;
+    Word word{std::string(token.text), position, token.startOffset, token.endOffset};
+    if (!window.empty() && position != window.back().position + 1) {
+      pending = std::move(word);
+    } else {
+      window.push_back(std::move(word));
+    }
+  }
+
+public:
+  ShingleFilter(std::unique_ptr<TokenStream> source, int minSize, int maxSize, bool unigrams,
+                std::string separator)
+      : TokenFilter(std::move(source)), minSize(minSize), maxSize(maxSize), unigrams(unigrams),
+        separator(std::move(separator)) {}
+
+  void reset() override {
+    TokenFilter::reset();
+    window.clear();
+    pending.reset();
+    exhausted = false;
+    position = -1;
+    emitted = -1;
+    size = 0;
+  }
+
+  bool incrementToken() override {
+    for (;;) {
+      if (window.empty()) {
+        if (pending) {
+          window.push_back(std::move(*pending));
+          pending.reset();
+        } else if (!exhausted) {
+          pull();
+        }
+        if (window.empty()) return false;
+      }
+      while (window.size() < (size_t) maxSize && !pending && !exhausted) pull();
+      if (size == 0) size = unigrams ? 1 : minSize;
+      if (size <= (int) window.size()) {
+        const Word& first = window[0];
+        const Word& last = window[(size_t) size - 1];
+        out = first.text;
+        for (int i = 1; i < size; i++) {
+          out += separator;
+          out += window[(size_t) i].text;
+        }
+        token.text = out;
+        token.positionIncrement = first.position - emitted;
+        token.setOffset(first.startOffset, last.endOffset);
+        emitted = first.position;
+        size = size == 1 ? minSize : size + 1;
+        return true;
+      }
+      window.pop_front();
+      size = 0;
+    }
+  }
+
+  // Shingles are an indexing expansion; multiterm input is folded, never joined.
+};
+
+// An integer component parameter in [lo, hi]. JSON numbers may arrive as
+// integral doubles.
+int intParam(std::string_view component, std::string_view key, const api::Val& value, int lo, int hi) {
+  std::optional<int64_t> n;
+  if (auto* i = std::get_if<int64_t>(&value.kind)) n = *i;
+  else if (auto* d = std::get_if<double>(&value.kind); d && *d >= lo && *d <= hi && *d == (double) (int) *d) {
+    n = (int64_t) *d;
+  }
+  if (!n || *n < lo || *n > hi) {
+    throw std::invalid_argument("filter '" + std::string(component) + "': parameter '" + std::string(key) +
+                                "' must be an integer from " + std::to_string(lo) + " to " +
+                                std::to_string(hi));
+  }
+  return (int) *n;
+}
+
+// Shared by the edge_ngram and shingle factories so Analyzer::compile can read
+// their parameters back into Analyzer::Accel.
+struct AccelFactory : TokenFilterFactory {
+  Analyzer::Accel accel;
+};
+
+std::unique_ptr<const TokenFilterFactory> edgeNGramFilter(const api::AnalyzerComponent& def) {
+  struct Factory : AccelFactory {
+    std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
+      return std::make_unique<EdgeNGramFilter>(std::move(source), accel.minSize, accel.maxSize);
+    }
+  };
+  auto factory = std::make_unique<Factory>();
+  factory->name = std::string(def.name);
+  factory->stateful = true;
+  factory->accel.kind = Analyzer::Accel::Kind::PREFIXES;
+  factory->accel.minSize = 2;
+  factory->accel.maxSize = 5;
+  for (const auto& [key, value] : def.params) {
+    if (key == "min_gram") factory->accel.minSize = intParam(def.name, key, *value, 1, 50);
+    else if (key == "max_gram") factory->accel.maxSize = intParam(def.name, key, *value, 1, 50);
+    else {
+      throw std::invalid_argument("filter 'edge_ngram': unknown parameter '" + std::string(key) +
+                                  "'; valid parameters: min_gram, max_gram");
+    }
+  }
+  if (factory->accel.minSize > factory->accel.maxSize) {
+    throw std::invalid_argument("filter 'edge_ngram': min_gram must not exceed max_gram");
+  }
+  return factory;
+}
+
+std::unique_ptr<const TokenFilterFactory> shingleFilter(const api::AnalyzerComponent& def) {
+  struct Factory : AccelFactory {
+    std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
+      return std::make_unique<ShingleFilter>(std::move(source), accel.minSize, accel.maxSize,
+                                             accel.unigrams, accel.separator);
+    }
+  };
+  auto factory = std::make_unique<Factory>();
+  factory->name = std::string(def.name);
+  factory->stateful = true;
+  factory->accel.kind = Analyzer::Accel::Kind::SHINGLES;
+  factory->accel.minSize = 2;
+  factory->accel.maxSize = 2;
+  factory->accel.separator = " ";
+  for (const auto& [key, value] : def.params) {
+    if (key == "min_shingle_size") {
+      factory->accel.minSize = intParam(def.name, key, *value, 2, 5);
+    } else if (key == "max_shingle_size") {
+      factory->accel.maxSize = intParam(def.name, key, *value, 2, 5);
+    } else if (key == "output_unigrams") {
+      auto* flag = std::get_if<bool>(&value->kind);
+      if (!flag) throw std::invalid_argument("filter 'shingle': parameter 'output_unigrams' must be a boolean");
+      factory->accel.unigrams = *flag;
+    } else if (key == "token_separator") {
+      auto* text = std::get_if<std::string_view>(&value->kind);
+      if (!text) throw std::invalid_argument("filter 'shingle': parameter 'token_separator' must be a string");
+      factory->accel.separator = std::string(*text);
+    } else {
+      throw std::invalid_argument("filter 'shingle': unknown parameter '" + std::string(key) +
+                                  "'; valid parameters: min_shingle_size, max_shingle_size, "
+                                  "output_unigrams, token_separator");
+    }
+  }
+  if (factory->accel.minSize > factory->accel.maxSize) {
+    throw std::invalid_argument("filter 'shingle': min_shingle_size must not exceed max_shingle_size");
+  }
+  return factory;
+}
+
 void requireNoParams(const api::AnalyzerComponent& def, std::string_view kind) {
   if (def.params.empty()) return;
   std::string got;
@@ -631,6 +869,8 @@ constexpr FilterEntry FILTERS[] = {
   {"fold", plainFilter<makeAccentFoldFilter>},
   {"english_possessive", plainFilter<makeEnglishPossessiveFilter, false>},
   {"kstem", kstemFilter},
+  {"edge_ngram", edgeNGramFilter},
+  {"shingle", shingleFilter},
 };
 
 template <class Entry, size_t N>
@@ -667,6 +907,24 @@ std::unique_ptr<const TokenFilterFactory> makeTokenFilterFactory(const api::Anal
                               "'; valid filters: " + joinNames(FILTERS));
 }
 
+namespace {
+
+std::string canonicalJson(const api::AnalyzerDef& def) {
+  api::AnalyzerDef effective = def;
+  if (!effective.tokenizer) effective.tokenizer.emplace().name = "whitespace";
+  std::string json;
+  if (!api::write_json(effective, json)) throw std::runtime_error("Cannot serialize analyzer");
+  // Sort parameter objects recursively; filter order remains semantic.
+  glz::generic_sorted_u64 value;
+  if (glz::read_json(value, json)) throw std::runtime_error("Cannot canonicalize analyzer");
+  // Give the empty chain the same representation everywhere.
+  if (def.filters.empty()) value["filters"] = glz::generic_sorted_u64::array_t{};
+  if (glz::write_json(value, json)) throw std::runtime_error("Cannot serialize canonical analyzer");
+  return json;
+}
+
+}  // namespace
+
 std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
   api::AnalyzerComponent whitespace;
   whitespace.name = "whitespace";
@@ -676,22 +934,26 @@ std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
   for (const auto& filter : def.filters) {
     filters.push_back(makeTokenFilterFactory(filter));
   }
-  api::AnalyzerDef effective = def;
-  if (!effective.tokenizer) effective.tokenizer = whitespace;
-  std::string json;
-  if (!api::write_json(effective, json)) throw std::runtime_error("Cannot serialize analyzer");
-  // Sort parameter objects recursively; filter order remains semantic.
-  glz::generic_sorted_u64 value;
-  if (glz::read_json(value, json)) throw std::runtime_error("Cannot canonicalize analyzer");
-  // Give the empty chain the same representation everywhere.
-  if (def.filters.empty()) value["filters"] = glz::generic_sorted_u64::array_t{};
-  if (glz::write_json(value, json)) throw std::runtime_error("Cannot serialize canonical analyzer");
-  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters), std::move(json)));
+  Accel accel;
+  if (auto* last = filters.empty() ? nullptr : dynamic_cast<const AccelFactory*>(filters.back().get())) {
+    accel = last->accel;
+    // Shingles join consecutive positions only, so a base with stacked
+    // edge_ngram tokens would lose pairs a phrase on the base still matches.
+    bool stacked = std::any_of(filters.begin(), filters.end() - 1,
+                               [](const auto& f) { return f->name == "edge_ngram"; });
+    if (accel.kind == Accel::Kind::SHINGLES && stacked) accel.kind = Accel::Kind::NONE;
+    api::AnalyzerDef base = def;
+    base.filters = def.filters.first(def.filters.size() - 1);
+    accel.baseCanonical = canonicalJson(base);
+  }
+  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters),
+                                                      canonicalJson(def), std::move(accel)));
 }
 
 Analyzer::Analyzer(std::unique_ptr<const TokenizerFactory> tok,
-                   std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical)
-    : canonical(std::move(canonical)), tokenizer(std::move(tok)),
+                   std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical,
+                   Accel accel)
+    : canonical(std::move(canonical)), accel(std::move(accel)), tokenizer(std::move(tok)),
       filters(std::move(fs)),
       fusedHead(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "nfkc_cf"),
       fusedFold(fusedHead && filters.size() > 1 && filters[1]->name == "fold"),

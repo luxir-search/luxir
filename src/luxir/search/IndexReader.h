@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <algorithm>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <utility>
@@ -86,6 +88,7 @@ public:
       uint64_t commit_time;     // first time this segment was committed as part of the index
       int32_t  max_doc;         // Number of live documents in this segment
       int32_t  live_docs;       // Number of live documents in this segment
+      uint64_t schema_gen = 0;  // Oldest schema generation any of its documents was indexed under
     };
 
     const SegmentInfo segInfo;    // metadata read from the index info file about the segment
@@ -337,6 +340,17 @@ public:
 
   std::span<Segment> segments() noexcept {
     return core->segs;
+  }
+
+  // The oldest schema generation any live document was indexed under; a
+  // representation introduced after it is missing from some documents.
+  // Absent when there are no live documents.
+  std::optional<uint64_t> oldestSchemaGen() const noexcept {
+    std::optional<uint64_t> oldest;
+    for (const auto& seg : core->segs) {
+      if (seg.numLive() > 0) oldest = std::min(oldest.value_or(seg.segInfo.schema_gen), seg.segInfo.schema_gen);
+    }
+    return oldest;
   }
 
   // Aux readers for entries in the parsed IndexInfo.aux_indexes (in the same

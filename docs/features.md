@@ -168,8 +168,12 @@ whole machine. Designed from the start for parallelism on modern hardware.
 
 - Tokenizers: Unicode word segmentation (UAX#29), whitespace, keyword.
 - Token filters: NFKC case folding, ASCII lowercase, accent and diacritic
-  folding, English possessive removal, and KStem English stemming (the
-  dictionary-based Krovetz stemmer).
+  folding, English possessive removal, KStem English stemming (the
+  dictionary-based Krovetz stemmer), edge n-grams, and shingles.
+- Prefix and phrase acceleration: a text variant that adds `edge_ngram` or
+  `shingle` to the field's analysis turns short prefix queries and exact
+  phrases into term lookups. The built-in `_sayt` template sets both up for
+  search-as-you-type.
 - The default `_t` field applies Unicode words, case folding, accent folding,
   possessive removal, and KStem. `_un` is Unicode text without stemming, `_u`
   keeps case and accents, and `_w`/`_wl` split on whitespace.

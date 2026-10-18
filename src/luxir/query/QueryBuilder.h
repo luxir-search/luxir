@@ -297,6 +297,83 @@ private:
     return term->data() == scratch.data() ? poolCopy(*term) : *term;
   }
 
+  // A sibling representation of a TEXT target whose analyzer is the target's
+  // plus a trailing edge_ngram or shingle (Analyzer::Accel) that `accepts`,
+  // and that every searched document was indexed with. Null when none is.
+  template <class Accepts>
+  const ResolvedFieldHandle* acceleratedVariant(const ResolvedFieldHandle& target,
+                                                Analyzer::Accel::Kind kind, Accepts accepts) {
+    if (!target.owner || target.fieldType->type() != FieldType::TEXT) return nullptr;
+    const std::string& base = ((TextFieldType*) target.fieldType)->analyzer_->canonical;
+    for (const auto& [label, type] : target.owner->variants) {
+      if (type.get() == target.fieldType || type->type() != FieldType::TEXT || !type->indexed()) continue;
+      const auto& accel = ((TextFieldType&) *type).analyzer_->accel;
+      if (accel.kind != kind || accel.baseCanonical != base || !accepts(accel)) continue;
+      const auto& variant = fields.resolve(target.logicalName + "__" + label, OpClass::SEARCH);
+      if (fields.coversAll(variant.physicalName)) return &variant;
+    }
+    return nullptr;
+  }
+
+  static size_t codepointCount(std::string_view text) {
+    size_t count = 0;
+    for (unsigned char c : text) count += (c & 0xC0) != 0x80;
+    return count;
+  }
+
+  // A prefix whose code point length an edge_ngram variant indexes is one
+  // term there. TermInSetQuery keeps the prefix query's automatic constant score.
+  Query* routePrefix(const ResolvedFieldHandle& target, std::string_view prefix) {
+    size_t length = codepointCount(prefix);
+    if (prefix.size() > PackedTerm::MAX_LEN) return nullptr;
+    const auto* variant = acceleratedVariant(target, Analyzer::Accel::Kind::PREFIXES,
+        [&](const Analyzer::Accel& accel) {
+          return length >= (size_t) accel.minSize && length <= (size_t) accel.maxSize;
+        });
+    if (!variant) return nullptr;
+    fields.explain(std::format("prefix: {} -> {}", target.physicalName, variant->physicalName));
+    std::string_view term = prefix;
+    return pool.make<TermInSetQuery>(poolCopy(variant->physicalName),
+                                     pool.copy_span(std::span<std::string_view>(&term, 1)));
+  }
+
+  // An exact phrase of consecutive terms against a variant that indexes word
+  // pairs: two terms are one pair term there (scored by that term's
+  // statistics), and a longer phrase keeps its own scoring but requires each
+  // of its pairs as a filter first. Slop, gaps and stacked terms fall back.
+  Query* routePhrase(const ResolvedFieldHandle& target, std::span<const std::string_view> terms,
+                     std::span<const int32_t> positions, int32_t slop, Query* phrase) {
+    if (slop != 0) return nullptr;
+    for (size_t i = 0; i < positions.size(); i++) {
+      if (positions[i] != (int32_t) i) return nullptr;
+    }
+    const auto* variant = acceleratedVariant(target, Analyzer::Accel::Kind::SHINGLES,
+        [](const Analyzer::Accel& accel) {
+          // The space never occurs inside a token joined by a tokenizer that
+          // emits more than one token per value, so pair terms cannot collide.
+          return accel.minSize == 2 && accel.separator == " ";
+        });
+    if (!variant) return nullptr;
+    std::vector<std::string_view> pairs;
+    for (size_t i = 0; i + 1 < terms.size(); i++) {
+      if (terms[i].find(' ') != std::string_view::npos || terms[i + 1].find(' ') != std::string_view::npos
+          || terms[i].size() + 1 + terms[i + 1].size() > PackedTerm::MAX_LEN) {
+        return nullptr;
+      }
+      std::string pair = std::string(terms[i]) + " " + std::string(terms[i + 1]);
+      if (!std::ranges::contains(pairs, std::string_view(pair))) pairs.push_back(poolCopy(pair));
+    }
+    fields.explain(std::format("phrase: {} -> {}", target.physicalName, variant->physicalName));
+    auto field = poolCopy(variant->physicalName);
+    if (terms.size() == 2) return pool.make<TermQuery>(field, pairs[0]);
+    auto filters = pool.make_span<Query*>(pairs.size());
+    for (size_t i = 0; i < pairs.size(); i++) filters[i] = pool.make<TermQuery>(field, pairs[i]);
+    auto mandatory = pool.make_span<Query*>(1);
+    mandatory[0] = phrase;
+    std::span<Query*> none{};
+    return pool.make<BooleanQuery>(mandatory, none, none, filters);
+  }
+
   // Collapse a term list into the right query type:
   //   0 terms -> match nothing (a phrase with no terms cannot match, and
   //              PhraseQuery itself requires >= 2 terms)
@@ -346,11 +423,13 @@ private:
     if (terms.size() == 1) {
       return pool.make<TermQuery>(field, terms[0]);
     }
-    return pool.make<PhraseQuery>(
+    Query* phrase = pool.make<PhraseQuery>(
         field,
         pool.copy_span(std::span<std::string_view>(terms.data(), terms.size())),
         pool.copy_span(std::span<int32_t>(positions.data(), positions.size())),
         slop);
+    if (Query* routed = routePhrase(target, terms, positions, slop, phrase)) return routed;
+    return phrase;
   }
 
 public:
@@ -559,6 +638,7 @@ public:
           throw std::runtime_error(std::format(
               "Prefix query requires an indexed field: {}", field));
         }
+        if (Query* routed = routePrefix(target, prefix)) return routed;
         return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix));
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
