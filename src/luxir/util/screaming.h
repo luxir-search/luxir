@@ -85,11 +85,21 @@ int64_t gallopLowerBound(int64_t lo, int64_t hi, const T& key,
 
 
 // Bucket descriptor:
-//   2:[high 16 bits]  2:[cardinality-1] 4:[ byte offset to container ]
-// if cardinality is max, store nothing (offset is meaningless)
+//   2:[high 16 bits]  2:[cardinality-1] 4:[ byte offset to container | kind flag ]
+// Container offsets are multiples of BLOCK_ALIGN, so the low bits of the offset
+// are free; bit 0 (RUN_FLAG) marks a run container.  Each bucket is one of:
+//   SPARSE:   card <= 4096, sorted uint16 values.
+//   DENSE:    card > 4096, an 8 KB bitmap followed by a rank index.
+//   RUN:      RUN_FLAG set, any card < 65536.  nRuns uint16 run starts, then
+//             nRuns uint16 cumulative cardinalities before each run (so rank is
+//             arithmetic, no summing of run lengths), zero padding, and nRuns as
+//             the block's last uint16 (read via the next block's offset).  A
+//             run's length is the next run's cumulative count (or the bucket
+//             card for the last run) minus its own.
+//   ALL_ONES: card == 65536, no payload.
+// The builder picks the smallest container per bucket (Roaring's rule) and
+// keeps the array/bitmap container on ties.
 // if cardinality is 1 or 2, we could inline those values in the offset. (set the pointer to the offset itself... no need to change nextValue code)
-// if cardinality is 65536-(1 or 2) then we could inline the negative in the offset
-// since offsets will always be even, we have a spare bit there if we need it.
 //
 // Idea: if the bucket list itself is very dense, we could go ahead and make it direct mapped so random lookups would be faster.
 // We would just need an extra bucket to signify that it's an empty bucket.
@@ -439,7 +449,6 @@ public:
   static constexpr uint32_t BUCKET_SIZE = 1 << BUCKET_BITS; // buckets should be 65536 wide, with all vals sharing top 16 bits
   static constexpr uint32_t BUCKET_MASK_UPPERBITS = 0xFFFFFFFF << BUCKET_BITS; // 0xFFFF0000
   static constexpr uint32_t BUCKET_SPARSE_MAX = BUCKET_SIZE / 8 / sizeof(uint16_t);   // max cardinality to express as sparse bucket
-  static constexpr uint32_t BUCKET_NEG_MIN = BUCKET_SIZE - BUCKET_SIZE / 8; // min cardinality to express as neg set
   using Bits = OpenBitSet<BUCKET_SIZE, uint64_t, uint32_t>; // type for the bits only of a bit bucket
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
@@ -462,6 +471,31 @@ public:
   static_assert(DENSE_CONTAINER_SIZE % BLOCK_ALIGN == 0,
                 "dense blocks must preserve the block alignment invariant");
 
+  // Low bit of BucketDescriptor::offset that marks a run container.
+  static constexpr uint32_t RUN_FLAG = 1;
+  static_assert(RUN_FLAG < BLOCK_ALIGN, "the kind flag must fit below the block alignment");
+  // The builder stages a run container's two uint16 arrays in one 8 KB
+  // container buffer, which caps the run count.  At the cap a run container
+  // is within 3% of a bitmap's size, so the cap only drops near-ties.
+  static constexpr uint32_t RUN_MAX = SPARSE_CONTAINER_SIZE / (2 * sizeof(uint16_t));
+
+  enum Kind : uint8_t {
+    SPARSE,
+    DENSE,
+    RUN,
+    ALL_ONES
+  };
+
+  // Bytes of a run container with nRuns runs, including padding.
+  static constexpr uint32_t runBlockBytes(uint32_t nRuns) {
+    return (nRuns * 2 * sizeof(uint16_t) + sizeof(uint16_t) + BLOCK_ALIGN - 1) & ~(BLOCK_ALIGN - 1);
+  }
+
+  // Bytes of a sparse (array) container with card values, including padding.
+  static constexpr uint32_t sparseBlockBytes(uint32_t card) {
+    return (card * sizeof(uint16_t) + BLOCK_ALIGN - 1) & ~(BLOCK_ALIGN - 1);
+  }
+
   // A dense bucket stores its bitset words immediately followed by a
   // cumulative-popcount rank index (RANK_INDEX_ENTRIES uint16s; see
   // Builder::flushBucket).  This is the single source of where that index lives:
@@ -478,12 +512,38 @@ public:
   typedef struct {
     uint16_t upperBits; // upper 16 bits of all values in this bucket
     uint16_t size;      // cardinality of this bucket minus 1
-    uint32_t offset;    // location of the data for this bucket
+    uint32_t offset;    // location of the data for this bucket, ORed with RUN_FLAG for a run container
   } BucketDescriptor;
+
+  // A full bucket of 65536 values needs no container; its rank is arithmetic.
+  // Iterators treat it as a run container holding this one run.
+  static constexpr uint16_t ALL_ONES_RUN[2] = {0, 0};  // start 0, cumulative 0
 
   const char* start;
   const BucketDescriptor* descriptors;
   uint16_t nBuckets;
+
+  static constexpr Kind kindOf(const BucketDescriptor& desc) {
+    if (desc.offset & RUN_FLAG) return RUN;
+    uint32_t card = (uint32_t)desc.size + 1;
+    if (card <= BUCKET_SPARSE_MAX) return SPARSE;
+    return card == BUCKET_SIZE ? ALL_ONES : DENSE;
+  }
+
+  Kind bucketKind(int32_t bi) const {
+    return kindOf(descriptors[bi]);
+  }
+
+  const char* container(const BucketDescriptor& desc) const {
+    return start + (desc.offset & ~(BLOCK_ALIGN - 1));
+  }
+
+  // Run count of the run container in bucket bi.  The count is the block's
+  // last uint16, so it sits just before the next block (or the descriptors).
+  uint32_t runCount(int32_t bi) const {
+    const char* end = bi + 1 < nBuckets ? container(descriptors[bi + 1]) : (const char*)descriptors;
+    return ((const uint16_t*)end)[-1];
+  }
 
   BitSet() {
     // if nBuckets==0, none of the other pointers are touched
@@ -511,7 +571,10 @@ public:
     }
     // the size of all the buckets is the offset of the last bucket plus the size of that bucket
     auto lastDescriptor = descriptors[nBuckets - 1];
-    auto sizeOfAllBuckets = lastDescriptor.offset + blockBytes(lastDescriptor);
+    uint32_t lastBytes = kindOf(lastDescriptor) == RUN
+        ? runBlockBytes(((const uint16_t*)descriptors)[-1])
+        : blockBytes(lastDescriptor);
+    auto sizeOfAllBuckets = (lastDescriptor.offset & ~(BLOCK_ALIGN - 1)) + lastBytes;
     start = ((char*)descriptors) - sizeOfAllBuckets;
     assert((reinterpret_cast<uintptr_t>(start) & (BLOCK_ALIGN - 1)) == 0);
   }
@@ -542,9 +605,18 @@ public:
       // uint8_t wordShift;  // how much currWord as been right shifted already
     } DenseBucket;
 
+    // Also used for ALL_ONES buckets, as one run over ALL_ONES_RUN.
+    typedef struct {
+      const uint16_t *starts;  // run starts; the cumulative counts follow at starts + nRuns
+      int32_t nRuns;
+      int32_t index;           // current run, -1 before the first
+      int32_t end;             // exclusive absolute end of the current run
+    } RunBucket;
+
     union Bucket {
       SparseBucket sparse;
       DenseBucket bits;
+      RunBucket run;
 
       Bucket() : sparse{nullptr, -1} {}
 
@@ -555,13 +627,17 @@ public:
       void setDense(Bits::word_type* words) {
         std::construct_at(&bits, DenseBucket{Bits(words)});
       }
+
+      void setRun(const uint16_t* starts, int32_t nRuns, int32_t end) {
+        std::construct_at(&run, RunBucket{starts, nRuns, -1, end});
+      }
     } bucket;
 
     // enum that takes 16 bits
     enum BucketType : std::uint8_t {
       SPARSE,
       DENSE,
-      NEGATIVE
+      RUN
     };
 
     BucketType bucketType;
@@ -593,6 +669,11 @@ public:
           return sparseNext();
         case DENSE:
           return denseNextMaybe();
+        case RUN:
+          if (curr + 1 < bucket.run.end) {
+            return ++curr;
+          }
+          return runNextRun();
       }
       std::unreachable();
     }
@@ -634,6 +715,13 @@ public:
         case DENSE:
           curr = target - 1;
           return denseNextMaybe();
+        case RUN:
+          if (target < bucket.run.end) {
+            // still inside the current run (target > curr >= its start)
+            curr = target;
+            return curr;
+          }
+          return runAdvance(target);
       }
       std::unreachable();
     }
@@ -671,6 +759,54 @@ public:
       return nextBucket();
     }
 
+    // Moves to the first value of the next run, or the next bucket.
+    int32_t runNextRun() {
+      int32_t i = bucket.run.index + 1;
+      if (i >= bucket.run.nRuns) {
+        return nextBucket();
+      }
+      enterRun(i);
+      curr = bucketBase + bucket.run.starts[i];
+      return curr;
+    }
+
+    // target is in this run bucket and at or past the current run's end.
+    // Gallop the run starts from the cursor for the last run starting at or
+    // before target.
+    int32_t runAdvance(int32_t target) {
+      int32_t from = bucket.run.index + 1;
+      const uint16_t* starts = bucket.run.starts;
+      const uint16_t* endPtr = starts + bucket.run.nRuns;
+      auto lowerBits = (uint16_t) target;
+      int32_t i = (int32_t)(gallopLowerBound(starts + from, endPtr, lowerBits) - starts);
+      if (i < bucket.run.nRuns && starts[i] == lowerBits) {
+        enterRun(i);
+        curr = target;
+        return curr;
+      }
+      if (i > from) {
+        // run i-1 starts before target; it may still cover it
+        enterRun(i - 1);
+        if (target < bucket.run.end) {
+          curr = target;
+          return curr;
+        }
+      }
+      if (i < bucket.run.nRuns) {
+        enterRun(i);
+        curr = bucketBase + starts[i];
+        return curr;
+      }
+      return nextBucket();
+    }
+
+    void enterRun(int32_t i) {
+      const uint16_t* cums = bucket.run.starts + bucket.run.nRuns;
+      int32_t nextCum = i + 1 < bucket.run.nRuns ? cums[i + 1] : bucketSize;
+      bucket.run.index = i;
+      bucket.run.end = bucketBase + bucket.run.starts[i] + nextCum - cums[i];
+    }
+
     // NOTE: if one is calling next() followed by rank(), it's more efficient to just increment the previous rank by 1.
     // This is only useful in conjunction with advance.
     int32_t rank() {
@@ -680,6 +816,12 @@ public:
       switch (bucketType) {
         case SPARSE:
           return bucketRank + bucket.sparse.index;
+        case RUN: {
+          // values before the run, plus the offset within it
+          int32_t i = bucket.run.index;
+          const uint16_t* cums = bucket.run.starts + bucket.run.nRuns;
+          return bucketRank + cums[i] + (curr - bucketBase - bucket.run.starts[i]);
+        }
         case DENSE:
           // if bit buckets were 64 byte aligned, then every miniblock of 8 words would be exactly a cache line.
           auto localIndex = uint16_t(curr);
@@ -716,23 +858,13 @@ public:
         return curr;
       }
       bucketRank += bucketSize; // bucketSize is the size of the current bucket, before we advance to the next.
-
-      bucketIdx++;
-      const BucketDescriptor& desc = set->descriptors[bucketIdx];
-      bucketBase = desc.upperBits << BUCKET_BITS;
-      bucketSize = desc.size + 1;
-      if (bucketSize <= BUCKET_SPARSE_MAX) {
-        bucketType = SPARSE;
-        bucket.setSparse((uint16_t*)(set->start + desc.offset));
-        return sparseNext();
-      } else {
-        bucketType = DENSE;
-        assert((reinterpret_cast<uintptr_t>(set->start + desc.offset)
-                & (BLOCK_ALIGN - 1)) == 0);
-        bucket.setDense((Bits::word_type*)(set->start + desc.offset));
-        curr = bucketBase - 1;
-        return denseNext();
+      bucketSetup(bucketIdx + 1);
+      switch (bucketType) {
+        case SPARSE: return sparseNext();
+        case DENSE: return denseNext();
+        case RUN: return runNextRun();
       }
+      std::unreachable();
     }
 
     bool advanceBucket(int32_t targetBase) {
@@ -749,21 +881,34 @@ public:
       return false;
     }
 
+    // Enters bucket bucketIndex positioned before its first value.
     void bucketSetup(int bucketIndex) {
       bucketIdx = bucketIndex;
       const BucketDescriptor& desc = set->descriptors[bucketIdx];
       bucketBase = desc.upperBits << BUCKET_BITS;
       bucketSize = desc.size + 1;
-      if (bucketSize <= BUCKET_SPARSE_MAX) {
-        bucketType = SPARSE;
-        bucket.setSparse((uint16_t*)(set->start + desc.offset));
-      } else {
-        bucketType = DENSE;
-        assert((reinterpret_cast<uintptr_t>(set->start + desc.offset)
-                & (BLOCK_ALIGN - 1)) == 0);
-        bucket.setDense((Bits::word_type*)(set->start + desc.offset));
-        curr = bucketBase - 1;
+      curr = bucketBase - 1;
+      const char* data = set->container(desc);
+      switch (kindOf(desc)) {
+        case Kind::SPARSE:
+          bucketType = SPARSE;
+          bucket.setSparse((uint16_t*)data);
+          return;
+        case Kind::DENSE:
+          bucketType = DENSE;
+          assert((reinterpret_cast<uintptr_t>(data) & (BLOCK_ALIGN - 1)) == 0);
+          bucket.setDense((Bits::word_type*)data);
+          return;
+        case Kind::RUN:
+          bucketType = RUN;
+          bucket.setRun((const uint16_t*)data, (int32_t)set->runCount(bucketIdx), bucketBase);
+          return;
+        case Kind::ALL_ONES:
+          bucketType = RUN;
+          bucket.setRun(ALL_ONES_RUN, 1, bucketBase);
+          return;
       }
+      std::unreachable();
     }
 
   }; // end Iterator
@@ -812,18 +957,33 @@ protected:
     int32_t bucketBase = (int32_t)desc.upperBits << BUCKET_BITS;
     int32_t card = (int32_t)desc.size + 1;
     assert(localRank >= 0 && localRank < card);
-    if (card <= (int32_t)BUCKET_SPARSE_MAX) {
-      // Sparse bucket: a sorted uint16 array, so the localRank-th value is direct.
-      const uint16_t* vals = (const uint16_t*)(start + desc.offset);
-      return bucketBase + (int32_t)vals[localRank];
+    switch (kindOf(desc)) {
+      case SPARSE: {
+        // Sparse bucket: a sorted uint16 array, so the localRank-th value is direct.
+        const uint16_t* vals = (const uint16_t*)container(desc);
+        return bucketBase + (int32_t)vals[localRank];
+      }
+      case ALL_ONES:
+        return bucketBase + localRank;
+      case RUN: {
+        // The owning run is the last one whose cumulative count is <= localRank.
+        int32_t nRuns = (int32_t)runCount(bi);
+        const uint16_t* starts = (const uint16_t*)container(desc);
+        const uint16_t* cums = starts + nRuns;
+        auto* up = luxir::BranchlessIndex<uint16_t>::upperBound(cums, (size_t)nRuns, localRank);
+        int32_t r = (int32_t)(up - cums) - 1;
+        return bucketBase + (int32_t)starts[r] + localRank - (int32_t)cums[r];
+      }
+      case DENSE:
+        break;
     }
     // Dense bucket: a bitset block followed by the cumulative-popcount rank index
     // (one uint16 per 1<<RANK_INDEX_SHIFT words; entry m == popcount of the words
     // before mini-block m, with the final mini-block intentionally uncounted).
     // Binary-search the index to the owning mini-block, scan its words to the
     // owning word, then select within that word.  Mirrors Iterator::rank().
-    assert((reinterpret_cast<uintptr_t>(start + desc.offset) & (BLOCK_ALIGN - 1)) == 0);
-    const Bits::word_type* words = (const Bits::word_type*)(start + desc.offset);
+    assert((reinterpret_cast<uintptr_t>(container(desc)) & (BLOCK_ALIGN - 1)) == 0);
+    const Bits::word_type* words = (const Bits::word_type*)container(desc);
     const uint16_t* rankIndexArr = denseRankIndex(words);
     // largest m with rankIndexArr[m] <= localRank == (first m with rankIndexArr[m] > localRank) - 1
     auto* up = luxir::BranchlessIndex<uint16_t>::upperBound(rankIndexArr, RANK_INDEX_ENTRIES, localRank);
@@ -851,17 +1011,20 @@ protected:
 #endif
   }
 
-  // The number of bytes taken up by a block, including its alignment padding
-  // (every block occupies a multiple of BLOCK_ALIGN bytes - see the invariant
-  // comment above; the builder's flushBucket writes matching padding).
+  // The number of bytes taken up by a non-run block, including its alignment
+  // padding (every block occupies a multiple of BLOCK_ALIGN bytes - see the
+  // invariant comment above; the builder's flushBucket writes matching padding).
+  // A run block's size depends on its run count; see runBlockBytes().
   // NOTE: this requires knowing if a rank index is being used for dense blocks!
-  static constexpr int blockBytes(const BucketDescriptor& desc) {
-    int sz = (int)desc.size + 1;
-    if (sz <= BUCKET_SPARSE_MAX) {
-      return (int)((sz * sizeof(uint16_t) + BLOCK_ALIGN - 1) & ~(size_t)(BLOCK_ALIGN - 1));
-    } else {
-      return DENSE_CONTAINER_SIZE;
+  static constexpr uint32_t blockBytes(const BucketDescriptor& desc) {
+    switch (kindOf(desc)) {
+      case SPARSE: return sparseBlockBytes((uint32_t)desc.size + 1);
+      case DENSE: return DENSE_CONTAINER_SIZE;
+      case ALL_ONES: return 0;
+      case RUN: break;
     }
+    assert(false && "run block size needs its run count");
+    return 0;
   }
 
 };
@@ -1038,18 +1201,30 @@ protected:
     desc.size = bucketSize - 1;
     desc.offset = bucketStart;
 
-    if (bucketSize <= BitSet::BUCKET_SPARSE_MAX) {
-      // TODO: if (nVals <= 2) {}
-      writeSize = bucketSize * sizeof(uint16_t);
-      write((void *) values, writeSize);
-      // Pad every block to BLOCK_ALIGN so dense-bucket words (and the trailing
-      // descriptor array) stay 8-aligned; blockBytes() reports the padded size.
-      static constexpr char zeros[BitSet::BLOCK_ALIGN] = {};
-      uint32_t pad = (BitSet::BLOCK_ALIGN - (writeSize & (BitSet::BLOCK_ALIGN - 1)))
-                     & (BitSet::BLOCK_ALIGN - 1);
-      if (pad > 0) {
-        write((void *) zeros, pad);
-        writeSize += pad;
+    // Pick the smallest container (Roaring's rule), keeping the array or
+    // bitmap on ties since they iterate without the run bookkeeping.
+    if (bucketSize == BitSet::BUCKET_SIZE) {
+      // ALL_ONES: the descriptor alone says it all
+      writeSize = 0;
+    } else if (bucketSize <= BitSet::BUCKET_SPARSE_MAX) {
+      uint32_t nRuns = sparseRunCount();
+      if (BitSet::runBlockBytes(nRuns) < BitSet::sparseBlockBytes(bucketSize)) {
+        // the bitmap buffer is unused for a sparse bucket, so stage the runs there
+        uint16_t* runs = (uint16_t*)bits.words;
+        sparseRuns(runs, nRuns);
+        writeSize = writeRuns(runs, nRuns);
+        desc.offset |= BitSet::RUN_FLAG;
+      } else {
+        // TODO: if (nVals <= 2) {}
+        writeSize = bucketSize * sizeof(uint16_t);
+        write((void *) values, writeSize);
+        // Pad every block to BLOCK_ALIGN so dense-bucket words (and the trailing
+        // descriptor array) stay 8-aligned; blockBytes() reports the padded size.
+        uint32_t pad = BitSet::sparseBlockBytes(bucketSize) - writeSize;
+        if (pad > 0) {
+          write((void *) zeros, pad);
+          writeSize += pad;
+        }
       }
     } else {
       // fill in the rest of the bits from the buffered values
@@ -1057,39 +1232,127 @@ protected:
         bits.set(values[i]);
       }
 
-      // TODO: store as negative set if too big
-      writeSize = Bits::sizeInBytes;
-
-      if (rankIndex) {
-        writeSize = BitSet::DENSE_CONTAINER_SIZE;
-        uint16_t* rankIndexArr = BitSet::denseRankIndex(bits.words);
-        uint16_t cumulativeRank = 0;
-        constexpr uint32_t wordsPerCount = (1<<BitSet::RANK_INDEX_SHIFT);
-        // The count represents the cumulative popcnt of the *previous* block, i.e. the first is 0.
-        // We could get rid of that count, at the cost of extra logic.  For iterators, we could also calculate rank
-        // from the nearest count (i.e. not always rounding down), but that logic would likely make things slower
-        // rather than faster. POPCNT on modern processors is fast and the extra branch mispredictions
-        // and code complexity prob wouldn't be worth it.
-        rankIndexArr[0] = 0;
-        // Don't count the last block... it would never be used in our current round-down scheme in the iterator.
-        // This also prevents cumulativeRank from overflowing 16 bits.  The other way to prevent it is to
-        // implement the all-bits-set optimization of skipping the block entirely.
-        for (int i=0; i<bits.fixedNumWords - wordsPerCount; i += wordsPerCount) {
-          int rank = 0;
-          for (int j=i; j < i + wordsPerCount; j++) {
-            rank += std::popcount(bits.words[j]);
-          }
-          cumulativeRank += rank;
-          rankIndexArr[(i>>BitSet::RANK_INDEX_SHIFT) + 1] = cumulativeRank;
-        }
+      uint32_t nRuns = denseRunCount();
+      if (nRuns <= BitSet::RUN_MAX && BitSet::runBlockBytes(nRuns) < BitSet::DENSE_CONTAINER_SIZE) {
+        // the values have been copied into the bitmap, so stage the runs there
+        denseRuns(values, nRuns);
+        writeSize = writeRuns(values, nRuns);
+        desc.offset |= BitSet::RUN_FLAG;
+      } else {
+        writeSize = denseWrite();
       }
-
-      write(bits.words, writeSize);
     }
 
     numBuckets++;
     bucketStart += writeSize;
     bucketSize = 0;
+  }
+
+  static constexpr char zeros[BitSet::BLOCK_ALIGN] = {};
+
+  // Writes the bitmap container plus its rank index.
+  uint32_t denseWrite() {
+    uint32_t writeSize = Bits::sizeInBytes;
+
+    if (rankIndex) {
+      writeSize = BitSet::DENSE_CONTAINER_SIZE;
+      uint16_t* rankIndexArr = BitSet::denseRankIndex(bits.words);
+      uint16_t cumulativeRank = 0;
+      constexpr uint32_t wordsPerCount = (1<<BitSet::RANK_INDEX_SHIFT);
+      // The count represents the cumulative popcnt of the *previous* block, i.e. the first is 0.
+      // We could get rid of that count, at the cost of extra logic.  For iterators, we could also calculate rank
+      // from the nearest count (i.e. not always rounding down), but that logic would likely make things slower
+      // rather than faster. POPCNT on modern processors is fast and the extra branch mispredictions
+      // and code complexity prob wouldn't be worth it.
+      rankIndexArr[0] = 0;
+      // Don't count the last block... it would never be used in our current round-down scheme in the iterator.
+      // This also prevents cumulativeRank from overflowing 16 bits (a full bucket is ALL_ONES and has no block).
+      for (int i=0; i<bits.fixedNumWords - wordsPerCount; i += wordsPerCount) {
+        int rank = 0;
+        for (int j=i; j < i + wordsPerCount; j++) {
+          rank += std::popcount(bits.words[j]);
+        }
+        cumulativeRank += rank;
+        rankIndexArr[(i>>BitSet::RANK_INDEX_SHIFT) + 1] = cumulativeRank;
+      }
+    }
+
+    write(bits.words, writeSize);
+    return writeSize;
+  }
+
+  uint32_t sparseRunCount() const {
+    uint32_t nRuns = 1;
+    for (uint32_t i = 1; i < bucketSize; i++) {
+      nRuns += (int32_t)values[i] != (int32_t)values[i - 1] + 1;
+    }
+    return nRuns;
+  }
+
+  // A run starts at each set bit whose lower neighbor is clear.
+  uint32_t denseRunCount() const {
+    uint32_t nRuns = 0;
+    uint64_t carry = 0;
+    for (uint32_t i = 0; i < Bits::fixedNumWords; i++) {
+      uint64_t word = bits.words[i];
+      nRuns += std::popcount(word & ~((word << 1) | carry));
+      carry = word >> 63;
+    }
+    return nRuns;
+  }
+
+  // Fills runs[0, nRuns) with run starts and runs[nRuns, 2 * nRuns) with the
+  // number of values before each run.
+  void sparseRuns(uint16_t* runs, uint32_t nRuns) const {
+    uint32_t k = 0;
+    for (uint32_t i = 0; i < bucketSize; i++) {
+      if (i == 0 || (int32_t)values[i] != (int32_t)values[i - 1] + 1) {
+        runs[k] = values[i];
+        runs[nRuns + k] = (uint16_t)i;
+        k++;
+      }
+    }
+    assert(k == nRuns);
+  }
+
+  void denseRuns(uint16_t* runs, uint32_t nRuns) const {
+    uint32_t k = 0, rank = 0, runStart = 0;
+    uint64_t carry = 0;
+    for (uint32_t i = 0; i < Bits::fixedNumWords; i++) {
+      uint64_t word = bits.words[i];
+      uint64_t lower = (word << 1) | carry;  // bit j holds bit j-1
+      uint64_t startBits = word & ~lower;
+      uint64_t endBits = ~word & lower;       // first clear bit after a run
+      carry = word >> 63;
+      // starts and ends alternate in bit order
+      for (uint64_t events = startBits | endBits; events != 0; events &= events - 1) {
+        uint32_t pos = (i << Bits::wordShift) + (uint32_t)std::countr_zero(events);
+        if (startBits & events & (~events + 1)) {
+          runStart = pos;
+          runs[k] = (uint16_t)pos;
+          runs[nRuns + k] = (uint16_t)rank;
+          k++;
+        } else {
+          rank += pos - runStart;
+        }
+      }
+    }
+    assert(k == nRuns);
+  }
+
+  // Writes a run container staged by sparseRuns/denseRuns: both arrays, zero
+  // padding, then the run count as the block's last uint16.
+  uint32_t writeRuns(uint16_t* runs, uint32_t nRuns) {
+    uint32_t arrayBytes = nRuns * 2 * sizeof(uint16_t);
+    uint32_t blockBytes = BitSet::runBlockBytes(nRuns);
+    write((void *) runs, arrayBytes);
+    uint32_t pad = blockBytes - arrayBytes - sizeof(uint16_t);
+    if (pad > 0) {
+      write((void *) zeros, pad);
+    }
+    uint16_t count = (uint16_t)nRuns;
+    write(&count, sizeof(uint16_t));
+    return blockBytes;
   }
 
 

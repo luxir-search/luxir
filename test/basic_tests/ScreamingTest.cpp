@@ -3,6 +3,8 @@
 
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#include <iterator>
 #include <iostream>
 #include <vector>
 #include <random>
@@ -53,6 +55,7 @@ public:
     int base = 0; // the base of the current bucket
     int curr = -1;  // the current value added
     int nAdds = 0;
+    std::vector<int32_t> added;  // every value, in order
 
     explicit BldBase(const Rng& rng = LuxirTest::rng) : rng(rng) {
       buf.resize(screaming::BitSet::Bits::fixedNumWords);
@@ -71,6 +74,7 @@ public:
       curr = val;
       addHash = addHash * 31 + val;
       virtAdd(val);
+      added.push_back(val);
       nAdds++;
     }
 
@@ -141,11 +145,38 @@ public:
           // just over the number of entries to transition to a bitmap
           int card = (int) (screaming::BitSet::BUCKET_SPARSE_MAX + 1 + rng.rint(3));
           addSmallBucket(card);
-        } else {
+        } else if (r < 75) {
           // random bucket
           addMidBucket();
+        } else if (r < 90) {
+          addRunBucket(1 + rng.rint(3000));
+        } else {
+          addFullBucket(rng.rint(3));
         }
       }
+    }
+
+    // nRuns runs of random length at random spots, one per equal slice of the bucket.
+    void addRunBucket(int nRuns) {
+      if (base < 0) return;
+      int64_t slice = 65536 / nRuns;
+      for (int64_t r = 0; r < nRuns; r++) {
+        int64_t first = base + r * slice + rng.rint(slice / 2 + 1);
+        int64_t len = 1 + rng.rint(slice / 2 + 1);
+        for (int64_t v = first; v < first + len && v <= bucketMax(); v++) add((int)v);
+      }
+      nextBucket();
+    }
+
+    // The whole bucket, minus a few random holes.
+    void addFullBucket(int holes = 0) {
+      if (base < 0) return;
+      std::vector<int> skip;
+      for (int i = 0; i < holes; i++) skip.push_back(base + rng.rint(65536));
+      for (int64_t v = base; v <= bucketMax(); v++) {
+        if (std::find(skip.begin(), skip.end(), (int)v) == skip.end()) add((int)v);
+      }
+      nextBucket();
     }
 
     void addMidBucket() {
@@ -517,10 +548,9 @@ TEST_F(ScreamingTest, denseBucketAlignment) {
                   & (screaming::BitSet::BLOCK_ALIGN - 1), 0u);
     int denseSeen = 0;
     for (int i = 0; i < bs.nBuckets; i++) {
-      const auto& desc = bs.descriptors[i];
-      if ((uint32_t)desc.size + 1 > screaming::BitSet::BUCKET_SPARSE_MAX) {
+      if (bs.bucketKind(i) == screaming::BitSet::DENSE) {
         denseSeen++;
-        ASSERT_EQ(reinterpret_cast<uintptr_t>(bs.start + desc.offset)
+        ASSERT_EQ(reinterpret_cast<uintptr_t>(bs.container(bs.descriptors[i]))
                       & (screaming::BitSet::BLOCK_ALIGN - 1), 0u);
       }
     }
@@ -613,6 +643,101 @@ TEST_F(ScreamingTest, select) {
   set.addSmallBucket((int)(screaming::BitSet::BUCKET_SPARSE_MAX + 1 + rng.rint(3))); // just-dense
   set.finishBuild();
   ASSERT_TRUE(set.verifyIteratorSkips());
+}
+
+// Each bucket gets the smallest container: array, bitmap, runs, or nothing
+// for a full bucket. Ties keep the array/bitmap.
+TEST_F(ScreamingTest, containerKinds) {
+  using BS = screaming::BitSet;
+  auto addRange = [](BldBase& set, int first, int len) {
+    for (int v = first; v < first + len; v++) set.add(v);
+  };
+  SStreamBuilder set;
+  std::vector<BS::Kind> expected;
+  auto bucket = [&](BS::Kind kind, auto fill) {
+    fill();
+    set.nextBucket();
+    expected.push_back(kind);
+  };
+  bucket(BS::SPARSE, [&] { for (int i = 0; i < 100; i++) set.add(set.base + i * 7); });
+  bucket(BS::SPARSE, [&] { addRange(set, set.base, 4); });                // run 8 bytes == array 8
+  bucket(BS::RUN, [&] { addRange(set, set.base + 9, 5); });               // run 8 < array 16
+  bucket(BS::SPARSE, [&] { addRange(set, set.base, 2); addRange(set, set.base + 9, 2); }); // 16 vs 8
+  bucket(BS::RUN, [&] { addRange(set, set.base + 100, 3000); addRange(set, set.base + 5000, 1000); });
+  bucket(BS::DENSE, [&] { for (int i = 0; i < 65536; i += 2) set.add(set.base + i); });
+  // 2048 runs (8200 bytes) still beat the 8448 byte bitmap; 2049 exceed RUN_MAX
+  bucket(BS::RUN, [&] { for (int i = 0; i < (int)BS::RUN_MAX; i++) addRange(set, set.base + i * 31, 3); });
+  bucket(BS::DENSE, [&] { for (int i = 0; i <= (int)BS::RUN_MAX; i++) addRange(set, set.base + i * 31, 3); });
+  bucket(BS::ALL_ONES, [&] { addRange(set, set.base, 65536); });
+  bucket(BS::RUN, [&] { addRange(set, set.base, 65535); });               // full but the last value
+  bucket(BS::RUN, [&] { addRange(set, set.base + 1, 65535); });           // full but the first value
+  bucket(BS::RUN, [&] { addRange(set, set.base, 300); addRange(set, set.base + 301, 65235); });
+  bucket(BS::ALL_ONES, [&] { addRange(set, set.base, 65536); });          // last bucket has no payload
+  set.finishBuild();
+
+  ASSERT_EQ((int)set.bitset->nBuckets, (int)expected.size());
+  for (int i = 0; i < (int)expected.size(); i++) {
+    EXPECT_EQ(expected[i], set.bitset->bucketKind(i)) << "bucket " << i;
+  }
+  ASSERT_TRUE(set.verifyIteratorSkips());
+
+  // Every value of a run bucket and its neighbors, via advance from a fresh iterator.
+  for (int32_t target : {(4 << 16) + 99, (4 << 16) + 100, (4 << 16) + 3100, (4 << 16) + 4999,
+                         (4 << 16) + 5999, (4 << 16) + 6000, (11 << 16) + 300}) {
+    BS::Iterator it(*set.bitset);
+    auto lb = std::lower_bound(set.added.begin(), set.added.end(), target);
+    ASSERT_EQ(*lb, it.advance(target));
+    EXPECT_EQ((int32_t)(lb - set.added.begin()), it.rank());
+  }
+}
+
+// Advance-driven intersection (leapfrog) and next()-driven union over sets
+// whose buckets mix every container kind.
+TEST_F(ScreamingTest, mixedKindIntersectionAndUnion) {
+  using BS = screaming::BitSet;
+  for (int trial = 0; trial < 8; trial++) {
+    SStreamBuilder a(Rng(trial * 2)), b(Rng(trial * 2 + 1));
+    for (BldBase* set : {(BldBase*)&a, (BldBase*)&b}) {
+      for (int i = 0; i < 6; i++) set->addBucket();
+      set->finishBuild();
+    }
+
+    std::vector<int32_t> expected;
+    std::set_intersection(a.added.begin(), a.added.end(), b.added.begin(), b.added.end(),
+                          std::back_inserter(expected));
+    std::vector<int32_t> got;
+    BS::Iterator ia(*a.bitset), ib(*b.bitset);
+    int32_t x = ia.next(), y = ib.next();
+    while (x != BS::END && y != BS::END) {
+      if (x < y) {
+        x = ia.advance(y);
+      } else if (y < x) {
+        y = ib.advance(x);
+      } else {
+        got.push_back(x);
+        EXPECT_EQ(x, a.added[(size_t)ia.rank()]);
+        EXPECT_EQ(x, b.added[(size_t)ib.rank()]);
+        x = ia.next();
+        y = ib.next();
+      }
+    }
+    EXPECT_EQ(expected, got);
+
+    expected.clear();
+    std::set_union(a.added.begin(), a.added.end(), b.added.begin(), b.added.end(),
+                   std::back_inserter(expected));
+    got.clear();
+    BS::Iterator ua(*a.bitset), ub(*b.bitset);
+    x = ua.next();
+    y = ub.next();
+    while (x != BS::END || y != BS::END) {
+      int32_t v = std::min(x, y);
+      got.push_back(v);
+      if (x == v) x = ua.next();
+      if (y == v) y = ub.next();
+    }
+    EXPECT_EQ(expected, got);
+  }
 }
 
 TEST_F(ScreamingTest, selectSingleValue) {
