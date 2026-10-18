@@ -3,6 +3,7 @@
 
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -249,6 +250,82 @@ void BM_NumericRangePointsSize(benchmark::State& state, FieldShape shape) {
   state.counters["points"] = (double)points;
 }
 
+// Time-sorted timestamps with arrival jitter: every block is a linear fit,
+// so each range edge lands in a crossing linear-fit block. Many small ranges
+// (per-bucket domains, multi-range filters) multiply those edges.
+class TimeSortedBenchIndex {
+  TestIndex index;
+  int32_t numDocs;
+
+public:
+  static constexpr std::string_view FIELD = "range_time_sorted_i";
+  static constexpr int64_t START = 1'700'000'000'000;
+  static constexpr int64_t STEP = 10;
+  static constexpr int64_t JITTER = 100;
+
+  TimeSortedBenchIndex()
+      : numDocs(luxir::unit_tests
+            ? (int32_t)LuxirTest::scaleTestWork(20'480)
+            : 1'024'000) {
+    Inverter& inverter = index.getInverter();
+    auto& field = inverter.getIndexHandler(FIELD);
+    SplitMix64 rng(0x7135);
+    for (int32_t doc = 0; doc < numDocs; doc++) {
+      inverter.startDoc();
+      field.index(inverter, START + (int64_t)doc * STEP
+                                + (int64_t)rng.rint(JITTER));
+      inverter.finishDoc();
+    }
+    index.flush();
+    index.initReader();
+  }
+
+  TestIndex& getIndex() { return index; }
+  int32_t docCount() const { return numDocs; }
+};
+
+TimeSortedBenchIndex& timeSortedIndex() {
+  static TimeSortedBenchIndex fixture;
+  return fixture;
+}
+
+// state.range(0) disjoint ranges tile the middle half of the column; each
+// matches about a block's worth of docs.
+void BM_NumericRangeTimeSorted(benchmark::State& state, BenchArm arm) {
+  auto& fixture = timeSortedIndex();
+  int32_t ranges = (int32_t)state.range(0);
+  int64_t width = std::max<int64_t>(
+      1, (int64_t)fixture.docCount() / 2 / ranges);
+  int64_t first = TimeSortedBenchIndex::START
+      + (int64_t)fixture.docCount() / 4 * TimeSortedBenchIndex::STEP;
+  auto run = [&](BenchArm runArm) {
+    MemPool pool;
+    Query::Context context(pool, *fixture.getIndex().reader);
+    auto& segment = fixture.getIndex().reader->segments()[0];
+    int64_t count = 0;
+    for (int32_t i = 0; i < ranges; i++) {
+      int64_t lo = first + i * width * TimeSortedBenchIndex::STEP;
+      int64_t hi = lo + width * TimeSortedBenchIndex::STEP - 1;
+      NumericPredicateQuery query(TimeSortedBenchIndex::FIELD, lo, hi);
+      auto* weight = static_cast<NumericPredicateQuery::Weight*>(
+          query.createWeight(context, 0));
+      count += countMatches(createScorer(*weight, pool, segment, runArm));
+    }
+    return count;
+  };
+  int64_t baseline = run(FULLSCAN_FORCED);
+  for (auto _ : state) {
+    int64_t count = run(arm);
+    benchmark::DoNotOptimize(count);
+    if (count != baseline) {
+      state.SkipWithError("time-sorted range arm differs from full scan");
+      break;
+    }
+  }
+  state.counters["docs"] = fixture.docCount();
+  state.counters["matches"] = (double)baseline;
+}
+
 benchmark::Benchmark* registerTimingBenchmark(FieldShape shape, BenchArm arm) {
   const FieldSpec& field = FIELDS[(size_t)shape];
   std::string name = "BM_NumericRangePoints/" + std::string(field.label)
@@ -281,6 +358,12 @@ benchmark::Benchmark* registerSizeBenchmark(FieldShape shape) {
     registerTimingBenchmark(shape, FULLSCAN_FORCED);
     registerTimingBenchmark(shape, SELECTED);
     registerSizeBenchmark(shape);
+  }
+  for (BenchArm arm : {ZONE_FORCED, FULLSCAN_FORCED}) {
+    std::string name = "BM_NumericRangeTimeSorted/" + std::string(armName(arm));
+    benchmark::RegisterBenchmark(name, [arm](benchmark::State& state) {
+      BM_NumericRangeTimeSorted(state, arm);
+    })->ArgName("ranges")->Arg(1)->Arg(16)->Arg(256)->UseRealTime();
   }
   return true;
 }();

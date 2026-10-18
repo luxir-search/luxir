@@ -196,6 +196,12 @@ public:
     return nvals;
   }
 
+  // One decoded value, for point reads off the hot path.
+  int64_t valueAt(int64_t valueRank) const {
+    assert(valueRank >= 0 && valueRank < nvals);
+    return values.valueAt(valueRank);
+  }
+
   int32_t docsWithValue() const {
     return docsWithField;
   }

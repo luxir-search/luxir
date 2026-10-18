@@ -122,9 +122,11 @@ whole machine. Designed from the start for parallelism on modern hardware.
   that cannot be competitive. Per-block min/max zone maps enable pruning
   even without a points (BKD) index.
 - **Range pruning:** Numeric ranges and value sets skip irrelevant column
-  blocks, accept fully covered blocks, and decode only blocks requiring
-  closer inspection. The same zone maps enable this without a points (BKD)
-  index.
+  blocks, accept fully covered blocks, and inspect only the values that
+  need it: crossing blocks are split by their 512-value leaf zones, and
+  linear-fit blocks (sorted ramps such as time-ordered timestamps) by the
+  rank intervals their fit bounds, leaving a narrow band at each range edge
+  to decode. The same zone maps enable this without a points (BKD) index.
 - **Adaptive facet execution:** Dynamically selects counting strategies and
   counter representations to suit the matching documents and field
   cardinality, balancing speed and memory use.
