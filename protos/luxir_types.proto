@@ -1783,7 +1783,7 @@ message FieldDef {
 
   // VECTOR only: ANN overlay settings. Absent inherits the parent's whole
   // definition (no per-property merge), else every VectorAnnDef default.
-  VectorAnnDef ann = 20;
+  VectorAnnDef ann = 22;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

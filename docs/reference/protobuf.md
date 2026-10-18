@@ -850,7 +850,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.defaults"></a>[`defaults`](#field-luxir.fielddef.defaults) | 14 | [`FieldDefaults`](#message-luxir.fielddefaults) | singular | default search and value representations |
 | <a id="field-luxir.fielddef.normalizer"></a>[`normalizer`](#field-luxir.fielddef.normalizer) | 15 | [`NormalizerDef`](#message-luxir.normalizerdef) | singular | whole-value STRING normalization |
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
-| <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 20 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
+| <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
 
 <a id="message-luxir.fielddefaults"></a>
 
