@@ -62,6 +62,7 @@ enum class QueryKind : uint8_t {
   ALL,
   NONE,
   RESCORE,
+  STORED_PHRASE,
   TEST,
 };
 

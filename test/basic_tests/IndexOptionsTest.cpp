@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/query/StoredPhraseQuery.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -8,6 +9,7 @@
 
 #include <format>
 #include <map>
+#include <set>
 
 namespace luxir::test {
 
@@ -64,7 +66,7 @@ protected:
   void mergeAll() { mergeAll(helper); }
 };
 
-TEST_F(IndexOptionsTest, docsWithoutNormsScoresMatchesAlikeAndRejectsPhrases) {
+TEST_F(IndexOptionsTest, docsWithoutNormsScoresMatchesAlike) {
   put(R"({"fields":{"msg":{"type":"text","index_options":"docs","norms":false}}})");
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "msg", "disk full"),
                                flatdoc("id", "b", "msg", "disk disk disk on the long path of a long message"),
@@ -80,10 +82,53 @@ TEST_F(IndexOptionsTest, docsWithoutNormsScoresMatchesAlikeAndRejectsPhrases) {
   EXPECT_EQ(hits["a"], hits["b"]);
   EXPECT_EQ(1u, scores("msg:good").size());
   EXPECT_EQ(3u, scores("exists(msg)").size());
+}
 
+TEST_F(IndexOptionsTest, positionlessPhrasesVerifyAgainstStoredSource) {
+  put(R"({"fields":{"msg":{"type":"text","index_options":"docs","norms":false},
+                    "lines":{"type":"text","index_options":"freqs","multi":true},
+                    "kind":"string"}})");
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "msg", "disk full on host", "kind", "rare"),
+                               flatdoc("id", "b", "msg", "full disk on host", "kind", "common"),
+                               flatdoc("id", "c", "msg", "disk is nearly full", "kind", "common"),
+                               flatdoc("id", "d", "msg", "disk disk", "lines", vecs("the disk", "full now"))},
+                              UpdateMessage::COMMIT).success);
+  auto ids = [&](std::string_view expr) {
+    std::set<std::string> result;
+    for (auto& [id, score] : scores(expr)) result.insert(id);
+    return result;
+  };
+  using Ids = std::set<std::string>;
+  EXPECT_EQ(Ids({"a"}), ids("msg:\"disk full\""));
+  EXPECT_EQ(Ids({"a"}), ids("msg:\"disk full\"~1"));
+  EXPECT_EQ(Ids({"a", "b", "c"}), ids("msg:\"disk full\"~2"));
+  EXPECT_EQ(Ids({"d"}), ids("msg:\"disk disk\""));
+  EXPECT_EQ(Ids({"a", "b"}), ids("msg:\"on host\""));
+  // Values sit 100 positions apart, as in an indexed phrase.
+  EXPECT_EQ(Ids(), ids("lines:\"disk full\"~99"));
+  EXPECT_EQ(Ids({"d"}), ids("lines:\"disk full\"~100"));
+
+  // Verification runs only on candidates the cheaper clause accepts: a, not
+  // all three docs holding both terms.
+  StoredPhraseQuery::Verifier::matchCallsForTests = 0;
+  EXPECT_EQ(Ids({"a"}), ids("kind:rare AND msg:\"disk full\"~2"));
+  EXPECT_LT(StoredPhraseQuery::Verifier::matchCallsForTests, 3);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").simpleQuery("\"full disk\"", {"msg"}).fields({"id"}).limit(-1);
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  ASSERT_EQ(1u, req->getDocs().size());
+  EXPECT_EQ("b", std::get<std::string>(*find(req->getDocs()[0], "id")));
+}
+
+TEST_F(IndexOptionsTest, positionlessPhraseWithoutStoredSourceFails) {
+  put(R"({"fields":{"msg":{"type":"text","index_options":"docs","norms":false,"stored":false}}})");
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "msg", "disk full"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(1u, scores("msg:disk").size());
   std::string error;
   EXPECT_TRUE(scores("msg:\"disk full\"", &error).empty());
-  EXPECT_NE(std::string::npos, error.find("requires indexed positions")) << error;
+  EXPECT_NE(std::string::npos, error.find("requires indexed positions or a stored source")) << error;
 }
 
 TEST_F(IndexOptionsTest, normsFalseIgnoresLengthButKeepsFreqsAndPhrases) {

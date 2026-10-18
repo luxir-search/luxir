@@ -179,6 +179,11 @@ public:
   // resolves to the same authored definition.
   std::shared_ptr<const Analyzer> analyzer_;
 
+  // Positions jump by this between values of a multi-valued text field. The
+  // gap discourages ordinary phrase matches but does not isolate values:
+  // slop >= 100 can cross the boundary (adjacent raw positions differ by 101).
+  static constexpr int POSITION_INCREMENT_GAP = 100;
+
   TextFieldType(std::string_view name, int flags, std::shared_ptr<const Analyzer> analyzer)
     : FieldType(name, FieldType::TEXT, flags), analyzer_(std::move(analyzer)) {}
 

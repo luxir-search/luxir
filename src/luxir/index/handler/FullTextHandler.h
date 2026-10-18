@@ -45,10 +45,7 @@ public:
 
   ~FullTextHandlerT() override = default;
 
-  // Positions jump by this between values of a multi-valued text field. The
-  // gap discourages ordinary phrase matches but does not isolate values:
-  // slop >= 100 can cross the boundary (adjacent raw positions differ by 101).
-  static constexpr int POSITION_INCREMENT_GAP = 100;
+  static constexpr int POSITION_INCREMENT_GAP = TextFieldType::POSITION_INCREMENT_GAP;
 
   void index(Inverter& inverter, const IndexVal& val) override {
     // expected kinds first, coercions last

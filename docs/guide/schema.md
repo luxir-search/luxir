@@ -359,8 +359,8 @@ For Unicode text without English stemming, use `_un`, or configure
 | Value | Records | Phrase queries | Term scoring |
 |---|---|---|---|
 | `positions` (default) | documents, term frequencies, positions | yes | BM25 |
-| `freqs` | documents, term frequencies | no | BM25 |
-| `docs` | documents only | no | every match counts one occurrence; no norms |
+| `freqs` | documents, term frequencies | verified against the stored source | BM25 |
+| `docs` | documents only | verified against the stored source | every match counts one occurrence; no norms |
 
 `norms: false` drops the per-document length norm. BM25 then scores every
 document as if it had the average field length, so a short and a long value
@@ -368,11 +368,24 @@ with the same term frequency score alike. Norms need term frequencies: `docs`
 never keeps them and rejects `norms: true`.
 
 Term, match, prefix, wildcard, regex, fuzzy, and exists queries work at every
-level. A phrase on a field whose definition lacks positions fails with an
-error. Positions are usually the largest part of a text field's postings, so
+level. Positions are usually the largest part of a text field's postings, so
 dropping them saves the most space and indexing time.
 
-For log messages or other text that is searched by term but rarely scored or
+A phrase on a field whose definition lacks positions is verified against the
+logical field's stored source (`stored`, on by default for `text`), as
+Elasticsearch's `match_only_text` does. Documents containing every phrase term
+are the candidates. Each candidate that passes the query's other clauses has
+its stored value(s) re-analyzed with the field's analyzer and must contain the
+phrase under the same slop and multi-valued position gap rules as an indexed
+phrase. This applies to `phrase` queries and to phrases written in `expr` and
+`simple_query` strings. A verified phrase scores like the conjunction of its
+terms: matches are not ranked by phrase frequency. Verification reads and
+re-analyzes each candidate, so it costs far more per document than an indexed
+phrase; put selective filters beside it. Segments that have no stored source
+for the field match nothing. Without a stored source, a phrase on the field
+fails with an error.
+
+For log messages or other text that is searched by term and only sometimes
 phrase-matched, a match-only definition is much smaller:
 
 ```json
@@ -732,9 +745,10 @@ documents without a new `author__s` variant will not match its exact queries
 or appear in its facet buckets.
 
 Changing `index_options` or `norms` applies to newly indexed documents; older
-segments are queried as written. A phrase query finds no matches in segments
-without positions, and segments without norms score without length
-normalization. A merge keeps a level or norms only when the current definition
+segments are queried as written. While the definition has positions, a
+phrase finds no matches in segments written without them; once it drops
+positions, every segment is verified against the stored source. Segments
+without norms score without length normalization. A merge keeps a level or norms only when the current definition
 and every merged segment have them. Lowering a setting therefore shrinks older
 segments as they merge, while raising one reaches merged segments only once
 every merged segment already has it: reindex older documents to upgrade them.
