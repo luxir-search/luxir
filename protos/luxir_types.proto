@@ -784,7 +784,7 @@ message SearchResponse {
   // Server-side wall time in microseconds from receiving the complete request
   // to sending its final response, including any min_commit wait and earlier
   // streamed batches. Final response only.
-  uint64 took_us = 6;
+  uint64 took_us = 8;
   bool more = 15;  // if true, expect at least one more streaming response to the logical request.
 }
 
