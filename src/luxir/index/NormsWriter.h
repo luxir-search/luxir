@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <bit>
 #include <cassert>
 #include <cstdint>
 #include <span>
@@ -12,6 +13,7 @@
 #include "ColumnIndexing.h"
 #include "PostingsWriter.h"
 #include "Stream.h"
+#include "luxir/reader/NormsLayout.h"
 
 namespace luxir {
 
@@ -51,6 +53,92 @@ private:
     }
     assert(reader.eof());
     return {bytes, (size_t)docsWithField};
+  }
+
+  // The packed encoding of a field's norm bytes, chosen from their distinct
+  // values. bits == 0 means the bytes need more than MAX_PACKED_BITS.
+  struct PackedPlan {
+    uint32_t bits = 0;
+    uint32_t tableLen = 0;  // 0: frame of reference from min
+    uint8_t min = 0;
+    uint8_t table[NormsLayout::MAX_PACKED_CODES] = {};
+    uint8_t codeOf[256] = {};
+  };
+
+  // Picks the narrower of frame of reference over [min, max] and a dictionary
+  // of the distinct bytes; on a tie, frame of reference (a 1-byte header).
+  static PackedPlan planPacked(std::span<const uint8_t> norms) {
+    bool seen[256] = {};
+    for (uint8_t b : norms) seen[b] = true;
+    PackedPlan plan;
+    uint32_t distinct = 0;
+    uint32_t lo = 255, hi = 0;
+    for (uint32_t b = 0; b < 256; b++) {
+      if (!seen[b]) continue;
+      distinct++;
+      lo = std::min(lo, b);
+      hi = std::max(hi, b);
+    }
+    uint32_t dictBits = NormsLayout::packedBits(distinct);
+    uint32_t forBits = NormsLayout::packedBits(hi - lo + 1);
+    if (dictBits == 0) {
+      return plan;
+    }
+    plan.min = (uint8_t) lo;
+    if (forBits != 0 && forBits <= dictBits) {
+      plan.bits = forBits;
+      for (uint32_t b = lo; b <= hi; b++) plan.codeOf[b] = (uint8_t) (b - lo);
+    } else {
+      plan.bits = dictBits;
+      for (uint32_t b = lo; b <= hi; b++) {
+        if (!seen[b]) continue;
+        plan.codeOf[b] = (uint8_t) plan.tableLen;
+        plan.table[plan.tableLen++] = (uint8_t) b;
+      }
+    }
+    return plan;
+  }
+
+  static int64_t packedRegionBytes(const PackedPlan& plan, int64_t count) {
+    int64_t header = 3 + (plan.tableLen == 0 ? 1 : (int64_t) plan.tableLen);
+    return header + NormsLayout::packedBytes(count, plan.bits);
+  }
+
+  // Codes go to slots by docid (missing docs keep code 0) or by rank.
+  static void writePacked(MemPool& pool, OutputStream& out, const PackedPlan& plan,
+                          const PreparedNorms& prepared, DocStream& docsWithVal,
+                          bool byDoc) {
+    int64_t count = byDoc ? prepared.maxDoc : prepared.docsWithField;
+    size_t len = (size_t) NormsLayout::packedBytes(count, plan.bits);
+    uint8_t* codes = (uint8_t*) pool.alloc(len);
+    std::fill(codes, codes + len, (uint8_t) 0);
+    uint32_t perByteLog = 3 - (uint32_t) std::countr_zero(plan.bits);
+    uint32_t idxMask = (1u << perByteLog) - 1;
+    auto put = [&](int64_t slot, uint8_t norm) {
+      uint32_t shift = ((uint32_t) slot & idxMask) * plan.bits;
+      codes[(size_t) (slot >> perByteLog)] |= (uint8_t) (plan.codeOf[norm] << shift);
+    };
+    if (byDoc && prepared.hasBitset) {
+      int32_t ord = 0;
+      docsWithVal.forEachDoc(pool, [&](int32_t docid) {
+        put(docid, prepared.ordinalNorms[(size_t) ord++]);
+      });
+      assert(ord == prepared.docsWithField);
+    } else {
+      for (size_t i = 0; i < prepared.ordinalNorms.size(); i++) {
+        put((int64_t) i, prepared.ordinalNorms[i]);
+      }
+    }
+    uint8_t header[3] = {(uint8_t) plan.bits,
+                         byDoc ? NormsLayout::BY_DOC : NormsLayout::BY_RANK,
+                         (uint8_t) plan.tableLen};
+    out.write((const char*) header, sizeof(header));
+    if (plan.tableLen == 0) {
+      out.write((char) plan.min);
+    } else {
+      out.write((const char*) plan.table, plan.tableLen);
+    }
+    out.write((const char*) codes, len);
   }
 
   static void writePresenceBitset(MemPool& pool, PostingsWriter& postingsWriter,
@@ -140,6 +228,25 @@ public:
     OutputStream& out = *outPtr;
     size_t start = out.size();
     fieldInfo.normsLoc = seg_location(out.streamNumber, start);
+    std::span<const uint8_t> norms = prepared.ordinalNorms;
+    if (std::all_of(norms.begin(), norms.end(), [&](uint8_t b) { return b == norms[0]; })) {
+      // Constant needs no addressing: every doc with the field has this byte.
+      fieldInfo.normsFormat = SegFieldInfo::NORMS_CONSTANT;
+      fieldInfo.normsLen = 1;
+      out.write((char) norms[0]);
+      return;
+    }
+    // Packed keeps the raw layout's addressing (docid when the field is
+    // dense enough for FLAT, presence rank otherwise) and is used only when
+    // it is smaller than the raw bytes.
+    int64_t rawCount = prepared.flat ? maxDoc : docsWithField;
+    PackedPlan plan = planPacked(norms);
+    if (plan.bits != 0 && packedRegionBytes(plan, rawCount) < rawCount) {
+      fieldInfo.normsFormat = SegFieldInfo::NORMS_PACKED;
+      writePacked(pool, out, plan, prepared, docsWithVal, prepared.flat);
+      fieldInfo.normsLen = (int64_t) (out.size() - start);
+      return;
+    }
     if (prepared.flat) {
       fieldInfo.normsFormat = SegFieldInfo::NORMS_FLAT;
       fieldInfo.normsLen = maxDoc;
