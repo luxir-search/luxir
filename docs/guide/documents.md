@@ -258,7 +258,9 @@ variants that have a column. HTTP row format omits missing fields; HTTP
 column format includes the requested key with `null`.
 
 For a multi-valued field, stored values keep source order and duplicates;
-a string column is a sorted, deduplicated set.
+a string column is a sorted, deduplicated set, and a numeric or date column
+returns each document's values in ascending numeric order with duplicates
+kept. Geo point columns keep source order.
 
 ### Multi-valued text and phrases
 

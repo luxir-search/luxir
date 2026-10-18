@@ -531,6 +531,13 @@ public:
     return docRank == 0 ? 0 : endValueRankReader->valueAt(docRank - 1);
   }
 
+  /// Value rank of the doc's smallest (last == false) or largest value.
+  /// Numeric columns store each doc's values ascending (GEO_POINT excepted),
+  /// so either edge is one lookup. Only valid if multiValued() is true.
+  int64_t getEdgeValueRank(int32_t docRank, bool last) {
+    return last ? endValueRankReader->valueAt(docRank) - 1 : getStartValueRank(docRank);
+  }
+
   template <class DocAcceptor>
   void pushDocs(DocAcceptor docAcceptor) {
     // TODO OPT: push the acceptor right down into screaming bitset! This avoids switching on the bucket type in the bitset!

@@ -421,3 +421,61 @@ INT_SORT_SHAPE_CAPTURES(and_01_10, IntSortShape::AND_01_10)
 INT_SORT_SHAPE_CAPTURES(and_10_10, IntSortShape::AND_10_10)
 INT_SORT_SHAPE_CAPTURES(phrase_mid, IntSortShape::PHRASE_MID)
 INT_SORT_SHAPE_CAPTURES(phrase_hh, IntSortShape::PHRASE_HH)
+
+// A multi-valued int sort over one segment of docs holding eight random
+// values each: the bare field (its edge value) and the min()/max() reducers.
+static void BM_MultiIntSort(benchmark::State& state, const char* sortExpr,
+                            qb::SortDir direction) {
+  int64_t nDocs = 2'000'000;
+  if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
+  std::string collection = std::format("multi_int_sort_bm_{}", nDocs);
+  CollectionHelper helper(collection);
+  std::vector<int32_t> docsPerSeg{(int32_t)nDocs};
+  bool reused = helper.indexMatchesShape(docsPerSeg);
+  if (!reused) {
+    helper.clear();
+    auto iw = helper.getIndexWriter();
+    Inverter& inverter = iw->obtainInverter();
+    Inverter::InputHandler& id = inverter.getIndexHandler("id");
+    Inverter::InputHandler& many = inverter.getIndexHandler("many_is");
+    int64_t values[8];
+    for (int64_t doc = 0; doc < nDocs; doc++) {
+      SplitMix64 r(doc);
+      inverter.startDoc();
+      id.index(inverter, std::to_string(doc));
+      for (int64_t& value : values) value = r.rint(1'000'000'000);
+      many.index(inverter, std::span<const int64_t>(values));
+      inverter.finishDoc();
+    }
+    iw->releaseInverter(inverter, true);
+    helper.commit();
+  }
+
+  int64_t fingerprint = -1;
+  for (auto _ : state) {
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
+    req->collection(collection);
+    auto& top = req->topDocs("q").allQuery().limit(10).fields({"id"});
+    qb::sort(top, sortExpr, direction);
+    req->execute(false);
+    int64_t current = 0;
+    for (const auto& batch : req->responses) {
+      const auto* list = batch->proto.ops.at("q")->docList();
+      for (const auto& docId : std::get<api::ColStr>(list->columns.at("id").kind).v) {
+        current = current * 31 + java_string_hashcode(docId);
+      }
+    }
+    benchmark::DoNotOptimize(current);
+    if (fingerprint != -1) {
+      ASSERT_EQ(fingerprint, current);
+    }
+    fingerprint = current;
+  }
+  state.counters["fp"] = fingerprint;
+  state.counters["reused"] = reused;
+}
+
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, field_asc, "many_is", qb::ASC);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, field_desc, "many_is", qb::DESC);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, min_asc, "min(many_is)", qb::ASC);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, max_desc, "max(many_is)", qb::DESC);

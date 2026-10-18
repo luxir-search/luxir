@@ -726,9 +726,9 @@ or is not an identifier. To sort analyzed text, use a string variant.
 
 A bare multi-valued string field sorts by its smallest value ascending and its
 largest value descending (string values are stored as a per-document sorted
-set, so either edge is free to read). A bare multi-valued numeric field sorts
-by its first stored value, the one key that needs no per-document scan; use
-`min(f)` or `max(f)` for edge semantics when the scan is worth paying.
+set, so either edge is free to read). A bare multi-valued numeric or date field
+does the same: its column keeps each document's values in ascending order, so
+the edges are one read, as are `min(f)` and `max(f)` over a bare field.
 
 Integer-only addition, subtraction, and multiplication stay int64; a double
 operand promotes that operation to double, and division always returns double.

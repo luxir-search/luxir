@@ -15,7 +15,9 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
 #include <ranges>
+#include <vector>
 
 using namespace luxir;
 namespace luxir::handler {
@@ -237,19 +239,26 @@ public:
 };
 
 
+// Numeric multi-valued columns hold each doc's values in ascending encoded
+// order (duplicates kept), so a doc's min and max are its first and last
+// values. The encoded order is the numeric order for every int-column type
+// (FLOAT/DOUBLE use sortable bits). GEO_POINT keeps insertion order: packed
+// points have no meaningful order.
 class MultiIntColHandler : public Inverter::IndexHandler {
   friend class Inverter;
   LongStream longStream;
   IntStream lengthStream;
   DocStream docsWithVal;
+  std::vector<int64_t> docValues;  // per-doc scratch, reused across docs
   int64_t numVals = 0;
   int32_t numDocs = 0;
+  bool sortValues;
 
 public:
   MultiIntColHandler(Inverter& inverter, const std::string_view& fieldName,
-                     const std::shared_ptr<FieldType>& fieldType)
+                     const std::shared_ptr<FieldType>& fieldType, bool sortValues = true)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType), longStream(inverter.pool),
-      lengthStream(inverter.pool), docsWithVal(inverter.pool) {
+      lengthStream(inverter.pool), docsWithVal(inverter.pool), sortValues(sortValues) {
   }
 
   ~MultiIntColHandler() override = default;
@@ -299,12 +308,12 @@ public:
   }
 
   void indexMulti(Inverter& inverter, std::ranges::input_range auto&& values) {
-    int64_t n = 0;
-    for (auto val : values) {
-      longStream.addVal(inverter.pool, val);
-      n++;
-    }
-    if (n == 0) return;
+    docValues.clear();
+    for (auto val : values) docValues.push_back(val);
+    if (docValues.empty()) return;
+    if (sortValues) std::ranges::sort(docValues);
+    for (int64_t val : docValues) longStream.addVal(inverter.pool, val);
+    int64_t n = (int64_t)docValues.size();
     numVals += n;
     docsWithVal.addDoc(inverter.pool, inverter.getDoc());
     lengthStream.addVal(inverter.pool, n);
@@ -454,7 +463,7 @@ class MultiGeoPointHandler final : public MultiIntColHandler {
 public:
   MultiGeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
                        const std::shared_ptr<FieldType>& fieldType)
-    : MultiIntColHandler(inverter, fieldName, fieldType) {}
+    : MultiIntColHandler(inverter, fieldName, fieldType, false) {}
 
   void index(Inverter& inverter, double latitude, double longitude) override {
     int64_t packed = geo::encodePoint(latitude, longitude);

@@ -472,7 +472,7 @@ class SimpleNumericFieldComparator : public FieldComparator,
         keys[i] = missingValueSubstitute;
         continue;
       }
-      int64_t valueRank = reader->getStartValueRank(rank);
+      int64_t valueRank = reader->getEdgeValueRank(rank, sortMultiplier < 0);
       keys[i] = transformPresent(pointValues->valueAt(valueRank));
     }
   }
@@ -673,12 +673,11 @@ public:
       if (iter->docId() > docid) return missingValueSubstitute;
       rank = iter->rank();
     }
-    // Multi-valued numeric columns store per-doc values unsorted, so the
-    // cheap deterministic sort key is the FIRST stored value (storage order).
-    // min/max over unsorted values would scan every value per doc; callers
-    // that want that spell it explicitly (min(f)/max(f) sort expressions).
+    // Multi-valued numeric columns store each doc's values ascending, so a
+    // multi-valued doc sorts by its min ascending and its max descending (the
+    // string comparators' edge semantics) with one value read.
     int64_t value = multiValued
-        ? iter->values().valueAt(reader->getStartValueRank(rank))
+        ? iter->values().valueAt(reader->getEdgeValueRank(rank, sortMultiplier < 0))
         : iter->values().valueAt(rank);
     // For descending sort, negate the value.
     // if we wanted to make this branchless, we could have a an adder and multiplier

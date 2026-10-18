@@ -946,24 +946,23 @@ public:
                         data.counts.add(value - keyBase, docid);
                       });
                 } else {
-                  // Values retain insertion order, including non-adjacent
-                  // repeats. Only the first occurrence feeds the metrics.
-                  boost::unordered_flat_map<int64_t, char*> seen;
+                  // Each doc's values are stored ascending, so repeats are
+                  // adjacent. Only the first occurrence feeds the metrics.
                   int32_t lastDoc = -1;
+                  int64_t lastKey = 0;
+                  char* lastEntry = nullptr;
                   forEachIntColValue(domain, column, maxDoc, data.missing_num,
                       [&](int32_t docid, int64_t value) LUXIR_INLINE {
-                        if (docid != lastDoc) {
-                          seen.clear();
-                          lastDoc = docid;
-                        }
                         int64_t key = value - keyBase;
-                        auto [it, first] = seen.try_emplace(key, nullptr);
-                        if (first) {
-                          it->second = data.counts.resolveEntry(key);
-                          data.counts.touchEntry(it->second, docid);
-                        } else {
-                          data.counts.addOccurrence(it->second);
+                        if (docid == lastDoc && key == lastKey) {
+                          data.counts.addOccurrence(lastEntry);
+                          return;
                         }
+                        assert(docid != lastDoc || key > lastKey);
+                        lastDoc = docid;
+                        lastKey = key;
+                        lastEntry = data.counts.resolveEntry(key);
+                        data.counts.touchEntry(lastEntry, docid);
                       });
                 }
               });

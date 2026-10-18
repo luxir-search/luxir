@@ -522,6 +522,18 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
     bool reducer = node.childCount == 1;
     if (reducer) {
       if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
+      if (node.opcode != ValueOpcode::AVG
+          && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN) {
+        // A column array holds the doc's values ascending, so min is the
+        // first present element and max the last (a NaN reads as missing).
+        bool fromEnd = node.opcode == ValueOpcode::MAX;
+        for (int64_t i = 0; i < first.array.size; i++) {
+          ValueResult next = program.evalArrayElement(
+              first.array, fromEnd ? first.array.size - 1 - i : i);
+          if (next.valid) return promote(next, node.type);
+        }
+        return ValueResult::missing(node.type);
+      }
       ValueResult aggregate = ValueResult::missing(valueScalarType(first.type));
       long double sum = 0.0;
       int64_t present = 0;
