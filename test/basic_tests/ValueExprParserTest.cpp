@@ -142,6 +142,9 @@ TEST(ValueExprParserTest, logicalDateRules) {
   ValueExprParser parser(options, *memory.arena);
 
   EXPECT_EQ(ValueNature::DATE, parser.parse("when_dt")->root().nature);
+  EXPECT_EQ(ValueNature::DATE, parser.parse("birthday_ld")->root().nature);
+  EXPECT_EQ(ValueNature::NUMBER,
+            parser.parse("when_dt - birthday_ld")->root().nature);
   EXPECT_EQ(ValueNature::DATE,
             parser.parse("when_dt + 1000")->root().nature);
   EXPECT_EQ(ValueNature::NUMBER,

@@ -666,7 +666,7 @@ message RangeFacet {
   optional int64 mincount = 5; // minimum bucket count; unset = 0; must be >= 0
   bool missing = 6; // Return the count without a value, in the chosen count unit.
   map<string, SearchOp> ops = 8;  // sub-facets or search operations performed per bucket
-  string time_zone = 9; // empty inherits SearchRequest.time_zone; DATE fields only
+  string time_zone = 9; // empty inherits SearchRequest.time_zone; DATE fields only; LOCAL_DATE ignores it
 
   // Scalar or array naming generated bucket lower bounds. Selected buckets
   // are returned even below mincount. Null, nongenerated bounds, and duplicate
@@ -1607,6 +1607,11 @@ message FieldDef {
     VECTOR = 7;    // dense float vector
     DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
     GEO_POINT = 9; // latitude/longitude point
+    // calendar date with no time of day (birthday, invoice date), stored like
+    // DATE as the epoch millis of UTC midnight. Ingest rejects any other
+    // instant; query literals, date math and range facets resolve in UTC and
+    // ignore time_zone, so a date never shifts into a neighbouring day.
+    LOCAL_DATE = 10;
   }
   optional FieldClass type = 2; // required unless inherited from parent
 

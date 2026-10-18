@@ -108,6 +108,7 @@ defaults and constraints are described in the comments and guides.
 - [`FieldDef`](#message-luxir.fielddef)
 - [`FieldDefaults`](#message-luxir.fielddefaults)
 - [`FieldFacet`](#message-luxir.fieldfacet)
+- [`FieldMetadataStats`](#message-luxir.fieldmetadatastats)
 - [`FieldVariants`](#message-luxir.fieldvariants)
 - [`Filter`](#message-luxir.filter)
 - [`FollowerStatus`](#message-luxir.followerstatus)
@@ -880,6 +881,26 @@ Buckets of distinct field values, using the field's value binding. STRING/ID sup
 | <a id="field-luxir.fieldfacet.count_unit"></a>[`count_unit`](#field-luxir.fieldfacet.count_unit) | 9 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Unset inherits a parent facet's measure, or counts groups beneath a collapsed list; entering group ops defaults to docs. Explicit GROUPS uses the nearest enclosing collapse, including inside a group. Controls count, count order, mincount, and missing; metrics still fold documents. |
 | <a id="field-luxir.fieldfacet.count_distinct"></a>[`count_distinct`](#field-luxir.fieldfacet.count_distinct) | 10 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys per bucket, also usable without collapse. Same key types and missing policies as Collapse. Conflicting measures are errors. |
 
+<a id="message-luxir.fieldmetadatastats"></a>
+
+### luxir.FieldMetadataStats
+
+Cached field metadata payload, excluding allocator overhead and unused hash-table capacity.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.fieldmetadatastats.bytes"></a>[`bytes`](#field-luxir.fieldmetadatastats.bytes) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.directories"></a>[`directories`](#field-luxir.fieldmetadatastats.directories) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.directory_bytes"></a>[`directory_bytes`](#field-luxir.fieldmetadatastats.directory_bytes) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.pages"></a>[`pages`](#field-luxir.fieldmetadatastats.pages) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.page_bytes"></a>[`page_bytes`](#field-luxir.fieldmetadatastats.page_bytes) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.entries"></a>[`entries`](#field-luxir.fieldmetadatastats.entries) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.entry_bytes"></a>[`entry_bytes`](#field-luxir.fieldmetadatastats.entry_bytes) | 7 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.names"></a>[`names`](#field-luxir.fieldmetadatastats.names) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.fieldmetadatastats.name_bytes"></a>[`name_bytes`](#field-luxir.fieldmetadatastats.name_bytes) | 9 | `uint64` | singular |  |
+
 <a id="message-luxir.fieldvariants"></a>
 
 ### luxir.FieldVariants
@@ -1203,6 +1224,7 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.indexing_budget"></a>[`indexing_budget`](#field-luxir.memorystats.indexing_budget) | 1 | [`IndexRamStats`](#message-luxir.indexramstats) | singular |  |
 | <a id="field-luxir.memorystats.storage_ram"></a>[`storage_ram`](#field-luxir.memorystats.storage_ram) | 2 | [`StorageRamStats`](#message-luxir.storageramstats) | singular |  |
 | <a id="field-luxir.memorystats.jemalloc"></a>[`jemalloc`](#field-luxir.memorystats.jemalloc) | 3 | [`JemallocStats`](#message-luxir.jemallocstats) | singular | Present only when Luxir runs on jemalloc. |
+| <a id="field-luxir.memorystats.field_metadata"></a>[`field_metadata`](#field-luxir.memorystats.field_metadata) | 4 | [`FieldMetadataStats`](#message-luxir.fieldmetadatastats) | singular |  |
 
 <a id="message-luxir.multivector"></a>
 
@@ -1366,7 +1388,7 @@ Numeric or DATE buckets using the field's value binding. Each bucket is inclusiv
 | <a id="field-luxir.rangefacet.mincount"></a>[`mincount`](#field-luxir.rangefacet.mincount) | 5 | `int64` | optional | minimum bucket count; unset = 0; must be &gt;= 0 |
 | <a id="field-luxir.rangefacet.missing"></a>[`missing`](#field-luxir.rangefacet.missing) | 6 | `bool` | singular | Return the count without a value, in the chosen count unit. |
 | <a id="field-luxir.rangefacet.ops"></a>[`ops`](#field-luxir.rangefacet.ops) | 8 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed per bucket |
-| <a id="field-luxir.rangefacet.time_zone"></a>[`time_zone`](#field-luxir.rangefacet.time_zone) | 9 | `string` | singular | empty inherits SearchRequest.time\_zone; DATE fields only |
+| <a id="field-luxir.rangefacet.time_zone"></a>[`time_zone`](#field-luxir.rangefacet.time_zone) | 9 | `string` | singular | empty inherits SearchRequest.time\_zone; DATE fields only; LOCAL\_DATE ignores it |
 | <a id="field-luxir.rangefacet.selected"></a>[`selected`](#field-luxir.rangefacet.selected) | 11 | [`Val`](#message-luxir.val) | singular | Scalar or array naming generated bucket lower bounds. Selected buckets are returned even below mincount. Null, nongenerated bounds, and duplicate bounds after coercion are errors. |
 | <a id="field-luxir.rangefacet.selection_mode"></a>[`selection_mode`](#field-luxir.rangefacet.selection_mode) | 12 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | same filtering rules as FieldFacet; see SelectionMode |
 | <a id="field-luxir.rangefacet.count_unit"></a>[`count_unit`](#field-luxir.rangefacet.count_unit) | 13 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Inherits the parent measure; GROUPS uses the nearest collapse. |
@@ -2025,6 +2047,7 @@ Placement preference for returned document fields: dense columns (DocList.column
 | <a id="value-luxir.fielddef.fieldclass.vector"></a>[`VECTOR`](#value-luxir.fielddef.fieldclass.vector) | 7 | dense float vector |
 | <a id="value-luxir.fielddef.fieldclass.date"></a>[`DATE`](#value-luxir.fielddef.fieldclass.date) | 8 | timestamp, stored as int64 milliseconds since the Unix epoch |
 | <a id="value-luxir.fielddef.fieldclass.geo_point"></a>[`GEO_POINT`](#value-luxir.fielddef.fieldclass.geo_point) | 9 | latitude/longitude point |
+| <a id="value-luxir.fielddef.fieldclass.local_date"></a>[`LOCAL_DATE`](#value-luxir.fielddef.fieldclass.local_date) | 10 | calendar date with no time of day (birthday, invoice date), stored like DATE as the epoch millis of UTC midnight. Ingest rejects any other instant; query literals, date math and range facets resolve in UTC and ignore time\_zone, so a date never shifts into a neighbouring day. |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 

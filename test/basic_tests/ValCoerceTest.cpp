@@ -144,6 +144,15 @@ TEST_F(ValCoerceTest, fieldTypeColInt64Encodings) {
   EXPECT_EQ(1234, dat.coerceColInt64(coerce::scalarVal((int64_t)1234), "f"));
   EXPECT_THROW(dat.coerceColInt64(coerce::scalarVal(1.5), "f"), std::runtime_error);
   EXPECT_THROW(dat.coerceColInt64(sval("not a date"), "f"), std::runtime_error);
+
+  // A local date resolves in UTC whatever the zone and rejects a time of day.
+  DateFieldType local("_ld", FieldType::COLUMN_STORED, true);
+  CoerceContext denver{std::nullopt, *resolveTimeZone("America/Denver")};
+  EXPECT_EQ(*ms, local.coerceColInt64(sval("2020-01-01"), "f", denver));
+  EXPECT_EQ(*ms, local.coerceDateRange(sval("2020-01-01"), "f", denver).lo);
+  EXPECT_EQ(*ms + 7 * 3600000LL, dat.coerceColInt64(sval("2020-01-01"), "f", denver));
+  EXPECT_THROW(local.coerceColInt64(sval("2020-01-01T01:00"), "f"), std::runtime_error);
+  EXPECT_THROW(local.coerceColInt64(coerce::scalarVal(*ms - 1), "f"), std::runtime_error);
 }
 
 TEST_F(ValCoerceTest, fieldTypeDefaultsThrow) {

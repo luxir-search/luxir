@@ -45,8 +45,8 @@ int64_t DoubleFieldType::coerceColInt64(const api::Val& val, std::string_view fi
   return doubleToSortableInt64(coerce::toDouble(val, fieldName));
 }
 
-int64_t DateFieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
-                                      const CoerceContext& context) const {
+static int64_t parseDateMillis(const api::Val& val, std::string_view fieldName,
+                               const CoerceContext& context) {
   // epoch millis passthrough; strings parse as ISO-8601 / epoch millis / date math
   if (auto i = std::get_if<int64_t>(&val.kind)) return *i;
   if (auto s = std::get_if<std::string_view>(&val.kind)) {
@@ -60,9 +60,24 @@ int64_t DateFieldType::coerceColInt64(const api::Val& val, std::string_view fiel
   coerce::throwCoerce(fieldName, val, "a date");
 }
 
+int64_t DateFieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
+                                      const CoerceContext& context) const {
+  int64_t millis = parseDateMillis(val, fieldName, frame(context));
+  // A local date is a whole UTC day: a time of day is rejected rather than
+  // truncated, so "2024-06-01T23:30-05:00" cannot silently become June 2.
+  if (local && millis % datetime_detail::kMsPerDay != 0) {
+    throw RequestError(fmt::format(
+        "LOCAL_DATE field '{}': {} is not a calendar date "
+        "(expected a date such as 2024-06-01, or epoch millis at UTC midnight)",
+        fieldName, coerce::describe(val)), "invalid_value");
+  }
+  return millis;
+}
+
 DateRange DateFieldType::coerceDateRange(const api::Val& val,
                                          std::string_view fieldName,
-                                         const CoerceContext& context) const {
+                                         const CoerceContext& requestContext) const {
+  CoerceContext context = frame(requestContext);
   if (auto i = std::get_if<int64_t>(&val.kind)) return {*i, *i + 1};  // an exact instant
   if (auto s = std::get_if<std::string_view>(&val.kind)) {
     int64_t now = context.dateMathNowEpochMillis.value_or(currentEpochMillis());

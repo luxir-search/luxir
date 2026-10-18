@@ -201,6 +201,9 @@ private:
           return doubleToSortableInt64(
               coerce::toDoubleScalar(value, field));
         case FieldType::Type::DATE:
+          // A local date resolves in UTC and rejects a time of day; take the
+          // field type's own coercion below.
+          if (DateFieldType::isLocal(fieldType)) break;
           if constexpr (std::is_same_v<T, int64_t>) {
             return value;
           } else if constexpr (std::is_same_v<T, std::string_view>) {
@@ -868,7 +871,8 @@ public:
   // window end, so [2024-01 TO 2024-06] covers January through June inclusive
   // and {2024-01 TO 2024-06} excludes both whole months.  Match on a DATE
   // field routes through here with gte == lte, so equality on a day matches
-  // the whole day.
+  // the whole day.  A local date's literals resolve in UTC whatever the
+  // request time_zone (DateFieldType::frame).
   //
   // Term-backed fields (TEXT/STRING/ID) build a constant-scoring
   // TermRangeQuery over the terms dictionary in byte order: bounds coerce to

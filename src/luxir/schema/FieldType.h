@@ -257,9 +257,32 @@ public:
 // range-facet, and min/max stats run on the raw column with no per-value
 // transform (unlike FLOAT/DOUBLE, which store sortable bits).  The DATE tag
 // drives string<->millis parsing on input and date-aware rendering on output.
+//
+// A local date (schema type LOCAL_DATE) is a calendar date with no time of
+// day: a birthday or an invoice date.  It stores the same int64 epoch millis
+// of UTC midnight in the same column, so segments, sorting, merging and
+// output are DATE's, and the segment records FieldType::DATE.  What differs
+// is the civil frame: ingest accepts only values at UTC midnight, and query
+// literals, date math and calendar range facets resolve in UTC whatever the
+// request or facet time_zone, so a date never shifts into a neighbouring day.
 class DateFieldType : public FieldType {
 public:
-  DateFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DATE, flags) {
+  const bool local;
+
+  DateFieldType(std::string_view name, int flags=COLUMN_STORED, bool local=false)
+    : FieldType(name, FieldType::DATE, flags), local(local) {
+  }
+
+  // Whether `fieldType` is a DATE field with calendar-date semantics.
+  static bool isLocal(FieldType& fieldType) {
+    return fieldType.type() == FieldType::DATE && ((DateFieldType&)fieldType).local;
+  }
+
+  // The civil frame this field resolves literals in: UTC for a local date,
+  // the request's zone otherwise.
+  CoerceContext frame(const CoerceContext& context) const {
+    if (!local) return context;
+    return {context.dateMathNowEpochMillis, TimeZone::utc()};
   }
 
   int64_t coerceColInt64(

@@ -198,7 +198,7 @@ String, text, numeric, and date multi-fields use an array of scalar values.
 A multi-geo field uses an array of `[lon,lat]` points. A multi-vector field
 uses an array of number arrays; a bare number array is also accepted as a
 one-vector list. The field must be declared `multi: true`; the `_ss`, `_is`,
-`_fs`, `_ds`, `_dts`, and `_vs` default suffixes already are.
+`_fs`, `_ds`, `_dts`, `_lds`, and `_vs` default suffixes already are.
 
 ## What is returned
 
