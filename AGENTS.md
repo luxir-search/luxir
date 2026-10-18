@@ -37,7 +37,14 @@ caps. Native vcpkg dependencies, the ARM64 toolchain and packages, and ccache
 objects are shared between worktrees, so a new worktree reuses them instead of
 rebuilding.
 See [Parallelism and shared caches](docs/dev/build-setup.md#parallelism-and-shared-caches).
-Use worktrees to avoid conflicting. Once work is pushed, clean up the worktree.
+
+Use worktrees to avoid conflicting, created and removed with `tools/worktree`
+(`add NAME [START]`, `remove NAME`, `list`). `add` also fetches the submodule
+and FastPFOR. Once work is pushed, `tools/worktree remove` it: that deletes its
+build directories too. Keep build directories inside the worktree
+(`build/<preset>`), never symlinked or `-B` elsewhere, or ccache stops sharing
+objects between worktrees; to build on another disk, set `LUXIR_WORKTREE_ROOT`
+so the whole worktree lives there.
 
 ### Iterate (default): non-ASan, fastest edit-build-test
 

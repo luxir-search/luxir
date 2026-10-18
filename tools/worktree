@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Creates Luxir worktrees ready to build, and removes them with their builds.
+# Worktrees live under LUXIR_WORKTREE_ROOT (default: <main checkout>-wt).
+#
+# ccache shares objects between worktrees only when each build directory is
+# physically inside its worktree (the presets' build/<preset>): ccache rewrites
+# paths relative to the real working directory, so a build directory elsewhere,
+# even behind a build/ symlink, puts the worktree name into every hashed path.
+# To keep builds off a full disk, move the worktrees there instead.
+#
+# Usage:
+#   tools/worktree add NAME [START]    new branch NAME from START (default origin/main)
+#   tools/worktree remove [-f] NAME    refuses uncommitted or unpushed work without -f
+#   tools/worktree list
+set -euo pipefail
+
+repo=$(git rev-parse --path-format=absolute --git-common-dir)
+repo=${repo%/.git}
+root=${LUXIR_WORKTREE_ROOT:-$repo-wt}
+
+usage() {
+  sed -n 's/^#   //p' "$0" >&2
+  exit 1
+}
+
+cmd=${1:-}
+(( $# )) && shift
+case $cmd in
+  add)
+    (( $# >= 1 && $# <= 2 )) || usage
+    name=$1 start=${2:-origin/main}
+    dir=$root/$name
+    mkdir -p "$root"
+    git -C "$repo" worktree add -b "$name" "$dir" "$start"
+    git -C "$dir" submodule update --init
+    # Clone FastPFOR from the main checkout when it has one, not the network.
+    if [[ -d $repo/deps/FastPFOR/.git ]]; then
+      export FASTPFOR_REPO=file://$repo/deps/FastPFOR
+    fi
+    "$dir/deps/fetch_sources.sh"
+    echo "Worktree ready: $dir"
+    ;;
+  remove)
+    force=0
+    if [[ ${1:-} == -f ]]; then
+      force=1
+      shift
+    fi
+    (( $# == 1 )) || usage
+    dir=$root/$1
+    [[ -d $dir ]] || { echo "No worktree at $dir" >&2; exit 1; }
+    if (( !force )); then
+      if [[ -n $(git -C "$dir" status --porcelain) ]]; then
+        echo "$dir has uncommitted changes; commit them or pass -f" >&2
+        exit 1
+      fi
+      if [[ -n $(git -C "$dir" rev-list HEAD --not --remotes) ]]; then
+        echo "$dir has commits on no remote; push them or pass -f" >&2
+        exit 1
+      fi
+    fi
+    # --force: git refuses to remove any worktree with submodules otherwise.
+    # The checks above stand in for its own clean-tree check.
+    git -C "$repo" worktree remove --force "$dir"
+    echo "Removed $dir and its builds (branches are kept)"
+    ;;
+  list)
+    git -C "$repo" worktree list --porcelain | sed -n 's/^worktree //p' | while read -r dir; do
+      size=$(du -sh "$dir/build" 2>/dev/null | cut -f1)
+      printf '%-60s %s build=%s\n' "$dir" "$(git -C "$dir" rev-parse --abbrev-ref HEAD)" "${size:-none}"
+    done
+    ;;
+  *)
+    usage
+    ;;
+esac

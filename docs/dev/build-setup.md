@@ -173,7 +173,11 @@ Shared state lives outside the checkout, so a new worktree reuses it:
   native worktree once it is installed.
 - ccache uses its normal cache directory. The launcher sets `CCACHE_BASEDIR` to
   the checkout and maps the checkout to `.` in debug information, so worktrees at
-  different paths share objects. Debug information therefore names sources
+  different paths share objects: a new worktree's first build is then mostly
+  cache hits plus links. A worktree's objects still miss wherever it changes a
+  header they include. Each branch and preset adds its own objects, so size the
+  cache for the worktrees in use at once (`max_size` in `ccache.conf`, e.g.
+  50 GB for a few); a full cache evicts the objects the next worktree needs. Debug information therefore names sources
   relative to the checkout root: start GDB from the checkout root, or add it
   with `directory`. `__FILE__` is relative too, so tests locate data through
   `testDataPath()`, not their source path.
@@ -185,7 +189,21 @@ Shared state lives outside the checkout, so a new worktree reuses it:
   corrupt it.
 
 Build directories and per-build installs (such as `build/arm64-deps`) stay in
-each worktree.
+each worktree, and must physically be there: ccache rewrites paths relative to
+the real working directory, so a build directory outside the worktree (through
+`-B` or a `build/` symlink) puts the worktree's name in every hashed path and
+never hits another worktree's objects.
+
+`tools/worktree add NAME [START]` creates a worktree on a new branch (from
+`origin/main` by default) under `LUXIR_WORKTREE_ROOT` (default
+`<main checkout>-wt`), with the submodule and FastPFOR fetched.
+`tools/worktree remove NAME` deletes it with its builds, refusing uncommitted
+or unpushed work without `-f`. Worktrees are cheap to recreate, so on a machine
+whose source disk is short of space, point `LUXIR_WORKTREE_ROOT` at a larger
+one: build directories are 10 to 20 GB per worktree. Prefer a directory that
+systemd-tmpfiles does not age out (check `tmpfiles.d` for `/tmp` and
+`/var/tmp`): aging deletes files untouched for its period even without a
+reboot, including sources of a long-lived worktree.
 
 ## Fresh checkout / after `rm -rf build/`
 
