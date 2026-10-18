@@ -1029,3 +1029,67 @@ TEST_F(IntColTest, testMonoBig) {
 
   }
 }
+
+// A column with a value on every doc is written dense (no docs-with-field
+// bitset, value rank == doc id) by flush and by merge, including a merge whose
+// deletes remove the only docs without a value.
+TEST_F(IntColTest, denseAfterFlushAndMerge) {
+  CollectionHelper helper("dense_int");
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  auto expectDense = [&](std::vector<bool> dense, int64_t sum) {
+    auto reader = writer->snapshots.readers.getReader();
+    ASSERT_EQ(dense.size(), reader->segments().size());
+    for (size_t s = 0; s < dense.size(); s++) {
+      auto& segment = reader->segments()[s];
+      int32_t maxDoc = segment.postingsReader().maxDoc();
+      for (std::string_view field : {"x_i", "xs_is"}) {
+        auto* fieldInfo = segment.postingsReader().fieldInfo(field);
+        ASSERT_TRUE(fieldInfo != nullptr);
+        IntColReader column(segment.postingsReader(), *fieldInfo);
+        EXPECT_EQ(dense[s], column.denseDocsWithValue()) << field << " " << s;
+        EXPECT_EQ(dense[s], column.docsWithValue() == maxDoc) << field;
+      }
+    }
+    if (dense.size() != 1) return;
+    auto& segment = reader->segments()[0];
+    IntColReader column(segment.postingsReader(),
+                        *segment.postingsReader().fieldInfo("x_i"));
+    IntColReader::SparseValues values(column);
+    int64_t total = 0;
+    for (int64_t rank = 0; rank < column.numValues(); rank++) {
+      total += values.valueAt(rank);
+    }
+    EXPECT_EQ(sum, total);
+  };
+  auto many = [](std::initializer_list<int64_t> v) {
+    return std::vector<int64_t>(v);
+  };
+  auto mergeAll = [&] {
+    CollectionHelper::UpdateBuilder merge;
+    merge.commit(true, 1);
+    return helper.submit(merge).success;
+  };
+
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "x_i", 1, "xs_is", many({1, 2})),
+                               flatdoc("id", "b", "x_i", 2, "xs_is", many({3}))},
+                              UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "c", "x_i", 3, "xs_is", many({4})),
+                               flatdoc("id", "d")},
+                              UpdateMessage::COMMIT).success);
+  expectDense({true, false}, 0);
+
+  ASSERT_TRUE(mergeAll());
+  expectDense({false}, 6);
+
+  ASSERT_TRUE(helper.index(flatdoc("id", "e", "x_i", 5, "xs_is", many({5, 6})),
+                           UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteByIds({"d"}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(mergeAll());
+  expectDense({true}, 11);
+
+  ASSERT_TRUE(helper.index(flatdoc("id", "f", "x_i", 7, "xs_is", many({7})),
+                           UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(mergeAll());
+  expectDense({true}, 18);
+}
