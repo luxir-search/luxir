@@ -5647,6 +5647,64 @@ TEST(FilterKeyTest, scoreAndExecutionWrappersPreserveMembershipKey) {
   EXPECT_EQ(keyFor(term), keyFor(force));
 }
 
+// An unrounded NOW range keys a new filter every request. It must stay exact
+// as NOW advances and must not touch admission history, so a rounded filter's
+// first sighting survives a stream of them and admits on its second.
+TEST(FilterCacheIntegrationTest, unroundedNowRangeIsExactAndSkipsAdmission) {
+  LuxirConfig config;
+  config.queryCacheBytes = 0;
+  LuxirNode node(config);
+  constexpr std::string_view collection = "filter_cache_unrounded_now";
+  luxir::test::CollectionHelper helper(node, collection);
+  auto cache = std::make_shared<FilterCache>(testConfig());
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+
+  constexpr int64_t minute = 60000;
+  int64_t base = *parseDateToEpochMillis("2026-07-22T08:00:00Z");
+  std::vector<luxir::test::Doc> input;
+  for (int64_t i = 0; i < 60; i++) {
+    input.push_back(luxir::test::flatdoc("when_dt", base + i * minute));
+  }
+  ASSERT_TRUE(helper.indexAll(input, UpdateMessage::COMMIT).success);
+
+  struct NowRestore {
+    ~NowRestore() { forcedDateMathNowEpochMillis.reset(); }
+  } restore;
+  auto count = [&](int64_t now, std::string_view gte, std::string_view lte) {
+    forcedDateMathNowEpochMillis = now;
+    auto request = luxir::test::localReq(node.getSearchEngine());
+    auto& cursor = request->collection(collection)
+                       .topDocs("q").allQuery().getNumber().limit(0);
+    addFilter(cursor, luxir::test::qb::range(
+        cursor.mr(), "when_dt", luxir::test::qb::valStr(cursor.mr(), gte),
+        nullptr, luxir::test::qb::valStr(cursor.mr(), lte), nullptr));
+    request->execute();
+    EXPECT_TRUE(request->ok()) << request->toString();
+    return request->getMatchCount("q");
+  };
+
+  int64_t start = base + 30 * minute + 500;
+  EXPECT_EQ(11, count(start, "now-10m/m", "now/m"));  // first sighting
+  // More unique keys than testConfig's admission history holds.
+  for (int64_t k = 0; k < 40; k++) {
+    int64_t now = start + k * 7001;
+    int64_t expected = 0;
+    for (int64_t i = 0; i < 60; i++) {
+      int64_t when = base + i * minute;
+      expected += when >= now - 10 * minute && when <= now;
+    }
+    EXPECT_EQ(expected, count(now, "now-10m", "now")) << k;
+  }
+  EXPECT_EQ(0u, cache->entryCountForTest());
+  EXPECT_EQ(0u, cache->counters().builds);
+
+  EXPECT_EQ(11, count(start, "now-10m/m", "now/m"));
+  EXPECT_GT(cache->counters().builds, 0u);
+  auto hitsBefore = cache->counters().hits;
+  EXPECT_EQ(11, count(start + 1000, "now-10m/m", "now/m"));
+  EXPECT_GT(cache->counters().hits, hitsBefore);
+}
+
 TEST(FilterKeyTest, dateMathKeysFollowCoercedBuckets) {
   TimeZone utc = TimeZone::utc();
   int64_t morning = *parseDateToEpochMillis("2026-07-22T08:00:00Z");

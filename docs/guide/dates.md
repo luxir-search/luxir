@@ -54,6 +54,13 @@ Rounding produces a window, and a range endpoint uses the appropriate edge
 of it: `when_dt:>=NOW/DAY` means "from the start of today" and
 `when_dt:<=NOW/DAY` means "through the end of today".
 
+Round relative ranges that repeat, such as dashboard filters. `now-1h` moves
+with every request millisecond, so a range with an unrounded `NOW` bound is
+never cached: it is evaluated in full on every request. `now-1h/m` to `now/m`
+is the same filter for a whole minute, so repeated requests reuse the cached
+result. Pick the coarsest unit the use case tolerates; the rounded range can
+include up to one unit more at each end than the unrounded one.
+
 ## Time zones
 
 By default everything above is UTC. Set `time_zone` on a search request to

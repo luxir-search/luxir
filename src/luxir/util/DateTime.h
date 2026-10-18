@@ -270,6 +270,9 @@ struct DateRange {
   int64_t lo;
   int64_t hiExclusive;
   bool granuleSkipped = false;
+  // NOW-anchored with no rounding command: the window moves with every
+  // request millisecond, so a filter built from it never repeats.
+  bool unroundedNow = false;
 };
 
 // A parsed literal additionally preserves whether an offset token was present.
@@ -958,11 +961,16 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
   // NOW/now is the one non-literal anchor. Case-insensitive acceptance lets
   // Solr and OpenSearch clients share the same endpoint.
   if (dd::startsWithNow(input)) {
-    if (input.size() == 3) return DateRange{nowEpochMillis, nowEpochMillis + 1};
+    if (input.size() == 3) {
+      return DateRange{nowEpochMillis, nowEpochMillis + 1, false, true};
+    }
     input.advance(3);
     input.consume("||");  // harmless union convenience
-    return dd::applyDateMath(
-        nowEpochMillis, input.slice(input.position(), input.size()), zone);
+    std::string_view math = input.slice(input.position(), input.size());
+    auto result = dd::applyDateMath(nowEpochMillis, math, zone);
+    // Any '/unit' command makes the result step with that unit.
+    if (result) result->unroundedNow = math.find('/') == std::string_view::npos;
+    return result;
   }
 
   // A literal without math retains Luxir's existing granularity window.

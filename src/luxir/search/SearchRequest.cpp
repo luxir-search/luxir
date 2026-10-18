@@ -17,7 +17,8 @@ SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
       memoryTracker(forcedRequestMemoryMaxBytes != 0
                         ? forcedRequestMemoryMaxBytes
                         : searchConfig.request_memory_max_bytes),
-      proto(proto), arena(arena), dateMathNowEpochMillis(currentEpochMillis()),
+      proto(proto), arena(arena), dateMathNowEpochMillis(
+          forcedDateMathNowEpochMillis.value_or(currentEpochMillis())),
       timeZone(resolveTimeZone(proto.time_zone)) {
   if (!timeZone) timeZoneError = timeZoneResolutionError(proto.time_zone);
 }

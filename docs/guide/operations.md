@@ -375,7 +375,8 @@ Search has its own limits:
 - `query-cache-bytes` caps each collection's filter cache (default `64MB`; `0`
   disables it). Cached filters are evicted by rebuild cost per byte, so under
   pressure the cache keeps expensive compound filters and drops cheap ones
-  first. Cache counters appear in `_stats`.
+  first. Cache counters appear in `_stats`. Date ranges with an unrounded
+  `NOW` bound are never cached; see [Dates](dates.md#date-math).
 
 ## Time-zone data
 
