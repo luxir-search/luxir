@@ -20,6 +20,7 @@
 
 #include <memory_resource>
 #include <span>
+#include <tuple>
 
 using namespace luxir;
 using namespace luxir::test;
@@ -1617,6 +1618,44 @@ TEST_F(SchemaTest, vectorAnnSettings) {
   }
   EXPECT_ANY_THROW(schemaJson(R"({"fields":{"a":{"type":"vector","ann":{"codec":"hnsw"}}}})"));
   EXPECT_ANY_THROW(schemaJson(R"({"fields":{"a":{"type":"vector","ann":{"bits":1}}}})"));
+}
+
+TEST_F(SchemaTest, vectorPqMUsesEffectiveDimensions) {
+  const std::string templ = R"({"templates":{"_e":{"type":"vector","dims":8,
+    "ann":{"codec":"pq","pq":{"m":4}}}},"fields":)";
+  auto s = schemaJson(templ + R"({
+    "inherits":{"parent":"_e"},
+    "resized":{"parent":"_e","dims":12},
+    "replaces":{"parent":"_e","dims":6,"ann":{"codec":"pq","pq":{"m":3}}},
+    "inferred":{"parent":"_e","dims":0,"ann":{"codec":"pq","pq":{"m":0}}},
+    "automatic":{"type":"vector","ann":{"codec":"pq"}},
+    "branches":{"parent":"_e","variants":{"p":{"parent":"_e"},
+      "q":{"parent":"_e","ann":{"codec":"pq","pq":{"m":2}}}}}
+  }})");
+  for (auto [name, dims, m] : {std::tuple{"inherits", 8, 4}, {"resized", 12, 4},
+       {"replaces", 6, 3}, {"inferred", 0, 0}, {"automatic", 0, 0},
+       {"branches__p", 8, 4}, {"branches__q", 8, 2}}) {
+    auto* v = dynamic_cast<VectorFieldType*>(s->physical(name));
+    ASSERT_NE(v, nullptr);
+    EXPECT_EQ(dims, v->dims());
+    EXPECT_EQ(m, v->ann().pqM);
+  }
+  for (auto field : {
+      R"({"type":"vector","ann":{"codec":"pq","pq":{"m":4}}})",
+      R"({"type":"vector","dims":0,"ann":{"codec":"pq","pq":{"m":4}}})",
+      R"({"parent":"_e","dims":0})",
+      R"({"parent":"_e","dims":6})",
+      R"({"parent":"_e","ann":{"codec":"pq","pq":{"m":3}}})",
+      R"({"parent":"_e","variants":{"p":{"parent":"_e","ann":{"codec":"pq","pq":{"m":3}}}}})",
+      R"({"parent":"_e","dims":6,"ann":{"codec":"pq"},"variants":{"p":{"parent":"_e","dims":6}}})"}) {
+    SCOPED_TRACE(field);
+    EXPECT_THROW(schemaJson(templ + "{\"a\":" + field + "}}"), SchemaError);
+  }
+  EXPECT_THROW(schemaJson(R"({"templates":{"_e":{"type":"vector","ann":{"codec":"pq","pq":{"m":4}}}}})"), SchemaError);
+  // Replacing a parent revalidates a child's authored m against its new dims.
+  auto before = schemaJson(templ + R"({"a":{"parent":"_e","ann":{"codec":"pq","pq":{"m":4}}}}})");
+  EXPECT_THROW(schemaJson(R"({"templates":{"_e":{"type":"vector","dims":6,
+    "ann":{"codec":"pq","pq":{"m":3}}}}})", before.get()), SchemaError);
 }
 
 TEST_F(SchemaTest, variantLabelGrammarAndReservedDelimiter) {

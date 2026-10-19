@@ -82,8 +82,8 @@ int32_t chooseIvfNList(int32_t configured, int64_t ntotal) {
 
 int32_t choosePqM(int32_t configured, int32_t dims) {
   if (configured > 0) {
-    // The schema checks this when dims is pinned; an inferred dims can only
-    // be checked here.
+    // The schema validates authored settings; keep this check for
+    // programmatically constructed field types too.
     if (dims % configured != 0) {
       throw std::runtime_error(fmt::format(
         "VectorIndexBuilder: IVF+PQ M={} does not divide dims={}", configured, dims));
@@ -342,7 +342,6 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   if (rabitq) {
     requiredTraining = std::max<int64_t>(ivfRaBitQMinTrainingVectors, nlist);
   } else {
-    pqM = choosePqM(ann.pqM, dims);
     pqBits = std::clamp(ann.pqBits, 1, 8);
     int64_t pqTrainingFloor = MIN_TRAINING_POINTS_PER_CENTROID * ((int64_t)1 << pqBits);
     requiredTraining = std::max<int64_t>(
@@ -361,6 +360,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
               fieldName, scanCost, ivfBuildThresholdScanCost);
     return std::nullopt;
   }
+  if (!rabitq) pqM = choosePqM(ann.pqM, dims);
 
   size_t bytesPerVec = (size_t)dims * sizeof(float);
   int64_t byteCap = bytesPerVec == 0 ? 0 : (int64_t)(ivfTrainingSampleBytes / bytesPerVec);

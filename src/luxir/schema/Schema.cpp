@@ -252,8 +252,8 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
 }
 
 // Apply defaults to an authored ann definition and validate it against the
-// field's dims (0 = inferred per segment, so the PQ divisor check then runs
-// at build time).
+// effective dims. Positive PQ m requires pinned dims; automatic m also works
+// with dims inferred per segment.
 static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t dims,
                                         std::string_view name) {
   VectorAnnConfig cfg;
@@ -288,8 +288,11 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
   if (def->pq) {
     if (def->pq->m) {
       if (*def->pq->m < 0) fail("pq.m must be >= 0");
-      if (*def->pq->m > 0 && dims > 0 && dims % *def->pq->m != 0) {
-        fail("pq.m=" + std::to_string(*def->pq->m) + " does not divide dims=" + std::to_string(dims));
+      if (*def->pq->m > 0) {
+        if (dims <= 0) fail("positive pq.m requires positive dims");
+        if (dims % *def->pq->m != 0) {
+          fail("pq.m=" + std::to_string(*def->pq->m) + " does not divide dims=" + std::to_string(dims));
+        }
       }
       cfg.pqM = *def->pq->m;
     }

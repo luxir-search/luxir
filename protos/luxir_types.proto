@@ -1689,8 +1689,10 @@ message VectorAnnDef {
   RaBitQ rabitq = 3;  // codec rabitq only
 
   message Pq {
-    // Sub-quantizers; must divide dims. Absent or 0: the largest divisor of
-    // dims up to 32 that leaves at least 4 dimensions per sub-quantizer.
+    // Sub-quantizers. Positive m requires positive effective (inherited)
+    // dims and must divide it. Absent or 0: automatic, including inferred
+    // dims; the largest divisor up to 32 leaving at least 4 dimensions per
+    // sub-quantizer, or the largest divisor up to 32 if none does.
     optional int32 m = 1;
     optional int32 bits = 2;  // bits per sub-quantizer code, 1..8. Absent: 8.
   }

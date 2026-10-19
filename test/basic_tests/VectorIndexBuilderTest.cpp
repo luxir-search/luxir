@@ -410,6 +410,7 @@ TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
 
     auto meta = readVectorAuxMeta(*aux);
     EXPECT_EQ(meta.dims, 3);
+    EXPECT_EQ(meta.pqM, 3);
     EXPECT_EQ(meta.metric, (int32_t)luxir::api::VectorMetric::L2);
     EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 0);
   }
@@ -1363,6 +1364,40 @@ TEST_F(VectorIndexBuilderTest, ivfPqFallsBackWhenTooSmallToTrain) {
   auto info = readIndexInfo(h.getIndexWriter()->dir);
   EXPECT_EQ(0, info->aux_indexes.size());
   EXPECT_EQ(vectorOverlays(info).size(), 0u);
+}
+
+TEST_F(VectorIndexBuilderTest, skipPolicyPrecedesProgrammaticPqMSelection) {
+  IvfTestGuard guard;
+  CollectionHelper h("main");
+  enableL2OnVecSuffix(h.collection(), pqAnn(1, 0, 1));
+  for (int32_t i = 0; i < 80; i++) {
+    h.index(flatdoc("id", std::to_string(i), "embedding_v", std::vector<float>{(float)i, 0, 1, 0}));
+  }
+  h.commit();
+  auto writer = h.getIndexWriter();
+  auto reader = writer->snapshots.readers.getReader();
+  ASSERT_EQ(reader->segments().size(), 1u);
+  const auto& seg = reader->segments()[0];
+  VectorIndexBuilder::SegInput input{seg.segInfo.seg_id, &seg.postingsReader()};
+  auto schema = Schema::createDefaultSchema();
+  VectorAnnConfig ann;
+  ann.codec = VectorAnnConfig::PQ;
+  ann.nlist = 1;
+  ann.pqM = 3;
+  ann.pqBits = 1;
+  schema->fieldTypeMap["embedding_v"] = std::make_shared<VectorFieldType>("embedding_v", 4,
+      FieldType::COLUMN_STORED | FieldType::FIXED_SIZE, VectorFieldType::METRIC_L2, false, false, ann);
+  VectorIndexBuilder builder(writer->dir, std::span(&input, 1), *schema, 0);
+  std::vector<std::string> files;
+  auto build = [&] { return builder.build({"*"}, {}, files, VectorIndexBuilder::BuildSite::COMMIT); };
+  VectorIndexBuilder::ivfPqMinTrainingVectors = 81;
+  EXPECT_TRUE(build().empty());
+  VectorIndexBuilder::ivfPqMinTrainingVectors = 2;
+  VectorIndexBuilder::ivfBuildThresholdScanCost = 321;
+  EXPECT_TRUE(build().empty());
+  VectorIndexBuilder::ivfBuildThresholdScanCost = 0;
+  EXPECT_THROW(build(), std::runtime_error);
+  EXPECT_TRUE(files.empty());
 }
 
 // Field with metric=NONE (the default _v) is not eligible for build, even via "*".

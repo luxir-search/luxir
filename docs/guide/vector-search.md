@@ -602,12 +602,16 @@ POST /collections/books/_schema
 | `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
 | `rabitq.bits` | Bits per dimension, `1` to `9`. Default `1`. |
 | `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
-| `pq.m` | PQ sub-quantizers; must divide `dims`. Default: the largest divisor of `dims` up to 32 that leaves at least 4 dimensions each. |
+| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide it. Absent or `0`: automatic, including inferred dims; the largest divisor up to 32 leaving at least 4 dimensions each, or the largest divisor up to 32 if none does. |
 | `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. |
 
 `rabitq` settings require codec `rabitq`, and `pq` settings codec `pq`. A
 field without `ann` inherits its parent's, and an `ann` object replaces the
 parent's whole definition rather than merging with it.
+
+These rules also apply to inherited ANN settings and vector variants. Use
+automatic `m` when dimensions are inferred from indexed values; an explicit
+positive `m` requires dimensions pinned in the schema.
 
 **RaBitQ** (the default) stores each vector as one sign bit per dimension of
 its randomly rotated offset from its IVF list's centroid, plus a few
@@ -643,6 +647,11 @@ overlay's codec, so segments built under different settings mix freely.
 and takes effect for existing RaBitQ overlays immediately, including when the
 current schema selects PQ for future builds. Changing `ann` does not change
 the field's identity: existing values stay searchable.
+
+The [resolved schema view](schema.md#resolved-view) exposes each vector
+representation's effective `ann` settings, including defaults and inherited
+values. It includes only the selected codec's settings. `nlist:0` and `m:0`
+remain automatic policies, rather than sizes chosen for any one segment.
 
 ### Query knobs
 
