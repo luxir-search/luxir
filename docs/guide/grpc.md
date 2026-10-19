@@ -30,7 +30,7 @@ The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 | [`luxir.Admin/GetSchema`](../reference/protobuf.md#method-luxir.admin.getschema) | unary | Read a collection schema. |
 | [`luxir.Admin/CreateCollection`](../reference/protobuf.md#method-luxir.admin.createcollection) | unary | Create a collection, optionally with a schema. |
 | [`luxir.Admin/DeleteCollection`](../reference/protobuf.md#method-luxir.admin.deletecollection) | unary | Delete a collection and its stored data. |
-| [`luxir.Admin/Stats`](../reference/protobuf.md#method-luxir.admin.stats) | unary | Read node-wide or collection index statistics. |
+| [`luxir.Admin/Stats`](../reference/protobuf.md#method-luxir.admin.stats) | unary | Read node, tenant or collection statistics (the structured form of HTTP `_stats`). |
 
 The server also registers the standard gRPC health service and descriptor
 reflection. Luxir implements the application services through gRPC's generic

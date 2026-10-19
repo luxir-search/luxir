@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <optional>
 #include <string_view>
 
+#include "FittedTerms.h"
 #include "MultiTermQuery.h"
 #include "luxir/reader/DfaIntersectEnum.h"
 #include "luxir/util/automaton/ByteDfa.h"
@@ -33,15 +35,20 @@ private:
   automaton::ByteDfaKind classification;
   std::string_view exactOrPrefix;
   DfaScanPlan scanPlan;
+  // The field's long-term policy for a general pattern on a field that can
+  // hold fitted (hashed or truncated) long values, whose discarded bytes the
+  // pattern cannot see; nullopt means no warning applies.
+  std::optional<TermPolicy> fittedPolicy;
 
 public:
   AutomatonQuery(std::string_view field, Kind kind, std::string_view pattern,
                  automaton::ByteDfaView dfa, automaton::ByteDfaKind classification,
-                 std::string_view exactOrPrefix, DfaScanPlan scanPlan)
+                 std::string_view exactOrPrefix, DfaScanPlan scanPlan,
+                 std::optional<TermPolicy> fittedPolicy = std::nullopt)
       : MultiTermQuery(QueryKind::AUTOMATON, field), automatonKind(kind),
         pattern(pattern), dfa(dfa),
         classification(classification), exactOrPrefix(exactOrPrefix),
-        scanPlan(scanPlan) {}
+        scanPlan(scanPlan), fittedPolicy(fittedPolicy) {}
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const AutomatonQuery&>(other);
@@ -65,22 +72,18 @@ public:
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
-  FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override {
-    switch (classification) {
-      case automaton::ByteDfaKind::SINGLE:
-        return pool.make<ExactTermTermsEnum>(te, exactOrPrefix);
-      case automaton::ByteDfaKind::PREFIX:
-      case automaton::ByteDfaKind::ALL:
-        return pool.make<PrefixTermsEnum>(te, exactOrPrefix);
-      case automaton::ByteDfaKind::NORMAL:
-        return pool.make<DfaIntersectEnum>(pool, te, dfa, scanPlan);
-      case automaton::ByteDfaKind::NONE:
-        assert(false);
-    }
-    return nullptr;
-  }
+  FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override;
 
   const DfaScanPlan& getScanPlan() const { return scanPlan; }
+
+protected:
+  void validateLogicalImpl(PlanningContext& context, float multiplier) const override {
+    checkedBoostProduct(multiplier, 1.0f);
+    if (!fittedPolicy) return;
+    warnIfFittedTermsReachable(context, field, *fittedPolicy, [&] {
+      return dfa.maxAcceptedLength() >= (int32_t)PackedTerm::MIN_FITTED_LEN;
+    });
+  }
 };
 
 } // namespace luxir

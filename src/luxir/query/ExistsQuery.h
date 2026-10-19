@@ -233,12 +233,6 @@ public:
   };
 };
 
-inline ExistsQuery::Weight* ExistsQuery::createWeight(
-    Context& context, int32_t flags, float multiplier) {
-  return context.pool.make<ExistsQuery::Weight>(
-      context, *this, flags, Query::constantWhenScored(flags, multiplier));
-}
-
 static_assert(std::is_trivially_destructible_v<ExistsQuery::Weight>);
 static_assert(std::is_trivially_destructible_v<ExistsQuery::Scorer>);
 

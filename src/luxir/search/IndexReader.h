@@ -153,19 +153,22 @@ public:
 /// IndexReader is thread safe
 class IndexReader {
   struct FieldRecord;
+  struct HeaderTotals;
 
 public:
   using Segment = ::luxir::Segment;
 
   // A borrowed view, valid while its reader lives. Null means absent.
   // at() lazily resolves ordinals and headers in this core's segments.
-  // stats() resolves every segment for header totals, including deleted docs.
+  // stats() and flagsUnion() resolve every segment for header totals,
+  // including deleted docs.
   class FieldSegments {
     friend class IndexReader;
     const FieldRecord* record = nullptr;
     const Segment* segments = nullptr;
     FieldSegments(const FieldRecord* record, const Segment* segments)
         : record(record), segments(segments) {}
+    const HeaderTotals& totals() const;
 
   public:
     FieldSegments() = default;
@@ -179,6 +182,8 @@ public:
     bool exists() const noexcept;
     size_t size() const noexcept;
     const Similarity::FieldStats& stats() const;
+    // OR of the segment headers' flags, such as segment-format markers.
+    FieldType::flag_type flagsUnion() const;
     bool operator==(const FieldSegments&) const = default;
   };
 
@@ -200,6 +205,11 @@ public:
 private:
   friend class ReaderManager;
 
+  struct HeaderTotals {
+    Similarity::FieldStats stats;
+    FieldType::flag_type flags = 0;
+  };
+
   // Positive names, header totals and OrdMaps shared by segment sets with the same
   // core generation. The record owns its name and lazily caches each ordinal;
   // it holds no Segment or reader, so views can use different open readers.
@@ -209,7 +219,7 @@ private:
     size_t hash;
     size_t numSegments;
     std::unique_ptr<std::atomic<int32_t>[]> ordinals;
-    mutable std::atomic<Similarity::FieldStats*> fieldStats{nullptr};
+    mutable std::atomic<HeaderTotals*> totals{nullptr};
     mutable SharedLazyCell<OrdMap, true> ordMap;
     size_t bytes;
 

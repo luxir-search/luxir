@@ -247,11 +247,7 @@ public:
   };
 
   AllQuery::Weight* createWeight(Context& context, int32_t flags,
-                                 float multiplier = 1.0f) override {
-    AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(
-        context, *this, flags, constantWhenScored(flags, multiplier));
-    return weight;
-  }
+                                 float multiplier = 1.0f) override;
 
 };
 

@@ -27,7 +27,7 @@
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/search/Collector.h"
 #include "luxir/reader/PosEnum.h"

@@ -416,10 +416,10 @@ IndexReader::FieldRecord::FieldRecord(std::string_view name, size_t hash, size_t
 }
 
 IndexReader::FieldRecord::~FieldRecord() {
-  auto* stats = fieldStats.load(std::memory_order_relaxed);
+  auto* resolved = totals.load(std::memory_order_relaxed);
   fieldMetadataMemory.names.fetch_sub(1, std::memory_order_relaxed);
-  fieldMetadataMemory.nameBytes.fetch_sub(bytes + (stats ? sizeof(*stats) : 0), std::memory_order_relaxed);
-  delete stats;
+  fieldMetadataMemory.nameBytes.fetch_sub(bytes + (resolved ? sizeof(*resolved) : 0), std::memory_order_relaxed);
+  delete resolved;
 }
 
 IndexReader::FieldRecords::Table::Table(size_t capacity)
@@ -507,27 +507,36 @@ size_t IndexReader::FieldSegments::size() const noexcept {
   return record ? record->numSegments : 0;
 }
 
-const Similarity::FieldStats& IndexReader::FieldSegments::stats() const {
+const IndexReader::HeaderTotals& IndexReader::FieldSegments::totals() const {
   assert(record);
-  auto* stats = record->fieldStats.load(std::memory_order_acquire);
-  if (!stats) {
-    auto fresh = std::make_unique<Similarity::FieldStats>();
+  auto* totals = record->totals.load(std::memory_order_acquire);
+  if (!totals) {
+    auto fresh = std::make_unique<HeaderTotals>();
     for (size_t i = 0; i < size(); i++) {
-      fresh->maxDoc += segments[i].maxDoc();
+      fresh->stats.maxDoc += segments[i].maxDoc();
       if (auto* info = at(i)) {
-        fresh->docsWithField += info->docsWithField;
-        fresh->sumDocFreq += info->sumDocFreq;
-        fresh->sumTotalTermFreq += info->sumTotalTermFreq;
+        fresh->stats.docsWithField += info->docsWithField;
+        fresh->stats.sumDocFreq += info->sumDocFreq;
+        fresh->stats.sumTotalTermFreq += info->sumTotalTermFreq;
+        fresh->flags |= info->flags;
       }
     }
-    if (record->fieldStats.compare_exchange_strong(stats, fresh.get(),
-                                                 std::memory_order_release,
-                                                 std::memory_order_acquire)) {
-      stats = fresh.release();
-      fieldMetadataMemory.nameBytes.fetch_add(sizeof(*stats), std::memory_order_relaxed);
+    if (record->totals.compare_exchange_strong(totals, fresh.get(),
+                                               std::memory_order_release,
+                                               std::memory_order_acquire)) {
+      totals = fresh.release();
+      fieldMetadataMemory.nameBytes.fetch_add(sizeof(*totals), std::memory_order_relaxed);
     }
   }
-  return *stats;
+  return *totals;
+}
+
+const Similarity::FieldStats& IndexReader::FieldSegments::stats() const {
+  return totals().stats;
+}
+
+FieldType::flag_type IndexReader::FieldSegments::flagsUnion() const {
+  return record ? totals().flags : 0;
 }
 
 std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projectableFields() {
