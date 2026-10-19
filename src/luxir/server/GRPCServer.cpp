@@ -171,6 +171,10 @@ struct MethodEntry {
   // ReadOnlyDirectory), but that backstop is for paths holding a Directory
   // directly - it is not a decent error for a caller.
   bool mutating = false;
+  MetricOperation operation = MetricOperation::OTHER;
+  // Many request messages on one call; a message's in-band failure does not
+  // fail the call (searches and index batches count each message).
+  bool clientStream = false;
 };
 
 static const MethodEntry* lookupMethod(const std::string& method);
@@ -292,6 +296,8 @@ static grpc::ByteBuffer serializeToByteBuffer(const Message& msg) {
 // post-write callback. A unary RPC is just a stream with one read + one write.
 class GenericCallData : public CallData {
 public:
+  MetricScope requestMetric;
+  std::atomic<int> metricErrorKind{-1};  // the first ErrorKind, or -1
   std::stop_source waitCancellation{std::nostopstate};
   std::optional<std::stop_callback<std::function<void()>>> serverCancellation;
   grpc::AsyncGenericService& genericService;
@@ -339,6 +345,12 @@ public:
         highWater(server.streamBufferBytes()), lowWater(server.streamBufferBytes() / 2) {
     genericCtx.AsyncNotifyWhenDone(make_tag(DONE));
     genericService.RequestCall(&genericCtx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
+  }
+
+  // Records the call's first error; any thread may report it.
+  void metricError(ErrorKind kind) {
+    int none = -1;
+    metricErrorKind.compare_exchange_strong(none, (int)kind, std::memory_order_relaxed);
   }
 
   void enableWaitCancellation() {
@@ -394,6 +406,7 @@ public:
       kickFinish();
       return -1;
     }
+    server.getLuxirNode().metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::GRPC, buf.Length());
     queuedBytes += (int64_t)buf.Length();
     if (writeOutstanding) {
       pending.emplace_back(std::move(buf));
@@ -422,6 +435,7 @@ public:
     {
       const std::lock_guard<std::mutex> lock(mutex);
       if (!errored && queuedBytes > lowWater) {
+        server.getLuxirNode().metrics->add(MetricTransportCounter::STREAM_PAUSES, MetricTransport::GRPC);
         drainWaiters.push_back(std::move(resume));
         return;
       }
@@ -442,6 +456,10 @@ public:
   // been written: no further requests are read, but nothing accepted is
   // dropped, so a client of a multiplexed UpdateStream still sees the
   // acknowledgements that preceded the failure, then the terminal status.
+  void finishWithError(const ErrorInfo& info, int32_t finishCount = 1) {
+    metricError(info.kind);
+    finishWithError(grpcStatus(info), finishCount);
+  }
   void finishWithError(grpc::Status status, int32_t finishCount = 1) {
     std::vector<std::function<void()>> waiters;
     {
@@ -511,6 +529,17 @@ public:
   void deleteIfFinished() {
     if (!doneReceived || !finishReceived) return;
     { const std::lock_guard<std::mutex> lock(mutex); if (readOutstanding) return; }
+    if (requestMetric.active()) {
+      int kind = metricErrorKind.load(std::memory_order_relaxed);
+      // A failed write means the client went away, as on HTTP.
+      auto outcome = genericCtx.IsCancelled() || errored ? MetricOutcome::CANCELLED
+          : kind >= 0 || !finishStatus.ok() ? MetricOutcome::ERROR : MetricOutcome::OK;
+      if (outcome == MetricOutcome::ERROR) {
+        server.getLuxirNode().metrics->requestError(MetricTransport::GRPC,
+            kind >= 0 ? (ErrorKind)kind : ErrorKind::UNKNOWN);
+      }
+      requestMetric.finish(outcome);
+    }
     delete this;
   }
 
@@ -521,7 +550,10 @@ public:
         // re-arm a fresh acceptor before doing any work
         createNew();
         methodEntry = lookupMethod(genericCtx.method());
+        requestMetric.begin(*server.getLuxirNode().metrics, metricActivity(MetricTransport::GRPC,
+            methodEntry ? methodEntry->operation : MetricOperation::OTHER));
         if (methodEntry == nullptr) {
+          metricError(ErrorKind::NOT_FOUND);
           LOG_ERROR("gRPC: no handler for method '{}'", genericCtx.method());
           readsDone = true;
           finishSent = true;
@@ -529,6 +561,7 @@ public:
           break;
         }
         if (methodEntry->mutating && server.getLuxirNode().readOnly()) {
+          metricError(ErrorKind::FAILED_PRECONDITION);
           readsDone = true;
           finishSent = true;
           readerWriter.Finish(
@@ -552,6 +585,7 @@ public:
           else responsesExpected++;
         }
         if (discard) { deleteIfFinished(); break; }
+        server.getLuxirNode().metrics->add(MetricTransportCounter::RECEIVED_BYTES, MetricTransport::GRPC, readBuf.Length());
         methodEntry->handle(*this, readBuf);
         {
           const std::lock_guard<std::mutex> lock(mutex);
@@ -605,7 +639,7 @@ static std::shared_ptr<Collection> resolveUpdateCollection(GRPCServer& server, c
 }
 
 static void finishWithError(GenericCallData& call, const ErrorInfo& info) {
-  call.finishWithError(grpcStatus(info));
+  call.finishWithError(info);
 }
 
 // Unary handlers run after request parsing, so an unclassified exception is
@@ -643,8 +677,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       } catch (const std::exception& e) {
         // The response cannot be delivered: the call ends with the failure
         // instead of a silently empty message.
-        parent->finishWithError(grpcStatus(classifyException(e, ErrorKind::INTERNAL)),
-                                response.last ? 1 : 0);
+        parent->finishWithError(classifyException(e, ErrorKind::INTERNAL), response.last ? 1 : 0);
         response.req.replyCallback(response);
         return ReplyStatus::CANCEL;
       }
@@ -736,9 +769,12 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       completed->await(call->server.getLuxirNode(), [call](auto result) {
         call->server.getLuxirNode().getTaskArena().enqueue([call, result] {
           try {
+            // A unary update fails only when nothing was applied.
+            if (!call->methodEntry->clientStream && result->response.status == api::UpdateResponse_::Status::ERROR)
+              call->metricError(ProtoUpdateMessage::failureKind(result->response));
             call->respondRaw(serializeToByteBuffer(result->response), 1);
           } catch (const std::exception& e) {
-            call->finishWithError(grpcStatus(classifyException(e, ErrorKind::INTERNAL)));
+            call->finishWithError(classifyException(e, ErrorKind::INTERNAL));
           }
         });
       }, stop);
@@ -967,15 +1003,15 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
 
 static const MethodEntry* lookupMethod(const std::string& method) {
   static const std::unordered_map<std::string, MethodEntry> table = {
-    {"/luxir.Searcher/Search",          {handleSearch}},
-    {"/luxir.Indexer/Update",           {handleUpdate, true}},
-    {"/luxir.Indexer/UpdateStream",     {handleUpdate, true}},
-    {"/luxir.Admin/SetSchema",          {handleSetSchema, true}},
-    {"/luxir.Admin/GetSchema",          {handleGetSchema}},
-    {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true}},
-    {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true}},
-    {"/luxir.Admin/Stats",              {handleStats}},
-    {"/luxir.Admin/CacheControl",       {handleCacheControl}},
+    {"/luxir.Searcher/Search",          {handleSearch, false, MetricOperation::SEARCH, true}},
+    {"/luxir.Indexer/Update",           {handleUpdate, true, MetricOperation::UPDATE}},
+    {"/luxir.Indexer/UpdateStream",     {handleUpdate, true, MetricOperation::UPDATE, true}},
+    {"/luxir.Admin/SetSchema",          {handleSetSchema, true, MetricOperation::SCHEMA}},
+    {"/luxir.Admin/GetSchema",          {handleGetSchema, false, MetricOperation::SCHEMA}},
+    {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/Stats",              {handleStats, false, MetricOperation::STATS}},
+    {"/luxir.Admin/CacheControl",       {handleCacheControl, false, MetricOperation::OTHER}},
   };
   auto it = table.find(method);
   return it == table.end() ? nullptr : &it->second;

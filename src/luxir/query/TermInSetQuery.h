@@ -49,9 +49,7 @@ public:
   }
 
   FilteredTermsEnum* createFilteredEnum(MemPool& pool,
-                                        TermsEnum& te) override {
-    return pool.make<ExplicitTermsEnum>(te, terms);
-  }
+                                        TermsEnum& te) override;
 };
 
 } // namespace luxir

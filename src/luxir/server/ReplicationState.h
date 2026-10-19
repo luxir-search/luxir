@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
-#include <glaze/glaze.hpp>
+#include <map>
+#include <string>
 #include "luxir/store/Directory.h"
 #include "luxir/store/CollectionId.h"
 
@@ -23,24 +24,7 @@ struct ReplicationState {
 
   Collection& collection(const CollectionId& id) { return tenants[id.tenant][id.name]; }
 
-  static ReplicationState read(InputFile& file) {
-    ReplicationState state;
-    std::string text(file.read()); // the parser reads up to a terminator
-    if (glz::read_json(state, text)) throw std::runtime_error("Invalid follower state");
-    return state;
-  }
-  void write(Directory& dir) const {
-    auto bytes = glz::write_json(*this).value();
-    Directory::FileCreateOptions options; options.expectedSize = bytes.size();
-    auto file = dir.createFile("replication.json.pending", options);
-    OutputStream out(file.get());
-    out.write(bytes.data(), bytes.size()); out.close();
-    dir.finishFile(*file);
-    std::array<std::string, 1> pending{"replication.json.pending"};
-    dir.sync(pending);
-    dir.renameFile("replication.json.pending", "replication.json");
-    std::array<std::string, 1> directory{"."};
-    dir.sync(directory);
-  }
+  static ReplicationState read(InputFile& file);
+  void write(Directory& dir) const;
 };
 }

@@ -226,6 +226,9 @@ public:
     return 0;
   }
 
+  // Unknown dimensions use observed binding bytes for subsequent blocks.
+  virtual bool facetBucketGrows() const { return false; }
+
   // Whether this subtree runs query weights whose per-segment state is
   // released and rebuilt (Weight::hasReleasableSegmentState): bucket bindings
   // fed in one segment pass share it. Ops holding weights override this to
@@ -317,6 +320,8 @@ public:
     std::vector<DomainHandle> structuralDomains() const;
 
     StructuralConstraint::Finish structuralFinish() const;
+
+    virtual size_t facetBucketObservedBytes() const { return op.facetBucketResidentBytes(); }
 
     virtual void releaseSegmentState(IndexReader::Segment& segment) noexcept {
       op.releaseSegmentState(segment);

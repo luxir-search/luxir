@@ -97,6 +97,7 @@ one.
 | `offset` | Zero-based rank of the first returned document. Default `0`. |
 | `get_number` | Compute and return the exact match count as `found`. |
 | `get_scores` | Add `_score_` to every returned document. |
+| `min_score` | Minimum relevance score. Documents scoring below it do not match; see [Minimum score](#minimum-score). |
 | `fields` | Fields to retrieve. Omitted: every retrievable field. |
 | `sort` | One sort clause or a list of them. Absent means relevance order. |
 | `batch_size` | Maximum documents in one streaming response batch. |
@@ -151,6 +152,34 @@ POST /collections/books/_search
   }
 }
 ```
+
+### Minimum score
+
+`min_score` drops documents whose query score is below the given value, the
+same contract as Elasticsearch's top-level `min_score`. A dropped document is
+not a match at all: it is absent from `docs`, from `found`, and from the
+domain of every entry in `ops`, so facet counts and metrics describe only the
+documents that passed. The score compared is the query's own score (filters
+do not score), and it is computed even when the request sorts by fields or
+does not return scores:
+
+```http
+POST /collections/books/_search
+
+{
+  "query": "title_t:dune",
+  "min_score": 0.5,
+  "get_number": true,
+  "ops": {"categories": {"field_facet": {"field": "category_s"}}}
+}
+```
+
+The value must be finite. A boundary score equal to `min_score` matches.
+Scores depend on the corpus, so calibrate thresholds per collection. A
+`min_score` on a fusion source applies to that source's ranked list before
+fusion. Any query can carry its own cut-off through
+[`rescore`](query-reference.md#rescore) `min_score`, and `knn` has a
+similarity threshold of its own ([Vector search](vector-search.md#similarity-threshold)).
 
 ## Diversifying a document list
 

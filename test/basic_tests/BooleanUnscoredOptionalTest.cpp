@@ -18,7 +18,7 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/TestUtils.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/reader/SkipStats.h"
 
 using namespace luxir;

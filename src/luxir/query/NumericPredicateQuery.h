@@ -31,6 +31,12 @@ class NumericPredicateQuery final : public Query {
   PointsReader::ValueRange envelope;
   std::span<const int64_t> exactValues;
   std::span<const PointsReader::ValueRange> exactIntervals;
+  // Normally SEGMENT_STABLE; REQUEST_STABLE when a bound came from the request
+  // clock (unrounded NOW). Such keys never repeat across requests, so skip the
+  // shared cache and admission history while still deduplicating in the request.
+  // equals()/hash() ignore this: BooleanQuery dedups by equals(), and cache
+  // lifetime must not change membership.
+  FilterKeyScope filterKeyScope = FilterKeyScope::SEGMENT_STABLE;
 
 public:
   bool recoverableAsPredicate() const noexcept override { return true; }
@@ -42,8 +48,10 @@ public:
   static inline thread_local void (*verificationObserver)(int32_t) = nullptr;
 #endif
 
-  NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi)
-    : Query(QueryKind::NUMERIC_PREDICATE), field(field), envelope{lo, hi} {}
+  NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi,
+                        FilterKeyScope filterKeyScope = FilterKeyScope::SEGMENT_STABLE)
+    : Query(QueryKind::NUMERIC_PREDICATE), field(field), envelope{lo, hi},
+      filterKeyScope(filterKeyScope) {}
 
   NumericPredicateQuery(std::string_view field,
                         std::span<const int64_t> exactValues,
@@ -169,14 +177,11 @@ public:
       out.appendSize(exactValues.size());
       for (int64_t value : exactValues) out.appendInt64(value);
     }
-    return FilterKeyScope::SEGMENT_STABLE;
+    return filterKeyScope;
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags,
-                              float multiplier = 1.0f) override {
-    float score = constantWhenScored(flags, multiplier);
-    return context.pool.make<Weight>(context, *this, flags, score);
-  }
+                              float multiplier = 1.0f) override;
 
   // PredicateScorer is the sparse two-phase verifier and, when instantiated
   // with IntColReader::Iterator, the benchmark's full column-scan baseline.

@@ -22,7 +22,7 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/reader/DocsEnum.h"
