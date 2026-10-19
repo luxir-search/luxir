@@ -2072,8 +2072,14 @@ message FieldDef {
   // STRING columns alone do not provide term-query support.
   enum IndexMode {
     NONE = 0;    // no index
-    MATCH = 1;   // term index for STRING/TEXT/ID, including term ranges
+
+    // Term index for STRING/TEXT/ID, including term ranges. On
+    // INT/FLOAT/DOUBLE/DATE, one term per value for exact and value-set
+    // queries; requires column=true.
+    MATCH = 1;
+
     RANGE = 2;   // numeric Match/Range or GEO_POINT predicates; requires column=true
+    MATCH_RANGE = 3; // numeric only: both MATCH and RANGE; requires column=true
   }
 
   // Unset inherits, falling back to MATCH for STRING/TEXT/ID and NONE

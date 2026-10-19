@@ -334,6 +334,8 @@ struct SkipStats {
   static inline int64_t numericPredicatePointsArms = 0;
   static inline int64_t numericPredicateZoneArms = 0;
   static inline int64_t numericPredicateScanArms = 0;
+  // Segments whose numeric predicate reads the field's numeric terms.
+  static inline int64_t numericPredicateTermArms = 0;
   static inline int64_t rangeFacetPointsArms = 0;
   static inline int64_t geoBKDArms = 0;
   static inline int64_t geoScanArms = 0;
@@ -628,6 +630,7 @@ struct SkipStats {
     numericPredicatePointsArms = 0;
     numericPredicateZoneArms = 0;
     numericPredicateScanArms = 0;
+    numericPredicateTermArms = 0;
     rangeFacetPointsArms = 0;
     geoBKDArms = 0;
     geoScanArms = 0;

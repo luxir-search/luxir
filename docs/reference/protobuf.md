@@ -2585,8 +2585,9 @@ Index acceleration. Numeric Match/Range and geographic predicates can scan a col
 | Value | Number | Description |
 |---|---|---|
 | <a id="value-luxir.fielddef.indexmode.none"></a>[`NONE`](#value-luxir.fielddef.indexmode.none) | 0 | no index |
-| <a id="value-luxir.fielddef.indexmode.match"></a>[`MATCH`](#value-luxir.fielddef.indexmode.match) | 1 | term index for STRING/TEXT/ID, including term ranges |
+| <a id="value-luxir.fielddef.indexmode.match"></a>[`MATCH`](#value-luxir.fielddef.indexmode.match) | 1 | Term index for STRING/TEXT/ID, including term ranges. On INT/FLOAT/DOUBLE/DATE, one term per value for exact and value-set queries; requires column=true. |
 | <a id="value-luxir.fielddef.indexmode.range"></a>[`RANGE`](#value-luxir.fielddef.indexmode.range) | 2 | numeric Match/Range or GEO\_POINT predicates; requires column=true |
+| <a id="value-luxir.fielddef.indexmode.match_range"></a>[`MATCH_RANGE`](#value-luxir.fielddef.indexmode.match_range) | 3 | numeric only: both MATCH and RANGE; requires column=true |
 
 <a id="enum-luxir.fielddef.longterms"></a>
 

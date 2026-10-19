@@ -89,7 +89,8 @@ The HTTP dialect also accepts the field-name form:
 Text values are analyzed with the resolved field analyzer. String values use
 their normalizer, if configured, and match as exact terms. Numeric and date
 values are coerced through the same rules as indexing and matched through
-their columns.
+their columns, or their indexed terms when the field has
+[`index: "match"`](schema.md#numeric-indexes).
 
 ## Exact membership (`any_of`)
 
@@ -135,7 +136,8 @@ POST /collections/authors/_search
 | `values` | Exact values; any matching value admits the document. |
 
 STRING, TEXT, and ID exact membership requires indexed terms. Numeric/date
-representations can use their columns.
+representations can use their columns, or their indexed terms with
+[`index: "match"`](schema.md#numeric-indexes).
 
 STRING literals are whole values and use the same normalizer as ingest. TEXT
 literals use exact token membership: each value must analyze to at most one

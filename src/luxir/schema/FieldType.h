@@ -144,6 +144,18 @@ public:
     return type == INT || type == DATE || type == FLOAT || type == DOUBLE;
   }
 
+  // Term bytes of one value of a MATCH-indexed numeric field: the column's
+  // encoded int64 with the sign bit flipped, big-endian, so the terms
+  // dictionary's byte order is the column's value order.
+  static constexpr size_t NUMERIC_TERM_BYTES = 8;
+  static std::string_view numericTerm(int64_t value, std::span<char, NUMERIC_TERM_BYTES> out) {
+    uint64_t bits = (uint64_t)value ^ (1ull << 63);
+    for (size_t i = 0; i < NUMERIC_TERM_BYTES; i++) {
+      out[i] = (char)(bits >> (56 - 8 * i));
+    }
+    return {out.data(), NUMERIC_TERM_BYTES};
+  }
+
   bool isAnalyzerFieldSpecific() { return (bool) (flags_ & FIELD_SPECIFIC_ANALYZER); }
 
   bool hasColumn() { return (bool) (flags_ & COLUMN_STORED); }

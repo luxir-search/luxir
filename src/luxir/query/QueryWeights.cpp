@@ -145,8 +145,7 @@ Query::Weight* MultiTermQuery::createWeight(Context& context, int32_t flags,
 
 Query::Weight* NumericPredicateQuery::createWeight(Context& context, int32_t flags,
                                                    float multiplier) {
-  float score = constantWhenScored(flags, multiplier);
-  return context.pool.make<Weight>(context, *this, flags, score);
+  return context.pool.make<Weight>(context, *this, flags, multiplier);
 }
 
 Query::Weight* PhraseQuery::createWeight(Context& context, int32_t flags,

@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cassert>
 #include <cstdint>
@@ -15,9 +16,14 @@
 #include <vector>
 
 #include "luxir/query/Query.h"
+#include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/PointsMaterialize.h"
+#include "luxir/query/TermInSetQuery.h"
+#include "luxir/query/TermQuery.h"
+#include "luxir/query/TermRangeQuery.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/PointsReader.h"
+#include "luxir/schema/FieldType.h"
 
 namespace luxir {
 
@@ -25,7 +31,9 @@ namespace luxir {
 // range or an exact sorted value set. Every numeric field type stores an
 // order-preserving encoded int64 (INT raw, FLOAT/DOUBLE Lucene sortable bits,
 // DATE epoch millis), so pruning and comparisons happen in encoded space. A
-// document matches when any value satisfies the range or set.
+// document matches when any value satisfies the range or set. Segments of a
+// MATCH-indexed field also carry one term per value; the weight reads those
+// postings where they serve better than the column (see Weight).
 class NumericPredicateQuery final : public Query {
   std::string_view field;
   PointsReader::ValueRange envelope;
@@ -111,6 +119,27 @@ public:
     return exactIntervals.empty()
         ? std::span<const PointsReader::ValueRange>(&envelope, 1)
         : exactIntervals;
+  }
+
+  // The same predicate over a MATCH-indexed field's numeric terms
+  // (FieldType::numericTerm), constant scoring like this query.
+  Query* termQuery(MemPool& pool) const {
+    auto term = [&pool](int64_t value) {
+      std::span<char, FieldType::NUMERIC_TERM_BYTES> bytes(
+          pool.alloc(FieldType::NUMERIC_TERM_BYTES), FieldType::NUMERIC_TERM_BYTES);
+      return FieldType::numericTerm(value, bytes);
+    };
+    Query* terms;
+    if (isExactSet()) {
+      auto exact = pool.make_span<std::string_view>(exactValues.size());
+      for (size_t i = 0; i < exactValues.size(); i++) exact[i] = term(exactValues[i]);
+      terms = pool.make<TermInSetQuery>(field, exact);
+    } else if (envelope.lo == envelope.hi) {
+      terms = pool.make<TermQuery>(field, term(envelope.lo));
+    } else {
+      terms = pool.make<TermRangeQuery>(field, term(envelope.lo), true, term(envelope.hi), true);
+    }
+    return pool.make<ConstantScoreQuery>(terms);
   }
 
   // The range test is inlined into every per-value loop; the exact-set
@@ -821,9 +850,19 @@ public:
   using PointsArrayBulkScorer = PointsMaterialize::PointsArrayBulkScorer;
   using PointsBitBulkScorer = PointsMaterialize::PointsBitBulkScorer;
   class Weight final : public Query::Weight {
+    // A range reads a segment's numeric terms only when at most this many
+    // fall inside it. Initial value, not measured.
+    static constexpr int64_t MAX_RANGE_TERMS = 64;
+
     NumericPredicateQuery& query;
     IndexReader::FieldSegments segInfos;
     float constantScore;
+    // termQuery()'s weight, when any segment carries the field's numeric
+    // terms. Such a segment answers an exact value or value set from its
+    // postings, which intersect and cache like any term filter. A range uses
+    // them only without points and when few terms fall inside it; otherwise,
+    // and in segments without terms, the column arms below run.
+    Query::Weight* termWeight = nullptr;
 
     static int64_t estimateCost(IntColReader& reader,
                                 std::span<const BlockPlan> plans,
@@ -875,13 +914,46 @@ public:
       return info && info->columnLoc.offset() > 0 ? info : nullptr;
     }
 
+    bool exactTerms() const {
+      return query.isExactSet() || query.getLo() == query.getHi();
+    }
+
+    // Whether this segment reads termWeight. Exact predicates decide from
+    // metadata alone; a range counts its terms with two dictionary seeks.
+    bool usesTerms(MemPool& pool, IndexReader::Segment& segment,
+                   const PostingsReader::Field& info) const {
+      if (termWeight == nullptr || (info.flags & FieldType::INDEX_DOCS) == 0) return false;
+      if (exactTerms()) return true;
+      if (info.pointsMetaOff != 0) return false;
+      std::array<char, FieldType::NUMERIC_TERM_BYTES> bytes;
+      TermsEnum terms(pool, segment.postingsReader(), info);
+      if (!terms.seekCeil(FieldType::numericTerm(query.getLo(), bytes))) return true;
+      int64_t first = terms.ord();
+      int64_t end = query.getHi() == std::numeric_limits<int64_t>::max()
+              || !terms.seekCeil(FieldType::numericTerm(query.getHi() + 1, bytes))
+          ? info.nTerms : terms.ord();
+      return end - first <= MAX_RANGE_TERMS;
+    }
+
   public:
     Weight(Context& context, NumericPredicateQuery& query, int32_t flags,
-           float constantScore)
+           float multiplier)
         : Query::Weight(context, query, flags), query(query),
-          constantScore(constantScore) {
+          constantScore(constantWhenScored(flags, multiplier)) {
       traits |= IS_CONSTANT_SCORING;
       segInfos = context.topReader.field(query.getField());
+      if (segInfos.exists() && (segInfos.flagsUnion() & FieldType::INDEX_DOCS) != 0
+          && query.getLo() <= query.getHi()) {
+        termWeight = query.termQuery(context.pool)->createWeight(context, flags, multiplier);
+      }
+    }
+
+    void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
+      if (termWeight != nullptr) termWeight->releaseSegmentState(segment);
+    }
+
+    bool hasReleasableSegmentState() const noexcept override {
+      return termWeight != nullptr && termWeight->hasReleasableSegmentState();
     }
 
     // Bounds answer covering and disjoint ranges without opening points.
@@ -891,6 +963,11 @@ public:
       if (query.getHi() < query.getLo()) return {0, CountHow::METADATA};
       const auto* info = segmentInfo(segment);
       if (!info) return {0, CountHow::METADATA};
+      // Ranges never route to terms where points could resolve a count, so
+      // only exact predicates follow the term arm's shortcut.
+      if (termWeight != nullptr && exactTerms() && (info->flags & FieldType::INDEX_DOCS) != 0) {
+        return termWeight->countShortcut(segment, domain);
+      }
       if (!info->columnBounds) {
         assert(false && "numeric column has no bounds");
         return {countBound(segment, domain, info->docsWithField).maxMatches, CountHow::ITERATE};
@@ -1398,7 +1475,22 @@ public:
     Query::ScorerSupplier* scorerSupplierImpl(
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {
-      unused(executionMode);
+      if (query.getHi() < query.getLo()) return nullptr;
+      const auto* segInfo = segmentInfo(segment);
+      if (!segInfo) return nullptr;
+      if (segInfo->columnBounds
+          && !query.intersects(segInfo->columnBounds->min, segInfo->columnBounds->max)) {
+        return nullptr;
+      }
+      if (usesTerms(targetPool, segment, *segInfo)) {
+        skipCount(SkipStats::numericPredicateTermArms);
+        return termWeight->scorerSupplier(targetPool, segment, executionMode);
+      }
+      return columnSupplier(targetPool, segment);
+    }
+
+    // The column arms: points, zone map, scan, or sparse verification.
+    Supplier* columnSupplier(MemPool& targetPool, IndexReader::Segment& segment) {
       if (query.getHi() < query.getLo()) return nullptr;
       const auto* segInfo = segmentInfo(segment);
       if (!segInfo) return nullptr;
@@ -1468,14 +1560,14 @@ public:
 
     Query::Scorer* createPointsScorerForTests(MemPool& targetPool,
                                               IndexReader::Segment& segment) {
-      auto* supplier = static_cast<Supplier*>(scorerSupplier(targetPool, segment));
+      auto* supplier = columnSupplier(targetPool, segment);
       return supplier == nullptr ? nullptr
           : supplier->createPointsScorerForTests(targetPool);
     }
 
     Query::Scorer* createComplementScorerForTests(
         MemPool& targetPool, IndexReader::Segment& segment) {
-      auto* supplier = static_cast<Supplier*>(scorerSupplier(targetPool, segment));
+      auto* supplier = columnSupplier(targetPool, segment);
       return supplier == nullptr ? nullptr
           : supplier->createComplementScorerForTests(targetPool);
     }
