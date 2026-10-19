@@ -351,9 +351,7 @@ public:
   }
 
   Weight* createWeight(Context& context, int32_t flags,
-                       float multiplier = 1.0f) override {
-    return context.pool.make<PhraseQuery::Weight>(context, *this, flags, multiplier);
-  }
+                       float multiplier = 1.0f) override;
 
   class Weight final : public Query::Weight {
     PhraseQuery& query;

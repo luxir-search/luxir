@@ -872,7 +872,9 @@ public:
   // and {2024-01 TO 2024-06} excludes both whole months.  Match on a DATE
   // field routes through here with gte == lte, so equality on a day matches
   // the whole day.  A local date's literals resolve in UTC whatever the
-  // request time_zone (DateFieldType::frame).
+  // request time_zone (DateFieldType::frame).  A bound from unrounded NOW
+  // math restricts filter reuse to this request, keeping it out of
+  // shared-cache admission history.
   //
   // Term-backed fields (TEXT/STRING/ID) build a constant-scoring
   // TermRangeQuery over the terms dictionary in byte order: bounds coerce to
@@ -931,6 +933,7 @@ public:
     // Coerce every supplied bound first, so a malformed bound is always a
     // request error regardless of whether the range would collapse to empty.
     std::optional<int64_t> loEnc, hiEnc;
+    bool unroundedNow = false;
     if (fieldType.type() == FieldType::Type::DATE) {
       auto& dateType = (DateFieldType&)fieldType;
       auto dateBound = [&](const api::Val& value) {
@@ -947,6 +950,7 @@ public:
                     opName, field, text, coerceContext.timeZone.name());
           addWarning(*warnings, pool, "date_granule_skipped", message);
         }
+        unroundedNow |= range.unroundedNow;
         return range;
       };
       // Window edges chosen so the existing +/-1 exclusive fold below lands
@@ -985,7 +989,9 @@ public:
       hi = *hiEnc - 1;
     }
     if (lo > hi) return matchNoDocs();  // empty range
-    return pool.make<NumericPredicateQuery>(field, lo, hi);
+    return pool.make<NumericPredicateQuery>(field, lo, hi,
+        unroundedNow ? FilterKeyScope::REQUEST_STABLE
+                     : FilterKeyScope::SEGMENT_STABLE);
   }
 
   // Build a phrase query from un-analyzed input by running the field's analyzer.

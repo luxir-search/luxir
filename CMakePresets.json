@@ -56,8 +56,8 @@
       "name": "features-asan",
       "hidden": true,
       "cacheVariables": {
-        "CMAKE_C_FLAGS": "-g -fsanitize=address -fno-omit-frame-pointer",
-        "CMAKE_CXX_FLAGS": "-g -fsanitize=address -fno-omit-frame-pointer",
+        "CMAKE_C_FLAGS": "-fsanitize=address -fno-omit-frame-pointer",
+        "CMAKE_CXX_FLAGS": "-fsanitize=address -fno-omit-frame-pointer",
         "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address",
         "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=address",
         "CMAKE_MODULE_LINKER_FLAGS": "-fsanitize=address"
@@ -105,7 +105,10 @@
       "name": "gcc-debug-asan",
       "inherits": ["native-asan", "base-native", "base-debug"],
       "displayName": "GCC Debug ASAN (memory checks only)",
-      "description": "Use before committing or when chasing a crash/UB (use-after-free, leaks, OOB)."
+      "description": "Use before committing or when chasing a crash/UB (use-after-free, leaks, OOB). Builds with -g1, which keeps functions, inlined frames, and line tables for backtraces but not local variables. To inspect locals in a debugger, override CMAKE_CXX_FLAGS_DEBUG with -g -Og -ftrivial-auto-var-init=pattern.",
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS_DEBUG": "-g1 -Og -ftrivial-auto-var-init=pattern"
+      }
     },
     {
       "name": "gcc-release-asan",
@@ -192,7 +195,7 @@
       "cacheVariables": {
         "VCPKG_INSTALLED_DIR": "/opt/vcpkg/installed-asan",
         "VCPKG_TARGET_TRIPLET": "x64-linux-luxir-v2-asan",
-        "CMAKE_CXX_FLAGS_DEBUG": "-g -Og -ftrivial-auto-var-init=pattern -fno-omit-frame-pointer"
+        "CMAKE_CXX_FLAGS_DEBUG": "-g1 -Og -ftrivial-auto-var-init=pattern -fno-omit-frame-pointer"
       }
     }
   ],

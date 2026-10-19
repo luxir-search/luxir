@@ -61,8 +61,10 @@ per-test/per-suite lines otherwise burn context on every green run.
 
 # Run benchmarks (NOTE: builds production-scale corpora - slow setup, use
 # gcc-release and memory caps appropriate to the machine for real measurements.
-# For quick iteration/coverage use the small-corpus unit-test mode instead:
-#   ./build/gcc-debug/bin/luxir_test --gtest_filter="Benchmarks.all" --gtest_brief=1 --gtest_print_time=0
+# For quick iteration/coverage use the small-corpus unit-test mode instead.
+# Debug builds leave the benchmarks out unless configured with
+# -DLUXIR_TEST_BENCHMARKS=ON:
+#   ./build/gcc-release/bin/luxir_test --gtest_filter="Benchmarks.all" --gtest_brief=1 --gtest_print_time=0
 ./build/gcc-release/bin/luxir_test --bench
 
 # Run all benchmarks except the slow vector ones (HNSW/IVFPQ builds dominate

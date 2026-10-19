@@ -474,9 +474,10 @@ TEST_F(CollectionAdminApiTest, tenantRoutesAdministerNamedTenants) {
   auto stats = body(http::verb::get, "/tenants/acme/_stats?pretty=false").second;
   EXPECT_NE(std::string::npos, stats.find(R"("tenant":"acme")"));
   EXPECT_EQ(std::string::npos, stats.find(R"("tenant":"t0")"));
-  EXPECT_NE(std::string::npos, body(http::verb::get, "/_stats?pretty=false").second.find(R"("tenant":"t0")"));
-  // Node memory is node-wide, not a tenant's view.
-  EXPECT_EQ(400, body(http::verb::get, "/tenants/acme/_stats?memory=true").first);
+  EXPECT_NE(std::string::npos, body(http::verb::get, "/_stats?collections=true&pretty=false").second.find(R"("tenant":"t0")"));
+  // Node blocks are node-wide, not a tenant's view.
+  EXPECT_EQ(std::string::npos, stats.find(R"("memory")"));
+  EXPECT_EQ(400, body(http::verb::get, "/tenants/acme/_stats?system=true").first);
   // Searching and indexing act in the caller's own tenant only.
   EXPECT_EQ(404, body(http::verb::post, "/tenants/acme/collections/docs/_search", "{}").first);
   EXPECT_EQ(404, body(http::verb::post, "/tenants/acme/collections/docs/_update", "{}").first);

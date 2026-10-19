@@ -114,7 +114,8 @@ dependency debug information. Release retains full Luxir debug information so
 packaging can later split symbols from the exact optimized executable; its
 dependency libraries use vcpkg's normal Release symbol settings.
 ASan Release dependency libraries use `-g1` for stack traces and line numbers;
-ASan Debug libraries retain full variable information. Dependency source trees
+ASan Debug libraries retain full variable information; Luxir itself builds
+with `-g1` under `container-asan`. Dependency source trees
 are omitted from the image; retrieve the matching sources when
 stepping into them in GDB.
 

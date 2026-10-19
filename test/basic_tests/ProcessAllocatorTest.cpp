@@ -240,7 +240,6 @@ TEST(ProcessAllocatorTest, inverterFlushReclaimsArena) {
   api::StatsResponse response;
   std::pmr::monotonic_buffer_resource responseMemory;
   api::StatsRequest request;
-  request.memory = true;
   gatherStats(node, request, response, responseMemory);
   ASSERT_TRUE(response.memory.has_value() && response.memory->jemalloc.has_value());
   const auto& jemalloc = *response.memory->jemalloc;
@@ -483,7 +482,6 @@ TEST(BigBufferTest, statsReportArena) {
   api::StatsResponse response;
   std::pmr::monotonic_buffer_resource memory;
   api::StatsRequest request;
-  request.memory = true;
   gatherStats(node, request, response, memory);
   ASSERT_TRUE(response.memory.has_value() && response.memory->jemalloc.has_value());
   const auto& bigBuffer = response.memory->jemalloc->big_buffer;

@@ -43,9 +43,7 @@ public:
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
-  FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override {
-    return pool.make<PrefixTermsEnum>(te, prefix);
-  }
+  FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override;
 };
 
 } // namespace luxir
