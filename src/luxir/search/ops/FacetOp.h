@@ -208,6 +208,26 @@ public:
                     callback);
     return true;
   }
+
+  // facetSegOrdCol for a counter over the segment's own term ords: whole runs
+  // of a run-length column go to runs(localOrd, n) where countOrdRuns covers
+  // the domain, and every other value to callback(docid, localOrd).
+  bool facetSegOrdCounts(DocSet* domain, int32_t segnum, int64_t& missing_num,
+                         auto&& callback, auto&& runs) {
+    auto& postingsReader = reader.segments()[segnum].postingsReader();
+    int32_t maxDoc = postingsReader.maxDoc();
+    auto* info = fieldInfo(segnum);
+    if (!info) {
+      missing_num += domain ? domain->card() : maxDoc;
+      return false;
+    }
+    OrdColReader ordColReader(postingsReader, *info);
+    if (!countOrdRuns(domain, ordColReader, maxDoc, missing_num, runs)) {
+      forEachOrdValue(domain, ordColReader, OrdMap::SegToGlobal::identity(),
+                      maxDoc, missing_num, callback);
+    }
+    return true;
+  }
 };
 
 class FieldFacetReq : public FacetReq {

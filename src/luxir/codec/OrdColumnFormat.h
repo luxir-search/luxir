@@ -13,6 +13,7 @@
 #include <type_traits>
 
 #include "LinearFit.h"
+#include "LinearPack.h"
 
 namespace luxir {
 
@@ -35,6 +36,53 @@ struct OrdColumnFormat {
     PredictedBlockInfo info{};
     uint64_t count = 0;
   };
+
+  // A run-length encoded block: the start (rank in the block) of every run
+  // but the first, which starts at 0, at startBits each, then every run's
+  // value minus base at valueBits each. A rank's run is the count of stored
+  // starts at or below it, found by binary search.
+  struct RunBlockInfo {
+    uint64_t payloadOffset;
+    uint32_t base;
+    uint16_t runs;
+    uint8_t startBits;
+    uint8_t valueBits;
+  };
+  static_assert(sizeof(RunBlockInfo) == 16);
+
+  static uint64_t runStartsByteSize(const RunBlockInfo& info) {
+    return LinearPack::packedByteSize(info.runs - 1u, info.startBits);
+  }
+
+  static uint64_t runPayloadByteSize(const RunBlockInfo& info) {
+    return runStartsByteSize(info)
+        + LinearPack::packedByteSize(info.runs, info.valueBits);
+  }
+
+  template <class T>
+  static RunBlockInfo planRunBlock(std::span<const T> values) {
+    static_assert(std::is_integral_v<T> && std::is_unsigned_v<T>);
+    assert(!values.empty() && values.size() <= BLOCK_SIZE);
+    T low = values[0];
+    T high = values[0];
+    uint32_t runs = 1;
+    uint32_t lastStart = 0;
+    for (size_t i = 1; i < values.size(); i++) {
+      low = std::min(low, values[i]);
+      high = std::max(high, values[i]);
+      if (values[i] != values[i - 1]) {
+        runs++;
+        lastStart = (uint32_t)i;
+      }
+    }
+    assert(high <= std::numeric_limits<uint32_t>::max());
+    RunBlockInfo info{};
+    info.base = (uint32_t)low;
+    info.runs = (uint16_t)runs;
+    info.startBits = (uint8_t)std::bit_width(lastStart);
+    info.valueBits = (uint8_t)std::bit_width((uint64_t)(high - low));
+    return info;
+  }
 
   static int64_t predict(int64_t intercept, int64_t scaledSlope,
                          uint64_t rank, uint8_t slopeShift) {

@@ -279,6 +279,20 @@ public:
     return count;
   }
 
+  // Set bits in [from, to).
+  int32_t cardRange(int32_t from, int32_t to) const {
+    assert(from >= 0 && to >= from && to <= nbits);
+    if (from == to) return 0;
+    int32_t first = from >> 6;
+    int32_t last = (to - 1) >> 6;
+    uint64_t lowMask = ~0ULL << (from & 63);
+    uint64_t highMask = ~0ULL >> (63 - ((to - 1) & 63));
+    if (first == last) return std::popcount(words[first] & lowMask & highMask);
+    int32_t count = std::popcount(words[first] & lowMask);
+    for (int32_t i = first + 1; i < last; i++) count += std::popcount(words[i]);
+    return count + std::popcount(words[last] & highMask);
+  }
+
   // OR [from, to) into destination with bit 0 corresponding to from.
   // The final partial word is masked; destination words beyond the range are
   // untouched.
