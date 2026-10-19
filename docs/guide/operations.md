@@ -86,6 +86,51 @@ executing keep their index view and complete normally.
 Deletion waits for indexing work already accepted, including a running merge,
 so deleting a collection mid-merge can take as long as that merge.
 
+### Opening and closing a collection at runtime
+
+A node discovers its collections at startup. Two endpoints move a collection
+in and out of a running writer without a restart, for fleets that restore a
+collection's files from object storage into the data directory of a live node
+and later hand the directory back:
+
+- `POST /collections/{name}/_open` (or
+  `/tenants/{tenant}/collections/{name}/_open`; unary `luxir.Admin/OpenCollection`)
+  adopts `t/<tenant>/<name>/`, which must already hold an incarnation. The
+  name must not be registered (`collection_exists`, 409); a directory with no
+  incarnations is `collection_not_found` (404). The collection opens exactly as
+  it would at startup: recovery, verify-on-open and corruption markers apply.
+  Body fields, both optional:
+  - `promote` (bool): copy the selected snapshot into a new incarnation first,
+    reusing its files, as `luxir promote` does, and retire the old one. Use it
+    whenever the files are a copy of a collection that may still be served
+    elsewhere under the old incarnation, so commit tokens stay distinct.
+  - `incarnation` (16 hex digits): without `CURRENT`, the incarnation to
+    select. Required then (400 `incarnation_required`); with `CURRENT` it must
+    be absent or agree.
+
+  The response is `{"name","tenant","incarnation","commit"}`: the incarnation
+  now serving and the published commit token.
+- `POST /collections/{name}/_close` (unary `luxir.Admin/CloseCollection`)
+  unregisters the collection and closes its writer without committing. New
+  requests see `collection_not_found`; searches already running keep their
+  index view and complete normally. Body fields, both optional:
+  - `discard` (bool): also delete the stored data, like `_delete`.
+  - `expect_commit` (`incarnation:gen`, as `X-Luxir-Commit` and `_stats`
+    report it): close only if that is still the published commit and no
+    update since is uncommitted (buffered or flushed documents, deletes, or a
+    merge waiting for publication). Otherwise the call fails with
+    `collection_changed` (409) and the collection stays open. The check and
+    the close are one step: no update is accepted in between, so an operator
+    that took a snapshot at `expect_commit` knows the close lost no
+    acknowledged write.
+
+  The response is `{"name","tenant"}`.
+
+Both are part of the write surface: a read-only node and a follower refuse
+them. The per-collection `_stats` row carries `uncommitted`, true while the
+writer holds changes its last commit does not cover, so a caller can tell
+whether `_close` with `expect_commit` will succeed before it tries.
+
 On the filesystem backend collections use
 `t/<tenant>/<name>/<incarnation>/`, selected by an atomically replaced `CURRENT`
 file in `t/<tenant>/<name>/`. Single-tenant deployments use the default tenant

@@ -263,6 +263,13 @@ until every collection is promoted. To restore a backup, use pull plus promote
 rather than copying a writer directory back over a live one. Read-only nodes can
 open a follower directory directly.
 
+A raw copy of one collection's directory placed under a running writer's data
+directory is adopted with `POST /collections/{name}/_open` and
+`{"promote": true}` (see
+[Opening and closing a collection at runtime](operations.md#opening-and-closing-a-collection-at-runtime)).
+Promotion matters there for the same reason: the source may still be live
+under the old incarnation, and the copy must not share its commit tokens.
+
 For manual failover, stop the writer and the follower, promote the follower's
 directory, and start it as a writer:
 
