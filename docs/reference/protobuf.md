@@ -1961,9 +1961,9 @@ Approximate nearest-neighbor index settings for a VECTOR field: the codec and pa
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.vectoranndef.codec"></a>[`codec`](#field-luxir.vectoranndef.codec) | 1 | [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec) | optional | absent: rabitq |
+| <a id="field-luxir.vectoranndef.codec"></a>[`codec`](#field-luxir.vectoranndef.codec) | 1 | [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec) | optional | absent: pq; rabitq is opt-in |
 | <a id="field-luxir.vectoranndef.nlist"></a>[`nlist`](#field-luxir.vectoranndef.nlist) | 2 | `int32` | optional | IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors), capped at 4096. Clamped to the segment's vector count. |
-| <a id="field-luxir.vectoranndef.rabitq"></a>[`rabitq`](#field-luxir.vectoranndef.rabitq) | 3 | [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq) | singular | codec rabitq only |
+| <a id="field-luxir.vectoranndef.rabitq"></a>[`rabitq`](#field-luxir.vectoranndef.rabitq) | 3 | [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq) | singular | requires explicit codec rabitq |
 | <a id="field-luxir.vectoranndef.pq"></a>[`pq`](#field-luxir.vectoranndef.pq) | 4 | [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq) | singular | codec pq only |
 
 <a id="message-luxir.vectoranndef.pq"></a>

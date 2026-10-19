@@ -293,8 +293,9 @@ public:
 };
 
 // Resolved ANN overlay settings of a vector field (api::VectorAnnDef with
-// defaults applied).  Build-time parameters are recorded in each overlay's
-// VectorAuxMeta, so a change only affects overlays built afterwards;
+// defaults applied: PQ unless explicitly selected otherwise). Build-time
+// parameters are recorded in each overlay's VectorAuxMeta, so a change only
+// affects overlays built afterwards;
 // rabitqQueryBits is a search-time parameter read from the current schema.
 struct VectorAnnConfig {
   enum Codec {
@@ -305,7 +306,7 @@ struct VectorAnnConfig {
   static constexpr int32_t DEFAULT_RABITQ_QUERY_BITS = 4;
   static constexpr int32_t DEFAULT_PQ_BITS = 8;
 
-  Codec codec = RABITQ;
+  Codec codec = PQ;
   int32_t nlist = 0;  // 0 = sqrt(segment vectors), capped
   int32_t rabitqBits = DEFAULT_RABITQ_BITS;
   int32_t rabitqQueryBits = DEFAULT_RABITQ_QUERY_BITS;

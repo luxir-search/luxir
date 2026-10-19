@@ -34,7 +34,7 @@ namespace {
 // Benchmark codec selector (the "codec" benchmark arg): the field's schema
 // ann settings, so the production path is what gets measured.
 enum BenchCodec : int32_t {
-  RABITQ1 = 0,  // schema default: 1-bit codes, 4-bit queries
+  RABITQ1 = 0,  // explicit RaBitQ: 1-bit codes, 4-bit queries
   PQ = 1,       // IVF+PQ with its defaults (M <= 32, 8 bits)
   RABITQ4 = 2,  // extended RaBitQ, 4 bits per dimension
   RABITQ2 = 3,

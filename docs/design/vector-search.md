@@ -47,7 +47,7 @@ future work.
 
 Every overlay is an IVF index: k-means centroids route a query to inverted
 lists, and the lists hold one compact code per vector. The field's schema
-`ann` settings pick the code (see
+`ann` settings pick the code (PQ by default, or opt-in RaBitQ; see
 [guide/vector-search.md](../guide/vector-search.md#index-settings)); the
 builder reads them when it builds an overlay and records the codec and its
 build parameters in the overlay's `VectorAuxMeta`, so the reader and query
@@ -60,7 +60,7 @@ metric space for both (see rotation below). RaBitQ query quantization
 (`query_bits`) is not an index property; it is read from the current schema at
 search time.
 
-**IVF+RaBitQ** (default, `ENGINE_IVFRABITQ`) uses FAISS `IndexIVFRaBitQ`.
+**IVF+RaBitQ** (opt-in, `ENGINE_IVFRABITQ`) uses FAISS `IndexIVFRaBitQ`.
 RaBitQ (Gao and Long, SIGMOD 2024) stores, per vector, the sign bits of its
 residual from the list centroid plus two float factors, and estimates
 distances from the code with a proven error bound; extended RaBitQ adds
@@ -117,7 +117,7 @@ install omits `faiss/utils/popcount.h`, which its header includes, so it does
 not compile against the installed headers without patching the port. The
 codec is recorded per overlay, so FastScan can arrive as another engine id.
 
-**IVF+PQ** (`ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
+**IVF+PQ** (default, `ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
 sub-quantizers of `pq.bits` bits each, unrotated. PQ's automatic `m` is the
 largest divisor of dims under a metric-dependent cap that leaves at least
 four dimensions per sub-quantizer. The cap is `max(32, dims / 8)` for the

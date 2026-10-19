@@ -1670,7 +1670,7 @@ message VectorAnnDef {
     RABITQ = 0;  // IVF + RaBitQ (randomly rotated, centroid-relative bit codes)
     PQ = 1;      // IVF + product quantization
   }
-  optional Codec codec = 1;  // absent: rabitq
+  optional Codec codec = 1;  // absent: pq; rabitq is opt-in
 
   // IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors),
   // capped at 4096. Clamped to the segment's vector count.
@@ -1686,7 +1686,7 @@ message VectorAnnDef {
     // overlays.
     optional int32 query_bits = 2;
   }
-  RaBitQ rabitq = 3;  // codec rabitq only
+  RaBitQ rabitq = 3;  // requires explicit codec rabitq
 
   message Pq {
     // Sub-quantizers. Positive m requires positive effective (inherited)

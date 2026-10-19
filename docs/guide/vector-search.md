@@ -540,8 +540,8 @@ after changing source limits.
 
 Exact search costs one pass over the column per query. For large collections,
 a commit can build approximate nearest-neighbor indexes as segment overlays:
-an inverted-file (IVF) index whose lists hold compact RaBitQ codes by default,
-or product-quantization (PQ) codes, built with FAISS. An overlay is built
+an inverted-file (IVF) index whose lists hold product-quantization (PQ) codes
+by default, or opt-in RaBitQ codes, built with FAISS. An overlay is built
 from the vector column, follows its segment through later commits and
 merges, and its candidates are always rescored from the full-precision column
 before they are returned. Building an overlay does not reindex documents.
@@ -590,7 +590,7 @@ POST /collections/books/_schema
       "type": "vector",
       "dims": 768,
       "metric": "cosine",
-      "ann": {"codec": "rabitq", "rabitq": {"bits": 1, "query_bits": 4}}
+      "ann": {"codec": "pq"}
     }
   }
 }
@@ -598,22 +598,25 @@ POST /collections/books/_schema
 
 | Field | Meaning |
 |---|---|
-| `codec` | `rabitq` (default) or `pq`. |
+| `codec` | `pq` (default) or opt-in `rabitq`. |
 | `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
 | `rabitq.bits` | Bits per dimension, `1` to `9`. Default `1`. |
 | `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
 | `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide it. Absent or `0`: automatic, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, dims / 8)` for IP/cosine or `32` for L2. If none does, use the largest divisor under the same cap. |
 | `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. |
 
-`rabitq` settings require codec `rabitq`, and `pq` settings codec `pq`. A
-field without `ann` inherits its parent's, and an `ann` object replaces the
+`rabitq` settings require an explicit `"codec":"rabitq"`, for example
+`"ann":{"codec":"rabitq","rabitq":{"bits":1,"query_bits":4}}`.
+Omitting the codec selects PQ, including for `ann:{}`, `nlist` alone, or
+`pq` settings alone; a `rabitq` object does not infer the codec. A field
+without `ann` inherits its parent's, and an `ann` object replaces the
 parent's whole definition rather than merging with it.
 
 These rules also apply to inherited ANN settings and vector variants. Use
 automatic `m` when dimensions are inferred from indexed values; an explicit
 positive `m` requires dimensions pinned in the schema.
 
-**RaBitQ** (the default) stores each vector as one sign bit per dimension of
+**RaBitQ** (opt-in) stores each vector as one sign bit per dimension of
 its randomly rotated offset from its IVF list's centroid, plus a few
 correction factors: 104 bytes for a 768-dimension vector, about 1/30 of the
 float vector. Distances estimated from these codes come with a proven error
@@ -624,7 +627,7 @@ only on vectors whose error bound still overlaps the current top candidates.
 `query_bits: 4` matches the 1-bit-document, 4-bit-query asymmetry other
 engines use and costs no measurable recall against `8`.
 
-**PQ** splits each vector into `m` sub-vectors and stores one learned
+**PQ** (the default) splits each vector into `m` sub-vectors and stores one learned
 codebook entry per sub-vector. PQ's automatic `m` scales with IP/cosine
 dimensions above 256: for example, 768 dimensions selects `m=96`, or 96 code
 bytes at 8 bits, close to RaBitQ's 104. This improves high-dimensional recall
@@ -636,11 +639,11 @@ has no such resident table. Fields of up to 256 dimensions and explicit `m`
 settings keep their existing choices. PQ codebooks are retrained for every
 segment build and merge; automatic `m` depends only on dimensions and metric.
 
-Start with the default. With 1-bit RaBitQ, recall is usually limited by how
-many lists are probed rather than by the codes, so raise `ivf.nprobe` first;
-extra `bits` help mainly when `refine_candidates` is small. Choose `pq` when
-overlay size or scan speed matters more than recall: FAISS currently scans PQ
-lists faster than RaBitQ lists.
+PQ favors scan speed: FAISS currently scans PQ lists faster than RaBitQ
+lists. Opt into RaBitQ for its different size/recall tradeoff.
+With 1-bit RaBitQ, recall is usually limited by how many lists are probed
+rather than by the codes, so raise `ivf.nprobe` first; extra `bits` help mainly
+when `refine_candidates` is small.
 
 Overlays record the settings they were built with, so a change applies to
 segments built afterwards: new flushes, merges, and segments without an
@@ -706,11 +709,11 @@ so a merge does not change the effort a request asks for. An explicit `nprobe`
 pins the effort cap; an adaptive one may deepen when filters or collapse
 underfill the result. The adaptive default starts at `sqrt(nlist)` of that
 reference index for fields of up to 128 dimensions and scales by
-`sqrt(dims / 128)` above that (capped at 4x), because the true neighbors of a
-high-dimensional query spread over more lists: about 2.5x at 768 to 960
-dimensions, which lifted recall@10 from 0.82-0.87 to about 0.95 on GIST and
-Cohere embeddings. Probed lists are always scanned in full; `nprobe` is the
-only work limiter.
+`sqrt(dims / 128)` above that (capped at 4x). This effort policy applies to
+both codecs. The multiplier is about 2.5x at 768 to 960 dimensions; RaBitQ
+measurements on GIST and Cohere embeddings showed recall@10 rising from
+0.82-0.87 to about 0.95. Probed lists are always scanned in full; `nprobe` is
+the only work limiter.
 
 ### Scoring
 

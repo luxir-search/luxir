@@ -262,17 +262,21 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
     throw SchemaError("ann: " + msg + " (field: " + std::string(name) + ")");
   };
   using Codec = api::VectorAnnDef_::Codec;
-  Codec codec = def->codec.value_or(Codec::RABITQ);
-  if (codec != Codec::RABITQ && codec != Codec::PQ) {
-    fail("unknown codec " + std::to_string((int)codec) + "; valid: rabitq, pq");
+  if (def->codec) {
+    Codec codec = *def->codec;
+    if (codec != Codec::RABITQ && codec != Codec::PQ) {
+      fail("unknown codec " + std::to_string((int)codec) + "; valid: rabitq, pq");
+    }
+    cfg.codec = codec == Codec::PQ ? VectorAnnConfig::PQ : VectorAnnConfig::RABITQ;
   }
-  cfg.codec = codec == Codec::PQ ? VectorAnnConfig::PQ : VectorAnnConfig::RABITQ;
   if (def->nlist) {
     if (*def->nlist < 0 || *def->nlist > 65536) fail("nlist must be in [0, 65536]");
     cfg.nlist = *def->nlist;
   }
-  if (def->rabitq && codec != Codec::RABITQ) fail("rabitq settings require codec rabitq");
-  if (def->pq && codec != Codec::PQ) fail("pq settings require codec pq");
+  if (def->rabitq && cfg.codec != VectorAnnConfig::RABITQ) {
+    fail("rabitq settings require explicit codec \"rabitq\"");
+  }
+  if (def->pq && cfg.codec != VectorAnnConfig::PQ) fail("pq settings require codec pq");
   if (def->rabitq) {
     if (def->rabitq->bits) {
       if (*def->rabitq->bits < 1 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [1, 9]");

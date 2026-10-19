@@ -323,6 +323,7 @@ TEST_F(FieldVariantsGenerationTest, resolvedVectorAnnIncludesDefaultsAndInherita
     "ann":{"codec":"pq","nlist":16,"pq":{"m":4,"bits":6}}}},"fields":{
     "plain":{"type":"vector"},
     "pqDefaults":{"type":"vector","ann":{"codec":"pq"}},
+    "rabitqDefaults":{"type":"vector","ann":{"codec":"rabitq"}},
     "inherits":{"parent":"_e","variants":{"r":{"parent":"_e",
       "ann":{"codec":"rabitq","nlist":8,"rabitq":{"bits":2,"query_bits":0}}}}}
   }})");
@@ -331,8 +332,9 @@ TEST_F(FieldVariantsGenerationTest, resolvedVectorAnnIncludesDefaultsAndInherita
   auto ann = [&](std::string_view name, std::string_view label = "self") {
     return glz::write_json(json["fields"][name]["representations"][label]["ann"]).value();
   };
-  EXPECT_EQ(R"({"codec":"rabitq","nlist":0,"rabitq":{"bits":1,"query_bits":4}})", ann("plain"));
+  EXPECT_EQ(R"({"codec":"pq","nlist":0,"pq":{"bits":8,"m":0}})", ann("plain"));
   EXPECT_EQ(R"({"codec":"pq","nlist":0,"pq":{"bits":8,"m":0}})", ann("pqDefaults"));
+  EXPECT_EQ(R"({"codec":"rabitq","nlist":0,"rabitq":{"bits":1,"query_bits":4}})", ann("rabitqDefaults"));
   EXPECT_EQ(R"({"codec":"pq","nlist":16,"pq":{"bits":6,"m":4}})", ann("inherits"));
   EXPECT_EQ(R"({"codec":"rabitq","nlist":8,"rabitq":{"bits":2,"query_bits":0}})", ann("inherits", "r"));
   EXPECT_FALSE(json["fields"]["id"]["representations"]["self"].get<glz::generic_sorted_u64::object_t>().contains("ann"));
