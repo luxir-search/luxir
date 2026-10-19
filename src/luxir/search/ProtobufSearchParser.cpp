@@ -23,7 +23,7 @@
 #include "luxir/search/ops/FusionOp.h"
 #include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/query/AllQuery.h"
-#include "luxir/reader/IntColReader.h"
+#include "luxir/search/RangeFacetGrid.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/MinScoreQuery.h"
@@ -148,64 +148,6 @@ struct SearchParserImpl {
     req.warnOnce(code, message);
   }
 
-  ParsedFences makeAffineFences(std::string_view facetName,
-                                 int64_t start, int64_t end, int64_t gap) {
-    uint64_t distance = (uint64_t)end - (uint64_t)start;
-    uint64_t bucketCount = distance / (uint64_t)gap
-                         + (distance % (uint64_t)gap != 0);
-    if (bucketCount > MAX_RANGE_BUCKETS) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': range exceeds the 100000 bucket limit");
-    }
-    auto fences = req.requestPool.make_span<int64_t>((size_t)bucketCount + 1);
-    for (uint64_t i = 0; i <= bucketCount; i++) {
-      __uint128_t product = (__uint128_t)i * (uint64_t)gap;
-      uint64_t offset = product < distance ? (uint64_t)product : distance;
-      fences[(size_t)i] = (int64_t)((uint64_t)start + offset);
-    }
-    return {fences, gap, true};
-  }
-
-  ParsedFences makeFloatingFences(std::string_view facetName,
-                                  FieldType::Type type,
-                                  double start, double end, double gap) {
-    std::vector<int64_t> built;
-    built.reserve(256);
-    for (size_t i = 0; ; i++) {
-      if (i > MAX_RANGE_BUCKETS) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': range exceeds the 100000 bucket limit");
-      }
-      double nominal = start + (double)i * gap;
-      double value = nominal < end ? nominal : end;
-      int64_t encoded;
-      if (type == FieldType::Type::FLOAT) {
-        float rounded = (float)value;
-        if (!std::isfinite(rounded)) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': fence " + std::to_string(i)
-              + " is not finite after FLOAT rounding");
-        }
-        encoded = (int64_t)floatToSortableInt32(rounded);
-      } else {
-        encoded = doubleToSortableInt64(value);
-      }
-      if (!built.empty() && encoded <= built.back()) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': fence " + std::to_string(i)
-            + " is not strictly increasing after "
-            + (type == FieldType::Type::FLOAT ? "FLOAT" : "DOUBLE")
-            + " rounding");
-      }
-      built.push_back(encoded);
-      if (value == end) break;
-    }
-
-    auto fences = req.requestPool.make_span<int64_t>(built.size());
-    std::copy(built.begin(), built.end(), fences.begin());
-    return {fences, 0, false};
-  }
-
   static std::optional<CalendarUnit> calendarUnit(
       api::CalendarGap::Unit unit) {
     using Unit = api::CalendarGap::Unit;
@@ -220,112 +162,24 @@ struct SearchParserImpl {
     return std::nullopt;
   }
 
-  ParsedFences makeCalendarFences(
-      std::string_view facetName, int64_t start, int64_t end,
-      const api::CalendarGap& gap, const TimeZone& zone) {
-    auto unit = calendarUnit(gap.unit);
-    if (gap.n <= 0 || !unit) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': calendar_gap requires n > 0 and a DAY/WEEK/MONTH/QUARTER/YEAR unit");
-    }
-    if (!zone.isIana()
-        && (*unit == CalendarUnit::DAY || *unit == CalendarUnit::WEEK)) {
-      int64_t daysPerUnit = *unit == CalendarUnit::WEEK ? 7 : 1;
-      __int128 fixedGap = (__int128)gap.n * daysPerUnit
-                        * datetime_detail::kMsPerDay;
-      if (fixedGap > std::numeric_limits<int64_t>::max()) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': calendar_gap is too large");
-      }
-      return makeAffineFences(facetName, start, end, (int64_t)fixedGap);
-    }
-
-    CivilCalendarStepper stepper(start, zone);
-    if (!stepper.valid() || !civilFromInstant(end, zone)) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': calendar bounds are outside the supported civil range");
-    }
-    auto previous = stepper.at(0, *unit);
-    if (!previous || previous->instant != start) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': calendar start cannot be resolved in its civil frame");
-    }
-
-    std::vector<int64_t> built;
-    built.reserve(256);
-    built.push_back(start);
-    std::optional<int64_t> shiftedFence;
-    for (int64_t i = 1; ; i++) {
-      __int128 amount = (__int128)i * gap.n;
-      if (amount > std::numeric_limits<int64_t>::max()) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': calendar fence arithmetic overflow");
-      }
-      auto fence = stepper.at((int64_t)amount, *unit);
-      if (!fence) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': calendar fence is outside the supported civil range");
-      }
-      bool substituted = shiftedFence.has_value();
-      int64_t instant = substituted ? *shiftedFence : fence->instant;
-      shiftedFence.reset();
-
-      // A whole skipped date can be reported one nominal endpoint late by
-      // libstdc++'s text-tzdb reader. Detect it from the forward jump covering
-      // the civil interval, drop its bucket now, and carry its shifted instant
-      // as the surviving next label's fence.
-      if (!substituted) {
-        __int128 nextAmount = (__int128)(i + 1) * gap.n;
-        if (nextAmount <= std::numeric_limits<int64_t>::max()) {
-          auto next = stepper.at((int64_t)nextAmount, *unit);
-          if (next && civilIntervalSkipped(
-                  fence->civilMillis, next->civilMillis, zone)) {
-            std::string label = formatEpochMillisIso8601(
-                fence->civilMillis).substr(0, 10);
-            warnOnce("calendar_bucket_skipped",
-                "facet '" + std::string(facetName) + "': calendar bucket "
-                + label + " skipped: no such local day in " + zone.name());
-            shiftedFence = fence->instant;
-            previous = fence;
-            continue;
-          }
-        }
-      }
-
-      if (instant >= end) {
-        built.push_back(end);
-        if (built.size() - 1 > MAX_RANGE_BUCKETS) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': range exceeds the 100000 bucket limit");
-        }
-        break;
-      }
-      if (instant < built.back()) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': calendar fences are not increasing");
-      }
-      if (instant == built.back()) {
-        std::string label = formatEpochMillisIso8601(previous->civilMillis).substr(0, 10);
+  ParsedFences makeGridFences(std::string_view facetName,
+                              const RangeFacetGrid& grid,
+                              int64_t lo, int64_t hi, bool clip) {
+    try {
+      auto built = grid.fences(lo, hi, clip, MAX_RANGE_BUCKETS);
+      for (int64_t civil : built.skippedCivil) {
         warnOnce("calendar_bucket_skipped",
-            "facet '" + std::string(facetName) + "': calendar bucket " + label
-            + " skipped: no such local day in " + zone.name());
-        previous = fence;
-        continue;
+            "facet '" + std::string(facetName) + "': calendar bucket "
+            + formatEpochMillisIso8601(civil).substr(0, 10)
+            + " skipped: no such local day in " + grid.timeZone().name());
       }
-      built.push_back(instant);
-      if (built.size() - 1 > MAX_RANGE_BUCKETS) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': range exceeds the 100000 bucket limit");
-      }
-      previous = fence;
+      auto fences = req.requestPool.make_span<int64_t>(built.values.size());
+      std::copy(built.values.begin(), built.values.end(), fences.begin());
+      return {fences, built.affineGap, built.affineGap != 0};
+    } catch (const std::runtime_error& error) {
+      throw std::runtime_error("facet '" + std::string(facetName) + "': " + error.what());
     }
-
-    auto fences = req.requestPool.make_span<int64_t>(built.size());
-    std::copy(built.begin(), built.end(), fences.begin());
-    return {fences, 0, false};
   }
-
-
 
 public:
   // The provided pool will be used to store the parsed query tree.
@@ -807,12 +661,6 @@ public:
 
   // ---- RangeFacet bounds=DATA ----------------------------------------------
 
-  static __int128 floorDiv(__int128 a, __int128 b) {
-    __int128 q = a / b;
-    if (a % b != 0 && ((a < 0) != (b < 0))) --q;
-    return q;
-  }
-
   // The encoded min and max of a numeric column over every segment of the
   // reader, from column metadata alone: a superset of any domain's range
   // (it ignores the query and deleted documents).
@@ -821,10 +669,8 @@ public:
     std::optional<std::pair<int64_t, int64_t>> range;
     for (auto& segment : req.reader->segments()) {
       const auto* info = infos.at(segment);
-      if (!info) continue;
-      IntColReader column(segment.postingsReader(), *info);
-      auto bounds = column.encodedBounds();
-      if (!bounds.hasValues) continue;
+      if (!info || info->numValues == 0 || !info->columnBounds) continue;
+      const auto& bounds = *info->columnBounds;
       if (!range) range = {bounds.min, bounds.max};
       else range = {std::min(range->first, bounds.min), std::max(range->second, bounds.max)};
     }
@@ -840,119 +686,10 @@ public:
     std::optional<int64_t> lo, hi;
     if (data) { lo = data->first; hi = data->second; }
     if (start) lo = lo ? std::min(*lo, *start) : *start;
-    if (end) hi = hi ? std::max(*hi, *end - 1) : *end - 1;
+    // INT64_MIN has no representable predecessor and cannot widen the span.
+    if (end && *end != INT64_MIN) hi = hi ? std::max(*hi, *end - 1) : *end - 1;
     if (!lo || !hi) return std::nullopt;
     return std::pair{*lo, std::max(*lo, *hi)};
-  }
-
-  // Bucket cap shared by the DATA fence builders; mirrors the EXPLICIT error.
-  void checkDataBucketCount(std::string_view facetName, __int128 buckets) {
-    if (buckets > (__int128)MAX_RANGE_BUCKETS) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': range exceeds the 100000 bucket limit; use a larger gap");
-    }
-  }
-
-  // Fences for a fixed gap over [lo, hi] (inclusive, instants or values):
-  // lower bounds are origin + k * gap, counted in the zone's local time for
-  // DATE fields.
-  ParsedFences makeDataFixedFences(std::string_view facetName, int64_t lo, int64_t hi,
-                                   int64_t gap, int64_t origin,
-                                   const TimeZone* zone) {
-    auto fit = [&](__int128 v) {
-      if (v < std::numeric_limits<int64_t>::min() || v > std::numeric_limits<int64_t>::max()) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': range bounds overflow; use explicit start and end");
-      }
-      return (int64_t)v;
-    };
-    if (zone && zone->isIana()) {
-      auto civil = civilFromInstant(lo, *zone);
-      if (!civil) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': range bounds are outside the supported civil range");
-      }
-      __int128 firstLocal = (__int128)origin + floorDiv((__int128)civil->millis - origin, gap) * gap;
-      datetime_detail::LocalTimeResolver resolver(*zone, civil->offset);
-      std::vector<int64_t> built;
-      for (int64_t k = 0; ; k++) {
-        auto instant = resolver.resolve(fit(firstLocal + (__int128)k * gap));
-        if (!instant) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': range fence is outside the supported civil range");
-        }
-        if (!built.empty() && *instant <= built.back()) continue;  // skipped local time
-        built.push_back(*instant);
-        // The first fence is at or below lo; the last is the first above hi.
-        if (built.size() > 1 && *instant > hi) break;
-        checkDataBucketCount(facetName, (__int128)built.size());
-      }
-      // A first fence above lo means lo fell in a repeated local hour: step back.
-      if (built.front() > lo) {
-        auto prior = resolver.resolve(fit(firstLocal - gap));
-        if (prior && *prior <= lo) built.insert(built.begin(), *prior);
-      }
-      auto fences = req.requestPool.make_span<int64_t>(built.size());
-      std::copy(built.begin(), built.end(), fences.begin());
-      return {fences, 0, false};
-    }
-    int64_t offset = zone && zone->isFixed() ? (int64_t)zone->offsetMinutes() * 60000 : 0;
-    __int128 firstLocal = (__int128)origin
-        + floorDiv((__int128)lo + offset - origin, gap) * gap;
-    __int128 buckets = floorDiv((__int128)hi + offset - firstLocal, gap) + 1;
-    checkDataBucketCount(facetName, buckets);
-    int64_t first = fit(firstLocal - offset);
-    int64_t last = fit((__int128)first + buckets * gap);
-    return makeAffineFences(facetName, first, last, gap);
-  }
-
-  // Fences for a calendar gap over [lo, hi]: the unit start at or below lo,
-  // stepped by n units until a fence passes hi.
-  ParsedFences makeDataCalendarFences(std::string_view facetName, int64_t lo, int64_t hi,
-                                      const api::CalendarGap& gap, const TimeZone& zone) {
-    namespace dd = datetime_detail;
-    auto unit = calendarUnit(gap.unit);
-    if (gap.n <= 0 || !unit) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': calendar_gap requires n > 0 and a DAY/WEEK/MONTH/QUARTER/YEAR unit");
-    }
-    std::optional<int64_t> start;
-    if (*unit == CalendarUnit::QUARTER) {
-      auto civil = civilFromInstant(lo, zone);
-      if (civil) {
-        using namespace std::chrono;
-        local_days day = floor<days>(local_time<milliseconds>{milliseconds{civil->millis}});
-        year_month_day ymd{day};
-        unsigned month = ((unsigned)ymd.month() - 1) / 3 * 3 + 1;
-        int64_t civilStart = local_days{year_month_day{ymd.year(), std::chrono::month{month}, std::chrono::day{1}}}
-            .time_since_epoch().count() * dd::kMsPerDay;
-        start = instantFromCivil(civilStart, zone, civil->offset);
-      }
-    } else {
-      auto unitOf = *unit == CalendarUnit::DAY ? dd::DateMathUnit::DAY
-          : *unit == CalendarUnit::WEEK ? dd::DateMathUnit::WEEK
-          : *unit == CalendarUnit::MONTH ? dd::DateMathUnit::MONTH : dd::DateMathUnit::YEAR;
-      if (auto rounded = dd::roundedInterval(lo, unitOf, zone)) start = rounded->first;
-    }
-    if (!start) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': calendar bounds are outside the supported civil range");
-    }
-    CivilCalendarStepper stepper(*start, zone);
-    std::optional<int64_t> end;
-    for (int64_t i = 1; i <= (int64_t)MAX_RANGE_BUCKETS + 1; i++) {
-      auto fence = stepper.at(i * gap.n, *unit);
-      if (!fence) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': calendar fence is outside the supported civil range");
-      }
-      if (fence->instant > hi) {
-        end = fence->instant;
-        break;
-      }
-    }
-    if (!end) checkDataBucketCount(facetName, (__int128)MAX_RANGE_BUCKETS + 1);
-    return makeCalendarFences(facetName, *start, *end, gap, zone);
   }
 
   // Trimming plan for a DATA facet: the bucket range an explicit start or end
@@ -1026,6 +763,20 @@ public:
         && (!facetReq.time_zone.empty() || calendar)) {
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': time_zone and calendar_gap are only valid for DATE fields");
+    }
+
+    std::optional<CalendarUnit> calendarGridUnit;
+    if (calendar) {
+      const auto& spec = std::get<api::CalendarGap>(facetReq.gap_kind);
+      calendarGridUnit = calendarUnit(spec.unit);
+      if (spec.n <= 0 || !calendarGridUnit) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': calendar_gap requires n > 0 and a DAY/WEEK/MONTH/QUARTER/YEAR unit");
+      }
+      if (facetReq.origin.has_value()) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': origin is not supported with calendar_gap");
+      }
     }
 
     int64_t minCount = facetReq.mincount.value_or(0);
@@ -1150,47 +901,41 @@ public:
         throw std::runtime_error("facet '" + std::string(facetName)
             + "': range gap must be > 0");
       }
+      auto gridType = fieldType->type();
+      double origin = dataBounds
+          ? (facetReq.origin.has_value() ? floatingValue(*facetReq.origin, "origin") : 0.0)
+          : *givenStart;
+      auto grid = RangeFacetGrid::floating(gridType, gap, origin);
+      auto encodedStart = givenStart ? std::optional<int64_t>(grid.encode(*givenStart)) : std::nullopt;
+      auto encodedEnd = givenEnd ? std::optional<int64_t>(grid.encode(*givenEnd)) : std::nullopt;
       ParsedFences parsed;
       DataTrim trim;
       if (dataBounds) {
-        double origin = facetReq.origin.has_value()
-            ? floatingValue(*facetReq.origin, "origin") : 0.0;
-        std::optional<double> lo = givenStart, hi = givenEnd;
+        std::optional<int64_t> lo = encodedStart, hi;
+        // End is exclusive in the encoded column representation too.
+        if (encodedEnd) hi = *encodedEnd - 1;
         if (auto data = dataColumnBounds(facetField)) {
           auto decode = [&](int64_t encoded) {
-            return fieldType->type() == FieldType::Type::FLOAT
+            return gridType == FieldType::Type::FLOAT
                 ? (double)sortableInt32ToFloat((int32_t)encoded)
                 : sortableInt64ToDouble(encoded);
           };
-          double dataLo = decode(data->first), dataHi = decode(data->second);
-          if (!std::isfinite(dataLo) || !std::isfinite(dataHi)) {
+          if (!std::isfinite(decode(data->first)) || !std::isfinite(decode(data->second))) {
             throw std::runtime_error("facet '" + std::string(facetName)
                 + "': field has non-finite values; bounds DATA cannot span them");
           }
-          lo = lo ? std::min(*lo, dataLo) : dataLo;
-          hi = hi ? std::max(*hi, dataHi) : dataHi;
+          lo = lo ? std::min(*lo, data->first) : data->first;
+          hi = hi ? std::max(*hi, data->second) : data->second;
         }
         if (lo && hi) {
-          double first = origin + std::floor((*lo - origin) / gap) * gap;
-          double buckets = std::floor((*hi - first) / gap) + 1;
-          if (!(buckets <= (double)MAX_RANGE_BUCKETS)) {
-            throw std::runtime_error("facet '" + std::string(facetName)
-                + "': range exceeds the 100000 bucket limit; use a larger gap");
-          }
-          parsed = makeFloatingFences(facetName, fieldType->type(), first,
-                                      first + buckets * gap, gap);
+          parsed = makeGridFences(facetName, grid, *lo, std::max(*lo, *hi), false);
         } else {
-          parsed = makeFloatingFences(facetName, fieldType->type(), 0.0, 1.0, 1.0);
+          parsed = makeGridFences(facetName,
+              RangeFacetGrid::floating(gridType, 1), grid.encode(0), grid.encode(1), true);
         }
-        auto encode = [&](double v) {
-          return fieldType->type() == FieldType::Type::FLOAT
-              ? (int64_t)floatToSortableInt32((float)v) : doubleToSortableInt64(v);
-        };
-        trim = dataTrim(parsed.values,
-            givenStart ? std::optional<int64_t>(encode(*givenStart)) : std::nullopt,
-            givenEnd ? std::optional<int64_t>(encode(*givenEnd)) : std::nullopt);
+        trim = dataTrim(parsed.values, encodedStart, encodedEnd);
       } else {
-        parsed = makeFloatingFences(facetName, fieldType->type(), *givenStart, *givenEnd, gap);
+        parsed = makeGridFences(facetName, grid, *encodedStart, *encodedEnd, true);
       }
       checkSubOpBucketCap(parsed);
       auto selected = resolveSelectedBuckets(parsed, [&](const api::Val& value) {
@@ -1220,62 +965,45 @@ public:
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': range start must be less than end");
     }
-    int64_t start = givenStart.value_or(0);
-    int64_t end = givenEnd.value_or(0);
-
     ParsedFences parsed;
     DataTrim trim;
-    if (const auto* gapValue = std::get_if<api::Val>(&facetReq.gap_kind)) {
-      int64_t gap;
-      if (fieldType->type() == FieldType::Type::DATE) {
-        const auto* millis = std::get_if<int64_t>(&gapValue->kind);
-        if (millis == nullptr) {
+    auto grid = [&]() {
+      if (calendar) {
+        const auto& spec = std::get<api::CalendarGap>(facetReq.gap_kind);
+        return RangeFacetGrid::calendar(*calendarGridUnit, spec.n, zone,
+            dataBounds ? std::nullopt : givenStart);
+      }
+      const auto& gapValue = std::get<api::Val>(facetReq.gap_kind);
+      bool date = fieldType->type() == FieldType::Type::DATE;
+      auto integer = [&](const api::Val& value, std::string_view name) {
+        if (!date) return fieldType->coerceColInt64(value, facetField, context);
+        const auto* millis = std::get_if<int64_t>(&value.kind);
+        if (!millis) {
           throw std::runtime_error("facet '" + std::string(facetName)
-              + "': a DATE fixed gap must be integer milliseconds");
+              + "': a DATE " + std::string(name) + " must be integer milliseconds");
         }
-        gap = *millis;
-      } else {
-        gap = fieldType->coerceColInt64(*gapValue, facetField, context);
-      }
-      if (gap <= 0) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': range gap must be > 0");
-      }
+        return *millis;
+      };
+      int64_t gap = integer(gapValue, "fixed gap");
+      int64_t origin = 0;
       if (dataBounds) {
-        int64_t origin = 0;
-        if (facetReq.origin.has_value()) {
-          if (fieldType->type() == FieldType::Type::DATE) {
-            const auto* millis = std::get_if<int64_t>(&facetReq.origin->kind);
-            if (millis == nullptr) {
-              throw std::runtime_error("facet '" + std::string(facetName)
-                  + "': a DATE origin must be integer milliseconds");
-            }
-            origin = *millis;
-          } else {
-            origin = fieldType->coerceColInt64(*facetReq.origin, facetField, context);
-          }
-        }
-        auto range = dataIntRange(facetField, givenStart, givenEnd);
-        if (range) {
-          parsed = makeDataFixedFences(facetName, range->first, range->second, gap, origin,
-              fieldType->type() == FieldType::Type::DATE ? &zone : nullptr);
-        } else {
-          parsed = makeAffineFences(facetName, 0, 1, 1);
-        }
+        if (facetReq.origin.has_value()) origin = integer(*facetReq.origin, "origin");
       } else {
-        parsed = makeAffineFences(facetName, start, end, gap);
+        if (date) {
+          auto civil = civilFromInstant(*givenStart, zone);
+          if (!civil) throw std::runtime_error("range bounds are outside the supported civil range");
+          origin = civil->millis;
+        } else origin = *givenStart;
       }
-    } else if (dataBounds) {
+      return RangeFacetGrid::fixed(fieldType->type(),
+                                   gap, origin, zone);
+    }();
+    if (dataBounds) {
       auto range = dataIntRange(facetField, givenStart, givenEnd);
-      if (range) {
-        parsed = makeDataCalendarFences(facetName, range->first, range->second,
-            std::get<api::CalendarGap>(facetReq.gap_kind), zone);
-      } else {
-        parsed = makeAffineFences(facetName, 0, 1, 1);
-      }
+      if (range) parsed = makeGridFences(facetName, grid, range->first, range->second, false);
+      else parsed = makeGridFences(facetName, RangeFacetGrid::fixed(FieldType::Type::INT, 1), 0, 1, true);
     } else {
-      parsed = makeCalendarFences(facetName, start, end,
-          std::get<api::CalendarGap>(facetReq.gap_kind), zone);
+      parsed = makeGridFences(facetName, grid, *givenStart, *givenEnd, true);
     }
     if (dataBounds) {
       trim = dataTrim(parsed.values, givenStart,

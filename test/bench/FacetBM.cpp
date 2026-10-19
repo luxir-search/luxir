@@ -198,6 +198,85 @@ static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
       state.iterations(), benchmark::Counter::kIsRate);
 }
 
+// Shared DATA corpus. Setup stays outside the timed search loop. In addition
+// to the current lanes, keep a time-correlated 20-year minute span for narrow
+// filters, separated parent windows, and distinct keys for the streaming lanes.
+struct RangeDataBenchFixture {
+  CollectionHelper helper{"facet_range_data_bm"};
+  bool reused;
+  static constexpr int64_t epoch = 1577836800000LL;
+  static constexpr int64_t retention = 20LL * 365 * 86400000;
+
+  explicit RangeDataBenchFixture(int64_t docs, std::string_view shape) {
+    if (unit_tests) docs = LuxirTest::scaleTestWork(200);
+    std::vector<int32_t> docsPerSeg;
+    CollectionHelper::calcSegSizes(docs, 10, shape, docsPerSeg);
+    reused = helper.indexMatchesShape(docsPerSeg);
+    if (reused) return;
+    helper.clear();
+    SchemaBuilder schema;
+    for (auto name : {"data_i", "date_dt", "retention_dt", "group_i"}) {
+      auto& field = schema.field(name);
+      field.type = std::string_view(name).ends_with("_dt")
+          ? api::FieldDef::FieldClass::DATE : api::FieldDef::FieldClass::INT;
+      field.index = api::FieldDef::IndexMode::RANGE;
+    }
+    schema.field("parent_s").type = api::FieldDef::FieldClass::STRING;
+    schema.set(helper.collection());
+    auto iw = helper.getIndexWriter();
+    int64_t doc = 0;
+    for (int32_t size : docsPerSeg) {
+      auto& inv = iw->obtainInverter();
+      auto& id = inv.getIndexHandler("id");
+      auto& value = inv.getIndexHandler("data_i");
+      auto& date = inv.getIndexHandler("date_dt");
+      auto& retained = inv.getIndexHandler("retention_dt");
+      auto& parent = inv.getIndexHandler("parent_s");
+      auto& group = inv.getIndexHandler("group_i");
+      for (int32_t i = 0; i < size; i++, doc++) {
+        inv.startDoc();
+        id.index(inv, std::to_string(doc));
+        value.index(inv, doc % 10000 * 1000);
+        date.index(inv, epoch + doc % (365 * 24) * 3600000);
+        retained.index(inv, epoch + (int64_t)((__int128)doc * retention / docs));
+        parent.index(inv, "p" + std::to_string(doc * 32 / docs));
+        group.index(inv, doc % 4096);
+        inv.finishDoc();
+      }
+      iw->releaseInverter(inv, true);
+    }
+    helper.commit();
+  }
+};
+
+static void BM_RangeFacetData(benchmark::State& state, int64_t nDocs,
+                              std::string_view shape, bool date, bool iana) {
+  RangeDataBenchFixture fixture(nDocs, shape);
+  int64_t fingerprint = -1;
+  for (auto _ : state) {
+    auto req = localReq(fixture.helper.getSearchEngine());
+    req->collection("facet_range_data_bm");
+    if (iana) req->timeZone("America/New_York");
+    req->rangeFacet("f", date ? "date_dt" : "data_i")
+        .rangeData(date ? 3600000 : 100000);
+    req->execute(false);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+    int64_t current = 0;
+    const auto& bounds = std::get<api::ArrArrInt>(result->bucket_ids->kind).v;
+    for (size_t i = 0; i < result->counts.size(); i++) {
+      current = (int64_t)((uint64_t)current * 31 + (uint64_t)bounds[i].v[0] + result->counts[i]);
+    }
+    benchmark::DoNotOptimize(current);
+    if (fingerprint != -1) {
+      ASSERT_EQ(fingerprint, current);
+    }
+    fingerprint = current;
+  }
+  state.counters["fp"] = fingerprint;
+  state.counters["reused"] = fixture.reused;
+}
+
 enum class AggregateFacetBenchMode {
   BUCKET_DOMAIN,
   INLINE_SORT,
@@ -418,6 +497,9 @@ LUXIR_BENCHMARK_CAPTURE(BM_Facet, lim0_bigD_u10_i,  nDocs, shape, "short_u10_s",
 
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, points,      nDocs, shape, false);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, forced_walk, nDocs, shape, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_int, nDocs, shape, false, false);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_date, nDocs, shape, true, false);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_hourly, nDocs, shape, true, true);
 LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, bucket_domain,
                         AggregateFacetBenchMode::BUCKET_DOMAIN, 10);
 LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_10,

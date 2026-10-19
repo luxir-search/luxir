@@ -6305,6 +6305,15 @@ TEST_F(FacetTest, dataBoundsValidation) {
   cap->rangeFacet("h", "n_i").rangeData(1, std::nullopt, 0, 1000000);
   cap->execute(false);
   EXPECT_TRUE(hasError(cap->responses[0]->proto));
+  EXPECT_NE(std::string::npos, cap->errorMsg().find("; use a larger gap"));
+
+  auto explicitCap = localReq(luxirNode->getSearchEngine());
+  explicitCap->collection("main");
+  explicitCap->rangeFacet("h", "n_i").range(0, 1000000, 1);
+  explicitCap->execute(false);
+  EXPECT_FALSE(explicitCap->ok());
+  EXPECT_NE(std::string::npos, explicitCap->errorMsg().find("100000 bucket limit"));
+  EXPECT_EQ(std::string::npos, explicitCap->errorMsg().find("use a larger gap"));
 }
 
 TEST_F(FacetTest, dataBoundsDateFixedGapCountsInLocalTime) {
@@ -6366,4 +6375,308 @@ TEST_F(FacetTest, dataBoundsFloatingGap) {
   EXPECT_DOUBLE_EQ(1.0, bounds.front().v[0]);
   EXPECT_DOUBLE_EQ(5.0, bounds.back().v[1]);
   EXPECT_EQ((Counts{1, 0, 0, 1}), countsOf(result));
+}
+
+TEST_F(FacetTest, dataFloatingCoverageBothEnds) {
+  CollectionHelper helper;
+  setRangeFacetSchema(helper, std::array{
+      RangeSchemaField{"x_d", false, false, api::FieldDef::FieldClass::DOUBLE},
+      RangeSchemaField{"x_f", false, false, api::FieldDef::FieldClass::FLOAT}});
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "x_d", 0.3, "x_f", 0.7),
+                           UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "x_d", 0.7), UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("d", "x_d").rangeDataFp(0.1);
+  req->rangeFacet("f", "x_f").rangeDataFp(0.1);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& doubles = rootFacetResult(*req, "d");
+  const auto& floats = rootFacetResult(*req, "f");
+  EXPECT_EQ(2, std::accumulate(doubles.counts.begin(), doubles.counts.end(), int64_t{0}))
+      << req->toString();
+  EXPECT_EQ(1, std::accumulate(floats.counts.begin(), floats.counts.end(), int64_t{0}))
+      << req->toString();
+}
+
+TEST_F(FacetTest, dataFloatingNegativeLowerCoverage) {
+  CollectionHelper helper;
+  setRangeFacetSchema(helper, std::array{
+      RangeSchemaField{"x_d", false, false, api::FieldDef::FieldClass::DOUBLE}});
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "x_d", -1.86), UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("d", "x_d").rangeDataFp(0.31);
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ((Counts{1}), countsOf(rootFacetResult(*req, "d"))) << req->toString();
+}
+
+TEST_F(FacetTest, dataCalendarPhaseIgnoresExcludedDocs) {
+  CollectionHelper helper;
+  indexInts(helper, {epoch("2024-02-15T00:00:00Z")},
+            api::FieldDef::FieldClass::DATE, "when_dt");
+  auto run = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    req->topDocs("q").matchQuery("when_dt", "2024-02-15T00:00:00Z").limit(0)
+        .rangeFacet("m", "when_dt").rangeDataCalendar(2, api::CalendarGap_::Unit::MONTH);
+    req->execute(false);
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    return boundsOf(topFacetResult(*req, "q", "m"));
+  };
+  Bounds before = run();
+  ASSERT_EQ((Bounds{{epoch("2024-01-01T00:00:00Z"), epoch("2024-03-01T00:00:00Z")}}), before);
+  ASSERT_TRUE(helper.index(flatdoc("id", "unrelated", "when_dt", "2024-01-15T00:00:00Z"),
+                           UpdateMessage::COMMIT).success);
+  EXPECT_EQ(before, run());
+}
+
+TEST_F(FacetTest, dataDateFoldPhaseIgnoresExcludedDocs) {
+  CollectionHelper helper;
+  indexInts(helper, {epoch("2024-11-03T06:30:00Z")},
+            api::FieldDef::FieldClass::DATE, "when_dt");
+  auto run = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").timeZone("America/New_York");
+    req->topDocs("q").matchQuery("when_dt", "2024-11-03T06:30:00Z").limit(0)
+        .rangeFacet("h", "when_dt").rangeData(3600000);
+    req->execute(false);
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    return boundsOf(topFacetResult(*req, "q", "h"));
+  };
+  Bounds before = run();
+  ASSERT_EQ((Bounds{{epoch("2024-11-03T06:00:00Z"), epoch("2024-11-03T07:00:00Z")}}), before);
+  ASSERT_TRUE(helper.index(flatdoc("id", "unrelated", "when_dt", "2024-11-03T05:30:00Z"),
+                           UpdateMessage::COMMIT).success);
+  EXPECT_EQ(before, run());
+}
+
+TEST_F(FacetTest, dataEmptyFieldValidatesCalendarGap) {
+  CollectionHelper helper;
+  indexInts(helper, {}, api::FieldDef::FieldClass::DATE, "when_dt");
+  for (int n : {0, -1, 1}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    req->rangeFacet("h", "when_dt").rangeDataCalendar(n,
+        n == 1 ? api::CalendarGap_::Unit::UNKNOWN : api::CalendarGap_::Unit::MONTH);
+    req->execute(false);
+    EXPECT_TRUE(hasError(req->responses[0]->proto)) << n << ' ' << req->toString();
+  }
+}
+
+TEST_F(FacetTest, dataMinimumWideningEndDoesNotOverflow) {
+  CollectionHelper helper;
+  indexInts(helper, {15});
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("h", "n_i").rangeData(10, std::nullopt, std::nullopt,
+                                        std::numeric_limits<int64_t>::min());
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ((Bounds{{10, 20}}), boundsOf(rootFacetResult(*req, "h")));
+}
+
+TEST_F(FacetTest, dataDateSpringGapCoversMinimum) {
+  CollectionHelper helper;
+  indexInts(helper, {epoch("2024-03-10T07:02:00Z")},
+            api::FieldDef::FieldClass::DATE, "when_dt");
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").timeZone("America/New_York");
+  req->rangeFacet("h", "when_dt").rangeData(600000, 300000);
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ((Counts{1}), countsOf(rootFacetResult(*req, "h"))) << req->toString();
+}
+
+TEST_F(FacetTest, dataFloatingWideningEndIsExclusive) {
+  CollectionHelper helper;
+  setRangeFacetSchema(helper, std::array{
+      RangeSchemaField{"x_d", false, false, api::FieldDef::FieldClass::DOUBLE}});
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "x_d", 15.0), UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","ops":{
+    "h":{"range_facet":{"field":"x_d","bounds":"data","gap":1,
+      "start":0,"end":100000}}}})", req->mr));
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ(100000u, rootFacetResult(*req, "h").counts.size());
+}
+
+TEST_F(FacetTest, dataDateIanaBucketCapBoundary) {
+  CollectionHelper helper;
+  int64_t start = epoch("2024-01-15T00:00Z");
+  indexInts(helper, {start}, api::FieldDef::FieldClass::DATE, "when_dt");
+  for (auto zoneName : {"UTC", "America/New_York"}) for (int n : {100000, 100001}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").timeZone(zoneName);
+    req->rangeFacet("h", "when_dt").rangeData(1, std::nullopt, start, start + n);
+    req->execute(false);
+    EXPECT_EQ(n == 100000, req->ok()) << zoneName << ' ' << req->toString();
+    if (req->ok()) {
+      EXPECT_EQ(100000u, rootFacetResult(*req, "h").counts.size());
+    }
+  }
+}
+
+TEST_F(FacetTest, dateFixedExplicitAndDataShareClock) {
+  CollectionHelper helper;
+  indexInts(helper, {epoch("2024-03-10T16:00Z"), epoch("2024-03-11T16:00Z")},
+            api::FieldDef::FieldClass::DATE, "when_dt");
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").timeZone("America/New_York");
+  int64_t start = epoch("2024-03-09T05:00Z"), end = epoch("2024-03-12T04:00Z");
+  req->rangeFacet("explicit", "when_dt").range(start, end, 86400000);
+  req->rangeFacet("data", "when_dt").rangeData(86400000, std::nullopt, start, end);
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ(boundsOf(rootFacetResult(*req, "data")), boundsOf(rootFacetResult(*req, "explicit")));
+  EXPECT_EQ(epoch("2024-03-11T04:00Z"), boundsOf(rootFacetResult(*req, "data"))[1].second);
+}
+
+TEST_F(FacetTest, dataFloatingInteriorIgnoresExcludedDocs) {
+  CollectionHelper helper;
+  setRangeFacetSchema(helper, std::array{
+      RangeSchemaField{"x_d", false, false, api::FieldDef::FieldClass::DOUBLE}});
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "a", "tag_s", "keep", "x_d", 0.5),
+      flatdoc("id", "b", "tag_s", "keep", "x_d", 0.6),
+      flatdoc("id", "c", "tag_s", "keep", "x_d", 0.85)}, UpdateMessage::COMMIT).success);
+  auto run = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    req->topDocs("q").matchQuery("tag_s", "keep").limit(0)
+        .rangeFacet("h", "x_d").rangeDataFp(0.1);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->toString();
+    return countsOf(topFacetResult(*req, "q", "h"));
+  };
+  Counts before = run();
+  ASSERT_EQ(3, std::accumulate(before.begin(), before.end(), int64_t{0}));
+  ASSERT_TRUE(helper.index(flatdoc("id", "unrelated", "x_d", 0.0), UpdateMessage::COMMIT).success);
+  EXPECT_EQ(before, run());
+}
+
+TEST_F(FacetTest, dataDateTransitionFencesCountTowardCap) {
+  CollectionHelper helper;
+  // The transition fence and both fold occurrences count toward the cap.
+  indexInts(helper, {epoch("2024-03-10T07:10Z")}, api::FieldDef::FieldClass::DATE, "when_dt");
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").timeZone("America/New_York");
+  req->rangeFacet("h", "when_dt").rangeData(3600000, 1800000, std::nullopt,
+                                           epoch("2035-08-07T10:30Z"));
+  req->execute(false);
+  EXPECT_FALSE(req->ok()) << req->toString();
+}
+
+TEST_F(FacetTest, calendarDataOriginRejectedBeforeReadingEmptyField) {
+  CollectionHelper helper;
+  indexInts(helper, {}, api::FieldDef::FieldClass::DATE, "when_dt");
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& op = req->rangeFacet("h", "when_dt").rangeDataCalendar(1, api::CalendarGap_::Unit::DAY);
+  auto* origin = api::build::allocMessage<api::Val>(req->mr);
+  origin->kind = int64_t{0};
+  std::get<api::RangeFacet>(op.rawOp().kind).origin = origin;
+  req->execute(false);
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("origin"));
+}
+
+TEST_F(FacetTest, dataIntegerMatchesExplicitAcrossExecutionPaths) {
+  CollectionHelper helper;
+  std::mt19937 random(57);
+  for (bool points : {false, true}) {
+    helper.clear();
+    setRangeFacetSchema(helper, std::array{RangeSchemaField{"n_i", points, true}});
+    std::vector<Doc> docs;
+    for (int i = 0; i < 64; i++) {
+      if (i % 11 == 0) docs.push_back(flatdoc("id", std::to_string(i)));
+      else docs.push_back(flatdoc("id", std::to_string(i), "n_i",
+          std::vector<int64_t>{(int)(random() % 180) - 90, (int)(random() % 180) - 90},
+          "score_i", i));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    for (int phase : {0, 1}) {
+      if (phase) {
+        ASSERT_TRUE(helper.deleteByIds({"1", "2", "3", "4"}, UpdateMessage::COMMIT).success);
+      }
+      for (int parallel : {1, -1}) for (int mincount : {0, 2}) for (bool metrics : {false, true}) {
+        auto req = localReq(helper.getSearchEngine());
+        req->collection("main");
+        auto& data = req->rangeFacet("data", "n_i").rangeData(10, 3, -97, 103).mincount(mincount);
+        auto& explicitRange = req->rangeFacet("explicit", "n_i").range(-97, 103, 10).mincount(mincount);
+        for (OpCursor* cursor : {&data, &explicitRange}) {
+          std::get<api::RangeFacet>(cursor->rawOp().kind).missing = true;
+          if (metrics) cursor->avg("avg", "score_i");
+        }
+        req->execute(parallel);
+        ASSERT_OK(req);
+        const auto& a = rootFacetResult(*req, "data");
+        const auto& b = rootFacetResult(*req, "explicit");
+        EXPECT_EQ(boundsOf(b), boundsOf(a));
+        EXPECT_EQ(countsOf(b), countsOf(a));
+        EXPECT_EQ(b.missing, a.missing);
+        EXPECT_EQ(encodeFacetResult(*req, "explicit"), encodeFacetResult(*req, "data"));
+      }
+    }
+  }
+}
+
+TEST_F(FacetTest, dataCalendarSingleUnitMatchesExplicit) {
+  CollectionHelper helper;
+  indexInts(helper, {epoch("2024-02-15T10:00:00Z"), epoch("2024-04-02T01:00:00Z")},
+            api::FieldDef::FieldClass::DATE, "when_dt");
+  using Unit = api::CalendarGap_::Unit;
+  struct Case { Unit unit; std::string_view start; std::string_view end; };
+  for (const auto& c : std::array{
+      Case{Unit::DAY, "2024-02-15", "2024-04-03"},
+      Case{Unit::WEEK, "2024-02-12", "2024-04-08"},
+      Case{Unit::MONTH, "2024-02-01", "2024-05-01"},
+      Case{Unit::QUARTER, "2024-01-01", "2024-07-01"},
+      Case{Unit::YEAR, "2024-01-01", "2025-01-01"}}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    req->rangeFacet("data", "when_dt").rangeDataCalendar(1, c.unit, "UTC");
+    req->rangeFacet("explicit", "when_dt").calendarRange(c.start, c.end, 1, c.unit, "UTC");
+    req->execute(false);
+    ASSERT_OK(req);
+    EXPECT_EQ(boundsOf(rootFacetResult(*req, "explicit")), boundsOf(rootFacetResult(*req, "data")));
+    EXPECT_EQ(countsOf(rootFacetResult(*req, "explicit")), countsOf(rootFacetResult(*req, "data")));
+  }
+}
+
+TEST_F(FacetTest, explicitCalendarMultipleUnitsKeepStartPhase) {
+  CollectionHelper helper;
+  indexInts(helper, {epoch("2024-02-15"), epoch("2024-05-15")},
+            api::FieldDef::FieldClass::DATE, "when_dt");
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("m", "when_dt").calendarRange(
+      "2024-02-01", "2024-06-02", 2, api::CalendarGap_::Unit::MONTH, "UTC");
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ((Bounds{{epoch("2024-02-01"), epoch("2024-04-01")},
+                    {epoch("2024-04-01"), epoch("2024-06-01")},
+                    {epoch("2024-06-01"), epoch("2024-06-02")}}),
+            boundsOf(rootFacetResult(*req, "m")));
+  EXPECT_EQ((Counts{1, 1, 0}), countsOf(rootFacetResult(*req, "m")));
+}
+
+TEST_F(FacetTest, dataCalendarMidnightFoldUsesEarliestFence) {
+  CollectionHelper helper;
+  indexInts(helper, {epoch("2015-11-01T04:30Z"), epoch("2015-11-01T05:30Z")},
+            api::FieldDef::FieldClass::DATE, "when_dt");
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").timeZone("America/Havana");
+  req->rangeFacet("d", "when_dt").rangeDataCalendar(1, api::CalendarGap_::Unit::DAY);
+  req->rangeFacet("m", "when_dt").rangeDataCalendar(1, api::CalendarGap_::Unit::MONTH);
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ((Bounds{{epoch("2015-11-01T04:00Z"), epoch("2015-11-02T05:00Z")}}),
+            boundsOf(rootFacetResult(*req, "d")));
+  EXPECT_EQ((Bounds{{epoch("2015-11-01T04:00Z"), epoch("2015-12-01T05:00Z")}}),
+            boundsOf(rootFacetResult(*req, "m")));
+  EXPECT_EQ((Counts{2}), countsOf(rootFacetResult(*req, "d")));
+  EXPECT_EQ((Counts{2}), countsOf(rootFacetResult(*req, "m")));
 }
