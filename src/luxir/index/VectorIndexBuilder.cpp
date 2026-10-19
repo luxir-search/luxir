@@ -197,7 +197,6 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
 // Default 1 MiB.  Tests can override via VectorIndexBuilder::renormChunkBytes.
 size_t VectorIndexBuilder::renormChunkBytes = 1 * 1024 * 1024;
 bool VectorIndexBuilder::buildFaissAuxIndexes = true;
-std::optional<VectorAnnConfig> VectorIndexBuilder::annConfigOverrideForTests;
 // PQ trains 2^bits centroids per sub-quantizer: FAISS wants 39 points per
 // centroid, so 8-bit PQ needs ~10k vectors before its codebooks mean much.
 int64_t VectorIndexBuilder::ivfPqMinTrainingVectors =
@@ -281,7 +280,7 @@ VectorIndexBuilder::build(const std::vector<std::string>& selectors,
 
     LOG_TRACE("VectorIndexBuilder: building {} (metric={}, dims_pinned={})",
              auxName, (int)vft->metric_, vft->dims_);
-    auto info = buildField(fieldName, *vft, outFilesToSync, buildSite);
+    auto info = buildIvfField(fieldName, *vft, outFilesToSync, buildSite);
     if (info) {
       result.emplace_back(std::move(*info));
     }
@@ -308,24 +307,15 @@ VectorIndexBuilder::matchingOverlayNames(const std::vector<std::string>& selecto
 }
 
 std::optional<AuxInfo>
-VectorIndexBuilder::buildField(std::string_view fieldName,
-                               const VectorFieldType& ft,
-                               std::vector<std::string>& outFilesToSync,
-                               BuildSite buildSite) {
+VectorIndexBuilder::buildIvfField(std::string_view fieldName,
+                                  const VectorFieldType& ft,
+                                  std::vector<std::string>& outFilesToSync,
+                                  BuildSite buildSite) {
   // Test hook: a listener may throw (or block) to exercise vector
   // build-failure paths.  Args: the field name (std::string_view*) and the
   // build site, so a listener can target a specific field and/or site.
   Signal::emit("vectorBuildField", (void*)&fieldName, (void*)(intptr_t)buildSite);
-  const VectorAnnConfig& ann = annConfigOverrideForTests ? *annConfigOverrideForTests : ft.ann();
-  return buildIvfField(fieldName, ft, ann, outFilesToSync, buildSite);
-}
-
-std::optional<AuxInfo>
-VectorIndexBuilder::buildIvfField(std::string_view fieldName,
-                                  const VectorFieldType& ft,
-                                  const VectorAnnConfig& ann,
-                                  std::vector<std::string>& outFilesToSync,
-                                  BuildSite buildSite) {
+  const VectorAnnConfig& ann = ft.ann();
   int32_t dims = ft.dims_;
   faiss::MetricType metric = toFaissMetric(ft.metric_);
   bool rabitq = ann.codec == VectorAnnConfig::RABITQ;

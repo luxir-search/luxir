@@ -56,11 +56,6 @@ public:
   // the flat-over-column fallback without changing request selectors.
   static bool buildFaissAuxIndexes;
 
-  // Test override for every field's schema "ann" settings (codec, nlist,
-  // codec parameters); unset in production, where the field type is the
-  // only source.
-  static std::optional<VectorAnnConfig> annConfigOverrideForTests;
-
   // Build policy.  A segment gets an IVF overlay only when it has at least
   // the codec's training floor of vectors and N * dims >= the scan-cost
   // threshold; smaller segments are scanned exactly from the column.
@@ -132,16 +127,10 @@ private:
 
   // Builds the FAISS index file for one field.  Returns nullopt when
   // no segment has any vectors for the field (no files written, nothing to record).
-  std::optional<AuxInfo> buildField(std::string_view fieldName,
-                                                const VectorFieldType& ft,
-                                                std::vector<std::string>& outFilesToSync,
-                                                BuildSite buildSite);
-
   std::optional<AuxInfo> buildIvfField(std::string_view fieldName,
-                                       const VectorFieldType& ft,
-                                       const VectorAnnConfig& ann,
-                                       std::vector<std::string>& outFilesToSync,
-                                       BuildSite buildSite);
+                                      const VectorFieldType& ft,
+                                      std::vector<std::string>& outFilesToSync,
+                                      BuildSite buildSite);
 };
 
 } // namespace luxir

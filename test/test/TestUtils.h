@@ -41,25 +41,17 @@ template <class... Values>
 SearchOverridesGuard(Values&...) -> SearchOverridesGuard<Values...>;
 
 // Opens the IVF build policy for tiny test corpora (training floor
-// minTraining, no scan-cost threshold) and, when `ann` is set, pins every
-// vector field's ANN settings over the schema's.  Restores on destruction.
+// minTraining, no scan-cost threshold). Restores on destruction.
 class IvfTestGuard {
-  SearchOverridesGuard<bool, std::optional<VectorAnnConfig>, int64_t, int64_t, int64_t> saved{
-    VectorIndexBuilder::buildFaissAuxIndexes, VectorIndexBuilder::annConfigOverrideForTests,
+  SearchOverridesGuard<int64_t, int64_t, int64_t> saved{
     VectorIndexBuilder::ivfPqMinTrainingVectors, VectorIndexBuilder::ivfRaBitQMinTrainingVectors,
     VectorIndexBuilder::ivfBuildThresholdScanCost};
 
 public:
-  explicit IvfTestGuard(std::optional<VectorAnnConfig> ann, int64_t minTraining = 2) {
-    VectorIndexBuilder::buildFaissAuxIndexes = true;
-    VectorIndexBuilder::annConfigOverrideForTests = ann;
+  explicit IvfTestGuard(int64_t minTraining = 2) {
     VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
     VectorIndexBuilder::ivfRaBitQMinTrainingVectors = minTraining;
     VectorIndexBuilder::ivfBuildThresholdScanCost = 0;
-  }
-
-  static VectorAnnConfig pq(int32_t nlist, int32_t m, int32_t bits) {
-    return {.codec = VectorAnnConfig::PQ, .nlist = nlist, .pqM = m, .pqBits = bits};
   }
 };
 

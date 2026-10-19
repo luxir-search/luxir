@@ -58,13 +58,12 @@ int32_t benchRaBitQBits(int32_t codec) {
 }
 
 void setBenchAnn(api::FieldDef& f, int32_t dims, int32_t codec) {
-  auto& ann = f.ann.emplace();
   if (codec == PQ || codec == PQ_D8) {
-    ann.codec = api::VectorAnnDef::Codec::PQ;
-    if (codec == PQ_D8) ann.pq.emplace().m = dims / 8;
+    f.ann = pqAnn(luxir::unit_tests ? 4 : 0,
+                  luxir::unit_tests ? 2 : codec == PQ_D8 ? dims / 8 : 0,
+                  luxir::unit_tests ? 1 : 8);
   } else {
-    ann.codec = api::VectorAnnDef::Codec::RABITQ;
-    ann.rabitq.emplace().bits = benchRaBitQBits(codec);
+    f.ann = rabitqAnn(luxir::unit_tests ? 4 : 0, benchRaBitQBits(codec));
   }
 }
 
@@ -104,22 +103,16 @@ float nextFloat(SplitMix64& rng) {
   return ((float)((int32_t)rng.rint((int64_t)2001) - 1000)) / 1000.0f;
 }
 
-// Forces eligibility so the benchmark measures the aux path.  Real runs keep
-// the production training floors and the schema's ann settings; unit-test
-// mode shrinks the floors and nlist so the tiny corpus actually trains.
+// Forces eligibility so the benchmark measures the aux path. Real runs keep
+// the production training floors; unit-test mode shrinks them for tiny corpora.
 struct IvfBenchGuard {
-  SearchOverridesGuard<bool, std::optional<VectorAnnConfig>, int64_t, int64_t, int64_t> saved{
-    VectorIndexBuilder::buildFaissAuxIndexes, VectorIndexBuilder::annConfigOverrideForTests,
+  SearchOverridesGuard<int64_t, int64_t, int64_t> saved{
     VectorIndexBuilder::ivfPqMinTrainingVectors, VectorIndexBuilder::ivfRaBitQMinTrainingVectors,
     VectorIndexBuilder::ivfBuildThresholdScanCost};
 
-  explicit IvfBenchGuard(int32_t codec = RABITQ1) {
-    VectorIndexBuilder::buildFaissAuxIndexes = true;
+  IvfBenchGuard() {
     VectorIndexBuilder::ivfBuildThresholdScanCost = 0;
     if (luxir::unit_tests) {
-      VectorIndexBuilder::annConfigOverrideForTests = codec == PQ
-        ? IvfTestGuard::pq(/*nlist=*/4, /*m=*/2, /*bits=*/1)
-        : VectorAnnConfig{.nlist = 4, .rabitqBits = benchRaBitQBits(codec)};
       VectorIndexBuilder::ivfPqMinTrainingVectors = 16;
       VectorIndexBuilder::ivfRaBitQMinTrainingVectors = 16;
     }
@@ -506,7 +499,7 @@ void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec) {
     std::lock_guard<std::mutex> lock(setupMutex);
     reuseIndex = clusteredIndexReusable(helper, docsPerSeg, codec);
     if (!reuseIndex) {
-      IvfBenchGuard guard(codec);
+      IvfBenchGuard guard;
       buildClusteredVectorIndex(helper, dims, nClusters, docsPerSeg, codec);
     }
     auto it = truthByK.find(k);
@@ -633,7 +626,7 @@ void BM_VectorIvfBuild(benchmark::State& state) {
   int32_t nClusters = luxir::unit_tests ? 8 : 100;
   int32_t codec = (int32_t)state.range(0);
 
-  IvfBenchGuard guard(codec);
+  IvfBenchGuard guard;
   CollectionHelper helper("main");
   std::vector<int32_t> docsPerSeg = clusteredDocsPerSeg(nDocs);
 

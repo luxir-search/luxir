@@ -46,28 +46,32 @@ protected:
     col->setSchema(Schema::createDefaultSchema());
   }
 
-  struct IvfPqGuard : IvfTestGuard {
-    IvfPqGuard() : IvfTestGuard(pq(/*nlist=*/2, /*m=*/1, /*bits=*/1)) {}
-  };
-
   // Install a schema where _v has metric=L2 so the suffix-rule fields
   // (e.g. "embedding_v") become eligible for FAISS aux indexing.
-  static void enableL2OnVecSuffix(Collection& col) {
+  static void enableL2OnVecSuffix(Collection& col,
+                                  std::optional<api::VectorAnnDef> ann = std::nullopt,
+                                  int32_t dims = 0) {
     SchemaBuilder b;
     auto& f = b.templ("_v");
     f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
     f.column = true;
     f.metric = luxir::api::VectorMetric::L2;
+    f.ann = ann;
+    if (dims > 0) f.dims = dims;
     b.set(col);
   }
 
-  static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite) {
+  static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite,
+                                      std::optional<api::VectorAnnDef> ann = std::nullopt,
+                                      int32_t dims = 0) {
     SchemaBuilder b;
     auto& f = b.templ("_v");
     f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
     f.column = true;
     f.metric = luxir::api::VectorMetric::COSINE;
     f.normalize_on_write = normalizeOnWrite;
+    f.ann = ann;
+    if (dims > 0) f.dims = dims;
     b.set(col);
   }
 };
@@ -106,9 +110,9 @@ const luxir::api::AuxIndexInfo& onlyVectorOverlay(const luxir::api::IndexInfo& i
 // AuxReader is present, dispatched to VectorAuxReader, and the FAISS index
 // round-trips through deserialize_index correctly.
 TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
-  IvfPqGuard guard;
+  IvfTestGuard guard;
   CollectionHelper h("main");
-  enableL2OnVecSuffix(h.collection());
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
 
   std::vector<std::vector<float>> vecs;
   vecs.reserve(80);
@@ -152,9 +156,9 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
 // payloads written in Luxir's own layout round-trip (every segment-local
 // valueRank appears exactly once across the lists).
 TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
-  IvfPqGuard guard;
+  IvfTestGuard guard;
   CollectionHelper h("main");
-  enableL2OnVecSuffix(h.collection());
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
 
   constexpr int N = 80;
   for (int i = 0; i < N; i++) {
@@ -198,7 +202,7 @@ TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
 // table-free.  If a FAISS upgrade changes either side, this fails and the
 // residency accounting (and docs) need a fresh look.
 TEST_F(IndexReaderAuxTest, cosineSkipsL2PrecomputedTable) {
-  IvfPqGuard guard;
+  IvfTestGuard guard;
 
   // Keeps the reader + aux alive alongside the borrowed index pointer (the
   // VectorAuxReader owns the faiss::Index and the mmap lists behind it).
@@ -229,7 +233,7 @@ TEST_F(IndexReaderAuxTest, cosineSkipsL2PrecomputedTable) {
 
   {
     CollectionHelper h("main");
-    enableCosineOnVecSuffix(h.collection(), true);
+    enableCosineOnVecSuffix(h.collection(), true, pqAnn(2, 1, 1), 4);
     indexDocs(h);
     auto opened = openIvfPq(h);
     ASSERT_NE(opened.ivfpq, nullptr);
@@ -239,7 +243,7 @@ TEST_F(IndexReaderAuxTest, cosineSkipsL2PrecomputedTable) {
   {
     CollectionHelper h("main");
     h.clear();
-    enableL2OnVecSuffix(h.collection());
+    enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
     indexDocs(h);
     auto opened = openIvfPq(h);
     ASSERT_NE(opened.ivfpq, nullptr);
@@ -249,9 +253,9 @@ TEST_F(IndexReaderAuxTest, cosineSkipsL2PrecomputedTable) {
 }
 
 TEST_F(IndexReaderAuxTest, cosineRawColumnSetsRescorePolicy) {
-  IvfPqGuard guard;
+  IvfTestGuard guard;
   CollectionHelper h("main");
-  enableCosineOnVecSuffix(h.collection(), false);
+  enableCosineOnVecSuffix(h.collection(), false, pqAnn(2, 1, 1), 4);
 
   for (int i = 0; i < 80; i++) {
     h.index(flatdoc("id", "doc" + std::to_string(i),
@@ -283,9 +287,9 @@ TEST_F(IndexReaderAuxTest, noAuxEntriesIsEmpty) {
 // Verifies that an IndexReader opened after a tiny commit still sees the
 // carried overlay for the surviving segment.
 TEST_F(IndexReaderAuxTest, opensCleanlyAfterTinyCommitCarryForward) {
-  IvfPqGuard guard;
+  IvfTestGuard guard;
   CollectionHelper h("main");
-  enableL2OnVecSuffix(h.collection());
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 0, 1));
 
   // First commit + build.
   for (int i = 0; i < 80; i++) {
@@ -346,9 +350,9 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterTinyCommitCarryForward) {
 // the retry window) need a Directory wrapper that can simulate the race -
 // not in scope for this test.
 TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
-  IvfPqGuard guard;
+  IvfTestGuard guard;
   CollectionHelper h("main");
-  enableL2OnVecSuffix(h.collection());
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
 
   for (int i = 0; i < 80; i++) {
     h.index(flatdoc("id", "doc" + std::to_string(i),
@@ -384,9 +388,9 @@ TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
 // name + gen as the previous reader's, IndexReader reuses the previous
 // AuxReader instance instead of re-deserializing.  We verify by pointer identity.
 TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
-  IvfPqGuard guard;
+  IvfTestGuard guard;
   CollectionHelper h("main");
-  enableL2OnVecSuffix(h.collection());
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
 
   // Build aux index.
   for (int i = 0; i < 80; i++) {
@@ -426,9 +430,9 @@ TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
 // Adding an above-threshold segment builds a second overlay.  The surviving
 // segment's reader is reused; the new segment gets a fresh reader.
 TEST_F(IndexReaderAuxTest, newSegmentGetsFreshAuxReader) {
-  IvfPqGuard guard;
+  IvfTestGuard guard;
   CollectionHelper h("main");
-  enableL2OnVecSuffix(h.collection());
+  enableL2OnVecSuffix(h.collection(), pqAnn(2, 1, 1), 4);
 
   for (int i = 0; i < 80; i++) {
     h.index(flatdoc("id", "a" + std::to_string(i),

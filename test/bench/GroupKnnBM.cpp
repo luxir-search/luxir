@@ -53,6 +53,8 @@ void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t 
     field.column = true;
     field.metric = api::VectorMetric::L2;
     field.dims = dims;
+    field.ann = pqAnn(unit_tests ? 2 : 16, coarse ? 4 : 0,
+                      unit_tests ? 1 : coarse ? 4 : 8);
     b.set(helper.collection());
     std::mt19937 rng(52);
     for (int segment = 0; segment < 4; segment++) {
@@ -74,9 +76,7 @@ void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t 
       if (segment == 3) VectorIndexBuilder::buildFaissAuxIndexes = false;
       helper.indexAll(docs, UpdateMessage::COMMIT);
       if (segment == 2) {
-        IvfTestGuard ivf(IvfTestGuard::pq(unit_tests ? 2 : 16, coarse ? 4 : 0,
-                                          unit_tests ? 1 : coarse ? 4 : 8),
-                         unit_tests ? 8 : 64);
+        IvfTestGuard ivf(unit_tests ? 8 : 64);
         helper.commit({"vec.vec_v"});
       }
     }

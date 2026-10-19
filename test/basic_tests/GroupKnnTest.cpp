@@ -63,7 +63,8 @@ std::string keySpec(std::span<const std::string> fields, std::string_view policy
   return s + R"(],"missing":")" + std::string(policy) + R"("})";
 }
 
-void schema(CollectionHelper& helper, api::VectorMetric metric = api::VectorMetric::L2) {
+void schema(CollectionHelper& helper, api::VectorMetric metric = api::VectorMetric::L2,
+            std::optional<api::VectorAnnDef> ann = std::nullopt) {
   SchemaBuilder b;
   auto& v = b.templ("_vs");
   v.type = api::FieldDef::FieldClass::VECTOR;
@@ -71,6 +72,7 @@ void schema(CollectionHelper& helper, api::VectorMetric metric = api::VectorMetr
   v.multi = true;
   v.dims = 4;
   v.metric = metric;
+  v.ann = ann;
   b.set(helper.collection());
 }
 }
@@ -199,7 +201,7 @@ TEST_F(GroupKnnTest, reportsExhaustionAndCapsAndRejectsMissingScope) {
 
 TEST_F(GroupKnnTest, actualIvfAndFlatSegmentsStillFindDistinctGroups) {
   CollectionHelper helper;
-  schema(helper);
+  schema(helper, api::VectorMetric::L2, pqAnn(4, 2, 2));
   for (int segment = 0; segment < 2; segment++) {
     std::vector<Doc> docs;
     for (int i = 0; i < 160; i++) {
@@ -211,7 +213,7 @@ TEST_F(GroupKnnTest, actualIvfAndFlatSegmentsStillFindDistinctGroups) {
     }
     helper.indexAll(docs, UpdateMessage::COMMIT);
   }
-  IvfTestGuard ivf(IvfTestGuard::pq(4, 2, 2), 16);
+  IvfTestGuard ivf(/*minTraining=*/16);
   helper.commit({"vec.vec_vs"});
   // A later segment has no aux, and the same near group straddles all three.
   helper.indexAll({flatdoc("id", "flat", "key_s", "flat", "key_i", (int64_t)1000,
@@ -279,11 +281,11 @@ TEST_F(GroupKnnTest, identityIncludesResolvedKeyPolicyAndUnit) {
 }
 
 TEST_F(GroupKnnTest, annAdmissionPrecedesTheVectorCutForIpAndCosine) {
-  IvfTestGuard ivf(IvfTestGuard::pq(4, 2, 2), 16);
+  IvfTestGuard ivf(/*minTraining=*/16);
   for (auto metric : {api::VectorMetric::IP, api::VectorMetric::COSINE}) {
     std::string name = "group_metric_" + std::to_string((int)metric);
     CollectionHelper helper(name);
-    schema(helper, metric);
+    schema(helper, metric, pqAnn(4, 2, 2));
     for (int group = 20; group > 0; group--) for (int member = 0; member < 8; member++) {
       helper.index(flatdoc("id", std::to_string(group * 8 + member), "key_s", "g" + std::to_string(group),
           "vec_vs", std::vector<std::vector<float>>{{(float)group, 1, 0, 0}, {(float)group * 0.75f, 0.5f, 0, 0}}));
@@ -356,12 +358,12 @@ TEST_F(GroupKnnTest, cappedAdmissionMatchesGreedyAcrossPartitions) {
 
 TEST_F(GroupKnnTest, approximateMemberCapRecoversExactRepresentative) {
   CollectionHelper helper;
-  schema(helper);
+  schema(helper, api::VectorMetric::L2, pqAnn(2, 0, 1));
   for (int group = 0; group < 48; group++) for (int member = 0; member < 2; member++) {
     helper.index(flatdoc("id", std::to_string(group * 2 + member), "key_s", "g" + std::to_string(group),
         "vec_vs", std::vector<std::vector<float>>{{(float)group + (float)member * 0.1f, 0, 0, 0}}));
   }
-  IvfTestGuard ivf(IvfTestGuard::pq(2, 0, 1), 8);
+  IvfTestGuard ivf(/*minTraining=*/8);
   helper.commit({"vec.vec_vs"});
   auto truth = rows(*run("main", R"("limit":-1,"collapse":"key_s","query":)" + knn(3, true)));
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();

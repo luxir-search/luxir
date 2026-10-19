@@ -41,24 +41,13 @@ constexpr int32_t CLUSTERS = 16;
 // More than sqrt(live vectors) for every corpus below: probes every list.
 constexpr int32_t ALL_LISTS = 1 << 16;
 
-struct Codec {
-  api::VectorAnnDef::Codec codec;
-  int32_t bits;  // rabitq.bits or pq.bits
-};
-
-void installAnn(Collection& col, api::VectorMetric metric, Codec c) {
+void installAnn(Collection& col, api::VectorMetric metric, const api::VectorAnnDef& ann) {
   SchemaBuilder b;
   auto& f = b.field("emb_v");
   f.type = api::FieldDef_::FieldClass::VECTOR;
   f.dims = DIMS;
   f.metric = metric;
-  auto& ann = f.ann.emplace();
-  ann.codec = c.codec;
-  if (c.codec == api::VectorAnnDef::Codec::PQ) {
-    ann.pq.emplace().bits = c.bits;
-  } else {
-    ann.rabitq.emplace().bits = c.bits;
-  }
+  f.ann = ann;
   b.set(col);
 }
 
@@ -133,15 +122,16 @@ std::vector<const VectorAuxReader*> overlays(CollectionHelper& h,
 } // namespace
 
 TEST_F(VectorAnnCodecTest, eachCodecAndMetricBuildsFromSchemaAndRecalls) {
-  IvfTestGuard guard(std::nullopt);  // the schema is the only source of settings
+  IvfTestGuard guard;
   using C = api::VectorAnnDef::Codec;
-  for (Codec c : {Codec{C::RABITQ, 1}, Codec{C::RABITQ, 4}, Codec{C::PQ, 4}}) {
+  for (const auto& ann : {rabitqAnn(), rabitqAnn(0, 4), pqAnn(0, 0, 4)}) {
+    int32_t bits = ann.codec == C::PQ ? *ann.pq->bits : *ann.rabitq->bits;
     for (auto metric : {api::VectorMetric::L2, api::VectorMetric::IP, api::VectorMetric::COSINE}) {
-      SCOPED_TRACE(std::to_string((int)c.codec) + "/" + std::to_string(c.bits) + " metric "
+      SCOPED_TRACE(std::to_string((int)*ann.codec) + "/" + std::to_string(bits) + " metric "
                    + std::to_string((int)metric));
       CollectionHelper h("main");
       h.clear();
-      installAnn(h.collection(), metric, c);
+      installAnn(h.collection(), metric, ann);
       indexSegment(h, 0, 2000);
 
       std::shared_ptr<IndexReader> reader;
@@ -149,13 +139,13 @@ TEST_F(VectorAnnCodecTest, eachCodecAndMetricBuildsFromSchemaAndRecalls) {
       ASSERT_EQ(aux.size(), 1u);
       ASSERT_NE(aux[0], nullptr);
       ASSERT_NE(aux[0]->getFaissIndex(), nullptr);
-      if (c.codec == C::PQ) {
+      if (ann.codec == C::PQ) {
         EXPECT_EQ(aux[0]->getEngine(), VectorAuxMeta::ENGINE_IVFPQ);
-        EXPECT_EQ(aux[0]->getPqBits(), 4);
+        EXPECT_EQ(aux[0]->getPqBits(), bits);
         EXPECT_EQ(aux[0]->getRotation(), nullptr);
       } else {
         EXPECT_TRUE(aux[0]->isRaBitQ());
-        EXPECT_EQ(aux[0]->getRaBitQBits(), c.bits);
+        EXPECT_EQ(aux[0]->getRaBitQBits(), bits);
         ASSERT_NE(aux[0]->getRotation(), nullptr);
         EXPECT_TRUE(aux[0]->getRotation()->is_orthonormal);
       }
@@ -165,9 +155,9 @@ TEST_F(VectorAnnCodecTest, eachCodecAndMetricBuildsFromSchemaAndRecalls) {
 }
 
 TEST_F(VectorAnnCodecTest, mergeRebuildsWithFieldCodecAndSharesRotation) {
-  IvfTestGuard guard(std::nullopt);
+  IvfTestGuard guard;
   CollectionHelper h("main");
-  installAnn(h.collection(), api::VectorMetric::L2, {api::VectorAnnDef::Codec::RABITQ, 2});
+  installAnn(h.collection(), api::VectorMetric::L2, rabitqAnn(0, 2));
   indexSegment(h, 0, 1000);
   indexSegment(h, 1000, 1000);
   {
@@ -197,11 +187,11 @@ TEST_F(VectorAnnCodecTest, mergeRebuildsWithFieldCodecAndSharesRotation) {
 // A codec change applies to overlays built afterwards; existing segments keep
 // theirs, and one query serves each segment by its own overlay metadata.
 TEST_F(VectorAnnCodecTest, codecChangeLeavesMixedSegmentsQueryable) {
-  IvfTestGuard guard(std::nullopt);
+  IvfTestGuard guard;
   CollectionHelper h("main");
-  installAnn(h.collection(), api::VectorMetric::IP, {api::VectorAnnDef::Codec::PQ, 4});
+  installAnn(h.collection(), api::VectorMetric::IP, pqAnn(0, 0, 4));
   indexSegment(h, 0, 1200);
-  installAnn(h.collection(), api::VectorMetric::IP, {api::VectorAnnDef::Codec::RABITQ, 1});
+  installAnn(h.collection(), api::VectorMetric::IP, rabitqAnn());
   indexSegment(h, 1200, 1200);
 
   std::shared_ptr<IndexReader> reader;
