@@ -18,7 +18,7 @@
 #include "luxir/api/build.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/reader/BKDReader.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/random.h"
@@ -128,10 +128,9 @@ void setGeoSchema(CollectionHelper& helper, bool range = true) {
 
 SegFieldInfo fieldInfo(IndexReader::Segment& segment, std::string_view field) {
   MemPool pool;
-  FieldReader fields(segment.postingsReader());
-  if (!fields.seek(field)) throw std::runtime_error("missing geo test field");
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = segment.postingsReader().fieldInfo(field);
+  if (!fields) throw std::runtime_error("missing geo test field");
+  const auto& info = *fields;
   return info;
 }
 
@@ -483,7 +482,7 @@ TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
       MemPool countPool;
       QueryState countState(countPool, *reader, field, box);
       EXPECT_EQ(field == "geo_single" ? (int64_t)expected.size() : -1,
-                countState.weight->count(segment));
+                countForTests(countState.weight, segment));
     }
   }
   SkipStats::enabled = false;
@@ -496,7 +495,7 @@ TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
   ASSERT_NE(nullptr, supplier);
   EXPECT_EQ((int64_t)(N - (N + 4) / 5), supplier->cost());
   EXPECT_EQ((int64_t)oracle(single, boxes[2]).size(),
-            state.weight->count(segment));
+            countForTests(state.weight, segment));
   int64_t sparseBefore = SkipStats::geoSparseVerifyArms;
   SkipStats::enabled = true;
   auto* sparsePlan = resolveScorerPlanForTests(pool, *supplier, 0);
@@ -508,7 +507,7 @@ TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
   EXPECT_EQ(sparseBefore + 1, SkipStats::geoSparseVerifyArms);
 
   QueryState multiState(pool, *reader, "geo_multi", boxes[2]);
-  EXPECT_EQ(-1, multiState.weight->count(segment));
+  EXPECT_EQ(-1, countForTests(multiState.weight, segment));
 }
 
 TEST_F(GeoBoxQueryTest, rejectsInvalidBoxesAndTreatsUnrepresentableEdgesAsEmpty) {
@@ -589,7 +588,7 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   MemPool deletedCountPool;
   QueryState deletedCountState(deletedCountPool, *beforeMerge,
                                "geo_single", all);
-  EXPECT_EQ(-1, deletedCountState.weight->count(beforeMerge->segments()[1]));
+  EXPECT_EQ(-1, countForTests(deletedCountState.weight, beforeMerge->segments()[1]));
 
   writer->mergeSegments();
   auto afterMerge = writer->snapshots.readers.getReader();
@@ -643,7 +642,7 @@ TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
 
   MemPool countPool;
   QueryState singleCountState(countPool, *afterMerge, "geo_single", all);
-  EXPECT_EQ(39, singleCountState.weight->count(merged));
+  EXPECT_EQ(39, countForTests(singleCountState.weight, merged));
   QueryState multiCountState(countPool, *afterMerge, "geo_multi", all);
-  EXPECT_EQ(-1, multiCountState.weight->count(merged));
+  EXPECT_EQ(-1, countForTests(multiCountState.weight, merged));
 }

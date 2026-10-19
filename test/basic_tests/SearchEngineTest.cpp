@@ -22,7 +22,7 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/reader/DocsEnum.h"
@@ -2311,7 +2311,7 @@ TEST_F(SearchEngineTest, wholeCountBackoffBypassFallsBackOnce) {
       query, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan plan(
       *weight, use, context.filterUses);
-  auto built = plan.resolve(*reader, reader->segments()[0], nullptr);
+  auto built = resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr);
   ASSERT_TRUE(built.available);
   EXPECT_EQ(8, built.count);
   cache->sweep();
@@ -2645,6 +2645,9 @@ TEST_F(SearchEngineTest, wholeTopKCountHandlesEmptyAndNonemptySegments) {
   EXPECT_EQ(2, bypass.bypasses);
   EXPECT_EQ(2, build.builds);
   EXPECT_EQ(2, hit.hits);
+  EXPECT_EQ(1, bypass.constants);
+  EXPECT_EQ(0, build.constants);
+  EXPECT_EQ(0, hit.constants);
 }
 
 TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
@@ -2679,7 +2682,7 @@ TEST_F(SearchEngineTest, wholeTopKCountBackoffBypassKeepsLandedFallback) {
       query, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan plan(
       *weight, use, context.filterUses);
-  ASSERT_TRUE(plan.resolve(*reader, reader->segments()[0], nullptr).available);
+  ASSERT_TRUE(resolveWholeMembershipForTests(plan, *reader, reader->segments()[0], nullptr).available);
   cache->sweep();
   ASSERT_EQ(1u, cache->counters().capacityDeadBuilds);
 
@@ -3395,7 +3398,7 @@ TEST_F(SearchEngineTest, wholeFieldSortBackoffBypassKeepsLandedFallback) {
       query, FilterCache::AdmissionLane::WHOLE);
   QueryPrep::WholeMembershipPlan plan(
       *weight, use, context.filterUses);
-  ASSERT_TRUE(plan.resolve(
+  ASSERT_TRUE(resolveWholeMembershipForTests(plan,
       *reader, reader->segments()[0], nullptr).available);
   cache->sweep();
   ASSERT_EQ(1u, cache->counters().capacityDeadBuilds);
@@ -4659,13 +4662,13 @@ TEST_F(SearchEngineTest, opDomainValidationIsParseTime) {
       "apply_parent_filters requires domain.query");
   expectError(R"json({"limit":0,"ops":{"outer":{"field_facet":{
     "field":"brand_s","ops":{"inner":{"expr_op":"sum(price_i)",
-      "domain":{"query":{"all":true}}}}}}}})json",
-      "under a facet bucket: domain is only supported");
+      "domain":{"apply_parent_filters":false}}}}}}})json",
+      "apply_parent_filters requires domain.query");
   expectError(R"json({"ops":{"f":{"fusion":{
     "sources":{"s":{"query":{"all":true}}},"rrf":{},
     "ops":{"x":{"expr_op":"sum(price_i)",
       "domain":{"query":{"all":true}}}}}}}})json",
-      "under Fusion.ops: domain is only supported for ops dispatched by the request root or TopDocs");
+      "domain is not supported under Fusion.ops");
 
   auto missing = localReq(luxirNode->getSearchEngine());
   auto& facet = missing->collection("main").topDocs("q").allQuery()

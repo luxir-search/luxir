@@ -61,7 +61,10 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <system_error>
 #include <unordered_set>
 
 #include "luxir/api/sort_clause.h"
@@ -74,18 +77,87 @@ namespace luxir::api::jsond {
 template <class... Ts> struct overloaded : Ts... { using Ts::operator()...; };
 template <class... Ts> overloaded(Ts...) -> overloaded<Ts...>;
 
-// True if the number token starting at `it` has a fraction or exponent (JSON syntax:
-// only '.', 'e', 'E' can introduce one; the token ends at a delimiter/ws/NUL).
-inline bool numberTokenIsFloat(const auto* it, const auto* end) {
-  for (auto p = it; p != end; ++p) {
-    char c = (char)*p;
-    if (c == '.' || c == 'e' || c == 'E') return true;
-    if (c == ',' || c == '}' || c == ']' || c == ' ' || c == '\t' || c == '\n' || c == '\r' ||
-        c == '\0') {
-      break;
-    }
+// One JSON number token, parsed in a single pass: an integral token (no fraction or
+// exponent) into `i`, anything else into `d`.
+struct Number {
+  const char* next;  // first byte after the token
+  bool isInt;
+  std::int64_t i;
+  double d;
+};
+
+// Parses the number at `p` with glaze's strict JSON grammar and its fast_float
+// conversion (the code glaze's own double read runs), so values are bit-identical to
+// glaze's per-type reads. Returns false for a malformed token ("01", "1.", ".5", "+1",
+// "NaN"), an integral token outside int64, or a double conversion error. Bytes after
+// the token are the caller's to validate ("1e" parses 1 and leaves "e").
+template <bool NullTerminated>
+inline bool parseNumber(const char* p, const char* end, Number& out) {
+  auto pns = glz::parse_number_string<NullTerminated>(p, end);
+  if (!pns.valid) [[unlikely]] return false;
+  out.next = pns.lastmatch;
+  out.isInt = pns.lastmatch == pns.integer.ptr + pns.integer.len();
+  if (out.isInt) {
+    // <= 19 digits cannot wrap the uint64 mantissa; INT64_MIN's magnitude is one past INT64_MAX.
+    std::uint64_t limit = (std::uint64_t)INT64_MAX + (pns.negative ? 1 : 0);
+    if (pns.integer.len() > 19 || pns.mantissa > limit) [[unlikely]] return false;
+    out.i = pns.negative ? (std::int64_t)(0 - pns.mantissa) : (std::int64_t)pns.mantissa;
+    return true;
   }
-  return false;
+  return glz::fast_float::from_chars_advanced(pns, out.d).ec == std::errc();
+}
+
+// Reads an array whose elements are all JSON numbers (`it` at its '[') straight into a
+// typed ArrInt or ArrDouble: one pass per number into one buffer, no Val per element.
+// Ints stay exact until the first non-integral token, then promote as (double)int64.
+// Returns false, with `it` and ctx unchanged, for any other array or any syntax error;
+// the caller's generic read then produces the ArrVal/ArrStr or the error. That read
+// parses each number with the same parseNumber, so every all-number array it accepts
+// is taken here first and it never yields ArrInt/ArrDouble itself.
+// Not inlined: the stack buffer must stay out of the recursive Val reader's frame.
+template <auto Opts>
+[[gnu::noinline]] bool readNumberArray(Val& value, auto& ctx, auto& it, auto& end) {
+  static constexpr std::size_t STACK_ELEMS = 1024;
+  // Storage for int64s while every element is integral, then (converted in place) doubles.
+  alignas(8) std::byte stackBuf[STACK_ELEMS * 8];
+  void* buf = stackBuf;
+  std::size_t cap = STACK_ELEMS, n = 0;
+  bool allInt = true;
+  auto& mr = ctx.memory_resource();
+  auto bail = [&] {
+    ctx.error = glz::error_code::none;  // skip_ws flags running off the input
+    return false;
+  };
+  const char* p = it + 1;
+  const char* e = end;
+  if (glz::skip_ws<Opts>(ctx, p, e)) return bail();
+  while (true) {
+    Number num;
+    if (!parseNumber<Opts.null_terminated>(p, e, num)) return bail();
+    if (n == cap) [[unlikely]] {
+      void* grown = mr.allocate(2 * cap * 8, 8);
+      std::memcpy(grown, buf, n * 8);
+      buf = grown;
+      cap *= 2;
+    }
+    if (allInt && !num.isInt) {
+      allInt = false;
+      for (std::size_t k = 0; k < n; k++) ((double*)buf)[k] = (double)((std::int64_t*)buf)[k];
+    }
+    if (allInt) ((std::int64_t*)buf)[n++] = num.i;
+    else ((double*)buf)[n++] = num.isInt ? (double)num.i : num.d;
+    p = num.next;
+    if (glz::skip_ws<Opts>(ctx, p, e)) return bail();
+    if (*p == ']') break;
+    if (*p != ',') return bail();
+    ++p;
+    if (glz::skip_ws<Opts>(ctx, p, e)) return bail();
+  }
+  if (buf == stackBuf) buf = std::memcpy(mr.allocate(n * 8, 8), stackBuf, n * 8);
+  if (allInt) value.kind.template emplace<ArrInt>().v = {(const std::int64_t*)buf, n};
+  else value.kind.template emplace<ArrDouble>().v = {(const double*)buf, n};
+  it = p + 1;  // past ']'
+  return true;
 }
 } // namespace luxir::api::jsond
 
@@ -332,6 +404,8 @@ struct from<JSON, luxir::api::QueryFacet> {
     bool sawOps = false;
     bool sawSelected = false;
     bool sawSelectionMode = false;
+    bool sawCountUnit = false;
+    bool sawCountDistinct = false;
     util::scan_object_fields<Opts, true>(
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
@@ -350,6 +424,12 @@ struct from<JSON, luxir::api::QueryFacet> {
           } else if (key == "selection_mode" && !sawSelectionMode) {
             sawSelectionMode = true;
             util::from_json<O>(value.selection_mode, ctx, vit, vend);
+          } else if (key == "count_unit" && !sawCountUnit) {
+            sawCountUnit = true;
+            util::from_json<O>(value.count_unit, ctx, vit, vend);
+          } else if (key == "count_distinct" && !sawCountDistinct) {
+            sawCountDistinct = true;
+            util::from_json<O>(value.count_distinct, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -393,6 +473,14 @@ struct to<JSON, luxir::api::QueryFacet> {
     if (value.selection_mode != luxir::api::SelectionMode::ANY) {
       dump<",\"selection_mode\":" >(b, ix);
       serialize<JSON>::template op<Opts>(value.selection_mode, ctx, b, ix);
+    }
+    if (value.count_unit) {
+      dump<",\"count_unit\":" >(b, ix);
+      serialize<JSON>::template op<Opts>(*value.count_unit, ctx, b, ix);
+    }
+    if (value.count_distinct) {
+      dump<",\"count_distinct\":" >(b, ix);
+      serialize<JSON>::template op<Opts>(*value.count_distinct, ctx, b, ix);
     }
     dump<'}'>(b, ix);
   }
@@ -622,6 +710,8 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.normalized, ctx, vit, vend);
           } else if (key == "normalize_on_write") {
             util::from_json<V>(value.normalize_on_write, ctx, vit, vend);
+          } else if (key == "ann") {
+            util::from_json<V>(value.ann, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -962,6 +1052,89 @@ struct to<JSON, luxir::api::Filter> {
 };
 
 template <>
+struct from<JSON, luxir::api::Collapse> {
+  template <auto Opts>
+  static void op(luxir::api::Collapse &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) return;
+    }
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    auto readFields = [&](auto &vit, auto &vend) {
+      value.field = {};
+      decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.field);
+      if (skip_ws<O>(ctx, vit, vend)) return;
+      if ((char)*vit == '[') glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
+      else {
+        fields.resize(1);
+        util::from_json<O>(fields[0], ctx, vit, vend);
+      }
+    };
+    if ((char)*it == '"') {
+      value.missing = luxir::api::Collapse_::MissingPolicy::EXPAND;
+      value.head_sort = {};
+      value.sort = {};
+      value.get_number = false;
+      value.ops = {};
+      readFields(it, end);
+      return;
+    }
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<Opts, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "field") readFields(vit, vend);
+          else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
+          else if (key == "get_number") util::from_json<O>(value.get_number, ctx, vit, vend);
+          else if (key == "ops") {
+            decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
+            glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          }
+          else if (key == "head_sort" || key == "sort") {
+            decltype(auto) sort = ::hpp_proto::detail::as_modifiable(
+                ctx, key == "head_sort" ? value.head_sort : value.sort);
+            readSortList<O>(sort, ctx, vit, vend);
+          }
+          else { ctx.error = error_code::unknown_key; return true; }
+          return bool(ctx.error);
+        }, [](auto &, auto &) {});
+  }
+};
+
+template <>
+struct from<JSON, luxir::api::Diversify> {
+  template <auto Opts>
+  static void op(luxir::api::Diversify &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    static constexpr auto O = opening_handled_off<ws_handled_off<Opts>()>();
+    auto readFields = [&](auto &vit, auto &vend) {
+      value.field = {};
+      decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.field);
+      if (skip_ws<O>(ctx, vit, vend)) return;
+      if ((char)*vit == '[') glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
+      else {
+        fields.resize(1);
+        util::from_json<O>(fields[0], ctx, vit, vend);
+      }
+    };
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<Opts, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "field") readFields(vit, vend);
+          else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
+          else if (key == "max_per_key") util::from_json<O>(value.max_per_key, ctx, vit, vend);
+          else { ctx.error = error_code::unknown_key; return true; }
+          return bool(ctx.error);
+        }, [](auto &, auto &) {});
+  }
+};
+
+template <>
 struct from<JSON, luxir::api::TopDocs> {
   template <auto Opts>
   static void op(luxir::api::TopDocs &value,
@@ -987,12 +1160,18 @@ struct from<JSON, luxir::api::TopDocs> {
             util::from_json<O>(value.get_number, ctx, vit, vend);
           } else if (key == "get_scores") {
             util::from_json<O>(value.get_scores, ctx, vit, vend);
+          } else if (key == "min_score") {
+            util::from_json<O>(value.min_score, ctx, vit, vend);
           } else if (key == "fields") {
             decltype(auto) fields = ::hpp_proto::detail::as_modifiable(ctx, value.fields);
             glz::util::parse_repeated<O>(false, fields, ctx, vit, vend);
           } else if (key == "sort") {
             decltype(auto) sort = ::hpp_proto::detail::as_modifiable(ctx, value.sort);
             readSortList<O>(sort, ctx, vit, vend);
+          } else if (key == "diversify") {
+            util::from_json<O>(value.diversify, ctx, vit, vend);
+          } else if (key == "collapse") {
+            util::from_json<O>(value.collapse, ctx, vit, vend);
           } else if (key == "batch_size") {
             util::from_json<O>(value.batch_size, ctx, vit, vend);
           } else if (key == "document_format") {
@@ -1049,11 +1228,14 @@ struct from<JSON, luxir::api::Fusion> {
           } else if (key == "weights") {
             decltype(auto) weights = ::hpp_proto::detail::as_modifiable(ctx, value.weights);
             glz::util::parse_repeated<O>(true, weights, ctx, vit, vend);
+          } else if (key == "collapse") {
+            util::from_json<O>(value.collapse, ctx, vit, vend);
           } else if (key == "rrf" || key == "linear") {
             // one method arm: a second one is an error (proto3 canonical
             // JSON), not a silent last-wins
             if (value.method.index() != 0) {
-              ctx.error = error_code::unknown_key;
+              ctx.error = error_code::syntax_error;
+              ctx.custom_error_message = "fusion takes exactly one method: rrf or linear";
               return true;
             }
             if (key == "rrf") {
@@ -1109,6 +1291,7 @@ struct from<JSON, luxir::api::Val> {
         break;
       }
       case '[': {
+        if (api::jsond::readNumberArray<O>(value, ctx, it, end)) break;
         api::ArrVal tmp{};
         {
           decltype(auto) elems = ::hpp_proto::detail::as_modifiable(ctx, tmp.v);
@@ -1117,45 +1300,30 @@ struct from<JSON, luxir::api::Val> {
         if (bool(ctx.error)) [[unlikely]] {
           break;
         }
-        // Collapse a homogeneous array to its typed arm (most specific wins); ints
-        // promote when mixed with doubles; anything else stays a generic ArrVal.
-        bool allS = !tmp.v.empty(), allI = allS, allNum = allS;
-        for (const auto &e : tmp.v) {
-          bool isI = std::holds_alternative<std::int64_t>(e.kind);
-          allS = allS && std::holds_alternative<std::string_view>(e.kind);
-          allI = allI && isI;
-          allNum = allNum && (isI || std::holds_alternative<double>(e.kind));
-        }
-        size_t n = tmp.v.size();
-        auto &mr = ctx.memory_resource();
+        // All-number arrays were taken by readNumberArray; an all-string array
+        // collapses to ArrStr, anything else stays a generic ArrVal.
+        bool allS = !tmp.v.empty();
+        for (const auto &e : tmp.v) allS = allS && std::holds_alternative<std::string_view>(e.kind);
         if (allS) {
-          auto *a = (std::string_view *)mr.allocate(n * sizeof(std::string_view),
-                                                    alignof(std::string_view));
+          size_t n = tmp.v.size();
+          auto *a = (std::string_view *)ctx.memory_resource().allocate(
+              n * sizeof(std::string_view), alignof(std::string_view));
           for (size_t i = 0; i < n; i++) a[i] = std::get<std::string_view>(tmp.v[i].kind);
           value.kind.template emplace<api::ArrStr>().v = {a, n};
-        } else if (allI) {
-          auto *a = (std::int64_t *)mr.allocate(n * sizeof(std::int64_t), alignof(std::int64_t));
-          for (size_t i = 0; i < n; i++) a[i] = std::get<std::int64_t>(tmp.v[i].kind);
-          value.kind.template emplace<api::ArrInt>().v = {a, n};
-        } else if (allNum) {
-          auto *a = (double *)mr.allocate(n * sizeof(double), alignof(double));
-          for (size_t i = 0; i < n; i++) {
-            const auto &k = tmp.v[i].kind;
-            auto *d = std::get_if<double>(&k);
-            a[i] = d ? *d : (double)std::get<std::int64_t>(k);
-          }
-          value.kind.template emplace<api::ArrDouble>().v = {a, n};
         } else {
           value.kind.template emplace<api::ArrVal>() = tmp;
         }
         break;
       }
       default: {
-        if (api::jsond::numberTokenIsFloat(it, end)) {
-          util::from_json<O>(value.kind.template emplace<double>(), ctx, it, end);
-        } else {
-          util::from_json<O>(value.kind.template emplace<std::int64_t>(), ctx, it, end);
+        api::jsond::Number num;
+        if (!api::jsond::parseNumber<O.null_terminated>(it, end, num)) [[unlikely]] {
+          ctx.error = error_code::parse_number_failure;
+          break;
         }
+        if (num.isInt) value.kind.template emplace<std::int64_t>(num.i);
+        else value.kind.template emplace<double>(num.d);
+        it = num.next;
         break;
       }
     }
@@ -1289,6 +1457,14 @@ struct from<JSON, luxir::api::SearchRequest> {
             if (reusedShorthand) topDocs.sort = {};
             decltype(auto) sort = ::hpp_proto::detail::as_modifiable(ctx, topDocs.sort);
             readSortList<O>(sort, ctx, vit, vend);
+          } else if (key == "diversify") {
+            auto &topDocs = shorthand();
+            topDocs.diversify.reset();
+            util::from_json<O>(topDocs.diversify, ctx, vit, vend);
+          } else if (key == "collapse") {
+            auto &topDocs = shorthand();
+            topDocs.collapse.reset();
+            util::from_json<O>(topDocs.collapse, ctx, vit, vend);
           } else if (key == "batch_size") {
             util::from_json<O>(shorthand().batch_size, ctx, vit, vend);
           } else if (key == "document_format") {
@@ -1297,6 +1473,8 @@ struct from<JSON, luxir::api::SearchRequest> {
             util::from_json<O>(shorthand().get_number, ctx, vit, vend);
           } else if (key == "get_scores") {
             util::from_json<O>(shorthand().get_scores, ctx, vit, vend);
+          } else if (key == "min_score") {
+            util::from_json<O>(shorthand().min_score, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

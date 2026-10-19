@@ -87,12 +87,11 @@ public:
 template <class QueryType, class Relation>
 class GeoQueryWeight final : public Query::Weight {
   QueryType& query;
-  std::span<SegFieldInfo*> segInfos;
+  IndexReader::FieldSegments segInfos;
   float constantScore;
 
-  bool segmentInfo(IndexReader::Segment& segment, SegFieldInfo*& info) const {
-    if (segInfos.empty()) return false;
-    info = segInfos[(size_t)segment.ord];
+  bool segmentInfo(IndexReader::Segment& segment, const SegFieldInfo*& info) const {
+    info = segInfos.at((size_t)segment.ord);
     return info != nullptr && info->columnLoc.offset() > 0;
   }
 
@@ -112,7 +111,21 @@ public:
       : Query::Weight(context, query, flags), query(query),
         constantScore(constantScore) {
     traits |= IS_CONSTANT_SCORING;
-    segInfos = context.readSegInfos(query.getField());
+    segInfos = context.topReader.field(query.getField());
+  }
+
+  // A BKD count can decode crossing leaves, so probes only report that level;
+  // the walk belongs to execution after the supplier has been selected.
+  Query::CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    const SegFieldInfo* info = nullptr;
+    if (query.isEmpty() || !segmentInfo(segment, info) || info->numValues == 0) {
+      return {0, Query::CountHow::METADATA};
+    }
+    auto how = info->pointsMetaOff != 0 && info->monoLoc.offset() == 0
+        ? Query::CountHow::INDEX_WALK : Query::CountHow::ITERATE;
+    auto shortcut = Query::countBound(segment, domain, info->docsWithField, how);
+    if (shortcut.how == Query::CountHow::INDEX_WALK) shortcut.resolver = this;
+    return shortcut;
   }
 
   class Supplier final : public Query::ScorerSupplier {
@@ -284,13 +297,18 @@ public:
         BulkUse use, const BulkScorerContext& bulkContext) override {
       unused(use);
       if (bulkContext.requireConstantCount) {
-        if (segment.liveDocs() != nullptr || bkd == nullptr
-            || reader.multiValued()) {
+        auto shortcut = weight.countShortcut(segment, nullptr);
+        if (shortcut.how == Query::CountHow::METADATA) {
+          return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
+                  BulkAnswer::NO, nullptr, shortcut.maxMatches};
+        }
+        if (shortcut.how != Query::CountHow::INDEX_WALK) {
           return {
             BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
             BulkAnswer::NO,
           };
         }
+        assert(bkd != nullptr && !reader.multiValued() && segment.liveDocs() == nullptr);
         size_t size = bkd->maxPointsPerLeaf();
         BKDReader::Scratch countScratch{
           {}, planPool.make_span<uint32_t>(size),
@@ -331,7 +349,7 @@ public:
       Query::SupplierExecutionMode executionMode) override {
     unused(executionMode);
     if (query.isEmpty()) return nullptr;
-    SegFieldInfo* info = nullptr;
+    const SegFieldInfo* info = nullptr;
     if (!segmentInfo(segment, info)) return nullptr;
     if (info->type != FieldType::GEO_POINT) wrongFieldType();
     auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *info);
@@ -364,7 +382,7 @@ public:
   Query::Scorer* createScanScorerForTests(
       MemPool& targetPool, IndexReader::Segment& segment) {
     if (query.isEmpty()) return nullptr;
-    SegFieldInfo* info = nullptr;
+    const SegFieldInfo* info = nullptr;
     if (!segmentInfo(segment, info)) return nullptr;
     if (info->type != FieldType::GEO_POINT) wrongFieldType();
     auto* reader = targetPool.make<IntColReader>(segment.postingsReader(),

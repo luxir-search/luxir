@@ -40,7 +40,7 @@ public:
     // boolean that contains one) are scored through their PreparedWeight, so read
     // cost off the prepared supplier - that is the path materialized filters take.
     if (weight->needsPrepare()) {
-      Query::Weight::PrepareContext pctx{*reader, std::span<DocSet* const>{}, false};
+      Query::Weight::PrepareContext pctx{*reader, std::span<DocSet* const>{}, false, nullptr};
       auto prepared = weight->prepare(pctx);
       return prepared->scorerSupplier(pool, seg)->cost();
     }

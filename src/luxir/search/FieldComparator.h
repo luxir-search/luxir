@@ -4,8 +4,8 @@
 #pragma once
 
 #include "luxir/search/Collector.h"
+#include "luxir/search/IndexReader.h"
 #include "luxir/reader/PostingsReader.h"
-#include "luxir/reader/FieldReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/reader/StrColReader.h"
@@ -288,15 +288,27 @@ public:
     }
   };
 
+protected:
+  IndexReader::FieldSegments fields;
+
+public:
+  explicit FieldComparator(IndexReader::FieldSegments fields) : fields(fields) {}
+
   virtual ~FieldComparator() = default;
 
   // Set the current segment for this comparator
-  virtual void setSegment(int32_t segment, PostingsReader* reader) = 0;
+  virtual void setSegment(const IndexReader::Segment& segment) = 0;
 
   virtual void setBottom(int32_t slot) { unused(slot); }
 
   // compare new document to bottom slot
   virtual int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) = 0;
+
+  // Compare any retained slot against the current document. Bottom-only
+  // implementations can cache setBottom(), so this is a distinct capability.
+  virtual int compareCurrent(int32_t slot, segdoc oldDoc, segdoc newDoc) {
+    return compareBottom(slot, oldDoc, newDoc);
+  }
 
   // compare two slots
   virtual int compare(int32_t slotA, segdoc docA, int32_t slotB, segdoc docB) = 0;
@@ -378,7 +390,6 @@ class SimpleNumericFieldComparator : public FieldComparator,
   // IntColBM break-even: decodeFrame wins at eight gathered values per frame.
   static constexpr size_t FRAME_DECODE_MIN = 8;
 
-  std::string fieldName;
   std::optional<IntColReader> reader;
   std::optional<IntColReader::Iterator> iter;
   std::optional<IntColReader::SparseValues> pointValues;
@@ -493,11 +504,11 @@ public:
   // `missingLiteral` (an encoded column value) is the value a doc without
   // one sorts as, overriding `missingValue`'s edge. `pick` selects the key
   // of a multi-valued doc (default: defaultPick).
-  SimpleNumericFieldComparator(const std::string& fieldName, bool reversed,
-                               MissingValue missingValue,
+  SimpleNumericFieldComparator(bool reversed, MissingValue missingValue,
+                               IndexReader::FieldSegments fields,
                                std::optional<int64_t> missingLiteral = std::nullopt,
                                std::optional<MultiPick> pick = std::nullopt)
-    : fieldName(fieldName),
+    : FieldComparator(fields),
       sortMultiplier(reversed ? -1 : 1),
       pickMax(pick.value_or(defaultPick(reversed)) == MultiPick::MAX) {
 
@@ -516,7 +527,8 @@ public:
     }
   }
 
-  void setSegment(int32_t segment, PostingsReader* postingsReader) override {
+  void setSegment(const IndexReader::Segment& segment) override {
+    auto* postingsReader = &segment.postingsReader();
     // Reset reader and iterator
     iter.reset();
     pointValues.reset();
@@ -529,13 +541,8 @@ public:
     landedDoc = -1;
     landedRank = -1;
 
-    if (!postingsReader) return;
-
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(*postingsReader);
-    if (fieldReader.seek(fieldName)) {
-      SegFieldInfo fieldInfo;
-      fieldReader.readFieldInfo(fieldInfo);
+    if (auto* info = fields.at(segment)) {
+      const auto& fieldInfo = *info;
       if (fieldInfo.columnLoc.offset() > 0) {
         reader.emplace(*postingsReader, fieldInfo);
         iter.emplace(*reader);
@@ -795,22 +802,21 @@ inline int32_t selectedSortOrd(const OrdColReader& reader, int32_t docid,
 }
 
 class GlobalOrdComparator : public FieldComparator {
-  std::string fieldName;
   std::shared_ptr<OrdMap> ordMap;
   std::optional<OrdColReader> reader;
   std::vector<int64_t> globalOrds; // Storage for global ordinals
   OrdMap::SegToGlobal segmentMapping;
   PostingsReader* postingsReader = nullptr;
-  SegFieldInfo fieldInfo{};
+  const SegFieldInfo* fieldInfo = nullptr;
   int64_t sortMultiplier; // 1 for ascending, -1 for descending
   int64_t missingOrd;
   bool pickMax;
 
 public:
-  GlobalOrdComparator(const std::string& fieldName, std::shared_ptr<OrdMap> ordMap,
-                      bool reversed, MissingValue missingValue,
+  GlobalOrdComparator(std::shared_ptr<OrdMap> ordMap,
+                      bool reversed, MissingValue missingValue, IndexReader::FieldSegments fields,
                       std::optional<MultiPick> pick = std::nullopt)
-    : fieldName(fieldName),
+    : FieldComparator(fields),
       ordMap(ordMap),
       sortMultiplier(reversed ? -1 : 1),
       pickMax(pick.value_or(defaultPick(reversed)) == MultiPick::MAX) {
@@ -827,29 +833,25 @@ public:
     }
   }
   
-  void setSegment(int32_t segment, PostingsReader* reader_) override {
+  void setSegment(const IndexReader::Segment& segment) override {
     reader.reset();
     segmentMapping = {};
-    postingsReader = reader_;
-    fieldInfo = {};
-
-    if (!postingsReader) return;
+    postingsReader = &segment.postingsReader();
+    fieldInfo = nullptr;
 
     // Get segment-to-global ordinal mapping from OrdMap
     if (ordMap) {
-      segmentMapping = ordMap->getSegToGlobal(segment);
+      segmentMapping = ordMap->getSegToGlobal(segment.ord);
     }
 
     // Load the ordinal column reader for this segment
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(*postingsReader);
-    if (fieldReader.seek(fieldName)) {
-      fieldReader.readFieldInfo(fieldInfo);
+    fieldInfo = fields.at(segment);
+    if (fieldInfo) {
       if (!ordMap) {
-        segmentMapping.numOrds = fieldInfo.nTerms;
+        segmentMapping.numOrds = fieldInfo->nTerms;
       }
-      if (fieldInfo.columnLoc.offset() > 0) {
-        reader.emplace(*postingsReader, fieldInfo);
+      if (fieldInfo->columnLoc.offset() > 0) {
+        reader.emplace(*postingsReader, *fieldInfo);
       }
     }
   }
@@ -868,7 +870,7 @@ public:
       CompetitiveOrdState& out, int32_t bottomSlot, segdoc bottomDoc,
       int32_t segment, int32_t from, bool soleSort) override {
     if (!reader.has_value() || ordMap != nullptr || postingsReader == nullptr
-        || fieldInfo.nTerms == 0) {
+        || fieldInfo->nTerms == 0) {
       return OrdIntervalStatus::UNSUPPORTED;
     }
     // Missing-first: docs without the field beat any real-valued bottom but
@@ -893,7 +895,7 @@ public:
     out.nTerms = segmentMapping.numOrds;
     out.descending = sortMultiplier < 0;
     out.postingsReader = postingsReader;
-    out.fieldInfo = &fieldInfo;
+    out.fieldInfo = fieldInfo;
     return OrdIntervalStatus::READY;
   }
 
@@ -970,11 +972,10 @@ class SegmentOrdComparator : public FieldComparator {
     uint32_t capacity = 0;
   };
 
-  std::string fieldName;
   MemPool termPool;
   MemPool enumPool;
   MemPool::save_point enumPoolStart;
-  SegFieldInfo fieldInfo{};
+  const SegFieldInfo* fieldInfo = nullptr;
   std::optional<OrdColReader> reader;
   std::optional<TermsEnum> termsEnum;
   PostingsReader* postingsReader = nullptr;
@@ -1056,11 +1057,10 @@ class SegmentOrdComparator : public FieldComparator {
 public:
   // `literal` is the term a doc without a value sorts as, overriding
   // `missingValue`'s edge.
-  SegmentOrdComparator(const std::string& fieldName,
-                       bool reversed, MissingValue missingValue,
+  SegmentOrdComparator(bool reversed, MissingValue missingValue, IndexReader::FieldSegments fields,
                        std::optional<std::string> literal = std::nullopt,
                        std::optional<MultiPick> pick = std::nullopt)
-    : fieldName(fieldName),
+    : FieldComparator(fields),
       enumPoolStart(enumPool.getSavePoint()),
       sortMultiplier(reversed ? -1 : 1),
       // GlobalOrdComparator keeps its missing sentinel at the requested edge.
@@ -1069,26 +1069,24 @@ public:
       pickMax(pick.value_or(defaultPick(reversed)) == MultiPick::MAX),
       missingTerm(std::move(literal)) {}
 
-  void setSegment(int32_t segment, PostingsReader* reader_) override {
+  void setSegment(const IndexReader::Segment& segment) override {
     termsEnum.reset();
     reader.reset();
     enumPool.rewind(enumPoolStart);
-    fieldInfo = {};
-    currentSegment = segment;
-    postingsReader = reader_;
+    fieldInfo = nullptr;
+    currentSegment = segment.ord;
+    postingsReader = &segment.postingsReader();
     literalOrd = 0;
 
-    if (!postingsReader) return;
 
-    FieldReader fieldReader(*postingsReader);
-    if (!fieldReader.seek(fieldName)) return;
-    fieldReader.readFieldInfo(fieldInfo);
-    if (fieldInfo.nTerms == 0 || fieldInfo.columnLoc.offset() == 0 ||
-        fieldInfo.ordFormat == SegFieldInfo::ORD_NONE) {
+    fieldInfo = fields.at(segment);
+    if (!fieldInfo) return;
+    if (fieldInfo->nTerms == 0 || fieldInfo->columnLoc.offset() == 0 ||
+        fieldInfo->ordFormat == SegFieldInfo::ORD_NONE) {
       return;
     }
-    reader.emplace(*postingsReader, fieldInfo);
-    termsEnum.emplace(enumPool, *postingsReader, fieldInfo);
+    reader.emplace(*postingsReader, *fieldInfo);
+    termsEnum.emplace(enumPool, *postingsReader, *fieldInfo);
     if (missingTerm.has_value() && termsEnum->seekCeil(*missingTerm)
         && termsEnum->term() == std::string_view(*missingTerm)) {
       literalOrd = (int32_t)termsEnum->ord() + 1;
@@ -1117,7 +1115,7 @@ public:
     if (missingFirst || bottomMissing || missingTerm.has_value()) {
       return OrdIntervalStatus::PENDING;
     }
-    int64_t nTerms = (int64_t)fieldInfo.nTerms;
+    int64_t nTerms = (int64_t)fieldInfo->nTerms;
     bool closable = soleSort && bottomExact
         && segdoc(segment, from) >= bottomDoc;
     if (sortMultiplier > 0) {
@@ -1132,7 +1130,7 @@ public:
     out.nTerms = nTerms;
     out.descending = sortMultiplier < 0;
     out.postingsReader = postingsReader;
-    out.fieldInfo = &fieldInfo;
+    out.fieldInfo = fieldInfo;
     return OrdIntervalStatus::READY;
   }
 
@@ -1152,8 +1150,8 @@ public:
 
     std::string_view value = term(bottom);
     if (!termsEnum->seekCeil(value)) {
-      assert(fieldInfo.nTerms <= INT32_MAX);
-      bottomOrd = (int32_t)fieldInfo.nTerms;
+      assert(fieldInfo->nTerms <= INT32_MAX);
+      bottomOrd = (int32_t)fieldInfo->nTerms;
       return;
     }
     if (termsEnum->term() == value) {
@@ -1198,6 +1196,22 @@ public:
     return sortMultiplier * cmp;
   }
 
+  int compareCurrent(int32_t slot, segdoc oldDoc, segdoc newDoc) override {
+    unused(oldDoc);
+    const Slot& head = slots[(size_t)slot];
+    int32_t ord = selectedOrd(newDoc.docId());
+    int cmp;
+    if (head.ord == 0 || ord == 0) {
+      cmp = compareMissing(head.ord == 0, ord == 0);
+    } else if (head.ordGen == currentSegment) {
+      cmp = (head.ord > ord) - (head.ord < ord);
+    } else {
+      termsEnum->seekOrd((int64_t)ord - 1);
+      cmp = compareTerms(term(head), (std::string_view)termsEnum->term());
+    }
+    return sortMultiplier * cmp;
+  }
+
   void copy(int32_t slot, segdoc doc) override {
     assert(slot >= 0 && slot < (int32_t)slots.size());
     Slot& target = slots[slot];
@@ -1219,7 +1233,7 @@ public:
     unused(docA, docB);
     assert(dynamic_cast<SegmentOrdComparator*>(&other) != nullptr);
     auto* otherOrd = static_cast<SegmentOrdComparator*>(&other);
-    assert(fieldName == otherOrd->fieldName);
+    assert(fields == otherOrd->fields);
     assert(slotA >= 0 && slotA < (int32_t)slots.size());
     assert(slotB >= 0 && slotB < (int32_t)otherOrd->slots.size());
     return sortMultiplier * compareSlots(slots[slotA], otherOrd->slots[slotB]);
@@ -1230,7 +1244,7 @@ public:
     unused(otherDoc);
     assert(dynamic_cast<SegmentOrdComparator*>(&other) != nullptr);
     auto* otherOrd = static_cast<SegmentOrdComparator*>(&other);
-    assert(fieldName == otherOrd->fieldName);
+    assert(fields == otherOrd->fields);
     assert(slot >= 0 && slot < (int32_t)slots.size());
     assert(otherSlot >= 0 && otherSlot < (int32_t)otherOrd->slots.size());
     Slot& target = slots[slot];
@@ -1247,7 +1261,6 @@ public:
 
 // A comparator for non-indexed string columns that compares by value
 class StrColComparator : public FieldComparator {
-  std::string fieldName;
   std::optional<StrColReader> reader;
   std::optional<StrColReader::Iterator> iter;
   std::vector<std::string> values; // Storage for string values
@@ -1257,9 +1270,9 @@ class StrColComparator : public FieldComparator {
 public:
   // `literal` is the value a doc without one sorts as, overriding
   // `missingValue`'s edge.
-  StrColComparator(const std::string& fieldName, bool reversed, MissingValue missingValue,
+  StrColComparator(bool reversed, MissingValue missingValue, IndexReader::FieldSegments fields,
                    std::optional<std::string> literal = std::nullopt)
-    : fieldName(fieldName),
+    : FieldComparator(fields),
       sortMultiplier(reversed ? -1 : 1) {
 
     // For missing values, use empty string for MISSING_FIRST in ASC (sorts before all others)
@@ -1273,18 +1286,14 @@ public:
     }
   }
   
-  void setSegment(int32_t segment, PostingsReader* postingsReader) override {
+  void setSegment(const IndexReader::Segment& segment) override {
+    auto* postingsReader = &segment.postingsReader();
     // Reset reader and iterator
     reader.reset();
     iter.reset();
-    
-    if (!postingsReader) return;
-    
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(*postingsReader);
-    if (fieldReader.seek(fieldName)) {
-      SegFieldInfo fieldInfo;
-      fieldReader.readFieldInfo(fieldInfo);
+
+    if (auto* info = fields.at(segment)) {
+      const auto& fieldInfo = *info;
       if (fieldInfo.columnLoc.offset() > 0) {
         reader.emplace(*postingsReader, fieldInfo);
         iter.emplace(*reader);
@@ -1358,6 +1367,10 @@ public:
     values[slot] = otherStr->values[otherSlot];
   }
   
+  // Retained variable-width payload; fixed slot arrays are accounted by the
+  // owning collection route. Ordinary top-k never calls this accessor.
+  size_t retainedSlotBytes(int32_t slot) const;
+
   ~StrColComparator() override = default;
 };
 

@@ -9,7 +9,7 @@
 #include <string_view>
 #include <vector>
 
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/FilteredTermsEnum.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/TermsEnum.h"
@@ -124,10 +124,9 @@ int32_t lcp(std::string_view a, std::string_view b) {
 }
 
 SegFieldInfo readFieldInfo(MemPool& pool, PostingsReader& postingsReader, std::string_view fieldName) {
-  FieldReader fieldReader(postingsReader);
-  EXPECT_TRUE(fieldReader.seek(fieldName));
-  SegFieldInfo fieldInfo;
-  fieldReader.readFieldInfo(fieldInfo);
+  auto* fieldReader = postingsReader.fieldInfo(fieldName);
+  EXPECT_TRUE((fieldReader != nullptr));
+  const auto& fieldInfo = *fieldReader;
   return fieldInfo;
 }
 

@@ -360,7 +360,7 @@ public:
   ordMap(std::move(ordMap)) {
     if (!selected.empty()) {
       auto poolGuard = MemPool::threadLocalPoolGuard();
-      OrdMapStr lookup(poolGuard.pool(), this->ordMap.get(), reader, fieldName);
+      OrdMapStr lookup(poolGuard.pool(), this->ordMap.get(), reader, segInfos);
       pinnedBuckets.reserve(selected.size());
       for (std::string_view key : selected) {
         auto stats = lookup.termStats(key);
@@ -376,6 +376,7 @@ public:
 
   void init() override {
     FieldFacetReq::init();
+    if (countDistinct != nullptr) return;
     // Whether the REMAINING sub-ops join the count pass or stay behind for the
     // post-selection bucket-domain feed. limit==-1 still inlines all because
     // every bucket is returned. A finite limit that covers the index-wide
@@ -395,7 +396,7 @@ public:
         && limit >= buckets
         && forcedFacetSubOpInline == FacetSubOpInlineMode::AUTO
         && std::ranges::any_of(subOps, [](const auto& subOp) {
-             return subOp.second->canInline();
+             return subOp.second->canInlineInBucket();
            });
   }
 
@@ -532,8 +533,9 @@ public:
 
 
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : FieldFacetReq::Calc(op, parent, slot, numSlots),
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+      : FieldFacetReq::Calc(op, parent, slot, numSlots, structural),
         profileRun(op.addExecutionProfileRun()),
         inlineOps(((StrFacetOp&)op).inlineSubOps),
         feedOps(((StrFacetOp&)op).subOps.begin(),
@@ -561,7 +563,7 @@ public:
       std::vector<std::pair<const std::string_view, SearchOp*>> remaining;
       remaining.reserve(feedOps.size());
       for (auto& subOp : feedOps) {
-        if (subOp.second->canInline()) {
+        if (subOp.second->canInlineInBucket()) {
           inlineOps.push_back(subOp);
         } else {
           remaining.push_back(subOp);
@@ -587,10 +589,9 @@ public:
           totalDomainSize += domainSize;
         }
         if (inlineOps.empty()) continue;
-        FieldReader reader(postings);
-        if (!reader.seek(thisOp().fieldName)) continue;
-        SegFieldInfo info;
-        reader.readFieldInfo(info);
+        auto* field = thisOp().fieldInfo((int32_t)segnum);
+        if (!field) continue;
+        const auto& info = *field;
         int64_t expected = scaleExpectedValues(
             domainSize, info.numValues, maxDoc);
         if (expected > std::numeric_limits<int64_t>::max()
@@ -613,13 +614,12 @@ public:
         calcSegment(tg, -1, {});
         return;
       }
-      for (int32_t segnum = 0; segnum < (int32_t)domains.size(); segnum++) {
-        DomainHandle domain = domains[(size_t)segnum];
-        assert(domain.isDeliverable());
-        task_group_run(tg, [this, tg, segnum, domain]() {
-          calcSegment(tg, segnum, domain);
-        });
-      }
+      task_group_fanout(tg, domains.size(), [&](size_t segnum) {
+        return [this, tg, segnum, domain = domains[segnum]]() {
+          assert(domain.isDeliverable());
+          calcSegment(tg, (int32_t)segnum, domain);
+        };
+      });
     }
 
 
@@ -690,7 +690,6 @@ public:
                ExecutionProfilePieceState* profile) {
       inlineDriver.contribute([&](MergeableFieldFacetInline& data) {
         InlineSegmentScope inlineScope(data.inlineCalcs, segnum);
-        SegFieldInfo segFieldInfo;
         PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
         int32_t maxDoc = postingsReader.maxDoc();
         if (profile != nullptr) {
@@ -699,14 +698,11 @@ public:
           profile->wire.strategy = "inline";
           profile->details.emplace_back(domainDesc(domain));
         }
-        FieldReader fieldReader(postingsReader);
-        bool found = fieldReader.seek(thisOp().fieldName);
-        if (found) {
-          fieldReader.readFieldInfo(segFieldInfo);
-        }
+        auto* segFieldInfo = thisOp().fieldInfo(segnum);
+        bool found = segFieldInfo != nullptr;
         if (profile != nullptr) {
           profile->wire.cardinality = found
-              ? (thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms)
+              ? (thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo->nTerms)
               : 0;
         }
         // A null OrdMap means the field has no values in any segment, so the
@@ -721,7 +717,7 @@ public:
           int64_t expectedValues = inlineExpectedValues >= 0
               ? inlineExpectedValues
               : scaleExpectedValues(
-                    domainSize, segFieldInfo.numValues, maxDoc);
+                    domainSize, segFieldInfo->numValues, maxDoc);
           data.counts.initialize(
               expectedValues,
               forcedInlineFacetEntryMode
@@ -737,7 +733,7 @@ public:
         // repeats; countSegment's skinny repeats>2 crossover is the prior art
         // for that measured follow-up.
         facetReq.facetSegOrdCol(
-            domain, segnum, missing_num, segFieldInfo, mapping,
+            domain, segnum, missing_num, mapping,
             [&](int32_t docid, int64_t ord) LUXIR_INLINE {
               data.counts.add(ord, docid);
             });
@@ -757,7 +753,6 @@ public:
                       ExecutionProfilePieceState* profile,
                       bool allowTopTerms) {
         //write only to different slots, so no need to synchronize
-        SegFieldInfo segFieldInfo;
         auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
         int32_t maxDoc = postingsReader.maxDoc();
         int32_t domainSize = domain ? domain->card() : maxDoc;
@@ -766,8 +761,8 @@ public:
           profile->wire.domain_size = domainSize;
         }
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        FieldReader fieldReader(postingsReader);
-        bool found = fieldReader.seek(thisOp().fieldName);
+        auto* info = thisOp().fieldInfo(segnum);
+        bool found = info != nullptr;
         if (!found) {
           data.missing_num += domainSize;
           if (profile != nullptr) {
@@ -777,7 +772,7 @@ public:
           }
           return; // field not found, but still a contribution (driver releases)
         }
-        fieldReader.readFieldInfo(segFieldInfo);
+        const auto& segFieldInfo = *info;
 
         int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
         auto& facetReq = (FacetReq&)getOp();
@@ -1120,14 +1115,14 @@ public:
           MergeableStrData::ensureRep(data, MergeableStrData::Rep::Span, globVals);
           assert(countSpan != nullptr);
           if (forcedFacetCounterMode == FacetCounterMode::SPAN_GLOBAL) {
-            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+            facetReq.facetSegOrdCol(domain, segnum, missing_num,
               mapping, [&](int32_t docid, int64_t ord) LUXIR_INLINE {
                 unused(docid);
                 countSpan->increment(ord);
               });
           } else {
             std::vector<uint32_t> localCounts(segFieldInfo.nTerms);
-            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+            facetReq.facetSegOrdCol(domain, segnum, missing_num,
               OrdMap::SegToGlobal::identity(),
               [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
                 unused(docid);
@@ -1166,7 +1161,7 @@ public:
           std::vector<int64_t> localCounts(
               stage ? (size_t)segTerms * (size_t)(laneMask + 1) : 0);
           int64_t* counts = stage ? localCounts.data() : countVec->data();
-          facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+          facetReq.facetSegOrdCol(domain, segnum, missing_num,
             stage ? OrdMap::SegToGlobal::identity() : mapping,
             [&](int32_t docid, int64_t ord) LUXIR_INLINE {
               counts[(int64_t)(docid & laneMask) * segTerms + ord]++;
@@ -1185,7 +1180,7 @@ public:
           }
 
         } else if (countMap) {
-          facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+          facetReq.facetSegOrdCol(domain, segnum, missing_num,
             mapping, [&](int32_t docid, int64_t ord) LUXIR_INLINE {
               unused(docid);
               (*countMap)[ord]++;
@@ -1204,7 +1199,7 @@ public:
             : (mapping.bits != 0 && (domainSize >> 1) >= segFieldInfo.nTerms);
           if (useLocal) {
             std::vector<uint8_t> localCounts(segFieldInfo.nTerms);
-            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+            facetReq.facetSegOrdCol(domain, segnum, missing_num,
               OrdMap::SegToGlobal::identity(),
               [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
               unused(docid);
@@ -1221,7 +1216,7 @@ public:
             });
           } else {
             // Not many repeats expected, so just collect global ords directly.
-            facetReq.facetSegOrdCol(domain, segnum, missing_num, segFieldInfo,
+            facetReq.facetSegOrdCol(domain, segnum, missing_num,
               mapping, [&](int32_t docid, int64_t ord) LUXIR_INLINE {
                 unused(docid);
                 countSkinny->increment(ord);
@@ -1399,57 +1394,19 @@ public:
     void emitPage(std::vector<FinalizedFacetBucket<int64_t>> finalized,
                   int64_t missingCount) {
 
-      std::vector<std::pair<std::string, int64_t>> countVec;
-      std::vector<SelectedFacetBucket<std::string_view>> selectedBuckets;
-      auto poolGuard = MemPool::threadLocalPoolGuard();
-      OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(),
-                         *thisOp().req.reader, thisOp().fieldName);
-      countVec.reserve(finalized.size());
-      selectedBuckets.reserve(finalized.size());
-      for (const auto& bucket : finalized) {
-        std::string_view key;
-        std::optional<FacetBucketId> id;
-        FacetBucketFlags flags = FacetBucketFlags::NONE;
-        if (bucket.pinned()) {
-          const auto& pin = thisOp().pinnedBuckets[bucket.pinIndex];
-          key = pin.key;
-          if (pin.ord.has_value()) id = FacetBucketId{*pin.ord};
-          flags = FacetBucketFlags::PINNED;
-        } else {
-          assert(bucket.key.has_value());
-          key = ordMapStr.ordToStr(*bucket.key);
-          id = FacetBucketId{*bucket.key};
-        }
-        countVec.emplace_back(key, bucket.count);
-        int32_t output = (int32_t)selectedBuckets.size();
-        selectedBuckets.push_back({
-            .key = countVec.back().first,
-            .id = id,
-            .count = bucket.count,
-            .owner = FacetOwnerSlot{output},
-            .output = FacetOutputSlot{output},
-            .flags = flags,
-        });
-      }
-
-      auto& mr = op.req.lastResponse->mr;
-      luxir::api::FacetResult* result = nullptr;
-      getTarget(nullptr, [&](luxir::api::Val& val) {
-        routeTarget<luxir::api::ArrVal>(val, mr, [&](luxir::api::Val& target) {
-          result = &oneofMut<luxir::api::FacetResult>(target);
-        });
-      });
-      auto& facetResultProto = *result;
-      emitBuckets(facetResultProto, countVec, mr);
-      if (thisOp().missing) facetResultProto.missing = missingCount;
-      executeResultChildren(selectedBuckets);
+      auto pool = MemPool::threadLocalPoolGuard();
+      OrdMapStr labels(pool.pool(), thisOp().ordMap.get(), thisOp().reader, thisOp().segInfos);
+      emitCountPage<std::string>(finalized, missingCount,
+          [&](const auto& bucket) { return std::string(bucket.pinned()
+              ? thisOp().pinnedBuckets[bucket.pinIndex].key : labels.ordToStr(*bucket.key)); },
+          [this](auto& buckets) { executeResultChildren(buckets); });
     }
 
 
     void facetResult2(std::unique_ptr<MergeableFieldFacetInline> mergedData) {
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr labels(poolGuard.pool(), thisOp().ordMap.get(),
-                       thisOp().reader, thisOp().fieldName);
+                       thisOp().reader, thisOp().segInfos);
       std::vector<std::optional<int64_t>> pins;
       pins.reserve(thisOp().pinnedBuckets.size());
       for (const auto& pin : thisOp().pinnedBuckets) pins.push_back(pin.ord);
@@ -1489,10 +1446,8 @@ public:
         builders.reserve(numBuckets);
         for (size_t i = 0; i < numBuckets; i++) builders.emplace_back(maxDoc);
 
-        FieldReader fieldReader(postingsReader);
-        if (fieldReader.seek(thisOp().fieldName)) {
-          SegFieldInfo segFieldInfo;
-          fieldReader.readFieldInfo(segFieldInfo);
+        if (auto* info = thisOp().fieldInfo((int32_t)segnum)) {
+          const auto& segFieldInfo = *info;
           OrdColReader ordColReader(postingsReader, segFieldInfo);
           auto mapping = thisOp().ordMap->getSegToGlobal((int32_t)segnum);
           StrFacetSelectedOrdMap selectedMap(mapping, selected);
@@ -1551,7 +1506,7 @@ public:
                   && feedOps.size() == 1));
       if (tryReplay) {
         StringFacetColumnSource source{
-            .field = thisOp().fieldName,
+            .segInfos = thisOp().segInfos,
             .ordMap = *thisOp().ordMap,
             .domains = input,
             .buckets = buckets
@@ -1636,7 +1591,10 @@ public:
                   : materializeTermDomain((int32_t)segnum, block[i].key,
                                           input[segnum].get()));
             }
-          }, FacetBucketBlockExecutor::BINDING_BYTES);
+          }, FacetBucketBlockExecutor::BINDING_BYTES, input,
+          [this](size_t segnum, auto block, DomainHandle eligibility, FacetBucketFeed feed) {
+            this->identityDomains(segnum, block, std::move(eligibility), feed, thisOp().ordMap);
+          });
     }
   };
 
@@ -1678,7 +1636,7 @@ public:
 
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr ordMapStr(poolGuard.pool(), child.ordMap.get(),
-                         *child.req.reader, child.fieldName);
+                         *child.req.reader, child.segInfos);
       std::vector<std::pair<std::string, int64_t>> countVec;
       for (const auto& bucket : buckets) {
         int32_t owner = bucket.owner.value;
@@ -1787,23 +1745,19 @@ public:
       int64_t routedDocs = 0;
       int64_t routedValues = 0;
 
-      FieldReader parentFieldReader(postingsReader);
-      if (!parentFieldReader.seek(source.field)) return;
-      SegFieldInfo parentFieldInfo;
-      parentFieldReader.readFieldInfo(parentFieldInfo);
+      auto* parentInfo = source.segInfos.at((size_t)segnum);
+      if (!parentInfo) return;
+      const auto& parentFieldInfo = *parentInfo;
       OrdColReader parentColumn(postingsReader, parentFieldInfo);
       auto parentMapping = source.ordMap.getSegToGlobal(segnum);
       StrFacetSelectedOrdMap selected(parentMapping, selectedBuckets);
 
-      FieldReader childFieldReader(postingsReader);
-      bool childFieldFound = childFieldReader.seek(child.fieldName);
-      std::optional<SegFieldInfo> childFieldInfo;
+      auto* childFieldInfo = child.fieldInfo(segnum);
+      bool childFieldFound = childFieldInfo != nullptr;
       std::optional<OrdColReader> childColumn;
       std::optional<OrdColReader::Iterator> childIterator;
       auto childMapping = child.ordMap->getSegToGlobal(segnum);
       if (childFieldFound) {
-        childFieldInfo.emplace();
-        childFieldReader.readFieldInfo(*childFieldInfo);
         childColumn.emplace(postingsReader, *childFieldInfo);
         childIterator.emplace(*childColumn);
       }
@@ -1873,10 +1827,9 @@ public:
         maxDocs += segmentMax;
         DocSet* domain = source.domains[segnum].get();
         domainDocs += domain != nullptr ? domain->card() : segmentMax;
-        FieldReader fieldReader(postingsReader);
-        if (!fieldReader.seek(child.fieldName)) continue;
-        SegFieldInfo fieldInfo;
-        fieldReader.readFieldInfo(fieldInfo);
+        auto* info = child.fieldInfo((int32_t)segnum);
+        if (!info) continue;
+        const auto& fieldInfo = *info;
         childValues += fieldInfo.numValues;
       }
       __int128 estimate = maxDocs > 0
@@ -1936,7 +1889,8 @@ public:
 
   FacetChildExecutor* bindFacetChild(
       const FacetChildContext& context) override {
-    if (context.stringColumn == nullptr || ordMap == nullptr
+    if (bucketDomain != nullptr || needsStructuralScope) return nullptr;
+    if (countDistinct != nullptr || context.stringColumn == nullptr || ordMap == nullptr
         || !subOps.empty() || !inlineSubOps.empty() || !fieldFacet.sort.empty()) {
       return nullptr;
     }
@@ -1947,8 +1901,12 @@ public:
                                     *context.stringColumn);
   }
 
-  Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots) override {
-    return new Calc(*this, parent, slot, numSlots);
+  Calculator* createCalculator(
+      Calculator* parent, int64_t slot, int64_t numSlots,
+      const StructuralConstraint* structural = nullptr) override {
+    if (countDistinct != nullptr) return new DistinctCalc<true>(
+        *this, parent, slot, numSlots, ordMap, {}, structural);
+    return new Calc(*this, parent, slot, numSlots, structural);
   }
 
   // Retained by one bucket binding while its segments are fed: the
@@ -1961,6 +1919,9 @@ public:
   // hash, are not charged.
   size_t facetBucketResidentBytes() const override {
     int64_t numOrds = ordMap ? ordMap->numOrds() : 0;
+    if (countDistinct != nullptr) {
+      return saturatingAdd(sizeof(DistinctCalc<true>), distinctBindingBytes({true, 0, (uint64_t)numOrds}));
+    }
     size_t bytes = sizeof(Calc);
     if (inlineSubOps.empty()) {
       int64_t maxDoc = 0;
@@ -1979,7 +1940,7 @@ public:
       if (inlineAllCandidate) {
         // calcAll may promote the remaining inlinable sub-ops.
         for (auto& [name, child] : subOps) {
-          if (child->canInline()) {
+          if (child->canInlineInBucket()) {
             stride = saturatingAdd(stride, child->inlineEntryBytes());
           }
         }

@@ -12,9 +12,12 @@
 #include "luxir/search/IndexReader.h"
 #include "FacetEmit.h"
 #include "FacetExecution.h"
+#include "DistinctFacetCounts.h"
 #include "SearchOp.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/DocsReader.h"
+#include <limits>
+
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/reader/PointsReader.h"
@@ -23,6 +26,7 @@
 #include "luxir/query/QueryPrep.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/OrdMapStr.h"
+#include "luxir/search/RangeFacetGrid.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/util/AtomicMerger.h"
 #include "luxir/util/NumericUtils.h"
@@ -35,6 +39,39 @@ namespace luxir {
 
 class FacetReq : public SearchOp {
 public:
+  bool needsCompleteBucketInput() const override {
+    // Facets open result children after their last segment feed. A nested
+    // reset must still be able to recover its ancestors on earlier segments.
+    return (needsStructuralScope && !subOps.empty()) || SearchOp::needsCompleteBucketInput();
+  }
+
+  const CollapsePlan* countDistinct = nullptr;
+  std::shared_ptr<const FacetGroupPlan> groupPlan;
+  // RUN requires every group's matching docs to form one run in exactly one
+  // segment. Index sorting alone is insufficient: it also needs ownership or
+  // a key-ordered merge across segments.
+  static constexpr bool isContiguous = false;
+  FacetDimension groupDimension() const { return groupPlan->dimension; }
+
+  template <bool Growing = false, typename Visit>
+  void collectGroups(DistinctFacetCounts& data, int32_t segnum, DocSet* domain, Visit&& visit) {
+    auto pool = MemPool::threadLocalPoolGuard();
+    CollapseKeyReader keys(*countDistinct);
+    keys.withWalk(segnum, domain, [&](auto read) {
+      auto collect = [&](auto add, auto missing) {
+        if constexpr (std::is_same_v<std::invoke_result_t<decltype(read), int32_t>, const CollapseKey*>) {
+          int32_t previous = -1;
+          GroupIdentity saved{GroupIdentity::DROP};
+          visit([&](int32_t doc) {
+            if (doc != previous) { saved = data.identity(*groupPlan, read(doc)); previous = doc; }
+            return saved;
+          }, add, missing);
+        } else visit(read, add, missing);
+      };
+      if constexpr (Growing) data.collectValues(collect);
+      else data.collect(collect);
+    });
+  }
   IndexReader& reader;
   std::string_view fieldName;
   int64_t limit;
@@ -42,14 +79,47 @@ public:
   bool missing;
 
   std::string_view facetName;
+  IndexReader::FieldSegments segInfos;
+
+  const SegFieldInfo* fieldInfo(int32_t segnum) const {
+    return segInfos.at((size_t)segnum);
+  }
 
   FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName,
     int64_t limit, int64_t minCount, bool missing)
     : SearchOp(req, facetName), reader(*req.reader), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
-      facetName(facetName) {
+      facetName(facetName), segInfos(fieldName.empty() ? IndexReader::FieldSegments{} : reader.field(fieldName)) {
   }
 
   virtual ~FacetReq() = default;
+
+  size_t distinctBindingBytes(FacetDimension values) const {
+    if (DistinctFacetCounts::select(values, groupDimension(), isContiguous) == DistinctFacetMode::PAGED) {
+      uint64_t groups = groupDimension().size;
+      uint64_t words = groups / 64 + (groups % 64 != 0);
+      return saturatingMultiply((size_t)(values.size + 1),
+          (size_t)(words * 8 + (words / 64 + (words % 64 != 0) + 1) * sizeof(uint64_t*)));
+    }
+    // HASH grows with this bucket's touched pairs, just as a document facet's
+    // hash grows with its touched values. Do not price the entire index into
+    // every child binding; actual growth is enforced by the request breaker.
+    return 0;
+  }
+
+  // Distinct missing counts need document identities, not a scalar missing
+  // total. The column presence set is independent of bucket/range predicates.
+  void forEachMissing(DocSet* domain, int32_t segnum, auto&& accept) {
+    auto& postings = reader.segments()[(size_t)segnum].postingsReader();
+    auto* info = fieldInfo(segnum);
+    if (info == nullptr) { forEachDomainDoc(domain, postings.maxDoc(), accept); return; }
+    DocsReader docs(postings, *info);
+    if (!docs.hasBitset()) return;
+    screaming::BitSet::Iterator values(docs.bitset());
+    forEachDomainDoc(domain, postings.maxDoc(), [&](int32_t doc) {
+      if (values.val() < doc) values.advance(doc);
+      if (values.val() != doc) accept(doc);
+    });
+  }
 
   void init() override {
     for (const auto& [childName, child] : subOps) {
@@ -62,21 +132,37 @@ public:
     SearchOp::init();
   }
 
-  // Open the segment column under a pool scope. An absent field adds the
+  // The points format here is the same one-dimensional numeric format used
+  // by range counts. Other points shapes must use the column predicate.
+  static bool numericIdentityPoints(const SegFieldInfo& info) {
+    return info.pointsMetaOff != 0 && (info.type == FieldType::INT
+        || info.type == FieldType::FLOAT || info.type == FieldType::DOUBLE
+        || info.type == FieldType::DATE);
+  }
+
+  // Compare a block's shared column pass with its points fences before
+  // constructing one predicate supplier per bucket.
+  bool numericIdentitiesLead(size_t segment, const SegFieldInfo& info, DocSet* eligibility,
+      size_t count, std::function_ref<PointsReader::ValueRange(size_t)> bounds);
+
+  // Uncached predicate execution owns the indexed representation choice.
+  DomainHandle numericPredicateIdentity(size_t segment, int64_t lo, int64_t hi,
+                                       DocSet* eligibility);
+
+  // Open the segment column. An absent field adds the
   // whole domain to missing_num; otherwise the visitor owns the column walk.
   bool withIntColumn(DocSet* domain, int32_t segnum, int64_t& missing_num,
-                     SegFieldInfo& segFieldInfo, auto&& visitColumn) {
+                     auto&& visitColumn) {
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     int32_t maxDoc = postingsReader.maxDoc();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek(fieldName);
+    auto* info = fieldInfo(segnum);
+    bool found = info != nullptr;
     if (!found) {
       // field absent in this segment: every in-domain doc is missing.
       missing_num += domain ? domain->card() : maxDoc;
       return false;
     }
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *info;
     IntColReader intColReader(postingsReader, segFieldInfo);
     visitColumn(intColReader, maxDoc);
     return true;
@@ -85,20 +171,18 @@ public:
   // utility template method that calls callback with (int32 docid, int64_t value) for each doc in the domain that has
   // a value in the int column field (single or multi-valued).
   // missing is an out parameter that is incremented for every domain doc that does not have the field.
-  // segFieldInfo is passed in uninitializsed and filled in if the field exists in the segment.
   // The value returned is if the field exists in the segment.
-  bool facetSegIntCol(DocSet* domain, int32_t segnum, int64_t& missing_num, SegFieldInfo& segFieldInfo, auto&& callback) {
+  bool facetSegIntCol(DocSet* domain, int32_t segnum, int64_t& missing_num, auto&& callback) {
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     int32_t maxDoc = postingsReader.maxDoc();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek(fieldName);
+    auto* info = fieldInfo(segnum);
+    bool found = info != nullptr;
     if (!found) {
       // field absent in this segment: every in-domain doc is missing.
       missing_num += domain ? domain->card() : maxDoc;
       return false;
     }
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *info;
     // Walk the domain over the int column.  forEachIntColValue owns the
     // domain-type x single/multi x dense/sparse dispatch (and the one
     // (BitDocSet*)/(ArrDocSet*) cast); callback is per value.
@@ -110,17 +194,15 @@ public:
   // callback(docid, ord) per value, ord 0-based in `ordSpace`
   // (forEachOrdValue).
   bool facetSegOrdCol(DocSet* domain, int32_t segnum, int64_t& missing_num,
-                      SegFieldInfo& segFieldInfo,
                       const OrdMap::SegToGlobal& ordSpace, auto&& callback) {
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     int32_t maxDoc = postingsReader.maxDoc();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(postingsReader);
-    if (!fieldReader.seek(fieldName)) {
+    auto* info = fieldInfo(segnum);
+    if (!info) {
       missing_num += domain ? domain->card() : maxDoc;
       return false;
     }
-    fieldReader.readFieldInfo(segFieldInfo);
+    const auto& segFieldInfo = *info;
     OrdColReader ordColReader(postingsReader, segFieldInfo);
     forEachOrdValue(domain, ordColReader, ordSpace, maxDoc, missing_num,
                     callback);
@@ -140,7 +222,7 @@ protected:
   void inlineRemainingSubOps() {
     std::vector<std::string_view> moved;
     for (auto& subOp : subOps) {
-      if (subOp.second->canInline()) {
+      if (subOp.second->canInlineInBucket()) {
         inlineSubOps.push_back(subOp);
         moved.push_back(subOp.first);
       }
@@ -151,6 +233,15 @@ protected:
 public:
   void init() override {
     FacetReq::init();
+    if (countDistinct != nullptr) {
+      // Distinct counting feeds result children with ordinary bucket document
+      // domains. Metrics fold those documents, never one witness per key.
+      if (!fieldFacet.sort.empty()) {
+        throw RequestError("facet '" + std::string(facetName)
+            + "': metric sort with count_distinct is not supported yet");
+      }
+      return;
+    }
     auto sorts = fieldFacet.sort;
     if (!sorts.empty()) {
       if (sorts.size() > 1) {
@@ -168,7 +259,7 @@ public:
           throw std::runtime_error("facet '" + std::string(facetName)
               + "': unknown sort field '" + std::string(sort.expr) + "'");
         }
-        if (!iter->second->canInline()) {
+        if (!iter->second->canInlineInBucket()) {
           throw std::runtime_error("facet '" + std::string(facetName)
               + "': cannot sort by a subop without inline support: "
               + std::string(iter->second->name));
@@ -244,23 +335,23 @@ public:
       }
     };
 
+    template <bool Identity = false>
     DomainHandle materializeTermDomain(
         int32_t segnum, std::string_view term, DocSet* inputDomain) {
-      SegFieldInfo segFieldInfo;
       auto& postingsReader =
           fieldOp().reader.segments()[(size_t)segnum].postingsReader();
       int32_t maxDoc = postingsReader.maxDoc();
       auto poolGuard = MemPool::threadLocalPoolGuard();
-      FieldReader fieldReader(postingsReader);
       std::unique_ptr<DocSet> domain;
-      if (fieldReader.seek(fieldOp().fieldName)) {
-        fieldReader.readFieldInfo(segFieldInfo);
+      if (auto* info = fieldOp().fieldInfo(segnum)) {
+        const auto& segFieldInfo = *info;
         TermsEnum terms(poolGuard.pool(), postingsReader, segFieldInfo);
         if (terms.seek(term)) {
           int32_t docFreq = terms.docFreq();
           DocsOnlyEnum postings(terms);
-          domain = materializePostingsIntersection(
+          if constexpr (Identity) domain = materializeIdentityPostingsIntersection(
               postings, docFreq, inputDomain, maxDoc);
+          else domain = materializePostingsIntersection(postings, docFreq, inputDomain, maxDoc);
         }
       }
 
@@ -273,21 +364,82 @@ public:
       return DomainHandle(std::move(domain));
     }
 
+    template <typename Key>
+    void identityDomains(size_t segnum, std::span<const SelectedFacetBucket<Key>> buckets,
+                         DomainHandle eligibility, FacetBucketFeed feed,
+                         const std::shared_ptr<OrdMap>& ordMap = {}) {
+      auto& facet = fieldOp();
+      auto& postings = facet.reader.segments()[segnum].postingsReader();
+      auto* info = facet.fieldInfo((int32_t)segnum);
+      bool identityLeads = false;
+      if (info) {
+        if constexpr (std::is_same_v<Key, std::string_view>) {
+          // materializePostingsIntersection chooses postings or its sparse
+          // eligibility as the lead, using docFreq and eligibility cardinality.
+          identityLeads = (info->flags & FieldType::INDEX_DOCS) != 0;
+        } else {
+          identityLeads = numericIdentityPoints(*info)
+              && facet.numericIdentitiesLead(segnum, *info, eligibility.get(), buckets.size(),
+                  [&](size_t i) -> PointsReader::ValueRange {
+                    return {buckets[i].key, buckets[i].key};
+                  });
+        }
+      }
+      if (identityLeads) {
+        for (size_t i = 0; i < buckets.size(); i++) {
+          if constexpr (std::is_same_v<Key, std::string_view>) {
+            feed(i, materializeTermDomain<true>((int32_t)segnum, buckets[i].key, eligibility.get()));
+          } else {
+            feed(i, facet.numericPredicateIdentity(
+                segnum, buckets[i].key, buckets[i].key, eligibility.get()));
+          }
+        }
+        return;
+      }
+      feedFacetBucketDomainChunks(postings.maxDoc(), buckets,
+          forcedFacetBucketDomainByteBudget ? forcedFacetBucketDomainByteBudget
+              : FACET_BUCKET_DOMAIN_BYTES, feed,
+          [&](auto chunk) {
+            boost::unordered_flat_map<int64_t, int32_t> owner;
+            for (size_t i = 0; i < chunk.size(); i++) {
+              if constexpr (std::is_same_v<Key, std::string_view>) {
+                if (chunk[i].id) owner.emplace(chunk[i].id->value, (int32_t)i);
+              } else owner.emplace(chunk[i].key, (int32_t)i);
+            }
+            return buildFacetBucketDomains(postings.maxDoc(), chunk.size(), [&](auto&& accept) {
+              int64_t missing = 0;
+              if constexpr (std::is_same_v<Key, std::string_view>) {
+                assert(ordMap || !info);
+                if (ordMap) facet.facetSegOrdCol(eligibility.get(), (int32_t)segnum, missing,
+                    ordMap->getSegToGlobal((int32_t)segnum), accept);
+              } else facet.facetSegIntCol(eligibility.get(), (int32_t)segnum, missing, accept);
+            }, [&](int64_t value) {
+              auto found = owner.find(value);
+              return found == owner.end() ? -1 : found->second;
+            });
+          });
+    }
+
     template <typename Key, typename DomainSource>
     void executeBucketChildren(std::span<const SelectedFacetBucket<Key>> buckets,
                                FacetBucketProducer producer,
-                               DomainSource&& source) {
+                               std::span<const DomainHandle> input, DomainSource&& source,
+                               const std::shared_ptr<OrdMap>& ordMap = {}) {
       if (fieldOp().subOps.empty()) return;
       std::vector<SearchOp*> children;
       children.reserve(fieldOp().subOps.size());
       for (auto& [name, child] : fieldOp().subOps) children.push_back(child);
       FacetBucketBlockExecutor::execute<Key>(
           *this, children, buckets, fieldOp().reader, producer, source,
-          FacetBucketBlockExecutor::BINDING_BYTES);
+          FacetBucketBlockExecutor::BINDING_BYTES,
+          input, [this, &ordMap](size_t segnum, auto block, DomainHandle eligibility,
+                               FacetBucketFeed feed) {
+            identityDomains(segnum, block, std::move(eligibility), feed, ordMap);
+          });
     }
 
     template <typename Key, typename Buckets, typename KeyAt, typename IdAt>
-    static std::vector<SelectedFacetBucket<Key>> selectedBuckets(
+    static auto selectedBuckets(
         const Buckets& finalized, KeyAt&& keyAt, IdAt&& idAt) {
       std::vector<SelectedFacetBucket<Key>> buckets;
       buckets.reserve(finalized.size());
@@ -297,6 +449,40 @@ public:
             finalized[i].pinned() ? FacetBucketFlags::PINNED : FacetBucketFlags::NONE});
       }
       return buckets;
+    }
+
+    template <typename Enumerate, typename Lookup>
+    auto finishCountBuckets(Enumerate&& enumerate,
+                            std::span<const std::optional<int64_t>> pins, Lookup&& count) {
+      FieldBucketFinalizer<int64_t, std::monostate, decltype(countFieldBucketOrder)> finalizer(
+          fieldOp().minCount, 0, fieldOp().limit, countFieldBucketOrder);
+      enumerate(finalizer);
+      auto finalized = finalizer.finish();
+      std::vector<PinnedBucketValue<>> pinValues;
+      for (auto key : pins) pinValues.push_back({key ? count(*key) : 0, {}});
+      mergePinnedBuckets<int64_t, std::monostate>(finalized, pins, pinValues);
+      return finalized;
+    }
+
+    // Count-only document and distinct facets share labels, output and child
+    // routing. Their counter enumeration/lookup and domain producers differ.
+    template <typename Label, typename ResolveLabel, typename ExecuteChildren>
+    void emitCountPage(const std::vector<FinalizedFacetBucket<int64_t>>& finalized,
+                       int64_t missing, ResolveLabel&& label, ExecuteChildren&& executeChildren) {
+      std::vector<std::pair<Label, int64_t>> emitted;
+      emitted.reserve(finalized.size());
+      for (const auto& bucket : finalized) emitted.emplace_back(label(bucket), bucket.count);
+      auto& out = *slotArm<luxir::api::FacetResult>(nullptr);
+      emitBuckets(out, emitted, op.req.lastResponse->mr);
+      if (fieldOp().missing) out.missing = missing;
+      using ChildKey = std::conditional_t<std::is_same_v<Label, std::string>, std::string_view, Label>;
+      auto buckets = selectedBuckets<ChildKey>(finalized,
+          [&](size_t i) -> ChildKey { return emitted[i].first; },
+          [&](size_t i) -> std::optional<FacetBucketId> {
+            if constexpr (std::is_same_v<Label, int64_t>) return FacetBucketId{emitted[i].first};
+            else return finalized[i].key ? std::optional(FacetBucketId{*finalized[i].key}) : std::nullopt;
+          });
+      executeChildren(buckets);
     }
 
     template <typename Data = MergeableFieldFacetInline>
@@ -471,6 +657,123 @@ public:
     };
   };
 
+  // A measure-selected count binding, sharing column readers, bucket
+  // finalization and child-domain execution with document facets. The ordinary
+  // calculators retain their existing loops and additive reduction.
+  template <bool Ordinal>
+  class DistinctCalc : public Calc {
+    std::shared_ptr<OrdMap> ordMap;
+    SegmentMergeDriver<DistinctFacetCounts> driver;
+    FacetCountResource domainResource;
+    std::pmr::vector<DomainHandle> input;
+
+    FacetDimension valueDimension;
+    DistinctFacetMode mode = DistinctFacetMode::AUTO;
+    void collect(DistinctFacetCounts& data, int32_t segnum, DocSet* domain) {
+      auto& facet = this->fieldOp();
+      auto pool = MemPool::threadLocalPoolGuard();
+      auto& postings = facet.reader.segments()[(size_t)segnum].postingsReader();
+      auto* info = facet.fieldInfo(segnum);
+      int64_t missing = 0;
+      facet.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
+        if (!info) { missing = domain ? domain->card() : postings.maxDoc(); return; }
+        if constexpr (Ordinal) {
+          OrdColReader column(postings, *info);
+          forEachOrdValue(domain, column, ordMap->getSegToGlobal(segnum), postings.maxDoc(), missing,
+              [&](int32_t doc, int64_t value) LUXIR_INLINE { add(value, group(doc)); });
+        } else {
+          IntColReader column(postings, *info);
+          forEachIntColValue(domain, column, postings.maxDoc(), missing,
+              [&](int32_t doc, int64_t value) LUXIR_INLINE { add(value, group(doc)); });
+        }
+      });
+      if (facet.missing && missing != 0) {
+        facet.collectGroups(data, segnum, domain, [&](auto group, auto, auto missingBucket) {
+          facet.forEachMissing(domain, segnum,
+              [&](int32_t doc) { missingBucket(group(doc)); });
+        });
+      }
+    }
+
+    void result(std::unique_ptr<DistinctFacetCounts> data) {
+      auto& facet = this->fieldOp();
+      data->finish();
+      auto pool = MemPool::threadLocalPoolGuard();
+      std::optional<OrdMapStr> labels;
+      if constexpr (Ordinal) labels.emplace(pool.pool(), ordMap.get(), facet.reader, facet.segInfos);
+      std::vector<std::optional<int64_t>> pins;
+      if constexpr (Ordinal) {
+        for (std::string_view selected : facet.selectedStrings) {
+          pins.push_back(labels->termStats(selected).globalOrd);
+        }
+      } else for (int64_t selected : facet.selectedInts) pins.push_back(selected);
+      auto finalized = this->finishCountBuckets([&](auto& finalizer) {
+        for (auto [value, count] : data->counts) if (count > 0) finalizer.add({value, count, {}});
+        if constexpr (Ordinal) if (facet.minCount == 0) {
+          for (uint64_t value = 0; value < valueDimension.size; value++) {
+            if (data->count((int64_t)value) == 0) finalizer.add({(int64_t)value, 0, {}});
+          }
+        }
+      }, pins, [&](int64_t key) { return data->count(key); });
+      int64_t missingCount = data->missing();
+      data.reset();
+      auto children = [&](auto& buckets) {
+        using Key = std::conditional_t<Ordinal, std::string_view, int64_t>;
+        this->template executeBucketChildren<Key>(buckets, FacetBucketProducer::JOINT, input,
+          [&](size_t segnum, auto block, FacetBucketFeed feed) {
+            feedFacetBucketDomainChunks(facet.reader.segments()[segnum].maxDoc(), block,
+                FACET_BUCKET_DOMAIN_BYTES, feed, [&](auto chunk) {
+                  boost::unordered_flat_map<int64_t, int32_t> bucketOf;
+                  for (size_t i = 0; i < chunk.size(); i++) {
+                    if (chunk[i].id) bucketOf.emplace(chunk[i].id->value, (int32_t)i);
+                  }
+                  return buildFacetBucketDomains(facet.reader.segments()[segnum].maxDoc(), chunk.size(),
+                      [&](auto&& accept) {
+                        int64_t missing = 0;
+                        if constexpr (Ordinal) facet.facetSegOrdCol(input[segnum].get(), (int32_t)segnum,
+                            missing, ordMap->getSegToGlobal((int32_t)segnum), accept);
+                        else facet.facetSegIntCol(input[segnum].get(), (int32_t)segnum, missing, accept);
+                      }, [&](int64_t value) {
+                        auto it = bucketOf.find(value);
+                        return it == bucketOf.end() ? -1 : it->second;
+                      });
+                });
+          }, ordMap);
+      };
+      if constexpr (Ordinal) this->template emitCountPage<std::string>(finalized, missingCount,
+          [&](const auto& bucket) { return std::string(bucket.pinned() ? facet.selectedStrings[bucket.pinIndex]
+              : labels->ordToStr(*bucket.key)); }, children);
+      else this->template emitCountPage<int64_t>(finalized, missingCount,
+          [](const auto& bucket) { return *bucket.key; }, children);
+    }
+
+  public:
+    DistinctCalc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+                 std::shared_ptr<OrdMap> ordMap = {}, FacetDimension values = {},
+                 const StructuralConstraint* structural = nullptr)
+        : Calc(op, parent, slot, numSlots, structural), ordMap(std::move(ordMap)),
+          driver(op.req.reader->segments().size(),
+              [this](std::unique_ptr<DistinctFacetCounts> data) { result(std::move(data)); }),
+          domainResource(op.req.memoryTracker, std::format("facet '{}' domains", op.name)), input(&domainResource) {
+      driver.setCreator([this]() { return new DistinctFacetCounts(this->op.req.memoryTracker,
+          std::format("facet '{}'", this->op.name), mode, valueDimension, this->fieldOp().groupDimension(), FacetReq::isContiguous); });
+      if constexpr (Ordinal) valueDimension = {true, 0, (uint64_t)(this->ordMap ? this->ordMap->numOrds() : 0)};
+      else valueDimension = values;
+      mode = DistinctFacetCounts::select(valueDimension, this->fieldOp().groupDimension(), FacetReq::isContiguous);
+      if (!this->fieldOp().subOps.empty()) input.resize(op.req.reader->segments().size());
+    }
+
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DomainHandle domain) override {
+      unused(tg);
+      if (segnum == -1) { driver.completeEmpty(); return; }
+      DocSet* docs = domain.get();
+      if (!input.empty()) input[(size_t)segnum] = std::move(domain);
+      driver.contribute([&](DistinctFacetCounts& data) { collect(data, segnum, docs); });
+    }
+
+
+  };
+
 public:
   FieldFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet,
     std::string_view fieldName, std::string_view facetName, int64_t limit,
@@ -555,39 +858,38 @@ public:
     bool useVector = false;
   };
 
-  // ProtobufSearchParser computes globalMin/globalMax/useVector via
-  // scanGlobalRange and passes them in (see TopDocsReq's ctor comment).
   IntFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
-    const GlobalRange& range,
     std::span<const int64_t> selected) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
-                selected, {}),
-  globalMin(range.min), globalMax(range.max), useVector(range.useVector) {}
+                selected, {}) {
+    auto range = scanGlobalRange(reader, segInfos);
+    globalMin = range.min;
+    globalMax = range.max;
+    useVector = range.useVector;
+  }
+
+  FacetDimension valueDimension() const {
+    return {useVector, globalMin, useVector ? (uint64_t)globalMax - (uint64_t)globalMin + 1 : 0};
+  }
 
   bool canEmitAsBucketChild() const override {
     return true;
   }
 
   // Scan every segment for the column's min/max and decide vector vs map
-  // storage based on the resulting range.  Runs during parsing so the result
-  // can be passed to the IntFacetReq ctor.
-  static GlobalRange scanGlobalRange(IndexReader& reader, std::string_view fieldName) {
+  // storage based on the resulting range.
+  static GlobalRange scanGlobalRange(IndexReader& reader, IndexReader::FieldSegments infos) {
     GlobalRange r;
     for (size_t segnum = 0; segnum < reader.segments().size(); segnum++) {
-      auto& postingsReader = reader.segments()[segnum].postingsReader();
-      auto poolGuard = MemPool::threadLocalPoolGuard();
-      FieldReader fieldReader(postingsReader);
-      bool found = fieldReader.seek(fieldName);
-      if (!found) continue;
-
-      SegFieldInfo segFieldInfo;
-      fieldReader.readFieldInfo(segFieldInfo);
+      auto* info = infos.at(segnum);
+      if (!info) continue;
+      const auto& segFieldInfo = *info;
       if (segFieldInfo.numValues == 0) continue;
 
-      IntColReader intColReader(postingsReader, segFieldInfo);
-      r.min = std::min(r.min, intColReader.getMin());
-      r.max = std::max(r.max, intColReader.getMax());
+      assert(info->columnBounds);
+      r.min = std::min(r.min, info->columnBounds->min);
+      r.max = std::max(r.max, info->columnBounds->max);
     }
     if (r.min <= r.max) {
       // width = (#distinct values) - 1, computed unsigned: max-min can exceed
@@ -607,8 +909,9 @@ public:
     std::optional<SegmentMergeDriver<MergeableFieldFacetInline>> inlineDriver;
     std::vector<DomainHandle> input;
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : FieldFacetReq::Calc(op, parent, slot, numSlots),
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+      : FieldFacetReq::Calc(op, parent, slot, numSlots, structural),
         driver(op.req.reader->segments().size(),
                [this](std::unique_ptr<MergeableIntFacet> m){ facetResult(*m); }) {
       if (!thisOp().subOps.empty()) input.resize(op.req.reader->segments().size());
@@ -645,8 +948,7 @@ public:
               forcedInlineFacetEntryMode == InlineFacetEntryMode::FORCE_DENSE,
               forcedInlineFacetEntryMode == InlineFacetEntryMode::FORCE_SPARSE);
           int64_t keyBase = thisOp().useVector ? thisOp().globalMin : 0;
-          SegFieldInfo info;
-          thisOp().withIntColumn(domain, segnum, data.missing_num, info,
+          thisOp().withIntColumn(domain, segnum, data.missing_num,
               [&](IntColReader& column, int32_t maxDoc) {
                 if (!column.multiValued()) {
                   forEachIntColValue(domain, column, maxDoc, data.missing_num,
@@ -684,7 +986,6 @@ public:
       }
       if (!input.empty()) input[(size_t)segnum] = std::move(domainHandle);
       driver.contribute([&](MergeableIntFacet& data) {
-        SegFieldInfo segFieldInfo;
         auto& facetReq = (FacetReq&)getOp();
         // Initialize storage based on the pre-determined type (first segment).
         if (std::holds_alternative<std::monostate>(data.counts)) {
@@ -698,14 +999,14 @@ public:
         }
         if (auto* countVec = std::get_if<MergeableIntFacet::CountVector>(&data.counts)) {
           int64_t minVal = data.minValue;
-          facetReq.facetSegIntCol(domain, segnum, data.missing_num, segFieldInfo,
+          facetReq.facetSegIntCol(domain, segnum, data.missing_num,
             [countVec, minVal](int32_t docid, int64_t val) LUXIR_INLINE {
               unused(docid);
               (*countVec)[val - minVal]++;
             });
         } else {
           auto* countMap = &std::get<MergeableIntFacet::IntHash>(data.counts);
-          facetReq.facetSegIntCol(domain, segnum, data.missing_num, segFieldInfo,
+          facetReq.facetSegIntCol(domain, segnum, data.missing_num,
             [countMap](int32_t docid, int64_t val) LUXIR_INLINE {
               unused(docid);
               (*countMap)[val]++;
@@ -715,69 +1016,31 @@ public:
     };
 
     void facetResult(MergeableIntFacet& merged) {
-      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result
-      auto& facetResultProto = *slotArm<luxir::api::FacetResult>(nullptr);
-      auto minCount = thisOp().minCount;
-      auto limit = thisOp().limit;
-      auto missing = thisOp().missing;
-
-      // TODO: stream into FieldBucketFinalizer instead of collecting every
-      // counted value (see finalizeFieldBuckets in FacetEmit.h).
-      std::vector<FacetCandidate<int64_t>> candidates;
-      // Both storage types (monostate -> neither -> empty result, e.g. empty index).
-      if (auto* countMap = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
-        for (auto [val, count] : *countMap) {
-          candidates.push_back({val, count, {}});
+      auto lookup = [&](int64_t selected) -> int64_t {
+        if (auto* counts = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
+          auto it = counts->find(selected);
+          return it == counts->end() ? 0 : it->second;
         }
-      } else if (auto* countVector = std::get_if<MergeableIntFacet::CountVector>(&merged.counts)) {
-        for (size_t i = 0; i < countVector->size(); i++) {
-          if ((*countVector)[i] > 0) {
-            candidates.push_back({merged.minValue + (int64_t)i,
-                                  (*countVector)[i], {}});
-          }
-        }
-      }
-      // Selected values are reconciled against the finished page, and the
-      // count for one the page does not hold is read straight out of the
-      // counter rather than carried through selection.
-      std::vector<std::optional<int64_t>> pins;
-      std::vector<PinnedBucketValue<>> pinValues;
-      pins.reserve(thisOp().selectedInts.size());
-      pinValues.reserve(thisOp().selectedInts.size());
-      for (int64_t selected : thisOp().selectedInts) {
-        pins.emplace_back(selected);
-        int64_t count = 0;
-        if (auto* countMap = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
-          auto it = countMap->find(selected);
-          if (it != countMap->end()) count = it->second;
-        } else if (auto* countVector =
-                       std::get_if<MergeableIntFacet::CountVector>(&merged.counts)) {
+        if (auto* counts = std::get_if<MergeableIntFacet::CountVector>(&merged.counts)) {
           uint64_t index = (uint64_t)selected - (uint64_t)merged.minValue;
-          if (index < countVector->size()) {
-            count = (*countVector)[index];
+          return index < counts->size() ? (*counts)[index] : 0;
+        }
+        return 0;
+      };
+      std::vector<std::optional<int64_t>> pins;
+      for (int64_t selected : thisOp().selectedInts) pins.push_back(selected);
+      auto finalized = finishCountBuckets([&](auto& finalizer) {
+        if (auto* counts = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
+          for (auto [value, count] : *counts) finalizer.add({value, count, {}});
+        } else if (auto* counts = std::get_if<MergeableIntFacet::CountVector>(&merged.counts)) {
+          for (size_t i = 0; i < counts->size(); i++) if ((*counts)[i] > 0) {
+            finalizer.add({(int64_t)((uint64_t)merged.minValue + i), (*counts)[i], {}});
           }
         }
-        pinValues.push_back({count, {}});
-      }
-      auto finalized = finalizeCountFieldBuckets(
-          std::move(candidates), minCount, 0, limit);
-      mergePinnedBuckets<int64_t, std::monostate>(finalized, pins, pinValues);
-      std::vector<std::pair<int64_t, int64_t>> countVec;
-      countVec.reserve(finalized.size());
-      for (const auto& bucket : finalized) {
-        assert(bucket.key.has_value());
-        countVec.emplace_back(*bucket.key, bucket.count);
-      }
-      emitBuckets(facetResultProto, countVec, mr);
-      if (missing) {
-        facetResultProto.missing = merged.missing_num;
-      }
-      if (!thisOp().subOps.empty()) {
-        auto buckets = selectedBuckets<int64_t>(finalized,
-            [&](size_t i) { return *finalized[i].key; },
-            [&](size_t i) { return FacetBucketId{*finalized[i].key}; });
-        executeResultChildren(buckets);
-      }
+      }, pins, lookup);
+      emitCountPage<int64_t>(finalized, merged.missing_num,
+          [](const auto& bucket) { return *bucket.key; },
+          [this](auto& buckets) { executeResultChildren(buckets); });
     }
 
     void facetInlineResult(std::unique_ptr<MergeableFieldFacetInline> data) {
@@ -800,7 +1063,7 @@ public:
     }
 
     std::vector<DomainHandle> bucketDomains(
-        size_t segnum, std::span<const SelectedFacetBucket<int64_t>> buckets) {
+        size_t segnum, std::span<const SelectedFacetBucket<int64_t>> buckets, DocSet* eligibility) {
       boost::unordered_flat_map<int64_t, int32_t> builderOfValue;
       builderOfValue.reserve(buckets.size());
       for (size_t i = 0; i < buckets.size(); i++) {
@@ -809,10 +1072,9 @@ public:
       return buildFacetBucketDomains(
           thisOp().reader.segments()[segnum].maxDoc(), buckets.size(),
           [&](auto&& accept) {
-            SegFieldInfo info;
             int64_t missing = 0;
-            thisOp().facetSegIntCol(input[segnum].get(), (int32_t)segnum,
-                                    missing, info, accept);
+            thisOp().facetSegIntCol(eligibility, (int32_t)segnum,
+                                    missing, accept);
           }, [&](int64_t value) {
             auto it = builderOfValue.find(value);
             return it == builderOfValue.end() ? -1 : it->second;
@@ -820,18 +1082,21 @@ public:
     }
 
     void executeResultChildren(std::span<const SelectedFacetBucket<int64_t>> buckets) {
-      executeBucketChildren<int64_t>(buckets, FacetBucketProducer::JOINT,
+      executeBucketChildren<int64_t>(buckets, FacetBucketProducer::JOINT, input,
           [this](size_t segnum, auto block, FacetBucketFeed feed) {
             feedFacetBucketDomainChunks(
                 thisOp().reader.segments()[segnum].maxDoc(), block,
                 FACET_BUCKET_DOMAIN_BYTES, feed,
-                [&](auto chunk) { return bucketDomains(segnum, chunk); });
+                [&](auto chunk) { return bucketDomains(segnum, chunk, input[segnum].get()); });
           });
     }
 
   };
 
   size_t facetBucketResidentBytes() const override {
+    if (countDistinct != nullptr) {
+      return saturatingAdd(sizeof(DistinctCalc<false>), distinctBindingBytes(valueDimension()));
+    }
     int64_t width = useVector ? globalMax - globalMin + 1 : 0;
     size_t bytes = sizeof(Calc);
     if (inlineSubOps.empty()) {
@@ -853,8 +1118,12 @@ public:
     return bytes;
   }
 
-  Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
-    return new Calc(*this, parent, slot, numSlots);
+  Calculator* createCalculator(
+      Calculator* parent, int64_t slot, int64_t numSlots = -1,
+      const StructuralConstraint* structural = nullptr) override {
+    if (countDistinct != nullptr) return new DistinctCalc<false>(
+        *this, parent, slot, numSlots, {}, valueDimension(), structural);
+    return new Calc(*this, parent, slot, numSlots, structural);
   };
 
 
@@ -940,8 +1209,9 @@ public:
     std::optional<SegmentMergeDriver<MergeableTextInline>> inlineDriver;
     std::vector<DomainHandle> input;
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : FieldFacetReq::Calc(op, parent, slot, numSlots),
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+      : FieldFacetReq::Calc(op, parent, slot, numSlots, structural),
         driver(op.req.reader->segments().size(),
                [this](std::unique_ptr<MergeableStrFacet> m){ facetResult(*m); }) {
       if (!thisOp().subOps.empty()) input.resize(op.req.reader->segments().size());
@@ -983,18 +1253,17 @@ public:
       if (!input.empty()) input[(size_t)segnum] = std::move(domainHandle);
       driver.contribute([&](MergeableStrFacet& data) {
         boost::unordered_flat_map<std::string, int64_t>& counts = data.counts;
-        SegFieldInfo segFieldInfo;
         auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
         int32_t maxDoc = postingsReader.maxDoc();
         DomainView domainView(domain, maxDoc);
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        FieldReader fieldReader(postingsReader);
-        if (!fieldReader.seek(thisOp().fieldName)) {
+        auto* info = thisOp().fieldInfo(segnum);
+        if (!info) {
           // field absent in this segment: all in-domain docs are missing
           data.missing_num += domainView.card;
           return;
         }
-        fieldReader.readFieldInfo(segFieldInfo);
+        const auto& segFieldInfo = *info;
         if (domainView.compCard != 0) {
           domainView.materializeBits(poolGuard.pool());
         }
@@ -1027,13 +1296,12 @@ public:
         data.counts.initialize(0, false, true);
         auto& postings = thisOp().reader.segments()[(size_t)segnum].postingsReader();
         DomainView view(domain, postings.maxDoc());
-        FieldReader field(postings);
-        if (!field.seek(thisOp().fieldName)) {
+        auto* field = thisOp().fieldInfo(segnum);
+        if (!field) {
           data.missing_num += view.card;
           return;
         }
-        SegFieldInfo info;
-        field.readFieldInfo(info);
+        const auto& info = *field;
         TermsEnum terms(MemPool::threadLocal(), postings, info);
         int32_t lastDoc = -1;
         while (terms.nextTerm()) {
@@ -1081,7 +1349,7 @@ public:
     void executeResultChildren(
         std::span<const SelectedFacetBucket<std::string_view>> buckets) {
       executeBucketChildren<std::string_view>(buckets,
-          FacetBucketProducer::INDEPENDENT,
+          FacetBucketProducer::INDEPENDENT, input,
           [this](size_t segnum, auto block, FacetBucketFeed feed) {
             for (size_t i = 0; i < block.size(); i++) {
               feed(i, materializeTermDomain((int32_t)segnum, block[i].key,
@@ -1142,8 +1410,10 @@ public:
         : saturatingMultiply(reader.segments().size(), sizeof(DomainHandle)));
   }
 
-  Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
-    return new Calc(*this, parent, slot, numSlots);
+  Calculator* createCalculator(
+      Calculator* parent, int64_t slot, int64_t numSlots = -1,
+      const StructuralConstraint* structural = nullptr) override {
+    return new Calc(*this, parent, slot, numSlots, structural);
   }
 };
 
@@ -1152,6 +1422,7 @@ class FixedBucketFacetReq : public FacetReq {
   std::span<const size_t> selectedBuckets;
 
 public:
+  struct CountView { std::span<const int64_t> counts; int64_t missing_num; };
   class MergeableFixedBuckets : public MergeableData {
   public:
     std::vector<int64_t> counts;
@@ -1181,6 +1452,17 @@ public:
       numBuckets(numBuckets), selectedBuckets(selectedBuckets) {}
 
   size_t bucketCount() const { return numBuckets; }
+  size_t facetBucketResidentBytes() const override {
+    size_t bytes = countDistinct == nullptr
+        ? saturatingAdd(sizeof(Calc<false>) + sizeof(MergeableFixedBuckets),
+            saturatingMultiply(numBuckets, sizeof(int64_t)))
+        : saturatingAdd(sizeof(Calc<true>) + sizeof(DistinctFacetCounts),
+            distinctBindingBytes({true, 0, (uint64_t)numBuckets}));
+    if (!subOps.empty() || requiresWholeReaderDomain()) {
+      bytes = saturatingAdd(bytes, FacetBucketBlockExecutor::inputDomainBytes(reader).wholeReader);
+    }
+    return bytes;
+  }
   std::span<const size_t> selectedBucketIndexes() const {
     return selectedBuckets;
   }
@@ -1195,7 +1477,7 @@ public:
   virtual bool requiresWholeReaderDomain() const { return false; }
 
   virtual std::vector<size_t> emittedBuckets(
-      const MergeableFixedBuckets& merged,
+      CountView merged,
       std::span<const uint8_t> pinned) const {
     unused(merged);
     unused(pinned);
@@ -1207,12 +1489,55 @@ public:
 
   virtual void emitBucketResult(
       luxir::api::FacetResult& result,
-      const MergeableFixedBuckets& merged,
+      CountView merged,
       std::span<const size_t> emitted,
       std::pmr::memory_resource& mr) const = 0;
 
+  // Storage and finalized layout are independent of the shared segment and
+  // result-child lifecycle. The fixed policy is empty and keeps its old data.
+  template <bool Distinct>
+  struct FixedStorage {
+    using Data = std::conditional_t<Distinct, DistinctFacetCounts, MergeableFixedBuckets>;
+    static constexpr bool growing = false;
+    explicit FixedStorage(SearchOp&) {}
+    static void initialize(FixedBucketFacetReq& op, Data& data) {
+      if constexpr (!Distinct) if (data.counts.empty()) data.counts.assign(op.bucketCount(), 0);
+    }
+    static Data* create(FixedBucketFacetReq& op, DistinctFacetMode mode) {
+      if constexpr (Distinct) return new Data(op.req.memoryTracker,
+          std::format("facet '{}'", op.name), mode,
+          FacetDimension{true, 0, (uint64_t)op.bucketCount()}, op.groupDimension(), FacetReq::isContiguous);
+      else return new Data;
+    }
+    template <typename Emit>
+    static void finish(FixedBucketFacetReq& op, Data& data, Emit&& emit) {
+      if constexpr (Distinct) {
+        data.finish();
+        std::vector<int64_t> counts(op.bucketCount());
+        for (size_t i = 0; i < counts.size(); i++) counts[i] = data.count((int64_t)i);
+        emit(CountView{counts, data.missing()});
+      } else emit(CountView{data.counts, data.missing_num});
+    }
+    static size_t bucketCount(const FixedBucketFacetReq& op) { return op.bucketCount(); }
+    static std::vector<uint8_t> pinned(const FixedBucketFacetReq& op) { return std::vector<uint8_t>(op.bucketCount()); }
+    static std::vector<size_t> emitted(FixedBucketFacetReq& op, CountView counts, std::span<const uint8_t> pinned) {
+      return op.emittedBuckets(counts, pinned);
+    }
+    static void emit(FixedBucketFacetReq& op, api::FacetResult& result, CountView counts,
+                     std::span<const size_t> emitted, std::pmr::memory_resource& mr) {
+      op.emitBucketResult(result, counts, emitted, mr);
+    }
+  };
+
+  virtual void checkEmittedBucketCount(size_t) const {}
+
+  template <bool Distinct = false, typename Storage = FixedStorage<Distinct>>
   class Calc : public Calculator {
-    SegmentMergeDriver<MergeableFixedBuckets> driver;
+  public:
+    using Data = typename Storage::Data;
+  private:
+    SegmentMergeDriver<Data> driver;
+    DistinctFacetMode mode = DistinctFacetMode::AUTO;
     std::atomic<int32_t> gatheredDomainsSeen{0};
 
   protected:
@@ -1221,54 +1546,54 @@ public:
     // the producer intersects them with each bucket.
     std::vector<DomainHandle> input;
 
+    [[no_unique_address]] Storage storage;
+
     FixedBucketFacetReq& fixedOp() {
       return (FixedBucketFacetReq&)getOp();
     }
 
     virtual void collectSegment(
-        MergeableFixedBuckets& data, int32_t segnum, DocSet* domain) = 0;
+        Data& data, int32_t segnum, DocSet* domain) = 0;
     // The FacetBucketBlockExecutor domain source for result children.
     virtual void feedBucketDomains(
         size_t segnum, std::span<const SelectedFacetBucket<size_t>> block,
         FacetBucketFeed feed) = 0;
+    virtual void feedIdentityDomains(size_t segnum,
+        std::span<const SelectedFacetBucket<size_t>> block, DomainHandle eligibility,
+        FacetBucketFeed feed) = 0;
+    virtual Query::Weight* bucketSelection(size_t) { return nullptr; }
     virtual void prepareGatheredDomains(oneapi::tbb::task_group* tg) {
       unused(tg);
     }
 
     void collectInputSegment(int32_t segnum, DocSet* domain) {
-      driver.contribute([&](MergeableFixedBuckets& data) {
-        if (data.counts.empty()) {
-          data.counts.assign(fixedOp().bucketCount(), 0);
-        }
+      driver.contribute([&](Data& data) {
+        storage.initialize(fixedOp(), data);
         collectSegment(data, segnum, domain);
+        if constexpr (Storage::growing) storage.observe(data);
       });
     }
 
     void prepareAndDispatch(oneapi::tbb::task_group* tg) {
       prepareGatheredDomains(tg);
-      for (int32_t segnum = 0; segnum < (int32_t)input.size(); segnum++) {
-        task_group_run(tg, [this, segnum]() {
-          collectInputSegment(segnum, input[(size_t)segnum].get());
-        });
-      }
-    }
-
-    void startGatheredDispatch(oneapi::tbb::task_group* tg) {
-      task_group_run(tg, [this, tg]() {
-        prepareAndDispatch(tg);
+      task_group_fanout(tg, input.size(), [&](size_t segnum) {
+        return [this, segnum, domain = input[segnum]]() {
+          collectInputSegment((int32_t)segnum, domain.get());
+        };
       });
     }
 
-    void facetResult(MergeableFixedBuckets& merged) {
+    void facetResult(CountView merged) {
       auto& mr = op.req.lastResponse->mr;
-      auto* result = slotArm<luxir::api::FacetResult>(nullptr);
 
-      std::vector<uint8_t> pinned(fixedOp().bucketCount());
+      auto pinned = storage.pinned(fixedOp());
       for (size_t bucket : fixedOp().selectedBucketIndexes()) {
         pinned[bucket] = 1;
       }
-      std::vector<size_t> emitted = fixedOp().emittedBuckets(merged, pinned);
-      fixedOp().emitBucketResult(*result, merged, emitted, mr);
+      auto emitted = storage.emitted(fixedOp(), merged, pinned);
+      fixedOp().checkEmittedBucketCount(emitted.size());
+      auto* result = slotArm<luxir::api::FacetResult>(nullptr);
+      storage.emit(fixedOp(), *result, merged, emitted, mr);
       executeResultChildren(merged, emitted, pinned);
     }
 
@@ -1277,7 +1602,7 @@ public:
     // after its last segment. The subclass producer decides how many of a
     // segment's bucket domains are alive at once.
     void executeResultChildren(
-        const MergeableFixedBuckets& merged,
+        CountView merged,
         std::span<const size_t> emitted,
         std::span<const uint8_t> pinned) {
       if (fixedOp().subOps.empty() || emitted.empty()) return;
@@ -1309,18 +1634,42 @@ public:
           [this](size_t segnum, auto block, FacetBucketFeed feed) {
             feedBucketDomains(segnum, block, feed);
           },
-          fixedOp().bindingStateChunkBytes());
+          fixedOp().bindingStateChunkBytes(),
+          input, [this](size_t segnum, auto block, DomainHandle eligibility, FacetBucketFeed feed) {
+            feedIdentityDomains(segnum, block, std::move(eligibility), feed);
+          }, [this](const auto& bucket) { return bucketSelection(bucket.key); });
     }
 
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : Calculator(op, parent, slot, numSlots),
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+      : Calculator(op, parent, slot, numSlots, structural),
         driver(op.req.reader->segments().size(),
-               [this](std::unique_ptr<MergeableFixedBuckets> merged) {
-                 facetResult(*merged);
-               }) {
+               [this](std::unique_ptr<Data> merged) {
+                 if constexpr (Storage::growing) {
+                   auto release = scope_guard([&]() noexcept { input.clear(); });
+                   storage.finish(fixedOp(), *merged, [this](CountView counts) { facetResult(counts); });
+                 } else storage.finish(fixedOp(), *merged, [this](CountView counts) { facetResult(counts); });
+               }),
+        input(), storage(op) {
+      if constexpr (Distinct || Storage::growing) {
+        driver.setCreator([this]() { return storage.create(fixedOp(), mode); });
+        if constexpr (Distinct && !Storage::growing) {
+          mode = DistinctFacetCounts::select({true, 0, (uint64_t)fixedOp().bucketCount()}, fixedOp().groupDimension(), FacetReq::isContiguous);
+        }
+      }
       if (!fixedOp().subOps.empty() || fixedOp().requiresWholeReaderDomain()) {
         input.resize(op.req.reader->segments().size());
+      }
+    }
+
+    size_t facetBucketObservedBytes() const override {
+      if constexpr (!Storage::growing) return this->op.facetBucketResidentBytes();
+      else {
+        size_t bytes = sizeof(*this) + storage.observed.load(std::memory_order_relaxed)
+            + input.capacity() * sizeof(DomainHandle);
+        bytes = saturatingAdd(bytes, storage.retainedInputs.load(std::memory_order_relaxed));
+        return bytes;
       }
     }
 
@@ -1344,7 +1693,16 @@ public:
         return;
       }
       DocSet* domain = domainHandle.get();
-      if (!input.empty()) input[(size_t)segnum] = std::move(domainHandle);
+      if (!input.empty()) {
+        if constexpr (Storage::growing) {
+          if (domainHandle.ownsStorage()) domainHandle = DomainVariantPlan::account(
+              std::move(domainHandle), op.req.memoryTracker, "retained range bucket inputs");
+          domain = domainHandle.get();
+          if (domain && domainHandle.isCharged()) storage.retainedInputs.fetch_add(
+              domain->ramBytesUsed(), std::memory_order_relaxed);
+        }
+        input[(size_t)segnum] = std::move(domainHandle);
+      }
       if (!fixedOp().requiresWholeReaderDomain()) {
         collectInputSegment(segnum, domain);
         return;
@@ -1352,7 +1710,7 @@ public:
       int32_t seen = gatheredDomainsSeen.fetch_add(
           1, std::memory_order_acq_rel) + 1;
       assert(seen <= (int32_t)input.size());
-      if (seen == (int32_t)input.size()) startGatheredDispatch(tg);
+      if (seen == (int32_t)input.size()) prepareAndDispatch(tg);
     }
 
     void calcAll(oneapi::tbb::task_group* tg,
@@ -1367,10 +1725,10 @@ public:
         return;
       }
       std::copy(domains.begin(), domains.end(), input.begin());
-      for (const DomainHandle& domain : input) {
+      for ([[maybe_unused]] const DomainHandle& domain : input) {
         assert(domain.isDeliverable());
       }
-      startGatheredDispatch(tg);
+      prepareAndDispatch(tg);
     }
   };
 };
@@ -1380,6 +1738,64 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
   int64_t affineGap;
   FieldType::Type valueType;
   bool affine;
+  std::optional<RangeFacetGrid> grid;
+  std::optional<int64_t> wideningStart, wideningEnd;
+  std::span<const RangeFacetRun> runs;
+
+  template <bool Distinct> struct GrowingStorage;
+  struct BucketLayout {
+    std::span<const int64_t> fences;
+    int64_t gap;
+    std::span<const RangeFacetRun> runs;
+    RangeFacetRunCursor cursor{};
+    size_t bucketOf(int64_t value) {
+      if (gap) return (size_t)(((uint64_t)value - (uint64_t)fences.front()) / (uint64_t)gap);
+      return cursor.bucketOf(value, runs, fences);
+    }
+  };
+
+  std::vector<DomainHandle> bucketDomains(size_t segnum,
+      std::span<const SelectedFacetBucket<size_t>> buckets, DocSet* eligibility,
+      BucketLayout layout) {
+    std::vector<int32_t> builderOfBucket(layout.fences.size() - 1, -1);
+    for (size_t i = 0; i < buckets.size(); i++) builderOfBucket[buckets[i].key] = (int32_t)i;
+    int64_t start = layout.fences.front(), end = layout.fences.back();
+    return buildFacetBucketDomains(reader.segments()[segnum].maxDoc(), buckets.size(),
+        [&](auto&& accept) {
+          int64_t missing = 0;
+          facetSegIntCol(eligibility, (int32_t)segnum, missing, accept);
+        }, [&](int64_t value) {
+          return value < start || value >= end ? -1 : builderOfBucket[layout.bucketOf(value)];
+        });
+  }
+
+  void feedRangeDomains(size_t segnum, std::span<const SelectedFacetBucket<size_t>> block,
+      DomainHandle eligibility, FacetBucketFeed feed, BucketLayout layout, bool identity) {
+    if (identity) if (auto* info = fieldInfo((int32_t)segnum)) {
+      if (numericIdentityPoints(*info)
+          && numericIdentitiesLead(segnum, *info, eligibility.get(), block.size(),
+              [&](size_t i) -> PointsReader::ValueRange {
+                size_t bucket = block[i].key;
+                return {layout.fences[bucket], layout.fences[bucket + 1] - 1};
+              })) {
+        for (size_t i = 0; i < block.size(); i++) {
+          size_t bucket = block[i].key;
+          feed(i, numericPredicateIdentity(segnum, layout.fences[bucket],
+              layout.fences[bucket + 1] - 1, eligibility.get()));
+        }
+        return;
+      }
+    }
+    size_t budget = identity && forcedFacetBucketDomainByteBudget
+        ? forcedFacetBucketDomainByteBudget : bucketDomainByteBudget();
+    feedFacetBucketDomainChunks(reader.segments()[segnum].maxDoc(), block, budget, feed,
+        [&](auto chunk) { return bucketDomains(segnum, chunk, eligibility.get(), layout); });
+  }
+
+  struct DataCounts;
+  template <bool Distinct, bool Floating = false> class DataCalc;
+  Calculator* createDataCalculator(Calculator* parent, int64_t slot, int64_t numSlots,
+                                    const StructuralConstraint* structural);
 
   // Bucket index for an in-range value (caller checks [front, back)).
   size_t bucketOf(int64_t val) const {
@@ -1387,8 +1803,11 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
       return (size_t)(((uint64_t)val - (uint64_t)fences.front())
                       / (uint64_t)affineGap);
     }
-    return (size_t)(std::upper_bound(fences.begin(), fences.end(), val)
-                    - fences.begin() - 1);
+    return (size_t)(std::upper_bound(fences.begin(), fences.end(), val) - fences.begin() - 1);
+  }
+  LUXIR_INLINE size_t bucketOf(int64_t val, RangeFacetRunCursor& cursor) const {
+    if (affine) return bucketOf(val);
+    return cursor.bucketOf(val, runs);
   }
 
 public:
@@ -1400,12 +1819,23 @@ public:
     std::string_view fieldName, std::string_view facetName,
     std::span<const int64_t> fences, bool affine, int64_t affineGap,
     FieldType::Type valueType, int64_t minCount, bool missing,
-    std::span<const size_t> selectedBuckets)
+    std::span<const size_t> selectedBuckets, std::span<const RangeFacetRun> runs)
   : FixedBucketFacetReq(
         req, fieldName, facetName, minCount, missing,
         fences.size() - 1, selectedBuckets),
     fences(fences), affineGap(affineGap), valueType(valueType),
-    affine(affine) {}
+    affine(affine), runs(runs) {}
+
+  IntFacetRangeReq(SearchRequest& req,
+      std::string_view fieldName, std::string_view facetName,
+      RangeFacetGrid grid, std::optional<int64_t> start, std::optional<int64_t> end,
+      FieldType::Type valueType, int64_t minCount, bool missing)
+    : FixedBucketFacetReq(req, fieldName, facetName, minCount, missing, 0, {}),
+      affineGap(0), valueType(valueType), affine(false), grid(std::move(grid)),
+      wideningStart(start), wideningEnd(end) {}
+
+  size_t facetBucketResidentBytes() const override;
+  bool facetBucketGrows() const override { return grid.has_value(); }
 
   size_t bindingStateChunkBytes() const override {
     return forcedRangeFacetBindingStateChunkBytes != 0
@@ -1423,8 +1853,13 @@ public:
     return FacetBucketProducer::JOINT;
   }
 
+  void checkEmittedBucketCount(size_t count) const override {
+    if (!subOps.empty() && count > 1024) throw RequestError(
+        "facet '" + std::string(name) + "': range facets with sub-ops are limited to 1024 buckets");
+  }
+
   std::vector<size_t> emittedBuckets(
-      const MergeableFixedBuckets& merged,
+      CountView merged,
       std::span<const uint8_t> pinned) const override {
     std::vector<size_t> emitted;
     emitted.reserve(bucketCount());
@@ -1437,9 +1872,16 @@ public:
 
   void emitBucketResult(
       luxir::api::FacetResult& result,
-      const MergeableFixedBuckets& merged,
+      CountView merged,
       std::span<const size_t> emitted,
       std::pmr::memory_resource& mr) const override {
+    emitRangeResult(result, merged, emitted, mr, fences);
+  }
+
+  void emitRangeResult(
+      luxir::api::FacetResult& result, CountView merged,
+      std::span<const size_t> emitted, std::pmr::memory_resource& mr,
+      std::span<const int64_t> layout) const {
     size_t n = emitted.size();
     auto emitBounds = [&]<typename Outer>(auto decode) {
       auto& bucketIds = result.bucket_ids.emplace().kind.emplace<Outer>();
@@ -1448,8 +1890,8 @@ public:
       for (size_t i = 0; i < n; i++) {
         size_t bucket = emitted[i];
         auto* bounds = build::allocArray(pairs[i].v, 2, mr);
-        bounds[0] = decode(fences[bucket]);
-        bounds[1] = decode(fences[bucket + 1]);
+        bounds[0] = decode(layout[bucket]);
+        bounds[1] = decode(layout[bucket + 1]);
         counts[i] = merged.counts.empty() ? 0 : merged.counts[bucket];
       }
     };
@@ -1472,15 +1914,41 @@ public:
     if (missing) result.missing = merged.missing_num;
   }
 
-  class Calc : public FixedBucketFacetReq::Calc {
+  template <bool Distinct = false>
+  class Calc : public FixedBucketFacetReq::Calc<Distinct> {
+    using Base = FixedBucketFacetReq::Calc<Distinct>;
     IntFacetRangeReq& rangeOp() {
-      return (IntFacetRangeReq&)getOp();
+      return (IntFacetRangeReq&)this->getOp();
     }
 
     void collectSegment(
-        MergeableFixedBuckets& data, int32_t segnum,
+        typename Base::Data& data, int32_t segnum,
         DocSet* domain) override {
-      SegFieldInfo segFieldInfo;
+      if constexpr (Distinct) {
+        auto& range = rangeOp();
+        int64_t missing = 0;
+        if (range.runs.empty()) {
+          range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
+            range.facetSegIntCol(domain, segnum, missing,
+                [&](int32_t doc, int64_t value) LUXIR_INLINE {
+                  if (value >= range.fences.front() && value < range.fences.back()) add((int64_t)range.bucketOf(value), group(doc));
+                });
+          });
+        } else {
+          RangeFacetRunCursor cursor;
+          range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
+            range.facetSegIntCol(domain, segnum, missing,
+                [&](int32_t doc, int64_t value) LUXIR_INLINE {
+                  if (value >= range.fences.front() && value < range.fences.back()) add((int64_t)range.bucketOf(value, cursor), group(doc));
+                });
+          });
+        }
+        if (range.missing && missing != 0) range.collectGroups(data, segnum, domain,
+            [&](auto group, auto, auto missingBucket) {
+              range.forEachMissing(domain, segnum,
+                  [&](int32_t doc) { missingBucket(group(doc)); });
+            });
+      } else {
       int64_t start = rangeOp().fences.front();
       int64_t end = rangeOp().fences.back();
       auto& segment = rangeOp().reader.segments()[segnum];
@@ -1489,9 +1957,8 @@ public:
           && domain == nullptr && segment.liveDocs() == nullptr && noSubOps
           && start < end) {
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        FieldReader fieldReader(segment.postingsReader());
-        if (fieldReader.seek(rangeOp().fieldName)) {
-          fieldReader.readFieldInfo(segFieldInfo);
+        if (auto* info = rangeOp().fieldInfo(segnum)) {
+          const auto& segFieldInfo = *info;
           bool oneDimensionalNumeric = segFieldInfo.type == FieldType::INT
                                       || segFieldInfo.type == FieldType::FLOAT
                                       || segFieldInfo.type == FieldType::DOUBLE
@@ -1522,62 +1989,56 @@ public:
           }
         }
       }
-      rangeOp().facetSegIntCol(
-          domain, segnum, data.missing_num, segFieldInfo,
-          // Captured by value: through a by-reference capture the counts
-          // store may alias the op's fences and the count vector itself, so
-          // each value would reload them.
-          [start, end, counts = std::span(data.counts), &range = rangeOp()]
-          (int32_t docid, int64_t val) LUXIR_INLINE {
+      // Select the lookup form once per segment. The plain closure retains
+      // the original captures and generated affine loop; only run collectors
+      // carry the mutable cursor. Both use the same lifecycle and producer.
+      if (rangeOp().runs.empty()) {
+        // Capture by value so the counter store cannot alias the captures.
+        rangeOp().facetSegIntCol(domain, segnum, data.missing_num,
+            [start, end, counts = std::span(data.counts), &range = rangeOp()]
+              (int32_t docid, int64_t val) LUXIR_INLINE {
             unused(docid);
             if (val < start || val >= end) return;
             counts[range.bucketOf(val)]++;
           });
-    }
-
-    // Build one chunk of one segment's bucket domains in a value-column pass.
-    // A multi-valued document can put two values in one bucket and
-    // DocSetBuilder requires strictly increasing docids, so each builder skips
-    // a repeat of the docid it just added.
-    std::vector<DomainHandle> bucketDomains(
-        size_t segnum,
-        std::span<const SelectedFacetBucket<size_t>> buckets) {
-      std::vector<int32_t> builderOfBucket(rangeOp().bucketCount(), -1);
-      for (size_t i = 0; i < buckets.size(); i++) {
-        builderOfBucket[buckets[i].key] = (int32_t)i;
-      }
-      int64_t start = rangeOp().fences.front();
-      int64_t end = rangeOp().fences.back();
-      return buildFacetBucketDomains(
-          rangeOp().reader.segments()[segnum].maxDoc(), buckets.size(),
-          [&](auto&& accept) {
-            SegFieldInfo info;
-            int64_t missing = 0;
-            rangeOp().facetSegIntCol(input[segnum].get(), (int32_t)segnum,
-                                     missing, info, accept);
-          }, [&](int64_t value) {
-            return value < start || value >= end
-                ? -1 : builderOfBucket[rangeOp().bucketOf(value)];
+      } else {
+        rangeOp().facetSegIntCol(domain, segnum, data.missing_num,
+            [start, end, counts = std::span(data.counts), &range = rangeOp(), cursor = RangeFacetRunCursor{}]
+              (int32_t docid, int64_t val) mutable LUXIR_INLINE {
+            unused(docid);
+            if (val < start || val >= end) return;
+            counts[range.bucketOf(val, cursor)]++;
           });
+      }
+      }
     }
 
-    void feedBucketDomains(
-        size_t segnum, std::span<const SelectedFacetBucket<size_t>> block,
+    void feedBucketDomains(size_t segnum,
+        std::span<const SelectedFacetBucket<size_t>> block, FacetBucketFeed feed) override {
+      auto& range = rangeOp();
+      range.feedRangeDomains(segnum, block, this->input[segnum], feed,
+          {range.fences, range.affine ? range.affineGap : 0, range.runs}, false);
+    }
+    void feedIdentityDomains(size_t segnum,
+        std::span<const SelectedFacetBucket<size_t>> block, DomainHandle eligibility,
         FacetBucketFeed feed) override {
-      feedFacetBucketDomainChunks(
-          rangeOp().reader.segments()[segnum].maxDoc(), block,
-          rangeOp().bucketDomainByteBudget(), feed,
-          [&](auto chunk) { return bucketDomains(segnum, chunk); });
+      auto& range = rangeOp();
+      range.feedRangeDomains(segnum, block, std::move(eligibility), feed,
+          {range.fences, range.affine ? range.affineGap : 0, range.runs}, true);
     }
 
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : FixedBucketFacetReq::Calc(op, parent, slot, numSlots) {}
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+      : Base(op, parent, slot, numSlots, structural) {}
   };
 
   Calculator* createCalculator(
-      Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
-    return new Calc(*this, parent, slot, numSlots);
+      Calculator* parent, int64_t slot, int64_t numSlots = -1,
+      const StructuralConstraint* structural = nullptr) override {
+    if (grid) return createDataCalculator(parent, slot, numSlots, structural);
+    if (countDistinct != nullptr) return new Calc<true>(*this, parent, slot, numSlots, structural);
+    return new Calc<false>(*this, parent, slot, numSlots, structural);
   }
 };
 
@@ -1618,13 +2079,17 @@ public:
     return FacetBucketProducer::INDEPENDENT;
   }
 
+  bool needsCompleteBucketInput() const override {
+    return preparedBuckets || FacetReq::needsCompleteBucketInput();
+  }
+
   bool requiresWholeReaderDomain() const override {
     return preparedBuckets;
   }
 
   void emitBucketResult(
       luxir::api::FacetResult& result,
-      const MergeableFixedBuckets& merged,
+      CountView merged,
       std::span<const size_t> emitted,
       std::pmr::memory_resource& mr) const override {
     auto& ids = result.bucket_ids.emplace().kind.emplace<luxir::api::ColStr>();
@@ -1637,11 +2102,14 @@ public:
     }
   }
 
-  class Calc : public FixedBucketFacetReq::Calc {
+  template <bool Distinct = false>
+  class Calc : public FixedBucketFacetReq::Calc<Distinct> {
+    using Base = FixedBucketFacetReq::Calc<Distinct>;
     std::vector<QueryPrep::PreparedSource> preparedSources;
+    std::unique_ptr<DomainVariantPlan::Reservation> preparedCharge;
 
     QueryFacetReq& queryOp() {
-      return (QueryFacetReq&)getOp();
+      return (QueryFacetReq&)this->getOp();
     }
 
     Query::SegmentSource& bucketSource(size_t bucket) {
@@ -1667,23 +2135,61 @@ public:
 
     void prepareGatheredDomains(oneapi::tbb::task_group* tg) override {
       std::vector<DocSet*> domains;
-      domains.reserve(input.size());
-      for (const DomainHandle& domain : input) {
+      domains.reserve(this->input.size());
+      for (const DomainHandle& domain : this->input) {
         domains.push_back(domain.get());
       }
       Query::Weight::PrepareContext context{
         *queryOp().req.reader,
         std::span<DocSet* const>(domains.data(), domains.size()),
-        tg != nullptr
-      };
+        tg != nullptr, &queryOp().req};
       preparedSources = QueryPrep::prepareSources(
           queryOp().bucketWeights, context);
       assert(preparedSources.size() == queryOp().bucketCount());
+      if (this->structural) {
+        size_t bytes = preparedSources.capacity() * sizeof(QueryPrep::PreparedSource);
+        for (const auto& source : preparedSources) {
+          if (source.prepared) bytes += source.prepared->retainedBytes();
+        }
+        preparedCharge = std::make_unique<DomainVariantPlan::Reservation>(
+            this->op.req.memoryTracker, bytes, "query bucket windows");
+      }
+    }
+
+    Query::Weight* bucketSelection(size_t bucket) override {
+      auto* weight = queryOp().bucketWeights[bucket];
+      // A prepared predicate is still a predicate, but its execution needs the
+      // complete scope. Prepare it at the same bounded stage as a selection;
+      // never retain a canonical whole-reader identity table on this Calc.
+      return !queryOp().bucketQueries[bucket]->recoverableAsPredicate() || weight->needsPrepare()
+          ? weight : nullptr;
+    }
+
+    DomainHandle identityDomain(size_t segnum, size_t bucket, DocSet* eligibility) {
+      // A mixed block can memoize predicate rows beside staged rows. The
+      // latter are applied by StructuralConstraint::finish, never replayed
+      // from this placeholder or from the bucket's original selected window.
+      if (bucketSelection(bucket)) return DomainHandle(std::make_unique<ArrDocSet>(
+          std::vector<int32_t>{}));
+      auto& segment = queryOp().reader.segments()[segnum];
+      auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
+      return DomainHandle(QueryPrep::materialize(
+          *queryOp().bucketWeights[bucket], nullptr, segment, eligibility));
     }
 
     void collectSegment(
-        MergeableFixedBuckets& data, int32_t segnum,
+        typename Base::Data& data, int32_t segnum,
         DocSet* domain) override {
+      if constexpr (Distinct) {
+        auto& segment = queryOp().reader.segments()[(size_t)segnum];
+        for (size_t bucket = 0; bucket < queryOp().bucketCount(); bucket++) {
+          auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
+          DomainHandle matches = materializeBucket((size_t)segnum, bucket, domain);
+          queryOp().collectGroups(data, segnum, matches.get(), [&](auto group, auto add, auto) {
+            forEachDomainDoc(matches.get(), segment.maxDoc(), [&](int32_t doc) { add((int64_t)bucket, group(doc)); });
+          });
+        }
+      } else {
       auto& segment = queryOp().reader.segments()[(size_t)segnum];
       // The count pass never retains matches (result children re-materialize
       // their selected buckets), so the direct count is eligible whenever the
@@ -1691,15 +2197,34 @@ public:
       bool countOnly = domain == nullptr;
       for (size_t bucket = 0; bucket < queryOp().bucketCount(); bucket++) {
         auto release = scope_guard([&]() noexcept { releaseBucketState(segment, bucket); });
+        auto guard = MemPool::threadLocalPoolGuard();
+        Query::ScorerSupplier* supplier = nullptr;
+        bool supplierBuilt = false;
+        auto obtainSupplier = [&]() {
+          if (!supplierBuilt) {
+            supplier = bucketSource(bucket).scorerSupplier(guard.pool(), segment);
+            supplierBuilt = true;
+          }
+          return supplier;
+        };
         if (countOnly && !queryOp().bucketWeights[bucket]->needsPrepare()) {
-          int64_t count = queryOp().bucketWeights[bucket]->count(segment);
-          if (count >= 0) {
-            data.counts[bucket] += count;
+          auto* weight = queryOp().bucketWeights[bucket];
+          auto count = QueryPrep::resolveCount(weight->countShortcut(segment, domain),
+              [&](Query::Weight& resolver) {
+                return &resolver == weight ? obtainSupplier()
+                    : resolver.scorerSupplier(guard.pool(), segment);
+              }, Query::COUNT_EXECUTION_LIMIT);
+          if (!count) count = QueryPrep::supplierCount(obtainSupplier());
+          if (count) {
+            data.counts[bucket] += *count;
             continue;
           }
         }
-        DomainHandle matches = materializeBucket((size_t)segnum, bucket, domain);
+        supplier = obtainSupplier();
+        if (supplier == nullptr) continue;
+        DomainHandle matches(QueryPrep::materialize(supplier, guard.pool(), segment, domain));
         data.counts[bucket] += matches.get()->card();
+      }
       }
     }
 
@@ -1716,15 +2241,25 @@ public:
             releaseBucketState(segment, block[i].key);
           });
           domain = materializeBucket(
-              segnum, block[i].key, input[segnum].get());
+              segnum, block[i].key, this->input[segnum].get());
         }
         feed(i, std::move(domain));
       }
     }
 
+    void feedIdentityDomains(size_t segnum,
+        std::span<const SelectedFacetBucket<size_t>> block, DomainHandle eligibility,
+        FacetBucketFeed feed) override {
+      for (size_t i = 0; i < block.size(); i++) {
+        if (queryOp().bucketWeights[block[i].key]->matchesAllDocs()) feed(i, eligibility);
+        else feed(i, identityDomain(segnum, block[i].key, eligibility.get()));
+      }
+    }
+
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : FixedBucketFacetReq::Calc(op, parent, slot, numSlots) {}
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+      : Base(op, parent, slot, numSlots, structural) {}
 
     void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
       if (queryOp().segmentStateRetained(segment)) return;
@@ -1734,8 +2269,10 @@ public:
   };
 
   Calculator* createCalculator(
-      Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
-    return new Calc(*this, parent, slot, numSlots);
+      Calculator* parent, int64_t slot, int64_t numSlots = -1,
+      const StructuralConstraint* structural = nullptr) override {
+    if (countDistinct != nullptr) return new Calc<true>(*this, parent, slot, numSlots, structural);
+    return new Calc<false>(*this, parent, slot, numSlots, structural);
   }
 };
 

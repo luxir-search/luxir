@@ -34,6 +34,19 @@ std::string ReaderManager::resolvedSchema() {
     auto* type = schema->physical(name);
     rep["stored"] = type->isStored();
     if (type->isStored()) rep["stored_resource"] = type->storedResource_;
+    if (auto* vector = dynamic_cast<const VectorFieldType*>(type)) {
+      const auto& config = vector->ann();
+      auto& ann = rep["ann"];
+      ann["codec"] = config.codec == VectorAnnConfig::PQ ? "pq" : "rabitq";
+      ann["nlist"] = config.nlist;
+      if (config.codec == VectorAnnConfig::PQ) {
+        ann["pq"]["m"] = config.pqM;
+        ann["pq"]["bits"] = config.pqBits;
+      } else {
+        ann["rabitq"]["bits"] = config.rabitqBits;
+        ann["rabitq"]["query_bits"] = config.rabitqQueryBits;
+      }
+    }
     if (!signature.properties.contains("analyzer")) rep["analyzer"] = nullptr;
     if (!signature.properties.contains("normalizer")) rep["normalizer"] = nullptr;
     uint64_t introduced = schema->introduction(name);

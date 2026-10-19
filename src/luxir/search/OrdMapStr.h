@@ -20,12 +20,12 @@ public:
   MemPool& pool;
   OrdMap* ordMap;
   IndexReader& index;
-  std::string_view fieldName;
   std::span<TermsEnum*> enums;
+  IndexReader::FieldSegments segInfos;
   IntColReader::SparseValues* deltas = nullptr;
   IntColReader::SparseValues* firstSegs = nullptr;
 
-  OrdMapStr(MemPool& pool, OrdMap* ordMap, IndexReader& index, std::string_view fieldName) : pool(pool), ordMap(ordMap), index(index), fieldName(fieldName) {
+  OrdMapStr(MemPool& pool, OrdMap* ordMap, IndexReader& index, IndexReader::FieldSegments segInfos) : pool(pool), ordMap(ordMap), index(index), segInfos(segInfos) {
     // Lazy per-segment cache: null means not yet opened.
     enums = pool.make_span_zeroed<TermsEnum*>(index.segments().size());
     if (ordMap && ordMap->getGlobDeltas()) {
@@ -39,11 +39,8 @@ public:
     auto* tenum = enums[segnum];
     if (!tenum) {
       PostingsReader& postingsReader = index.segments()[segnum].postingsReader();
-      FieldReader fieldReader(postingsReader);
-      SegFieldInfo* segFieldInfo = pool.make<SegFieldInfo>();
-      bool found = fieldReader.seek(fieldName);
-      assert(found);
-      fieldReader.readFieldInfo(*segFieldInfo);
+      auto* segFieldInfo = segInfos.at((size_t)segnum);
+      assert(segFieldInfo != nullptr);
       // Create a new TermsEnum in the pool for this segment
       tenum = pool.make<TermsEnum>(pool, postingsReader, *segFieldInfo);
       enums[segnum] = tenum;

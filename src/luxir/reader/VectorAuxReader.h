@@ -5,6 +5,9 @@
 
 #include <faiss/Index.h>
 #include <faiss/IndexIVF.h>
+#include <faiss/IndexIVFRaBitQ.h>
+#include <faiss/IndexPreTransform.h>
+#include <faiss/VectorTransform.h>
 #include <faiss/impl/io.h>
 #include <faiss/index_io.h>
 #include <faiss/invlists/InvertedLists.h>
@@ -42,13 +45,18 @@ struct VectorAuxMeta {
   int32_t dims = 0;
   int32_t metric = 0;       // raw luxir::api::VectorMetric value
   int32_t cosineNormalizeColumnOnRescore = 0;  // bool: raw cosine column, renorm at rescore
-  int32_t engine = 0;       // ENGINE_IVFPQ
-  int32_t nlist = 0;        // IVF only
-  int32_t defaultBreadth = 0;  // IVF only: build-time default nprobe
-  int32_t pqM = 0;          // IVF+PQ only
-  int32_t pqBits = 0;       // IVF+PQ only
+  int32_t engine = 0;       // ENGINE_IVFPQ or ENGINE_IVFRABITQ: the overlay's codec
+  int32_t nlist = 0;
+  int32_t pqM = 0;          // ENGINE_IVFPQ only
+  int32_t pqBits = 0;       // ENGINE_IVFPQ only
+  int32_t rabitqBits = 0;   // ENGINE_IVFRABITQ only: bits per dimension
 
+  // IVF + product quantization; the FAISS header is a bare IndexIVFPQ.
   static constexpr int32_t ENGINE_IVFPQ = 1;
+  // IVF + RaBitQ; the FAISS header is IndexPreTransform(RandomRotationMatrix,
+  // IndexIVFRaBitQ).  The IVF index lives in the rotated space, so queries
+  // are rotated before coarse assignment and list scans.
+  static constexpr int32_t ENGINE_IVFRABITQ = 2;
 
   std::string toBytes() const {
     return std::string((const char*)this, sizeof(VectorAuxMeta));
@@ -63,7 +71,7 @@ struct VectorAuxMeta {
     }
     VectorAuxMeta meta;
     std::memcpy(&meta, bytes.data(), sizeof(VectorAuxMeta));
-    if (meta.engine != ENGINE_IVFPQ) {
+    if (meta.engine != ENGINE_IVFPQ && meta.engine != ENGINE_IVFRABITQ) {
       // (int32_t) copies: can't bind a reference to a packed field.
       throw std::runtime_error(std::format(
         "VectorAuxMeta: aux '{}' has unsupported vector engine {}",
@@ -90,9 +98,34 @@ inline int32_t defaultIvfNList(int64_t n) {
 static_assert(sizeof(VectorAuxMeta) == 8 * sizeof(int32_t),
               "VectorAuxMeta layout is an on-disk contract");
 
+/// Process-wide dedup of RaBitQ rotation matrices.  Every RaBitQ overlay of
+/// a given dims is built with the same fixed seed, so their d x d matrices
+/// are identical; sharing one copy keeps the per-segment RAM cost at the
+/// centroids instead of d^2 floats per overlay, and lets a query rotate once
+/// per distinct matrix rather than once per segment.  Matches by content, so
+/// a matrix from a different seed (or FAISS RNG) simply gets its own entry.
+inline std::shared_ptr<const faiss::LinearTransform>
+internVectorRotation(std::unique_ptr<faiss::LinearTransform> rotation) {
+  static std::mutex mutex;
+  static std::vector<std::weak_ptr<const faiss::LinearTransform>> entries;
+  std::lock_guard<std::mutex> lock(mutex);
+  std::erase_if(entries, [](const auto& w) { return w.expired(); });
+  for (const auto& w : entries) {
+    auto existing = w.lock();
+    if (existing && existing->d_in == rotation->d_in && existing->d_out == rotation->d_out
+        && existing->have_bias == rotation->have_bias
+        && existing->A == rotation->A && existing->b == rotation->b) {
+      return existing;
+    }
+  }
+  std::shared_ptr<const faiss::LinearTransform> shared(std::move(rotation));
+  entries.push_back(shared);
+  return shared;
+}
+
 /// Trailing footer of a vector aux file.  The file layout (written by
 /// VectorIndexBuilder, served by VectorAuxReader) keeps the FAISS blob down to
-/// the index "header" (params + coarse quantizer + PQ codebooks + an empty
+/// the index "header" (params + coarse quantizer + PQ codebooks or rotation + an empty
 /// set of inverted lists) and stores the list payloads in Luxir's own layout
 /// so they are served zero-copy from the file's memory view instead of being
 /// deserialized into FAISS-owned RAM:
@@ -228,7 +261,8 @@ struct RankLiveBitmap {
 /// AuxIndexInfo.files(0), plus the VectorAuxMeta decoded out of
 /// AuxIndexInfo.opaque_meta.
 ///
-/// Contract (matches VectorIndexBuilder): one IVF+PQ file per segment overlay.
+/// Contract (matches VectorIndexBuilder): one IVF file (IVF+RaBitQ or IVF+PQ) per segment
+/// overlay.
 /// Both single- and multi-valued vector fields are supported: every vector is
 /// its own segment-local FAISS id, and KnnQuery maps each id back via the
 /// valueRank->docId column.  The file is opened at IndexReader open time so a
@@ -243,6 +277,9 @@ class VectorAuxReader : public AuxReader {
   // never owns the lists (replace_invlists own=false).
   mutable std::unique_ptr<MmapInvertedLists> mmapLists;
   mutable std::unique_ptr<faiss::Index> faissIndex;
+  // ENGINE_IVFRABITQ: the random rotation the IVF index was built behind
+  // (shared across overlays by internVectorRotation); null otherwise.
+  mutable std::shared_ptr<const faiss::LinearTransform> rotation;
   VectorAuxMeta meta;
   // Cached RankLiveBitmap (built by KnnQuery).  Built once per liveDocs
   // generation - in time proportional to the segment's DELETED docs, not its
@@ -276,17 +313,24 @@ public:
     return meta.cosineNormalizeColumnOnRescore != 0;
   }
   int32_t getEngine() const noexcept { return meta.engine; }
+  bool isRaBitQ() const noexcept { return meta.engine == VectorAuxMeta::ENGINE_IVFRABITQ; }
   int32_t getNList() const noexcept { return meta.nlist; }
-  int32_t getDefaultBreadth() const noexcept { return meta.defaultBreadth; }
   int32_t getPqM() const noexcept { return meta.pqM; }
   int32_t getPqBits() const noexcept { return meta.pqBits; }
+  int32_t getRaBitQBits() const noexcept { return meta.rabitqBits; }
   bool scoresAreExact() const noexcept { return false; }
 
-  // Search-time entry point.  Decode is lazy and once-only; faiss::Index::search
-  // is thread-safe for concurrent readers after construction.  Only the FAISS
-  // header (params + coarse quantizer + PQ codebooks) is deserialized into
-  // RAM; the inverted-list payloads are served zero-copy from the file's
-  // memory view via MmapInvertedLists (see VectorAuxListsFooter).
+  /// The rotation queries must pass through before reaching getFaissIndex()
+  /// (ENGINE_IVFRABITQ), or null.  Valid after getFaissIndex().
+  const faiss::LinearTransform* getRotation() const noexcept { return rotation.get(); }
+
+  // Search-time entry point: the IVF index (for ENGINE_IVFRABITQ, the index
+  // behind the rotation; see getRotation).  Decode is lazy and once-only;
+  // faiss::Index::search is thread-safe for concurrent readers after
+  // construction.  Only the FAISS header (params + coarse quantizer + PQ
+  // codebooks or rotation) is deserialized into RAM; the inverted-list
+  // payloads are served zero-copy from the file's memory view via
+  // MmapInvertedLists (see VectorAuxListsFooter).
   faiss::Index* getFaissIndex() const {
     std::call_once(loadOnce, [this]() {
       InputStream is = file->getInputStream();
@@ -306,10 +350,41 @@ public:
           "VectorAuxReader: dims mismatch for aux '{}': index has {}, opaque_meta says {}",
           name, (int)idx->d, (int32_t)meta.dims));
       }
-      auto* ivf = dynamic_cast<faiss::IndexIVF*>(idx.get());
+      std::shared_ptr<const faiss::LinearTransform> rot;
+      faiss::IndexPreTransform* pt = nullptr;
+      faiss::LinearTransform* lt = nullptr;
+      faiss::Index* innerIndex = idx.get();
+      if (isRaBitQ()) {
+        pt = dynamic_cast<faiss::IndexPreTransform*>(idx.get());
+        auto* rq = pt == nullptr ? nullptr : dynamic_cast<faiss::IndexIVFRaBitQ*>(pt->index);
+        if (pt == nullptr || pt->chain.size() != 1
+            || rq == nullptr) {
+          throw std::runtime_error(std::format(
+            "VectorAuxReader: aux '{}' header is not a rotated IVF+RaBitQ index", name));
+        }
+        if (rq->rabitq.nb_bits != (size_t)meta.rabitqBits) {
+          throw std::runtime_error(std::format(
+            "VectorAuxReader: RaBitQ bits mismatch for aux '{}': index has {}, opaque_meta says {}",
+            name, rq->rabitq.nb_bits, (int32_t)meta.rabitqBits));
+        }
+        lt = dynamic_cast<faiss::LinearTransform*>(pt->chain[0]);
+        if (lt == nullptr || !lt->is_orthonormal || lt->d_in != meta.dims
+            || lt->d_out != meta.dims || pt->index->d != meta.dims) {
+          throw std::runtime_error(std::format(
+            "VectorAuxReader: aux '{}' rotation is not an orthonormal {}x{} transform",
+            name, (int32_t)meta.dims, (int32_t)meta.dims));
+        }
+        innerIndex = pt->index;
+      }
+      auto* ivf = dynamic_cast<faiss::IndexIVF*>(innerIndex);
       if (ivf == nullptr) {
         throw std::runtime_error(std::format(
           "VectorAuxReader: aux '{}' header is not an IVF index", name));
+      }
+      if (ivf->nlist != (size_t)meta.nlist) {
+        throw std::runtime_error(std::format(
+          "VectorAuxReader: nlist mismatch for aux '{}': index has {}, opaque_meta says {}",
+          name, ivf->nlist, (int32_t)meta.nlist));
       }
       if ((int64_t)ivf->nlist != footer.nlist
           || (int64_t)ivf->code_size != footer.codeSize
@@ -319,6 +394,17 @@ public:
           "does not match index header (nlist={} codeSize={} ntotal={})",
           name, (int64_t)footer.nlist, (int64_t)footer.codeSize, (int64_t)footer.ntotal,
           ivf->nlist, ivf->code_size, ivf->ntotal));
+      }
+
+      if (pt != nullptr) {
+        // Validate before taking ownership away from the wrapper. The reader
+        // owns the IVF index; the rotation is interned for sharing.
+        pt->own_fields = false;
+        std::unique_ptr<faiss::Index> inner(pt->index);
+        rot = internVectorRotation(std::unique_ptr<faiss::LinearTransform>(lt));
+        pt->chain.clear();
+        pt->index = nullptr;
+        idx = std::move(inner);
       }
 
       const int64_t* sizes = (const int64_t*)(base + footer.sizesOffset());
@@ -338,6 +424,7 @@ public:
       ivf->replace_invlists(lists.get(), /*own=*/false);
       mmapLists = std::move(lists);
       faissIndex = std::move(idx);
+      rotation = std::move(rot);
     });
     return faissIndex.get();
   }
@@ -391,7 +478,7 @@ public:
     // Residency rule: index data must NOT be force-resident.  IVF/IVF+PQ list
     // payloads are served zero-copy from the file's memory view via
     // MmapInvertedLists (see VectorAuxListsFooter); only the small routing
-    // model (centroids + PQ codebooks) is deserialized into RAM.
+    // model (centroids + PQ codebooks or rotation) is deserialized into RAM.
     //
     // Stay-on-disk story for other index types when we add them:
     //   - HNSW: FAISS 1.14.1's IO_FLAG_MMAP_IFC can mmap both the graph

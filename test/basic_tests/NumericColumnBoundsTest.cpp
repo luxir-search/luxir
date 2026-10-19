@@ -7,7 +7,7 @@
 #include <optional>
 
 #include "luxir/index/IntColWriter.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/value/ValueExprParser.h"
 #include "test/CollectionHelper.h"
@@ -22,10 +22,9 @@ namespace {
 std::optional<IntColReader::EncodedBounds> readBounds(
     IndexReader::Segment& segment, std::string_view field) {
   MemPool pool;
-  FieldReader fields(segment.postingsReader());
-  if (!fields.seek(field)) return std::nullopt;
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = segment.postingsReader().fieldInfo(field);
+  if (!fields) return std::nullopt;
+  const auto& info = *fields;
   IntColReader column(segment.postingsReader(), info);
   return column.encodedBounds();
 }
@@ -95,7 +94,7 @@ TEST_F(NumericColumnBoundsTest, missingOnlySegmentBindsAsMissing) {
   ValueExprOptions options{helper.collection().getSchema().get(), {}};
   ValueProgram* program = ValueExprParser(options, *arena).parse("price_i");
   MemPool pool;
-  auto bound = program->bind(pool, reader->segments()[1]);
+  auto bound = program->bind(pool, reader->segments()[1], program->resolveFields(pool, *reader));
   EXPECT_TRUE(bound->bounds(program->rootNode).alwaysMissing);
   EXPECT_FALSE(bound->evalPoint(0, 0.0f).valid);
   releaseArena(arena);
