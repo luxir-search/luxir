@@ -1,7 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "luxir/search/RangeFacetCountWindow.h"
+#include "luxir/search/RangeFacetCellWindow.h"
 
 #include <stdexcept>
 
@@ -12,21 +12,24 @@ namespace {
 }
 }
 
-RangeFacetCountWindow::RangeFacetCountWindow(const RangeFacetGrid& grid,
+template <typename T>
+RangeFacetCellWindow<T>::RangeFacetCellWindow(const RangeFacetGrid& grid,
     RequestMemTracker& tracker, std::string_view label, size_t cap)
-    : resource(tracker, label, "facet range counts"), grid(grid), cap(cap),
+    : resource(tracker, label, std::is_same_v<T, int64_t> ? "facet range counts" : "facet distinct state"), grid(grid), cap(cap),
       counters(&resource), fences(&resource) {
   assert(cap != 0 && cap <= 100000);
 }
 
-size_t RangeFacetCountWindow::indexOfKey(int64_t value) const {
+template <typename T>
+size_t RangeFacetCellWindow<T>::indexOfKey(int64_t value) const {
   if (gap) return (size_t)(((uint64_t)value - (uint64_t)base) / gap);
   auto it = std::lower_bound(fences.begin(), fences.end(), value);
   assert(it != fences.end() && *it == value);
   return (size_t)(it - fences.begin());
 }
 
-std::pair<size_t, size_t> RangeFacetCountWindow::extent() const {
+template <typename T>
+std::pair<size_t, size_t> RangeFacetCellWindow<T>::extent() const {
   size_t first = occupiedFirst, last = occupiedLast;
   if (widened) {
     first = std::min(first, indexOfKey(widened->first));
@@ -35,7 +38,8 @@ std::pair<size_t, size_t> RangeFacetCountWindow::extent() const {
   return {first, last};
 }
 
-void RangeFacetCountWindow::install(std::pmr::vector<int64_t>& counts,
+template <typename T>
+void RangeFacetCellWindow<T>::install(std::pmr::vector<T>& counts,
     std::pmr::vector<int64_t>& keys, int64_t newBase, uint64_t newWidth, uint64_t newGap) {
   auto newIndex = [&](int64_t value) {
     return newGap ? (size_t)(((uint64_t)value - (uint64_t)newBase) / newGap)
@@ -71,7 +75,8 @@ void RangeFacetCountWindow::install(std::pmr::vector<int64_t>& counts,
   occupiedLast = newLast;
 }
 
-bool RangeFacetCountWindow::rebuildAffine(int64_t lo, int64_t hi, bool left, uint64_t newGap) {
+template <typename T>
+bool RangeFacetCellWindow<T>::rebuildAffine(int64_t lo, int64_t hi, bool left, uint64_t newGap) {
   uint64_t distance = (uint64_t)hi - (uint64_t)lo;
   if (distance / newGap >= cap) capExceeded();
   size_t count = (size_t)(distance / newGap) + 1;
@@ -105,13 +110,15 @@ bool RangeFacetCountWindow::rebuildAffine(int64_t lo, int64_t hi, bool left, uin
     certified = grid.affineGap(first, (int64_t)std::min(end, (__int128)INT64_MAX));
   }
   if (!certified || (uint64_t)*certified != newGap) return false;
-  std::pmr::vector<int64_t> counts(count + extra, 0, &resource), keys(&resource);
+  std::pmr::vector<T> counts(count + extra, T{}, &resource);
+  std::pmr::vector<int64_t> keys(&resource);
   install(counts, keys, first, (uint64_t)(end - first), newGap);
   return true;
 }
 
-void RangeFacetCountWindow::rebuild(int64_t lo, int64_t hi, bool left,
-                                  const RangeFacetCountWindow* other) {
+template <typename T>
+void RangeFacetCellWindow<T>::rebuild(int64_t lo, int64_t hi, bool left,
+                                  const RangeFacetCellWindow<T>* other) {
   auto certified = grid.affineGap(lo, hi == INT64_MAX ? hi : hi + 1);
   if (certified && rebuildAffine(lo, hi, left, (uint64_t)*certified)) return;
 
@@ -121,7 +128,7 @@ void RangeFacetCountWindow::rebuild(int64_t lo, int64_t hi, bool left,
   auto cell = grid.floor(lo);
   size_t cursor = 0, otherCursor = 0;
   bool cellIndexKnown = true;
-  auto cachedNext = [&](const RangeFacetCountWindow& window, size_t& index) -> std::optional<int64_t> {
+  auto cachedNext = [&](const RangeFacetCellWindow<T>& window, size_t& index) -> std::optional<int64_t> {
     if (window.counters.empty() || cell.key < window.base) return std::nullopt;
     if (window.gap) {
       uint64_t offset = (uint64_t)cell.key - (uint64_t)window.base;
@@ -165,7 +172,7 @@ void RangeFacetCountWindow::rebuild(int64_t lo, int64_t hi, bool left,
   {
     std::pmr::vector<int64_t> prefix(&resource);
     size_t back = fences.size(), otherBack = other ? other->fences.size() : 0;
-    auto cachedPrevious = [&](const RangeFacetCountWindow& window, size_t& index,
+    auto cachedPrevious = [&](const RangeFacetCellWindow<T>& window, size_t& index,
                                int64_t first) -> std::optional<int64_t> {
       if (window.counters.empty() || first <= window.base) return std::nullopt;
       if (window.gap) {
@@ -198,13 +205,14 @@ void RangeFacetCountWindow::rebuild(int64_t lo, int64_t hi, bool left,
     catch (const std::runtime_error&) { break; }
     keys.push_back(cell.key);
   }
-  std::pmr::vector<int64_t> counts(keys.size() - 1, 0, &resource);
+  std::pmr::vector<T> counts(keys.size() - 1, T{}, &resource);
   int64_t first = keys.front();
   uint64_t newWidth = (uint64_t)keys.back() - (uint64_t)first;
   install(counts, keys, first, newWidth, 0);
 }
 
-size_t RangeFacetCountWindow::grow(int64_t value) {
+template <typename T>
+size_t RangeFacetCellWindow<T>::grow(int64_t value) {
   auto bounds = grid.valueBounds();
   if (value < bounds.first || value > bounds.second) {
     throw std::runtime_error("range fence is outside the supported civil range");
@@ -225,7 +233,8 @@ size_t RangeFacetCountWindow::grow(int64_t value) {
   return indexOfKey(cell.key);
 }
 
-void RangeFacetCountWindow::widen(std::optional<int64_t> start, std::optional<int64_t> end) {
+template <typename T>
+void RangeFacetCellWindow<T>::widen(std::optional<int64_t> start, std::optional<int64_t> end) {
   if (empty() && (!start || !end || *start >= *end)) return;
   int64_t lo, hi;
   if (empty()) {
@@ -242,7 +251,8 @@ void RangeFacetCountWindow::widen(std::optional<int64_t> start, std::optional<in
   widened = {lo, hi};
 }
 
-void RangeFacetCountWindow::mergeFrom(const RangeFacetCountWindow& other) {
+template <typename T>
+void RangeFacetCellWindow<T>::prepareMerge(const RangeFacetCellWindow<T>& other) {
   assert(&grid == &other.grid && this != &other);
   if (other.empty()) return;
   auto [otherFirst, otherLast] = other.extent();
@@ -254,27 +264,9 @@ void RangeFacetCountWindow::mergeFrom(const RangeFacetCountWindow& other) {
   }
   // In-window unions fit because even capacity (including headroom) is capped.
   if (counters.empty() || lo < base || hi > key(counters.size() - 1)) rebuild(lo, hi, lo < base, &other);
-  if (gap && gap == other.gap) {
-    size_t offset = indexOfKey(other.key(otherFirst));
-    for (size_t i = otherFirst; i <= otherLast; i++) counters[offset + i - otherFirst] += other.counters[i];
-  } else {
-    size_t destination = indexOfKey(other.key(otherFirst));
-    for (size_t i = otherFirst; i <= otherLast; i++) {
-      int64_t sourceKey = other.key(i);
-      if (gap) destination = indexOfKey(sourceKey);
-      else while (fences[destination] < sourceKey) destination++;
-      assert(gap || fences[destination] == sourceKey);
-      counters[destination] += other.counters[i];
-    }
-  }
-  if (auto occupied = other.occupiedBounds()) {
-    occupiedFirst = std::min(occupiedFirst, indexOfKey(occupied->first));
-    occupiedLast = std::max(occupiedLast, indexOfKey(occupied->second));
-  }
-  if (other.widened) {
-    if (widened) widened = {std::min(widened->first, other.widened->first), std::max(widened->second, other.widened->second)};
-    else widened = other.widened;
-  }
 }
+
+template class RangeFacetCellWindow<int64_t>;
+template class RangeFacetCellWindow<uint64_t**>;
 
 } // namespace luxir
