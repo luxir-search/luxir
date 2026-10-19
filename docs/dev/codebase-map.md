@@ -11,6 +11,9 @@ locations, browse `src/luxir/<area>/`.
    - `GRPCServer`: Manages gRPC services and thread pool
    - `HttpServer`: JSON/HTTP API (Boost.Beast), including NDJSON streaming ingest
    - `LuxirNode`: Central coordinator wiring collections and services
+   - `Stats`: The one mapping from engine state (`IndexWriter`/`ReaderManager::stats`, RAM budgets,
+     allocator, `util/Metrics.h` service counters, `SystemStats` procfs/cgroup readers) into
+     `api::StatsResponse`; `Prometheus` renders that response as text for `/metrics` and `_stats?format=prometheus`
    - `Collections`: Owns the name -> collection map and every transition of it
      (startup discovery, creation, activation of a new incarnation, removal),
      announced in order through `CollectionEvents`
@@ -63,6 +66,16 @@ locations, browse `src/luxir/<area>/`.
    [`Query.h`](../../src/luxir/query/Query.h) is the authoritative hierarchy and
    planning-contract description.
 
+   Each query defines `createWeight` (a `MultiTermQuery` subclass,
+   `createFilteredEnum`) out of line. That virtual is the class's key
+   function, so its vtable and the Weight and scorer code reached from it
+   compile once rather than in every translation unit that constructs the
+   query. `BooleanQuery` and `KnnQuery` define it in their own `.cpp`; the
+   other queries share `QueryWeights.cpp` rather than each paying a
+   translation unit's header parsing for a few lines of code. `BooleanQuery`'s
+   Weight and scorers are in `BooleanWeight.h`, which only `BooleanQuery.cpp`
+   and white-box tests include.
+
    - Supports Term, Boolean, Phrase, and All queries
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
@@ -101,11 +114,13 @@ locations, browse `src/luxir/<area>/`.
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
    - `VectorReader`: reads column-stored vectors in the segment's `VectorEncoding`
-     (`codec/VectorCodec.h`: f32, f16, per-vector int8) for exact flat KNN
+     (`codec/VectorCodec.h`: f32, f16, bf16, per-vector int8, bit) for exact flat KNN
    - `VectorScorer` (`query/`): the one place a float query is scored against a stored row
-     per encoding, shared by the flat column scan and candidate rescore
-   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF+PQ aux overlays for ANN,
-     built from the decoded column or the `keep_original` companion column
+     per encoding, shared by the flat column scan and candidate rescore; batched over blocks
+     of rows, on the SIMD kernels in `codec/VectorKernels.cpp` (AVX2/F16C, NEON, portable)
+   - `VectorIndexBuilder` / `VectorAuxReader`: per-segment FAISS IVF (PQ by default, or opt-in
+     RaBitQ) aux overlays for ANN, built from the decoded column or the `keep_original`
+     companion column
    - Reuses column storage for exact search, cosine raw-column normalization, and candidate rescoring
    - See [../guide/vector-search.md](../guide/vector-search.md) for the user contract (query knobs, scoring, recall) and [../design/vector-search.md](../design/vector-search.md) for the overlay/build/query internals
 

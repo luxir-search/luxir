@@ -270,6 +270,9 @@ struct DateRange {
   int64_t lo;
   int64_t hiExclusive;
   bool granuleSkipped = false;
+  // NOW-anchored with no rounding coarser than a millisecond: the window
+  // moves with every request millisecond.
+  bool unroundedNow = false;
 };
 
 // A parsed literal additionally preserves whether an offset token was present.
@@ -456,6 +459,18 @@ public:
   LocalTimeResolver(const TimeZone& zone,
                     std::optional<std::chrono::seconds> preferredOffset)
     : zone(zone), preferredOffset(preferredOffset) {}
+
+  bool intervalSkipped(int64_t civilLo, int64_t civilNext) const {
+    // The direct check inspects the interval's last millisecond. Reuse a
+    // cached unique/fold interval when it already covers that point; actual
+    // gaps keep the shared helper's skipped-day and tzdb endpoint handling.
+    if (civilNext > civilLo && cached
+        && cachedInfo.result != std::chrono::local_info::nonexistent) {
+      int64_t last = civilNext - 1;
+      if ((__int128)last >= cachedBegin && (__int128)last < cachedEnd) return false;
+    }
+    return civilIntervalSkipped(civilLo, civilNext, zone);
+  }
 
   std::optional<int64_t> resolve(int64_t civilMillis) {
     using namespace std::chrono;
@@ -843,16 +858,23 @@ inline std::optional<std::pair<int64_t, int64_t>> roundedInterval(
   return std::pair{*lo, *last};
 }
 
+struct DateMathResult {
+  DateRange range;
+  bool rounded;
+};
+
 // Evaluate once for the lower edge and once for the upper edge. A slash floors
 // the lower edge and rounds the upper edge to the unit's last millisecond;
 // later commands transform both. This is exactly the interval the existing
-// DATE range fold needs for gte/gt/lte/lt semantics.
-inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view math,
-                                              const TimeZone& zone) {
+// DATE range fold needs for gte/gt/lte/lt semantics. rounded is true when some
+// /unit coarser than a millisecond was applied.
+inline std::optional<DateMathResult> applyDateMath(
+    int64_t anchor, std::string_view math, const TimeZone& zone) {
   Cursor cur{math};
   if (cur.atEnd()) return std::nullopt;
   int64_t lo = anchor;
   int64_t hi = anchor;
+  bool rounded = false;
   while (!cur.atEnd()) {
     char op = cur.peek();
     cur.advance();
@@ -878,6 +900,7 @@ inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view m
       if (!lowWindow || !highWindow) return std::nullopt;
       lo = lowWindow->first;
       hi = highWindow->second;
+      rounded |= *unit != DateMathUnit::MILLISECOND;
     } else {
       auto newLo = addUnit(lo, amount, *unit, zone);
       auto newHi = addUnit(hi, amount, *unit, zone);
@@ -887,7 +910,7 @@ inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view m
     }
   }
   if (!supportedInstant(lo) || !supportedInstant(hi) || lo > hi) return std::nullopt;
-  return DateRange{lo, hi + 1};
+  return DateMathResult{.range = {lo, hi + 1}, .rounded = rounded};
 }
 
 inline bool startsWithNow(const Cursor& input) {
@@ -896,55 +919,26 @@ inline bool startsWithNow(const Cursor& input) {
 
 } // namespace datetime_detail
 
-// From-start civil stepping for calendar facet fences. The start instant's
-// frame offset is retained as the ofLocal preference for every independently
-// computed fence.
-class CivilCalendarStepper {
-  TimeZone zone;
-  std::optional<CivilTime> startCivil;
-  datetime_detail::LocalTimeResolver resolver;
-
-public:
-  CivilCalendarStepper(int64_t startInstant, const TimeZone& zone)
-    : zone(zone), startCivil(civilFromInstant(startInstant, zone)),
-      resolver(zone, startCivil
-          ? std::optional<std::chrono::seconds>{startCivil->offset}
-          : std::nullopt) {}
-
-  bool valid() const { return startCivil.has_value(); }
-
-  std::optional<CivilFence> at(int64_t amount, CalendarUnit unit) {
-    namespace dd = datetime_detail;
-    if (!startCivil) return std::nullopt;
-
-    std::optional<int64_t> civil;
-    if (unit == CalendarUnit::DAY || unit == CalendarUnit::WEEK) {
-      int64_t daysPerUnit = unit == CalendarUnit::WEEK ? 7 : 1;
-      __int128 target = (__int128)startCivil->millis
-                      + (__int128)amount * daysPerUnit * dd::kMsPerDay;
-      if (target < dd::kMinEpochMs || target > dd::kMaxEpochMs) {
-        return std::nullopt;
-      }
-      civil = (int64_t)target;
-    } else if (unit == CalendarUnit::YEAR) {
-      civil = dd::calendarCivil(
-          startCivil->millis, amount, dd::DateMathUnit::YEAR);
-    } else {
-      __int128 months = amount;
-      if (unit == CalendarUnit::QUARTER) months *= 3;
-      if (months < std::numeric_limits<int64_t>::min()
-          || months > std::numeric_limits<int64_t>::max()) {
-        return std::nullopt;
-      }
-      civil = dd::calendarCivil(
-          startCivil->millis, (int64_t)months, dd::DateMathUnit::MONTH);
-    }
-    if (!civil) return std::nullopt;
-    auto instant = resolver.resolve(*civil);
-    if (!instant) return std::nullopt;
-    return CivilFence{*civil, *instant};
+// Pure civil arithmetic, always from the original anchor. Month-end clamping
+// must not accumulate (Jan 31 -> Feb 29 -> Mar 31).
+inline std::optional<int64_t> civilCalendarAt(
+    int64_t startCivil, int64_t amount, CalendarUnit unit) {
+  namespace dd = datetime_detail;
+  if (unit == CalendarUnit::DAY || unit == CalendarUnit::WEEK) {
+    int64_t daysPerUnit = unit == CalendarUnit::WEEK ? 7 : 1;
+    __int128 target = (__int128)startCivil
+                    + (__int128)amount * daysPerUnit * dd::kMsPerDay;
+    if (target < dd::kMinEpochMs || target > dd::kMaxEpochMs) return std::nullopt;
+    return (int64_t)target;
   }
-};
+  if (unit == CalendarUnit::YEAR) {
+    return dd::calendarCivil(startCivil, amount, dd::DateMathUnit::YEAR);
+  }
+  __int128 months = (__int128)amount * (unit == CalendarUnit::QUARTER ? 3 : 1);
+  if (months < std::numeric_limits<int64_t>::min()
+      || months > std::numeric_limits<int64_t>::max()) return std::nullopt;
+  return dd::calendarCivil(startCivil, (int64_t)months, dd::DateMathUnit::MONTH);
+}
 
 inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEpochMillis,
                                                const TimeZone& zone) {
@@ -958,11 +952,17 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
   // NOW/now is the one non-literal anchor. Case-insensitive acceptance lets
   // Solr and OpenSearch clients share the same endpoint.
   if (dd::startsWithNow(input)) {
-    if (input.size() == 3) return DateRange{nowEpochMillis, nowEpochMillis + 1};
+    if (input.size() == 3) {
+      return DateRange{.lo = nowEpochMillis, .hiExclusive = nowEpochMillis + 1,
+                       .unroundedNow = true};
+    }
     input.advance(3);
     input.consume("||");  // harmless union convenience
-    return dd::applyDateMath(
+    auto result = dd::applyDateMath(
         nowEpochMillis, input.slice(input.position(), input.size()), zone);
+    if (!result) return std::nullopt;
+    result->range.unroundedNow = !result->rounded;
+    return result->range;
   }
 
   // A literal without math retains Luxir's existing granularity window.
@@ -982,8 +982,9 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     if (!anchor) return std::nullopt;
     auto result = dd::applyDateMath(
         anchor->range.lo, input.slice(mathStart, input.size()), zone);
-    if (result) result->granuleSkipped = anchor->range.granuleSkipped;
-    return result;
+    if (!result) return std::nullopt;
+    result->range.granuleSkipped = anchor->range.granuleSkipped;
+    return result->range;
   }
 
   // Solr appends math directly. Try operator positions from right to left so
@@ -1000,8 +1001,8 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     if (!anchor) continue;
     if (auto result = dd::applyDateMath(
             anchor->range.lo, input.slice(separator, input.size()), zone)) {
-      result->granuleSkipped = anchor->range.granuleSkipped;
-      return result;
+      result->range.granuleSkipped = anchor->range.granuleSkipped;
+      return result->range;
     }
   }
   return std::nullopt;

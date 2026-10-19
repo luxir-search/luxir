@@ -19,6 +19,7 @@
 #include "oneapi/tbb/task_scheduler_observer.h"
 #include "luxir/search/SearchEngine.h"
 #include "luxir/LuxirConfig.h"
+#include "luxir/util/Metrics.h"
 #include "luxir/util/SharedLazyMap.h"
 #include "luxir/util/thread.h"
 
@@ -37,6 +38,8 @@ class Scrubber;
 
 class LuxirNode {
 public:
+  // Shared with retained collections so instrumentation outlives their work.
+  const std::shared_ptr<Metrics> metrics = std::make_shared<Metrics>();
   static constexpr std::string_view kDefaultCollectionName = Collections::kDefaultCollectionName;
   using CollectionEntry = Collections::Entry;
 

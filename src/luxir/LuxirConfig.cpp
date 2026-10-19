@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "LuxirConfig.h"
+#include <CLI/CLI.hpp>
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/server/Collections.h"
 #include <unistd.h>

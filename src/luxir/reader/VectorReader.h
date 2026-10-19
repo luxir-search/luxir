@@ -20,25 +20,29 @@ namespace luxir {
 /// from the column's fixedValueSize and the encoding; the schema does not need
 /// to declare dims.
 ///
-/// rowAtRank(r) returns the r-th stored value in its encoding (score it with a
-/// VectorScorer), decodeAtRank(r) materializes it as floats.  For multi-valued
+/// rowAtRank(r) returns the r-th stored row in its encoding, with the norm
+/// prefix when hasNorms() (score it with a VectorScorer); decodeAtRank(r)
+/// materializes it as floats.  Rows are fixed-size and contiguous, so
+/// rowsBase() + r * valueBytes() addresses row r directly.  For multi-valued
 /// fields, valueRange(docRank) gives [startValueRank, endValueRank).
 class VectorReader {
   StrColReader strCol_;
   VectorEncoding encoding_;
+  bool norms_;
   int32_t dims_;
 
 public:
   VectorReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo)
     : strCol_(postingsReader, fieldInfo),
       encoding_((VectorEncoding)fieldInfo.vectorEncoding),
+      norms_(fieldInfo.vectorNorms),
       dims_(0) {
     if (!vcodec::valid(fieldInfo.vectorEncoding) || !strCol_.isFixedSize()) {
       throw std::runtime_error(std::format(
         "vector field '{}' has an unsupported column layout (encoding {})",
         (std::string_view)fieldInfo.fieldname, fieldInfo.vectorEncoding));
     }
-    dims_ = vcodec::dimsFromBytes(encoding_, strCol_.fixedValueSize());
+    dims_ = vcodec::dimsFromRowBytes(encoding_, strCol_.fixedValueSize(), norms_);
     if (dims_ < 0) {
       throw std::runtime_error(std::format(
         "vector field '{}' value size {} is invalid for encoding {}",
@@ -51,7 +55,10 @@ public:
 
   VectorEncoding encoding() const { return encoding_; }
 
-  /// Stored bytes per vector.
+  /// Whether rows carry the |x|^2 prefix (vcodec::rowNormSq).
+  bool hasNorms() const { return norms_; }
+
+  /// Stored bytes per vector (row stride).
   int32_t valueBytes() const { return strCol_.fixedValueSize(); }
 
   int32_t docsWithValue() const { return strCol_.docsWithValue(); }
@@ -66,9 +73,13 @@ public:
     return strCol_.valueAt(valueRank);
   }
 
+  /// The first row; row r is at rowsBase() + r * valueBytes().  Requires
+  /// numVectors() > 0.
+  const char* rowsBase() const { return rowAtRank(0).data(); }
+
   /// Decodes the vector at a global value rank into out[0..dims()).
   void decodeAtRank(int64_t valueRank, float* out) const {
-    vcodec::decode(encoding_, rowAtRank(valueRank).data(), dims_, out);
+    vcodec::decode(encoding_, vcodec::rowPayload(rowAtRank(valueRank).data(), norms_), dims_, out);
   }
 
   /// Decodes n consecutive vectors starting at valueRank into out (n * dims()).
@@ -76,12 +87,13 @@ public:
     if (n <= 0) return;
     const char* base = rowAtRank(valueRank).data();
     int64_t stride = valueBytes();
-    if (encoding_ == VectorEncoding::F32) {
+    if (encoding_ == VectorEncoding::F32 && !norms_) {
       std::memcpy(out, base, (size_t)(n * stride));
       return;
     }
     for (int64_t i = 0; i < n; i++) {
-      vcodec::decode(encoding_, base + i * stride, dims_, out + i * dims_);
+      vcodec::decode(encoding_, vcodec::rowPayload(base + i * stride, norms_), dims_,
+                     out + i * dims_);
     }
   }
 
@@ -89,7 +101,8 @@ public:
   std::span<const float> vectorAtRank(int64_t valueRank) const {
     assert(encoding_ == VectorEncoding::F32);
     auto bytes = strCol_.valueAt(valueRank);
-    return std::span<const float>((const float*)bytes.data(), (size_t)dims_);
+    return std::span<const float>((const float*)vcodec::rowPayload(bytes.data(), norms_),
+                                  (size_t)dims_);
   }
 
   /// F32 columns only, single-valued: the vector for the doc at a doc rank.

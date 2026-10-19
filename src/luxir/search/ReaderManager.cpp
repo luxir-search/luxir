@@ -16,6 +16,7 @@ void ReaderManager::throwClosed() {
 }
 
 std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot, Directory& source) {
+  MetricWork metric(*metrics, MetricStage::READER_REFRESH);
   std::lock_guard lock(indexReaderMutex);
   checkOpen();
   auto previous = indexReader.load();
@@ -76,6 +77,7 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
   const std::lock_guard<std::mutex> readerLock(indexReaderMutex);
   reader = indexReader.load(std::memory_order_acquire);
   if (!reader || stale(*reader) || schemaChanged(*reader)) {
+    MetricWork metric(*metrics, MetricStage::READER_REFRESH);
     auto openPublished = [&](IndexReader* previous) {
       for (;;) {
         checkOpen();
@@ -99,7 +101,7 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
   return reader;
 }
 
-ReaderManager::Stats ReaderManager::stats(bool includeSegments) {
+ReaderManager::Stats ReaderManager::stats(bool includeSegments, bool includeFiles) {
   Stats out;
   auto current = snapshot();
   std::pmr::monotonic_buffer_resource arena;
@@ -110,7 +112,7 @@ ReaderManager::Stats ReaderManager::stats(bool includeSegments) {
   out.updateVersion = info.update_version;
   out.schemaGen = info.schema_gen;
   out.segments = out.committedSegments = info.segments.size();
-  out.totalBytes = dir.totalBytes();
+  if (includeFiles) out.totalBytes = dir.totalBytes();
   auto copyAux = [](const api::AuxIndexInfo& aux) {
     AuxStats result;
     result.kind = aux.kind;

@@ -51,6 +51,8 @@ struct ResolvedField {
   // 0 means "not set / infer from first indexed value"; > 0 means strict.
   int32_t vectorDims = 0;
   bool hasVectorDims = false;
+  // 0 means no truncation; > 0 keeps that many leading components.
+  int32_t vectorTruncateDims = 0;
   bool hasVectorMetric = false;
   VectorFieldType::Metric vectorMetric = VectorFieldType::METRIC_NONE;
   bool hasVectorNormalized = false;
@@ -61,6 +63,8 @@ struct ResolvedField {
   VectorEncoding vectorEncoding = VectorEncoding::F32;
   bool hasVectorKeepOriginal = false;
   bool vectorKeepOriginal = false;
+  // Atomic like analyzer: the nearest authored ann in the parent chain.
+  const luxir::api::VectorAnnDef* ann = nullptr;
 };
 
 struct ResolvedOwnership {
@@ -216,13 +220,25 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorDims = parentResolved.vectorDims;
   }
 
+  // truncate_dims: explicit set on this field overrides (0 = no truncation);
+  // otherwise inherit.
+  if (def.truncate_dims.has_value()) {
+    if (*def.truncate_dims < 0) {
+      throw SchemaError("truncate_dims must be >= 0 (field: " + std::string(name) + ")");
+    }
+    r.vectorTruncateDims = *def.truncate_dims;
+  } else {
+    r.vectorTruncateDims = parentResolved.vectorTruncateDims;
+  }
+
   // metric: explicit set on this field overrides (including an explicit
   // "none" = storage-only); otherwise inherit.  Range-checked like index.
   if (def.metric.has_value()) {
     if (*def.metric != VectorMetric::NONE && *def.metric != VectorMetric::L2 &&
-        *def.metric != VectorMetric::IP && *def.metric != VectorMetric::COSINE) {
+        *def.metric != VectorMetric::IP && *def.metric != VectorMetric::COSINE &&
+        *def.metric != VectorMetric::HAMMING) {
       throw SchemaError("unknown metric value " + std::to_string((int)*def.metric) +
-                        " (field: " + std::string(name) + "); valid: none, l2, ip, cosine");
+                        " (field: " + std::string(name) + "); valid: none, l2, ip, cosine, hamming");
     }
     r.hasVectorMetric = true;
     r.vectorMetric = (VectorFieldType::Metric)*def.metric;
@@ -253,7 +269,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   if (def.encoding.has_value()) {
     if (!vcodec::valid((int32_t)*def.encoding)) {
       throw SchemaError("unknown encoding value " + std::to_string((int)*def.encoding) +
-                        " (field: " + std::string(name) + "); valid: f32, f16, int8");
+                        " (field: " + std::string(name) + "); valid: f32, f16, bf16, int8, bit");
     }
     r.hasVectorEncoding = true;
     r.vectorEncoding = (VectorEncoding)*def.encoding;
@@ -271,7 +287,68 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorKeepOriginal = parentResolved.vectorKeepOriginal;
   }
 
+  r.ann = def.ann ? &*def.ann : parentResolved.ann;
   return r;
+}
+
+// Apply defaults to an authored ann definition and validate it against the
+// effective dims. Positive PQ m requires pinned dims; automatic m also works
+// with dims inferred per segment.
+// dims is the stored dimension the overlay is built over; dimsName names the
+// schema property it came from.
+static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t dims,
+                                        std::string_view dimsName, std::string_view name) {
+  VectorAnnConfig cfg;
+  if (def == nullptr) return cfg;
+  auto fail = [&](const std::string& msg) {
+    throw SchemaError("ann: " + msg + " (field: " + std::string(name) + ")");
+  };
+  using Codec = api::VectorAnnDef_::Codec;
+  if (def->codec) {
+    Codec codec = *def->codec;
+    if (codec != Codec::RABITQ && codec != Codec::PQ) {
+      fail("unknown codec " + std::to_string((int)codec) + "; valid: rabitq, pq");
+    }
+    cfg.codec = codec == Codec::PQ ? VectorAnnConfig::PQ : VectorAnnConfig::RABITQ;
+  }
+  if (def->nlist) {
+    if (*def->nlist < 0 || *def->nlist > 65536) fail("nlist must be in [0, 65536]");
+    cfg.nlist = *def->nlist;
+  }
+  if (def->rabitq && cfg.codec != VectorAnnConfig::RABITQ) {
+    fail("rabitq settings require explicit codec \"rabitq\"");
+  }
+  if (def->pq && cfg.codec != VectorAnnConfig::PQ) fail("pq settings require codec pq");
+  if (def->rabitq) {
+    if (def->rabitq->bits) {
+      if (*def->rabitq->bits < 1 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [1, 9]");
+      cfg.rabitqBits = *def->rabitq->bits;
+    }
+    if (def->rabitq->query_bits) {
+      if (*def->rabitq->query_bits < 0 || *def->rabitq->query_bits > 8) {
+        fail("rabitq.query_bits must be in [0, 8]");
+      }
+      cfg.rabitqQueryBits = *def->rabitq->query_bits;
+    }
+  }
+  if (def->pq) {
+    if (def->pq->m) {
+      if (*def->pq->m < 0) fail("pq.m must be >= 0");
+      if (*def->pq->m > 0) {
+        if (dims <= 0) fail("positive pq.m requires positive dims");
+        if (dims % *def->pq->m != 0) {
+          fail("pq.m=" + std::to_string(*def->pq->m) + " does not divide " + std::string(dimsName) + "=" +
+               std::to_string(dims));
+        }
+      }
+      cfg.pqM = *def->pq->m;
+    }
+    if (def->pq->bits) {
+      if (*def->pq->bits < 1 || *def->pq->bits > 8) fail("pq.bits must be in [1, 8]");
+      cfg.pqBits = *def->pq->bits;
+    }
+  }
+  return cfg;
 }
 
 static void resolveField(std::string_view name, const sv_entry_map& defMap,
@@ -352,13 +429,14 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   if (def.normalizer && r.type != FieldClass::STRING) {
     throw SchemaError("normalizer is only valid for string fields (field: " + name + ")");
   }
-  bool vectorProp = def.dims.has_value() || def.metric.has_value() ||
+  bool vectorProp = def.dims.has_value() || def.truncate_dims.has_value() || def.metric.has_value() ||
                     def.normalized.has_value() || def.normalize_on_write.has_value() ||
-                    def.encoding.has_value() || def.keep_original.has_value();
+                    def.encoding.has_value() || def.keep_original.has_value() ||
+                    def.ann.has_value();
   if (vectorProp && r.type != FieldClass::VECTOR) {
     throw SchemaError(
-      "dims/metric/normalized/normalize_on_write/encoding/keep_original are only valid for "
-      "vector fields (field: " + name + ")");
+      "dims/truncate_dims/metric/normalized/normalize_on_write/encoding/keep_original/ann are only "
+      "valid for vector fields (field: " + name + ")");
   }
 }
 
@@ -561,13 +639,61 @@ struct FieldCompiler {
       case FieldClass::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
         // dims may be 0, meaning "infer from first indexed value".
+        if (r.vectorTruncateDims > 0) {
+          // Every truncated input stores the same size, so the declared full
+          // dims is the only check that catches vectors from another model.
+          if (r.vectorDims == 0) {
+            throw SchemaError("truncate_dims requires dims (field: " + std::string(name) + ")");
+          }
+          if (r.vectorTruncateDims >= r.vectorDims) {
+            throw SchemaError("truncate_dims (" + std::to_string(r.vectorTruncateDims) +
+                              ") must be < dims (" + std::to_string(r.vectorDims) +
+                              ") (field: " + std::string(name) + ")");
+          }
+          // Matryoshka models compare renormalized prefixes.  Under cosine a
+          // prefix cut here and one the provider renormalized score the same;
+          // l2 and ip would score the raw prefix's shrunken length.
+          if (r.vectorMetric != VectorFieldType::METRIC_COSINE) {
+            throw SchemaError("truncate_dims requires metric cosine (field: " + std::string(name) + ")");
+          }
+          // normalized asserts unit-length input, but a truncated prefix of a
+          // unit vector is shorter than 1.
+          if (r.vectorNormalized) {
+            throw SchemaError("normalized=true cannot be combined with truncate_dims "
+                              "(a truncated prefix is not unit length; it is renormalized on write) (field: " +
+                              std::string(name) + ")");
+          }
+        }
         bool normalizeOnWrite;
         normalizeOnWrite = !r.vectorNormalized && (r.hasVectorNormalizeOnWrite
           ? r.vectorNormalizeOnWrite
           : (r.vectorMetric == VectorFieldType::METRIC_COSINE));
+        // ANN overlays are built over the stored (truncated) column.
+        bool truncated = r.vectorTruncateDims > 0;
+        VectorAnnConfig ann = resolveAnnConfig(r.ann, truncated ? r.vectorTruncateDims : r.vectorDims,
+                                               truncated ? "truncate_dims" : "dims", name);
+        // Binary vectors: HAMMING defaults to the bit encoding, and the two
+        // only go together.
+        bool hamming = r.vectorMetric == VectorFieldType::METRIC_HAMMING;
+        VectorEncoding encoding = hamming && !r.hasVectorEncoding ? VectorEncoding::BIT
+                                                                  : r.vectorEncoding;
+        if (hamming && encoding != VectorEncoding::BIT) {
+          throw SchemaError("metric hamming requires encoding bit (field: " + std::string(name) + ")");
+        }
+        if (encoding == VectorEncoding::BIT) {
+          if (!hamming && r.vectorMetric != VectorFieldType::METRIC_NONE) {
+            throw SchemaError("encoding bit requires metric hamming or none (field: " +
+                              std::string(name) + ")");
+          }
+          if (r.vectorDims % 8 != 0) {
+            throw SchemaError("encoding bit requires dims to be a multiple of 8 (field: " +
+                              std::string(name) + ")");
+          }
+        }
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
                                                r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
-                                               r.vectorEncoding, r.vectorKeepOriginal);
+                                               encoding, r.vectorKeepOriginal, ann,
+                                               r.vectorTruncateDims);
         break;
       }
       default:

@@ -862,7 +862,7 @@ TEST_F(VectorColTest, schemaProtoRoundTrip) {
   auto schema = b.build();
   auto* vft = dynamic_cast<VectorFieldType*>(schema->getFieldTypePtr("embedding"));
   ASSERT_NE(nullptr, vft);
-  EXPECT_EQ(384, vft->dims());
+  EXPECT_EQ(384, vft->storedDims());
   EXPECT_EQ(VectorFieldType::METRIC_COSINE, vft->metric());
   EXPECT_TRUE(vft->normalizeOnWrite());
   EXPECT_TRUE(vft->hasColumn());

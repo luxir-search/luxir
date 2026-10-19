@@ -302,8 +302,8 @@ restart, and RAM followers refetch. `--store.ram-limit-mb`
 (default 0, unlimited) bounds storage buffers. Under pressure, pins on retired
 files are dropped first; if space is still short, writes fail with
 `storage_memory_limit`. Allow room for current data plus changed files.
-Per-collection storage usage is in `_stats`; node storage usage and its limit
-are in `_stats?memory=true` under `memory.storage_ram`.
+Per-collection storage usage is in `_stats?collections=true`; node storage usage
+and its limit are in `_stats` under `memory.storage_ram`.
 
 ## Reference
 
@@ -325,8 +325,8 @@ All replication settings use `--replication.` (configuration keys use underscore
 Copying a snapshot pins it so its files stay readable. A pin expires after
 `pin-idle-timeout-ms` without progress, and the oldest pins are revoked when
 retired files held only by pins exceed `pin-retained-bytes`. The follower then
-fetches a new snapshot and reuses the files it already verified. `_stats`
-reports `snapshot_pins`, `pin_retained_bytes`, `pin_idle_drops` and
+fetches a new snapshot and reuses the files it already verified.
+`_stats?collections=true` reports `snapshot_pins`, `pin_retained_bytes`, `pin_idle_drops` and
 `pin_budget_drops`.
 
 A source tracks up to 4096 live followers and `max-acknowledgments`

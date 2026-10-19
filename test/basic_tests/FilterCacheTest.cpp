@@ -28,7 +28,7 @@
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/query/AllQuery.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExistsQuery.h"
@@ -2441,6 +2441,34 @@ TEST(FilterCacheTest, uncacheableFilterStaysPostingsBacked) {
       QueryPrep::FilterSupplierMode::EXHAUSTIVE_CLAUSE);
   ASSERT_NE(nullptr, supplier);
   EXPECT_EQ(nullptr, dynamic_cast<QueryPrep::DocSetSupplier*>(supplier));
+}
+
+TEST(FilterCacheTest, requestStableFilterOwnsAndDeduplicatesWithoutSharedTraffic) {
+  LuxirNode node;
+  luxir::test::CollectionHelper helper(node, "request_stable_filter");
+  ASSERT_TRUE(helper.indexAll({luxir::test::flatdoc("when_dt", 1)},
+                              UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto* cache = reader->filterCache();
+  NumericPredicateQuery query("when_dt", 1, 1, FilterKeyScope::REQUEST_STABLE);
+  NumericPredicateQuery same("when_dt", 1, 1, FilterKeyScope::REQUEST_STABLE);
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  EXPECT_FALSE(context.planningContext().lookupExistingFilterUse(query, true));
+  auto* use = context.getFilterUse(query);
+  ASSERT_NE(nullptr, use);
+  EXPECT_EQ(use, context.getFilterUse(same));
+  OwnedFilterStatsGuard stats;
+  for (auto* q : {&query, &same}) {
+    QueryPrep::materializeEffectiveFilter(
+        *q->createWeight(context, 0), context.getFilterUse(*q),
+        *reader, reader->segments()[0], nullptr);
+  }
+  EXPECT_EQ(1, SkipStats::ownedFilterMaterializations);
+  EXPECT_EQ(0u, cache->entryCountForTest());
+  EXPECT_EQ(0u, cache->counters().admissions);
+  EXPECT_EQ(0u, cache->counters().builds);
+  EXPECT_EQ(0u, cache->counters().misses);
 }
 
 TEST(FilterCacheTest, weightCountShortcutsAreNarrowAndTransparent) {
@@ -5645,6 +5673,74 @@ TEST(FilterKeyTest, scoreAndExecutionWrappersPreserveMembershipKey) {
   EXPECT_EQ(keyFor(term), keyFor(boost));
   EXPECT_EQ(keyFor(term), keyFor(constant));
   EXPECT_EQ(keyFor(term), keyFor(force));
+}
+
+TEST(FilterKeyTest, requestScopePropagatesSeparatelyFromQueryEquality) {
+  NumericPredicateQuery request("when_dt", 1, 2, FilterKeyScope::REQUEST_STABLE);
+  NumericPredicateQuery literal("when_dt", 1, 2);
+  // BooleanQuery dedups membership by equals(), independently of cache lifetime.
+  EXPECT_TRUE(request.equals(literal));
+  EXPECT_EQ(request.hash(), literal.hash());
+  EXPECT_NE(keyFor(request), keyFor(literal));
+  std::array<Query*, 2> clauses{&literal, &request};
+  BooleanQuery compound(clauses, {}, {}, {});
+  FilterKeyBuilder out;
+  EXPECT_EQ(FilterKeyScope::REQUEST_STABLE, compound.appendFilterKey(out, {}));
+  UncacheableQuery uncacheable(request);
+  std::array<Query*, 2> mixed{&request, &uncacheable};
+  BooleanQuery rejected(mixed, {}, {}, {});
+  EXPECT_FALSE(optionalKeyFor(rejected));
+}
+
+// An unrounded NOW range must not touch admission history, so a rounded filter's
+// first sighting survives a stream of them and admits on its second.
+TEST(FilterCacheIntegrationTest, unroundedNowRangeSkipsAdmission) {
+  LuxirConfig config;
+  config.queryCacheBytes = 0;
+  LuxirNode node(config);
+  constexpr std::string_view collection = "filter_cache_unrounded_now";
+  luxir::test::CollectionHelper helper(node, collection);
+  auto cache = std::make_shared<FilterCache>(testConfig());
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+
+  constexpr int64_t minute = 60000;
+  int64_t base = *parseDateToEpochMillis("2026-07-22T08:00:00Z");
+  std::vector<luxir::test::Doc> input;
+  for (int64_t i = 0; i < 60; i++) {
+    input.push_back(luxir::test::flatdoc("when_dt", base + i * minute));
+  }
+  ASSERT_TRUE(helper.indexAll(input, UpdateMessage::COMMIT).success);
+
+  struct NowRestore {
+    ~NowRestore() { forcedDateMathNowEpochMillis.reset(); }
+  } restore;
+  auto count = [&](int64_t now, std::string_view gte, std::string_view lte) {
+    forcedDateMathNowEpochMillis = now;
+    auto request = luxir::test::localReq(node.getSearchEngine());
+    auto& cursor = request->collection(collection)
+                       .topDocs("q").allQuery().getNumber().limit(0);
+    addFilter(cursor, luxir::test::qb::range(
+        cursor.mr(), "when_dt", luxir::test::qb::valStr(cursor.mr(), gte),
+        nullptr, luxir::test::qb::valStr(cursor.mr(), lte), nullptr));
+    request->execute();
+    EXPECT_TRUE(request->ok()) << request->toString();
+    return request->getMatchCount("q");
+  };
+
+  int64_t start = base + 30 * minute + 500;
+  EXPECT_EQ(11, count(start, "now-10m/m", "now/m"));  // first sighting
+  // More unique keys than testConfig's admission history holds.
+  for (int64_t k = 0; k < 40; k++) {
+    EXPECT_EQ(10, count(start + k, "now-10m", "now"));
+  }
+  EXPECT_EQ(0u, cache->entryCountForTest());
+  EXPECT_EQ(0u, cache->counters().builds);
+
+  EXPECT_EQ(11, count(start, "now-10m/m", "now/m"));
+  EXPECT_GT(cache->counters().builds, 0u);
+  auto hitsBefore = cache->counters().hits;
+  EXPECT_EQ(11, count(start + 1000, "now-10m/m", "now/m"));
+  EXPECT_GT(cache->counters().hits, hitsBefore);
 }
 
 TEST(FilterKeyTest, dateMathKeysFollowCoercedBuckets) {

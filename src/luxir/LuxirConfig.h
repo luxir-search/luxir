@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <string>
-#include <CLI/CLI.hpp>
 #include <oneapi/tbb/info.h>
+
+namespace CLI { class App; }
 
 namespace luxir {
 

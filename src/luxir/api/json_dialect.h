@@ -698,6 +698,8 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.stored_resource, ctx, vit, vend);
           } else if (key == "dims") {
             util::from_json<V>(value.dims, ctx, vit, vend);
+          } else if (key == "truncate_dims") {
+            util::from_json<V>(value.truncate_dims, ctx, vit, vend);
           } else if (key == "metric") {
             util::from_json<V>(value.metric, ctx, vit, vend);
           } else if (key == "normalized") {
@@ -708,6 +710,8 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.encoding, ctx, vit, vend);
           } else if (key == "keep_original") {
             util::from_json<V>(value.keep_original, ctx, vit, vend);
+          } else if (key == "ann") {
+            util::from_json<V>(value.ann, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

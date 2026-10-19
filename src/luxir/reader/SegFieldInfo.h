@@ -111,6 +111,8 @@ struct SegFieldInfo {
   // VECTOR only: the column's VectorEncoding, as written for this segment.
   // Serialized only for VECTOR fields.
   int32_t vectorEncoding = 0;
+  // VECTOR only: rows carry the |x|^2 prefix (see VectorCodec.h).
+  bool vectorNorms = false;
 
   // Within-file references are relative; these are the complete set of
   // segment-global bases.  Relocate them together before FieldInfo is

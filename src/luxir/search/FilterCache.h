@@ -25,6 +25,7 @@
 #include "luxir/search/DocSet.h"
 #include "luxir/search/FilterKey.h"
 #include "luxir/search/RequestMemTracker.h"
+#include "luxir/util/Striped.h"
 
 namespace luxir {
 
@@ -587,37 +588,8 @@ private:
     std::vector<SegmentIdentity> segments;
   };
 
-  // Exact counter bumped on every segment probe by every search thread.
-  // Each thread adds to its own cache-line stripe so hot hits do not
-  // serialize on one shared line; reads sum the stripes.
-  class StripedCounter {
-    static constexpr size_t STRIPES = 32;
-    struct alignas(64) Stripe {
-      std::atomic<uint64_t> value{0};
-    };
-    std::array<Stripe, STRIPES> stripes;
-
-    static size_t threadStripe();
-
-  public:
-    void add(uint64_t delta) {
-      stripes[threadStripe()].value.fetch_add(delta, std::memory_order_relaxed);
-    }
-    uint64_t load() const {
-      uint64_t total = 0;
-      for (const auto& stripe : stripes) {
-        total += stripe.value.load(std::memory_order_relaxed);
-      }
-      return total;
-    }
-    void reset() {
-      for (auto& stripe : stripes) {
-        stripe.value.store(0, std::memory_order_relaxed);
-      }
-    }
-  };
-
   struct AtomicCounters {
+    // Bumped on every segment probe by every search thread.
     StripedCounter hits;
     StripedCounter misses;
     std::atomic<uint64_t> admissions{0};

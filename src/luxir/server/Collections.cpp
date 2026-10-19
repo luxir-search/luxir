@@ -89,8 +89,8 @@ void Collections::validate(const CollectionId& id) {
 }
 
 Collections::Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget,
-                         oneapi::tbb::task_arena& arena)
-    : config(config), events(events), indexRamBudget(indexRamBudget), arena(arena),
+                         oneapi::tbb::task_arena& arena, std::shared_ptr<Metrics> metrics)
+    : metrics(std::move(metrics)), config(config), events(events), indexRamBudget(indexRamBudget), arena(arena),
       verifyOnOpen(config.store.verify_on_open == "full") {
   if (!verifyOnOpen && config.store.verify_on_open != "none") throw std::invalid_argument("store.verify-on-open must be none or full");
   if (config.store.backend == "fs") {
@@ -215,6 +215,7 @@ std::shared_ptr<Collection> Collections::makeCollection(const CollectionId& name
   col->shard->dir = std::move(directory);
   col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(*col->shard->dir,
       FilterCacheConfig{.maxBytes = config.queryCacheBytes});
+  col->shard->getReaderManager().metrics = metrics;
   const auto& policy = config.replication;
   col->shard->snapshots->setPolicy({std::chrono::milliseconds(policy.pin_idle_timeout_ms), policy.pin_retained_bytes});
   return col;
@@ -264,6 +265,8 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   col->shard->iw = std::make_shared<IndexWriter>(*col->shard->snapshots,
     std::move(initialSchema), &indexRamBudget,
     config.index.merge_factor, creating ? *selected : std::string{}, &arena);
+  col->shard->iw->metrics = metrics;
+  col->shard->iw->collectionMetrics = col->metrics;
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
   if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");

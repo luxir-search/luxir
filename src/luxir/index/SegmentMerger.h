@@ -1548,7 +1548,7 @@ private:
       // int column that is not an ord column (assume all other field types have this (currently true)
       std::vector<BKDWriter::Point> geoPoints;
       bool rebuildGeo = hasGeoPoints(type, allFlags);
-      mergeIntCol2(sortedFields, postingsWriter, outputFieldInfo,
+      mergeIntCol(sortedFields, postingsWriter, outputFieldInfo,
                    rebuildGeo ? &geoPoints : nullptr);
       if (rebuildGeo) {
         if (!geoPoints.empty()) {
@@ -1638,85 +1638,6 @@ private:
     writer.finish(postingsWriter.getMaxDoc());
   }
 
-  void mergeIntCol(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
-                   PostingsWriter::IndexFieldInfo& outputFieldInfo) {
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    auto& pool = poolGuard.pool();
-
-    auto outputPtr = postingsWriter.getOutputStream();
-    IntColWriter intColWriter(*outputPtr);
-
-    // currently all values must be written before all docs - TODO FIXME - is this still true??
-    for (auto* field : sortedFields) {
-      auto baseId = (int32_t)field->seg->base;
-      unused(baseId);
-
-      IntColReader reader(*field->seg->postingsReader, field->segFieldInfo);
-      IntColReader::BulkValues values(reader);
-
-
-      // int32_t highest = field->seg->postingsReader->numDocs();
-      for (;;) {
-        auto index = values.next();
-        if (index == IntColReader::ENDINDEX) {
-          break;
-        }
-        int64_t val = values.value();
-        intColWriter.addInt64(val);
-      }
-    }
-
-    bool full = false; // TODO: calculate if this column is dense!
-
-    if (!full) {
-      DocsWithValWriter docsWriter(pool, postingsWriter, outputFieldInfo);
-      for (auto* field : sortedFields) {
-        auto baseId = (int32_t)field->seg->base;
-
-        IntColReader reader(*field->seg->postingsReader, field->segFieldInfo);
-        IntColReader::Iterator colIter(reader);
-
-        [[maybe_unused]] int32_t highest = field->seg->postingsReader->maxDoc();
-        for (;;) {
-          int32_t localId = colIter.next();
-          if (localId == IntColReader::ENDDOC) {
-            break;
-          }
-          assert(localId < highest);
-          docsWriter.startDoc(baseId + localId);
-        }
-      }
-      docsWriter.finish();
-    }
-
-
-    intColWriter.finish(outputFieldInfo);
-    if (outputFieldInfo.flags & FieldType::MULTI_VALUED) {
-      auto guard = pool.rewindScopeGuard();
-      OutputStreamPtr out = postingsWriter.getOutputStream();
-      MonoWriter endValueRankWriter(pool, *out);
-      int64_t endValueRankBase = 0;
-
-      for (auto* field : sortedFields) {
-        assert(field->segFieldInfo.flags & FieldType::MULTI_VALUED);
-        // open IntColReader for each segment
-        IntColReader reader( *field->seg->postingsReader, field->segFieldInfo);
-        MonoReader* endValueRankReader = reader.getEndValueRankReader();
-        assert(endValueRankReader != nullptr);
-        int64_t endValueRank;
-        for (int i = 0; i < endValueRankReader->numValues(); i++) {
-          endValueRank = endValueRankBase + endValueRankReader->valueAt(i);
-          endValueRankWriter.addInt64(endValueRank);
-        }
-        endValueRankBase = endValueRank;
-      }
-      endValueRankWriter.finish();
-      outputFieldInfo.monoLoc = endValueRankWriter.blockLoc;
-      outputFieldInfo.monoMetaOff = endValueRankWriter.metaOff;
-    }
-  }
-
-
   // Merges non-indexed string/binary columns written by StrColHandler.
   // Rebuilds the concatenated byte stream, the per-value endOffsetReader (if values are
   // variable-size), and the per-doc endValueRankReader (if the field is multi-valued).
@@ -1783,10 +1704,21 @@ private:
     for (auto* f : sortedFields) {
       if (f == nullptr || !isVector) continue;
       auto e = (VectorEncoding)f->segFieldInfo.vectorEncoding;
-      if (firstEncoding || vcodec::precision(e) > vcodec::precision(outEncoding)) outEncoding = e;
+      outEncoding = firstEncoding ? e : vcodec::mergeEncoding(outEncoding, e);
       firstEncoding = false;
     }
     outputFieldInfo.vectorEncoding = (int32_t)outEncoding;
+    // Whether a column needs the norm prefix depends on its encoding (and the
+    // field settings), so the output keeps it when any input already in the
+    // output encoding has it.  Other inputs gain it (computed here) or drop it.
+    bool outNorms = false;
+    for (auto* f : sortedFields) {
+      if (f == nullptr || !isVector) continue;
+      if ((VectorEncoding)f->segFieldInfo.vectorEncoding == outEncoding) {
+        outNorms = outNorms || f->segFieldInfo.vectorNorms;
+      }
+    }
+    outputFieldInfo.vectorNorms = outNorms;
     std::vector<float> transcodeFloats;
     std::vector<char> transcodeBytes;
 
@@ -1848,23 +1780,36 @@ private:
       StrColReader reader(*field->seg->postingsReader, field->segFieldInfo);
       StrColReader::Iterator iter(reader);
 
-      // Identity unless this input's vector encoding differs from the output's.
+      // Identity unless this input's vector encoding or norm prefix differs
+      // from the output's.  Only the prefix differing keeps the payload bytes.
       auto inEncoding = (VectorEncoding)field->segFieldInfo.vectorEncoding;
-      bool transcode = isVector && inEncoding != outEncoding && reader.numValues() > 0;
+      bool inNorms = field->segFieldInfo.vectorNorms;
+      bool transcode = isVector && (inEncoding != outEncoding || inNorms != outNorms)
+          && reader.numValues() > 0;
       int32_t transcodeDims = 0;
       if (transcode) {
-        transcodeDims = vcodec::dimsFromBytes(inEncoding, reader.fixedValueSize());
+        transcodeDims = vcodec::dimsFromRowBytes(inEncoding, reader.fixedValueSize(), inNorms);
         if (!reader.isFixedSize() || transcodeDims <= 0) {
           throw std::runtime_error("SegmentMerger: invalid vector column in field "
                                    + std::string((std::string_view)field->segFieldInfo.fieldname));
         }
         transcodeFloats.resize((size_t)transcodeDims);
-        transcodeBytes.resize((size_t)vcodec::bytesPerVector(outEncoding, transcodeDims));
+        transcodeBytes.resize((size_t)vcodec::rowBytes(outEncoding, transcodeDims, outNorms));
       }
       auto convert = [&](std::string_view value) {
         if (!transcode) return value;
-        vcodec::decode(inEncoding, value.data(), transcodeDims, transcodeFloats.data());
-        vcodec::encode(outEncoding, transcodeFloats.data(), transcodeDims, transcodeBytes.data());
+        const char* payload = vcodec::rowPayload(value.data(), inNorms);
+        char* out = transcodeBytes.data();
+        if (inEncoding == outEncoding) {
+          // Same payload; only the norm prefix is added (outNorms is the OR
+          // over the inputs of this encoding, so it is never dropped here).
+          std::memcpy(out + vcodec::NORM_BYTES, payload,
+                      (size_t)vcodec::bytesPerVector(inEncoding, transcodeDims));
+          vcodec::writeRowNorm(outEncoding, out, transcodeDims);
+        } else {
+          vcodec::decode(inEncoding, payload, transcodeDims, transcodeFloats.data());
+          vcodec::encodeRow(outEncoding, outNorms, transcodeFloats.data(), transcodeDims, out);
+        }
         return std::string_view(transcodeBytes.data(), transcodeBytes.size());
       };
 
@@ -2016,10 +1961,14 @@ private:
     outputFieldInfo.pointsMetaOff = data.pointsMetaOff;
   }
 
-  void mergeIntCol2(std::span<MergeFieldInfo*> sortedFields,
-                    PostingsWriter& postingsWriter,
-                    PostingsWriter::IndexFieldInfo& outputFieldInfo,
-                    std::vector<BKDWriter::Point>* geoPoints) {
+  // Merges int64 columns. The output is dense (no docs-with-field bitset, so
+  // value rank == doc id for single-valued readers) whenever every surviving
+  // doc has a value: all sources dense and present, or a sparse source whose
+  // docs without a value were all deleted.
+  void mergeIntCol(std::span<MergeFieldInfo*> sortedFields,
+                   PostingsWriter& postingsWriter,
+                   PostingsWriter::IndexFieldInfo& outputFieldInfo,
+                   std::vector<BKDWriter::Point>* geoPoints) {
     assert(sortedFields.size() == segs.size());  // expect non-compacted fields to make the code a little simpler.
 
     auto poolGuard = MemPool::threadLocalPoolGuard();

@@ -147,13 +147,17 @@ POST /collections/books/_schema
 }
 ```
 
-Metrics are `l2`, `ip` (inner product), and `cosine`. Set a positive `dims`
+Metrics are `l2`, `ip` (inner product), `cosine`, and `hamming` (binary
+vectors, see [Binary vectors](#binary-vectors)). Set a positive `dims`
 to fix the dimension for indexed and query vectors across the collection.
 When omitted, the first vector in each segment establishes the dimension.
 
 A multi-valued vector field (`multi: true`, or the `_vs` suffix) holds many
 vectors per document, such as one per passage or chunk. Search collapses them
 to one hit per document, scored by that document's best vector.
+
+An optional `ann` object chooses how [approximate indexes](#index-settings)
+for the field are built; the defaults suit most embedding models.
 
 ### Column encoding
 
@@ -165,9 +169,16 @@ it. `encoding` chooses how each vector is stored:
 |---|---|---|
 | `f32` (default) | `4 * dims` | the float32 values |
 | `f16` | `2 * dims` | IEEE half precision per element |
+| `bf16` | `2 * dims` | bfloat16 per element: the float32 rounded to its high 16 bits |
 | `int8` | `8 + dims` | per-vector scalar quantization: a float offset and scale, plus one byte per dimension |
+| `bit` | `dims / 8` | one bit per dimension, for `hamming` fields (see [Binary vectors](#binary-vectors)) |
 
-At 768 dimensions that is 3072, 1536, and 776 bytes per vector.
+At 768 dimensions that is 3072, 1536, 1536, 776, and 96 bytes per vector.
+`f16` keeps more precision per element (10 significand bits against 7), `bf16`
+keeps the full float32 range. Fields
+whose scoring needs each stored vector's norm also store it once, 4 more bytes
+per vector, so searches never recompute it: cosine over `f16` or `int8`,
+cosine with `normalize_on_write: false`, and `int8` with `l2`.
 
 ```json
 {
@@ -188,13 +199,13 @@ statistics. Merges copy stored vectors unchanged. Cosine vectors are
 normalized before they are quantized.
 
 Encoded fields reject vectors with non-finite elements (NaN or infinity), and
-`f16` also rejects elements whose magnitude exceeds 65504. A constant vector
-is valid under `int8`.
+`f16` also rejects elements whose magnitude exceeds 65504. `bf16` needs no
+range check. A constant vector is valid under `int8`.
 
 Search scores the query, which stays float32, against the stored encoding:
 `exact: true`, the scan of segments without an overlay, and the rescore of
 approximate candidates are all exact over the stored vectors, not over the
-vectors you submitted. Cosine over `f16` and `int8` divides by the norm of the
+vectors you submitted. Cosine over `f16`, `bf16` and `int8` divides by the norm of the
 stored vector, so scores remain cosines. Vectors read back in `fields` are the
 stored values decoded to float32.
 
@@ -208,7 +219,130 @@ the exact input.
 `encoding` and `keep_original` apply to segments written after the change.
 Existing segments keep the encoding they were written with, and a merge of
 segments with different encodings writes the most precise of them, so a merge
-never loses precision. To re-encode existing data, reindex it.
+never loses precision (`f16` and `bf16` together merge to `f32`). To re-encode
+existing data, reindex it.
+
+With
+[`truncate_dims`](#truncate-matryoshka-embeddings), `dims` in the table
+above is the truncated dimension: the encoded column and the `keep_original`
+column both store the truncated vector (the latter before cosine
+normalization).
+
+### Binary vectors
+
+Binary embeddings (and SimHash-style fingerprints) use `metric: "hamming"`,
+which stores one bit per dimension (`encoding: "bit"`, the default and only
+encoding for it). `dims` must be a multiple of 8:
+
+```json
+{
+  "fields": {
+    "fingerprint_v": {
+      "type": "vector",
+      "dims": 256,
+      "metric": "hamming"
+    }
+  }
+}
+```
+
+Index and query vectors are ordinary number arrays of `dims` elements; an
+element sets its bit when it is greater than 0, so the sign of a float
+embedding binarizes it. Read back in `fields`, a bit vector is its bits as
+`0` and `1`. The score is `1 - hamming_distance / dims`, from `1` for
+identical bits down to `0`. Search scans the column exactly with a SIMD
+popcount; commits build no approximate index for `hamming` fields, and a
+`bit` column is 32 times smaller than `f32`.
+
+`bit` requires `hamming` (or `metric: "none"` for storage only), and
+`hamming` requires `bit`. Changing a field between `bit` and another
+encoding needs a reindex: older segments cannot be scored under the new
+metric.
+
+### Truncate Matryoshka embeddings
+
+Some embedding models are trained with
+[Matryoshka Representation Learning](https://arxiv.org/abs/2205.13147) (MRL):
+the leading components of their output are themselves a usable, lower
+dimensional embedding. `truncate_dims` keeps only that prefix:
+
+```http
+POST /collections/books/_schema
+
+{
+  "fields": {
+    "summary_v": {
+      "type": "vector",
+      "dims": 1024,
+      "truncate_dims": 256,
+      "metric": "cosine"
+    }
+  }
+}
+```
+
+Clients send either the full model output or a vector already truncated to
+`truncate_dims` (for example with the provider's `dimensions` option), for
+documents and for kNN queries. Luxir cuts every vector to its first
+`truncate_dims` components before it is stored or searched, so index and
+query vectors are always truncated the same way. The column, approximate
+indexes and scoring all work on the shorter vector: 256 dimensions here store
+and scan a quarter of the bytes of 1024.
+
+- `dims` is the full input dimension and is required. `truncate_dims` is the
+  stored and searched dimension, and must be less than `dims`.
+- Every indexed and query vector must have exactly `dims` or exactly
+  `truncate_dims` components (`expected dims=1024 or truncate_dims=256, got
+  768`). Once truncated, vectors from different models have the same length,
+  so this check is what keeps most other models' output out of the field. It
+  cannot catch a model whose native size equals `truncate_dims`: with
+  `dims: 3072, truncate_dims: 1536`, vectors from a 1536-dimension model are
+  accepted as already truncated.
+- A vector whose truncated prefix is all zeros has no cosine direction, even
+  when its tail does: it is skipped at index time and rejected as a query.
+- `truncate_dims` requires `metric: cosine`. The prefix of a unit vector is
+  shorter than 1, and MRL models compare renormalized prefixes, so Luxir
+  renormalizes it. Cosine ignores length, so a full vector cut by Luxir and a
+  prefix renormalized by the provider score the same. `normalized: true` is
+  rejected, because the stored vectors are no longer the vectors the assertion
+  was about. `normalize_on_write: false` keeps the raw prefix and normalizes
+  at query time, as for any cosine field.
+- Reading the field back returns the stored truncated vector (normalized
+  unless `normalize_on_write: false`), which can be sent back as input.
+- `truncate_dims: 0` turns off truncation inherited from a parent.
+- Approximate indexes are built over the truncated vector, so a positive
+  `ann.pq.m` must divide `truncate_dims`.
+- Changing `truncate_dims` changes the stored dimension, so existing
+  segments must be reindexed, as for a `dims` change.
+
+To compare several sizes from one indexing pass, declare truncated
+[variants](schema.md#field-variants) beside the full vector before indexing.
+Each one indexes the same input, and a query selects one by name, such as
+`summary_v__d256`. A variant added later covers only documents indexed after
+it, like any new variant:
+
+```json
+"summary_v": {
+  "type": "vector", "dims": 1024, "metric": "cosine",
+  "variants": {
+    "d256": { "type": "vector", "dims": 1024, "truncate_dims": 256, "metric": "cosine" }
+  }
+}
+```
+
+Use it only with models trained for it. Models that document MRL truncation
+include OpenAI `text-embedding-3-small` and `-large` (the `dimensions`
+parameter), Google `gemini-embedding-001`, Jina `jina-embeddings-v3`, Nomic
+`nomic-embed-text-v1.5`, and mixedbread `mxbai-embed-large-v1`. Check the
+model card for the dimensions it was trained to support. Truncating an
+embedding from a model *not* trained with MRL discards information the model
+spread across all of its dimensions, and recall drops sharply; this option
+does nothing to compensate.
+
+Some models prescribe extra steps around truncation. Nomic's reference code
+applies a layer norm to the full embedding before cutting it; Luxir does not
+do that, so send full vectors that already have any such pre-truncation step
+applied. Otherwise they will not match vectors the provider truncated.
 
 ## Index vectors
 
@@ -592,12 +726,13 @@ after changing source limits.
 ## Approximate search
 
 Exact search costs one pass over the column per query. For large collections,
-a commit can build approximate nearest-neighbor indexes (IVF+PQ, via FAISS)
-as segment overlays. An overlay is built from the vector column (decoded from
-its encoding, or from the `keep_original` column when present), follows its
-segment through later commits and merges, and its candidates are always
-rescored from the stored column before they are returned. Building
-an overlay does not reindex documents.
+a commit can build approximate nearest-neighbor indexes as segment overlays:
+an inverted-file (IVF) index whose lists hold product-quantization (PQ) codes
+by default, or opt-in RaBitQ codes, built with FAISS. An overlay is built
+from the vector column (decoded from its encoding, or from the `keep_original`
+column when present), follows its segment through later commits and merges,
+and its candidates are always rescored from the stored column before they are
+returned. Building an overlay does not reindex documents.
 
 ### Build at commit
 
@@ -618,15 +753,99 @@ unpublished and can be retried. Once a segment has an overlay, later commits
 carry it forward and delete-only commits keep it (deleted documents are
 filtered out at query time).
 
-Whether a segment gets an overlay is size based. IVF+PQ is built only when the
-segment has enough vectors to train on and enough scan cost to justify it;
-smaller segments stay on the exact column scan. A single query routinely uses
+Whether a segment gets an overlay is size based. An overlay is built only
+when the segment has enough vectors (8192 for RaBitQ, about 10,000 for PQ,
+which must train its codebooks) and enough scan cost to justify it; smaller
+segments stay on the exact column scan, which is faster than an index at that
+size and exact. A single query routinely uses
 the index for large segments and exact scan for small ones, with the same
 results contract either way. A merged segment gets fresh
 overlays for the fields being built, when it passes the same
 thresholds. If a merge-time build fails, the merged segment is published
 without the overlay and that field is served by exact scan until a later
 explicit build succeeds.
+
+### Index settings
+
+A vector field's `ann` object selects the overlay codec and its parameters:
+
+```http
+POST /collections/books/_schema
+
+{
+  "fields": {
+    "embedding_v": {
+      "type": "vector",
+      "dims": 768,
+      "metric": "cosine",
+      "ann": {"codec": "pq"}
+    }
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `codec` | `pq` (default) or opt-in `rabitq`. |
+| `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
+| `rabitq.bits` | Bits per dimension, `1` to `9`. Default `1`. |
+| `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
+| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for IP/cosine or `32` for L2. If none does, use the largest divisor under the same cap. |
+| `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. |
+
+`rabitq` settings require an explicit `"codec":"rabitq"`, for example
+`"ann":{"codec":"rabitq","rabitq":{"bits":1,"query_bits":4}}`.
+Omitting the codec selects PQ, including for `ann:{}`, `nlist` alone, or
+`pq` settings alone; a `rabitq` object does not infer the codec. A field
+without `ann` inherits its parent's, and an `ann` object replaces the
+parent's whole definition rather than merging with it.
+
+These rules also apply to inherited ANN settings and vector variants. Use
+automatic `m` when dimensions are inferred from indexed values; an explicit
+positive `m` requires dimensions pinned in the schema.
+
+**RaBitQ** (opt-in) stores each vector as one sign bit per dimension of
+its randomly rotated offset from its IVF list's centroid, plus a few
+correction factors: 104 bytes for a 768-dimension vector, about 1/30 of the
+float vector. Distances estimated from these codes come with a proven error
+bound, and the codec trains nothing beyond the IVF centroids. With `bits`
+above 1 (extended RaBitQ), each dimension gets extra magnitude bits; a scan
+then estimates every vector from its sign bits first and spends the extra bits
+only on vectors whose error bound still overlaps the current top candidates.
+`query_bits: 4` matches the 1-bit-document, 4-bit-query asymmetry other
+engines use and costs no measurable recall against `8`.
+
+**PQ** (the default) splits each vector into `m` sub-vectors and stores one learned
+codebook entry per sub-vector. PQ's automatic `m` scales with IP/cosine
+dimensions above 256: for example, 768 dimensions selects `m=96`, or 96 code
+bytes at 8 bits, close to RaBitQ's 104. This improves high-dimensional recall
+over `m=32` at the cost of larger codes and more scan work; see the
+[codec measurements](../design/vector-search.md#codec-measurements).
+L2 keeps the cap of 32 because FAISS retains an `nlist * m * 256`-float
+precomputed table at 8 bits; IP/cosine builds its lookup table per query and
+has no such resident table. Fields of up to 256 dimensions and explicit `m`
+settings keep their existing choices. PQ codebooks are retrained for every
+segment build and merge; automatic `m` depends only on dimensions and metric.
+
+PQ favors scan speed: FAISS currently scans PQ lists faster than RaBitQ
+lists. Opt into RaBitQ for its different size/recall tradeoff.
+With 1-bit RaBitQ, recall is usually limited by how many lists are probed
+rather than by the codes, so raise `ivf.nprobe` first; extra `bits` help mainly
+when `refine_candidates` is small.
+
+Overlays record the settings they were built with, so a change applies to
+segments built afterwards: new flushes, merges, and segments without an
+overlay that a later commit selects. A query serves every segment with its own
+overlay's codec, so segments built under different settings mix freely.
+`query_bits` is applied at search time to both document and group searches
+and takes effect for existing RaBitQ overlays immediately, including when the
+current schema selects PQ for future builds. Changing `ann` does not change
+the field's identity: existing values stay searchable.
+
+The [resolved schema view](schema.md#resolved-view) exposes each vector
+representation's effective `ann` settings, including defaults and inherited
+values. It includes only the selected codec's settings. `nlist:0` and `m:0`
+remain automatic policies, rather than sizes chosen for any one segment.
 
 ### Query knobs
 
@@ -651,7 +870,7 @@ every index type.
 | Field | Meaning |
 |---|---|
 | `field` | Vector field. Required. |
-| `query` | Query vector; must match the field's dimension. Required. |
+| `query` | Query vector with `dims` components, or `truncate_dims` when set. Required. |
 | `k` | Nearest documents or groups the query node produces. Required, positive. |
 | `unit` | `docs` (default) or `groups`; groups requires an enclosing collapse. |
 | `exact` | Require the true top-k over the stored vectors (exact over the field's `encoding`). Scans the column and ignores overlays and the knobs below. |
@@ -676,13 +895,20 @@ Luxir would probe if the field were a single IVF index built with
 `nlist`. That total effort is spread across the current per-segment indexes,
 so a merge does not change the effort a request asks for. An explicit `nprobe`
 pins the effort cap; an adaptive one may deepen when filters or collapse
-underfill the result. Probed lists are always scanned in full; `nprobe` is the
-only work limiter.
+underfill the result. The adaptive default starts at `sqrt(nlist)` of that
+reference index for fields of up to 128 stored dimensions and scales by
+`sqrt(dims / 128)` above that (capped at 4x), where `dims` is the stored
+dimension (`truncate_dims` when set). This effort policy applies to
+both codecs. The multiplier is about 2.5x at 768 to 960 dimensions; RaBitQ
+measurements on GIST and Cohere embeddings showed recall@10 rising from
+0.82-0.87 to about 0.95. Probed lists are always scanned in full; `nprobe` is
+the only work limiter.
 
 ### Scoring
 
 L2 scores are `1 / (1 + squared_distance)`. Inner product scores are the dot
-product. Cosine is inner product over normalized vectors. The score
+product. Cosine is inner product over normalized vectors. Hamming scores are
+`1 - hamming_distance / dims`. The score
 distribution depends on the embedding model and corpus, so calibrate
 thresholds per deployment.
 
@@ -731,17 +957,18 @@ POST /collections/books/_search
 ```
 
 That is `[0.6, 0.3, 0.1]` at unit length. Set `normalize_on_write: false` to
-keep the raw vectors in the column; candidate rescoring then normalizes at
-query time. Zero and near-zero cosine vectors have no direction and are
-skipped at index time.
+keep the raw vectors in the column; each raw vector's norm is then stored
+once at index time (4 bytes per vector) and scoring divides by it. Zero and
+near-zero cosine vectors have no direction: they are skipped at index time,
+and a kNN query with one is rejected.
 
 ### Measure recall
 
-IVF+PQ is approximate. Higher `ivf.nprobe` and higher `refine_candidates`
-raise recall and latency. Setting `nprobe` to at least the reference
-`sqrt(live_vector_count)`, or `ivf.min_scan_fraction` to `1`, makes the search
-exhaustive over IVF lists, but PQ ordering still decides which candidates are
-rescored.
+Approximate search is approximate. Higher `ivf.nprobe` and higher
+`refine_candidates` raise recall and latency. Setting `nprobe` to at least the
+reference `sqrt(live_vector_count)`, or `ivf.min_scan_fraction` to `1`, makes
+the search exhaustive over IVF lists, but the codec's estimated ordering still
+decides which candidates are rescored.
 
 `exact: true` uses a path that guarantees the true top-k over the stored
 vectors and does not consult overlays. Everything else about
@@ -757,7 +984,10 @@ bit-identical results to a serial run of the same query.
 
 ## Limits
 
-- IVF+PQ is the only approximate index type. There is no HNSW yet.
+- IVF (with RaBitQ or PQ codes) is the only approximate index type. There is
+  no HNSW yet.
+- An `ann` change does not rebuild existing overlays; only segments built
+  afterwards use it (see [Index settings](#index-settings)).
 - Filters are always applied inside the vector search. There is no cost-based
   choice between filtered approximate search and exact search over the
   filtered set, and no automatic exact fallback when a selective filter still

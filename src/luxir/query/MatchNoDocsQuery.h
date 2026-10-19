@@ -30,11 +30,8 @@ public:
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
-  MatchNoDocsQuery::Weight* createWeight(Context& context, int32_t flags,
-                                         float multiplier = 1.0f) override {
-    unused(multiplier);
-    return context.pool.make<MatchNoDocsQuery::Weight>(context, *this, flags);
-  }
+  Query::Weight* createWeight(Context& context, int32_t flags,
+                              float multiplier = 1.0f) override;
 
   class Weight final : public Query::Weight {
   public:

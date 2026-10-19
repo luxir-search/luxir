@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/util/Metrics.h"
 
 #include <atomic>
 #include <mutex>
@@ -24,6 +25,8 @@ class ReaderManager {
   std::atomic<uint64_t> lastAdvertisedCommitTime = 0;
   FilterCacheConfig originalFilterCacheConfig;
 public:
+  // The node's service counters; set by the collection that owns this manager.
+  std::shared_ptr<Metrics> metrics = Metrics::detached();
   std::shared_ptr<FilterCache> filterCache;
   alignas(64) std::atomic<std::shared_ptr<IndexReader>> indexReader;
 
@@ -81,12 +84,12 @@ public:
 private:
   [[noreturn]] static void throwClosed();
   void checkOpen() const {
-    if (closed.load(std::memory_order_acquire)) throwClosed();
+    if (isClosed()) throwClosed();
   }
   void publishReader(std::shared_ptr<IndexReader> reader);
 
 public:
-  Stats stats(bool includeSegments);
+  Stats stats(bool includeSegments, bool includeFiles = true);
   void cacheStats(CacheStats& out) const;
   explicit ReaderManager(Directory& dir, FilterCacheConfig config = {});
   std::shared_ptr<IndexReader> getReader(uint64_t freshness_us = 0);
@@ -100,6 +103,7 @@ public:
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});
   std::string resolvedSchema();
   void close() noexcept { closed.store(true, std::memory_order_release); }
+  bool isClosed() const { return closed.load(std::memory_order_acquire); }
   // Quiescent tests only: clear the physical namespace and cache together.
   void testReset();
 };
