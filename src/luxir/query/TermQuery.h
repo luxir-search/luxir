@@ -332,6 +332,8 @@ public:
     std::optional<luxir::IntColReader::Iterator> valueIter;
     luxir::OrdColReader* ordReader = nullptr;
     const uint8_t* flatNormsBase = nullptr;
+    // CONSTANT or docid-addressed PACKED norms: O(1) by docid, no iterator.
+    const luxir::NormsReader* byDocNorms = nullptr;
     luxir::Similarity::BM25Scorer* simScorer;
     ImpactsIndex impacts;
     float minCompetitiveScore = 0.0f;
@@ -391,6 +393,7 @@ public:
       if (normsReader != nullptr) {
         normsIter.emplace(*normsReader);
         flatNormsBase = normsReader->flatBase();
+        if (flatNormsBase == nullptr && normsReader->isByDoc()) byDocNorms = normsReader;
       }
       if (valueReader != nullptr) valueIter.emplace(*valueReader);
       competitiveBound = std::numeric_limits<float>::infinity();
@@ -585,6 +588,9 @@ public:
       if (flatNormsBase != nullptr) {
         return flatNormsBase[doc];
       }
+      if (byDocNorms != nullptr) {
+        return byDocNorms->byDocValue(doc);
+      }
       if (normsIter) {
         int32_t normDoc = normsIter->advance(doc);
         assert(normDoc == doc);
@@ -605,7 +611,7 @@ public:
       auto docid = docsEnum.docId();
       int32_t tf = docsEnum.termFreq();
       // Keep the flat-norms load inline (it is one indexed byte read); the
-      // NOINLINE advanceNorm wrapper stays for the sparse iterator walk only,
+      // NOINLINE advanceNorm wrapper stays for the other norm layouts,
       // which is the inliner-sensitive code pulled into score().
       int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[docid]
                                                      : advanceNorm(docid);
@@ -786,6 +792,13 @@ public:
           int32_t doc = blockDocs[(size_t) i];
           normBuf[i] = flatNormsBase[doc];
         }
+        simScorer->scoreBlock(blockFreqs.data(), normBuf, boost, scores, count);
+        return;
+      }
+      if (byDocNorms != nullptr) {
+        assert(count <= Postings::DOCS_BLOCK_SIZE);
+        uint8_t normBuf[Postings::DOCS_BLOCK_SIZE];
+        byDocNorms->byDocValues(blockDocs.data(), count, normBuf);
         simScorer->scoreBlock(blockFreqs.data(), normBuf, boost, scores, count);
         return;
       }
