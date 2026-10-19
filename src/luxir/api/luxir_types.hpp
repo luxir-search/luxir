@@ -81,6 +81,7 @@ struct FieldVariants; struct FieldDefaults; struct NormalizerDef; struct VectorA
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
+struct OpenCollectionRequest; struct OpenCollectionResponse; struct CloseCollectionRequest; struct CloseCollectionResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
 struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
@@ -394,6 +395,7 @@ struct CollectionStats {
   uint64_t schema_gen = 0;
   std::span<const ShardStats> shards;
   std::optional<Error> error;
+  bool uncommitted = false;
 };
 struct StatsRequest { std::string_view collection; std::string_view tenant; bool segments = false; bool memory = false; };
 struct FollowerStatus {
@@ -543,6 +545,10 @@ struct CreateCollectionResponse {
   std::string_view commit; std::string_view name; std::optional<ReplicaResult> replicas; };
 struct DeleteCollectionRequest { std::string_view name; std::string_view tenant; };
 struct DeleteCollectionResponse { std::string_view name; };
+struct OpenCollectionRequest { std::string_view name; std::string_view tenant; std::string_view incarnation; bool promote = false; };
+struct OpenCollectionResponse { std::string_view name; std::string_view incarnation; std::string_view commit; std::string_view tenant; };
+struct CloseCollectionRequest { std::string_view name; std::string_view tenant; std::string_view expect_commit; bool discard = false; };
+struct CloseCollectionResponse { std::string_view name; std::string_view tenant; };
 struct ListCollectionsResponse { std::span<const std::string_view> collections; };
 struct ListTenantsResponse { std::span<const std::string_view> tenants; };
 struct MultiVector { std::span<const ArrVector> v; };
@@ -863,6 +869,7 @@ LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocEr
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
+LUXIR_TD(OpenCollectionRequest) LUXIR_TD(OpenCollectionResponse) LUXIR_TD(CloseCollectionRequest) LUXIR_TD(CloseCollectionResponse)
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
@@ -908,6 +915,8 @@ LUXIR_ENTRY(VectorAnnDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
+LUXIR_ENTRY(OpenCollectionRequest) LUXIR_ENTRY(OpenCollectionResponse)
+LUXIR_ENTRY(CloseCollectionRequest) LUXIR_ENTRY(CloseCollectionResponse)
 LUXIR_ENTRY(ListCollectionsResponse)
 LUXIR_ENTRY(ListTenantsResponse)
 LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStatus) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)

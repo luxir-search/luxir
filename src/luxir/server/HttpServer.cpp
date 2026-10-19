@@ -103,7 +103,7 @@ struct ShardPin {
 // The HTTP status for a classified failure: the error's kind decides, except
 // for conditions with an HTTP idiom of their own.
 static http::status httpStatusFor(const ErrorInfo& info) {
-  if (info.code == "commit_incarnation_mismatch") return http::status::conflict;
+  if (info.code == "commit_incarnation_mismatch" || info.code == "collection_changed") return http::status::conflict;
   if (info.code == "method_not_allowed") return http::status::method_not_allowed;
   if (info.code == "request_too_large") return http::status::payload_too_large;
   if (info.code == "snapshot_expired") return http::status::gone;
@@ -591,7 +591,8 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
+    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, COLLECTION_OPEN, COLLECTION_CLOSE,
+    SEARCH, UPDATE, STATS, SCHEMA,
     REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED
   };
 
@@ -951,7 +952,8 @@ private:
     if (target == "/collections/_create" || target == "/collections/_delete") return true;
     if (method != http::verb::post) return false;
     std::string coll;
-    return parseUpdatePath(target, coll) || parseSchemaPath(target, coll);
+    return parseUpdatePath(target, coll) || parseSchemaPath(target, coll) ||
+           parseCollectionPath(target, "/_open", coll) || parseCollectionPath(target, "/_close", coll);
   }
 
   static ErrorInfo readOnlyError(std::string_view target) {
@@ -1321,7 +1323,7 @@ private:
   // update and replica waits always act in the caller's own tenant.
   static bool tenantRoute(Route route) {
     return route == Route::COLLECTION_LIST || route == Route::COLLECTION_CREATE || route == Route::COLLECTION_DELETE ||
-           route == Route::STATS || route == Route::SCHEMA || route == Route::REPLICATION_SNAPSHOT ||
+           route == Route::COLLECTION_OPEN || route == Route::COLLECTION_CLOSE || route == Route::STATS || route == Route::SCHEMA || route == Route::REPLICATION_SNAPSHOT ||
            route == Route::REPLICATION_FILE;
   }
 
@@ -1358,6 +1360,10 @@ private:
       m.route = Route::COLLECTION_CREATE; m.allow = "POST, PUT";
     } else if (target == "/collections/_delete") {
       m.route = Route::COLLECTION_DELETE; m.allow = "POST";
+    } else if (parseCollectionPath(target, "/_open", m.coll)) {
+      m.route = Route::COLLECTION_OPEN; m.allow = "POST";
+    } else if (parseCollectionPath(target, "/_close", m.coll)) {
+      m.route = Route::COLLECTION_CLOSE; m.allow = "POST";
     } else if (parseCollectionPath(target, "/_snapshot", m.coll)) {
       m.route = Route::REPLICATION_SNAPSHOT; m.allow = "GET, HEAD";
     } else if (parseSnapshotFilePath(target, m.coll, m.file)) {
@@ -1466,6 +1472,12 @@ private:
         break;
       case Route::COLLECTION_DELETE:
         handleCollectionDelete(req.body());
+        break;
+      case Route::COLLECTION_OPEN:
+        handleCollectionOpen(coll, req.body());
+        break;
+      case Route::COLLECTION_CLOSE:
+        handleCollectionClose(coll, req.body());
         break;
       case Route::SEARCH: {
         if (req.method() == http::verb::get && !req.body().empty()) {
@@ -1963,6 +1975,83 @@ private:
       if (waiting) self->stopWaitDisconnect();
       if (auto* body = std::get_if<std::string>(&result)) self->respondJson(http::status::ok, std::move(*body));
       else self->respondError(std::get<ErrorInfo>(result));
+    });
+  }
+
+  // The path names the collection; a body may repeat it, never name another.
+  template <typename Request>
+  bool readAdminBody(Request& request, std::pmr::memory_resource& resource, const std::string& body,
+                     std::string_view coll, std::string_view what) {
+    try {
+      bool blank = std::ranges::all_of(body, [](char c) { return c == ' ' || c == '\t' || c == '\r' || c == '\n'; });
+      std::string err;
+      if (!blank && !luxir::api::read_json(request, body, resource, &err)) {
+        throw RequestError(err.empty() ? "malformed " + std::string(what) + " request" : err, "invalid_json");
+      }
+      if (!request.name.empty() && request.name != coll) {
+        throw RequestError("collection '" + std::string(request.name) + "' belongs in a /collections/" +
+                           std::string(request.name) + " route");
+      }
+      return true;
+    } catch (const std::exception& e) {
+      respondException(e, ErrorKind::INVALID_REQUEST);
+      return false;
+    }
+  }
+
+  // Runs `work` off the io thread and responds with its JSON, or its error.
+  template <typename State, typename Work>
+  void respondAdmin(std::shared_ptr<State> state, Work&& work) {
+    auto shardPin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, shardPin, work = std::forward<Work>(work)] {
+      std::variant<std::string, ErrorInfo> result;
+      try { result = work(*state); }
+      catch (const std::exception& e) { result = classifyException(e, ErrorKind::INTERNAL); }
+      self->finishPublication(shardPin, false, std::move(result));
+    });
+  }
+
+  void handleCollectionOpen(const std::string& coll, const std::string& body) {
+    struct State {
+      std::pmr::monotonic_buffer_resource resource;
+      luxir::api::OpenCollectionRequest request;
+      CollectionId id;
+    };
+    auto state = std::make_shared<State>();
+    if (!readAdminBody(state->request, state->resource, body, coll, "open collection")) return;
+    try { state->id = adminTarget(state->request.tenant, coll); }
+    catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
+    respondAdmin(state, [this](State& s) {
+      std::optional<std::string> incarnation;
+      if (!s.request.incarnation.empty()) incarnation = std::string(s.request.incarnation);
+      auto opened = node_.openCollection(s.id, s.request.promote, incarnation);
+      auto commit = opened->getShard()->getSnapshots().snapshot()->id;
+      auto token = commit.token();
+      luxir::api::OpenCollectionResponse response{s.id.name, commit.incarnation, token, s.id.tenant};
+      std::string out;
+      if (!luxir::api::write_json(response, out)) throw std::runtime_error("failed to serialize open collection response");
+      return out;
+    });
+  }
+
+  void handleCollectionClose(const std::string& coll, const std::string& body) {
+    struct State {
+      std::pmr::monotonic_buffer_resource resource;
+      luxir::api::CloseCollectionRequest request;
+      CollectionId id;
+    };
+    auto state = std::make_shared<State>();
+    if (!readAdminBody(state->request, state->resource, body, coll, "close collection")) return;
+    try { state->id = adminTarget(state->request.tenant, coll); }
+    catch (const std::exception& e) { respondException(e, ErrorKind::INVALID_REQUEST); return; }
+    respondAdmin(state, [this](State& s) {
+      std::optional<std::string> expect;
+      if (!s.request.expect_commit.empty()) expect = std::string(s.request.expect_commit);
+      node_.closeCollection(s.id, s.request.discard, expect);
+      luxir::api::CloseCollectionResponse response{s.id.name, s.id.tenant};
+      std::string out;
+      if (!luxir::api::write_json(response, out)) throw std::runtime_error("failed to serialize close collection response");
+      return out;
     });
   }
 

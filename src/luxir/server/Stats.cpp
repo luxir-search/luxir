@@ -212,8 +212,12 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
       indexTotals.deleted_docs = stats.maxDocs - stats.liveDocs;
       indexTotals.bytes = stats.totalBytes;
     };
-    if (writer) fill(writer->stats(request.segments));
-    else fill(shard->getReaderManager().stats(request.segments));
+    if (writer) {
+      fill(writer->stats(request.segments));
+      collectionStats.uncommitted = writer->hasUncommittedChanges();
+    } else {
+      fill(shard->getReaderManager().stats(request.segments));
+    }
 
     collectionStats.totals = shardStats.index.totals;
     collectionStats.totals.shards = 1;

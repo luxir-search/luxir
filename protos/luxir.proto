@@ -30,6 +30,12 @@ service Admin {
   rpc GetSchema(SchemaRequest) returns (SchemaResponse) {}
   rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse) {}
   rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse) {}
+  // Adopts a collection whose files were placed in the data directory while
+  // the node runs (a restore), without a restart.
+  rpc OpenCollection(OpenCollectionRequest) returns (OpenCollectionResponse) {}
+  // Unregisters and closes a collection without a restart, optionally only if
+  // nothing changed since a named commit, so its directory can be released.
+  rpc CloseCollection(CloseCollectionRequest) returns (CloseCollectionResponse) {}
   rpc Stats(StatsRequest) returns (StatsResponse) {}
   rpc CacheControl(CacheControlRequest) returns (CacheControlResponse) {}
 }

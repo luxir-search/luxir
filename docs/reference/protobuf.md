@@ -29,6 +29,8 @@ defaults and constraints are described in the comments and guides.
 | <a id="method-luxir.admin.getschema"></a>[`GetSchema`](#method-luxir.admin.getschema) | [`SchemaRequest`](#message-luxir.schemarequest) | [`SchemaResponse`](#message-luxir.schemaresponse) |  |
 | <a id="method-luxir.admin.createcollection"></a>[`CreateCollection`](#method-luxir.admin.createcollection) | [`CreateCollectionRequest`](#message-luxir.createcollectionrequest) | [`CreateCollectionResponse`](#message-luxir.createcollectionresponse) |  |
 | <a id="method-luxir.admin.deletecollection"></a>[`DeleteCollection`](#method-luxir.admin.deletecollection) | [`DeleteCollectionRequest`](#message-luxir.deletecollectionrequest) | [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse) |  |
+| <a id="method-luxir.admin.opencollection"></a>[`OpenCollection`](#method-luxir.admin.opencollection) | [`OpenCollectionRequest`](#message-luxir.opencollectionrequest) | [`OpenCollectionResponse`](#message-luxir.opencollectionresponse) | Adopts a collection whose files were placed in the data directory while the node runs (a restore), without a restart. |
+| <a id="method-luxir.admin.closecollection"></a>[`CloseCollection`](#method-luxir.admin.closecollection) | [`CloseCollectionRequest`](#message-luxir.closecollectionrequest) | [`CloseCollectionResponse`](#message-luxir.closecollectionresponse) | Unregisters and closes a collection without a restart, optionally only if nothing changed since a named commit, so its directory can be released. |
 | <a id="method-luxir.admin.stats"></a>[`Stats`](#method-luxir.admin.stats) | [`StatsRequest`](#message-luxir.statsrequest) | [`StatsResponse`](#message-luxir.statsresponse) |  |
 | <a id="method-luxir.admin.cachecontrol"></a>[`CacheControl`](#method-luxir.admin.cachecontrol) | [`CacheControlRequest`](#message-luxir.cachecontrolrequest) | [`CacheControlResponse`](#message-luxir.cachecontrolresponse) |  |
 
@@ -78,6 +80,8 @@ defaults and constraints are described in the comments and guides.
 - [`CacheControlResponse`](#message-luxir.cachecontrolresponse)
 - [`CacheEntryDump`](#message-luxir.cacheentrydump)
 - [`CalendarGap`](#message-luxir.calendargap)
+- [`CloseCollectionRequest`](#message-luxir.closecollectionrequest)
+- [`CloseCollectionResponse`](#message-luxir.closecollectionresponse)
 - [`ColDouble`](#message-luxir.coldouble)
 - [`ColFloat`](#message-luxir.colfloat)
 - [`ColInt`](#message-luxir.colint)
@@ -132,6 +136,8 @@ defaults and constraints are described in the comments and guides.
 - [`MemoryStats`](#message-luxir.memorystats)
 - [`MultiVector`](#message-luxir.multivector)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
+- [`OpenCollectionRequest`](#message-luxir.opencollectionrequest)
+- [`OpenCollectionResponse`](#message-luxir.opencollectionresponse)
 - [`PhraseQuery`](#message-luxir.phrasequery)
 - [`PrefixQuery`](#message-luxir.prefixquery)
 - [`Query`](#message-luxir.query)
@@ -450,6 +456,32 @@ One resident cache entry. key\_text is the printable-byte extraction from the se
 | <a id="field-luxir.calendargap.n"></a>[`n`](#field-luxir.calendargap.n) | 1 | `int32` | singular | number of civil units per bucket; must be positive |
 | <a id="field-luxir.calendargap.unit"></a>[`unit`](#field-luxir.calendargap.unit) | 2 | [`CalendarGap.Unit`](#enum-luxir.calendargap.unit) | singular |  |
 
+<a id="message-luxir.closecollectionrequest"></a>
+
+### luxir.CloseCollectionRequest
+
+Unregisters and closes a collection without committing, so its directory can be removed; searches already running finish. HTTP: POST /collections/{name}/\_close or /tenants/{tenant}/collections/{name}/\_close.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.closecollectionrequest.name"></a>[`name`](#field-luxir.closecollectionrequest.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.closecollectionrequest.tenant"></a>[`tenant`](#field-luxir.closecollectionrequest.tenant) | 2 | `string` | singular | as CreateCollectionRequest.tenant |
+| <a id="field-luxir.closecollectionrequest.discard"></a>[`discard`](#field-luxir.closecollectionrequest.discard) | 3 | `bool` | singular | also delete the stored data |
+| <a id="field-luxir.closecollectionrequest.expect_commit"></a>[`expect_commit`](#field-luxir.closecollectionrequest.expect_commit) | 4 | `string` | singular | Close only if this is the published commit (incarnation:gen, as X-Luxir-Commit reports it) and no update since is uncommitted; otherwise collection\_changed (HTTP 409) and the collection stays open. |
+
+<a id="message-luxir.closecollectionresponse"></a>
+
+### luxir.CloseCollectionResponse
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.closecollectionresponse.name"></a>[`name`](#field-luxir.closecollectionresponse.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.closecollectionresponse.tenant"></a>[`tenant`](#field-luxir.closecollectionresponse.tenant) | 2 | `string` | singular |  |
+
 <a id="message-luxir.coldouble"></a>
 
 ### luxir.ColDouble
@@ -563,6 +595,7 @@ Partition matching documents by an exact, single-valued key.
 | <a id="field-luxir.collectionstats.shards"></a>[`shards`](#field-luxir.collectionstats.shards) | 4 | [`ShardStats`](#message-luxir.shardstats) | repeated |  |
 | <a id="field-luxir.collectionstats.error"></a>[`error`](#field-luxir.collectionstats.error) | 5 | [`Error`](#message-luxir.error) | singular | Set for a collection that is not serving (failed to load, or a delete failed partway); kind is UNAVAILABLE and the message is the recorded reason. |
 | <a id="field-luxir.collectionstats.storage_ram_bytes"></a>[`storage_ram_bytes`](#field-luxir.collectionstats.storage_ram_bytes) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.collectionstats.uncommitted"></a>[`uncommitted`](#field-luxir.collectionstats.uncommitted) | 8 | `bool` | singular | Writers: changes since the last commit (buffered or flushed documents, deletes, or an unpublished segment layout) would be lost by a close. |
 
 <a id="message-luxir.column"></a>
 
@@ -1255,6 +1288,34 @@ Whole-value STRING normalization using a keyword input and only normalizing filt
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.normalizerdef.filters"></a>[`filters`](#field-luxir.normalizerdef.filters) | 1 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | repeated |  |
+
+<a id="message-luxir.opencollectionrequest"></a>
+
+### luxir.OpenCollectionRequest
+
+Opens a collection whose directory (t/&lt;tenant&gt;/&lt;name&gt;/) already holds an incarnation, for example restored from a backup while the node runs. The name must not be registered (collection\_exists). HTTP: POST /collections/{name}/\_open or /tenants/{tenant}/collections/{name}/\_open.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.opencollectionrequest.name"></a>[`name`](#field-luxir.opencollectionrequest.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.opencollectionrequest.tenant"></a>[`tenant`](#field-luxir.opencollectionrequest.tenant) | 2 | `string` | singular | as CreateCollectionRequest.tenant |
+| <a id="field-luxir.opencollectionrequest.promote"></a>[`promote`](#field-luxir.opencollectionrequest.promote) | 3 | `bool` | singular | Copy the selected snapshot into a new incarnation first, reusing its files, as \`luxir promote\` does. Required when the copy may still be served elsewhere under its old incarnation: commit tokens stay distinct. |
+| <a id="field-luxir.opencollectionrequest.incarnation"></a>[`incarnation`](#field-luxir.opencollectionrequest.incarnation) | 4 | `string` | singular | Without CURRENT, the incarnation (16 hex digits) to select; with CURRENT it must be absent or agree. |
+
+<a id="message-luxir.opencollectionresponse"></a>
+
+### luxir.OpenCollectionResponse
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.opencollectionresponse.name"></a>[`name`](#field-luxir.opencollectionresponse.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.opencollectionresponse.incarnation"></a>[`incarnation`](#field-luxir.opencollectionresponse.incarnation) | 2 | `string` | singular | the incarnation now serving (new when promoted) |
+| <a id="field-luxir.opencollectionresponse.commit"></a>[`commit`](#field-luxir.opencollectionresponse.commit) | 3 | `string` | singular | the published commit token, incarnation:gen |
+| <a id="field-luxir.opencollectionresponse.tenant"></a>[`tenant`](#field-luxir.opencollectionresponse.tenant) | 4 | `string` | singular |  |
 
 <a id="message-luxir.phrasequery"></a>
 

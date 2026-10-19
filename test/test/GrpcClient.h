@@ -57,6 +57,8 @@ inline constexpr const char* SetSchema         = "/luxir.Admin/SetSchema";
 inline constexpr const char* GetSchema         = "/luxir.Admin/GetSchema";
 inline constexpr const char* CreateCollection  = "/luxir.Admin/CreateCollection";
 inline constexpr const char* DeleteCollection  = "/luxir.Admin/DeleteCollection";
+inline constexpr const char* OpenCollection    = "/luxir.Admin/OpenCollection";
+inline constexpr const char* CloseCollection   = "/luxir.Admin/CloseCollection";
 inline constexpr const char* Stats             = "/luxir.Admin/Stats";
 }  // namespace rpc
 
@@ -68,6 +70,8 @@ std::string grpcSerialize(const luxir::api::UpdateRequest& msg, grpc::ByteBuffer
 std::string grpcSerialize(const luxir::api::StatsRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const luxir::api::CreateCollectionRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const luxir::api::DeleteCollectionRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::OpenCollectionRequest& msg, grpc::ByteBuffer& out);
+std::string grpcSerialize(const luxir::api::CloseCollectionRequest& msg, grpc::ByteBuffer& out);
 std::string grpcSerialize(const luxir::api::SchemaRequest& msg, grpc::ByteBuffer& out);
 // `storage` retains the raw reply bytes the non-owning `msg` views; `arena` backs nested
 // message allocations. Both must outlive any read of `msg`.
@@ -80,6 +84,10 @@ std::string grpcParse(luxir::api::StatsResponse& msg, const grpc::ByteBuffer& in
 std::string grpcParse(luxir::api::CreateCollectionResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
 std::string grpcParse(luxir::api::DeleteCollectionResponse& msg, const grpc::ByteBuffer& in,
+                      std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
+std::string grpcParse(luxir::api::OpenCollectionResponse& msg, const grpc::ByteBuffer& in,
+                      std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
+std::string grpcParse(luxir::api::CloseCollectionResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);
 std::string grpcParse(luxir::api::SchemaResponse& msg, const grpc::ByteBuffer& in,
                       std::vector<std::byte>& storage, std::pmr::memory_resource& arena);

@@ -1257,6 +1257,47 @@ message DeleteCollectionResponse {
   string name = 1;
 }
 
+// Opens a collection whose directory (t/<tenant>/<name>/) already holds an
+// incarnation, for example restored from a backup while the node runs. The
+// name must not be registered (collection_exists). HTTP:
+// POST /collections/{name}/_open or /tenants/{tenant}/collections/{name}/_open.
+message OpenCollectionRequest {
+  string name = 1;
+  string tenant = 2; // as CreateCollectionRequest.tenant
+  // Copy the selected snapshot into a new incarnation first, reusing its
+  // files, as `luxir promote` does. Required when the copy may still be
+  // served elsewhere under its old incarnation: commit tokens stay distinct.
+  bool promote = 3;
+  // Without CURRENT, the incarnation (16 hex digits) to select; with CURRENT
+  // it must be absent or agree.
+  string incarnation = 4;
+}
+
+message OpenCollectionResponse {
+  string name = 1;
+  string incarnation = 2; // the incarnation now serving (new when promoted)
+  string commit = 3;      // the published commit token, incarnation:gen
+  string tenant = 4;
+}
+
+// Unregisters and closes a collection without committing, so its directory
+// can be removed; searches already running finish. HTTP:
+// POST /collections/{name}/_close or /tenants/{tenant}/collections/{name}/_close.
+message CloseCollectionRequest {
+  string name = 1;
+  string tenant = 2; // as CreateCollectionRequest.tenant
+  bool discard = 3;  // also delete the stored data
+  // Close only if this is the published commit (incarnation:gen, as
+  // X-Luxir-Commit reports it) and no update since is uncommitted; otherwise
+  // collection_changed (HTTP 409) and the collection stays open.
+  string expect_commit = 4;
+}
+
+message CloseCollectionResponse {
+  string name = 1;
+  string tenant = 2;
+}
+
 // Names of every collection of one tenant, sorted. HTTP-only: GET or POST
 // /collections/_list (also GET /collections) for the caller's tenant, or
 // /tenants/{tenant}/collections/_list.
@@ -1422,6 +1463,9 @@ message CollectionStats {
   // partway); kind is UNAVAILABLE and the message is the recorded reason.
   Error error = 5;
   uint64 storage_ram_bytes = 6;
+  // Writers: changes since the last commit (buffered or flushed documents,
+  // deletes, or an unpublished segment layout) would be lost by a close.
+  bool uncommitted = 8;
 }
 
 message ShardStats {

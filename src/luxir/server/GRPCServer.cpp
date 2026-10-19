@@ -184,6 +184,10 @@ using CreateCollectionReqProto = luxir::api::CreateCollectionRequest;
 using CreateCollectionRespProto = luxir::api::CreateCollectionResponse;
 using DeleteCollectionReqProto = luxir::api::DeleteCollectionRequest;
 using DeleteCollectionRespProto = luxir::api::DeleteCollectionResponse;
+using OpenCollectionReqProto = luxir::api::OpenCollectionRequest;
+using OpenCollectionRespProto = luxir::api::OpenCollectionResponse;
+using CloseCollectionReqProto = luxir::api::CloseCollectionRequest;
+using CloseCollectionRespProto = luxir::api::CloseCollectionResponse;
 using StatsReqProto = luxir::api::StatsRequest;
 using StatsRespProto = luxir::api::StatsResponse;
 using CacheControlReqProto = luxir::api::CacheControlRequest;
@@ -848,6 +852,60 @@ static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& read
   }
 }
 
+//   rpc OpenCollection(OpenCollectionRequest) returns (OpenCollectionResponse)  [unary]
+static void handleOpenCollection(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto request = std::make_shared<HppRequestState<OpenCollectionReqProto>>();
+  if (!parseRequest(readBuf, *request, "OpenCollection")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "OpenCollection: malformed request"));
+    return;
+  }
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+      try {
+        auto id = LuxirNode::adminTarget(request->proto.tenant, request->proto.name);
+        std::optional<std::string> incarnation;
+        if (!request->proto.incarnation.empty()) incarnation = std::string(request->proto.incarnation);
+        auto opened = call.server.getLuxirNode().openCollection(id, request->proto.promote, incarnation);
+        auto commit = opened->getShard()->getSnapshots().snapshot()->id;
+        auto token = commit.token();
+        OpenCollectionRespProto response{id.name, commit.incarnation, token, id.tenant};
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) {
+        finishWithException(call, e);
+      }
+    });
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
+}
+
+//   rpc CloseCollection(CloseCollectionRequest) returns (CloseCollectionResponse)  [unary]
+static void handleCloseCollection(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto request = std::make_shared<HppRequestState<CloseCollectionReqProto>>();
+  if (!parseRequest(readBuf, *request, "CloseCollection")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "CloseCollection: malformed request"));
+    return;
+  }
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+      try {
+        auto id = LuxirNode::adminTarget(request->proto.tenant, request->proto.name);
+        std::optional<std::string> expect;
+        if (!request->proto.expect_commit.empty()) expect = std::string(request->proto.expect_commit);
+        call.server.getLuxirNode().closeCollection(id, request->proto.discard, expect);
+        CloseCollectionRespProto response{id.name, id.tenant};
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) {
+        finishWithException(call, e);
+      }
+    });
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
+}
+
 //   rpc SetSchema(SchemaRequest) returns (SchemaResponse)  [unary]
 static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   HppRequestState<SchemaReqProto> request;
@@ -974,6 +1032,8 @@ static const MethodEntry* lookupMethod(const std::string& method) {
     {"/luxir.Admin/GetSchema",          {handleGetSchema}},
     {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true}},
     {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true}},
+    {"/luxir.Admin/OpenCollection",     {handleOpenCollection, true}},
+    {"/luxir.Admin/CloseCollection",    {handleCloseCollection, true}},
     {"/luxir.Admin/Stats",              {handleStats}},
     {"/luxir.Admin/CacheControl",       {handleCacheControl}},
   };
