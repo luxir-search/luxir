@@ -1898,14 +1898,11 @@ void IndexWriter::sortMergeSources(std::vector<SegInfo*>& segs, const std::strin
   keyed.reserve(segs.size());
   for (SegInfo* seg : segs) {
     auto postingsReader = getSegmentPostingsReader(*seg);
-    FieldReader fields(*postingsReader);
     std::optional<int64_t> min;
-    if (fields.seek(indexSortField)) {
-      SegFieldInfo info;
-      fields.readFieldInfo(info);
-      if ((info.type == FieldType::INT || info.type == FieldType::DATE) &&
-          (info.flags & FieldType::COLUMN_STORED) != 0 && info.numValues > 0) {
-        min = IntColReader(*postingsReader, info).getMin();
+    if (const auto* info = postingsReader->fieldInfo(indexSortField)) {
+      if ((info->type == FieldType::INT || info->type == FieldType::DATE) &&
+          (info->flags & FieldType::COLUMN_STORED) != 0 && info->numValues > 0) {
+        min = IntColReader(*postingsReader, *info).getMin();
       }
     }
     keyed.push_back({seg, min});
