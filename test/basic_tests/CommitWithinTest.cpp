@@ -49,31 +49,35 @@ TEST_F(CommitWithinTest, coalescesToOneCommitPerWindow) {
   CollectionHelper helper("main");
   auto writer = helper.getIndexWriter();
   uint64_t before = writer->stats(false).commits;
+  // No hour-long window closes during the test, so the last update's short window
+  // is the one deadline, and its commit covers every pending update.
   constexpr size_t docs = 20;
-  for (size_t i = 0; i < docs; i++) {
-    ASSERT_TRUE(addWithin(helper, "d" + std::to_string(i), 1000).success);
+  for (size_t i = 0; i + 1 < docs; i++) {
+    ASSERT_TRUE(addWithin(helper, "d" + std::to_string(i), 3'600'000).success);
   }
+  ASSERT_TRUE(addWithin(helper, "d" + std::to_string(docs - 1), 1).success);
   EXPECT_TRUE(waitForIds(helper, docs, 10s));
-  // The burst fits well inside one 1s window; allow slack for a slow machine
-  // pushing some updates past the first deadline, but far below one per update.
-  EXPECT_LE(writer->stats(false).commits - before, 4u);
+  EXPECT_EQ(before + 1, writer->stats(false).commits);
 }
 
 TEST_F(CommitWithinTest, explicitCommitSatisfiesPendingDeadline) {
   CollectionHelper helper("main");
   auto writer = helper.getIndexWriter();
-  // A window beyond the steady clock's representable range: exercises deadline
-  // saturation (an overflowed deadline would wrap into the past and commit
-  // immediately, tripping the commit-count assertions below), and the deadline
-  // must never be what makes this visible.
+  // A window beyond the steady clock's representable range: its deadline must
+  // saturate (an overflow would wrap it into the past and commit at once), and
+  // the deadline must never be what makes this visible.
   ASSERT_TRUE(addWithin(helper, "d1", (uint64_t)1 << 62).success);
+  {
+    std::lock_guard lock(writer->autoCommitMutex);
+    EXPECT_GT(writer->autoCommitDeadline, DeadlineScheduler::Clock::now() + std::chrono::hours(24 * 365));
+  }
   uint64_t before = writer->stats(false).commits;
   writer->commit();
   EXPECT_EQ((std::vector<std::string>{"d1"}), allIds(helper));
   EXPECT_EQ(before + 1, writer->stats(false).commits);
-  // The satisfied deadline must not produce a trailing auto-commit.
-  std::this_thread::sleep_for(200ms);
-  EXPECT_EQ(before + 1, writer->stats(false).commits);
+  // The satisfied deadline leaves nothing for a trailing auto-commit to do.
+  std::lock_guard lock(writer->autoCommitMutex);
+  EXPECT_FALSE(writer->autoCommitPending);
 }
 
 }  // namespace luxir::test

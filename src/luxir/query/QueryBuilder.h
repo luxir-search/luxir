@@ -649,7 +649,12 @@ private:
     std::string commonPrefix;
     std::string commonSuffix;
     automaton::ByteDfaView::State initialState = compiled.start();
+    std::optional<TermPolicy> fittedPolicy;
     if (kind == automaton::ByteDfaKind::NORMAL) {
+      // Exact and prefix shapes see fitted terms correctly; a general pattern
+      // may test hash or truncation bytes. Planning decides whether it can.
+      TermPolicy policy = target.fieldType->longTerms;
+      if (policy != TermPolicy::REJECT) fittedPolicy = policy;
       commonPrefix = std::move(prefixAndState.first);
       auto state = prefixAndState.second;
       commonSuffix = compiled.commonSuffix();
@@ -661,7 +666,7 @@ private:
     DfaScanPlan scanPlan{poolCopy(commonPrefix), poolCopy(commonSuffix), initialState};
     automaton::ByteDfaView frozen = compiled.freeze(pool);
     return pool.make<AutomatonQuery>(field, queryKind, patternCopy, frozen, kind,
-                                    exactOrPrefixCopy, scanPlan);
+                                    exactOrPrefixCopy, scanPlan, fittedPolicy);
   }
 
 public:
@@ -699,6 +704,7 @@ public:
       default:
         throw std::runtime_error(std::format("Fuzzy query on unsupported field type: {}", field));
     }
+    size_t sourceLen = term.size();
     term = fitTerm(target, term); // Edit distance is measured in indexed term bytes.
     int resolvedEdits;
     if (!maxEdits) {
@@ -719,7 +725,16 @@ public:
       throw std::runtime_error(
         std::format("Fuzzy query max_expansions must not be negative (got {})", maxExpansions));
     }
-    return pool.make<FuzzyQuery>(field, term, resolvedEdits, resolvedPrefix, maxExpansions);
+    // Edits can reach a fitted term, or the query term is fitted itself, and
+    // distance over kept bytes misses near long values. Zero edits is an
+    // exact lookup, which applies the same transform as ingest.
+    std::optional<TermPolicy> fittedPolicy;
+    if (fieldType.longTerms != TermPolicy::REJECT && resolvedEdits > 0
+        && sourceLen + (size_t)resolvedEdits >= PackedTerm::MIN_FITTED_LEN) {
+      fittedPolicy = fieldType.longTerms;
+    }
+    return pool.make<FuzzyQuery>(field, term, resolvedEdits, resolvedPrefix, maxExpansions,
+                                 1.0f, fittedPolicy);
   }
 
   // Build a match query for `field` against raw value `value`.
@@ -853,7 +868,8 @@ public:
   // window end, so [2024-01 TO 2024-06] covers January through June inclusive
   // and {2024-01 TO 2024-06} excludes both whole months.  Match on a DATE
   // field routes through here with gte == lte, so equality on a day matches
-  // the whole day.
+  // the whole day.  A bound from unrounded NOW math restricts filter reuse
+  // to this request, keeping it out of shared-cache admission history.
   //
   // Term-backed fields (TEXT/STRING/ID) build a constant-scoring
   // TermRangeQuery over the terms dictionary in byte order: bounds coerce to
@@ -912,6 +928,7 @@ public:
     // Coerce every supplied bound first, so a malformed bound is always a
     // request error regardless of whether the range would collapse to empty.
     std::optional<int64_t> loEnc, hiEnc;
+    bool unroundedNow = false;
     if (fieldType.type() == FieldType::Type::DATE) {
       auto& dateType = (DateFieldType&)fieldType;
       auto dateBound = [&](const api::Val& value) {
@@ -926,20 +943,9 @@ public:
                     "op '{}', DATE field '{}': date granule '{}' skipped: "
                     "no such local granule in {}",
                     opName, field, text, coerceContext.timeZone.name());
-          bool duplicate = false;
-          for (const api::Warning& warning : *warnings) {
-            if (warning.code == "date_granule_skipped" && warning.message == message) {
-              duplicate = true;
-              break;
-            }
-          }
-          if (!duplicate) {
-            char* copy = pool.alloc(message.size());
-            std::memcpy(copy, message.data(), message.size());
-            warnings->push_back({"date_granule_skipped",
-                                 std::string_view(copy, message.size())});
-          }
+          addWarning(*warnings, pool, "date_granule_skipped", message);
         }
+        unroundedNow |= range.unroundedNow;
         return range;
       };
       // Window edges chosen so the existing +/-1 exclusive fold below lands
@@ -978,7 +984,9 @@ public:
       hi = *hiEnc - 1;
     }
     if (lo > hi) return matchNoDocs();  // empty range
-    return pool.make<NumericPredicateQuery>(field, lo, hi);
+    return pool.make<NumericPredicateQuery>(field, lo, hi,
+        unroundedNow ? FilterKeyScope::REQUEST_STABLE
+                     : FilterKeyScope::SEGMENT_STABLE);
   }
 
   // Build a phrase query from un-analyzed input by running the field's analyzer.

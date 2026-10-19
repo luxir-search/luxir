@@ -5,6 +5,7 @@
 #include "CommitWaits.h"
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
+#include "Scrubber.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/log.h"
 #include "oneapi/tbb/global_control.h"
@@ -54,8 +55,8 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
   }
 }
 
-LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
-  : config(std::move(config)), workers(std::max(1, this->config.server.resolveWorkers())),
+LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
+  : config(std::move(config)), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
     reservedSlots(reservedArenaSlots(this->config)),
     taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
@@ -69,8 +70,8 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   auto& replicationConfig = this->config.replication;
   replicationConfig.validate();
   replication = std::make_shared<ReplicationSource>(std::chrono::milliseconds(
-      replicationConfig.follower_timeout_ms), ReplicationSource::Clock::now, replicationConfig.max_acknowledgments);
-  commitWaits = std::make_shared<CommitWaits>(*replication, following());
+      replicationConfig.follower_timeout_ms), this->clock, replicationConfig.max_acknowledgments);
+  commitWaits = std::make_shared<CommitWaits>(*replication, following(), this->clock);
   replication->onAcknowledgmentsChanged([weak = std::weak_ptr(commitWaits)](const CollectionId* id) {
     if (auto waits = weak.lock()) waits->acknowledged(id);
   });
@@ -93,7 +94,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
-  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget, indexArena);
+  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget, indexArena, metrics);
 
   if (following()) {
     // The follower first checks that it owns the data directory.
@@ -109,10 +110,13 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
     collections_->open(this->config.read_only ? Collections::Role::READ_ONLY : Collections::Role::WRITER);
   }
   searchEngine = std::make_unique<SearchEngine>(*this);
+  scrubber = std::make_unique<Scrubber>(*this);
+  if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
 }
 
 LuxirNode::~LuxirNode() {
+  scrubber->stop();
   if (follower) follower->stop();
   commitWaits->close();
 }

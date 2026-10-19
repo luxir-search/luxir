@@ -17,6 +17,7 @@
 #include <memory>
 #include <latch>
 
+#include <CLI/CLI.hpp>
 #include <oneapi/tbb/flow_graph.h>
 #include <luxir/index/Inverter.h>
 #include <luxir/server/ProtoUpdateMessage.h>
@@ -2769,7 +2770,8 @@ TEST_F(IndexWriterTest, durablePublicationFailureClosesWriter) {
   auto originalSchema = writer.getSchema();
   int changes = 0;
   writerSnapshots.onChange = [&]() noexcept { changes++; };
-  Signal::listen("manifestDurable", [&](void*, void*, void*) -> void* {
+  Signal::listen("manifestDurable", [&](void* source, void*, void*) -> void* {
+    if (source != &writer) return nullptr; // another test's background merge
     EXPECT_NE(nullptr, dir.openFile(Manifest::name(before->index_gen + 1), true));
     throw std::runtime_error("injected publication failure");
   });

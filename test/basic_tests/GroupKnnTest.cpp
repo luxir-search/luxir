@@ -63,14 +63,25 @@ std::string keySpec(std::span<const std::string> fields, std::string_view policy
   return s + R"(],"missing":")" + std::string(policy) + R"("})";
 }
 
-void schema(CollectionHelper& helper, api::VectorMetric metric = api::VectorMetric::L2) {
+std::string vectorJson(std::span<const float> vector) {
+  std::string json = "[";
+  for (float x : vector) {
+    if (json.size() > 1) json += ',';
+    json += std::to_string(x);
+  }
+  return json + ']';
+}
+
+void schema(CollectionHelper& helper, api::VectorMetric metric = api::VectorMetric::L2,
+            std::optional<api::VectorAnnDef> ann = std::nullopt, int32_t dims = 4) {
   SchemaBuilder b;
   auto& v = b.templ("_vs");
   v.type = api::FieldDef::FieldClass::VECTOR;
   v.column = true;
   v.multi = true;
-  v.dims = 4;
+  v.dims = dims;
   v.metric = metric;
+  v.ann = ann;
   b.set(helper.collection());
 }
 }
@@ -199,52 +210,126 @@ TEST_F(GroupKnnTest, reportsExhaustionAndCapsAndRejectsMissingScope) {
 
 TEST_F(GroupKnnTest, actualIvfAndFlatSegmentsStillFindDistinctGroups) {
   CollectionHelper helper;
-  schema(helper);
-  for (int segment = 0; segment < 2; segment++) {
-    std::vector<Doc> docs;
-    for (int i = 0; i < 160; i++) {
-      auto doc = flatdoc("id", std::to_string(segment * 160 + i),
-          "vec_vs", std::vector<std::vector<float>>{{i < 128 ? 0.0f : (float)i, 0, 0, 0}});
-      if (i % 7) doc.emplace_back("key_s", i < 128 ? "near" : "g" + std::to_string(i));
-      if (i % 11) doc.emplace_back("key_i", (int64_t)(i < 128 ? 0 : i));
-      docs.push_back(std::move(doc));
+  for (const auto& ann : {pqAnn(4, 2, 2), rabitqAnn(4)}) {
+    helper.clear();
+    schema(helper, api::VectorMetric::L2, ann);
+    for (int segment = 0; segment < 2; segment++) {
+      std::vector<Doc> docs;
+      for (int i = 0; i < 160; i++) {
+        auto doc = flatdoc("id", std::to_string(segment * 160 + i),
+            "vec_vs", std::vector<std::vector<float>>{{i < 128 ? 0.0f : (float)i, 0, 0, 0}});
+        if (i % 7) doc.emplace_back("key_s", i < 128 ? "near" : "g" + std::to_string(i));
+        if (i % 11) doc.emplace_back("key_i", (int64_t)(i < 128 ? 0 : i));
+        docs.push_back(std::move(doc));
+      }
+      helper.indexAll(docs, UpdateMessage::COMMIT);
     }
-    helper.indexAll(docs, UpdateMessage::COMMIT);
-  }
-  SearchOverridesGuard a(VectorIndexBuilder::ivfPqNList);
-  SearchOverridesGuard b(VectorIndexBuilder::ivfPqM);
-  SearchOverridesGuard c(VectorIndexBuilder::ivfPqBits);
-  SearchOverridesGuard d(VectorIndexBuilder::ivfPqMinTrainingVectors);
-  SearchOverridesGuard e(VectorIndexBuilder::ivfPqBuildThresholdScanCost);
-  SearchOverridesGuard f(VectorIndexBuilder::buildFaissIvfPqAuxIndexes);
-  VectorIndexBuilder::ivfPqNList = 4; VectorIndexBuilder::ivfPqM = 2;
-  VectorIndexBuilder::ivfPqBits = 2; VectorIndexBuilder::ivfPqMinTrainingVectors = 16;
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0; VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-  helper.commit({"vec.vec_vs"});
-  // A later segment has no aux, and the same near group straddles all three.
-  helper.indexAll({flatdoc("id", "flat", "key_s", "flat", "key_i", (int64_t)1000,
-      "vec_vs", std::vector<std::vector<float>>{{1, 0, 0, 0}})}, UpdateMessage::COMMIT);
-  helper.deleteByIds({"0", "160"}, UpdateMessage::COMMIT);
-  auto full = run("main", R"("limit":-1,"query":)" + knn(1000, false));
-  for (auto fields : std::vector<std::vector<std::string>>{{"key_s"}, {"key_i"}, {"key_s", "key_i"}}) {
-  for (auto policy : {"expand", "group", "drop"}) for (int parallel : {1, -1}) {
-    KnnQuery::Stats stats;
-    SearchOverridesGuard guard(KnnQuery::statsForTests);
-    KnnQuery::statsForTests = &stats;
-    auto actual = run("main", R"("limit":-1,"collapse":)" + keySpec(fields, policy)
-        + R"(,"query":)" + knn(8, true, false, R"(,"refine_candidates":1000,"ivf":{"min_scan_fraction":1})"), parallel);
-    EXPECT_EQ(oracle(*full, fields, policy, 8), rows(*actual));
-    EXPECT_EQ(8u, rows(*actual).size());
-    EXPECT_GT(stats.lists.load(), 0);
-    EXPECT_GT(stats.bytes.load(), 0);
-  }
-  }
-  auto pinned = run("main", R"("limit":-1,"collapse":"key_s","filter":["key_s:near"],"query":)"
-      + knn(8, true, false, R"(,"ivf":{"nprobe":1})"));
-  ASSERT_LT(rows(*pinned).size(), 8u);
-  ASSERT_EQ(1u, pinned->responses.back()->proto.warnings.size());
-  EXPECT_NE(std::string_view::npos, pinned->responses.back()->proto.warnings[0].message.find("candidates_exhausted=false"));
+    IvfTestGuard ivf(/*minTraining=*/16);
+    helper.commit({"vec.vec_vs"});
+    // A later segment has no aux, and the same near group straddles all three.
+    helper.indexAll({flatdoc("id", "flat", "key_s", "flat", "key_i", (int64_t)1000,
+        "vec_vs", std::vector<std::vector<float>>{{1, 0, 0, 0}})}, UpdateMessage::COMMIT);
+    helper.deleteByIds({"0", "160"}, UpdateMessage::COMMIT);
+    auto full = run("main", R"("limit":-1,"query":)" + knn(1000, false));
+    for (auto fields : std::vector<std::vector<std::string>>{{"key_s"}, {"key_i"}, {"key_s", "key_i"}}) {
+    for (auto policy : {"expand", "group", "drop"}) for (int parallel : {1, -1}) {
+      KnnQuery::Stats stats;
+      SearchOverridesGuard guard(KnnQuery::statsForTests);
+      KnnQuery::statsForTests = &stats;
+      auto actual = run("main", R"("limit":-1,"collapse":)" + keySpec(fields, policy)
+          + R"(,"query":)" + knn(8, true, false, R"(,"refine_candidates":1000,"ivf":{"min_scan_fraction":1})"), parallel);
+      EXPECT_EQ(oracle(*full, fields, policy, 8), rows(*actual));
+      EXPECT_EQ(8u, rows(*actual).size());
+      EXPECT_GT(stats.lists.load(), 0);
+      EXPECT_GT(stats.bytes.load(), 0);
+    }
+    }
+    auto pinned = run("main", R"("limit":-1,"collapse":"key_s","filter":["key_s:near"],"query":)"
+        + knn(8, true, false, R"(,"ivf":{"nprobe":1})"));
+    ASSERT_LT(rows(*pinned).size(), 8u);
+    ASSERT_EQ(1u, pinned->responses.back()->proto.warnings.size());
+    EXPECT_NE(std::string_view::npos, pinned->responses.back()->proto.warnings[0].message.find("candidates_exhausted=false"));
 
+  }
+}
+
+TEST_F(GroupKnnTest, rabitqPreparedQueryFindsGroupsAndRepresentatives) {
+  IvfTestGuard ivf;
+  CollectionHelper helper;
+  constexpr int dims = 16;
+  schema(helper, api::VectorMetric::IP, rabitqAnn(4, 4), dims);
+  std::mt19937 rng(418);
+  std::vector<float> query(dims);
+  for (auto& x : query) x = (float)(rng() % 2001) / 1000.0f - 1.0f;
+  std::string vector = vectorJson(query);
+  std::vector<std::vector<float>> centers(40, std::vector<float>(dims));
+  for (auto& center : centers) for (auto& x : center) x = (float)(rng() % 2001) / 100.0f - 10.0f;
+  for (int segment = 0; segment < 2; segment++) {
+    for (int group = 0; group < 40; group++) for (int member = 0; member < 4; member++) {
+      auto value = centers[(size_t)group];
+      for (int d = 0; d < dims; d++) value[(size_t)d] += (float)(member + segment * 4) * query[(size_t)d];
+      helper.index(flatdoc("id", std::to_string(segment * 160 + group * 4 + member),
+          "key_s", "g" + std::to_string(group), "eligible_s", group % 3 ? "yes" : "no",
+          "vec_vs", std::vector<std::vector<float>>{value}));
+    }
+    helper.commit({"vec.vec_vs"});
+  }
+  SearchOverridesGuard grains(KnnQuery::scanTaskGrainVectors, KnnQuery::rescoreTaskGrainCandidates);
+  KnnQuery::scanTaskGrainVectors = KnnQuery::rescoreTaskGrainCandidates = 1;
+  for (bool filtered : {false, true}) {
+    std::string prefix = R"("limit":-1,"collapse":"key_s",)"
+        + std::string(filtered ? R"("filter":["eligible_s:yes"],)" : "") + R"("query":)";
+    auto expected = rows(*run("main", prefix + knn(6, true, true, {}, vector)));
+    ASSERT_EQ(6u, expected.size());
+    for (int parallel : {1, -1}) {
+      KnnQuery::Stats stats;
+      SearchOverridesGuard saved(KnnQuery::statsForTests);
+      KnnQuery::statsForTests = &stats;
+      auto actual = run("main", prefix + knn(6, true, false,
+          R"(,"refine_candidates":24,"ivf":{"min_scan_fraction":1})", vector), parallel);
+      EXPECT_EQ(expected, rows(*actual));
+      EXPECT_GT(stats.lists.load(), 0);
+      EXPECT_GT(stats.bytes.load(), 0);
+    }
+  }
+}
+
+TEST_F(GroupKnnTest, rabitqQueryBitsChangeBoundedGroupedSelection) {
+  IvfTestGuard ivf;
+  CollectionHelper helper;
+  constexpr int dims = 16;
+  schema(helper, api::VectorMetric::IP, rabitqAnn(4), dims);
+  std::mt19937 rng(831);
+  std::vector<float> query(dims);
+  for (auto& x : query) x = (float)(rng() % 2001) / 1000.0f - 1.0f;
+  std::string vector = vectorJson(query);
+  for (int i = 0; i < 320; i++) {
+    std::vector<float> value(dims);
+    for (auto& x : value) x = (float)(rng() % 2001) / 1000.0f - 1.0f;
+    helper.index(flatdoc("id", std::to_string(i), "key_s", std::to_string(i),
+        "vec_vs", std::vector<std::vector<float>>{value}));
+  }
+  helper.commit({"vec.vec_vs"});
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto aux = reader->segments()[0].getAuxReader("vec.vec_vs");
+  ASSERT_NE(nullptr, aux);
+  std::vector<std::vector<Row>> selected;
+  for (int bits : {0, 1}) {
+    schema(helper, api::VectorMetric::IP, rabitqAnn(4, 1, bits), dims);
+    auto current = helper.getIndexWriter()->snapshots.readers.getReader();
+    EXPECT_EQ(aux.get(), current->segments()[0].getAuxReader("vec.vec_vs").get());
+    auto extra = R"(,"refine_candidates":3,"ivf":{"min_scan_fraction":1})";
+    auto docs = rows(*run("main", R"("limit":-1,"query":)" + knn(3, false, false, extra, vector)));
+    ASSERT_EQ(3u, docs.size());
+    std::vector<Row> groups;
+    for (int parallel : {1, -1}) {
+      groups = rows(*run("main", R"("limit":-1,"collapse":"key_s","query":)"
+          + knn(3, true, false, extra, vector), parallel));
+      EXPECT_EQ(docs, groups) << bits;
+    }
+    selected.push_back(std::move(groups));
+  }
+  EXPECT_NE(selected[0], selected[1]);
 }
 
 TEST_F(GroupKnnTest, identityIncludesResolvedKeyPolicyAndUnit) {
@@ -287,20 +372,11 @@ TEST_F(GroupKnnTest, identityIncludesResolvedKeyPolicyAndUnit) {
 }
 
 TEST_F(GroupKnnTest, annAdmissionPrecedesTheVectorCutForIpAndCosine) {
-  SearchOverridesGuard enabled(VectorIndexBuilder::buildFaissIvfPqAuxIndexes);
-  SearchOverridesGuard threshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost);
-  SearchOverridesGuard lists(VectorIndexBuilder::ivfPqNList);
-  SearchOverridesGuard m(VectorIndexBuilder::ivfPqM);
-  SearchOverridesGuard bits(VectorIndexBuilder::ivfPqBits);
-  SearchOverridesGuard training(VectorIndexBuilder::ivfPqMinTrainingVectors);
-  VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-  VectorIndexBuilder::ivfPqNList = 4; VectorIndexBuilder::ivfPqM = 2;
-  VectorIndexBuilder::ivfPqBits = 2; VectorIndexBuilder::ivfPqMinTrainingVectors = 16;
+  IvfTestGuard ivf(/*minTraining=*/16);
   for (auto metric : {api::VectorMetric::IP, api::VectorMetric::COSINE}) {
     std::string name = "group_metric_" + std::to_string((int)metric);
     CollectionHelper helper(name);
-    schema(helper, metric);
+    schema(helper, metric, pqAnn(4, 2, 2));
     for (int group = 20; group > 0; group--) for (int member = 0; member < 8; member++) {
       helper.index(flatdoc("id", std::to_string(group * 8 + member), "key_s", "g" + std::to_string(group),
           "vec_vs", std::vector<std::vector<float>>{{(float)group, 1, 0, 0}, {(float)group * 0.75f, 0.5f, 0, 0}}));
@@ -373,21 +449,12 @@ TEST_F(GroupKnnTest, cappedAdmissionMatchesGreedyAcrossPartitions) {
 
 TEST_F(GroupKnnTest, approximateMemberCapRecoversExactRepresentative) {
   CollectionHelper helper;
-  schema(helper);
+  schema(helper, api::VectorMetric::L2, pqAnn(2, 0, 1));
   for (int group = 0; group < 48; group++) for (int member = 0; member < 2; member++) {
     helper.index(flatdoc("id", std::to_string(group * 2 + member), "key_s", "g" + std::to_string(group),
         "vec_vs", std::vector<std::vector<float>>{{(float)group + (float)member * 0.1f, 0, 0, 0}}));
   }
-  SearchOverridesGuard enabled(VectorIndexBuilder::buildFaissIvfPqAuxIndexes);
-  SearchOverridesGuard threshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost);
-  SearchOverridesGuard lists(VectorIndexBuilder::ivfPqNList);
-  SearchOverridesGuard bits(VectorIndexBuilder::ivfPqBits);
-  SearchOverridesGuard training(VectorIndexBuilder::ivfPqMinTrainingVectors);
-  VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-  VectorIndexBuilder::ivfPqNList = 2;
-  VectorIndexBuilder::ivfPqBits = 1;
-  VectorIndexBuilder::ivfPqMinTrainingVectors = 8;
+  IvfTestGuard ivf(/*minTraining=*/8);
   helper.commit({"vec.vec_vs"});
   auto truth = rows(*run("main", R"("limit":-1,"collapse":"key_s","query":)" + knn(3, true)));
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();

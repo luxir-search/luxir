@@ -55,7 +55,10 @@ std::vector<std::string> SearchEngine::explain(const ReqProto& proto, std::strin
   return notes;
 }
 
+Metrics& SearchEngine::metrics() const { return *node.metrics; }
+
 void SearchEngine::submitBody(SearchRequest& req) {
+  MetricScope execution(*node.metrics, metricActivity(MetricStage::SEARCH_EXECUTION));
   // Until the calculators start, an unclassified failure is the request's
   // fault: parsers and planners reject authored input with bare exceptions.
   // Once execution is under way it is the engine's.  Throw sites that know
@@ -116,10 +119,14 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // Send back the final response - or, if a flow-controlled emitter is still
   // paused with batches to produce, hand off: the last stream to end sends it.
   // Do not access req after this point as it may be asynchronously deleted.
+  execution.finish();
   req.bodyDone();
 }
 
 void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
+  req.counting = true;
+  req.submitted = std::chrono::steady_clock::now();
+  metrics().start(metricActivity(MetricStage::SEARCH));
   if (!req.proto.min_commit.empty()) {
     try {
       auto floor = CommitId::parse(req.proto.min_commit);
@@ -177,6 +184,7 @@ void SearchEngine::getResources(SearchRequest& req) {
   auto& request = req.proto;
   auto& node = req.engine.node;
   auto collection = req.floorCollection ? req.floorCollection : node.getCollection(LuxirNode::target(req.tenant, request.collection));
+  req.collectionMetrics = collection->sharedMetrics();
 
   // get the index reader
   // The API freshness tolerance is milliseconds; the reader clock domain is

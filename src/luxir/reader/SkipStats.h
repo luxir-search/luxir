@@ -116,6 +116,10 @@ struct SkipStats {
   static inline int64_t mandOptBulkCompactions = 0;
   static inline int64_t mandOptBulkOptDrivenWindows = 0;
   static inline int64_t mandOptBulkScalarFillFallbacks = 0;
+  // Min-score child windows filtered, and candidate scores checked. Bulk
+  // checks are added once per window; pull checks count verifier calls.
+  static inline int64_t minScoreBulkWindows = 0;
+  static inline int64_t minScoreChecks = 0;
   static inline int64_t countBulkFillCalls = 0;
   static inline int64_t countBulkFillBlocks = 0;
   static inline int64_t countBulkFillDocs = 0;
@@ -443,6 +447,8 @@ struct SkipStats {
     mandOptBulkCompactions = 0;
     mandOptBulkOptDrivenWindows = 0;
     mandOptBulkScalarFillFallbacks = 0;
+    minScoreBulkWindows = 0;
+    minScoreChecks = 0;
     countBulkFillCalls = 0;
     countBulkFillBlocks = 0;
     countBulkFillDocs = 0;

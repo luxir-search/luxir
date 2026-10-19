@@ -78,6 +78,8 @@ private:
 // Configure before first use. The process-wide indexing arena is never destroyed.
 void configureIndexingArena(bool hugePages);
 AllocatorArena& indexingArena();
+inline constexpr AllocatorArenaOptions bigBufferArenaOptions{
+    .hugePages = true, .wholeHugePagePurge = true, .dirtyDecayMs = 5000};
 AllocatorArena& bigBufferArena();
 
 // Process allocator, version and effective configuration for the startup banner.

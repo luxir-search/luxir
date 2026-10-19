@@ -10,6 +10,7 @@
 #include <tuple>
 #include "LuxirTest.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/query/Query.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/util/Overloaded.h"
@@ -38,6 +39,21 @@ public:
 
 template <class... Values>
 SearchOverridesGuard(Values&...) -> SearchOverridesGuard<Values...>;
+
+// Opens the IVF build policy for tiny test corpora (training floor
+// minTraining, no scan-cost threshold). Restores on destruction.
+class IvfTestGuard {
+  SearchOverridesGuard<int64_t, int64_t, int64_t> saved{
+    VectorIndexBuilder::ivfPqMinTrainingVectors, VectorIndexBuilder::ivfRaBitQMinTrainingVectors,
+    VectorIndexBuilder::ivfBuildThresholdScanCost};
+
+public:
+  explicit IvfTestGuard(int64_t minTraining = 2) {
+    VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
+    VectorIndexBuilder::ivfRaBitQMinTrainingVectors = minTraining;
+    VectorIndexBuilder::ivfBuildThresholdScanCost = 0;
+  }
+};
 
 inline Query::ScorerPlan* resolveScorerPlanForTests(
     MemPool& pool, Query::ScorerSupplier& supplier, int64_t candidates,
@@ -134,18 +150,24 @@ auto vecsv(Args&&... args) {
     return std::vector<std::string_view>{std::forward<Args>(args)...};
 }
 
+inline void appendFlat(Doc&) {}
+
+template<typename N, typename V, typename... Rest>
+void appendFlat(Doc& doc, N&& name, V&& val, Rest&&... rest) {
+  doc.push_back(NameVal{std::forward<N>(name), std::forward<V>(val)});
+  appendFlat(doc, std::forward<Rest>(rest)...);
+}
+
 // allow construction of a Doc with just alternating names and values. Example:
 // auto doc1 = flatdoc("name1", 1, "name2", 2.0, "name3", "hi");
-template<typename T1, typename T2, typename... Args>
-Doc flatdoc(T1 arg1, T2 arg2, Args... args) {
-  std::vector<NameVal> vec;
-  vec.push_back(NameVal{arg1, arg2});
-  if constexpr (sizeof...(args) > 0) {
-    auto otherPairs = flatdoc(args...);
-    vec.insert(vec.end(), otherPairs.begin(), otherPairs.end());
-  }
-  return vec;
-};
+template<typename... Args>
+Doc flatdoc(Args&&... args) {
+  static_assert(sizeof...(Args) > 0 && sizeof...(Args) % 2 == 0, "flatdoc takes name, value pairs");
+  Doc doc;
+  doc.reserve(sizeof...(Args) / 2);
+  appendFlat(doc, std::forward<Args>(args)...);
+  return doc;
+}
 
 
 using luxir::overloaded;  // the shared std::visit visitor (luxir/util/Overloaded.h)

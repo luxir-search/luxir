@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/reader/SkipStats.h"
 #include "test/CollectionHelper.h"

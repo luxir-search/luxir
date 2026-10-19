@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <string>
-#include <CLI/CLI.hpp>
 #include <oneapi/tbb/info.h>
+
+namespace CLI { class App; }
 
 namespace luxir {
 
@@ -75,6 +77,14 @@ struct StoreConfig {
   std::string data_dir = "luxir_data";
   uint64_t ram_limit_mb = 0; // RAM storage only; zero is unlimited.
   CheckedDirConfig checked_dir;
+  // Before a collection serves at startup: none trusts the manifest footer and
+  // file sizes; full also reads every file the committed snapshot lists and
+  // checks its size and xxh3, failing only that collection on a mismatch.
+  std::string verify_on_open = "none";   // none, full
+  // Background re-verification of every published snapshot's files; a
+  // mismatch makes the collection unavailable. Zero disables it.
+  uint64_t scrub_interval_s = 0;
+  uint64_t scrub_max_bytes_per_sec = 64ULL * 1024 * 1024; // zero is unthrottled
 };
 
 struct IndexConfig {
@@ -170,6 +180,9 @@ struct ReplicationConfig {
   int64_t pin_idle_timeout_ms = 60'000;
   uint64_t pin_retained_bytes = 1024ULL * 1024 * 1024;
   int64_t follower_timeout_ms = 90'000;
+  // A follower's delay before reconnecting to a lost source, and before its first
+  // retry of a failed collection sync (doubling per consecutive failure, to 60 s).
+  int64_t retry_ms = 1000;
   std::string source;
   std::string follower_id; // empty: host:port of this node's listener
   std::string tenants; // comma-separated; empty subscribes to every tenant
