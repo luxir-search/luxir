@@ -37,7 +37,6 @@ caps. Native vcpkg dependencies and the ARM64 toolchain and packages are
 shared between worktrees; ccache objects are shared only when the checkouts are
 configured with `-DLUXIR_CCACHE_RELATIVE_PATHS=ON`.
 See [Parallelism and shared caches](docs/dev/build-setup.md#parallelism-and-shared-caches).
-Use worktrees to avoid conflicting. Once work is pushed, clean up the worktree.
 
 ### Iterate (default): non-ASan, fastest edit-build-test
 
