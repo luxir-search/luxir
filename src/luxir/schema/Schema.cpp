@@ -63,6 +63,8 @@ struct ResolvedField {
   VectorEncoding vectorEncoding = VectorEncoding::F32;
   bool hasVectorKeepOriginal = false;
   bool vectorKeepOriginal = false;
+  bool hasVectorMaxSim = false;
+  bool vectorMaxSim = false;
   // Atomic like analyzer: the nearest authored ann in the parent chain.
   const luxir::api::VectorAnnDef* ann = nullptr;
 };
@@ -287,6 +289,21 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorKeepOriginal = parentResolved.vectorKeepOriginal;
   }
 
+  // multi_vector_scoring: explicit set on this field overrides; otherwise inherit.
+  if (def.multi_vector_scoring.has_value()) {
+    auto scoring = *def.multi_vector_scoring;
+    if (scoring != api::FieldDef::MultiVectorScoring::MAX &&
+        scoring != api::FieldDef::MultiVectorScoring::MAXSIM) {
+      throw SchemaError("unknown multi_vector_scoring value " + std::to_string((int)scoring) +
+                        " (field: " + std::string(name) + "); valid: max, maxsim");
+    }
+    r.hasVectorMaxSim = true;
+    r.vectorMaxSim = scoring == api::FieldDef::MultiVectorScoring::MAXSIM;
+  } else {
+    r.hasVectorMaxSim = parentResolved.hasVectorMaxSim;
+    r.vectorMaxSim = parentResolved.vectorMaxSim;
+  }
+
   r.ann = def.ann ? &*def.ann : parentResolved.ann;
   return r;
 }
@@ -432,11 +449,11 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   bool vectorProp = def.dims.has_value() || def.truncate_dims.has_value() || def.metric.has_value() ||
                     def.normalized.has_value() || def.normalize_on_write.has_value() ||
                     def.encoding.has_value() || def.keep_original.has_value() ||
-                    def.ann.has_value();
+                    def.multi_vector_scoring.has_value() || def.ann.has_value();
   if (vectorProp && r.type != FieldClass::VECTOR) {
     throw SchemaError(
-      "dims/truncate_dims/metric/normalized/normalize_on_write/encoding/keep_original/ann are only "
-      "valid for vector fields (field: " + name + ")");
+      "dims/truncate_dims/metric/normalized/normalize_on_write/encoding/keep_original/"
+      "multi_vector_scoring/ann are only valid for vector fields (field: " + name + ")");
   }
 }
 
@@ -690,9 +707,13 @@ struct FieldCompiler {
                               std::string(name) + ")");
           }
         }
+        if (r.vectorMaxSim && (!multi || r.vectorMetric == VectorFieldType::METRIC_NONE)) {
+          throw SchemaError("multi_vector_scoring maxsim requires a multi-valued field with a "
+                            "metric (field: " + std::string(name) + ")");
+        }
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
                                                r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
-                                               encoding, r.vectorKeepOriginal, ann,
+                                               encoding, r.vectorKeepOriginal, r.vectorMaxSim, ann,
                                                r.vectorTruncateDims);
         break;
       }

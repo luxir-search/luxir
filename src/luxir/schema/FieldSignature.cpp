@@ -49,6 +49,7 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
         ? "true" : "false";
     properties["encoding"] = "\"" + std::string(vcodec::name(vector->encoding())) + "\"";
     properties["keep_original"] = vector->keepOriginal() ? "true" : "false";
+    properties["multi_vector_scoring"] = vector->maxSim() ? "\"maxsim\"" : "\"max\"";
   }
 }
 

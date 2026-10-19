@@ -358,6 +358,9 @@ public:
   // Also store the submitted float32 vectors in a cold companion column
   // (originalColumnName) that the query path never reads.
   bool keepOriginal_;
+  // Multi-valued only: KnnQuery with several query vectors scores late
+  // interaction (sum over query vectors of the best document vector).
+  bool maxSim_;
   // ANN overlay codec and parameters (schema "ann").
   VectorAnnConfig ann_;
 
@@ -368,6 +371,7 @@ public:
                   bool normalizeOnWrite = true,
                   VectorEncoding encoding = VectorEncoding::F32,
                   bool keepOriginal = false,
+                  bool maxSim = false,
                   VectorAnnConfig ann = {},
                   int32_t truncateDims = 0)
     : FieldType(name, FieldType::VECTOR, flags),
@@ -378,6 +382,7 @@ public:
       normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized),
       encoding_(encoding),
       keepOriginal_(keepOriginal),
+      maxSim_(maxSim),
       ann_(ann) {
     assert(truncateDims == 0 || (truncateDims > 0 && truncateDims < dims));
   }
@@ -404,6 +409,7 @@ public:
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
   VectorEncoding encoding() const { return encoding_; }
   bool keepOriginal() const { return keepOriginal_; }
+  bool maxSim() const { return maxSim_; }
   const VectorAnnConfig& ann() const { return ann_; }
 
   // The contract for every indexed and query vector: inputDims() components
@@ -418,8 +424,11 @@ public:
   bool knnSearchable() const { return metric_ != METRIC_NONE; }
 
   // True iff commits may build an ANN overlay for this field.  HAMMING has no
-  // ANN index: bit columns are small and scanned exactly.
-  bool annIndexable() const { return knnSearchable() && metric_ != METRIC_HAMMING; }
+  // ANN index: bit columns are small and scanned exactly.  Neither has MaxSim:
+  // late interaction is scored exactly over a document's whole vector set.
+  bool annIndexable() const {
+    return knnSearchable() && metric_ != METRIC_HAMMING && !maxSim_;
+  }
 };
 
 // How a stored-fields resource compresses its chunks.  codec and the two chunk

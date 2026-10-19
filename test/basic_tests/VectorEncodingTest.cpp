@@ -149,6 +149,20 @@ std::vector<std::string> rows(CollectionHelper& h, std::string_view field,
   return out;
 }
 
+// A kNN query with several late-interaction query vectors.
+api::Query maxSimKnn(std::pmr::memory_resource& mr, std::string_view field,
+                     const std::vector<Vec>& queries, int32_t k) {
+  api::Query q = qb::knn(mr, field, queries[0], k);
+  auto& knn = std::get<api::KnnQuery>(q.kind);
+  knn.query.reset();
+  api::Vector* vs = api::build::allocArray(knn.queries, queries.size(), mr);
+  for (size_t i = 0; i < queries.size(); i++) {
+    float* a = api::build::allocArray(vs[i].f32.emplace().v, queries[i].size(), mr);
+    std::copy(queries[i].begin(), queries[i].end(), a);
+  }
+  return q;
+}
+
 // Small IVF+PQ overlay settings for the tiny test corpus.
 api::VectorAnnDef smallPqAnn() {
   api::VectorAnnDef ann;
@@ -668,4 +682,68 @@ TEST_F(VectorEncodingTest, parallelMatchesSerialPerEncoding) {
     }
   }
   KnnQuery::rescoreTaskGrainCandidates = savedGrain;
+}
+
+// multi_vector_scoring maxsim: several query vectors score a document by
+// sum over query vectors of its best vector's similarity, exactly, across
+// segments, inside filters, serial or parallel; the field gets no ANN overlay.
+TEST_F(VectorEncodingTest, maxSimScoresLateInteraction) {
+  CollectionHelper h("main");
+  SchemaBuilder b;
+  auto& def = b.field("tok_vs");
+  def.type = api::FieldDef::FieldClass::VECTOR;
+  def.metric = api::VectorMetric::IP;
+  def.multi = true;
+  def.multi_vector_scoring = api::FieldDef::MultiVectorScoring::MAXSIM;
+  auto schema = b.set(h.collection());
+  EXPECT_FALSE(((const VectorFieldType*)schema->getFieldTypePtr("tok_vs"))->annIndexable());
+  using Vecs = std::vector<Vec>;
+  h.index(flatdoc("id", std::string("a"), "kind_s", std::string("drop"), "tok_vs", Vecs{{1, 0}, {0, 1}}));
+  h.index(flatdoc("id", std::string("b"), "kind_s", std::string("keep"), "tok_vs", Vecs{{1, 0}, {1, 0}}));
+  h.commit();
+  h.index(flatdoc("id", std::string("c"), "kind_s", std::string("keep"), "tok_vs", Vecs{{0.6f, 0.6f}}));
+  h.commit();
+
+  Vecs queries = {{1, 0}, {0, 1}};
+  auto search = [&](bool filtered, bool parallel) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.getScores().fields({"id"});
+    cur.rawQuery() = maxSimKnn(cur.mr(), "tok_vs", queries, 3);
+    if (filtered) cur.matchFilter("kind_s", "keep");
+    req->execute(parallel);
+    return scoredHits(req);
+  };
+  using Hits = std::vector<std::pair<std::string, float>>;
+  Hits expected = {{"a", 2.0f}, {"c", (float)(0.6 + 0.6)}, {"b", 1.0f}};
+  EXPECT_EQ(expected, search(false, false));
+  EXPECT_EQ(expected, search(false, true));
+  EXPECT_EQ((Hits{{"c", (float)(0.6 + 0.6)}, {"b", 1.0f}}), search(true, false));
+
+  // One query vector keeps the best-single-vector score.
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.getScores().fields({"id"});
+  cur.rawQuery() = qb::knn(cur.mr(), "tok_vs", Vec{1, 0}, 3);
+  req->execute();
+  EXPECT_EQ((Hits{{"a", 1.0f}, {"b", 1.0f}, {"c", 0.6f}}), scoredHits(req));
+}
+
+TEST_F(VectorEncodingTest, maxSimValidates) {
+  CollectionHelper h("main");
+  installFields(h.collection(), {.metric = api::VectorMetric::IP, .multi = true});
+  auto* req = LocalReq::create(luxirNode->getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.rawQuery() = maxSimKnn(cur.mr(), "enc_v", {QUERY, QUERY}, 3);
+  req->execute();
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("maxsim")) << req->errorMsg();
+  req->done();
+
+  SchemaBuilder sb;
+  auto& f = sb.field("one_v");
+  f.type = api::FieldDef::FieldClass::VECTOR;
+  f.metric = api::VectorMetric::IP;
+  f.multi_vector_scoring = api::FieldDef::MultiVectorScoring::MAXSIM;
+  EXPECT_THROW(Schema::fromProto(sb.def()), SchemaError);
 }

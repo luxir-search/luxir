@@ -449,6 +449,25 @@ queries. Once widening finishes, the final candidate pool is rescanned from
 the stored column (exact over its encoding), sorted by exact score, and
 collapsed to one hit per document.
 
+### Late interaction (MaxSim)
+
+A `knn` with several `queries` on a `multi_vector_scoring: maxsim` field
+skips the engines and the widen loop. MaxSim (ColBERT, Khattab and Zaharia,
+SIGIR 2020, arXiv:2004.12832) scores a document by
+`sum over q of max over its vectors d of sim(q, d)`, which no per-vector index
+ranks: a document's best vector for one query token says little about its
+sum. Like Elasticsearch's `rank_vectors`, Luxir scores it by brute force
+instead: each segment walks its doc-ordered value ranks, and for every
+eligible document batches the document's rows through the column's
+`VectorScorer` once per query vector, taking the max per query vector and
+summing in double. Segments run as parallel tasks into one bounded top-k
+under the same strict total order, so results are deterministic. The cost is
+`queries x vectors` kernel calls over the eligible set, which is meant for
+small collections or a candidate set narrowed by filters (the domain);
+commits build no overlay for such fields. Candidate generation from a
+per-token index (ColBERT's own retrieval, or PLAID's centroid pruning,
+arXiv:2205.09707) can come later in front of the same scorer.
+
 ## Parallel Execution
 
 A single query's scan and rescore run in parallel when the request executes in

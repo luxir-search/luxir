@@ -122,6 +122,7 @@ namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
+enum class MultiVectorScoring { MAX = 0, MAXSIM = 1 };
 }
 namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1 }; }
 namespace StoredResourceDef_ { enum class Codec { LZ4 = 0, ZSTD = 1 }; }
@@ -261,6 +262,7 @@ struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
   using IndexMode = luxir::api::FieldDef_::IndexMode;
   using LongTerms = luxir::api::FieldDef_::LongTerms;
+  using MultiVectorScoring = luxir::api::FieldDef_::MultiVectorScoring;
   using Metric = luxir::api::VectorMetric;
   using Encoding = luxir::api::VectorEncoding;
   std::string_view parent;
@@ -277,6 +279,7 @@ struct FieldDef {
   std::optional<std::int32_t> truncate_dims;                    // align 4
   std::optional<Metric> metric;                                 // align 4 (enum)
   std::optional<Encoding> encoding;                             // align 4 (enum)
+  std::optional<MultiVectorScoring> multi_vector_scoring;       // align 4 (enum)
   std::optional<bool> column;                                   // align 1 (optional<bool>s)
   std::optional<bool> multi;
   std::optional<bool> stored;
@@ -772,6 +775,7 @@ struct KnnQuery {                                                // needs Vector
   using Ivf = luxir::api::KnnQuery_::Ivf;
   std::string_view field;
   std::optional<Vector> query;
+  std::span<const Vector> queries;
   std::optional<Ivf> ivf;
   std::optional<float> similarity;
   int32_t k = 0;

@@ -102,10 +102,20 @@ namespace luxir {
 /// per doc.  Approximate aux engines return vector candidates instead; the
 /// host pools them and the terminal refine collapses.  Above maxKnnCandidates
 /// the result is best-effort.
+///
+/// Late interaction (MaxSim): a field with multi_vector_scoring maxsim takes
+/// several query vectors (queryCount > 1, packed in queryVec).  A document
+/// then scores sum over query vectors q of max over its vectors d of
+/// sim(q, d), the ColBERT / ColPali score.  That score has no ANN index, so
+/// prepareMaxSim scores every eligible document exactly, batching each
+/// document's rows through the same VectorScorer kernels once per query
+/// vector: an exact scan for small corpora, and a brute-force rescore of a
+/// candidate set given as the enclosing filter (the domain).
 class KnnQuery final : public luxir::Query {
   std::string_view field;
   const VectorFieldType& fieldType;
   std::span<const float> queryVec;
+  int32_t queryCount;
   int32_t k;
   int32_t nprobe;
   int32_t refineCandidates;
@@ -132,9 +142,14 @@ class KnnQuery final : public luxir::Query {
       throw std::runtime_error(std::format(
           "KnnQuery on vector field '{}' without a metric", field));
     }
-    // The parser enforces the field's input contract and cuts the query to
-    // its stored prefix.
-    assert(fieldType.storedDims() == 0 || (int32_t)queryVec.size() == fieldType.storedDims());
+    if (queryCount > 1 && (!fieldType.maxSim() || groups != nullptr)) {
+      throw std::runtime_error(std::format(
+          "KnnQuery: several query vectors need a maxsim field and unit docs (field '{}')", field));
+    }
+    // The parser enforces the field's input contract and cuts each query
+    // vector to its stored prefix.
+    assert(fieldType.storedDims() == 0
+           || (int32_t)queryVec.size() == fieldType.storedDims() * queryCount);
     assert(std::ranges::all_of(queryVec, [](float x) { return std::isfinite(x); }));
   }
 
@@ -252,6 +267,10 @@ public:
   // broke and deepen rounds silently regressed to re-returning the pool.
   static inline std::atomic<int64_t> staleHitsForTests{0};
   static inline std::atomic<int64_t> prepareCallsForTests{0};
+
+  // Most late-interaction query vectors one KnnQuery takes (ColBERT queries
+  // are 32 tokens; ColPali's are a few dozen).
+  static constexpr size_t MAX_QUERY_VECTORS = 1024;
 
   /// Resolves a segment-local value rank to its owning docId.  Exactly one mode is
   /// active per segment:
@@ -427,10 +446,10 @@ public:
            std::span<const float> queryVec, int32_t k,
            int32_t nprobe = 0, int32_t refineCandidates = 0,
            float minScanFraction = 0.0f, bool exact = false,
-           const CollapsePlan* groups = nullptr,
+           const CollapsePlan* groups = nullptr, int32_t queryCount = 1,
            std::optional<float> similarity = std::nullopt)
     : Query(QueryKind::KNN), field(field), fieldType(fieldType),
-      queryVec(queryVec), k(k),
+      queryVec(queryVec), queryCount(queryCount), k(k),
       nprobe(nprobe), refineCandidates(refineCandidates),
       minScanFraction(minScanFraction), exact(exact), groups(groups),
       similarity(similarity) {}
@@ -444,7 +463,7 @@ public:
         && refineCandidates == rhs.refineCandidates
         && std::bit_cast<uint32_t>(minScanFraction)
             == std::bit_cast<uint32_t>(rhs.minScanFraction)
-        && exact == rhs.exact
+        && exact == rhs.exact && queryCount == rhs.queryCount
         && similarity.has_value() == rhs.similarity.has_value()
         && (!similarity.has_value()
             || std::bit_cast<uint32_t>(*similarity)
@@ -468,6 +487,7 @@ public:
     value = mixHash(value, refineCandidates);
     value = mixHash(value, std::bit_cast<uint32_t>(minScanFraction));
     value = mixHash(value, exact);
+    value = mixHash(value, queryCount);
     value = mixHash(value, groups != nullptr);
     if (groups != nullptr) {
       value = mixHash(value, (int32_t)groups->missing);
@@ -493,7 +513,10 @@ public:
 
   std::string_view getField() const noexcept { return field; }
   const VectorFieldType& getFieldType() const noexcept { return fieldType; }
+  /// All query vectors, packed: getQueryCount() vectors of getQueryDims().
   std::span<const float> getQueryVec() const noexcept { return queryVec; }
+  int32_t getQueryCount() const noexcept { return queryCount; }
+  int32_t getQueryDims() const noexcept { return (int32_t)queryVec.size() / queryCount; }
   int32_t getK() const noexcept { return k; }
   int32_t getNProbe() const noexcept { return nprobe; }
   int32_t getRefineCandidates() const noexcept { return refineCandidates; }
@@ -531,6 +554,7 @@ public:
     out.appendKind(kind);
     unused(ctx);
     out.appendString(field);
+    out.appendInt32(queryCount);
     out.appendSize(queryVec.size());
     for (float value : queryVec) out.appendFloat(value);
     out.appendInt32(k);
@@ -685,7 +709,134 @@ public:
 
   public:
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+      if (query.queryCount > 1) return prepareMaxSim(ctx);
       return query.groups ? prepareUnit<true>(ctx) : prepareUnit<false>(ctx);
+    }
+
+    /// Late interaction: every eligible document of every segment scores
+    /// sum over query vectors of its best row's similarity (see the class
+    /// comment).  Segments run as parallel tasks into one bounded top-k;
+    /// betterDoc is a strict total order and each document's score depends
+    /// only on its own rows, so parallel == serial.
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareMaxSim(Query::Weight::PrepareContext& ctx) {
+      prepareCallsForTests.fetch_add(1, std::memory_order_relaxed);
+      IndexReader& reader = ctx.reader;
+      auto segInfos = reader.field(query.getField());
+      size_t numSegs = reader.segments().size();
+      int32_t dims = query.getQueryDims();
+      int32_t queryCount = query.getQueryCount();
+      int32_t metric = (int32_t)query.getFieldType().metric();
+      bool normalizeColumn = query.getFieldType().metric() == VectorFieldType::METRIC_COSINE
+          && !query.getFieldType().normalized() && !query.getFieldType().normalizeOnWrite();
+      std::vector<float> queries(query.getQueryVec().begin(), query.getQueryVec().end());
+      if (metric == (int32_t)luxir::api::VectorMetric::COSINE) {
+        faiss::fvec_renorm_L2((size_t)dims, (size_t)queryCount, queries.data());
+      }
+      int64_t kDocs = query.getK();
+
+      AtomicMerger<RescoreAccumulator<false>> merger(
+        [kDocs]() { return new RescoreAccumulator<false>(kDocs, nullptr); },
+        [](RescoreAccumulator<false>* acc) { delete acc; });
+      auto scanSegment = [&](size_t segOrd) {
+        const SegFieldInfo* info = segInfos.at(segOrd);
+        IndexReader::Segment& seg = reader.segments()[segOrd];
+        VectorReader vr(seg.postingsReader(), *info);
+        int64_t numVals = vr.numVectors();
+        if (numVals == 0) return;
+        if (vr.dims() != dims) {
+          throw std::runtime_error(std::format(
+            "KnnQuery: query vector dims {} do not match segment dims {} for field '{}'",
+            dims, vr.dims(), query.getField()));
+        }
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        SegV2D v2d;
+        std::optional<MonoReader> mono;
+        if (vr.isMultiValued()) {
+          MonoReader* mr = vr.strColReader().getValDocReader();
+          if (mr == nullptr) {
+            throw std::runtime_error(std::format(
+              "KnnQuery: multi-valued vector field '{}' is missing its valueRank->docId map",
+              query.getField()));
+          }
+          mono.emplace(*mr);
+          v2d.mono = &*mono;
+        } else if (vr.strColReader().docsReader().hasBitset()) {
+          v2d.sel = makeValueDocSelector(poolGuard.pool(), vr.strColReader().docsReader().bitset());
+        }
+        DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segOrd];
+        std::vector<VectorScorer> scorers;
+        scorers.reserve((size_t)queryCount);
+        for (int32_t q = 0; q < queryCount; q++) {
+          scorers.emplace_back(queries.data() + (size_t)q * (size_t)dims, dims, metric,
+                               normalizeColumn, vr.encoding(), vr.hasNorms());
+        }
+        const char* rowsBase = vr.rowsBase();
+        int64_t rowStride = vr.valueBytes();
+        std::vector<const char*> rows;
+        std::vector<float> scores;
+        std::unique_ptr<RescoreAccumulator<false>> acc(merger.obtain());
+        // Value ranks are doc-ordered, so a document's rows are one run.
+        for (int64_t begin = 0; begin < numVals;) {
+          int32_t docId = v2d.resolve(begin);
+          int64_t end = begin + 1;
+          while (end < numVals && v2d.resolve(end) == docId) end++;
+          if (domain == nullptr || domain->get(docId)) {
+            rows.resize((size_t)(end - begin));
+            scores.resize(rows.size());
+            for (int64_t r = begin; r < end; r++) rows[(size_t)(r - begin)] = rowsBase + r * rowStride;
+            double total = 0.0;
+            for (const VectorScorer& scorer : scorers) {
+              scorer.scoreRows(rows.data(), rows.size(), scores.data());
+              total += (double)*std::max_element(scores.begin(), scores.end());
+            }
+            acc->heap.offer(DocHit{(int32_t)segOrd, docId, finiteScore((float)total)});
+          }
+          begin = end;
+        }
+        merger.release(acc.release());
+      };
+
+      std::vector<size_t> segs;
+      for (size_t i = 0; i < numSegs; i++) {
+        if (segInfos.at(i) != nullptr) segs.push_back(i);
+      }
+      if (!ctx.parallel || segs.size() < 2) {
+        for (size_t i : segs) scanSegment(i);
+      } else {
+        TaskGroupRunner runner;
+        task_group_fanout(runner.group(), segs.size(), [&](size_t i) {
+          return [&scanSegment, seg = segs[i]]() { scanSegment(seg); };
+        });
+        runner.join();
+      }
+
+      std::vector<DocHit> docHits = merger.getData()->heap.take();
+      return preparedFromDocHits(docHits, numSegs);
+    }
+
+    /// Boost, then the per-segment hit arrays sorted by docId.  Boost is
+    /// applied only after the raw-similarity top-k cut, so it can change
+    /// scores (including zeroing them) but never the retained docs.
+    std::unique_ptr<KnnPreparedWeight> preparedFromDocHits(std::vector<DocHit>& docHits, size_t numSegs) {
+      if (boost != 1.0f) {
+        for (auto& hit : docHits) hit.score *= boost;
+      }
+      std::sort(docHits.begin(), docHits.end(), [](const DocHit& a, const DocHit& b) {
+        return (a.segOrd == b.segOrd) ? (a.docId < b.docId) : (a.segOrd < b.segOrd);
+      });
+      std::vector<std::vector<Hit>> perSegHits(numSegs);
+      for (size_t r = 0; r < docHits.size();) {
+        int32_t ord = docHits[r].segOrd;
+        size_t j = r + 1;
+        while (j < docHits.size() && docHits[j].segOrd == ord) j++;
+        auto& out = perSegHits[(size_t)ord];
+        out.reserve(j - r);
+        for (size_t i = r; i < j; i++) {
+          out.push_back({docHits[i].docId, docHits[i].score});
+        }
+        r = j;
+      }
+      return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
     }
 
     template <bool Groups>
@@ -699,7 +850,6 @@ public:
             "knn_group_underfill", std::format("field '{}': returned 0 of k={} groups; candidates_exhausted=true", query.field, query.k));
         return std::make_unique<KnnPreparedWeight>(std::vector<std::vector<Hit>>(numSegs));
       };
-      std::vector<std::vector<Hit>> perSegHits(numSegs);
 
       // prepare() runs in the parallel phase, possibly deep in a work-stealing
       // stack; use the thread-local pool (inline buffer in TLS, not on this
@@ -1246,34 +1396,11 @@ public:
         });
       }
 
-      // Boost is applied only after the raw-similarity top-k cut, so it can
-      // change scores (including zeroing them) but never the retained docs.
-      if (boost != 1.0f) {
-        for (auto& hit : docHits) hit.score *= boost;
-      }
-
       if ((int64_t)docHits.size() < kDocs && cap < ntotal) {
         LOG_DEBUG("KnnQuery: {} of k={} docs for field '{}' at candidate cap {}",
                   docHits.size(), kDocs, query.getField(), cap);
       }
-
-      // Materialize the per-segment hit arrays, sorted by docId.
-      std::sort(docHits.begin(), docHits.end(), [](const DocHit& a, const DocHit& b) {
-        return (a.segOrd == b.segOrd) ? (a.docId < b.docId) : (a.segOrd < b.segOrd);
-      });
-      for (size_t r = 0; r < docHits.size();) {
-        int32_t ord = docHits[r].segOrd;
-        size_t j = r + 1;
-        while (j < docHits.size() && docHits[j].segOrd == ord) j++;
-        auto& out = perSegHits[(size_t)ord];
-        out.reserve(j - r);
-        for (size_t i = r; i < j; i++) {
-          out.push_back({docHits[i].docId, docHits[i].score});
-        }
-        r = j;
-      }
-
-      return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
+      return preparedFromDocHits(docHits, numSegs);
     }
 
     Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) override {

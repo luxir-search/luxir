@@ -155,6 +155,7 @@ When omitted, the first vector in each segment establishes the dimension.
 A multi-valued vector field (`multi: true`, or the `_vs` suffix) holds many
 vectors per document, such as one per passage or chunk. Search collapses them
 to one hit per document, scored by that document's best vector.
+For token-level embeddings, see [Late interaction](#late-interaction-maxsim).
 
 An optional `ann` object chooses how [approximate indexes](#index-settings)
 for the field are built; the defaults suit most embedding models.
@@ -258,6 +259,69 @@ popcount; commits build no approximate index for `hamming` fields, and a
 `hamming` requires `bit`. Changing a field between `bit` and another
 encoding needs a reindex: older segments cannot be scored under the new
 metric.
+
+### Late interaction (MaxSim)
+
+Late-interaction models (ColBERT, ColPali) embed every token of a document
+and of the query, and score a document by MaxSim: for each query vector, the
+similarity of the document's closest vector, summed over the query vectors.
+Store the document's token vectors in a multi-valued field with
+`multi_vector_scoring: "maxsim"`:
+
+```json
+{
+  "fields": {
+    "tokens_vs": {
+      "type": "vector",
+      "dims": 128,
+      "metric": "ip",
+      "multi": true,
+      "multi_vector_scoring": "maxsim"
+    }
+  }
+}
+```
+
+and search it with `queries`, the query's token vectors, in place of
+`query`:
+
+```json
+{
+  "query": {
+    "knn": {
+      "field": "tokens_vs",
+      "queries": [[0.12, -0.03], [0.08, 0.41], [-0.27, 0.05]],
+      "k": 10
+    }
+  }
+}
+```
+
+(`dims` is shortened in the example.) A document's score is
+`sum over q in queries of max over its vectors d of similarity(q, d)` under the
+field's metric, so with `ip` or `cosine` it grows with the number of query
+vectors. One vector in `query` (or `queries`) is the ordinary best-vector
+score.
+
+MaxSim has no approximate index: commits build no overlay for a `maxsim`
+field, and every eligible document is scored exactly, reading all of its
+vectors once per query vector (with the SIMD kernels of its `encoding`). That
+suits small collections, and rescoring a candidate set: put the candidate
+query in `filter` (filters apply inside the search) and the MaxSim query
+ranks only those documents.
+
+```json
+{
+  "query": {"knn": {"field": "tokens_vs", "queries": [[0.12, -0.03], [0.08, 0.41]], "k": 10}},
+  "filter": ["title_t:dune"]
+}
+```
+
+`queries` takes up to 1024 vectors of the field's `dims` (or `truncate_dims`). It ignores
+`exact`, `refine_candidates` and `ivf`, does not support `unit: "groups"`
+or `similarity`, and is rejected on fields without
+`multi_vector_scoring: "maxsim"`, whose default is `max`. A `maxsim` field
+builds no overlay, so its `ann` settings have no effect.
 
 ### Truncate Matryoshka embeddings
 
@@ -870,7 +934,8 @@ every index type.
 | Field | Meaning |
 |---|---|
 | `field` | Vector field. Required. |
-| `query` | Query vector with `dims` components, or `truncate_dims` when set. Required. |
+| `query` | Query vector with `dims` components, or `truncate_dims` when set. Required unless `queries` is set. |
+| `queries` | Late-interaction query vectors for a `maxsim` field (see [Late interaction](#late-interaction-maxsim)). |
 | `k` | Nearest documents or groups the query node produces. Required, positive. |
 | `unit` | `docs` (default) or `groups`; groups requires an enclosing collapse. |
 | `exact` | Require the true top-k over the stored vectors (exact over the field's `encoding`). Scans the column and ignores overlays and the knobs below. |

@@ -710,6 +710,8 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.encoding, ctx, vit, vend);
           } else if (key == "keep_original") {
             util::from_json<V>(value.keep_original, ctx, vit, vend);
+          } else if (key == "multi_vector_scoring") {
+            util::from_json<V>(value.multi_vector_scoring, ctx, vit, vend);
           } else if (key == "ann") {
             util::from_json<V>(value.ann, ctx, vit, vend);
           } else {
