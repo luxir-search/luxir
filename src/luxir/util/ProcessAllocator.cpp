@@ -294,8 +294,7 @@ AllocatorArena& indexingArena() {
 }
 
 AllocatorArena& bigBufferArena() {
-  static auto* arena = new AllocatorArena("big-buffers",
-      {.hugePages = true, .wholeHugePagePurge = true, .dirtyDecayMs = 5000});
+  static auto* arena = new AllocatorArena("big-buffers", bigBufferArenaOptions);
   return *arena;
 }
 

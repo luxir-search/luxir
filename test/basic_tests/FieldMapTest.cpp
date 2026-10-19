@@ -130,6 +130,33 @@ TEST_F(FieldMapTest, postMappingCollisionLastWins) {
 }
 
 
+TEST_F(FieldMapTest, repeatedKeyLastWinsInEachDoc) {
+  CollectionHelper helper("main");
+
+  // A repeated key takes its last value, so a single-valued field sees one value.
+  // The second doc repeats keys at positions shifted from the first's.
+  std::vector<Doc> docs = {
+    flatdoc("id", "a1", "n_i", (int64_t)1, "text_w", "first", "n_i", (int64_t)2,
+            "text_w", "second"),
+    flatdoc("text_w", "third", "n_i", (int64_t)3, "id", "a2", "n_i", (int64_t)4),
+  };
+  auto result = submitDocs(helper, docs, {});
+  ASSERT_EQ(ResponseStatus::OK, result.status);
+  EXPECT_EQ(0u, matchDocs(helper, "first").size());
+  EXPECT_EQ(1u, matchDocs(helper, "second").size());
+  EXPECT_EQ(1u, matchDocs(helper, "third").size());
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "n_i"}).limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto found = req->getDocs();
+  ASSERT_EQ(2u, found.size());
+  EXPECT_CONTAINS_DOC(found, flatdoc("id", "a1", "n_i", (int64_t)2));
+  EXPECT_CONTAINS_DOC(found, flatdoc("id", "a2", "n_i", (int64_t)4));
+}
+
+
 TEST_F(FieldMapTest, unmappedUnresolvableKeyStillErrors) {
   CollectionHelper helper("main");
 

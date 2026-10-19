@@ -12,6 +12,8 @@
 #include "luxir/query/Query.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/util/ExecutionBudget.h"
+#include "luxir/search/Collapse.h"
+#include "luxir/search/Diversify.h"
 
 namespace luxir {
 
@@ -50,16 +52,28 @@ public:
 
 
 
-class TopDocsCollector {
+struct NoCollapseAdmission {};
+
+template <bool Collapsed = false, typename Admission = CollapseAdmission>
+class ScoreCollector {
   public:
+  static constexpr bool isCollapsed = Collapsed;
 
   // Having this packed helped both memory and CPU (presumably better cache hits?)
   LUXIR_UNALIGNED_START
-  struct ScoreDoc {
+  struct DocScore {
     float score;
     segdoc doc;
   } LUXIR_UNALIGNED_END;
+  struct GroupScore {
+    float score;
+    segdoc doc;
+    size_t slot;
+  };
+  using ScoreDoc = std::conditional_t<Collapsed, GroupScore, DocScore>;
 
+  [[no_unique_address]] std::conditional_t<Collapsed,
+      std::unique_ptr<Admission>, NoCollapseAdmission> groups;
 
   int64_t hitCount = 0;
 
@@ -80,47 +94,80 @@ class TopDocsCollector {
   // The storage expands on demand: topCount bounds the heap but is not allocated up
   // front, which matters for deep or unbounded limits (limit=-1 maps to maxDoc) and for
   // the per-slice collectors that never see topCount hits.
-  ExpandingPQ<ScoreDoc, decltype(scoreAndDocComp)> pq;
+  using Comparator = decltype(scoreAndDocComp);
+  ExpandingPQ<ScoreDoc, Comparator, Collapsed> pq;
 
-  TopDocsCollector(int64_t topCount)
-      : topCount(topCount), pq((size_t)std::max(topCount, (int64_t)0)) {
+  ScoreCollector(int64_t topCount, const typename Admission::Plan* collapse = nullptr)
+      : topCount(topCount), pq((size_t)std::max(topCount, (int64_t)0), scoreAndDocComp) {
+    if constexpr (Collapsed) groups = std::make_unique<Admission>(*collapse);
+    else unused(collapse);
     // topCount == 0 is valid ("count/aggregate only, no docs", e.g. limit 0): the heap is
     // empty and collect() only counts.  Negative counts are a bug in the caller.
     assert(topCount >= 0);
   }
 
   void collect(int32_t segment, int32_t docid, float score) {
-    hitCount++;
+    if constexpr (Collapsed) {
+      // A doc losing to (bottom score, bottom doc) cannot enter as a new
+      // group or improve a retained group: its head is already at or above
+      // that floor, and at an equal score is the earlier doc. This uses the
+      // floor's segdoc, independent of traversal order, just as document top-k.
+      if (!groups->plan.getNumber && (topCount == 0 || losesToFloor(segment, docid, score))) return;
+      const auto* key = groups->read(segment, docid);
+      if (key == nullptr) return;
+      hitCount++;
+      groups->count(*key);
+      offer(*key, segdoc(segment, docid), score);
+    } else {
+      hitCount++;
 
-    // topCount == 0: keep no docs, just count hits (the heap has zero capacity, so any
-    // insert/top() would be out of bounds).  hitCount above still yields an accurate
-    // total, so get_number and sub-op domains are unaffected.
-    if (topCount == 0) {
-      return;
-    }
+      // topCount == 0: keep no docs, just count hits (the heap has zero capacity, so any
+      // insert/top() would be out of bounds).  hitCount above still yields an accurate
+      // total, so get_number and sub-op domains are unaffected.
+      if (topCount == 0) {
+        return;
+      }
 
-    // Admit anything that can match OR beat the k-th best score (>=, not >): a doc whose
-    // score ties the k-th score is still competitive if its (seg, docid) sorts ahead of the
-    // current worst tied doc.  insertWithOverflow resolves that via the (score, then doc)
-    // heap comparator, so a losing tie is a cheap no-op insert and a winning tie evicts the
-    // worst.  This is what makes the kept top-K order-independent (collection, merge, slice).
-    if (score >= minCompetitiveVal) {
-      pq.insertWithOverflow({score, segdoc(segment, docid)});
-      // Once the heap holds topCount docs, its root (a min-heap on score) is the k-th best
-      // so far - the competitive threshold a later doc must beat to enter.  Publish it as
-      // soon as the heap fills, not only when a doc evicts one: best-docs-first / index-
-      // sorted / clustered input never evicts, so the old "update on overflow only" left the
-      // threshold at lowest() forever and defeated impact pruning exactly when it helps most.
-      if (pq.size() >= topCount) {
-        minCompetitiveVal = pq.top().score;
+      // Admit anything that can match OR beat the k-th best score (>=, not >): a doc whose
+      // score ties the k-th score is still competitive if its (seg, docid) sorts ahead of the
+      // current worst tied doc.  insertWithOverflow resolves that via the (score, then doc)
+      // heap comparator, so a losing tie is a cheap no-op insert and a winning tie evicts the
+      // worst.  This is what makes the kept top-K order-independent (collection, merge, slice).
+      if (score >= minCompetitiveVal) {
+        pq.insertWithOverflow({score, segdoc(segment, docid)});
+        // Once the heap holds topCount docs, its root (a min-heap on score) is the k-th best
+        // so far - the competitive threshold a later doc must beat to enter.  Publish it as
+        // soon as the heap fills, not only when a doc evicts one: best-docs-first / index-
+        // sorted / clustered input never evicts, so the old "update on overflow only" left the
+        // threshold at lowest() forever and defeated impact pruning exactly when it helps most.
+        if (pq.size() >= topCount) {
+          minCompetitiveVal = pq.top().score;
+        }
       }
     }
   }
 
-  // The heap floor stays inclusive because an equal-scoring doc with a
-  // smaller total-order key can replace its root. For a monotone segment
-  // stream, once its next key is past the root, equal scores cannot enter and
-  // the scorer may use the next representable float as an exclusive floor.
+  bool losesToFloor(int32_t segment, int32_t docid, float score) const requires Collapsed {
+    if (pq.size() < (size_t)topCount) return false;
+    const ScoreDoc& floor = pq.top();
+    return score < floor.score || (score == floor.score && segdoc(segment, docid) > floor.doc);
+  }
+
+  void setSegment(int32_t segment, int64_t sourceCost = -1) requires Collapsed {
+    groups->setSegment(segment, topCount, sourceCost);
+  }
+
+  void offer(const CollapseKey& key, segdoc doc, float score) requires Collapsed {
+    if (topCount == 0 || score < minCompetitiveVal) return;
+    ScoreDoc candidate{score, doc, 0};
+    groups->admit(key, pq, candidate,
+        [&](const ScoreDoc& head) { return scoreAndDocComp(candidate, head); },
+        [](size_t, bool) {});
+    if (pq.size() == (size_t)topCount) minCompetitiveVal = pq.top().score;
+  }
+
+  // A later segdoc loses an equal score, even under collapse. Publish the
+  // next float only for that stream; sibling streams retain an inclusive floor.
   float minCompetitiveScoreForNextDoc(int32_t segment, int32_t docid) const {
     if (topCount == 0 || pq.size() < topCount) {
       return std::numeric_limits<float>::lowest();
@@ -133,6 +180,7 @@ class TopDocsCollector {
   }
 
   int64_t totalHits() const {
+    if constexpr (Admission::isDiversified) return groups->totalDocuments();
     return hitCount;
   }
 
@@ -141,20 +189,31 @@ class TopDocsCollector {
   }
 
   // merge other into this.
-  void merge(TopDocsCollector& other) {
+  void merge(ScoreCollector& other) {
     // Self-merge would iterate a span that collect() can reallocate out from under us.
     assert(this != &other);
     // In some scenarios, popping the top of the other heap until it's no longer competitive will be faster,
     // while in other scenarios just a linear scan of the other heap will be faster.
     // We'll just do a linear scan for now.
-    auto newHitCount = hitCount + other.hitCount;
-    std::span<ScoreDoc> otherDocs = other.pq.span();
-    // Since min-heap has smallest element at position 0, it should be more efficient to start from the other end.
-    // Future possible optimization: if we do a whole level of a min-tree without any insertions, we could stop early.
-    for (int64_t i = (int64_t)otherDocs.size() - 1; i >= 0; i--) {
-      collect(otherDocs[i].doc.segment(), otherDocs[i].doc.docId(), otherDocs[i].score);
+    if constexpr (Collapsed) {
+      hitCount += other.hitCount;
+      groups->mergeCounts(*other.groups);
+      groups->finishSegment();
+      // Local top-L groups suffice globally: an omitted group has L local
+      // groups ahead of its best local witness, hence L global groups ahead.
+      for (const auto& member : other.pq.span()) {
+        offer(other.groups->keyAt((size_t)member.slot), member.doc, member.score);
+      }
+    } else {
+      auto newHitCount = hitCount + other.hitCount;
+      std::span<ScoreDoc> otherDocs = other.pq.span();
+      // Since min-heap has smallest element at position 0, it should be more efficient to start from the other end.
+      // Future possible optimization: if we do a whole level of a min-tree without any insertions, we could stop early.
+      for (int64_t i = (int64_t)otherDocs.size() - 1; i >= 0; i--) {
+        collect(otherDocs[i].doc.segment(), otherDocs[i].doc.docId(), otherDocs[i].score);
+      }
+      hitCount = newHitCount;
     }
-    hitCount = newHitCount;
   }
 
   // Since we use min-heap comparators in our priority queues, the list will be reverse-sorted (smallest last)
@@ -172,6 +231,9 @@ class TopDocsCollector {
   }
 };
 
+
+using TopDocsCollector = ScoreCollector<false>;
+using GroupScoreCollector = ScoreCollector<true>;
 
 // A different way to get top-k results: Collect results in an array until we have 2k of them.
 // The find the median (kth value), and drop all values less than the median. Repeat collection more results.
@@ -677,11 +739,20 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
 }
 
 inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
-                                     DocSet* filter, TopDocsCollector& collector,
+                                     DocSet* filter, auto& collector,
                                      int64_t topCount) {
   assert(scorer != nullptr);
   assert(topCount > 0);
   int64_t collected = 0;
+  auto complete = [&](int32_t doc) {
+    if constexpr (std::remove_cvref_t<decltype(collector)>::isCollapsed) {
+      // This pull is in doc order with one constant score. Stop only once
+      // L distinct groups are held and this stream has reached their floor's
+      // segdoc. An earlier segment must still improve later tied heads.
+      return collector.size() == topCount
+          && segdoc(segnum, doc) >= collector.pq.top().doc;
+    } else { unused(doc); return collected >= topCount; }
+  };
   auto collectOne = [&](int32_t doc) {
     collector.collect(segnum, doc, scorer->score());
     collected++;
@@ -690,7 +761,7 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
   if (filter == nullptr || filter->type == DocSet::BITSET) {
     BitDocSet* bitDocs = (BitDocSet*) filter;
     auto* domainBits = bitDocs == nullptr ? nullptr : &bitDocs->bits();
-    while (collected < topCount) {
+    while (!complete(0)) {
       int32_t doc = scorer->next();
       if (doc == PostingsReader::END) {
         break;
@@ -699,6 +770,7 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
         continue;
       }
       collectOne(doc);
+      if (complete(doc)) break;
     }
   } else {
     for (int32_t doc : ((ArrDocSet*) filter)->docs()) {
@@ -709,17 +781,20 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
         continue;
       }
       collectOne(doc);
-      if (collected >= topCount) {
+      if (complete(doc)) {
         break;
       }
     }
+  }
+  if constexpr (std::remove_cvref_t<decltype(collector)>::isCollapsed) {
+    if (SkipStats::enabled) SkipStats::collapseDocsVisited += collected;
   }
   return collected;
 }
 
 inline void collectConstantTopKAndDomain(
     int32_t segnum, Query::Scorer* scorer, DocSet* filter,
-    DocSetBuilder& builder, TopDocsCollector& collector) {
+    DocSetBuilder& builder, auto& collector) {
   assert(scorer != nullptr);
   assert(collector.topCount > 0);
   skipCount(SkipStats::constantPullDomainCollections);
@@ -789,7 +864,7 @@ inline int64_t countMatchesWindowed(BulkScorer* bulk, DocSet* filter,
 
 inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
                                  DocSetBuilder* builder,
-                                 TopDocsCollector& collector, int32_t maxDoc) {
+                                 auto& collector, int32_t maxDoc) {
   assert(bulk != nullptr);
   assert(collector.topCount == 0);
   collector.hitCount += countMatchesWindowed(bulk, filter, builder, maxDoc);
@@ -809,7 +884,7 @@ enum class ConstantScoreDrain : uint8_t {
 // scores match what a pull scorer from the same weight returns.
 inline void collectFirstKConstantWindowed(
     int32_t segnum, BulkScorer* bulk, DocSet* filter, DocSetBuilder* builder,
-    TopDocsCollector& collector, int32_t maxDoc,
+    auto& collector, int32_t maxDoc,
     ConstantScoreDrain drain) {
   assert(bulk != nullptr);
   assert(collector.topCount > 0);

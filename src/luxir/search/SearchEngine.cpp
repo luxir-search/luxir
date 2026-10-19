@@ -66,8 +66,11 @@ static void attachWarnings(SearchRequest& req) {
   }
 }
 
+Metrics& SearchEngine::metrics() const { return *node.metrics; }
+
 void SearchEngine::submitBody(SearchRequest& req) {
-  // Window loops reach the budget through the thread; task_group_run carries
+  MetricScope execution(*node.metrics, metricActivity(MetricStage::SEARCH_EXECUTION));
+  // Window loops reach the budget through the thread; task_group_fanout carries
   // it into the tasks this body spawns.
   ExecutionBudget::Scope budgetScope(&req.budget);
   // Until the calculators start, an unclassified failure is the request's
@@ -94,10 +97,10 @@ void SearchEngine::submitBody(SearchRequest& req) {
       LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
     }
   } catch (std::exception& e) {
-    // Drain any in-flight tasks so they aren't writing into the response while
-    // we tear down.  wait() rethrows the first exception, so swallow it here.
+    // Cancel and drain in-flight tasks before tearing down their response.
+    // Swallow any parked task exception so the original error is preserved.
     if (req.tg) {
-      // TODO: notify other tasks about the error?
+      req.tg->cancel();
       try { req.tg->wait(); } catch (...) {}
     }
     ErrorInfo info = classifyException(e, fallback);
@@ -123,6 +126,7 @@ void SearchEngine::submitBody(SearchRequest& req) {
   // Send back the final response - or, if a flow-controlled emitter is still
   // paused with batches to produce, hand off: the last stream to end sends it.
   // Do not access req after this point as it may be asynchronously deleted.
+  execution.finish();
   req.bodyDone();
 }
 
@@ -151,6 +155,9 @@ void SearchEngine::armBudget(SearchRequest& req) {
 }
 
 void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel) {
+  req.counting = true;
+  req.submitted = std::chrono::steady_clock::now();
+  metrics().start(metricActivity(MetricStage::SEARCH));
   // The deadline runs from receipt: a min_commit wait and time in the
   // admission queue count against it.
   armBudget(req);
@@ -292,6 +299,7 @@ void SearchEngine::getResources(SearchRequest& req) {
   auto& request = req.proto;
   auto& node = req.engine.node;
   auto collection = req.floorCollection ? req.floorCollection : node.getCollection(LuxirNode::target(req.tenant, request.collection));
+  req.collectionMetrics = collection->sharedMetrics();
 
   // get the index reader
   // The API freshness tolerance is milliseconds; the reader clock domain is

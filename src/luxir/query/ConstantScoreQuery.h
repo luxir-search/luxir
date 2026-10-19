@@ -198,6 +198,10 @@ public:
     : Query(QueryKind::CONSTANT_SCORE), child(child),
       constantScore(constantScore) {}
 
+  bool recoverableAsPredicate() const noexcept override {
+    return child->recoverableAsPredicate();
+  }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const ConstantScoreQuery&>(other);
     return std::bit_cast<uint32_t>(constantScore)
@@ -234,10 +238,7 @@ public:
     return child->appendFilterKey(out, ctx);
   }
   Weight* createWeight(Context& context, int32_t flags,
-                       float multiplier = 1.0f) override {
-    return context.pool.make<ConstantScoreQuery::Weight>(context, *this, flags,
-                                                         multiplier);
-  }
+                       float multiplier = 1.0f) override;
 
   class Weight final : public Query::Weight {
     Query::Weight* childWeight = nullptr;
@@ -270,6 +271,10 @@ public:
 
       void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
         child.releaseSegmentState(segment);
+      }
+
+      size_t retainedBytes() const noexcept override {
+        return sizeof(*this) + (child.prepared ? child.prepared->retainedBytes() : 0);
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {
@@ -324,9 +329,9 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    std::optional<int64_t> constantCount(
+    CountShortcut countShortcut(
         IndexReader::Segment& segment, DocSet* domain) override {
-      return childWeight->constantCount(segment, domain);
+      return childWeight->countShortcut(segment, domain);
     }
   };
 };

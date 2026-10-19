@@ -56,6 +56,7 @@ public:
   }
 
   const SearchConfig& searchConfig() const;
+  Metrics& metrics() const;
 
   // Prepare through the ordinary parser/planner, without running calculators.
   // As a search in `tenant` would resolve it.

@@ -11,6 +11,9 @@ revision recorded as `builtin-baseline` in [deps/vcpkg.json](../../deps/vcpkg.js
 the same manifest, and the same overlay ports. Native dependencies are installed
 in `/opt/vcpkg/installed-native` and `/opt/vcpkg/installed-native-asan`.
 
+For a Linux ARM64 executable built on an x86-64 host,
+use the [ARM64 cross-build workflow](arm64-build.md).
+
 ## Development Requirements
 
 - C++26-capable GCC and matching libstdc++; the currently verified environment
@@ -19,8 +22,9 @@ in `/opt/vcpkg/installed-native` and `/opt/vcpkg/installed-native-asan`.
 - vcpkg (toolchain files expected at `/opt/vcpkg/`)
 - Host tools: pkg-config, Python 3, curl, zip, unzip, and tar
 - Dependencies: Protobuf, gRPC, Intel TBB, Boost, xxHash, spdlog, CLI11,
-  LZ4, FAISS, glaze, GTL, jemalloc, GoogleTest, and Google Benchmark. The
-  compiler supplies OpenMP; FastPFOR is fetched and uni-algo is vendored
+  LZ4, Zstandard, FAISS, glaze, GTL, jemalloc, GoogleTest, and Google
+  Benchmark. The compiler supplies OpenMP; FastPFOR is fetched and uni-algo is
+  vendored
 
 The build uses `-march=native`; a release binary is intended for the machine
 class on which its dependencies and Luxir itself were built.
@@ -131,7 +135,8 @@ ASan build trees too, reapplying local CMake options. This clears cached paths
 to the old host tools. The disk-space saving occurs during this migration.
 
 The project uses CMake (Ninja generator) with vcpkg. ccache, a fast linker
-(mold), and a precompiled header are used when available. Each preset builds
+(mold 2.31.0 or newer, else lld or gold), and a precompiled header are used
+when available. Each preset builds
 into `build/<preset-name>/`, with binaries in `build/<preset-name>/bin/`.
 
 The presets are GCC-only. Clang presets existed but were never usable: FAISS and
@@ -172,6 +177,10 @@ Before committing memory-sensitive work, run the ASan build:
 
 The ASan presets use the instrumented dependencies in
 `/opt/vcpkg/installed-native-asan`, built by the same setup script.
+`gcc-debug-asan` compiles Luxir with `-g1`: backtraces keep functions, inlined
+frames, and line numbers, but a debugger cannot show local variables. To
+inspect locals under ASan, configure with
+`-DCMAKE_CXX_FLAGS_DEBUG="-g -Og -ftrivial-auto-var-init=pattern"`.
 
 ```bash
 cmake --preset gcc-debug-asan
@@ -199,8 +208,12 @@ The negative filter excludes the slow vector families. For a quick path/code
 coverage pass over the small unit-test corpus, use:
 
 ```bash
-./build/gcc-debug/bin/luxir_test --gtest_filter='Benchmarks.all'
+./build/gcc-release/bin/luxir_test --gtest_filter='Benchmarks.all'
 ```
+
+Debug builds, including ASan, leave the benchmarks out of `luxir_test` to keep
+the edit-build-test loop short. Configure with `-DLUXIR_TEST_BENCHMARKS=ON` to
+include them.
 
 Test runs default to `--effort=1`. Scalable fuzz loops and benchmark unit
 corpora can derive linear work with `LuxirTest::scaleTestWork()` or scale each

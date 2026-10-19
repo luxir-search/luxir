@@ -183,6 +183,42 @@ TEST(DateMathQueryBuilder, usesOneExplicitNowAndRoundingWindow) {
   EXPECT_EQ(*parseDateToEpochMillis("2024-06-25T23:59:59.999Z"), range->getHi());
 }
 
+// NOW math with no rounding coarser than a millisecond moves with every
+// request, so its range is request-stable; the bounds stay exact.
+TEST(DateMathQueryBuilder, unroundedNowRangesAreRequestStable) {
+  auto schema = Schema::createDefaultSchema();
+  MemPool pool;
+  int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
+  QueryBuilder builder(pool, *schema, CoerceContext{now, TimeZone::utc()});
+  auto build = [&](std::string_view lower, std::string_view upper) {
+    api::Val lo, hi;
+    lo.kind = lower;
+    hi.kind = upper;
+    return dynamic_cast<NumericPredicateQuery*>(
+        builder.createRangeQuery("when_dt", &lo, nullptr, &hi, nullptr));
+  };
+  auto expectScope = [&](FilterKeyScope expected, std::string_view lower,
+                         std::string_view upper) {
+    auto* range = build(lower, upper);
+    ASSERT_NE(nullptr, range);
+    FilterKeyBuilder out;
+    EXPECT_EQ(expected, range->appendFilterKey(out, FilterKeyContext{}));
+  };
+  expectScope(FilterKeyScope::REQUEST_STABLE, "now-1h", "now");
+  expectScope(FilterKeyScope::REQUEST_STABLE, "now-1h/m", "NOW");
+  expectScope(FilterKeyScope::REQUEST_STABLE, "2024-06-01", "now+1d");
+  expectScope(FilterKeyScope::REQUEST_STABLE, "now-1h/MILLI", "now/MILLI");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "now-1h/m", "now/m");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "now-1h/m/MILLI", "now/MILLI/m");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "NOW/DAY-7DAYS", "NOW/DAY");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "2024-06-01", "2024-06-01||+1d");
+
+  auto* exact = build("now-1h", "now");
+  ASSERT_NE(nullptr, exact);
+  EXPECT_EQ(now - 3600000, exact->getLo());
+  EXPECT_EQ(now, exact->getHi());
+}
+
 TEST_F(DateFieldTest, parseRejectsInvalid) {
   EXPECT_FALSE(parseDateToEpochMillis("").has_value());
   EXPECT_FALSE(parseDateToEpochMillis("not a date").has_value());

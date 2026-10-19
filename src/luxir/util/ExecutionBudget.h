@@ -19,7 +19,7 @@ namespace luxir {
 // Code that has the request in hand asks it directly (SearchRequest::
 // shouldStop).  Free-standing loops (the Collector.h window drivers) consult
 // the budget installed on the calling thread: SearchEngine installs it for the
-// request body and task_group_run carries it into spawned tasks.
+// request body and task_group_fanout carries it into spawned tasks.
 class ExecutionBudget {
 public:
   using Clock = std::chrono::steady_clock;

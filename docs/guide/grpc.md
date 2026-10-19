@@ -30,7 +30,7 @@ The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 | [`luxir.Admin/GetSchema`](../reference/protobuf.md#method-luxir.admin.getschema) | unary | Read a collection schema. |
 | [`luxir.Admin/CreateCollection`](../reference/protobuf.md#method-luxir.admin.createcollection) | unary | Create a collection, optionally with a schema. |
 | [`luxir.Admin/DeleteCollection`](../reference/protobuf.md#method-luxir.admin.deletecollection) | unary | Delete a collection and its stored data. |
-| [`luxir.Admin/Stats`](../reference/protobuf.md#method-luxir.admin.stats) | unary | Read node-wide or collection index statistics. |
+| [`luxir.Admin/Stats`](../reference/protobuf.md#method-luxir.admin.stats) | unary | Read node, tenant or collection statistics (the structured form of HTTP `_stats`). |
 
 The server also registers the standard gRPC health service and descriptor
 reflection. Luxir implements the application services through gRPC's generic
@@ -112,6 +112,17 @@ completion timing. Responses may complete out of request order.
 
 Send documents through the repeated `docs` row maps. Row maps use the field
 coercion, update, and commit semantics described in [Indexing](indexing.md).
+
+## Message size
+
+Each received message, a unary request or one message of a stream, is
+limited to `--server.grpc.max-receive-message-size`, which defaults to
+`--indexing.max-request-body` (32 MiB). A larger message is rejected before it
+is decoded: the call ends with `RESOURCE_EXHAUSTED` and a message naming both
+sizes, and nothing in it is applied. Batch documents so each `UpdateRequest`
+stays below the limit, or send many messages over `Indexer.UpdateStream`;
+there is no limit on the number of messages in a stream. See
+[Operating Luxir](operations.md#indexing-memory-and-request-limits).
 
 ## Errors
 

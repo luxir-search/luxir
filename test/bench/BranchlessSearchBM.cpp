@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <benchmark/benchmark.h>
-#include <gtest/gtest.h>
 #include <random>
 #include <vector>
 #include <map>
@@ -27,26 +26,8 @@ namespace luxir { extern bool unit_tests; }
 //   luxir_test --bench --benchmark_filter='UpperBound|ColdSparse|SparseSkip|DenseRank'
 // The findings are recorded in the project memory; the production choices they
 // justify (gallop in the SPARSE advance, branchless in select / findSeg / the
-// dense rank index) are covered by the normal Screaming/Knn tests plus the
-// always-on correctness test below.
-
-// Always-on: cheap fuzz check that the production gallop and branchless searches
-// match std::lower_bound across edge-case lengths and every key position.
-TEST(BranchlessSearchBM, gallopAndBranchlessMatchStd) {
-  auto& rng = LuxirTest::rng;  // gtest-seeded (per-test) fast RNG
-  for (size_t len : std::initializer_list<size_t>{0, 1, 2, 3, 7, 16, 100, 4096}) {
-    std::uniform_int_distribution<int> v(0, (int)len + 5);
-    std::vector<uint16_t> arr(len);
-    for (auto& x : arr) x = (uint16_t)v(rng);
-    std::sort(arr.begin(), arr.end());
-    for (int t = -1; t <= (int)len + 6; t++) {
-      uint16_t key = (uint16_t)std::max(0, t);
-      auto* expect = std::lower_bound(arr.data(), arr.data() + len, key);
-      EXPECT_EQ(gallopLowerBound(arr.data(), arr.data() + len, key), expect) << "gallop len=" << len << " key=" << key;
-      EXPECT_EQ(BranchlessIndex<uint16_t>::lowerBound(arr.data(), len, key), expect) << "branchless len=" << len << " key=" << key;
-    }
-  }
-}
+// dense rank index) are covered by the normal Screaming/Knn tests and
+// BranchlessSearchTest.
 
 namespace {
 

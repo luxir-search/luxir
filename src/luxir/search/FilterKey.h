@@ -26,8 +26,14 @@ enum class FilterKeyScope : uint8_t {
   SEGMENT_STABLE = 0,
   CORE_STABLE = 1,
   READER_STABLE = 2,
-  UNCACHEABLE = 3
+  // Keeps request-local identity and ownership without shared-cache traffic.
+  REQUEST_STABLE = 3,
+  UNCACHEABLE = 4
 };
+
+inline bool usesSharedFilterCache(FilterKeyScope scope) {
+  return scope <= FilterKeyScope::READER_STABLE;
+}
 
 inline FilterKeyScope strongestFilterKeyScope(FilterKeyScope a,
                                                FilterKeyScope b) {
@@ -37,10 +43,10 @@ inline FilterKeyScope strongestFilterKeyScope(FilterKeyScope a,
 // In-memory keys cannot outlive their process-local encoder, so tags only need
 // to be distinct within a build. Renumbering them is therefore harmless.
 enum class FilterKeyTag : uint8_t {
-  BOOLEAN_MANDATORY = 21,
-  BOOLEAN_OPTIONAL = 22,
-  BOOLEAN_PROHIBITED = 23,
-  BOOLEAN_FILTER = 24,
+  BOOLEAN_MANDATORY = 40,
+  BOOLEAN_OPTIONAL = 41,
+  BOOLEAN_PROHIBITED = 42,
+  BOOLEAN_FILTER = 43,
 };
 
 // Correctness envelope: schemaGen and timeZone always, plus coreGen for CORE_STABLE scope.

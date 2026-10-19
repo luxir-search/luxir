@@ -2,7 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <atomic>
+#include <cstdint>
+#include <functional>
 #include <optional>
+#include <utility>
 #include <pthread.h>
 #include <algorithm>
 #include <oneapi/tbb/flow_graph.h>
@@ -37,35 +41,49 @@ auto withCurrentBudget(F&& f) {
   };
 }
 
-/// enqueue/run a task in a task_group, or run it directly if the task_group is null.
-template <typename F>
-void task_group_run(oneapi::tbb::task_group* tg, F&& f) {
-  if (tg) {
-    tg->run(withCurrentBudget(std::forward<F>(f)));
-  } else {
-    std::forward<F>(f)();
+inline std::atomic<bool> countTaskSpawnsForTests{false};
+inline std::atomic<int64_t> taskSpawnsForTests{0};
+
+/// makeTask runs on the caller and may read borrowed state; its returned
+/// callable owns its captures. Publish indices 0..n-2 and run n-1 here.
+/// A null group runs every index here, in order.
+template <typename MakeTask>
+void task_group_fanout(oneapi::tbb::task_group* tg, size_t n, MakeTask&& makeTask) {
+  for (size_t i = 0; i < n; i++) {
+    if (tg && i + 1 < n) {
+      tg->run(withCurrentBudget(makeTask(i)));
+      if (countTaskSpawnsForTests.load(std::memory_order_relaxed)) {
+        taskSpawnsForTests.fetch_add(1, std::memory_order_relaxed);
+      }
+    } else {
+      makeTask(i)();
+    }
   }
 }
 
 
-/// Scope guard for a maybe-parallel fan-out over one task_group.
-/// run(spawn, f) either spawns f on the (lazily created) group or runs it
-/// inline on the calling thread.  Call join() on the success path: it waits
-/// and propagates the first task exception.  If the scope unwinds before
-/// join() - an inline body or run() itself threw - the destructor cancels
-/// the group and waits while swallowing any parked task exception, so the
-/// unwind never double-throws (a bare ~task_group rethrowing a captured task
-/// exception during active unwinding would std::terminate).
+/// Scope guard for a maybe-parallel fan-out over one (lazily created)
+/// task_group: pass group() to task_group_fanout, or run(spawn, f) to spawn f
+/// or run it inline.  Call join() on the success path: it waits and
+/// propagates the first task exception.  If the scope unwinds before join(),
+/// the destructor cancels the group and waits while swallowing any parked
+/// task exception, so the unwind never double-throws (a bare ~task_group
+/// rethrowing a captured task exception during active unwinding would
+/// std::terminate).
 class TaskGroupRunner {
   std::optional<oneapi::tbb::task_group> tg;
   bool joined = false;
 
 public:
+  oneapi::tbb::task_group* group() {
+    if (!tg) tg.emplace();
+    return &*tg;
+  }
+
   template <typename F>
   void run(bool spawn, F&& f) {
     if (spawn) {
-      if (!tg) tg.emplace();
-      tg->run(withCurrentBudget(std::forward<F>(f)));
+      group()->run(withCurrentBudget(std::forward<F>(f)));
     } else {
       std::forward<F>(f)();
     }

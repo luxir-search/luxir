@@ -58,7 +58,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   MemPool pool;
 
   ValueProgram* program = parseValue(memory, *schema, "def(x_i,7) + 2 * 1");
-  auto bound = program->bind(pool, segment);
+  auto bound = program->bind(pool, segment, program->resolveFields(pool, *reader));
   std::array<int64_t, 3> expected{BIG + 2, 9, -3};
   for (int32_t doc = 0; doc < 3; doc++) {
     ValueResult result = bound->evalPoint(doc, 0.0f);
@@ -81,7 +81,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   }
 
   ValueProgram* bareColumn = parseValue(memory, *schema, "x_i");
-  auto bareBound = bareColumn->bind(pool, segment);
+  auto bareBound = bareColumn->bind(pool, segment, bareColumn->resolveFields(pool, *reader));
   std::array<ScalarValueResult, 3> scalarBatch;
   bareBound->evalScalarBatch(docs, scalarBatch);
   ASSERT_TRUE(scalarBatch[0].valid);
@@ -94,7 +94,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
            {"max(values_is)", 5.0}, {"avg(values_is)", 1.0},
            {"sum(values_is)", 2.0}}) {
     ValueProgram* reducer = parseValue(memory, *schema, expression);
-    auto reducerBound = reducer->bind(pool, segment);
+    auto reducerBound = reducer->bind(pool, segment, reducer->resolveFields(pool, *reader));
     ValueResult result = reducerBound->evalPoint(0, 0.0f);
     ASSERT_TRUE(result.valid) << expression;
     double actual = result.type == ValueType::DOUBLE
@@ -104,7 +104,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   }
 
   ValueProgram* sum = parseValue(memory, *schema, "sum(values_is)");
-  auto sumBound = sum->bind(pool, segment);
+  auto sumBound = sum->bind(pool, segment, sum->resolveFields(pool, *reader));
   const ValueBounds& sumBounds = sumBound->bounds(sum->rootNode);
   EXPECT_EQ(BoundsCertainty::UNBOUNDED, sumBounds.certainty);
   EXPECT_TRUE(sumBounds.mayBeMissing);
@@ -118,7 +118,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   EXPECT_FALSE(sumBatch[2].valid);
 
   ValueProgram* doubleSum = parseValue(memory, *schema, "sum(values_ds)");
-  auto doubleSumBound = doubleSum->bind(pool, segment);
+  auto doubleSumBound = doubleSum->bind(pool, segment, doubleSum->resolveFields(pool, *reader));
   EXPECT_DOUBLE_EQ(1.25,
                    doubleSumBound->evalPoint(0, 0.0f).doubleValue);
   EXPECT_FALSE(doubleSumBound->evalPoint(2, 0.0f).valid);
@@ -129,11 +129,11 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   EXPECT_FALSE(doubleSumBatch[2].valid);
 
   ValueProgram* overflow = parseValue(memory, *schema, "sum(overflow_is)");
-  auto overflowBound = overflow->bind(pool, segment);
+  auto overflowBound = overflow->bind(pool, segment, overflow->resolveFields(pool, *reader));
   EXPECT_FALSE(overflowBound->evalPoint(0, 0.0f).valid);
 
   ValueProgram* count = parseValue(memory, *schema, "count(values_is)");
-  auto countBound = count->bind(pool, segment);
+  auto countBound = count->bind(pool, segment, count->resolveFields(pool, *reader));
   const ValueBounds& countBounds = countBound->bounds(count->rootNode);
   ASSERT_EQ(BoundsCertainty::BOUNDED, countBounds.certainty);
   EXPECT_EQ(0, countBounds.intMin);
@@ -146,7 +146,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   EXPECT_EQ(0, countBatch[2].intValue);
 
   ValueProgram* scalarCount = parseValue(memory, *schema, "count(x_i)");
-  auto scalarCountBound = scalarCount->bind(pool, segment);
+  auto scalarCountBound = scalarCount->bind(pool, segment, scalarCount->resolveFields(pool, *reader));
   const ValueBounds& scalarCountBounds =
       scalarCountBound->bounds(scalarCount->rootNode);
   ASSERT_EQ(BoundsCertainty::BOUNDED, scalarCountBounds.certainty);
@@ -161,7 +161,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
 
   ValueProgram* sparseCount =
       parseValue(memory, *schema, "count(12 / divisors_is)");
-  auto sparseCountBound = sparseCount->bind(pool, segment);
+  auto sparseCountBound = sparseCount->bind(pool, segment, sparseCount->resolveFields(pool, *reader));
   EXPECT_EQ(2, sparseCountBound->evalPoint(0, 0.0f).intValue);
   EXPECT_EQ(0, sparseCountBound->evalPoint(1, 0.0f).intValue);
 
@@ -179,15 +179,15 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
       ValueExprParser(emptyOptions, *memory.arena).parse("sum($empty)");
   ValueProgram* emptyCount =
       ValueExprParser(emptyOptions, *memory.arena).parse("count($empty)");
-  EXPECT_FALSE(emptySum->bind(pool, segment)->evalPoint(0, 0.0f).valid);
+  EXPECT_FALSE(emptySum->bind(pool, segment, emptySum->resolveFields(pool, *reader))->evalPoint(0, 0.0f).valid);
   ValueResult emptyCountValue =
-      emptyCount->bind(pool, segment)->evalPoint(0, 0.0f);
+      emptyCount->bind(pool, segment, emptyCount->resolveFields(pool, *reader))->evalPoint(0, 0.0f);
   ASSERT_TRUE(emptyCountValue.valid);
   EXPECT_EQ(0, emptyCountValue.intValue);
 
   ValueProgram* dividedArray =
       parseValue(memory, *schema, "avg(values_is / den_i)");
-  auto dividedArrayBound = dividedArray->bind(pool, segment);
+  auto dividedArrayBound = dividedArray->bind(pool, segment, dividedArray->resolveFields(pool, *reader));
   EXPECT_DOUBLE_EQ(-1.0,
                    dividedArrayBound->evalPoint(0, 0.0f).doubleValue);
   EXPECT_FALSE(dividedArrayBound->evalPoint(1, 0.0f).valid);
@@ -195,21 +195,21 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
 
   ValueProgram* sparseDivision =
       parseValue(memory, *schema, "avg(12 / divisors_is)");
-  auto sparseDivisionBound = sparseDivision->bind(pool, segment);
+  auto sparseDivisionBound = sparseDivision->bind(pool, segment, sparseDivision->resolveFields(pool, *reader));
   ValueResult sparseAverage = sparseDivisionBound->evalPoint(0, 0.0f);
   ASSERT_TRUE(sparseAverage.valid);
   EXPECT_DOUBLE_EQ(4.5, sparseAverage.doubleValue);
   EXPECT_FALSE(sparseDivisionBound->evalPoint(1, 0.0f).valid);
 
   ValueProgram* floating = parseValue(memory, *schema, "add(f_f,2.0)");
-  auto floatingBound = floating->bind(pool, segment);
+  auto floatingBound = floating->bind(pool, segment, floating->resolveFields(pool, *reader));
   const ValueBounds& floatBounds = floatingBound->bounds(floating->rootNode);
   ASSERT_EQ(BoundsCertainty::BOUNDED, floatBounds.certainty);
   EXPECT_DOUBLE_EQ(0.5, floatBounds.doubleMin);
   EXPECT_DOUBLE_EQ(6.25, floatBounds.doubleMax);
 
   ValueProgram* date = parseValue(memory, *schema, "when_dt");
-  auto dateBound = date->bind(pool, segment);
+  auto dateBound = date->bind(pool, segment, date->resolveFields(pool, *reader));
   const ValueBounds& dateBounds = dateBound->bounds(date->rootNode);
   EXPECT_EQ(1000, dateBounds.intMin);
   EXPECT_EQ(3000, dateBounds.intMax);
@@ -218,7 +218,7 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   ValueProgram* dateArithmetic =
       parseValue(memory, *schema, "(when_dt + 1000) - when_dt");
   EXPECT_EQ(ValueNature::NUMBER, dateArithmetic->root().nature);
-  auto dateArithmeticBound = dateArithmetic->bind(pool, segment);
+  auto dateArithmeticBound = dateArithmetic->bind(pool, segment, dateArithmetic->resolveFields(pool, *reader));
   EXPECT_EQ(1000, dateArithmeticBound->evalPoint(0, 0.0f).intValue);
   EXPECT_EQ(1000, dateArithmeticBound->evalPoint(1, 0.0f).intValue);
   EXPECT_FALSE(dateArithmeticBound->evalPoint(2, 0.0f).valid);
@@ -226,13 +226,13 @@ TEST_F(ValueExprKernelTest, pointBatchMissingPrecisionReducersAndBounds) {
   ValueProgram* dayBucket =
       parseValue(memory, *schema, "floor(when_dt / 86400000)");
   EXPECT_EQ(ValueNature::NUMBER, dayBucket->root().nature);
-  auto dayBucketBound = dayBucket->bind(pool, segment);
+  auto dayBucketBound = dayBucket->bind(pool, segment, dayBucket->resolveFields(pool, *reader));
   EXPECT_DOUBLE_EQ(0.0, dayBucketBound->evalPoint(0, 0.0f).doubleValue);
   EXPECT_DOUBLE_EQ(0.0, dayBucketBound->evalPoint(1, 0.0f).doubleValue);
   EXPECT_FALSE(dayBucketBound->evalPoint(2, 0.0f).valid);
 
   ValueProgram* absent = parseValue(memory, *schema, "absent_i");
-  auto absentBound = absent->bind(pool, segment);
+  auto absentBound = absent->bind(pool, segment, absent->resolveFields(pool, *reader));
   const ValueBounds& absentBounds = absentBound->bounds(absent->rootNode);
   EXPECT_EQ(BoundsCertainty::UNBOUNDED, absentBounds.certainty);
   EXPECT_TRUE(absentBounds.alwaysMissing);
@@ -254,14 +254,14 @@ TEST_F(ValueExprKernelTest, negativeValuesAndRuntimeFiniteGuard) {
   MemPool pool;
 
   ValueProgram* abs = parseValue(memory, *schema, "abs(x_i)");
-  auto absBound = abs->bind(pool, segment);
+  auto absBound = abs->bind(pool, segment, abs->resolveFields(pool, *reader));
   EXPECT_EQ(9, absBound->evalPoint(0, 0.0f).intValue);
   EXPECT_EQ(0, absBound->evalPoint(1, 0.0f).intValue);
 
   for (std::string_view expression : {"div(1,den_i)", "1 / den_i"}) {
     ValueProgram* division = parseValue(memory, *schema, expression);
     EXPECT_EQ(ValueType::DOUBLE, division->root().type);
-    auto divisionBound = division->bind(pool, segment);
+    auto divisionBound = division->bind(pool, segment, division->resolveFields(pool, *reader));
     const ValueBounds& bounds = divisionBound->bounds(division->rootNode);
     EXPECT_EQ(BoundsCertainty::UNBOUNDED, bounds.certainty);
     EXPECT_TRUE(bounds.mayBeMissing);
@@ -280,13 +280,13 @@ TEST_F(ValueExprKernelTest, negativeValuesAndRuntimeFiniteGuard) {
   }
 
   ValueProgram* withDefault = parseValue(memory, *schema, "def(1 / den_i, 7)");
-  auto defaultBound = withDefault->bind(pool, segment);
+  auto defaultBound = withDefault->bind(pool, segment, withDefault->resolveFields(pool, *reader));
   ValueResult defaulted = defaultBound->evalPoint(1, 0.0f);
   ASSERT_TRUE(defaulted.valid);
   EXPECT_DOUBLE_EQ(7.0, defaulted.doubleValue);
 
   ValueProgram* constantZero = parseValue(memory, *schema, "1 / 0");
-  auto constantZeroBound = constantZero->bind(pool, segment);
+  auto constantZeroBound = constantZero->bind(pool, segment, constantZero->resolveFields(pool, *reader));
   const ValueBounds& zeroBounds =
       constantZeroBound->bounds(constantZero->rootNode);
   EXPECT_TRUE(zeroBounds.alwaysMissing);
@@ -305,7 +305,7 @@ TEST_F(ValueExprKernelTest, provenInvalidityIsRejectedAtBind) {
 
   ValueProgram* logarithm = parseValue(memory, *schema, "log(x_i)");
   try {
-    logarithm->bind(pool, segment);
+    logarithm->bind(pool, segment, logarithm->resolveFields(pool, *reader));
     FAIL() << "expected log bounds failure";
   } catch (const ValueEvaluationError& error) {
     std::string message = error.what();
@@ -325,7 +325,7 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   MemPool pool;
 
   ValueProgram* program = parseValue(memory, *schema, "add(score,x_i)");
-  auto bound = program->bind(pool, segment);
+  auto bound = program->bind(pool, segment, program->resolveFields(pool, *reader));
   EXPECT_EQ(BoundsCertainty::UNBOUNDED, bound->bounds(program->rootNode).certainty);
   ValueBounds scoreInterval = ValueBounds::floating(-2.0, 3.0);
   scoreInterval.minAttained = false;
@@ -340,7 +340,7 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   EXPECT_DOUBLE_EQ(5.5, result.doubleValue);
 
   ValueProgram* squareRoot = parseValue(memory, *schema, "sqrt(score)");
-  auto squareRootBound = squareRoot->bind(pool, segment);
+  auto squareRootBound = squareRoot->bind(pool, segment, squareRoot->resolveFields(pool, *reader));
   EXPECT_EQ(BoundsCertainty::UNBOUNDED,
             squareRootBound->bounds(squareRoot->rootNode).certainty);
   ValueBounds nonNegativeScore = ValueBounds::floating(0.0, 4.0);
@@ -357,7 +357,7 @@ TEST_F(ValueExprKernelTest, scoreBoundsStayUnknownAndPointUsesSuppliedScore) {
   EXPECT_THROW(squareRootBound->evalPoint(0, -1.0f), std::runtime_error);
 
   ValueProgram* overflowing = parseValue(memory, *schema, "mul(score,1e308)");
-  auto overflowingBound = overflowing->bind(pool, segment);
+  auto overflowingBound = overflowing->bind(pool, segment, overflowing->resolveFields(pool, *reader));
   EXPECT_THROW(overflowingBound->evalPoint(0, 2.0f), std::runtime_error);
 }
 
@@ -418,7 +418,7 @@ TEST_F(ValueExprKernelTest, columnInfinityIsAValueAndNaNIsMissing) {
   ArenaOwner memory;
   MemPool pool;
   ValueProgram* program = parseValue(memory, *schema, "weight_d");
-  BoundValueProgram* bound = program->bind(pool, reader->segments()[0]);
+  BoundValueProgram* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
   EXPECT_DOUBLE_EQ(1.0, bound->evalPoint(0, 0.0f).doubleValue);
   ValueResult infinite = bound->evalPoint(1, 0.0f);
   ASSERT_TRUE(infinite.valid);
@@ -427,7 +427,7 @@ TEST_F(ValueExprKernelTest, columnInfinityIsAValueAndNaNIsMissing) {
 
   ValueProgram* minimum = parseValue(memory, *schema, "min(clean_d,0)");
   BoundValueProgram* minimumBound =
-      minimum->bind(pool, reader->segments()[0]);
+      minimum->bind(pool, reader->segments()[0], minimum->resolveFields(pool, *reader));
   EXPECT_DOUBLE_EQ(0.0, minimumBound->evalPoint(0, 0.0f).doubleValue);
   EXPECT_DOUBLE_EQ(0.0, minimumBound->evalPoint(1, 0.0f).doubleValue);
   EXPECT_FALSE(minimumBound->evalPoint(2, 0.0f).valid);
@@ -435,7 +435,7 @@ TEST_F(ValueExprKernelTest, columnInfinityIsAValueAndNaNIsMissing) {
   ValueProgram* maximum = parseValue(
       memory, *schema, "max(clean_d,clean_d)");
   BoundValueProgram* maximumBound =
-      maximum->bind(pool, reader->segments()[0]);
+      maximum->bind(pool, reader->segments()[0], maximum->resolveFields(pool, *reader));
   EXPECT_DOUBLE_EQ(1.0, maximumBound->evalPoint(0, 0.0f).doubleValue);
   EXPECT_EQ(std::numeric_limits<double>::infinity(),
             maximumBound->evalPoint(1, 0.0f).doubleValue);

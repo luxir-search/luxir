@@ -232,13 +232,13 @@ void BM_NumericRangePointsSize(benchmark::State& state, FieldShape shape) {
   for (auto _ : state) {
     MemPool pool;
     Query::Context context(pool, *fixture.getIndex().reader);
-    auto infos = context.readSegInfos(field.name);
+    auto infos = context.topReader.field(field.name);
     auto& segment = fixture.getIndex().reader->segments()[0];
-    if (infos.empty() || infos[0] == nullptr || infos[0]->pointsMetaOff == 0) {
+    if (infos.at(0) == nullptr || infos.at(0)->pointsMetaOff == 0) {
       state.SkipWithError("points index is absent");
       return;
     }
-    PointsReader reader(segment.postingsReader(), *infos[0]);
+    PointsReader reader(segment.postingsReader(), *infos.at(0));
     bytes = reader.sizeInBytes();
     points = reader.pointCount();
     benchmark::DoNotOptimize(bytes);

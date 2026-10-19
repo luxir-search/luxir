@@ -4,8 +4,8 @@ The HTTP surface is plain JSON for bounded messages and NDJSON for streams.
 Collection names live in the path, and the request body uses the same field
 names as the protobuf messages.
 
-Collections belong to a tenant. Search, update and replica-wait routes act in
-the caller's own tenant, which is the default tenant `t0` until requests carry
+Collections belong to a tenant. Search and update routes act in the caller's
+own tenant, which is the default tenant `t0` until requests carry
 credentials. Administration and snapshot routes may name another tenant under
 `/tenants/{tenant}`.
 
@@ -15,16 +15,16 @@ credentials. Administration and snapshot routes may name another tenant under
 |---|---|
 | `GET /health` | Process liveness. |
 | `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
-| `POST /collections/{collection}/_wait_for_replicas` | Wait on an existing commit token; see [Replication](replication.md#write-then-read-your-write). |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
 | `GET /collections/{collection}/_schema?view=resolved` | Read physical representations, bindings, and conservative schema coverage; HTTP only. |
-| `POST /collections/{collection}/_schema` | Set definitions or replace the schema. |
+| `POST /collections/{collection}/_schema` | Set definitions or replace the schema; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |
 | `GET /collections/_list` (or `POST`) | List collection names; `GET /collections` is a synonym. |
-| `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`. |
+| `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
-| `GET /_stats` | Node totals and per-collection operational statistics. |
-| `GET /collections/{collection}/_stats` | Operational statistics for one collection. |
+| `GET /_stats` | Node statistics: service activity and memory by default; `collections`, `files`, `segments`, `system` and `host` opt in to costlier sections; `format=prometheus` renders Prometheus text. See [Stats and monitoring](operations.md#stats-and-monitoring). |
+| `GET /metrics` | The node's Prometheus scrape: `_stats` rendered as Prometheus text, with `collections` and `system` on by default. |
+| `GET /collections/{collection}/_stats` | Statistics for one collection, in JSON or Prometheus text. |
 | `GET /collections/{collection}/_snapshot` | Pin the current snapshot for copying; see [Replication](replication.md). |
 | `GET /collections/{collection}/_snapshot/files/{name}` | One file of a pinned snapshot. |
 | `GET /tenants` | Tenants that own a collection. |
@@ -68,7 +68,8 @@ Every JSON body ends with a newline. `?pretty` (bare, or `?pretty=true` /
 `?pretty=false`) is a URL-only, best-effort formatting hint that applies to
 every JSON body of the request, errors and ingest acknowledgements included.
 Schema, collection list, and stats responses default to pretty; every other
-route defaults to compact. Indentation is two spaces but is not part of the
+route defaults to compact. `_stats?format=prometheus` is
+`text/plain; version=0.0.4` and ignores `pretty`. Indentation is two spaces but is not part of the
 contract. A pretty stream is sent as `application/json`, still chunked, with
 one pretty JSON text per batch separated by blank lines. It is not a single
 JSON document, though `jq` reads the sequence directly. Pretty is ignored for `format=docs`, whether selected by URL or

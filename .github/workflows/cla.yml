@@ -20,31 +20,28 @@ permissions:
   pull-requests: write
   statuses: write
 
-# Serialize signature writes.
-concurrency:
-  group: cla
-  cancel-in-progress: false
+env:
+  CLA_PHRASE: I have read the Luxir CLA and I hereby sign it.
+  CLA_BRANCH: cla-signatures
+  CLA_FILE: signatures.json
 
 jobs:
-  cla:
-    if: >-
-      github.event_name == 'pull_request_target' ||
-      contains(github.event.comment.body, 'Luxir CLA') ||
-      github.event.comment.body == 'recheck'
+  # No concurrency group: a group keeps only one pending run and cancels the
+  # rest, which would drop signatures. Concurrent writes are instead detected
+  # by the fast-forward-only ref update and retried.
+  sign:
+    if: github.event_name == 'issue_comment' && contains(github.event.comment.body, 'Luxir CLA')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/github-script@d746ffe35508b1917358783b479e04febd2b8f71 # v9.0.0
         with:
           script: |
-            const PHRASE = 'I have read the Luxir CLA and I hereby sign it.';
-            const BRANCH = 'cla-signatures';
-            const FILE = 'signatures.json';
-            const MARKER = '<!-- luxir-cla -->';
-            // The Steward named in CLA.md does not sign; bots are exempt by account type.
-            const EXEMPT = new Set(['yonik']);
+            const {CLA_PHRASE: PHRASE, CLA_BRANCH: BRANCH, CLA_FILE: FILE} = process.env;
             const {owner, repo} = context.repo;
+            const c = context.payload.comment;
+            if (c.body.trim() !== PHRASE) return;
             const defaultBranch = context.payload.repository.default_branch;
-            const claUrl = `https://github.com/${owner}/${repo}/blob/${defaultBranch}/CLA.md`;
+            const doc = await github.rest.repos.getContent({owner, repo, path: 'CLA.md', ref: defaultBranch});
 
             async function load() {
               let head = null;
@@ -58,44 +55,72 @@ jobs:
               }
             }
 
-            async function save(head, sigs, message) {
+            for (let attempt = 1; ; attempt++) {
+              const {head, sigs} = await load();
+              if (sigs.some(s => s.id === c.user.id)) return;
+              sigs.push({login: c.user.login, id: c.user.id, cla: doc.data.sha,
+                         comment: c.html_url, signed_at: c.created_at});
               const content = JSON.stringify(sigs, null, 2) + '\n';
               const blob = await github.rest.git.createBlob({owner, repo, content, encoding: 'utf-8'});
               const tree = await github.rest.git.createTree({owner, repo,
                 tree: [{path: FILE, mode: '100644', type: 'blob', sha: blob.data.sha}]});
-              const commit = await github.rest.git.createCommit({owner, repo, message,
-                tree: tree.data.sha, parents: head ? [head] : []});
-              if (head)
-                await github.rest.git.updateRef({owner, repo, ref: `heads/${BRANCH}`, sha: commit.data.sha});
-              else
-                await github.rest.git.createRef({owner, repo, ref: `refs/heads/${BRANCH}`, sha: commit.data.sha});
-            }
-
-            let prNumber;
-            if (context.eventName === 'issue_comment') {
-              const c = context.payload.comment;
-              const body = c.body.trim();
-              if (body === PHRASE) {
-                const {head, sigs} = await load();
-                if (!sigs.some(s => s.id === c.user.id)) {
-                  const doc = await github.rest.repos.getContent({owner, repo, path: 'CLA.md', ref: defaultBranch});
-                  sigs.push({login: c.user.login, id: c.user.id, cla: doc.data.sha,
-                             comment: c.html_url, signed_at: c.created_at});
-                  await save(head, sigs, `${c.user.login} signed the CLA`);
-                }
-              } else if (body !== 'recheck') {
+              const commit = await github.rest.git.createCommit({owner, repo,
+                message: `${c.user.login} signed the CLA`, tree: tree.data.sha, parents: head ? [head] : []});
+              try {
+                if (head)
+                  await github.rest.git.updateRef({owner, repo, ref: `heads/${BRANCH}`, sha: commit.data.sha});
+                else
+                  await github.rest.git.createRef({owner, repo, ref: `refs/heads/${BRANCH}`, sha: commit.data.sha});
                 return;
+              } catch (e) {
+                // 422: another run moved or created the branch first; reload and reapply.
+                if (e.status !== 422 || attempt === 5) throw e;
               }
-              if (!context.payload.issue.pull_request) return;
-              prNumber = context.payload.issue.number;
-            } else {
-              prNumber = context.payload.pull_request.number;
             }
 
+  # Serialized per pull request so a stale run cannot overwrite a newer status.
+  # A pending run replaced by a newer one loses nothing: the newer run
+  # re-evaluates the current head and signatures.
+  check:
+    needs: sign
+    if: >-
+      !cancelled() && needs.sign.result != 'failure' && (
+        github.event_name == 'pull_request_target' ||
+        github.event.issue.pull_request && (
+          contains(github.event.comment.body, 'Luxir CLA') ||
+          github.event.comment.body == 'recheck'))
+    concurrency:
+      group: cla-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@d746ffe35508b1917358783b479e04febd2b8f71 # v9.0.0
+        with:
+          script: |
+            const {CLA_PHRASE: PHRASE, CLA_BRANCH: BRANCH, CLA_FILE: FILE} = process.env;
+            const MARKER = '<!-- luxir-cla -->';
+            // The Steward named in CLA.md does not sign; bots are exempt by account type.
+            const EXEMPT = new Set(['yonik']);
+            const {owner, repo} = context.repo;
+            const defaultBranch = context.payload.repository.default_branch;
+            const claUrl = `https://github.com/${owner}/${repo}/blob/${defaultBranch}/CLA.md`;
+
+            async function loadSigs() {
+              try {
+                const f = await github.rest.repos.getContent({owner, repo, path: FILE, ref: BRANCH});
+                return JSON.parse(Buffer.from(f.data.content, 'base64').toString());
+              } catch (e) {
+                if (e.status !== 404) throw e;
+                return [];
+              }
+            }
+
+            const prNumber = context.eventName === 'issue_comment'
+              ? context.payload.issue.number : context.payload.pull_request.number;
             const pr = (await github.rest.pulls.get({owner, repo, pull_number: prNumber})).data;
             const commits = await github.paginate(github.rest.pulls.listCommits,
               {owner, repo, pull_number: prNumber, per_page: 100});
-            const signed = new Set((await load()).sigs.map(s => s.id));
+            const signed = new Set((await loadSigs()).map(s => s.id));
             const missing = new Set();
             const unlinked = new Set();
             for (const c of commits) {

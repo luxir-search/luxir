@@ -7,6 +7,7 @@
 #include "ReplicationState.h"
 #include "luxir/api/build.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/store/CorruptionMarker.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
 #include <boost/asio.hpp>
@@ -17,6 +18,7 @@
 #include <thread>
 #include <set>
 #include <ostream>
+#include <unistd.h>
 
 namespace luxir {
 namespace {
@@ -211,6 +213,15 @@ std::string errorMessage(const std::exception& error) {
   if (auto* system = dynamic_cast<const boost::system::system_error*>(&error)) return system->code().message();
   return error.what();
 }
+// The name the source knows this follower by: host:port of its listener, so a
+// restart resumes the same acknowledgment rows. Without a fixed port, a
+// per-process id.
+std::string defaultFollowerName(const LuxirConfig& config) {
+  int port = config.server.http.enabled ? config.server.http.port : config.server.grpc.port;
+  char host[256] = {};
+  if (port <= 0 || ::gethostname(host, sizeof(host) - 1) != 0 || !*host) return newUuid();
+  return std::string(host) + ":" + std::to_string(port);
+}
 struct PinGone : std::runtime_error { PinGone() : std::runtime_error("source snapshot pin expired") {} };
 struct PeerMismatch : std::runtime_error {
   explicit PeerMismatch(const std::string& name) : std::runtime_error("peer file checksum mismatch: " + name) {}
@@ -218,6 +229,11 @@ struct PeerMismatch : std::runtime_error {
 }
 
 struct ReplicationFollower::Impl {
+  struct Repair {
+    std::weak_ptr<Collection> collection;
+    std::vector<FileDescriptor> suspects;
+    std::string reason;
+  };
   struct State {
     // advertised: the source's current commit; serving: installed locally;
     // acknowledged: last serving commit the source accepted. Independent.
@@ -229,10 +245,13 @@ struct ReplicationFollower::Impl {
     // The local copy could not be opened; CURRENT, if it could be read, selects
     // this incarnation ("" otherwise). It is retained until an install replaces it.
     std::optional<std::string> unreadable;
+    std::shared_ptr<const Repair> corrupt; // a failed copy or a replacement sharing its suspects
     uint64_t advertisedDigest = 0; // manifest digest announced with `advertised`
     unsigned failures = 0;
     uint64_t progress = 0;
-    Clock::time_point readySince = Clock::now();
+    // Node-clock times: when the work became ready (unset until a commit is
+    // advertised), and when a failed sync may retry.
+    Clock::time_point readySince{};
     Clock::time_point retry{};
     uint64_t downloaded = 0, reused = 0, total = 0;
     // The incarnation `verified` describes, and its staged candidate when
@@ -245,10 +264,12 @@ struct ReplicationFollower::Impl {
     }
   };
   LuxirNode& node;
+  const std::chrono::milliseconds retryDelay; // reconnect, and first sync retry
   Source source;
   std::vector<Source> peers; // never resized after construction: clients reference them
   const std::vector<std::string> tenants;
   ReplicationState binding;
+  std::string follower; // set by start(); pull runs anonymously
   std::mutex metadataMutex;
   std::string persisted;
   std::shared_ptr<Directory> metadata;
@@ -262,22 +283,19 @@ struct ReplicationFollower::Impl {
   std::stop_source stopping;
   std::vector<std::jthread> threads;
 
-  explicit Impl(LuxirNode& node) : node(node), source(node.getConfig().replication.source),
+  explicit Impl(LuxirNode& node) : node(node), retryDelay(node.getConfig().replication.retry_ms),
+      source(node.getConfig().replication.source),
       tenants(node.getConfig().replication.tenantFilter()) {
     for (const auto& peer : node.getConfig().replication.peerList()) peers.emplace_back(peer);
     if (node.getConfig().replication.downloads < 1 || node.getConfig().replication.downloads > 64) {
       throw std::invalid_argument("replication.downloads must be between 1 and 64");
     }
     binding.source = "http://" + source.authority;
-    binding.follower = node.getConfig().replication.follower_id;
     bool fs = node.getConfig().store.backend == "fs";
     metadata = fs ? std::shared_ptr<Directory>(std::make_shared<FSDirectory>(node.getConfig().store.data_dir))
                   : std::make_shared<RAMDir>();
     if (auto stored = metadata->openFile("replication.json")) {
       auto existing = ReplicationState::read(*stored);
-      if (!binding.follower.empty() && binding.follower != existing.follower) {
-        throw std::invalid_argument("configured follower id differs from persisted follower id");
-      }
       existing.source = binding.source;
       binding = std::move(existing);
     } else {
@@ -287,11 +305,8 @@ struct ReplicationFollower::Impl {
         if (name == "t" && FSDirFactory::holdsNoCollections(entry.path())) continue;
         throw std::invalid_argument("replication requires an empty data directory or a follower data directory");
       }
-      if (binding.follower.empty()) binding.follower = newUuid();
-      if (binding.follower.size() > 255) throw std::invalid_argument("invalid follower id");
       binding.write(*metadata);
     }
-    if (binding.follower.empty() || binding.follower.size() > 255) throw std::invalid_argument("invalid follower id");
   }
 
   // A worker's connections: the source, then each peer in configured order.
@@ -333,7 +348,7 @@ struct ReplicationFollower::Impl {
     ReplicationState next;
     {
       std::lock_guard lock(mutex);
-      next.source = binding.source; next.follower = binding.follower;
+      next.source = binding.source;
       for (const auto& [id, state] : states)
         next.collection(id) = ReplicationState::Collection{
             state.advertised ? state.advertised->token() : "", state.seenBoot, state.replaceEmpty, {}};
@@ -341,7 +356,7 @@ struct ReplicationFollower::Impl {
     auto bytes = glz::write_json(next).value();
     if (bytes != persisted) { next.write(*metadata); persisted = std::move(bytes); }
   }
-  std::string followerQuery() const { return "follower=" + escape(binding.follower); }
+  std::string followerQuery() const { return "follower=" + escape(follower); }
   http::response<http::string_body> request(Client& client, http::verb method, const std::string& path, const std::string& body = {}, std::chrono::milliseconds timeout = 40s) {
     http::response<http::string_body> response;
     try { client.send(method, path, body); response = client.response(timeout); }
@@ -362,6 +377,36 @@ struct ReplicationFollower::Impl {
     auto& state = states[name];
     state.serving.reset(); state.acknowledged.reset(); state.unreadable.reset();
     state.verified.clear(); state.targetIncarnation.clear(); state.remove = false;
+  }
+
+  // A delayed scrub result applies only to its collection or a replacement
+  // holding the same suspect bytes. Other replacements keep serving.
+  void unloadCorrupt(const CollectionId& name, const std::shared_ptr<const Repair>& repair) {
+    auto active = node.collections().get(name);
+    auto shard = active ? active->getShard() : nullptr;
+    auto snapshot = shard ? shard->getSnapshots().snapshot() : nullptr;
+    auto failed = repair->collection.lock();
+    std::vector<std::string> suspects;
+    if (snapshot) for (const auto& file : repair->suspects) {
+      if (std::ranges::find(snapshot->files, file) != snapshot->files.end()) suspects.push_back(file.name);
+    }
+    if (shard && (active == failed || !suspects.empty())) {
+      // A replacement may have linked the bad file before the original failed.
+      // Mark it too, so staging cannot trust a matching buffered hash.
+      if (active != failed) node.collections().fail(name, active, repair->reason, suspects);
+      node.collections().unload(name, active, repair->reason);
+      std::lock_guard lock(mutex);
+      auto& state = states[name];
+      state.unreadable = snapshot ? snapshot->id.incarnation : "";
+      state.serving.reset(); state.acknowledged.reset();
+      state.verified.clear(); state.targetIncarnation.clear();
+      state.error = repair->reason;
+    }
+    {
+      std::lock_guard lock(mutex);
+      if (states[name].corrupt == repair) states[name].corrupt.reset();
+    }
+    Signal::emit("replicationRepairProcessed", (void*)&name);
   }
 
   api::ReplicationCatalog fetchCatalog(Client& client, const std::string& cursor, std::chrono::milliseconds timeout, std::pmr::memory_resource& arena) {
@@ -401,7 +446,7 @@ struct ReplicationFollower::Impl {
     if (desired && (!state.advertised || desired->incarnation != state.advertised->incarnation))
       state.replaceEmpty = state.seenBoot == sourceBoot;
     if (desired != state.advertised) {
-      if (!state.advertised || state.advertised == state.serving || state.waiting) state.readySince = Clock::now();
+      if (!state.advertised || state.advertised == state.serving || state.waiting) state.readySince = node.now();
       state.advertised = std::move(desired); state.waiting = false;
     }
     state.advertisedDigest = announced ? announced->digest : 0;
@@ -455,7 +500,7 @@ struct ReplicationFollower::Impl {
         { std::lock_guard lock(mutex); connected = false; discoveryError = message; }
         LOG_WARN("Replication source {} unavailable: {}", binding.source, message);
         std::unique_lock lock(mutex);
-        changed.wait_for(lock, stopping.get_token(), 1s, [] { return false; });
+        changed.wait_for(lock, stopping.get_token(), retryDelay, [] { return false; });
       }
     }
   }
@@ -590,16 +635,22 @@ struct ReplicationFollower::Impl {
   }
 
   // Verifies every file of `snapshot` in the target directory, downloading what
-  // is missing, and makes them durable. Returns the target's prior snapshot.
+  // is missing or suspect, and makes them durable.
   void stageFiles(Clients& clients, const CollectionId& name, Directory& dir, const std::shared_ptr<const CommitSnapshot>& previous,
                   const CommitSnapshot& snapshot, const std::shared_ptr<Collection>& active) {
+    auto suspects = CorruptionMarker::read(dir);
     std::map<std::string, FileDescriptor> verified;
     { std::lock_guard lock(mutex); verified = states[name].verified; }
-    if (!previous) {
-      if (auto shard = active ? active->getShard() : nullptr) {
+    if (!previous && active && !active->isFailed()) {
+      if (auto shard = active->getShard()) {
         auto& source = shard->getSnapshots();
         if (auto serving = source.snapshot()) {
-          for (auto& file : dir.reuseFiles(source.dir, serving->files, snapshot.files))
+          auto sourceSuspects = CorruptionMarker::read(source.dir);
+          std::vector<FileDescriptor> available;
+          for (const auto& file : serving->files)
+            if (!std::ranges::binary_search(sourceSuspects, file.name)
+                && !std::ranges::binary_search(suspects, file.name)) available.push_back(file);
+          for (auto& file : dir.reuseFiles(source.dir, available, snapshot.files))
             verified.insert_or_assign(file.name, std::move(file));
         }
       }
@@ -614,20 +665,22 @@ struct ReplicationFollower::Impl {
     for (const auto& file : snapshot.files) {
       if (file.name.empty() || file.name == "." || file.name == ".." || file.name.find_first_of("/\\") != std::string::npos
           || file.name.starts_with(Manifest::kPrefix) || file.name.ends_with(".tmp") || !unique.insert(file.name).second) throw std::runtime_error("invalid snapshot file name");
-      bool reuse = verified.contains(file.name) && verified.at(file.name) == file;
-      if (!reuse) {
+      bool suspect = std::ranges::binary_search(suspects, file.name);
+      if (suspect && durableNames.contains(file.name))
+        throw std::runtime_error("cannot replace suspect file in serving snapshot: " + file.name + "; unload and repair the collection");
+      bool reuse = !suspect && verified.contains(file.name) && verified.at(file.name) == file;
+      if (!reuse && !suspect) {
         // Unpublished verified files can survive a reconnect or failed install.
         // After process restart only these candidates need to be hashed. An
         // unreadable unpublished file is downloaded again and replaced; a
         // serving file must stay readable.
-        std::shared_ptr<InputFile> local;
-        try { local = dir.openFile(file.name); }
+        std::optional<FileCheck> local;
+        try { local = dir.checksum(file.name); }
         catch (const FileIOException&) {
           if (durableNames.contains(file.name)) throw;
         }
         if (local) {
-          auto data = local->read();
-          reuse = data.size() == file.size && XXH3_64bits(data.data(), data.size()) == file.xxh3;
+          reuse = local->matches(file);
           if (!reuse && previous) {
             for (const auto& live : previous->files) if (live.name == file.name) throw std::runtime_error("source changed immutable file: " + file.name);
           }
@@ -755,9 +808,9 @@ struct ReplicationFollower::Impl {
           State* selected = nullptr;
           for (auto& [key, state] : states) {
             if (!includes(key)) continue;
-            bool work = state.remove || (state.advertised && ((state.advertised != state.serving && !state.waiting)
+            bool work = state.remove || (bool)state.corrupt || (state.advertised && ((state.advertised != state.serving && !state.waiting)
                     || state.needsAck()));
-            if (!state.busy && !state.unavailable && work && Clock::now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
+            if (!state.busy && !state.unavailable && work && node.now() >= state.retry && (!selected || std::max(state.readySince, state.retry) < std::max(selected->readySince, selected->retry))) {
               name = key; selected = &state;
             }
           }
@@ -765,17 +818,27 @@ struct ReplicationFollower::Impl {
           selected->busy = true; progress = selected->progress;
           return true;
         };
-        changed.wait_for(lock, stopping.get_token(), 200ms, ready);
+        // Recheck at least every 200 ms, and when the next backed-off retry is due.
+        auto recheck = Clock::duration(200ms);
+        auto now = node.now();
+        for (const auto& [key, state] : states) if (state.retry > now) recheck = std::min(recheck, state.retry - now);
+        changed.wait_for(lock, stopping.get_token(), recheck, ready);
         if (stopping.stop_requested()) break;
         if (name.name.empty()) continue;
       }
       std::string error;
       try {
         bool remove, needsSync;
+        std::shared_ptr<const Repair> corrupt;
         std::optional<CommitId> serving;
         {
           std::lock_guard lock(mutex);
-          auto& state = states[name]; remove = state.remove;
+          auto& state = states[name]; remove = state.remove; corrupt = state.corrupt;
+        }
+        if (corrupt) unloadCorrupt(name, corrupt);
+        {
+          std::lock_guard lock(mutex);
+          auto& state = states[name];
           needsSync = state.advertised && state.advertised != state.serving && !state.waiting;
         }
         if (remove) eraseLocal(name);
@@ -790,7 +853,7 @@ struct ReplicationFollower::Impl {
             }
             if (!serving) return;
             auto token = serving->token();
-            api::ReplicationInstalled ack{binding.follower, name.tenant, name.name, token};
+            api::ReplicationInstalled ack{follower, name.tenant, name.name, token};
             std::string body;
             if (!api::write_json(ack, body)) throw std::runtime_error("failed to serialize acknowledgment");
             request(clients.source, http::verb::post, "/_replication/installed", body);
@@ -810,12 +873,12 @@ struct ReplicationFollower::Impl {
         auto& state = states[name];
         // Discovery may have superseded a failed target while this job ran.
         if (state.serving && state.advertised == state.serving && state.acknowledged == state.serving) error.clear();
-        state.busy = false; state.error = error; state.readySince = Clock::now();
+        state.busy = false; state.error = error; state.readySince = node.now();
         if (error.empty()) { state.failures = 0; state.retry = {}; }
         else {
           if (state.progress != progress) state.failures = 0;
-          auto delay = std::chrono::seconds(std::min(60u, 1u << std::min(6u, state.failures)));
-          state.failures++; state.retry = Clock::now() + delay;
+          auto delay = std::min<Clock::duration>(60s, retryDelay * (1 << std::min(6u, state.failures)));
+          state.failures++; state.retry = node.now() + delay;
         }
         if (!state.unreadable && !state.advertised && !state.serving && !state.candidate && error.empty()) states.erase(name);
       }
@@ -830,6 +893,11 @@ ReplicationFollower::~ReplicationFollower() { stop(); }
 void ReplicationFollower::seed(const std::vector<Collections::Opened>& opened) { impl->seed(opened); }
 bool ReplicationFollower::pull(std::ostream& output) { return impl->pull(output); }
 void ReplicationFollower::start() {
+  {
+    const auto& name = impl->node.getConfig().replication.follower_id;
+    std::lock_guard lock(impl->mutex);
+    impl->follower = name.empty() ? defaultFollowerName(impl->node.getConfig()) : name;
+  }
   impl->threads.emplace_back([this] { impl->watch(); });
   for (int i = 0; i < impl->node.getConfig().replication.downloads; i++) impl->threads.emplace_back([this] { impl->worker(); });
 }
@@ -859,10 +927,21 @@ void ReplicationFollower::deleteOrphan(const CollectionId& key) {
   impl->persistState();
   impl->changed.notify_all();
 }
+void ReplicationFollower::repair(const CollectionId& id, const std::shared_ptr<Collection>& collection,
+                                 const std::string& reason, std::span<const FileDescriptor> suspects) {
+  auto repair = std::make_shared<const Impl::Repair>(Impl::Repair{collection, {suspects.begin(), suspects.end()}, reason});
+  {
+    std::lock_guard lock(impl->mutex);
+    auto it = impl->states.find(id);
+    if (it == impl->states.end()) return;
+    it->second.corrupt = std::move(repair);
+  }
+  impl->changed.notify_all();
+}
 void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_resource& arena) {
   std::lock_guard lock(impl->mutex);
   auto str = [&](std::string_view value) { return api::build::arenaStr(arena, value); };
-  out.source = str(impl->binding.source); out.follower = str(impl->binding.follower);
+  out.source = str(impl->binding.source); out.follower = str(impl->follower);
   out.connected = impl->connected; out.last_contact = impl->lastContact;
   auto* rows = api::build::allocArray(out.collections, impl->states.size(), arena);
   size_t i = 0;
@@ -872,7 +951,7 @@ void ReplicationFollower::stats(api::ReplicationStatus& out, std::pmr::memory_re
     using State = api::ReplicationCollectionStatus::State;
     row.state = !impl->includes(id) ? State::ORPHAN : (!impl->connected || state.unavailable) ? State::STALE : !state.advertised ? State::ORPHAN : !state.error.empty() ? State::ERROR
         : state.waiting ? State::WAITING : state.advertised == state.serving ? State::SERVING : State::SYNCING;
-    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(state.retry - Clock::now()).count();
+    auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(state.retry - impl->node.now()).count();
     if (!state.error.empty() && remaining > 0) row.next_retry = wallTime() + (uint64_t)remaining;
     row.bytes_downloaded = state.downloaded; row.bytes_total = state.total; row.last_error = str(state.error.empty() && !impl->connected ? impl->discoveryError : state.error);
   }

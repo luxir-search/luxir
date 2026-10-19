@@ -97,10 +97,14 @@ response paths keep connection handling separate from long-running engine work.
   full, so a timeout cannot publish an incomplete set. The gRPC
   unary update path currently waits for indexing on its completion-queue
   handler.
-- Ingest is streaming and incremental: NDJSON bodies are parsed as bytes
+- Ingest is streaming and incremental: NDJSON bodies are framed as bytes
   arrive and each document enters the indexing pipeline immediately - a
   document can be getting inverted while the request that carried it is
-  still on the wire. Responses stream back the same way, a chunk at a time.
+  still on the wire. The connection thread only splits records, recognizes
+  control records, and cuts batches; JSON decoding of documents happens on
+  the indexing workers, so one connection can keep several cores busy.
+  Buffered JSON update bodies are likewise decoded on the task arena.
+  Responses stream back the same way, a chunk at a time.
   For HTTP/JSON clients, there is no maximum stream size and no required
   user-visible bulk-request boundary.
 
@@ -171,8 +175,8 @@ is a single term.
 ## Vector search, natively integrated
 
 Vectors are stored as ordinary columns. Exact kNN scans the column;
-approximate search uses per-segment ANN indexes (currently IVF+PQ) built as
-segment overlays, which follow the segment lifecycle and are served
+approximate search uses per-segment ANN indexes (IVF with PQ codes by default,
+or opt-in RaBitQ, chosen per field) built as segment overlays, which follow the segment lifecycle and are served
 zero-copy from memory-mapped files like everything else. Approximate
 candidates are rescored at full precision. Because the ANN index is part of
 the segment, there is no separate vector store to keep in sync with your
