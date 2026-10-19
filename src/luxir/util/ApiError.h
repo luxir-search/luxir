@@ -11,6 +11,7 @@
 // ApiError knows its classification at the throw site; a bare std::exception
 // is classified by the catching phase's fallback kind.
 
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <stdexcept>
@@ -37,8 +38,9 @@ enum class ErrorKind : uint8_t {
   FAILED_PRECONDITION = 4,
   RESOURCE_EXHAUSTED = 5,
   UNAVAILABLE = 6,
-  INTERNAL = 7,
+  INTERNAL = 7,  // the last kind: ERROR_KINDS counts through it
 };
+inline constexpr size_t ERROR_KINDS = (size_t)ErrorKind::INTERNAL + 1;
 
 // The kind's wire spelling; doubles as the code of an unclassified failure.
 constexpr std::string_view errorKindName(ErrorKind kind) {

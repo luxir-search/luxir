@@ -125,8 +125,9 @@ public:
     // Null when this segment has no stored source for the field.
     static Verifier* open(google::protobuf::Arena& arena, const StoredPhraseQuery& query,
                           IndexReader::Segment& segment) {
-      auto reader = StoredFieldsReader::open(segment.postingsReader(), query.storedResource);
-      if (!reader) return nullptr;
+      auto* resource = segment.postingsReader().fieldInfo(query.storedResource);
+      if (resource == nullptr) return nullptr;
+      auto reader = std::make_unique<StoredFieldsReader>(segment.postingsReader(), *resource);
       int32_t fid = reader->fieldId(query.storedField);
       if (fid < 0) return nullptr;
       return luxir::arenaCreate<Verifier>(arena, query, std::move(reader), fid);
@@ -369,9 +370,7 @@ public:
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
-  Weight* createWeight(Context& context, int32_t flags, float multiplier = 1.0f) override {
-    return context.pool.make<StoredPhraseQuery::Weight>(context, *this, flags, multiplier);
-  }
+  Weight* createWeight(Context& context, int32_t flags, float multiplier = 1.0f) override;
 
   class Weight final : public Query::Weight {
     StoredPhraseQuery& query;

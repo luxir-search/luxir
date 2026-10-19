@@ -230,7 +230,9 @@ public:
       return index_;
     }
 
-    int64_t valueAt(int64_t index) {
+    // Always inlined, like the doc iterator's advance: the column walks call
+    // it once per value, and only the frame decode belongs out of line.
+    LUXIR_INLINE int64_t valueAt(int64_t index) {
       assert(index >= 0 && index < column.numValues());
       if (index < decodedStart || index >= decodedEnd) decode(index);
       return decoded[index - decodedStart];
@@ -598,7 +600,7 @@ public:
       return values.advance(target);
     }
 
-    int64_t valueAt(int64_t index) {
+    LUXIR_INLINE int64_t valueAt(int64_t index) {
       return values.valueAt(index);
     }
   };
@@ -642,13 +644,17 @@ public:
 
     /// for single-valued fields only!  For multi-valued
     /// use values() to get the start and end ranks.
-    int64_t value() {
+    LUXIR_INLINE int64_t value() {
       return valueIter.valueAt(docRank);
     }
 
     // TODO: directly expose docsIter (or the screaming set) here to enable bulk / direct operations on them?
 
-    int32_t advance(int32_t target) {
+    // Always inlined: the facet and stats column walks call this once per
+    // document, and its dense branch is a few instructions. Leaving it to the
+    // inliner made it an out-of-line call whenever another caller appeared
+    // elsewhere in the translation unit (int facets ran 40-67% slower).
+    LUXIR_INLINE int32_t advance(int32_t target) {
       if (dense) {
         if (target >= maxRank) {
           doc = ENDDOC;
@@ -663,7 +669,7 @@ public:
     }
 
     // returns the docid corresponding to the next value
-    int32_t next() {
+    LUXIR_INLINE int32_t next() {
       if (docRank + 1 >= maxRank) {
         doc = ENDDOC;
         return doc;
@@ -678,6 +684,35 @@ public:
 
       return doc;
     }
+
+    // Steps to the first later document for which accept(doc, rank) holds,
+    // or ENDDOC, as repeated next() calls would. The cursor stays in locals
+    // and is stored once on return: a scan that stores it for every document
+    // pays a store/reload chain whose cost depended on where the iterator
+    // landed in memory (forced column full scans varied by 15%).
+    template <typename Accept>
+    LUXIR_INLINE int32_t nextWhere(Accept&& accept) {
+      int32_t rank = docRank;
+      int32_t end = maxRank;
+      if (dense) {
+        while (++rank < end) {
+          if (accept(rank, rank)) {
+            docRank = rank;
+            return doc = rank;
+          }
+        }
+      } else {
+        while (++rank < end) {
+          int32_t next = docsIter.next();
+          if (accept(next, rank)) {
+            docRank = rank;
+            return doc = next;
+          }
+        }
+      }
+      docRank = rank - 1;
+      return doc = ENDDOC;
+    }
   };
 
   using SparseIterator = DocIterator<SparseValues>;  // decodes individual values (good for big skipping)
@@ -690,7 +725,7 @@ public:
   /// for each docid that has any values.
   /// For example, if docids[4]==1000, and docid 1000 has values {10, 11, 12}, then the callbacks would be:
   /// callback(4, 1000, 10, 0, 3), callback(4, 1000, 11, 1, 3), callback(4, 1000, 12, 2, 3).
-  static void getValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedIds, auto&& callback) {
+  static void getValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedIds, auto&& callback) {
     IntColReader intColReader(postingsReader, segFieldInfo);
     IntColReader::Iterator iter(intColReader);
 
@@ -721,7 +756,7 @@ public:
 
   /// docids is a sorted range of docids to load values for in a multi-valued field.
   /// calls callback(size_t input_index, int32_t docid, int64_t value) for each docid that has any values.
-  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
+  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
     IntColReader intColReader(postingsReader, segFieldInfo);
     IntColReader::Iterator iter(intColReader);
     assert(!intColReader.multiValued());
@@ -741,18 +776,6 @@ public:
     }
   }
 
-  /// see getSingleValues(), but starting with a field name.
-  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader, std::string_view field, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek(field);
-    if (!found) {
-      return;
-    }
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
-
-    getSingleValues(pool, postingsReader, segFieldInfo, sortedDocIds, callback);
-  }
 
 };
 

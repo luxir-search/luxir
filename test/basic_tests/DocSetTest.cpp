@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include <thread>
 
 #include "test/LuxirTest.h"
 #include "luxir/search/DocSet.h"
@@ -269,6 +270,23 @@ TEST_F(DocSetTest, builderAddSortedPromotesOnSpanOverflow) {
   EXPECT_EQ(set->card(), 5);
   EXPECT_EQ(collect(*set, 96),
             (std::vector<int32_t>{1, 2, 10, 20, 95}));
+}
+
+TEST_F(DocSetTest, lazyCardinalityIsSafeForConcurrentReaders) {
+  RAMBitDocSet docs(100'000);
+  for (int i = 0; i < 100'000; i += 3) docs.mutableBits().set(i);
+  EXPECT_EQ(-1, docs.cachedCard());
+  std::vector<std::thread> readers;
+  for (int i = 0; i < 8; i++) {
+    readers.emplace_back([&] { for (int j = 0; j < 100; j++) EXPECT_EQ(33'334, docs.card()); });
+  }
+  for (auto& reader : readers) reader.join();
+  EXPECT_EQ(33'334, docs.cachedCard());
+  DocSetBuilder builder(1'000);
+  for (int i = 0; i < 500; i++) builder.add(i);
+  EXPECT_EQ(500, builder.card());
+  auto built = builder.build();
+  EXPECT_EQ(500, built->cachedCard());
 }
 
 }  // namespace luxir::test

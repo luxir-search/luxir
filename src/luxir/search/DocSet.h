@@ -3,6 +3,7 @@
 
 #pragma once
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cstddef>
 #include <memory>
@@ -20,7 +21,7 @@ class DocSetBuilder;
 class DocSet {
   friend DocSetBuilder;
 protected:
-  int32_t card_ = -1;
+  std::atomic<int32_t> card_{-1};
   virtual int32_t calcCard(){ return -1;};
 
 public:
@@ -34,19 +35,21 @@ public:
 
   /// returns the cardinality, which may involve calculating it first if it's not already known.
   int32_t card() {
-    if (card_ == -1) {
-      card_ = calcCard();
+    int32_t value = card_.load(std::memory_order_relaxed);
+    if (value == -1) {
+      value = calcCard();
+      card_.store(value, std::memory_order_relaxed);
     }
-    return card_;
+    return value;
   }
 
   /// returns either -1 for unknown, or the cached cardinality.
   int32_t cachedCard() const {
-    return card_;
+    return card_.load(std::memory_order_relaxed);
   }
 
   void setCard(int32_t card) {
-    card_ = card;
+    card_.store(card, std::memory_order_relaxed);
   }
 
   virtual bool get(int32_t docid) const = 0; // returns true if the docid is in the set
@@ -80,6 +83,8 @@ class DomainHandle {
         std::shared_ptr<const void> retained)
       : storage(std::move(storage)), retained(std::move(retained)) {}
   };
+
+  static inline const char chargedLifetime = 0;
 
   DocSet* docs = nullptr;
   std::shared_ptr<const void> lifetime;
@@ -134,10 +139,26 @@ public:
       throw std::invalid_argument(
           "borrowed domain requires its storage pin before retention");
     }
-    lifetime = std::make_shared<RetainedLifetime>(
+    bool charged = isCharged();
+    auto combined = std::make_shared<RetainedLifetime>(
         std::move(lifetime), std::move(retained));
+    lifetime = charged ? std::shared_ptr<const void>(std::move(combined), &chargedLifetime)
+        : std::move(combined);
     return std::move(*this);
   }
+
+  // The alias marks accounting ownership without enlarging every delivery
+  // handle. Its control block still owns both storage and the charge.
+  template <typename T>
+  DomainHandle chargedWith(std::shared_ptr<T> charge) && {
+    if (charge == nullptr) return std::move(*this);
+    auto result = std::move(*this).retainedWith(std::move(charge));
+    result.lifetime = std::shared_ptr<const void>(std::move(result.lifetime), &chargedLifetime);
+    return result;
+  }
+
+  bool isCharged() const noexcept { return lifetime.get() == &chargedLifetime; }
+  bool ownsStorage() const noexcept { return docs && lifetime.get() == docs; }
 
   DocSet* get() const { return docs; }
   bool isDeliverable() const { return docs == nullptr || lifetime != nullptr; }
@@ -161,7 +182,7 @@ public:
   }
 
   BitDocSet(FixedBitSet bits, int32_t card) : DocSet(BITSET), bits_(bits) {
-    card_ = card;
+    setCard(card);
   }
 
   bool get(int32_t docid) const override {
@@ -189,8 +210,7 @@ class RAMBitDocSet : public BitDocSet {
 public:
   RAMBitDocSet(int32_t size) : BitDocSet(FixedBitSet(FixedBitSet::allocate(size, false).release(), size)) {}
 
-  RAMBitDocSet(RAMBitDocSet&& other) noexcept : BitDocSet(std::move(other.bits_)) {
-    card_ = other.card_;
+  RAMBitDocSet(RAMBitDocSet&& other) noexcept : BitDocSet(std::move(other.bits_), other.cachedCard()) {
     other.bits_.words = nullptr;
   }
 
@@ -223,7 +243,7 @@ public:
       // must stay distinct from an empty set that rejects every doc.
       docs_.reserve(1);
     }
-    card_ = static_cast<int32_t>(docs_.size());
+    setCard((int32_t)docs_.size());
   }
 
   std::span<int32_t> docs() {
@@ -486,6 +506,7 @@ public:
 };
 
 class DocSetBuilder {
+  int32_t bitCard = 0;
   #ifndef NDEBUG
   int32_t lastDoc = -1;
 
@@ -539,7 +560,7 @@ class DocSetBuilder {
     for (auto d : docs) {
       bits->set(d);
     }
-    bitDocs->setCard((int32_t) docs.size());
+    bitCard = (int32_t)docs.size();
     docs.clear();
     docs.shrink_to_fit();
   }
@@ -593,7 +614,7 @@ class DocSetBuilder {
         }
       }
     }
-    bitDocs->card_ += wordCard;
+    bitCard += wordCard;
   }
 
 public:
@@ -617,7 +638,7 @@ public:
     #endif
     if (bits) {
       bits->set(docid);
-      bitDocs->card_++;
+      bitCard++;
       return;
     }
     if (docs.size() < (size_t) arrayLimit()) {
@@ -626,7 +647,7 @@ public:
     }
     promoteToBits();
     bits->set(docid);
-    bitDocs->card_++;
+    bitCard++;
   }
 
   void addSorted(std::span<const int32_t> sortedDocs) {
@@ -642,7 +663,7 @@ public:
       for (int32_t doc : sortedDocs) {
         bits->set(doc);
       }
-      bitDocs->card_ += (int32_t) sortedDocs.size();
+      bitCard += (int32_t) sortedDocs.size();
       return;
     }
 
@@ -660,11 +681,11 @@ public:
     for (int32_t doc : sortedDocs.subspan((size_t) appendBeforePromotion)) {
       bits->set(doc);
     }
-    bitDocs->card_ += (int32_t) sortedDocs.size() - appendBeforePromotion;
+    bitCard += (int32_t) sortedDocs.size() - appendBeforePromotion;
   }
 
   int32_t card() const {
-    return bits ? bitDocs->cachedCard() : (int32_t) docs.size();
+    return bits ? bitCard : (int32_t) docs.size();
   }
 
   void addWindowWords(const uint64_t* words, int32_t windowStart,
@@ -707,6 +728,7 @@ public:
 
   std::unique_ptr<DocSet> build() {
     if (bitDocs.has_value()) {
+      bitDocs->setCard(bitCard);
       return std::make_unique<RAMBitDocSet>(std::move(*bitDocs));
     }
     docs.shrink_to_fit();

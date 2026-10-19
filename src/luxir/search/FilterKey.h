@@ -26,8 +26,14 @@ enum class FilterKeyScope : uint8_t {
   SEGMENT_STABLE = 0,
   CORE_STABLE = 1,
   READER_STABLE = 2,
-  UNCACHEABLE = 3
+  // Keeps request-local identity and ownership without shared-cache traffic.
+  REQUEST_STABLE = 3,
+  UNCACHEABLE = 4
 };
+
+inline bool usesSharedFilterCache(FilterKeyScope scope) {
+  return scope <= FilterKeyScope::READER_STABLE;
+}
 
 inline FilterKeyScope strongestFilterKeyScope(FilterKeyScope a,
                                                FilterKeyScope b) {

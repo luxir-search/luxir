@@ -51,8 +51,9 @@ protected:
     auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
     std::vector<SegFieldInfo> infos;
     for (auto& segment : reader->segments()) {
-      FieldReader fields(segment.postingsReader());
-      if (fields.seek(field)) fields.readFieldInfo(infos.emplace_back());
+      if (auto* info = segment.postingsReader().fieldInfo(field)) {
+        infos.push_back(*info);
+      }
     }
     return infos;
   }

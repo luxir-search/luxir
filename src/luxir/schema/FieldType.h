@@ -69,6 +69,13 @@ public:
   // Segment-format marker. It is never supplied by schema configuration.
   static constexpr flag_type TERM_RANGES = (1 << 12);
   static constexpr flag_type DERIVED = (1 << 13);  // named representation of a logical field
+  // Segment-format marker, never supplied by schema configuration: some term
+  // in this segment field is at least PackedTerm::MIN_FITTED_LEN bytes, so it
+  // may be a truncated or hashed (fitted) form of a longer value.
+  static constexpr flag_type MAY_HAVE_FITTED = (1 << 14);
+  // Every segment-format marker. A writer derives them from what it writes,
+  // so merges never carry them over from source segments.
+  static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED;
   // TEXT only: no per-doc length norms. Fields without freqs never carry norms.
   static constexpr flag_type OMIT_NORMS = (1 << 15);
 
@@ -292,6 +299,28 @@ public:
                               std::span<char> buf) const override;
 };
 
+// Resolved ANN overlay settings of a vector field (api::VectorAnnDef with
+// defaults applied: PQ unless explicitly selected otherwise). Build-time
+// parameters are recorded in each overlay's VectorAuxMeta, so a change only
+// affects overlays built afterwards;
+// rabitqQueryBits is a search-time parameter read from the current schema.
+struct VectorAnnConfig {
+  enum Codec {
+    RABITQ = 0,
+    PQ = 1,
+  };
+  static constexpr int32_t DEFAULT_RABITQ_BITS = 1;
+  static constexpr int32_t DEFAULT_RABITQ_QUERY_BITS = 4;
+  static constexpr int32_t DEFAULT_PQ_BITS = 8;
+
+  Codec codec = PQ;
+  int32_t nlist = 0;  // 0 = sqrt(segment vectors), capped
+  int32_t rabitqBits = DEFAULT_RABITQ_BITS;
+  int32_t rabitqQueryBits = DEFAULT_RABITQ_QUERY_BITS;
+  int32_t pqM = 0;    // 0 = derived from dims
+  int32_t pqBits = DEFAULT_PQ_BITS;
+};
+
 // Dense float vector field.  Values are stored as fixed-size byte blobs
 // through the standard binary-column path (see VectorHandler).  dims_ may be
 // 0, in which case the first indexed value in a segment fixes the segment's
@@ -317,53 +346,82 @@ public:
   // COSINE fields normalize vectors before column storage by default.  Ignored
   // for non-COSINE metrics.
   bool normalizeOnWrite_;
+  // ANN overlay codec and parameters (schema "ann").
+  VectorAnnConfig ann_;
 
   VectorFieldType(std::string_view name, int32_t dims = 0,
                   int flags = COLUMN_STORED | FIXED_SIZE,
                   Metric metric = METRIC_NONE,
                   bool normalized = false,
-                  bool normalizeOnWrite = true)
+                  bool normalizeOnWrite = true,
+                  VectorAnnConfig ann = {})
     : FieldType(name, FieldType::VECTOR, flags),
       dims_(dims),
       metric_(metric),
       normalized_(normalized),
-      normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized) {
+      normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized),
+      ann_(ann) {
   }
 
   int32_t dims() const { return dims_; }
   Metric metric() const { return metric_; }
   bool normalized() const { return normalized_; }
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
+  const VectorAnnConfig& ann() const { return ann_; }
 
   // True iff this field supports kNN / ANN search.  Exact flat search can run
   // directly over the column; real ANN engines may also build aux artifacts.
   bool knnSearchable() const { return metric_ != METRIC_NONE; }
 };
 
-// Describes a stored-fields resource (a per-segment column of LZ4-compressed
+// How a stored-fields resource compresses its chunks.  codec and the two chunk
+// limits are recorded in each segment's resource metadata; the level only
+// affects compression.
+struct StoredChunkFormat {
+  // Recorded on disk as one byte.
+  enum Codec : uint8_t { LZ4 = 0, ZSTD = 1 };
+  static constexpr int DEFAULT_ZSTD_LEVEL = 3;
+  static constexpr uint32_t DEFAULT_CHUNK_TARGET = 16 * 1024;
+  static constexpr uint32_t DEFAULT_MAX_DOCS_PER_CHUNK = 128;
+  // ZSTD is chosen for size, so its defaults trade some per-document read
+  // cost for larger chunks.
+  static constexpr uint32_t DEFAULT_ZSTD_CHUNK_TARGET = 64 * 1024;
+  static constexpr uint32_t DEFAULT_ZSTD_MAX_DOCS_PER_CHUNK = 1024;
+
+  Codec codec = LZ4;
+  int zstdLevel = DEFAULT_ZSTD_LEVEL;
+  // Target uncompressed bytes per chunk before flushing.
+  uint32_t chunkTarget = DEFAULT_CHUNK_TARGET;
+  // Hard cap on docs per chunk.  A chunk flushes when *either* the byte
+  // target or this doc count is reached, whichever comes first.
+  uint32_t maxDocsPerChunk = DEFAULT_MAX_DOCS_PER_CHUNK;
+
+  // Same chunk bytes and boundaries: compressed chunks of one format can be
+  // copied verbatim into a writer of the other.  The level is not part of it.
+  bool sameLayout(const StoredChunkFormat& o) const {
+    return codec == o.codec && chunkTarget == o.chunkTarget && maxDocsPerChunk == o.maxDocsPerChunk;
+  }
+  bool operator==(const StoredChunkFormat&) const = default;
+
+  // The defaults for a codec.
+  static StoredChunkFormat defaults(Codec codec) {
+    if (codec == LZ4) return {};
+    return {ZSTD, DEFAULT_ZSTD_LEVEL, DEFAULT_ZSTD_CHUNK_TARGET, DEFAULT_ZSTD_MAX_DOCS_PER_CHUNK};
+  }
+};
+
+// Describes a stored-fields resource (a per-segment column of compressed
 // whole-doc chunks).  Registered in the schema under the resource's own name
 // (e.g. "_stored_" for the default, "_stored_paragraphs_" for a named family).
 // FieldType::storedResource_ names which StoredFieldType a STORED field
-// flushes into.
+// flushes into.  Built from SchemaDef.stored_resources.
 class StoredFieldType : public FieldType {
 public:
-  // Codec name.  Only "lz4" is supported in v1; reserved slot for future
-  // codecs (e.g. zstd with a trained dictionary).
-  std::string codec_;
-  // Target uncompressed bytes per chunk before flushing.
-  size_t chunkTargetUncompressed_;
-  // Hard cap on docs per chunk.  A chunk flushes when *either* the byte
-  // target or this doc count is reached, whichever comes first.
-  size_t maxDocsPerChunk_;
+  StoredChunkFormat format_;
 
-  explicit StoredFieldType(std::string_view name,
-                           std::string_view codec = "lz4",
-                           size_t chunkTargetUncompressed = 16 * 1024,
-                           size_t maxDocsPerChunk = 128)
+  explicit StoredFieldType(std::string_view name, StoredChunkFormat format = {})
     : FieldType(name, FieldType::BIN, FieldType::STORED),
-      codec_(codec),
-      chunkTargetUncompressed_(chunkTargetUncompressed),
-      maxDocsPerChunk_(maxDocsPerChunk) {}
+      format_(format) {}
 };
 
 } // end namespace

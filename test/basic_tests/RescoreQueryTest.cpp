@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 
 #include "luxir/query/BooleanQuery.h"
+#include "luxir/query/AllQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/ParseContext.h"
@@ -91,6 +92,50 @@ void expectSameTopK(IndexReader& reader, Query& query,
 } // namespace
 
 class RescoreQueryTest : public LuxirTest {};
+
+TEST_F(RescoreQueryTest, fieldMetadataBelongsToEachWeight) {
+  CollectionHelper first("first");
+  CollectionHelper second("second");
+  ASSERT_TRUE(first.index(flatdoc("aaa_i", 1, "popularity_i", 3),
+                          UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(second.index(flatdoc("popularity_i", 29), UpdateMessage::COMMIT).success);
+  auto firstReader = first.getIndexWriter()->snapshots.readers.getReader();
+  auto secondReader = second.getIndexWriter()->snapshots.readers.getReader();
+  google::protobuf::Arena arena;
+  auto schema = first.collection().getSchema();
+  auto* program = parseValue(arena, *schema, "popularity_i");
+  AllQuery all;
+  ForcePrepareQuery forced(&all);
+  for (bool prepare : {false, true}) {
+    RescoreQuery query(prepare ? (Query*)&forced : &all, program);
+    MemPool firstPool;
+    MemPool secondPool;
+    Query::Context firstContext(firstPool, *firstReader);
+    Query::Context secondContext(secondPool, *secondReader);
+    auto* firstWeight = query.createWeight(firstContext, Query::NEED_SCORES);
+    auto* secondWeight = query.createWeight(secondContext, Query::NEED_SCORES);
+    std::unique_ptr<Query::Weight::PreparedWeight> firstPrepared;
+    std::unique_ptr<Query::Weight::PreparedWeight> secondPrepared;
+    if (prepare) {
+      Query::Weight::PrepareContext firstPrepare{*firstReader, {}, false, nullptr};
+      Query::Weight::PrepareContext secondPrepare{*secondReader, {}, false, nullptr};
+      firstPrepared = firstWeight->prepare(firstPrepare);
+      secondPrepared = secondWeight->prepare(secondPrepare);
+    }
+    auto& firstSource = firstPrepared ? (Query::SegmentSource&)*firstPrepared : *firstWeight;
+    auto& secondSource = secondPrepared ? (Query::SegmentSource&)*secondPrepared : *secondWeight;
+    auto* firstScorer = firstSource.createScorer(firstPool, firstReader->segments()[0]);
+    auto* secondScorer = secondSource.createScorer(secondPool, secondReader->segments()[0]);
+    ASSERT_NE(nullptr, firstScorer);
+    ASSERT_NE(nullptr, secondScorer);
+    EXPECT_EQ(0, firstScorer->next());
+    EXPECT_EQ(0, secondScorer->next());
+    EXPECT_EQ(3, firstScorer->score());
+    EXPECT_EQ(29, secondScorer->score());
+    EXPECT_EQ(3, firstScorer->score());
+    EXPECT_EQ("popularity_i", program->root().text);
+  }
+}
 
 TEST_F(RescoreQueryTest, grammarExecutionPreservesMembershipAndAllowsNegativeScores) {
   CollectionHelper helper;
@@ -273,8 +318,8 @@ TEST_F(RescoreQueryTest, childScoreDependencyAndScorelessBinding) {
   Query::Weight* filterWeight = unbound.createWeight(filterContext, 0);
   Query::Context childFilterContext(pool, *reader);
   Query::Weight* childFilterWeight = term.createWeight(childFilterContext, 0);
-  EXPECT_EQ(childFilterWeight->count(reader->segments()[0]),
-            filterWeight->count(reader->segments()[0]));
+  EXPECT_EQ(countForTests(childFilterWeight, reader->segments()[0]),
+            countForTests(filterWeight, reader->segments()[0]));
   Query::Scorer* filterScorer =
       filterWeight->createScorer(pool, reader->segments()[0]);
   ASSERT_NE(nullptr, filterScorer);
@@ -297,7 +342,7 @@ TEST_F(RescoreQueryTest, childScoreDependencyAndScorelessBinding) {
       preparedQuery.createWeight(preparedContext, Query::NEED_SCORES);
   ASSERT_TRUE(preparedWeight->needsPrepare());
   Query::Weight::PrepareContext prepareContext{
-      *reader, std::span<DocSet* const>{}, false};
+      *reader, std::span<DocSet* const>{}, false, nullptr};
   auto prepared = preparedWeight->prepare(prepareContext);
   ASSERT_NE(nullptr, prepared);
   Query::Scorer* preparedScorer =

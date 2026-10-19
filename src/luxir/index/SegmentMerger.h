@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "MergeCostModel.h"
 #include "OrdCollector.h"
@@ -551,13 +552,14 @@ class SegmentMerger {
   std::span<LiveDocs*> liveDocs; // parallel to preaders, nullptr if no deletes
   PostingsWriter& postingsWriter;
   IndexRamBudget& ramBudget;
+  // Current schema: per-resource stored-fields formats, and text merges drop
+  // postings levels and norms it no longer asks for.
+  const Schema& schema;
   const uint64_t estimatedOutputBytes;
   const int32_t streamBudget;
   int64_t termPartitionMinBytes;
   int64_t termPartitionMinRangeBytes;
   int32_t termPartitionMaxRanges;
-  // Current schema, if any: text merges drop postings levels and norms it no longer asks for.
-  std::shared_ptr<Schema> schema;
 
   std::vector<FieldReader> fieldReaders;  // todo - pool allocate (& use smart ptr on MergeSeg if destructors needed)
   std::vector<Segment> segs;
@@ -568,14 +570,14 @@ public:
   SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
-                int32_t termPartitionMaxRanges, std::shared_ptr<Schema> schema = nullptr)
+                int32_t termPartitionMaxRanges, const Schema& schema)
   : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
+    schema(schema),
     estimatedOutputBytes(estimateOutputBytes(preaders)),
     streamBudget(MergeCostModel::streamBudgetForBytes(estimatedOutputBytes)),
     termPartitionMinBytes(termPartitionMinBytes),
     termPartitionMinRangeBytes(termPartitionMinRangeBytes),
-    termPartitionMaxRanges(termPartitionMaxRanges),
-    schema(std::move(schema))
+    termPartitionMaxRanges(termPartitionMaxRanges)
   {
     assert(preaders.size() == liveDocs.size());
     assert(termPartitionMinBytes >= 0 && termPartitionMinRangeBytes > 0);
@@ -721,7 +723,8 @@ private:
   int64_t estimateCost(std::span<const MergeFieldInfo> fields) const {
     assert(!fields.empty());
     if (isStoredField(fields[0].segFieldInfo)) {
-      int64_t maxChunkBytes = 0;
+      StoredChunkFormat format = storedFormat(std::string_view(fields[0].segFieldInfo.fieldname));
+      int64_t maxChunkBytes = format.chunkTarget;
       for (const auto& field : fields) {
         maxChunkBytes = std::max(
             maxChunkBytes,
@@ -730,9 +733,11 @@ private:
       // Stored-field merge processes one source segment at a time.  The
       // value-scaled buffers are: source decompressed chunk, writer per-doc
       // staging, writer chunk body, writer assembled uncompressed chunk, and
-      // LZ4 compression output.  LIGHT_BYTES covers fixed stream/mono scratch
-      // and the small LZ4_compressBound overhead above 1x.
-      return MergeCostModel::storedFieldsBytes(maxChunkBytes);
+      // compression output.  LIGHT_BYTES covers fixed stream/mono scratch,
+      // the small compress-bound overhead above 1x and a ZSTD source's
+      // decompression context; a ZSTD output adds its compression context.
+      return MergeCostModel::storedFieldsBytes(maxChunkBytes)
+          + StoredChunkCompressor::contextBytes(format, maxChunkBytes);
     }
 
     FieldType::Type type;
@@ -1330,6 +1335,7 @@ private:
       int32_t blockOrd = 0;
       int64_t sumDocFreq = 0;
       int64_t sumTotalTermFreq = 0;
+      bool mayHaveFitted = false;
 
       for (auto& outputPtr : outputs) {
         RangeOutput& output = *outputPtr;
@@ -1362,12 +1368,14 @@ private:
         blockOrd += result.nBlocks;
         sumDocFreq += result.sumDocFreq;
         sumTotalTermFreq += result.sumTotalTermFreq;
+        mayHaveFitted |= result.mayHaveFitted;
         previousLastTerm = result.lastTerm;
       }
 
       outputFieldInfo->nTerms = termOrd;
       outputFieldInfo->sumDocFreq = sumDocFreq;
       outputFieldInfo->sumTotalTermFreq = sumTotalTermFreq;
+      if (mayHaveFitted) outputFieldInfo->flags |= FieldType::MAY_HAVE_FITTED;
       if (termOrd == 0) {
         outputFieldInfo->flags &= ~FieldType::TERM_RANGES;
         outputFieldInfo->termBlockIndexLoc = {0, 0};
@@ -1431,7 +1439,7 @@ private:
     constexpr int32_t upperLevels = FieldType::INDEX_DOCS_FREQS_POSITIONS & ~FieldType::INDEX_DOCS;
     int32_t levels = (allFlags & FieldType::INDEX_DOCS) | (commonFlags & upperLevels);
     bool norms = (indexedFlags & FieldType::OMIT_NORMS) == 0;
-    FieldType* current = schema ? schema->getFieldTypePtr(name) : nullptr;
+    FieldType* current = schema.getFieldTypePtr(name);
     if (current != nullptr && current->type() == FieldType::TEXT && current->indexed()) {
       levels &= current->flags_ | ~upperLevels;
       norms = norms && current->hasNorms();
@@ -1489,7 +1497,7 @@ private:
         LOG_ERROR("Field types don't match! {} {}", (int)type, (int)field->segFieldInfo.type);
         // now what?
       }
-      allFlags |= field->segFieldInfo.flags & ~FieldType::TERM_RANGES;
+      allFlags |= field->segFieldInfo.flags & ~FieldType::SEGMENT_MARKERS;
       // A source whose field was not indexed (index=none text) contributes no
       // postings, so it does not limit the levels or norms of indexed sources.
       if (field->segFieldInfo.flags & FieldType::INDEX_DOCS) {
@@ -1606,12 +1614,20 @@ private:
   }
 
 
+  // Output format for a stored-fields resource: the schema's current setting,
+  // else the defaults.
+  StoredChunkFormat storedFormat(std::string_view resourceName) const {
+    auto* type = dynamic_cast<const StoredFieldType*>(schema.getFieldTypePtr(resourceName));
+    return type ? type->format_ : StoredChunkFormat{};
+  }
+
   // Merge one stored-fields resource (default or named column family).
-  // Decompresses each source segment's live docs in merged-docID order and
-  // re-emits them via a fresh StoredFieldsWriter for the same resource name.
-  // Multi-valued fields are preserved as single addValues calls so the
-  // on-disk grouping survives the merge.  Verbatim chunk-copy optimization
-  // is a follow-up.
+  // Writes a fresh StoredFieldsWriter for the same resource name in the
+  // resource's current format.  Sources in that same layout are copied as
+  // compressed chunks; the rest are decompressed and their live docs re-added
+  // in merged-docID order, which converts them to the output codec and chunk
+  // size.  Multi-valued fields are preserved as single addValues calls so the
+  // on-disk grouping survives the merge.
   void mergeStoredFields(std::vector<MergeFieldInfo>& mergeFieldInfos) {
     // Resource name comes from the (identical across segments) field name.
     std::string_view resourceName(mergeFieldInfos[0].segFieldInfo.fieldname);
@@ -1625,10 +1641,7 @@ private:
       fieldInfos[mfi.seg->ord] = &mfi.segFieldInfo;
     }
 
-    // Config isn't threaded through the merger yet; writer uses defaults.
-    // When per-family codec/chunk-size becomes meaningful, look up the
-    // StoredFieldType in the current schema here.
-    StoredFieldsWriter writer(postingsWriter, resourceName);
+    StoredFieldsWriter writer(postingsWriter, resourceName, storedFormat(resourceName));
     std::vector<int64_t> srcChunkFirstDocs, srcChunkOffsets;
 
     for (auto& seg : segs) {
@@ -1640,10 +1653,12 @@ private:
       // base + localId, and compressed chunk bodies are position-independent,
       // so the whole source region is copied without decompression - the
       // dominant cost of a large merge is otherwise this resource's serial
-      // LZ4 recompression.  Bodies reference the source's field-id table, so
-      // it must adopt into ours; deletions or a table mismatch fall back to
+      // recompression.  The source must have the output's codec and chunk
+      // limits, and bodies reference its field-id table, so it must adopt
+      // into ours; deletions, another layout or a table mismatch fall back to
       // the doc-by-doc re-add below.
-      if (!seg.hasDeletes() && writer.adoptFieldTable(reader.fieldNames())) {
+      if (!seg.hasDeletes() && reader.format().sameLayout(writer.format())
+          && writer.adoptFieldTable(reader.fieldNames())) {
         writer.alignForRawAppend(seg.base);
         reader.readChunkDirectory(srcChunkFirstDocs, srcChunkOffsets);
         writer.appendRawChunkRegion(seg.base, reader.chunkRegionPtr(),

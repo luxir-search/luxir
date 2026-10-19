@@ -10,6 +10,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <oneapi/tbb/task_arena.h>
 #include "Collection.h"
 #include "CollectionEvents.h"
 #include "luxir/LuxirConfig.h"
@@ -106,9 +107,12 @@ private:
     ~Transition();
   };
 
+  std::shared_ptr<Metrics> metrics;
   const LuxirConfig& config;
   CollectionEvents& events;
   IndexRamBudget& indexRamBudget;
+  oneapi::tbb::task_arena& arena;  // runs every writer's indexing (the node's index arena)
+  bool verifyOnOpen; // store.verify-on-open=full
   std::unique_ptr<DirectoryFactory> factory;
   SharedLazyMap<CollectionId, Collection> map;
   std::mutex slotsMutex;
@@ -120,7 +124,10 @@ private:
 
   std::shared_ptr<Collection> makeCollection(const CollectionId& id, std::shared_ptr<Directory> directory);
   std::shared_ptr<Collection> openCollection(const CollectionId& id, Role role, const std::optional<std::string>& selected);
-  std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {});
+  std::shared_ptr<Collection> initWriter(const CollectionId& id, std::shared_ptr<Schema> initialSchema = {}, bool startup = false);
+  // A writer whose newest root is invalid continues from the newest valid one
+  // under a new incarnation. Returns the incarnation to open.
+  std::string recoverWriter(const CollectionId& id, CollectionStorage& storage, const std::string& selected);
   void observe(const CollectionId& id, Collection& collection);
   // Lists and announces a registration, or a removal.
   void registered(const CollectionId& id, const std::shared_ptr<Collection>& collection);
@@ -132,7 +139,8 @@ private:
   void retire(const CollectionId& id, const std::string& selected) noexcept;
 
 public:
-  Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget);
+  Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget,
+              oneapi::tbb::task_arena& arena, std::shared_ptr<Metrics> metrics = Metrics::detached());
   ~Collections();
 
   // A tenant or collection name: [a-z][a-z0-9_]*, at most 255 bytes.
@@ -178,6 +186,17 @@ public:
   void retainSelected(const CollectionId& id) noexcept;
   // Registers an unavailable placeholder unless something is already registered.
   std::shared_ptr<Collection> unavailable(const CollectionId& id, std::string reason);
+
+  // A check found `suspects` of the registered `collection` damaged: the
+  // names are recorded durably in its incarnation directory first, then the
+  // collection fails with `reason` and the change is announced. A failed
+  // marker write is warned but does not prevent failing the collection.
+  void fail(const CollectionId& id, const std::shared_ptr<Collection>& collection, const std::string& reason,
+            std::span<const std::string> suspects);
+  // Replaces the registered `expected` with an unavailable placeholder and
+  // retains its incarnation, as a failed load does: a follower then repairs
+  // it in place by staging the same incarnation again.
+  void unload(const CollectionId& id, const std::shared_ptr<Collection>& expected, std::string reason);
 };
 
 }

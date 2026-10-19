@@ -19,7 +19,7 @@
 #include "luxir/api/build.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/reader/DocsEnum.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
@@ -91,17 +91,17 @@ protected:
     for (auto& segment : reader.segments()) {
       auto& postingsReader = segment.postingsReader();
       MemPool pool;
-      FieldReader idFields(postingsReader);
-      FieldReader valueFields(postingsReader);
+      const PostingsReader::Field* idFields = nullptr;
+      const PostingsReader::Field* valueFields = nullptr;
       SegFieldInfo idInfo;
       SegFieldInfo valueInfo;
-      EXPECT_TRUE(idFields.seek("id"));
-      EXPECT_TRUE(valueFields.seek("n_i"));
-      idFields.readFieldInfo(idInfo);
-      valueFields.readFieldInfo(valueInfo);
+      EXPECT_TRUE(((idFields = postingsReader.fieldInfo("id")) != nullptr));
+      EXPECT_TRUE(((valueFields = postingsReader.fieldInfo("n_i")) != nullptr));
+      idInfo = *idFields;
+      valueInfo = *valueFields;
       IntColReader column(postingsReader, valueInfo);
       IntColReader::SparseIterator values(column);
-      const auto* leaves = postingsReader.numericLeafMeta("n_i");
+      const auto* leaves = postingsReader.fieldInfo("n_i")->numericLeafMeta();
       EXPECT_NE(nullptr, leaves);
       TermsEnum terms(pool, postingsReader, idInfo);
       while (terms.nextTerm()) {
@@ -133,6 +133,54 @@ protected:
     return out;
   }
 };
+
+TEST_F(SegmentSharingTest, fieldNamesFollowSegmentSet) {
+  addSegment(3);
+  auto before = current();
+  auto field = before->field("n_i");
+  auto missing = before->field("missing_i");
+  auto* info = field.at(0);
+  ASSERT_NE(nullptr, info);
+  EXPECT_EQ(IndexReader::FieldSegments{}, missing);
+  EXPECT_FALSE(missing.exists());
+  EXPECT_EQ(nullptr, missing.at(0));
+  EXPECT_EQ(3, field.stats().docsWithField);
+
+  auto same = std::make_shared<IndexReader>(writer->dir, before.get());
+  EXPECT_EQ(field, same->field("n_i"));
+  EXPECT_EQ(missing, same->field("missing_i"));
+  EXPECT_EQ(&field.stats(), &same->field("n_i").stats());
+
+  ASSERT_TRUE(helper->deleteById("0", UpdateMessage::COMMIT).success);
+  auto deleted = current();
+  auto deletedField = deleted->field("n_i");
+  EXPECT_EQ(&field.stats(), &deletedField.stats());
+  EXPECT_EQ(3, deletedField.stats().docsWithField);
+  EXPECT_EQ(2, deleted->liveDocs());
+
+  // The same segment set can be opened through another publisher's reader.
+  auto independent = PostingsReader::create(writer->dir, before->segments()[0].segInfo.seg_id);
+  auto snapshot = *writer->snapshots.snapshot();
+  snapshot.openReaders[0] = independent;
+  auto separate = std::make_shared<IndexReader>(writer->dir, snapshot, before.get());
+  auto separateField = separate->field("n_i");
+  EXPECT_EQ(independent, separate->segments()[0].postingsReaderShared());
+  EXPECT_EQ(&field.stats(), &separateField.stats());
+  EXPECT_NE(info, separateField.at(0));
+  EXPECT_EQ(independent->fieldInfo("n_i"), separateField.at(0));
+
+  addSegment(2);
+  auto after = current();
+  ASSERT_EQ(2u, after->segments().size());
+  EXPECT_EQ(before->segments()[0].postingsReaderShared(),
+            after->segments()[0].postingsReaderShared());
+  auto reopenedField = after->field("n_i");
+  EXPECT_NE(field, reopenedField);
+  EXPECT_EQ(info, reopenedField.at(0));
+  EXPECT_EQ(5, reopenedField.stats().docsWithField);
+  EXPECT_NE(&field.stats(), &reopenedField.stats());
+  EXPECT_FALSE(after->field("missing_i").exists());
+}
 
 // A delete-only commit changes one segment's live docs: every PostingsReader
 // and every other segment's live docs carry over. The writer applied the

@@ -253,18 +253,14 @@ bool forEachElement(const api::Val& val, F&& fn) {
   return false;
 }
 
-// Append one dense vector to floats and return its element count.
+// Append one dense vector to floats and return its element count. Doubles narrow
+// unchecked (out of float32 range becomes inf); the vector handler rejects
+// non-finite elements whatever arm they arrived in.
 inline int32_t appendVector(const api::Val& one, std::string_view fieldName,
                             int32_t ordinal, std::vector<float>& floats) {
   size_t start = floats.size();
   // Error-message prefix, formatted lazily so the success path does no formatting.
   auto prefix = [&]() { return ordinal < 0 ? std::string() : fmt::format("vector {}: ", ordinal); };
-  auto appendDouble = [&](double d, size_t index) {
-    float f = (float)d;
-    if (!std::isfinite(f)) throw RequestError(fmt::format(
-        "field '{}': {}element {} is outside finite float32 range", fieldName, prefix(), index), "invalid_value");
-    floats.push_back(f);
-  };
   if (const auto* vec = std::get_if<api::Vector>(&one.kind)) {
     if (!vec->f32.has_value()) throw RequestError(fmt::format(
         "field '{}': {}unsupported or unset vector encoding", fieldName, prefix()), "invalid_value");
@@ -272,14 +268,18 @@ inline int32_t appendVector(const api::Val& one, std::string_view fieldName,
   } else if (const auto* arr = std::get_if<api::ArrFloat>(&one.kind)) {
     floats.insert(floats.end(), arr->v.begin(), arr->v.end());
   } else if (const auto* arr = std::get_if<api::ArrDouble>(&one.kind)) {
-    for (size_t i = 0; i < arr->v.size(); i++) appendDouble(arr->v[i], i);
+    size_t n = arr->v.size();
+    floats.resize(start + n);
+    for (size_t i = 0; i < n; i++) floats[start + i] = (float)arr->v[i];
   } else if (const auto* arr = std::get_if<api::ArrInt>(&one.kind)) {
-    for (int64_t value : arr->v) floats.push_back((float)value);
+    size_t n = arr->v.size();
+    floats.resize(start + n);
+    for (size_t i = 0; i < n; i++) floats[start + i] = (float)arr->v[i];
   } else if (const auto* arr = std::get_if<api::ArrVal>(&one.kind)) {
     for (size_t i = 0; i < arr->v.size(); i++) {
       const auto& kind = arr->v[i].kind;
       if (const auto* value = std::get_if<float>(&kind)) floats.push_back(*value);
-      else if (const auto* value = std::get_if<double>(&kind)) appendDouble(*value, i);
+      else if (const auto* value = std::get_if<double>(&kind)) floats.push_back((float)*value);
       else if (const auto* value = std::get_if<int64_t>(&kind)) floats.push_back((float)*value);
       else throw RequestError(fmt::format("field '{}': {}element {} is not a number",
                                                 fieldName, prefix(), i), "invalid_value");

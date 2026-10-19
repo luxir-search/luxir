@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <type_traits>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -140,9 +141,10 @@ private:
     return domain;
   }
 
+  template <bool Tracked = false>
   DomainHandle composeBase(
       size_t baseVariant, DomainHandle identity,
-      std::span<const DomainHandle> filters) const {
+      std::span<const DomainHandle> filters, RequestMemTracker* tracker = nullptr) const {
     assert(filters.size() == filterCount);
     std::vector<DomainHandle> parts;
     parts.reserve(filterCount + 1);
@@ -150,7 +152,8 @@ private:
     for (size_t i = 0; i < filterCount; i++) {
       if (baseIncludes(baseVariant, i)) parts.push_back(filters[i]);
     }
-    return compose(std::move(parts));
+    if constexpr (Tracked) return composeTracked(std::move(parts), *tracker);
+    else return compose(std::move(parts));
   }
 
 public:
@@ -216,80 +219,15 @@ public:
     filterCount = count;
   }
 
-  template <typename Excluded>
   bool addChild(
-      std::string_view key, Excluded&& excluded,
+      std::string_view key, std::function_ref<bool(size_t)> excluded,
       const QuerySpec* resetQuery = nullptr,
       bool applyParentFilters = false,
-      std::span<const QuerySpec> extraFilters = {}) {
-    Frame frame = resetQuery == nullptr ? Frame::INHERIT : Frame::RESET;
-    std::vector<uint64_t> included((filterCount + 63) >> 6, 0);
-    if (frame == Frame::INHERIT || applyParentFilters) {
-      for (size_t i = 0; i < filterCount; i++) {
-        if (!excluded(i)) included[i >> 6] |= 1ULL << (i & 63);
-      }
-    }
-
-    Variant candidate;
-    candidate.frame = frame;
-    candidate.included = std::move(included);
-    if (frame == Frame::INHERIT) {
-      candidate.inheritBase = internInheritBase(candidate.included);
-    } else {
-      candidate.resetSource = internSource(*resetQuery);
-    }
-    candidate.extraSources.reserve(extraFilters.size());
-    for (const auto& filter : extraFilters) {
-      candidate.extraSources.push_back(internSource(filter));
-    }
-
-    if (candidate.frame == Frame::INHERIT
-        && candidate.inheritBase == 0
-        && candidate.extraSources.empty()) {
-      childRoutes.push_back({key, 0});
-      return false;
-    }
-
-    auto found = std::find_if(
-        variants.begin(), variants.end(), [&](const Variant& variant) {
-          return variant.frame == candidate.frame
-              && variant.included == candidate.included
-              && variant.resetSource == candidate.resetSource
-              && variant.extraSources == candidate.extraSources;
-        });
-    size_t variant;
-    bool created = found == variants.end();
-    if (created) {
-      if (variants.size() >= MAX_NON_DEFAULT_VARIANTS) {
-        bool domainOverride = resetQuery != nullptr || !extraFilters.empty();
-        throw std::runtime_error(
-            "op '" + std::string(key)
-            + (domainOverride
-                    ? "': domain variant cap 64 exceeded"
-                    : "': routed filter variant cap 64 exceeded"));
-      }
-      variants.push_back(std::move(candidate));
-      if (resetQuery != nullptr || !extraFilters.empty()) {
-        domainOverrideCount++;
-      }
-      variant = variants.size();
-    } else {
-      variant = (size_t) (found - variants.begin()) + 1;
-    }
-    childRoutes.push_back({key, (uint8_t) variant});
-    return created;
-  }
+      std::span<const QuerySpec> extraFilters = std::span<const QuerySpec>());
 
   void buildWeights(
       Query::Context& context, Query::PlanningContext& planning,
-      int32_t requestFlags) {
-    int32_t filterFlags = requestFlags
-        & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING);
-    for (auto& source : querySources) {
-      source.weight = source.query->createWeight(context, filterFlags);
-      source.use = planning.getFilterUse(*source.query);
-    }
-  }
+      int32_t requestFlags);
 
   bool empty() const { return variants.empty(); }
   size_t nonDefaultVariantCount() const { return variants.size(); }
@@ -499,18 +437,23 @@ public:
     selection.offers[selection.count++] = {
         Offer::INDEPENDENT, independentCost,
         saturatedMultiply(produced + 2, setBytes)};
-    std::sort(
-        selection.offers.begin(),
-        selection.offers.begin() + (std::ptrdiff_t) selection.count,
-        [](const CostedOffer& left, const CostedOffer& right) {
-          if (left.cpuCost != right.cpuCost) {
-            return left.cpuCost < right.cpuCost;
-          }
-          if (left.peakBytes != right.peakBytes) {
-            return left.peakBytes < right.peakBytes;
-          }
-          return (uint8_t) left.offer < (uint8_t) right.offer;
-        });
+    auto less = [](const CostedOffer& left, const CostedOffer& right) {
+      if (left.cpuCost != right.cpuCost) return left.cpuCost < right.cpuCost;
+      if (left.peakBytes != right.peakBytes) return left.peakBytes < right.peakBytes;
+      return (uint8_t)left.offer < (uint8_t)right.offer;
+    };
+    // There are at most three offers. A bounded insertion sort also avoids
+    // GCC's array-bounds false positives in std::sort's introsort machinery.
+    for (size_t i = 1; i < selection.offers.size(); i++) {
+      if (i >= selection.count) break;
+      auto offer = selection.offers[i];
+      size_t j = i;
+      while (j != 0 && less(offer, selection.offers[j - 1])) {
+        selection.offers[j] = selection.offers[j - 1];
+        j--;
+      }
+      selection.offers[j] = offer;
+    }
     if (forcedOfferForTests.has_value()) {
       auto forced = std::find_if(
           selection.offers.begin(),
@@ -527,43 +470,52 @@ public:
     return selection;
   }
 
+  template <bool Tracked = false>
   DomainHandle constrainRaw(
-      DomainHandle rawMatches, DomainHandle base) const {
+      DomainHandle rawMatches, DomainHandle base, RequestMemTracker* tracker = nullptr) const {
     if (rawMatches.get() == nullptr) return freeze(std::move(base));
     if (base.get() == nullptr) return freeze(std::move(rawMatches));
     std::array<DocSet*, 2> parts{rawMatches.get(), base.get()};
-    return freeze(DomainHandle(DocSet::intersect(parts)));
+    auto result = freeze(DomainHandle(DocSet::intersect(parts)));
+    if constexpr (Tracked) return account(std::move(result), *tracker, "constrained bucket matches");
+    else return result;
   }
 
+  template <bool Tracked = false>
   std::vector<DomainHandle> produceSharedBases(
       DomainHandle rawMatches,
-      std::span<const DomainHandle> filters) const {
+      std::span<const DomainHandle> filters, RequestMemTracker* tracker = nullptr) const {
     assert(needsInheritProduction());
     std::vector<DomainHandle> output(inheritBaseCount());
     for (size_t variant = 0; variant < output.size(); variant++) {
-      output[variant] = composeBase(variant, rawMatches, filters);
+      output[variant] = composeBase<Tracked>(variant, rawMatches, filters, tracker);
       assert(output[variant].isDeliverable());
     }
     return output;
   }
 
-  template <typename Producer>
+  template <bool Tracked = false, typename Producer>
   std::vector<DomainHandle> produceIndependentBases(
       DomainHandle base,
-      std::span<const DomainHandle> filters, Producer&& producer) const {
+      std::span<const DomainHandle> filters, Producer&& producer,
+      RequestMemTracker* tracker = nullptr) const {
     assert(needsInheritProduction());
     std::vector<DomainHandle> output(inheritBaseCount());
     for (size_t variant = 0; variant < output.size(); variant++) {
-      DomainHandle eligibility = composeBase(variant, base, filters);
+      DomainHandle eligibility = composeBase<Tracked>(variant, base, filters, tracker);
       output[variant] = freeze(producer(eligibility.get()));
+      if constexpr (Tracked) {
+        output[variant] = account(std::move(output[variant]), *tracker, "independent bucket matches");
+      }
       assert(output[variant].isDeliverable());
     }
     return output;
   }
 
+  template <bool Tracked = false>
   DomainHandle defaultDomain(
-      DomainHandle base, std::span<const DomainHandle> filters) const {
-    return composeBase(0, std::move(base), filters);
+      DomainHandle base, std::span<const DomainHandle> filters, RequestMemTracker* tracker = nullptr) const {
+    return composeBase<Tracked>(0, std::move(base), filters, tracker);
   }
 
   static DomainHandle compose(std::vector<DomainHandle> parts) {
@@ -655,17 +607,143 @@ public:
     return true;
   }
 
+  // Semantic predicate capability and execution preparation are distinct:
+  // unknown/selection queries and prepared sources take the complete-input route.
+  bool segmentLocal(bool selectionInPath = false) const;
+
+  // Light domain ownership charge: no stored label/string and no mutable
+  // scratch reservation. Ordinary group domains use this before allocation.
+  struct DomainCharge {
+    RequestMemTracker& tracker;
+    size_t bytes;
+    DomainCharge(RequestMemTracker& tracker, size_t bytes, std::string_view detail,
+                 std::string_view breaker = "domain variants")
+        : tracker(tracker), bytes(bytes) {
+      tracker.charge(bytes, breaker, detail);
+    }
+    ~DomainCharge() { tracker.release(bytes); }
+  };
+
+  static DomainHandle account(DomainHandle domain, RequestMemTracker& tracker,
+                              std::string_view detail);
+
+  static DomainHandle composeTracked(std::vector<DomainHandle> parts, RequestMemTracker& tracker);
+
+  // One active segment's primitive sources, shared by every bucket using
+  // this plan. Cache admission may build a primitive once; a bypass stays
+  // scoped to each structural input instead of forcing an index-wide scan.
+  struct SegmentSources {
+    struct Source {
+      Query::Weight* weight = nullptr;
+      FilterCache::Use* use = nullptr;
+      std::optional<DomainHandle> stable;
+      bool bypassed = false;
+    };
+    IndexReader& reader;
+    Query::PlanningContext& planning;
+    int32_t segment;
+    RequestMemTracker& tracker;
+    RequestMemResource resource;
+    std::pmr::vector<Source> values;
+
+    SegmentSources(const DomainVariantPlan& plan, IndexReader& reader,
+                   Query::PlanningContext& planning, int32_t segment, RequestMemTracker& tracker);
+
+    SegmentSources(std::span<Query::Weight* const> weights, std::span<FilterCache::Use* const> uses,
+                   IndexReader& reader, Query::PlanningContext& planning, int32_t segment,
+                   RequestMemTracker& tracker);
+
+    void init(size_t source, Query::Weight* weight, FilterCache::Use* use);
+
+    SegmentSources(const SegmentSources&) = delete;
+    SegmentSources& operator=(const SegmentSources&) = delete;
+
+    DomainHandle materialize(size_t source, DocSet* base);
+    DomainHandle materialize(size_t source, DocSet* base, FilterCache::Probe acquired);
+
+    DomainHandle resolve(size_t source, DomainHandle base,
+                         const QueryPrep::PreparedSource* prepared = nullptr);
+  };
+
+  template <typename Resolve, typename Compose>
+  std::vector<DomainHandle> composeVariants(DomainHandle inherited, DomainHandle resetBase,
+      Resolve&& resolve, Compose&& composeResult,
+      std::span<const DomainHandle> prepared = {}, std::span<const uint8_t> ready = {},
+      std::span<const DomainHandle> variantBases = {}, std::optional<Frame> onlyFrame = {}) const {
+    std::vector<DomainHandle> output(variantCount());
+    output[0] = inherited;
+    for (size_t variant = 1; variant < output.size(); variant++) {
+      if (onlyFrame && frame(variant) != *onlyFrame) continue;
+      if (!ready.empty() && ready[variant]) { output[variant] = prepared[variant]; continue; }
+      auto kind = frame(variant);
+      DomainHandle base = variantBases.empty()
+          ? (kind == Frame::RESET ? resetBase : inherited) : variantBases[variant];
+      std::vector<DomainHandle> parts{base};
+      bool firstSource = true;
+      auto add = [&](size_t source) {
+        if (sourceWeight(source)->matchesAllDocs()) return;
+        auto value = resolve(source, base, kind);
+        // Each resolved source is already restricted to its base. Null is
+        // unrestricted, so it may never replace a non-null structural base.
+        assert(value.isDeliverable());
+        assert(!base.get() || value.get());
+        // RESET starts from the effective source, as at the request root;
+        // re-inserting live docs would repeat a full AND. INHERIT keeps its
+        // established composition and reservation policy.
+        if (firstSource && kind == Frame::RESET) parts.clear();
+        firstSource = false;
+        parts.push_back(std::move(value));
+      };
+      if (kind == Frame::RESET) add(resetSource(variant));
+      for (size_t source : extraSources(variant)) add(source);
+      output[variant] = composeResult(std::move(parts));
+    }
+    return output;
+  }
+
+  template <typename Resolve>
+  std::vector<DomainHandle> produceSegment(DomainHandle inherited, DomainHandle resetBase,
+      Resolve&& resolve, RequestMemTracker& tracker,
+      std::span<const DomainHandle> prepared = {}, std::span<const uint8_t> ready = {},
+      std::span<const DomainHandle> variantBases = {}, std::optional<Frame> onlyFrame = {}) const {
+    return composeVariants(std::move(inherited), std::move(resetBase), std::forward<Resolve>(resolve),
+        [&](auto parts) { return composeTracked(std::move(parts), tracker); },
+        prepared, ready, variantBases, onlyFrame);
+  }
+
+  std::vector<DomainHandle> produceSegment(SegmentSources& sources,
+      DomainHandle inherited, DomainHandle resetBase, RequestMemTracker& tracker,
+      std::span<const DomainHandle> variantBases = {}, std::optional<Frame> onlyFrame = {}) const;
+
   struct PreparedResetVariants {
     std::vector<std::vector<DomainHandle>> domains;
     std::vector<uint8_t> ready;
   };
 
-  template <typename Reserve>
+  struct NoPreparedCharge {
+    std::shared_ptr<Reservation> operator()(const Query::Weight::PreparedWeight&) const { return {}; }
+    void retain(std::shared_ptr<Reservation>) const {}
+  };
+
+  // The structural caller owns canonical prepared windows. Temporary variant
+  // windows keep a local charge; ordinary preparation has no accounting state.
+  struct PreparedAccounting {
+    RequestMemTracker& tracker;
+    std::function_ref<void(std::shared_ptr<Reservation>)> retain;
+    std::shared_ptr<Reservation> operator()(const Query::Weight::PreparedWeight& window) const {
+      return std::make_shared<Reservation>(tracker, window.retainedBytes(), "reset prepared window");
+    }
+  };
+
+  template <typename Reserve, typename PreparedCharge = NoPreparedCharge,
+            typename Finish = std::nullptr_t>
   PreparedResetVariants prepareResetVariants(
       std::vector<QueryPrep::PreparedSource>& preparedSources,
       const std::vector<std::vector<DomainHandle>>& eligibility,
       std::span<DocSet* const> canonicalDomains,
-      IndexReader& reader, bool parallel, Reserve&& reserve) const {
+      IndexReader& reader, bool parallel, ExecutionWarnings* warnings,
+      Reserve&& reserve, PreparedCharge chargePrepared = {},
+      Finish&& finish = nullptr) const {
     auto segments = reader.segments();
     assert(preparedSources.size() == sourceCount());
     assert(eligibility.size() == segments.size());
@@ -740,13 +818,17 @@ public:
         Query::Weight::PrepareContext context{
           reader,
           std::span<DocSet* const>(views.data(), views.size()),
-          parallel
-        };
+          parallel, warnings};
         std::array<Query::Weight*, 1> weights{sourceWeight(source)};
         std::array<FilterCache::Use*, 1> uses{sourceUse(source)};
         auto prepared = QueryPrep::prepareFilterSources(
             weights, uses, context);
         preparedSources[source] = std::move(prepared[0]);
+      }
+      if (!preparedAsExtra && preparedSources[source].prepared) {
+        if (auto charge = chargePrepared(*preparedSources[source].prepared)) {
+          chargePrepared.retain(std::move(charge));
+        }
       }
       if (preparedSources[source].domainDependence
           == PreparedDomainDependence::QUERY_CANONICAL) {
@@ -784,11 +866,12 @@ public:
           Query::Weight::PrepareContext context{
             reader,
             std::span<DocSet* const>(views.data(), views.size()),
-            parallel
-          };
+            parallel, warnings};
           ownedWeight = sourceWeight(source)->prepare(context);
           variantWeight = ownedWeight.get();
         }
+        std::shared_ptr<Reservation> windowCharge;
+        if (ownedWeight) windowCharge = chargePrepared(*ownedWeight);
         for (size_t segnum = 0; segnum < segments.size(); segnum++) {
           auto reservation = reservations[segnum];
           DomainHandle matches(QueryPrep::materialize(
@@ -797,8 +880,11 @@ public:
           if (matches.get() != nullptr) {
             reservation->grow(matches.get()->ramBytesUsed());
           }
-          groupMatches[group][segnum] =
-              std::move(matches).retainedWith(reservation);
+          if constexpr (std::is_same_v<PreparedCharge, NoPreparedCharge>) {
+            groupMatches[group][segnum] = std::move(matches).retainedWith(reservation);
+          } else {
+            groupMatches[group][segnum] = std::move(matches).chargedWith(reservation);
+          }
         }
       }
     }
@@ -814,8 +900,74 @@ public:
         result.domains[segnum][variant] = groupMatches[group][segnum];
       }
     }
+    if constexpr (!std::is_same_v<Finish, std::nullptr_t>) {
+      if (finish) for (size_t variant = 1; variant < count; variant++) {
+        if (frame(variant) != Frame::RESET) continue;
+        std::vector<DomainHandle> domains;
+        domains.reserve(segments.size());
+        size_t source = resetSource(variant);
+        for (size_t segment = 0; segment < segments.size(); segment++) {
+          if (result.ready[variant]) domains.push_back(result.domains[segment][variant]);
+          else {
+            auto charge = reserve(variant, segment);
+            DomainHandle matches(QueryPrep::materialize(preparedSources[source].segmentSource(),
+                segments[segment], eligibility[segment][variant].get()));
+            if (matches.get()) charge->grow(matches.get()->ramBytesUsed());
+            domains.push_back(std::move(matches).chargedWith(std::move(charge)));
+          }
+        }
+        domains = finish(std::move(domains));
+        for (size_t segment = 0; segment < segments.size(); segment++) {
+          result.domains[segment][variant] = std::move(domains[segment]);
+        }
+        result.ready[variant] = 1;
+      }
+    }
     return result;
   }
+
+  // New bucket production borrows segment primitives and owns only scoped
+  // results. Root and top-level TopDocs retain their existing production and
+  // pre-composition reservations.
+  using Sources = std::function_ref<SegmentSources&(size_t)>;
+  using Finish = std::function<std::vector<DomainHandle>(std::vector<DomainHandle>)>;
+
+  struct BucketProduction {
+    RequestMemTracker& tracker;
+    Sources sources;
+    std::shared_ptr<Reservation> reserve(size_t, std::string detail) {
+      return std::make_shared<Reservation>(tracker, 0, std::move(detail));
+    }
+    std::shared_ptr<Reservation> reserveVariant(size_t segment, std::string detail) {
+      return reserve(segment, std::move(detail));
+    }
+    std::shared_ptr<Reservation> chargePrepared(const Query::Weight::PreparedWeight& prepared) {
+      return std::make_shared<Reservation>(tracker, prepared.retainedBytes(), "reset prepared window");
+    }
+    void release(const QueryPrep::PreparedSource&, IndexReader::Segment&) {
+      // Prepared release hooks can delegate into shared child Weights too.
+      // Owned windows die with their unique_ptrs; only the executor releases
+      // shared query pools, after its retention guards leave.
+    }
+    DomainHandle composeResult(std::vector<DomainHandle> parts) {
+      return composeTracked(std::move(parts), tracker);
+    }
+    DomainHandle resolve(size_t source, const QueryPrep::PreparedSource& input,
+                         size_t segment, DomainHandle base, Reservation&) {
+      return sources(segment).resolve(source, std::move(base), &input);
+    }
+  };
+
+  std::vector<std::vector<DomainHandle>> produceBucketDomains(
+      IndexReader& reader, Query::PlanningContext& planning,
+      std::span<const DomainHandle> inherited, std::span<const DomainHandle> resetBase,
+      bool parallel, ExecutionWarnings* warnings, RequestMemTracker& tracker,
+      Sources sources, const Finish& finish = {}) const;
+
+  std::vector<std::vector<DomainHandle>> producePreparedDomains(
+      IndexReader& reader, Query::PlanningContext& planning,
+      std::span<const DomainHandle> inherited, std::span<const DomainHandle> resetBase,
+      bool parallel, ExecutionWarnings* warnings, BucketProduction& production, const Finish& finish) const;
 
   void retainReservation(
       std::vector<DomainHandle>& domains,

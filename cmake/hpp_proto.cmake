@@ -46,17 +46,26 @@ target_compile_features(hpp_proto_runtime INTERFACE cxx_std_23)
 add_library(hpp_proto::runtime ALIAS hpp_proto_runtime)
 
 # --- the code generator plugin (self-hosting; links only is_utf8) ---
-add_executable(protoc-gen-hpp "${HPP_PROTO_DIR}/src/protoc-plugin/hpp_gen.cpp")
-target_include_directories(protoc-gen-hpp PRIVATE "${HPP_PROTO_DIR}/include")
-target_link_libraries(protoc-gen-hpp PRIVATE is_utf8)
-target_compile_features(protoc-gen-hpp PRIVATE cxx_std_23)
-# This single TU is the head of the clean-build critical path: CMake gives every luxir_lib
-# and luxir_test object an order-only dependency on it (they link luxir_proto_concrete,
-# whose sources it generates), so nothing else starts until it links. It is a build-time
-# tool we never debug and it runs in ~40ms, so drop debug info: -g0 takes it from ~14s to
-# ~11.5s. Same reasoning as is_utf8's -O3 above - the vendored build tool gets the flags
-# that suit it, not the tree's preset flags.
-target_compile_options(protoc-gen-hpp PRIVATE -g0)
+set(LUXIR_HOST_PROTOC_GEN_HPP "" CACHE FILEPATH "Host protoc-gen-hpp executable for cross builds")
+if(CMAKE_CROSSCOMPILING)
+  if(NOT EXISTS "${LUXIR_HOST_PROTOC_GEN_HPP}")
+    message(FATAL_ERROR "Cross builds require LUXIR_HOST_PROTOC_GEN_HPP; use tools/build-arm64")
+  endif()
+  add_executable(protoc-gen-hpp IMPORTED GLOBAL)
+  set_target_properties(protoc-gen-hpp PROPERTIES IMPORTED_LOCATION "${LUXIR_HOST_PROTOC_GEN_HPP}")
+else()
+  add_executable(protoc-gen-hpp "${HPP_PROTO_DIR}/src/protoc-plugin/hpp_gen.cpp")
+  target_include_directories(protoc-gen-hpp PRIVATE "${HPP_PROTO_DIR}/include")
+  target_link_libraries(protoc-gen-hpp PRIVATE is_utf8)
+  target_compile_features(protoc-gen-hpp PRIVATE cxx_std_23)
+  # This single TU is the head of the clean-build critical path: CMake gives every luxir_lib
+  # and luxir_test object an order-only dependency on it (they link luxir_proto_concrete,
+  # whose sources it generates), so nothing else starts until it links. It is a build-time
+  # tool we never debug and it runs in ~40ms, so drop debug info: -g0 takes it from ~14s to
+  # ~11.5s. Same reasoning as is_utf8's -O3 above - the vendored build tool gets the flags
+  # that suit it, not the tree's preset flags.
+  target_compile_options(protoc-gen-hpp PRIVATE -g0)
+endif()
 
 # hpp_proto_generate(
 #   OUT_VAR <var>            # set in parent scope to the list of generated headers

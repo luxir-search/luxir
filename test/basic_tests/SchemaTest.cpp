@@ -20,6 +20,7 @@
 
 #include <memory_resource>
 #include <span>
+#include <tuple>
 
 using namespace luxir;
 using namespace luxir::test;
@@ -631,6 +632,7 @@ TEST_F(SchemaTest, storedResourceRoundtripsThroughProto) {
   // A custom stored_resource survives toProto -> fromProto; unset fields
   // keep the default "_stored_".
   SchemaBuilder b;
+  b.storedResource("_stored_embeddings_");
   auto& custom = b.field("paragraphs");
   custom.type = FieldClass::TEXT;
   custom.index = IndexMode::MATCH;
@@ -658,6 +660,8 @@ TEST_F(SchemaTest, storedResourceInheritedFromParent) {
   // A child inheriting from a parent with a non-default stored_resource
   // picks up the parent's choice.  Explicit override on the child wins.
   SchemaBuilder b;
+  b.storedResource("_stored_embeddings_");
+  b.storedResource("_stored_captions_");
   auto& parent = b.templ("_emb_");
   parent.type = FieldClass::TEXT;
   parent.index = IndexMode::MATCH;
@@ -681,6 +685,7 @@ TEST_F(SchemaTest, setPreservesStoredResource) {
   // doesn't mention the field.  (Programmatic FieldType mutations are NOT
   // preserved: the source def is the single source of truth.)
   SchemaBuilder baseB;
+  baseB.storedResource("_stored_embeddings_");
   auto& body = baseB.field("body");
   body.type = FieldClass::TEXT;
   body.index = IndexMode::MATCH;
@@ -1252,6 +1257,83 @@ TEST_F(SchemaTest, indexOptionsAndNormsAreTextOnly) {
   EXPECT_THROW(b.build(), SchemaError);
 }
 
+static const StoredFieldType& storedType(const Schema& s, std::string_view name) {
+  auto* type = dynamic_cast<const StoredFieldType*>(s.getFieldTypePtr(name));
+  if (!type) throw std::runtime_error("no stored resource " + std::string(name));
+  return *type;
+}
+
+TEST_F(SchemaTest, storedResourcesRoundTripAndSetMerge) {
+  auto s = schemaJson(R"({"fields":{"msg":{"type":"text","stored_resource":"_stored_logs_"}},
+    "stored_resources":{"_stored_logs_":{"codec":"zstd","zstd_level":9,"chunk_size_bytes":65536,
+      "max_docs_per_chunk":1024}}})");
+  EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 9, 65536, 1024}), storedType(*s, "_stored_logs_").format_);
+  EXPECT_EQ(StoredChunkFormat{}, storedType(*s, "_stored_").format_);
+
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef out;
+  s->toProto(&out, arena);
+  std::vector<std::byte> bytes;
+  ASSERT_TRUE(api::encode(out, bytes));
+  api::SchemaDef decoded;
+  ASSERT_TRUE(api::decode(decoded, api::copyToPaddedInput(bytes, arena), arena));
+  EXPECT_EQ(s->sourceDef_, Schema::fromProto(decoded)->sourceDef_);
+  auto json = authoredJson(*s);
+  EXPECT_NE(std::string::npos, json.find("\"codec\":\"zstd\""));
+  EXPECT_EQ(s->sourceDef_, schemaJson(json)->sourceDef_);
+
+  // mode=set replaces named entries and keeps the rest; replace_all drops them.
+  auto set = schemaJson(R"({"stored_resources":{"_stored_":{"codec":"zstd"}}})", s.get());
+  // zstd without chunk limits takes its own defaults: 64KB, 1024 docs.
+  EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 3, 65536, 1024}), storedType(*set, "_stored_").format_);
+  EXPECT_EQ(9, storedType(*set, "_stored_logs_").format_.zstdLevel);
+  EXPECT_EQ(nullptr, schemaJson(R"({"fields":{}})")->getFieldTypePtr("_stored_logs_"));
+}
+
+TEST_F(SchemaTest, storedResourcesValidation) {
+  for (auto json : {
+      R"({"stored_resources":{"_stored_":{"zstd_level":3}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_level":0}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_level":23}}})",
+      R"({"stored_resources":{"_stored_":{"chunk_size_bytes":1023}}})",
+      R"({"stored_resources":{"_stored_":{"chunk_size_bytes":4194305}}})",
+      R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":0}}})",
+      R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":65537}}})",
+      R"({"stored_resources":{"bad-name":{}}})",
+      // Names must be '_name_': neither a field name nor a suffix template.
+      R"({"stored_resources":{"cold":{}}})",
+      R"({"stored_resources":{"_cold":{}}})",
+      R"({"templates":{"_cold_":{"type":"text"}},"stored_resources":{"_cold_":{}}})",
+      // References must name a declared resource.
+      R"({"fields":{"body":{"type":"text","stored_resource":"_cold_"}}})",
+      R"({"templates":{"_t":{"type":"text","stored_resource":"_cold_"}}})"}) {
+    SCOPED_TRACE(json);
+    EXPECT_THROW(schemaJson(json), SchemaError);
+  }
+  EXPECT_THROW(schemaJson(R"({"stored_resources":{"_stored_":{"codec":"gzip"}}})"), std::runtime_error);
+}
+
+TEST_F(SchemaTest, storedResourcesSurviveRestart) {
+  LuxirConfig config;
+  config.store.backend = "ram";
+  LuxirNode node(config);
+  CollectionHelper ch(node);
+  {
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef def;
+    ASSERT_TRUE(api::read_json(def, R"({"stored_resources":{"_stored_":{"codec":"zstd","chunk_size_bytes":32768}}})", arena));
+    ch.collection().updateSchema(def, api::SchemaRequest_::Mode::SET);
+  }
+  ch.index(Doc{{"id", std::string("1")}, {"title_t", std::string("hello")}});
+  ch.commit();
+
+  ch.getIndexWriter()->close();
+  CommitSnapshotRegistry reopenedSnapshots(*ch.collection().getShard()->getDirectory());
+  IndexWriter reopened(reopenedSnapshots);
+  auto& stored = storedType(*reopened.getSchema(), "_stored_");
+  EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 3, 32768, 1024}), stored.format_);
+}
+
 TEST_F(SchemaTest, variantsResolveByOperationAndExplicitSelectors) {
   auto s = schemaJson(R"({"fields":{
     "author":{"type":"text","variants":{"s":"string"}},
@@ -1465,14 +1547,14 @@ TEST_F(SchemaTest, variantsAtomicInheritanceAndDefaultsClearing) {
 
 TEST_F(SchemaTest, variantParentsBorrowOnlyPhysicalSettings) {
   auto s = schemaJson(R"({"templates":{
-    "_strings":{"type":"string","multi":true,"stored":true,"stored_resource":"cold",
+    "_strings":{"type":"string","multi":true,"stored":true,"stored_resource":"_cold_",
                 "normalizer":["lowercase"],"variants":{"i":"int"},"defaults":{"value":"i"}},
     "_text":{"type":"text","multi":true,"stored":true,"analyzer":{"filters":["fold"]}}
   },"fields":{
     "a":{"type":"text","variants":{"s":{"parent":"_strings"},"t":{"parent":"_text"}}},
     "b":{"type":"string","multi":true,"variants":{"t":{"parent":"_text"}}},
     "c":{"type":"text","variants":{"again":{"parent":"c"}}}
-  }})");
+  },"stored_resources":{"_cold_":{}}})");
   auto input = s->resolveInput("a");
   EXPECT_TRUE(input.fieldType->isStored());
   EXPECT_FALSE(input.owner->multi);
@@ -1546,6 +1628,115 @@ TEST_F(SchemaTest, variantShapeFamiliesAndVectorDimensions) {
     SCOPED_TRACE(field);
     EXPECT_THROW(schemaJson(std::string("{\"fields\":{\"a\":") + field + "}}"), SchemaError);
   }
+}
+
+TEST_F(SchemaTest, vectorAnnSettings) {
+  auto s = schemaJson(R"({"templates":{"_e":{"type":"vector","dims":8,"metric":"l2",
+      "ann":{"codec":"pq","nlist":16,"pq":{"m":4,"bits":6}}}},"fields":{
+    "plain":{"type":"vector","dims":8,"metric":"ip"},
+    "rbq":{"type":"vector","dims":8,"metric":"ip","ann":{"codec":"rabitq","rabitq":{"bits":4,"query_bits":0}}},
+    "inherits":{"parent":"_e"},
+    "replaces":{"parent":"_e","ann":{"nlist":4}}}})");
+  auto ann = [&](std::string_view name) { return ((VectorFieldType*)s->physical(name))->ann(); };
+  EXPECT_EQ(VectorAnnConfig::PQ, ann("plain").codec);
+  EXPECT_EQ(0, ann("plain").nlist);
+  EXPECT_EQ(1, ann("plain").rabitqBits);
+  EXPECT_EQ(4, ann("plain").rabitqQueryBits);
+  EXPECT_EQ(4, ann("rbq").rabitqBits);
+  EXPECT_EQ(0, ann("rbq").rabitqQueryBits);
+  EXPECT_EQ(VectorAnnConfig::PQ, ann("inherits").codec);
+  EXPECT_EQ(16, ann("inherits").nlist);
+  EXPECT_EQ(4, ann("inherits").pqM);
+  EXPECT_EQ(6, ann("inherits").pqBits);
+  // An authored ann replaces the parent's whole definition.
+  EXPECT_EQ(VectorAnnConfig::PQ, ann("replaces").codec);
+  EXPECT_EQ(4, ann("replaces").nlist);
+  EXPECT_NE(std::string::npos, authoredJson(*s).find(R"("pq":{"m":4,"bits":6})"));
+
+  for (auto field : {
+      R"({"type":"string","ann":{}})",
+      R"({"type":"vector","ann":{"codec":"pq","rabitq":{"bits":2}}})",
+      R"({"type":"vector","ann":{"codec":"rabitq","pq":{"m":4}}})",
+      R"({"type":"vector","ann":{"codec":"rabitq","rabitq":{"bits":0}}})",
+      R"({"type":"vector","ann":{"codec":"rabitq","rabitq":{"bits":10}}})",
+      R"({"type":"vector","ann":{"codec":"rabitq","rabitq":{"query_bits":9}}})",
+      R"({"type":"vector","ann":{"codec":"pq","pq":{"bits":9}}})",
+      R"({"type":"vector","dims":8,"ann":{"codec":"pq","pq":{"m":3}}})",
+      R"({"type":"vector","ann":{"nlist":-1}})",
+      R"({"type":"vector","ann":{"nlist":65537}})"}) {
+    SCOPED_TRACE(field);
+    EXPECT_THROW(schemaJson(std::string("{\"fields\":{\"a\":") + field + "}}"), SchemaError);
+  }
+  EXPECT_ANY_THROW(schemaJson(R"({"fields":{"a":{"type":"vector","ann":{"codec":"hnsw"}}}})"));
+  EXPECT_ANY_THROW(schemaJson(R"({"fields":{"a":{"type":"vector","ann":{"bits":1}}}})"));
+}
+
+TEST_F(SchemaTest, vectorAnnCodecDefaultsAndPresence) {
+  auto s = schemaJson(R"({"fields":{
+    "absent":{"type":"vector"}, "empty":{"type":"vector","ann":{}},
+    "lists":{"type":"vector","ann":{"nlist":7}},
+    "pqSettings":{"type":"vector","dims":8,"ann":{"nlist":12,"pq":{"m":2,"bits":6}}},
+    "pq":{"type":"vector","ann":{"codec":"pq"}},
+    "rq":{"type":"vector","ann":{"codec":"rabitq"}}
+  }})");
+  // The authored protobuf and JSON must preserve explicit enum zero (RaBitQ).
+  auto roundtrip = schemaJson(authoredJson(*s));
+  for (const auto& schema : {s, roundtrip}) {
+    for (auto name : {"absent", "empty", "lists", "pqSettings", "pq", "rq"}) {
+      SCOPED_TRACE(name);
+      const auto& ann = dynamic_cast<VectorFieldType&>(*schema->physical(name)).ann();
+      EXPECT_EQ(name == std::string_view("rq") ? VectorAnnConfig::RABITQ : VectorAnnConfig::PQ, ann.codec);
+      EXPECT_EQ(name == std::string_view("lists") ? 7 : name == std::string_view("pqSettings") ? 12 : 0, ann.nlist);
+      EXPECT_EQ(name == std::string_view("pqSettings") ? 2 : 0, ann.pqM);
+      EXPECT_EQ(name == std::string_view("pqSettings") ? 6 : 8, ann.pqBits);
+    }
+  }
+  for (auto ann : {R"({"rabitq":{}})", R"({"rabitq":{"bits":2}})"}) {
+    try {
+      schemaJson(std::string(R"({"fields":{"v":{"type":"vector","ann":)") + ann + "}}}");
+      FAIL() << "Accepted RaBitQ settings without a codec";
+    } catch (const SchemaError& e) {
+      EXPECT_NE(std::string_view(e.what()).find("explicit codec \"rabitq\""), std::string_view::npos);
+    }
+  }
+}
+
+TEST_F(SchemaTest, vectorPqMUsesEffectiveDimensions) {
+  const std::string templ = R"({"templates":{"_e":{"type":"vector","dims":8,
+    "ann":{"codec":"pq","pq":{"m":4}}}},"fields":)";
+  auto s = schemaJson(templ + R"({
+    "inherits":{"parent":"_e"},
+    "resized":{"parent":"_e","dims":12},
+    "replaces":{"parent":"_e","dims":6,"ann":{"codec":"pq","pq":{"m":3}}},
+    "inferred":{"parent":"_e","dims":0,"ann":{"codec":"pq","pq":{"m":0}}},
+    "automatic":{"type":"vector","ann":{"codec":"pq"}},
+    "branches":{"parent":"_e","variants":{"p":{"parent":"_e"},
+      "q":{"parent":"_e","ann":{"codec":"pq","pq":{"m":2}}}}}
+  }})");
+  for (auto [name, dims, m] : {std::tuple{"inherits", 8, 4}, {"resized", 12, 4},
+       {"replaces", 6, 3}, {"inferred", 0, 0}, {"automatic", 0, 0},
+       {"branches__p", 8, 4}, {"branches__q", 8, 2}}) {
+    auto* v = dynamic_cast<VectorFieldType*>(s->physical(name));
+    ASSERT_NE(v, nullptr);
+    EXPECT_EQ(dims, v->dims());
+    EXPECT_EQ(m, v->ann().pqM);
+  }
+  for (auto field : {
+      R"({"type":"vector","ann":{"codec":"pq","pq":{"m":4}}})",
+      R"({"type":"vector","dims":0,"ann":{"codec":"pq","pq":{"m":4}}})",
+      R"({"parent":"_e","dims":0})",
+      R"({"parent":"_e","dims":6})",
+      R"({"parent":"_e","ann":{"codec":"pq","pq":{"m":3}}})",
+      R"({"parent":"_e","variants":{"p":{"parent":"_e","ann":{"codec":"pq","pq":{"m":3}}}}})",
+      R"({"parent":"_e","dims":6,"ann":{"codec":"pq"},"variants":{"p":{"parent":"_e","dims":6}}})"}) {
+    SCOPED_TRACE(field);
+    EXPECT_THROW(schemaJson(templ + "{\"a\":" + field + "}}"), SchemaError);
+  }
+  EXPECT_THROW(schemaJson(R"({"templates":{"_e":{"type":"vector","ann":{"codec":"pq","pq":{"m":4}}}}})"), SchemaError);
+  // Replacing a parent revalidates a child's authored m against its new dims.
+  auto before = schemaJson(templ + R"({"a":{"parent":"_e","ann":{"codec":"pq","pq":{"m":4}}}}})");
+  EXPECT_THROW(schemaJson(R"({"templates":{"_e":{"type":"vector","dims":6,
+    "ann":{"codec":"pq","pq":{"m":3}}}}})", before.get()), SchemaError);
 }
 
 TEST_F(SchemaTest, variantLabelGrammarAndReservedDelimiter) {
@@ -1720,10 +1911,11 @@ TEST_F(SchemaTest, stringNormalizerSchemaValidation) {
 }
 
 TEST_F(SchemaTest, storedResourceEmptyStillInheritsOnPrimary) {
-  auto s = schemaJson(R"({"templates":{"_t":{"type":"text","stored_resource":"cold"}},
-                         "fields":{"a":{"parent":"_t","stored_resource":""}}})");
-  EXPECT_EQ("cold", s->physical("a")->storedResource_);
-  EXPECT_EQ("cold", schemaJson(authoredJson(*s))->physical("a")->storedResource_);
+  auto s = schemaJson(R"({"templates":{"_t":{"type":"text","stored_resource":"_cold_"}},
+                         "fields":{"a":{"parent":"_t","stored_resource":""}},
+                         "stored_resources":{"_cold_":{}}})");
+  EXPECT_EQ("_cold_", s->physical("a")->storedResource_);
+  EXPECT_EQ("_cold_", schemaJson(authoredJson(*s))->physical("a")->storedResource_);
 }
 
 TEST_F(SchemaTest, resolvedHandlesUseHandBuiltFieldTypesWithoutOwners) {

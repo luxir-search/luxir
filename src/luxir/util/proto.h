@@ -6,7 +6,6 @@
 #include <iterator>
 #include <memory_resource>
 #include <new>
-#include <optional>
 #include <string_view>
 #include <type_traits>
 #include <unordered_map>
@@ -78,7 +77,8 @@ inline void releaseArena(google::protobuf::Arena* arena) {
 /// itself uses for map entries in CreateInArenaStorage).  If the ctor throws, C++ unwinds the
 /// subobjects that were already built and the only thing "leaked" is the raw sizeof(T) bump
 /// region, which the arena reclaims wholesale at reset.  So ctors of arena objects are free
-/// to throw - there is no nothrow requirement.
+/// to throw - there is no nothrow requirement. If registering cleanup fails after
+/// construction, destroy the object immediately so its owned resources are reclaimed.
 ///
 /// T is placement-new'd into arena storage and never freed with delete, so `arena` must be a
 /// real arena (the reference makes that a contract, not a runtime check).  Trivially
@@ -88,7 +88,12 @@ T* arenaCreate(google::protobuf::Arena& arena, Args&&... args) {
   void* p = arena.AllocateAligned(sizeof(T), alignof(T));
   T* obj = new (p) T(std::forward<Args>(args)...);
   if constexpr (!std::is_trivially_destructible_v<T>) {
-    arena.OwnDestructor(obj);
+    try {
+      arena.OwnDestructor(obj);
+    } catch (...) {
+      obj->~T();
+      throw;
+    }
   }
   return obj;
 }
@@ -100,29 +105,20 @@ T* arenaCreate(google::protobuf::Arena& arena, Args&&... args) {
 // to one entry per key (the LAST occurrence), in first-seen key order. The returned
 // pointers alias the input map's values (same backing storage), so the map/bytes must
 // outlive the result. Use wherever protobuf-map dedup semantics matter (request field
-// maps, op maps, etc.).
-//
-// keyFn rewrites each key to the key the entry is deduplicated and emitted under, or
-// returns nullopt to drop the entry entirely - so entries whose REWRITTEN keys collide
-// also collapse last-wins (doc field maps under UpdateRequest.field_map).
-template <class MapView, class KeyFn>
-auto lastWins(const MapView& m, KeyFn&& keyFn) {
+// maps, op maps, etc.). Document fields, collapsed once per doc, dedup by input handler
+// instead (ProtoUpdateMessage).
+template <class MapView>
+auto lastWins(const MapView& m) {
   using ValPtr = decltype(&std::begin(m)->second);  // const V*
   std::vector<std::pair<std::string_view, ValPtr>> out;
   std::unordered_map<std::string_view, size_t> pos;
   for (const auto& kv : m) {
-    std::optional<std::string_view> key = keyFn(std::string_view{kv.first});
-    if (!key) continue;
-    auto [it, inserted] = pos.try_emplace(*key, out.size());
-    if (inserted) out.emplace_back(*key, &kv.second);
+    std::string_view key{kv.first};
+    auto [it, inserted] = pos.try_emplace(key, out.size());
+    if (inserted) out.emplace_back(key, &kv.second);
     else out[it->second].second = &kv.second;  // later value wins, position preserved
   }
   return out;
-}
-
-template <class MapView>
-auto lastWins(const MapView& m) {
-  return lastWins(m, [](std::string_view key) { return std::optional<std::string_view>(key); });
 }
 
 

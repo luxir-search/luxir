@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/FieldReader.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -1490,7 +1491,7 @@ TEST_F(DocsEnumAdvanceTest,
   PostingsReader reader(dir, 0);
   int32_t maxDoc = reader.maxDoc();
 
-  auto materialize = [&](DocSet* domain) {
+  auto materialize = [&](DocSet* domain, bool identity = false) {
     FieldReader fieldReader(reader);
     EXPECT_TRUE(fieldReader.readNextField());
     SegFieldInfo fieldInfo;
@@ -1499,8 +1500,8 @@ TEST_F(DocsEnumAdvanceTest,
     EXPECT_TRUE(terms.seek("mixed"));
     int32_t docFreq = terms.docFreq();
     DocsOnlyEnum postings(terms);
-    return materializePostingsIntersection(
-        postings, docFreq, domain, maxDoc);
+    return identity ? materializeIdentityPostingsIntersection(postings, docFreq, domain, maxDoc)
+        : materializePostingsIntersection(postings, docFreq, domain, maxDoc);
   };
 
   std::vector<int32_t> mergeDocs;
@@ -1529,6 +1530,23 @@ TEST_F(DocsEnumAdvanceTest,
   EXPECT_EQ(collectDocSet(*sparseResult, maxDoc),
             (std::vector<int32_t>{docs[5], docs[300]}));
   EXPECT_GT(SkipStats::advanceCalls, 0);
+  RAMBitDocSet sparseBits(maxDoc);
+  sparseBits.mutableBits().set(docs[5]);
+  sparseBits.mutableBits().set(docs[300]);
+  SkipStats::reset();
+  auto bitsetResult = materialize(&sparseBits, true);
+  EXPECT_EQ(collectDocSet(*bitsetResult, maxDoc), collectDocSet(*sparseResult, maxDoc));
+  EXPECT_GT(SkipStats::advanceCalls, 0);
+
+  // A non-posting prefix doc lands on the next posting, which is also in the prefix.
+  int32_t gap = tailBase + 4;
+  ASSERT_FALSE(std::ranges::binary_search(docs, gap));
+  RAMBitDocSet gapBits(maxDoc);
+  gapBits.mutableBits().set(gap);
+  gapBits.mutableBits().set(tailBase + 5);
+  ASSERT_TRUE(shouldDrivePostingsFromArray((int32_t) docs.size(), gapBits.card()));
+  EXPECT_EQ(collectDocSet(*materialize(&gapBits, true), maxDoc),
+            (std::vector<int32_t>{tailBase + 5}));
 }
 
 // The whole-term impact frontier stored in the term dictionary must equal the

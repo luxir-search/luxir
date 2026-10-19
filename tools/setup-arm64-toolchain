@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+repo_dir=$(cd "$(dirname "$0")/.." && pwd)
+work="$repo_dir/build/arm64-toolchain"
+version=16.1.0
+archive="$work/gcc-$version.tar.xz"
+compiler_root="$work/compiler"
+toolchain="$compiler_root/gcc-$version/aarch64-unknown-linux-gnu"
+mkdir -p "$compiler_root"
+
+if [[ ! -f $archive ]]; then
+    curl -fL --retry 3 \
+        "https://s3.amazonaws.com/compiler-explorer/opt/arm64-gcc-$version.tar.xz" \
+        -o "$archive.part"
+    mv "$archive.part" "$archive"
+fi
+printf '%s  %s\n' a0a158a02595413527c1092a845930eb0d7a10d7e4ae7f7c8d986850eb3d2e66 \
+    "$archive" | sha256sum -c -
+if [[ ! -f $compiler_root/.gcc-$version-ready ]]; then
+    tar -xJf "$archive" -C "$compiler_root"
+    touch "$compiler_root/.gcc-$version-ready"
+fi
+
+echo "ARM64 compiler: $toolchain"
+echo "ARM64 sysroot: $toolchain/aarch64-unknown-linux-gnu/sysroot"

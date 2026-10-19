@@ -10,11 +10,11 @@
 #include <vector>
 
 #include "DocSet.h"
-#include "OrdMap.h"
+#include "Similarity.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/screaming.h"
-#include "luxir/util/SharedLazyMap.h"
+#include "luxir/util/SharedLazyCell.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define IREADER_DEBUG LOG_TRACE
@@ -152,8 +152,40 @@ public:
 
 /// IndexReader is thread safe
 class IndexReader {
+  struct FieldRecord;
+  struct HeaderTotals;
+
 public:
   using Segment = ::luxir::Segment;
+
+  // A borrowed view, valid while its reader lives. Null means absent.
+  // at() lazily resolves ordinals and headers in this core's segments.
+  // stats() and flagsUnion() resolve every segment for header totals,
+  // including deleted docs.
+  class FieldSegments {
+    friend class IndexReader;
+    const FieldRecord* record = nullptr;
+    const Segment* segments = nullptr;
+    FieldSegments(const FieldRecord* record, const Segment* segments)
+        : record(record), segments(segments) {}
+    const HeaderTotals& totals() const;
+
+  public:
+    FieldSegments() = default;
+    const PostingsReader::Field* at(size_t segment) const;
+    const PostingsReader::Field* at(const Segment& segment) const {
+      assert(!record || (segment.ord >= 0 && (size_t)segment.ord < size()
+                         && &segments[segment.ord] == &segment));
+      return at((size_t)segment.ord);
+    }
+    std::string_view name() const noexcept;
+    bool exists() const noexcept;
+    size_t size() const noexcept;
+    const Similarity::FieldStats& stats() const;
+    // OR of the segment headers' flags, such as segment-format markers.
+    FieldType::flag_type flagsUnion() const;
+    bool operator==(const FieldSegments&) const = default;
+  };
 
   struct ProjectableField {
     std::string_view name;
@@ -173,6 +205,57 @@ public:
 private:
   friend class ReaderManager;
 
+  struct HeaderTotals {
+    Similarity::FieldStats stats;
+    FieldType::flag_type flags = 0;
+  };
+
+  // Positive names, header totals and OrdMaps shared by segment sets with the same
+  // core generation. The record owns its name and lazily caches each ordinal;
+  // it holds no Segment or reader, so views can use different open readers.
+  struct FieldRecord {
+    static constexpr int32_t UNRESOLVED = -2;
+    std::string name;
+    size_t hash;
+    size_t numSegments;
+    std::unique_ptr<std::atomic<int32_t>[]> ordinals;
+    mutable std::atomic<HeaderTotals*> totals{nullptr};
+    mutable SharedLazyCell<OrdMap, true> ordMap;
+    size_t bytes;
+
+    FieldRecord(std::string_view name, size_t hash, size_t numSegments, size_t first, int32_t ordinal);
+    ~FieldRecord();
+  };
+
+  // Records by name. Insert-only, so a lookup takes no lock and writes no
+  // shared memory. Inserts serialize; one that grows the table publishes a
+  // doubled copy, and replaced tables live as long as the records because a
+  // lookup may still be probing one.
+  class FieldRecords {
+    struct Table {
+      size_t mask;
+      std::unique_ptr<std::atomic<const FieldRecord*>[]> slots;
+      explicit Table(size_t capacity);
+      const FieldRecord* find(std::string_view name, size_t hash) const noexcept;
+      void place(const FieldRecord* record) noexcept;
+    };
+    std::atomic<const Table*> current{nullptr};
+    std::mutex insertMutex;
+    std::vector<std::unique_ptr<Table>> tables;
+    std::vector<std::unique_ptr<FieldRecord>> records;
+
+  public:
+    static constexpr size_t BYTES_PER_RECORD =
+        sizeof(std::unique_ptr<FieldRecord>) + sizeof(std::atomic<const FieldRecord*>);
+
+    const FieldRecord* find(std::string_view name, size_t hash) const noexcept {
+      const Table* table = current.load(std::memory_order_acquire);
+      return table ? table->find(name, hash) : nullptr;
+    }
+    // Returns the record kept for its name: this one, or one inserted first.
+    const FieldRecord* insert(std::unique_ptr<FieldRecord> record);
+  };
+
   // A physical snapshot is shared directly by readers with different schemas.
   // Its lazy catalogs and maps never retain a reader or schema.
   struct PhysicalCore {
@@ -180,7 +263,7 @@ private:
     std::once_flag projectableOnce;
     std::vector<ProjectableField> projectable;
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;
-    std::shared_ptr<SharedLazyMap<std::string, OrdMap>> ordMaps;
+    std::shared_ptr<FieldRecords> fields;
     uint64_t coreGeneration = 0;
     int64_t totalMaxDoc = 0;
     int64_t livedocs = 0;
@@ -292,19 +375,12 @@ public:
     return core->coreGeneration;
   }
 
-  std::shared_ptr<OrdMap> getOrdMap(std::string_view field) {
-    return core->ordMaps->getOrCreate(std::string(field), [this, field]() {
-      return OrdMap::build(field, *this);
-    });
-  }
+  FieldSegments field(std::string_view name) const;
+
+  std::shared_ptr<OrdMap> getOrdMap(std::string_view name);
 
   // This reader's segment `segId`, or null.
   const Segment* findSegment(uint64_t segId) const { return core->segment(segId); }
-
-  // Get the number of cached OrdMaps (for testing)
-  size_t getOrdMapCacheSize() const {
-    return core->ordMaps->dataMap.size();
-  }
 
   FilterCache* filterCache() const noexcept {
     return sharedFilterCache.get();

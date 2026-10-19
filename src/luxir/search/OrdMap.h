@@ -325,7 +325,7 @@ public:
   }
 
   /// Build an OrdMap for the given field across all segments in the reader.
-  static std::shared_ptr<OrdMap> build(std::string_view field, IndexReader& reader);
+  static std::shared_ptr<OrdMap> build(IndexReader::FieldSegments fields, IndexReader& reader);
 
   static DeltaEncoding configuredDeltaEncoding();
 

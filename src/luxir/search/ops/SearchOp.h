@@ -17,6 +17,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 
 #include "luxir/search/DocSet.h"
+#include "luxir/search/DomainVariantPlan.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/util/BigBuffer.h"
@@ -76,6 +77,66 @@ T& optMut(std::optional<T>& opt) {
   return *opt;
 }
 
+// Recoverable bucket identities, separate from materialized matches. Nodes
+// borrow their producer/selected keys during synchronous bucket execution;
+// descendants borrow the path until their synchronous calculations complete.
+struct StructuralConstraint {
+  struct Producer {
+    struct Sources {
+      const void* identity;
+      int32_t segment;
+      std::unique_ptr<DomainVariantPlan::SegmentSources> values;
+    };
+    RequestMemResource sourcesResource;
+    std::pmr::vector<Sources> sources;
+
+    using Feed = std::function_ref<void(size_t, DomainHandle)>;
+    SearchRequest& req;
+    const StructuralConstraint* ancestor;
+    size_t bucketCount;
+    std::pmr::vector<std::pmr::vector<DomainHandle>> memo;
+    // 0 = not produced, 1 = retained, 2 = streaming segment released.
+    std::pmr::vector<uint8_t> ready;
+
+    Producer(SearchRequest& req, const StructuralConstraint* ancestor, size_t bucketCount);
+    void releaseSegment(int32_t segment);
+
+    DomainVariantPlan::SegmentSources& segmentSources(const DomainVariantPlan& plan,
+        IndexReader& reader, Query::PlanningContext& planning, int32_t segment,
+        RequestMemTracker& tracker);
+
+    void releaseSources(int32_t segment);
+
+    DomainVariantPlan::SegmentSources& filterSources(std::span<Query::Weight* const> weights,
+        std::span<FilterCache::Use* const> uses, IndexReader& reader, Query::PlanningContext& planning,
+        int32_t segment, RequestMemTracker& tracker);
+
+    DomainHandle prefix(int32_t segment, size_t bucket);
+    DomainHandle recover(int32_t segment, size_t bucket, DomainHandle eligibility);
+    virtual void produce(size_t segment, size_t begin, size_t count,
+                         DomainHandle base, Feed feed) = 0;
+    virtual ~Producer() = default;
+  };
+  using Finish = std::function<std::vector<DomainHandle>(std::vector<DomainHandle>)>;
+
+  const StructuralConstraint* parent;
+  Producer* producer;
+  size_t bucket;
+  Query::Weight* selection = nullptr;
+
+  bool hasSelection() const;
+
+  DomainHandle prefix(int32_t segment, DomainHandle eligibility) const;
+
+  std::vector<DomainHandle> finish(IndexReader& reader, std::vector<DomainHandle> domains,
+                                  ExecutionWarnings* warnings, RequestMemTracker& tracker) const;
+};
+
+struct BucketDomainPlan {
+  DomainVariantPlan variants;
+  Query::PlanningContext* planning = nullptr;
+};
+
 class SearchOp {
   std::vector<uint32_t> segmentStateRetentions;
 
@@ -85,6 +146,8 @@ public:
   SearchOp* parent = nullptr;  // set by parser after construction.
   boost::unordered_flat_map<std::string_view, SearchOp*> subOps;  // set by parser after construction.
   ExecutionProfileOpState* executionProfile = nullptr;
+  BucketDomainPlan* bucketDomain = nullptr;
+  bool needsStructuralScope = false;
 
   // We can't pass both the parent and children to constructors (and have them fully formed)
   // one has to come before the other.  The parser currently sets subOps and parent
@@ -137,13 +200,17 @@ public:
 
   class Calculator;
   class InlineCalculator;
-  virtual Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) = 0;
+  virtual Calculator* createCalculator(
+      Calculator* parent, int64_t slot = -1, int64_t numSlots = -1,
+      const StructuralConstraint* structural = nullptr) = 0;
   virtual InlineCalculator* createInlineCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) {
     return nullptr;
   }
   virtual bool canInline() {
     return false;
   }
+
+  bool canInlineInBucket() { return bucketDomain == nullptr && canInline(); }
 
   // Packed state size belongs to the resolved plan, so scheduling can budget
   // inline buckets without constructing their runtime calculators.
@@ -159,6 +226,9 @@ public:
     return 0;
   }
 
+  // Unknown dimensions use observed binding bytes for subsequent blocks.
+  virtual bool facetBucketGrows() const { return false; }
+
   // Whether this subtree runs query weights whose per-segment state is
   // released and rebuilt (Weight::hasReleasableSegmentState): bucket bindings
   // fed in one segment pass share it. Ops holding weights override this to
@@ -166,6 +236,15 @@ public:
   virtual bool facetBucketSharesSegmentState() const {
     return std::ranges::any_of(subOps, [](const auto& entry) {
       return entry.second->facetBucketSharesSegmentState();
+    });
+  }
+
+  // A descendant that gathers segment inputs may ask for earlier structural
+  // prefixes only after the last feed. Ordinary streaming bindings do not.
+  virtual bool needsCompleteBucketInput() const {
+    if (bucketDomain && !bucketDomain->variants.segmentLocal()) return true;
+    return std::ranges::any_of(subOps, [](const auto& entry) {
+      return entry.second->needsCompleteBucketInput();
     });
   }
 
@@ -227,7 +306,22 @@ public:
       }
     };
 
-    Calculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : op(op), parent(parent), slot(slot), numSlots(numSlots) {}
+    const StructuralConstraint* structural;
+
+    Calculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+        : op(op), parent(parent), slot(slot), numSlots(numSlots),
+          structural(structural ? structural : parent ? parent->structural : nullptr) {}
+
+    const StructuralConstraint* structuralConstraint() const {
+      return structural;
+    }
+
+    std::vector<DomainHandle> structuralDomains() const;
+
+    StructuralConstraint::Finish structuralFinish() const;
+
+    virtual size_t facetBucketObservedBytes() const { return op.facetBucketResidentBytes(); }
 
     virtual void releaseSegmentState(IndexReader::Segment& segment) noexcept {
       op.releaseSegmentState(segment);
@@ -337,6 +431,10 @@ public:
       return parent;
     }
 
+    // calc and calcAll execute their own work synchronously. Only sibling
+    // fan-outs through task_group_fanout publish work. Published tasks own
+    // their captures or reference calculator members that outlive the
+    // request group.
     // If domain.get()==nullptr, then the domain consists of all documents in
     // the segment. Non-null domains crossing this boundary carry their
     // lifetime with them.
@@ -354,21 +452,20 @@ public:
     // individual handles, never the span.
     virtual void calcAll(oneapi::tbb::task_group* tg,
                          std::span<const DomainHandle> domains) {
+      assert(structural == nullptr || tg == nullptr);
       assert(domains.size() == op.req.reader->segments().size());
       if (domains.empty()) {
         calc(tg, -1, {});
         return;
       }
-      // task_group runs locally submitted tasks from a stack. Ascending
-      // submission lets later segments, which are typically smaller, begin
-      // on this thread first while earlier segments are available to steal.
-      for (int32_t segnum = 0; segnum < (int32_t)domains.size(); segnum++) {
-        DomainHandle domain = domains[(size_t)segnum];
-        assert(domain.isDeliverable());
-        task_group_run(tg, [this, tg, segnum, domain]() {
-          calc(tg, segnum, domain);
-        });
-      }
+      // Ascending submission leaves the last, typically smaller segment on
+      // this thread while earlier segments are available to steal.
+      task_group_fanout(tg, domains.size(), [&](size_t segnum) {
+        return [this, tg, segnum, domain = domains[segnum]]() {
+          assert(domain.isDeliverable());
+          calc(tg, (int32_t)segnum, domain);
+        };
+      });
     }
 
     virtual ~Calculator() = default;
@@ -408,13 +505,23 @@ public:
 
 };
 
-// Fixed-stride inline facet entries keyed by int64 bucket key. A positive dense
+// Fixed-stride inline aggregate entries: int64 bucket keys for facets, exact
+// group keys for metric-ordered collapse. With int64 keys, a positive dense
 // key-space size permits keys in [0, size); zero permits arbitrary signed keys
 // with sparse storage. Dense entries use one flat key-indexed allocation plus
 // touched order; sparse entries use map
 // iteration order. Each representation keeps one stable order from finalize
 // through selection and result fill.
-class FacetEntryTable {
+struct NoAggregatePayload {
+  static constexpr size_t BYTES = 0;
+};
+
+// Key and payload policies are compile-time: the ordinal facet specialization
+// retains its packed layout and direct dense indexing.
+template <typename Key = int64_t, typename Hash = boost::hash<Key>,
+          typename Payload = NoAggregatePayload>
+class KeyedAggregateTable {
+  using KeyArg = std::conditional_t<std::is_same_v<Key, int64_t>, int64_t, const Key&>;
   enum class Rep { UNINITIALIZED, SPARSE, DENSE };
 
   // Initial, refittable crossover constants. The 64 MiB entry-array cap admits
@@ -429,10 +536,12 @@ class FacetEntryTable {
   // boost::unordered_flat_map's open-addressed slot array needs spare slots;
   // two value slots per touched key is a conservative budget reservation.
   static constexpr size_t SPARSE_HASH_BYTES_PER_ENTRY =
-      2 * (sizeof(std::pair<int64_t, char*>) + 1);
+      2 * (sizeof(std::pair<Key, char*>) + 1);
   static constexpr std::string_view BREAKER = "facet aggregate state";
 
-  BigFlatMap<int64_t, char*> sparseEntries;
+  BigFlatMap<Key, char*, Hash> sparseEntries;
+  [[no_unique_address]] Payload payload;
+  static constexpr size_t HEADER_BYTES = sizeof(int64_t) + Payload::BYTES;
   // The entry header counts documents delivered to metrics. Repeated values
   // add only facet occurrences, without changing compact metric denominators.
   boost::unordered_flat_map<char*, int64_t> extraOccurrences;
@@ -447,7 +556,7 @@ class FacetEntryTable {
   size_t sparseBytesCharged = 0;
   size_t touchedCapacityCharged = 0;
   size_t denseStorageBytesCharged = 0;
-  size_t stride = sizeof(int64_t);
+  size_t stride = HEADER_BYTES;
   int64_t keySpaceSize = 0;
   Rep rep = Rep::UNINITIALIZED;
 
@@ -518,8 +627,9 @@ class FacetEntryTable {
     }
   }
 
-  char* sparseFirstTouch(int64_t key) {
+  char* sparseFirstTouch(KeyArg key) {
     size_t bytes = stride + SPARSE_HASH_BYTES_PER_ENTRY;
+    if constexpr (requires { key.ramBytesUsed(); }) bytes += key.ramBytesUsed();
     charge(bytes);
     sparseBytesCharged += bytes;
     char* entry = entryPool.alloc(stride);
@@ -529,8 +639,8 @@ class FacetEntryTable {
     return entry;
   }
 
-  char* LUXIR_INLINE findEntry(int64_t key) {
-    if (rep == Rep::DENSE) {
+  char* LUXIR_INLINE findEntry(KeyArg key) {
+    if constexpr (std::is_same_v<Key, int64_t>) if (rep == Rep::DENSE) {
       assert(key >= 0 && key < keySpaceSize);
       char* entry = denseEntryForIndex((size_t)key);
       // Zero count is the absence sentinel. Inline mincount=0 deliberately
@@ -541,8 +651,8 @@ class FacetEntryTable {
     return iter == sparseEntries.end() ? nullptr : iter->second;
   }
 
-  char* firstTouch(int64_t key) {
-    if (rep == Rep::DENSE) {
+  char* firstTouch(KeyArg key) {
+    if constexpr (std::is_same_v<Key, int64_t>) if (rep == Rep::DENSE) {
       assert(key >= 0 && key < keySpaceSize);
       ensureTouchedCapacity();
       touchedKeys.push_back(key);
@@ -553,10 +663,11 @@ class FacetEntryTable {
 
   void LUXIR_INLINE insertEntry(char* entry, int32_t docid) {
     storeUnaligned<int64_t>(entry, 1);
-    char* ptr = entry + sizeof(int64_t);
+    if constexpr (Payload::BYTES != 0) payload.insert(entry + sizeof(int64_t), docid);
+    char* ptr = entry + HEADER_BYTES;
     if (calcs.size() == 1) {
       calcs.front()->insert(ptr, docid);
-      assert(sizeof(int64_t) + calcEntryBytes.front() == stride);
+      assert(HEADER_BYTES + calcEntryBytes.front() == stride);
       return;
     }
     for (size_t i = 0; i < calcs.size(); i++) {
@@ -568,7 +679,8 @@ class FacetEntryTable {
 
   void LUXIR_INLINE updateEntry(char* entry, int32_t docid) {
     storeUnaligned<int64_t>(entry, loadUnaligned<int64_t>(entry) + 1);
-    char* ptr = entry + sizeof(int64_t);
+    if constexpr (Payload::BYTES != 0) payload.update(entry + sizeof(int64_t), docid);
+    char* ptr = entry + HEADER_BYTES;
     if (calcs.size() == 1) {
       calcs.front()->update(ptr, docid);
       return;
@@ -579,10 +691,12 @@ class FacetEntryTable {
     }
   }
 
-  void mergeNewEntry(char* target, char* from) {
+  void mergeNewEntry(char* target, char* from, KeyedAggregateTable& other) {
     storeUnaligned<int64_t>(target, loadUnaligned<int64_t>(from));
-    target += sizeof(int64_t);
-    from += sizeof(int64_t);
+    if constexpr (Payload::BYTES != 0) payload.mergeNew(target + sizeof(int64_t),
+        from + sizeof(int64_t), other.payload);
+    target += HEADER_BYTES;
+    from += HEADER_BYTES;
     for (size_t i = 0; i < calcs.size(); i++) {
       calcs[i]->mergeNew(target, from);
       target += calcEntryBytes[i];
@@ -590,11 +704,13 @@ class FacetEntryTable {
     }
   }
 
-  void mergeEntry(char* target, char* from) {
+  void mergeEntry(char* target, char* from, KeyedAggregateTable& other) {
     storeUnaligned<int64_t>(
         target, loadUnaligned<int64_t>(target) + loadUnaligned<int64_t>(from));
-    target += sizeof(int64_t);
-    from += sizeof(int64_t);
+    if constexpr (Payload::BYTES != 0) payload.merge(target + sizeof(int64_t),
+        from + sizeof(int64_t), other.payload);
+    target += HEADER_BYTES;
+    from += HEADER_BYTES;
     for (size_t i = 0; i < calcs.size(); i++) {
       calcs[i]->merge(target, from);
       target += calcEntryBytes[i];
@@ -609,11 +725,13 @@ public:
     return saturatingMultiply((size_t)denseKeys, stride);
   }
 
-  FacetEntryTable() = default;
-  FacetEntryTable(const FacetEntryTable&) = delete;
-  FacetEntryTable& operator=(const FacetEntryTable&) = delete;
+  explicit KeyedAggregateTable(Payload policy = {}) : payload(std::move(policy)) {}
+  Payload& payloadPolicy() { return payload; }
+  static char* metricState(char* entry) { return entry + HEADER_BYTES; }
+  KeyedAggregateTable(const KeyedAggregateTable&) = delete;
+  KeyedAggregateTable& operator=(const KeyedAggregateTable&) = delete;
 
-  ~FacetEntryTable() {
+  ~KeyedAggregateTable() {
     if (tracker != nullptr) {
       releaseCharge(denseStorageBytesCharged + sparseBytesCharged
                     + touchedCapacityCharged);
@@ -665,7 +783,7 @@ public:
     int64_t quarterKeys = keySpaceSize / 4 + (keySpaceSize % 4 != 0);
     bool likelyDense = keySpaceSize <= DENSE_SMALL_KEYS
         || expectedValues >= quarterKeys;
-    bool wantDense = !forceSparse
+    bool wantDense = std::is_same_v<Key, int64_t> && !forceSparse
         && (forceDense || (denseFitsCap && likelyDense));
     if (wantDense && keySpaceSize > 0) {
       if (denseSizeValid && tryInitializeDense(denseBytes, expectedTouched)) {
@@ -684,7 +802,7 @@ public:
 
   // Resolve once when many documents share a key. The caller must touch a
   // new entry before resolving it again; zero marks uninitialized metric state.
-  char* resolveEntry(int64_t key) {
+  char* resolveEntry(KeyArg key) {
     assert(rep != Rep::UNINITIALIZED);
     char* entry = findEntry(key);
     if (entry == nullptr) {
@@ -705,7 +823,7 @@ public:
   // instantiated per domain and column shape, and inlining add() into those
   // large bodies leaves the inliner no budget to fold the devirtualized
   // calculator update in here, turning it into a virtual call per document.
-  void LUXIR_NOINLINE add(int64_t key, int32_t docid) {
+  void LUXIR_NOINLINE add(KeyArg key, int32_t docid) {
     assert(rep != Rep::UNINITIALIZED);
     char* entry = findEntry(key);
     if (entry == nullptr) {
@@ -738,7 +856,7 @@ public:
   }
 
   template <typename RemapKey>
-  void merge(FacetEntryTable& other, RemapKey&& remapKey) {
+  void merge(KeyedAggregateTable& other, RemapKey&& remapKey) {
     assert(rep != Rep::UNINITIALIZED || other.empty());
     if (rep == Rep::DENSE && !other.empty() && stats != nullptr) {
       stats->denseMerges.fetch_add(1, std::memory_order_relaxed);
@@ -747,14 +865,14 @@ public:
       }
     }
     const bool carryOccurrences = !other.extraOccurrences.empty();
-    other.forEachEntry([&](int64_t key, char* from) {
-      int64_t targetKey = remapKey(key);
+    other.forEachEntry([&](KeyArg key, char* from) {
+      decltype(auto) targetKey = remapKey(key);
       char* target = findEntry(targetKey);
       if (target == nullptr) {
         target = firstTouch(targetKey);
-        mergeNewEntry(target, from);
+        mergeNewEntry(target, from, other);
       } else {
-        mergeEntry(target, from);
+        mergeEntry(target, from, other);
       }
       if (carryOccurrences) {
         auto it = other.extraOccurrences.find(from);
@@ -763,16 +881,16 @@ public:
     });
   }
 
-  void merge(FacetEntryTable& other) {
-    merge(other, [](int64_t key) { return key; });
+  void merge(KeyedAggregateTable& other) {
+    merge(other, [](KeyArg key) -> KeyArg { return key; });
   }
 
   void finalize() {
     for (auto* calc : calcs) calc->beginFinalize(size());
-    forEachEntry([&](int64_t key, char* entry) {
+    forEachEntry([&](KeyArg key, char* entry) {
       unused(key);
       int64_t count = loadUnaligned<int64_t>(entry);
-      char* ptr = entry + sizeof(int64_t);
+      char* ptr = entry + HEADER_BYTES;
       for (size_t i = 0; i < calcs.size(); i++) {
         calcs[i]->finalize(ptr, count);
         ptr += calcEntryBytes[i];
@@ -782,7 +900,7 @@ public:
 
   template<typename Accept>
   void forEachEntry(Accept&& accept) {
-    if (rep == Rep::DENSE) {
+    if constexpr (std::is_same_v<Key, int64_t>) if (rep == Rep::DENSE) {
       for (int64_t key : touchedKeys) {
         size_t index = (size_t)key;
         accept(key, denseEntries.data() + index * stride);
@@ -799,5 +917,6 @@ public:
   bool dense() const { return rep == Rep::DENSE; }
 };
 
+using FacetEntryTable = KeyedAggregateTable<>;
 
 }
