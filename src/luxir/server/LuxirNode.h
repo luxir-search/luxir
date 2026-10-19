@@ -19,6 +19,7 @@
 #include "oneapi/tbb/task_scheduler_observer.h"
 #include "luxir/search/SearchEngine.h"
 #include "luxir/LuxirConfig.h"
+#include "luxir/util/Metrics.h"
 #include "luxir/util/SharedLazyMap.h"
 #include "luxir/util/thread.h"
 
@@ -33,9 +34,12 @@ class LuxirNode;
 class ReplicationSource;
 class CommitWaits;
 class ReplicationFollower;
+class Scrubber;
 
 class LuxirNode {
 public:
+  // Shared with retained collections so instrumentation outlives their work.
+  const std::shared_ptr<Metrics> metrics = std::make_shared<Metrics>();
   static constexpr std::string_view kDefaultCollectionName = Collections::kDefaultCollectionName;
   using CollectionEntry = Collections::Entry;
 
@@ -51,6 +55,9 @@ public:
   const LuxirConfig& getConfig() const { return config; }
   Clock::time_point now() const { return clock(); }
   ReplicationFollower* getFollower() { return follower.get(); }
+  // Checksum scrub of published snapshots; runs periodically only when
+  // store.scrub-interval-s is set, but scrub() works on demand regardless.
+  Scrubber& getScrubber() { return *scrubber; }
   bool following() const { return !config.replication.source.empty(); }
   ReplicationSource& getReplication() { return *replication; }
   CommitWaits& getCommitWaits() { return *commitWaits; }
@@ -194,6 +201,7 @@ private:
   std::shared_ptr<CollectionEvents> events; // ordered feed of the collection map
   std::unique_ptr<Collections> collections_;
   std::unique_ptr<ReplicationFollower> follower;
+  std::unique_ptr<Scrubber> scrubber;
   std::unique_ptr<SearchEngine> searchEngine;
 };
 

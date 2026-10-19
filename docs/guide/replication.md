@@ -33,6 +33,19 @@ automatically. A source that restarts without its data, such as a RAM writer,
 does not empty its followers: a follower keeps serving its copy until the source
 commits data to that collection.
 
+If a local collection cannot be opened at startup, the follower keeps its files
+and reports it unavailable. A later verified install can replace it. Until then,
+the unreadable copy is treated as populated for the empty-replacement rule.
+With `--store.verify-on-open=full` a local file whose bytes no longer match its
+manifest digest also makes the copy unreadable, and a background scrub that
+finds one does the same while the follower runs; the next install keeps the
+files that still verify and re-downloads every file named by a corruption
+marker, even when its buffered hash matches. Suspect files are excluded from
+hard-link reuse from the serving copy; a failed serving collection supplies no
+such reuse. A repair unloads the failed collection before replacing files in
+its incarnation. See
+[file integrity checks](operations.md#file-integrity-checks).
+
 ## Try it on one machine
 
 Start a writer on port 9400 and a follower on port 9500, each in its own
@@ -224,6 +237,10 @@ luxir -p 9600 --store.backend=fs --store.data-dir=/tmp/luxir/seed
 ```
 
 Promotion gives every collection a new incarnation while reusing its files.
+Promotion and writer recovery preserve corruption markers for files in the
+copied manifest. The new writer re-checks those suspects at startup even with
+`--store.verify-on-open=none`; promotion does not erase a pending scrub hit.
+
 The promoted copy starts an independent commit history: it may be older than
 the previous writer, and future writes can diverge. A new incarnation keeps
 its commit tokens distinct, so an old `min_commit` token cannot incorrectly
@@ -285,8 +302,8 @@ restart, and RAM followers refetch. `--store.ram-limit-mb`
 (default 0, unlimited) bounds storage buffers. Under pressure, pins on retired
 files are dropped first; if space is still short, writes fail with
 `storage_memory_limit`. Allow room for current data plus changed files.
-Per-collection storage usage is in `_stats`; node storage usage and its limit
-are in `_stats?memory=true` under `memory.storage_ram`.
+Per-collection storage usage is in `_stats?collections=true`; node storage usage
+and its limit are in `_stats` under `memory.storage_ram`.
 
 ## Reference
 
@@ -308,8 +325,8 @@ All replication settings use `--replication.` (configuration keys use underscore
 Copying a snapshot pins it so its files stay readable. A pin expires after
 `pin-idle-timeout-ms` without progress, and the oldest pins are revoked when
 retired files held only by pins exceed `pin-retained-bytes`. The follower then
-fetches a new snapshot and reuses the files it already verified. `_stats`
-reports `snapshot_pins`, `pin_retained_bytes`, `pin_idle_drops` and
+fetches a new snapshot and reuses the files it already verified.
+`_stats?collections=true` reports `snapshot_pins`, `pin_retained_bytes`, `pin_idle_drops` and
 `pin_budget_drops`.
 
 A source tracks up to 4096 live followers and `max-acknowledgments`

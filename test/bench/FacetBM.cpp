@@ -3,6 +3,8 @@
 
 #include <charconv>
 #include <latch>
+#include <numeric>
+#include <random>
 #include <variant>
 
 #include <tbb/task_group.h>
@@ -197,6 +199,345 @@ static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
   state.counters["rate"] = benchmark::Counter(
       state.iterations(), benchmark::Counter::kIsRate);
 }
+
+// Shared DATA corpus. Setup stays outside the timed search loop. In addition
+// to the current lanes, keep a time-correlated 20-year minute span for narrow
+// filters, separated parent windows, and distinct keys for the streaming lanes.
+struct RangeDataBenchFixture {
+  CollectionHelper helper;
+  bool reused;
+  int64_t numDocs;
+  static constexpr int64_t epoch = 1577836800000LL;
+  static constexpr int64_t retention = 20LL * 365 * 86400000;
+
+  explicit RangeDataBenchFixture(int64_t docs, std::string_view shape,
+                                 std::string_view name = "facet_range_data_bm") : helper(name) {
+    if (unit_tests) docs = LuxirTest::scaleTestWork(200);
+    numDocs = docs;
+    std::vector<int32_t> docsPerSeg;
+    CollectionHelper::calcSegSizes(docs, 10, shape, docsPerSeg);
+    reused = helper.indexMatchesShape(docsPerSeg);
+    if (reused) return;
+    helper.clear();
+    SchemaBuilder schema;
+    for (auto name : {"data_i", "date_dt", "retention_dt", "group_i"}) {
+      auto& field = schema.field(name);
+      field.type = std::string_view(name).ends_with("_dt")
+          ? api::FieldDef::FieldClass::DATE : api::FieldDef::FieldClass::INT;
+      field.index = api::FieldDef::IndexMode::RANGE;
+    }
+    if (name == "facet_range_data_drop_bm") schema.field("drop_group_i").type = api::FieldDef::FieldClass::INT;
+    schema.field("parent_s").type = api::FieldDef::FieldClass::STRING;
+    if (name != "facet_range_data_bm") schema.field("parent_i").type = api::FieldDef::FieldClass::INT;
+    schema.set(helper.collection());
+    auto iw = helper.getIndexWriter();
+    int64_t doc = 0;
+    std::mt19937 random(37);
+    for (int32_t size : docsPerSeg) {
+      auto& inv = iw->obtainInverter();
+      auto& id = inv.getIndexHandler("id");
+      auto& value = inv.getIndexHandler("data_i");
+      auto& date = inv.getIndexHandler("date_dt");
+      auto& retained = inv.getIndexHandler("retention_dt");
+      auto& parent = inv.getIndexHandler("parent_s");
+      auto& group = inv.getIndexHandler("group_i");
+      auto* parentNumber = name != "facet_range_data_bm" ? &inv.getIndexHandler("parent_i") : nullptr;
+      auto* dropGroup = name == "facet_range_data_drop_bm" ? &inv.getIndexHandler("drop_group_i") : nullptr;
+      for (int32_t i = 0; i < size; i++, doc++) {
+        inv.startDoc();
+        id.index(inv, std::to_string(doc));
+        value.index(inv, doc % 10000 * 1000);
+        int64_t cell = name == "facet_range_data_shuffled_bm" ? random() % (365 * 24) : doc % (365 * 24);
+        date.index(inv, epoch + cell * 3600000);
+        retained.index(inv, epoch + (int64_t)((__int128)doc * retention / docs));
+        parent.index(inv, "p" + std::to_string(doc * 32 / docs));
+        group.index(inv, doc % 4096);
+        if (dropGroup && doc % 4 != 0) dropGroup->index(inv, doc % 4096);
+        if (parentNumber) parentNumber->index(inv, doc * 32 / docs);
+        inv.finishDoc();
+      }
+      iw->releaseInverter(inv, true);
+    }
+    helper.commit();
+  }
+};
+
+enum class RangeDataBenchMode {
+  INT, DATE, IANA, IANA_SHIFTED, IANA_DAILY, IANA_DAILY_6H, CALENDAR_DAY,
+  NARROW, DISTINCT, DISTINCT_WIDE, DISTINCT_DROP, NESTED
+};
+
+// Logical source values per search, including values handled by point ordinals
+// and values whose distinct key is dropped. RSS includes the resident corpus;
+// peak_bytes measures only allocations charged to the request tracker.
+static void rangeDataBenchCounters(benchmark::State& state, int64_t values,
+                                  size_t buckets, size_t peak, RSSWatcher& rss) {
+  state.counters["values"] = (double)values;
+  state.counters["values_per_second"] = benchmark::Counter(
+      (double)values, benchmark::Counter::kIsIterationInvariantRate);
+  state.counters["buckets"] = (double)buckets;
+  state.counters["peak_bytes"] = (double)peak;
+  state.counters["rss_bytes"] = (double)(std::max(rss.startRSS, rss.getDeltaKB().second) * 1024);
+}
+
+static void BM_RangeFacetData(benchmark::State& state, int64_t nDocs,
+                              std::string_view shape, RangeDataBenchMode mode,
+                              bool forceWalk = false, bool parallel = false,
+                              bool explicitBounds = false, bool shuffled = false) {
+  bool drop = mode == RangeDataBenchMode::DISTINCT_DROP;
+  std::string_view collection = drop ? "facet_range_data_drop_bm"
+      : shuffled ? "facet_range_data_shuffled_bm" : "facet_range_data_bm";
+  RangeDataBenchFixture fixture(nDocs, shape, collection);
+  int64_t explicitStart = 0, explicitEnd = 0;
+  if (explicitBounds) {
+    auto zone = *resolveTimeZone("America/New_York");
+    int64_t gap = mode == RangeDataBenchMode::IANA_DAILY || mode == RangeDataBenchMode::CALENDAR_DAY
+        ? 86400000 : 3600000;
+    int64_t origin = mode == RangeDataBenchMode::IANA_SHIFTED ? 17 * 60000 : 0;
+    auto grid = mode == RangeDataBenchMode::CALENDAR_DAY ? RangeFacetGrid::calendar(CalendarUnit::DAY, 1, zone)
+        : RangeFacetGrid::fixed(FieldType::DATE, gap, origin, zone);
+    explicitStart = grid.floor(RangeDataBenchFixture::epoch).key;
+    explicitEnd = grid.next(grid.floor(RangeDataBenchFixture::epoch + (365 * 24 - 1LL) * 3600000)).key;
+  }
+  RSSWatcher rss;
+  bool savedWalk = IntFacetRangeReq::disablePointsRangeFacetForTests;
+  auto* savedCounter = facetBucketBlockCounter;
+  size_t blocks = 0, peak = 0, buckets = 0;
+  int64_t values = fixture.numDocs;
+  IntFacetRangeReq::disablePointsRangeFacetForTests = forceWalk;
+  facetBucketBlockCounter = &blocks;
+  auto restore = scope_guard([&]() noexcept {
+    IntFacetRangeReq::disablePointsRangeFacetForTests = savedWalk;
+    facetBucketBlockCounter = savedCounter;
+  });
+  std::optional<uint64_t> fingerprint;
+  for (auto _ : state) {
+    blocks = 0;
+    auto req = localReq(fixture.helper.getSearchEngine());
+    req->collection(collection);
+    bool iana = mode == RangeDataBenchMode::IANA || mode == RangeDataBenchMode::IANA_SHIFTED
+        || mode == RangeDataBenchMode::IANA_DAILY || mode == RangeDataBenchMode::IANA_DAILY_6H
+        || mode == RangeDataBenchMode::CALENDAR_DAY;
+    if (iana) req->timeZone("America/New_York");
+    OpCursor* facet;
+    if (mode == RangeDataBenchMode::NARROW) {
+      auto& top = req->topDocs("q").limit(0).exprQuery("retention_dt:[2025-01-01T00:00Z TO 2025-01-02T00:00Z}");
+      facet = &top.rangeFacet("f", "retention_dt").rangeData(60000);
+    } else if (mode == RangeDataBenchMode::NESTED) {
+      facet = &req->facet("parents", "parent_s").limit(-1)
+          .rangeFacet("f", "retention_dt").rangeData(3600000);
+    } else if (mode == RangeDataBenchMode::CALENDAR_DAY) {
+      facet = &req->rangeFacet("f", "date_dt").rangeDataCalendar(1, api::CalendarGap_::Unit::DAY);
+    } else {
+      bool date = mode == RangeDataBenchMode::DATE || iana;
+      bool daily = mode == RangeDataBenchMode::IANA_DAILY || mode == RangeDataBenchMode::IANA_DAILY_6H;
+      int64_t gap = date ? (daily ? 86400000 : 3600000)
+          : mode == RangeDataBenchMode::DISTINCT_WIDE ? 100 : 100000;
+      int64_t origin = mode == RangeDataBenchMode::IANA_SHIFTED ? 17 * 60000
+          : mode == RangeDataBenchMode::IANA_DAILY_6H ? 6 * 3600000 : 0;
+      facet = &req->rangeFacet("f", date ? "date_dt" : "data_i").rangeData(gap, origin);
+    }
+    if (explicitBounds) {
+      facet->range(explicitStart, explicitEnd,
+          mode == RangeDataBenchMode::IANA_DAILY || mode == RangeDataBenchMode::CALENDAR_DAY ? 86400000 : 3600000);
+      auto& range = std::get<api::RangeFacet>(facet->rawOp().kind);
+      range.bounds = api::RangeFacet_::Bounds::EXPLICIT;
+      range.origin.reset();
+      if (mode == RangeDataBenchMode::CALENDAR_DAY) {
+        auto& calendar = range.gap_kind.emplace<api::CalendarGap>();
+        calendar.n = 1;
+        calendar.unit = api::CalendarGap_::Unit::DAY;
+      }
+    }
+    if (mode == RangeDataBenchMode::DISTINCT || mode == RangeDataBenchMode::DISTINCT_WIDE || drop) {
+      auto& range = std::get<api::RangeFacet>(facet->rawOp().kind);
+      auto* key = api::build::allocMessage<api::Collapse>(req->mr);
+      *api::build::allocArray(key->field, 1, req->mr) = drop ? "drop_group_i" : "group_i";
+      if (drop) key->missing = api::Collapse_::MissingPolicy::DROP;
+      range.count_distinct = key;
+    }
+    req->execute(parallel ? -1 : 1);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    uint64_t current = 0;
+    buckets = 0;
+    auto consume = [&](const api::FacetResult& result) {
+      const auto& bounds = std::get<api::ArrArrInt>(result.bucket_ids->kind).v;
+      buckets += result.counts.size();
+      for (size_t i = 0; i < result.counts.size(); i++) {
+        current = current * 31 + (uint64_t)bounds[i].v[0] + result.counts[i];
+      }
+    };
+    if (mode == RangeDataBenchMode::NESTED) {
+      const auto* parents = req->responses[0]->proto.ops.at("parents")->facetResult();
+      for (const auto& child : std::get<api::ArrVal>(parents->ops.at("f")->kind).v) consume(*child.facetResult());
+    } else if (mode == RangeDataBenchMode::NARROW) {
+      const auto& result = *req->docList()->ops.at("f")->facetResult();
+      values = std::accumulate(result.counts.begin(), result.counts.end(), int64_t{0});
+      consume(result);
+    } else consume(*req->responses[0]->proto.ops.at("f")->facetResult());
+    benchmark::DoNotOptimize(current);
+    if (fingerprint) { ASSERT_EQ(*fingerprint, current); }
+    fingerprint = current;
+    peak = std::max(peak, req->memoryTracker.peak());
+  }
+  state.counters["fp"] = (double)fingerprint.value_or(0);
+  state.counters["reused"] = fixture.reused;
+  state.counters["blocks"] = (double)blocks;
+  rangeDataBenchCounters(state, values, buckets, peak, rss);
+}
+
+// Existing nested fixed-bucket shapes. Keep these independent of DATA so the
+// resident-byte scheduling change can be measured against the old estimate.
+static void BM_FixedBucketResident(benchmark::State& state, bool query, bool metric) {
+  RangeDataBenchFixture fixture(10'000'000, "9555");
+  size_t blocks = 0;
+  auto* savedCounter = facetBucketBlockCounter;
+  facetBucketBlockCounter = &blocks;
+  auto restore = scope_guard([&]() noexcept { facetBucketBlockCounter = savedCounter; });
+  uint64_t fingerprint = 0;
+  size_t peak = 0;
+  for (auto _ : state) {
+    blocks = 0;
+    auto req = localReq(fixture.helper.getSearchEngine());
+    auto& parent = req->collection("facet_range_data_bm").facet("parents", "parent_s").limit(-1);
+    auto& child = parent.rangeFacet("child", "data_i");
+    if (query) {
+      auto& facet = child.rawOp().kind.emplace<api::QueryFacet>();
+      auto* buckets = api::build::allocArray(facet.buckets, 64, req->mr);
+      for (size_t i = 0; i < 64; i++) {
+        buckets[i].name = api::build::arenaStr(req->mr, std::to_string(i));
+        auto* predicate = api::build::allocMessage<api::Query>(req->mr);
+        predicate->kind = true;
+        buckets[i].query = predicate;
+      }
+      if (metric) api::build::mapSlot(facet.ops, 1, "mean", req->mr)->kind.emplace<api::ExprOp>().expr = "avg(group_i)";
+    } else {
+      child.range(0, 10'000'000, metric ? 10000 : 1000);
+    }
+    if (metric && !query) child.avg("mean", "group_i");
+    req->execute(false);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto& result = *req->responses[0]->proto.ops.at("parents")->facetResult();
+    uint64_t current = 0;
+    for (auto count : result.counts) current = current * 31 + count;
+    const auto& children = std::get<api::ArrVal>(result.ops.at("child")->kind).v;
+    for (const auto& value : children) {
+      const auto& nested = *value.facetResult();
+      for (auto count : nested.counts) current = current * 31 + count;
+      if (metric) {
+        const auto& means = std::get<api::ArrVal>(nested.ops.at("mean")->kind).v;
+        for (const auto& mean : means) {
+          if (!mean.isNull()) current = current * 31 + (uint64_t)mean.asDouble();
+        }
+      }
+    }
+    if (fingerprint) { ASSERT_EQ(fingerprint, current); }
+    fingerprint = current;
+    peak = std::max(peak, req->memoryTracker.peak());
+    benchmark::DoNotOptimize(current);
+  }
+  state.counters["blocks"] = (double)blocks;
+  state.counters["peak_bytes"] = (double)peak;
+  state.counters["fp"] = (double)fingerprint;
+}
+
+LUXIR_BENCHMARK_CAPTURE(BM_FixedBucketResident, range_counts, false, false);
+LUXIR_BENCHMARK_CAPTURE(BM_FixedBucketResident, range_metric, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_FixedBucketResident, query_counts, true, false);
+LUXIR_BENCHMARK_CAPTURE(BM_FixedBucketResident, query_metric, true, true);
+
+// Three observed cells occupy a year-wide directory. Put the endpoints in
+// the first segment so the wide state stays resident while another segment
+// is still due. mincount=1 bounds output and permits avg under the sub-op cap.
+struct RangeFanoutBenchFixture {
+  CollectionHelper helper{"facet_range_data_fanout_bm"};
+  int parents;
+  explicit RangeFanoutBenchFixture() : parents(unit_tests ? 8 : 10000) {
+    std::array<int32_t, 2> shape{parents * 2, parents};
+    if (helper.indexMatchesShape(shape)) return;
+    helper.clear();
+    SchemaBuilder schema;
+    schema.field("parent_s").type = api::FieldDef::FieldClass::STRING;
+    schema.field("parent_i").type = api::FieldDef::FieldClass::INT;
+    schema.field("date_dt").type = api::FieldDef::FieldClass::DATE;
+    schema.field("score_i").type = api::FieldDef::FieldClass::INT;
+    schema.set(helper.collection());
+    for (int segment = 0; segment < 2; segment++) {
+      std::vector<Doc> docs;
+      for (int parent = 0; parent < parents; parent++) {
+        for (int cell : segment == 0 ? std::vector<int>{0, 8759} : std::vector<int>{4380}) {
+          docs.push_back(flatdoc("id", std::to_string(parent) + ":" + std::to_string(cell),
+              "parent_s", std::to_string(parent), "parent_i", parent,
+              "date_dt", RangeDataBenchFixture::epoch + (int64_t)cell * 3600000,
+              "score_i", parent + cell));
+        }
+      }
+      auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
+      if (!result.success) throw std::runtime_error(result.error_message);
+    }
+  }
+};
+
+static void BM_RangeFacetDataNested(benchmark::State& state, bool numeric,
+                                     bool metric, bool parallel, bool fanout) {
+  std::unique_ptr<RangeDataBenchFixture> regular;
+  std::unique_ptr<RangeFanoutBenchFixture> large;
+  if (fanout) large = std::make_unique<RangeFanoutBenchFixture>();
+  else regular = std::make_unique<RangeDataBenchFixture>(10000000, "9555", "facet_range_data_nested_bm");
+  auto& helper = fanout ? large->helper : regular->helper;
+  RSSWatcher rss;
+  size_t blocks = 0, peak = 0, emitted = 0;
+  auto* saved = facetBucketBlockCounter;
+  facetBucketBlockCounter = &blocks;
+  auto restore = scope_guard([&]() noexcept { facetBucketBlockCounter = saved; });
+  std::optional<uint64_t> fingerprint;
+  for (auto _ : state) {
+    blocks = 0;
+    emitted = 0;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(fanout ? "facet_range_data_fanout_bm" : "facet_range_data_nested_bm");
+    auto& parent = req->facet("parents", numeric ? "parent_i" : "parent_s").limit(-1);
+    auto& child = parent.rangeFacet("hist", fanout ? "date_dt" : "retention_dt")
+        .rangeData(fanout ? 3600000 : 86400000).mincount(1);
+    if (metric) child.avg("avg", fanout ? "score_i" : "group_i");
+    req->execute(parallel ? -1 : 1);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto& p = *req->responses[0]->proto.ops.at("parents")->facetResult();
+    uint64_t fp = 0;
+    for (const auto& row : std::get<api::ArrVal>(p.ops.at("hist")->kind).v) {
+      const auto& h = *row.facetResult();
+      emitted += h.counts.size();
+      for (auto count : h.counts) fp = fp * 31 + count;
+      if (metric) for (const auto& mean : std::get<api::ArrVal>(h.ops.at("avg")->kind).v) {
+        if (!mean.isNull()) fp = fp * 31 + (uint64_t)mean.asDouble();
+      }
+    }
+    if (fingerprint) { ASSERT_EQ(*fingerprint, fp); }
+    fingerprint = fp;
+    peak = std::max(peak, req->memoryTracker.peak());
+    benchmark::DoNotOptimize(fp);
+  }
+  state.counters["blocks"] = (double)blocks;
+  state.counters["emitted"] = (double)emitted;
+  rangeDataBenchCounters(state, fanout ? large->parents * 3 : regular->numDocs, emitted, peak, rss);
+}
+
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, string_counts, false, false, false, false);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, string_avg, false, true, false, false);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, string_counts_parallel, false, false, true, false);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, string_avg_parallel, false, true, true, false);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, numeric_counts, true, false, false, false);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, numeric_avg, true, true, false, false);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, numeric_counts_parallel, true, false, true, false);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, numeric_avg_parallel, true, true, true, false);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, fanout_string_counts, false, false, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, fanout_string_avg, false, true, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, fanout_string_counts_parallel, false, false, true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, fanout_string_avg_parallel, false, true, true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, fanout_numeric_counts, true, false, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, fanout_numeric_avg, true, true, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, fanout_numeric_counts_parallel, true, false, true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetDataNested, fanout_numeric_avg_parallel, true, true, true, true);
 
 enum class AggregateFacetBenchMode {
   BUCKET_DOMAIN,
@@ -418,6 +759,36 @@ LUXIR_BENCHMARK_CAPTURE(BM_Facet, lim0_bigD_u10_i,  nDocs, shape, "short_u10_s",
 
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, points,      nDocs, shape, false);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, forced_walk, nDocs, shape, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_int, nDocs, shape, RangeDataBenchMode::INT);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_int_walk, nDocs, shape, RangeDataBenchMode::INT, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_date, nDocs, shape, RangeDataBenchMode::DATE);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_date_walk, nDocs, shape, RangeDataBenchMode::DATE, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_hourly, nDocs, shape, RangeDataBenchMode::IANA);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_hourly_walk, nDocs, shape, RangeDataBenchMode::IANA, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_hourly_17m, nDocs, shape, RangeDataBenchMode::IANA_SHIFTED);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_hourly_17m_walk, nDocs, shape, RangeDataBenchMode::IANA_SHIFTED, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_daily, nDocs, shape, RangeDataBenchMode::IANA_DAILY);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_daily_walk, nDocs, shape, RangeDataBenchMode::IANA_DAILY, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_daily_6h, nDocs, shape, RangeDataBenchMode::IANA_DAILY_6H);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_daily_6h_walk, nDocs, shape, RangeDataBenchMode::IANA_DAILY_6H, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, calendar_day, nDocs, shape, RangeDataBenchMode::CALENDAR_DAY);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, calendar_day_walk, nDocs, shape, RangeDataBenchMode::CALENDAR_DAY, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, explicit_iana_hourly_walk, nDocs, shape, RangeDataBenchMode::IANA, true, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, explicit_iana_hourly_17m_walk, nDocs, shape, RangeDataBenchMode::IANA_SHIFTED, true, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, explicit_iana_daily_walk, nDocs, shape, RangeDataBenchMode::IANA_DAILY, true, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, explicit_calendar_day_walk, nDocs, shape, RangeDataBenchMode::CALENDAR_DAY, true, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, shuffled_iana_hourly_walk, nDocs, shape, RangeDataBenchMode::IANA, true, false, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, shuffled_iana_hourly_17m_walk, nDocs, shape, RangeDataBenchMode::IANA_SHIFTED, true, false, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, shuffled_iana_daily_walk, nDocs, shape, RangeDataBenchMode::IANA_DAILY, true, false, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, shuffled_calendar_day_walk, nDocs, shape, RangeDataBenchMode::CALENDAR_DAY, true, false, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, narrow_retention, nDocs, shape, RangeDataBenchMode::NARROW);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, distinct_int, nDocs, shape, RangeDataBenchMode::DISTINCT);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, distinct_int_parallel, nDocs, shape, RangeDataBenchMode::DISTINCT, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, distinct_wide, nDocs, shape, RangeDataBenchMode::DISTINCT_WIDE);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, distinct_wide_parallel, nDocs, shape, RangeDataBenchMode::DISTINCT_WIDE, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, distinct_drop, nDocs, shape, RangeDataBenchMode::DISTINCT_DROP);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, distinct_drop_parallel, nDocs, shape, RangeDataBenchMode::DISTINCT_DROP, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, nested_retention, nDocs, shape, RangeDataBenchMode::NESTED);
 LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, bucket_domain,
                         AggregateFacetBenchMode::BUCKET_DOMAIN, 10);
 LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_10,

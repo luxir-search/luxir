@@ -316,6 +316,67 @@ TEST_F(FieldVariantsGenerationTest, schemaOnlyPublicationPreservesIntroductionsA
   }
 }
 
+TEST_F(FieldVariantsGenerationTest, resolvedVectorAnnIncludesDefaultsAndInheritance) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  put(helper.collection(), R"({"templates":{"_e":{"type":"vector","dims":8,
+    "ann":{"codec":"pq","nlist":16,"pq":{"m":4,"bits":6}}}},"fields":{
+    "plain":{"type":"vector"},
+    "pqDefaults":{"type":"vector","ann":{"codec":"pq"}},
+    "rabitqDefaults":{"type":"vector","ann":{"codec":"rabitq"}},
+    "inherits":{"parent":"_e","variants":{"r":{"parent":"_e",
+      "ann":{"codec":"rabitq","nlist":8,"rabitq":{"bits":2,"query_bits":0}}}}}
+  }})");
+  glz::generic_sorted_u64 json;
+  ASSERT_FALSE(glz::read_json(json, helper.getIndexWriter()->snapshots.readers.resolvedSchema()));
+  auto ann = [&](std::string_view name, std::string_view label = "self") {
+    return glz::write_json(json["fields"][name]["representations"][label]["ann"]).value();
+  };
+  EXPECT_EQ(R"({"codec":"pq","nlist":0,"pq":{"bits":8,"m":0}})", ann("plain"));
+  EXPECT_EQ(R"({"codec":"pq","nlist":0,"pq":{"bits":8,"m":0}})", ann("pqDefaults"));
+  EXPECT_EQ(R"({"codec":"rabitq","nlist":0,"rabitq":{"bits":1,"query_bits":4}})", ann("rabitqDefaults"));
+  EXPECT_EQ(R"({"codec":"pq","nlist":16,"pq":{"bits":6,"m":4}})", ann("inherits"));
+  EXPECT_EQ(R"({"codec":"rabitq","nlist":8,"rabitq":{"bits":2,"query_bits":0}})", ann("inherits", "r"));
+  EXPECT_FALSE(json["fields"]["id"]["representations"]["self"].get<glz::generic_sorted_u64::object_t>().contains("ann"));
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef authored;
+  helper.collection().getSchema()->toProto(&authored, arena);
+  EXPECT_FALSE(authored.fields.at("plain")->ann.has_value());
+  EXPECT_FALSE(authored.fields.at("inherits")->ann.has_value());
+  EXPECT_FALSE(authored.fields.at("pqDefaults")->ann->pq.has_value());
+  EXPECT_FALSE(authored.fields.at("pqDefaults")->ann->nlist.has_value());
+}
+
+TEST_F(FieldVariantsGenerationTest, annOnlyChangePreservesIntroductionsAndCoverage) {
+  for (bool gap : {false, true}) {
+    LuxirNode node;
+    CollectionHelper helper(node);
+    if (gap) {
+      ASSERT_TRUE(helper.index(flatdoc("id", "old"), UpdateMessage::COMMIT).success);
+    }
+    auto before = put(helper.collection(), R"({"templates":{"_e":{"type":"vector","dims":4,"metric":"l2",
+      "ann":{"codec":"pq"}}},"fields":{"v":{"parent":"_e","variants":{"r":{"parent":"_e"}}}}})");
+    ASSERT_TRUE(helper.index(flatdoc("id", "new", "v", std::vector<float>{1, 2, 3, 4}), UpdateMessage::COMMIT).success);
+    auto writer = helper.getIndexWriter();
+    auto initial = view(*writer);
+    auto after = put(helper.collection(), R"({"templates":{"_e":{"type":"vector","dims":4,"metric":"l2",
+      "ann":{"codec":"rabitq","nlist":8,"rabitq":{"bits":2,"query_bits":0}}}}})");
+    EXPECT_GT(after->gen_, before->gen_);
+    auto changed = view(*writer);
+    for (auto label : {"self", "r"}) {
+      auto& a = initial["fields"]["v"]["representations"][label];
+      auto& b = changed["fields"]["v"]["representations"][label];
+      EXPECT_EQ(before->gen_, b["introduced_generation"].get<uint64_t>());
+      EXPECT_EQ(a["oldest_generation"].get<uint64_t>(), b["oldest_generation"].get<uint64_t>());
+      EXPECT_EQ(!gap, b["coverage_complete"].get<bool>());
+      EXPECT_EQ(before->signatures().at(label == std::string_view("self") ? "v" : "v__r").properties,
+          after->signatures().at(label == std::string_view("self") ? "v" : "v__r").properties);
+      EXPECT_EQ("rabitq", b["ann"]["codec"].get<std::string>());
+      EXPECT_EQ(2u, b["ann"]["rabitq"]["bits"].get<uint64_t>());
+    }
+  }
+}
+
 TEST_F(FieldVariantsGenerationTest, longTermsResolvedSettingsAndStoredSourceSurviveReopenAndMerge) {
   std::string source(300, 'x');
   auto checkSource = [&](CollectionHelper& helper) {

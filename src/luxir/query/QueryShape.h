@@ -12,6 +12,7 @@
 #include "ConstantScoreQuery.h"
 #include "ForcePrepareQuery.h"
 #include "RescoreQuery.h"
+#include "MinScoreQuery.h"
 #include "BooleanQuery.h"
 
 namespace luxir {
@@ -54,6 +55,7 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
     case QueryKind::KNN:
     case QueryKind::FEATURE:
     case QueryKind::NONE:
+    case QueryKind::MIN_SCORE:
     case QueryKind::TEST:
       return Query::ScoreProfile::variable();
   }
@@ -92,6 +94,7 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
     case QueryKind::FEATURE:
       return true;
     case QueryKind::FORCE_PREPARE:
+    case QueryKind::MIN_SCORE:
     case QueryKind::TEST:
       return false;
   }
@@ -130,6 +133,7 @@ inline bool exactDomainIdentity(const Query& query) {
     case QueryKind::GEO_DISTANCE:
     case QueryKind::FEATURE:
     case QueryKind::NONE:
+    case QueryKind::MIN_SCORE:
     case QueryKind::TEST:
       return false;
   }
@@ -173,6 +177,7 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::FEATURE:
+    case QueryKind::MIN_SCORE:
     case QueryKind::TEST:
       return false;
   }
@@ -213,6 +218,8 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
     case QueryKind::CONSTANT_SCORE:
       return membershipVerificationWork(
           *static_cast<const ConstantScoreQuery&>(query).getChild());
+    case QueryKind::MIN_SCORE:
+      return Query::VerificationWork::PRESENT;
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:

@@ -596,27 +596,88 @@ float, double, or date field:
 | Field | Meaning |
 |---|---|
 | `field` | Numeric or date field. Required; its value binding must be numeric or date. |
-| `start`, `end` | Bounds of the bucketed range. Required. |
+| `start`, `end` | Bounds of the bucketed range. Required unless `bounds` is `data`, where they only widen it. |
+| `bounds` | `explicit` (default) or `data`; see [Data-derived bounds](#data-derived-bounds). |
+| `origin` | With `bounds: data` and a fixed gap, the grid phase. Default 0; wall-clock milliseconds for DATE. Rejected with `calendar_gap`. |
 | `gap` | Fixed bucket width (milliseconds for dates). Exactly one of `gap` or `calendar_gap` is required. |
 | `calendar_gap` | `{"n": 1, "unit": "month"}` for civil buckets over dates; see [Date histograms](#date-histograms). |
 | `mincount` | `0` (default) keeps every bucket in order, zero counts included; a positive value filters after counting. |
 | `missing` | Also return the count of documents with no value. |
 | `ops` | Per-bucket metrics, nested facets, or `top_docs`. |
-| `selected` | Lower fences of buckets that refine the result set. See [Multi-select navigation](#multi-select-navigation). |
-| `time_zone` | Time zone for bounds without an explicit offset and for calendar buckets; empty inherits the request's. |
+| `selected` | Lower fences of buckets that refine the result set. EXPLICIT only. See [Multi-select navigation](#multi-select-navigation). |
+| `time_zone` | DATE time zone for offset-less bounds and fixed or calendar stepping; empty inherits the request's. |
 
-Every in-range bucket is returned in lower-bound order, including zero counts,
-so the result plots directly as a histogram. The final bucket is shortened if the gap does
-not divide the range evenly. NaN and infinity fall outside every floating-point
-bucket. The gap must be large enough to advance the field's numeric
-representation at that magnitude. At most 100,000 buckets may be requested;
-range facets with sub-operations are limited to 1,024. Sub-operations have the
-same semantics as under a string bucket, so an empty range bucket yields
-`null` metrics.
+Buckets return in lower-bound order; the default `mincount: 0` includes zero
+counts. With EXPLICIT bounds, the first fence is `start` and the last is
+`end`, clipping the final bucket if needed. NaN and infinity fall outside
+every floating-point bucket, including under DATA, and never make DATA fail.
+The gap must advance the field's numeric representation at that magnitude.
+The generated span may contain at most 100,000 buckets, including empty
+interior buckets and widening. A range facet with sub-operations may return
+at most 1,024 buckets, checked after `mincount` filtering (and selected-bucket
+retention) for both EXPLICIT and DATA. Sub-operations have the same semantics
+as under a string bucket, so an empty range bucket yields `null` metrics.
 
 For numeric and date fields declared with `index: "range"`, a points index can
 answer a whole-index range facet from indexed points instead of walking the
 column. The result is the same either way; only the cost differs.
+
+### Data-derived bounds
+
+Set `"bounds": "data"` to derive the histogram's extent from values in the
+facet's own incoming documents, rather than specifying both bounds:
+
+```json
+"per_hour": {
+  "range_facet": {
+    "field": "when_dt",
+    "bounds": "data",
+    "gap": 3600000,
+    "time_zone": "America/New_York"
+  }
+}
+```
+
+The extent runs from the cell containing the smallest matching finite value
+through the cell containing the largest. Queries, filters and deletions affect
+that extent. Occupancy uses raw field values, independently of the count
+measure: a value whose distinct key is dropped still occupies its cell even
+if the cell's count is zero. `mincount` filters the resulting buckets afterward.
+Under a parent bucket, each histogram instance spans its own incoming values,
+as with an Elasticsearch histogram under a terms bucket. Parent buckets can
+therefore return different spans on the same grid. A child domain reset uses
+that child's incoming documents.
+
+Optional `start` and exclusive `end` only widen the extent; they do not exclude
+values or clip cells. The span includes the cell containing `start` and all
+cells intersecting the requested range before `end`, like extended bounds.
+Without values, no buckets are returned unless both `start` and `end` supply
+a span; one widening bound alone cannot define an empty histogram.
+
+The grid is independent of the matching minimum:
+
+- For INT, FLOAT and DOUBLE fixed gaps, fences are `origin + k * gap` for a
+  global integer `k`; default `origin` is 0. Floating fences use the field's
+  encoded representation, so rounding does not shift the grid with the query.
+- For DATE fixed gaps, `origin` is a wall-clock phase in the facet zone,
+  expressed in integer milliseconds. For example, `gap: 86400000` and
+  `origin: 21600000` start days at 06:00 local, including DST days. Luxir
+  applies this phase before resolving local times. Elasticsearch's `offset`
+  translates the rounded grid in UTC, so nonzero phases can differ near DST
+  changes; `origin` is not an exact synonym for that offset.
+- DATA calendar gaps align to civil unit starts. For `n > 1`, the phase is
+  anchored at the 1970 civil epoch: days from 1970-01-01, months and quarters
+  from January 1970, and years from 1970. ISO weeks anchor at Monday
+  1969-12-29. Thus two-month buckets cover Jan-Feb, Mar-Apr, and so on,
+  regardless of the query. A civil day begins at its first midnight occurrence;
+  if midnight is skipped, it begins at the first valid instant of that day.
+  Calendar gaps reject `origin`.
+
+`selected` is not supported with DATA. The 100,000-bucket cap applies to each
+instance's actual span, including empty interior cells and widening, rather
+than to the field-wide range or the number of nonempty buckets. Exceeding it
+fails the request with `use a larger gap`. The 1,024 returned-bucket sub-operation
+cap applies after `mincount` filtering.
 
 ## Date histograms
 
@@ -637,19 +698,31 @@ or years:
 }
 ```
 
-The facet `time_zone` controls offset-less bounds and calendar stepping. Empty
-inherits the request time zone; `UTC` explicitly overrides it. IANA zone names
-and fixed offsets are accepted. Bucket IDs remain raw epoch-millisecond fence
-pairs, because they identify instants unambiguously.
+The facet `time_zone` controls offset-less bounds and fixed or calendar
+stepping. Empty inherits the request time zone; `UTC` explicitly overrides it.
+IANA zone names and fixed offsets are accepted. Bucket IDs remain raw
+epoch-millisecond fence pairs, because they identify instants unambiguously.
 
-Calendar fences are derived from the original start rather than by repeatedly
-adding to the previous fence, so a sequence starting on January 31 produces
-February 28 or 29 and then March 31 instead of drifting. Days across a
-daylight-saving change are 23 or 25 physical hours. Week buckets begin on
-Monday. When a zone change removes a whole nominal bucket, Luxir drops the
-zero-width bucket and returns a `calendar_bucket_skipped` warning.
-[Dates and time zones](dates.md) has the
-date-math and civil-time contract.
+Fixed gaps step on the local clock in both EXPLICIT and DATA modes. Every
+occurrence of a repeated lattice time is a fence, so an hourly histogram has
+two separate 01:00 buckets at a fall-back. A nonexistent lattice time maps to
+the DST transition instant, with duplicate fences removed. EXPLICIT takes its
+phase from the local time of `start`, then clips its last bucket to `end`.
+This changes EXPLICIT fixed-gap results across DST when local stepping adds
+or moves fences relative to elapsed-time stepping; buckets follow the local
+clock. UTC, fixed offsets and spans without a transition retain elapsed-time
+results.
+
+EXPLICIT calendar fences are derived from the original `start` for every `n`,
+rather than by repeatedly adding to the previous fence, so a sequence starting
+on January 31 produces February 28 or 29 and then March 31 instead of drifting.
+Days across a daylight-saving change are 23 or 25 physical hours. DATA weeks begin on Monday;
+EXPLICIT weeks step from `start`. An ambiguous EXPLICIT calendar fence prefers
+the UTC offset of `start` when that offset is available. DATA calendar alignment is described
+[above](#data-derived-bounds). When a zone change removes a whole nominal
+bucket, Luxir drops the zero-width bucket and returns a
+`calendar_bucket_skipped` warning.
+[Dates and time zones](dates.md) has the date-math and civil-time contract.
 
 For a fixed UTC epoch-day number in the value-expression language, use
 `floor(when_dt / 86400000)`; use a calendar gap when day bucketing must follow
@@ -895,8 +968,8 @@ primary, the bare field name counts words without needing `__self`.
   for the default count order.
 - `selected` is not accepted at the root of a full-form request, under a
   `fusion`, or on a nested facet.
-- Range facets with sub-operations are limited to 1,024 buckets; a range facet
-  without them may request at most 100,000.
+- Range facets may generate at most 100,000 buckets. With sub-operations,
+  at most 1,024 buckets may be returned after filtering, in either bounds mode.
 
 ## Bucket domain resets
 

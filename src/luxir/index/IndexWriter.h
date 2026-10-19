@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/util/Metrics.h"
 
 #include <atomic>
 #include <deque>
@@ -128,6 +129,10 @@ class IndexWriter {
 
 public:
 
+  // The node's and the collection's counters; set by the collection that opens
+  // this writer.
+  std::shared_ptr<Metrics> metrics = Metrics::detached();
+  std::shared_ptr<CollectionMetrics> collectionMetrics = CollectionMetrics::detached();
   struct MergeFailureInfo {
     std::vector<uint64_t> sourceSegIds;
     uint64_t outputSegId = 0;
@@ -145,6 +150,7 @@ public:
   struct Stats : ReaderManager::SnapshotStats<SegmentStats> {
     uint64_t commits = 0;
     uint64_t activeMerges = 0;
+    uint64_t flushing = 0, idle = 0, indexing = 0;
   };
 
   // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file
@@ -524,6 +530,12 @@ public:
     return failed.load(std::memory_order_acquire) ? failureReason : nullptr;
   }
 
+  // An external check found a committed file damaged (Collection::fail): no
+  // further update, flush, merge or commit may read those bytes or publish
+  // over them. Admission, commit and publication all consult `failed`; a
+  // publication in flight completes first, and the registry closes.
+  void fail(std::string reason);
+
   // Advisory, for callers that would rather give up than submit (a streaming update
   // holding a cached writer).  Closing is terminal, so false may be stale but true
   // is final; the rejection that matters happens in the graph.
@@ -741,7 +753,7 @@ public:
   std::optional<MergeFailureInfo> testLastMergeFailure();
 
   // Coherent writer-visible and committed state for operational introspection.
-  Stats stats(bool includeSegments);
+  Stats stats(bool includeSegments, bool includeFiles = true);
 };
 
 
