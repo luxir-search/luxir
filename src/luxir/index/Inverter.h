@@ -270,6 +270,9 @@ public:
     bool multi;
     StoredFieldsWriter* writer;
     std::vector<Branch> branches;
+    // The document that last claimed this field, and the slot it claimed (see claim).
+    int32_t claimedDoc = -1;
+    uint32_t claimedSlot = 0;
 
     void store(Inverter& inverter, const IndexVal& val);
     void checkShape(const IndexVal& val) const;
@@ -294,6 +297,17 @@ public:
     InputHandler(Inverter& inverter, const ResolvedFieldHandle& resolved,
                  std::shared_ptr<FieldType> fieldType, StoredFieldsWriter* writer);
     bool operator==(std::string_view name) const { return fieldName == name; }
+
+    // Last-wins dedup of a document's input fields by handler, which is one per input
+    // name: claims this field for the current document at the caller's `slot` and
+    // returns it, or returns the earlier slot if the document already claimed it.
+    uint32_t claim(const Inverter& inverter, uint32_t slot) {
+      if (claimedDoc != inverter.getDoc()) {
+        claimedDoc = inverter.getDoc();
+        claimedSlot = slot;
+      }
+      return claimedSlot;
+    }
 
     void index(Inverter& inverter, std::string_view val);
     void index(Inverter& inverter, std::span<const std::string_view> vals);
@@ -340,7 +354,7 @@ public:
     return currDoc + 1;
   }
 
-  int32_t getDoc() {
+  int32_t getDoc() const {
     return currDoc;
   }
 
@@ -406,7 +420,8 @@ private:
                                               const StoredFieldType* config) {
     auto it = storedFields_.find(resourceName);
     if (it != storedFields_.end()) return *it->second;
-    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName, config);
+    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName,
+                                                       config ? config->format_ : StoredChunkFormat{});
     auto [newIt, _] = storedFields_.emplace(std::string(resourceName), std::move(writer));
     return *newIt->second;
   }

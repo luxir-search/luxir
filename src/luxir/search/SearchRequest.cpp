@@ -17,9 +17,33 @@ SearchRequest::SearchRequest(SearchEngine& engine, const ReqProto& proto,
       memoryTracker(forcedRequestMemoryMaxBytes != 0
                         ? forcedRequestMemoryMaxBytes
                         : searchConfig.request_memory_max_bytes),
-      proto(proto), arena(arena), dateMathNowEpochMillis(currentEpochMillis()),
+      proto(proto), arena(arena), dateMathNowEpochMillis(
+          forcedDateMathNowEpochMillis.value_or(currentEpochMillis())),
       timeZone(resolveTimeZone(proto.time_zone)) {
   if (!timeZone) timeZoneError = timeZoneResolutionError(proto.time_zone);
+}
+
+// A dispatched search that never sent its final response was abandoned.
+SearchRequest::~SearchRequest() {
+  if (counting && !finalSent) count(MetricOutcome::CANCELLED);
+}
+
+// Counts the search for the node and, once resolved, for its collection.
+void SearchRequest::count(MetricOutcome outcome) {
+  auto nanos = nanosSince(submitted);
+  engine.metrics().complete(metricActivity(MetricStage::SEARCH), outcome, nanos);
+  if (collectionMetrics) collectionMetrics->search(outcome, nanos);
+}
+
+void SearchRequest::replyCallback(SearchResponse& response) {
+  bool last = response.last;
+  // if this response used a different Arena, release it.
+  if (&response.arena != &arena) {
+    releaseArena(&response.arena);
+  }
+  if (last) {
+    done();
+  }
 }
 
 void SearchRequest::warnOnce(std::string_view code, std::string_view message) {
@@ -51,6 +75,8 @@ void SearchRequest::maybeSendFinal(bool endingStream) {
     }
   }
   if (send) {
+    if (!warnings.empty()) engine.metrics().add(MetricCounter::SEARCH_WARNINGS);
+    if (counting) count(lastResponse->proto.error ? MetricOutcome::ERROR : MetricOutcome::OK);
     reply(*lastResponse);  // may delete *this*; nothing after this call
   }
 }
@@ -59,6 +85,8 @@ void SearchRequest::setError(const ErrorInfo& info) {
   std::lock_guard<std::mutex> lock(mutex);
   if (lastResponse == nullptr) lastResponse = SearchResponse::create(*this, true);
   if (lastResponse->proto.error.has_value()) return;  // the first failure wins
+  if (info.kind == ErrorKind::RESOURCE_EXHAUSTED)
+    engine.metrics().add(MetricCounter::SEARCH_RESOURCE_EXHAUSTED);
   lastResponse->proto.error = api::build::arenaError(lastResponse->mr, info);
   lastResponse->proto.ops = {};
 }

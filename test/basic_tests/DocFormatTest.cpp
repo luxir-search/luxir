@@ -673,6 +673,7 @@ TEST_F(DocFormatTest, discoveryRequiresConfiguredStoreOrPrimaryColumnFallback) {
 
   // Both names occur in the old store. Only STRING has a usable fallback
   // when a different schema selects a resource this reader does not have.
+  b.storedResource("_stored_cold_");
   text.stored_resource = "_stored_cold_";
   string.stored_resource = "_stored_cold_";
   auto schema = b.build(ch.collection().getSchema().get());

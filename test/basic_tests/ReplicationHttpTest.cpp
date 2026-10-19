@@ -562,24 +562,41 @@ TEST_F(ReplicationHttpTest, emptyReplicaRequirementIsRejectedBeforeAdmission) {
   EXPECT_EQ(200, get("/health").result_int());
 }
 
-TEST_F(ReplicationHttpTest, standaloneWaitRetriesAnExistingToken) {
-  auto token = snapshot()->id.token();
-  auto wait = [&](std::string requirement) {
+TEST_F(ReplicationHttpTest, emptyCommitRetriesAWaitPastStaleAcknowledgments) {
+  auto stale = snapshot()->id;
+  // A follower that acknowledged `stale` and then restarted without it.
+  node->getReplication().installed({"f", "t0", "main", stale.token()});
+  for (int retry = 0; retry < 2; retry++) {
+    auto response = httpRequest(server->getPort(), http::verb::post, "/collections/main/_update",
+        R"({"docs":[],"commit":{"wait_for_replicas":{"all":{}},"wait_for_replicas_timeout_ms":0}})");
+    ASSERT_EQ(200, response.result_int()) << response.body();
+    Json result; ASSERT_FALSE(glz::read_json(result, response.body()));
+    EXPECT_GT(CommitId::parse(result["commit"].get<std::string>()).index_gen, stale.index_gen);
+    EXPECT_EQ(1, result["replicas"]["wanted"].get<double>());
+    EXPECT_EQ(0, result["replicas"]["serving"].get<double>());
+    EXPECT_EQ("timed_out", result["replicas"]["outcome"].get<std::string>());
+  }
+}
+
+TEST_F(ReplicationHttpTest, createWaitCountsActiveSubscribedFollowers) {
+  auto create = [&](std::string name) {
     auto response = httpRequest(server->getPort(), http::verb::post,
-        "/collections/main/_wait_for_replicas?wait_for_replicas=" + requirement + "&wait_for_replicas_timeout_ms=0",
-        "{\"commit\":\"" + token + "\"}");
+        "/collections/_create?wait_for_replicas=all&wait_for_replicas_timeout_ms=0", "{\"name\":\"" + name + "\"}");
     EXPECT_EQ(200, response.result_int()) << response.body();
     Json result; EXPECT_FALSE(glz::read_json(result, response.body()));
     return result;
   };
-  auto first = wait("1");
-  EXPECT_EQ("timed_out", first["replicas"]["outcome"].get<std::string>());
-  node->getReplication().installed({"f", "t0", "main", token});
-  auto second = wait("1");
-  EXPECT_EQ(token, second["commit"].get<std::string>());
-  EXPECT_EQ("satisfied", second["replicas"]["outcome"].get<std::string>());
-  EXPECT_EQ("satisfied", wait("all")["replicas"]["outcome"].get<std::string>());
-  EXPECT_EQ(token, snapshot()->id.token());
+  auto alone = create("alone");
+  EXPECT_EQ(0, alone["replicas"]["wanted"].get<double>());
+  EXPECT_EQ("satisfied", alone["replicas"]["outcome"].get<std::string>());
+  node->getReplication().installed({"f", "t0", "main", snapshot()->id.token()});
+  auto followed = create("followed");
+  EXPECT_EQ(1, followed["replicas"]["wanted"].get<double>());
+  EXPECT_EQ("timed_out", followed["replicas"]["outcome"].get<std::string>());
+  auto rejected = httpRequest(server->getPort(), http::verb::post, "/collections/_create",
+      R"({"name":"rejected","wait_for_replicas":{}})");
+  EXPECT_EQ(400, rejected.result_int()) << rejected.body();
+  EXPECT_THROW(node->getCollection("rejected"), CollectionNotFoundError);
 }
 
 TEST_F(ReplicationHttpTest, createSchemaAndSearchReturnPublicationTokens) {
@@ -636,7 +653,7 @@ TEST_F(ReplicationHttpTest, updateBodiesAreReleasedBeforeReplicaWait) {
   }
 }
 
-TEST_F(ReplicationHttpTest, resetStandaloneWaitIsCancelled) {
+TEST_F(ReplicationHttpTest, resetSchemaWaitIsCancelled) {
   std::promise<void> parked;
   std::promise<api::ReplicaResult> completed;
   Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* { parked.set_value(); return nullptr; });
@@ -647,8 +664,8 @@ TEST_F(ReplicationHttpTest, resetStandaloneWaitIsCancelled) {
   tcp::socket socket(io);
   socket.connect({net::ip::make_address("127.0.0.1"), (unsigned short)server->getPort()});
   http::request<http::string_body> request(http::verb::post,
-      "/collections/main/_wait_for_replicas?wait_for_replicas=1&wait_for_replicas_timeout_ms=600000", 11);
-  request.body() = "{\"commit\":\"" + snapshot()->id.token() + "\"}";
+      "/collections/main/_schema?wait_for_replicas=1&wait_for_replicas_timeout_ms=600000", 11);
+  request.body() = R"({"fields":{"n_i":{"type":"int"}}})";
   request.prepare_payload();
   http::write(socket, request);
   ASSERT_EQ(std::future_status::ready, parked.get_future().wait_for(3s));
@@ -662,18 +679,17 @@ TEST_F(ReplicationHttpTest, resetStandaloneWaitIsCancelled) {
 TEST_F(ReplicationHttpTest, halfClosedClientStillReceivesSatisfiedWait) {
   std::promise<void> parked;
   Signal::listen("replicationWaitParked", [&](void*, void*, void*) -> void* { parked.set_value(); return nullptr; });
-  auto token = snapshot()->id.token();
   net::io_context io;
   tcp::socket socket(io);
   socket.connect({net::ip::make_address("127.0.0.1"), (unsigned short)server->getPort()});
   http::request<http::string_body> request(http::verb::post,
-      "/collections/main/_wait_for_replicas?wait_for_replicas=1", 11);
-  request.body() = "{\"commit\":\"" + token + "\"}";
+      "/collections/main/_schema?wait_for_replicas=1", 11);
+  request.body() = R"({"fields":{"n_i":{"type":"int"}}})";
   request.prepare_payload();
   http::write(socket, request);
   socket.shutdown(tcp::socket::shutdown_send);
   ASSERT_EQ(std::future_status::ready, parked.get_future().wait_for(3s));
-  node->getReplication().installed({"f", "t0", "main", token});
+  node->getReplication().installed({"f", "t0", "main", snapshot()->id.token()});
   beast::flat_buffer buffer;
   http::response<http::string_body> response;
   http::read(socket, buffer, response);

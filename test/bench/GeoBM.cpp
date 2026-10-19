@@ -19,13 +19,14 @@
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
 #include "luxir/reader/BKDReader.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/random.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestIndex.h"
+#include "test/TestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -420,12 +421,11 @@ public:
   SegFieldInfo fieldInfo() {
     MemPool pool;
     auto& segment = index.reader->segments()[0];
-    FieldReader fields(segment.postingsReader());
-    if (!fields.seek(FIELD)) {
+    auto* fields = segment.postingsReader().fieldInfo(FIELD);
+    if (!fields) {
       throw std::logic_error("geo benchmark field is missing");
     }
-    SegFieldInfo info;
-    fields.readFieldInfo(info);
+    const auto& info = *fields;
     return info;
   }
 };
@@ -539,7 +539,7 @@ void BM_GeoCount(benchmark::State& state, CorpusShape shape) {
     GeoBoxQuery query(FIELD, box.minLat, box.maxLat, box.minLon, box.maxLon);
     auto* weight = static_cast<GeoBoxQuery::Weight*>(
         query.createWeight(context, 0));
-    int64_t count = weight->count(segment);
+    int64_t count = countForTests(weight, segment);
     benchmark::DoNotOptimize(count);
     if (count != expected) {
       state.SkipWithError("geo count differs from quantized oracle");
@@ -652,7 +652,7 @@ void BM_GeoDistanceCount(benchmark::State& state, CorpusShape shape) {
                            circle.radiusMeters);
     auto* weight = static_cast<GeoDistanceQuery::Weight*>(
         query.createWeight(context, 0));
-    int64_t count = weight->count(segment);
+    int64_t count = countForTests(weight, segment);
     benchmark::DoNotOptimize(count);
     if (count != expected) {
       state.SkipWithError("geo distance count differs from quantized oracle");

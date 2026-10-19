@@ -245,7 +245,7 @@ TEST_F(ValueExprSortTest, collectorReuseAndPairwiseMergeKeepOnlyValues) {
       auto& readerSegment = reader->segments()[(size_t)segment];
       auto& postings = readerSegment.postingsReader();
       MemPool pool;
-      collector.setSegment(segment, &postings);
+      collector.setSegment(reader->segments()[segment]);
       {
         FieldSortCollector::ExpressionBindings bindings(
             collector, pool, readerSegment);

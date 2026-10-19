@@ -324,17 +324,6 @@ public:
   }
 };
 
-inline bool File::isRelocatable(const OutputStream& os) const {
-  return !os.hasFlushedBytes();
-}
-
-inline void File::appendRelocatableTo(OutputStream& source,
-                                      OutputStream& target) {
-  assert(isRelocatable(source));
-  target.write(source.start, source.buffered());
-  source.pos = source.start;
-}
-
 
 inline void seg_location::write(OutputStream& os) const {
   os.writeVint(filenum());

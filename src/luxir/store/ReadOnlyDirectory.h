@@ -41,6 +41,10 @@ public:
     return delegate_->openFile(name, expectSynced);
   }
 
+  std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
+    return delegate_->openChecksum(name, direct);
+  }
+
   void expectSynced(std::span<const FileDescriptor> files) override {
     delegate_->expectSynced(files);
   }

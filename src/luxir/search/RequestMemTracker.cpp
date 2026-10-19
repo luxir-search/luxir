@@ -59,6 +59,7 @@ bool RequestMemTracker::tryCharge(size_t bytes) {
     if (maxBytes != 0 && total > maxBytes) return false;
     if (chargedBytes.compare_exchange_weak(
             current, total, std::memory_order_relaxed)) {
+      recordPeak(total);
       return true;
     }
   }
@@ -88,6 +89,7 @@ size_t RequestMemTracker::chargeUpTo(
     size_t total = current + granted;
     if (chargedBytes.compare_exchange_weak(
             current, total, std::memory_order_relaxed)) {
+      recordPeak(total);
       return granted;
     }
   }

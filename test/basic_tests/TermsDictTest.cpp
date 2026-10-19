@@ -373,15 +373,14 @@ IteratedStats readQueryPostingsStats(MemPool& pool, IndexReader& reader,
                                      CachedFieldInfo& cachedFieldInfo,
                                      std::string_view term,
                                      bool readPositions) {
-  unused(pool);
   auto read = [&]<DocsEnumTier Tier>() {
     IteratedStats stats;
-    for (int i = 0; i < (int) reader.segments().size(); i++) {
-      TermsEnum* termsEnum = cachedFieldInfo.termsEnums[i];
-      if (termsEnum == nullptr || !termsEnum->seek(term)) {
-        continue;
-      }
-      BasicDocsEnum<Tier> docsEnum(*termsEnum);
+    for (auto& segment : reader.segments()) {
+      auto* field = cachedFieldInfo.segInfos.at(segment);
+      if (!field) continue;
+      TermsEnum terms(pool, segment.postingsReader(), *field);
+      if (!terms.seek(term)) continue;
+      BasicDocsEnum<Tier> docsEnum(terms);
       IteratedStats segmentStats;
       if constexpr (Tier == DocsEnumTier::POSITIONS) {
         PosEnum posEnum(docsEnum);
@@ -971,10 +970,9 @@ TEST_F(TermsDictTest, MergedSegmentsRoundTripAllIndexLevels) {
     IndexReader indexReader(dir);
     ASSERT_EQ(indexReader.segments().size(), 1u);
     auto& segment = indexReader.segments()[0];
-    FieldReader fieldReader(segment.postingsReader());
-    ASSERT_TRUE(fieldReader.seek("f"));
-    SegFieldInfo fieldInfo;
-    fieldReader.readFieldInfo(fieldInfo);
+    auto* fieldReader = segment.postingsReader().fieldInfo("f");
+    ASSERT_TRUE((fieldReader != nullptr));
+    const auto& fieldInfo = *fieldReader;
     ASSERT_EQ(FieldType::hasFreqs(fieldInfo.flags), FieldType::hasFreqs(level.flags));
     ASSERT_EQ(FieldType::hasPositions(fieldInfo.flags), FieldType::hasPositions(level.flags));
 

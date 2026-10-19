@@ -8,6 +8,7 @@
 #include <tbb/task_group.h>
 
 #include "bench/luxir_bench.h"
+#include "luxir/search/OrdMap.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -197,14 +198,13 @@ int64_t scanIntCol(std::string_view field, IndexReader& reader) {
   for (auto& seg : reader.segments()) {
     // create a fieldReader and look up the field
     auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(seg.postingsReader());
-    bool hasField = fieldReader.seek(field);
+    auto* fieldReader = seg.postingsReader().fieldInfo(field);
+    bool hasField = (fieldReader != nullptr);
     if (!hasField) {
       continue;
     }
     // read the SegFieldInfo
-    SegFieldInfo fieldInfo;
-    fieldReader.readFieldInfo(fieldInfo);
+    const auto& fieldInfo = *fieldReader;
     IntColReader colReader(seg.postingsReader(), fieldInfo);
     IntColReader::Iterator iter(colReader);
     while (true) {

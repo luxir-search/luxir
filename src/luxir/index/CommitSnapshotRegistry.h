@@ -80,6 +80,7 @@ private:
   void unlinkFiles(std::span<const std::string> names) noexcept;
   void notifyChange() noexcept;
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
+  void requireHeld(const FileDescriptor& descriptor);
 public:
   explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now)
       : now(std::move(now)), dir(dir), readers(dir, config) {}
@@ -96,7 +97,10 @@ public:
   // without removing a root that already existed.
   void commit(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened);
   std::shared_ptr<const CommitSnapshot> snapshot() const { return readers.snapshot(); }
-  void openLocalSnapshot();
+  // Verifies held files before mapping them into a reader, then publishes.
+  // With verify, checks all files; otherwise only marker-named files.
+  // Only opening failures retry against a newer root, never hash failures.
+  void openLocalSnapshot(bool verify = false);
   void sweepOrphans(const Manifest& manifest);
   void sweepOrphans();
   static std::vector<std::string> obsoleteFiles(const CommitSnapshot& previous,
@@ -109,6 +113,10 @@ public:
   // A file by identity (name, size and digest) from the current or any pinned
   // snapshot, without pinning: peers serve verified copies this way.
   std::shared_ptr<InputFile> openFile(const FileDescriptor& descriptor);
+  // As openFile(descriptor), for a checksum pass (the scrub): the handle
+  // outlives a retirement, so a file retired mid-pass still hashes. Null when
+  // the file is held but missing on disk (expected on a read-only node).
+  std::shared_ptr<ChecksumReader> openChecksum(const FileDescriptor& descriptor, bool direct);
   bool touch(const CommitId& id, uint64_t bytes);
   // Storage pressure skips current snapshots and open transfers. Retention
   // budget eviction can still revoke any pin to enforce its bound.
@@ -117,7 +125,7 @@ public:
   // Tests only: revoke the oldest pin as budget enforcement would.
   bool testEvictOldest();
   void setPolicy(Policy value);
-  Stats stats();
+  Stats stats(bool expire = true);
   void expire();
   void retire(std::span<const std::string> names);
   void retirePrefix(std::string_view prefix);

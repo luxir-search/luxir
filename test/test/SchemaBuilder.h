@@ -27,6 +27,30 @@
 
 namespace luxir {
 
+namespace test {
+
+inline api::VectorAnnDef pqAnn(int32_t nlist = 0, int32_t m = 0, int32_t bits = 8) {
+  api::VectorAnnDef ann;
+  ann.codec = api::VectorAnnDef::Codec::PQ;
+  ann.nlist = nlist;
+  auto& pq = ann.pq.emplace();
+  pq.m = m;
+  pq.bits = bits;
+  return ann;
+}
+
+inline api::VectorAnnDef rabitqAnn(int32_t nlist = 0, int32_t bits = 1, int32_t queryBits = 4) {
+  api::VectorAnnDef ann;
+  ann.codec = api::VectorAnnDef::Codec::RABITQ;
+  ann.nlist = nlist;
+  auto& rabitq = ann.rabitq.emplace();
+  rabitq.bits = bits;
+  rabitq.query_bits = queryBits;
+  return ann;
+}
+
+} // namespace test
+
 class SchemaBuilder {
   using Pair = std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>;
   std::pmr::monotonic_buffer_resource arena_;
@@ -35,6 +59,7 @@ class SchemaBuilder {
   std::vector<Pair> fieldsFlat_;
   std::vector<Pair> templatesFlat_;
   std::optional<api::SchemaDef::IndexSort> indexSort_;
+  std::vector<std::pair<std::string_view, api::StoredResourceDef>> resources_;
 
   api::FieldDef& add(std::deque<Pair>& out, std::string_view name) {
     auto* def = api::build::allocMessage<api::FieldDef>(arena_);
@@ -48,6 +73,11 @@ public:
   // Add a concrete field / a template (abstract suffix or parent) definition.
   api::FieldDef& field(std::string_view name) { return add(fields_, name); }
   api::FieldDef& templ(std::string_view name) { return add(templates_, name); }
+
+  // Add a stored_resources entry; the reference is valid until the next call.
+  api::StoredResourceDef& storedResource(std::string_view name) {
+    return resources_.emplace_back(api::build::arenaStr(arena_, name), api::StoredResourceDef{}).second;
+  }
 
   api::FieldDef& variant(api::FieldDef& field, std::string_view label) {
     auto* def = api::build::allocMessage<api::FieldDef>(arena_);
@@ -92,6 +122,8 @@ public:
     d.templates = api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
       std::span<const Pair>(templatesFlat_.data(), templatesFlat_.size()));
     d.index_sort = indexSort_;
+    d.stored_resources = api::map_view<std::string_view, api::StoredResourceDef>(
+      std::span<const std::pair<std::string_view, api::StoredResourceDef>>(resources_.data(), resources_.size()));
     return d;
   }
 

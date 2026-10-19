@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <cstring>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -12,10 +11,13 @@
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/query/FieldResolver.h"
+#include "luxir/query/Warnings.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/MemPool.h"
 
 namespace luxir {
+
+class CollapsePlan;
 
 // Request-scoped context threaded through query parsing and building: the
 // pool the query tree is built into, the schema, the warnings sink (declared
@@ -23,6 +25,7 @@ namespace luxir {
 // budget.  This is the request-scoped parse/build context from the
 // query-string design; the limits-config snapshot joins it later.
 struct ParseContext {
+  const CollapsePlan* collapse = nullptr;
   MemPool& pool;
   Schema& schema;
   google::protobuf::Arena& arena;
@@ -60,11 +63,9 @@ struct ParseContext {
       fields(fields ? *fields : localFields) {}
 
   // code must be a string with static storage duration (a literal).
+  // Repeats are dropped.
   void warn(std::string_view code, std::string_view message) {
-    if (warnings == nullptr) return;
-    char* copy = pool.alloc(message.size());
-    std::memcpy(copy, message.data(), message.size());
-    warnings->push_back({code, std::string_view(copy, message.size())});
+    if (warnings != nullptr) addWarning(*warnings, pool, code, message);
   }
 };
 

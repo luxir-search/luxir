@@ -89,7 +89,11 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
   const bool allOrNone = request.all_or_none;
   const bool returnIds = request.return_ids;
   const FieldNameMap fieldMap(request);
+  // Handlers cached by raw field position: a request's docs usually share a shape,
+  // so a hit costs one name compare.
   std::vector<Inverter::InputHandler*> handlers;
+  // The current doc's fields after last-wins dedup, in first-seen order.
+  std::vector<std::pair<Inverter::InputHandler*, const IndexVal*>> fields;
 
   // first docid this request's adds will use; needed for all_or_none rollback.
   const int32_t firstDoc = inverter.getMaxDoc();
@@ -107,19 +111,26 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     inverter.startDoc();
 
     try {
-      int idx = 0;
-      // dedup duplicate field keys post-mapping, last-wins
-      for (const auto& [fname, fval] :
-           lastWins(doc.fields, [&](std::string_view name) { return fieldMap.resolve(name); })) {
+      // Duplicate keys post-mapping collapse last-wins (protobuf map semantics). The
+      // handler is a name's identity, so its claim finds an earlier occurrence without
+      // a per-doc map; a repeat replaces the value at the first occurrence's position.
+      fields.clear();
+      size_t raw = 0;
+      for (const auto& [name, val] : doc.fields) {
+        Inverter::InputHandler*& handler = handlers[raw++];
+        auto fname = fieldMap.resolve(name);
+        if (!fname) continue;
         // A cached handler proves its name was accepted; creation validates a
         // new name (a derived selector is not a document key).
-        auto handler = handlers[idx];
-        if (handler == nullptr || *handler != fname) {
-          handlers[idx] = handler = &inverter.getIndexHandler(fname);
+        if (handler == nullptr || *handler != *fname) {
+          handler = &inverter.getIndexHandler(*fname);
         }
-
-        handler->index(inverter, **fval);
-        idx++;
+        uint32_t slot = handler->claim(inverter, (uint32_t)fields.size());
+        if (slot == fields.size()) fields.emplace_back(handler, &*val);
+        else fields[slot].second = &*val;
+      }
+      for (const auto& [handler, val] : fields) {
+        handler->index(inverter, *val);
       }
 
       inverter.finishDoc();
@@ -183,6 +194,42 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 
 
 void ProtoUpdateMessage::handle(IndexWriter& iw) {
+  // Counts the batch for the node and its collection as it leaves, however
+  // it leaves. A message with no documents and no delete ids (a commit-only
+  // message) is not a batch; its commit counts under the COMMIT stage.
+  struct Count {
+    ProtoUpdateMessage& msg;
+    Metrics& node;
+    CollectionMetrics& collection;
+    bool active = !msg.req->docs.empty() || !msg.req->delete_ids.empty();
+    int exceptions = std::uncaught_exceptions();
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    Count(ProtoUpdateMessage& msg, Metrics& node, CollectionMetrics& collection)
+        : msg(msg), node(node), collection(collection) {
+      if (active) node.start(metricActivity(MetricStage::INDEX_BATCH));
+    }
+    ~Count() {
+      if (!active) return;
+      const auto& req = *msg.req;
+      // The batch failed when nothing in it applied; a partial batch's
+      // rejections count per document.
+      bool failed = std::uncaught_exceptions() > exceptions || msg.metricFailed();
+      auto outcome = failed ? MetricOutcome::ERROR : MetricOutcome::OK;
+      auto nanos = nanosSince(start);
+      auto errors = msg.docErrors();
+      uint64_t rejected = failed ? req.docs.size() : errors.size();
+      uint64_t accepted = req.docs.size() - rejected;
+      uint64_t deleteIds = failed ? 0 : req.delete_ids.size();
+      node.complete(metricActivity(MetricStage::INDEX_BATCH), outcome, nanos);
+      node.add(MetricCounter::DOCUMENTS_ACCEPTED, accepted);
+      node.add(MetricCounter::DOCUMENTS_REJECTED, rejected);
+      node.add(MetricCounter::DELETE_IDS_ACCEPTED, deleteIds);
+      for (const auto& error : errors) {
+        node.documentError(error.error ? (ErrorKind)error.error->kind : ErrorKind::UNKNOWN);
+      }
+      collection.batch(outcome, nanos, accepted, rejected, deleteIds);
+    }
+  } count{*this, *iw.metrics, *iw.collectionMetrics};
   validateFieldMap(*req);
 
   // Check if we need an inverter for either deletes or adds
@@ -267,10 +314,6 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   }
 }
 
-
-void ProtoUpdateMessage::validateReplicaWait(const api::ReplicaRequirement& value) {
-  if (value.kind.index() == 0) throw RequestError("wait_for_replicas requires count or all");
-}
 
 std::shared_ptr<ProtoUpdateMessage::Completion> ProtoUpdateMessage::takeCompletion(LuxirNode& node) {
   auto completed = std::make_shared<Completion>();

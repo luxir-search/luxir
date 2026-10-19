@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/analysis/Analyzer.h"
+#include "luxir/analysis/AsciiScan.h"
 #include "luxir/analysis/KStemmer.h"
 #include "luxir/analysis/NfkcCfData.h"
 
@@ -187,18 +188,23 @@ constexpr AsciiWbTable wbTable;
 
 inline bool isWbWord(unsigned char cls) { return cls >= WB_LET && cls <= WB_ENL; }
 
+inline bool isAscii(std::string_view s) {
+  return ascii::findNonAscii(s.data(), s.size()) == s.size();
+}
+
 inline bool isAsciiWs(unsigned char c) {
   return c == ' ' || (c >= '\t' && c <= '\r');  // \t \n \v \f \r
 }
 
 // The fused default tokenizer: UAX#29 word segmentation with per-token NFKC_CF
 // applied in the same stage. Equivalent to unicode_word + nfkc_cf (asserted in
-// AnalysisTest) but without the extra filter hop / redundant ASCII scan. Accent
-// folding is intentionally NOT fused in - it stays the separate, optional `fold`
-// filter (lossy, language-dependent; it is what distinguishes _t from _un).
+// AnalysisTest) but without the extra filter hop / redundant ASCII scan. When
+// the chain continues with `fold` (the _t chain), that is fused in too, but
+// only as an equivalent shortcut: fold stays a separate, optional component
+// (lossy, language-dependent; it is what distinguishes _t from _un).
 //
 // Hot-path structure: reset() copies the value into `lowered`, ASCII-lowercasing
-// in one bulk pass (vectorizable; ASCII byte ops cannot corrupt multibyte UTF-8
+// in one bulk SIMD pass (ASCII byte ops cannot corrupt multibyte UTF-8
 // sequences, and pre-lowercasing ASCII never changes NFKC_CF output since
 // casefold subsumes it). The scan then carves the value into regions delimited
 // at *safe splits*: an ASCII whitespace byte followed by an ASCII byte (or end).
@@ -206,14 +212,17 @@ inline bool isAsciiWs(unsigned char c) {
 // TAB is Other, which also breaks both sides), and the only UAX#29 rule that
 // reaches across a character is WB4 gluing Extend/Format/ZWJ onto it - all
 // non-ASCII, ruled out by the followed-by-ASCII condition. So each region
-// segments independently and boundaries match whole-value segmentation. A
-// pure-ASCII region (the common case) is tokenized by the byte-class DFA above
+// segments independently and boundaries match whole-value segmentation.
+// Regions are found from the non-ASCII bytes, not the whitespace: a SIMD scan
+// locates the next high byte, everything up to the last safe split before it
+// is one pure-ASCII region (usually many words) for the byte-class DFA above,
 // with no per-token fold work at all (already lowercased, NFKC is a no-op on
-// ASCII); a region containing a high byte goes through uni-algo word_only +
-// per-token NFKC_CF, the fully conformant path.
+// ASCII), and the region holding the high byte, up to the next safe split
+// after it, goes through uni-algo word_only + per-token NFKC_CF (+ fold), the
+// fully conformant path.
 //
-// Tokens point into `lowered` (or the NFKC scratch `buf`): the producer's
-// private reusable buffers, per the borrow contract.
+// Tokens point into `lowered` (or the NFKC / fold scratch buffers): the
+// producer's private reusable buffers, per the borrow contract.
 class StandardTokenizer : public Tokenizer {
   using View = decltype(una::views::word_only::utf8(std::declval<std::string_view>()));
   using Iter = decltype(std::declval<View&>().begin());
@@ -221,21 +230,29 @@ class StandardTokenizer : public Tokenizer {
   const char* loweredBase = nullptr;  // = lowered.data(), cached so offset math avoids reloading it
   const char* cur = nullptr;     // region scan cursor into `lowered`
   const char* valEnd = nullptr;
+  const char* nextHigh = nullptr;  // first non-ASCII byte at or after cur once refreshed; valEnd if none
   const char* dfaCur = nullptr;  // active pure-ASCII region: [dfaCur, dfaEnd)
   const char* dfaEnd = nullptr;
   std::optional<View> view;      // active non-ASCII region: word_only over it
   Iter it{};
   std::string buf;               // NFKC_CF scratch for the current token
+  std::string foldBuf;           // accent-fold scratch for the current token
+  const bool foldAccents;        // fused `fold` filter (see Analyzer::fusedFold)
 
 public:
+  explicit StandardTokenizer(bool foldAccents) : foldAccents(foldAccents) {}
+
   void reset() override {
-    lowered.assign(start_, (size_t) (end_ - start_));
-    for (char& ch : lowered) {
-      if ((unsigned char) (ch - 'A') < 26) ch = (char) (ch + ('a' - 'A'));
-    }
+    size_t n = (size_t) (end_ - start_);
+    const char* src = start_;
+    lowered.resize_and_overwrite(n, [src](char* dst, size_t len) {
+      ascii::lowerCopy(dst, src, len);
+      return len;
+    });
     loweredBase = lowered.data();
     cur = loweredBase;
     valEnd = cur + lowered.size();
+    nextHigh = cur + ascii::findNonAscii(cur, n);
     dfaCur = dfaEnd = nullptr;
     view.reset();
   }
@@ -246,55 +263,93 @@ public:
     std::string scratch;
     std::string_view folded = applyNfkcCf(term, scratch);
     if (folded.data() != term.data()) term.assign(folded);
+    if (foldAccents && !isAscii(term)) term = una::norm::to_unaccent_utf8(term);
   }
 
   bool incrementToken() override {
     token.clear();
     for (;;) {
-      // drain the active region first
+      // Drain the active region first. The ASCII DFA is the hot path and stays
+      // inline; the uni-algo drain and the region dispatch are out of line.
       if (dfaCur != dfaEnd) {
         if (asciiNext()) return true;
       } else if (view) {
-        if (it != view->end()) {
-          // Capture the source span before NFKC_CF repoints token.text at `buf`.
-          // `lowered` is a length-preserving ASCII-lowercased copy, so byte
-          // offsets into it equal byte offsets into the original value.
-          std::string_view w = *it;
-          token.setOffset((int) (w.data() - loweredBase),
-                          (int) (w.data() + w.size() - loweredBase));
-          token.text = applyNfkcCf(w, buf);
-          ++it;
-          if (token.text.empty()) continue;  // invisible words consume no position
-          return true;
-        }
-        view.reset();
-      }
-      // skip ASCII whitespace to the next region start
-      while (cur < valEnd && isAsciiWs((unsigned char) *cur)) cur++;
-      if (cur >= valEnd) return false;
-      // region extends to the next safe split (see class comment); track
-      // whether it is pure ASCII as we scan
-      const char* rs = cur;
-      const char* p = cur;
-      bool high = false;
-      while (p < valEnd) {
-        unsigned char c = (unsigned char) *p;
-        if (isAsciiWs(c) && (p + 1 == valEnd || ((unsigned char) p[1] & 0x80) == 0)) break;
-        high |= (c & 0x80) != 0;
-        p++;
-      }
-      cur = p;
-      if (!high) {
-        dfaCur = rs;
-        dfaEnd = p;
-      } else {
-        view.emplace(una::views::word_only::utf8(std::string_view(rs, (size_t) (p - rs))));
-        it = view->begin();
+        if (viewNext()) return true;
+      } else if (!nextRegion()) {
+        return false;
       }
     }
   }
 
 private:
+  // Emit the next word from the active uni-algo region; false (and the view
+  // released) when it is exhausted.
+  [[gnu::noinline]] bool viewNext() {
+    while (it != view->end()) {
+      // Capture the source span before NFKC_CF repoints token.text at `buf`.
+      // `lowered` is a length-preserving ASCII-lowercased copy, so byte
+      // offsets into it equal byte offsets into the original value.
+      std::string_view w = *it;
+      token.setOffset((int) (w.data() - loweredBase),
+                      (int) (w.data() + w.size() - loweredBase));
+      token.text = applyNfkcCf(w, buf);
+      ++it;
+      if (token.text.empty()) continue;  // invisible words consume no position
+      // Fused `fold`, exactly as AccentFoldFilter applies it after nfkc_cf
+      // (including keeping a token that folds to empty). DFA tokens are
+      // ASCII, which fold leaves alone, so only this path pays for it.
+      if (foldAccents && !isAscii(token.text)) {
+        foldBuf = una::norm::to_unaccent_utf8(token.text);
+        token.text = foldBuf;
+      }
+      return true;
+    }
+    view.reset();
+    return false;
+  }
+
+  // Start the next region at the cursor: an ASCII span for the DFA or a
+  // non-ASCII span for uni-algo. False at the end of the value.
+  [[gnu::noinline]] bool nextRegion() {
+    // skip ASCII whitespace to the next region start
+    while (cur < valEnd && isAsciiWs((unsigned char) *cur)) cur++;
+    if (cur >= valEnd) return false;
+    // Find the next non-ASCII byte (SIMD scan, amortized: it is only
+    // recomputed once the cursor passes it). Everything before the last safe
+    // split ahead of it is pure ASCII and goes to the DFA as one region; the
+    // DFA's output does not depend on where regions split as long as they
+    // split at whitespace.
+    if (nextHigh < cur) nextHigh = cur + ascii::findNonAscii(cur, (size_t) (valEnd - cur));
+    if (nextHigh == valEnd) {
+      dfaCur = cur;
+      dfaEnd = valEnd;
+      cur = valEnd;
+      return true;
+    }
+    // Last safe split before nextHigh: a whitespace byte at or before
+    // nextHigh - 2, so the byte after it is ASCII.
+    ptrdiff_t split = (nextHigh - cur) - 2;
+    while (split >= 0 && !isAsciiWs((unsigned char) cur[split])) split--;
+    if (split >= 0) {
+      dfaCur = cur;
+      dfaEnd = cur + split;
+      cur += split;
+      return true;
+    }
+    // The region holding nextHigh extends to the next safe split after it
+    // and is segmented by uni-algo, the fully conformant path.
+    const char* rs = cur;
+    const char* p = nextHigh;
+    while (p < valEnd) {
+      if (isAsciiWs((unsigned char) *p) && (p + 1 == valEnd || ((unsigned char) p[1] & 0x80) == 0)) break;
+      p++;
+    }
+    cur = p;
+    view.emplace(una::views::word_only::utf8(std::string_view(rs, (size_t) (p - rs))));
+    it = view->begin();
+    return true;
+  }
+
   // Emit the next word from the active ASCII region; false when exhausted.
   bool asciiNext() {
     const char* s = dfaCur;
@@ -387,13 +442,8 @@ public:
   bool incrementToken() override {
     if (!source().incrementToken()) return false;
 
-    std::string_view in = token.text;
-    bool hasNonAscii = false;
-    for (unsigned char c : in) {
-      if (c & 0x80) { hasNonAscii = true; break; }
-    }
-    if (hasNonAscii) {
-      buf = una::norm::to_unaccent_utf8(in);
+    if (!isAscii(token.text)) {
+      buf = una::norm::to_unaccent_utf8(token.text);
       token.text = buf;
     }
     return true;
@@ -437,8 +487,8 @@ std::unique_ptr<Tokenizer> makeUnicodeWordTokenizer() {
   return std::make_unique<UnicodeWordTokenizer>();
 }
 
-std::unique_ptr<Tokenizer> makeStandardTokenizer() {
-  return std::make_unique<StandardTokenizer>();
+std::unique_ptr<Tokenizer> makeStandardTokenizer(bool foldAccents) {
+  return std::make_unique<StandardTokenizer>(foldAccents);
 }
 
 std::unique_ptr<TokenStream> makeNfkcCasefoldFilter(std::unique_ptr<TokenStream> source) {
@@ -644,14 +694,15 @@ Analyzer::Analyzer(std::unique_ptr<const TokenizerFactory> tok,
     : canonical(std::move(canonical)), tokenizer(std::move(tok)),
       filters(std::move(fs)),
       fusedHead(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "nfkc_cf"),
+      fusedFold(fusedHead && filters.size() > 1 && filters[1]->name == "fold"),
       stateful(tokenizer->stateful ||
                std::any_of(filters.begin(), filters.end(), [](const auto& f) { return f->stateful; })) {}
 
 std::unique_ptr<TokenChain> Analyzer::createChain() const {
-  std::unique_ptr<Tokenizer> head = fusedHead ? makeStandardTokenizer() : tokenizer->create();
+  std::unique_ptr<Tokenizer> head = fusedHead ? makeStandardTokenizer(fusedFold) : tokenizer->create();
   auto& headRef = *head;
   std::unique_ptr<TokenStream> tail = std::move(head);
-  for (size_t i = fusedHead ? 1 : 0; i < filters.size(); i++) {
+  for (size_t i = fusedFold ? 2 : fusedHead ? 1 : 0; i < filters.size(); i++) {
     tail = filters[i]->create(std::move(tail));
   }
   return std::make_unique<TokenChain>(headRef, std::move(tail), stateful);

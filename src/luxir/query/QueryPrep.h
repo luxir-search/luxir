@@ -25,6 +25,26 @@ inline bool disableProhibitedCacheForTests = false;
 // bypass instead of preserving the postings supplier as the gather feed.
 inline bool disableSparseBatchPostingsFeedForTests = false;
 
+inline std::optional<int64_t> supplierCount(Query::ScorerSupplier* supplier) {
+  if (supplier == nullptr) return 0;
+  Query::ScorerSupplier::BulkScorerContext context;
+  context.requireConstantCount = true;
+  auto plan = supplier->planBulk(Query::ExecutionUse::COUNT_WINDOWS, context);
+  return plan.hasConstantCount() ? std::optional<int64_t>(plan.constantCount) : std::nullopt;
+}
+
+// A probe stops before a crossing-leaf walk. Execution may resolve that level
+// too, using the resolver's supplier rather than constructing a composite.
+template <typename SupplierFor>
+inline std::optional<int64_t> resolveCount(
+    Query::CountShortcut shortcut, SupplierFor&& supplierFor,
+    Query::CountHow through = Query::COUNT_PROBE_LIMIT) {
+  if (shortcut.how == Query::CountHow::METADATA) return shortcut.maxMatches;
+  if (shortcut.how == Query::CountHow::ITERATE || shortcut.how > through) return std::nullopt;
+  assert(shortcut.resolver != nullptr);
+  return supplierCount(supplierFor(*shortcut.resolver));
+}
+
 inline uint32_t elapsedBuildMicros(
     std::chrono::steady_clock::time_point start) {
   auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -522,21 +542,12 @@ enum class MaterializeMode : uint8_t {
   DOMAIN_DRIVEN,
 };
 
-inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
+inline std::unique_ptr<DocSet> materialize(Query::ScorerSupplier* supplier,
+                                           MemPool& scratch,
                                            IndexReader::Segment& segment,
                                            DocSet* domain,
-                                           Query::SupplierExecutionMode executionMode =
-                                               Query::SupplierExecutionMode::ORDINARY,
-                                           MaterializeMode materializeMode =
-                                               MaterializeMode::ORDINARY) {
-  // Used from prepare() paths, which can run deep in a work-stealing stack.
-  // Use the thread-local pool (its inline buffer lives in TLS, not on this
-  // stack frame) rather than a stack-resident MemPool, and keep scorer
-  // temporaries out of Query::Context's shared request pool.
-  auto guard = MemPool::threadLocalPoolGuard();
-  MemPool& scratch = guard.pool();
+                                           MaterializeMode materializeMode = MaterializeMode::ORDINARY) {
   DocSetBuilder builder(segment.maxDoc());
-  auto* supplier = source.scorerSupplier(scratch, segment, executionMode);
   if (supplier != nullptr) {
     if (materializeMode == MaterializeMode::ORDINARY) {
       Query::ScorerSupplier::BulkScorerContext bulkContext;
@@ -636,6 +647,23 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
     }
   }
   return builder.build();
+}
+
+inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
+                                           IndexReader::Segment& segment,
+                                           DocSet* domain,
+                                           Query::SupplierExecutionMode executionMode =
+                                               Query::SupplierExecutionMode::ORDINARY,
+                                           MaterializeMode materializeMode =
+                                               MaterializeMode::ORDINARY) {
+  // Used from prepare() paths, which can run deep in a work-stealing stack.
+  // Use the thread-local pool (its inline buffer lives in TLS, not on this
+  // stack frame) rather than a stack-resident MemPool, and keep scorer
+  // temporaries out of Query::Context's shared request pool.
+  auto guard = MemPool::threadLocalPoolGuard();
+  MemPool& scratch = guard.pool();
+  auto* supplier = source.scorerSupplier(scratch, segment, executionMode);
+  return materialize(supplier, scratch, segment, domain, materializeMode);
 }
 
 inline std::unique_ptr<DocSet> materialize(Query::Weight& weight,
@@ -866,9 +894,10 @@ enum class WholeMembershipConsumer : uint8_t {
   FIELD_SORT,
 };
 
-// Request-owned whole-query membership fact. Constant counts precede cache
-// traffic; cache values remain raw and the incoming effective domain is
-// composed once at the Use boundary.
+// Request-owned whole-query membership fact. Cache-routed metadata zeros
+// participate in admission; other constant counts precede cache traffic.
+// Cache values remain raw and the incoming effective domain is composed once
+// at the Use boundary.
 class WholeMembershipPlan {
   enum class Source : uint8_t {
     EMPTY,
@@ -991,10 +1020,11 @@ public:
     skipCount(SkipStats::wholeFieldSortRoutingBypasses);
   }
 
+  template <typename SupplierFor>
   WholeMembershipResult resolve(
       IndexReader& reader, IndexReader::Segment& segment,
-      DocSet* incomingDomain,
-      Query::Weight::PreparedWeight* prepared = nullptr) const {
+      DocSet* incomingDomain, Query::Weight::PreparedWeight* prepared,
+      SupplierFor&& supplierFor) const {
     if (source == Source::EMPTY) return {};
     if (source == Source::ACCEPTED_EXISTING) {
       DomainHandle docs = cacheUse->effectiveDomain(
@@ -1026,19 +1056,23 @@ public:
       };
     }
 
-    auto constant = weight->constantCount(segment, incomingDomain);
-    if (constant.has_value()) {
-      record(SkipStats::wholeCountConstant,
-             SkipStats::wholeTopKCountConstant,
+    assert(fieldSortCacheRoutes.empty()
+           || (size_t)segment.ord < fieldSortCacheRoutes.size());
+    bool routed = fieldSortCacheRoutes.empty()
+        || fieldSortCacheRoutes[(size_t)segment.ord] != 0;
+    auto shortcut = weight->countShortcut(segment, incomingDomain);
+    auto count = resolveCount(shortcut, std::forward<SupplierFor>(supplierFor));
+    // Empty effective counts still need raw residency for Weight omission.
+    bool cacheZero = cacheUse != nullptr && routed
+        && shortcut.how == Query::CountHow::METADATA && shortcut.maxMatches == 0;
+    if (count && !cacheZero) {
+      record(SkipStats::wholeCountConstant, SkipStats::wholeTopKCountConstant,
              SkipStats::wholeFieldSortConstant);
-      return {true, {}, *constant};
+      return {true, {}, *count};
     }
     // FIELD_SORT routing rejects a cache representation before probe(), so it
     // neither records an admission sighting nor competes for cache capacity.
-    assert(fieldSortCacheRoutes.empty()
-           || (size_t)segment.ord < fieldSortCacheRoutes.size());
-    if (!fieldSortCacheRoutes.empty()
-        && fieldSortCacheRoutes[(size_t)segment.ord] == 0) {
+    if (!routed) {
       recordRoutingBypass();
       return {};
     }
@@ -1081,6 +1115,11 @@ public:
     record(SkipStats::wholeCountBypasses,
            SkipStats::wholeTopKCountBypasses,
            SkipStats::wholeFieldSortBypasses);
+    if (cacheZero) {
+      record(SkipStats::wholeCountConstant, SkipStats::wholeTopKCountConstant,
+             SkipStats::wholeFieldSortConstant);
+      return {true, {}, 0};
+    }
     return {};
   }
 };
@@ -1419,6 +1458,10 @@ inline DomainHandle materializeEffectiveFilter(
 
   return use->effectiveDomain((size_t) segment.ord, reader, domain);
 }
+
+DomainHandle materializeEffectiveFilter(
+    const PreparedSource& source, IndexReader& reader,
+    IndexReader::Segment& segment, DocSet* domain, FilterCache::Probe probe);
 
 inline DomainHandle materializeEffectiveFilter(
     Query::Weight& weight, FilterCache::Use* use, IndexReader& reader,

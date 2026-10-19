@@ -22,6 +22,7 @@ namespace luxir {
 using FieldClass = luxir::api::FieldDef_::FieldClass;
 using IndexMode = luxir::api::FieldDef_::IndexMode;
 using LongTerms = luxir::api::FieldDef_::LongTerms;
+using StoredCodec = luxir::api::StoredResourceDef_::Codec;
 using VectorMetric = luxir::api::VectorMetric;
 
 // One authored (source) entry: a name plus its FieldDef view and which map it
@@ -56,6 +57,8 @@ struct ResolvedField {
   bool vectorNormalized = false;
   bool hasVectorNormalizeOnWrite = false;
   bool vectorNormalizeOnWrite = false;
+  // Atomic like analyzer: the nearest authored ann in the parent chain.
+  const luxir::api::VectorAnnDef* ann = nullptr;
 };
 
 struct ResolvedOwnership {
@@ -244,7 +247,65 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
   }
 
+  r.ann = def.ann ? &*def.ann : parentResolved.ann;
   return r;
+}
+
+// Apply defaults to an authored ann definition and validate it against the
+// effective dims. Positive PQ m requires pinned dims; automatic m also works
+// with dims inferred per segment.
+static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t dims,
+                                        std::string_view name) {
+  VectorAnnConfig cfg;
+  if (def == nullptr) return cfg;
+  auto fail = [&](const std::string& msg) {
+    throw SchemaError("ann: " + msg + " (field: " + std::string(name) + ")");
+  };
+  using Codec = api::VectorAnnDef_::Codec;
+  if (def->codec) {
+    Codec codec = *def->codec;
+    if (codec != Codec::RABITQ && codec != Codec::PQ) {
+      fail("unknown codec " + std::to_string((int)codec) + "; valid: rabitq, pq");
+    }
+    cfg.codec = codec == Codec::PQ ? VectorAnnConfig::PQ : VectorAnnConfig::RABITQ;
+  }
+  if (def->nlist) {
+    if (*def->nlist < 0 || *def->nlist > 65536) fail("nlist must be in [0, 65536]");
+    cfg.nlist = *def->nlist;
+  }
+  if (def->rabitq && cfg.codec != VectorAnnConfig::RABITQ) {
+    fail("rabitq settings require explicit codec \"rabitq\"");
+  }
+  if (def->pq && cfg.codec != VectorAnnConfig::PQ) fail("pq settings require codec pq");
+  if (def->rabitq) {
+    if (def->rabitq->bits) {
+      if (*def->rabitq->bits < 1 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [1, 9]");
+      cfg.rabitqBits = *def->rabitq->bits;
+    }
+    if (def->rabitq->query_bits) {
+      if (*def->rabitq->query_bits < 0 || *def->rabitq->query_bits > 8) {
+        fail("rabitq.query_bits must be in [0, 8]");
+      }
+      cfg.rabitqQueryBits = *def->rabitq->query_bits;
+    }
+  }
+  if (def->pq) {
+    if (def->pq->m) {
+      if (*def->pq->m < 0) fail("pq.m must be >= 0");
+      if (*def->pq->m > 0) {
+        if (dims <= 0) fail("positive pq.m requires positive dims");
+        if (dims % *def->pq->m != 0) {
+          fail("pq.m=" + std::to_string(*def->pq->m) + " does not divide dims=" + std::to_string(dims));
+        }
+      }
+      cfg.pqM = *def->pq->m;
+    }
+    if (def->pq->bits) {
+      if (*def->pq->bits < 1 || *def->pq->bits > 8) fail("pq.bits must be in [1, 8]");
+      cfg.pqBits = *def->pq->bits;
+    }
+  }
+  return cfg;
 }
 
 static void resolveField(std::string_view name, const sv_entry_map& defMap,
@@ -326,10 +387,11 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
     throw SchemaError("normalizer is only valid for string fields (field: " + name + ")");
   }
   bool vectorProp = def.dims.has_value() || def.metric.has_value() ||
-                    def.normalized.has_value() || def.normalize_on_write.has_value();
+                    def.normalized.has_value() || def.normalize_on_write.has_value() ||
+                    def.ann.has_value();
   if (vectorProp && r.type != FieldClass::VECTOR) {
     throw SchemaError(
-      "dims/metric/normalized/normalize_on_write are only valid for vector fields (field: " + name + ")");
+      "dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " + name + ")");
   }
 }
 
@@ -537,7 +599,8 @@ struct FieldCompiler {
           ? r.vectorNormalizeOnWrite
           : (r.vectorMetric == VectorFieldType::METRIC_COSINE));
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
-                                               r.vectorMetric, r.vectorNormalized, normalizeOnWrite);
+                                               r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
+                                               resolveAnnConfig(r.ann, r.vectorDims, name));
         break;
       }
       default:
@@ -597,6 +660,43 @@ static std::string binding(std::optional<std::string_view> label,
   return selected.empty() ? "self" : selected;
 }
 
+// Validate one stored_resources entry and build its StoredFieldType.
+static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name,
+                                                           const api::StoredResourceDef& def) {
+  auto fail = [&](const std::string& msg) {
+    throw SchemaError(msg + " (stored resource: " + std::string(name) + ")");
+  };
+  // '_' + name + '_' can be neither a document field nor a suffix template
+  // (suffix matching anchors on a field name's last underscore).
+  if (name.size() < 3 || name.back() != '_' || !Schema::validTemplateName(name)) {
+    fail("invalid stored resource name: '_', ASCII letters, digits, or underscores, and a closing '_'");
+  }
+  StoredCodec codec = def.codec.value_or(StoredCodec::LZ4);
+  if (codec != StoredCodec::LZ4 && codec != StoredCodec::ZSTD) {
+    fail("unknown codec value " + std::to_string((int)codec) + "; valid: lz4, zstd");
+  }
+  auto format = StoredChunkFormat::defaults(codec == StoredCodec::ZSTD ? StoredChunkFormat::ZSTD
+                                                                       : StoredChunkFormat::LZ4);
+  if (def.zstd_level) {
+    if (codec != StoredCodec::ZSTD) fail("zstd_level requires codec zstd");
+    if (*def.zstd_level < 1 || *def.zstd_level > 22) fail("zstd_level must be 1 to 22");
+    format.zstdLevel = *def.zstd_level;
+  }
+  if (def.chunk_size_bytes) {
+    if (*def.chunk_size_bytes < 1024 || *def.chunk_size_bytes > 4 * 1024 * 1024) {
+      fail("chunk_size_bytes must be 1024 to 4194304");
+    }
+    format.chunkTarget = (uint32_t)*def.chunk_size_bytes;
+  }
+  if (def.max_docs_per_chunk) {
+    if (*def.max_docs_per_chunk < 1 || *def.max_docs_per_chunk > 65536) {
+      fail("max_docs_per_chunk must be 1 to 65536");
+    }
+    format.maxDocsPerChunk = (uint32_t)*def.max_docs_per_chunk;
+  }
+  return std::make_shared<StoredFieldType>(name, format);
+}
+
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
   auto schema = std::make_shared<Schema>();
 
@@ -631,6 +731,18 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
   }
   for (const auto& [name, fd] : def.fields) entries.push_back({name, *fd, false});
   for (const auto& [name, fd] : def.templates) entries.push_back({name, *fd, true});
+
+  // Stored resources merge the same way: a named entry replaces the base one.
+  using ResourcePair = std::pair<std::string_view, api::StoredResourceDef>;
+  std::vector<ResourcePair> resources;
+  for (const auto& [name, rd] : baseSrc.stored_resources) {
+    if (!def.stored_resources.contains(name)) resources.push_back({name, rd});
+  }
+  for (const auto& [name, rd] : def.stored_resources) {
+    std::erase_if(resources, [&](const ResourcePair& r) { return r.first == name; });  // last wins
+    resources.push_back({name, rd});
+  }
+  std::ranges::sort(resources, {}, &ResourcePair::first);
 
   // Materialize the reserved fields when absent: a REPLACE_ALL that omits them gets
   // working defaults instead of a silently broken collection.
@@ -693,6 +805,8 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(fieldPairs.data(), fieldPairs.size()));
     src.templates = luxir::api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(templatePairs.data(), templatePairs.size()));
+    src.stored_resources = luxir::api::map_view<std::string_view, api::StoredResourceDef>(
+      std::span<const ResourcePair>(resources.data(), resources.size()));
     schema->sourceDef_ = serializeSchemaDef(src);
   }
 
@@ -732,6 +846,16 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
   ownership_map ownership;
   for (const auto& e : entries) resolveOwnership(e.name, defMap, ownership);
   validateReservedFields(resolved, ownership);
+  // A stored_resource must be declared, so a typo cannot silently start a
+  // separate resource with default settings.
+  for (const auto& e : entries) {
+    const auto& name = ownership.at(e.name).storedResource;
+    if (!name.empty() && name != Postings::STORED_DEFAULT_RESOURCE
+        && !std::ranges::binary_search(resources, std::string_view(name), {}, &ResourcePair::first)) {
+      throw SchemaError("stored_resource '" + name + "' is not declared in stored_resources (field: " +
+                        std::string(e.name) + ")");
+    }
+  }
 
   FieldCompiler compiler;
   for (const auto& e : entries) {
@@ -812,10 +936,16 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
     }
   }
 
-  // Ensure the default stored-fields resource is available in every schema.
-  // StoredFieldType entries are not part of the authored source def, so we
-  // materialize the default unconditionally.  Users who have registered named
-  // column families must re-add them programmatically.
+  // Stored-fields resources share the field registry (a segment registers
+  // each under its own name), so they cannot reuse a field or template name.
+  for (const auto& [name, rd] : resources) {
+    auto type = storedResourceType(name, rd);
+    if (!schema->fieldTypeMap.emplace(std::string(name), std::move(type)).second) {
+      throw SchemaError("stored resource '" + std::string(name) + "' collides with a field or template name");
+    }
+  }
+  // The default resource is always available; without an entry it uses the
+  // default format.
   std::string defaultName(Postings::STORED_DEFAULT_RESOURCE);
   if (schema->fieldTypeMap.find(defaultName) == schema->fieldTypeMap.end()) {
     schema->fieldTypeMap[defaultName] = std::make_shared<StoredFieldType>(defaultName);

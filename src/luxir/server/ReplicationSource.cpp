@@ -278,18 +278,24 @@ void ReplicationSource::expire() {
   if (acknowledgmentsChanged) acknowledgmentsChanged(nullptr);
 }
 
-ReplicationSource::Barrier ReplicationSource::capture(const api::ReplicaRequirement& requirement,
-                                                       const CollectionId& collection, const CommitId& commit) {
+void ReplicationSource::validate(const api::ReplicaRequirement& requirement) {
   if (requirement.kind.index() == 0) throw RequestError("wait_for_replicas requires count or all");
+}
+
+ReplicationSource::Barrier ReplicationSource::capture(const api::ReplicaRequirement& requirement,
+                                                       const CollectionId& collection, const CommitId& commit, Members members) {
+  validate(requirement);
   Barrier result{std::holds_alternative<api::AllReplicas>(requirement.kind), 0, {}};
   if (!result.all) result.wanted = std::get<uint32_t>(requirement.kind);
   else {
     std::lock_guard lock(mutex);
     expireLocked();
     for (const auto& [id, follower] : followers) {
+      if (!follower.includes(collection)) continue;
       auto serving = follower.commits.find(collection);
-      if (follower.includes(collection) && serving != follower.commits.end()
-          && serving->second.commit.incarnation == commit.incarnation) result.members.emplace(id, serving->second.membership);
+      if (serving != follower.commits.end() && serving->second.commit.incarnation == commit.incarnation)
+        result.members.emplace(id, serving->second.membership);
+      else if (members == Members::SUBSCRIBED && !follower.commits.empty()) result.members.emplace(id, 0);
     }
   }
   return result;
@@ -304,8 +310,8 @@ api::ReplicaResult ReplicationSource::progress(const Barrier& barrier, const Col
     auto commit = follower.commits.find(collection);
     if (barrier.all) {
       auto member = barrier.members.find(name);
-      if (member == barrier.members.end() || commit == follower.commits.end()
-          || member->second != commit->second.membership) continue;
+      if (member == barrier.members.end()) continue;
+      if (member->second && (commit == follower.commits.end() || member->second != commit->second.membership)) continue;
       wanted++;
     }
     if (commit != follower.commits.end() && commit->second.commit.incarnation == id.incarnation

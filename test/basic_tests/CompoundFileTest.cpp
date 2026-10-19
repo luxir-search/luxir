@@ -22,7 +22,7 @@
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/PostingsWriter.h"
 #include "luxir/reader/DocsEnum.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/NormsReader.h"
 #include "luxir/reader/PointsReader.h"
@@ -73,10 +73,9 @@ std::shared_ptr<Schema> compoundSchema() {
 }
 
 SegFieldInfo fieldInfo(PostingsReader& reader, std::string_view field) {
-  FieldReader fields(reader);
-  EXPECT_TRUE(fields.seek(field));
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = reader.fieldInfo(field);
+  EXPECT_NE(nullptr, fields);
+  const auto& info = *fields;
   return info;
 }
 
@@ -203,7 +202,9 @@ void verifyTinySegment(Directory& directory, size_t largeTagBytes = 0) {
   std::vector<PointsReader::Point> expectedPoints = {{-2, 1}, {7, 0}};
   EXPECT_EQ(expectedPoints, points.readAll());
 
-  auto stored = StoredFieldsReader::open(postings);
+  auto* storedField = postings.fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+
+  auto stored = storedField ? std::make_unique<StoredFieldsReader>(postings, *storedField) : nullptr;
   ASSERT_NE(nullptr, stored);
   EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{
                 {"body", "alpha beta"}}),
@@ -292,7 +293,9 @@ void verifyCollapsedMerge(Directory& directory, size_t tagBytes = 0) {
     }
   }
 
-  auto stored = StoredFieldsReader::open(postings);
+  auto* storedField = postings.fieldInfo(Postings::STORED_DEFAULT_RESOURCE);
+
+  auto stored = storedField ? std::make_unique<StoredFieldsReader>(postings, *storedField) : nullptr;
   ASSERT_NE(nullptr, stored);
   for (int32_t doc = 0; doc < 3; doc++) {
     EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{
