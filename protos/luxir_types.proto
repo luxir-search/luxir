@@ -299,6 +299,7 @@ message Query {
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
     MultiMatchQuery multi_match = 20; // one text over several weighted fields
+    DisMaxQuery dis_max = 25;       // best-scoring of several queries, plus a tie breaker
   }
 }
 
@@ -412,32 +413,62 @@ message WeightedField {
 
 // Analyzes one text across several fields. In COMBINED mode, fields sharing
 // an analyzer and long-term policy form a group scored as one field with
-// BM25F; group scores add. PER_FIELD adds weighted match scores.
+// BM25F; group scores add by default. PER_FIELD adds weighted match scores.
 // BM25F follows Lucene's CombinedFieldQuery.
 message MultiMatchQuery {
   string text = 1; // the text to analyze
   // Required and non-empty. Fields resolve through their search bindings.
-  // Duplicate physical fields keep the larger weight.
+  // Duplicate physical fields keep the larger weight. Names containing '*'
+  // expand over schema and reader fields, keeping TEXT and STRING fields.
   repeated WeightedField fields = 2;
   // Unset = COMBINED.
   Mode mode = 3;
 
   // How analyzed terms combine. Unset = OR. COMBINED applies this within
   // each group (AND: every term in some field of one group). PER_FIELD
-  // applies it within each field (AND: every term in that field).
+  // applies it within each field (AND: every term in that field). Ignored
+  // by the phrase modes.
   Match.Operator operator = 4;
 
   // Zero uses operator. Positive values override operator and are clamped
   // to the analyzed term count within each group/field. Must be >= 0.
   int32 min_match = 5;
 
+  // Weight of non-best fields or groups: best + tie_breaker * others.
+  // Unset = 1 for COMBINED and PER_FIELD, 0 for phrase modes. In [0, 1].
+  optional float tie_breaker = 6;
+
+  // Phrase slop for PHRASE and PHRASE_PREFIX. Must be >= 0.
+  int32 slop = 7;
+
+  // Maximum PHRASE_PREFIX expansions, in byte order. 0 = 50, at most 1024.
+  // BOOL_PREFIX ignores this limit and matches every expansion.
+  int32 max_expansions = 8;
+
   enum Mode {
-    // TEXT fields only. A weight scales both term frequency and document
-    // length, at every group size, rather than multiplying the score.
+    // TEXT weights scale term frequency and document length at every group
+    // size. Other fields are singleton groups with multiplicative weights.
     COMBINED = 0;
     // One match per field; each weight multiplies that field's score.
     PER_FIELD = 1;
+    // One phrase per TEXT field, a match on other fields; combined by dis_max.
+    PHRASE = 2;
+    // One phrase per field whose last word is a prefix; combined by dis_max.
+    PHRASE_PREFIX = 3;
+    // Leading terms and a final prefix per field; field scores add.
+    BOOL_PREFIX = 4;
   }
+}
+
+// Disjunction max: matches documents that match any of `queries`, scoring
+// each with its best-scoring query plus tie_breaker times the sum of the
+// other matching queries' scores (Elasticsearch dis_max).
+message DisMaxQuery {
+  repeated Query queries = 1;  // required, non-empty
+
+  // Weight of the non-best matching queries. Unset = 0. Must be in [0, 1];
+  // 1 adds every score like a boolean disjunction.
+  optional float tie_breaker = 2;
 }
 
 // Constant-score exact value-set membership using the field's value binding.

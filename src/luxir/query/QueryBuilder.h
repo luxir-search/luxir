@@ -17,6 +17,8 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/AutomatonQuery.h"
 #include "luxir/query/CombinedFieldQuery.h"
+#include "luxir/query/DisMaxQuery.h"
+#include "luxir/query/PhrasePrefixQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExistsQuery.h"
 #include "luxir/query/FuzzyQuery.h"
@@ -899,7 +901,8 @@ public:
   // analysis pass and one BM25F query per term. Group order follows physical
   // field order, independent of request order and the query text.
   Query* createMultiMatchCombined(std::span<const WeightedField> requested,
-                                  std::string_view text, Operator op, int minMatch) {
+                                  std::string_view text, Operator op, int minMatch,
+                                  float tieBreaker = 1.0f) {
     struct Group {
       const ResolvedFieldHandle* target;
       std::span<std::string_view> fields;
@@ -912,16 +915,15 @@ public:
     size_t numGroups = 0;
     for (size_t i = 0; i < resolved.size(); i++) {
       const auto& target = *resolved[i].target;
-      if (target.fieldType->type() != FieldType::TEXT) {
-        throw std::runtime_error(std::format(
-            "multi_match: field '{}' is not a TEXT field", target.physicalName));
-      }
-      auto* type = (TextFieldType*)target.fieldType;
-      size_t group = 0;
-      for (; group < numGroups; group++) {
-        auto* other = (TextFieldType*)groups[group].target->fieldType;
-        if (type->analyzer_.get() == other->analyzer_.get()
-            && type->longTerms == other->longTerms) break;
+      size_t group = numGroups;
+      if (target.fieldType->type() == FieldType::TEXT) {
+        auto* type = (TextFieldType*)target.fieldType;
+        for (group = 0; group < numGroups; group++) {
+          if (groups[group].target->fieldType->type() != FieldType::TEXT) continue;
+          auto* other = (TextFieldType*)groups[group].target->fieldType;
+          if (type->analyzer_.get() == other->analyzer_.get()
+              && type->longTerms == other->longTerms) break;
+        }
       }
       if (group == numGroups) groups[numGroups++] = {&target, {}, {}, 0};
       groupIndices[i] = group;
@@ -942,6 +944,10 @@ public:
     auto optional = pool.make_span<Query*>(numGroups);
     size_t count = 0;
     for (const auto& group : groups) {
+      if (group.target->fieldType->type() != FieldType::TEXT) {
+        optional[count++] = createMatchQuery(*group.target, text, op, minMatch, group.weights[0]);
+        continue;
+      }
       auto terms = analyzeText(*group.target, text);
       if (terms.empty()) continue;
       bool plainTerm = group.fields.size() == 1 && group.weights[0] == 1.0f;
@@ -956,23 +962,148 @@ public:
       optional[count++] = combineAnalyzedClauses(clauses, op, minMatch);
     }
     if (count == 0) return matchNoDocs();
-    if (count == 1) return optional[0];
-    std::span<Query*> none{};
-    return pool.make<BooleanQuery>(none, optional.first(count), none, none);
+    return DisMaxQuery::make(pool, optional.first(count), tieBreaker);
   }
 
   // Each field contributes its own match score multiplied by its weight.
   Query* createMultiMatchPerField(std::span<const WeightedField> requested,
-                                  std::string_view text, Operator op, int minMatch) {
+                                  std::string_view text, Operator op, int minMatch,
+                                  float tieBreaker = 1.0f) {
     auto resolved = resolveWeightedFields(requested);
     auto clauses = pool.make_span<Query*>(resolved.size());
     for (size_t i = 0; i < resolved.size(); i++) {
       clauses[i] = createMatchQuery(*resolved[i].target, text, op, minMatch, resolved[i].weight);
     }
     if (clauses.empty()) return matchNoDocs();
-    if (clauses.size() == 1) return clauses[0];
-    std::span<Query*> none{};
-    return pool.make<BooleanQuery>(none, clauses, none, none);
+    return DisMaxQuery::make(pool, clauses, tieBreaker);
+  }
+
+  Query* boosted(Query* query, float boost) {
+    if (boost == 1.0f) return query;
+    if (query->getKind() == QueryKind::TERM) {
+      auto* term = (TermQuery*)query;
+      return pool.make<TermQuery>(term->getField(), term->getTerm(), boost * term->getBoost(),
+                                  term->shouldUseFrontierBound());
+    }
+    return pool.make<BoostQuery>(query, boost);
+  }
+
+  // multi_match phrase: a phrase per TEXT field (a match on other fields,
+  // whose value is one term), combined like best_fields.
+  Query* createMultiPhraseQuery(std::span<const WeightedField> requested, std::string_view text,
+                                int32_t slop, float tieBreaker) {
+    return createPerFieldQuery(requested, tieBreaker, [&](const ResolvedFieldHandle& target) {
+      if (target.fieldType->type() != FieldType::Type::TEXT) {
+        return createMatchQuery(target, text);
+      }
+      return createPhraseQuery(target, std::span<const std::string_view>(&text, 1), {}, slop);
+    });
+  }
+
+  // multi_match phrase_prefix: createPhrasePrefixQuery per TEXT field (a
+  // prefix query on other fields), combined like best_fields.
+  Query* createMultiPhrasePrefixQuery(std::span<const WeightedField> requested,
+                                      std::string_view text, int32_t slop,
+                                      int32_t maxExpansions, float tieBreaker) {
+    return createPerFieldQuery(requested, tieBreaker, [&](const ResolvedFieldHandle& target) {
+      return createPhrasePrefixQuery(target, text, slop, maxExpansions);
+    });
+  }
+
+  // multi_match bool_prefix: createBoolPrefixQuery per field, the field
+  // scores added up like most_fields.
+  Query* createMultiBoolPrefixQuery(std::span<const WeightedField> requested,
+                                    std::string_view text, Operator op, int minMatch) {
+    return createPerFieldQuery(requested, 1.0f, [&](const ResolvedFieldHandle& target) {
+      return createBoolPrefixQuery(target, text, op, minMatch);
+    });
+  }
+
+  // match_phrase_prefix: the analyzed text as a phrase whose last term is a
+  // prefix, expanded at weight creation to at most maxExpansions terms. A
+  // non-TEXT field takes the whole text as a prefix.
+  Query* createPhrasePrefixQuery(const ResolvedFieldHandle& target, std::string_view text,
+                                 int32_t slop, int32_t maxExpansions) {
+    if (slop < 0) {
+      throw std::runtime_error("Phrase query slop must be nonnegative");
+    }
+    if (target.fieldType->type() != FieldType::Type::TEXT) {
+      return createPrefixQuery(target, text);
+    }
+    auto field = poolCopy(target.physicalName);
+    TokenChain& tc = *fields.chain(target);
+    Token& tok = tc.head.getToken();
+    TokenStream& tail = *tc.tail;
+    std::vector<std::string_view> terms;
+    std::vector<int32_t> positions;
+    std::string last;
+    int32_t lastPosition = 0;
+    int64_t pos = -1;
+    bool any = false;
+    tc.head.setValue(text);
+    tc.reset();
+    while (tail.incrementToken()) {
+      pos += (int64_t)tok.positionIncrement;
+      if (pos > std::numeric_limits<int32_t>::max()) {
+        throw std::runtime_error("Phrase query positions must be in [0, INT_MAX]");
+      }
+      if (any) {
+        terms.push_back(poolCopy(fitTerm(target, last)));
+        positions.push_back(lastPosition);
+      }
+      last.assign(tok.text.data(), tok.text.size());
+      lastPosition = (int32_t)pos;
+      any = true;
+    }
+    if (!any) return matchNoDocs();
+    if (!terms.empty()) positionalTextFieldType(target);
+    int32_t base = terms.empty() ? lastPosition : positions[0];
+    for (auto& p : positions) p -= base;
+    std::string_view prefix = poolCopy(PackedTerm::fitPrefix(target.fieldType->longTerms, last));
+    return pool.make<PhrasePrefixQuery>(
+        field, pool.copy_span(std::span<std::string_view>(terms)),
+        pool.copy_span(std::span<int32_t>(positions)), prefix, lastPosition - base, slop,
+        maxExpansions);
+  }
+
+  // match_bool_prefix: every analyzed term but the last is a term query and
+  // the last is a prefix query, combined by `op` / minMatch like match. A
+  // non-TEXT field takes the whole text as a prefix.
+  Query* createBoolPrefixQuery(const ResolvedFieldHandle& target, std::string_view text,
+                               Operator op, int minMatch) {
+    if (target.fieldType->type() != FieldType::Type::TEXT) {
+      return createPrefixQuery(target, text);
+    }
+    auto field = poolCopy(target.physicalName);
+    TokenChain& tc = *fields.chain(target);
+    Token& tok = tc.head.getToken();
+    TokenStream& tail = *tc.tail;
+    std::vector<std::string> raw;
+    tc.head.setValue(text);
+    tc.reset();
+    while (tail.incrementToken()) raw.emplace_back(tok.text.data(), tok.text.size());
+    if (raw.empty()) return matchNoDocs();
+    auto clauses = pool.make_span<Query*>(raw.size());
+    for (size_t i = 0; i + 1 < raw.size(); i++) {
+      clauses[i] = pool.make<TermQuery>(field, poolCopy(fitTerm(target, raw[i])));
+    }
+    clauses[raw.size() - 1] = pool.make<PrefixQuery>(
+        field, poolCopy(PackedTerm::fitPrefix(target.fieldType->longTerms, raw.back())));
+    return combineAnalyzedClauses(clauses, op, minMatch);
+  }
+
+  // One query per requested field, boosted by the field's boost, combined
+  // as a dis_max with tieBreaker (1 adds the scores like a disjunction).
+  template <typename PerField>
+  Query* createPerFieldQuery(std::span<const WeightedField> requested, float tieBreaker,
+                             PerField&& perField) {
+    auto resolved = resolveWeightedFields(requested);
+    if (resolved.empty()) return matchNoDocs();
+    auto clauses = pool.make_span<Query*>(resolved.size());
+    for (size_t i = 0; i < resolved.size(); i++) {
+      clauses[i] = boosted(perField(*resolved[i].target), resolved[i].weight);
+    }
+    return DisMaxQuery::make(pool, clauses, tieBreaker);
   }
 
   // Build a range query over `field` from raw bound Vals (any may be null for

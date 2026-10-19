@@ -924,6 +924,8 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::ExprQuery>);
           } else if (key == "multi_match") {
             arm(std::in_place_type<api::MultiMatchQuery>);
+          } else if (key == "dis_max") {
+            arm(std::in_place_type<api::DisMaxQuery>);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

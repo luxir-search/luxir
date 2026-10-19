@@ -443,7 +443,7 @@ representation does not grant access to its siblings.
 
 `multi_match` searches one text across several weighted fields. The default
 `combined` mode scores fields sharing an analyzer and long-term policy as one
-field with BM25F. The `per_field` mode adds weighted `match` scores:
+field with BM25F. The `per_field` mode adds weighted `match` scores by default:
 
 ```json
 {
@@ -459,9 +459,12 @@ field with BM25F. The `per_field` mode adds weighted `match` scores:
 |---|---|
 | `text` | Text to analyze or coerce. |
 | `fields` | Required non-empty list of objects with `field` and optional `weight`. Unset weight is `1`; every weight must be finite and greater than `0`. |
-| `mode` | `combined` (default) or `per_field`. |
+| `mode` | `combined` (default), `per_field`, `phrase`, `phrase_prefix`, or `bool_prefix`. |
 | `operator` | `or` (default) or `and`; combines terms within each group in `combined`, or within each field in `per_field`. |
-| `min_match` | Must be non-negative. Zero uses `operator`; a positive value overrides it and is clamped to the analyzed term count within each group or field. |
+| `min_match` | Must be non-negative. Zero uses `operator`; a positive value overrides it and is clamped to the analyzed term count within each group or field. Ignored by the phrase modes. |
+| `tie_breaker` | In `[0, 1]`: best score plus this weight times the other scores. Default `1` for `combined` and `per_field`, `0` for the phrase modes; ignored by `bool_prefix`. |
+| `slop` | Non-negative phrase slop for `phrase` and `phrase_prefix` only. |
+| `max_expansions` | Maximum `phrase_prefix` expansions in byte order: `0` means `50`, at most `1024`. Ignored by `bool_prefix`. |
 
 JSON also accepts `"title_t"` and `"title_t^2"`, the field-list form of Solr's
 `qf`, as shorthand for field objects.
@@ -469,9 +472,13 @@ Writes use the canonical object form shown above. Field names resolve through
 their `search` binding, like `match`. Duplicate physical targets keep the
 larger weight in both modes; field order does not affect the query.
 
-In `combined` mode, fields must be TEXT. Fields sharing the same compiled
-analyzer and long-term policy form a group. Group membership comes from the
-schema, independently of the query text. Each group analyzes the text once
+Field names containing `*` expand against schema and reader field names,
+keeping TEXT and STRING fields. A pattern matching nothing adds no field.
+
+In `combined` mode, TEXT fields sharing the same compiled analyzer and
+long-term policy form a group. Other fields form singleton groups whose
+weights multiply their match scores. Group membership comes from the
+schema, independently of the query text. Each TEXT group analyzes the text once
 and scores each term with BM25F, as in Lucene's `CombinedFieldQuery`.
 
 Within a group, a weight scales that field's term frequency and document
@@ -484,15 +491,17 @@ term counts divided by the largest per-field document count; document
 frequency is the largest per-field document frequency. A term present in
 several fields saturates once within the group.
 
-Group scores add, and a document matches when any group matches.
+Group scores add by default; `tie_breaker` selects the best score plus a
+fraction of the other group scores. A document matches when any group matches.
 `operator: "and"` requires every term in some field of one group; it does not
 require every group to match. `min_match` also applies within each group.
 A group producing no terms contributes nothing; if all groups produce no
 terms, the query matches nothing. One field at weight `1` scores like `match`.
 
 In `per_field` mode, each field runs a `match` query, and its weight multiplies
-that field's score. Field scores add, and a document matches when any field
-matches. This mode accepts the field types that [`match`](#match) accepts.
+that field's score. Field scores add by default; `tie_breaker` combines them
+as in `combined`. A document matches when any field matches. This mode accepts
+the field types that [`match`](#match) accepts.
 `operator: "and"` requires every term in that field; `min_match` applies
 within each field. Use `per_field` to multiply individual field scores, or
 wrap the query in [`boost`](#constant-score-and-boost) to multiply its final score.
@@ -504,6 +513,40 @@ weights and enum arguments:
 ```text
 multi_match(dune, fields=[title_t^2, body_t], mode=per_field, operator=and)
 ```
+
+`phrase` runs a phrase query per TEXT field and a whole-value match on
+other fields, combining their scores with `tie_breaker`. `phrase_prefix`
+expands the last analyzed word to index terms and scores the best completed
+phrase per field. `bool_prefix` combines the leading terms and a final prefix
+by `operator`/`min_match`, then adds field scores. The phrase modes ignore
+`operator` and `min_match`.
+
+## Disjunction max
+
+`dis_max` matches documents that match any of its queries and scores each
+document with its best-scoring query, plus `tie_breaker` times the sum of the
+other matching queries' scores:
+
+```json
+{
+  "dis_max": {
+    "queries": [
+      {"match":{"title_t":"dune"}},
+      {"match":{"description_t":"dune"}}
+    ],
+    "tie_breaker": 0.3
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `queries` | Required non-empty list of queries. |
+| `tie_breaker` | In `[0, 1]`, default `0`. `0` keeps only the best score; `1` adds every score like a boolean `optional` list. |
+
+In a filter, `dis_max` matches the same documents as a boolean disjunction of
+its queries and shares that disjunction's filter cache entry. From the query
+language: `dis_max(queries=[title_t:dune, description_t:dune], tie_breaker=0.3)`.
 
 ## Expression
 
@@ -543,7 +586,5 @@ in their own guides:
 - `except_ops` routing is not accepted on Fusion filters or Fusion source
   filters, and `domain` overrides are not supported directly in `Fusion.ops`
   or beneath facet buckets.
-- `multi_match` has no `dis_max`/`tie_breaker`, phrase forms, or wildcard
-  field names. `combined` mode accepts TEXT fields only.
 - Fuzzy expansion truncation (the `64` clause budget and any lower operator
   limit) is not reported in the response.

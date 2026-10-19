@@ -3,7 +3,9 @@
 
 #include "luxir/query/ProtobufQueryParser.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <format>
 #include <limits>
 #include <stdexcept>
@@ -19,6 +21,7 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/ExprParser.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
@@ -30,6 +33,7 @@
 #include "luxir/query/SimpleQueryParser.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/search/IndexReader.h"
 #include "luxir/util/Overloaded.h"
 #include "luxir/value/ValueExprParser.h"
 
@@ -508,16 +512,101 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
   return pool.make<luxir::MinScoreQuery>(rescored, *rescoreQuery.min_score);
 }
 
+namespace {
+
+// '*' matches any run of characters, as in Elasticsearch field patterns.
+bool globMatch(std::string_view pattern, std::string_view name) {
+  size_t p = 0, n = 0, star = std::string_view::npos, resume = 0;
+  while (n < name.size()) {
+    if (p < pattern.size() && pattern[p] == '*') {
+      star = p++;
+      resume = n;
+    } else if (p < pattern.size() && pattern[p] == name[n]) {
+      p++;
+      n++;
+    } else if (star != std::string_view::npos) {
+      p = star + 1;
+      n = ++resume;
+    } else {
+      return false;
+    }
+  }
+  while (p < pattern.size() && pattern[p] == '*') p++;
+  return p == pattern.size();
+}
+
+// Field names a wildcard can select: the schema's concrete fields and the
+// reader's indexed fields, without engine names ('_' prefix) and variant
+// representations ("__" separator), sorted and unique.
+std::vector<std::string> wildcardCandidates(const Schema& schema, IndexReader* reader) {
+  std::vector<std::string> names;
+  auto keep = [](std::string_view name) {
+    return !name.empty() && name[0] != '_' && name.find("__") == std::string_view::npos;
+  };
+  for (const auto& entry : schema.fieldTypeMap) {
+    if (keep(entry.first)) names.push_back(entry.first);
+  }
+  if (reader != nullptr) {
+    for (auto& segment : reader->segments()) {
+      auto& postings = segment.postingsReader();
+      for (int32_t ord = 0; ord < postings.numFields(); ord++) {
+        const auto* info = postings.fieldInfo(ord);
+        if (info == nullptr || info->nTerms == 0) continue;
+        std::string_view name = (std::string_view)info->fieldname;
+        if (keep(name)) names.emplace_back(name);
+      }
+    }
+  }
+  std::sort(names.begin(), names.end());
+  names.erase(std::unique(names.begin(), names.end()), names.end());
+  return names;
+}
+
+QueryBuilder::Operator builderOperator(luxir::api::Match_::Operator op) {
+  return op == luxir::api::Match_::Operator::AND ? QueryBuilder::Operator::AND
+                                                  : QueryBuilder::Operator::OR;
+}
+
+float tieBreakerOf(std::optional<float> tieBreaker, std::string_view label,
+                   float defaultValue = 0.0f) {
+  float value = tieBreaker.value_or(defaultValue);
+  if (!std::isfinite(value) || value < 0.0f || value > 1.0f) {
+    throw std::runtime_error(std::format(
+        "{} 'tie_breaker' must be in [0, 1] (got {})", label, value));
+  }
+  return value;
+}
+
+// Cap on multi_match max_expansions: each expansion is a phrase clause.
+constexpr int32_t MAX_PREFIX_EXPANSIONS = 1024;
+
+} // namespace
+
 luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQuery& query) {
+  using Mode = luxir::api::MultiMatchQuery_::Mode;
   if (query.min_match < 0) {
     throw std::runtime_error("multi_match 'min_match' must not be negative");
   }
+  if (query.slop < 0) {
+    throw std::runtime_error("multi_match 'slop' must not be negative");
+  }
+  if (query.max_expansions < 0 || query.max_expansions > MAX_PREFIX_EXPANSIONS) {
+    throw std::runtime_error(std::format(
+        "multi_match 'max_expansions' must be in [0, {}] (got {})",
+        MAX_PREFIX_EXPANSIONS, query.max_expansions));
+  }
+  bool phrase = query.mode == Mode::PHRASE || query.mode == Mode::PHRASE_PREFIX;
+  if (query.slop > 0 && !phrase) {
+    throw std::runtime_error("multi_match 'slop' applies only to modes phrase and phrase_prefix");
+  }
+  float defaultTie = query.mode == Mode::COMBINED || query.mode == Mode::PER_FIELD ? 1.0f : 0.0f;
+  float tieBreaker = tieBreakerOf(query.tie_breaker, "multi_match", defaultTie);
   if (query.fields.empty()) {
     throw std::runtime_error("multi_match requires a non-empty 'fields' list");
   }
-  auto fields = pool.make_span<QueryBuilder::WeightedField>(query.fields.size());
-  for (size_t i = 0; i < query.fields.size(); i++) {
-    const auto& field = query.fields[i];
+  std::vector<QueryBuilder::WeightedField> fields;
+  std::optional<std::vector<std::string>> candidates;
+  for (const auto& field : query.fields) {
     float weight = field.weight.value_or(1.0f);
     if (field.field.empty()) {
       throw std::runtime_error("multi_match: empty field name");
@@ -527,19 +616,50 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
           "multi_match: weight of field '{}' must be finite and > 0 (got {})",
           field.field, weight));
     }
-    fields[i] = {field.field, weight};
+    if (field.field.find('*') == std::string_view::npos) {
+      fields.push_back({field.field, weight});
+      continue;
+    }
+    if (!candidates) candidates = wildcardCandidates(schema, context.reader);
+    for (const auto& name : *candidates) {
+      if (!globMatch(field.field, name)) continue;
+      FieldType::Type type;
+      try {
+        type = context.fields.resolve(name, OpClass::SEARCH).fieldType->type();
+      } catch (const std::exception&) {
+        continue;  // no search binding
+      }
+      if (type != FieldType::TEXT && type != FieldType::STRING) continue;
+      char* copy = pool.alloc(name.size());
+      memcpy(copy, name.data(), name.size());
+      fields.push_back({std::string_view(copy, name.size()), weight});
+    }
   }
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
-  auto op = query.operator_ == luxir::api::Match_::Operator::AND
-      ? QueryBuilder::Operator::AND : QueryBuilder::Operator::OR;
+  auto op = builderOperator(query.operator_);
   switch (query.mode) {
-    case luxir::api::MultiMatchQuery_::Mode::COMBINED:
-      return builder.createMultiMatchCombined(fields, query.text, op, query.min_match);
-    case luxir::api::MultiMatchQuery_::Mode::PER_FIELD:
-      return builder.createMultiMatchPerField(fields, query.text, op, query.min_match);
+    case Mode::COMBINED:
+      return builder.createMultiMatchCombined(fields, query.text, op, query.min_match, tieBreaker);
+    case Mode::PER_FIELD:
+      return builder.createMultiMatchPerField(fields, query.text, op, query.min_match, tieBreaker);
+    case Mode::PHRASE:
+      return builder.createMultiPhraseQuery(fields, query.text, query.slop, tieBreaker);
+    case Mode::PHRASE_PREFIX:
+      return builder.createMultiPhrasePrefixQuery(
+          fields, query.text, query.slop, query.max_expansions, tieBreaker);
+    case Mode::BOOL_PREFIX:
+      return builder.createMultiBoolPrefixQuery(fields, query.text, op, query.min_match);
   }
   throw std::runtime_error(std::format("multi_match: unknown mode {}", (int)query.mode));
+}
+
+luxir::Query* ProtobufQueryParser::parseDisMax(const luxir::api::DisMaxQuery& query) {
+  if (query.queries.empty()) {
+    throw std::runtime_error("dis_max requires a non-empty 'queries' list");
+  }
+  float tieBreaker = tieBreakerOf(query.tie_breaker, "dis_max");
+  return luxir::DisMaxQuery::make(pool, parseQueryList(query.queries), tieBreaker);
 }
 
 luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
@@ -573,6 +693,7 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
       return parseRescore(r);
     },
     [&](const luxir::api::MultiMatchQuery& m) -> luxir::Query* { return parseMultiMatch(m); },
+    [&](const luxir::api::DisMaxQuery& d) -> luxir::Query* { return parseDisMax(d); },
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);
