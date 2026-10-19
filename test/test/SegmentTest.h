@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/reader/FieldReader.h"
 #include <tuple>
 #include "luxir/index/PostingsWriter.h"
 #include "luxir/reader/DocsEnum.h"
@@ -123,7 +124,11 @@ public:
   SegFieldInfo fieldInfo;
   void makeTermsEnum() {
     fieldReader->readFieldInfo(fieldInfo);
-    tenum = std::make_unique<TermsEnum>(pool, *reader, fieldInfo);
+    makeTermsEnum(fieldInfo);
+  }
+
+  void makeTermsEnum(const SegFieldInfo& info) {
+    tenum = std::make_unique<TermsEnum>(pool, *reader, info);
   }
 
   uint32_t getPositionDelta(int nPositions) {

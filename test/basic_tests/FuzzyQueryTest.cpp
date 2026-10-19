@@ -12,7 +12,7 @@
 #include "test/TestIndex.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/QueryBuilder.h"
 #include "luxir/reader/Postings.h"

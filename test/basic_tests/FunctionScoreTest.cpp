@@ -59,7 +59,9 @@ protected:
 
   // One value per doc a, b, c; nullopt for missing.
   std::vector<std::optional<double>> eval(std::string_view expression) {
-    BoundValueProgram* bound = parse(expression)->bind(pool, reader->segments()[0]);
+    auto program = parse(expression);
+    BoundValueProgram* bound = program->bind(pool, reader->segments()[0],
+                                             program->resolveFields(pool, *reader));
     std::vector<std::optional<double>> out;
     for (int32_t doc = 0; doc < 3; doc++) {
       ValueResult r = bound->evalPoint(doc, 0.0f);
@@ -181,7 +183,9 @@ TEST_F(FunctionScoreTest, decayFunctionsMatchElasticsearch) {
   expectValues("geo_distance(loc_p, 0, 0)", {meters, std::nullopt, std::nullopt});
 
   // Decays are provably within (0, 1] for pruning.
-  BoundValueProgram* bound = parse("gauss(v_d, 100, 50)")->bind(pool, reader->segments()[0]);
+  auto program = parse("gauss(v_d, 100, 50)");
+  BoundValueProgram* bound = program->bind(pool, reader->segments()[0],
+                                           program->resolveFields(pool, *reader));
   const ValueBounds& bounds = bound->bounds(bound->program.rootNode);
   EXPECT_EQ(BoundsCertainty::BOUNDED, bounds.certainty);
   EXPECT_GE(bounds.doubleMin, 0.0);

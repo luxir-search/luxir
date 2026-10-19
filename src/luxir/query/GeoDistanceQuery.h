@@ -21,6 +21,8 @@ class GeoDistanceQuery final : public Query {
   double radiusMeters;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static constexpr std::string_view QUERY_NAME = "GeoDistanceQuery";
   using Weight = GeoQueryWeight<GeoDistanceQuery, BKDDistanceRelation>;
 
@@ -75,10 +77,7 @@ public:
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags,
-                              float multiplier = 1.0f) override {
-    float score = constantWhenScored(flags, multiplier);
-    return context.pool.make<Weight>(context, *this, flags, score);
-  }
+                              float multiplier = 1.0f) override;
 };
 
 } // namespace luxir

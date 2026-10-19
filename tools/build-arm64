@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+repo_dir=$(cd "$(dirname "$0")/.." && pwd)
+cd "$repo_dir"
+if [[ $(uname -sm) != 'Linux x86_64' ]]; then
+    echo 'This cross-build workflow requires a Linux x86-64 host.' >&2
+    exit 1
+fi
+export CXX=${CXX:-g++-16}
+export VCPKG_MAX_CONCURRENCY=${LUXIR_BUILD_JOBS:-12}
+export VCPKG_DISABLE_METRICS=1
+export VCPKG_DOWNLOADS="$repo_dir/build/arm64-vcpkg/downloads"
+export VCPKG_BINARY_SOURCES="clear;files,$repo_dir/build/arm64-vcpkg-cache,readwrite"
+export LUXIR_ARM64_TOOLCHAIN="$repo_dir/build/arm64-toolchain/compiler/gcc-16.1.0/aarch64-unknown-linux-gnu"
+export LUXIR_ARM64_SYSROOT="$LUXIR_ARM64_TOOLCHAIN/aarch64-unknown-linux-gnu/sysroot"
+logs="$repo_dir/build/arm64-logs"
+vcpkg="$repo_dir/build/arm64-vcpkg-src"
+mkdir -p "$logs" "$VCPKG_DOWNLOADS" build/arm64-vcpkg-cache build/arm64-host-tools
+
+stage() {
+    local name=$1
+    shift
+    echo "$name (log: $logs/$name.log)"
+    if ! "$@" > "$logs/$name.log" 2>&1; then
+        tail -100 "$logs/$name.log" >&2
+        return 1
+    fi
+    grep -n 'warning:' "$logs/$name.log" || true
+}
+
+stage toolchain bash tools/setup-arm64-toolchain
+stage runtime-check "$LUXIR_ARM64_TOOLCHAIN/bin/aarch64-unknown-linux-gnu-g++" \
+    --sysroot="$LUXIR_ARM64_SYSROOT" -march=armv8-a -std=c++26 -O2 -fopenmp -pthread \
+    -static-libstdc++ -static-libgcc -Wl,--as-needed .devcontainer/check-toolchain.cpp \
+    "$LUXIR_ARM64_TOOLCHAIN/aarch64-unknown-linux-gnu/lib64/libgomp.a" \
+    -o build/arm64-toolchain/check-runtime
+qemu=${LUXIR_QEMU_AARCH64:-$(command -v qemu-aarch64 || true)}
+if [[ -n $qemu ]]; then
+    stage runtime-execute env OMP_NUM_THREADS=2 "$qemu" -cpu cortex-a53 \
+        -L "$LUXIR_ARM64_SYSROOT" build/arm64-toolchain/check-runtime
+fi
+revision=$(python3 -c 'import json; print(json.load(open("deps/vcpkg.json"))["builtin-baseline"])')
+if [[ ! -d $vcpkg/.git ]]; then
+    git init "$vcpkg"
+    git -C "$vcpkg" remote add origin https://github.com/microsoft/vcpkg.git
+    git -C "$vcpkg" fetch --depth 1 origin "$revision"
+    git -C "$vcpkg" checkout --detach FETCH_HEAD
+fi
+if [[ $(git -C "$vcpkg" rev-parse HEAD) != "$revision" ]]; then
+    echo "The ARM64 vcpkg checkout must be at $revision." >&2
+    exit 1
+fi
+if [[ ! -x $vcpkg/vcpkg ]]; then
+    stage bootstrap "$vcpkg/bootstrap-vcpkg.sh" -disableMetrics
+fi
+stage sources ./deps/fetch_sources.sh
+# Make-based ports preserve CC/CXX from the environment, even when CMake has
+# selected the cross compiler. Let vcpkg supply each triplet's compiler.
+stage dependencies env -u CC -u CXX "$vcpkg/vcpkg" install --x-manifest-root="$repo_dir/deps" \
+    --x-install-root="$repo_dir/build/arm64-deps" --triplet=arm64-linux-luxir \
+    --host-triplet=x64-linux-luxir-host --x-feature=jemalloc \
+    --clean-buildtrees-after-build --clean-packages-after-build
+stage lapack-check "$LUXIR_ARM64_TOOLCHAIN/bin/aarch64-unknown-linux-gnu-g++" \
+    --sysroot="$LUXIR_ARM64_SYSROOT" -march=armv8-a -std=c++26 -O2 -pthread \
+    -static-libstdc++ -static-libgcc .devcontainer/check-lapack.cpp \
+    build/arm64-deps/arm64-linux-luxir/lib/libopenblas.a -lm \
+    -o build/arm64-toolchain/check-lapack
+if [[ -n $qemu ]]; then
+    stage lapack-execute env OPENBLAS_NUM_THREADS=2 "$qemu" -cpu cortex-a53 \
+        -L "$LUXIR_ARM64_SYSROOT" build/arm64-toolchain/check-lapack
+fi
+stage generator "$CXX" -std=c++26 -O2 -g0 -pthread \
+    -Ideps/hpp-proto/include -Ideps/is_utf8/include \
+    deps/hpp-proto/src/protoc-plugin/hpp_gen.cpp deps/is_utf8/src/is_utf8.cpp \
+    -o build/arm64-host-tools/protoc-gen-hpp
+# Use the same CMake that the pinned vcpkg revision downloads. Older distro
+# CMake releases recognize CXX26 but do not know GCC's flag for it.
+cmake_bin=${LUXIR_CMAKE:-"$VCPKG_DOWNLOADS/tools/cmake-4.4.3-linux/cmake-4.4.3-linux-x86_64/bin/cmake"}
+# CMake caches the compiler path independently of the toolchain environment.
+# Reset configuration when running this workflow so toolchain changes take effect.
+stage configure "$cmake_bin" --fresh --preset arm64-release -DLUXIR_COMPILE_JOBS="$VCPKG_MAX_CONCURRENCY"
+stage build "$cmake_bin" --build --preset arm64-release
+if [[ -n $qemu ]]; then
+    stage binary-execute "$qemu" -cpu cortex-a53 -L "$LUXIR_ARM64_SYSROOT" \
+        build/arm64-release/bin/luxir --version
+fi
+echo "ARM64 executable: $repo_dir/build/arm64-release/bin/luxir"

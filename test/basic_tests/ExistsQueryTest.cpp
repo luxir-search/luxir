@@ -13,7 +13,7 @@
 #include "luxir/query/AllQuery.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ExistsQuery.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/schema/Schema.h"
 #include "test/CollectionHelper.h"
@@ -80,10 +80,10 @@ std::vector<std::string> expectedIds(
 SegFieldInfo readFieldInfo(IndexReader::Segment& segment,
                            std::string_view field) {
   MemPool pool;
-  FieldReader reader(segment.postingsReader());
-  if (!reader.seek(field)) throw std::runtime_error("missing test field");
+  auto* reader = segment.postingsReader().fieldInfo(field);
+  if (!(reader != nullptr)) throw std::runtime_error("missing test field");
   SegFieldInfo info{};
-  reader.readFieldInfo(info);
+  info = *reader;
   return info;
 }
 
@@ -294,7 +294,7 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
   auto* sparseSupplier = sparseWeight->scorerSupplier(pool, segment);
   ASSERT_NE(nullptr, sparseSupplier);
   EXPECT_EQ(2, sparseSupplier->cost());
-  EXPECT_EQ(2, sparseWeight->count(segment));
+  EXPECT_EQ(2, countForTests(sparseWeight, segment));
   auto* sparseScorer = buildScorerForTests(
       pool, *sparseSupplier, segment.maxDoc());
   ASSERT_NE(nullptr, sparseScorer);
@@ -347,7 +347,7 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
   Query::Context deletedContext(deletedPool, *deletedReader);
   ExistsQuery deletedQuery("body_w");
   auto* deletedWeight = deletedQuery.createWeight(deletedContext, 0);
-  EXPECT_EQ(-1, deletedWeight->count(deletedReader->segments()[0]));
+  EXPECT_EQ(-1, countForTests(deletedWeight, deletedReader->segments()[0]));
 
   auto deletedReq = localReq(helper.getSearchEngine());
   deletedReq->collection("main").topDocs("q").existsQuery("body_w")

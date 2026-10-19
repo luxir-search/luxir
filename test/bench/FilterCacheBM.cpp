@@ -4,7 +4,9 @@
 #include <benchmark/benchmark.h>
 
 #include <array>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -98,6 +100,57 @@ void BM_FilterCacheKeyBuild(benchmark::State& state, size_t clauseCount) {
     benchmark::DoNotOptimize(key->hash());
   }
   state.SetItemsProcessed((int64_t)state.iterations() * (int64_t)clauseCount);
+}
+
+// A search-shaped pure-hit workload: every request opens one UseRegistry over
+// a many-segment reader and probes each of its filters on every segment, all
+// of which are resident. Run with several threads to expose per-hit shared
+// writes (epoch, counters, recency) and per-Use allocation.
+struct ConcurrentHitFixture {
+  static constexpr size_t SEGMENTS = 30;
+  static constexpr size_t FILTERS = 3;
+  static constexpr int32_t MAX_DOC = 4096;
+
+  FilterCache cache{cacheConfig()};
+  std::vector<FilterCache::SegmentIdentity> segments;
+  std::vector<FilterKey> keys;
+
+  ConcurrentHitFixture() {
+    for (size_t i = 0; i < SEGMENTS; i++) {
+      segments.push_back({(uint64_t)(i + 1), MAX_DOC});
+    }
+    cache.onReaderPublished(1, segments);
+    for (size_t f = 0; f < FILTERS; f++) {
+      keys.emplace_back("concurrent-hit-" + std::to_string(f));
+      FilterCache::UseRegistry request(cache, 1, segments);
+      auto* use = request.get(keys.back());
+      for (size_t i = 0; i < SEGMENTS; i++) {
+        auto probe = use->probe(i);
+        use->publishRaw(i, probe, denseDocs(MAX_DOC), 1);
+      }
+    }
+    // Population probes count as misses; the timed loop must see none.
+    cache.resetCounters();
+  }
+};
+
+void BM_FilterCacheHitConcurrent(benchmark::State& state) {
+  static ConcurrentHitFixture fixture;
+  for (auto _ : state) {
+    FilterCache::UseRegistry request(fixture.cache, 1, fixture.segments);
+    for (const auto& key : fixture.keys) {
+      auto* use = request.get(key);
+      for (size_t i = 0; i < fixture.segments.size(); i++) {
+        auto probe = use->probe(i);
+        benchmark::DoNotOptimize(probe.docSet());
+      }
+    }
+  }
+  if (state.thread_index() == 0
+      && fixture.cache.counters().misses != 0) {
+    state.SkipWithError("concurrent hit benchmark observed a miss");
+  }
+  state.SetItemsProcessed((int64_t)state.iterations());
 }
 
 void BM_FilterCacheBeginUseHot(benchmark::State& state, size_t clauseCount) {
@@ -221,6 +274,60 @@ void BM_FilterCachePublishDense(benchmark::State& state) {
   state.SetItemsProcessed((int64_t)state.iterations());
 }
 
+// One hot key resident on 24 live segments after `merges` publications that
+// each merged away the oldest segment. A request's cost must not grow with
+// the entry's segment history.
+struct AgedFixture {
+  static constexpr int32_t SEGMENTS = 24;
+  static constexpr int32_t MAX_DOC = 4096;
+
+  FilterCache cache{cacheConfig()};
+  FilterKey key{"aged"};
+  std::vector<FilterCache::SegmentIdentity> segments;
+  uint64_t gen = 0;
+
+  explicit AgedFixture(int32_t merges) {
+    for (int32_t round = 0; round <= merges; round++) {
+      gen++;
+      segments.clear();
+      for (int32_t s = 0; s < SEGMENTS; s++) {
+        segments.push_back({(uint64_t)(round + s + 1), MAX_DOC});
+      }
+      cache.onReaderPublished(gen, segments);
+      FilterCache::UseRegistry request(cache, gen, segments);
+      auto* use = request.get(key);
+      for (size_t i = 0; i < segments.size(); i++) {
+        auto probe = use->probe(i);
+        if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+          use->publishRaw(i, probe, denseDocs(MAX_DOC), 1);
+        }
+      }
+    }
+  }
+};
+
+void BM_FilterCacheAgedHit(benchmark::State& state, int32_t merges) {
+  static std::mutex mutex;
+  static std::map<int32_t, std::unique_ptr<AgedFixture>> fixtures;
+  AgedFixture* fixture;
+  {
+    std::lock_guard lock(mutex);
+    auto& slot = fixtures[merges];
+    if (slot == nullptr) slot = std::make_unique<AgedFixture>(merges);
+    fixture = slot.get();
+  }
+  for (auto _ : state) {
+    FilterCache::UseRegistry request(fixture->cache, fixture->gen,
+                                     fixture->segments);
+    auto* use = request.get(fixture->key);
+    for (size_t i = 0; i < fixture->segments.size(); i++) {
+      auto probe = use->probe(i);
+      benchmark::DoNotOptimize(probe.docSet());
+    }
+  }
+  state.SetItemsProcessed((int64_t)state.iterations());
+}
+
 } // namespace
 
 LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheKeyBuild, term, 1);
@@ -233,8 +340,16 @@ LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheBeginUseHot, boolean_10k, 10'000);
 
 LUXIR_BENCHMARK(BM_FilterCacheProbePin);
 
+LUXIR_BENCHMARK(BM_FilterCacheHitConcurrent)
+    ->Threads(1)->Threads(8)->Threads(16)->ThreadPerCpu();
+
 BENCHMARK_CAPTURE(BM_FilterCacheEffectiveDocSet, raw_serve, false)
     ->UseManualTime()->Iterations(100);
 BENCHMARK_CAPTURE(BM_FilterCacheEffectiveDocSet, live_docs_and, true)
     ->UseManualTime()->Iterations(100);
 BENCHMARK(BM_FilterCachePublishDense)->UseManualTime()->Iterations(100);
+
+LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheAgedHit, fresh, 0)
+    ->Threads(1)->Threads(8);
+LUXIR_BENCHMARK_CAPTURE(BM_FilterCacheAgedHit, merged_2000, 2000)
+    ->Threads(1)->Threads(8);

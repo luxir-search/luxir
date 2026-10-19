@@ -26,6 +26,7 @@
 #include "luxir/schema/FieldType.h"
 #include "test/LuxirTest.h"
 #include "test/TestData.h"
+#include "bench/ScientificText.h"
 
 using namespace luxir;
 
@@ -355,6 +356,7 @@ TEST_F(AnalysisTest, analyzerOutlivesDefinition) {
     analyzer = Analyzer::compile(def);
   }
   EXPECT_TRUE(analyzer->fusedHead);
+  EXPECT_TRUE(analyzer->fusedFold);
   EXPECT_EQ("unicode_word", analyzer->tokenizer->name);
   ASSERT_EQ(2u, analyzer->filters.size());
   EXPECT_EQ("fold", analyzer->filters[1]->name);
@@ -759,18 +761,26 @@ namespace {
 // and the fused StandardTokenizer (region dispatch + ASCII DFA + bulk
 // lowercase), and return both term lists for `v`. The fast paths are correct
 // iff these are always identical.
-std::pair<std::vector<std::string>, std::vector<std::string>> composedVsFused(std::string_view v) {
+std::pair<std::vector<std::string>, std::vector<std::string>> composedVsFused(std::string_view v,
+                                                                             bool fold = false) {
   auto t1 = makeUnicodeWordTokenizer();
   Tokenizer& h1 = *t1;
   std::unique_ptr<TokenStream> composedTail = makeNfkcCasefoldFilter(std::move(t1));
+  if (fold) composedTail = makeAccentFoldFilter(std::move(composedTail));
   TokenChain composed(h1, std::move(composedTail), true);
 
-  auto t2 = makeStandardTokenizer();
+  auto t2 = makeStandardTokenizer(fold);
   Tokenizer& h2 = *t2;
   std::unique_ptr<TokenStream> fusedTail = std::move(t2);
   TokenChain fused(h2, std::move(fusedTail), true);
 
-  return {analyze(composed, v).terms, analyze(fused, v).terms};
+  Analysis a = analyze(composed, v);
+  Analysis b = analyze(fused, v);
+  // Positions and offsets must match too, not just the terms.
+  EXPECT_EQ(a.positions, b.positions) << v;
+  EXPECT_EQ(a.starts, b.starts) << v;
+  EXPECT_EQ(a.ends, b.ends) << v;
+  return {a.terms, b.terms};
 }
 }  // namespace
 
@@ -802,8 +812,10 @@ TEST_F(AnalysisTest, standardFusionAdversarialEquivalence) {
       "",
   };
   for (std::string_view v : cases) {
-    auto [composed, fused] = composedVsFused(v);
-    EXPECT_EQ(composed, fused) << "mismatch on: " << v;
+    for (bool fold : {false, true}) {
+      auto [composed, fused] = composedVsFused(v, fold);
+      EXPECT_EQ(composed, fused) << "fold=" << fold << " mismatch on: " << v;
+    }
   }
 }
 
@@ -827,8 +839,10 @@ TEST_F(AnalysisTest, standardFusionMatchesComposedOnWordBreakCorpus) {
     }
     if (input.empty()) continue;
     ++total;
-    auto [composed, fused] = composedVsFused(input);
-    ASSERT_EQ(composed, fused) << "WordBreakTest input: " << l;
+    for (bool fold : {false, true}) {
+      auto [composed, fused] = composedVsFused(input, fold);
+      ASSERT_EQ(composed, fused) << "fold=" << fold << " WordBreakTest input: " << l;
+    }
   }
   RecordProperty("wordbreak_equivalence_lines", total);
 }
@@ -850,8 +864,44 @@ TEST_F(AnalysisTest, standardFusionRandomizedEquivalence) {
     std::string v;
     int n = (int) rng.rint(40);
     for (int i = 0; i < n; i++) v += atoms[rng.rint(natoms)];
-    auto [composed, fused] = composedVsFused(v);
-    ASSERT_EQ(composed, fused) << "value: " << v;
+    for (bool fold : {false, true}) {
+      auto [composed, fused] = composedVsFused(v, fold);
+      ASSERT_EQ(composed, fused) << "fold=" << fold << " value: " << v;
+    }
+  }
+}
+
+// Synthetic scientific article text (the production shape: long, mostly
+// ASCII values with sparse non-ASCII) through both chains. Long values make the
+// fused tokenizer hand big multi-word ASCII spans to the DFA between
+// non-ASCII regions.
+TEST_F(AnalysisTest, standardFusionMatchesComposedOnScientificText) {
+  for (uint64_t seed = 1; seed <= 6; seed++) {
+    std::string v = scientificText(8 * 1024, seed);
+    for (bool fold : {false, true}) {
+      auto [composed, fused] = composedVsFused(v, fold);
+      ASSERT_EQ(composed, fused) << "fold=" << fold << " seed " << seed;
+    }
+  }
+}
+
+// One non-ASCII character planted at every offset of a long ASCII value full
+// of whitespace kinds and mid chars, so the region split before it lands at
+// every distance from the SIMD scan's block boundaries and from whitespace.
+TEST_F(AnalysisTest, standardFusionNonAsciiAtEveryOffset) {
+  std::string ascii;
+  while (ascii.size() < 100) ascii += "Ab c\td.e 1,2\n x:y  _z o'k\r\nFoO ";
+  for (std::string_view planted : {"\u00e9", "\u00a0", "\u0301", "\u2019", "\u00df", "\u0130",
+                                   "\uFB01", "\uFF21", "\u200d", "\xff"}) {
+    for (size_t pos = 0; pos <= ascii.size(); pos++) {
+      std::string v = ascii.substr(0, pos);
+      v += planted;
+      v += ascii.substr(pos);
+      for (bool fold : {false, true}) {
+        auto [composed, fused] = composedVsFused(v, fold);
+        ASSERT_EQ(composed, fused) << "fold=" << fold << " pos " << pos << " value: " << v;
+      }
+    }
   }
 }
 

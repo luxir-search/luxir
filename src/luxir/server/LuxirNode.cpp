@@ -5,8 +5,10 @@
 #include "CommitWaits.h"
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
+#include "Scrubber.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/log.h"
+#include "oneapi/tbb/global_control.h"
 
 namespace luxir {
 
@@ -16,6 +18,31 @@ namespace luxir {
 static int reservedArenaSlots(const LuxirConfig& config) {
   const auto& server = config.server;
   return (server.http.enabled ? server.http.resolveThreads() : 0) + server.grpc.resolveThreads() + 1;
+}
+
+// TBB's global pool lends at most max_allowed_parallelism - 1 workers to all
+// arenas, and that defaults to the affinity width: one CPU is kept for a
+// master thread, as in a default arena.  Arena slots past it stay empty, so a
+// node whose workers fill every CPU (the small-node default) would still get
+// one fewer.  Raise the pool to the widest node's workers.  It is never
+// lowered: each arena caps its own concurrency, and a global_control lowers
+// the limit for every arena in the process (the smallest active value wins),
+// so a narrow node must not starve a wider one.  The high-water mark is kept
+// here rather than read from active_value(), which also reflects controls this
+// function does not own.  Leaked on purpose: a static would be destroyed after
+// the TBB runtime may have shut down.
+static void ensureWorkerPool(int workers) {
+  using oneapi::tbb::global_control;
+  static std::mutex mutex;
+  static global_control* control = nullptr;
+  static std::size_t raised = (std::size_t)std::max(1, oneapi::tbb::info::default_concurrency());
+  std::lock_guard<std::mutex> lock(mutex);
+  std::size_t wanted = (std::size_t)workers + 1;
+  if (wanted <= raised) return;
+  auto* next = new global_control(global_control::max_allowed_parallelism, wanted);
+  delete control;  // the smaller limit holds until here
+  control = next;
+  raised = wanted;
 }
 
 LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view server)
@@ -28,10 +55,13 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
   }
 }
 
-LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
-  : config(std::move(config)), reservedSlots(reservedArenaSlots(this->config)),
-    taskArena(std::max(1, oneapi::tbb::info::default_concurrency() - 1) + reservedSlots, reservedSlots,
-              oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast) {
+LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
+  : config(std::move(config)), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
+    reservedSlots(reservedArenaSlots(this->config)),
+    taskArena(workers + reservedSlots, reservedSlots,
+              oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
+    indexArena(workers + 1, 1, oneapi::tbb::task_arena::priority::low) {
+  ensureWorkerPool(workers + 1);
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers
@@ -40,8 +70,8 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   auto& replicationConfig = this->config.replication;
   replicationConfig.validate();
   replication = std::make_shared<ReplicationSource>(std::chrono::milliseconds(
-      replicationConfig.follower_timeout_ms), ReplicationSource::Clock::now, replicationConfig.max_acknowledgments);
-  commitWaits = std::make_shared<CommitWaits>(*replication, following());
+      replicationConfig.follower_timeout_ms), this->clock, replicationConfig.max_acknowledgments);
+  commitWaits = std::make_shared<CommitWaits>(*replication, following(), this->clock);
   replication->onAcknowledgmentsChanged([weak = std::weak_ptr(commitWaits)](const CollectionId* id) {
     if (auto waits = weak.lock()) waits->acknowledged(id);
   });
@@ -64,7 +94,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
   events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
-  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget);
+  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget, indexArena, metrics);
 
   if (following()) {
     // The follower first checks that it owns the data directory.
@@ -80,10 +110,13 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode)
     collections_->open(this->config.read_only ? Collections::Role::READ_ONLY : Collections::Role::WRITER);
   }
   searchEngine = std::make_unique<SearchEngine>(*this);
+  scrubber = std::make_unique<Scrubber>(*this);
+  if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
 }
 
 LuxirNode::~LuxirNode() {
+  scrubber->stop();
   if (follower) follower->stop();
   commitWaits->close();
 }

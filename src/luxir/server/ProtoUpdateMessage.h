@@ -114,6 +114,18 @@ public:
     return rsp;
   }
 
+  std::span<const DocError> docErrors() const { return errors_.finish(); }
+  // The kind of a failed update (status ERROR): its own error, else its first
+  // document's (an all_or_none rollback or every document rejected).
+  static ErrorKind failureKind(const ResponseProto& response) {
+    if (response.error) return (ErrorKind)response.error->kind;
+    for (const auto& doc : response.errors) {
+      if (doc.error) return (ErrorKind)doc.error->kind;
+    }
+    return ErrorKind::INVALID_REQUEST;
+  }
+  bool metricFailed() const { return response && response->status == ResponseStatus::ERROR; }
+
   // This owns only response data and a copied wait specification. The transport
   // releases its request and message before starting the replica wait.
   struct Completion : std::enable_shared_from_this<Completion> {

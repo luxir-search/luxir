@@ -201,8 +201,8 @@ the result list is narrowed to one. Names must be distinct, nonempty keys in
 that map. Routing is supported by both JSON and protobuf; Fusion filters and
 Fusion source filters do not accept `except_ops`.
 
-An operation directly in `SearchRequest.ops` or `TopDocs.ops` may also set a
-`domain`:
+An operation in `SearchRequest.ops`, `TopDocs.ops`, or a bucket's `ops` may
+also set a `domain`:
 
 ```json
 "brands": {
@@ -214,11 +214,14 @@ An operation directly in `SearchRequest.ops` or `TopDocs.ops` may also set a
 `domain.query` replaces the incoming document set with that query's matches
 across the collection. Without it, the operation inherits its incoming set.
 `domain.filter` adds local constraints in either case. With a replacement
-query, `apply_parent_filters: true` reapplies the immediate parent's filters,
+query, `apply_parent_filters: true` reapplies the owning list's filters,
 including facet selections, while respecting `except_ops`. It defaults to
 false and requires `domain.query`; it does not restore the parent's query or
-ancestor domain. Domain overrides are not supported directly in `Fusion.ops`
-or beneath facet buckets.
+ancestor matching query. Beneath buckets, a reset preserves every enclosing
+bucket identity, including group key equality; see
+[bucket domain resets](faceting.md#bucket-domain-resets). Domain overrides
+are not supported directly in `Fusion.ops`. Selection queries in enclosing
+query-facet buckets are re-evaluated in the reset scope, outer to inner.
 
 ## Phrase
 
@@ -385,6 +388,7 @@ expression:
 | `query` | The child query. Its matches are the rescored set. Required. |
 | `expr` | A numeric value expression; `score` is the child's score and column names read the document's values. Required. |
 | `vars` | Scalar values for `$name` references in `expr`. |
+| `min_score` | Optional. Documents whose rescored value is below it do not match. |
 
 The expression uses the same value-expression language as sorting (arithmetic,
 `def`, math such as `exp` and `pow`, comparisons and `?:` conditionals,
@@ -396,6 +400,13 @@ with `def()` or exclude them with an `exists()` clause in the child query.
 The expression form is
 `rescore(title_t:dune, expr=score * log1p(popularity_i))`, whose `$vars`
 bind from the surrounding expression's `vars` map.
+
+`min_score` is the counterpart of Elasticsearch's `function_score` and
+`script_score` `min_score`: it compares the expression output, before any
+enclosing `boost`, and removes the document from the match set, so it also
+applies when the rescore is a non-scoring filter. In the expression form:
+`rescore(title_t:dune, expr=log1p(popularity_i), min_score=2)`. Use
+`rescore(q, score, min_score=...)` for a cut-off on any query's own score.
 
 ## Simple query
 
@@ -454,7 +465,8 @@ Vector and geographic queries use the same `Query` node and are documented
 in their own guides:
 
 - [`knn`](vector-search.md) covers `field`, `query`, `k`, `refine_candidates`,
-  `exact`, and the per-engine `ivf` object (`nprobe`, `min_scan_fraction`).
+  `exact`, `similarity`, and the per-engine `ivf` object (`nprobe`,
+  `min_scan_fraction`).
 - [`geo_box` and `geo_distance`](geo-search.md) cover coordinate order,
   inclusive boundaries, dateline crossing, and distance units.
 

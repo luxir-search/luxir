@@ -847,6 +847,30 @@ TEST_F(GrpcIndexTest, unsafeCollectionNameIsInvalidArgument) {
   EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, delStatus.error_code()) << delStatus.error_message();
 }
 
+// The receive limit defaults to --indexing.max-request-body, well above gRPC's
+// own 4 MiB default; a message over it fails with RESOURCE_EXHAUSTED.
+TEST_F(GrpcIndexTest, maxReceiveMessageSize) {
+  auto update = [&](std::string_view id, size_t textBytes, size_t docs) {
+    CollectionHelper::UpdateBuilder b;
+    b.collection("grpc_msg_size");
+    std::string text(textBytes, 'x');
+    for (size_t i = 0; i < docs; i++) {
+      b.add(flatdoc("id", std::format("{}{}", id, i), "body_s", text));
+    }
+    grpc::ClientContext context;
+    Reply<luxir::api::UpdateResponse> response;
+    return hppUnaryCall(channel.get(), rpc::Update, &context, b.finish(), &response);
+  };
+
+  auto ok = update("a", 1024, 6000);  // ~6 MiB
+  EXPECT_TRUE(ok.ok()) << ok.error_message();
+
+  size_t limit = (size_t)luxirNode->getConfig().ingest.max_request_body;
+  auto big = update("b", limit + 1, 1);
+  EXPECT_EQ(grpc::StatusCode::RESOURCE_EXHAUSTED, big.error_code());
+  EXPECT_NE(big.error_message().find(std::to_string(limit)), std::string::npos) << big.error_message();
+}
+
 TEST_F(GrpcIndexTest, addDocsStream) {
   // Setup request
   Reply<luxir::api::UpdateResponse> response;

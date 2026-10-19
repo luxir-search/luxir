@@ -385,7 +385,7 @@ public:
   };
 
   static void getValues(MemPool& pool, PostingsReader& postingsReader,
-                        SegFieldInfo& fieldInfo, std::ranges::input_range auto&& sortedIds,
+                        const SegFieldInfo& fieldInfo, std::ranges::input_range auto&& sortedIds,
                         auto&& callback) {
     unused(pool);
     OrdColReader reader(postingsReader, fieldInfo);
@@ -411,7 +411,7 @@ public:
   }
 
   static void getSingleValues(MemPool& pool, PostingsReader& postingsReader,
-                              SegFieldInfo& fieldInfo,
+                              const SegFieldInfo& fieldInfo,
                               std::ranges::input_range auto&& sortedIds,
                               auto&& callback) {
     unused(pool);
@@ -425,18 +425,7 @@ public:
     }
   }
 
-  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader,
-                              std::string_view field,
-                              std::ranges::input_range auto&& sortedIds,
-                              auto&& callback) {
-    FieldReader fieldReader(postingsReader);
-    if (!fieldReader.seek(field)) return;
-    SegFieldInfo fieldInfo;
-    fieldReader.readFieldInfo(fieldInfo);
-    getSingleValues(pool, postingsReader, fieldInfo,
-                    std::forward<decltype(sortedIds)>(sortedIds),
-                    std::forward<decltype(callback)>(callback));
-  }
+
 };
 
 } // namespace luxir

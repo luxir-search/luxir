@@ -18,7 +18,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/FilterCache.h"

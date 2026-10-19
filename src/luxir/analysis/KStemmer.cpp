@@ -1121,6 +1121,7 @@ std::string_view KStemmer::stemCandidate(std::string_view term) {
     auto root = entryRoot(entry);
     return root.empty() ? term : root;
   }
+  ++unknownRuns;
   return stemUnknown(term);
 }
 

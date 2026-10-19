@@ -12,7 +12,6 @@
 
 #include <fmt/format.h>
 
-#include "luxir/reader/FieldReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/geo.h"
@@ -1446,12 +1445,12 @@ std::string ValueFunctionRegistry::arrayReducerNames() {
 }
 
 BoundValueProgram* ValueProgram::bind(MemPool& pool,
-                                      IndexReader::Segment& segment) const {
-  return pool.make<BoundValueProgram>(pool, *this, segment);
+                                      IndexReader::Segment& segment, ValueFieldInfos fields) const {
+  return pool.make<BoundValueProgram>(pool, *this, segment, fields);
 }
 
 BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
-                                     IndexReader::Segment& segment)
+                                     IndexReader::Segment& segment, ValueFieldInfos fields)
     : program(program), segment(segment), postings(segment.postingsReader()),
       nodes(pool.make_span<BoundValueNode>(program.nodes.size())) {
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
@@ -1467,13 +1466,11 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                 : ValueBounds::integer(segment.base,
                                                        segment.base + maxDoc - 1);
     } else if (node.kind == ValueNodeKind::COLUMN) {
-      FieldReader fields(postings);
-      if (!fields.seek(node.text)) {
+      auto* fieldInfo = fields[index].at(segment);
+      if (!fieldInfo) {
         bound.bounds = ValueBounds::unbounded(node.type, true, true);
       } else {
-        SegFieldInfo info;
-        fields.readFieldInfo(info);
-        bound.column.emplace(postings, info);
+        bound.column.emplace(postings, *fieldInfo);
         bound.iterator.emplace(*bound.column);
         bound.bulkIterator.emplace(*bound.column);
         bool missing = bound.column->docsWithValue() < postings.maxDoc();

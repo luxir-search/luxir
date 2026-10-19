@@ -26,6 +26,8 @@ class GeoBoxQuery final : public Query {
   bool empty = false;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static constexpr std::string_view QUERY_NAME = "GeoBoxQuery";
   using Weight = GeoQueryWeight<GeoBoxQuery, BKDBoxRelation>;
 
@@ -98,10 +100,7 @@ public:
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags,
-                              float multiplier = 1.0f) override {
-    float score = constantWhenScored(flags, multiplier);
-    return context.pool.make<Weight>(context, *this, flags, score);
-  }
+                              float multiplier = 1.0f) override;
 };
 
 } // namespace luxir

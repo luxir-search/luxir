@@ -109,7 +109,8 @@ public:
   }
 
   /// Get the value at a given global value rank (0..numValues()-1).
-  std::string_view valueAt(int64_t valueRank) const {
+  // Keep fixed-size column access in scan loops independent of the TU inline budget.
+  LUXIR_INLINE std::string_view valueAt(int64_t valueRank) const {
     assert(valueRank >= 0 && valueRank < nvals);
     if (endOffsetReader) {
       auto [startOffset, endOffset] = endOffsetReader->valuesAt(valueRank);
@@ -253,7 +254,7 @@ public:
 
   /// Get string values for a sorted range of docids (single-valued fields).
   /// Calls callback(size_t input_index, int32_t docid, std::string_view value) for each docid that has a value.
-  static void getValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo,
+  static void getValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo,
                         std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
     StrColReader strColReader(postingsReader, segFieldInfo);
     StrColReader::Iterator iter(strColReader);
@@ -278,7 +279,7 @@ public:
   /// for each value of each docid that has values.  Within-doc value access goes through
   /// DocValues so consecutive values share a block decode.  The endValueRankReader is still
   /// accessed sparsely (once per matched doc), appropriate for top-K style callers.
-  static void getMultiValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo,
+  static void getMultiValues(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& segFieldInfo,
                              std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
     StrColReader strColReader(postingsReader, segFieldInfo);
     StrColReader::Iterator iter(strColReader);
@@ -303,19 +304,7 @@ public:
     }
   }
 
-  /// Get string values starting with a field name.
-  static void getValues(MemPool& pool, PostingsReader& postingsReader, std::string_view field,
-                        std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
-    FieldReader fieldReader(postingsReader);
-    bool found = fieldReader.seek(field);
-    if (!found) {
-      return;
-    }
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
 
-    getValues(pool, postingsReader, segFieldInfo, sortedDocIds, callback);
-  }
 };
 
 } // end namespace luxir

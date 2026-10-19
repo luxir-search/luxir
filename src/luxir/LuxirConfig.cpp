@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "LuxirConfig.h"
+#include <CLI/CLI.hpp>
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/server/Collections.h"
 #include <unistd.h>
@@ -93,6 +94,7 @@ void ReplicationConfig::validate() const {
   if (pin_idle_timeout_ms < 2 || follower_timeout_ms < 3) {
     throw std::invalid_argument("replication timeouts must be positive (at least 2/3 ms respectively)");
   }
+  if (retry_ms < 1) throw std::invalid_argument("replication.retry-ms must be positive");
 }
 
 void LuxirConfig::addOptions(CLI::App& app) {
@@ -124,6 +126,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.grpc.port", server.grpc.port, "gRPC listen port (default: HTTP port + 1)");
   app.add_option("--server.grpc.threads", server.grpc.threads, "Number of server threads (0 = auto)")
       ->default_val(server.grpc.threads);
+  app.add_option("--server.grpc.max-receive-message-size", server.grpc.max_receive_message_size,
+                 "Max received gRPC message; larger -> RESOURCE_EXHAUSTED (e.g. 64MB)")
+      ->transform(CLI::AsSizeValue(false))
+      ->check(CLI::NonNegativeNumber)
+      ->default_str("--indexing.max-request-body");
 
   app.add_flag("--server.http.enabled,!--no-http", server.http.enabled, "Enable the HTTP/JSON server")
       ->default_val(server.http.enabled);
@@ -133,6 +140,11 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--server.http.threads", server.http.threads,
                  "HTTP connection I/O shards (one thread each, plus one accept thread; 0 = auto)")
       ->default_val(server.http.threads);
+  app.add_option("--server.workers", server.workers,
+                 "Task-arena worker threads for indexing, merges and parallel search "
+                 "(0 = auto: all CPUs on nodes of up to 4, else all but one)")
+      ->default_val(server.workers)
+      ->check(CLI::NonNegativeNumber);
   app.add_option("--server.stream_buffer_bytes", server.stream_buffer_bytes,
                  "Per-connection buffered response bytes before streaming producers pause")
       ->default_val(server.stream_buffer_bytes);
@@ -144,6 +156,9 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(replication.pin_retained_bytes);
   app.add_option("--replication.follower-timeout-ms", replication.follower_timeout_ms,
                  "Follower liveness in milliseconds (watch timeout at most one third)")->default_val(replication.follower_timeout_ms);
+  app.add_option("--replication.retry-ms", replication.retry_ms,
+                 "Follower reconnect and first sync retry delay in milliseconds (retries double, to 60 s)")
+      ->default_val(replication.retry_ms);
 
   app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
       ->default_val(store.backend)
@@ -154,6 +169,17 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--store.checked-dir.sync", store.checked_dir.sync, "Check fsync correctness: off, warn, throw")
       ->default_val(store.checked_dir.sync)
       ->check(CLI::IsMember({"off", "warn", "throw"}));
+  app.add_option("--store.verify-on-open", store.verify_on_open,
+                 "Startup check of committed files: none, or full (size and xxh3 of every file)")
+      ->default_val(store.verify_on_open)
+      ->check(CLI::IsMember({"none", "full"}));
+  app.add_option("--store.scrub-interval-s", store.scrub_interval_s,
+                 "Seconds between background checksum scrubs of published snapshots (0 = off)")
+      ->default_val(store.scrub_interval_s);
+  app.add_option("--store.scrub-max-bytes-per-sec", store.scrub_max_bytes_per_sec,
+                 "Background scrub read rate limit (0 = unthrottled)")
+      ->transform(CLI::AsSizeValue(false))
+      ->default_str("64MB");
 
   app.add_flag("--indexing.huge-pages,!--no-indexing.huge-pages", index.huge_pages,
                "Advise transparent huge pages for the indexing arena (jemalloc builds; "
@@ -194,7 +220,7 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(ingest.stream_batch_docs)
       ->check(CLI::PositiveNumber);
   app.add_option("--indexing.max-inflight-batches", ingest.max_inflight_batches,
-                 "Streaming NDJSON: batches in flight per connection (0 = task arena compute width + 2)")
+                 "Streaming NDJSON: batches in flight per connection (0 = server.workers + 2)")
       ->default_val(ingest.max_inflight_batches)
       ->check(CLI::NonNegativeNumber);
   app.add_flag("--indexing.auto-create-collection,!--no-indexing.auto-create-collection",

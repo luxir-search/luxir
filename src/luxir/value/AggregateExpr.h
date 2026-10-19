@@ -311,8 +311,11 @@ struct BoundAggregateInput {
 
 };
 
+std::span<const ValueFieldInfos> resolveAggregateFields(
+    const AggregateProgram& program, MemPool& pool, IndexReader& reader);
+
 std::vector<BoundAggregateInput> bindAggregateInputs(
     const AggregateProgram& program, MemPool& pool,
-    IndexReader::Segment& segment);
+    IndexReader::Segment& segment, std::span<const ValueFieldInfos> fields);
 
 } // namespace luxir

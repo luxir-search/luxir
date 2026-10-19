@@ -26,6 +26,8 @@ class PhraseQuery final : public Query {
   int32_t slop;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static inline bool disableShapesForTests = false;
 
   struct ScorerControls {
@@ -349,9 +351,7 @@ public:
   }
 
   Weight* createWeight(Context& context, int32_t flags,
-                       float multiplier = 1.0f) override {
-    return context.pool.make<PhraseQuery::Weight>(context, *this, flags, multiplier);
-  }
+                       float multiplier = 1.0f) override;
 
   class Weight final : public Query::Weight {
     PhraseQuery& query;
@@ -363,7 +363,7 @@ public:
         IndexReader::Segment& segment, bool disableSort,
         bool disableRepeatDedup) const {
       if (cachedFieldInfo == nullptr
-          || cachedFieldInfo->segInfos[segment.ord] == nullptr) {
+          || cachedFieldInfo->segInfos.at(segment.ord) == nullptr) {
         return {};
       }
       std::vector<const TermsEnum::PostingsState*> states;
@@ -469,7 +469,7 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         const EstimateMemo& estimate) {
       if (!estimate.nonempty) return nullptr;
-      auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord];
+      auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord);
       assert(segFieldInfo != nullptr);
 
       auto querySlotEnums = targetPool.make_span<DocsPosEnum*>(cachedTermInfos.size());

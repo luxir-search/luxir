@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "FieldReader.h"
+#include "PostingsReader.h"
 #include "luxir/util/screaming.h"
 
 namespace luxir {
