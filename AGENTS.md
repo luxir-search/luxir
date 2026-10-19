@@ -30,7 +30,7 @@ grep -n "warning:" /tmp/build.log
 
 ### Concurrent builds and worktrees
 
-Builds size their compile and link parallelism from cores and memory, and
+Builds size their compile parallelism from cores and memory, and
 concurrent builds (other worktrees, presets, or the dev container) share one
 machine-wide limit, so running several at once needs no manual `-j` or job
 caps. Native vcpkg dependencies, the ARM64 toolchain and packages, and ccache

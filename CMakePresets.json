@@ -201,7 +201,7 @@
   ],
 
   "buildPresets": [
-    { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "description": "Native non-ASan debug build. Compile and link parallelism are capped automatically; override with LUXIR_COMPILE_JOBS / LUXIR_LINK_JOBS when configuring." },
+    { "name": "gcc-debug",        "configurePreset": "gcc-debug",        "description": "Native non-ASan debug build. Concurrent compilation is limited by the luxir_compile Ninja pool; override with LUXIR_COMPILE_JOBS when configuring." },
     { "name": "gcc-debug-asan",   "configurePreset": "gcc-debug-asan",   "description": "Memory-check build (pre-commit)." },
     { "name": "gcc-release",      "configurePreset": "gcc-release" },
     { "name": "gcc-release-asan", "configurePreset": "gcc-release-asan" },

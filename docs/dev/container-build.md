@@ -66,12 +66,11 @@ The copied port files use [vcpkg's MIT license](../../deps/ports/LICENSE.vcpkg).
 ./tools/dev-container env ASAN_OPTIONS=detect_leaks=1:allow_addr2line=1 build/container-asan/bin/luxir_test --gtest_brief=1 --gtest_print_time=0
 ```
 
-The compile and link job limits account for physical cores, container CPU and
-memory limits, and ASan's larger compiler processes. Concurrent container and
-host builds share them through the build slots in the shared Luxir cache; see
+The compile job limit accounts for physical cores, container CPU and memory
+limits, and ASan's larger compiler processes. Concurrent container and host
+builds share it through the build slots in the shared Luxir cache; see
 [Parallelism and shared caches](build-setup.md#parallelism-and-shared-caches).
-Override them with `-DLUXIR_COMPILE_JOBS=N` and `-DLUXIR_LINK_JOBS=N` when
-configuring if necessary.
+Override it with `-DLUXIR_COMPILE_JOBS=N` when configuring if necessary.
 
 CMake downloads checksum-verified book and Unicode fixtures into each build's
 `test/data/` directory, so they survive between container commands. If a download

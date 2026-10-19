@@ -147,22 +147,19 @@ with those dependencies first, then adding the preset back.
 
 ## Parallelism and shared caches
 
-Configure sizes two limits from the machine with `tools/build-jobs`, which
-counts physical cores and memory, honoring cgroup CPU and memory limits:
+Configure sizes `LUXIR_COMPILE_JOBS` from the machine with `tools/build-jobs`,
+which counts physical cores and memory, honoring cgroup CPU and memory limits:
+one compile per physical core, at most 16, and at most one per 3 GB of memory
+(4 GB with ASan).
 
-- `LUXIR_COMPILE_JOBS`: one compile per physical core, at most 16, and at most
-  one per 3 GB of memory (4 GB with ASan) left after the link reservation.
-- `LUXIR_LINK_JOBS`: at most two links, within a quarter of memory at 4 GB per
-  link (6 GB with ASan).
-
-Each limit is a Ninja pool, so a plain `cmake --build` needs no `-j`. Compiles
-and links also take one of that many machine-wide slots (lock files under
+The limit is a Ninja pool, so a plain `cmake --build` needs no `-j`. Compiles
+also take one of that many machine-wide slots (lock files under
 `~/.cache/luxir/build-slots`, see `tools/build-slot`), so concurrent builds from
-other worktrees, presets, or the development container share the limits rather
-than each assuming the whole machine. A job waiting for a slot sleeps and uses no
-memory. Override the limits with `-DLUXIR_COMPILE_JOBS=N` and
-`-DLUXIR_LINK_JOBS=N` when configuring; set `-DLUXIR_BUILD_SLOT_DIR=` (empty) to
-limit a build only by its own pools.
+other worktrees, presets, or the development container share the limit rather
+than each assuming the whole machine. A compile waiting for a slot sleeps and
+uses no memory. Override the limit with `-DLUXIR_COMPILE_JOBS=N` when
+configuring; set `-DLUXIR_BUILD_SLOT_DIR=` (empty) to limit a build only by its
+own pool.
 
 Shared state lives outside the checkout, so a new worktree reuses it:
 

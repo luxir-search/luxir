@@ -95,7 +95,7 @@ stage generator "$CXX" -std=c++26 -O2 -g0 -pthread \
 cmake_bin=${LUXIR_CMAKE:-"$VCPKG_DOWNLOADS/tools/cmake-4.4.3-linux/cmake-4.4.3-linux-x86_64/bin/cmake"}
 # CMake caches the compiler path independently of the toolchain environment.
 # Reset configuration when running this workflow so toolchain changes take effect.
-# Without LUXIR_BUILD_JOBS, CMake sizes the compile and link limits itself.
+# Without LUXIR_BUILD_JOBS, CMake sizes the compile limit itself.
 configure_args=()
 if [[ -n ${LUXIR_BUILD_JOBS:-} ]]; then
     configure_args=(-DLUXIR_COMPILE_JOBS="$LUXIR_BUILD_JOBS")

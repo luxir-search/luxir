@@ -4,14 +4,14 @@
 
 # Prints how many build jobs fit this machine: at most one per physical core
 # (within the CPUs and CPU quota available to this process) and at most one per
-# MB_PER_JOB megabytes of memory (within any cgroup limit) after RESERVE_MB.
-# Usage: tools/build-jobs MB_PER_JOB [RESERVE_MB]
+# MB_PER_JOB megabytes of memory (within any cgroup limit).
+# Usage: tools/build-jobs MB_PER_JOB
 set -euo pipefail
-if (( $# < 1 || $# > 2 )); then
-  echo "Usage: $0 MB_PER_JOB [RESERVE_MB]" >&2
+if (( $# != 1 )); then
+  echo "Usage: $0 MB_PER_JOB" >&2
   exit 1
 fi
-per_job=$1 reserve=${2:-0}
+per_job=$1
 
 cpus=$(nproc)
 cores=$(lscpu -p=core,socket 2>/dev/null | grep -v '^#' | sort -u | wc -l || true)
@@ -44,7 +44,7 @@ for limit_file in "${limits[@]}"; do
   fi
 done
 
-jobs=$(( (mem_mb - reserve) / per_job ))
+jobs=$(( mem_mb / per_job ))
 (( jobs > cores )) && jobs=$cores
 (( jobs < 1 )) && jobs=1
 echo "$jobs"

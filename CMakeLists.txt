@@ -78,58 +78,39 @@ option(LUXIR_PROBE_WRAPPER_TRIMS
 # masked by a plausible zero (zero-init also blinds valgrind/MSan detection).
 
 # Build acceleration
-# ---- Build parallelism: compile and link limits sized from this machine ----
+# ---- Build parallelism: compile limit sized from this machine ----
 # hpp-proto template instantiation makes each heavy TU expensive to compile, so the build
-# tool's default -j (logical cores) can exhaust memory. tools/build-jobs sizes each limit
+# tool's default -j (logical cores) can exhaust memory. tools/build-jobs sizes the limit
 # from physical cores and memory (cgroup limits included): at most one compile per core,
 # never above 16 (hyperthreads add little compile throughput). Measured peak RSS of the
-# heaviest single compile: 2.7G at -O0, 3.1G at -Og, 3.9G at -Og with ASan. Linking
-# luxir_test is the largest single step, so links get their own smaller limit whose
-# memory is reserved from the compile budget. Override with -DLUXIR_COMPILE_JOBS=N and
-# -DLUXIR_LINK_JOBS=N. Both are caps, not a forced -j: a smaller -j still wins.
-if(_luxir_sanitizer)
-  set(_luxir_compile_mb 4000)
-  set(_luxir_link_mb 6000)
-else()
-  set(_luxir_compile_mb 3000)
-  set(_luxir_link_mb 4000)
-endif()
-function(luxir_build_jobs out per_job_mb reserve_mb fallback)
-  execute_process(COMMAND "${CMAKE_SOURCE_DIR}/tools/build-jobs" ${per_job_mb} ${reserve_mb}
-                  OUTPUT_VARIABLE _jobs OUTPUT_STRIP_TRAILING_WHITESPACE
-                  RESULT_VARIABLE _result ERROR_QUIET)
-  if(NOT _result EQUAL 0 OR NOT _jobs MATCHES "^[0-9]+$")
-    message(WARNING "tools/build-jobs failed; assuming ${fallback} jobs")
-    set(_jobs ${fallback})
-  endif()
-  set(${out} ${_jobs} PARENT_SCOPE)
-endfunction()
-if(NOT DEFINED LUXIR_LINK_JOBS)
-  # At most a quarter of memory for links, and at most two at once.
-  math(EXPR _luxir_link_quarter "${_luxir_link_mb} * 4")
-  luxir_build_jobs(LUXIR_LINK_JOBS ${_luxir_link_quarter} 0 1)
-  if(LUXIR_LINK_JOBS GREATER 2)
-    set(LUXIR_LINK_JOBS 2)
-  endif()
-endif()
+# heaviest single compile: 2.7G at -O0, 3.1G at -Og, 3.9G at -Og with ASan. Links need no
+# limit: mold links luxir_test in under 2s with about 1.4G of anonymous memory. Override
+# with -DLUXIR_COMPILE_JOBS=N. It is a cap, not a forced -j: a smaller -j still wins.
 if(NOT DEFINED LUXIR_COMPILE_JOBS)
-  math(EXPR _luxir_link_reserve "${LUXIR_LINK_JOBS} * ${_luxir_link_mb}")
-  luxir_build_jobs(LUXIR_COMPILE_JOBS ${_luxir_compile_mb} ${_luxir_link_reserve} 4)
+  if(_luxir_sanitizer)
+    set(_luxir_compile_mb 4000)
+  else()
+    set(_luxir_compile_mb 3000)
+  endif()
+  execute_process(COMMAND "${CMAKE_SOURCE_DIR}/tools/build-jobs" ${_luxir_compile_mb}
+                  OUTPUT_VARIABLE LUXIR_COMPILE_JOBS OUTPUT_STRIP_TRAILING_WHITESPACE
+                  RESULT_VARIABLE _luxir_jobs_result ERROR_QUIET)
+  if(NOT _luxir_jobs_result EQUAL 0 OR NOT LUXIR_COMPILE_JOBS MATCHES "^[0-9]+$")
+    message(WARNING "tools/build-jobs failed; assuming 4 compile jobs")
+    set(LUXIR_COMPILE_JOBS 4)
+  endif()
   if(LUXIR_COMPILE_JOBS GREATER 16)
     set(LUXIR_COMPILE_JOBS 16)
   endif()
 endif()
-message(STATUS "Luxir build-job caps: ${LUXIR_COMPILE_JOBS} compile, ${LUXIR_LINK_JOBS} link")
-set_property(GLOBAL PROPERTY JOB_POOLS
-             luxir_compile=${LUXIR_COMPILE_JOBS} luxir_link=${LUXIR_LINK_JOBS})
+message(STATUS "Luxir compile-job cap: ${LUXIR_COMPILE_JOBS}")
+set_property(GLOBAL PROPERTY JOB_POOLS luxir_compile=${LUXIR_COMPILE_JOBS})
 set(CMAKE_JOB_POOL_COMPILE luxir_compile)
-set(CMAKE_JOB_POOL_LINK luxir_link)
 
-# The Ninja pools only see this build. Compiles and links also hold one of
-# LUXIR_COMPILE_JOBS / LUXIR_LINK_JOBS machine-wide lock files (tools/build-slot), so
-# concurrent builds from other worktrees, presets, or the development container share
-# the limits instead of each assuming the whole machine. Set LUXIR_BUILD_SLOT_DIR to an
-# empty string to limit this build alone.
+# The Ninja pool only sees this build. Compiles also hold one of LUXIR_COMPILE_JOBS
+# machine-wide lock files (tools/build-slot), so concurrent builds from other worktrees,
+# presets, or the development container share the limit instead of each assuming the
+# whole machine. Set LUXIR_BUILD_SLOT_DIR to an empty string to limit this build alone.
 if(DEFINED ENV{LUXIR_CACHE_DIR})
   set(_luxir_cache_dir "$ENV{LUXIR_CACHE_DIR}")
 elseif(DEFINED ENV{XDG_CACHE_HOME})
@@ -141,12 +122,10 @@ set(LUXIR_BUILD_SLOT_DIR "${_luxir_cache_dir}/build-slots" CACHE PATH
     "Directory of machine-wide build slot locks shared by concurrent builds; empty disables")
 find_program(LUXIR_FLOCK flock)
 set(_luxir_compile_launcher "")
-set(_luxir_link_launcher "")
 if(LUXIR_BUILD_SLOT_DIR AND LUXIR_FLOCK)
   file(MAKE_DIRECTORY "${LUXIR_BUILD_SLOT_DIR}")
-  set(_luxir_slot "${CMAKE_SOURCE_DIR}/tools/build-slot")
-  set(_luxir_compile_launcher "${_luxir_slot};${LUXIR_BUILD_SLOT_DIR}/compile;${LUXIR_COMPILE_JOBS}")
-  set(_luxir_link_launcher "${_luxir_slot};${LUXIR_BUILD_SLOT_DIR}/link;${LUXIR_LINK_JOBS}")
+  set(_luxir_compile_launcher
+      "${CMAKE_SOURCE_DIR}/tools/build-slot;${LUXIR_BUILD_SLOT_DIR}/compile;${LUXIR_COMPILE_JOBS}")
   message(STATUS "Luxir: build slots shared through ${LUXIR_BUILD_SLOT_DIR}")
 endif()
 
@@ -169,8 +148,6 @@ if(CCACHE_PROGRAM)
 endif()
 set(CMAKE_C_COMPILER_LAUNCHER   "${_luxir_compile_launcher}")
 set(CMAKE_CXX_COMPILER_LAUNCHER "${_luxir_compile_launcher}")
-set(CMAKE_C_LINKER_LAUNCHER     "${_luxir_link_launcher}")
-set(CMAKE_CXX_LINKER_LAUNCHER   "${_luxir_link_launcher}")
 
 # Fast linker: prefer mold, then lld, then gold. Each candidate is verified with
 # a real test link, so a linker that cannot handle this toolchain (e.g. mold
