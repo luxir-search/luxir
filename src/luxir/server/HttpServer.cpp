@@ -1299,8 +1299,8 @@ private:
       return false;
     }
     if (const std::string* text = findParam(params, "document_format")) {
-      if (*text != "default" && *text != "rows" && *text != "columns") {
-        err = "invalid URL parameter 'document_format': expected default, rows, or columns, got '" +
+      if (*text != "default" && *text != "rows" && *text != "columns" && *text != "adaptive") {
+        err = "invalid URL parameter 'document_format': expected default, rows, columns, or adaptive, got '" +
               *text + "'";
         return false;
       }
@@ -1531,10 +1531,14 @@ private:
         // mode=replace_all must be typed.  PUT/PATCH are reserved.
         if (req.method() == http::verb::get) {
           const auto* view = findParam(params, "view");
-          if (view && *view != "authored" && *view != "resolved") {
+          if (view && *view != "authored" && *view != "resolved" && *view != "fields") {
             respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST,
-                "unknown schema view '" + *view + "' (valid: authored, resolved)"));
+                "unknown schema view '" + *view + "' (valid: authored, resolved, fields)"));
             return;
+          }
+          if (view && *view == "fields") {
+            handleFieldList(coll);
+            break;
           }
           handleSchemaGet(coll, view && *view == "resolved");
           break;
@@ -1646,6 +1650,9 @@ private:
         if (td->document_format == luxir::api::DocFormat::COLUMNS) {
           return "format=docs emits row documents; document_format COLUMNS conflicts";
         }
+        if (td->document_format == luxir::api::DocFormat::ADAPTIVE) {
+          return "format=docs emits row documents; document_format ADAPTIVE conflicts";
+        }
       } else if (const auto* f = std::get_if<luxir::api::Fusion>(&op.kind)) {
         if (!f->ops.empty()) return "format=docs does not support nested ops";
         for (const auto& [srcName, src] : f->sources) {
@@ -1653,6 +1660,9 @@ private:
         }
         if (f->document_format == luxir::api::DocFormat::COLUMNS) {
           return "format=docs emits row documents; document_format COLUMNS conflicts";
+        }
+        if (f->document_format == luxir::api::DocFormat::ADAPTIVE) {
+          return "format=docs emits row documents; document_format ADAPTIVE conflicts";
         }
       } else {
         return "format=docs requires top_docs or fusion ops";
@@ -2058,6 +2068,33 @@ private:
     }
     if (failure) respondError(*failure);
     else respondJson(http::status::ok, std::move(out));
+  }
+
+  // The retrievable field catalog, dynamic fields included (view=fields).
+  // Opening the current reader can block (reader mutex, catalog build), so
+  // this runs on the task arena like view=resolved.
+  void handleFieldList(const std::string& coll) {
+    auto shardPin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), coll, tenant = tenant_, shardPin] {
+      std::string out;
+      std::optional<ErrorInfo> failure;
+      try {
+        std::pmr::monotonic_buffer_resource arena;
+        luxir::api::FieldsResponse response;
+        auto collection = self->node_.getCollection(LuxirNode::target(tenant, coll));
+        collection->getReaderManager().listFields(response, arena);
+        if (!luxir::api::write_json(response, out)) {
+          throw std::runtime_error("failed to serialize fields response");
+        }
+      } catch (const std::exception& e) {
+        failure = classifyException(e, ErrorKind::INTERNAL);
+      }
+      net::post(self->stream_.get_executor(),
+                [self, shardPin, failure = std::move(failure), out = std::move(out)]() mutable {
+                  if (failure) self->respondError(*failure);
+                  else self->respondJson(http::status::ok, std::move(out));
+                });
+    });
   }
 
   static api::ReplicaRequirement replicaRequirement(std::string_view text) {

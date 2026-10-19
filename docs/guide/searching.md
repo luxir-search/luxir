@@ -101,7 +101,7 @@ one.
 | `fields` | Fields to retrieve. Omitted: every retrievable field. |
 | `sort` | One sort clause or a list of them. Absent means relevance order. |
 | `batch_size` | Maximum documents in one streaming response batch. |
-| `document_format` | `rows` or `columns`; HTTP defaults to rows, gRPC to columns. |
+| `document_format` | `rows`, `columns`, or `adaptive`; HTTP defaults to rows, gRPC to columns. |
 | `ops` | Facets or metrics over this query's complete match set. |
 
 ### Counts are exact, and opt-in
@@ -785,7 +785,12 @@ query.
 to row documents: a document without a requested field omits the key rather
 than returning `null`. Set `document_format: "columns"`
 when consumers prefer every requested key in every row, with missing cells
-rendered as `null`.
+rendered as `null`. That holds for named fields; a field returned by an empty
+or wildcard `fields` selector is left out of a batch in which no document has
+a value. `document_format: "adaptive"` picks per batch and field
+whichever placement encodes the batch more compactly: sparse fields as row
+keys, dense ones as columns (see [column placement](grpc.md#column-placement)).
+`columns` and `adaptive` are rejected with `format=docs`.
 
 With no `fields`, every retrievable logical field comes back: stored text,
 string, numeric, date, and `id` values, discovered from the index itself (so
@@ -793,12 +798,12 @@ dynamic suffix fields appear under their concrete names), `id` first and the
 rest in name order. Vector fields and engine fields such as `_version_` are
 returned only when named. A `fields` entry containing `*` is a wildcard
 pattern (`"attr_*"`, `"*_s"`, `"t*s"`) that expands through the same
-discovery. Discovered fields are always placed in row documents, whatever
-`document_format` says; naming fields produces dense columns. A field both
-named and matched by a pattern is
-returned once, in its explicit placement, so `"fields": ["id", "*"]` returns
-an `id` column beside rows of everything else. `_score_` is requested
-explicitly (`get_scores`) and keeps the format's placement.
+discovery. Discovered fields follow `document_format` like named ones, except
+that under `columns` a discovered field with no value in a batch is left out
+of that batch, while a named column is always present. A field both named
+and matched by a pattern is returned once, so `"fields": ["id", "*"]` returns
+`id` and everything else. `_score_` is requested explicitly (`get_scores`)
+and is a column except under `rows`.
 
 With [field variants](schema.md#field-variants): bare names return the
 primary's stored source or its own column, independently of the search and
@@ -913,7 +918,7 @@ The recognized top-document parameters are:
 | `fields` | Comma-separated field names. An empty value clears the body list. |
 | `sort` | One sort clause per parameter, in the body's string form: `expr`, `expr asc`, or `expr desc`. Repeat to form an ordered sort list. |
 | `batch_size` | Signed 32-bit decimal integer. |
-| `document_format` | Exactly `default`, `rows`, or `columns`. |
+| `document_format` | Exactly `default`, `rows`, `columns`, or `adaptive`. |
 | `get_number`, `get_scores` | Exactly `true` or `false`. |
 
 URL form decoding happens before these grammars are applied, so `+` in a

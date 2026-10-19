@@ -28,6 +28,8 @@ service Searcher {
 service Admin {
   rpc SetSchema(SchemaRequest) returns (SchemaResponse) {}
   rpc GetSchema(SchemaRequest) returns (SchemaResponse) {}
+  // The retrievable fields of a collection, including dynamically created ones.
+  rpc ListFields(FieldsRequest) returns (FieldsResponse) {}
   rpc CreateCollection(CreateCollectionRequest) returns (CreateCollectionResponse) {}
   rpc DeleteCollection(DeleteCollectionRequest) returns (DeleteCollectionResponse) {}
   rpc Stats(StatsRequest) returns (StatsResponse) {}

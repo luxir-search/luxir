@@ -3528,9 +3528,56 @@ TEST_F(HttpApiTest, docsFormatValidation) {
   EXPECT_EQ(400, columns.result_int()) << columns.body();
   EXPECT_NE(std::string::npos, columns.body().find("format=docs")) << columns.body();
 
+  auto adaptive = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?format=docs&document_format=adaptive",
+      R"({"query":{"all":true},"fields":["id"]})");
+  EXPECT_EQ(400, adaptive.result_int()) << adaptive.body();
+  EXPECT_NE(std::string::npos, adaptive.body().find("ADAPTIVE")) << adaptive.body();
+
   auto unknown = httpRequest(port(), http::verb::post, "/collections/main/_search?format=lines",
       R"({"query":{"all":true}})");
   EXPECT_EQ(400, unknown.result_int()) << unknown.body();
+}
+
+// document_format=adaptive answers with envelopes whose merged documents
+// carry sparse fields from docs and dense ones from columns; view=fields
+// lists the catalog, dynamic fields included.
+TEST_F(HttpApiTest, adaptiveFormatAndFieldsView) {
+  LuxirTest::clearCollection("http_adaptive");
+  CollectionHelper ch("http_adaptive");
+  std::vector<Doc> docs{flatdoc("id", "a0", "year_i", (int64_t)2000, "rare_s", "x")};
+  for (int i = 1; i < 20; i++) {
+    docs.push_back(flatdoc("id", "a" + std::to_string(i), "year_i", (int64_t)(2000 + i)));
+  }
+  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs), UpdateMessage::COMMIT).success);
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_adaptive/_search",
+      R"({"query":{"all":true},"limit":-1,"fields":["id","year_i","rare_s"],"document_format":"adaptive"})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  size_t rows = 0, withRare = 0;
+  for (const auto& line : splitLines(res.body())) {
+    glz::generic_i64 body;
+    ASSERT_FALSE(glz::read_json(body, line));
+    for (const auto& row : body["docs"].get_array()) {
+      rows++;
+      EXPECT_TRUE(row.contains("year_i"));
+      if (row.contains("rare_s")) {
+        withRare++;
+        EXPECT_EQ("x", row["rare_s"].get_string());
+      }
+    }
+  }
+  EXPECT_EQ(20u, rows);
+  EXPECT_EQ(1u, withRare);
+
+  auto fields = httpRequest(port(), http::verb::get, "/collections/http_adaptive/_schema?view=fields");
+  ASSERT_EQ(200, fields.result_int()) << fields.body();
+  glz::generic_i64 catalog;
+  ASSERT_FALSE(glz::read_json(catalog, fields.body()));
+  std::map<std::string, std::string> types;
+  for (const auto& f : catalog["fields"].get_array()) types[f["name"].get_string()] = f["type"].get_string();
+  EXPECT_EQ("string", types["rare_s"]);
+  EXPECT_EQ("int", types["year_i"]);
 }
 
 // An engine error before anything streams is a plain HTTP error, not a 200

@@ -259,7 +259,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Field projection: named fields, `*` wildcard patterns, or every retrievable
   field when `fields` is omitted. Row- or column-oriented documents per
   request (`document_format`): HTTP defaults to rows (a missing field is an
-  absent key), gRPC to dense columns.
+  absent key), gRPC to dense columns; `adaptive` picks per batch and field
+  whichever encodes more compactly.
 - Any number of named operations in one request over the same index view:
   ranked lists, facets, metrics, and fusion, nested to any depth and executed
   in parallel. HTTP responses preserve their names and nesting under `ops`.

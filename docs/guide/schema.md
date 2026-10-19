@@ -636,12 +636,14 @@ representations.
 |---|---|
 | `GET /collections/{c}/_schema` | the authored schema (valid write body) |
 | `GET /collections/{c}/_schema?view=resolved` | effective representations, bindings, and schema coverage (HTTP only) |
+| `GET /collections/{c}/_schema?view=fields` | the retrievable fields as the engine sees them, including fields created from dynamic-field templates |
 | `POST /collections/{c}/_schema` | `mode=set` (default): set the named definitions, keep the rest |
 | `POST /collections/{c}/_schema?mode=replace_all` | replace the whole schema |
 | `POST /collections/_create` | create a collection, optionally with a `schema` installed before it becomes visible |
 
 The same operations are available over gRPC as `luxir.Admin/GetSchema`,
-`SetSchema`, and `CreateCollection`; see the [gRPC API](grpc.md).
+`SetSchema`, and `CreateCollection`, and `view=fields` as `ListFields`; see
+the [gRPC API](grpc.md).
 
 ### Resolved view
 

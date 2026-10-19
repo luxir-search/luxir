@@ -4,8 +4,11 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <map>
 #include <string>
+#include <vector>
 
+#include "luxir/api/build.h"
 #include "luxir/util/Signal.h"
 
 #include "test/CollectionHelper.h"
@@ -145,9 +148,9 @@ TEST_F(DocFormatTest, rowCountWithoutColumnsOrDocs) {
 }
 
 // No fields named: the default projection returns every retrievable field -
-// id, stored text, string and numeric columns - as per-document rows whatever
-// document_format says (discovered fields are never dense columns).  Engine
-// fields (_version_) are left out unless named.
+// id, stored text, string and numeric columns - placed per document_format
+// (the gRPC default is COLUMNS).  Engine fields (_version_) are left out
+// unless named.
 TEST_F(DocFormatTest, defaultProjectionReturnsEveryRetrievableField) {
   CollectionHelper ch;
   indexBooks(ch);
@@ -160,8 +163,10 @@ TEST_F(DocFormatTest, defaultProjectionReturnsEveryRetrievableField) {
     const auto* dl = req->docList("q");
     ASSERT_NE(dl, nullptr);
     EXPECT_EQ(3, dl->row_count);
-    EXPECT_TRUE(dl->columns.empty());
-    ASSERT_EQ(3u, dl->docs.size());
+    bool rows = fmt == api::DocFormat::ROWS;
+    EXPECT_EQ(rows, dl->columns.empty());
+    EXPECT_EQ(rows ? 3u : 0u, dl->docs.size());
+    EXPECT_EQ(nullptr, dl->columns.find("_version_"));
     for (const auto& row : dl->docs) {
       EXPECT_EQ(nullptr, row.fields.find("_version_"));
     }
@@ -200,11 +205,9 @@ TEST_F(DocFormatTest, defaultProjectionReturnsEveryRetrievableField) {
   EXPECT_NE(nullptr, find(namedDocs[0], "_version_"));
 }
 
-// _score_ is asked for explicitly (get_scores), so it keeps the
-// document_format placement even when the fields are discovered: a dense
-// column under columns format, beside the discovered rows; a row key under
-// rows format.
-TEST_F(DocFormatTest, defaultProjectionKeepsScoreColumnUnderColumnsFormat) {
+// _score_ (get_scores) is a dense column under COLUMNS and ADAPTIVE, even
+// beside fields ADAPTIVE moves to docs, and a row key under ROWS.
+TEST_F(DocFormatTest, defaultProjectionScorePlacementFollowsFormat) {
   CollectionHelper ch;
   indexBooks(ch);
 
@@ -217,15 +220,13 @@ TEST_F(DocFormatTest, defaultProjectionKeepsScoreColumnUnderColumnsFormat) {
     return req;
   };
 
-  auto cols = run(api::DocFormat::COLUMNS);
-  const auto* dl = cols->docList("q");
-  ASSERT_NE(dl, nullptr);
-  EXPECT_EQ(1u, dl->columns.size());
-  EXPECT_NE(nullptr, dl->columns.find("_score_"));
-  ASSERT_EQ(2u, dl->docs.size());
-  for (const auto& row : dl->docs) {
-    EXPECT_EQ(nullptr, row.fields.find("_score_"));
-    EXPECT_NE(nullptr, row.fields.find("title_t"));
+  for (auto fmt : {api::DocFormat::COLUMNS, api::DocFormat::ADAPTIVE}) {
+    auto cols = run(fmt);
+    const auto* dl = cols->docList("q");
+    ASSERT_NE(dl, nullptr);
+    EXPECT_NE(nullptr, dl->columns.find("_score_"));
+    EXPECT_NE(nullptr, dl->columns.find("title_t"));
+    for (const auto& row : dl->docs) EXPECT_EQ(nullptr, row.fields.find("_score_"));
   }
 
   auto rows = run(api::DocFormat::ROWS);
@@ -268,11 +269,10 @@ TEST_F(DocFormatTest, defaultProjectionDiscoversPerSegmentAndSkipsVectors) {
 }
 
 // A fields entry containing '*' expands against the index's field catalog
-// through the default-projection filter.  Matches are placed in rows whatever
-// document_format says; explicitly named fields keep dense columns.  Engine
-// fields and vectors are never matched by a pattern, and a name given
-// explicitly is never duplicated by one.
-TEST_F(DocFormatTest, wildcardFieldsDiscoverIntoRows) {
+// through the default-projection filter.  Matches are placed per
+// document_format like named fields.  Engine fields and vectors are never
+// matched by a pattern, and a name given explicitly is never duplicated by one.
+TEST_F(DocFormatTest, wildcardFieldsFollowDocumentFormat) {
   CollectionHelper ch;
   indexBooks(ch);
   ch.index(flatdoc("id", std::string("b5"), "title_t", std::string("wildcards"),
@@ -290,14 +290,12 @@ TEST_F(DocFormatTest, wildcardFieldsDiscoverIntoRows) {
   const auto* dl = req->docList("q");
   ASSERT_NE(dl, nullptr);
   EXPECT_EQ(4, dl->row_count);
-  ASSERT_EQ(1u, dl->columns.size());
-  EXPECT_NE(nullptr, dl->columns.find("id"));
-  ASSERT_EQ(4u, dl->docs.size());
-  for (const auto& row : dl->docs) {
-    EXPECT_EQ(nullptr, row.fields.find("id"));         // explicit wins on collision
-    EXPECT_EQ(nullptr, row.fields.find("_version_"));  // engine fields need naming
-    EXPECT_EQ(nullptr, row.fields.find("emb_v"));      // vectors need naming
+  EXPECT_TRUE(dl->docs.empty());
+  for (auto name : {"id", "title_t", "year_i", "rating_f", "price_d", "tags_ss"}) {
+    EXPECT_NE(nullptr, dl->columns.find(name)) << name;
   }
+  EXPECT_EQ(nullptr, dl->columns.find("_version_"));  // engine fields need naming
+  EXPECT_EQ(nullptr, dl->columns.find("emb_v"));      // vectors need naming
   auto docs = req->getDocs();
   EXPECT_CONTAINS_DOC(docs, flatdoc("id", std::string("b1"),
                                     "title_t", std::string("dune novel"),
@@ -306,6 +304,163 @@ TEST_F(DocFormatTest, wildcardFieldsDiscoverIntoRows) {
                                     "tags_ss", vecs("classic", "scifi")));
   EXPECT_CONTAINS_DOC(docs, flatdoc("id", std::string("b5"),
                                     "title_t", std::string("wildcards")));
+}
+
+// COLUMNS leaves a discovered column with no value in the batch out of it; a
+// named column stays even when every slot is missing.
+TEST_F(DocFormatTest, columnsLeavesOutAllMissingDiscoveredColumns) {
+  CollectionHelper ch;
+  indexBooks(ch);
+
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("title_t", "messiah")
+      .fields({"price_d", "*"})
+      .documentFormat(api::DocFormat::COLUMNS).limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  const auto* dl = req->docList("q");
+  ASSERT_NE(dl, nullptr);
+  EXPECT_EQ(1, dl->row_count);
+  EXPECT_TRUE(dl->docs.empty());
+  EXPECT_NE(nullptr, dl->columns.find("price_d"));  // named: always present
+  EXPECT_NE(nullptr, dl->columns.find("id"));
+  EXPECT_NE(nullptr, dl->columns.find("title_t"));
+  for (auto name : {"year_i", "rating_f", "tags_ss"}) {
+    EXPECT_EQ(nullptr, dl->columns.find(name)) << name;
+  }
+}
+
+// ADAPTIVE puts a field present in 1 of 20 documents in docs and dense fields
+// in columns; the merged documents equal the ROWS result.
+TEST_F(DocFormatTest, adaptivePlacesSparseFieldsInDocs) {
+  CollectionHelper ch;
+  std::vector<Doc> corpus{flatdoc("id", "d0", "year_i", (int64_t)2000, "rare_s", "x")};
+  for (int i = 1; i < 20; i++) {
+    corpus.push_back(flatdoc("id", "d" + std::to_string(i), "year_i", (int64_t)(2000 + i)));
+  }
+  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(corpus), UpdateMessage::COMMIT).success);
+
+  auto run = [&](api::DocFormat fmt) {
+    auto req = localReq(ch.getSearchEngine());
+    req->collection("main").topDocs("q").allQuery().documentFormat(fmt).limit(-1);
+    req->execute();
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    return req;
+  };
+  auto adaptive = run(api::DocFormat::ADAPTIVE);
+  const auto* dl = adaptive->docList("q");
+  ASSERT_NE(dl, nullptr);
+  EXPECT_NE(nullptr, dl->columns.find("id"));
+  EXPECT_NE(nullptr, dl->columns.find("year_i"));
+  EXPECT_EQ(nullptr, dl->columns.find("rare_s"));
+  ASSERT_EQ(20u, dl->docs.size());
+  size_t withRare = 0;
+  for (const auto& row : dl->docs) withRare += row.fields.find("rare_s") ? 1 : 0;
+  EXPECT_EQ(1u, withRare);
+
+  auto rowDocs = run(api::DocFormat::ROWS)->getDocs();
+  auto adaptiveDocs = adaptive->getDocs();
+  ASSERT_EQ(rowDocs.size(), adaptiveDocs.size());
+  for (const auto& doc : rowDocs) EXPECT_TRUE(containsDoc(adaptiveDocs, doc));
+}
+
+// ADAPTIVE leaves a named field out of a batch where no document has a value.
+TEST_F(DocFormatTest, adaptiveLeavesOutNamedFieldWithoutValues) {
+  CollectionHelper ch;
+  indexBooks(ch);
+
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("title_t", "messiah")
+      .fields({"id", "price_d"})
+      .documentFormat(api::DocFormat::ADAPTIVE).limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  const auto* dl = req->docList("q");
+  ASSERT_NE(dl, nullptr);
+  EXPECT_EQ(1, dl->row_count);
+  EXPECT_NE(nullptr, dl->columns.find("id"));
+  EXPECT_EQ(nullptr, dl->columns.find("price_d"));
+  for (const auto& row : dl->docs) EXPECT_EQ(nullptr, row.fields.find("price_d"));
+}
+
+// COLUMNS settles discovered columns per batch: one with no value in a batch
+// is left out of that batch and present in the next; a named column is in
+// every batch.
+TEST_F(DocFormatTest, columnsDiscoveredColumnsVaryPerBatch) {
+  CollectionHelper ch;
+  ASSERT_TRUE(ch.indexAll({flatdoc("id", "d0", "n_i", (int64_t)0),
+                           flatdoc("id", "d1", "n_i", (int64_t)1),
+                           flatdoc("id", "d2", "n_i", (int64_t)2, "extra_s", "x"),
+                           flatdoc("id", "d3", "n_i", (int64_t)3, "rating_f", 1.5f)},
+                          UpdateMessage::COMMIT).success);
+  auto req = localReq(ch.getSearchEngine());
+  auto& cursor = req->collection("main").topDocs("q").allQuery().fields({"rating_f", "*"})
+      .documentFormat(api::DocFormat::COLUMNS).batchSize(2).limit(-1);
+  auto* sorts = api::build::allocArray(std::get<api::TopDocs>(cursor.rawOp().kind).sort, 1, cursor.mr());
+  sorts[0].expr = "n_i";
+  sorts[0].dir = api::SortSpec::SortDir::ASC;
+  req->execute();
+  ASSERT_OK(req);
+  ASSERT_EQ(2u, req->responses.size());
+  for (size_t b = 0; b < 2; b++) {
+    const auto* op = req->responses[b]->proto.ops.find("q");
+    ASSERT_NE(nullptr, op);
+    const auto* dl = (**op).docList();
+    ASSERT_NE(nullptr, dl);
+    EXPECT_EQ(2, dl->row_count);
+    EXPECT_TRUE(dl->docs.empty());
+    EXPECT_NE(nullptr, dl->columns.find("rating_f")) << b;  // named: every batch
+    EXPECT_EQ(b == 1, dl->columns.find("extra_s") != nullptr) << b;
+  }
+}
+
+// ADAPTIVE also moves sparse multi-valued and stored text fields to docs;
+// the merged documents equal the ROWS result.
+TEST_F(DocFormatTest, adaptiveMovesMultiValuedAndStoredFields) {
+  CollectionHelper ch;
+  std::vector<Doc> corpus{flatdoc("id", "d0", "year_i", (int64_t)2000,
+                                  "tags_ss", vecs("scifi", "classic"), "title_t", "dune novel")};
+  for (int i = 1; i < 20; i++) {
+    corpus.push_back(flatdoc("id", "d" + std::to_string(i), "year_i", (int64_t)(2000 + i)));
+  }
+  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(corpus), UpdateMessage::COMMIT).success);
+
+  auto run = [&](api::DocFormat fmt) {
+    auto req = localReq(ch.getSearchEngine());
+    req->collection("main").topDocs("q").allQuery()
+        .fields({"id", "year_i", "tags_ss", "title_t"}).documentFormat(fmt).limit(-1);
+    req->execute();
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    return req;
+  };
+  auto adaptive = run(api::DocFormat::ADAPTIVE);
+  const auto* dl = adaptive->docList("q");
+  ASSERT_NE(dl, nullptr);
+  EXPECT_NE(nullptr, dl->columns.find("year_i"));
+  EXPECT_EQ(nullptr, dl->columns.find("tags_ss"));
+  EXPECT_EQ(nullptr, dl->columns.find("title_t"));
+  ASSERT_EQ(20u, dl->docs.size());
+
+  auto rowDocs = run(api::DocFormat::ROWS)->getDocs();
+  auto adaptiveDocs = adaptive->getDocs();
+  ASSERT_EQ(rowDocs.size(), adaptiveDocs.size());
+  for (const auto& doc : rowDocs) EXPECT_TRUE(containsDoc(adaptiveDocs, doc));
+}
+
+// ListFields reports the retrievable catalog, including dynamic fields that
+// the authored schema never names.
+TEST_F(DocFormatTest, listFieldsIncludesDynamicFields) {
+  CollectionHelper ch;
+  indexBooks(ch);
+  std::pmr::monotonic_buffer_resource arena;
+  api::FieldsResponse response;
+  ch.collection().getReaderManager().listFields(response, arena);
+  std::map<std::string, std::string> byName;
+  for (const auto& f : response.fields) byName[std::string(f.name)] = std::string(f.type);
+  EXPECT_EQ("int", byName["year_i"]);
+  EXPECT_EQ("text", byName["title_t"]);
+  EXPECT_EQ("string", byName["tags_ss"]);
+  EXPECT_EQ(0u, byName.count("_version_"));
 }
 
 // Patterns with literal prefix/suffix parts select just the matching fields;
@@ -331,7 +486,7 @@ TEST_F(DocFormatTest, wildcardPatternSelectsMatchingFields) {
 }
 
 // Explicit wins on collision regardless of position: a field named after a
-// pattern that also matches it stays a dense column, appearing exactly once.
+// pattern that also matches it appears exactly once.
 TEST_F(DocFormatTest, wildcardExplicitWinsOnCollision) {
   CollectionHelper ch;
   indexBooks(ch);
@@ -345,12 +500,10 @@ TEST_F(DocFormatTest, wildcardExplicitWinsOnCollision) {
   ASSERT_OK(req);
   const auto* dl = req->docList("q");
   ASSERT_NE(dl, nullptr);
-  ASSERT_EQ(1u, dl->columns.size());
+  ASSERT_EQ(2u, dl->columns.size());
   EXPECT_NE(nullptr, dl->columns.find("title_t"));
-  ASSERT_EQ(3u, dl->docs.size());
-  for (const auto& row : dl->docs) {
-    EXPECT_EQ(nullptr, row.fields.find("title_t"));
-  }
+  EXPECT_NE(nullptr, dl->columns.find("tags_ss"));
+  EXPECT_TRUE(dl->docs.empty());
   EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("title_t", std::string("dune novel"),
                                               "tags_ss", vecs("classic", "scifi")));
 }
@@ -455,7 +608,7 @@ TEST_F(FieldVariantsProjectionTest, discoveryReturnsConcreteLogicalRootsOnce) {
     EXPECT_CONTAINS_DOC(docs, flatdoc("id", "b", "translator_name", "A Translator"));
     const auto* dl = req->docList("q");
     ASSERT_NE(dl, nullptr);
-    EXPECT_TRUE(dl->columns.empty());
+    EXPECT_TRUE(dl->docs.empty());  // the gRPC default is COLUMNS
     if (fields.size() == 0) {
       EXPECT_EQ("id", docs[0][0].name);
     }
@@ -497,12 +650,11 @@ TEST_F(FieldVariantsProjectionTest, explicitKeysWinWildcardPlacementAndDeduplica
   ASSERT_OK(req);
   const auto* dl = req->docList("q");
   ASSERT_NE(dl, nullptr);
-  ASSERT_EQ(2u, dl->columns.size());
-  EXPECT_NE(nullptr, dl->columns.find("author"));
-  EXPECT_NE(nullptr, dl->columns.find("author__s"));
-  for (const auto& row : dl->docs) {
-    EXPECT_EQ(nullptr, row.fields.find("author"));
-    EXPECT_EQ(nullptr, row.fields.find("author__s"));
+  EXPECT_TRUE(dl->docs.empty());
+  for (std::string_view name : {"author", "author__s"}) {
+    size_t n = 0;
+    for (const auto& [key, col] : dl->columns) n += key == name ? 1 : 0;
+    EXPECT_EQ(1u, n) << name;
   }
   EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "a", "author", "Le Guin",
       "author__s", "le guin", "authors", vecs("Zed", "Ada", "Zed"),

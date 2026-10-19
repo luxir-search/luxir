@@ -81,6 +81,7 @@ struct FieldVariants; struct FieldDefaults; struct NormalizerDef; struct StoredR
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
+struct FieldsRequest; struct FieldInfo; struct FieldsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
 struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
@@ -107,7 +108,7 @@ enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR =
 }
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
-enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2 };
+enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
@@ -528,6 +529,9 @@ struct DeleteCollectionRequest { std::string_view name; std::string_view tenant;
 struct DeleteCollectionResponse { std::string_view name; };
 struct ListCollectionsResponse { std::span<const std::string_view> collections; };
 struct ListTenantsResponse { std::span<const std::string_view> tenants; };
+struct FieldsRequest { std::string_view collection; std::string_view tenant; };
+struct FieldInfo { std::string_view name; std::string_view type; bool derived = false; };
+struct FieldsResponse { std::span<const FieldInfo> fields; };
 struct MultiVector { std::span<const ArrVector> v; };
 struct ArrVal { std::span<const Val> v; };                       // span<incomplete Val> OK
 
@@ -842,7 +846,7 @@ LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef) LUXIR_TD
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
-LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
+LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse) LUXIR_TD(FieldsRequest) LUXIR_TD(FieldInfo) LUXIR_TD(FieldsResponse)
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
@@ -888,6 +892,7 @@ LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
 LUXIR_ENTRY(ListCollectionsResponse)
+LUXIR_ENTRY(FieldsRequest) LUXIR_ENTRY(FieldInfo) LUXIR_ENTRY(FieldsResponse)
 LUXIR_ENTRY(ListTenantsResponse)
 LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStatus) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
