@@ -26,6 +26,7 @@
 #include "luxir/query/QueryPrep.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/OrdMapStr.h"
+#include "luxir/search/RangeFacetGrid.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/util/AtomicMerger.h"
 #include "luxir/util/NumericUtils.h"
@@ -52,12 +53,12 @@ public:
   static constexpr bool isContiguous = false;
   FacetDimension groupDimension() const { return groupPlan->dimension; }
 
-  template <typename Visit>
+  template <bool Growing = false, typename Visit>
   void collectGroups(DistinctFacetCounts& data, int32_t segnum, DocSet* domain, Visit&& visit) {
     auto pool = MemPool::threadLocalPoolGuard();
     CollapseKeyReader keys(*countDistinct);
     keys.withWalk(segnum, domain, [&](auto read) {
-      data.collect([&](auto add, auto missing) {
+      auto collect = [&](auto add, auto missing) {
         if constexpr (std::is_same_v<std::invoke_result_t<decltype(read), int32_t>, const CollapseKey*>) {
           int32_t previous = -1;
           GroupIdentity saved{GroupIdentity::DROP};
@@ -66,7 +67,9 @@ public:
             return saved;
           }, add, missing);
         } else visit(read, add, missing);
-      });
+      };
+      if constexpr (Growing) data.collectValues(collect);
+      else data.collect(collect);
     });
   }
   IndexReader& reader;
@@ -1673,9 +1676,13 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
   int64_t affineGap;
   FieldType::Type valueType;
   bool affine;
-  bool trimEdges = false;
-  int64_t keepLo = std::numeric_limits<int64_t>::max();
-  int64_t keepHi = -1;
+  std::optional<RangeFacetGrid> grid;
+  std::optional<int64_t> wideningStart, wideningEnd;
+
+  struct DataCounts;
+  template <bool Distinct, bool Floating = false> class DataCalc;
+  Calculator* createDataCalculator(Calculator* parent, int64_t slot, int64_t numSlots,
+                                    const StructuralConstraint* structural);
 
   // Bucket index for an in-range value (caller checks [front, back)).
   size_t bucketOf(int64_t val) const {
@@ -1703,6 +1710,16 @@ public:
     fences(fences), affineGap(affineGap), valueType(valueType),
     affine(affine) {}
 
+  IntFacetRangeReq(SearchRequest& req,
+      std::string_view fieldName, std::string_view facetName,
+      RangeFacetGrid grid, std::optional<int64_t> start, std::optional<int64_t> end,
+      FieldType::Type valueType, int64_t minCount, bool missing)
+    : FixedBucketFacetReq(req, fieldName, facetName, minCount, missing, 0, {}),
+      affineGap(0), valueType(valueType), affine(false), grid(std::move(grid)),
+      wideningStart(start), wideningEnd(end) {}
+
+  size_t facetBucketResidentBytes() const override;
+
   size_t bindingStateChunkBytes() const override {
     return forcedRangeFacetBindingStateChunkBytes != 0
         ? forcedRangeFacetBindingStateChunkBytes
@@ -1719,32 +1736,12 @@ public:
     return FacetBucketProducer::JOINT;
   }
 
-  // bounds=DATA over the request's own domain: the fences cover the field's
-  // whole data range, so drop the empty buckets before the first and after the
-  // last nonempty one, except the span [keepLo, keepHi] an explicit start or
-  // end asks for.
-  void trimEmptyEdges(int64_t keepLo, int64_t keepHi) {
-    trimEdges = true;
-    this->keepLo = keepLo;
-    this->keepHi = keepHi;
-  }
-
   std::vector<size_t> emittedBuckets(
       CountView merged,
       std::span<const uint8_t> pinned) const override {
     std::vector<size_t> emitted;
     emitted.reserve(bucketCount());
-    int64_t lo = keepLo, hi = keepHi;
-    if (trimEdges) {
-      for (size_t i = 0; i < bucketCount(); i++) {
-        if (!merged.counts.empty() && merged.counts[i] > 0) {
-          lo = std::min(lo, (int64_t)i);
-          hi = std::max(hi, (int64_t)i);
-        }
-      }
-    }
     for (size_t i = 0; i < bucketCount(); i++) {
-      if (trimEdges && ((int64_t)i < lo || (int64_t)i > hi)) continue;
       int64_t count = merged.counts.empty() ? 0 : merged.counts[i];
       if (pinned[i] != 0 || count >= minCount) emitted.push_back(i);
     }
@@ -1756,6 +1753,13 @@ public:
       CountView merged,
       std::span<const size_t> emitted,
       std::pmr::memory_resource& mr) const override {
+    emitRangeResult(result, merged, emitted, mr, fences);
+  }
+
+  void emitRangeResult(
+      luxir::api::FacetResult& result, CountView merged,
+      std::span<const size_t> emitted, std::pmr::memory_resource& mr,
+      std::span<const int64_t> layout) const {
     size_t n = emitted.size();
     auto emitBounds = [&]<typename Outer>(auto decode) {
       auto& bucketIds = result.bucket_ids.emplace().kind.emplace<Outer>();
@@ -1764,8 +1768,8 @@ public:
       for (size_t i = 0; i < n; i++) {
         size_t bucket = emitted[i];
         auto* bounds = build::allocArray(pairs[i].v, 2, mr);
-        bounds[0] = decode(fences[bucket]);
-        bounds[1] = decode(fences[bucket + 1]);
+        bounds[0] = decode(layout[bucket]);
+        bounds[1] = decode(layout[bucket + 1]);
         counts[i] = merged.counts.empty() ? 0 : merged.counts[bucket];
       }
     };
@@ -1935,6 +1939,7 @@ public:
   Calculator* createCalculator(
       Calculator* parent, int64_t slot, int64_t numSlots = -1,
       const StructuralConstraint* structural = nullptr) override {
+    if (grid) return createDataCalculator(parent, slot, numSlots, structural);
     if (countDistinct != nullptr) return new Calc<true>(*this, parent, slot, numSlots, structural);
     return new Calc<false>(*this, parent, slot, numSlots, structural);
   }

@@ -7,6 +7,7 @@
 #include <stdexcept>
 
 #include "luxir/util/NumericUtils.h"
+#include "luxir/util/ApiError.h"
 #include "luxir/util/luxir_util.h"
 
 namespace luxir {
@@ -21,14 +22,14 @@ __int128 floorDiv(__int128 value, __int128 divisor) {
 
 int64_t fit(__int128 value) {
   if (value < INT64_MIN || value > INT64_MAX) {
-    throw std::runtime_error("range fence arithmetic overflow");
+    throw RequestError("range fence arithmetic overflow");
   }
   return (int64_t)value;
 }
 
 int64_t civilFit(__int128 value) {
   if (value < dd::kMinEpochMs || value > dd::kMaxEpochMs) {
-    throw std::runtime_error("range fence is outside the supported civil range");
+    throw RequestError("range fence is outside the supported civil range");
   }
   return (int64_t)value;
 }
@@ -53,7 +54,7 @@ sys_info infoAt(const TimeZone& zone, int64_t instant) {
   // at/after its end (libstdc++ at 32767-12-31). Traversal must not treat that
   // non-advancing endpoint as another transition and spin indefinitely.
   if (value < info.begin || value >= info.end) {
-    throw std::runtime_error("range fence is outside the time-zone database's supported interval");
+    throw RequestError("range fence is outside the time-zone database's supported interval");
   }
   return info;
 }
@@ -64,7 +65,7 @@ int64_t offsetMillis(const sys_info& info) {
 
 void checkBucketCount(uint64_t count, size_t cap, bool clip) {
   if (count > cap) {
-    throw std::runtime_error("range exceeds the " + std::to_string(cap)
+    throw RequestError("range exceeds the " + std::to_string(cap)
         + " bucket limit" + (clip ? "" : "; use a larger gap"));
   }
 }
@@ -94,7 +95,7 @@ void RangeFacetGrid::visitCalendarFences(
   std::optional<int64_t> shifted;
   for (;;) {
     if (!followingCivil) {
-      throw std::runtime_error("calendar fence is outside the supported civil range");
+      throw RequestError("calendar fence is outside the supported civil range");
     }
     int64_t previousCivil = civil;
     civil = *followingCivil;
@@ -105,7 +106,7 @@ void RangeFacetGrid::visitCalendarFences(
     auto instant = substituted ? shifted : resolver.resolve(civil);
     shifted.reset();
     if (!instant) {
-      throw std::runtime_error("calendar fence is outside the supported civil range");
+      throw RequestError("calendar fence is outside the supported civil range");
     }
     if (!substituted && followingCivil
         && resolver.intervalSkipped(civil, *followingCivil)) {
@@ -113,7 +114,7 @@ void RangeFacetGrid::visitCalendarFences(
       shifted = instant;
       continue;
     }
-    if (*instant < previous) throw std::runtime_error("calendar fences are not increasing");
+    if (*instant < previous) throw RequestError("calendar fences are not increasing");
     if (*instant == previous) {
       if (skippedCivil) skippedCivil->push_back(previousCivil);
       continue;
@@ -129,9 +130,9 @@ RangeFacetGrid::RangeFacetGrid(Kind kind, FieldType::Type type, TimeZone zone)
 RangeFacetGrid RangeFacetGrid::fixed(FieldType::Type type, int64_t gap, int64_t origin,
                                     TimeZone zone) {
   if (type != FieldType::Type::INT && type != FieldType::Type::DATE) {
-    throw std::runtime_error("integer grid requires INT or DATE");
+    throw RequestError("integer grid requires INT or DATE");
   }
-  if (gap <= 0) throw std::runtime_error("range gap must be > 0");
+  if (gap <= 0) throw RequestError("range gap must be > 0");
   RangeFacetGrid result(Kind::FIXED, type, type == FieldType::Type::DATE ? zone : TimeZone::utc());
   result.gap = gap;
   result.origin = origin;
@@ -140,10 +141,10 @@ RangeFacetGrid RangeFacetGrid::fixed(FieldType::Type type, int64_t gap, int64_t 
 
 RangeFacetGrid RangeFacetGrid::floating(FieldType::Type type, double gap, double origin) {
   if (type != FieldType::Type::FLOAT && type != FieldType::Type::DOUBLE) {
-    throw std::runtime_error("floating grid requires FLOAT or DOUBLE");
+    throw RequestError("floating grid requires FLOAT or DOUBLE");
   }
   if (!std::isfinite(gap) || gap <= 0 || !std::isfinite(origin)) {
-    throw std::runtime_error("range gap must be finite and > 0; origin must be finite");
+    throw RequestError("range gap must be finite and > 0; origin must be finite");
   }
   RangeFacetGrid result(Kind::FLOATING, type, TimeZone::utc());
   result.floatingGap = gap;
@@ -154,14 +155,14 @@ RangeFacetGrid RangeFacetGrid::floating(FieldType::Type type, double gap, double
 RangeFacetGrid RangeFacetGrid::calendar(CalendarUnit unit, int64_t n, TimeZone zone,
                                        std::optional<int64_t> start) {
   if (n <= 0 || unit < CalendarUnit::DAY || unit > CalendarUnit::YEAR) {
-    throw std::runtime_error("calendar_gap requires n > 0 and a DAY/WEEK/MONTH/QUARTER/YEAR unit");
+    throw RequestError("calendar_gap requires n > 0 and a DAY/WEEK/MONTH/QUARTER/YEAR unit");
   }
   RangeFacetGrid result(Kind::CALENDAR, FieldType::Type::DATE, zone);
   result.unit = unit;
   result.n = n;
   if (start) {
     auto civil = civilFromInstant(*start, zone);
-    if (!civil) throw std::runtime_error("calendar bounds are outside the supported civil range");
+    if (!civil) throw RequestError("calendar bounds are outside the supported civil range");
     result.anchor = civil->millis;
     result.preferredOffset = civil->offset;
   } else {
@@ -177,10 +178,10 @@ RangeFacetGrid RangeFacetGrid::calendar(CalendarUnit unit, int64_t n, TimeZone z
 int64_t RangeFacetGrid::encode(double value) const {
   if (type == FieldType::Type::FLOAT) {
     float rounded = (float)value;
-    if (!std::isfinite(rounded)) throw std::runtime_error("fence is not finite after FLOAT rounding");
+    if (!std::isfinite(rounded)) throw RequestError("fence is not finite after FLOAT rounding");
     return (int64_t)floatToSortableInt32(rounded);
   }
-  if (!std::isfinite(value)) throw std::runtime_error("fence is not finite after DOUBLE rounding");
+  if (!std::isfinite(value)) throw RequestError("fence is not finite after DOUBLE rounding");
   return doubleToSortableInt64(value);
 }
 
@@ -193,7 +194,7 @@ RangeFacetGrid::Cell RangeFacetGrid::floatingCell(int64_t index) const {
 
 int64_t RangeFacetGrid::calendarCivil(int64_t index) const {
   auto civil = civilCalendarAt(anchor, fit((__int128)index * n), unit);
-  if (!civil) throw std::runtime_error("calendar fence is outside the supported civil range");
+  if (!civil) throw RequestError("calendar fence is outside the supported civil range");
   return *civil;
 }
 
@@ -214,7 +215,7 @@ RangeFacetGrid::Cell RangeFacetGrid::calendarCell(int64_t index) const {
     if (previous && civilIntervalSkipped(*previous, civil, zone)) civil = *previous;
   }
   auto instant = instantFromCivil(civil, zone, preferredOffset);
-  if (!instant) throw std::runtime_error("calendar fence is outside the supported civil range");
+  if (!instant) throw RequestError("calendar fence is outside the supported civil range");
   return {*instant, index};
 }
 
@@ -268,16 +269,16 @@ RangeFacetGrid::Cell RangeFacetGrid::floor(int64_t value) const {
   if (kind == Kind::FLOATING) {
     double decoded = type == FieldType::Type::FLOAT ? (double)sortableInt32ToFloat((int32_t)value)
                                         : sortableInt64ToDouble(value);
-    if (!std::isfinite(decoded)) throw std::runtime_error("cannot floor a non-finite value");
+    if (!std::isfinite(decoded)) throw RequestError("cannot floor a non-finite value");
     long double index = std::floor(((long double)decoded - floatingOrigin) / floatingGap);
     // At larger indices unit increments cannot yield distinct double fences.
     if (index <= (long double)INT64_MIN || index >= (long double)INT64_MAX) {
-      throw std::runtime_error("floating grid index overflow");
+      throw RequestError("floating grid index overflow");
     }
     Cell cell = floatingCell((int64_t)index);
     while (cell.key > value) {
       Cell previous = floatingCell(fit((__int128)cell.index - 1));
-      if (previous.key >= cell.key) throw std::runtime_error("fences are not strictly increasing after floating rounding");
+      if (previous.key >= cell.key) throw RequestError("fences are not strictly increasing after floating rounding");
       cell = previous;
     }
     for (;;) {
@@ -294,7 +295,7 @@ RangeFacetGrid::Cell RangeFacetGrid::floor(int64_t value) const {
   }
   if (kind == Kind::CALENDAR) {
     auto civil = civilFromInstant(value, zone);
-    if (!civil) throw std::runtime_error("calendar bounds are outside the supported civil range");
+    if (!civil) throw RequestError("calendar bounds are outside the supported civil range");
     __int128 index;
     if (gap) {
       index = floorDiv((__int128)civil->millis - anchor, gap);
@@ -326,7 +327,7 @@ RangeFacetGrid::Cell RangeFacetGrid::next(Cell cell, std::vector<int64_t>* skipp
   if (kind == Kind::FLOATING) {
     Cell result = floatingCell(fit((__int128)cell.index + 1));
     if (result.key <= cell.key) {
-      throw std::runtime_error("fence " + std::to_string(cell.index + 1)
+      throw RequestError("fence " + std::to_string(cell.index + 1)
           + " is not strictly increasing after " + (type == FieldType::Type::FLOAT ? "FLOAT" : "DOUBLE") + " rounding");
     }
     return result;
@@ -361,8 +362,33 @@ std::optional<int64_t> RangeFacetGrid::affineGap(int64_t start, int64_t end) con
   }
 }
 
+std::vector<int64_t> RangeFacetGrid::skippedCalendarCells(int64_t lo, int64_t end) const {
+  std::vector<int64_t> skipped;
+  if (kind != Kind::CALENDAR || !zone.isIana()) return skipped;
+  int64_t probe = lo;
+  for (;;) {
+    auto info = infoAt(zone, probe);
+    int64_t transition = endMillis(info);
+    if (transition > end || transition > dd::kMaxEpochMs) return skipped;
+    auto following = infoAt(zone, transition);
+    // The local resolver owns skipped-label normalization, including text
+    // tzdb discrepancies between system and civil transition endpoints.
+    if (offsetMillis(following) > offsetMillis(info)) {
+      // The normalized surviving boundary can precede the sys_info jump
+      // (Apia's text-tzdb endpoint differs by an hour). Step back from the
+      // canonical boundary itself, not from the raw transition instant.
+      auto boundary = floor(transition);
+      if (boundary.key > lo) {
+        auto previous = floor(boundary.key - 1);
+        if (previous.key >= lo) next(previous, &skipped);
+      }
+    }
+    probe = transition;
+  }
+}
+
 RangeFacetGrid::Fences RangeFacetGrid::fences(int64_t lo, int64_t hi, bool clip, size_t cap) const {
-  if (clip ? lo >= hi : lo > hi) throw std::runtime_error("range start must be less than end");
+  if (clip ? lo >= hi : lo > hi) throw RequestError("range start must be less than end");
   Cell first = kind == Kind::FLOATING && clip && floatingCell(0).key == lo
       ? floatingCell(0) : floor(lo);
   int64_t start = clip ? lo : first.key;

@@ -81,6 +81,10 @@ public:
   // just a representation choice; floor/next define the same fence set.
   std::optional<int64_t> affineGap(int64_t start, int64_t end) const;
 
+  // O(number of zone transitions), for execution-time calendar warnings.
+  // Returns only skipped labels between surviving fences in [lo,end].
+  std::vector<int64_t> skippedCalendarCells(int64_t lo, int64_t end) const;
+
   // clip=true: exact EXPLICIT endpoints. Otherwise cover inclusive [lo,hi].
   // The cap applies to the final, deduplicated bucket count.
   Fences fences(int64_t lo, int64_t hi, bool clip, size_t cap = 100000) const;

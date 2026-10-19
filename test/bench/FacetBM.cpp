@@ -249,32 +249,71 @@ struct RangeDataBenchFixture {
   }
 };
 
+enum class RangeDataBenchMode { INT, DATE, IANA, NARROW, DISTINCT, NESTED };
+
 static void BM_RangeFacetData(benchmark::State& state, int64_t nDocs,
-                              std::string_view shape, bool date, bool iana) {
+                              std::string_view shape, RangeDataBenchMode mode,
+                              bool forceWalk = false) {
   RangeDataBenchFixture fixture(nDocs, shape);
+  bool savedWalk = IntFacetRangeReq::disablePointsRangeFacetForTests;
+  auto* savedCounter = facetBucketBlockCounter;
+  size_t blocks = 0, peak = 0, buckets = 0;
+  IntFacetRangeReq::disablePointsRangeFacetForTests = forceWalk;
+  facetBucketBlockCounter = &blocks;
+  auto restore = scope_guard([&]() noexcept {
+    IntFacetRangeReq::disablePointsRangeFacetForTests = savedWalk;
+    facetBucketBlockCounter = savedCounter;
+  });
   int64_t fingerprint = -1;
   for (auto _ : state) {
+    blocks = 0;
     auto req = localReq(fixture.helper.getSearchEngine());
     req->collection("facet_range_data_bm");
-    if (iana) req->timeZone("America/New_York");
-    req->rangeFacet("f", date ? "date_dt" : "data_i")
-        .rangeData(date ? 3600000 : 100000);
+    if (mode == RangeDataBenchMode::IANA) req->timeZone("America/New_York");
+    OpCursor* facet;
+    if (mode == RangeDataBenchMode::NARROW) {
+      auto& top = req->topDocs("q").limit(0).exprQuery("retention_dt:[2025-01-01T00:00Z TO 2025-01-02T00:00Z}");
+      facet = &top.rangeFacet("f", "retention_dt").rangeData(60000);
+    } else if (mode == RangeDataBenchMode::NESTED) {
+      facet = &req->facet("parents", "parent_s").limit(-1)
+          .rangeFacet("f", "retention_dt").rangeData(3600000);
+    } else {
+      bool date = mode == RangeDataBenchMode::DATE || mode == RangeDataBenchMode::IANA;
+      facet = &req->rangeFacet("f", date ? "date_dt" : "data_i")
+          .rangeData(date ? 3600000 : 100000);
+    }
+    if (mode == RangeDataBenchMode::DISTINCT) {
+      auto& range = std::get<api::RangeFacet>(facet->rawOp().kind);
+      auto* key = api::build::allocMessage<api::Collapse>(req->mr);
+      *api::build::allocArray(key->field, 1, req->mr) = "group_i";
+      range.count_distinct = key;
+    }
     req->execute(false);
     ASSERT_TRUE(req->ok()) << req->errorMsg();
-    const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
     int64_t current = 0;
-    const auto& bounds = std::get<api::ArrArrInt>(result->bucket_ids->kind).v;
-    for (size_t i = 0; i < result->counts.size(); i++) {
-      current = (int64_t)((uint64_t)current * 31 + (uint64_t)bounds[i].v[0] + result->counts[i]);
-    }
+    buckets = 0;
+    auto consume = [&](const api::FacetResult& result) {
+      const auto& bounds = std::get<api::ArrArrInt>(result.bucket_ids->kind).v;
+      buckets += result.counts.size();
+      for (size_t i = 0; i < result.counts.size(); i++) {
+        current = (int64_t)((uint64_t)current * 31 + (uint64_t)bounds[i].v[0] + result.counts[i]);
+      }
+    };
+    if (mode == RangeDataBenchMode::NESTED) {
+      const auto* parents = req->responses[0]->proto.ops.at("parents")->facetResult();
+      for (const auto& child : std::get<api::ArrVal>(parents->ops.at("f")->kind).v) consume(*child.facetResult());
+    } else if (mode == RangeDataBenchMode::NARROW) consume(*req->docList()->ops.at("f")->facetResult());
+    else consume(*req->responses[0]->proto.ops.at("f")->facetResult());
     benchmark::DoNotOptimize(current);
-    if (fingerprint != -1) {
-      ASSERT_EQ(fingerprint, current);
-    }
+    if (fingerprint != -1) { ASSERT_EQ(fingerprint, current); }
     fingerprint = current;
+    peak = std::max(peak, req->memoryTracker.peak());
   }
   state.counters["fp"] = fingerprint;
   state.counters["reused"] = fixture.reused;
+  state.counters["blocks"] = (double)blocks;
+  state.counters["buckets"] = (double)buckets;
+  state.counters["peak_bytes"] = (double)peak;
 }
 
 // Existing nested fixed-bucket shapes. Keep these independent of DATA so the
@@ -557,9 +596,14 @@ LUXIR_BENCHMARK_CAPTURE(BM_Facet, lim0_bigD_u10_i,  nDocs, shape, "short_u10_s",
 
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, points,      nDocs, shape, false);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, forced_walk, nDocs, shape, true);
-LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_int, nDocs, shape, false, false);
-LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_date, nDocs, shape, true, false);
-LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_hourly, nDocs, shape, true, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_int, nDocs, shape, RangeDataBenchMode::INT);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_int_walk, nDocs, shape, RangeDataBenchMode::INT, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_date, nDocs, shape, RangeDataBenchMode::DATE);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, unfiltered_date_walk, nDocs, shape, RangeDataBenchMode::DATE, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_hourly, nDocs, shape, RangeDataBenchMode::IANA);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, narrow_retention, nDocs, shape, RangeDataBenchMode::NARROW);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, distinct_int, nDocs, shape, RangeDataBenchMode::DISTINCT);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, nested_retention, nDocs, shape, RangeDataBenchMode::NESTED);
 LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, bucket_domain,
                         AggregateFacetBenchMode::BUCKET_DOMAIN, 10);
 LUXIR_BENCHMARK_CAPTURE(BM_AggregateFacet, inline_sort_10,

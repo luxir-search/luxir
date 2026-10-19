@@ -659,61 +659,6 @@ public:
     return facet;
   }
 
-  // ---- RangeFacet bounds=DATA ----------------------------------------------
-
-  // The encoded min and max of a numeric column over every segment of the
-  // reader, from column metadata alone: a superset of any domain's range
-  // (it ignores the query and deleted documents).
-  std::optional<std::pair<int64_t, int64_t>> dataColumnBounds(std::string_view physicalName) {
-    auto infos = req.reader->field(physicalName);
-    std::optional<std::pair<int64_t, int64_t>> range;
-    for (auto& segment : req.reader->segments()) {
-      const auto* info = infos.at(segment);
-      if (!info || info->numValues == 0 || !info->columnBounds) continue;
-      const auto& bounds = *info->columnBounds;
-      if (!range) range = {bounds.min, bounds.max};
-      else range = {std::min(range->first, bounds.min), std::max(range->second, bounds.max)};
-    }
-    return range;
-  }
-
-  // The inclusive instant/value span a DATA int or DATE facet must cover: the
-  // data range widened by an explicit start and end (exclusive, so end - 1).
-  std::optional<std::pair<int64_t, int64_t>> dataIntRange(
-      std::string_view physicalName, std::optional<int64_t> start,
-      std::optional<int64_t> end) {
-    auto data = dataColumnBounds(physicalName);
-    std::optional<int64_t> lo, hi;
-    if (data) { lo = data->first; hi = data->second; }
-    if (start) lo = lo ? std::min(*lo, *start) : *start;
-    // INT64_MIN has no representable predecessor and cannot widen the span.
-    if (end && *end != INT64_MIN) hi = hi ? std::max(*hi, *end - 1) : *end - 1;
-    if (!lo || !hi) return std::nullopt;
-    return std::pair{*lo, std::max(*lo, *hi)};
-  }
-
-  // Trimming plan for a DATA facet: the bucket range an explicit start or end
-  // keeps even when empty. The facet drops other empty edge buckets.
-  struct DataTrim {
-    int64_t keepLo = std::numeric_limits<int64_t>::max();
-    int64_t keepHi = -1;
-  };
-
-  static DataTrim dataTrim(std::span<const int64_t> fences,
-                           std::optional<int64_t> start, std::optional<int64_t> end) {
-    DataTrim trim;
-    int64_t last = (int64_t)fences.size() - 2;
-    if (start) {
-      auto it = std::upper_bound(fences.begin(), fences.end(), *start);
-      trim.keepLo = std::clamp<int64_t>((it - fences.begin()) - 1, 0, last);
-    }
-    if (end) {
-      auto it = std::lower_bound(fences.begin(), fences.end(), *end);
-      trim.keepHi = std::clamp<int64_t>((it - fences.begin()) - 1, 0, last);
-    }
-    return trim;
-  }
-
   FacetReq* createRangeFacetReq(
       std::string_view facetName, const luxir::api::RangeFacet& facetReq,
       OpsPlacement placement) {
@@ -741,10 +686,12 @@ public:
             + "': range start and end are required unless bounds is DATA");
       }
     }
-    // A parent facet bucket keeps the shared fences: only a facet evaluated
-    // over the request's own domain drops its empty edge buckets.
-    bool trimEdges = dataBounds && placement != OpsPlacement::FACET_BUCKET
-        && placement != OpsPlacement::GROUP_BUCKET;
+    // DATA children already have independent bindings. Their own result
+    // children need the binding-owned layout/domain producer (next checkpoint).
+    if (dataBounds && !facetReq.ops.empty()) {
+      throw std::runtime_error("facet '" + std::string(facetName)
+          + "': bounds DATA with sub-ops is not supported yet");
+    }
     if (std::holds_alternative<std::monostate>(facetReq.gap_kind)) {
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': range gap or calendar_gap is required");
@@ -908,35 +855,14 @@ public:
       auto grid = RangeFacetGrid::floating(gridType, gap, origin);
       auto encodedStart = givenStart ? std::optional<int64_t>(grid.encode(*givenStart)) : std::nullopt;
       auto encodedEnd = givenEnd ? std::optional<int64_t>(grid.encode(*givenEnd)) : std::nullopt;
-      ParsedFences parsed;
-      DataTrim trim;
       if (dataBounds) {
-        std::optional<int64_t> lo = encodedStart, hi;
-        // End is exclusive in the encoded column representation too.
-        if (encodedEnd) hi = *encodedEnd - 1;
-        if (auto data = dataColumnBounds(facetField)) {
-          auto decode = [&](int64_t encoded) {
-            return gridType == FieldType::Type::FLOAT
-                ? (double)sortableInt32ToFloat((int32_t)encoded)
-                : sortableInt64ToDouble(encoded);
-          };
-          if (!std::isfinite(decode(data->first)) || !std::isfinite(decode(data->second))) {
-            throw std::runtime_error("facet '" + std::string(facetName)
-                + "': field has non-finite values; bounds DATA cannot span them");
-          }
-          lo = lo ? std::min(*lo, data->first) : data->first;
-          hi = hi ? std::max(*hi, data->second) : data->second;
-        }
-        if (lo && hi) {
-          parsed = makeGridFences(facetName, grid, *lo, std::max(*lo, *hi), false);
-        } else {
-          parsed = makeGridFences(facetName,
-              RangeFacetGrid::floating(gridType, 1), grid.encode(0), grid.encode(1), true);
-        }
-        trim = dataTrim(parsed.values, encodedStart, encodedEnd);
-      } else {
-        parsed = makeGridFences(facetName, grid, *encodedStart, *encodedEnd, true);
+        auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
+            facetField, facetName, std::move(grid), encodedStart, encodedEnd,
+            fieldType->type(), minCount, facetReq.missing);
+        configureMeasure(*facet, measure);
+        return facet;
       }
+      auto parsed = makeGridFences(facetName, grid, *encodedStart, *encodedEnd, true);
       checkSubOpBucketCap(parsed);
       auto selected = resolveSelectedBuckets(parsed, [&](const api::Val& value) {
         double canonical = floatingValue(value, "selected value");
@@ -948,7 +874,6 @@ public:
           req.arena, req, facetField, facetName, parsed.values,
           parsed.affine, parsed.affineGap, fieldType->type(), minCount,
           facetReq.missing, selected);
-      if (trimEdges) facet->trimEmptyEdges(trim.keepLo, trim.keepHi);
       configureMeasure(*facet, measure);
       return facet;
     }
@@ -965,8 +890,6 @@ public:
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': range start must be less than end");
     }
-    ParsedFences parsed;
-    DataTrim trim;
     auto grid = [&]() {
       if (calendar) {
         const auto& spec = std::get<api::CalendarGap>(facetReq.gap_kind);
@@ -999,16 +922,13 @@ public:
                                    gap, origin, zone);
     }();
     if (dataBounds) {
-      auto range = dataIntRange(facetField, givenStart, givenEnd);
-      if (range) parsed = makeGridFences(facetName, grid, range->first, range->second, false);
-      else parsed = makeGridFences(facetName, RangeFacetGrid::fixed(FieldType::Type::INT, 1), 0, 1, true);
-    } else {
-      parsed = makeGridFences(facetName, grid, *givenStart, *givenEnd, true);
+      auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,
+          facetField, facetName, std::move(grid), givenStart, givenEnd,
+          fieldType->type(), minCount, facetReq.missing);
+      configureMeasure(*facet, measure);
+      return facet;
     }
-    if (dataBounds) {
-      trim = dataTrim(parsed.values, givenStart,
-                      givenEnd ? std::optional<int64_t>(*givenEnd) : std::nullopt);
-    }
+    auto parsed = makeGridFences(facetName, grid, *givenStart, *givenEnd, true);
     checkSubOpBucketCap(parsed);
 
     auto selected = resolveSelectedBuckets(parsed, [&](const api::Val& value) {
@@ -1019,7 +939,6 @@ public:
         req.arena, req, facetField, facetName, parsed.values,
         parsed.affine, parsed.affineGap, fieldType->type(), minCount,
         facetReq.missing, selected);
-    if (trimEdges) facet->trimEmptyEdges(trim.keepLo, trim.keepHi);
     configureMeasure(*facet, measure);
     return facet;
   }

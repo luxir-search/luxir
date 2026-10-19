@@ -4,11 +4,12 @@
 #include "luxir/search/RangeFacetCellWindow.h"
 
 #include <stdexcept>
+#include "luxir/util/ApiError.h"
 
 namespace luxir {
 namespace {
 [[noreturn]] void capExceeded() {
-  throw std::runtime_error("range exceeds the 100000 bucket limit; use a larger gap");
+  throw RequestError("range exceeds the 100000 bucket limit; use a larger gap");
 }
 }
 
@@ -83,7 +84,7 @@ bool RangeFacetCellWindow<T>::rebuildAffine(int64_t lo, int64_t hi, bool left, u
   size_t target = std::min(cap, std::max({size_t{8}, counters.size() * 2, count + count / 2}));
   auto bounds = grid.valueBounds();
   __int128 min = bounds.first, max = bounds.second;
-  if (lo < min || hi > max) throw std::runtime_error("range fence is outside the supported civil range");
+  if (lo < min || hi > max) throw RequestError("range fence is outside the supported civil range");
   size_t extra = target - count;
   // Bias slack toward the growing end, retaining slack at the other end too.
   // Giving it all to one side degenerates into repeated full relocations for
@@ -215,7 +216,7 @@ template <typename T>
 size_t RangeFacetCellWindow<T>::grow(int64_t value) {
   auto bounds = grid.valueBounds();
   if (value < bounds.first || value > bounds.second) {
-    throw std::runtime_error("range fence is outside the supported civil range");
+    throw RequestError("range fence is outside the supported civil range");
   }
   auto cell = grid.floor(value);
   // A full-int64 affine window has an unrepresentable unsigned width. Its
@@ -235,6 +236,7 @@ size_t RangeFacetCellWindow<T>::grow(int64_t value) {
 
 template <typename T>
 void RangeFacetCellWindow<T>::widen(std::optional<int64_t> start, std::optional<int64_t> end) {
+  if (!start && !end) return;
   if (empty() && (!start || !end || *start >= *end)) return;
   int64_t lo, hi;
   if (empty()) {

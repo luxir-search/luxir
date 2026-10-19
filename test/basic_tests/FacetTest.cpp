@@ -6641,14 +6641,13 @@ TEST_F(FacetTest, dataIntegerMatchesExplicitAcrossExecutionPaths) {
       if (phase) {
         ASSERT_TRUE(helper.deleteByIds({"1", "2", "3", "4"}, UpdateMessage::COMMIT).success);
       }
-      for (int parallel : {1, -1}) for (int mincount : {0, 2}) for (bool metrics : {false, true}) {
+      for (int parallel : {1, -1}) for (int mincount : {0, 2}) {
         auto req = localReq(helper.getSearchEngine());
         req->collection("main");
         auto& data = req->rangeFacet("data", "n_i").rangeData(10, 3, -97, 103).mincount(mincount);
         auto& explicitRange = req->rangeFacet("explicit", "n_i").range(-97, 103, 10).mincount(mincount);
         for (OpCursor* cursor : {&data, &explicitRange}) {
           std::get<api::RangeFacet>(cursor->rawOp().kind).missing = true;
-          if (metrics) cursor->avg("avg", "score_i");
         }
         req->execute(parallel);
         ASSERT_OK(req);
@@ -6719,4 +6718,334 @@ TEST_F(FacetTest, dataCalendarMidnightFoldUsesEarliestFence) {
             boundsOf(rootFacetResult(*req, "m")));
   EXPECT_EQ((Counts{2}), countsOf(rootFacetResult(*req, "d")));
   EXPECT_EQ((Counts{2}), countsOf(rootFacetResult(*req, "m")));
+}
+
+TEST_F(FacetTest, dataSelectiveAndDeletedDomainIgnoresFieldSpan) {
+  CollectionHelper helper;
+  indexInts(helper, {});
+  ASSERT_TRUE(helper.index(flatdoc("id", "keep", "n_i", 0), UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "unrelated", "n_i", 200000), UpdateMessage::COMMIT).success);
+  auto run = [&] {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    req->topDocs("q").matchQuery("n_i", "0").limit(0)
+        .rangeFacet("h", "n_i").rangeData(1);
+    req->execute(false);
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+  };
+  run();
+  ASSERT_TRUE(helper.deleteById("unrelated", UpdateMessage::COMMIT).success);
+  run();
+}
+
+TEST_F(FacetTest, dataDistinctDropKeepsOccupiedEdges) {
+  CollectionHelper helper;
+  indexInts(helper, {});
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "n_i", 15), UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "n_i", 27, "key_s", "x"),
+                           UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","ops":{
+    "h":{"range_facet":{"field":"n_i","bounds":"data","gap":10,
+      "count_distinct":{"field":"key_s","missing":"drop"}}}}})", req->mr));
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ((Bounds{{10, 20}, {20, 30}}), boundsOf(rootFacetResult(*req, "h")));
+  EXPECT_EQ((Counts{0, 1}), countsOf(rootFacetResult(*req, "h")));
+}
+
+TEST_F(FacetTest, dataExcludedNonFiniteValueIsIgnored) {
+  CollectionHelper helper;
+  setRangeFacetSchema(helper, std::array{
+      RangeSchemaField{"x_d", false, false, api::FieldDef::FieldClass::DOUBLE}});
+  ASSERT_TRUE(helper.index(flatdoc("id", "keep", "x_d", 1.5), UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "unrelated", "x_d", std::numeric_limits<double>::infinity()),
+                           UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->topDocs("q").matchQuery("id", "keep").limit(0)
+      .rangeFacet("h", "x_d").rangeDataFp(1.0);
+  req->execute(false);
+  ASSERT_OK(req);
+}
+
+TEST_F(FacetTest, dataNonFiniteValuesAreOutsideBuckets) {
+  PointsRangeFacetTestGuard guard;
+  for (auto type : {api::FieldDef::FieldClass::FLOAT, api::FieldDef::FieldClass::DOUBLE}) {
+    for (bool points : {false, true}) for (bool includeFinite : {false, true}) {
+      CollectionHelper helper;
+      helper.clear();
+      setRangeFacetSchema(helper, std::array{RangeSchemaField{"x_d", points, false, type}});
+      std::vector<Doc> docs{
+          flatdoc("id", "nan", "x_d", std::numeric_limits<double>::quiet_NaN()),
+          flatdoc("id", "pos", "x_d", std::numeric_limits<double>::infinity()),
+          flatdoc("id", "neg", "x_d", -std::numeric_limits<double>::infinity())};
+      if (includeFinite) docs.push_back(flatdoc("id", "finite", "x_d", 1.5));
+      ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+      for (auto query : {"*:*", "id:nan"}) {
+        auto req = localReq(helper.getSearchEngine());
+        req->collection("main");
+        auto& facet = req->topDocs("q").exprQuery(query).limit(0).rangeFacet("h", "x_d").rangeDataFp(1.0);
+        std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
+        SkipStats::rangeFacetPointsArms = 0;
+        req->execute(false);
+        ASSERT_OK(req);
+        const auto& result = topFacetResult(*req, "q", "h");
+        EXPECT_EQ(includeFinite && query == std::string_view("*:*") ? Counts{1} : Counts{}, countsOf(result));
+        EXPECT_EQ(0, result.missing.value_or(-1));
+        EXPECT_EQ(points && query == std::string_view("*:*") ? 1 : 0, SkipStats::rangeFacetPointsArms);
+        EXPECT_EQ(0u, req->memoryTracker.bytes());
+      }
+    }
+  }
+}
+
+TEST_F(FacetTest, dataMatchingOneValueRetainsOtherValues) {
+  CollectionHelper helper;
+  setRangeFacetSchema(helper, std::array{RangeSchemaField{"n_i", true, true}});
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "n_i", std::vector<int64_t>{0, 200000}),
+                           UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->topDocs("q").exprQuery("n_i:0").limit(0)
+      .rangeFacet("h", "n_i").rangeData(100000);
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ((Bounds{{0, 100000}, {100000, 200000}, {200000, 300000}}),
+            boundsOf(topFacetResult(*req, "q", "h")));
+  EXPECT_EQ((Counts{1, 0, 1}), countsOf(topFacetResult(*req, "q", "h")));
+}
+
+TEST_F(FacetTest, dataNestedEmptyFieldHasNoPlaceholder) {
+  CollectionHelper helper;
+  indexInts(helper, {}, api::FieldDef::FieldClass::INT, "n_i");
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "cat_s", "one"), UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->facet("p", "cat_s").rangeFacet("h", "n_i").rangeData(10);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& child = metricValues(rootFacetResult(*req, "p"), "h")[0];
+  EXPECT_TRUE(boundsOf(*child.facetResult()).empty()) << req->toString();
+}
+
+TEST_F(FacetTest, dataActualExtentCapUsesOnlyLiveValues) {
+  for (bool points : {false, true}) {
+    CollectionHelper helper;
+    helper.clear();
+    setRangeFacetSchema(helper, std::array{RangeSchemaField{"n_i", points, false}});
+    ASSERT_TRUE(helper.indexAll({flatdoc("id", "keep", "n_i", 0),
+        flatdoc("id", "far", "n_i", 200000)}, UpdateMessage::COMMIT).success);
+    for (bool deleted : {false, true}) {
+      if (deleted) { ASSERT_TRUE(helper.deleteById("far", UpdateMessage::COMMIT).success); }
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("main").rangeFacet("h", "n_i").rangeData(1);
+      req->execute(-1);
+      EXPECT_EQ(deleted, req->ok()) << req->toString();
+      if (!deleted) EXPECT_NE(std::string::npos, req->errorMsg().find("use a larger gap"));
+      else EXPECT_EQ((Bounds{{0, 1}}), boundsOf(rootFacetResult(*req, "h")));
+    }
+  }
+}
+
+TEST_F(FacetTest, dataNestedBindingsHaveIndependentExtents) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "a", "parent_s", "a", "n_i", 15),
+      flatdoc("id", "b", "parent_s", "b", "n_i", 200027)}, UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").facet("p", "parent_s").limit(-1)
+      .rangeFacet("h", "n_i").rangeData(1);
+  req->execute(-1);
+  ASSERT_OK(req);
+  const auto& parent = rootFacetResult(*req, "p");
+  const auto& keys = std::get<api::ColStr>(parent.bucket_ids->kind).v;
+  const auto children = metricValues(parent, "h");
+  ASSERT_EQ(2u, children.size());
+  for (size_t i = 0; i < keys.size(); i++) {
+    int64_t lower = keys[i] == "a" ? 15 : 200027;
+    EXPECT_EQ((Bounds{{lower, lower + 1}}), boundsOf(*children[i].facetResult()));
+    EXPECT_EQ((Counts{1}), countsOf(*children[i].facetResult()));
+  }
+}
+
+TEST_F(FacetTest, dataSubOpsRejectedUntilBindingLayoutProducer) {
+  CollectionHelper helper;
+  indexInts(helper, {15});
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").rangeFacet("h", "n_i").rangeData(10).avg("mean", "n_i");
+  req->execute(false);
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("bounds DATA with sub-ops"));
+}
+
+// The oracle enumerates the actual matching values, not segment metadata or
+// another facet. Iteration counts are fixed so release failures cannot spin.
+TEST_F(FacetTest, dataStreamingMatchesLiveDomainOracle) {
+  using FC = api::FieldDef::FieldClass;
+  std::mt19937 random(12937);
+  for (auto type : {FC::INT, FC::DATE, FC::FLOAT, FC::DOUBLE}) {
+    for (bool points : {false, true}) for (int segments : {1, 5}) {
+      SCOPED_TRACE(std::format("type={} points={} segments={}", (int)type, points, segments));
+      CollectionHelper helper;
+      helper.clear();
+      setRangeFacetSchema(helper, std::array{RangeSchemaField{"value", points, true, type}});
+      bool floating = type == FC::FLOAT || type == FC::DOUBLE;
+      struct Doc { std::vector<int64_t> values; int group; bool keep, live; };
+      std::vector<Doc> docs;
+      for (int d = 0; d < 75; d++) {
+        Doc doc{{}, d % 7, d % 3 != 0, segments == 1 || d % 11 != 0};
+        std::vector<double> fp;
+        for (int v = 0; v < (d % 13 == 0 ? 0 : 1 + d % 2); v++) {
+          int64_t value = (int64_t)(random() % 71) - 35;
+          if (floating) {
+            double x = (double)value / 10 + (d % 3) * 0.001;
+            if (d % 17 == 0) x = std::numeric_limits<double>::infinity();
+            if (d % 19 == 0) x = -std::numeric_limits<double>::infinity();
+            if (d % 23 == 0) x = std::numeric_limits<double>::quiet_NaN();
+            fp.push_back(x);
+            doc.values.push_back(type == FC::FLOAT ? (int64_t)floatToSortableInt32((float)x)
+                                                  : doubleToSortableInt64(x));
+          } else {
+            if (type == FC::DATE) value = epoch(d % 2 ? "2024-03-10T07:00Z" : "2024-11-03T06:00Z") + value * 300000;
+            doc.values.push_back(value);
+          }
+        }
+        auto commit = (d + 1) % (75 / segments) == 0 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT;
+        std::string id = std::to_string(d);
+        auto result = doc.values.empty()
+            ? helper.index(flatdoc("id", id, "group_i", doc.group, "keep_s", doc.keep ? "yes" : "no"), commit)
+            : floating
+            ? helper.index(flatdoc("id", id, "group_i", doc.group, "keep_s", doc.keep ? "yes" : "no", "value", fp), commit)
+            : helper.index(flatdoc("id", id, "group_i", doc.group, "keep_s", doc.keep ? "yes" : "no", "value", doc.values), commit);
+        ASSERT_TRUE(result.success) << result.error_message;
+        docs.push_back(std::move(doc));
+      }
+      if (segments > 1) {
+        std::vector<std::string> deleted;
+        for (size_t d = 0; d < docs.size(); d++) if (!docs[d].live) deleted.push_back(std::to_string(d));
+        ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
+      }
+      for (std::string_view zoneName : {"UTC", "+05:30", "America/New_York"}) {
+        if (type != FC::DATE && zoneName != "UTC") continue;
+        SCOPED_TRACE(zoneName);
+        TimeZone zone = *resolveTimeZone(zoneName);
+        auto grid = floating ? RangeFacetGrid::floating(type == FC::FLOAT ? FieldType::FLOAT : FieldType::DOUBLE, 0.1, 0.3)
+            : RangeFacetGrid::fixed(type == FC::DATE ? FieldType::DATE : FieldType::INT,
+                type == FC::DATE ? 2700000 : 10, type == FC::DATE ? 1020000 : 3, zone);
+        for (int scenario = 0; scenario < 6; scenario++) for (int parallel : {1, -1}) {
+          bool filtered = scenario % 2 != 0;
+          int measure = scenario / 2; // values, DOCS distinct, GROUPS distinct
+          std::map<int64_t, int64_t> counts;
+          std::map<int64_t, std::set<int>> groups;
+          int64_t missing = 0;
+          std::set<int> missingGroups;
+          for (const auto& doc : docs) if (doc.live && (!filtered || doc.keep)) {
+            if (doc.values.empty()) { missing++; missingGroups.insert(doc.group); }
+            for (int64_t value : doc.values) {
+              if (floating && !std::isfinite(type == FC::FLOAT ? (double)sortableInt32ToFloat((int32_t)value) : sortableInt64ToDouble(value))) continue;
+              int64_t key = grid.floor(value).key;
+              counts[key]++;
+              groups[key].insert(doc.group);
+            }
+          }
+          ASSERT_FALSE(counts.empty());
+          int64_t lo = counts.begin()->first, hi = counts.rbegin()->first;
+          int64_t start = floating ? grid.encode(-5) : type == FC::DATE ? epoch("2024-03-09T00:00Z") : -100;
+          int64_t end = floating ? grid.encode(5) : type == FC::DATE ? epoch("2024-11-04T00:00Z") : 100;
+          bool left = scenario % 4 == 1 || scenario % 4 == 3;
+          bool right = scenario % 4 >= 2;
+          if (left) lo = std::min(lo, grid.floor(start).key);
+          if (right) hi = std::max(hi, grid.floor(end - 1).key);
+          auto decode = [&](int64_t encoded) {
+            return floating ? type == FC::FLOAT ? (double)sortableInt32ToFloat((int32_t)encoded) : sortableInt64ToDouble(encoded) : (double)encoded;
+          };
+          std::string bounds = left ? std::string(",\"start\":") + (floating ? std::to_string(decode(start)) : std::to_string(start)) : "";
+          if (right) bounds += std::string(",\"end\":") + (floating ? std::to_string(decode(end)) : std::to_string(end));
+          std::string spec = floating ? "\"gap\":0.1,\"origin\":0.3" : type == FC::DATE ? "\"gap\":2700000,\"origin\":1020000" : "\"gap\":10,\"origin\":3";
+          if (measure == 1) spec += ",\"count_distinct\":\"group_i\"";
+          if (measure == 2) spec += ",\"count_unit\":\"groups\"";
+          int mincount = scenario == 5 ? 2 : 0;
+          auto req = localReq(helper.getSearchEngine());
+          std::string json = "{\"collection\":\"main\",\"time_zone\":\"" + std::string(zoneName)
+              + "\",\"ops\":{\"q\":{\"top_docs\":{\"query\":\"" + (filtered ? std::string("keep_s:yes") : std::string("*:*"))
+              + "\",\"limit\":0," + (measure == 2 ? std::string("\"collapse\":\"group_i\",") : "")
+              + "\"ops\":{\"h\":{\"range_facet\":{\"field\":\"value\",\"bounds\":\"data\",\"missing\":true,\"mincount\":"
+              + std::to_string(mincount) + "," + spec + bounds + "}}}}}}}";
+          ASSERT_TRUE(api::read_json(req->rawRequest(), json, req->mr));
+          req->timeZone(zoneName);
+          req->execute(parallel);
+          ASSERT_OK(req) << json;
+          const auto& result = topFacetResult(*req, "q", "h");
+          EXPECT_EQ(measure == 0 ? missing : (int64_t)missingGroups.size(), result.missing.value_or(-1));
+          Bounds expectedBounds;
+          Counts expectedCounts;
+          auto cell = grid.floor(lo);
+          for (int iterations = 0; cell.key <= hi && iterations < 10000; iterations++) {
+            auto next = grid.next(cell);
+            int64_t count = measure == 0 ? counts[cell.key] : (int64_t)groups[cell.key].size();
+            if (count >= mincount) { expectedBounds.emplace_back(cell.key, next.key); expectedCounts.push_back(count); }
+            cell = next;
+          }
+          ASSERT_GT(cell.key, hi);
+          Bounds actual;
+          if (type == FC::FLOAT) for (const auto& pair : std::get<api::ArrArrFloat>(result.bucket_ids->kind).v) actual.emplace_back(floatToSortableInt32(pair.v[0]), floatToSortableInt32(pair.v[1]));
+          else if (type == FC::DOUBLE) for (const auto& pair : std::get<api::ArrArrDouble>(result.bucket_ids->kind).v) actual.emplace_back(doubleToSortableInt64(pair.v[0]), doubleToSortableInt64(pair.v[1]));
+          else actual = boundsOf(result);
+          EXPECT_EQ(expectedBounds, actual) << "scenario=" << scenario << " parallel=" << parallel;
+          EXPECT_EQ(expectedCounts, countsOf(result));
+        }
+      }
+    }
+  }
+}
+
+TEST_F(FacetTest, dataDisjointSegmentUnionEnforcesCap) {
+  CollectionHelper helper;
+  setRangeFacetSchema(helper, std::array{RangeSchemaField{"n_i", true, false}});
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "n_i", 0), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "n_i", 200000), UpdateMessage::COMMIT).success);
+  for (int parallel : {1, -1}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").rangeFacet("h", "n_i").rangeData(1);
+    req->execute(parallel);
+    EXPECT_FALSE(req->ok());
+    EXPECT_NE(std::string::npos, req->errorMsg().find("use a larger gap"));
+  }
+}
+
+TEST_F(FacetTest, dataCalendarSkippedDayWarningUsesFinalExtent) {
+  CollectionHelper helper;
+  indexInts(helper, {}, api::FieldDef::FieldClass::DATE, "when_dt");
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "when_dt", epoch("2011-12-29T12:00Z")), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "when_dt", epoch("2011-12-30T12:00Z")), UpdateMessage::COMMIT).success);
+  for (int parallel : {1, -1}) for (bool filtered : {false, true}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& top = req->topDocs("q").limit(0);
+    if (filtered) top.matchQuery("id", "b");
+    top.rangeFacet("h", "when_dt").rangeDataCalendar(1, api::CalendarGap_::Unit::DAY, "Pacific/Apia");
+    req->execute(parallel);
+    ASSERT_OK(req);
+    EXPECT_EQ(!filtered, req->hasWarning("calendar_bucket_skipped"));
+    EXPECT_EQ(filtered ? Counts{1} : (Counts{1, 1}), countsOf(topFacetResult(*req, "q", "h")));
+  }
+}
+
+TEST_F(FacetTest, dataWindowAndLayoutMemoryAreReleased) {
+  SearchOverridesGuard guard(forcedRequestMemoryMaxBytes);
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "n_i", 5, "group_i", 1), UpdateMessage::COMMIT).success);
+  for (bool distinct : {false, true}) for (size_t budget : {size_t{4096}, size_t{4 << 20}}) {
+    forcedRequestMemoryMaxBytes = budget;
+    auto req = localReq(helper.getSearchEngine());
+    std::string json = R"({"collection":"main","ops":{"h":{"range_facet":{"field":"n_i","bounds":"data","gap":1,"start":0,"end":100000)"
+        + std::string(distinct ? ",\"count_distinct\":\"group_i\"" : "") + "}}}}";
+    ASSERT_TRUE(api::read_json(req->rawRequest(), json, req->mr));
+    req->execute(false);
+    EXPECT_EQ(budget > 4096, req->ok()) << req->toString();
+    if (!req->ok()) { EXPECT_NE(std::string::npos, req->errorMsg().find("request memory breaker")); }
+    EXPECT_GT(req->memoryTracker.peak(), 0u);
+    EXPECT_EQ(0u, req->memoryTracker.bytes());
+  }
 }
