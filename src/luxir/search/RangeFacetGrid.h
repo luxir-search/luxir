@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <utility>
 #include <vector>
 
 #include "luxir/util/DateTime.h"
@@ -67,6 +68,14 @@ public:
   Cell next(Cell cell, std::vector<int64_t>* skippedCivil = nullptr) const;
   int64_t encode(double value) const;
   const TimeZone& timeZone() const { return zone; }
+  // Affine INT and UTC/fixed-offset DATE grids use the full encoded range.
+  // Calendar and IANA resolution are limited by the civil representation.
+  std::pair<int64_t, int64_t> valueBounds() const {
+    if (kind == Kind::CALENDAR || (type == FieldType::Type::DATE && zone.isIana())) {
+      return {datetime_detail::kMinEpochMs, datetime_detail::kMaxEpochMs};
+    }
+    return {INT64_MIN, INT64_MAX};
+  }
 
   // Certify [start,end), including any transition fences. A certificate is
   // just a representation choice; floor/next define the same fence set.

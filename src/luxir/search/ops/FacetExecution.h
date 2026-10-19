@@ -118,6 +118,11 @@ public:
   // and the child's column and ord-map decoding.
   static constexpr size_t CACHE_BYTES = 256 * 1024;
 
+  struct InputDomainBytes { size_t largestSegment = 0; size_t wholeReader = 0; };
+  // Conservative retained-domain bound, shared by structural routing and
+  // child plans that keep their input domains for result-stage execution.
+  static InputDomainBytes inputDomainBytes(IndexReader& reader);
+
   struct StructuralRoute {
     bool scopeNeeded = false;
     bool overrides = false;

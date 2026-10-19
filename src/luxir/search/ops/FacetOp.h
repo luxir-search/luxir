@@ -1445,8 +1445,15 @@ public:
 
   size_t bucketCount() const { return numBuckets; }
   size_t facetBucketResidentBytes() const override {
-    if (countDistinct == nullptr) return SearchOp::facetBucketResidentBytes();
-    return distinctBindingBytes({true, 0, (uint64_t)numBuckets});
+    size_t bytes = countDistinct == nullptr
+        ? saturatingAdd(sizeof(Calc<false>) + sizeof(MergeableFixedBuckets),
+            saturatingMultiply(numBuckets, sizeof(int64_t)))
+        : saturatingAdd(sizeof(Calc<true>) + sizeof(DistinctFacetCounts),
+            distinctBindingBytes({true, 0, (uint64_t)numBuckets}));
+    if (!subOps.empty() || requiresWholeReaderDomain()) {
+      bytes = saturatingAdd(bytes, FacetBucketBlockExecutor::inputDomainBytes(reader).wholeReader);
+    }
+    return bytes;
   }
   std::span<const size_t> selectedBucketIndexes() const {
     return selectedBuckets;

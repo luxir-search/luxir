@@ -277,6 +277,66 @@ static void BM_RangeFacetData(benchmark::State& state, int64_t nDocs,
   state.counters["reused"] = fixture.reused;
 }
 
+// Existing nested fixed-bucket shapes. Keep these independent of DATA so the
+// resident-byte scheduling change can be measured against the old estimate.
+static void BM_FixedBucketResident(benchmark::State& state, bool query, bool metric) {
+  RangeDataBenchFixture fixture(10'000'000, "9555");
+  size_t blocks = 0;
+  auto* savedCounter = facetBucketBlockCounter;
+  facetBucketBlockCounter = &blocks;
+  auto restore = scope_guard([&]() noexcept { facetBucketBlockCounter = savedCounter; });
+  uint64_t fingerprint = 0;
+  size_t peak = 0;
+  for (auto _ : state) {
+    blocks = 0;
+    auto req = localReq(fixture.helper.getSearchEngine());
+    auto& parent = req->collection("facet_range_data_bm").facet("parents", "parent_s").limit(-1);
+    auto& child = parent.rangeFacet("child", "data_i");
+    if (query) {
+      auto& facet = child.rawOp().kind.emplace<api::QueryFacet>();
+      auto* buckets = api::build::allocArray(facet.buckets, 64, req->mr);
+      for (size_t i = 0; i < 64; i++) {
+        buckets[i].name = api::build::arenaStr(req->mr, std::to_string(i));
+        auto* predicate = api::build::allocMessage<api::Query>(req->mr);
+        predicate->kind = true;
+        buckets[i].query = predicate;
+      }
+      if (metric) api::build::mapSlot(facet.ops, 1, "mean", req->mr)->kind.emplace<api::ExprOp>().expr = "avg(group_i)";
+    } else {
+      child.range(0, 10'000'000, metric ? 10000 : 1000);
+    }
+    if (metric && !query) child.avg("mean", "group_i");
+    req->execute(false);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto& result = *req->responses[0]->proto.ops.at("parents")->facetResult();
+    uint64_t current = 0;
+    for (auto count : result.counts) current = current * 31 + count;
+    const auto& children = std::get<api::ArrVal>(result.ops.at("child")->kind).v;
+    for (const auto& value : children) {
+      const auto& nested = *value.facetResult();
+      for (auto count : nested.counts) current = current * 31 + count;
+      if (metric) {
+        const auto& means = std::get<api::ArrVal>(nested.ops.at("mean")->kind).v;
+        for (const auto& mean : means) {
+          if (!mean.isNull()) current = current * 31 + (uint64_t)mean.asDouble();
+        }
+      }
+    }
+    if (fingerprint) { ASSERT_EQ(fingerprint, current); }
+    fingerprint = current;
+    peak = std::max(peak, req->memoryTracker.peak());
+    benchmark::DoNotOptimize(current);
+  }
+  state.counters["blocks"] = (double)blocks;
+  state.counters["peak_bytes"] = (double)peak;
+  state.counters["fp"] = (double)fingerprint;
+}
+
+LUXIR_BENCHMARK_CAPTURE(BM_FixedBucketResident, range_counts, false, false);
+LUXIR_BENCHMARK_CAPTURE(BM_FixedBucketResident, range_metric, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_FixedBucketResident, query_counts, true, false);
+LUXIR_BENCHMARK_CAPTURE(BM_FixedBucketResident, query_metric, true, true);
+
 enum class AggregateFacetBenchMode {
   BUCKET_DOMAIN,
   INLINE_SORT,

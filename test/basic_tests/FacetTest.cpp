@@ -3172,6 +3172,46 @@ TEST_F(FacetTest, wideNumericChildKeepsSharedBindingBlock) {
   }
 }
 
+TEST_F(FacetTest, fixedBucketChildrenBudgetCountersAndRetainedInputs) {
+  CollectionHelper helper;
+  for (int seg = 0; seg < 2; seg++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 32; i++) docs.push_back(flatdoc("parent_s", "p" + std::to_string(i % 4), "value_i", i));
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+  SearchOverridesGuard guard(forcedFacetBucketCacheBytes, facetBucketBlockCounter);
+  size_t blocks = 0;
+  facetBucketBlockCounter = &blocks;
+  for (bool query : {false, true}) for (bool metric : {false, true}) {
+    auto run = [&](size_t budget) {
+      forcedFacetBucketCacheBytes = budget;
+      blocks = 0;
+      auto req = localReq(helper.getSearchEngine());
+      auto& parent = req->collection("main").facet("parents", "parent_s").limit(-1);
+      auto& child = parent.rangeFacet("child", "value_i");
+      if (query) {
+        auto& facet = child.rawOp().kind.emplace<api::QueryFacet>();
+        auto* buckets = api::build::allocArray(facet.buckets, 1, req->mr);
+        buckets[0].name = "all";
+        auto* all = api::build::allocMessage<api::Query>(req->mr);
+        all->kind = true;
+        buckets[0].query = all;
+        if (metric) api::build::mapSlot(facet.ops, 1, "total", req->mr)->kind.emplace<api::ExprOp>().expr = "sum(value_i)";
+      } else {
+        child.range(0, 32, 1);
+        if (metric) child.sum("total", "value_i");
+      }
+      req->execute(false);
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
+      return encodeFacetResult(*req, "parents");
+    };
+    auto expected = run(0);
+    size_t wide = blocks;
+    EXPECT_EQ(expected, run(1));
+    EXPECT_EQ(wide + 3, blocks); // Four parent blocks rather than one.
+  }
+}
+
 // A nested string facet shares no segment work across its parent's buckets,
 // so their bindings open in blocks that keep its counts within the cache
 // budget. A sibling child whose query holds releasable per-segment state

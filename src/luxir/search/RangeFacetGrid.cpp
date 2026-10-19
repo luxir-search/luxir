@@ -45,7 +45,17 @@ int64_t endMillis(const sys_info& info) {
 }
 
 sys_info infoAt(const TimeZone& zone, int64_t instant) {
-  return zone.ianaZone()->get_info(sys_time<milliseconds>{milliseconds{instant}});
+  // Compare in seconds without converting open-ended sys_info endpoints to
+  // milliseconds (that conversion can overflow).
+  auto value = std::chrono::floor<seconds>(sys_time<milliseconds>{milliseconds{instant}});
+  auto info = zone.ianaZone()->get_info(value);
+  // Some tzdb implementations return their final interval even for values
+  // at/after its end (libstdc++ at 32767-12-31). Traversal must not treat that
+  // non-advancing endpoint as another transition and spin indefinitely.
+  if (value < info.begin || value >= info.end) {
+    throw std::runtime_error("range fence is outside the time-zone database's supported interval");
+  }
+  return info;
 }
 
 int64_t offsetMillis(const sys_info& info) {
