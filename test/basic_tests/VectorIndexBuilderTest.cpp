@@ -235,6 +235,48 @@ std::vector<std::string> runKnnIds(SearchEngine& engine, std::string_view field,
 
 } // namespace
 
+// truncate_dims: the overlay builds over the stored prefix, and full-length
+// query vectors search it after the same truncation, for both codecs and for
+// a raw (normalize_on_write=false) prefix column.
+TEST_F(VectorIndexBuilderTest, truncatedFieldBuildsOverlayOnPrefix) {
+  IvfTestGuard guard;
+  struct Case { api::VectorAnnDef ann; bool normalizeOnWrite; };
+  for (const auto& c : {Case{pqAnn(2, 2, 1), true}, Case{pqAnn(2, 2, 1), false},
+                        Case{rabitqAnn(2), true}}) {
+    SCOPED_TRACE((int)*c.ann.codec);
+    SCOPED_TRACE(c.normalizeOnWrite);
+    CollectionHelper h("main");
+    h.clear();
+    SchemaBuilder b;
+    auto& f = b.templ("_v");
+    f.type = api::FieldDef_::FieldClass::VECTOR;
+    f.metric = api::VectorMetric::COSINE;
+    f.dims = 4;
+    f.truncate_dims = 2;
+    f.normalize_on_write = c.normalizeOnWrite;
+    f.ann = c.ann;
+    b.set(h.collection());
+
+    // Prefixes (1..10, 1..8); only doc42's (3, 5) points along the query's prefix.
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", "doc" + std::to_string(i), "embedding_v",
+                      std::vector<float>{(float)(i % 10 + 1), (float)(i / 10 + 1), (float)-i, 7.0f}));
+    }
+    h.commit({"*"});
+
+    auto info = readIndexInfo(h.getIndexWriter()->dir);
+    auto meta = readVectorAuxMeta(onlyVectorOverlay(info));
+    EXPECT_EQ(meta.dims, 2);
+    EXPECT_EQ(meta.engine, *c.ann.codec == api::VectorAnnDef::Codec::PQ
+        ? VectorAuxMeta::ENGINE_IVFPQ : VectorAuxMeta::ENGINE_IVFRABITQ);
+    EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, (int32_t)!c.normalizeOnWrite);
+
+    auto ids = runKnnIds(h.getSearchEngine(), "embedding_v", {3.0f, 5.0f, 100.0f, -100.0f}, 1,
+                         /*nprobe=*/2, /*refineCandidates=*/80);
+    EXPECT_EQ(ids, std::vector<std::string>{"doc42"});
+  }
+}
+
 // One segment, one field, build all aux indexes via "*".  Verify a FAISS index file
 // is written with the expected ntotal / dims and that the IndexInfo references it.
 TEST_F(VectorIndexBuilderTest, overlayFileNamesAreCaseSafe) {

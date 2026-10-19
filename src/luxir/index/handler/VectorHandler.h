@@ -10,7 +10,6 @@
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/log.h"
 
-#include <bit>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
@@ -25,9 +24,11 @@ namespace luxir::handler {
 /// StrColHandler. The column's existing fixed-size fast path captures
 /// per-segment dims automatically (mono2MetaOff = dims*4).
 ///
-/// dims_ tracks the vector size observed so far in this segment.  If the
-/// owning VectorFieldType declares a non-zero dims, it seeds dims_ and any
-/// mismatched input is rejected.  Otherwise dims are learned from input, but
+/// dims_ tracks the stored vector size observed so far in this segment.  If
+/// the owning VectorFieldType declares a non-zero dims, its stored dims seed
+/// dims_ and any mismatched input is rejected.  With truncate_dims, an input
+/// carries dims or truncate_dims components and is cut to its truncate_dims
+/// prefix before normalization and storage.  Otherwise dims are learned from input, but
 /// only committed to dims_ once a value is actually appended to the column:
 /// a doc that fails during validation (and is rolled back / marked deleted)
 /// must not constrain later docs, while an appended value makes the
@@ -49,7 +50,7 @@ public:
     // Caller (Inverter::createPhysicalHandler) only constructs us for VECTOR-typed
     // fields, which fromProto always builds as VectorFieldType.
     auto* vft = (VectorFieldType*)(fieldType.get());
-    dims_ = vft->dims_;
+    dims_ = vft->storedDims();
     metric = vft->metric_;
     trustNormalized = vft->normalized_;
     normalizeOnWrite = vft->normalizeOnWrite_;
@@ -102,8 +103,6 @@ public:
   }
 
 private:
-  static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
-
   // The dims constraint to validate against: committed segment dims if any,
   // else dims learned earlier in the current value.
   int32_t effectiveDims() const {
@@ -118,13 +117,22 @@ private:
   }
 
   // Returns false for a zero / near-zero cosine vector. Otherwise validates
-  // dimensions and finiteness and applies write-time normalization in place.
-  bool validate(std::span<float> vec, int32_t ordinal) {
+  // finiteness and dimensions, narrows vec to the truncate_dims prefix, and
+  // applies write-time normalization in place.
+  bool validate(std::span<float>& vec, int32_t ordinal) {
     auto prefix = [&]() { return ordinal < 0 ? std::string() : fmt::format("vector {}: ", ordinal); };
     if (vec.empty()) {
       throw DocumentError(fmt::format(
           "field '{}': {}empty vector", std::string_view(fieldName), prefix()));
     }
+    // The field's input contract (length, and every element finite whatever
+    // arm it arrived in: a double past float32 range has narrowed to inf).
+    const auto& vft = (const VectorFieldType&)*fieldType;
+    if (std::string err = vft.inputError(vec); !err.empty()) {
+      throw DocumentError(fmt::format("field '{}': {}{}", std::string_view(fieldName), prefix(), err));
+    }
+    vec = vec.first(vft.storedSize(vec.size()));
+    // Without schema dims, the segment's first value sets them.
     int32_t n = (int32_t)vec.size();
     int32_t expected = effectiveDims();
     if (expected == 0) {
@@ -134,19 +142,6 @@ private:
           "field '{}': {}expected dims={}, got {}",
           std::string_view(fieldName), prefix(), expected, n));
     }
-    // Every element must be finite, whatever arm it arrived in (a double past
-    // float32 range has narrowed to inf). One branch-free pass over the exponent
-    // bits; only a failure goes back for the first bad index.
-    uint32_t nonFinite = 0;
-    for (float x : vec) nonFinite |= (uint32_t)((std::bit_cast<uint32_t>(x) & 0x7f800000u) == 0x7f800000u);
-    if (nonFinite) [[unlikely]] {
-      for (size_t i = 0; i < vec.size(); i++) {
-        if (!std::isfinite(vec[i])) {
-          throw DocumentError(fmt::format("field '{}': {}element {} is not a finite float32",
-                                          std::string_view(fieldName), prefix(), i));
-        }
-      }
-    }
     if (metric == VectorFieldType::METRIC_COSINE && !trustNormalized) {
       // Finite elements: the double sum of squares cannot overflow.
       double normSq = 0.0;
@@ -154,7 +149,7 @@ private:
         double d = (double)x;
         normSq += d * d;
       }
-      if (normSq <= MIN_COSINE_NORM_SQ) {
+      if (normSq <= VectorFieldType::MIN_COSINE_NORM_SQ) {
         // No cosine direction - skip this value rather than abort the update.
         LOG_WARN("VectorHandler: cosine field '{}' skipping zero / near-zero vector",
                  std::string_view(fieldName));

@@ -272,6 +272,7 @@ struct FieldDef {
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<LongTerms> long_terms;                          // align 4 (enum)
   std::optional<std::int32_t> dims;                             // align 4
+  std::optional<std::int32_t> truncate_dims;                    // align 4
   std::optional<Metric> metric;                                 // align 4 (enum)
   std::optional<bool> column;                                   // align 1 (optional<bool>s)
   std::optional<bool> multi;
