@@ -337,7 +337,7 @@ void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux,
 // Measures recall@k of the production IVF+PQ defaults against ground truth
 // from the exact contract path (KnnQuery.exact), through the same request
 // pipeline - same filters, collapse, and score scale, so the only variable is
-// the index.  The nprobe arg sweeps breadth (0 = the index build default,
+// the index. The nprobe arg sweeps breadth (0 = the query's adaptive default,
 // large = exhaustive over lists); recall and latency move together, which is
 // the curve that decides the shipping default.
 //
@@ -377,8 +377,8 @@ std::vector<float> makeClusteredQuery(int32_t queryOrd, int32_t dims, int32_t nC
   return vec;
 }
 
-std::vector<int32_t> clusteredDocsPerSeg(int64_t nDocs) {
-  int64_t nSegs = luxir::unit_tests ? 2 : 4;
+std::vector<int32_t> clusteredDocsPerSeg(int64_t nDocs, int64_t nSegs = 4) {
+  if (luxir::unit_tests) nSegs = 2;
   std::vector<int32_t> docsPerSeg((size_t)nSegs);
   for (int64_t seg = 0; seg < nSegs; seg++) {
     docsPerSeg[(size_t)seg] = (int32_t)(nDocs / nSegs + (seg < nDocs % nSegs ? 1 : 0));
@@ -642,14 +642,14 @@ void BM_VectorKnnRecallThreadsParallel(benchmark::State& state) {
 void BM_VectorIvfBuild(benchmark::State& state) {
   int64_t nDocs = luxir::unit_tests
       ? LuxirTest::scaleTestWork(240)
-      : 50'000;
-  int32_t dims = luxir::unit_tests ? 16 : 64;
+      : state.range(1);
+  int32_t dims = luxir::unit_tests ? 16 : (int32_t)state.range(2);
   int32_t nClusters = luxir::unit_tests ? 8 : 100;
   int32_t codec = (int32_t)state.range(0);
 
   IvfBenchGuard guard;
   CollectionHelper helper("main");
-  std::vector<int32_t> docsPerSeg = clusteredDocsPerSeg(nDocs);
+  std::vector<int32_t> docsPerSeg = clusteredDocsPerSeg(nDocs, state.range(3));
 
   double indexDocsSecs = 0;
   for (auto _ : state) {
@@ -688,6 +688,8 @@ void BM_VectorIvfBuild(benchmark::State& state) {
 
   state.counters["nDocs"] = (double)nDocs;
   state.counters["dims"] = (double)dims;
+  state.counters["segments"] = (double)docsPerSeg.size();
+  state.counters["chunkBytes"] = (double)VectorIndexBuilder::ivfAddChunkBytes;
   state.counters["docIndexSecs"] =
       state.iterations() > 0 ? indexDocsSecs / (double)state.iterations() : 0.0;
   state.counters["vecPerSec"] = benchmark::Counter(
@@ -954,7 +956,10 @@ TUNING_BENCHMARK(BM_VectorAnnDataset)->ArgNames({"codec", "nprobe", "cand"})
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that
 // LUXIR_BENCHMARK appends.
-BENCHMARK(BM_VectorIvfBuild)->ArgName("codec")->Arg(RABITQ1)->Arg(PQ)->Arg(RABITQ4)
+BENCHMARK(BM_VectorIvfBuild)->ArgNames({"codec", "nDocs", "dims", "segments"})
+    ->Args({RABITQ1, 50'000, 64, 4})->Args({PQ, 50'000, 64, 4})->Args({RABITQ4, 50'000, 64, 4})
+    // Both training and add exceed the production 16 MiB transform chunk.
+    ->Args({RABITQ1, 50'000, 128, 1})->Args({PQ, 50'000, 128, 1})
     ->UseManualTime()->Iterations(3);
 BENCHMARK(BM_VectorIvfIncrementalBuild)->ArgName("aboveThresholdFlush")
     ->Arg(0)->Arg(1)->UseManualTime()->Iterations(3);

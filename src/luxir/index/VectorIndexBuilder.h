@@ -48,10 +48,6 @@ public:
   static constexpr std::string_view NAME_PREFIX = "vec.";
   static constexpr std::string_view KIND = "vector_faiss";
 
-  // Working-memory budget for the COSINE renormalization buffer.  Mutable so
-  // tests can shrink it to exercise the multi-chunk loop on small inputs.
-  static size_t renormChunkBytes;
-
   // Normal aux builds attempt an IVF index.  Tests may disable this to verify
   // the flat-over-column fallback without changing request selectors.
   static bool buildFaissAuxIndexes;
@@ -65,6 +61,9 @@ public:
   static std::atomic<int64_t> ivfBuildCountForTests;
   static std::atomic<int64_t> ivfMergeBuildCountForTests;
   static size_t ivfTrainingSampleBytes;
+  // Per-buffer transform budget, capped by available vectors with a minimum
+  // of one vector. Training rotation uses one buffer; add uses up to two for
+  // raw cosine plus rotation. Untransformed PQ add passes column bytes directly to FAISS.
   static size_t ivfAddChunkBytes;
 
   // Seed of the RaBitQ random rotation.  Fixed so every overlay of a given

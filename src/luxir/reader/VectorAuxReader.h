@@ -351,33 +351,40 @@ public:
           name, (int)idx->d, (int32_t)meta.dims));
       }
       std::shared_ptr<const faiss::LinearTransform> rot;
+      faiss::IndexPreTransform* pt = nullptr;
+      faiss::LinearTransform* lt = nullptr;
+      faiss::Index* innerIndex = idx.get();
       if (isRaBitQ()) {
-        auto* pt = dynamic_cast<faiss::IndexPreTransform*>(idx.get());
+        pt = dynamic_cast<faiss::IndexPreTransform*>(idx.get());
+        auto* rq = pt == nullptr ? nullptr : dynamic_cast<faiss::IndexIVFRaBitQ*>(pt->index);
         if (pt == nullptr || pt->chain.size() != 1
-            || dynamic_cast<faiss::IndexIVFRaBitQ*>(pt->index) == nullptr) {
+            || rq == nullptr) {
           throw std::runtime_error(std::format(
             "VectorAuxReader: aux '{}' header is not a rotated IVF+RaBitQ index", name));
         }
-        auto* lt = dynamic_cast<faiss::LinearTransform*>(pt->chain[0]);
+        if (rq->rabitq.nb_bits != (size_t)meta.rabitqBits) {
+          throw std::runtime_error(std::format(
+            "VectorAuxReader: RaBitQ bits mismatch for aux '{}': index has {}, opaque_meta says {}",
+            name, rq->rabitq.nb_bits, (int32_t)meta.rabitqBits));
+        }
+        lt = dynamic_cast<faiss::LinearTransform*>(pt->chain[0]);
         if (lt == nullptr || !lt->is_orthonormal || lt->d_in != meta.dims
             || lt->d_out != meta.dims || pt->index->d != meta.dims) {
           throw std::runtime_error(std::format(
             "VectorAuxReader: aux '{}' rotation is not an orthonormal {}x{} transform",
             name, (int32_t)meta.dims, (int32_t)meta.dims));
         }
-        // Take the chain apart: the reader owns the IVF index, the rotation
-        // is interned, and the wrapper itself is not used for search.
-        pt->own_fields = false;
-        std::unique_ptr<faiss::Index> inner(pt->index);
-        rot = internVectorRotation(std::unique_ptr<faiss::LinearTransform>(lt));
-        pt->chain.clear();
-        pt->index = nullptr;
-        idx = std::move(inner);
+        innerIndex = pt->index;
       }
-      auto* ivf = dynamic_cast<faiss::IndexIVF*>(idx.get());
+      auto* ivf = dynamic_cast<faiss::IndexIVF*>(innerIndex);
       if (ivf == nullptr) {
         throw std::runtime_error(std::format(
           "VectorAuxReader: aux '{}' header is not an IVF index", name));
+      }
+      if (ivf->nlist != (size_t)meta.nlist) {
+        throw std::runtime_error(std::format(
+          "VectorAuxReader: nlist mismatch for aux '{}': index has {}, opaque_meta says {}",
+          name, ivf->nlist, (int32_t)meta.nlist));
       }
       if ((int64_t)ivf->nlist != footer.nlist
           || (int64_t)ivf->code_size != footer.codeSize
@@ -387,6 +394,17 @@ public:
           "does not match index header (nlist={} codeSize={} ntotal={})",
           name, (int64_t)footer.nlist, (int64_t)footer.codeSize, (int64_t)footer.ntotal,
           ivf->nlist, ivf->code_size, ivf->ntotal));
+      }
+
+      if (pt != nullptr) {
+        // Validate before taking ownership away from the wrapper. The reader
+        // owns the IVF index; the rotation is interned for sharing.
+        pt->own_fields = false;
+        std::unique_ptr<faiss::Index> inner(pt->index);
+        rot = internVectorRotation(std::unique_ptr<faiss::LinearTransform>(lt));
+        pt->chain.clear();
+        pt->index = nullptr;
+        idx = std::move(inner);
       }
 
       const int64_t* sizes = (const int64_t*)(base + footer.sizesOffset());

@@ -110,21 +110,19 @@ bool shouldNormalizeForFaiss(const VectorFieldType& ft) {
   return ft.metric_ == VectorFieldType::METRIC_COSINE && !ft.normalized_ && !ft.normalizeOnWrite_;
 }
 
-// Vectors go to FAISS normalized (raw cosine column) and/or rotated (RaBitQ),
-// chunk by chunk so the working set stays bounded.
-void addVectorsToIndex(faiss::Index& index, VectorReader& vr, int32_t dims,
-                       bool normalizeForFaiss, const faiss::VectorTransform* rotation,
-                       std::vector<float>& scratch, std::vector<float>& rotated,
-                       size_t chunkBytes) {
-  int64_t numVals = vr.numVectors();
+// Shared by the owned training sample and borrowed column vectors. Rotation
+// always writes to separate storage: FAISS's matrix multiply cannot alias.
+template <typename Consume>
+void transformVectorChunks(const float* base, int64_t numVals, int32_t dims,
+                            bool normalizeForFaiss, const faiss::VectorTransform* rotation,
+                            size_t chunkBytes, Consume consume) {
   if (numVals <= 0) return;
-  const float* base = (const float*)vr.vectorAtRank(0).data();
   size_t bytesPerVec = (size_t)dims * sizeof(float);
-  size_t chunkVecs = chunkBytes == 0 ? (size_t)numVals
-                                     : std::max((size_t)1, chunkBytes / bytesPerVec);
+  size_t chunkVecs = std::min((size_t)numVals, std::max((size_t)1, chunkBytes / bytesPerVec));
   size_t chunkFloats = chunkVecs * (size_t)dims;
-  if (normalizeForFaiss && scratch.size() < chunkFloats) scratch.resize(chunkFloats);
-  if (rotation != nullptr && rotated.size() < chunkFloats) rotated.resize(chunkFloats);
+  std::vector<float> scratch, rotated;
+  if (normalizeForFaiss) scratch.resize(chunkFloats);
+  if (rotation != nullptr) rotated.resize(chunkFloats);
 
   for (int64_t off = 0; off < numVals; off += (int64_t)chunkVecs) {
     int64_t n = std::min((int64_t)chunkVecs, numVals - off);
@@ -138,7 +136,7 @@ void addVectorsToIndex(faiss::Index& index, VectorReader& vr, int32_t dims,
       rotation->apply_noalloc(n, x, rotated.data());
       x = rotated.data();
     }
-    index.add(n, x);
+    consume(off, n, x);
   }
 }
 
@@ -194,8 +192,6 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
 
 } // namespace
 
-// Default 1 MiB.  Tests can override via VectorIndexBuilder::renormChunkBytes.
-size_t VectorIndexBuilder::renormChunkBytes = 1 * 1024 * 1024;
 bool VectorIndexBuilder::buildFaissAuxIndexes = true;
 // PQ trains 2^bits centroids per sub-quantizer: FAISS wants 39 points per
 // centroid, so 8-bit PQ needs ~10k vectors before its codebooks mean much.
@@ -401,9 +397,6 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   if (rabitq) {
     rotation = std::make_unique<faiss::RandomRotationMatrix>(dims, dims);
     rotation->init(RABITQ_ROTATION_SEED);
-    std::vector<float> rotated(training.size());
-    rotation->apply_noalloc(ntrain, training.data(), rotated.data());
-    training.swap(rotated);
     auto rq = std::make_unique<faiss::IndexIVFRaBitQ>(
         quantizer.get(), (size_t)dims, (size_t)nlist, metric,
         /*own_invlists=*/true, (uint8_t)std::clamp(ann.rabitqBits, 1, 9));
@@ -419,9 +412,13 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   }
   quantizer.release();
   index->own_fields = true;
-  // Queries pass an explicit list selection to search_preassigned, so this
-  // only documents the build-time default in the serialized header.
-  index->nprobe = (size_t)std::clamp((int32_t)std::sqrt((double)nlist), 1, nlist);
+
+  if (rotation != nullptr) {
+    transformVectorChunks(training.data(), ntrain, dims, false, rotation.get(),
+        ivfAddChunkBytes, [&](int64_t off, int64_t n, const float* x) {
+      std::memcpy(training.data() + off * dims, x, (size_t)n * bytesPerVec);
+    });
+  }
 
   LOG_TRACE("VectorIndexBuilder: training {} {} ntotal={} ntrain={} dims={} "
             "nlist={} M={} pqBits={} rabitqBits={}",
@@ -443,13 +440,14 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   training.clear();
   training.shrink_to_fit();
 
-  std::vector<float> scratch;
-  std::vector<float> rotatedChunk;
   forEachVectorSegment(segments_, fieldName, dims,
       [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
     if (vr.numVectors() > 0) {
-      addVectorsToIndex(*index, vr, dims, shouldNormalizeForFaiss(ft), rotation.get(),
-                        scratch, rotatedChunk, ivfAddChunkBytes);
+      const float* base = (const float*)vr.vectorAtRank(0).data();
+      transformVectorChunks(base, vr.numVectors(), dims, shouldNormalizeForFaiss(ft), rotation.get(),
+          ivfAddChunkBytes, [&](int64_t, int64_t n, const float* x) {
+        index->add(n, x);
+      });
     }
     return true;
   });

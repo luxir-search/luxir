@@ -149,6 +149,50 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   EXPECT_EQ(idx->metric_type, faiss::METRIC_L2);
 }
 
+TEST_F(IndexReaderAuxTest, vectorHeaderMustMatchCopiedMetadata) {
+  IvfTestGuard guard;
+  for (const auto& ann : {pqAnn(2, 1, 1), rabitqAnn(2), rabitqAnn(2, 4)}) {
+    CollectionHelper h("main");
+    h.clear();
+    enableL2OnVecSuffix(h.collection(), ann, 4);
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", std::to_string(i), "embedding_v",
+          std::vector<float>{(float)(i % 10), (float)(i / 10), 1, 0.5f}));
+    }
+    h.commit({"*"});
+    auto& dir = h.getIndexWriter()->dir;
+    auto durable = readDurableIndexInfo(dir);
+    const auto& original = onlyVectorOverlay(durable.info);
+    auto meta = VectorAuxMeta::fromBytes(std::string_view(
+        (const char*)original.opaque_meta.data(), original.opaque_meta.size()), original.name);
+    for (bool bits : {false, true}) {
+      if (bits && ann.codec == api::VectorAnnDef::Codec::PQ) continue;
+      auto changed = meta;
+      if (bits) changed.rabitqBits++;
+      else changed.nlist++;
+      std::string bytes = changed.toBytes();
+      auto copied = original;
+      copied.opaque_meta = std::as_bytes(std::span(bytes.data(), bytes.size()));
+      auto aux = VectorAuxReader::open(dir, copied, false);
+      // call_once retries must leave both the wrapper and its children safe.
+      for (int attempt = 0; attempt < 2; attempt++) {
+        try {
+          aux->getFaissIndex();
+          FAIL() << "Accepted mismatched metadata";
+        } catch (const std::runtime_error& e) {
+          std::string message = e.what();
+          EXPECT_NE(message.find(bits ? "RaBitQ bits mismatch" : "nlist mismatch"), std::string::npos);
+          EXPECT_NE(message.find(original.name), std::string::npos);
+          EXPECT_NE(message.find("index has " + std::to_string(bits ? meta.rabitqBits : meta.nlist)), std::string::npos);
+          EXPECT_NE(message.find("opaque_meta says " + std::to_string(bits ? changed.rabitqBits : changed.nlist)), std::string::npos);
+        }
+      }
+    }
+    auto healthy = VectorAuxReader::open(dir, original, false);
+    EXPECT_NE(healthy->getFaissIndex(), nullptr);
+  }
+}
+
 // mmap residency: only the IVF header (coarse quantizer + PQ codebooks) is
 // deserialized into RAM; the list payloads are served zero-copy from the aux
 // file's memory view through MmapInvertedLists.  Guards against silently

@@ -355,8 +355,10 @@ TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
     std::vector<float> query{3.0f, 4.0f, 1.0f, 0.5f};
     std::vector<float> ramDist(K), fsDist(K);
     std::vector<faiss::idx_t> ramIds(K), fsIds(K);
-    ramIdx->search(1, query.data(), K, ramDist.data(), ramIds.data());
-    fsIvf->search(1, query.data(), K, fsDist.data(), fsIds.data());
+    faiss::SearchParametersIVF params;
+    params.nprobe = fsIvf->nlist;
+    ramIdx->search(1, query.data(), K, ramDist.data(), ramIds.data(), &params);
+    fsIvf->search(1, query.data(), K, fsDist.data(), fsIds.data(), &params);
     EXPECT_EQ(ramIds, fsIds);
     EXPECT_EQ(ramDist, fsDist);
     EXPECT_NE(ramIds[0], -1);
@@ -1271,46 +1273,52 @@ TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
   EXPECT_NE(h.getIndexWriter()->dir.openFile(origFile), nullptr);
 }
 
-// Cosine renormalization happens in fixed-size chunks so a single segment with
-// many vectors doesn't blow up memory.  Set a tiny chunk size and verify the
-// loop boundaries - every vector still ends up correctly normalized.
-TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
+TEST_F(VectorIndexBuilderTest, cosineTransformChunkBoundaries) {
   IvfTestGuard guard;
-  // Force a chunk size of 2 vectors x 4 floats x 4 bytes = 32 bytes per chunk.
-  // With 7 vectors this exercises 4 chunks (sizes 2, 2, 2, 1).
-  size_t saved = VectorIndexBuilder::renormChunkBytes;
-  VectorIndexBuilder::renormChunkBytes = 32;
-
-  CollectionHelper h("main");
-
-  SchemaBuilder b;
-  auto& f = b.templ("_v");
-  f.type = luxir::api::FieldDef_::FieldClass::VECTOR;
-  f.column = true;
-  f.metric = luxir::api::VectorMetric::COSINE;
-  f.normalize_on_write = false;
-  f.dims = 4;
-  f.ann = pqAnn(2, 1, 1);
-  b.set(h.collection());
-
-  std::vector<std::vector<float>> vecs = {
-    {3, 0, 0, 0}, {0, 5, 0, 0}, {0, 0, 7, 0}, {0, 0, 0, 9},
-    {2, 2, 0, 0}, {0, 0, 4, 4}, {1, 1, 1, 1},
-  };
-  for (int i = 0; i < 80; i++) {
-    Doc d = flatdoc("id", "doc" + std::to_string(i), "v_v", vecs[(size_t)i % vecs.size()]);
-    h.index(d);
+  SearchOverridesGuard chunks(VectorIndexBuilder::ivfAddChunkBytes);
+  // Three vectors per chunk leaves two in the final training and add chunk.
+  for (size_t bytes : {0u, 48u}) {
+    SCOPED_TRACE(bytes);
+    VectorIndexBuilder::ivfAddChunkBytes = bytes;
+    CollectionHelper h("main");
+    h.clear();
+    SchemaBuilder b;
+    auto& f = b.templ("_v");
+    f.type = api::FieldDef_::FieldClass::VECTOR;
+    f.metric = api::VectorMetric::COSINE;
+    f.normalize_on_write = false;
+    f.dims = 4;
+    f.ann = rabitqAnn(2, 4);
+    b.set(h.collection());
+    std::vector<std::vector<float>> vecs = {
+      {3, 0, 0, 0}, {0, 5, 0, 0}, {0, 0, 7, 0}, {0, 0, 0, 9}, {2, 2, 0, 0}, {0, 0, 4, 4}
+    };
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", "doc" + std::to_string(i), "v_v",
+          i == 79 ? std::vector<float>{10, 10, 10, 10} : vecs[(size_t)i % vecs.size()]));
+    }
+    h.commit({"*"});
+    auto& dir = h.getIndexWriter()->dir;
+    auto info = readIndexInfo(dir);
+    auto aux = VectorAuxReader::open(dir, onlyVectorOverlay(info), false);
+    ASSERT_TRUE(aux->shouldNormalizeColumnOnCosineRescore());
+    auto* index = aux->getFaissIndex();
+    ASSERT_EQ(index->ntotal, 80);
+    ASSERT_NE(aux->getRotation(), nullptr);
+    std::vector<float> query(4, 0.5f), rotated(4);
+    aux->getRotation()->apply_noalloc(1, query.data(), rotated.data());
+    faiss::IVFRaBitQSearchParameters params;
+    params.nprobe = aux->getNList();
+    params.qb = 0;
+    float distance;
+    faiss::idx_t id;
+    index->search(1, rotated.data(), 1, &distance, &id, &params);
+    EXPECT_EQ(id, 79);
+    EXPECT_NEAR(distance, 1.0f, 0.1f);
+    auto approx = runKnnIds(h.getSearchEngine(), "v_v", query, 1, 1024, 1);
+    EXPECT_EQ(approx, (std::vector<std::string>{"doc79"}));
+    EXPECT_EQ(approx, runKnnIds(h.getSearchEngine(), "v_v", query, 1, 1024, 1, true));
   }
-  h.commit({"*"});
-
-  auto info = readIndexInfo(h.getIndexWriter()->dir);
-  auto& aux = onlyVectorOverlay(info);
-  auto meta = readVectorAuxMeta(aux);
-  EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 1);
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0].name);
-  ASSERT_EQ(idx->ntotal, 80);
-
-  VectorIndexBuilder::renormChunkBytes = saved;
 }
 
 TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {

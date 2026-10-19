@@ -122,6 +122,11 @@ sub-quantizers of `pq.bits` bits each, unrotated, exactly as before.
 
 ### Codec measurements
 
+These measurements predate the dimensions-scaled default probe policy.
+Here, "default" means `sqrt(nlist)` lists at every dimensionality, without
+the multiplier now applied above 128 dimensions. The default-recall and
+latency numbers below describe that earlier policy.
+
 `Tuning/BM_VectorAnnDataset` (test/bench/VectorKnnBM.cpp) indexes a real
 corpus through the normal request path into 4 segments, builds every overlay
 with the production policy, and measures recall@10 of 200 held-out queries
@@ -159,20 +164,32 @@ segments.
 The floors differ per codec for different reasons. PQ must train 2^bits
 centroids per sub-quantizer, and FAISS wants 39 points per centroid, so 8-bit
 PQ needs about 10k vectors. RaBitQ trains only the IVF centroids, which 39
-points each cover from about 1.5k vectors, but training is not what binds: at
-the default effort (`nlist = sqrt(N)`, `sqrt(nlist)` lists probed at <= 128
-dims and `sqrt(dims / 128)` times that above (capped at 4x), about 194
-candidates rescored for k=10) a single-threaded standalone FAISS measurement
-found the exact scan faster than an IVF+RaBitQ probe plus rescore below
+points each cover from about 1.5k vectors, but training is not what binds. The
+original floor calibration also predates the dimensions-scaled probe policy:
+at `nlist = sqrt(N)`, `sqrt(nlist)` lists probed at every dimensionality and
+about 194 candidates rescored for k=10, a single-threaded standalone FAISS
+measurement found the exact scan faster than an IVF+RaBitQ probe plus rescore below
 roughly 8k vectors, at both 768 dims (4k vectors: 0.25 ms exact vs 0.61 ms
 IVF; 16k: 1.74 ms vs 0.38 ms) and 128 dims (4k: 0.04 ms vs 0.07 ms; 8k:
-0.10 ms vs 0.06 ms). The RaBitQ floor is therefore 8192 vectors, close to the
+0.10 ms vs 0.06 ms). The retained RaBitQ floor is 8192 vectors, close to the
 PQ floor, and the exact path keeps small segments exact.
 
 The training set is a strided sample across the segment's vector values, not
 a prefix sample. This avoids training only on the oldest values when data
 inside a segment is time ordered. The builder normalizes vectors for FAISS
 when the field uses cosine and the stored column is raw.
+
+Raw-cosine training samples are normalized in place in their owned buffer.
+RaBitQ training then uses the chunked transform helper for rotation only,
+copying each rotated chunk back into the sample; PQ needs no training
+transform call. There is no second full-size training allocation or swap.
+Each scratch buffer is limited by `ivfAddChunkBytes` (16 MiB by default),
+capped by the available vectors with a minimum of one vector. Training
+rotation needs one buffer, released before FAISS training. Add uses the same
+helper with up to two buffers for raw cosine plus rotation, keeping matrix
+multiply input and output disjoint. Untransformed PQ add passes column bytes
+directly to FAISS. The serialized header's `nprobe` is unused by Luxir:
+searches supply explicit probe parameters or selected lists.
 
 ## Memory-Mapped Index Layout
 
@@ -184,6 +201,12 @@ reader decodes only the header into memory and serves list scans directly from
 the mmapped file. Residency of the bulk index data is therefore managed by the
 OS page cache, like the vector column itself, rather than forced into process
 RAM.
+
+Before taking apart a RaBitQ wrapper, the reader checks the header's bit
+count against the overlay metadata. Both codecs also check the header's list
+count against that metadata, in addition to checking the list footer against
+the header. Mismatches reject the overlay with the conflicting values in the
+diagnostic.
 
 ## Merging
 
