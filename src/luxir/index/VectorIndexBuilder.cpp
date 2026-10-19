@@ -279,7 +279,7 @@ VectorIndexBuilder::build(const std::vector<std::string>& selectors,
     }
 
     LOG_TRACE("VectorIndexBuilder: building {} (metric={}, dims_pinned={})",
-             auxName, (int)vft->metric_, vft->dims_);
+             auxName, (int)vft->metric_, vft->storedDims());
     auto info = buildIvfField(fieldName, *vft, outFilesToSync, buildSite);
     if (info) {
       result.emplace_back(std::move(*info));
@@ -316,7 +316,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   // build site, so a listener can target a specific field and/or site.
   Signal::emit("vectorBuildField", (void*)&fieldName, (void*)(intptr_t)buildSite);
   const VectorAnnConfig& ann = ft.ann();
-  int32_t dims = ft.dims_;
+  int32_t dims = ft.storedDims();
   faiss::MetricType metric = toFaissMetric(ft.metric_);
   bool rabitq = ann.codec == VectorAnnConfig::RABITQ;
   const char* codecName = rabitq ? "IVF+RaBitQ" : "IVF+PQ";

@@ -1596,7 +1596,7 @@ private:
       // int column that is not an ord column (assume all other field types have this (currently true)
       std::vector<BKDWriter::Point> geoPoints;
       bool rebuildGeo = hasGeoPoints(type, allFlags);
-      mergeIntCol2(sortedFields, postingsWriter, outputFieldInfo,
+      mergeIntCol(sortedFields, postingsWriter, outputFieldInfo,
                    rebuildGeo ? &geoPoints : nullptr);
       if (rebuildGeo) {
         if (!geoPoints.empty()) {
@@ -1685,85 +1685,6 @@ private:
 
     writer.finish(postingsWriter.getMaxDoc());
   }
-
-  void mergeIntCol(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
-                   PostingsWriter::IndexFieldInfo& outputFieldInfo) {
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    auto& pool = poolGuard.pool();
-
-    auto outputPtr = postingsWriter.getOutputStream();
-    IntColWriter intColWriter(*outputPtr);
-
-    // currently all values must be written before all docs - TODO FIXME - is this still true??
-    for (auto* field : sortedFields) {
-      auto baseId = (int32_t)field->seg->base;
-      unused(baseId);
-
-      IntColReader reader(*field->seg->postingsReader, field->segFieldInfo);
-      IntColReader::BulkValues values(reader);
-
-
-      // int32_t highest = field->seg->postingsReader->numDocs();
-      for (;;) {
-        auto index = values.next();
-        if (index == IntColReader::ENDINDEX) {
-          break;
-        }
-        int64_t val = values.value();
-        intColWriter.addInt64(val);
-      }
-    }
-
-    bool full = false; // TODO: calculate if this column is dense!
-
-    if (!full) {
-      DocsWithValWriter docsWriter(pool, postingsWriter, outputFieldInfo);
-      for (auto* field : sortedFields) {
-        auto baseId = (int32_t)field->seg->base;
-
-        IntColReader reader(*field->seg->postingsReader, field->segFieldInfo);
-        IntColReader::Iterator colIter(reader);
-
-        [[maybe_unused]] int32_t highest = field->seg->postingsReader->maxDoc();
-        for (;;) {
-          int32_t localId = colIter.next();
-          if (localId == IntColReader::ENDDOC) {
-            break;
-          }
-          assert(localId < highest);
-          docsWriter.startDoc(baseId + localId);
-        }
-      }
-      docsWriter.finish();
-    }
-
-
-    intColWriter.finish(outputFieldInfo);
-    if (outputFieldInfo.flags & FieldType::MULTI_VALUED) {
-      auto guard = pool.rewindScopeGuard();
-      OutputStreamPtr out = postingsWriter.getOutputStream();
-      MonoWriter endValueRankWriter(pool, *out);
-      int64_t endValueRankBase = 0;
-
-      for (auto* field : sortedFields) {
-        assert(field->segFieldInfo.flags & FieldType::MULTI_VALUED);
-        // open IntColReader for each segment
-        IntColReader reader( *field->seg->postingsReader, field->segFieldInfo);
-        MonoReader* endValueRankReader = reader.getEndValueRankReader();
-        assert(endValueRankReader != nullptr);
-        int64_t endValueRank;
-        for (int i = 0; i < endValueRankReader->numValues(); i++) {
-          endValueRank = endValueRankBase + endValueRankReader->valueAt(i);
-          endValueRankWriter.addInt64(endValueRank);
-        }
-        endValueRankBase = endValueRank;
-      }
-      endValueRankWriter.finish();
-      outputFieldInfo.monoLoc = endValueRankWriter.blockLoc;
-      outputFieldInfo.monoMetaOff = endValueRankWriter.metaOff;
-    }
-  }
-
 
   // Merges non-indexed string/binary columns written by StrColHandler.
   // Rebuilds the concatenated byte stream, the per-value endOffsetReader (if values are
@@ -2025,10 +1946,14 @@ private:
     outputFieldInfo.pointsMetaOff = data.pointsMetaOff;
   }
 
-  void mergeIntCol2(std::span<MergeFieldInfo*> sortedFields,
-                    PostingsWriter& postingsWriter,
-                    PostingsWriter::IndexFieldInfo& outputFieldInfo,
-                    std::vector<BKDWriter::Point>* geoPoints) {
+  // Merges int64 columns. The output is dense (no docs-with-field bitset, so
+  // value rank == doc id for single-valued readers) whenever every surviving
+  // doc has a value: all sources dense and present, or a sparse source whose
+  // docs without a value were all deleted.
+  void mergeIntCol(std::span<MergeFieldInfo*> sortedFields,
+                   PostingsWriter& postingsWriter,
+                   PostingsWriter::IndexFieldInfo& outputFieldInfo,
+                   std::vector<BKDWriter::Point>* geoPoints) {
     assert(sortedFields.size() == segs.size());  // expect non-compacted fields to make the code a little simpler.
 
     auto poolGuard = MemPool::threadLocalPoolGuard();

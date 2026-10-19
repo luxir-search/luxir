@@ -54,6 +54,8 @@ struct ResolvedField {
   // 0 means "not set / infer from first indexed value"; > 0 means strict.
   int32_t vectorDims = 0;
   bool hasVectorDims = false;
+  // 0 means no truncation; > 0 keeps that many leading components.
+  int32_t vectorTruncateDims = 0;
   bool hasVectorMetric = false;
   VectorFieldType::Metric vectorMetric = VectorFieldType::METRIC_NONE;
   bool hasVectorNormalized = false;
@@ -225,6 +227,17 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorDims = parentResolved.vectorDims;
   }
 
+  // truncate_dims: explicit set on this field overrides (0 = no truncation);
+  // otherwise inherit.
+  if (def.truncate_dims.has_value()) {
+    if (*def.truncate_dims < 0) {
+      throw SchemaError("truncate_dims must be >= 0 (field: " + std::string(name) + ")");
+    }
+    r.vectorTruncateDims = *def.truncate_dims;
+  } else {
+    r.vectorTruncateDims = parentResolved.vectorTruncateDims;
+  }
+
   // metric: explicit set on this field overrides (including an explicit
   // "none" = storage-only); otherwise inherit.  Range-checked like index.
   if (def.metric.has_value()) {
@@ -265,8 +278,10 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
 // Apply defaults to an authored ann definition and validate it against the
 // effective dims. Positive PQ m requires pinned dims; automatic m also works
 // with dims inferred per segment.
+// dims is the stored dimension the overlay is built over; dimsName names the
+// schema property it came from.
 static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t dims,
-                                        std::string_view name) {
+                                        std::string_view dimsName, std::string_view name) {
   VectorAnnConfig cfg;
   if (def == nullptr) return cfg;
   auto fail = [&](const std::string& msg) {
@@ -306,7 +321,8 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
       if (*def->pq->m > 0) {
         if (dims <= 0) fail("positive pq.m requires positive dims");
         if (dims % *def->pq->m != 0) {
-          fail("pq.m=" + std::to_string(*def->pq->m) + " does not divide dims=" + std::to_string(dims));
+          fail("pq.m=" + std::to_string(*def->pq->m) + " does not divide " + std::string(dimsName) + "=" +
+               std::to_string(dims));
         }
       }
       cfg.pqM = *def->pq->m;
@@ -397,12 +413,13 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   if (def.normalizer && r.type != FieldClass::STRING) {
     throw SchemaError("normalizer is only valid for string fields (field: " + name + ")");
   }
-  bool vectorProp = def.dims.has_value() || def.metric.has_value() ||
+  bool vectorProp = def.dims.has_value() || def.truncate_dims.has_value() || def.metric.has_value() ||
                     def.normalized.has_value() || def.normalize_on_write.has_value() ||
                     def.ann.has_value();
   if (vectorProp && r.type != FieldClass::VECTOR) {
     throw SchemaError(
-      "dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " + name + ")");
+      "dims/truncate_dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " +
+      name + ")");
   }
 }
 
@@ -621,13 +638,42 @@ struct FieldCompiler {
       case FieldClass::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
         // dims may be 0, meaning "infer from first indexed value".
+        if (r.vectorTruncateDims > 0) {
+          // Every truncated input stores the same size, so the declared full
+          // dims is the only check that catches vectors from another model.
+          if (r.vectorDims == 0) {
+            throw SchemaError("truncate_dims requires dims (field: " + std::string(name) + ")");
+          }
+          if (r.vectorTruncateDims >= r.vectorDims) {
+            throw SchemaError("truncate_dims (" + std::to_string(r.vectorTruncateDims) +
+                              ") must be < dims (" + std::to_string(r.vectorDims) +
+                              ") (field: " + std::string(name) + ")");
+          }
+          // Matryoshka models compare renormalized prefixes.  Under cosine a
+          // prefix cut here and one the provider renormalized score the same;
+          // l2 and ip would score the raw prefix's shrunken length.
+          if (r.vectorMetric != VectorFieldType::METRIC_COSINE) {
+            throw SchemaError("truncate_dims requires metric cosine (field: " + std::string(name) + ")");
+          }
+          // normalized asserts unit-length input, but a truncated prefix of a
+          // unit vector is shorter than 1.
+          if (r.vectorNormalized) {
+            throw SchemaError("normalized=true cannot be combined with truncate_dims "
+                              "(a truncated prefix is not unit length; it is renormalized on write) (field: " +
+                              std::string(name) + ")");
+          }
+        }
         bool normalizeOnWrite;
         normalizeOnWrite = !r.vectorNormalized && (r.hasVectorNormalizeOnWrite
           ? r.vectorNormalizeOnWrite
           : (r.vectorMetric == VectorFieldType::METRIC_COSINE));
+        // ANN overlays are built over the stored (truncated) column.
+        bool truncated = r.vectorTruncateDims > 0;
+        VectorAnnConfig ann = resolveAnnConfig(r.ann, truncated ? r.vectorTruncateDims : r.vectorDims,
+                                               truncated ? "truncate_dims" : "dims", name);
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
                                                r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
-                                               resolveAnnConfig(r.ann, r.vectorDims, name));
+                                               ann, r.vectorTruncateDims);
         break;
       }
       default:

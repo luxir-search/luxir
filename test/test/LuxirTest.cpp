@@ -89,7 +89,8 @@ static bool fieldTypesEqual(const FieldType& lhs, const FieldType& rhs) {
   if (auto* l = dynamic_cast<const VectorFieldType*>(&lhs)) {
     auto* r = dynamic_cast<const VectorFieldType*>(&rhs);
     return r != nullptr
-           && l->dims_ == r->dims_
+           && l->inputDims_ == r->inputDims_
+           && l->truncateDims_ == r->truncateDims_
            && l->metric_ == r->metric_
            && l->normalized_ == r->normalized_
            && l->normalizeOnWrite_ == r->normalizeOnWrite_;

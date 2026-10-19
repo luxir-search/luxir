@@ -130,19 +130,10 @@ class KnnQuery final : public luxir::Query {
       throw std::runtime_error(std::format(
           "KnnQuery on vector field '{}' without a metric", field));
     }
-    if (fieldType.dims() > 0
-        && (int32_t) queryVec.size() != fieldType.dims()) {
-      throw std::runtime_error(std::format(
-          "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
-          queryVec.size(), fieldType.dims(), field));
-    }
-    for (float value : queryVec) {
-      if (!std::isfinite(value)) {
-        throw std::runtime_error(std::format(
-            "KnnQuery: query vector for field '{}' must contain only finite values",
-            field));
-      }
-    }
+    // The parser enforces the field's input contract and cuts the query to
+    // its stored prefix.
+    assert(fieldType.storedDims() == 0 || (int32_t)queryVec.size() == fieldType.storedDims());
+    assert(std::ranges::all_of(queryVec, [](float x) { return std::isfinite(x); }));
   }
 
 public:
@@ -457,7 +448,7 @@ public:
             || std::bit_cast<uint32_t>(*similarity)
                 == std::bit_cast<uint32_t>(*rhs.similarity))
         && queryVec.size() == rhs.queryVec.size()
-        && fieldType.dims() == rhs.fieldType.dims()
+        && fieldType.storedDims() == rhs.fieldType.storedDims()
         && fieldType.metric() == rhs.fieldType.metric()
         && fieldType.ann().rabitqQueryBits == rhs.fieldType.ann().rabitqQueryBits
         && fieldType.normalized() == rhs.fieldType.normalized()
@@ -491,7 +482,7 @@ public:
         [](uint64_t seed, std::byte byte) {
           return mixHash(seed, byte);
         });
-    value = mixHash(value, fieldType.dims());
+    value = mixHash(value, fieldType.storedDims());
     value = mixHash(value, (int32_t) fieldType.metric());
     value = mixHash(value, fieldType.ann().rabitqQueryBits);
     value = mixHash(value, fieldType.normalized());
@@ -749,9 +740,7 @@ public:
 
       int64_t totalDocsWithValue = 0;
       bool anyMultiValued = false;
-      int32_t dims = query.getFieldType().dims() > 0
-        ? query.getFieldType().dims()
-        : (int32_t)query.getQueryVec().size();
+      int32_t dims = (int32_t)query.getQueryVec().size();
       if (dims <= 0) {
         throw std::runtime_error(std::format(
           "KnnQuery: query vector for field '{}' must have positive dims", query.getField()));
@@ -2450,8 +2439,6 @@ public:
   };
 
 private:
-  static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
-
   /// Fill `bits` with the all-set pattern for n ranks: ceil(n/8) 0xFF bytes
   /// with the tail bits past n cleared.  Every rank bitmap in this file
   /// keeps that tail invariant, so popcount(bits) == set ranks (see
@@ -2774,7 +2761,7 @@ private:
         // explicit tradeoff for preserving the originally submitted bytes when
         // normalize_on_write=false; the default cosine path stores unit vectors.
         float normSq = faiss::fvec_norm_L2sqr(vec.data(), (size_t)dims);
-        if (!std::isfinite(normSq) || normSq <= MIN_COSINE_NORM_SQ) return 0.0f;
+        if (!std::isfinite(normSq) || normSq <= VectorFieldType::MIN_COSINE_NORM_SQ) return 0.0f;
         return finiteScore(sum / std::sqrt(normSq));
       }
       default:

@@ -157,6 +157,91 @@ to one hit per document, scored by that document's best vector.
 An optional `ann` object chooses how [approximate indexes](#index-settings)
 for the field are built; the defaults suit most embedding models.
 
+### Truncate Matryoshka embeddings
+
+Some embedding models are trained with
+[Matryoshka Representation Learning](https://arxiv.org/abs/2205.13147) (MRL):
+the leading components of their output are themselves a usable, lower
+dimensional embedding. `truncate_dims` keeps only that prefix:
+
+```http
+POST /collections/books/_schema
+
+{
+  "fields": {
+    "summary_v": {
+      "type": "vector",
+      "dims": 1024,
+      "truncate_dims": 256,
+      "metric": "cosine"
+    }
+  }
+}
+```
+
+Clients send either the full model output or a vector already truncated to
+`truncate_dims` (for example with the provider's `dimensions` option), for
+documents and for kNN queries. Luxir cuts every vector to its first
+`truncate_dims` components before it is stored or searched, so index and
+query vectors are always truncated the same way. The column, approximate
+indexes and scoring all work on the shorter vector: 256 dimensions here store
+and scan a quarter of the bytes of 1024.
+
+- `dims` is the full input dimension and is required. `truncate_dims` is the
+  stored and searched dimension, and must be less than `dims`.
+- Every indexed and query vector must have exactly `dims` or exactly
+  `truncate_dims` components (`expected dims=1024 or truncate_dims=256, got
+  768`). Once truncated, vectors from different models have the same length,
+  so this check is what keeps most other models' output out of the field. It
+  cannot catch a model whose native size equals `truncate_dims`: with
+  `dims: 3072, truncate_dims: 1536`, vectors from a 1536-dimension model are
+  accepted as already truncated.
+- A vector whose truncated prefix is all zeros has no cosine direction, even
+  when its tail does: it is skipped at index time and rejected as a query.
+- `truncate_dims` requires `metric: cosine`. The prefix of a unit vector is
+  shorter than 1, and MRL models compare renormalized prefixes, so Luxir
+  renormalizes it. Cosine ignores length, so a full vector cut by Luxir and a
+  prefix renormalized by the provider score the same. `normalized: true` is
+  rejected, because the stored vectors are no longer the vectors the assertion
+  was about. `normalize_on_write: false` keeps the raw prefix and normalizes
+  at query time, as for any cosine field.
+- Reading the field back returns the stored truncated vector (normalized
+  unless `normalize_on_write: false`), which can be sent back as input.
+- `truncate_dims: 0` turns off truncation inherited from a parent.
+- Approximate indexes are built over the truncated vector, so a positive
+  `ann.pq.m` must divide `truncate_dims`.
+- Changing `truncate_dims` changes the stored dimension, so existing
+  segments must be reindexed, as for a `dims` change.
+
+To compare several sizes from one indexing pass, declare truncated
+[variants](schema.md#field-variants) beside the full vector before indexing.
+Each one indexes the same input, and a query selects one by name, such as
+`summary_v__d256`. A variant added later covers only documents indexed after
+it, like any new variant:
+
+```json
+"summary_v": {
+  "type": "vector", "dims": 1024, "metric": "cosine",
+  "variants": {
+    "d256": { "type": "vector", "dims": 1024, "truncate_dims": 256, "metric": "cosine" }
+  }
+}
+```
+
+Use it only with models trained for it. Models that document MRL truncation
+include OpenAI `text-embedding-3-small` and `-large` (the `dimensions`
+parameter), Google `gemini-embedding-001`, Jina `jina-embeddings-v3`, Nomic
+`nomic-embed-text-v1.5`, and mixedbread `mxbai-embed-large-v1`. Check the
+model card for the dimensions it was trained to support. Truncating an
+embedding from a model *not* trained with MRL discards information the model
+spread across all of its dimensions, and recall drops sharply; this option
+does nothing to compensate.
+
+Some models prescribe extra steps around truncation. Nomic's reference code
+applies a layer norm to the full embedding before cutting it; Luxir does not
+do that, so send full vectors that already have any such pre-truncation step
+applied. Otherwise they will not match vectors the provider truncated.
+
 ## Index vectors
 
 A vector is a bare number array. A multi-valued field takes an array of
@@ -602,7 +687,7 @@ POST /collections/books/_schema
 | `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
 | `rabitq.bits` | Bits per dimension, `1` to `9`. Default `1`. |
 | `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
-| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide it. Absent or `0`: automatic, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, dims / 8)` for IP/cosine or `32` for L2. If none does, use the largest divisor under the same cap. |
+| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for IP/cosine or `32` for L2. If none does, use the largest divisor under the same cap. |
 | `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. |
 
 `rabitq` settings require an explicit `"codec":"rabitq"`, for example
@@ -682,7 +767,7 @@ every index type.
 | Field | Meaning |
 |---|---|
 | `field` | Vector field. Required. |
-| `query` | Query vector; must match the field's dimension. Required. |
+| `query` | Query vector with `dims` components, or `truncate_dims` when set. Required. |
 | `k` | Nearest documents or groups the query node produces. Required, positive. |
 | `unit` | `docs` (default) or `groups`; groups requires an enclosing collapse. |
 | `exact` | Require the true top-k. Uses the full-precision column scan and ignores overlays and the knobs below. |
@@ -708,8 +793,9 @@ Luxir would probe if the field were a single IVF index built with
 so a merge does not change the effort a request asks for. An explicit `nprobe`
 pins the effort cap; an adaptive one may deepen when filters or collapse
 underfill the result. The adaptive default starts at `sqrt(nlist)` of that
-reference index for fields of up to 128 dimensions and scales by
-`sqrt(dims / 128)` above that (capped at 4x). This effort policy applies to
+reference index for fields of up to 128 stored dimensions and scales by
+`sqrt(dims / 128)` above that (capped at 4x), where `dims` is the stored
+dimension (`truncate_dims` when set). This effort policy applies to
 both codecs. The multiplier is about 2.5x at 768 to 960 dimensions; RaBitQ
 measurements on GIST and Cohere embeddings showed recall@10 rising from
 0.82-0.87 to about 0.95. Probed lists are always scanned in full; `nprobe` is
@@ -768,8 +854,8 @@ POST /collections/books/_search
 
 That is `[0.6, 0.3, 0.1]` at unit length. Set `normalize_on_write: false` to
 keep the raw vectors in the column; candidate rescoring then normalizes at
-query time. Zero and near-zero cosine vectors have no direction and are
-skipped at index time.
+query time. Zero and near-zero cosine vectors have no direction: they are
+skipped at index time, and a kNN query with one is rejected.
 
 ### Measure recall
 

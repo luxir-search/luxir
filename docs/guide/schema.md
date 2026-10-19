@@ -275,12 +275,13 @@ publication advances the schema generation.
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
-| `dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
+| `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 | `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
 
 For PQ, positive `ann.pq.m` requires positive effective (inherited) `dims`
-and must divide it. Omitted or zero `m` selects automatically and permits
-inferred dimensions. Validation includes inherited ANN settings and variants.
+and must divide the stored dimension: `truncate_dims` when set, else `dims`.
+Omitted or zero `m` selects automatically and permits inferred dimensions.
+Validation includes inherited ANN settings and variants.
 
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you

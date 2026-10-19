@@ -327,7 +327,7 @@ message RescoreQuery {
 // Multi-valued fields return one hit per document using its highest similarity.
 message KnnQuery {
   string field = 1;        // vector field name (e.g. "embedding_v")
-  Vector query = 2;        // query vector - must match the field's dims
+  Vector query = 2;        // query vector - dims components, or truncate_dims when set
   int32 k = 3;             // nearest documents (default) or groups to return; must be positive
 
   // Require exact top-k results by scanning stored vectors. Cost is linear
@@ -2100,6 +2100,7 @@ message FieldDef {
 
   // Vector dimensionality. Unset inherits, falling back to 0 (infer
   // from the first indexed value). A positive value enforces dimensions at ingest.
+  // With truncate_dims, this is the full input dimension.
   optional int32 dims = 9;
 
   // Vector similarity metric.  Absent means inherit, else NONE (storage-only).
@@ -2147,6 +2148,15 @@ message FieldDef {
   // document as if it had the average field length. Requires FREQS or
   // POSITIONS. Absent: inherit from parent, else true (false at DOCS).
   optional bool norms = 18;
+
+  // VECTOR only. Keep the first truncate_dims components of every indexed
+  // and query vector, for Matryoshka (MRL) embeddings whose prefixes are
+  // usable embeddings. Requires dims (the full input dimension, which must be
+  // larger) and metric COSINE, which renormalizes the prefix; normalized=true
+  // is rejected. Inputs carry dims components, or truncate_dims for a vector
+  // already truncated. The column, ANN overlays and kNN scoring use
+  // truncate_dims. Unset inherits; 0 means no truncation.
+  optional int32 truncate_dims = 19;
 
   // VECTOR only: ANN overlay settings. Absent inherits the parent's whole
   // definition (no per-property merge), else every VectorAnnDef default.
