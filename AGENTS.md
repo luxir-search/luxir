@@ -33,9 +33,9 @@ grep -n "warning:" /tmp/build.log
 Builds size their compile parallelism from cores and memory, and
 concurrent builds (other worktrees, presets, or the dev container) share one
 machine-wide limit, so running several at once needs no manual `-j` or job
-caps. Native vcpkg dependencies, the ARM64 toolchain and packages, and ccache
-objects are shared between worktrees, so a new worktree reuses them instead of
-rebuilding.
+caps. Native vcpkg dependencies and the ARM64 toolchain and packages are
+shared between worktrees; ccache objects are shared only when the checkouts are
+configured with `-DLUXIR_CCACHE_RELATIVE_PATHS=ON`.
 See [Parallelism and shared caches](docs/dev/build-setup.md#parallelism-and-shared-caches).
 Use worktrees to avoid conflicting. Once work is pushed, clean up the worktree.
 

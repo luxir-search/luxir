@@ -168,12 +168,15 @@ Shared state lives outside the checkout, so a new worktree reuses it:
   share its root. The install directories follow the manifest of the most recent
   `deps/make_deps.sh` run, so a branch that changes dependencies affects every
   native worktree once it is installed.
-- ccache uses its normal cache directory. The launcher sets `CCACHE_BASEDIR` to
-  the checkout and maps the checkout to `.` in debug information, so worktrees at
-  different paths share objects. Debug information therefore names sources
-  relative to the checkout root: start GDB from the checkout root, or add it
-  with `directory`. `__FILE__` is relative too, so tests locate data through
-  `testDataPath()`, not their source path.
+- ccache uses its normal cache directory. Objects are shared between worktrees
+  at different paths only when every checkout involved, including the main one,
+  is configured with `-DLUXIR_CCACHE_RELATIVE_PATHS=ON`. That sets
+  `CCACHE_BASEDIR` to the checkout and maps the checkout to `.` in debug
+  information, with two costs: compiler diagnostics and `__FILE__` name sources
+  relative to the build directory (`../../src/...`), and debuggers resolve
+  sources from the checkout root, so start GDB there or add it with
+  `directory`. Size the cache for several builds (one debug build is over
+  4 GB of objects), e.g. `ccache -M 20G`.
 - `LUXIR_CACHE_DIR` (default `~/.cache/luxir`, or `$XDG_CACHE_HOME/luxir`) holds
   the build slots, the [ARM64](arm64-build.md) toolchain, vcpkg checkout,
   downloads, and binary packages, and the development container's ccache.

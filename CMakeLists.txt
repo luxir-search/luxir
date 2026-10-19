@@ -133,17 +133,22 @@ endif()
 # pch_defines,time_macros sloppiness is required to get cache hits on TUs that
 # use a precompiled header (see target_precompile_headers below). Apply it in
 # the launcher rather than relying on each developer's global ccache config.
-# CCACHE_BASEDIR makes the paths ccache hashes relative, and the prefix map makes the
-# debug info's compilation directory relative to the checkout (sources resolve from the
-# checkout root), so objects are shared between worktrees at different paths.
+# LUXIR_CCACHE_RELATIVE_PATHS shares objects between checkouts and worktrees at different
+# paths: CCACHE_BASEDIR makes the paths ccache hashes relative, and the prefix map makes
+# the debug info's compilation directory relative to the checkout. It is off by default
+# because compiler diagnostics and __FILE__ then name sources relative to the build
+# directory, and debuggers resolve sources from the checkout root.
+option(LUXIR_CCACHE_RELATIVE_PATHS "Use checkout-relative paths so ccache shares objects across checkouts" OFF)
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
-  list(APPEND _luxir_compile_launcher "${CMAKE_COMMAND}" -E env
-       CCACHE_SLOPPINESS=pch_defines,time_macros "CCACHE_BASEDIR=${CMAKE_SOURCE_DIR}"
-       "${CCACHE_PROGRAM}")
-  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
-    add_compile_options("-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.")
+  list(APPEND _luxir_compile_launcher "${CMAKE_COMMAND}" -E env CCACHE_SLOPPINESS=pch_defines,time_macros)
+  if(LUXIR_CCACHE_RELATIVE_PATHS)
+    list(APPEND _luxir_compile_launcher "CCACHE_BASEDIR=${CMAKE_SOURCE_DIR}")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+      add_compile_options("-fdebug-prefix-map=${CMAKE_SOURCE_DIR}=.")
+    endif()
   endif()
+  list(APPEND _luxir_compile_launcher "${CCACHE_PROGRAM}")
   message(STATUS "Luxir: ccache enabled (${CCACHE_PROGRAM})")
 endif()
 set(CMAKE_C_COMPILER_LAUNCHER   "${_luxir_compile_launcher}")
