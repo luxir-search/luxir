@@ -13,7 +13,8 @@ if (( $# != 1 )); then
 fi
 per_job=$1
 
-cpus=$(nproc)
+# nproc also honors OpenMP's thread limits, which say nothing about build jobs.
+cpus=$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)
 cores=$(lscpu -p=core,socket 2>/dev/null | grep -v '^#' | sort -u | wc -l || true)
 if (( cores < 1 || cores > cpus )); then
   cores=$cpus

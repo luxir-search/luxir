@@ -6,7 +6,8 @@
 # sharing PREFIX (e.g. from several worktrees, or the host and the development
 # container) then share one machine-wide limit instead of each assuming the
 # whole machine. The lock belongs to the inherited file descriptor, so it is
-# released when the command exits, including on a crash.
+# released when the command exits, including on a crash. If a slot file cannot
+# be opened, COMMAND runs without a slot.
 # Usage: tools/build-slot PREFIX SLOTS COMMAND [ARGS...]
 set -u
 prefix=$1 slots=$2
@@ -18,7 +19,9 @@ if [[ ! -w $dir ]]; then
 fi
 while :; do
   for (( i = 0; i < slots; i++ )); do
-    exec {fd}>>"$prefix-$i"
+    if ! { exec {fd}>>"$prefix-$i"; } 2>/dev/null; then
+      exec "$@"
+    fi
     if flock -n "$fd"; then
       exec "$@"
     fi
