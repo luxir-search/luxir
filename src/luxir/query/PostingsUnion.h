@@ -221,9 +221,10 @@ class UnionHeapScorer final : public UnionWindowScorer<UnionHeapScorer> {
         // The term left the allowed interval; its entry dies at the frontier.
         continue;
       }
-      if (state.docsEnd == state.docsStart) {
+      if (state.docsEnd == state.docsStart && state.docFreq == 1) {
         // Pulsed single-doc term: the key is the doc. A key behind the
-        // window was strided past by an advance and is dead.
+        // window was strided past by an advance and is dead.  Multi-doc
+        // pulsed terms take the enum path below.
         const int32_t doc = state.pulsedDoc;
         if (doc >= windowStart) {
           setWindowBit(doc);

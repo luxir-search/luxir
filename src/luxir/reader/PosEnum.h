@@ -8,8 +8,9 @@
 namespace luxir {
 
 // Position ordinals are indexes into the term-global positions list for
-// non-pulsed positions. DocsEnumImpl owns doc/freq alignment; PosEnum owns the
-// mutable position stream and decoder state.
+// positions in the positions stream (all but an inlined pulsed position).
+// DocsEnumImpl owns doc/freq alignment; PosEnum owns the mutable position
+// stream and decoder state.
 class PosEnum {
   DocsPosEnum& docsEnum;
   InputStream posIS;
@@ -110,7 +111,9 @@ public:
     assert(!docsEnum.positionBatchActive);
     docsEnum.enablePositionTracking();
 
-    if (docsEnum.docsSize == 0) {
+    if (docsEnum.docsSize == 0 && docsEnum.ttf == 1) {
+      // A pulsed single-occurrence term inlines its position in the term
+      // dictionary; any other pulsed term reads the positions stream.
       posBuf[0] = docsEnum.pulsedPosition;
       posBufEnd = posBufLimit = 1;
     } else {

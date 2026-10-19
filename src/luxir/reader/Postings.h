@@ -34,11 +34,38 @@ public:
   static constexpr int8_t DOC_BLOCK_PACKED = 1;
   static constexpr int8_t DOC_BLOCK_CONTIGUOUS = 0;
 
+  // Pulsing: a term whose postings are small enough lives entirely in the
+  // term dictionary (PostingsWriter::endTerm, TermsEnum::postingsState) and
+  // writes nothing to the docs stream.  A docs-stream term pays an L1 group
+  // header and an L0 block header (about 12 bytes) before its first doc,
+  // which for a keyword term with a handful of docs rivals the doc ids.
+  //   - every term with docFreq 1 pulses, whatever its tf (tf is then ttf,
+  //     which the dictionary already stores; positions beyond a single one
+  //     stay in the positions stream, which has no per-term headers);
+  //   - docs-only fields (no freqs, impacts or positions) also pulse terms
+  //     with docFreq <= PULSED_MAX_DOCS.
+  // Pulsed docs have no skip data and are decoded whole when a postings enum
+  // opens, and the reader walks every pulsed doc gap in a term block to locate
+  // each term's run.  8 keeps both linear walks short (at most 7 gaps per
+  // term) while still saving about 40% on an 8-doc list with 2-byte gaps;
+  // past that the fixed header is a shrinking share of the list.
+  static constexpr int32_t PULSED_MAX_DOCS = 8;
+
+  static bool pulses(bool hasFreqs, int64_t docFreq) {
+    return docFreq == 1 || (!hasFreqs && docFreq <= PULSED_MAX_DOCS);
+  }
+
+  // Term block header code for the pulsed-term mask (PostingsWriter::flushTerms):
+  // only an explicit mask spends the 4 mask bytes.
+  static constexpr uint8_t PULSED_MASK_NONE = 0;
+  static constexpr uint8_t PULSED_MASK_ALL = 1;
+  static constexpr uint8_t PULSED_MASK_EXPLICIT = 2;
+
   // Filename related utilities.  We try to keep filenames short for many reasons, including
   // being able to fit in short-string optimization.
 
   static constexpr std::string_view PREFIX_FNAME = "s";         // prefix for all data files
-  static constexpr std::string_view LUXIR_HEADER = "LUXIR004";  // every data file starts with this header; the digits version the format
+  static constexpr std::string_view LUXIR_HEADER = "LUXIR005";  // every data file starts with this header; the digits version the format
 
   // Reserved field name under which the default stored-fields resource is
   // registered in a segment's per-field index.  Named column families live
