@@ -13,6 +13,7 @@
 #include "handler/VectorHandler.h"
 #include "luxir/index/handler/IntColHandler.h"
 #include "luxir/index/handler/StrHandler.h"
+#include "luxir/index/handler/FeatureHandler.h"
 #include "luxir/index/handler/FullTextHandler.h"
 
 namespace luxir {
@@ -101,7 +102,11 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
 
   switch (fieldType->type()) {
     case FieldType::Type::TEXT:
-      fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
+      if (dynamic_cast<FeatureFieldType*>(fieldType.get()) != nullptr) {
+        fieldHandler = pool.make_unique<handler::FeatureHandler>(*this, name, fieldType);
+      } else {
+        fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
+      }
       break;
     case FieldType::Type::ID:
       fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType);

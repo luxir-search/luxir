@@ -345,6 +345,74 @@ The same composition works under a boolean clause, so a vector query can be
 one required clause beside text and range clauses, or the query behind a
 [query facet](faceting.md#query-facets) bucket.
 
+## Sparse vectors
+
+A learned sparse model (SPLADE, ELSER) turns text into a weighted set of
+vocabulary tokens. Index the document's tokens into a
+[`sparse_vector` field](schema.md#feature-fields), run the model on the
+query, and pass its tokens to the `sparse_vector` query:
+
+```http
+POST /collections/docs/_search
+
+{
+  "query": {
+    "sparse_vector": {
+      "field": "ml_tokens",
+      "query_vector": {"dune": 1.4, "desert": 0.6, "sand": 0.2}
+    }
+  }
+}
+```
+
+A document matches when it has any query token. Its score is the dot product
+of the two vectors over the shared tokens: the sum of query weight times
+stored weight. Query weights must be finite and positive; a repeated token
+keeps its last weight.
+
+The query is a disjunction with one clause per token. Each clause bounds its
+postings blocks by the stored max weight, so a top-k search skips blocks
+that cannot reach the current k-th score, as BM25 term clauses do. The query
+composes like any other: as a fusion source next to `knn` and BM25 for
+[hybrid search](#hybrid-search), under `boolean`, or with filters.
+
+## Rank features
+
+The `rank_feature` query scores one feature by a function of its stored value
+`S`, as in Elasticsearch. Documents without the feature do not match, so the
+usual pattern is an optional clause that boosts a main query:
+
+```http
+POST /collections/docs/_search
+
+{
+  "query": {
+    "boolean": {
+      "required": [{"match": {"title_t": "dune"}}],
+      "optional": [
+        {"rank_feature": {"field": "pagerank", "saturation": {"pivot": 10}}},
+        {"rank_feature": {"field": "topics.science", "log": {"scaling_factor": 1}}}
+      ]
+    }
+  }
+}
+```
+
+`field` names a `rank_feature` field, or a `rank_features` or `sparse_vector`
+field together with a feature: `"field": "topics", "feature": "science"`, or
+`"topics.science"`. Set at most one function:
+
+| Function | Score | Parameters |
+|---|---|---|
+| `saturation` (default) | `S / (S + pivot)` | `pivot` > 0; absent = an approximate geometric mean of the feature's values in the index, so a typical value scores about 0.5 |
+| `log` | `ln(scaling_factor + S)` | `scaling_factor` >= 1 |
+| `sigmoid` | `S^exponent / (S^exponent + pivot^exponent)` | `pivot` > 0, `exponent` > 0 |
+| `linear` | `S` | none (`{}`) |
+
+`saturation` and `sigmoid` stay below 1, so a `boost` sets the feature's
+maximum share of the score. Every function grows with `S`, so these clauses
+take part in block-max pruning as well.
+
 ## Hybrid search
 
 A `fusion` operation ranks several sources independently and merges them into
@@ -892,3 +960,10 @@ bit-identical results to a serial run of the same query.
   not in the update response.
 - Vector fields are returned only when named in `fields`; they are excluded
   from default projection.
+- `sparse_vector` traverses postings term by term with block-max pruning.
+  There is no block-ordered (BMP) or clustered (Seismic) traversal yet, which
+  matter most for long model-generated queries, and no index-time pruning of
+  low-weight tokens.
+- `sparse_vector` and `rank_feature` have no expression-language form; use
+  the structured objects. `rank_feature` fields cannot invert their effect
+  (Elasticsearch `positive_score_impact: false`).

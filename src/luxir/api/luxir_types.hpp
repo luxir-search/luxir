@@ -67,7 +67,8 @@ struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struc
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
-struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning; struct Error;
+struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct SparseVectorQuery; struct RankFeatureQuery;
+struct Warning; struct Error;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
 struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult;
@@ -118,7 +119,10 @@ enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
-enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
+enum class FieldClass {
+  STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9,
+  SPARSE_VECTOR = 14, RANK_FEATURES = 15, RANK_FEATURE = 16
+};
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 }
@@ -1076,6 +1080,25 @@ struct GeoDistanceQuery {
   double lon = 0.0;
   double radius_meters = 0.0;
 };
+struct SparseVectorQuery {
+  std::string_view field;
+  map_view<std::string_view, float> query_vector;
+};
+namespace RankFeatureQuery_ {
+struct Saturation { std::optional<float> pivot; };
+struct Log { float scaling_factor = 0.0f; };
+struct Sigmoid { float pivot = 0.0f; float exponent = 0.0f; };
+struct Linear {};
+} // namespace RankFeatureQuery_
+struct RankFeatureQuery {
+  using Saturation = luxir::api::RankFeatureQuery_::Saturation;
+  using Log = luxir::api::RankFeatureQuery_::Log;
+  using Sigmoid = luxir::api::RankFeatureQuery_::Sigmoid;
+  using Linear = luxir::api::RankFeatureQuery_::Linear;
+  std::string_view field;
+  std::string_view feature;
+  std::variant<std::monostate, Saturation, Log, Sigmoid, Linear> function;
+};
 struct ExprQuery {                                             // map value indirect: Val may be incomplete, but is complete here anyway
   std::string_view q;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
@@ -1084,7 +1107,7 @@ struct Query {                                                 // needs Match,An
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
-               AnyOfQuery>
+               AnyOfQuery, SparseVectorQuery, RankFeatureQuery>
       kind;
 };
 struct UpdateRequest {                                         // needs CommitParams
@@ -1109,7 +1132,7 @@ LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) L
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
-LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery)
+LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery) LUXIR_TD(SparseVectorQuery) LUXIR_TD(RankFeatureQuery)
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
@@ -1156,6 +1179,7 @@ LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXI
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(ExprQuery)
+LUXIR_ENTRY(SparseVectorQuery) LUXIR_ENTRY(RankFeatureQuery)
 LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)

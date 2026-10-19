@@ -64,6 +64,7 @@ enum class QueryKind : uint8_t {
   ALL,
   NONE,
   RESCORE,
+  FEATURE,
   MIN_SCORE,
   TEST,
 };

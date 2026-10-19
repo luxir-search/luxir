@@ -20,6 +20,9 @@ Choose a type based on how you want to search and use the values:
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, for distance and bounding-box queries. See [Geo search](geo-search.md). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
+| `sparse_vector` | Learned sparse vector, such as SPLADE or ELSER output: an object of token to weight. Searched with the `sparse_vector` query. See [Feature fields](#feature-fields). |
+| `rank_features` | Named static ranking signals in one field, such as topic scores: an object of feature name to weight. See [Feature fields](#feature-fields). |
+| `rank_feature` | One static ranking signal, such as pagerank or popularity: a single positive number. See [Feature fields](#feature-fields). |
 
 ### `text` versus `string`
 
@@ -261,7 +264,7 @@ publication advances the schema generation.
 
 | Key | Meaning |
 |---|---|
-| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
+| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `sparse_vector`, `rank_features`, `rank_feature`, `id` |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | multi-valued |
@@ -269,7 +272,7 @@ publication advances the schema generation.
 | `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_`; see [Stored resources](#stored-resources) |
 | `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
-| `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
+| `long_terms` | `string`, `text` (per token), feature fields (per feature name), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
@@ -391,6 +394,55 @@ accent folding without possessive removal or stemming. Neither
 
 For Unicode text without English stemming, use `_un`, or configure
 `unicode_word` with `["nfkc_cf", "fold"]` to retain accent folding as well.
+
+## Feature fields
+
+`sparse_vector`, `rank_features`, and `rank_feature` store weights that
+queries read back as scores, after Lucene's `FeatureField`. Each feature name
+is a term, and its weight is stored as that term's frequency, so the
+postings and their block-max impacts already hold everything scoring needs.
+
+```http
+POST /collections/docs/_schema
+
+{
+  "fields": {
+    "ml_tokens": {"type": "sparse_vector"},
+    "topics": {"type": "rank_features"},
+    "pagerank": {"type": "rank_feature"}
+  }
+}
+```
+
+```json
+{
+  "id": "1",
+  "ml_tokens": {"dune": 1.82, "desert": 0.71, "spice": 0.33},
+  "topics": {"sports": 0.2, "science": 0.9},
+  "pagerank": 12.5
+}
+```
+
+- `sparse_vector` and `rank_features` take a JSON object of feature name to
+  weight; `rank_feature` takes one number. Names are matched exactly (no
+  analysis) and may appear once per document.
+- Weights must be positive and finite numbers. A document with a zero,
+  negative, or non-numeric weight is rejected.
+- Weights are quantized like Lucene: the top 16 bits of the 32-bit float
+  (sign dropped), which keeps 9 significant bits. The stored value is
+  truncated, so it is at most 0.4% below the input and never above it, and
+  every value from `1.2e-38` to `3.4e38` fits.
+- The fields are always `index: match`, single-valued, without a column,
+  and not stored. A schema that sets otherwise is rejected.
+- There are no norms. A `match` query on a feature name finds the
+  documents that have it, and `exists` finds documents with any feature.
+
+`sparse_vector` and `rank_features` share a format. The type tells readers of
+the schema which query the field is for: `sparse_vector` fields hold model
+output for the [`sparse_vector`](vector-search.md#sparse-vectors) query, and
+`rank_features` fields hold signals for the
+[`rank_feature`](vector-search.md#rank-features) query. Both queries accept
+both types.
 
 ## Field variants
 

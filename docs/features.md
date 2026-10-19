@@ -228,6 +228,10 @@ Anywhere a query goes, it can be a structured object or an expression string.
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
 - `knn` vector search, `geo_box`, and `geo_distance`.
+- `sparse_vector` (learned sparse retrieval such as SPLADE or ELSER, a
+  weighted token dot product with block-max pruning) and `rank_feature`
+  (static signals through saturation, log, sigmoid, or linear functions)
+  over `sparse_vector`, `rank_features`, and `rank_feature` fields.
 - `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,
   quoted phrases with `~N` slop, grouping, trailing-`*` prefix, `~N` fuzzy
   terms, and `field:value` terms against an allowlist).

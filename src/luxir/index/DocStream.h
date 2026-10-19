@@ -148,6 +148,57 @@ public:
 }
   LUXIR_UNALIGNED_END;
 
+// Docs with an explicit term frequency each, for fields whose frequency is a
+// value rather than an occurrence count (feature weights). Each doc is added
+// once, in increasing order.
+LUXIR_UNALIGNED_START
+class DocTfStream {
+  Stream docs;  // (doc delta, tf) vint pairs for every doc but the last
+  int lastDoc;
+  int lastDocDelta;
+  int lastTf;
+  int docFreq = 1;
+
+public:
+  DocTfStream(MemPool& pool, int docid, int tf) : lastDoc(docid), lastDocDelta(docid), lastTf(tf) {
+    unused(pool);
+    assert(tf > 0);
+  }
+
+  DocTfStream(const DocTfStream&) = delete;
+  DocTfStream(DocTfStream&&) = delete;
+
+  int getLastDoc() const { return lastDoc; }
+
+  void addDoc(MemPool& pool, int docid, int tf) {
+    assert(docid > lastDoc && tf > 0);
+    docs.writeVInt(pool, lastDocDelta);
+    docs.writeVInt(pool, lastTf);
+    lastDocDelta = docid - lastDoc;
+    lastDoc = docid;
+    lastTf = tf;
+    docFreq++;
+  }
+
+  /// Calls sink.addDoc(docid, tf) for each doc.
+  template <class PostingsConsumer>
+  void pushDocs(MemPool& pool, PostingsConsumer& sink) {
+    StreamReader dstream(docs, pool);
+    int docid = 0;
+    int handled = 0;
+    while (!dstream.eof()) {
+      docid += dstream.readVint();
+      int tf = dstream.readVint();
+      sink.addDoc(docid, tf);
+      handled++;
+    }
+    sink.addDoc(lastDoc, lastTf);
+    assert(handled + 1 == docFreq);
+    unused(handled);
+  }
+}
+LUXIR_UNALIGNED_END;
+
 // TODO: consider indexing payloads as separate type? (separate index options)
 // That would save 1 bit per position.
 // OPTIMIZATION TODO: somehow consolidate the docs and positions streams!

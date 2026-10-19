@@ -10,6 +10,7 @@
 #include <bit>
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <span>
 #include "luxir/reader/Postings.h"
 #include "luxir/util/luxir_util.h"
@@ -90,6 +91,52 @@ public:
 };
 
 
+
+// Scores one feature of a feature field (FeatureFieldType) as
+// weight * f(S), S the stored value decoded from the term frequency, after
+// Lucene's FeatureField functions. Every f is non-negative and grows with S,
+// so the max tf of a postings block bounds the block's scores.
+struct FeatureScorer {
+  enum Function : uint8_t { LINEAR, SATURATION, LOG, SIGMOID };
+
+  Function function = LINEAR;
+  float weight = 1.0f;
+  float pivot = 1.0f;          // SATURATION, SIGMOID
+  float scalingFactor = 1.0f;  // LOG, >= 1
+  float exponent = 1.0f;       // SIGMOID
+
+  // FeatureFieldType::decodeWeight: the stored 16 high bits of the float.
+  static float decodeTf(int32_t tf) { return std::bit_cast<float>((uint32_t) tf << 15); }
+
+  float value(float s) const {
+    double v = s;
+    switch (function) {
+      case LINEAR: break;
+      case SATURATION: v = v / (v + pivot); break;
+      case LOG: v = std::log((double) scalingFactor + v); break;
+      case SIGMOID: {
+        double sa = std::pow(v, (double) exponent);
+        v = sa / (sa + std::pow((double) pivot, (double) exponent));
+        break;
+      }
+    }
+    return (float) v;
+  }
+
+  float score(int32_t tf) const { return weight * value(decodeTf(tf)); }
+
+  // An upper bound for every doc whose tf is at most maxTf, one ulp wide so
+  // float rounding in score() can never exceed it.
+  float bound(int32_t maxTf) const {
+    return std::nextafter(score(maxTf), std::numeric_limits<float>::infinity());
+  }
+
+  // The bound with no impact data: saturation and sigmoid stay below 1.
+  float unboundedMax() const {
+    return function == SATURATION || function == SIGMOID
+        ? weight : std::numeric_limits<float>::infinity();
+  }
+};
 
 //
 // The same tradeoffs, quantization, and order-of-operations were used as Lucene here to make scores compatible.

@@ -26,6 +26,17 @@ TextFieldType::TextFieldType(std::string_view name, int flags, std::string_view 
   analyzer_ = Analyzer::compile(def);  // copies what it keeps; the views die here
 }
 
+FeatureFieldType::FeatureFieldType(std::string_view name, int flags, Kind kind)
+    : TextFieldType(name, flags, std::shared_ptr<const Analyzer>()), kind(kind) {
+  // One compiled keyword chain serves every feature field.
+  static const std::shared_ptr<const Analyzer> keyword = [] {
+    api::AnalyzerDef def;
+    def.tokenizer.emplace().name = "keyword";
+    return Analyzer::compile(def);
+  }();
+  analyzer_ = keyword;
+}
+
 std::string VectorFieldType::inputError(std::span<const float> vec) const {
   size_t n = vec.size();
   if (inputDims_ != 0 && n != (size_t)inputDims_ && (truncateDims_ == 0 || n != (size_t)truncateDims_)) {

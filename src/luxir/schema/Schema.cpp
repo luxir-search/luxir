@@ -461,6 +461,9 @@ struct FieldCompiler {
       throw SchemaError("Field '" + std::string(name) + "' has no type and no parent to inherit from");
     }
 
+    bool featureClass = r.type == FieldClass::SPARSE_VECTOR || r.type == FieldClass::RANK_FEATURE
+                        || r.type == FieldClass::RANK_FEATURES;
+
     // Apply defaults based on type if properties were not explicitly set
     IndexMode index = r.index;
     bool column = r.column;
@@ -474,7 +477,7 @@ struct FieldCompiler {
         case FieldClass::STRING: index = IndexMode::MATCH; break;
         case FieldClass::TEXT:   index = IndexMode::MATCH; break;
         case FieldClass::INT:    index = IndexMode::NONE; break;
-        default: index = IndexMode::NONE; break;
+        default: index = featureClass ? IndexMode::MATCH : IndexMode::NONE; break;
       }
     }
 
@@ -484,7 +487,7 @@ struct FieldCompiler {
         case FieldClass::STRING: column = true; break;
         case FieldClass::TEXT:   column = false; break;
         case FieldClass::INT:    column = true; break;
-        default: column = true; break;
+        default: column = !featureClass; break;
       }
     }
 
@@ -494,9 +497,28 @@ struct FieldCompiler {
         "(field: " + std::string(name) + ")");
     }
 
+    if (featureClass) {
+      // Weights live only in the postings: there is no column, stored copy
+      // or second value to keep.
+      if (index != IndexMode::MATCH || column) {
+        throw SchemaError("sparse_vector, rank_feature and rank_features fields require "
+                          "index=match and column=false (field: " + std::string(name) + ")");
+      }
+      if (logical.hasMulti && logical.multi) {
+        throw SchemaError("sparse_vector, rank_feature and rank_features fields cannot be "
+                          "multi-valued (field: " + std::string(name) + ")");
+      }
+      if (logical.hasStored && logical.stored) {
+        throw SchemaError("sparse_vector, rank_feature and rank_features fields cannot be "
+                          "stored (field: " + std::string(name) + ")");
+      }
+    }
+
     if (r.longTerms) {
-      if (r.type != FieldClass::STRING && r.type != FieldClass::TEXT && r.type != FieldClass::ID) {
-        throw SchemaError("long_terms is only valid for string, text or id fields (field: " + std::string(name) + ")");
+      if (r.type != FieldClass::STRING && r.type != FieldClass::TEXT && r.type != FieldClass::ID
+          && !featureClass) {
+        throw SchemaError("long_terms is only valid for string, text, id or feature fields (field: "
+                          + std::string(name) + ")");
       }
       if (r.type == FieldClass::STRING && index == IndexMode::NONE) {
         throw SchemaError("long_terms is not valid for a string field with index=none; "
@@ -543,6 +565,9 @@ struct FieldCompiler {
     if (index == IndexMode::MATCH) {
       if (r.type == FieldClass::TEXT) {
         flags |= FieldType::INDEX_DOCS_FREQS_POSITIONS;
+      } else if (featureClass) {
+        // The frequency carries the weight; without positions there are no norms.
+        flags |= FieldType::INDEX_DOCS_FREQS;
       } else {
         flags |= FieldType::INDEX_DOCS;
       }
@@ -593,6 +618,15 @@ struct FieldCompiler {
         ft = std::make_shared<TextFieldType>(name, flags, analyzer);
         break;
       }
+      case FieldClass::SPARSE_VECTOR:
+        ft = std::make_shared<FeatureFieldType>(name, flags, FeatureFieldType::SPARSE_VECTOR);
+        break;
+      case FieldClass::RANK_FEATURES:
+        ft = std::make_shared<FeatureFieldType>(name, flags, FeatureFieldType::RANK_FEATURES);
+        break;
+      case FieldClass::RANK_FEATURE:
+        ft = std::make_shared<FeatureFieldType>(name, flags, FeatureFieldType::RANK_FEATURE);
+        break;
       case FieldClass::INT:
         ft = std::make_shared<IntFieldType>(name, flags);
         break;

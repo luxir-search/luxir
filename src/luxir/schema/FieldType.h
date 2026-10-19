@@ -8,8 +8,11 @@
 #include "luxir/util/DateTime.h"
 #include "luxir/util/StrRef.h"
 
+#include <bit>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -202,6 +205,50 @@ public:
 
   std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
                               std::span<char> buf) const override;
+};
+
+// sparse_vector, rank_features and rank_feature fields, after Lucene's
+// FeatureField: a positionless TEXT field whose tokens are feature names and
+// whose term frequency is the feature's weight, quantized by encodeWeight.
+// Scoring decodes the weight from the frequency, so norms take no part and
+// the block max-tf impacts bound every score. A RANK_FEATURE field holds one
+// number per document under the fixed token SINGLE_FEATURE. The keyword
+// analyzer keeps term queries on a feature name exact.
+class FeatureFieldType : public TextFieldType {
+public:
+  enum Kind : uint8_t { SPARSE_VECTOR, RANK_FEATURES, RANK_FEATURE };
+
+  // The one token of a RANK_FEATURE field.
+  static constexpr std::string_view SINGLE_FEATURE = "_";
+
+  Kind kind;
+
+  FeatureFieldType(std::string_view name, int flags, Kind kind);
+
+  std::string_view kindName() const {
+    switch (kind) {
+      case SPARSE_VECTOR: return "sparse_vector";
+      case RANK_FEATURES: return "rank_features";
+      case RANK_FEATURE: return "rank_feature";
+    }
+    return "sparse_vector";
+  }
+
+  // A weight is stored as the top 16 of a positive float's 31 value bits (8
+  // exponent bits plus 8 mantissa bits, 9 significant bits), as in Lucene.
+  // The cut truncates, so a decoded weight is at most 0.4% below the input
+  // and never above it. The largest code, for FLT_MAX, is 65279, so every
+  // frequency fits the 16-bit impact headers.
+  static bool validWeight(double weight) {
+    return std::isfinite(weight) && weight >= (double) std::numeric_limits<float>::min()
+        && weight <= (double) std::numeric_limits<float>::max();
+  }
+  static int32_t encodeWeight(float weight) {
+    return (int32_t) (std::bit_cast<uint32_t>(weight) >> 15);
+  }
+  static float decodeWeight(int32_t tf) {
+    return std::bit_cast<float>((uint32_t) tf << 15);
+  }
 };
 
 class StrFieldType : public FieldType {

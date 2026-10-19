@@ -32,7 +32,7 @@ namespace luxir::expr {
 // field order).  The static_assert keeps this table in lockstep with the
 // variant: a new arm fails to compile until it is named here (and its expr
 // callability decided).
-inline constexpr std::array<std::string_view, 20> ARM_NAMES = {
+inline constexpr std::array<std::string_view, 22> ARM_NAMES = {
     "",               // monostate (unset)
     "match",          // Match
     "boolean",        // BooleanQuery
@@ -53,6 +53,8 @@ inline constexpr std::array<std::string_view, 20> ARM_NAMES = {
     "wildcard",       // WildcardQuery
     "regex",          // RegexQuery
     "any_of",         // AnyOfQuery - exact scalar/list input
+    "sparse_vector",  // SparseVectorQuery - structured-only (a token map is not expressible)
+    "rank_feature",   // RankFeatureQuery - structured-only (nested function messages)
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),
               "Query gained an arm: name it in ARM_NAMES and decide its expr callability");
@@ -92,8 +94,8 @@ inline constexpr std::string_view jsonName(std::string_view member) {
 
 // Emplace the message arm named `name` in q and invoke f on the fresh
 // message.  Returns false when no callable message arm has that name; the
-// caller owns the error. "all" is the bool-arm special case; expr, knn, and
-// geo queries deliberately remain structured-only.
+// caller owns the error. "all" is the bool-arm special case; expr, knn, geo
+// and feature queries deliberately remain structured-only.
 template <typename F>
 bool withCallableArm(api::Query& q, std::string_view name, F&& f) {
   bool called = false;

@@ -158,6 +158,11 @@ defaults and constraints are described in the comments and guides.
 - [`QueryFacet`](#message-luxir.queryfacet)
 - [`RangeFacet`](#message-luxir.rangefacet)
 - [`RangeQuery`](#message-luxir.rangequery)
+- [`RankFeatureQuery`](#message-luxir.rankfeaturequery)
+- [`RankFeatureQuery.Linear`](#message-luxir.rankfeaturequery.linear)
+- [`RankFeatureQuery.Log`](#message-luxir.rankfeaturequery.log)
+- [`RankFeatureQuery.Saturation`](#message-luxir.rankfeaturequery.saturation)
+- [`RankFeatureQuery.Sigmoid`](#message-luxir.rankfeaturequery.sigmoid)
 - [`RegexQuery`](#message-luxir.regexquery)
 - [`ReplicaRequirement`](#message-luxir.replicarequirement)
 - [`ReplicaResult`](#message-luxir.replicaresult)
@@ -181,6 +186,7 @@ defaults and constraints are described in the comments and guides.
 - [`ShardStats`](#message-luxir.shardstats)
 - [`SimpleQuery`](#message-luxir.simplequery)
 - [`SortSpec`](#message-luxir.sortspec)
+- [`SparseVectorQuery`](#message-luxir.sparsevectorquery)
 - [`StatsRequest`](#message-luxir.statsrequest)
 - [`StatsResponse`](#message-luxir.statsresponse)
 - [`StatsTotals`](#message-luxir.statstotals)
@@ -1682,6 +1688,8 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.wildcard"></a>[`wildcard`](#field-luxir.query.wildcard) | 17 | [`WildcardQuery`](#message-luxir.wildcardquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by wildcard term match |
 | <a id="field-luxir.query.regex"></a>[`regex`](#field-luxir.query.regex) | 18 | [`RegexQuery`](#message-luxir.regexquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by regular-expression term match |
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
+| <a id="field-luxir.query.sparse_vector"></a>[`sparse_vector`](#field-luxir.query.sparse_vector) | 22 | [`SparseVectorQuery`](#message-luxir.sparsevectorquery) | oneof [`kind`](#oneof-luxir.query.kind) | learned sparse retrieval: weighted feature dot product |
+| <a id="field-luxir.query.rank_feature"></a>[`rank_feature`](#field-luxir.query.rank_feature) | 23 | [`RankFeatureQuery`](#message-luxir.rankfeaturequery) | oneof [`kind`](#oneof-luxir.query.kind) | scores one stored feature through a function |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -1786,6 +1794,74 @@ Matches documents whose field value falls in the given range. All bounds are opt
 | <a id="field-luxir.rangequery.gt"></a>[`gt`](#field-luxir.rangequery.gt) | 3 | [`Val`](#message-luxir.val) | singular | lower bound, exclusive (&gt;) |
 | <a id="field-luxir.rangequery.lte"></a>[`lte`](#field-luxir.rangequery.lte) | 4 | [`Val`](#message-luxir.val) | singular | upper bound, inclusive (&lt;=) |
 | <a id="field-luxir.rangequery.lt"></a>[`lt`](#field-luxir.rangequery.lt) | 5 | [`Val`](#message-luxir.val) | singular | upper bound, exclusive (&lt;) |
+
+<a id="message-luxir.rankfeaturequery"></a>
+
+### luxir.RankFeatureQuery
+
+Scores the documents that have a feature in a RANK\_FEATURE, RANK\_FEATURES or SPARSE\_VECTOR field by a monotonic function of the stored value S, as Elasticsearch's rank\_feature query. Documents without the feature do not match, so use it as an optional (should) clause to boost a main query. Every function only grows with S; the bounded functions score in \[0, 1).
+
+[Source](../../protos/luxir_types.proto)
+
+<a id="oneof-luxir.rankfeaturequery.function"></a>
+
+**oneof `function`:** at most one member can be set.
+
+Unset = saturation with the default pivot.
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.rankfeaturequery.field"></a>[`field`](#field-luxir.rankfeaturequery.field) | 1 | `string` | singular | A RANK\_FEATURE field, or a RANK\_FEATURES / SPARSE\_VECTOR field together with \`feature\`. "field.feature" also names a feature of a RANK\_FEATURES or SPARSE\_VECTOR field. |
+| <a id="field-luxir.rankfeaturequery.feature"></a>[`feature`](#field-luxir.rankfeaturequery.feature) | 2 | `string` | singular | feature name; empty for a RANK\_FEATURE field |
+| <a id="field-luxir.rankfeaturequery.saturation"></a>[`saturation`](#field-luxir.rankfeaturequery.saturation) | 3 | [`RankFeatureQuery.Saturation`](#message-luxir.rankfeaturequery.saturation) | oneof [`function`](#oneof-luxir.rankfeaturequery.function) |  |
+| <a id="field-luxir.rankfeaturequery.log"></a>[`log`](#field-luxir.rankfeaturequery.log) | 4 | [`RankFeatureQuery.Log`](#message-luxir.rankfeaturequery.log) | oneof [`function`](#oneof-luxir.rankfeaturequery.function) |  |
+| <a id="field-luxir.rankfeaturequery.sigmoid"></a>[`sigmoid`](#field-luxir.rankfeaturequery.sigmoid) | 5 | [`RankFeatureQuery.Sigmoid`](#message-luxir.rankfeaturequery.sigmoid) | oneof [`function`](#oneof-luxir.rankfeaturequery.function) |  |
+| <a id="field-luxir.rankfeaturequery.linear"></a>[`linear`](#field-luxir.rankfeaturequery.linear) | 6 | [`RankFeatureQuery.Linear`](#message-luxir.rankfeaturequery.linear) | oneof [`function`](#oneof-luxir.rankfeaturequery.function) |  |
+
+<a id="message-luxir.rankfeaturequery.linear"></a>
+
+### luxir.RankFeatureQuery.Linear
+
+S itself.
+
+[Source](../../protos/luxir_types.proto)
+
+<a id="message-luxir.rankfeaturequery.log"></a>
+
+### luxir.RankFeatureQuery.Log
+
+ln(scaling\_factor + S); scaling\_factor must be &gt;= 1, so scores are &gt;= 0.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.rankfeaturequery.log.scaling_factor"></a>[`scaling_factor`](#field-luxir.rankfeaturequery.log.scaling_factor) | 1 | `float` | singular |  |
+
+<a id="message-luxir.rankfeaturequery.saturation"></a>
+
+### luxir.RankFeatureQuery.Saturation
+
+S / (S + pivot). Unset pivot = an approximate geometric mean of the feature's values over the index, so a typical value scores about 0.5.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.rankfeaturequery.saturation.pivot"></a>[`pivot`](#field-luxir.rankfeaturequery.saturation.pivot) | 1 | `float` | optional |  |
+
+<a id="message-luxir.rankfeaturequery.sigmoid"></a>
+
+### luxir.RankFeatureQuery.Sigmoid
+
+S^exponent / (S^exponent + pivot^exponent); both must be finite and &gt; 0.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.rankfeaturequery.sigmoid.pivot"></a>[`pivot`](#field-luxir.rankfeaturequery.sigmoid.pivot) | 1 | `float` | singular |  |
+| <a id="field-luxir.rankfeaturequery.sigmoid.exponent"></a>[`exponent`](#field-luxir.rankfeaturequery.sigmoid.exponent) | 2 | `float` | singular |  |
 
 <a id="message-luxir.regexquery"></a>
 
@@ -2153,6 +2229,19 @@ Forgiving end-user query for raw search-box input. Malformed query text degrades
 | <a id="field-luxir.sortspec.expr"></a>[`expr`](#field-luxir.sortspec.expr) | 1 | `string` | singular |  |
 | <a id="field-luxir.sortspec.vars"></a>[`vars`](#field-luxir.sortspec.vars) | 2 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
 | <a id="field-luxir.sortspec.dir"></a>[`dir`](#field-luxir.sortspec.dir) | 10 | [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir) | singular |  |
+
+<a id="message-luxir.sparsevectorquery"></a>
+
+### luxir.SparseVectorQuery
+
+Learned sparse retrieval (SPLADE, ELSER) over a SPARSE\_VECTOR or RANK\_FEATURES field. Matches documents that have at least one query token and scores the dot product sum(query weight \* stored weight) over the shared tokens. Stored weights are quantized (see FieldDef.SPARSE\_VECTOR). Scoring uses block-max pruning when only the top hits are needed.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.sparsevectorquery.field"></a>[`field`](#field-luxir.sparsevectorquery.field) | 1 | `string` | singular |  |
+| <a id="field-luxir.sparsevectorquery.query_vector"></a>[`query_vector`](#field-luxir.sparsevectorquery.query_vector) | 2 | map&lt;`string`, `float`&gt; | map | Required, non-empty. Token -&gt; weight; weights must be finite and &gt; 0. Tokens are matched exactly, without analysis. |
 
 <a id="message-luxir.statsrequest"></a>
 
@@ -2574,6 +2663,9 @@ Placement preference for returned document fields: dense columns (DocList.column
 | <a id="value-luxir.fielddef.fieldclass.vector"></a>[`VECTOR`](#value-luxir.fielddef.fieldclass.vector) | 7 | dense float vector |
 | <a id="value-luxir.fielddef.fieldclass.date"></a>[`DATE`](#value-luxir.fielddef.fieldclass.date) | 8 | timestamp, stored as int64 milliseconds since the Unix epoch |
 | <a id="value-luxir.fielddef.fieldclass.geo_point"></a>[`GEO_POINT`](#value-luxir.fielddef.fieldclass.geo_point) | 9 | latitude/longitude point |
+| <a id="value-luxir.fielddef.fieldclass.sparse_vector"></a>[`SPARSE_VECTOR`](#value-luxir.fielddef.fieldclass.sparse_vector) | 14 | Feature fields (Lucene FeatureField). A document value is a JSON object of feature name -&gt; weight (SPARSE\_VECTOR, RANK\_FEATURES) or one number (RANK\_FEATURE). Weights must be positive and finite; they are stored as term frequencies with 9 significant bits, truncated (at most 0.4% low). Always index=MATCH, single-valued, no column, not stored.<br><br>learned sparse vector (SPLADE, ELSER tokens) |
+| <a id="value-luxir.fielddef.fieldclass.rank_features"></a>[`RANK_FEATURES`](#value-luxir.fielddef.fieldclass.rank_features) | 15 | named ranking signals, e.g. topic scores |
+| <a id="value-luxir.fielddef.fieldclass.rank_feature"></a>[`RANK_FEATURE`](#value-luxir.fielddef.fieldclass.rank_feature) | 16 | one static ranking signal, e.g. pagerank |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 
