@@ -363,8 +363,12 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Background merging that parallelizes inside a single merge, admitted
   against a node-wide indexing-RAM budget. `--max-ram-mb` sizes the whole node
   from one number (25% of system or cgroup RAM by default).
-- Operational statistics per node and per collection (`/_stats`): segments,
-  live documents, bytes, merge activity, and cache counters.
+- Operational statistics per node and per collection (`/_stats`, scraped as
+  `/metrics`), as JSON or Prometheus text from one response: request, search,
+  ingest and background rates and latencies, memory budgets and allocator
+  state, and opt-in collection state (documents, segments, bytes, merges,
+  inverters, cache counters, per-collection search and ingest activity) and
+  process, host and cgroup statistics.
 - No built-in authentication or TLS yet: run the server inside your own
   network boundary.
 

@@ -346,7 +346,7 @@ target_compile_definitions(luxir_lib PUBLIC
 
 add_executable(luxir src/luxir/main.cpp)
 target_link_libraries(luxir luxir_lib)
-set_source_files_properties(src/luxir/luxir_main.cpp PROPERTIES
+set_source_files_properties(src/luxir/BuildInfo.cpp PROPERTIES
   COMPILE_DEFINITIONS "LUXIR_VERSION=\"${PROJECT_VERSION}\";LUXIR_CPU_NAME=\"${LUXIR_CPU_TARGET}\"")
 # Declare the executable's baseline, without marking optional dependency kernels
 # as unconditional requirements. The loader can reject an unsupported CPU early.

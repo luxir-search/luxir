@@ -24,8 +24,9 @@ tenant under `/tenants/{tenant}`.
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
 | `POST /collections/{collection}/_open` | Adopt a collection whose files are already in the data directory; body `{"promote": bool, "incarnation": "..."}`, both optional. See [operations](operations.md#opening-and-closing-a-collection-at-runtime). |
 | `POST /collections/{collection}/_close` | Unregister and close a collection without a restart; body `{"discard": bool, "expect_commit": "incarnation:gen"}`, both optional. |
-| `GET /_stats` | Node totals and per-collection operational statistics. |
-| `GET /collections/{collection}/_stats` | Operational statistics for one collection. |
+| `GET /_stats` | Node statistics: service activity and memory by default; `collections`, `files`, `segments`, `system` and `host` opt in to costlier sections; `format=prometheus` renders Prometheus text. See [Stats and monitoring](operations.md#stats-and-monitoring). |
+| `GET /metrics` | The node's Prometheus scrape: `_stats` rendered as Prometheus text, with `collections` and `system` on by default. |
+| `GET /collections/{collection}/_stats` | Statistics for one collection, in JSON or Prometheus text. |
 | `GET /collections/{collection}/_snapshot` | Pin the current snapshot for copying; see [Replication](replication.md). |
 | `GET /collections/{collection}/_snapshot/files/{name}` | One file of a pinned snapshot. |
 | `GET /tenants` | Tenants that own a collection. |
@@ -69,7 +70,8 @@ Every JSON body ends with a newline. `?pretty` (bare, or `?pretty=true` /
 `?pretty=false`) is a URL-only, best-effort formatting hint that applies to
 every JSON body of the request, errors and ingest acknowledgements included.
 Schema, collection list, and stats responses default to pretty; every other
-route defaults to compact. Indentation is two spaces but is not part of the
+route defaults to compact. `_stats?format=prometheus` is
+`text/plain; version=0.0.4` and ignores `pretty`. Indentation is two spaces but is not part of the
 contract. A pretty stream is sent as `application/json`, still chunked, with
 one pretty JSON text per batch separated by blank lines. It is not a single
 JSON document, though `jq` reads the sequence directly. Pretty is ignored for `format=docs`, whether selected by URL or

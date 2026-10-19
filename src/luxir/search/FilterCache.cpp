@@ -965,13 +965,6 @@ FilterCache::FilterCache(FilterCacheConfig config)
                        std::memory_order_release);
 }
 
-size_t FilterCache::StripedCounter::threadStripe() {
-  static std::atomic<size_t> nextStripe{0};
-  thread_local size_t stripe =
-      nextStripe.fetch_add(1, std::memory_order_relaxed) % STRIPES;
-  return stripe;
-}
-
 uint64_t FilterCache::nextEpoch() {
   return epoch.fetch_add(1, std::memory_order_relaxed);
 }
