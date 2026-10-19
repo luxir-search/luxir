@@ -97,9 +97,15 @@ parallel list chunks share the same preparation policy without sharing
 mutable scanner state. Exact column scans and terminal rescoring retain the
 canonical query.
 
-RaBitQ's estimated L2 distance is unbiased and can be slightly negative for
-near vectors, so the approximate L2 score conversion clamps distances at zero
-(1 / (1 + d) would otherwise turn a negative estimate into a worse score).
+RaBitQ's estimated squared L2 distance can be negative. Internal ordering
+scores use `1 / (1 + d)` for `d >= 0` and `1 - d` for `d < 0`, preserving
+ordering across segments and bounded cuts instead of tying negative estimates
+at 1. Group scanners invert this same map when setting their competitive
+distance threshold. These approximate scores may exceed the public L2 range
+`[0, 1]`; terminal rescoring from column vectors restores exact scores before
+the final cut, similarity filtering, and returning results. Exact column
+witnesses bypass the bounded approximate heap, so an inflated estimate cannot
+evict an exact candidate. Public L2 scoring remains `1 / (1 + squared_distance)`.
 
 FAISS also ships `IndexIVFRaBitQFastScan`, which block-packs codes 32 vectors
 at a time for SIMD lookups and measured about 1.5 to 2 times faster list scans

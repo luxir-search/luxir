@@ -513,8 +513,8 @@ public:
   /// The similarity threshold as a floor in score space, or -inf when unset.
   /// L2 similarity is a maximum (non-squared) distance d, scored as
   /// 1 / (1 + d^2); IP and COSINE scores are the similarity itself. The float
-  /// expression mirrors scoreFromDist, so a hit at exactly distance d keeps
-  /// its place.
+  /// expression mirrors scoreFromDist's nonnegative branch, so a hit at
+  /// exactly distance d keeps its place.
   float similarityScoreFloor() const noexcept {
     if (!similarity.has_value()) {
       return -std::numeric_limits<float>::infinity();
@@ -1097,8 +1097,9 @@ public:
       //   BREADTH - pool exhausted but more IVF lists remain: grow breadth
       //             (the engine allocates the next globally-best lists).
       // The whole loop runs on ENGINE scores (exact for column slots,
-      // approximate for IVF overlays): the stopping condition is a distinct-doc
-      // COUNT, which approximate scores answer just as well, so exact rescore
+      // approximate for IVF overlays, possibly above 1 for L2): the stopping
+      // condition is a distinct-doc COUNT, which approximate scores answer
+      // just as well, so exact rescore
       // is deferred to one terminal pass after the loop.  Deliberately not
       // overlapped with rescore: interleaving would re-read column vectors
       // for segments that later rounds add candidates to, trading throughput
@@ -1460,7 +1461,10 @@ public:
           // the distance outward too (L2's score conversion rounds twice).
           float score = std::nextafter(floor->score, -std::numeric_limits<float>::infinity());
           if (metric == (int32_t)api::VectorMetric::L2) {
-            if (score > 0) threshold = std::nextafter(1.0f / score - 1.0f, std::numeric_limits<float>::infinity());
+            if (score > 0) {
+              float distance = score >= 1.0f ? 1.0f - score : 1.0f / score - 1.0f;
+              threshold = std::nextafter(distance, std::numeric_limits<float>::infinity());
+            }
           } else threshold = score;
         }
         bool add_result(float distance, faiss::idx_t rank) override {
@@ -2745,8 +2749,8 @@ private:
     return std::nextafter(std::numeric_limits<float>::lowest(), 0.0f);
   }
 
-  // Keep L2/IP conversions in sync with scoreFromDist below.  COSINE has a
-  // separate stored-vector norm branch for raw-column rescore mode.
+  // Keep L2's nonnegative branch and IP in sync with scoreFromDist below.
+  // COSINE has a separate stored-vector norm branch for raw-column rescore mode.
   static float exactScore(const float* queryPtr,
                           std::span<const float> vec,
                           int32_t dims,
@@ -2802,8 +2806,8 @@ private:
     }
   }
 
-  // Convert FAISS's per-metric distance to a "higher is better" score.
-  //   L2:    FAISS returns squared distance - invert to 1/(1+d).
+  // Convert FAISS's per-metric distance to an internal "higher is better" score.
+  //   L2:    squared distance d >= 0 maps to 1/(1+d); d < 0 maps to 1-d.
   //   IP:    FAISS returns dot product - already higher-is-better.
   //   COSINE: stored as IP over normalized vectors (write path or builder),
   //           query is normalized at search time - same as IP.
@@ -2811,10 +2815,9 @@ private:
   static float scoreFromDist(float dist, int32_t metric) {
     switch (metric) {
       case (int32_t)luxir::api::VectorMetric::L2:
-        // Exact and PQ distances are >= 0, but RaBitQ's unbiased estimate
-        // can dip below zero for near vectors; clamping keeps the
-        // conversion monotone (1 / (1 + d) flips sign past d = -1).
-        return finiteScore(1.0f / (1.0f + std::max(dist, 0.0f)));
+        // Preserve ordering among negative RaBitQ estimates. Scores above
+        // 1 are internal only: terminal rescore restores exact L2 scores.
+        return finiteScore(dist >= 0.0f ? 1.0f / (1.0f + dist) : 1.0f - dist);
       case (int32_t)luxir::api::VectorMetric::IP:
       case (int32_t)luxir::api::VectorMetric::COSINE:
       default:
