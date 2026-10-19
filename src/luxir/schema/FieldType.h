@@ -292,6 +292,28 @@ public:
                               std::span<char> buf) const override;
 };
 
+// Resolved ANN overlay settings of a vector field (api::VectorAnnDef with
+// defaults applied: PQ unless explicitly selected otherwise). Build-time
+// parameters are recorded in each overlay's VectorAuxMeta, so a change only
+// affects overlays built afterwards;
+// rabitqQueryBits is a search-time parameter read from the current schema.
+struct VectorAnnConfig {
+  enum Codec {
+    RABITQ = 0,
+    PQ = 1,
+  };
+  static constexpr int32_t DEFAULT_RABITQ_BITS = 1;
+  static constexpr int32_t DEFAULT_RABITQ_QUERY_BITS = 4;
+  static constexpr int32_t DEFAULT_PQ_BITS = 8;
+
+  Codec codec = PQ;
+  int32_t nlist = 0;  // 0 = sqrt(segment vectors), capped
+  int32_t rabitqBits = DEFAULT_RABITQ_BITS;
+  int32_t rabitqQueryBits = DEFAULT_RABITQ_QUERY_BITS;
+  int32_t pqM = 0;    // 0 = derived from dims
+  int32_t pqBits = DEFAULT_PQ_BITS;
+};
+
 // Dense float vector field.  Values are stored as fixed-size byte blobs
 // through the standard binary-column path (see VectorHandler).  dims_ may be
 // 0, in which case the first indexed value in a segment fixes the segment's
@@ -317,23 +339,28 @@ public:
   // COSINE fields normalize vectors before column storage by default.  Ignored
   // for non-COSINE metrics.
   bool normalizeOnWrite_;
+  // ANN overlay codec and parameters (schema "ann").
+  VectorAnnConfig ann_;
 
   VectorFieldType(std::string_view name, int32_t dims = 0,
                   int flags = COLUMN_STORED | FIXED_SIZE,
                   Metric metric = METRIC_NONE,
                   bool normalized = false,
-                  bool normalizeOnWrite = true)
+                  bool normalizeOnWrite = true,
+                  VectorAnnConfig ann = {})
     : FieldType(name, FieldType::VECTOR, flags),
       dims_(dims),
       metric_(metric),
       normalized_(normalized),
-      normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized) {
+      normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized),
+      ann_(ann) {
   }
 
   int32_t dims() const { return dims_; }
   Metric metric() const { return metric_; }
   bool normalized() const { return normalized_; }
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
+  const VectorAnnConfig& ann() const { return ann_; }
 
   // True iff this field supports kNN / ANN search.  Exact flat search can run
   // directly over the column; real ANN engines may also build aux artifacts.

@@ -109,8 +109,12 @@ class Collection {
   std::atomic<bool> failed{false};
   mutable std::mutex failureMutex;
   std::string failure;
+  // Shared with the writer, whose work can outlive this object.
+  std::shared_ptr<CollectionMetrics> metrics = std::make_shared<CollectionMetrics>();
 public:
   const CollectionId& getId() const { return id; }
+  CollectionMetrics& getMetrics() const { return *metrics; }
+  const std::shared_ptr<CollectionMetrics>& sharedMetrics() const { return metrics; }
   std::string getUnavailableReason() const;
   // The one way a collection becomes unavailable while registered: a
   // placeholder's reason, or a failure found while serving (a scrub mismatch).

@@ -460,6 +460,18 @@ public:
                     std::optional<std::chrono::seconds> preferredOffset)
     : zone(zone), preferredOffset(preferredOffset) {}
 
+  bool intervalSkipped(int64_t civilLo, int64_t civilNext) const {
+    // The direct check inspects the interval's last millisecond. Reuse a
+    // cached unique/fold interval when it already covers that point; actual
+    // gaps keep the shared helper's skipped-day and tzdb endpoint handling.
+    if (civilNext > civilLo && cached
+        && cachedInfo.result != std::chrono::local_info::nonexistent) {
+      int64_t last = civilNext - 1;
+      if ((__int128)last >= cachedBegin && (__int128)last < cachedEnd) return false;
+    }
+    return civilIntervalSkipped(civilLo, civilNext, zone);
+  }
+
   std::optional<int64_t> resolve(int64_t civilMillis) {
     using namespace std::chrono;
     if (!zone.isIana()) {
@@ -907,55 +919,26 @@ inline bool startsWithNow(const Cursor& input) {
 
 } // namespace datetime_detail
 
-// From-start civil stepping for calendar facet fences. The start instant's
-// frame offset is retained as the ofLocal preference for every independently
-// computed fence.
-class CivilCalendarStepper {
-  TimeZone zone;
-  std::optional<CivilTime> startCivil;
-  datetime_detail::LocalTimeResolver resolver;
-
-public:
-  CivilCalendarStepper(int64_t startInstant, const TimeZone& zone)
-    : zone(zone), startCivil(civilFromInstant(startInstant, zone)),
-      resolver(zone, startCivil
-          ? std::optional<std::chrono::seconds>{startCivil->offset}
-          : std::nullopt) {}
-
-  bool valid() const { return startCivil.has_value(); }
-
-  std::optional<CivilFence> at(int64_t amount, CalendarUnit unit) {
-    namespace dd = datetime_detail;
-    if (!startCivil) return std::nullopt;
-
-    std::optional<int64_t> civil;
-    if (unit == CalendarUnit::DAY || unit == CalendarUnit::WEEK) {
-      int64_t daysPerUnit = unit == CalendarUnit::WEEK ? 7 : 1;
-      __int128 target = (__int128)startCivil->millis
-                      + (__int128)amount * daysPerUnit * dd::kMsPerDay;
-      if (target < dd::kMinEpochMs || target > dd::kMaxEpochMs) {
-        return std::nullopt;
-      }
-      civil = (int64_t)target;
-    } else if (unit == CalendarUnit::YEAR) {
-      civil = dd::calendarCivil(
-          startCivil->millis, amount, dd::DateMathUnit::YEAR);
-    } else {
-      __int128 months = amount;
-      if (unit == CalendarUnit::QUARTER) months *= 3;
-      if (months < std::numeric_limits<int64_t>::min()
-          || months > std::numeric_limits<int64_t>::max()) {
-        return std::nullopt;
-      }
-      civil = dd::calendarCivil(
-          startCivil->millis, (int64_t)months, dd::DateMathUnit::MONTH);
-    }
-    if (!civil) return std::nullopt;
-    auto instant = resolver.resolve(*civil);
-    if (!instant) return std::nullopt;
-    return CivilFence{*civil, *instant};
+// Pure civil arithmetic, always from the original anchor. Month-end clamping
+// must not accumulate (Jan 31 -> Feb 29 -> Mar 31).
+inline std::optional<int64_t> civilCalendarAt(
+    int64_t startCivil, int64_t amount, CalendarUnit unit) {
+  namespace dd = datetime_detail;
+  if (unit == CalendarUnit::DAY || unit == CalendarUnit::WEEK) {
+    int64_t daysPerUnit = unit == CalendarUnit::WEEK ? 7 : 1;
+    __int128 target = (__int128)startCivil
+                    + (__int128)amount * daysPerUnit * dd::kMsPerDay;
+    if (target < dd::kMinEpochMs || target > dd::kMaxEpochMs) return std::nullopt;
+    return (int64_t)target;
   }
-};
+  if (unit == CalendarUnit::YEAR) {
+    return dd::calendarCivil(startCivil, amount, dd::DateMathUnit::YEAR);
+  }
+  __int128 months = (__int128)amount * (unit == CalendarUnit::QUARTER ? 3 : 1);
+  if (months < std::numeric_limits<int64_t>::min()
+      || months > std::numeric_limits<int64_t>::max()) return std::nullopt;
+  return dd::calendarCivil(startCivil, (int64_t)months, dd::DateMathUnit::MONTH);
+}
 
 inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEpochMillis,
                                                const TimeZone& zone) {

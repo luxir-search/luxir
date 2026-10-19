@@ -107,6 +107,7 @@ private:
     ~Transition();
   };
 
+  std::shared_ptr<Metrics> metrics;
   const LuxirConfig& config;
   CollectionEvents& events;
   IndexRamBudget& indexRamBudget;
@@ -139,7 +140,7 @@ private:
 
 public:
   Collections(const LuxirConfig& config, CollectionEvents& events, IndexRamBudget& indexRamBudget,
-              oneapi::tbb::task_arena& arena);
+              oneapi::tbb::task_arena& arena, std::shared_ptr<Metrics> metrics = Metrics::detached());
   ~Collections();
 
   // A tenant or collection name: [a-z][a-z0-9_]*, at most 255 bytes.

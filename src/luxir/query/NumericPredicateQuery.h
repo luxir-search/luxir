@@ -181,10 +181,7 @@ public:
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags,
-                              float multiplier = 1.0f) override {
-    float score = constantWhenScored(flags, multiplier);
-    return context.pool.make<Weight>(context, *this, flags, score);
-  }
+                              float multiplier = 1.0f) override;
 
   // PredicateScorer is the sparse two-phase verifier and, when instantiated
   // with IntColReader::Iterator, the benchmark's full column-scan baseline.

@@ -11,6 +11,7 @@
 #include <sstream>
 #include <thread>
 #include "luxir/luxir_main.h"
+#include "luxir/BuildInfo.h"
 #include "luxir/server/Promotion.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/util/luxir_util.h"
@@ -18,6 +19,7 @@
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/ReplicationFollower.h"
 #include "luxir/LuxirConfig.h"
+#include <CLI/CLI.hpp>
 
 namespace fs = std::filesystem;
 
@@ -75,7 +77,7 @@ int luxir_main(int argc, char** argv) {
   spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");
 
   CLI::App app{"Luxir search engine"};
-  app.set_version_flag("--version", "Luxir " LUXIR_VERSION " (" LUXIR_CPU_NAME ")");
+  app.set_version_flag("--version", "Luxir " + std::string(buildVersion()) + " (" + std::string(buildCpuTarget()) + ")");
   LuxirConfig config;
   config.addOptions(app);
   auto* pull = app.add_subcommand("pull", "Copy current source snapshots to a follower data directory");
@@ -191,7 +193,7 @@ int luxir_main(int argc, char** argv) {
 
 std::string luxir_banner() {
   std::stringstream ss;
-  ss << "Luxir " LUXIR_VERSION " (" LUXIR_CPU_NAME ")";
+  ss << "Luxir " << buildVersion() << " (" << buildCpuTarget() << ")";
 #ifdef NDEBUG
   ss << " Release (NDEBUG)";
 #else

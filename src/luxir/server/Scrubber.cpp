@@ -53,8 +53,11 @@ void Scrubber::run(std::stop_token stop) {
 }
 
 size_t Scrubber::scrub(std::stop_token stop) {
-  // Announce first: a background pass yields at its next chunk.
+  // Announce first: a background pass yields at its next chunk. The lock
+  // orders the announcement before the pass's predicate check, so a notify
+  // cannot slip between that check and its wait.
   waiting.fetch_add(1, std::memory_order_relaxed);
+  { std::lock_guard lock(wakeMutex); }
   wake.notify_all();
   std::lock_guard lock(mutex);
   waiting.fetch_sub(1, std::memory_order_relaxed);

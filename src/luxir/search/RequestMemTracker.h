@@ -54,20 +54,27 @@ class RequestMemResource : public std::pmr::memory_resource {
   RequestMemTracker& tracker;
   std::string detail;
   std::string breaker;
+  std::atomic<size_t> allocatedBytes{0};
 
   void* do_allocate(size_t bytes, size_t alignment) override {
     tracker.charge(bytes, breaker, detail);
-    try { return std::pmr::new_delete_resource()->allocate(bytes, alignment); }
+    try {
+      void* result = std::pmr::new_delete_resource()->allocate(bytes, alignment);
+      allocatedBytes.fetch_add(bytes, std::memory_order_relaxed);
+      return result;
+    }
     catch (...) { tracker.release(bytes); throw; }
   }
   void do_deallocate(void* p, size_t bytes, size_t alignment) override {
     std::pmr::new_delete_resource()->deallocate(p, bytes, alignment);
+    allocatedBytes.fetch_sub(bytes, std::memory_order_relaxed);
     tracker.release(bytes);
   }
   bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
     return this == &other;
   }
 public:
+  size_t bytes() const { return allocatedBytes.load(std::memory_order_relaxed); }
   RequestMemResource(RequestMemTracker& tracker, std::string_view detail,
                      std::string_view breaker = "facet distinct state")
       : tracker(tracker), detail(detail), breaker(breaker) {}

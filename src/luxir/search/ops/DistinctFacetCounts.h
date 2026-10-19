@@ -11,6 +11,7 @@
 #include "FacetCountResource.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/util/AtomicMerger.h"
+#include "luxir/search/RangeFacetCellWindow.h"
 
 namespace luxir {
 
@@ -39,6 +40,13 @@ class DistinctFacetCounts : public MergeableData {
   template <typename K, typename Hash = boost::hash<K>>
   using Set = boost::unordered_flat_set<K, Hash, std::equal_to<K>, std::pmr::polymorphic_allocator<K>>;
   struct SingletonCount { int64_t count = 0; uint64_t lastDoc = UINT64_MAX; };
+  using CellWindow = RangeFacetCellWindow<uint64_t**>;
+  struct WindowDeleter {
+    std::pmr::memory_resource* resource;
+    void operator()(CellWindow* window) const {
+      std::pmr::polymorphic_allocator<>(resource).delete_object(window);
+    }
+  };
 
   FacetCountResource resource;
   DistinctFacetMode mode;
@@ -48,6 +56,7 @@ class DistinctFacetCounts : public MergeableData {
   uint64_t words;
   uint64_t pagesPerValue;
   std::pmr::vector<uint64_t**> rows;
+  uint64_t** missingRow = nullptr;
   Set<FacetPair, FacetPairHash> pairs;
   Set<int64_t> nullValues;
   Set<int64_t> missingGroups;
@@ -65,6 +74,11 @@ class DistinctFacetCounts : public MergeableData {
   boost::unordered_flat_map<std::pmr::string, int64_t, TupleHash, std::equal_to<>,
       std::pmr::polymorphic_allocator<std::pair<const std::pmr::string, int64_t>>> tuples{&resource};
   std::pmr::string encoded{&resource};
+  std::unique_ptr<CellWindow, WindowDeleter> window{nullptr, WindowDeleter{&resource}};
+  bool adaptive = false;
+  size_t pagedBytes = 0;
+  size_t nextCheck = 32ULL << 20;
+  size_t conversions = 0;
 
   int64_t intern(std::string_view key) {
     auto found = tuples.find(key);
@@ -76,26 +90,46 @@ class DistinctFacetCounts : public MergeableData {
   }
 
   uint64_t pageWords(uint64_t index) const { return std::min(PAGE_WORDS, words - index * PAGE_WORDS); }
-  uint64_t* page(uint64_t value, uint64_t index) {
-    if (rows[value] == nullptr) {
-      rows[value] = (uint64_t**)resource.allocate(pagesPerValue * sizeof(uint64_t*), alignof(uint64_t*));
-      std::fill_n(rows[value], pagesPerValue, nullptr);
-    }
-    if (rows[value][index] == nullptr) {
-      auto* p = (uint64_t*)resource.allocate(pageWords(index) * sizeof(uint64_t), alignof(uint64_t));
-      std::fill_n(p, pageWords(index), 0);
-      rows[value][index] = p;
-    }
-    return rows[value][index];
+  [[gnu::cold, gnu::noinline]] uint64_t* allocatePage(uint64_t**& row, uint64_t index);
+  uint64_t* page(uint64_t**& row, uint64_t index) {
+    if (row == nullptr || row[index] == nullptr) [[unlikely]] return allocatePage(row, index);
+    return row[index];
   }
-  void releasePages() {
-    for (auto* row : rows) if (row) {
-      for (uint64_t i = 0; i < pagesPerValue; i++) if (row[i]) {
-        resource.deallocate(row[i], pageWords(i) * sizeof(uint64_t), alignof(uint64_t));
-      }
-      resource.deallocate(row, pagesPerValue * sizeof(uint64_t*), alignof(uint64_t*));
+  void releaseRow(uint64_t**& row);
+  void releasePages();
+  [[gnu::cold, gnu::noinline]] uint64_t* growingPage(uint64_t**& row, uint64_t index);
+  void considerHash(size_t extra);
+  void convertToHash();
+  static DistinctFacetCounts* mergeGrowing(DistinctFacetCounts* a, DistinctFacetCounts* b);
+  template <typename Row>
+  void eachRow(Row&& row) const {
+    if (window) {
+      auto entries = window->entries();
+      for (size_t i = 0; i < entries.size(); i++) if (entries[i]) row(window->cellKey(i), entries[i]);
+    } else {
+      for (size_t i = 0; i < rows.size(); i++) if (rows[i]) row(values.value(i), rows[i]);
     }
-    rows.clear();
+  }
+  template <typename Pair>
+  void eachGroup(uint64_t** row, Pair&& pair) const {
+    if (!row) return;
+    for (uint64_t p = 0; p < pagesPerValue; p++) if (row[p]) {
+      for (uint64_t w = 0; w < pageWords(p); w++) {
+        uint64_t bits = row[p][w];
+        while (bits) {
+          uint64_t index = (p * PAGE_WORDS + w) * 64 + std::countr_zero(bits);
+          pair(groups.value(index));
+          bits &= bits - 1;
+        }
+      }
+    }
+  }
+  int64_t rowCount(uint64_t** row) const {
+    int64_t count = 0;
+    if (row) for (uint64_t i = 0; i < pagesPerValue; i++) if (row[i]) {
+      for (uint64_t w = 0; w < pageWords(i); w++) count += std::popcount(row[i][w]);
+    }
+    return count;
   }
   static void singleton(SingletonCount& state, int64_t doc) {
     if (state.lastDoc != (uint64_t)doc) { state.count++; state.lastDoc = (uint64_t)doc; }
@@ -113,13 +147,26 @@ class DistinctFacetCounts : public MergeableData {
     } else normal((int64_t)group);
   }
 
-  template <DistinctFacetMode Mode, typename Visit>
+  template <DistinctFacetMode Mode, bool Growing = false, bool Adaptive = false, typename Visit>
   void collectAs(Visit&& visit) {
     auto normal = [&](int64_t value, int64_t group) LUXIR_INLINE {
       if constexpr (Mode == DistinctFacetMode::PAGED) {
         uint64_t index = groups.index(group);
-        assert(index < groups.size && values.index(value) < values.size);
-        page(values.index(value), index / 64 / PAGE_WORDS)[index / 64 % PAGE_WORDS] |= 1ULL << (index & 63);
+        assert(index < groups.size);
+        if constexpr (Growing) {
+          if constexpr (Adaptive) if (mode == DistinctFacetMode::HASH) [[unlikely]] {
+            pairs.insert({window->cellKey((size_t)value), group});
+            return;
+          }
+          auto& row = window->entry((size_t)value);
+          auto* p = row ? row[index / 64 / PAGE_WORDS] : nullptr;
+          if (!p) [[unlikely]] p = growingPage(row, index / 64 / PAGE_WORDS);
+          if (!p) [[unlikely]] { pairs.insert({window->cellKey((size_t)value), group}); return; }
+          p[index / 64 % PAGE_WORDS] |= 1ULL << (index & 63);
+        } else {
+          assert(values.index(value) < values.size);
+          page(rows[values.index(value)], index / 64 / PAGE_WORDS)[index / 64 % PAGE_WORDS] |= 1ULL << (index & 63);
+        }
       } else if constexpr (Mode == DistinctFacetMode::HASH) pairs.insert({value, group});
       else {
         auto found = last.find(value);
@@ -128,14 +175,24 @@ class DistinctFacetCounts : public MergeableData {
       }
     };
     visit([&](int64_t value, auto group) LUXIR_INLINE {
-      accept(group, [&](int64_t id) LUXIR_INLINE { normal(value, id); },
-          [&] { nullValues.insert(value); },
-          [&](int64_t doc) { singleton(singletons[value], doc); });
+      size_t cell = 0;
+      if constexpr (Growing) cell = window->observe(value); // Before DROP filtering.
+      int64_t key = value;
+      if constexpr (Growing && Mode != DistinctFacetMode::PAGED) key = window->cellKey(cell);
+      accept(group, [&](int64_t id) LUXIR_INLINE { normal(Growing && Mode == DistinctFacetMode::PAGED ? (int64_t)cell : key, id); },
+          [&] { nullValues.insert(Growing ? window->cellKey(cell) : value); },
+          [&](int64_t doc) { singleton(singletons[Growing ? window->cellKey(cell) : value], doc); });
     }, [&](auto group) LUXIR_INLINE {
       accept(group, [&](int64_t id) {
         if constexpr (Mode == DistinctFacetMode::PAGED) {
           uint64_t index = groups.index(id);
-          page(values.size, index / 64 / PAGE_WORDS)[index / 64 % PAGE_WORDS] |= 1ULL << (index & 63);
+          if constexpr (Growing) {
+            if (mode == DistinctFacetMode::HASH) { missingGroups.insert(id); return; }
+            auto* p = missingRow ? missingRow[index / 64 / PAGE_WORDS] : nullptr;
+            if (!p) p = growingPage(missingRow, index / 64 / PAGE_WORDS);
+            if (p) p[index / 64 % PAGE_WORDS] |= 1ULL << (index & 63);
+            else missingGroups.insert(id);
+          } else page(missingRow, index / 64 / PAGE_WORDS)[index / 64 % PAGE_WORDS] |= 1ULL << (index & 63);
         } else if constexpr (Mode == DistinctFacetMode::HASH) missingGroups.insert(id);
         else if (lastMissing != id) { missingCount++; lastMissing = id; }
       }, [&] { missingNull = true; }, [&](int64_t doc) { singleton(missingSingletons, doc); });
@@ -146,7 +203,9 @@ class DistinctFacetCounts : public MergeableData {
 public:
   Map<int64_t, int64_t> counts;
 
-  GroupIdentity identity(const FacetGroupPlan& plan, const CollapseKey* key) {
+  // Keep tuple identity outside the value loop: inlining it alongside PAGED
+  // counting increases register pressure in the tuple-key walk.
+  LUXIR_NOINLINE GroupIdentity identity(const FacetGroupPlan& plan, const CollapseKey* key) {
     if (key == nullptr) return {GroupIdentity::DROP};
     if (key->singleton) return {GroupIdentity::SINGLETON, (int64_t)*key->singleton};
     if (!plan.internTuples) return {GroupIdentity::VALUE, plan.tupleId(*key)};
@@ -183,16 +242,46 @@ public:
         pagesPerValue(words / PAGE_WORDS + (words % PAGE_WORDS != 0)), rows(&resource), pairs(&resource),
         nullValues(&resource), missingGroups(&resource), singletons(&resource), last(&resource), counts(&resource) {
     assert(mode != DistinctFacetMode::RUN || isContiguous || distinctFacetRunContractForTests);
-    if (mode == DistinctFacetMode::PAGED) rows.assign(values.size + 1, nullptr);
+    if (mode == DistinctFacetMode::PAGED) rows.assign(values.size, nullptr);
     if (distinctFacetStatsForTests) {
       if (mode == DistinctFacetMode::PAGED) distinctFacetStatsForTests->paged++;
       if (mode == DistinctFacetMode::HASH) distinctFacetStatsForTests->hash++;
       if (mode == DistinctFacetMode::RUN) distinctFacetStatsForTests->run++;
     }
   }
+  // AUTO starts PAGED for a representable dense group directory, then checks
+  // actual allocated state. Unknown range extents never select HASH by themselves.
+  DistinctFacetCounts(RequestMemTracker& tracker, std::string_view label,
+      DistinctFacetMode requested, const RangeFacetGrid& grid, FacetDimension groups,
+      size_t pagedLimit = 32ULL << 20, size_t bucketCap = 100000,
+      bool isContiguous = false);
+  size_t residentBytes() const { return resource.bytes() + (window ? window->residentBytes() : 0); }
+  DistinctFacetMode selectedMode() const { return mode; }
+  size_t conversionCount() const { return conversions; }
+  const RangeFacetCellWindow<uint64_t**>* cellWindow() const { return window.get(); }
+  void widen(std::optional<int64_t> start, std::optional<int64_t> end) {
+    assert(window);
+    window->widen(start, end);
+  }
   ~DistinctFacetCounts() { releasePages(); }
+  // Raw values use the growing directory. Fixed collectors already supply
+  // bucket identities and never instantiate this dispatch in their hot loop.
+  template <typename Visit>
+  void collectValues(Visit&& visit) {
+    assert(window);
+    switch (mode) {
+      case DistinctFacetMode::PAGED:
+        if (adaptive) collectAs<DistinctFacetMode::PAGED, true, true>(visit);
+        else collectAs<DistinctFacetMode::PAGED, true>(visit);
+        break;
+      case DistinctFacetMode::HASH: collectAs<DistinctFacetMode::HASH, true>(visit); break;
+      case DistinctFacetMode::RUN: collectAs<DistinctFacetMode::RUN, true>(visit); break;
+      default: assert(false);
+    }
+  }
   template <typename Visit>
   void collect(Visit&& visit) {
+    assert(!window);
     switch (mode) {
       case DistinctFacetMode::PAGED: collectAs<DistinctFacetMode::PAGED>(visit); break;
       case DistinctFacetMode::HASH: collectAs<DistinctFacetMode::HASH>(visit); break;
@@ -202,13 +291,18 @@ public:
   }
 
   static DistinctFacetCounts* merge(DistinctFacetCounts* a, DistinctFacetCounts* b) {
+    if (a->window || b->window) return mergeGrowing(a, b);
     assert(a->mode == b->mode);
     if (a->mode == DistinctFacetMode::PAGED) {
       for (uint64_t value = 0; value < a->rows.size(); value++) if (b->rows[value]) {
         for (uint64_t i = 0; i < a->pagesPerValue; i++) if (b->rows[value][i]) {
-          auto* p = a->page(value, i);
+          auto* p = a->page(a->rows[value], i);
           for (uint64_t w = 0; w < a->pageWords(i); w++) p[w] |= b->rows[value][i][w];
         }
+      }
+      if (b->missingRow) for (uint64_t i = 0; i < a->pagesPerValue; i++) if (b->missingRow[i]) {
+        auto* p = a->page(a->missingRow, i);
+        for (uint64_t w = 0; w < a->pageWords(i); w++) p[w] |= b->missingRow[i][w];
       }
     } else if (a->mode == DistinctFacetMode::HASH) {
       if (!a->tuples.empty() || !b->tuples.empty()) {
@@ -236,14 +330,11 @@ public:
 
   void finish() {
     if (mode == DistinctFacetMode::PAGED) {
-      for (uint64_t row = 0; row < rows.size(); row++) if (rows[row]) {
-        int64_t count = 0;
-        for (uint64_t i = 0; i < pagesPerValue; i++) if (rows[row][i]) {
-          for (uint64_t w = 0; w < pageWords(i); w++) count += std::popcount(rows[row][i][w]);
-        }
-        if (row == values.size) missingCount += count;
-        else if (count != 0) counts[values.value(row)] += count;
-      }
+      eachRow([&](int64_t value, uint64_t** row) {
+        int64_t count = rowCount(row);
+        if (count) counts[value] += count;
+      });
+      missingCount += rowCount(missingRow);
     } else if (mode == DistinctFacetMode::HASH) {
       for (auto pair : pairs) counts[pair.value]++;
       missingCount += (int64_t)missingGroups.size();

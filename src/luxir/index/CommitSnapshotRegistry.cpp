@@ -336,11 +336,11 @@ void CommitSnapshotRegistry::setPolicy(Policy value) {
   unlink(retired);
 }
 
-CommitSnapshotRegistry::Stats CommitSnapshotRegistry::stats() {
+CommitSnapshotRegistry::Stats CommitSnapshotRegistry::stats(bool expire) {
   std::vector<std::string> retired;
   auto cleanup = scope_guard([&] { unlink(retired); });
   std::lock_guard lock(mutex);
-  expireLocked(retired);
+  if (expire) expireLocked(retired);
   auto result = counters;
   result.pins = pins.size();
   return result;

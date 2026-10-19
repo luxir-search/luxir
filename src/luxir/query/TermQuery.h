@@ -104,10 +104,8 @@ public:
     return hasInjectedTermStats ? injectedTermStats : cachedTermInfo.termStats;
   }
 
-  TermQuery::Weight* createWeight(Context& context, int32_t flags,
-                                  float multiplier = 1.0f) override {
-    return context.pool.make<TermQuery::Weight>(context, *this, flags, multiplier);
-  }
+  Query::Weight* createWeight(Context& context, int32_t flags,
+                              float multiplier = 1.0f) override;
 
   class Weight final : public Query::Weight {
   protected:
@@ -1481,18 +1479,5 @@ public:
   };
 
 };
-
-inline BulkScorer* TermQuery::Weight::Supplier::buildBulk(
-    MemPool& targetPool, const BulkPlan& plan) {
-  using DirectTermScorer = TermQuery::Scorer;
-  assert(plan.available == BulkAnswer::YES);
-  assert(!plan.hasConstantCount());
-  auto* scorer = dynamic_cast<DirectTermScorer*>(
-      weight.createScorer(targetPool, segment));
-  if (scorer == nullptr) {
-    return nullptr;
-  }
-  return targetPool.make<TermQuery::TermBulkScorer>(targetPool, scorer, segment.maxDoc());
-}
 
 } // namespace luxir

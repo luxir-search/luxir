@@ -676,12 +676,19 @@ message CalendarGap {
 
 // Numeric or DATE buckets using the field's value binding. Each bucket is
 // inclusive at its lower bound and exclusive at its upper bound; the final
-// bucket is clipped to end. start must be less than end. Buckets return in
-// lower-bound order.
+// bucket is clipped to end under EXPLICIT bounds. start must be less than end
+// when both are supplied. Buckets return in lower-bound order. At most 100000
+// buckets may be generated; with sub-operations at most 1024 may be returned
+// after mincount filtering. Fixed DATE gaps step in local time in the facet zone:
+// both fold occurrences are fences; skipped lattice times map to the transition.
 message RangeFacet {
   string field = 1;
-  Val start = 2; // required inclusive start of the range
-  Val end = 3;   // required exclusive end of the range
+  // EXPLICIT: inclusive first fence, required. DATA: optional widening bound;
+  // include its cell without excluding smaller matching values.
+  Val start = 2;
+  // EXPLICIT: exclusive last fence, required. DATA: optional exclusive widening
+  // bound; include intersecting cells below it without excluding larger values.
+  Val end = 3;
   oneof gap_kind {
     Val gap = 4; // positive fixed width in field units; integer milliseconds for DATE
     CalendarGap calendar_gap = 10; // civil gap for DATE fields only
@@ -693,11 +700,39 @@ message RangeFacet {
 
   // Scalar or array naming generated bucket lower bounds. Selected buckets
   // are returned even below mincount. Null, nongenerated bounds, and duplicate
-  // bounds after coercion are errors.
+  // bounds after coercion are errors. Not supported with DATA bounds.
   Val selected = 11;
   SelectionMode selection_mode = 12; // same filtering rules as FieldFacet; see SelectionMode
   optional FieldFacet.CountUnit count_unit = 13; // Inherits the parent measure; GROUPS uses the nearest collapse.
   Collapse count_distinct = 14; // Exact distinct keys; same specification as Collapse.
+
+  // Whether the extent is explicit or derived from this facet instance's values.
+  enum Bounds {
+    // start and end are required. Fixed DATE grids use the local time of start
+    // as their phase; calendar grids step from start for every n. The last
+    // fence is clipped to end.
+    EXPLICIT = 0;
+    // Span the smallest through largest matching finite values, plus optional
+    // start/end widening. Queries, filters and deletions affect the extent;
+    // each parent bucket's child histogram has its own span. Occupancy is from
+    // raw values, even when a distinct key is dropped and its measured count
+    // is zero. Empty domains return no buckets unless both widening bounds
+    // supply a span. NaN/Inf are outside every bucket and never fail DATA.
+    // Calendar grids use the 1970 civil epoch (ISO weeks: Monday 1969-12-29);
+    // a civil day starts at its first midnight, or first valid instant.
+    // selected is unsupported. The 100000-bucket cap applies to the actual
+    // span including widening and empty interior cells; use a larger gap.
+    DATA = 1;
+  }
+  Bounds bounds = 15;
+
+  // DATA fixed gaps only; rejected with calendar_gap. Default 0. For INT,
+  // FLOAT and DOUBLE, fences are origin + k * gap from a global integer k.
+  // For DATE, origin is a wall-clock phase in the facet zone: 21600000 with
+  // gap 86400000 starts days at 06:00 local across DST. This differs from
+  // Elasticsearch's UTC-translated offset near transitions. Must be integer
+  // milliseconds for DATE, an integer for INT, or a number for FLOAT/DOUBLE.
+  Val origin = 16;
 }
 
 message QueryBucket {
@@ -1261,32 +1296,332 @@ message ListTenantsResponse {
   repeated string tenants = 1;
 }
 
-// Operational statistics. An empty collection requests every
-// collection on the node; per-segment records are opt-in because they are the
-// only unbounded part of the response.
+// Which statistics to gather. The node scope (no collection, no tenant) always
+// returns the cheap counters: service activity and node memory, read from
+// atomics and allocator statistics. Anything that walks collections, lists
+// directories, or reads the operating system is opt-in. A tenant or a
+// collection scope always walks its collections and returns no node blocks.
 message StatsRequest {
+  reserved 4;
+  reserved "memory";
   // Empty selects every collection of `tenant`, or of every tenant when
   // `tenant` is also empty (administration).
   string collection = 1;
+  // Per-segment records. Implies `files`, and `collections` at node scope.
   bool segments = 2;
   // Administration only. With a collection, empty is the caller's tenant.
   string tenant = 3;
-  // Return only node memory statistics (StatsResponse.memory), without
-  // collections or totals. Node-wide: invalid with a collection, a tenant, or
-  // segments.
-  bool memory = 4;
+  // Node scope: also walk every collection (totals, index state, query cache,
+  // snapshot pins, inverters). Takes each writer's index lock briefly; no
+  // file I/O. Implied by a tenant or collection scope.
+  bool collections = 5;
+  // Also list index directories, filling the `bytes` totals, segment bytes and
+  // aux index bytes. Implies `collections` at node scope.
+  bool files = 6;
+  // Node scope only: this process, the data directory's filesystem and the
+  // process's cgroup v2, read from procfs and cgroupfs (Linux only).
+  bool system = 7;
+  // Node scope only: host-wide CPU, memory, network, TCP, disk and pressure
+  // statistics from procfs (Linux only), which node_exporter also reports.
+  // Inside a container most of them describe the host, not the container.
+  bool host = 8;
 }
 
 message StatsResponse {
   reserved 3, 6, 7;
   reserved "indexing_ram", "storage_ram", "big_buffer_ram";
+  // Set when collections are walked.
   StatsTotals totals = 1;
   repeated CollectionStats collections = 2;
   uint64 multiterm_expansion_refills = 8;
-  // Set only by a StatsRequest.memory request, which returns nothing else.
+  // Node scope only.
   MemoryStats memory = 9;
+  // Node scope only.
+  ServiceStats service = 10;
+  // Set by StatsRequest.system.
+  SystemStats system = 11;
+  // Set by StatsRequest.host.
+  HostStats host = 15;
+  // Time spent gathering this response, excluding serialization.
+  double duration_seconds = 13;
   // Node-wide checksum scrub counters; set when store.scrub-interval-s is.
   ScrubStats scrub = 14;
+}
+
+// Cumulative duration histogram. counts[i] is the number of observations at or
+// below bound i of the histogram's family (ServiceStats.request_duration_bounds
+// or background_duration_bounds); the last entry (+Inf) equals count. counts is
+// empty when count is zero.
+message HistogramStats {
+  repeated uint64 counts = 1;
+  double sum = 2;  // seconds
+  uint64 count = 3;
+}
+
+// One kind of work: currently running, completed by outcome, and the duration
+// of completed work (failed and cancelled work included).
+message ActivityStats {
+  int64 in_flight = 1;
+  uint64 ok = 2;
+  uint64 error = 3;
+  uint64 cancelled = 4;
+  HistogramStats duration = 5;
+}
+
+// Request traffic on one transport. Replication routes are not counted.
+message TransportStats {
+  // Keyed by operation: search, update, schema, collections, stats, health, other.
+  map<string, ActivityStats> operations = 1;
+  // Failed requests or calls, keyed by the kind of their first error. A
+  // request fails when the transport fails, its response carries a
+  // whole-request error, or its stream ends in failure.
+  map<string, uint64> errors = 2;
+  uint64 received_bytes = 3; // application payload, excluding transport framing
+  uint64 sent_bytes = 4;     // application payload submitted for sending
+  uint64 stream_pauses = 5;  // response producers paused by flow control
+  uint64 connections = 6;    // HTTP only: live sessions, including idle keep-alive
+  int64 io_threads = 7;      // HTTP only: running connection shard threads
+}
+
+// Process-wide service counters since start. Counters reset on restart and
+// cache-control reset_counters does not touch them.
+message ServiceStats {
+  string version = 1;
+  // The CPU target the binary was built for.
+  string cpu_target = 20;
+  bool read_only = 2;
+  // Upper bounds, in seconds, of the request, search execution and index batch
+  // histograms.
+  repeated double request_duration_bounds = 3;
+  // Upper bounds, in seconds, of the flush, commit, merge, vector build and
+  // reader refresh histograms.
+  repeated double background_duration_bounds = 4;
+  TransportStats http = 5;
+  TransportStats grpc = 6;
+  // Searches the engine accepted, from submission to the final response. A
+  // gRPC Search call can carry many, so this is the per-search view there.
+  ActivityStats search = 21;
+  // Search body execution, excluding scheduler waits and streaming drains.
+  HistogramStats search_execution = 7;
+  uint64 search_resource_exhausted = 8;
+  uint64 search_warnings = 9;
+  ActivityStats index_batches = 10;
+  // Accepted into indexing (not durably acknowledged) or rejected/rolled back.
+  uint64 documents_accepted = 11;
+  uint64 documents_rejected = 12;
+  uint64 delete_ids_accepted = 13;
+  // Documents rejected with an error of their own, keyed by error kind. The
+  // rest of documents_rejected were rolled back with a failed batch.
+  map<string, uint64> document_errors = 19;
+  ActivityStats flush = 14;
+  ActivityStats commit = 15;
+  ActivityStats merge = 16;
+  ActivityStats vector_build = 17;
+  ActivityStats reader_refresh = 18;
+}
+
+// This process, its data filesystem and its cgroup. Collectors that read their
+// sources are listed in `available`; the others in `unavailable`, with their
+// fields omitted.
+message SystemStats {
+  ProcessStats process = 1;
+  ProcessIoStats process_io = 6;
+  // The data directory's filesystem; set only for the fs store backend.
+  FilesystemStats filesystem = 2;
+  CgroupStats cgroup = 3;
+  repeated string available = 4;
+  repeated string unavailable = 5;
+}
+
+// Host-wide statistics, as node_exporter reports them. Collectors are listed
+// as in SystemStats.
+message HostStats {
+  HostCpuStats cpu = 1;
+  HostMemoryStats memory = 2;
+  repeated NetworkInterfaceStats network = 3;
+  TcpStats tcp = 4;
+  repeated DiskStats disks = 5;
+  repeated PressureStats pressure = 6;
+  repeated string available = 7;
+  repeated string unavailable = 8;
+}
+
+message ProcessStats {
+  uint64 resident_bytes = 1;
+  uint64 virtual_bytes = 2;
+  uint64 swap_bytes = 3;
+  uint64 resident_anonymous_bytes = 4;
+  uint64 resident_file_bytes = 5;
+  uint64 resident_shared_bytes = 6;
+  uint64 resident_peak_bytes = 7;
+  uint64 threads = 8;
+  double cpu_seconds = 9;
+  uint64 voluntary_context_switches = 10;
+  uint64 involuntary_context_switches = 11;
+  uint64 minor_page_faults = 12;
+  uint64 major_page_faults = 13;
+  int64 max_fds = 14; // soft limit; -1 is unlimited
+  uint64 open_fds = 15;
+  double start_time_seconds = 16; // since the Unix epoch
+}
+
+// This process's I/O accounting (/proc/self/io).
+message ProcessIoStats {
+  uint64 disk_read_bytes = 1;
+  uint64 disk_written_bytes = 2;
+  uint64 io_read_bytes = 3;
+  uint64 io_written_bytes = 4;
+  uint64 io_read_calls = 5;
+  uint64 io_write_calls = 6;
+}
+
+message CpuTimes {
+  string cpu = 1;
+  double user = 2; // seconds; includes guest time
+  double nice = 3;
+  double system = 4;
+  double idle = 5;
+  double iowait = 6;
+  double irq = 7;
+  double softirq = 8;
+  double steal = 9;
+}
+
+message HostCpuStats {
+  repeated CpuTimes cpus = 1;
+  uint64 context_switches = 2;
+  uint64 forks = 3;
+  uint64 procs_running = 4;
+  uint64 procs_blocked = 5;
+  double boot_time_seconds = 6;
+  double load1 = 7;
+  double load5 = 8;
+  double load15 = 9;
+  uint64 filefd_allocated = 10;
+  uint64 filefd_maximum = 11;
+}
+
+// Host memory from /proc/meminfo and VM events from /proc/vmstat.
+message HostMemoryStats {
+  uint64 total_bytes = 1;
+  uint64 free_bytes = 2;
+  uint64 available_bytes = 3;
+  uint64 buffers_bytes = 4;
+  uint64 cached_bytes = 5;
+  uint64 swap_cached_bytes = 6;
+  uint64 swap_total_bytes = 7;
+  uint64 swap_free_bytes = 8;
+  uint64 dirty_bytes = 9;
+  uint64 writeback_bytes = 10;
+  uint64 mapped_bytes = 11;
+  uint64 shmem_bytes = 12;
+  uint64 slab_bytes = 13;
+  uint64 slab_reclaimable_bytes = 14;
+  uint64 slab_unreclaimable_bytes = 15;
+  uint64 page_tables_bytes = 16;
+  uint64 kernel_stack_bytes = 17;
+  uint64 anon_pages_bytes = 18;
+  uint64 page_faults = 19;
+  uint64 major_page_faults = 20;
+  uint64 swap_in_pages = 21;
+  uint64 swap_out_pages = 22;
+  uint64 oom_kills = 23;
+}
+
+// One interface in this network namespace (/proc/net/dev).
+message NetworkInterfaceStats {
+  string device = 1;
+  uint64 receive_bytes = 2;
+  uint64 receive_packets = 3;
+  uint64 receive_errs = 4;
+  uint64 receive_drop = 5;
+  uint64 receive_fifo = 6;
+  uint64 receive_frame = 7;
+  uint64 receive_compressed = 8;
+  uint64 receive_multicast = 9;
+  uint64 transmit_bytes = 10;
+  uint64 transmit_packets = 11;
+  uint64 transmit_errs = 12;
+  uint64 transmit_drop = 13;
+  uint64 transmit_fifo = 14;
+  uint64 transmit_colls = 15;
+  uint64 transmit_carrier = 16;
+  uint64 transmit_compressed = 17;
+}
+
+// TCP counters for this network namespace (/proc/net/snmp).
+message TcpStats {
+  uint64 curr_estab = 1;
+  uint64 retrans_segs = 2;
+  uint64 in_errs = 3;
+  uint64 out_rsts = 4;
+  uint64 attempt_fails = 5;
+}
+
+// One block device or partition (/proc/diskstats).
+message DiskStats {
+  string device = 1;
+  uint64 reads_completed = 2;
+  uint64 reads_merged = 3;
+  uint64 read_bytes = 4;
+  double read_time_seconds = 5;
+  uint64 writes_completed = 6;
+  uint64 writes_merged = 7;
+  uint64 written_bytes = 8;
+  double write_time_seconds = 9;
+  uint64 io_now = 10;
+  double io_time_seconds = 11;
+  double io_time_weighted_seconds = 12;
+}
+
+message FilesystemStats {
+  string path = 1;
+  uint64 size_bytes = 2;
+  uint64 free_bytes = 3;  // including reserved blocks
+  uint64 avail_bytes = 4; // available to this process
+  uint64 files = 5;
+  uint64 files_free = 6;
+  bool readonly = 7;
+}
+
+// Pressure stall information for one resource (/proc/pressure).
+message PressureStats {
+  string resource = 1;
+  double some_seconds = 2;
+  optional double full_seconds = 3;
+}
+
+// This process's cgroup v2. Limits are local to the cgroup; ancestors may
+// impose stricter ones. Controllers that are not enabled are omitted.
+message CgroupStats {
+  string path = 1;
+  CgroupMemoryStats memory = 2;
+  CgroupCpuStats cpu = 3;
+  CgroupTaskStats tasks = 4;
+}
+
+message CgroupMemoryStats {
+  uint64 current_bytes = 1; // including page cache and descendants
+  int64 max_bytes = 2;      // -1 is unlimited
+  int64 high_bytes = 3;     // -1 is unlimited
+  uint64 low_events = 4;
+  uint64 high_events = 5;
+  uint64 max_events = 6;
+  uint64 oom_events = 7;
+  uint64 oom_kill_events = 8;
+}
+
+message CgroupCpuStats {
+  double usage_seconds = 1;
+  double throttled_seconds = 2;
+  uint64 periods = 3;
+  uint64 throttled_periods = 4;
+  double quota_cores = 5; // -1 is unlimited
+}
+
+message CgroupTaskStats {
+  uint64 current = 1; // including threads
+  int64 max = 2;      // -1 is unlimited
 }
 
 // Background checksum scrub of published snapshot files. A mismatch also
@@ -1322,6 +1657,11 @@ message MemoryStats {
   // Present only when Luxir runs on jemalloc.
   JemallocStats jemalloc = 3;
   FieldMetadataStats field_metadata = 4;
+  // Configured budget for managed memory (max_ram_mb); not an RSS ceiling.
+  // Zero is unlimited.
+  uint64 node_budget_bytes = 5;
+  // Per-request tracked search memory ceiling; zero disables rejection.
+  uint64 search_request_limit_bytes = 6;
 }
 
 // Full catalog for a discovery cursor, scoped to this source boot.
@@ -1395,7 +1735,14 @@ message StatsTotals {
   uint64 max_docs = 5;
   uint64 live_docs = 6;
   uint64 deleted_docs = 7;
-  uint64 bytes = 8;  // on-disk bytes; the index level reports the whole directory including metadata and in-flight files
+  // On-disk bytes from a directory listing, present only with
+  // StatsRequest.files: the whole index directory, including metadata and
+  // in-flight files. Compare committed_bytes.
+  optional uint64 bytes = 8;
+  // Bytes referenced by the current published snapshot, summed from its file
+  // descriptors without touching the filesystem. Excludes in-flight and
+  // pin-retained files, so it is normally below `bytes`.
+  uint64 committed_bytes = 9;
 }
 
 message StorageRamStats {
@@ -1410,10 +1757,34 @@ message CollectionStats {
   uint64 schema_gen = 3; // Schema generation
   repeated ShardStats shards = 4;
 
-  // Set for a collection that is not serving (failed to load, or a delete failed
-  // partway); kind is UNAVAILABLE and the message is the recorded reason.
+  // Set for a collection that is not serving (failed to load, being deleted, or
+  // a delete failed partway): kind is UNAVAILABLE and the message is the
+  // reason. A node-wide walk also reports here a collection whose statistics
+  // could not be read, with the failure's kind.
   Error error = 5;
   uint64 storage_ram_bytes = 6;
+  // Set for a serving collection.
+  CollectionActivityStats activity = 8;
+}
+
+// Engine work that reached this collection since it was opened. The node's
+// ServiceStats also count requests that failed before resolving a collection,
+// and keep their counts when a collection is deleted.
+message CollectionActivityStats {
+  // Searches, from submission to the final response.
+  OutcomeStats searches = 1;
+  OutcomeStats index_batches = 2;
+  uint64 documents_accepted = 3;
+  uint64 documents_rejected = 4;
+  uint64 delete_ids_accepted = 5;
+}
+
+// Completed work by outcome, and its summed duration.
+message OutcomeStats {
+  uint64 ok = 1;
+  uint64 error = 2;
+  uint64 cancelled = 3;
+  double seconds = 4;
 }
 
 message ShardStats {
@@ -1436,6 +1807,11 @@ message IndexStats {
   uint64 pin_retained_bytes = 12; // bytes whose only remaining owners are pins
   uint64 pin_idle_drops = 13;
   uint64 pin_budget_drops = 14;
+  // Writer only: indexing inverters by state.
+  uint64 inverters_busy = 15;
+  uint64 inverters_idle = 16;
+  uint64 inverters_flushing = 17;
+  uint64 commits = 18; // writer only: commits since the writer opened
 }
 
 // Ids and generations that appear in filenames are reported in their
@@ -1492,12 +1868,19 @@ message QueryCacheStats {
   uint64 reader_stable_hits = 14;
   uint64 reader_stable_refreshes = 15;
   uint64 reader_stable_retires = 16;
+  uint64 build_attempts = 17;
+  uint64 capacity_dead_builds = 18;
+  uint64 thrash_build_skips = 19;
+  uint64 reader_dead_builds = 20;
+  uint64 reader_thrash_build_skips = 21;
 }
 
 // Indexing RAM budget: the configured limit and the bytes reserved against it.
 message IndexRamStats {
-  uint64 limit_bytes = 1;
-  uint64 reserved_bytes = 2;
+  uint64 limit_bytes = 1;     // zero is unlimited
+  uint64 reserved_bytes = 2;  // may temporarily exceed the soft limit
+  uint64 draining_bytes = 3;  // reserved bytes currently draining through flushes
+  uint64 pending_merge_bytes = 4; // pending merge demand, capped at the limit when limited
 }
 
 // jemalloc's process-wide statistics (stats.*), read at one statistics epoch
@@ -1652,6 +2035,46 @@ enum VectorMetric {
   COSINE = 3;
 }
 
+// Approximate nearest-neighbor index settings for a VECTOR field: the codec
+// and parameters of the per-segment IVF overlays built at commit and merge.
+// Read when an overlay is built; each overlay records what it was built
+// with, so a change applies to segments built afterwards. See
+// docs/guide/vector-search.md#index-settings.
+message VectorAnnDef {
+  enum Codec {
+    RABITQ = 0;  // IVF + RaBitQ (randomly rotated, centroid-relative bit codes)
+    PQ = 1;      // IVF + product quantization
+  }
+  optional Codec codec = 1;  // absent: pq; rabitq is opt-in
+
+  // IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors),
+  // capped at 4096. Clamped to the segment's vector count.
+  optional int32 nlist = 2;
+
+  message RaBitQ {
+    // Bits per dimension, 1..9. Absent: 1. Above 1 (extended RaBitQ) a
+    // 1-bit pass prunes with the error bound and survivors are re-estimated
+    // with the extra bits.
+    optional int32 bits = 1;
+    // Query quantization bits, 0..8; 0 scans with the float query.
+    // Absent: 4. Read at search time, so a change applies to existing
+    // overlays.
+    optional int32 query_bits = 2;
+  }
+  RaBitQ rabitq = 3;  // requires explicit codec rabitq
+
+  message Pq {
+    // Sub-quantizers. Positive m requires positive effective (inherited)
+    // dims and must divide it. Absent or 0: automatic, including inferred
+    // dims. Choose the largest divisor leaving at least 4 dimensions per
+    // sub-quantizer, capped at max(32, dims / 8) for IP/cosine or 32 for L2.
+    // If none does, choose the largest divisor under the same cap.
+    optional int32 m = 1;
+    optional int32 bits = 2;  // bits per sub-quantizer code, 1..8. Absent: 8.
+  }
+  Pq pq = 4;  // codec pq only
+}
+
 // A field, template, or variant definition, named by its enclosing map key.
 // Unset properties inherit from parent, then use type defaults, except as
 // documented on individual properties. HTTP JSON enum values are lowercase.
@@ -1735,6 +2158,10 @@ message FieldDef {
     HASH128 = 2;  // prefix of at most 230 bytes plus 25 base36 hash digits
   }
   optional LongTerms long_terms = 16; // absent: inherit from parent, else hash128
+
+  // VECTOR only: ANN overlay settings. Absent inherits the parent's whole
+  // definition (no per-property merge), else every VectorAnnDef default.
+  VectorAnnDef ann = 22;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

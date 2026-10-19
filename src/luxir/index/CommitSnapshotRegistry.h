@@ -125,7 +125,7 @@ public:
   // Tests only: revoke the oldest pin as budget enforcement would.
   bool testEvictOldest();
   void setPolicy(Policy value);
-  Stats stats();
+  Stats stats(bool expire = true);
   void expire();
   void retire(std::span<const std::string> names);
   void retirePrefix(std::string_view prefix);
