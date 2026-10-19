@@ -109,7 +109,8 @@ public:
   }
 
   /// Get the value at a given global value rank (0..numValues()-1).
-  std::string_view valueAt(int64_t valueRank) const {
+  // Keep fixed-size column access in scan loops independent of the TU inline budget.
+  LUXIR_INLINE std::string_view valueAt(int64_t valueRank) const {
     assert(valueRank >= 0 && valueRank < nvals);
     if (endOffsetReader) {
       auto [startOffset, endOffset] = endOffsetReader->valuesAt(valueRank);

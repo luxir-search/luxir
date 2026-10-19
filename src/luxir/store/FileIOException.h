@@ -16,6 +16,14 @@ public:
       : ApiError(kind, std::move(code), message) {}
 };
 
+// The kernel reported EIO: unlike resource or permission failures, this
+// makes the file suspect even when no checksum could be computed.
+class FileEIOError : public FileIOException {
+public:
+  explicit FileEIOError(const std::string& message)
+      : FileIOException(ErrorKind::INTERNAL, "file_eio", message) {}
+};
+
 class StorageMemoryLimitError : public FileIOException {
 public:
   StorageMemoryLimitError()

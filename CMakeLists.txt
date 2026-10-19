@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 set(LUXIR_CPU_TARGET native CACHE STRING "Compiler CPU target for Luxir and vendored code")
-set_property(CACHE LUXIR_CPU_TARGET PROPERTY STRINGS native x86-64-v2 x86-64-v3 x86-64-v4)
+set_property(CACHE LUXIR_CPU_TARGET PROPERTY STRINGS native x86-64-v2 x86-64-v3 x86-64-v4 armv8-a)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   if(LUXIR_CPU_TARGET STREQUAL "native")
     set(_luxir_cpu_tune native)
@@ -107,30 +107,47 @@ endif()
 # catch a race, so check the version. It is not cached, so old caches get it.
 include(CheckLinkerFlag)
 set(LUXIR_LINKER "")
-foreach(_cand mold lld gold)
-  check_linker_flag(CXX "-fuse-ld=${_cand}" LUXIR_LD_WORKS_${_cand})
-  if(LUXIR_LD_WORKS_${_cand} AND _cand STREQUAL "mold")
-    execute_process(
-      COMMAND "${CMAKE_CXX_COMPILER}" -fuse-ld=mold -Wl,--version
-      OUTPUT_VARIABLE _luxir_mold_out ERROR_QUIET)
-    string(REGEX MATCH "mold ([0-9]+\\.[0-9]+(\\.[0-9]+)?)" _ "${_luxir_mold_out}")
-    set(_luxir_mold_version "${CMAKE_MATCH_1}")
-    if(NOT _luxir_mold_version OR _luxir_mold_version VERSION_LESS 2.31.0)
-      message(STATUS "Luxir: skipping mold ${_luxir_mold_version} "
-                     "(before 2.31.0 its output section flags are nondeterministic)")
-      continue()
+# Cross builds use their toolchain's linker. A host linker can pass the small
+# probe but mishandle target relocations: mold placed ARM64 upb extension
+# pointers in a read-only segment, causing a loader crash before main().
+if(NOT CMAKE_CROSSCOMPILING)
+  foreach(_cand mold lld gold)
+    check_linker_flag(CXX "-fuse-ld=${_cand}" LUXIR_LD_WORKS_${_cand})
+    if(LUXIR_LD_WORKS_${_cand} AND _cand STREQUAL "mold")
+      execute_process(
+        COMMAND "${CMAKE_CXX_COMPILER}" -fuse-ld=mold -Wl,--version
+        OUTPUT_VARIABLE _luxir_mold_out ERROR_QUIET)
+      string(REGEX MATCH "mold ([0-9]+\\.[0-9]+(\\.[0-9]+)?)" _ "${_luxir_mold_out}")
+      set(_luxir_mold_version "${CMAKE_MATCH_1}")
+      if(NOT _luxir_mold_version OR _luxir_mold_version VERSION_LESS 2.31.0)
+        message(STATUS "Luxir: skipping mold ${_luxir_mold_version} "
+                       "(before 2.31.0 its output section flags are nondeterministic)")
+        continue()
+      endif()
     endif()
-  endif()
-  if(LUXIR_LD_WORKS_${_cand})
-    add_link_options("-fuse-ld=${_cand}")
-    set(LUXIR_LINKER "${_cand}")
-    break()
-  endif()
-endforeach()
+    if(LUXIR_LD_WORKS_${_cand})
+      add_link_options("-fuse-ld=${_cand}")
+      set(LUXIR_LINKER "${_cand}")
+      break()
+    endif()
+  endforeach()
+endif()
 if(LUXIR_LINKER)
   message(STATUS "Luxir: using '${LUXIR_LINKER}' linker")
+elseif(CMAKE_CROSSCOMPILING)
+  message(STATUS "Luxir: using the cross-toolchain linker")
 else()
   message(STATUS "Luxir: using default system linker (no faster linker usable)")
+endif()
+
+# Thin static archives: the project's libraries only feed this build's own
+# links, so an archive can index its objects in place instead of copying them.
+# Rewriting the full luxir_lib archive after each engine edit took seconds.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  foreach(_lang C CXX)
+    set(CMAKE_${_lang}_ARCHIVE_CREATE "<CMAKE_AR> qcT <TARGET> <LINK_FLAGS> <OBJECTS>")
+    set(CMAKE_${_lang}_ARCHIVE_APPEND "<CMAKE_AR> qT <TARGET> <LINK_FLAGS> <OBJECTS>")
+  endforeach()
 endif()
 
 # This keeps dlls and executables together, which makes windows happy.
@@ -149,6 +166,7 @@ find_package(TBB CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(CLI11 CONFIG REQUIRED)
 find_package(lz4 CONFIG REQUIRED)
+find_package(zstd CONFIG REQUIRED)
 # JSON (both the proto-JSON dialect and the HTTP envelope) is glaze, which comes in
 # via luxir_proto_concrete. Boost.Beast/Asio (the HTTP transport) are header-only and
 # come with the Boost include dir found above.
@@ -328,7 +346,7 @@ target_compile_definitions(luxir_lib PUBLIC
 
 add_executable(luxir src/luxir/main.cpp)
 target_link_libraries(luxir luxir_lib)
-set_source_files_properties(src/luxir/luxir_main.cpp PROPERTIES
+set_source_files_properties(src/luxir/BuildInfo.cpp PROPERTIES
   COMPILE_DEFINITIONS "LUXIR_VERSION=\"${PROJECT_VERSION}\";LUXIR_CPU_NAME=\"${LUXIR_CPU_TARGET}\"")
 # Declare the executable's baseline, without marking optional dependency kernels
 # as unconditional requirements. The loader can reject an unsupported CPU early.
@@ -427,6 +445,7 @@ target_link_libraries(luxir_lib PUBLIC gRPC::grpc++ gRPC::grpc++_reflection)
 target_link_libraries(luxir_lib PUBLIC spdlog::spdlog)
 target_link_libraries(luxir_lib PRIVATE CLI11::CLI11)
 target_link_libraries(luxir_lib PRIVATE lz4::lz4)
+target_link_libraries(luxir_lib PRIVATE zstd::libzstd)
 target_link_libraries(luxir_lib PRIVATE faiss)
 # uni-algo (vendored): Unicode case folding / NFKC / UAX#29 segmentation, used by
 # the analysis chain (src/luxir/analysis/Analyzer.cpp).

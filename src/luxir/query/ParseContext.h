@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include <cstring>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -12,6 +11,7 @@
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/query/FieldResolver.h"
+#include "luxir/query/Warnings.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/MemPool.h"
 
@@ -63,11 +63,9 @@ struct ParseContext {
       fields(fields ? *fields : localFields) {}
 
   // code must be a string with static storage duration (a literal).
+  // Repeats are dropped.
   void warn(std::string_view code, std::string_view message) {
-    if (warnings == nullptr) return;
-    char* copy = pool.alloc(message.size());
-    std::memcpy(copy, message.data(), message.size());
-    warnings->push_back({code, std::string_view(copy, message.size())});
+    if (warnings != nullptr) addWarning(*warnings, pool, code, message);
   }
 };
 

@@ -228,7 +228,7 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
     std::filesystem::create_symlink("/dev/full", failingTmp);
 
     EXPECT_FALSE(submit(false));
-    iw.updateGraph.wait_for_all();
+    iw.updateGraph->wait_for_all();
     EXPECT_TRUE(iw.segInfos.empty());
     EXPECT_TRUE(iw.idleInverters.empty());
 
@@ -236,7 +236,7 @@ TEST_F(VectorColTest, ioFailureAbortsStreamedSegment) {
     // sweep. Remove the test-only device symlink before the healthy request.
     std::filesystem::remove(failingTmp);
     EXPECT_TRUE(submit(true));
-    iw.updateGraph.wait_for_all();
+    iw.updateGraph->wait_for_all();
     EXPECT_EQ(1, iw.snapshots.readers.getReader()->maxDoc());
   }
 

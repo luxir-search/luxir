@@ -17,7 +17,7 @@
 #include "test/QueryBuild.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
 #include "luxir/query/RescoreQuery.h"
