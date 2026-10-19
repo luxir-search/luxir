@@ -12,7 +12,7 @@
 #include <gtest/gtest.h>
 
 #include "luxir/index/PointsWriter.h"
-#include "luxir/reader/FieldReader.h"
+#include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/PointsReader.h"
 #include "luxir/store/Directory.h"
@@ -115,10 +115,9 @@ std::vector<Point> pointsFromColumn(PostingsReader& postingsReader,
 
 SegFieldInfo readFieldInfo(MemPool& pool, PostingsReader& postingsReader,
                            std::string_view field) {
-  FieldReader fields(postingsReader);
-  if (!fields.seek(field)) throw std::runtime_error("missing test field");
-  SegFieldInfo info;
-  fields.readFieldInfo(info);
+  auto* fields = postingsReader.fieldInfo(field);
+  if (!fields) throw std::runtime_error("missing test field");
+  const auto& info = *fields;
   return info;
 }
 

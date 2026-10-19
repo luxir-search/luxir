@@ -18,6 +18,7 @@
     },
     "spdlog",
     "lz4",
+    "zstd",
     "cli11",
     "glaze",
     "faiss",

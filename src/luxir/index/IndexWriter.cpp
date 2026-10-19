@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/reader/FieldReader.h"
 #include "IndexWriter.h"
 #include "luxir/store/Manifest.h"
 
@@ -107,7 +108,8 @@ void setException(ErrorHolder& result, const std::exception_ptr& failure) {
 // Covered by IndexWriterTest.overwriteSurvivesCommitAheadOfOlderUpdate.
 
 IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Schema> schema,
-                         IndexRamBudget* sharedIndexRamBudget, int mergeFactor, std::string initialIncarnation)
+                         IndexRamBudget* sharedIndexRamBudget, int mergeFactor, std::string initialIncarnation,
+                         oneapi::tbb::task_arena* arena)
   : dir(snapshots.dir),
     privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
     indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget),
@@ -196,10 +198,13 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     seedActiveVectorOverlayNamesFromManifestLocked();
   }
 
+  if (arena) arena->execute([this] { updateGraph.emplace(); });
+  else updateGraph.emplace();
+
   // Create the updateGraph.  Start with a serial node that assigns an order to each update command
   // This could be done in a quick synchronized block instead... and could then be safely inspected by the client
   // if necessary before submitting to the actual processing graph.
-  startUpdateNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
+  startUpdateNode = std::make_unique<UpdateMessageMultiFunc>(*updateGraph, 1,
     [this](UpdateMessage* msg,
     UpdateMessageMultiFunc::output_ports_type& op) {
       try {
@@ -215,7 +220,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     });
 
   // next, the node to actually process the update, indexing documents, etc.
-  processUpdateNode = std::make_unique<UpdateMessageFunc>(updateGraph, tbb::flow::unlimited,
+  processUpdateNode = std::make_unique<UpdateMessageFunc>(*updateGraph, tbb::flow::unlimited,
     [this](UpdateMessage* msg) -> UpdateMessage* {
       // exceptions handled in processUpdateBody()
       this->processUpdateBody(*msg);
@@ -223,7 +228,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     });
 
   // then make sure that the updates are finished in order so all updates are done before a commit is processed.
-  updateSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(updateGraph,
+  updateSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(*updateGraph,
     [](UpdateMessage* msg) -> size_t {
       INDEX_DEBUG("updateSequencerNode: msg={} updateVersion={} updateOrdinal={}",
                   (void*)msg, msg->updateVersion, msg->updateOrdinal);
@@ -231,7 +236,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     });
 
   // updates flow into the updateFinishNode in order which is single threaded and ensures that updates are finished in order.
-  updateFinishNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
+  updateFinishNode = std::make_unique<UpdateMessageMultiFunc>(*updateGraph, 1,
     [this](UpdateMessage* msg,
     UpdateMessageMultiFunc::output_ports_type& op) {
       unused(op);
@@ -252,7 +257,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   // firehose (hundreds of batches in flight) a flush that waited its turn
   // behind them would let the budget overshoot by the whole queue; a merge
   // that waited would let segments pile up for the commit to pay for.
-  segmentFlushNode = std::make_unique<InverterMultiFunc>(updateGraph, tbb::flow::unlimited,
+  segmentFlushNode = std::make_unique<InverterMultiFunc>(*updateGraph, tbb::flow::unlimited,
     [this](Inverter* inverter,
     InverterMultiFunc::output_ports_type& op) {
       unused(op);
@@ -263,25 +268,26 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   // Budget callbacks never take indexMutex or flush inline.  They coalesce on
   // this elevated-priority graph node, whose body rechecks global pressure and
   // claims victims against the budget before changing writer state.
-  pressureCheckNode = std::make_unique<PressureCheckMultiFunc>(updateGraph, 1,
+  pressureCheckNode = std::make_unique<PressureCheckMultiFunc>(*updateGraph, 1,
     [this](tbb::flow::continue_msg,
            PressureCheckMultiFunc::output_ports_type& op) {
       unused(op);
       this->pressureCheckBody();
     }, FLUSH_PRIORITY);
 
-  commitSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(updateGraph,
+  commitSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(*updateGraph,
     [](UpdateMessage* msg) -> size_t {
       INDEX_DEBUG("commitSequencerNode: msg={} commitNum={}", (void*)&msg, msg->commitNum);
       return msg->commitNum;
     });
 
   // must be single-threaded
-  commitFinishNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
+  commitFinishNode = std::make_unique<UpdateMessageMultiFunc>(*updateGraph, 1,
     [this](UpdateMessage* msg,
     UpdateMessageMultiFunc::output_ports_type& op) {
       unused(op);
       bool dispatchCompletion = true;
+      MetricScope metric(*metrics, metricActivity(MetricStage::COMMIT));
       try {
         dispatchCompletion = this->finishCommitBody(*msg);
       }
@@ -291,6 +297,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
         msg->result.setException(e);
       }
 
+      metric.finish(dispatchCompletion && msg->result.errored() ? MetricOutcome::ERROR : MetricOutcome::OK);
       if (dispatchCompletion) {
         try {
           msg->done(*this);
@@ -305,13 +312,12 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
   tbb::flow::make_edge(*commitSequencerNode, *commitFinishNode);
 
   // must be single-threaded
-  mergeSegmentsNode = std::make_unique<MergeMessageMultiFunc>(updateGraph, 1,
+  mergeSegmentsNode = std::make_unique<MergeMessageMultiFunc>(*updateGraph, 1,
     [this](MergeMessage* msg,
     MergeMessageMultiFunc::output_ports_type& op) {
       unused(op);
       INDEX_DEBUG("mergeSegmentsNode: msg={}", (void*)&msg,  msg->commitNum);
       bool dispatchCompletion = this->mergeSegmentsBody(*msg);
-
       if (dispatchCompletion) {
         try {
           msg->done(*this);
@@ -336,10 +342,18 @@ IndexWriter::~IndexWriter() {
   DeadlineScheduler::global().detach(autoCommitSlot);
   // A submit racing close() is rejected by startUpdateNode, but that rejection is
   // still a graph task; wait for it before the nodes are destroyed.
-  updateGraph.wait_for_all();
+  updateGraph->wait_for_all();
   idleInverters.clear();
   busyInverters.clear();
   flushingInverters.clear();
+}
+
+void IndexWriter::fail(std::string reason) {
+  std::lock_guard publicationLock(publicationMutex);
+  if (failed.load(std::memory_order_acquire)) return;
+  failureReason = std::make_shared<const std::string>(std::move(reason));
+  failed.store(true, std::memory_order_release);
+  snapshots.fail();
 }
 
 void IndexWriter::close() {
@@ -360,7 +374,7 @@ void IndexWriter::close() {
   // without this, in gcc release mode we can get a crash when the IndexWriter is destroyed, even when
   // the graph wasn't used. Presumably because the test was so fast and there was some async initialization
   // of the graph still going on?
-  updateGraph.wait_for_all();
+  updateGraph->wait_for_all();
 
   std::vector<UpdateMessage*> abandoned;
   {
@@ -1051,6 +1065,7 @@ void IndexWriter::_releaseToCommitSequencer(UpdateMessage* msg) {
 // Inverter for the segment should already be in the flushingInverters list.
 // This is called in parallel.  The inverter will be deleted.
 void IndexWriter::segmentFlushBody(Inverter& inverter) {
+  MetricWork metric(*metrics, MetricStage::FLUSH);
   INDEX_DEBUG("segmentFlushBody: inverter={} commitInfo={} msg.leftToFlush={}", inverter,
               (void*)inverter.commitInfo,
               inverter.commitInfo == nullptr ? -1 : inverter.commitInfo->leftToFlush);
@@ -1080,6 +1095,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     }
   }
 
+  metric.failed = aborted;
   std::unique_ptr<SegInfo> segInfo;
   if (!aborted) {
     segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
@@ -1727,6 +1743,7 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
                           schema, overlayGen);
     std::vector<std::string> oneSelector{overlayName};
+    MetricWork metric(*metrics, MetricStage::VECTOR_BUILD);
     auto newlyBuilt = vb.build(oneSelector, existingNames, outFiles, buildSite);
     for (auto& info : newlyBuilt) {
       existingNames.emplace(info.name);
@@ -2109,6 +2126,13 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
 // those segments.
 // We also mark segments that are going to be merged, so the commit code knows about them.
 bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
+  // Started once there are sources to merge (or on a failure), so a pass that
+  // finds nothing to merge does not count as a merge.
+  std::optional<MetricWork> metric;
+  auto metricFailed = [&] {
+    if (!metric) metric.emplace(*metrics, MetricStage::MERGE);
+    metric->failed = true;
+  };
   std::vector<SegInfo*> segs;
   std::vector<uint64_t> sourceSegIds;
   bool clientOrigin = msg.forcedBy != nullptr;
@@ -2258,6 +2282,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       }
       INDEX_DEBUG("mergeSegmentsBody: only one mergeable segment at level {}; skipping", msg.mergeLevel);
     } else {
+      metric.emplace(*metrics, MetricStage::MERGE);
       sourceSegIds.reserve(segs.size());
       for (auto* seg : segs) {
         sourceSegIds.push_back(seg->segId);
@@ -2322,10 +2347,12 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       PostingsWriter pwriter(dir, outputSegId);
 
       phase = "segment_merge";
-      // Do the actual merge.
+      // Do the actual merge.  The current schema chooses each stored-fields
+      // resource's output format.
+      auto mergeSchema = getSchema();
       SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
-                           termPartitionMaxRanges);
+                           termPartitionMaxRanges, *mergeSchema);
       merger.merge();
 
       phase = "new_segment_info";
@@ -2461,6 +2488,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   }
 
   if (mergeFailed) {
+    metricFailed();
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
       lastMergeFailure = failure;
@@ -2535,6 +2563,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       chainNextMerge = !mergeFailed;
     }
   } catch (const std::exception& e) {
+    metricFailed();
     LOG_ERROR("mergeSegmentsBody escaped exception: exception={}", e.what());
     if (!outputPublished && markedSegmentCount > 0) {
       const std::lock_guard<std::mutex> lock(indexMutex);
@@ -2556,6 +2585,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     allowSyntheticCommit = outputPublished;
     chainNextMerge = false;
   } catch (...) {
+    metricFailed();
     LOG_ERROR("mergeSegmentsBody escaped exception: unknown exception");
     if (!outputPublished && markedSegmentCount > 0) {
       const std::lock_guard<std::mutex> lock(indexMutex);
@@ -2637,7 +2667,7 @@ bool IndexWriter::testIsEmpty() {
 void IndexWriter::testDeleteAllData() {
   INDEX_DEBUG("testDeleteAllData: deleting all data.");
   // wait for things in the execution graph to finish.
-  updateGraph.wait_for_all();
+  updateGraph->wait_for_all();
   std::unique_lock publicationLock(publicationMutex);
 
   {
@@ -2749,7 +2779,7 @@ std::optional<IndexWriter::MergeFailureInfo> IndexWriter::testLastMergeFailure()
   return lastMergeFailure;
 }
 
-IndexWriter::Stats IndexWriter::stats(bool includeSegments) {
+IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   Stats out;
   std::vector<uint64_t> committedIds;
   std::vector<uint64_t> writerSegmentIds;
@@ -2774,6 +2804,9 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments) {
     out.schemaGen = schemaGen_;
     out.activeMerges = mergePolicy ? (uint64_t)mergePolicy->outstandingMerges : 0;
     out.segments = segInfos.size();
+    out.flushing = flushingInverters.size();
+    out.idle = idleInverters.size();
+    out.indexing = busyInverters.size();
     out.auxIndexes.reserve(currentAuxIndexes_.size());
     std::ranges::transform(currentAuxIndexes_, std::back_inserter(out.auxIndexes), copyAux);
 
@@ -2816,7 +2849,7 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments) {
   // (never hold indexMutex across statx).  A file that disappeared between the
   // segment snapshot above and this listing simply contributes 0.
   std::vector<Directory::FileInfo> files;
-  dir.listFiles(files);
+  if (includeFiles) dir.listFiles(files);
   for (const auto& file : files) {
     out.totalBytes += file.size;
   }
@@ -3028,23 +3061,18 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   int32_t newDeletesCount = 0;
 
   // Read the "id" field using TermsEnum
-  FieldReader fieldReader(reader);
-  if (!fieldReader.seek("id")) {
+  auto* idFieldInfo = reader.fieldInfo("id");
+  if (!idFieldInfo) {
     LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
     return;
   }
 
-  SegFieldInfo idFieldInfo;
-  fieldReader.readFieldInfo(idFieldInfo);
-  TermsEnum termsEnum(pool, reader, idFieldInfo);
+  TermsEnum termsEnum(pool, reader, *idFieldInfo);
 
   // Also get the "_version_" field for version comparison
-  FieldReader versionFieldReader(reader);
-  SegFieldInfo versionFieldInfo;
   std::optional<IntColReader> versionColReader;
-  if (versionFieldReader.seek("_version_")) {
-    versionFieldReader.readFieldInfo(versionFieldInfo);
-    versionColReader.emplace(reader, versionFieldInfo);
+  if (auto* versionFieldInfo = reader.fieldInfo("_version_")) {
+    versionColReader.emplace(reader, *versionFieldInfo);
     assert(!versionColReader->multiValued());
   }
 

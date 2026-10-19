@@ -93,6 +93,24 @@ TEST_F(ValCoerceTest, toDoubleArms) {
   EXPECT_THROW(coerce::toDouble(coerce::scalarVal(true), "f"), std::runtime_error);
 }
 
+TEST_F(ValCoerceTest, toVectorsNarrowsDoubles) {
+  std::vector<float> floats;
+  std::vector<int32_t> lens;
+  double ok[] = {0.5, -1e-3, 3.4e38, -0.0};
+  api::Val v;
+  v.kind.emplace<api::ArrDouble>().v = {ok, 4};
+  EXPECT_FALSE(coerce::toVectors(v, "f", floats, lens));
+  EXPECT_EQ(floats, (std::vector<float>{0.5f, (float)-1e-3, (float)3.4e38, -0.0f}));
+  EXPECT_EQ(lens, (std::vector<int32_t>{4}));
+
+  // past float32 range narrows to inf; the vector handler rejects non-finite elements
+  double big[] = {1e39, -1e39};
+  v.kind.emplace<api::ArrDouble>().v = {big, 2};
+  EXPECT_FALSE(coerce::toVectors(v, "f", floats, lens));
+  float inf = std::numeric_limits<float>::infinity();
+  EXPECT_EQ(floats, (std::vector<float>{inf, -inf}));
+}
+
 TEST_F(ValCoerceTest, toTextRendersCanonically) {
   char buf[coerce::TEXT_BUF_SIZE];
   EXPECT_EQ("42", coerce::toText(coerce::scalarVal((int64_t)42), "f", buf));

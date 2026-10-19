@@ -28,6 +28,7 @@ namespace luxir {
 struct VectorSearchRequest {
   const float* query = nullptr;
   int32_t dims = 0;
+  // Document/vector budget; group approximate cuts count documents.
   int64_t candidates = 0;
   // Domain filtering is supplied by engine construction today.  Flat FAISS
   // receives it through SearchParameters::sel instead of per request state.
@@ -57,12 +58,16 @@ struct VectorSearchRequest {
   //   - The spans are valid only for the duration of this search() call.
   //     The host mutates the backing bytes between rounds; never cache them.
   std::span<const std::span<const uint8_t>> eligible;
+  // Group policy only; docs engines ignore it. Exact cuts always use one.
+  int64_t perKey = 1;
 };
 
-/// Candidate from the vector engine seam.  score is exact for flat engines;
-/// quantized engines may return an approximate score and must be rescored by
-/// the host before doc collapse.  valueRank is segment-relative: it is the
-/// vector's ordinal within segOrd's vector column, not a shard-level FAISS id.
+/// Candidate from the vector engine seam. score is exact for flat engines;
+/// quantized engines may return an internal ordering score, possibly above
+/// the public L2 range [0, 1] for negative distance estimates. The host must
+/// rescore before the final cut and similarity filtering. valueRank is
+/// segment-relative: the vector's ordinal within segOrd's vector column,
+/// not a shard-level FAISS id.
 struct VectorEngineHit {
   float score = 0.0f;
   int32_t segOrd = -1;
@@ -81,7 +86,8 @@ static_assert(sizeof(VectorEngineHit) == 16);
 struct VectorSearchResult {
   std::vector<VectorEngineHit> hits;
   // False means hit.score is only an engine approximation; the host must
-  // rescore from full-precision column vectors before sorting / doc collapse.
+  // rescore from full-precision column vectors before the final cut and
+  // similarity filtering.
   bool scoresAreExact = false;
   // Refinement when scoresAreExact is false: segments whose hits in this
   // result carry exact scores anyway (a multi-engine merge where only some
@@ -102,8 +108,10 @@ struct VectorSearchResult {
 /// segment-local identities and report the taxonomy above; everything
 /// cross-cutting stays in the host: candidate pooling and dedup across
 /// rounds, the deepen policy, exact rescore, multi-valued doc collapse, and
-/// the K-distinct-docs guarantee.  An engine therefore never needs to know
-/// about docs, only vectors.
+/// the selected-unit guarantee. Document-unit engines operate on vectors;
+/// group-unit engines resolve group identities before every bounded cut,
+/// retaining at most perKey documents per group. Exact cuts use one. Unit selection is a
+/// construction-time policy, never a per-candidate switch on document search.
 class VectorEngine {
 public:
   virtual ~VectorEngine() = default;

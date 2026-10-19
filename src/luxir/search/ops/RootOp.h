@@ -6,6 +6,7 @@
 #include "SearchOp.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/search/DomainVariantPlan.h"
+#include "luxir/util/Signal.h"
 
 namespace luxir {
 
@@ -27,9 +28,12 @@ public:
   class Calc final : public SearchOp::Calculator {
     std::vector<std::unique_ptr<Calculator>> subCalcs;
     std::vector<size_t> subCalcVariants;
+    std::vector<DomainHandle> domains;
 
   public:
-    Calc(RootOp& op, SearchOp::Calculator* parent, int64_t slot, int64_t numSlots) : SearchOp::Calculator(op, parent, slot, numSlots) {}
+    Calc(RootOp& op, SearchOp::Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+      : SearchOp::Calculator(op, parent, slot, numSlots, structural) {}
 
     luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       // Top-level ops map: slot array sized to the root op's subOps; one Val per sub.
@@ -72,7 +76,6 @@ public:
       }
 
       const auto& segs = op.req.reader->segments();
-      std::vector<DomainHandle> domains;
       domains.reserve(segs.size());
       for (auto& seg : segs) {
         // Start with live docs. This establishes the PrepareContext domain
@@ -84,9 +87,13 @@ public:
       }
 
       if (root.domainVariants.empty()) {
-        for (auto& subCalc : subCalcs) {
-          subCalc->calcAll(tg, domains);
-        }
+        task_group_fanout(domains.empty() ? nullptr : tg, subCalcs.size(), [&](size_t child) {
+          auto* subCalc = subCalcs[child].get();
+          return [this, subCalc, tg]() {
+            Signal::emit("searchRootChildStart", subCalc);
+            subCalc->calcAll(tg, domains);
+          };
+        });
         return;
       }
 
@@ -103,8 +110,7 @@ public:
       Query::Weight::PrepareContext prepareContext{
         *op.req.reader,
         std::span<DocSet* const>(liveViews.data(), liveViews.size()),
-        tg != nullptr
-      };
+        tg != nullptr, &op.req};
       std::vector<QueryPrep::PreparedSource> prepared(weights.size());
       auto release = scope_guard([&]() noexcept {
         for (auto& segment : op.req.reader->segments()) {
@@ -178,7 +184,7 @@ public:
       auto preparedVariants = root.domainVariants.prepareResetVariants(
           prepared, eligibility,
           std::span<DocSet* const>(liveViews.data(), liveViews.size()),
-          *op.req.reader, tg != nullptr,
+          *op.req.reader, tg != nullptr, &op.req,
           [&](size_t variant, size_t segnum) {
             auto& segment = op.req.reader->segments()[segnum];
             return root.domainVariants.reserveVariantPreparation(
@@ -237,22 +243,26 @@ public:
       }
 
       assert(subCalcs.size() == subCalcVariants.size());
-      std::vector<DomainHandle> childDomains(domains.size());
-      for (size_t child = 0; child < subCalcs.size(); child++) {
+      task_group_fanout(domains.empty() ? nullptr : tg, subCalcs.size(), [&](size_t child) {
+        std::vector<DomainHandle> childDomains(domains.size());
         size_t variant = subCalcVariants[child];
         for (size_t segnum = 0; segnum < domains.size(); segnum++) {
           childDomains[segnum] = produced[segnum][variant];
         }
-        subCalcs[child]->calcAll(tg, childDomains);
-      }
+        auto* subCalc = subCalcs[child].get();
+        return [subCalc, tg, childDomains = std::move(childDomains)]() {
+          Signal::emit("searchRootChildStart", subCalc);
+          subCalc->calcAll(tg, childDomains);
+        };
+      });
     }
   };
 
   Calc* createCalculator(
-      Calculator* parent, int64_t slot = -1,
-      int64_t numSlots = -1) override {
+      Calculator* parent, int64_t slot = -1, int64_t numSlots = -1,
+      const StructuralConstraint* structural = nullptr) override {
     assert(parent == nullptr);
-    return new Calc(*this, nullptr, slot, numSlots);
+    return new Calc(*this, nullptr, slot, numSlots, structural);
   }
 
 };

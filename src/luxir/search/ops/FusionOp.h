@@ -74,6 +74,10 @@ public:
   std::span<FilterCache::Use*> filterUses;
   Method method = Method::RRF;
   int32_t rrfK = 60;  // RRF only
+  CollapsePlan* collapse = nullptr;
+  std::optional<SortPlan> headSort;
+  boost::unordered_flat_map<std::string_view, SearchOp*> groupOps;
+  bool diverseSources = false;
 
   // ProtobufSearchParser builds each source TopDocsReq (with rankingSink wired)
   // and the filter weights, then passes them in (see TopDocsReq's ctor comment).
@@ -136,6 +140,12 @@ public:
     for (auto* weight : filterWeights) weight->releaseSegmentState(segment);
     for (auto* source : sources) source->releaseSegmentState(segment);
     SearchOp::releaseSegmentState(segment);
+    for (auto& [name, child] : groupOps) child->releaseSegmentState(segment);
+  }
+
+  bool needsCompleteBucketInput() const override {
+    // Fusion gathers all segment inputs before executing its result children.
+    return true;
   }
 
   bool facetBucketSharesSegmentState() const override {
@@ -145,7 +155,10 @@ public:
         || std::ranges::any_of(sources, [](const TopDocsReq* source) {
              return source->facetBucketSharesSegmentState();
            })
-        || SearchOp::facetBucketSharesSegmentState();
+        || SearchOp::facetBucketSharesSegmentState()
+        || std::ranges::any_of(groupOps, [](const auto& entry) {
+             return entry.second->facetBucketSharesSegmentState();
+           });
   }
 
   // Sources are not in `subOps` (different lifecycle: they deliver via
@@ -156,6 +169,7 @@ public:
     for (auto* src : sources) {
       src->init();
     }
+    for (auto& [name, child] : groupOps) child->init();
   }
 
   class Calc : public SearchOp::Calculator {
@@ -189,8 +203,9 @@ public:
     // op.sources.size(), the last delivery launches doFusion.
     std::atomic<int32_t> sourcesDelivered{0};
 
-    Calc(FusionOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : SearchOp::Calculator(op, parent, slot, numSlots) {
+    Calc(FusionOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
+        const StructuralConstraint* structural = nullptr)
+      : SearchOp::Calculator(op, parent, slot, numSlots, structural) {
       auto numSources = op.sources.size();
       auto numSegs = op.req.reader->segments().size();
       sourceCalcs.reserve(numSources);
@@ -238,9 +253,7 @@ public:
       // write before doFusion reads it.
       if (segnum <= 0) taskGroup = tg;
       if (needsPrepare) {
-        task_group_run(tg, [this, tg, segnum, domain]() {
-          doPrepareDomain(tg, segnum, domain);
-        });
+        doPrepareDomain(tg, segnum, std::move(domain));
         return;
       }
       doCalc(tg, segnum, domain);
@@ -304,8 +317,7 @@ public:
       Query::Weight::PrepareContext baseCtx{
         *op.req.reader,
         std::span<DocSet* const>(baseDomainViews.data(), baseDomainViews.size()),
-        tg != nullptr
-      };
+        tg != nullptr, &op.req};
       preparedFilterSources = QueryPrep::prepareFilterSources(
           op.filterWeights, op.filterUses, baseCtx);
 
@@ -313,11 +325,11 @@ public:
         segFilters[(size_t)i] = buildSharedFilter(i, baseDomainViews[(size_t)i]);
       }
 
-      for (int32_t i = 0; i < (int32_t)op.req.reader->segments().size(); i++) {
-        task_group_run(tg, [this, tg, i]() {
-          dispatchSources(tg, i, segFilters[(size_t)i]);
-        });
-      }
+      task_group_fanout(tg, segFilters.size(), [&](size_t i) {
+        return [this, tg, i, filter = segFilters[i]]() {
+          dispatchSources(tg, (int32_t)i, filter);
+        };
+      });
     }
 
     void doCalc(oneapi::tbb::task_group* tg, int32_t segnum,
@@ -347,9 +359,13 @@ public:
       // filter as its domain.  The source will intersect with its own
       // filterWeights, collect top-K, and ultimately invoke rankingSink
       // which lands in acceptSourceRanking below.
-      for (auto& sc : sourceCalcs) {
-        sc->calc(tg, segnum, sharedFilter);
-      }
+      task_group_fanout(segnum < 0 ? nullptr : tg, sourceCalcs.size(),
+          [&](size_t i) {
+        auto* sourceCalc = sourceCalcs[i].get();
+        return [sourceCalc, tg, segnum, sharedFilter]() {
+          sourceCalc->calc(tg, segnum, sharedFilter);
+        };
+      });
     }
 
     // Called by each source TopDocsReq's rankingSink when its top-K is
@@ -378,62 +394,68 @@ public:
 
     // Fuse the per-source ranked lists, then emit a fused DocList via the
     // shared streaming emitter.
-    void doFusion() {
+    virtual void doFusion() { doFusionImpl<false>(); }
+
+    // A collapsed source's ranked group heads, with each head's rank score.
+    struct RankedHead {
+      segdoc doc;
+      float score;
+    };
+    void appendCollapsedSource(MergeableCollector& collector, std::vector<RankedHead>& heads);
+    virtual void finishCollapsedFusion();
+
+    template <bool Diverse>
+    void doFusionImpl() {
       auto& op = thisOp();
-      bool linear = op.method != Method::RRF;
 
-      // Pull each source's ranked docs out of its delivered collector.  Each
-      // collector has already merged every segment, so linear fusion
-      // normalizes over the source's whole ranked list.  Field-sorted
-      // collectors carry no relevance score; only RRF accepts them.
-      std::vector<std::vector<segdoc>> rankedPerSource;
-      std::vector<std::vector<float>> scoresPerSource;
-      rankedPerSource.reserve(op.sources.size());
-      scoresPerSource.reserve(op.sources.size());
-      for (size_t s = 0; s < op.sources.size(); s++) {
-        auto* mc = deliveredCollectors[s];
-        std::vector<segdoc> docs;
-        std::vector<float> scores;
-        if (mc != nullptr) {
-          if (mc->useFieldSort) {
-            assert(!linear);
-            auto sortDocs = mc->fieldCollector->sort();
-            docs.reserve(sortDocs.size());
-            for (auto& sd : sortDocs) docs.push_back(sd.doc);
-          } else {
-            auto scoreDocs = mc->scoreCollector->sort();
-            docs.reserve(scoreDocs.size());
-            if (linear) scores.reserve(scoreDocs.size());
-            for (auto& sd : scoreDocs) {
-              docs.push_back(sd.doc);
-              if (linear) scores.push_back(sd.score);
-            }
-          }
-        }
-        if (op.method == Method::LINEAR_MIN_MAX) minMaxNormalize(scores);
-        rankedPerSource.emplace_back(std::move(docs));
-        scoresPerSource.emplace_back(std::move(scores));
-      }
-
-      // Accumulate fused scores by segdoc.  Every listed doc enters `fused`,
-      // even with a zero contribution, so the candidate set (found and the
-      // ops domain) is the union of the source lists for every method.
+      // Accumulate fused scores by segdoc, one source at a time.  Each
+      // delivered collector has already merged every segment, so linear
+      // fusion normalizes over the source's whole ranked list.  Every listed
+      // doc enters `fused`, even with a zero contribution, so the candidate
+      // set (found and the ops domain) is the union of the source lists for
+      // every method.  A possible opt-in on fusion.collapse could instead fuse
+      // each source's best rank per group, giving a product credit when its
+      // text and vector matches land on different variants.
       boost::unordered_flat_map<segdoc, float, SegdocHash> fused;
-      for (size_t s = 0; s < rankedPerSource.size(); s++) {
-        auto& ranked = rankedPerSource[s];
-        if (linear) {
-          double weight = op.sourceWeights[s];
-          auto& normalized = scoresPerSource[s];
-          for (size_t i = 0; i < ranked.size(); i++) {
-            fused[ranked[i]] += (float)(weight * (double)normalized[i]);
-          }
-          continue;
-        }
-        float weight = (float)op.sourceWeights[s];
+      auto addRanks = [&](const auto& ranked, float weight) {
         for (int32_t rank = 0; rank < (int32_t)ranked.size(); rank++) {
           // 1-based rank; weighted RRF: weight / (k + rank).
-          float contrib = weight / (float)((int64_t)op.rrfK + rank + 1);
-          fused[ranked[rank]] += contrib;
+          fused[ranked[rank].doc] += weight / (float)((int64_t)op.rrfK + rank + 1);
+        }
+      };
+      std::vector<float> normalized;
+      auto addScores = [&](const auto& scoreDocs, double weight) {
+        normalized.clear();
+        for (auto& sd : scoreDocs) normalized.push_back(sd.score);
+        minMaxNormalize(normalized);
+        for (size_t i = 0; i < scoreDocs.size(); i++) {
+          fused[scoreDocs[i].doc] += (float)(weight * (double)normalized[i]);
+        }
+      };
+      [[maybe_unused]] std::vector<RankedHead> heads;
+      for (size_t s = 0; s < op.sources.size(); s++) {
+        auto* mc = deliveredCollectors[s];
+        if (mc == nullptr) continue;
+        double weight = op.sourceWeights[s];
+        if constexpr (Diverse) {
+          if (op.sources[s]->collapse != nullptr || op.sources[s]->diversify != nullptr) {
+            heads.clear();
+            appendCollapsedSource(*mc, heads);
+            if (op.method == Method::RRF) addRanks(heads, (float)weight);
+            else addScores(heads, weight);
+            continue;
+          }
+        }
+        if (mc->useFieldSort) {
+          // Field-sorted collectors carry no relevance score; only RRF
+          // accepts them.
+          assert(op.method == Method::RRF);
+          addRanks(mc->fieldCollector->sort(), (float)weight);
+        } else if (op.method == Method::RRF) {
+          addRanks(mc->scoreCollector->sort(), (float)weight);
+        } else {
+          assert(op.method == Method::LINEAR_MIN_MAX);
+          addScores(mc->scoreCollector->sort(), weight);
         }
       }
 
@@ -448,6 +470,12 @@ public:
                   return a.first < b.first;
                 });
 
+      if constexpr (Diverse) {
+        if (op.collapse != nullptr) {
+          finishCollapsedFusion();
+          return;
+        }
+      }
       if (!subCalcs.empty()) {
         std::vector<segdoc> candidates;
         candidates.reserve(fusedList.size());
@@ -465,12 +493,15 @@ public:
           // An empty segment needs an empty set: a null domain means all docs.
           fusedDomains.emplace_back(builder.build());
         }
-        for (auto& sub : subCalcs) sub->calcAll(taskGroup, fusedDomains);
       }
+
+      task_group_fanout(fusedDomains.empty() ? nullptr : taskGroup, subCalcs.size(), [&](size_t i) {
+        auto* subCalc = subCalcs[i].get();
+        return [this, subCalc]() { subCalc->calcAll(taskGroup, fusedDomains); };
+      });
 
       int64_t numCollected = std::min((int64_t)fusedList.size(), op.topCount);
       int64_t totalHits = (int64_t)fused.size();
-
       auto getDocList = [this](SearchResponse* resp) -> luxir::api::DocList& {
         return *slotArm<luxir::api::DocList>(resp);
       };
@@ -493,9 +524,19 @@ public:
   };
 
 
-  Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) override {
-    return new Calc(*this, parent, slot, numSlots);
+  Calculator* createCalculator(
+      Calculator* parent, int64_t slot = -1, int64_t numSlots = -1,
+      const StructuralConstraint* structural = nullptr) override {
+    if (collapse != nullptr || diverseSources) {
+      return createDiverseCalculator(parent, slot, numSlots, structural);
+    }
+    return new Calc(*this, parent, slot, numSlots, structural);
   }
+
+  Calculator* createDiverseCalculator(Calculator* parent, int64_t slot, int64_t numSlots,
+                                      const StructuralConstraint* structural);
+
+  size_t collapsedResidentBytes() const;
 
   bool canEmitAsBucketChild() const override { return true; }
 
@@ -514,6 +555,7 @@ public:
       unused(name);
       bytes = saturatingAdd(bytes, child->facetBucketResidentBytes());
     }
+    if (collapse != nullptr) bytes = saturatingAdd(bytes, collapsedResidentBytes());
     return bytes;
   }
 };

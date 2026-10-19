@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <stop_token>
 
 #include <atomic>
@@ -15,10 +16,12 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/api/build.h"
 #include "luxir/LuxirConfig.h"
+#include "luxir/util/Metrics.h"
 #include "IndexReader.h"
 #include "luxir/index/CommitSnapshot.h"
 #include "FilterCache.h"
 #include "RequestMemTracker.h"
+#include "luxir/query/ExecutionWarnings.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
@@ -78,8 +81,9 @@ struct ExecutionProfileOpState {
 
 // The top-level request for the SearchEngine.
 class Collection;
-class SearchRequest {
+class SearchRequest : public ExecutionWarnings {
   friend class SearchEngine;
+  void count(MetricOutcome outcome);
 
 public:
   std::stop_source waitCancellation{std::nostopstate};
@@ -87,6 +91,15 @@ public:
   // default tenant.
   std::string tenant;
   std::shared_ptr<Collection> floorCollection;
+  // The resolved collection's metrics, held until the request ends so the
+  // search counts in that collection's stats. Only the metrics, not the
+  // Collection: a slow stream must not keep a deleted collection's shard alive.
+  std::shared_ptr<CollectionMetrics> collectionMetrics;
+  // Set when the engine accepts the request (SearchEngine::dispatch): it
+  // counts from then until its final response, or as cancelled without one.
+  // An explain is prepared but never dispatched, so it does not count.
+  std::chrono::steady_clock::time_point submitted;
+  bool counting = false;
   SearchEngine& engine;
   const SearchConfig searchConfig;
   RequestMemTracker memoryTracker;
@@ -145,7 +158,7 @@ public:
   SearchRequest(SearchEngine& engine, const ReqProto& proto,
                 google::protobuf::Arena& arena);
 
-  virtual ~SearchRequest() = default;
+  virtual ~SearchRequest();
 
   ExecutionProfileOpState* addExecutionProfileOp(std::string_view name) {
     if (!proto.profile) return nullptr;
@@ -165,7 +178,7 @@ public:
   }
 
   void fillExecutionProfile(SearchResponse& response);
-  void warnOnce(std::string_view code, std::string_view message);
+  void warnOnce(std::string_view code, std::string_view message) override;
 
   /// Flow-control advice returned by reply().  The response is always accepted
   /// (or dropped, for CANCEL); the status only tells a streaming producer what
@@ -284,17 +297,6 @@ public:
   using ColumnsType = decltype(std::declval<luxir::api::DocList>().columns);
 };
 
-
-inline void SearchRequest::replyCallback(SearchResponse& response) {
-  bool last = response.last;
-  // if this response used a different Arena, release it.
-  if (&response.arena != &arena) {
-    releaseArena(&response.arena);
-  }
-  if (last) {
-    done();
-  }
-};
 
 inline void SearchRequest::fillExecutionProfile(SearchResponse& response) {
   if (!proto.profile) return;

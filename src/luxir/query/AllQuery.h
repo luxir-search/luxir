@@ -12,6 +12,8 @@ namespace luxir {
 
 class AllQuery final : public luxir::Query {
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   static inline bool disableDenseClauseForTests = false;
 
   AllQuery() : Query(QueryKind::ALL) {}
@@ -233,21 +235,19 @@ public:
       return targetPool.make<AllQuery::Scorer>(segment, score);
     }
 
-    std::optional<int64_t> constantCount(
+    CountShortcut countShortcut(
         IndexReader::Segment& segment, DocSet* domain) override {
-      return domain == nullptr
-          ? std::optional<int64_t>((int64_t) segment.maxDoc())
-          : std::nullopt;
+      if (domain && domain->cachedCard() >= 0
+          && (!segment.liveDocs() || domain == &segment.liveDocs()->docset())) {
+        return {domain->cachedCard(), CountHow::METADATA};
+      }
+      return countBound(segment, domain, segment.maxDoc(), CountHow::METADATA);
     }
 
   };
 
   AllQuery::Weight* createWeight(Context& context, int32_t flags,
-                                 float multiplier = 1.0f) override {
-    AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(
-        context, *this, flags, constantWhenScored(flags, multiplier));
-    return weight;
-  }
+                                 float multiplier = 1.0f) override;
 
 };
 

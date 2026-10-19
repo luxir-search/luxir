@@ -16,6 +16,7 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/luxir_main.h"
 #include "luxir/LuxirConfig.h"
+#include <CLI/CLI.hpp>
 #include "benchmark/benchmark.h"
 
 
@@ -95,10 +96,7 @@ static bool fieldTypesEqual(const FieldType& lhs, const FieldType& rhs) {
   }
   if (auto* l = dynamic_cast<const StoredFieldType*>(&lhs)) {
     auto* r = dynamic_cast<const StoredFieldType*>(&rhs);
-    return r != nullptr
-           && l->codec_ == r->codec_
-           && l->chunkTargetUncompressed_ == r->chunkTargetUncompressed_
-           && l->maxDocsPerChunk_ == r->maxDocsPerChunk_;
+    return r != nullptr && l->format_ == r->format_;
   }
   return typeid(lhs) == typeid(rhs);
 }
@@ -163,7 +161,7 @@ class LuxirTestListener : public testing::EmptyTestEventListener {
         auto collection = LuxirTest::luxirNode->getCollection("main");
         auto writer = collection->getShard()->getIndexWriter();
         // An async update still queued from the previous test can be invisible here. This is the same
-        // exposure tests have today and is not worth an updateGraph.wait_for_all() on every clean check.
+        // exposure tests have today and is not worth an updateGraph->wait_for_all() on every clean check.
         bool dirty = !writer->testIsEmpty() || !LuxirTest::isDefaultSchema(collection->getSchema());
         if (dirty) {
           // Tests intentionally leave main populated; reset it silently before the next test.
@@ -230,6 +228,13 @@ TEST(LuxirTestHarnessTest, effortScaling) {
 
   luxir::LuxirTest::effort = 8;
   EXPECT_EQ(200, luxir::LuxirTest::scaleTestDimension(100, 3));
+}
+
+// Read by jemalloc when it is the process allocator (unused otherwise). The debug
+// preset links jemalloc's debug build, whose junk filling of every allocation and
+// free costs more than the tests themselves; its assertions stay on.
+extern "C" {
+const char* malloc_conf = "junk:false";
 }
 
 // global argc/argv
@@ -326,9 +331,15 @@ int main(int argc, char **argv) {
   tbb::task_arena test_arena;
   test_arena.execute([&] {
     if (!luxir::unit_tests) {
+#if LUXIR_TEST_BENCHMARKS
       benchmark::Initialize(&myargc, &(myargv[0]));
       benchmark::RunSpecifiedBenchmarks();
       ret = testing::Test::HasFatalFailure();
+#else
+      std::cerr << "luxir_test was built without benchmarks; configure with "
+                   "-DLUXIR_TEST_BENCHMARKS=ON" << std::endl;
+      ret = 1;
+#endif
     } else {
       ret = RUN_ALL_TESTS();
     }
@@ -357,6 +368,7 @@ int main(int argc, char **argv) {
 
 
 
+#if LUXIR_TEST_BENCHMARKS
 // unit test that runs all benchmarks at a faster speed
 TEST(Benchmarks, all) {
   // if we are running unit tests, we want the benchmarks to run faster
@@ -392,3 +404,4 @@ TEST(Benchmarks, all) {
   benchmark::Initialize(&myargc, &(myargv[0]));
   benchmark::RunSpecifiedBenchmarks();
 }
+#endif

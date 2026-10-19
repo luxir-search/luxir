@@ -30,6 +30,8 @@ protected:
   bool useFrontierBound;
   bool hasInjectedTermStats = false;
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   class Scorer;
   class TermBulkScorer;
   static inline bool disableCandidateLeapfrogForTests = false;
@@ -102,10 +104,8 @@ public:
     return hasInjectedTermStats ? injectedTermStats : cachedTermInfo.termStats;
   }
 
-  TermQuery::Weight* createWeight(Context& context, int32_t flags,
-                                  float multiplier = 1.0f) override {
-    return context.pool.make<TermQuery::Weight>(context, *this, flags, multiplier);
-  }
+  Query::Weight* createWeight(Context& context, int32_t flags,
+                              float multiplier = 1.0f) override;
 
   class Weight final : public Query::Weight {
   protected:
@@ -164,7 +164,7 @@ public:
             (luxir::Similarity::BM25Scorer*)nullptr, boost);
       }
 
-      auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
+      auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord); // this segFieldInfo can't be null at this point
       luxir::NormsReader* normsReader = nullptr;
       luxir::IntColReader* valueReader = nullptr;
       luxir::OrdColReader* ordReader = nullptr;
@@ -185,20 +185,12 @@ public:
                                                 query.shouldUseFrontierBound());
     }
 
-    std::optional<int64_t> constantCount(
-        IndexReader::Segment& segment, DocSet* domain) override {
-      if (cachedTermInfo == nullptr) {
-        return 0;
-      }
-      if (domain != nullptr || segment.liveDocs() != nullptr) {
-        return std::nullopt;
-      }
-      return (int64_t) cachedTermInfo->docFreq(segment.ord);
+    // A missing term is empty under any domain; otherwise docFreq is exact
+    // only when eligibility does not restrict the segment.
+    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+      int64_t docs = cachedTermInfo ? cachedTermInfo->docFreq(segment.ord) : 0;
+      return countBound(segment, domain, docs, CountHow::METADATA);
     }
-
-    // A term's exact match count is its docFreq - free from the term stats -
-    // unless deletions could have removed some of its docs. A term absent
-    // from the whole reader counts zero under any domain.
 
     // Per-segment supplier that exposes the term's real cost (its number of docs
     // in this segment) so compound scorers can order leaders by cost. The
@@ -1487,18 +1479,5 @@ public:
   };
 
 };
-
-inline BulkScorer* TermQuery::Weight::Supplier::buildBulk(
-    MemPool& targetPool, const BulkPlan& plan) {
-  using DirectTermScorer = TermQuery::Scorer;
-  assert(plan.available == BulkAnswer::YES);
-  assert(!plan.hasConstantCount());
-  auto* scorer = dynamic_cast<DirectTermScorer*>(
-      weight.createScorer(targetPool, segment));
-  if (scorer == nullptr) {
-    return nullptr;
-  }
-  return targetPool.make<TermQuery::TermBulkScorer>(targetPool, scorer, segment.maxDoc());
-}
 
 } // namespace luxir

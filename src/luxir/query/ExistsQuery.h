@@ -20,6 +20,8 @@ class ExistsQuery final : public Query {
   std::string_view field;
 
 public:
+  bool recoverableAsPredicate() const noexcept override { return true; }
+
   explicit ExistsQuery(std::string_view field)
     : Query(QueryKind::EXISTS), field(field) {}
 
@@ -96,40 +98,32 @@ public:
 
   class Weight final : public Query::Weight {
     ExistsQuery& query;
-    std::span<SegFieldInfo*> segInfos;
+    IndexReader::FieldSegments segInfos;
     float constantScore;
 
-    SegFieldInfo* segmentInfo(IndexReader::Segment& segment) const {
-      return segInfos.empty() ? nullptr : segInfos[(size_t)segment.ord];
+    const SegFieldInfo* segmentInfo(IndexReader::Segment& segment) const {
+      return segInfos.at((size_t)segment.ord);
     }
 
   public:
     Weight(Context& context, ExistsQuery& query, int32_t flags,
            float constantScore)
         : Query::Weight(context, query, flags), query(query),
-          segInfos(context.readSegInfos(query.getField())),
+          segInfos(context.topReader.field(query.getField())),
           constantScore(constantScore) {
       traits |= IS_CONSTANT_SCORING;
     }
 
-    // docsWithField is the exact match count - free from the field stats -
-    // unless deletions could have removed some of its docs. A field with no
-    // values in the segment counts zero under any domain.
-    std::optional<int64_t> constantCount(
-        IndexReader::Segment& segment, DocSet* domain) override {
-      SegFieldInfo* info = segmentInfo(segment);
-      if (info == nullptr || info->docsWithField == 0) {
-        return 0;
-      }
-      if (domain != nullptr || segment.liveDocs() != nullptr) {
-        return std::nullopt;
-      }
-      return (int64_t) info->docsWithField;
+    // Header totals include deleted docs, so a restricted segment needs iteration.
+    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+      const auto* info = segmentInfo(segment);
+      return countBound(segment, domain, info ? info->docsWithField : 0,
+                        CountHow::METADATA);
     }
 
     class Supplier final : public Query::ScorerSupplier {
       IndexReader::Segment& segment;
-      SegFieldInfo& fieldInfo;
+      const SegFieldInfo& fieldInfo;
       float constantScore;
       bool needsScores;
 
@@ -161,7 +155,7 @@ public:
       };
 
     public:
-      Supplier(IndexReader::Segment& segment, SegFieldInfo& fieldInfo,
+      Supplier(IndexReader::Segment& segment, const SegFieldInfo& fieldInfo,
                float constantScore, bool needsScores)
           : segment(segment), fieldInfo(fieldInfo),
             constantScore(constantScore), needsScores(needsScores) {}
@@ -221,7 +215,7 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {
       unused(executionMode);
-      SegFieldInfo* info = segmentInfo(segment);
+      const SegFieldInfo* info = segmentInfo(segment);
       if (info == nullptr || info->docsWithField == 0) return nullptr;
       return targetPool.make<Supplier>(segment, *info, constantScore, needsScores());
     }
@@ -238,12 +232,6 @@ public:
 
   };
 };
-
-inline ExistsQuery::Weight* ExistsQuery::createWeight(
-    Context& context, int32_t flags, float multiplier) {
-  return context.pool.make<ExistsQuery::Weight>(
-      context, *this, flags, Query::constantWhenScored(flags, multiplier));
-}
 
 static_assert(std::is_trivially_destructible_v<ExistsQuery::Weight>);
 static_assert(std::is_trivially_destructible_v<ExistsQuery::Scorer>);

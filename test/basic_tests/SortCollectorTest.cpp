@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include "luxir/util/Signal.h"
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
@@ -10,6 +11,7 @@
 #include "test/SchemaBuilder.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/search/FieldSortCollector.h"
+#include "luxir/search/FilterCache.h"
 #include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/search/SortField.h"
 #include "luxir/search/SearchOverrides.h"
@@ -212,18 +214,24 @@ protected:
 
   void runStringCandidatePruning(int32_t nSegs);
 
+  // Scenarios over the corpus costModelScenarios builds once.
+  void walkDescentPricesTheCollectedDomain();
+  void bestFirstRouteFollowsCostModel();
+  void rangeOnSortFieldClipsBoundOrder();
+  void seededLateHeadObeysAbortBudget();
+
   static WindowResult collectNumericWindows(
       IndexReader& reader, std::string_view field, int64_t topCount,
       SortField::SortOrder order, FieldComparator::MissingValue missing,
       bool disableGather, std::span<const int32_t> segmentOrder = {}) {
     IntFieldType fieldType(field);
     SortField sortField(field, fieldType, order, missing);
-    FieldSortCollector collector(topCount, columnPlan(sortField));
+    FieldSortCollector collector(topCount, columnPlan(sortField), &reader);
     KeyGatherGuard guard(disableGather);
 
     auto collectSegment = [&](int32_t segment) {
       auto& leaf = reader.segments()[(size_t)segment];
-      collector.setSegment(segment, &leaf.postingsReader());
+      collector.setSegment(leaf);
       std::vector<int32_t> docs;
       for (int32_t doc = 0; doc < leaf.maxDoc(); doc++) {
         if (leaf.liveDocs() == nullptr || leaf.liveDocs()->bitset().get(doc)) {
@@ -417,13 +425,12 @@ TEST_F(SortCollectorTest, numericKeyGatherMatchesFallbackAcrossColumnShapes) {
   ASSERT_EQ(2u, reader->segments().size());
   for (std::string_view field :
        {"dense_i", "sparse_i", "dense_is", "sparse_is"}) {
-    SimpleNumericFieldComparator comparator(std::string(field), true,
-                                            FieldComparator::MISSING_LAST);
+    SimpleNumericFieldComparator comparator(true, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
     for (auto& segment : reader->segments()) {
-      comparator.setSegment(segment.ord, &segment.postingsReader());
+      comparator.setSegment(segment);
       auto keys = comparator.keyBatch()->segmentKeys(std::nullopt);
-      const auto* meta = segment.postingsReader().numericLeafMeta(field);
-      EXPECT_EQ(meta, segment.postingsReader().numericLeafMeta(field));
+      const auto* meta = segment.postingsReader().fieldInfo(field)->numericLeafMeta();
+      EXPECT_EQ(meta, segment.postingsReader().fieldInfo(field)->numericLeafMeta());
       EXPECT_EQ(field == "dense_i", meta != nullptr) << field;
       ASSERT_EQ(keys.has_value(), meta != nullptr) << field;
       if (meta == nullptr) continue;
@@ -493,14 +500,14 @@ TEST_F(SortCollectorTest, fieldSortLeafMetaLivesWithItsSegment) {
     uint64_t coreGen = old.lock()->coreGen();
     EXPECT_EQ(expected, newest());  // reads each segment's leaf metadata
     const auto* meta =
-        old.lock()->segments()[0].postingsReader().numericLeafMeta("time_i");
+        old.lock()->segments()[0].postingsReader().fieldInfo("time_i")->numericLeafMeta();
     ASSERT_NE(nullptr, meta);
     commit();
     auto current = writer->snapshots.readers.getReader();
     EXPECT_EQ(coreGen, current->coreGen());
     EXPECT_TRUE(old.expired());
     EXPECT_EQ(meta,
-              current->segments()[0].postingsReader().numericLeafMeta("time_i"));
+              current->segments()[0].postingsReader().fieldInfo("time_i")->numericLeafMeta());
     current.reset();
     EXPECT_EQ(expected, newest());
   };
@@ -593,10 +600,10 @@ TEST_F(SortCollectorTest, sparseLandingReusesPresentCandidate) {
     IntFieldType fieldType(field);
     SortField sortField(
         field, fieldType, SortField::ASC, FieldComparator::MISSING_LAST);
-    FieldSortCollector collector(2, columnPlan(sortField));
+    FieldSortCollector collector(2, columnPlan(sortField), reader.get());
     KeyGatherGuard guard(disableGather);
     auto& segment = reader->segments()[0];
-    collector.setSegment(0, &segment.postingsReader());
+    collector.setSegment(segment);
     collector.collectWindow(0, candidates);
     WindowResult result;
     result.hitCount = collector.totalHits();
@@ -666,9 +673,9 @@ TEST_F(SortCollectorTest, collectWindowFallbackCountsEachHitOnce) {
       SortClause(SortField("primary_i", primaryType, SortField::ASC)),
       SortClause(SortField("secondary_i", secondaryType, SortField::ASC)),
   };
-  FieldSortCollector collector(4, clauses);
+  FieldSortCollector collector(4, clauses, reader.get());
   auto& segment = reader->segments()[0];
-  collector.setSegment(0, &segment.postingsReader());
+  collector.setSegment(segment);
   std::array<int32_t, 9> candidates = {0, 1, 2, 3, 4, 5, 6, 7, 8};
   collector.collectWindow(0, candidates);
 
@@ -1048,7 +1055,7 @@ TEST_F(SortCollectorTest, smallEdge) {
   auto collect = [&](FieldSortCollector& collector, int32_t seg) {
     auto* postingsReader = &reader->segments()[seg].postingsReader();
     auto nDocs = postingsReader->maxDoc();
-    collector.setSegment(seg, postingsReader);
+    collector.setSegment(reader->segments()[seg]);
     for (int32_t doc = 0; doc < nDocs; doc++) {
       collector.collect(seg, doc, 1.0f);
     }
@@ -1056,7 +1063,7 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test collecting segments in order
   {
-    FieldSortCollector collector(2, columnPlan(sf));
+    FieldSortCollector collector(2, columnPlan(sf), reader.get());
 
     // collect 2nd segment first: should have [doc2,doc1]
     collect(collector, 0);
@@ -1074,7 +1081,7 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test collecting segments out of order
   {
-    FieldSortCollector collector(2, columnPlan(sf));
+    FieldSortCollector collector(2, columnPlan(sf), reader.get());
 
     // collect 2nd segment first: should have [doc5, doc4]
     collect(collector, 1);
@@ -1092,8 +1099,8 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test merging collectors in different orders
   {
-    FieldSortCollector collector0(2, columnPlan(sf));
-    FieldSortCollector collector1(2, columnPlan(sf));
+    FieldSortCollector collector0(2, columnPlan(sf), reader.get());
+    FieldSortCollector collector1(2, columnPlan(sf), reader.get());
 
     collect(collector0, 0);
     collect(collector1, 1);
@@ -1107,8 +1114,8 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   // Test merging collectors in reverse order this time
   {
-    FieldSortCollector collector0(2, columnPlan(sf));
-    FieldSortCollector collector1(2, columnPlan(sf));
+    FieldSortCollector collector0(2, columnPlan(sf), reader.get());
+    FieldSortCollector collector1(2, columnPlan(sf), reader.get());
 
     collect(collector0, 0);
     collect(collector1, 1);
@@ -1168,7 +1175,7 @@ TEST_F(SortCollectorTest, randomSmall) {
     auto collect = [&](FieldSortCollector& collector, int32_t seg) {
       auto* postingsReader = &reader->segments()[seg].postingsReader();
       auto nDocs = postingsReader->maxDoc();
-      collector.setSegment(seg, postingsReader);
+      collector.setSegment(reader->segments()[seg]);
       for (int32_t doc = 0; doc < nDocs; doc++) {
         collector.collect(seg, doc, 1.0f);
       }
@@ -1195,7 +1202,7 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test collecting segments in order
     {
-      FieldSortCollector collector(topK, columnPlan(sf));
+      FieldSortCollector collector(topK, columnPlan(sf), reader.get());
 
       // collect 2nd segment first: should have [doc5, doc4]
       collect(collector, 0);
@@ -1205,7 +1212,7 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test collecting segments out of order
     {
-      FieldSortCollector collector(topK, columnPlan(sf));
+      FieldSortCollector collector(topK, columnPlan(sf), reader.get());
 
       // collect 2nd segment first: should have [doc5, doc4]
       collect(collector, 1);
@@ -1215,8 +1222,8 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test merging collectors in different orders
     {
-      FieldSortCollector collector0(topK, columnPlan(sf));
-      FieldSortCollector collector1(topK, columnPlan(sf));
+      FieldSortCollector collector0(topK, columnPlan(sf), reader.get());
+      FieldSortCollector collector1(topK, columnPlan(sf), reader.get());
       collect(collector0, 0);
       collect(collector1, 1);
       collector0.merge(collector1);
@@ -1225,8 +1232,8 @@ TEST_F(SortCollectorTest, randomSmall) {
 
     // Test merging collectors in reverse order this time
     {
-      FieldSortCollector collector0(topK, columnPlan(sf));
-      FieldSortCollector collector1(topK, columnPlan(sf));
+      FieldSortCollector collector0(topK, columnPlan(sf), reader.get());
+      FieldSortCollector collector1(topK, columnPlan(sf), reader.get());
       collect(collector0, 0);
       collect(collector1, 1);
       collector1.merge(collector0);
@@ -1265,21 +1272,21 @@ TEST_F(SortCollectorTest, DeepLimitGrowsSlotStorageOnDemand) {
   SortField sortField("sort_i", fieldType, SortField::ASC);
   auto& leaf = reader->segments()[0];
   auto collect = [&](FieldSortCollector& collector, int32_t parity) {
-    collector.setSegment(0, &leaf.postingsReader());
+    collector.setSegment(leaf);
     for (int32_t doc = 0; doc < leaf.maxDoc(); doc++) {
       if (parity < 0 || doc % 2 == parity) collector.collect(0, doc, 1.0f);
     }
   };
 
   // collect() warmup path; capacity tracks the hits, not the limit.
-  FieldSortCollector whole(deepLimit, columnPlan(sortField));
+  FieldSortCollector whole(deepLimit, columnPlan(sortField), reader.get());
   collect(whole, -1);
   EXPECT_EQ(whole.size(), (uint64_t)nDocs);
   EXPECT_LE(whole.slotCapacity, (int64_t)nDocs * 2);
 
   // Underfull merge mints the merged-in slots.
-  FieldSortCollector even(deepLimit, columnPlan(sortField));
-  FieldSortCollector odd(deepLimit, columnPlan(sortField));
+  FieldSortCollector even(deepLimit, columnPlan(sortField), reader.get());
+  FieldSortCollector odd(deepLimit, columnPlan(sortField), reader.get());
   collect(even, 0);
   collect(odd, 1);
   even.merge(odd);
@@ -1440,14 +1447,18 @@ TEST_F(SortCollectorTest, SegmentModeIsParseBoundAndDoesNotBuildOrdMap) {
   helper.index(flatdoc("id_s", "b", "name_s", "a"), UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(2u, reader->segments().size());
-  size_t cacheSize = reader->getOrdMapCacheSize();
+  std::atomic<int> builds{0};
+  Signal::listen("ordMapBuild", [&](void*, void*, void*) -> void* {
+    builds++;
+    return nullptr;
+  });
 
   StrFieldType fieldType("name_s");
   StringSortModeGuard segmentGuard(StringSortMode::SEGMENT);
   SortField sortField("name_s", fieldType, SortField::ASC);
   {
     StringSortModeGuard globalGuard(StringSortMode::GLOBAL);
-    auto comparator = sortField.createComparator(reader.get());
+    auto comparator = sortField.createComparator(*reader);
     EXPECT_NE(nullptr, dynamic_cast<SegmentOrdComparator*>(comparator.get()));
   }
 
@@ -1458,7 +1469,7 @@ TEST_F(SortCollectorTest, SegmentModeIsParseBoundAndDoesNotBuildOrdMap) {
   req->execute(true);
   ASSERT_OK(req);
   EXPECT_EQ((std::vector<std::string>{"b", "a"}), resultIds(*req));
-  EXPECT_EQ(cacheSize, reader->getOrdMapCacheSize());
+  EXPECT_EQ(0, builds.load());
 }
 
 TEST_F(SortCollectorTest, SegmentOrdBottomAnchors) {
@@ -1485,12 +1496,11 @@ TEST_F(SortCollectorTest, SegmentOrdBottomAnchors) {
   auto compare = [&](int32_t pivotDoc, int32_t targetSegment, int32_t candidateDoc,
                      FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST,
                      bool reversed = false) {
-    SegmentOrdComparator comparator("name_s", reversed, missing);
+    SegmentOrdComparator comparator(reversed, missing, reader->field("name_s"));
     comparator.growSlots(1);
-    comparator.setSegment(0, &reader->segments()[0].postingsReader());
+    comparator.setSegment(reader->segments()[0]);
     comparator.copy(0, segdoc(0, pivotDoc));
-    comparator.setSegment(targetSegment,
-                          &reader->segments()[targetSegment].postingsReader());
+    comparator.setSegment(reader->segments()[targetSegment]);
     comparator.setBottom(0);
     return comparator.compareBottom(0, segdoc(0, pivotDoc),
                                     segdoc(targetSegment, candidateDoc));
@@ -1532,7 +1542,7 @@ TEST_F(SortCollectorTest, SegmentOrdCollectorReuseAcrossAdversarialSegments) {
   FieldSortCollector collector(4, columnPlan(field), reader.get());
   auto collectSegment = [&](int32_t segment) {
     auto& postings = reader->segments()[segment].postingsReader();
-    collector.setSegment(segment, &postings);
+    collector.setSegment(reader->segments()[segment]);
     for (int32_t doc = 0; doc < postings.maxDoc(); doc++) {
       collector.collect(segment, doc, 1.0f);
     }
@@ -1588,7 +1598,7 @@ TEST_F(SortCollectorTest, SegmentOrdPairwiseMergeOwnsCopiedTerms) {
     auto right = makeCollector();
     auto collect = [&](FieldSortCollector& collector, int32_t segment) {
       auto& postings = reader->segments()[segment].postingsReader();
-      collector.setSegment(segment, &postings);
+      collector.setSegment(reader->segments()[segment]);
       for (int32_t doc = 0; doc < postings.maxDoc(); doc++) {
         collector.collect(segment, doc, 1.0f);
       }
@@ -2469,6 +2479,7 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
   std::vector<std::string> deleted;
   int32_t docId = 0;
   for (int32_t seg = 0; seg < 2; seg++) {
+    CollectionHelper::UpdateBuilder batch;
     for (int32_t i = 0; i < kDocsPerSeg; i++, docId++) {
       std::string id = std::to_string(docId);
       int64_t rand = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
@@ -2496,11 +2507,11 @@ TEST_F(SortCollectorTest, numericBlockPruningMatchesExhaustive) {
       }
       if ((docId & 1) == 0) doc.push_back(NameVal{"dense_s", "y"});
       if (docId % 100 == 0) doc.push_back(NameVal{"sparse_s", "y"});
-      helper.index(doc, UpdateMessage::NO_COMMIT);
+      batch.add(doc);
       // Segment 0 retains a null live-doc domain; segment 1 exercises deletes.
       if (seg == 1 && docId % 97 == 0) deleted.push_back(id);
     }
-    helper.commit();
+    ASSERT_TRUE(helper.submit(batch.commit()).success);
   }
   ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
 
@@ -2724,6 +2735,7 @@ TEST_F(SortCollectorTest, phraseFieldSortPruningMatchesExhaustive) {
   std::vector<std::string> deleted;
   int32_t docId = 0;
   for (int32_t seg = 0; seg < 2; seg++) {
+    CollectionHelper::UpdateBuilder batch;
     for (int32_t i = 0; i < kDocsPerSeg; i++, docId++) {
       std::string id = std::to_string(docId);
       int64_t rand = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
@@ -2733,18 +2745,16 @@ TEST_F(SortCollectorTest, phraseFieldSortPruningMatchesExhaustive) {
                                           : "one fox red two";
       std::string par = (docId & 1) == 0 ? "even" : "odd";
       if (seg == 1 && i % 13 == 0) {
-        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
-                             "par_w", par, "ties_i", (int64_t)(docId % 7)),
-                     UpdateMessage::NO_COMMIT);
+        batch.add(flatdoc("id", id, "id_s", id, "body_w", body,
+                          "par_w", par, "ties_i", (int64_t)(docId % 7)));
       } else {
-        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
-                             "par_w", par, "rand_i", rand,
-                             "ties_i", (int64_t)(docId % 7)),
-                     UpdateMessage::NO_COMMIT);
+        batch.add(flatdoc("id", id, "id_s", id, "body_w", body,
+                          "par_w", par, "rand_i", rand,
+                          "ties_i", (int64_t)(docId % 7)));
       }
       if (docId % 97 == 0) deleted.push_back(id);
     }
-    helper.commit();
+    ASSERT_TRUE(helper.submit(batch.commit()).success);
   }
   ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
 
@@ -2887,9 +2897,8 @@ TEST_F(SortCollectorTest, boundOrderLeavesAscendByBoundThenLeaf) {
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   for (bool reversed : {false, true}) {
     for (auto& segment : reader->segments()) {
-      SimpleNumericFieldComparator comparator(
-          "key_i", reversed, FieldComparator::MISSING_LAST);
-      comparator.setSegment(segment.ord, &segment.postingsReader());
+      SimpleNumericFieldComparator comparator(reversed, FieldComparator::MISSING_LAST, reader->field("key_i"));
+      comparator.setSegment(segment);
       FieldComparator::KeyBatch* batch = comparator.keyBatch();
       ASSERT_NE(0, batch->leafBlockSize());
       int64_t leaves = batch->leafBlockCount();
@@ -2932,9 +2941,8 @@ TEST_F(SortCollectorTest, keyFloorClipsValueEnvelopes) {
 
   auto floorOf = [&](std::string_view field, bool reversed,
                      Query::ValueEnvelope values) {
-    SimpleNumericFieldComparator comparator(
-        std::string(field), reversed, FieldComparator::MISSING_LAST);
-    comparator.setSegment(segment.ord, &segment.postingsReader());
+    SimpleNumericFieldComparator comparator(reversed, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
+    comparator.setSegment(segment);
     auto keys = comparator.keyBatch()->segmentKeys(values);
     return keys.has_value() ? std::optional<int64_t>(keys->keyFloor())
                             : std::nullopt;
@@ -2966,9 +2974,9 @@ TEST_F(SortCollectorTest, keyFloorClipsValueEnvelopes) {
       SortField sortField(field,
                           isFloat ? (FieldType&)floatType : (FieldType&)intType,
                           reversed ? SortField::DESC : SortField::ASC);
-      FieldSortCollector collector(10, columnPlan(sortField));
+      FieldSortCollector collector(10, columnPlan(sortField), reader.get());
       collector.primaryValues = values;
-      collector.setSegment(segment.ord, &segment.postingsReader());
+      collector.setSegment(segment);
       auto* batch = collector.clauses[0].comparator->keyBatch();
       ASSERT_NE(0, batch->leafBlockSize());
       int64_t floor = collector.primaryKeys->keyFloor();
@@ -2992,9 +3000,8 @@ TEST_F(SortCollectorTest, keyFloorClipsValueEnvelopes) {
       std::iota(all.begin(), all.end(), 0);
       std::vector<int64_t> keys(all.size());
       batch->gatherKeys(all, keys);
-      SimpleNumericFieldComparator raw(std::string(field), false,
-                                       FieldComparator::MISSING_LAST);
-      raw.setSegment(segment.ord, &segment.postingsReader());
+      SimpleNumericFieldComparator raw(false, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
+      raw.setSegment(segment);
       std::vector<int64_t> stored(all.size());
       raw.keyBatch()->gatherKeys(all, stored);
       for (size_t doc = 0; doc < all.size(); doc++) {
@@ -3006,8 +3013,8 @@ TEST_F(SortCollectorTest, keyFloorClipsValueEnvelopes) {
   // Without an envelope nothing is clipped.
   IntFieldType intType("key_i");
   SortField sortField("key_i", intType, SortField::DESC);
-  FieldSortCollector collector(10, columnPlan(sortField));
-  collector.setSegment(segment.ord, &segment.postingsReader());
+  FieldSortCollector collector(10, columnPlan(sortField), reader.get());
+  collector.setSegment(segment);
   EXPECT_EQ(0, collector.leavesBeforeKeyFloor);
 }
 
@@ -3329,39 +3336,95 @@ TEST_F(SortCollectorTest, exactDomainSortCostsDecide) {
                                     kGridLeaves, kGridLeaves, 10}));
 }
 
+// The cost-model scenarios below share one corpus, a single 256-leaf segment
+// built in one batch (d = doc id, h = (uint32_t)d * 2654435761u):
+//   id, id_s         d
+//   key_i            h & 0x7fffffff: uniform keys
+//   rnd_i, rnd_pt    h >> 12: uniform over [0, 2^20), rnd_pt points-indexed
+//   mono_i           d: keys in doc order
+//   mono8_i, _pt     8d over [0, 2^20), mono8_pt points-indexed
+//   walk_i           random over [0, 2^30); lead_s is y on 10% of docs and
+//                    rare_s on an independent 2.5%
+//   body_w           "even large" on even d, else "odd"; "small" on every
+//                    127th; "low" where key_i is in its lowest quarter,
+//                    "lowsparse" on every 16th of those, "favored" on even d
+//                    in its lowest 1/64; "early first" / "early second" by
+//                    parity over the older half, "late" over the newer
+// Each scenario starts with nothing cached and no filter sightings, as on a
+// fresh collection.
+TEST_F(SortCollectorTest, costModelScenarios) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  for (std::string_view name : {"rnd_pt", "mono8_pt"}) {
+    auto& field = schema.field(name);
+    field.type = luxir::api::FieldDef::FieldClass::INT;
+    field.index = luxir::api::FieldDef::IndexMode::RANGE;
+  }
+  schema.set(helper.collection());
+  constexpr int32_t kDocs = 256 * 512;
+  constexpr int64_t kLowKeys = 0x7fffffff / 4;
+  CollectionHelper::UpdateBuilder batch;
+  for (int32_t d = 0; d < kDocs; d++) {
+    uint32_t h = (uint32_t)d * 2654435761u;
+    int64_t key = (int64_t)h & 0x7fffffff;
+    std::string body = d % 2 == 0 ? "even large" : "odd";
+    if (d % 127 == 0) body += " small";
+    if (key < kLowKeys) body += " low";
+    if (key < kLowKeys && d % 16 == 0) body += " lowsparse";
+    if (key < kLowKeys / 16 && d % 2 == 0) body += " favored";
+    body += d >= kDocs / 2 ? " late"
+        : d % 2 == 0       ? " early first"
+                           : " early second";
+    SplitMix64 r((uint64_t)d);
+    int64_t walk = r.rint(1 << 30);
+    bool lead = r.rint(10) == 0;
+    bool rare = r.rint(40) == 0;
+    std::string id = std::to_string(d);
+    batch.add(flatdoc("id", id, "id_s", id, "body_w", body, "key_i", key,
+                      "rnd_i", (int64_t)(h >> 12), "rnd_pt", (int64_t)(h >> 12),
+                      "mono_i", (int64_t)d, "mono8_i", (int64_t)d * 8,
+                      "mono8_pt", (int64_t)d * 8, "walk_i", walk,
+                      "lead_s", lead ? "y" : "n", "rare_s", rare ? "y" : "n"));
+  }
+  ASSERT_TRUE(helper.submit(batch.commit()).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  FilterCache* cache = reader->filterCache();
+  ASSERT_NE(nullptr, cache);
+  auto forget = [&] {
+    cache->clear();
+    cache->resetAdmission();
+  };
+  forget();
+  walkDescentPricesTheCollectedDomain();
+  forget();
+  bestFirstRouteFollowsCostModel();
+  forget();
+  rangeOnSortFieldClipsBoundOrder();
+  forget();
+  seededLateHeadObeysAbortBudget();
+}
+
 // The walk prices leaf descent on the docs it expects to collect
 // (TopDocsReq::walkMembershipWork), not on what its source costs. One
 // 256-leaf segment under uniform keys at k = 1: a 10% term alone admits few
 // leaves and holds 51 docs in each, so the walk descends; ANDed with an
 // independent 2.5% term its lead costs the same, but it collects 0.25% - 1.3
 // docs a leaf over the 80% of leaves the bottom admits - and does not.
-TEST_F(SortCollectorTest, walkDescentPricesTheCollectedDomain) {
+void SortCollectorTest::walkDescentPricesTheCollectedDomain() {
   WholeMembershipPlanGuard wholeGuard(true);
   SeededGuard seededGuard(true, false);
-  CollectionHelper helper("walk_descent");
-  constexpr int32_t kDocs = 256 * 512;
-  for (int32_t docId = 0; docId < kDocs; docId++) {
-    SplitMix64 r((uint64_t)docId);
-    helper.index(flatdoc("id", std::to_string(docId),
-                         "id_s", std::to_string(docId),
-                         "rnd_i", r.rint(1 << 30),
-                         "lead_s", r.rint(10) == 0 ? "y" : "n",
-                         "rare_s", r.rint(40) == 0 ? "y" : "n"),
-                 UpdateMessage::NO_COMMIT);
-  }
-  helper.commit();
-
   auto leavesSkipped = [&](bool conjunction) {
     SortSkipStatsGuard statsGuard;
     auto req = localReq(luxirNode->getSearchEngine());
-    req->collection("walk_descent");
+    req->collection("main");
     auto& cur = req->topDocs("q").limit(1).fields({"id_s"});
     auto& mr = cur.mr();
     cur.rawQuery() = conjunction
         ? qb::boolean(mr, {qb::match(mr, "lead_s", "y"),
                            qb::match(mr, "rare_s", "y")})
         : qb::match(mr, "lead_s", "y");
-    qb::sort(cur, "rnd_i", qb::ASC);
+    qb::sort(cur, "walk_i", qb::ASC);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
     return SkipStats::fieldSortLeavesSkipped;
@@ -3427,8 +3490,8 @@ TEST_F(SortCollectorTest, exactDomainPhasesMatchExhaustive) {
                      int64_t topCount, std::optional<Phase> phase,
                      int64_t cap, bool checkProgress, int64_t floor) {
     MemPool pool;
-    FieldSortCollector collector(topCount, columnPlan(sortField));
-    collector.setSegment(0, &segment.postingsReader(), &pool,
+    FieldSortCollector collector(topCount, columnPlan(sortField), reader.get());
+    collector.setSegment(segment, &pool,
                          (int64_t)domain.size());
     if (!phase.has_value()) {
       collector.collectWindow(0, domain);
@@ -3493,8 +3556,8 @@ TEST_F(SortCollectorTest, exactDomainPhasesMatchExhaustive) {
     SortField sortField("mono_i", monoType, order,
                         FieldComparator::MISSING_LAST);
     MemPool pool;
-    FieldSortCollector collector(7, columnPlan(sortField));
-    collector.setSegment(0, &segment.postingsReader(), &pool, kDocs);
+    FieldSortCollector collector(7, columnPlan(sortField), reader.get());
+    collector.setSegment(segment, &pool, kDocs);
     auto* batch = collector.maskedKeyBlockPlan().batch;
     ASSERT_NE(nullptr, batch);
     collector.collectWindow(0, std::span(sparse).first(3));
@@ -3529,25 +3592,8 @@ TEST_F(SortCollectorTest, exactDomainPhasesMatchExhaustive) {
 // the predicted bottom plans bound order, which proves after the leaves
 // holding the first matches. Every route matches exhaustive collection, the
 // ladder, and forced bound order.
-TEST_F(SortCollectorTest, bestFirstRouteFollowsCostModel) {
+void SortCollectorTest::bestFirstRouteFollowsCostModel() {
   WholeMembershipPlanGuard wholeGuard(true);
-  CollectionHelper helper("best_first_cost");
-  constexpr int32_t kDocs = 256 * 512;
-  constexpr int64_t kLowKeys = 0x7fffffff / 4;
-  for (int32_t docId = 0; docId < kDocs; docId++) {
-    int64_t key = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
-    std::string body = docId % 2 == 0 ? "large" : "odd";
-    if (docId % 127 == 0) body += " small";
-    if (key < kLowKeys) body += " low";
-    if (key < kLowKeys && docId % 16 == 0) body += " lowsparse";
-    if (key < kLowKeys / 16 && docId % 2 == 0) body += " favored";
-    helper.index(flatdoc("id", std::to_string(docId),
-                         "id_s", std::to_string(docId), "body_w", body,
-                         "key_i", key, "mono_i", (int64_t)docId),
-                 UpdateMessage::NO_COMMIT);
-  }
-  helper.commit();
-
   struct Result {
     std::vector<std::string> ids;
     int64_t sweeps = 0;
@@ -3568,7 +3614,7 @@ TEST_F(SortCollectorTest, bestFirstRouteFollowsCostModel) {
     SortPruningGuard pruningGuard(disablePruning);
     SortSkipStatsGuard statsGuard;
     auto req = localReq(luxirNode->getSearchEngine());
-    req->collection("best_first_cost");
+    req->collection("main");
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
     cur.allQuery().matchFilter("body_w", value);
     qb::sort(cur, field, dir);
@@ -3692,6 +3738,7 @@ TEST_F(SortCollectorTest, exactDomainCostRouteAcrossSegments) {
   int32_t docId = 0;
   std::vector<std::string> deletes;
   for (int32_t seg = 0; seg < 3; seg++) {
+    CollectionHelper::UpdateBuilder batch;
     for (int32_t i = 0; i < kSegDocs[(size_t)seg]; i++, docId++) {
       int64_t leaf = i / 512;
       int64_t permLeaf = leaf < 48 ? 27 + leaf : leaf < 75 ? leaf - 48 : leaf;
@@ -3699,7 +3746,7 @@ TEST_F(SortCollectorTest, exactDomainCostRouteAcrossSegments) {
       if (docId % 40 == 0) body += " every40";
       if (docId % 51 == 0) body += " every51";
       if (docId % 101 == 0) body += " sparse";
-      helper.index(
+      batch.add(
           flatdoc("id", std::to_string(docId), "id_s", std::to_string(docId),
                   "body_w", body,
                   "rnd_i",
@@ -3707,11 +3754,10 @@ TEST_F(SortCollectorTest, exactDomainCostRouteAcrossSegments) {
                   "time_i", (int64_t)docId, "tie_i", (int64_t)(docId % 3),
                   "perm_i",
                   seg == 0 ? permLeaf * 512 + i % 512
-                           : (int64_t)(1 << 20) + docId),
-          UpdateMessage::NO_COMMIT);
+                           : (int64_t)(1 << 20) + docId));
       if (docId % 1009 == 7) deletes.push_back(std::to_string(docId));
     }
-    helper.commit();
+    ASSERT_TRUE(helper.submit(batch.commit()).success);
   }
   ASSERT_TRUE(helper.deleteByIds(deletes, UpdateMessage::COMMIT).success);
   ASSERT_EQ(3u, helper.getIndexWriter()
@@ -3834,30 +3880,9 @@ TEST_F(SortCollectorTest, exactDomainCostRouteAcrossSegments) {
 // filter (the cached range set) and an unfolded one (a collector filter
 // under match-all), and for a query's resident whole membership; every
 // route matches exhaustive collection.
-TEST_F(SortCollectorTest, rangeOnSortFieldClipsBoundOrder) {
+void SortCollectorTest::rangeOnSortFieldClipsBoundOrder() {
   WholeMembershipPlanGuard wholeGuard(true);
-  CollectionHelper helper("range_clip");
-  SchemaBuilder schema;
-  for (std::string_view name : {"rnd_pt", "mono_pt"}) {
-    auto& field = schema.field(name);
-    field.type = luxir::api::FieldDef::FieldClass::INT;
-    field.index = luxir::api::FieldDef::IndexMode::RANGE;
-  }
-  schema.set(helper.collection());
-  constexpr int32_t kDocs = 256 * 512;
   constexpr int64_t kHalf = 1 << 19;
-  for (int32_t docId = 0; docId < kDocs; docId++) {
-    int64_t rnd = (int64_t)(((uint32_t)docId * 2654435761u) >> 12);
-    int64_t mono = (int64_t)docId * 8;
-    helper.index(flatdoc("id", std::to_string(docId),
-                         "id_s", std::to_string(docId),
-                         "body_w", docId % 2 == 0 ? "even" : "odd",
-                         "rnd_i", rnd, "rnd_pt", rnd,
-                         "mono_i", mono, "mono_pt", mono),
-                 UpdateMessage::NO_COMMIT);
-  }
-  helper.commit();
-
   struct Result {
     std::vector<std::string> ids;
     int64_t sweeps = 0;
@@ -3875,7 +3900,7 @@ TEST_F(SortCollectorTest, rangeOnSortFieldClipsBoundOrder) {
     WholeMembershipPlanGuard whole(domain != Domain::WHOLE);
     SortSkipStatsGuard statsGuard;
     auto req = localReq(luxirNode->getSearchEngine());
-    req->collection("range_clip");
+    req->collection("main");
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
     if (domain == Domain::WHOLE) {
       cur.matchQuery("body_w", "even");
@@ -3894,7 +3919,7 @@ TEST_F(SortCollectorTest, rangeOnSortFieldClipsBoundOrder) {
                   SkipStats::fieldSortDomainScans};
   };
   constexpr int64_t kSparse = kHalf / 32;  // a 1.5% range: an ARRAY domain
-  for (std::string_view field : {"rnd_i", "rnd_pt", "mono_i", "mono_pt"}) {
+  for (std::string_view field : {"rnd_i", "rnd_pt", "mono8_i", "mono8_pt"}) {
     for (int64_t hi : {kHalf, kSparse}) {
       run(field, qb::DESC, hi, 1);  // two sightings admit the filter
       run(field, qb::DESC, hi, 1);
@@ -3914,7 +3939,7 @@ TEST_F(SortCollectorTest, rangeOnSortFieldClipsBoundOrder) {
     EXPECT_EQ(1, ascending.boundOrder) << field;
     EXPECT_EQ(1, ascending.proofs) << field;
   }
-  for (std::string_view field : {"mono_i", "mono_pt"}) {
+  for (std::string_view field : {"mono8_i", "mono8_pt"}) {
     auto correlated = run(field, qb::DESC, kHalf, 1);
     EXPECT_EQ(0, correlated.sweeps) << field;
     EXPECT_EQ(1, correlated.boundOrder) << field;
@@ -3932,7 +3957,7 @@ TEST_F(SortCollectorTest, rangeOnSortFieldClipsBoundOrder) {
   EXPECT_EQ(1, resident.scans);
   EXPECT_EQ(0, resident.sweeps + resident.boundOrder);
 
-  for (std::string_view field : {"rnd_i", "rnd_pt", "mono_i", "mono_pt"}) {
+  for (std::string_view field : {"rnd_i", "rnd_pt", "mono8_i", "mono8_pt"}) {
     for (int64_t hi : {kHalf, kSparse}) {
       for (qb::SortDir dir : {qb::DESC, qb::ASC}) {
         for (Domain domain : {Domain::FOLDED, Domain::UNFOLDED, Domain::WHOLE}) {
@@ -3971,9 +3996,8 @@ TEST_F(SortCollectorTest, segmentKeysEstimateKeysWithinEnvelopes) {
   auto& segment = reader->segments()[0];
   using Envelope = std::optional<Query::ValueEnvelope>;
   for (std::string_view field : {"key_i", "mono_i"}) {
-    SimpleNumericFieldComparator raw(std::string(field), false,
-                                     FieldComparator::MISSING_LAST);
-    raw.setSegment(segment.ord, &segment.postingsReader());
+    SimpleNumericFieldComparator raw(false, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
+    raw.setSegment(segment);
     std::vector<int32_t> all(kDocs);
     std::iota(all.begin(), all.end(), 0);
     std::vector<int64_t> values(kDocs);
@@ -3984,9 +4008,8 @@ TEST_F(SortCollectorTest, segmentKeysEstimateKeysWithinEnvelopes) {
         SCOPED_TRACE(std::string(field) + (reversed ? " desc" : " asc")
                      + (envelope ? " env " + std::to_string(envelope->lo)
                                  : " all"));
-        SimpleNumericFieldComparator comparator(
-            std::string(field), reversed, FieldComparator::MISSING_LAST);
-        comparator.setSegment(segment.ord, &segment.postingsReader());
+        SimpleNumericFieldComparator comparator(reversed, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
+        comparator.setSegment(segment);
         auto keys = comparator.keyBatch()->segmentKeys(envelope);
         ASSERT_TRUE(keys.has_value());
         if (field == "mono_i") {
@@ -4078,10 +4101,9 @@ TEST_F(SortCollectorTest, predictedBottomFollowsHeapAcrossSegments) {
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(2u, reader->segments().size());
   auto keysOf = [&](std::string_view field, bool reversed, size_t seg) {
-    SimpleNumericFieldComparator comparator(std::string(field), reversed,
-                                            FieldComparator::MISSING_LAST);
+    SimpleNumericFieldComparator comparator(reversed, FieldComparator::MISSING_LAST, reader->field(std::string(field)));
     auto& segment = reader->segments()[seg];
-    comparator.setSegment(segment.ord, &segment.postingsReader());
+    comparator.setSegment(segment);
     return *comparator.keyBatch()->segmentKeys(std::nullopt);
   };
   constexpr int64_t k = 100;
@@ -4372,6 +4394,7 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
   constexpr int32_t kDocsPerSeg = 5000;
   int32_t docId = 0;
   for (int32_t seg = 0; seg < 2; seg++) {
+    CollectionHelper::UpdateBuilder batch;
     for (int32_t i = 0; i < kDocsPerSeg; i++, docId++) {
       std::string id = std::to_string(docId);
       int64_t rand = (int64_t)((uint32_t)docId * 2654435761u) & 0x7fffffff;
@@ -4380,19 +4403,17 @@ TEST_F(SortCollectorTest, seededFieldSortMatchesExhaustive) {
       if (docId >= 9000) body = "tail";
       if (docId % 7 == 0) body += " excluded";
       if (seg == 1 && i % 13 == 0) {
-        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
-                             "ties_i", (int64_t)(docId % 7),
-                             "mono_i", (int64_t)docId),
-                     UpdateMessage::NO_COMMIT);
+        batch.add(flatdoc("id", id, "id_s", id, "body_w", body,
+                          "ties_i", (int64_t)(docId % 7),
+                          "mono_i", (int64_t)docId));
       } else {
-        helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
-                             "rand_i", rand,
-                             "ties_i", (int64_t)(docId % 7),
-                             "mono_i", (int64_t)docId),
-                     UpdateMessage::NO_COMMIT);
+        batch.add(flatdoc("id", id, "id_s", id, "body_w", body,
+                          "rand_i", rand,
+                          "ties_i", (int64_t)(docId % 7),
+                          "mono_i", (int64_t)docId));
       }
     }
-    helper.commit();
+    ASSERT_TRUE(helper.submit(batch.commit()).success);
   }
 
   struct Sorts {
@@ -4556,21 +4577,21 @@ TEST_F(SortCollectorTest, seededFieldSortAntiCorrelationAborts) {
   constexpr int32_t kProbeStart = 12 * 4096;
   CollectionHelper helper("seeded_abort");
   helper.getIndexWriter()->mergePolicy->setMergeFactor(10);
+  CollectionHelper::UpdateBuilder small;
   for (int32_t i = 0; i < 5000; i++) {
-    helper.index(flatdoc("id", std::to_string(i), "id_s", std::to_string(i),
-                         "body_w", "probe", "mono_i", (int64_t)(100000 + i)),
-                 UpdateMessage::NO_COMMIT);
+    small.add(flatdoc("id", std::to_string(i), "id_s", std::to_string(i),
+                      "body_w", "probe", "mono_i", (int64_t)(100000 + i)));
   }
-  helper.commit();
+  ASSERT_TRUE(helper.submit(small.commit()).success);
+  CollectionHelper::UpdateBuilder big;
   for (int32_t i = 0; i < kBigSegDocs; i++) {
     int32_t docId = 5000 + i;
-    helper.index(flatdoc("id", std::to_string(docId),
-                         "id_s", std::to_string(docId),
-                         "body_w", i >= kProbeStart ? "probe" : "filler",
-                         "mono_i", (int64_t)i),
-                 UpdateMessage::NO_COMMIT);
+    big.add(flatdoc("id", std::to_string(docId),
+                    "id_s", std::to_string(docId),
+                    "body_w", i >= kProbeStart ? "probe" : "filler",
+                    "mono_i", (int64_t)i));
   }
-  helper.commit();
+  ASSERT_TRUE(helper.submit(big.commit()).success);
 
   auto run = [&](bool seeded, bool disablePruning,
                  int32_t budgetPerMille = 0) {
@@ -4608,20 +4629,8 @@ TEST_F(SortCollectorTest, seededFieldSortAntiCorrelationAborts) {
 // A late head must still abandon empty rounds within the common budget and
 // let the sweep finish. Oldest-first over the newer half does the same.
 // Both terms and unions must retain exhaustive ranked-ID parity.
-TEST_F(SortCollectorTest, seededLateHeadObeysAbortBudget) {
+void SortCollectorTest::seededLateHeadObeysAbortBudget() {
   WholeMembershipPlanGuard wholeGuard(true);
-  CollectionHelper helper("seeded_rounds");
-  constexpr int32_t kDocs = 256 * 512;
-  std::vector<Doc> docs;
-  for (int32_t doc = 0; doc < kDocs; doc++) {
-    docs.push_back(flatdoc("id", std::to_string(doc), "id_s",
-                           std::to_string(doc), "body_w",
-                           doc < kDocs / 2
-                               ? (doc % 2 == 0 ? "early first" : "early second")
-                               : "late",
-                           "mono_i", (int64_t)doc));
-  }
-  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   struct Result {
     std::vector<std::string> ids;
     int64_t rounds = 0;
@@ -4633,7 +4642,7 @@ TEST_F(SortCollectorTest, seededLateHeadObeysAbortBudget) {
     SortPruningGuard pruningGuard(disablePruning);
     SortSkipStatsGuard statsGuard;
     auto req = localReq(luxirNode->getSearchEngine());
-    req->collection("seeded_rounds");
+    req->collection("main");
     auto& cur = req->topDocs("q").limit(limit).fields({"id_s"});
     if (unionQuery) {
       cur.rawQuery() = qb::boolean(
@@ -4685,6 +4694,7 @@ void SortCollectorTest::runStringCandidatePruning(int32_t nSegs) {
     std::vector<std::string> deleted;
     int32_t docId = 0;
     for (int32_t seg = 0; seg < nSegs; seg++) {
+      CollectionHelper::UpdateBuilder batch;
       for (int32_t i = 0; i < kDocsPerSeg; i++, docId++) {
         std::string id = std::to_string(docId);
         uint32_t rand = (uint32_t)((uint32_t)docId * 2654435761u) % 200000;
@@ -4692,17 +4702,15 @@ void SortCollectorTest::runStringCandidatePruning(int32_t nSegs) {
         std::string body = (docId & 1) == 0 ? "alpha" : "other";
         std::string tieValue = "v" + std::to_string(docId % 7);
         if (docId % 13 == 0) {
-          helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
-                               "ties_s", tieValue),
-                       UpdateMessage::NO_COMMIT);
+          batch.add(flatdoc("id", id, "id_s", id, "body_w", body,
+                            "ties_s", tieValue));
         } else {
-          helper.index(flatdoc("id", id, "id_s", id, "body_w", body,
-                               "rand_s", randValue, "ties_s", tieValue),
-                       UpdateMessage::NO_COMMIT);
+          batch.add(flatdoc("id", id, "id_s", id, "body_w", body,
+                            "rand_s", randValue, "ties_s", tieValue));
         }
         if (docId % 97 == 0) deleted.push_back(id);
       }
-      helper.commit();
+      ASSERT_TRUE(helper.submit(batch.commit()).success);
     }
     ASSERT_TRUE(helper.deleteByIds(deleted, UpdateMessage::COMMIT).success);
 
@@ -4790,18 +4798,18 @@ TEST_F(SortCollectorTest, missingFirstBlocksCandidateIntervals) {
                                 : FieldComparator::MISSING_LAST;
     Status expected = missingFirst ? Status::PENDING : Status::READY;
 
-    SegmentOrdComparator seg("s_s", false, missing);
+    SegmentOrdComparator seg(false, missing, reader->field("s_s"));
     seg.growSlots(1);
-    seg.setSegment(0, &leaf.postingsReader());
+    seg.setSegment(leaf);
     seg.copy(0, segdoc(0, 0));
     seg.setBottom(0);
     FieldComparator::CompetitiveOrdState state;
     EXPECT_EQ(seg.competitiveOrdInterval(state, 0, segdoc(0, 0), 0, 1, true),
               expected);
 
-    GlobalOrdComparator glob("s_s", nullptr, false, missing);
+    GlobalOrdComparator glob(nullptr, false, missing, reader->field("s_s"));
     glob.growSlots(1);
-    glob.setSegment(0, &leaf.postingsReader());
+    glob.setSegment(leaf);
     glob.copy(0, segdoc(0, 0));
     EXPECT_EQ(glob.competitiveOrdInterval(state, 0, segdoc(0, 0), 0, 1, true),
               expected);

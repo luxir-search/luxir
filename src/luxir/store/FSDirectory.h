@@ -4,6 +4,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -13,6 +14,7 @@
 #include <xxhash.h>
 #include "Directory.h"
 #include "luxir/util/Signal.h"
+#include "luxir/util/luxir_util.h"
 
 namespace luxir {
 
@@ -25,6 +27,23 @@ class MMapInputFile : public InputFile {
   size_t sz_;
 
 public:
+  // The caller retains ownership of fd. O_DIRECT affects pread, not mmap.
+  static std::shared_ptr<InputFile> map(int fd, const std::filesystem::path& path) {
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+      throw FileIOException("MMapInputFile: fstat failed for " + path.string() + ": " + strerror(errno));
+    }
+    auto size = (size_t)st.st_size;
+    if (!size) return std::make_shared<MMapInputFile>(nullptr, 0);
+    void* mapped = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (mapped == MAP_FAILED) {
+      throw FileIOException("MMapInputFile: mmap failed for " + path.string() + ": " + strerror(errno));
+    }
+    try {
+      return std::make_shared<MMapInputFile>((char*)mapped, size);
+    } catch (...) { munmap(mapped, size); throw; }
+  }
+
   MMapInputFile(char* data, size_t size) : data_(data), sz_(size) {}
 
   ~MMapInputFile() override {
@@ -51,6 +70,93 @@ public:
 
   InputStream getInputStream() override {
     return {data_, data_ + sz_};
+  }
+};
+
+
+/// Sequential checksum of a file through its own descriptor: pread in 1 MiB
+/// chunks, never the mmap path (see Directory::openChecksum). The fd keeps
+/// the inode readable after an unlink. With O_DIRECT the chunks come from the
+/// media and leave the page cache alone; a filesystem that refuses it (tmpfs)
+/// or a read it rejects falls back to buffered reads of the same fd offset.
+class FSChecksumReader : public ChecksumReader {
+  std::filesystem::path path;
+  int fd;
+  uint64_t size_;
+  bool direct;
+
+  static constexpr size_t kChunk = 1 << 20;
+  static constexpr size_t kAlignment = 4096; // covers every common logical block size
+
+  static int openPath(const std::filesystem::path& path, bool direct) {
+    int fd = ::open(path.c_str(), O_RDONLY | (direct ? O_DIRECT : 0));
+    if (fd < 0 && direct && errno == EINVAL) fd = ::open(path.c_str(), O_RDONLY);
+    return fd;
+  }
+  [[noreturn]] static void fail(const std::filesystem::path& path, const char* operation, int error) {
+    auto message = "FSChecksumReader: " + std::string(operation) + " failed for " + path.string() + ": " + strerror(error);
+    if (error == EIO) throw FileEIOError(message);
+    throw FileIOException(message);
+  }
+  void useBuffered() {
+    int flags = fcntl(fd, F_GETFL);
+    if (flags < 0 || fcntl(fd, F_SETFL, flags & ~O_DIRECT) < 0) fail(path, "fcntl", errno);
+    direct = false;
+  }
+
+public:
+  // Null when the file does not exist.
+  static std::shared_ptr<FSChecksumReader> open(const std::filesystem::path& path, bool direct) {
+    int fd = openPath(path, direct);
+    if (fd < 0) {
+      if (errno == ENOENT) return {};
+      fail(path, "open", errno);
+    }
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+      int error = errno;
+      ::close(fd);
+      fail(path, "fstat", error);
+    }
+    // fcntl tells whether the direct open stuck (the fallback above cleared it).
+    int flags = fcntl(fd, F_GETFL);
+    try {
+      return std::make_shared<FSChecksumReader>(path, fd, (uint64_t)st.st_size, flags >= 0 && (flags & O_DIRECT));
+    } catch (...) { ::close(fd); throw; }
+  }
+  FSChecksumReader(std::filesystem::path path, int fd, uint64_t size, bool direct)
+      : path(std::move(path)), fd(fd), size_(size), direct(direct) {}
+  ~FSChecksumReader() override { ::close(fd); }
+  FSChecksumReader(const FSChecksumReader&) = delete;
+  FSChecksumReader& operator=(const FSChecksumReader&) = delete;
+
+  uint64_t size() const override { return size_; }
+  std::shared_ptr<InputFile> map() override { return MMapInputFile::map(fd, path); }
+  bool isDirect() const { return direct; }
+
+  FileCheck checksum(const std::function<void(size_t)>& progress) override {
+    void* raw = nullptr;
+    if (posix_memalign(&raw, kAlignment, kChunk) != 0) throw std::bad_alloc();
+    std::unique_ptr<void, decltype(&std::free)> buffer(raw, &std::free);
+    auto* data = (char*)raw;
+    XXH3_state_t state;
+    XXH3_64bits_reset(&state);
+    uint64_t total = 0;
+    // Reads past the recorded size too: a file that grew hashes to a mismatch
+    // instead of silently verifying its first bytes.
+    for (;;) {
+      auto n = ::pread(fd, data, kChunk, (off_t)total);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        if (direct && errno == EINVAL) { useBuffered(); continue; }
+        fail(path, "read", errno);
+      }
+      if (n == 0) break;
+      XXH3_64bits_update(&state, data, (size_t)n);
+      total += (uint64_t)n;
+      if (progress) progress((size_t)n);
+    }
+    return {total, XXH3_64bits_digest(&state)};
   }
 };
 
@@ -379,33 +485,12 @@ public:
       throw FileIOException("FSDirectory::openFile: open failed for " + path.string() + ": " + strerror(errno));
     }
 
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-      int error = errno;
-      ::close(fd);
-      throw FileIOException("FSDirectory::openFile: fstat failed for " + path.string() + ": " + strerror(error));
-    }
+    auto close = scope_guard([&] { ::close(fd); });
+    return MMapInputFile::map(fd, path);
+  }
 
-    auto sz = (size_t)st.st_size;
-    if (sz == 0) {
-      ::close(fd);
-      return std::make_shared<MMapInputFile>(nullptr, 0);
-    }
-
-    void* mapped = mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mapped == MAP_FAILED) {
-      int error = errno;
-      ::close(fd);
-      throw FileIOException("FSDirectory::openFile: mmap failed for " + path.string() + ": " + strerror(error));
-    }
-
-    ::close(fd);
-    try {
-      return std::make_shared<MMapInputFile>((char*)mapped, sz);
-    } catch (...) {
-      munmap(mapped, sz);
-      throw;
-    }
+  std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
+    return FSChecksumReader::open(filePath(name), direct);
   }
 
   std::unique_ptr<File> createFile(std::string_view name) override {

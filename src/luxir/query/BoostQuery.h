@@ -26,6 +26,10 @@ public:
     }
   }
 
+  bool recoverableAsPredicate() const noexcept override {
+    return child->recoverableAsPredicate();
+  }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const BoostQuery&>(other);
     return sameScoringClause(this, &rhs);
@@ -60,9 +64,7 @@ public:
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags,
-                              float multiplier = 1.0f) override {
-    return child->createWeight(context, flags, multiplier * boost);
-  }
+                              float multiplier = 1.0f) override;
 };
 
 inline const Query* peelBoost(const Query* query, float& boost) {

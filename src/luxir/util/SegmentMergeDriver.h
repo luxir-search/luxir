@@ -4,6 +4,7 @@
 #pragma once
 #include <functional>
 #include <memory>
+#include <type_traits>
 
 #include "AtomicMerger.h"
 
@@ -31,7 +32,10 @@ class SegmentMergeDriver {
 
 public:
   SegmentMergeDriver(size_t numSegs, std::function<void(std::unique_ptr<T>)> onComplete)
-    : numSegs(numSegs), onComplete(std::move(onComplete)) {}
+    : merger({}, [](T* data) { delete data; }),
+      numSegs(numSegs), onComplete(std::move(onComplete)) {
+    if constexpr (std::is_default_constructible_v<T>) setCreator([]() { return new T; });
+  }
 
   // Optional custom storage creator (e.g. to pre-wire per-bucket calculators).
   void setCreator(std::function<T*()> creator) { merger.creator = std::move(creator); }

@@ -84,10 +84,9 @@ protected:
     constexpr bool hasPositions = Tier == DocsEnumTier::POSITIONS;
     ASSERT_EQ(1u, index.reader->segments().size());
     Segment& segment = index.reader->segments()[0];
-    FieldReader fieldReader(segment.postingsReader());
-    ASSERT_TRUE(fieldReader.seek(field));
-    SegFieldInfo fieldInfo;
-    fieldReader.readFieldInfo(fieldInfo);
+    auto* fieldReader = segment.postingsReader().fieldInfo(field);
+    ASSERT_TRUE((fieldReader != nullptr));
+    const auto& fieldInfo = *fieldReader;
     ASSERT_EQ(hasFreqs, FieldType::hasFreqs(fieldInfo.flags));
     ASSERT_EQ(hasPositions, FieldType::hasPositions(fieldInfo.flags));
     ASSERT_FALSE(fieldInfo.rangeTableLoc.isNull());
@@ -153,10 +152,9 @@ protected:
     for (Segment* source : sources) {
       Segment& segment = *source;
       std::vector<int32_t> sourceIds((size_t) segment.maxDoc(), -1);
-      FieldReader fieldReader(segment.postingsReader());
-      ASSERT_TRUE(fieldReader.seek("pos"));
-      SegFieldInfo fieldInfo;
-      fieldReader.readFieldInfo(fieldInfo);
+      auto* fieldReader = segment.postingsReader().fieldInfo("pos");
+      ASSERT_TRUE((fieldReader != nullptr));
+      const auto& fieldInfo = *fieldReader;
       TermsEnum terms(index.pool, segment.postingsReader(), fieldInfo);
       while (terms.nextTerm()) {
         std::string_view term(terms.term());

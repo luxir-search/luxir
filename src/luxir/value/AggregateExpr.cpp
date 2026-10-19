@@ -230,15 +230,24 @@ void writeAggregateValue(api::Val& target, const BucketScalar& value) {
   target.kind.emplace<int64_t>((int64_t)value.intValue);
 }
 
+std::span<const ValueFieldInfos> resolveAggregateFields(
+    const AggregateProgram& program, MemPool& pool, IndexReader& reader) {
+  auto fields = pool.make_span<ValueFieldInfos>(program.leaves.size());
+  for (size_t i = 0; i < fields.size(); i++) {
+    fields[i] = program.leaves[i].input->resolveFields(pool, reader);
+  }
+  return fields;
+}
+
 std::vector<BoundAggregateInput> bindAggregateInputs(
     const AggregateProgram& program, MemPool& pool,
-    IndexReader::Segment& segment) {
+    IndexReader::Segment& segment, std::span<const ValueFieldInfos> fields) {
   std::vector<BoundAggregateInput> bindings;
   bindings.reserve(program.leaves.size());
   for (uint32_t index = 0; index < program.leaves.size(); index++) {
     const AggregateLeaf& leaf = program.leaves[index];
     const ValueNode& root = leaf.input->root();
-    BoundValueProgram* values = leaf.input->bind(pool, segment);
+    BoundValueProgram* values = leaf.input->bind(pool, segment, fields[index]);
     bool bareColumn = root.kind == ValueNodeKind::COLUMN
         && !valueArray(root.type);
     BoundValueNode& rootBinding = values->nodes[leaf.input->rootNode];
