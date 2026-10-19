@@ -270,6 +270,8 @@ publication advances the schema generation.
 | `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
+| `index_options` | `text` only: `positions` (default), `freqs`, or `docs`, what the postings record per term; see [Postings detail and norms](#postings-detail-and-norms) |
+| `norms` | `text` only: keep per-document length norms for scoring; default `true`, always off at `docs`; see [Postings detail and norms](#postings-detail-and-norms) |
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
@@ -391,6 +393,49 @@ accent folding without possessive removal or stemming. Neither
 
 For Unicode text without English stemming, use `_un`, or configure
 `unicode_word` with `["nfkc_cf", "fold"]` to retain accent folding as well.
+
+## Postings detail and norms
+
+`index_options` chooses what a `text` field records for each term:
+
+| Value | Records | Phrase queries | Term scoring |
+|---|---|---|---|
+| `positions` (default) | documents, term frequencies, positions | yes | BM25 |
+| `freqs` | documents, term frequencies | verified against the stored source | BM25 |
+| `docs` | documents only | verified against the stored source | every match counts one occurrence; no norms |
+
+`norms: false` drops the per-document length norm. BM25 then scores every
+document as if it had the average field length, so a short and a long value
+with the same term frequency score alike. Norms need term frequencies: `docs`
+never keeps them and rejects `norms: true`.
+
+Term, match, prefix, wildcard, regex, fuzzy, and exists queries work at every
+level. Positions are usually the largest part of a text field's postings, so
+dropping them saves the most space and indexing time.
+
+A phrase on a field whose definition lacks positions is verified against the
+logical field's stored source (`stored`, on by default for `text`), as
+Elasticsearch's `match_only_text` does. Documents containing every phrase term
+are the candidates. Each candidate that passes the query's other clauses has
+its stored value(s) re-analyzed with the field's analyzer and must contain the
+phrase under the same slop and multi-valued position gap rules as an indexed
+phrase. This applies to `phrase` queries and to phrases written in `expr` and
+`simple_query` strings. A verified phrase scores like the conjunction of its
+terms: matches are not ranked by phrase frequency. Verification reads and
+re-analyzes each candidate, so it costs far more per document than an indexed
+phrase; put selective filters beside it. Segments that have no stored source
+for the field match nothing. Without a stored source, a phrase on the field
+fails with an error.
+
+For log messages or other text that is searched by term and only sometimes
+phrase-matched, a match-only definition is much smaller:
+
+```json
+{"fields": {"message": {"type": "text", "index_options": "docs", "norms": false}}}
+```
+
+See [Changes to a live collection](#changes-to-a-live-collection) for what
+happens to existing segments when these settings change.
 
 ## Field variants
 
@@ -693,11 +738,13 @@ GET /collections/authors/_schema?view=resolved
           "column": false,
           "coverage_complete": false,
           "index": "match",
+          "index_options": "positions",
           "introduced_generation": 1,
           "long_terms": "hash128",
           "multi": false,
           "name": "inherited",
           "normalizer": null,
+          "norms": true,
           "oldest_generation": 0,
           "stored": true,
           "stored_resource": "_stored_",
@@ -718,7 +765,7 @@ field.) The resolved view is diagnostic, not a schema write body. It contains:
 | `fields` | Declared concrete fields and their variants; suffix-template instances are not listed. |
 | `fields.<f>.bindings` | `search` and `value`, each naming the effective physical field. |
 | `fields.<f>.representations` | Definitions keyed by `self` or variant label. |
-| Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer`, `normalizer`, effective `long_terms` for term-backed representations, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
+| Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer`, `normalizer`, effective `long_terms` for term-backed representations, `index_options` and `norms` for indexed text, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
 | `ann` (vector representations) | Effective ANN settings in the authored vocabulary, including defaults and inherited values. Contains `codec`, `nlist`, and only the selected codec's `pq` or `rabitq` object. Zero `nlist` and `pq.m` retain their automatic policies. ANN-only changes preserve introduction and coverage generations. |
 | `introduced_generation` | Start of this representation's current continuous availability. Redefining a representation or removing and re-adding its label starts a new introduction. |
 | `oldest_generation` | Minimum schema generation across all committed live segments, even those lacking this field; `null` for an empty index. |
@@ -742,6 +789,15 @@ Reindex from your source data, then select the new variant explicitly or set
 pinned, retain it in the `defaults` object and omit only the other. Older
 documents without a new `author__s` variant will not match its exact queries
 or appear in its facet buckets.
+
+Changing `index_options` or `norms` applies to newly indexed documents; older
+segments are queried as written. While the definition has positions, a
+phrase finds no matches in segments written without them; once it drops
+positions, every segment is verified against the stored source. Segments
+without norms score without length normalization. A merge keeps a level or norms only when the current definition
+and every merged segment have them. Lowering a setting therefore shrinks older
+segments as they merge, while raising one reaches merged segments only once
+every merged segment already has it: reindex older documents to upgrade them.
 
 Schema edits are not checked for compatibility with existing data. To change
 a field's type or analysis, use a new field or variant label and reindex.

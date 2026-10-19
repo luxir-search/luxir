@@ -1003,6 +1003,8 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.defaults"></a>[`defaults`](#field-luxir.fielddef.defaults) | 14 | [`FieldDefaults`](#message-luxir.fielddefaults) | singular | default search and value representations |
 | <a id="field-luxir.fielddef.normalizer"></a>[`normalizer`](#field-luxir.fielddef.normalizer) | 15 | [`NormalizerDef`](#message-luxir.normalizerdef) | singular | whole-value STRING normalization |
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
+| <a id="field-luxir.fielddef.index_options"></a>[`index_options`](#field-luxir.fielddef.index_options) | 17 | [`FieldDef.IndexOptions`](#enum-luxir.fielddef.indexoptions) | optional | absent: inherit from parent, else positions |
+| <a id="field-luxir.fielddef.norms"></a>[`norms`](#field-luxir.fielddef.norms) | 18 | `bool` | optional | TEXT only: keep per-document length norms for BM25. false scores every document as if it had the average field length. Requires FREQS or POSITIONS. Absent: inherit from parent, else true (false at DOCS). |
 | <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
 
@@ -2482,6 +2484,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`Error.Kind`](#enum-luxir.error.kind)
 - [`FieldDef.FieldClass`](#enum-luxir.fielddef.fieldclass)
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
+- [`FieldDef.IndexOptions`](#enum-luxir.fielddef.indexoptions)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
 - [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit)
 - [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
@@ -2588,6 +2591,20 @@ Index acceleration. Numeric Match/Range and geographic predicates can scan a col
 | <a id="value-luxir.fielddef.indexmode.none"></a>[`NONE`](#value-luxir.fielddef.indexmode.none) | 0 | no index |
 | <a id="value-luxir.fielddef.indexmode.match"></a>[`MATCH`](#value-luxir.fielddef.indexmode.match) | 1 | term index for STRING/TEXT/ID, including term ranges |
 | <a id="value-luxir.fielddef.indexmode.range"></a>[`RANGE`](#value-luxir.fielddef.indexmode.range) | 2 | numeric Match/Range or GEO\_POINT predicates; requires column=true |
+
+<a id="enum-luxir.fielddef.indexoptions"></a>
+
+### luxir.FieldDef.IndexOptions
+
+TEXT only: what the postings record per term. Lower levels are smaller and index faster. Phrase queries need POSITIONS; at DOCS every match scores with term frequency 1. A change applies to newly indexed documents; a merge keeps only what both the current schema and every merged segment have.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.fielddef.indexoptions.docs"></a>[`DOCS`](#value-luxir.fielddef.indexoptions.docs) | 0 | doc ids only; every match has term frequency 1, no norms |
+| <a id="value-luxir.fielddef.indexoptions.freqs"></a>[`FREQS`](#value-luxir.fielddef.indexoptions.freqs) | 1 | doc ids and term frequencies |
+| <a id="value-luxir.fielddef.indexoptions.positions"></a>[`POSITIONS`](#value-luxir.fielddef.indexoptions.positions) | 2 | doc ids, term frequencies and positions |
 
 <a id="enum-luxir.fielddef.longterms"></a>
 

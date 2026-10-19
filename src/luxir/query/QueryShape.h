@@ -50,6 +50,7 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
       return Query::ScoreProfile::automatic(1.0f);
     case QueryKind::TERM:
     case QueryKind::PHRASE:
+    case QueryKind::STORED_PHRASE:
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
     case QueryKind::KNN:
@@ -78,6 +79,7 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
           *static_cast<const RescoreQuery&>(query).getChild());
     case QueryKind::TERM:
     case QueryKind::PHRASE:
+    case QueryKind::STORED_PHRASE:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
     case QueryKind::KNN:
@@ -118,6 +120,7 @@ inline bool exactDomainIdentity(const Query& query) {
       return true;
     case QueryKind::TERM:
     case QueryKind::PHRASE:
+    case QueryKind::STORED_PHRASE:
     case QueryKind::BOOLEAN:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
@@ -162,6 +165,7 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::NONE:
       return true;
     case QueryKind::PHRASE:
+    case QueryKind::STORED_PHRASE:
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
@@ -203,6 +207,7 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
     case QueryKind::TERM:
       return Query::VerificationWork::ABSENT;
     case QueryKind::PHRASE:
+    case QueryKind::STORED_PHRASE:
       return Query::VerificationWork::PRESENT;
     case QueryKind::BOOLEAN:
       return static_cast<const BooleanQuery&>(query)

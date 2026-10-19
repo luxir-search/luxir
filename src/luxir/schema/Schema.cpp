@@ -22,6 +22,7 @@ namespace luxir {
 using FieldClass = luxir::api::FieldDef_::FieldClass;
 using IndexMode = luxir::api::FieldDef_::IndexMode;
 using LongTerms = luxir::api::FieldDef_::LongTerms;
+using IndexOptions = luxir::api::FieldDef_::IndexOptions;
 using StoredCodec = luxir::api::StoredResourceDef_::Codec;
 using VectorMetric = luxir::api::VectorMetric;
 
@@ -42,6 +43,8 @@ struct ResolvedField {
   bool hasIndex = false;
   IndexMode index = IndexMode::NONE;
   std::optional<LongTerms> longTerms;
+  std::optional<IndexOptions> indexOptions;
+  std::optional<bool> norms;
   bool hasColumn = false;
   bool column = false;
   // The authored analyzer in force: the first non-empty AnalyzerDef in the
@@ -189,6 +192,14 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     throw SchemaError("unknown long_terms value " + std::to_string((int)*r.longTerms) +
                       " (field: " + std::string(name) + "); valid: hash128, truncate, reject");
   }
+
+  r.indexOptions = def.index_options ? def.index_options : parentResolved.indexOptions;
+  if (r.indexOptions && *r.indexOptions != IndexOptions::DOCS && *r.indexOptions != IndexOptions::FREQS
+      && *r.indexOptions != IndexOptions::POSITIONS) {
+    throw SchemaError("unknown index_options value " + std::to_string((int)*r.indexOptions) +
+                      " (field: " + std::string(name) + "); valid: docs, freqs, positions");
+  }
+  r.norms = def.norms ? def.norms : parentResolved.norms;
 
   // column
   if (def.column.has_value()) {
@@ -504,6 +515,17 @@ struct FieldCompiler {
       }
     }
 
+    // Postings shape for analyzed text. Like long_terms, TEXT accepts these
+    // independently of its index mode so templates can carry them.
+    if ((r.indexOptions || r.norms) && r.type != FieldClass::TEXT) {
+      throw SchemaError(std::string(r.indexOptions ? "index_options" : "norms") +
+                        " is only valid for text fields (field: " + std::string(name) + ")");
+    }
+    IndexOptions indexOptions = r.indexOptions.value_or(IndexOptions::POSITIONS);
+    if (indexOptions == IndexOptions::DOCS && r.norms.value_or(false)) {
+      throw SchemaError("norms require index_options freqs or positions (field: " + std::string(name) + ")");
+    }
+
     // Reject index modes the engine cannot honor. RANGE covers 1-D numeric
     // ranges and 2-D GEO_POINT boxes; both require a column in this phase.
     bool numericClass = r.type == FieldClass::INT || r.type == FieldClass::FLOAT ||
@@ -542,7 +564,12 @@ struct FieldCompiler {
     FieldType::flag_type flags = 0;
     if (index == IndexMode::MATCH) {
       if (r.type == FieldClass::TEXT) {
-        flags |= FieldType::INDEX_DOCS_FREQS_POSITIONS;
+        switch (indexOptions) {
+          case IndexOptions::DOCS: flags |= FieldType::INDEX_DOCS; break;
+          case IndexOptions::FREQS: flags |= FieldType::INDEX_DOCS_FREQS; break;
+          case IndexOptions::POSITIONS: flags |= FieldType::INDEX_DOCS_FREQS_POSITIONS; break;
+        }
+        if (!r.norms.value_or(true)) flags |= FieldType::OMIT_NORMS;
       } else {
         flags |= FieldType::INDEX_DOCS;
       }

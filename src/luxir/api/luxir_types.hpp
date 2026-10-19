@@ -121,6 +121,7 @@ namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
+enum class IndexOptions { DOCS = 0, FREQS = 1, POSITIONS = 2 };
 }
 namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1 }; }
 namespace StoredResourceDef_ { enum class Codec { LZ4 = 0, ZSTD = 1 }; }
@@ -260,6 +261,7 @@ struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
   using IndexMode = luxir::api::FieldDef_::IndexMode;
   using LongTerms = luxir::api::FieldDef_::LongTerms;
+  using IndexOptions = luxir::api::FieldDef_::IndexOptions;
   using Metric = luxir::api::VectorMetric;
   std::string_view parent;
   std::optional<AnalyzerDef> analyzer;                          // align 8
@@ -271,6 +273,7 @@ struct FieldDef {
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<LongTerms> long_terms;                          // align 4 (enum)
+  std::optional<IndexOptions> index_options;                    // align 4 (enum)
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<std::int32_t> truncate_dims;                    // align 4
   std::optional<Metric> metric;                                 // align 4 (enum)
@@ -279,6 +282,7 @@ struct FieldDef {
   std::optional<bool> stored;
   std::optional<bool> normalized;
   std::optional<bool> normalize_on_write;
+  std::optional<bool> norms;
 };
 struct AuxStats {
   std::string_view kind;

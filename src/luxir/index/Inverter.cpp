@@ -101,7 +101,11 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
 
   switch (fieldType->type()) {
     case FieldType::Type::TEXT:
-      fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
+      if (fieldType->hasPositions()) {
+        fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
+      } else {
+        fieldHandler = pool.make_unique<handler::PositionlessTextHandler>(*this, name, fieldType);
+      }
       break;
     case FieldType::Type::ID:
       fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType);

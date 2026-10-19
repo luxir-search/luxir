@@ -64,6 +64,7 @@ enum class QueryKind : uint8_t {
   ALL,
   NONE,
   RESCORE,
+  STORED_PHRASE,
   MIN_SCORE,
   TEST,
 };
@@ -335,6 +336,20 @@ struct CachedFieldInfo {
   boost::unordered_node_map<std::string_view, CachedTermInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
 
   explicit CachedFieldInfo(MemPool& pool, size_t initialMapSize=4) : termInfos(initialMapSize, pool.getAllocator()) {}
+
+  // Text segments written without length norms (norms: false or index_options: docs)
+  // score with Similarity::getNormFreeScorer.
+  static bool normFree(const SegFieldInfo& info) {
+    return info.type == FieldType::TEXT && info.normsFormat == SegFieldInfo::NORMS_NONE;
+  }
+
+  bool anyNormFree() const {
+    for (size_t i = 0; i < segInfos.size(); i++) {
+      auto* info = segInfos.at(i);
+      if (info != nullptr && normFree(*info)) return true;
+    }
+    return false;
+  }
 };
 
 

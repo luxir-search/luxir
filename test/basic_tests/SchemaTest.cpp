@@ -1206,6 +1206,57 @@ TEST_F(SchemaTest, longTermsRequiresEligibleTypeAndKnownPolicy) {
   EXPECT_NO_THROW(schemaJson(R"({"fields":{"body":{"type":"text","index":"none","long_terms":"reject"}}})"));
 }
 
+TEST_F(SchemaTest, indexOptionsAndNormsMapToPostingFlags) {
+  auto s = schemaJson(R"({"templates":{"_m":{"type":"text","index_options":"docs","norms":false}},
+    "fields":{
+      "body":"text",
+      "docs":{"type":"text","index_options":"docs"},
+      "freqs":{"type":"text","index_options":"freqs","norms":false},
+      "lean":{"type":"text","norms":false},
+      "child":{"parent":"_m","index_options":"positions"}
+    }})");
+  auto flags = [&](std::string_view name) { return s->physical(name)->segmentFlags(); };
+  EXPECT_TRUE(FieldType::hasPositions(flags("body")));
+  EXPECT_TRUE(FieldType::hasNorms(flags("body")));
+  EXPECT_FALSE(FieldType::hasFreqs(flags("docs")));
+  EXPECT_FALSE(FieldType::hasNorms(flags("docs")));
+  EXPECT_FALSE(FieldType::hasFreqs(flags("log_m")));
+  EXPECT_TRUE(FieldType::hasFreqs(flags("freqs")));
+  EXPECT_FALSE(FieldType::hasPositions(flags("freqs")));
+  EXPECT_FALSE(FieldType::hasNorms(flags("freqs")));
+  EXPECT_TRUE(FieldType::hasPositions(flags("lean")));
+  EXPECT_FALSE(FieldType::hasNorms(flags("lean")));
+  EXPECT_TRUE(FieldType::hasPositions(flags("child")));
+  EXPECT_FALSE(FieldType::hasNorms(flags("child")));
+  EXPECT_EQ("\"docs\"", s->signatures().at("docs").properties.at("index_options"));
+  EXPECT_EQ("false", s->signatures().at("lean").properties.at("norms"));
+  EXPECT_NE(schemaJson(R"({"fields":{"body":"text"}})")->signatures().at("body").properties,
+            schemaJson(R"({"fields":{"body":{"type":"text","norms":false}}})")->signatures().at("body").properties);
+
+  auto json = authoredJson(*s);
+  EXPECT_NE(std::string::npos, json.find("\"index_options\":\"docs\""));
+  EXPECT_NE(std::string::npos, json.find("\"norms\":false"));
+  EXPECT_EQ(s->sourceDef_, schemaJson(json)->sourceDef_);
+}
+
+TEST_F(SchemaTest, indexOptionsAndNormsAreTextOnly) {
+  for (auto property : {R"("index_options":"docs")", R"("norms":false)"}) {
+    for (auto type : {"string", "int", "date", "vector", "geo_point"}) {
+      auto json = std::format(R"({{"fields":{{"bad":{{"type":"{}",{}}}}}}})", type, property);
+      SCOPED_TRACE(json);
+      EXPECT_THROW(schemaJson(json), SchemaError);
+    }
+  }
+  EXPECT_THROW(schemaJson(R"({"fields":{"bad":{"type":"text","index_options":"docs","norms":true}}})"),
+               SchemaError);
+  EXPECT_THROW(schemaJson(R"({"fields":{"bad":{"type":"text","index_options":"offsets"}}})"),
+               std::runtime_error);
+  SchemaBuilder b;
+  b.field("bad").type = FieldClass::TEXT;
+  b.field("bad").index_options = (api::FieldDef::IndexOptions) 7;
+  EXPECT_THROW(b.build(), SchemaError);
+}
+
 static const StoredFieldType& storedType(const Schema& s, std::string_view name) {
   auto* type = dynamic_cast<const StoredFieldType*>(s.getFieldTypePtr(name));
   if (!type) throw std::runtime_error("no stored resource " + std::string(name));

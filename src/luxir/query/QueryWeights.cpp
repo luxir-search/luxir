@@ -22,6 +22,7 @@
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/RescoreQuery.h"
+#include "luxir/query/StoredPhraseQuery.h"
 #include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/query/TermRangeQuery.h"
@@ -162,6 +163,11 @@ Query::Weight* RescoreQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
   return context.pool.make<RescoreQuery::Weight>(
       context, *this, flags, multiplier);
+}
+
+Query::Weight* StoredPhraseQuery::createWeight(Context& context, int32_t flags,
+                                               float multiplier) {
+  return context.pool.make<StoredPhraseQuery::Weight>(context, *this, flags, multiplier);
 }
 
 FilteredTermsEnum* TermInSetQuery::createFilteredEnum(MemPool& pool,
