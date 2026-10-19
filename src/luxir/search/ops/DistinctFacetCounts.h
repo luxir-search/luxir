@@ -255,6 +255,7 @@ public:
       DistinctFacetMode requested, const RangeFacetGrid& grid, FacetDimension groups,
       size_t pagedLimit = 32ULL << 20, size_t bucketCap = 100000,
       bool isContiguous = false);
+  size_t residentBytes() const { return resource.bytes() + (window ? window->residentBytes() : 0); }
   DistinctFacetMode selectedMode() const { return mode; }
   size_t conversionCount() const { return conversions; }
   const RangeFacetCellWindow<uint64_t**>* cellWindow() const { return window.get(); }

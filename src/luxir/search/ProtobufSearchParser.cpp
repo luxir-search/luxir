@@ -108,7 +108,6 @@ struct SearchParserImpl {
   // in addSubs, the single funnel for op recursion.
   const int maxOpDepth;
   static constexpr size_t MAX_RANGE_BUCKETS = 100000;
-  static constexpr size_t MAX_SUBOP_RANGE_BUCKETS = 1024;
 
   enum class TopDocsPlacement : uint8_t {
     ROOT_OP,
@@ -686,12 +685,6 @@ public:
             + "': range start and end are required unless bounds is DATA");
       }
     }
-    // DATA children already have independent bindings. Their own result
-    // children need the binding-owned layout/domain producer (next checkpoint).
-    if (dataBounds && !facetReq.ops.empty()) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': bounds DATA with sub-ops is not supported yet");
-    }
     if (std::holds_alternative<std::monostate>(facetReq.gap_kind)) {
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': range gap or calendar_gap is required");
@@ -731,18 +724,6 @@ public:
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': mincount must be >= 0");
     }
-
-    // With sub-ops, every bucket carries a domain builder per segment plus
-    // per-bucket response slots, so the cap sits far below the plain-counting
-    // bucket limit.
-    auto checkSubOpBucketCap = [&](const ParsedFences& parsed) {
-      if (!facetReq.ops.empty()
-          && parsed.values.size() - 1 > MAX_SUBOP_RANGE_BUCKETS) {
-        throw std::runtime_error("facet '" + std::string(facetName)
-            + "': range facets with sub-ops are limited to "
-            + std::to_string(MAX_SUBOP_RANGE_BUCKETS) + " buckets");
-      }
-    };
 
     TimeZone zone = TimeZone::utc();
     if (fieldType->type() == FieldType::Type::DATE) {
@@ -863,7 +844,6 @@ public:
         return facet;
       }
       auto parsed = makeGridFences(facetName, grid, *encodedStart, *encodedEnd, true);
-      checkSubOpBucketCap(parsed);
       auto selected = resolveSelectedBuckets(parsed, [&](const api::Val& value) {
         double canonical = floatingValue(value, "selected value");
         return fieldType->type() == FieldType::Type::FLOAT
@@ -929,7 +909,6 @@ public:
       return facet;
     }
     auto parsed = makeGridFences(facetName, grid, *givenStart, *givenEnd, true);
-    checkSubOpBucketCap(parsed);
 
     auto selected = resolveSelectedBuckets(parsed, [&](const api::Val& value) {
       return intBound(value);

@@ -6641,13 +6641,14 @@ TEST_F(FacetTest, dataIntegerMatchesExplicitAcrossExecutionPaths) {
       if (phase) {
         ASSERT_TRUE(helper.deleteByIds({"1", "2", "3", "4"}, UpdateMessage::COMMIT).success);
       }
-      for (int parallel : {1, -1}) for (int mincount : {0, 2}) {
+      for (int parallel : {1, -1}) for (int mincount : {0, 2}) for (bool metrics : {false, true}) {
         auto req = localReq(helper.getSearchEngine());
         req->collection("main");
         auto& data = req->rangeFacet("data", "n_i").rangeData(10, 3, -97, 103).mincount(mincount);
         auto& explicitRange = req->rangeFacet("explicit", "n_i").range(-97, 103, 10).mincount(mincount);
         for (OpCursor* cursor : {&data, &explicitRange}) {
           std::get<api::RangeFacet>(cursor->rawOp().kind).missing = true;
+          if (metrics) cursor->avg("avg", "score_i");
         }
         req->execute(parallel);
         ASSERT_OK(req);
@@ -6869,14 +6870,14 @@ TEST_F(FacetTest, dataNestedBindingsHaveIndependentExtents) {
   }
 }
 
-TEST_F(FacetTest, dataSubOpsRejectedUntilBindingLayoutProducer) {
+TEST_F(FacetTest, dataMetricUsesBindingLayout) {
   CollectionHelper helper;
   indexInts(helper, {15});
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").rangeFacet("h", "n_i").rangeData(10).avg("mean", "n_i");
   req->execute(false);
-  EXPECT_FALSE(req->ok());
-  EXPECT_NE(std::string::npos, req->errorMsg().find("bounds DATA with sub-ops"));
+  ASSERT_OK(req);
+  EXPECT_DOUBLE_EQ(15, metricValues(rootFacetResult(*req, "h"), "mean")[0].asDouble());
 }
 
 // The oracle enumerates the actual matching values, not segment metadata or
@@ -7047,5 +7048,291 @@ TEST_F(FacetTest, dataWindowAndLayoutMemoryAreReleased) {
     if (!req->ok()) { EXPECT_NE(std::string::npos, req->errorMsg().find("request memory breaker")); }
     EXPECT_GT(req->memoryTracker.peak(), 0u);
     EXPECT_EQ(0u, req->memoryTracker.bytes());
+  }
+}
+
+TEST_F(FacetTest, rangeSubOpCapCountsEmittedBuckets) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 1025; i++) docs.push_back(flatdoc("id", std::to_string(i), "n_i", i));
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  for (int parallel : {1, -1}) for (bool data : {false, true}) {
+    for (int emitted : {1024, 1025}) for (int mincount : {0, 1, 2}) {
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("main");
+      auto& top = req->topDocs("q").limit(0).exprQuery(emitted == 1024 ? "n_i:<1024" : "*:*" );
+      auto& facet = top.rangeFacet("h", "n_i").mincount(mincount);
+      if (data) facet.rangeData(1);
+      else facet.range(0, 2000, 1);
+      facet.avg("avg", "n_i");
+      req->execute(parallel);
+      bool ok = mincount == 2 || (emitted == 1024 && (data || mincount == 1));
+      EXPECT_EQ(ok, req->ok()) << req->toString();
+      if (!ok) { EXPECT_NE(std::string::npos, req->errorMsg().find("limited to 1024")); }
+      else EXPECT_EQ(mincount == 2 ? 0u : 1024u, topFacetResult(*req, "q", "h").counts.size());
+    }
+  }
+}
+
+TEST_F(FacetTest, dataResultChildrenMatchExplicit) {
+  for (auto type : {api::FieldDef::FieldClass::INT, api::FieldDef::FieldClass::DATE,
+                    api::FieldDef::FieldClass::FLOAT, api::FieldDef::FieldClass::DOUBLE}) {
+    CollectionHelper helper;
+    helper.clear();
+    setRangeFacetSchema(helper, std::array{RangeSchemaField{"value", true, true, type}});
+    bool date = type == api::FieldDef::FieldClass::DATE;
+    bool fp = type == api::FieldDef::FieldClass::FLOAT || type == api::FieldDef::FieldClass::DOUBLE;
+    int64_t start = date ? epoch("2024-03-09T05:00Z") : 0;
+    int64_t end = date ? epoch("2024-03-12T04:00Z") : 100;
+    int64_t gap = date ? 86400000 : 10;
+    for (int i = 0; i < 12; i++) {
+      int64_t value = date ? start + i * 6 * 3600000 : i * 7;
+      Doc doc = flatdoc("id", std::to_string(i), "score_i", i + 1, "tag_s", i % 2 ? "a" : "b");
+      if (i % 5 != 0) {
+        if (fp) doc.emplace_back("value", std::vector<double>{(double)value + 0.25, (double)value + 0.5});
+        else doc.emplace_back("value", std::vector<int64_t>{value, value + 1});
+      }
+      ASSERT_TRUE(helper.index(doc, i % 4 == 3 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT).success);
+    }
+    ASSERT_TRUE(helper.deleteById("3", UpdateMessage::COMMIT).success);
+    for (int parallel : {1, -1}) for (bool filtered : {false, true}) {
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("main").timeZone("America/New_York");
+      auto& top = req->topDocs("q").limit(0).exprQuery(filtered ? "tag_s:a" : "*:*" );
+      for (bool data : {false, true}) {
+        auto& facet = top.rangeFacet(data ? "data" : "explicit", "value");
+        if (fp) facet.rangeFp((double)start, (double)end, (double)gap);
+        else facet.range(start, end, gap);
+        if (data) std::get<api::RangeFacet>(facet.rawOp().kind).bounds = api::RangeFacet_::Bounds::DATA;
+        std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
+        facet.avg("avg", "score_i");
+        facet.facet("tags", "tag_s").limit(-1);
+        auto& hits = facet.topDocs("hits").allQuery().limit(-1).fields({"id"}).getNumber();
+        qb::sort(hits, "id", qb::ASC);
+      }
+      req->execute(parallel);
+      ASSERT_OK(req);
+      std::vector<std::byte> a, b;
+      ASSERT_TRUE(api::encode(topFacetResult(*req, "q", "data"), a));
+      ASSERT_TRUE(api::encode(topFacetResult(*req, "q", "explicit"), b));
+      EXPECT_EQ(a, b) << "type=" << (int)type << " filtered=" << filtered;
+    }
+  }
+}
+
+TEST_F(FacetTest, dataNestingMatchesPerInstanceOracle) {
+  CollectionHelper helper;
+  struct Row { const char* id; int parent; const char* group; std::vector<int64_t> values; int score; };
+  const std::vector<Row> rows{
+      {"a", 0, "g1", {15, 17}, 10}, {"b", 0, "g1", {27}, 20},
+      {"c", 1, "g2", {95}, 30}, {"d", 1, "g3", {105, 108}, 40},
+      {"e", 2, "g4", {}, 50}, {"f", 0, "g5", {15, 105}, 60}};
+  for (size_t i = 0; i < rows.size(); i++) {
+    const auto& row = rows[i];
+    Doc doc = flatdoc("id", row.id, "p_i", row.parent, "p_s", std::to_string(row.parent),
+        "group_s", row.group, "score_i", row.score);
+    if (!row.values.empty()) doc.emplace_back("n_is", row.values);
+    ASSERT_TRUE(helper.index(doc, i % 3 == 2 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT).success);
+  }
+  auto check = [&](const api::FacetResult& result, auto includes, bool widen) {
+    std::map<int64_t, int64_t> counts;
+    std::map<int64_t, std::set<size_t>> docs;
+    int missing = 0;
+    for (size_t i = 0; i < rows.size(); i++) if (includes(rows[i])) {
+      if (rows[i].values.empty()) missing++;
+      for (int64_t value : rows[i].values) { counts[value / 10 * 10]++; docs[value / 10 * 10].insert(i); }
+    }
+    Bounds bounds;
+    Counts expected;
+    if (widen || !counts.empty()) {
+      int64_t lo = widen ? 0 : counts.begin()->first, hi = widen ? 120 : counts.rbegin()->first;
+      for (int64_t cell = lo; cell <= hi; cell += 10) { bounds.emplace_back(cell, cell + 10); expected.push_back(counts[cell]); }
+    }
+    EXPECT_EQ(bounds, boundsOf(result));
+    EXPECT_EQ(expected, countsOf(result));
+    EXPECT_EQ(missing, result.missing.value_or(-1));
+    if (bounds.empty()) { EXPECT_TRUE(result.ops.empty()); return; }
+    auto means = metricValues(result, "avg");
+    for (size_t i = 0; i < bounds.size(); i++) {
+      auto& members = docs[bounds[i].first];
+      if (members.empty()) EXPECT_TRUE(means[i].isNull());
+      else {
+        int sum = 0;
+        for (size_t doc : members) sum += rows[doc].score;
+        EXPECT_DOUBLE_EQ((double)sum / members.size(), means[i].asDouble());
+      }
+    }
+  };
+  for (int parallel : {1, -1}) for (bool widen : {false, true}) {
+    std::string child = R"("h":{"range_facet":{"field":"n_is","bounds":"data","gap":10,"missing":true,"count_unit":"docs")"
+        + std::string(widen ? ",\"start\":0,\"end\":130" : "") + R"json(,"ops":{"avg":"avg(score_i)"}}})json";
+    for (std::string parent : {
+        R"("field_facet":{"field":"p_s","limit":-1,"ops":{)" + child + "}}",
+        R"("field_facet":{"field":"p_i","limit":-1,"ops":{)" + child + "}}",
+        R"("range_facet":{"field":"p_i","start":0,"end":3,"gap":1,"ops":{)" + child + "}}",
+        R"("range_facet":{"field":"p_i","bounds":"data","gap":1,"ops":{)" + child + "}}",
+        R"("query_facet":{"buckets":{"0":"p_i:0","1":"p_i:1","2":"p_i:2","3":"id:none"},"ops":{)" + child + "}}"}) {
+      auto req = localReq(helper.getSearchEngine());
+      std::string json = R"({"collection":"main","ops":{"p":{)" + parent + "}}}";
+      ASSERT_TRUE(api::read_json(req->rawRequest(), json, req->mr)) << json;
+      req->execute(parallel);
+      ASSERT_OK(req);
+      const auto& p = rootFacetResult(*req, "p");
+      auto children = metricValues(p, "h");
+      for (size_t i = 0; i < children.size(); i++) {
+        int key = std::visit([&](const auto& ids) -> int {
+          using T = std::decay_t<decltype(ids)>;
+          if constexpr (std::is_same_v<T, api::ColStr>) return std::stoi(std::string(ids.v[i]));
+          else if constexpr (std::is_same_v<T, api::ColInt>) return (int)ids.v[i];
+          else if constexpr (std::is_same_v<T, api::ArrArrInt>) return (int)ids.v[i].v[0];
+          else return -1;
+        }, p.bucket_ids->kind);
+        check(*children[i].facetResult(), [&](const Row& row) { return row.parent == key; }, widen);
+      }
+    }
+    auto req = localReq(helper.getSearchEngine());
+    std::string json = R"({"collection":"main","ops":{"q":{"top_docs":{"limit":-1,"collapse":{"field":"group_s","ops":{)"
+        + child + "}}}}}}";
+    ASSERT_TRUE(api::read_json(req->rawRequest(), json, req->mr)) << json;
+    req->execute(parallel);
+    ASSERT_OK(req);
+    const auto& groups = *req->docList()->groups;
+    const auto& results = std::get<api::ArrVal>(groups.ops.at("h")->kind).v;
+    for (size_t i = 0; i < results.size(); i++) {
+      auto group = std::get<std::string_view>(groups.keys[i].component[0].value);
+      check(*results[i].facetResult(), [&](const Row& row) { return row.group == group; }, widen);
+    }
+  }
+}
+
+TEST_F(FacetTest, dataBucketResetKeepsAncestorAndBucketIdentity) {
+  for (bool points : {false, true}) {
+    CollectionHelper helper;
+    helper.clear();
+    setRangeFacetSchema(helper, std::array{RangeSchemaField{"n_i", points, false}, RangeSchemaField{"y_i", points, false}});
+    ASSERT_TRUE(helper.indexAll({
+        flatdoc("id", "a", "cat_s", "A", "n_i", 15, "y_i", 100, "stock_i", 1),
+        flatdoc("id", "b", "cat_s", "A", "n_i", 17, "y_i", 200, "stock_i", 1),
+        flatdoc("id", "c", "cat_s", "A", "n_i", 27, "y_i", 999, "stock_i", 1),
+        flatdoc("id", "d", "cat_s", "B", "n_i", 15, "y_i", 500, "stock_i", 1),
+        flatdoc("id", "deleted", "cat_s", "A", "n_i", 18, "y_i", 10000, "stock_i", 1)}, UpdateMessage::COMMIT).success);
+    ASSERT_TRUE(helper.deleteById("deleted", UpdateMessage::COMMIT).success);
+    for (int parallel : {1, -1}) {
+      auto req = localReq(helper.getSearchEngine());
+      ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","query":"id:a","limit":0,"ops":{
+        "p":{"field_facet":{"field":"cat_s","ops":{
+          "h":{"range_facet":{"field":"n_i","bounds":"data","gap":10,"ops":{
+            "hits":{"top_docs":{"limit":-1,"sort":"id asc","fields":["id"],"get_number":true},"domain":{"query":"*:*","filter":["stock_i:1"]}},
+            "y":{"range_facet":{"field":"y_i","bounds":"data","gap":50},"domain":{"query":"*:*","filter":["stock_i:1"]}}}}},
+          "reset":{"range_facet":{"field":"y_i","bounds":"data","gap":50},"domain":{"query":"*:*","filter":["stock_i:1"]}}
+        }}}}})", req->mr));
+      req->execute(parallel);
+      ASSERT_OK(req);
+      const auto& p = topFacetResult(*req, "q", "p");
+      const auto& h = *metricValues(p, "h")[0].facetResult();
+      EXPECT_EQ((Bounds{{10, 20}}), boundsOf(h));
+      EXPECT_EQ(2, metricValues(h, "hits")[0].docList()->found.value_or(-1));
+      const auto& y = *metricValues(h, "y")[0].facetResult();
+      EXPECT_EQ((Bounds{{100, 150}, {150, 200}, {200, 250}}), boundsOf(y));
+      EXPECT_EQ((Counts{1, 0, 1}), countsOf(y));
+      const auto& reset = *metricValues(p, "reset")[0].facetResult();
+      EXPECT_EQ(18u, reset.counts.size());
+      EXPECT_EQ(3, std::accumulate(reset.counts.begin(), reset.counts.end(), int64_t{0}));
+      EXPECT_EQ((std::pair<int64_t, int64_t>{950, 1000}), boundsOf(reset).back());
+    }
+  }
+}
+
+TEST_F(FacetTest, dataDistinctDropEdgeStillHasResultChildren) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "n_i", 15),
+      flatdoc("id", "b", "n_i", 27, "key_s", "x")}, UpdateMessage::COMMIT).success);
+  for (int parallel : {1, -1}) {
+    auto req = localReq(helper.getSearchEngine());
+    ASSERT_TRUE(api::read_json(req->rawRequest(), R"json({"collection":"main","ops":{
+      "h":{"range_facet":{"field":"n_i","bounds":"data","gap":10,
+        "count_distinct":{"field":"key_s","missing":"drop"},"ops":{"avg":"avg(n_i)"}}}}})json", req->mr));
+    req->execute(parallel);
+    ASSERT_OK(req);
+    const auto& h = rootFacetResult(*req, "h");
+    EXPECT_EQ((Bounds{{10, 20}, {20, 30}}), boundsOf(h));
+    EXPECT_EQ((Counts{0, 1}), countsOf(h));
+    EXPECT_DOUBLE_EQ(15, metricValues(h, "avg")[0].asDouble());
+    EXPECT_DOUBLE_EQ(27, metricValues(h, "avg")[1].asDouble());
+  }
+}
+
+TEST_F(FacetTest, dataSelectiveDomainSubOpCapIgnoresExcludedCells) {
+  CollectionHelper helper;
+  indexInts(helper, {0, 2000});
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("n_i", "0").limit(0)
+      .rangeFacet("h", "n_i").rangeData(1).avg("avg", "n_i");
+  req->execute(-1);
+  ASSERT_OK(req);
+  EXPECT_EQ((Counts{1}), countsOf(topFacetResult(*req, "q", "h")));
+}
+
+TEST_F(FacetTest, dataNumericParentUsesOwnExtentAfterFiltering) {
+  CollectionHelper helper;
+  indexInts(helper, {15, 27, 95});
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").exprQuery("n_i:<30").limit(0)
+      .facet("p", "n_i").rangeFacet("h", "n_i").rangeData(10);
+  req->execute(-1);
+  ASSERT_OK(req);
+  const auto& p = topFacetResult(*req, "q", "p");
+  const auto& keys = std::get<api::ColInt>(p.bucket_ids->kind).v;
+  auto children = metricValues(p, "h");
+  ASSERT_EQ(2u, children.size());
+  for (size_t i = 0; i < keys.size(); i++) {
+    int64_t lo = keys[i] / 10 * 10;
+    EXPECT_EQ((Bounds{{lo, lo + 10}}), boundsOf(*children[i].facetResult()));
+  }
+}
+
+TEST_F(FacetTest, dataFanoutUsesObservedBytesBeforeMultiplyingWindows) {
+  SearchOverridesGuard guard(forcedRequestMemoryMaxBytes, forcedFacetBucketBlockBuckets, facetBucketBlockCounter);
+  CollectionHelper helper;
+  for (int segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int parent = 0; parent < 32; parent++) for (int value : segment == 0 ? std::vector<int>{0, 8759} : std::vector<int>{4380}) {
+      docs.push_back(flatdoc("id", std::to_string(parent) + ":" + std::to_string(value),
+          "parent_s", std::to_string(parent), "parent_i", parent, "n_i", value));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  forcedRequestMemoryMaxBytes = 1 << 20;
+  for (int parallel : {1, -1}) for (bool numeric : {false, true}) for (bool metric : {false, true}) {
+    for (bool adaptive : {false, true}) {
+      size_t blocks = 0;
+      facetBucketBlockCounter = &blocks;
+      forcedFacetBucketBlockBuckets = adaptive ? 0 : 32;
+      auto req = localReq(helper.getSearchEngine());
+      auto& parent = req->collection("main").facet("p", numeric ? "parent_i" : "parent_s").limit(-1);
+      auto& child = parent.rangeFacet("h", "n_i").rangeData(1).mincount(1);
+      if (metric) child.avg("avg", "n_i");
+      req->execute(parallel);
+      EXPECT_EQ(adaptive, req->ok()) << req->toString();
+      if (!adaptive) { EXPECT_NE(std::string::npos, req->errorMsg().find("request memory breaker")); }
+      else {
+        const auto& p = rootFacetResult(*req, "p");
+        auto histograms = metricValues(p, "h");
+        ASSERT_EQ(32u, histograms.size());
+        for (const auto& value : histograms) {
+          const auto& h = *value.facetResult();
+          EXPECT_EQ((Counts{1, 1, 1}), countsOf(h));
+          if (metric) {
+            auto means = metricValues(h, "avg");
+            EXPECT_DOUBLE_EQ(0, means[0].asDouble());
+            EXPECT_DOUBLE_EQ(4380, means[1].asDouble());
+            EXPECT_DOUBLE_EQ(8759, means[2].asDouble());
+          }
+        }
+        EXPECT_GT(blocks, 1u);
+        EXPECT_LT(req->memoryTracker.peak(), (size_t)(1 << 20));
+      }
+      EXPECT_EQ(0u, req->memoryTracker.bytes());
+    }
   }
 }

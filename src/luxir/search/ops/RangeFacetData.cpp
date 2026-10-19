@@ -20,16 +20,92 @@ struct IntFacetRangeReq::DataCounts : MergeableData {
   }
 };
 
-// DATA has a binding-owned layout, with no retained segment domains. Keep
-// the fixed Calc specialized, including its existing inner loop.
-template <bool Distinct, bool Floating>
-class IntFacetRangeReq::DataCalc : public Calculator {
+// The growing policy owns only storage and the finalized layout. Segment
+// delivery, retained domains, result children and routing use the fixed base.
+template <bool Distinct>
+struct IntFacetRangeReq::GrowingStorage {
   using Data = std::conditional_t<Distinct, DistinctFacetCounts, DataCounts>;
+  static constexpr bool growing = true;
   RequestMemResource resource;
   std::pmr::vector<int64_t> layout;
-  SegmentMergeDriver<Data> driver;
+  int64_t gap = 0;
+  std::atomic<size_t> observed{0};
+  std::atomic<size_t> retainedInputs{0};
 
-  IntFacetRangeReq& rangeOp() { return (IntFacetRangeReq&)this->op; }
+  explicit GrowingStorage(SearchOp& op)
+      : resource(op.req.memoryTracker, std::format("facet '{}'", op.name), "facet range layout"), layout(&resource) {}
+  static void initialize(FixedBucketFacetReq&, Data&) {}
+  void observe(const Data& data) {
+    size_t bytes = sizeof(Data) + resource.bytes();
+    if constexpr (Distinct) bytes += data.residentBytes();
+    else bytes += data.window.residentBytes();
+    size_t previous = observed.load(std::memory_order_relaxed);
+    while (previous < bytes && !observed.compare_exchange_weak(previous, bytes, std::memory_order_relaxed)) {}
+  }
+  static Data* create(FixedBucketFacetReq& op, DistinctFacetMode) {
+    auto& range = (IntFacetRangeReq&)op;
+    if constexpr (Distinct) return new Data(range.req.memoryTracker,
+        std::format("facet '{}'", range.name), forcedDistinctFacetMode,
+        *range.grid, range.groupDimension());
+    else return new Data(range);
+  }
+  template <typename Emit>
+  void finish(FixedBucketFacetReq& op, Data& data, Emit&& emit) {
+    auto release = scope_guard([&]() noexcept {
+      decltype(layout) empty(&resource);
+      layout.swap(empty);
+    });
+    observe(data);
+    auto& range = (IntFacetRangeReq&)op;
+    auto& window = [&]() -> auto& {
+      if constexpr (Distinct) return *data.cellWindow();
+      else return data.window;
+    }();
+    if constexpr (Distinct) {
+      data.widen(range.wideningStart, range.wideningEnd);
+      data.finish();
+    } else data.window.widen(range.wideningStart, range.wideningEnd);
+    layout.reserve(window.size() + 1);
+    for (size_t i = 0; i < window.size(); i++) layout.push_back(window.lowerFence(i));
+    if (!window.empty()) layout.push_back(range.grid->next(range.grid->floor(layout.back())).key);
+    if (!layout.empty()) for (int64_t civil : range.grid->skippedCalendarCells(layout.front(), layout.back())) {
+      range.req.warnOnce("calendar_bucket_skipped",
+          "facet '" + std::string(range.name) + "': calendar bucket "
+          + formatEpochMillisIso8601(civil).substr(0, 10)
+          + " skipped: no such local day in " + range.grid->timeZone().name());
+    }
+    gap = layout.empty() ? 0 : range.grid->affineGap(layout.front(), layout.back()).value_or(0);
+    std::pmr::vector<int64_t> distinctCounts(&resource);
+    CountView merged;
+    if constexpr (Distinct) {
+      distinctCounts.reserve(window.size());
+      for (size_t i = 0; i < window.size(); i++) distinctCounts.push_back(data.count(layout[i]));
+      merged = {distinctCounts, data.missing()};
+    } else merged = {window.counts(), data.missing_num};
+    observe(data);
+    emit(merged);
+  }
+  size_t bucketCount(const FixedBucketFacetReq&) const { return layout.empty() ? 0 : layout.size() - 1; }
+  std::pmr::vector<uint8_t> pinned(const FixedBucketFacetReq& op) {
+    return std::pmr::vector<uint8_t>(bucketCount(op), 0, &resource);
+  }
+  std::pmr::vector<size_t> emitted(FixedBucketFacetReq& op, CountView merged, std::span<const uint8_t>) {
+    std::pmr::vector<size_t> result(&resource);
+    for (size_t i = 0; i < merged.counts.size(); i++) if (merged.counts[i] >= op.minCount) result.push_back(i);
+    return result;
+  }
+  void emit(FixedBucketFacetReq& op, api::FacetResult& result, CountView merged,
+            std::span<const size_t> emitted, std::pmr::memory_resource& mr) {
+    ((IntFacetRangeReq&)op).emitRangeResult(result, merged, emitted, mr, layout);
+  }
+};
+
+template <bool Distinct, bool Floating>
+class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, GrowingStorage<Distinct>> {
+  using Base = FixedBucketFacetReq::Calc<Distinct, GrowingStorage<Distinct>>;
+  using Data = typename Base::Data;
+  IntFacetRangeReq& rangeOp() { return (IntFacetRangeReq&)this->getOp(); }
+  FieldType::Type rangeOpType() const { return ((IntFacetRangeReq&)this->op).valueType; }
 
   bool finite(int64_t value) const {
     if constexpr (!Floating) return true;
@@ -38,13 +114,12 @@ class IntFacetRangeReq::DataCalc : public Calculator {
     }
     return std::isfinite(sortableInt64ToDouble(value));
   }
-  FieldType::Type rangeOpType() const { return ((IntFacetRangeReq&)this->op).valueType; }
 
   bool pointsSegment(DataCounts& data, int32_t segnum, DocSet* domain) {
     auto& range = rangeOp();
     auto& segment = range.reader.segments()[(size_t)segnum];
     const auto* info = range.segInfos.at((size_t)segnum);
-    if (disablePointsRangeFacetForTests || domain || segment.liveDocs()
+    if (disablePointsRangeFacetForTests || domain || segment.liveDocs() || !range.subOps.empty()
         || !info || !info->columnBounds || !numericIdentityPoints(*info)) return false;
     auto [lo, hi] = *info->columnBounds;
     auto pool = MemPool::threadLocalPoolGuard();
@@ -95,7 +170,7 @@ class IntFacetRangeReq::DataCalc : public Calculator {
     return true;
   }
 
-  void collectSegment(Data& data, int32_t segnum, DocSet* domain) {
+  void collectSegment(Data& data, int32_t segnum, DocSet* domain) override {
     auto& range = rangeOp();
     if constexpr (Distinct) {
       int64_t missing = 0;
@@ -121,78 +196,30 @@ class IntFacetRangeReq::DataCalc : public Calculator {
     }
   }
 
-  void finish(std::unique_ptr<Data> data) {
-    // Result children will consume this binding's layout synchronously. Even
-    // though root bindings live until done(), their finished buffers need not.
-    auto release = scope_guard([&]() noexcept {
-      decltype(layout) empty(&resource);
-      layout.swap(empty);
-    });
-    auto& range = rangeOp();
-    auto& window = [&]() -> auto& {
-      if constexpr (Distinct) return *data->cellWindow();
-      else return data->window;
-    }();
-    if constexpr (Distinct) {
-      data->widen(range.wideningStart, range.wideningEnd);
-      data->finish();
-    } else data->window.widen(range.wideningStart, range.wideningEnd);
-    layout.reserve(window.size() + 1);
-    for (size_t i = 0; i < window.size(); i++) layout.push_back(window.lowerFence(i));
-    if (!window.empty()) layout.push_back(range.grid->next(range.grid->floor(layout.back())).key);
-    if (!layout.empty()) for (int64_t civil : range.grid->skippedCalendarCells(layout.front(), layout.back())) {
-      range.req.warnOnce("calendar_bucket_skipped",
-          "facet '" + std::string(range.name) + "': calendar bucket "
-          + formatEpochMillisIso8601(civil).substr(0, 10)
-          + " skipped: no such local day in " + range.grid->timeZone().name());
-    }
-    std::pmr::vector<int64_t> distinctCounts(&resource);
-    CountView merged;
-    if constexpr (Distinct) {
-      distinctCounts.reserve(window.size());
-      for (size_t i = 0; i < window.size(); i++) distinctCounts.push_back(data->count(layout[i]));
-      merged = {distinctCounts, data->missing()};
-    } else merged = {window.counts(), data->missing_num};
-    std::pmr::vector<size_t> emitted(&resource);
-    for (size_t i = 0; i < merged.counts.size(); i++) {
-      if (merged.counts[i] >= range.minCount) emitted.push_back(i);
-    }
-    auto* result = this->template slotArm<luxir::api::FacetResult>(nullptr);
-    range.emitRangeResult(*result, merged, emitted, range.req.lastResponse->mr, layout);
+  void feedBucketDomains(size_t segnum,
+      std::span<const SelectedFacetBucket<size_t>> block, FacetBucketFeed feed) override {
+    rangeOp().feedRangeDomains(segnum, block, this->input[segnum], feed,
+        {this->storage.layout, this->storage.gap}, false);
   }
-
+  void feedIdentityDomains(size_t segnum,
+      std::span<const SelectedFacetBucket<size_t>> block, DomainHandle eligibility,
+      FacetBucketFeed feed) override {
+    rangeOp().feedRangeDomains(segnum, block, std::move(eligibility), feed,
+        {this->storage.layout, this->storage.gap}, true);
+  }
 public:
-  DataCalc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots,
-      const StructuralConstraint* structural)
-    : Calculator(op, parent, slot, numSlots, structural),
-      resource(op.req.memoryTracker, std::format("facet '{}'", op.name), "facet range layout"),
-      layout(&resource), driver(op.req.reader->segments().size(),
-          [this](std::unique_ptr<Data> data) { finish(std::move(data)); }) {
-    driver.setCreator([this]() {
-      auto& range = rangeOp();
-      if constexpr (Distinct) return new Data(range.req.memoryTracker,
-          std::format("facet '{}'", range.name), forcedDistinctFacetMode,
-          *range.grid, range.groupDimension());
-      else return new Data(range);
-    });
-  }
-  luxir::api::Val* getTargetForSub(SearchResponse*, Calculator*) override {
-    throw std::logic_error("DATA range sub-ops are not supported yet");
-  }
-  void calc(oneapi::tbb::task_group*, int32_t segnum, DomainHandle domain) override {
-    if (segnum == -1) driver.completeEmpty();
-    else driver.contribute([&](Data& data) { collectSegment(data, segnum, domain.get()); });
-  }
+  using Base::Base;
 };
-
 
 size_t IntFacetRangeReq::facetBucketResidentBytes() const {
   if (!grid) return FixedBucketFacetReq::facetBucketResidentBytes();
   // Unknown extents are priced by their initial directory, never by the
   // field-wide span or the cap. Actual allocations use the request breaker.
-  return countDistinct ? sizeof(DataCalc<true>) + sizeof(DistinctFacetCounts)
+  size_t bytes = countDistinct ? sizeof(DataCalc<true>) + sizeof(DistinctFacetCounts)
       + distinctBindingBytes({true, 0, 8})
       : sizeof(DataCalc<false>) + sizeof(DataCounts) + 8 * sizeof(int64_t);
+  if (!subOps.empty()) bytes = saturatingAdd(bytes, reader.segments().size() * sizeof(DomainHandle));
+  return bytes;
 }
 
 SearchOp::Calculator* IntFacetRangeReq::createDataCalculator(

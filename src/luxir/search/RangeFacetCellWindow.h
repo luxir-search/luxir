@@ -85,6 +85,7 @@ public:
     return std::pair{key(occupiedFirst), key(occupiedLast)};
   }
   size_t capacity() const { return counters.size(); }
+  size_t residentBytes() const { return resource.bytes(); }
   bool affine() const { return gap != 0; }
 
   // Optional widening bounds use column encodings; end is exclusive.
