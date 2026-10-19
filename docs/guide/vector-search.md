@@ -639,9 +639,10 @@ Overlays record the settings they were built with, so a change applies to
 segments built afterwards: new flushes, merges, and segments without an
 overlay that a later commit selects. A query serves every segment with its own
 overlay's codec, so segments built under different settings mix freely.
-`query_bits` is applied at search time and takes effect for existing overlays
-immediately. Changing `ann` does not change the field's identity: existing
-values stay searchable.
+`query_bits` is applied at search time to both document and group searches
+and takes effect for existing RaBitQ overlays immediately, including when the
+current schema selects PQ for future builds. Changing `ann` does not change
+the field's identity: existing values stay searchable.
 
 ### Query knobs
 

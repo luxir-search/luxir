@@ -88,6 +88,15 @@ the rotation made no measurable recall difference (the embeddings are close to
 isotropic already); it is kept because the guarantee, not that corpus, is what
 the codec is chosen for.
 
+Each IVF engine slot binds an immutable prepared query: the canonical query
+for PQ, or the cached rotated query for RaBitQ, plus the current schema's
+query quantization bits. Coarse assignment and both document and group scans
+use that same index-space query. Each scan call owns its selector and FAISS
+search parameters, including `query_bits`, so filtering, deeper rounds, and
+parallel list chunks share the same preparation policy without sharing
+mutable scanner state. Exact column scans and terminal rescoring retain the
+canonical query.
+
 RaBitQ's estimated L2 distance is unbiased and can be slightly negative for
 near vectors, so the approximate L2 score conversion clamps distances at zero
 (1 / (1 + d) would otherwise turn a negative estimate into a worse score).

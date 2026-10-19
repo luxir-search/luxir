@@ -1727,53 +1727,56 @@ TEST_F(KnnQueryTest, parallelMultiValuedIvfMatchesSerial) {
   KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
   ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
   CollectionHelper h("main");
-  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  for (const auto& ann : {pqAnn(4, 2, 2), rabitqAnn(4)}) {
+    h.clear();
+    installMultiVecSchema(h.collection(), api::VectorMetric::L2, ann, 4);
 
-  // Vector counts (180 and 160) sit above the PQ training floor of 156.
-  for (int i = 0; i < 60; i++) {
-    float base = (float)i;
-    h.index(flatdoc("id", "a" + std::to_string(i), "emb_vs",
-                    std::vector<std::vector<float>>{
-                      {base, 0.0f, 0.0f, 0.0f},
-                      {base, 1.0f, 0.0f, 0.0f},
-                      {base, 2.0f, 0.0f, 0.0f}}));
+    // Vector counts (180 and 160) sit above the PQ training floor of 156.
+    for (int i = 0; i < 60; i++) {
+      float base = (float)i;
+      h.index(flatdoc("id", "a" + std::to_string(i), "emb_vs",
+                      std::vector<std::vector<float>>{
+                        {base, 0.0f, 0.0f, 0.0f},
+                        {base, 1.0f, 0.0f, 0.0f},
+                        {base, 2.0f, 0.0f, 0.0f}}));
+    }
+    h.commit({"*"});
+    for (int i = 0; i < 80; i++) {
+      float base = (float)i + 0.5f;
+      h.index(flatdoc("id", "b" + std::to_string(i), "emb_vs",
+                      std::vector<std::vector<float>>{
+                        {base, 0.0f, 0.0f, 0.0f},
+                        {base, 1.0f, 0.0f, 0.0f}}));
+    }
+    h.commit({"*"});
+    {
+      auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+      ASSERT_EQ(reader->segments().size(), 2u);
+      ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
+          << "segment 0 fell back to flat (below IVF training floor)";
+      ASSERT_NE(reader->segments()[1].getAuxReader("vec.emb_vs"), nullptr)
+          << "segment 1 fell back to flat (below IVF training floor)";
+    }
+
+    std::vector<float> queryVec{20.2f, 0.0f, 0.0f, 0.0f};
+    auto* par = makeKnnReq(*luxirNode, "emb_vs", queryVec, 10,
+                           /*nprobe=*/4, /*refineCandidates=*/20);
+    par->execute(/*parallel=*/true);
+    auto parIds = resultIds(*par);
+    auto parScores = resultScores(*par);
+    par->done();
+
+    auto* ser = makeKnnReq(*luxirNode, "emb_vs", queryVec, 10,
+                           /*nprobe=*/4, /*refineCandidates=*/20);
+    ser->execute(/*parallel=*/false);
+    auto serIds = resultIds(*ser);
+    auto serScores = resultScores(*ser);
+    ser->done();
+
+    ASSERT_EQ(parIds.size(), 10u) << "k docs guaranteed despite the candidate cut";
+    EXPECT_EQ(parIds, serIds);
+    EXPECT_EQ(parScores, serScores);
   }
-  h.commit({"*"});
-  for (int i = 0; i < 80; i++) {
-    float base = (float)i + 0.5f;
-    h.index(flatdoc("id", "b" + std::to_string(i), "emb_vs",
-                    std::vector<std::vector<float>>{
-                      {base, 0.0f, 0.0f, 0.0f},
-                      {base, 1.0f, 0.0f, 0.0f}}));
-  }
-  h.commit({"*"});
-  {
-    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
-    ASSERT_EQ(reader->segments().size(), 2u);
-    ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
-        << "segment 0 fell back to flat (below IVF training floor)";
-    ASSERT_NE(reader->segments()[1].getAuxReader("vec.emb_vs"), nullptr)
-        << "segment 1 fell back to flat (below IVF training floor)";
-  }
-
-  std::vector<float> queryVec{20.2f, 0.0f, 0.0f, 0.0f};
-  auto* par = makeKnnReq(*luxirNode, "emb_vs", queryVec, 10,
-                         /*nprobe=*/4, /*refineCandidates=*/20);
-  par->execute(/*parallel=*/true);
-  auto parIds = resultIds(*par);
-  auto parScores = resultScores(*par);
-  par->done();
-
-  auto* ser = makeKnnReq(*luxirNode, "emb_vs", queryVec, 10,
-                         /*nprobe=*/4, /*refineCandidates=*/20);
-  ser->execute(/*parallel=*/false);
-  auto serIds = resultIds(*ser);
-  auto serScores = resultScores(*ser);
-  ser->done();
-
-  ASSERT_EQ(parIds.size(), 10u) << "k docs guaranteed despite the candidate cut";
-  EXPECT_EQ(parIds, serIds);
-  EXPECT_EQ(parScores, serScores);
 }
 
 // Parallel mode must reach a kNN nested inside a boolean clause:
@@ -2534,67 +2537,70 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedDeletesClearAllRanks) {
 TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
   KnnPolicyGuard guard(/*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
-  installMultiVecSchema(h.collection(), api::VectorMetric::L2, pqAnn(4, 2, 2), 4);
+  for (const auto& ann : {pqAnn(4, 2, 2), rabitqAnn(4)}) {
+    h.clear();
+    installMultiVecSchema(h.collection(), api::VectorMetric::L2, ann, 4);
 
-  std::vector<std::vector<float>> zvecs;
-  for (int i = 0; i < 40; i++) {
-    zvecs.push_back({(float)i * 0.001f, 0, 0, 0});
+    std::vector<std::vector<float>> zvecs;
+    for (int i = 0; i < 40; i++) {
+      zvecs.push_back({(float)i * 0.001f, 0, 0, 0});
+    }
+    h.index(flatdoc("id", std::string("z"), "emb_vs", zvecs));
+    h.index(flatdoc("id", std::string("b"), "emb_vs",
+                    std::vector<std::vector<float>>{{1, 0, 0, 0}}));
+    h.index(flatdoc("id", std::string("c"), "emb_vs",
+                    std::vector<std::vector<float>>{{2, 0, 0, 0}}));
+    h.index(flatdoc("id", std::string("d"), "emb_vs",
+                    std::vector<std::vector<float>>{{3, 0, 0, 0}}));
+    h.index(flatdoc("id", std::string("del"), "emb_vs",
+                    std::vector<std::vector<float>>{{0.5f, 0, 0, 0}, {0.6f, 0, 0, 0}}));
+    for (int i = 0; i < 155; i++) {
+      float x = 50.0f + (float)i;
+      h.index(flatdoc("id", "f" + std::to_string(i), "emb_vs",
+                      std::vector<std::vector<float>>{{
+                          x, (float)(i % 7) * 0.1f, (float)(i % 13) * 0.05f, 0.25f}}));
+    }
+    h.commit({"*"});
+    {
+      auto reader = h.getIndexWriter()->snapshots.readers.getReader();
+      ASSERT_EQ(reader->segments().size(), 1u);
+      ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
+          << "segment fell back to flat (below IVF training floor)";
+    }
+    std::vector<std::string> dels{"del"};
+    h.deleteByIds(dels, UpdateMessage::COMMIT);
+
+    int64_t folds0 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
+    int64_t stale0 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
+    auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
+                           /*nprobe=*/0, /*refineCandidates=*/8,
+                           /*exact=*/false, /*minScanFraction=*/1.0f);
+    req->execute();
+    auto ids = resultIds(*req);
+    req->done();
+    int64_t folds1 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
+    EXPECT_GT(folds1, folds0) << "query never deepened; fold path unexercised";
+    // The eligible contract is binding: post-fold rounds must return only
+    // fresh hits.  A stale hit means the selector wiring quietly disconnected
+    // (deepen rounds would re-return the pool and the results would STILL
+    // look right, because markSeen dedups - this counter is the tripwire).
+    int64_t stale1 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
+    EXPECT_EQ(stale1, stale0) << "an engine returned an already-pooled rank post-fold";
+
+    auto* exact = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
+                             /*nprobe=*/0, /*refineCandidates=*/8, /*exact=*/true);
+    exact->execute();
+    auto exactIds = resultIds(*exact);
+    exact->done();
+
+    ASSERT_EQ(ids.size(), 4u);
+    EXPECT_EQ(ids, exactIds);
+    EXPECT_EQ(ids[0], "z");
+    EXPECT_EQ(ids[1], "b");
+    EXPECT_EQ(ids[2], "c");
+    EXPECT_EQ(ids[3], "d");
+    for (const auto& id : ids) EXPECT_NE(id, "del");
   }
-  h.index(flatdoc("id", std::string("z"), "emb_vs", zvecs));
-  h.index(flatdoc("id", std::string("b"), "emb_vs",
-                  std::vector<std::vector<float>>{{1, 0, 0, 0}}));
-  h.index(flatdoc("id", std::string("c"), "emb_vs",
-                  std::vector<std::vector<float>>{{2, 0, 0, 0}}));
-  h.index(flatdoc("id", std::string("d"), "emb_vs",
-                  std::vector<std::vector<float>>{{3, 0, 0, 0}}));
-  h.index(flatdoc("id", std::string("del"), "emb_vs",
-                  std::vector<std::vector<float>>{{0.5f, 0, 0, 0}, {0.6f, 0, 0, 0}}));
-  for (int i = 0; i < 155; i++) {
-    float x = 50.0f + (float)i;
-    h.index(flatdoc("id", "f" + std::to_string(i), "emb_vs",
-                    std::vector<std::vector<float>>{{
-                        x, (float)(i % 7) * 0.1f, (float)(i % 13) * 0.05f, 0.25f}}));
-  }
-  h.commit({"*"});
-  {
-    auto reader = h.getIndexWriter()->snapshots.readers.getReader();
-    ASSERT_EQ(reader->segments().size(), 1u);
-    ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
-        << "segment fell back to flat (below IVF training floor)";
-  }
-  std::vector<std::string> dels{"del"};
-  h.deleteByIds(dels, UpdateMessage::COMMIT);
-
-  int64_t folds0 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
-  int64_t stale0 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
-  auto* req = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
-                         /*nprobe=*/0, /*refineCandidates=*/8,
-                         /*exact=*/false, /*minScanFraction=*/1.0f);
-  req->execute();
-  auto ids = resultIds(*req);
-  req->done();
-  int64_t folds1 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
-  EXPECT_GT(folds1, folds0) << "query never deepened; fold path unexercised";
-  // The eligible contract is binding: post-fold rounds must return only
-  // fresh hits.  A stale hit means the selector wiring quietly disconnected
-  // (deepen rounds would re-return the pool and the results would STILL
-  // look right, because markSeen dedups - this counter is the tripwire).
-  int64_t stale1 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
-  EXPECT_EQ(stale1, stale0) << "an engine returned an already-pooled rank post-fold";
-
-  auto* exact = makeKnnReq(*luxirNode, "emb_vs", {0, 0, 0, 0}, 4,
-                           /*nprobe=*/0, /*refineCandidates=*/8, /*exact=*/true);
-  exact->execute();
-  auto exactIds = resultIds(*exact);
-  exact->done();
-
-  ASSERT_EQ(ids.size(), 4u);
-  EXPECT_EQ(ids, exactIds);
-  EXPECT_EQ(ids[0], "z");
-  EXPECT_EQ(ids[1], "b");
-  EXPECT_EQ(ids[2], "c");
-  EXPECT_EQ(ids[3], "d");
-  for (const auto& id : ids) EXPECT_NE(id, "del");
 }
 
 TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
@@ -3109,5 +3115,26 @@ TEST_F(KnnQueryTest, ivfScanGrainSpawnCounts) {
       while (scorer->next() != PostingsReader::END) hits++;
       EXPECT_EQ(10, hits);
     }
+  }
+}
+
+TEST_F(KnnQueryTest, identityIncludesQueryBitsButNotBuildSettings) {
+  std::array<float, 4> vector{0.3f, -0.7f, 0.2f, 1.1f};
+  for (auto codec : {VectorAnnConfig::PQ, VectorAnnConfig::RABITQ}) {
+    VectorAnnConfig ann;
+    ann.codec = codec;
+    VectorFieldType first("v", 4, FieldType::COLUMN_STORED, VectorFieldType::METRIC_IP, false, false, ann);
+    ann.rabitqQueryBits = 0;
+    VectorFieldType bits("v", 4, FieldType::COLUMN_STORED, VectorFieldType::METRIC_IP, false, false, ann);
+    ann = first.ann();
+    ann.nlist = 100;
+    ann.pqM = 2;
+    ann.rabitqBits = 4;
+    VectorFieldType build("v", 4, FieldType::COLUMN_STORED, VectorFieldType::METRIC_IP, false, false, ann);
+    KnnQuery a("v", first, vector, 3), b("v", bits, vector, 3), c("v", build, vector, 3);
+    EXPECT_FALSE(a.equals(b));
+    EXPECT_NE(a.hash(), b.hash());
+    EXPECT_TRUE(a.equals(c));
+    EXPECT_EQ(a.hash(), c.hash());
   }
 }

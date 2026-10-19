@@ -459,6 +459,7 @@ public:
         && queryVec.size() == rhs.queryVec.size()
         && fieldType.dims() == rhs.fieldType.dims()
         && fieldType.metric() == rhs.fieldType.metric()
+        && fieldType.ann().rabitqQueryBits == rhs.fieldType.ann().rabitqQueryBits
         && fieldType.normalized() == rhs.fieldType.normalized()
         && fieldType.normalizeOnWrite()
             == rhs.fieldType.normalizeOnWrite()
@@ -492,6 +493,7 @@ public:
         });
     value = mixHash(value, fieldType.dims());
     value = mixHash(value, (int32_t) fieldType.metric());
+    value = mixHash(value, fieldType.ann().rabitqQueryBits);
     value = mixHash(value, fieldType.normalized());
     return mixHash(value, fieldType.normalizeOnWrite());
   }
@@ -674,6 +676,11 @@ public:
     };
 
   private:
+    struct PreparedQuery {
+      const float* query;
+      uint8_t queryBits;
+    };
+
     template <bool Groups> class SegmentFaissVectorEngine;
 
     template <bool Groups> struct EngineSlot {
@@ -900,15 +907,15 @@ public:
           approximateEngine = approximateEngine || !vaux->scoresAreExact();
           const float* indexQuery = vaux->getRotation() != nullptr
             ? rotatedQuery(vaux->getRotation())
-            : nullptr;
+            : queryPtr;
           // rankLivePerSeg[i] is shared with the engine, NOT moved: the widen
           // loop's foldSeen() seeds the eligible bitmaps from it.
           auto faissEngine = std::make_unique<SegmentFaissVectorEngine<Groups>>(
             *idx, (int32_t)i, seg, v2dPerSeg[i], domain,
             rankLivePerSeg[i],
             metric, vaux->scoresAreExact(), isIvf,
-            vaux->getNList(), query.groups, v2dSpan, indexQuery,
-            vaux->isRaBitQ() ? rabitqQueryBits : -1);
+            vaux->getNList(), query.groups, v2dSpan,
+            PreparedQuery{indexQuery, (uint8_t)rabitqQueryBits});
           SegmentFaissVectorEngine<Groups>* ivfEngine = isIvf ? faissEngine.get() : nullptr;
           slots.push_back({
             .engine = std::move(faissEngine),
@@ -1360,16 +1367,8 @@ public:
       bool exactScores;
       bool isIvf;
       int32_t nlist;
-      // The query in the index's space (rotated for RaBitQ overlays), owned
-      // by prepare(); null = the request's query as is.
-      const float* indexQuery;
-      // RaBitQ query quantization bits (IVFRaBitQSearchParameters::qb);
-      // negative for other codecs.
-      int32_t rabitqQueryBits;
-
-      const float* queryFor(const float* requestQuery) const noexcept {
-        return indexQuery != nullptr ? indexQuery : requestQuery;
-      }
+      // Owned by prepareUnit(): canonical for PQ, rotated for RaBitQ.
+      const PreparedQuery preparedQuery;
 
       /// The ONLY selector policy: built per scan call from (domain,
       /// domainIsLive, rankLive, request.eligible), so round 1 and deepen
@@ -1420,6 +1419,32 @@ public:
         }
       };
 
+      struct ScanContext {
+        RoundSelector selector;
+        const float* const query;
+        // PQ ignores the RaBitQ fields. sel points into selector, so this
+        // context must stay at its construction address throughout the scan.
+        faiss::IVFRaBitQSearchParameters params;
+
+        ScanContext(const SegmentFaissVectorEngine& eng,
+                    const VectorSearchRequest& request, size_t listCount)
+            : selector(eng, request), query(eng.preparedQuery.query) {
+          params.sel = selector.get();
+          params.nprobe = listCount;
+          params.qb = eng.preparedQuery.queryBits;
+          // max_codes stays 0: scan every selected list in full.
+        }
+
+        ScanContext(const ScanContext&) = delete;
+        ScanContext& operator=(const ScanContext&) = delete;
+        ScanContext(ScanContext&&) = delete;
+        ScanContext& operator=(ScanContext&&) = delete;
+      };
+
+      ScanContext prepareScan(const VectorSearchRequest& request, size_t listCount) const {
+        return ScanContext(*this, request, listCount);
+      }
+
       struct GroupResultHandler final : faiss::ResultHandler {
         BoundedHits<true, VectorEngineHit, betterHit>& heap;
         int32_t metric, segment;
@@ -1457,8 +1482,7 @@ public:
                                bool isIvf,
                                int32_t nlist, const CollapsePlan* groupPlan,
                                std::span<const SegV2D> groupV2d,
-                               const float* indexQuery = nullptr,
-                               int32_t rabitqQueryBits = -1)
+                               PreparedQuery preparedQuery)
         : groupPlan(groupPlan), groupV2d(groupV2d), index(index),
           ivf(isIvf ? dynamic_cast<faiss::IndexIVF*>(&index) : nullptr),
           segOrd(segOrd),
@@ -1472,8 +1496,8 @@ public:
           exactScores(exactScores),
           isIvf(isIvf),
           nlist(nlist),
-          indexQuery(indexQuery),
-          rabitqQueryBits(rabitqQueryBits) {
+          preparedQuery(preparedQuery) {
+        assert(preparedQuery.query != nullptr);
         if (isIvf && ivf == nullptr) {
           throw std::runtime_error("KnnQuery: vector aux marked IVF but FAISS index is not IndexIVF");
         }
@@ -1482,18 +1506,17 @@ public:
 
       int32_t getNList() const noexcept { return nlist; }
 
-      void coarseRun(const float* query, int32_t dims,
+      void coarseRun(int32_t dims,
                      std::vector<faiss::idx_t>& listIds,
                      std::vector<float>& centroidDists) const {
         assert(ivf != nullptr);
-        assert(query != nullptr);
         assert(dims == index.d);
         unused(dims);
         listIds.assign((size_t)nlist, (faiss::idx_t)-1);
         centroidDists.assign((size_t)nlist, 0.0f);
         // The rotation is orthonormal, so these distances compare directly
         // with other segments' (rotated or not) in the global list ranking.
-        ivf->quantizer->search(1, queryFor(query), nlist, centroidDists.data(), listIds.data());
+        ivf->quantizer->search(1, preparedQuery.query, nlist, centroidDists.data(), listIds.data());
       }
 
       /// Live vector count of one IVF list - the unit the global allocator
@@ -1542,10 +1565,11 @@ public:
           return result;
         }
 
+        auto scan = prepareScan(request, listIds.size());
         if constexpr (Groups) {
-          RoundSelector selector(*this, request);
-          std::unique_ptr<faiss::InvertedListScanner> scanner(ivf->get_InvertedListScanner(false, selector.get()));
-          scanner->set_query(request.query);
+          std::unique_ptr<faiss::InvertedListScanner> scanner(
+              ivf->get_InvertedListScanner(false, scan.params.sel, &scan.params));
+          scanner->set_query(scan.query);
           BoundedHits<true, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d,
               exactScores ? 1 : (size_t)request.perKey);
           GroupResultHandler handler(heap, metric, segOrd);
@@ -1576,24 +1600,13 @@ public:
         std::vector<faiss::idx_t> ids((size_t)request.candidates, (faiss::idx_t)-1);
         std::vector<float> dists((size_t)request.candidates, 0.0f);
 
-        // Single per-round selector policy (see RoundSelector); null when
-        // the segment needs no filtering this round, so the scanner
-        // compiles the per-vector check out.
-        RoundSelector roundSel(*this, request);
-        // IVFRaBitQSearchParameters is a SearchParametersIVF; IVF+PQ ignores
-        // the RaBitQ fields, which only RaBitQ scanners look up.
-        faiss::IVFRaBitQSearchParameters ivfParams;
-        ivfParams.sel = roundSel.get();
-        // max_codes remains 0: selected IVF lists are scanned in full.
-        ivfParams.nprobe = listIds.size();
-        if (rabitqQueryBits >= 0) ivfParams.qb = (uint8_t)rabitqQueryBits;
         // Local stats sink, discarded: with a null stats argument FAISS does
         // plain non-atomic '+=' on the global faiss::indexIVF_stats, and
         // concurrent chunk tasks of one query would race on it.
         faiss::IndexIVFStats stats;
-        ivf->search_preassigned(1, queryFor(request.query), request.candidates,
+        ivf->search_preassigned(1, scan.query, request.candidates,
                                 listIds.data(), centroidDists.data(),
-                                dists.data(), ids.data(), false, &ivfParams,
+                                dists.data(), ids.data(), false, &scan.params,
                                 &stats);
         if (statsForTests) {
           statsForTests->lists += (int64_t)listIds.size();
@@ -1992,7 +2005,7 @@ public:
         for (size_t i = 0; i < slots.size(); i++) {
           auto* ivf = slots[i].ivfEngine;
           if (ivf == nullptr || slots[i].liveVectorCount <= 0 || ivf->getNList() <= 0) continue;
-          ivf->coarseRun(request.query, request.dims, runs[i].listIds, runs[i].centroidDists);
+          ivf->coarseRun(request.dims, runs[i].listIds, runs[i].centroidDists);
           while (cursors[i] < runs[i].listIds.size() && runs[i].listIds[cursors[i]] < 0) {
             cursors[i]++;
           }

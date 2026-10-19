@@ -230,13 +230,19 @@ void buildVectorBenchIndex(CollectionHelper& helper, int64_t nDocs, int32_t dims
 LocalReq* makeKnnBenchReq(SearchEngine& engine, std::string_view field,
                           const std::vector<float>& queryVec, int32_t k,
                           int32_t nprobe = 0, int32_t refineCandidates = 0,
-                          bool exact = false) {
+                          bool exact = false, bool groups = false) {
   auto* req = LocalReq::create(engine);
   req->collection("main").requestId("vector-bench");
 
   auto& cur = req->topDocs();
   cur.limit(k).getNumber().fields({"id"});
   cur.rawQuery() = qb::knn(cur.mr(), field, queryVec, k, nprobe, exact, refineCandidates);
+  if (groups) {
+    std::get<api::KnnQuery>(cur.rawQuery().kind).unit = "groups";
+    auto* collapse = new (cur.mr().allocate(sizeof(api::Collapse), alignof(api::Collapse))) api::Collapse();
+    api::build::allocArray(collapse->field, 1, cur.mr())[0] = "id";
+    std::get<api::TopDocs>(cur.rawOp().kind).collapse = collapse;
+  }
 
   return req;
 }
@@ -461,7 +467,8 @@ bool responseIds(LocalReq& req, std::vector<std::string>& out, std::string& erro
   return true;
 }
 
-void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec) {
+void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec,
+                            bool exact = false, bool groups = false) {
   if (luxir::unit_tests && state.threads() > 4) {
     state.SkipWithMessage("reduced vector unit-test thread sweep");
     return;
@@ -528,10 +535,16 @@ void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec) {
   // ANN run per query, mean over all queries.  Averaging inside the loop
   // overweights early-rotation queries whenever the iteration count is not a
   // multiple of nQueries (~+-0.01 wobble observed).
+  KnnQuery::Stats stats;
+  std::optional<SearchOverridesGuard<KnnQuery::Stats*>> statsGuard;
+  if (state.threads() == 1) {
+    statsGuard.emplace(KnnQuery::statsForTests);
+    KnnQuery::statsForTests = &stats;
+  }
   double recallSum = 0;
   for (int32_t q = 0; q < nQueries; q++) {
     auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v",
-                                queries[(size_t)q], k, nprobe, cand);
+                                queries[(size_t)q], k, nprobe, cand, exact, groups);
     req->execute(false);
     std::vector<std::string> ids;
     std::string error;
@@ -549,13 +562,15 @@ void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec) {
     recallSum += (double)hits / (double)expected.size();
   }
 
+  statsGuard.reset();
+
   // Timed loop measures latency only, cycling queries for realistic variety.
   // parallelExec runs each request on the TBB task group (intra-query scan /
   // rescore tasks); results are identical either way, only latency moves.
   int32_t queryOrd = 0;
   for (auto _ : state) {
     auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v",
-                                queries[(size_t)queryOrd], k, nprobe, cand);
+                                queries[(size_t)queryOrd], k, nprobe, cand, exact, groups);
     req->execute(parallelExec);
     std::vector<std::string> ids;
     std::string error;
@@ -576,6 +591,12 @@ void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec) {
   state.counters["recall"] = Counter(recallSum / (double)nQueries, Counter::kAvgThreads);
   state.counters["nprobe"] = Counter((double)nprobe, Counter::kAvgThreads);
   state.counters["cand"] = Counter((double)cand, Counter::kAvgThreads);
+  state.counters["lists"] = (double)stats.lists.load() / nQueries;
+  state.counters["vectors"] = (double)stats.vectors.load() / nQueries;
+  state.counters["bytes_read"] = (double)stats.bytes.load() / nQueries;
+  state.counters["rounds"] = (double)stats.rounds.load() / nQueries;
+  state.counters["exact"] = exact;
+  state.counters["groups"] = groups;
   state.counters["reused"] = Counter(reuseIndex ? 1.0 : 0.0, Counter::kAvgThreads);
   state.counters["k"] = Counter((double)k, Counter::kAvgThreads);
   state.counters["codec"] = Counter((double)codec, Counter::kAvgThreads);
@@ -982,3 +1003,16 @@ LUXIR_BENCHMARK(BM_VectorKnnRecallThreads)->ArgNames({"nprobe", "cand", "k", "co
     ->Args({0, 0, 10, RABITQ1})->ThreadRange(1, 32);
 LUXIR_BENCHMARK(BM_VectorKnnRecallThreadsParallel)->ArgNames({"nprobe", "cand", "k", "codec"})
     ->Args({0, 0, 10, RABITQ1})->ThreadRange(1, 32);
+
+// Matched query-path cells: same clustered corpus, explicit probe and pool
+// budgets. Exact requests use the column while sharing the PQ-built fixture.
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, pq_serial, false)
+    ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, PQ});
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, pq_parallel, true)
+    ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, PQ});
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, flat_serial, false, true)
+    ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, PQ});
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, flat_parallel, true, true)
+    ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, PQ});
+LUXIR_BENCHMARK_CAPTURE(BM_VectorKnnRecallBody, rabitq_groups, false, false, true)
+    ->ArgNames({"nprobe", "cand", "k", "codec"})->Args({4, 160, 10, RABITQ1});
