@@ -1691,8 +1691,9 @@ message VectorAnnDef {
   message Pq {
     // Sub-quantizers. Positive m requires positive effective (inherited)
     // dims and must divide it. Absent or 0: automatic, including inferred
-    // dims; the largest divisor up to 32 leaving at least 4 dimensions per
-    // sub-quantizer, or the largest divisor up to 32 if none does.
+    // dims. Choose the largest divisor leaving at least 4 dimensions per
+    // sub-quantizer, capped at max(32, dims / 8) for IP/cosine or 32 for L2.
+    // If none does, choose the largest divisor under the same cap.
     optional int32 m = 1;
     optional int32 bits = 2;  // bits per sub-quantizer code, 1..8. Absent: 8.
   }

@@ -80,7 +80,7 @@ int32_t chooseIvfNList(int32_t configured, int64_t ntotal) {
   return defaultIvfNList(ntotal);
 }
 
-int32_t choosePqM(int32_t configured, int32_t dims) {
+int32_t choosePqM(int32_t configured, int32_t dims, faiss::MetricType metric) {
   if (configured > 0) {
     // The schema validates authored settings; keep this check for
     // programmatically constructed field types too.
@@ -91,7 +91,11 @@ int32_t choosePqM(int32_t configured, int32_t dims) {
     return configured;
   }
 
-  int32_t maxM = std::min<int32_t>(32, dims);
+  // IP (including cosine) builds lookup tables per query, so grow code bytes
+  // with dims. L2 + by_residual recomputes nlist * M * 256 floats at open
+  // and keeps them resident at 8 bits; retain its cap to bound that table.
+  int32_t cap = metric == faiss::METRIC_INNER_PRODUCT ? std::max(32, dims / 8) : 32;
+  int32_t maxM = std::min(cap, dims);
   for (int32_t m = maxM; m >= 1; m--) {
     if (dims % m == 0 && dims / m >= 4) return m;
   }
@@ -356,7 +360,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
               fieldName, scanCost, ivfBuildThresholdScanCost);
     return std::nullopt;
   }
-  if (!rabitq) pqM = choosePqM(ann.pqM, dims);
+  if (!rabitq) pqM = choosePqM(ann.pqM, dims, metric);
 
   size_t bytesPerVec = (size_t)dims * sizeof(float);
   int64_t byteCap = bytesPerVec == 0 ? 0 : (int64_t)(ivfTrainingSampleBytes / bytesPerVec);

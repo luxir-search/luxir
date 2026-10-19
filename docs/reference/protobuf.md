@@ -1974,7 +1974,7 @@ Approximate nearest-neighbor index settings for a VECTOR field: the codec and pa
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.vectoranndef.pq.m"></a>[`m`](#field-luxir.vectoranndef.pq.m) | 1 | `int32` | optional | Sub-quantizers. Positive m requires positive effective (inherited) dims and must divide it. Absent or 0: automatic, including inferred dims; the largest divisor up to 32 leaving at least 4 dimensions per sub-quantizer, or the largest divisor up to 32 if none does. |
+| <a id="field-luxir.vectoranndef.pq.m"></a>[`m`](#field-luxir.vectoranndef.pq.m) | 1 | `int32` | optional | Sub-quantizers. Positive m requires positive effective (inherited) dims and must divide it. Absent or 0: automatic, including inferred dims. Choose the largest divisor leaving at least 4 dimensions per sub-quantizer, capped at max(32, dims / 8) for IP/cosine or 32 for L2. If none does, choose the largest divisor under the same cap. |
 | <a id="field-luxir.vectoranndef.pq.bits"></a>[`bits`](#field-luxir.vectoranndef.pq.bits) | 2 | `int32` | optional | bits per sub-quantizer code, 1..8. Absent: 8. |
 
 <a id="message-luxir.vectoranndef.rabitq"></a>

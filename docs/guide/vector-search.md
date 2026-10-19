@@ -602,7 +602,7 @@ POST /collections/books/_schema
 | `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
 | `rabitq.bits` | Bits per dimension, `1` to `9`. Default `1`. |
 | `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
-| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide it. Absent or `0`: automatic, including inferred dims; the largest divisor up to 32 leaving at least 4 dimensions each, or the largest divisor up to 32 if none does. |
+| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide it. Absent or `0`: automatic, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, dims / 8)` for IP/cosine or `32` for L2. If none does, use the largest divisor under the same cap. |
 | `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. |
 
 `rabitq` settings require codec `rabitq`, and `pq` settings codec `pq`. A
@@ -625,13 +625,16 @@ only on vectors whose error bound still overlaps the current top candidates.
 engines use and costs no measurable recall against `8`.
 
 **PQ** splits each vector into `m` sub-vectors and stores one learned
-codebook entry per sub-vector: 32 bytes for a 768-dimension vector at the
-defaults. It is the smallest codec, but at the default `m` its ranking is
-markedly coarser on high-dimensional embeddings: on a 768-dimension corpus it
-stayed below 0.89 recall@10 even with 500 rescored candidates, where RaBitQ
-reached 0.96 to 0.99 (see the design notes). A larger `m`, such as `dims / 8`
-(one byte per 8 dimensions, close to RaBitQ's size), recovers most of that
-recall. PQ codebooks are retrained for every segment build and merge.
+codebook entry per sub-vector. PQ's automatic `m` scales with IP/cosine
+dimensions above 256: for example, 768 dimensions selects `m=96`, or 96 code
+bytes at 8 bits, close to RaBitQ's 104. This improves high-dimensional recall
+over `m=32` at the cost of larger codes and more scan work; see the
+[codec measurements](../design/vector-search.md#codec-measurements).
+L2 keeps the cap of 32 because FAISS retains an `nlist * m * 256`-float
+precomputed table at 8 bits; IP/cosine builds its lookup table per query and
+has no such resident table. Fields of up to 256 dimensions and explicit `m`
+settings keep their existing choices. PQ codebooks are retrained for every
+segment build and merge; automatic `m` depends only on dimensions and metric.
 
 Start with the default. With 1-bit RaBitQ, recall is usually limited by how
 many lists are probed rather than by the codes, so raise `ivf.nprobe` first;

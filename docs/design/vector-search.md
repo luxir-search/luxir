@@ -118,11 +118,34 @@ not compile against the installed headers without patching the port. The
 codec is recorded per overlay, so FastScan can arrive as another engine id.
 
 **IVF+PQ** (`ENGINE_IVFPQ`) uses FAISS `IndexIVFPQ` with `pq.m`
-sub-quantizers of `pq.bits` bits each, unrotated, exactly as before.
+sub-quantizers of `pq.bits` bits each, unrotated. PQ's automatic `m` is the
+largest divisor of dims under a metric-dependent cap that leaves at least
+four dimensions per sub-quantizer. The cap is `max(32, dims / 8)` for the
+FAISS inner-product metric (IP and cosine), and 32 for L2. If no divisor
+leaves four dimensions, use the largest divisor under the same cap. Explicit
+`m` is unchanged. Automatic `m` depends only on dims and metric, so it is
+stable across merges. Up to 256 dims the choices are unchanged; IP/cosine
+selects 48 / 96 / 120 / 192 / 384 at 384 / 768 / 960 / 1536 / 3072 dims.
+
+L2 retains the cap because FAISS's L2 + `by_residual` path recomputes a
+precomputed table at open and keeps it resident: `nlist * m * 256` floats
+at 8 bits. At about 121k vectors (`nlist=348`), `m=96` would mean about
+34 MB of resident table against 11.6 MB of codes. IP/cosine instead builds
+its lookup table per query, with no such index-resident table.
+`IndexReaderAuxTest.cosineSkipsL2PrecomputedTable` pins that distinction.
+
+The basis is the Cohere-768 cosine [measurement below](#codec-measurements):
+`m=96` improves recall over `m=32`, with code bytes and per-code scan work
+growing linearly with `m` (32 -> 96 bytes at 8 bits). The leading k-means
+work per training vector per iteration, and encode work per vector, remain
+`256 * dims` at 8 bits: splitting the dimensions into more sub-quantizers
+does not multiply that arithmetic. This does not establish unchanged
+wall-clock build time; the build measurement below used `m=32`.
 
 ### Codec measurements
 
-These measurements predate the dimensions-scaled default probe policy.
+These measurements predate the dimensions-scaled default probe policy and
+the dimensions-scaled automatic PQ `m` for IP/cosine.
 Here, "default" means `sqrt(nlist)` lists at every dimensionality, without
 the multiplier now applied above 128 dimensions. The default-recall and
 latency numbers below describe that earlier policy.
@@ -139,7 +162,7 @@ i7-14700KF, shared with other builds). Two corpora:
 
 At 768 dims, recall with 1-bit RaBitQ is set by the probed lists alone: 1, 2,
 and 4 bits all give 0.893 / 0.911 / 0.960 / 0.986 at nprobe default / 32 / 64
-/ 128, at any rescore pool. PQ at its default `m=32` (32 code bytes) never
+/ 128, at any rescore pool. PQ at its then-automatic `m=32` (32 code bytes) never
 passed 0.88, even with 500 rescored candidates; PQ with `m=96` (96 bytes,
 close to RaBitQ's 104) reached 0.886 / 0.902 / 0.950 / 0.970. FAISS's plain
 RaBitQ scanner is slower than its PQ scanner (default nprobe: 1.2 ms vs 0.66
@@ -151,6 +174,13 @@ coarse assignment, took 10.2 s (RaBitQ, 140 B/vector) vs 16.7 s (PQ m=32,
 55 B/vector) at 768 dims and 10.4 s vs 12.9 s at 128 dims. Bytes per vector
 include the 8-byte id and per-overlay headers (centroids, and for RaBitQ the
 stored d x d rotation).
+
+The Cohere-768 cosine comparison motivating PQ's automatic `m=96` is:
+
+| PQ m | Code bytes/vector (8 bits) | Recall@10, earlier default probes | Serial latency, earlier default probes | Recall@10, nprobe 64 |
+|---|---|---|---|---|
+| 32 | 32 | 0.761 | 0.46 ms | 0.784 |
+| 96 | 96 | 0.886 | 0.66 ms | 0.950 |
 
 ## Build Policy
 

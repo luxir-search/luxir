@@ -1358,6 +1358,41 @@ TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {
   EXPECT_EQ(meta.pqBits, 2);
 }
 
+TEST_F(VectorIndexBuilderTest, automaticPqMScalesWithDimensionsForInnerProduct) {
+  IvfTestGuard guard;
+  struct Case { api::VectorMetric metric; int32_t dims, configuredM, expectedM; };
+  for (const auto& c : {Case{api::VectorMetric::COSINE, 320, 0, 40},
+                        Case{api::VectorMetric::IP, 320, 0, 40},
+                        Case{api::VectorMetric::L2, 320, 0, 32},
+                        Case{api::VectorMetric::COSINE, 256, 0, 32},
+                        Case{api::VectorMetric::COSINE, 768, 0, 96},
+                        Case{api::VectorMetric::COSINE, 320, 16, 16}}) {
+    SCOPED_TRACE((int)c.metric);
+    SCOPED_TRACE(c.dims);
+    SCOPED_TRACE(c.configuredM);
+    CollectionHelper h("main");
+    h.clear();
+    SchemaBuilder b;
+    auto& f = b.templ("_v");
+    f.type = api::FieldDef_::FieldClass::VECTOR;
+    f.metric = c.metric;
+    f.dims = c.dims;
+    f.ann = pqAnn(1, c.configuredM, 1);
+    b.set(h.collection());
+    for (int i = 0; i < 80; i++) {
+      std::vector<float> v(c.dims);
+      for (int j = 0; j < c.dims; j++) v[j] = (float)((i * 7 + j * 3) % 31 - 15);
+      h.index(flatdoc("id", std::to_string(i), "embedding_v", v));
+    }
+    h.commit({"*"});
+    auto info = readIndexInfo(h.getIndexWriter()->dir);
+    auto meta = readVectorAuxMeta(onlyVectorOverlay(info));
+    EXPECT_EQ(meta.engine, VectorAuxMeta::ENGINE_IVFPQ);
+    EXPECT_EQ(meta.dims, c.dims);
+    EXPECT_EQ(meta.pqM, c.expectedM);
+  }
+}
+
 TEST_F(VectorIndexBuilderTest, ivfPqFallsBackWhenTooSmallToTrain) {
   IvfTestGuard guard(/*minTraining=*/128);
   CollectionHelper h("main");
