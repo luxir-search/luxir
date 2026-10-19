@@ -458,7 +458,7 @@ Lucene's `CombinedFieldQuery` and the Elasticsearch `combined_fields` query:
 | Field | Meaning |
 |---|---|
 | `query` | Text to analyze. |
-| `fields` | Required non-empty TEXT fields, each `name` or `name^boost`. Boosts must be finite and at least `1`. |
+| `fields` | Required non-empty TEXT fields, each `name` or `name^boost`. Boosts must be finite and at least `1`. A name with `*` is a wildcard; see [multi-match](#multi-match). |
 | `operator` | `or` (default): any term matches in any field. `and`: every term appears in at least one field. |
 | `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
 
@@ -489,7 +489,7 @@ the Elasticsearch query of the same name:
   "multi_match": {
     "query": "dune",
     "fields": ["title_t^3", "description_t", "tags_w"],
-    "type": "cross_fields"
+    "tie_breaker": 0.3
   }
 }
 ```
@@ -498,19 +498,69 @@ the Elasticsearch query of the same name:
 |---|---|
 | `query` | Text to analyze. |
 | `fields` | Required non-empty fields, each `name` or `name^boost`. Boosts must be finite and greater than `0`. |
-| `type` | `cross_fields` or `most_fields`. Required: the Elasticsearch default, `best_fields`, is not supported yet. |
-| `operator` | `or` (default) or `and`; applies per term across fields for `cross_fields` and per field for `most_fields`. |
+| `type` | `best_fields` (default), `most_fields`, `cross_fields`, `phrase`, `phrase_prefix`, or `bool_prefix`. |
+| `operator` | `or` (default) or `and`; applies per term across fields for `cross_fields` and per field for the other non-phrase types. |
 | `min_match` | Minimum analyzed terms that must match; overrides `operator`. |
+| `tie_breaker` | In `[0, 1]`, default `0`. A document scores its best field (or `cross_fields` group) plus `tie_breaker` times the sum of the others. |
+| `slop` | Phrase slop for `phrase` and `phrase_prefix`; an error for the other types. |
+| `max_expansions` | Terms the last word of `phrase_prefix` expands to, at most `1024`; `0` means `50`. |
 
-`cross_fields` is term-centric BM25F. TEXT fields that analyze the text to
-the same terms form a group scored like `combined_fields`; groups with
-different analysis add their scores, and a document matches when any group
-matches. `most_fields` runs a `match` per field, multiplies each by its boost,
-and adds the scores. `best_fields`, `phrase`, `phrase_prefix`, and
-`bool_prefix` are rejected with an error.
+The types build one query per field and combine them:
+
+| Type | Per field | Combined as |
+|---|---|---|
+| `best_fields` | `match` | `dis_max` with `tie_breaker` |
+| `most_fields` | `match` | scores added |
+| `cross_fields` | BM25F per analysis group, `match` for a non-TEXT field | `dis_max` of the groups with `tie_breaker` |
+| `phrase` | `phrase` on TEXT, `match` otherwise | `dis_max` with `tie_breaker` |
+| `phrase_prefix` | phrase whose last word is a prefix on TEXT, `prefix` otherwise | `dis_max` with `tie_breaker` |
+| `bool_prefix` | terms by `operator`, the last word a `prefix`; `prefix` on a non-TEXT field | scores added |
+
+A field's boost multiplies its query's score. `cross_fields` is term-centric
+BM25F: TEXT fields that analyze the text to the same terms form a group
+scored like `combined_fields`, and every other field is a group of its own.
+`phrase_prefix` expands its last word, at weight creation, to the first
+`max_expansions` terms of the field in byte order, and a document scores its
+best-matching completion. A one-word `phrase_prefix` matches the expanded
+terms themselves. The `bool_prefix` prefix clause scores a constant `1`, like
+`prefix`.
+
+A field name containing `*` is a wildcard. It matches the schema's fields and
+the fields indexed in the searched collection, skipping engine names (a
+leading `_`) and variant representations (`__`). `multi_match` keeps the
+matching TEXT and STRING fields and `combined_fields` the TEXT ones, and a
+pattern that matches nothing adds no field. A field selected more than once
+keeps its largest boost.
 
 Both arms are callable from the query language with `query` as the main
 value: `combined_fields(dune, fields=[title_t, description_t])`.
+
+## Disjunction max
+
+`dis_max` matches documents that match any of its queries and scores each
+document with its best-scoring query, plus `tie_breaker` times the sum of the
+other matching queries' scores:
+
+```json
+{
+  "dis_max": {
+    "queries": [
+      {"match":{"title_t":"dune"}},
+      {"match":{"description_t":"dune"}}
+    ],
+    "tie_breaker": 0.3
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `queries` | Required non-empty list of queries. |
+| `tie_breaker` | In `[0, 1]`, default `0`. `0` keeps only the best score; `1` adds every score like a boolean `optional` list. |
+
+In a filter, `dis_max` matches the same documents as a boolean disjunction of
+its queries and shares that disjunction's filter cache entry. From the query
+language: `dis_max(queries=[title_t:dune, description_t:dune], tie_breaker=0.3)`.
 
 ## Expression
 
@@ -550,9 +600,10 @@ in their own guides:
 - `except_ops` routing is not accepted on Fusion filters or Fusion source
   filters, and `domain` overrides are not supported directly in `Fusion.ops`
   or beneath facet buckets.
-- `multi_match` supports `cross_fields` and `most_fields` only; the
-  `best_fields` default, `tie_breaker`, and wildcard field names are not
-  supported. `cross_fields` groups add their scores rather than taking the
-  best group.
+- `combined_fields` accepts only TEXT fields, as in Elasticsearch.
+- `phrase_prefix` expands its last word to at most `1024` terms per field;
+  expansions past `max_expansions` are dropped without a warning.
+- Wildcard field names see the collection's indexed fields only on search
+  requests; elsewhere they match the schema's concrete fields.
 - Fuzzy expansion truncation (the `64` clause budget and any lower operator
   limit) is not reported in the response.

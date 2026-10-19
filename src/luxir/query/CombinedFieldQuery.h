@@ -286,7 +286,7 @@ public:
       auto norms = targetPool.make_span<Scorer::Norms>(n);
       for (size_t i = 0; i < n; i++) {
         if (fieldInfos[i] == nullptr) continue;
-        SegFieldInfo* segInfo = fieldInfos[i]->segInfos[(size_t)segment.ord];
+        const SegFieldInfo* segInfo = fieldInfos[i]->segInfos.at(segment);
         if (segInfo == nullptr) continue;
         float weight = query.weights[i];
         if (termInfos[i] != nullptr) {

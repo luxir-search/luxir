@@ -864,6 +864,8 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::CombinedFieldsQuery>);
           } else if (key == "multi_match") {
             arm(std::in_place_type<api::MultiMatchQuery>);
+          } else if (key == "dis_max") {
+            arm(std::in_place_type<api::DisMaxQuery>);
           } else if (key == "fuzzy") {
             arm(std::in_place_type<api::FuzzyQuery>);
           } else if (key == "simple_query") {

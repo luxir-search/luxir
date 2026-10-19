@@ -289,6 +289,7 @@ message Query {
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
     CombinedFieldsQuery combined_fields = 20; // BM25F: several text fields scored as one
     MultiMatchQuery multi_match = 21; // one query text over several fields
+    DisMaxQuery dis_max = 25;       // best-scoring of several queries, plus a tie breaker
   }
 }
 
@@ -404,7 +405,8 @@ message CombinedFieldsQuery {
   string query = 1;  // the text to analyze
 
   // Required, non-empty TEXT fields. Each entry is a name or "name^boost";
-  // boosts must be finite and >= 1 (default 1).
+  // boosts must be finite and >= 1 (default 1). A name containing '*' is a
+  // wildcard, as in MultiMatchQuery.fields, keeping the TEXT fields.
   repeated string fields = 2;
 
   // How the analyzed terms combine. Unset = OR: a doc matches if any term
@@ -421,32 +423,68 @@ message MultiMatchQuery {
   string query = 1;  // the text to analyze
 
   // Required, non-empty fields. Each entry is a name or "name^boost"; boosts
-  // must be finite and > 0 (default 1).
+  // must be finite and > 0 (default 1). A name containing '*' is a wildcard
+  // over the schema's fields and the index's fields, keeping the TEXT and
+  // STRING ones; a pattern that matches nothing contributes no field.
   repeated string fields = 2;
 
   // Scoring strategy. Unset = BEST_FIELDS, as in Elasticsearch.
   Type type = 3;
 
-  // How the analyzed terms combine (per field for MOST_FIELDS, per term
-  // across fields for CROSS_FIELDS). Unset = OR.
+  // How the analyzed terms combine (per field for BEST_FIELDS, MOST_FIELDS
+  // and BOOL_PREFIX, per term across fields for CROSS_FIELDS). Unset = OR.
+  // Ignored by the phrase types.
   Match.Operator operator = 4;
 
   // Minimum number of analyzed terms that must match; overrides `operator`.
+  // Ignored by the phrase types.
   int32 min_match = 5;
+
+  // Weight of the non-best fields (BEST_FIELDS, PHRASE, PHRASE_PREFIX) or
+  // field groups (CROSS_FIELDS): a document scores its best field plus
+  // tie_breaker times the sum of the others. Unset = 0. Must be in [0, 1].
+  optional float tie_breaker = 6;
+
+  // Phrase slop for PHRASE and PHRASE_PREFIX. Must be >= 0.
+  int32 slop = 7;
+
+  // Terms the last word expands to for PHRASE_PREFIX and BOOL_PREFIX.
+  // 0 = 50. PHRASE_PREFIX takes the first terms in byte order; BOOL_PREFIX
+  // ignores it (its prefix query matches every expansion).
+  int32 max_expansions = 8;
 
   enum Type {
     TYPE_UNSPECIFIED = 0; // treated as BEST_FIELDS
-    BEST_FIELDS = 1;      // not supported yet; rejected
+    // A match query per field; a document scores its best field, plus
+    // tie_breaker times the others.
+    BEST_FIELDS = 1;
     // A match query per field; the field scores add up.
     MOST_FIELDS = 2;
     // Term-centric BM25F: TEXT fields that analyze `query` to the same terms
-    // are scored as one combined field, as in CombinedFieldsQuery; groups of
-    // fields with different analysis add their scores.
+    // are scored as one combined field, as in CombinedFieldsQuery. Every
+    // other field is a group of its own. Groups combine like BEST_FIELDS.
     CROSS_FIELDS = 3;
-    PHRASE = 4;           // not supported yet; rejected
-    PHRASE_PREFIX = 5;    // not supported yet; rejected
-    BOOL_PREFIX = 6;      // not supported yet; rejected
+    // A phrase per field (PhraseQuery text with `slop`), combined like
+    // BEST_FIELDS.
+    PHRASE = 4;
+    // A phrase per field whose last word is a prefix, combined like
+    // BEST_FIELDS.
+    PHRASE_PREFIX = 5;
+    // Per field, every word but the last is a term and the last is a prefix,
+    // combined by `operator`; the fields add up like MOST_FIELDS.
+    BOOL_PREFIX = 6;
   }
+}
+
+// Disjunction max: matches documents that match any of `queries`, scoring
+// each with its best-scoring query plus tie_breaker times the sum of the
+// other matching queries' scores (Elasticsearch dis_max).
+message DisMaxQuery {
+  repeated Query queries = 1;  // required, non-empty
+
+  // Weight of the non-best matching queries. Unset = 0. Must be in [0, 1];
+  // 1 adds every score like a boolean disjunction.
+  optional float tie_breaker = 2;
 }
 
 // Constant-score exact value-set membership using the field's value binding.

@@ -3,7 +3,9 @@
 
 #include "luxir/query/ProtobufQueryParser.h"
 
+#include <algorithm>
 #include <charconv>
+#include <cstring>
 #include <cmath>
 #include <format>
 #include <limits>
@@ -20,6 +22,7 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/ExprParser.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
@@ -31,6 +34,7 @@
 #include "luxir/query/SimpleQueryParser.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/search/IndexReader.h"
 #include "luxir/util/Overloaded.h"
 #include "luxir/value/ValueExprParser.h"
 
@@ -498,17 +502,94 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
 
 namespace {
 
+// '*' matches any run of characters, as in Elasticsearch field patterns.
+bool globMatch(std::string_view pattern, std::string_view name) {
+  size_t p = 0, n = 0, star = std::string_view::npos, resume = 0;
+  while (n < name.size()) {
+    if (p < pattern.size() && pattern[p] == '*') {
+      star = p++;
+      resume = n;
+    } else if (p < pattern.size() && pattern[p] == name[n]) {
+      p++;
+      n++;
+    } else if (star != std::string_view::npos) {
+      p = star + 1;
+      n = ++resume;
+    } else {
+      return false;
+    }
+  }
+  while (p < pattern.size() && pattern[p] == '*') p++;
+  return p == pattern.size();
+}
+
+// Field names a wildcard can select: the schema's concrete fields and the
+// reader's indexed fields, without engine names ('_' prefix) and variant
+// representations ("__" separator), sorted and unique.
+std::vector<std::string> wildcardCandidates(const Schema& schema, IndexReader* reader) {
+  std::vector<std::string> names;
+  auto keep = [](std::string_view name) {
+    return !name.empty() && name[0] != '_' && name.find("__") == std::string_view::npos;
+  };
+  for (const auto& entry : schema.fieldTypeMap) {
+    if (keep(entry.first)) names.push_back(entry.first);
+  }
+  if (reader != nullptr) {
+    for (auto& segment : reader->segments()) {
+      auto& postings = segment.postingsReader();
+      for (int32_t ord = 0; ord < postings.numFields(); ord++) {
+        const auto* info = postings.fieldInfo(ord);
+        if (info == nullptr || info->nTerms == 0) continue;
+        std::string_view name = (std::string_view)info->fieldname;
+        if (keep(name)) names.emplace_back(name);
+      }
+    }
+  }
+  std::sort(names.begin(), names.end());
+  names.erase(std::unique(names.begin(), names.end()), names.end());
+  return names;
+}
+
+QueryBuilder::Operator builderOperator(luxir::api::Match_::Operator op) {
+  return op == luxir::api::Match_::Operator::AND ? QueryBuilder::Operator::AND
+                                                  : QueryBuilder::Operator::OR;
+}
+
+float tieBreakerOf(std::optional<float> tieBreaker, std::string_view label) {
+  float value = tieBreaker.value_or(0.0f);
+  if (!std::isfinite(value) || value < 0.0f || value > 1.0f) {
+    throw std::runtime_error(std::format(
+        "{} 'tie_breaker' must be in [0, 1] (got {})", label, value));
+  }
+  return value;
+}
+
+// Cap on multi_match max_expansions: each expansion is a phrase clause.
+constexpr int32_t MAX_PREFIX_EXPANSIONS = 1024;
+
 // Split "name^boost" entries (the Elasticsearch field-list syntax) into
-// names and boosts. minBoost is the inclusive lower bound when inclusive,
-// otherwise exclusive.
+// names and boosts, expanding wildcard names. minBoost is the inclusive
+// lower bound when inclusive, otherwise exclusive. A wildcard keeps the
+// matching fields whose search binding is one of `types`; a name listed
+// more than once keeps its largest boost.
 std::vector<QueryBuilder::WeightedField> parseWeightedFields(
-    std::span<const std::string_view> fields, std::string_view label,
-    float minBoost, bool inclusive) {
+    ParseContext& context, std::span<const std::string_view> fields, std::string_view label,
+    float minBoost, bool inclusive, std::span<const FieldType::Type> types) {
+  MemPool& pool = context.pool;
   if (fields.empty()) {
     throw std::runtime_error(std::format("{} requires a non-empty 'fields' list", label));
   }
   std::vector<QueryBuilder::WeightedField> out;
-  out.reserve(fields.size());
+  std::optional<std::vector<std::string>> candidates;
+  auto add = [&](std::string_view name, float boost) {
+    for (auto& existing : out) {
+      if (existing.name == name) {
+        existing.boost = std::max(existing.boost, boost);
+        return;
+      }
+    }
+    out.push_back({name, boost});
+  };
   for (std::string_view entry : fields) {
     QueryBuilder::WeightedField wf{entry, 1.0f};
     size_t caret = entry.rfind('^');
@@ -529,14 +610,26 @@ std::vector<QueryBuilder::WeightedField> parseWeightedFields(
           "{}: boost of field '{}' must be finite and {} {} (got {})",
           label, wf.name, inclusive ? ">=" : ">", minBoost, wf.boost));
     }
-    out.push_back(wf);
+    if (wf.name.find('*') == std::string_view::npos) {
+      add(wf.name, wf.boost);
+      continue;
+    }
+    if (!candidates) candidates = wildcardCandidates(context.schema, context.reader);
+    for (const auto& name : *candidates) {
+      if (!globMatch(wf.name, name)) continue;
+      FieldType::Type type;
+      try {
+        type = context.fields.resolve(name, OpClass::SEARCH).fieldType->type();
+      } catch (const std::exception&) {
+        continue;  // no search binding
+      }
+      if (std::find(types.begin(), types.end(), type) == types.end()) continue;
+      char* copy = pool.alloc(name.size());
+      memcpy(copy, name.data(), name.size());
+      add(std::string_view(copy, name.size()), wf.boost);
+    }
   }
   return out;
-}
-
-QueryBuilder::Operator builderOperator(luxir::api::Match_::Operator op) {
-  return op == luxir::api::Match_::Operator::AND ? QueryBuilder::Operator::AND
-                                                  : QueryBuilder::Operator::OR;
 }
 
 } // namespace
@@ -548,7 +641,8 @@ luxir::Query* ProtobufQueryParser::parseCombinedFields(
   }
   // Elasticsearch requires boosts >= 1: smaller weights break the BM25
   // saturation that keeps a combined frequency from outscoring a real one.
-  auto fields = parseWeightedFields(query.fields, "combined_fields", 1.0f, true);
+  static constexpr FieldType::Type TEXT_ONLY[] = {FieldType::Type::TEXT};
+  auto fields = parseWeightedFields(context, query.fields, "combined_fields", 1.0f, true, TEXT_ONLY);
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
   return builder.createCombinedFieldsQuery(
@@ -561,29 +655,51 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
   if (query.min_match < 0) {
     throw std::runtime_error("multi_match 'min_match' must not be negative");
   }
-  auto fields = parseWeightedFields(query.fields, "multi_match", 0.0f, false);
+  if (query.slop < 0) {
+    throw std::runtime_error("multi_match 'slop' must not be negative");
+  }
+  if (query.max_expansions < 0 || query.max_expansions > MAX_PREFIX_EXPANSIONS) {
+    throw std::runtime_error(std::format(
+        "multi_match 'max_expansions' must be in [0, {}] (got {})",
+        MAX_PREFIX_EXPANSIONS, query.max_expansions));
+  }
+  bool phrase = query.type == Type::PHRASE || query.type == Type::PHRASE_PREFIX;
+  if (query.slop > 0 && !phrase) {
+    throw std::runtime_error("multi_match 'slop' applies only to type phrase and phrase_prefix");
+  }
+  float tieBreaker = tieBreakerOf(query.tie_breaker, "multi_match");
+  static constexpr FieldType::Type TERM_FIELDS[] = {
+    FieldType::Type::TEXT, FieldType::Type::STRING};
+  auto fields = parseWeightedFields(context, query.fields, "multi_match", 0.0f, false, TERM_FIELDS);
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
   auto op = builderOperator(query.operator_);
   switch (query.type) {
-    case Type::CROSS_FIELDS:
-      return builder.createCombinedFieldsQuery(
-          fields, query.query, op, query.min_match, true, "multi_match");
-    case Type::MOST_FIELDS:
-      return builder.createMostFieldsQuery(fields, query.query, op, query.min_match);
     case Type::TYPE_UNSPECIFIED:
     case Type::BEST_FIELDS:
-      throw std::runtime_error(
-          "multi_match type best_fields (the default) is not supported yet; "
-          "set type to cross_fields or most_fields");
+      return builder.createBestFieldsQuery(fields, query.query, op, query.min_match, tieBreaker);
+    case Type::CROSS_FIELDS:
+      return builder.createCombinedFieldsQuery(
+          fields, query.query, op, query.min_match, true, "multi_match", tieBreaker);
+    case Type::MOST_FIELDS:
+      return builder.createMostFieldsQuery(fields, query.query, op, query.min_match);
     case Type::PHRASE:
+      return builder.createMultiPhraseQuery(fields, query.query, query.slop, tieBreaker);
     case Type::PHRASE_PREFIX:
+      return builder.createMultiPhrasePrefixQuery(
+          fields, query.query, query.slop, query.max_expansions, tieBreaker);
     case Type::BOOL_PREFIX:
-      break;
+      return builder.createMultiBoolPrefixQuery(fields, query.query, op, query.min_match);
   }
-  throw std::runtime_error(
-      "multi_match supports type cross_fields or most_fields; "
-      "phrase, phrase_prefix, and bool_prefix are not supported yet");
+  throw std::runtime_error("multi_match: unknown type");
+}
+
+luxir::Query* ProtobufQueryParser::parseDisMax(const luxir::api::DisMaxQuery& query) {
+  if (query.queries.empty()) {
+    throw std::runtime_error("dis_max requires a non-empty 'queries' list");
+  }
+  float tieBreaker = tieBreakerOf(query.tie_breaker, "dis_max");
+  return luxir::DisMaxQuery::make(pool, parseQueryList(query.queries), tieBreaker);
 }
 
 luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
@@ -620,6 +736,7 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
       return parseCombinedFields(c);
     },
     [&](const luxir::api::MultiMatchQuery& m) -> luxir::Query* { return parseMultiMatch(m); },
+    [&](const luxir::api::DisMaxQuery& d) -> luxir::Query* { return parseDisMax(d); },
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);

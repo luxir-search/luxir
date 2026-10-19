@@ -66,6 +66,8 @@ enum class QueryKind : uint8_t {
   RESCORE,
   COMBINED_FIELDS,
   MIN_SCORE,
+  DIS_MAX,
+  PHRASE_PREFIX,
   TEST,
 };
 

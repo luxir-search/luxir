@@ -591,7 +591,8 @@ clauses, filters, fusion sources, or another query wrapper.
 | Boost | `{"boost":{"query":...,"boost":2.0}}` | Multiplies child scores. A numeric `boost` sibling is input sugar. |
 | Simple query | `{"simple_query":{"q":"dune | messiah","fields":["title_t"]}}` | Never-failing syntax for raw search-box input. |
 | Combined fields | `{"combined_fields":{"query":"dune messiah","fields":["title_t^2","body_t"]}}` | BM25F: the fields score as one combined field. |
-| Multi-match | `{"multi_match":{"query":"dune","fields":["title_t","body_t"],"type":"cross_fields"}}` | `cross_fields` (BM25F) or `most_fields`. |
+| Multi-match | `{"multi_match":{"query":"dune","fields":["title_t^2","body_t"],"tie_breaker":0.3}}` | `best_fields` (default), `most_fields`, `cross_fields` (BM25F), `phrase`, `phrase_prefix`, or `bool_prefix`. |
+| Disjunction max | `{"dis_max":{"queries":[{"match":{"title_t":"dune"}},{"match":{"body_t":"dune"}}]}}` | Best query's score plus `tie_breaker` times the others. |
 | Expression | `"title_t:dune AND year_i:>=1965"` | Strict developer syntax with exact parse errors and safe `$vars`. |
 | kNN | `{"knn":{"field":"embedding_v","query":[...],"k":20}}` | Exact or ANN vector search; see [Vector Search](vector-search.md). |
 | Geo box | `{"geo_box":{"field":"location","min_lat":40,"max_lat":42,"min_lon":-75,"max_lon":-72}}` | Inclusive box, including dateline-crossing boxes. |

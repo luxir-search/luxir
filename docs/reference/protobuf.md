@@ -95,6 +95,7 @@ defaults and constraints are described in the comments and guides.
 - [`CreateCollectionResponse`](#message-luxir.createcollectionresponse)
 - [`DeleteCollectionRequest`](#message-luxir.deletecollectionrequest)
 - [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse)
+- [`DisMaxQuery`](#message-luxir.dismaxquery)
 - [`Diversify`](#message-luxir.diversify)
 - [`DocList`](#message-luxir.doclist)
 - [`Domain`](#message-luxir.domain)
@@ -599,7 +600,7 @@ Analyzes \`query\` and scores each term as if the listed TEXT fields were one co
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.combinedfieldsquery.query"></a>[`query`](#field-luxir.combinedfieldsquery.query) | 1 | `string` | singular | the text to analyze |
-| <a id="field-luxir.combinedfieldsquery.fields"></a>[`fields`](#field-luxir.combinedfieldsquery.fields) | 2 | `string` | repeated | Required, non-empty TEXT fields. Each entry is a name or "name^boost"; boosts must be finite and &gt;= 1 (default 1). |
+| <a id="field-luxir.combinedfieldsquery.fields"></a>[`fields`](#field-luxir.combinedfieldsquery.fields) | 2 | `string` | repeated | Required, non-empty TEXT fields. Each entry is a name or "name^boost"; boosts must be finite and &gt;= 1 (default 1). A name containing '\*' is a wildcard, as in MultiMatchQuery.fields, keeping the TEXT fields. |
 | <a id="field-luxir.combinedfieldsquery.operator"></a>[`operator`](#field-luxir.combinedfieldsquery.operator) | 3 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How the analyzed terms combine. Unset = OR: a doc matches if any term appears in any listed field. AND requires every term in some field. |
 | <a id="field-luxir.combinedfieldsquery.min_match"></a>[`min_match`](#field-luxir.combinedfieldsquery.min_match) | 4 | `int32` | singular | Minimum number of analyzed terms that must match; overrides \`operator\` and is clamped to the term count. Mirrors Match.min\_match. |
 
@@ -677,6 +678,19 @@ Parameters governing how a commit is performed. Presence of this message in an U
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.deletecollectionresponse.name"></a>[`name`](#field-luxir.deletecollectionresponse.name) | 1 | `string` | singular |  |
+
+<a id="message-luxir.dismaxquery"></a>
+
+### luxir.DisMaxQuery
+
+Disjunction max: matches documents that match any of \`queries\`, scoring each with its best-scoring query plus tie\_breaker times the sum of the other matching queries' scores (Elasticsearch dis\_max).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.dismaxquery.queries"></a>[`queries`](#field-luxir.dismaxquery.queries) | 1 | [`Query`](#message-luxir.query) | repeated | required, non-empty |
+| <a id="field-luxir.dismaxquery.tie_breaker"></a>[`tie_breaker`](#field-luxir.dismaxquery.tie_breaker) | 2 | `float` | optional | Weight of the non-best matching queries. Unset = 0. Must be in \[0, 1\]; 1 adds every score like a boolean disjunction. |
 
 <a id="message-luxir.diversify"></a>
 
@@ -1256,10 +1270,13 @@ Elasticsearch-style multi\_match: one query text over several fields.
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.multimatchquery.query"></a>[`query`](#field-luxir.multimatchquery.query) | 1 | `string` | singular | the text to analyze |
-| <a id="field-luxir.multimatchquery.fields"></a>[`fields`](#field-luxir.multimatchquery.fields) | 2 | `string` | repeated | Required, non-empty fields. Each entry is a name or "name^boost"; boosts must be finite and &gt; 0 (default 1). |
+| <a id="field-luxir.multimatchquery.fields"></a>[`fields`](#field-luxir.multimatchquery.fields) | 2 | `string` | repeated | Required, non-empty fields. Each entry is a name or "name^boost"; boosts must be finite and &gt; 0 (default 1). A name containing '\*' is a wildcard over the schema's fields and the index's fields, keeping the TEXT and STRING ones; a pattern that matches nothing contributes no field. |
 | <a id="field-luxir.multimatchquery.type"></a>[`type`](#field-luxir.multimatchquery.type) | 3 | [`MultiMatchQuery.Type`](#enum-luxir.multimatchquery.type) | singular | Scoring strategy. Unset = BEST\_FIELDS, as in Elasticsearch. |
-| <a id="field-luxir.multimatchquery.operator"></a>[`operator`](#field-luxir.multimatchquery.operator) | 4 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How the analyzed terms combine (per field for MOST\_FIELDS, per term across fields for CROSS\_FIELDS). Unset = OR. |
-| <a id="field-luxir.multimatchquery.min_match"></a>[`min_match`](#field-luxir.multimatchquery.min_match) | 5 | `int32` | singular | Minimum number of analyzed terms that must match; overrides \`operator\`. |
+| <a id="field-luxir.multimatchquery.operator"></a>[`operator`](#field-luxir.multimatchquery.operator) | 4 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How the analyzed terms combine (per field for BEST\_FIELDS, MOST\_FIELDS and BOOL\_PREFIX, per term across fields for CROSS\_FIELDS). Unset = OR. Ignored by the phrase types. |
+| <a id="field-luxir.multimatchquery.min_match"></a>[`min_match`](#field-luxir.multimatchquery.min_match) | 5 | `int32` | singular | Minimum number of analyzed terms that must match; overrides \`operator\`. Ignored by the phrase types. |
+| <a id="field-luxir.multimatchquery.tie_breaker"></a>[`tie_breaker`](#field-luxir.multimatchquery.tie_breaker) | 6 | `float` | optional | Weight of the non-best fields (BEST\_FIELDS, PHRASE, PHRASE\_PREFIX) or field groups (CROSS\_FIELDS): a document scores its best field plus tie\_breaker times the sum of the others. Unset = 0. Must be in \[0, 1\]. |
+| <a id="field-luxir.multimatchquery.slop"></a>[`slop`](#field-luxir.multimatchquery.slop) | 7 | `int32` | singular | Phrase slop for PHRASE and PHRASE\_PREFIX. Must be &gt;= 0. |
+| <a id="field-luxir.multimatchquery.max_expansions"></a>[`max_expansions`](#field-luxir.multimatchquery.max_expansions) | 8 | `int32` | singular | Terms the last word expands to for PHRASE\_PREFIX and BOOL\_PREFIX. 0 = 50. PHRASE\_PREFIX takes the first terms in byte order; BOOL\_PREFIX ignores it (its prefix query matches every expansion). |
 
 <a id="message-luxir.multivector"></a>
 
@@ -1349,6 +1366,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
 | <a id="field-luxir.query.combined_fields"></a>[`combined_fields`](#field-luxir.query.combined_fields) | 20 | [`CombinedFieldsQuery`](#message-luxir.combinedfieldsquery) | oneof [`kind`](#oneof-luxir.query.kind) | BM25F: several text fields scored as one |
 | <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 21 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one query text over several fields |
+| <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best-scoring of several queries, plus a tie breaker |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -2189,12 +2207,12 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | Value | Number | Description |
 |---|---|---|
 | <a id="value-luxir.multimatchquery.type.type_unspecified"></a>[`TYPE_UNSPECIFIED`](#value-luxir.multimatchquery.type.type_unspecified) | 0 | treated as BEST\_FIELDS |
-| <a id="value-luxir.multimatchquery.type.best_fields"></a>[`BEST_FIELDS`](#value-luxir.multimatchquery.type.best_fields) | 1 | not supported yet; rejected |
+| <a id="value-luxir.multimatchquery.type.best_fields"></a>[`BEST_FIELDS`](#value-luxir.multimatchquery.type.best_fields) | 1 | A match query per field; a document scores its best field, plus tie\_breaker times the others. |
 | <a id="value-luxir.multimatchquery.type.most_fields"></a>[`MOST_FIELDS`](#value-luxir.multimatchquery.type.most_fields) | 2 | A match query per field; the field scores add up. |
-| <a id="value-luxir.multimatchquery.type.cross_fields"></a>[`CROSS_FIELDS`](#value-luxir.multimatchquery.type.cross_fields) | 3 | Term-centric BM25F: TEXT fields that analyze \`query\` to the same terms are scored as one combined field, as in CombinedFieldsQuery; groups of fields with different analysis add their scores. |
-| <a id="value-luxir.multimatchquery.type.phrase"></a>[`PHRASE`](#value-luxir.multimatchquery.type.phrase) | 4 | not supported yet; rejected |
-| <a id="value-luxir.multimatchquery.type.phrase_prefix"></a>[`PHRASE_PREFIX`](#value-luxir.multimatchquery.type.phrase_prefix) | 5 | not supported yet; rejected |
-| <a id="value-luxir.multimatchquery.type.bool_prefix"></a>[`BOOL_PREFIX`](#value-luxir.multimatchquery.type.bool_prefix) | 6 | not supported yet; rejected |
+| <a id="value-luxir.multimatchquery.type.cross_fields"></a>[`CROSS_FIELDS`](#value-luxir.multimatchquery.type.cross_fields) | 3 | Term-centric BM25F: TEXT fields that analyze \`query\` to the same terms are scored as one combined field, as in CombinedFieldsQuery. Every other field is a group of its own. Groups combine like BEST\_FIELDS. |
+| <a id="value-luxir.multimatchquery.type.phrase"></a>[`PHRASE`](#value-luxir.multimatchquery.type.phrase) | 4 | A phrase per field (PhraseQuery text with \`slop\`), combined like BEST\_FIELDS. |
+| <a id="value-luxir.multimatchquery.type.phrase_prefix"></a>[`PHRASE_PREFIX`](#value-luxir.multimatchquery.type.phrase_prefix) | 5 | A phrase per field whose last word is a prefix, combined like BEST\_FIELDS. |
+| <a id="value-luxir.multimatchquery.type.bool_prefix"></a>[`BOOL_PREFIX`](#value-luxir.multimatchquery.type.bool_prefix) | 6 | Per field, every word but the last is a term and the last is a prefix, combined by \`operator\`; the fields add up like MOST\_FIELDS. |
 
 <a id="enum-luxir.replicaresult.outcome"></a>
 

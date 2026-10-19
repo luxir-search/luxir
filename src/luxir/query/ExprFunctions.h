@@ -32,7 +32,7 @@ namespace luxir::expr {
 // field order).  The static_assert keeps this table in lockstep with the
 // variant: a new arm fails to compile until it is named here (and its expr
 // callability decided).
-inline constexpr std::array<std::string_view, 22> ARM_NAMES = {
+inline constexpr std::array<std::string_view, 23> ARM_NAMES = {
     "",               // monostate (unset)
     "match",          // Match
     "boolean",        // BooleanQuery
@@ -55,6 +55,7 @@ inline constexpr std::array<std::string_view, 22> ARM_NAMES = {
     "any_of",         // AnyOfQuery - exact scalar/list input
     "combined_fields", // CombinedFieldsQuery
     "multi_match",    // MultiMatchQuery
+    "dis_max",        // DisMaxQuery
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),
               "Query gained an arm: name it in ARM_NAMES and decide its expr callability");
@@ -116,6 +117,7 @@ bool withCallableArm(api::Query& q, std::string_view name, F&& f) {
                   std::is_same_v<Arm, api::SimpleQuery> ||
                   std::is_same_v<Arm, api::CombinedFieldsQuery> ||
                   std::is_same_v<Arm, api::MultiMatchQuery> ||
+                  std::is_same_v<Arm, api::DisMaxQuery> ||
                   std::is_same_v<Arm, api::RangeQuery> ||
                   std::is_same_v<Arm, api::BoostQuery> ||
                   std::is_same_v<Arm, api::RescoreQuery>) {

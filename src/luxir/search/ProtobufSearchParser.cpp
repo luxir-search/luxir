@@ -342,6 +342,7 @@ public:
       req.requestPool, *req.schema, req.arena,
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
       "root", &req.warnings, &fields};
+    parseContext.reader = req.reader.get();
     ProtobufQueryParser parser(parseContext);
     ParsedDomains domains = parseChildDomains(req.proto.ops, parser);
     if (!domains.empty()) {
@@ -402,6 +403,7 @@ public:
           CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
           currOp.name, &req.warnings, &fields};
       context.collapse = enclosingCollapse;
+      context.reader = req.reader.get();
       ProtobufQueryParser parser(context);
       auto domains = parseChildDomains(ops, parser);
       if (!domains.empty()) {
@@ -551,6 +553,7 @@ public:
             CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
             name, &req.warnings, &fields};
           parseContext.collapse = enclosingCollapse;
+          parseContext.reader = req.reader.get();
           ProtobufQueryParser parser(parseContext);
           plan = createQueryFacetPlan(
               name, facetReq, placement, parser);
@@ -1580,6 +1583,7 @@ public:
       req.requestPool, *req.schema, req.arena,
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
     parseContext.collapse = enclosingCollapse;
+    parseContext.reader = req.reader.get();
     ProtobufQueryParser parser(parseContext);
     // An absent query selects all documents: the domain is then whatever the
     // filters carve out (browse / filter-only search). Boolean normalization
@@ -2244,6 +2248,7 @@ public:
       req.requestPool, *req.schema, req.arena,
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
     parseContext.collapse = enclosingCollapse;
+    parseContext.reader = req.reader.get();
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseFilters(
         parser, fusionProto.filter, nullptr, "fusion.filter");
