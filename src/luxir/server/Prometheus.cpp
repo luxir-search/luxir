@@ -26,58 +26,67 @@ std::string join(std::string_view labels, std::string_view more) {
 
 class Renderer {
   PrometheusText& out;
-  std::span<const double> bounds;
 public:
-  Renderer(PrometheusText& out, std::span<const double> bounds) : out(out), bounds(bounds) {}
+  explicit Renderer(PrometheusText& out) : out(out) {}
   void gauge(std::string_view name, std::string_view help, double value, std::string_view labels = {}) {
     out.sample(name, help, "gauge", value, labels);
   }
   void counter(std::string_view name, std::string_view help, double value, std::string_view labels = {}) {
     out.sample(name, help, "counter", value, labels);
   }
-  void activity(std::string_view prefix, const api::ActivityStats& a, std::string_view labels = {}) {
-    std::string name(prefix);
-    gauge(name + "_in_flight", "Operations currently in flight.", (double)a.in_flight, labels);
+  // `name` prefixes the completion counter and the in-flight gauge; `duration`
+  // names the histogram.
+  void activity(std::string_view name, std::string_view duration, const api::ActivityStats& a,
+                std::span<const double> bounds, std::string_view labels = {}) {
+    gauge(std::string(name) + "_in_flight", "Operations currently in flight.", (double)a.in_flight, labels);
     constexpr std::string_view help = "Completed operations by outcome.";
-    counter(name + "_total", help, (double)a.ok, join(labels, "outcome=\"ok\""));
-    counter(name + "_total", help, (double)a.error, join(labels, "outcome=\"error\""));
-    counter(name + "_total", help, (double)a.cancelled, join(labels, "outcome=\"cancelled\""));
-    out.histogram(name + "_duration_seconds", "Operation duration in seconds, including failed operations.",
+    counter(std::string(name) + "_total", help, (double)a.ok, join(labels, "outcome=\"ok\""));
+    counter(std::string(name) + "_total", help, (double)a.error, join(labels, "outcome=\"error\""));
+    counter(std::string(name) + "_total", help, (double)a.cancelled, join(labels, "outcome=\"cancelled\""));
+    out.histogram(duration, "Operation duration in seconds, including failed operations.",
                   bounds, a.duration, labels);
   }
-  void histogram(std::string_view name, std::string_view help, const api::HistogramStats& h) {
+  void histogram(std::string_view name, std::string_view help, std::span<const double> bounds,
+                 const api::HistogramStats& h) {
     out.histogram(name, help, bounds, h);
   }
 };
 
 void service(Renderer& r, const api::ServiceStats& s) {
-  if (!s.version.empty()) r.gauge("luxir_build_info", "Luxir build version.", 1, PrometheusText::label("version", s.version));
+  r.gauge("luxir_build_info", "Luxir build version and CPU target.", 1,
+          PrometheusText::label("version", s.version) + "," + PrometheusText::label("cpu_target", s.cpu_target));
   r.gauge("luxir_node_read_only", "Node is configured read only.", s.read_only);
   for (auto [transportName, transport] : {std::pair{"http", &s.http}, {"grpc", &s.grpc}}) {
     auto t = PrometheusText::label("transport", transportName);
     for (const auto& [operation, activity] : transport->operations)
-      r.activity("luxir_requests", activity, t + "," + PrometheusText::label("operation", operation));
+      r.activity("luxir_requests", "luxir_request_duration_seconds", activity, s.request_duration_bounds,
+                 t + "," + PrometheusText::label("operation", operation));
     for (const auto& [kind, count] : transport->errors)
-      r.counter("luxir_request_errors_total", "First application error per HTTP request or gRPC call, including in-band errors.",
+      r.counter("luxir_request_errors_total", "Failed HTTP requests or gRPC calls, by the kind of their first error.",
                 (double)count, t + "," + PrometheusText::label("kind", kind));
-    r.counter("luxir_received_body_bytes_total", "Received application payload bytes, excluding transport framing.", (double)transport->received_bytes, t);
+    r.counter("luxir_request_body_bytes_total", "Received application payload bytes, excluding transport framing.", (double)transport->received_bytes, t);
     r.counter("luxir_response_body_bytes_total", "Application payload bytes submitted for sending, including failed deliveries.", (double)transport->sent_bytes, t);
     r.counter("luxir_stream_pauses_total", "Response producers paused by flow control.", (double)transport->stream_pauses, t);
   }
   r.gauge("luxir_http_connections", "Live HTTP sessions, including idle keep-alive connections.", (double)s.http.connections);
   r.gauge("luxir_http_io_threads", "Running HTTP connection shard threads (excludes the accept thread).", (double)s.http.io_threads);
-  r.activity("luxir_search", s.search);
-  r.histogram("luxir_search_execution_duration_seconds", "Search body execution, excluding scheduler waits and later streaming drains.", s.search_execution);
+  r.activity("luxir_searches", "luxir_search_duration_seconds", s.search, s.request_duration_bounds);
+  r.histogram("luxir_search_execution_duration_seconds", "Search body execution, excluding scheduler waits and later streaming drains.",
+              s.request_duration_bounds, s.search_execution);
   r.counter("luxir_search_resource_exhausted_total", "Searches rejected by resource limits, including the request memory breaker.", (double)s.search_resource_exhausted);
   r.counter("luxir_search_warnings_total", "Searches completing with at least one declared degradation warning.", (double)s.search_warnings);
-  r.activity("luxir_index_batches", s.index_batches);
+  r.activity("luxir_index_batches", "luxir_index_batch_duration_seconds", s.index_batches, s.request_duration_bounds);
   constexpr std::string_view docs = "Documents accepted into indexing or rejected/rolled back; acceptance is not durable acknowledgment.";
   r.counter("luxir_ingest_documents_total", docs, (double)s.documents_accepted, "outcome=\"accepted\"");
   r.counter("luxir_ingest_documents_total", docs, (double)s.documents_rejected, "outcome=\"rejected\"");
+  for (const auto& [kind, count] : s.document_errors)
+    r.counter("luxir_ingest_document_errors_total", "Documents rejected with an error of their own, by error kind.",
+              (double)count, PrometheusText::label("kind", kind));
   r.counter("luxir_ingest_delete_ids_total", "Accepted delete IDs, not the number of matching documents removed.", (double)s.delete_ids_accepted);
   for (auto [kind, activity] : {std::pair{"flush", &s.flush}, {"commit", &s.commit}, {"merge", &s.merge},
                                 {"vector_build", &s.vector_build}, {"reader_refresh", &s.reader_refresh}})
-    r.activity("luxir_background", *activity, PrometheusText::label("kind", kind));
+    r.activity("luxir_background", "luxir_background_duration_seconds", *activity, s.background_duration_bounds,
+               PrometheusText::label("kind", kind));
 }
 
 void memory(Renderer& r, const api::MemoryStats& m) {
@@ -110,6 +119,16 @@ void memory(Renderer& r, const api::MemoryStats& m) {
   }
 }
 
+void scrub(Renderer& r, const api::ScrubStats& s) {
+  r.counter("luxir_scrub_passes_total", "Completed checksum scrub passes over every collection.", (double)s.passes);
+  r.counter("luxir_scrub_files_total", "Files checked by the checksum scrub.", (double)s.files);
+  r.counter("luxir_scrub_read_bytes_total", "Bytes read by the checksum scrub.", (double)s.bytes);
+  r.counter("luxir_scrub_mismatches_total", "Checksum mismatches, EIO, or unexpectedly missing files.", (double)s.mismatches);
+  r.counter("luxir_scrub_errors_total", "Other file check errors; retried on the next pass.", (double)s.errors);
+  if (s.last_pass_end)
+    r.gauge("luxir_scrub_last_pass_end_timestamp_seconds", "When the last completed scrub pass ended, since Unix epoch.", s.last_pass_end / 1e3);
+}
+
 void cache(Renderer& r, const api::QueryCacheStats& c, const std::string& labels) {
   r.gauge("luxir_filter_cache_resident_bytes", "Resident filter-cache payload bytes.", (double)c.resident_bytes, labels);
   r.gauge("luxir_filter_cache_metadata_bytes", "Filter-cache metadata bytes.", (double)c.metadata_bytes, labels);
@@ -127,7 +146,26 @@ void cache(Renderer& r, const api::QueryCacheStats& c, const std::string& labels
     r.counter(std::string("luxir_filter_cache_") + name + "_total", "Filter-cache events; reset by cache-control reset_counters.", (double)value, labels);
 }
 
-void collections(Renderer& r, const api::StatsResponse& stats, bool files) {
+void collectionActivity(Renderer& r, const api::CollectionActivityStats& a, const std::string& labels) {
+  for (auto [name, seconds, help, o] : {
+           std::tuple{"luxir_collection_searches", "luxir_collection_search_seconds_total",
+                      "Searches that reached the collection, by outcome.", &a.searches},
+           {"luxir_collection_index_batches", "luxir_collection_index_batch_seconds_total",
+            "Index batches the collection's writer processed, by outcome.", &a.index_batches}}) {
+    auto total = std::string(name) + "_total";
+    r.counter(total, help, (double)o->ok, labels + ",outcome=\"ok\"");
+    r.counter(total, help, (double)o->error, labels + ",outcome=\"error\"");
+    r.counter(total, help, (double)o->cancelled, labels + ",outcome=\"cancelled\"");
+    r.counter(seconds, "Summed duration of the completions; divide its rate by the completion rate for the mean.",
+              o->seconds, labels);
+  }
+  constexpr std::string_view docs = "Documents accepted into the collection's indexing or rejected/rolled back.";
+  r.counter("luxir_collection_documents_total", docs, (double)a.documents_accepted, labels + ",outcome=\"accepted\"");
+  r.counter("luxir_collection_documents_total", docs, (double)a.documents_rejected, labels + ",outcome=\"rejected\"");
+  r.counter("luxir_collection_delete_ids_total", "Accepted delete IDs.", (double)a.delete_ids_accepted, labels);
+}
+
+void collections(Renderer& r, const api::StatsResponse& stats) {
   uint64_t available = 0, unavailable = 0;
   for (const auto& c : stats.collections) {
     auto labels = PrometheusText::label("tenant", c.tenant) + "," + PrometheusText::label("collection", c.name);
@@ -146,7 +184,7 @@ void collections(Renderer& r, const api::StatsResponse& stats, bool files) {
     r.gauge("luxir_index_uncommitted_segments", "Flushed segments not in the last published snapshot.",
             t.segments > t.committed_segments ? (double)(t.segments - t.committed_segments) : 0, labels);
     r.gauge("luxir_index_committed_bytes", "Bytes in the current snapshot file descriptors; excludes in-flight and retained files.", (double)t.committed_bytes, labels);
-    if (files) r.gauge("luxir_index_directory_bytes", "Bytes in the index directory listing, including metadata and in-flight files.", (double)t.bytes, labels);
+    if (t.bytes) r.gauge("luxir_index_directory_bytes", "Bytes in the index directory listing, including metadata and in-flight files.", (double)*t.bytes, labels);
     r.gauge("luxir_index_last_commit_timestamp_seconds", "Last published commit time since Unix epoch; age alone does not imply stale data.", index.commit_time / 1e6, labels);
     r.gauge("luxir_snapshot_pins", "Current snapshot pins.", (double)index.snapshot_pins, labels);
     r.gauge("luxir_snapshot_retained_bytes", "Retired bytes held only by snapshot pins.", (double)index.pin_retained_bytes, labels);
@@ -157,11 +195,19 @@ void collections(Renderer& r, const api::StatsResponse& stats, bool files) {
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_idle, labels + ",state=\"idle\"");
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_flushing, labels + ",state=\"flushing\"");
     r.counter("luxir_index_commits_total", "Commits since the writer opened.", (double)index.commits, labels);
+    if (c.activity) collectionActivity(r, *c.activity, labels);
     cache(r, index.query_cache, labels);
   }
   r.gauge("luxir_collections", "Collections by availability.", (double)available, "state=\"available\"");
   r.gauge("luxir_collections", "Collections by availability.", (double)unavailable, "state=\"unavailable\"");
-  r.gauge("luxir_stats_collection_errors", "Collections whose statistics could not be read in this request.", (double)stats.collection_errors);
+}
+
+// One series per collector that ran, so a failing source is alertable.
+void collectors(Renderer& r, std::span<const std::string_view> available,
+                std::span<const std::string_view> unavailable) {
+  constexpr std::string_view help = "Whether the collector could read its sources; unavailable data is omitted.";
+  for (auto collector : available) r.gauge("luxir_stats_collector_success", help, 1, PrometheusText::label("collector", collector));
+  for (auto collector : unavailable) r.gauge("luxir_stats_collector_success", help, 0, PrometheusText::label("collector", collector));
 }
 
 void systemStats(Renderer& r, const api::SystemStats& s) {
@@ -182,77 +228,15 @@ void systemStats(Renderer& r, const api::SystemStats& s) {
     r.gauge("process_max_fds", "Soft file descriptor limit; -1 means unlimited.", (double)p.max_fds);
     r.gauge("process_open_fds", "Open file descriptors.", (double)p.open_fds);
     r.gauge("process_start_time_seconds", "Process start time since Unix epoch.", p.start_time_seconds);
+  }
+  if (s.process_io) {
+    const auto& p = *s.process_io;
     constexpr std::string_view io = "Process I/O accounting from procfs.";
     for (auto [name, value] : {std::pair{"process_disk_read_bytes_total", p.disk_read_bytes},
         {"process_disk_written_bytes_total", p.disk_written_bytes}, {"process_io_read_bytes_total", p.io_read_bytes},
         {"process_io_written_bytes_total", p.io_written_bytes}, {"process_io_read_calls_total", p.io_read_calls},
         {"process_io_write_calls_total", p.io_write_calls}})
       r.counter(name, io, (double)value);
-  }
-  if (s.cpu) {
-    const auto& c = *s.cpu;
-    for (const auto& cpu : c.cpus) {
-      auto labels = PrometheusText::label("cpu", cpu.cpu);
-      for (auto [mode, value] : {std::pair{"user", cpu.user}, {"nice", cpu.nice}, {"system", cpu.system},
-          {"idle", cpu.idle}, {"iowait", cpu.iowait}, {"irq", cpu.irq}, {"softirq", cpu.softirq}, {"steal", cpu.steal}})
-        r.counter("node_cpu_seconds_total", "CPU time by logical CPU and mode; user includes guest time.", value,
-                  labels + "," + PrometheusText::label("mode", mode));
-    }
-    r.counter("node_context_switches_total", "Host context switches.", (double)c.context_switches);
-    r.counter("node_forks_total", "Host tasks created.", (double)c.forks);
-    r.gauge("node_procs_running", "Runnable tasks.", (double)c.procs_running);
-    r.gauge("node_procs_blocked", "Tasks blocked on I/O.", (double)c.procs_blocked);
-    r.gauge("node_boot_time_seconds", "Host boot time since Unix epoch.", c.boot_time_seconds);
-    r.gauge("node_load1", "Host load average.", c.load1);
-    r.gauge("node_load5", "Host load average.", c.load5);
-    r.gauge("node_load15", "Host load average.", c.load15);
-    r.gauge("node_filefd_allocated", "Host allocated file handles.", (double)c.filefd_allocated);
-    r.gauge("node_filefd_maximum", "Host file handle limit.", (double)c.filefd_maximum);
-  }
-  if (s.memory) {
-    const auto& m = *s.memory;
-    for (auto [key, value] : {std::pair{"MemTotal", m.total_bytes}, {"MemFree", m.free_bytes},
-        {"MemAvailable", m.available_bytes}, {"Buffers", m.buffers_bytes}, {"Cached", m.cached_bytes},
-        {"SwapCached", m.swap_cached_bytes}, {"SwapTotal", m.swap_total_bytes}, {"SwapFree", m.swap_free_bytes},
-        {"Dirty", m.dirty_bytes}, {"Writeback", m.writeback_bytes}, {"Mapped", m.mapped_bytes},
-        {"Shmem", m.shmem_bytes}, {"Slab", m.slab_bytes}, {"SReclaimable", m.slab_reclaimable_bytes},
-        {"SUnreclaim", m.slab_unreclaimable_bytes}, {"PageTables", m.page_tables_bytes},
-        {"KernelStack", m.kernel_stack_bytes}, {"AnonPages", m.anon_pages_bytes}})
-      r.gauge(std::string("node_memory_") + key + "_bytes", "Host memory from procfs in bytes.", (double)value);
-    for (auto [key, value] : {std::pair{"pgfault", m.page_faults}, {"pgmajfault", m.major_page_faults},
-        {"pswpin", m.swap_in_pages}, {"pswpout", m.swap_out_pages}, {"oom_kill", m.oom_kills}})
-      r.counter(std::string("node_vmstat_") + key + "_total", "Kernel VM event count.", (double)value);
-  }
-  for (const auto& n : s.network) {
-    auto labels = PrometheusText::label("device", n.device);
-    for (auto [name, value] : {std::pair{"receive_bytes", n.receive_bytes}, {"receive_packets", n.receive_packets},
-        {"receive_errs", n.receive_errs}, {"receive_drop", n.receive_drop}, {"receive_fifo", n.receive_fifo},
-        {"receive_frame", n.receive_frame}, {"receive_compressed", n.receive_compressed},
-        {"receive_multicast", n.receive_multicast}, {"transmit_bytes", n.transmit_bytes},
-        {"transmit_packets", n.transmit_packets}, {"transmit_errs", n.transmit_errs}, {"transmit_drop", n.transmit_drop},
-        {"transmit_fifo", n.transmit_fifo}, {"transmit_colls", n.transmit_colls},
-        {"transmit_carrier", n.transmit_carrier}, {"transmit_compressed", n.transmit_compressed}})
-      r.counter(std::string("node_network_") + name + "_total", "Network namespace interface counter.", (double)value, labels);
-  }
-  if (s.tcp) {
-    r.gauge("node_netstat_Tcp_CurrEstab", "Established TCP connections in the network namespace.", (double)s.tcp->curr_estab);
-    for (auto [name, value] : {std::pair{"RetransSegs", s.tcp->retrans_segs}, {"InErrs", s.tcp->in_errs},
-        {"OutRsts", s.tcp->out_rsts}, {"AttemptFails", s.tcp->attempt_fails}})
-      r.counter(std::string("node_netstat_Tcp_") + name + "_total", "TCP namespace event counter.", (double)value);
-  }
-  for (const auto& d : s.disks) {
-    auto labels = PrometheusText::label("device", d.device);
-    r.counter("node_disk_reads_completed_total", "Completed disk reads.", (double)d.reads_completed, labels);
-    r.counter("node_disk_reads_merged_total", "Merged disk reads.", (double)d.reads_merged, labels);
-    r.counter("node_disk_read_bytes_total", "Disk bytes read.", (double)d.read_bytes, labels);
-    r.counter("node_disk_read_time_seconds_total", "Cumulative disk read time.", d.read_time_seconds, labels);
-    r.counter("node_disk_writes_completed_total", "Completed disk writes.", (double)d.writes_completed, labels);
-    r.counter("node_disk_writes_merged_total", "Merged disk writes.", (double)d.writes_merged, labels);
-    r.counter("node_disk_written_bytes_total", "Disk bytes written.", (double)d.written_bytes, labels);
-    r.counter("node_disk_write_time_seconds_total", "Cumulative disk write time.", d.write_time_seconds, labels);
-    r.gauge("node_disk_io_now", "Disk requests in progress.", (double)d.io_now, labels);
-    r.counter("node_disk_io_time_seconds_total", "Time disk had I/O in progress.", d.io_time_seconds, labels);
-    r.counter("node_disk_io_time_weighted_seconds_total", "Weighted time spent doing I/O.", d.io_time_weighted_seconds, labels);
   }
   if (s.filesystem) {
     const auto& f = *s.filesystem;
@@ -263,12 +247,6 @@ void systemStats(Renderer& r, const api::SystemStats& s) {
     r.gauge("luxir_data_filesystem_files", "Data filesystem inode capacity.", (double)f.files, labels);
     r.gauge("luxir_data_filesystem_files_free", "Data filesystem free inodes.", (double)f.files_free, labels);
     r.gauge("luxir_data_filesystem_readonly", "Data filesystem is mounted read only.", f.readonly, labels);
-  }
-  for (const auto& p : s.pressure) {
-    constexpr std::string_view help = "Time stalled on a resource (PSI some/full).";
-    auto labels = PrometheusText::label("resource", p.resource);
-    r.counter("node_pressure_stall_seconds_total", help, p.some_seconds, labels + ",kind=\"some\"");
-    if (p.full_seconds) r.counter("node_pressure_stall_seconds_total", help, *p.full_seconds, labels + ",kind=\"full\"");
   }
   if (s.cgroup) {
     if (const auto& m = s.cgroup->memory) {
@@ -291,18 +269,85 @@ void systemStats(Renderer& r, const api::SystemStats& s) {
       r.gauge("luxir_cgroup_tasks_max", "Local cgroup task limit; -1 means unlimited.", (double)t->max);
     }
   }
-  // One series per collector that ran, so a failing source is alertable.
-  auto failed = [&](std::string_view name) { return std::ranges::find(s.unavailable, name) != s.unavailable.end(); };
-  constexpr std::string_view help = "Whether the system collector could read its sources; unavailable data is omitted.";
-  for (auto collector : s.unavailable) r.gauge("luxir_stats_collector_success", help, 0, PrometheusText::label("collector", collector));
-  for (std::string_view collector : {"host_stat", "process", "process_io", "cpu", "memory", "network", "tcp", "disk",
-                                     "filesystem", "pressure", "cgroup", "cgroup_memory", "cgroup_cpu", "cgroup_tasks"}) {
-    if (failed(collector) || failed("system")) continue;
-    if (collector == "filesystem" && !s.filesystem) continue;
-    if (collector.starts_with("cgroup_") && !s.cgroup) continue;
-    if ((collector == "process" || collector == "process_io" || collector == "cpu") && failed("host_stat")) continue;
-    r.gauge("luxir_stats_collector_success", help, 1, PrometheusText::label("collector", collector));
+  collectors(r, s.available, s.unavailable);
+}
+
+// Host-wide statistics under luxir_host_, named after their JSON fields; inside
+// a container most describe the host, not the container.
+void hostStats(Renderer& r, const api::HostStats& s) {
+  if (s.cpu) {
+    const auto& c = *s.cpu;
+    for (const auto& cpu : c.cpus) {
+      auto labels = PrometheusText::label("cpu", cpu.cpu);
+      for (auto [mode, value] : {std::pair{"user", cpu.user}, {"nice", cpu.nice}, {"system", cpu.system},
+          {"idle", cpu.idle}, {"iowait", cpu.iowait}, {"irq", cpu.irq}, {"softirq", cpu.softirq}, {"steal", cpu.steal}})
+        r.counter("luxir_host_cpu_seconds_total", "Host CPU time by logical CPU and mode; user includes guest time.", value,
+                  labels + "," + PrometheusText::label("mode", mode));
+    }
+    r.counter("luxir_host_context_switches_total", "Host context switches.", (double)c.context_switches);
+    r.counter("luxir_host_forks_total", "Host tasks created.", (double)c.forks);
+    r.gauge("luxir_host_procs_running", "Runnable tasks.", (double)c.procs_running);
+    r.gauge("luxir_host_procs_blocked", "Tasks blocked on I/O.", (double)c.procs_blocked);
+    r.gauge("luxir_host_boot_time_seconds", "Host boot time since Unix epoch.", c.boot_time_seconds);
+    r.gauge("luxir_host_load1", "Host load average.", c.load1);
+    r.gauge("luxir_host_load5", "Host load average.", c.load5);
+    r.gauge("luxir_host_load15", "Host load average.", c.load15);
+    r.gauge("luxir_host_filefd_allocated", "Host allocated file handles.", (double)c.filefd_allocated);
+    r.gauge("luxir_host_filefd_maximum", "Host file handle limit.", (double)c.filefd_maximum);
   }
+  if (s.memory) {
+    const auto& m = *s.memory;
+    for (auto [name, value] : {std::pair{"total_bytes", m.total_bytes}, {"free_bytes", m.free_bytes},
+        {"available_bytes", m.available_bytes}, {"buffers_bytes", m.buffers_bytes}, {"cached_bytes", m.cached_bytes},
+        {"swap_cached_bytes", m.swap_cached_bytes}, {"swap_total_bytes", m.swap_total_bytes},
+        {"swap_free_bytes", m.swap_free_bytes}, {"dirty_bytes", m.dirty_bytes}, {"writeback_bytes", m.writeback_bytes},
+        {"mapped_bytes", m.mapped_bytes}, {"shmem_bytes", m.shmem_bytes}, {"slab_bytes", m.slab_bytes},
+        {"slab_reclaimable_bytes", m.slab_reclaimable_bytes}, {"slab_unreclaimable_bytes", m.slab_unreclaimable_bytes},
+        {"page_tables_bytes", m.page_tables_bytes}, {"kernel_stack_bytes", m.kernel_stack_bytes},
+        {"anon_pages_bytes", m.anon_pages_bytes}})
+      r.gauge(std::string("luxir_host_memory_") + name, "Host memory from /proc/meminfo in bytes.", (double)value);
+    for (auto [name, value] : {std::pair{"page_faults", m.page_faults}, {"major_page_faults", m.major_page_faults},
+        {"swap_in_pages", m.swap_in_pages}, {"swap_out_pages", m.swap_out_pages}, {"oom_kills", m.oom_kills}})
+      r.counter(std::string("luxir_host_memory_") + name + "_total", "Kernel VM events from /proc/vmstat.", (double)value);
+  }
+  for (const auto& n : s.network) {
+    auto labels = PrometheusText::label("device", n.device);
+    for (auto [name, value] : {std::pair{"receive_bytes", n.receive_bytes}, {"receive_packets", n.receive_packets},
+        {"receive_errs", n.receive_errs}, {"receive_drop", n.receive_drop}, {"receive_fifo", n.receive_fifo},
+        {"receive_frame", n.receive_frame}, {"receive_compressed", n.receive_compressed},
+        {"receive_multicast", n.receive_multicast}, {"transmit_bytes", n.transmit_bytes},
+        {"transmit_packets", n.transmit_packets}, {"transmit_errs", n.transmit_errs}, {"transmit_drop", n.transmit_drop},
+        {"transmit_fifo", n.transmit_fifo}, {"transmit_colls", n.transmit_colls},
+        {"transmit_carrier", n.transmit_carrier}, {"transmit_compressed", n.transmit_compressed}})
+      r.counter(std::string("luxir_host_network_") + name + "_total", "Network namespace interface counter.", (double)value, labels);
+  }
+  if (s.tcp) {
+    r.gauge("luxir_host_tcp_curr_estab", "Established TCP connections in the network namespace.", (double)s.tcp->curr_estab);
+    for (auto [name, value] : {std::pair{"retrans_segs", s.tcp->retrans_segs}, {"in_errs", s.tcp->in_errs},
+        {"out_rsts", s.tcp->out_rsts}, {"attempt_fails", s.tcp->attempt_fails}})
+      r.counter(std::string("luxir_host_tcp_") + name + "_total", "TCP namespace event counter.", (double)value);
+  }
+  for (const auto& d : s.disks) {
+    auto labels = PrometheusText::label("device", d.device);
+    r.counter("luxir_host_disk_reads_completed_total", "Completed disk reads.", (double)d.reads_completed, labels);
+    r.counter("luxir_host_disk_reads_merged_total", "Merged disk reads.", (double)d.reads_merged, labels);
+    r.counter("luxir_host_disk_read_bytes_total", "Disk bytes read.", (double)d.read_bytes, labels);
+    r.counter("luxir_host_disk_read_time_seconds_total", "Cumulative disk read time.", d.read_time_seconds, labels);
+    r.counter("luxir_host_disk_writes_completed_total", "Completed disk writes.", (double)d.writes_completed, labels);
+    r.counter("luxir_host_disk_writes_merged_total", "Merged disk writes.", (double)d.writes_merged, labels);
+    r.counter("luxir_host_disk_written_bytes_total", "Disk bytes written.", (double)d.written_bytes, labels);
+    r.counter("luxir_host_disk_write_time_seconds_total", "Cumulative disk write time.", d.write_time_seconds, labels);
+    r.gauge("luxir_host_disk_io_now", "Disk requests in progress.", (double)d.io_now, labels);
+    r.counter("luxir_host_disk_io_time_seconds_total", "Time disk had I/O in progress.", d.io_time_seconds, labels);
+    r.counter("luxir_host_disk_io_time_weighted_seconds_total", "Weighted time spent doing I/O.", d.io_time_weighted_seconds, labels);
+  }
+  for (const auto& p : s.pressure) {
+    constexpr std::string_view help = "Time stalled on a resource (PSI some/full).";
+    auto labels = PrometheusText::label("resource", p.resource);
+    r.counter("luxir_host_pressure_stall_seconds_total", help, p.some_seconds, labels + ",kind=\"some\"");
+    if (p.full_seconds) r.counter("luxir_host_pressure_stall_seconds_total", help, *p.full_seconds, labels + ",kind=\"full\"");
+  }
+  collectors(r, s.available, s.unavailable);
 }
 } // namespace
 
@@ -346,15 +391,15 @@ std::string PrometheusText::str() const {
   return result;
 }
 
-std::string renderPrometheus(const api::StatsResponse& stats, bool files) {
+std::string renderPrometheus(const api::StatsResponse& stats) {
   PrometheusText out;
-  std::span<const double> bounds;
-  if (stats.service) bounds = stats.service->duration_bounds;
-  Renderer r(out, bounds);
+  Renderer r(out);
   if (stats.service) service(r, *stats.service);
   if (stats.memory) memory(r, *stats.memory);
-  if (stats.totals) collections(r, stats, files);
+  if (stats.totals) collections(r, stats);
   if (stats.system) systemStats(r, *stats.system);
+  if (stats.host) hostStats(r, *stats.host);
+  if (stats.scrub) scrub(r, *stats.scrub);
   r.counter("luxir_multiterm_expansion_refills_total", "Process-wide multi-term expansion refills.", (double)stats.multiterm_expansion_refills);
   r.gauge("luxir_stats_duration_seconds", "Time gathering this response, excluding serialization and transmission.", stats.duration_seconds);
   return out.str();

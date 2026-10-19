@@ -129,7 +129,10 @@ class IndexWriter {
 
 public:
 
-  std::shared_ptr<Metrics> metrics;
+  // The node's and the collection's counters; set by the collection that opens
+  // this writer.
+  std::shared_ptr<Metrics> metrics = Metrics::detached();
+  std::shared_ptr<CollectionMetrics> collectionMetrics = CollectionMetrics::detached();
   struct MergeFailureInfo {
     std::vector<uint64_t> sourceSegIds;
     uint64_t outputSegId = 0;
@@ -526,6 +529,12 @@ public:
   std::shared_ptr<const std::string> getFailureReason() const {
     return failed.load(std::memory_order_acquire) ? failureReason : nullptr;
   }
+
+  // An external check found a committed file damaged (Collection::fail): no
+  // further update, flush, merge or commit may read those bytes or publish
+  // over them. Admission, commit and publication all consult `failed`; a
+  // publication in flight completes first, and the registry closes.
+  void fail(std::string reason);
 
   // Advisory, for callers that would rather give up than submit (a streaming update
   // holding a cached writer).  Closing is terminal, so false may be stale but true

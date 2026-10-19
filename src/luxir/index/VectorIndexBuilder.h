@@ -21,8 +21,9 @@ namespace luxir {
 /// Builds FAISS aux indexes for vector fields in one segment.
 ///
 /// Flat kNN is served directly from the vector column.  Aux builds produce an
-/// IVF+PQ ANN index when enough vectors are present and the segment is large
-/// enough to be worth indexing.
+/// IVF ANN index (the field's "ann" codec: IVF+PQ by default, or opt-in IVF+RaBitQ)
+/// when enough vectors are present and the segment is large enough to be
+/// worth indexing.
 ///
 /// One index per (eligible) vector field per segment, written under a single
 /// filename produced by Postings::getSegmentOverlayFileName.  The "name"
@@ -47,25 +48,27 @@ public:
   static constexpr std::string_view NAME_PREFIX = "vec.";
   static constexpr std::string_view KIND = "vector_faiss";
 
-  // Working-memory budget for the COSINE renormalization buffer.  Mutable so
-  // tests can shrink it to exercise the multi-chunk loop on small inputs.
-  static size_t renormChunkBytes;
+  // Normal aux builds attempt an IVF index.  Tests may disable this to verify
+  // the flat-over-column fallback without changing request selectors.
+  static bool buildFaissAuxIndexes;
 
-  // Normal aux builds attempt IVF+PQ.  Tests may disable this to verify the
-  // flat-over-column fallback without changing request selectors.
-  static bool buildFaissIvfPqAuxIndexes;
-
-  // IVF+PQ tuning defaults.  Zero means "derive from the field / collection".
-  static int32_t ivfPqNList;
-  static int32_t ivfPqM;
-  static int32_t ivfPqBits;
-  static int32_t ivfPqDefaultNProbe;
+  // Build policy.  A segment gets an IVF overlay only when it has at least
+  // the codec's training floor of vectors and N * dims >= the scan-cost
+  // threshold; smaller segments are scanned exactly from the column.
   static int64_t ivfPqMinTrainingVectors;
-  static int64_t ivfPqBuildThresholdScanCost;
-  static std::atomic<int64_t> ivfPqBuildCountForTests;
-  static std::atomic<int64_t> ivfPqMergeBuildCountForTests;
-  static size_t ivfPqTrainingSampleBytes;
-  static size_t ivfPqAddChunkBytes;
+  static int64_t ivfRaBitQMinTrainingVectors;
+  static int64_t ivfBuildThresholdScanCost;
+  static std::atomic<int64_t> ivfBuildCountForTests;
+  static std::atomic<int64_t> ivfMergeBuildCountForTests;
+  static size_t ivfTrainingSampleBytes;
+  // Per-buffer transform budget, capped by available vectors with a minimum
+  // of one vector. Training rotation uses one buffer; add uses up to two for
+  // raw cosine plus rotation. Untransformed PQ add passes column bytes directly to FAISS.
+  static size_t ivfAddChunkBytes;
+
+  // Seed of the RaBitQ random rotation.  Fixed so every overlay of a given
+  // dims shares one matrix (deduplicated in RAM by internVectorRotation).
+  static constexpr int RABITQ_ROTATION_SEED = 0x5ab17;
 
 
   enum class BuildSite {
@@ -123,15 +126,10 @@ private:
 
   // Builds the FAISS index file for one field.  Returns nullopt when
   // no segment has any vectors for the field (no files written, nothing to record).
-  std::optional<AuxInfo> buildField(std::string_view fieldName,
-                                                const VectorFieldType& ft,
-                                                std::vector<std::string>& outFilesToSync,
-                                                BuildSite buildSite);
-
-  std::optional<AuxInfo> buildIvfPqField(std::string_view fieldName,
-                                                     const VectorFieldType& ft,
-                                                     std::vector<std::string>& outFilesToSync,
-                                                     BuildSite buildSite);
+  std::optional<AuxInfo> buildIvfField(std::string_view fieldName,
+                                      const VectorFieldType& ft,
+                                      std::vector<std::string>& outFilesToSync,
+                                      BuildSite buildSite);
 };
 
 } // namespace luxir

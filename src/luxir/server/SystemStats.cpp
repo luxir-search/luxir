@@ -3,10 +3,13 @@
 #include "Stats.h"
 #include "luxir/api/build.h"
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <optional>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -21,6 +24,30 @@
 namespace luxir {
 namespace {
 using api::build::arenaStr;
+
+// Each collector fills its own fields or is listed as unavailable; a missing
+// source never hides the others.
+struct Collectors {
+  std::vector<std::string_view> available, unavailable;
+
+  template<class F>
+  bool collect(std::string_view name, F&& fn) {
+    try {
+      fn();
+      available.push_back(name);
+      return true;
+    } catch (const std::exception&) {
+      unavailable.push_back(name);
+      return false;
+    }
+  }
+  void finish(std::span<const std::string_view>& availableOut, std::span<const std::string_view>& unavailableOut,
+              std::pmr::memory_resource& resource) {
+    std::copy(available.begin(), available.end(), api::build::allocArray(availableOut, available.size(), resource));
+    std::copy(unavailable.begin(), unavailable.end(),
+              api::build::allocArray(unavailableOut, unavailable.size(), resource));
+  }
+};
 
 #ifdef __linux__
 std::ifstream input(const std::filesystem::path& path) {
@@ -116,7 +143,7 @@ void process(api::ProcessStats& out, const HostStat& host) {
   out.start_time_seconds = host.scalars.at("btime") + std::stod(field) / (double)sysconf(_SC_CLK_TCK);
 }
 
-void processIO(api::ProcessStats& out) {
+void processIO(api::ProcessIoStats& out) {
   auto io = values("/proc/self/io");
   out.disk_read_bytes = (uint64_t)io.at("read_bytes");
   out.disk_written_bytes = (uint64_t)io.at("write_bytes");
@@ -356,46 +383,59 @@ void cgroupTasks(api::CgroupTaskStats& out, const std::filesystem::path& path) {
 #endif
 } // namespace
 
-void gatherSystemStats(api::SystemStats& stats, std::string_view dataDirectory,
+void gatherSystemStats(api::SystemStats* system, api::HostStats* host, std::string_view dataDirectory,
                        std::pmr::memory_resource& resource) {
-  std::vector<std::string_view> unavailable;
 #ifdef __linux__
-  // Each collector fills its own section or is listed as unavailable; a
-  // missing source never hides the others.
-  auto collect = [&](std::string_view name, auto&& fn) {
-    try { fn(); return true; } catch (const std::exception&) { unavailable.push_back(name); return false; }
+  // /proc/stat serves both the process start time and the host CPU.
+  std::optional<HostStat> stat;
+  auto readStat = [&]() -> const HostStat& {
+    if (!stat) stat = hostStat();
+    return *stat;
   };
-  HostStat host;
-  bool haveHost = collect("host_stat", [&] { host = hostStat(); });
-  api::ProcessStats process;
-  bool processOk = haveHost && collect("process", [&] { luxir::process(process, host); });
-  collect("process_io", [&] { processIO(process); });
-  if (processOk) stats.process = process;
-  if (haveHost) collect("cpu", [&] { api::HostCpuStats cpu; hostCPU(cpu, host, resource); stats.cpu = cpu; });
-  collect("memory", [&] { api::HostMemoryStats memory; hostMemory(memory); stats.memory = memory; });
-  collect("network", [&] { network(stats.network, resource); });
-  collect("tcp", [&] { api::TcpStats t; tcp(t); stats.tcp = t; });
-  collect("disk", [&] { disks(stats.disks, resource); });
-  // Only the data filesystem: statvfs on arbitrary remote mounts can hang.
-  if (!dataDirectory.empty()) {
-    collect("filesystem", [&] { api::FilesystemStats fs; filesystem(fs, dataDirectory, resource); stats.filesystem = fs; });
+  if (system) {
+    Collectors c;
+    c.collect("process", [&] { api::ProcessStats process; luxir::process(process, readStat()); system->process = process; });
+    c.collect("process_io", [&] { api::ProcessIoStats io; processIO(io); system->process_io = io; });
+    // Only the data filesystem: statvfs on arbitrary remote mounts can hang.
+    if (!dataDirectory.empty()) {
+      c.collect("filesystem", [&] {
+        api::FilesystemStats fs;
+        filesystem(fs, dataDirectory, resource);
+        system->filesystem = fs;
+      });
+    }
+    std::filesystem::path cgroupPath;
+    if (c.collect("cgroup", [&] { cgroupPath = cgroupDirectory(); })) {
+      auto& cgroup = system->cgroup.emplace();
+      cgroup.path = arenaStr(resource, cgroupPath.string());
+      // Controllers are independent: a missing pids controller must not hide
+      // otherwise available CPU and memory measurements.
+      c.collect("cgroup_memory", [&] { api::CgroupMemoryStats m; cgroupMemory(m, cgroupPath); cgroup.memory = m; });
+      c.collect("cgroup_cpu", [&] { api::CgroupCpuStats cpu; cgroupCPU(cpu, cgroupPath); cgroup.cpu = cpu; });
+      c.collect("cgroup_tasks", [&] { api::CgroupTaskStats t; cgroupTasks(t, cgroupPath); cgroup.tasks = t; });
+    }
+    c.finish(system->available, system->unavailable, resource);
   }
-  collect("pressure", [&] { pressure(stats.pressure, resource); });
-  std::filesystem::path cgroupPath;
-  if (collect("cgroup", [&] { cgroupPath = cgroupDirectory(); })) {
-    auto& cgroup = stats.cgroup.emplace();
-    cgroup.path = arenaStr(resource, cgroupPath.string());
-    // Controllers are independent: a missing pids controller must not hide
-    // otherwise available CPU and memory measurements.
-    collect("cgroup_memory", [&] { api::CgroupMemoryStats m; cgroupMemory(m, cgroupPath); cgroup.memory = m; });
-    collect("cgroup_cpu", [&] { api::CgroupCpuStats c; cgroupCPU(c, cgroupPath); cgroup.cpu = c; });
-    collect("cgroup_tasks", [&] { api::CgroupTaskStats t; cgroupTasks(t, cgroupPath); cgroup.tasks = t; });
+  if (host) {
+    Collectors c;
+    c.collect("cpu", [&] { api::HostCpuStats cpu; hostCPU(cpu, readStat(), resource); host->cpu = cpu; });
+    c.collect("memory", [&] { api::HostMemoryStats memory; hostMemory(memory); host->memory = memory; });
+    c.collect("network", [&] { network(host->network, resource); });
+    c.collect("tcp", [&] { api::TcpStats t; tcp(t); host->tcp = t; });
+    c.collect("disk", [&] { disks(host->disks, resource); });
+    c.collect("pressure", [&] { pressure(host->pressure, resource); });
+    c.finish(host->available, host->unavailable, resource);
   }
 #else
   (void)dataDirectory;
-  unavailable.push_back("system");
+  if (system) {
+    Collectors c{{}, {"system"}};
+    c.finish(system->available, system->unavailable, resource);
+  }
+  if (host) {
+    Collectors c{{}, {"host"}};
+    c.finish(host->available, host->unavailable, resource);
+  }
 #endif
-  auto* names = api::build::allocArray(stats.unavailable, unavailable.size(), resource);
-  std::copy(unavailable.begin(), unavailable.end(), names);
 }
 } // namespace luxir

@@ -159,8 +159,10 @@ Filesystem publication syncs new data files and then the directory before
 writing a new `commit_<index_gen>` manifest with a length and xxh3 checksum
 footer. It syncs that manifest and then the directory before acknowledging
 the commit. Startup checks the newest manifest's footer and decodes its payload;
-it does not hash data files. Torn candidates are skipped. Fallback candidates
-also require their referenced files to be present with matching sizes.
+by default it does not hash data files (see
+[file integrity checks](#file-integrity-checks)). Torn candidates are skipped.
+Fallback candidates also require their referenced files to be present with
+matching sizes.
 
 Once the new root is durable, obsolete manifests and unreferenced data are removed.
 Replication pin counters are described in the
@@ -193,10 +195,15 @@ Valid spdlog levels include `trace`, `debug`, `info`, `warn`, `error`, and
 
 ## Stats and monitoring
 
-`_stats` is the single statistics endpoint. It returns one typed response,
-rendered as JSON by default or as Prometheus text format 0.0.4 with
-`format=prometheus`. Both renderings come from the same response, so a value
-present in one is present in the other. The same response is available through
+`_stats` returns one typed response, rendered as JSON by default or as
+Prometheus text format 0.0.4 with `format=prometheus`. `GET /metrics` is the
+node's Prometheus scrape: the same response and rendering, with
+`collections=true` and `system=true` unless the URL says otherwise (it takes
+the same parameters, so `format=json` returns that response as JSON). Both
+renderings come from the same response. Prometheus carries every monitoring
+value; generations, segment and aux index layout, and the pre-summed totals
+are JSON-only (Prometheus sums the per-index series itself). A test fails when
+a new field is in neither list. The same response is available through
 unary `luxir.Admin/Stats` (structured protobuf; there is no text rendering on
 gRPC). The endpoint shares the administration API's network access boundary
 and includes host information and tenant/collection names.
@@ -204,6 +211,7 @@ and includes host information and tenant/collection names.
 | Route | Scope |
 | --- | --- |
 | `GET /_stats` | The node. |
+| `GET /metrics` | The node, as Prometheus text with collections and system statistics. |
 | `GET /tenants/{tenant}/_stats` | Every collection of one tenant. |
 | `GET /collections/{collection}/_stats`, `GET /tenants/{tenant}/collections/{collection}/_stats` | One collection. |
 
@@ -219,7 +227,8 @@ blocks.
 | `files=true` | `bytes` from an index directory listing; aux index and segment bytes. Implies `collections`. | Lists every index directory. |
 | `segments=true` | Per-segment records. Implies `files`. | Iterates segments. |
 | `columns=true` | Per-segment column zone statistics for INT and DATE columns, see [Column zone statistics](#column-zone-statistics). Implies `segments`. | Reads block metadata, O(blocks) per column. |
-| `system=true` | `system`: process, host CPU/memory, network, disk, data filesystem, pressure and cgroup v2. Node scope only. | About 20 procfs/cgroupfs reads and a scan of `/proc/self/fd`. |
+| `system=true` | `system`: this process, the data filesystem and the process's cgroup v2. Node scope only. | About 15 procfs/cgroupfs reads and a scan of `/proc/self/fd`. |
+| `host=true` | `host`: host-wide CPU, memory, network, TCP, disk and pressure statistics, which node_exporter also reports. Node scope only. | About 10 procfs reads. |
 | `format=prometheus` | Text exposition instead of JSON (`text/plain; version=0.0.4`). | Rendering only. |
 
 Flags accept exactly `true` or `false`; `format` accepts `json` or
@@ -238,31 +247,50 @@ emitted, so a reader must treat an absent field as zero. Totals appear at the
 node, collection, and index levels, and each level sets only the counts that
 mean something there: `collections` only on the node total, `shards` only on
 node and collection totals. A node-wide walk includes load-failure tombstones
-with their `error` and excludes them from totals; a collection that cannot be
-read mid-walk (for example, deleted concurrently) is left out and counted in
-`collection_errors`. Each collection index is sampled coherently, but a
+with their `error` and excludes them from totals. A collection deleted during
+the walk is reported the same way, as unavailable; one whose statistics cannot
+be read for another reason carries that failure in its `error`, and the
+failure is logged. Each collection index is sampled coherently, but a
 node-wide response is not one transaction across collections.
+
+Each serving collection also reports its `activity` since it was opened:
+searches and index batches by outcome with their summed `seconds`, and the
+documents and delete IDs its writer accepted or rejected. These count only
+work that reached the collection. `service` has the node totals, which also
+count requests that never resolved a collection and keep their counts after
+a collection is deleted.
 
 Two byte counts measure different things and will disagree:
 
 - `committed_bytes` sums the file sizes recorded in the current published
   snapshot. It needs no filesystem access, so it is always reported. It
   excludes in-flight files and files kept only by snapshot pins.
-- `bytes` (with `files=true`) is a directory listing of the whole index
-  directory: manifests, in-flight flush and merge output, and pin-retained
-  files. It is normally larger than `committed_bytes`, and can exceed the sum
+- `bytes` (present only with `files=true`) is a directory listing of the
+  whole index directory: manifests, in-flight flush and merge output, and
+  pin-retained files. It is normally larger than `committed_bytes`, and can exceed the sum
   of segment bytes. With `segments=true` each segment reports its own `bytes`
   (data + deletes + overlays) and each aux entry reports the bytes of its
   listed files.
 
 `service` counters are process-wide and reset on restart. Each activity
 (`operations` per transport, `search`, `index_batches`, `flush`, `commit`,
-`merge`, `vector_build`, `reader_refresh`) reports `in_flight`, completions by
-outcome (`ok`, `error`, `cancelled`) and a `duration` histogram. Histogram
-`counts` are cumulative, aligned with the shared `service.duration_bounds`
-(seconds) plus a final `+Inf` entry, and are omitted while `count` is zero.
-`errors` counts the first application error per request or call by error kind,
-including errors carried inside a successful transport response. `_stats`
+`merge`, `vector_build`, `reader_refresh`) reports `in_flight`, completions by outcome
+(`ok`, `error`, `cancelled`) and a `duration` histogram. Histogram `counts` are
+cumulative, aligned with `service.request_duration_bounds` (requests, search
+execution and index batches, from 10 microseconds) or
+`service.background_duration_bounds` (the background stages, up to an hour),
+in seconds, plus a final `+Inf` entry, and are omitted while `count` is zero.
+A request or call fails when its response carries a whole-request error (a
+failed search, an update that applied nothing), when a stream ends in
+failure, or when the server fails it; a client that goes away first cancels
+it. `errors` counts failed requests and calls by the kind of their first
+error. An update that applies some of its documents succeeds; its rejected
+documents are counted in `documents_rejected`, and those with an error of
+their own in `document_errors` by kind. An NDJSON stream fails as a whole:
+when it ends in failure, when its URL commit fails, or when it applied none of
+its input. Messages on a gRPC `Search` or `UpdateStream` call count as
+searches or index batches; the call fails only when it ends in failure.
+`_stats`
 requests themselves are counted under the `stats` operation; replication routes
 are not counted.
 
@@ -283,19 +311,14 @@ and an absent field means none. `schema_gen`, `index_gen`, `core_gen`, and
 
 ### Prometheus scraping
 
-Point Prometheus at `_stats` with the flags you want. Scrape parameters choose
-the cost: drop `collections` on nodes with very many collections, and drop
-`system` when node_exporter already covers the host.
+Prometheus scrapes `/metrics` by default, so a job needs only its targets.
+Parameters choose the cost: `collections=false` on nodes with very many
+collections, and `host=true` only where node_exporter does not cover the host.
 
 ```yaml
 scrape_configs:
   - job_name: luxir
     scrape_interval: 15s
-    metrics_path: /_stats
-    params:
-      format: [prometheus]
-      collections: ["true"]
-      system: ["true"]
     static_configs:
       - targets: ["localhost:9400"]
 ```
@@ -309,14 +332,15 @@ client load.
 
 | Metric or family | Meaning |
 | --- | --- |
-| `luxir_requests_total`, `luxir_requests_in_flight`, `luxir_requests_duration_seconds` | HTTP requests or gRPC calls, by `transport`, bounded `operation`, and completion `outcome`. Duration includes body reception after HTTP headers, execution, waits, and response delivery. A gRPC stream is one call, regardless of its message count. |
-| `luxir_request_errors_total` | First application failure per request/call, by transport and fixed error `kind`; includes errors carried inside successful transport responses. |
-| `luxir_received_body_bytes_total`, `luxir_response_body_bytes_total` | Application payload throughput; excludes transport framing. Response bytes are counted when submitted for sending, even if delivery subsequently fails. |
-| `luxir_search_total`, `luxir_search_in_flight`, `luxir_search_duration_seconds` | Engine search requests, including individual messages on a gRPC stream. Ends when the final response is handed to the transport. |
+| `luxir_requests_total`, `luxir_requests_in_flight`, `luxir_request_duration_seconds` | HTTP requests or gRPC calls, by `transport`, bounded `operation`, and completion `outcome`. Duration includes body reception after HTTP headers, execution, waits, and response delivery. A gRPC stream is one call, regardless of its message count. |
+| `luxir_request_errors_total` | Failed requests/calls, by transport and the fixed `kind` of their first error. An update that applies some documents is not a failed request. |
+| `luxir_request_body_bytes_total`, `luxir_response_body_bytes_total` | Application payload throughput; excludes transport framing. Response bytes are counted when submitted for sending, even if delivery subsequently fails. |
+| `luxir_searches_total`, `luxir_searches_in_flight`, `luxir_search_duration_seconds` | Searches the engine accepted, by `outcome`, from submission to the final response. A gRPC `Search` call can carry many searches, so this is its per-search view; `cancelled` means the search ended without a final response. |
 | `luxir_search_execution_duration_seconds` | Search-body execution, excluding scheduler/visibility waits and later streaming drains. |
 | `luxir_search_resource_exhausted_total`, `luxir_search_warnings_total` | Resource-limit failures (including the request memory breaker), and searches with declared degradation warnings. |
-| `luxir_index_batches_total`, `luxir_index_batches_in_flight`, `luxir_index_batches_duration_seconds` | Index-batch processing inside the engine, excluding queueing and commit work. HTTP NDJSON can produce many batches per request. |
+| `luxir_index_batches_total`, `luxir_index_batches_in_flight`, `luxir_index_batch_duration_seconds` | Index-batch processing inside the engine, excluding queueing and commit work. HTTP NDJSON can produce many batches per request. A batch fails only when none of it applied. |
 | `luxir_ingest_documents_total`, `luxir_ingest_delete_ids_total` | Documents accepted into indexing or rejected/rolled back, and accepted delete IDs. Acceptance does not mean durability; commits can still fail. Deletes count submitted IDs, not matched documents. |
+| `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
 | `luxir_stream_pauses_total` | Response backpressure events by transport. |
 | `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
 | `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
@@ -325,24 +349,27 @@ client load.
 | `luxir_storage_ram_bytes`, `luxir_storage_ram_limit_bytes` | RAM storage consumption and its cap, separate from filesystem usage. |
 | `luxir_field_metadata_objects`, `luxir_field_metadata_bytes` | Cached field metadata by `part` (directory, page, entry, name). |
 | `luxir_allocator_bytes`, `luxir_allocator_arena_*_bytes` | Jemalloc allocated, active, resident, mapped, retained, dirty, and metadata memory, plus indexing/big-buffer arenas. Resident is an allocator estimate, not process RSS. Absent without jemalloc; check `luxir_allocator_stats_available`. |
+| `luxir_scrub_*_total`, `luxir_scrub_last_pass_end_timestamp_seconds` | Checksum scrub passes, files, read bytes, mismatches, and other check errors, and when the last pass ended. Present only while scrubbing is enabled; the timestamp is absent before the first pass. |
 | `luxir_multiterm_expansion_refills_total` | Process-wide multi-term expansion refills. |
-| `luxir_build_info`, `luxir_node_read_only` | Build version and read-only configuration. |
+| `luxir_build_info`, `luxir_node_read_only` | Build version and CPU target, and read-only configuration. |
 | `luxir_stats_duration_seconds` | Time gathering the response, excluding serialization. |
 
 With `collections=true`:
 
 | Metric or family | Meaning |
 | --- | --- |
-| `luxir_collections`, `luxir_collection_available` | Collection availability. An available HTTP endpoint does not imply every collection is usable. |
+| `luxir_collections`, `luxir_collection_available` | Collection availability, including collections deleted or unreadable during the walk. An available HTTP endpoint does not imply every collection is usable. |
 | `luxir_collection_storage_ram_bytes` | RAM storage owned by the collection. |
 | `luxir_index_documents`, `luxir_index_segments`, `luxir_index_uncommitted_segments` | Flushed segment document/segment state; excludes documents still buffered in inverters. |
 | `luxir_index_committed_bytes`, `luxir_index_last_commit_timestamp_seconds` | Current snapshot descriptor bytes and publication timestamp. An old timestamp alone does not indicate a problem on an idle collection. |
 | `luxir_index_directory_bytes` | Directory-listing bytes; only with `files=true`. See the two byte counts above. |
 | `luxir_index_commits_total` | Commits since the writer opened. |
+| `luxir_collection_searches_total`, `luxir_collection_search_seconds_total` | Searches that reached the collection, by `outcome`, and their summed duration from submission to the final response. The mean is the ratio of the two rates. |
+| `luxir_collection_index_batches_total`, `luxir_collection_index_batch_seconds_total` | The collection's index batches by `outcome`, and their summed processing time. |
+| `luxir_collection_documents_total`, `luxir_collection_delete_ids_total` | Documents the collection accepted or rejected, and its accepted delete IDs. |
 | `luxir_inverters`, `luxir_merge_tasks` | Busy, idle, and flushing inverters; outstanding merge work includes queued tasks. |
 | `luxir_filter_cache_*` | Hit/miss counters, build attempts, builds, dead builds, thrash skips, admissions, rejections, evictions, purges, bypasses, reader-stable counters, payload/metadata memory, and payload budget. |
 | `luxir_snapshot_pins`, `luxir_snapshot_retained_bytes`, `luxir_snapshot_pin_drops_total` | Current pins, retired files held only by pins, and pins dropped by `reason` (idle, budget). A stats request never expires pins or removes files. |
-| `luxir_stats_collection_errors` | Collections that could not be read in this request, including deletion races; other rows remain available. |
 
 Counters reset when their owner restarts. Collection cache counters also reset
 on recreation or explicit cache-control `reset_counters`; use `rate()` or
@@ -352,36 +379,49 @@ buckets, not averages of node percentiles.
 
 Collection metrics use `tenant` and `collection` labels. There are no labels
 for raw URLs, query text, field names, document IDs, commit IDs, or segment IDs.
+Each collection adds about 50 series; on a node with very many collections,
+scrape `/metrics?collections=false` and read per-collection detail from
+`_stats` on demand.
 Generations, aux indexes, and per-segment layout are JSON only.
 
-### Process and system metrics
+### Process, system and host metrics
 
-With `system=true` (Linux only), the response describes the kernel views
-available to the Luxir process:
+With `system=true` (Linux only), the response describes this process, its
+data filesystem and its cgroup:
 
 | Family | Coverage |
 | --- | --- |
 | `process_*` | CPU time, thread count, resident/virtual/anonymous/file/shared/swap/peak memory, open descriptors and soft descriptor limit, start time, voluntary/involuntary context switches, minor/major page faults, storage bytes, and I/O syscall bytes/counts. Context switches and CPU cover all process threads. |
-| `node_cpu_seconds_total`, `node_load*`, `node_procs_*`, `node_forks_total`, `node_context_switches_total`, `node_boot_time_seconds` | CPU modes per logical CPU, load averages, runnable/blocked tasks, task creation, context switches, and boot time. |
-| `node_memory_*_bytes`, `node_vmstat_*_total` | Total/available/free memory, page cache, swap, dirty/writeback pages, kernel/slab memory, faults, swap events, and OOM kills where supported. |
-| `node_filefd_*` | Host-wide allocated file handles and their limit. |
-| `node_network_*_total`, `node_netstat_Tcp_*` | Per-interface bytes/packets/errors/drops and TCP established connections, retransmissions, resets, input errors, and failed attempts. These describe the network namespace, not just Luxir traffic. |
-| `node_disk_*` | Every visible block device's read/write bytes, operations, merges, cumulative latency, I/O in progress, busy time, and weighted I/O time. Device and partition counters overlap; do not sum them indiscriminately. |
 | `luxir_data_filesystem_*` | The configured filesystem data directory's capacity, free/available bytes, total/free inodes, and read-only state. Only for filesystem storage. Arbitrary remote mounts are not probed. |
-| `node_pressure_stall_seconds_total` | CPU, memory, and I/O pressure stall time, with `some`/`full` labels where supported. |
 | `luxir_cgroup_*` | Current cgroup v2 memory usage/high/max, task count/limit, memory pressure/OOM events, CPU time/quota, and CPU throttling time/periods. Memory includes page cache and descendants. |
 
-In containers, host CPU/memory/disk views can be broader than the container;
-network counters follow its network namespace. Cgroup statistics locate this
-process's membership using procfs and the cgroup mount. They report **local**
-limits; ancestor cgroups can impose stricter limits. A cgroup limit of `-1`
-means unlimited. Cgroup v1 is not supported.
+Cgroup statistics locate this process's membership using procfs and the
+cgroup mount. They report **local** limits; ancestor cgroups can impose
+stricter limits. A cgroup limit of `-1` means unlimited. Cgroup v1 is not
+supported.
 
-A collector whose source is unavailable, unsupported, or unreadable is listed
-in the JSON `system.unavailable` and reported as
-`luxir_stats_collector_success{collector="..."} 0`; its measurements are
-omitted, not reported as zero. Restricted procfs, disabled PSI, and absent
-cgroup controllers are common reasons.
+With `host=true` (Linux only), the response adds host-wide statistics, the
+ones node_exporter reports. They are named `luxir_host_*` after their JSON
+fields, so they never collide with node_exporter's series:
+
+| Family | Coverage |
+| --- | --- |
+| `luxir_host_cpu_seconds_total`, `luxir_host_load*`, `luxir_host_procs_*`, `luxir_host_forks_total`, `luxir_host_context_switches_total`, `luxir_host_boot_time_seconds` | CPU modes per logical CPU, load averages, runnable/blocked tasks, task creation, context switches, and boot time. |
+| `luxir_host_memory_*` | Total/available/free memory, page cache, swap, dirty/writeback pages, kernel/slab memory, faults, swap events, and OOM kills where supported. |
+| `luxir_host_filefd_*` | Host-wide allocated file handles and their limit. |
+| `luxir_host_network_*_total`, `luxir_host_tcp_*` | Per-interface bytes/packets/errors/drops and TCP established connections, retransmissions, resets, input errors, and failed attempts. These describe the network namespace, not just Luxir traffic. |
+| `luxir_host_disk_*` | Every visible block device's read/write bytes, operations, merges, cumulative latency, I/O in progress, busy time, and weighted I/O time. Device and partition counters overlap; do not sum them indiscriminately. |
+| `luxir_host_pressure_stall_seconds_total` | CPU, memory, and I/O pressure stall time, with `some`/`full` labels where supported. |
+
+Inside a container, the host CPU, memory and disk figures describe the host,
+not the container; network counters follow the container's network
+namespace. The cgroup statistics under `system` are the container's own view.
+
+Each section lists the collectors that read their sources in `available` and
+the others in `unavailable` (JSON), reported as
+`luxir_stats_collector_success{collector="..."}` 1 or 0. An unavailable
+collector's measurements are omitted, not reported as zero. Restricted procfs,
+disabled PSI, and absent cgroup controllers are common reasons.
 
 Useful initial alerts are: scrape failures, unavailable collections, rising
 internal/unavailable errors, p99 latency above the service target, sustained
@@ -391,16 +431,16 @@ For example, aggregate HTTP search p99 across nodes with:
 
 ```promql
 histogram_quantile(0.99,
-  sum by (le) (rate(luxir_requests_duration_seconds_bucket{
+  sum by (le) (rate(luxir_request_duration_seconds_bucket{
     transport="http", operation="search"
   }[5m]))
 )
 ```
 
 There are no replication metrics in `_stats`; see
-[replication status](replication.md#diagnose-status). Search admission queues,
-deadline-driven partial results, and checksum scrubbing are not implemented on
-this revision, so no statistics exist for those features.
+[replication status](replication.md#diagnose-status). Search admission queues and
+deadline-driven partial results are not implemented on this revision, so no
+statistics exist for those features.
 
 ### Column zone statistics
 
@@ -575,7 +615,9 @@ Search has its own limits:
 - `query-cache-bytes` caps each collection's filter cache (default `64MB`; `0`
   disables it). Cached filters are evicted by rebuild cost per byte, so under
   pressure the cache keeps expensive compound filters and drops cheap ones
-  first. Cache counters appear in `_stats`.
+  first. Cache counters appear in `_stats?collections=true`
+  (and on the collection and tenant `_stats` routes). Date ranges with an unrounded
+  `NOW` bound are never cached; see [Dates](dates.md#date-math).
 
 ## Time-zone data
 
@@ -603,7 +645,75 @@ kept as a tombstone rather than preventing healthy collections from loading.
 Queries and updates to that collection return the recorded load error as an
 `unavailable` error (HTTP `503`, code `collection_unavailable`) and the server
 will not silently recreate storage over it. Other segment corruption is
-detected when the affected reader is opened.
+detected when the affected reader is opened, or earlier with the
+[file integrity checks](#file-integrity-checks) below.
+
+## File integrity checks
+
+Every committed manifest records each file it references with its size and
+xxh3-64 digest, computed while the file is written. Checks read a file with
+its own descriptor (never through the mapping queries use), so a bad sector
+fails the check instead of the process, and a check never touches the request
+threads' address space.
+
+- **Transfers** always verify: a replicated file is hashed while it streams in
+  and is installed only if it matches, and a follower hashes a leftover local
+  candidate before reusing it. Reuse by hard link (a repointed follower,
+  `luxir promote`, writer recovery from an older root) compares manifest
+  descriptors only; whether the linked bytes still match is the at-rest
+  question the checks below answer.
+- **`--store.verify-on-open=full`** reads every file of every collection's
+  committed snapshot at startup, one collection at a time on the node's
+  indexing threads. Within a collection, files hash in parallel, largest first;
+  checksum descriptors are held for at most one collection at a time. Checked
+  files are verified before any reader maps or parses them. Readers map those
+  same descriptors, so a file retired during hashing remains readable. The
+  default, `none`, trusts the manifest footer and file sizes. A mismatching, missing or unreadable file fails only that
+  collection: it loads as unavailable (HTTP `503`, code `collection_unavailable`)
+  with an error naming the file (`checksum mismatch: <file>: expected size=..
+  xxh3=.., actual ..`, `missing file: <file>` or `unreadable file: <file>: ..` for EIO),
+  and its data is kept. Other verification errors also fail the load, with
+  `could not verify file: <file>: ..`; verification never creates corruption
+  markers. A follower then fetches the damaged files from its source. `luxir promote --store.verify-on-open=full` checks the files it links
+  the same way. Startup reads the whole index, so expect it to take as long as
+  reading the data directory once.
+- **`--store.scrub-interval-s=N`** (default `0`, off) re-reads the files of
+  every published snapshot every `N` seconds on one thread, with `O_DIRECT`
+  where the filesystem allows so the pass reads the media and leaves the page
+  cache to queries, paced to `--store.scrub-max-bytes-per-sec` (default
+  `64MB`, `0` for unthrottled; the rate is the throttle, the thread's low CPU
+  priority only yields the CPU). A size/digest mismatch, EIO, or a held file
+  missing on a writer or follower is logged at error level and fails
+  the collection: it is unavailable with the same error, a writer publishes
+  nothing more over the damaged bytes (no further update, commit or merge), and
+  the suspect file is recorded in a `corrupted_<id>` marker in the incarnation
+  directory. `GET /_stats` reports node-wide `scrub` counters (`passes`,
+  `files`, `bytes`, `mismatches`, `errors`, `last_pass_end` in Unix milliseconds)
+  while scrubbing is enabled. `mismatches` includes EIO and unexpectedly missing
+  files. Other errors (such as descriptor exhaustion, allocation failures or
+  permission errors) are warnings counted in `errors`; they leave the collection
+  available and the next pass retries. On a read-only node a live writer can
+  retire files still served through mappings: the scrub skips missing files.
+
+On a writable node a marker survives restarts: at startup the files it names
+are re-verified with `O_DIRECT` where supported, whatever
+`--store.verify-on-open` says. Under `full` other files use buffered reads.
+The collection stays unavailable while a suspect file still fails; the marker
+is removed once its files pass or are replaced. Read-only nodes honor existing
+markers but cannot persist new ones or clear them, so their scrub failures do
+not survive a restart unless another process recorded a marker.
+
+Markers travel with `luxir promote` and writer recovery into a new incarnation,
+restricted to files in the copied manifest. A promoted or recovered writer
+therefore re-checks known suspects even under the default policy. A follower
+repairs a scrub hit by itself: the next sync re-downloads every marker-named
+file even if its buffered hash matches, checks other local candidates as usual,
+and installs the copy again. Suspect files are never linked from the serving
+copy, and a failed serving collection supplies no hard-link reuse. An advance
+cannot replace a suspect serving file in place; repair first unloads the failed
+collection and re-stages it. Repair a writer by restoring from a follower
+(`luxir pull` and `luxir promote`) or by replacing the damaged file from a
+backup and restarting.
 
 ## Current production boundary
 

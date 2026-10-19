@@ -118,6 +118,11 @@ public:
   // and the child's column and ord-map decoding.
   static constexpr size_t CACHE_BYTES = 256 * 1024;
 
+  struct InputDomainBytes { size_t largestSegment = 0; size_t wholeReader = 0; };
+  // Conservative retained-domain bound, shared by structural routing and
+  // child plans that keep their input domains for result-stage execution.
+  static InputDomainBytes inputDomainBytes(IndexReader& reader);
+
   struct StructuralRoute {
     bool scopeNeeded = false;
     bool overrides = false;
@@ -180,7 +185,9 @@ public:
     if (children.empty() || buckets.empty()) return;
     size_t residentBytesPerBucket = 0;
     bool sharedSegmentWork = producer == FacetBucketProducer::JOINT;
+    bool adaptive = false;
     for (SearchOp* child : children) {
+      adaptive = adaptive || child->facetBucketGrows();
       residentBytesPerBucket = saturatingAdd(
           residentBytesPerBucket, child->facetBucketResidentBytes());
       sharedSegmentWork = sharedSegmentWork
@@ -217,17 +224,29 @@ public:
               ? forcedFacetBucketCacheBytes : CACHE_BYTES);
     size_t bindingBlockSize = std::max<size_t>(
         1, blockBytes / std::max<size_t>(1, residentBytesPerBucket));
-    if (forcedFacetBucketBlockBuckets != 0) {
-      bindingBlockSize = forcedFacetBucketBlockBuckets;
-    }
+    size_t observedBytesPerBucket = residentBytesPerBucket;
     auto& tracker = parent.getOp().req.memoryTracker;
-    for (size_t blockBegin = 0; blockBegin < buckets.size();
-         blockBegin += bindingBlockSize) {
+    for (size_t blockBegin = 0; blockBegin < buckets.size();) {
+      if (adaptive) {
+        size_t budget = blockBytes;
+        if (tracker.ceiling() != 0) {
+          size_t remaining = tracker.ceiling() - std::min(tracker.ceiling(), tracker.bytes());
+          budget = std::min(budget, remaining / 2);
+        }
+        // Probe one binding before multiplying an unknown directory by the
+        // fan-out. Then use the observed high-water mark directly: joint
+        // producers rescan the parent column for each block. The extra factor
+        // covers directory relocation overlap.
+        bindingBlockSize = blockBegin == 0 ? 1 : std::max<size_t>(1,
+            budget / std::max<size_t>(1, saturatingMultiply(observedBytesPerBucket, 2)));
+      }
+      if (forcedFacetBucketBlockBuckets != 0) bindingBlockSize = forcedFacetBucketBlockBuckets;
       if (facetBucketBlockCounter != nullptr) (*facetBucketBlockCounter)++;
       size_t blockSize = std::min(
           bindingBlockSize, buckets.size() - blockBegin);
       auto block = std::span<const SelectedFacetBucket<Key>>(buckets)
                        .subspan(blockBegin, blockSize);
+      blockBegin += blockSize;
       // Recoverable identities have their own predicate producer. MEMBERS
       // scheduling and cost rules remain independent of live-doc identity work.
       using Block = decltype(block);
@@ -285,6 +304,13 @@ public:
         }
       };
       auto close = [&](size_t bucket) {
+        if (adaptive) {
+          size_t bytes = 0;
+          for (size_t child = 0; child < children.size(); child++) bytes = saturatingAdd(
+              bytes, bindings[bucket * children.size() + child]->facetBucketObservedBytes());
+          if constexpr (Structural) bytes = saturatingAdd(bytes, routing.retainedBytesPerBucket);
+          observedBytesPerBucket = std::max(observedBytesPerBucket, bytes);
+        }
         for (size_t child = 0; child < children.size(); child++) {
           bindings[bucket * children.size() + child].reset();
         }

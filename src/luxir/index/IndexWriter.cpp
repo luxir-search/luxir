@@ -287,7 +287,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     UpdateMessageMultiFunc::output_ports_type& op) {
       unused(op);
       bool dispatchCompletion = true;
-      MetricScope metric(metrics ? &metrics->commits : nullptr);
+      MetricScope metric(*metrics, metricActivity(MetricStage::COMMIT));
       try {
         dispatchCompletion = this->finishCommitBody(*msg);
       }
@@ -346,6 +346,14 @@ IndexWriter::~IndexWriter() {
   idleInverters.clear();
   busyInverters.clear();
   flushingInverters.clear();
+}
+
+void IndexWriter::fail(std::string reason) {
+  std::lock_guard publicationLock(publicationMutex);
+  if (failed.load(std::memory_order_acquire)) return;
+  failureReason = std::make_shared<const std::string>(std::move(reason));
+  failed.store(true, std::memory_order_release);
+  snapshots.fail();
 }
 
 void IndexWriter::close() {
@@ -1057,7 +1065,7 @@ void IndexWriter::_releaseToCommitSequencer(UpdateMessage* msg) {
 // Inverter for the segment should already be in the flushingInverters list.
 // This is called in parallel.  The inverter will be deleted.
 void IndexWriter::segmentFlushBody(Inverter& inverter) {
-  MetricWork metric(metrics ? &metrics->flushes : nullptr);
+  MetricWork metric(*metrics, MetricStage::FLUSH);
   INDEX_DEBUG("segmentFlushBody: inverter={} commitInfo={} msg.leftToFlush={}", inverter,
               (void*)inverter.commitInfo,
               inverter.commitInfo == nullptr ? -1 : inverter.commitInfo->leftToFlush);
@@ -1735,7 +1743,7 @@ std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
                           schema, overlayGen);
     std::vector<std::string> oneSelector{overlayName};
-    MetricWork metric(metrics ? &metrics->vectorBuilds : nullptr);
+    MetricWork metric(*metrics, MetricStage::VECTOR_BUILD);
     auto newlyBuilt = vb.build(oneSelector, existingNames, outFiles, buildSite);
     for (auto& info : newlyBuilt) {
       existingNames.emplace(info.name);
@@ -2118,7 +2126,13 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
 // those segments.
 // We also mark segments that are going to be merged, so the commit code knows about them.
 bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
-  MetricWork metric(metrics ? &metrics->merges : nullptr);
+  // Started once there are sources to merge (or on a failure), so a pass that
+  // finds nothing to merge does not count as a merge.
+  std::optional<MetricWork> metric;
+  auto metricFailed = [&] {
+    if (!metric) metric.emplace(*metrics, MetricStage::MERGE);
+    metric->failed = true;
+  };
   std::vector<SegInfo*> segs;
   std::vector<uint64_t> sourceSegIds;
   bool clientOrigin = msg.forcedBy != nullptr;
@@ -2268,6 +2282,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       }
       INDEX_DEBUG("mergeSegmentsBody: only one mergeable segment at level {}; skipping", msg.mergeLevel);
     } else {
+      metric.emplace(*metrics, MetricStage::MERGE);
       sourceSegIds.reserve(segs.size());
       for (auto* seg : segs) {
         sourceSegIds.push_back(seg->segId);
@@ -2473,7 +2488,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   }
 
   if (mergeFailed) {
-    metric.failed = true;
+    metricFailed();
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
       lastMergeFailure = failure;
@@ -2548,7 +2563,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       chainNextMerge = !mergeFailed;
     }
   } catch (const std::exception& e) {
-    metric.failed = true;
+    metricFailed();
     LOG_ERROR("mergeSegmentsBody escaped exception: exception={}", e.what());
     if (!outputPublished && markedSegmentCount > 0) {
       const std::lock_guard<std::mutex> lock(indexMutex);
@@ -2570,7 +2585,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     allowSyntheticCommit = outputPublished;
     chainNextMerge = false;
   } catch (...) {
-    metric.failed = true;
+    metricFailed();
     LOG_ERROR("mergeSegmentsBody escaped exception: unknown exception");
     if (!outputPublished && markedSegmentCount > 0) {
       const std::lock_guard<std::mutex> lock(indexMutex);

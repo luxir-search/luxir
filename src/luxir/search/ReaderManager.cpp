@@ -15,12 +15,12 @@ void ReaderManager::throwClosed() {
   throw ApiError(ErrorKind::UNAVAILABLE, "reader_closed", "reader manager is closed");
 }
 
-std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot) {
-  MetricWork metric(metrics ? &metrics->readerRefreshes : nullptr);
+std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot, Directory& source) {
+  MetricWork metric(*metrics, MetricStage::READER_REFRESH);
   std::lock_guard lock(indexReaderMutex);
   checkOpen();
   auto previous = indexReader.load();
-  return std::make_shared<IndexReader>(dir, snapshot, previous.get(), filterCache);
+  return std::make_shared<IndexReader>(source, snapshot, previous.get(), filterCache);
 }
 
 void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {
@@ -77,7 +77,7 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
   const std::lock_guard<std::mutex> readerLock(indexReaderMutex);
   reader = indexReader.load(std::memory_order_acquire);
   if (!reader || stale(*reader) || schemaChanged(*reader)) {
-    MetricWork metric(metrics ? &metrics->readerRefreshes : nullptr);
+    MetricWork metric(*metrics, MetricStage::READER_REFRESH);
     auto openPublished = [&](IndexReader* previous) {
       for (;;) {
         checkOpen();

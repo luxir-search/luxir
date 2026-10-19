@@ -89,6 +89,7 @@ defaults and constraints are described in the comments and guides.
 - [`ColStr`](#message-luxir.colstr)
 - [`ColVector`](#message-luxir.colvector)
 - [`Collapse`](#message-luxir.collapse)
+- [`CollectionActivityStats`](#message-luxir.collectionactivitystats)
 - [`CollectionCacheControl`](#message-luxir.collectioncachecontrol)
 - [`CollectionCommit`](#message-luxir.collectioncommit)
 - [`CollectionStats`](#message-luxir.collectionstats)
@@ -131,6 +132,7 @@ defaults and constraints are described in the comments and guides.
 - [`HistogramStats`](#message-luxir.histogramstats)
 - [`HostCpuStats`](#message-luxir.hostcpustats)
 - [`HostMemoryStats`](#message-luxir.hostmemorystats)
+- [`HostStats`](#message-luxir.hoststats)
 - [`IndexRamStats`](#message-luxir.indexramstats)
 - [`IndexStats`](#message-luxir.indexstats)
 - [`JemallocStats`](#message-luxir.jemallocstats)
@@ -145,9 +147,11 @@ defaults and constraints are described in the comments and guides.
 - [`MultiVector`](#message-luxir.multivector)
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
+- [`OutcomeStats`](#message-luxir.outcomestats)
 - [`PhraseQuery`](#message-luxir.phrasequery)
 - [`PrefixQuery`](#message-luxir.prefixquery)
 - [`PressureStats`](#message-luxir.pressurestats)
+- [`ProcessIoStats`](#message-luxir.processiostats)
 - [`ProcessStats`](#message-luxir.processstats)
 - [`Query`](#message-luxir.query)
 - [`QueryBucket`](#message-luxir.querybucket)
@@ -168,6 +172,7 @@ defaults and constraints are described in the comments and guides.
 - [`SchemaDef`](#message-luxir.schemadef)
 - [`SchemaRequest`](#message-luxir.schemarequest)
 - [`SchemaResponse`](#message-luxir.schemaresponse)
+- [`ScrubStats`](#message-luxir.scrubstats)
 - [`SearchOp`](#message-luxir.searchop)
 - [`SearchRequest`](#message-luxir.searchrequest)
 - [`SearchResponse`](#message-luxir.searchresponse)
@@ -191,6 +196,9 @@ defaults and constraints are described in the comments and guides.
 - [`UpdateResponse.DocError`](#message-luxir.updateresponse.docerror)
 - [`Val`](#message-luxir.val)
 - [`Vector`](#message-luxir.vector)
+- [`VectorAnnDef`](#message-luxir.vectoranndef)
+- [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq)
+- [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq)
 - [`Warning`](#message-luxir.warning)
 - [`WildcardQuery`](#message-luxir.wildcardquery)
 
@@ -611,6 +619,22 @@ Partition matching documents by an exact, single-valued key.
 | <a id="field-luxir.collapse.ops"></a>[`ops`](#field-luxir.collapse.ops) | 5 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Per-group operations on matching members; facet count units start at docs. Explicit group units still resolve to this nearest enclosing collapse. |
 | <a id="field-luxir.collapse.sort"></a>[`sort`](#field-luxir.collapse.sort) | 6 | [`SortSpec`](#message-luxir.sortspec) | repeated | Exhaustive group order by metrics in ops; missing/failed values last. Ties use the best member under the list sort, then document order. |
 
+<a id="message-luxir.collectionactivitystats"></a>
+
+### luxir.CollectionActivityStats
+
+Engine work that reached this collection since it was opened. The node's ServiceStats also count requests that failed before resolving a collection, and keep their counts when a collection is deleted.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.collectionactivitystats.searches"></a>[`searches`](#field-luxir.collectionactivitystats.searches) | 1 | [`OutcomeStats`](#message-luxir.outcomestats) | singular | Searches, from submission to the final response. |
+| <a id="field-luxir.collectionactivitystats.index_batches"></a>[`index_batches`](#field-luxir.collectionactivitystats.index_batches) | 2 | [`OutcomeStats`](#message-luxir.outcomestats) | singular |  |
+| <a id="field-luxir.collectionactivitystats.documents_accepted"></a>[`documents_accepted`](#field-luxir.collectionactivitystats.documents_accepted) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.collectionactivitystats.documents_rejected"></a>[`documents_rejected`](#field-luxir.collectionactivitystats.documents_rejected) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.collectionactivitystats.delete_ids_accepted"></a>[`delete_ids_accepted`](#field-luxir.collectionactivitystats.delete_ids_accepted) | 5 | `uint64` | singular |  |
+
 <a id="message-luxir.collectioncachecontrol"></a>
 
 ### luxir.CollectionCacheControl
@@ -649,8 +673,9 @@ Partition matching documents by an exact, single-valued key.
 | <a id="field-luxir.collectionstats.totals"></a>[`totals`](#field-luxir.collectionstats.totals) | 2 | [`StatsTotals`](#message-luxir.statstotals) | singular |  |
 | <a id="field-luxir.collectionstats.schema_gen"></a>[`schema_gen`](#field-luxir.collectionstats.schema_gen) | 3 | `uint64` | singular | Schema generation |
 | <a id="field-luxir.collectionstats.shards"></a>[`shards`](#field-luxir.collectionstats.shards) | 4 | [`ShardStats`](#message-luxir.shardstats) | repeated |  |
-| <a id="field-luxir.collectionstats.error"></a>[`error`](#field-luxir.collectionstats.error) | 5 | [`Error`](#message-luxir.error) | singular | Set for a collection that is not serving (failed to load, or a delete failed partway); kind is UNAVAILABLE and the message is the recorded reason. |
+| <a id="field-luxir.collectionstats.error"></a>[`error`](#field-luxir.collectionstats.error) | 5 | [`Error`](#message-luxir.error) | singular | Set for a collection that is not serving (failed to load, being deleted, or a delete failed partway): kind is UNAVAILABLE and the message is the reason. A node-wide walk also reports here a collection whose statistics could not be read, with the failure's kind. |
 | <a id="field-luxir.collectionstats.storage_ram_bytes"></a>[`storage_ram_bytes`](#field-luxir.collectionstats.storage_ram_bytes) | 6 | `uint64` | singular |  |
+| <a id="field-luxir.collectionstats.activity"></a>[`activity`](#field-luxir.collectionstats.activity) | 8 | [`CollectionActivityStats`](#message-luxir.collectionactivitystats) | singular | Set for a serving collection. |
 
 <a id="message-luxir.column"></a>
 
@@ -1002,6 +1027,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.defaults"></a>[`defaults`](#field-luxir.fielddef.defaults) | 14 | [`FieldDefaults`](#message-luxir.fielddefaults) | singular | default search and value representations |
 | <a id="field-luxir.fielddef.normalizer"></a>[`normalizer`](#field-luxir.fielddef.normalizer) | 15 | [`NormalizerDef`](#message-luxir.normalizerdef) | singular | whole-value STRING normalization |
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
+| <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1238,7 +1264,7 @@ Columns aligned with a collapsed list's returned rows. Absent columns were not r
 
 ### luxir.HistogramStats
 
-Cumulative duration histogram. counts\[i\] is the number of observations at or below ServiceStats.duration\_bounds\[i\]; the last entry (+Inf) equals count. counts is empty when count is zero.
+Cumulative duration histogram. counts\[i\] is the number of observations at or below bound i of the histogram's family (ServiceStats.request\_duration\_bounds or background\_duration\_bounds); the last entry (+Inf) equals count. counts is empty when count is zero.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1301,6 +1327,25 @@ Host memory from /proc/meminfo and VM events from /proc/vmstat.
 | <a id="field-luxir.hostmemorystats.swap_in_pages"></a>[`swap_in_pages`](#field-luxir.hostmemorystats.swap_in_pages) | 21 | `uint64` | singular |  |
 | <a id="field-luxir.hostmemorystats.swap_out_pages"></a>[`swap_out_pages`](#field-luxir.hostmemorystats.swap_out_pages) | 22 | `uint64` | singular |  |
 | <a id="field-luxir.hostmemorystats.oom_kills"></a>[`oom_kills`](#field-luxir.hostmemorystats.oom_kills) | 23 | `uint64` | singular |  |
+
+<a id="message-luxir.hoststats"></a>
+
+### luxir.HostStats
+
+Host-wide statistics, as node\_exporter reports them. Collectors are listed as in SystemStats.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.hoststats.cpu"></a>[`cpu`](#field-luxir.hoststats.cpu) | 1 | [`HostCpuStats`](#message-luxir.hostcpustats) | singular |  |
+| <a id="field-luxir.hoststats.memory"></a>[`memory`](#field-luxir.hoststats.memory) | 2 | [`HostMemoryStats`](#message-luxir.hostmemorystats) | singular |  |
+| <a id="field-luxir.hoststats.network"></a>[`network`](#field-luxir.hoststats.network) | 3 | [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats) | repeated |  |
+| <a id="field-luxir.hoststats.tcp"></a>[`tcp`](#field-luxir.hoststats.tcp) | 4 | [`TcpStats`](#message-luxir.tcpstats) | singular |  |
+| <a id="field-luxir.hoststats.disks"></a>[`disks`](#field-luxir.hoststats.disks) | 5 | [`DiskStats`](#message-luxir.diskstats) | repeated |  |
+| <a id="field-luxir.hoststats.pressure"></a>[`pressure`](#field-luxir.hoststats.pressure) | 6 | [`PressureStats`](#message-luxir.pressurestats) | repeated |  |
+| <a id="field-luxir.hoststats.available"></a>[`available`](#field-luxir.hoststats.available) | 7 | `string` | repeated |  |
+| <a id="field-luxir.hoststats.unavailable"></a>[`unavailable`](#field-luxir.hoststats.unavailable) | 8 | `string` | repeated |  |
 
 <a id="message-luxir.indexramstats"></a>
 
@@ -1382,6 +1427,7 @@ Nearest-neighbor query against a searchable vector field. Search is exact when n
 | <a id="field-luxir.knnquery.refine_candidates"></a>[`refine_candidates`](#field-luxir.knnquery.refine_candidates) | 5 | `int32` | singular | Candidate-document pool size for full-precision rescoring of ANN results, in both units. Group search caps the number of candidates per group so repeated keys cannot consume the whole pool. Clamped up to k; 0 selects an adaptive default. Larger pools can improve recall at a cost in memory and latency. Fewer candidates may be available. |
 | <a id="field-luxir.knnquery.ivf"></a>[`ivf`](#field-luxir.knnquery.ivf) | 6 | [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf) | singular | ignored for exact search and segments without an IVF index |
 | <a id="field-luxir.knnquery.unit"></a>[`unit`](#field-luxir.knnquery.unit) | 7 | `string` | singular | docs (default): k counts documents. groups: k counts nearest groups under the enclosing top\_docs collapse key and missing policy; requires collapse. The match set contains one best scored witness per selected group. |
+| <a id="field-luxir.knnquery.similarity"></a>[`similarity`](#field-luxir.knnquery.similarity) | 8 | `float` | optional | Minimum vector similarity for a hit, in the metric's own space (not the transformed score): for l2 the maximum L2 distance (not squared), for ip the minimum dot product, for cosine the minimum cosine similarity. Hits beyond it are dropped from the k nearest, so fewer than k may match. Compared before any enclosing boost. Must be finite; l2 requires &gt;= 0. |
 
 <a id="message-luxir.knnquery.ivf"></a>
 
@@ -1526,6 +1572,21 @@ Whole-value STRING normalization using a keyword input and only normalizing filt
 |---|---|---|---|---|
 | <a id="field-luxir.normalizerdef.filters"></a>[`filters`](#field-luxir.normalizerdef.filters) | 1 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | repeated |  |
 
+<a id="message-luxir.outcomestats"></a>
+
+### luxir.OutcomeStats
+
+Completed work by outcome, and its summed duration.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.outcomestats.ok"></a>[`ok`](#field-luxir.outcomestats.ok) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.outcomestats.error"></a>[`error`](#field-luxir.outcomestats.error) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.outcomestats.cancelled"></a>[`cancelled`](#field-luxir.outcomestats.cancelled) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.outcomestats.seconds"></a>[`seconds`](#field-luxir.outcomestats.seconds) | 4 | `double` | singular |  |
+
 <a id="message-luxir.phrasequery"></a>
 
 ### luxir.PhraseQuery
@@ -1569,6 +1630,23 @@ Pressure stall information for one resource (/proc/pressure).
 | <a id="field-luxir.pressurestats.some_seconds"></a>[`some_seconds`](#field-luxir.pressurestats.some_seconds) | 2 | `double` | singular |  |
 | <a id="field-luxir.pressurestats.full_seconds"></a>[`full_seconds`](#field-luxir.pressurestats.full_seconds) | 3 | `double` | optional |  |
 
+<a id="message-luxir.processiostats"></a>
+
+### luxir.ProcessIoStats
+
+This process's I/O accounting (/proc/self/io).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.processiostats.disk_read_bytes"></a>[`disk_read_bytes`](#field-luxir.processiostats.disk_read_bytes) | 1 | `uint64` | singular |  |
+| <a id="field-luxir.processiostats.disk_written_bytes"></a>[`disk_written_bytes`](#field-luxir.processiostats.disk_written_bytes) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.processiostats.io_read_bytes"></a>[`io_read_bytes`](#field-luxir.processiostats.io_read_bytes) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.processiostats.io_written_bytes"></a>[`io_written_bytes`](#field-luxir.processiostats.io_written_bytes) | 4 | `uint64` | singular |  |
+| <a id="field-luxir.processiostats.io_read_calls"></a>[`io_read_calls`](#field-luxir.processiostats.io_read_calls) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.processiostats.io_write_calls"></a>[`io_write_calls`](#field-luxir.processiostats.io_write_calls) | 6 | `uint64` | singular |  |
+
 <a id="message-luxir.processstats"></a>
 
 ### luxir.ProcessStats
@@ -1593,12 +1671,6 @@ Pressure stall information for one resource (/proc/pressure).
 | <a id="field-luxir.processstats.max_fds"></a>[`max_fds`](#field-luxir.processstats.max_fds) | 14 | `int64` | singular | soft limit; -1 is unlimited |
 | <a id="field-luxir.processstats.open_fds"></a>[`open_fds`](#field-luxir.processstats.open_fds) | 15 | `uint64` | singular |  |
 | <a id="field-luxir.processstats.start_time_seconds"></a>[`start_time_seconds`](#field-luxir.processstats.start_time_seconds) | 16 | `double` | singular | since the Unix epoch |
-| <a id="field-luxir.processstats.disk_read_bytes"></a>[`disk_read_bytes`](#field-luxir.processstats.disk_read_bytes) | 17 | `uint64` | singular |  |
-| <a id="field-luxir.processstats.disk_written_bytes"></a>[`disk_written_bytes`](#field-luxir.processstats.disk_written_bytes) | 18 | `uint64` | singular |  |
-| <a id="field-luxir.processstats.io_read_bytes"></a>[`io_read_bytes`](#field-luxir.processstats.io_read_bytes) | 19 | `uint64` | singular |  |
-| <a id="field-luxir.processstats.io_written_bytes"></a>[`io_written_bytes`](#field-luxir.processstats.io_written_bytes) | 20 | `uint64` | singular |  |
-| <a id="field-luxir.processstats.io_read_calls"></a>[`io_read_calls`](#field-luxir.processstats.io_read_calls) | 21 | `uint64` | singular |  |
-| <a id="field-luxir.processstats.io_write_calls"></a>[`io_write_calls`](#field-luxir.processstats.io_write_calls) | 22 | `uint64` | singular |  |
 
 <a id="message-luxir.query"></a>
 
@@ -1696,7 +1768,7 @@ Named query buckets. A document may contribute to more than one bucket.
 
 ### luxir.RangeFacet
 
-Numeric or DATE buckets using the field's value binding. Each bucket is inclusive at its lower bound and exclusive at its upper bound; the final bucket is clipped to end. start must be less than end. Buckets return in lower-bound order.
+Numeric or DATE buckets using the field's value binding. Each bucket is inclusive at its lower bound and exclusive at its upper bound; the final bucket is clipped to end under EXPLICIT bounds. start must be less than end when both are supplied. Buckets return in lower-bound order. At most 100000 buckets may be generated; with sub-operations at most 1024 may be returned after mincount filtering. Fixed DATE gaps step in local time in the facet zone: both fold occurrences are fences; skipped lattice times map to the transition.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1707,18 +1779,20 @@ Numeric or DATE buckets using the field's value binding. Each bucket is inclusiv
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.rangefacet.field"></a>[`field`](#field-luxir.rangefacet.field) | 1 | `string` | singular |  |
-| <a id="field-luxir.rangefacet.start"></a>[`start`](#field-luxir.rangefacet.start) | 2 | [`Val`](#message-luxir.val) | singular | required inclusive start of the range |
-| <a id="field-luxir.rangefacet.end"></a>[`end`](#field-luxir.rangefacet.end) | 3 | [`Val`](#message-luxir.val) | singular | required exclusive end of the range |
+| <a id="field-luxir.rangefacet.start"></a>[`start`](#field-luxir.rangefacet.start) | 2 | [`Val`](#message-luxir.val) | singular | EXPLICIT: inclusive first fence, required. DATA: optional widening bound; include its cell without excluding smaller matching values. |
+| <a id="field-luxir.rangefacet.end"></a>[`end`](#field-luxir.rangefacet.end) | 3 | [`Val`](#message-luxir.val) | singular | EXPLICIT: exclusive last fence, required. DATA: optional exclusive widening bound; include intersecting cells below it without excluding larger values. |
 | <a id="field-luxir.rangefacet.gap"></a>[`gap`](#field-luxir.rangefacet.gap) | 4 | [`Val`](#message-luxir.val) | oneof [`gap_kind`](#oneof-luxir.rangefacet.gap_kind) | positive fixed width in field units; integer milliseconds for DATE |
 | <a id="field-luxir.rangefacet.calendar_gap"></a>[`calendar_gap`](#field-luxir.rangefacet.calendar_gap) | 10 | [`CalendarGap`](#message-luxir.calendargap) | oneof [`gap_kind`](#oneof-luxir.rangefacet.gap_kind) | civil gap for DATE fields only |
 | <a id="field-luxir.rangefacet.mincount"></a>[`mincount`](#field-luxir.rangefacet.mincount) | 5 | `int64` | optional | minimum bucket count; unset = 0; must be &gt;= 0 |
 | <a id="field-luxir.rangefacet.missing"></a>[`missing`](#field-luxir.rangefacet.missing) | 6 | `bool` | singular | Return the count without a value, in the chosen count unit. |
 | <a id="field-luxir.rangefacet.ops"></a>[`ops`](#field-luxir.rangefacet.ops) | 8 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed per bucket |
 | <a id="field-luxir.rangefacet.time_zone"></a>[`time_zone`](#field-luxir.rangefacet.time_zone) | 9 | `string` | singular | empty inherits SearchRequest.time\_zone; DATE fields only |
-| <a id="field-luxir.rangefacet.selected"></a>[`selected`](#field-luxir.rangefacet.selected) | 11 | [`Val`](#message-luxir.val) | singular | Scalar or array naming generated bucket lower bounds. Selected buckets are returned even below mincount. Null, nongenerated bounds, and duplicate bounds after coercion are errors. |
+| <a id="field-luxir.rangefacet.selected"></a>[`selected`](#field-luxir.rangefacet.selected) | 11 | [`Val`](#message-luxir.val) | singular | Scalar or array naming generated bucket lower bounds. Selected buckets are returned even below mincount. Null, nongenerated bounds, and duplicate bounds after coercion are errors. Not supported with DATA bounds. |
 | <a id="field-luxir.rangefacet.selection_mode"></a>[`selection_mode`](#field-luxir.rangefacet.selection_mode) | 12 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | same filtering rules as FieldFacet; see SelectionMode |
 | <a id="field-luxir.rangefacet.count_unit"></a>[`count_unit`](#field-luxir.rangefacet.count_unit) | 13 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Inherits the parent measure; GROUPS uses the nearest collapse. |
 | <a id="field-luxir.rangefacet.count_distinct"></a>[`count_distinct`](#field-luxir.rangefacet.count_distinct) | 14 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys; same specification as Collapse. |
+| <a id="field-luxir.rangefacet.bounds"></a>[`bounds`](#field-luxir.rangefacet.bounds) | 15 | [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds) | singular |  |
+| <a id="field-luxir.rangefacet.origin"></a>[`origin`](#field-luxir.rangefacet.origin) | 16 | [`Val`](#message-luxir.val) | singular | DATA fixed gaps only; rejected with calendar\_gap. Default 0. For INT, FLOAT and DOUBLE, fences are origin + k \* gap from a global integer k. For DATE, origin is a wall-clock phase in the facet zone: 21600000 with gap 86400000 starts days at 06:00 local across DST. This differs from Elasticsearch's UTC-translated offset near transitions. Must be integer milliseconds for DATE, an integer for INT, or a number for FLOAT/DOUBLE. |
 
 <a id="message-luxir.rangequery"></a>
 
@@ -1863,6 +1937,7 @@ Full catalog for a discovery cursor, scoped to this source boot.
 | <a id="field-luxir.rescorequery.query"></a>[`query`](#field-luxir.rescorequery.query) | 1 | [`Query`](#message-luxir.query) | singular |  |
 | <a id="field-luxir.rescorequery.expr"></a>[`expr`](#field-luxir.rescorequery.expr) | 2 | `string` | singular |  |
 | <a id="field-luxir.rescorequery.vars"></a>[`vars`](#field-luxir.rescorequery.vars) | 3 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
+| <a id="field-luxir.rescorequery.min_score"></a>[`min_score`](#field-luxir.rescorequery.min_score) | 4 | `float` | optional | Minimum rescored value. Documents whose expression output is below it do not match, in scored and unscored (filter) positions alike. Compared before any enclosing boost. Must be finite. |
 
 <a id="message-luxir.rrffusion"></a>
 
@@ -1914,6 +1989,23 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 | <a id="field-luxir.schemaresponse.commit"></a>[`commit`](#field-luxir.schemaresponse.commit) | 2 | `string` | singular | exact snapshot published by a schema update |
 | <a id="field-luxir.schemaresponse.schema"></a>[`schema`](#field-luxir.schemaresponse.schema) | 1 | [`SchemaDef`](#message-luxir.schemadef) | singular | the resulting schema after the operation |
 | <a id="field-luxir.schemaresponse.replicas"></a>[`replicas`](#field-luxir.schemaresponse.replicas) | 3 | [`ReplicaResult`](#message-luxir.replicaresult) | singular |  |
+
+<a id="message-luxir.scrubstats"></a>
+
+### luxir.ScrubStats
+
+Background checksum scrub of published snapshot files. A mismatch also makes its collection unavailable with the failing file in its error.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.scrubstats.passes"></a>[`passes`](#field-luxir.scrubstats.passes) | 1 | `uint64` | singular | completed passes over every collection |
+| <a id="field-luxir.scrubstats.files"></a>[`files`](#field-luxir.scrubstats.files) | 2 | `uint64` | singular | files checked |
+| <a id="field-luxir.scrubstats.bytes"></a>[`bytes`](#field-luxir.scrubstats.bytes) | 3 | `uint64` | singular | bytes read |
+| <a id="field-luxir.scrubstats.mismatches"></a>[`mismatches`](#field-luxir.scrubstats.mismatches) | 4 | `uint64` | singular | checksum mismatches, EIO, or unexpectedly missing files |
+| <a id="field-luxir.scrubstats.last_pass_end"></a>[`last_pass_end`](#field-luxir.scrubstats.last_pass_end) | 5 | `uint64` | singular | Unix milliseconds; absent before the first pass |
+| <a id="field-luxir.scrubstats.errors"></a>[`errors`](#field-luxir.scrubstats.errors) | 6 | `uint64` | singular | other file check errors; retried on the next pass |
 
 <a id="message-luxir.searchop"></a>
 
@@ -2013,11 +2105,13 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.servicestats.version"></a>[`version`](#field-luxir.servicestats.version) | 1 | `string` | singular |  |
+| <a id="field-luxir.servicestats.cpu_target"></a>[`cpu_target`](#field-luxir.servicestats.cpu_target) | 20 | `string` | singular | The CPU target the binary was built for. |
 | <a id="field-luxir.servicestats.read_only"></a>[`read_only`](#field-luxir.servicestats.read_only) | 2 | `bool` | singular |  |
-| <a id="field-luxir.servicestats.duration_bounds"></a>[`duration_bounds`](#field-luxir.servicestats.duration_bounds) | 3 | `double` | repeated | Upper bounds, in seconds, shared by every HistogramStats in the response. |
-| <a id="field-luxir.servicestats.http"></a>[`http`](#field-luxir.servicestats.http) | 4 | [`TransportStats`](#message-luxir.transportstats) | singular |  |
-| <a id="field-luxir.servicestats.grpc"></a>[`grpc`](#field-luxir.servicestats.grpc) | 5 | [`TransportStats`](#message-luxir.transportstats) | singular |  |
-| <a id="field-luxir.servicestats.search"></a>[`search`](#field-luxir.servicestats.search) | 6 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.request_duration_bounds"></a>[`request_duration_bounds`](#field-luxir.servicestats.request_duration_bounds) | 3 | `double` | repeated | Upper bounds, in seconds, of the request, search execution and index batch histograms. |
+| <a id="field-luxir.servicestats.background_duration_bounds"></a>[`background_duration_bounds`](#field-luxir.servicestats.background_duration_bounds) | 4 | `double` | repeated | Upper bounds, in seconds, of the flush, commit, merge, vector build and reader refresh histograms. |
+| <a id="field-luxir.servicestats.http"></a>[`http`](#field-luxir.servicestats.http) | 5 | [`TransportStats`](#message-luxir.transportstats) | singular |  |
+| <a id="field-luxir.servicestats.grpc"></a>[`grpc`](#field-luxir.servicestats.grpc) | 6 | [`TransportStats`](#message-luxir.transportstats) | singular |  |
+| <a id="field-luxir.servicestats.search"></a>[`search`](#field-luxir.servicestats.search) | 21 | [`ActivityStats`](#message-luxir.activitystats) | singular | Searches the engine accepted, from submission to the final response. A gRPC Search call can carry many, so this is the per-search view there. |
 | <a id="field-luxir.servicestats.search_execution"></a>[`search_execution`](#field-luxir.servicestats.search_execution) | 7 | [`HistogramStats`](#message-luxir.histogramstats) | singular | Search body execution, excluding scheduler waits and streaming drains. |
 | <a id="field-luxir.servicestats.search_resource_exhausted"></a>[`search_resource_exhausted`](#field-luxir.servicestats.search_resource_exhausted) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.search_warnings"></a>[`search_warnings`](#field-luxir.servicestats.search_warnings) | 9 | `uint64` | singular |  |
@@ -2025,6 +2119,7 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.documents_accepted"></a>[`documents_accepted`](#field-luxir.servicestats.documents_accepted) | 11 | `uint64` | singular | Accepted into indexing (not durably acknowledged) or rejected/rolled back. |
 | <a id="field-luxir.servicestats.documents_rejected"></a>[`documents_rejected`](#field-luxir.servicestats.documents_rejected) | 12 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.delete_ids_accepted"></a>[`delete_ids_accepted`](#field-luxir.servicestats.delete_ids_accepted) | 13 | `uint64` | singular |  |
+| <a id="field-luxir.servicestats.document_errors"></a>[`document_errors`](#field-luxir.servicestats.document_errors) | 19 | map&lt;`string`, `uint64`&gt; | map | Documents rejected with an error of their own, keyed by error kind. The rest of documents\_rejected were rolled back with a failed batch. |
 | <a id="field-luxir.servicestats.flush"></a>[`flush`](#field-luxir.servicestats.flush) | 14 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.commit"></a>[`commit`](#field-luxir.servicestats.commit) | 15 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.merge"></a>[`merge`](#field-luxir.servicestats.merge) | 16 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
@@ -2087,7 +2182,7 @@ Forgiving end-user query for raw search-box input. Malformed query text degrades
 
 ### luxir.StatsRequest
 
-Operational statistics. An empty collection requests every collection on the node; per-segment records are opt-in because they are the only unbounded part of the response. Which statistics to gather. The node scope (no collection, no tenant) always returns the cheap counters: service activity and node memory, read from atomics and allocator statistics. Anything that walks collections, lists directories, or reads the operating system is opt-in. A tenant or a collection scope always walks its collections and returns no node blocks.
+Which statistics to gather. The node scope (no collection, no tenant) always returns the cheap counters: service activity and node memory, read from atomics and allocator statistics. Anything that walks collections, lists directories, or reads the operating system is opt-in. A tenant or a collection scope always walks its collections and returns no node blocks.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -2098,8 +2193,9 @@ Operational statistics. An empty collection requests every collection on the nod
 | <a id="field-luxir.statsrequest.tenant"></a>[`tenant`](#field-luxir.statsrequest.tenant) | 3 | `string` | singular | Administration only. With a collection, empty is the caller's tenant. |
 | <a id="field-luxir.statsrequest.collections"></a>[`collections`](#field-luxir.statsrequest.collections) | 5 | `bool` | singular | Node scope: also walk every collection (totals, index state, query cache, snapshot pins, inverters). Takes each writer's index lock briefly; no file I/O. Implied by a tenant or collection scope. |
 | <a id="field-luxir.statsrequest.files"></a>[`files`](#field-luxir.statsrequest.files) | 6 | `bool` | singular | Also list index directories, filling the \`bytes\` totals, segment bytes and aux index bytes. Implies \`collections\` at node scope. |
-| <a id="field-luxir.statsrequest.system"></a>[`system`](#field-luxir.statsrequest.system) | 7 | `bool` | singular | Node scope only: process, host, network, disk, data filesystem, pressure and cgroup v2 statistics, read from procfs and cgroupfs (Linux only). |
-| <a id="field-luxir.statsrequest.columns"></a>[`columns`](#field-luxir.statsrequest.columns) | 8 | `bool` | singular | Add per-segment column zone statistics (SegmentStats.columns); implies segments. Reads every INT and DATE column's block metadata in the current search snapshot, so it costs O(blocks) per column but decodes nothing. |
+| <a id="field-luxir.statsrequest.system"></a>[`system`](#field-luxir.statsrequest.system) | 7 | `bool` | singular | Node scope only: this process, the data directory's filesystem and the process's cgroup v2, read from procfs and cgroupfs (Linux only). |
+| <a id="field-luxir.statsrequest.host"></a>[`host`](#field-luxir.statsrequest.host) | 8 | `bool` | singular | Node scope only: host-wide CPU, memory, network, TCP, disk and pressure statistics from procfs (Linux only), which node\_exporter also reports. Inside a container most of them describe the host, not the container. |
+| <a id="field-luxir.statsrequest.columns"></a>[`columns`](#field-luxir.statsrequest.columns) | 15 | `bool` | singular | Add per-segment column zone statistics (SegmentStats.columns); implies segments. Reads every INT and DATE column's block metadata in the current search snapshot, so it costs O(blocks) per column but decodes nothing. |
 
 <a id="message-luxir.statsresponse"></a>
 
@@ -2115,8 +2211,9 @@ Operational statistics. An empty collection requests every collection on the nod
 | <a id="field-luxir.statsresponse.memory"></a>[`memory`](#field-luxir.statsresponse.memory) | 9 | [`MemoryStats`](#message-luxir.memorystats) | singular | Node scope only. |
 | <a id="field-luxir.statsresponse.service"></a>[`service`](#field-luxir.statsresponse.service) | 10 | [`ServiceStats`](#message-luxir.servicestats) | singular | Node scope only. |
 | <a id="field-luxir.statsresponse.system"></a>[`system`](#field-luxir.statsresponse.system) | 11 | [`SystemStats`](#message-luxir.systemstats) | singular | Set by StatsRequest.system. |
-| <a id="field-luxir.statsresponse.collection_errors"></a>[`collection_errors`](#field-luxir.statsresponse.collection_errors) | 12 | `uint64` | singular | Collections whose statistics could not be read (for example, deleted while being walked). They are left out of the response. |
+| <a id="field-luxir.statsresponse.host"></a>[`host`](#field-luxir.statsresponse.host) | 15 | [`HostStats`](#message-luxir.hoststats) | singular | Set by StatsRequest.host. |
 | <a id="field-luxir.statsresponse.duration_seconds"></a>[`duration_seconds`](#field-luxir.statsresponse.duration_seconds) | 13 | `double` | singular | Time spent gathering this response, excluding serialization. |
+| <a id="field-luxir.statsresponse.scrub"></a>[`scrub`](#field-luxir.statsresponse.scrub) | 14 | [`ScrubStats`](#message-luxir.scrubstats) | singular | Node-wide checksum scrub counters; set when store.scrub-interval-s is. |
 
 <a id="message-luxir.statstotals"></a>
 
@@ -2135,7 +2232,7 @@ Rolled-up counts. Only the fields meaningful at a given level are set, so "colle
 | <a id="field-luxir.statstotals.max_docs"></a>[`max_docs`](#field-luxir.statstotals.max_docs) | 5 | `uint64` | singular |  |
 | <a id="field-luxir.statstotals.live_docs"></a>[`live_docs`](#field-luxir.statstotals.live_docs) | 6 | `uint64` | singular |  |
 | <a id="field-luxir.statstotals.deleted_docs"></a>[`deleted_docs`](#field-luxir.statstotals.deleted_docs) | 7 | `uint64` | singular |  |
-| <a id="field-luxir.statstotals.bytes"></a>[`bytes`](#field-luxir.statstotals.bytes) | 8 | `uint64` | singular | On-disk bytes from a directory listing (StatsRequest.files): the whole index directory, including metadata and in-flight files. Compare committed\_bytes. |
+| <a id="field-luxir.statstotals.bytes"></a>[`bytes`](#field-luxir.statstotals.bytes) | 8 | `uint64` | optional | On-disk bytes from a directory listing, present only with StatsRequest.files: the whole index directory, including metadata and in-flight files. Compare committed\_bytes. |
 | <a id="field-luxir.statstotals.committed_bytes"></a>[`committed_bytes`](#field-luxir.statstotals.committed_bytes) | 9 | `uint64` | singular | Bytes referenced by the current published snapshot, summed from its file descriptors without touching the filesystem. Excludes in-flight and pin-retained files, so it is normally below \`bytes\`. |
 
 <a id="message-luxir.storageramstats"></a>
@@ -2168,22 +2265,18 @@ Chunk settings for one stored-field group (a FieldDef stored\_resource). Every s
 
 ### luxir.SystemStats
 
-Operating system statistics. Collectors whose sources cannot be read are listed in \`unavailable\` and their fields are omitted.
+This process, its data filesystem and its cgroup. Collectors that read their sources are listed in \`available\`; the others in \`unavailable\`, with their fields omitted.
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.systemstats.process"></a>[`process`](#field-luxir.systemstats.process) | 1 | [`ProcessStats`](#message-luxir.processstats) | singular |  |
-| <a id="field-luxir.systemstats.cpu"></a>[`cpu`](#field-luxir.systemstats.cpu) | 2 | [`HostCpuStats`](#message-luxir.hostcpustats) | singular |  |
-| <a id="field-luxir.systemstats.memory"></a>[`memory`](#field-luxir.systemstats.memory) | 3 | [`HostMemoryStats`](#message-luxir.hostmemorystats) | singular |  |
-| <a id="field-luxir.systemstats.network"></a>[`network`](#field-luxir.systemstats.network) | 4 | [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats) | repeated |  |
-| <a id="field-luxir.systemstats.tcp"></a>[`tcp`](#field-luxir.systemstats.tcp) | 5 | [`TcpStats`](#message-luxir.tcpstats) | singular |  |
-| <a id="field-luxir.systemstats.disks"></a>[`disks`](#field-luxir.systemstats.disks) | 6 | [`DiskStats`](#message-luxir.diskstats) | repeated |  |
-| <a id="field-luxir.systemstats.filesystem"></a>[`filesystem`](#field-luxir.systemstats.filesystem) | 7 | [`FilesystemStats`](#message-luxir.filesystemstats) | singular | The data directory's filesystem; set only for the fs store backend. |
-| <a id="field-luxir.systemstats.pressure"></a>[`pressure`](#field-luxir.systemstats.pressure) | 8 | [`PressureStats`](#message-luxir.pressurestats) | repeated |  |
-| <a id="field-luxir.systemstats.cgroup"></a>[`cgroup`](#field-luxir.systemstats.cgroup) | 9 | [`CgroupStats`](#message-luxir.cgroupstats) | singular |  |
-| <a id="field-luxir.systemstats.unavailable"></a>[`unavailable`](#field-luxir.systemstats.unavailable) | 10 | `string` | repeated |  |
+| <a id="field-luxir.systemstats.process_io"></a>[`process_io`](#field-luxir.systemstats.process_io) | 6 | [`ProcessIoStats`](#message-luxir.processiostats) | singular |  |
+| <a id="field-luxir.systemstats.filesystem"></a>[`filesystem`](#field-luxir.systemstats.filesystem) | 2 | [`FilesystemStats`](#message-luxir.filesystemstats) | singular | The data directory's filesystem; set only for the fs store backend. |
+| <a id="field-luxir.systemstats.cgroup"></a>[`cgroup`](#field-luxir.systemstats.cgroup) | 3 | [`CgroupStats`](#message-luxir.cgroupstats) | singular |  |
+| <a id="field-luxir.systemstats.available"></a>[`available`](#field-luxir.systemstats.available) | 4 | `string` | repeated |  |
+| <a id="field-luxir.systemstats.unavailable"></a>[`unavailable`](#field-luxir.systemstats.unavailable) | 5 | `string` | repeated |  |
 
 <a id="message-luxir.tcpstats"></a>
 
@@ -2221,6 +2314,7 @@ TCP counters for this network namespace (/proc/net/snmp).
 | <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | rows vs columns placement of returned fields (see DocFormat) |
 | <a id="field-luxir.topdocs.diversify"></a>[`diversify`](#field-luxir.topdocs.diversify) | 12 | [`Diversify`](#message-luxir.diversify) | singular | Incompatible with collapse; found counts capped documents. |
 | <a id="field-luxir.topdocs.collapse"></a>[`collapse`](#field-luxir.topdocs.collapse) | 11 | [`Collapse`](#message-luxir.collapse) | singular | limit, offset and found count groups; found\_docs counts eligible documents. |
+| <a id="field-luxir.topdocs.min_score"></a>[`min_score`](#field-luxir.topdocs.min_score) | 14 | `float` | optional | Minimum score cut-off. When set, documents whose query score is below this value do not match: they are excluded from the returned documents, from the get\_number count, and from the domain of ops (facets and metrics). The score compared is the query's own relevance score (filters do not score), computed even when the request sorts by fields or does not return scores. Must be finite. As a Fusion source, the cut-off applies to that source's ranked list. |
 | <a id="field-luxir.topdocs.ops"></a>[`ops`](#field-luxir.topdocs.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed over docs that match this query. |
 
 <a id="message-luxir.transportstats"></a>
@@ -2234,7 +2328,7 @@ Request traffic on one transport. Replication routes are not counted.
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.transportstats.operations"></a>[`operations`](#field-luxir.transportstats.operations) | 1 | map&lt;`string`, [`ActivityStats`](#message-luxir.activitystats)&gt; | map | Keyed by operation: search, update, schema, collections, stats, health, other. |
-| <a id="field-luxir.transportstats.errors"></a>[`errors`](#field-luxir.transportstats.errors) | 2 | map&lt;`string`, `uint64`&gt; | map | First application error per HTTP request or gRPC call, including errors carried inside a successful transport response, keyed by error kind. |
+| <a id="field-luxir.transportstats.errors"></a>[`errors`](#field-luxir.transportstats.errors) | 2 | map&lt;`string`, `uint64`&gt; | map | Failed requests or calls, keyed by the kind of their first error. A request fails when the transport fails, its response carries a whole-request error, or its stream ends in failure. |
 | <a id="field-luxir.transportstats.received_bytes"></a>[`received_bytes`](#field-luxir.transportstats.received_bytes) | 3 | `uint64` | singular | application payload, excluding transport framing |
 | <a id="field-luxir.transportstats.sent_bytes"></a>[`sent_bytes`](#field-luxir.transportstats.sent_bytes) | 4 | `uint64` | singular | application payload submitted for sending |
 | <a id="field-luxir.transportstats.stream_pauses"></a>[`stream_pauses`](#field-luxir.transportstats.stream_pauses) | 5 | `uint64` | singular | response producers paused by flow control |
@@ -2342,6 +2436,43 @@ A dense vector value. Dimensionality is the number of elements in f32.v.
 |---|---|---|---|---|
 | <a id="field-luxir.vector.f32"></a>[`f32`](#field-luxir.vector.f32) | 1 | [`ArrFloat`](#message-luxir.arrfloat) | oneof [`kind`](#oneof-luxir.vector.kind) |  |
 
+<a id="message-luxir.vectoranndef"></a>
+
+### luxir.VectorAnnDef
+
+Approximate nearest-neighbor index settings for a VECTOR field: the codec and parameters of the per-segment IVF overlays built at commit and merge. Read when an overlay is built; each overlay records what it was built with, so a change applies to segments built afterwards. See docs/guide/vector-search.md#index-settings.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.vectoranndef.codec"></a>[`codec`](#field-luxir.vectoranndef.codec) | 1 | [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec) | optional | absent: pq; rabitq is opt-in |
+| <a id="field-luxir.vectoranndef.nlist"></a>[`nlist`](#field-luxir.vectoranndef.nlist) | 2 | `int32` | optional | IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors), capped at 4096. Clamped to the segment's vector count. |
+| <a id="field-luxir.vectoranndef.rabitq"></a>[`rabitq`](#field-luxir.vectoranndef.rabitq) | 3 | [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq) | singular | requires explicit codec rabitq |
+| <a id="field-luxir.vectoranndef.pq"></a>[`pq`](#field-luxir.vectoranndef.pq) | 4 | [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq) | singular | codec pq only |
+
+<a id="message-luxir.vectoranndef.pq"></a>
+
+### luxir.VectorAnnDef.Pq
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.vectoranndef.pq.m"></a>[`m`](#field-luxir.vectoranndef.pq.m) | 1 | `int32` | optional | Sub-quantizers. Positive m requires positive effective (inherited) dims and must divide it. Absent or 0: automatic, including inferred dims. Choose the largest divisor leaving at least 4 dimensions per sub-quantizer, capped at max(32, dims / 8) for IP/cosine or 32 for L2. If none does, choose the largest divisor under the same cap. |
+| <a id="field-luxir.vectoranndef.pq.bits"></a>[`bits`](#field-luxir.vectoranndef.pq.bits) | 2 | `int32` | optional | bits per sub-quantizer code, 1..8. Absent: 8. |
+
+<a id="message-luxir.vectoranndef.rabitq"></a>
+
+### luxir.VectorAnnDef.RaBitQ
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.vectoranndef.rabitq.bits"></a>[`bits`](#field-luxir.vectoranndef.rabitq.bits) | 1 | `int32` | optional | Bits per dimension, 1..9. Absent: 1. Above 1 (extended RaBitQ) a 1-bit pass prunes with the error bound and survivors are re-estimated with the extra bits. |
+| <a id="field-luxir.vectoranndef.rabitq.query_bits"></a>[`query_bits`](#field-luxir.vectoranndef.rabitq.query_bits) | 2 | `int32` | optional | Query quantization bits, 0..8; 0 scans with the float query. Absent: 4. Read at search time, so a change applies to existing overlays. |
+
 <a id="message-luxir.warning"></a>
 
 ### luxir.Warning
@@ -2381,6 +2512,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
 - [`Match.Operator`](#enum-luxir.match.operator)
+- [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds)
 - [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
 - [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
 - [`ResponseFormat`](#enum-luxir.responseformat)
@@ -2389,6 +2521,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir)
 - [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
+- [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec)
 - [`VectorMetric`](#enum-luxir.vectormetric)
 
 <a id="enum-luxir.calendargap.unit"></a>
@@ -2541,6 +2674,19 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.match.operator.or"></a>[`OR`](#value-luxir.match.operator.or) | 1 | a doc matches if any analyzed term matches |
 | <a id="value-luxir.match.operator.and"></a>[`AND`](#value-luxir.match.operator.and) | 2 | a doc must match every analyzed term |
 
+<a id="enum-luxir.rangefacet.bounds"></a>
+
+### luxir.RangeFacet.Bounds
+
+Whether the extent is explicit or derived from this facet instance's values.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.rangefacet.bounds.explicit"></a>[`EXPLICIT`](#value-luxir.rangefacet.bounds.explicit) | 0 | start and end are required. Fixed DATE grids use the local time of start as their phase; calendar grids step from start for every n. The last fence is clipped to end. |
+| <a id="value-luxir.rangefacet.bounds.data"></a>[`DATA`](#value-luxir.rangefacet.bounds.data) | 1 | Span the smallest through largest matching finite values, plus optional start/end widening. Queries, filters and deletions affect the extent; each parent bucket's child histogram has its own span. Occupancy is from raw values, even when a distinct key is dropped and its measured count is zero. Empty domains return no buckets unless both widening bounds supply a span. NaN/Inf are outside every bucket and never fail DATA. Calendar grids use the 1970 civil epoch (ISO weeks: Monday 1969-12-29); a civil day starts at its first midnight, or first valid instant. selected is unsupported. The 100000-bucket cap applies to the actual span including widening and empty interior cells; use a larger gap. |
+
 <a id="enum-luxir.replicaresult.outcome"></a>
 
 ### luxir.ReplicaResult.Outcome
@@ -2638,6 +2784,17 @@ How facet selections filter the enclosing TopDocs results and its sub-operations
 | <a id="value-luxir.updateresponse.status.ok"></a>[`OK`](#value-luxir.updateresponse.status.ok) | 1 | the update was successful |
 | <a id="value-luxir.updateresponse.status.partial"></a>[`PARTIAL`](#value-luxir.updateresponse.status.partial) | 2 | part of the request took effect, part failed (see errors) |
 | <a id="value-luxir.updateresponse.status.error"></a>[`ERROR`](#value-luxir.updateresponse.status.error) | 3 | The request failed. If error is unset, the failure was per-document (see errors) and the request had no visible effect on the index. If error is set, the failure was request-level (e.g. commit pipeline) and the effect of individual documents is indeterminate beyond what errors lists. |
+
+<a id="enum-luxir.vectoranndef.codec"></a>
+
+### luxir.VectorAnnDef.Codec
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.vectoranndef.codec.rabitq"></a>[`RABITQ`](#value-luxir.vectoranndef.codec.rabitq) | 0 | IVF + RaBitQ (randomly rotated, centroid-relative bit codes) |
+| <a id="value-luxir.vectoranndef.codec.pq"></a>[`PQ`](#value-luxir.vectoranndef.codec.pq) | 1 | IVF + product quantization |
 
 <a id="enum-luxir.vectormetric"></a>
 

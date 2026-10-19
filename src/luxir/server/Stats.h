@@ -18,10 +18,12 @@ class LuxirNode;
 void gatherStats(LuxirNode& node, const api::StatsRequest& request,
                  api::StatsResponse& response, std::pmr::memory_resource& resource);
 
-// Read process, host and cgroup statistics from procfs and cgroupfs (Linux).
-// `dataDirectory` names the filesystem to report; empty skips it. Collectors
-// that fail are listed in `unavailable`. Same borrowing contract as gatherStats.
-void gatherSystemStats(api::SystemStats& stats, std::string_view dataDirectory,
+// Read this process's, its data filesystem's and its cgroup's statistics into
+// `system`, and host-wide statistics into `host`, from procfs and cgroupfs
+// (Linux); either may be null. `dataDirectory` names the filesystem to report;
+// empty skips it. Each section lists its collectors as available or
+// unavailable. Same borrowing contract as gatherStats.
+void gatherSystemStats(api::SystemStats* system, api::HostStats* host, std::string_view dataDirectory,
                        std::pmr::memory_resource& resource);
 
 // Apply the requested filter-cache actions (flush / reset_admission /

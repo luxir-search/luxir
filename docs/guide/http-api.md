@@ -22,7 +22,8 @@ credentials. Administration and snapshot routes may name another tenant under
 | `GET /collections/_list` (or `POST`) | List collection names; `GET /collections` is a synonym. |
 | `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
-| `GET /_stats` | Node statistics: service activity and memory by default; `collections`, `files`, `segments` and `system` opt in to costlier sections; `format=prometheus` renders Prometheus text. See [Stats and monitoring](operations.md#stats-and-monitoring). |
+| `GET /_stats` | Node statistics: service activity and memory by default; `collections`, `files`, `segments`, `system` and `host` opt in to costlier sections; `format=prometheus` renders Prometheus text. See [Stats and monitoring](operations.md#stats-and-monitoring). |
+| `GET /metrics` | The node's Prometheus scrape: `_stats` rendered as Prometheus text, with `collections` and `system` on by default. |
 | `GET /collections/{collection}/_stats` | Statistics for one collection, in JSON or Prometheus text. |
 | `GET /collections/{collection}/_snapshot` | Pin the current snapshot for copying; see [Replication](replication.md). |
 | `GET /collections/{collection}/_snapshot/files/{name}` | One file of a pinned snapshot. |

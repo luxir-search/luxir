@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "CommitSnapshotRegistry.h"
+#include "luxir/store/VerifiedDirectory.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/luxir_util.h"
@@ -39,20 +40,40 @@ void CommitSnapshotRegistry::fail() noexcept {
   notifyChange();
 }
 
-void CommitSnapshotRegistry::openLocalSnapshot() {
+void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
   auto manifest = Manifest::load(dir);
+  auto changed = [&] {
+    auto latest = Manifest::load(dir);
+    if (!latest.bytes || *latest.bytes == *manifest.bytes) return false;
+    manifest = std::move(latest);
+    return true;
+  };
   for (;;) {
     if (!manifest.bytes) throw ReadOnlyError("collection has no snapshot");
     auto snapshot = CommitSnapshot::fromBytes(manifest.bytes);
-    try {
-      auto reader = readers.prepare(*snapshot);
-      publish(std::move(snapshot), std::move(reader));
-      return;
-    } catch (...) {
-      auto latest = Manifest::load(dir);
-      if (!latest.bytes || *latest.bytes == *manifest.bytes) throw;
-      manifest = std::move(latest);
+    std::shared_ptr<IndexReader> reader;
+    {
+      FileVerification verification;
+      try { verification.open(dir, snapshot->files, verify); }
+      catch (...) {
+        if (!changed()) throw;
+        continue;
+      }
+      // Verify before mapping or parsing any checked file. A hash failure is
+      // final; successful handles survive retirement and supply the mappings.
+      verification.run();
+      try {
+        VerifiedDirectory source(dir, verification);
+        reader = readers.prepare(*snapshot, source);
+      } catch (...) {
+        // Full holds every file: a prepare failure is final. Under none an
+        // unchecked file may have been retired while hashing, so retry it.
+        if (verify || !changed()) throw;
+        continue;
+      }
     }
+    publish(std::move(snapshot), std::move(reader));
+    return;
   }
 }
 
@@ -161,28 +182,36 @@ std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const CommitId& id, 
   return std::shared_ptr<InputFile>(std::move(owner), file.get());
 }
 
+void CommitSnapshotRegistry::requireHeld(const FileDescriptor& descriptor) {
+  std::lock_guard lock(mutex);
+  auto published = snapshot();
+  if (published != indexed) {
+    indexedFiles.clear();
+    if (published) for (const auto& file : published->files) indexedFiles.emplace(file.name, &file);
+    indexed = published;
+  }
+  auto holds = [&](const auto& files) {
+    auto it = files.find(descriptor.name);
+    return it != files.end() && *it->second == descriptor;
+  };
+  bool held = !closed && (holds(indexedFiles) || std::ranges::any_of(pins, [&](const auto& pin) { return holds(pin.second.files); }));
+  if (!held) throw ApiError(ErrorKind::NOT_FOUND, "file_not_held", "no current or pinned snapshot holds this file");
+}
+
 std::shared_ptr<InputFile> CommitSnapshotRegistry::openFile(const FileDescriptor& descriptor) {
   // Joined with retirement, so a referenced file cannot be unlinked between
   // the check and the open; once open, its bytes outlive an unlink.
   std::lock_guard retirementLock(retirementMutex);
-  {
-    std::lock_guard lock(mutex);
-    auto published = snapshot();
-    if (published != indexed) {
-      indexedFiles.clear();
-      if (published) for (const auto& file : published->files) indexedFiles.emplace(file.name, &file);
-      indexed = published;
-    }
-    auto holds = [&](const auto& files) {
-      auto it = files.find(descriptor.name);
-      return it != files.end() && *it->second == descriptor;
-    };
-    bool held = !closed && (holds(indexedFiles) || std::ranges::any_of(pins, [&](const auto& pin) { return holds(pin.second.files); }));
-    if (!held) throw ApiError(ErrorKind::NOT_FOUND, "file_not_held", "no current or pinned snapshot holds this file");
-  }
+  requireHeld(descriptor);
   auto file = dir.openFile(descriptor.name, true);
   if (!file) throw std::runtime_error("held snapshot file is missing");
   return file;
+}
+
+std::shared_ptr<ChecksumReader> CommitSnapshotRegistry::openChecksum(const FileDescriptor& descriptor, bool direct) {
+  std::lock_guard retirementLock(retirementMutex);
+  requireHeld(descriptor);
+  return dir.openChecksum(descriptor.name, direct);
 }
 
 bool CommitSnapshotRegistry::touch(const CommitId& id, uint64_t bytes) {

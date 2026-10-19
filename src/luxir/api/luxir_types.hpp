@@ -77,14 +77,15 @@ struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrA
 struct ArrArrDouble; struct Vector; struct ArrVector;
 struct ColStr; struct Column; struct ColVector; struct MultiVector; struct ColInt;
 struct ColFloat; struct ColDouble; struct AnalyzerComponent; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
-struct FieldVariants; struct FieldDefaults; struct NormalizerDef; struct StoredResourceDef;
+struct FieldVariants; struct FieldDefaults; struct NormalizerDef; struct VectorAnnDef; struct StoredResourceDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
 struct ShardStats; struct IndexStats; struct SegmentStats; struct ColumnZoneStats; struct AuxStats;
-struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats;
+struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
 struct HistogramStats; struct ActivityStats; struct TransportStats; struct ServiceStats; struct SystemStats;
+struct HostStats; struct OutcomeStats; struct CollectionActivityStats; struct ProcessIoStats;
 struct ProcessStats; struct CpuTimes; struct HostCpuStats; struct HostMemoryStats; struct NetworkInterfaceStats;
 struct TcpStats; struct DiskStats; struct FilesystemStats; struct PressureStats; struct CgroupStats;
 struct CgroupMemoryStats; struct CgroupCpuStats; struct CgroupTaskStats;
@@ -92,6 +93,7 @@ struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
 namespace KnnQuery_ { struct Ivf; }
+namespace VectorAnnDef_ { struct RaBitQ; struct Pq; }
 
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
 namespace Error_ {
@@ -103,6 +105,7 @@ enum class Kind {
 namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
 namespace Collapse_ { enum class MissingPolicy { EXPAND = 0, GROUP = 1, DROP = 2 }; }
 namespace FieldFacet_ { enum class CountUnit { DOCS = 0, GROUPS = 1 }; }
+namespace RangeFacet_ { enum class Bounds { EXPLICIT = 0, DATA = 1 }; }
 namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
@@ -119,6 +122,7 @@ enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 }
+namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1 }; }
 namespace StoredResourceDef_ { enum class Codec { LZ4 = 0, ZSTD = 1 }; }
 namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 
@@ -239,6 +243,19 @@ struct FieldDefaults {
 struct NormalizerDef {
   std::span<const AnalyzerComponent> filters;
 };
+namespace VectorAnnDef_ {
+struct RaBitQ { std::optional<int32_t> bits; std::optional<int32_t> query_bits; };
+struct Pq { std::optional<int32_t> m; std::optional<int32_t> bits; };
+} // namespace VectorAnnDef_
+struct VectorAnnDef {
+  using Codec = luxir::api::VectorAnnDef_::Codec;
+  using RaBitQ = luxir::api::VectorAnnDef_::RaBitQ;
+  using Pq = luxir::api::VectorAnnDef_::Pq;
+  std::optional<RaBitQ> rabitq;                                 // align 4
+  std::optional<Pq> pq;
+  std::optional<Codec> codec;
+  std::optional<int32_t> nlist;
+};
 struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
   using IndexMode = luxir::api::FieldDef_::IndexMode;
@@ -250,6 +267,7 @@ struct FieldDef {
   std::optional<FieldVariants> variants;
   std::optional<FieldDefaults> defaults;
   std::optional<NormalizerDef> normalizer;
+  std::optional<VectorAnnDef> ann;                              // align 4
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<LongTerms> long_terms;                          // align 4 (enum)
@@ -344,7 +362,7 @@ struct StatsTotals {
   uint64_t max_docs = 0;
   uint64_t live_docs = 0;
   uint64_t deleted_docs = 0;
-  uint64_t bytes = 0;
+  std::optional<uint64_t> bytes;
   uint64_t committed_bytes = 0;
 };
 struct ColumnZoneStats {
@@ -402,7 +420,21 @@ struct ShardStats {
   IndexStats index;
   uint32_t shard_id = 0;
 };
+struct OutcomeStats {
+  double seconds = 0;
+  uint64_t ok = 0;
+  uint64_t error = 0;
+  uint64_t cancelled = 0;
+};
+struct CollectionActivityStats {
+  OutcomeStats searches;
+  OutcomeStats index_batches;
+  uint64_t documents_accepted = 0;
+  uint64_t documents_rejected = 0;
+  uint64_t delete_ids_accepted = 0;
+};
 struct CollectionStats {
+  std::optional<CollectionActivityStats> activity;
   uint64_t storage_ram_bytes = 0;
   std::string_view name;
   std::string_view tenant;
@@ -418,6 +450,7 @@ struct StatsRequest {
   bool collections = false;
   bool files = false;
   bool system = false;
+  bool host = false;
   bool columns = false;
 };
 struct FollowerStatus {
@@ -490,10 +523,13 @@ struct TransportStats {
 };
 struct ServiceStats {
   std::string_view version;
-  std::span<const double> duration_bounds;
+  std::string_view cpu_target;
+  std::span<const double> request_duration_bounds;
+  std::span<const double> background_duration_bounds;
   TransportStats http;
   TransportStats grpc;
   ActivityStats search;
+  map_view<std::string_view, uint64_t> document_errors;
   HistogramStats search_execution;
   uint64_t search_resource_exhausted = 0;
   uint64_t search_warnings = 0;
@@ -525,6 +561,8 @@ struct ProcessStats {
   uint64_t minor_page_faults = 0;
   uint64_t major_page_faults = 0;
   uint64_t open_fds = 0;
+};
+struct ProcessIoStats {
   uint64_t disk_read_bytes = 0;
   uint64_t disk_written_bytes = 0;
   uint64_t io_read_bytes = 0;
@@ -664,15 +702,29 @@ struct CgroupStats {
 };
 struct SystemStats {
   std::optional<ProcessStats> process;
+  std::optional<ProcessIoStats> process_io;
+  std::optional<FilesystemStats> filesystem;
+  std::optional<CgroupStats> cgroup;
+  std::span<const std::string_view> available;
+  std::span<const std::string_view> unavailable;
+};
+struct HostStats {
   std::optional<HostCpuStats> cpu;
   std::optional<HostMemoryStats> memory;
   std::span<const NetworkInterfaceStats> network;
   std::optional<TcpStats> tcp;
   std::span<const DiskStats> disks;
-  std::optional<FilesystemStats> filesystem;
   std::span<const PressureStats> pressure;
-  std::optional<CgroupStats> cgroup;
+  std::span<const std::string_view> available;
   std::span<const std::string_view> unavailable;
+};
+struct ScrubStats {
+  uint64_t passes = 0;
+  uint64_t files = 0;
+  uint64_t bytes = 0;
+  uint64_t mismatches = 0;
+  uint64_t errors = 0;
+  uint64_t last_pass_end = 0;
 };
 struct StatsResponse {
   std::optional<StatsTotals> totals;
@@ -681,8 +733,9 @@ struct StatsResponse {
   std::optional<MemoryStats> memory;
   std::optional<ServiceStats> service;
   std::optional<SystemStats> system;
-  uint64_t collection_errors = 0;
+  std::optional<HostStats> host;
   double duration_seconds = 0;
+  std::optional<ScrubStats> scrub;
 };
 struct CacheControlRequest {
   std::string_view collection;
@@ -731,6 +784,7 @@ struct KnnQuery {                                                // needs Vector
   std::string_view field;
   std::optional<Vector> query;
   std::optional<Ivf> ivf;
+  std::optional<float> similarity;
   int32_t k = 0;
   int32_t refine_candidates = 0;
   bool exact = false;
@@ -811,6 +865,7 @@ struct TopDocs {                                                 // all indirect
   std::span<const std::string_view> fields;
   std::span<const SortSpec> sort;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+  std::optional<float> min_score;
   int32_t batch_size = 0;
   ::hpp_proto::optional_indirect_view<Collapse> collapse;
   ::hpp_proto::optional_indirect_view<Diversify> diversify;
@@ -948,7 +1003,9 @@ struct RangeFacet {                                             // needs Val,Cal
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   std::string_view time_zone;
   ::hpp_proto::optional_indirect_view<Val> selected;
+  ::hpp_proto::optional_indirect_view<Val> origin;
   SelectionMode selection_mode = SelectionMode::ANY;
+  RangeFacet_::Bounds bounds = RangeFacet_::Bounds::EXPLICIT;
   bool missing = false;
 };
 struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,Domain
@@ -1004,6 +1061,7 @@ struct RescoreQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
   std::string_view expr;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
+  std::optional<float> min_score;
 };
 struct SimpleQuery {
   using Operator = luxir::api::Match_::Operator;
@@ -1079,15 +1137,16 @@ LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXI
 LUXIR_TD(ColFloat) LUXIR_TD(ColDouble)
 LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
 LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef) LUXIR_TD(StoredResourceDef)
+LUXIR_TD(VectorAnnDef) LUXIR_TD(VectorAnnDef_::RaBitQ) LUXIR_TD(VectorAnnDef_::Pq)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
 LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
-LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
+LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(OutcomeStats) LUXIR_TD(CollectionActivityStats) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
 LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(ColumnZoneStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
-LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats)
-LUXIR_TD(HistogramStats) LUXIR_TD(ActivityStats) LUXIR_TD(TransportStats) LUXIR_TD(ServiceStats) LUXIR_TD(SystemStats) LUXIR_TD(ProcessStats) LUXIR_TD(CpuTimes) LUXIR_TD(HostCpuStats) LUXIR_TD(HostMemoryStats) LUXIR_TD(NetworkInterfaceStats) LUXIR_TD(TcpStats) LUXIR_TD(DiskStats) LUXIR_TD(FilesystemStats) LUXIR_TD(PressureStats) LUXIR_TD(CgroupStats) LUXIR_TD(CgroupMemoryStats) LUXIR_TD(CgroupCpuStats) LUXIR_TD(CgroupTaskStats)
+LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats) LUXIR_TD(ScrubStats)
+LUXIR_TD(HistogramStats) LUXIR_TD(ActivityStats) LUXIR_TD(TransportStats) LUXIR_TD(ServiceStats) LUXIR_TD(HostStats) LUXIR_TD(SystemStats) LUXIR_TD(ProcessIoStats) LUXIR_TD(ProcessStats) LUXIR_TD(CpuTimes) LUXIR_TD(HostCpuStats) LUXIR_TD(HostMemoryStats) LUXIR_TD(NetworkInterfaceStats) LUXIR_TD(TcpStats) LUXIR_TD(DiskStats) LUXIR_TD(FilesystemStats) LUXIR_TD(PressureStats) LUXIR_TD(CgroupStats) LUXIR_TD(CgroupMemoryStats) LUXIR_TD(CgroupCpuStats) LUXIR_TD(CgroupTaskStats)
 LUXIR_TD(CacheControlRequest) LUXIR_TD(CacheControlResponse) LUXIR_TD(CacheEntryDump)
 LUXIR_TD(ShardCacheControl) LUXIR_TD(CollectionCacheControl)
 LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) LUXIR_TD(ReplicationCatalogEntry) LUXIR_TD(ReplicationInstalled)
@@ -1125,17 +1184,18 @@ LUXIR_ENTRY(ArrVector) LUXIR_ENTRY(ColStr) LUXIR_ENTRY(Column)
 LUXIR_ENTRY(ColVector) LUXIR_ENTRY(MultiVector) LUXIR_ENTRY(ColInt) LUXIR_ENTRY(ColFloat)
 LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(AnalyzerComponent) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
 LUXIR_ENTRY(FieldVariants) LUXIR_ENTRY(FieldDefaults) LUXIR_ENTRY(NormalizerDef) LUXIR_ENTRY(StoredResourceDef)
+LUXIR_ENTRY(VectorAnnDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)
 LUXIR_ENTRY(DeleteCollectionRequest) LUXIR_ENTRY(DeleteCollectionResponse)
 LUXIR_ENTRY(ListCollectionsResponse)
 LUXIR_ENTRY(ListTenantsResponse)
-LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStatus) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(StatsTotals)
+LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStatus) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(OutcomeStats) LUXIR_ENTRY(CollectionActivityStats) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
 LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(ColumnZoneStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
 LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)
-LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(FieldMetadataStats) LUXIR_ENTRY(MemoryStats)
-LUXIR_ENTRY(HistogramStats) LUXIR_ENTRY(ActivityStats) LUXIR_ENTRY(TransportStats) LUXIR_ENTRY(ServiceStats) LUXIR_ENTRY(SystemStats) LUXIR_ENTRY(ProcessStats) LUXIR_ENTRY(CpuTimes) LUXIR_ENTRY(HostCpuStats) LUXIR_ENTRY(HostMemoryStats) LUXIR_ENTRY(NetworkInterfaceStats) LUXIR_ENTRY(TcpStats) LUXIR_ENTRY(DiskStats) LUXIR_ENTRY(FilesystemStats) LUXIR_ENTRY(PressureStats) LUXIR_ENTRY(CgroupStats) LUXIR_ENTRY(CgroupMemoryStats) LUXIR_ENTRY(CgroupCpuStats) LUXIR_ENTRY(CgroupTaskStats)
+LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(FieldMetadataStats) LUXIR_ENTRY(MemoryStats) LUXIR_ENTRY(ScrubStats)
+LUXIR_ENTRY(HistogramStats) LUXIR_ENTRY(ActivityStats) LUXIR_ENTRY(TransportStats) LUXIR_ENTRY(ServiceStats) LUXIR_ENTRY(HostStats) LUXIR_ENTRY(SystemStats) LUXIR_ENTRY(ProcessIoStats) LUXIR_ENTRY(ProcessStats) LUXIR_ENTRY(CpuTimes) LUXIR_ENTRY(HostCpuStats) LUXIR_ENTRY(HostMemoryStats) LUXIR_ENTRY(NetworkInterfaceStats) LUXIR_ENTRY(TcpStats) LUXIR_ENTRY(DiskStats) LUXIR_ENTRY(FilesystemStats) LUXIR_ENTRY(PressureStats) LUXIR_ENTRY(CgroupStats) LUXIR_ENTRY(CgroupMemoryStats) LUXIR_ENTRY(CgroupCpuStats) LUXIR_ENTRY(CgroupTaskStats)
 LUXIR_ENTRY(CacheControlRequest) LUXIR_ENTRY(CacheControlResponse) LUXIR_ENTRY(CacheEntryDump)
 LUXIR_ENTRY(ShardCacheControl) LUXIR_ENTRY(CollectionCacheControl)
 LUXIR_ENTRY(AllReplicas) LUXIR_ENTRY(ReplicaRequirement) LUXIR_ENTRY(ReplicationCatalog) LUXIR_ENTRY(ReplicationCatalogEntry) LUXIR_ENTRY(ReplicationInstalled)

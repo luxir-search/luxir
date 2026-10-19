@@ -345,6 +345,10 @@ struct HttpStreamUpdateState {
   bool urlCommitInFlight = false;
   size_t urlCommitsPending = 0;
   bool failed = false;
+  // Whether any batch applied documents or deletes, and the first failure's
+  // kind: a stream that applied nothing failed.
+  bool anyApplied = false;
+  std::optional<ErrorKind> firstFailureKind;
 
   HttpStreamUpdateState(std::size_t batchTargetBytes, std::size_t batchMaxDocs,
                         std::size_t maxRecordBytes, std::size_t maxRequestBody,
@@ -432,11 +436,12 @@ public:
     shard_->liveConnections.fetch_sub(1, std::memory_order_release);
   }
 
+  // Records the request's first error; any thread may report it.
   void metricError(ErrorKind kind = ErrorKind::UNKNOWN) {
-    if (!metricFailed.exchange(true, std::memory_order_relaxed))
-      metrics->errors[0][(size_t)kind].fetch_add(1, std::memory_order_relaxed);
+    int none = -1;
+    metricErrorKind.compare_exchange_strong(none, (int)kind, std::memory_order_relaxed);
   }
-  void metricPause() { metrics->streamPauses[0].fetch_add(1, std::memory_order_relaxed); }
+  void metricPause() { metrics->add(MetricTransportCounter::STREAM_PAUSES, MetricTransport::HTTP); }
 
   void run();  // defined after HttpSessionRegistry (touches the registry)
 
@@ -480,7 +485,7 @@ public:
   // the dispatch, so the count never lags the producer.
   int64_t enqueueLine(std::string line, bool last) {
     int64_t bytes = (int64_t)line.size();
-    metrics->sentBytes[0].fetch_add(bytes, std::memory_order_relaxed);
+    metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::HTTP, bytes);
     int64_t queued = queuedBytes_.fetch_add(bytes, std::memory_order_relaxed) + bytes;
     uint64_t ticket = lineTickets_.fetch_add(1, std::memory_order_relaxed);
     try {
@@ -602,7 +607,7 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, SCHEMA,
+    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
     REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED
   };
 
@@ -682,16 +687,16 @@ private:
   std::vector<UrlParam> urlParams_;
   RouteMatch route_;
   MetricScope requestMetric;
-  std::atomic<bool> metricFailed{false};
+  std::atomic<int> metricErrorKind{-1};  // the first ErrorKind, or -1
 
   void startRequestMetric() {
-    metricFailed.store(false, std::memory_order_relaxed);
+    metricErrorKind.store(-1, std::memory_order_relaxed);
     MetricOperation operation = MetricOperation::OTHER;
     switch (route_.route) {
       case Route::SEARCH: operation = MetricOperation::SEARCH; break;
       case Route::UPDATE: operation = MetricOperation::UPDATE; break;
       case Route::SCHEMA: operation = MetricOperation::SCHEMA; break;
-      case Route::STATS: operation = MetricOperation::STATS; break;
+      case Route::STATS: case Route::METRICS: operation = MetricOperation::STATS; break;
       case Route::HEALTH: operation = MetricOperation::HEALTH; break;
       case Route::TENANT_LIST: case Route::COLLECTION_LIST:
       case Route::COLLECTION_CREATE: case Route::COLLECTION_DELETE:
@@ -701,11 +706,17 @@ private:
       case Route::REPLICATION_INSTALLED: return;
       default: break;
     }
-    requestMetric.begin(&metrics->request(MetricTransport::HTTP, operation));
+    requestMetric.begin(*metrics, metricActivity(MetricTransport::HTTP, operation));
   }
-  void finishRequestMetric() {
-    requestMetric.finish(metricFailed.load(std::memory_order_relaxed)
-        ? MetricOutcome::ERROR : MetricOutcome::OK);
+  // A request with a recorded error failed; a failed request counts its error
+  // kind. Untracked (replication) requests count nothing.
+  void finishRequestMetric(MetricOutcome outcome = MetricOutcome::OK) {
+    if (!requestMetric.active()) return;
+    int kind = metricErrorKind.load(std::memory_order_relaxed);
+    if (outcome == MetricOutcome::OK && kind >= 0) outcome = MetricOutcome::ERROR;
+    if (outcome == MetricOutcome::ERROR)
+      metrics->requestError(MetricTransport::HTTP, kind >= 0 ? (ErrorKind)kind : ErrorKind::UNKNOWN);
+    requestMetric.finish(outcome);
   }
 
   UpdateUrlParams updateUrl_;
@@ -964,7 +975,7 @@ private:
     if (ec && !needBuffer) { LOG_TRACE("http read: {}", ec.message()); doClose(); return; }
 
     std::size_t produced = bodyBuf_.size() - parser_->get().body().size;
-    metrics->receivedBytes[0].fetch_add(produced, std::memory_order_relaxed);
+    metrics->add(MetricTransportCounter::RECEIVED_BYTES, MetricTransport::HTTP, produced);
     bufferedBody_.append(bodyBuf_.data(), produced);
 
     if (parser_->is_done()) {
@@ -1390,6 +1401,8 @@ private:
     RouteMatch m;
     if (target == "/health") {
       m.route = Route::HEALTH; m.allow = "GET";
+    } else if (target == "/metrics") {
+      m.route = Route::METRICS; m.allow = "GET";
     } else if (target == "/collections/_list") {
       // The canonical _list spelling also accepts POST (matching the other
       // _-verb endpoints; any body is ignored - the request has no parameters).
@@ -1551,8 +1564,12 @@ private:
       case Route::UPDATE:
         handleUpdate(std::move(req.body()), coll, updateUrl_);
         break;
-      case Route::STATS: {
-        StatsParams stats;
+      case Route::STATS:
+      case Route::METRICS: {
+        // /metrics is the Prometheus scrape of the node: the same stats, with
+        // the collections and system sections on unless the URL turns them off.
+        bool scrape = match.route == Route::METRICS;
+        StatsParams stats{.collections = scrape, .system = scrape};
         std::string err;
         const std::string* format = findParam(params, "format");
         if (format && *format != "json" && *format != "prometheus") {
@@ -1563,11 +1580,12 @@ private:
             !parseBoolParam(params, "collections", stats.collections, err) ||
             !parseBoolParam(params, "files", stats.files, err) ||
             !parseBoolParam(params, "system", stats.system, err) ||
+            !parseBoolParam(params, "host", stats.host, err) ||
             !parseBoolParam(params, "columns", stats.columns, err)) {
           respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
           return;
         }
-        stats.prometheus = format && *format == "prometheus";
+        stats.prometheus = format ? *format == "prometheus" : scrape;
         // /_stats covers every tenant; a tenant route or a collection is scoped.
         handleStats(coll.empty() ? std::nullopt : std::optional<std::string>(coll),
                     match.tenantRoute || !coll.empty() ? tenant_ : std::string(), stats);
@@ -1813,8 +1831,8 @@ private:
           net::post(target->stream_.get_executor(), [target, guard, result] {
             try {
               std::string out;
-              if (result->response.status != api::UpdateResponse_::Status::OK)
-                target->metricError(result->response.error ? (ErrorKind)result->response.error->kind : ErrorKind::INVALID_REQUEST);
+              if (result->response.status == api::UpdateResponse_::Status::ERROR)
+                target->metricError(ProtoUpdateMessage::failureKind(result->response));
               if (!api::write_json(result->response, out)) throw std::runtime_error("failed to serialize update response");
               target->respondJson(http::status::ok, std::move(out));
             } catch (...) { target->respondError(currentExceptionInfo(ErrorKind::INTERNAL)); }
@@ -2415,6 +2433,7 @@ private:
     bool collections = false;
     bool files = false;
     bool system = false;
+    bool host = false;
     bool columns = false;
     bool prometheus = false;
   };
@@ -2432,6 +2451,7 @@ private:
             request.collections = params.collections;
             request.files = params.files;
             request.system = params.system;
+            request.host = params.host;
             request.columns = params.columns;
             request.tenant = tenant;
             if (coll) request.collection = *coll;
@@ -2440,7 +2460,7 @@ private:
             gatherStats(self->node_, request, response, resource);
 
             if (params.prometheus) {
-              out = renderPrometheus(response, params.files || params.segments);
+              out = renderPrometheus(response);
             } else if (!luxir::api::write_json(response, out)) {
               throw std::runtime_error("failed to serialize stats response");
             }
@@ -2519,7 +2539,7 @@ private:
     resp->set(http::field::allow, allow);
     resp->keep_alive(keepAlive_);
     resp->body() = finishJson(renderErrorBody(info, requestId_));
-    metrics->sentBytes[0].fetch_add(resp->body().size(), std::memory_order_relaxed);
+    metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::HTTP, resp->body().size());
     resp->prepare_payload();
     http::async_write(stream_, *resp,
         [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
@@ -2822,7 +2842,7 @@ private:
     }
 
     std::size_t produced = state->readSpace - parser_->get().body().size;
-    metrics->receivedBytes[0].fetch_add(produced, std::memory_order_relaxed);
+    metrics->add(MetricTransportCounter::RECEIVED_BYTES, MetricTransport::HTTP, produced);
     state->framer.commit(produced);
 
     if (parser_->is_done()) state->bodyDone = true;
@@ -2933,8 +2953,6 @@ private:
     if (!force && !streamIntervalHasActivity(*state)) return true;
 
     std::string out;
-    for (const auto& [name, result] : state->interval.commits)
-      if (result.error) metricError(result.error->kind);
     if (!renderStreamIntervalResponseBody(*state, currentStreamResponseRequestId(*state), nullptr, out)) {
       failStreamingUpdate(ErrorInfo::of(ErrorKind::INTERNAL, "failed to serialize update response"));
       return false;
@@ -3477,10 +3495,12 @@ private:
   }
 
   void foldStreamBatchResult(const HttpStreamBatchResult& result) {
-    if (result.error) metricError(result.error->kind);
-    else if (!result.errors.empty()) metricError(result.errors.front().error.kind);
     auto state = streamUpdate_;
     assert(state != nullptr);
+    if (!state->firstFailureKind) {
+      if (result.error) state->firstFailureKind = result.error->kind;
+      else if (!result.errors.empty()) state->firstFailureKind = result.errors.front().error.kind;
+    }
     auto& interval = state->interval;
     interval.lastUpdateVersion = result.updateVersion;
     if (result.commit) { interval.commit = result.commit; interval.replicas = result.replicas; }
@@ -3496,6 +3516,7 @@ private:
     if (result.status != luxir::api::UpdateResponse_::Status::ERROR &&
         (indexedDocs > 0 || result.deleteCount > 0)) {
       interval.anySuccess = true;
+      state->anyApplied = true;
     }
 
     // Ids on a request-level failure are not proof of anything durable.
@@ -3575,6 +3596,8 @@ private:
       return;
     }
 
+    // Like a buffered update, a stream that applied none of its input failed.
+    if (!state->anyApplied && state->firstFailureKind) metricError(*state->firstFailureKind);
     if (streamIntervalHasActivity(*state) || !state->emittedLine) {
       emitCurrentStreamInterval(true, true);
       return;
@@ -3589,6 +3612,7 @@ private:
                        const std::optional<CommitId>& id, std::optional<api::ReplicaResult> replicas,
                        std::optional<ErrorInfo> error) {
     if (streamUpdate_ != state || state->failed) return;
+    if (error) metricError(error->kind);  // the commit covers the whole request
     state->interval.commits[name] = {id ? id->token() : "", replicas, std::move(error)};
     if (--state->urlCommitsPending == 0) {
       stopWaitDisconnect();
@@ -3827,7 +3851,7 @@ private:
   void respondSimple(http::status status, std::string_view contentType, std::string body, bool head = false) {
     stopWaitDisconnect();
     if ((unsigned)status >= 400) metricError();
-    metrics->sentBytes[0].fetch_add(body.size(), std::memory_order_relaxed);
+    metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::HTTP, body.size());
     auto resp = std::make_shared<http::response<http::string_body>>(status, httpVersion_);
     resp->set(http::field::server, "luxir");
     resp->set(http::field::content_type, contentType);
@@ -3882,7 +3906,7 @@ private:
   }
 
   void doClose() {
-    requestMetric.finish(MetricOutcome::CANCELLED);
+    finishRequestMetric(MetricOutcome::CANCELLED);
     waitCancellation.request_stop();
     replicationStopped_ = true;
     cancelReplicationWatch();
@@ -3891,7 +3915,7 @@ private:
   }
 
   void doTerminalStreamingClose() {
-    requestMetric.finish(MetricOutcome::ERROR);
+    finishRequestMetric(MetricOutcome::ERROR);
     waitCancellation.request_stop();
     beast::error_code ec;
     stream_.socket().shutdown(tcp::socket::shutdown_both, ec);

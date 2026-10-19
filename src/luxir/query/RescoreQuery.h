@@ -570,10 +570,4 @@ public:
   };
 };
 
-inline Query::Weight* RescoreQuery::createWeight(
-    Context& context, int32_t flags, float multiplier) {
-  return context.pool.make<RescoreQuery::Weight>(
-      context, *this, flags, multiplier);
-}
-
 } // namespace luxir

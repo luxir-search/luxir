@@ -5,7 +5,9 @@
 #include "luxir/query/QueryStats.h"
 #include "luxir/util/ApiError.h"
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/util/log.h"
 #include "ReplicationFollower.h"
+#include "Scrubber.h"
 
 #include <algorithm>
 #include <cassert>
@@ -14,6 +16,7 @@
 #include <vector>
 
 #include "LuxirNode.h"
+#include "luxir/BuildInfo.h"
 #include "luxir/api/build.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/reader/IntColReader.h"
@@ -75,33 +78,46 @@ void addTotals(api::StatsTotals& dst, const api::StatsTotals& src) {
   dst.max_docs += src.max_docs;
   dst.live_docs += src.live_docs;
   dst.deleted_docs += src.deleted_docs;
-  dst.bytes += src.bytes;
+  if (src.bytes) dst.bytes = dst.bytes.value_or(0) + *src.bytes;
   dst.committed_bytes += src.committed_bytes;
 }
 
-void fillHistogram(api::HistogramStats& dst, const MetricHistogram& src,
+void fillHistogram(api::HistogramStats& dst, const ActivityCounts& src, std::span<const double> bounds,
                    std::pmr::memory_resource& resource) {
-  auto snapshot = src.snapshot();
   uint64_t count = 0;
-  for (auto bucket : snapshot.buckets) count += bucket;
-  dst.sum = snapshot.sum;
+  for (std::size_t i = 0; i <= bounds.size(); i++) count += src.buckets[i];
+  dst.sum = (double)src.nanos / 1e9;
   dst.count = count;
   if (count == 0) return;
-  auto* counts = api::build::allocArray(dst.counts, snapshot.buckets.size(), resource);
+  auto* counts = api::build::allocArray(dst.counts, bounds.size() + 1, resource);
   uint64_t cumulative = 0;
-  for (std::size_t i = 0; i < snapshot.buckets.size(); i++) counts[i] = cumulative += snapshot.buckets[i];
+  for (std::size_t i = 0; i <= bounds.size(); i++) counts[i] = cumulative += src.buckets[i];
 }
 
-void fillActivity(api::ActivityStats& dst, const MetricActivity& src,
+void fillActivity(api::ActivityStats& dst, const MetricCounts& counts, size_t activity,
                   std::pmr::memory_resource& resource) {
-  dst.in_flight = src.active.load(std::memory_order_relaxed);
-  dst.ok = src.completed[(size_t)MetricOutcome::OK].load(std::memory_order_relaxed);
-  dst.error = src.completed[(size_t)MetricOutcome::ERROR].load(std::memory_order_relaxed);
-  dst.cancelled = src.completed[(size_t)MetricOutcome::CANCELLED].load(std::memory_order_relaxed);
-  fillHistogram(dst.duration, src.duration, resource);
+  const auto& src = counts.activities[activity];
+  dst.ok = src.completed[(size_t)MetricOutcome::OK];
+  dst.error = src.completed[(size_t)MetricOutcome::ERROR];
+  dst.cancelled = src.completed[(size_t)MetricOutcome::CANCELLED];
+  // Stripes are summed one at a time, so work finishing during the read can
+  // briefly count as completed before it counts as started.
+  uint64_t completed = dst.ok + dst.error + dst.cancelled;
+  dst.in_flight = src.started > completed ? (int64_t)(src.started - completed) : 0;
+  fillHistogram(dst.duration, src, metricBounds(activity), resource);
 }
 
-void fillTransport(api::TransportStats& dst, Metrics& metrics, MetricTransport transport,
+// Counts by error kind, keyed by the kind's wire spelling.
+api::map_view<std::string_view, uint64_t> errorKinds(const std::array<uint64_t, ERROR_KINDS>& counts,
+                                                     std::pmr::memory_resource& resource) {
+  using Entry = std::pair<std::string_view, uint64_t>;
+  std::span<const Entry> entries;
+  auto* kinds = api::build::allocArray(entries, ERROR_KINDS, resource);
+  for (std::size_t kind = 0; kind < ERROR_KINDS; kind++) kinds[kind] = {errorKindName((ErrorKind)kind), counts[kind]};
+  return {entries};
+}
+
+void fillTransport(api::TransportStats& dst, const MetricCounts& counts, MetricTransport transport,
                    std::pmr::memory_resource& resource) {
   auto t = (size_t)transport;
   using Operation = std::pair<std::string_view, api::ActivityStats>;
@@ -109,45 +125,59 @@ void fillTransport(api::TransportStats& dst, Metrics& metrics, MetricTransport t
   auto* ops = api::build::allocArray(operations, metricOperations.size(), resource);
   for (std::size_t op = 0; op < metricOperations.size(); op++) {
     ops[op].first = metricOperations[op];
-    fillActivity(ops[op].second, metrics.requests[t][op], resource);
+    fillActivity(ops[op].second, counts, metricActivity(transport, (MetricOperation)op), resource);
   }
   dst.operations = {operations};
-  using Error = std::pair<std::string_view, uint64_t>;
-  std::span<const Error> errors;
-  auto* kinds = api::build::allocArray(errors, metrics.errors[t].size(), resource);
-  for (std::size_t kind = 0; kind < metrics.errors[t].size(); kind++) {
-    kinds[kind] = {errorKindName((ErrorKind)kind), metrics.errors[t][kind].load(std::memory_order_relaxed)};
-  }
-  dst.errors = {errors};
-  dst.received_bytes = metrics.receivedBytes[t].load(std::memory_order_relaxed);
-  dst.sent_bytes = metrics.sentBytes[t].load(std::memory_order_relaxed);
-  dst.stream_pauses = metrics.streamPauses[t].load(std::memory_order_relaxed);
+  dst.errors = errorKinds(counts.requestErrors[t], resource);
+  dst.received_bytes = counts.transport[(size_t)MetricTransportCounter::RECEIVED_BYTES][t];
+  dst.sent_bytes = counts.transport[(size_t)MetricTransportCounter::SENT_BYTES][t];
+  dst.stream_pauses = counts.transport[(size_t)MetricTransportCounter::STREAM_PAUSES][t];
 }
 
 void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_resource& resource) {
   auto& metrics = *node.metrics;
-#ifdef LUXIR_VERSION
-  dst.version = LUXIR_VERSION;
-#endif
+  auto counts = metrics.counts();
+  auto counter = [&](MetricCounter c) { return counts.counters[(size_t)c]; };
+  dst.version = buildVersion();
+  dst.cpu_target = buildCpuTarget();
   dst.read_only = node.readOnly();
-  dst.duration_bounds = MetricHistogram::bounds;
-  fillTransport(dst.http, metrics, MetricTransport::HTTP, resource);
-  dst.http.connections = metrics.httpConnections.load(std::memory_order_relaxed);
+  dst.request_duration_bounds = requestBounds;
+  dst.background_duration_bounds = backgroundBounds;
+  fillTransport(dst.http, counts, MetricTransport::HTTP, resource);
+  dst.http.connections = (uint64_t)metrics.httpConnections.load(std::memory_order_relaxed);
   dst.http.io_threads = metrics.httpThreads.load(std::memory_order_relaxed);
-  fillTransport(dst.grpc, metrics, MetricTransport::GRPC, resource);
-  fillActivity(dst.search, metrics.searches, resource);
-  fillHistogram(dst.search_execution, metrics.searchExecution, resource);
-  dst.search_resource_exhausted = metrics.searchResourceExhausted.load(std::memory_order_relaxed);
-  dst.search_warnings = metrics.searchWarnings.load(std::memory_order_relaxed);
-  fillActivity(dst.index_batches, metrics.updates, resource);
-  dst.documents_accepted = metrics.documentsAccepted.load(std::memory_order_relaxed);
-  dst.documents_rejected = metrics.documentsRejected.load(std::memory_order_relaxed);
-  dst.delete_ids_accepted = metrics.deletesAccepted.load(std::memory_order_relaxed);
-  fillActivity(dst.flush, metrics.flushes, resource);
-  fillActivity(dst.commit, metrics.commits, resource);
-  fillActivity(dst.merge, metrics.merges, resource);
-  fillActivity(dst.vector_build, metrics.vectorBuilds, resource);
-  fillActivity(dst.reader_refresh, metrics.readerRefreshes, resource);
+  fillTransport(dst.grpc, counts, MetricTransport::GRPC, resource);
+  fillActivity(dst.search, counts, metricActivity(MetricStage::SEARCH), resource);
+  fillHistogram(dst.search_execution, counts.activities[metricActivity(MetricStage::SEARCH_EXECUTION)],
+                requestBounds, resource);
+  dst.search_resource_exhausted = counter(MetricCounter::SEARCH_RESOURCE_EXHAUSTED);
+  dst.search_warnings = counter(MetricCounter::SEARCH_WARNINGS);
+  fillActivity(dst.index_batches, counts, metricActivity(MetricStage::INDEX_BATCH), resource);
+  dst.documents_accepted = counter(MetricCounter::DOCUMENTS_ACCEPTED);
+  dst.documents_rejected = counter(MetricCounter::DOCUMENTS_REJECTED);
+  dst.delete_ids_accepted = counter(MetricCounter::DELETE_IDS_ACCEPTED);
+  dst.document_errors = errorKinds(counts.documentErrors, resource);
+  fillActivity(dst.flush, counts, metricActivity(MetricStage::FLUSH), resource);
+  fillActivity(dst.commit, counts, metricActivity(MetricStage::COMMIT), resource);
+  fillActivity(dst.merge, counts, metricActivity(MetricStage::MERGE), resource);
+  fillActivity(dst.vector_build, counts, metricActivity(MetricStage::VECTOR_BUILD), resource);
+  fillActivity(dst.reader_refresh, counts, metricActivity(MetricStage::READER_REFRESH), resource);
+}
+
+void fillOutcomes(api::OutcomeStats& dst, const std::array<uint64_t, (size_t)MetricOutcome::COUNT>& outcomes,
+                  uint64_t nanos) {
+  dst.ok = outcomes[(size_t)MetricOutcome::OK];
+  dst.error = outcomes[(size_t)MetricOutcome::ERROR];
+  dst.cancelled = outcomes[(size_t)MetricOutcome::CANCELLED];
+  dst.seconds = (double)nanos / 1e9;
+}
+
+void fillCollectionActivity(api::CollectionActivityStats& dst, const CollectionCounts& src) {
+  fillOutcomes(dst.searches, src.searches, src.searchNanos);
+  fillOutcomes(dst.index_batches, src.batches, src.batchNanos);
+  dst.documents_accepted = src.documentsAccepted;
+  dst.documents_rejected = src.documentsRejected;
+  dst.delete_ids_accepted = src.deleteIdsAccepted;
 }
 
 void copyAuxStats(api::AuxStats& dst, const ReaderManager::AuxStats& src,
@@ -282,16 +312,18 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
   bool nodeScope = request.collection.empty() && request.tenant.empty();
   bool segments = request.segments || request.columns;
   bool files = request.files || segments;
-  if (!nodeScope && request.system) {
-    throw RequestError("system stats are node-wide: request them without a collection or tenant");
+  if (!nodeScope && (request.system || request.host)) {
+    throw RequestError("system and host stats are node-wide: request them without a collection or tenant");
   }
   if (nodeScope) {
     // Atomics and allocator statistics only: cheap enough to poll.
     fillServiceStats(node, response.service.emplace(), resource);
     fillMemoryStats(node, response.memory.emplace());
-    if (request.system) {
+    if (request.system || request.host) {
       const auto& store = node.getConfig().store;
-      gatherSystemStats(response.system.emplace(), store.backend == "fs" ? store.data_dir : "", resource);
+      gatherSystemStats(request.system ? &response.system.emplace() : nullptr,
+                        request.host ? &response.host.emplace() : nullptr,
+                        store.backend == "fs" ? store.data_dir : "", resource);
     }
   }
   response.multiterm_expansion_refills =
@@ -309,17 +341,28 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
 
     auto& totals = response.totals.emplace();
     auto* collections = api::build::allocArray(response.collections, entries.size(), resource);
-    std::size_t filled = 0;
-    for (const auto& entry : entries) {
-      auto& collectionStats = collections[filled];
-      collectionStats = {};
+    for (std::size_t i = 0; i < entries.size(); i++) {
+      const auto& entry = entries[i];
+      auto& collectionStats = collections[i];
       collectionStats.name = api::build::arenaStr(resource, entry.id.name);
       collectionStats.tenant = api::build::arenaStr(resource, entry.id.tenant);
       collectionStats.storage_ram_bytes = node.storageBytes(entry.id);
+      auto unavailable = [&](const ErrorInfo& info) {
+        collectionStats.schema_gen = 0;
+        collectionStats.shards = {};
+        collectionStats.error = api::build::arenaError(resource, info);
+      };
       if (!entry.error.empty()) {
-        collectionStats.error = api::build::arenaError(
-            resource, {ErrorKind::UNAVAILABLE, "collection_unavailable", entry.error});
-        filled++;
+        unavailable({ErrorKind::UNAVAILABLE, "collection_unavailable", entry.error});
+        continue;
+      }
+      // Deleted since the listing (or the resolution): report it as
+      // resolution now would.
+      if (entry.collection->getReaderManager().isClosed()) {
+        if (!request.collection.empty()) {
+          throw CollectionUnavailableError("collection '" + entry.id.label() + "' was deleted");
+        }
+        unavailable({ErrorKind::UNAVAILABLE, "collection_unavailable", "collection was deleted"});
         continue;
       }
       try {
@@ -356,25 +399,35 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
           indexTotals.live_docs = stats.liveDocs;
           assert(stats.liveDocs <= stats.maxDocs);
           indexTotals.deleted_docs = stats.maxDocs - stats.liveDocs;
-          indexTotals.bytes = stats.totalBytes;
+          if (files) indexTotals.bytes = stats.totalBytes;
         };
         if (writer) fill(writer->stats(segments, files));
         else fill(shard->getReaderManager().stats(segments, files));
-      } catch (const std::exception&) {
-        // A collection deleted or closed while walking a node-wide listing must
-        // not fail the whole response; a named collection reports the failure.
+      } catch (const std::exception& e) {
+        // A named collection reports its failure. A node-wide walk reports the
+        // collection in its error slot and goes on: unavailable if it was
+        // deleted while being read, otherwise the engine's failure, logged.
         if (!request.collection.empty()) throw;
-        response.collection_errors++;
+        if (entry.collection->getReaderManager().isClosed()) {
+          unavailable({ErrorKind::UNAVAILABLE, "collection_unavailable", e.what()});
+        } else {
+          auto info = classifyException(e, ErrorKind::INTERNAL);
+          LOG_ERROR("stats for collection '{}' failed: {}", entry.id.label(), info.message);
+          unavailable(info);
+        }
         continue;
       }
 
+      fillCollectionActivity(collectionStats.activity.emplace(), entry.collection->getMetrics().counts());
       collectionStats.totals = collectionStats.shards[0].index.totals;
       collectionStats.totals.shards = 1;
       addTotals(totals, collectionStats.totals);
       totals.collections++;
-      filled++;
     }
-    response.collections = response.collections.first(filled);
+  }
+  if (nodeScope && node.getScrubber().enabled()) {
+    auto scrub = node.getScrubber().stats();
+    response.scrub = api::ScrubStats{scrub.passes, scrub.files, scrub.bytes, scrub.mismatches, scrub.errors, scrub.lastPassEnd};
   }
   response.duration_seconds =
       std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
@@ -418,24 +471,9 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
     if (request.reset_admission) cache->resetAdmission();
     if (request.reset_counters) cache->resetCounters();
 
-    auto counters = cache->counters();
-    auto& stats = shardControl.stats;
-    stats.enabled = cache->enabled();
-    stats.max_bytes = cache->configuration().maxBytes;
-    stats.resident_bytes = cache->bytesUsed();
-    stats.metadata_bytes = cache->metadataBytesUsed();
-    stats.hits = counters.hits;
-    stats.misses = counters.misses;
-    stats.admissions = counters.admissions;
-    stats.builds = counters.builds;
-    stats.byproduct_inserts = counters.byproductInserts;
-    stats.publish_rejects = counters.publishRejects;
-    stats.evictions = counters.evictions;
-    stats.purges = counters.purges;
-    stats.oversized_key_bypasses = counters.oversizedKeyBypasses;
-    stats.reader_stable_hits = counters.readerStableHits;
-    stats.reader_stable_refreshes = counters.readerStableRefreshes;
-    stats.reader_stable_retires = counters.readerStableRetires;
+    ReaderManager::CacheStats cacheStats;
+    shard->getReaderManager().cacheStats(cacheStats);
+    fillQueryCacheStats(shardControl.stats, cacheStats);
 
     if (!request.dump) continue;
     size_t resident = 0;
@@ -448,11 +486,13 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
       out.key_hash = row.keyHash;
       out.key_bytes = (uint32_t)row.keyBytes;
       out.key_text = api::build::arenaStr(resource, row.keyText);
-      std::string_view scope = row.scope == FilterKeyScope::READER_STABLE
-          ? "READER_STABLE"
-          : row.scope == FilterKeyScope::CORE_STABLE ? "CORE_STABLE"
-                                                     : "SEGMENT_STABLE";
-      out.scope = scope;
+      switch (row.scope) {
+        case FilterKeyScope::SEGMENT_STABLE: out.scope = "SEGMENT_STABLE"; break;
+        case FilterKeyScope::CORE_STABLE: out.scope = "CORE_STABLE"; break;
+        case FilterKeyScope::READER_STABLE: out.scope = "READER_STABLE"; break;
+        case FilterKeyScope::REQUEST_STABLE: out.scope = "REQUEST_STABLE"; break;
+        case FilterKeyScope::UNCACHEABLE: out.scope = "UNCACHEABLE"; break;
+      }
       out.reader_value = row.readerValue;
       out.bytes = row.bytes;
       out.segments_resident = row.segmentsResident;

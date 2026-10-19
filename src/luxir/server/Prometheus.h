@@ -27,7 +27,6 @@ public:
 inline constexpr std::string_view prometheusContentType = "text/plain; version=0.0.4; charset=utf-8";
 
 // Render a gathered stats response (see gatherStats). Every sample comes from
-// the response, so the JSON and Prometheus formats carry the same data.
-// `files` reports whether the response was gathered with directory listings.
-std::string renderPrometheus(const api::StatsResponse& stats, bool files);
+// the response alone; StatsMetricsTest checks which response fields have none.
+std::string renderPrometheus(const api::StatsResponse& stats);
 } // namespace luxir

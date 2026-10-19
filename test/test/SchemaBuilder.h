@@ -27,6 +27,30 @@
 
 namespace luxir {
 
+namespace test {
+
+inline api::VectorAnnDef pqAnn(int32_t nlist = 0, int32_t m = 0, int32_t bits = 8) {
+  api::VectorAnnDef ann;
+  ann.codec = api::VectorAnnDef::Codec::PQ;
+  ann.nlist = nlist;
+  auto& pq = ann.pq.emplace();
+  pq.m = m;
+  pq.bits = bits;
+  return ann;
+}
+
+inline api::VectorAnnDef rabitqAnn(int32_t nlist = 0, int32_t bits = 1, int32_t queryBits = 4) {
+  api::VectorAnnDef ann;
+  ann.codec = api::VectorAnnDef::Codec::RABITQ;
+  ann.nlist = nlist;
+  auto& rabitq = ann.rabitq.emplace();
+  rabitq.bits = bits;
+  rabitq.query_bits = queryBits;
+  return ann;
+}
+
+} // namespace test
+
 class SchemaBuilder {
   using Pair = std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>;
   std::pmr::monotonic_buffer_resource arena_;
