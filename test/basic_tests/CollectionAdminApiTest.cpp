@@ -477,9 +477,11 @@ TEST_F(CollectionAdminApiTest, tenantRoutesAdministerNamedTenants) {
   EXPECT_NE(std::string::npos, body(http::verb::get, "/_stats?pretty=false").second.find(R"("tenant":"t0")"));
   // Node memory is node-wide, not a tenant's view.
   EXPECT_EQ(400, body(http::verb::get, "/tenants/acme/_stats?memory=true").first);
-  // Searching and indexing act in the caller's own tenant only.
+  // Searching acts in the caller's own tenant only; a tenant route can update.
   EXPECT_EQ(404, body(http::verb::post, "/tenants/acme/collections/docs/_search", "{}").first);
-  EXPECT_EQ(404, body(http::verb::post, "/tenants/acme/collections/docs/_update", "{}").first);
+  EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/docs/_update",
+                      R"({"docs":[{"id":"x"}],"commit":{}})").first);
+  EXPECT_EQ(1, node.getCollection(CollectionId{"acme", "docs"})->getReaderManager().getReader()->liveDocs());
   EXPECT_EQ(404, body(http::verb::post, "/collections/docs/_search", "{}").first);
   EXPECT_EQ(200, body(http::verb::post, "/tenants/acme/collections/_delete", R"({"name":"docs"})").first);
   EXPECT_FALSE(std::filesystem::exists(data.path() / "t" / "acme" / "docs"));

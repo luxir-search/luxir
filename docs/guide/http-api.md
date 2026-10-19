@@ -6,8 +6,8 @@ names as the protobuf messages.
 
 Collections belong to a tenant. Search and update routes act in the caller's
 own tenant, which is the default tenant `t0` until requests carry
-credentials. Administration and snapshot routes may name another tenant under
-`/tenants/{tenant}`.
+credentials. Administration, snapshot and update routes may name another
+tenant under `/tenants/{tenant}`.
 
 ## Endpoints
 
@@ -22,12 +22,14 @@ credentials. Administration and snapshot routes may name another tenant under
 | `GET /collections/_list` (or `POST`) | List collection names; `GET /collections` is a synonym. |
 | `POST /collections/_create` (or `PUT`) | Create a collection; body `{"name": "...", "schema": {...}}`; `wait_for_replicas` waits for [followers](replication.md#2-commit-and-wait-for-followers). |
 | `POST /collections/_delete` | Delete a collection and its stored data; body `{"name": "..."}`. |
+| `POST /collections/{collection}/_open` | Adopt a collection whose files are already in the data directory; body `{"promote": bool, "incarnation": "..."}`, both optional. See [operations](operations.md#opening-and-closing-a-collection-at-runtime). |
+| `POST /collections/{collection}/_close` | Unregister and close a collection without a restart; body `{"discard": bool, "expect_commit": "incarnation:gen"}`, both optional. |
 | `GET /_stats` | Node totals and per-collection operational statistics. |
 | `GET /collections/{collection}/_stats` | Operational statistics for one collection. |
 | `GET /collections/{collection}/_snapshot` | Pin the current snapshot for copying; see [Replication](replication.md). |
 | `GET /collections/{collection}/_snapshot/files/{name}` | One file of a pinned snapshot. |
 | `GET /tenants` | Tenants that own a collection. |
-| `/tenants/{tenant}/collections/...` | The administration and snapshot routes above (`_list`, `_create`, `_delete`, `_schema`, `_stats`, `_snapshot`) for a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
+| `/tenants/{tenant}/collections/...` | The administration, snapshot and update routes above (`_list`, `_create`, `_delete`, `_open`, `_close`, `_schema`, `_stats`, `_snapshot`, `_update`) for a named tenant; `GET /tenants/{tenant}/_stats` covers that tenant. |
 | `GET /_replication/watch`, `POST /_replication/installed`, `GET /_replication/status` | Replication discovery, acknowledgments and status; see [Replication](replication.md). |
 
 Collection names occupy one URL path component. Names beginning with `_` are

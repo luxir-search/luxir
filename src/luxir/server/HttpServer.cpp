@@ -1319,11 +1319,12 @@ private:
     return true;
   }
 
-  // Routes that may name a tenant: administration and replication. Search,
-  // update and replica waits always act in the caller's own tenant.
+  // Routes that may name a tenant: administration, replication and update (an
+  // operator ingesting or committing for a tenant). Search and replica waits
+  // always act in the caller's own tenant.
   static bool tenantRoute(Route route) {
     return route == Route::COLLECTION_LIST || route == Route::COLLECTION_CREATE || route == Route::COLLECTION_DELETE ||
-           route == Route::COLLECTION_OPEN || route == Route::COLLECTION_CLOSE || route == Route::STATS || route == Route::SCHEMA || route == Route::REPLICATION_SNAPSHOT ||
+           route == Route::COLLECTION_OPEN || route == Route::COLLECTION_CLOSE || route == Route::UPDATE || route == Route::STATS || route == Route::SCHEMA || route == Route::REPLICATION_SNAPSHOT ||
            route == Route::REPLICATION_FILE;
   }
 
