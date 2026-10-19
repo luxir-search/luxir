@@ -664,6 +664,7 @@ public:
       }
 
       assert(domainHandle.isDeliverable());
+      domainHandle = segmentDomain(std::move(domainHandle));
       DocSet* domain = domainHandle.get();
       if (!feedOps.empty()) input[(size_t)segnum] = std::move(domainHandle);
 

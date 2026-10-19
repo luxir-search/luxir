@@ -13,6 +13,8 @@
 #include <oneapi/tbb/info.h>
 #include <oneapi/tbb/task_group.h>
 
+#include "luxir/util/ExecutionBudget.h"
+
 namespace luxir {
 
 /// Label the calling thread for ps/top/gdb (15-char kernel limit).
@@ -29,6 +31,16 @@ inline int computeWidth(int arenaConcurrency) {
 }
 
 
+/// Wrap a task so it runs under the spawning thread's execution budget: the
+/// thread that picks it up may be serving another request (or none).
+template <typename F>
+auto withCurrentBudget(F&& f) {
+  return [budget = ExecutionBudget::current, f = std::forward<F>(f)]() {
+    ExecutionBudget::Scope scope(budget);
+    f();
+  };
+}
+
 inline std::atomic<bool> countTaskSpawnsForTests{false};
 inline std::atomic<int64_t> taskSpawnsForTests{0};
 
@@ -39,7 +51,7 @@ template <typename MakeTask>
 void task_group_fanout(oneapi::tbb::task_group* tg, size_t n, MakeTask&& makeTask) {
   for (size_t i = 0; i < n; i++) {
     if (tg && i + 1 < n) {
-      tg->run(makeTask(i));
+      tg->run(withCurrentBudget(makeTask(i)));
       if (countTaskSpawnsForTests.load(std::memory_order_relaxed)) {
         taskSpawnsForTests.fetch_add(1, std::memory_order_relaxed);
       }
@@ -71,7 +83,7 @@ public:
   template <typename F>
   void run(bool spawn, F&& f) {
     if (spawn) {
-      group()->run(std::forward<F>(f));
+      group()->run(withCurrentBudget(std::forward<F>(f)));
     } else {
       std::forward<F>(f)();
     }

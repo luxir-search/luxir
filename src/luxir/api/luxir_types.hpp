@@ -99,7 +99,7 @@ namespace VectorAnnDef_ { struct RaBitQ; struct Pq; }
 namespace Error_ {
 enum class Kind {
   UNKNOWN = 0, INVALID_REQUEST = 1, NOT_FOUND = 2, ALREADY_EXISTS = 3, FAILED_PRECONDITION = 4,
-  RESOURCE_EXHAUSTED = 5, UNAVAILABLE = 6, INTERNAL = 7
+  RESOURCE_EXHAUSTED = 5, UNAVAILABLE = 6, INTERNAL = 7, CANCELLED = 8, DEADLINE_EXCEEDED = 9
 };
 }
 namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
@@ -916,6 +916,7 @@ struct SearchRequest {
   std::int32_t max_parallel = 0;
   std::string_view min_commit;
   std::optional<uint64_t> min_commit_timeout_ms;
+  uint64_t timeout_ms = 0;
   // JSON parsing metadata, absent from the wire schema and canonical JSON.
   // Only a root TopDocs shorthand creates this implicit q; an explicit op
   // named q (including one modified by a URL overlay) keeps its wrapper.
@@ -1020,6 +1021,7 @@ struct SearchResponse {
   std::optional<Error> error;
   std::span<const Warning> warnings;
   std::optional<ExecutionProfile> profile;
+  bool timed_out = false;
   bool more = false;
 };
 struct Match {

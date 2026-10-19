@@ -1623,6 +1623,32 @@ public:
       op.releaseSegmentState(segment);
     }
 
+    // Out of budget (SearchRequest::shouldStop): the segment collects nothing
+    // but still completes.  The domain cannot simply be swapped for an empty
+    // one here, since prepared sources may require the exact domain they were
+    // built for.  Sub-ops get an empty domain (a null one would mean every
+    // document), and the collector goes back to the merger so the last
+    // segment still runs doneCollecting.
+    template <bool Collapsed, bool MetricGroups>
+    void skipSegment(oneapi::tbb::task_group* tg, int32_t segnum) {
+      auto& op = thisOp();
+      releaseSegmentState(op.planning.topReader.segments()[segnum]);
+      DomainHandle empty = emptyDomain();
+      if (!output.empty()) output[(size_t)segnum] = empty;
+      if constexpr (Collapsed) {
+        if (memberReplay) memberReplay->domains[(size_t)segnum] = empty;
+      }
+      task_group_fanout(tg, subCalcs.size(), [&](size_t i) {
+        auto* subCalc = subCalcs[subCalcs.size() - 1 - i].get();
+        return [subCalc, tg, segnum, empty]() { subCalc->calc(tg, segnum, empty); };
+      });
+      auto count = [&] {
+        if constexpr (MetricGroups) return metricGroups->merger.release(metricGroups->merger.obtain());
+        else return collectorMerger.release(collectorMerger.obtain());
+      }();
+      if (count == (int64_t)op.req.reader->segments().size()) doneCollecting<MetricGroups>();
+    }
+
     template <bool Structural, bool MetricGroups = false, typename Admission = CollapseAdmission>
     void doCollect(oneapi::tbb::task_group* tg, int32_t segnum,
                    DomainHandle domainHandle) {
@@ -1645,6 +1671,10 @@ public:
         DomainHandle domainHandle) {
       auto& op = thisOp();
       assert(domainHandle.isDeliverable());
+      if (op.req.shouldStop()) {
+        skipSegment<Collapsed, MetricGroups>(tg, segnum);
+        return;
+      }
       DocSet* domain = domainHandle.get();
 
       // A constant-scoring match-all is the identity on its domain: every doc

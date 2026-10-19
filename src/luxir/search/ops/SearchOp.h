@@ -463,9 +463,24 @@ public:
       task_group_fanout(tg, domains.size(), [&](size_t segnum) {
         return [this, tg, segnum, domain = domains[segnum]]() {
           assert(domain.isDeliverable());
-          calc(tg, (int32_t)segnum, domain);
+          calc(tg, (int32_t)segnum, segmentDomain(domain));
         };
       });
+    }
+
+    // A domain holding no documents (a null domain means every document).
+    static DomainHandle emptyDomain() {
+      return DomainHandle(std::make_unique<ArrDocSet>(std::vector<int32_t>{}));
+    }
+
+    // The domain a segment's work starts with: `domain`, or an empty one once
+    // the request is out of budget (SearchRequest::shouldStop), so the segment
+    // still runs its completion bookkeeping but collects nothing.  Only valid
+    // where the domain is delivered, before the calculator prepares against
+    // it: prepared sources may require the exact domain they were built for.
+    DomainHandle segmentDomain(DomainHandle domain) {
+      if (!op.req.shouldStop()) return domain;
+      return emptyDomain();
     }
 
     virtual ~Calculator() = default;

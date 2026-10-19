@@ -276,6 +276,11 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - A warnings channel: declared degradations (a clamped fuzzy distance, a
   skipped calendar bucket) carry a code and a message in the response instead
   of silently changing the query.
+- Search deadlines (`timeout_ms`, a node default, or the gRPC call deadline):
+  a search out of time returns its partial results flagged `timed_out`
+  instead of failing, and a disconnected client's search stops early. A node
+  can cap concurrent searches, queueing a bounded number and rejecting the
+  rest with HTTP 429.
 - Opt-in execution profiles (`profile: true`) with per-segment strategy,
   inputs, and timing for instrumented operations (string facets today), and
   `max_parallel` to force serial execution when isolating scheduler effects.

@@ -2025,6 +2025,7 @@ Top-level search request that can contain multiple search operations.
 | <a id="field-luxir.searchrequest.max_parallel"></a>[`max_parallel`](#field-luxir.searchrequest.max_parallel) | 8 | `int32` | singular | Intra-request parallelism: 0 (default) lets the engine choose; 1 runs serially on the shared executor; -1 permits unlimited parallelism, starting on the receiving thread with shared workers joining in. Automatic execution is serial on the receiving thread. Other values are rejected. |
 | <a id="field-luxir.searchrequest.min_commit"></a>[`min_commit`](#field-luxir.searchrequest.min_commit) | 9 | `string` | singular | Require a local snapshot at least this new (incarnation:index\_gen). Writers reject a different incarnation immediately; followers wait for a switch. |
 | <a id="field-luxir.searchrequest.min_commit_timeout_ms"></a>[`min_commit_timeout_ms`](#field-luxir.searchrequest.min_commit_timeout_ms) | 10 | `uint64` | optional | Search floor deadline. Absent defaults to 30000; zero checks immediately. |
+| <a id="field-luxir.searchrequest.timeout_ms"></a>[`timeout_ms`](#field-luxir.searchrequest.timeout_ms) | 11 | `uint64` | singular | Execution deadline in milliseconds, measured from receipt. 0 (the default) sets none of its own. The effective deadline is the earliest of this, the node's search.default-timeout-ms and a gRPC call deadline; time spent waiting for min\_commit or in the admission queue counts against it. A search that runs out of time stops collecting and answers with what it has: SearchResponse.timed\_out and a timed\_out warning, not an error. |
 
 <a id="message-luxir.searchresponse"></a>
 
@@ -2042,6 +2043,7 @@ Top-level response to a Search request
 | <a id="field-luxir.searchresponse.error"></a>[`error`](#field-luxir.searchresponse.error) | 3 | [`Error`](#message-luxir.error) | singular | Present on a failed request's final response; ops is then empty. A final error may follow earlier result batches. |
 | <a id="field-luxir.searchresponse.warnings"></a>[`warnings`](#field-luxir.searchresponse.warnings) | 4 | [`Warning`](#message-luxir.warning) | repeated | final response only, on success or failure |
 | <a id="field-luxir.searchresponse.profile"></a>[`profile`](#field-luxir.searchresponse.profile) | 5 | [`ExecutionProfile`](#message-luxir.executionprofile) | singular | final response only, when SearchRequest.profile is true |
+| <a id="field-luxir.searchresponse.timed_out"></a>[`timed_out`](#field-luxir.searchresponse.timed_out) | 6 | `bool` | singular | Final response only: the search ran out of time (SearchRequest.timeout\_ms) and stopped early. Ops hold what was collected by then: counts and facet buckets may be low, and top documents are the best of the documents seen. A timed\_out warning accompanies it. |
 | <a id="field-luxir.searchresponse.more"></a>[`more`](#field-luxir.searchresponse.more) | 15 | `bool` | singular | if true, expect at least one more streaming response to the logical request. |
 
 <a id="message-luxir.segmentstats"></a>
@@ -2552,9 +2554,11 @@ Placement preference for returned document fields: dense columns (DocList.column
 | <a id="value-luxir.error.kind.not_found"></a>[`NOT_FOUND`](#value-luxir.error.kind.not_found) | 2 | the addressed collection or route does not exist (404) |
 | <a id="value-luxir.error.kind.already_exists"></a>[`ALREADY_EXISTS`](#value-luxir.error.kind.already_exists) | 3 | the request would create what already exists (409) |
 | <a id="value-luxir.error.kind.failed_precondition"></a>[`FAILED_PRECONDITION`](#value-luxir.error.kind.failed_precondition) | 4 | the node's state forbids the operation, e.g. --read-only (403) |
-| <a id="value-luxir.error.kind.resource_exhausted"></a>[`RESOURCE_EXHAUSTED`](#value-luxir.error.kind.resource_exhausted) | 5 | a size or memory ceiling was exceeded (429; 413 for request\_too\_large) |
+| <a id="value-luxir.error.kind.resource_exhausted"></a>[`RESOURCE_EXHAUSTED`](#value-luxir.error.kind.resource_exhausted) | 5 | a size, memory or concurrency ceiling was exceeded (429; 413 for request\_too\_large) |
 | <a id="value-luxir.error.kind.unavailable"></a>[`UNAVAILABLE`](#value-luxir.error.kind.unavailable) | 6 | the target exists but cannot serve now: shutting down, being deleted, failed to load (503) |
 | <a id="value-luxir.error.kind.internal"></a>[`INTERNAL`](#value-luxir.error.kind.internal) | 7 | a server-side failure the request did not cause (500) |
+| <a id="value-luxir.error.kind.cancelled"></a>[`CANCELLED`](#value-luxir.error.kind.cancelled) | 8 | the client went away or the node is shutting down (499) |
+| <a id="value-luxir.error.kind.deadline_exceeded"></a>[`DEADLINE_EXCEEDED`](#value-luxir.error.kind.deadline_exceeded) | 9 | reserved: a search past its deadline returns partial results instead (504) |
 
 <a id="enum-luxir.fielddef.fieldclass"></a>
 

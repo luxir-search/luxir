@@ -83,6 +83,11 @@ One request contains:
   inline on the completion-queue thread that received it (no scheduler
   handoff). `0` and `-1` occupy that thread for the request's duration.
   Larger values are reserved.
+- `timeout_ms`: execution deadline. The call's own gRPC deadline also
+  applies, and the earlier of the two wins. A search out of time returns its
+  partial results with `SearchResponse.timed_out` set rather than failing;
+  cancelling the call stops the search. See
+  [Timeouts and partial results](searching.md#timeouts-and-partial-results).
 
 Unlike HTTP, gRPC does not have the root `top_docs` shorthand. Populate the
 `ops` map explicitly. It also does not use HTTP's document-line
@@ -123,7 +128,8 @@ there is no limit on the number of messages in a stream. See
 
 A unary method fails with a gRPC status whose code follows the error's
 `kind`: `INVALID_ARGUMENT`, `NOT_FOUND`, `ALREADY_EXISTS`,
-`FAILED_PRECONDITION`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, or `INTERNAL`.
+`FAILED_PRECONDITION`, `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, `INTERNAL`,
+`CANCELLED`, or `DEADLINE_EXCEEDED`.
 The status message is the human detail, and the status details
 (`grpc-status-details-bin`) carry a `google.rpc.Status` whose single detail is
 the `luxir.Error` message, so a generated client reads the stable `code`

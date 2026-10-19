@@ -169,6 +169,17 @@ struct SearchConfig {
   // reservation tails, is 158,536,389 bytes - so 160 MiB covers it.
   // Early-merge degradation is future work.
   size_t request_memory_max_bytes = 0;
+  // Node search deadline in milliseconds; 0 (the default) is none.  A request's
+  // own timeout_ms can shorten it but not extend it.  A search out of time
+  // returns its partial results flagged timed_out.
+  int64_t default_timeout_ms = 0;
+  // Searches admitted to run at once; 0 (the default) is unlimited.  A search
+  // holds its slot from dispatch (including a min_commit wait) until its body
+  // finishes; a paused streaming emitter does not hold one.
+  int64_t max_concurrent = 0;
+  // Searches waiting FIFO for a slot once max_concurrent are running; beyond
+  // that a search is rejected with RESOURCE_EXHAUSTED (search_queue_full).
+  int64_t max_queued = 1000;
 };
 
 struct ReplicationConfig {
