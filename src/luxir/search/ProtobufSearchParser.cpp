@@ -127,6 +127,7 @@ struct SearchParserImpl {
     std::span<const int64_t> values;
     int64_t affineGap = 0;
     bool affine = false;
+    std::span<const RangeFacetRun> runs;
   };
 
   struct ParsedDomain {
@@ -174,7 +175,15 @@ struct SearchParserImpl {
       }
       auto fences = req.requestPool.make_span<int64_t>(built.values.size());
       std::copy(built.values.begin(), built.values.end(), fences.begin());
-      return {fences, built.affineGap, built.affineGap != 0};
+      std::span<RangeFacetRun> runs;
+      if (!built.affineGap) {
+        auto compressed = grid.runs(built.values);
+        if (!compressed.empty()) {
+          runs = req.requestPool.make_span<RangeFacetRun>(compressed.size());
+          std::copy(compressed.begin(), compressed.end(), runs.begin());
+        }
+      }
+      return {fences, built.affineGap, built.affineGap != 0, runs};
     } catch (const std::runtime_error& error) {
       throw std::runtime_error("facet '" + std::string(facetName) + "': " + error.what());
     }
@@ -853,7 +862,7 @@ public:
       auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
           req.arena, req, facetField, facetName, parsed.values,
           parsed.affine, parsed.affineGap, fieldType->type(), minCount,
-          facetReq.missing, selected);
+          facetReq.missing, selected, parsed.runs);
       configureMeasure(*facet, measure);
       return facet;
     }
@@ -917,7 +926,7 @@ public:
     auto* facet = luxir::arenaCreate<IntFacetRangeReq>(
         req.arena, req, facetField, facetName, parsed.values,
         parsed.affine, parsed.affineGap, fieldType->type(), minCount,
-        facetReq.missing, selected);
+        facetReq.missing, selected, parsed.runs);
     configureMeasure(*facet, measure);
     return facet;
   }

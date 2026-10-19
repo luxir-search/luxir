@@ -31,9 +31,11 @@ struct IntFacetRangeReq::GrowingStorage {
   int64_t gap = 0;
   std::atomic<size_t> observed{0};
   std::atomic<size_t> retainedInputs{0};
+  std::pmr::vector<RangeFacetRun> runs;
 
   explicit GrowingStorage(SearchOp& op)
-      : resource(op.req.memoryTracker, std::format("facet '{}'", op.name), "facet range layout"), layout(&resource) {}
+      : resource(op.req.memoryTracker, std::format("facet '{}'", op.name), "facet range layout"),
+        layout(&resource), runs(&resource) {}
   static void initialize(FixedBucketFacetReq&, Data&) {}
   void observe(const Data& data) {
     size_t bytes = sizeof(Data) + resource.bytes();
@@ -54,6 +56,8 @@ struct IntFacetRangeReq::GrowingStorage {
     auto release = scope_guard([&]() noexcept {
       decltype(layout) empty(&resource);
       layout.swap(empty);
+      decltype(runs) emptyRuns(&resource);
+      runs.swap(emptyRuns);
     });
     observe(data);
     auto& range = (IntFacetRangeReq&)op;
@@ -75,6 +79,7 @@ struct IntFacetRangeReq::GrowingStorage {
           + " skipped: no such local day in " + range.grid->timeZone().name());
     }
     gap = layout.empty() ? 0 : range.grid->affineGap(layout.front(), layout.back()).value_or(0);
+    if (!gap) runs = range.grid->runs(layout, &resource);
     std::pmr::vector<int64_t> distinctCounts(&resource);
     CountView merged;
     if constexpr (Distinct) {
@@ -199,13 +204,13 @@ class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, Gr
   void feedBucketDomains(size_t segnum,
       std::span<const SelectedFacetBucket<size_t>> block, FacetBucketFeed feed) override {
     rangeOp().feedRangeDomains(segnum, block, this->input[segnum], feed,
-        {this->storage.layout, this->storage.gap}, false);
+        {this->storage.layout, this->storage.gap, this->storage.runs}, false);
   }
   void feedIdentityDomains(size_t segnum,
       std::span<const SelectedFacetBucket<size_t>> block, DomainHandle eligibility,
       FacetBucketFeed feed) override {
     rangeOp().feedRangeDomains(segnum, block, std::move(eligibility), feed,
-        {this->storage.layout, this->storage.gap}, true);
+        {this->storage.layout, this->storage.gap, this->storage.runs}, true);
   }
 public:
   using Base::Base;

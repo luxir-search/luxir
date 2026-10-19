@@ -361,6 +361,22 @@ std::optional<int64_t> RangeFacetGrid::affineGap(int64_t start, int64_t end) con
   }
 }
 
+std::pmr::vector<RangeFacetRun> RangeFacetGrid::runs(std::span<const int64_t> fences,
+    std::pmr::memory_resource* resource) const {
+  std::pmr::vector<RangeFacetRun> result(resource);
+  if (fences.size() < 2 || kind == Kind::FLOATING || (kind == Kind::CALENDAR && !gap)) return result;
+  size_t first = 0;
+  while (first + 1 < fences.size()) {
+    uint64_t stride = (uint64_t)fences[first + 1] - (uint64_t)fences[first];
+    size_t end = first + 1;
+    while (end + 1 < fences.size()
+        && (uint64_t)fences[end + 1] - (uint64_t)fences[end] == stride) end++;
+    result.push_back({fences[first], (uint64_t)fences[end] - (uint64_t)fences[first], stride, first});
+    first = end;
+  }
+  return result;
+}
+
 std::vector<int64_t> RangeFacetGrid::skippedCalendarCells(int64_t lo, int64_t end) const {
   std::vector<int64_t> skipped;
   if (kind != Kind::CALENDAR || !zone.isIana()) return skipped;

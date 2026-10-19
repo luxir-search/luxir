@@ -17,7 +17,7 @@ template <typename T>
 RangeFacetCellWindow<T>::RangeFacetCellWindow(const RangeFacetGrid& grid,
     RequestMemTracker& tracker, std::string_view label, size_t cap)
     : resource(tracker, label, std::is_same_v<T, int64_t> ? "facet range counts" : "facet distinct state"), grid(grid), cap(cap),
-      counters(&resource), fences(&resource) {
+      counters(&resource), fences(&resource), runs(&resource) {
   assert(cap != 0 && cap <= 100000);
 }
 
@@ -42,6 +42,9 @@ std::pair<size_t, size_t> RangeFacetCellWindow<T>::extent() const {
 template <typename T>
 void RangeFacetCellWindow<T>::install(std::pmr::vector<T>& counts,
     std::pmr::vector<int64_t>& keys, int64_t newBase, uint64_t newWidth, uint64_t newGap) {
+  // Complete all allocations before rebasing owning payloads or committing any
+  // directory. The old and new run directories share the relocation charge.
+  auto newRuns = grid.runs(keys, &resource);
   auto newIndex = [&](int64_t value) {
     return newGap ? (size_t)(((uint64_t)value - (uint64_t)newBase) / newGap)
         : (size_t)(std::lower_bound(keys.begin(), keys.end(), value) - keys.begin());
@@ -69,6 +72,8 @@ void RangeFacetCellWindow<T>::install(std::pmr::vector<T>& counts,
   // Both old and new allocations remain charged until these locals die.
   counters.swap(counts);
   fences.swap(keys);
+  runs.swap(newRuns);
+  cursor.cached = runs.empty() ? RangeFacetRun{} : runs.front();
   base = newBase;
   width = newWidth;
   gap = newGap;

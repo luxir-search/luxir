@@ -1735,14 +1735,17 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
   bool affine;
   std::optional<RangeFacetGrid> grid;
   std::optional<int64_t> wideningStart, wideningEnd;
+  std::span<const RangeFacetRun> runs;
 
   template <bool Distinct> struct GrowingStorage;
   struct BucketLayout {
     std::span<const int64_t> fences;
     int64_t gap;
-    size_t bucketOf(int64_t value) const {
+    std::span<const RangeFacetRun> runs;
+    RangeFacetRunCursor cursor{};
+    size_t bucketOf(int64_t value) {
       if (gap) return (size_t)(((uint64_t)value - (uint64_t)fences.front()) / (uint64_t)gap);
-      return (size_t)(std::upper_bound(fences.begin(), fences.end(), value) - fences.begin() - 1);
+      return cursor.bucketOf(value, runs, fences);
     }
   };
 
@@ -1795,8 +1798,11 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
       return (size_t)(((uint64_t)val - (uint64_t)fences.front())
                       / (uint64_t)affineGap);
     }
-    return (size_t)(std::upper_bound(fences.begin(), fences.end(), val)
-                    - fences.begin() - 1);
+    return (size_t)(std::upper_bound(fences.begin(), fences.end(), val) - fences.begin() - 1);
+  }
+  LUXIR_INLINE size_t bucketOf(int64_t val, RangeFacetRunCursor& cursor) const {
+    if (affine) return bucketOf(val);
+    return cursor.bucketOf(val, runs);
   }
 
 public:
@@ -1808,12 +1814,12 @@ public:
     std::string_view fieldName, std::string_view facetName,
     std::span<const int64_t> fences, bool affine, int64_t affineGap,
     FieldType::Type valueType, int64_t minCount, bool missing,
-    std::span<const size_t> selectedBuckets)
+    std::span<const size_t> selectedBuckets, std::span<const RangeFacetRun> runs)
   : FixedBucketFacetReq(
         req, fieldName, facetName, minCount, missing,
         fences.size() - 1, selectedBuckets),
     fences(fences), affineGap(affineGap), valueType(valueType),
-    affine(affine) {}
+    affine(affine), runs(runs) {}
 
   IntFacetRangeReq(SearchRequest& req,
       std::string_view fieldName, std::string_view facetName,
@@ -1916,12 +1922,22 @@ public:
       if constexpr (Distinct) {
         auto& range = rangeOp();
         int64_t missing = 0;
-        range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
-          range.facetSegIntCol(domain, segnum, missing,
-              [&](int32_t doc, int64_t value) LUXIR_INLINE {
-                if (value >= range.fences.front() && value < range.fences.back()) add((int64_t)range.bucketOf(value), group(doc));
-              });
-        });
+        if (range.runs.empty()) {
+          range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
+            range.facetSegIntCol(domain, segnum, missing,
+                [&](int32_t doc, int64_t value) LUXIR_INLINE {
+                  if (value >= range.fences.front() && value < range.fences.back()) add((int64_t)range.bucketOf(value), group(doc));
+                });
+          });
+        } else {
+          RangeFacetRunCursor cursor;
+          range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
+            range.facetSegIntCol(domain, segnum, missing,
+                [&](int32_t doc, int64_t value) LUXIR_INLINE {
+                  if (value >= range.fences.front() && value < range.fences.back()) add((int64_t)range.bucketOf(value, cursor), group(doc));
+                });
+          });
+        }
         if (range.missing && missing != 0) range.collectGroups(data, segnum, domain,
             [&](auto group, auto, auto missingBucket) {
               range.forEachMissing(domain, segnum,
@@ -1968,17 +1984,27 @@ public:
           }
         }
       }
-      rangeOp().facetSegIntCol(
-          domain, segnum, data.missing_num,
-          // Captured by value: through a by-reference capture the counts
-          // store may alias the op's fences and the count vector itself, so
-          // each value would reload them.
-          [start, end, counts = std::span(data.counts), &range = rangeOp()]
-          (int32_t docid, int64_t val) LUXIR_INLINE {
+      // Select the lookup form once per segment. The plain closure retains
+      // the original captures and generated affine loop; only run collectors
+      // carry the mutable cursor. Both use the same lifecycle and producer.
+      if (rangeOp().runs.empty()) {
+        // Capture by value so the counter store cannot alias the captures.
+        rangeOp().facetSegIntCol(domain, segnum, data.missing_num,
+            [start, end, counts = std::span(data.counts), &range = rangeOp()]
+              (int32_t docid, int64_t val) LUXIR_INLINE {
             unused(docid);
             if (val < start || val >= end) return;
             counts[range.bucketOf(val)]++;
           });
+      } else {
+        rangeOp().facetSegIntCol(domain, segnum, data.missing_num,
+            [start, end, counts = std::span(data.counts), &range = rangeOp(), cursor = RangeFacetRunCursor{}]
+              (int32_t docid, int64_t val) mutable LUXIR_INLINE {
+            unused(docid);
+            if (val < start || val >= end) return;
+            counts[range.bucketOf(val, cursor)]++;
+          });
+      }
       }
     }
 
@@ -1986,14 +2012,14 @@ public:
         std::span<const SelectedFacetBucket<size_t>> block, FacetBucketFeed feed) override {
       auto& range = rangeOp();
       range.feedRangeDomains(segnum, block, this->input[segnum], feed,
-          {range.fences, range.affine ? range.affineGap : 0}, false);
+          {range.fences, range.affine ? range.affineGap : 0, range.runs}, false);
     }
     void feedIdentityDomains(size_t segnum,
         std::span<const SelectedFacetBucket<size_t>> block, DomainHandle eligibility,
         FacetBucketFeed feed) override {
       auto& range = rangeOp();
       range.feedRangeDomains(segnum, block, std::move(eligibility), feed,
-          {range.fences, range.affine ? range.affineGap : 0}, true);
+          {range.fences, range.affine ? range.affineGap : 0, range.runs}, true);
     }
 
   public:

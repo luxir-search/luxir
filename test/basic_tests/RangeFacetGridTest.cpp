@@ -285,3 +285,61 @@ TEST(RangeFacetGridTest, calendarSkippedIntervalCacheMatchesDirectLookup) {
     }
   }
 }
+
+TEST(RangeFacetGridTest, piecewiseRunsMatchFenceSearch) {
+  struct Case { std::string_view name, center; };
+  std::mt19937_64 random(37);
+  for (auto c : {Case{"America/New_York", "2024-03-10T07:00Z"},
+      Case{"America/New_York", "2024-11-03T06:00Z"},
+      Case{"America/New_York", "1969-10-26T06:00Z"},
+      Case{"Australia/Lord_Howe", "2024-04-06T15:00Z"},
+      Case{"Australia/Lord_Howe", "2024-10-05T15:30Z"},
+      Case{"Pacific/Apia", "2011-12-30T10:00Z"},
+      Case{"+05:30", "1969-03-10T07:00Z"}, Case{"UTC", "1969-03-10T07:00Z"}}) {
+    auto z = zone(c.name);
+    int64_t center = epoch(c.center);
+    for (bool clip : {false, true}) for (int kind = 0; kind < 7; kind++) {
+      for (int64_t phase : {int64_t{0}, 5 * minute, 17 * minute, 360 * minute}) {
+        SCOPED_TRACE(std::string(c.name) + " kind=" + std::to_string(kind)
+            + " phase=" + std::to_string(phase) + " clip=" + std::to_string(clip));
+        int64_t lo = center - 15 * day + (int64_t)(random() % day);
+        int64_t hi = center + 15 * day - (int64_t)(random() % day);
+        auto grid = kind >= 5 ? Grid::calendar(kind == 5 ? CalendarUnit::DAY : CalendarUnit::WEEK,
+            1, z, clip ? std::optional<int64_t>(lo) : std::nullopt)
+            : Grid::fixed(FieldType::DATE, std::array<int64_t, 5>{15 * minute, 45 * minute,
+                60 * minute, 120 * minute, day}[kind],
+                clip ? civilFromInstant(lo, z)->millis : phase, z);
+        auto fences = grid.fences(lo, hi, clip).values;
+        auto runs = grid.runs(fences);
+        ASSERT_FALSE(runs.empty());
+        EXPECT_EQ(fences.front(), runs.front().first);
+        EXPECT_EQ(fences.back(), (int64_t)((uint64_t)runs.back().first + runs.back().width));
+        std::vector<int64_t> values;
+        for (size_t i = 0; i + 1 < fences.size(); i++) {
+          values.push_back(fences[i]);
+          values.push_back(fences[i + 1] - 1);
+        }
+        for (int i = 0; i < 128; i++) values.push_back(fences.front()
+            + (int64_t)(random() % ((uint64_t)fences.back() - (uint64_t)fences.front())));
+        for (bool ordered : {true, false}) {
+          if (ordered) std::sort(values.begin(), values.end());
+          else std::shuffle(values.begin(), values.end(), random);
+          RangeFacetRunCursor cursor;
+          for (int64_t value : values) {
+            size_t expected = (size_t)(std::upper_bound(fences.begin(), fences.end(), value) - fences.begin() - 1);
+            ASSERT_EQ(expected, cursor.bucketOf(value, runs, fences)) << value;
+          }
+        }
+      }
+    }
+  }
+  // Month/quarter/year and floating grids retain their fence search.
+  for (auto grid : {Grid::calendar(CalendarUnit::MONTH, 1, TimeZone::utc()),
+                    Grid::floating(FieldType::DOUBLE, 1)}) {
+    auto fences = grid.fences(0, 100, true).values;
+    auto runs = grid.runs(fences);
+    EXPECT_TRUE(runs.empty());
+    RangeFacetRunCursor cursor;
+    EXPECT_EQ(0u, cursor.bucketOf(fences.front(), runs, fences));
+  }
+}

@@ -4,12 +4,14 @@
 #pragma once
 
 #include <cstdint>
+#include <memory_resource>
 #include <optional>
 #include <utility>
 #include <vector>
 
 #include "luxir/util/DateTime.h"
 #include "luxir/schema/FieldType.h"
+#include "luxir/search/RangeFacetLayout.h"
 
 namespace luxir {
 
@@ -80,6 +82,12 @@ public:
   // Certify [start,end), including any transition fences. A certificate is
   // just a representation choice; floor/next define the same fence set.
   std::optional<int64_t> affineGap(int64_t start, int64_t end) const;
+
+  // Compress the canonical layout already traversed by the fence builder or
+  // window. Only fixed integer/date and calendar DAY/WEEK grids use runs.
+  // Equal adjacent strides certify each run, including clipped/transition cells.
+  std::pmr::vector<RangeFacetRun> runs(std::span<const int64_t> fences,
+      std::pmr::memory_resource* resource = std::pmr::get_default_resource()) const;
 
   // O(number of zone transitions), for execution-time calendar warnings.
   // Returns only skipped labels between surviving fences in [lo,end].

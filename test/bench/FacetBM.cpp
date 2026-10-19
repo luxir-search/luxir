@@ -4,6 +4,7 @@
 #include <charconv>
 #include <latch>
 #include <numeric>
+#include <random>
 #include <variant>
 
 #include <tbb/task_group.h>
@@ -231,6 +232,7 @@ struct RangeDataBenchFixture {
     schema.set(helper.collection());
     auto iw = helper.getIndexWriter();
     int64_t doc = 0;
+    std::mt19937 random(37);
     for (int32_t size : docsPerSeg) {
       auto& inv = iw->obtainInverter();
       auto& id = inv.getIndexHandler("id");
@@ -245,7 +247,8 @@ struct RangeDataBenchFixture {
         inv.startDoc();
         id.index(inv, std::to_string(doc));
         value.index(inv, doc % 10000 * 1000);
-        date.index(inv, epoch + doc % (365 * 24) * 3600000);
+        int64_t cell = name == "facet_range_data_shuffled_bm" ? random() % (365 * 24) : doc % (365 * 24);
+        date.index(inv, epoch + cell * 3600000);
         retained.index(inv, epoch + (int64_t)((__int128)doc * retention / docs));
         parent.index(inv, "p" + std::to_string(doc * 32 / docs));
         group.index(inv, doc % 4096);
@@ -279,9 +282,23 @@ static void rangeDataBenchCounters(benchmark::State& state, int64_t values,
 
 static void BM_RangeFacetData(benchmark::State& state, int64_t nDocs,
                               std::string_view shape, RangeDataBenchMode mode,
-                              bool forceWalk = false, bool parallel = false) {
+                              bool forceWalk = false, bool parallel = false,
+                              bool explicitBounds = false, bool shuffled = false) {
   bool drop = mode == RangeDataBenchMode::DISTINCT_DROP;
-  RangeDataBenchFixture fixture(nDocs, shape, drop ? "facet_range_data_drop_bm" : "facet_range_data_bm");
+  std::string_view collection = drop ? "facet_range_data_drop_bm"
+      : shuffled ? "facet_range_data_shuffled_bm" : "facet_range_data_bm";
+  RangeDataBenchFixture fixture(nDocs, shape, collection);
+  int64_t explicitStart = 0, explicitEnd = 0;
+  if (explicitBounds) {
+    auto zone = *resolveTimeZone("America/New_York");
+    int64_t gap = mode == RangeDataBenchMode::IANA_DAILY || mode == RangeDataBenchMode::CALENDAR_DAY
+        ? 86400000 : 3600000;
+    int64_t origin = mode == RangeDataBenchMode::IANA_SHIFTED ? 17 * 60000 : 0;
+    auto grid = mode == RangeDataBenchMode::CALENDAR_DAY ? RangeFacetGrid::calendar(CalendarUnit::DAY, 1, zone)
+        : RangeFacetGrid::fixed(FieldType::DATE, gap, origin, zone);
+    explicitStart = grid.floor(RangeDataBenchFixture::epoch).key;
+    explicitEnd = grid.next(grid.floor(RangeDataBenchFixture::epoch + (365 * 24 - 1LL) * 3600000)).key;
+  }
   RSSWatcher rss;
   bool savedWalk = IntFacetRangeReq::disablePointsRangeFacetForTests;
   auto* savedCounter = facetBucketBlockCounter;
@@ -297,7 +314,7 @@ static void BM_RangeFacetData(benchmark::State& state, int64_t nDocs,
   for (auto _ : state) {
     blocks = 0;
     auto req = localReq(fixture.helper.getSearchEngine());
-    req->collection(drop ? "facet_range_data_drop_bm" : "facet_range_data_bm");
+    req->collection(collection);
     bool iana = mode == RangeDataBenchMode::IANA || mode == RangeDataBenchMode::IANA_SHIFTED
         || mode == RangeDataBenchMode::IANA_DAILY || mode == RangeDataBenchMode::IANA_DAILY_6H
         || mode == RangeDataBenchMode::CALENDAR_DAY;
@@ -319,6 +336,18 @@ static void BM_RangeFacetData(benchmark::State& state, int64_t nDocs,
       int64_t origin = mode == RangeDataBenchMode::IANA_SHIFTED ? 17 * 60000
           : mode == RangeDataBenchMode::IANA_DAILY_6H ? 6 * 3600000 : 0;
       facet = &req->rangeFacet("f", date ? "date_dt" : "data_i").rangeData(gap, origin);
+    }
+    if (explicitBounds) {
+      facet->range(explicitStart, explicitEnd,
+          mode == RangeDataBenchMode::IANA_DAILY || mode == RangeDataBenchMode::CALENDAR_DAY ? 86400000 : 3600000);
+      auto& range = std::get<api::RangeFacet>(facet->rawOp().kind);
+      range.bounds = api::RangeFacet_::Bounds::EXPLICIT;
+      range.origin.reset();
+      if (mode == RangeDataBenchMode::CALENDAR_DAY) {
+        auto& calendar = range.gap_kind.emplace<api::CalendarGap>();
+        calendar.n = 1;
+        calendar.unit = api::CalendarGap_::Unit::DAY;
+      }
     }
     if (mode == RangeDataBenchMode::DISTINCT || mode == RangeDataBenchMode::DISTINCT_WIDE || drop) {
       auto& range = std::get<api::RangeFacet>(facet->rawOp().kind);
@@ -744,6 +773,14 @@ LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_daily_6h, nDocs, shape, RangeDat
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, iana_daily_6h_walk, nDocs, shape, RangeDataBenchMode::IANA_DAILY_6H, true);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, calendar_day, nDocs, shape, RangeDataBenchMode::CALENDAR_DAY);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, calendar_day_walk, nDocs, shape, RangeDataBenchMode::CALENDAR_DAY, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, explicit_iana_hourly_walk, nDocs, shape, RangeDataBenchMode::IANA, true, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, explicit_iana_hourly_17m_walk, nDocs, shape, RangeDataBenchMode::IANA_SHIFTED, true, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, explicit_iana_daily_walk, nDocs, shape, RangeDataBenchMode::IANA_DAILY, true, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, explicit_calendar_day_walk, nDocs, shape, RangeDataBenchMode::CALENDAR_DAY, true, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, shuffled_iana_hourly_walk, nDocs, shape, RangeDataBenchMode::IANA, true, false, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, shuffled_iana_hourly_17m_walk, nDocs, shape, RangeDataBenchMode::IANA_SHIFTED, true, false, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, shuffled_iana_daily_walk, nDocs, shape, RangeDataBenchMode::IANA_DAILY, true, false, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, shuffled_calendar_day_walk, nDocs, shape, RangeDataBenchMode::CALENDAR_DAY, true, false, false, true);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, narrow_retention, nDocs, shape, RangeDataBenchMode::NARROW);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, distinct_int, nDocs, shape, RangeDataBenchMode::DISTINCT);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacetData, distinct_int_parallel, nDocs, shape, RangeDataBenchMode::DISTINCT, false, true);

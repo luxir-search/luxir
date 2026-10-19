@@ -33,6 +33,8 @@ class RangeFacetCellWindow : public MergeableData {
   size_t occupiedFirst = SIZE_MAX;
   size_t occupiedLast = 0;
   std::optional<std::pair<int64_t, int64_t>> widened;
+  std::pmr::vector<RangeFacetRun> runs;
+  RangeFacetRunCursor cursor;
 
   size_t indexOfKey(int64_t key) const;
   int64_t key(size_t index) const {
@@ -53,12 +55,22 @@ public:
 
   // Only unsigned range arithmetic and division/search on a hit. An offset
   // spanning all 2^64 values has width=0 and deliberately takes the cold path.
-  size_t observe(int64_t value) {
-    uint64_t offset = (uint64_t)value - (uint64_t)base;
+  [[gnu::always_inline]] size_t observe(int64_t value) {
     size_t index;
-    if (offset >= width) [[unlikely]] index = grow(value);
-    else if (gap) index = (size_t)(offset / gap);
-    else index = (size_t)(std::upper_bound(fences.begin(), fences.end(), value) - fences.begin() - 1);
+    if (gap) {
+      uint64_t offset = (uint64_t)value - (uint64_t)base;
+      if (offset >= width) [[unlikely]] index = grow(value);
+      else index = (size_t)(offset / gap);
+    } else if (auto found = cursor.cachedBucket(value)) [[likely]] {
+      // A run hit also certifies membership in the directory. An empty cache
+      // has width zero, so floating/month grids fall through without a flag.
+      index = *found;
+    } else {
+      uint64_t offset = (uint64_t)value - (uint64_t)base;
+      if (offset >= width) [[unlikely]] index = grow(value);
+      else if (!runs.empty()) index = cursor.seek(value, runs);
+      else index = (size_t)(std::upper_bound(fences.begin(), fences.end(), value) - fences.begin() - 1);
+    }
     occupiedFirst = std::min(occupiedFirst, index);
     occupiedLast = std::max(occupiedLast, index);
     return index;

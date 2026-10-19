@@ -7325,3 +7325,64 @@ TEST_F(FacetTest, dataFanoutUsesObservedBytesBeforeMultiplyingWindows) {
     }
   }
 }
+
+TEST_F(FacetTest, piecewiseLayoutsFeedBucketDomains) {
+  std::mt19937_64 random(37);
+  for (auto c : {std::pair{"America/New_York", "2024-03-10T07:00Z"},
+      std::pair{"America/New_York", "2024-11-03T06:00Z"},
+      std::pair{"Australia/Lord_Howe", "2024-10-05T15:30Z"},
+      std::pair{"Pacific/Apia", "2011-12-30T10:00Z"}}) {
+    CollectionHelper helper;
+    helper.clear();
+    setRangeFacetSchema(helper, std::array{RangeSchemaField{"when_dt", true, false, api::FieldDef::FieldClass::DATE}});
+    std::vector<int64_t> values;
+    int64_t center = epoch(c.second);
+    for (int i = 0; i < 64; i++) {
+      values.push_back(center - 15 * 86400000LL + (int64_t)(random() % (30 * 86400000LL)));
+      ASSERT_TRUE(helper.index(flatdoc("id", std::to_string(i), "when_dt", values.back(), "score_i", i),
+          i % 16 == 15 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT).success);
+    }
+    auto [lo, hi] = std::minmax_element(values.begin(), values.end());
+    for (int kind = 0; kind < 4; kind++) {
+      int64_t gap = kind == 0 ? 3600000 : 86400000;
+      int64_t phase = kind == 0 ? 17 * 60000 : 6 * 3600000;
+      auto grid = kind >= 2 ? RangeFacetGrid::calendar(kind == 2 ? CalendarUnit::DAY : CalendarUnit::WEEK, 1, zone(c.first))
+          : RangeFacetGrid::fixed(FieldType::DATE, gap, phase, zone(c.first));
+      auto fences = grid.fences(*lo, *hi, false).values;
+      for (int parallel : {1, -1}) for (bool data : {false, true}) {
+        auto req = localReq(helper.getSearchEngine());
+        req->collection("main").timeZone(c.first);
+        auto& facet = req->rangeFacet("h", "when_dt").range(fences.front(), fences.back(), gap);
+        auto& spec = std::get<api::RangeFacet>(facet.rawOp().kind);
+        if (data) spec.bounds = api::RangeFacet_::Bounds::DATA;
+        if (kind >= 2) {
+          auto& calendar = spec.gap_kind.emplace<api::CalendarGap>();
+          calendar.n = 1;
+          calendar.unit = kind == 2 ? api::CalendarGap_::Unit::DAY : api::CalendarGap_::Unit::WEEK;
+        } else if (data) {
+          auto* origin = api::build::allocMessage<api::Val>(req->mr);
+          origin->kind = phase;
+          spec.origin = origin;
+        }
+        facet.avg("avg", "score_i");
+        req->execute(parallel);
+        ASSERT_OK(req);
+        const auto& result = rootFacetResult(*req, "h");
+        auto means = metricValues(result, "avg");
+        ASSERT_EQ(fences.size() - 1, result.counts.size());
+        auto bounds = boundsOf(result);
+        for (size_t bucket = 0; bucket + 1 < fences.size(); bucket++) {
+          int64_t count = 0, sum = 0;
+          for (size_t i = 0; i < values.size(); i++) if (values[i] >= fences[bucket] && values[i] < fences[bucket + 1]) {
+            count++;
+            sum += i;
+          }
+          EXPECT_EQ((std::pair{fences[bucket], fences[bucket + 1]}), bounds[bucket]);
+          EXPECT_EQ(count, result.counts[bucket]);
+          if (count) EXPECT_DOUBLE_EQ((double)sum / count, means[bucket].asDouble());
+          else EXPECT_TRUE(means[bucket].isNull());
+        }
+      }
+    }
+  }
+}

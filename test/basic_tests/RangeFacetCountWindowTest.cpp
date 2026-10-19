@@ -368,3 +368,23 @@ TEST(RangeFacetCountWindowTest, memoryFailuresDuringNonAffineRelocationAreTransa
   EXPECT_GT(failures, 0);
   EXPECT_GT(successes, 0);
 }
+
+TEST(RangeFacetCountWindowTest, piecewiseGrowthAndMergeMatchMap) {
+  std::mt19937_64 random(37);
+  for (auto pair : {std::pair{"America/New_York", "2024-03-10T07:00Z"},
+      std::pair{"America/New_York", "2024-11-03T06:00Z"},
+      std::pair{"Australia/Lord_Howe", "2024-04-06T15:00Z"},
+      std::pair{"Australia/Lord_Howe", "2024-10-05T15:30Z"},
+      std::pair{"Pacific/Apia", "2011-12-30T10:00Z"}}) {
+    auto zone = resolveTimeZone(pair.first).value();
+    for (auto grid : {Grid::fixed(FieldType::DATE, 3600000, 17 * 60000, zone),
+        Grid::fixed(FieldType::DATE, 86400000, 6 * 3600000, zone),
+        Grid::calendar(CalendarUnit::DAY, 1, zone), Grid::calendar(CalendarUnit::WEEK, 1, zone)}) {
+      std::vector<int64_t> values;
+      int64_t center = epoch(pair.second);
+      for (int i = 0; i < 128; i++) values.push_back(center - 15 * 86400000LL
+          + (int64_t)(random() % (30 * 86400000LL)));
+      randomized(grid, std::move(values));
+    }
+  }
+}
