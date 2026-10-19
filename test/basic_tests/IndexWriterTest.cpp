@@ -17,6 +17,7 @@
 #include <memory>
 #include <latch>
 
+#include <CLI/CLI.hpp>
 #include <oneapi/tbb/flow_graph.h>
 #include <luxir/index/Inverter.h>
 #include <luxir/server/ProtoUpdateMessage.h>

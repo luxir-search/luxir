@@ -831,10 +831,10 @@ FilterCache::Use* FilterCache::UseRegistry::get(const FilterKey& key,
       throw std::logic_error(
           "FilterCache request key reused with different scope");
     }
-    if (cache != nullptr) cache->observeAdmissionLane(*use, lane);
+    if (use->cache != nullptr) use->cache->observeAdmissionLane(*use, lane);
     return use;
   }
-  auto use = cache != nullptr
+  auto use = cache != nullptr && usesSharedFilterCache(scope)
       ? cache->beginUse(
           key, scope, readerCoreGen, readerVersion, segments, lane)
       : std::unique_ptr<Use>(new Use(
@@ -963,13 +963,6 @@ FilterCache::FilterCache(FilterCacheConfig config)
   this->config.minSegmentDocs = std::max(0, this->config.minSegmentDocs);
   activeSegments.store(std::make_shared<const ActiveSnapshot>(),
                        std::memory_order_release);
-}
-
-size_t FilterCache::StripedCounter::threadStripe() {
-  static std::atomic<size_t> nextStripe{0};
-  thread_local size_t stripe =
-      nextStripe.fetch_add(1, std::memory_order_relaxed) % STRIPES;
-  return stripe;
 }
 
 uint64_t FilterCache::nextEpoch() {
@@ -1201,6 +1194,7 @@ std::unique_ptr<FilterCache::Use> FilterCache::beginUse(
     const FilterKey& key, FilterKeyScope scope, uint64_t readerCoreGen,
     uint64_t readerVersion,
     std::span<const SegmentIdentity> readerSegments, AdmissionLane lane) {
+  assert(usesSharedFilterCache(scope));
   auto use = std::unique_ptr<Use>(new Use(
       this, key, scope, nullptr,
       std::vector<std::shared_ptr<SegmentSlot>>(readerSegments.size()),
@@ -1216,7 +1210,7 @@ std::unique_ptr<FilterCache::Use> FilterCache::lookupExisting(
     uint64_t readerVersion,
     std::span<const SegmentIdentity> readerSegments) {
   if (!enabled() || readerSegments.empty()
-      || scope == FilterKeyScope::UNCACHEABLE) {
+      || !usesSharedFilterCache(scope)) {
     return nullptr;
   }
   auto entry = findEntry(key);
@@ -1346,6 +1340,7 @@ bool FilterCache::acceptExisting(Use& use, AdmissionLane lane) {
 }
 
 void FilterCache::observeAdmissionLane(Use& use, AdmissionLane lane) {
+  assert(use.cache == this && usesSharedFilterCache(use.scope_));
   uint8_t laneBit = (uint8_t)(1U << (uint8_t)lane);
   if ((use.observedAdmissionLanes & laneBit) != 0) return;
   use.observedAdmissionLanes |= laneBit;

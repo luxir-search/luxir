@@ -15,7 +15,7 @@
 #include <oneapi/tbb/global_control.h>
 
 #include "luxir/api/padded_input.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/search/ops/SearchOp.h"

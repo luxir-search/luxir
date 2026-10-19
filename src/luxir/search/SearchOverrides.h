@@ -6,7 +6,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string_view>
 
 // Execution overrides for the search ops: env-driven bench knobs and A/B
@@ -68,6 +70,10 @@ inline std::size_t forcedFacetBucketBlockBuckets = [] {
 // Test override for the per-request query-memory breaker ceiling. Zero uses
 // LuxirConfig.
 inline std::size_t forcedRequestMemoryMaxBytes = 0;
+
+// Test override for the request's date-math NOW snapshot (epoch millis).
+// Unset uses the wall clock.
+inline std::optional<int64_t> forcedDateMathNowEpochMillis;
 enum class DistinctFacetMode;
 extern DistinctFacetMode forcedDistinctFacetMode;
 // Test-only assertion: each group's matching docs form one run in exactly
