@@ -19,7 +19,7 @@
 #include "test/TopKAssert.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/reader/SkipStats.h"

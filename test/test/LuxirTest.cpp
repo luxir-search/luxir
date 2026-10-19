@@ -16,6 +16,7 @@
 #include "luxir/schema/Schema.h"
 #include "luxir/luxir_main.h"
 #include "luxir/LuxirConfig.h"
+#include <CLI/CLI.hpp>
 #include "benchmark/benchmark.h"
 
 
@@ -327,9 +328,15 @@ int main(int argc, char **argv) {
   tbb::task_arena test_arena;
   test_arena.execute([&] {
     if (!luxir::unit_tests) {
+#if LUXIR_TEST_BENCHMARKS
       benchmark::Initialize(&myargc, &(myargv[0]));
       benchmark::RunSpecifiedBenchmarks();
       ret = testing::Test::HasFatalFailure();
+#else
+      std::cerr << "luxir_test was built without benchmarks; configure with "
+                   "-DLUXIR_TEST_BENCHMARKS=ON" << std::endl;
+      ret = 1;
+#endif
     } else {
       ret = RUN_ALL_TESTS();
     }
@@ -358,6 +365,7 @@ int main(int argc, char **argv) {
 
 
 
+#if LUXIR_TEST_BENCHMARKS
 // unit test that runs all benchmarks at a faster speed
 TEST(Benchmarks, all) {
   // if we are running unit tests, we want the benchmarks to run faster
@@ -393,3 +401,4 @@ TEST(Benchmarks, all) {
   benchmark::Initialize(&myargc, &(myargv[0]));
   benchmark::RunSpecifiedBenchmarks();
 }
+#endif

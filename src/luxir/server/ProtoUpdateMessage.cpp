@@ -194,6 +194,42 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 
 
 void ProtoUpdateMessage::handle(IndexWriter& iw) {
+  // Counts the batch for the node and its collection as it leaves, however
+  // it leaves. A message with no documents and no delete ids (a commit-only
+  // message) is not a batch; its commit counts under the COMMIT stage.
+  struct Count {
+    ProtoUpdateMessage& msg;
+    Metrics& node;
+    CollectionMetrics& collection;
+    bool active = !msg.req->docs.empty() || !msg.req->delete_ids.empty();
+    int exceptions = std::uncaught_exceptions();
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    Count(ProtoUpdateMessage& msg, Metrics& node, CollectionMetrics& collection)
+        : msg(msg), node(node), collection(collection) {
+      if (active) node.start(metricActivity(MetricStage::INDEX_BATCH));
+    }
+    ~Count() {
+      if (!active) return;
+      const auto& req = *msg.req;
+      // The batch failed when nothing in it applied; a partial batch's
+      // rejections count per document.
+      bool failed = std::uncaught_exceptions() > exceptions || msg.metricFailed();
+      auto outcome = failed ? MetricOutcome::ERROR : MetricOutcome::OK;
+      auto nanos = nanosSince(start);
+      auto errors = msg.docErrors();
+      uint64_t rejected = failed ? req.docs.size() : errors.size();
+      uint64_t accepted = req.docs.size() - rejected;
+      uint64_t deleteIds = failed ? 0 : req.delete_ids.size();
+      node.complete(metricActivity(MetricStage::INDEX_BATCH), outcome, nanos);
+      node.add(MetricCounter::DOCUMENTS_ACCEPTED, accepted);
+      node.add(MetricCounter::DOCUMENTS_REJECTED, rejected);
+      node.add(MetricCounter::DELETE_IDS_ACCEPTED, deleteIds);
+      for (const auto& error : errors) {
+        node.documentError(error.error ? (ErrorKind)error.error->kind : ErrorKind::UNKNOWN);
+      }
+      collection.batch(outcome, nanos, accepted, rejected, deleteIds);
+    }
+  } count{*this, *iw.metrics, *iw.collectionMetrics};
   validateFieldMap(*req);
 
   // Check if we need an inverter for either deletes or adds

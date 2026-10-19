@@ -154,6 +154,9 @@ A multi-valued vector field (`multi: true`, or the `_vs` suffix) holds many
 vectors per document, such as one per passage or chunk. Search collapses them
 to one hit per document, scored by that document's best vector.
 
+An optional `ann` object chooses how [approximate indexes](#index-settings)
+for the field are built; the defaults suit most embedding models.
+
 ## Index vectors
 
 A vector is a bare number array. A multi-valued field takes an array of
@@ -536,11 +539,12 @@ after changing source limits.
 ## Approximate search
 
 Exact search costs one pass over the column per query. For large collections,
-a commit can build approximate nearest-neighbor indexes (IVF+PQ, via FAISS)
-as segment overlays. An overlay is built from the vector column, follows its
-segment through later commits and merges, and its candidates are always
-rescored from the full-precision column before they are returned. Building
-an overlay does not reindex documents.
+a commit can build approximate nearest-neighbor indexes as segment overlays:
+an inverted-file (IVF) index whose lists hold product-quantization (PQ) codes
+by default, or opt-in RaBitQ codes, built with FAISS. An overlay is built
+from the vector column, follows its segment through later commits and
+merges, and its candidates are always rescored from the full-precision column
+before they are returned. Building an overlay does not reindex documents.
 
 ### Build at commit
 
@@ -561,15 +565,99 @@ unpublished and can be retried. Once a segment has an overlay, later commits
 carry it forward and delete-only commits keep it (deleted documents are
 filtered out at query time).
 
-Whether a segment gets an overlay is size based. IVF+PQ is built only when the
-segment has enough vectors to train on and enough scan cost to justify it;
-smaller segments stay on the exact column scan. A single query routinely uses
+Whether a segment gets an overlay is size based. An overlay is built only
+when the segment has enough vectors (8192 for RaBitQ, about 10,000 for PQ,
+which must train its codebooks) and enough scan cost to justify it; smaller
+segments stay on the exact column scan, which is faster than an index at that
+size and exact. A single query routinely uses
 the index for large segments and exact scan for small ones, with the same
 results contract either way. A merged segment gets fresh
 overlays for the fields being built, when it passes the same
 thresholds. If a merge-time build fails, the merged segment is published
 without the overlay and that field is served by exact scan until a later
 explicit build succeeds.
+
+### Index settings
+
+A vector field's `ann` object selects the overlay codec and its parameters:
+
+```http
+POST /collections/books/_schema
+
+{
+  "fields": {
+    "embedding_v": {
+      "type": "vector",
+      "dims": 768,
+      "metric": "cosine",
+      "ann": {"codec": "pq"}
+    }
+  }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `codec` | `pq` (default) or opt-in `rabitq`. |
+| `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
+| `rabitq.bits` | Bits per dimension, `1` to `9`. Default `1`. |
+| `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
+| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide it. Absent or `0`: automatic, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, dims / 8)` for IP/cosine or `32` for L2. If none does, use the largest divisor under the same cap. |
+| `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. |
+
+`rabitq` settings require an explicit `"codec":"rabitq"`, for example
+`"ann":{"codec":"rabitq","rabitq":{"bits":1,"query_bits":4}}`.
+Omitting the codec selects PQ, including for `ann:{}`, `nlist` alone, or
+`pq` settings alone; a `rabitq` object does not infer the codec. A field
+without `ann` inherits its parent's, and an `ann` object replaces the
+parent's whole definition rather than merging with it.
+
+These rules also apply to inherited ANN settings and vector variants. Use
+automatic `m` when dimensions are inferred from indexed values; an explicit
+positive `m` requires dimensions pinned in the schema.
+
+**RaBitQ** (opt-in) stores each vector as one sign bit per dimension of
+its randomly rotated offset from its IVF list's centroid, plus a few
+correction factors: 104 bytes for a 768-dimension vector, about 1/30 of the
+float vector. Distances estimated from these codes come with a proven error
+bound, and the codec trains nothing beyond the IVF centroids. With `bits`
+above 1 (extended RaBitQ), each dimension gets extra magnitude bits; a scan
+then estimates every vector from its sign bits first and spends the extra bits
+only on vectors whose error bound still overlaps the current top candidates.
+`query_bits: 4` matches the 1-bit-document, 4-bit-query asymmetry other
+engines use and costs no measurable recall against `8`.
+
+**PQ** (the default) splits each vector into `m` sub-vectors and stores one learned
+codebook entry per sub-vector. PQ's automatic `m` scales with IP/cosine
+dimensions above 256: for example, 768 dimensions selects `m=96`, or 96 code
+bytes at 8 bits, close to RaBitQ's 104. This improves high-dimensional recall
+over `m=32` at the cost of larger codes and more scan work; see the
+[codec measurements](../design/vector-search.md#codec-measurements).
+L2 keeps the cap of 32 because FAISS retains an `nlist * m * 256`-float
+precomputed table at 8 bits; IP/cosine builds its lookup table per query and
+has no such resident table. Fields of up to 256 dimensions and explicit `m`
+settings keep their existing choices. PQ codebooks are retrained for every
+segment build and merge; automatic `m` depends only on dimensions and metric.
+
+PQ favors scan speed: FAISS currently scans PQ lists faster than RaBitQ
+lists. Opt into RaBitQ for its different size/recall tradeoff.
+With 1-bit RaBitQ, recall is usually limited by how many lists are probed
+rather than by the codes, so raise `ivf.nprobe` first; extra `bits` help mainly
+when `refine_candidates` is small.
+
+Overlays record the settings they were built with, so a change applies to
+segments built afterwards: new flushes, merges, and segments without an
+overlay that a later commit selects. A query serves every segment with its own
+overlay's codec, so segments built under different settings mix freely.
+`query_bits` is applied at search time to both document and group searches
+and takes effect for existing RaBitQ overlays immediately, including when the
+current schema selects PQ for future builds. Changing `ann` does not change
+the field's identity: existing values stay searchable.
+
+The [resolved schema view](schema.md#resolved-view) exposes each vector
+representation's effective `ann` settings, including defaults and inherited
+values. It includes only the selected codec's settings. `nlist:0` and `m:0`
+remain automatic policies, rather than sizes chosen for any one segment.
 
 ### Query knobs
 
@@ -619,8 +707,13 @@ Luxir would probe if the field were a single IVF index built with
 `nlist`. That total effort is spread across the current per-segment indexes,
 so a merge does not change the effort a request asks for. An explicit `nprobe`
 pins the effort cap; an adaptive one may deepen when filters or collapse
-underfill the result. Probed lists are always scanned in full; `nprobe` is the
-only work limiter.
+underfill the result. The adaptive default starts at `sqrt(nlist)` of that
+reference index for fields of up to 128 dimensions and scales by
+`sqrt(dims / 128)` above that (capped at 4x). This effort policy applies to
+both codecs. The multiplier is about 2.5x at 768 to 960 dimensions; RaBitQ
+measurements on GIST and Cohere embeddings showed recall@10 rising from
+0.82-0.87 to about 0.95. Probed lists are always scanned in full; `nprobe` is
+the only work limiter.
 
 ### Scoring
 
@@ -680,11 +773,11 @@ skipped at index time.
 
 ### Measure recall
 
-IVF+PQ is approximate. Higher `ivf.nprobe` and higher `refine_candidates`
-raise recall and latency. Setting `nprobe` to at least the reference
-`sqrt(live_vector_count)`, or `ivf.min_scan_fraction` to `1`, makes the search
-exhaustive over IVF lists, but PQ ordering still decides which candidates are
-rescored.
+Approximate search is approximate. Higher `ivf.nprobe` and higher
+`refine_candidates` raise recall and latency. Setting `nprobe` to at least the
+reference `sqrt(live_vector_count)`, or `ivf.min_scan_fraction` to `1`, makes
+the search exhaustive over IVF lists, but the codec's estimated ordering still
+decides which candidates are rescored.
 
 `exact: true` uses a path that guarantees the true top-k and does not
 consult overlays. Everything else about
@@ -697,7 +790,10 @@ bit-identical results to a serial run of the same query.
 
 ## Limits
 
-- IVF+PQ is the only approximate index type. There is no HNSW yet.
+- IVF (with RaBitQ or PQ codes) is the only approximate index type. There is
+  no HNSW yet.
+- An `ann` change does not rebuild existing overlays; only segments built
+  afterwards use it (see [Index settings](#index-settings)).
 - Filters are always applied inside the vector search. There is no cost-based
   choice between filtered approximate search and exact search over the
   filtered set, and no automatic exact fallback when a selective filter still

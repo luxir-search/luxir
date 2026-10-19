@@ -9,7 +9,23 @@ find_package(benchmark REQUIRED)
 file(GLOB_RECURSE Test_SOURCES CONFIGURE_DEPENDS *.cpp *.h)
 list(FILTER Test_SOURCES EXCLUDE REGEX "/allocation_tests/")
 
+# The benchmarks (bench/) are about a tenth of the test build. Debug builds
+# serve edit-build-test and the ASan gate, so they leave them out unless asked;
+# optimized builds keep luxir_test --bench.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set(_luxir_bench_default OFF)
+else()
+  set(_luxir_bench_default ON)
+endif()
+option(LUXIR_TEST_BENCHMARKS "Compile the benchmarks (test/bench) into luxir_test"
+       ${_luxir_bench_default})
+if(NOT LUXIR_TEST_BENCHMARKS)
+  list(FILTER Test_SOURCES EXCLUDE REGEX "/bench/[^/]*\\.cpp$")
+endif()
+
 add_executable(luxir_test ${Test_SOURCES})
+set_source_files_properties(test/LuxirTest.cpp PROPERTIES
+  COMPILE_DEFINITIONS "LUXIR_TEST_BENCHMARKS=$<BOOL:${LUXIR_TEST_BENCHMARKS}>")
 target_include_directories(luxir_test PRIVATE .)
 target_link_libraries(luxir_test PRIVATE luxir_lib benchmark::benchmark GTest::gtest)
 # HttpApiTest's helper (test/HttpReq.h) parses NDJSON with glaze (via luxir_lib) and
@@ -37,13 +53,18 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Cla
     -Wl,--wrap=_Znwm -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdlPvm)
 endif()
 
+set(LUXIR_TEST_X86 OFF)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i.86)$")
+  set(LUXIR_TEST_X86 ON)
+endif()
+
 # Compile the same exhaustive decoded-successor tests with AVX-512 forcibly
 # unavailable so AVX2 hosts exercise the AVX2 path.
 add_executable(decoded_successor_no_avx512_test
   basic_tests/DecodedSuccessorTest.cpp)
 target_include_directories(decoded_successor_no_avx512_test PRIVATE .)
 target_link_libraries(decoded_successor_no_avx512_test PRIVATE GTest::gtest_main)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i.86)$")
+if(LUXIR_TEST_X86)
   target_compile_options(decoded_successor_no_avx512_test PRIVATE -mno-avx512f)
 endif()
 target_compile_definitions(decoded_successor_no_avx512_test PRIVATE
@@ -55,7 +76,7 @@ add_executable(decoded_successor_scalar_test
   basic_tests/DecodedSuccessorTest.cpp)
 target_include_directories(decoded_successor_scalar_test PRIVATE .)
 target_link_libraries(decoded_successor_scalar_test PRIVATE GTest::gtest_main)
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|AMD64|i.86)$")
+if(LUXIR_TEST_X86)
   target_compile_options(decoded_successor_scalar_test PRIVATE
     -mno-avx512f -mno-avx2)
 endif()
@@ -65,11 +86,13 @@ target_compile_definitions(decoded_successor_scalar_test PRIVATE
 # The analysis ASCII kernels (AsciiScan.h) with AVX2 unavailable, so AVX2 hosts
 # also exercise the SSE2 path the x86-64-v2 container build ships. The NEON
 # path is covered by the arm64 build's luxir_test, the SWAR path everywhere.
-add_executable(ascii_scan_sse2_test
-  basic_tests/AsciiScanTest.cpp)
-target_include_directories(ascii_scan_sse2_test PRIVATE .)
-target_link_libraries(ascii_scan_sse2_test PRIVATE GTest::gtest_main)
-target_compile_options(ascii_scan_sse2_test PRIVATE -mno-avx512f -mno-avx2)
+if(LUXIR_TEST_X86)
+  add_executable(ascii_scan_sse2_test
+    basic_tests/AsciiScanTest.cpp)
+  target_include_directories(ascii_scan_sse2_test PRIVATE .)
+  target_link_libraries(ascii_scan_sse2_test PRIVATE GTest::gtest_main)
+  target_compile_options(ascii_scan_sse2_test PRIVATE -mno-avx512f -mno-avx2)
+endif()
 
 
 # (luxir_smoke removed: it was migration scaffolding to run SmokeTest while luxir_test was

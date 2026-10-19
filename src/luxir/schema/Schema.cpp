@@ -57,6 +57,8 @@ struct ResolvedField {
   bool vectorNormalized = false;
   bool hasVectorNormalizeOnWrite = false;
   bool vectorNormalizeOnWrite = false;
+  // Atomic like analyzer: the nearest authored ann in the parent chain.
+  const luxir::api::VectorAnnDef* ann = nullptr;
 };
 
 struct ResolvedOwnership {
@@ -245,7 +247,65 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
   }
 
+  r.ann = def.ann ? &*def.ann : parentResolved.ann;
   return r;
+}
+
+// Apply defaults to an authored ann definition and validate it against the
+// effective dims. Positive PQ m requires pinned dims; automatic m also works
+// with dims inferred per segment.
+static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t dims,
+                                        std::string_view name) {
+  VectorAnnConfig cfg;
+  if (def == nullptr) return cfg;
+  auto fail = [&](const std::string& msg) {
+    throw SchemaError("ann: " + msg + " (field: " + std::string(name) + ")");
+  };
+  using Codec = api::VectorAnnDef_::Codec;
+  if (def->codec) {
+    Codec codec = *def->codec;
+    if (codec != Codec::RABITQ && codec != Codec::PQ) {
+      fail("unknown codec " + std::to_string((int)codec) + "; valid: rabitq, pq");
+    }
+    cfg.codec = codec == Codec::PQ ? VectorAnnConfig::PQ : VectorAnnConfig::RABITQ;
+  }
+  if (def->nlist) {
+    if (*def->nlist < 0 || *def->nlist > 65536) fail("nlist must be in [0, 65536]");
+    cfg.nlist = *def->nlist;
+  }
+  if (def->rabitq && cfg.codec != VectorAnnConfig::RABITQ) {
+    fail("rabitq settings require explicit codec \"rabitq\"");
+  }
+  if (def->pq && cfg.codec != VectorAnnConfig::PQ) fail("pq settings require codec pq");
+  if (def->rabitq) {
+    if (def->rabitq->bits) {
+      if (*def->rabitq->bits < 1 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [1, 9]");
+      cfg.rabitqBits = *def->rabitq->bits;
+    }
+    if (def->rabitq->query_bits) {
+      if (*def->rabitq->query_bits < 0 || *def->rabitq->query_bits > 8) {
+        fail("rabitq.query_bits must be in [0, 8]");
+      }
+      cfg.rabitqQueryBits = *def->rabitq->query_bits;
+    }
+  }
+  if (def->pq) {
+    if (def->pq->m) {
+      if (*def->pq->m < 0) fail("pq.m must be >= 0");
+      if (*def->pq->m > 0) {
+        if (dims <= 0) fail("positive pq.m requires positive dims");
+        if (dims % *def->pq->m != 0) {
+          fail("pq.m=" + std::to_string(*def->pq->m) + " does not divide dims=" + std::to_string(dims));
+        }
+      }
+      cfg.pqM = *def->pq->m;
+    }
+    if (def->pq->bits) {
+      if (*def->pq->bits < 1 || *def->pq->bits > 8) fail("pq.bits must be in [1, 8]");
+      cfg.pqBits = *def->pq->bits;
+    }
+  }
+  return cfg;
 }
 
 static void resolveField(std::string_view name, const sv_entry_map& defMap,
@@ -327,10 +387,11 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
     throw SchemaError("normalizer is only valid for string fields (field: " + name + ")");
   }
   bool vectorProp = def.dims.has_value() || def.metric.has_value() ||
-                    def.normalized.has_value() || def.normalize_on_write.has_value();
+                    def.normalized.has_value() || def.normalize_on_write.has_value() ||
+                    def.ann.has_value();
   if (vectorProp && r.type != FieldClass::VECTOR) {
     throw SchemaError(
-      "dims/metric/normalized/normalize_on_write are only valid for vector fields (field: " + name + ")");
+      "dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " + name + ")");
   }
 }
 
@@ -538,7 +599,8 @@ struct FieldCompiler {
           ? r.vectorNormalizeOnWrite
           : (r.vectorMetric == VectorFieldType::METRIC_COSINE));
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
-                                               r.vectorMetric, r.vectorNormalized, normalizeOnWrite);
+                                               r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
+                                               resolveAnnConfig(r.ann, r.vectorDims, name));
         break;
       }
       default:

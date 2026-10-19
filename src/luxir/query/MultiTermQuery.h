@@ -40,9 +40,7 @@ public:
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;
 
   Weight* createWeight(Context& context, int32_t flags,
-                       float multiplier = 1.0f) override {
-    return context.pool.make<MultiTermQuery::Weight>(context, *this, flags, multiplier);
-  }
+                       float multiplier = 1.0f) override;
 
   // Iterates set bits of the membership bitset under a constant score.
   class Scorer final : public Query::ConstantScorer {
