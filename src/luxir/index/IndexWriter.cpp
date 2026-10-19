@@ -362,9 +362,79 @@ void IndexWriter::close() {
   {
     std::lock_guard publicationLock(publicationMutex);
     std::lock_guard lock(indexMutex);
+    std::lock_guard admission(admissionMutex);
     closed.store(true, std::memory_order_release);
   }
+  drainClosed();
+}
 
+bool IndexWriter::uncommittedLocked() const {
+  if (!busyInverters.empty() || !flushingInverters.empty()) return true;
+  for (const auto& [ptr, inverter] : idleInverters) {
+    unused(ptr);
+    if (inverter->getMaxDoc() > 0) return true;
+  }
+  if (!pendingDeletes.empty()) return true;
+  boost::unordered_flat_set<uint64_t> committed(lastCommittedSegIds.begin(), lastCommittedSegIds.end());
+  for (const auto& [segId, seg] : segInfos) {
+    if (!committed.contains(segId) || seg->liveGen != seg->publishedLiveGen) return true;
+  }
+  // A retired segment the published snapshot still lists (fully deleted, or
+  // merged away) leaves with the next commit.
+  for (const auto& seg : segmentsToDelete) if (committed.contains(seg->segId)) return true;
+  return false;
+}
+
+bool IndexWriter::hasUncommittedChanges() {
+  const std::lock_guard<std::mutex> lock(indexMutex);
+  return uncommittedLocked();
+}
+
+bool IndexWriter::closeIfUnchanged(const CommitId& expected) {
+  std::lock_guard closeLock(closeMutex);
+  auto unchanged = [&] { return lastSnapshot.load()->id == expected && !uncommittedLocked(); };
+  {
+    std::lock_guard publicationLock(publicationMutex);
+    std::lock_guard lock(indexMutex);
+    if (closed.load(std::memory_order_relaxed) || !unchanged()) return false;
+    std::lock_guard admission(admissionMutex);
+    closed.store(true, std::memory_order_release);
+  }
+  // Everything admitted before the mark completes here, so the re-check sees
+  // the documents of an update that raced the first check.
+  updateGraph->wait_for_all();
+  {
+    std::lock_guard publicationLock(publicationMutex);
+    std::lock_guard lock(indexMutex);
+    if (!unchanged()) closed.store(false, std::memory_order_release);
+  }
+  if (closed.load(std::memory_order_relaxed)) {
+    drainClosed();
+    return true;
+  }
+  rearmDeferredCommit();
+  return false;
+}
+
+void IndexWriter::rearmDeferredCommit() {
+  bool arm = false;
+  DeadlineScheduler::Clock::time_point due{};
+  {
+    const std::lock_guard<std::mutex> lock(autoCommitMutex);
+    if (autoCommitPending && !autoCommitInFlight) {
+      const auto now = DeadlineScheduler::Clock::now();
+      if (autoCommitDeadline <= now) autoCommitDeadline = now;
+      arm = true;
+      due = autoCommitDeadline;
+    }
+  }
+  if (arm) {
+    try { DeadlineScheduler::global().arm(autoCommitSlot, due); }
+    catch (const std::exception& e) { LOG_ERROR("deferred-commit re-arm failed: {}", e.what()); }
+  }
+}
+
+void IndexWriter::drainClosed() {
   // Stop new budget callbacks before draining the graph.  Registration reset
   // synchronizes with a callback already copied out of the budget; any task it
   // queued before reset is included in wait_for_all below.

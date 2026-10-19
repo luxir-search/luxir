@@ -169,6 +169,22 @@ public:
   // still removes leftover storage. Refused while a candidate is staged.
   void remove(const CollectionId& id, bool mustExist = true);
 
+  // Writers. Opens a collection whose files were placed in storage while the
+  // node runs (a restore), as startup would. The name must be unregistered
+  // (CollectionExistsError) and have incarnation directories
+  // (CollectionNotFoundError). Without CURRENT, `incarnation` names the one to
+  // select; with CURRENT it must be absent or agree. `promote` first copies the
+  // selected snapshot into a new incarnation, as `luxir promote` does, so a
+  // copy of a live collection elsewhere keeps distinct commit tokens.
+  std::shared_ptr<Collection> openExisting(const CollectionId& id, bool promote,
+                                           const std::optional<std::string>& incarnation);
+  // Unregisters and closes a collection without committing; searches already
+  // holding a reader finish. With `expectCommit` (incarnation:gen) the close
+  // happens only if that is the published commit and nothing is uncommitted,
+  // else CollectionChangedError. `discard` also removes the storage. Refused
+  // while a candidate is staged.
+  void close(const CollectionId& id, bool discard, const std::optional<std::string>& expectCommit);
+
   Candidate stage(const CollectionId& id, std::string_view incarnation);
   // Makes `snapshot` durable in the candidate's directory, whose files the
   // caller verified and synced, and opens its readers. On failure the

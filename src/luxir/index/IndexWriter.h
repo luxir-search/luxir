@@ -121,6 +121,10 @@ class IndexWriter {
   std::mutex closeMutex;
   std::mutex publicationMutex; // held only while constructing and publishing a manifest
   std::mutex indexMutex;
+  // Serializes update admission (the closed check and version assignment in
+  // startUpdateBody) with closeIfUnchanged(), so nothing is admitted between
+  // its check and the close. Innermost lock; never taken before the others.
+  std::mutex admissionMutex;
   std::vector<std::string> manifestNames;
   std::vector<std::string> pendingRetirement; // publicationMutex
   uint64_t nextManifestGen = 0;
@@ -468,6 +472,16 @@ public:
                        oneapi::tbb::task_arena* arena = nullptr);
   ~IndexWriter();
   void close();
+  // True when acknowledged changes are not covered by the published snapshot:
+  // buffered or flushed but uncommitted documents, pending deletes, or an
+  // unpublished segment layout (a merge waiting for publication counts).
+  bool hasUncommittedChanges();
+  // Closes the writer only if `expected` is the published snapshot and there
+  // are no uncommitted changes, with no update admitted in between: the check
+  // stops admission, drains admitted work, and re-checks. Returns false and
+  // leaves the writer open otherwise (updates refused meanwhile see
+  // IndexWriterClosedError and can be retried).
+  bool closeIfUnchanged(const CommitId& expected);
 
   // Per-inverter auto-flush caps, evaluated once at the end of each update batch
   // (ProtoUpdateMessage::handle): an inverter past either cap is flushed to a
@@ -587,14 +601,17 @@ private:
     // Rejection must come before the sequence numbers are assigned: they must stay
     // dense for the sequencer nodes. Merge continuations belong to already
     // admitted work, including automatic merges whose commits also flush.
-    if (failed.load(std::memory_order_acquire) || (closed.load(std::memory_order_relaxed)
-        && dynamic_cast<MergeCommitMessage*>(&msg) == nullptr)) {
-      throw IndexWriterClosedError("index writer is closed");
+    {
+      const std::lock_guard<std::mutex> admission(admissionMutex);
+      if (failed.load(std::memory_order_acquire) || (closed.load(std::memory_order_relaxed)
+          && dynamic_cast<MergeCommitMessage*>(&msg) == nullptr)) {
+        throw IndexWriterClosedError("index writer is closed");
+      }
+      msg.schema = lastSnapshot.load()->schema;
+      // Sequences must start at 0 for the sequencer nodes.
+      msg.updateVersion = updateNumber.fetch_add(1, std::memory_order_relaxed) + 1;
+      msg.updateOrdinal = updateOrdinal++;
     }
-    msg.schema = lastSnapshot.load()->schema;
-    // Sequences must start at 0 for the sequencer nodes.
-    msg.updateVersion = updateNumber.fetch_add(1, std::memory_order_relaxed) + 1;
-    msg.updateOrdinal = updateOrdinal++;
     msg.commitNum = 0;
     if (msg.commit != UpdateMessage::NO_COMMIT && !msg.publishOnly &&
         msg.commit_within_ms > 0 && msg.maxSegments == 0 && !msg.waitForMerges &&
@@ -748,6 +765,14 @@ public:
 
   // Coherent writer-visible and committed state for operational introspection.
   Stats stats(bool includeSegments);
+
+private:
+  // indexMutex held.
+  bool uncommittedLocked() const;
+  // After `closed` is set: drains the graph and completes abandoned work.
+  void drainClosed();
+  // Resumes a deferred commit whose timer may have fired while transiently closed.
+  void rearmDeferredCommit();
 };
 
 

@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -96,6 +97,12 @@ public:
   }
   void deleteCollection(const CollectionId& id);
   void deleteCollection(std::string_view name) { deleteCollection(CollectionId::of(name)); }
+  // Runtime adoption and release of a collection's files (see Collections);
+  // writers only: refused on a follower or a read-only node.
+  std::shared_ptr<Collection> openCollection(const CollectionId& id, bool promote = false,
+                                             const std::optional<std::string>& incarnation = std::nullopt);
+  void closeCollection(const CollectionId& id, bool discard = false,
+                       const std::optional<std::string>& expectCommit = std::nullopt);
 
   oneapi::tbb::task_arena& getTaskArena() {
     return taskArena;

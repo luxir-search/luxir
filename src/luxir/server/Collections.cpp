@@ -492,6 +492,108 @@ void Collections::remove(const CollectionId& key, bool mustExist) {
   removed(key);
 }
 
+std::shared_ptr<Collection> Collections::openExisting(const CollectionId& key, bool promote,
+                                                      const std::optional<std::string>& incarnation) {
+  validate(key);
+  auto storage = factory->collection(key);
+  Transition transition(*this, key);
+  if (map.get(key)) throw CollectionExistsError("collection '" + key.label() + "' already exists");
+  std::vector<std::string> incarnations;
+  try { incarnations = storage.incarnations(); } catch (const std::exception&) {}
+  if (incarnations.empty()) throw CollectionNotFoundError("collection '" + key.label() + "' has no files to open");
+  auto selected = storage.current();
+  if (selected && !CommitId::validIncarnation(*selected)) throw std::runtime_error("CURRENT selects an invalid incarnation");
+  if (!selected) {
+    if (!incarnation) {
+      throw ApiError(ErrorKind::INVALID_REQUEST, "incarnation_required",
+                     "collection '" + key.label() + "' has no CURRENT: name the incarnation to open");
+    }
+    if (!CommitId::validIncarnation(*incarnation) || std::ranges::find(incarnations, *incarnation) == incarnations.end()) {
+      throw ApiError(ErrorKind::NOT_FOUND, "incarnation_not_found",
+                     "collection '" + key.label() + "' has no incarnation '" + *incarnation + "'");
+    }
+    storage.select(*incarnation);
+    selected = *incarnation;
+  } else if (incarnation && *incarnation != *selected) {
+    throw ApiError(ErrorKind::INVALID_REQUEST, "incarnation_mismatch",
+                   "collection '" + key.label() + "' CURRENT selects " + *selected + ", not " + *incarnation);
+  }
+  if (promote) {
+    auto manifest = Manifest::load(*storage.open(*selected));
+    if (!manifest.bytes) throw std::runtime_error("incarnation " + *selected + " has no committed snapshot");
+    auto promoted = copySnapshot(storage, *selected, manifest, verifyOnOpen);
+    storage.select(promoted);
+    LOG_INFO("Promoted collection '{}' from {} to {}", key.label(), *selected, promoted);
+    selected = promoted;
+  }
+  // Opened as at startup; initWriter retires what nothing selects (the
+  // promoted-from incarnation included).
+  auto collection = openCollection(key, Role::WRITER, selected);
+  if (!map.insert(key, collection)) {
+    collection->shard->iw->close();
+    throw std::logic_error("collection '" + key.label() + "' registered during open");
+  }
+  registered(key, collection);
+  LOG_INFO("Opened collection: {} ({})", key.label(), *selected);
+  return collection;
+}
+
+void Collections::close(const CollectionId& key, bool discard, const std::optional<std::string>& expectCommit) {
+  if (key.name.empty()) throw InvalidCollectionNameError("collection name is empty");
+  auto storage = factory->collection(key);
+  Transition transition(*this, key);
+  {
+    std::lock_guard lock(slotsMutex);
+    if (!slots[key].leased.empty()) throw CollectionUnavailableError("collection '" + key.label() + "' has a staged replacement");
+  }
+  auto collection = map.get(key);
+  if (!collection) {
+    validate(key);
+    throw CollectionNotFoundError("collection '" + key.label() + "' does not exist");
+  }
+  auto shard = collection->getShard();
+  if (expectCommit) {
+    CommitId expected;
+    try { expected = CommitId::parse(*expectCommit); }
+    catch (const std::exception& e) { throw ApiError(ErrorKind::INVALID_REQUEST, "invalid_commit", std::string("expect_commit: ") + e.what()); }
+    if (!shard || !shard->iw) {
+      throw CollectionChangedError("collection '" + key.label() + "' is unavailable: " + collection->getUnavailableReason());
+    }
+    // Checked and closed as one step: nothing is admitted in between.
+    if (!shard->iw->closeIfUnchanged(expected)) {
+      auto current = shard->getSnapshots().snapshot();
+      throw CollectionChangedError("collection '" + key.label() + "' changed since commit " + *expectCommit +
+                                   (current ? " (published " + current->id.token() + ")" : std::string()) +
+                                   (shard->iw->hasUncommittedChanges() ? "; it has uncommitted changes" : ""));
+    }
+  }
+  // The transition owns the name, so the entry is still the one read above.
+  if (!map.erase(key, collection)) throw std::runtime_error("collection '" + key.label() + "' changed while closing");
+  removed(key);
+  if (shard) {
+    if (shard->iw) shard->iw->close();
+    // Readers admitted searches hold stay valid; pins and retirement stop.
+    if (discard) shard->snapshots->close();
+    else shard->snapshots->detach();
+  }
+  if (!discard) {
+    LOG_INFO("Closed collection: {}", key.label());
+    return;
+  }
+  try {
+    storage.remove();
+  } catch (const std::exception& e) {
+    auto failed = Collection::placeholder(key, "close failed: " + std::string(e.what()));
+    if (map.insert(key, failed)) registered(key, failed);
+    throw;
+  }
+  {
+    std::lock_guard lock(slotsMutex);
+    slots[key].retained.clear();
+  }
+  LOG_INFO("Closed and discarded collection: {}", key.label());
+}
+
 Collections::Candidate Collections::stage(const CollectionId& key, std::string_view incarnation) {
   auto lease = std::unique_ptr<Lease>(new Lease{*this, key, std::string(incarnation)});
   {

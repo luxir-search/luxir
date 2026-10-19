@@ -53,6 +53,14 @@ public:
     : ApiError(ErrorKind::ALREADY_EXISTS, "collection_exists", message) {}
 };
 
+// A close guarded by expect_commit found the collection past that commit, or
+// holding uncommitted changes (HTTP 409).
+class CollectionChangedError : public ApiError {
+public:
+  explicit CollectionChangedError(const std::string& message)
+    : ApiError(ErrorKind::FAILED_PRECONDITION, "collection_changed", message) {}
+};
+
 class Shard {
   Collection& collection; // hard reference to the collection that owns this shard
   std::shared_ptr<Directory> dir;  // does this need to be shared_ptr?  Perhaps not if we have a shared ptr to a parent object (Shard or Collection?)

@@ -160,4 +160,17 @@ void LuxirNode::deleteCollection(const CollectionId& id) {
   else collections_->remove(id);
 }
 
+std::shared_ptr<Collection> LuxirNode::openCollection(const CollectionId& id, bool promote,
+                                                      const std::optional<std::string>& incarnation) {
+  if (following()) throw ReadOnlyError("cannot open collections on a follower");
+  if (readOnly()) throw ReadOnlyError("cannot open collections on a read-only node");
+  return collections_->openExisting(id, promote, incarnation);
+}
+
+void LuxirNode::closeCollection(const CollectionId& id, bool discard, const std::optional<std::string>& expectCommit) {
+  if (following()) throw ReadOnlyError("cannot close collections on a follower");
+  if (readOnly()) throw ReadOnlyError("cannot close collections on a read-only node");
+  collections_->close(id, discard, expectCommit);
+}
+
 } // namespace luxir
