@@ -360,8 +360,24 @@ public:
 // TODO: index vs query time analyzers (getIndexingChain/getQueryingChain?)
 class Analyzer {
 public:
+  // A chain that ends in edge_ngram or shingle indexes the tokens of the chain
+  // without that last filter (its base) as prefixes or as word n-grams. A
+  // variant with such a chain accelerates prefix and phrase queries on a
+  // representation whose canonical form equals `baseCanonical`; QueryBuilder
+  // finds it there.
+  struct Accel {
+    enum class Kind : uint8_t { NONE, PREFIXES, SHINGLES };
+    Kind kind = Kind::NONE;
+    int minSize = 0;          // edge_ngram min_gram / shingle min_shingle_size
+    int maxSize = 0;          // edge_ngram max_gram / shingle max_shingle_size
+    bool unigrams = false;    // shingle output_unigrams
+    std::string separator;    // shingle token_separator
+    std::string baseCanonical;
+  };
+
   // Canonical effective component names and parameters, before execution fusion.
   const std::string canonical;
+  const Accel accel;
   // Read-only by construction: only compile() creates a plan, so the derived
   // state below is always consistent with the components.
   const std::unique_ptr<const TokenizerFactory> tokenizer;
@@ -385,7 +401,8 @@ public:
 
 private:
   Analyzer(std::unique_ptr<const TokenizerFactory> tok,
-           std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical);
+           std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical,
+           Accel accel);
 };
 
 

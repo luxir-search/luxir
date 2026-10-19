@@ -195,6 +195,7 @@ public:
   // Both the pool and any parsed protobuf objects must outlive the query tree.
   explicit SearchParserImpl(SearchRequest& req)
     : req(req), fields(*req.schema, req.resolvedFields), maxOpDepth(req.searchConfig.max_op_depth) {
+    if (req.reader) fields.setCoverage(req.reader->oldestSchemaGen());
   }
 
   RootOp* parse() {

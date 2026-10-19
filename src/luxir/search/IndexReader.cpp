@@ -328,6 +328,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         segmentInfo.max_doc = nDocs;
         segmentInfo.commit_time = segment.commit_time;
         segmentInfo.live_docs = segment.live_docs;
+        segmentInfo.schema_gen = segment.schema_gen;
 
         segs.emplace_back(std::move(postingsReader), std::move(liveDocs),
                           std::move(segmentAuxReaders), segmentInfo, totalMaxDoc, i);

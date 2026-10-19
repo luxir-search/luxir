@@ -130,6 +130,7 @@ The built-in templates are:
 | `_wl` | Text split on whitespace, Unicode-lowercased; no normalization or accent folding. |
 | `_name` | Unicode-word text with case and accent folding and no stemming, plus a whole-value string variant for facets and sorting. |
 | `_names` | Multi-valued form of `_name`. |
+| `_sayt` | Search-as-you-type: `_name`'s word analysis plus `prefix` and `shingle` text variants that accelerate prefix and phrase queries; see [Prefix and phrase acceleration](#prefix-and-phrase-acceleration). |
 | `_v`, `_vs` | Single- or multi-valued vector column; storage-only until a metric is set on a concrete field. |
 
 Text fields are **stored** in the default compressed **stored_resource**.
@@ -345,7 +346,9 @@ A text analyzer is one tokenizer followed by a list of filters:
 | `lowercase` | Filter: Unicode lowercasing only. |
 | `fold` | Filter: accent and diacritic folding. |
 | `english_possessive` | Filter: remove a trailing `'s`. |
-| `kstem` | Filter: KStem English stemming; the only component with parameters. |
+| `kstem` | Filter: KStem English stemming; takes `possessive`. |
+| `edge_ngram` | Filter: the leading `min_gram` to `max_gram` code points of each token (defaults 2 and 5, at most 50). For prefix variants. |
+| `shingle` | Filter: runs of `min_shingle_size` to `max_shingle_size` consecutive tokens (defaults 2 and 2, at most 5) joined by `token_separator` (default `" "`); `output_unigrams` (default false) also emits the single tokens. For phrase variants. |
 
 Prefer `nfkc_cf` to `lowercase` on Unicode-segmented text: bare lowercasing
 leaves equal-looking strings unequal (composed versus decomposed forms, final
@@ -383,6 +386,17 @@ The standalone filter is useful without stemming. When placing it before
 `kstem`, set `possessive: false` on KStem so removal happens only once.
 Possessive removal applies even when the remaining word is non-ASCII or outside
 KStem's length range. Source spelling, offsets, and positions are preserved.
+
+`edge_ngram` emits every gram at its token's position, with the token's
+source offsets. A token shorter than `min_gram` is dropped and keeps its
+position, so later positions stay the same as without the filter. `shingle`
+places each shingle at the position of its first token, spanning the offsets
+of its first through last token. It joins tokens at consecutive positions
+only, so it never joins across a position gap or across the values of a
+multi-valued field. Both filters expand tokens at indexing; query terms are
+not split or joined. See
+[Prefix and phrase acceleration](#prefix-and-phrase-acceleration) for
+their use.
 
 Prefix, wildcard, regex, and fuzzy query terms receive the field's case and
 accent folding without possessive removal or stemming. Neither
@@ -578,6 +592,60 @@ stemming; its string variant keeps the whole value for sorting, faceting,
 and exact lookup through the inferred value binding. See
 [field retrieval](searching.md#field-retrieval-and-result-shape)
 for retrieving a particular variant.
+
+### Prefix and phrase acceleration
+
+A text variant whose analyzer is the analyzer of another representation of
+the same field plus one final `edge_ngram` or `shingle` filter accelerates
+queries on that representation. The variant receives the same value, so its
+terms are that representation's tokens as prefixes or as word pairs:
+
+- A `prefix` query whose normalized prefix is `min_gram` to `max_gram` code
+  points long becomes a lookup of one term in the `edge_ngram` variant, instead
+  of a walk over every term with that prefix. It keeps the prefix query's
+  constant score. Shorter and longer prefixes use the field itself.
+- An exact phrase (`slop` 0) of two terms becomes one term lookup in a
+  `shingle` variant with `min_shingle_size` 2 and the default `" "`
+  separator. A longer exact phrase still runs as a phrase, but first requires
+  each of its adjacent pairs as a filter. Phrases with slop, gaps, or stacked
+  terms use the field itself.
+
+Results do not change; only the plan does. A two-term phrase is scored as the
+pair term of the variant (its own document frequency and length norms), so
+scores differ from the positional phrase. Routing only happens when every
+document that is searched was indexed with the variant: a variant added to a
+field with documents takes over after those documents are reindexed. A
+`shingle` variant over a base that already has `edge_ngram` is never used,
+because the stacked grams would break its pairs. `?explain=resolved` lists
+each rewrite, such as `prefix: title_sayt -> title_sayt__prefix`.
+
+The built-in `_sayt` template sets this up for search-as-you-type:
+
+```json
+{
+  "templates": {
+    "_sayt": {
+      "type": "text",
+      "analyzer": {"tokenizer": "unicode_word", "filters": ["nfkc_cf", "fold"]},
+      "variants": {
+        "prefix": {"type": "text", "analyzer": {"tokenizer": "unicode_word",
+                   "filters": ["nfkc_cf", "fold", "edge_ngram"]}},
+        "shingle": {"type": "text", "analyzer": {"tokenizer": "unicode_word",
+                    "filters": ["nfkc_cf", "fold", "shingle"]}}
+      }
+    }
+  }
+}
+```
+
+It does not stem, so a typed prefix of a word still matches that word. Both
+variants are text, so the field keeps searching itself by default and never
+needs `defaults`. Use the same shape on another analyzer, or with other
+`edge_ngram` limits, for a custom template. Each variant indexes extra terms:
+the prefix variant up to `max_gram - min_gram + 1` per token and the shingle
+variant one per adjacent pair. See
+[Query reference: search as you type](query-reference.md#search-as-you-type)
+for the query pattern.
 
 ## STRING normalization and length
 
