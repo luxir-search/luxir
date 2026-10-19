@@ -172,9 +172,9 @@ public:
       auto outputPtr = postingsWriter.getOutputStream();
       IntColWriter writer(*outputPtr,
                           FieldType::sortsByIntColumn(fieldType->type()));
-      // TODO: not having the docids here makes it impossible to do a dense field encoding!  Of course that's
-      // not really possible if we're writing the column directly and incrementally since we don't know
-      // min, max, numbits, gcd, etc.  But we *could* know that stuff when merging segments!
+      // When full, values are already in doc order and the column is written dense (no docs-with-field
+      // bitset, see finishDense below); otherwise values are rank-addressed through the bitset.
+      // TODO: a docid-indexed encoding for mostly-full columns would need a missing marker per doc.
       // For direct incremental columns, and for merging, we could have a IntColWriter method that accepts (docid,val)
       // For that, we could have versions of push that take a number of values to push so we can have the best
       // of both worlds.

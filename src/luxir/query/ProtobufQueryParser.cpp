@@ -260,10 +260,23 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
     throw std::runtime_error(std::format(
       "KnnQuery for field '{}' must have a non-empty query vector", field));
   }
-  if (vectorType.dims() > 0 && (int32_t)queryVec.size() != vectorType.dims()) {
+  // Query vectors follow the same input contract as indexed ones and are cut
+  // to the same stored prefix, so the query is scored exactly like the
+  // indexed vectors.
+  if (std::string err = vectorType.inputError(queryVec); !err.empty()) {
     throw std::runtime_error(std::format(
-      "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
-      queryVec.size(), vectorType.dims(), field));
+      "KnnQuery: query vector for field '{}': {}", field, err));
+  }
+  queryVec = queryVec.first(vectorType.storedSize(queryVec.size()));
+  if (vectorType.metric() == VectorFieldType::METRIC_COSINE) {
+    // No direction to compare (possibly only after truncation): every
+    // candidate would score 0.
+    double normSq = 0.0;
+    for (float x : queryVec) normSq += (double)x * (double)x;
+    if (normSq <= VectorFieldType::MIN_COSINE_NORM_SQ) {
+      throw std::runtime_error(std::format(
+        "KnnQuery: cosine query vector for field '{}' has zero norm", field));
+    }
   }
 
   int32_t k = knnQuery.k;
