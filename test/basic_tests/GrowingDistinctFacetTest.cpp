@@ -10,6 +10,7 @@
 #include "test/TestUtils.h"
 #include "luxir/search/ops/DistinctFacetCounts.h"
 #include "luxir/util/ApiError.h"
+#include "test/RangeFacetTestUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -18,8 +19,6 @@ using Mode = DistinctFacetMode;
 using Grid = RangeFacetGrid;
 using Counts = DistinctFacetCounts;
 using Pairs = std::map<int64_t, std::set<std::pair<int, int64_t>>>;
-
-int64_t epoch(std::string_view value) { return parseDateToEpochMillis(value).value(); }
 
 void add(Counts& counts, int64_t value, GroupIdentity group = {GroupIdentity::VALUE, 0}) {
   counts.collectValues([&](auto add, auto) { add(value, group); });

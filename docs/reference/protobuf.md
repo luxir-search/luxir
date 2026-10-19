@@ -1372,7 +1372,7 @@ Named query buckets. A document may contribute to more than one bucket.
 
 ### luxir.RangeFacet
 
-Numeric or DATE buckets using the field's value binding. Each bucket is inclusive at its lower bound and exclusive at its upper bound; the final bucket is clipped to end. start must be less than end. Buckets return in lower-bound order.
+Numeric or DATE buckets using the field's value binding. Each bucket is inclusive at its lower bound and exclusive at its upper bound; the final bucket is clipped to end under EXPLICIT bounds. start must be less than end when both are supplied. Buckets return in lower-bound order. At most 100000 buckets may be generated; with sub-operations at most 1024 may be returned after mincount filtering. Fixed DATE gaps step in local time in the facet zone: both fold occurrences are fences; skipped lattice times map to the transition.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1383,20 +1383,20 @@ Numeric or DATE buckets using the field's value binding. Each bucket is inclusiv
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.rangefacet.field"></a>[`field`](#field-luxir.rangefacet.field) | 1 | `string` | singular |  |
-| <a id="field-luxir.rangefacet.start"></a>[`start`](#field-luxir.rangefacet.start) | 2 | [`Val`](#message-luxir.val) | singular | inclusive start of the range; required unless bounds is DATA |
-| <a id="field-luxir.rangefacet.end"></a>[`end`](#field-luxir.rangefacet.end) | 3 | [`Val`](#message-luxir.val) | singular | exclusive end of the range; required unless bounds is DATA |
+| <a id="field-luxir.rangefacet.start"></a>[`start`](#field-luxir.rangefacet.start) | 2 | [`Val`](#message-luxir.val) | singular | EXPLICIT: inclusive first fence, required. DATA: optional widening bound; include its cell without excluding smaller matching values. |
+| <a id="field-luxir.rangefacet.end"></a>[`end`](#field-luxir.rangefacet.end) | 3 | [`Val`](#message-luxir.val) | singular | EXPLICIT: exclusive last fence, required. DATA: optional exclusive widening bound; include intersecting cells below it without excluding larger values. |
 | <a id="field-luxir.rangefacet.gap"></a>[`gap`](#field-luxir.rangefacet.gap) | 4 | [`Val`](#message-luxir.val) | oneof [`gap_kind`](#oneof-luxir.rangefacet.gap_kind) | positive fixed width in field units; integer milliseconds for DATE |
 | <a id="field-luxir.rangefacet.calendar_gap"></a>[`calendar_gap`](#field-luxir.rangefacet.calendar_gap) | 10 | [`CalendarGap`](#message-luxir.calendargap) | oneof [`gap_kind`](#oneof-luxir.rangefacet.gap_kind) | civil gap for DATE fields only |
 | <a id="field-luxir.rangefacet.mincount"></a>[`mincount`](#field-luxir.rangefacet.mincount) | 5 | `int64` | optional | minimum bucket count; unset = 0; must be &gt;= 0 |
 | <a id="field-luxir.rangefacet.missing"></a>[`missing`](#field-luxir.rangefacet.missing) | 6 | `bool` | singular | Return the count without a value, in the chosen count unit. |
 | <a id="field-luxir.rangefacet.ops"></a>[`ops`](#field-luxir.rangefacet.ops) | 8 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed per bucket |
 | <a id="field-luxir.rangefacet.time_zone"></a>[`time_zone`](#field-luxir.rangefacet.time_zone) | 9 | `string` | singular | empty inherits SearchRequest.time\_zone; DATE fields only |
-| <a id="field-luxir.rangefacet.selected"></a>[`selected`](#field-luxir.rangefacet.selected) | 11 | [`Val`](#message-luxir.val) | singular | Scalar or array naming generated bucket lower bounds. Selected buckets are returned even below mincount. Null, nongenerated bounds, and duplicate bounds after coercion are errors. |
+| <a id="field-luxir.rangefacet.selected"></a>[`selected`](#field-luxir.rangefacet.selected) | 11 | [`Val`](#message-luxir.val) | singular | Scalar or array naming generated bucket lower bounds. Selected buckets are returned even below mincount. Null, nongenerated bounds, and duplicate bounds after coercion are errors. Not supported with DATA bounds. |
 | <a id="field-luxir.rangefacet.selection_mode"></a>[`selection_mode`](#field-luxir.rangefacet.selection_mode) | 12 | [`SelectionMode`](#enum-luxir.selectionmode) | singular | same filtering rules as FieldFacet; see SelectionMode |
 | <a id="field-luxir.rangefacet.count_unit"></a>[`count_unit`](#field-luxir.rangefacet.count_unit) | 13 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Inherits the parent measure; GROUPS uses the nearest collapse. |
 | <a id="field-luxir.rangefacet.count_distinct"></a>[`count_distinct`](#field-luxir.rangefacet.count_distinct) | 14 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys; same specification as Collapse. |
 | <a id="field-luxir.rangefacet.bounds"></a>[`bounds`](#field-luxir.rangefacet.bounds) | 15 | [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds) | singular |  |
-| <a id="field-luxir.rangefacet.origin"></a>[`origin`](#field-luxir.rangefacet.origin) | 16 | [`Val`](#message-luxir.val) | singular | DATA only: bucket lower bounds are origin + k \* gap for fixed gaps, and calendar unit starts in the time zone for calendar gaps. For DATE fields fixed gaps are counted in local time, so origin 0 aligns hourly and daily buckets to local midnight. Must be an integer (milliseconds) for DATE and INT fields, and a number for FLOAT and DOUBLE. Calendar gaps ignore it. Default: 0. |
+| <a id="field-luxir.rangefacet.origin"></a>[`origin`](#field-luxir.rangefacet.origin) | 16 | [`Val`](#message-luxir.val) | singular | DATA fixed gaps only; rejected with calendar\_gap. Default 0. For INT, FLOAT and DOUBLE, fences are origin + k \* gap from a global integer k. For DATE, origin is a wall-clock phase in the facet zone: 21600000 with gap 86400000 starts days at 06:00 local across DST. This differs from Elasticsearch's UTC-translated offset near transitions. Must be integer milliseconds for DATE, an integer for INT, or a number for FLOAT/DOUBLE. |
 
 <a id="message-luxir.rangequery"></a>
 
@@ -2151,14 +2151,14 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 
 ### luxir.RangeFacet.Bounds
 
-How start and end are determined.
+Whether the extent is explicit or derived from this facet instance's values.
 
 [Source](../../protos/luxir_types.proto)
 
 | Value | Number | Description |
 |---|---|---|
-| <a id="value-luxir.rangefacet.bounds.explicit"></a>[`EXPLICIT`](#value-luxir.rangefacet.bounds.explicit) | 0 | start and end are required |
-| <a id="value-luxir.rangefacet.bounds.data"></a>[`DATA`](#value-luxir.rangefacet.bounds.data) | 1 | Buckets span the field's data: from the bucket holding the smallest value to the bucket holding the largest. start and end are optional and only widen that span (like Elasticsearch extended\_bounds). The data range is read from segment column metadata, so it covers every indexed value of the field and ignores the query and deleted documents; leading and trailing buckets that are empty for the facet's documents are then dropped, unless start or end widens past them (not under a parent facet bucket, which keeps the shared fences). An empty field with no start and end returns no buckets. selected is not supported. Exceeding the bucket cap is the same error as with EXPLICIT bounds: use a larger gap. |
+| <a id="value-luxir.rangefacet.bounds.explicit"></a>[`EXPLICIT`](#value-luxir.rangefacet.bounds.explicit) | 0 | start and end are required. Fixed DATE grids use the local time of start as their phase; calendar grids step from start for every n. The last fence is clipped to end. |
+| <a id="value-luxir.rangefacet.bounds.data"></a>[`DATA`](#value-luxir.rangefacet.bounds.data) | 1 | Span the smallest through largest matching finite values, plus optional start/end widening. Queries, filters and deletions affect the extent; each parent bucket's child histogram has its own span. Occupancy is from raw values, even when a distinct key is dropped and its measured count is zero. Empty domains return no buckets unless both widening bounds supply a span. NaN/Inf are outside every bucket and never fail DATA. Calendar grids use the 1970 civil epoch (ISO weeks: Monday 1969-12-29); a civil day starts at its first midnight, or first valid instant. selected is unsupported. The 100000-bucket cap applies to the actual span including widening and empty interior cells; use a larger gap. |
 
 <a id="enum-luxir.replicaresult.outcome"></a>
 

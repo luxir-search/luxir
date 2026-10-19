@@ -23,6 +23,7 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "test/TestUtils.h"
+#include "test/RangeFacetTestUtils.h"
 #include "luxir/util/random.h"
 #include "luxir/util/proto.h"
 #include "luxir/index/Inverter.h"
@@ -171,18 +172,6 @@ void expectFloatingRangeResult(const api::FacetResult& result,
     EXPECT_EQ(fences[bucket + 1], bounds[bucket].v[1]);
     EXPECT_EQ(expected[bucket], result.counts[bucket]);
   }
-}
-
-int64_t epoch(std::string_view text) {
-  auto value = parseDateToEpochMillis(text);
-  EXPECT_TRUE(value.has_value()) << text;
-  return value.value_or(0);
-}
-
-TimeZone zone(std::string_view name) {
-  auto value = resolveTimeZone(name);
-  EXPECT_TRUE(value.has_value()) << name;
-  return value.value_or(TimeZone::utc());
 }
 
 std::optional<std::string_view> avgExpressionField(
@@ -6817,7 +6806,7 @@ TEST_F(FacetTest, dataMatchingOneValueRetainsOtherValues) {
   EXPECT_EQ((Counts{1, 0, 1}), countsOf(topFacetResult(*req, "q", "h")));
 }
 
-TEST_F(FacetTest, dataNestedEmptyFieldHasNoPlaceholder) {
+TEST_F(FacetTest, dataNestedEmptyFieldHasNoBuckets) {
   CollectionHelper helper;
   indexInts(helper, {}, api::FieldDef::FieldClass::INT, "n_i");
   ASSERT_TRUE(helper.index(flatdoc("id", "a", "cat_s", "one"), UpdateMessage::COMMIT).success);

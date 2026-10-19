@@ -7,9 +7,12 @@
 
 #include "luxir/search/RangeFacetCountWindow.h"
 #include "luxir/util/ApiError.h"
+#include "test/RangeFacetTestUtils.h"
 #include "luxir/util/NumericUtils.h"
 
 using namespace luxir;
+using luxir::test::epoch;
+using luxir::test::zone;
 namespace {
 using Grid = RangeFacetGrid;
 using Window = RangeFacetCountWindow;
@@ -43,8 +46,6 @@ void check(const Grid& grid, const Window& window, const Oracle& occupied) {
   }
   EXPECT_EQ(i, counts.size());
 }
-
-int64_t epoch(std::string_view value) { return parseDateToEpochMillis(value).value(); }
 
 void randomized(const Grid& grid, std::vector<int64_t> values) {
   std::mt19937 random(57);

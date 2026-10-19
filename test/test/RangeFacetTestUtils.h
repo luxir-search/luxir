@@ -3,11 +3,24 @@
 
 #pragma once
 
+#include <gtest/gtest.h>
 #include <vector>
 
 #include "luxir/util/DateTime.h"
 
 namespace luxir::test {
+
+inline int64_t epoch(std::string_view text) {
+  auto value = parseDateToEpochMillis(text);
+  EXPECT_TRUE(value.has_value()) << text;
+  return value.value_or(0);
+}
+
+inline TimeZone zone(std::string_view name) {
+  auto value = resolveTimeZone(name);
+  EXPECT_TRUE(value.has_value()) << name;
+  return value.value_or(TimeZone::utc());
+}
 
 // The previous EXPLICIT calendar algorithm, kept as a compatibility fingerprint.
 inline std::vector<int64_t> oldCalendarFences(int64_t start, int64_t end,

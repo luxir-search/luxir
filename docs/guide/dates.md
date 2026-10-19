@@ -102,7 +102,9 @@ explicit offset.
 ## Date histograms
 
 Range facets bucket DATE fields with either a fixed gap in milliseconds or a
-calendar gap in the facet's zone:
+calendar gap in the facet's zone. Set `"bounds": "data"` to derive the span
+from matching values; each nested instance has its own extent. Explicit
+`start` and `end` instead set a fixed span:
 
 ```http
 POST /collections/main/_search
@@ -134,5 +136,9 @@ POST /collections/main/_search
 Buckets are returned in order, zero counts included, with `[start, end)`
 epoch-millisecond pairs as bucket ids. Calendar buckets follow the civil
 calendar: months vary in length, and a daylight-saving day is 23 or 25 hours
-wide. A facet may set its own `time_zone`; leaving it empty inherits the
-request's. See [faceting.md](faceting.md) for the full contract.
+wide. Fixed gaps also step in local time when a zone is set: repeated lattice
+times have both occurrences as fences, and skipped lattice times map to the
+transition instant. With EXPLICIT bounds, the phase comes from the local time
+of `start`. A facet may set its own `time_zone`; leaving it empty inherits the
+request's. See [range facets](faceting.md#range-facets) for DATA widening,
+`origin`, calendar alignment, DST behavior and limits.

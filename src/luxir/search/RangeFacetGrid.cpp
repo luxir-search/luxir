@@ -4,7 +4,6 @@
 #include "luxir/search/RangeFacetGrid.h"
 
 #include <cmath>
-#include <stdexcept>
 
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/ApiError.h"

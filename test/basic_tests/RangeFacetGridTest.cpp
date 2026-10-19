@@ -10,19 +10,13 @@
 #include "test/RangeFacetTestUtils.h"
 
 using namespace luxir;
+using luxir::test::epoch;
+using luxir::test::zone;
 using luxir::test::oldCalendarFences;
 namespace {
 using Grid = RangeFacetGrid;
 constexpr int64_t minute = 60000;
 constexpr int64_t day = 86400000;
-
-int64_t epoch(std::string_view value) {
-  return parseDateToEpochMillis(value).value();
-}
-
-TimeZone zone(std::string_view value) {
-  return resolveTimeZone(value).value();
-}
 
 // Independent reference: scan UTC instants, testing the local lattice at each
 // minute. At a forward jump scan the missing civil minutes too. All tested
