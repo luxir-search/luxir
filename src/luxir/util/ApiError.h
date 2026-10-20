@@ -14,6 +14,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -111,6 +112,8 @@ public:
 inline ErrorInfo classifyException(const std::exception& e, ErrorKind fallback,
                                    std::string_view code = {}) {
   if (const auto* api = dynamic_cast<const ApiError*>(&e)) return api->info();
+  if (dynamic_cast<const std::bad_alloc*>(&e))
+    return ErrorInfo::of(ErrorKind::RESOURCE_EXHAUSTED, "memory allocation failed");
   if (code.empty()) code = errorKindName(fallback);
   return {fallback, std::string(code), e.what()};
 }

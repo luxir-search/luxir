@@ -11,6 +11,7 @@
 #include <cxxabi.h>
 #include "luxir/util/ApiError.h"
 #include "luxir/util/log.h"
+#include "luxir/util/ErrorLog.h"
 
 namespace luxir {
 
@@ -113,6 +114,7 @@ private:
   // different threads may try to set an error state concurrently, so we need some level of concurrency control.
   std::atomic<LuxirError*> error;
 public:
+  ErrorContext context{"update", {}, {}, {}};
   ErrorHolder() = default;
   ErrorHolder(const ErrorHolder& other) = delete;
   ErrorHolder& operator=(const ErrorHolder& other) = delete;
@@ -144,11 +146,7 @@ public:
   // expected to announce itself with a typed throw.
   LuxirError* setException(const std::exception& e, ErrorKind fallback = ErrorKind::INTERNAL) {
     auto err = std::make_unique<LuxirError>(e, fallback);
-    if (dynamic_cast<const ApiError*>(&e) != nullptr) {
-      LOG_WARN("update rejected: {}", err->what());
-    } else {
-      LOG_ERROR("update failed: {}\nStack trace:\n{}", err->what(), getStackTrace());
-    }
+    logError(err->info, context);
     return setLuxirError(std::move(err));
   }
 
