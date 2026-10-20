@@ -320,9 +320,22 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         }
         if (retry) break;
 
+        // Source documents are read lazily, so opening the segment only names the
+        // map. The previous snapshot's reader is shared while the map is the same.
+        std::shared_ptr<SourceReader> source;
+        if (segment.source_gen != 0) {
+          auto mapName = Postings::getSourceMapFileName(Postings::getSortableString(segId), segment.source_gen);
+          if (prevSeg && prevSeg->sharedSource && prevSeg->sharedSource->name() == mapName) {
+            source = prevSeg->sharedSource;
+          } else {
+            source = std::make_shared<SourceReader>(dir, std::move(mapName), nDocs);
+          }
+        }
+
         Segment::SegmentInfo segmentInfo;
         segmentInfo.seg_id = segId;
         segmentInfo.live_gen = liveGen;
+        segmentInfo.source_gen = segment.source_gen;
         segmentInfo.min_version = segment.min_version;
         segmentInfo.max_version = segment.max_version;
         segmentInfo.max_doc = nDocs;
@@ -330,7 +343,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         segmentInfo.live_docs = segment.live_docs;
 
         segs.emplace_back(std::move(postingsReader), std::move(liveDocs),
-                          std::move(segmentAuxReaders), segmentInfo, totalMaxDoc, i);
+                          std::move(segmentAuxReaders), segmentInfo, totalMaxDoc, i, std::move(source));
         totalMaxDoc += segs.back().postingsReader().maxDoc();
         livedocs += segs.back().numLive();
         assert(nDocs == segs.back().postingsReader().maxDoc());

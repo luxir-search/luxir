@@ -267,6 +267,39 @@ column format includes the requested key with `null`.
 For a multi-valued field, stored values keep source order and duplicates;
 a string column is a sorted, deduplicated set.
 
+### Keeping documents as submitted (`_source`)
+
+Typed fields normalize what they index, so a collection cannot always give back
+what was sent. Turn on the source store to keep each document exactly as it was
+submitted (key order, duplicate keys, number spelling; only whitespace outside
+strings is dropped):
+
+```
+POST /collections/_create
+{"name": "articles", "schema": {"source": {"enabled": true}}}
+```
+
+It is off by default. `--indexing.source-default` turns it on for every new
+collection whose schema does not say (`source.enabled: false` opts a collection
+out); the choice is stored in the collection's schema, so changing the flag
+never alters an existing collection. Enabling it applies to documents indexed
+afterwards.
+
+Request `"fields": ["_source"]` to get a document back as raw JSON. `_source` is
+never part of the default or wildcard projection. To export the original
+documents, add `?format=docs&source=true`: each line is one stored document, and
+the output pipes straight back into `_update`.
+
+```
+POST /collections/articles/_search?format=docs&source=true
+{"query": {"all": true}, "fields": ["_source"], "limit": -1}
+```
+
+Source files are separate from the index, are never read by a search, and are
+copied by merges only when mostly deleted or small. See
+[the design](../design/source-store.md) and the `source` settings in
+[Schema](schema.md).
+
 ### Multi-valued text and phrases
 
 A multi-valued text field analyzes each input value separately and inserts a

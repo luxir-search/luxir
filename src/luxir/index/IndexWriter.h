@@ -52,6 +52,7 @@ public:
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
+    uint64_t sourceGen = 0;  // generation of the segment's source map, or 0 if its documents keep no source.
     int64_t mergedLiveGen = -1;  // if this segment was merged into another, what liveGen was used.
     uint64_t publishedLiveGen = 0; // the generation in the published snapshot
     std::vector<uint64_t> obsoleteLiveGens; // protected by indexMutex
@@ -85,6 +86,10 @@ public:
     // Populated by PostingsWriter::finish() and drained at commit time.
     std::vector<std::string> unsyncedFiles;
     std::vector<FileDescriptor> files;
+    // The source files (not the map) this segment's docs live in. Set once, when the
+    // segment is flushed, loaded or merged, and never changed after, so a merge may
+    // read it while a commit rewrites `files` and `unsyncedFiles`.
+    std::vector<FileDescriptor> sourceFiles;
 
     // Segment-local aux overlays recorded in SegmentInfo.overlays.  Vector
     // ANN entries are carried by segment liveness; coreGen does not
@@ -299,6 +304,7 @@ public:
 
   // the last segId generated. Atomic since we don't grab any lock in the merge code to generate a new segment id.
   std::atomic_uint64_t lastSegId;
+  std::atomic_uint64_t nextSourceSeq{0};  // names the next source file ("v<seq>"); never reused
 
   CommitSnapshotRegistry& snapshots;
   CommitId openingCommit; // Captured before this writer becomes externally visible.
@@ -727,6 +733,9 @@ private:
   void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
   bool mergeSegmentsBody(MergeMessage& msg);
+  void mergeSourceFiles(const std::vector<SegInfo*>& segs, const std::vector<LiveDocs*>& liveDocs,
+                        const Schema& schema, SegInfo& out, std::string& relocatedFile);
+  std::vector<std::string> unreferencedSourceFilesLocked(const std::vector<std::unique_ptr<SegInfo>>& dead);
 
 public:
   /// THIS SECTION ONLY FOR TEST CODE!

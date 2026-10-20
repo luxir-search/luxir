@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "JsonResponse.h"
+#include "luxir/util/ApiError.h"
 
 #include <algorithm>
 #include <charconv>
@@ -220,6 +221,12 @@ void val(std::string& out, const luxir::api::Column& col, size_t i) {
   else out += "null";
 }
 void nul(std::string& out, const luxir::api::Column&, size_t) { out += "null"; }
+// The _source column holds each document's JSON text, which is spliced in as is.
+void rawStr(std::string& out, const luxir::api::Column& col, size_t i) {
+  auto& c = std::get<luxir::api::ColStr>(col.kind);
+  if (i < c.v.size() && c.v[i] != c.missing_val) out.append(c.v[i]);
+  else out += "null";
+}
 } // namespace cell
 
 CellFn resolveCellFn(const luxir::api::Column& col) {
@@ -283,7 +290,8 @@ std::vector<ColPlan> buildColPlan(const luxir::api::DocList& docs) {
     if (plan.size() > 1) p.key += ',';
     appendJsonString(p.key, name);
     p.key += ':';
-    p.fn = resolveCellFn(col);
+    p.fn = name == "_source" && std::holds_alternative<luxir::api::ColStr>(col.kind) ? cell::rawStr
+                                                                                     : resolveCellFn(col);
     p.col = &col;
   }
   return plan;
@@ -306,7 +314,11 @@ void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
       first = false;
       appendJsonString(out, name);
       out += ':';
-      appendOpVal(out, *val);
+      if (name == "_source" && std::holds_alternative<std::string_view>(val->kind)) {
+        out.append(std::get<std::string_view>(val->kind));
+      } else {
+        appendOpVal(out, *val);
+      }
     }
   }
   if constexpr (Collapsed) {
@@ -628,12 +640,36 @@ std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, boo
   return out;
 }
 
-std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp) {
+std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp, bool sourceOnly) {
   std::vector<DocRun> runs;
   for (const auto& [name, val] : resp.ops) {
     if (const auto* dl = std::get_if<luxir::api::DocList>(&val->kind)) {
       auto& run = runs.emplace_back(DocRun{name, dl, {}});
-      if (dl->row_count > 0) {
+      if (dl->row_count > 0 && sourceOnly) {
+        // Placed in a dense column, or in the row maps (the docs format's default).
+        const luxir::api::ColStr* strings = nullptr;
+        for (const auto& [key, col] : dl->columns) {
+          if (key == "_source") strings = std::get_if<luxir::api::ColStr>(&col.kind);
+        }
+        for (size_t i = 0; i < (size_t)dl->row_count; i++) {
+          bool found = false;
+          if (strings && i < strings->v.size() && strings->v[i] != strings->missing_val) {
+            run.body.append(strings->v[i]);
+            found = true;
+          } else if (i < dl->docs.size()) {
+            for (const auto& [key, val] : dl->docs[i].fields) {
+              if (key != "_source") continue;
+              if (const auto* text = std::get_if<std::string_view>(&val->kind)) {
+                run.body.append(*text);
+                found = true;
+              }
+            }
+          }
+          // A doc with no stored source (indexed before the store was on, or damaged)
+          // has no line: an empty document would reindex as a bogus one.
+          if (found) run.body += '\n';
+        }
+      } else if (dl->row_count > 0) {
         auto plan = buildColPlan(*dl);
         auto appendRows = [&]<bool Collapsed>() {
           for (size_t i = 0; i < (size_t)dl->row_count; i++) {

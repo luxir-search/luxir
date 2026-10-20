@@ -26,11 +26,21 @@
 #include "luxir/util/Uuid.h"
 #include "luxir/util/thread.h"
 #include "SegmentMerger.h"
+#include "SourceMerge.h"
 #include "VectorIndexBuilder.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 
 
 namespace luxir {
+
+static std::vector<FileDescriptor> sourceFilesOf(const std::vector<FileDescriptor>& files) {
+  std::vector<FileDescriptor> out;
+  for (const auto& file : files) {
+    if (isSourceFile(file.name) && !isSourceMapFile(file.name)) out.push_back(file);
+  }
+  return out;
+}
+
 
 namespace {
 
@@ -129,6 +139,7 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     if (schema) throw std::invalid_argument("Initial schema supplied when reopening an index");
     incarnation = indexInfo.incarnation;
     lastSegId = indexInfo.last_seg_id;
+    nextSourceSeq = indexInfo.next_source_seq;
     lastCommitTime = indexInfo.commit_time;
     lastSnapshot.store(std::make_shared<const CommitSnapshot>(manifest.bytes,
         Schema::fromStored(*indexInfo.schema, indexInfo.schema_gen),
@@ -154,11 +165,13 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
       assert(success); // should be no repeated segments
       auto& seg = *iter->second;
       seg.liveGen = seg.publishedLiveGen = segment.live_gen;
+      seg.sourceGen = segment.source_gen;
       seg.minVersion = segment.min_version;
       seg.maxVersion = segment.max_version;
       seg.liveDocs = segment.live_docs;
       seg.schemaGen = segment.schema_gen;
       seg.files = fromWire(segment.files);
+      seg.sourceFiles = sourceFilesOf(seg.files);
       seg.firstCommitTime = segment.commit_time;  // firstCommitTime is stored in the segment meta.
       seg.lastCommitTime = indexInfo.commit_time; // not stored in the segment meta, so use index meta.
       seg.nextOverlayGen = segment.next_overlay_gen;
@@ -613,6 +626,7 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
   if (!inverter) {
     auto newInverter = std::make_unique<Inverter>(
         dir, ++lastSegId, pinned, indexRamBudget);
+    newInverter->sourceSeq = &nextSourceSeq;
     inverter = newInverter.get();
     inverter->updateVersions(updateVersion);
     busyInverters.emplace(inverter, std::move(newInverter));
@@ -1108,9 +1122,11 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
                                         inverter.getPostingsWriter().getMaxDoc());
     segInfo->unsyncedFiles = std::move(flushedFiles);
     segInfo->files = std::move(descriptors);
+    segInfo->sourceFiles = sourceFilesOf(segInfo->files);
     segInfo->minVersion = inverter.minVersion;
     segInfo->maxVersion = inverter.maxVersion;
     segInfo->schemaGen = inverter.schema->gen_;
+    segInfo->sourceGen = inverter.sourceGen;
     // Set liveDocs + liveGen for deleted docs from errors during indexing
     if (inverter.liveGen > 0) {
       segInfo->liveGen = inverter.liveGen;
@@ -1523,6 +1539,7 @@ void IndexWriter::tryDeleteSegments() {
     // Do not delete any segments that are being merged.
     std::vector<std::unique_ptr<SegInfo>> localDeleteList;
     std::vector<std::string> liveDocsToDelete;
+    std::vector<std::string> unreferencedSourceFiles;
     {
       std::lock_guard publicationLock(publicationMutex);
       const std::lock_guard<std::mutex> lock(indexMutex);
@@ -1535,6 +1552,7 @@ void IndexWriter::tryDeleteSegments() {
           segmentsToDelete.push_back(std::move(seg)); // keep it in the list, we can't delete it yet.
         }
       }
+      unreferencedSourceFiles = unreferencedSourceFilesLocked(localDeleteList);
       auto retireLiveDocs = [&](SegInfo& seg) {
         // Generations beyond the published one can still be in a preparing
         // commit's sync list, including after a failed publication.
@@ -1553,6 +1571,7 @@ void IndexWriter::tryDeleteSegments() {
     // No publication or index lock is held during filesystem cleanup.
     Signal::emit("segmentRetirement", this);
     snapshots.retire(liveDocsToDelete);
+    snapshots.retire(unreferencedSourceFiles);
     // Now delete the segments outside of the mutex.
     // In the future, if we wanted to support windows, we need a background deleter to
     // retry deletes after some time in case they are still open.
@@ -1565,6 +1584,34 @@ void IndexWriter::tryDeleteSegments() {
   } catch (std::exception& e) {
     LOG_ERROR("Exception caught while deleting segments: {}", e.what());
   }
+}
+
+// Source files belong to no segment name, so retiring a dead segment by prefix
+// leaves them. A source file goes with the last segment that lists it: of the
+// source files `dead` lists, those no live or pending segment lists and the
+// published snapshot does not. (A file an older snapshot still holds is
+// retained by the registry until the snapshot goes.) Call with indexMutex held.
+std::vector<std::string> IndexWriter::unreferencedSourceFilesLocked(const std::vector<std::unique_ptr<SegInfo>>& dead) {
+  std::vector<std::string> candidates;
+  for (const auto& seg : dead) {
+    if (!seg) continue;
+    for (const auto& file : seg->sourceFiles) candidates.push_back(file.name);
+  }
+  if (candidates.empty()) return candidates;
+  boost::unordered_flat_set<std::string_view> referenced;
+  for (const auto& [id, seg] : segInfos) {
+    for (const auto& file : seg->sourceFiles) referenced.insert(file.name);
+  }
+  for (const auto& seg : segmentsToDelete) {
+    for (const auto& file : seg->sourceFiles) referenced.insert(file.name);
+  }
+  if (auto published = lastSnapshot.load()) {
+    for (const auto& file : published->files) referenced.insert(file.name);
+  }
+  std::erase_if(candidates, [&](const std::string& name) { return referenced.contains(name); });
+  std::ranges::sort(candidates);
+  candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+  return candidates;
 }
 
 // Move a segment from segInfos to segmentsToDelete for deferred deletion
@@ -1903,6 +1950,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   info.schema = schema->storedInfo(arena);
   info.incarnation = incarnation;
   info.last_seg_id = lastSegId.load(std::memory_order_relaxed);
+  info.next_source_seq = nextSourceSeq.load(std::memory_order_relaxed);
   auto now = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::system_clock::now().time_since_epoch()).count();
   info.commit_time = std::max(now, lastCommitTime.load() + 1);
@@ -2070,6 +2118,7 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
     wire.seg_id = seg.segId;
     wire.max_doc = seg.maxDoc;
     wire.live_gen = seg.liveGen;
+    wire.source_gen = seg.sourceGen;
     wire.min_version = seg.minVersion;
     wire.max_version = seg.maxVersion;
     wire.commit_time = seg.firstCommitTime;
@@ -2135,6 +2184,59 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
 // So we don't delete segments that the commit code is about to use, the commit code marks
 // those segments.
 // We also mark segments that are going to be merged, so the commit code knows about them.
+// Gives the merged segment its source map. Source files of the inputs are
+// referenced rather than copied, except for the ones the merge relocates (see
+// mergeSources); the segment lists every source file its map names, so commit
+// pinning, retirement and replication follow the files.
+void IndexWriter::mergeSourceFiles(const std::vector<SegInfo*>& segs, const std::vector<LiveDocs*>& liveDocs,
+                                   const Schema& schema, SegInfo& out, std::string& relocatedFile) {
+  std::vector<SourceMap> maps(segs.size());
+  std::vector<SourceMergeInput> inputs(segs.size());
+  for (size_t i = 0; i < segs.size(); i++) {
+    inputs[i].maxDoc = segs[i]->maxDoc;
+    if (liveDocs[i]) inputs[i].live = &liveDocs[i]->bitset();
+    if (segs[i]->sourceGen == 0) continue;
+    try {
+      maps[i] = SourceMap::read(dir, Postings::getSourceMapFileName(Postings::getSortableString(segs[i]->segId),
+                                                                    segs[i]->sourceGen), segs[i]->maxDoc);
+      inputs[i].map = &maps[i];
+    } catch (const std::exception& e) {
+      // The segment's documents lose their source; the merge goes on.
+      LOG_WARN("segment {} has an unreadable source map: {}", segs[i]->segId, e.what());
+    }
+  }
+  auto merged = mergeSources(dir, schema.source, inputs, [&] {
+    relocatedFile = Postings::getSourceFileName(nextSourceSeq.fetch_add(1));
+    return relocatedFile;
+  });
+  if (merged.lostDocs > 0) LOG_WARN("merge into segment {} lost the source of {} docs", out.segId, merged.lostDocs);
+  if (merged.map.runs.empty()) {
+    if (merged.written) dir.deleteFile(relocatedFile);
+    relocatedFile.clear();
+    return;
+  }
+  merged.map.write(dir, Postings::getSourceMapFileName(Postings::getSortableString(out.segId), 1),
+                   &out.unsyncedFiles, &out.files);
+  out.sourceGen = 1;
+  for (const auto& ref : merged.map.files) {
+    if (merged.written && ref.name == merged.written->name) {
+      out.files.push_back(*merged.written);
+      out.unsyncedFiles.push_back(ref.name);
+      continue;
+    }
+    for (const SegInfo* seg : segs) {
+      auto file = std::ranges::find(seg->sourceFiles, ref.name, &FileDescriptor::name);
+      if (file == seg->sourceFiles.end()) continue;
+      out.files.push_back(*file);
+      // A source file of a segment that has not committed yet is not durable; syncing
+      // one that is costs a call, and the inputs' sync lists are not safe to read here.
+      out.unsyncedFiles.push_back(ref.name);
+      break;
+    }
+  }
+  out.sourceFiles = sourceFilesOf(out.files);
+}
+
 bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   // Started once there are sources to merge (or on a failure), so a pass that
   // finds nothing to merge does not count as a merge.
@@ -2153,6 +2255,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   bool mergeFailed = false;
   size_t markedSegmentCount = 0;
   uint64_t outputSegId = 0;
+  std::string relocatedSourceFile;  // written by this merge, deleted if it does not publish
   MergeFailureInfo failure;
   const char* phase = "select_sources";
 
@@ -2379,6 +2482,9 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
 
+      phase = "merge_source";
+      mergeSourceFiles(segs, liveDocsPtrs, *mergeSchema, *newSegInfo, relocatedSourceFile);
+
       phase = "active_overlay_snapshot";
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();
       if (!activeOverlayNames.empty()) {
@@ -2536,6 +2642,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
     if (!outputPublished) {
       try {
+        if (!relocatedSourceFile.empty()) dir.deleteFile(relocatedSourceFile);
         dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId));
       } catch (const std::exception& e) {
         LOG_ERROR("Failed to delete merged segment files for segId={} after merge failure: {}",
@@ -2712,6 +2819,7 @@ void IndexWriter::testDeleteAllData() {
     // Any operation that rewinds seg_id/coreGen/commitTime namespaces MUST
     // swap or epoch the filter cache before reusing those namespaces.
     lastSegId = 0;
+    nextSourceSeq = 0;
     indexGen = 0;
     incarnation = CommitId::newIncarnation();
     coreGen = 0;

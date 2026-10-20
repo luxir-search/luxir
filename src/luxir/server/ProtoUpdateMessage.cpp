@@ -7,6 +7,7 @@
 #include "CommitWaits.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/source/SourceJson.h"
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <new>
@@ -98,6 +99,13 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
   // first docid this request's adds will use; needed for all_or_none rollback.
   const int32_t firstDoc = inverter.getMaxDoc();
 
+  // Collections that store their source keep each document as it was submitted:
+  // the JSON bytes the transport retained, else the document as a serialized Map.
+  const bool keepSource = inverter.schema->source.enabled;
+  const bool rawAligned = msg.rawDocs.size() == request.docs.size();
+  std::string sourceJson;
+  std::vector<std::byte> sourceMap;
+
   int32_t failed = 0;
   int32_t docIndex = -1;
   for (const auto &doc : request.docs) {
@@ -111,6 +119,22 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     inverter.startDoc();
 
     try {
+      if (keepSource) {
+        uint8_t flags = request.allow_dups ? source::kFlagAllowDups : 0;
+        std::string_view body;
+        if (rawAligned) {
+          sourceJson.clear();
+          source::minifyJson(msg.rawDocs[(size_t)docIndex], sourceJson);
+          body = sourceJson;
+          flags |= source::kFlagMinifiedJson;
+        } else {
+          sourceMap.clear();
+          if (!luxir::api::encode(doc, sourceMap)) throw std::runtime_error("failed to serialize document source");
+          body = std::string_view((const char*)sourceMap.data(), sourceMap.size());
+          flags |= source::kFlagProtoMap;
+        }
+        inverter.addSource(docId(doc, fieldMap), body, msg.updateVersion, flags);
+      }
       // Duplicate keys post-mapping collapse last-wins (protobuf map semantics). The
       // handler is a name's identity, so its claim finds an earlier occurrence without
       // a per-doc map; a repeat replaces the value at the first occurrence's position.

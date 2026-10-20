@@ -111,6 +111,11 @@ struct IndexConfig {
   int64_t max_ram_mb = -1;
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
   int merge_factor = 10;
+  // Whether a new collection keeps each document as submitted (_source) when its
+  // schema does not say. Applied once, when the collection is created: the choice
+  // is then part of its schema, so changing this never alters an existing
+  // collection. A create request opts out with source.enabled = false.
+  bool source_default = false;
 };
 
 struct IngestConfig {

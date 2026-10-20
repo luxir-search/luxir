@@ -127,6 +127,22 @@ public:
     return s;
   }
 
+  /// A _source file: "v<seq>".  Sequence numbers come from IndexInfo.next_source_seq
+  /// and are never reused.  The name carries no segment: a merged segment
+  /// references the source files of its inputs.
+  static std::string getSourceFileName(uint64_t seq) {
+    return "v" + getSortableString(seq);
+  }
+
+  /// The source map of a segment, which lists the source files holding its
+  /// documents: "s<seg>__S<gen>".
+  static std::string getSourceMapFileName(const std::string_view segStr, uint64_t sourceGen) {
+    std::string s = std::string(PREFIX_FNAME).append(segStr);
+    s += "__S";
+    s.append(getSortableString(sourceGen));
+    return s;
+  }
+
   /// A file that contains deletes for the segment.  deleteGen==0 implies no deletes.
   static std::string getLiveDocsFileName(const std::string_view gen, uint64_t liveGen) {
     std::string s = std::string(PREFIX_FNAME).append(gen);

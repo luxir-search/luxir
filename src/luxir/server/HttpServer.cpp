@@ -56,6 +56,7 @@
 #include "JsonResponse.h"
 #include "NdjsonFramer.h"
 #include "ProtoUpdateMessage.h"
+#include "luxir/source/SourceJson.h"
 #include "Stats.h"
 #include "luxir/util/thread.h"
 #include "luxir/util/Signal.h"
@@ -142,6 +143,9 @@ struct HttpUpdateState {
   std::pmr::monotonic_buffer_resource resource;
   std::string body;  // raw JSON until it is decoded on the task arena
   HttpUpdateReqProto proto;  // JSON readers copy update strings into resource
+  // Where each doc of proto.docs starts and ends in `body`, which is then kept
+  // until the update completes. Set only for a collection that stores its source.
+  std::vector<std::string_view> rawDocs;
 };
 
 struct HttpStreamWriterTarget {
@@ -209,9 +213,13 @@ struct HttpStreamBatchState {
   // as the batch, which outlives the message.  Decoded strings are copied into
   // `resource`, so the raw bytes go as soon as decoding succeeds.  A malformed
   // record fails the whole batch before any of it is indexed.
-  void decodeDocs() {
+  //
+  // With keepRaw (the collection stores its source) the raw records and the chunks
+  // they point into stay until the batch is destroyed, and are returned so the
+  // update can keep each document as submitted.
+  std::span<const std::string_view> decodeDocs(bool keepRaw) {
     auto raw = records.finish();
-    if (raw.empty()) return;
+    if (raw.empty()) return {};
     luxir::api::build::SpanBuilder<luxir::api::Map> docs(resource);
     docs.reserve(raw.size());
     std::string err;
@@ -224,7 +232,9 @@ struct HttpStreamBatchState {
       }
     }
     proto.docs = docs.finish();
+    if (keepRaw) return raw;
     chunks.clear();
+    return {};
   }
 };
 
@@ -794,7 +804,7 @@ private:
       // The in-flight map owns the batch (and req) until done() has run.
       auto batch = batch_.lock();
       assert(batch != nullptr);
-      batch->decodeDocs();
+      rawDocs = batch->decodeDocs(schema && schema->source.enabled);
       ProtoUpdateMessage::handle(iw);
     }
 
@@ -1535,6 +1545,14 @@ private:
           return;
         }
         auto format = HttpSearchFormat::ENVELOPE;
+        docsSource_ = false;
+        if (const std::string* s = findParam(params, "source")) {
+          if (*s != "true" && *s != "false") {
+            respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, "source must be true or false"));
+            return;
+          }
+          docsSource_ = *s == "true";
+        }
         if (const std::string* f = findParam(params, "format")) {
           if (*f == "docs") {
             format = HttpSearchFormat::DOCS;
@@ -1557,6 +1575,10 @@ private:
           }
           handleExplain(req.body(), coll, overlay, *explain);
         } else {
+          if (docsSource_ && format != HttpSearchFormat::DOCS) {
+            respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, "source=true requires format=docs"));
+            return;
+          }
           handleSearch(req.body(), coll, format, overlay);
         }
         break;
@@ -1693,7 +1715,7 @@ private:
   // with nothing that would need an envelope to carry.  Multi-op requests are
   // fine - their runs are attributed by op-named _header_ markers.  Returns
   // an error message, or nullptr when the request qualifies.
-  static const char* validateDocsFormat(const HttpSearchReqProto& proto) {
+  static const char* validateDocsFormat(const HttpSearchReqProto& proto, bool sourceOnly = false) {
     if (proto.ops.size() == 0) {
       return "format=docs requires at least one op";
     }
@@ -1709,6 +1731,9 @@ private:
       const luxir::api::SearchOp& op = *opView;
       if (const auto* td = std::get_if<luxir::api::TopDocs>(&op.kind)) {
         if (!td->ops.empty()) return "format=docs does not support nested ops";
+        if (sourceOnly && std::find(td->fields.begin(), td->fields.end(), std::string_view("_source")) == td->fields.end()) {
+          return "source=true requires fields [\"_source\"]";
+        }
         if (td->document_format == luxir::api::DocFormat::COLUMNS) {
           return "format=docs emits row documents; document_format COLUMNS conflicts";
         }
@@ -1716,6 +1741,7 @@ private:
           return "format=docs emits row documents; document_format ADAPTIVE conflicts";
         }
       } else if (const auto* f = std::get_if<luxir::api::Fusion>(&op.kind)) {
+        if (sourceOnly) return "source=true is not supported for fusion ops";
         if (!f->ops.empty()) return "format=docs does not support nested ops";
         for (const auto& [srcName, src] : f->sources) {
           if (!src.ops.empty()) return "format=docs does not support nested ops";
@@ -1732,6 +1758,8 @@ private:
     }
     return nullptr;
   }
+
+  bool docsSource_ = false;  // ?source=true of the request being routed
 
   void handleSearch(const std::string& body, const std::string& coll, HttpSearchFormat format,
                     const SearchUrlOverlay& overlay) {
@@ -1753,7 +1781,7 @@ private:
     }
     bool docsMultiOp = false;
     if (format == HttpSearchFormat::DOCS) {
-      if (const char* err = validateDocsFormat(requestState->proto)) {
+      if (const char* err = validateDocsFormat(requestState->proto, docsSource_)) {
         releaseArena(arena);
         respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
         return;
@@ -1772,6 +1800,7 @@ private:
     }
     sreq->format = format;
     sreq->docsState.multiOp = docsMultiOp;
+    sreq->docsState.sourceOnly = docsSource_;
     sreq->docsState.requestId = sreq->proto.request_id;
     // Pin the io_context: shutdown drains until this query finishes, and the
     // context survives the request's teardown on the task-arena thread.
@@ -1792,13 +1821,23 @@ private:
   // a large JSON body (vectors especially) must not occupy the connection's
   // I/O shard, which serves every other connection assigned to it.
   static void prepareBufferedUpdate(HttpUpdateState& state, std::string_view coll,
-                                    const UpdateUrlParams& url) {
+                                    const UpdateUrlParams& url,
+                                    const std::function<bool(std::string_view)>& keepsSource) {
     std::string err;
     if (!luxir::api::read_json(state.proto, state.body, state.resource, &err)) {
       throw RequestError(err.empty() ? "malformed update request" : err, "invalid_json");
     }
-    std::string{}.swap(state.body); // Decoded request strings live in state.resource.
     setCollectionTarget(state.proto.collection, coll, state.resource);
+    // Decoded request strings live in state.resource, so the body is only kept for
+    // a collection that stores each document as submitted. Spans that do not line up
+    // with the decoded docs are dropped, and the update serializes the docs instead.
+    if (!state.proto.docs.empty() && keepsSource(state.proto.collection) &&
+        source::findUpdateDocSpans(state.body, state.rawDocs) && state.rawDocs.size() == state.proto.docs.size()) {
+      state.rawDocs.shrink_to_fit();
+    } else {
+      state.rawDocs.clear();
+      std::string{}.swap(state.body);
+    }
     // Same unit rule as streaming groups: a body that sets either field-map knob
     // owns the pair; otherwise the URL-param default applies.
     if (state.proto.field_map.empty() && !state.proto.drop_unmapped &&
@@ -1822,7 +1861,9 @@ private:
     std::shared_ptr<ShardPin> pin;
   public:
     BufferedUpdate(std::shared_ptr<HttpSession> session, std::shared_ptr<HttpUpdateState> state, std::shared_ptr<ShardPin> pin)
-        : ProtoUpdateMessage(&state->proto), session(std::move(session)), state(std::move(state)), pin(std::move(pin)) {}
+        : ProtoUpdateMessage(&state->proto), session(std::move(session)), state(std::move(state)), pin(std::move(pin)) {
+      rawDocs = this->state->rawDocs;
+    }
     void done(IndexWriter&) override {
       auto completed = takeCompletion(session->node_);
       auto target = session;
@@ -1884,7 +1925,9 @@ private:
         auto state = std::move(slot.state);
         std::optional<ErrorInfo> failure;
         try {
-          prepareBufferedUpdate(*state, coll, url);
+          prepareBufferedUpdate(*state, coll, url, [&](std::string_view target) {
+            return self->node_.keepsSource(LuxirNode::target(tenant, target));
+          });
         } catch (const std::exception& e) {
           failure = classifyException(e, ErrorKind::INVALID_REQUEST);
         } catch (...) {
@@ -4012,7 +4055,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
       // Document bodies are a pure function of the batch: render them OUTSIDE
       // any lock (this is the expensive part).  Only run framing depends on
       // cross-emitter interleaving.
-      auto runs = renderDocRuns(response.proto);
+      auto runs = renderDocRuns(response.proto, docsState.sourceOnly);
 
       // Multi-op requests have one emitter per op replying concurrently: the
       // framing decisions and the queue posts must agree on order, so both

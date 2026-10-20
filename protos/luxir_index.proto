@@ -26,6 +26,10 @@ message IndexInfo {
   // Auxiliary indexes built at index scope. Segment-local overlays live on
   // SegmentInfo.overlays.
   repeated AuxIndexInfo aux_indexes = 16;
+
+  // Allocation high-water mark for source file names ("v<seq>"), including files
+  // that are no longer referenced, so a name is never reused.
+  uint64 next_source_seq = 30;
 }
 
 // Authored schema and field introduction history embedded in the manifest.
@@ -67,4 +71,8 @@ message SegmentInfo {
   repeated AuxIndexInfo overlays = 9;
   repeated FileDescriptor files = 10; // Segment data and current liveDocs
   uint64 next_overlay_gen = 11; // Persistent high-water mark, including dropped overlays
+
+  // Generation of the segment's source map ("s<seg>__S<gen>"), 0 = no source
+  // store for this segment. The map lists the source files holding its documents.
+  uint64 source_gen = 30;
 }

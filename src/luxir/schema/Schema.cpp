@@ -746,6 +746,39 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
   return std::make_shared<StoredFieldType>(name, format);
 }
 
+SourceSettings SourceSettings::resolve(const api::SourceDef& def) {
+  auto fail = [](const std::string& msg) { throw SchemaError(msg + " (source)"); };
+  SourceSettings out;
+  out.enabled = def.enabled.value_or(false);
+  if (def.codec) {
+    switch (*def.codec) {
+      case api::SourceDef_::Codec::ZSTD: out.codec = source::Codec::ZSTD; break;
+      case api::SourceDef_::Codec::NONE: out.codec = source::Codec::NONE; break;
+      default: fail("unknown codec value " + std::to_string((int)*def.codec) + "; valid: zstd, none");
+    }
+  }
+  if (def.zstd_level) {
+    if (out.codec != source::Codec::ZSTD) fail("zstd_level requires codec zstd");
+    if (*def.zstd_level < 1 || *def.zstd_level > 22) fail("zstd_level must be 1 to 22");
+    out.zstdLevel = *def.zstd_level;
+  }
+  if (def.block_size_bytes) {
+    if (*def.block_size_bytes < 1024 || *def.block_size_bytes > 4 * 1024 * 1024) {
+      fail("block_size_bytes must be 1024 to 4194304");
+    }
+    out.blockBytes = (uint32_t)*def.block_size_bytes;
+  }
+  if (def.min_live_ratio) {
+    if (!(*def.min_live_ratio > 0.0 && *def.min_live_ratio <= 1.0)) fail("min_live_ratio must be above 0 and at most 1");
+    out.minLiveRatio = *def.min_live_ratio;
+  }
+  if (def.min_file_bytes) {
+    if (*def.min_file_bytes < 0) fail("min_file_bytes must not be negative");
+    out.minFileBytes = (uint64_t)*def.min_file_bytes;
+  }
+  return out;
+}
+
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
   auto schema = std::make_shared<Schema>();
 
@@ -792,6 +825,17 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
     resources.push_back({name, rd});
   }
   std::ranges::sort(resources, {}, &ResourcePair::first);
+
+  // The source store setting replaces the base's as a whole, except that an
+  // absent enabled keeps the current one.
+  std::optional<api::SourceDef> sourceDef;
+  if (baseSrc.source) sourceDef = baseSrc.source;
+  if (def.source) {
+    auto enabled = def.source->enabled ? def.source->enabled : (sourceDef ? sourceDef->enabled : std::nullopt);
+    sourceDef = def.source;
+    sourceDef->enabled = enabled;
+  }
+  if (sourceDef) schema->source = SourceSettings::resolve(*sourceDef);
 
   // Materialize the reserved fields when absent: a REPLACE_ALL that omits them gets
   // working defaults instead of a silently broken collection.
@@ -850,6 +894,7 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(templatePairs.data(), templatePairs.size()));
     src.stored_resources = luxir::api::map_view<std::string_view, api::StoredResourceDef>(
       std::span<const ResourcePair>(resources.data(), resources.size()));
+    src.source = sourceDef;
     schema->sourceDef_ = serializeSchemaDef(src);
   }
 

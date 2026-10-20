@@ -40,6 +40,7 @@ struct DocLinesState {
   bool multiOp = false;               // request has more than one DocList op
   std::string_view currentOp;         // op of the last emitted run
   std::string_view requestId;         // echoed on the first header when set
+  bool sourceOnly = false;            // each line is the document's _source alone (?source=true)
   bool anyHeaderEmitted = false;      // request warnings ride on the first header
   std::vector<std::string_view> headeredOps;  // ops whose first run was processed
 };
@@ -57,7 +58,12 @@ struct DocRun {
 
 // Render every DocList op in `resp` into a DocRun.  Intermediate responses
 // carry one op's batch; the final response carries every op's tail.
-std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp);
+//
+// With sourceOnly, a line is the document's stored source as submitted (the
+// "_source" column) instead of an object holding it, so the output pipes into
+// /update as the original documents; a doc without a stored source is an
+// empty object. Throws RequestError if the response has no "_source" column.
+std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp, bool sourceOnly = false);
 
 // Decide a run's framing and update `state` (the ONLY stateful step - callers
 // with concurrent producers serialize calls, paired with their queue posts).
