@@ -8,6 +8,8 @@ find_package(benchmark REQUIRED)
 # without a manual reconfigure (otherwise new files link as undefined symbols).
 file(GLOB_RECURSE Test_SOURCES CONFIGURE_DEPENDS *.cpp *.h)
 list(FILTER Test_SOURCES EXCLUDE REGEX "/allocation_tests/")
+# Plugin sources build into their own libraries (luxir_add_plugin), not luxir_test.
+list(FILTER Test_SOURCES EXCLUDE REGEX "/test/plugins/")
 
 # The benchmarks (bench/) are about a tenth of the test build. Debug builds
 # serve edit-build-test and the ASan gate, so they leave them out unless asked;
@@ -48,7 +50,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Cla
   add_executable(response_allocation_failure_test
     allocation_tests/ResponseAllocationFailureTest.cpp)
   target_include_directories(response_allocation_failure_test PRIVATE .)
-  target_link_libraries(response_allocation_failure_test PRIVATE luxir_lib GTest::gtest_main)
+  target_link_libraries(response_allocation_failure_test PRIVATE luxir_plugins luxir_lib GTest::gtest_main)
   target_link_options(response_allocation_failure_test PRIVATE
     -Wl,--wrap=_Znwm -Wl,--wrap=_ZdlPv -Wl,--wrap=_ZdlPvm)
 endif()
