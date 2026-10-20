@@ -22,6 +22,18 @@ namespace luxir {
 //
 
 
+// The ALP domain of a field type's int column.
+inline NumColumnFormat::ValueDomain columnDomain(FieldType::Type type) {
+  switch (type) {
+  case FieldType::FLOAT:
+    return NumColumnFormat::ValueDomain::FLOAT;
+  case FieldType::DOUBLE:
+    return NumColumnFormat::ValueDomain::DOUBLE;
+  default:
+    return NumColumnFormat::ValueDomain::INT;
+  }
+}
+
 class IntColWriter {
 public:
   static constexpr uint32_t BLOCK_SIZE = NumColumnFormat::BLOCK_SIZE;
@@ -31,10 +43,12 @@ private:
   NumColumnWriter writer;
 
 public:
-  // `sketch`: whether the column persists a value sketch
-  // (NumColumnWriter).
-  explicit IntColWriter(OutputStream& target, bool sketch = false)
-      : writer(target, true, true, sketch) {}
+  // `sketch`: whether the column persists a value sketch, and `domain`:
+  // how its values read as numbers (NumColumnWriter).
+  explicit IntColWriter(
+      OutputStream& target, bool sketch = false,
+      NumColumnFormat::ValueDomain domain = NumColumnFormat::ValueDomain::INT)
+      : writer(target, true, true, sketch, domain) {}
 
   void addInt64(int64_t val) {
     writer.addInt64(val);

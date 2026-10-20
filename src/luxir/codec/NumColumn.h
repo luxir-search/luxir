@@ -8,6 +8,156 @@
 
 namespace luxir {
 
+// Decode of the non-FOR block kinds (NumBlockKind; layouts in
+// NumColumnFormat::planCodec). Only general columns write them, so only
+// NumColumnT<true> reaches here. `count` is the block's value count, which
+// locates the ALP exceptions after the packed slots.
+class NumBlockCodecs {
+  static constexpr uint32_t BULK_SIZE = NumColumnFormat::BULK_SIZE;
+
+  static const char* packed(const NumBlockInfo& info, const char* payload,
+                            uint64_t count) {
+    switch (info.kind()) {
+    case NumBlockKind::DELTA:
+      return payload + NumColumnFormat::frameCount(count) * sizeof(int64_t);
+    case NumBlockKind::DICT:
+      return payload + info.dictSize() * sizeof(int64_t);
+    default:
+      return payload;
+    }
+  }
+
+  // n slots starting at the frame-aligned rankInBlock.
+  static void unpackSlots(const char* packed, uint64_t rankInBlock,
+                          uint32_t n, uint8_t bits, uint64_t* out) {
+    assert(rankInBlock % BULK_SIZE == 0 && n <= BULK_SIZE);
+    if (bits <= 32) {
+      uint32_t slots[BULK_SIZE];
+      LinearPack::unpack128(packed, rankInBlock, n, bits,
+                            LinearPack::mask32(bits), slots);
+      for (uint32_t i = 0; i < n; i++) out[i] = slots[i];
+      return;
+    }
+    uint64_t mask = LinearPack::mask64(bits);
+    for (uint32_t i = 0; i < n; i++) {
+      out[i] = LinearPack::select64(packed, rankInBlock + i, bits, mask);
+    }
+  }
+
+  // The first exception at or after rankInBlock.
+  static uint64_t lowerException(const char* positions, uint64_t exceptions,
+                                 uint64_t rankInBlock) {
+    uint64_t lo = 0;
+    uint64_t hi = exceptions;
+    while (lo < hi) {
+      uint64_t mid = lo + (hi - lo) / 2;
+      uint16_t position =
+          loadUnaligned<uint16_t>(positions + mid * sizeof(uint16_t));
+      if (position < rankInBlock) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+public:
+  static int64_t valueAt(const NumBlockInfo& info, const char* payload,
+                         uint64_t count, uint64_t rankInBlock) {
+    const char* slots = packed(info, payload, count);
+    uint8_t bits = info.bits();
+    switch (info.kind()) {
+    case NumBlockKind::DICT: {
+      uint64_t code = LinearPack::select64(slots, rankInBlock, bits,
+                                           LinearPack::mask64(bits));
+      assert(code < info.dictSize());
+      return loadUnaligned<int64_t>(payload + code * sizeof(int64_t));
+    }
+    case NumBlockKind::ALP_DOUBLE:
+    case NumBlockKind::ALP_FLOAT: {
+      uint64_t exceptions = info.alpExceptions();
+      if (exceptions != 0) {
+        const char* positions =
+            slots + LinearPack::packedByteSize(count, bits);
+        uint64_t i = lowerException(positions, exceptions, rankInBlock);
+        if (i < exceptions
+            && loadUnaligned<uint16_t>(positions + i * sizeof(uint16_t))
+                == rankInBlock) {
+          return loadUnaligned<int64_t>(positions
+                                        + exceptions * sizeof(uint16_t)
+                                        + i * sizeof(int64_t));
+        }
+      }
+      uint64_t slot = LinearPack::select64(slots, rankInBlock, bits,
+                                           LinearPack::mask64(bits));
+      return NumColumnFormat::alpDecode((int64_t)(info.baseBits + slot),
+                                        info.alpExponent(), info.alpFactor(),
+                                        info.kind());
+    }
+    default: {
+      // DELTA: the prefix sum of the rank's frame up to the rank.
+      assert(info.kind() == NumBlockKind::DELTA);
+      uint64_t frameStart = rankInBlock / BULK_SIZE * BULK_SIZE;
+      int64_t out[BULK_SIZE];
+      uint32_t n = (uint32_t)(rankInBlock - frameStart + 1);
+      decodeFrame(info, payload, count, frameStart, n, out);
+      return out[n - 1];
+    }
+    }
+  }
+
+  // The n values from the frame-aligned rankInBlock.
+  static void decodeFrame(const NumBlockInfo& info, const char* payload,
+                          uint64_t count, uint64_t rankInBlock, uint32_t n,
+                          int64_t* out) {
+    assert(rankInBlock + n <= count);
+    uint64_t slots[BULK_SIZE];
+    unpackSlots(packed(info, payload, count), rankInBlock, n, info.bits(),
+                slots);
+    switch (info.kind()) {
+    case NumBlockKind::DELTA: {
+      uint64_t value = loadUnaligned<uint64_t>(
+          payload + rankInBlock / BULK_SIZE * sizeof(int64_t));
+      out[0] = (int64_t)value;
+      for (uint32_t i = 1; i < n; i++) {
+        value += info.baseBits + slots[i];
+        out[i] = (int64_t)value;
+      }
+      return;
+    }
+    case NumBlockKind::DICT:
+      for (uint32_t i = 0; i < n; i++) {
+        assert(slots[i] < info.dictSize());
+        out[i] = loadUnaligned<int64_t>(payload + slots[i] * sizeof(int64_t));
+      }
+      return;
+    default: {
+      assert(info.kind() == NumBlockKind::ALP_DOUBLE
+             || info.kind() == NumBlockKind::ALP_FLOAT);
+      uint8_t e = info.alpExponent();
+      uint8_t f = info.alpFactor();
+      NumBlockKind kind = info.kind();
+      for (uint32_t i = 0; i < n; i++) {
+        out[i] = NumColumnFormat::alpDecode(
+            (int64_t)(info.baseBits + slots[i]), e, f, kind);
+      }
+      uint64_t exceptions = info.alpExceptions();
+      if (exceptions == 0) return;
+      const char* positions = packed(info, payload, count)
+          + LinearPack::packedByteSize(count, info.bits());
+      const char* values = positions + exceptions * sizeof(uint16_t);
+      for (uint64_t x = lowerException(positions, exceptions, rankInBlock);
+           x < exceptions; x++) {
+        uint64_t position =
+            loadUnaligned<uint16_t>(positions + x * sizeof(uint16_t));
+        if (position >= rankInBlock + n) break;
+        out[position - rankInBlock] =
+            loadUnaligned<int64_t>(values + x * sizeof(int64_t));
+      }
+      return;
+    }
+    }
+  }
+};
+
 // Shared numeric-column physical decode layer. Descriptors are read in place.
 //
 // The block-meta array must be 8-aligned - NumBlockInfo is a naturally aligned
@@ -78,7 +228,7 @@ public:
 
   std::optional<std::pair<uint64_t, uint64_t>> affineBlock(int64_t blockNum) const {
     const auto& info = blockInfo(blockNum);
-    if (info.bits() != 0 || ((uint64_t)info.scaledSlope & ((1ULL << NumColumnFormat::SLOPE_SHIFT) - 1))) return {};
+    if (!info.forPacked() || info.bits() != 0 || ((uint64_t)info.scaledSlope & ((1ULL << NumColumnFormat::SLOPE_SHIFT) - 1))) return {};
     uint64_t step = (uint64_t)(info.scaledSlope >> NumColumnFormat::SLOPE_SHIFT);
     if constexpr (WithGcd) step *= info.gcd;
     return std::pair(info.baseBits, step);
@@ -96,7 +246,16 @@ public:
     const NumBlockInfo& info =
         blockInfo((int64_t)((uint64_t)rank / BLOCK_SIZE));
     const char* payload = blocks + info.payloadOffset();
-    if (info.bits() > NumColumnFormat::MAX_PACKED_BITS) {
+    if (!info.forPacked()) {
+      if constexpr (WithGcd) {
+        if (!info.raw()) {
+          return NumBlockCodecs::valueAt(
+              info, payload,
+              (uint64_t)valuesInBlock((int64_t)((uint64_t)rank / BLOCK_SIZE)),
+              rankInBlock);
+        }
+      }
+      assert(info.raw());
       return loadUnaligned<int64_t>(payload + rankInBlock * sizeof(int64_t));
     }
     uint64_t residual = LinearPack::select64(
@@ -121,7 +280,11 @@ public:
     const NumBlockInfo& info =
         blockInfo((int64_t)((uint64_t)rank / BLOCK_SIZE));
     const char* payload = blocks + info.payloadOffset();
-    if (info.bits() > NumColumnFormat::MAX_PACKED_BITS) {
+    if (!info.forPacked()) {
+      if constexpr (WithGcd) {
+        if (!info.raw()) return {valueAt(rank - 1), valueAt(rank)};
+      }
+      assert(info.raw());
       int64_t pair[2];
       memcpy(pair, payload + (rankInBlock - 1) * sizeof(int64_t), sizeof(pair));
       return {pair[0], pair[1]};
@@ -138,10 +301,11 @@ public:
   //
   // Deliberately out of line. This runs once per 128 values, but it carries
   // every format variant (raw, packed-narrow with three scale-loop shapes,
-  // packed-wide), so inlining it into a caller's per-value loop bloats that
-  // loop and spills its cursor state to the stack. Measured on dense numeric
-  // faceting: inlined, the per-value path reloads decodedStart/decodedEnd from
-  // stack every iteration and the whole facet is ~25% slower.
+  // packed-wide, the other block kinds), so inlining it into a caller's
+  // per-value loop bloats that loop and spills its cursor state to the stack.
+  // Measured on dense numeric faceting: inlined, the per-value path reloads
+  // decodedStart/decodedEnd from stack every iteration and the whole facet is
+  // ~25% slower.
   LUXIR_NOINLINE int64_t decodeFrame(int64_t rank, int64_t* out,
                                      uint32_t& count) const {
     assert(rank >= 0 && rank < nValues);
@@ -152,7 +316,16 @@ public:
     count = (uint32_t)std::min<int64_t>(BULK_SIZE, nValues - start);
     const char* payload = blocks + info.payloadOffset();
 
-    if (info.bits() > NumColumnFormat::MAX_PACKED_BITS) {
+    if (!info.forPacked()) {
+      if constexpr (WithGcd) {
+        if (!info.raw()) {
+          NumBlockCodecs::decodeFrame(info, payload,
+                                      (uint64_t)valuesInBlock(blockNum),
+                                      rankInBlock, count, out);
+          return start;
+        }
+      }
+      assert(info.raw());
       memcpy(out, payload + rankInBlock * sizeof(int64_t),
              count * sizeof(int64_t));
       return start;

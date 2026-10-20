@@ -32,6 +32,8 @@ private:
   NumColumnFormat::ValueSketcher sketcher;
   std::vector<int64_t> values;
   std::vector<uint64_t> quotients;
+  NumColumnFormat::CodecScratch codecScratch;
+  NumColumnFormat::ValueDomain domain = NumColumnFormat::ValueDomain::INT;
   bool useGcd = true;
   bool zonesEnabled = true;
   bool sketchEnabled = false;
@@ -39,10 +41,15 @@ private:
   void addBlock(std::span<const int64_t> block) {
     NumColumnFormat::BlockPlan plan =
         NumColumnFormat::planBlock(block, quotients, useGcd, zonesEnabled);
+    // The other block kinds are for general columns: monotonic ones are read
+    // through NumColumnT<false>, which decodes FOR only.
+    if (useGcd) {
+      NumColumnFormat::planCodec(block, plan, domain, codecScratch);
+    }
     overallMin = std::min(overallMin, plan.zone.min);
     overallMax = std::max(overallMax, plan.zone.max);
 
-    NumBlockCodec::write(out, colStart, block, plan, quotients);
+    NumBlockCodec::write(out, colStart, block, plan, quotients, &codecScratch);
     blockInfo.push_back(plan.info);
     blockZones.push_back(plan.zone);
     leafZones.insert(leafZones.end(), plan.leafZones,
@@ -62,9 +69,13 @@ public:
   // columns, a query-time OrdMap's internal columns) writes an empty one
   // and skips the sketcher: two tail-buffer passes per value and up to
   // 512 KB while writing.
-  explicit NumColumnWriter(OutputStream& out, bool useGcd = true,
-                           bool writeZones = true, bool writeSketch = false)
-      : out(out), colStart(out.size()), useGcd(useGcd),
+  // `domain` says how the values read as numbers, so FLOAT/DOUBLE columns
+  // can weigh ALP blocks (NumColumnFormat::planCodec).
+  explicit NumColumnWriter(
+      OutputStream& out, bool useGcd = true, bool writeZones = true,
+      bool writeSketch = false,
+      NumColumnFormat::ValueDomain domain = NumColumnFormat::ValueDomain::INT)
+      : out(out), colStart(out.size()), domain(domain), useGcd(useGcd),
         zonesEnabled(writeZones), sketchEnabled(writeSketch) {
     assert(!writeSketch || writeZones);
     values.reserve(NumColumnFormat::BLOCK_SIZE);

@@ -346,7 +346,8 @@ public:
 
     plan.relation = BlockRelation::CROSSES;
     if (isExactSet()) return plan;
-    if (block.bits() > 32 || block.scaledSlope != 0) {
+    // Other block kinds and wide or sloped FOR blocks decode instead.
+    if (!block.residualComparable()) {
       return plan;
     }
 
@@ -390,8 +391,7 @@ public:
                  const NumericPredicateQuery& query) {
       int64_t blockNum = valueRank / IntColReader::BLOCK_SIZE;
       auto block = reader.blockInfo(blockNum);
-      if (!query.isExactSet()
-          && block.bits() <= 32 && block.scaledSlope == 0) {
+      if (!query.isExactSet() && block.residualComparable()) {
         if (valueRank < residualStart
             || valueRank >= residualStart + (int64_t)residualCount) {
           residualStart = reader.decodeResidualSubBlock(valueRank, residuals,

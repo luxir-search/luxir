@@ -272,7 +272,7 @@ public:
     int64_t blockNum = start / BLOCK_SIZE;
     int64_t rankInBlock = start % BLOCK_SIZE;
     const NumericBlockInfo& block = blockInfo(blockNum);
-    assert(block.bits() <= 32 && block.scaledSlope == 0);
+    assert(block.residualComparable());
     count = (uint32_t)std::min<int64_t>(SUB_BLOCK_SIZE, nvals - start);
     LinearPack::unpack128(
         columnIS.ptr() + block.payloadOffset(), rankInBlock, count,

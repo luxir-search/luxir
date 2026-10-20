@@ -241,7 +241,8 @@ inline VersionRuns::VersionRuns(const char* file, size_t fileSize, size_t header
     size_t metaSize = sizeof(VersionBlockHeader) + (bh.step ? 0 : sizeof(NumBlockInfo));
     auto check = [&](const NumBlockInfo& info, bool monotonic) {
       uint8_t bits = info.bits();
-      if ((bits > NumColumnFormat::MAX_PACKED_BITS && bits != 64) || !info.gcd
+      if (info.kind() != NumBlockKind::FOR
+          || (bits > NumColumnFormat::MAX_PACKED_BITS && bits != 64) || !info.gcd
           || (monotonic && info.gcd != 1)) invalid();
       uint64_t payload = info.payloadOffset();
       uint64_t bytes = bits == 64 ? (uint64_t)view.size() * 8

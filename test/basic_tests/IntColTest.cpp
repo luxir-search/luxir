@@ -9,10 +9,13 @@
 #include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
+#include <cmath>
 #include <numeric>
+#include <random>
 #include <vector>
 
 #include "luxir/index/IntColWriter.h"
+#include "luxir/util/NumericUtils.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -416,6 +419,109 @@ TEST_F(IntColTest, linearPackFormatCorners) {
     }
     check(ramp);
   }
+}
+
+// Writes `values` as one column in `domain`, checks every read path and the
+// zones against them, and returns each block's kind.
+static std::vector<NumBlockKind> writeCodecColumn(
+    std::span<const int64_t> values, NumColumnFormat::ValueDomain domain) {
+  RAMDir dir;
+  auto file = dir.createFile("numeric");
+  OutputStream out(file.get());
+  IntColWriter writer(out, false, domain);
+  for (int64_t value : values) writer.addInt64(value);
+  auto data = writer.finish();
+  out.close();
+  dir.finishFile(*file);
+
+  auto in = dir.openFile("numeric");
+  InputStream input(in->getInputStream());
+  IntColReader reader(input, data.columnLoc, data.columnMetaOff,
+                      data.numValues);
+  IntColReader::SparseValues sparse(reader);
+  IntColReader::BulkValues bulk(reader);
+  for (int64_t i = 0; i < (int64_t)values.size(); i++) {
+    EXPECT_EQ(sparse.valueAt(i), values[(size_t)i]) << "rank=" << i;
+    EXPECT_EQ(bulk.valueAt(i), values[(size_t)i]) << "rank=" << i;
+  }
+  // Point reads off frame starts, backwards (DELTA prefix sums).
+  for (int64_t i = (int64_t)values.size() - 1; i >= 0; i -= 37) {
+    EXPECT_EQ(sparse.valueAt(i), values[(size_t)i]) << "rank=" << i;
+  }
+  std::vector<NumBlockKind> kinds;
+  for (int64_t block = 0; block < reader.numBlocks(); block++) {
+    int64_t start = block * IntColReader::BLOCK_SIZE;
+    int64_t end = start + reader.valuesInBlock(block);
+    auto [minIt, maxIt] = std::minmax_element(values.begin() + start,
+                                              values.begin() + end);
+    EXPECT_EQ(reader.blockZone(block).min, *minIt);
+    EXPECT_EQ(reader.blockZone(block).max, *maxIt);
+    kinds.push_back(reader.blockInfo(block).kind());
+  }
+  return kinds;
+}
+
+// Each block kind is chosen for the data shape it targets, only when it is
+// smaller than FOR, and decodes back to the stored values.
+TEST_F(IntColTest, codecBlockKinds) {
+  using Domain = NumColumnFormat::ValueDomain;
+  constexpr size_t N = 2 * IntColReader::BLOCK_SIZE + 300;
+  std::mt19937_64 gen(42);
+  std::vector<int64_t> values(N);
+  auto expectAll = [](const std::vector<NumBlockKind>& kinds,
+                      NumBlockKind kind) {
+    for (size_t b = 0; b < kinds.size(); b++) {
+      EXPECT_EQ((int)kinds[b], (int)kind) << "block=" << b;
+    }
+  };
+
+  // Status codes: 9 bits by FOR, 2 by dictionary.
+  constexpr int64_t CODES[] = {200, 301, 404, 503};
+  for (auto& v : values) v = CODES[gen() % 4];
+  expectAll(writeCodecColumn(values, Domain::INT), NumBlockKind::DICT);
+
+  // Bursty ascending timestamps: random gaps under 1000 drift far from the
+  // endpoint line, so deltas (10 bits) beat the linear fit.
+  int64_t t = 1'700'000'000'000;
+  for (auto& v : values) v = t += (int64_t)(gen() % 1000);
+  expectAll(writeCodecColumn(values, Domain::INT), NumBlockKind::DELTA);
+  // Descending from INT64_MAX: negative deltas, wrapping reconstruction.
+  t = std::numeric_limits<int64_t>::max();
+  for (auto& v : values) v = t -= (int64_t)(gen() % 1000);
+  expectAll(writeCodecColumn(values, Domain::INT), NumBlockKind::DELTA);
+
+  // Two-decimal prices of both signs, with exceptions: values ALP cannot
+  // scale (-0.0, NaN, infinities, denormals) and irrational ones.
+  for (size_t i = 0; i < N; i++) {
+    double price = (double)((int64_t)(gen() % 2'000'000) - 1'000'000) / 100.0;
+    if (i % 400 == 7) price = std::sqrt((double)i);
+    if (i == 100) price = -0.0;
+    if (i == 101) price = std::numeric_limits<double>::quiet_NaN();
+    if (i == 102) price = std::numeric_limits<double>::infinity();
+    if (i == 103) price = -std::numeric_limits<double>::infinity();
+    if (i == 104) price = std::numeric_limits<double>::denorm_min();
+    values[i] = doubleToSortableInt64(price);
+  }
+  expectAll(writeCodecColumn(values, Domain::DOUBLE),
+            NumBlockKind::ALP_DOUBLE);
+  // The same bits in an INT column are never read as doubles.
+  for (NumBlockKind kind : writeCodecColumn(values, Domain::INT)) {
+    EXPECT_NE((int)kind, (int)NumBlockKind::ALP_DOUBLE);
+  }
+
+  // One-decimal float readings.
+  for (size_t i = 0; i < N; i++) {
+    float reading = (float)(int64_t)(gen() % 100'000) / 10.0f;
+    if (i % 300 == 11) reading = (float)std::sqrt((double)i);
+    values[i] = floatToSortableInt32(reading);
+  }
+  expectAll(writeCodecColumn(values, Domain::FLOAT), NumBlockKind::ALP_FLOAT);
+
+  // Shapes FOR already serves stay FOR: a steady ramp, wide random ints.
+  for (size_t i = 0; i < N; i++) values[i] = (int64_t)i * 17 + (int64_t)(i % 3);
+  expectAll(writeCodecColumn(values, Domain::INT), NumBlockKind::FOR);
+  for (auto& v : values) v = (int64_t)(gen() % 1'000'000);
+  expectAll(writeCodecColumn(values, Domain::DOUBLE), NumBlockKind::FOR);
 }
 
 // Leaf visit orders over ten leaves spanning two blocks (the last one

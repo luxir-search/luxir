@@ -6,17 +6,38 @@
 #include <algorithm>
 #include <bit>
 #include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <vector>
 
 #include "LinearFit.h"
+#include "luxir/util/NumericUtils.h"
 
 namespace luxir {
+
+// Block encodings. Persisted in the descriptor: append only.
+//   FOR        frame of reference: min + gcd * (slopeTerm(rank) + residual),
+//              or RAW (bits() == RAW_BITS) plain int64s
+//   DELTA      per-128-value frame anchors, then bit-packed in-frame deltas
+//   DICT       a sorted per-block dictionary, then bit-packed codes
+//   ALP_DOUBLE decimal-scaled doubles (ALP), then patched exceptions
+//   ALP_FLOAT  the same for floats
+// Every kind decodes to the column's int64 values (sortable bits for
+// FLOAT/DOUBLE), so consumers above the decode layer never see the kind.
+enum class NumBlockKind : uint8_t {
+  FOR = 0,
+  DELTA = 1,
+  DICT = 2,
+  ALP_DOUBLE = 3,
+  ALP_FLOAT = 4,
+};
 
 // Naturally aligned, and read in place off the mapping: every writer 8-aligns
 // the block-meta array (NumColumnWriter::finish), and every reader asserts it
@@ -25,33 +46,85 @@ namespace luxir {
 // reason.  Do not make this LUXIR_UNALIGNED to paper over a new relocator;
 // pad the relocator instead, or the assert will point at it.
 struct NumBlockInfo {
-  // Payload offset in the low 56 bits, packed width in the top 8. One load
-  // yields both, and it lands the descriptor on 32 bytes: two per cache line,
-  // never straddling one, indexed by a shift. 2^56 bytes of payload per column
-  // is not a limit anything can reach.
+  // Payload offset in the low 52 bits, packed width in the next 8, block
+  // kind in the top 4. One load yields all three, and it lands the
+  // descriptor on 32 bytes: two per cache line, never straddling one,
+  // indexed by a shift. 2^52 bytes of payload per column is not a limit
+  // anything can reach. Kind above width makes "a FOR block with a packed
+  // payload", the hot case, one compare of the top 12 bits (forPacked).
   //
   // A general block can use gcd and scaledSlope together - a sorted
   // day-granularity date column is a ramp over values sharing a divisor - so
   // the two are separate fields. Monotonic columns pin gcd to 1 and
   // NumColumnT<false> never reads it.
+  //
+  // The other kinds reuse the three value fields:
+  //   DELTA  baseBits = the minimum in-frame delta (mod 2^64)
+  //   DICT   gcd = dictionary size
+  //   ALP_*  baseBits = the minimum scaled integer, gcd = exponent |
+  //          factor << 8, scaledSlope = exception count
+  // Their scaledSlope is otherwise 0 and their gcd otherwise 1.
   uint64_t offsetAndBits = 0;
   uint64_t baseBits = 0;
   uint64_t gcd = 1;
   int64_t scaledSlope = 0;
 
-  static constexpr uint64_t OFFSET_MASK = (1ULL << 56) - 1;
+  static constexpr uint32_t OFFSET_BITS = 52;
+  static constexpr uint64_t OFFSET_MASK = (1ULL << OFFSET_BITS) - 1;
+  static constexpr uint8_t MAX_PACKED_BITS = 57;
+  static constexpr uint8_t RAW_BITS = 64;
 
   uint64_t payloadOffset() const {
     return offsetAndBits & OFFSET_MASK;
   }
 
   uint8_t bits() const {
-    return (uint8_t)(offsetAndBits >> 56);
+    return (uint8_t)(offsetAndBits >> OFFSET_BITS);
   }
 
-  void setPayload(uint64_t payloadOffset, uint8_t bits) {
+  NumBlockKind kind() const {
+    return (NumBlockKind)(offsetAndBits >> (OFFSET_BITS + 8));
+  }
+
+  // A FOR block with a bit-packed payload (not RAW, not another kind).
+  bool forPacked() const {
+    return (offsetAndBits >> OFFSET_BITS) <= MAX_PACKED_BITS;
+  }
+
+  bool raw() const {
+    return (offsetAndBits >> OFFSET_BITS) == RAW_BITS;
+  }
+
+  // Whether the packed values are FOR residuals (value - min) / gcd, which
+  // range queries compare against bounds moved into the residual domain
+  // instead of decoding.
+  bool residualComparable() const {
+    return forPacked() && bits() <= 32 && scaledSlope == 0;
+  }
+
+  uint64_t dictSize() const {
+    assert(kind() == NumBlockKind::DICT);
+    return gcd;
+  }
+
+  uint8_t alpExponent() const {
+    return (uint8_t)gcd;
+  }
+
+  uint8_t alpFactor() const {
+    return (uint8_t)(gcd >> 8);
+  }
+
+  uint64_t alpExceptions() const {
+    return (uint64_t)scaledSlope;
+  }
+
+  void setPayload(uint64_t payloadOffset, uint8_t bits,
+                  NumBlockKind kind = NumBlockKind::FOR) {
     assert(payloadOffset <= OFFSET_MASK);
-    offsetAndBits = payloadOffset | ((uint64_t)bits << 56);
+    assert(kind == NumBlockKind::FOR || bits <= MAX_PACKED_BITS);
+    offsetAndBits = payloadOffset | ((uint64_t)bits << OFFSET_BITS)
+        | ((uint64_t)kind << (OFFSET_BITS + 8));
   }
 };
 static_assert(sizeof(NumBlockInfo) == 32);
@@ -93,8 +166,8 @@ struct NumColumnFormat {
   static constexpr uint8_t SLOPE_SHIFT =
       (uint8_t)(std::bit_width(BLOCK_SIZE) + 1);
   static_assert(BLOCK_SIZE <= (1u << SLOPE_SHIFT), "block drift must stay < 1");
-  static constexpr uint8_t MAX_PACKED_BITS = 57;
-  static constexpr uint8_t RAW_BITS = 64;
+  static constexpr uint8_t MAX_PACKED_BITS = NumBlockInfo::MAX_PACKED_BITS;
+  static constexpr uint8_t RAW_BITS = NumBlockInfo::RAW_BITS;
   static constexpr uint8_t MIN_LINEAR_BITS_SAVED = 1;
 
   struct BlockPlan {
@@ -106,12 +179,13 @@ struct NumColumnFormat {
     uint32_t leafCount = 0;
     LinearFit::Plan fit;
     uint64_t count = 0;
-    // Held outside info until the writer knows the payload offset; the two
+    // Held outside info until the writer knows the payload offset; the three
     // share a word on disk.
     uint8_t bits = 0;
+    NumBlockKind kind = NumBlockKind::FOR;
 
     bool raw() const {
-      return bits > MAX_PACKED_BITS;
+      return kind == NumBlockKind::FOR && bits > MAX_PACKED_BITS;
     }
   };
 
@@ -188,6 +262,333 @@ struct NumColumnFormat {
     // holding.
     assert(plan.info.scaledSlope != 0 || plan.info.baseBits == (uint64_t)min);
     return plan;
+  }
+
+  // How a column's int64 values read as numbers, for the ALP kinds: FLOAT
+  // and DOUBLE columns hold sortable bits (NumericUtils.h), FLOAT ones
+  // sign-extended from int32.
+  enum class ValueDomain : uint8_t { INT, FLOAT, DOUBLE };
+
+  // The non-FOR kinds are only weighed for blocks of at least one decode
+  // frame: a smaller (tail) block cannot save enough to matter, and tiny
+  // columns keep the plain layout.
+  static constexpr uint32_t MIN_CODEC_BLOCK = BULK_SIZE;
+  // DICT codes stay at most 8 bits, and the dictionary at most 2 KB.
+  static constexpr uint32_t MAX_DICT_SIZE = 256;
+  // ALP picks its exponent pair on this many evenly spaced values, then
+  // encodes the whole block with the winner.
+  static constexpr uint32_t ALP_SAMPLE = 64;
+  static constexpr uint8_t ALP_MAX_EXPONENT_DOUBLE = 18;
+  static constexpr uint8_t ALP_MAX_EXPONENT_FLOAT = 10;
+  // An exception costs its uint16 rank and its int64 value.
+  static constexpr uint64_t ALP_EXCEPTION_BITS = 16 + 64;
+  // Scaled values stay inside the double mantissa, so round() is exact and
+  // the integers' FOR range fits MAX_PACKED_BITS.
+  static constexpr double ALP_MAX_SCALED = 4503599627370496.0;  // 2^52
+
+  static constexpr double ALP_POW10[] = {
+      1e0, 1e1, 1e2, 1e3, 1e4, 1e5, 1e6, 1e7, 1e8, 1e9,
+      1e10, 1e11, 1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 1e18};
+
+  // ALP (Afroozeh, Kuffo, Boncz, SIGMOD 2024): a decimal-origin value v is
+  // stored as the integer n = round(v * 10^e / 10^f) and read back as
+  // n * 10^f / 10^e. The writer keeps n only when that read reproduces the
+  // stored bits exactly, through this same function, so the encoding is
+  // lossless by construction; any other value is an exception. ALP itself
+  // multiplies by an inexact 10^-e; dividing by the exact 10^e instead costs
+  // a division per value but makes the read the correctly rounded quotient,
+  // which is exactly what a parser produced for a decimal with at most e - f
+  // fraction digits, so such values never become exceptions. Floats decode
+  // through double and round once more, which is innocuous for a quotient
+  // (53 >= 2 * 24 + 2 bits).
+  static int64_t alpDecode(int64_t n, uint8_t e, uint8_t f,
+                           NumBlockKind kind) {
+    double value = (double)n * ALP_POW10[f] / ALP_POW10[e];
+    return kind == NumBlockKind::ALP_FLOAT
+        ? (int64_t)floatToSortableInt32((float)value)
+        : doubleToSortableInt64(value);
+  }
+
+  // The number a stored value stands for; false when it has none ALP can
+  // scale (an out-of-range FLOAT pattern).
+  static bool alpValue(int64_t stored, ValueDomain domain, double& value) {
+    assert(domain != ValueDomain::INT);
+    if (domain == ValueDomain::DOUBLE) {
+      value = sortableInt64ToDouble(stored);
+      return true;
+    }
+    if (stored < std::numeric_limits<int32_t>::min()
+        || stored > std::numeric_limits<int32_t>::max()) {
+      return false;
+    }
+    value = (double)sortableInt32ToFloat((int32_t)stored);
+    return true;
+  }
+
+  // n for `value` at (e, f), or false if the value is an exception there.
+  // The range test also rejects NaN and the infinities.
+  static bool alpEncode(double value, int64_t stored, uint8_t e, uint8_t f,
+                        NumBlockKind kind, int64_t& n) {
+    double scaled = value * ALP_POW10[e] / ALP_POW10[f];
+    if (!(std::fabs(scaled) <= ALP_MAX_SCALED)) return false;
+    n = (int64_t)std::round(scaled);
+    return alpDecode(n, e, f, kind) == stored;
+  }
+
+  // Payload of a non-FOR plan, reused across blocks: `prefix` (DELTA frame
+  // anchors or the DICT entries), then `slots` bit-packed at plan.bits, then
+  // for ALP the exception ranks and their stored values.
+  struct CodecScratch {
+    std::vector<int64_t> prefix;
+    std::vector<uint64_t> slots;
+    std::vector<uint16_t> positions;
+    std::vector<int64_t> exceptions;
+    std::vector<int64_t> dict;
+    std::vector<double> numbers;
+    std::vector<uint8_t> scalable;
+  };
+
+  // DELTA: each 128-value frame stores its first value as an anchor, and
+  // every later value as its delta from the previous one, minus the
+  // block's least in-frame delta. Frames keep decodeFrame independent of
+  // earlier frames, and the point read to at most one frame's prefix sum.
+  // Deltas are taken in 128-bit arithmetic for the width, and reconstruct
+  // mod 2^64.
+  static std::optional<__int128> deltaMin(std::span<const int64_t> values,
+                                          uint8_t& bits) {
+    __int128 lo = 0;
+    __int128 hi = 0;
+    bool any = false;
+    for (size_t i = 1; i < values.size(); i++) {
+      if (i % BULK_SIZE == 0) continue;
+      __int128 delta = (__int128)values[i] - (__int128)values[i - 1];
+      if (!any || delta < lo) lo = delta;
+      if (!any || delta > hi) hi = delta;
+      any = true;
+    }
+    if (!any) return std::nullopt;
+    auto range = (unsigned __int128)(hi - lo);
+    if (range >= ((unsigned __int128)1 << MAX_PACKED_BITS)) {
+      return std::nullopt;
+    }
+    bits = (uint8_t)std::bit_width((uint64_t)range);
+    return lo;
+  }
+
+  static uint64_t frameCount(uint64_t count) {
+    return (count + BULK_SIZE - 1) / BULK_SIZE;
+  }
+
+  // DICT: the block's distinct values ascending, so codes keep value
+  // order. Bails out past MAX_DICT_SIZE with an open-addressed table at
+  // most half full.
+  static bool collectDistinct(std::span<const int64_t> values,
+                              std::vector<int64_t>& dict) {
+    constexpr uint32_t SLOTS = 2 * MAX_DICT_SIZE;
+    constexpr int SHIFT = 64 - std::countr_zero(SLOTS);
+    int64_t table[SLOTS];
+    bool used[SLOTS] = {};
+    dict.clear();
+    for (int64_t value : values) {
+      uint32_t slot =
+          (uint32_t)(((uint64_t)value * 0x9E3779B97F4A7C15ULL) >> SHIFT);
+      while (used[slot] && table[slot] != value) {
+        slot = (slot + 1) & (SLOTS - 1);
+      }
+      if (used[slot]) continue;
+      if (dict.size() == MAX_DICT_SIZE) return false;
+      used[slot] = true;
+      table[slot] = value;
+      dict.push_back(value);
+    }
+    std::sort(dict.begin(), dict.end());
+    return true;
+  }
+
+  struct AlpPlan {
+    uint8_t e = 0;
+    uint8_t f = 0;
+    uint8_t bits = 0;
+    int64_t minN = 0;
+    uint64_t cost = 0;
+  };
+
+  // Chooses (e, f) on a sample by estimated size, then encodes the block:
+  // scratch.slots receives each value's n (0 for exceptions) and the
+  // exception lists their ranks and stored values.
+  static std::optional<AlpPlan> planAlp(std::span<const int64_t> values,
+                                        ValueDomain domain,
+                                        CodecScratch& scratch) {
+    NumBlockKind kind = domain == ValueDomain::FLOAT
+        ? NumBlockKind::ALP_FLOAT : NumBlockKind::ALP_DOUBLE;
+    uint8_t maxExponent = domain == ValueDomain::FLOAT
+        ? ALP_MAX_EXPONENT_FLOAT : ALP_MAX_EXPONENT_DOUBLE;
+    size_t n = values.size();
+    scratch.numbers.resize(n);
+    scratch.scalable.resize(n);
+    for (size_t i = 0; i < n; i++) {
+      scratch.scalable[i] = alpValue(values[i], domain, scratch.numbers[i]);
+    }
+
+    // Sizes one (e, f) over every stride-th value.
+    auto measure = [&](uint8_t e, uint8_t f, size_t stride, int64_t& lo,
+                       uint64_t& exceptions) {
+      int64_t hi = 0;
+      bool any = false;
+      exceptions = 0;
+      for (size_t i = 0; i < n; i += stride) {
+        int64_t scaled;
+        if (!scratch.scalable[i]
+            || !alpEncode(scratch.numbers[i], values[i], e, f, kind,
+                          scaled)) {
+          exceptions++;
+          continue;
+        }
+        if (!any || scaled < lo) lo = scaled;
+        if (!any || scaled > hi) hi = scaled;
+        any = true;
+      }
+      if (!any) lo = 0;
+      return any ? (uint8_t)std::bit_width((uint64_t)hi - (uint64_t)lo)
+                 : (uint8_t)0;
+    };
+
+    size_t stride = std::max<size_t>(1, n / ALP_SAMPLE);
+    uint64_t sampled = (n + stride - 1) / stride;
+    AlpPlan best;
+    bool found = false;
+    for (uint8_t e = 0; e <= maxExponent; e++) {
+      for (uint8_t f = 0; f <= e; f++) {
+        int64_t lo = 0;
+        uint64_t exceptions = 0;
+        uint8_t bits = measure(e, f, stride, lo, exceptions);
+        if (exceptions == sampled) continue;
+        uint64_t cost = sampled * bits + exceptions * ALP_EXCEPTION_BITS;
+        if (!found || cost < best.cost) {
+          best = {e, f, bits, lo, cost};
+          found = true;
+        }
+      }
+    }
+    if (!found) return std::nullopt;
+
+    uint64_t exceptions = 0;
+    best.bits = measure(best.e, best.f, 1, best.minN, exceptions);
+    best.cost = n * best.bits + exceptions * ALP_EXCEPTION_BITS;
+
+    scratch.slots.resize(n);
+    scratch.positions.clear();
+    scratch.exceptions.clear();
+    for (size_t i = 0; i < n; i++) {
+      int64_t scaled;
+      if (!scratch.scalable[i]
+          || !alpEncode(scratch.numbers[i], values[i], best.e, best.f, kind,
+                        scaled)) {
+        scratch.slots[i] = 0;
+        scratch.positions.push_back((uint16_t)i);
+        scratch.exceptions.push_back(values[i]);
+        continue;
+      }
+      scratch.slots[i] = (uint64_t)scaled - (uint64_t)best.minN;
+    }
+    assert(scratch.positions.size() == exceptions);
+    return best;
+  }
+
+  // Switches a FOR plan to the smallest other kind, when one is strictly
+  // smaller, and fills scratch with its payload. Zones are left alone: they
+  // bound the stored values, whatever the kind. ALP is weighed only for
+  // FLOAT/DOUBLE domains.
+  static void planCodec(std::span<const int64_t> values, BlockPlan& plan,
+                        ValueDomain domain, CodecScratch& scratch) {
+    uint64_t n = values.size();
+    if (n < MIN_CODEC_BLOCK) return;
+    uint64_t best = n * (plan.raw() ? RAW_BITS : plan.bits);
+    NumBlockKind choice = NumBlockKind::FOR;
+
+    uint8_t deltaBits = 0;
+    auto minDelta = deltaMin(values, deltaBits);
+    if (minDelta) {
+      uint64_t cost = n * deltaBits + frameCount(n) * 64;
+      if (cost < best) {
+        best = cost;
+        choice = NumBlockKind::DELTA;
+      }
+    }
+
+    uint8_t dictBits = 0;
+    if (plan.bits > 1 && collectDistinct(values, scratch.dict)
+        && scratch.dict.size() > 1) {
+      dictBits = (uint8_t)std::bit_width(scratch.dict.size() - 1);
+      uint64_t cost = n * dictBits + scratch.dict.size() * 64;
+      if (cost < best) {
+        best = cost;
+        choice = NumBlockKind::DICT;
+      }
+    }
+
+    std::optional<AlpPlan> alp;
+    if (domain != ValueDomain::INT) {
+      alp = planAlp(values, domain, scratch);
+      if (alp && alp->cost < best) {
+        best = alp->cost;
+        choice = domain == ValueDomain::FLOAT ? NumBlockKind::ALP_FLOAT
+                                              : NumBlockKind::ALP_DOUBLE;
+      }
+    }
+
+    if (choice == NumBlockKind::FOR) return;
+    scratch.prefix.clear();
+    if (choice != NumBlockKind::ALP_DOUBLE
+        && choice != NumBlockKind::ALP_FLOAT) {
+      scratch.positions.clear();
+      scratch.exceptions.clear();
+      scratch.slots.resize(n);
+    }
+    plan.kind = choice;
+    plan.info.gcd = 1;
+    plan.info.scaledSlope = 0;
+    switch (choice) {
+    case NumBlockKind::FOR:
+      break;
+    case NumBlockKind::DELTA:
+      plan.bits = deltaBits;
+      plan.info.baseBits = (uint64_t)*minDelta;
+      for (size_t i = 0; i < n; i++) {
+        if (i % BULK_SIZE == 0) {
+          scratch.prefix.push_back(values[i]);
+          scratch.slots[i] = 0;
+        } else {
+          scratch.slots[i] = (uint64_t)((__int128)values[i]
+                                        - (__int128)values[i - 1]
+                                        - *minDelta);
+        }
+      }
+      break;
+    case NumBlockKind::DICT:
+      plan.bits = dictBits;
+      plan.info.baseBits = 0;
+      plan.info.gcd = scratch.dict.size();
+      scratch.prefix = scratch.dict;
+      for (size_t i = 0; i < n; i++) {
+        scratch.slots[i] = (uint64_t)(std::lower_bound(scratch.dict.begin(),
+                                                       scratch.dict.end(),
+                                                       values[i])
+                                      - scratch.dict.begin());
+      }
+      break;
+    case NumBlockKind::ALP_DOUBLE:
+    case NumBlockKind::ALP_FLOAT:
+      // planAlp already left the slots and exceptions in scratch.
+      plan.bits = alp->bits;
+      plan.info.baseBits = (uint64_t)alp->minN;
+      plan.info.gcd = (uint64_t)alp->e | ((uint64_t)alp->f << 8);
+      plan.info.scaledSlope = (int64_t)scratch.positions.size();
+      break;
+    }
+    assert(std::ranges::all_of(scratch.slots, [&](uint64_t slot) {
+      return std::bit_width(slot) <= plan.bits;
+    }));
   }
 
   // Leaf visit orders, persisted after the leaf zones. A field sort over the

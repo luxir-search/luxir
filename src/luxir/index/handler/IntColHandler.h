@@ -171,7 +171,8 @@ public:
     {
       auto outputPtr = postingsWriter.getOutputStream();
       IntColWriter writer(*outputPtr,
-                          FieldType::sortsByIntColumn(fieldType->type()));
+                          FieldType::sortsByIntColumn(fieldType->type()),
+                          columnDomain(fieldType->type()));
       // When full, values are already in doc order and the column is written dense (no docs-with-field
       // bitset, see finishDense below); otherwise values are rank-addressed through the bitset.
       // TODO: a docid-indexed encoding for mostly-full columns would need a missing marker per doc.
@@ -338,7 +339,7 @@ public:
     // push values
     {
       auto outputPtr = postingsWriter.getOutputStream();
-      IntColWriter writer(*outputPtr);
+      IntColWriter writer(*outputPtr, false, columnDomain(fieldType->type()));
       longStream.pushValues(inverter.pool, writer);
       writer.finish(fieldInfo);
     }

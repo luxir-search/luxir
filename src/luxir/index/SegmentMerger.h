@@ -1930,7 +1930,8 @@ private:
     auto intColWriter = pool.make_unique_align<IntColWriter>(
         8, *outputPtr,
         FieldType::sortsByIntColumn(outputFieldInfo.type)
-            && !(outputFieldInfo.flags & FieldType::MULTI_VALUED));
+            && !(outputFieldInfo.flags & FieldType::MULTI_VALUED),
+        columnDomain(outputFieldInfo.type));
 
     u_ptr<DocsWithValWriter> docsWriter = nullptr;  // docs with the field, created on demand if needed
 

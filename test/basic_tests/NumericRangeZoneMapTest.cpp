@@ -7,12 +7,14 @@
 #include <array>
 #include <cstdint>
 #include <limits>
+#include <random>
 #include <span>
 #include <vector>
 
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/schema/ValCoerce.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
@@ -519,4 +521,83 @@ TEST_F(NumericRangeZoneMapTest, predictedCrossingBlockComparesDecodedValues) {
       query.createWeight(context, 0));
   EXPECT_EQ(collect(weight->createZoneMapScorerForTests(pool, segment)),
             expected);
+}
+
+// Each non-FOR block kind (NumColumnFormat::planCodec) through flush, merge
+// and range queries. Range plans decode these blocks instead of comparing
+// residuals, and every collection path agrees with the oracle.
+TEST_F(NumericRangeZoneMapTest, codecBlocksMatchAllCollectionPaths) {
+  constexpr int32_t PER_SEGMENT = 2 * IntColReader::BLOCK_SIZE + 200;
+  constexpr int64_t CODES[] = {200, 301, 404, 503};
+  struct Field {
+    const char* name;
+    NumBlockKind kind;
+  };
+  const Field fields[] = {{"status_i", NumBlockKind::DICT},
+                          {"time_i", NumBlockKind::DELTA},
+                          {"price_d", NumBlockKind::ALP_DOUBLE},
+                          {"reading_f", NumBlockKind::ALP_FLOAT}};
+  // Encoded column values per field, per doc.
+  std::vector<std::vector<std::vector<int64_t>>> values(std::size(fields));
+  std::mt19937_64 gen(7);
+  int64_t time = 1'700'000'000'000;
+
+  TestIndex index;
+  auto addSegment = [&] {
+    Inverter& inverter = index.getInverter();
+    for (int32_t doc = 0; doc < PER_SEGMENT; doc++) {
+      int64_t status = CODES[gen() % 4];
+      time += (int64_t)(gen() % 1000);
+      double price = (double)((int64_t)(gen() % 2'000'000) - 1'000'000) / 100.0;
+      float reading = (float)(int64_t)(gen() % 100'000) / 10.0f;
+      inverter.startDoc();
+      inverter.getIndexHandler("status_i").index(inverter, status);
+      inverter.getIndexHandler("time_i").index(inverter, time);
+      inverter.getIndexHandler("price_d").index(inverter,
+                                                coerce::scalarVal(price));
+      inverter.getIndexHandler("reading_f").index(inverter,
+                                                  coerce::scalarVal(reading));
+      inverter.finishDoc();
+      values[0].push_back({status});
+      values[1].push_back({time});
+      values[2].push_back({doubleToSortableInt64(price)});
+      values[3].push_back({(int64_t)floatToSortableInt32(reading)});
+    }
+    index.flush();
+  };
+
+  auto check = [&] {
+    index.initReader();
+    ASSERT_EQ(1u, index.reader->segments().size());
+    auto& segment = index.reader->segments()[0];
+    for (size_t f = 0; f < std::size(fields); f++) {
+      SCOPED_TRACE(fields[f].name);
+      const auto* info = segment.postingsReader().fieldInfo(fields[f].name);
+      ASSERT_NE(nullptr, info);
+      IntColReader column(segment.postingsReader(), *info);
+      for (int64_t b = 0; b < column.numBlocks(); b++) {
+        EXPECT_EQ((int)fields[f].kind, (int)column.blockInfo(b).kind())
+            << "block=" << b;
+      }
+      std::vector<int64_t> sorted;
+      for (const auto& doc : values[f]) sorted.push_back(doc[0]);
+      std::sort(sorted.begin(), sorted.end());
+      size_t n = sorted.size();
+      const std::pair<int64_t, int64_t> ranges[] = {
+          {sorted[n / 3], sorted[n / 3 + n / 50]},
+          {sorted[n / 2], sorted[n / 2]},
+          {sorted[0], sorted[n / 10]},
+          {sorted[n - n / 7], sorted[n - 1]}};
+      for (auto [lo, hi] : ranges) {
+        expectRun(runRange(*index.reader, fields[f].name, lo, hi),
+                  oracle(values[f], lo, hi));
+      }
+    }
+  };
+
+  addSegment();
+  check();
+  addSegment();
+  index.iw->mergeSegments();
+  check();
 }
