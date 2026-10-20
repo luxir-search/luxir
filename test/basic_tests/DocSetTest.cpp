@@ -272,6 +272,33 @@ TEST_F(DocSetTest, builderAddSortedPromotesOnSpanOverflow) {
             (std::vector<int32_t>{1, 2, 10, 20, 95}));
 }
 
+TEST_F(DocSetTest, builderAddRangeAcrossPromotion) {
+  // arrayLimit(200) is 7: five docs stay an array, the next range promotes.
+  DocSetBuilder array(200);
+  array.addRange(1, 3);
+  array.addRange(5, 5);
+  array.addRange(7, 10);
+  auto arr = array.build();
+  ASSERT_EQ(arr->type, DocSet::ARRAY);
+  EXPECT_EQ(collect(*arr, 200), (std::vector<int32_t>{1, 2, 7, 8, 9}));
+
+  DocSetBuilder builder(200);
+  builder.addRange(1, 3);
+  builder.addRange(7, 10);
+  builder.addRange(60, 130);
+  builder.add(140);
+  builder.addRange(192, 200);
+  auto set = builder.build();
+
+  ASSERT_EQ(set->type, DocSet::BITSET);
+  std::vector<int32_t> expected{1, 2, 7, 8, 9};
+  for (int32_t doc = 60; doc < 130; doc++) expected.push_back(doc);
+  expected.push_back(140);
+  for (int32_t doc = 192; doc < 200; doc++) expected.push_back(doc);
+  EXPECT_EQ(set->card(), (int32_t)expected.size());
+  EXPECT_EQ(collect(*set, 200), expected);
+}
+
 TEST_F(DocSetTest, lazyCardinalityIsSafeForConcurrentReaders) {
   RAMBitDocSet docs(100'000);
   for (int i = 0; i < 100'000; i += 3) docs.mutableBits().set(i);
