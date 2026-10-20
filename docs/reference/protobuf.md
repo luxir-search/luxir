@@ -79,7 +79,6 @@ defaults and constraints are described in the comments and guides.
 - [`CacheControlResponse`](#message-luxir.cachecontrolresponse)
 - [`CacheEntryDump`](#message-luxir.cacheentrydump)
 - [`CalendarGap`](#message-luxir.calendargap)
-- [`Cardinality`](#message-luxir.cardinality)
 - [`CgroupCpuStats`](#message-luxir.cgroupcpustats)
 - [`CgroupMemoryStats`](#message-luxir.cgroupmemorystats)
 - [`CgroupStats`](#message-luxir.cgroupstats)
@@ -151,8 +150,6 @@ defaults and constraints are described in the comments and guides.
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
 - [`OutcomeStats`](#message-luxir.outcomestats)
-- [`PercentileRanks`](#message-luxir.percentileranks)
-- [`Percentiles`](#message-luxir.percentiles)
 - [`PhraseOptions`](#message-luxir.phraseoptions)
 - [`PhraseQuery`](#message-luxir.phrasequery)
 - [`PrefixQuery`](#message-luxir.prefixquery)
@@ -495,19 +492,6 @@ One resident cache entry. key\_text is the printable-byte extraction from the se
 |---|---|---|---|---|
 | <a id="field-luxir.calendargap.n"></a>[`n`](#field-luxir.calendargap.n) | 1 | `int32` | singular | number of civil units per bucket; must be positive |
 | <a id="field-luxir.calendargap.unit"></a>[`unit`](#field-luxir.calendargap.unit) | 2 | [`CalendarGap.Unit`](#enum-luxir.calendargap.unit) | singular |  |
-
-<a id="message-luxir.cardinality"></a>
-
-### luxir.Cardinality
-
-Approximate count of the distinct values of a field over the operation's incoming documents. The result is an int64. Supports STRING, ID, INT, FLOAT, DOUBLE, and DATE fields; multi-valued documents contribute every value, and documents without a value contribute nothing.
-
-[Source](../../protos/luxir_types.proto)
-
-| Field | Number | Type | Cardinality / group | Description |
-|---|---|---|---|---|
-| <a id="field-luxir.cardinality.field"></a>[`field`](#field-luxir.cardinality.field) | 1 | `string` | singular |  |
-| <a id="field-luxir.cardinality.precision_threshold"></a>[`precision_threshold`](#field-luxir.cardinality.precision_threshold) | 2 | `int64` | optional | Distinct counts up to this value are exact (up to 64-bit hash collisions); above it a HyperLogLog sketch with 2^p registers takes over, p = ceil(log2(threshold / 0.75)) clamped to \[4, 18\]. Unset = 3000; must be in \[0, 40000\]. |
 
 <a id="message-luxir.cgroupcpustats"></a>
 
@@ -1632,36 +1616,6 @@ Completed work by outcome, and its summed duration.
 | <a id="field-luxir.outcomestats.cancelled"></a>[`cancelled`](#field-luxir.outcomestats.cancelled) | 3 | `uint64` | singular |  |
 | <a id="field-luxir.outcomestats.seconds"></a>[`seconds`](#field-luxir.outcomestats.seconds) | 4 | `double` | singular |  |
 
-<a id="message-luxir.percentileranks"></a>
-
-### luxir.PercentileRanks
-
-The percentile rank (0-100: the percentage of values &lt;= v) of each of \`values\` for an INT, FLOAT, DOUBLE, or DATE field, from the same sketch as Percentiles. Result shape as Percentiles, keyed by the formatted value.
-
-[Source](../../protos/luxir_types.proto)
-
-| Field | Number | Type | Cardinality / group | Description |
-|---|---|---|---|---|
-| <a id="field-luxir.percentileranks.field"></a>[`field`](#field-luxir.percentileranks.field) | 1 | `string` | singular |  |
-| <a id="field-luxir.percentileranks.values"></a>[`values`](#field-luxir.percentileranks.values) | 2 | `double` | repeated | required, nonempty, finite, distinct |
-| <a id="field-luxir.percentileranks.compression"></a>[`compression`](#field-luxir.percentileranks.compression) | 3 | `double` | optional | unset = 100; must be in \[20, 1000\] |
-| <a id="field-luxir.percentileranks.keyed"></a>[`keyed`](#field-luxir.percentileranks.keyed) | 4 | `bool` | optional | unset = true |
-
-<a id="message-luxir.percentiles"></a>
-
-### luxir.Percentiles
-
-Approximate percentiles of an INT, FLOAT, DOUBLE, or DATE field's values over the operation's incoming documents, from a t-digest. Keyed results are a Map from the formatted percent ("50.0", "99.9") to a double, in request order; unkeyed results are an array of {key, value} Maps. Values are null when no document has a value. NaN and infinite values are skipped.
-
-[Source](../../protos/luxir_types.proto)
-
-| Field | Number | Type | Cardinality / group | Description |
-|---|---|---|---|---|
-| <a id="field-luxir.percentiles.field"></a>[`field`](#field-luxir.percentiles.field) | 1 | `string` | singular |  |
-| <a id="field-luxir.percentiles.percents"></a>[`percents`](#field-luxir.percentiles.percents) | 2 | `double` | repeated | each in \[0, 100\], distinct; empty = 1,5,25,50,75,95,99 |
-| <a id="field-luxir.percentiles.compression"></a>[`compression`](#field-luxir.percentiles.compression) | 3 | `double` | optional | t-digest compression; unset = 100; must be in \[20, 1000\] |
-| <a id="field-luxir.percentiles.keyed"></a>[`keyed`](#field-luxir.percentiles.keyed) | 4 | `bool` | optional | unset = true |
-
 <a id="message-luxir.phraseoptions"></a>
 
 ### luxir.PhraseOptions
@@ -2116,9 +2070,6 @@ A named search operation. The name is its key in the enclosing ops map.
 | <a id="field-luxir.searchop.range_facet"></a>[`range_facet`](#field-luxir.searchop.range_facet) | 9 | [`RangeFacet`](#message-luxir.rangefacet) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
 | <a id="field-luxir.searchop.query_facet"></a>[`query_facet`](#field-luxir.searchop.query_facet) | 10 | [`QueryFacet`](#message-luxir.queryfacet) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
 | <a id="field-luxir.searchop.expr_op"></a>[`expr_op`](#field-luxir.searchop.expr_op) | 15 | [`ExprOp`](#message-luxir.exprop) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
-| <a id="field-luxir.searchop.cardinality"></a>[`cardinality`](#field-luxir.searchop.cardinality) | 16 | [`Cardinality`](#message-luxir.cardinality) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
-| <a id="field-luxir.searchop.percentiles"></a>[`percentiles`](#field-luxir.searchop.percentiles) | 17 | [`Percentiles`](#message-luxir.percentiles) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
-| <a id="field-luxir.searchop.percentile_ranks"></a>[`percentile_ranks`](#field-luxir.searchop.percentile_ranks) | 18 | [`PercentileRanks`](#message-luxir.percentileranks) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
 | <a id="field-luxir.searchop.domain"></a>[`domain`](#field-luxir.searchop.domain) | 20 | [`Domain`](#message-luxir.domain) | singular | optional override of the incoming document domain |
 
 <a id="message-luxir.searchrequest"></a>

@@ -21,9 +21,8 @@ other queries, and a filter uses a query without contributing to the score.
 
 A **search operation** ([`SearchOp`](../reference/protobuf.md#message-luxir.searchop))
 defines what to compute or return:
-`top_docs` returns ranked documents for a query, facets return buckets, `expr_op`,
-`cardinality`, and `percentiles` compute
-[metrics](faceting.md#distinct-counts-and-percentiles), and `fusion` combines ranked lists. A request
+`top_docs` returns ranked documents for a query, facets return buckets, `expr_op` computes
+metrics, and `fusion` combines ranked lists. A request
 ([`SearchRequest`](../reference/protobuf.md#message-luxir.searchrequest))
 contains a map of named operations in `ops`.
 
@@ -580,7 +579,7 @@ With root query shorthand, `found` and `docs` appear in the HTTP envelope;
 the query's sub-operation results appear under `ops` by name. Expression metrics fold `avg`,
 `sum`, `min`, or `max` over value expressions and ignore missing document
 values. Integer results stay integers; averages and floating-point results are
-doubles. An empty metric domain renders as `null` in JSON.
+doubles. These four aggregates render as `null` in JSON for an empty domain.
 
 One request returned the documents, the facet counts for a sidebar, and the
 total for a header. See [Faceting](faceting.md) for

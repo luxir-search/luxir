@@ -306,11 +306,10 @@ Anywhere a query goes, it can be a structured object or an expression string.
   order with zero counts included, daylight-saving changes handled.
 - Nesting: sub-facets under buckets, metrics per bucket, and a ranked
   `top_docs` (or `fusion`) list per bucket, all in one request.
-- Distinct counts (`cardinality`, HyperLogLog with an exact phase) and
-  `percentiles` / `percentile_ranks` (t-digest), at the top level or per bucket.
-- Expression metrics: `avg`, `sum`, `min`, and `max` over value expressions
-  (`sum(price_f * qty_i) / sum(qty_i)`), at query level or per bucket; facets
-  can sort by a named metric.
+- Expression metrics: `avg`, `sum`, `min`, `max`, distinct counts
+  (`cardinality`), `percentile`, and exact `percentile_rank` over value
+  expressions (`sum(price_f * qty_i) / sum(qty_i)`), at query level or per
+  bucket; facets can sort by a named metric.
 - Easy [multi-select navigation](guide/faceting.md#easy-multi-select-with-selected):
   put choices in each facet's `selected` array. Luxir builds the filters and
   automatically counts alternatives with the other facets' selections applied.

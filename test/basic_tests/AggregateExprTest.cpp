@@ -7,6 +7,7 @@
 #include <latch>
 #include <limits>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -394,12 +395,18 @@ TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
 
 TEST_F(AggregateExprTest, cardinalityFlattensValuesAndMapsGlobalOrds) {
   CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
   helper.indexAll({
-      flatdoc("id", "a", "s_ss", vecs("a", "c"), "n_is", vec_i(1, 2), "when_dt", int64_t{10}),
-      flatdoc("id", "b", "s_ss", vecs("c"), "n_is", vec_i(2, 3))}, UpdateMessage::COMMIT);
+      flatdoc("id", "a", "s_ss", vecs("a", "c"), "n_is", vec_i(1, 2), "when_dt", int64_t{10},
+              "s_s", "a", "n_i", 1, "n_d", 1.5),
+      flatdoc("id", "b", "s_ss", vecs("c"), "n_is", vec_i(2, 3),
+              "s_s", "b", "n_i", 2)}, UpdateMessage::COMMIT);
   helper.indexAll({
-      flatdoc("id", "c", "s_ss", vecs("b", "c"), "n_is", vec_i(1, 4), "when_dt", int64_t{20}),
+      flatdoc("id", "c", "s_ss", vecs("b", "c"), "n_is", vec_i(1, 4), "when_dt", int64_t{20},
+              "s_s", "a", "n_i", 1, "n_d", 2.5),
       flatdoc("id", "d")}, UpdateMessage::COMMIT);
+  helper.indexAll({flatdoc("id", "e", "s_ss", vecs("a"), "n_is", vec_i(2),
+                           "s_s", "c", "n_i", 3, "n_d", 1.5)}, UpdateMessage::COMMIT);
   auto req = localReq(helper.getSearchEngine());
   auto& root = req->collection("main");
   root.expr("strings", "cardinality(s_ss)");
@@ -409,17 +416,60 @@ TEST_F(AggregateExprTest, cardinalityFlattensValuesAndMapsGlobalOrds) {
   root.expr("dates", "cardinality(when_dt)");
   root.expr("rank", "percentile_rank(when_dt, 10)");
   root.expr("threshold", "cardinality(n_is, $t)", "t", int64_t{40000});
+  root.expr("single_string", "cardinality(s_s)");
+  root.expr("single_int", "cardinality(n_i)");
+  root.expr("double_values", "cardinality(n_d,10)");
+  auto& selected = root.topDocs("selected").exprQuery("n_i:1").limit(0);
+  selected.expr("strings", "cardinality(s_s)");
+  selected.expr("numbers", "cardinality(n_is)");
   req->execute(-1);
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ(3, req->scalar<int64_t>("strings"));
-  EXPECT_EQ(4, req->scalar<int64_t>("ids"));
+  EXPECT_EQ(5, req->scalar<int64_t>("ids"));
   EXPECT_EQ(4, req->scalar<int64_t>("numbers"));
   EXPECT_EQ(1, req->scalar<int64_t>("computed"));
   EXPECT_EQ(2, req->scalar<int64_t>("dates"));
   EXPECT_DOUBLE_EQ(50, req->scalar<double>("rank"));
   EXPECT_EQ(4, req->scalar<int64_t>("threshold"));
+  EXPECT_EQ(3, req->scalar<int64_t>("single_string"));
+  EXPECT_EQ(3, req->scalar<int64_t>("single_int"));
+  EXPECT_EQ(2, req->scalar<int64_t>("double_values"));
+  EXPECT_EQ(1, req->docList("selected")->ops.at("strings")->asInt());
+  EXPECT_EQ(3, req->docList("selected")->ops.at("numbers")->asInt());
   EXPECT_EQ(0u, req->memoryTracker.bytes());
   EXPECT_GT(req->memoryTracker.peak(), 0u);
+}
+
+TEST_F(AggregateExprTest, cardinalityEstimatesMatchExactRandomSets) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  std::mt19937_64 random(5);
+  std::set<int64_t> users, values;
+  for (int segment = 0; segment < 4; segment++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 6000; i++) {
+      int64_t user = (int64_t)(random() % 20000);
+      int64_t value = (int64_t)(random() % 50000);
+      users.insert(user);
+      values.insert(value);
+      docs.push_back(flatdoc("id", std::to_string(segment * 6000 + i),
+          "user_s", "u" + std::to_string(user), "value_i", value));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  root.expr("users", "cardinality(user_s)");
+  root.expr("numbers", "cardinality(value_i)");
+  root.expr("users_exact", "cardinality(user_s,40000)");
+  root.expr("numbers_exact", "cardinality(value_i,40000)");
+  req->execute(-1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_NEAR((double)users.size(), (double)req->scalar<int64_t>("users"), users.size() * 0.065);
+  EXPECT_NEAR((double)values.size(), (double)req->scalar<int64_t>("numbers"), values.size() * 0.065);
+  EXPECT_EQ((int64_t)users.size(), req->scalar<int64_t>("users_exact"));
+  EXPECT_EQ((int64_t)values.size(), req->scalar<int64_t>("numbers_exact"));
+  EXPECT_EQ(0u, req->memoryTracker.bytes());
 }
 
 TEST_F(AggregateExprTest, sketchRowsSkipNonFiniteValuesAndCanonicalizeZero) {
@@ -639,7 +689,6 @@ TEST_F(AggregateExprTest, cardinalityEstimatorChargesExactAndDenseStorage) {
       EXPECT_NEAR(count, estimate, count * 4.16 / std::sqrt(registers));
     }
     EXPECT_GT(tracker.peak(), (size_t)threshold * sizeof(uint64_t));
-    EXPECT_LE(tracker.peak(), AggregateStateView::bytes(*program) + HyperLogLog::maxBytes(threshold));
     EXPECT_EQ(0u, tracker.bytes());
   }
 }

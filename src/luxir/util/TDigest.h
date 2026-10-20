@@ -29,7 +29,7 @@ namespace luxir {
 //
 // While fewer than bufferLimit() values have been added in total the digest
 // holds them raw and answers exactly: quantile() interpolates linearly
-// between the two closest ranks, and cdf() is the fraction of values <= x.
+// between the two closest ranks.
 // Equal finite inputs have identical bits after normalizing signed zero.
 // Sorting only raw doubles and stably merging fixed runs makes compression
 // independent of the sort implementation.
@@ -57,13 +57,6 @@ public:
     return (size_t)(5.0 * compression);
   }
 
-  // Resident bytes a digest of this compression may hold.
-  static size_t maxBytes(double compression) {
-    size_t limit = bufferLimitFor(compression);
-    return sizeof(TDigest) + 4 * limit * sizeof(double)
-        + 6 * limit * sizeof(Centroid);
-  }
-
   explicit TDigest(double compression = DEFAULT_COMPRESSION,
                    std::pmr::memory_resource* resource = std::pmr::get_default_resource())
       : compression(compression), centroids(resource), buffer(resource), scratch(resource) {
@@ -72,7 +65,7 @@ public:
 
   size_t bufferLimit() const { return bufferLimitFor(compression); }
 
-  // Raw values only: quantiles and ranks are exact.
+  // Raw values only: quantiles are exact.
   bool exact() const { return centroids.empty(); }
 
   double count() const { return centroidWeight + (double)buffer.size(); }
@@ -116,7 +109,7 @@ public:
     compress(other.centroids);
   }
 
-  // Prepare for quantile() and cdf(): fold pending values into the
+  // Prepare for quantile(): fold pending values into the
   // centroids, or sort the raw values of an exact digest.
   void finish() {
     if (exact()) {
@@ -183,59 +176,7 @@ public:
                        (index - weightSoFar) / (c[n - 1].weight / 2.0));
   }
 
-  // Fraction of the values <= x, in [0, 1]. NaN when empty. Call finish()
-  // first.
-  double cdf(double x) const {
-    if (empty()) return std::numeric_limits<double>::quiet_NaN();
-    if (exact()) {
-      assert(sortedBuffer);
-      auto end = std::upper_bound(buffer.begin(), buffer.end(), x);
-      return (double)(end - buffer.begin()) / (double)buffer.size();
-    }
-    assert(buffer.empty());
-    if (x < min) return 0.0;
-    if (x >= max) return 1.0;
-    const auto& c = centroids;
-    const size_t n = c.size();
-    const double total = centroidWeight;
-    if (n == 1) return fractionBetween(min, max, x);
-    if (x < c[0].mean) {
-      // Linear from min (weight 1) to the first centroid's midpoint.
-      double left = 1.0 + fractionBetween(min, c[0].mean, x)
-          * std::max(0.0, c[0].weight / 2.0 - 1.0);
-      return std::min(left, c[0].weight / 2.0) / total;
-    }
-    if (x >= c[n - 1].mean) {
-      double right = max > c[n - 1].mean
-          ? 1.0 + (1.0 - fractionBetween(c[n - 1].mean, max, x))
-              * std::max(0.0, c[n - 1].weight / 2.0 - 1.0)
-          : 0.0;
-      return 1.0 - std::min(right, c[n - 1].weight / 2.0) / total;
-    }
-    double weightSoFar = c[0].weight / 2.0;
-    for (size_t i = 0; i + 1 < n; i++) {
-      if (x < c[i + 1].mean) {
-        double dw = (c[i].weight + c[i + 1].weight) / 2.0;
-        double leftUnit = c[i].weight == 1.0 ? 0.5 : 0.0;
-        double rightUnit = c[i + 1].weight == 1.0 ? 0.5 : 0.0;
-        double fraction = c[i + 1].mean > c[i].mean
-            ? fractionBetween(c[i].mean, c[i + 1].mean, x) : 0.0;
-        double below = weightSoFar + leftUnit
-            + (dw - leftUnit - rightUnit) * fraction;
-        return below / total;
-      }
-      weightSoFar += (c[i].weight + c[i + 1].weight) / 2.0;
-    }
-    return 1.0;
-  }
-
 private:
-  static double fractionBetween(double a, double b, double x) {
-    double span = b - a;
-    if (std::isfinite(span)) return (x - a) / span;
-    return (x / 2.0 - a / 2.0) / (b / 2.0 - a / 2.0);
-  }
-
   static double interpolate(double a, double b, double fraction) {
     return std::lerp(a, b, std::clamp(fraction, 0.0, 1.0));
   }

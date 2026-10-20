@@ -50,15 +50,6 @@ public:
     return std::clamp(p, MIN_PRECISION, MAX_PRECISION);
   }
 
-  // Upper bound on resident bytes for a sketch with this threshold.
-  static size_t maxBytes(int64_t threshold) {
-    // Include spare hash slots, metadata, rehash overlap, and the dense
-    // allocation made before releasing the exact set.
-    size_t exactBytes = (size_t)(threshold + 1) * 4 * (sizeof(uint64_t) + 1) + 256;
-    size_t denseBytes = (size_t)1 << precisionForThreshold(threshold);
-    return sizeof(HyperLogLog) + exactBytes + denseBytes;
-  }
-
   // A 64-bit finalizer (MurmurHash3 fmix64). It is a bijection, so distinct
   // integers keep distinct hashes and the exact phase stays exact.
   static uint64_t mix(uint64_t x) {

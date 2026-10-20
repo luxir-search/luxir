@@ -112,9 +112,6 @@ TEST(TDigest, ExactForSmallInputs) {
   EXPECT_DOUBLE_EQ(50.5, digest.quantile(0.5));
   EXPECT_DOUBLE_EQ(95.05, digest.quantile(0.95));
   EXPECT_DOUBLE_EQ(100.0, digest.quantile(1.0));
-  EXPECT_DOUBLE_EQ(0.5, digest.cdf(50));
-  EXPECT_DOUBLE_EQ(0.0, digest.cdf(0.5));
-  EXPECT_DOUBLE_EQ(1.0, digest.cdf(100));
 
   TDigest one;
   one.add(7.5);
@@ -125,7 +122,6 @@ TEST(TDigest, ExactForSmallInputs) {
   TDigest none;
   none.finish();
   EXPECT_TRUE(std::isnan(none.quantile(0.5)));
-  EXPECT_TRUE(std::isnan(none.cdf(1.0)));
 }
 
 void expectAccurate(TDigest& digest, std::vector<double> data,
@@ -141,11 +137,6 @@ void expectAccurate(TDigest& digest, std::vector<double> data,
     double tolerance = 0.002 + 3.0 * std::sqrt(q * (1.0 - q)) / digest.compression;
     EXPECT_LE(rankError(data, digest.quantile(q), q), tolerance)
         << label << " q=" << q;
-  }
-  for (double q : {0.01, 0.1, 0.5, 0.9, 0.99}) {
-    double x = data[(size_t)(q * (double)(data.size() - 1))];
-    // Any rank inside x's run of equal values is correct.
-    EXPECT_LE(rankError(data, x, digest.cdf(x)), 0.01) << label << " q=" << q;
   }
 }
 
@@ -221,8 +212,6 @@ TEST(TDigest, SingletonCentroidsAndTailBoundaries) {
   EXPECT_DOUBLE_EQ(0, digest.quantile(0));
   EXPECT_DOUBLE_EQ(1.5, digest.quantile(2.0 / 3.0));
   EXPECT_DOUBLE_EQ(2, digest.quantile(1));
-  EXPECT_DOUBLE_EQ(1.0 / 3.0, digest.cdf(0));
-  EXPECT_DOUBLE_EQ(1, digest.cdf(2));
   digest.centroids = {{7.0, 3.0}};
   digest.min = 3;
   digest.max = 9;
@@ -236,11 +225,6 @@ TEST(TDigest, SingletonCentroidsAndTailBoundaries) {
   for (double rank : {10.0, 10.5, 11.0}) {
     EXPECT_DOUBLE_EQ(1, digest.quantile(rank / 21));
   }
-  digest.centroids = {{0, 2}};
-  digest.centroidWeight = 2;
-  digest.min = -std::numeric_limits<double>::max();
-  digest.max = std::numeric_limits<double>::max();
-  EXPECT_DOUBLE_EQ(0.5, digest.cdf(0));
 }
 
 TEST(TDigest, CentroidMergesKeepStableTieOrder) {
@@ -305,7 +289,6 @@ TEST(TDigest, FiniteExtremesDoNotOverflowInterpolation) {
   }
   EXPECT_DOUBLE_EQ(-extreme, compressed.quantile(0));
   EXPECT_DOUBLE_EQ(extreme, compressed.quantile(1));
-  EXPECT_NEAR(0.5, compressed.cdf(0), 0.02);
 }
 
 } // namespace

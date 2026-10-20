@@ -20,7 +20,6 @@
 #include "luxir/search/ops/FacetOp.h"
 #include "luxir/search/ops/StrFacetOp.h"
 #include "luxir/search/ops/ExprStatsOp.h"
-#include "luxir/search/ops/SketchOps.h"
 #include "luxir/search/ops/FusionOp.h"
 #include "luxir/search/ops/TopDocsReq.h"
 #include "luxir/query/AllQuery.h"
@@ -439,116 +438,8 @@ public:
         auto fields = resolveAggregateFields(*program, req.requestPool, *req.reader);
         return luxir::arenaCreate<ExprStatsOp>(req.arena, req, name, *program, fields);
       },
-      [&](const luxir::api::Cardinality& cardinality) -> SearchOp* {
-        return parseCardinality(name, cardinality);
-      },
-      [&](const luxir::api::Percentiles& percentiles) -> SearchOp* {
-        std::vector<double> percents(percentiles.percents.begin(),
-                                     percentiles.percents.end());
-        if (percents.empty()) percents = {1, 5, 25, 50, 75, 95, 99};
-        for (double percent : percents) {
-          if (!(percent >= 0.0 && percent <= 100.0)) {
-            throw std::runtime_error("percentiles '" + std::string(name)
-                + "': percents must be in [0, 100]");
-          }
-        }
-        return parsePercentiles(name, "percentiles", percentiles.field,
-                                std::move(percents), percentiles.compression,
-                                percentiles.keyed, false);
-      },
-      [&](const luxir::api::PercentileRanks& ranks) -> SearchOp* {
-        std::vector<double> values(ranks.values.begin(), ranks.values.end());
-        if (values.empty()) {
-          throw std::runtime_error("percentile_ranks '" + std::string(name)
-              + "': values are required");
-        }
-        for (double value : values) {
-          if (!std::isfinite(value)) {
-            throw std::runtime_error("percentile_ranks '" + std::string(name)
-                + "': values must be finite");
-          }
-        }
-        return parsePercentiles(name, "percentile_ranks", ranks.field,
-                                std::move(values), ranks.compression,
-                                ranks.keyed, true);
-      },
       [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
     }, searchOp.kind);
-  }
-
-  // Resolve a sketch metric's field through its value binding and check its
-  // type against `allowed`.
-  const ResolvedFieldHandle& resolveSketchField(
-      std::string_view name, std::string_view kind, std::string_view field,
-      std::initializer_list<FieldType::Type> allowed,
-      std::string_view allowedText) {
-    std::string context = std::string(kind) + " '" + std::string(name) + "'";
-    if (field.empty()) {
-      throw std::runtime_error(context + ": field is required");
-    }
-    const auto& target = fields.resolve(field, OpClass::VALUE, context);
-    auto type = target.fieldType->type();
-    if (std::find(allowed.begin(), allowed.end(), type) == allowed.end()) {
-      throw std::runtime_error(context + ": field '" + std::string(field)
-          + "' must be " + std::string(allowedText));
-    }
-    if (!target.fieldType->hasColumn()) {
-      throw std::runtime_error(context + ": field '" + std::string(field)
-          + "' has no column");
-    }
-    if ((type == FieldType::STRING || type == FieldType::ID)
-        && !target.fieldType->indexed()) {
-      throw std::runtime_error(context + ": field '" + std::string(field)
-          + "' is column-only (not indexed); string values are counted "
-            "from indexed terms");
-    }
-    return target;
-  }
-
-  SearchOp* parseCardinality(std::string_view name,
-                             const api::Cardinality& cardinality) {
-    const auto& target = resolveSketchField(
-        name, "cardinality", cardinality.field,
-        {FieldType::STRING, FieldType::ID, FieldType::INT, FieldType::FLOAT,
-         FieldType::DOUBLE, FieldType::DATE},
-        "a STRING, ID, INT, FLOAT, DOUBLE, or DATE field");
-    int64_t threshold = cardinality.precision_threshold.value_or(
-        HyperLogLog::DEFAULT_PRECISION_THRESHOLD);
-    if (threshold < 0 || threshold > HyperLogLog::MAX_PRECISION_THRESHOLD) {
-      throw std::runtime_error("cardinality '" + std::string(name)
-          + "': precision_threshold must be in [0, "
-          + std::to_string(HyperLogLog::MAX_PRECISION_THRESHOLD) + "]");
-    }
-    auto field = api::build::arenaStr(req.requestPool, target.physicalName);
-    return luxir::arenaCreate<CardinalityOp>(
-        req.arena, req, name, field, target.fieldType->type(), threshold);
-  }
-
-  SearchOp* parsePercentiles(std::string_view name, std::string_view kind,
-                             std::string_view fieldName,
-                             std::vector<double> points,
-                             std::optional<double> compressionParam,
-                             std::optional<bool> keyed, bool ranks) {
-    const auto& target = resolveSketchField(
-        name, kind, fieldName,
-        {FieldType::INT, FieldType::FLOAT, FieldType::DOUBLE, FieldType::DATE},
-        "an INT, FLOAT, DOUBLE, or DATE field");
-    double compression = compressionParam.value_or(TDigest::DEFAULT_COMPRESSION);
-    if (!(compression >= TDigest::MIN_COMPRESSION
-          && compression <= TDigest::MAX_COMPRESSION)) {
-      throw std::runtime_error(std::string(kind) + " '" + std::string(name)
-          + "': compression must be in [20, 1000]");
-    }
-    std::vector<double> sorted = points;
-    std::sort(sorted.begin(), sorted.end());
-    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
-      throw std::runtime_error(std::string(kind) + " '" + std::string(name)
-          + "': " + (ranks ? "values" : "percents") + " must be distinct");
-    }
-    auto field = api::build::arenaStr(req.requestPool, target.physicalName);
-    return luxir::arenaCreate<PercentilesOp>(
-        req.arena, req, name, field, target.fieldType->type(),
-        std::move(points), compression, ranks, keyed.value_or(true));
   }
 
   template<typename Facet>
