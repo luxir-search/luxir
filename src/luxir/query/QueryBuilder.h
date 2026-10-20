@@ -298,6 +298,22 @@ private:
     return term->data() == scratch.data() ? poolCopy(*term) : *term;
   }
 
+  // Analyzer buffers are borrowed until the next pull. Fitted term bytes
+  // belong to the pool; the returned vector only owns their views.
+  std::vector<std::string_view> analyzeText(const ResolvedFieldHandle& target,
+                                           std::string_view text) {
+    TokenChain& tc = *fields.chain(target);
+    Token& tok = tc.head.getToken();
+    TokenStream& tail = *tc.tail;
+    std::vector<std::string_view> terms;
+    tc.head.setValue(text);
+    tc.reset();
+    while (tail.incrementToken()) {
+      terms.push_back(poolCopy(fitTerm(target, tok.text)));
+    }
+    return terms;
+  }
+
   // Collapse a term list into the right query type:
   //   0 terms -> match nothing (a phrase with no terms cannot match, and
   //              PhraseQuery itself requires >= 2 terms)
@@ -752,57 +768,28 @@ public:
   // k <= 1 builds a disjunction, k >= N a conjunction, and the middle a
   // min-should-match boolean.
   Query* createMatchQuery(std::string_view field, std::string_view value,
-                          Operator op = Operator::OR, int minMatch = 0) {
-    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), value, op, minMatch);
+                          Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f) {
+    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), value, op, minMatch, boost);
   }
 
   Query* createMatchQuery(const ResolvedFieldHandle& target, std::string_view value,
-                          Operator op = Operator::OR, int minMatch = 0) {
+                          Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
       case FieldType::Type::TEXT: {
-        auto* chain = fields.chain(target);
-        TokenChain& tc = *chain;
-        Token& tok = tc.head.getToken();
-        TokenStream& tail = *tc.tail;
-
-        std::vector<std::string_view> terms;
-        tc.head.setValue(value);
-        tc.reset();
-        while (tail.incrementToken()) {
-          // Analyzer buffers are borrowed until the next pull.
-          terms.push_back(poolCopy(fitTerm(target, tok.text)));
-        }
-
-        if (terms.empty()) {
-          return matchNoDocs();
-        }
-        if (terms.size() == 1) {
-          return pool.make<TermQuery>(field, terms[0]);
-        }
+        auto terms = analyzeText(target, value);
+        if (terms.empty()) return matchNoDocs();
+        if (terms.size() == 1) return pool.make<TermQuery>(field, terms[0], boost);
         auto clauses = pool.make_span<Query*>(terms.size());
         for (size_t i = 0; i < terms.size(); i++) {
-          clauses[i] = pool.make<TermQuery>(field, terms[i]);
+          clauses[i] = pool.make<TermQuery>(field, terms[i], boost);
         }
-        int n = (int)terms.size();
-        int k = minMatch > 0 ? minMatch : (op == Operator::AND ? n : 1);
-        // BooleanQuery dedups after this k decision. For k <= 1, SHOULD
-        // dedup is safe; for k >= n the conjunction arm stores no k; for the
-        // middle min-should-match arm the ctor's msm > 1 guard preserves
-        // duplicate scorer instances.
-        std::span<Query*> none{};
-        if (k >= n) {
-          return pool.make<BooleanQuery>(clauses, none, none, none);  // conjunction (all)
-        }
-        if (k <= 1) {
-          return pool.make<BooleanQuery>(none, clauses, none, none);  // disjunction (any)
-        }
-        return pool.make<BooleanQuery>(none, clauses, none, none, k);  // min-should-match
+        return combineAnalyzedClauses(clauses, op, minMatch);
       }
       case FieldType::Type::STRING:
       case FieldType::Type::ID:
-        return pool.make<TermQuery>(field, normalizeLiteral(target, value, true));
+        return pool.make<TermQuery>(field, normalizeLiteral(target, value, true), boost);
       case FieldType::Type::INT:
       case FieldType::Type::FLOAT:
       case FieldType::Type::DOUBLE:
@@ -812,7 +799,8 @@ public:
         if (value.empty()) return matchNoDocs();
         luxir::api::Val v;
         v.kind = value;  // string arm; coerceColInt64 parses per the field type
-        return createRangeQuery(target, &v, nullptr, &v, nullptr);
+        Query* query = createRangeQuery(target, &v, nullptr, &v, nullptr);
+        return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
       }
       default:
         throw std::runtime_error(std::format("Match query on unsupported field type: {}", field));
@@ -864,11 +852,15 @@ public:
 
   // Combine analyzed-term clauses the way match does: OR, AND, or
   // min-should-match over the term clauses.
-  Query* combineTermClauses(std::span<Query*> clauses, Operator op, int minMatch) {
+  Query* combineAnalyzedClauses(std::span<Query*> clauses, Operator op, int minMatch) {
     if (clauses.empty()) return matchNoDocs();
     if (clauses.size() == 1) return clauses[0];
     int n = (int)clauses.size();
     int k = minMatch > 0 ? minMatch : (op == Operator::AND ? n : 1);
+    // BooleanQuery dedups after this k decision. For k <= 1, SHOULD
+    // dedup is safe; for k >= n the conjunction arm stores no k; for the
+    // middle min-should-match arm the ctor's msm > 1 guard preserves
+    // duplicate scorer instances.
     std::span<Query*> none{};
     if (k >= n) return pool.make<BooleanQuery>(clauses, none, none, none);
     if (k <= 1) return pool.make<BooleanQuery>(none, clauses, none, none);
@@ -904,15 +896,7 @@ public:
         weights[at] = std::max(weights[at], wf.boost);
         continue;
       }
-      TokenChain& tc = *fields.chain(target);
-      Token& tok = tc.head.getToken();
-      TokenStream& tail = *tc.tail;
-      std::vector<std::string_view> terms;
-      tc.head.setValue(text);
-      tc.reset();
-      while (tail.incrementToken()) {
-        terms.push_back(poolCopy(fitTerm(target, tok.text)));
-      }
+      auto terms = analyzeText(target, text);
       physical.push_back(poolCopy(target.physicalName));
       weights.push_back(wf.boost);
       analyzed.push_back(std::move(terms));
@@ -954,7 +938,7 @@ public:
                   std::span<const std::string_view>(fieldSpan),
                   std::span<const float>(weightSpan), g.terms[t]);
       }
-      groupQueries.push_back(combineTermClauses(clauses, op, minMatch));
+      groupQueries.push_back(combineAnalyzedClauses(clauses, op, minMatch));
     }
     if (groupQueries.empty()) return matchNoDocs();
     if (groupQueries.size() == 1) return groupQueries[0];
@@ -969,9 +953,8 @@ public:
                                std::string_view text, Operator op, int minMatch) {
     auto clauses = pool.make_span<Query*>(requested.size());
     for (size_t i = 0; i < requested.size(); i++) {
-      Query* match = createMatchQuery(requested[i].name, text, op, minMatch);
-      clauses[i] = requested[i].boost == 1.0f
-          ? match : pool.make<BoostQuery>(match, requested[i].boost);
+      clauses[i] = createMatchQuery(
+          requested[i].name, text, op, minMatch, requested[i].boost);
     }
     if (clauses.size() == 1) return clauses[0];
     std::span<Query*> none{};
