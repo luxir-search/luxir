@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Exercise the real CMake/Ninja build in disposable Git repositories.
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+source = Path(__file__).resolve().parents[1]
+with tempfile.TemporaryDirectory(prefix='luxir-build-info-test-') as temporary:
+    base = Path(temporary)
+    repo = base / 'repo'
+    repo.mkdir()
+
+    def run(*args, cwd=repo):
+        p = subprocess.run(args, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if p.returncode:
+            raise RuntimeError(f'{args}:\n{p.stdout}')
+        return p.stdout.strip()
+
+    for name in ('BuildInfo.cmake', 'BuildInfo.cpp.in'):
+        shutil.copy(source / 'cmake' / name, repo / name)
+    (repo / 'luxir').mkdir()
+    shutil.copy(source / 'src/luxir/BuildInfo.h', repo / 'luxir/BuildInfo.h')
+    (repo / 'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.25)
+    project(BuildMetadata VERSION 1.2.3 LANGUAGES CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(_luxir_cpu_name test)
+    include(BuildInfo.cmake)
+    add_executable(info main.cpp "${CMAKE_CURRENT_BINARY_DIR}/BuildInfo.cpp")
+    target_include_directories(info PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    ''')
+    (repo / 'main.cpp').write_text('#include "luxir/BuildInfo.h"\n#include <iostream>\nint main() { const auto& b = luxir::buildInfo(); std::cout << b.version << " " << b.sourceCommit << " " << b.cpuTarget; }\n')
+    run('git', 'init', '-b', 'main')
+    run('git', 'config', 'user.email', 'test@example.invalid')
+    run('git', 'config', 'user.name', 'Build metadata test')
+    run('git', 'add', '.')
+    run('git', 'commit', '-m', 'initial fixture')
+    first = run('git', 'rev-parse', 'HEAD')
+
+    def configure(tree, build, *extra):
+        run('cmake', '-G', 'Ninja', '-S', str(tree), '-B', str(build), *extra)
+
+    def check(tree, build, expected):
+        run('cmake', '--build', str(build), cwd=tree)
+        assert run(str(build / 'info')) == f'1.2.3 {expected} test'
+
+    build = base / 'build'
+    configure(repo, build)
+    check(repo, build, first)
+    mtime = (build / 'info').stat().st_mtime_ns
+    check(repo, build, first)
+    assert (build / 'info').stat().st_mtime_ns == mtime, 'unchanged build relinked'
+    run('git', 'commit', '--allow-empty', '-m', 'next fixture')
+    second = run('git', 'rev-parse', 'HEAD')
+    check(repo, build, second)
+    run('git', 'checkout', '--detach', first)
+    check(repo, build, first)
+    run('git', 'checkout', 'main')
+    check(repo, build, second)
+    run('git', 'pack-refs', '--all', '--prune')
+    check(repo, build, second)
+    run('git', 'commit', '--allow-empty', '-m', 'after packed refs')
+    third = run('git', 'rev-parse', 'HEAD')
+    check(repo, build, third)
+    worktree = base / 'worktree'
+    run('git', 'worktree', 'add', '-b', 'linked', str(worktree))
+    workbuild = base / 'workbuild'
+    configure(worktree, workbuild)
+    check(worktree, workbuild, third)
+    run('git', 'commit', '--allow-empty', '-m', 'linked commit', cwd=worktree)
+    check(worktree, workbuild, run('git', 'rev-parse', 'HEAD', cwd=worktree))
+    archive = base / 'archive'
+    shutil.copytree(repo, archive, ignore=shutil.ignore_patterns('.git'))
+    archivebuild = base / 'archivebuild'
+    configure(archive, archivebuild)
+    check(archive, archivebuild, 'unknown')
+    configure(archive, archivebuild, f'-DLUXIR_SOURCE_COMMIT={third}')
+    check(archive, archivebuild, third)
+    p = subprocess.run(['cmake', '-S', str(archive), '-B', str(archivebuild), '-DLUXIR_SOURCE_COMMIT=bad'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    assert p.returncode and 'must be a full Git commit hash' in p.stdout
+    print('PASS: unchanged builds, commits, detached HEAD, branch switches, packed refs, linked worktrees, archive fallback, override, and invalid hash rejection')
