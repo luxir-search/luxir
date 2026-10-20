@@ -15,6 +15,8 @@
 #include <google/protobuf/arena.h>
 
 #include "luxir/util/proto.h"
+#include "luxir/reader/OrdColReader.h"
+#include "luxir/search/OrdMap.h"
 #include "luxir/value/ValueExpr.h"
 
 namespace luxir {
@@ -87,7 +89,9 @@ struct AggregateConstant {
 
 struct AggregateStateOps {
   using Init = void (*)(void* state,
-                        std::span<const AggregateConstant> arguments);
+                        std::span<const AggregateConstant> arguments,
+                        std::pmr::memory_resource* resource);
+  using Destroy = void (*)(void* state) noexcept;
   using Accumulate = void (*)(void* state, const ValueResult& value,
                               std::span<const AggregateConstant> arguments);
   using AccumulateBatch = void (*)(
@@ -120,6 +124,10 @@ struct AggregateStateOps {
   Merge merge = nullptr;
   Finish finish = nullptr;
   AccumulateKeyedRawBatch accumulateKeyedRawBatch = nullptr;
+  Destroy destroy = nullptr;
+  bool inlineCapable = true;
+  bool replayCapable = true;
+  bool orderSensitive = false;
 };
 
 // Optional packed state for a bare, single-valued column that is present on
@@ -190,6 +198,7 @@ public:
   std::pmr::vector<AggregateLeaf> leaves;
   uint32_t rootNode = 0;
   uint32_t stateBytes = 0;
+  bool hasIndirectStates = false;
 
   explicit AggregateProgram(google::protobuf::Arena& arena)
       : resource(&arena), nodes(&resource), leaves(&resource) {}
@@ -233,7 +242,10 @@ public:
     return (uint32_t)sizeof(AggregateFailure) + program.stateBytes;
   }
 
-  void init();
+  // Init rolls back completed leaves on failure; each leaf init must itself
+  // leave no resources behind when it throws.
+  void init(std::pmr::memory_resource* resource = nullptr);
+  void destroy() noexcept;
   void add(uint32_t leaf, const ValueResult& value);
   void addBatch(uint32_t leaf, std::span<const ScalarValueResult> values);
   void addRawBatch(uint32_t leaf, std::span<const int64_t> values,
@@ -253,7 +265,11 @@ public:
   int64_t releaseCount = 0;
 
   AggregateAccumulator() = default;
-  explicit AggregateAccumulator(const AggregateProgram& program);
+  explicit AggregateAccumulator(const AggregateProgram& program,
+      std::pmr::memory_resource* resource = nullptr);
+  ~AggregateAccumulator();
+  AggregateAccumulator(const AggregateAccumulator&) = delete;
+  AggregateAccumulator& operator=(const AggregateAccumulator&) = delete;
 
   void add(uint32_t leaf, const ValueResult& value);
   void addBatch(uint32_t leaf, std::span<const ScalarValueResult> values);
@@ -272,15 +288,53 @@ void writeAggregateValue(api::Val& target, const BucketScalar& value);
 struct BoundAggregateInput {
   BoundValueProgram* values = nullptr;
   const AggregateLeaf* leaf = nullptr;
+  OrdColReader* ordColumn = nullptr;
+  OrdColReader::Iterator* ordIterator = nullptr;
+  OrdMap::SegToGlobal ordMapping;
   IntColReader::BulkIterator* columnIterator = nullptr;
   AggregateStateOps::AccumulateRawPoint accumulateRawPoint = nullptr;
   std::span<const AggregateConstant> arguments;
   uint32_t leafStateOffset = 0;
   uint32_t leafIndex = 0;
   FieldType::Type columnType = FieldType::NONE;
+  bool columnScan = false;
   bool bareColumn = false;
 
+  bool scalar() const {
+    return leaf->input->root().type != ValueType::COLUMN_ONLY
+        && !valueArray(leaf->input->root().type);
+  }
+
+  template <typename Consume>
+  void forEachValue(int32_t docid, Consume&& consume) {
+    if (leaf->input->root().type == ValueType::COLUMN_ONLY) {
+      if (ordIterator == nullptr) return;
+      if (ordIterator->docId() < docid) ordIterator->advance(docid);
+      if (ordIterator->docId() != docid) return;
+      auto add = [&](int32_t stored) {
+        if (stored != 0) consume(ValueResult::integer(ordMapping.globalOrd(stored - 1)));
+      };
+      if (ordColumn->multiValued()) {
+        auto [start, end] = ordColumn->getStartEndValueRank(ordIterator->rank());
+        for (int64_t i = start; i < end; i++) add(ordIterator->values().valueAt(i));
+      } else {
+        add(ordIterator->value());
+      }
+      return;
+    }
+    ValueResult value = evalPoint(docid);
+    if (!value.valid) return;
+    if (valueArray(value.type)) {
+      for (int64_t i = 0; i < value.array.size; i++) {
+        consume(values->evalArrayElement(value.array, i));
+      }
+    } else {
+      consume(value);
+    }
+  }
+
   bool readRawPoint(int32_t docid, int64_t& raw) {
+    assert(bareColumn && scalar());
     if (columnIterator == nullptr) return false;
     IntColReader::BulkIterator& iterator = *columnIterator;
     if (iterator.docId() < docid) iterator.advance(docid);
@@ -299,6 +353,7 @@ struct BoundAggregateInput {
   }
 
   void accumulatePoint(void* aggregateState, int32_t docid) {
+    assert(scalar());
     void* leafState = static_cast<std::byte*>(aggregateState)
         + leafStateOffset;
     if (bareColumn) {
@@ -323,11 +378,17 @@ struct BoundAggregateInput {
 
 };
 
-std::span<const ValueFieldInfos> resolveAggregateFields(
+struct AggregateFieldInfos {
+  ValueFieldInfos values;
+  // Borrowed from the reader's field cache, pinned by the request reader.
+  const OrdMap* ords = nullptr;
+};
+
+std::span<const AggregateFieldInfos> resolveAggregateFields(
     const AggregateProgram& program, MemPool& pool, IndexReader& reader);
 
 std::vector<BoundAggregateInput> bindAggregateInputs(
     const AggregateProgram& program, MemPool& pool,
-    IndexReader::Segment& segment, std::span<const ValueFieldInfos> fields);
+    IndexReader::Segment& segment, std::span<const AggregateFieldInfos> fields);
 
 } // namespace luxir

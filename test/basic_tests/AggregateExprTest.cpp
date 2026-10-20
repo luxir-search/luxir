@@ -13,6 +13,8 @@
 #include "luxir/search/ops/ExprStatsOp.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/value/AggregateExprParser.h"
+#include "luxir/util/HyperLogLog.h"
+#include "luxir/server/JsonRequest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -335,10 +337,11 @@ TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
   ArenaOwner memory;
   for (const AggregateFunction& function : AggregateFunctionRegistry::entries()) {
     EXPECT_NE(nullptr, function.resolve) << function.name;
-    EXPECT_EQ(1, function.minArguments) << function.name;
-    EXPECT_EQ(1, function.maxArguments) << function.name;
+    EXPECT_LE(1, function.minArguments) << function.name;
+    EXPECT_GE(function.maxArguments, function.minArguments) << function.name;
     AggregateProgram* program = parseAggregate(
-        memory, *schema, std::string(function.name) + "(price_i)");
+        memory, *schema, std::string(function.name)
+            + (function.minArguments == 2 ? "(price_i, 5)" : "(price_i)"));
     ASSERT_EQ(1u, program->leaves.size());
     const AggregateStateOps& state = program->leaves[0].resolved.state;
     EXPECT_GT(state.bytes, 0u) << function.name;
@@ -366,6 +369,445 @@ TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
     ASSERT_NE(nullptr, function) << name;
     EXPECT_EQ(nullptr, function->evalBucketScalar) << name;
   }
+}
+
+TEST_F(AggregateExprTest, cardinalityFlattensValuesAndMapsGlobalOrds) {
+  CollectionHelper helper;
+  helper.indexAll({
+      flatdoc("id", "a", "s_ss", vecs("a", "c"), "n_is", vec_i(1, 2), "when_dt", int64_t{10}),
+      flatdoc("id", "b", "s_ss", vecs("c"), "n_is", vec_i(2, 3))}, UpdateMessage::COMMIT);
+  helper.indexAll({
+      flatdoc("id", "c", "s_ss", vecs("b", "c"), "n_is", vec_i(1, 4), "when_dt", int64_t{20}),
+      flatdoc("id", "d")}, UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  root.expr("strings", "cardinality(s_ss)");
+  root.expr("ids", "cardinality(id)");
+  root.expr("numbers", "cardinality(n_is)");
+  root.expr("computed", "cardinality(n_is * 0)");
+  root.expr("dates", "cardinality(when_dt)");
+  root.expr("rank", "percentile_rank(when_dt, 10)");
+  root.expr("threshold", "cardinality(n_is, $t)", "t", int64_t{40000});
+  req->execute(-1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(3, req->scalar<int64_t>("strings"));
+  EXPECT_EQ(4, req->scalar<int64_t>("ids"));
+  EXPECT_EQ(4, req->scalar<int64_t>("numbers"));
+  EXPECT_EQ(1, req->scalar<int64_t>("computed"));
+  EXPECT_EQ(2, req->scalar<int64_t>("dates"));
+  EXPECT_DOUBLE_EQ(50, req->scalar<double>("rank"));
+  EXPECT_EQ(4, req->scalar<int64_t>("threshold"));
+  EXPECT_EQ(0u, req->memoryTracker.bytes());
+  EXPECT_GT(req->memoryTracker.peak(), 0u);
+}
+
+TEST_F(AggregateExprTest, sketchRowsSkipNonFiniteValuesAndCanonicalizeZero) {
+  CollectionHelper helper;
+  double nan = std::numeric_limits<double>::quiet_NaN();
+  double inf = std::numeric_limits<double>::infinity();
+  for (double x : {-0.0, 0.0, 7.0, nan, inf, -inf}) {
+    helper.index(flatdoc("id", std::to_string(std::bit_cast<uint64_t>(x)),
+                         "x_d", x, "x_f", (float)x), UpdateMessage::NO_COMMIT);
+  }
+  helper.commit();
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  root.expr("d", "cardinality(x_d)");
+  root.expr("f", "cardinality(x_f)");
+  root.expr("r", "percentile_rank(x_d, 0)");
+  root.expr("rf", "percentile_rank(x_f, 0)");
+  root.expr("expr", "cardinality(def(other_d, x_d))");
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(2, req->scalar<int64_t>("d"));
+  EXPECT_EQ(2, req->scalar<int64_t>("f"));
+  EXPECT_EQ(2, req->scalar<int64_t>("expr"));
+  EXPECT_DOUBLE_EQ(100.0 * (2.0 / 3.0), req->scalar<double>("r"));
+  EXPECT_DOUBLE_EQ(100.0 * (2.0 / 3.0), req->scalar<double>("rf"));
+  EXPECT_TRUE(req->respWarnings().empty());
+}
+
+TEST_F(AggregateExprTest, exactRanksKeepMixedNumericComparisonsExact) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  struct Example { std::string_view expression; ValueResult value; double expected; };
+  for (const auto& example : {
+      Example{"percentile_rank(x_i, 9007199254740992.0)", ValueResult::integer(9007199254740993LL), 0},
+      Example{"percentile_rank(x_i, 9007199254740993)", ValueResult::integer(9007199254740993LL), 100},
+      Example{"percentile_rank(x_i, 9223372036854775808.0)", ValueResult::integer(INT64_MAX), 100},
+      Example{"percentile_rank(x_i, -9223372036854775808.0)", ValueResult::integer(INT64_MIN), 100},
+      Example{"percentile_rank(x_i, -1.5)", ValueResult::integer(-1), 0},
+      Example{"percentile_rank(x_d, 9223372036854775807)", ValueResult::floating(0x1p63), 0},
+      Example{"percentile_rank(x_d, -9223372036854775808)", ValueResult::floating(-0x1p63), 100},
+      Example{"percentile_rank(x_d, 9007199254740993)", ValueResult::floating(9007199254740992.0), 100},
+      Example{"percentile_rank(x_f, 0.1)", ValueResult::floating((double)0.1f), 100},
+      Example{"percentile_rank(x_f + 0, 0.1)", ValueResult::floating((double)0.1f), 0}}) {
+    auto* program = parseAggregate(memory, *schema, example.expression);
+    AggregateAccumulator accumulator(*program);
+    accumulator.add(0, example.value);
+    EXPECT_DOUBLE_EQ(example.expected, accumulator.finish().doubleValue) << example.expression;
+  }
+  auto* program = parseAggregate(memory, *schema, "percentile_rank(x_i, 5)");
+  AggregateAccumulator overflow(*program);
+  overflow.add(0, ValueResult::integer(5));
+  for (int i = 0; i < 64; i++) AggregateAccumulator::merge(&overflow, &overflow);
+  EXPECT_EQ(AggregateFailure::COUNT_OVERFLOW, overflow.finish().failure);
+  std::vector<int64_t> raw;
+  std::vector<ScalarValueResult> values;
+  for (int i = 0; i < 2000; i++) {
+    raw.push_back(i % 10);
+    values.push_back(ScalarValueResult::integer(i % 10));
+  }
+  AggregateAccumulator batch(*program), column(*program);
+  batch.addBatch(0, values);
+  column.addRawBatch(0, raw, FieldType::INT);
+  AggregateAccumulator::merge(&batch, &column);
+  EXPECT_DOUBLE_EQ(60, batch.finish().doubleValue);
+}
+
+TEST_F(AggregateExprTest, floatRankThresholdMatchesRangeCoercion) {
+  CollectionHelper helper;
+  helper.indexAll({flatdoc("id", "1", "x_f", 0.1f),
+                   flatdoc("id", "2", "x_f", 0.2f)}, UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  root.topDocs("q").exprQuery("x_f:[* TO 0.1]").countLimit().limit(0);
+  root.expr("bare", "percentile_rank(x_f, 0.1)");
+  root.expr("variable", "percentile_rank(x_f, $v)", "v", 0.1);
+  root.expr("computed", "percentile_rank(x_f + 0, 0.1)");
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1, req->getMatchCount());
+  EXPECT_DOUBLE_EQ(50, req->scalar<double>("bare"));
+  EXPECT_DOUBLE_EQ(50, req->scalar<double>("variable"));
+  EXPECT_DOUBLE_EQ(0, req->scalar<double>("computed"));
+}
+
+TEST_F(AggregateExprTest, podProgramsKeepUnchargedAccumulatorStorage) {
+  CollectionHelper helper;
+  helper.indexAll({flatdoc("id", "1", "x_i", 10),
+                   flatdoc("id", "2", "x_i", 20)}, UpdateMessage::COMMIT);
+  auto guard = facetAggregateOverrides();
+  forcedRequestMemoryMaxBytes = 1;
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  root.expr("existing", "sum(x_i) + avg(x_i) + min(x_i) + max(x_i)");
+  root.expr("rank", "percentile_rank(x_i, 10)");
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_DOUBLE_EQ(75, req->scalar<double>("existing"));
+  EXPECT_DOUBLE_EQ(50, req->scalar<double>("rank"));
+  EXPECT_EQ(0u, req->memoryTracker.peak());
+}
+
+TEST_F(AggregateExprTest, cardinalityAndRanksPreserveInt64ColumnValues) {
+  CollectionHelper helper;
+  helper.indexAll({flatdoc("id", "1", "x_i", 9007199254740992LL),
+                   flatdoc("id", "2", "x_i", 9007199254740993LL),
+                   flatdoc("id", "3", "x_i", INT64_MAX)}, UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  root.expr("c", "cardinality(x_i)");
+  root.expr("r", "percentile_rank(x_i,9007199254740992.0)");
+  root.expr("computed", "percentile_rank(x_i + 0,9007199254740993)");
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(3, req->scalar<int64_t>("c"));
+  EXPECT_DOUBLE_EQ(100.0 / 3, req->scalar<double>("r"));
+  EXPECT_DOUBLE_EQ(100.0 * (2.0 / 3), req->scalar<double>("computed"));
+}
+
+TEST_F(AggregateExprTest, sketchRowsValidateArgumentsCapabilitiesAndEmptyResults) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  for (std::string_view expression : {"cardinality(x_i, -1)", "cardinality(x_i, 40001)",
+                                     "cardinality(x_i, 1.5)"}) {
+    expectParseError(memory, *schema, expression, "integer in [0, 40000]");
+  }
+  expectParseError(memory, *schema, "cardinality(x_sc)", "indexed STRING or ID");
+  expectParseError(memory, *schema, "cardinality(x_t)", "TEXT");
+  expectParseError(memory, *schema, "cardinality(x_i, x_i)", "numeric constants");
+  expectParseError(memory, *schema, "percentile_rank(x_is, 1)", "one scalar per document");
+  expectParseError(memory, *schema, "percentile_rank(x_s, 1)", "numeric expression");
+  expectParseError(memory, *schema, "percentile_rank(x_i, 1, 2)", "arguments");
+  auto* cardinality = parseAggregate(memory, *schema, "cardinality(x_i, 0)");
+  EXPECT_FALSE(cardinality->leaves[0].resolved.state.inlineCapable);
+  EXPECT_NE(nullptr, cardinality->leaves[0].resolved.state.destroy);
+  EXPECT_EQ(0, (int64_t)AggregateAccumulator(*cardinality).finish().intValue);
+  auto* rank = parseAggregate(memory, *schema, "percentile_rank(x_i, 1)");
+  EXPECT_TRUE(rank->leaves[0].resolved.state.inlineCapable);
+  EXPECT_FALSE(AggregateAccumulator(*rank).finish().valid);
+  EXPECT_FALSE(parseAggregate(memory, *schema, "sum(x_d)")->leaves[0].resolved.state.orderSensitive);
+  EXPECT_FALSE(parseAggregate(memory, *schema, "sum(x_i)")->leaves[0].resolved.state.orderSensitive);
+}
+
+TEST_F(AggregateExprTest, indirectStatesReleaseFailedAddsAndMerges) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  auto* two = parseAggregate(memory, *schema, "cardinality(x_i) + cardinality(x_i)");
+  RequestMemTracker small(sizeof(HyperLogLog));
+  RequestMemResource initResource(small, "test aggregates");
+  {
+    AggregateAccumulator accumulator(*two, &initResource);
+    EXPECT_EQ(0u, small.bytes());
+    EXPECT_THROW(accumulator.add(0, ValueResult::integer(1)), ResourceExhaustedError);
+    EXPECT_EQ(sizeof(HyperLogLog), small.bytes());
+    EXPECT_THROW(accumulator.add(1, ValueResult::integer(1)), ResourceExhaustedError);
+  }
+  EXPECT_EQ(0u, small.bytes());
+  auto* program = parseAggregate(memory, *schema, "cardinality(x_i, 1)");
+  RequestMemTracker tracker(4096);
+  RequestMemResource resource(tracker, "test aggregates");
+  {
+    AggregateAccumulator left(*program, &resource), right(*program, &resource);
+    left.add(0, ValueResult::integer(1));
+    right.add(0, ValueResult::integer(2));
+    size_t reserved = tracker.ceiling() - tracker.bytes();
+    tracker.charge(reserved, "test aggregates", "other live state");
+    EXPECT_THROW(AggregateAccumulator::merge(&left, &right), ResourceExhaustedError);
+    tracker.release(reserved);
+    left.fail(AggregateFailure::VALUE_EVALUATION);
+  }
+  EXPECT_EQ(0u, tracker.bytes());
+}
+
+TEST_F(AggregateExprTest, emptyCardinalityStatesDoNotAllocate) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  auto* program = parseAggregate(memory, *schema, "cardinality(x_i)");
+  RequestMemTracker tracker(0);
+  RequestMemResource resource(tracker, "cardinality");
+  {
+    AggregateAccumulator empty(*program, &resource), other(*program, &resource);
+    empty.add(0, ValueResult::floating(std::numeric_limits<double>::quiet_NaN()));
+    empty.add(0, ValueResult::floating(std::numeric_limits<double>::infinity()));
+    AggregateAccumulator::merge(&empty, &other);
+    EXPECT_EQ(0, (int64_t)empty.finish().intValue);
+    EXPECT_EQ(0u, tracker.peak());
+    other.add(0, ValueResult::integer(7));
+    AggregateAccumulator::merge(&other, &empty);
+    EXPECT_EQ(1, (int64_t)other.finish().intValue);
+    AggregateAccumulator::merge(&empty, &other);
+    EXPECT_EQ(1, (int64_t)empty.finish().intValue);
+    other.add(0, ValueResult::integer(8));
+    EXPECT_EQ(1, (int64_t)empty.finish().intValue);
+  }
+  EXPECT_EQ(0u, tracker.bytes());
+}
+
+TEST_F(AggregateExprTest, cardinalityEstimatorChargesExactAndDenseStorage) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  for (int threshold : {0, 16, 3000, 40000}) {
+    auto* program = parseAggregate(memory, *schema,
+        "cardinality(x_i," + std::to_string(threshold) + ")");
+    RequestMemTracker tracker(0);
+    RequestMemResource resource(tracker, "cardinality");
+    {
+      AggregateAccumulator accumulator(*program, &resource);
+      int count = std::max(100, threshold * 2);
+      for (int i = 0; i < count; i++) accumulator.add(0, ValueResult::integer(i));
+      double estimate = (double)accumulator.finish().intValue;
+      double registers = (double)(uint64_t{1} << HyperLogLog::precisionForThreshold(threshold));
+      EXPECT_NEAR(count, estimate, count * 4.16 / std::sqrt(registers));
+    }
+    EXPECT_GT(tracker.peak(), (size_t)threshold * sizeof(uint64_t));
+    EXPECT_LE(tracker.peak(), AggregateStateView::bytes(*program) + HyperLogLog::maxBytes(threshold));
+    EXPECT_EQ(0u, tracker.bytes());
+  }
+}
+
+TEST_F(AggregateExprTest, sketchRowsHandleEmptyDomainsAndEmptyFacetBuckets) {
+  CollectionHelper helper;
+  helper.indexAll({flatdoc("id", "1", "x_i", 10, "s_s", "a"),
+                   flatdoc("id", "2", "x_i", 30, "s_s", "b")}, UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  auto& root = req->collection("main");
+  root.expr("c", "cardinality(other_s)");
+  root.expr("r", "percentile_rank(other_i, 20)");
+  auto& facet = root.rangeFacet("f", "x_i").range(0, 60, 20).mincount(0);
+  facet.expr("c", "cardinality(s_s)");
+  facet.expr("r", "percentile_rank(x_i,20)");
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(0, req->scalar<int64_t>("c"));
+  EXPECT_TRUE(req->responses[0]->proto.ops.at("r")->isNull());
+  const auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
+  const auto& counts = std::get<api::ArrVal>(result.ops.at("c")->kind).v;
+  const auto& ranks = std::get<api::ArrVal>(result.ops.at("r")->kind).v;
+  ASSERT_EQ(3u, counts.size());
+  EXPECT_EQ(1, counts[0].asInt());
+  EXPECT_EQ(1, counts[1].asInt());
+  EXPECT_EQ(0, counts[2].asInt());
+  EXPECT_DOUBLE_EQ(100, ranks[0].asDouble());
+  EXPECT_DOUBLE_EQ(0, ranks[1].asDouble());
+  EXPECT_TRUE(ranks[2].isNull());
+
+  auto query = localReq(helper.getSearchEngine());
+  parseQueryRequest(R"json({"ops":{"f":{"query_facet":{"buckets":{"empty":"id:none"},
+      "ops":{"c":"cardinality(s_s)","r":"percentile_rank(x_i,20)"}}}}})json",
+      query->rawRequest(), query->mr);
+  query->collection("main");
+  query->execute(false);
+  ASSERT_TRUE(query->ok()) << query->errorMsg();
+  const auto& empty = *query->responses[0]->proto.ops.at("f")->facetResult();
+  EXPECT_EQ(0, std::get<api::ArrVal>(empty.ops.at("c")->kind).v[0].asInt());
+  EXPECT_TRUE(std::get<api::ArrVal>(empty.ops.at("r")->kind).v[0].isNull());
+}
+
+TEST_F(AggregateExprTest, sketchConstantsMustBeFiniteAndCardinalityCannotSortInline) {
+  CollectionHelper helper;
+  helper.indexAll({flatdoc("id", "1", "x_i", 1, "cat_s", "a")}, UpdateMessage::COMMIT);
+  for (std::string_view expression : {"cardinality(x_i,$v)", "percentile_rank(x_i,$v)"}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").expr("bad", expression, "v", std::numeric_limits<double>::infinity());
+    req->execute(false);
+    EXPECT_FALSE(req->ok());
+    EXPECT_NE(std::string::npos, req->errorMsg().find("NaN or infinity"));
+  }
+  auto req = localReq(helper.getSearchEngine());
+  auto& facet = req->collection("main").facet("f", "cat_s");
+  facet.expr("keys", "cardinality(x_i)");
+  qb::sort(facet, "keys", qb::DESC);
+  req->execute(false);
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("without inline support"));
+}
+
+TEST_F(AggregateExprTest, cardinalityReplayMatchesDomainsAndRankSortsInline) {
+  CollectionHelper helper;
+  helper.indexAll({
+      flatdoc("id", "1", "parent_ss", vecs("a", "b"), "tags_ss", vecs("x", "y"), "x_i", 10, "n_is", vec_i(1, 2)),
+      flatdoc("id", "2", "parent_ss", vecs("a"), "tags_ss", vecs("x"), "x_i", 20, "n_is", vec_i(2, 3))}, UpdateMessage::COMMIT);
+  helper.indexAll({
+      flatdoc("id", "3", "parent_ss", vecs("b", "c"), "tags_ss", vecs("w", "y"), "x_i", 30, "n_is", vec_i(3, 4)),
+      flatdoc("id", "4", "parent_ss", vecs("c"), "x_i", 40)}, UpdateMessage::COMMIT);
+  auto guard = facetAggregateOverrides();
+  forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  auto run = [&](FacetFeedStrategy feed) {
+    forcedFacetFeedStrategy = feed;
+    auto req = localReq(helper.getSearchEngine());
+    auto& facet = req->collection("main").facet("f", "parent_ss").limit(-1);
+    facet.expr("pct", "percentile_rank(x_i, 20)");
+    facet.expr("keys", "cardinality(tags_ss)");
+    facet.expr("numbers", "cardinality(n_is + 1)");
+    facet.expr("mixed", "cardinality(tags_ss) + percentile_rank(x_i, 20)");
+    qb::sort(facet, "pct", qb::DESC);
+    req->execute(-1);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(0u, req->memoryTracker.bytes());
+    std::vector<std::byte> encoded;
+    if (req->ok()) {
+      const auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
+      EXPECT_EQ("a", std::get<api::ColStr>(result.bucket_ids->kind).v[0]);
+      const auto& keys = std::get<api::ArrVal>(result.ops.at("keys")->kind).v;
+      EXPECT_EQ(2, keys[0].asInt());
+      EXPECT_EQ(3, keys[1].asInt());
+      EXPECT_EQ(2, keys[2].asInt());
+      const auto& mixed = std::get<api::ArrVal>(result.ops.at("mixed")->kind).v;
+      EXPECT_DOUBLE_EQ(102, mixed[0].asDouble());
+      EXPECT_TRUE(api::encode(result, encoded));
+    }
+    return encoded;
+  };
+  auto domains = run(FacetFeedStrategy::BUCKET_DOMAINS);
+  EXPECT_EQ(domains, run(FacetFeedStrategy::STRING_COLUMN_REPLAY));
+}
+
+TEST_F(AggregateExprTest, indirectReplayAndDomainFailuresReleaseAllState) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 100; i++) docs.push_back(flatdoc("id", std::to_string(i),
+      "cat_s", "c" + std::to_string(i % 4), "x_i", i));
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto guard = facetAggregateOverrides();
+  forcedFacetSubOpInline = FacetSubOpInlineMode::SORT_KEY_ONLY;
+  for (auto feed : {FacetFeedStrategy::BUCKET_DOMAINS, FacetFeedStrategy::STRING_COLUMN_REPLAY}) {
+    forcedFacetFeedStrategy = feed;
+    for (size_t ceiling : {32u, 256u, 512u}) {
+      forcedRequestMemoryMaxBytes = ceiling;
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("main").facet("f", "cat_s").limit(-1)
+          .expr("keys", "cardinality(x_i) + cardinality(id)");
+      req->execute(false);
+      EXPECT_FALSE(req->ok()) << ceiling;
+      EXPECT_EQ(0u, req->memoryTracker.bytes()) << ceiling;
+    }
+  }
+}
+
+TEST_F(AggregateExprTest, manySmallCardinalityBucketsRespectRequestBudget) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int i = 0; i < 1024; i++) docs.push_back(flatdoc("id", std::to_string(i),
+      "cat_s", "c" + std::to_string(i % 64), "key_s", "k" + std::to_string(i)));
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto guard = facetAggregateOverrides();
+  forcedRequestMemoryMaxBytes = 64 * 1024;
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").facet("f", "cat_s").limit(-1).expr("keys", "cardinality(key_s)");
+  req->execute(false);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
+  const auto& values = std::get<api::ArrVal>(result.ops.at("keys")->kind).v;
+  ASSERT_EQ(64u, values.size());
+  for (const auto& value : values) EXPECT_EQ(16, value.asInt());
+  EXPECT_LE(req->memoryTracker.peak(), 64u * 1024);
+  EXPECT_EQ(0u, req->memoryTracker.bytes());
+}
+
+TEST_F(AggregateExprTest, cardinalityBucketBlocksUseObservedStateBytes) {
+  CollectionHelper helper;
+  for (int segment = 0; segment < 2; segment++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 70; i++) docs.push_back(flatdoc(
+        "id", std::to_string(segment * 70 + i), "bucket_i", i,
+        "x_is", vec_i(i, segment * 70 + i)));
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+  size_t blocks = 0;
+  auto guard = facetAggregateOverrides();
+  forcedRangeFacetBucketDomainByteBudget = 1;
+  facetBucketBlockCounter = &blocks;
+  for (size_t budget : {4u * 1024, 256u * 1024}) {
+    forcedRangeFacetBindingStateChunkBytes = budget;
+    blocks = 0;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").rangeFacet("f", "bucket_i").range(0, 70, 1)
+        .expr("keys", "cardinality(x_is)");
+    req->execute(false);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    const auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
+    const auto& values = std::get<api::ArrVal>(result.ops.at("keys")->kind).v;
+    ASSERT_EQ(70u, values.size());
+    for (const auto& value : values) EXPECT_EQ(2, value.asInt());
+    if (budget == 4u * 1024) {
+      EXPECT_GT(blocks, 2u);
+      EXPECT_LT(blocks, 70u);
+    } else {
+      EXPECT_EQ(2u, blocks);
+    }
+    EXPECT_EQ(0u, req->memoryTracker.bytes());
+  }
+}
+
+TEST_F(AggregateExprTest, exactRankOrdersCollapsedGroups) {
+  CollectionHelper helper;
+  helper.indexAll({flatdoc("id", "1", "cat_s", "a", "x_i", 10),
+                   flatdoc("id", "2", "cat_s", "b", "x_i", 30)}, UpdateMessage::COMMIT);
+  helper.indexAll({flatdoc("id", "3", "cat_s", "a", "x_i", 20),
+                   flatdoc("id", "4", "cat_s", "b", "x_i", 10)}, UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  parseQueryRequest(R"json({"limit":-1,"get_scores":true,"collapse":{"field":"cat_s","head_sort":"x_i asc",
+      "sort":"pct desc","ops":{"pct":"percentile_rank(x_i,20)"}}})json",
+      req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute(-1);
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto* list = req->docList();
+  ASSERT_EQ(2u, list->groups->ranks.size());
+  EXPECT_DOUBLE_EQ(100, list->groups->ranks[0].v[0].asDouble());
+  EXPECT_DOUBLE_EQ(50, list->groups->ranks[1].v[0].asDouble());
 }
 
 TEST_F(AggregateExprTest, dataFailuresMergeAndFinishAsNull) {

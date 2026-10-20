@@ -43,10 +43,26 @@ void* AggregateStateView::leafState(const AggregateLeaf& leaf) const {
   return storage + sizeof(AggregateFailure) + leaf.stateOffset;
 }
 
-void AggregateStateView::init() {
+void AggregateStateView::init(std::pmr::memory_resource* resource) {
   setFailure(AggregateFailure::NONE);
+  size_t initialized = 0;
+  try {
+    for (const AggregateLeaf& leaf : program->leaves) {
+      leaf.resolved.state.init(leafState(leaf), leaf.arguments, resource);
+      initialized++;
+    }
+  } catch (...) {
+    while (initialized != 0) {
+      const auto& leaf = program->leaves[--initialized];
+      if (leaf.resolved.state.destroy) leaf.resolved.state.destroy(leafState(leaf));
+    }
+    throw;
+  }
+}
+
+void AggregateStateView::destroy() noexcept {
   for (const AggregateLeaf& leaf : program->leaves) {
-    leaf.resolved.state.init(leafState(leaf), leaf.arguments);
+    if (leaf.resolved.state.destroy) leaf.resolved.state.destroy(leafState(leaf));
   }
 }
 
@@ -164,9 +180,16 @@ BucketScalar AggregateStateView::finish() const {
   return finish(scratch);
 }
 
-AggregateAccumulator::AggregateAccumulator(const AggregateProgram& program)
+AggregateAccumulator::AggregateAccumulator(const AggregateProgram& program,
+                                           std::pmr::memory_resource* resource)
     : program(&program), states(AggregateStateView::bytes(program)) {
-  AggregateStateView(program, states.data()).init();
+  AggregateStateView(program, states.data()).init(resource);
+}
+
+AggregateAccumulator::~AggregateAccumulator() {
+  if (program != nullptr && program->hasIndirectStates) {
+    AggregateStateView(*program, states.data()).destroy();
+  }
 }
 
 void AggregateAccumulator::add(uint32_t leafIndex, const ValueResult& value) {
@@ -230,30 +253,51 @@ void writeAggregateValue(api::Val& target, const BucketScalar& value) {
   target.kind.emplace<int64_t>((int64_t)value.intValue);
 }
 
-std::span<const ValueFieldInfos> resolveAggregateFields(
+std::span<const AggregateFieldInfos> resolveAggregateFields(
     const AggregateProgram& program, MemPool& pool, IndexReader& reader) {
-  auto fields = pool.make_span<ValueFieldInfos>(program.leaves.size());
+  auto fields = pool.make_span<AggregateFieldInfos>(program.leaves.size());
   for (size_t i = 0; i < fields.size(); i++) {
-    fields[i] = program.leaves[i].input->resolveFields(pool, reader);
+    const ValueProgram& input = *program.leaves[i].input;
+    fields[i].values = input.resolveFields(pool, reader);
+    if (input.root().type == ValueType::COLUMN_ONLY) {
+      fields[i].ords = reader.getOrdMap(input.root().text).get();
+    }
   }
   return fields;
 }
 
 std::vector<BoundAggregateInput> bindAggregateInputs(
     const AggregateProgram& program, MemPool& pool,
-    IndexReader::Segment& segment, std::span<const ValueFieldInfos> fields) {
+    IndexReader::Segment& segment, std::span<const AggregateFieldInfos> fields) {
   std::vector<BoundAggregateInput> bindings;
   bindings.reserve(program.leaves.size());
   for (uint32_t index = 0; index < program.leaves.size(); index++) {
     const AggregateLeaf& leaf = program.leaves[index];
     const ValueNode& root = leaf.input->root();
-    BoundValueProgram* values = leaf.input->bind(pool, segment, fields[index]);
-    bool bareColumn = root.kind == ValueNodeKind::COLUMN
-        && !valueArray(root.type);
+    if (root.type == ValueType::COLUMN_ONLY) {
+      BoundAggregateInput binding;
+      binding.leaf = &leaf;
+      binding.leafIndex = index;
+      binding.leafStateOffset = (uint32_t)sizeof(AggregateFailure) + leaf.stateOffset;
+      binding.columnType = root.columnType;
+      binding.arguments = leaf.arguments;
+      auto* info = fields[index].values[leaf.input->rootNode].at(segment);
+      if (info != nullptr && fields[index].ords != nullptr) {
+        binding.ordColumn = pool.make<OrdColReader>(segment.postingsReader(), *info);
+        binding.ordIterator = pool.make<OrdColReader::Iterator>(*binding.ordColumn);
+        binding.ordMapping = fields[index].ords->getSegToGlobal(segment.ord);
+      }
+      bindings.push_back(binding);
+      continue;
+    }
+    BoundValueProgram* values = leaf.input->bind(pool, segment, fields[index].values);
+    bool columnScan = root.kind == ValueNodeKind::COLUMN;
+    bool bareColumn = columnScan && !valueArray(root.type);
     BoundValueNode& rootBinding = values->nodes[leaf.input->rootNode];
     bindings.push_back({
         .values = values,
         .leaf = &leaf,
+        .ordMapping = {},
         .columnIterator = bareColumn && rootBinding.bulkIterator
             ? &*rootBinding.bulkIterator : nullptr,
         .accumulateRawPoint = leaf.resolved.state.accumulateRawPoint,
@@ -262,6 +306,7 @@ std::vector<BoundAggregateInput> bindAggregateInputs(
             + leaf.stateOffset,
         .leafIndex = index,
         .columnType = root.columnType,
+        .columnScan = columnScan,
         .bareColumn = bareColumn
     });
   }

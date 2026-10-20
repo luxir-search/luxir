@@ -8,6 +8,7 @@
 #include <bit>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -33,7 +34,7 @@ class ExprStatsOp : public SearchOp {
       "facet aggregate state";
 
   AggregateProgram& aggregate;
-  std::span<const ValueFieldInfos> fields;
+  std::span<const AggregateFieldInfos> fields;
   const DenseFacetStateOps* denseFacetState = nullptr;
 
   const DenseFacetStateOps* resolveDenseFacetState() {
@@ -50,7 +51,7 @@ class ExprStatsOp : public SearchOp {
         || input.columnMultiValued) {
       return nullptr;
     }
-    auto infos = fields[0][leaf.input->rootNode];
+    auto infos = fields[0].values[leaf.input->rootNode];
     for (auto& segment : req.reader->segments()) {
       auto& postings = segment.postingsReader();
       if (postings.maxDoc() == 0) continue;
@@ -82,7 +83,7 @@ class ExprStatsOp : public SearchOp {
 
 public:
   ExprStatsOp(SearchRequest& req, std::string_view name,
-              AggregateProgram& aggregate, std::span<const ValueFieldInfos> fields)
+              AggregateProgram& aggregate, std::span<const AggregateFieldInfos> fields)
       : SearchOp(req, name), aggregate(aggregate), fields(fields) {}
 
   void init() override {
@@ -96,11 +97,16 @@ public:
     static constexpr size_t BATCH_SIZE = 1024;
 
     AggregateEvalScratch scratch;
+    // The driver destroys every accumulator before this resource is released.
+    std::optional<RequestMemResource> stateResource;
+    size_t observedStateBytes = 0;
     SegmentMergeDriver<AggregateAccumulator> driver;
 
     ExprStatsOp& thisOp() { return (ExprStatsOp&)getOp(); }
 
     void emitResult(const AggregateAccumulator& accumulator) {
+      // Completion frees the accumulator before the bucket sizing hook runs.
+      if (stateResource) observedStateBytes = stateResource->bytes();
       BucketScalar result = accumulator.finish(scratch);
       thisOp().warnFailure(result);
       auto& mr = op.req.lastResponse->mr;
@@ -140,6 +146,14 @@ public:
     void accumulateExpression(AggregateAccumulator& accumulator,
                               BoundAggregateInput& binding, DocSet* domain,
                               int32_t maxDoc) {
+      if (!binding.scalar()) {
+        forEachDomainDoc(domain, maxDoc, [&](int32_t doc) {
+          binding.forEachValue(doc, [&](const ValueResult& value) {
+            accumulator.add(binding.leafIndex, value);
+          });
+        });
+        return;
+      }
       std::array<int32_t, BATCH_SIZE> docs;
       std::array<ScalarValueResult, BATCH_SIZE> results;
       size_t count = 0;
@@ -167,9 +181,19 @@ public:
                  [this](std::unique_ptr<AggregateAccumulator> accumulator) {
                    emitResult(*accumulator);
                  }) {
+      if (thisOp().aggregate.hasIndirectStates) {
+        stateResource.emplace(op.req.memoryTracker, fmt::format("metric '{}'", op.name),
+                              FACET_STATE_BREAKER);
+      }
       driver.setCreator([this]() {
-        return new AggregateAccumulator(thisOp().aggregate);
+        return new AggregateAccumulator(thisOp().aggregate,
+            stateResource ? &*stateResource : nullptr);
       });
+    }
+
+    size_t facetBucketObservedBytes() const override {
+      return saturatingAdd(op.facetBucketResidentBytes(),
+          stateResource ? std::max(observedStateBytes, stateResource->bytes()) : 0);
     }
 
     api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
@@ -197,7 +221,7 @@ public:
 
           int32_t maxDoc = segment.postingsReader().maxDoc();
           for (BoundAggregateInput& binding : bindings) {
-            if (binding.bareColumn) {
+            if (binding.columnScan) {
               accumulateColumn(
                   accumulator, binding, domainHandle.get(), maxDoc);
             } else {
@@ -531,16 +555,21 @@ public:
     SearchOp::Calculator& parent;
     StringFacetColumnSource source;
     StrFacetSelectedOrdMap::Selected selectedBuckets;
-    std::vector<std::byte> states;
     std::string chargeDetail;
+    std::optional<RequestMemResource> stateResource;
+    std::vector<std::byte> states;
     AggregateEvalScratch scratch;
     size_t chargedBytes = 0;
+    size_t initializedStates = 0;
     uint32_t stride;
 
     void releaseStates() {
-      if (chargedBytes == 0) return;
+      if (stateResource) {
+        while (initializedStates != 0) state((int32_t)--initializedStates).destroy();
+      }
+      initializedStates = 0;
       std::vector<std::byte>().swap(states);
-      child.req.memoryTracker.release(chargedBytes);
+      if (chargedBytes != 0) child.req.memoryTracker.release(chargedBytes);
       chargedBytes = 0;
     }
 
@@ -597,6 +626,20 @@ public:
         if (docCount == 0) return;
         std::span<const int32_t> docBatch(docs.data(), docCount);
         for (BoundAggregateInput& binding : bindings) {
+          if (!binding.scalar()) {
+            for (size_t i = 0; i < docCount; i++) {
+              auto owners = std::span<const int32_t>(ownerIds).subspan(
+                  ownerOffsets[i], ownerOffsets[i + 1] - ownerOffsets[i]);
+              try {
+                binding.forEachValue(docs[i], [&](const ValueResult& value) {
+                  for (int32_t owner : owners) state(owner).add(binding.leafIndex, value);
+                });
+              } catch (const ValueEvaluationError&) {
+                failOwners(owners);
+              }
+            }
+            continue;
+          }
           try {
             binding.evalBatch(docBatch,
                               std::span<ScalarValueResult>(values.data(),
@@ -711,7 +754,11 @@ public:
           selectedBuckets(StrFacetSelectedOrdMap::selectedBuckets(source.buckets)),
           chargeDetail(fmt::format("facet '{}' metric '{}'",
                                    parent.getOp().name, child.name)),
-          stride(AggregateStateView::bytes(child.aggregate)) {}
+          stride(AggregateStateView::bytes(child.aggregate)) {
+      if (child.aggregate.hasIndirectStates) {
+        stateResource.emplace(child.req.memoryTracker, chargeDetail, FACET_STATE_BREAKER);
+      }
+    }
 
     ~ColumnReplayExecutor() override {
       releaseStates();
@@ -737,7 +784,8 @@ public:
       }
       states.resize(chargedBytes);
       for (size_t owner = 0; owner < numOwners; owner++) {
-        state((int32_t)owner).init();
+        state((int32_t)owner).init(stateResource ? &*stateResource : nullptr);
+        initializedStates++;
       }
 
       for (int32_t segnum = 0; segnum < (int32_t)source.domains.size();
@@ -765,17 +813,28 @@ public:
   InlineCalculator* createInlineCalculator(
       Calculator* parent, int64_t slot = -1,
       int64_t numSlots = -1) override {
+    assert(canInline());
     return new InlineCalc(*this, parent, slot, numSlots);
   }
 
-  bool canInline() override { return true; }
+  bool canInline() override {
+    return !aggregate.hasIndirectStates
+        && std::ranges::all_of(aggregate.leaves, [](const AggregateLeaf& leaf) {
+      return leaf.resolved.state.inlineCapable
+          && leaf.input->root().type != ValueType::COLUMN_ONLY
+          && !valueArray(leaf.input->root().type);
+    });
+  }
 
   // Every leaf a bare scalar column with a keyed raw batch accumulator: the
   // inline calculator then reads its values straight from the column per batch.
   bool inlinesAsColumnBatch() const override {
-    return std::ranges::all_of(aggregate.leaves, [](const AggregateLeaf& leaf) {
+    return !aggregate.hasIndirectStates
+        && std::ranges::all_of(aggregate.leaves, [](const AggregateLeaf& leaf) {
       const ValueNode& input = leaf.input->root();
-      return input.kind == ValueNodeKind::COLUMN && !valueArray(input.type)
+      return leaf.resolved.state.inlineCapable
+          && input.kind == ValueNodeKind::COLUMN && !valueArray(input.type)
+          && input.type != ValueType::COLUMN_ONLY
           && leaf.resolved.state.accumulateKeyedRawBatch != nullptr;
     });
   }
@@ -789,10 +848,15 @@ public:
     return AggregateStateView::bytes(aggregate);
   }
 
+  bool facetBucketGrows() const override { return aggregate.hasIndirectStates; }
+
   FacetChildExecutor* bindFacetChild(
       const FacetChildContext& context) override {
     if (bucketDomain != nullptr || needsStructuralScope) return nullptr;
     if (context.stringColumn == nullptr) return nullptr;
+    if (!std::ranges::all_of(aggregate.leaves, [](const AggregateLeaf& leaf) {
+          return leaf.resolved.state.replayCapable;
+        })) return nullptr;
     for (const auto& bucket : context.stringColumn->buckets) {
       if (!bucket.id.has_value()) return nullptr;
     }

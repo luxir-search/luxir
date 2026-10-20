@@ -4,11 +4,13 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cassert>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory_resource>
 #include <vector>
 
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -27,6 +29,9 @@ namespace luxir {
 // standard error of about 1.04 / sqrt(2^p): 1.6% at p = 12.
 class HyperLogLog {
 public:
+  using ExactSet = boost::unordered_flat_set<
+      uint64_t, boost::hash<uint64_t>, std::equal_to<uint64_t>,
+      std::pmr::polymorphic_allocator<uint64_t>>;
   static constexpr int64_t DEFAULT_PRECISION_THRESHOLD = 3000;
   static constexpr int64_t MAX_PRECISION_THRESHOLD = 40000;
   static constexpr int MIN_PRECISION = 4;
@@ -34,8 +39,8 @@ public:
 
   int64_t threshold;
   int precision;
-  boost::unordered_flat_set<uint64_t> exact;
-  std::vector<uint8_t> registers; // nonempty once dense
+  ExactSet exact;
+  std::pmr::vector<uint8_t> registers; // nonempty once dense
 
   // Enough registers that the dense estimate at the threshold is about as
   // accurate as a hash table of that many entries at 0.75 load would allow.
@@ -47,11 +52,11 @@ public:
 
   // Upper bound on resident bytes for a sketch with this threshold.
   static size_t maxBytes(int64_t threshold) {
-    // A flat set holds at most threshold + 1 hashes before conversion; its
-    // slot array is at most twice that, one control byte per slot.
-    size_t exactBytes = (size_t)(threshold + 1) * 2 * (sizeof(uint64_t) + 1);
+    // Include spare hash slots, metadata, rehash overlap, and the dense
+    // allocation made before releasing the exact set.
+    size_t exactBytes = (size_t)(threshold + 1) * 4 * (sizeof(uint64_t) + 1) + 256;
     size_t denseBytes = (size_t)1 << precisionForThreshold(threshold);
-    return std::max(exactBytes, denseBytes);
+    return sizeof(HyperLogLog) + exactBytes + denseBytes;
   }
 
   // A 64-bit finalizer (MurmurHash3 fmix64). It is a bijection, so distinct
@@ -65,8 +70,10 @@ public:
     return x;
   }
 
-  explicit HyperLogLog(int64_t threshold = DEFAULT_PRECISION_THRESHOLD)
-      : threshold(threshold), precision(precisionForThreshold(threshold)) {
+  explicit HyperLogLog(int64_t threshold = DEFAULT_PRECISION_THRESHOLD,
+                       std::pmr::memory_resource* resource = std::pmr::get_default_resource())
+      : threshold(threshold), precision(precisionForThreshold(threshold)),
+        exact(resource), registers(resource) {
     assert(threshold >= 0 && threshold <= MAX_PRECISION_THRESHOLD);
   }
 
@@ -97,7 +104,7 @@ public:
     if (!dense()) return (int64_t)exact.size();
     const int q = 64 - precision;
     const double m = (double)registers.size();
-    std::vector<int64_t> histogram((size_t)q + 2, 0);
+    std::array<int64_t, 65> histogram{};
     for (uint8_t r : registers) histogram[r]++;
     double z = m * tau(1.0 - (double)histogram[(size_t)q + 1] / m);
     for (int k = q; k >= 1; k--) {
@@ -124,7 +131,7 @@ private:
   void toDense() {
     registers.assign((size_t)1 << precision, 0);
     for (uint64_t hash : exact) addDense(hash);
-    boost::unordered_flat_set<uint64_t>().swap(exact);
+    ExactSet(exact.get_allocator()).swap(exact);
   }
 
   static double sigma(double x) {

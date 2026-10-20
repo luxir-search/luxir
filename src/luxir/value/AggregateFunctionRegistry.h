@@ -15,12 +15,14 @@ namespace luxir {
 struct AggregateFunction {
   using Resolve = ResolvedAggregate (*)(
       const ValueNode* input,
-      std::span<const AggregateConstant> trailingArguments);
+      std::span<AggregateConstant> trailingArguments);
 
   std::string_view name;
   uint8_t minArguments = 0;
   uint8_t maxArguments = 0;
   Resolve resolve = nullptr;
+  // Set-valued aggregates flatten arrays and accept ordinal columns.
+  bool acceptsValues = false;
 };
 
 struct ExpressionFunctionLookup {

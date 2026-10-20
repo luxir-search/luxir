@@ -236,7 +236,7 @@ private:
           "op '{}': scores are not available in aggregate expressions",
           opts.opName));
     }
-    if (input != nullptr && valueArray(input->root().type)) {
+    if (input != nullptr && !function.acceptsValues && valueArray(input->root().type)) {
       std::string_view argument = cur->slice(argumentStart, argumentEnd);
       fail(pos, fmt::format(
           "{}() requires one scalar per document; '{}' produces a {}; "
@@ -244,7 +244,7 @@ private:
           name, argument, valueTypeName(input->root().type),
           ValueFunctionRegistry::arrayReducerNames()));
     }
-    if (input != nullptr && input->root().type == ValueType::COLUMN_ONLY) {
+    if (input != nullptr && !function.acceptsValues && input->root().type == ValueType::COLUMN_ONLY) {
       fail(pos, fmt::format("{}() requires a numeric expression", name));
     }
 
@@ -262,6 +262,8 @@ private:
     leaf.arguments = program->copyConstants(trailing);
     leaf.stateOffset = program->stateBytes;
     program->stateBytes += leaf.resolved.state.bytes;
+    program->hasIndirectStates = program->hasIndirectStates
+        || leaf.resolved.state.destroy != nullptr;
     uint32_t leafIndex = (uint32_t)program->leaves.size();
     program->leaves.push_back(leaf);
 
