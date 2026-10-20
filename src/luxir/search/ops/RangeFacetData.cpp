@@ -193,6 +193,46 @@ class IntFacetRangeReq::DataCalc : public FixedBucketFacetReq::Calc<Distinct, Gr
           });
     } else {
       if (pointsSegment(data, segnum, domain)) return;
+      // A zone inside one grid cell counts without a decode. Its bounds can
+      // come from docs outside the domain, so classifying never throws: a
+      // bound the grid rejects decodes, and only an in-domain value fails.
+      struct WindowCounter {
+        DataCalc& calc;
+        const RangeFacetGrid& grid;
+        RangeFacetCountWindow& window;
+        int64_t zoneMin = 0;
+        static constexpr bool needsDocs() { return false; }
+        IntZoneVerdict zone(int64_t min, int64_t max) {
+          if constexpr (Floating) {
+            if (!calc.finite(min) || !calc.finite(max)) return IntZoneVerdict::VALUES;
+          }
+          zoneMin = min;
+          // The directory is one contiguous run of cells, so a bound outside
+          // it lies in a different cell from a bound inside it.
+          auto first = window.find(min), last = window.find(max);
+          if (first || last) {
+            return first && last && *first == *last
+                ? IntZoneVerdict::WHOLE : IntZoneVerdict::VALUES;
+          }
+          auto [lowest, highest] = grid.valueBounds();
+          if (min < lowest || max > highest) return IntZoneVerdict::VALUES;
+          try {
+            return max < grid.next(grid.floor(min)).key
+                ? IntZoneVerdict::WHOLE : IntZoneVerdict::VALUES;
+          } catch (const std::runtime_error&) {
+            return IntZoneVerdict::VALUES;
+          }
+        }
+        void run(const IntZoneRun& run) {
+          window.add(zoneMin, run.count);
+          skipCount(SkipStats::rangeFacetZoneRuns);
+        }
+        LUXIR_INLINE void value(int64_t, int64_t value) {
+          if constexpr (Floating) if (!calc.finite(value)) return;
+          window.add(value);
+        }
+      } counter{*this, *range.grid, data.window};
+      if (range.facetSegIntZones(domain, segnum, data.missing_num, counter)) return;
       range.facetSegIntCol(domain, segnum, data.missing_num,
           [&](int32_t, int64_t value) LUXIR_INLINE {
             if constexpr (Floating) if (!finite(value)) return;

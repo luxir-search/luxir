@@ -1366,8 +1366,8 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
 
 // The zone walk (whole blocks and leaves counted from their zones, straddling
 // zones bucketed against their own fences) must reproduce the doc walk exactly
-// across column shapes, domains, deletions, sub-ops, bucket-domain chunking
-// and fence kinds.
+// across column shapes, domains, deletions, sub-ops, bucket-domain chunking,
+// fence kinds and bounds:data grids.
 TEST_F(FacetTest, zoneRangeFacetMatchesDocWalk) {
   CollectionHelper helper;
   helper.clear();
@@ -1376,6 +1376,7 @@ TEST_F(FacetTest, zoneRangeFacetMatchesDocWalk) {
     RangeSchemaField{"rand_dt", false, false, api::FieldDef::FieldClass::DATE},
     RangeSchemaField{"step_i", false, false},
     RangeSchemaField{"rand_i", false, false},
+    RangeSchemaField{"plateau_i", false, false},
     RangeSchemaField{"step_f", false, false, api::FieldDef::FieldClass::FLOAT},
     RangeSchemaField{"rand_d", false, false, api::FieldDef::FieldClass::DOUBLE},
     RangeSchemaField{"sparse_i", false, false},
@@ -1386,11 +1387,20 @@ TEST_F(FacetTest, zoneRangeFacetMatchesDocWalk) {
   // Three segments of time-ordered docs, 7 minutes apart from 2024-01-15 UTC.
   // rand_dt holds unclustered instants over the ten years from 2020-01-01
   // UTC, rand_d unclustered doubles in [-1000, 1000), and step_f exact FLOAT
-  // steps from negative to positive in doc order.
+  // steps from negative to positive in doc order, with a few non-finite and
+  // signed-zero values. plateau_i is constant over 1024-doc plateaus a
+  // million apart, with one sentinel far below them in doc 4001, which
+  // neither filter matches.
   const int64_t base = 1705276800000LL;
   const int64_t step = 7 * 60 * 1000LL;
   const int64_t randBase = 1577836800000LL;
   const uint64_t tenYears = 3653 * 86'400'000ULL;
+  const float floatInf = std::numeric_limits<float>::infinity();
+  const float floatNan = std::numeric_limits<float>::quiet_NaN();
+  const std::map<int32_t, float> specialFloats = {
+    {300, -floatInf}, {9409, floatInf}, {12'501, -0.0f}, {13'005, floatNan},
+    {24'003, -floatNan}
+  };
   std::mt19937_64 rng(42);
   std::vector<std::string> deleted;
   int32_t doc = 0;
@@ -1400,9 +1410,14 @@ TEST_F(FacetTest, zoneRangeFacetMatchesDocWalk) {
       int64_t randWhen = randBase + (int64_t)(rng() % tenYears);
       int64_t randInt = (int64_t)(rng() % 100'000);
       double randDouble = (double)((int64_t)(rng() % 2'000'000) - 1'000'000) / 1000;
+      int64_t plateau = doc == 4001 ? std::numeric_limits<int64_t>::min() + 1
+                                    : doc / 1024 * 1'000'000LL;
+      auto special = specialFloats.find(doc);
+      float stepFloat = special != specialFloats.end() ? special->second
+                                                       : (float)(doc - 12'500) * 0.125f;
       Doc d = flatdoc("id", std::to_string(doc), "when_dt", base + doc * step,
                       "rand_dt", randWhen, "step_i", (int64_t)doc,
-                      "rand_i", randInt, "step_f", (float)(doc - 12'500) * 0.125f,
+                      "rand_i", randInt, "plateau_i", plateau, "step_f", stepFloat,
                       "rand_d", randDouble);
       if (doc % 3 == 0) appendFlat(d, "tag_s", "third");
       if (doc % 97 == 0) appendFlat(d, "tag_s", "rare");
@@ -1421,12 +1436,14 @@ TEST_F(FacetTest, zoneRangeFacetMatchesDocWalk) {
   const int64_t lastWhen = base + (doc - 1) * step;
   const int64_t hour = 60 * 60 * 1000LL;
   using Unit = api::CalendarGap_::Unit;
-  // A sub facet carries an avg sub-op, so it also builds bucket domains.
+  // A SUB facet carries an avg sub-op, so it also builds bucket domains; a
+  // DATA facet derives its bounds from the data.
+  enum : int { SUB = 1, DATA = 2 };
   struct Spec {
     std::string_view name;
     std::string_view field;
     std::function<void(OpCursor&)> configure;
-    bool sub = false;
+    int kind = 0;
   };
   const std::vector<Spec> specs = {
     // Fixed gap clipped inside the data at both ends.
@@ -1455,24 +1472,40 @@ TEST_F(FacetTest, zoneRangeFacetMatchesDocWalk) {
     {"sparse", "sparse_i", [](OpCursor& f) { f.range(100, 24'000, 1024); }},
     {"multi", "multi_is", [](OpCursor& f) { f.range(0, 26'000, 2048); }},
     {"sub_step", "step_i", [](OpCursor& f) {
-      f.range(100, 20'000, 4000).avg("a", "rand_i"); }, true},
+      f.range(100, 20'000, 4000).avg("a", "rand_i"); }, SUB},
     {"sub_days", "when_dt", [](OpCursor& f) {
       f.calendarRange("2024-03-01", "2024-04-15", 1, Unit::DAY, "America/Denver")
-          .avg("a", "rand_i"); }, true},
+          .avg("a", "rand_i"); }, SUB},
     {"sub_month", "when_dt", [](OpCursor& f) {
       f.calendarRange("2024-02-01", "2024-05-01", 1, Unit::MONTH, "UTC")
-          .avg("a", "rand_i"); }, true},
+          .avg("a", "rand_i"); }, SUB},
     {"sub_float", "step_f", [](OpCursor& f) {
-      f.rangeFp(-1000.0, 1000.0, 250.0).avg("a", "rand_i"); }, true}
+      f.rangeFp(-1000.0, 1000.0, 250.0).avg("a", "rand_i"); }, SUB},
+    // bounds:data grids. A leaf spans about 60 hours of when_dt, so hourly
+    // and daily cells only straddle; weeks (IANA fixed gap) and months count
+    // whole zones.
+    {"data_hours", "when_dt", [&](OpCursor& f) { f.rangeData(hour); }, DATA},
+    {"data_days", "when_dt", [](OpCursor& f) {
+      f.rangeDataCalendar(1, Unit::DAY, "America/Denver"); }, DATA},
+    {"data_weeks", "when_dt", [&](OpCursor& f) {
+      f.rangeData(7 * 24 * hour);
+      std::get<api::RangeFacet>(f.rawOp().kind).time_zone = "America/Denver"; }, DATA},
+    {"data_months", "when_dt", [](OpCursor& f) {
+      f.rangeDataCalendar(1, Unit::MONTH, "America/Denver"); }, DATA},
+    {"data_step", "step_i", [](OpCursor& f) { f.rangeData(1000); }, DATA},
+    {"data_float", "step_f", [](OpCursor& f) { f.rangeDataFp(125.0); }, DATA},
+    {"data_sub", "step_i", [](OpCursor& f) {
+      f.rangeData(2000).avg("a", "rand_i"); }, DATA | SUB}
   };
 
-  struct Pass {
+  struct Outcome {
+    bool ok = false;
+    std::string error;
     std::vector<std::pair<std::string_view, std::vector<std::byte>>> results;
     int64_t zoneRuns = 0;
     int64_t domainRuns = 0;
   };
-  // subOnly runs just the sub facets.
-  auto run = [&](std::string_view filter, bool zones, bool subOnly) {
+  auto run = [&](std::string_view filter, bool zones, std::span<const Spec> list) {
     IntFacetRangeReq::disableZoneRangeFacetForTests = !zones;
     SkipStats::reset();
     auto req = localReq(luxirNode->getSearchEngine());
@@ -1482,56 +1515,113 @@ TEST_F(FacetTest, zoneRangeFacetMatchesDocWalk) {
       top = &req->topDocs("q");
       top->matchQuery("tag_s", filter).limit(0);
     }
-    for (const auto& spec : specs) {
-      if (subOnly && !spec.sub) continue;
+    for (const auto& spec : list) {
       OpCursor& facet = top ? top->rangeFacet(spec.name, spec.field)
                             : req->rangeFacet(spec.name, spec.field);
       std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
       spec.configure(facet);
     }
     req->execute(false);
-    EXPECT_TRUE(req->ok()) << req->errorMsg();
-    Pass pass;
-    pass.zoneRuns = SkipStats::rangeFacetZoneRuns;
-    pass.domainRuns = SkipStats::rangeFacetZoneDomainRuns;
-    for (const auto& spec : specs) {
-      if (subOnly && !spec.sub) continue;
+    Outcome outcome{req->ok(), req->errorMsg(), {}, SkipStats::rangeFacetZoneRuns,
+                    SkipStats::rangeFacetZoneDomainRuns};
+    if (!outcome.ok) return outcome;
+    for (const auto& spec : list) {
       const auto& result = top ? topFacetResult(*req, "q", spec.name)
                                : rootFacetResult(*req, spec.name);
+      if (!top && spec.name == "step_wide") {
+        // Every live doc lands in one bucket.
+        EXPECT_EQ(doc - (int64_t)deleted.size(),
+                  std::accumulate(result.counts.begin(), result.counts.end(), 0LL));
+      }
       std::vector<std::byte> bytes;
       EXPECT_TRUE(api::encode(result, bytes));
-      pass.results.emplace_back(spec.name, std::move(bytes));
+      outcome.results.emplace_back(spec.name, std::move(bytes));
     }
-    if (!top && !subOnly) {
-      const auto& wide = rootFacetResult(*req, "step_wide");
-      EXPECT_EQ(doc - (int64_t)deleted.size(),
-                std::accumulate(wide.counts.begin(), wide.counts.end(), 0LL));
+    return outcome;
+  };
+  // The specs with (or, for kind 0, without) any of the kind bits.
+  auto pick = [&](int kind) {
+    std::vector<Spec> list;
+    for (const auto& spec : specs) {
+      if (kind == 0 ? (spec.kind & DATA) == 0 : (spec.kind & kind) != 0) list.push_back(spec);
     }
-    return pass;
+    return list;
+  };
+  auto check = [&](std::string_view filter, std::span<const Spec> list) {
+    Outcome zones = run(filter, true, list);
+    Outcome walk = run(filter, false, list);
+    EXPECT_TRUE(zones.ok) << zones.error;
+    EXPECT_TRUE(walk.ok) << walk.error;
+    EXPECT_GT(zones.zoneRuns, 0);
+    EXPECT_GT(zones.domainRuns, 0);
+    EXPECT_EQ(0, walk.zoneRuns);
+    EXPECT_EQ(0, walk.domainRuns);
+    ASSERT_EQ(zones.results.size(), walk.results.size());
+    for (size_t i = 0; i < zones.results.size(); i++) {
+      EXPECT_EQ(zones.results[i], walk.results[i]);
+    }
   };
 
   // Domains: all live docs (a liveDocs bitset in the segment with deletions),
-  // a bitset filter, and an array filter. The chunked pass reruns the sub
-  // facets with one bucket domain per chunk, so a zone reaching only other
-  // buckets adds nothing.
+  // a bitset filter, and an array filter. The explicit facets run together;
+  // the sub facets run again with one bucket domain per chunk, so a zone
+  // reaching only other buckets adds nothing; the DATA facets run alone, so
+  // their zone runs are counted apart.
   SkipStatsScope stats;
   SearchOverridesGuard overrides(IntFacetRangeReq::disableZoneRangeFacetForTests,
                                  forcedRangeFacetBucketDomainByteBudget);
+  const std::vector<Spec> explicitSpecs = pick(0), subSpecs = pick(SUB),
+                          dataSpecs = pick(DATA);
   for (std::string_view filter : {"", "third", "rare"}) {
-    for (bool chunked : {false, true}) {
-      forcedRangeFacetBucketDomainByteBudget = chunked ? 1 : 0;
-      Pass zones = run(filter, true, chunked);
-      Pass walk = run(filter, false, chunked);
-      std::string label = std::format("filter '{}' chunked {}", filter, chunked);
-      EXPECT_GT(zones.zoneRuns, 0) << label;
-      EXPECT_GT(zones.domainRuns, 0) << label;
-      EXPECT_EQ(0, walk.zoneRuns) << label;
-      EXPECT_EQ(0, walk.domainRuns) << label;
-      ASSERT_EQ(zones.results.size(), walk.results.size()) << label;
-      for (size_t i = 0; i < zones.results.size(); i++) {
-        EXPECT_EQ(zones.results[i], walk.results[i]) << label;
-      }
+    SCOPED_TRACE(std::format("filter '{}'", filter));
+    {
+      SCOPED_TRACE("explicit");
+      check(filter, explicitSpecs);
     }
+    {
+      SCOPED_TRACE("chunked sub-ops");
+      forcedRangeFacetBucketDomainByteBudget = 1;
+      check(filter, subSpecs);
+      forcedRangeFacetBucketDomainByteBudget = 0;
+    }
+    {
+      SCOPED_TRACE("bounds:data");
+      check(filter, dataSpecs);
+    }
+  }
+
+  // Single DATA facets whose outcome, counts or error, must not depend on the
+  // walk. The plateau_i sentinel is below anything the grid can floor: a zone
+  // holding it decodes, so the filtered requests succeed, and only the
+  // unfiltered one sees it, failing as the doc walk does. One-unit cells
+  // over the plateaus exceed the cell cap from whole zones and from values.
+  const std::vector<Spec> sentinel = {
+    {"f", "plateau_i", [](OpCursor& f) { f.rangeData(1000); }, DATA}
+  };
+  const std::vector<Spec> tooMany = {
+    {"f", "plateau_i", [](OpCursor& f) { f.rangeData(1); }, DATA}
+  };
+  for (std::string_view filter : {"", "third", "rare"}) {
+    SCOPED_TRACE(std::format("filter '{}'", filter));
+    Outcome zones = run(filter, true, sentinel);
+    Outcome walk = run(filter, false, sentinel);
+    EXPECT_EQ(!filter.empty(), zones.ok) << zones.error;
+    EXPECT_EQ(zones.ok, walk.ok);
+    EXPECT_EQ(zones.error, walk.error);
+    EXPECT_EQ(zones.results, walk.results);
+    if (filter.empty()) {
+      EXPECT_NE(std::string::npos, walk.error.find("overflow")) << walk.error;
+    } else {
+      EXPECT_GT(zones.zoneRuns, 0);
+    }
+
+    zones = run(filter, true, tooMany);
+    walk = run(filter, false, tooMany);
+    EXPECT_FALSE(zones.ok);
+    EXPECT_FALSE(walk.ok);
+    EXPECT_GT(zones.zoneRuns, 0);
+    EXPECT_EQ(zones.error, walk.error);
+    EXPECT_NE(std::string::npos, zones.error.find("use a larger gap")) << zones.error;
   }
 }
 

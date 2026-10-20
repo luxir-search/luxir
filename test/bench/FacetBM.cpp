@@ -289,13 +289,17 @@ static void runDateHistogram(benchmark::State& state, std::string_view collectio
       state.iterations(), benchmark::Counter::kIsRate);
 }
 
+// The facet a date histogram lane times. HOUR_SUB adds an avg sub-op, so
+// each bucket's domain is built from the zones too; sub-ops allow 1024
+// buckets, so it covers the first 1000 hours. DATA_* derive their bounds from
+// the data (bounds:data).
+enum class DateFacet { HOUR, MONTH, HOUR_SUB, DATA_HOUR, DATA_MONTH };
+
 // A date histogram over time-ordered values, one per second: whole zones
-// count without a decode. sub adds an avg sub-op, so each bucket's domain is
-// built from the zones too; sub-ops allow 1024 buckets, so the hourly sub-op
-// lanes cover the first 1000 hours.
+// count without a decode.
 static void BM_DateHistogram(benchmark::State& state, int64_t nDocs,
                              std::string_view shape, bool filtered,
-                             bool calendar, bool zones, bool sub = false) {
+                             DateFacet kind, bool zones) {
   if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
   std::vector<int32_t> docsPerSeg;
   CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
@@ -307,16 +311,29 @@ static void BM_DateHistogram(benchmark::State& state, int64_t nDocs,
     });
   }
   int64_t end = DATE_BENCH_START + (nDocs - 1) * 1000 + 1;
-  if (sub) end = std::min(end, DATE_BENCH_START + 1000 * HOUR_MS);
+  using Unit = api::CalendarGap_::Unit;
   runDateHistogram(state, "date_histogram_bm", reused, filtered, zones,
       [&](OpCursor& facet) {
-        if (calendar) {
-          facet.calendarRange("2024-01-01", "2025-01-01", 1,
-                              api::CalendarGap_::Unit::MONTH, "America/New_York");
-        } else {
-          facet.range(DATE_BENCH_START, end, HOUR_MS);
+        switch (kind) {
+          case DateFacet::HOUR:
+            facet.range(DATE_BENCH_START, end, HOUR_MS);
+            break;
+          case DateFacet::MONTH:
+            facet.calendarRange("2024-01-01", "2025-01-01", 1, Unit::MONTH,
+                                "America/New_York");
+            break;
+          case DateFacet::HOUR_SUB:
+            facet.range(DATE_BENCH_START,
+                        std::min(end, DATE_BENCH_START + 1000 * HOUR_MS), HOUR_MS)
+                .avg("a", "when_dt");
+            break;
+          case DateFacet::DATA_HOUR:
+            facet.rangeData(HOUR_MS);
+            break;
+          case DateFacet::DATA_MONTH:
+            facet.rangeDataCalendar(1, Unit::MONTH, "America/New_York");
+            break;
         }
-        if (sub) facet.avg("a", "when_dt");
       });
 }
 
@@ -904,16 +921,24 @@ LUXIR_BENCHMARK_CAPTURE(BM_Facet, lim0_bigD_u10_i,  nDocs, shape, "short_u10_s",
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, points,      nDocs, shape, false);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, forced_walk, nDocs, shape, true);
 LUXIR_BENCHMARK_CAPTURE(BM_RangeFacet, forced_doc_walk, nDocs, shape, true, false);
-LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_all_zones,  nDocs, shape, false, false, true);
-LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_all_walk,   nDocs, shape, false, false, false);
-LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_zones, nDocs, shape, true,  false, true);
-LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_walk,  nDocs, shape, true,  false, false);
-LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_all_zones,  nDocs, shape, false, true, true);
-LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_all_walk,   nDocs, shape, false, true, false);
-LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_filt_zones, nDocs, shape, true,  true, true);
-LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_filt_walk,  nDocs, shape, true,  true, false);
-LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_sub_zones, nDocs, shape, true, false, true, true);
-LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_sub_walk,  nDocs, shape, true, false, false, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_all_zones,        nDocs, shape, false, DateFacet::HOUR,       true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_all_walk,         nDocs, shape, false, DateFacet::HOUR,       false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_zones,       nDocs, shape, true,  DateFacet::HOUR,       true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_walk,        nDocs, shape, true,  DateFacet::HOUR,       false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_all_zones,       nDocs, shape, false, DateFacet::MONTH,      true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_all_walk,        nDocs, shape, false, DateFacet::MONTH,      false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_filt_zones,      nDocs, shape, true,  DateFacet::MONTH,      true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, month_filt_walk,       nDocs, shape, true,  DateFacet::MONTH,      false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_sub_zones,   nDocs, shape, true,  DateFacet::HOUR_SUB,   true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, hour_filt_sub_walk,    nDocs, shape, true,  DateFacet::HOUR_SUB,   false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_hour_all_zones,   nDocs, shape, false, DateFacet::DATA_HOUR,  true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_hour_all_walk,    nDocs, shape, false, DateFacet::DATA_HOUR,  false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_hour_filt_zones,  nDocs, shape, true,  DateFacet::DATA_HOUR,  true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_hour_filt_walk,   nDocs, shape, true,  DateFacet::DATA_HOUR,  false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_month_all_zones,  nDocs, shape, false, DateFacet::DATA_MONTH, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_month_all_walk,   nDocs, shape, false, DateFacet::DATA_MONTH, false);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_month_filt_zones, nDocs, shape, true,  DateFacet::DATA_MONTH, true);
+LUXIR_BENCHMARK_CAPTURE(BM_DateHistogram, data_month_filt_walk,  nDocs, shape, true,  DateFacet::DATA_MONTH, false);
 LUXIR_BENCHMARK_CAPTURE(BM_DateHistShuffled, ny_day_zones,  nDocs, shape, "America/New_York", true);
 LUXIR_BENCHMARK_CAPTURE(BM_DateHistShuffled, ny_day_walk,   nDocs, shape, "America/New_York", false);
 LUXIR_BENCHMARK_CAPTURE(BM_DateHistShuffled, utc_day_zones, nDocs, shape, "UTC", true);
