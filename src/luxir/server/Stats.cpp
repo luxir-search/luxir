@@ -9,8 +9,10 @@
 #include "ReplicationFollower.h"
 #include "Scrubber.h"
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <map>
 #include <string_view>
 #include <vector>
 
@@ -18,6 +20,7 @@
 #include "luxir/BuildInfo.h"
 #include "luxir/api/build.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/reader/FieldBytes.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/schema/Schema.h"
@@ -268,13 +271,80 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
   }
 }
 
+// Storage per field over the segments of `reader`. Segment overlays (vector
+// ANN indexes) come from `src`'s segment records and are charged to the field
+// they name.
+template<class Stats>
+void fillFieldBytes(api::IndexStats& dst, IndexReader& reader, const Stats& src,
+                    std::pmr::memory_resource& resource) {
+  struct Totals {
+    FieldBytes bytes;
+    uint32_t segments = 0;
+    uint64_t vectorIndex = 0;
+  };
+  std::map<std::string, Totals, std::less<>> byField;
+  for (auto& segment : reader.segments()) {
+    auto layout = segmentFieldBytes(segment.postingsReader());
+    dst.unattributed_bytes += layout.unattributed;
+    for (const auto& field : layout.fields) {
+      auto& totals = byField[field.field];
+      totals.bytes.type = field.type;
+      totals.segments++;
+      for (size_t k = 0; k < FieldBytes::NUM_KINDS; k++) totals.bytes.bytes[k] += field.bytes[k];
+      totals.bytes.docs += field.docs;
+      totals.bytes.values += field.values;
+      totals.bytes.terms += field.terms;
+      totals.bytes.postings += field.postings;
+      totals.bytes.positions += field.positions;
+    }
+  }
+  for (const auto& segment : src.segmentStats) {
+    if (reader.findSegment(segment.segId) == nullptr) continue;
+    for (const auto& overlay : segment.overlays) {
+      if (!overlay.field.empty()) byField[overlay.field].vectorIndex += overlay.bytes;
+    }
+  }
+
+  auto* out = api::build::allocArray(dst.field_bytes, byField.size(), resource);
+  size_t i = 0;
+  for (const auto& [name, totals] : byField) {
+    auto& entry = out[i++];
+    const auto& b = totals.bytes.bytes;
+    entry.field = api::build::arenaStr(resource, name);
+    entry.type = FieldBytes::typeName(totals.bytes.type);
+    entry.segments = totals.segments;
+    entry.terms_bytes = b[FieldBytes::TERMS];
+    entry.term_index_bytes = b[FieldBytes::TERM_INDEX];
+    entry.postings_bytes = b[FieldBytes::POSTINGS];
+    entry.positions_bytes = b[FieldBytes::POSITIONS];
+    entry.norms_bytes = b[FieldBytes::NORMS];
+    entry.docs_with_field_bytes = b[FieldBytes::DOCS_WITH_FIELD];
+    entry.column_bytes = b[FieldBytes::COLUMN];
+    entry.column_index_bytes = b[FieldBytes::COLUMN_INDEX];
+    entry.points_bytes = b[FieldBytes::POINTS];
+    entry.stored_bytes = b[FieldBytes::STORED];
+    entry.vector_bytes = b[FieldBytes::VECTORS];
+    entry.vector_index_bytes = totals.vectorIndex;
+    entry.bytes = totals.bytes.total() + totals.vectorIndex;
+    entry.docs = totals.bytes.docs;
+    entry.values = totals.bytes.values;
+    entry.terms = totals.bytes.terms;
+    entry.postings = totals.bytes.postings;
+    entry.positions = totals.bytes.positions;
+  }
+  std::stable_sort(out, out + byField.size(), [](const auto& a, const auto& b) {
+    return a.bytes > b.bytes;
+  });
+}
+
 } // namespace
 
 void gatherStats(LuxirNode& node, const api::StatsRequest& request,
                  api::StatsResponse& response, std::pmr::memory_resource& resource) {
   auto start = std::chrono::steady_clock::now();
   bool nodeScope = request.collection.empty() && request.tenant.empty();
-  bool files = request.files || request.segments;
+  // Field bytes charge ANN overlay files to their fields, so they list files.
+  bool files = request.files || request.segments || request.field_bytes;
   if (!nodeScope && (request.system || request.host)) {
     throw RequestError("system and host stats are node-wide: request them without a collection or tenant");
   }
@@ -345,11 +415,20 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
         shardStats.index.pin_idle_drops = pins.idleDrops;
         shardStats.index.pin_budget_drops = pins.budgetDrops;
         auto& indexTotals = shardStats.index.totals;
+        // Field bytes read the search snapshot's segments; a segment the writer
+        // has not yet published is not counted.
+        std::shared_ptr<IndexReader> fieldsReader;
+        if (request.field_bytes) fieldsReader = shard->getReaderManager().getReader();
         if (auto snapshot = shard->getReaderManager().snapshot()) {
           for (const auto& file : snapshot->files) indexTotals.committed_bytes += file.size;
         }
         auto fill = [&](const auto& stats) {
           fillIndexStats(shardStats.index, stats, resource);
+          if (fieldsReader) {
+            fillFieldBytes(shardStats.index, *fieldsReader, stats, resource);
+            // Segment records were gathered only for their overlays.
+            if (!request.segments) shardStats.index.segments = {};
+          }
           // Counts for this index alone.  "collections" is meaningless below the node
           // total and "shards" below the collection total, so neither is set here.
           indexTotals.segments = stats.segments;
@@ -360,8 +439,9 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
           indexTotals.deleted_docs = stats.maxDocs - stats.liveDocs;
           if (files) indexTotals.bytes = stats.totalBytes;
         };
-        if (writer) fill(writer->stats(request.segments, files));
-        else fill(shard->getReaderManager().stats(request.segments, files));
+        bool segments = request.segments || request.field_bytes;
+        if (writer) fill(writer->stats(segments, files));
+        else fill(shard->getReaderManager().stats(segments, files));
       } catch (const std::exception& e) {
         // A named collection reports its failure. A node-wide walk reports the
         // collection in its error slot and goes on: unavailable if it was

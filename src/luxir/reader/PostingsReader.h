@@ -131,6 +131,16 @@ public:
     return total;
   }
 
+  // Physical filenums are below numFiles(); folded-away ones have no file.
+  uint32_t numFiles() const noexcept { return (uint32_t)files.size(); }
+  bool hasFile(uint32_t fnum) const noexcept { return fnum < files.size() && files[fnum] != nullptr; }
+
+  // Where file 0's field directory starts (the first field's entry is
+  // furthest before the offsets array); the segment info follows it.
+  int64_t fieldDirectoryOffset() const noexcept {
+    return nFields > 0 ? fieldOffsetsLoc - (int64_t)fieldOffsets[0] : fieldOffsetsLoc;
+  }
+
   InputFile* getFile(uint32_t fnum) {
     assert(fnum < files.size());
     assert(files[fnum] != nullptr);
