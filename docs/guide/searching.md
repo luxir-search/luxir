@@ -55,7 +55,7 @@ POST /collections/books/_search
   "query": "title_t:(dune OR messiah) AND year_i:>=1965",
   "filter": ["stock_i:>0"],
   "limit": 10,
-  "get_number": true,
+  "count_limit": -1,
   "get_scores": true,
   "fields": ["id", "title_t", "year_i", "price_f"]
 }
@@ -95,9 +95,7 @@ one.
 | `filter` | Non-scoring queries ANDed with the main query: expression strings, query objects, or `{"query": ..., "except_ops": [...]}` wrappers that hide a filter from named sub-operations. |
 | `limit` | Maximum documents returned. Default `10`; `0` for count/analytics only; `-1` for all matches. |
 | `offset` | Zero-based rank of the first returned document. Default `0`. |
-| `get_number` | Compute and return the match count as `found`. |
-| `count_limit` | With `get_number`, let the count stop at this many matches. See below. |
-| `track_total_hits` | Elasticsearch-style count switch: `true` is `get_number`, `false` omits the count, and an integer `N` is `get_number` with `count_limit: N`. |
+| `count_limit` | Match count: unset or `0` omits `found`; `-1` counts exactly; positive `N` permits a lower bound at `N`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `min_score` | Minimum relevance score. Documents scoring below it do not match; see [Minimum score](#minimum-score). |
 | `fields` | Fields to retrieve. Omitted: every retrievable field. |
@@ -108,36 +106,32 @@ one.
 
 ### Counts are opt-in, exact or bounded
 
-`found` is opt-in, and the choice changes how the engine runs. Without
-`get_number`, a top-k request uses per-block score bounds and MaxScore-style
-skipping to avoid scoring documents that cannot enter the top k. With
-`get_number`, the engine counts the whole match set and returns the exact
-total, even when you retrieve only a few documents.
+`found` is opt-in. Unset or `count_limit: 0` omits the count and permits
+competitive-score skipping. `count_limit: -1` requests an exact count, even
+when only a few documents are returned.
 
-`count_limit` (or `track_total_hits: N`) bounds that cost, like
-Elasticsearch's default of 10,000. A relevance-ranked list counts until it has
-seen `count_limit` matches and then switches to the same skipping as an
-uncounted request; the returned documents are identical either way. When the
-limit was reached, `found` is exactly `count_limit` and
-`found_is_lower_bound: true` says at least that many documents match.
-Otherwise `found` is exact and `found_is_lower_bound` is omitted. A single
-term or a pure disjunction whose index statistics already prove the limit
-(a term's document frequency minus deletions) skips the counting phase
-entirely.
+A positive `count_limit: N` permits counting to stop at N. A relevance-ranked
+list holds competitive-score skipping until N matches have been counted, or
+index statistics already prove at least N matches. If collection then skips
+remaining work, `found` is N and `found_gte: true` marks it as a lower bound.
+Otherwise the count is exact and `found_gte` is omitted. An exact total is a
+valid answer even when it equals or exceeds N. Metadata and already-resident
+membership can supply an exact count without a counting pass.
 
 ```http
 POST /collections/books/_search
 
-{"query": "title_t:the", "track_total_hits": 10000}
+{"query": "title_t:the", "count_limit": 10000}
 ```
 
 ```json
-{"found": 10000, "found_is_lower_bound": true, "docs": [...]}
+{"found": 10000, "found_gte": true, "docs": [...]}
 ```
 
-Lists that need their complete match set anyway count exactly and ignore the
-limit: lists with `ops`, `collapse`, or `diversify`, field sorts, nested
-lists, and `limit: 0` count-only requests. `count_limit` must be positive.
+Lists with `ops`, `collapse`, or `diversify`, field sorts, nested lists, and
+`limit: 0` count-only requests retain exact counting for any nonzero
+`count_limit`. Fusion also always supplies an exact count when requested.
+Values below -1 are rejected.
 
 For a count plus analytics with no documents at all, set `limit: 0`. No
 document fields are loaded:
@@ -148,7 +142,7 @@ POST /collections/books/_search
 {
   "query": "title_t:dune",
   "limit": 0,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "categories": {
       "field_facet": {
@@ -196,7 +190,7 @@ POST /collections/books/_search
 {
   "query": "title_t:dune",
   "min_score": 0.5,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {"categories": {"field_facet": {"field": "category_s"}}}
 }
 ```
@@ -218,7 +212,7 @@ Use `diversify` to keep at most a fixed number of documents per key:
   "sort": "price_i asc",
   "diversify": {"field": "product_id_s", "max_per_key": 2, "missing": "expand"},
   "limit": 10,
-  "get_number": true,
+  "count_limit": -1,
   "fields": ["id", "price_i"]
 }
 ```
@@ -227,7 +221,7 @@ This returns documents in the ordinary list order (sort values, then document
 order), keeping each key's best `max_per_key` documents. The cap applies before
 `offset`, so concatenating pages gives the same result as one large page.
 `limit: -1` returns the entire capped list; `limit: 0` returns only requested
-counts and operations. With `get_number`, `found` counts capped documents and
+counts and operations. With `count_limit: -1`, `found` counts capped documents and
 `found_groups` counts distinct eligible keys. Exact totals read every matching
 key and retain per-key counts in request memory. Without totals, competitive
 pruning remains available.
@@ -270,7 +264,7 @@ selects another member. For example:
   "collapse": "product_id_s",
   "sort": "price_i asc",
   "limit": 2,
-  "get_number": true,
+  "count_limit": -1,
   "fields": ["id", "title_t", "price_i"]
 }
 ```
@@ -288,7 +282,7 @@ If five matching documents describe three products, a response might be:
 }
 ```
 
-`limit` and `offset` count groups. With `get_number: true`, `found` is the
+`limit` and `offset` count groups. With `count_limit: -1`, `found` is the
 exact number of groups and `found_docs` is the number of eligible matching
 documents, both before paging. `limit: 0` returns totals without documents;
 `limit: -1` returns every group. Exact totals require examining all matching
@@ -351,15 +345,15 @@ and show their cheapest matching variant:
   "collapse": {
     "field": "product_id_s",
     "head_sort": ["price_i asc", "id asc"],
-    "get_number": true
+    "get_count": true
   },
   "fields": ["id", "price_i"],
   "limit": 10
 }
 ```
 
-`collapse.get_number` adds `_group_.count`, the number of members in each
-returned group. This differs from the list's `get_number`, which returns
+`collapse.get_count` adds `_group_.count`, the number of members in each
+returned group. This differs from the list's `count_limit: -1`, which returns
 totals before paging. When `head_sort` picks another member and `get_scores`
 is true, `_group_.rank` contains the group's original sort values as a typed
 array in clause order. The row's `_score_` is the displayed member's own score.
@@ -468,8 +462,8 @@ only their head documents enter fusion. For example:
 {"ops":{"hybrid":{"fusion":{
   "rrf":{},
   "sources":{"text":{"query":"title_t:jacket","collapse":"product_s","limit":100}},
-  "collapse":{"field":"product_s","get_number":true},
-  "limit":10,"get_number":true
+  "collapse":{"field":"product_s","get_count":true},
+  "limit":10,"count_limit":-1
 }}}}
 ```
 
@@ -542,7 +536,7 @@ POST /collections/books/_search
   "query": "title_t:dune",
   "filter": ["stock_i:>0"],
   "limit": 10,
-  "get_number": true,
+  "count_limit": -1,
   "fields": ["id","title_t","price_f"],
   "ops": {
     "categories": {
@@ -654,7 +648,7 @@ POST /collections/authors/_search
 {
   "query": "author_name:Asher",
   "fields": ["title_t", "author_name", "author_name__s", "author_name__self"],
-  "get_number": true,
+  "count_limit": -1,
   "sort": ["author_name", "id"],
   "limit": 1
 }
@@ -684,7 +678,7 @@ POST /collections/authors/_search
     "all": true
   },
   "fields": ["id"],
-  "get_number": true,
+  "count_limit": -1,
   "filter": [
     {
       "any_of": {
@@ -864,7 +858,7 @@ operation in a request-level `ops` map:
         "query": "title_t:dune",
         "filter": ["stock_i:>0"],
         "limit": 10,
-        "get_number": true,
+        "count_limit": -1,
         "fields": ["id","title_t","price_f"],
         "ops": {
           "categories": {"field_facet": {"field":"category_s","limit":10}},
@@ -946,9 +940,8 @@ The recognized top-document parameters are:
 | `sort` | One sort clause per parameter, in the body's string form: `expr`, `expr asc`, or `expr desc`. Repeat to form an ordered sort list. |
 | `batch_size` | Signed 32-bit decimal integer. |
 | `document_format` | Exactly `default`, `rows`, `columns`, or `adaptive`. |
-| `get_number`, `get_scores` | Exactly `true` or `false`. |
-| `count_limit` | Signed 64-bit decimal integer. |
-| `track_total_hits` | `true`, `false`, or a signed 64-bit decimal integer. |
+| `get_scores` | Exactly `true` or `false`. |
+| `count_limit` | Signed 64-bit decimal integer: `0` omits counts, `-1` is exact, positive values permit a lower bound. |
 
 URL form decoding happens before these grammars are applied, so `+` in a
 `sort` value is a space. `sort=` clears the body sort list; empty and non-empty
@@ -1064,7 +1057,7 @@ there is no cursor, scroll state, or page size to manage:
 ```http
 POST /collections/books/_search?format=docs
 
-{"query": {"all": true}, "limit": -1, "fields": ["id", "title_t"], "get_number": true}
+{"query": {"all": true}, "limit": -1, "fields": ["id", "title_t"], "count_limit": -1}
 ```
 
 ```jsonl
@@ -1075,7 +1068,7 @@ POST /collections/books/_search?format=docs
 {"id":"b4","title_t":"Neuromancer"}
 ```
 
-Each line is one bare document. If `get_number` or warnings are present, a
+Each line is one bare document. If a count was requested or warnings are present, a
 leading `_header_` record carries them. Multi-operation document streams use
 header markers to name the following operation. The output pipes directly into
 the [NDJSON update endpoint](indexing.md#unbounded-ndjson-ingest), which

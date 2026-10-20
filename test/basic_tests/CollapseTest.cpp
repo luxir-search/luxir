@@ -123,8 +123,8 @@ protected:
     std::string json = R"({"collection":")" + std::string(collection)
         + R"(","query":)" + queryJson
         + R"(,"fields":["id","key_s","key_i","when_dt","sort_i","sort_s"],"document_format":"rows","get_scores":)"
-        + (scores ? "true" : "false") + R"(,"get_number":)"
-        + (count ? "true" : "false") + R"(,"limit":)" + std::to_string(limit)
+        + (scores ? "true" : "false") + R"(,"count_limit":)"
+        + (count ? "-1" : "0") + R"(,"limit":)" + std::to_string(limit)
         + R"(,"offset":)" + std::to_string(offset)
         + R"(,"batch_size":)" + std::to_string(batch);
     if (!sort.empty()) json += R"(,"sort":)" + std::string(sort);
@@ -764,7 +764,7 @@ TEST_F(CollapseTest, pageMemberOracle) {
             for (auto policy : {"expand", "group", "drop"}) {
               auto expected = memberOracle(*rankDocs, *headDocs, fields, policy, fieldSort);
               auto collapse = spec(fields, policy);
-              collapse.pop_back(); collapse += R"(,"get_number":true,"head_sort":)" + head + '}';
+              collapse.pop_back(); collapse += R"(,"get_count":true,"head_sort":)" + head + '}';
               for (auto strategy : {CollapseMemberStrategy::KEYS, CollapseMemberStrategy::DOMAIN_WALK}) {
                 collapseMemberStrategy = strategy;
                 for (int parallel : {1, -1}) {
@@ -796,14 +796,14 @@ TEST_F(CollapseTest, memberPagingWireAndRendering) {
       flatdoc("id", "b", "key_s", "x", "sort_i", (int64_t)3),
       flatdoc("id", "c", "sort_i", (int64_t)8),
       flatdoc("id", "d", "key_s", "y", "sort_i", (int64_t)4)}, UpdateMessage::COMMIT).success);
-  std::string collapse = R"({"field":"key_s","get_number":true,"head_sort":"sort_i asc"})";
+  std::string collapse = R"({"field":"key_s","get_count":true,"head_sort":"sort_i asc"})";
   auto full = run("main", "*:*", collapse, -1, 0, -1, true, 1, R"("sort_i desc")");
   api::Collapse replacement;
   ASSERT_TRUE(api::read_json(replacement, collapse, full->mr));
-  ASSERT_TRUE(replacement.get_number);
+  ASSERT_TRUE(replacement.get_count);
   ASSERT_TRUE(api::read_json(replacement, R"("key_i")", full->mr));
   EXPECT_EQ("key_i", replacement.field[0]);
-  EXPECT_FALSE(replacement.get_number);
+  EXPECT_FALSE(replacement.get_count);
   EXPECT_TRUE(replacement.head_sort.empty());
   auto expected = enrichedRows(*full);
   auto jsonRows = renderSearchResponseBody(full->responses[0]->proto, true);
@@ -869,7 +869,7 @@ TEST_F(CollapseTest, countOnlyAndAlternateHeadsUseFinalizedFilters) {
     auto req = localReq(helper.getSearchEngine());
     std::string json = R"({"collection":"main","sort":"sort_i desc","fields":["id"],"filter":[)";
     json += routed ? R"({"query":"eligible_s:yes","except_ops":["keys"]})" : R"("eligible_s:yes")";
-    json += R"(],"collapse":{"field":"key_s","get_number":true,"head_sort":"sort_i asc"})";
+    json += R"(],"collapse":{"field":"key_s","get_count":true,"head_sort":"sort_i asc"})";
     if (routed) json += R"(,"ops":{"keys":{"field_facet":{"field":"key_s","count_unit":"docs"}}})";
     json += '}';
     ASSERT_TRUE(api::read_json(req->rawRequest(), json, req->mr)) << json;
@@ -883,10 +883,10 @@ TEST_F(CollapseTest, countOnlyAndAlternateHeadsUseFinalizedFilters) {
   }
   stats.keySegments = 0; stats.domainSegments = 0;
   auto plain = run("main", "*:*", R"("key_s")");
-  auto zero = run("main", "*:*", R"({"field":"key_s","get_number":true,"head_sort":"sort_i asc"})", 0);
+  auto zero = run("main", "*:*", R"({"field":"key_s","get_count":true,"head_sort":"sort_i asc"})", 0);
   EXPECT_EQ(0, stats.keySegments);
   EXPECT_EQ(0, stats.domainSegments);
-  auto counts = run("main", "*:*", R"({"field":"key_s","get_number":true})");
+  auto counts = run("main", "*:*", R"({"field":"key_s","get_count":true})");
   EXPECT_EQ(3, counts->docList()->groups->counts[0]);
   EXPECT_TRUE(counts->docList()->groups->ranks.empty());
   auto scoreHead = run("main", "rescore(*:*, sub(0,sort_i))",
@@ -898,14 +898,14 @@ TEST_F(CollapseTest, countOnlyAndAlternateHeadsUseFinalizedFilters) {
   ASSERT_TRUE(singletons.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
   stats.candidates = 0;
   auto single = run("singleton_members", "*:*",
-      R"({"field":"key_s","get_number":true,"head_sort":"sort_i asc"})");
+      R"({"field":"key_s","get_count":true,"head_sort":"sort_i asc"})");
   EXPECT_EQ(0, stats.candidates);
   for (auto count : single->docList()->groups->counts) EXPECT_EQ(1, count);
   SearchOverridesGuard budget(forcedRequestMemoryMaxBytes);
   forcedRequestMemoryMaxBytes = 128;
   auto limited = localReq(helper.getSearchEngine());
   ASSERT_TRUE(api::read_json(limited->rawRequest(),
-      R"({"collection":"main","collapse":{"field":"key_s","get_number":true}})", limited->mr));
+      R"({"collection":"main","collapse":{"field":"key_s","get_count":true}})", limited->mr));
   limited->execute();
   EXPECT_FALSE(limited->ok());
   EXPECT_NE(std::string::npos, std::string(limited->errorMsg()).find("collapse member state"));
@@ -917,7 +917,7 @@ TEST_F(CollapseTest, typedGroupRanks) {
       flatdoc("id", "a", "key_s", "x", "sort_i", INT64_MAX, "sort_s", "z", "sort_d", 3.25),
       flatdoc("id", "b", "key_s", "x", "sort_i", INT64_MIN, "sort_s", "a", "sort_d", 0.5)},
       UpdateMessage::COMMIT).success);
-  auto key = R"({"field":"key_s","head_sort":"sort_i asc","get_number":true})";
+  auto key = R"({"field":"key_s","head_sort":"sort_i asc","get_count":true})";
   for (std::string sort : {R"(["sort_s desc","sort_i desc"])", R"("add(sort_d,0) desc")", R"("sort_d desc")"}) {
     auto req = run("main", "*:*", key, -1, 0, -1, true, 10, sort);
     ASSERT_TRUE(req->ok());
@@ -1031,7 +1031,7 @@ TEST_F(CollapseTest, groupOpsMemberOracle) {
             }
             auto collapse = spec(fields, policy);
             collapse.pop_back();
-            collapse += R"JSON(,"get_number":true,"head_sort":["sort_i asc","id asc"],"ops":{"low":"min(sort_i)","high":"max(sort_i)","average":"avg(sort_i)","variants":{"top_docs":{"sort":["sort_i asc","id asc"],"fields":["id"],"document_format":"rows","limit":3}},"relevant":{"top_docs":{"query":")JSON" + query
+            collapse += R"JSON(,"get_count":true,"head_sort":["sort_i asc","id asc"],"ops":{"low":"min(sort_i)","high":"max(sort_i)","average":"avg(sort_i)","variants":{"top_docs":{"sort":["sort_i asc","id asc"],"fields":["id"],"document_format":"rows","limit":3}},"relevant":{"top_docs":{"query":")JSON" + query
                 + R"JSON(","get_scores":true,"fields":["id"],"document_format":"rows","limit":3}},"swatches":{"field_facet":{"field":"sort_s","limit":-1}}}})JSON";
             for (auto forced : {CollapseMemberStrategy::KEYS, CollapseMemberStrategy::DOMAIN_WALK}) {
               collapseMemberStrategy = forced;
@@ -1065,7 +1065,7 @@ TEST_F(CollapseTest, groupOpsNestedAndCompleteStreamingBlocks) {
       flatdoc("id", "b", "key_s", "x", "key_i", (int64_t)1, "sort_i", (int64_t)3, "sort_s", "red"),
       flatdoc("id", "c", "sort_i", (int64_t)8, "sort_s", "blue"),
       flatdoc("id", "d", "key_s", "y", "sort_i", (int64_t)4, "sort_s", "red")}, UpdateMessage::COMMIT).success);
-  std::string collapse = R"JSON({"field":"key_s","get_number":true,"ops":{
+  std::string collapse = R"JSON({"field":"key_s","get_count":true,"ops":{
     "variants":{"top_docs":{"sort":"sort_i asc","fields":["id"],"document_format":"rows","limit":3}},
     "swatches":{"field_facet":{"field":"sort_s","ops":{"low":"min(sort_i)"}}},
     "prices":{"range_facet":{"field":"sort_i","start":0,"end":10,"gap":5,"ops":{"low":"min(sort_i)"}}},
@@ -1212,7 +1212,7 @@ TEST_F(CollapseTest, resetGroupDomainOracle) {
                     std::string(parentFilters ? "true}" : "false}");
       auto collapse = spec(fields, policy);
       collapse.pop_back();
-      collapse += R"(,"get_number":true,"ops":{"members":{"top_docs":{"limit":-1,
+      collapse += R"(,"get_count":true,"ops":{"members":{"top_docs":{"limit":-1,
         "sort":"id asc","fields":["id"],"document_format":"rows"},)" +
                   domain + R"(},"swatches":{"field_facet":{"field":"color_s","limit":-1,
         "missing":true},)" +
@@ -1528,9 +1528,9 @@ TEST_F(CollapseTest, rootResetAndInheritReuseTheirSharedPrimitive) {
   auto req = localReq(helper.getSearchEngine());
   ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"root_reuse",
         "ops":{
-    "reset":{"top_docs":{"limit":0,"get_number":true},
+    "reset":{"top_docs":{"limit":0,"count_limit":-1},
       "domain":{"query":"*:*","filter":["stock_i:>0"]}},
-    "inherit":{"top_docs":{"limit":0,"get_number":true},
+    "inherit":{"top_docs":{"limit":0,"count_limit":-1},
       "domain":{"filter":["stock_i:>0"]}}
   }})", req->mr));
   req->execute(1);

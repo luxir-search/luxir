@@ -668,7 +668,7 @@ TEST_F(AggregateExprTest, deniedDenseInlineEntriesFallBackToSparse) {
   forcedRequestMemoryMaxBytes = 512;
   auto req = localReq(helper.getSearchEngine());
   auto& top = req->topDocs("q");
-  top.getNumber(true).matchQuery("pick_s", "yes");
+  top.countLimit().matchQuery("pick_s", "yes");
   auto& facet = top.facet("f", "cat_s").limit(1);
   facet.expr("metric", "sum(x_i)");
   qb::sort(facet, "metric", qb::DESC);
@@ -775,7 +775,7 @@ TEST_F(AggregateExprTest, inlineMincountZeroRemainsTouchedOnly) {
   forcedInlineFacetEntryMode = InlineFacetEntryMode::FORCE_DENSE;
   auto req = localReq(helper.getSearchEngine());
   auto& top = req->topDocs("q");
-  top.getNumber(true).matchQuery("pick_s", "yes");
+  top.countLimit().matchQuery("pick_s", "yes");
   auto& facet = top.facet("f", "cat_s").limit(-1).mincount(0);
   facet.expr("metric", "sum(x_i)");
   qb::sort(facet, "metric", qb::DESC);

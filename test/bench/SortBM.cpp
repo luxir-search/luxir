@@ -41,7 +41,7 @@ static void BM_StringSort(benchmark::State& state, int64_t nDocs,
   for (auto _ : state) {
     auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection("string_sort_bm");
-    auto& top = req->topDocs("q").getNumber(true).allQuery().limit(100)
+    auto& top = req->topDocs("q").countLimit().allQuery().limit(100)
         .fields({"id", "short_u10k_s"});
     qb::sort(top, "short_u10k_s", direction);
     req->execute(false);

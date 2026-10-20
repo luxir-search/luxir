@@ -102,6 +102,8 @@ public:
     }
   }
 
+  bool needsCount() const { return fusionProto.count_limit.value_or(0) != 0; }
+
   // Min-max normalize one source's merged ranked scores in place:
   // (score - min) / (max - min), so the source's best document gets 1 and its
   // worst gets 0.  min and max cover the finite scores only.  When they are
@@ -516,7 +518,7 @@ public:
         op.fusionProto.fields,
         op.fusionProto.batch_size,
         op.fusionProto.offset,
-        op.fusionProto.get_number,
+        op.needsCount(),
         op.fusionProto.get_scores,
         op.fusionProto.document_format,
         emission);

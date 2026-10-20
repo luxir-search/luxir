@@ -837,7 +837,7 @@ struct Collapse {
   Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
   std::span<const SortSpec> head_sort;
   std::span<const SortSpec> sort;
-  bool get_number = false;
+  bool get_count = false;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
 };
 struct Diversify {
@@ -859,13 +859,13 @@ struct TopDocs {                                                 // all indirect
   ::hpp_proto::optional_indirect_view<Collapse> collapse;
   ::hpp_proto::optional_indirect_view<Diversify> diversify;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
-  bool get_number = false;
   bool get_scores = false;
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
   map_view<std::string_view, TopDocs> sources;
   std::span<const Filter> filter;
   std::optional<std::int64_t> limit;
+  std::optional<std::int64_t> count_limit;
   int64_t offset = 0;
   std::span<const std::string_view> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
@@ -874,7 +874,6 @@ struct Fusion {                                                  // needs TopDoc
   std::variant<std::monostate, RrfFusion, LinearFusion> method;  // align 4
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
-  bool get_number = false;
   bool get_scores = false;
 };
 struct Domain {
@@ -954,7 +953,7 @@ struct DocList {                                                // needs Column 
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
   int32_t row_count = 0;                                       // align 4
   bool more = false;
-  bool found_is_lower_bound = false;
+  bool found_gte = false;
 };
 struct FacetResult {                                           // needs Column (optional)
   std::optional<Column> bucket_ids;

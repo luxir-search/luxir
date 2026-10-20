@@ -420,7 +420,7 @@ TEST_F(FacetTest, spanCounterModesMatchAuto) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs();
-    topDocs.getNumber(true).matchQuery("selected_s", "yes");
+    topDocs.countLimit().matchQuery("selected_s", "yes");
     auto& facet = topDocs.facet("f", "category_s").limit(10).mincount(mincount);
     std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
     req->execute(true);
@@ -513,7 +513,7 @@ TEST_F(FacetTest, stringFacetCountsMatchValuesAcrossRemappedSegments) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs();
-    topDocs.getNumber(true);
+    topDocs.countLimit();
     if (domains[d].empty()) topDocs.allQuery();
     else topDocs.matchQuery(domains[d], "y");
     auto& facet = topDocs.facet("f", fields[f]).limit(-1);
@@ -609,7 +609,7 @@ TEST_F(FacetTest, stringFacetStrategiesMatchAcrossDomainSeams) {
       addFacets(*req);
     } else {
       auto& top = req->topDocs("q");
-      top.getNumber(true).matchQuery(
+      top.countLimit().matchQuery(
           "sel_s", domainKind == 1 ? "yes" : "does-not-exist");
       addFacets(top);
     }
@@ -654,7 +654,7 @@ std::map<std::string, int64_t> filteredFacetBuckets(
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
   auto& top = req->topDocs("q");
-  top.getNumber(true).matchQuery("sel_s", "yes");
+  top.countLimit().matchQuery("sel_s", "yes");
   top.facet("f", field).limit(-1).mincount(1);
   req->execute(false);
   EXPECT_TRUE(req->ok()) << req->errorMsg();
@@ -831,7 +831,7 @@ TEST_F(FacetTest, stringFacetTopTermsMatchesForcedStrategies) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& docs = req->topDocs("q");
-    docs.getNumber(true).matchQuery("sel_s", "yes");
+    docs.countLimit().matchQuery("sel_s", "yes");
     auto& facet = docs.facet("f", "cat_s").limit(3).mincount(0);
     std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
     req->execute(false);
@@ -1068,7 +1068,7 @@ TEST_F(FacetTest, emptyIndex) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
 
-    req->topDocs().getNumber(true).allQuery();
+    req->topDocs().countLimit().allQuery();
 
     // Add facet based on field type
     if (fieldType.isRangeFacet) {
@@ -1747,7 +1747,7 @@ TEST_F(FacetTest, emptyIndexNestedFacet) {
   req->collection("main");
 
   auto& topDocs = req->topDocs();
-  topDocs.getNumber(true).allQuery();
+  topDocs.countLimit().allQuery();
 
   auto& facet = topDocs.facet("f", "category_s");
   facet.limit(10);
@@ -1784,7 +1784,7 @@ TEST_F(FacetTest, singleSegment) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
 
-    req->topDocs().getNumber(true).allQuery();
+    req->topDocs().countLimit().allQuery();
     req->facet("f", "price_i").limit(10);
 
     req->execute(true);
@@ -1810,7 +1810,7 @@ TEST_F(FacetTest, singleSegment) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
 
-    req->topDocs().getNumber(true).allQuery();
+    req->topDocs().countLimit().allQuery();
     req->facet("f_str", "color_s").limit(10);
 
     req->execute(true);
@@ -1856,7 +1856,7 @@ TEST_F(FacetTest, multipleSegments) {
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
-  req->topDocs().getNumber(true).allQuery();
+  req->topDocs().countLimit().allQuery();
   req->facet("f", "price_i").limit(20);
 
   req->execute(true);
@@ -1902,7 +1902,7 @@ TEST_F(FacetTest, matchAllCountsFromDomain) {
     for (bool para : {false, true}) {
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
-      req->topDocs().allQuery().getNumber(true).limit(limit);
+      req->topDocs().allQuery().countLimit().limit(limit);
       req->facet("f", "color_s").limit(10);
       req->execute(para);
 
@@ -1937,7 +1937,7 @@ TEST_F(FacetTest, flatOrdMapDeltaFrames) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  req->topDocs().getNumber(true).allQuery();
+  req->topDocs().countLimit().allQuery();
   req->facet("f", "cat_s").limit(-1);
   req->execute(true);
 
@@ -1963,7 +1963,7 @@ TEST_F(FacetTest, fullTextFacetSegmentMissingField) {
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
-  req->topDocs().getNumber(true).allQuery();
+  req->topDocs().countLimit().allQuery();
 
   auto& facet = req->facet("f", "body_w");
   facet.limit(-1);
@@ -2006,7 +2006,7 @@ TEST_F(FacetTest, fullTextFacetNestedSparseArrayDomain) {
   req->collection("main");
 
   auto& topDocs = req->topDocs();
-  topDocs.getNumber(true).matchQuery("pick_w", "yes");
+  topDocs.countLimit().matchQuery("pick_w", "yes");
 
   topDocs.facet("f", "body_w").limit(-1);
 
@@ -2045,7 +2045,7 @@ TEST_F(FacetTest, vectorOptimization) {
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
-  req->topDocs().getNumber(true).allQuery();
+  req->topDocs().countLimit().allQuery();
   req->facet("f", "score_i").limit(30);
 
   req->execute(true);
@@ -2087,7 +2087,7 @@ TEST_F(FacetTest, subOpInlineModesAgree) {
     forcedFacetSubOpInline = mode;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    req->topDocs().getNumber(true).allQuery();
+    req->topDocs().countLimit().allQuery();
     auto& facet = req->facet("f", "cat_s");
     facet.limit(2);              // finite, so the two modes really do differ
     facet.avg("avg_foo", "foo_i");   // the sort key: inlined either way
@@ -2270,7 +2270,7 @@ TEST_F(FacetTest, subOpInlineAutoUsesDomainCrossover) {
     };
     if (tinyDomain) {
       auto& top = req->topDocs("q");
-      top.getNumber(true).matchQuery("tiny_s", "yes");
+      top.countLimit().matchQuery("tiny_s", "yes");
       configure(top.facet("f", "cat_s"));
     } else {
       configure(req->facet("f", "cat_s"));
@@ -2322,7 +2322,7 @@ TEST_F(FacetTest, boundedSelectionMatchesOrderingEveryBucket) {
   auto run = [&](int64_t limit) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    req->topDocs().getNumber(true).allQuery();
+    req->topDocs().countLimit().allQuery();
     auto& facet = req->facet("f", "cat_s");
     facet.limit(limit);
     facet.avg("avg_foo", "foo_i");
@@ -2408,7 +2408,7 @@ static void checkBucketDomainSources(bool forced) {
       addFacets(*req);
     } else {
       auto& top = req->topDocs("q");
-      top.getNumber(true).matchQuery(
+      top.countLimit().matchQuery(
           "sel_s", domainKind == 1 ? "yes" : "does-not-exist");
       addFacets(top);
     }
@@ -2488,7 +2488,7 @@ TEST_F(FacetTest, bucketDomainAutoFollowsCoverage) {
     };
     if (filtered) {
       auto& top = req->topDocs("q");
-      top.getNumber(true).matchQuery("sel_s", "yes");
+      top.countLimit().matchQuery("sel_s", "yes");
       addFacet(top);
     } else {
       addFacet(*req);
@@ -2545,7 +2545,7 @@ TEST_F(FacetTest, sortBySubOp) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
 
-    req->topDocs().getNumber(true).allQuery();
+    req->topDocs().countLimit().allQuery();
 
     auto& facet = req->facet("f", "cat_s");
     facet.limit(limit);
@@ -2619,7 +2619,7 @@ TEST_F(FacetTest, minMaxSubOps) {
   for (int64_t limit : {10, -1}) {  // 10 = deferred sub-op path, -1 = inline path
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    req->topDocs().getNumber(true).allQuery();
+    req->topDocs().countLimit().allQuery();
     auto& facet = req->facet("f", "cat_s");
     facet.limit(limit);
     facet.min("mn", "foo_i");
@@ -2670,7 +2670,7 @@ TEST_F(FacetTest, sortByMinSubOpWithEmptyBucket) {
   auto runFacet = [&](int64_t limit, qb::SortDir dir) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    req->topDocs().getNumber(true).allQuery();
+    req->topDocs().countLimit().allQuery();
     auto& facet = req->facet("f", "cat_s");
     facet.limit(limit);
     facet.min("mn", "foo_i");
@@ -2744,7 +2744,7 @@ TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
 
-  req->topDocs().getNumber(true).allQuery();
+  req->topDocs().countLimit().allQuery();
 
   auto& facet = req->facet("f", "cat_s");
   facet.limit(-1);
@@ -2826,7 +2826,7 @@ TEST_F(FacetTest, rangeFacetSubOps) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  auto& topDocs = req->topDocs("q").getNumber(true).matchQuery("keep_s", "y");
+  auto& topDocs = req->topDocs("q").countLimit().matchQuery("keep_s", "y");
   topDocs.rangeFacet("f", "val_i").range(0, 30, 10)
       .avg("avg_score", "score_i").sum("sum_score", "score_i");
   req->execute(true);
@@ -2871,7 +2871,7 @@ TEST_F(FacetTest, rangeFacetSubOpsMultiValueAndMincount) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  req->topDocs().getNumber(true).allQuery();
+  req->topDocs().countLimit().allQuery();
   req->rangeFacet("f", "vals_is").range(0, 30, 10).mincount(1)
       .sum("sum_score", "score_i");
   req->execute(true);
@@ -2903,7 +2903,7 @@ TEST_F(FacetTest, rangeFacetNestedUnderStringFacet) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  req->topDocs().getNumber(true).allQuery();
+  req->topDocs().countLimit().allQuery();
   req->facet("f", "cat_s").rangeFacet("r", "val_i").range(0, 20, 10);
   req->execute(true);
   ASSERT_OK(req);
@@ -3067,7 +3067,7 @@ TEST_F(FacetTest, numericFacetSubOpsAndEntryRepresentations) {
         facet.sum("total", "score_i").avg("mean", "score_i");
         facet.facet("cats", "cat_s").limit(-1);
         facet.rangeFacet("ranges", "score_i").range(0, 40, 20);
-        facet.topDocs("hits").allQuery().limit(1).getNumber().fields({"id"});
+        facet.topDocs("hits").allQuery().limit(1).countLimit().fields({"id"});
         auto& query = facet.facet("queries", field).rawOp().kind.emplace<api::QueryFacet>();
         auto* queryBuckets = api::build::allocArray(query.buckets, 1, req->mr);
         queryBuckets[0].name = "all";
@@ -3132,7 +3132,7 @@ TEST_F(FacetTest, numericFacetPinnedMetricsAndEmptyDomains) {
         std::array<int64_t, 2> pins{5, std::numeric_limits<int64_t>::min()};
         setSelected(facet, pins);
         facet.sum("total", "score_i");
-        facet.topDocs("hits").allQuery().limit(0).getNumber();
+        facet.topDocs("hits").allQuery().limit(0).countLimit();
         if (sort) qb::sort(facet, "total", qb::ASC);
         req->execute();
         ASSERT_OK(req);
@@ -3600,7 +3600,7 @@ TEST_F(FacetTest, textFacetSubOpsSortPinsAndDomains) {
         facet.expr("shifted", "sum(score_i + 1)");
         facet.facet("groups", "group_i").limit(-1).avg("mean", "score_i");
         facet.rangeFacet("ranges", "score_i").range(0, 40, 20);
-        facet.topDocs("hits").allQuery().limit(1).getNumber().fields({"id"});
+        facet.topDocs("hits").allQuery().limit(1).countLimit().fields({"id"});
         if (sort >= 0) qb::sort(facet, "total", sort == 0 ? qb::ASC : qb::DESC);
         req->execute(true);
         ASSERT_OK(req);
@@ -3691,7 +3691,7 @@ TEST_F(FacetTest, textFacetEmptyAndMissingInlineDomains) {
       setSelected(facet, pins);
       std::get<api::FieldFacet>(facet.rawOp().kind).missing = true;
       facet.avg("mean", "score_i");
-      facet.topDocs("hits").allQuery().limit(0).getNumber();
+      facet.topDocs("hits").allQuery().limit(0).countLimit();
       if (limit == -1) qb::sort(facet, "mean", qb::DESC);
       req->execute();
       ASSERT_OK(req);
@@ -3814,7 +3814,7 @@ TEST_F(FacetTest, emptyIndexForcePrepareNestedOps) {
   req->collection("main");
 
   auto& topDocs = req->topDocs();
-  topDocs.getNumber(true);
+  topDocs.countLimit();
   topDocs.rawQuery() = qb::all();
 
   topDocs.facet("f", "category_s").limit(10);
@@ -3852,7 +3852,7 @@ TEST_F(FacetTest, stringFacetMincountZeroShowsAllValues) {
   req->collection("main");
 
   auto& topDocs = req->topDocs();
-  topDocs.getNumber(true).matchQuery("sel_s", "yes");
+  topDocs.countLimit().matchQuery("sel_s", "yes");
 
   topDocs.facet("f", "cat_s").limit(-1).mincount(0);
 
@@ -3883,7 +3883,7 @@ TEST_F(FacetTest, stringFacetMincountZeroPadsZerosByValue) {
   req->collection("main");
 
   auto& topDocs = req->topDocs();
-  topDocs.getNumber(true).matchQuery("sel_s", "yes");
+  topDocs.countLimit().matchQuery("sel_s", "yes");
 
   topDocs.facet("f", "cat_s").limit(-1).mincount(0);
 
@@ -3918,7 +3918,7 @@ TEST_F(FacetTest, stringFacetMincountZeroPadsToFiniteLimit) {
   req->collection("main");
 
   auto& topDocs = req->topDocs();
-  topDocs.getNumber(true).matchQuery("sel_s", "yes");
+  topDocs.countLimit().matchQuery("sel_s", "yes");
 
   topDocs.facet("f", "cat_s").limit(4).mincount(0);
 
@@ -3953,7 +3953,7 @@ TEST_F(FacetTest, fullTextFacetMincountZeroShowsOutOfDomainTerms) {
   req->collection("main");
 
   auto& topDocs = req->topDocs();
-  topDocs.getNumber(true).matchQuery("sel_s", "yes");
+  topDocs.countLimit().matchQuery("sel_s", "yes");
 
   topDocs.facet("f", "body_w").limit(-1).mincount(0);
 
@@ -3999,7 +3999,7 @@ TEST_F(FacetTest, avgNestedSparseArrayDomain) {
   req->collection("main");
 
   auto& topDocs = req->topDocs();
-  topDocs.getNumber(true).matchQuery("pick_s", "yes");
+  topDocs.countLimit().matchQuery("pick_s", "yes");
 
   topDocs.avg("a", "val_i");
 
@@ -4028,7 +4028,7 @@ TEST_F(FacetTest, fullTextFacetMixedPresenceMissing) {
   req->collection("main");
 
   auto& topDocs = req->topDocs();
-  topDocs.getNumber(true).allQuery();
+  topDocs.countLimit().allQuery();
 
   auto& facet = topDocs.facet("f", "body_w");
   facet.limit(-1);
@@ -4077,7 +4077,7 @@ TEST_F(FacetTest, fullTextFacetSparseDomainMissing) {
   req->collection("main");
 
   auto& topDocs = req->topDocs();
-  topDocs.getNumber(true).matchQuery("pick_s", "yes");
+  topDocs.countLimit().matchQuery("pick_s", "yes");
 
   auto& facet = topDocs.facet("f", "body_w");
   facet.limit(-1);
@@ -4126,7 +4126,7 @@ TEST_F(FacetTest, facetAvgRespectsSelectiveDomain) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs();
-    topDocs.getNumber(true).matchQuery("sel_s", "yes");
+    topDocs.countLimit().matchQuery("sel_s", "yes");
     auto& facet = topDocs.facet("f", "cat_s");
     facet.limit(limit);
     facet.avg("av", "avgval_i");
@@ -4163,7 +4163,7 @@ TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
   auto& topDocs = req->topDocs();
-  topDocs.getNumber(true).matchQuery("sel_s", "yes");
+  topDocs.countLimit().matchQuery("sel_s", "yes");
   auto& facet = topDocs.facet("f", "cat_s");
   facet.limit(10);  // finite -> post-hoc sub-op path
   facet.avg("av", "avgval_i");
@@ -4351,7 +4351,7 @@ TEST_F(FacetTest, nestedStringFacetsAcrossSegmentsMatchOracle) {
             };
             if (filtered) {
               auto& top = req->topDocs("q");
-              top.getNumber(true).matchQuery("sel_s", "yes");
+              top.countLimit().matchQuery("sel_s", "yes");
               addFacets(top);
             } else {
               addFacets(*req);
@@ -4462,7 +4462,7 @@ TEST_F(FacetTest, stringColumnReplayMatchesBucketDomainsAcrossArities) {
     };
     if (filtered) {
       auto& top = req->topDocs("q");
-      top.getNumber(true).matchQuery("sel_s", "yes");
+      top.countLimit().matchQuery("sel_s", "yes");
       addFacet(top);
     } else {
       addFacet(*req);
@@ -5433,7 +5433,7 @@ public:
             int numQueries = 1 + localRng.rint(3);  // 1..3
             for (int qi = 0; qi < numQueries; qi++) {
               auto& topDocs = req->topDocs("q" + std::to_string(qi));
-              topDocs.getNumber(true);
+              topDocs.countLimit();
               makeRandomQuery(localRng, topDocs, fields);
               for (size_t f = 0; f < fields.size(); f++) {
                 if (localRng.rint(100) < 70) {
@@ -5612,7 +5612,7 @@ TEST_F(FacetTest, selectedFacetsRefineSidewaysWithUnionBuckets) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(R"json({"ops":{"q":{"top_docs":{
-    "limit":0,"get_number":true,
+    "limit":0,"count_limit":-1,
     "ops":{
       "brands":{"field_facet":{"field":"brand_s","limit":1,
         "mincount":1,"selected":["acme","globex"],
@@ -5658,7 +5658,7 @@ TEST_F(FacetTest, selectedAnyComposesPerValueCacheEntries) {
 
   auto prime = localReq(luxirNode->getSearchEngine());
   auto& primeTop = prime->collection("main").topDocs("q")
-      .allQuery().getNumber().limit(0);
+      .allQuery().countLimit().limit(0);
   primeTop.facet("brands", "brand_s").limit(-1);
   primeTop.filter(
       qb::match(primeTop.mr(), "color_s", "red"), {"brands"});
@@ -5670,7 +5670,7 @@ TEST_F(FacetTest, selectedAnyComposesPerValueCacheEntries) {
   SkipStatsScope stats;
   auto req = localReq(luxirNode->getSearchEngine());
   auto& top = req->collection("main").topDocs("q")
-      .allQuery().getNumber().limit(0);
+      .allQuery().countLimit().limit(0);
   std::array<std::string, 2> selected{"red", "blue"};
   setSelected(top.facet("colors", "color_s").limit(-1), selected);
   top.facet("brands", "brand_s").limit(-1);
@@ -5731,7 +5731,7 @@ TEST_F(FacetTest, selectedFieldPinsAppendAfterNaturalPage) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(R"({"ops":{"q":{"top_docs":{
-    "limit":0,"get_number":true,
+    "limit":0,"count_limit":-1,
     "ops":{"brands":{"field_facet":{"field":"brand_s","limit":1,
       "mincount":2,"selected":["absent","rare"]}}}}}}})",
       req->rawRequest(), req->mr);
@@ -5817,7 +5817,7 @@ TEST_F(FacetTest, selectedEmptyRangeBucketRunsSubOps) {
   }, UpdateMessage::COMMIT);
 
   auto req = localReq(luxirNode->getSearchEngine());
-  parseQueryRequest(R"json({"limit":0,"get_number":true,
+  parseQueryRequest(R"json({"limit":0,"count_limit":-1,
     "ops":{"prices":{"range_facet":{"field":"price_i",
       "start":0,"end":200,"gap":100,"mincount":1,"selected":[100],
       "ops":{"avg_price":"avg(price_i)"}}}}})json",
@@ -5846,7 +5846,7 @@ TEST_F(FacetTest, selectedIntFieldPinsShareFieldFinalization) {
   }, UpdateMessage::COMMIT);
 
   auto req = localReq(luxirNode->getSearchEngine());
-  parseQueryRequest(R"({"limit":0,"get_number":true,
+  parseQueryRequest(R"({"limit":0,"count_limit":-1,
     "ops":{"codes":{"field_facet":{"field":"code_i","limit":1,
       "mincount":2,"selected":[99,2]}}}})",
     req->rawRequest(), req->mr);
@@ -5898,7 +5898,7 @@ TEST_F(FacetTest, selectedAllIsStrictOnMultiValuedFields) {
   SkipStatsScope stats;
   auto req = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(R"({"ops":{"q":{"top_docs":{
-    "limit":0,"get_number":true,
+    "limit":0,"count_limit":-1,
     "ops":{"tags":{"field_facet":{"field":"tags_ss","limit":-1,
       "selected":["x","y"],"selection_mode":"all"}}}}}}})",
       req->rawRequest(), req->mr);
@@ -5925,7 +5925,7 @@ TEST_F(FacetTest, selectedComposesWithExplicitRoutedFilter) {
   SkipStatsScope stats;
   auto req = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(R"({"ops":{"q":{"top_docs":{
-    "limit":0,"get_number":true,
+    "limit":0,"count_limit":-1,
     "filter":[{"query":"stock_s:yes","except_ops":["brands"]}],
     "ops":{"brands":{"field_facet":{"field":"brand_s","limit":-1,
       "selected":["acme"]}}}}}}})", req->rawRequest(), req->mr);
@@ -5951,7 +5951,7 @@ TEST_F(FacetTest, selectedTextFoldIsSharedByPinsAndFilter) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(R"({"ops":{"q":{"top_docs":{
-    "limit":-1,"fields":["id"],"get_number":true,
+    "limit":-1,"fields":["id"],"count_limit":-1,
     "ops":{"terms":{"field_facet":{"field":"body_un","limit":0,
       "selected":["ThOmAs"]}}}}}}})", req->rawRequest(), req->mr);
   req->collection("main");
@@ -6005,7 +6005,7 @@ TEST_F(FacetTest, selectedValidationIsParseTime) {
   }}}})", "facet 'brands' at Fusion.ops: selected is only supported on facets directly inside TopDocs.ops");
 
   auto duplicates = localReq(luxirNode->getSearchEngine());
-  parseQueryRequest(R"({"limit":0,"get_number":true,
+  parseQueryRequest(R"({"limit":0,"count_limit":-1,
     "ops":{"f":{"field_facet":{"field":"price_i","limit":0,
       "selected":[10,10.0]}}}})",
       duplicates->rawRequest(), duplicates->mr);
@@ -6053,7 +6053,7 @@ TEST_F(FacetTest, randomSelectedFacetsMatchExactOracle) {
     std::array<Selection, 3> selections;
     auto req = localReq(luxirNode->getSearchEngine());
     auto& top = req->collection("main").topDocs("q").allQuery()
-        .getNumber().limit(0);
+        .countLimit().limit(0);
     for (int facet = 0; facet < 3; facet++) {
       auto& selection = selections[(size_t)facet];
       selection.mode = (random() & 1U) == 0
@@ -6257,9 +6257,9 @@ TEST_F(FacetTest, floatingRangeResetIdentity) {
     auto req = localReq(helper.getSearchEngine());
     ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","query":"id:0",
       "limit":0,"ops":{"f":{"range_facet":{"field":"value_f","start":0,"end":4,"gap":2,
-        "ops":{"n":{"top_docs":{"limit":0,"get_number":true},"domain":{"query":"*:*"}}}}},
+        "ops":{"n":{"top_docs":{"limit":0,"count_limit":-1},"domain":{"query":"*:*"}}}}},
       "d":{"range_facet":{"field":"value_d","start":0,"end":4,"gap":2,
-        "ops":{"n":{"top_docs":{"limit":0,"get_number":true},"domain":{"query":"*:*"}}}}}}})",
+        "ops":{"n":{"top_docs":{"limit":0,"count_limit":-1},"domain":{"query":"*:*"}}}}}}})",
       req->mr));
     req->execute(parallel);
     ASSERT_OK(req);
@@ -7199,7 +7199,7 @@ TEST_F(FacetTest, dataResultChildrenMatchExplicit) {
         std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
         facet.avg("avg", "score_i");
         facet.facet("tags", "tag_s").limit(-1);
-        auto& hits = facet.topDocs("hits").allQuery().limit(-1).fields({"id"}).getNumber();
+        auto& hits = facet.topDocs("hits").allQuery().limit(-1).fields({"id"}).countLimit();
         qb::sort(hits, "id", qb::ASC);
       }
       req->execute(parallel);
@@ -7314,7 +7314,7 @@ TEST_F(FacetTest, dataBucketResetKeepsAncestorAndBucketIdentity) {
       ASSERT_TRUE(api::read_json(req->rawRequest(), R"({"collection":"main","query":"id:a","limit":0,"ops":{
         "p":{"field_facet":{"field":"cat_s","ops":{
           "h":{"range_facet":{"field":"n_i","bounds":"data","gap":10,"ops":{
-            "hits":{"top_docs":{"limit":-1,"sort":"id asc","fields":["id"],"get_number":true},"domain":{"query":"*:*","filter":["stock_i:1"]}},
+            "hits":{"top_docs":{"limit":-1,"sort":"id asc","fields":["id"],"count_limit":-1},"domain":{"query":"*:*","filter":["stock_i:1"]}},
             "y":{"range_facet":{"field":"y_i","bounds":"data","gap":50},"domain":{"query":"*:*","filter":["stock_i:1"]}}}}},
           "reset":{"range_facet":{"field":"y_i","bounds":"data","gap":50},"domain":{"query":"*:*","filter":["stock_i:1"]}}
         }}}}})", req->mr));

@@ -11719,6 +11719,9 @@ public:
           survivor = shortcut;
         }
         sum = std::min<int64_t>(segment.maxDoc(), sum + shortcut.maxMatches);
+        if (required == 0 && prohibitedWeights.empty() && minShouldMatch <= 1) {
+          bound.minMatches = std::max(bound.minMatches, shortcut.minMatches);
+        }
       }
       if (minShouldMatch > (int64_t)live) return {0, CountHow::METADATA};
       if (required == 0 && prohibitedWeights.empty() && minShouldMatch <= 1 && live <= 1) {
@@ -11727,24 +11730,6 @@ public:
       bound.maxMatches = std::min(bound.maxMatches, sum);
     }
     if (bound.maxMatches == 0) bound.how = CountHow::METADATA;
-    return bound;
-  }
-
-  // A lone required clause bounds membership when optionals only score; a
-  // pure disjunction matches at least its largest clause. Conjunctions,
-  // exclusions and minimum-match groups prove nothing from metadata.
-  int64_t matchLowerBound(IndexReader::Segment& segment) override {
-    if (!prohibitedWeights.empty()) return 0;
-    size_t required = mandatoryWeights.size() + filterWeights.size();
-    if (required == 1 && minShouldMatch < 1) {
-      auto* child = mandatoryWeights.empty() ? filterWeights.front() : mandatoryWeights.front();
-      return child ? child->matchLowerBound(segment) : 0;
-    }
-    if (required != 0 || minShouldMatch > 1) return 0;
-    int64_t bound = 0;
-    for (auto* child : optionalWeights) {
-      if (child) bound = std::max(bound, child->matchLowerBound(segment));
-    }
     return bound;
   }
 

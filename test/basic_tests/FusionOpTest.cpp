@@ -189,7 +189,7 @@ TEST_F(FusionOpTest, rrfTextAndKnn) {
   auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
-  fusion.get_number = true;
+  fusion.count_limit = -1;
   fusion.get_scores = true;
   addField(fusion, "id", mr);
   fusion.method.emplace<api::RrfFusion>().k = 60;
@@ -242,7 +242,7 @@ TEST_F(FusionOpTest, sharedFilter) {
   auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
-  fusion.get_number = true;
+  fusion.count_limit = -1;
   fusion.get_scores = true;
   addField(fusion, "id", mr);
   fusion.method.emplace<api::RrfFusion>().k = 60;
@@ -333,7 +333,7 @@ TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
   for (int round = 0; round < 3; round++) {
     auto warm = localReq(luxirNode->getSearchEngine());
     warm->collection("main");
-    auto& topDocs = warm->topDocs("q").getNumber().limit(0);
+    auto& topDocs = warm->topDocs("q").countLimit().limit(0);
     topDocs.rawQuery() = countQuery(topDocs.mr());
     warm->execute(false);
     ASSERT_OK(warm);
@@ -346,13 +346,13 @@ TEST_F(FusionOpTest, pureCountWholeHitComposesSharedDomain) {
       lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
-  fusion.get_number = true;
+  fusion.count_limit = -1;
   addField(fusion, "id", mr);
   fusion.method.emplace<api::RrfFusion>().k = 60;
 
   auto& countSource = addSource(fusion, "count", mr);
   countSource.limit = 0;
-  countSource.get_number = true;
+  countSource.count_limit = -1;
   countSource.query = arenaQuery(mr, countQuery(mr));
   auto& rankedSource = addSource(fusion, "ranked", mr);
   rankedSource.limit = 10;
@@ -454,7 +454,7 @@ TEST_F(FusionOpTest, topKCountWholeHitComposesSharedDomainOnce) {
   for (int round = 0; round < 3; round++) {
     auto warm = localReq(luxirNode->getSearchEngine());
     warm->collection("main");
-    auto& topDocs = warm->topDocs("q").getNumber().getScores()
+    auto& topDocs = warm->topDocs("q").countLimit().getScores()
         .fields({"id"}).limit(10);
     topDocs.rawQuery() = rankedQuery(topDocs.mr());
     warm->execute(false);
@@ -468,13 +468,13 @@ TEST_F(FusionOpTest, topKCountWholeHitComposesSharedDomainOnce) {
       lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
-  fusion.get_number = true;
+  fusion.count_limit = -1;
   addField(fusion, "id", mr);
   fusion.method.emplace<api::RrfFusion>().k = 60;
 
   auto& source = addSource(fusion, "ranked", mr);
   source.limit = 10;
-  source.get_number = true;
+  source.count_limit = -1;
   source.get_scores = true;
   source.query = arenaQuery(mr, rankedQuery(mr));
   addFilter(fusion.filter, qb::match(mr, "keep_s", "yes"), mr);
@@ -511,7 +511,7 @@ TEST_F(FusionOpTest, sharedKnnFilter) {
   auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
-  fusion.get_number = true;
+  fusion.count_limit = -1;
   addField(fusion, "id", mr);
   fusion.method.emplace<api::RrfFusion>().k = 60;
 
@@ -562,7 +562,7 @@ TEST_F(FusionOpTest, rrfMultiSegment) {
   auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
-  fusion.get_number = true;
+  fusion.count_limit = -1;
   fusion.get_scores = true;
   addField(fusion, "id", mr);
   fusion.method.emplace<api::RrfFusion>().k = 60;
@@ -642,7 +642,7 @@ TEST_F(FusionOpTest, subOpsUseFusedCandidates) {
           "knn":{"query":{"knn":{"field":"embedding_v","query":[0],"k":2}},
                  "limit":2}},
         "filter":[{"match":{"keep_s":"yes"}}],"rrf":{},
-        "get_number":true,"fields":["id"],
+        "count_limit":-1,"fields":["id"],
         "ops":{
           "colors":{"field_facet":{"field":"color_s","ops":{
             "ids":{"field_facet":{"field":"id"}}}}},
@@ -717,7 +717,7 @@ TEST_F(FusionOpTest, sharedAndPerSourceFilter) {
   auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 10;
-  fusion.get_number = true;
+  fusion.count_limit = -1;
   addField(fusion, "id", mr);
   fusion.method.emplace<api::RrfFusion>().k = 60;
 
@@ -746,6 +746,30 @@ TEST_F(FusionOpTest, sharedAndPerSourceFilter) {
 
 // Validation: missing required pieces surface as
 // errors in the response.
+TEST_F(FusionOpTest, countLimit) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{flatdoc("id", "a"), flatdoc("id", "b")},
+                             UpdateMessage::COMMIT).success);
+  for (int64_t limit : {-2, -1, 0, 1, 10}) {
+    auto req = localReq(helper.getSearchEngine());
+    parseQueryRequest(R"({"ops":{"f":{"fusion":{"sources":{"a":{}},"rrf":{},"count_limit":)"
+        + std::to_string(limit) + "}}}}", req->rawRequest(), req->mr);
+    req->collection("main");
+    ExpectLog quiet("Search request rejected");
+    req->execute(1);
+    if (limit < -1) {
+      EXPECT_FALSE(req->ok());
+      EXPECT_NE(std::string::npos, req->errorMsg().find("count_limit must be >= -1"));
+    } else {
+      ASSERT_OK(req);
+      auto* docs = req->docList("f");
+      EXPECT_EQ(limit != 0, docs->found.has_value());
+      if (limit != 0) { EXPECT_EQ(2, docs->found); }
+      EXPECT_FALSE(docs->found_gte);
+    }
+  }
+}
+
 TEST_F(FusionOpTest, validation) {
   CollectionHelper h("main");
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple"), UpdateMessage::COMMIT);
@@ -809,7 +833,7 @@ TEST_F(FusionOpTest, emptyIndex) {
   auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
   auto& mr = lreq->mr;
   fusion.limit = 5;
-  fusion.get_number = true;
+  fusion.count_limit = -1;
   fusion.method.emplace<api::RrfFusion>().k = 60;
   setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
 
@@ -836,7 +860,7 @@ TEST_F(FusionOpTest, emptyIndexWithTwoSourcesSpawnsNoTasks) {
   req->collection("main");
   auto& fusion = req->topDocs("f").rawOp().kind.emplace<api::Fusion>();
   fusion.limit = 5;
-  fusion.get_number = true;
+  fusion.count_limit = -1;
   fusion.method.emplace<api::RrfFusion>().k = 60;
   setTextSource(addSource(fusion, "text", req->mr), req->mr, "foo_w", "apple", 5);
   setTextSource(addSource(fusion, "other", req->mr), req->mr, "foo_w", "banana", 5);
@@ -932,7 +956,7 @@ TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
     auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<luxir::api::Fusion>();
     auto& mr = lreq->mr;
     fusion.limit = -1;
-    fusion.get_number = true;
+    fusion.count_limit = -1;
     addField(fusion, "id", mr);
     fusion.method.emplace<api::RrfFusion>().k = 60;
     // 10 sources, each a boolean of 2 optional kNN clauses => 20 kNN weights,
@@ -982,7 +1006,7 @@ TEST_F(FusionOpTest, offsetPagesSourceWindows) {
     auto& cursor = req->collection("main").topDocs("f");
     auto& fusion = cursor.rawOp().kind.emplace<api::Fusion>();
     cursor.offset(offset).limit(limit);
-    fusion.get_number = true;
+    fusion.count_limit = -1;
     fusion.get_scores = true;
     fusion.method.emplace<api::RrfFusion>();
     addField(fusion, "id", req->mr);
@@ -1071,7 +1095,7 @@ protected:
         "apple":{"query":{"match":{"foo_w":"apple"}}},
         "banana":{"query":{"match":{"foo_w":"banana"}},
                   "sort":[{"expr":"prio_i","dir":"desc"}]}},
-        "get_number":true,"get_scores":true,"fields":["id"],
+        "count_limit":-1,"get_scores":true,"fields":["id"],
         "ops":{"ids":{"field_facet":{"field":"id"}}},)"
         + std::string(extra) + "}}}}", req->rawRequest(), req->mr);
     req->execute();
@@ -1201,7 +1225,7 @@ protected:
                      std::string_view collection = "main") {
     auto req = localReq(luxirNode->getSearchEngine());
     parseQueryRequest(R"({"ops":{"f":{"fusion":{"sources":{)" + std::string(sources)
-        + R"(},"get_number":true,"get_scores":true,"fields":["id"],
+        + R"(},"count_limit":-1,"get_scores":true,"fields":["id"],
         "ops":{"ids":{"field_facet":{"field":"id"}}},)" + std::string(extra) + "}}}}",
         req->rawRequest(), req->mr);
     req->collection(collection);

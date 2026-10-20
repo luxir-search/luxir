@@ -334,9 +334,6 @@ public:
       return childWeight->countShortcut(segment, domain);
     }
 
-    int64_t matchLowerBound(IndexReader::Segment& segment) override {
-      return childWeight->matchLowerBound(segment);
-    }
   };
 };
 

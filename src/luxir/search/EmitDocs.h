@@ -905,8 +905,8 @@ public:
   std::span<ReturnField> fields;  // resolved selectors
   int32_t maxBatchSize;
   int64_t offset;
-  bool getNumber;
-  bool foundIsLowerBound;
+  bool emitCount;
+  bool foundGte;
   bool getScores;
   // Resolved DocFormat: ROWS, COLUMNS or ADAPTIVE.  Every field loads as a
   // column; placeBatchColumns settles each batch's placement.  The synthetic
@@ -930,13 +930,13 @@ public:
   DocEmitterImpl(SearchRequest& req, GetDocList getDocList, GetDoc getDoc,
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
                  std::span<ReturnField> fields, int32_t maxBatchSize,
-                 int64_t offset, bool getNumber, bool foundIsLowerBound, bool getScores,
+                 int64_t offset, bool emitCount, bool foundGte, bool getScores,
                  luxir::api::DocFormat placement, bool parallel, size_t colCap,
                  DocBatchMetadata metadata)
       : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
-        metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
-        foundIsLowerBound(foundIsLowerBound), getScores(getScores), placement(placement),
+        metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
+        foundGte(foundGte), getScores(getScores), placement(placement),
         parallel(parallel), colCap(colCap),
         batchStart(std::min(offset, numCollected)) {}
 
@@ -1005,9 +1005,9 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       response.proto.more = true;  // also set at the response level for easier client handling.
     }
 
-    if (getNumber) {
+    if (emitCount) {
       docListProto.found = totalHits;
-      docListProto.found_is_lower_bound = foundIsLowerBound;
+      docListProto.found_gte = foundGte;
     }
 
     // Materialize just this batch's docs from getDoc.  Field loaders need a
@@ -1442,12 +1442,12 @@ void emitDocsResponse(SearchRequest& req,
                       std::span<const std::string_view> fields,
                       int32_t batchSize,
                       int64_t offset,
-                      bool getNumber,
+                      bool emitCount,
                       bool getScores,
                       luxir::api::DocFormat docFormat,
                       DocEmission emission,
                       DocBatchMetadata metadata = {},
-                      bool foundIsLowerBound = false)
+                      bool foundGte = false)
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1492,7 +1492,7 @@ void emitDocsResponse(SearchRequest& req,
   auto* emitter = luxir::arenaCreate<Impl>(req.arena, req,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
-      maxBatchSize, offset, getNumber, foundIsLowerBound, getScores, placement,
+      maxBatchSize, offset, emitCount, foundGte, getScores, placement,
       /*parallel=*/req.tg != nullptr, colCap, std::move(metadata));
   req.streamStarted();
   emitter->produce();

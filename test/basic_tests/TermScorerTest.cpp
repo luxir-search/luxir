@@ -9429,10 +9429,10 @@ TEST_F(TermScorerTest, CrossSegmentAccumulatorCorpusChecks) {
 }
 
 // Regression for the 1f bug: impact block skipping under-counts the total hit count
-// (matches / get_number), since skipped docs are never visited.  collectTopK must keep
+// (count_limit: -1), since skipped docs are never visited.  collectTopK must keep
 // pruning OFF (allowPruning=false) when an exact count is needed, so every match is
 // visited; only then does totalHits() equal the true docfreq.
-TEST_F(TermScorerTest, getNumberDisablesImpactSkipping) {
+TEST_F(TermScorerTest, exactCountDisablesImpactSkipping) {
   const int32_t N = 6 * Postings::DOCS_BLOCK_SIZE + 17;  // multi-block common term
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
@@ -9454,7 +9454,7 @@ TEST_F(TermScorerTest, getNumberDisablesImpactSkipping) {
   auto& segment = qContext.topReader.segments()[0];
   const int32_t k = 5;  // small k: with pruning ON the threshold would rise and skip blocks.
 
-  // allowPruning=false (the get_number path): pruning is disabled, so every match is
+  // allowPruning=false (the exact-count path): pruning is disabled, so every match is
   // visited and totalHits() is the exact docfreq (== N).  "needle" is in every doc.
   // This is a valid guard: skipping DOES fire on this corpus when allowed, so a broken
   // gate (pruning despite allowPruning=false) would drop the count below N and fail here.

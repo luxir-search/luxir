@@ -75,6 +75,7 @@ class ScoreCollector {
       std::unique_ptr<Admission>, NoCollapseAdmission> groups;
 
   int64_t hitCount = 0;
+  bool countIncomplete = false;
 
   float minCompetitiveVal = std::numeric_limits<float>::lowest();
 
@@ -122,7 +123,7 @@ class ScoreCollector {
 
       // topCount == 0: keep no docs, just count hits (the heap has zero capacity, so any
       // insert/top() would be out of bounds).  hitCount above still yields an accurate
-      // total, so get_number and sub-op domains are unaffected.
+      // total, so requested counts and sub-op domains are unaffected.
       if (topCount == 0) {
         return;
       }
@@ -191,6 +192,7 @@ class ScoreCollector {
   void merge(ScoreCollector& other) {
     // Self-merge would iterate a span that collect() can reallocate out from under us.
     assert(this != &other);
+    countIncomplete |= other.countIncomplete;
     // In some scenarios, popping the top of the other heap until it's no longer competitive will be faster,
     // while in other scenarios just a linear scan of the other heap will be faster.
     // We'll just do a linear scan for now.
@@ -409,18 +411,13 @@ public:
   MaxScoreAccumulator() : maxScore(std::numeric_limits<float>::lowest()) {
   }
 
-  void holdUntilHits(int64_t threshold) {
+  void holdUntilHits(int64_t threshold, bool boundProven) {
     hitThreshold = threshold;
-    pruningOpen.store(threshold <= 0, std::memory_order_relaxed);
+    pruningOpen.store(boundProven || threshold <= 0, std::memory_order_relaxed);
   }
 
   bool canPrune() const {
     return pruningOpen.load(std::memory_order_relaxed);
-  }
-
-  // True when a threshold was held and has been reached.
-  bool hitThresholdReached() const {
-    return hitThreshold > 0 && canPrune();
   }
 
   // Returns whether pruning is open after counting `hits` more.
@@ -464,7 +461,13 @@ public:
   HeldHitCounter& operator=(const HeldHitCounter&) = delete;
 
   ~HeldHitCounter() {
-    if (holding && pending > 0) accumulator->countHits(pending);
+    flush();
+  }
+
+  bool flush() {
+    if (holding && pending > 0) holding = !accumulator->countHits(pending);
+    pending = 0;
+    return !holding;
   }
 
   // Returns true when this call observed pruning open.
@@ -491,11 +494,9 @@ enum class DomainBuildMode : uint8_t {
 // Precondition: caller is responsible for any per-segment setup on `collector`.  In
 // particular, FieldSortCollector requires `setSegment(segnum, &postingsReader)` to be
 // called before this; TopDocsCollector has no per-segment setup.
-// allowPruning: when false (e.g. the request asks for an exact total hit count via
-// get_number), the rising threshold is NOT pushed to the scorer, so impact block
-// skipping stays off and every matching doc is visited.  Dynamic pruning and an exact
-// total count are mutually exclusive - skipping does not visit (cannot count) the docs
-// it skips - so a query that needs the count must forgo pruning.
+// allowPruning=false keeps the competitive threshold at lowest. Exact totals
+// may instead come from a separate count or known membership. A bounded count
+// holds the threshold until enough hits have been counted, then permits pruning.
 template <typename Collector>
 void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
                  DocSetBuilder* builder, Collector& collector, bool allowPruning = true,
@@ -542,6 +543,11 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       if (minCompetitiveScore > lastPushedMinCompetitiveScore) {
         scorer->setMinCompetitiveScore(minCompetitiveScore);
         lastPushedMinCompetitiveScore = minCompetitiveScore;
+        if constexpr (requires { collector.countIncomplete; }) {
+          if (accumulator != nullptr && accumulator->hitThreshold > 0) {
+            collector.countIncomplete = true;
+          }
+        }
       }
     } else {
       unused(localScore, localRise, periodicPoll, lastPushedMinCompetitiveScore,
@@ -581,6 +587,11 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       if (seed > lastPushedMinCompetitiveScore) {
         scorer->setMinCompetitiveScore(seed);
         lastPushedMinCompetitiveScore = seed;
+        if constexpr (requires { collector.countIncomplete; }) {
+          if (accumulator != nullptr && accumulator->hitThreshold > 0) {
+            collector.countIncomplete = true;
+          }
+        }
       }
     }
   }
@@ -804,10 +815,13 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
 
 inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
                                      DocSet* filter, auto& collector,
-                                     int64_t topCount) {
+                                     int64_t topCount,
+                                     MaxScoreAccumulator* accumulator = nullptr) {
   assert(scorer != nullptr);
   assert(topCount > 0);
   int64_t collected = 0;
+  HeldHitCounter held(accumulator, true);
+  bool stopped = false;
   auto complete = [&](int32_t doc) {
     if constexpr (std::remove_cvref_t<decltype(collector)>::isCollapsed) {
       // This pull is in doc order with one constant score. Stop only once
@@ -815,11 +829,17 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
       // segdoc. An earlier segment must still improve later tied heads.
       return collector.size() == topCount
           && segdoc(segnum, doc) >= collector.pq.top().doc;
-    } else { unused(doc); return collected >= topCount; }
+    } else { unused(doc); return collected >= topCount && !held.holding; }
   };
   auto collectOne = [&](int32_t doc) {
-    collector.collect(segnum, doc, scorer->score());
+    if (collected < topCount || std::remove_cvref_t<decltype(collector)>::isCollapsed) {
+      collector.collect(segnum, doc, scorer->score());
+    } else collector.hitCount++;
     collected++;
+    if (held.holding) {
+      held.add(1);
+      if (collected == topCount) held.flush();
+    }
   };
 
   if (filter == nullptr || filter->type == DocSet::BITSET) {
@@ -834,7 +854,7 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
         continue;
       }
       collectOne(doc);
-      if (complete(doc)) break;
+      if (complete(doc)) { stopped = true; break; }
     }
   } else {
     for (int32_t doc : ((ArrDocSet*) filter)->docs()) {
@@ -846,12 +866,16 @@ inline int64_t collectFirstKConstant(int32_t segnum, Query::Scorer* scorer,
       }
       collectOne(doc);
       if (complete(doc)) {
+        stopped = true;
         break;
       }
     }
   }
   if constexpr (std::remove_cvref_t<decltype(collector)>::isCollapsed) {
     if (SkipStats::enabled) SkipStats::collapseDocsVisited += collected;
+  }
+  if (stopped && accumulator != nullptr && accumulator->hitThreshold > 0) {
+    collector.countIncomplete = true;
   }
   return collected;
 }
@@ -929,6 +953,7 @@ inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
 
 enum class ConstantScoreDrain : uint8_t {
   LIMIT_ONLY,
+  BOUNDED,
   COMPLETE,
 };
 
@@ -942,10 +967,12 @@ enum class ConstantScoreDrain : uint8_t {
 inline void collectFirstKConstantWindowed(
     int32_t segnum, BulkScorer* bulk, DocSet* filter, DocSetBuilder* builder,
     auto& collector, int32_t maxDoc,
-    ConstantScoreDrain drain) {
+    ConstantScoreDrain drain, MaxScoreAccumulator* accumulator = nullptr) {
   assert(bulk != nullptr);
   assert(collector.topCount > 0);
   assert(drain == ConstantScoreDrain::COMPLETE || builder == nullptr);
+  HeldHitCounter held(accumulator, drain == ConstantScoreDrain::BOUNDED);
+  bool skipped = false;
   skipCount(SkipStats::constantWindowCaptures);
   bulk->setTopKDepth((int32_t) collector.topCount, false);
   int64_t collected = 0;
@@ -967,12 +994,17 @@ inline void collectFirstKConstantWindowed(
       if (collected < collector.topCount) {
         collector.collect(segnum, doc, window.scores[(size_t) i]);
         collected++;
-      } else if (drain == ConstantScoreDrain::COMPLETE) {
+      } else if (drain == ConstantScoreDrain::COMPLETE || held.holding) {
         // The capture window ran past K; these are count-only.
         collector.hitCount++;
         overshoot++;
       } else {
+        skipped = true;
         break;
+      }
+      if (held.holding) {
+        held.add(1);
+        if (collected == collector.topCount && overshoot == 0) held.flush();
       }
     }
     if (next == PostingsReader::END) {
@@ -982,7 +1014,13 @@ inline void collectFirstKConstantWindowed(
     assert(next > cursor);
     cursor = next;
   }
-  if (drain == ConstantScoreDrain::LIMIT_ONLY) {
+  held.flush();
+  if (drain == ConstantScoreDrain::LIMIT_ONLY
+      || (drain == ConstantScoreDrain::BOUNDED && !held.holding)) {
+    if (accumulator != nullptr && accumulator->hitThreshold > 0
+        && (skipped || (cursor != PostingsReader::END && cursor < maxDoc))) {
+      collector.countIncomplete = true;
+    }
     return;
   }
   if (cursor != PostingsReader::END && cursor < maxDoc) {
@@ -990,12 +1028,21 @@ inline void collectFirstKConstantWindowed(
   }
   int64_t count = 0;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
+    int64_t before = count;
     int32_t next = bulk->countNextWindow(count, builder, filter, cursor, maxDoc);
+    if (held.holding) {
+      held.add(count - before);
+      held.flush();
+    }
     if (next == PostingsReader::END) {
       break;
     }
     assert(next > cursor);
     cursor = next;
+    if (drain == ConstantScoreDrain::BOUNDED && !held.holding && cursor < maxDoc) {
+      collector.countIncomplete = true;
+      break;
+    }
   }
   collector.hitCount += count;
   assert(builder == nullptr
@@ -2187,6 +2234,10 @@ void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
       : accumulator != nullptr
         ? std::max(localTheta, accumulator->get())
         : localTheta;
+    if (accumulator != nullptr && accumulator->hitThreshold > 0
+        && theta > std::numeric_limits<float>::lowest()) {
+      collector.countIncomplete = true;
+    }
     int32_t next = bulk->scoreNextWindow(window, filter, cursor, maxDoc, theta);
 
     if (exactScorer != nullptr && window.size > 0) {

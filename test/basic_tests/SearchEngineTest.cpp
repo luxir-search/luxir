@@ -543,7 +543,7 @@ WholeCountRun runWholeCount(
   auto req = localReq(engine);
   req->testForcePrepare = forcePrepare;
   req->collection(collection);
-  auto& topDocs = req->topDocs("q").getNumber().limit(0);
+  auto& topDocs = req->topDocs("q").countLimit().limit(0);
   if (getScores) topDocs.getScores();
   topDocs.rawQuery() = buildQuery(topDocs.mr());
 
@@ -642,7 +642,7 @@ WholeTopKRun runWholeTopK(
   auto req = localReq(engine);
   req->collection(collection);
   auto& topDocs = req->topDocs("q").getScores().fields({"id"}).limit(limit);
-  if (exactCount) topDocs.getNumber();
+  if (exactCount) topDocs.countLimit();
   topDocs.rawQuery() = wholeTopKQuery(
       topDocs.mr(), family, key, constant);
 
@@ -702,7 +702,7 @@ ResidentExactDomainRun runResidentExactDomain(
   auto req = localReq(engine);
   req->collection(collection);
   auto& topDocs = req->topDocs("q").getScores().fields({"id"}).limit(limit);
-  if (getNumber) topDocs.getNumber();
+  if (getNumber) topDocs.countLimit();
   std::string phrase = std::string(key) + "a " + std::string(key) + "b";
   auto query = qb::phraseText(topDocs.mr(), "body_w", phrase);
   topDocs.rawQuery() = constant
@@ -801,7 +801,7 @@ WholeFieldSortRun runWholeFieldSort(
   auto req = localReq(engine);
   req->collection(collection);
   auto& topDocs = req->topDocs("q").fields({"id"}).limit(limit);
-  if (exactCount) topDocs.getNumber();
+  if (exactCount) topDocs.countLimit();
   if (getScores) topDocs.getScores();
   std::string a = std::string(key) + "a";
   std::string b = std::string(key) + "b";
@@ -975,7 +975,7 @@ SparseFilteredTopKResult runSparseFilteredTopK(
   auto req = localReq(engine);
   req->collection(collection);
   auto& cur = req->topDocs("q").getScores().fields({"id"}).limit(topCount);
-  if (exact) cur.getNumber();
+  if (exact) cur.countLimit();
   cur.rawQuery() = filteredCountBody(cur.mr(), shape);
   if (!filter.empty()) {
     cur.matchFilter("filter_w", filter);
@@ -1034,7 +1034,7 @@ FilteredCountResult runFilteredCount(SearchEngine& engine,
                                      std::string_view collection = "main") {
   auto req = localReq(engine);
   req->collection(collection);
-  auto& cur = req->topDocs("q").getNumber().limit(0);
+  auto& cur = req->topDocs("q").countLimit().limit(0);
   api::Query body = filteredCountBody(cur.mr(), shape);
   if (path == FilteredCountPath::PLAIN_INTERSECTION) {
     cur.rawQuery() = qb::boolean(cur.mr(),
@@ -1077,7 +1077,7 @@ FilteredCountResult runUnfilteredCount(SearchEngine& engine,
                                        std::string_view collection) {
   auto req = localReq(engine);
   req->collection(collection);
-  auto& cur = req->topDocs("q").getNumber().limit(0);
+  auto& cur = req->topDocs("q").countLimit().limit(0);
   cur.rawQuery() = filteredCountBody(cur.mr(), shape);
 
   SkipStatsGuard statsGuard;
@@ -1260,10 +1260,10 @@ void expectPrunedFacetTwoPassMatchesExhaustive(CollectionHelper& helper,
 
   auto baseline = localReq(helper.getSearchEngine());
   baseline->collection("main");
-  auto& baselineRank = baseline->topDocs("rank").getNumber().getScores()
+  auto& baselineRank = baseline->topDocs("rank").countLimit().getScores()
       .fields({"id"}).limit(topK);
   setPrunableDisjunction(baselineRank);
-  auto& baselineDomain = baseline->topDocs("domain").getNumber().limit(0);
+  auto& baselineDomain = baseline->topDocs("domain").countLimit().limit(0);
   setPrunableDisjunction(baselineDomain);
   baselineDomain.facet("groups", "group_s").limit(-1);
   baseline->execute(false);
@@ -1271,7 +1271,7 @@ void expectPrunedFacetTwoPassMatchesExhaustive(CollectionHelper& helper,
 
   auto actual = localReq(helper.getSearchEngine());
   actual->collection("main");
-  auto& actualRank = actual->topDocs("rank").getNumber().getScores()
+  auto& actualRank = actual->topDocs("rank").countLimit().getScores()
       .fields({"id"}).limit(topK);
   setPrunableDisjunction(actualRank);
   actualRank.facet("groups", "group_s").limit(-1);
@@ -1331,7 +1331,7 @@ SparseConstantDispatchResult runSparseConstantDispatch(
     bool passive, bool secondFilter = false) {
   auto req = localReq(engine);
   req->collection("main");
-  auto& topDocs = req->topDocs("q").allQuery().getNumber()
+  auto& topDocs = req->topDocs("q").allQuery().countLimit()
       .fields({"id"}).limit(10);
   if (!filterField.empty()) {
     topDocs.matchFilter(filterField, "yes");
@@ -1379,7 +1379,7 @@ TEST_F(SearchEngineTest, aggregateOpsEmptyIndexEmitNull) {
   req->collection("main");
   req->requestId("test_aggregate_ops_empty_index_emit_null");
 
-  auto& topDocs = req->topDocs("q").allQuery().getNumber();
+  auto& topDocs = req->topDocs("q").allQuery().countLimit();
   topDocs.avg("nested_avg", "foo_i");
   topDocs.sum("nested_sum", "foo_i");
 
@@ -1421,7 +1421,7 @@ TEST_F(SearchEngineTest, minMaxOps) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  req->topDocs("q").allQuery().getNumber();
+  req->topDocs("q").allQuery().countLimit();
   req->min("min_i", "foo_i");
   req->max("max_i", "foo_i");
   req->min("min_f", "foo_f");
@@ -1460,7 +1460,7 @@ TEST_F(SearchEngineTest, sumOps) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  auto& topDocs = req->topDocs("q").allQuery().getNumber();
+  auto& topDocs = req->topDocs("q").allQuery().countLimit();
   topDocs.sum("nested_i", "foo_i");
   req->sum("sum_i", "foo_i");
   req->sum("sum_f", "foo_f");
@@ -1516,11 +1516,11 @@ TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
   helper.index(flatdoc("foo_w", "charlie brown", "foo_i", 23, "color_s", "blue"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("foo_w", "brown", "foo_i", 5, "color_s", "brown"), UpdateMessage::COMMIT);
 
-  // Score path: match query, limit 0 + get_number.  Accurate count, zero docs.
+  // Score path: match query, limit 0 + count_limit.  Accurate count, zero docs.
   {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    req->topDocs("q").matchQuery("foo_w", "brown").getNumber().limit(0);
+    req->topDocs("q").matchQuery("foo_w", "brown").countLimit().limit(0);
     req->execute();
 
     ASSERT_OK(req);
@@ -1532,7 +1532,7 @@ TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
   {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& q = req->topDocs("q").matchQuery("foo_w", "brown").getNumber().limit(0);
+    auto& q = req->topDocs("q").matchQuery("foo_w", "brown").countLimit().limit(0);
     q.facet("colors", "color_s").limit(-1);
     req->execute();
 
@@ -1547,11 +1547,11 @@ TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
     EXPECT_EQ(3, facetTotal);
   }
 
-  // Field-sort path: sort by a column, limit 0 + get_number.  Accurate count, zero docs.
+  // Field-sort path: sort by a column, limit 0 + count_limit.  Accurate count, zero docs.
   {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& q = req->topDocs("q").matchQuery("foo_w", "brown").getNumber().limit(0);
+    auto& q = req->topDocs("q").matchQuery("foo_w", "brown").countLimit().limit(0);
     qb::sort(q, "foo_i", qb::ASC);
     req->execute();
 
@@ -1722,7 +1722,7 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
     if (name == "phrase") {
       auto req = localReq(helper.getSearchEngine());
       req->collection(collection);
-      auto& topDocs = req->topDocs("q").getNumber().limit(0);
+      auto& topDocs = req->topDocs("q").countLimit().limit(0);
       auto phrase =
           qb::phraseWords(topDocs.mr(), "body_w", {"quick", "fox"});
       auto inner = qb::boost(
@@ -1739,7 +1739,7 @@ TEST_F(SearchEngineTest, wholeMembershipCachesPureCountQueryFamilies) {
     if (name == "duplicate terms") {
       auto req = localReq(helper.getSearchEngine());
       req->collection(collection);
-      auto& topDocs = req->topDocs("q").getNumber().limit(0);
+      auto& topDocs = req->topDocs("q").countLimit().limit(0);
       topDocs.rawQuery() = qb::boolean(
           topDocs.mr(),
           {qb::boost(topDocs.mr(),
@@ -1927,7 +1927,7 @@ TEST_F(SearchEngineTest,
     auto before = cache->counters();
     auto request = localReq(node.getSearchEngine());
     request->collection(collection);
-    auto& topDocs = request->topDocs("q").getNumber().limit(0);
+    auto& topDocs = request->topDocs("q").countLimit().limit(0);
     topDocs.rawQuery() = invalidQuery(topDocs.mr(), shape);
     SkipStatsGuard stats;
     request->execute(false);
@@ -2069,7 +2069,7 @@ TEST_F(SearchEngineTest, foldedNamedFilterUsesWholeCompoundPlan) {
   auto run = [&]() {
     auto req = localReq(helper.getSearchEngine());
     req->collection(collection);
-    req->topDocs("q").allQuery().getNumber().limit(0)
+    req->topDocs("q").allQuery().countLimit().limit(0)
         .matchFilter("keep_s", "yes");
     SkipStatsGuard stats;
     req->execute(false);
@@ -2103,7 +2103,7 @@ TEST_F(SearchEngineTest, foldedNamedFilterUsesWholeCompoundPlan) {
 
   auto passive = localReq(helper.getSearchEngine());
   passive->collection(collection);
-  passive->topDocs("q").allQuery().getNumber().limit(0)
+  passive->topDocs("q").allQuery().countLimit().limit(0)
       .matchFilter("keep_s", "yes");
   {
     TopDocsFilterFoldGuard fold(true);
@@ -2496,7 +2496,7 @@ TEST_F(SearchEngineTest, wholeTopKCountConstantGateAndLimitOnlyStayCacheFree) {
   auto domainReq = localReq(helper.getSearchEngine());
   domainReq->collection(collection);
   auto& domainTopK = domainReq->topDocs("q").matchQuery(
-      "body_w", "s3o1a").getNumber().getScores().fields({"id"}).limit(10);
+      "body_w", "s3o1a").countLimit().getScores().fields({"id"}).limit(10);
   domainTopK.facet("groups", "group_s").limit(-1);
   {
     SkipStatsGuard stats;
@@ -2511,7 +2511,7 @@ TEST_F(SearchEngineTest, wholeTopKCountConstantGateAndLimitOnlyStayCacheFree) {
   auto sortedReq = localReq(helper.getSearchEngine());
   sortedReq->collection(collection);
   auto& sortedTopK = sortedReq->topDocs("q").matchQuery(
-      "body_w", "s3o1a").getNumber().fields({"id"}).limit(10);
+      "body_w", "s3o1a").countLimit().fields({"id"}).limit(10);
   qb::sort(sortedTopK, "id", qb::ASC);
   {
     SkipStatsGuard stats;
@@ -3342,7 +3342,7 @@ TEST_F(SearchEngineTest, wholeFieldSortConstantFactFallsBackWithoutCacheUse) {
     auto req = localReq(helper.getSearchEngine());
     req->collection(collection);
     auto& topDocs = req->topDocs("q").matchQuery(
-        "body_w", "constant").getNumber().fields({"id"}).limit(9);
+        "body_w", "constant").countLimit().fields({"id"}).limit(9);
     qb::sort(topDocs, "sort_i", qb::ASC);
     SkipStatsGuard stats;
     req->execute(false);
@@ -3437,7 +3437,7 @@ TEST_F(SearchEngineTest, wholeFieldSortHitComposesFusionDomainOnce) {
         req->topDocs("f").rawOp().kind.emplace<api::Fusion>();
     auto& mr = req->mr;
     fusion.limit = 9;
-    fusion.get_number = true;
+    fusion.count_limit = -1;
     fusion.method.emplace<api::RrfFusion>().k = 60;
 
     std::string_view* fields = build::allocArray(fusion.fields, 1, mr);
@@ -3452,7 +3452,7 @@ TEST_F(SearchEngineTest, wholeFieldSortHitComposesFusionDomainOnce) {
         std::span<const SourcePair>(sourcePair, 1));
     api::TopDocs& source = sourcePair[0].second;
     source.limit = 200;
-    source.get_number = true;
+    source.count_limit = -1;
     auto query = qb::boolean(
         mr, {}, {qb::match(mr, "body_w", "s4fusiona"),
                  qb::match(mr, "body_w", "s4fusionb")});
@@ -3515,7 +3515,7 @@ TEST_F(SearchEngineTest, singleTermLimitZeroFacetFallsBackOnCacheMiss) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main");
-  auto& q = req->topDocs("q").matchQuery("foo_w", "needle").getNumber().limit(0);
+  auto& q = req->topDocs("q").matchQuery("foo_w", "needle").countLimit().limit(0);
   q.facet("colors", "color_s").limit(-1);
   req->execute(false);
 
@@ -3982,7 +3982,7 @@ TEST_F(SearchEngineTest, jsonRoutedFilterExecutes) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(
-      R"({"limit":0,"get_number":true,"filter":[{"query":"brand_s:acme","except_ops":["brands"]}],"ops":{"brands":{"field_facet":{"field":"brand_s","limit":-1}}}})",
+      R"({"limit":0,"count_limit":-1,"filter":[{"query":"brand_s:acme","except_ops":["brands"]}],"ops":{"brands":{"field_facet":{"field":"brand_s","limit":-1}}}})",
       req->rawRequest(), req->mr);
   req->collection("main");
   req->execute();
@@ -4010,7 +4010,7 @@ TEST_F(SearchEngineTest, opDomainsImplementInheritedAndResetFrames) {
   auto req = localReq(luxirNode->getSearchEngine());
   parseQueryRequest(R"json({"ops":{
     "q":{"top_docs":{"query":"main_s:yes","filter":["brand_s:acme"],
-      "limit":0,"get_number":true,"ops":{
+      "limit":0,"count_limit":-1,"ops":{
         "default":{"field_facet":{"field":"color_s","limit":-1}},
         "local":{"field_facet":{"field":"brand_s","limit":-1},
           "domain":{"filter":["color_s:red"]}},
@@ -4096,7 +4096,7 @@ TEST_F(SearchEngineTest, selectedComposesWithEveryDomainFrame) {
   auto run = [&](std::string_view domain) {
     auto req = localReq(luxirNode->getSearchEngine());
     std::string json = R"({"query":"main_s:yes","filter":["stock_s:yes"],
-      "limit":0,"get_number":true,"ops":{"brands":{"field_facet":{
+      "limit":0,"count_limit":-1,"ops":{"brands":{"field_facet":{
         "field":"brand_s","limit":-1,"selected":["acme"]})";
     json += domain;
     json += "}}}";
@@ -4151,7 +4151,7 @@ TEST_F(SearchEngineTest, routedFiltersServeSidewaysFacetsStatsAndDefault) {
 
   auto req = localReq(luxirNode->getSearchEngine());
   auto& top = req->collection("main").topDocs("q").allQuery()
-      .getNumber().fields({"id"}).limit(-1);
+      .countLimit().fields({"id"}).limit(-1);
   top.facet("brands", "brand_s").limit(-1);
   top.facet("brands_copy", "brand_s").limit(-1);
   top.facet("colors", "color_s").limit(-1);
@@ -4188,7 +4188,7 @@ TEST_F(SearchEngineTest, routedMultiValueFilterComposesWithAnyOfQuery) {
   auto req = localReq(luxirNode->getSearchEngine());
   req->testForcePrepare = true;
   auto& top = req->collection("main").topDocs("q").allQuery()
-      .getNumber().limit(0);
+      .countLimit().limit(0);
   top.facet("tags", "tags_ss").limit(-1);
   top.filter(stringAnyOfQuery(top.mr(), "brand_s", {"acme"}));
   top.filter(qb::match(top.mr(), "tags_ss", "x"), {"tags"});
@@ -4218,7 +4218,7 @@ TEST_F(SearchEngineTest, routedFiltersSupportExpressionSort) {
       DomainVariantPlan::Offer::SHARED_M;
   auto req = localReq(luxirNode->getSearchEngine());
   auto& top = req->collection("main").topDocs("q")
-      .matchQuery("body_w", "common").getNumber().fields({"id"}).limit(-1);
+      .matchQuery("body_w", "common").countLimit().fields({"id"}).limit(-1);
   top.facet("brands", "brand_s").limit(-1);
   top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
   top.filter(qb::match(top.mr(), "color_s", "red"));
@@ -4253,7 +4253,7 @@ TEST_F(SearchEngineTest, routedDomainProductionOffersAgree) {
     DomainVariantPlan::forcedOfferForTests = offer;
     auto req = localReq(luxirNode->getSearchEngine());
     auto& top = req->collection("main").topDocs("q")
-        .allQuery().getNumber().limit(0);
+        .allQuery().countLimit().limit(0);
     top.facet("brands", "brand_s").limit(-1);
     top.facet("colors", "color_s").limit(-1);
     top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
@@ -4304,7 +4304,7 @@ TEST_F(SearchEngineTest, routedVariableQueryOffersAgreeAcrossRepresentations) {
         .allQuery().limit(0);
     outer.matchFilter("scope_s", "keep");
     auto& top = outer.topDocs("q").matchQuery("body_w", "common")
-        .getNumber().limit(3);
+        .countLimit().limit(3);
     top.facet("brands", "brand_s").limit(-1);
     top.facet("colors", "color_s").limit(-1);
     top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
@@ -4341,7 +4341,7 @@ TEST_F(SearchEngineTest, routedSharedBitSetIsFrozenForSiblingConsumers) {
       DomainVariantPlan::Offer::SHARED_M;
   auto req = localReq(luxirNode->getSearchEngine());
   auto& top = req->collection("main").topDocs("q")
-      .matchQuery("body_w", "common").getNumber().limit(0);
+      .matchQuery("body_w", "common").countLimit().limit(0);
   top.facet("brands_a", "brand_s").limit(-1);
   top.facet("brands_b", "brand_s").limit(-1);
   top.facet("colors", "color_s").limit(-1);
@@ -4379,7 +4379,7 @@ TEST_F(SearchEngineTest, routedNestedTopDocsRespectsInheritedLiveDomain) {
   auto& outer = req->collection("main").topDocs("outer")
       .allQuery().limit(0);
   outer.matchFilter("scope_s", "keep");
-  auto& inner = outer.topDocs("inner").allQuery().getNumber().limit(0);
+  auto& inner = outer.topDocs("inner").allQuery().countLimit().limit(0);
   inner.facet("brands", "brand_s").limit(-1);
   inner.filter(qb::match(inner.mr(), "brand_s", "acme"), {"brands"});
   inner.filter(qb::match(inner.mr(), "color_s", "red"));
@@ -4437,7 +4437,7 @@ TEST_F(SearchEngineTest, routedFiltersReuseFilterCacheArtifacts) {
   auto run = [&]() {
     auto req = localReq(luxirNode->getSearchEngine());
     auto& top = req->collection("main").topDocs("q")
-        .allQuery().getNumber().limit(0);
+        .allQuery().countLimit().limit(0);
     top.facet("brands", "brand_s").limit(-1);
     top.filter(qb::match(top.mr(), "brand_s", "acme"), {"brands"});
     top.filter(qb::match(top.mr(), "color_s", "red"));
@@ -4521,7 +4521,7 @@ TEST_F(SearchEngineTest, randomRoutedFiltersMatchExactOracle) {
   for (int iteration = 0; iteration < 100; iteration++) {
     auto req = localReq(luxirNode->getSearchEngine());
     auto& top = req->collection("main").topDocs("q").allQuery()
-        .getNumber().limit(0);
+        .countLimit().limit(0);
     std::array<DomainModel, 4> domains;
     for (size_t op = 0; op < opNames.size(); op++) {
       auto& facet = top.facet(
@@ -4743,7 +4743,7 @@ TEST_F(SearchEngineTest, topDocsFilters) {
   {  // single filter narrows the query domain
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    req->topDocs("q").matchQuery("foo_w", "hello").getNumber().fields({"id"})
+    req->topDocs("q").matchQuery("foo_w", "hello").countLimit().fields({"id"})
         .matchFilter("cat_s", "a");
     req->execute();
     ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
@@ -4753,7 +4753,7 @@ TEST_F(SearchEngineTest, topDocsFilters) {
   {  // two filters intersect
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    req->topDocs("q").matchQuery("foo_w", "hello").getNumber().fields({"id"})
+    req->topDocs("q").matchQuery("foo_w", "hello").countLimit().fields({"id"})
         .matchFilter("cat_s", "a").matchFilter("size_s", "big");
     req->execute();
     ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
@@ -4764,7 +4764,7 @@ TEST_F(SearchEngineTest, topDocsFilters) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& td = req->topDocs("q");
-    td.matchQuery("foo_w", "hello").getNumber().fields({"id"})
+    td.matchQuery("foo_w", "hello").countLimit().fields({"id"})
         .matchFilter("size_s", "big");
     td.facet("cats", "cat_s").limit(-1);
     req->execute();
@@ -4832,7 +4832,7 @@ TEST_F(SearchEngineTest, topDocsFilterFoldMatchesPassivePath) {
     req->topDocs("ranked").matchQuery("body_w", "apple").withStats().fields({"id"})
         .limit(2).matchFilter("keep_s", "yes");
     auto& count = req->topDocs("count").matchQuery("body_w", "apple")
-        .getNumber().limit(0).matchFilter("keep_s", "yes");
+        .countLimit().limit(0).matchFilter("keep_s", "yes");
     count.facet("groups", "group_s").limit(-1);
     {
       TopDocsFilterFoldGuard guard(passive);
@@ -4913,7 +4913,7 @@ TEST_F(SearchEngineTest,
   auto runExact = [&](bool disabled) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& cur = req->topDocs("q").getNumber().limit(0);
+    auto& cur = req->topDocs("q").countLimit().limit(0);
     cur.rawQuery() = qb::boolean(
         cur.mr(),
         {qb::match(cur.mr(), "body_w", "required_lead"),
@@ -4956,7 +4956,7 @@ TEST_F(SearchEngineTest,
                  std::string_view filter, bool disabled = false) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& cur = req->topDocs("q").getNumber().limit(0);
+    auto& cur = req->topDocs("q").countLimit().limit(0);
     cur.rawQuery() = qb::boolean(
         cur.mr(),
         {qb::match(cur.mr(), "body_w", first),
@@ -5011,7 +5011,7 @@ TEST_F(SearchEngineTest,
   auto runSingleTerm = [&] {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& cur = req->topDocs("q").getNumber().limit(0);
+    auto& cur = req->topDocs("q").countLimit().limit(0);
     cur.rawQuery() = qb::match(cur.mr(), "body_w", "dense_a");
     cur.matchFilter("filter_w", "selected");
     SkipStatsGuard statsGuard;
@@ -5096,7 +5096,7 @@ TEST_F(SearchEngineTest, cachedNumericFilterHitIgnoresShapeToggle) {
     auto req = localReq(helper.getSearchEngine());
     req->collection(collection);
     auto& topDocs = req->topDocs("q").matchQuery("body_w", "alpha")
-        .getNumber().limit(0);
+        .countLimit().limit(0);
     appendRawFilter(topDocs, qb::range(
         topDocs.mr(), "range_i", qb::valI64(topDocs.mr(), 0), nullptr,
         qb::valI64(topDocs.mr(), N / 2 - 1), nullptr));
@@ -5345,7 +5345,7 @@ TEST_F(SearchEngineTest, cachedDocSetBatchesExactScoredTerm) {
     FilteredConjunctionBatchGuard guard(disabled);
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& cur = req->topDocs("q").getNumber().withStats()
+    auto& cur = req->topDocs("q").countLimit().withStats()
         .fields({"id"}).limit(100);
     cur.rawQuery() = filteredCountBody(cur.mr(), FilteredCountShape::TERM);
     cur.matchFilter("filter_w", "selected");
@@ -5650,7 +5650,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {
   {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& cur = req->topDocs("q").getNumber().limit(0);
+    auto& cur = req->topDocs("q").countLimit().limit(0);
     cur.rawQuery() = filteredCountBody(cur.mr(), FilteredCountShape::UNION);
     cur.matchFilter("filter_w", "selected");
     cur.facet("groups", "group_s").limit(-1);
@@ -5675,7 +5675,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterDrivesDisjunctionBatch) {
     FilteredDisjunctionBatchGuard guard(disabled);
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& cur = req->topDocs("q").getNumber().withStats()
+    auto& cur = req->topDocs("q").countLimit().withStats()
         .fields({"id"}).limit(100);
     cur.rawQuery() = filteredCountBody(cur.mr(), FilteredCountShape::UNION);
     cur.matchFilter("filter_w", "selected");
@@ -5730,7 +5730,7 @@ TEST_F(SearchEngineTest, cachedSparseFilterLeadsPhraseDisjunctionPull) {
     WholeMembershipPlanGuard wholeGuard(true);
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& cur = req->topDocs("q").getNumber().withStats()
+    auto& cur = req->topDocs("q").countLimit().withStats()
         .fields({"id"}).limit(100);
     cur.rawQuery() = qb::boolean(cur.mr(), {},
         {qb::phraseWords(
@@ -5812,7 +5812,7 @@ TEST_F(SearchEngineTest, exactCountTopKRoutesAtFilterUnionCostBoundary) {
         disableSparseDecision);
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& cur = req->topDocs("q").getNumber().withStats()
+    auto& cur = req->topDocs("q").countLimit().withStats()
         .fields({"id"}).limit(100);
     cur.rawQuery() = qb::boolean(cur.mr(), {},
         {qb::match(cur.mr(), "body_w", "alpha"),
@@ -5889,7 +5889,7 @@ TEST_F(SearchEngineTest,
     FilteredDisjunctionBatchGuard batchGuard(true);
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& cur = req->topDocs("q").getNumber().withStats()
+    auto& cur = req->topDocs("q").countLimit().withStats()
         .fields({"id"}).limit(100);
     cur.rawQuery() = qb::boolean(cur.mr(), {},
         {qb::match(cur.mr(), "body_w", "alpha"),
@@ -6052,7 +6052,7 @@ TEST_F(SearchEngineTest, filterOnlyBulkAndConstantTopKMatchPassivePath) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs("q").allQuery().fields({"id"}).limit(limit);
-    if (getNumber) topDocs.getNumber();
+    if (getNumber) topDocs.countLimit();
     topDocs.matchFilter("keep_s", "yes");
     if (twoFilters) topDocs.matchFilter("size_s", "big");
     if (withFacet) topDocs.facet("groups", "group_s").limit(-1);
@@ -6138,7 +6138,7 @@ TEST_F(SearchEngineTest, cachedFilterOnlyDocSetIsTopDocsFacetDomain) {
                  bool passive, bool nested) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& topDocs = req->topDocs("q").allQuery().getNumber()
+    auto& topDocs = req->topDocs("q").allQuery().countLimit()
         .fields({"id"}).limit(limit)
         .matchFilter(filterField, "yes");
     auto& facet = topDocs.facet("groups", "group_s").limit(-1);
@@ -6277,7 +6277,7 @@ TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
       // A scored query keeps the fold from collapsing to a lone filter
       // clause whose count is a constant df: constant-served requests never
       // execute, so they would not admit the filter into the cache.
-      req->topDocs("q").getNumber().limit(0)
+      req->topDocs("q").countLimit().limit(0)
           .matchQuery("body_w", "apple")
           .matchFilter(field, "yes");
       req->execute(false);
@@ -6292,7 +6292,7 @@ TEST_F(SearchEngineTest, filterDocSetIdentityRejectsNonIdentityPlans) {
                  bool passive, bool disableFilterClause) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
-    auto& topDocs = req->topDocs("q").getNumber().fields({"id"})
+    auto& topDocs = req->topDocs("q").countLimit().fields({"id"})
         .limit(fieldSort || scoredQuery ? 4 : 0);
     if (scoredQuery) {
       topDocs.matchQuery("body_w", "apple");
@@ -6395,7 +6395,7 @@ TEST_F(SearchEngineTest, limitZeroSubOpsIntersectQueryAndFilterDocSets) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection(collection);
     auto& topDocs = req->topDocs("q").matchQuery("body_w", "apple")
-        .getNumber().limit(0)
+        .countLimit().limit(0)
         .matchFilter("keep_s", "yes")
         .matchFilter("low_s", "yes");
     topDocs.facet("groups", "group_s").limit(-1);
@@ -6434,7 +6434,7 @@ TEST_F(SearchEngineTest, limitZeroSubOpsIntersectQueryAndFilterDocSets) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->testForcePrepare = true;
     req->collection(collection);
-    auto& topDocs = req->topDocs("q").getNumber().limit(0);
+    auto& topDocs = req->topDocs("q").countLimit().limit(0);
     topDocs.rawQuery() = qb::boolean(
         topDocs.mr(), {}, {}, {},
         {qb::match(topDocs.mr(), "body_w", "apple")});
@@ -6464,7 +6464,7 @@ TEST_F(SearchEngineTest, topDocsFilterFoldAllPrepareAndDeletes) {
   auto runAll = [&](bool filtered) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& cur = req->topDocs("q").allQuery().getNumber().fields({"id"}).limit(-1);
+    auto& cur = req->topDocs("q").allQuery().countLimit().fields({"id"}).limit(-1);
     if (filtered) cur.matchFilter("keep_s", "yes");
     cur.facet("groups", "group_s").limit(-1);
     req->execute();
@@ -6483,7 +6483,7 @@ TEST_F(SearchEngineTest, topDocsFilterFoldAllPrepareAndDeletes) {
   prepared->testForcePrepare = true;
   prepared->collection("main");
   auto& preparedCur = prepared->topDocs("q").matchQuery("body_w", "apple")
-      .getNumber().fields({"id"}).limit(0).matchFilter("keep_s", "yes");
+      .countLimit().fields({"id"}).limit(0).matchFilter("keep_s", "yes");
   preparedCur.facet("groups", "group_s").limit(-1);
   prepared->execute();
   ASSERT_OK(prepared);
@@ -6636,7 +6636,7 @@ ConstantTopKRun runConstantConjTopK(SearchEngine& engine, int64_t limit,
   req->collection("main");
   auto& topDocs = req->topDocs("q")
       .exprQuery("body_w:qax* AND body_w:qbx*")
-      .getNumber().fields({"id"}).limit(limit);
+      .countLimit().fields({"id"}).limit(limit);
   if (withScores) topDocs.getScores();
   if (withFilter) topDocs.matchFilter("keep_s", "yes");
   if (withFacet) topDocs.facet("groups", "group_s").limit(-1);
@@ -6757,7 +6757,7 @@ TEST_F(SearchEngineTest, filteredConstantTopKLimitOnly) {
             auto req = localReq(helper.getSearchEngine());
             parseQueryRequest(std::string(R"({"query":"*:*","fields":["id"],"limit":4,"offset":1,"filter":[")")
                 + (pull ? R"(body_w:\"a d\")" : "body_w:a AND body_w:d")
-                + R"("],"get_number":)" + (count ? "true" : "false")
+                + R"("],"count_limit":)" + (count ? "-1" : "0")
                 + (collapsed ? R"(,"collapse":"group_s")" : "") + "}",
                 req->rawRequest(), req->mr);
             req->collection("main");
@@ -6804,7 +6804,7 @@ TEST_F(SearchEngineTest, filteredMultiTermCountExpandsOncePerSegment) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs("q").exprQuery("body_w:qax*")
-        .getNumber().limit(0);
+        .countLimit().limit(0);
     if (filtered) {
       topDocs.matchFilter("keep_s", "yes");
     }
@@ -6849,7 +6849,7 @@ TEST_F(SearchEngineTest, filteredMultiTermDenseCountUsesWindowFill) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& topDocs = req->topDocs("q").exprQuery("body_w:qax*")
-        .getNumber().limit(0);
+        .countLimit().limit(0);
     topDocs.matchFilter(filterField, "yes");
     SkipStatsGuard stats;
     {
@@ -6935,7 +6935,7 @@ TEST_F(SearchEngineTest, conjunctionPlanFillsOptionalMultiTermMemo) {
   auto run = [&](bool disableFilterFold) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
-    auto& topDocs = req->topDocs("q").getNumber().limit(0);
+    auto& topDocs = req->topDocs("q").countLimit().limit(0);
     topDocs.rawQuery() = qb::boolean(
         topDocs.mr(), {},
         {qb::match(topDocs.mr(), "body_w", "filler"),
@@ -6983,7 +6983,7 @@ TEST_F(SearchEngineTest, filteredPhraseCountRetiresPhraseIsland) {
   auto run = [&](bool disableShapes) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
-    auto& topDocs = req->topDocs("q").getNumber().limit(0);
+    auto& topDocs = req->topDocs("q").countLimit().limit(0);
     topDocs.rawQuery() =
         qb::phraseWords(topDocs.mr(), "body_w", {"quick", "fox"});
     topDocs.matchFilter("keep_s", "yes");
@@ -7052,7 +7052,7 @@ TEST_F(SearchEngineTest, filteredNumericCountRetiresNumericIsland) {
     auto req = localReq(helper.getSearchEngine());
     req->collection(collection);
     auto& topDocs = req->topDocs("q").matchQuery("body_w", "alpha")
-        .getNumber().limit(0);
+        .countLimit().limit(0);
     appendRawFilter(topDocs, qb::range(
         topDocs.mr(), "range_i", qb::valI64(topDocs.mr(), 0), nullptr,
         qb::valI64(topDocs.mr(), N / 2 - 1), nullptr));
@@ -7149,7 +7149,7 @@ TEST_F(SearchEngineTest,
     auto req = localReq(helper.getSearchEngine());
     req->collection(collection);
     auto& topDocs = req->topDocs("q").matchQuery("body_w", "alpha")
-        .getNumber();
+        .countLimit();
     if (fieldSort) {
       topDocs.fields({"id"}).limit(25);
       qb::sort(topDocs, "range_i", qb::ASC);
@@ -7243,7 +7243,7 @@ TEST_F(SearchEngineTest,
   auto run = [&](int64_t spanScale) {
     auto req = localReq(helper.getSearchEngine());
     req->collection(collection);
-    auto& topDocs = req->topDocs("q").getNumber().limit(0);
+    auto& topDocs = req->topDocs("q").countLimit().limit(0);
     topDocs.rawQuery() = qb::boolean(
         topDocs.mr(),
         {qb::match(topDocs.mr(), "body_w", "moderate_a"),
@@ -7313,7 +7313,7 @@ TEST_F(SearchEngineTest,
   auto run = [&](bool disableShapes) {
     auto req = localReq(helper.getSearchEngine());
     req->collection(collection);
-    auto& topDocs = req->topDocs("q").getNumber().limit(0);
+    auto& topDocs = req->topDocs("q").countLimit().limit(0);
     topDocs.rawQuery() = qb::boolean(
         topDocs.mr(), {},
         {qb::match(topDocs.mr(), "body_w", "union_a"),
@@ -7383,7 +7383,7 @@ TEST_F(SearchEngineTest,
   auto run = [&](bool disableShapes) {
     auto req = localReq(helper.getSearchEngine());
     req->collection(collection);
-    auto& topDocs = req->topDocs("q").getNumber().limit(0);
+    auto& topDocs = req->topDocs("q").countLimit().limit(0);
     topDocs.rawQuery() = qb::boolean(
         topDocs.mr(),
         {qb::match(topDocs.mr(), "body_w", "dense")}, {},
@@ -7432,7 +7432,7 @@ TEST_F(SearchEngineTest, offsetRankedPages) {
       auto req = localReq(helper.getSearchEngine());
       auto& q = req->collection("main").topDocs("q")
           .matchQuery("body_w", "apple").fields({"id"}).getScores()
-          .offset(offset).limit(limit).getNumber(count);
+          .offset(offset).limit(limit).countLimit(count ? -1 : 0);
       if (fieldSort) qb::sort(q, "rank_i", qb::ASC);
       req->execute();
       EXPECT_TRUE(req->ok()) << req->toString();
@@ -7484,7 +7484,7 @@ TEST_F(SearchEngineTest, offsetStreamingBatches) {
   helper.commit();
   auto req = localReq(helper.getSearchEngine());
   auto& q = req->collection("main").topDocs("q").allQuery().fields({"id"})
-      .offset(3).limit(5).batchSize(2).getNumber();
+      .offset(3).limit(5).batchSize(2).countLimit();
   qb::sort(q, "rank_i", qb::ASC);
   req->execute();
   ASSERT_OK(req);
@@ -7511,7 +7511,7 @@ TEST_F(SearchEngineTest, offsetEmptyIndexAndNoMatches) {
     for (bool count : {false, true}) {
       auto req = localReq(helper.getSearchEngine());
       req->collection("main").topDocs("q").matchQuery("body_w", "apple")
-          .offset(INT64_MAX).limit(5).getNumber(count);
+          .offset(INT64_MAX).limit(5).countLimit(count ? -1 : 0);
       req->execute();
       ASSERT_OK(req);
       ASSERT_EQ(1u, req->responses.size());
@@ -7549,7 +7549,7 @@ TEST_F(SearchEngineTest, offsetCachedMembership) {
     for (int round = 0; round < 2; round++) {
       auto req = localReq(helper.getSearchEngine());
       auto& q = req->collection("main").topDocs("q").fields({"id"})
-          .offset(3).limit(5).getNumber();
+          .offset(3).limit(5).countLimit();
       q.rawQuery() = qb::constantScore(q.mr(), qb::phraseText(q.mr(), "body_w", "apple pear"));
       if (fieldSort) qb::sort(q, "rank_i", qb::DESC);
       SkipStatsGuard stats;
@@ -7592,7 +7592,7 @@ TEST_F(SearchEngineTest, offsetCachedFieldSortPlannerDepth) {
     int32_t offset = round == 2 ? 49 : 0;
     auto req = localReq(helper.getSearchEngine());
     auto& q = req->collection("main").topDocs("q").fields({"id"})
-        .limit(1).offset(offset).getNumber();
+        .limit(1).offset(offset).countLimit();
     q.rawQuery() = qb::boolean(q.mr(), {},
         {qb::match(q.mr(), "body_w", "apple"), qb::match(q.mr(), "body_w", "pear")});
     qb::sort(q, "rank_i", qb::ASC);

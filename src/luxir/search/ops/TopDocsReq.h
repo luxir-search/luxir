@@ -575,7 +575,7 @@ public:
     if (collapse && !topDocsProto.collapse->sort.empty()) resolveMetricGroupOrder(*this);
   }
   bool enrichGroups() const {
-    return collapse != nullptr && (topDocsProto.collapse->get_number || headSort.has_value() || !groupOps.empty())
+    return collapse != nullptr && (topDocsProto.collapse->get_count || headSort.has_value() || !groupOps.empty())
         && topCount > topDocsProto.offset;
   }
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
@@ -596,12 +596,8 @@ public:
   std::span<FilterCache::Use*> filterUses;
   DomainVariantPlan domainVariants;
   CollectionRequirements requirements;
-  // Bounded hit count (TopDocs.count_limit), 0 when exact. Set only for a
-  // pruning score-ranked list: collection holds the competitive threshold
-  // until this many hits are counted, and found reports the limit as a
-  // lower bound once it is reached. countLimitProven: metadata already
-  // proves the limit, so pruning starts at the first doc.
-  int64_t countLimit = 0;
+  // The requested quantity stays in requirements; exact routes need no hold.
+  bool boundedCount = false;
   bool countLimitProven = false;
   QueryPrep::WholeMembershipPlan wholeMembershipPlan;
   QueryPrep::ExactDomainPlan exactDomainPlan;
@@ -701,8 +697,8 @@ public:
       collectorMerger.destroyer = [](MergeableCollector* data) {
         delete data;
       };
-      if (op.countLimit > 0 && !op.countLimitProven) {
-        scoreAccumulator.holdUntilHits(op.countLimit);
+      if (op.boundedCount) {
+        scoreAccumulator.holdUntilHits(op.requirements.countLimit, op.countLimitProven);
       }
 
       if (op.subOps.size() > 0) {
@@ -888,7 +884,9 @@ public:
       }
       // First-K collection applies any collector filter before accepting hits.
       if (!TopDocsReq::disableConstantWindowCaptureForTests
-          && !op.requirements.needExactCount && builder == nullptr) {
+          && (!op.requirements.needsCount()
+              || (op.boundedCount && scoreAccumulator.canPrune()))
+          && builder == nullptr) {
         skipCount(SkipStats::constantLimitOnlyCollections);
         return ConstantScoreDisposition::LIMIT_ONLY;
       }
@@ -1973,7 +1971,7 @@ public:
             if (counted) {
               // fall through to the sub-calc/merge tail below
             } else if (!Collapsed && routedDomainsReady && !data->useFieldSort
-                       && op.requirements.needExactCount
+                       && op.requirements.needsCount()
                        && scoreCollector->topCount > 0) {
               int64_t count = routedProduction->domains[0].get() == nullptr
                   ? seg.maxDoc()
@@ -1991,8 +1989,8 @@ public:
               // Collapse totals disable every skipping arm, even over an
               // exact cached domain.
               bool mustStreamForCompleteness =
-                  (Collapsed && op.requirements.needExactCount)
-                  || (op.requirements.needExactCount && !wholeFieldSortAvailable
+                  (Collapsed && op.requirements.needsCount())
+                  || (op.requirements.needsCount() && !wholeFieldSortAvailable
                    && !routedExactDomain)
                   || builderPtr != nullptr;
               bool maySkipNoncompetitiveDocs =
@@ -2261,7 +2259,7 @@ public:
                   fieldCollector->recordSegmentSkipStats(segnum);
                 }
               }
-              if (!Collapsed && op.requirements.needExactCount
+              if (!Collapsed && op.requirements.needsCount()
                   && (wholeFieldSortAvailable || routedExactDomain)) {
                 int64_t collected =
                     fieldCollector->hitCount - fieldHitsBefore;
@@ -2280,7 +2278,7 @@ public:
               // domain. Without pruning, windowed scoring still beats the
               // doc-at-a-time heap disjunction by using per-clause window drives.
               bool allowPruning = op.weight->allowsPruning()
-                  && (!Collapsed || (!op.requirements.needExactCount
+                  && (!Collapsed || (!op.requirements.needsCount()
                       && !disableCollapsePruningForTests));
               BulkScorer* bulk = nullptr;
               bool composedExactCountTopK = false;
@@ -2383,7 +2381,9 @@ public:
                       constantRoute
                               == ConstantScoreDisposition::LIMIT_ONLY
                           ? ConstantScoreDrain::LIMIT_ONLY
-                          : ConstantScoreDrain::COMPLETE);
+                          : op.boundedCount ? ConstantScoreDrain::BOUNDED
+                                            : ConstantScoreDrain::COMPLETE,
+                      op.boundedCount ? &scoreAccumulator : nullptr);
                 } else if (!Collapsed && op.weight->isConstantScoring()) {
                   // In the test-forced arrangement, the bulk scorer drives the
                   // exhaustive count/domain and an independent scorer visits only
@@ -2424,11 +2424,14 @@ public:
                     : buildPullScorer(poolGuard.pool(), *supplier);
                 if (scorer != nullptr) {
                   if (constantRoute
-                      == ConstantScoreDisposition::LIMIT_ONLY) {
+                          == ConstantScoreDisposition::LIMIT_ONLY
+                      || (!Collapsed && op.boundedCount
+                          && op.weight->isConstantScoring())) {
                     collectFirstKConstant(
                         segnum, scorer, collectorFilter,
                         *scoreCollector,
-                        scoreCollector->topCount);
+                        scoreCollector->topCount,
+                        op.boundedCount ? &scoreAccumulator : nullptr);
                   } else {
                     collectTopK(
                         segnum, scorer, collectorFilter, builderPtr,
@@ -2572,7 +2575,7 @@ public:
           && !requirements.needExactDomain
           && ((this->sortPlan.useFieldSort
                   && requirements.needRankedDocs && !requestNeedsScores)
-              || (requirements.needExactCount
+              || (requirements.needsCount()
                   && (!requirements.needRankedDocs
                       || scoreProfile.kind
                           != Query::ScoreProfile::Kind::VARIABLE)));

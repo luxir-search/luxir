@@ -349,8 +349,9 @@ public:
           enclosingCollapse = oldCollapse;
           inheritedFacetMeasure = oldMeasure;
         });
-        auto topDocsPlacement = depth == 1 ? TopDocsPlacement::ROOT_OP
-                                           : TopDocsPlacement::NESTED_OP;
+        // An explicit domain supplies external eligibility, as for nested lists.
+        auto topDocsPlacement = depth == 1 && !searchOp.domain
+            ? TopDocsPlacement::ROOT_OP : TopDocsPlacement::NESTED_OP;
         auto* qr = parseTopDocs(name, topDocs, topDocsPlacement);
         if (topDocs.collapse) {
           addSubs(*qr, topDocs.ops, depth, OpsPlacement::TOP_DOCS);
@@ -536,7 +537,7 @@ public:
       }
     }
     if (facetReq.count_distinct) {
-      if (facetReq.count_distinct->get_number || !facetReq.count_distinct->head_sort.empty()
+      if (facetReq.count_distinct->get_count || !facetReq.count_distinct->head_sort.empty()
           || !facetReq.count_distinct->sort.empty()
           || !facetReq.count_distinct->ops.empty()) {
         throw RequestError("count_distinct accepts only field and missing");
@@ -1441,40 +1442,20 @@ public:
     return filters;
   }
 
-  // Metadata-only lower bound on the main weight's live matches.
-  int64_t matchLowerBound(Query::Weight& weight) {
-    int64_t bound = 0;
-    for (auto& segment : req.reader->segments()) {
-      bound += weight.matchLowerBound(segment);
-    }
-    return bound;
-  }
-
   // Build a TopDocsReq from a TopDocs proto. Placement is semantic: ordinary
   // TopDocs can serve a canonical-root whole-reader fact, while a Fusion
   // source delivers candidates into a parent-owned domain.
   TopDocsReq* parseTopDocs(std::string_view name,
                            const luxir::api::TopDocs& topDocsReq,
                            TopDocsPlacement placement) {
-    /*
-    message TopDocs {
-            Query query = 1;
-            int64 offset = 2;
-            optional sint64 limit = 3;
-            bool get_number = 4;          // return the number of matching documents
-            bool get_scores = 5;          // return the relevancy score for each document returned
-            repeated string fields = 6;   // fields to return for each document (empty: every retrievable field)
-            repeated SortSpec sort = 7;
-    }
-    */
-
+    int64_t countLimit = topDocsReq.count_limit.value_or(0);
     // Place the Query in the requestPool since it uses things like string_view that directly reference
     // the request.
     DiversifyPlan* diversify = nullptr;
     if (topDocsReq.diversify) {
       auto keys = diversifyKeySpec(topDocsReq);
       auto* resolved = resolveCollapse(keys,
-          placement != TopDocsPlacement::FUSION_SOURCE && topDocsReq.get_number);
+          placement != TopDocsPlacement::FUSION_SOURCE && countLimit != 0);
       diversify = luxir::arenaCreate<DiversifyPlan>(req.arena,
           *resolved, (size_t)*topDocsReq.diversify->max_per_key, req.memoryTracker);
     }
@@ -1482,14 +1463,14 @@ public:
     if (topDocsReq.collapse) {
       if (placement == TopDocsPlacement::FUSION_SOURCE) {
         const auto& spec = *topDocsReq.collapse;
-        if (!spec.head_sort.empty() || !spec.sort.empty() || spec.get_number || !spec.ops.empty()) {
+        if (!spec.head_sort.empty() || !spec.sort.empty() || spec.get_count || !spec.ops.empty()) {
           throw RequestError("fusion source '" + std::string(name)
-              + "': collapse supports only field and missing; head_sort, sort, get_number and ops"
+              + "': collapse supports only field and missing; head_sort, sort, get_count and ops"
                 " require source finalization");
         }
       }
       collapse = resolveCollapse(*topDocsReq.collapse,
-          placement != TopDocsPlacement::FUSION_SOURCE && topDocsReq.get_number);
+          placement != TopDocsPlacement::FUSION_SOURCE && countLimit != 0);
       enclosingCollapse = collapse;
       // Facets under a collapsed list count groups unless they say otherwise.
       inheritedFacetMeasure = collapse;
@@ -1522,9 +1503,9 @@ public:
       throw std::runtime_error(
           "top_docs '" + std::string(name) + "': offset must be >= 0");
     }
-    if (topDocsReq.count_limit.has_value() && *topDocsReq.count_limit <= 0) {
+    if (countLimit < -1) {
       throw std::runtime_error(
-          "top_docs '" + std::string(name) + "': count_limit must be > 0");
+          "top_docs '" + std::string(name) + "': count_limit must be >= -1");
     }
     int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;
     // limit to actual number of docs in the index (or all if limit == -1)
@@ -1558,7 +1539,7 @@ public:
         explicitFilters,
         prepareFacetSelections(
             topDocsReq, parseContext, parser,
-            specifiedLimit != 0 || topDocsReq.get_number));
+            specifiedLimit != 0 || countLimit != 0));
     ParsedDomains parsedDomains = parseChildDomains(topDocsReq.ops, parser);
 
     DomainVariantPlan domainVariants;
@@ -1578,14 +1559,14 @@ public:
     // query tree owns both matching and preparation. Keep the routed filter
     // metadata on TopDocsReq; the toggle preserves the former passive domain
     // path as the benchmark baseline.
-    bool countClauseDisabled =
-        BooleanQuery::disableFilterClauseCountForTests
-        && limit == 0 && topDocsReq.get_number;
     CollectionRequirements requirements{
       .needRankedDocs = limit > 0,
-      .needExactCount = topDocsReq.get_number,
+      .countLimit = countLimit,
       .needExactDomain = !topDocsReq.ops.empty()
     };
+    bool countClauseDisabled =
+        BooleanQuery::disableFilterClauseCountForTests
+        && limit == 0 && requirements.needsCount();
     bool foldFilters = !routedFilters && !filters.empty()
         && !disableTopDocsFilterFold
         && !countClauseDisabled;
@@ -1661,41 +1642,34 @@ public:
             || (headSort && headSort->rankNeedsScores))) {
       requestFlags |= Query::NEED_SCORES;
     }
-    // Competitive-score pruning requires a score-ranked heap. Sub-ops permit
-    // pruning because a separate exhaustive windowed pass produces their
-    // complete match domain and exact count before the ranking pass. Match-all
-    // reuses the incoming domain and its cardinality instead.
-    //
-    // A bounded count (count_limit) is a score-ranked root list's count that
-    // may stop at the limit: pruning stays allowed, and collection holds the
-    // competitive threshold at lowest until the limit is counted (Lucene's
-    // totalHitsThreshold). Other shapes keep counting exactly.
-    int64_t countLimit = topDocsReq.get_number && topDocsReq.count_limit.has_value()
-        && placement == TopDocsPlacement::ROOT_OP
-        && collapse == nullptr && diversify == nullptr
-        && requirements.needRankedDocs && !requirements.needExactDomain
-        && !parsedSorts.useFieldSort && parsedSorts.rankNeedsScores
-        ? *topDocsReq.count_limit : 0;
-    bool allowPruning = requirements.needRankedDocs
-        && !parsedSorts.useFieldSort
-        && (!requirements.needExactCount || requirements.needExactDomain
-            || countLimit > 0);
-    if (allowPruning && !(diversify && topDocsReq.get_number)
-        && !(collapse && !topDocsReq.collapse->sort.empty())) {
-      requestFlags |= Query::ALLOW_PRUNING;
-    }
-    Query::ScoreProfile scoreProfile = luxir::scoreProfile(*query);
     // Document cardinality is not a distinct-group count; collapse totals
     // read every eligible key through the normal exhaustive driver.
     bool exactCountTopKShape = collapse == nullptr && diversify == nullptr
         && requirements.needRankedDocs
-        && requirements.needExactCount && !requirements.needExactDomain
+        && requirements.needsCount() && !requirements.needExactDomain
         && !parsedSorts.useFieldSort
         && parsedSorts.rankNeedsScores;
-    bool exactCountTopK = exactCountTopKShape && countLimit == 0;
+    // A bounded root list uses an exact count when the whole-membership plan
+    // supplies it from metadata or a resident entry. Otherwise collection
+    // holds the competitive threshold at lowest until countLimit hits.
+    bool boundedCount = exactCountTopKShape
+        && placement == TopDocsPlacement::ROOT_OP && requirements.isBounded();
+    // Competitive-score pruning requires a score-ranked heap. Sub-ops permit
+    // pruning because a separate exhaustive windowed pass produces their
+    // complete match domain and exact count before the ranking pass. Match-all
+    // reuses the incoming domain and its cardinality instead.
+    bool allowPruning = requirements.needRankedDocs
+        && !parsedSorts.useFieldSort
+        && (!requirements.needsCount() || requirements.needExactDomain || boundedCount);
+    if (allowPruning && !(diversify && requirements.needsCount())
+        && !(collapse && !topDocsReq.collapse->sort.empty())) {
+      requestFlags |= Query::ALLOW_PRUNING;
+    }
+    Query::ScoreProfile scoreProfile = luxir::scoreProfile(*query);
+    bool exactCountTopK = exactCountTopKShape && !boundedCount;
     bool pureCountShape = collapse == nullptr && diversify == nullptr
         && !QueryPrep::disableWholeMembershipPlanForTests
-        && limit == 0 && topDocsReq.get_number
+        && limit == 0 && requirements.needsCount()
         && !requirements.needExactDomain && !parsedSorts.useFieldSort
         && (foldFilters || filters.empty());
     FilterCache::Use* cacheFirstMembershipUse = nullptr;
@@ -1728,14 +1702,6 @@ public:
             std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
       }
       cacheFirstTopKCount = cacheFirstMembershipUse != nullptr;
-      if (cacheFirstTopKCount && countLimit > 0) {
-        // Resident membership already holds the exact count; the bounded
-        // count gives way to the exact cache-first plan.
-        countLimit = 0;
-        exactCountTopK = true;
-        allowPruning = false;
-        requestFlags &= ~Query::ALLOW_PRUNING;
-      }
       if (cacheFirstTopKCount) {
         skipCount(SkipStats::cacheFirstTopKCountWeightSkips);
         if (scoreProfile.kind != Query::ScoreProfile::Kind::VARIABLE) {
@@ -1904,7 +1870,7 @@ public:
     bool wholeConstantRanking = false;
     bool pureCount = pureCountShape && filterWeights.empty();
     bool wholeTopKCount = !QueryPrep::disableWholeMembershipPlanForTests
-        && exactCountTopK
+        && exactCountTopKShape
         && (cacheFirstTopKCount
             || (weight != nullptr && !weight->needsPrepare()))
         && filterWeights.empty();
@@ -1953,17 +1919,18 @@ public:
             auto shortcut = wholeMembershipWeight->countShortcut(segment, rootDomain);
             everySegmentEmpty &= shortcut.how == Query::CountHow::METADATA
                 && shortcut.maxMatches == 0;
-            if (shortcut.how > Query::COUNT_PROBE_LIMIT) {
+            if (shortcut.how > (boundedCount
+                    ? Query::CountHow::METADATA : Query::COUNT_PROBE_LIMIT)) {
               everySegmentConstant = false;
               break;
             }
           }
-          if (everySegmentEmpty && hasRequiredConjunction(*query)) {
+          if (!boundedCount && everySegmentEmpty && hasRequiredConjunction(*query)) {
             everySegmentConstant = false;
           }
         }
         bool fieldSortFullyRouted = false;
-        if (!everySegmentConstant && cache != nullptr && cache->enabled()) {
+        if (!boundedCount && !everySegmentConstant && cache != nullptr && cache->enabled()) {
           bool acquireUse = true;
           if (wholeFieldSort && !readerStableWhole) {
             wholeFieldSortCacheRoutes = req.requestPool.make_span<uint8_t>(
@@ -2009,14 +1976,14 @@ public:
       } else if (weight != nullptr && wholeTopKCount
           && wholeMembershipWeight != nullptr
           && !weight->isConstantScoring()) {
-        Query::Weight* countFreeRankingWeight = rankingWeight;
+        Query::Weight* countFreeRankingWeight = boundedCount ? weight : rankingWeight;
         if (countFreeRankingWeight == nullptr) {
           int32_t rankingFlags =
               requestFlags | Query::NEED_SCORES | Query::ALLOW_PRUNING;
           countFreeRankingWeight =
               query->createWeight(*qcontext, rankingFlags);
         }
-        bool reroute = foldFilters
+        bool reroute = !boundedCount && foldFilters
             && !countFreeRankingWeight->needsPrepare()
             && TopDocsReq::admitSparseFilteredTopK(
                 *countFreeRankingWeight, *req.reader, topCount);
@@ -2053,10 +2020,14 @@ public:
 
     qr->collapse = collapse;
     qr->diversify = diversify;
-    if (countLimit > 0 && weight != nullptr && weight->allowsPruning()) {
-      qr->countLimit = countLimit;
-      qr->countLimitProven = filterWeights.empty()
-          && matchLowerBound(*weight) >= countLimit;
+    qr->boundedCount = boundedCount && wholeMembershipWeight == nullptr
+        && wholeMembershipUse == nullptr;
+    if (qr->boundedCount && filterWeights.empty()) {
+      int64_t minMatches = 0;
+      for (auto& segment : req.reader->segments()) {
+        minMatches += weight->countShortcut(segment, nullptr).minMatches;
+      }
+      qr->countLimitProven = minMatches >= requirements.countLimit;
     }
     qr->headSort = std::move(headSort);
     if (firstQuery == nullptr) {
@@ -2106,6 +2077,10 @@ public:
   }
 
   SearchOp* parseFusion(std::string_view name, const luxir::api::Fusion& fusionProto, int depth) {
+    int64_t countLimit = fusionProto.count_limit.value_or(0);
+    if (countLimit < -1) {
+      throw std::runtime_error(fusionPrefix(name) + "count_limit must be >= -1");
+    }
     auto* oldCollapse = enclosingCollapse;
     auto* oldMeasure = inheritedFacetMeasure;
     auto restore = scope_guard([&]() noexcept {
@@ -2117,7 +2092,7 @@ public:
       if (!fusionProto.collapse->sort.empty()) {
         throw RequestError("fusion.collapse.sort is not supported");
       }
-      collapse = resolveCollapse(*fusionProto.collapse, fusionProto.get_number);
+      collapse = resolveCollapse(*fusionProto.collapse, countLimit != 0);
       enclosingCollapse = collapse;
       inheritedFacetMeasure = collapse;
     }

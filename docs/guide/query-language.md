@@ -98,7 +98,7 @@ POST /collections/authors/_search
 {
   "query": "author_name:=(\"Neal Asher\", \"Neal Stephenson\")",
   "fields": ["id"],
-  "get_number": true,
+  "count_limit": -1,
   "sort": "id"
 }
 ```
@@ -126,7 +126,7 @@ POST /collections/authors/_search
     }
   },
   "fields": ["id"],
-  "get_number": true,
+  "count_limit": -1,
   "sort": "id"
 }
 ```

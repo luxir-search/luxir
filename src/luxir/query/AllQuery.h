@@ -244,10 +244,6 @@ public:
       return countBound(segment, domain, segment.maxDoc(), CountHow::METADATA);
     }
 
-    int64_t matchLowerBound(IndexReader::Segment& segment) override {
-      return segment.numLive();
-    }
-
   };
 
   AllQuery::Weight* createWeight(Context& context, int32_t flags,

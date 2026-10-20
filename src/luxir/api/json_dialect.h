@@ -617,30 +617,6 @@ void readSortList(auto &sort, auto &ctx, auto &it, auto &end) {
   util::from_json<O>(sort[n], ctx, it, end);
 }
 
-// Elasticsearch track_total_hits: true counts exactly, false omits the count,
-// and an integer N bounds it (get_number plus count_limit = N).
-template <auto Opts>
-void readTrackTotalHits(luxir::api::TopDocs &td, auto &ctx, auto &it, auto &end) {
-  if constexpr (!check_ws_handled(Opts)) {
-    if (skip_ws<Opts>(ctx, it, end)) {
-      return;
-    }
-  }
-  static constexpr auto O = ws_handled<Opts>();
-  char c = (char)*it;
-  if (c == 't' || c == 'f') {
-    bool track = false;
-    util::from_json<O>(track, ctx, it, end);
-    td.get_number = track;
-    td.count_limit.reset();
-    return;
-  }
-  int64_t limit = 0;
-  util::from_json<O>(limit, ctx, it, end);
-  td.get_number = true;
-  td.count_limit = limit;
-}
-
 template <>
 struct from<JSON, luxir::api::FieldVariants> {
   template <auto Opts>
@@ -1095,7 +1071,7 @@ struct from<JSON, luxir::api::Collapse> {
       value.missing = luxir::api::Collapse_::MissingPolicy::EXPAND;
       value.head_sort = {};
       value.sort = {};
-      value.get_number = false;
+      value.get_count = false;
       value.ops = {};
       readFields(it, end);
       return;
@@ -1107,7 +1083,7 @@ struct from<JSON, luxir::api::Collapse> {
         [&](auto &vit, auto &vend) {
           if (key == "field") readFields(vit, vend);
           else if (key == "missing") util::from_json<O>(value.missing, ctx, vit, vend);
-          else if (key == "get_number") util::from_json<O>(value.get_number, ctx, vit, vend);
+          else if (key == "get_count") util::from_json<O>(value.get_count, ctx, vit, vend);
           else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
@@ -1176,12 +1152,8 @@ struct from<JSON, luxir::api::TopDocs> {
             util::from_json<O>(value.offset, ctx, vit, vend);
           } else if (key == "limit") {
             util::from_json<O>(value.limit, ctx, vit, vend);
-          } else if (key == "get_number") {
-            util::from_json<O>(value.get_number, ctx, vit, vend);
           } else if (key == "count_limit") {
             util::from_json<O>(value.count_limit, ctx, vit, vend);
-          } else if (key == "track_total_hits") {
-            readTrackTotalHits<O>(value, ctx, vit, vend);
           } else if (key == "get_scores") {
             util::from_json<O>(value.get_scores, ctx, vit, vend);
           } else if (key == "min_score") {
@@ -1235,8 +1207,8 @@ struct from<JSON, luxir::api::Fusion> {
             util::from_json<O>(value.limit, ctx, vit, vend);
           } else if (key == "offset") {
             util::from_json<O>(value.offset, ctx, vit, vend);
-          } else if (key == "get_number") {
-            util::from_json<O>(value.get_number, ctx, vit, vend);
+          } else if (key == "count_limit") {
+            util::from_json<O>(value.count_limit, ctx, vit, vend);
           } else if (key == "get_scores") {
             util::from_json<O>(value.get_scores, ctx, vit, vend);
           } else if (key == "fields") {
@@ -1493,12 +1465,8 @@ struct from<JSON, luxir::api::SearchRequest> {
             util::from_json<O>(shorthand().batch_size, ctx, vit, vend);
           } else if (key == "document_format") {
             util::from_json<O>(shorthand().document_format, ctx, vit, vend);
-          } else if (key == "get_number") {
-            util::from_json<O>(shorthand().get_number, ctx, vit, vend);
           } else if (key == "count_limit") {
             util::from_json<O>(shorthand().count_limit, ctx, vit, vend);
-          } else if (key == "track_total_hits") {
-            readTrackTotalHits<O>(shorthand(), ctx, vit, vend);
           } else if (key == "get_scores") {
             util::from_json<O>(shorthand().get_scores, ctx, vit, vend);
           } else if (key == "min_score") {

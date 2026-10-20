@@ -54,8 +54,11 @@ inline size_t saturatingMultiply(size_t a, size_t b) {
 
 struct CollectionRequirements {
   bool needRankedDocs = false;
-  bool needExactCount = false;
+  int64_t countLimit = 0; // 0: none; -1: exact; positive: at least this many.
   bool needExactDomain = false;
+
+  bool needsCount() const { return countLimit != 0; }
+  bool isBounded() const { return countLimit > 0; }
 };
 
 // --- Response-side (owning) oneof / optional mutators ---

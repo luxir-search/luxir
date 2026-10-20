@@ -179,14 +179,14 @@ TEST(JsonDialect, SearchRequestUnifiedRoot) {
   // shorthand: root TopDocs keys register as ops["q"]; request-level keys mix in
   { P::SearchRequest r;
     ASSERT_TRUE(P::read_json(r,
-        R"({"query":"title_w:dune","limit":5,"max_parallel":-1,"time_zone":"UTC","get_number":true})", mr));
+        R"({"query":"title_w:dune","limit":5,"max_parallel":-1,"time_zone":"UTC","count_limit":-1})", mr));
     EXPECT_TRUE(r.json_shorthand);
     EXPECT_EQ(-1, r.max_parallel);
     EXPECT_EQ("UTC", r.time_zone);
     ASSERT_EQ(1u, r.ops.size());
     const auto& td = std::get<P::TopDocs>((**r.ops.find("q")).kind);
     EXPECT_EQ(5, *td.limit);
-    EXPECT_TRUE(td.get_number);
+    EXPECT_EQ(-1, td.count_limit);
     ASSERT_TRUE(td.query.has_value());
     EXPECT_EQ("title_w:dune", std::get<P::ExprQuery>(td.query->kind).q); }
 

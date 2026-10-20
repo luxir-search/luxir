@@ -313,7 +313,7 @@ TEST_F(NumericRangeZoneMapTest, deletedOnlyMatchesKeepScorerPresent) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  auto& topDocs = req->topDocs("q").getNumber().limit(0);
+  auto& topDocs = req->topDocs("q").countLimit().limit(0);
   topDocs.rawQuery() = qb::range(
       topDocs.mr(), "deleted_only_i", qb::valI64(topDocs.mr(), 10),
       nullptr, qb::valI64(topDocs.mr(), 10), nullptr);

@@ -101,7 +101,7 @@ POST /collections/authors/_search
   "fields": ["title_t", "author_name"],
   "sort": "id",
   "limit": 3,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "authors": {
       "field_facet": {

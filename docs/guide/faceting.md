@@ -29,7 +29,7 @@ POST /collections/books/_search
   "query": "title_t:dune",
   "filter": ["stock_i:>0"],
   "limit": 10,
-  "get_number": true,
+  "count_limit": -1,
   "fields": ["id","title_t"],
   "ops": {
     "categories": {
@@ -105,7 +105,7 @@ POST /collections/books/_search
   "query": {"all":true},
   "filter": ["stock_i:>0"],
   "limit": 10,
-  "get_number": true,
+  "count_limit": -1,
   "fields": ["id","title_t"],
   "ops": {
     "categories": {
@@ -450,7 +450,7 @@ same `ops` map.
 A `top_docs` (or `fusion`) operation under a facet returns a ranked document
 list for every bucket: the best few products per category, the latest post per
 author. It is an ordinary operation with its own `query`, `filter`, `sort`,
-`limit`, `fields`, and `get_number`, applied to that bucket's documents:
+`limit`, `fields`, and `count_limit`, applied to that bucket's documents:
 
 ```json
 "category": {
@@ -463,7 +463,7 @@ author. It is an ordinary operation with its own `query`, `filter`, `sort`,
           "query": "title_t:dune",
           "limit": 2,
           "fields": ["id","title_t"],
-          "get_number": true
+          "count_limit": -1
         }
       }
     }
@@ -803,7 +803,7 @@ POST /collections/authors/_search
     "all": true
   },
   "fields": ["id", "title_t", "author_name"],
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "authors": {
       "field_facet": {
@@ -916,7 +916,7 @@ POST /collections/authors/_search
     "all": true
   },
   "limit": 0,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "words": {
       "field_facet": {

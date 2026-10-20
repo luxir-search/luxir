@@ -16,7 +16,7 @@ results, and links the protobuf definitions shared by JSON and gRPC.
 ```http
 POST /collections/books/_search
 
-{"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "get_number": true}
+{"query": {"match": {"title_t": "dune"}}, "fields": ["id"], "count_limit": -1}
 ```
 
 ```json
@@ -107,7 +107,7 @@ POST /collections/authors/_search
     }
   },
   "fields": ["id"],
-  "get_number": true,
+  "count_limit": -1,
   "sort": "id"
 }
 ```

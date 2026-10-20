@@ -743,6 +743,7 @@ public:
     int64_t maxMatches;
     CountHow how;
     Weight* resolver = nullptr;
+    int64_t minMatches = 0; // Live-match floor under no additional domain.
   };
 
   // Restrict header totals by cheap eligibility bounds; restrictions need iteration.
@@ -753,8 +754,10 @@ public:
       bound = std::min<int64_t>(bound, domain->cachedCard());
     }
     if (bound == 0) return {0, CountHow::METADATA};
+    int64_t minMatches = how == CountHow::METADATA && domain == nullptr
+        ? std::max<int64_t>(0, docs - (segment.maxDoc() - segment.numLive())) : 0;
     if (domain || segment.liveDocs()) how = CountHow::ITERATE;
-    return {bound, how};
+    return {bound, how, nullptr, minMatches};
   }
 
   /// Per-segment planning state. Suppliers are allocated from the segment-local
@@ -1622,14 +1625,6 @@ public:
     virtual CountShortcut countShortcut(IndexReader::Segment& segment,
                                          DocSet* domain) {
       return countBound(segment, domain, segment.maxDoc());
-    }
-
-    /// Metadata-only lower bound on this weight's live matches in `segment`,
-    /// under no domain; 0 when metadata proves nothing. A bounded hit count
-    /// uses it to skip counting once the limit is proven.
-    virtual int64_t matchLowerBound(IndexReader::Segment& segment) {
-      unused(segment);
-      return 0;
     }
 
     /// Policy family for choosing the sparse-filtered top-k density knee.

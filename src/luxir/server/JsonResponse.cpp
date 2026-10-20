@@ -466,7 +466,7 @@ void appendDocListMembers(std::string& out, const luxir::api::DocList& docs) {
     out += R"("found":)";
     appendInt(out, *docs.found);
     out += ',';
-    if (docs.found_is_lower_bound) out += R"("found_is_lower_bound":true,)";
+    if (docs.found_gte) out += R"("found_gte":true,)";
   }
   if (docs.found_docs.has_value()) {
     out += R"("found_docs":)";
@@ -659,7 +659,7 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
   // Found goes out with the op's first run; request warnings and the request
   // id with the stream's first header. Degraded execution must not be silent,
   // and neither may correlation, so either forces a header even without
-  // get_number.
+  // nonzero count_limit.
   bool haveFound = firstForOp && docs.found.has_value();
   bool haveFoundDocs = firstForOp && docs.found_docs.has_value();
   bool haveFoundGroups = firstForOp && docs.found_groups.has_value();
@@ -687,7 +687,7 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
       if (!first) marker += ',';
       marker += R"("found":)";
       appendInt(marker, *docs.found);
-      if (docs.found_is_lower_bound) marker += R"(,"found_is_lower_bound":true)";
+      if (docs.found_gte) marker += R"(,"found_gte":true)";
       first = false;
     }
     if (haveFoundDocs) {

@@ -554,7 +554,7 @@ TEST_F(BooleanFuzzTest, twoTermConjunctionAcrossSegments) {
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
   auto& cur = req->topDocs("q");
-  cur.getNumber().limit(100).fields({"id"});
+  cur.countLimit().limit(100).fields({"id"});
   cur.rawQuery() = qb::boolean(cur.mr(),
       /*required=*/{qb::match(cur.mr(), "body_w", "b"), qb::match(cur.mr(), "body_w", "d")});
   req->execute(false);
@@ -630,7 +630,7 @@ TEST_F(BooleanFuzzTest, negatedAndRankOnlyDisjunctionAdvanceMatchesOracle) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
-    cur.getNumber().limit(10);
+    cur.countLimit().limit(10);
     cur.rawQuery() = q;
     req->execute(false);
     return req->getMatchCount();
@@ -738,7 +738,7 @@ TEST_F(BooleanFuzzTest, negatedDenseCountHandlesWindowsSegmentsDeletesAndDomain)
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
-    cur.getNumber().limit(0);
+    cur.countLimit().limit(0);
     std::vector<api::Query> required = {
         qb::match(cur.mr(), "body_w", sparse ? "nc_sparse" : "nc_pos")};
     std::vector<api::Query> prohibited = {
@@ -860,7 +860,7 @@ TEST_F(BooleanFuzzTest, randomizedNegatedCountMatchesPullOracle) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
-    cur.getNumber().limit(0);
+    cur.countLimit().limit(0);
     std::vector<api::Query> required = {
         qb::match(cur.mr(), "body_w",
                   "rn_pos" + std::to_string(positive))};
@@ -968,7 +968,7 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
       auto req = localReq(helper.getSearchEngine());
       req->collection("main");
       auto& cur = req->topDocs("q");
-      cur.getNumber()
+      cur.countLimit()
          .limit(numDocs)
          .batchSize(numDocs + 1)
          .fields({"id"});
@@ -1141,10 +1141,10 @@ TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {
       req->collection("main");
       auto& nestedCursor = req->topDocs("nested");
       auto queries = explicitCase(nestedCursor.mr(), spec);
-      nestedCursor.getNumber().getScores().limit(64).batchSize(65).fields({"id"});
+      nestedCursor.countLimit().getScores().limit(64).batchSize(65).fields({"id"});
       nestedCursor.rawQuery() = queries.first;
       auto& twinCursor = req->topDocs("twin");
-      twinCursor.getNumber().getScores().limit(64).batchSize(65).fields({"id"});
+      twinCursor.countLimit().getScores().limit(64).batchSize(65).fields({"id"});
       twinCursor.rawQuery() = queries.second;
       req->testForcePrepare = prepared;
       req->execute(iter % 2 == 0);
@@ -1175,10 +1175,10 @@ TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {
       req->collection("main");
       auto& nestedCursor = req->topDocs("nested");
       auto queries = explicitCase(nestedCursor.mr(), spec);
-      nestedCursor.getNumber().limit(0);
+      nestedCursor.countLimit().limit(0);
       nestedCursor.rawQuery() = queries.first;
       auto& twinCursor = req->topDocs("twin");
-      twinCursor.getNumber().limit(0);
+      twinCursor.countLimit().limit(0);
       twinCursor.rawQuery() = queries.second;
       req->testForcePrepare = prepared;
       req->execute(iter % 2 != 0);

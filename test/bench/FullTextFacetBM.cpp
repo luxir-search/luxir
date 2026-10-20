@@ -1014,7 +1014,7 @@ static void BM_FullTextFacet(benchmark::State& state, int64_t nDocs, std::string
     } else {
       topDocs.matchQuery("body_w", qterm);
     }
-    topDocs.getNumber(true).getScores(false).fields({"id"});
+    topDocs.countLimit().getScores(false).fields({"id"});
 
     // facet on the full-text field itself
     auto& facet = topDocs.facet("f", "body_w");

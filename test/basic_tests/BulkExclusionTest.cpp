@@ -297,7 +297,7 @@ CountRun runCachedCount(CollectionHelper& helper,
   SkipStatsGuard statsGuard;
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  auto& top = req->topDocs("q").getNumber().limit(0);
+  auto& top = req->topDocs("q").countLimit().limit(0);
   top.rawQuery() = qb::boolean(
       top.mr(),
       {qb::match(top.mr(), "body_w", "left"),
@@ -320,7 +320,7 @@ int64_t runCount(CollectionHelper& helper, bool disabled,
   BulkExclusionGuard bulkGuard(disabled);
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  auto& top = req->topDocs("q").getNumber().limit(0);
+  auto& top = req->topDocs("q").countLimit().limit(0);
   std::array<api::Query, 1> prohibited = {
       qb::match(top.mr(), "body_w", exclusion)};
   top.rawQuery() = scoredDisjunction(

@@ -41,7 +41,7 @@ POST /collections/main/_search
   },
   "fields": ["id", "title_t", "price_f"],
   "limit": 2,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "series": {
       "field_facet": {
@@ -265,7 +265,7 @@ Anywhere a query goes, it can be a structured object or an expression string.
   ranked lists, facets, metrics, and fusion, nested to any depth and executed
   in parallel. HTTP responses preserve their names and nesting under `ops`.
   Root query shorthand returns `found` and `docs` directly in the HTTP envelope.
-- Count-only and analytics-only requests: `limit: 0` with `get_number: true`
+- Count-only and analytics-only requests: `limit: 0` with `count_limit: -1`
   loads no document fields.
 - Stream every match: `limit: -1` with `?format=docs` returns one document
   per line over one connection, with no cursor, scroll state, or page size.
