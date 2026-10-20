@@ -14,6 +14,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include "FacetEmit.h"
+#include "luxir/query/FacetTermFilter.h"
 #include "FacetExecution.h"
 #include "FacetOp.h"
 #include "SkinnyCounter.h"
@@ -149,6 +150,10 @@ class StrFacetOp : public FieldFacetReq {
   };
   std::vector<PinnedBucket> pinnedBuckets;
   bool inlineAllCandidate = false;
+  // Which terms may be ordinary buckets; null keeps every term. Counting is
+  // unaffected, so selection is the only place it applies (OrdCountSink,
+  // facetResult2). Selected buckets bypass it.
+  std::shared_ptr<const FacetTermFilter> termFilter;
 
 public:
   class MergeableStrData : public luxir::MergeableData {
@@ -360,10 +365,11 @@ public:
   StrFacetOp(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     std::shared_ptr<OrdMap> ordMap,
-    std::span<const std::string_view> selected) :
+    std::span<const std::string_view> selected,
+    std::shared_ptr<const FacetTermFilter> termFilter = nullptr) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 {}, selected),
-  ordMap(std::move(ordMap)) {
+  ordMap(std::move(ordMap)), termFilter(std::move(termFilter)) {
     if (!selected.empty()) {
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr lookup(poolGuard.pool(), this->ordMap.get(), reader, segInfos);
@@ -444,6 +450,15 @@ public:
     bool full = false;
     int64_t floorCount = 0;
     int64_t floorOrd = 0;
+    // Term lookup for the filter, only when one is set. The guard releases
+    // the lookup's pool allocations with the sink.
+    std::optional<MemPool::ScopeGuard> poolGuard;
+    std::optional<OrdMapStr> labels;
+
+    bool accepts(int64_t ord) {
+      return op.termFilter == nullptr
+          || op.termFilter->accepts(labels->ordToStr(ord));
+    }
 
     LUXIR_NOINLINE void admit(int64_t ord, int64_t count) {
       finalizer.add({ord, count, {}});
@@ -458,6 +473,10 @@ public:
     OrdCountSink(const StrFacetOp& op, bool allowZeroPadding)
       : op(op),
         finalizer(op.minCount, 0, op.limit, countFieldBucketOrder) {
+      if (op.termFilter != nullptr) {
+        poolGuard.emplace(MemPool::threadLocal());
+        labels.emplace(poolGuard->pool(), op.ordMap.get(), op.reader, op.segInfos);
+      }
       if (allowZeroPadding && op.minCount == 0) {
         int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
         paddingTarget = op.limit < 0 ? (size_t)numGlobalOrds : (size_t)op.limit;
@@ -465,14 +484,16 @@ public:
     }
 
     LUXIR_INLINE void add(int64_t ord, int64_t count) {
-      if (counted < paddingTarget) countedOrds.push_back(ord);
-      counted++;
       // countFieldBucketOrder: a newcomer must beat the page's worst bucket
       // on count, or tie it with a smaller ord.
       if (full && (count < floorCount
                    || (count == floorCount && ord > floorOrd))) {
+        counted++;
         return;
       }
+      if (op.termFilter != nullptr && !accepts(ord)) return;
+      if (counted < paddingTarget) countedOrds.push_back(ord);
+      counted++;
       admit(ord, count);
     }
 
@@ -492,7 +513,7 @@ public:
         size_t emitted = counted;
         for (int64_t ord = 0;
              ord < numGlobalOrds && emitted < paddingTarget; ord++) {
-          if (present.contains(ord)) continue;
+          if (present.contains(ord) || !accepts(ord)) continue;
           finalizer.add({ord, 0, {}});
           emitted++;
         }
@@ -847,7 +868,7 @@ public:
                     ? 0 : (int64_t)thisOp().ordMap->topTerms().entries.size(),
                 .domainHasBitset = domainView.bits != nullptr,
                 .missingRequested = thisOp().missing,
-                .allowTopTerms = allowTopTerms,
+                .allowTopTerms = allowTopTerms && thisOp().termFilter == nullptr,
                 .hasGlobalOrdMap = thisOp().ordMap != nullptr,
                 .readerHasNoDeletes =
                     thisOp().reader.liveDocs() == thisOp().reader.maxDoc()
@@ -1458,7 +1479,12 @@ public:
             return std::string(bucket.pinned()
                 ? thisOp().pinnedBuckets[bucket.pinIndex].key
                 : labels.ordToStr(*bucket.key));
-          }, [this](auto& buckets) { executeResultChildren(buckets); });
+          }, [this](auto& buckets) { executeResultChildren(buckets); },
+          std::less<int64_t>{}, thisOp().termFilter == nullptr
+              ? std::function<bool(int64_t)>()
+              : [&](int64_t ord) {
+                  return thisOp().termFilter->accepts(labels.ordToStr(ord));
+                });
     }
 
 

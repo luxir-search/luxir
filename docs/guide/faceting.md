@@ -288,6 +288,7 @@ the facet's `limit: 10` returns up to ten categories.
 | `ops` | Per-bucket sub-facets, metrics, or `top_docs` / `fusion` lists. |
 | `selected` | Values that refine the result set and stay visible as buckets. See [Multi-select navigation](#multi-select-navigation). |
 | `selection_mode` | `any` (default) or `all`: match any selected value, or require every one. |
+| `term_filter` | String and ID fields only. Restricts which terms can become buckets; counts stay exact. See [Filtering bucket terms](#filtering-bucket-terms). |
 
 String and ID facets return buckets in count-descending order, with bucket
 value ascending as a deterministic tie break. A multi-valued field contributes
@@ -306,6 +307,48 @@ rather than enumerated.
 A string facet needs indexed terms and a column. Facets return the term as
 stored. For fields with multiple representations, see
 [Field variants](#field-variants).
+
+### Filtering bucket terms
+
+`term_filter` limits which terms of a string or ID field can become buckets,
+for example an autocomplete over category names or a facet over the values a
+caller is allowed to see. It is not a query filter: every term is still
+counted in the facet's domain, so the counts of the remaining buckets are
+exactly what they would be without the filter, and `limit` applies to the
+filtered terms (`limit: 1` with `"prefix": "b"` returns the best `b` term, not
+nothing because an `a` term ranked first).
+
+```json
+{
+  "field": "category_s",
+  "limit": 10,
+  "term_filter": {"prefix": "sci", "exclude": ["science-fiction-misc"]}
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `prefix` | Keep terms starting with this prefix. |
+| `regex` | Keep terms matching this regular expression in full, with [regex query](query-reference.md) syntax. |
+| `exclude_regex` | Drop terms matching this regular expression in full. |
+| `include` | Keep only these exact terms. An empty list is unset. |
+| `exclude` | Drop these exact terms. |
+| `partition`, `num_partitions` | Keep terms whose stable hash modulo `num_partitions` equals `partition`. Requests for partitions `0` to `num_partitions - 1` together return every term exactly once, so a client can page through a very large term set. The hash is 64-bit FNV-1a over the indexed term bytes. |
+
+Every condition that is set must hold. Literals are matched the way the field
+indexes terms: `prefix`, `regex`, `include`, and `exclude` are normalized like
+the same values in a prefix, regex, or `any_of` query, and ID fields use them
+verbatim. Regexes cannot see the discarded bytes of a long term that the field
+truncates or hashes.
+
+The filter changes only the ordinary buckets:
+
+- `missing` still counts every document in the domain without a value.
+- `mincount: 0` pads with zero-count terms that pass the filter.
+- `selected` buckets are always returned, whether or not they pass the filter.
+- Sub-operations and nested facets run on the buckets that pass.
+
+`term_filter` is rejected on integer, date, and text fields.
 
 ## Expression metrics
 
