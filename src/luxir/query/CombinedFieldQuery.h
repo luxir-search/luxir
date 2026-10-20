@@ -18,9 +18,8 @@
 namespace luxir {
 
 // BM25F over one term in several TEXT fields, scored as if the fields were a
-// single combined field (Lucene's CombinedFieldQuery, the engine behind
-// Elasticsearch combined_fields). Each field's weight multiplies its term
-// frequency and its document length:
+// single combined field. Each field's weight multiplies its term frequency
+// and its document length, as in Lucene's CombinedFieldQuery:
 //
 //   freq(d)   = sum_f w_f * tf_f(d)
 //   length(d) = sum_f w_f * length_f(d), rounded and re-encoded like a norm
@@ -29,11 +28,11 @@ namespace luxir {
 //
 // Every listed field contributes its length to a document even when the
 // term is absent from that field, so a long body still dampens a title hit.
-// Weights below 1 are legal but break BM25's saturation guarantee; the
-// combined_fields arm requires >= 1 like Elasticsearch.
+// Positive weights, including those below 1, retain the BM25 score bound.
 //
 // Membership is the union of the per-field postings, so an unscored use
-// rewrites to a disjunction of TermQuerys and shares their filter keys.
+// rewrites to a disjunction of TermQuerys. Its own filter key identifies the
+// combined field set and term, independently of the scoring weights.
 class CombinedFieldQuery final : public Query {
   std::span<const std::string_view> fields;
   std::span<const float> weights;
@@ -218,6 +217,9 @@ public:
         Similarity similarity;
         float idf = similarity.idf(docFreq, docCount);
         float avgdl = (float)(sumTotalTermFreq / (double)docCount);
+        // Keep membership even with empty statistics or float overflow from
+        // finite field weights. BM25 needs a finite, positive average length.
+        if (!(avgdl > 0.0f) || !std::isfinite(avgdl)) avgdl = 1.0f;
         simScorer = context.pool.make<Similarity::BM25Scorer>(
             multiplier, similarity.k1, similarity.b, idf, avgdl);
       }

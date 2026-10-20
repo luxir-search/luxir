@@ -844,12 +844,40 @@ public:
     return createMatchQuery(target, text, op, minMatch);
   }
 
-  // One request field with its boost, as written ("name" or "name^boost").
   struct WeightedField {
-    std::string_view name;
-    float boost = 1.0f;
+    std::string_view field;
+    float weight = 1.0f;
   };
 
+private:
+  struct ResolvedWeightedField {
+    const ResolvedFieldHandle* target;
+    float weight;
+  };
+
+  // Normalize before analysis or clause construction. Search aliases can name
+  // the same physical field; the largest weight wins in either mode.
+  std::span<ResolvedWeightedField> resolveWeightedFields(std::span<const WeightedField> requested) {
+    auto resolved = pool.make_span<ResolvedWeightedField>(requested.size());
+    for (size_t i = 0; i < requested.size(); i++) {
+      resolved[i] = {&fields.resolve(requested[i].field, OpClass::SEARCH, opName),
+                     requested[i].weight};
+    }
+    std::sort(resolved.begin(), resolved.end(), [](const auto& a, const auto& b) {
+      return a.target->physicalName < b.target->physicalName;
+    });
+    size_t count = 0;
+    for (const auto& field : resolved) {
+      if (count > 0 && resolved[count - 1].target->physicalName == field.target->physicalName) {
+        resolved[count - 1].weight = std::max(resolved[count - 1].weight, field.weight);
+      } else {
+        resolved[count++] = field;
+      }
+    }
+    return resolved.first(count);
+  }
+
+public:
   // Combine analyzed-term clauses the way match does: OR, AND, or
   // min-should-match over the term clauses.
   Query* combineAnalyzedClauses(std::span<Query*> clauses, Operator op, int minMatch) {
@@ -867,95 +895,81 @@ public:
     return pool.make<BooleanQuery>(none, clauses, none, none, k);
   }
 
-  // BM25F over TEXT fields (combined_fields, multi_match cross_fields).
-  // Fields are resolved through their search binding and deduplicated by
-  // physical name (the larger boost wins). Each field analyzes `text` with
-  // its own analyzer; fields that produce the same term sequence form one
-  // group, scored as a single combined field per term. Without
-  // allowGroups, more than one group is an error. Groups add their scores.
-  Query* createCombinedFieldsQuery(std::span<const WeightedField> requested,
-                                   std::string_view text, Operator op, int minMatch,
-                                   bool allowGroups, std::string_view label) {
+  // Fields with the same compiled analyzer and long-term policy share one
+  // analysis pass and one BM25F query per term. Group order follows physical
+  // field order, independent of request order and the query text.
+  Query* createMultiMatchCombined(std::span<const WeightedField> requested,
+                                  std::string_view text, Operator op, int minMatch) {
     struct Group {
-      std::vector<std::string_view> terms;
-      std::vector<std::string_view> fieldNames;
-      std::vector<float> weights;
+      const ResolvedFieldHandle* target;
+      std::span<std::string_view> fields;
+      std::span<float> weights;
+      size_t count;
     };
-    std::vector<std::string_view> physical;
-    std::vector<float> weights;
-    std::vector<std::vector<std::string_view>> analyzed;
-    for (const auto& wf : requested) {
-      const ResolvedFieldHandle& target = fields.resolve(wf.name, OpClass::SEARCH, opName);
-      if (target.fieldType->type() != FieldType::Type::TEXT) {
+    auto resolved = resolveWeightedFields(requested);
+    auto groups = pool.make_span<Group>(resolved.size());
+    auto groupIndices = pool.make_span<size_t>(resolved.size());
+    size_t numGroups = 0;
+    for (size_t i = 0; i < resolved.size(); i++) {
+      const auto& target = *resolved[i].target;
+      if (target.fieldType->type() != FieldType::TEXT) {
         throw std::runtime_error(std::format(
-            "{}: field '{}' is not a TEXT field", label, wf.name));
+            "multi_match: field '{}' is not a TEXT field", target.physicalName));
       }
-      auto found = std::find(physical.begin(), physical.end(), target.physicalName);
-      if (found != physical.end()) {
-        size_t at = (size_t)(found - physical.begin());
-        weights[at] = std::max(weights[at], wf.boost);
-        continue;
+      auto* type = (TextFieldType*)target.fieldType;
+      size_t group = 0;
+      for (; group < numGroups; group++) {
+        auto* other = (TextFieldType*)groups[group].target->fieldType;
+        if (type->analyzer_.get() == other->analyzer_.get()
+            && type->longTerms == other->longTerms) break;
       }
-      auto terms = analyzeText(target, text);
-      physical.push_back(poolCopy(target.physicalName));
-      weights.push_back(wf.boost);
-      analyzed.push_back(std::move(terms));
+      if (group == numGroups) groups[numGroups++] = {&target, {}, {}, 0};
+      groupIndices[i] = group;
+      groups[group].count++;
+    }
+    groups = groups.first(numGroups);
+    for (auto& group : groups) {
+      group.fields = pool.make_span<std::string_view>(group.count);
+      group.weights = pool.make_span<float>(group.count);
+      group.count = 0;
+    }
+    for (size_t i = 0; i < resolved.size(); i++) {
+      auto& group = groups[groupIndices[i]];
+      group.fields[group.count] = poolCopy(resolved[i].target->physicalName);
+      group.weights[group.count++] = resolved[i].weight;
     }
 
-    std::vector<Group> groups;
-    for (size_t i = 0; i < physical.size(); i++) {
-      Group* group = nullptr;
-      for (auto& g : groups) {
-        if (g.terms == analyzed[i]) group = &g;
-      }
-      if (group == nullptr) {
-        if (!allowGroups && !groups.empty()) {
-          throw std::runtime_error(std::format(
-              "{}: fields '{}' and '{}' analyze the query text differently; "
-              "every field must use the same analysis (multi_match with type "
-              "cross_fields groups fields by analysis)",
-              label, groups[0].fieldNames[0], physical[i]));
-        }
-        group = &groups.emplace_back();
-        group->terms = analyzed[i];
-      }
-      group->fieldNames.push_back(physical[i]);
-      group->weights.push_back(weights[i]);
-    }
-
-    std::vector<Query*> groupQueries;
-    for (auto& g : groups) {
-      if (g.terms.empty()) continue;
-      auto fieldSpan = pool.copy_span(std::span<std::string_view>(g.fieldNames));
-      auto weightSpan = pool.copy_span(std::span<float>(g.weights));
-      bool plainTerm = g.fieldNames.size() == 1 && g.weights[0] == 1.0f;
-      auto clauses = pool.make_span<Query*>(g.terms.size());
-      for (size_t t = 0; t < g.terms.size(); t++) {
-        // One field at weight 1 is exactly BM25, so keep the term planner.
+    auto optional = pool.make_span<Query*>(numGroups);
+    size_t count = 0;
+    for (const auto& group : groups) {
+      auto terms = analyzeText(*group.target, text);
+      if (terms.empty()) continue;
+      bool plainTerm = group.fields.size() == 1 && group.weights[0] == 1.0f;
+      auto clauses = pool.make_span<Query*>(terms.size());
+      for (size_t t = 0; t < terms.size(); t++) {
+        // Only a singleton at weight 1 is ordinary BM25. All other weights
+        // scale frequency and length, including in single-field groups.
         clauses[t] = plainTerm
-            ? (Query*)pool.make<TermQuery>(fieldSpan[0], g.terms[t])
-            : (Query*)pool.make<CombinedFieldQuery>(
-                  std::span<const std::string_view>(fieldSpan),
-                  std::span<const float>(weightSpan), g.terms[t]);
+            ? (Query*)pool.make<TermQuery>(group.fields[0], terms[t])
+            : (Query*)pool.make<CombinedFieldQuery>(group.fields, group.weights, terms[t]);
       }
-      groupQueries.push_back(combineAnalyzedClauses(clauses, op, minMatch));
+      optional[count++] = combineAnalyzedClauses(clauses, op, minMatch);
     }
-    if (groupQueries.empty()) return matchNoDocs();
-    if (groupQueries.size() == 1) return groupQueries[0];
-    auto optional = pool.copy_span(std::span<Query*>(groupQueries));
+    if (count == 0) return matchNoDocs();
+    if (count == 1) return optional[0];
     std::span<Query*> none{};
-    return pool.make<BooleanQuery>(none, optional, none, none);
+    return pool.make<BooleanQuery>(none, optional.first(count), none, none);
   }
 
-  // multi_match most_fields: one match query per field, scores add up, each
-  // field's boost multiplies its match score.
-  Query* createMostFieldsQuery(std::span<const WeightedField> requested,
-                               std::string_view text, Operator op, int minMatch) {
-    auto clauses = pool.make_span<Query*>(requested.size());
-    for (size_t i = 0; i < requested.size(); i++) {
-      clauses[i] = createMatchQuery(
-          requested[i].name, text, op, minMatch, requested[i].boost);
+  // Each field contributes its own match score multiplied by its weight.
+  Query* createMultiMatchPerField(std::span<const WeightedField> requested,
+                                  std::string_view text, Operator op, int minMatch) {
+    auto resolved = resolveWeightedFields(requested);
+    auto clauses = pool.make_span<Query*>(resolved.size());
+    for (size_t i = 0; i < resolved.size(); i++) {
+      clauses[i] = createMatchQuery(*resolved[i].target, text, op, minMatch, resolved[i].weight);
     }
+    if (clauses.empty()) return matchNoDocs();
     if (clauses.size() == 1) return clauses[0];
     std::span<Query*> none{};
     return pool.make<BooleanQuery>(none, clauses, none, none);

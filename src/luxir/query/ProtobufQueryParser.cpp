@@ -535,10 +535,9 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
       ? QueryBuilder::Operator::AND : QueryBuilder::Operator::OR;
   switch (query.mode) {
     case luxir::api::MultiMatchQuery_::Mode::COMBINED:
-      return builder.createCombinedFieldsQuery(
-          fields, query.text, op, query.min_match, true, "multi_match");
+      return builder.createMultiMatchCombined(fields, query.text, op, query.min_match);
     case luxir::api::MultiMatchQuery_::Mode::PER_FIELD:
-      return builder.createMostFieldsQuery(fields, query.text, op, query.min_match);
+      return builder.createMultiMatchPerField(fields, query.text, op, query.min_match);
   }
   throw std::runtime_error(std::format("multi_match: unknown mode {}", (int)query.mode));
 }
