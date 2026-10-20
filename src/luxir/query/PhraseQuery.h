@@ -16,6 +16,7 @@
 #include "Query.h"
 #include "luxir/reader/NormsReader.h"
 #include "luxir/reader/PosEnum.h"
+#include "luxir/reader/UnionPosEnum.h"
 
 namespace luxir {
 
@@ -24,6 +25,10 @@ class PhraseQuery final : public Query {
   std::span<std::string_view> terms;
   std::span<const int32_t> positions;
   int32_t slop;
+  // Per-slot term sets of a MultiPhrase-style query (match_phrase_prefix's
+  // expanded last slot); empty for a plain phrase. When set, slot i matches
+  // any term in slotTerms[i] and terms[i] is slotTerms[i][0].
+  std::span<const std::span<std::string_view>> slotTerms;
 
 public:
   bool recoverableAsPredicate() const noexcept override { return true; }
@@ -41,19 +46,25 @@ public:
     static inline bool disableSloppyGallopForTests = false;
   };
 
-  struct RepeatGroup {
-    DocsPosEnum* docsEnum = nullptr;
-    PosEnum* posEnum = nullptr;
+  template<class DocsT, class PosT>
+  struct RepeatGroupOver {
+    DocsT* docsEnum = nullptr;
+    PosT* posEnum = nullptr;
     int32_t* buf = nullptr;
     int32_t cap = 0;
     int32_t count = 0;
     int32_t filled = 0;
     std::span<const int32_t> slots;
   };
+  using RepeatGroup = RepeatGroupOver<DocsPosEnum, PosEnum>;
 
   class ExactMatcher;
   class SloppyMatcher;
-  template<class MatcherPolicy> class PhraseScorer;
+  // Slots read single-term postings unless the query has a multi-term slot;
+  // then every slot is a union cursor, so the scorer, matchers, and repeat
+  // groups stay one code path.
+  template<class MatcherPolicy, class DocsT = DocsPosEnum, class PosT = PosEnum>
+  class PhraseScorer;
   using Scorer = PhraseScorer<ExactMatcher>;
   using SloppyScorer = PhraseScorer<SloppyMatcher>;
 
@@ -98,7 +109,8 @@ private:
       std::span<const TermsEnum::PostingsState* const> states,
       std::span<const std::string_view> queryTerms,
       std::span<const int32_t> queryPositions, int32_t slop,
-      bool disableSort, bool disableRepeatDedup) {
+      bool disableSort, bool disableRepeatDedup,
+      std::span<const uint8_t> multiSlots = {}) {
     assert(states.size() == queryTerms.size());
     assert(states.size() == queryPositions.size());
     EstimateCalculation result;
@@ -107,6 +119,15 @@ private:
     }
     result.nonempty = true;
 
+    // A multi-term slot never shares an enum with another slot, even one
+    // whose (first) term is equal.
+    auto isMulti = [&](int32_t slot) {
+      return !multiSlots.empty() && multiSlots[(size_t) slot] != 0;
+    };
+    auto sameSource = [&](int32_t a, int32_t b) {
+      return !isMulti(a) && !isMulti(b)
+          && queryTerms[(size_t) a] == queryTerms[(size_t) b];
+    };
     auto byCost = [&](int32_t a, int32_t b) {
       const auto& sa = *states[(size_t) a];
       const auto& sb = *states[(size_t) b];
@@ -114,7 +135,10 @@ private:
       int32_t ta = narrowedTotalTermFreq(sa);
       int32_t tb = narrowedTotalTermFreq(sb);
       if (ta != tb) return ta < tb;
-      return queryTerms[(size_t) a] < queryTerms[(size_t) b];
+      if (queryTerms[(size_t) a] != queryTerms[(size_t) b]) {
+        return queryTerms[(size_t) a] < queryTerms[(size_t) b];
+      }
+      return isMulti(a) < isMulti(b);
     };
     result.slotOrder.resize(states.size());
     for (size_t i = 0; i < result.slotOrder.size(); i++) {
@@ -134,7 +158,7 @@ private:
         int32_t source = i;
         if (dedupRepeats) {
           for (int32_t j = 0; j < i; j++) {
-            if (queryTerms[(size_t) j] == queryTerms[(size_t) i]) {
+            if (sameSource(j, i)) {
               source = j;
               break;
             }
@@ -149,10 +173,9 @@ private:
       for (size_t begin = 0; begin < result.slotOrder.size();) {
         size_t end = begin + 1;
         if (dedupRepeats) {
-          std::string_view term = queryTerms[
-              (size_t) result.slotOrder[begin]];
           while (end < result.slotOrder.size()
-                 && queryTerms[(size_t) result.slotOrder[end]] == term) {
+                 && sameSource(result.slotOrder[begin],
+                               result.slotOrder[end])) {
             end++;
           }
         }
@@ -307,8 +330,29 @@ public:
     assert(slop >= 0);
   }
 
+  // A phrase whose slots each accept a term set (Lucene's MultiPhraseQuery).
+  // Every set is nonempty; a slot with one term behaves as a plain slot.
+  PhraseQuery(MemPool& pool, std::string_view field,
+              std::span<const std::span<std::string_view>> slotTerms,
+              std::span<const int32_t> positions, int32_t slop = 0)
+      : Query(QueryKind::PHRASE), field(field), positions(positions),
+        slop(slop), slotTerms(slotTerms) {
+    assert(slotTerms.size() == positions.size());
+    assert(slotTerms.size() >= 2);
+    assert(slop >= 0);
+    terms = pool.make_span<std::string_view>(slotTerms.size());
+    for (size_t i = 0; i < slotTerms.size(); i++) {
+      assert(!slotTerms[i].empty());
+      terms[i] = slotTerms[i][0];
+    }
+  }
+
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const PhraseQuery&>(other);
+    if (slotTerms.size() != rhs.slotTerms.size()) return false;
+    for (size_t i = 0; i < slotTerms.size(); i++) {
+      if (!std::ranges::equal(slotTerms[i], rhs.slotTerms[i])) return false;
+    }
     return field == rhs.field && slop == rhs.slop
         && terms.size() == rhs.terms.size()
         && positions.size() == rhs.positions.size()
@@ -320,6 +364,11 @@ public:
   uint64_t hashImpl() const override {
     uint64_t value = mixHash(Query::hashImpl(), field);
     value = mixHash(value, slop);
+    value = mixSampledSequence(
+        value, slotTerms,
+        [](uint64_t seed, std::span<std::string_view> slot) {
+          return mixHash(seed, slot.size());
+        });
     value = mixSampledSequence(
         value, terms,
         [](uint64_t seed, std::string_view term) {
@@ -336,6 +385,10 @@ public:
   [[nodiscard]] std::span<std::string_view> getTerms() const { return terms; }
   [[nodiscard]] std::span<const int32_t> getPositions() const { return positions; }
   [[nodiscard]] int32_t getSlop() const { return slop; }
+  [[nodiscard]] std::span<const std::span<std::string_view>> getSlotTerms() const {
+    return slotTerms;
+  }
+  [[nodiscard]] bool hasMultiTermSlots() const { return !slotTerms.empty(); }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
@@ -347,6 +400,11 @@ public:
     out.appendSize(positions.size());
     for (int32_t position : positions) out.appendInt32(position);
     out.appendInt32(slop);
+    out.appendSize(slotTerms.size());
+    for (std::span<std::string_view> slot : slotTerms) {
+      out.appendSize(slot.size());
+      for (std::string_view term : slot) out.appendTerm(term);
+    }
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
@@ -357,7 +415,66 @@ public:
     PhraseQuery& query;
     CachedFieldInfo* cachedFieldInfo;
     std::span<CachedTermInfo*> cachedTermInfos;
+    // Multi-term mode only: the indexed terms of each slot (terms absent from
+    // every segment dropped). cachedTermInfos is then unused.
+    std::span<std::span<CachedTermInfo*>> slotTermInfos;
+    // Sloppy multi-term mode only: per query slot, the smallest slot whose
+    // term set it shares a term with, transitively, or -1 when it shares none.
+    std::span<int32_t> overlapClass;
     Similarity::BM25Scorer* simScorer = nullptr;
+
+    void computeOverlapClasses(MemPool& pool) {
+      auto slots = query.getSlotTerms();
+      overlapClass = pool.make_span<int32_t>(slots.size());
+      for (size_t i = 0; i < slots.size(); i++) overlapClass[i] = (int32_t) i;
+      auto root = [&](int32_t i) {
+        while (overlapClass[(size_t) i] != i) i = overlapClass[(size_t) i];
+        return i;
+      };
+      bool any = false;
+      for (size_t a = 0; a < slots.size(); a++) {
+        for (size_t b = a + 1; b < slots.size(); b++) {
+          bool shared = std::ranges::any_of(slots[a], [&](std::string_view term) {
+            return std::ranges::find(slots[b], term) != slots[b].end();
+          });
+          if (!shared) continue;
+          int32_t ra = root((int32_t) a);
+          int32_t rb = root((int32_t) b);
+          if (ra != rb) overlapClass[(size_t) std::max(ra, rb)] = std::min(ra, rb);
+          any = true;
+        }
+      }
+      if (!any) {
+        overlapClass = {};
+        return;
+      }
+      std::vector<int32_t> members(slots.size(), 0);
+      for (size_t i = 0; i < slots.size(); i++) {
+        overlapClass[i] = root((int32_t) i);
+        members[(size_t) overlapClass[i]]++;
+      }
+      for (size_t i = 0; i < slots.size(); i++) {
+        if (members[(size_t) overlapClass[i]] < 2) overlapClass[i] = -1;
+      }
+    }
+
+    // A multi-term slot's stats in one segment, summed over its terms. The
+    // docFreq is clamped to maxDoc, which the union cannot exceed. Only
+    // docFreq and totalTermFreq are filled; docFreq == 0 means the slot has
+    // no term in the segment.
+    TermsEnum::PostingsState slotState(
+        size_t slot, IndexReader::Segment& segment) const {
+      TermsEnum::PostingsState state;
+      int64_t docFreq = 0;
+      for (const auto* termInfo : slotTermInfos[slot]) {
+        const auto* termState = termInfo->postingsStates[segment.ord];
+        if (termState == nullptr) continue;
+        docFreq += termState->docFreq;
+        state.totalTermFreq += termState->totalTermFreq;
+      }
+      state.docFreq = (int32_t) std::min(docFreq, (int64_t) segment.maxDoc());
+      return state;
+    }
 
     EstimateCalculation estimateScorer(
         IndexReader::Segment& segment, bool disableSort,
@@ -367,25 +484,41 @@ public:
         return {};
       }
       std::vector<const TermsEnum::PostingsState*> states;
-      states.reserve(cachedTermInfos.size());
-      for (const auto* termInfo : cachedTermInfos) {
-        states.push_back(termInfo->postingsStates[segment.ord]);
+      states.reserve(query.getTerms().size());
+      if (slotTermInfos.empty()) {
+        for (const auto* termInfo : cachedTermInfos) {
+          states.push_back(termInfo->postingsStates[segment.ord]);
+        }
+        return PhraseQuery::estimate(
+            states, query.getTerms(), query.getPositions(), query.getSlop(),
+            disableSort, disableRepeatDedup);
+      }
+      std::vector<TermsEnum::PostingsState> summed;
+      std::vector<uint8_t> multiSlots;
+      summed.reserve(slotTermInfos.size());
+      for (size_t i = 0; i < slotTermInfos.size(); i++) {
+        summed.push_back(slotState(i, segment));
+        multiSlots.push_back(query.getSlotTerms()[i].size() > 1 ? 1 : 0);
+      }
+      for (const auto& state : summed) {
+        states.push_back(state.docFreq > 0 ? &state : nullptr);
       }
       return PhraseQuery::estimate(
           states, query.getTerms(), query.getPositions(), query.getSlop(),
-          disableSort, disableRepeatDedup);
+          disableSort, disableRepeatDedup, multiSlots);
     }
 
 #ifndef NDEBUG
+    template<class DocsT, class PosT>
     void assertConstructionMatchesEstimate(
         IndexReader::Segment& segment, const EstimateMemo& estimate,
-        std::span<DocsPosEnum*> querySlotEnums,
-        std::span<DocsPosEnum*> slotEnums,
+        std::span<DocsT*> querySlotEnums,
+        std::span<DocsT*> slotEnums,
         std::span<const int32_t> positions,
         std::span<const int32_t> ordinals,
-        std::span<DocsPosEnum*> conjunctionEnums,
+        std::span<DocsT*> conjunctionEnums,
         std::span<const int32_t> slotGroup,
-        std::span<RepeatGroup> groups) const {
+        std::span<RepeatGroupOver<DocsT, PosT>> groups) const {
       assert(estimate.nonempty);
       assert(querySlotEnums.size() == estimate.querySlotSources.size());
       for (size_t i = 0; i < querySlotEnums.size(); i++) {
@@ -402,13 +535,13 @@ public:
       for (size_t i = 0; i < slotEnums.size(); i++) {
         int32_t ordinal = estimate.slotOrder[i];
         int32_t source = estimate.querySlotSources[(size_t) ordinal];
-        const auto* state = cachedTermInfos[(size_t) source]
-            ->postingsStates[segment.ord];
-        assert(state != nullptr);
+        TermsEnum::PostingsState state = slotTermInfos.empty()
+            ? *cachedTermInfos[(size_t) source]->postingsStates[segment.ord]
+            : slotState((size_t) source, segment);
         assert(slotEnums[i] == querySlotEnums[(size_t) ordinal]);
-        assert(slotEnums[i]->numDocs() == state->docFreq);
+        assert(slotEnums[i]->numDocs() == state.docFreq);
         assert(slotEnums[i]->totalTermFreq()
-               == narrowedTotalTermFreq(*state));
+               == narrowedTotalTermFreq(state));
         assert(positions[i] == query.getPositions()[(size_t) ordinal]);
         assert(ordinals[i] == ordinal);
       }
@@ -434,9 +567,43 @@ public:
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
       if (cachedFieldInfo == nullptr) return;
 
-      cachedTermInfos = context.pool.make_span<CachedTermInfo*>(query.getTerms().size());
       Similarity similarity;
       double idf = 0.0;
+      if (query.hasMultiTermSlots()) {
+        // Each slot weighs as one term whose docFreq is the sum of its
+        // terms' (capped at the field's doc count), so expanding a prefix
+        // to more terms does not inflate the phrase's IDF.
+        auto slots = query.getSlotTerms();
+        slotTermInfos = context.pool.make_span<std::span<CachedTermInfo*>>(slots.size());
+        for (size_t i = 0; i < slots.size(); i++) {
+          auto infos = context.pool.make_span<CachedTermInfo*>(slots[i].size());
+          size_t found = 0;
+          Similarity::TermStats slotStats = {};
+          for (std::string_view term : slots[i]) {
+            CachedTermInfo* info = context.getCachedTerminfo(*cachedFieldInfo, term);
+            if (info == nullptr) continue;
+            infos[found++] = info;
+            slotStats.docFreq += info->termStats.docFreq;
+            slotStats.totalTermFreq += info->termStats.totalTermFreq;
+          }
+          if (found == 0) {
+            cachedFieldInfo = nullptr;
+            return;
+          }
+          slotTermInfos[i] = infos.first(found);
+          slotStats.docFreq = std::min(
+              slotStats.docFreq, cachedFieldInfo->fieldStats.docsWithField);
+          idf += similarity.idf(cachedFieldInfo->fieldStats, slotStats);
+        }
+        if (query.getSlop() > 0) computeOverlapClasses(context.pool);
+        if (needScores) {
+          simScorer = context.pool.make<Similarity::BM25Scorer>(
+              similarity.getScorer(multiplier, cachedFieldInfo->fieldStats, (float) idf));
+        }
+        return;
+      }
+
+      cachedTermInfos = context.pool.make_span<CachedTermInfo*>(query.getTerms().size());
       for (int i = 0; i < cachedTermInfos.size(); i++) {
         cachedTermInfos[i] = context.getCachedTerminfo(*cachedFieldInfo, query.getTerms()[i]);
         if (cachedTermInfos[i] == nullptr) {
@@ -469,12 +636,56 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         const EstimateMemo& estimate) {
       if (!estimate.nonempty) return nullptr;
+      if (slotTermInfos.empty()) {
+        return assembleScorer<DocsPosEnum, PosEnum>(
+            targetPool, segment, estimate,
+            [&](int32_t slot) -> std::pair<DocsPosEnum*, PosEnum*> {
+              DocsPosEnum* docsEnum = cachedTermInfos[(size_t) slot]
+                  ->useDocsEnum<DocsEnumTier::POSITIONS>(targetPool, segment);
+              assert(docsEnum != nullptr);
+              if (docsEnum == nullptr) return {nullptr, nullptr};
+              return {docsEnum, targetPool.make<PosEnum>(*docsEnum)};
+            });
+      }
+      return assembleScorer<UnionDocsPosEnum, UnionPosEnum>(
+          targetPool, segment, estimate,
+          [&](int32_t slot) -> std::pair<UnionDocsPosEnum*, UnionPosEnum*> {
+            std::span<CachedTermInfo*> infos = slotTermInfos[(size_t) slot];
+            auto subs = targetPool.make_span<DocsPosEnum*>(infos.size());
+            auto subPos = targetPool.make_span<PosEnum*>(infos.size());
+            size_t count = 0;
+            for (CachedTermInfo* info : infos) {
+              DocsPosEnum* docsEnum =
+                  info->useDocsEnum<DocsEnumTier::POSITIONS>(targetPool, segment);
+              if (docsEnum == nullptr) continue;
+              subs[count] = docsEnum;
+              subPos[count] = targetPool.make<PosEnum>(*docsEnum);
+              count++;
+            }
+            assert(count > 0);
+            if (count == 0) return {nullptr, nullptr};
+            TermsEnum::PostingsState state = slotState((size_t) slot, segment);
+            auto* docsEnum = targetPool.make<UnionDocsPosEnum>(
+                targetPool, subs.first(count), state.docFreq,
+                narrowedTotalTermFreq(state));
+            return {docsEnum, targetPool.make<UnionPosEnum>(
+                targetPool, *docsEnum, subPos.first(count))};
+          });
+    }
+
+    // Wires per-slot cursors into a scorer per the estimate. openSlot(slot)
+    // returns the docs and positions cursors of one source slot.
+    template<class DocsT, class PosT, class OpenSlot>
+    Query::Scorer* assembleScorer(
+        MemPool& targetPool, IndexReader::Segment& segment,
+        const EstimateMemo& estimate, OpenSlot&& openSlot) {
       auto* segFieldInfo = cachedFieldInfo->segInfos.at(segment.ord);
       assert(segFieldInfo != nullptr);
+      size_t slotCount = query.getTerms().size();
 
-      auto querySlotEnums = targetPool.make_span<DocsPosEnum*>(cachedTermInfos.size());
-      auto querySlotPosEnums = targetPool.make_span<PosEnum*>(cachedTermInfos.size());
-      for (int32_t i = 0; i < (int32_t) cachedTermInfos.size(); i++) {
+      auto querySlotEnums = targetPool.make_span<DocsT*>(slotCount);
+      auto querySlotPosEnums = targetPool.make_span<PosT*>(slotCount);
+      for (int32_t i = 0; i < (int32_t) slotCount; i++) {
         int32_t source = estimate.querySlotSources[(size_t) i];
         if (source != i) {
           querySlotEnums[(size_t) i] = querySlotEnums[(size_t) source];
@@ -482,18 +693,15 @@ public:
               querySlotPosEnums[(size_t) source];
           continue;
         }
-        DocsPosEnum* docsEnum = cachedTermInfos[(size_t) i]
-            ->useDocsEnum<DocsEnumTier::POSITIONS>(targetPool, segment);
-        assert(docsEnum != nullptr);
+        auto [docsEnum, posEnum] = openSlot(i);
         if (docsEnum == nullptr) return nullptr;
-        PosEnum* posEnum = targetPool.make<PosEnum>(*docsEnum);
         querySlotEnums[(size_t) i] = docsEnum;
         querySlotPosEnums[(size_t) i] = posEnum;
       }
 
-      auto conjunctionEnums = targetPool.make_span<DocsPosEnum*>(
+      auto conjunctionEnums = targetPool.make_span<DocsT*>(
           estimate.conjunctionOrder.size());
-      auto conjunctionPosEnums = targetPool.make_span<PosEnum*>(
+      auto conjunctionPosEnums = targetPool.make_span<PosT*>(
           estimate.conjunctionOrder.size());
       for (size_t i = 0; i < estimate.conjunctionOrder.size(); i++) {
         int32_t ordinal = estimate.conjunctionOrder[i];
@@ -501,9 +709,9 @@ public:
         conjunctionPosEnums[i] = querySlotPosEnums[(size_t) ordinal];
       }
 
-      auto slotEnums = targetPool.make_span<DocsPosEnum*>(
+      auto slotEnums = targetPool.make_span<DocsT*>(
           estimate.slotOrder.size());
-      auto slotPosEnums = targetPool.make_span<PosEnum*>(
+      auto slotPosEnums = targetPool.make_span<PosT*>(
           estimate.slotOrder.size());
       auto positions = targetPool.make_span<int32_t>(
           estimate.slotOrder.size());
@@ -518,7 +726,7 @@ public:
       }
 
       std::span<const int32_t> slotGroup = estimate.slotGroup;
-      auto groups = targetPool.make_span<RepeatGroup>(
+      auto groups = targetPool.make_span<RepeatGroupOver<DocsT, PosT>>(
           estimate.groupSlots.size());
       for (size_t g = 0; g < estimate.groupSlots.size(); g++) {
         std::span<const int32_t> groupSlots =
@@ -529,7 +737,7 @@ public:
       }
 
 #ifndef NDEBUG
-      assertConstructionMatchesEstimate(
+      assertConstructionMatchesEstimate<DocsT, PosT>(
           segment, estimate, querySlotEnums, slotEnums, positions, ordinals,
           conjunctionEnums, slotGroup, groups);
 #endif
@@ -538,35 +746,63 @@ public:
           ? targetPool.make<NormsReader>(segment.postingsReader(), *segFieldInfo)
           : nullptr;
 
+      // Impacts are per term; a union slot has none, so a multi-term phrase
+      // runs without block-max pruning (the doc-level freq bound remains).
       std::span<ImpactsIndex> impacts;
       std::span<int32_t> impactMultiplicities;
-      if (simScorer != nullptr && normsReader != nullptr) {
-        auto built = targetPool.make_span<ImpactsIndex>(conjunctionEnums.size());
-        auto multiplicities = targetPool.make_span<int32_t>(conjunctionEnums.size());
-        bool allBuilt = true;
-        for (size_t i = 0; i < conjunctionEnums.size(); i++) {
-          DocsPosEnum* docsEnum = conjunctionEnums[i];
-          int32_t multiplicity = 0;
-          for (DocsPosEnum* slotEnum : slotEnums) {
-            if (slotEnum == docsEnum) multiplicity++;
+      if constexpr (std::is_same_v<DocsT, DocsPosEnum>) {
+        if (simScorer != nullptr && normsReader != nullptr) {
+          auto built = targetPool.make_span<ImpactsIndex>(conjunctionEnums.size());
+          auto multiplicities = targetPool.make_span<int32_t>(conjunctionEnums.size());
+          bool allBuilt = true;
+          for (size_t i = 0; i < conjunctionEnums.size(); i++) {
+            DocsPosEnum* docsEnum = conjunctionEnums[i];
+            int32_t multiplicity = 0;
+            for (DocsPosEnum* slotEnum : slotEnums) {
+              if (slotEnum == docsEnum) multiplicity++;
+            }
+            multiplicities[i] = multiplicity;
+            built[i].build(targetPool, *docsEnum, *simScorer, 1.0f, true);
+            allBuilt &= !built[i].empty();
           }
-          multiplicities[i] = multiplicity;
-          built[i].build(targetPool, *docsEnum, *simScorer, 1.0f, true);
-          allBuilt &= !built[i].empty();
+          impactMultiplicities = multiplicities;
+          if (allBuilt) impacts = built;
         }
-        impactMultiplicities = multiplicities;
-        if (allBuilt) impacts = built;
       }
 
+      using Exact = PhraseScorer<ExactMatcher, DocsT, PosT>;
+      using Sloppy = PhraseScorer<SloppyMatcher, DocsT, PosT>;
       if (query.getSlop() > 0) {
-        return targetPool.make<SloppyScorer>(
+        // Overlap classes, renumbered densely and mapped to slot order.
+        std::span<int32_t> overlapGroup;
+        std::span<std::span<int32_t>> overlaps;
+        if (!overlapClass.empty()) {
+          size_t slotsInOrder = estimate.slotOrder.size();
+          overlapGroup = targetPool.make_span<int32_t>(slotsInOrder);
+          std::vector<std::vector<int32_t>> byClass(slotsInOrder);
+          for (size_t k = 0; k < slotsInOrder; k++) {
+            int32_t cls = overlapClass[(size_t) estimate.slotOrder[k]];
+            if (cls >= 0) byClass[(size_t) cls].push_back((int32_t) k);
+          }
+          std::fill(overlapGroup.begin(), overlapGroup.end(), -1);
+          size_t groupCount = (size_t) std::ranges::count_if(
+              byClass, [](const auto& members) { return !members.empty(); });
+          overlaps = targetPool.make_span<std::span<int32_t>>(groupCount);
+          size_t next = 0;
+          for (auto& members : byClass) {
+            if (members.empty()) continue;
+            for (int32_t k : members) overlapGroup[(size_t) k] = (int32_t) next;
+            overlaps[next++] = targetPool.copy_span(std::span<int32_t>(members));
+          }
+        }
+        return targetPool.make<Sloppy>(
             targetPool, slotEnums, slotPosEnums, positions, ordinals,
             conjunctionEnums, conjunctionPosEnums, normsReader,
             simScorer, impacts, impactMultiplicities, slotGroup, groups,
             estimate.approximationCost, estimate.matchCost, query.getSlop(),
-            (inputFlags & EXCLUSION_WINDOW_FILL) != 0);
+            (inputFlags & EXCLUSION_WINDOW_FILL) != 0, overlapGroup, overlaps);
       }
-      return targetPool.make<Scorer>(
+      return targetPool.make<Exact>(
           targetPool, slotEnums, slotPosEnums, positions, ordinals,
           conjunctionEnums, conjunctionPosEnums, normsReader,
           simScorer, impacts, impactMultiplicities, slotGroup, groups,
@@ -661,6 +897,11 @@ public:
       int64_t cost() override {
         if (weight.cachedFieldInfo == nullptr) return 0;
         int64_t minCost = -1;
+        for (size_t i = 0; i < weight.slotTermInfos.size(); i++) {
+          int64_t c = weight.slotState(i, segment).docFreq;
+          if (c == 0) return 0;
+          if (minCost < 0 || c < minCost) minCost = c;
+        }
         for (auto* termInfo : weight.cachedTermInfos) {
           int64_t c = termInfo->docFreq(segment.ord);
           if (c == 0) return 0;
@@ -952,10 +1193,10 @@ public:
     // slop - the emission test ignores them and they can never set an
     // emitted matchLength. The capturedSecond+1 cap keeps every crossing
     // position visited. Repeat-group slots pull from a shared buffer and
-    // keep the stepwise walk.
+    // overlap-group slots resolve collisions, so both keep the stepwise walk.
     template<class S>
     bool advanceSlotGallop(S& scorer, int32_t slot, int64_t capturedSecond) {
-      if (scorer.slotGroup[(size_t) slot] >= 0
+      if (scorer.slotGroup[(size_t) slot] >= 0 || overlapGroupOf(scorer, slot) >= 0
           || ScorerControls::disableSloppyGallopForTests) {
         return advanceSlot(scorer, slot);
       }
@@ -975,11 +1216,27 @@ public:
     }
 
     template<class S>
+    static int32_t overlapGroupOf(const S& scorer, int32_t slot) {
+      return scorer.overlapGroup.empty() ? -1 : scorer.overlapGroup[(size_t) slot];
+    }
+
+    // Two slots that can read the same term must not claim one document
+    // position. Repeat-group members share a buffer; overlap-group members
+    // (multi-term slots whose term sets intersect another slot's) read
+    // separate cursors, so their collisions are found by position alone.
+    template<class S>
     int32_t collidingSlot(const S& scorer, int32_t slot) const {
       int32_t group = scorer.slotGroup[(size_t) slot];
-      if (group < 0) return -1;
-      for (int32_t other : scorer.groups[(size_t) group].slots) {
-        if (other != slot && actual[(size_t) other] == actual[(size_t) slot]) return other;
+      if (group >= 0) {
+        for (int32_t other : scorer.groups[(size_t) group].slots) {
+          if (other != slot && actual[(size_t) other] == actual[(size_t) slot]) return other;
+        }
+      }
+      int32_t overlap = overlapGroupOf(scorer, slot);
+      if (overlap >= 0) {
+        for (int32_t other : scorer.overlaps[(size_t) overlap]) {
+          if (other != slot && actual[(size_t) other] == actual[(size_t) slot]) return other;
+        }
       }
       return -1;
     }
@@ -1007,7 +1264,7 @@ public:
 
     template<class S>
     bool initPositions(S& scorer) {
-      for (const RepeatGroup& group : scorer.groups) {
+      for (const auto& group : scorer.groups) {
         if (group.docsEnum->termFreq() < (int32_t) group.slots.size()) return false;
       }
       for (auto* posEnum : scorer.conjunctionPosEnums) posEnum->startPositions();
@@ -1020,7 +1277,7 @@ public:
         if (position == PostingsReader::END) return false;
         setPosition(scorer, slot, position);
       }
-      for (const RepeatGroup& group : scorer.groups) {
+      for (const auto& group : scorer.groups) {
         for (int32_t slot : group.slots) {
           int32_t position = scorer.repeatSlotFirst(slot);
           if (position == PostingsReader::END) return false;
@@ -1032,6 +1289,11 @@ public:
             if (!advanceSlot(scorer, slot)) return false;
           }
         }
+      }
+      for (int32_t slot = 0; slot < (int32_t) scorer.slotEnums.size(); slot++) {
+        if (overlapGroupOf(scorer, slot) < 0) continue;
+        int32_t active = slot;
+        if (!resolveCollisions(scorer, active)) return false;
       }
       positioned = true;
       return true;
@@ -1103,13 +1365,13 @@ public:
       positioned = false;
       if (scorer.docid == PostingsReader::END) return false;
 
-      for (const RepeatGroup& group : scorer.groups) {
+      for (const auto& group : scorer.groups) {
         if (group.docsEnum->termFreq() < (int32_t) group.slots.size()) return false;
       }
       if (scorer.minCompetitiveScore > 0.0f && scorer.simScorer != nullptr
           && !ScorerControls::disableDocBoundForTests) {
         int64_t maxFreq = 1;
-        for (DocsPosEnum* docsEnum : scorer.slotEnums) {
+        for (auto* docsEnum : scorer.slotEnums) {
           maxFreq += (int64_t) docsEnum->termFreq() - 1;
         }
         float boundFreq = S::roundUpToFloat(maxFreq);
@@ -1160,19 +1422,23 @@ public:
     }
   };
 
-  template<class MatcherPolicy>
+  template<class MatcherPolicy, class DocsT, class PosT>
   class PhraseScorer final : public Query::Scorer {
     friend MatcherPolicy;
 
-    std::span<DocsPosEnum*> slotEnums;
-    std::span<PosEnum*> slotPosEnums;
+    std::span<DocsT*> slotEnums;
+    std::span<PosT*> slotPosEnums;
     std::span<const int32_t> positions;
     std::span<const int32_t> ordinals;
-    std::span<DocsPosEnum*> conjunctionEnums;
-    std::span<PosEnum*> conjunctionPosEnums;
+    std::span<DocsT*> conjunctionEnums;
+    std::span<PosT*> conjunctionPosEnums;
     MemPool* pool;
     std::span<const int32_t> slotGroup;
-    std::span<RepeatGroup> groups;
+    std::span<RepeatGroupOver<DocsT, PosT>> groups;
+    // Sloppy multi-term phrases only: per slot, its overlap group or -1, and
+    // each group's slots (see SloppyMatcher::collidingSlot). Empty otherwise.
+    std::span<const int32_t> overlapGroup;
+    std::span<const std::span<int32_t>> overlaps;
     std::span<int32_t> slotCursor;
     std::optional<NormsReader::Iterator> normsIter;
     Similarity::BM25Scorer* simScorer;
@@ -1322,7 +1588,7 @@ public:
     int32_t repeatSlotFirst(int32_t slot) {
       int32_t groupId = slotGroup[(size_t) slot];
       assert(groupId >= 0);
-      RepeatGroup& group = groups[(size_t) groupId];
+      auto& group = groups[(size_t) groupId];
       while (group.filled == 0 && group.filled < group.count) {
         group.buf[group.filled++] = group.posEnum->nextPosition();
       }
@@ -1333,7 +1599,7 @@ public:
     int32_t repeatSlotAdvance(int32_t slot, int32_t target) {
       int32_t groupId = slotGroup[(size_t) slot];
       if (groupId < 0) return slotPosEnums[(size_t) slot]->advancePosition(target);
-      RepeatGroup& group = groups[(size_t) groupId];
+      auto& group = groups[(size_t) groupId];
       int32_t idx = slotCursor[(size_t) slot];
       for (;;) {
         while (idx >= group.filled && group.filled < group.count) {
@@ -1349,7 +1615,7 @@ public:
     int32_t repeatSlotNext(int32_t slot) {
       int32_t groupId = slotGroup[(size_t) slot];
       if (groupId < 0) return slotPosEnums[(size_t) slot]->nextPosition();
-      RepeatGroup& group = groups[(size_t) groupId];
+      auto& group = groups[(size_t) groupId];
       int32_t idx = slotCursor[(size_t) slot];
       if (idx >= group.count) return PostingsReader::END;
       idx++;
@@ -1418,20 +1684,24 @@ public:
       return rounded;
     }
 
-    PhraseScorer(MemPool& targetPool, std::span<DocsPosEnum*> slotEnums,
-                 std::span<PosEnum*> slotPosEnums,
+    PhraseScorer(MemPool& targetPool, std::span<DocsT*> slotEnums,
+                 std::span<PosT*> slotPosEnums,
                  std::span<const int32_t> positions, std::span<const int32_t> ordinals,
-                 std::span<DocsPosEnum*> conjunctionEnums,
-                 std::span<PosEnum*> conjunctionPosEnums, NormsReader* normsReader,
+                 std::span<DocsT*> conjunctionEnums,
+                 std::span<PosT*> conjunctionPosEnums, NormsReader* normsReader,
                  Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts,
                  std::span<const int32_t> impactMultiplicities,
-                 std::span<const int32_t> slotGroup, std::span<RepeatGroup> groups,
+                 std::span<const int32_t> slotGroup,
+                 std::span<RepeatGroupOver<DocsT, PosT>> groups,
                  int64_t approximationCost, float matchCostEstimate,
-                 int32_t slop, bool exclusionWindowFill = false)
+                 int32_t slop, bool exclusionWindowFill = false,
+                 std::span<const int32_t> overlapGroup = {},
+                 std::span<const std::span<int32_t>> overlaps = {})
         : slotEnums(slotEnums), slotPosEnums(slotPosEnums), positions(positions),
           ordinals(ordinals), conjunctionEnums(conjunctionEnums),
           conjunctionPosEnums(conjunctionPosEnums), pool(&targetPool), slotGroup(slotGroup),
-          groups(groups), simScorer(simScorer), impacts(impacts),
+          groups(groups), overlapGroup(overlapGroup), overlaps(overlaps),
+          simScorer(simScorer), impacts(impacts),
           impactMultiplicities(impactMultiplicities), matcher(slop),
           matchCostEstimate(matchCostEstimate),
           approximationCost(approximationCost),
@@ -1482,7 +1752,15 @@ public:
       return doApproximationAdvance(target);
     }
     int32_t approximationDocId() override { return docid; }
-    std::span<DocsPosEnum*> approximationEnums() override { return conjunctionEnums; }
+    // Union cursors are not DocsPosEnums, so a multi-term phrase keeps its
+    // approximation private.
+    std::span<DocsPosEnum*> approximationEnums() override {
+      if constexpr (std::is_same_v<DocsT, DocsPosEnum>) {
+        return conjunctionEnums;
+      } else {
+        return {};
+      }
+    }
     bool matches() override {
 #ifndef NDEBUG
       markTwoPhase();
@@ -1492,7 +1770,7 @@ public:
     bool matchesAt(int32_t doc) override {
 #ifndef NDEBUG
       markExternal();
-      for (DocsPosEnum* docsEnum : conjunctionEnums) assert(docsEnum->docId() == doc);
+      for (auto* docsEnum : conjunctionEnums) assert(docsEnum->docId() == doc);
 #endif
       docid = doc;
       return doMatches();

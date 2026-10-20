@@ -59,6 +59,7 @@ class ProtobufQueryParser {
   std::span<std::string_view> binToSpan(std::span<const ::hpp_proto::bytes_view> vals);
 
   Query* parsePhrase(const luxir::api::PhraseQuery& phraseQuery);
+  Query* parseMatchPhrasePrefix(const luxir::api::MatchPhrasePrefixQuery& query);
   Query* parsePrefix(const luxir::api::PrefixQuery& prefixQuery);
   Query* parseWildcard(const luxir::api::WildcardQuery& wildcardQuery);
   Query* parseRegex(const luxir::api::RegexQuery& regexQuery);

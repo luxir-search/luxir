@@ -279,6 +279,7 @@ void roundTripType(const char* nm) {
   X(SearchRequest) X(SearchOp) X(ExprOp) X(TopDocs) X(Fusion) X(RrfFusion) X(LinearFusion) X(SortSpec)             \
   X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(AnyOfQuery) X(Filter)    \
   X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(RegexQuery) X(FuzzyQuery) X(PhraseQuery)       \
+  X(MatchPhrasePrefixQuery)                                                                        \
   X(SimpleQuery) X(RangeQuery) X(GeoBoxQuery) X(GeoDistanceQuery) X(ExprQuery) X(Warning)           \
   X(FieldFacet) X(ExecutionProfile) X(ExecutionProfileOp) X(ExecutionProfilePiece)                 \
   X(CalendarGap) X(RangeFacet) X(QueryBucket) X(QueryFacet) X(Domain)                               \
@@ -366,6 +367,28 @@ TEST(ProtoRoundTrip, PhraseSlopValues) {
   P::PhraseQuery absent;
   ASSERT_TRUE(read_json(absent, R"({"field":"body_w","text":"a b"})", arena));
   EXPECT_EQ(0, absent.slop);
+}
+
+TEST(ProtoRoundTrip, MatchPhrasePrefixArm) {
+  std::pmr::monotonic_buffer_resource arena;
+  P::Query in;
+  ASSERT_TRUE(read_json(in, R"({"match_phrase_prefix":{"field":"body_w","text":"quick bro",)"
+                            R"("slop":2,"max_expansions":10}})", arena));
+  const auto* q = std::get_if<P::MatchPhrasePrefixQuery>(&in.kind);
+  ASSERT_NE(nullptr, q);
+  EXPECT_EQ("quick bro", q->text);
+  EXPECT_EQ(2, q->slop);
+  EXPECT_EQ(10, q->max_expansions);
+
+  std::vector<std::byte> wire;
+  ASSERT_TRUE(encode(in, wire));
+  P::Query out;
+  auto padded = P::copyToPaddedInput(std::span<const std::byte>(wire), arena);
+  ASSERT_TRUE(decode(out, padded, arena));
+  const auto* decoded = std::get_if<P::MatchPhrasePrefixQuery>(&out.kind);
+  ASSERT_NE(nullptr, decoded);
+  EXPECT_EQ("body_w", decoded->field);
+  EXPECT_EQ(10, decoded->max_expansions);
 }
 
 P::SearchRequest buildSortExpressionRequest(std::pmr::memory_resource& mr) {

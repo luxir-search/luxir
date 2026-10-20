@@ -85,11 +85,26 @@ The HTTP dialect also accepts the field-name form:
 | `val` | Value to analyze or coerce. Required. |
 | `operator` | `or` (default) or `and` for several analyzed terms. |
 | `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
+| `fuzziness` | Match each analyzed term fuzzily: `AUTO`, `AUTO:low,high`, `0`, `1`, or `2`, as in [Fuzzy](#fuzzy). Unset means exact terms. |
+| `prefix_length`, `max_expansions`, `transpositions` | The [Fuzzy](#fuzzy) options of the same names, per term. Only with `fuzziness`. |
+| `fuzzy_rewrite` | The fuzzy `rewrite` for each term. Only with `fuzziness`. |
 
 Text values are analyzed with the resolved field analyzer. String values use
 their normalizer, if configured, and match as exact terms. Numeric and date
 values are coerced through the same rules as indexing and matched through
 their columns.
+
+With `fuzziness`, each analyzed term (or the single STRING/ID term) becomes a
+fuzzy query on that term, and `operator` and `min_match` combine those fuzzy
+clauses exactly as they combine exact terms:
+
+```json
+{"match":{"title_t":"quikc brwon","operator":"and","fuzziness":"AUTO"}}
+```
+
+AUTO picks each term's edit distance from its own length. Numeric and date
+fields reject `fuzziness`. The expression form is
+`match(quikc brwon, field=title_t, operator=AND, fuzziness=AUTO)`.
 
 ## Exact membership (`any_of`)
 
@@ -246,6 +261,36 @@ Slop is not simply the number of intervening words. An adjacent transposition
 costs `2`, and multi-valued text fields have a position gap of `100`. See
 [Query language: terms and phrases](query-language.md#terms-and-phrases).
 
+## Match phrase prefix
+
+A phrase whose last word is a prefix, for search-as-you-type:
+
+```json
+{"match_phrase_prefix":{"field":"title_t","text":"way of ki","slop":0,"max_expansions":50}}
+```
+
+| Field | Meaning |
+|---|---|
+| `field` | Positional TEXT field. Required. |
+| `text` | Unanalyzed text. The field analyzer produces the phrase terms; the last analyzed word is the prefix. |
+| `slop` | Same as `phrase` slop. Default `0`; must be non-negative. |
+| `max_expansions` | Maximum terms the prefix expands to. Unset or `0` uses the default `50`; negative values are rejected. |
+
+The prefix expands to the first `max_expansions` indexed terms that start
+with it, in term (byte) order across all segments, not the most frequent
+ones. A short prefix on a large vocabulary can therefore miss the words a
+user meant; type more of the word or raise the cap. The phrase then matches
+with any expansion in the last position: `"quick bro"` matches
+`quick brown` and `quick brother`. The phrase is matched once over the union
+of the expansions' postings rather than once per expansion, and the last
+position scores as one term whose document frequency is the expansions'
+combined. Phrases with an expanded position do not use block-max pruning.
+
+Text that analyzes to a single word matches documents containing any
+expansion. Text that analyzes to no words, or a prefix with no indexed
+expansion, matches nothing. The expression form is
+`match_phrase_prefix('way of ki', field=title_t, slop=1)`.
+
 ## Prefix
 
 ```json
@@ -300,7 +345,7 @@ The expression form is `regex(dune|kings, field=title_t)`.
   "fuzzy": {
     "field": "author_s",
     "term": "herbet",
-    "max_edits": 1,
+    "fuzziness": "AUTO",
     "prefix_length": 1,
     "max_expansions": 0
   }
@@ -311,15 +356,32 @@ The expression form is `regex(dune|kings, field=title_t)`.
 |---|---|
 | `field` | Indexed term field. Required. |
 | `term` | Term to compare. TEXT normalizes/folds without tokenizing; STRING uses its normalizer if present; ID uses it verbatim. Required. |
-| `max_edits` | Byte-wise Levenshtein distance from `0` to `2`. Unset uses `0` for terms of at most 2 bytes, `1` through 5 bytes, then `2`. |
-| `prefix_length` | Leading bytes that must match exactly. Unset defaults to `1`; explicit `0` disables it. |
+| `max_edits` | Edit distance from `0` to `2`. Unset means `AUTO`. |
+| `fuzziness` | Elasticsearch-style alternative to `max_edits` (set at most one): `AUTO` (the same as `AUTO:3,6`), `AUTO:low,high` (`0` edits for terms shorter than `low` code points, `1` for terms shorter than `high`, otherwise `2`), or `0`, `1`, `2`. `AUTO` is case-insensitive. |
+| `transpositions` | Count swapping two adjacent characters as one edit (Damerau, optimal string alignment). Default `true`. |
+| `prefix_length` | Leading code points that must match exactly. Unset defaults to `1`; explicit `0` disables it. |
 | `max_expansions` | Maximum term expansions, closest first. Unset or `0` uses the default `50`; a positive value pins the requested cap. |
+| `rewrite` | How the expanded terms run; see below. Default `top_terms_blended_freqs`. |
+| `rewrite_size` | For the `top_terms*` rewrites, keep at most this many terms. Unset or `0` leaves it to `max_expansions`. |
 
-The engine also applies a current clause budget of `64` and may apply a lower
-operator limit. Truncation is not reported in the response. Scoring uses
-blended BM25 statistics; filter context is constant-scoring, but both use the
-same expansion set and match set. Simple-query syntax still warns when it
-clamps an unsupported edit distance before constructing the fuzzy query.
+Distance counts Unicode code points, not bytes: `cafe` is one edit from
+caf&eacute;, and `AUTO` and `prefix_length` count code points too. Bytes that are
+not well-formed UTF-8 count one each.
+
+| `rewrite` | Expansion | Scoring |
+|---|---|---|
+| `top_terms_blended_freqs` | Closest terms, capped. | BM25 with one blended (maximum) document frequency across the kept terms, scaled by each term's similarity, so a rare misspelling never outranks the common spelling. |
+| `top_terms` | Closest terms, capped. | BM25 with each term's own statistics, scaled by its similarity: a rare variant can outrank the exact term. |
+| `top_terms_boost` | Closest terms, capped. | A constant per term: the boost times the term's similarity (`1 - edits / length`). |
+| `constant_score` | Every term within the distance; `max_expansions` and `rewrite_size` do not apply. | One constant score. |
+
+The `top_terms*` rewrites also apply a current clause budget of `64`, and
+every rewrite may meet a lower operator limit. When a cap drops matching terms,
+the response carries a `fuzzy_truncated` warning naming the cap; the only
+silent cap is the default `50` of an unset `max_expansions`, as in Lucene and
+Elasticsearch. Filter context is constant-scoring, but uses the same expansion
+set and match set as scoring. Simple-query syntax still warns when it clamps an
+unsupported edit distance before constructing the fuzzy query.
 
 ## Range
 
@@ -467,6 +529,64 @@ in their own guides:
 - [`geo_box` and `geo_distance`](geo-search.md) cover coordinate order,
   inclusive boundaries, dateline crossing, and distance units.
 
+## Named queries
+
+Any query object can carry a `_name` (`name` in the canonical request and
+over gRPC: `Query.name`). Set `get_matched_queries` on the result list
+(`top_docs` or `fusion`) and each returned document gets a
+`_matched_queries_` field listing the named clauses it matches, in request
+order, the same feature as Elasticsearch's named queries:
+
+```http
+POST /collections/books/_search
+
+{
+  "query": {
+    "boolean": {
+      "required": [{"match": {"title_t": "dune"}, "_name": "title"}],
+      "optional": [{"match": {"author_s": "Frank Herbert"}, "_name": "author"}]
+    }
+  },
+  "filter": [{"range": {"field": "year_i", "gte": 1960}, "_name": "modern"}],
+  "fields": ["id"],
+  "get_matched_queries": true
+}
+```
+
+```json
+{
+  "docs": [
+    {"id": "b1", "_matched_queries_": ["title", "author", "modern"]},
+    {"id": "b2", "_matched_queries_": ["title", "modern"]}
+  ]
+}
+```
+
+- A name may sit on any clause at any depth, including filters, wrapper
+  arms and the root query. Names in facet or domain queries are not reported.
+- A named clause is evaluated by itself, for the returned documents only:
+  a document lists every named clause it satisfies, whether or not that
+  clause decided the match (a named `prohibited` clause therefore never
+  appears). A named `knn` clause selects its own nearest neighbors among all
+  live documents, not within its enclosing filters.
+- Two clauses with the same name merge: the name is listed once when either
+  matches. Identical clauses under different names are both reported, even
+  though the engine executes them once.
+- `include_named_queries_score: true` turns the field into a map from name
+  to that clause's own score (the score it would get as the whole query,
+  before any enclosing boost; for a merged name, the highest). A `_name`
+  beside a numeric `boost` sugar names the boosted clause.
+- A document matching no named clause omits the field. Naming a clause does
+  not change matching or scoring.
+- Under `fusion`, the names come from every source's query and filters plus
+  the fusion filters; a fused document lists the names it matches in any
+  source. Per-source `get_matched_queries` is ignored.
+
+A names-only `_matched_queries_` is placed like `_score_`: under `columns`
+and `adaptive` it is a column of string lists (empty for a document without
+matches) in every batch, and under `rows` a row key. The score map has no column
+form and is always placed in the row documents.
+
 ## Limits
 
 - `knn`, `geo_box`, and `geo_distance` are structured-only: expression
@@ -477,5 +597,5 @@ in their own guides:
 - `except_ops` routing is not accepted on Fusion filters or Fusion source
   filters, and `domain` overrides are not supported directly in `Fusion.ops`
   or beneath facet buckets.
-- Fuzzy expansion truncation (the `64` clause budget and any lower operator
-  limit) is not reported in the response.
+- Fuzzy expansion truncation by the default `max_expansions` of `50` is not
+  reported; every other cap that drops terms warns with `fuzzy_truncated`.

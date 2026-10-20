@@ -101,6 +101,9 @@ struct SearchParserImpl {
   std::unordered_map<const api::SearchOp*, FacetParsePlan> preparedFacets;
   const CollapsePlan* enclosingCollapse = nullptr;
   const CollapsePlan* inheritedFacetMeasure = nullptr;
+  // Collects the named clauses of the sources of the Fusion being parsed,
+  // when it requests matched queries.
+  std::vector<std::pair<std::string_view, Query*>>* fusionNamed = nullptr;
   std::span<ParsedFilter>* owningList = nullptr;
   std::string_view owningListChild;
   std::vector<std::shared_ptr<const FacetGroupPlan>> facetGroupPlans;
@@ -1490,6 +1493,11 @@ public:
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
     parseContext.collapse = enclosingCollapse;
     ProtobufQueryParser parser(parseContext);
+    // Named clauses count in the query and the explicit filters only, not in
+    // facet or domain queries. A Fusion source reports into its Fusion.
+    std::vector<std::pair<std::string_view, Query*>> named;
+    parseContext.named = placement == TopDocsPlacement::FUSION_SOURCE ? fusionNamed
+        : topDocsReq.get_matched_queries ? &named : nullptr;
     // An absent query selects all documents: the domain is then whatever the
     // filters carve out (browse / filter-only search). Boolean normalization
     // eliminates the match-all when filters fold in beside it.
@@ -1541,6 +1549,7 @@ public:
     }
     auto explicitFilters = parseFilters(
         parser, topDocsReq.filter, &topDocsReq.ops, "top_docs.filter");
+    parseContext.named = nullptr;
     auto filters = appendDerivedFilters(
         explicitFilters,
         prepareFacetSelections(
@@ -2019,6 +2028,8 @@ public:
     qr->collapse = collapse;
     qr->diversify = diversify;
     qr->headSort = std::move(headSort);
+    qr->namedQueries = NamedQueries::create(
+        req, *planningContext, named, topDocsReq.include_named_queries_score);
     if (firstQuery == nullptr) {
       firstQuery = qr;
     }
@@ -2123,6 +2134,10 @@ public:
     // indirect), so srcProto is the message itself.  A zero-weight source is
     // disabled: it is neither parsed nor executed, so its documents never
     // reach the fused list, found, or the ops domain.
+    std::vector<std::pair<std::string_view, Query*>> named;
+    auto* oldNamed = fusionNamed;
+    auto restoreNamed = scope_guard([&]() noexcept { fusionNamed = oldNamed; });
+    fusionNamed = fusionProto.get_matched_queries ? &named : nullptr;
     std::vector<TopDocsReq*> sources;
     std::vector<double> sourceWeights;
     sources.reserve(sourceEntries.size());
@@ -2156,9 +2171,12 @@ public:
       req.requestPool, *req.schema, req.arena,
       CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
     parseContext.collapse = enclosingCollapse;
+    parseContext.named = fusionNamed;
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseFilters(
         parser, fusionProto.filter, nullptr, "fusion.filter");
+    parseContext.named = nullptr;
+    fusionNamed = oldNamed;
     // Reuse the first source's execution Context when it has one. A fully
     // resident source may be Context-free, in which case shared filter
     // Weights are unresolved execution and create the Context here.
@@ -2190,6 +2208,8 @@ public:
       method, rrfK);
 
     fusion->collapse = collapse;
+    fusion->namedQueries = NamedQueries::create(req, fusion->sources.front()->planning,
+        named, fusionProto.include_named_queries_score);
     if (collapse && !fusionProto.collapse->head_sort.empty()) {
       fusion->headSort = parseSorts(fusionProto.collapse->head_sort);
     }

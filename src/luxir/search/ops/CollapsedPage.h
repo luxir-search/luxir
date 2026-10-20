@@ -5,6 +5,7 @@
 
 #include "SearchOp.h"
 #include "luxir/search/Collector.h"
+#include "luxir/search/NamedQueries.h"
 #include "luxir/search/SortField.h"
 
 namespace luxir {
@@ -31,6 +32,7 @@ struct CollapsedPageSettings {
   bool alwaysRank = false;
   void (*releaseSegment)(SearchOp&, IndexReader::Segment&) = nullptr;
   void (*releaseMembers)(SearchOp::Calculator&) = nullptr;
+  NamedQueries* namedQueries = nullptr;  // evaluated per returned head
 };
 
 void emitCollapsedPage(const CollapsedPageSettings& settings,

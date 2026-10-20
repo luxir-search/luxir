@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <charconv>
 #include <cstring>
 #include <format>
 #include <limits>
@@ -21,6 +22,7 @@
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
+#include "luxir/query/PhrasePrefixQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/Query.h"
@@ -671,71 +673,152 @@ private:
 
 public:
 
-  // OpenSearch-style AUTO fuzziness by byte length.
-  static int autoMaxEdits(size_t termLen) {
-    if (termLen <= 2) return 0;
-    if (termLen <= 5) return 1;
+  // How a fuzzy query (or a fuzzy match) expands its terms. Unset maxEdits is
+  // AUTO by code-point length: 0 edits below autoLow, 1 below autoHigh, else 2.
+  struct FuzzyOptions {
+    std::optional<int> maxEdits;
+    int autoLow = 3;
+    int autoHigh = 6;
+    std::optional<int> prefixLength;  // code points; unset = 1
+    int maxExpansions = 0;            // 0 = FuzzyQuery::DEFAULT_MAX_EXPANSIONS
+    bool transpositions = true;
+    FuzzyRewrite rewrite = FuzzyRewrite::TOP_TERMS_BLENDED_FREQS;
+    int rewriteSize = 0;
+  };
+
+  // Elasticsearch-style AUTO fuzziness by code-point length (AUTO = AUTO:3,6).
+  static int autoMaxEdits(int termUnits, int low = 3, int high = 6) {
+    if (termUnits < low) return 0;
+    if (termUnits < high) return 1;
     return 2;
+  }
+
+  // Parse an Elasticsearch fuzziness string into `opts`: "AUTO",
+  // "AUTO:low,high" (case-insensitive AUTO), or an edit count "0", "1", "2".
+  static void parseFuzziness(std::string_view text, FuzzyOptions& opts) {
+    auto fail = [&]() -> void {
+      throw std::runtime_error(std::format(
+          "fuzziness must be AUTO, AUTO:low,high, 0, 1, or 2 (got '{}')", text));
+    };
+    auto parseInt = [&](std::string_view digits) {
+      int v = 0;
+      auto [p, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), v);
+      if (digits.empty() || ec != std::errc() || p != digits.data() + digits.size()) fail();
+      return v;
+    };
+    auto upper = [](char c) { return c >= 'a' && c <= 'z' ? (char)(c - 'a' + 'A') : c; };
+    bool isAuto = text.size() >= 4;
+    for (size_t i = 0; isAuto && i < 4; i++) isAuto = upper(text[i]) == "AUTO"[i];
+    if (!isAuto) {
+      int edits = parseInt(text);
+      if (edits < 0 || edits > 2) fail();
+      opts.maxEdits = edits;
+      return;
+    }
+    opts.maxEdits.reset();
+    std::string_view rest = text.substr(4);
+    if (rest.empty()) return;
+    size_t comma = rest.find(',');
+    if (rest[0] != ':' || comma == std::string_view::npos) fail();
+    int low = parseInt(rest.substr(1, comma - 1));
+    int high = parseInt(rest.substr(comma + 1));
+    if (low < 0 || high < low) {
+      throw std::runtime_error(std::format(
+          "fuzziness AUTO:low,high needs 0 <= low <= high (got '{}')", text));
+    }
+    opts.autoLow = low;
+    opts.autoHigh = high;
   }
 
   // Build a fuzzy query over term-backed fields. The term is normalized (not
   // tokenized) for analyzed TEXT fields - AUTO edits are computed from the
-  // normalized bytes - and normalized for STRING; ID is verbatim.
-  // Defaults: maxEdits = AUTO, prefixLength = 1, maxExpansions = 0 (complete).
+  // normalized code points - and normalized for STRING; ID is verbatim.
+  // Defaults: maxEdits = AUTO, prefixLength = 1, maxExpansions = 0 (default 50).
   Query* createFuzzyQuery(std::string_view field, std::string_view term,
                           std::optional<int> maxEdits = std::nullopt,
                           std::optional<int> prefixLength = std::nullopt,
                           int maxExpansions = 0) {
-    return createFuzzyQuery(fields.resolve(field, OpClass::SEARCH, opName), term, maxEdits, prefixLength, maxExpansions);
+    FuzzyOptions opts;
+    opts.maxEdits = maxEdits;
+    opts.prefixLength = prefixLength;
+    opts.maxExpansions = maxExpansions;
+    return createFuzzyQuery(field, term, opts);
+  }
+
+  Query* createFuzzyQuery(std::string_view field, std::string_view term,
+                          const FuzzyOptions& opts) {
+    return createFuzzyQuery(fields.resolve(field, OpClass::SEARCH, opName), term, opts);
   }
 
   Query* createFuzzyQuery(const ResolvedFieldHandle& target, std::string_view term,
-                          std::optional<int> maxEdits = std::nullopt,
-                          std::optional<int> prefixLength = std::nullopt,
-                          int maxExpansions = 0) {
-    auto field = poolCopy(target.physicalName);
-    FieldType& fieldType = *target.fieldType;
-    switch (fieldType.type()) {
+                          const FuzzyOptions& opts) {
+    validateFuzzyOptions(opts);
+    switch (target.fieldType->type()) {
       case FieldType::Type::TEXT:
       case FieldType::Type::ID:
       case FieldType::Type::STRING:
         term = normalizeLiteral(target, term, false);
         break;
       default:
-        throw std::runtime_error(std::format("Fuzzy query on unsupported field type: {}", field));
+        throw std::runtime_error(
+            std::format("Fuzzy query on unsupported field type: {}", target.physicalName));
     }
-    size_t sourceLen = term.size();
-    term = fitTerm(target, term); // Edit distance is measured in indexed term bytes.
-    int resolvedEdits;
-    if (!maxEdits) {
-      resolvedEdits = autoMaxEdits(term.size());
-    } else if (*maxEdits < 0 || *maxEdits > 2) {
+    return makeFuzzyQuery(target, term, opts);
+  }
+
+private:
+  [[noreturn]] static void throwFuzzyMatchType(std::string_view field) {
+    throw std::runtime_error(std::format(
+        "Match fuzziness requires a text, string, or id field: {}", field));
+  }
+
+  void validateFuzzyOptions(const FuzzyOptions& opts) {
+    if (opts.maxEdits && (*opts.maxEdits < 0 || *opts.maxEdits > 2)) {
       // Keep fuzzy within the common 0..2 range; wider scans get expensive fast.
-      throw std::runtime_error(std::format("Fuzzy query max_edits must be 0..2 (got {})", *maxEdits));
-    } else {
-      resolvedEdits = *maxEdits;
+      throw std::runtime_error(
+          std::format("Fuzzy query max_edits must be 0..2 (got {})", *opts.maxEdits));
     }
+    if (opts.prefixLength && *opts.prefixLength < 0) {
+      throw std::runtime_error(std::format(
+          "Fuzzy query prefix_length must not be negative (got {})", *opts.prefixLength));
+    }
+    if (opts.maxExpansions < 0) {
+      throw std::runtime_error(std::format(
+          "Fuzzy query max_expansions must not be negative (got {})", opts.maxExpansions));
+    }
+    if (opts.rewriteSize < 0) {
+      throw std::runtime_error(std::format(
+          "Fuzzy query rewrite_size must not be negative (got {})", opts.rewriteSize));
+    }
+  }
+
+  // `term` is already in field form (normalized or analyzed), not yet fitted.
+  Query* makeFuzzyQuery(const ResolvedFieldHandle& target, std::string_view term,
+                        const FuzzyOptions& opts) {
+    auto field = poolCopy(target.physicalName);
+    FieldType& fieldType = *target.fieldType;
+    size_t sourceLen = term.size();
+    term = fitTerm(target, term); // Edit distance is measured in indexed term units.
+    int resolvedEdits = opts.maxEdits
+        ? *opts.maxEdits
+        : autoMaxEdits(fuzzy_units::count(term), opts.autoLow, opts.autoHigh);
     // The default prefix limits scans; explicit 0 allows a full-field scan.
-    int resolvedPrefix = prefixLength.value_or(1);
-    if (resolvedPrefix < 0) {
-      throw std::runtime_error(
-        std::format("Fuzzy query prefix_length must not be negative (got {})", resolvedPrefix));
-    }
-    if (maxExpansions < 0) {
-      throw std::runtime_error(
-        std::format("Fuzzy query max_expansions must not be negative (got {})", maxExpansions));
-    }
+    int resolvedPrefix = opts.prefixLength.value_or(1);
     // Edits can reach a fitted term, or the query term is fitted itself, and
     // distance over kept bytes misses near long values. Zero edits is an
-    // exact lookup, which applies the same transform as ingest.
+    // exact lookup, which applies the same transform as ingest. An inserted
+    // code point is up to 4 bytes.
     std::optional<TermPolicy> fittedPolicy;
     if (fieldType.longTerms != TermPolicy::REJECT && resolvedEdits > 0
-        && sourceLen + (size_t)resolvedEdits >= PackedTerm::MIN_FITTED_LEN) {
+        && sourceLen + (size_t)resolvedEdits * 4 >= PackedTerm::MIN_FITTED_LEN) {
       fittedPolicy = fieldType.longTerms;
     }
-    return pool.make<FuzzyQuery>(field, term, resolvedEdits, resolvedPrefix, maxExpansions,
-                                 1.0f, fittedPolicy);
+    return pool.make<FuzzyQuery>(field, term, resolvedEdits, resolvedPrefix, opts.maxExpansions,
+                                 1.0f, fittedPolicy, opts.transpositions, opts.rewrite,
+                                 opts.rewriteSize);
   }
+
+public:
 
   // Build a match query for `field` against raw value `value`.
   //   * TEXT field: run the field's analyzer and combine the resulting terms.
@@ -750,15 +833,23 @@ public:
   //   * else `op`: OR -> k = 1 (disjunction), AND -> k = N (conjunction).
   // k <= 1 builds a disjunction, k >= N a conjunction, and the middle a
   // min-should-match boolean.
+  //
+  // `fuzzy` (match fuzziness) turns each analyzed term, or the one STRING/ID
+  // term, into a FuzzyQuery on that term instead of a TermQuery; the
+  // combination rules above are unchanged.
   Query* createMatchQuery(std::string_view field, std::string_view value,
-                          Operator op = Operator::OR, int minMatch = 0) {
-    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), value, op, minMatch);
+                          Operator op = Operator::OR, int minMatch = 0,
+                          const FuzzyOptions* fuzzy = nullptr) {
+    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), value, op, minMatch,
+                            fuzzy);
   }
 
   Query* createMatchQuery(const ResolvedFieldHandle& target, std::string_view value,
-                          Operator op = Operator::OR, int minMatch = 0) {
+                          Operator op = Operator::OR, int minMatch = 0,
+                          const FuzzyOptions* fuzzy = nullptr) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
+    if (fuzzy != nullptr) validateFuzzyOptions(*fuzzy);
     switch (fieldType.type()) {
       case FieldType::Type::TEXT: {
         auto* chain = fields.chain(target);
@@ -770,19 +861,25 @@ public:
         tc.head.setValue(value);
         tc.reset();
         while (tail.incrementToken()) {
-          // Analyzer buffers are borrowed until the next pull.
-          terms.push_back(poolCopy(fitTerm(target, tok.text)));
+          // Analyzer buffers are borrowed until the next pull. Fuzzy terms
+          // are fitted by the fuzzy builder, which needs the unfitted length.
+          terms.push_back(poolCopy(fuzzy != nullptr ? std::string_view(tok.text)
+                                                    : fitTerm(target, tok.text)));
         }
 
+        auto termClause = [&](std::string_view term) -> Query* {
+          if (fuzzy != nullptr) return makeFuzzyQuery(target, term, *fuzzy);
+          return pool.make<TermQuery>(field, term);
+        };
         if (terms.empty()) {
           return matchNoDocs();
         }
         if (terms.size() == 1) {
-          return pool.make<TermQuery>(field, terms[0]);
+          return termClause(terms[0]);
         }
         auto clauses = pool.make_span<Query*>(terms.size());
         for (size_t i = 0; i < terms.size(); i++) {
-          clauses[i] = pool.make<TermQuery>(field, terms[i]);
+          clauses[i] = termClause(terms[i]);
         }
         int n = (int)terms.size();
         int k = minMatch > 0 ? minMatch : (op == Operator::AND ? n : 1);
@@ -801,11 +898,15 @@ public:
       }
       case FieldType::Type::STRING:
       case FieldType::Type::ID:
+        if (fuzzy != nullptr) {
+          return makeFuzzyQuery(target, normalizeLiteral(target, value, false), *fuzzy);
+        }
         return pool.make<TermQuery>(field, normalizeLiteral(target, value, true));
       case FieldType::Type::INT:
       case FieldType::Type::FLOAT:
       case FieldType::Type::DOUBLE:
       case FieldType::Type::DATE: {
+        if (fuzzy != nullptr) throwFuzzyMatchType(field);
         // Exact numeric match == a degenerate inclusive [v, v] range; route
         // through createRangeQuery so it shares the same column validation.
         if (value.empty()) return matchNoDocs();
@@ -825,15 +926,19 @@ public:
   // index-time and query-time coercion agree.  Uncoercible Vals (arrays,
   // maps) throw.
   Query* createMatchQuery(std::string_view field, const luxir::api::Val& val,
-                          Operator op = Operator::OR, int minMatch = 0) {
-    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), val, op, minMatch);
+                          Operator op = Operator::OR, int minMatch = 0,
+                          const FuzzyOptions* fuzzy = nullptr) {
+    return createMatchQuery(fields.resolve(field, OpClass::SEARCH, opName), val, op, minMatch,
+                            fuzzy);
   }
 
   Query* createMatchQuery(const ResolvedFieldHandle& target, const luxir::api::Val& val,
-                          Operator op = Operator::OR, int minMatch = 0) {
+                          Operator op = Operator::OR, int minMatch = 0,
+                          const FuzzyOptions* fuzzy = nullptr) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
     if (isNumericColumnType(fieldType.type())) {
+      if (fuzzy != nullptr) throwFuzzyMatchType(field);
       // Exact numeric match == a degenerate inclusive [v, v] range; route
       // through createRangeQuery so it shares the same column validation.  An
       // array/uncoercible Val throws there (multi-value Match semantics are
@@ -852,7 +957,7 @@ public:
     if (text.data() == buf) {
       text = poolCopy(text);
     }
-    return createMatchQuery(target, text, op, minMatch);
+    return createMatchQuery(target, text, op, minMatch, fuzzy);
   }
 
   // Build a range query over `field` from raw bound Vals (any may be null for
@@ -1064,6 +1169,61 @@ public:
     return buildPhrase(target,
                        std::span<std::string_view>(terms.data(), terms.size()),
                        std::span<const int64_t>(positions.data(), positions.size()), slop);
+  }
+
+  // match_phrase_prefix: analyze `text` with the field's chain like a phrase
+  // and treat the last token as a prefix. The prefix expands against the
+  // index at weight creation (PhrasePrefixQuery). maxExpansions 0 selects
+  // the default cap.
+  Query* createMatchPhrasePrefixQuery(std::string_view field, std::string_view text,
+                                      int32_t slop = 0, int32_t maxExpansions = 0) {
+    return createMatchPhrasePrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), text,
+                                        slop, maxExpansions);
+  }
+
+  Query* createMatchPhrasePrefixQuery(const ResolvedFieldHandle& target, std::string_view text,
+                                      int32_t slop = 0, int32_t maxExpansions = 0) {
+    if (slop < 0) {
+      throw std::runtime_error("match_phrase_prefix slop must be nonnegative");
+    }
+    if (maxExpansions < 0) {
+      throw std::runtime_error(std::format(
+          "match_phrase_prefix max_expansions must not be negative (got {})", maxExpansions));
+    }
+    if (maxExpansions == 0) maxExpansions = PhrasePrefixQuery::DEFAULT_MAX_EXPANSIONS;
+    positionalTextFieldType(target);
+    auto* chain = fields.chain(target);
+    TokenChain& tc = *chain;
+    Token& tok = tc.head.getToken();
+    TokenStream& tail = *tc.tail;
+
+    std::vector<std::string_view> tokens;
+    std::vector<int64_t> tokenPositions;
+    int64_t pos = -1;  // first token's positionIncrement (>= 1) lands it at >= 0
+    tc.head.setValue(text);
+    tc.reset();
+    while (tail.incrementToken()) {
+      pos += (int64_t) tok.positionIncrement;
+      tokens.push_back(poolCopy(tok.text));
+      tokenPositions.push_back(pos);
+    }
+    if (tokens.empty()) return matchNoDocs();
+
+    auto terms = pool.make_span<std::string_view>(tokens.size() - 1);
+    auto positions = pool.make_span<int32_t>(tokens.size());
+    for (size_t i = 0; i < tokens.size(); i++) {
+      int64_t normalized = tokenPositions[i] - tokenPositions[0];
+      if (normalized > std::numeric_limits<int32_t>::max()) {
+        throw std::runtime_error(
+            "match_phrase_prefix normalized positions must be in [0, INT_MAX]");
+      }
+      positions[i] = (int32_t) normalized;
+      if (i + 1 < tokens.size()) terms[i] = fitTerm(target, tokens[i]);
+    }
+    // The prefix stays unfitted: a fitted (hashed or truncated) form would
+    // not be a prefix of the terms it should reach.
+    return pool.make<PhrasePrefixQuery>(poolCopy(target.physicalName), terms, positions,
+                                        tokens.back(), slop, maxExpansions);
   }
 
   // Build a phrase query from already-analyzed terms; the terms are used

@@ -308,10 +308,23 @@ otherwise the text is used exactly as written, so `author_s:Herbet~1` finds
 `Herbert` while `author_s:herbet~1` does not on a string field with no
 normalizer.
 
-Fuzzy matching currently requires the first byte to match exactly (the
+Fuzzy distance counts characters (Unicode code points), and swapping two
+adjacent characters is one edit, so `teh~1` finds "the" and `cafe~1` finds
+"caf&eacute;". Fuzzy matching requires the first character to match exactly (the
 default `prefix_length` is 1, which bounds the scan); `hte~1` will not find
 "the". Pass `prefix_length=0` through the `fuzzy(...)` function to trade a
-wider scan for first-position typos.
+wider scan for first-position typos. The function form also takes
+Elasticsearch-style `fuzziness` (`AUTO`, `AUTO:low,high`, `0`, `1`, `2`),
+`transpositions=false`, and a `rewrite`:
+
+```
+fuzzy(herbet, field=author_s, fuzziness="AUTO:4,7", transpositions=false)
+fuzzy(herbet, field=author_s, rewrite=constant_score)
+match(quikc brwon, field=title_t, operator=AND, fuzziness=AUTO)
+```
+
+Quote `AUTO:low,high` in a function argument, since `,` separates arguments.
+See [Fuzzy](query-reference.md#fuzzy) for the options.
 
 ## Wildcards and regular expressions
 
@@ -393,7 +406,9 @@ reference:
 match(dune messiah, field=title_t, operator=AND, min_match=2)
 phrase(dune messiah, field=title_t)
 phrase(dune messiah, field=title_t, slop=2)
+match_phrase_prefix(dune mess, field=title_t)
 fuzzy(smith, field=name_s, max_edits=2, prefix_length=0)
+match(smiht jon, field=name_t, fuzziness=AUTO)
 prefix(mess, field=title_t)
 wildcard(du*, field=title_t)
 regex(dune|kings, field=title_t)

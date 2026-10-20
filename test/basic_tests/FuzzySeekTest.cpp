@@ -13,6 +13,7 @@
 
 #include "luxir/reader/FuzzySeekEnum.h"
 #include "luxir/reader/FuzzyTermsEnum.h"
+#include "luxir/reader/LevenshteinAutomaton.h"
 #include "test/LuxirTest.h"
 #include "test/TestIndex.h"
 
@@ -124,11 +125,12 @@ void indexTerms(TestIndex& ti, TestField& field, const std::vector<std::string>&
 }
 
 std::vector<Match> collectBrute(TestField& field, std::string_view prefix,
-                                std::string_view suffix, int k, bool prefixMode) {
+                                std::string_view suffix, int k, bool prefixMode,
+                                bool transpositions = true) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
   TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
-  FuzzyTermsEnum e(guard.pool(), te, prefix, suffix, k, prefixMode);
+  FuzzyTermsEnum e(guard.pool(), te, prefix, suffix, k, prefixMode, transpositions);
   std::vector<Match> out;
   while (e.next()) {
     std::string_view t = e.termView();
@@ -140,11 +142,11 @@ std::vector<Match> collectBrute(TestField& field, std::string_view prefix,
 std::vector<Match> collectSeek(TestField& field, std::string_view prefix,
                                std::string_view suffix, int k, bool prefixMode,
                                int64_t* termsExamined = nullptr,
-                               int64_t* jumps = nullptr) {
+                               int64_t* jumps = nullptr, bool transpositions = true) {
   auto guard = field.testIndex.pool.rewindScopeGuard();
   auto* seg = field.currentSegment();
   TermsEnum te(guard.pool(), seg->postingsReader(), field.fieldInfo);
-  FuzzySeekEnum e(guard.pool(), te, prefix, suffix, k, prefixMode);
+  FuzzySeekEnum e(guard.pool(), te, prefix, suffix, k, prefixMode, transpositions);
   std::vector<Match> out;
   while (e.next()) {
     std::string_view t = e.termView();
@@ -172,25 +174,61 @@ void expectSame(const std::vector<Match>& brute, const std::vector<Match>& seek,
   EXPECT_EQ(std::bit_cast<uint32_t>(seekSum), std::bit_cast<uint32_t>(bruteSum));
 }
 
+// prefixLen counts code points, as FuzzyQuery's prefix_length does.
 void expectEnumsEqual(TestField& field, std::string_view query, int prefixLen, int k,
-                      bool prefixMode) {
-  int pl = std::min(prefixLen, (int)query.size());
-  std::string_view prefix = query.substr(0, (size_t)pl);
-  std::string_view suffix = query.substr((size_t)pl);
-  auto brute = collectBrute(field, prefix, suffix, k, prefixMode);
-  auto seek = collectSeek(field, prefix, suffix, k, prefixMode);
+                      bool prefixMode, bool transpositions = true) {
+  size_t pl = fuzzy_units::prefixBytes(query, prefixLen);
+  std::string_view prefix = query.substr(0, pl);
+  std::string_view suffix = query.substr(pl);
+  SCOPED_TRACE("transpositions=" + std::to_string((int)transpositions));
+  auto brute = collectBrute(field, prefix, suffix, k, prefixMode, transpositions);
+  auto seek = collectSeek(field, prefix, suffix, k, prefixMode, nullptr, nullptr,
+                          transpositions);
   expectSame(brute, seek, query, prefixLen, k, prefixMode);
 }
 
-void expectCrossProduct(TestField& field, const std::vector<std::string>& queries) {
+void expectCrossProduct(TestField& field, const std::vector<std::string>& queries,
+                        bool bothTranspositions = false) {
   for (const auto& q : queries) {
     for (int prefixLen : {0, 1, 2}) {
       for (int k = 0; k <= 2; k++) {
         expectEnumsEqual(field, q, prefixLen, k, false);
         expectEnumsEqual(field, q, prefixLen, k, true);
+        if (bothTranspositions) {
+          expectEnumsEqual(field, q, prefixLen, k, false, false);
+          expectEnumsEqual(field, q, prefixLen, k, true, false);
+        }
       }
     }
   }
+}
+
+// Terms of whole units: ASCII, 2/3/4-byte code points and stray bytes, so
+// distances cross multi-byte boundaries.
+std::string randomUnicodeTerm(std::mt19937& rng, int maxUnits) {
+  static const std::vector<std::string> pieces = {
+    "a", "b", "e", "r", bytes({0xc3, 0xa9}), bytes({0xc3, 0xa8}), bytes({0xd0, 0xb6}),
+    bytes({0xe2, 0x82, 0xac}), bytes({0xe6, 0x97, 0xa5}), bytes({0xf0, 0x9f, 0x98, 0x80}),
+    bytes({0x80}), bytes({0xc3}),
+  };
+  std::uniform_int_distribution<int> lenDist(1, maxUnits);
+  std::uniform_int_distribution<int> pieceDist(0, (int)pieces.size() - 1);
+  std::string s;
+  int len = lenDist(rng);
+  for (int i = 0; i < len; i++) s += pieces[(size_t)pieceDist(rng)];
+  return s;
+}
+
+// Swap two adjacent code points (whole units, by decoded length).
+std::string swapAdjacent(std::string_view s, int at) {
+  size_t a = fuzzy_units::prefixBytes(s, at);
+  size_t b = fuzzy_units::prefixBytes(s, at + 1);
+  size_t c = fuzzy_units::prefixBytes(s, at + 2);
+  std::string out(s.substr(0, a));
+  out += s.substr(b, c - b);
+  out += s.substr(a, b - a);
+  out += s.substr(c);
+  return out;
 }
 
 bool containsTerm(const std::vector<Match>& matches, std::string_view term) {
@@ -393,4 +431,48 @@ TEST_F(FuzzySeekTest, JumpEffectivenessSparseCorpus) {
   ASSERT_FALSE(seek.empty());
   EXPECT_LT(termsExamined, (int64_t)terms.size() / 2);
   EXPECT_GT(jumps, 0);
+}
+
+TEST_F(FuzzySeekTest, DifferentialUnicodeAndTranspositions) {
+  TestIndex ti;
+  TestField field(ti, "foo_s");
+  std::mt19937 rng(0xc0de9017);
+  std::vector<std::string> terms;
+  std::vector<std::string> queries;
+  for (int i = 0; i < 24; i++) {
+    std::string q = randomUnicodeTerm(rng, 6);
+    queries.push_back(q);
+    addUnique(terms, q);
+    int n = fuzzy_units::count(q);
+    for (int at = 0; at + 1 < n; at++) addUnique(terms, swapAdjacent(q, at));
+  }
+  while ((int)terms.size() < 400) addUnique(terms, randomUnicodeTerm(rng, 7));
+  indexTerms(ti, field, terms);
+  expectCrossProduct(field, queries, true);
+}
+
+TEST_F(FuzzySeekTest, MultiByteEditsAndSwapsCostOne) {
+  TestIndex ti;
+  TestField field(ti, "foo_s");
+  std::string cafe = std::string("caf") + bytes({0xc3, 0xa9});
+  std::vector<std::string> terms = {"cafe", cafe, "acfe", "cfae", "cafes"};
+  indexTerms(ti, field, terms);
+
+  auto matched = [&](std::string_view q, int k, bool transpositions) {
+    std::vector<std::string> out;
+    for (const auto& m : collectSeek(field, "", q, k, false, nullptr, nullptr, transpositions)) {
+      out.push_back(m.term);
+    }
+    return out;
+  };
+  using V = std::vector<std::string>;
+  // e -> e-acute is one substitution of a code point (two bytes differ).
+  EXPECT_EQ(matched("cafe", 1, false), (V{"cafe", "cafes", cafe}));
+  // An adjacent swap is one edit with transpositions, two without.
+  EXPECT_EQ(matched("cafe", 1, true), (V{"acfe", "cafe", "cafes", cafe, "cfae"}));
+  // Scores count code points: one edit over four units.
+  auto scored = collectSeek(field, "", cafe, 1, false);
+  ASSERT_EQ(scored.size(), 2u);
+  EXPECT_EQ(scored[0].term, "cafe");
+  EXPECT_FLOAT_EQ(scored[0].score, 1.0f - 1.0f / 4.0f);
 }

@@ -208,7 +208,8 @@ clauses, as non-scoring filters, as facet domains, and as fusion sources.
 Anywhere a query goes, it can be a structured object or an expression string.
 
 - `match` (analyzed, AND/OR operator, minimum-match; numeric and date
-  equality through columns), `phrase` (positional, with slop), `boolean`
+  equality through columns), `phrase` (positional, with slop),
+  `match_phrase_prefix` (a phrase whose last word is a prefix), `boolean`
   (required, optional, prohibited, and filter clauses with minimum-match),
   `any_of` (exact value-set membership), `exists`, and match-all.
 - `range` over numeric, date, string, ID, and text fields, either side open.
@@ -217,9 +218,13 @@ Anywhere a query goes, it can be a structured object or an expression string.
   (`NOW/DAY-30DAYS`, `2024-06-25||+2d/d`) with a request-stable `NOW`,
   evaluated in a request time zone (IANA name or fixed offset).
 - `prefix`, `wildcard` (`*` and `?`), `regex` (anchored whole-term), and
-  `fuzzy` (edit distance up to 2, with blended scoring so a rare misspelling
-  never outranks the exact term; fuzzy clauses take part in block-max pruning
-  like any other clause).
+  `fuzzy` (edit distance up to 2 in Unicode code points, an adjacent
+  transposition counting as one edit; Elasticsearch-style `fuzziness`
+  (`AUTO`, `AUTO:low,high`); blended scoring by default so a rare misspelling
+  never outranks the exact term, with `top_terms`, `top_terms_boost`, and
+  `constant_score` rewrites; a `fuzzy_truncated` warning when a cap drops
+  matching terms; fuzzy clauses take part in block-max pruning like any other
+  clause). `match` takes `fuzziness` too, making each analyzed term fuzzy.
 - `constant_score`, `boost`, and `rescore`: keep a query's matches and replace
   each score with a value expression over columns and the original score
   (`score * def(popularity_i, 1)`). `rescore` takes an optional `min_score`
@@ -274,8 +279,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
   of min-max normalized scores, over named sources with shared and
   per-source filters, `limit` and `offset` over the fused list, and facets and
   metrics over the fused candidate set.
-- A warnings channel: declared degradations (a clamped fuzzy distance, a
-  skipped calendar bucket) carry a code and a message in the response instead
+- A warnings channel: declared degradations (a clamped fuzzy distance,
+  truncated fuzzy expansions, a skipped calendar bucket) carry a code and a message in the response instead
   of silently changing the query.
 - Opt-in execution profiles (`profile: true`) with per-segment strategy,
   inputs, and timing for instrumented operations (string facets today), and

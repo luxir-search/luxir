@@ -65,6 +65,7 @@ enum class QueryKind : uint8_t {
   NONE,
   RESCORE,
   MIN_SCORE,
+  PHRASE_PREFIX,
   TEST,
 };
 

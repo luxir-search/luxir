@@ -175,6 +175,18 @@ inline api::Query phraseWords(std::pmr::memory_resource& mr, std::string_view fi
   return q;
 }
 
+inline api::Query matchPhrasePrefix(std::pmr::memory_resource& mr, std::string_view field,
+                                    std::string_view text, int32_t slop = 0,
+                                    int32_t maxExpansions = 0) {
+  api::Query q;
+  auto& p = q.kind.emplace<api::MatchPhrasePrefixQuery>();
+  p.field = build::arenaStr(mr, field);
+  p.text = build::arenaStr(mr, text);
+  p.slop = slop;
+  p.max_expansions = maxExpansions;
+  return q;
+}
+
 inline api::Query phraseText(std::pmr::memory_resource& mr, std::string_view field,
                              std::string_view text) {
   api::Query q;

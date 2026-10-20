@@ -51,6 +51,20 @@ std::string_view ProtobufQueryParser::getString(const luxir::api::Val& val) {
   return {};
 }
 
+static luxir::FuzzyRewrite fuzzyRewrite(luxir::api::FuzzyRewrite rewrite) {
+  switch (rewrite) {
+    case luxir::api::FuzzyRewrite::TOP_TERMS_BLENDED_FREQS:
+      return luxir::FuzzyRewrite::TOP_TERMS_BLENDED_FREQS;
+    case luxir::api::FuzzyRewrite::TOP_TERMS:
+      return luxir::FuzzyRewrite::TOP_TERMS;
+    case luxir::api::FuzzyRewrite::TOP_TERMS_BOOST:
+      return luxir::FuzzyRewrite::TOP_TERMS_BOOST;
+    case luxir::api::FuzzyRewrite::CONSTANT_SCORE:
+      return luxir::FuzzyRewrite::CONSTANT_SCORE;
+  }
+  throw std::runtime_error(std::format("unknown fuzzy rewrite {}", (int)rewrite));
+}
+
 luxir::Query* ProtobufQueryParser::parseMatch(const luxir::api::Match& matchQuery) {
   std::string_view field = matchQuery.field;
 
@@ -64,13 +78,31 @@ luxir::Query* ProtobufQueryParser::parseMatch(const luxir::api::Match& matchQuer
 
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+  std::optional<QueryBuilder::FuzzyOptions> fuzzy;
+  if (matchQuery.fuzziness.has_value()) {
+    fuzzy.emplace();
+    QueryBuilder::parseFuzziness(*matchQuery.fuzziness, *fuzzy);
+    if (matchQuery.prefix_length.has_value()) fuzzy->prefixLength = *matchQuery.prefix_length;
+    fuzzy->maxExpansions = matchQuery.max_expansions.value_or(0);
+    fuzzy->transpositions = matchQuery.transpositions.value_or(true);
+    if (matchQuery.fuzzy_rewrite.has_value()) {
+      fuzzy->rewrite = fuzzyRewrite(*matchQuery.fuzzy_rewrite);
+    }
+  } else if (matchQuery.prefix_length.has_value() || matchQuery.max_expansions.has_value()
+             || matchQuery.transpositions.has_value() || matchQuery.fuzzy_rewrite.has_value()) {
+    throw std::runtime_error(
+        "Match prefix_length, max_expansions, transpositions and fuzzy_rewrite need fuzziness");
+  }
+  const QueryBuilder::FuzzyOptions* fuzzyOptions = fuzzy ? &*fuzzy : nullptr;
   if (matchQuery.val.has_value()) {
     // Val goes through the coercion contract: a numeric val against a
     // text/string field matches its canonical rendering (it used to
     // silently match nothing).
-    return builder.createMatchQuery(field, *matchQuery.val, op, matchQuery.min_match);
+    return builder.createMatchQuery(field, *matchQuery.val, op, matchQuery.min_match,
+                                    fuzzyOptions);
   }
-  return builder.createMatchQuery(field, std::string_view{}, op, matchQuery.min_match);
+  return builder.createMatchQuery(field, std::string_view{}, op, matchQuery.min_match,
+                                  fuzzyOptions);
 }
 
 luxir::Query* ProtobufQueryParser::parseAnyOf(
@@ -165,6 +197,14 @@ luxir::Query* ProtobufQueryParser::parsePhrase(const luxir::api::PhraseQuery& ph
   return builder.matchNoDocs();
 }
 
+luxir::Query* ProtobufQueryParser::parseMatchPhrasePrefix(
+    const luxir::api::MatchPhrasePrefixQuery& query) {
+  QueryBuilder builder(
+      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+  return builder.createMatchPhrasePrefixQuery(query.field, query.text, query.slop,
+                                              query.max_expansions);
+}
+
 luxir::Query* ProtobufQueryParser::parsePrefix(const luxir::api::PrefixQuery& prefixQuery) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
@@ -227,12 +267,21 @@ luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzz
   }
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
-  std::optional<int> maxEdits = fuzzyQuery.max_edits.has_value()
-      ? std::optional<int>(*fuzzyQuery.max_edits) : std::nullopt;
-  std::optional<int> prefixLength = fuzzyQuery.prefix_length.has_value()
-      ? std::optional<int>(*fuzzyQuery.prefix_length) : std::nullopt;
-  return builder.createFuzzyQuery(fuzzyQuery.field, fuzzyQuery.term,
-                                  maxEdits, prefixLength, fuzzyQuery.max_expansions);
+  QueryBuilder::FuzzyOptions opts;
+  if (fuzzyQuery.fuzziness.has_value()) {
+    if (fuzzyQuery.max_edits.has_value()) {
+      throw std::runtime_error("Fuzzy query takes fuzziness or max_edits, not both");
+    }
+    QueryBuilder::parseFuzziness(*fuzzyQuery.fuzziness, opts);
+  } else if (fuzzyQuery.max_edits.has_value()) {
+    opts.maxEdits = *fuzzyQuery.max_edits;
+  }
+  if (fuzzyQuery.prefix_length.has_value()) opts.prefixLength = *fuzzyQuery.prefix_length;
+  opts.maxExpansions = fuzzyQuery.max_expansions;
+  opts.transpositions = fuzzyQuery.transpositions.value_or(true);
+  opts.rewrite = fuzzyRewrite(fuzzyQuery.rewrite);
+  opts.rewriteSize = fuzzyQuery.rewrite_size;
+  return builder.createFuzzyQuery(fuzzyQuery.field, fuzzyQuery.term, opts);
 }
 
 luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery) {
@@ -513,11 +562,21 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
   // passes through here, so the shared budget bounds tree depth no matter
   // which parser (wire, JSON, expr, simple_query) produced the tree.
   NestingScope nesting(context);
+  // Reserve the entry before descending, so names list in document order.
+  size_t namedSlot = 0;
+  bool named = !pquery.name.empty() && context.named != nullptr;
+  if (named) {
+    namedSlot = context.named->size();
+    context.named->emplace_back(pquery.name, nullptr);
+  }
   // Exhaustive dispatch over the Query oneof: a new arm is a compile error until handled.
-  return std::visit(luxir::overloaded{
+  luxir::Query* query = std::visit(luxir::overloaded{
     [&](const luxir::api::Match& m) -> luxir::Query* { return parseMatch(m); },
     [&](const luxir::api::AnyOfQuery& a) -> luxir::Query* { return parseAnyOf(a); },
     [&](const luxir::api::PhraseQuery& p) -> luxir::Query* { return parsePhrase(p); },
+    [&](const luxir::api::MatchPhrasePrefixQuery& p) -> luxir::Query* {
+      return parseMatchPhrasePrefix(p);
+    },
     [&](const luxir::api::PrefixQuery& p) -> luxir::Query* { return parsePrefix(p); },
     [&](const luxir::api::WildcardQuery& w) -> luxir::Query* { return parseWildcard(w); },
     [&](const luxir::api::RegexQuery& r) -> luxir::Query* { return parseRegex(r); },
@@ -541,6 +600,8 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);
+  if (named) (*context.named)[namedSlot].second = query;
+  return query;
 }
 
 } // luxir

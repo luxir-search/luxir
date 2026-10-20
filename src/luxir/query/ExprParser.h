@@ -1125,6 +1125,8 @@ private:
       member = parseBoolValue(argName);
     } else if constexpr (std::is_same_v<T, api::Match_::Operator>) {
       member = parseOperatorValue(argName);
+    } else if constexpr (std::is_same_v<T, api::FuzzyRewrite>) {
+      member = parseFuzzyRewriteValue(argName);
     } else if constexpr (isOptional<T>) {
       assignArg(fn, argName, argPos, member.emplace());
     } else if constexpr (std::is_same_v<T, ::hpp_proto::optional_indirect_view<api::Val>>) {
@@ -1260,6 +1262,30 @@ private:
     if (text == "AND") return api::Match_::Operator::AND;
     if (text == "OR") return api::Match_::Operator::OR;
     fail(pos, fmt::format("argument '{}' expects AND or OR (got '{}')", argName, text));
+  }
+
+  api::FuzzyRewrite parseFuzzyRewriteValue(std::string_view argName) {
+    cur.skipWs();
+    size_t pos = cur.position();
+    std::string_view text;
+    if (cur.peek() == '$') {
+      text = varString(*parseVarRef(), argName);
+    } else {
+      text = scanToken(ARG_STOPS, /*stopAtColon=*/false).text;
+    }
+    // Either case: the JSON names are lowercase, the proto names uppercase.
+    auto is = [&](std::string_view name) {
+      return text.size() == name.size()
+          && std::equal(text.begin(), text.end(), name.begin(), [](char a, char b) {
+               return (a >= 'a' && a <= 'z' ? (char)(a - 'a' + 'A') : a) == b;
+             });
+    };
+    if (is("TOP_TERMS_BLENDED_FREQS")) return api::FuzzyRewrite::TOP_TERMS_BLENDED_FREQS;
+    if (is("TOP_TERMS")) return api::FuzzyRewrite::TOP_TERMS;
+    if (is("TOP_TERMS_BOOST")) return api::FuzzyRewrite::TOP_TERMS_BOOST;
+    if (is("CONSTANT_SCORE")) return api::FuzzyRewrite::CONSTANT_SCORE;
+    fail(pos, fmt::format("argument '{}' expects TOP_TERMS_BLENDED_FREQS, TOP_TERMS, "
+                          "TOP_TERMS_BOOST or CONSTANT_SCORE (got '{}')", argName, text));
   }
 
   const api::Val* parseValValue(std::string_view argName) {
