@@ -179,14 +179,12 @@ public:
     // really makes sense though since it would only occasionally fix the "many small segments" problem, and
     // it is the indexing pattern that is causing the issue.  Perhaps this should be fixed by the user
     // through an API that requests a more aggressive merge to sweep up small segments.
-    float inverseLogM = 1.0f / log2(mergeFactor);
 
     // Methods with _ prefix should be called with the indexMutex already locked.
     MergePolicy(IndexWriter& iw) : iw(iw) {}
 
     void setMergeFactor(int32_t mergeFactor) {
       this->mergeFactor = std::max(2,mergeFactor);
-      inverseLogM = 1.0f / log2(this->mergeFactor);
     }
 
     // re-calculate the merges from scratch (i.e. not incrementally)
@@ -213,11 +211,14 @@ public:
       }
     }
 
+    // Integer arithmetic: a floating-point log ratio rounds exact powers of the
+    // merge factor (e.g. 100 docs for factor 10) down a level.
     int32_t _mergeLevelForMaxDoc(int32_t maxDoc) const {
-      if (maxDoc < mergeFactor) {
-        return 0;
+      int32_t level = 0;
+      for (int64_t bound = mergeFactor; maxDoc >= bound; bound *= mergeFactor) {
+        level++;
       }
-      return (int32_t)(log2(maxDoc) * inverseLogM);
+      return level;
     }
 
     // Reserve any merge-policy storage needed by _update(seg) before the
@@ -646,6 +647,10 @@ private:
       INDEX_DEBUG("processUpdateBody: msg={} failed: {}", (void*)&msg, e.what());
       msg.result.setException(e);
       // message should continue flowing to finishUpdateBody so the sequencers stay happy.
+    } catch (...) {
+      // Escaping the node would cancel the graph and strand this message.
+      std::runtime_error error("Unknown non-standard exception while handling update");
+      msg.result.setException(error);
     }
   }
 

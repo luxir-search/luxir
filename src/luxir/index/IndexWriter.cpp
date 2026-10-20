@@ -344,6 +344,12 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
           e.what());
         msg->result.setException(e);
       }
+      catch (...) {
+        // Escaping the node would cancel the graph and strand this commit.
+        std::runtime_error error("Unknown non-standard exception while committing");
+        LOG_ERROR("finishCommitBody Exception Caught: exception={}", error.what());
+        msg->result.setException(error);
+      }
 
       metric.finish(dispatchCompletion && msg->result.errored() ? MetricOutcome::ERROR : MetricOutcome::OK);
       if (dispatchCompletion) {
@@ -1299,6 +1305,19 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
 
   std::vector<SegInfo*> segs;
   std::vector<SegInfo*> segsToApplyDeletes;
+  std::vector<SegInfo*> markedInUse;
+
+  // A failed commit must clear its in-use marks: a marked segment that a merge
+  // retires before the next successful commit would otherwise never be deleted.
+  // Cleared once published, when publication or the empty-segment drop below
+  // has replaced every mark and retirement may free the segments.
+  auto releaseInUseMarks = scope_guard([&] {
+    if (markedInUse.empty()) return;
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    for (auto* seg : markedInUse) {
+      if (seg->lastCommitTime == 1) seg->lastCommitTime = 0;
+    }
+  });
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
@@ -1307,11 +1326,13 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     msg.commitInfo->highestUpdateVersion =
       std::max({durableUpdateVersion, msg.updateVersion, maxDeleteVersion});
     segs.reserve(segInfos.size());
+    markedInUse.reserve(segInfos.size());
     // grab all segments and mark them as being part of a commit.
     for (auto& [segId, seg] : segInfos) {
       segs.push_back(seg.get());
       if (seg->lastCommitTime == 0) {
         seg->lastCommitTime = 1; // IMPORTANT - for marking it in use to prevent its deletion.
+        markedInUse.push_back(seg.get());
       }
       if (mayApplyDeletes(*seg, commitDeletes) || mayApplyDeletes(*seg, seg->personalDeletes)) {
         // this segment has personal deletes and/or commit-level deletes that need to be applied.
@@ -1519,6 +1540,7 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   std::unique_lock publicationLock(publicationMutex);
   CommitId result{incarnation, 0};
   writeIndexInfoFile(segsToKeep, *msg.commitInfo, auxIndexInfos);
+  markedInUse.clear();
   for (auto* seg : segsToKeep) seg->unsyncedFiles.clear();
   result.index_gen = indexGen;
   msg.resultingCommit = std::move(result);

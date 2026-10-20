@@ -48,14 +48,29 @@ class IndexWriterTest : public LuxirTest {
 public:
   std::string field = "text_w";
 
-  void addDoc(IndexWriter& iw) {
+  void addDoc(IndexWriter& iw, bool flush = false) {
     auto* inverter = &iw.obtainInverter();
     auto* fieldHandler = &inverter->getIndexHandler(field);
     std::string doc1 = "test";
     inverter->startDoc();
     fieldHandler->index(*inverter, doc1);
     inverter->finishDoc();
-    iw.releaseInverter(*inverter);
+    iw.releaseInverter(*inverter, flush);
+  }
+
+  // Completes through a future so a lost completion fails the test instead of hanging it.
+  class ProbeUpdate final : public UpdateMessage {
+  public:
+    std::function<void()> body;
+    std::promise<void> completed;
+    void handle(IndexWriter& iw) override { unused(iw); if (body) body(); }
+    void done(IndexWriter& iw) override { unused(iw); completed.set_value(); }
+  };
+
+  static bool completes(ProbeUpdate& msg, IndexWriter& iw) {
+    auto completed = msg.completed.get_future();
+    return iw.submitUpdate(&msg)
+        && completed.wait_for(std::chrono::seconds(30)) == std::future_status::ready;
   }
 };
 
@@ -3705,4 +3720,110 @@ TEST_F(IndexWriterTest, shadowFrontierWaitsForCompletedHandlers) {
   EXPECT_GT(stats.completedUpdateVersion, held.updateVersion);
   EXPECT_EQ(UINT64_MAX, stats.minInverterVersion);
   EXPECT_EQ(0, stats.frontierHeldDeleteBytes);
+}
+
+TEST_F(IndexWriterTest, mergeLevelsBreakAtExactPowersOfMergeFactor) {
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
+  auto& policy = *writer.mergePolicy;
+  for (int32_t factor = 2; factor <= 32; factor++) {
+    policy.setMergeFactor(factor);
+    EXPECT_EQ(0, policy._mergeLevelForMaxDoc(0));
+    int32_t level = 0;
+    for (int64_t bound = factor; bound <= INT32_MAX; bound *= factor) {
+      level++;
+      EXPECT_EQ(level - 1, policy._mergeLevelForMaxDoc((int32_t)bound - 1)) << "factor=" << factor;
+      EXPECT_EQ(level, policy._mergeLevelForMaxDoc((int32_t)bound)) << "factor=" << factor;
+    }
+    EXPECT_EQ(level, policy._mergeLevelForMaxDoc(INT32_MAX)) << "factor=" << factor;
+  }
+  policy.setMergeFactor(0);
+  EXPECT_EQ(2, policy.mergeFactor);
+  EXPECT_EQ(1, policy._mergeLevelForMaxDoc(2));
+}
+
+TEST_F(IndexWriterTest, failedCommitDoesNotPinMergedAwaySegments) {
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
+  writer.mergePolicy->setMergeFactor(2);
+  addDoc(writer);
+  Signal::listen("commitDataSync", [](void*, void*, void*) -> void* {
+    throw std::runtime_error("injected I/O failure");
+  });
+  EXPECT_THROW(writer.commit(), std::runtime_error);
+  Signal::unlisten("commitDataSync");
+  ASSERT_EQ(1u, writer.segInfos.size());
+  auto failedSegId = writer.segInfos.begin()->first;
+
+  // A second flushed segment merges with the never-published one before any
+  // commit succeeds; the merge's own commit then publishes the output.
+  addDoc(writer, true);
+  writer.updateGraph->wait_for_all();
+  writer.commit();
+  ASSERT_EQ(1u, writer.segInfos.size());
+  EXPECT_NE(failedSegId, writer.segInfos.begin()->first);
+  EXPECT_EQ(2, writer.snapshots.readers.getReader()->liveDocs());
+  EXPECT_TRUE(writer.segmentsToDelete.empty());
+  std::vector<Directory::FileInfo> files;
+  dir.listFiles(files);
+  auto prefix = Postings::getIndexFileNamePrefix(failedSegId);
+  EXPECT_FALSE(std::ranges::any_of(files, [&](const auto& file) { return file.name.starts_with(prefix); }));
+}
+
+TEST_F(IndexWriterTest, nonStandardHandlerExceptionCompletesMessage) {
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
+  ProbeUpdate update;
+  update.commit = UpdateMessage::COMMIT;
+  update.body = [] { throw 42; };
+  ASSERT_TRUE(completes(update, writer));
+  EXPECT_TRUE(update.result.errored());
+  addDoc(writer);
+  writer.commit();
+  EXPECT_EQ(1, writer.snapshots.readers.getReader()->liveDocs());
+}
+
+TEST_F(IndexWriterTest, nonStandardCommitExceptionCompletesCommit) {
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
+  addDoc(writer);
+  Signal::listen("commitDataSync", [](void*, void*, void*) -> void* { throw 42; });
+  auto unlisten = scope_guard([] { Signal::unlisten("commitDataSync"); });
+  ProbeUpdate commit;
+  commit.commit = UpdateMessage::COMMIT;
+  ASSERT_TRUE(completes(commit, writer));
+  EXPECT_TRUE(commit.result.errored());
+  Signal::unlisten("commitDataSync");
+  writer.commit();
+  EXPECT_EQ(1, writer.snapshots.readers.getReader()->liveDocs());
+}
+
+TEST_F(IndexWriterTest, emptyFlushLeavesNoState) {
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
+  writer.releaseInverter(writer.obtainInverter(), true);
+  writer.updateGraph->wait_for_all();
+  EXPECT_TRUE(writer.testIsEmpty());
+  EXPECT_TRUE(writer.commit().has_value());
+  EXPECT_TRUE(writer.testIsEmpty());
+}
+
+TEST_F(IndexWriterTest, forceMergeOfEmptyOrClosedWriterCompletes) {
+  RAMDir dir;
+  CommitSnapshotRegistry writerSnapshots(dir);
+  IndexWriter writer(writerSnapshots);
+  writer.mergeSegments();
+  EXPECT_TRUE(writer.testIsEmpty());
+  addDoc(writer);
+  writer.mergeSegments();
+  EXPECT_EQ(1u, writer.segInfos.size());
+  writer.close();
+  writer.mergeSegments();
+  EXPECT_EQ(1u, writer.segInfos.size());
+  EXPECT_FALSE(writer.testMergeRunning());
 }
