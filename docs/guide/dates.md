@@ -142,3 +142,31 @@ transition instant. With EXPLICIT bounds, the phase comes from the local time
 of `start`. A facet may set its own `time_zone`; leaving it empty inherits the
 request's. See [range facets](faceting.md#range-facets) for DATA widening,
 `origin`, calendar alignment, DST behavior and limits.
+
+## Range index for timestamps
+
+A DATE field is always stored as a column. `index: "range"` also builds a
+points index, a sorted (value, doc) copy of the same values. Without it,
+ranges and counts use the column's per-block and per-leaf min/max zones:
+blocks wholly inside or outside the range are counted or skipped from those
+zones, and only the few values near each range bound are decoded. That works
+when documents arrive in roughly time order, as event and log timestamps do,
+because each block then spans a short slice of time.
+
+Measured on 4M events over 30 days in one segment (gcc-release, median
+per-segment latency; counts are hit totals, filters iterate every match):
+
+| Arrival order | Column bytes/value | Points bytes/value | Count, column only | Count, with points | 1 h filter, column only | 1 h filter, with points | 7 d filter, column only | 7 d filter, with points |
+|---|---|---|---|---|---|---|---|---|
+| time-sorted | 1.98 | 2.48 | 6 us | 0.3 us | 61 us | 7 us | 2.4 ms | 2.2 ms |
+| 1 h jitter | 3.03 | 4.23 | 29-40 us | 0.3 us | 112 us | 39 us | 2.5 ms | 2.7 ms |
+| random | 4.07 | 5.23 | 4.4-4.9 ms | 0.3 us | 14 ms | 39 us | 20 ms | 3.3 ms |
+
+Windows of a day or more filter at about the same speed either way on
+time-ordered data, since collecting the matches dominates. Omit
+`index: "range"` on a timestamp whose documents arrive in time order: the
+points index more than doubles the field's storage to save a few
+microseconds per segment on counts and tens of microseconds on narrow
+filters. Keep it for dates that arrive in no particular order (birth dates,
+due dates, backfilled data), where the zones prune nothing and every query
+decodes the whole column.

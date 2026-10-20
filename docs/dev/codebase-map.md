@@ -79,7 +79,8 @@ locations, browse `src/luxir/<area>/`.
    - Supports Term, Boolean, Phrase, and All queries
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
-     column scans; `GeoBoxQuery` executes through the BKD. Both share the
+     column scans. Without points, single-valued counts come from block and
+     leaf zones, decoding only crossing leaves; `GeoBoxQuery` executes through the BKD. Both share the
      `PointsMaterialize` scorer/bitset primitives and keep a sparse
      two-phase column verify for small lead costs.
    - `ProtobufQueryParser` lowers the wire tree (`luxir::api::Query`) via `QueryBuilder`

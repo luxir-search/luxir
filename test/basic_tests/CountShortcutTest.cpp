@@ -189,7 +189,7 @@ TEST_P(CountShortcutTest, numericLevelsAgree) {
         NumericPredicateQuery query(field, lo, hi);
         auto expected = lo > hi || lo > 100 || lo < -100
             ? Query::CountHow::METADATA
-            : std::string_view(field) == "numbers" || std::string_view(field) == "scan"
+            : std::string_view(field) == "numbers"
                 ? Query::CountHow::ITERATE : Query::CountHow::SUPPLIER;
         check(query, expected);
       }
@@ -334,13 +334,14 @@ TEST_P(CountShortcutTest, resolverReusesOwnSupplierAndBuildsOnlyLeaf) {
 }
 
 TEST_P(CountShortcutTest, topDocsResolvesPointsBeforeFilterCache) {
+  for (auto field : {"number", "scan"})
   for (int shape = 0; shape < 3; shape++) {
     for (int repeat = 0; repeat < 3; repeat++) {
       CountStats stats;
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
       auto& op = req->topDocs("q").limit(0).getNumber();
-      auto query = qb::range(op.mr(), "number", qb::valI64(op.mr(), -10), nullptr,
+      auto query = qb::range(op.mr(), field, qb::valI64(op.mr(), -10), nullptr,
                              qb::valI64(op.mr(), 10), nullptr);
       if (shape == 2) {
         op.allQuery().filter(query);
@@ -355,7 +356,7 @@ TEST_P(CountShortcutTest, topDocsResolvesPointsBeforeFilterCache) {
       EXPECT_EQ(0u, cache->counters().buildAttempts);
       MemPool pool;
       Query::Context context(pool, *reader);
-      NumericPredicateQuery reference("number", -10, 10);
+      NumericPredicateQuery reference(field, -10, 10);
       auto* weight = reference.createWeight(context, 0);
       int64_t expected = 0;
       for (auto& segment : reader->segments()) {
@@ -367,7 +368,7 @@ TEST_P(CountShortcutTest, topDocsResolvesPointsBeforeFilterCache) {
 }
 
 TEST_P(CountShortcutTest, topDocsKeepsNumericCountExecutor) {
-  for (auto field : {"numbers", "scan"}) {
+  for (auto field : {"numbers"}) {
     CountStats stats;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
