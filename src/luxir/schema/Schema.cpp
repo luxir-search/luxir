@@ -776,6 +776,11 @@ SourceSettings SourceSettings::resolve(const api::SourceDef& def) {
     if (*def.min_file_bytes < 0) fail("min_file_bytes must not be negative");
     out.minFileBytes = (uint64_t)*def.min_file_bytes;
   }
+  try {
+    out.filter = source::SourceFilter(def.includes, def.excludes);
+  } catch (const std::invalid_argument& e) {
+    fail(e.what());
+  }
   return out;
 }
 

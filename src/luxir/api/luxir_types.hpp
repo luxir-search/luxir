@@ -790,6 +790,8 @@ struct SourceDef {
   using Codec = luxir::api::SourceDef_::Codec;
   std::optional<std::int64_t> min_file_bytes;                   // align 8
   std::optional<double> min_live_ratio;
+  std::span<const std::string_view> includes;
+  std::span<const std::string_view> excludes;
   std::optional<Codec> codec;                                   // align 4 (enum)
   std::optional<std::int32_t> zstd_level;
   std::optional<std::int32_t> block_size_bytes;
@@ -1110,6 +1112,9 @@ struct UpdateRequest {                                         // needs CommitPa
   std::optional<CommitParams> commit;
   // Input doc key -> schema field for this request's docs ("" target = drop the key).
   map_view<std::string_view, std::string_view> field_map;
+  // Source includes/excludes for this request's docs, replacing the collection's.
+  std::span<const std::string_view> source_includes;
+  std::span<const std::string_view> source_excludes;
   bool allow_dups = false;
   bool all_or_none = false;
   bool return_ids = false;

@@ -304,6 +304,10 @@ struct UpdateUrlParams {
   bool commit = false;
   std::string waitForReplicas;
   std::optional<uint64_t> waitForReplicasTimeoutMs;
+  // ?source_includes / ?source_excludes: the source paths kept for docs whose
+  // body or request sets neither.
+  std::vector<std::string> sourceIncludes;
+  std::vector<std::string> sourceExcludes;
 };
 
 struct HttpStreamUpdateState {
@@ -1845,6 +1849,7 @@ private:
       copyFieldMap(state.proto, url.fieldMap, state.resource);
       state.proto.drop_unmapped = url.dropUnmapped;
     }
+    applyUrlSourceFilter(state.proto, url, state.resource);
     // ?commit=true is a publication guarantee, as at NDJSON EOF: the request
     // commits before responding.  The body's other commit options survive.
     if (url.commit) {
@@ -2648,6 +2653,45 @@ private:
     return true;
   }
 
+  // Parses repeatable, comma-separated ?source_includes / ?source_excludes params.
+  static bool parseSourceFilterParams(const std::vector<UrlParam>& params, UpdateUrlParams& out,
+                                      std::string& err) {
+    for (const auto& p : params) {
+      auto* target = p.key == "source_includes" ? &out.sourceIncludes
+                   : p.key == "source_excludes" ? &out.sourceExcludes : nullptr;
+      if (!target) continue;
+      std::string_view rest = p.value;
+      for (;;) {
+        auto comma = rest.find(',');
+        std::string_view pattern = rest.substr(0, comma);
+        if (pattern.empty()) {
+          err = p.key + " must not hold an empty pattern";
+          return false;
+        }
+        target->emplace_back(pattern);
+        if (comma == std::string_view::npos) break;
+        rest = rest.substr(comma + 1);
+      }
+    }
+    if (!out.sourceIncludes.empty() && !out.sourceExcludes.empty()) {
+      err = "source_includes and source_excludes are mutually exclusive";
+      return false;
+    }
+    return true;
+  }
+
+  // The URL's source paths apply to a request that sets neither list itself.
+  static void applyUrlSourceFilter(luxir::api::UpdateRequest& proto, const UpdateUrlParams& url,
+                                   std::pmr::memory_resource& resource) {
+    if (!proto.source_includes.empty() || !proto.source_excludes.empty()) return;
+    auto copy = [&](std::span<const std::string_view>& target, const std::vector<std::string>& patterns) {
+      auto* a = luxir::api::build::allocArray(target, patterns.size(), resource);
+      for (std::size_t i = 0; i < patterns.size(); i++) a[i] = luxir::api::build::arenaStr(resource, patterns[i]);
+    };
+    copy(proto.source_includes, url.sourceIncludes);
+    copy(proto.source_excludes, url.sourceExcludes);
+  }
+
   static bool parseCommitParam(const std::vector<UrlParam>& params, bool& out,
                                std::string& err) {
     if (const std::string* value = findParam(params, "commit")) {
@@ -2676,6 +2720,7 @@ private:
     if (!out.waitForReplicas.empty() && !findParam(params, "commit")) { err = "wait_for_replicas requires commit=true"; return false; }
     return parseCommitParam(params, out.commit, err) &&
            parseFieldMapParams(params, out.fieldMap, err) &&
+           parseSourceFilterParams(params, out, err) &&
            parseBoolParam(params, "drop_unmapped", out.dropUnmapped, err);
   }
 
@@ -2698,7 +2743,8 @@ private:
       if (name == "request_id" || name == "commit") continue;
       if (name == "collection" || name == "allow_dups" || name == "all_or_none" ||
           name == "return_ids" || name == "docs" || name == "delete_ids" ||
-          name == "field_map" || name == "drop_unmapped") {
+          name == "field_map" || name == "drop_unmapped" || name == "source_includes" ||
+          name == "source_excludes") {
         err = "_end_ control cannot carry submit-time field '" + std::string(name) + "'";
         return false;
       }
@@ -2714,7 +2760,7 @@ private:
       if (name == "collection" || name == "allow_dups" || name == "all_or_none" ||
           name == "return_ids" || name == "request_id" || name == "commit" ||
           name == "docs" || name == "delete_ids" || name == "field_map" ||
-          name == "drop_unmapped") {
+          name == "drop_unmapped" || name == "source_includes" || name == "source_excludes") {
         continue;
       }
       err = "unsupported _update_ control field '" + std::string(name) + "'";
@@ -3204,6 +3250,11 @@ private:
     state->batch->proto.allow_dups = state->group.allowDups();
     state->batch->proto.all_or_none = state->group.allOrNone();
     applyStreamBatchFieldMap(*state, *state->batch);
+    if (state->group.request) {  // views into the group's arena, kept alive by requestOwner
+      state->batch->proto.source_includes = state->group.request->proto.source_includes;
+      state->batch->proto.source_excludes = state->group.request->proto.source_excludes;
+    }
+    applyUrlSourceFilter(state->batch->proto, state->url, state->batch->resource);
     state->batch->proto.request_id =
         luxir::api::build::arenaStr(state->batch->resource, state->group.requestId);
     // Once the folded prefix reaches the retention cap, later slices can skip
@@ -3243,6 +3294,7 @@ private:
     state->batch->proto.allow_dups = state->group.allowDups();
     state->batch->proto.all_or_none = state->group.allOrNone();
     applyStreamBatchFieldMap(*state, *state->batch);
+    applyUrlSourceFilter(state->batch->proto, state->url, state->batch->resource);
     state->batch->proto.return_ids =
         state->group.returnIds() && state->interval.ids.size() < HttpStreamUpdateState::kMaxRetainedIds;
     if (state->batch->proto.collection.empty()) {

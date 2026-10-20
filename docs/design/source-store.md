@@ -55,10 +55,16 @@ spelling survive. A transport retains those bytes only for a collection whose
 schema (or, for a new collection, the node default) stores sources; anything else
 is serialized as a `Map`. The version is the update version the writer assigned.
 
+Source includes/excludes (`SourceDef.includes` / `excludes`, overridden per
+request by `UpdateRequest.source_includes` / `source_excludes`) narrow the body
+before it is written, and nothing else: the document is indexed in full.
+`source::SourceFilter` filters the minified bytes without building a value tree
+(kept values are copied byte for byte) and a `Map` by sharing its kept values.
+
 ## Settings
 
 `SchemaDef.source`: `enabled`, `codec` (`zstd`, `none`), `zstd_level`,
-`block_size_bytes`, `min_live_ratio`, `min_file_bytes`. A new collection whose
+`block_size_bytes`, `min_live_ratio`, `min_file_bytes`, `includes`, `excludes`. A new collection whose
 schema does not say takes `--indexing.source-default` (default off); the choice
 is written into the schema, so changing the node setting never alters an
 existing collection. Enabling applies to documents indexed afterwards.

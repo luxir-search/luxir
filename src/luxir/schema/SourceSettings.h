@@ -6,12 +6,14 @@
 #include <cstdint>
 
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/source/SourceFilter.h"
 #include "luxir/source/SourceFormat.h"
 
 namespace luxir {
 
-// A collection's resolved SchemaDef.source: whether documents keep their source
-// and how the source files are written and compacted.
+// A collection's resolved SchemaDef.source: whether documents keep their source,
+// which of their paths it keeps, and how the source files are written and
+// compacted.
 struct SourceSettings {
   bool enabled = false;
   source::Codec codec = source::Codec::ZSTD;
@@ -19,6 +21,7 @@ struct SourceSettings {
   uint32_t blockBytes = 16384;
   double minLiveRatio = 0.5;
   uint64_t minFileBytes = 4ULL * 1024 * 1024;
+  source::SourceFilter filter;  // empty keeps whole documents; an update request may override it
 
   // Applies defaults and validates; throws SchemaError on a bad value.
   static SourceSettings resolve(const api::SourceDef& def);

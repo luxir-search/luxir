@@ -7,6 +7,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 
 #include "luxir/server/HttpServer.h"
@@ -160,6 +161,41 @@ TEST_F(SourceStoreTest, replacingTheSchemaKeepsTheStoreAndEnablingLaterSkipsOlde
   post(server, "/collections/r/_update", R"({"docs":[],"commit":{"max_segments":1,"wait_for_merges":true}})");
   // The doc indexed before the store was on has no line to export.
   EXPECT_EQ(R"({"id":"new"})" "\n", sources(server, "r", true));
+  server.shutdown();
+}
+
+TEST_F(SourceStoreTest, includesAndExcludesNarrowTheSourceButNotTheIndex) {
+  LuxirNode node(config());
+  HttpServer server(node, 2, 0);
+  server.start();
+  post(server, "/collections/_create",
+       R"({"name":"f","schema":{"source":{"enabled":true,"excludes":["secret_s","pw*"]}}})");
+  post(server, "/collections/f/_update?commit=true",
+       R"({"docs":[{"id":"1","secret_s":"k","name_s":"n","pw_s":"p"}]})");
+  // A request's own list replaces the collection's, in the body or the URL (NDJSON too).
+  post(server, "/collections/f/_update?commit=true",
+       R"({"docs":[{"id":"2","secret_s":"k","title_s":"t"}],"source_includes":["id","title_s"]})");
+  // An NDJSON _update_ group's list wins over the URL's.
+  post(server, "/collections/f/_update?commit=true&source_excludes=title_s",
+       R"({"id":"3","secret_s":"k","title_s":"t"})" "\n"
+       R"({"_update_":{"source_includes":["id"]}})" "\n" R"({"id":"4","title_s":"t"})" "\n"
+       R"({"_end_":{}})" "\n", "application/x-ndjson");
+  EXPECT_EQ(R"({"id":"1","name_s":"n"})" "\n" R"({"id":"2","title_s":"t"})" "\n"
+            R"({"id":"3","secret_s":"k"})" "\n" R"({"id":"4"})" "\n", sources(server, "f", true));
+  // The dropped field is still indexed.
+  auto hits = post(server, "/collections/f/_search?format=docs",
+                   R"({"query":{"match":{"secret_s":"k"}},"fields":["id"],"limit":-1})");
+  EXPECT_EQ(3, std::ranges::count(hits, '\n')) << hits;
+
+  auto both = httpRequest(server.getPort(), http::verb::post,
+                          "/collections/f/_update?source_includes=a&source_excludes=b", R"({"docs":[]})");
+  EXPECT_EQ(400, both.result_int()) << both.body();
+  auto bodyBoth = httpRequest(server.getPort(), http::verb::post, "/collections/f/_update",
+                              R"({"docs":[{"id":"5"}],"source_includes":["a"],"source_excludes":["b"]})");
+  EXPECT_NE(bodyBoth.body().find("mutually exclusive"), std::string::npos) << bodyBoth.body();
+  auto schemaBoth = httpRequest(server.getPort(), http::verb::post, "/collections/_create",
+                                R"({"name":"g","schema":{"source":{"enabled":true,"includes":["a"],"excludes":["b"]}}})");
+  EXPECT_EQ(400, schemaBoth.result_int()) << schemaBoth.body();
   server.shutdown();
 }
 

@@ -7,11 +7,14 @@
 #include "CommitWaits.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/source/SourceFilter.h"
 #include "luxir/source/SourceJson.h"
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <memory_resource>
 #include <new>
 #include <optional>
+#include <stdexcept>
 #include <variant>
 
 namespace luxir {
@@ -101,10 +104,23 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 
   // Collections that store their source keep each document as it was submitted:
   // the JSON bytes the transport retained, else the document as a serialized Map.
+  // Source includes/excludes (the request's, else the collection's) narrow it.
   const bool keepSource = inverter.schema->source.enabled;
   const bool rawAligned = msg.rawDocs.size() == request.docs.size();
+  std::optional<source::SourceFilter> requestFilter;
+  if (!request.source_includes.empty() || !request.source_excludes.empty()) {
+    try {
+      requestFilter.emplace(request.source_includes, request.source_excludes);
+    } catch (const std::invalid_argument& e) {
+      throw RequestError(e.what());
+    }
+  }
+  const source::SourceFilter* sourceFilter = requestFilter ? &*requestFilter : &inverter.schema->source.filter;
+  if (sourceFilter->empty()) sourceFilter = nullptr;
   std::string sourceJson;
+  std::string filteredJson;
   std::vector<std::byte> sourceMap;
+  std::pmr::monotonic_buffer_resource filterArena;
 
   int32_t failed = 0;
   int32_t docIndex = -1;
@@ -122,14 +138,29 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       if (keepSource) {
         uint8_t flags = request.allow_dups ? source::kFlagAllowDups : 0;
         std::string_view body;
-        if (rawAligned) {
+        bool asJson = rawAligned;
+        if (asJson) {
           sourceJson.clear();
           source::minifyJson(msg.rawDocs[(size_t)docIndex], sourceJson);
           body = sourceJson;
+          if (sourceFilter) {
+            filteredJson.clear();
+            asJson = sourceFilter->filterJson(sourceJson, filteredJson);
+            body = filteredJson;
+          }
+        }
+        if (asJson) {
           flags |= source::kFlagMinifiedJson;
         } else {
+          const luxir::api::Map* kept = &doc;
+          luxir::api::Map filtered;
+          if (sourceFilter) {
+            filterArena.release();
+            filtered = sourceFilter->filterMap(doc, filterArena);
+            kept = &filtered;
+          }
           sourceMap.clear();
-          if (!luxir::api::encode(doc, sourceMap)) throw std::runtime_error("failed to serialize document source");
+          if (!luxir::api::encode(*kept, sourceMap)) throw std::runtime_error("failed to serialize document source");
           body = std::string_view((const char*)sourceMap.data(), sourceMap.size());
           flags |= source::kFlagProtoMap;
         }

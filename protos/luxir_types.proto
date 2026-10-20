@@ -1025,6 +1025,12 @@ message UpdateRequest {
   // If true, doc keys not present in field_map are dropped instead of indexed.
   // Requires a non-empty field_map (note "id" is dropped too unless mapped).
   bool drop_unmapped = 12;
+
+  // Override the collection's source includes/excludes (SourceDef) for this
+  // request's docs: setting either replaces both. At most one of the two, with
+  // the same path syntax. Ignored by a collection that does not store sources.
+  repeated string source_includes = 13;
+  repeated string source_excludes = 14;
 }
 
 // The response to an update request.  In streaming mode the server sends exactly one
@@ -2231,6 +2237,17 @@ message SourceDef {
   // A merge also rewrites a source file smaller than this, even when fully
   // live, so small files fold together. 0 or more; absent selects 4194304.
   optional int64 min_file_bytes = 6;
+
+  // Keep only these paths of each document's source (includes) or all but
+  // these (excludes); at most one of the two. The document is still indexed in
+  // full. A path joins object keys with '.' ("user.name") and reaches into
+  // arrays of objects without an index step; '*' in a pattern matches any run
+  // of characters, dots included. A matching path keeps or drops its whole
+  // value; with includes, an object or array left with nothing is dropped too.
+  // Paths name the keys as submitted, before field_map. An update request can
+  // override them for its own documents (UpdateRequest.source_includes).
+  repeated string includes = 7;
+  repeated string excludes = 8;
 }
 
 message SchemaDef {

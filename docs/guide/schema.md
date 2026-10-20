@@ -352,6 +352,8 @@ Every key is optional.
 | `block_size_bytes` | target uncompressed bytes per block, 1024 to 4194304; default 16384. One document larger than this gets a block of its own |
 | `min_live_ratio` | a merge keeps referencing a source file while at least this fraction of its documents is live, and rewrites the live ones otherwise; above 0 up to 1, default 0.5 |
 | `min_file_bytes` | a merge also rewrites a source file smaller than this so small files fold together; default 4194304 |
+| `includes` | keep only these paths of each document's source; see [Documents](documents.md#keeping-only-part-of-the-source) |
+| `excludes` | keep all but these paths; at most one of `includes` and `excludes` |
 
 A `source` object in a schema update replaces the whole setting: keys it omits return to their defaults. Turning the store off stops capture for new documents; the next merge of a segment then drops that segment's sources and their files.
 

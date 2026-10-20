@@ -295,6 +295,30 @@ POST /collections/articles/_search?format=docs&source=true
 {"query": {"all": true}, "fields": ["_source"], "limit": -1}
 ```
 
+#### Keeping only part of the source
+
+`source.includes` keeps only the listed paths of each document's source;
+`source.excludes` keeps everything but them. Set at most one. The document is
+still indexed in full: only the stored copy loses the paths.
+
+```
+POST /collections/_create
+{"name": "users", "schema": {"source": {"enabled": true, "excludes": ["password_s", "profile.ssn_s"]}}}
+```
+
+A path joins object keys with `.` (`profile.ssn_s`) and names the keys as
+submitted, before `field_map`. Arrays add no step: `items.price_d` reaches the
+objects inside `items`. `*` matches any run of characters, dots included
+(`*_secret`, `profile.*`). A matching path keeps (includes) or drops (excludes)
+its whole value; with includes, an object or array left with nothing is dropped
+too.
+
+One update request can override the collection's lists for its own documents,
+in the body (`"source_includes": [...]` or `"source_excludes": [...]`) or the
+URL (`?source_includes=id,title_t`, comma separated, repeatable), or an NDJSON
+`_update_` group (which wins over the URL). Setting either replaces both of the collection's
+lists. A collection that does not store sources ignores them.
+
 Source files are separate from the index, are never read by a search, and are
 copied by merges only when mostly deleted or small. See
 [the design](../design/source-store.md) and the `source` settings in
