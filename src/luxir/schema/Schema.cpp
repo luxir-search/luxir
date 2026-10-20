@@ -510,7 +510,8 @@ struct FieldCompiler {
     // Reject index modes the engine cannot honor. RANGE covers 1-D numeric
     // ranges and 2-D GEO_POINT boxes; both require a column in this phase.
     bool numericClass = r.type == FieldClass::INT || r.type == FieldClass::FLOAT ||
-                        r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE;
+                        r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE ||
+                        r.type == FieldClass::LOCAL_DATE;
     bool geoClass = r.type == FieldClass::GEO_POINT;
     if (index == IndexMode::RANGE) {
       if (!numericClass && !geoClass) {
@@ -607,6 +608,9 @@ struct FieldCompiler {
         break;
       case FieldClass::DATE:
         ft = std::make_shared<DateFieldType>(name, flags);
+        break;
+      case FieldClass::LOCAL_DATE:
+        ft = std::make_shared<DateFieldType>(name, flags, true);
         break;
       case FieldClass::GEO_POINT:
         ft = std::make_shared<GeoPointFieldType>(name, flags);
@@ -1148,6 +1152,8 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   add(templates, "_ds", FieldClass::DOUBLE).multi = true;
   add(templates, "_dt", FieldClass::DATE);
   add(templates, "_dts", FieldClass::DATE).multi = true;
+  add(templates, "_ld", FieldClass::LOCAL_DATE);
+  add(templates, "_lds", FieldClass::LOCAL_DATE).multi = true;
   // Text suffixes, from raw to folded and stemmed. In the whitespace
   // family a trailing `l` means "plus lowercase"; the unicode family uses `n`
   // for NFKC_CF ("normalize": casefold + compatibility forms + canonical

@@ -461,7 +461,14 @@ private:
     api::Val v;
     v.kind = value;
     try {
-      fieldType.coerceColInt64(v, fieldType.name(), opts.coerceContext);
+      // A local date rejects a time of day at ingest; as a query literal it
+      // is still a date (a window that matches no calendar date), as lowering
+      // builds it.
+      if (DateFieldType::isLocal(fieldType)) {
+        ((DateFieldType&)fieldType).coerceDateRange(v, fieldType.name(), opts.coerceContext);
+      } else {
+        fieldType.coerceColInt64(v, fieldType.name(), opts.coerceContext);
+      }
       return true;
     } catch (const std::exception&) {
       return false;

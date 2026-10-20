@@ -734,8 +734,11 @@ public:
           + "': mincount must be >= 0");
     }
 
+    // A local date buckets in the UTC civil calendar it is stored in, so
+    // time_zone is ignored and DAY/WEEK gaps stay affine.
     TimeZone zone = TimeZone::utc();
-    if (fieldType->type() == FieldType::Type::DATE) {
+    if (fieldType->type() == FieldType::Type::DATE
+        && !DateFieldType::isLocal(*fieldType)) {
       if (facetReq.time_zone.empty()) {
         if (!req.timeZone) {
           throw std::runtime_error(req.timeZoneError);
