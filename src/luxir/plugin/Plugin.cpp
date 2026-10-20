@@ -43,9 +43,12 @@ const QueryRegistry& globalQueryRegistry() { return Registries::global().query; 
 
 const SearchOpRegistry& globalSearchOpRegistry() { return Registries::global().searchOps; }
 
+const StorageRegistry& globalStorageRegistry() { return Registries::global().storage; }
+
 void Registries::freeze() {
   plugins.freeze();
   analysis.freeze();
+  storage.freeze();  // storage backends and layers
   query.freeze();
   searchOps.freeze();
   http.freeze();
@@ -65,6 +68,7 @@ void initPlugins(void (*addPlugins)(PluginRegistry&)) {
   std::call_once(once, [addPlugins] {
     Registries& r = Registries::global();
     registerBuiltinAnalysis(r.analysis);
+    registerBuiltinStorage(r.storage);  // storage: ram, fs
     addPlugins(r.plugins);
     std::string names;
     for (const auto& p : r.plugins.plugins()) {

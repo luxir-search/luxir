@@ -37,6 +37,23 @@ Use [`luxir pull`](replication.md#copy-restore-or-promote) for an online copy,
 then `luxir promote` to restore it as a writer under new collection incarnations.
 Do not restore a raw directory copy over an existing writer identity.
 
+### Backends, layers and options
+
+`--store.backend` names the storage backend: `ram` and `fs` are built in, and a
+plugin build may add more (an unknown name fails startup with the list of
+registered ones). `--store.layer NAME` (repeatable, innermost first) wraps the
+backend in layers a plugin provides, such as a cache. `--store.option KEY=VALUE`
+(repeatable) passes free-form settings to the backend and layers; the plugin
+documents its keys.
+
+```bash
+./luxir --store.backend=s3 --store.option bucket=search-data --store.layer=cache
+```
+
+Luxir's own `--store.checked-dir.sync` and `--read-only` wrappers always sit
+outside the layers. The effective stack is logged at startup as
+`storage: ...`. See [plugins](../dev/plugins.md#storage-backends-and-layers).
+
 ## Read-only nodes
 
 A data directory has exactly one writer, which holds `write.lock` from startup

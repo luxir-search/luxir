@@ -127,7 +127,13 @@ locations, browse `src/luxir/<area>/`.
    - `CorruptionMarker`: `corrupted_<id>` files naming suspect index files, re-verified at open
    - `DirectoryFactory`: storage backends (`RAMDirFactory`, `FSDirFactory`) and wrappers
      (`CheckedDirFactory`, `ReadOnlyDirFactory`); `CollectionStorage` is a collection's
-     handle: CURRENT selects one of its incarnation directories
+     handle: CURRENT selects one of its incarnation directories. Also `nodeDirectory()`
+     (node-level metadata), `holdsNoCollections()` and `describe()`
+   - `StorageRegistry` (`StorageRegistry.h`): named backends and layers resolved by `Collections`
+     from `store.backend` / `store.layers`; `DelegatingDirectory` / `DelegatingDirFactory` forward
+     everything, so a layer overrides only what it changes (Checked and ReadOnly are built on them);
+     `Directory::capabilities()` (`HARD_LINK`, `ATOMIC_RENAME`, `DURABLE_SYNC`, `MEMORY_MAPPED`,
+     `REMOTE`) lets callers fall back (`reuseFiles` copies when links are unavailable)
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)

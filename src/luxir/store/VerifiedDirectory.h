@@ -43,6 +43,7 @@ public:
   void clear() override { delegate.clear(); }
   Directory& underlying() override { return delegate.underlying(); }
   void linkFile(Directory& source, std::string_view name) override { delegate.linkFile(source, name); }
+  Capabilities capabilities() const override { return delegate.capabilities(); }
 };
 
 }

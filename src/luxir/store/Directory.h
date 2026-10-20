@@ -67,6 +67,18 @@ public:
     uint64_t size = 0;
   };
 
+  // What a backend can do beyond the bare interface. Callers that can fall back
+  // (reuseFiles) check a flag instead of assuming the strongest behavior.
+  using Capabilities = uint32_t;
+  static constexpr Capabilities HARD_LINK = 1u << 0;       // linkFile shares bytes instead of copying
+  static constexpr Capabilities ATOMIC_RENAME = 1u << 1;   // renameFile replaces the target atomically
+  static constexpr Capabilities DURABLE_SYNC = 1u << 2;    // sync() makes the files crash-safe (fsync)
+  static constexpr Capabilities MEMORY_MAPPED = 1u << 3;   // openFile returns stable mapped bytes
+  static constexpr Capabilities REMOTE = 1u << 4;          // bytes may be fetched over a network
+
+  // Unknown backends claim nothing, which selects the conservative fallbacks.
+  virtual Capabilities capabilities() const { return 0; }
+
   // TODO: add a prefix option?
   // Appends; the appended range is sorted by name.  Sizes are a best-effort
   // snapshot and entries vanishing mid-scan are skipped, never thrown.
@@ -137,6 +149,22 @@ public:
   // Install an immutable file without copying its bytes (same storage backend).
   virtual void linkFile(Directory& source, std::string_view name) = 0;
 
+  // Installs a copy of `source`'s file `name` under the same name. The fallback
+  // for backends that cannot link; the caller syncs it like any created file.
+  void copyFile(Directory& source, std::string_view name) {
+    auto input = source.openFile(name, true);
+    if (!input) throw std::runtime_error("copy source missing: " + std::string(name));
+    auto data = input->read();
+    auto file = createFile(name);
+    OutputStream out(file.get());
+    constexpr size_t kChunk = 1 << 20;
+    for (size_t offset = 0; offset < data.size(); offset += kChunk) {
+      out.write(data.data() + offset, std::min(kChunk, data.size() - offset));
+    }
+    out.close();
+    finishFile(*file);
+  }
+
   // Only descriptors from a published snapshot authorize reuse; filenames alone
   // are not identities across collection incarnations. A hard link cannot
   // change bytes, so this compares descriptors only: whether the source bytes
@@ -153,7 +181,8 @@ public:
       bool present = true;
       try { present = openFile(file.name) != nullptr; } catch (const std::exception&) {}
       if (present) continue;
-      linkFile(source, file.name);
+      if (capabilities() & HARD_LINK) linkFile(source, file.name);
+      else copyFile(source, file.name);
       reused.push_back(file);
     }
     return reused;
@@ -192,6 +221,8 @@ private:
 
 public:
   explicit RAMDir(std::shared_ptr<StorageMemory> memory = std::make_shared<StorageMemory>()) : memory(std::move(memory)) {}
+  // linkFile shares the immutable buffer; renames happen under the lock.
+  Capabilities capabilities() const override { return HARD_LINK | ATOMIC_RENAME | MEMORY_MAPPED; }
   uint64_t storageBytes() const { return memory->bytes(); }
 
   // Only used by tests to clear (e.g. dir = RAMDir())
