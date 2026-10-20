@@ -76,6 +76,23 @@ public:
 
   const DfaScanPlan& getScanPlan() const { return scanPlan; }
 
+  // Whether `term` is in the pattern's language (a byte-wise DFA run).
+  bool accepts(std::string_view term) const {
+    switch (classification) {
+      case automaton::ByteDfaKind::SINGLE: return term == exactOrPrefix;
+      case automaton::ByteDfaKind::PREFIX:
+      case automaton::ByteDfaKind::ALL: return term.starts_with(exactOrPrefix);
+      case automaton::ByteDfaKind::NORMAL: break;
+      case automaton::ByteDfaKind::NONE: return false;
+    }
+    auto state = dfa.start();
+    for (char c : term) {
+      state = dfa.step(state, (uint8_t)c);
+      if (!dfa.canMatch(state)) return false;
+    }
+    return dfa.isMatch(state);
+  }
+
 protected:
   void validateLogicalImpl(PlanningContext& context, float multiplier) const override {
     checkedBoostProduct(multiplier, 1.0f);

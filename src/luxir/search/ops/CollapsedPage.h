@@ -9,6 +9,8 @@
 
 namespace luxir {
 
+struct HighlightPlan;
+
 // A ranked list supplies its finalized membership and original scores. The
 // source and eligibility handles live through synchronous page execution;
 // response columns and ranked storage remain pinned through streaming.
@@ -31,6 +33,7 @@ struct CollapsedPageSettings {
   bool alwaysRank = false;
   void (*releaseSegment)(SearchOp&, IndexReader::Segment&) = nullptr;
   void (*releaseMembers)(SearchOp::Calculator&) = nullptr;
+  const HighlightPlan* highlight = nullptr;
 };
 
 void emitCollapsedPage(const CollapsedPageSettings& settings,

@@ -1166,6 +1166,8 @@ struct from<JSON, luxir::api::TopDocs> {
             readSortList<O>(sort, ctx, vit, vend);
           } else if (key == "diversify") {
             util::from_json<O>(value.diversify, ctx, vit, vend);
+          } else if (key == "highlight") {
+            util::from_json<O>(value.highlight, ctx, vit, vend);
           } else if (key == "collapse") {
             util::from_json<O>(value.collapse, ctx, vit, vend);
           } else if (key == "batch_size") {
@@ -1226,6 +1228,8 @@ struct from<JSON, luxir::api::Fusion> {
             glz::util::parse_repeated<O>(true, weights, ctx, vit, vend);
           } else if (key == "collapse") {
             util::from_json<O>(value.collapse, ctx, vit, vend);
+          } else if (key == "highlight") {
+            util::from_json<O>(value.highlight, ctx, vit, vend);
           } else if (key == "rrf" || key == "linear") {
             // one method arm: a second one is an error (proto3 canonical
             // JSON), not a silent last-wins
@@ -1457,6 +1461,10 @@ struct from<JSON, luxir::api::SearchRequest> {
             auto &topDocs = shorthand();
             topDocs.diversify.reset();
             util::from_json<O>(topDocs.diversify, ctx, vit, vend);
+          } else if (key == "highlight") {
+            auto &topDocs = shorthand();
+            topDocs.highlight.reset();
+            util::from_json<O>(topDocs.highlight, ctx, vit, vend);
           } else if (key == "collapse") {
             auto &topDocs = shorthand();
             topDocs.collapse.reset();

@@ -129,6 +129,7 @@ defaults and constraints are described in the comments and guides.
 - [`GroupComponent`](#message-luxir.groupcomponent)
 - [`GroupKey`](#message-luxir.groupkey)
 - [`GroupTable`](#message-luxir.grouptable)
+- [`Highlight`](#message-luxir.highlight)
 - [`HistogramStats`](#message-luxir.histogramstats)
 - [`HostCpuStats`](#message-luxir.hostcpustats)
 - [`HostMemoryStats`](#message-luxir.hostmemorystats)
@@ -869,6 +870,7 @@ A batch of returned documents. Document i is the merge of columns row i and docs
 | <a id="field-luxir.doclist.offset"></a>[`offset`](#field-luxir.doclist.offset) | 4 | `int64` | singular |  |
 | <a id="field-luxir.doclist.ops"></a>[`ops`](#field-luxir.doclist.ops) | 14 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | sub-operation results performed on the TopDocs query. |
 | <a id="field-luxir.doclist.more"></a>[`more`](#field-luxir.doclist.more) | 15 | `bool` | singular | true if this document list has more batches; see SearchResponse.more |
+| <a id="field-luxir.doclist.highlight"></a>[`highlight`](#field-luxir.doclist.highlight) | 25 | [`Map`](#message-luxir.map) | repeated | With TopDocs/Fusion highlight: row\_count entries aligned with the rows. highlight\[i\].fields maps a highlighted field to its fragments (arr\_s); a field without a match is absent. |
 
 <a id="message-luxir.domain"></a>
 
@@ -1158,6 +1160,7 @@ Required fusion method: exactly one.
 | <a id="field-luxir.fusion.collapse"></a>[`collapse`](#field-luxir.fusion.collapse) | 17 | [`Collapse`](#message-luxir.collapse) | singular | Collapse the fused document list before paging. Source windows never refill. found counts eligible groups; found\_docs counts eligible fused documents. |
 | <a id="field-luxir.fusion.ops"></a>[`ops`](#field-luxir.fusion.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Runs over the union of filtered source ranked lists, even with collapse. Fusion limit and offset do not affect this candidate domain. |
 | <a id="field-luxir.fusion.weights"></a>[`weights`](#field-luxir.fusion.weights) | 16 | map&lt;`string`, `double`&gt; | map | Per-source weights keyed by source name, used by the fusion method. A source without an entry has weight 1. Weights must be finite, &gt;= 0, and within float range, every key must name a source, and at least one source must have a weight &gt; 0. A zero weight disables its source: it is not executed and its documents do not enter the fused list, found, or the ops domain. |
+| <a id="field-luxir.fusion.highlight"></a>[`highlight`](#field-luxir.fusion.highlight) | 27 | [`Highlight`](#message-luxir.highlight) | singular | Highlights the fused rows with the terms of every executed source query. |
 
 <a id="message-luxir.fuzzyquery"></a>
 
@@ -1250,6 +1253,24 @@ Columns aligned with a collapsed list's returned rows. Absent columns were not r
 | <a id="field-luxir.grouptable.counts"></a>[`counts`](#field-luxir.grouptable.counts) | 2 | `sint64` | repeated |  |
 | <a id="field-luxir.grouptable.ranks"></a>[`ranks`](#field-luxir.grouptable.ranks) | 3 | [`ArrVal`](#message-luxir.arrval) | repeated | Metric sort values, or list rank values when head\_sort chooses another member. |
 | <a id="field-luxir.grouptable.ops"></a>[`ops`](#field-luxir.grouptable.ops) | 4 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Each operation is an array aligned with keys, as in FacetResult.ops. |
+
+<a id="message-luxir.highlight"></a>
+
+### luxir.Highlight
+
+Search-result highlighting: mark the query's matches in stored text and return the best fragments per field (DocList.highlight). The stored value is re-analyzed at query time with each queried representation's analyzer; no index structure is needed. Only the returned page is highlighted.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.highlight.fields"></a>[`fields`](#field-luxir.highlight.fields) | 1 | `string` | repeated | Logical fields to highlight. Each must keep stored source text (TEXT, or STRING with stored). A name containing '\*' is a pattern over the logical fields the query targets; it skips fields without stored text. |
+| <a id="field-luxir.highlight.pre_tag"></a>[`pre_tag`](#field-luxir.highlight.pre_tag) | 2 | `string` | optional | unset: "&lt;em&gt;" |
+| <a id="field-luxir.highlight.post_tag"></a>[`post_tag`](#field-luxir.highlight.post_tag) | 3 | `string` | optional | unset: "&lt;/em&gt;" |
+| <a id="field-luxir.highlight.fragment_size"></a>[`fragment_size`](#field-luxir.highlight.fragment_size) | 4 | `int32` | optional | Approximate fragment length in bytes; unset: 100. Fragments snap to whitespace and UTF-8 boundaries and grow to keep a match whole. |
+| <a id="field-luxir.highlight.number_of_fragments"></a>[`number_of_fragments`](#field-luxir.highlight.number_of_fragments) | 5 | `int32` | optional | Maximum fragments per field; unset: 5. 0 returns each matching value whole, ignoring fragment\_size. |
+| <a id="field-luxir.highlight.encoder"></a>[`encoder`](#field-luxir.highlight.encoder) | 6 | [`Highlight.Encoder`](#enum-luxir.highlight.encoder) | singular |  |
+| <a id="field-luxir.highlight.max_analyzed_offset"></a>[`max_analyzed_offset`](#field-luxir.highlight.max_analyzed_offset) | 7 | `int32` | optional | Bytes of each stored value analyzed for matches; unset: 1000000. Matches past it are not marked. |
 
 <a id="message-luxir.histogramstats"></a>
 
@@ -2307,6 +2328,7 @@ TCP counters for this network namespace (/proc/net/snmp).
 | <a id="field-luxir.topdocs.collapse"></a>[`collapse`](#field-luxir.topdocs.collapse) | 11 | [`Collapse`](#message-luxir.collapse) | singular | limit, offset and found count groups; found\_docs counts eligible documents. |
 | <a id="field-luxir.topdocs.min_score"></a>[`min_score`](#field-luxir.topdocs.min_score) | 14 | `float` | optional | Minimum score cut-off. When set, documents whose query score is below this value do not match: they are excluded from the returned documents, from the get\_number count, and from the domain of ops (facets and metrics). The score compared is the query's own relevance score (filters do not score), computed even when the request sorts by fields or does not return scores. Must be finite. As a Fusion source, the cut-off applies to that source's ranked list. |
 | <a id="field-luxir.topdocs.ops"></a>[`ops`](#field-luxir.topdocs.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed over docs that match this query. |
+| <a id="field-luxir.topdocs.highlight"></a>[`highlight`](#field-luxir.topdocs.highlight) | 25 | [`Highlight`](#message-luxir.highlight) | singular | ignored as a Fusion source; set Fusion.highlight |
 
 <a id="message-luxir.transportstats"></a>
 
@@ -2501,6 +2523,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
 - [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit)
 - [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
+- [`Highlight.Encoder`](#enum-luxir.highlight.encoder)
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
 - [`Match.Operator`](#enum-luxir.match.operator)
 - [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds)
@@ -2643,6 +2666,17 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.groupcomponent.type.id"></a>[`ID`](#value-luxir.groupcomponent.type.id) | 1 |  |
 | <a id="value-luxir.groupcomponent.type.int"></a>[`INT`](#value-luxir.groupcomponent.type.int) | 2 |  |
 | <a id="value-luxir.groupcomponent.type.date"></a>[`DATE`](#value-luxir.groupcomponent.type.date) | 3 |  |
+
+<a id="enum-luxir.highlight.encoder"></a>
+
+### luxir.Highlight.Encoder
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.highlight.encoder.default"></a>[`DEFAULT`](#value-luxir.highlight.encoder.default) | 0 | text is copied as stored |
+| <a id="value-luxir.highlight.encoder.html"></a>[`HTML`](#value-luxir.highlight.encoder.html) | 1 | text (not the tags) is HTML-escaped |
 
 <a id="enum-luxir.linearfusion.normalization"></a>
 

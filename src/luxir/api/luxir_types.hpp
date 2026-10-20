@@ -62,7 +62,7 @@ enum class NullValue { NULL_VALUE = 0 };
 namespace luxir::api {
 
 // ---- forward declarations (all messages) ----
-struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
+struct SearchRequest; struct SearchOp; struct ExprOp; struct Highlight; struct TopDocs;
 struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struct GroupTable;
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
@@ -103,6 +103,7 @@ enum class Kind {
 };
 }
 namespace LinearFusion_ { enum class Normalization { MIN_MAX = 0 }; }
+namespace Highlight_ { enum class Encoder { DEFAULT = 0, HTML = 1 }; }
 namespace Collapse_ { enum class MissingPolicy { EXPAND = 0, GROUP = 1, DROP = 2 }; }
 namespace FieldFacet_ { enum class CountUnit { DOCS = 0, GROUPS = 1 }; }
 namespace RangeFacet_ { enum class Bounds { EXPLICIT = 0, DATA = 1 }; }
@@ -845,6 +846,16 @@ struct Diversify {
   Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
   std::optional<int64_t> max_per_key;
 };
+struct Highlight {
+  using Encoder = luxir::api::Highlight_::Encoder;
+  std::span<const std::string_view> fields;
+  std::optional<std::string_view> pre_tag;
+  std::optional<std::string_view> post_tag;
+  std::optional<int32_t> fragment_size;
+  std::optional<int32_t> number_of_fragments;
+  std::optional<int32_t> max_analyzed_offset;
+  Encoder encoder = Encoder::DEFAULT;
+};
 struct TopDocs {                                                 // all indirect/span/opt-scalar
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const Filter> filter;
@@ -857,6 +868,7 @@ struct TopDocs {                                                 // all indirect
   int32_t batch_size = 0;
   ::hpp_proto::optional_indirect_view<Collapse> collapse;
   ::hpp_proto::optional_indirect_view<Diversify> diversify;
+  ::hpp_proto::optional_indirect_view<Highlight> highlight;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_number = false;
   bool get_scores = false;
@@ -870,6 +882,7 @@ struct Fusion {                                                  // needs TopDoc
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   map_view<std::string_view, double> weights;
   ::hpp_proto::optional_indirect_view<Collapse> collapse;
+  ::hpp_proto::optional_indirect_view<Highlight> highlight;
   std::variant<std::monostate, RrfFusion, LinearFusion> method;  // align 4
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
@@ -949,6 +962,8 @@ struct DocList {                                                // needs Column 
   // Per-document field maps: docs[i] holds document i's fields not in
   // columns (row_count entries when present).  See the .proto contract.
   std::span<const Map> docs;
+  // highlight[i] maps a highlighted field to document i's fragments.
+  std::span<const Map> highlight;
   int64_t offset = 0;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
   int32_t row_count = 0;                                       // align 4
@@ -1106,7 +1121,7 @@ struct UpdateRequest {                                         // needs CommitPa
 
 // ===================== trivial-destructibility checks =====================
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
-LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
+LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(Highlight) LUXIR_TD(TopDocs)
 LUXIR_TD(Diversify) LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey) LUXIR_TD(GroupTable)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
@@ -1151,7 +1166,7 @@ LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) 
                  std::string *error = nullptr);                                              \
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,             \
                   std::string *error = nullptr);
-LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
+LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp) LUXIR_ENTRY(Highlight)
 LUXIR_ENTRY(Diversify) LUXIR_ENTRY(Collapse) LUXIR_ENTRY(GroupComponent)
 LUXIR_ENTRY(GroupKey) LUXIR_ENTRY(GroupTable)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(LinearFusion) LUXIR_ENTRY(SortSpec)

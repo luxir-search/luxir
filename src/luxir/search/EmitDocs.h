@@ -40,6 +40,7 @@
 #include "luxir/reader/StrColReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/search/Collector.h"
+#include "luxir/search/Highlighter.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
@@ -902,6 +903,7 @@ public:
   int64_t numCollected;
   int64_t totalHits;
   DocBatchMetadata metadata;
+  const HighlightPlan* highlight;  // null: no highlighting
   std::span<ReturnField> fields;  // resolved selectors
   int32_t maxBatchSize;
   int64_t offset;
@@ -931,10 +933,10 @@ public:
                  std::span<ReturnField> fields, int32_t maxBatchSize,
                  int64_t offset, bool getNumber, bool getScores,
                  luxir::api::DocFormat placement, bool parallel, size_t colCap,
-                 DocBatchMetadata metadata)
+                 DocBatchMetadata metadata, const HighlightPlan* highlight)
       : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
-        metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
+        metadata(std::move(metadata)), highlight(highlight), fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
         getScores(getScores), placement(placement), parallel(parallel), colCap(colCap),
         batchStart(std::min(offset, numCollected)) {}
 
@@ -1216,6 +1218,15 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       }
     }
 
+    // Highlights are a per-row loader beside the fields: only this page's
+    // hits pay for re-analysis, one task per segment run.
+    if (highlight && columnSize > 0) {
+      luxir::api::Map* highlights = build::allocArray(docListProto.highlight, (size_t)columnSize, mr);
+      addFieldLoader(pendingLoaders, runs, [this, segDocs, highlights, &mr](std::span<RowIndex> idxSpan) {
+        highlightRows(req, *highlight, segDocs, idxSpan, highlights, mr);
+      });
+    }
+
     bool scoreRows = returnScores && placement == luxir::api::DocFormat::ROWS;
     if (returnScores && !scoreRows) {
       auto& scoresProto = build::columnSlot(docListProto.columns, colCap, "_score_", mr);
@@ -1443,7 +1454,8 @@ void emitDocsResponse(SearchRequest& req,
                       bool getScores,
                       luxir::api::DocFormat docFormat,
                       DocEmission emission,
-                      DocBatchMetadata metadata = {})
+                      DocBatchMetadata metadata = {},
+                      const HighlightPlan* highlight = nullptr)
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1489,7 +1501,7 @@ void emitDocsResponse(SearchRequest& req,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
       maxBatchSize, offset, getNumber, getScores, placement,
-      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata));
+      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata), highlight);
   req.streamStarted();
   emitter->produce();
 }

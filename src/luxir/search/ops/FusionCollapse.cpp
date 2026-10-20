@@ -126,6 +126,7 @@ public:
         op.fusionProto.offset, op.fusionProto.get_number, op.fusionProto.get_scores,
         op.fusionProto.document_format, enrich ? members.get() : nullptr,
         fusedDomains, pageGroups, true};
+    settings.highlight = op.highlight;
     emitCollapsedPage(settings, *this, *groups);
   }
 };

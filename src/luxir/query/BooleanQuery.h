@@ -771,6 +771,10 @@ public:
             minShouldMatch(minShouldMatch) {
   }
 
+  std::span<Query* const> getMandatory() const { return mandatory; }
+  std::span<Query* const> getOptional() const { return optional; }
+  std::span<Query* const> getFilter() const { return filter; }
+
   bool recoverableAsPredicate() const noexcept override {
     for (auto clauses : {mandatory, optional, prohibited, filter}) {
       for (auto* clause : clauses) if (!clause->recoverableAsPredicate()) return false;
