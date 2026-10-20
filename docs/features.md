@@ -256,6 +256,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Sorting by column values, query score, value expressions
   (`popularity_i + score * $weight`), and reader order; ascending or
   descending; lexicographic over several keys; `offset` and `limit` paging.
+  Elasticsearch-style `missing` (`_first`, `_last`, or a literal value) and
+  multi-value `mode` (`min`, `max`, `sum`, `avg`, `median`) per sort clause.
 - Field projection: named fields, `*` wildcard patterns, or every retrievable
   field when `fields` is omitted. Row- or column-oriented documents per
   request (`document_format`): HTTP defaults to rows (a missing field is an

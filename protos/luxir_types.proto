@@ -260,12 +260,31 @@ message SortSpec {
   string expr = 1;
   map<string, Val> vars = 2;
 
+  // Where documents without a sort value go: "_last" (the default) or
+  // "_first" under either direction, or a literal of the sort value's type
+  // (a number, a DATE string or epoch millis, or a string for STRING/ID
+  // fields) that such documents sort as.
+  Val missing = 3;
+
   enum SortDir {
     UNKNOWN = 0;
     ASC = 1;
     DESC = 2;
   }
   SortDir dir = 10;
+
+  // Which value of a multi-valued field keys the sort. Unset picks min for
+  // ascending and max for descending. SUM, AVG, and MEDIAN require a numeric
+  // value; SUM also rejects DATE.
+  enum SortMode {
+    MODE_UNSET = 0;
+    MIN = 1;
+    MAX = 2;
+    SUM = 3;
+    AVG = 4;
+    MEDIAN = 5;
+  }
+  SortMode mode = 11;  // value picked from a multi-valued field; unset is min asc, max desc
 }
 
 message Query {

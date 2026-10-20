@@ -106,11 +106,11 @@ TEST_F(ValueExprSortTest, dateScalingDemotesAndFloorSortsEpochDays) {
   EXPECT_EQ((std::vector<std::string>{"day1", "day2"}), ids(*req));
 }
 
-TEST_F(ValueExprSortTest, bareMultiValuedIntSortsByFirstValue) {
-  // Multi-valued numeric columns store per-doc values unsorted, so the bare
-  // field sort key is the FIRST stored value; min/max are explicit reducers.
-  // Data chosen so first-value order, per-doc min order, per-doc max order,
-  // and the flat value stream's leading entries all rank the docs differently.
+TEST_F(ValueExprSortTest, bareMultiValuedIntSortsByMinAscMaxDesc) {
+  // A bare multi-valued numeric field keys on its smallest value ascending and
+  // its largest descending (Elasticsearch's default modes), like the explicit
+  // reducers. Data chosen so first-value order, per-doc min order, per-doc max
+  // order, and the flat value stream's leading entries all rank differently.
   CollectionHelper helper;
   helper.index(flatdoc("id_s", "a", "values_is", vec_i(9, 4)), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "values_is", vec_i(8, 7)), UpdateMessage::NO_COMMIT);
@@ -127,10 +127,9 @@ TEST_F(ValueExprSortTest, bareMultiValuedIntSortsByFirstValue) {
     return ids(*req);
   };
 
-  // First values: a=9, b=8, c=1; d missing sorts last both directions.
-  EXPECT_EQ((std::vector<std::string>{"c", "b", "a", "d"}), run("values_is", qb::ASC));
-  EXPECT_EQ((std::vector<std::string>{"a", "b", "c", "d"}), run("values_is", qb::DESC));
-  // Explicit reducers see every value: mins a=4, b=7, c=1; maxes a=9, b=8, c=20.
+  // Mins a=4, b=7, c=1; maxes a=9, b=8, c=20; d missing sorts last both ways.
+  EXPECT_EQ((std::vector<std::string>{"c", "a", "b", "d"}), run("values_is", qb::ASC));
+  EXPECT_EQ((std::vector<std::string>{"c", "a", "b", "d"}), run("values_is", qb::DESC));
   EXPECT_EQ((std::vector<std::string>{"c", "a", "b", "d"}), run("min(values_is)", qb::ASC));
   EXPECT_EQ((std::vector<std::string>{"c", "a", "b", "d"}), run("max(values_is)", qb::DESC));
 }

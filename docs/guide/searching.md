@@ -716,8 +716,8 @@ POST /collections/books/_search
 `sort` takes one clause or a list of clauses, so `["category_s", "year_i desc"]`
 sorts by category and then by year within it. A clause is a string, `expr`,
 `expr asc`, or `expr desc`, or an object with the same `expr` and `dir` plus a
-`vars` map for `$name` values. The expression is a bare field name or a
-numeric value expression:
+`vars` map for `$name` values and the `missing` and `mode` options below. The
+expression is a bare field name or a numeric value expression:
 
 ```json
 {
@@ -729,8 +729,38 @@ An omitted direction is descending for `score` (also spelled `_score_`) and
 ascending for everything else. `_docid_` sorts by reader-local
 `(segment, docid)` order, and after all explicit keys tie, that order is the
 final deterministic tiebreak. Documents missing the sort value sort last under
-both directions. Responses and `?explain=request` show the canonical
-list-of-objects form.
+both directions unless the clause sets `missing`. Responses and
+`?explain=request` show the canonical list-of-objects form.
+
+### Missing values and multi-valued fields
+
+Sort clause objects accept the Elasticsearch `missing` and `mode` options:
+
+```json
+{
+  "sort": [
+    {"field": "price_i", "dir": "asc", "missing": "_first"},
+    {"field": "sizes_is", "dir": "desc", "mode": "avg", "missing": 0}
+  ]
+}
+```
+
+| Option | Values |
+|---|---|
+| `missing` | `"_last"` (default) or `"_first"` places documents without a sort value at that end under either direction. Any other value is a literal those documents sort as, coerced like a query literal: a number for numeric fields and expressions, an ISO-8601 string or epoch millis for DATE fields, and a string for STRING and ID fields. A literal ties with documents holding the same value; index order breaks the tie. |
+| `mode` | Which value of a multi-valued field keys the document: `min`, `max`, `sum`, `avg`, or `median`. Unset is `min` ascending and `max` descending. |
+
+`sum`, `avg`, and `median` require a numeric or DATE value (`sum` rejects
+DATE); on a STRING or ID field they are a request error. `median` of an even
+count is the mean of the two middle values, and `avg` and `median` sort as
+doubles. A missing or empty array is missing for every mode. A mode applies to
+a single-valued field as a no-op, and an array-valued expression such as
+`sizes_is * 2` takes a mode the way a bare field does; a scalar expression
+ignores it. `score` and `_docid_` have one value per document and reject both
+options. A `min` or `max` mode keeps the direct column sort; `sum`, `avg`, and
+`median` over a multi-valued field sort through the expression path, exactly
+as `sum(sizes_is)` would. A STRING literal is compared as written, without the
+field's normalizer. Facet bucket sorts reject both options.
 
 ### Sort expressions in detail
 
@@ -742,7 +772,7 @@ to its following value. The function spellings remain available:
 - Arithmetic: `add`, `sub`, `mul`, and `div`.
 - Defaults: `def(value, fallback)` substitutes only when `value` is missing.
 - Unary math: `neg`, `abs`, `sqrt`, `log`, `log1p`, and `floor`.
-- Multi-valued reducers: `min`, `max`, `avg`, `sum`, and `count`. Missing or
+- Multi-valued reducers: `min`, `max`, `avg`, `sum`, `median`, and `count`. Missing or
   empty arrays reduce to missing except for `count`, which returns zero (and
   one or zero for a present or missing scalar). Integer `sum` overflow makes
   that document's value missing; `sum` rejects DATE arrays. A composed
@@ -753,11 +783,11 @@ Field names use the value binding. Numeric, date, string, and ID fields keep
 the direct column-sort path. Use `col("name")` when a field name is reserved
 or is not an identifier. To sort analyzed text, use a string variant.
 
-A bare multi-valued string field sorts by its smallest value ascending and its
-largest value descending (string values are stored as a per-document sorted
-set, so either edge is free to read). A bare multi-valued numeric field sorts
-by its first stored value, the one key that needs no per-document scan; use
-`min(f)` or `max(f)` for edge semantics when the scan is worth paying.
+A bare multi-valued field sorts by its smallest value ascending and its
+largest value descending unless the clause sets `mode`. String values are
+stored as a per-document sorted set, so either edge is free to read; numeric
+values are stored unsorted, so a multi-valued numeric document pays a scan of
+its values.
 
 Integer-only addition, subtraction, and multiplication stay int64; a double
 operand promotes that operation to double, and division always returns double.
