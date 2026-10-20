@@ -512,8 +512,10 @@ struct FieldCompiler {
     bool numericClass = r.type == FieldClass::INT || r.type == FieldClass::FLOAT ||
                         r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE;
     bool geoClass = r.type == FieldClass::GEO_POINT;
+    bool rangeClass = r.type == FieldClass::LONG_RANGE || r.type == FieldClass::DOUBLE_RANGE ||
+                      r.type == FieldClass::DATE_RANGE;
     if (index == IndexMode::RANGE) {
-      if (!numericClass && !geoClass) {
+      if (!numericClass && !geoClass && !rangeClass) {
         throw SchemaError(
           "index=range is not supported for this type (field: " + std::string(name) +
           "); MATCH-indexed string/id fields answer range queries through the terms dictionary");
@@ -523,7 +525,7 @@ struct FieldCompiler {
       }
     }
     if (index == IndexMode::MATCH) {
-      if (numericClass || geoClass) {
+      if (numericClass || geoClass || rangeClass) {
         throw SchemaError(
           "index=match (numeric term postings) is not yet implemented for field: " + std::string(name));
       }
@@ -539,6 +541,19 @@ struct FieldCompiler {
       // be returned in search results.  Other types default to false;
       // STRING/ID already expose their value via the column store.
       stored = (r.type == FieldClass::TEXT);
+    }
+    if (rangeClass) {
+      if (!column) {
+        throw SchemaError("range fields require column=true (field: " + std::string(name) + ")");
+      }
+      if (multi) {
+        throw SchemaError("multi-valued range fields are not supported yet (field: " +
+                          std::string(name) + ")");
+      }
+      if (stored) {
+        throw SchemaError("stored is not supported for range fields; values are retrieved "
+                          "from the column (field: " + std::string(name) + ")");
+      }
     }
 
     // Build flags
@@ -611,6 +626,15 @@ struct FieldCompiler {
       case FieldClass::GEO_POINT:
         ft = std::make_shared<GeoPointFieldType>(name, flags);
         break;
+      case FieldClass::LONG_RANGE:
+        ft = std::make_shared<RangeFieldType>(name, FieldType::INT, flags);
+        break;
+      case FieldClass::DOUBLE_RANGE:
+        ft = std::make_shared<RangeFieldType>(name, FieldType::DOUBLE, flags);
+        break;
+      case FieldClass::DATE_RANGE:
+        ft = std::make_shared<RangeFieldType>(name, FieldType::DATE, flags);
+        break;
       case FieldClass::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
         // dims may be 0, meaning "infer from first indexed value".
@@ -671,6 +695,10 @@ struct FieldCompiler {
 static LogicalField::Shape shapeFamily(FieldClass type) {
   if (type == FieldClass::VECTOR) return LogicalField::Shape::VECTOR;
   if (type == FieldClass::GEO_POINT) return LogicalField::Shape::GEO;
+  if (type == FieldClass::LONG_RANGE || type == FieldClass::DOUBLE_RANGE ||
+      type == FieldClass::DATE_RANGE) {
+    return LogicalField::Shape::RANGE;
+  }
   return LogicalField::Shape::SCALAR;
 }
 

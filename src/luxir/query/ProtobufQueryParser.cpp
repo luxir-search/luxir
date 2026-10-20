@@ -194,8 +194,18 @@ luxir::Query* ProtobufQueryParser::parseRange(const luxir::api::RangeQuery& rang
       -> const luxir::api::Val* { return v.has_value() ? &*v : nullptr; };
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+  using Relation = luxir::api::RangeQuery_::Relation;
+  RangeFieldQuery::Relation relation;
+  switch (rangeQuery.relation) {
+    case Relation::INTERSECTS: relation = RangeFieldQuery::Relation::INTERSECTS; break;
+    case Relation::CONTAINS: relation = RangeFieldQuery::Relation::CONTAINS; break;
+    case Relation::WITHIN: relation = RangeFieldQuery::Relation::WITHIN; break;
+    default:
+      throw std::runtime_error(std::format("Range query on '{}': unknown relation value {}",
+                                           rangeQuery.field, (int)rangeQuery.relation));
+  }
   return builder.createRangeQuery(rangeQuery.field, ptr(rangeQuery.gte), ptr(rangeQuery.gt),
-                                  ptr(rangeQuery.lte), ptr(rangeQuery.lt));
+                                  ptr(rangeQuery.lte), ptr(rangeQuery.lt), relation);
 }
 
 luxir::Query* ProtobufQueryParser::parseGeoBox(const luxir::api::GeoBoxQuery& geoBoxQuery) {

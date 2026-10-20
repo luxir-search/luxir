@@ -275,7 +275,7 @@ TEST_F(DateFieldTest, parseFuzzSafetyAndInvariants) {
   }
 }
 
-// DATE columns merge through the int-column path (mergeIntCol2); values and
+// DATE columns merge through the int-column path (mergeIntCol); values and
 // chronological sort order must survive a multi-segment force-merge.
 TEST_F(DateFieldTest, mergeAcrossSegments) {
   CollectionHelper helper;

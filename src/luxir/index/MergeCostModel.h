@@ -79,6 +79,8 @@ struct MergeCostModel {
   static constexpr int64_t SYNTHESIZED_POINT_BYTES = 16;
   // vector growth can retain nearly 2x the 16-byte triple payload.
   static constexpr int64_t GEO_POINT_BYTES = 32;
+  // The same for a range field's 24-byte (min, max, docid) point.
+  static constexpr int64_t RANGE_POINT_BYTES = 48;
   // Three 8-byte directory arrays can each retain nearly 2x vector capacity.
   static constexpr int64_t POINTS_DIRECTORY_BYTES_PER_LEAF = 48;
 
@@ -110,6 +112,16 @@ struct MergeCostModel {
     return POINTS_WRITER_BYTES
         + totalValues * GEO_POINT_BYTES
         + leaves * POINTS_DIRECTORY_BYTES_PER_LEAF;
+  }
+
+  // Like geoPointsBytes; a range column holds two values per point.
+  static int64_t rangePointsBytes(int64_t totalValues) {
+    int64_t totalPoints = totalValues / 2;
+    int64_t leaves = totalPoints / POINTS_PER_LEAF
+        + (totalPoints % POINTS_PER_LEAF != 0);
+    return POINTS_WRITER_BYTES
+        + totalPoints * RANGE_POINT_BYTES
+        + leaves * 2 * POINTS_DIRECTORY_BYTES_PER_LEAF;
   }
 };
 

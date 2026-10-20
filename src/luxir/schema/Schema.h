@@ -33,7 +33,7 @@ enum class FieldRole { PRIMARY, VARIANT };
 // One input shape, with source storage on the primary and independent physical bundles.
 // Dynamic roots use the template's prototypes; their actual names live in handles.
 struct LogicalField {
-  enum class Shape { SCALAR, VECTOR, GEO };
+  enum class Shape { SCALAR, VECTOR, GEO, RANGE };
   std::string name;
   std::shared_ptr<FieldType> primary;
   std::map<std::string, std::shared_ptr<FieldType>, std::less<>> variants;

@@ -22,6 +22,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <memory_resource>
 #include <numeric>
@@ -424,6 +425,52 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
       };
       IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     }
+  });
+}
+
+// A range field's values as a Column.col_val, one Val per output row:
+// {"gte": min, "lte": max} in the element type (DATE as epoch millis, like
+// DATE columns), with an open end omitted. Rows without a value stay unset.
+// There is no typed column arm for intervals; placeBatchColumns moves the
+// column to the row maps when the placement asks for rows.
+inline void loadRangeVals(SearchRequest& req, IndexReader::FieldSegments infos,
+                          RangeFieldType& fieldType, std::span<const segdoc> segDocs,
+                          SegmentRuns runs, luxir::api::Column& fieldCol,
+                          FieldLoaders* loaders, std::pmr::memory_resource& mr)
+{
+  auto& col = fieldCol.kind.emplace<luxir::api::ColVal>();
+  if (segDocs.empty()) return;
+  auto* vals = build::allocArray(col.v, segDocs.size(), mr);
+  std::span<luxir::api::Val> target(vals, segDocs.size());
+  addFieldLoader(loaders, runs, [&req, infos, &fieldType, segDocs, target, &mr](std::span<RowIndex> idxSpan) {
+    auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
+    auto segNum = sortedSegDocs[0].segment();
+    auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
+    auto* info = infos.at(segNum);
+    if (!info) return;
+
+    auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    bool isDouble = fieldType.elementType() == FieldType::DOUBLE;
+    auto setBound = [&](luxir::api::Map& map, std::string_view key, int64_t encoded) {
+      auto* bound = build::mapSlot<luxir::api::Val>(map.fields, 2, key, mr);
+      if (isDouble) bound->kind = sortableInt64ToDouble(encoded);
+      else bound->kind = encoded;
+    };
+    int64_t min = 0;
+    auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+      assert(segDocs[idxSpan[idx]].docId() == doc);
+      unused(doc, numVals);
+      if (valIdx == 0) {
+        min = val;
+      } else if (valIdx == 1) {
+        // Single-valued: the doc's first pair is its interval.
+        auto& map = target[idxSpan[idx]].kind.emplace<luxir::api::Map>();
+        if (min != std::numeric_limits<int64_t>::min()) setBound(map, "gte", min);
+        if (val != std::numeric_limits<int64_t>::max()) setBound(map, "lte", val);
+      }
+    };
+    IntColReader::getValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
   });
 }
 
@@ -1180,6 +1227,12 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
         case FieldType::Type::VECTOR: {
           if (columnSize != 0) {
             loadVectorCol(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, mr);
+          }
+          break;
+        }
+        case FieldType::Type::RANGE: {
+          if (columnSize != 0) {
+            loadRangeVals(req, rf.infos, (RangeFieldType&)fieldType, segDocs, runs, outputColumn(), pendingLoaders, mr);
           }
           break;
         }

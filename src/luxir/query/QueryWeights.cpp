@@ -21,6 +21,7 @@
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
+#include "luxir/query/RangeFieldQuery.h"
 #include "luxir/query/RescoreQuery.h"
 #include "luxir/query/TermInSetQuery.h"
 #include "luxir/query/TermQuery.h"
@@ -122,6 +123,12 @@ Query::Weight* GeoBoxQuery::createWeight(Context& context, int32_t flags,
 
 Query::Weight* GeoDistanceQuery::createWeight(Context& context, int32_t flags,
                                               float multiplier) {
+  float score = constantWhenScored(flags, multiplier);
+  return context.pool.make<Weight>(context, *this, flags, score);
+}
+
+Query::Weight* RangeFieldQuery::createWeight(Context& context, int32_t flags,
+                                             float multiplier) {
   float score = constantWhenScored(flags, multiplier);
   return context.pool.make<Weight>(context, *this, flags, score);
 }

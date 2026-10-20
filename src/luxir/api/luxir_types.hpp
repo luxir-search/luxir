@@ -109,6 +109,7 @@ namespace RangeFacet_ { enum class Bounds { EXPLICIT = 0, DATA = 1 }; }
 namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
+namespace RangeQuery_ { enum class Relation { INTERSECTS = 0, CONTAINS = 1, WITHIN = 2 }; }
 namespace CalendarGap_ {
 enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR = 5 };
 }
@@ -118,7 +119,8 @@ enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
-enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
+enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9,
+                        LONG_RANGE = 18, DOUBLE_RANGE = 19, DATE_RANGE = 20 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 }
@@ -1060,11 +1062,13 @@ struct SimpleQuery {
   int32_t min_match = 0;
 };
 struct RangeQuery {                                            // needs Val
+  using Relation = luxir::api::RangeQuery_::Relation;
   std::string_view field;
   ::hpp_proto::optional_indirect_view<Val> gte;
   ::hpp_proto::optional_indirect_view<Val> gt;
   ::hpp_proto::optional_indirect_view<Val> lte;
   ::hpp_proto::optional_indirect_view<Val> lt;
+  Relation relation = Relation::INTERSECTS;
 };
 struct GeoBoxQuery {
   std::string_view field;

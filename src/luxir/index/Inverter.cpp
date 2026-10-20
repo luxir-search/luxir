@@ -141,6 +141,9 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
         fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType);
       }
       break;
+    case FieldType::Type::RANGE:
+      fieldHandler = pool.make_unique<handler::RangeHandler>(*this, name, fieldType);
+      break;
     case FieldType::Type::VECTOR:
       fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType);
       break;
