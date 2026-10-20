@@ -1765,7 +1765,7 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
     bool inRange(int64_t value) const { return value >= start && value < end; }
 
     // Bucket of an in-range value.
-    size_t bucketOf(int64_t value) {
+    LUXIR_INLINE size_t bucketOf(int64_t value) {
       if (gap) return (size_t)(((uint64_t)value - (uint64_t)start) / (uint64_t)gap);
       return cursor.bucketOf(value, runs, fences);
     }
@@ -1802,13 +1802,12 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
     if (auto domains = zoneBucketDomains(segnum, buckets, builderOfBucket, eligibility, layout)) {
       return std::move(*domains);
     }
-    int64_t start = layout.start, end = layout.end;
     return buildFacetBucketDomains(reader.segments()[segnum].maxDoc(), buckets.size(),
         [&](auto&& accept) {
           int64_t missing = 0;
           facetSegIntCol(eligibility, (int32_t)segnum, missing, accept);
         }, [&](int64_t value) {
-          return value < start || value >= end ? -1 : builderOfBucket[layout.bucketOf(value)];
+          return layout.inRange(value) ? builderOfBucket[layout.bucketOf(value)] : -1;
         });
   }
 
@@ -1839,19 +1838,6 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
   template <bool Distinct, bool Floating = false> class DataCalc;
   Calculator* createDataCalculator(Calculator* parent, int64_t slot, int64_t numSlots,
                                     const StructuralConstraint* structural);
-
-  // Bucket index for an in-range value (caller checks [front, back)).
-  size_t bucketOf(int64_t val) const {
-    if (affine) {
-      return (size_t)(((uint64_t)val - (uint64_t)fences.front())
-                      / (uint64_t)affineGap);
-    }
-    return (size_t)(std::upper_bound(fences.begin(), fences.end(), val) - fences.begin() - 1);
-  }
-  LUXIR_INLINE size_t bucketOf(int64_t val, RangeFacetRunCursor& cursor) const {
-    if (affine) return bucketOf(val);
-    return cursor.bucketOf(val, runs);
-  }
 
   // Walks a segment's column zone by zone (forEachIntColZone). False, having
   // visited nothing, for a column shape the zone walk does not cover.
@@ -2058,22 +2044,13 @@ public:
       if constexpr (Distinct) {
         auto& range = rangeOp();
         int64_t missing = 0;
-        if (range.runs.empty()) {
-          range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
-            range.facetSegIntCol(domain, segnum, missing,
-                [&](int32_t doc, int64_t value) LUXIR_INLINE {
-                  if (value >= range.fences.front() && value < range.fences.back()) add((int64_t)range.bucketOf(value), group(doc));
-                });
-          });
-        } else {
-          RangeFacetRunCursor cursor;
-          range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
-            range.facetSegIntCol(domain, segnum, missing,
-                [&](int32_t doc, int64_t value) LUXIR_INLINE {
-                  if (value >= range.fences.front() && value < range.fences.back()) add((int64_t)range.bucketOf(value, cursor), group(doc));
-                });
-          });
-        }
+        BucketLayout layout = range.fixedLayout();
+        range.collectGroups(data, segnum, domain, [&](auto group, auto add, auto) {
+          range.facetSegIntCol(domain, segnum, missing,
+              [&](int32_t doc, int64_t value) LUXIR_INLINE {
+                if (layout.inRange(value)) add((int64_t)layout.bucketOf(value), group(doc));
+              });
+        });
         if (range.missing && missing != 0) range.collectGroups(data, segnum, domain,
             [&](auto group, auto, auto missingBucket) {
               range.forEachMissing(domain, segnum,
@@ -2137,27 +2114,13 @@ public:
       if (rangeOp().facetSegIntZones(domain, segnum, data.missing_num, counter)) {
         return;
       }
-      // Select the lookup form once per segment. The plain closure retains
-      // the original captures and generated affine loop; only run collectors
-      // carry the mutable cursor. Both use the same lifecycle and producer.
-      if (rangeOp().runs.empty()) {
-        // Capture by value so the counter store cannot alias the captures.
-        rangeOp().facetSegIntCol(domain, segnum, data.missing_num,
-            [start, end, counts = std::span(data.counts), &range = rangeOp()]
-              (int32_t docid, int64_t val) LUXIR_INLINE {
-            unused(docid);
-            if (val < start || val >= end) return;
-            counts[range.bucketOf(val)]++;
-          });
-      } else {
-        rangeOp().facetSegIntCol(domain, segnum, data.missing_num,
-            [start, end, counts = std::span(data.counts), &range = rangeOp(), cursor = RangeFacetRunCursor{}]
-              (int32_t docid, int64_t val) mutable LUXIR_INLINE {
-            unused(docid);
-            if (val < start || val >= end) return;
-            counts[range.bucketOf(val, cursor)]++;
-          });
-      }
+      // Capture the layout by value so the counter store cannot alias it.
+      rangeOp().facetSegIntCol(domain, segnum, data.missing_num,
+          [counts = std::span(data.counts), layout = rangeOp().fixedLayout()]
+            (int32_t docid, int64_t val) mutable LUXIR_INLINE {
+          unused(docid);
+          if (layout.inRange(val)) counts[layout.bucketOf(val)]++;
+        });
       }
     }
 
