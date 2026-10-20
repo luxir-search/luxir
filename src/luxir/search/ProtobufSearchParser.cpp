@@ -1441,6 +1441,15 @@ public:
     return filters;
   }
 
+  // Metadata-only lower bound on the main weight's live matches.
+  int64_t matchLowerBound(Query::Weight& weight) {
+    int64_t bound = 0;
+    for (auto& segment : req.reader->segments()) {
+      bound += weight.matchLowerBound(segment);
+    }
+    return bound;
+  }
+
   // Build a TopDocsReq from a TopDocs proto. Placement is semantic: ordinary
   // TopDocs can serve a canonical-root whole-reader fact, while a Fusion
   // source delivers candidates into a parent-owned domain.
@@ -1512,6 +1521,10 @@ public:
     if (offset < 0) {
       throw std::runtime_error(
           "top_docs '" + std::string(name) + "': offset must be >= 0");
+    }
+    if (topDocsReq.count_limit.has_value() && *topDocsReq.count_limit <= 0) {
+      throw std::runtime_error(
+          "top_docs '" + std::string(name) + "': count_limit must be > 0");
     }
     int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;
     // limit to actual number of docs in the index (or all if limit == -1)
@@ -1652,9 +1665,21 @@ public:
     // pruning because a separate exhaustive windowed pass produces their
     // complete match domain and exact count before the ranking pass. Match-all
     // reuses the incoming domain and its cardinality instead.
+    //
+    // A bounded count (count_limit) is a score-ranked root list's count that
+    // may stop at the limit: pruning stays allowed, and collection holds the
+    // competitive threshold at lowest until the limit is counted (Lucene's
+    // totalHitsThreshold). Other shapes keep counting exactly.
+    int64_t countLimit = topDocsReq.get_number && topDocsReq.count_limit.has_value()
+        && placement == TopDocsPlacement::ROOT_OP
+        && collapse == nullptr && diversify == nullptr
+        && requirements.needRankedDocs && !requirements.needExactDomain
+        && !parsedSorts.useFieldSort && parsedSorts.rankNeedsScores
+        ? *topDocsReq.count_limit : 0;
     bool allowPruning = requirements.needRankedDocs
         && !parsedSorts.useFieldSort
-        && (!requirements.needExactCount || requirements.needExactDomain);
+        && (!requirements.needExactCount || requirements.needExactDomain
+            || countLimit > 0);
     if (allowPruning && !(diversify && topDocsReq.get_number)
         && !(collapse && !topDocsReq.collapse->sort.empty())) {
       requestFlags |= Query::ALLOW_PRUNING;
@@ -1662,10 +1687,12 @@ public:
     Query::ScoreProfile scoreProfile = luxir::scoreProfile(*query);
     // Document cardinality is not a distinct-group count; collapse totals
     // read every eligible key through the normal exhaustive driver.
-    bool exactCountTopK = collapse == nullptr && diversify == nullptr && requirements.needRankedDocs
+    bool exactCountTopKShape = collapse == nullptr && diversify == nullptr
+        && requirements.needRankedDocs
         && requirements.needExactCount && !requirements.needExactDomain
         && !parsedSorts.useFieldSort
         && parsedSorts.rankNeedsScores;
+    bool exactCountTopK = exactCountTopKShape && countLimit == 0;
     bool pureCountShape = collapse == nullptr && diversify == nullptr
         && !QueryPrep::disableWholeMembershipPlanForTests
         && limit == 0 && topDocsReq.get_number
@@ -1691,7 +1718,7 @@ public:
     if (cacheFirstMembershipUse == nullptr
         && placement == TopDocsPlacement::ROOT_OP
         && !QueryPrep::disableWholeMembershipPlanForTests
-        && exactCountTopK && (foldFilters || filters.empty())
+        && exactCountTopKShape && (foldFilters || filters.empty())
         && canOmitWeightForCacheFirstMembership(*query)
         && !directCountAvailable(*query, *req.reader)
         && cache != nullptr && cache->enabled()) {
@@ -1701,6 +1728,14 @@ public:
             std::move(*candidate), FilterCache::AdmissionLane::WHOLE);
       }
       cacheFirstTopKCount = cacheFirstMembershipUse != nullptr;
+      if (cacheFirstTopKCount && countLimit > 0) {
+        // Resident membership already holds the exact count; the bounded
+        // count gives way to the exact cache-first plan.
+        countLimit = 0;
+        exactCountTopK = true;
+        allowPruning = false;
+        requestFlags &= ~Query::ALLOW_PRUNING;
+      }
       if (cacheFirstTopKCount) {
         skipCount(SkipStats::cacheFirstTopKCountWeightSkips);
         if (scoreProfile.kind != Query::ScoreProfile::Kind::VARIABLE) {
@@ -2018,6 +2053,11 @@ public:
 
     qr->collapse = collapse;
     qr->diversify = diversify;
+    if (countLimit > 0 && weight != nullptr && weight->allowsPruning()) {
+      qr->countLimit = countLimit;
+      qr->countLimitProven = filterWeights.empty()
+          && matchLowerBound(*weight) >= countLimit;
+    }
     qr->headSort = std::move(headSort);
     if (firstQuery == nullptr) {
       firstQuery = qr;

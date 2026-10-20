@@ -466,6 +466,7 @@ void appendDocListMembers(std::string& out, const luxir::api::DocList& docs) {
     out += R"("found":)";
     appendInt(out, *docs.found);
     out += ',';
+    if (docs.found_is_lower_bound) out += R"("found_is_lower_bound":true,)";
   }
   if (docs.found_docs.has_value()) {
     out += R"("found_docs":)";
@@ -686,6 +687,7 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
       if (!first) marker += ',';
       marker += R"("found":)";
       appendInt(marker, *docs.found);
+      if (docs.found_is_lower_bound) marker += R"(,"found_is_lower_bound":true)";
       first = false;
     }
     if (haveFoundDocs) {

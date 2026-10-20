@@ -11730,6 +11730,24 @@ public:
     return bound;
   }
 
+  // A lone required clause bounds membership when optionals only score; a
+  // pure disjunction matches at least its largest clause. Conjunctions,
+  // exclusions and minimum-match groups prove nothing from metadata.
+  int64_t matchLowerBound(IndexReader::Segment& segment) override {
+    if (!prohibitedWeights.empty()) return 0;
+    size_t required = mandatoryWeights.size() + filterWeights.size();
+    if (required == 1 && minShouldMatch < 1) {
+      auto* child = mandatoryWeights.empty() ? filterWeights.front() : mandatoryWeights.front();
+      return child ? child->matchLowerBound(segment) : 0;
+    }
+    if (required != 0 || minShouldMatch > 1) return 0;
+    int64_t bound = 0;
+    for (auto* child : optionalWeights) {
+      if (child) bound = std::max(bound, child->matchLowerBound(segment));
+    }
+    return bound;
+  }
+
   std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
     auto filterSources = QueryPrep::prepareFilterSources(
         filterWeights, filterUses, ctx);

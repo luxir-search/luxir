@@ -850,6 +850,7 @@ struct TopDocs {                                                 // all indirect
   std::span<const Filter> filter;
   int64_t offset = 0;
   std::optional<std::int64_t> limit;
+  std::optional<std::int64_t> count_limit;
   std::span<const std::string_view> fields;
   std::span<const SortSpec> sort;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
@@ -953,6 +954,7 @@ struct DocList {                                                // needs Column 
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
   int32_t row_count = 0;                                       // align 4
   bool more = false;
+  bool found_is_lower_bound = false;
 };
 struct FacetResult {                                           // needs Column (optional)
   std::optional<Column> bucket_ids;

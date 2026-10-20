@@ -596,6 +596,13 @@ public:
   std::span<FilterCache::Use*> filterUses;
   DomainVariantPlan domainVariants;
   CollectionRequirements requirements;
+  // Bounded hit count (TopDocs.count_limit), 0 when exact. Set only for a
+  // pruning score-ranked list: collection holds the competitive threshold
+  // until this many hits are counted, and found reports the limit as a
+  // lower bound once it is reached. countLimitProven: metadata already
+  // proves the limit, so pruning starts at the first doc.
+  int64_t countLimit = 0;
+  bool countLimitProven = false;
   QueryPrep::WholeMembershipPlan wholeMembershipPlan;
   QueryPrep::ExactDomainPlan exactDomainPlan;
   SortPlan sortPlan;
@@ -694,6 +701,9 @@ public:
       collectorMerger.destroyer = [](MergeableCollector* data) {
         delete data;
       };
+      if (op.countLimit > 0 && !op.countLimitProven) {
+        scoreAccumulator.holdUntilHits(op.countLimit);
+      }
 
       if (op.subOps.size() > 0) {
         if (op.domainVariants.empty()

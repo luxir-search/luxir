@@ -136,6 +136,12 @@ message TopDocs {
   // Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining.
   optional sint64 limit = 4;
   bool get_number = 5;          // return the number of matching documents
+  // With get_number, the count may stop once it reaches this many matches
+  // (Elasticsearch track_total_hits=N). found is then exact, or exactly
+  // count_limit with found_is_lower_bound set. Unset counts exactly; must be
+  // positive. Lists with ops, collapse, diversify or a field sort, nested
+  // lists, and limit 0 still count exactly.
+  optional int64 count_limit = 16;
   bool get_scores = 6;          // return the relevancy score for each document returned
 
   // Fields to return for each document.  Empty returns every retrievable field
@@ -875,9 +881,12 @@ message GroupTable {
 // DocFormat; under COLUMNS an all-missing discovered column is left out of
 // the batch, under ADAPTIVE placement is per batch and field.
 message DocList {
-  // Exact match count when get_number was requested. Counts groups with
+  // Match count when get_number was requested. Counts groups with
   // collapse; otherwise Fusion counts source-union documents before paging.
   optional sint64 found = 1;
+  // found is a lower bound: the count stopped at TopDocs.count_limit, so at
+  // least found documents match. Unset means found is exact.
+  bool found_is_lower_bound = 9;
   optional sint64 found_docs = 2; // Collapse only, when get_number was requested, after missing=drop.
   optional sint64 found_groups = 8; // Diversify only, with get_number: distinct eligible keys.
   GroupTable groups = 7; // Collapse only: complete metadata aligned with this batch's rows.
