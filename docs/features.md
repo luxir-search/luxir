@@ -177,7 +177,9 @@ whole machine. Designed from the start for parallelism on modern hardware.
   (`{"name": "kstem", "params": {"possessive": false}}`); string fields take a
   normalizer (filters only, applied to the whole value).
 - Query-time analysis matches index-time analysis, so `match` finds what was
-  indexed.
+  indexed. `match`, `phrase`, and `simple_query` can name a different
+  analyzer (a schema text field or template, or `standard`, `whitespace`,
+  `keyword`) to analyze the query text.
 
 ## Indexing and ingest
 

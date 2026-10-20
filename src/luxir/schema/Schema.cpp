@@ -1093,6 +1093,27 @@ FieldType* Schema::physical(std::string_view name) const {
   return type->get();
 }
 
+const Analyzer& Schema::queryAnalyzer(std::string_view name) const {
+  // Exact entries include abstract templates ("_t"); findPhysical adds
+  // template instances and their variants ("body_t", "author_name__s").
+  FieldType* type = nullptr;
+  auto exact = fieldTypeMap.find(name);
+  if (exact != fieldTypeMap.end()) {
+    type = exact->second.get();
+  } else if (auto* found = findPhysical(name)) {
+    type = found->get();
+  }
+  if (type && type->type() == FieldType::TEXT) return *((TextFieldType*)type)->analyzer_;
+  if (auto* builtin = builtinAnalyzer(name)) return *builtin;
+  std::string hint = "; name a text field, variant, or template in the schema (e.g. _t) "
+                     "or a built-in analyzer (" + std::string(builtinAnalyzerNames()) + ")";
+  if (type) {
+    throw RequestError("Analyzer '" + std::string(name) + "' names a field that is not text" + hint,
+                       "unknown_analyzer");
+  }
+  throw RequestError("Unknown analyzer '" + std::string(name) + "'" + hint, "unknown_analyzer");
+}
+
 void Schema::toProto(luxir::api::SchemaDef* def, std::pmr::memory_resource& arena) const {
   // The authored source def IS the external representation; decode it into the
   // caller's arena.  fromProto already normalized order and materialized the

@@ -64,6 +64,7 @@ luxir::Query* ProtobufQueryParser::parseMatch(const luxir::api::Match& matchQuer
 
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+  builder.useAnalyzer(matchQuery.analyzer);
   if (matchQuery.val.has_value()) {
     // Val goes through the coercion contract: a numeric val against a
     // text/string field matches its canonical rendering (it used to
@@ -134,6 +135,12 @@ luxir::Query* ProtobufQueryParser::parsePhrase(const luxir::api::PhraseQuery& ph
     throw std::runtime_error(
       "Phrase query must set exactly one of text / words / terms / terms_bin");
   }
+  if (!phraseQuery.analyzer.empty() && (hasTerms || hasTermsBin)) {
+    throw RequestError(
+      "Phrase query 'analyzer' cannot be combined with already-analyzed 'terms' / 'terms_bin'",
+      "invalid_analyzer");
+  }
+  builder.useAnalyzer(phraseQuery.analyzer);
 
   if (hasText) {
     if (!positions.empty()) {
@@ -377,6 +384,10 @@ luxir::Query* ProtobufQueryParser::parseSimpleQuery(
   options.allowed_fields = sq.allowed_fields;
   options.operator_ = sq.operator_;
   options.min_match = sq.min_match;
+  if (!sq.analyzer.empty()) {
+    context.fields.namedChain(sq.analyzer);  // an unknown name is an error even with no TEXT clause
+    options.analyzer = sq.analyzer;
+  }
 
   SimpleQueryResult result = luxir::parseSimpleQuery(sq.q, options, pool);
   for (const auto& w : result.warnings) {

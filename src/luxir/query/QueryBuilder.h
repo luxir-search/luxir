@@ -117,6 +117,8 @@ class QueryBuilder {
   CoerceContext coerceContext;
   std::string_view opName;
   std::vector<api::Warning>* warnings;
+  // Query-named analyzer for TEXT match/phrase input (empty = the field's).
+  std::string_view analyzer;
 
   // Per-codepoint approximation of field folding for automaton literals.
   // Combining-sequence patterns may not compose exactly like whole terms.
@@ -277,6 +279,20 @@ private:
     }
   }
 
+  // The chain that analyzes TEXT match/phrase input: the query-named
+  // analyzer when one is set, else the field's own.
+  TokenChain& textChain(const ResolvedFieldHandle& target) {
+    return analyzer.empty() ? *fields.chain(target) : fields.namedChain(analyzer);
+  }
+
+  void requireTextForAnalyzer(const ResolvedFieldHandle& target) {
+    if (!analyzer.empty() && target.fieldType->type() != FieldType::Type::TEXT) {
+      throw RequestError(std::format(
+          "Match 'analyzer' applies only to text fields; field '{}' is not text",
+          target.physicalName), "invalid_analyzer");
+    }
+  }
+
   std::string_view normalizeMultiterm(TokenChain& chain,
                                       std::string_view text) {
     std::string norm(text);
@@ -364,6 +380,15 @@ public:
     : pool(pool), localFields(schema), fields(fields ? *fields : localFields),
       coerceContext(coerceContext), opName(opName),
       warnings(warnings) {}
+
+  // Analyze subsequent TEXT match/phrase input with a query-named analyzer
+  // (Schema::queryAnalyzer) instead of the field's.  Empty restores the
+  // field's analyzer.  Validates the name now, so an unknown one is an error
+  // even when no clause ends up analyzed.
+  void useAnalyzer(std::string_view name) {
+    analyzer = name;
+    if (!name.empty()) fields.namedChain(name);
+  }
 
   Query* matchNoDocs() {
     return pool.make<MatchNoDocsQuery>();
@@ -757,12 +782,12 @@ public:
 
   Query* createMatchQuery(const ResolvedFieldHandle& target, std::string_view value,
                           Operator op = Operator::OR, int minMatch = 0) {
+    requireTextForAnalyzer(target);
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
       case FieldType::Type::TEXT: {
-        auto* chain = fields.chain(target);
-        TokenChain& tc = *chain;
+        TokenChain& tc = textChain(target);
         Token& tok = tc.head.getToken();
         TokenStream& tail = *tc.tail;
 
@@ -831,6 +856,7 @@ public:
 
   Query* createMatchQuery(const ResolvedFieldHandle& target, const luxir::api::Val& val,
                           Operator op = Operator::OR, int minMatch = 0) {
+    requireTextForAnalyzer(target);
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
     if (isNumericColumnType(fieldType.type())) {
@@ -1016,8 +1042,7 @@ public:
       throw std::runtime_error("Phrase query slop must be nonnegative");
     }
     positionalTextFieldType(target);
-    auto* chain = fields.chain(target);
-    TokenChain& tc = *chain;
+    TokenChain& tc = textChain(target);
     Token& tok = tc.head.getToken();
     TokenStream& tail = *tc.tail;
 

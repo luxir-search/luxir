@@ -7,6 +7,7 @@
 #include "luxir/analysis/NfkcCfData.h"
 
 #include <algorithm>
+#include <initializer_list>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -697,6 +698,52 @@ Analyzer::Analyzer(std::unique_ptr<const TokenizerFactory> tok,
       fusedFold(fusedHead && filters.size() > 1 && filters[1]->name == "fold"),
       stateful(tokenizer->stateful ||
                std::any_of(filters.begin(), filters.end(), [](const auto& f) { return f->stateful; })) {}
+
+namespace {
+struct BuiltinAnalyzer {
+  std::string_view name;
+  std::shared_ptr<const Analyzer> analyzer;
+};
+
+std::shared_ptr<const Analyzer> compileBuiltin(std::string_view tokenizer,
+                                               std::initializer_list<std::string_view> filters) {
+  std::vector<api::AnalyzerComponent> components(filters.size());
+  size_t i = 0;
+  for (std::string_view filter : filters) components[i++].name = filter;
+  api::AnalyzerDef def;
+  def.tokenizer.emplace().name = tokenizer;
+  def.filters = std::span<const api::AnalyzerComponent>(components);
+  return Analyzer::compile(def);
+}
+
+const std::vector<BuiltinAnalyzer>& builtinAnalyzers() {
+  static const std::vector<BuiltinAnalyzer> table = {
+    {"standard", compileBuiltin("unicode_word", {"nfkc_cf"})},
+    {"whitespace", compileBuiltin("whitespace", {})},
+    {"keyword", compileBuiltin("keyword", {})},
+  };
+  return table;
+}
+}  // namespace
+
+const Analyzer* builtinAnalyzer(std::string_view name) {
+  for (const auto& entry : builtinAnalyzers()) {
+    if (entry.name == name) return entry.analyzer.get();
+  }
+  return nullptr;
+}
+
+std::string_view builtinAnalyzerNames() {
+  static const std::string names = [] {
+    std::string out;
+    for (const auto& entry : builtinAnalyzers()) {
+      if (!out.empty()) out += ", ";
+      out += entry.name;
+    }
+    return out;
+  }();
+  return names;
+}
 
 std::unique_ptr<TokenChain> Analyzer::createChain() const {
   std::unique_ptr<Tokenizer> head = fusedHead ? makeStandardTokenizer(fusedFold) : tokenizer->create();
