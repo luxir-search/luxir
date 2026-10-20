@@ -84,6 +84,36 @@ inline api::Query regex(std::pmr::memory_resource& mr, std::string_view field,
   return q;
 }
 
+// combined_fields / multi_match: fields are "name" or "name^boost".
+template <typename Arm>
+inline Arm& fieldsQuery(api::Query& q, std::pmr::memory_resource& mr, std::string_view text,
+                        std::initializer_list<std::string_view> fields, MatchOp op) {
+  auto& arm = q.kind.emplace<Arm>();
+  arm.query = build::arenaStr(mr, text);
+  auto* arr = build::allocArray(arm.fields, fields.size(), mr);
+  size_t i = 0;
+  for (auto f : fields) arr[i++] = build::arenaStr(mr, f);
+  arm.operator_ = op;
+  return arm;
+}
+
+inline api::Query combinedFields(std::pmr::memory_resource& mr, std::string_view text,
+                                 std::initializer_list<std::string_view> fields,
+                                 MatchOp op = MatchOp::OPERATOR_UNSPECIFIED) {
+  api::Query q;
+  fieldsQuery<api::CombinedFieldsQuery>(q, mr, text, fields, op);
+  return q;
+}
+
+inline api::Query multiMatch(std::pmr::memory_resource& mr, std::string_view text,
+                             std::initializer_list<std::string_view> fields,
+                             api::MultiMatchQuery_::Type type,
+                             MatchOp op = MatchOp::OPERATOR_UNSPECIFIED) {
+  api::Query q;
+  fieldsQuery<api::MultiMatchQuery>(q, mr, text, fields, op).type = type;
+  return q;
+}
+
 inline api::Query exists(std::pmr::memory_resource& mr, std::string_view field) {
   api::Query q;
   auto& e = q.kind.emplace<api::ExistsQuery>();

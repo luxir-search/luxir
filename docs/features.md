@@ -230,6 +230,12 @@ Anywhere a query goes, it can be a structured object or an expression string.
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
 - `knn` vector search, `geo_box`, and `geo_distance`.
+- `combined_fields` and `multi_match` (`cross_fields`, `most_fields`):
+  search one text across several fields. `combined_fields` scores with
+  BM25F, treating the fields as one combined field with per-field boosts as
+  term-frequency weights, as Lucene and Elasticsearch do. `cross_fields`
+  scores each group of identically analyzed fields the same way and adds the
+  groups, unlike Elasticsearch's blended-statistics `cross_fields`.
 - `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,
   quoted phrases with `~N` slop, grouping, trailing-`*` prefix, `~N` fuzzy
   terms, and `field:value` terms against an allowlist).

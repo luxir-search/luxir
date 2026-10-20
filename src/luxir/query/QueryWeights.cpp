@@ -9,6 +9,7 @@
 #include "luxir/query/AutomatonQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
+#include "luxir/query/CombinedFieldQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExistsQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
@@ -101,6 +102,32 @@ Query* FuzzyQuery::rewriteToDisjunction(Context& context) const {
   return context.pool.make<BooleanQuery>(
       std::span<Query*>{}, std::span<Query*>(clauses, candidates.size()),
       std::span<Query*>{}, std::span<Query*>{});
+}
+
+Query::Weight* CombinedFieldQuery::createWeight(
+    Context& context, int32_t flags, float multiplier) {
+  if ((flags & NEED_SCORES) != 0) {
+    return context.pool.make<CombinedFieldQuery::Weight>(context, *this, flags, multiplier);
+  }
+  // Unscored: the same match set as a disjunction of the per-field terms,
+  // which keeps the term planner's docs-only and window-fill routes.
+  Query* rewritten;
+  if (fields.size() == 1) {
+    rewritten = context.pool.make<TermQuery>(fields[0], term);
+  } else {
+    auto clauses = context.pool.make_span<Query*>(fields.size());
+    for (size_t i = 0; i < fields.size(); i++) {
+      clauses[i] = context.pool.make<TermQuery>(fields[i], term);
+    }
+    rewritten = context.pool.make<BooleanQuery>(
+        std::span<Query*>{}, clauses, std::span<Query*>{}, std::span<Query*>{});
+  }
+#ifndef NDEBUG
+  if (context.logicalValidationActive()) {
+    rewritten->validateLogical(context.planningContext(), multiplier);
+  }
+#endif
+  return rewritten->createWeight(context, flags, multiplier);
 }
 
 Query::Weight* FuzzyQuery::createWeight(
