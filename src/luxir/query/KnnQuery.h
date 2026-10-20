@@ -33,6 +33,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/RowReadAhead.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/query/VectorEngine.h"
@@ -40,7 +41,6 @@
 #include "luxir/search/Collapse.h"
 #include "luxir/util/AtomicMerger.h"
 #include "luxir/util/heap.h"
-#include "luxir/util/PagePrefetch.h"
 #include "luxir/util/log.h"
 #include "luxir/util/screaming.h"
 #include "luxir/util/thread.h"
@@ -1756,7 +1756,6 @@ public:
             "KnnQuery: query vector dims {} do not match segment dims {}",
             dims, vr.dims()));
         }
-        int64_t rowBytes = (int64_t)dims * (int64_t)sizeof(float);
 
         // Pooled-rank exclusion (request.eligible), honored at DOC level:
         // this engine's scores are exact and it emits each doc's max-sim
@@ -1779,37 +1778,12 @@ public:
           return false;
         };
 
-        // Read-ahead for an unfiltered scan of a column that is not resident
-        // (see PagePrefetcher): every row is read, so advise a byte window
-        // ahead of the cursor.  A filtered scan reads only eligible rows and
-        // relies on plain faults.
-        PagePrefetcher prefetch;
-        const char* rowsBase = (const char*)vr.vectorAtRank(0).data();
-        const char* columnEnd = rowsBase + numVals * rowBytes;
-        const char* advisedEnd = rowsBase;
-        int64_t sinceCheck = 0;
-        if (domain == nullptr) {
-          prefetch.probe(rowsBase);
-          prefetch.probe(rowsBase + numVals / 2 * rowBytes);
-        }
-        auto adviseAhead = [&](int64_t rank) LUXIR_INLINE {
-          if (domain != nullptr || ++sinceCheck < SCAN_CHECK_ROWS) return;
-          sinceCheck = 0;
-          prefetch.refresh();
-          if (!prefetch.active()) return;
-          const char* at = rowsBase + rank * rowBytes;
-          if (advisedEnd - at > (ptrdiff_t)(SCAN_PREFETCH_BYTES / 2)) return;
-          const char* end = std::min(columnEnd, at + SCAN_PREFETCH_BYTES);
-          if (end <= advisedEnd) return;
-          const char* from = std::max(advisedEnd, at);
-          prefetch.add(from, (size_t)(end - from));
-          prefetch.flush();
-          advisedEnd = end;
-        };
-        if (prefetch.active()) {
-          sinceCheck = SCAN_CHECK_ROWS;
-          adviseAhead(0);
-        }
+        // Read-ahead (see RowReadAhead) for an unfiltered scan: every row is
+        // read.  A filtered scan relies on plain faults.
+        StrColReader& col = vr.strColReader();
+        RowReadAhead::Gate gate;
+        RowReadAhead ahead(gate, domain == nullptr ? col.valuesFile() : nullptr, col.valuesOffset(),
+                           (size_t)col.fixedValueSize(), numVals);
 
         // Inline run-collapse: value ranks are doc-ordered (the valDoc map is
         // monotonic; sparse select and dense identity likewise), so a doc's
@@ -1828,7 +1802,7 @@ public:
                 idx = valDoc.next();
               } while (end < numVals && (int32_t)valDoc.value() == docId);
               unused(idx);
-              adviseAhead(rank);
+              ahead.scanAt(rank);
               if (docEligible(docId) && !pooledInRun(rank, end)) {
                 eligibleDocs++;
                 emit(docId, [&]() LUXIR_INLINE {
@@ -1845,7 +1819,7 @@ public:
           } else {
             // Single-valued (dense identity or sparse select): one-vector runs.
             for (int64_t rank = 0; rank < numVals; rank++) {
-              adviseAhead(rank);
+              ahead.scanAt(rank);
               if (pooledInRun(rank, rank + 1)) continue;
               int32_t docId = v2d.resolve(rank);
               if (!docEligible(docId)) continue;
@@ -1888,11 +1862,6 @@ public:
       }
 
     private:
-      // Read-ahead window of an unfiltered scan over a cold column, and rows
-      // between checks of the window and of the thread's major faults.
-      static constexpr size_t SCAN_PREFETCH_BYTES = 8 * 1024 * 1024;
-      static constexpr int64_t SCAN_CHECK_ROWS = 64;
-
       // The domain, when present, is live-filtered and is the complete
       // eligibility predicate (PrepareContext contract); null means the
       // segment has no deletes and no filters.
@@ -2668,7 +2637,7 @@ private:
       [kDocs, groupPlan]() { return new RescoreAccumulator<Groups>(kDocs, groupPlan); },
       [](RescoreAccumulator<Groups>* acc) { delete acc; });
 
-    auto rescoreBucket = [&](size_t bucketBegin, size_t bucketEnd) {
+    auto rescoreBucket = [&](size_t bucketBegin, size_t bucketEnd, RowReadAhead::Gate& gate) {
       int32_t segOrd = candidates[bucketBegin].segOrd;
       if (segOrd < 0 || (size_t)segOrd >= segInfos.size()) {
         throw std::runtime_error("KnnQuery: vector candidate segment ordinal out of range");
@@ -2689,36 +2658,38 @@ private:
           std::optional<VectorReader::Iterator>, NoGroupState> fullDocs;
       if constexpr (Groups) if (vr && vr->isMultiValued()) fullDocs.emplace(vr->strColReader());
 
-      // Read-ahead of the bucket's candidate rows on a column that is not
-      // resident (see PagePrefetcher): the rows' pages are advised
-      // RESCORE_PREFETCH_ROWS ahead so their reads overlap instead of faulting
-      // one at a time.  A group witness's document run starts at or around
-      // its row, so the same advice covers it.
-      PagePrefetcher prefetch;
-      size_t advised = bucketBegin;
-      size_t nextCheck = bucketBegin;
-      auto candidateRow = [&](size_t c) { return vr->vectorAtRank(candidates[c].valueRank); };
+      // Read-ahead of the bucket's rows on a column that is not resident (see
+      // RowReadAhead).  A unit is a candidate's row, or for a group witness
+      // its document's whole value run (the witness can sit anywhere in it),
+      // found by a second iterator in doc order.  Reads that iterator causes
+      // count as the batch's cold pages, which only leans toward staying on.
+      int64_t units = (int64_t)(bucketEnd - bucketBegin);
+      std::optional<RowReadAhead> ahead;
+      [[no_unique_address]] std::conditional_t<Groups,
+          std::optional<VectorReader::Iterator>, NoGroupState> aheadDocs;
+      auto rankAt = [&](int64_t k) { return candidates[bucketBegin + (size_t)k].valueRank; };
+      auto queue = [&](int64_t k) {
+        int64_t rank = rankAt(k);
+        if constexpr (Groups) if (aheadDocs) {
+          int32_t doc = v2d.resolve(rank);
+          if (aheadDocs->docId() < doc) aheadDocs->advance(doc);
+          auto [begin, end] = aheadDocs->valueRange();
+          ahead->queueRows(begin, end);
+          return;
+        }
+        ahead->queueRows(rank, rank + 1);
+      };
       if (vr) {
-        prefetch.probe(candidateRow(bucketBegin).data());
-        prefetch.probe(candidateRow(bucketBegin + (bucketEnd - bucketBegin) / 2).data());
+        ahead.emplace(gate, vr->strColReader());
+        if constexpr (Groups) if (fullDocs) aheadDocs.emplace(vr->strColReader());
+        ahead->probe({rankAt(units / 4), rankAt(units / 2 + units / 4)});
       }
 
       // unique_ptr guards the obtained accumulator against a throw before
       // release (same idiom as FacetOp).
       std::unique_ptr<RescoreAccumulator<Groups>> acc(merger.obtain());
       for (size_t i = bucketBegin; i < bucketEnd;) {
-        if (vr && i >= nextCheck) {
-          prefetch.refresh();
-          if (prefetch.active() && advised < bucketEnd && advised < i + RESCORE_PREFETCH_ROWS / 2) {
-            size_t target = std::min(bucketEnd, i + RESCORE_PREFETCH_ROWS);
-            for (advised = std::max(advised, i); advised < target; advised++) {
-              auto row = candidateRow(advised);
-              prefetch.add(row.data(), row.size_bytes());
-            }
-            prefetch.flush();
-          }
-          nextCheck = i + RESCORE_CHECK_ROWS;
-        }
+        if (ahead) ahead->sparseAt((int64_t)(i - bucketBegin), units, queue);
         int32_t docId = v2d.resolve(candidates[i].valueRank);
         size_t runEnd = i + 1;
         while (runEnd < bucketEnd && v2d.resolve(candidates[runEnd].valueRank) == docId) {
@@ -2768,10 +2739,11 @@ private:
     // Cancel and drain published buckets if a caller-side bucket throws.
     int64_t grain = std::max<int64_t>(1, rescoreTaskGrainCandidates);
     std::vector<std::pair<size_t, size_t>> tasks, local;
+    RowReadAhead::Gate gate;  // shared by the buckets that run on this thread
     for (size_t b = 0; b < candidates.size();) {
       size_t e = b + 1;
       while (e < candidates.size() && candidates[e].segOrd == candidates[b].segOrd) e++;
-      if (!parallel) rescoreBucket(b, e);
+      if (!parallel) rescoreBucket(b, e, gate);
       else if ((int64_t)(e - b) >= grain || e == candidates.size()) tasks.emplace_back(b, e);
       else local.emplace_back(b, e);
       b = e;
@@ -2779,20 +2751,18 @@ private:
     TaskGroupRunner runner;
     task_group_fanout(tasks.size() > 1 ? runner.group() : nullptr, tasks.size(), [&](size_t i) {
       auto [b, e] = tasks[i];
-      return [&rescoreBucket, b, e]() { rescoreBucket(b, e); };
+      return [&rescoreBucket, b, e]() {
+        RowReadAhead::Gate taskGate;
+        rescoreBucket(b, e, taskGate);
+      };
     });
-    for (auto [b, e] : local) rescoreBucket(b, e);
+    for (auto [b, e] : local) rescoreBucket(b, e, gate);
     runner.join();
 
     RescoreAccumulator<Groups>* acc = merger.getData();
     docHits = acc->heap.take();
     std::sort(docHits.begin(), docHits.end(), betterDoc);
   }
-
-  // Candidate rows ahead of the rescore cursor with read-ahead in flight on a
-  // cold column (each row is at most two pages), and rows between checks.
-  static constexpr size_t RESCORE_PREFETCH_ROWS = 1024;
-  static constexpr size_t RESCORE_CHECK_ROWS = 64;
 
   // The query vector is validated finite at Weight construction, but stored
   // vectors are not, so a distance can still come back NaN (a stored NaN, or

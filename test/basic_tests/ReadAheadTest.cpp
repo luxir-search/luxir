@@ -7,10 +7,12 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
 
+#include "luxir/reader/RowReadAhead.h"
 #include "luxir/store/FSDirectory.h"
 #include "luxir/util/Uuid.h"
 
@@ -66,6 +68,12 @@ struct ColdFile {
     return n;
   }
 
+  bool rowResident(int64_t rank, size_t stride) {
+    size_t start = (size_t)rank * stride / PAGE * PAGE;
+    size_t end = ((size_t)(rank + 1) * stride + PAGE - 1) / PAGE * PAGE;
+    return resident(start, end - start) == (end - start) / PAGE;
+  }
+
   // Advice only queues the reads, so wait for them.
   bool waitResident(size_t offset, size_t length) {
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -96,4 +104,90 @@ TEST(ReadAheadTest, prefetchFillsHolesBetweenResidentPages) {
   }
   cold.file->prefetch(100, (2 << 20) - 200);
   EXPECT_TRUE(cold.waitResident(0, 2 << 20)) << cold.resident(0, 2 << 20) << " pages resident";
+}
+
+namespace {
+
+// The gate reads this thread's major faults and input blocks.
+bool threadIoCounters(ColdFile& cold) {
+#ifdef RUSAGE_THREAD
+  struct rusage before, after;
+  getrusage(RUSAGE_THREAD, &before);
+  cold.file->prefetch(3 << 20, 4096);
+  getrusage(RUSAGE_THREAD, &after);
+  return after.ru_inblock > before.ru_inblock;
+#else
+  unused(cold);
+  return false;
+#endif
+}
+
+constexpr size_t STRIDE = 1536;
+
+} // namespace
+
+TEST(ReadAheadTest, probeTurnsOnForColdRowsOnly) {
+  ColdFile cold(8 << 20);
+  if (!cold.drop() || !threadIoCounters(cold)) GTEST_SKIP() << "no droppable pages or thread I/O counters";
+  int64_t rows = (int64_t)((8 << 20) / STRIDE);
+  RowReadAhead::Gate coldGate;
+  RowReadAhead coldAhead(coldGate, cold.file.get(), 0, STRIDE, rows);
+  coldAhead.probe({rows / 4, rows / 2});
+  EXPECT_TRUE(coldAhead.active());
+
+  cold.file->prefetch(0, 8 << 20);
+  ASSERT_TRUE(cold.waitResident(0, 8 << 20));
+  RowReadAhead::Gate hotGate;
+  RowReadAhead hotAhead(hotGate, cold.file.get(), 0, STRIDE, rows);
+  hotAhead.probe({rows / 4, rows / 2});
+  EXPECT_FALSE(hotAhead.active());
+}
+
+TEST(ReadAheadTest, faultsTurnSparseAdviceOnAndResidentBatchesOff) {
+  ColdFile cold(8 << 20);
+  if (!cold.drop() || !threadIoCounters(cold)) GTEST_SKIP() << "no droppable pages or thread I/O counters";
+  // Every other row of the first half; the second half stays hot.
+  std::vector<int64_t> ranks;
+  for (int64_t r = 0; r * STRIDE < (4 << 20); r += 2) ranks.push_back(r);
+  cold.file->prefetch(4 << 20, 4 << 20);
+  ASSERT_TRUE(cold.waitResident(4 << 20, 4 << 20));
+
+  RowReadAhead::Gate gate;
+  {
+    RowReadAhead ahead(gate, cold.file.get(), 0, STRIDE, (int64_t)((8 << 20) / STRIDE));
+    auto queue = [&](int64_t k) { ahead.queueRows(ranks[k], ranks[k] + 1); };
+    ahead.sparseAt(0, (int64_t)ranks.size(), queue);
+    EXPECT_FALSE(ahead.active());
+    // Four major faults in the first 256 units: 1/64, above the 1/128 bar.
+    for (size_t at : {1u << 20, 2u << 20, 3u << 20, 7u << 19}) {
+      volatile char sink = cold.file->read()[at];
+      unused(sink);
+    }
+    ahead.sparseAt(256, (int64_t)ranks.size(), queue);
+    EXPECT_TRUE(ahead.active());
+    for (int64_t k : {256, 500, 1000, 1279}) {
+      auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+      while (!cold.rowResident(ranks[k], STRIDE) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      EXPECT_TRUE(cold.rowResident(ranks[k], STRIDE)) << "unit " << k;
+    }
+  }
+  // The same gate on the resident half: the first batch reads nothing.
+  int64_t hotFirst = (int64_t)((4 << 20) / STRIDE) + 1;
+  RowReadAhead hot(gate, cold.file.get(), 0, STRIDE, (int64_t)((8 << 20) / STRIDE));
+  hot.sparseAt(0, 1000, [&](int64_t k) { hot.queueRows(hotFirst + 2 * k, hotFirst + 2 * k + 1); });
+  EXPECT_FALSE(hot.active());
+}
+
+TEST(ReadAheadTest, scanAdvisesAWindowAheadOfTheCursor) {
+  ColdFile cold(32 << 20);
+  if (!cold.drop() || !threadIoCounters(cold)) GTEST_SKIP() << "no droppable pages or thread I/O counters";
+  int64_t rows = (int64_t)((32 << 20) / STRIDE);
+  RowReadAhead::Gate gate;
+  RowReadAhead ahead(gate, cold.file.get(), 0, STRIDE, rows);
+  ahead.scanAt(0);
+  EXPECT_TRUE(ahead.active());
+  EXPECT_TRUE(cold.waitResident(0, 8 << 20));
+  EXPECT_LT(cold.resident(16 << 20, 4 << 20), 8u);
 }
