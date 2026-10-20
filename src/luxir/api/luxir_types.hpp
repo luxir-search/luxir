@@ -727,6 +727,7 @@ struct StatsResponse {
 struct CacheControlRequest {
   std::string_view collection;
   std::string_view tenant;
+  std::optional<uint64_t> max_bytes;
   uint32_t dump_limit = 0;
   bool flush = false;
   bool reset_admission = false;

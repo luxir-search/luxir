@@ -14,6 +14,7 @@
 #include <latch>
 #include <limits>
 #include <memory>
+#include <memory_resource>
 #include <mutex>
 #include <optional>
 #include <semaphore>
@@ -47,6 +48,7 @@
 #include "luxir/search/FilterCache.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/server/LuxirNode.h"
+#include "luxir/server/Stats.h"
 #include "luxir/store/Directory.h"
 #include "luxir/util/DateTime.h"
 #include "test/CollectionHelper.h"
@@ -671,6 +673,54 @@ TEST(FilterCacheTest, flushPosturesAndDump) {
   EXPECT_EQ(0u, counters.misses);
   EXPECT_EQ(0u, counters.builds);
   EXPECT_EQ(0u, counters.admissions);
+}
+
+// resize() rederives the budgets the config left at zero and keeps explicit
+// ones, sweeps a shrink down to the new low watermark, disables and empties
+// the cache at zero, and re-enables it from there. The explicit metadata
+// budget keeps the metadata sweep out of the shrink.
+TEST(FilterCacheTest, resizeAtRuntime) {
+  FilterCache cache({.maxBytes = 1024 * 1024, .minSegmentDocs = 0,
+                     .admissionThreshold = 1,
+                     .maxMetadataBytes = 64 * 1024});
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  ASSERT_TRUE(cache.onReaderPublished(1, segments));
+  auto key = [](int i) { return FilterKey("resize:" + std::to_string(i)); };
+  for (int i = 0; i < 16; i++) {
+    EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+              servePolicyValue(cache, segments, key(i), i, 10));
+  }
+  size_t full = cache.bytesUsed();
+  ASSERT_GT(full, 0u);
+
+  size_t shrunk = full / 2;
+  cache.resize(shrunk);
+  auto config = cache.configuration();
+  EXPECT_EQ(shrunk, config.maxBytes);
+  EXPECT_EQ(shrunk * 9 / 10, config.lowWatermarkBytes);
+  EXPECT_EQ(shrunk / 5, config.maxEntryBytes);
+  EXPECT_EQ(64u * 1024, config.maxMetadataBytes);
+  EXPECT_GT(cache.bytesUsed(), 0u);
+  EXPECT_LE(cache.bytesUsed(), config.lowWatermarkBytes);
+  EXPECT_GT(cache.counters().evictions, 0u);
+  cache.validateForTest();
+
+  cache.resize(0);
+  EXPECT_FALSE(cache.enabled());
+  EXPECT_EQ(0u, cache.bytesUsed());
+  EXPECT_EQ(0u, cache.entryCountForTest());
+  EXPECT_EQ(0u, cache.configuration().maxEntryBytes);
+  EXPECT_EQ(FilterCache::Probe::Kind::BYPASS,
+            servePolicyValue(cache, segments, key(0), 0, 10));
+
+  cache.resize(1024 * 1024);
+  EXPECT_TRUE(cache.enabled());
+  EXPECT_EQ(1024u * 1024 / 5, cache.configuration().maxEntryBytes);
+  EXPECT_EQ(FilterCache::Probe::Kind::BUILD,
+            servePolicyValue(cache, segments, key(0), 0, 10));
+  EXPECT_EQ(FilterCache::Probe::Kind::HIT,
+            servePolicyValue(cache, segments, key(0), 0, 10));
+  cache.validateForTest();
 }
 
 TEST(FilterCacheTest, existingLookupIsInertUntilCompleteAcceptance) {
@@ -4730,6 +4780,34 @@ TEST(DocSetScorerTest, nullSourceBulkScorerEmitsAllDocs) {
     EXPECT_TRUE(domain->get(windowSize + 1));
     EXPECT_FALSE(domain->get(windowSize + 2));
   }
+}
+
+TEST(FilterCacheIntegrationTest, cacheControlResizes) {
+  LuxirConfig config;
+  config.queryCacheBytes = 4 * 1024 * 1024;
+  LuxirNode node(config);
+  luxir::test::CollectionHelper helper(node, "filter_cache_resize");
+  ASSERT_TRUE(helper.indexAll({luxir::test::flatdoc("id", "1")},
+                              UpdateMessage::COMMIT).success);
+  auto cache = helper.getIndexWriter()->snapshots.readers.filterCache;
+
+  auto resize = [&](uint64_t maxBytes) {
+    std::pmr::monotonic_buffer_resource arena;
+    api::CacheControlRequest request;
+    request.collection = "filter_cache_resize";
+    request.max_bytes = maxBytes;
+    api::CacheControlResponse response;
+    gatherCacheControl(node, request, response, arena);
+    EXPECT_EQ(1u, response.collections.size());
+    EXPECT_EQ(1u, response.collections[0].shards.size());
+    const auto& stats = response.collections[0].shards[0].stats;
+    EXPECT_EQ(maxBytes != 0, stats.enabled);
+    EXPECT_EQ(maxBytes, stats.max_bytes);
+  };
+  resize(0);
+  EXPECT_FALSE(cache->enabled());
+  resize(1024 * 1024);
+  EXPECT_EQ(1024u * 1024, cache->configuration().maxBytes);
 }
 
 TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {

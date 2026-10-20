@@ -625,7 +625,22 @@ private:
     void reset();
   };
 
+  // Fixed policy. The byte budgets below live in limits and may change at
+  // runtime; requested keeps the caller's zero-means-derived budget fields so
+  // resize() can rederive them.
   FilterCacheConfig config;
+  FilterCacheConfig requested;
+  // Each field is read independently with relaxed loads. A reader racing
+  // resize() may combine old and new values for one decision, which is
+  // harmless: every budget is a soft target that the next sweep enforces.
+  struct Limits {
+    std::atomic<size_t> maxBytes{0};
+    std::atomic<size_t> lowWatermarkBytes{0};
+    std::atomic<size_t> maxEntryBytes{0};
+    std::atomic<size_t> maxMetadataBytes{0};
+    std::atomic<size_t> lowWatermarkMetadataBytes{0};
+  } limits;
+  std::mutex resizeMutex;
   boost::unordered::concurrent_flat_map<
       FilterKey, std::shared_ptr<FilterEntry>, FilterKeyHash> entries;
   AdmissionRing clauseAdmission;
@@ -697,6 +712,11 @@ private:
       Use& use, ReaderProbe& probe,
       std::vector<std::unique_ptr<DocSet>> liveExact,
       uint32_t buildCostMicros);
+  static FilterCacheConfig deriveLimits(FilterCacheConfig config);
+  void storeLimits(const FilterCacheConfig& derived);
+  size_t maxEntryBytes() const {
+    return limits.maxEntryBytes.load(std::memory_order_relaxed);
+  }
   void advanceEvictionClock(double priority);
   void maybeSweep();
   void sweepMetadata();
@@ -704,8 +724,21 @@ private:
 public:
   explicit FilterCache(FilterCacheConfig config = {});
 
-  bool enabled() const { return config.maxBytes != 0; }
-  FilterCacheConfig configuration() const { return config; }
+  bool enabled() const {
+    return limits.maxBytes.load(std::memory_order_relaxed) != 0;
+  }
+  // The effective configuration, with derived budgets filled in.
+  FilterCacheConfig configuration() const;
+  // Changes the byte budget at runtime. Budgets the original config left at
+  // zero (watermarks, maxEntryBytes, maxMetadataBytes) are rederived from the
+  // new size; explicit ones are kept and clamped as at construction. A
+  // shrink is swept down to the new low watermark, on this thread unless a
+  // sweep is already running (that sweeper then loops with the new limits).
+  // Zero disables the cache and drops every entry; a publish racing it may
+  // leave one value or entry behind, which the next Use's sweep evicts.
+  // Growing takes effect immediately. Admission history and other policy
+  // fields are unchanged.
+  void resize(size_t maxBytes);
   bool onReaderPublished(uint64_t coreGen,
                          std::span<const SegmentIdentity> segments);
   bool onReaderPublished(uint64_t coreGen, uint64_t readerVersion,

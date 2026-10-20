@@ -426,6 +426,7 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
     shardControl.shard_id = 0;
     if (cache == nullptr) continue;
 
+    if (request.max_bytes) cache->resize((size_t)*request.max_bytes);
     if (request.flush) cache->clear();
     if (request.reset_admission) cache->resetAdmission();
     if (request.reset_counters) cache->resetCounters();

@@ -448,7 +448,7 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
       || reader.segments().size() != readerSegments.size()) {
     return {};
   }
-  if (key.bytes().size() > cache->config.maxEntryBytes) {
+  if (key.bytes().size() > cache->maxEntryBytes()) {
     cache->counter.oversizedKeyBypasses.fetch_add(
         1, std::memory_order_relaxed);
     return {};
@@ -932,8 +932,41 @@ FilterCache::AdmissionRing& FilterCache::admissionFor(AdmissionLane lane) {
       ? clauseAdmission : wholeAdmission;
 }
 
+FilterCacheConfig FilterCache::deriveLimits(FilterCacheConfig config) {
+  if (config.lowWatermarkBytes == 0) {
+    config.lowWatermarkBytes = config.maxBytes * 9 / 10;
+  }
+  config.lowWatermarkBytes = std::min(config.lowWatermarkBytes,
+                                      config.maxBytes);
+  if (config.maxEntryBytes == 0 && config.maxBytes != 0) {
+    config.maxEntryBytes = std::max<size_t>(1, config.maxBytes / 5);
+  }
+  if (config.maxMetadataBytes == 0 && config.maxBytes != 0) {
+    config.maxMetadataBytes = std::max<size_t>(1, config.maxBytes / 4);
+  }
+  if (config.lowWatermarkMetadataBytes == 0) {
+    config.lowWatermarkMetadataBytes = config.maxMetadataBytes * 9 / 10;
+  }
+  config.lowWatermarkMetadataBytes = std::min(
+      config.lowWatermarkMetadataBytes, config.maxMetadataBytes);
+  return config;
+}
+
+void FilterCache::storeLimits(const FilterCacheConfig& derived) {
+  limits.maxBytes.store(derived.maxBytes, std::memory_order_relaxed);
+  limits.lowWatermarkBytes.store(derived.lowWatermarkBytes,
+                                 std::memory_order_relaxed);
+  limits.maxEntryBytes.store(derived.maxEntryBytes,
+                             std::memory_order_relaxed);
+  limits.maxMetadataBytes.store(derived.maxMetadataBytes,
+                                std::memory_order_relaxed);
+  limits.lowWatermarkMetadataBytes.store(derived.lowWatermarkMetadataBytes,
+                                         std::memory_order_relaxed);
+}
+
 FilterCache::FilterCache(FilterCacheConfig config)
   : config(config),
+    requested(config),
     clauseAdmission(config.admissionHistorySize, config.admissionThreshold),
     wholeAdmission(config.wholeAdmissionHistorySize == 0
         ? config.admissionHistorySize : config.wholeAdmissionHistorySize,
@@ -941,28 +974,40 @@ FilterCache::FilterCache(FilterCacheConfig config)
   if (this->config.wholeAdmissionHistorySize == 0) {
     this->config.wholeAdmissionHistorySize = this->config.admissionHistorySize;
   }
-  if (this->config.lowWatermarkBytes == 0) {
-    this->config.lowWatermarkBytes = this->config.maxBytes * 9 / 10;
-  }
-  this->config.lowWatermarkBytes = std::min(
-      this->config.lowWatermarkBytes, this->config.maxBytes);
-  if (this->config.maxEntryBytes == 0 && this->config.maxBytes != 0) {
-    this->config.maxEntryBytes = std::max<size_t>(1,
-        this->config.maxBytes / 5);
-  }
-  if (this->config.maxMetadataBytes == 0 && this->config.maxBytes != 0) {
-    this->config.maxMetadataBytes = std::max<size_t>(1,
-        this->config.maxBytes / 4);
-  }
-  if (this->config.lowWatermarkMetadataBytes == 0) {
-    this->config.lowWatermarkMetadataBytes =
-        this->config.maxMetadataBytes * 9 / 10;
-  }
-  this->config.lowWatermarkMetadataBytes = std::min(
-      this->config.lowWatermarkMetadataBytes, this->config.maxMetadataBytes);
   this->config.minSegmentDocs = std::max(0, this->config.minSegmentDocs);
+  storeLimits(deriveLimits(config));
   activeSegments.store(std::make_shared<const ActiveSnapshot>(),
                        std::memory_order_release);
+}
+
+FilterCacheConfig FilterCache::configuration() const {
+  FilterCacheConfig out = config;
+  out.maxBytes = limits.maxBytes.load(std::memory_order_relaxed);
+  out.lowWatermarkBytes =
+      limits.lowWatermarkBytes.load(std::memory_order_relaxed);
+  out.maxEntryBytes = maxEntryBytes();
+  out.maxMetadataBytes =
+      limits.maxMetadataBytes.load(std::memory_order_relaxed);
+  out.lowWatermarkMetadataBytes =
+      limits.lowWatermarkMetadataBytes.load(std::memory_order_relaxed);
+  return out;
+}
+
+void FilterCache::resize(size_t maxBytes) {
+  {
+    std::lock_guard<std::mutex> lock(resizeMutex);
+    requested.maxBytes = maxBytes;
+    storeLimits(deriveLimits(requested));
+  }
+  if (maxBytes == 0) {
+    clear();
+    return;
+  }
+  // A shrink below the old low watermark can leave residency between the new
+  // watermarks without crossing maxBytes; request a sweep unconditionally so
+  // the cache settles at the new low watermark either way.
+  sweepRequested.store(true, std::memory_order_release);
+  sweep();
 }
 
 uint64_t FilterCache::nextEpoch() {
@@ -1350,7 +1395,7 @@ void FilterCache::observeAdmissionLane(Use& use, AdmissionLane lane) {
   // observations are retained here and recorded by probeReaderStable only
   // after that gate accepts the request.
   if (use.scope_ == FilterKeyScope::READER_STABLE) return;
-  if (use.key.bytes().size() > config.maxEntryBytes) {
+  if (use.key.bytes().size() > maxEntryBytes()) {
     counter.oversizedKeyBypasses.fetch_add(1, std::memory_order_relaxed);
     return;
   }
@@ -1416,7 +1461,7 @@ std::shared_ptr<const FilterCache::SegmentValue> FilterCache::publish(
           && use.readerCoreGen >= publishedCoreGen.load(std::memory_order_acquire)
           && isActive(*active, identity)
           && local->card() != slot->maxDoc
-          && local->ramBytesUsed() <= config.maxEntryBytes;
+          && local->ramBytesUsed() <= maxEntryBytes();
       if (valid) {
         size_t valueCount = residentValueCount(*use.entry) + 1;
         double effectiveBytes = effectiveValueBytes(
@@ -1492,7 +1537,7 @@ FilterCache::publishReaderValue(
               == publishedReaderVersion.load(std::memory_order_acquire)
           && active->readerVersion == use.readerVersion
           && identitiesMatch
-          && local->ramBytesUsed() <= config.maxEntryBytes;
+          && local->ramBytesUsed() <= maxEntryBytes();
       if (valid) {
         size_t valueCount = residentValueCount(*localEntry);
         if (current == nullptr) valueCount++;
@@ -1650,10 +1695,11 @@ bool FilterCache::onReaderPublished(IndexReader& reader) {
 }
 
 void FilterCache::maybeSweep() {
-  if (residentBytes.load(std::memory_order_relaxed) > config.maxBytes
+  if (residentBytes.load(std::memory_order_relaxed)
+          > limits.maxBytes.load(std::memory_order_relaxed)
       || entries.size() > config.maxMetadataEntries
       || metadataBytes.load(std::memory_order_relaxed)
-          > config.maxMetadataBytes) {
+          > limits.maxMetadataBytes.load(std::memory_order_relaxed)) {
     sweepRequested.store(true, std::memory_order_release);
     sweep();
   }
@@ -1681,7 +1727,8 @@ void FilterCache::sweep() {
     {
       SweepGuard guard{sweeping};
       while (residentBytes.load(std::memory_order_relaxed)
-             > config.lowWatermarkBytes) {
+             > limits.lowWatermarkBytes.load(
+                 std::memory_order_relaxed)) {
         std::vector<std::shared_ptr<FilterEntry>> entrySnapshot;
         entrySnapshot.reserve(entries.size());
         entries.cvisit_all([&](const auto& item) {
@@ -1710,7 +1757,10 @@ void FilterCache::sweep() {
         bool detached = false;
         for (const auto& candidate : candidates) {
           if (residentBytes.load(std::memory_order_relaxed)
-              <= config.lowWatermarkBytes) break;
+              <= limits.lowWatermarkBytes.load(
+                  std::memory_order_relaxed)) {
+            break;
+          }
           if (candidate.readerValue != nullptr) {
             std::lock_guard<FilterEntry> feedbackLock(*candidate.entry);
             auto expected = candidate.readerValue;
@@ -1759,7 +1809,7 @@ void FilterCache::sweep() {
 void FilterCache::sweepMetadata() {
   if (entries.size() <= config.maxMetadataEntries
       && metadataBytes.load(std::memory_order_relaxed)
-          <= config.maxMetadataBytes) {
+          <= limits.maxMetadataBytes.load(std::memory_order_relaxed)) {
     return;
   }
   struct Candidate {
@@ -1779,7 +1829,8 @@ void FilterCache::sweepMetadata() {
   for (const auto& candidate : candidates) {
     bool overCount = entries.size() > config.maxMetadataEntries;
     bool overBytes = metadataBytes.load(std::memory_order_relaxed)
-        > config.lowWatermarkMetadataBytes;
+        > limits.lowWatermarkMetadataBytes.load(
+            std::memory_order_relaxed);
     if (!overCount && !overBytes) break;
     bool canErase = true;
     {
@@ -1787,7 +1838,8 @@ void FilterCache::sweepMetadata() {
       if (!candidate.entry->resident) continue;
       overCount = entries.size() > config.maxMetadataEntries;
       overBytes = metadataBytes.load(std::memory_order_relaxed)
-          > config.lowWatermarkMetadataBytes;
+          > limits.lowWatermarkMetadataBytes.load(
+              std::memory_order_relaxed);
       if (!overCount && !overBytes) break;
       auto readerValue = candidate.entry->readerValue.load(
           std::memory_order_acquire);

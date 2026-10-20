@@ -1928,6 +1928,11 @@ message CacheControlRequest {
   bool reset_counters = 4;
   bool dump = 5;
   uint32 dump_limit = 6;  // max dump rows per shard; 0 = 100
+  // Resizes each selected shard's filter cache before the other actions; 0
+  // disables it and drops every entry. Derived budgets (watermarks, per-entry
+  // and metadata caps) follow the new size. Not persisted: a reopened
+  // collection starts at the server's --query-cache-bytes.
+  optional uint64 max_bytes = 8;
 }
 
 // One resident cache entry. key_text is the printable-byte extraction from

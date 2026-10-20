@@ -26,9 +26,9 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
 void gatherSystemStats(api::SystemStats* system, api::HostStats* host, std::string_view dataDirectory,
                        std::pmr::memory_resource& resource);
 
-// Apply the requested filter-cache actions (flush / reset_admission /
-// reset_counters) and gather post-action stats plus an optional resident-entry
-// dump. Same borrowing contract as gatherStats.
+// Apply the requested filter-cache actions (max_bytes resize / flush /
+// reset_admission / reset_counters) and gather post-action stats plus an
+// optional resident-entry dump. Same borrowing contract as gatherStats.
 void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request,
                         api::CacheControlResponse& response,
                         std::pmr::memory_resource& resource);

@@ -447,6 +447,7 @@ Admin control over the per-collection query cache. Actions compose and apply in 
 | <a id="field-luxir.cachecontrolrequest.reset_counters"></a>[`reset_counters`](#field-luxir.cachecontrolrequest.reset_counters) | 4 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.dump"></a>[`dump`](#field-luxir.cachecontrolrequest.dump) | 5 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.dump_limit"></a>[`dump_limit`](#field-luxir.cachecontrolrequest.dump_limit) | 6 | `uint32` | singular | max dump rows per shard; 0 = 100 |
+| <a id="field-luxir.cachecontrolrequest.max_bytes"></a>[`max_bytes`](#field-luxir.cachecontrolrequest.max_bytes) | 8 | `uint64` | optional | Resizes each selected shard's filter cache before the other actions; 0 disables it and drops every entry. Derived budgets (watermarks, per-entry and metadata caps) follow the new size. Not persisted: a reopened collection starts at the server's --query-cache-bytes. |
 
 <a id="message-luxir.cachecontrolresponse"></a>
 
