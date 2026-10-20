@@ -32,6 +32,7 @@
 #include "luxir/util/Signal.h"
 #include "luxir/server/CommitWaits.h"
 #include "luxir/util/ApiError.h"
+#include "luxir/util/ErrorLog.h"
 #include "RpcStatus.h"
 #include "ProtoUpdateMessage.h"
 #include "Stats.h"
@@ -58,77 +59,95 @@ GRPCServer::GRPCServer(LuxirNode& node, int nthreads, int port, int64_t streamBu
 // NOTE: as of gRPC 1.39 there is a new C++ async callback API: https://github.com/grpc/grpc/pull/25728 in addition to an EventEngine
 // interface that may help with integration with external event loops.
 
-void luxir::GRPCServer::run() {
-  nameThisThread("luxir_grpc_main");
+bool luxir::GRPCServer::run() {
+  bool released = false;
+  try {
+    nameThisThread("luxir_grpc_main");
 
-  // Use requestedPort (default 0 for dynamic allocation, or a specific port
-  // like 50051).  Dynamic test ports bind localhost; configured ports keep the
-  // existing all-interfaces behavior.
-  std::string bindHost = requestedPort == 0 ? "127.0.0.1" : "0.0.0.0";
-  std::string server_address = bindHost + ":" + std::to_string(requestedPort);
+    // Use requestedPort (default 0 for dynamic allocation, or a specific port
+    // like 50051).  Dynamic test ports bind localhost; configured ports keep the
+    // existing all-interfaces behavior.
+    std::string bindHost = requestedPort == 0 ? "127.0.0.1" : "0.0.0.0";
+    std::string server_address = bindHost + ":" + std::to_string(requestedPort);
 
-  registerLuxirDescriptors();
-  grpc::EnableDefaultHealthCheckService(true);
-  grpc::reflection::InitProtoReflectionServerBuilderPlugin();
-  grpc::ServerBuilder builder;
-  // Listen on the given address without any authentication mechanism.
-  // The actual port will be stored in serverPort
-  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(), &serverPort);
+    registerLuxirDescriptors();
+    grpc::EnableDefaultHealthCheckService(true);
+    grpc::reflection::InitProtoReflectionServerBuilderPlugin();
+    grpc::ServerBuilder builder;
+    // Listen on the given address without any authentication mechanism.
+    // The actual port will be stored in serverPort
+    builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(), &serverPort);
 
-  // gRPC's own default (4 MiB) is far below the HTTP buffered-body limit and
-  // rejects ordinary update batches.  The send size stays at gRPC's default
-  // (unlimited): search replies are streamed in bounded batches.
-  const auto& config = luxirNode.getConfig();
-  int64_t maxReceive = config.server.grpc.max_receive_message_size > 0
-                           ? config.server.grpc.max_receive_message_size
-                           : config.ingest.max_request_body;
-  maxReceive = std::clamp<int64_t>(maxReceive, 1, std::numeric_limits<int>::max());
-  builder.SetMaxReceiveMessageSize((int)maxReceive);
+    // gRPC's own default (4 MiB) is far below the HTTP buffered-body limit and
+    // rejects ordinary update batches.  The send size stays at gRPC's default
+    // (unlimited): search replies are streamed in bounded batches.
+    const auto& config = luxirNode.getConfig();
+    int64_t maxReceive = config.server.grpc.max_receive_message_size > 0
+                             ? config.server.grpc.max_receive_message_size
+                             : config.ingest.max_request_body;
+    maxReceive = std::clamp<int64_t>(maxReceive, 1, std::numeric_limits<int>::max());
+    builder.SetMaxReceiveMessageSize((int)maxReceive);
 
-  // One generic service handles every method as raw bytes; dispatch is by RPC
-  // path inside GenericCallData.  registerLuxirDescriptors() makes describe and
-  // FileContainingSymbol work through the generated descriptor pool.  TODO:
-  // add a descriptor-backed reflection service for ListServices, since the
-  // stock plugin lists registered typed services and generic service leaves it
-  // empty.
-  builder.RegisterAsyncGenericService(&genericService);
+    // One generic service handles every method as raw bytes; dispatch is by RPC
+    // path inside GenericCallData.  registerLuxirDescriptors() makes describe and
+    // FileContainingSymbol work through the generated descriptor pool.  TODO:
+    // add a descriptor-backed reflection service for ListServices, since the
+    // stock plugin lists registered typed services and generic service leaves it
+    // empty.
+    builder.RegisterAsyncGenericService(&genericService);
 
-  threadInfos.reserve(nthreads);
+    threadInfos.reserve(nthreads);
 
-  // Give each thread a completion queue, but don't let them use it
-  // before the server starts (implemented with startLatch)
-  for (int i=0; i<nthreads; i++) {
-    threadInfos.emplace_back();
-    threadInfos.back().threadno = i;
-    threadInfos.back().cq = builder.AddCompletionQueue(); // each thread gets it's own completion queue
-  }
+    // Give each thread a completion queue, but don't let them use it
+    // before the server starts (implemented with startLatch)
+    for (int i=0; i<nthreads; i++) {
+      threadInfos.emplace_back();
+      threadInfos.back().threadno = i;
+      threadInfos.back().cq = builder.AddCompletionQueue(); // each thread gets it's own completion queue
+    }
 
-  this->server = builder.BuildAndStart();
-  if (!server) {
-    LOG_ERROR("GRPCServer failed to listen on {}", server_address);
+    this->server = builder.BuildAndStart();
+    if (!server) {
+      LOG_ERROR("GRPCServer failed to listen on {}", server_address);
+      startupFailed.store(true);
+      released = true;
+      startLatch.count_down();
+      startLatchThreads.count_down(nthreads);
+      return false;
+    }
+    LOG_INFO("GRPCServer listening on {}:{} (max receive message size {} bytes)", bindHost, serverPort, maxReceive);
+
+    threads.reserve(nthreads);
+    for (int i=0; i<nthreads; i++) {
+      Signal::emit("grpcWorkerStart", &i);
+      threads.emplace_back([this,i]{ this->runThread(threadInfos[i]); });
+    }
+
+    // inform everyone that the server is up and running
     startLatch.count_down();
-    startLatchThreads.count_down(nthreads);
-    return;
+    released = true;
+    startLatchThreads.wait();
+    if (startupFailed.load()) { shutdown(); return false; }
+    // At this point the completion queues have all been created, but runThread() may not have continued (hence we have
+    // not requested to the completion queue to handle certain messages.) If a client request comes in, it will still
+    // wait to be handled (and then will be handled correctly.)  This was tested manually by adding a long sleep
+    // in runThread() before requesting calls.
+
+    // Wait for the server to shutdown. Note that some other thread must be
+    // responsible for shutting down the server for this call to ever return.
+    server->Wait();
+    GRPC_DEBUG("server->Wait() returned!");
+    return true;
+  } catch (...) {
+    logCurrentException({"grpc.start", {}, {}, {}});
+    startupFailed.store(true);
+    if (!released) {
+      startLatchThreads.count_down(nthreads - threads.size());
+      startLatch.count_down();
+    }
+    shutdown();
+    return false;
   }
-  LOG_INFO("GRPCServer listening on {}:{} (max receive message size {} bytes)", bindHost, serverPort,
-           maxReceive);
-
-  threads.reserve(nthreads);
-  for (int i=0; i<nthreads; i++) {
-    threads.emplace_back([this,i]{ this->runThread(threadInfos[i]); });
-  }
-
-  // inform everyone that the server is up and running
-  startLatch.count_down();
-  // At this point the completion queues have all been created, but runThread() may not have continued (hence we have
-  // not requested to the completion queue to handle certain messages.) If a client request comes in, it will still
-  // wait to be handled (and then will be handled correctly.)  This was tested manually by adding a long sleep
-  // in runThread() before requesting calls.
-
-  // Wait for the server to shutdown. Note that some other thread must be
-  // responsible for shutting down the server for this call to ever return.
-  server->Wait();
-  GRPC_DEBUG("server->Wait() returned!");
 }
 
 
@@ -261,7 +280,7 @@ static bool parseRequest(grpc::ByteBuffer& buf, HppRequestState<Message>& state,
   const size_t payloadSize = state.wire.size() - luxir::api::PADDED_PROTO_INPUT_BYTES;
   std::span<const std::byte> payload(state.wire.data(), payloadSize);
   if (!luxir::api::decode(state.proto, payload, state.resource)) {
-    LOG_ERROR("{}: failed to parse request", method);
+    LOG_WARN("{}: failed to parse request", method);
     return false;
   }
   return true;
@@ -296,6 +315,7 @@ static grpc::ByteBuffer serializeToByteBuffer(const Message& msg) {
 // post-write callback. A unary RPC is just a stream with one read + one write.
 class GenericCallData : public CallData {
 public:
+  grpc::Status emergencyStatus{grpc::StatusCode::INTERNAL, "request failed"};
   MetricScope requestMetric;
   std::atomic<int> metricErrorKind{-1};  // the first ErrorKind, or -1
   std::stop_source waitCancellation{std::nostopstate};
@@ -334,7 +354,8 @@ public:
   // initiate Finish (a Finish initiated elsewhere could race the FINISH
   // completion deleting this object).  While engaged, Finish is held off so
   // the in-flight alarm tag can never dangle.
-  std::optional<grpc::Alarm> finishKick;
+  grpc::Alarm finishAlarm; // reserve before accepting requests, including allocation failures
+  bool finishKick = false;
 
   bool doneReceived = false;
   bool finishReceived = false;
@@ -385,8 +406,8 @@ public:
   // call's cq thread via an immediately-expiring alarm.
   void kickFinish() {
     if (finishSent || finishKick) return;
-    finishKick.emplace();
-    finishKick->Set(threadInfo.cq.get(), gpr_now(GPR_CLOCK_MONOTONIC), make_tag(KICK));
+    finishKick = true;
+    finishAlarm.Set(threadInfo.cq.get(), gpr_now(GPR_CLOCK_MONOTONIC), make_tag(KICK));
   }
 
   /// Enqueue an owned response (one outstanding write at a time).
@@ -397,22 +418,25 @@ public:
   /// so make it the last use of "this" in the caller.
   int64_t respondRaw(grpc::ByteBuffer&& buf, int32_t finishCount = 1) {
     const std::lock_guard<std::mutex> lock(mutex);
-    responsesExpected -= finishCount;
-    if (finishCount > 0) requestCompleted();
     if (errored) {
+      responsesExpected -= finishCount;
+      if (finishCount > 0) requestCompleted();
       // Client is gone: drop the bytes.  The finish accounting above must still
       // take effect, but Finish may only be initiated from the cq thread - kick
       // it over there.
       kickFinish();
       return -1;
     }
-    server.getLuxirNode().metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::GRPC, buf.Length());
-    queuedBytes += (int64_t)buf.Length();
+    auto bytes = (int64_t)buf.Length();
     if (writeOutstanding) {
       pending.emplace_back(std::move(buf));
     } else {
       doWrite(std::move(buf));
     }
+    queuedBytes += bytes;
+    server.getLuxirNode().metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::GRPC, (uint64_t)bytes);
+    responsesExpected -= finishCount;
+    if (finishCount > 0) requestCompleted();
     return queuedBytes;
   }
 
@@ -466,7 +490,7 @@ public:
       const std::lock_guard<std::mutex> lock(mutex);
       responsesExpected -= finishCount;
       readsDone = true;
-      finishStatus = status;
+      finishStatus = std::move(status);
       kickFinish();
       waiters = std::move(drainWaiters);
     }
@@ -516,6 +540,36 @@ public:
     }
   }
 
+  void failCurrentException(int32_t finishCount = 1, ErrorContext context = {}) noexcept {
+    context.operation = genericCtx.method();
+    logCurrentException(context);
+    grpc::Status status;
+    try {
+      auto info = currentExceptionInfo(ErrorKind::INTERNAL);
+      metricError(info.kind);
+      status = grpcStatus(info);
+    } catch (...) {
+      metricError(ErrorKind::INTERNAL);
+      const std::lock_guard<std::mutex> lock(mutex);
+      status = std::move(emergencyStatus);
+    }
+    try { finishWithError(std::move(status), finishCount); }
+    catch (...) { genericCtx.TryCancel(); }
+  }
+
+  // Completion ownership stays with the callback until enqueue succeeds.
+  // Running inline is safe here: gRPC replies already support engine threads.
+  template<class F>
+  void enqueueCompletion(F fn) noexcept {
+    auto completion = [this, fn = std::move(fn)]() noexcept {
+      try { fn(); } catch (...) { failCurrentException(); }
+    };
+    try {
+      Signal::emit("grpcCompletionEnqueue");
+      server.getLuxirNode().getTaskArena().enqueue(completion);
+    } catch (...) { completion(); }
+  }
+
   // mutex held, or initial CONNECT before dispatching any work.
   void readRequest() {
     assert(!readOutstanding);
@@ -543,88 +597,94 @@ public:
     delete this;
   }
 
-  virtual void proceed(bool ok, uint32_t tag) override {
-    switch (tag) {
-      case CONNECT:
-        if (!ok) { delete this; break; }
-        // re-arm a fresh acceptor before doing any work
-        createNew();
-        methodEntry = lookupMethod(genericCtx.method());
-        requestMetric.begin(*server.getLuxirNode().metrics, metricActivity(MetricTransport::GRPC,
-            methodEntry ? methodEntry->operation : MetricOperation::OTHER));
-        if (methodEntry == nullptr) {
-          metricError(ErrorKind::NOT_FOUND);
-          LOG_ERROR("gRPC: no handler for method '{}'", genericCtx.method());
-          readsDone = true;
-          finishSent = true;
-          readerWriter.Finish(grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "unknown method"), make_tag(FINISH));
-          break;
-        }
-        if (methodEntry->mutating && server.getLuxirNode().readOnly()) {
-          metricError(ErrorKind::FAILED_PRECONDITION);
-          readsDone = true;
-          finishSent = true;
-          readerWriter.Finish(
-              grpcStatus({ErrorKind::FAILED_PRECONDITION, "read_only",
-                          "node is read-only (--read-only): " + genericCtx.method() +
-                              " is not allowed"}),
-              make_tag(FINISH));
-          break;
-        }
-        readRequest();
-        break;
-      case READ: {
-        bool discard;
-        {
-          const std::lock_guard<std::mutex> lock(mutex);
-          readOutstanding = false;
-          if (!ok) readsDone = true;
-          discard = readsDone || finishSent;
-          if (discard) maybeSendFinish();
-          // A response may arrive from another thread before handle returns.
-          else responsesExpected++;
-        }
-        if (discard) { deleteIfFinished(); break; }
-        server.getLuxirNode().metrics->add(MetricTransportCounter::RECEIVED_BYTES, MetricTransport::GRPC, readBuf.Length());
-        methodEntry->handle(*this, readBuf);
-        {
-          const std::lock_guard<std::mutex> lock(mutex);
-          if (readsDone || finishSent) break;
-          if (requestActive) {
-            // Async request still running (or paused on flow control): defer
-            // the next READ to its completion so pipelined requests on this
-            // stream execute, and respond, in order.
-            rearmPending = true;
+  virtual void proceed(bool ok, uint32_t tag) noexcept override {
+    bool dispatching = false;
+    try {
+      switch (tag) {
+        case CONNECT:
+          if (!ok) { delete this; break; }
+          // re-arm a fresh acceptor before doing any work
+          createNew();
+          methodEntry = lookupMethod(genericCtx.method());
+          requestMetric.begin(*server.getLuxirNode().metrics, metricActivity(MetricTransport::GRPC,
+              methodEntry ? methodEntry->operation : MetricOperation::OTHER));
+          if (methodEntry == nullptr) {
+            metricError(ErrorKind::NOT_FOUND);
+            LOG_WARN("gRPC: no handler for method '{}'", genericCtx.method());
+            readsDone = true;
+            finishSent = true;
+            readerWriter.Finish(grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "unknown method"), make_tag(FINISH));
+            break;
+          }
+          if (methodEntry->mutating && server.getLuxirNode().readOnly()) {
+            metricError(ErrorKind::FAILED_PRECONDITION);
+            readsDone = true;
+            finishSent = true;
+            readerWriter.Finish(
+                grpcStatus({ErrorKind::FAILED_PRECONDITION, "read_only",
+                            "node is read-only (--read-only): " + genericCtx.method() +
+                                " is not allowed"}),
+                make_tag(FINISH));
             break;
           }
           readRequest();
+          break;
+        case READ: {
+          bool discard;
+          {
+            const std::lock_guard<std::mutex> lock(mutex);
+            readOutstanding = false;
+            if (!ok) readsDone = true;
+            discard = readsDone || finishSent;
+            if (discard) maybeSendFinish();
+            // A response may arrive from another thread before handle returns.
+            else responsesExpected++;
+          }
+          if (discard) { deleteIfFinished(); break; }
+          server.getLuxirNode().metrics->add(MetricTransportCounter::RECEIVED_BYTES, MetricTransport::GRPC, readBuf.Length());
+          dispatching = true;
+          Signal::emit("grpcRequestDispatch");
+          methodEntry->handle(*this, readBuf);
+          dispatching = false; // The handler now owns completion, possibly asynchronously.
+          {
+            const std::lock_guard<std::mutex> lock(mutex);
+            if (readsDone || finishSent) break;
+            if (requestActive) {
+              // Async request still running (or paused on flow control): defer
+              // the next READ to its completion so pipelined requests on this
+              // stream execute, and respond, in order.
+              rearmPending = true;
+              break;
+            }
+            readRequest();
+          }
+          break;
         }
-        break;
+        case WRITE:
+          writeFinished(ok);
+          break;
+        case KICK: {
+          // A non-cq thread requested a finish evaluation (ok is irrelevant -
+          // even a cancelled alarm must clear finishKick so Finish can proceed).
+          const std::lock_guard<std::mutex> lock(mutex);
+          finishKick = false;
+          maybeSendFinish();
+          break;
+        }
+        case DONE:
+          doneReceived = true;
+          if (genericCtx.IsCancelled()) waitCancellation.request_stop();
+          deleteIfFinished();
+          break;
+        case FINISH:
+          finishReceived = true;
+          deleteIfFinished();
+          break;
+        default:
+          LOG_ERROR("Unknown tag {} on generic call {}", tag, (void*)this);
+          break;
       }
-      case WRITE:
-        writeFinished(ok);
-        break;
-      case KICK: {
-        // A non-cq thread requested a finish evaluation (ok is irrelevant -
-        // even a cancelled alarm must clear finishKick so Finish can proceed).
-        const std::lock_guard<std::mutex> lock(mutex);
-        finishKick.reset();
-        maybeSendFinish();
-        break;
-      }
-      case DONE:
-        doneReceived = true;
-        if (genericCtx.IsCancelled()) waitCancellation.request_stop();
-        deleteIfFinished();
-        break;
-      case FINISH:
-        finishReceived = true;
-        deleteIfFinished();
-        break;
-      default:
-        LOG_ERROR("Unknown tag {} on generic call {}", tag, (void*)this);
-        break;
-    }
+    } catch (...) { failCurrentException(dispatching ? 1 : 0); }
   }
 };
 
@@ -642,12 +702,25 @@ static void finishWithError(GenericCallData& call, const ErrorInfo& info) {
   call.finishWithError(info);
 }
 
+template<class Request>
+static ErrorContext requestContext(const Request& request) {
+  ErrorContext context;
+  if constexpr (requires { request.tenant; }) context.tenant = request.tenant;
+  if constexpr (requires { request.collection; }) context.collection = request.collection;
+  else if constexpr (requires { request.name; }) context.collection = request.name;
+  if constexpr (requires { request.request_id; }) context.requestId = request.request_id;
+  return context;
+}
+
 // Unary handlers run after request parsing, so an unclassified exception is
 // the engine's; the request-class failures they meet (collection resolution,
 // schema validation, read-only storage) are typed.
 static void finishWithException(GenericCallData& call, const std::exception& e,
-                                ErrorKind fallback = ErrorKind::INTERNAL) {
-  finishWithError(call, classifyException(e, fallback));
+                                ErrorContext context = {}) {
+  auto info = classifyException(e, ErrorKind::INTERNAL);
+  context.operation = call.genericCtx.method();
+  logError(info, context);
+  finishWithError(call, info);
 }
 
 
@@ -674,10 +747,10 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       grpc::ByteBuffer buf;
       try {
         buf = serializeToByteBuffer(response.proto);
-      } catch (const std::exception& e) {
+      } catch (...) {
         // The response cannot be delivered: the call ends with the failure
         // instead of a silently empty message.
-        parent->finishWithError(classifyException(e, ErrorKind::INTERNAL), response.last ? 1 : 0);
+        parent->failCurrentException(response.last ? 1 : 0, {"search", tenant, proto.collection, proto.request_id});
         response.req.replyCallback(response);
         return ReplyStatus::CANCEL;
       }
@@ -687,7 +760,13 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       // Snapshot highWater first: once the final response is handed to
       // respondRaw, the call can Finish and delete parent at any moment.
       const int64_t highWater = parent->highWater;
-      int64_t buffered = parent->respondRaw(std::move(buf), response.last ? 1 : 0);
+      int64_t buffered;
+      try { buffered = parent->respondRaw(std::move(buf), response.last ? 1 : 0); }
+      catch (...) {
+        parent->failCurrentException(response.last ? 1 : 0, {"search", tenant, proto.collection, proto.request_id});
+        response.req.replyCallback(response);
+        return ReplyStatus::CANCEL;
+      }
       auto status = ReplyStatus::OK;
       if (buffered < 0) status = ReplyStatus::CANCEL;
       else if (buffered > highWater) status = ReplyStatus::PAUSE;
@@ -700,17 +779,21 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     void resumeWhenDrained(std::function<void()> resume) override {
       parent->whenDrained(std::move(resume));
     }
+
+    void failDelivery() noexcept override {
+      parent->failCurrentException(1, {"search", tenant, proto.collection, proto.request_id});
+      done();
+    }
   };
 
-  auto* arena = createArena();
+  std::unique_ptr<google::protobuf::Arena, decltype(&releaseArena)> ownedArena(createArena(), releaseArena);
+  auto* arena = ownedArena.get();
   auto requestState = std::make_unique<HppRequestState<SearchReqProto>>();
   if (!parseRequest(readBuf, *requestState, "Search")) {
-    releaseArena(arena);
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Search: malformed request"));
     return;
   }
   if (requestState->proto.response_format == luxir::api::ResponseFormat::DOCS) {
-    releaseArena(arena);
     // Doc-line framing is an HTTP/NDJSON concept; gRPC responses are already
     // framed DocList messages.
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST,
@@ -735,6 +818,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   // because its outstanding-response count stays positive until the final
   // reply, and requestActive keeps pipelined requests on this stream ordered.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  ownedArena.release(); // dispatch owns completion and cleanup, including scheduling failure.
   engine.dispatch(req, req.proto.max_parallel);
 }
 
@@ -760,24 +844,30 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
         // Admission runs on the completion queue thread, as does enabling
         // cancellation. Worker completions never read the mutable stop source.
         waitToken(parent->waitCancellation.get_token()) {}
-    virtual void done(IndexWriter& iw) override {
+    virtual void done(IndexWriter& iw) noexcept override {
       unused(iw);
-      auto completed = takeCompletion(parent->server.getLuxirNode());
       auto* call = parent;
       auto stop = waitToken;
+      std::shared_ptr<Completion> completed;
+      try {
+        Signal::emit("grpcUpdateCompletion");
+        completed = takeCompletion(call->server.getLuxirNode());
+      } catch (...) {
+        call->failCurrentException(1, {"update", target.tenant, target.name, request->proto.request_id});
+        delete this;
+        return;
+      }
       delete this;
-      completed->await(call->server.getLuxirNode(), [call](auto result) {
-        call->server.getLuxirNode().getTaskArena().enqueue([call, result] {
-          try {
+      try {
+        completed->await(call->server.getLuxirNode(), [call](auto result) {
+          call->enqueueCompletion([call, result] {
             // A unary update fails only when nothing was applied.
             if (!call->methodEntry->clientStream && result->response.status == api::UpdateResponse_::Status::ERROR)
               call->metricError(ProtoUpdateMessage::failureKind(result->response));
             call->respondRaw(serializeToByteBuffer(result->response), 1);
-          } catch (const std::exception& e) {
-            call->finishWithError(classifyException(e, ErrorKind::INTERNAL));
-          }
-        });
-      }, stop);
+          });
+        }, stop);
+      } catch (...) { call->failCurrentException(); }
     }
   };
 
@@ -798,7 +888,7 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       throw;
     }
   } catch (const std::exception& e) {
-    finishWithException(call, e);
+    finishWithException(call, e, request ? requestContext(request->proto) : ErrorContext{});
   }
 }
 
@@ -814,7 +904,7 @@ static void respondPublished(GenericCallData& call, std::shared_ptr<State> state
   waits.awaitReplicas(waits.prepareReplicas(std::move(name), commit, *requirement,
                                             waits.deadlineAfter(timeoutMs.value_or(30000)), members),
       stop, [&call, state](api::ReplicaResult replicas) {
-        call.server.getLuxirNode().getTaskArena().enqueue([&call, state, replicas] {
+        call.enqueueCompletion([&call, state, replicas] {
           try {
             state->response.replicas = replicas;
             call.respondRaw(serializeToByteBuffer(state->response), 1);
@@ -837,7 +927,7 @@ static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& read
       call.enableWaitCancellation();
     }
     { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call, stop = call.waitCancellation.get_token()] {
+    call.enqueueCompletion([request, &call, stop = call.waitCancellation.get_token()] {
       try {
         auto id = LuxirNode::adminTarget(request->proto.tenant, request->proto.name);
         auto created = call.server.getLuxirNode().createCollection(id,
@@ -851,11 +941,11 @@ static void handleCreateCollection(GenericCallData& call, grpc::ByteBuffer& read
         respondPublished(call, state, std::move(id), commit, request->proto.wait_for_replicas,
                          request->proto.wait_for_replicas_timeout_ms, ReplicationSource::Members::SUBSCRIBED, stop);
       } catch (const std::exception& e) {
-        finishWithException(call, e);
+        finishWithException(call, e, request ? requestContext(request->proto) : ErrorContext{});
       }
     });
   } catch (const std::exception& e) {
-    finishWithException(call, e);
+    finishWithException(call, e, request ? requestContext(request->proto) : ErrorContext{});
   }
 }
 
@@ -869,18 +959,18 @@ static void handleDeleteCollection(GenericCallData& call, grpc::ByteBuffer& read
 
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   try {
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+    call.enqueueCompletion([request, &call] {
       try {
         call.server.getLuxirNode().deleteCollection(LuxirNode::adminTarget(request->proto.tenant, request->proto.name));
         DeleteCollectionRespProto response;
         response.name = request->proto.name;
         call.respondRaw(serializeToByteBuffer(response), 1);
       } catch (const std::exception& e) {
-        finishWithException(call, e);
+        finishWithException(call, e, request ? requestContext(request->proto) : ErrorContext{});
       }
     });
   } catch (const std::exception& e) {
-    finishWithException(call, e);
+    finishWithException(call, e, request ? requestContext(request->proto) : ErrorContext{});
   }
 }
 
@@ -916,7 +1006,7 @@ static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
                      request.proto.wait_for_replicas_timeout_ms, ReplicationSource::Members::SERVING,
                      call.waitCancellation.get_token());
   } catch (const std::exception& e) {
-    finishWithException(call, e);
+    finishWithException(call, e, requestContext(request.proto));
   }
 }
 
@@ -939,7 +1029,7 @@ static void handleGetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     grpc::ByteBuffer buf = serializeToByteBuffer(response);
     call.respondRaw(std::move(buf), 1);
   } catch (const std::exception& e) {
-    finishWithException(call, e);
+    finishWithException(call, e, requestContext(request.proto));
   }
 }
 
@@ -956,18 +1046,18 @@ static void handleStats(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   // the call alive and requestActive preserves per-call request ordering.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   try {
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+    call.enqueueCompletion([request, &call] {
       try {
         StatsRespProto response;
         std::pmr::monotonic_buffer_resource respArena;
         gatherStats(call.server.getLuxirNode(), request->proto, response, respArena);
         call.respondRaw(serializeToByteBuffer(response), 1);
       } catch (const std::exception& e) {
-        finishWithException(call, e);
+        finishWithException(call, e, request ? requestContext(request->proto) : ErrorContext{});
       }
     });
   } catch (const std::exception& e) {
-    finishWithException(call, e);
+    finishWithException(call, e, request ? requestContext(request->proto) : ErrorContext{});
   }
 }
 
@@ -983,7 +1073,7 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
   // map; keep both off the completion-queue thread.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   try {
-    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+    call.enqueueCompletion([request, &call] {
       try {
         CacheControlRespProto response;
         std::pmr::monotonic_buffer_resource respArena;
@@ -991,11 +1081,11 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
                            respArena);
         call.respondRaw(serializeToByteBuffer(response), 1);
       } catch (const std::exception& e) {
-        finishWithException(call, e);
+        finishWithException(call, e, request ? requestContext(request->proto) : ErrorContext{});
       }
     });
   } catch (const std::exception& e) {
-    finishWithException(call, e);
+    finishWithException(call, e, request ? requestContext(request->proto) : ErrorContext{});
   }
 }
 
@@ -1033,8 +1123,13 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
   // accept backlog stays at this depth).  Matches the previous depth of 8
   // per-method acceptors.
   constexpr int kGenericAcceptors = 8;
-  for (int i = 0; i < kGenericAcceptors; i++) {
-    new GenericCallData(*this, genericService, threadInfo);
+  try {
+    if (!startupFailed.load()) for (int i = 0; i < kGenericAcceptors; i++) {
+      new GenericCallData(*this, genericService, threadInfo);
+    }
+  } catch (...) {
+    logCurrentException({"grpc.worker.start", {}, {}, {}});
+    startupFailed.store(true);
   }
 
   /*
@@ -1070,7 +1165,7 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
 
 bool GRPCServer::waitForStart() {
   startLatchThreads.wait();
-  return server != nullptr;
+  return server != nullptr && !startupFailed.load();
 }
 
 /*** NOTE: after upgrading from grpc1.41 (and dependencies) to grpc1.44 via vcpkg,
@@ -1094,6 +1189,7 @@ bool GRPCServer::waitForStart() {
     Another grpc example (written by someone else) also showed a leak after upgrading.
  */
 void luxir::GRPCServer::shutdown() {
+  std::lock_guard shutdownLock(shutdownMutex);
   stopping.request_stop();
   LOG_INFO("Shutting down luxir grpc server.");
   if (!server) {
@@ -1115,7 +1211,7 @@ void luxir::GRPCServer::shutdown() {
   GRPC_DEBUG("joining threads");
 
   for (auto& thread : threads) {
-    thread.join();
+    if (thread.joinable()) thread.join();
   }
 
   GRPC_DEBUG("shutdown complete");

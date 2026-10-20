@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir_main.h"
+#include "luxir/util/ErrorLog.h"
 
 int main(int argc, char** argv) {
-  return luxir_main(argc, argv);
+  try { return luxir_main(argc, argv); }
+  catch (...) {
+    luxir::logCurrentException({"process", {}, {}, {}});
+    return 1;
+  }
 }

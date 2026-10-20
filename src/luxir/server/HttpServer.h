@@ -13,6 +13,7 @@
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/ip/tcp.hpp>
 #include "LuxirNode.h"
+#include "luxir/util/ReservedHandler.h"
 
 namespace luxir {
 
@@ -76,6 +77,7 @@ private:
   std::optional<boost::asio::ip::tcp::acceptor> acceptor;
   std::optional<boost::asio::steady_timer> replicationTimer;
   std::thread acceptThread;
+  ReservedHandlerAllocator<> expiryAllocator;
   // Sessions and off-io work pins co-own their shard so executor teardown is
   // safe on any thread after HttpServer has joined the shard runner.
   std::vector<std::shared_ptr<HttpIoShard>> shards;

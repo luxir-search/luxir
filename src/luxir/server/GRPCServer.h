@@ -15,6 +15,8 @@ namespace luxir {
 
 class GRPCServer {
   std::stop_source stopping;
+  std::atomic<bool> startupFailed{false};
+  std::mutex shutdownMutex;
 public:
   std::stop_token stopToken() const { return stopping.get_token(); }
   // gRPC performance guidelines suggest having numcpu threads and 2 threads per completion queue.
@@ -30,7 +32,8 @@ public:
   int64_t streamBufferBytes() const { return streamBufferBytes_; }
 
   /// This starts the server and blocks the current thread until shutdown.
-  void run();
+  // False on startup failure; safe to invoke from an owning server thread.
+  bool run();
 
   /// wait for the server to come up, returns false on failure
   bool waitForStart();
