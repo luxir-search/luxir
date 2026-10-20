@@ -10,11 +10,13 @@
 #include "luxir/index/Inverter.h"
 #include "luxir/index/IntColWriter.h"
 #include "luxir/index/PointsWriter.h"
+#include "luxir/index/RangeBKDWriter.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/geo.h"
 
 #include <fmt/format.h>
 
+#include <array>
 #include <ranges>
 
 using namespace luxir;
@@ -37,6 +39,16 @@ inline void writePoints(PostingsWriter& postingsWriter,
   PointsWriter writer(*output, PointsWriter::Options{});
   for (const auto& point : points) writer.addPoint(point.value, point.docid);
   auto data = writer.finish();
+  fieldInfo.pointsLoc = data.pointsLoc;
+  fieldInfo.pointsMetaOff = data.pointsMetaOff;
+}
+
+inline void writeRangePoints(PostingsWriter& postingsWriter,
+                             PostingsWriter::IndexFieldInfo& fieldInfo,
+                             std::vector<RangeBKDWriter::Point>& points) {
+  auto output = postingsWriter.getOutputStream();
+  RangeBKDWriter writer(*output);
+  auto data = writer.write(points);
   fieldInfo.pointsLoc = data.pointsLoc;
   fieldInfo.pointsMetaOff = data.pointsMetaOff;
 }
@@ -326,6 +338,9 @@ public:
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
+    // A range column always holds a (min, max) pair per doc, so the segment
+    // marks it multi-valued whatever the logical field says.
+    if (fieldType->type() == FieldType::RANGE) fieldInfo.flags |= FieldType::MULTI_VALUED;
     flushIntCol(inverter, fieldInfo);
   }
 
@@ -344,7 +359,32 @@ public:
     }
 
     if (fieldType->rangeIndexed()) {
-      if (fieldType->type() == FieldType::GEO_POINT) {
+      if (fieldType->type() == FieldType::RANGE) {
+        // Values alternate min, max; each doc holds length / 2 points.
+        std::vector<RangeBKDWriter::Point> points;
+        points.reserve((size_t)numVals / 2);
+        inverter.noteFlushWorkspace(points.capacity() * sizeof(RangeBKDWriter::Point));
+        bool low = true;
+        int64_t min = 0;
+        longStream.visitValues(inverter.pool, [&](int64_t value) {
+          if (low) min = value;
+          else points.push_back({min, value, 0});
+          low = !low;
+        });
+        IntStream::Reader lengths(lengthStream, inverter.pool);
+        size_t pointIndex = 0;
+        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+          assert(!lengths.eof());
+          int32_t length = lengths.next();
+          assert(length % 2 == 0);
+          for (int32_t i = 0; i < length / 2; i++) {
+            assert(pointIndex < points.size());
+            points[pointIndex++].docid = docid;
+          }
+        });
+        assert(pointIndex == points.size());
+        writeRangePoints(postingsWriter, fieldInfo, points);
+      } else if (fieldType->type() == FieldType::GEO_POINT) {
         std::vector<BKDWriter::Point> points;
         points.reserve((size_t)numVals);
         inverter.noteFlushWorkspace(points.capacity() * sizeof(BKDWriter::Point));
@@ -486,5 +526,61 @@ public:
   }
 };
 
+// A range field value: {"gte"|"gt": a, "lte"|"lt": b}, either side optional.
+// The column holds the encoded inclusive (min, max) pair (see RangeFieldType).
+class RangeHandler final : public MultiIntColHandler {
+  [[noreturn]] void invalid(std::string_view detail) const {
+    throw DocumentError(fmt::format("field '{}': cannot coerce value to a range: {}",
+                                    std::string_view(fieldName), detail));
+  }
+
+public:
+  RangeHandler(Inverter& inverter, const std::string_view& fieldName,
+               const std::shared_ptr<FieldType>& fieldType)
+    : MultiIntColHandler(inverter, fieldName, fieldType) {}
+
+  void index(Inverter& inverter, int64_t int64) override {
+    unused(inverter, int64);
+    invalid("expected an object with gte/gt and lte/lt bounds");
+  }
+
+  void index(Inverter& inverter, std::span<const int64_t> vals) override {
+    unused(inverter, vals);
+    invalid("expected an object with gte/gt and lte/lt bounds");
+  }
+
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (coerce::isNull(val)) return;
+    if (const auto* arr = std::get_if<luxir::api::ArrVal>(&val.kind)) {
+      if (arr->v.empty()) return;
+      if (arr->v.size() != 1) invalid("multi-valued range fields are not supported yet");
+      index(inverter, arr->v[0]);
+      return;
+    }
+    const auto* map = std::get_if<luxir::api::Map>(&val.kind);
+    if (map == nullptr) {
+      invalid(fmt::format("expected an object with gte/gt and lte/lt bounds, got {}",
+                          coerce::describe(val)));
+    }
+    const IndexVal* gte = nullptr;
+    const IndexVal* gt = nullptr;
+    const IndexVal* lte = nullptr;
+    const IndexVal* lt = nullptr;
+    for (const auto& [key, value] : map->fields) {
+      const IndexVal* bound = &*value;
+      if (key == "gte") gte = bound;
+      else if (key == "gt") gt = bound;
+      else if (key == "lte") lte = bound;
+      else if (key == "lt") lt = bound;
+      else invalid(fmt::format("unknown key '{}' (expected gte, gt, lte or lt)", key));
+    }
+    auto& rangeType = (const RangeFieldType&)*fieldType;
+    auto bounds = rangeType.encodeBounds(gte, gt, lte, lt, std::string_view(fieldName),
+                                         inverter.coerceContext);
+    if (!bounds) invalid("the lower bound is above the upper bound");
+    std::array<int64_t, 2> pair{bounds->lo, bounds->hi};
+    indexMulti(inverter, pair);
+  }
+};
 
 } // namespace luxir::handler

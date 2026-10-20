@@ -19,7 +19,32 @@ Choose a type based on how you want to search and use the values:
 | `date` | Timestamp with millisecond precision, supplied as ISO-8601 text or epoch milliseconds. Supports date queries, ranges, and calendar facets. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, for distance and bounding-box queries. See [Geo search](geo-search.md). |
+| `long_range`, `double_range`, `date_range` | An interval of `int`, `double`, or `date` endpoints, such as a validity window, a price band, or an event's duration. See [Range types](#range-types). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
+
+### Range types
+
+A range value is an object with an optional lower bound (`gte` or `gt`) and an
+optional upper bound (`lte` or `lt`); a missing side is an open end:
+
+```json
+{"id": "promo-7", "valid": {"gte": "2024-06-01", "lt": "2024-07-01"}, "price": {"gte": 10.5, "lte": 20}}
+```
+
+Endpoints coerce like the matching scalar type. An exclusive bound is stored
+as its inclusive neighbor (`{"gt": 5}` on `long_range` stores 6), and
+`date_range` bounds round to the granule they name, as date range queries do:
+`{"lte": "2024-06"}` ends on the last millisecond of June. A lower bound above
+the upper bound fails the document. Search results return each value as
+`{"gte": min, "lte": max}` (dates as epoch milliseconds), with an open end
+omitted.
+
+Range fields are single-valued, require `column` (the default), and do not
+support `stored` or `index: match`. `index: range` adds a points index over
+the endpoints; without it, queries scan the column. Query them with the
+[range query](query-reference.md#range-fields) and its `relation` (`intersects`,
+`contains`, or `within`). Sorting and faceting on range fields are not
+supported.
 
 ### `text` versus `string`
 
@@ -266,7 +291,7 @@ publication advances the schema generation.
 
 | Key | Meaning |
 |---|---|
-| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
+| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `long_range`, `double_range`, `date_range`, `id` |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | multi-valued |
@@ -434,6 +459,7 @@ The primary and every variant must use types from the same group:
 | Scalar | `text`, `string`, `int`, `float`, `double`, `date`. |
 | Vector | `vector`; every branch must resolve to the same positive `dims`. |
 | Geo | `geo_point`. |
+| Range | `long_range`, `double_range`, `date_range`. |
 
 ### Default bindings for variants
 

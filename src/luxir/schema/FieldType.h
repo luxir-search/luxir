@@ -49,7 +49,10 @@ public:
     ID,       // unique id field
     VECTOR,   // dense float vector; column-stored as fixed-size bytes
     DATE,     // timestamp; column-stored as int64 milliseconds since the Unix epoch
-    GEO_POINT // latitude/longitude point; packed into one int64 column value
+    GEO_POINT, // latitude/longitude point; packed into one int64 column value
+    // [min, max] interval (RangeFieldType); the column holds two encoded
+    // int64 values per document, min then max.
+    RANGE = 11
   };
 
   using flag_type = int32_t;
@@ -281,6 +284,46 @@ public:
   GeoPointFieldType(std::string_view name, int flags=COLUMN_STORED)
     : FieldType(name, FieldType::GEO_POINT, flags) {
   }
+};
+
+// An interval of INT, DOUBLE or DATE endpoints. Each endpoint is stored with
+// its element type's column encoding (raw int64, sortable double bits, epoch
+// millis), so encoded order is value order and both [min, max] and query
+// bounds compare as plain int64. An open end stores the int64 extreme.
+//
+// The segment column is laid out like a multi-valued int column with two
+// values per document (min, max), so merges, deletes and the column scans
+// reuse that machinery. INDEX_RANGE adds a 2-D points index over (min, max)
+// (RangeBKDWriter).
+class RangeFieldType : public FieldType {
+public:
+  // Encoded inclusive bounds; lo > hi never escapes encodeBounds.
+  struct Bounds {
+    int64_t lo;
+    int64_t hi;
+    bool unroundedNow = false; // a DATE bound came from unrounded NOW math
+  };
+
+  // INT, DOUBLE or DATE: the type each endpoint coerces and renders as.
+  const std::shared_ptr<FieldType> element;
+
+  RangeFieldType(std::string_view name, FieldType::Type elementType, int flags=COLUMN_STORED);
+
+  FieldType::Type elementType() const { return element->type(); }
+
+  // The schema type name: long_range, double_range or date_range.
+  std::string_view typeName() const;
+
+  // Folds {gte|gt, lte|lt} (any may be null for an open side) into inclusive
+  // encoded bounds; an exclusive bound steps one encoded unit. DATE endpoints
+  // round by the granule a literal names, like a DATE range query: gte/gt use
+  // the window start/end and lte/lt the window end/start. Returns nullopt for
+  // an empty interval. Throws on both gte and gt (or lte and lt) and on
+  // uncoercible values.
+  std::optional<Bounds> encodeBounds(const api::Val* gte, const api::Val* gt,
+                                     const api::Val* lte, const api::Val* lt,
+                                     std::string_view fieldName,
+                                     const CoerceContext& context = {}) const;
 };
 
 // Unique id field

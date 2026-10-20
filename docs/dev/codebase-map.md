@@ -55,7 +55,8 @@ locations, browse `src/luxir/<area>/`.
    - `PointsReader` reads the optional 1-D sorted-leaf points index of a
      `RANGE`-indexed numeric field (value-sorted leaves + fence directory;
      exact ordinal counts). `BKDReader` reads the 2-D int32 BKD of a
-     `GEO_POINT` field. Absence of either = `SegFieldInfo.pointsMetaOff == 0`.
+     `GEO_POINT` field and `RangeBKDReader` the 2-D int64 (min, max) BKD of a
+     `RANGE` field. Absence of any = `SegFieldInfo.pointsMetaOff == 0`.
 
 4. **Query System** (`src/luxir/query/`)
 
@@ -79,7 +80,8 @@ locations, browse `src/luxir/<area>/`.
    - Supports Term, Boolean, Phrase, and All queries
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
-     column scans; `GeoBoxQuery` executes through the BKD. Both share the
+     column scans; `GeoBoxQuery` and `RangeFieldQuery` execute through their
+     BKDs. All share the
      `PointsMaterialize` scorer/bitset primitives and keep a sparse
      two-phase column verify for small lead costs.
    - `ProtobufQueryParser` lowers the wire tree (`luxir::api::Query`) via `QueryBuilder`
@@ -108,9 +110,10 @@ locations, browse `src/luxir/<area>/`.
      - `IndexHandler`: One physical representation, owned by `indexHandlers`;
        finish/flush visits each once in global physical-name order
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
-   - `PointsWriter` (1-D sorted leaves) and `BKDWriter` (2-D geo) build the
-     optional points indexes at flush; `SegmentMerger` carries 1-D points
-     forward by run-merging and rebuilds geo BKDs from the merged column.
+   - `PointsWriter` (1-D sorted leaves), `BKDWriter` (2-D geo) and
+     `RangeBKDWriter` (2-D int64 range endpoints) build the optional points
+     indexes at flush; `SegmentMerger` carries 1-D points forward by
+     run-merging and rebuilds 2-D BKDs from the merged column.
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)
    - `VectorReader`: reads column-stored vectors for exact flat KNN

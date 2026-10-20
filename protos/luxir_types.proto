@@ -424,12 +424,24 @@ message AnyOfQuery {
 // (no collation), constant-scoring. TEXT bounds use multi-term normalization
 // without tokenization; STRING bounds use the field's normalizer. Exact
 // bounds follow the field's long_terms policy. Uses the field's value binding.
+//
+// Range fields (LONG_RANGE, DOUBLE_RANGE, DATE_RANGE) compare each stored
+// [min, max] interval with the query interval by `relation`. Bounds coerce
+// like the field's element type; an open side is unbounded.
 message RangeQuery {
   string field = 1;
   Val gte = 2;   // lower bound, inclusive (>=)
   Val gt  = 3;   // lower bound, exclusive (>)
   Val lte = 4;   // upper bound, inclusive (<=)
   Val lt  = 5;   // upper bound, exclusive (<)
+
+  enum Relation {
+    INTERSECTS = 0; // the stored interval overlaps the query interval
+    CONTAINS = 1;   // the stored interval covers the whole query interval
+    WITHIN = 2;     // the stored interval lies inside the query interval
+  }
+  // Range fields only; rejected on other field types unless INTERSECTS.
+  Relation relation = 15;
 }
 
 // Inclusive geographic bounding box in degrees. Bounds are quantized to the
@@ -2087,6 +2099,12 @@ message FieldDef {
     VECTOR = 7;    // dense float vector
     DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
     GEO_POINT = 9; // latitude/longitude point
+    // Single-valued intervals written as {"gte"|"gt": a, "lte"|"lt": b};
+    // either side may be omitted for an open end. index=range adds a 2-D
+    // points index over (min, max).
+    LONG_RANGE = 18;   // int64 endpoints
+    DOUBLE_RANGE = 19; // double endpoints
+    DATE_RANGE = 20;   // DATE endpoints (epoch millis, ISO-8601 or date math)
   }
   optional FieldClass type = 2; // required unless inherited from parent
 
@@ -2096,7 +2114,7 @@ message FieldDef {
   enum IndexMode {
     NONE = 0;    // no index
     MATCH = 1;   // term index for STRING/TEXT/ID, including term ranges
-    RANGE = 2;   // numeric Match/Range or GEO_POINT predicates; requires column=true
+    RANGE = 2;   // numeric Match/Range, GEO_POINT or range-field predicates; requires column=true
   }
 
   // Unset inherits, falling back to MATCH for STRING/TEXT/ID and NONE

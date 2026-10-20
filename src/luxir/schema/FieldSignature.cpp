@@ -11,9 +11,11 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
   logicalName = name.substr(0, split);
   label = split == std::string_view::npos ? "self" : std::string(name.substr(split + 2));
   static constexpr const char* types[] = {
-    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point"
+    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point",
+    "range"
   };
-  properties["type"] = "\"" + std::string(types[type.type()]) + "\"";
+  auto* range = dynamic_cast<RangeFieldType*>(&type);
+  properties["type"] = "\"" + std::string(range ? range->typeName() : types[type.type()]) + "\"";
   properties["multi"] = type.multiValued() ? "true" : "false";
   properties["index"] = type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";
   properties["column"] = type.hasColumn() ? "true" : "false";
