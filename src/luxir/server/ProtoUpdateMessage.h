@@ -31,8 +31,9 @@ private:
   std::unique_ptr<ResponseProto> ownedResponse;
   ResponseProto* response;
   // The response is NON-OWNING; its message data (request_id, error strings, ids) and the
-  // variable-count errors/ids arrays are backed by this monotonic arena. Update processing
-  // for one message is single-threaded, so a plain monotonic resource suffices.
+  // variable-count errors/ids arrays are backed by this monotonic arena. Only the thread
+  // handling the message writes it (a split message's chunks buffer their outcomes and
+  // merge them afterwards), so a plain monotonic resource suffices.
   std::unique_ptr<std::pmr::monotonic_buffer_resource> mr_ = std::make_unique<std::pmr::monotonic_buffer_resource>();
   luxir::api::build::SpanBuilder<DocError> errors_{*mr_};
   luxir::api::build::SpanBuilder<std::string_view> ids_{*mr_};

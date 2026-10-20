@@ -2825,6 +2825,9 @@ TEST(FilterCacheIntegrationTest,
   cachedConfig.queryCacheBytes = 4 * 1024 * 1024;
   LuxirConfig uncachedConfig;
   uncachedConfig.queryCacheBytes = 0;
+  // Two segments, one per message: tied top-100 scores must break identically.
+  cachedConfig.index.parallel_update_chunk_docs = 0;
+  uncachedConfig.index.parallel_update_chunk_docs = 0;
   LuxirNode cachedNode(cachedConfig);
   LuxirNode uncachedNode(uncachedConfig);
   constexpr std::string_view collection =

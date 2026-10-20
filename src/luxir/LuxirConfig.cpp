@@ -216,6 +216,15 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Min idle-inverter size (MiB) to flush when over the shared indexing RAM cap")
       ->default_val(index.pressure_flush_floor_mb)
       ->check(CLI::PositiveNumber);
+  app.add_option("--indexing.parallel-update-chunk-docs", index.parallel_update_chunk_docs,
+                 "Split an update request of at least twice this many docs into chunks indexed in "
+                 "parallel (0 = never split)")
+      ->default_val(index.parallel_update_chunk_docs)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--indexing.parallel-update-max-chunks", index.parallel_update_max_chunks,
+                 "Max chunks one update request is split into")
+      ->default_val(index.parallel_update_max_chunks)
+      ->check(CLI::PositiveNumber);
 
   app.add_option("--indexing.max-request-body", ingest.max_request_body,
                  "Max buffered (non-streaming) request body; oversized -> 413 (e.g. 32MB)")

@@ -98,6 +98,9 @@ locations, browse `src/luxir/<area>/`.
      - Manages `Inverter` instances, flushing, merging, and commits.
      - Atomically pins schema at update admission; stale inverters flush at
        checkout or release, keeping one schema per segment
+     - A large update message is split into chunks indexed into separate
+       inverters in parallel (`ProtoUpdateMessage::handle`); every copy of an
+       id stays in one chunk so same-version overwrites resolve in memory
    - `CommitSnapshotRegistry`: Shard-owned current snapshot and commit-ID pins,
      lazy idle expiry, and retained-byte eviction. Publishes into its ReaderManager;
      accepts retirement from a writer or installer independently. Retirement preserves

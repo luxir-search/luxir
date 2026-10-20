@@ -541,6 +541,13 @@ the node unlimited. The resolved values are logged at startup.
 - Lower `indexing.max-inverter-ram-mb` to trade merge work for flush latency and
   peak RSS: smaller flushes land sooner and cost less at once, at the price of
   more segments to merge.
+- `indexing.parallel-update-chunk-docs` (default 250) and
+  `indexing.parallel-update-max-chunks` (default 8) let one large update
+  request use several cores: a request that is not `all_or_none` and has at
+  least twice the chunk size is split into up to that many chunks, each indexed
+  into its own inverter in parallel. Every copy of an id stays in one chunk, so
+  results are the same as indexing the request whole. Each chunk flushes to its
+  own segment, so splitting adds merge work; `0` chunk docs turns it off.
 
 `--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
 transparent huge pages for whole-huge-page indexing allocations; disable it

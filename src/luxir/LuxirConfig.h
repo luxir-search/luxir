@@ -110,6 +110,11 @@ struct IndexConfig {
   // Resolved by LuxirConfig::resolveRamBudgets().
   int64_t max_ram_mb = -1;
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
+  // Intra-request parallelism: a large update message is split into chunks of at
+  // least this many docs indexed in parallel, at most parallel_update_max_chunks.
+  // See IndexWriter::parallelUpdateChunkDocs.  0 disables splitting.
+  int64_t parallel_update_chunk_docs = 250;
+  int parallel_update_max_chunks = 8;
   int merge_factor = 10;
 };
 
