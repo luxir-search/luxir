@@ -542,6 +542,11 @@ the node unlimited. The resolved values are logged at startup.
   peak RSS: smaller flushes land sooner and cost less at once, at the price of
   more segments to merge.
 
+`--indexing.source-default` (default off) keeps every document as submitted
+(`_source`) in each new collection whose schema does not set `source.enabled`.
+A create request opts out with `"source": {"enabled": false}`. Existing
+collections are never changed by it.
+
 `--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
 transparent huge pages for whole-huge-page indexing allocations; disable it
 with `--no-indexing.huge-pages` (or `--indexing.huge-pages=false`). This is a

@@ -48,7 +48,17 @@ std::shared_ptr<const CommitSnapshot> Collection::updateSchema(const luxir::api:
                                                  luxir::api::SchemaRequest_::Mode mode) {
   if (!shard->iw) throw ReadOnlyError("collection has no writer");
   return shard->iw->updateSchema([&](const Schema* current) {
-    return Schema::fromProto(def, mode == api::SchemaRequest_::Mode::SET ? current : nullptr);
+    if (mode == api::SchemaRequest_::Mode::SET) return Schema::fromProto(def, current);
+    // Replacing the schema is about fields: a definition that says nothing about the
+    // source store keeps the collection's setting, so it cannot silently turn the
+    // store off (a merge would then drop the sources).
+    if (def.source || !current) return Schema::fromProto(def, nullptr);
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef existing;
+    current->toProto(&existing, arena);
+    api::SchemaDef replacement = def;
+    replacement.source = existing.source;
+    return Schema::fromProto(replacement, nullptr);
   });
 }
 
@@ -246,11 +256,28 @@ static void clearMarkers(const CollectionId& name, Directory& dir) {
   catch (const std::exception& e) { LOG_WARN("Cannot clear corruption markers of '{}': {}", name.label(), e.what()); }
 }
 
+// The schema a new collection starts with: the default schema plus the request's
+// definition. The node's source default fills in only what the request left
+// unsaid, and lands in the schema, so later changes to the node setting never
+// reach an existing collection.
+std::shared_ptr<Schema> Collections::newCollectionSchema(const api::SchemaDef* requested) const {
+  auto base = Schema::createDefaultSchema();
+  api::SchemaDef def = requested ? *requested : api::SchemaDef{};
+  if (config.index.source_default && !(def.source && def.source->enabled)) {
+    api::SourceDef source = def.source.value_or(api::SourceDef{});
+    source.enabled = true;
+    def.source = source;
+  }
+  if (!requested && !def.source) return base;
+  return Schema::fromProto(def, base.get());
+}
+
 std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, std::shared_ptr<Schema> initialSchema, bool startup) {
   auto storage = factory->collection(name);
   auto selected = CollectionStorage::current(*factory->container(name, true));
   bool creating = !selected;
   if (creating) {
+    if (!initialSchema) initialSchema = newCollectionSchema(nullptr);
     if (storage.hasFiles() || !storage.incarnations().empty()) throw std::runtime_error("Collection files exist without CURRENT");
     selected = CommitId::newIncarnation();
   } else {
@@ -410,8 +437,7 @@ std::shared_ptr<Collection> Collections::create(const CollectionId& key, const a
     Transition transition(*this, key);
     bool stored = false;
     try {
-      auto initialSchema = Schema::createDefaultSchema();
-      if (schema) initialSchema = Schema::fromProto(*schema, initialSchema.get());
+      auto initialSchema = newCollectionSchema(schema);
       factory->collection(key).createExclusive();
       stored = true;
       created = initWriter(key, std::move(initialSchema));

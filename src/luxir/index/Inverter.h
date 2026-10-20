@@ -12,6 +12,7 @@
 #include "luxir/schema/Schema.h"
 #include "IndexRamBudget.h"
 #include "PostingsWriter.h"
+#include "SourceWriter.h"
 #include "StoredFieldsWriter.h"
 
 // so IndexHandler can consume protobuf types
@@ -102,6 +103,18 @@ public:
   // Populated after flush() if there were deleted documents
   uint64_t liveGen = 0;
   int32_t liveDocs = 0;
+
+  // Allocates names for source files ("v<seq>"); set by the IndexWriter. A direct
+  // user of an Inverter gets a process-wide counter, which is enough for a test.
+  std::atomic<uint64_t>* sourceSeq = nullptr;
+
+  // The generation of the source map written by flush(), 0 if the segment has none.
+  uint64_t sourceGen = 0;
+
+  // Keeps the document being indexed as submitted, when the pinned schema keeps
+  // sources. `flags` are source::kFlag* bits. Call once per started document,
+  // after startDoc(); a document that never calls it gets a placeholder.
+  void addSource(std::string_view id, std::string_view body, uint64_t version, uint8_t flags);
 
   Inverter(luxir::Directory& dir, uint64_t segId,
            const std::function<std::shared_ptr<Schema>()>& schemaProvider = {},
@@ -410,6 +423,10 @@ public:
   bool flush(std::vector<std::string>* filenames = nullptr, std::vector<FileDescriptor>* descriptors = nullptr);
 
 private:
+  std::unique_ptr<SourceWriter> sourceWriter_;
+  size_t sourceRamAccounted_ = 0;
+  void flushSource(std::vector<std::string>* filenames, std::vector<FileDescriptor>* descriptors);
+
   IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createPhysicalHandler
   // Stored-fields writers, keyed by resource name.  Lazily populated when
   // fields with the STORED flag are first indexed.  PackedTermHash/Equal

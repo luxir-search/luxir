@@ -182,6 +182,7 @@ defaults and constraints are described in the comments and guides.
 - [`ShardStats`](#message-luxir.shardstats)
 - [`SimpleQuery`](#message-luxir.simplequery)
 - [`SortSpec`](#message-luxir.sortspec)
+- [`SourceDef`](#message-luxir.sourcedef)
 - [`StatsRequest`](#message-luxir.statsrequest)
 - [`StatsResponse`](#message-luxir.statsresponse)
 - [`StatsTotals`](#message-luxir.statstotals)
@@ -1955,6 +1956,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 | <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. \_version\_ is fixed and retrieval-only: it returns the update version of the request that indexed each document, including allow\_dups and documents without an ID. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
 | <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. |
+| <a id="field-luxir.schemadef.source"></a>[`source`](#field-luxir.schemadef.source) | 20 | [`SourceDef`](#message-luxir.sourcedef) | singular | The collection's source store. Absent keeps the current setting, in mode=set and in mode=replace\_all. A source given in mode=set replaces the whole current setting: keys it omits return to their defaults. |
 
 <a id="message-luxir.schemarequest"></a>
 
@@ -2170,6 +2172,25 @@ Forgiving end-user query for raw search-box input. Malformed query text degrades
 | <a id="field-luxir.sortspec.vars"></a>[`vars`](#field-luxir.sortspec.vars) | 2 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map |  |
 | <a id="field-luxir.sortspec.dir"></a>[`dir`](#field-luxir.sortspec.dir) | 10 | [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir) | singular |  |
 
+<a id="message-luxir.sourcedef"></a>
+
+### luxir.SourceDef
+
+Optional store of every document as it was submitted, kept in files of their own that no search, warmup or segment open reads, and that stay readable without the schema or the index format (see docs/design/source-store.md). Retrieve a document with fields \["\_source"\], or export it with format=docs and source=true. Every setting is optional; changes apply to documents indexed afterwards.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.sourcedef.enabled"></a>[`enabled`](#field-luxir.sourcedef.enabled) | 1 | `bool` | optional | Whether documents indexed from now on keep their source. Absent in a new collection takes the node's --indexing.source-default (off unless the node is configured otherwise); absent in a schema update keeps the current value. |
+| <a id="field-luxir.sourcedef.codec"></a>[`codec`](#field-luxir.sourcedef.codec) | 2 | [`SourceDef.Codec`](#enum-luxir.sourcedef.codec) | optional | Block compression; absent selects zstd. |
+| <a id="field-luxir.sourcedef.zstd_level"></a>[`zstd_level`](#field-luxir.sourcedef.zstd_level) | 3 | `int32` | optional | ZSTD level from 1 (fastest) to 22 (smallest); absent selects 3. |
+| <a id="field-luxir.sourcedef.block_size_bytes"></a>[`block_size_bytes`](#field-luxir.sourcedef.block_size_bytes) | 4 | `int32` | optional | Target uncompressed bytes per block, 1024 to 4194304; absent selects 16384. A document larger than that gets a block of its own. |
+| <a id="field-luxir.sourcedef.min_live_ratio"></a>[`min_live_ratio`](#field-luxir.sourcedef.min_live_ratio) | 5 | `double` | optional | A merge keeps referencing a source file while at least this fraction of its documents is live, and rewrites its live documents into a new file otherwise. 0 to 1 exclusive of 0; absent selects 0.5. |
+| <a id="field-luxir.sourcedef.min_file_bytes"></a>[`min_file_bytes`](#field-luxir.sourcedef.min_file_bytes) | 6 | `int64` | optional | A merge also rewrites a source file smaller than this, even when fully live, so small files fold together. 0 or more; absent selects 4194304. |
+| <a id="field-luxir.sourcedef.includes"></a>[`includes`](#field-luxir.sourcedef.includes) | 7 | `string` | repeated | Keep only these paths of each document's source (includes) or all but these (excludes); at most one of the two. The document is still indexed in full. A path joins object keys with '.' ("user.name") and reaches into arrays of objects without an index step; '\*' in a pattern matches any run of characters, dots included. A matching path keeps or drops its whole value; with includes, an object or array left with nothing is dropped too. Paths name the keys as submitted, before field\_map. An update request can override them for its own documents (UpdateRequest.source\_includes). |
+| <a id="field-luxir.sourcedef.excludes"></a>[`excludes`](#field-luxir.sourcedef.excludes) | 8 | `string` | repeated |  |
+
 <a id="message-luxir.statsrequest"></a>
 
 ### luxir.StatsRequest
@@ -2346,6 +2367,8 @@ Index or delete documents, with an optional commit.
 | <a id="field-luxir.updaterequest.commit"></a>[`commit`](#field-luxir.updaterequest.commit) | 10 | [`CommitParams`](#message-luxir.commitparams) | singular | Commit parameters. If present, this request will commit; if absent, no commit is performed. |
 | <a id="field-luxir.updaterequest.field_map"></a>[`field_map`](#field-luxir.updaterequest.field_map) | 11 | map&lt;`string`, `string`&gt; | map | Renames input document keys onto schema fields for this request's docs, applied before schema lookup: a doc key found in the map indexes under the mapped name. An entry mapping to "" drops that input key. After mapping, a name appearing more than once in a doc keeps the last occurrence (the same last-wins rule as duplicate keys). Keys not in the map index under their own name unless drop\_unmapped is set. This reshapes a foreign document stream per request, without editing the input or the schema. |
 | <a id="field-luxir.updaterequest.drop_unmapped"></a>[`drop_unmapped`](#field-luxir.updaterequest.drop_unmapped) | 12 | `bool` | singular | If true, doc keys not present in field\_map are dropped instead of indexed. Requires a non-empty field\_map (note "id" is dropped too unless mapped). |
+| <a id="field-luxir.updaterequest.source_includes"></a>[`source_includes`](#field-luxir.updaterequest.source_includes) | 13 | `string` | repeated | Override the collection's source includes/excludes (SourceDef) for this request's docs: setting either replaces both. At most one of the two, with the same path syntax. Ignored by a collection that does not store sources. |
+| <a id="field-luxir.updaterequest.source_excludes"></a>[`source_excludes`](#field-luxir.updaterequest.source_excludes) | 14 | `string` | repeated |  |
 
 <a id="message-luxir.updateresponse"></a>
 
@@ -2510,6 +2533,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`SchemaRequest.Mode`](#enum-luxir.schemarequest.mode)
 - [`SelectionMode`](#enum-luxir.selectionmode)
 - [`SortSpec.SortDir`](#enum-luxir.sortspec.sortdir)
+- [`SourceDef.Codec`](#enum-luxir.sourcedef.codec)
 - [`StoredResourceDef.Codec`](#enum-luxir.storedresourcedef.codec)
 - [`UpdateResponse.Status`](#enum-luxir.updateresponse.status)
 - [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec)
@@ -2752,6 +2776,17 @@ How facet selections filter the enclosing TopDocs results and its sub-operations
 | <a id="value-luxir.sortspec.sortdir.unknown"></a>[`UNKNOWN`](#value-luxir.sortspec.sortdir.unknown) | 0 |  |
 | <a id="value-luxir.sortspec.sortdir.asc"></a>[`ASC`](#value-luxir.sortspec.sortdir.asc) | 1 |  |
 | <a id="value-luxir.sortspec.sortdir.desc"></a>[`DESC`](#value-luxir.sortspec.sortdir.desc) | 2 |  |
+
+<a id="enum-luxir.sourcedef.codec"></a>
+
+### luxir.SourceDef.Codec
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.sourcedef.codec.zstd"></a>[`ZSTD`](#value-luxir.sourcedef.codec.zstd) | 0 |  |
+| <a id="value-luxir.sourcedef.codec.none"></a>[`NONE`](#value-luxir.sourcedef.codec.none) | 1 |  |
 
 <a id="enum-luxir.storedresourcedef.codec"></a>
 

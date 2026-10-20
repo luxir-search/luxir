@@ -34,6 +34,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/SourceReader.h"
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/StoredFieldsReader.h"
@@ -312,6 +313,34 @@ inline void loadStrCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
   uint8_t* present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
                                        starget, mtarget, pendingCols, mr);
   loadStrColWithTargets(req, infos, fieldType, starget, mtarget, present, segDocs, runs, loaders, mr);
+}
+
+// The _source pseudo-field: each document as it was submitted, from the
+// segment's source store. A string column holding raw JSON text (the JSON
+// response splices it in unquoted); docs without a stored source stay missing.
+inline void loadSource(SearchRequest& req, std::span<const segdoc> segDocs, SegmentRuns runs,
+                       luxir::api::Column& fieldCol, FieldLoaders* loaders, PendingCols& pendingCols,
+                       std::pmr::memory_resource& mr)
+{
+  auto columnSize = segDocs.size();
+  if (columnSize == 0) return;
+  std::span<std::string_view> starget;
+  std::span<luxir::api::ArrStr> mtarget;
+  uint8_t* present = allocStringColumn(fieldCol, columnSize, false, starget, mtarget, pendingCols, mr);
+  addFieldLoader(loaders, runs, [&req, segDocs, starget, present, &mr](std::span<RowIndex> idxSpan) {
+    auto* source = req.reader->segments()[segDocs[idxSpan[0]].segment()].source();
+    if (!source) return;
+    SourceReader::Cursor cursor;
+    source::Record record;
+    std::string json;
+    // idxSpan is in doc order, so consecutive docs share a decompressed block.
+    for (RowIndex idx : idxSpan) {
+      if (source->fetch(segDocs[idx].docId(), cursor, record) != SourceReader::Status::OK) continue;
+      if (!SourceReader::renderJson(record, json)) continue;
+      starget[idx] = build::arenaStr(mr, json);
+      present[idx] = 1;
+    }
+  });
 }
 
 // Per-type policies for emitting numeric columns.  INT columns hold the
@@ -698,13 +727,14 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 // retains the request spelling; physicalName + fieldType identify the source.
 // fieldType is resolved from the request schema at selector resolution, so explicit-name
 // errors surface before any batch is assembled and the emit loop does no
-// per-batch schema lookups; kind selects the physical, score, or version source.
+// per-batch schema lookups; kind selects the physical, score, version, or _source
+// (the document as submitted, as raw JSON) source.
 // discovered: from an empty or wildcard selector (COLUMNS leaves such a column
 // out of a batch where it has no value).  infos and storedInfos are bound with the
 // first rows (see resolveReturnFieldMetadata), so a count-only response never
 // looks them up.
 struct ReturnField {
-  enum class Kind { PHYSICAL, SCORE, VERSION };
+  enum class Kind { PHYSICAL, SCORE, VERSION, SOURCE };
 
   std::string_view outputKey;
   std::string_view physicalName;
@@ -1122,6 +1152,10 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           loadVersionRuns(req, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
           registerColumn();
           continue;
+        case ReturnField::Kind::SOURCE:
+          loadSource(req, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          registerColumn();
+          continue;
         case ReturnField::Kind::PHYSICAL:
           break;
       }
@@ -1365,6 +1399,17 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
     }
     if (f == "_score_") {
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
+      return;
+    }
+    if (f == "_source") {
+      // Segments written while the store was on keep serving it after it is turned off.
+      bool stored = req.schema->source.enabled || std::ranges::any_of(req.reader->segments(),
+          [](const Segment& segment) { return segment.source() != nullptr; });
+      if (!stored) {
+        throw RequestError("_source is not stored: enable it with source.enabled in the collection's schema",
+                           "invalid_field");
+      }
+      picked.push_back({f, {}, nullptr, ReturnField::Kind::SOURCE, false});
       return;
     }
     auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);

@@ -78,6 +78,8 @@ state, and commits are crash-safe on immutable segments.
 - [Architecture](design/architecture.md) explains how the engine is put
   together and why: immutable segments, mmap, work stealing, adaptive query
   execution, and native vector integration.
+- [Source store](design/source-store.md) describes the optional `_source` files:
+  format, merges, capture and recovery.
 - [Vector search design](design/vector-search.md) covers segment overlays and
   the ANN execution model.
 - [Codebase map](dev/codebase-map.md) traces source components and request

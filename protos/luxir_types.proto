@@ -1025,6 +1025,12 @@ message UpdateRequest {
   // If true, doc keys not present in field_map are dropped instead of indexed.
   // Requires a non-empty field_map (note "id" is dropped too unless mapped).
   bool drop_unmapped = 12;
+
+  // Override the collection's source includes/excludes (SourceDef) for this
+  // request's docs: setting either replaces both. At most one of the two, with
+  // the same path syntax. Ignored by a collection that does not store sources.
+  repeated string source_includes = 13;
+  repeated string source_excludes = 14;
 }
 
 // The response to an update request.  In streaming mode the server sends exactly one
@@ -2197,6 +2203,53 @@ message StoredResourceDef {
   optional int32 max_docs_per_chunk = 4;
 }
 
+// Optional store of every document as it was submitted, kept in files of their
+// own that no search, warmup or segment open reads, and that stay readable
+// without the schema or the index format (see docs/design/source-store.md).
+// Retrieve a document with fields ["_source"], or export it with
+// format=docs and source=true. Every setting is optional; changes apply to
+// documents indexed afterwards.
+message SourceDef {
+  enum Codec {
+    ZSTD = 0;
+    NONE = 1;
+  }
+  // Whether documents indexed from now on keep their source. Absent in a new
+  // collection takes the node's --indexing.source-default (off unless the node is
+  // configured otherwise); absent in a schema update keeps the current value.
+  optional bool enabled = 1;
+
+  // Block compression; absent selects zstd.
+  optional Codec codec = 2;
+
+  // ZSTD level from 1 (fastest) to 22 (smallest); absent selects 3.
+  optional int32 zstd_level = 3;
+
+  // Target uncompressed bytes per block, 1024 to 4194304; absent selects 16384.
+  // A document larger than that gets a block of its own.
+  optional int32 block_size_bytes = 4;
+
+  // A merge keeps referencing a source file while at least this fraction of its
+  // documents is live, and rewrites its live documents into a new file
+  // otherwise. 0 to 1 exclusive of 0; absent selects 0.5.
+  optional double min_live_ratio = 5;
+
+  // A merge also rewrites a source file smaller than this, even when fully
+  // live, so small files fold together. 0 or more; absent selects 4194304.
+  optional int64 min_file_bytes = 6;
+
+  // Keep only these paths of each document's source (includes) or all but
+  // these (excludes); at most one of the two. The document is still indexed in
+  // full. A path joins object keys with '.' ("user.name") and reaches into
+  // arrays of objects without an index step; '*' in a pattern matches any run
+  // of characters, dots included. A matching path keeps or drops its whole
+  // value; with includes, an object or array left with nothing is dropped too.
+  // Paths name the keys as submitted, before field_map. An update request can
+  // override them for its own documents (UpdateRequest.source_includes).
+  repeated string includes = 7;
+  repeated string excludes = 8;
+}
+
 message SchemaDef {
   // Concrete fields, keyed by field name.  Exact-name lookup consults only this
   // map.  The reserved "id" and "_version_" fields are always materialized: a
@@ -2218,6 +2271,11 @@ message SchemaDef {
   // the defaults without one. mode=set replaces the named entries and keeps
   // the others.
   map<string, StoredResourceDef> stored_resources = 4;
+
+  // The collection's source store. Absent keeps the current setting, in mode=set
+  // and in mode=replace_all. A source given in mode=set replaces the whole
+  // current setting: keys it omits return to their defaults.
+  SourceDef source = 20;
 }
 
 message SchemaRequest {

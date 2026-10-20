@@ -145,6 +145,17 @@ std::shared_ptr<Collection> LuxirNode::getCollection(const CollectionId& id) {
   throw CollectionNotFoundError("collection '" + id.label() + "' does not exist");
 }
 
+bool LuxirNode::keepsSource(const CollectionId& id) {
+  try {
+    auto collection = collections_->get(id);
+    if (!collection) return config.ingest.auto_create_collection && !following() && config.index.source_default;
+    if (!collection->getShard()) return false;  // an unavailable placeholder
+    return collection->getSchema()->source.enabled;
+  } catch (...) {
+    return false;
+  }
+}
+
 std::shared_ptr<Collection> LuxirNode::getOrCreateCollection(const CollectionId& id) {
   if (following()) return getCollection(id);
   return checkLoaded(collections_->getOrCreate(id, config.ingest.auto_create_collection));

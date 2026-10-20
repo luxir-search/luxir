@@ -85,6 +85,11 @@ public:
   std::shared_ptr<Collection> getCollection(const CollectionId& id);
   std::shared_ptr<Collection> getCollection(std::string_view name) { return getCollection(CollectionId::of(name)); }
   std::shared_ptr<Collection> getOrCreateCollection(const CollectionId& id);
+  // Whether documents indexed into the collection now keep their source: its
+  // current schema says so, or, for a collection that does not exist yet, the node
+  // default does. Transports use it to decide whether to retain raw document
+  // bytes; an unavailable or unknown collection answers false.
+  bool keepsSource(const CollectionId& id);
   std::shared_ptr<Collection> getOrCreateCollection(std::string_view name) { return getOrCreateCollection(CollectionId::of(name)); }
 
   // Snapshot fully-created collections without waiting for creations in

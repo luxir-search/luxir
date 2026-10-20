@@ -334,7 +334,50 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
     liveDocs = getMaxDoc();
   }
 
-  return getPostingsWriter().finish(filenames, descriptors);
+  bool written = getPostingsWriter().finish(filenames, descriptors);
+  if (written && sourceWriter_) flushSource(filenames, descriptors);
+  return written;
+}
+
+void Inverter::addSource(std::string_view id, std::string_view body, uint64_t version, uint8_t flags) {
+  if (!schema->source.enabled) return;
+  if (!sourceWriter_) {
+    sourceWriter_ = std::make_unique<SourceWriter>(schema->source, Postings::getIndexFileNamePrefix(getSegId()));
+  }
+  // Record i is doc i: docs started without a source before this one get placeholders.
+  sourceWriter_->padTo((uint32_t)currDoc);
+  sourceWriter_->add(id, body, version, flags);
+  size_t ram = sourceWriter_->ramBytes();
+  addExtraRam((int64_t)ram - (int64_t)sourceRamAccounted_);
+  sourceRamAccounted_ = ram;
+}
+
+// Writes the source file holding this segment's documents and the map that
+// points the segment's doc IDs at it. Both are listed with the segment's files.
+void Inverter::flushSource(std::vector<std::string>* filenames, std::vector<FileDescriptor>* descriptors) {
+  static std::atomic<uint64_t> fallbackSeq{0};
+  auto& dir = postingsWriter.getDirectory();
+  int32_t docs = getMaxDoc();
+  sourceWriter_->padTo((uint32_t)docs);
+  std::string name = Postings::getSourceFileName((sourceSeq ? sourceSeq : &fallbackSeq)->fetch_add(1));
+  std::string mapName = Postings::getSourceMapFileName(Postings::getSortableString(getSegId()), 1);
+  FileDescriptor file;
+  try {
+    sourceWriter_->flush(dir, name, file);
+    SourceMap map;
+    map.addRun(0, docs, map.fileIndex({name, (uint32_t)docs, file.size}), 0);
+    map.write(dir, mapName, filenames, descriptors);
+  } catch (...) {
+    dir.deleteFile(name);
+    dir.deleteFile(mapName);
+    throw;
+  }
+  if (filenames) filenames->push_back(name);
+  if (descriptors) descriptors->push_back(file);
+  sourceGen = 1;
+  addExtraRam(-(int64_t)sourceRamAccounted_);
+  sourceRamAccounted_ = 0;
+  sourceWriter_.reset();
 }
 
 

@@ -338,6 +338,25 @@ compressed chunks from inputs that already match its output codec and chunk
 limits and recompresses the others; the level alone does not trigger
 recompression. `mode=set` replaces the named entries and keeps the others.
 
+### Source store
+
+The top-level `source` setting keeps every document exactly as submitted, in
+files apart from the index; see [Documents](documents.md#keeping-documents-as-submitted-_source).
+Every key is optional.
+
+| Key | Meaning |
+|---|---|
+| `enabled` | store sources for documents indexed from now on. In a new collection, absent takes the node's `--indexing.source-default` (off unless set); in a schema update (`set` or `replace_all`), absent keeps the current value |
+| `codec` | `zstd` (default) or `none` |
+| `zstd_level` | `zstd` only: 1 to 22; default 3 |
+| `block_size_bytes` | target uncompressed bytes per block, 1024 to 4194304; default 16384. One document larger than this gets a block of its own |
+| `min_live_ratio` | a merge keeps referencing a source file while at least this fraction of its documents is live, and rewrites the live ones otherwise; above 0 up to 1, default 0.5 |
+| `min_file_bytes` | a merge also rewrites a source file smaller than this so small files fold together; default 4194304 |
+| `includes` | keep only these paths of each document's source; see [Documents](documents.md#keeping-only-part-of-the-source) |
+| `excludes` | keep all but these paths; at most one of `includes` and `excludes` |
+
+A `source` object in a schema update replaces the whole setting: keys it omits return to their defaults. Turning the store off stops capture for new documents; the next merge of a segment then drops that segment's sources and their files.
+
 ## Text analysis
 
 A text analyzer is one tokenizer followed by a list of filters:
