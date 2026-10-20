@@ -28,6 +28,7 @@
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/ReplicationSource.h"
 #include "luxir/util/ProcessAllocator.h"
+#include "luxir/BuildInfo.h"
 
 namespace luxir::test {
 
@@ -274,6 +275,23 @@ TEST_F(HttpApiTest, prettySearchMultipleBatches) {
     }
     EXPECT_EQ((std::map<std::string, std::size_t>{{"a", 3}, {"b", 3}}), docsByOp);
   }
+}
+
+TEST_F(HttpApiTest, buildInfo) {
+  for (const auto* target : {"/", "/?pretty=false"}) {
+    auto res = httpRequest(port(), http::verb::get, target);
+    ASSERT_EQ(200, res.result_int()) << res.body();
+    EXPECT_EQ("application/json", res[http::field::content_type]);
+    expectJsonObject(res.body(), std::string_view(target) == "/");
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, res.body()));
+    EXPECT_EQ(buildInfo().version, root["version"].get_string());
+    EXPECT_EQ(buildInfo().sourceCommit, root["source_commit"].get_string());
+    EXPECT_EQ(buildInfo().cpuTarget, root["cpu_target"].get_string());
+  }
+  auto res = httpRequest(port(), http::verb::post, "/");
+  EXPECT_EQ(405, res.result_int());
+  EXPECT_EQ("GET", res[http::field::allow]);
 }
 
 TEST_F(HttpApiTest, prettyIgnoredForDocsFormat) {

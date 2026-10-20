@@ -137,8 +137,8 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   auto& metrics = *node.metrics;
   auto counts = metrics.counts();
   auto counter = [&](MetricCounter c) { return counts.counters[(size_t)c]; };
-  dst.version = buildVersion();
-  dst.cpu_target = buildCpuTarget();
+  dst.version = buildInfo().version;
+  dst.cpu_target = buildInfo().cpuTarget;
   dst.read_only = node.readOnly();
   dst.request_duration_bounds = requestBounds;
   dst.background_duration_bounds = backgroundBounds;

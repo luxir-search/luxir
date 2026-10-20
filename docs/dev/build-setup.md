@@ -266,6 +266,21 @@ ASAN_OPTIONS=detect_leaks=1 ./build/gcc-debug-asan/bin/luxir_test --gtest_brief=
 
 The binaries for every preset are under `build/<preset>/bin/`.
 
+## Embedded build information
+
+The binary embeds the CMake project version, full Git HEAD commit hash, and CPU
+target. `luxir --version`, the startup banner, and `GET /` expose the same values.
+Incremental builds track Git HEAD and its ref, including linked worktrees and
+packed refs, so committing or switching branches refreshes the embedded hash.
+Uncommitted edits are not represented by the hash.
+
+For a source archive without `.git`, pass `-DLUXIR_SOURCE_COMMIT=<full-hash>` when
+configuring. Without it, CMake warns and the binary reports `unknown`. This
+override is cached; leave it empty for automatic Git detection in a checkout.
+
+Run `python3 tools/test-build-info` to check metadata refresh behavior with real
+Git repositories and a small CMake/Ninja build, without building the engine.
+
 ## Measure on your workload
 
 There are no published performance numbers yet. Hardware, corpus, query mix,
