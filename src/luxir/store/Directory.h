@@ -93,6 +93,13 @@ public:
   // references them (Manifest::commit). CheckedDirectory verifies it.
   virtual void expectSynced(std::span<const FileDescriptor> files) { unused(files); }
 
+  // `files` are committed: a manifest loaded from this directory lists them,
+  // with their sizes (Manifest::load). A directory may use that in place of
+  // asking its backend, e.g. a remote one skips a size request per openFile.
+  // Committed names are never rewritten with other bytes; a directory that
+  // remembers them forgets a name it deletes, renames or writes again.
+  virtual void knownFiles(std::span<const FileDescriptor> files) { unused(files); }
+
   virtual std::unique_ptr<File> createFile(const std::string_view name) = 0;
 
   // Backends that support delayed materialization may honor these options.
