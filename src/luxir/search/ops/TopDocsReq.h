@@ -886,9 +886,10 @@ public:
       if constexpr (std::remove_cvref_t<decltype(collector)>::isCollapsed) {
         if (disableCollapsePruningForTests) return ConstantScoreDisposition::NOT_CONSTANT_TOP_K;
       }
+      // First-K collection applies any collector filter before accepting hits.
       if (!TopDocsReq::disableConstantWindowCaptureForTests
-          && !op.requirements.needExactCount && builder == nullptr
-          && op.filters.empty()) {
+          && !op.requirements.needExactCount && builder == nullptr) {
+        skipCount(SkipStats::constantLimitOnlyCollections);
         return ConstantScoreDisposition::LIMIT_ONLY;
       }
       // Document first-K/count drains cannot supply distinct totals or child

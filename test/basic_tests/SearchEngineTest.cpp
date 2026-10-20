@@ -6733,6 +6733,61 @@ TEST_F(SearchEngineTest, constantTopKWindowCaptureMultiSegment) {
   expectConstantTopKShapes(helper.getSearchEngine());
 }
 
+TEST_F(SearchEngineTest, filteredConstantTopKLimitOnly) {
+  CollectionHelper helper;
+  helper.getIndexWriter()->snapshots.readers.filterCache = std::make_shared<FilterCache>(
+      FilterCacheConfig{.maxBytes = 0});
+  for (int32_t seg = 0; seg < 3; seg++) {
+    std::vector<Doc> docs;
+    for (int32_t i = seg * 120; i < (seg + 1) * 120; i++) {
+      docs.push_back(flatdoc("id", std::to_string(i),
+          "body_w", i % 6 == 0 ? "a d" : i % 2 == 0 ? "a" : "d",
+          "group_s", "g" + std::to_string((i / 12) % 7)));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  }
+  for (bool passive : {false, true}) {
+    TopDocsFilterFoldGuard fold(passive);
+    for (bool pull : {false, true}) {
+      for (bool collapsed : {false, true}) {
+        for (int32_t parallel : {1, -1}) {
+          SCOPED_TRACE(testing::PrintToString(std::make_tuple(passive, pull, collapsed, parallel)));
+          std::vector<std::string> expected;
+          for (bool count : {true, false}) {
+            auto req = localReq(helper.getSearchEngine());
+            parseQueryRequest(std::string(R"({"query":"*:*","fields":["id"],"limit":4,"offset":1,"filter":[")")
+                + (pull ? R"(body_w:\"a d\")" : "body_w:a AND body_w:d")
+                + R"("],"get_number":)" + (count ? "true" : "false")
+                + (collapsed ? R"(,"collapse":"group_s")" : "") + "}",
+                req->rawRequest(), req->mr);
+            req->collection("main");
+            {
+              SkipStatsScope stats;
+              SkipStats::enabled = parallel == 1;
+              req->execute(parallel);
+              ASSERT_OK(req);
+              if (parallel == 1) {
+                EXPECT_EQ(!count ? 3 : 0,
+                          SkipStats::constantLimitOnlyCollections);
+                if (!passive && !count) {
+                  EXPECT_EQ(!pull && !collapsed ? 3 : 0,
+                            SkipStats::constantWindowCaptures);
+                }
+              }
+            }
+            EXPECT_EQ(count, req->docList()->found.has_value());
+            if (count) {
+              EXPECT_EQ(collapsed ? 7 : 60, req->getMatchCount());
+              expected = resultIds(*req, "q");
+              ASSERT_EQ(4u, expected.size());
+            } else EXPECT_EQ(expected, resultIds(*req, "q"));
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST_F(SearchEngineTest, filteredMultiTermCountExpandsOncePerSegment) {
   CollectionHelper helper;
   constexpr int32_t kSegments = 3;
