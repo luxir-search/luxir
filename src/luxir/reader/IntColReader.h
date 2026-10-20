@@ -196,12 +196,6 @@ public:
     return nvals;
   }
 
-  // One decoded value, for point reads off the hot path.
-  int64_t valueAt(int64_t valueRank) const {
-    assert(valueRank >= 0 && valueRank < nvals);
-    return values.valueAt(valueRank);
-  }
-
   int32_t docsWithValue() const {
     return docsWithField;
   }
@@ -228,6 +222,11 @@ public:
 
   NumericBlockInfo blockInfo(int64_t blockNum) const {
     return values.blockInfo(blockNum);
+  }
+
+  std::optional<NumColumnFormat::RankBounds> rankBounds(
+      int64_t blockNum, int64_t lo, int64_t hi) const {
+    return values.rankBounds(blockNum, lo, hi);
   }
 
   NumBlockZone blockZone(int64_t blockNum) const {
@@ -271,19 +270,7 @@ public:
   // value rank of decoded[0] and writes the number of valid values to count.
   int64_t decodeResidualSubBlock(int64_t valueRank, uint32_t* decoded,
                                  uint32_t& count) const {
-    constexpr int64_t SUB_BLOCK_SIZE = 128;
-    static_assert(BLOCK_SIZE % SUB_BLOCK_SIZE == 0);
-    assert(valueRank >= 0 && valueRank < nvals);
-    int64_t start = valueRank / SUB_BLOCK_SIZE * SUB_BLOCK_SIZE;
-    int64_t blockNum = start / BLOCK_SIZE;
-    int64_t rankInBlock = start % BLOCK_SIZE;
-    const NumericBlockInfo& block = blockInfo(blockNum);
-    assert(block.bits() <= 32 && block.scaledSlope == 0);
-    count = (uint32_t)std::min<int64_t>(SUB_BLOCK_SIZE, nvals - start);
-    LinearPack::unpack128(
-        columnIS.ptr() + block.payloadOffset(), rankInBlock, count,
-        block.bits(), LinearPack::mask32(block.bits()), decoded);
-    return start;
+    return values.decodeResidualFrame(valueRank, decoded, count);
   }
 
   // Decode reconstructed values for packed predicted/wide or raw blocks.

@@ -329,10 +329,9 @@ public:
 
   // A block's relation to the predicate. A CROSSES block is refined below
   // block granularity: per leaf zone (any encoding), and for a linear-fit
-  // block by the rank intervals its fit bounds (boundLinearRanks). runAt
-  // walks the refinement as runs of in-block ranks sharing one relation, so
-  // consumers emit INSIDE runs, skip OUTSIDE runs and check only CROSSES
-  // runs value by value.
+  // block by the rank intervals the codec bounds. runAt walks the refinement
+  // as runs of in-block ranks sharing one relation, so consumers emit INSIDE
+  // runs, skip OUTSIDE runs and check only CROSSES runs value by value.
   struct BlockPlan {
     static constexpr uint32_t LEAF_SIZE = NumColumnFormat::LEAF_ZONE_SIZE;
     static_assert(NumColumnFormat::LEAVES_PER_BLOCK <= 8);
@@ -349,8 +348,10 @@ public:
     uint16_t checkEnd = 0;
     uint16_t insideBegin = 0;
     uint16_t insideEnd = 0;
-    uint32_t lowerResidual = 0;
-    uint32_t upperResidual = 0;
+    // Read only for CROSSES runs of residual-comparable blocks. Zero by
+    // default so a default plan is all zero bytes: classifyBlocks reloads
+    // each returned plan with wide loads, which stall on narrow stores.
+    NumColumnFormat::ResidualBounds residualBounds = {};
 
     struct Run {
       BlockRelation relation;
@@ -394,90 +395,6 @@ public:
     }
   };
 
-  // Bounds a linear-fit block's ranks against the range envelope. Values
-  // reconstruct as base + gcd * (slopeTerm(rank) + residual) with residual in
-  // [0, 2^bits), and slopeTerm is monotonic in rank (nondecreasing for a
-  // positive slope, nonincreasing for a negative one), so each rank's value
-  // lies in [L(rank), L(rank) + gcd * (2^bits - 1)] with L monotonic. Ranks
-  // whose interval misses the envelope cannot match, ranks whose interval it
-  // covers all match (ranges only), and binary searches over those monotonic
-  // predicates find the rank intervals exactly.
-  //
-  // Arithmetic is relative to the block minimum in __int128. The intercept
-  // is recovered from the value at rank 0: a linear fit is chosen only when
-  // it saves a bit over the constant fit, so every residual is under the
-  // block's quotient range and gcd * residual < 2^64 (checked below), which
-  // makes (value0 - base) mod 2^64 exactly gcd * residual0. Every term below
-  // is then the exact integer the writer computed (planBlock,
-  // LinearFit::predict), and each product stays far inside 128 bits.
-  void boundLinearRanks(const IntColReader& reader, int64_t blockNum,
-                        const IntColReader::NumericBlockInfo& block,
-                        const NumBlockZone& zone, uint32_t count,
-                        BlockPlan& plan) const {
-    assert(block.scaledSlope != 0
-           && block.bits() <= NumColumnFormat::MAX_PACKED_BITS);
-    uint64_t gcd = block.gcd;
-    assert(gcd != 0);
-    __int128 spread = (__int128)gcd * (__int128)((1ULL << block.bits()) - 1);
-    // The writer's fit choice implies this; checked so the recovery below
-    // never depends on it.
-    if (spread > (__int128)UINT64_MAX) return;
-    int64_t value0 =
-        reader.valueAt(blockNum * (int64_t)IntColReader::BLOCK_SIZE);
-    uint64_t scaledResidual0 = (uint64_t)value0 - block.baseBits;
-    assert(scaledResidual0 % gcd == 0);
-    __int128 intercept = (__int128)((uint64_t)value0 - (uint64_t)zone.min)
-        - (__int128)scaledResidual0;
-    __int128 lo = (__int128)envelope.lo - zone.min;
-    __int128 hi = (__int128)envelope.hi - zone.min;
-    int64_t slope = block.scaledSlope;
-    auto lower = [&](uint32_t rank) {
-      return intercept + (__int128)gcd
-          * (__int128)NumColumnFormat::slopeTerm(rank, slope);
-    };
-    auto upper = [&](uint32_t rank) { return lower(rank) + spread; };
-    // First rank in [0, count) where pred stops holding; pred must hold on
-    // a prefix.
-    auto partition = [count](auto pred) {
-      uint32_t first = 0;
-      uint32_t last = count;
-      while (first < last) {
-        uint32_t mid = first + (last - first) / 2;
-        if (pred(mid)) first = mid + 1;
-        else last = mid;
-      }
-      return first;
-    };
-    uint32_t checkBegin;
-    uint32_t checkEnd;
-    uint32_t insideBegin;
-    uint32_t insideEnd;
-    if (slope > 0) {
-      checkBegin = partition([&](uint32_t r) { return upper(r) < lo; });
-      checkEnd = partition([&](uint32_t r) { return lower(r) <= hi; });
-      insideBegin = partition([&](uint32_t r) { return lower(r) < lo; });
-      insideEnd = partition([&](uint32_t r) { return upper(r) <= hi; });
-    } else {
-      checkBegin = partition([&](uint32_t r) { return lower(r) > hi; });
-      checkEnd = partition([&](uint32_t r) { return upper(r) >= lo; });
-      insideBegin = partition([&](uint32_t r) { return upper(r) > hi; });
-      insideEnd = partition([&](uint32_t r) { return lower(r) >= lo; });
-    }
-    checkBegin = std::max<uint32_t>(checkBegin, plan.checkBegin);
-    checkEnd = std::max(checkBegin,
-                        std::min<uint32_t>(checkEnd, plan.checkEnd));
-    plan.checkBegin = (uint16_t)checkBegin;
-    plan.checkEnd = (uint16_t)checkEnd;
-    // An exact set's envelope bounds where members can lie, not where every
-    // value matches.
-    insideBegin = std::max(insideBegin, checkBegin);
-    insideEnd = std::min(insideEnd, checkEnd);
-    if (!isExactSet() && insideBegin < insideEnd) {
-      plan.insideBegin = (uint16_t)insideBegin;
-      plan.insideEnd = (uint16_t)insideEnd;
-    }
-  }
-
   BlockPlan classifyBlock(const IntColReader& reader, int64_t blockNum) const {
     BlockPlan plan;
     NumBlockZone zone = reader.blockZone(blockNum);
@@ -509,10 +426,16 @@ public:
       plan.leafCrossing = (uint8_t)((1u << leaves) - 1);
     }
 
-    IntColReader::NumericBlockInfo block = reader.blockInfo(blockNum);
-    if (block.scaledSlope != 0
-        && block.bits() <= NumColumnFormat::MAX_PACKED_BITS) {
-      boundLinearRanks(reader, blockNum, block, zone, count, plan);
+    if (plan.leafCrossing != 0) {
+      if (auto bounds = reader.rankBounds(blockNum, envelope.lo, envelope.hi)) {
+        plan.checkBegin = (uint16_t)bounds->checkBegin;
+        plan.checkEnd = (uint16_t)bounds->checkEnd;
+        // An exact set's envelope proves exclusion, not inclusion.
+        if (!isExactSet()) {
+          plan.insideBegin = (uint16_t)bounds->insideBegin;
+          plan.insideEnd = (uint16_t)bounds->insideEnd;
+        }
+      }
     }
 
     // Leaves can settle a block its hull zone could not: an exact set whose
@@ -533,32 +456,12 @@ public:
       return inside;
     }
 
-    if (isExactSet()) return plan;
-    if (block.bits() > 32 || block.scaledSlope != 0) {
-      return plan;
+    if (!anyCrossing || isExactSet()) return plan;
+    auto block = reader.blockInfo(blockNum);
+    if (block.residualComparable()) {
+      plan.residualBounds = NumColumnFormat::residualBounds(
+          block, envelope.lo, envelope.hi);
     }
-
-    // CROSSES guarantees every subtraction below represents a non-negative
-    // signed-order distance. Unsigned subtraction makes the full INT64 span
-    // exact, and quotient+remainder implements ceil without overflow.
-    uint64_t gcd = block.gcd;
-    assert(gcd != 0);
-    uint64_t lower = 0;
-    if (envelope.lo > zone.min) {
-      uint64_t delta = (uint64_t)envelope.lo - (uint64_t)zone.min;
-      lower = delta / gcd + (delta % gcd != 0);
-    }
-    uint64_t upper;
-    if (envelope.hi >= zone.max) {
-      upper = ((uint64_t)zone.max - (uint64_t)zone.min) / gcd;
-    } else {
-      upper = ((uint64_t)envelope.hi - (uint64_t)zone.min) / gcd;
-    }
-    // A compressed block's maximum persisted residual fits its format<=32.
-    // Saturation keeps a defensive release build correct at both signed
-    // extremes even if future metadata admits a wider residual.
-    plan.lowerResidual = lower > UINT32_MAX ? UINT32_MAX : (uint32_t)lower;
-    plan.upperResidual = upper > UINT32_MAX ? UINT32_MAX : (uint32_t)upper;
     return plan;
   }
 
@@ -604,14 +507,14 @@ public:
       int64_t blockNum = valueRank / IntColReader::BLOCK_SIZE;
       auto block = reader.blockInfo(blockNum);
       if (!query.isExactSet()
-          && block.bits() <= 32 && block.scaledSlope == 0) {
+          && block.residualComparable()) {
         if (valueRank < residualStart
             || valueRank >= residualStart + (int64_t)residualCount) {
           residualStart = reader.decodeResidualSubBlock(valueRank, residuals,
                                                         residualCount);
         }
         uint32_t v = residuals[valueRank - residualStart];
-        return plan.lowerResidual <= v && v <= plan.upperResidual;
+        return plan.residualBounds.lower <= v && v <= plan.residualBounds.upper;
       }
       if (valueRank < rawStart || valueRank >= rawStart + (int64_t)rawCount) {
         rawStart = reader.decodeValueSubBlock(valueRank, raw, rawCount);

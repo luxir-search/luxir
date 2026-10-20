@@ -512,7 +512,7 @@ TEST_F(NumericRangeZoneMapTest, predictedCrossingBlockComparesDecodedValues) {
   const auto& info = *fields;
   IntColReader column(segment.postingsReader(), info);
   ASSERT_EQ(column.numBlocks(), 1);
-  EXPECT_NE(column.blockInfo(0).scaledSlope, 0);
+  EXPECT_TRUE(column.blockInfo(0).linearFit());
 
   int64_t target = values[(size_t)OUTLIER][0];
   auto expected = oracle(values, target, target);
@@ -609,7 +609,7 @@ TEST_F(NumericRangeZoneMapTest, linearFitBlocksResolveRankRuns) {
     IntColReader column(segment.postingsReader(),
                         *segment.postingsReader().fieldInfo(field.name));
     for (int64_t block = 0; block < column.numBlocks(); block++) {
-      EXPECT_NE(column.blockInfo(block).scaledSlope, 0) << field.name;
+      EXPECT_TRUE(column.blockInfo(block).linearFit()) << field.name;
     }
 
     // Bounds on, just before and just after block and leaf edges.
@@ -694,7 +694,7 @@ TEST_F(NumericRangeZoneMapTest, leafZonesResolveCrossingBlocks) {
   auto& segment = index.reader->segments()[0];
   IntColReader column(segment.postingsReader(),
                       *segment.postingsReader().fieldInfo("leaf_bands_i"));
-  EXPECT_EQ(column.blockInfo(0).scaledSlope, 0);
+  EXPECT_FALSE(column.blockInfo(0).linearFit());
 
   for (auto [lo, hi] : std::array<std::pair<int64_t, int64_t>, 5>{{
            {7000, 7999}, {2500, 2600}, {1000, 2999}, {3999, 4000},
