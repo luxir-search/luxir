@@ -480,11 +480,9 @@ TEST_F(StoredFieldsTest, mergePreservesMultiValuedGrouping) {
   EXPECT_EQ(d1.vals[0].second, (std::vector<std::string>{"p", "q"}));
 }
 
-// A source segment whose field-id table conflicts with the output's cannot be
-// chunk-copied (compressed bodies reference the ids) and must fall back to the
-// doc-by-doc re-add.  Segment A sees body first, segment B sees title first,
-// segment C matches A again - so the merge runs copy, re-add, copy, which also
-// exercises sealing the re-add path's partial chunk before a raw append.
+// Re-adding small dirty sources preserves field names when they encounter
+// fields in different orders: A sees body first, B sees title first, and C
+// matches A again.
 TEST_F(StoredFieldsTest, mergeFieldTableMismatchFallsBack) {
   RAMDir dir;
   auto schema = makeSchema();
@@ -746,6 +744,20 @@ static std::vector<int64_t> chunkFirstDocs(StoredFieldsReader& r) {
   return firstDocs;
 }
 
+// Observe the actual path, since recompression can reproduce identical bytes.
+static std::vector<bool> mergeStoredCopies(IndexWriter& iw) {
+  std::vector<bool> copied;
+  Signal::listen("storedFieldsMergeSource", [&](void* resource, void*, void* copy) -> void* {
+    if (*(std::string_view*)resource == Postings::STORED_DEFAULT_RESOURCE) {
+      copied.push_back(*(bool*)copy);
+    }
+    return nullptr;
+  });
+  auto cleanup = scope_guard([] { Signal::unlisten("storedFieldsMergeSource"); });
+  iw.mergeSegments();
+  return copied;
+}
+
 TEST_F(StoredFieldsTest, mergeRecompressesOtherFormatsAndCopiesMatching) {
   RAMDir dir;
   StoredChunkFormat zstd{StoredChunkFormat::ZSTD, 3, 64 * 1024, 4};
@@ -794,6 +806,178 @@ TEST_F(StoredFieldsTest, mergeRepacksDirtyChunks) {
   expectBodies(*sfr, 32);
 }
 
+TEST_F(StoredFieldsTest, mergeDirtyChunkThreshold) {
+  for (int chunks : {99, 100}) {
+    SCOPED_TRACE(chunks);
+    RAMDir dir;
+    CommitSnapshotRegistry snapshots(dir);
+    StoredChunkFormat format;
+    format.maxDocsPerChunk = 4;
+    IndexWriter iw(snapshots, withStoredFormat(format));
+    int docs = (chunks - 1) * 4 + 1;
+    addBodySegment(iw, 0, docs);
+    addBodySegment(iw, docs, 3);
+    {
+      auto reader = snapshots.readers.getReader();
+      auto source = defaultStored(reader->segments()[0].postingsReader());
+      ASSERT_EQ(chunks, source->numChunks());
+      ASSERT_EQ(1, source->numDirtyChunks());
+    }
+    EXPECT_EQ((std::vector<bool>{chunks == 100, false}), mergeStoredCopies(iw));
+    auto reader = snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+    auto stored = defaultStored(reader->segments()[0].postingsReader());
+    EXPECT_EQ(chunks == 99 ? 99 : 101, stored->numChunks());
+    EXPECT_EQ(chunks == 99 ? 0 : 2, stored->numDirtyChunks());
+    expectBodies(*stored, docs + 3);
+  }
+}
+
+TEST_F(StoredFieldsTest, mergeCopiesSmallCleanSources) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  StoredChunkFormat format;
+  format.maxDocsPerChunk = 4;
+  IndexWriter iw(snapshots, withStoredFormat(format));
+  addBodySegment(iw, 0, 4);
+  addBodySegment(iw, 4, 4);
+  EXPECT_EQ((std::vector<bool>{true, true}), mergeStoredCopies(iw));
+  auto reader = snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto stored = defaultStored(reader->segments()[0].postingsReader());
+  EXPECT_EQ(2, stored->numChunks());
+  EXPECT_EQ(0, stored->numDirtyChunks());
+  expectBodies(*stored, 8);
+}
+
+TEST_F(StoredFieldsTest, mergeInheritedDirtCrossesThreshold) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  StoredChunkFormat format;
+  format.maxDocsPerChunk = 4;
+  IndexWriter iw(snapshots, withStoredFormat(format));
+  addBodySegment(iw, 0, 1);
+  addBodySegment(iw, 1, 397);  // 100 chunks, one dirty
+  EXPECT_EQ((std::vector<bool>{false, true}), mergeStoredCopies(iw));
+  {
+    auto reader = snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+    auto stored = defaultStored(reader->segments()[0].postingsReader());
+    EXPECT_EQ(101, stored->numChunks());
+    EXPECT_EQ(2, stored->numDirtyChunks());  // sealed prefix plus inherited dirt
+    expectBodies(*stored, 398);
+  }
+  addBodySegment(iw, 398, 2);
+  EXPECT_EQ((std::vector<bool>{false, false}), mergeStoredCopies(iw));
+  auto reader = snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto stored = defaultStored(reader->segments()[0].postingsReader());
+  EXPECT_EQ(100, stored->numChunks());
+  EXPECT_EQ(0, stored->numDirtyChunks());
+  expectBodies(*stored, 400);
+}
+
+TEST_F(StoredFieldsTest, mergePaddingPreservesDirtyCounts) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  StoredChunkFormat format;
+  format.maxDocsPerChunk = 4;
+  auto schema = withStoredFormat(format);
+  auto plain = withStoredFormat(format);
+  plain->fieldTypeMap["body"]->flags_ &= ~FieldType::STORED;
+  IndexWriter iw(snapshots, schema);
+  int first = 0;
+  for (auto [docs, hasStored] : {std::pair{3, false}, {4, true}, {5, false}, {397, true}, {5, false}}) {
+    iw.setSchema(hasStored ? schema : plain);
+    addBodySegment(iw, first, docs);
+    first += docs;
+  }
+  iw.setSchema(schema);
+  EXPECT_EQ((std::vector<bool>{true, true}), mergeStoredCopies(iw));
+  auto reader = snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  auto stored = defaultStored(reader->segments()[0].postingsReader());
+  ASSERT_EQ(106, stored->numChunks());
+  // Partial prefix, middle and suffix padding, plus the copied source's dirt.
+  EXPECT_EQ(4, stored->numDirtyChunks());
+  EXPECT_EQ(414, stored->maxDoc());
+  auto firstDocs = chunkFirstDocs(*stored);
+  EXPECT_EQ((std::vector<int64_t>{0, 3, 7, 11, 12}),
+            (std::vector<int64_t>(firstDocs.begin(), firstDocs.begin() + 5)));
+  EXPECT_EQ(409, firstDocs[firstDocs.size() - 2]);
+  EXPECT_EQ(413, firstDocs.back());
+  for (int doc = 0; doc < stored->maxDoc(); doc++) {
+    auto values = readStored(*stored, doc).flat();
+    if ((doc >= 3 && doc < 7) || (doc >= 12 && doc < 409)) {
+      EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{
+          {"body", "log line " + std::to_string(doc) + " status=200 path=/api/v1/items"}}), values);
+    } else {
+      EXPECT_TRUE(values.empty());
+    }
+  }
+}
+
+TEST_F(StoredFieldsTest, mergePreAdoptsLargestCopyFieldTable) {
+  for (bool tie : {false, true}) {
+    SCOPED_TRACE(tie);
+    RAMDir dir;
+    CommitSnapshotRegistry snapshots(dir);
+    auto schema = makeSchema();
+    StoredChunkFormat format;
+    format.maxDocsPerChunk = 4;
+    schema->fieldTypeMap["_stored_"] = std::make_shared<StoredFieldType>("_stored_", format);
+    IndexWriter iw(snapshots, schema);
+    auto addFields = [&](int docs, bool titleFirst, std::string_view body) {
+      auto& inv = iw.obtainInverter();
+      for (int doc = 0; doc < docs; doc++) {
+        inv.startDoc();
+        if (titleFirst) inv.getIndexHandler("title").index(inv, std::string_view("shared"));
+        inv.getIndexHandler("body").index(inv, body);
+        if (!titleFirst) inv.getIndexHandler("title").index(inv, std::string_view("shared"));
+        inv.finishDoc();
+      }
+      iw.releaseInverter(inv, true);
+      iw.commit();
+    };
+    std::string body = "shared";
+    if (!tie) {
+      std::mt19937 random(0);
+      body.resize(512);
+      for (char& c : body) c = (char)('a' + random() % 26);
+      for (size_t i = 63; i < body.size(); i += 64) body[i] = ' ';
+    }
+    addFields(1, tie, "shared");  // re-added, opposite field order to the winner
+    addFields(tie ? 4 : 8, false, "shared");
+    addFields(4, true, body);
+    {
+      auto reader = snapshots.readers.getReader();
+      auto second = defaultStored(reader->segments()[1].postingsReader());
+      auto third = defaultStored(reader->segments()[2].postingsReader());
+      if (tie) {
+        ASSERT_EQ(second->chunkRegionBytes(), third->chunkRegionBytes());
+      } else {
+        ASSERT_GT(second->numChunks(), third->numChunks());
+        ASSERT_LT(second->chunkRegionBytes(), third->chunkRegionBytes());
+      }
+    }
+    EXPECT_EQ((std::vector<bool>{false, tie, !tie}), mergeStoredCopies(iw));
+    auto reader = snapshots.readers.getReader();
+    ASSERT_EQ(1u, reader->segments().size());
+    auto stored = defaultStored(reader->segments()[0].postingsReader());
+    EXPECT_EQ(tie ? 0 : 1, stored->fieldId("body"));
+    EXPECT_EQ(tie ? 1 : 0, stored->fieldId("title"));
+    for (int doc = 0; doc < stored->maxDoc(); doc++) {
+      EXPECT_TRUE(stored->readField(doc, "body", [&](std::span<const std::string_view> values) {
+        ASSERT_EQ(1u, values.size());
+        EXPECT_EQ(doc >= stored->maxDoc() - 4 ? body : "shared", values[0]);
+      }));
+      EXPECT_TRUE(stored->readField(doc, "title", [&](std::span<const std::string_view> values) {
+        ASSERT_EQ(1u, values.size());
+        EXPECT_EQ("shared", values[0]);
+      }));
+    }
+  }
+}
 
 // End-to-end: a STORED TEXT field should come back in search results when
 // requested via TopDocs.fields.

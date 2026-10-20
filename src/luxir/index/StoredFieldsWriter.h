@@ -164,8 +164,7 @@ public:
   // and register the resource with the PostingsWriter.  No-op if no stored
   // values were added.
   void finish(int32_t maxDoc) {
-    // fieldNames.empty() is equivalent to "no addValue call ever reached
-    // getOrAssignFieldId" and is the single authoritative check.
+    // No fields were added or adopted from a merge source.
     if (fieldNames.empty()) {
       chunkOutput.reset();
       return;
@@ -242,13 +241,12 @@ public:
     return (int32_t)chunkFirstDocs.size();
   }
 
-  // Would copying a source with these chunk counts verbatim leave too many
-  // dirty chunks behind?  Re-adding a source re-packs its docs together with
-  // its neighbors', so every chunk but the merge's last comes out full.  More
-  // than 1% dirty chunks costs more than recompressing: small segments
-  // (fewer than 100 chunks) are always re-packed, which is cheap at their
-  // size, and large ones are copied unless dirt has accumulated, which bounds
-  // the extra chunks in any segment to about 1%.
+  // Repack sources above 1% dirty chunks. Re-added docs pack with their
+  // neighbors, but a raw-copy boundary can seal another partial chunk and
+  // copied chunks retain inherited dirt. This is an amortization rule, not
+  // a strict output bound: each partial chunk a merge leaves costs about 100
+  // chunks of later recompression when its segment crosses 1%. A source with
+  // fewer than 100 chunks is repacked only if it has any dirt.
   static bool tooDirty(int32_t numChunks, int32_t numDirtyChunks) {
     return (int64_t)numDirtyChunks * 100 > (int64_t)numChunks;
   }

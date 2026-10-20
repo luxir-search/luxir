@@ -1590,11 +1590,14 @@ private:
 
   // Merge one stored-fields resource (default or named column family).
   // Writes a fresh StoredFieldsWriter for the same resource name in the
-  // resource's current format.  Clean sources in that same layout are copied
-  // as compressed chunks; the rest are decompressed and their live docs re-added
-  // in merged-docID order, which converts them to the output codec and chunk
-  // size.  Multi-valued fields are preserved as single addValues calls so the
-  // on-disk grouping survives the merge.
+  // resource's current format. Sources in that layout within the dirt threshold
+  // can be copied as compressed chunks; the rest have their live docs re-added
+  // in merged-docID order. Adopt the largest eligible chunk region's field table
+  // first so earlier re-added fields cannot prevent its copy. Re-added docs pack
+  // together, but a copy boundary can seal another partial chunk. Each partial
+  // chunk a merge leaves costs about 100 chunks of later recompression when its
+  // segment crosses 1%; this is an amortization rule, not an output invariant.
+  // Multi-valued fields keep their grouping through single addValues calls.
   void mergeStoredFields(std::vector<MergeFieldInfo>& mergeFieldInfos) {
     // Resource name comes from the (identical across segments) field name.
     std::string_view resourceName(mergeFieldInfos[0].segFieldInfo.fieldname);
@@ -1611,6 +1614,26 @@ private:
     StoredFieldsWriter writer(postingsWriter, resourceName, storedFormat(resourceName));
     std::vector<int64_t> srcChunkFirstDocs, srcChunkOffsets;
 
+    auto copyable = [&](Segment& seg, const StoredFieldsReader& reader) {
+      return !seg.hasDeletes() && reader.format().sameLayout(writer.format())
+          && !StoredFieldsWriter::tooDirty(reader.numChunks(), reader.numDirtyChunks());
+    };
+    int bestSource = -1;
+    int64_t bestBytes = 0;
+    for (auto& seg : segs) {
+      const SegFieldInfo* fieldInfo = fieldInfos[seg.ord];
+      if (!fieldInfo) continue;
+      StoredFieldsReader reader(*seg.postingsReader, *fieldInfo);
+      if (copyable(seg, reader) && reader.chunkRegionBytes() > bestBytes) {
+        bestSource = seg.ord;
+        bestBytes = reader.chunkRegionBytes();
+      }
+    }
+    if (bestSource >= 0) {
+      StoredFieldsReader reader(*segs[bestSource].postingsReader, *fieldInfos[bestSource]);
+      writer.adoptFieldTable(reader.fieldNames());  // writer's table is still empty
+    }
+
     for (auto& seg : segs) {
       const SegFieldInfo* fieldInfo = fieldInfos[seg.ord];
       if (!fieldInfo) continue;  // segment had no stored-fields; writer pads automatically
@@ -1624,10 +1647,12 @@ private:
       // limits and few enough dirty (partially filled) chunks, and bodies
       // reference its field-id table, so it must adopt into ours; deletions,
       // another layout, too many dirty chunks or a table mismatch fall back to
-      // the doc-by-doc re-add below, which re-packs into full chunks.
-      if (!seg.hasDeletes() && reader.format().sameLayout(writer.format())
-          && !StoredFieldsWriter::tooDirty(reader.numChunks(), reader.numDirtyChunks())
-          && writer.adoptFieldTable(reader.fieldNames())) {
+      // the doc-by-doc re-add below, which packs these docs with adjacent
+      // re-added sources.
+      bool copy = copyable(seg, reader) && writer.adoptFieldTable(reader.fieldNames());
+      // Test seam: resource name, source ordinal, and copy versus re-add.
+      Signal::emit("storedFieldsMergeSource", &resourceName, &seg.ord, &copy);
+      if (copy) {
         writer.alignForRawAppend(seg.base);
         reader.readChunkDirectory(srcChunkFirstDocs, srcChunkOffsets);
         writer.appendRawChunkRegion(seg.base, reader.chunkRegionPtr(),

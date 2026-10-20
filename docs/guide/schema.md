@@ -338,7 +338,8 @@ compressed chunks from inputs that already match its output codec and chunk
 limits and recompresses the others; the level alone does not trigger
 recompression. Inputs where more than 1% of chunks were sealed before filling
 (each small flush ends in one) are also recompressed, so documents indexed a
-few at a time still end up in full-size chunks. `mode=set` replaces the named entries and keeps the others.
+few at a time still end up in full-size chunks. `mode=set` replaces the named
+entries and keeps the others.
 
 ## Text analysis
 
