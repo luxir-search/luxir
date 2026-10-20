@@ -489,7 +489,7 @@ struct to<JSON, luxir::api::QueryFacet> {
 };
 
 // ----- SearchOp: canonical one-arm object plus optional domain, or ExprOp sugar -----
-static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 7,
+static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 10,
               "SearchOp gained an arm: update its hand-written JSON arm dispatch and sugar");
 template <>
 struct from<JSON, luxir::api::SearchOp> {
@@ -540,6 +540,12 @@ struct from<JSON, luxir::api::SearchOp> {
             arm(std::in_place_type<api::QueryFacet>);
           } else if (key == "expr_op") {
             arm(std::in_place_type<api::ExprOp>);
+          } else if (key == "cardinality") {
+            arm(std::in_place_type<api::Cardinality>);
+          } else if (key == "percentiles") {
+            arm(std::in_place_type<api::Percentiles>);
+          } else if (key == "percentile_ranks") {
+            arm(std::in_place_type<api::PercentileRanks>);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

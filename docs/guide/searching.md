@@ -21,8 +21,9 @@ other queries, and a filter uses a query without contributing to the score.
 
 A **search operation** ([`SearchOp`](../reference/protobuf.md#message-luxir.searchop))
 defines what to compute or return:
-`top_docs` returns ranked documents for a query, facets return buckets, `expr_op` computes
-metrics, and `fusion` combines ranked lists. A request
+`top_docs` returns ranked documents for a query, facets return buckets, `expr_op`,
+`cardinality`, and `percentiles` compute
+[metrics](faceting.md#distinct-counts-and-percentiles), and `fusion` combines ranked lists. A request
 ([`SearchRequest`](../reference/protobuf.md#message-luxir.searchrequest))
 contains a map of named operations in `ops`.
 

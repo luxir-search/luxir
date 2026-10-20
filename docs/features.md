@@ -306,6 +306,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
   order with zero counts included, daylight-saving changes handled.
 - Nesting: sub-facets under buckets, metrics per bucket, and a ranked
   `top_docs` (or `fusion`) list per bucket, all in one request.
+- Distinct counts (`cardinality`, HyperLogLog with an exact phase) and
+  `percentiles` / `percentile_ranks` (t-digest), at the top level or per bucket.
 - Expression metrics: `avg`, `sum`, `min`, and `max` over value expressions
   (`sum(price_f * qty_i) / sum(qty_i)`), at query level or per bucket; facets
   can sort by a named metric.

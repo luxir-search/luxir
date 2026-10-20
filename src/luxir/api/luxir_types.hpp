@@ -63,7 +63,8 @@ enum class NullValue { NULL_VALUE = 0 };
 namespace luxir::api {
 
 // ---- forward declarations (all messages) ----
-struct SearchRequest; struct SearchOp; struct ExprOp; struct TopDocs;
+struct SearchRequest; struct SearchOp; struct ExprOp; struct Cardinality; struct Percentiles;
+struct PercentileRanks; struct TopDocs;
 struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struct GroupTable;
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
@@ -899,6 +900,22 @@ struct ExprOp {
   std::string_view expr;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
+struct Cardinality {
+  std::string_view field;
+  std::optional<std::int64_t> precision_threshold;
+};
+struct Percentiles {
+  std::string_view field;
+  std::span<const double> percents;
+  std::optional<double> compression;
+  std::optional<bool> keyed;
+};
+struct PercentileRanks {
+  std::string_view field;
+  std::span<const double> values;
+  std::optional<double> compression;
+  std::optional<bool> keyed;
+};
 struct FieldFacet {
   std::optional<FieldFacet_::CountUnit> count_unit;
   ::hpp_proto::optional_indirect_view<Collapse> count_distinct;
@@ -1011,8 +1028,9 @@ struct RangeFacet {                                             // needs Val,Cal
   RangeFacet_::Bounds bounds = RangeFacet_::Bounds::EXPLICIT;
   bool missing = false;
 };
-struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,Domain
-  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, QueryFacet, ExprOp> kind;
+struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,Cardinality,Percentiles,PercentileRanks,Domain
+  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, QueryFacet, ExprOp,
+               Cardinality, Percentiles, PercentileRanks> kind;
   std::optional<Domain> domain;
 };
 struct Warning { std::string_view code; std::string_view message; };
@@ -1143,7 +1161,8 @@ struct UpdateRequest {                                         // needs CommitPa
 
 // ===================== trivial-destructibility checks =====================
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
-LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
+LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(Cardinality)
+LUXIR_TD(Percentiles) LUXIR_TD(PercentileRanks) LUXIR_TD(TopDocs)
 LUXIR_TD(Diversify) LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey) LUXIR_TD(GroupTable)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
 LUXIR_TD(ExistsQuery)
@@ -1189,6 +1208,7 @@ LUXIR_TD(AllReplicas) LUXIR_TD(ReplicaRequirement) LUXIR_TD(ReplicationCatalog) 
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,             \
                   std::string *error = nullptr);
 LUXIR_ENTRY(SearchRequest) LUXIR_ENTRY(SearchOp) LUXIR_ENTRY(ExprOp)
+LUXIR_ENTRY(Cardinality) LUXIR_ENTRY(Percentiles) LUXIR_ENTRY(PercentileRanks)
 LUXIR_ENTRY(Diversify) LUXIR_ENTRY(Collapse) LUXIR_ENTRY(GroupComponent)
 LUXIR_ENTRY(GroupKey) LUXIR_ENTRY(GroupTable)
 LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(LinearFusion) LUXIR_ENTRY(SortSpec)
