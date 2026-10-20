@@ -1317,6 +1317,33 @@ TEST(FilterCacheTest, routedAccountingOwnsRejectedSegmentValue) {
   EXPECT_EQ(0u, tracker.bytes());
 }
 
+TEST(FilterCacheTest, rejectedChargeOfRejectedPublishLeavesNoRawValue) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array oldSegments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(4, oldSegments);
+  RequestMemTracker tracker(1);
+
+  {
+    FilterCache::UseRegistry request(cache, 4, oldSegments);
+    auto* use = request.get(FilterKey("routed-over-limit"));
+    use->enableRoutedAccounting(0, tracker, "segment 0");
+    {
+      // As in a request, unwinding releases the build claim.
+      auto claim = use->probe(0);
+      ASSERT_EQ(FilterCache::Probe::Kind::BUILD, claim.kind());
+      std::array newSegments{FilterCache::SegmentIdentity{2, 100}};
+      cache.onReaderPublished(5, newSegments);
+      EXPECT_ANY_THROW(use->publishRaw(0, claim, docs(100, {3, 7}), 1));
+    }
+    // The only owner of the rejected value unwound with the throw.
+    EXPECT_EQ(nullptr, use->rawDocSet(0));
+    EXPECT_NE(FilterCache::Probe::Kind::HIT, use->probe(0).kind());
+  }
+  EXPECT_EQ(0u, tracker.bytes());
+}
+
 TEST(FilterCacheTest, oldSchemaPopulationCannotHitNewSchemaKey) {
   FilterCacheConfig config = testConfig();
   config.admissionThreshold = 1;

@@ -578,7 +578,9 @@ public:
     auto facetField = api::build::arenaStr(req.requestPool, target.physicalName);
     int64_t limit = 5; // default limit
     if (facetReq.limit.has_value()) {
-      limit = *facetReq.limit;
+      // Any negative limit means all, as for top docs; facet ops test the
+      // -1 sentinel exactly.
+      limit = std::max<int64_t>(*facetReq.limit, -1);
     }
     int64_t minCount = -1;
     if (facetReq.mincount.has_value()) {

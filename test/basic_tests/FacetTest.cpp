@@ -7750,3 +7750,59 @@ TEST_F(FacetTest, piecewiseLayoutsFeedBucketDomains) {
     }
   }
 }
+
+TEST_F(FacetTest, absentStringPinWithChildrenOnEveryDomainSource) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "a", "cat_s", "x", "score_i", 1, "sel_s", "yes"),
+      flatdoc("id", "b", "cat_s", "y", "score_i", 2, "sel_s", "yes"),
+      flatdoc("id", "c", "cat_s", "x", "score_i", 4, "sel_s", "no"),
+  }, UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(forcedFacetBucketDomainSource);
+  for (auto source : {FacetBucketDomainSource::AUTO, FacetBucketDomainSource::POSTINGS,
+                      FacetBucketDomainSource::ORD_COLUMN}) {
+    forcedFacetBucketDomainSource = source;
+    auto req = localReq(helper.getSearchEngine());
+    auto& facet = req->collection("main").topDocs("q").matchQuery("sel_s", "yes").limit(0)
+        .facet("f", "cat_s").limit(-1);
+    std::array<std::string, 2> pins{"x", "absent"};
+    setSelected(facet, pins);
+    facet.sum("total", "score_i");
+    facet.topDocs("hits").allQuery().limit(0).getNumber();
+    req->execute();
+    ASSERT_OK(req);
+    const auto& result = topFacetResult(*req, "q", "f");
+    const auto& ids = std::get<api::ColStr>(result.bucket_ids->kind).v;
+    auto totals = metricValues(result, "total");
+    auto hits = metricValues(result, "hits");
+    ASSERT_EQ(3u, ids.size()) << (int)source;
+    for (size_t i = 0; i < ids.size(); i++) {
+      std::string_view id = ids[i];
+      int64_t expected = id == "absent" ? 0 : 1;
+      EXPECT_EQ(expected, result.counts[i]) << id << " source=" << (int)source;
+      EXPECT_EQ(expected, hits[i].docList()->found.value_or(-1)) << id << " source=" << (int)source;
+      if (id == "absent") EXPECT_TRUE(totals[i].isNull()) << "source=" << (int)source;
+      else EXPECT_EQ(id == "x" ? 1 : 2, totals[i].asInt()) << id << " source=" << (int)source;
+    }
+  }
+}
+
+TEST_F(FacetTest, facetLimitBelowMinusOneMeansAll) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "a", "cat_s", "x"), flatdoc("id", "b", "cat_s", "x"),
+      flatdoc("id", "c", "cat_s", "y"),
+  }, UpdateMessage::COMMIT).success);
+  for (int64_t mincount : {0, 1}) {
+    std::vector<std::vector<std::pair<std::string, int64_t>>> rows;
+    for (int64_t limit : {(int64_t)-1, (int64_t)-2, std::numeric_limits<int64_t>::min()}) {
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("main").facet("f", "cat_s").limit(limit).mincount(mincount);
+      req->execute();
+      ASSERT_OK(req);
+      rows.push_back(stringFacetRows(rootFacetResult(*req, "f")));
+    }
+    std::vector<std::pair<std::string, int64_t>> expected{{"x", 2}, {"y", 1}};
+    for (const auto& r : rows) EXPECT_EQ(expected, r) << "mincount=" << mincount;
+  }
+}
