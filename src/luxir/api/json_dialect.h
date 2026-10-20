@@ -706,6 +706,10 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.normalized, ctx, vit, vend);
           } else if (key == "normalize_on_write") {
             util::from_json<V>(value.normalize_on_write, ctx, vit, vend);
+          } else if (key == "encoding") {
+            util::from_json<V>(value.encoding, ctx, vit, vend);
+          } else if (key == "keep_original") {
+            util::from_json<V>(value.keep_original, ctx, vit, vend);
           } else if (key == "ann") {
             util::from_json<V>(value.ann, ctx, vit, vend);
           } else {

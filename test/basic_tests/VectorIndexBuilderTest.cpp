@@ -1471,7 +1471,8 @@ TEST_F(VectorIndexBuilderTest, skipPolicyPrecedesProgrammaticPqMSelection) {
   ann.pqM = 3;
   ann.pqBits = 1;
   schema->fieldTypeMap["embedding_v"] = std::make_shared<VectorFieldType>("embedding_v", 4,
-      FieldType::COLUMN_STORED | FieldType::FIXED_SIZE, VectorFieldType::METRIC_L2, false, false, ann);
+      FieldType::COLUMN_STORED | FieldType::FIXED_SIZE, VectorFieldType::METRIC_L2, false, false,
+      VectorEncoding::F32, false, ann);
   VectorIndexBuilder builder(writer->dir, std::span(&input, 1), *schema, 0);
   std::vector<std::string> files;
   auto build = [&] { return builder.build({"*"}, {}, files, VectorIndexBuilder::BuildSite::COMMIT); };

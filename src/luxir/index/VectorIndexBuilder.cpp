@@ -114,6 +114,16 @@ bool shouldNormalizeForFaiss(const VectorFieldType& ft) {
   return ft.metric_ == VectorFieldType::METRIC_COSINE && !ft.normalized_ && !ft.normalizeOnWrite_;
 }
 
+// Whether the vectors a segment feeds to FAISS need L2 normalization: cosine
+// over a raw column, over the raw keep_original column, or over a quantized
+// column (a quantized unit vector is only approximately unit length).
+bool normalizeSegmentForFaiss(const VectorFieldType& ft, const VectorReader& source,
+                              bool fromOriginal) {
+  if (ft.metric_ != VectorFieldType::METRIC_COSINE) return false;
+  if (source.encoding() != VectorEncoding::F32) return true;
+  return !ft.normalized_ && (fromOriginal || !ft.normalizeOnWrite_);
+}
+
 // Shared by the owned training sample and borrowed column vectors. Rotation
 // always writes to separate storage: FAISS's matrix multiply cannot alias.
 template <typename Consume>
@@ -144,22 +154,49 @@ void transformVectorChunks(const float* base, int64_t numVals, int32_t dims,
   }
 }
 
+// Adds one segment's vectors to the index.  F32 columns are read straight
+// from the mapped column; quantized columns decode one chunk at a time.
+void addVectorsToIndex(faiss::Index& index, VectorReader& vr, int32_t dims,
+                       bool normalizeForFaiss, const faiss::VectorTransform* rotation,
+                       size_t chunkBytes) {
+  int64_t numVals = vr.numVectors();
+  if (numVals <= 0) return;
+  auto add = [&](int64_t, int64_t n, const float* x) { index.add(n, x); };
+  if (vr.encoding() == VectorEncoding::F32) {
+    const float* base = (const float*)vr.rowAtRank(0).data();
+    transformVectorChunks(base, numVals, dims, normalizeForFaiss, rotation, chunkBytes, add);
+    return;
+  }
+
+  size_t bytesPerVec = (size_t)dims * sizeof(float);
+  size_t chunkVecs = std::min((size_t)numVals, std::max((size_t)1, chunkBytes / bytesPerVec));
+  std::vector<float> decoded(chunkVecs * (size_t)dims);
+  for (int64_t off = 0; off < numVals; off += (int64_t)chunkVecs) {
+    int64_t n = std::min((int64_t)chunkVecs, numVals - off);
+    vr.decodeRange(off, n, decoded.data());
+    // The decoded buffer is ours, so normalize it in place.
+    if (normalizeForFaiss) faiss::fvec_renorm_L2((size_t)dims, (size_t)n, decoded.data());
+    transformVectorChunks(decoded.data(), n, dims, false, rotation, chunkBytes, add);
+  }
+}
+
 void appendTrainingVectors(std::vector<float>& sample, int64_t sampleCap,
                            int64_t& nextSampleOrd,
                            int64_t ntotal,
                            int64_t segmentGlobalStart,
                            VectorReader& vr,
-                           int32_t dims) {
+                           int32_t dims,
+                           bool normalizeForFaiss) {
   int64_t numVals = vr.numVectors();
   int64_t segmentGlobalEnd = segmentGlobalStart + numVals;
   while (nextSampleOrd < sampleCap) {
     int64_t targetGlobal = (nextSampleOrd * ntotal) / sampleCap;
     if (targetGlobal >= segmentGlobalEnd) break;
     if (targetGlobal >= segmentGlobalStart) {
-      auto vec = vr.vectorAtRank(targetGlobal - segmentGlobalStart);
       size_t old = sample.size();
       sample.resize(old + (size_t)dims);
-      std::memcpy(sample.data() + old, vec.data(), (size_t)dims * sizeof(float));
+      vr.decodeAtRank(targetGlobal - segmentGlobalStart, sample.data() + old);
+      if (normalizeForFaiss) faiss::fvec_renorm_L2((size_t)dims, 1, sample.data() + old);
     }
     nextSampleOrd++;
   }
@@ -178,7 +215,11 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
     const auto& fi = *info;
     if (fi.type != FieldType::VECTOR) continue;
 
-    VectorReader vr(pr, fi);
+    // The keep_original column, when aligned with the encoded one, is the
+    // full-precision input for training and adds.
+    SegFieldInfo originalInfo;
+    bool fromOriginal = findOriginalColumn(pr, fi, originalInfo);
+    VectorReader vr(pr, fromOriginal ? originalInfo : (const SegFieldInfo&)fi);
     int32_t segDims = vr.dims();
     if (segDims <= 0) continue;
     if (dims == 0) {
@@ -189,7 +230,7 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
         fieldName, dims, seg.segId, segDims));
     }
 
-    if (!fn(seg, vr)) return false;
+    if (!fn(seg, vr, fromOriginal)) return false;
   }
   return true;
 }
@@ -232,7 +273,9 @@ VectorIndexBuilder::collectEligibleFields() {
     while (fr.readNextField()) {
       SegFieldInfo fi;
       fr.readFieldInfo(fi);
-      if (fi.type == FieldType::VECTOR) {
+      // keep_original companions are inputs to their field's build, not fields.
+      if (fi.type == FieldType::VECTOR
+          && !VectorFieldType::isOriginalColumnName((std::string_view)fr.name())) {
         seen.emplace((std::string_view)fr.name());
       }
     }
@@ -323,7 +366,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   int64_t ntotal = 0;
 
   forEachVectorSegment(segments_, fieldName, dims,
-      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
+      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr, bool) {
     ntotal += vr.numVectors();
     return true;
   });
@@ -372,9 +415,9 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   int64_t globalStart = 0;
   int64_t nextSampleOrd = 0;
   forEachVectorSegment(segments_, fieldName, dims,
-      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
+      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr, bool fromOriginal) {
     appendTrainingVectors(training, sampleCap, nextSampleOrd, ntotal,
-                          globalStart, vr, dims);
+                          globalStart, vr, dims, normalizeSegmentForFaiss(ft, vr, fromOriginal));
     globalStart += vr.numVectors();
     return nextSampleOrd < sampleCap;
   });
@@ -384,9 +427,6 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
               "using flat-over-column fallback",
               fieldName, ntrain);
     return std::nullopt;
-  }
-  if (shouldNormalizeForFaiss(ft)) {
-    faiss::fvec_renorm_L2((size_t)dims, (size_t)ntrain, training.data());
   }
 
   // RaBitQ's error bound assumes the codes are taken in a randomly rotated
@@ -445,13 +485,10 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   training.shrink_to_fit();
 
   forEachVectorSegment(segments_, fieldName, dims,
-      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr) {
+      [&](const VectorIndexBuilder::SegInput&, VectorReader& vr, bool fromOriginal) {
     if (vr.numVectors() > 0) {
-      const float* base = (const float*)vr.vectorAtRank(0).data();
-      transformVectorChunks(base, vr.numVectors(), dims, shouldNormalizeForFaiss(ft), rotation.get(),
-          ivfAddChunkBytes, [&](int64_t, int64_t n, const float* x) {
-        index->add(n, x);
-      });
+      addVectorsToIndex(*index, vr, dims, normalizeSegmentForFaiss(ft, vr, fromOriginal),
+                        rotation.get(), ivfAddChunkBytes);
     }
     return true;
   });

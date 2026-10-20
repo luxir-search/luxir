@@ -103,6 +103,7 @@ public:
       fieldInfo.mono2MetaOff = fieldIS.readVlong();
       fieldInfo.valDocLoc = fieldIS.readVal<seg_location>();
       fieldInfo.valDocMetaOff = fieldIS.readVlong();
+      fieldInfo.vectorEncoding = fieldInfo.type == FieldType::VECTOR ? fieldIS.readVint() : 0;
     }
   }
 
