@@ -61,6 +61,8 @@ struct ResolvedField {
   bool vectorNormalizeOnWrite = false;
   // Atomic like analyzer: the nearest authored ann in the parent chain.
   const luxir::api::VectorAnnDef* ann = nullptr;
+  std::optional<int32_t> depthLimit;
+  std::optional<int32_t> ignoreAbove;
 };
 
 struct ResolvedOwnership {
@@ -261,6 +263,15 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   }
 
   r.ann = def.ann ? &*def.ann : parentResolved.ann;
+  r.depthLimit = def.depth_limit ? def.depth_limit : parentResolved.depthLimit;
+  if (r.depthLimit && *r.depthLimit < 1) {
+    throw SchemaError("depth_limit must be >= 1 (field: " + std::string(name) + ")");
+  }
+  r.ignoreAbove = def.ignore_above ? def.ignore_above : parentResolved.ignoreAbove;
+  if (r.ignoreAbove && *r.ignoreAbove < 0) {
+    throw SchemaError("ignore_above must be >= 0 (field: " + std::string(name) + ")");
+  }
+
   return r;
 }
 
@@ -410,6 +421,9 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
       "dims/truncate_dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " +
       name + ")");
   }
+  if ((def.depth_limit || def.ignore_above) && r.type != FieldClass::FLATTENED) {
+    throw SchemaError("depth_limit/ignore_above are only valid for flattened fields (field: " + name + ")");
+  }
 }
 
 // Reserved-field invariants.  "id" and "_version_" are operationally hard-coded
@@ -475,6 +489,7 @@ struct FieldCompiler {
       switch (r.type) {
         case FieldClass::ID:     index = IndexMode::MATCH; break;
         case FieldClass::STRING: index = IndexMode::MATCH; break;
+        case FieldClass::FLATTENED: index = IndexMode::MATCH; break;
         case FieldClass::TEXT:   index = IndexMode::MATCH; break;
         case FieldClass::INT:    index = IndexMode::NONE; break;
         default: index = IndexMode::NONE; break;
@@ -497,8 +512,18 @@ struct FieldCompiler {
         "(field: " + std::string(name) + ")");
     }
 
+    if (r.type == FieldClass::FLATTENED) {
+      // Every query and facet on a key path is a term operation, and the
+      // ord column rebuilds the object for retrieval without stored source.
+      if (index != IndexMode::MATCH) {
+        throw SchemaError("flattened fields require index=match (field: " + std::string(name) + ")");
+      }
+      multi = true;
+    }
+
     if (r.longTerms) {
-      if (r.type != FieldClass::STRING && r.type != FieldClass::TEXT && r.type != FieldClass::ID) {
+      if (r.type != FieldClass::STRING && r.type != FieldClass::TEXT && r.type != FieldClass::ID
+          && r.type != FieldClass::FLATTENED) {
         throw SchemaError("long_terms is only valid for string, text or id fields (field: " + std::string(name) + ")");
       }
       if (r.type == FieldClass::STRING && index == IndexMode::NONE) {
@@ -531,7 +556,7 @@ struct FieldCompiler {
         throw SchemaError("index=match is not supported for this type (field: " + std::string(name) + ")");
       }
     }
-    if (!logical.hasMulti) {
+    if (!logical.hasMulti && r.type != FieldClass::FLATTENED) {
       multi = false;
     }
     if (!logical.hasStored) {
@@ -580,6 +605,14 @@ struct FieldCompiler {
           }
         }
         ft = std::make_shared<StrFieldType>(name, flags, normalizer);
+        break;
+      }
+      case FieldClass::FLATTENED: {
+        auto str = std::make_shared<StrFieldType>(name, flags);
+        str->flattened = true;
+        str->depthLimit = r.depthLimit.value_or(StrFieldType::DEFAULT_DEPTH_LIMIT);
+        str->ignoreAbove = r.ignoreAbove.value_or(0);
+        ft = std::move(str);
         break;
       }
       case FieldClass::TEXT: {
@@ -909,6 +942,9 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
     logical->primary = compiler.create(e.name, r, owned);
     logical->multi = logical->primary->multiValued();
     logical->shape = shapeFamily(r.type);
+    if (r.type == FieldClass::FLATTENED && owned.variants && !owned.variants->entries.empty()) {
+      throw SchemaError("flattened fields cannot have variants: " + logical->name);
+    }
     if (owned.variants) {
       boost::unordered_flat_set<std::string> labels;
       for (const auto& [label, view] : owned.variants->entries) {
@@ -942,6 +978,7 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
         auto branch = physicalSettings(name, def, parent);
         validateDirectProps({name, def, false}, branch);
         if (branch.type == FieldClass::ID) throw SchemaError("variant cannot have type id: " + name);
+        if (branch.type == FieldClass::FLATTENED) throw SchemaError("variant cannot have type flattened: " + name);
         if (shapeFamily(branch.type) != logical->shape) {
           throw SchemaError("variant must have the primary's shape family: " + name);
         }
@@ -1029,7 +1066,7 @@ static ResolvedFieldHandle handle(std::string_view root, std::string_view label,
   std::string physicalName(root);
   if (label != "self") physicalName.append("__").append(label);
   return {std::string(root), std::move(physicalName), &type,
-          label == "self" ? FieldRole::PRIMARY : FieldRole::VARIANT, owner};
+          label == "self" ? FieldRole::PRIMARY : FieldRole::VARIANT, owner, {}};
 }
 
 ResolvedFieldHandle Schema::resolveInput(std::string_view docKey) const {
@@ -1043,6 +1080,29 @@ ResolvedFieldHandle Schema::resolveInput(std::string_view docKey) const {
 }
 
 ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const {
+  // "field.key.path" names a key path inside a FLATTENED field. Field names
+  // cannot contain '.', so the first one ends the root; the key path may
+  // contain anything else.
+  auto dot = name.find('.');
+  if (dot != std::string_view::npos) {
+    auto rootName = name.substr(0, dot);
+    auto root = findRoot(rootName);
+    if (!root.primary || !flattenedType(root.primary->get())) {
+      throw RequestError("Field not found: " + std::string(name) +
+                         " (only flattened fields have key paths)", "unknown_field");
+    }
+    auto key = name.substr(dot + 1);
+    if (key.empty() || key.find('\0') != std::string_view::npos) {
+      throw RequestError("Invalid flattened key path: " + std::string(name), "invalid_field_name");
+    }
+    if (op == OpClass::RETRIEVE || op == OpClass::PRIMARY) {
+      throw RequestError("Field '" + std::string(name) + "' is a flattened key path; retrieve '" +
+                         std::string(rootName) + "' instead", "invalid_field");
+    }
+    auto target = handle(rootName, "self", **root.primary, root.owner);
+    target.flatPrefix.assign(key).push_back('\0');
+    return target;
+  }
   auto split = name.rfind("__");
   auto rootName = split == std::string_view::npos ? name : name.substr(0, split);
   if (!validFieldName(rootName)) {
@@ -1056,8 +1116,9 @@ ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const 
   std::string_view label = "self";
   if (split != std::string_view::npos) {
     label = name.substr(split + 2);
-    if (foldName(label) == "self") return handle(rootName, "self", **root.primary, root.owner);
-    if (!validVariantLabel(label)) {
+    if (foldName(label) == "self") {
+      label = "self";
+    } else if (!validVariantLabel(label)) {
       throw RequestError("Invalid variant selector: " + std::string(name), "invalid_field_name");
     }
   } else if (root.owner && op == OpClass::SEARCH) {
@@ -1065,7 +1126,13 @@ ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const 
   } else if (root.owner && op == OpClass::VALUE) {
     label = root.owner->value;
   }
-  if (label == "self") return handle(rootName, label, **root.primary, root.owner);
+  if (label == "self") {
+    auto target = handle(rootName, label, **root.primary, root.owner);
+    if ((op == OpClass::SEARCH || op == OpClass::VALUE) && flattenedType(target.fieldType)) {
+      target.flatPrefix.push_back('\0');
+    }
+    return target;
+  }
   if (root.owner) {
     auto variant = root.owner->variants.find(label);
     if (variant != root.owner->variants.end()) {

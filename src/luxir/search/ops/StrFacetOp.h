@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <format>
+#include <limits>
 #include <optional>
 #include <ranges>
 #include <string_view>
@@ -149,6 +150,17 @@ class StrFacetOp : public FieldFacetReq {
   };
   std::vector<PinnedBucket> pinnedBuckets;
   bool inlineAllCandidate = false;
+  // A flattened key path's buckets: the global ords [ordLo, ordHi) of the
+  // terms with termPrefix, labeled without it. Counting is unaffected; only
+  // selection and labels apply the restriction.
+  std::string termPrefix;
+  int64_t ordLo = 0;
+  int64_t ordHi = std::numeric_limits<int64_t>::max();
+
+  bool inRange(int64_t ord) const { return ord >= ordLo && ord < ordHi; }
+  std::string label(std::string_view term) const {
+    return std::string(term.substr(std::min(termPrefix.size(), term.size())));
+  }
 
 public:
   class MergeableStrData : public luxir::MergeableData {
@@ -360,10 +372,19 @@ public:
   StrFacetOp(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     std::shared_ptr<OrdMap> ordMap,
-    std::span<const std::string_view> selected) :
+    std::span<const std::string_view> selected,
+    std::string_view termPrefix = {}) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing,
                 {}, selected),
-  ordMap(std::move(ordMap)) {
+  ordMap(std::move(ordMap)), termPrefix(termPrefix) {
+    if (!this->termPrefix.empty()) {
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      OrdMapStr lookup(poolGuard.pool(), this->ordMap.get(), reader, segInfos);
+      std::string end = this->termPrefix;
+      end.back()++;
+      ordLo = lookup.ceilOrd(this->termPrefix);
+      ordHi = lookup.ceilOrd(end);
+    }
     if (!selected.empty()) {
       auto poolGuard = MemPool::threadLocalPoolGuard();
       OrdMapStr lookup(poolGuard.pool(), this->ordMap.get(), reader, segInfos);
@@ -465,6 +486,7 @@ public:
     }
 
     LUXIR_INLINE void add(int64_t ord, int64_t count) {
+      if (!op.inRange(ord)) return;
       if (counted < paddingTarget) countedOrds.push_back(ord);
       counted++;
       // countFieldBucketOrder: a newcomer must beat the page's worst bucket
@@ -490,8 +512,8 @@ public:
             countedOrds.begin(), countedOrds.end());
         int64_t numGlobalOrds = op.ordMap ? op.ordMap->numOrds() : 0;
         size_t emitted = counted;
-        for (int64_t ord = 0;
-             ord < numGlobalOrds && emitted < paddingTarget; ord++) {
+        for (int64_t ord = op.ordLo;
+             ord < std::min(numGlobalOrds, op.ordHi) && emitted < paddingTarget; ord++) {
           if (present.contains(ord)) continue;
           finalizer.add({ord, 0, {}});
           emitted++;
@@ -847,7 +869,7 @@ public:
                     ? 0 : (int64_t)thisOp().ordMap->topTerms().entries.size(),
                 .domainHasBitset = domainView.bits != nullptr,
                 .missingRequested = thisOp().missing,
-                .allowTopTerms = allowTopTerms,
+                .allowTopTerms = allowTopTerms && thisOp().termPrefix.empty(),
                 .hasGlobalOrdMap = thisOp().ordMap != nullptr,
                 .readerHasNoDeletes =
                     thisOp().reader.liveDocs() == thisOp().reader.maxDoc()
@@ -1440,7 +1462,7 @@ public:
       auto pool = MemPool::threadLocalPoolGuard();
       OrdMapStr labels(pool.pool(), thisOp().ordMap.get(), thisOp().reader, thisOp().segInfos);
       emitCountPage<std::string>(finalized, missingCount,
-          [&](const auto& bucket) { return std::string(bucket.pinned()
+          [&](const auto& bucket) { return thisOp().label(bucket.pinned()
               ? thisOp().pinnedBuckets[bucket.pinIndex].key : labels.ordToStr(*bucket.key)); },
           [this](auto& buckets) { executeResultChildren(buckets); });
     }
@@ -1455,10 +1477,13 @@ public:
       for (const auto& pin : thisOp().pinnedBuckets) pins.push_back(pin.ord);
       inlineResult<std::string>(std::move(mergedData), pins,
           [&](const auto& bucket) {
-            return std::string(bucket.pinned()
+            return thisOp().label(bucket.pinned()
                 ? thisOp().pinnedBuckets[bucket.pinIndex].key
                 : labels.ordToStr(*bucket.key));
-          }, [this](auto& buckets) { executeResultChildren(buckets); });
+          }, [this](auto& buckets) { executeResultChildren(buckets); },
+          std::less<int64_t>{}, thisOp().termPrefix.empty()
+              ? std::function<bool(int64_t)>()
+              : [this](int64_t ord) { return thisOp().inRange(ord); });
     }
 
 
@@ -1693,7 +1718,7 @@ public:
         for (const auto& result : finalized) {
           assert(!result.pinned() && result.key.has_value());
           countVec.emplace_back(
-              ordMapStr.ordToStr(*result.key), result.count);
+              child.label(ordMapStr.ordToStr(*result.key)), result.count);
         }
         auto& facetResultProto = oneofMut<luxir::api::FacetResult>(
             const_cast<luxir::api::Val&>(arr.v[(size_t)output]));

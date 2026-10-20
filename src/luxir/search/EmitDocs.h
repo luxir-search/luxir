@@ -39,6 +39,7 @@
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/StrColReader.h"
 #include "luxir/reader/TermsEnum.h"
+#include "luxir/schema/Flattened.h"
 #include "luxir/search/Collector.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/util/MemPool.h"
@@ -792,6 +793,35 @@ inline size_t missingSlotBytes(const luxir::api::Column& col) {
   }, col.kind);
 }
 
+// A flattened field returns its object, not its stored values: after the
+// loads, replace each flattened field's string column with a ColVal column
+// holding the object each document's values describe (unset = missing).
+// columnFields and columnPresent are as for placeBatchColumns; a replaced
+// column's tracker is cleared since ColVal presence is its set oneof.
+inline void finishFlattenedColumns(std::span<const ReturnField* const> columnFields,
+                                   std::span<const uint8_t*> columnPresent,
+                                   SearchResponse::ColumnsType& columns,
+                                   std::pmr::memory_resource& mr)
+{
+  using Pair = std::pair<std::string_view, luxir::api::Column>;
+  auto* arr = const_cast<Pair*>(columns.data());
+  size_t count = std::min(columns.size(), columnFields.size());
+  for (size_t i = 0; i < count; i++) {
+    if (!flattenedType(columnFields[i]->fieldType)) continue;
+    luxir::api::Column& col = arr[i].second;
+    // Flattened fields are always multi-valued: their values load as ArrArrStr.
+    auto* c = std::get_if<luxir::api::ArrArrStr>(&col.kind);
+    if (c == nullptr) continue;
+    std::span<const luxir::api::Val> vals;
+    luxir::api::Val* out = build::allocArray(vals, c->v.size(), mr);
+    for (size_t r = 0; r < c->v.size(); r++) {
+      if (!c->v[r].v.empty()) out[r] = flattened::retrieved(c->v[r].v, mr);
+    }
+    col.kind.emplace<luxir::api::ColVal>().v = vals;
+    columnPresent[i] = nullptr;
+  }
+}
+
 // Settle one batch's placement after finishPendingCols.  columnFields[i] is
 // the ReturnField behind response column i and columnPresent[i] its slot
 // tracker (null when untracked, see forEachPresent); later columns (_score_)
@@ -1272,6 +1302,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     // missing_val and fill its missing slots.  (ROWS mode relies on the
     // exact sentinels for its presence checks.)
     finishPendingCols(pendingCols);
+    finishFlattenedColumns(columnFields, columnPresent, docListProto.columns, mr);
     placeBatchColumns(placement, columnFields, columnPresent, docListProto.columns, rowColumns,
                       (size_t)columnSize, scoreRows, columnFate, rowCaps, mr);
 

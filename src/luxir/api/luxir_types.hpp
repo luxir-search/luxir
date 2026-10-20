@@ -118,7 +118,7 @@ enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
-enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
+enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9, FLATTENED = 17 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 }
@@ -273,6 +273,8 @@ struct FieldDef {
   std::optional<LongTerms> long_terms;                          // align 4 (enum)
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<std::int32_t> truncate_dims;                    // align 4
+  std::optional<std::int32_t> depth_limit;                      // align 4
+  std::optional<std::int32_t> ignore_above;                     // align 4
   std::optional<Metric> metric;                                 // align 4 (enum)
   std::optional<bool> column;                                   // align 1 (optional<bool>s)
   std::optional<bool> multi;

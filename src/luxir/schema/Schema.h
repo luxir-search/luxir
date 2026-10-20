@@ -54,6 +54,10 @@ struct ResolvedFieldHandle {
   FieldType* fieldType;
   FieldRole role;
   const LogicalField* owner;
+  // A FLATTENED field's term operations see only the terms with this prefix:
+  // "<key path>\0" for a "field.key.path" spelling, "\0" (the bare leaf
+  // values) for the root under SEARCH and VALUE. Empty otherwise.
+  std::string flatPrefix = {};
 };
 
 // Schema lookup is immutable and never retains names supplied by a request.

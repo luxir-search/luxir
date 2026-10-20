@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <boost/sort/spreadsort/string_sort.hpp>
+#include "luxir/schema/Flattened.h"
 #include "luxir/schema/Schema.h"
 
 // include the actual index handlers
@@ -218,7 +219,31 @@ void Inverter::InputHandler::store(Inverter& inverter, const IndexVal& val) {
   }
 }
 
+// A flattened value is one object: its terms go to the field's one physical
+// handler, and stored source keeps the object as JSON text.
+void Inverter::InputHandler::indexFlattened(Inverter& inverter, const IndexVal& val,
+                                            const StrFieldType& type) {
+  std::string_view name(fieldName);
+  std::vector<std::string> terms;
+  flattened::appendTerms(val, type, name, terms);
+  if (writer && !coerce::isNull(val)) {
+    std::string json;
+    if (!api::write_json(val, json)) {
+      throw DocumentError(fmt::format("Field '{}': cannot serialize the object for storage", name));
+    }
+    writer->addValue(inverter.getDoc(), name, json);
+  }
+  std::vector<std::string_view> views(terms.begin(), terms.end());
+  forEachBranch([&](IndexHandler& branch) {
+    branch.index(inverter, std::span<const std::string_view>(views.data(), views.size()));
+  });
+}
+
 void Inverter::InputHandler::index(Inverter& inverter, const IndexVal& val) {
+  if (auto* flat = flattenedType(fieldType.get())) {
+    indexFlattened(inverter, val, *flat);
+    return;
+  }
   checkShape(val);
   // Capture the original value before any branch's analysis or normalization.
   if (writer) store(inverter, val);

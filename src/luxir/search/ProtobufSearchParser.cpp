@@ -647,10 +647,22 @@ public:
               + std::string(facetField) + "' is column-only (not indexed); string facets "
               "require an indexed field");
         }
+        if (!target.flatPrefix.empty()) {
+          // Distinct counts label their buckets apart from StrFacetOp, and
+          // a key path's missing would need the docs without its terms.
+          if (measure != nullptr) {
+            throw RequestError("facet '" + std::string(facetName)
+                + "': distinct counts are not supported on flattened fields");
+          }
+          if (missing && target.flatPrefix.size() > 1) {
+            throw RequestError("facet '" + std::string(facetName)
+                + "': missing is not supported on a flattened key path");
+          }
+        }
         auto ordMap = req.reader->getOrdMap(facetField);
         facet = luxir::arenaCreate<StrFacetOp>(req.arena, req, facetReq,
             facetField, facetName, limit, minCount, missing,
-            std::move(ordMap), selectedStrings);
+            std::move(ordMap), selectedStrings, target.flatPrefix);
         break;
       }
       case FieldType::Type::TEXT:

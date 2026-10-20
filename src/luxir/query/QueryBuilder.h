@@ -376,6 +376,8 @@ public:
   Query* createExistsQuery(const ResolvedFieldHandle& target) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
+    // A flattened key path exists where some term carries its prefix.
+    if (!target.flatPrefix.empty()) return pool.make<PrefixQuery>(field, poolCopy(target.flatPrefix));
     if (!fieldType.indexed() && !fieldType.hasColumn()) {
       throw std::runtime_error(std::format(
           "Exists query requires an indexed or column-stored field: {}", field));
@@ -531,9 +533,12 @@ public:
     return pool.make<TermInSetQuery>(field, terms);
   }
 
+  // A flattened target's literal is a leaf below its key path, so it gains
+  // the path's term prefix.
   std::string_view normalizeLiteral(const ResolvedFieldHandle& target,
                                     std::string_view text, bool exact) {
     if (auto* chain = fields.chain(target)) text = normalizeMultiterm(*chain, text);
+    if (!target.flatPrefix.empty()) text = poolCopy(target.flatPrefix + std::string(text));
     if (exact && (target.fieldType->type() != FieldType::STRING || target.fieldType->indexed())) {
       text = fitTerm(target, text);
     }
@@ -598,9 +603,17 @@ public:
   }
 
 private:
+  static void rejectFlattened(std::string_view label, const ResolvedFieldHandle& target) {
+    if (flattenedType(target.fieldType)) {
+      throw std::runtime_error(std::format(
+          "{} query is not supported on flattened field: {}", label, target.physicalName));
+    }
+  }
+
   FieldType* checkAutomatonField(std::string_view label, const ResolvedFieldHandle& target) {
     const auto& field = target.physicalName;
     FieldType& fieldType = *target.fieldType;
+    rejectFlattened(label, target);
     switch (fieldType.type()) {
       case FieldType::Type::TEXT:
       case FieldType::Type::ID:
@@ -695,6 +708,7 @@ public:
                           int maxExpansions = 0) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
+    rejectFlattened("Fuzzy", target);
     switch (fieldType.type()) {
       case FieldType::Type::TEXT:
       case FieldType::Type::ID:
@@ -920,9 +934,23 @@ public:
         return normalizeLiteral(target, t, true);
       };
       std::optional<std::string_view> lower, upper;
+      bool lowerInclusive = hasGte, upperInclusive = hasLte;
       if (hasGte || hasGt) lower = termBound(hasGte ? *gte : *gt);
       if (hasLte || hasLt) upper = termBound(hasLte ? *lte : *lt);
-      return pool.make<TermRangeQuery>(field, lower, hasGte, upper, hasLte);
+      if (!target.flatPrefix.empty()) {
+        // An open side stops at the key path's terms: [prefix, prefix+1).
+        if (!lower) {
+          lower = poolCopy(target.flatPrefix);
+          lowerInclusive = true;
+        }
+        if (!upper) {
+          std::string end = target.flatPrefix;
+          end.back()++;
+          upper = poolCopy(end);
+          upperInclusive = false;
+        }
+      }
+      return pool.make<TermRangeQuery>(field, lower, lowerInclusive, upper, upperInclusive);
     }
 
     // Coerce every supplied bound first, so a malformed bound is always a
