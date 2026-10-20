@@ -280,6 +280,7 @@ public:
 
     void store(Inverter& inverter, const IndexVal& val);
     void checkShape(const IndexVal& val) const;
+    void indexFlattened(Inverter& inverter, const IndexVal& val, const StrFieldType& type);
 
     template<typename F>
     void forEachBranch(F&& index) {

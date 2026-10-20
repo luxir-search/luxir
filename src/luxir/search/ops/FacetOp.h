@@ -3,6 +3,7 @@
 
 #pragma once
 #include <atomic>
+#include <functional>
 #include <string_view>
 #include <vector>
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -504,7 +505,10 @@ public:
     void inlineResult(std::unique_ptr<Data> mergedData,
                       std::span<const std::optional<int64_t>> pinKeys,
                       ResolveLabel&& resolveLabel, ExecuteChildren&& executeChildren,
-                      KeyLess keyLess = {}) {
+                      KeyLess keyLess = {},
+                      // Null keeps every key. Rejected keys never join the
+                      // ordinary page; pinned buckets are captured regardless.
+                      std::function<bool(int64_t)> acceptKey = nullptr) {
       auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
       auto& facetResultProto = *slotArm<luxir::api::FacetResult>(nullptr);
       auto minCount = fieldOp().minCount;
@@ -568,7 +572,9 @@ public:
       if (finalizer.needsCandidates() || capturePins) {
         counts.forEachEntry([&](int64_t key, char* entry) {
           int64_t count = counts.occurrenceCount(entry);
-          finalizer.add({key, count, {entry, finalizedSlot}});
+          if (!acceptKey || acceptKey(key)) {
+            finalizer.add({key, count, {entry, finalizedSlot}});
+          }
           if (capturePins) {
             auto pin = pinByKey.find(key);
             if (pin != pinByKey.end()) {

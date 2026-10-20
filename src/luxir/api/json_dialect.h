@@ -708,6 +708,10 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.normalize_on_write, ctx, vit, vend);
           } else if (key == "ann") {
             util::from_json<V>(value.ann, ctx, vit, vend);
+          } else if (key == "depth_limit") {
+            util::from_json<V>(value.depth_limit, ctx, vit, vend);
+          } else if (key == "ignore_above") {
+            util::from_json<V>(value.ignore_above, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

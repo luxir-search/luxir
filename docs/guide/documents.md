@@ -207,6 +207,20 @@ uses an array of number arrays; a bare number array is also accepted as a
 one-vector list. The field must be declared `multi: true`; the `_ss`, `_is`,
 `_fs`, `_ds`, `_dts`, and `_vs` default suffixes already are.
 
+## Object values
+
+A field of type [`flattened`](schema.md#flattened-objects) accepts a JSON
+object (or an array of objects) and indexes each leaf as a string under its
+key path:
+
+```json
+{"id": "pod-1", "labels": {"app": "web", "tier": {"zone": "a"}}}
+```
+
+Query `labels.app:web` or `labels.tier.zone:a`, facet on `labels.app`, and
+retrieve `labels` to get the object back. Any other field rejects an object
+value.
+
 ## What is returned
 
 Columns and stored fields solve different problems:
@@ -275,8 +289,10 @@ unless its slop reaches that gap.
 
 ## Limits
 
-- Nested objects and nested documents are not a field type. Model
-  relationships with IDs or flatten the fields in the producer.
+- An object value needs a [`flattened`](schema.md#flattened-objects) field,
+  which indexes its leaves as strings under their key paths. Nested documents,
+  which keep each array element's fields together, are not supported; model
+  those relationships with IDs.
 - Geo columns participate in queries but are not yet decoded by document
   projection; see [Geo search](geo-search.md#current-limits).
 - Binary is reserved in the wire/schema enum but is not a usable engine field

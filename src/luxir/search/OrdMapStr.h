@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <algorithm>
 #include <optional>
 
 #include "OrdMap.h"
@@ -87,6 +88,21 @@ public:
       if (tenum->seek(term)) return mapping.globalOrd(tenum->ord());
     }
     return std::nullopt;
+  }
+
+  // The global ordinal of the smallest term >= target, or numOrds() when
+  // every term sorts before it. Global ords follow term order, so a term range
+  // [a, b) is the ord range [ceilOrd(a), ceilOrd(b)).
+  int64_t ceilOrd(std::string_view target) {
+    if (ordMap == nullptr) return 0;
+    int64_t result = ordMap->numOrds();
+    for (int32_t segnum = 0; segnum < (int32_t)enums.size(); segnum++) {
+      auto mapping = ordMap->getSegToGlobal(segnum);
+      if (mapping.numOrds == 0) continue;
+      TermsEnum* tenum = getTermsEnum(segnum);
+      if (tenum->seekCeil(target)) result = std::min(result, mapping.globalOrd(tenum->ord()));
+    }
+    return result;
   }
 
   // Resolve a global ordinal and sum its exact segment docFreqs in one pass.

@@ -1019,6 +1019,8 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
 | <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
+| <a id="field-luxir.fielddef.depth_limit"></a>[`depth_limit`](#field-luxir.fielddef.depth_limit) | 25 | `int32` | optional | Deepest object nesting accepted in one value; a deeper document is rejected. Absent inherits, falling back to 20. |
+| <a id="field-luxir.fielddef.ignore_above"></a>[`ignore_above`](#field-luxir.fielddef.ignore_above) | 26 | `int32` | optional | Leaf values longer than this many bytes are not indexed (they stay in stored source). Absent inherits, falling back to 0 (no limit). |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -2591,6 +2593,7 @@ Placement of returned document fields: dense columns (DocList.columns) or per-do
 | <a id="value-luxir.fielddef.fieldclass.vector"></a>[`VECTOR`](#value-luxir.fielddef.fieldclass.vector) | 7 | dense float vector |
 | <a id="value-luxir.fielddef.fieldclass.date"></a>[`DATE`](#value-luxir.fielddef.fieldclass.date) | 8 | timestamp, stored as int64 milliseconds since the Unix epoch |
 | <a id="value-luxir.fielddef.fieldclass.geo_point"></a>[`GEO_POINT`](#value-luxir.fielddef.fieldclass.geo_point) | 9 | latitude/longitude point |
+| <a id="value-luxir.fielddef.fieldclass.flattened"></a>[`FLATTENED`](#value-luxir.fielddef.fieldclass.flattened) | 17 | JSON object indexed as key path/value strings in one field |
 
 <a id="enum-luxir.fielddef.indexmode"></a>
 

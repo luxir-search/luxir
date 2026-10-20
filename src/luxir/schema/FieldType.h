@@ -207,6 +207,13 @@ public:
 class StrFieldType : public FieldType {
 public:
   std::shared_ptr<const Analyzer> normalizer;
+  // The FLATTENED schema class: each value is a JSON object indexed into this
+  // one field as "<key path>\0<leaf>" and "\0<leaf>" terms (schema/Flattened.h).
+  bool flattened = false;
+  int32_t depthLimit = DEFAULT_DEPTH_LIMIT;
+  int32_t ignoreAbove = 0;  // leaves longer than this are not indexed; 0 = no limit
+
+  static constexpr int32_t DEFAULT_DEPTH_LIMIT = 20;
 
   StrFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED,
                std::shared_ptr<const Analyzer> normalizer = {})
@@ -218,6 +225,13 @@ public:
   std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
                               std::span<char> buf) const override;
 };
+
+// The field as a FLATTENED string field, or null.
+inline const StrFieldType* flattenedType(const FieldType* type) {
+  if (type == nullptr || type->type_ != FieldType::STRING) return nullptr;
+  auto* str = static_cast<const StrFieldType*>(type);
+  return str->flattened ? str : nullptr;
+}
 
 class IntFieldType : public FieldType {
 public:

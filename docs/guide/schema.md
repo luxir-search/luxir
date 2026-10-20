@@ -19,6 +19,7 @@ Choose a type based on how you want to search and use the values:
 | `date` | Timestamp with millisecond precision, supplied as ISO-8601 text or epoch milliseconds. Supports date queries, ranges, and calendar facets. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, for distance and bounding-box queries. See [Geo search](geo-search.md). |
+| `flattened` | A JSON object with open-ended keys, indexed as one field: labels, tags, and log or OpenTelemetry attributes. Query, facet, and retrieve by key path. See [Flattened objects](#flattened-objects). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
 
 ### `text` versus `string`
@@ -47,6 +48,57 @@ When one value needs both full-text search and whole-value
 sorting or faceting, use a `text` field with a `string`
 [variant](#field-variants). The built-in `_name` template provides this
 combination for names.
+
+### Flattened objects
+
+A `flattened` field takes a JSON object and indexes every leaf into one
+string field, however many distinct keys appear. Use it when key sets are
+open-ended, such as Kubernetes labels or OpenTelemetry attributes, so that
+they do not create one field per key:
+
+```json
+{"fields": {"labels": "flattened"}}
+```
+
+```json
+{"id": "pod-1", "labels": {"app": "web", "env": "prod", "tier": {"zone": "a"}, "port": 8080}}
+```
+
+Name a leaf by its key path, the keys joined with `.` after the field name:
+
+| Query | Matches |
+|---|---|
+| `labels.app:web` | the leaf `app` equals `web` |
+| `labels.tier.zone:a` | a nested leaf |
+| `labels.app:we*` | prefix |
+| `labels.app:[a TO m]`, `labels.port:>=8000` | ranges compare as strings |
+| `labels.port:*` | the leaf exists |
+| `labels:prod` | any leaf equals `prod` |
+| `labels:*` | the field has any value |
+
+`any_of` / `:=` works on key paths too. A field facet on `labels.app`
+counts the values of that key, with bucket labels that leave out the key
+path; a facet on `labels` counts leaf values across all keys.
+
+Leaves are strings: numbers and booleans index their text, as in a `string`
+field, so `8080` matches `labels.port:8080` and ranges compare text (`"10"`
+sorts before `"9"`). An array contributes each element under its own key path.
+A key path names leaves: `labels.tier:*` does not match `tier.zone`. A key
+that contains `.` is indistinguishable from nesting.
+
+Retrieving the field returns an object: in rows as the field's value, in
+column format as a `col_val` column with one object per document. With
+`"stored": true` it is the object as indexed. Without it, the object is rebuilt from the index: leaves come back as strings, keys
+in sorted order, and several values under one key path as a sorted,
+deduplicated array.
+
+Flattened fields are always multi-valued and `index: match`; they cannot have
+variants or a normalizer. `depth_limit` (default 20) rejects a document whose
+objects nest deeper. `ignore_above` (default 0, no limit) skips leaves longer
+than that many bytes; they stay in stored source. Sorting, column
+expressions, collapse, distinct counts, wildcard, regex, fuzzy, and `missing`
+on a key path facet are not supported, and key paths cannot be retrieved on
+their own.
 
 ## Read the schema
 
@@ -266,7 +318,7 @@ publication advances the schema generation.
 
 | Key | Meaning |
 |---|---|
-| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
+| `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `flattened`, `id` |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
 | `multi` | multi-valued |
@@ -280,6 +332,7 @@ publication advances the schema generation.
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 | `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
+| `depth_limit`, `ignore_above` | `flattened` only: deepest object nesting accepted (default 20), and the longest leaf indexed in bytes (default 0, no limit); see [Flattened objects](#flattened-objects) |
 
 For PQ, positive `ann.pq.m` requires positive effective (inherited) `dims`
 and must divide the stored dimension: `truncate_dims` when set, else `dims`.

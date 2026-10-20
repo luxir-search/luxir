@@ -2087,6 +2087,7 @@ message FieldDef {
     VECTOR = 7;    // dense float vector
     DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
     GEO_POINT = 9; // latitude/longitude point
+    FLATTENED = 17; // JSON object indexed as key path/value strings in one field
   }
   optional FieldClass type = 2; // required unless inherited from parent
 
@@ -2168,6 +2169,16 @@ message FieldDef {
   // VECTOR only: ANN overlay settings. Absent inherits the parent's whole
   // definition (no per-property merge), else every VectorAnnDef default.
   VectorAnnDef ann = 22;
+
+  // --- FLATTENED fields ---
+
+  // Deepest object nesting accepted in one value; a deeper document is
+  // rejected. Absent inherits, falling back to 20.
+  optional int32 depth_limit = 25;
+
+  // Leaf values longer than this many bytes are not indexed (they stay in
+  // stored source). Absent inherits, falling back to 0 (no limit).
+  optional int32 ignore_above = 26;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

@@ -297,6 +297,9 @@ private:
       fail(pos, e.what());
     }
     FieldType* field = target.fieldType;
+    if (flattenedType(field)) {
+      fail(pos, fmt::format("field '{}' is flattened and has no value column", name));
+    }
     if (field->type() == FieldType::TEXT) {
       fail(pos, fmt::format("field '{}' is TEXT and has no value column; use a string variant", name));
     }

@@ -14,6 +14,11 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
     "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point"
   };
   properties["type"] = "\"" + std::string(types[type.type()]) + "\"";
+  if (auto* flat = flattenedType(&type)) {
+    properties["type"] = "\"flattened\"";
+    properties["depth_limit"] = std::to_string(flat->depthLimit);
+    properties["ignore_above"] = std::to_string(flat->ignoreAbove);
+  }
   properties["multi"] = type.multiValued() ? "true" : "false";
   properties["index"] = type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";
   properties["column"] = type.hasColumn() ? "true" : "false";
