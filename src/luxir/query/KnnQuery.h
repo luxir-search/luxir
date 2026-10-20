@@ -1778,12 +1778,30 @@ public:
           return false;
         };
 
-        // Read-ahead (see RowReadAhead) for an unfiltered scan: every row is
-        // read.  A filtered scan relies on plain faults.
+        // Read-ahead (see RowReadAhead); a filtered scan advises only the rows
+        // of eligible docs, resolved through its own valDoc cursor (windows
+        // ascend).  Reads that cursor causes count as the window's cold pages,
+        // which only leans toward staying on.
         StrColReader& col = vr.strColReader();
         RowReadAhead::Gate gate;
-        RowReadAhead ahead(gate, domain == nullptr ? col.valuesFile() : nullptr, col.valuesOffset(),
+        RowReadAhead ahead(gate, col.valuesFile(), col.valuesOffset(),
                            (size_t)col.fixedValueSize(), numVals);
+        std::optional<MonoReader::BulkValues> aheadValDoc;
+        if (domain != nullptr && v2d.mono != nullptr) aheadValDoc.emplace(*v2d.mono);
+        int32_t aheadDoc = -1;
+        bool aheadEligible = false;
+        auto eligibleRank = [&](int64_t r) {
+          int32_t doc = aheadValDoc ? (int32_t)aheadValDoc->valueAt(r) : v2d.resolve(r);
+          if (doc != aheadDoc) {
+            aheadDoc = doc;
+            aheadEligible = docEligible(doc);
+          }
+          return aheadEligible;
+        };
+        auto readAhead = [&](int64_t rank) LUXIR_INLINE {
+          if (domain == nullptr) ahead.scanAt(rank);
+          else ahead.scanAt(rank, eligibleRank);
+        };
 
         // Inline run-collapse: value ranks are doc-ordered (the valDoc map is
         // monotonic; sparse select and dense identity likewise), so a doc's
@@ -1802,7 +1820,7 @@ public:
                 idx = valDoc.next();
               } while (end < numVals && (int32_t)valDoc.value() == docId);
               unused(idx);
-              ahead.scanAt(rank);
+              readAhead(rank);
               if (docEligible(docId) && !pooledInRun(rank, end)) {
                 eligibleDocs++;
                 emit(docId, [&]() LUXIR_INLINE {
@@ -1819,7 +1837,7 @@ public:
           } else {
             // Single-valued (dense identity or sparse select): one-vector runs.
             for (int64_t rank = 0; rank < numVals; rank++) {
-              ahead.scanAt(rank);
+              readAhead(rank);
               if (pooledInRun(rank, rank + 1)) continue;
               int32_t docId = v2d.resolve(rank);
               if (!docEligible(docId)) continue;

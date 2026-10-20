@@ -191,3 +191,23 @@ TEST(ReadAheadTest, scanAdvisesAWindowAheadOfTheCursor) {
   EXPECT_TRUE(cold.waitResident(0, 8 << 20));
   EXPECT_LT(cold.resident(16 << 20, 4 << 20), 8u);
 }
+
+TEST(ReadAheadTest, filteredScanAdvisesOnlyEligibleRows) {
+  ColdFile cold(32 << 20);
+  if (!cold.drop() || !threadIoCounters(cold)) GTEST_SKIP() << "no droppable pages or thread I/O counters";
+  int64_t rows = (int64_t)((32 << 20) / STRIDE);
+  RowReadAhead::Gate gate;
+  RowReadAhead ahead(gate, cold.file.get(), 0, STRIDE, rows);
+  auto eligible = [](int64_t r) { return r % 300 == 0; };
+  ahead.scanAt(0, eligible);
+  EXPECT_TRUE(ahead.active());
+  for (int64_t r : {0, 300, 3000, 5100}) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!cold.rowResident(r, STRIDE) && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_TRUE(cold.rowResident(r, STRIDE)) << "row " << r;
+  }
+  // The pages between rows 0 and 300 (450 KB apart) stay cold.
+  EXPECT_EQ(0u, cold.resident(4096, 100 * 4096));
+}

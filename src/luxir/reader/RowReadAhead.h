@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <initializer_list>
 #include <limits>
+#include <type_traits>
 #include <sys/resource.h>
 #include <unistd.h>
 #include "StrColReader.h"
@@ -74,6 +75,11 @@ private:
   static constexpr int64_t SPARSE_AHEAD_UNITS = 1024;
   static constexpr size_t SPARSE_BATCH_BYTES = 8 << 20;
   static constexpr int64_t SPARSE_CHECK_UNITS = 256;
+  // A filtered scan merges eligible rows this close: reading a few unneeded
+  // pages costs less than another call and another device read.  Sparse
+  // sequences merge only touching ranges: their gaps are mostly wide, and
+  // merging the narrow ones read more than the calls saved.
+  static constexpr size_t SCAN_MERGE_GAP_BYTES = 16 * 1024;
   static constexpr int64_t NEVER = std::numeric_limits<int64_t>::max();
 
   Gate& gate;
@@ -147,7 +153,8 @@ private:
     runStart = runEnd = 0;
   }
 
-  void scanStep(int64_t rank);
+  template <class Eligible>
+  void scanStep(int64_t rank, Eligible& eligible);
 
 public:
   RowReadAhead(Gate& gate, InputFile* file, size_t base, size_t stride, int64_t rows)
@@ -171,16 +178,16 @@ public:
 
   bool active() const { return gate.on; }
 
-  /// Queues rows [first, end) for advice (clamped to the column).  Adjacent
-  /// and overlapping ranges in ascending order coalesce into one prefetch.
-  void queueRows(int64_t first, int64_t end) {
+  /// Queues rows [first, end) for advice (clamped to the column).  Ranges in
+  /// ascending order within mergeGap bytes coalesce into one prefetch.
+  void queueRows(int64_t first, int64_t end, size_t mergeGap = 0) {
     first = std::max<int64_t>(first, 0);
     end = std::min(end, rows);
     if (first >= end) return;
     size_t mask = pageSize() - 1;
     size_t start = (base + (size_t)first * stride) & ~mask;
     size_t stop = (base + (size_t)end * stride + mask) & ~mask;
-    if (runEnd != 0 && start <= runEnd && stop >= runStart) {
+    if (runEnd != 0 && start <= runEnd + mergeGap && stop >= runStart) {
       batchBytes += stop > runEnd ? stop - runEnd : 0;
       runStart = std::min(runStart, start);
       runEnd = std::max(runEnd, stop);
@@ -208,9 +215,18 @@ public:
     if (after > before) gate.on = true;
   }
 
-  /// Sequential: call with each rank the scan reaches, in order.
-  LUXIR_INLINE void scanAt(int64_t rank) {
-    if (rank >= due) scanStep(rank);
+  /// Every row of a sequential scan is read.
+  struct AllRows {
+    bool operator()(int64_t) const { return true; }
+  };
+
+  /// Sequential: call with each rank the scan reaches, in order.  Only the
+  /// rows eligible(rank) accepts are advised (merged across gaps up to
+  /// SCAN_MERGE_GAP_BYTES), so a filtered scan reads ahead just the pages it
+  /// will touch; the predicate runs only while advice is on.
+  template <class Eligible = AllRows>
+  LUXIR_INLINE void scanAt(int64_t rank, Eligible&& eligible = {}) {
+    if (rank >= due) scanStep(rank, eligible);
   }
 
   /// Sparse: pos of total units consumed so far; queue(k) queues unit k
@@ -251,7 +267,8 @@ public:
   }
 };
 
-inline void RowReadAhead::scanStep(int64_t rank) {
+template <class Eligible>
+void RowReadAhead::scanStep(int64_t rank, Eligible& eligible) {
   int64_t half = std::max<int64_t>(1, SCAN_WINDOW_BYTES / 2 / (int64_t)stride);
   if (rank == 0) probe({rows / 4, rows / 2 + rows / 4});
   gate.units++;
@@ -259,7 +276,18 @@ inline void RowReadAhead::scanStep(int64_t rank) {
   if (gate.on) {
     int64_t from = std::max(ahead, rank);
     int64_t target = std::min(rows, rank + 2 * half);
-    if (from < target) checkCold(adviseBatch([&]() { queueRows(from, target); }), 1);
+    batchBytes = 0;
+    int64_t coldPages = adviseBatch([&]() {
+      if constexpr (std::is_same_v<Eligible, AllRows>) {
+        queueRows(from, target);
+      } else {
+        for (int64_t r = from; r < target; r++) {
+          if (eligible(r)) queueRows(r, r + 1, SCAN_MERGE_GAP_BYTES);
+        }
+      }
+    });
+    // A window with no eligible rows says nothing about residency.
+    if (batchBytes > 0) checkCold(coldPages, 1);
     ahead = target;
   }
   due = rank + half;
