@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/store/StorageRegistry.h"
+#include "luxir/store/ObjectStoreDirectory.h"
 
 #include <stdexcept>
 
@@ -110,6 +111,7 @@ void registerBuiltinStorage(StorageRegistry& registry) {
   registry.addBackend("fs", [](const StorageContext& ctx) -> std::unique_ptr<DirectoryFactory> {
     return std::make_unique<FSDirFactory>(ctx.config.store.data_dir, ctx.config.read_only);
   });
+  registerRamObjectBackend(registry);
 }
 
 }  // namespace luxir

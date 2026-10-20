@@ -39,8 +39,8 @@ Do not restore a raw directory copy over an existing writer identity.
 
 ### Backends, layers and options
 
-`--store.backend` names the storage backend: `ram` and `fs` are built in, and a
-plugin build may add more (an unknown name fails startup with the list of
+`--store.backend` names the storage backend: `ram`, `fs` and `ram_object` are
+built in, and a plugin build may add more (an unknown name fails startup with the list of
 registered ones). `--store.layer NAME` (repeatable, innermost first) wraps the
 backend in layers a plugin provides, such as a cache. `--store.option KEY=VALUE`
 (repeatable) passes free-form settings to the backend and layers; the plugin
@@ -53,6 +53,32 @@ documents its keys.
 Luxir's own `--store.checked-dir.sync` and `--read-only` wrappers always sit
 outside the layers. The effective stack is logged at startup as
 `storage: ...`. See [plugins](../dev/plugins.md#storage-backends-and-layers).
+
+### Object-store backends
+
+`ram_object` keeps a collection as objects in an in-memory object store. It
+exists for tests and demos, and it is the reference for backends that keep
+segments in a remote object store (a plugin provides those; see
+[storage tiers](../design/storage-tiers.md)). Segment files are fetched by byte
+range as queries touch them, and each segment carries a small `s<seg>__hot` file
+that lets a node open it with a handful of reads. Options, all optional:
+
+| Option | Default | Meaning |
+|---|---|---|
+| `chunk_bytes` | `1M` | Fetch granularity of lazy reads. A range read fetches the chunks that cover it. |
+| `staging_dir` | none (RAM) | Local directory where files are staged on their way to the store. Staged copies stay readable until the file is deleted. Use a filesystem directory for anything large. |
+| `spill_bytes` | writer default (4 MiB) | With `staging_dir`: how large an index stream grows before it becomes an object of its own. Smaller means more, finer objects. |
+| `store_name` | `default` | `ram_object` only: the process-wide in-memory store to use, so a node restarted in the same process finds its data. |
+
+Sizes take a `K`, `M` or `G` suffix.
+
+```bash
+./luxir --store.backend=ram_object --store.option chunk_bytes=256K \
+        --store.option staging_dir=/var/tmp/luxir-staging
+```
+
+`--store.verify-on-open=full` and the scrub read an object in ranges and do not
+make it resident, so they cost one full read of every file by design.
 
 ## Read-only nodes
 

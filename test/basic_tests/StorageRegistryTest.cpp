@@ -51,7 +51,7 @@ TEST(StorageRegistryTest, unknownNamesListRegisteredOnes) {
   registerBuiltinStorage(registry);
   registry.addLayer("zlayer", [](std::unique_ptr<DirectoryFactory> inner, const StorageContext&) { return inner; });
   registry.addLayer("alayer", [](std::unique_ptr<DirectoryFactory> inner, const StorageContext&) { return inner; });
-  EXPECT_NE(messageOf([&] { registry.makeBackend("s3", context()); }).find("valid backends: fs, ram"), std::string::npos);
+  EXPECT_NE(messageOf([&] { registry.makeBackend("s3", context()); }).find("valid backends: fs, ram, ram_object"), std::string::npos);
   auto layer = messageOf([&] { registry.makeLayer("nope", std::make_unique<RAMDirFactory>(), context()); });
   EXPECT_NE(layer.find("'nope'"), std::string::npos);
   EXPECT_NE(layer.find("valid layers: alayer, zlayer"), std::string::npos);

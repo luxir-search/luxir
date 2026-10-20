@@ -68,7 +68,7 @@ void initPlugins(void (*addPlugins)(PluginRegistry&)) {
   std::call_once(once, [addPlugins] {
     Registries& r = Registries::global();
     registerBuiltinAnalysis(r.analysis);
-    registerBuiltinStorage(r.storage);  // storage: ram, fs
+    registerBuiltinStorage(r.storage);  // storage: ram, fs, ram_object
     addPlugins(r.plugins);
     std::string names;
     for (const auto& p : r.plugins.plugins()) {

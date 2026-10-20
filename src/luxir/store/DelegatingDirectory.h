@@ -11,8 +11,8 @@ namespace luxir {
 /// derive from it and override only what they change.
 ///
 /// Forwarding is total, including the createFile overload with options,
-/// expectSynced, deletePrefix, sync, underlying, linkFile, openChecksum, clear
-/// and capabilities. A wrapper that must not let a new virtual through (see
+/// expectSynced, knownFiles, deletePrefix, sync, underlying, linkFile,
+/// openChecksum, clear and capabilities. A wrapper that must not let a new virtual through (see
 /// ReadOnlyDirectory) overrides it explicitly.
 class DelegatingDirectory : public Directory {
 protected:
@@ -26,6 +26,7 @@ public:
     return delegate->openFile(name, expectSynced);
   }
   void expectSynced(std::span<const FileDescriptor> files) override { delegate->expectSynced(files); }
+  void knownFiles(std::span<const FileDescriptor> files) override { delegate->knownFiles(files); }
   std::unique_ptr<File> createFile(std::string_view name) override { return delegate->createFile(name); }
   std::unique_ptr<File> createFile(std::string_view name, FileCreateOptions options) override {
     return delegate->createFile(name, std::move(options));

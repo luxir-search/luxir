@@ -69,7 +69,7 @@ public:
   void freeze() { isFrozen = true; }
 };
 
-// Registers the built-in backends: ram and fs. Called by initPlugins.
+// Registers the built-in backends: ram, fs and ram_object. Called by initPlugins.
 void registerBuiltinStorage(StorageRegistry& registry);
 
 // The node-wide registry (Registries::global().storage).
