@@ -823,6 +823,61 @@ Over gRPC the response is a typed `DocList`: dense columns and row maps can
 coexist, `row_count` is authoritative, and `_score_` is a synthetic float
 column when requested.
 
+## Highlighting
+
+`highlight` on a result list marks where the query matched in each returned
+hit's stored text and returns the best fragments per field:
+
+```json
+{
+  "query": "body_t:jumping OR body_t:\"lazy dog\"",
+  "fields": ["id"],
+  "highlight": {"fields": ["body_t"], "fragment_size": 80, "number_of_fragments": 2}
+}
+```
+
+Over HTTP each hit carries a `_highlight_` object mapping a field to its
+fragments; a hit with no match in a field omits it:
+
+```json
+{"id": "7", "_highlight_": {"body_t": ["a lazy cat and a <em>lazy</em> <em>dog</em> <em>jumps</em>"]}}
+```
+
+Over gRPC, `DocList.highlight` has one map per row, aligned with the rows,
+whose values are string arrays (`arr_s`).
+
+| Option | Default | Meaning |
+|---|---|---|
+| `fields` | every queried field | Logical fields with stored text (TEXT, or STRING with `stored`). A name containing `*` is a pattern over the fields the query targets. |
+| `pre_tag`, `post_tag` | `<em>`, `</em>` | Wrap each matched token. |
+| `fragment_size` | `100` | Approximate fragment length in bytes. |
+| `number_of_fragments` | `5` | Fragments per field. `0` returns each matching value whole. |
+| `encoder` | `default` | `html` escapes the text (not the tags). |
+| `max_analyzed_offset` | `1000000` | Bytes of each value analyzed for matches. |
+
+Highlighting needs no index option. Each hit's stored value is analyzed again
+with the analyzer of every representation the query searched (primary and
+variants), and the tokens that match the query are marked by their source
+byte offsets, so stemmed and folded matches mark the original words:
+`jumping` marks `jumps` on a `_t` field. Marked are the terms of term, match
+and `any_of` queries, every occurrence of an exact phrase as a whole (a
+phrase with `slop` marks its terms wherever they occur), and the tokens
+accepted by prefix, wildcard, regex and fuzzy queries; fuzzy marks any token
+within `max_edits`, not only the expansions that scored. Clauses under
+`prohibited` and top-level `filter`s are not highlighted; filter clauses
+inside a boolean query are.
+
+Fragments are chosen per field by a density score, the number of matches a
+window holds, and returned in text order. A fragment grows to keep a match
+whole, and its edges snap to whitespace and UTF-8 boundaries.
+`fragment_size` and `max_analyzed_offset` count bytes.
+
+Only the returned page is highlighted, one task per segment beside the field
+loading, so the cost grows with `limit` and the stored text size, not with
+the match count. On a `fusion`, set `highlight` on the fusion itself: it
+marks the terms of every executed source query. `highlight` on a fusion
+source is ignored.
+
 ## Full request form
 
 The shorthand above is one `top_docs` operation named `q`, and its `ops` are

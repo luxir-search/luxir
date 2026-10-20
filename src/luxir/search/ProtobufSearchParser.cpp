@@ -1496,6 +1496,7 @@ public:
     Query* query = topDocsReq.query.has_value()
       ? parser.parse(*topDocsReq.query)
       : req.requestPool.make<AllQuery>();
+    Query* mainQuery = topDocsReq.query.has_value() ? query : nullptr;
     // A minimum score turns the query's score into part of its membership,
     // so the cut-off wraps the query before filters fold in beside it: every
     // ranking, count, and ops-domain route below then sees the same matches.
@@ -2019,6 +2020,12 @@ public:
     qr->collapse = collapse;
     qr->diversify = diversify;
     qr->headSort = std::move(headSort);
+    qr->mainQuery = mainQuery;
+    // A Fusion source's response shape is the Fusion's, highlight included.
+    if (topDocsReq.highlight && placement != TopDocsPlacement::FUSION_SOURCE) {
+      qr->highlight = buildHighlightPlan(req, *topDocsReq.highlight,
+                                         std::span<Query* const>(&qr->mainQuery, 1));
+    }
     if (firstQuery == nullptr) {
       firstQuery = qr;
     }
@@ -2192,6 +2199,11 @@ public:
     fusion->collapse = collapse;
     if (collapse && !fusionProto.collapse->head_sort.empty()) {
       fusion->headSort = parseSorts(fusionProto.collapse->head_sort);
+    }
+    if (fusionProto.highlight) {
+      std::vector<Query*> sourceQueries;
+      for (auto* src : fusion->sources) sourceQueries.push_back(src->mainQuery);
+      fusion->highlight = buildHighlightPlan(req, *fusionProto.highlight, sourceQueries);
     }
     fusion->diverseSources = std::ranges::any_of(fusion->sources,
         [](const TopDocsReq* source) { return source->collapse != nullptr || source->diversify != nullptr; });

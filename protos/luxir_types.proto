@@ -123,6 +123,33 @@ message Diversify {
   }
 }
 
+// Search-result highlighting: mark the query's matches in stored text and
+// return the best fragments per field (DocList.highlight). The stored value is
+// re-analyzed at query time with each queried representation's analyzer; no
+// index structure is needed. Only the returned page is highlighted.
+message Highlight {
+  // Logical fields to highlight. Each must keep stored source text (TEXT, or
+  // STRING with stored). A name containing '*' is a pattern over the logical
+  // fields the query targets; it skips fields without stored text.
+  repeated string fields = 1;
+  optional string pre_tag = 2;   // unset: "<em>"
+  optional string post_tag = 3;  // unset: "</em>"
+  // Approximate fragment length in bytes; unset: 100. Fragments snap to
+  // whitespace and UTF-8 boundaries and grow to keep a match whole.
+  optional int32 fragment_size = 4;
+  // Maximum fragments per field; unset: 5. 0 returns each matching value
+  // whole, ignoring fragment_size.
+  optional int32 number_of_fragments = 5;
+  enum Encoder {
+    DEFAULT = 0;  // text is copied as stored
+    HTML = 1;     // text (not the tags) is HTML-escaped
+  }
+  Encoder encoder = 6;
+  // Bytes of each stored value analyzed for matches; unset: 1000000. Matches
+  // past it are not marked.
+  optional int32 max_analyzed_offset = 7;
+}
+
 message TopDocs {
   Query query = 1;            // unset selects all documents (browse / filter-only search)
   repeated Filter filter = 2;
@@ -167,6 +194,8 @@ message TopDocs {
   optional float min_score = 14;
 
   map<string, SearchOp> ops = 15;  // sub-facets or search operations performed over docs that match this query.
+
+  Highlight highlight = 25; // ignored as a Fusion source; set Fusion.highlight
 }
 
 // Hybrid-search fusion: run several source queries (each a full TopDocs spec)
@@ -227,6 +256,9 @@ message Fusion {
   // not executed and its documents do not enter the fused list, found, or the
   // ops domain.
   map<string, double> weights = 16;
+
+  // Highlights the fused rows with the terms of every executed source query.
+  Highlight highlight = 27;
 }
 
 // Reciprocal Rank Fusion: fused_score(d) = sum over sources s of
@@ -897,6 +929,11 @@ message DocList {
   int64 offset = 4;
   map<string, Val> ops = 14; // sub-operation results performed on the TopDocs query.
   bool more = 15; // true if this document list has more batches; see SearchResponse.more
+
+  // With TopDocs/Fusion highlight: row_count entries aligned with the rows.
+  // highlight[i].fields maps a highlighted field to its fragments (arr_s);
+  // a field without a match is absent.
+  repeated Map highlight = 25;
 }
 
 

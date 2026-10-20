@@ -566,6 +566,10 @@ public:
   CollapsePlan* collapse = nullptr;
   DiversifyPlan* diversify = nullptr;
   MetricGroupPlan* metricOrder = nullptr;
+  // The request's own query, before filter folding (null when absent): the
+  // terms highlighting marks, here or in a parent Fusion.
+  Query* mainQuery = nullptr;
+  const HighlightPlan* highlight = nullptr;
   std::optional<SortPlan> headSort;
   boost::unordered_flat_map<std::string_view, SearchOp*> groupOps;
 

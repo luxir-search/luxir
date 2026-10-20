@@ -309,6 +309,22 @@ void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
       appendOpVal(out, *val);
     }
   }
+  // Highlighted fragments (DocList.highlight) render as one _highlight_
+  // object per document; a row without a match carries none.
+  if (i < docs.highlight.size() && !docs.highlight[i].fields.empty()) {
+    if (!first) out += ',';
+    first = false;
+    out += R"("_highlight_":{)";
+    bool firstField = true;
+    for (const auto& [name, val] : docs.highlight[i].fields) {
+      if (!firstField) out += ',';
+      firstField = false;
+      appendJsonString(out, name);
+      out += ':';
+      appendOpVal(out, *val);
+    }
+    out += '}';
+  }
   if constexpr (Collapsed) {
     assert(i < docs.groups->keys.size());
     if (!first) out += ',';
