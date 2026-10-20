@@ -762,8 +762,15 @@ private:
       // postings pass finishes: OrdCollector allocates ords[mergedMaxDoc] (int32)
       // up front, plus roughly a TaggedPtr/entry of pool per value for multi-value
       // chains.  This is the heavy class the budget exists for.
+      int64_t idFilterBytes = 0;
+      if ((allFlags & FieldType::ID_FILTER) != 0) {
+        int64_t sourceTerms = 0;
+        for (const auto& field : fields) sourceTerms += field.segFieldInfo.nTerms;
+        idFilterBytes = (int64_t)BlockBloomFilter::numBlocksFor(sourceTerms)
+            * BlockBloomFilter::BLOCK_BYTES;
+      }
       return (int64_t)postingsWriter.getMaxDoc() * 4 + numValues * 8
-          + MergeCostModel::LIGHT_BYTES + pointsBytes;
+          + idFilterBytes + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
     if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Text postings stream. What accumulates is the norms build (roughly one
@@ -1469,7 +1476,11 @@ private:
     // TODO: gather other stats to help us build the field (like if it's a dense field!)
     int32_t allFlags = 0;
     FieldType::Type type = FieldType::Type::NONE;
+    bool idFilter = false;  // rebuilt when any source carries one
+    int64_t sourceTerms = 0;
     for (auto* field : compactFields) {
+      idFilter |= (field->segFieldInfo.flags & FieldType::ID_FILTER) != 0;
+      sourceTerms += field->segFieldInfo.nTerms;
       if (type == FieldType::Type::NONE) {
         type = field->segFieldInfo.type;
       } else if (type != field->segFieldInfo.type) {
@@ -1535,6 +1546,10 @@ private:
       textWriter.startField(&outputFieldInfo);
       if (hasImpactNorms) {
         textWriter.setNorms(preparedNorms.textView());
+      }
+      if (idFilter) {
+        // Sized by the source term count, an upper bound when deletes drop terms.
+        textWriter.buildIdFilter(sourceTerms);
       }
 
       mergeTerms(textWriter, compactFields, isOrdCol, FieldType::hasPositions(allFlags),

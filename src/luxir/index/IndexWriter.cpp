@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/reader/FieldReader.h"
+#include "luxir/reader/IdFilterReader.h"
 #include "IndexWriter.h"
 #include "luxir/store/Manifest.h"
 
@@ -3062,6 +3063,26 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   PostingsReader& reader = *sharedReader;
   int32_t maxDocId = reader.maxDoc();
 
+  // Read the "id" field using TermsEnum
+  auto* idFieldInfo = reader.fieldInfo("id");
+  if (!idFieldInfo) {
+    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
+    return;
+  }
+
+  // Only the part of the sorted span inside the segment's [min, max] id term
+  // can match.  With random ids each segment's range covers nearly everything,
+  // so the per-id filter probe below does most of the pruning.
+  IdFilterReader idFilter(reader, *idFieldInfo);
+  if (idFilter.present()) {
+    auto first = std::lower_bound(deleteSpan.begin(), deleteSpan.end(), idFilter.minTerm(),
+        [](const SortedDeletes::Entry& e, std::string_view t) { return (std::string_view)e < t; });
+    auto last = std::upper_bound(first, deleteSpan.end(), idFilter.maxTerm(),
+        [](std::string_view t, const SortedDeletes::Entry& e) { return t < (std::string_view)e; });
+    deleteSpan = deleteSpan.subspan((size_t)(first - deleteSpan.begin()), (size_t)(last - first));
+    if (deleteSpan.empty()) return;  // disjoint: no live docs or terms are read
+  }
+
   // Load existing LiveDocs if they exist: the published reader's when it
   // holds this generation
   std::shared_ptr<LiveDocs> existingLiveDocs;
@@ -3083,13 +3104,6 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   int32_t numLiveDocs = existingLiveDocs ? existingLiveDocs->numLive() : maxDocId;
   int32_t newDeletesCount = 0;
 
-  // Read the "id" field using TermsEnum
-  auto* idFieldInfo = reader.fieldInfo("id");
-  if (!idFieldInfo) {
-    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
-    return;
-  }
-
   TermsEnum termsEnum(pool, reader, *idFieldInfo);
 
   // Phase 1: walk the merged delete span and collect the live candidate doc
@@ -3102,11 +3116,15 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     uint64_t deleteVersion;
   };
   std::vector<DeleteCandidate> candidates;
+  int64_t probes = 0;
 
   for (auto& entry : deleteSpan) {
     uint64_t deleteVersion = entry.val().deleteWatermark;
     if (deleteVersion == 0) continue;
     std::string_view deleteId = (std::string_view)entry;
+    // Skipping a target is safe: seekForward only needs ascending targets.
+    if (!idFilter.mayContain(deleteId)) continue;
+    probes++;
 
     INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
              deleteId, deleteVersion, seg.segId);
@@ -3123,6 +3141,8 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
       }
     } // end if termsEnum.seek()
   }
+  // Test hook: (segId, number of ids that passed the id filter and were sought).
+  luxir::Signal::emit("deleteIdsProbed", (void*)(int64_t)seg.segId, (void*)probes);
 
   // Gate in docId order with a forward cursor over request births.
   std::sort(candidates.begin(), candidates.end(),
