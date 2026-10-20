@@ -88,11 +88,10 @@ response paths keep connection handling separate from long-running engine work.
   does not occupy its connection thread, or parallelize (`max_parallel:
   -1`): it starts on the receiving thread, which enters the scheduler with
   a slot reserved for transport threads, and idle workers steal its tasks.
-  gRPC hands every search to the scheduler instead, because one HTTP/2
-  connection (a gateway's, say) lands all its calls on one completion queue
-  and inline execution would serialize them. The gRPC
-  unary update path currently waits for indexing on its completion-queue
-  handler.
+  gRPC hands every search to the scheduler instead: it offers a
+  connection's new calls to that connection's preferred completion queue
+  first, so inline execution would serialize the calls a client (a gateway,
+  say) multiplexes over one HTTP/2 connection.
 - Ingest is streaming and incremental: NDJSON bodies are framed as bytes
   arrive and each document enters the indexing pipeline immediately - a
   document can be getting inverted while the request that carried it is

@@ -42,12 +42,12 @@ message SearchRequest {
   // Return execution details for instrumented operations; see ExecutionProfile.
   bool profile = 7;
 
-  // Intra-request parallelism: 0 (default) lets the engine choose; 1 runs
-  // serially on the shared executor; -1 permits unlimited parallelism,
-  // starting on the receiving thread with shared workers joining in.
-  // Automatic execution is serial on the receiving thread. gRPC never
-  // executes on the receiving thread: 0 and 1 run serially on the shared
-  // executor and -1 starts there. Other values are rejected.
+  // Intra-request parallelism: 0 (default) lets the engine choose, today
+  // serial: over HTTP normally inline on the receiving thread, over gRPC on
+  // the shared executor. 1 runs serially on the shared executor; -1 permits
+  // unlimited parallelism, with shared workers joining in (starting on the
+  // receiving HTTP thread, or on the shared executor over gRPC). Other values
+  // are rejected.
   int32 max_parallel = 8;
 
   // Require a local snapshot at least this new (incarnation:index_gen).

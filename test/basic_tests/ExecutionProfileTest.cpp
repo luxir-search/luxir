@@ -465,7 +465,7 @@ TEST_F(ExecutionProfileTest, maxParallelZeroRunsInlineOnCallingThread) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("profile_inline").profile().facet("cats", "cat_s").limit(-1);
-  helper.getSearchEngine().dispatch(*req.get(), 0);
+  helper.getSearchEngine().dispatch(*req.get(), 0, SearchEngine::Receiver::MAY_EXECUTE);
   // 0 (the default) = the calling thread: the whole request completed inside
   // dispatch(), so the response is readable with no wait/synchronization.
   ASSERT_OK(req);
@@ -506,7 +506,7 @@ TEST_F(ExecutionProfileTest, maxParallelOneDispatchesOffCallingThread) {
       luxir::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
   auto repliedOn = static_cast<DispatchReq*>(req.get())->replied.get_future();
   req->collection("profile_pool").facet("cats", "cat_s").limit(-1);
-  helper.getSearchEngine().dispatch(*req.get(), 1);
+  helper.getSearchEngine().dispatch(*req.get(), 1, SearchEngine::Receiver::MAY_EXECUTE);
   ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(60)));
   EXPECT_NE(std::this_thread::get_id(), repliedOn.get());
   ASSERT_OK(req);
@@ -549,7 +549,7 @@ TEST_F(ExecutionProfileTest, maxParallelMinusOneRunsOnCallingThreadInNodeArena) 
       luxir::arenaCreate<DispatchReq>(*arena, helper.getSearchEngine(), *arena));
   auto repliedOn = static_cast<DispatchReq*>(req.get())->replied.get_future();
   req->collection("profile_parallel").facet("cats", "cat_s").limit(-1);
-  helper.getSearchEngine().dispatch(*req.get(), -1);
+  helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
   // Completed inside dispatch(), on this thread, inside the (wider than
   // default) node arena rather than this thread's implicit arena.
   ASSERT_EQ(std::future_status::ready, repliedOn.wait_for(std::chrono::seconds(0)));
@@ -587,7 +587,7 @@ TEST_F(ExecutionProfileTest, facetFanoutSpawnCounts) {
           int64_t spawns;
           {
             TaskSpawnCounter counter;
-            helper.getSearchEngine().dispatch(*req.get(), -1);
+            helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
             spawns = counter.count();
           }
           ASSERT_OK(req);
@@ -622,7 +622,7 @@ TEST_F(ExecutionProfileTest, currentPerColumnFieldLoadSpawnCounts) {
     int64_t spawns;
     {
       TaskSpawnCounter counter;
-      helper.getSearchEngine().dispatch(*req.get(), -1);
+      helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
       spawns = counter.count();
     }
     ASSERT_OK(req);
@@ -656,7 +656,9 @@ TEST_F(ExecutionProfileTest, topLevelOpsOverlap) {
   int64_t spawns;
   {
     TaskSpawnCounter counter;
-    std::thread search([&] { helper.getSearchEngine().dispatch(*req.get(), -1); });
+    std::thread search([&] {
+      helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
+    });
     // Timeouts bound a broken dispatch; both start signals must arrive while
     // the first op is still held by the latch.
     EXPECT_EQ(std::future_status::ready, first.wait_for(std::chrono::seconds(10)));
@@ -685,7 +687,7 @@ TEST_F(ExecutionProfileTest, rankedSubOpRunsOnCaller) {
   int64_t spawns;
   {
     TaskSpawnCounter counter;
-    helper.getSearchEngine().dispatch(*req.get(), -1);
+    helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
     spawns = counter.count();
   }
   Signal::unlisten("searchTopDocsChildStart");
@@ -708,7 +710,7 @@ TEST_F(ExecutionProfileTest, inlineFailureCancelsPublishedSiblings) {
     if (started.fetch_add(1) == 0) throw RequestError("inline failure", "invalid_request");
     return nullptr;
   });
-  helper.getSearchEngine().dispatch(*req.get(), -1);
+  helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
   Signal::unlisten("searchRootChildStart");
   EXPECT_FALSE(req->ok());
   EXPECT_EQ("invalid_request", req->errorCode());
@@ -743,7 +745,7 @@ TEST_F(ExecutionProfileTest, rankedFacetFanoutSpawnCounts) {
           int64_t spawns;
           {
             TaskSpawnCounter counter;
-            helper.getSearchEngine().dispatch(*req.get(), profile);
+            helper.getSearchEngine().dispatch(*req.get(), profile, SearchEngine::Receiver::MAY_EXECUTE);
             spawns = counter.count();
           }
           ASSERT_OK(req);

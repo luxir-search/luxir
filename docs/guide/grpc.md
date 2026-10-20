@@ -80,9 +80,10 @@ One request contains:
   for unlimited (shared workers join in across segments and operations).
   `0` (the default) lets the engine decide; today that is serial. Over gRPC
   every search runs on the shared worker pool, never on the completion-queue
-  thread that received it: one HTTP/2 connection lands its calls on one
-  completion queue, so running queries there would serialize every
-  concurrent call on that connection. `0` and `1` therefore behave alike,
+  thread that received it: gRPC offers a connection's new calls to its
+  preferred completion queue first, so running queries there would
+  serialize the calls multiplexed on that connection. `0` and `1` therefore
+  behave alike,
   and `-1` fans out from a worker. Larger values are reserved.
 
 Unlike HTTP, gRPC does not have the root `top_docs` shorthand. Populate the

@@ -20,6 +20,7 @@
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/support/byte_buffer.h>
 #include <hpp_proto/grpc/serialization.hpp>
+#include <oneapi/tbb/task_arena.h>
 #include <oneapi/tbb/task_group.h>
 
 #include "GRPCServer.h"
@@ -509,7 +510,11 @@ public:
   // allocation failure falls back to running the resume inline.
   void enqueueResume(std::function<void()> resume) {
     try {
-      server.getLuxirNode().getTaskArena().enqueue(resume);  // copies; resume stays valid if this throws
+      // Isolated like the search itself (SearchEngine::enqueueSubmit): a
+      // parallel emitter's batch waits help only with its own tasks.
+      server.getLuxirNode().getTaskArena().enqueue([resume] {  // copies; resume stays valid if this throws
+        oneapi::tbb::this_task_arena::isolate(resume);
+      });
     } catch (...) {
       if (resume) resume();
     }
@@ -725,15 +730,15 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     req.waitCancellation = call.waitCancellation;
   }
   // Every search leaves this completion-queue thread for the task arena (see
-  // SearchEngine::Receiver): one HTTP/2 connection lands its calls on one cq,
-  // so a query run here would serialize every concurrent call on that
-  // connection.  max_parallel keeps its parallelism meaning: 0 (the default)
-  // and 1 run serially on a worker, -1 fans out from one.  The reply and the
-  // final response come from that worker: respondRaw() is thread-safe and
-  // Finish is kicked back to this call's cq thread.  The call outlives the
-  // request because its outstanding-response count stays positive until the
-  // final reply, and requestActive keeps pipelined requests on this stream
-  // ordered.
+  // SearchEngine::Receiver): gRPC offers a connection's new calls to its
+  // preferred cq first, so a query run here would serialize the concurrent
+  // calls on that connection.  max_parallel keeps its parallelism meaning: 0
+  // (the default) and 1 run serially on a worker, -1 fans out from one.  The
+  // reply and the final response come from that worker: respondRaw() is
+  // thread-safe and Finish is kicked back to this call's cq thread.  The call
+  // outlives the request because its outstanding-response count stays
+  // positive until the final reply, and requestActive keeps pipelined
+  // requests on this stream ordered.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
   engine.dispatch(req, req.proto.max_parallel, SearchEngine::Receiver::OFFLOAD);
 }
@@ -1029,12 +1034,10 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
   // Used to test that a client request will still be handled correctly if it comes in before we've registered the calls
   // std::this_thread::sleep_for (std::chrono::seconds(10));
 
-  // Pre-arm generic acceptors per CQ (each re-arms on accept, so the accept
-  // backlog stays at this depth).  gRPC matches a connection's new calls to
-  // the acceptors armed on its cq, so this bounds how many calls one
-  // connection can start at once without waiting for a re-arm.  Handlers hand
-  // their work off, so the depth costs only an idle GenericCallData each.
-  constexpr int kGenericAcceptors = 64;
+  // Pre-arm several generic acceptors per CQ (each re-arms on accept, so the
+  // accept backlog stays at this depth).  Matches the previous depth of 8
+  // per-method acceptors.
+  constexpr int kGenericAcceptors = 8;
   for (int i = 0; i < kGenericAcceptors; i++) {
     new GenericCallData(*this, genericService, threadInfo);
   }

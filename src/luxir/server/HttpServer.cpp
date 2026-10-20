@@ -1779,7 +1779,7 @@ private:
     // synchronous engine.submit() onto the task arena so this io thread is
     // not occupied for the query's duration; reply() then posts results back
     // here.
-    engine.dispatch(*sreq, sreq->proto.max_parallel);
+    engine.dispatch(*sreq, sreq->proto.max_parallel, SearchEngine::Receiver::MAY_EXECUTE);
   }
 
   // Decodes and normalizes a buffered /update body.  Runs on the task arena:

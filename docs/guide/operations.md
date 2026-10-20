@@ -485,12 +485,10 @@ wait ends, whatever the setting.
 
 gRPC searches always run on the shared workers, never on the completion-queue
 thread: a client such as a gateway multiplexes many calls over one HTTP/2
-connection, and gRPC lands a connection's calls on one completion queue, so
-inline execution would run them one at a time. `max_parallel` keeps its
-parallelism meaning there: `0` and `1` run serially on a worker, and `-1` fans
-out from one. The current gRPC unary update handler waits for
-indexing on its completion-queue thread; streaming update and search use their
-separate flow-control paths.
+connection, and gRPC offers a connection's new calls to its preferred
+completion queue first, so inline execution would run them one at a time.
+`max_parallel` keeps its parallelism meaning there: `0` and `1` run serially
+on a worker, and `-1` fans out from one.
 
 `--server.stream_buffer_bytes` sets the per-HTTP-connection and per-gRPC-call
 high-water mark for serialized responses (default 1 MiB). Producers pause above

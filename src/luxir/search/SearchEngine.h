@@ -39,9 +39,10 @@ public:
 
   // Whether dispatch() may execute the query on the calling (transport)
   // thread.  An HTTP io shard may: it owns its connections, and the inline
-  // lane saves a scheduler hop.  A gRPC completion-queue thread may not: one
-  // HTTP/2 connection multiplexes many calls onto one queue, so a query run
-  // there would serialize every concurrent call on that connection.
+  // lane saves a scheduler hop.  A gRPC completion-queue thread may not: gRPC
+  // offers a connection's new calls to its preferred queue first, so a query
+  // run there would serialize the concurrent calls multiplexed on that
+  // connection.
   enum class Receiver { MAY_EXECUTE, OFFLOAD };
 
   // Transport entry point: route the request by max_parallel, then submit().
@@ -52,7 +53,7 @@ public:
   // arena and runs serially there, off the calling thread.  With
   // Receiver::OFFLOAD every request is enqueued on the arena: 0 and 1 run
   // serially on a worker, -1 starts on a worker and fans out from there.
-  void dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver = Receiver::MAY_EXECUTE);
+  void dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver);
 
   // Synchronous execution on the calling thread (dispatch() routes here).
   // maxParallel: 0 / 1 = single-threaded, -1 = unlimited intra-request

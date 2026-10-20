@@ -53,7 +53,7 @@ protected:
       auto req = localReq(helper.getSearchEngine());
       req->topDocs("q").limit(0).getNumber().rawQuery() = makeQuery(req->mr);
       SkipStatsScope stats;
-      helper.getSearchEngine().dispatch(*req.get(), 0);
+      helper.getSearchEngine().dispatch(*req.get(), 0, SearchEngine::Receiver::MAY_EXECUTE);
       ASSERT_OK(req);
       EXPECT_EQ(found, req->getMatchCount());
       if (repeat >= 2) {

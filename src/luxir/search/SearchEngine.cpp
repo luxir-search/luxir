@@ -19,7 +19,7 @@ RootOp* SearchEngine::prepare(SearchRequest& req) {
   if (!req.timeZone) throw RequestError(req.timeZoneError);
   if (req.maxParallel > 1 || req.maxParallel < -1) {
     throw RequestError(
-      "max_parallel must be 0 (serial on the receiving thread), 1 (serial "
+      "max_parallel must be 0 (engine default, serial today), 1 (serial "
       "on the shared executor), or -1 (unlimited parallelism); values "
       "above 1 are reserved for a parallelism budget and not implemented");
   }
@@ -126,7 +126,7 @@ void SearchEngine::submitBody(SearchRequest& req) {
 void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
   try {
     // Isolated: a -1 request waiting on its task group helps only with its own
-    // tasks, never picking up another request queued behind it.
+    // tasks, never stealing another request's.
     node.getTaskArena().enqueue([this, &req, maxParallel] {
       oneapi::tbb::this_task_arena::isolate([&] { submit(req, maxParallel); });
     });
@@ -150,10 +150,19 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver re
       waits.awaitCommit(std::move(collection), std::move(floor),
           waits.deadlineAfter(req.proto.min_commit_timeout_ms.value_or(30000)), req.waitCancellation.get_token(),
           [this, &req, maxParallel](CommitWaits::CommitResult result) {
-            node.getTaskArena().enqueue([this, &req, maxParallel, result = std::move(result)] {
-              if (result.error) { req.setError(*result.error); req.bodyDone(); }
-              else { req.floorCollection = result.collection; submit(req, maxParallel); }
-            });
+            if (!result.error) {
+              req.floorCollection = result.collection;
+              enqueueSubmit(req, maxParallel);
+              return;
+            }
+            // CommitWaits swallows a throw from here, which would strand the
+            // request: if the enqueue fails, fail the request on this thread.
+            auto fail = [&req, error = *result.error] { req.setError(error); req.bodyDone(); };
+            try {
+              node.getTaskArena().enqueue(fail);  // copies; fail stays valid if this throws
+            } catch (...) {
+              fail();
+            }
           });
       return;
 
@@ -163,7 +172,9 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver re
       return;
     }
   }
-  if (receiver == Receiver::OFFLOAD || (maxParallel != 0 && maxParallel != -1)) {
+  // 0 and -1 start on the receiving thread when its transport allows it.
+  bool runOnReceiver = receiver == Receiver::MAY_EXECUTE && (maxParallel == 0 || maxParallel == -1);
+  if (!runOnReceiver) {
     // Off the receiving thread: always for an offloading transport, and for
     // 1 (serial on the arena, the escape hatch for a query expected to be
     // expensive).  Other values are rejected in prepare(), on the arena like 1.

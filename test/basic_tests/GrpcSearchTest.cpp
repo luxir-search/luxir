@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <future>
 #include <iostream>
 #include <latch>
 #include <memory>
@@ -400,10 +402,17 @@ TEST_F(GrpcSearchTest, deadlineWhileSearchRunsOnWorker) {
   auto channel = grpc::CreateChannel("localhost:" + std::to_string(server.getPort()),
                                      grpc::InsecureChannelCredentials());
 
-  std::latch started(1), release(1);
+  // One-shot: only the abandoned search is held, and the hook stays installed
+  // until the server is down (removal does not synchronize with a callback).
+  std::atomic<bool> held{false};
+  std::promise<void> started;
+  auto startedFuture = started.get_future();
+  std::latch release(1);
   Signal::listen("searchRootChildStart", [&](void*, void*, void*) -> void* {
-    started.count_down();
-    release.wait();
+    if (!held.exchange(true)) {
+      started.set_value();
+      release.wait();
+    }
     return nullptr;
   });
   auto lreq = localReq(luxirNode->getSearchEngine());
@@ -415,9 +424,8 @@ TEST_F(GrpcSearchTest, deadlineWhileSearchRunsOnWorker) {
     EXPECT_EQ(grpc::StatusCode::DEADLINE_EXCEEDED, status.error_code());
     release.count_down();
   });
-  started.wait();
   searcher.join();
-  Signal::unlisten("searchRootChildStart");
+  EXPECT_EQ(std::future_status::ready, startedFuture.wait_for(std::chrono::seconds(10)));
 
   // The channel still serves searches after the abandoned call.
   grpc::ClientContext context;
@@ -425,4 +433,5 @@ TEST_F(GrpcSearchTest, deadlineWhileSearchRunsOnWorker) {
 
   server.shutdown();
   serverThread.join();
+  Signal::unlisten("searchRootChildStart");
 }
