@@ -173,9 +173,25 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Follower reconnect and first sync retry delay in milliseconds (retries double, to 60 s)")
       ->default_val(replication.retry_ms);
 
-  app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
-      ->default_val(store.backend)
-      ->check(CLI::IsMember({"ram", "fs"}));
+  // Names are validated against the registries when storage opens: options are added before plugins register.
+  app.add_option("--store.backend", store.backend, "Storage backend name (built in: ram, fs; plugins may add more)")
+      ->default_val(store.backend);
+  app.add_option("--store.layer", store.layers,
+                 "Storage layer wrapped around the backend (repeatable, innermost first; provided by plugins)")
+      ->expected(1);
+  app.add_option_function<std::vector<std::string>>("--store.option",
+      [&options = store.options](const std::vector<std::string>& pairs) {
+        for (const auto& pair : pairs) {
+          auto eq = pair.find('=');
+          if (eq == std::string::npos || eq == 0) {
+            throw CLI::ValidationError("--store.option", "expected KEY=VALUE, got '" + pair + "'");
+          }
+          options[pair.substr(0, eq)] = pair.substr(eq + 1);
+        }
+      },
+      "Backend or layer setting KEY=VALUE (repeatable)")
+      ->expected(1)
+      ->multi_option_policy(CLI::MultiOptionPolicy::TakeAll);
   app.add_option("--store.ram-limit-mb", store.ram_limit_mb, "RAM storage allocation limit in MiB (0 = unlimited)")->check(CLI::Range((uint64_t)0, UINT64_MAX / (1024 * 1024)));
   app.add_option("--store.data-dir", store.data_dir, "Base path for filesystem storage")
       ->default_val(store.data_dir);
@@ -302,9 +318,9 @@ void LuxirConfig::normalize() {
     spdlog::warn("store.data-dir is ignored when store.backend=ram");
   }
 
-  if (read_only && store.backend != "fs") {
-    throw std::runtime_error("--read-only requires --store.backend=fs; there is no "
-                             "existing data directory to serve with backend=" + store.backend);
+  if (read_only && store.backend == "ram") {
+    throw std::runtime_error("--read-only requires a persistent --store.backend such as fs; there is no "
+                             "existing data to serve with backend=" + store.backend);
   }
 
   // Only an explicit value can be over the pool's addressability; the derived

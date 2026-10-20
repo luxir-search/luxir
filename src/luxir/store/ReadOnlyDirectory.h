@@ -4,7 +4,7 @@
 #pragma once
 
 #include <algorithm>
-#include "DirectoryFactory.h"
+#include "DelegatingDirectory.h"
 
 namespace luxir {
 
@@ -14,14 +14,14 @@ namespace luxir {
 /// directory it does not own (no write.lock), so nothing may write to it.
 /// Making that a wrapper rather than a flag inside each backend means the
 /// guarantee holds for any Directory implementation, and a mutator added to
-/// the interface later cannot silently escape it - the override is missing and
-/// the compiler says so.
+/// the interface later cannot silently escape it: DelegatingDirectory forwards
+/// by default, so a new mutating virtual must get an override here (reviewed
+/// together with every Directory addition; DelegatingDirectoryTest lists them).
 ///
 /// Requests are refused at the transport before reaching here; these throws are
 /// the backstop for paths that hold a Directory directly (schema persistence,
 /// merges, commit) rather than the expected way for a user to see an error.
-class ReadOnlyDirectory : public Directory {
-  std::shared_ptr<Directory> delegate_;
+class ReadOnlyDirectory : public DelegatingDirectory {
   std::string name_;
 
   [[noreturn]] void reject(std::string_view operation) const {
@@ -30,26 +30,14 @@ class ReadOnlyDirectory : public Directory {
   }
 
 public:
-  ReadOnlyDirectory(std::shared_ptr<Directory> delegate, std::string name)
-      : delegate_(std::move(delegate)), name_(std::move(name)) {}
-
-  void listFiles(std::vector<FileInfo>& target) override {
-    delegate_->listFiles(target);
-  }
-
-  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
-    return delegate_->openFile(name, expectSynced);
-  }
-
-  std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
-    return delegate_->openChecksum(name, direct);
-  }
-
-  void expectSynced(std::span<const FileDescriptor> files) override {
-    delegate_->expectSynced(files);
-  }
+  ReadOnlyDirectory(std::shared_ptr<Directory> inner, std::string name)
+      : DelegatingDirectory(std::move(inner)), name_(std::move(name)) {}
 
   std::unique_ptr<File> createFile(std::string_view name) override {
+    reject(std::string("createFile(") + std::string(name) + ")");
+  }
+
+  std::unique_ptr<File> createFile(std::string_view name, FileCreateOptions) override {
     reject(std::string("createFile(") + std::string(name) + ")");
   }
 
@@ -74,7 +62,6 @@ public:
     reject("sync");
   }
 
-  Directory& underlying() override { return delegate_->underlying(); }
   void linkFile(Directory&, std::string_view) override { reject("linkFile"); }
 
   void clear() override {
@@ -88,34 +75,32 @@ public:
 /// Pair it with a backend factory opened read-only (see FSDirFactory), which
 /// suppresses the open-time side effects a wrapper cannot reach: taking
 /// write.lock, creating the data directory, resetting trash/.
-class ReadOnlyDirFactory : public DirectoryFactory {
-  std::unique_ptr<DirectoryFactory> delegate_;
-
+class ReadOnlyDirFactory : public DelegatingDirFactory {
   [[noreturn]] static void refuse(std::string_view what, const CollectionId& id) {
     throw ReadOnlyError("read-only data directory: cannot " + std::string(what) + " '" + id.label() + "'");
   }
 
 public:
-  explicit ReadOnlyDirFactory(std::unique_ptr<DirectoryFactory> delegate)
-      : delegate_(std::move(delegate)) {}
+  explicit ReadOnlyDirFactory(std::unique_ptr<DirectoryFactory> inner)
+      : DelegatingDirFactory(std::move(inner)) {}
 
-  uint64_t storageBytes() override { return delegate_->storageBytes(); }
-  uint64_t collectionBytes(const CollectionId& id) override { return delegate_->collectionBytes(id); }
-  std::vector<CollectionId> collections() override { return delegate_->collections(); }
+  std::string describe() const override { return "read_only(" + delegate->describe() + ")"; }
+  std::shared_ptr<Directory> nodeDirectory() override {
+    return std::make_shared<ReadOnlyDirectory>(delegate->nodeDirectory(), "node");
+  }
 
   // Every namespace mutation is refused before it reaches the backend, and
   // opening never creates.
   std::shared_ptr<Directory> container(const CollectionId& id, bool create) override {
     if (create) refuse("create collection", id);
-    return std::make_shared<ReadOnlyDirectory>(delegate_->container(id, false), id.label());
+    return std::make_shared<ReadOnlyDirectory>(delegate->container(id, false), id.label());
   }
   std::shared_ptr<Directory> incarnation(const CollectionId& id, std::string_view incarnation, bool create) override {
     if (create) refuse("create collection", id);
-    return std::make_shared<ReadOnlyDirectory>(delegate_->incarnation(id, incarnation, false),
+    return std::make_shared<ReadOnlyDirectory>(delegate->incarnation(id, incarnation, false),
                                                id.label() + "/" + std::string(incarnation));
   }
   void createCollection(const CollectionId& id) override { refuse("create collection", id); }
-  std::vector<std::string> incarnations(const CollectionId& id) override { return delegate_->incarnations(id); }
   void removeIncarnation(const CollectionId& id, std::string_view incarnation) override {
     unused(incarnation);
     refuse("remove an incarnation of", id);

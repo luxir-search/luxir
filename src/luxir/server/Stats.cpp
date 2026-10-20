@@ -42,8 +42,7 @@ void fillMemoryStats(LuxirNode& node, api::MemoryStats& memory) {
   memory.node_budget_bytes = node.getConfig().max_ram_mb * 1024 * 1024;
   memory.search_request_limit_bytes = node.getConfig().search.request_memory_max_bytes;
   memory.storage_ram.used_bytes = node.storageBytes();
-  memory.storage_ram.limit_bytes = node.getConfig().store.backend == "ram"
-      ? node.getConfig().store.ram_limit_mb * 1024 * 1024 : 0;
+  memory.storage_ram.limit_bytes = node.collections().storage().memoryLimitBytes();
   auto& fields = memory.field_metadata;
   fields.directories = fieldMetadataMemory.directories.load(std::memory_order_relaxed);
   fields.directory_bytes = fieldMetadataMemory.directoryBytes.load(std::memory_order_relaxed);
@@ -284,10 +283,9 @@ void gatherStats(LuxirNode& node, const api::StatsRequest& request,
     fillServiceStats(node, response.service.emplace(), resource);
     fillMemoryStats(node, response.memory.emplace());
     if (request.system || request.host) {
-      const auto& store = node.getConfig().store;
       gatherSystemStats(request.system ? &response.system.emplace() : nullptr,
                         request.host ? &response.host.emplace() : nullptr,
-                        store.backend == "fs" ? store.data_dir : "", resource);
+                        node.collections().storage().diskPath(), resource);
     }
   }
   response.multiterm_expansion_refills =

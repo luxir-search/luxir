@@ -78,6 +78,20 @@ public:
   virtual void removeIncarnation(const CollectionId& id, std::string_view incarnation) = 0;
   /// Remove all storage for the collection.
   virtual void remove(const CollectionId& id) = 0;
+
+  /// Node-level metadata files (replication.json), outside every collection.
+  /// Always the same logical directory for one factory.
+  virtual std::shared_ptr<Directory> nodeDirectory() = 0;
+  /// True when this storage holds nothing a follower must not overwrite: no
+  /// collections and no foreign files. The default asks collections().
+  virtual bool holdsNoCollections() { return collections().empty(); }
+  /// One line for the startup log, e.g. "fs:/data" or "checked(ram)".
+  virtual std::string describe() const = 0;
+  /// Local filesystem path whose disk usage and device describe this storage
+  /// (reported by system stats); empty when the backend has none.
+  virtual std::string diskPath() const { return {}; }
+  /// Byte limit of memory-resident storage, for memory stats; zero when unlimited or not RAM.
+  virtual uint64_t memoryLimitBytes() const { return 0; }
 };
 
 inline std::optional<std::string> CollectionStorage::current() {
@@ -123,7 +137,9 @@ class RAMDirFactory : public DirectoryFactory {
   };
   std::mutex mutex;
   std::map<CollectionId, Entry> entries;
+  uint64_t limit;
   std::shared_ptr<StorageMemory> memory;
+  std::shared_ptr<Directory> node = std::make_shared<RAMDir>();
   std::map<std::string, std::weak_ptr<StorageMemory>, std::less<>> tenantAccounts;
   std::map<CollectionId, std::weak_ptr<StorageMemory>> accounts;
 
@@ -146,7 +162,10 @@ class RAMDirFactory : public DirectoryFactory {
   }
 public:
   explicit RAMDirFactory(uint64_t limit = 0, std::function<bool()> reclaim = {})
-      : memory(std::make_shared<StorageMemory>(limit, nullptr, std::move(reclaim))) {}
+      : limit(limit), memory(std::make_shared<StorageMemory>(limit, nullptr, std::move(reclaim))) {}
+  std::shared_ptr<Directory> nodeDirectory() override { return node; }
+  std::string describe() const override { return "ram"; }
+  uint64_t memoryLimitBytes() const override { return limit; }
   uint64_t storageBytes() override { return memory->bytes(); }
   uint64_t collectionBytes(const CollectionId& id) override {
     std::lock_guard lock(mutex);
@@ -227,7 +246,7 @@ class FSDirFactory : public DirectoryFactory {
       if (text != kLayout) throw std::runtime_error("unsupported data directory layout in " + marker.string() + "; reindex it");
       return;
     }
-    if (!holdsNoCollections(collectionsPath_) || std::filesystem::exists(basePath_ / "c")) {
+    if (!layoutHoldsNoCollections(collectionsPath_) || std::filesystem::exists(basePath_ / "c")) {
       throw std::runtime_error("data directory " + basePath_.string() + " predates the tenant layout; reindex it");
     }
     if (unowned) return;
@@ -277,12 +296,29 @@ public:
 
   // An empty collections directory, apart from its layout marker and what an
   // interrupted marker write leaves behind (LAYOUT.pending and its staging).
-  static bool holdsNoCollections(const std::filesystem::path& collections) {
+  static bool layoutHoldsNoCollections(const std::filesystem::path& collections) {
     for (const auto& entry : std::filesystem::directory_iterator(collections)) {
       if (!entry.is_regular_file() || !entry.path().filename().string().starts_with(kLayoutFile)) return false;
     }
     return true;
   }
+
+  std::shared_ptr<Directory> nodeDirectory() override { return std::make_shared<FSDirectory>(basePath_, false); }
+
+  // A fresh or follower data directory: the write lock, the layout marker and
+  // an interrupted replication.json write are not collections.
+  bool holdsNoCollections() override {
+    for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
+      auto name = entry.path().filename().string();
+      if (name == "write.lock" || name == "replication.json.pending") continue;
+      if (name == "t" && layoutHoldsNoCollections(entry.path())) continue;
+      return false;
+    }
+    return true;
+  }
+
+  std::string describe() const override { return "fs:" + basePath_.string(); }
+  std::string diskPath() const override { return basePath_.string(); }
 
   std::vector<CollectionId> collections() override {
     std::vector<CollectionId> ids;
