@@ -55,6 +55,8 @@
 //   (the HTTP sort parameter grammar), and `field` as an alias for `expr`. A
 //   top-docs `sort` takes one clause or a list of them.
 //   Writes stay canonical with `expr` because sort expressions are the underlying API.
+// - WeightedField reads a canonical object or a bare STRING, "name" or
+//   "name^weight". Writes stay canonical with field and optional weight.
 // - QueryFacet buckets are a name -> Query object on JSON reads and writes. The wire's
 //   repeated QueryBucket form preserves that object's document order for gRPC parity.
 
@@ -67,6 +69,7 @@
 #include <unordered_set>
 
 #include "luxir/api/sort_clause.h"
+#include "luxir/api/weighted_field.h"
 
 // NOTE: relies on luxir_types_json.hpp having defined the luxir::api types and included
 // <hpp_proto/json.hpp>; kept as a separate file only so JSON-dialect code has one home.
@@ -547,6 +550,45 @@ struct from<JSON, luxir::api::SearchOp> {
   }
 };
 
+// ----- WeightedField: canonical object, or name/name^weight string sugar -----
+template <>
+struct from<JSON, luxir::api::WeightedField> {
+  template <auto Opts>
+  static void op(luxir::api::WeightedField& value,
+                 hpp_proto::concepts::is_non_owning_context auto& ctx, auto& it, auto& end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) return;
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    if ((char)*it == '"') {
+      util::from_json<O>(value.field, ctx, it, end);
+      // A root string may finish with the successful end_reached marker.
+      if (bool(ctx.error) && ctx.error != error_code::end_reached) return;
+      if (!luxir::api::splitWeightedField(value.field, value.field, value.weight)) {
+        ctx.error = error_code::syntax_error;
+      }
+      return;
+    }
+    static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<O, true>(
+        ctx, it, end, keyTarget, [](auto&, auto&) {},
+        [&](auto& vit, auto& vend) {
+          if (key == "field") {
+            util::from_json<V>(value.field, ctx, vit, vend);
+          } else if (key == "weight") {
+            util::from_json<V>(value.weight, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto&, auto&) {});
+  }
+};
+
 // ----- SortSpec: a bare string is one clause ("expr", "expr asc", "expr desc");
 // in the object form `field` is a bare-column alias for `expr` -----
 template <>
@@ -864,10 +906,6 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::RegexQuery>);
           } else if (key == "any_of") {
             arm(std::in_place_type<api::AnyOfQuery>);
-          } else if (key == "combined_fields") {
-            arm(std::in_place_type<api::CombinedFieldsQuery>);
-          } else if (key == "multi_match") {
-            arm(std::in_place_type<api::MultiMatchQuery>);
           } else if (key == "fuzzy") {
             arm(std::in_place_type<api::FuzzyQuery>);
           } else if (key == "simple_query") {
@@ -884,6 +922,8 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::RescoreQuery>);
           } else if (key == "expr") {
             arm(std::in_place_type<api::ExprQuery>);
+          } else if (key == "multi_match") {
+            arm(std::in_place_type<api::MultiMatchQuery>);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

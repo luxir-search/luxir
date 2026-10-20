@@ -1,11 +1,12 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-// combined_fields and multi_match: BM25F scoring of several TEXT fields as
+// multi_match: BM25F scoring of several TEXT fields as
 // one combined field, match semantics, request validation, and the HTTP form.
 
 #include <cmath>
 #include <map>
+#include <limits>
 #include <optional>
 
 #include <gtest/gtest.h>
@@ -21,7 +22,7 @@
 using namespace luxir;
 using namespace luxir::test;
 
-using Type = api::MultiMatchQuery_::Type;
+using Mode = api::MultiMatchQuery_::Mode;
 using MatchOp = api::Match_::Operator;
 
 class CombinedFieldsQueryTest : public LuxirTest {
@@ -69,7 +70,7 @@ public:
 
 // Hand-computed BM25F: title weight 2, body weight 1, one term.
 TEST_F(CombinedFieldsQueryTest, scoresMatchBm25fFormula) {
-  auto hits = run(qb::combinedFields(mr(), "dune", {"title_un^2", "body_un"}));
+  auto hits = run(qb::multiMatch(mr(), "dune", {{"title_un", 2.0f}, {"body_un", {}}}));
   ASSERT_TRUE(hits);
   ASSERT_EQ(2u, hits->size());
 
@@ -85,11 +86,6 @@ TEST_F(CombinedFieldsQueryTest, scoresMatchBm25fFormula) {
   EXPECT_NEAR(bm25f(2.0f, 6.0f), hits->at("d1"), 1e-6);
   EXPECT_NEAR(bm25f(2.0f, 7.0f), hits->at("d2"), 1e-6);
   EXPECT_GT(hits->at("d1"), hits->at("d2"));
-
-  // multi_match cross_fields over the same fields is the same query
-  auto cross = run(qb::multiMatch(mr(), "dune", {"title_un^2", "body_un"}, Type::CROSS_FIELDS));
-  ASSERT_TRUE(cross);
-  EXPECT_EQ(*hits, *cross);
 }
 
 // title_un in 1 of 3 docs is under half density, so its norms are sparse and
@@ -105,7 +101,7 @@ public:
 };
 
 TEST_F(CombinedFieldsSparseNormsTest, missingFieldAddsNoLength) {
-  auto hits = run(qb::combinedFields(mr(), "dune", {"title_un^2", "body_un"}));
+  auto hits = run(qb::multiMatch(mr(), "dune", {{"title_un", 2.0f}, {"body_un", {}}}));
   ASSERT_TRUE(hits);
   ASSERT_EQ(2u, hits->size());
 
@@ -124,67 +120,76 @@ TEST_F(CombinedFieldsSparseNormsTest, missingFieldAddsNoLength) {
 
 TEST_F(CombinedFieldsQueryTest, operatorAndFilterContext) {
   // AND: every term somewhere in the combined field
-  auto both = run(qb::combinedFields(mr(), "dune desert", {"title_un", "body_un"}, MatchOp::AND));
+  auto both = run(qb::multiMatch(mr(), "dune desert", {{"title_un", {}}, {"body_un", {}}}, Mode::COMBINED, MatchOp::AND));
   ASSERT_TRUE(both);
   EXPECT_EQ(2u, both->size());
   EXPECT_TRUE(both->contains("d1") && both->contains("d2"));
 
-  auto any = run(qb::combinedFields(mr(), "dune empire", {"title_un", "body_un"}));
+  auto any = run(qb::multiMatch(mr(), "dune empire", {{"title_un", {}}, {"body_un", {}}}));
   ASSERT_TRUE(any);
   EXPECT_EQ(3u, any->size());
 
   // unscored filter use keeps the same match set
-  auto filtered = run(qb::combinedFields(mr(), "dune empire", {"title_un", "body_un"}), true);
+  auto filtered = run(qb::multiMatch(mr(), "dune empire", {{"title_un", {}}, {"body_un", {}}}), true);
   ASSERT_TRUE(filtered);
   EXPECT_EQ(3u, filtered->size());
 }
 
 TEST_F(CombinedFieldsQueryTest, analysisGroups) {
-  std::string error;
-  // _w keeps "Dune" while _un folds it: combined_fields refuses the mix ...
-  EXPECT_FALSE(run(qb::combinedFields(mr(), "Dune", {"title_un", "tag_w"}), false, &error));
-  EXPECT_NE(std::string::npos, error.find("analyze the query text differently")) << error;
-
-  // ... multi_match cross_fields groups by analysis and adds the groups
-  auto cross = run(qb::multiMatch(mr(), "Dune", {"title_un", "body_un", "tag_w"}, Type::CROSS_FIELDS));
+  // Different token sequences form groups whose scores add.
+  auto cross = run(qb::multiMatch(mr(), "Dune", {{"title_un", {}}, {"body_un", {}}, {"tag_w", {}}}, Mode::COMBINED));
   ASSERT_TRUE(cross);
-  auto unGroup = run(qb::combinedFields(mr(), "Dune", {"title_un", "body_un"}));
+  auto unGroup = run(qb::multiMatch(mr(), "Dune", {{"title_un", {}}, {"body_un", {}}}));
   ASSERT_TRUE(unGroup);
   EXPECT_EQ(2u, cross->size());
   EXPECT_GT(cross->at("d1"), unGroup->at("d1"));  // tag_w:Dune adds to d1 only
   EXPECT_FLOAT_EQ(cross->at("d2"), unGroup->at("d2"));
 }
 
-TEST_F(CombinedFieldsQueryTest, mostFieldsAndValidation) {
-  auto most = run(qb::multiMatch(mr(), "dune", {"title_un", "body_un"}, Type::MOST_FIELDS));
-  ASSERT_TRUE(most);
-  EXPECT_EQ(2u, most->size());
-
+TEST_F(CombinedFieldsQueryTest, modesAndWeightValidation) {
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    auto hits = run(qb::multiMatch(mr(), "dune", {{"title_un", 0.5f}, {"body_un", {}}}, mode));
+    ASSERT_TRUE(hits);
+    EXPECT_EQ(2u, hits->size());
+    for (float weight : {0.0f, -1.0f, std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::infinity()}) {
+      std::string error;
+      EXPECT_FALSE(run(qb::multiMatch(mr(), "dune", {{"title_un", weight}}, mode), false, &error));
+      EXPECT_NE(std::string::npos, error.find("field 'title_un'")) << error;
+      EXPECT_NE(std::string::npos, error.find("finite and > 0 (got ")) << error;
+    }
+  }
   std::string error;
-  EXPECT_FALSE(run(qb::multiMatch(mr(), "dune", {"title_un"}, Type::TYPE_UNSPECIFIED), false, &error));
-  EXPECT_NE(std::string::npos, error.find("best_fields")) << error;
-  EXPECT_FALSE(run(qb::combinedFields(mr(), "dune", {"title_un^0.5"}), false, &error));
-  EXPECT_NE(std::string::npos, error.find(">= 1")) << error;
-  EXPECT_FALSE(run(qb::combinedFields(mr(), "dune", {"title_un^x"}), false, &error));
-  EXPECT_FALSE(run(qb::combinedFields(mr(), "dune", {"id"}), false, &error));
+  EXPECT_FALSE(run(qb::multiMatch(mr(), "dune", {}), false, &error));
+  EXPECT_NE(std::string::npos, error.find("non-empty 'fields'")) << error;
+  EXPECT_FALSE(run(qb::multiMatch(mr(), "dune", {{"", {}}}), false, &error));
+  EXPECT_NE(std::string::npos, error.find("empty field name")) << error;
+  auto negative = qb::multiMatch(mr(), "dune", {{"title_un", {}}});
+  std::get<api::MultiMatchQuery>(negative.kind).min_match = -1;
+  EXPECT_FALSE(run(negative, false, &error));
+  EXPECT_NE(std::string::npos, error.find("min_match")) << error;
+  EXPECT_FALSE(run(qb::multiMatch(mr(), "dune", {{"id", {}}}), false, &error));
   EXPECT_NE(std::string::npos, error.find("not a TEXT field")) << error;
+  EXPECT_FALSE(run(qb::multiMatch(mr(), "dune", {{"title_un", {}}}, (Mode)123), false, &error));
+  EXPECT_NE(std::string::npos, error.find("unknown mode 123")) << error;
 }
 
 TEST_F(CombinedFieldsQueryTest, httpJsonAndExpr) {
   HttpServer server(*LuxirTest::luxirNode, 1, 0);
   server.start();
   for (std::string query : {
-           R"({"combined_fields":{"query":"dune","fields":["title_un^2","body_un"]}})",
-           R"({"multi_match":{"query":"dune desert","fields":["title_un","body_un"],)"
-           R"("type":"cross_fields","operator":"and"}})",
-           R"x("combined_fields(dune, fields=[title_un, body_un])")x"}) {
+           R"({"multi_match":{"text":"dune","fields":["title_un^2","body_un"]}})",
+           R"({"multi_match":{"text":"dune desert","fields":[{"field":"title_un"},{"field":"body_un"}],)"
+           R"("mode":"combined","operator":"and"}})",
+           R"x("multi_match(dune, fields=[title_un^2, body_un], mode=per_field)")x"}) {
     auto res = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
                            R"({"query":)" + query + R"(,"fields":["id"],"get_number":true})");
     EXPECT_EQ(200, res.result_int()) << query << "\n" << res.body();
     EXPECT_NE(std::string::npos, res.body().find(R"("found":2)")) << query << "\n" << res.body();
   }
   auto bad = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
-      R"({"query":{"multi_match":{"query":"dune","fields":["title_un"],"type":"phrase"}}})");
+      R"({"query":{"combined_fields":{"query":"dune","fields":["title_un"]}}})");
   EXPECT_EQ(400, bad.result_int()) << bad.body();
+  EXPECT_NE(std::string::npos, bad.body().find("unknown_key")) << bad.body();
   server.shutdown();
 }

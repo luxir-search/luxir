@@ -298,8 +298,7 @@ message Query {
     WildcardQuery wildcard = 17;    // selects documents by wildcard term match
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
-    CombinedFieldsQuery combined_fields = 20; // BM25F: several text fields scored as one
-    MultiMatchQuery multi_match = 21; // one query text over several fields
+    MultiMatchQuery multi_match = 20; // one text over several weighted fields
   }
 }
 
@@ -404,62 +403,35 @@ message Match {
   }
 }
 
-// Analyzes `query` and scores each term as if the listed TEXT fields were one
-// combined field (BM25F, as Lucene's CombinedFieldQuery and Elasticsearch's
-// combined_fields). A field's boost multiplies both its term frequency and
-// its document length; document frequency is the largest across the fields
-// and the average length is the weighted sum of the fields' total term
-// counts divided by the largest per-field document count.
-// Every field must analyze `query` to the same terms; use MultiMatchQuery
-// with type CROSS_FIELDS to group fields with different analyzers.
-message CombinedFieldsQuery {
-  string query = 1;  // the text to analyze
-
-  // Required, non-empty TEXT fields. Each entry is a name or "name^boost";
-  // boosts must be finite and >= 1 (default 1).
-  repeated string fields = 2;
-
-  // How the analyzed terms combine. Unset = OR: a doc matches if any term
-  // appears in any listed field. AND requires every term in some field.
-  Match.Operator operator = 3;
-
-  // Minimum number of analyzed terms that must match; overrides `operator`
-  // and is clamped to the term count. Mirrors Match.min_match.
-  int32 min_match = 4;
+// One search field and its contribution to a multi-field text query.
+message WeightedField {
+  string field = 1;
+  // Unset = 1. Must be finite and > 0 in every mode.
+  optional float weight = 2;
 }
 
-// Elasticsearch-style multi_match: one query text over several fields.
+// Analyzes one text across several fields. COMBINED uses BM25F, the model
+// used by Lucene's CombinedFieldQuery; PER_FIELD adds weighted match scores.
 message MultiMatchQuery {
-  string query = 1;  // the text to analyze
+  string text = 1; // the text to analyze
+  // Required and non-empty. Fields resolve through their search bindings.
+  repeated WeightedField fields = 2;
+  Mode mode = 3;
 
-  // Required, non-empty fields. Each entry is a name or "name^boost"; boosts
-  // must be finite and > 0 (default 1).
-  repeated string fields = 2;
-
-  // Scoring strategy. Unset = BEST_FIELDS, as in Elasticsearch.
-  Type type = 3;
-
-  // How the analyzed terms combine (per field for MOST_FIELDS, per term
-  // across fields for CROSS_FIELDS). Unset = OR.
+  // How analyzed terms combine within each combined group or individual
+  // field. Unset = OR. AND requires every term in at least one group/field.
   Match.Operator operator = 4;
 
-  // Minimum number of analyzed terms that must match; overrides `operator`.
+  // Zero uses operator. Positive values override operator and are clamped
+  // to the analyzed term count within each group/field. Must be >= 0.
   int32 min_match = 5;
 
-  enum Type {
-    TYPE_UNSPECIFIED = 0; // treated as BEST_FIELDS
-    BEST_FIELDS = 1;      // not supported yet; rejected
-    // A match query per field; the field scores add up.
-    MOST_FIELDS = 2;
-    // Fields are grouped by how they analyze `query`; each group is scored
-    // with BM25F as one combined field, as in CombinedFieldsQuery, and the
-    // group scores add. This differs from Elasticsearch's cross_fields,
-    // which blends term statistics, multiplies scores by per-field boosts,
-    // and combines groups by dis_max.
-    CROSS_FIELDS = 3;
-    PHRASE = 4;           // not supported yet; rejected
-    PHRASE_PREFIX = 5;    // not supported yet; rejected
-    BOOL_PREFIX = 6;      // not supported yet; rejected
+  enum Mode {
+    // TEXT fields scored together with BM25F; group scores add. A weight
+    // scales both term frequency and document length, at every group size.
+    COMBINED = 0;
+    // One match per field; each weight multiplies that field's score.
+    PER_FIELD = 1;
   }
 }
 

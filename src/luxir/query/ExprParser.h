@@ -18,6 +18,7 @@
 #include <fmt/format.h>
 
 #include "luxir/api/build.h"
+#include "luxir/api/weighted_field.h"
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/Cursor.h"
 #include "luxir/query/ExprFunctions.h"
@@ -1123,8 +1124,8 @@ private:
       member = parseNumberValue<T>(argName);
     } else if constexpr (std::is_same_v<T, bool>) {
       member = parseBoolValue(argName);
-    } else if constexpr (std::is_same_v<T, api::Match_::Operator>) {
-      member = parseOperatorValue(argName);
+    } else if constexpr (std::is_enum_v<T>) {
+      member = parseEnumValue<T>(argName);
     } else if constexpr (isOptional<T>) {
       assignArg(fn, argName, argPos, member.emplace());
     } else if constexpr (std::is_same_v<T, ::hpp_proto::optional_indirect_view<api::Val>>) {
@@ -1134,6 +1135,8 @@ private:
       member = parseQueryValue(argName, ",)");
     } else if constexpr (std::is_same_v<T, std::span<const std::string_view>>) {
       member = parseStringList(argName);
+    } else if constexpr (std::is_same_v<T, std::span<const api::WeightedField>>) {
+      member = parseWeightedFieldList(argName);
     } else if constexpr (std::is_same_v<T, std::span<const api::Query>>) {
       member = parseQueryList(argName);
     } else if constexpr (std::is_same_v<T, std::span<const int32_t>>) {
@@ -1248,18 +1251,22 @@ private:
     fail(pos, fmt::format("argument '{}' expects true or false (got '{}')", argName, t.text));
   }
 
-  api::Match_::Operator parseOperatorValue(std::string_view argName) {
+  template <typename E>
+  E parseEnumValue(std::string_view argName) {
     cur.skipWs();
     size_t pos = cur.position();
-    std::string_view text;
-    if (cur.peek() == '$') {
-      text = varString(*parseVarRef(), argName);
-    } else {
-      text = scanToken(ARG_STOPS, /*stopAtColon=*/false).text;
-    }
-    if (text == "AND") return api::Match_::Operator::AND;
-    if (text == "OR") return api::Match_::Operator::OR;
-    fail(pos, fmt::format("argument '{}' expects AND or OR (got '{}')", argName, text));
+    std::string_view text = parseStringValue(argName);
+    std::optional<E> result;
+    expr::forEachEnumValue<E>([&](std::string_view name, E value) {
+      if (expr::enumNameMatches(text, name)) result = value;
+    });
+    if (result) return *result;
+    std::string expected;
+    expr::forEachEnumValue<E>([&](std::string_view name, E) {
+      if (!expected.empty()) expected += " or ";
+      expected += name;
+    });
+    fail(pos, fmt::format("argument '{}' expects {} (got '{}')", argName, expected, text));
   }
 
   const api::Val* parseValValue(std::string_view argName) {
@@ -1308,6 +1315,23 @@ private:
                                                alignof(std::string_view));
     for (size_t i = 0; i < vals.size(); i++) new (&arr[i]) std::string_view(vals[i]);
     return {arr, vals.size()};
+  }
+
+  std::span<const api::WeightedField> parseWeightedFieldList(std::string_view argName) {
+    size_t pos = cur.position();
+    auto entries = parseStringList(argName);
+    if (entries.empty()) return {};
+    api::WeightedField* fields =
+        (api::WeightedField*)mr.allocate(sizeof(api::WeightedField) * entries.size(),
+                                         alignof(api::WeightedField));
+    for (size_t i = 0; i < entries.size(); i++) {
+      auto& field = *new (&fields[i]) api::WeightedField();
+      if (!api::splitWeightedField(entries[i], field.field, field.weight)) {
+        fail(pos, fmt::format("argument '{}': invalid weighted field '{}' (expected name or name^weight)",
+                              argName, entries[i]));
+      }
+    }
+    return {fields, entries.size()};
   }
 
   std::span<const api::Query> parseQueryList(std::string_view argName) {

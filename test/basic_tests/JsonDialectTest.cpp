@@ -811,3 +811,40 @@ TEST(JsonDialect, UnknownKeyIsNamed) {
 }
 
 }  // namespace
+
+TEST(JsonDialect, MultiMatchWeightedFields) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::Query sugar, object;
+  ASSERT_TRUE(P::read_json(sugar,
+      R"({"multi_match":{"text":"dune","fields":["title_t^2","body_t"],"mode":"per_field"}})", mr));
+  ASSERT_TRUE(P::read_json(object,
+      R"({"multi_match":{"text":"dune","fields":[{"field":"title_t","weight":2},{"field":"body_t"}],"mode":"per_field"}})", mr));
+  std::string sugarJson, objectJson;
+  ASSERT_TRUE(P::write_json(sugar, sugarJson));
+  ASSERT_TRUE(P::write_json(object, objectJson));
+  EXPECT_EQ(objectJson, sugarJson);
+  EXPECT_NE(std::string::npos, sugarJson.find(R"("fields":[{"field":"title_t","weight":2},{"field":"body_t"}])"));
+  const auto& match = std::get<P::MultiMatchQuery>(sugar.kind);
+  EXPECT_EQ(P::MultiMatchQuery::Mode::PER_FIELD, match.mode);
+  ASSERT_EQ(2u, match.fields.size());
+  ASSERT_TRUE(match.fields[0].weight);
+  EXPECT_FLOAT_EQ(2.0f, *match.fields[0].weight);
+  EXPECT_FALSE(match.fields[1].weight);
+
+  P::WeightedField root;
+  ASSERT_TRUE(P::read_json(root, R"("title_t^2")", mr));
+  EXPECT_EQ("title_t", root.field);
+  ASSERT_TRUE(root.weight);
+  EXPECT_FLOAT_EQ(2.0f, *root.weight);
+  for (auto shorthand : {"a^", "a^x", "a^1^2", "^2"}) {
+    P::WeightedField field;
+    EXPECT_FALSE(P::read_json(field, std::string("\"") + shorthand + "\"", mr)) << shorthand;
+  }
+  std::string error;
+  EXPECT_FALSE(P::read_json(object, R"({"combined_fields":{}})", mr, &error));
+  EXPECT_NE(std::string::npos, error.find("unknown_key")) << error;
+  EXPECT_NE(std::string::npos, error.find("combined_fields")) << error;
+  EXPECT_FALSE(P::read_json(object, R"({"multi_match":{"query":"dune"}})", mr));
+  EXPECT_FALSE(P::read_json(object, R"({"multi_match":{"type":"cross_fields"}})", mr));
+  EXPECT_FALSE(P::read_json(object, R"({"multi_match":{"mode":"best_fields"}})", mr));
+}

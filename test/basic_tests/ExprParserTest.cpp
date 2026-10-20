@@ -708,3 +708,27 @@ TEST_F(ExprParserTest, keywordBoundaryIsByteExact) {
   ASSERT_EQ(2u, n.optional.size());  // NUL: one juxtaposed term "AND\0b"
   EXPECT_EQ(5u, matchVal(n.optional[1]).size());
 }
+
+TEST_F(ExprParserTest, functionMultiMatch) {
+  const auto& match = std::get<api::MultiMatchQuery>(parse(
+      "multi_match(dune messiah, fields=[title^2, body], mode=per_field, operator=and, min_match=2)")->kind);
+  EXPECT_EQ("dune messiah", match.text);
+  EXPECT_EQ(api::MultiMatchQuery::Mode::PER_FIELD, match.mode);
+  EXPECT_EQ(Operator::AND, match.operator_);
+  EXPECT_EQ(2, match.min_match);
+  ASSERT_EQ(2u, match.fields.size());
+  EXPECT_EQ("title", match.fields[0].field);
+  ASSERT_TRUE(match.fields[0].weight);
+  EXPECT_FLOAT_EQ(2.0f, *match.fields[0].weight);
+  EXPECT_EQ("body", match.fields[1].field);
+  EXPECT_FALSE(match.fields[1].weight);
+  EXPECT_EQ(api::MultiMatchQuery::Mode::COMBINED,
+      std::get<api::MultiMatchQuery>(parse("multi_match(dune, fields=[title])")->kind).mode);
+  EXPECT_EQ(api::MultiMatchQuery::Mode::PER_FIELD,
+      std::get<api::MultiMatchQuery>(parse("multi_match(dune, fields=[title], mode=PER_FIELD)")->kind).mode);
+  expectContains(parseErr("multi_match(dune, fields=[title], mode=best_fields)"), "expects COMBINED or PER_FIELD");
+  for (auto field : {"a^", "a^x", "a^1^2", "^2"}) {
+    expectContains(parseErr(std::string("multi_match(dune, fields=[") + field + "])"), "invalid weighted field");
+  }
+  expectContains(parseErr("combined_fields(dune, fields=[title])"), "unknown query function 'combined_fields'");
+}
