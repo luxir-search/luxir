@@ -14,6 +14,7 @@
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_index.hpp"
 #include "luxir/reader/Postings.h"
+#include "luxir/reader/SidecarReader.h"
 #include "luxir/store/Manifest.h"
 
 namespace luxir::test {
@@ -42,6 +43,7 @@ inline std::vector<api::FileDescriptor> manifestFiles(const api::IndexInfo& info
     for (const auto& overlay : segment.overlays) append(overlay.files);
   }
   for (const auto& aux : info.aux_indexes) append(aux.files);
+  if (info.sidecar) files.push_back(*info.sidecar);
   return files;
 }
 
@@ -71,6 +73,7 @@ inline void expectValidInventory(Directory& dir, const api::IndexInfo& info) {
     input.readVint(); // maxDoc
     auto count = input.readVint();
     for (uint32_t i = 0; i < count; i++) expected.insert(Postings::getIndexFileName(id, input.readVint()));
+    expected.insert(sidecar::segmentFileName(seg.seg_id));
     if (seg.live_gen) expected.insert(Postings::getLiveDocsFileName(id, seg.live_gen));
     auto names = fileNames(seg.files);
     EXPECT_EQ(expected, std::set<std::string>(names.begin(), names.end()));

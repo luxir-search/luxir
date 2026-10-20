@@ -26,6 +26,11 @@ message IndexInfo {
   // Auxiliary indexes built at index scope. Segment-local overlays live on
   // SegmentInfo.overlays.
   repeated AuxIndexInfo aux_indexes = 16;
+
+  // Snapshot sidecar (a Sidecar message): byte ranges and chunk hashes for the
+  // files no segment sidecar covers - live docs, segment overlays and
+  // index-level aux files. Absent when there are none.
+  FileDescriptor sidecar = 17;
 }
 
 // Authored schema and field introduction history embedded in the manifest.
@@ -65,6 +70,94 @@ message SegmentInfo {
   // Segment-local auxiliary overlays. Vector ANN indexes are recorded here
   // with kind "vector_faiss"; validity is segment liveness, not core_gen.
   repeated AuxIndexInfo overlays = 9;
-  repeated FileDescriptor files = 10; // Segment data and current liveDocs
+  repeated FileDescriptor files = 10; // Segment data, its sidecar ("s<seg>__M") and current liveDocs
   uint64 next_overlay_gen = 11; // Persistent high-water mark, including dropped overlays
+}
+
+// Hints written beside immutable index files so a range reader or hydrator can
+// fetch the bytes that matter first and verify each fetched chunk on its own.
+// Queries never depend on them; chunk hashes are verification data. A segment
+// sidecar (in SegmentInfo.files, named "s<seg>__M") covers that segment's data
+// files and is written with the segment. The snapshot sidecar
+// (IndexInfo.sidecar) covers every other file the manifest lists except the
+// sidecars themselves, which the manifest's whole-file digests verify. On disk
+// the message is followed by its length and XXH3-64, as in a commit manifest.
+message Sidecar {
+  uint32 format_version = 1;
+  uint64 chunk_size = 2;         // bytes per hashed chunk; a file's last chunk may be shorter
+  repeated string fields = 3;    // physical field names, referenced by ByteRange.field
+  repeated SidecarFile files = 4;
+}
+
+message SidecarFile {
+  string name = 1;
+  uint64 size = 2;
+  fixed64 xxh3 = 3;                // whole-file digest; binds the entry to the manifest's FileDescriptor
+  repeated fixed64 chunk_xxh3 = 4; // XXH3-64 of each chunk_size slice, in file order
+  repeated ByteRange ranges = 5;   // ascending, disjoint, and covering the whole file
+}
+
+// What a byte range holds. Its tier says how early a reader needs it.
+enum StructureKind {
+  STRUCTURE_UNKNOWN = 0;  // no recorded structure starts here
+  FILE_HEADER = 1;
+  SEGMENT_INFO = 2;
+  FIELD_DIRECTORY = 3;
+  TERM_INDEX = 4;         // term-block offset table
+  TERM_TRIE = 5;
+  TERM_RANGE_TABLE = 6;
+  TERM_BLOCKS = 7;
+  DOC_POSTINGS = 8;
+  POSITIONS = 9;
+  DOCS_WITH_FIELD = 10;
+  NORMS = 11;
+  COLUMN = 12;            // filter, sort and facet values
+  COLUMN_INDEX = 13;      // monotonic rank, offset and value-to-doc side columns
+  POINTS_LEAVES = 14;
+  POINTS_INDEX = 15;      // points/BKD inner nodes and fence directory
+  STORED_FIELDS = 16;
+  VECTOR_VALUES = 17;     // full-precision vector column
+  LIVE_DOCS = 18;
+  IVF_HEADER = 19;        // FAISS parameters, coarse quantizer and PQ codebooks
+  IVF_LIST_DIRECTORY = 20;
+  IVF_LISTS = 21;         // inverted-list ids and codes
+  ORDMAP_DIRECTORY = 22;
+  ORDMAP_DATA = 23;
+  TRAILER = 24;
+}
+
+message ByteRange {
+  uint64 offset = 1;
+  uint64 length = 2;
+  StructureKind kind = 3;
+  uint32 tier = 4;   // 0 = needed to open and plan, 1 = common query data, 2 = bulk payloads
+  uint32 field = 5;  // 1-based index into Sidecar.fields; 0 = not field-scoped
+}
+
+// Persisted global-ordinal maps (index-level aux kind "ordmaps") for one
+// segment composition. The file holds each field's mapping payload, then this
+// directory, its length and its XXH3-64.
+message OrdMapDirectory {
+  uint32 format_version = 1;
+  uint64 core_gen = 2;
+  repeated OrdMapSegment segments = 3; // manifest order
+  repeated OrdMapEntry entries = 4;    // sorted by field
+}
+
+message OrdMapSegment {
+  uint64 seg_id = 1;
+  int32 max_doc = 2;
+  fixed64 digest = 3; // XXH3-64 over the segment's data file digests
+}
+
+message OrdMapEntry {
+  string field = 1;
+  int64 num_ords = 2;
+  int32 single_segment = 3;    // 1 + the only segment with values (identity mapping), else 0
+  uint64 offset = 4;           // mapping payload, 8-aligned; empty for an identity mapping
+  uint64 length = 5;
+  fixed64 xxh3 = 6;
+  repeated int64 top_ords = 7; // TopTerms entries, df descending
+  repeated int64 top_dfs = 8;
+  int64 unlisted_bound = 9;
 }

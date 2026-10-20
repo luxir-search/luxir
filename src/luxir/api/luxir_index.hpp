@@ -60,6 +60,7 @@ struct SegmentInfo {
 struct IndexInfo {
   uint64_t last_seg_id = 0;
   std::optional<SchemaInfo> schema;
+  std::optional<FileDescriptor> sidecar;
   std::string_view incarnation;
   uint64_t version = 0;
   uint64_t commit_time = 0;
@@ -71,9 +72,67 @@ struct IndexInfo {
   std::span<const AuxIndexInfo> aux_indexes;
 };
 
+enum class StructureKind {
+  STRUCTURE_UNKNOWN = 0, FILE_HEADER = 1, SEGMENT_INFO = 2, FIELD_DIRECTORY = 3,
+  TERM_INDEX = 4, TERM_TRIE = 5, TERM_RANGE_TABLE = 6, TERM_BLOCKS = 7,
+  DOC_POSTINGS = 8, POSITIONS = 9, DOCS_WITH_FIELD = 10, NORMS = 11, COLUMN = 12,
+  COLUMN_INDEX = 13, POINTS_LEAVES = 14, POINTS_INDEX = 15, STORED_FIELDS = 16,
+  VECTOR_VALUES = 17, LIVE_DOCS = 18, IVF_HEADER = 19, IVF_LIST_DIRECTORY = 20,
+  IVF_LISTS = 21, ORDMAP_DIRECTORY = 22, ORDMAP_DATA = 23, TRAILER = 24
+};
+
+struct ByteRange {
+  uint64_t offset = 0;
+  uint64_t length = 0;
+  StructureKind kind = StructureKind::STRUCTURE_UNKNOWN;
+  uint32_t tier = 0;
+  uint32_t field = 0;
+};
+
+struct SidecarFile {
+  std::string_view name;
+  uint64_t size = 0;
+  uint64_t xxh3 = 0;
+  std::span<const uint64_t> chunk_xxh3;
+  std::span<const ByteRange> ranges;
+};
+
+struct Sidecar {
+  uint64_t chunk_size = 0;
+  std::span<const std::string_view> fields;
+  std::span<const SidecarFile> files;
+  uint32_t format_version = 0;
+};
+
+struct OrdMapSegment {
+  uint64_t seg_id = 0;
+  uint64_t digest = 0;
+  int32_t max_doc = 0;
+};
+
+struct OrdMapEntry {
+  std::string_view field;
+  int64_t num_ords = 0;
+  uint64_t offset = 0;
+  uint64_t length = 0;
+  uint64_t xxh3 = 0;
+  std::span<const int64_t> top_ords;
+  std::span<const int64_t> top_dfs;
+  int64_t unlisted_bound = 0;
+  int32_t single_segment = 0;
+};
+
+struct OrdMapDirectory {
+  uint64_t core_gen = 0;
+  std::span<const OrdMapSegment> segments;
+  std::span<const OrdMapEntry> entries;
+  uint32_t format_version = 0;
+};
+
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
 LUXIR_TD(IndexInfo) LUXIR_TD(SegmentInfo) LUXIR_TD(AuxIndexInfo)
-LUXIR_TD(SchemaInfo) LUXIR_TD(FileDescriptor)
+LUXIR_TD(SchemaInfo) LUXIR_TD(FileDescriptor) LUXIR_TD(Sidecar) LUXIR_TD(SidecarFile)
+LUXIR_TD(ByteRange) LUXIR_TD(OrdMapDirectory) LUXIR_TD(OrdMapSegment) LUXIR_TD(OrdMapEntry)
 #undef LUXIR_TD
 
 #define LUXIR_ENTRY(M)                                                                  \
@@ -85,7 +144,9 @@ LUXIR_TD(SchemaInfo) LUXIR_TD(FileDescriptor)
   bool merge_json(M &, std::string_view json, std::pmr::memory_resource &arena,         \
                   std::string *error = nullptr);
 LUXIR_ENTRY(IndexInfo) LUXIR_ENTRY(SegmentInfo) LUXIR_ENTRY(AuxIndexInfo)
-LUXIR_ENTRY(SchemaInfo) LUXIR_ENTRY(FileDescriptor)
+LUXIR_ENTRY(SchemaInfo) LUXIR_ENTRY(FileDescriptor) LUXIR_ENTRY(Sidecar)
+LUXIR_ENTRY(SidecarFile) LUXIR_ENTRY(ByteRange) LUXIR_ENTRY(OrdMapDirectory)
+LUXIR_ENTRY(OrdMapSegment) LUXIR_ENTRY(OrdMapEntry)
 #undef LUXIR_ENTRY
 
 } // namespace luxir::api

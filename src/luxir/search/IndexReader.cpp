@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "IndexReader.h"
+#include "OrdMapStore.h"
 #include "luxir/store/Manifest.h"
 #include "luxir/index/CommitSnapshot.h"
 #include "luxir/reader/FieldReader.h"
@@ -43,6 +44,9 @@ std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
   }
   if (info.kind == TestOverlayAuxReader::KIND) {
     return TestOverlayAuxReader::open(dir, info, missingFileOK);
+  }
+  if (info.kind == OrdMapStore::KIND) {
+    return OrdMapStore::open(dir, info, missingFileOK);
   }
   IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind, info.name);
   return nullptr;
@@ -361,7 +365,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
           // binaries can read indexes that contain newer aux kinds.
           std::shared_ptr<AuxReader> aux = openKnownAux(dir, info, missingFileOK);
           if (!aux && info.kind != VectorAuxReader::KIND
-                   && info.kind != TestOverlayAuxReader::KIND) {
+                   && info.kind != TestOverlayAuxReader::KIND && info.kind != OrdMapStore::KIND) {
             continue;
           }
 
@@ -387,6 +391,23 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
   } else {
     core->fields = std::make_shared<FieldRecords>();
   }
+  // Persisted maps serve this core only if built for exactly its segments.
+  for (const auto& aux : auxReadersList) {
+    if (aux->getKind() != OrdMapStore::KIND) continue;
+    std::vector<OrdMapStore::Segment> segments;
+    segments.reserve(segs.size());
+    for (size_t i = 0; i < segs.size(); i++) {
+      segments.push_back({segs[i].segInfo.seg_id, segs[i].maxDoc(),
+                          OrdMapStore::segmentDigest(core->segmentFiles[i].files)});
+    }
+    auto store = std::static_pointer_cast<OrdMapStore>(aux);
+    if (store->matches(core->coreGeneration, segments)) {
+      core->ordMapStore = std::move(store);
+    } else {
+      LOG_WARN("Ignoring persisted OrdMaps '{}': built for another segment set (coreGen={})",
+               aux->getName(), core->coreGeneration);
+    }
+  }
 
   IREADER_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), totalMaxDoc, commitTimeUs);
   return {std::move(core), std::move(schema), commitTimeUs, indexGen};
@@ -394,6 +415,15 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
 
 
+
+std::vector<std::string> IndexReader::cachedOrdMapFields() const {
+  std::vector<std::string> names;
+  core->fields->forEach([&](const FieldRecord& record) {
+    if (record.ordMap.peek()) names.push_back(record.name);
+  });
+  std::ranges::sort(names);
+  return names;
+}
 
 const Segment* IndexReader::PhysicalCore::segment(uint64_t segId) const {
   auto it = std::ranges::lower_bound(segOrds, segId, {}, &std::pair<uint64_t, int32_t>::first);
@@ -480,7 +510,12 @@ IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
 std::shared_ptr<OrdMap> IndexReader::getOrdMap(std::string_view name) {
   auto fields = field(name);
   if (!fields.exists()) return {};
-  return fields.record->ordMap.getOrCreate([&] { return OrdMap::build(fields, *this); });
+  return fields.record->ordMap.getOrCreate([&]() -> std::shared_ptr<OrdMap> {
+    if (core->ordMapStore && core->ordMapStore->contains(name)) {
+      if (auto loaded = core->ordMapStore->load(name)) return loaded;
+    }
+    return OrdMap::build(fields, *this);
+  });
 }
 
 std::string_view IndexReader::FieldSegments::name() const noexcept {

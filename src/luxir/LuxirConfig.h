@@ -111,6 +111,10 @@ struct IndexConfig {
   int64_t max_ram_mb = -1;
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
   int merge_factor = 10;
+  // Global-ordinal maps a commit that changes the segment set persists for
+  // its readers: off, used (fields readers built maps for), or all (every
+  // indexed string field with an ord column). See IndexWriter::buildOrdMaps.
+  std::string persist_ordmaps = "used";
 };
 
 struct IngestConfig {

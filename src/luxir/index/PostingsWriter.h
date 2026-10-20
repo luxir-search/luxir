@@ -33,6 +33,7 @@
 #include "luxir/util/screaming.h"
 #include "luxir/util/Signal.h"
 #include "LiveDocsWriter.h"
+#include "Sidecar.h"
 #include "VersionRunBuilder.h"
 
 
@@ -95,11 +96,23 @@ private:
     uint32_t fileNum;
     uint64_t baseOffset;
   };
+  // A structure whose extent its writer knows exactly (see noteExtent).
+  struct NotedExtent {
+    const IndexFieldInfo* field;
+    sidecar::Kind kind;
+    seg_location start;
+    uint64_t length;
+  };
   static constexpr uint32_t DROPPED_FILE = UINT32_MAX;
   std::deque<DataFile> files;
   // These are dequeues so elements don't move
   // TODO: put these in the pool?
   std::deque<IndexFieldInfo> fieldInfos;
+  std::vector<NotedExtent> notedExtents; // guarded by mutex
+  // The finished segment's byte layout, for its sidecar (set by finish()).
+  sidecar::Contents segmentLayout;
+  uint64_t fieldIndexStart = 0;
+  uint64_t segmentInfoStart = 0;
   // Guards the shared writer state that concurrent field-merge tasks touch: the
   // free-stream pool (freeFiles/files), the field registry (fieldInfos), and pool
   // (via copyTerm).  Checked-out OutputStreams are exclusively owned and need no lock.
@@ -314,6 +327,19 @@ public:
   }
 
 
+  // Thread-safe. Records a structure of `field` whose length its writer
+  // knows, for the segment sidecar's byte-range map. Structures that only
+  // record where they start (the SegFieldInfo locations) need no call.
+  void noteExtent(const IndexFieldInfo& field, sidecar::Kind kind, seg_location start, uint64_t length) {
+    if (length == 0) return;
+    const std::lock_guard<std::mutex> lock(mutex);
+    notedExtents.push_back({&field, kind, start, length});
+  }
+
+  // The finished segment's data files, each partitioned into labelled
+  // extents (no digests yet). Valid after finish().
+  const sidecar::Contents& layout() const { return segmentLayout; }
+
   uint64_t getSegId() const {
     return segId;
   }
@@ -356,6 +382,8 @@ public:
       }
     }
 
+    segmentLayout = describeLayout(survivorFileNums);
+
     if (filenames) {
       filenames->reserve(filenames->size() + survivorFileNums.size());
     }
@@ -373,6 +401,7 @@ public:
     finished = true;
     freeFiles.clear();
     fieldInfos.resize(0);
+    notedExtents.clear();
     files.resize(0);
     assert(delegatedRamBytes == 0);
     return true;
@@ -470,6 +499,7 @@ private:
     for (auto& fieldInfo : fieldInfos) {
       fieldInfo.relocateLocations(relocate);
     }
+    for (auto& noted : notedExtents) noted.start = relocate(noted.start);
     if (!versionRunsLoc.isNull()) versionRunsLoc = relocate(versionRunsLoc);
 
     std::vector<uint32_t> survivors;
@@ -481,11 +511,73 @@ private:
     return survivors;
   }
 
+  // Partitions each survivor file into labelled extents: every recorded
+  // structure start (relocated SegFieldInfo locations), the exact extents
+  // writers noted, and file 0's field directory and segment info.
+  sidecar::Contents describeLayout(std::span<const uint32_t> survivorFileNums) {
+    using Kind = sidecar::Kind;
+    sidecar::Contents layout;
+    std::vector<sidecar::Partition> partitions(files.size());
+    auto mark = [&](seg_location location, Kind kind, uint32_t field) {
+      if (!location.isNull() && location.filenum() < partitions.size()) {
+        partitions[location.filenum()].start(location.offset(), kind, field);
+      }
+    };
+    std::vector<const IndexFieldInfo*> sorted;
+    for (const auto& fieldInfo : fieldInfos) sorted.push_back(&fieldInfo);
+    std::sort(sorted.begin(), sorted.end(), [](const IndexFieldInfo* a, const IndexFieldInfo* b) {
+      return a->fieldname < b->fieldname;
+    });
+    std::unordered_map<const IndexFieldInfo*, uint32_t> fieldIds;
+    for (const auto* fi : sorted) {
+      uint32_t field = layout.fieldId(std::string_view(fi->fieldname.data(), fi->fieldname.size()));
+      fieldIds[fi] = field;
+      bool stored = fi->type == FieldType::BIN && (fi->flags & FieldType::STORED) != 0;
+      bool positions = (fi->flags & FieldType::INDEX_DOCS_FREQS_POSITIONS) == FieldType::INDEX_DOCS_FREQS_POSITIONS;
+      mark(fi->termBlockIndexLoc, Kind::TERM_INDEX, field);
+      mark(fi->trieLoc, Kind::TERM_TRIE, field);
+      mark(fi->rangeTableLoc, Kind::TERM_RANGE_TABLE, field);
+      mark(fi->termsLoc, Kind::TERM_BLOCKS, field);
+      mark(fi->docsLoc, Kind::DOC_POSTINGS, field);
+      if (positions) mark(fi->posLoc, Kind::POSITIONS, field);
+      mark(fi->columnLoc, stored ? Kind::STORED_FIELDS
+          : fi->type == FieldType::VECTOR ? Kind::VECTOR_VALUES : Kind::COLUMN, field);
+      mark(fi->monoLoc, Kind::COLUMN_INDEX, field);
+      mark(fi->mono2Loc, Kind::COLUMN_INDEX, field);
+      mark(fi->valDocLoc, Kind::COLUMN_INDEX, field);
+      mark(fi->normsLoc, Kind::NORMS, field);
+      if (!fi->pointsLoc.isNull()) {
+        mark(fi->pointsLoc, Kind::POINTS_LEAVES, field);
+        // Both points writers append the inner nodes and fences after the leaves.
+        if (fi->pointsMetaOff > 0) {
+          mark(seg_location(fi->pointsLoc.filenum(), fi->pointsLoc.offset() + (uint64_t)fi->pointsMetaOff),
+               Kind::POINTS_INDEX, field);
+        }
+      }
+    }
+    for (const auto& noted : notedExtents) {
+      if (noted.start.filenum() >= partitions.size()) continue;
+      auto id = fieldIds.find(noted.field);
+      partitions[noted.start.filenum()].exact(noted.start.offset(), noted.length, noted.kind,
+                                              id == fieldIds.end() ? 0 : id->second);
+    }
+    partitions[0].exact(fieldIndexStart, segmentInfoStart - fieldIndexStart, Kind::FIELD_DIRECTORY);
+    partitions[0].exact(segmentInfoStart, files[0].out.size() - segmentInfoStart, Kind::SEGMENT_INFO);
+    for (uint32_t fileNum : survivorFileNums) {
+      auto& partition = partitions[fileNum];
+      partition.exact(0, Postings::LUXIR_HEADER.size(), Kind::FILE_HEADER);
+      uint64_t size = files[fileNum].out.size();
+      layout.files.push_back({files[fileNum].file->name(), size, 0, {}, partition.extents(size)});
+    }
+    return layout;
+  }
+
   void writeSegmentInfo(std::span<const uint32_t> survivorFileNums) {
     // TODO: if maxDoc==0, does this cause issues elsewhere?
     // assert(maxDoc >= 1);
     OutputStream& out = files[0].out;
     auto outStart = out.size();
+    segmentInfoStart = outStart;
     out.writeVint(maxDoc);
     // Physical filenums are intentionally sparse.  Dense renumbering would
     // require renaming a file after it had started spilling, which becomes an
@@ -513,6 +605,7 @@ private:
     fieldOffs.reserve(fieldInfos.size());
 
     auto fieldsStart = fieldOutput.size();  // where this index starts
+    fieldIndexStart = fieldsStart;
 
     // PostingsReader::findOrdinal does a binary search over the field offsets array, so
     // fields must be written in sorted name order.  Callers that flush fields
@@ -2041,18 +2134,17 @@ public:
 
 class DocsWithValWriter {
   OutputStreamPtr idOutput;
+  seg_location startLoc; // before docsWriter, which may write as it is constructed
   DocsWriter docsWriter;
   PostingsWriter& postingsWriter;
-  // int64_t startLoc;
   PostingsWriter::IndexFieldInfo& fieldInfo; // don't have to store if we pass it to finish
 
 public:
   // TODO: fixme... this obtains an outputStream and hence should not be used if the field is dense.
   DocsWithValWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
-  : idOutput(postingsWriter.getOutputStream()), docsWriter(pool,*idOutput), postingsWriter(postingsWriter), fieldInfo(fieldInfo)
+  : idOutput(postingsWriter.getOutputStream()), startLoc(idOutput->slocation()), docsWriter(pool,*idOutput),
+    postingsWriter(postingsWriter), fieldInfo(fieldInfo)
   {
-    unused(this->postingsWriter);
-    // startLoc = idOutput.size();
   }
 
   // Same as addDoc... it's named startDoc target for DocStream.pushDocs.
@@ -2067,6 +2159,8 @@ public:
   void finish() {
     fieldInfo.docsWithField = docsWriter.finish();
     fieldInfo.docsWithFieldEndLoc = idOutput->slocation();
+    postingsWriter.noteExtent(fieldInfo, sidecar::Kind::DOCS_WITH_FIELD, startLoc,
+                              fieldInfo.docsWithFieldEndLoc.offset() - startLoc.offset());
   }
 
   // Signal that the column has all docs present. No docs should be added in this case, but the count

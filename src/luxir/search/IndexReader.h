@@ -25,6 +25,7 @@ namespace luxir {
 class FieldType;
 class FilterCache;
 class OrdMap;
+class OrdMapStore;
 class Schema;
 struct CommitSnapshot;
 
@@ -255,6 +256,12 @@ private:
     }
     // Returns the record kept for its name: this one, or one inserted first.
     const FieldRecord* insert(std::unique_ptr<FieldRecord> record);
+    // Visits every record inserted so far, under the insert lock.
+    template <typename Visit>
+    void forEach(Visit&& visit) {
+      std::lock_guard lock(insertMutex);
+      for (const auto& record : records) visit(*record);
+    }
   };
 
   // A physical snapshot is shared directly by readers with different schemas.
@@ -265,6 +272,8 @@ private:
     std::vector<ProjectableField> projectable;
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;
     std::shared_ptr<FieldRecords> fields;
+    // Persisted maps built for exactly this segment set, or null.
+    std::shared_ptr<OrdMapStore> ordMapStore;
     uint64_t coreGeneration = 0;
     int64_t totalMaxDoc = 0;
     int64_t livedocs = 0;
@@ -378,7 +387,16 @@ public:
 
   FieldSegments field(std::string_view name) const;
 
+  // The field's global-ordinal map, loaded from the commit's persisted maps
+  // when they cover it, else built; cached for the segment composition.
   std::shared_ptr<OrdMap> getOrdMap(std::string_view name);
+
+  // Fields whose OrdMap is cached for this composition (IndexWriter persists
+  // the ones in use when a commit changes the segment set).
+  std::vector<std::string> cachedOrdMapFields() const;
+
+  // The persisted maps this reader's segment set matches, or null.
+  const OrdMapStore* ordMapStore() const noexcept { return core->ordMapStore.get(); }
 
   // This reader's segment `segId`, or null.
   const Segment* findSegment(uint64_t segId) const { return core->segment(segId); }

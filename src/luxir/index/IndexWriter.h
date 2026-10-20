@@ -25,6 +25,7 @@
 #include "luxir/server/LuxirError.h"
 #include "luxir/util/DeadlineScheduler.h"
 #include "Inverter.h"
+#include "Sidecar.h"
 #include "UpdateMessage.h"
 #include "VectorIndexBuilder.h"
 
@@ -387,6 +388,13 @@ public:
   // indexMutex; commit/merge pipeline reads follow their existing ownership.
   std::vector<PublishedOverlay> currentSegmentOverlays_;
 
+  // The published snapshot sidecar, if any, and the file maps it holds, so a
+  // commit only reads the live-docs, overlay and aux files that are new.
+  // Written by publish() under publicationMutex and indexMutex; read by the
+  // commit thread.
+  std::optional<FileDescriptor> publishedSidecar;
+  sidecar::Contents publishedSidecarContents;
+
   std::optional<MergeFailureInfo> lastMergeFailure;
 
   // Concrete vector overlay names ("vec.<field>") that have been explicitly
@@ -496,6 +504,12 @@ public:
   // pressure (releaseInverter). Shedding smaller inverters spams tiny segments
   // without meaningful RAM relief, e.g. when merge reservations hold the budget.
   size_t pressureFlushFloorBytes = 4 * 1024 * 1024;
+
+  // Which global-ordinal maps a commit that changes the segment set builds
+  // and persists for every reader of the snapshot (see buildOrdMaps): none,
+  // the fields readers used, or every indexed string field with an ord column.
+  enum class OrdMapPersistence { OFF, USED, ALL };
+  OrdMapPersistence persistOrdMaps = OrdMapPersistence::USED;
 
   // TEXT merge partitioning thresholds. Tests and constrained deployments may
   // lower these without changing the on-disk behavior of flushes or serial merges.
@@ -692,13 +706,21 @@ private:
   void segmentFlushBody(Inverter& inverter);
   bool finishCommitBody(UpdateMessage& msg);
   // Caller holds publicationMutex. A supplied schema is copied before assigning history.
+  // A supplied sidecar replaces info.sidecar: the published file when its
+  // contents are unchanged, else a new snapshot sidecar written here.
   void publish(api::IndexInfo& info, std::pmr::memory_resource& arena,
-               std::shared_ptr<Schema> schema = {});
+               std::shared_ptr<Schema> schema = {}, const sidecar::Contents* sidecarContents = nullptr);
   uint64_t writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& commitInfo,
-                              std::span<AuxInfo> auxIndexes);
+                              std::span<AuxInfo> auxIndexes, const sidecar::Contents& sidecarContents);
   std::vector<AuxInfo> buildAuxIndexes(const UpdateMessage& msg,
                                                    std::span<SegInfo*> segsToKeep,
                                                    std::vector<std::string>& outFilesToSync);
+  std::optional<AuxInfo> buildOrdMaps(uint64_t newCoreGen, std::span<SegInfo*> segs,
+                                      std::vector<std::string> fields);
+  static std::vector<std::string> ordMapFieldsOf(const AuxInfo& info);
+  void addSegmentSidecar(const PostingsWriter& writer, std::vector<std::string>& unsynced,
+                         std::vector<FileDescriptor>& files);
+  sidecar::Contents snapshotSidecarContents(std::span<SegInfo*> segs, std::span<const AuxInfo> aux);
   void buildSegmentOverlays(const UpdateMessage& msg,
                             std::span<SegInfo*> segsToKeep,
                             std::vector<std::string>& outFilesToSync);

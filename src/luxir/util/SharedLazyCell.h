@@ -24,6 +24,11 @@ class SharedLazyCell {
   std::variant<Pointer, std::shared_ptr<SharedLazyBuild<Value>>> value;
 
 public:
+  // The value once built, else null; never starts or waits for a build.
+  Pointer peek() const {
+    return ready.load(std::memory_order_acquire) ? std::get<Pointer>(value) : Pointer{};
+  }
+
   template <typename CreateFunc>
   Pointer getOrCreate(CreateFunc&& createFunc) {
     if (ready.load(std::memory_order_acquire)) return std::get<Pointer>(value);

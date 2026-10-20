@@ -52,8 +52,8 @@ namespace luxir {
 //
 
 class OrdMapBuilder {
-  IndexReader::FieldSegments fields;
-  IndexReader& reader;
+  std::string_view field;
+  std::span<PostingsReader* const> segs;
   OrdMap::DeltaEncoding deltaEncoding;
   TopTermsBuilder topTermsBuilder;
 
@@ -75,7 +75,7 @@ class OrdMapBuilder {
       segments.push_back('b');
     }
     LOG_INFO("OrdMap field={} bytes={} topTerms={} unlistedBound={} segments=[{}]",
-             fields.name(), size, topTerms.entries.size(), topTerms.unlistedBound,
+             field, size, topTerms.entries.size(), topTerms.unlistedBound,
              segments);
   }
 
@@ -334,10 +334,10 @@ class OrdMapBuilder {
   };
 
 public:
-  OrdMapBuilder(IndexReader::FieldSegments fields, IndexReader& reader)
-      : fields(fields), reader(reader),
+  OrdMapBuilder(std::string_view field, std::span<PostingsReader* const> segs, int64_t maxDoc)
+      : field(field), segs(segs),
         deltaEncoding(OrdMap::configuredDeltaEncoding()),
-        topTermsBuilder(TopTermsBuilder::thresholdFor(reader.maxDoc())) {}
+        topTermsBuilder(TopTermsBuilder::thresholdFor(maxDoc)) {}
 
   // Build fills these in currently.  In the future, the output may be written to disk.
   std::unique_ptr<char[]> data;
@@ -355,7 +355,6 @@ public:
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
-    const auto& segs = reader.segments();
     auto nsegs = segs.size();
     segmentStats.resize(nsegs);
 
@@ -366,15 +365,16 @@ public:
 
     int segsWithValue = 0;
     for (auto i=0u; i<nsegs; i++) {
-      auto& seg = segs[i];
-      auto* fieldInfo = fields.at(i);
+      auto& seg = *segs[i];
+      // The segment's decoded header, shared by every snapshot holding it.
+      auto* fieldInfo = seg.fieldInfo(field);
       if (fieldInfo == nullptr) {
         allTermsEnums.emplace_back(nullptr);
         continue;
       }
 
       allTermsEnums.emplace_back(pool.make_unique<TermsEnumIdx>(
-          i, pool, seg.postingsReader(), *fieldInfo, deltaEncoding));
+          i, pool, seg, *fieldInfo, deltaEncoding));
       // position the TermsEnum on the first term
       if (!allTermsEnums.back()->tenum.nextTerm()) {
         // defensive coding, every field should have at least one term.
@@ -638,11 +638,16 @@ OrdMap::DeltaEncoding OrdMap::configuredDeltaEncoding() {
 }
 
 
-// In the future, we prob want to be able to accept a span of postings readers as well
-// so that IndexWriter could pre-create a OrdMap for a field without constructing an IndexReader.
-// Or we could just make IndexReader easier to construct w/o taking a Directory, etc.
 std::shared_ptr<OrdMap> OrdMap::build(IndexReader::FieldSegments fields, IndexReader& reader) {
-  OrdMapBuilder builder(fields, reader);
+  std::vector<PostingsReader*> segs;
+  segs.reserve(reader.segments().size());
+  for (auto& seg : reader.segments()) segs.push_back(&seg.postingsReader());
+  return build(fields.name(), segs, reader.maxDoc());
+}
+
+std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, std::span<PostingsReader* const> segs,
+                                      int64_t maxDoc) {
+  OrdMapBuilder builder(field, segs, maxDoc);
   builder.build();
   
   // Handle single segment with values case

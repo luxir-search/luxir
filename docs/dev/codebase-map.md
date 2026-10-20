@@ -108,6 +108,15 @@ locations, browse `src/luxir/<area>/`.
      - `IndexHandler`: One physical representation, owned by `indexHandlers`;
        finish/flush visits each once in global physical-name order
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
+   - `Sidecar` (`index/Sidecar.h`): byte-range map and chunk hashes written beside
+     immutable files. `PostingsWriter::finish` records each segment's layout;
+     `IndexWriter` hashes the files and writes the segment sidecar (`s<seg>__M`) and,
+     per commit, the snapshot sidecar for live docs, overlays and aux files.
+     `SidecarReader` (`reader/`) parses and verifies them and orders transfers by tier
+     (used by `ReplicationFollower`)
+   - `OrdMapStore` (`search/`): OrdMaps persisted per segment composition as the
+     index-level aux entry `ordmaps`; built by `IndexWriter::buildOrdMaps` when a commit
+     changes the segment set, loaded lazily by `IndexReader::getOrdMap`
    - `PointsWriter` (1-D sorted leaves) and `BKDWriter` (2-D geo) build the
      optional points indexes at flush; `SegmentMerger` carries 1-D points
      forward by run-merging and rebuilds geo BKDs from the merged column.
@@ -180,7 +189,8 @@ Protocol buffer definitions are in `protos/`:
 
 - [luxir.proto](../../protos/luxir.proto): Public service definitions only
 - [luxir_types.proto](../../protos/luxir_types.proto): Public request, response, and value definitions
-- [luxir_index.proto](../../protos/luxir_index.proto): Internal on-disk commit manifest, excluded from gRPC reflection
+- [luxir_index.proto](../../protos/luxir_index.proto): Internal on-disk commit manifest, sidecars and
+  persisted OrdMap directory, excluded from gRPC reflection
 
 The public and internal wire structs are handwritten in `src/luxir/api/`.
 hpp-proto generates their binary and JSON metadata into the build directory.
