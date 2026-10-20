@@ -522,7 +522,7 @@ level; use NOT or parentheses (context: "status_s:live AND <HERE>+tag_s:beta")
 - There is no default search field.
 - `?` and mid-word `*` in a term are literal characters, and `/re/` is not a
   regex; use `wildcard(...)` and `regex(...)`.
-- `geo_box` and `geo_distance` have no function form; use their structured
+- `geo_box`, `geo_distance`, and `geo_polygon` have no function form; use their structured
   JSON objects. New structured query arms are not automatically callable
   until their expression behavior is declared.
 - `$variables` are values only: they cannot supply a score decoration, a

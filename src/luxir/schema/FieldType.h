@@ -49,7 +49,7 @@ public:
     ID,       // unique id field
     VECTOR,   // dense float vector; column-stored as fixed-size bytes
     DATE,     // timestamp; column-stored as int64 milliseconds since the Unix epoch
-    GEO_POINT // latitude/longitude point; packed into one int64 column value
+    GEO_POINT // latitude/longitude point; one Morton-interleaved int64 column value
   };
 
   using flag_type = int32_t;

@@ -126,6 +126,9 @@ defaults and constraints are described in the comments and guides.
 - [`FuzzyQuery`](#message-luxir.fuzzyquery)
 - [`GeoBoxQuery`](#message-luxir.geoboxquery)
 - [`GeoDistanceQuery`](#message-luxir.geodistancequery)
+- [`GeoLatLon`](#message-luxir.geolatlon)
+- [`GeoPolygonQuery`](#message-luxir.geopolygonquery)
+- [`GeoRing`](#message-luxir.georing)
 - [`GroupComponent`](#message-luxir.groupcomponent)
 - [`GroupKey`](#message-luxir.groupkey)
 - [`GroupTable`](#message-luxir.grouptable)
@@ -1206,6 +1209,43 @@ Geographic distance query with a center in degrees and radius in meters. Matches
 | <a id="field-luxir.geodistancequery.lon"></a>[`lon`](#field-luxir.geodistancequery.lon) | 3 | `double` | singular | center longitude, degrees in \[-180, 180\] |
 | <a id="field-luxir.geodistancequery.radius_meters"></a>[`radius_meters`](#field-luxir.geodistancequery.radius_meters) | 4 | `double` | singular | inclusive radius, finite and non-negative |
 
+<a id="message-luxir.geolatlon"></a>
+
+### luxir.GeoLatLon
+
+A polygon vertex in degrees. Named scalars, like GeoBoxQuery, so the VALUE array contract \[x, y\] = \[lon, lat\] does not apply.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.geolatlon.lat"></a>[`lat`](#field-luxir.geolatlon.lat) | 1 | `double` | singular | degrees in \[-90, 90\] |
+| <a id="field-luxir.geolatlon.lon"></a>[`lon`](#field-luxir.geolatlon.lon) | 2 | `double` | singular | degrees in \[-180, 180\] |
+
+<a id="message-luxir.geopolygonquery"></a>
+
+### luxir.GeoPolygonQuery
+
+Matches when at least one GEO\_POINT value is inside the polygon: inside the outer ring and inside no hole, each by the even-odd rule. Edges are straight lines in latitude/longitude and do not cross the dateline (split such a polygon into two queries under a boolean should). A ring may repeat its first vertex at the end. Points exactly on an edge may match either way.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.geopolygonquery.field"></a>[`field`](#field-luxir.geopolygonquery.field) | 1 | `string` | singular |  |
+| <a id="field-luxir.geopolygonquery.points"></a>[`points`](#field-luxir.geopolygonquery.points) | 2 | [`GeoLatLon`](#message-luxir.geolatlon) | repeated | outer ring, at least 3 distinct vertices |
+| <a id="field-luxir.geopolygonquery.holes"></a>[`holes`](#field-luxir.geopolygonquery.holes) | 3 | [`GeoRing`](#message-luxir.georing) | repeated | optional holes inside the outer ring |
+
+<a id="message-luxir.georing"></a>
+
+### luxir.GeoRing
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.georing.points"></a>[`points`](#field-luxir.georing.points) | 1 | [`GeoLatLon`](#message-luxir.geolatlon) | repeated | at least 3 distinct vertices |
+
 <a id="message-luxir.groupcomponent"></a>
 
 ### luxir.GroupComponent
@@ -1698,6 +1738,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.wildcard"></a>[`wildcard`](#field-luxir.query.wildcard) | 17 | [`WildcardQuery`](#message-luxir.wildcardquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by wildcard term match |
 | <a id="field-luxir.query.regex"></a>[`regex`](#field-luxir.query.regex) | 18 | [`RegexQuery`](#message-luxir.regexquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by regular-expression term match |
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
+| <a id="field-luxir.query.geo_polygon"></a>[`geo_polygon`](#field-luxir.query.geo_polygon) | 24 | [`GeoPolygonQuery`](#message-luxir.geopolygonquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects GEO\_POINT values inside a polygon |
 
 <a id="message-luxir.querybucket"></a>
 

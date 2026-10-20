@@ -227,7 +227,7 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Request `min_score` (Elasticsearch-style): documents scoring below it are
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
-- `knn` vector search, `geo_box`, and `geo_distance`.
+- `knn` vector search, `geo_box`, `geo_distance`, and `geo_polygon`.
 - `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,
   quoted phrases with `~N` slop, grouping, trailing-`*` prefix, `~N` fuzzy
   terms, and `field:value` terms against an allowlist).
@@ -332,8 +332,11 @@ Anywhere a query goes, it can be a structured object or an expression string.
 - Geo point fields (`[lon, lat]` arrays in GeoJSON coordinate order,
   quantized to about a centimeter), single- or multi-valued, with an optional
   two-dimensional points index.
-- Bounding-box queries (dateline-aware) and great-circle distance queries,
-  usable as the main query, as a non-scoring filter, or as a boolean clause.
+- Bounding-box queries (dateline-aware), great-circle distance queries, and
+  polygon queries with holes, usable as the main query, as a non-scoring
+  filter, or as a boolean clause.
+- Points are stored Morton-interleaved, so column scans skip blocks by their
+  2-D bounds, and requested geo fields come back as `[lon, lat]`.
 
 ## API surfaces
 

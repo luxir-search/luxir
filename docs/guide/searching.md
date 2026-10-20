@@ -594,6 +594,7 @@ clauses, filters, fusion sources, or another query wrapper.
 | kNN | `{"knn":{"field":"embedding_v","query":[...],"k":20}}` | Exact or ANN vector search; see [Vector Search](vector-search.md). |
 | Geo box | `{"geo_box":{"field":"location","min_lat":40,"max_lat":42,"min_lon":-75,"max_lon":-72}}` | Inclusive box, including dateline-crossing boxes. |
 | Geo distance | `{"geo_distance":{"field":"location","lat":40.71,"lon":-74.01,"radius_meters":5000}}` | Inclusive great-circle radius. |
+| Geo polygon | `{"geo_polygon":{"field":"location","points":[{"lat":40,"lon":-75},{"lat":42,"lon":-75},{"lat":42,"lon":-72}]}}` | Polygon with optional `holes`; no dateline crossing. |
 
 `match` accepts `operator: "and"` or a numeric `min_match` when analysis
 produces several terms. Boolean `optional` clauses rank but do not constrain a

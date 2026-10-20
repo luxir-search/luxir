@@ -616,6 +616,7 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
         case FieldType::FLOAT:
         case FieldType::DOUBLE:
         case FieldType::DATE:
+        case FieldType::GEO_POINT:
           retrievable = source.column && type->hasColumn();
           break;
         default:
