@@ -269,6 +269,7 @@ std::shared_ptr<Collection> Collections::initWriter(const CollectionId& name, st
   col->shard->iw->collectionMetrics = col->metrics;
   col->shard->iw->perInverterRamBytes = (size_t)config.index.max_inverter_ram_mb * 1024 * 1024;
   col->shard->iw->pressureFlushFloorBytes = (size_t)config.index.pressure_flush_floor_mb * 1024 * 1024;
+  col->shard->iw->mergePolicy->maxConcurrentMerges = config.index.max_concurrent_merges;
   if (col->shard->snapshots->snapshot()->id.incarnation != *selected) throw std::runtime_error("Snapshot incarnation does not match CURRENT");
   if (creating) storage.select(*selected);
   retire(name, *selected);

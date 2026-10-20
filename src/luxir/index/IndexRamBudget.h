@@ -39,11 +39,17 @@ namespace luxir {
 // but are discounted from pressure because they are on their way out. Retained
 // delete packets stay reserved without a discount. The pressure predicate is:
 //
-//   reserved + pending merge demand - draining inverter RAM > total
+//   reserved + min(pending merge demand, total / 2) - draining inverter RAM > total
 //
-// Demand is capped at total for this predicate: values beyond a whole pool are
-// operationally identical and can arise from zero-stream partition range
-// batches.  The comparison is performed by subtraction to avoid overflow.
+// Demand counts toward pressure only up to half the pool.  Uncapped, a large
+// merge's demand (often more than the whole pool) keeps pressure permanently
+// true while it waits, so every inverter past the shed floor is flushed at
+// the end of its batch: about one tiny segment per bulk, which feeds the
+// merge backlog that produced the demand.  With the cap, inverters keep at
+// least half the pool and merges wait for the rest; demand values beyond the
+// cap (including those from zero-stream partition range batches) are
+// operationally identical.  The comparison is performed by subtraction to
+// avoid overflow.
 //
 // The cap is deliberately soft: forceAcquire() overdraws so a client that has
 // nothing in flight can always make progress (and so a single reservation larger
@@ -357,7 +363,7 @@ private:
     assert(current >= drainingBytes);
     int64_t live = current - drainingBytes;
     if (live > cap) return true;
-    return effectiveDemandLocked(cap) > cap - live;
+    return effectiveDemandLocked(mergeDemandPressureCap(cap)) > cap - live;
   }
 
   void collectAdmissionCallbacksLocked(CallbackList& callbacks) const {
@@ -538,6 +544,11 @@ private:
   }
 
 public:
+  // The most pending merge demand that counts toward inverter pressure.
+  static int64_t mergeDemandPressureCap(int64_t totalBytes) {
+    return std::max<int64_t>(1, totalBytes / 2);
+  }
+
   explicit IndexRamBudget(int64_t totalBytes = 0) : total(totalBytes) {
     assert(totalBytes >= 0);
   }
@@ -599,6 +610,14 @@ public:
   bool pressureNeeded() const {
     const std::lock_guard<std::mutex> lock(registryMutex);
     return pressureNeededLocked();
+  }
+
+  // True when reservations net of draining inverters exceed the cap (never
+  // when uncapped): pressure that holds without any merge demand.
+  bool liveOverBudget() const {
+    const std::lock_guard<std::mutex> lock(registryMutex);
+    int64_t cap = total.load(std::memory_order_relaxed);
+    return cap != 0 && reserved.load(std::memory_order_relaxed) - drainingBytes > cap;
   }
 
   // Conservative lock-free pre-check: false only when pressure is provably

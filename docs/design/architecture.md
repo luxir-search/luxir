@@ -69,7 +69,12 @@ every core busy even when work is skewed.
   output streams with no coordination. Tasks are admitted against a
   node-wide indexing-RAM budget: merge memory is predictable up front from
   segment statistics, so heavy fields are priced exactly, scheduled
-  largest-first, and light column merges pack around them.
+  largest-first, and light column merges pack around them. A merge waiting
+  for that budget claims at most half of it from in-progress indexing, so
+  ingest keeps building large segments instead of flushing a small one per
+  batch to make room. Several merges also run at once per collection over
+  disjoint segments, so a long merge of large segments does not hold back
+  the merges of small ones behind it.
 
 ### Asynchronous network IO
 

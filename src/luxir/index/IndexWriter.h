@@ -4,6 +4,7 @@
 #pragma once
 #include "luxir/util/Metrics.h"
 
+#include <algorithm>
 #include <atomic>
 #include <deque>
 #include <optional>
@@ -171,9 +172,15 @@ public:
     int32_t segCount = 0;  // a sanity check that we are in-sync with segments in the IndexWriter.
   public:
     static constexpr int32_t DEFAULT_MERGE_FACTOR = 10;
+    static constexpr int32_t DEFAULT_MAX_CONCURRENT_MERGES = 2;
     IndexWriter& iw;
-    int32_t outstandingMerges = 0;
+    int32_t outstandingMerges = 0;  // policy and client (force) merges submitted, not yet tailed
     int32_t mergeFactor = DEFAULT_MERGE_FACTOR;
+    // Policy merges that may run at once, so a long high-level merge does not
+    // hold back the small-level merges behind it.  Each takes at most
+    // mergeFactor segments and its sources are disjoint from every other
+    // running merge's.  A client force merge runs alone.
+    int32_t maxConcurrentMerges = DEFAULT_MAX_CONCURRENT_MERGES;
     // TODO: Hmmm, a high merge floor can lead to some O^N2 behavior: see https://issues.apache.org/jira/browse/LUCENE-10574
     // Perhaps an alternative would be to remove the floor and then kick off merges like normal, *but*
     // when a merge happens at tier 3, sweep up all the smaller segments as well.  I'm not sure this
@@ -273,16 +280,50 @@ public:
       }
     }
 
-    // Call with indexMutex locked, returns true if new merge message was sent.
-    bool _maybeMergeSegments(SegInfo* seg) {
-      int mergeLevel = -1;
-      {
-        // const std::lock_guard<std::mutex> lock(iw.indexMutex);
-        mergeLevel = _update(seg);
-        if (mergeLevel < 0 || outstandingMerges > 0) {
-          return false;
+    // Choose up to mergeFactor segments from the lowest level holding at least
+    // mergeFactor segments no other merge has claimed, oldest first, and mark
+    // them merging.  Empty when no level qualifies.  Call with indexMutex locked.
+    std::vector<SegInfo*> _selectMerge() {
+      std::vector<int32_t> eligible(levelCounts.size());
+      for (auto& [segId, seg] : iw.segInfos) {
+        if (!seg->merging && seg->liveDocs > 0 && seg->mergeLevel >= 0
+            && seg->mergeLevel < (int32_t)eligible.size()) {
+          eligible[seg->mergeLevel]++;
         }
       }
+      auto level = std::ranges::find_if(eligible, [&](int32_t n) { return n >= mergeFactor; });
+      if (level == eligible.end()) return {};
+      int32_t mergeLevel = (int32_t)(level - eligible.begin());
+      std::vector<SegInfo*> segs;
+      segs.reserve(*level);
+      for (auto& [segId, seg] : iw.segInfos) {
+        if (!seg->merging && seg->liveDocs > 0 && seg->mergeLevel == mergeLevel) {
+          segs.push_back(seg.get());
+        }
+      }
+      std::ranges::sort(segs, {}, &SegInfo::segId);
+      segs.resize(mergeFactor);
+      for (auto* seg : segs) {
+        seg->merging = true;
+        seg->mergedLiveGen = seg->liveGen;
+      }
+      return segs;
+    }
+
+    static void _unmark(std::span<SegInfo* const> segs) {
+      for (auto* seg : segs) {
+        seg->merging = false;
+        seg->mergedLiveGen = -1;
+      }
+    }
+
+    // Call with indexMutex locked.  Records seg (if any) and submits policy
+    // merges while a level qualifies and fewer than maxConcurrentMerges are
+    // running; returns true if any merge message was sent.  A client force
+    // merge, running or queued, holds policy merges back until it completes.
+    bool _maybeMergeSegments(SegInfo* seg) {
+      if (seg != nullptr) _update(seg);
+      if (_update(nullptr) < 0) return false;  // counts include merging segments: a cheap upper bound
 
       class MyMergeMessage : public MergeMessage {
       public:
@@ -293,13 +334,28 @@ public:
         }
       };
 
-      auto msg = std::make_unique<MyMergeMessage>();
-      msg->mergeLevel = mergeLevel;
-      if (!iw._submitMergeLocked(msg.get())) {
-        return false;
+      bool submitted = false;
+      while (outstandingMerges < maxConcurrentMerges && iw.activeForceMerge == nullptr
+             && iw.pendingForceMerges.empty()) {
+        auto msg = std::make_unique<MyMergeMessage>();
+        msg->segs = _selectMerge();
+        if (msg->segs.empty()) break;
+        msg->mergeLevel = msg->segs.front()->mergeLevel;
+        bool accepted = false;
+        try {
+          accepted = iw._submitMergeLocked(msg.get());
+        } catch (...) {
+          _unmark(msg->segs);
+          throw;
+        }
+        if (!accepted) {
+          _unmark(msg->segs);
+          break;
+        }
+        msg.release();
+        submitted = true;
       }
-      msg.release();
-      return true;
+      return submitted;
     }
   };  // end MergePolicy
 

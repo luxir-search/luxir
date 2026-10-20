@@ -493,6 +493,57 @@ TEST(PressureShedDirectTest, mergeDemandWakesIdleWriter) {
   }
 }
 
+// A merge waiting on a whole pool of demand must not turn every batch of large
+// documents into its own segment: demand claims at most half the pool from
+// inverters, and only an inverter holding a fair share of that half is shed for
+// it.  (Uncapped demand flushed all 40 batches as 40 segments.)
+TEST(PressureShedDirectTest, mergeDemandDoesNotShedEveryBatch) {
+  RAMDir dir;
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
+      "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
+
+  IndexRamBudget budget;
+  CommitSnapshotRegistry iwSnapshots(dir);
+  IndexWriter iw(iwSnapshots, schema, &budget);
+  iw.mergePolicy->setMergeFactor(1000);  // count flushed segments only
+  iw.pressureFlushFloorBytes = 1;
+
+  int docOrd = 0;
+  auto addBatch = [&]() {  // 20 docs of ~7 KB
+    auto& inverter = iw.obtainInverter();
+    for (int d = 0; d < 20; d++, docOrd++) {
+      std::string body;
+      for (int w = 0; w < 1000; w++) body += "w" + std::to_string((docOrd * 7919 + w * 104729) % 50000) + " ";
+      inverter.startDoc();
+      inverter.getIndexHandler("body").index(inverter, std::string_view(body));
+      inverter.finishDoc();
+    }
+    iw.releaseInverter(inverter);
+  };
+
+  addBatch();
+  int64_t first = budget.reservedBytes();
+  addBatch();
+  int64_t perBatch = budget.reservedBytes() - first;
+  ASSERT_GT(perBatch, 0);
+  // Inverters keep half of the pool: about five batches.
+  int64_t cap = 2 * (first + 4 * perBatch);
+  budget.setTotalBytes(cap);
+  auto demand = budget.registerMergeDemand([]() {});
+  demand.publish(cap);  // a merge that wants the whole pool
+
+  const int batches = 40;
+  for (int i = 2; i < batches; i++) addBatch();
+
+  demand.publish(0);
+  budget.setTotalBytes(0);
+  iw.commit();
+  auto segments = iw.snapshots.readers.getReader()->segments().size();
+  EXPECT_GT(segments, 1u) << "inverters past half the pool still yield to merge demand";
+  EXPECT_LE(segments, (size_t)batches / 3) << "merge demand shed small inverters";
+}
+
 // Hold the demand-triggered inverter flush.  Once it releases its reservation,
 // the budget callback must admit multiple field batches, which are then held at
 // segmentMergeBody.  This is the regression shape: without published demand the
