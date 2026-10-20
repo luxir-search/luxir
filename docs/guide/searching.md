@@ -611,8 +611,7 @@ clauses, filters, fusion sources, or another query wrapper.
 | Constant score | `{"constant_score":{"query":...,"score":1.0}}` | Replaces child scores without changing its match set. |
 | Boost | `{"boost":{"query":...,"boost":2.0}}` | Multiplies child scores. A numeric `boost` sibling is input sugar. |
 | Simple query | `{"simple_query":{"q":"dune | messiah","fields":["title_t"]}}` | Never-failing syntax for raw search-box input. |
-| Combined fields | `{"combined_fields":{"query":"dune messiah","fields":["title_t^2","body_t"]}}` | BM25F: the fields score as one combined field. |
-| Multi-match | `{"multi_match":{"query":"dune","fields":["title_t","body_t"],"type":"cross_fields"}}` | `cross_fields` (BM25F) or `most_fields`. |
+| Multi-match | `{"multi_match":{"text":"dune","fields":["title_t^2","body_t"]}}` | `combined` (default) scores analyzer/policy groups with BM25F; `per_field` adds weighted match scores. |
 | Expression | `"title_t:dune AND year_i:>=1965"` | Strict developer syntax with exact parse errors and safe `$vars`. |
 | kNN | `{"knn":{"field":"embedding_v","query":[...],"k":20}}` | Exact or ANN vector search; see [Vector Search](vector-search.md). |
 | Geo box | `{"geo_box":{"field":"location","min_lat":40,"max_lat":42,"min_lon":-75,"max_lon":-72}}` | Inclusive box, including dateline-crossing boxes. |
@@ -622,7 +621,7 @@ clauses, filters, fusion sources, or another query wrapper.
 produces several terms. Boolean `optional` clauses rank but do not constrain a
 query that already has `required` or `filter` clauses unless `min_match` is set.
 
-There are two query types for text. Text a person typed goes through
+There are two syntaxes for text queries. Text a person typed goes through
 [`simple_query`](query-reference.md#simple-query), which never fails to
 parse. Text your application authored uses the strict
 [query language](query-language.md), which reports parse errors with a byte
@@ -634,7 +633,7 @@ default.
 ### Field bindings
 
 A bare field name selects a representation by operation: text operations
-(match, phrase, prefix, fuzzy, simple query, expression terms) use the
+(match, multi-match, phrase, prefix, fuzzy, simple query, expression terms) use the
 field's `search` binding, and value operations (`any_of`, ranges, facets,
 sorts, metrics) use its `value` binding. `f__label` selects a variant
 exactly and `f__self` forces the primary. The rules live in

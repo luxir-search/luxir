@@ -1,8 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-// multi_match: BM25F scoring of several TEXT fields as
-// one combined field, match semantics, request validation, and the HTTP form.
+// multi_match: combined BM25F and weighted per-field match scoring.
 
 #include <cmath>
 #include <limits>

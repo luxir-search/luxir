@@ -439,17 +439,17 @@ identity: `author_name` and `author_name__self` from the
 `allowed_fields` restricts exact resolved search targets; allowing one
 representation does not grant access to its siblings.
 
-## Combined fields
+## Multi-match
 
-`combined_fields` searches one text across several TEXT fields as if they were
-a single field. Each analyzed term is scored with BM25F, the model behind
-Lucene's `CombinedFieldQuery` and the Elasticsearch `combined_fields` query:
+`multi_match` searches one text across several weighted fields. The default
+`combined` mode scores fields sharing an analyzer and long-term policy as one
+field with BM25F. The `per_field` mode adds weighted `match` scores:
 
 ```json
 {
-  "combined_fields": {
-    "query": "dune messiah",
-    "fields": ["title_t^2", "description_t"],
+  "multi_match": {
+    "text": "dune messiah",
+    "fields": [{"field": "title_t", "weight": 2}, {"field": "body_t"}],
     "operator": "and"
   }
 }
@@ -457,62 +457,53 @@ Lucene's `CombinedFieldQuery` and the Elasticsearch `combined_fields` query:
 
 | Field | Meaning |
 |---|---|
-| `query` | Text to analyze. |
-| `fields` | Required non-empty TEXT fields, each `name` or `name^boost`. Boosts must be finite and at least `1`. |
-| `operator` | `or` (default): any term matches in any field. `and`: every term appears in at least one field. |
-| `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
+| `text` | Text to analyze or coerce. |
+| `fields` | Required non-empty list of objects with `field` and optional `weight`. Unset weight is `1`; every weight must be finite and greater than `0`. |
+| `mode` | `combined` (default) or `per_field`. |
+| `operator` | `or` (default) or `and`; combines terms within each group in `combined`, or within each field in `per_field`. |
+| `min_match` | Must be non-negative. Zero uses `operator`; a positive value overrides it and is clamped to the analyzed term count within each group or field. |
 
-A field's boost is a weight on both its term frequency and its document
-length. For a term, a document's frequency is the weighted sum of its
-per-field frequencies, its length is the weighted sum of its per-field
-lengths, and the average length is the weighted sum of the fields' total term
-counts divided by the largest per-field document count. Document frequency is the largest of the fields' document
-frequencies, so a term that is common in one field is not rare in the
-combination. A match in a short title therefore outranks the same match in a
-long body, and a term repeated across title and body saturates once instead
-of scoring twice.
+JSON also accepts `"title_t"` and `"title_t^2"`, the field-list form of Solr's
+`qf`, as shorthand for field objects.
+Writes use the canonical object form shown above. Field names resolve through
+their `search` binding, like `match`. Duplicate physical targets keep the
+larger weight in both modes; field order does not affect the query.
 
-Every field must analyze `query` to the same terms. Fields with different
-analyzers are an error; use `multi_match` with `cross_fields`, which groups
-them. Field names resolve through their `search` binding like `match`, and a
-field listed twice keeps its larger boost. A single field at boost `1` scores
-exactly like `match`. In a filter, `combined_fields` matches the same
-documents without scoring.
+In `combined` mode, fields must be TEXT. Fields sharing the same compiled
+analyzer and long-term policy form a group. Group membership comes from the
+schema, independently of the query text. Each group analyzes the text once
+and scores each term with BM25F, as in Lucene's `CombinedFieldQuery`.
 
-## Multi-match
+Within a group, a weight scales that field's term frequency and document
+length at every group size, including a group with just one field. It does
+not multiply the field's score. For a term, frequency is the weighted sum of
+per-field frequencies, and length is the weighted sum of per-field lengths,
+rounded and encoded as a norm. Every field contributes length even when the
+term is absent from that field. Average length is the weighted sum of total
+term counts divided by the largest per-field document count; document
+frequency is the largest per-field document frequency. A term present in
+several fields saturates once within the group.
 
-`multi_match` runs one text over several fields, with the field list syntax of
-the Elasticsearch query of the same name:
+Group scores add, and a document matches when any group matches.
+`operator: "and"` requires every term in some field of one group; it does not
+require every group to match. `min_match` also applies within each group.
+A group producing no terms contributes nothing; if all groups produce no
+terms, the query matches nothing. One field at weight `1` scores like `match`.
 
-```json
-{
-  "multi_match": {
-    "query": "dune",
-    "fields": ["title_t^3", "description_t", "tags_w"],
-    "type": "cross_fields"
-  }
-}
+In `per_field` mode, each field runs a `match` query, and its weight multiplies
+that field's score. Field scores add, and a document matches when any field
+matches. This mode accepts the field types that [`match`](#match) accepts.
+`operator: "and"` requires every term in that field; `min_match` applies
+within each field. Use `per_field` to multiply individual field scores, or
+wrap the query in [`boost`](#constant-score-and-boost) to multiply its final score.
+Both modes keep the same match set when used as an unscored filter.
+
+The expression form uses `text` as its main value argument and accepts field
+weights and enum arguments:
+
+```text
+multi_match(dune, fields=[title_t^2, body_t], mode=per_field, operator=and)
 ```
-
-| Field | Meaning |
-|---|---|
-| `query` | Text to analyze. |
-| `fields` | Required non-empty fields, each `name` or `name^boost`. Boosts must be finite and greater than `0`. |
-| `type` | `cross_fields` or `most_fields`. Required: the Elasticsearch default, `best_fields`, is not supported yet. |
-| `operator` | `or` (default) or `and`; applies per term across fields for `cross_fields` and per field for `most_fields`. |
-| `min_match` | Minimum analyzed terms that must match; overrides `operator`. |
-
-`cross_fields` groups the fields by how they analyze the text. TEXT fields
-that analyze it to the same terms form a group scored with BM25F like
-`combined_fields`; the group scores add, and a document matches when any group
-matches. This differs from the Elasticsearch `cross_fields` type, which blends
-term statistics across fields, multiplies scores by per-field boosts, and
-combines groups with `dis_max`. `most_fields` runs a `match` per field, multiplies each by its boost,
-and adds the scores. `best_fields`, `phrase`, `phrase_prefix`, and
-`bool_prefix` are rejected with an error.
-
-Both arms are callable from the query language with `query` as the main
-value: `combined_fields(dune, fields=[title_t, description_t])`.
 
 ## Expression
 
@@ -552,9 +543,7 @@ in their own guides:
 - `except_ops` routing is not accepted on Fusion filters or Fusion source
   filters, and `domain` overrides are not supported directly in `Fusion.ops`
   or beneath facet buckets.
-- `multi_match` supports `cross_fields` and `most_fields` only; the
-  `best_fields` default, `tie_breaker`, and wildcard field names are not
-  supported. `cross_fields` groups add their scores rather than taking the
-  best group.
+- `multi_match` has no `dis_max`/`tie_breaker`, phrase forms, or wildcard
+  field names. `combined` mode accepts TEXT fields only.
 - Fuzzy expansion truncation (the `64` clause budget and any lower operator
   limit) is not reported in the response.
