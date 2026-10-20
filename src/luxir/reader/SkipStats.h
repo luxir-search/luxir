@@ -337,6 +337,8 @@ struct SkipStats {
   static inline int64_t rangeFacetPointsArms = 0;
   // Range facet zones (blocks or leaves) counted whole, without a decode.
   static inline int64_t rangeFacetZoneRuns = 0;
+  // Range facet zones added whole to sub-op bucket domains.
+  static inline int64_t rangeFacetZoneDomainRuns = 0;
   static inline int64_t geoBKDArms = 0;
   static inline int64_t geoScanArms = 0;
   static inline int64_t geoSparseVerifyArms = 0;
@@ -632,6 +634,7 @@ struct SkipStats {
     numericPredicateScanArms = 0;
     rangeFacetPointsArms = 0;
     rangeFacetZoneRuns = 0;
+    rangeFacetZoneDomainRuns = 0;
     geoBKDArms = 0;
     geoScanArms = 0;
     geoSparseVerifyArms = 0;

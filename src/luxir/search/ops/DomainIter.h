@@ -328,7 +328,8 @@ enum class IntZoneVerdict : uint8_t {
 };
 
 // The in-domain values of one WHOLE zone. [begin, end) are value ranks; a walk
-// with a domain is over a leafBounded() column, where they are also the docs.
+// with a domain, or for a visitor that needsDocs(), is over a leafBounded()
+// column, where they are also the docs.
 struct IntZoneRun {
   enum class Kind : uint8_t { ALL, BITS, ARRAY };
   int64_t begin;
@@ -345,17 +346,18 @@ struct IntZoneRun {
 // a VALUES leaf decodes and calls visitor.value(rank, value) per in-domain
 // value. In-domain docs without a value bump missing_num.
 //
-// A domain needs value ranks to be docs, so with one the column must be
-// leafBounded(); otherwise this returns false having visited nothing and the
-// caller walks docs (forEachIntColValue). Bitset domains decode a 128-value
-// frame only when the frame has domain docs, array domains decode by point.
+// A domain needs value ranks to be docs, and so does a visitor that collects
+// docs (V::needsDocs()), so either needs a leafBounded() column; otherwise this
+// returns false having visited nothing and the caller walks docs
+// (forEachIntColValue). Bitset domains decode a 128-value frame only when the
+// frame has domain docs, array domains decode by point.
 template <class V>
 bool forEachIntColZone(DocSet* domain, const IntColReader& col, int32_t maxDoc,
                        int64_t& missing_num, V& visitor) {
   constexpr int64_t BLOCK = NumColumnFormat::BLOCK_SIZE;
   constexpr int64_t LEAF = NumColumnFormat::LEAF_ZONE_SIZE;
   constexpr int64_t FRAME = NumColumnFormat::BULK_SIZE;
-  if (domain != nullptr && !col.leafBounded()) return false;
+  if ((domain != nullptr || V::needsDocs()) && !col.leafBounded()) return false;
   // A dense column has a value for every doc, so only a null domain (any
   // shape) can see docs without one.
   if (domain == nullptr) missing_num += maxDoc - col.docsWithValue();

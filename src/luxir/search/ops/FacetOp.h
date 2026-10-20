@@ -1738,29 +1738,71 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
   std::span<const RangeFacetRun> runs;
 
   template <bool Distinct> struct GrowingStorage;
+  // The op's fixed fences, or a bounds:data facet's finished layout, with their
+  // lookup. zone() narrows the lookup to the buckets [lo, lo + span] that a
+  // column zone's [min, max] reaches, once per zone (forEachIntColZone), so
+  // zoneBucketOf() searches only the fences inside the zone: a branchless
+  // compare-count over a few, or the full rule over many (unclustered data).
   struct BucketLayout {
+    static constexpr size_t SCAN_FENCES = 8;
     std::span<const int64_t> fences;
     int64_t gap;
     std::span<const RangeFacetRun> runs;
+    // The outer fences, held by value: a value walk's counter stores could
+    // alias them through fences.
+    int64_t start;
+    int64_t end;
     RangeFacetRunCursor cursor{};
+    size_t lo = 0;
+    size_t span = 0;
+
+    BucketLayout(std::span<const int64_t> fences, int64_t gap,
+                 std::span<const RangeFacetRun> runs)
+      : fences(fences), gap(gap), runs(runs),
+        start(fences.empty() ? 0 : fences.front()),
+        end(fences.empty() ? 0 : fences.back()) {}
+
+    bool inRange(int64_t value) const { return value >= start && value < end; }
+
+    // Bucket of an in-range value.
     size_t bucketOf(int64_t value) {
-      if (gap) return (size_t)(((uint64_t)value - (uint64_t)fences.front()) / (uint64_t)gap);
+      if (gap) return (size_t)(((uint64_t)value - (uint64_t)start) / (uint64_t)gap);
       return cursor.bucketOf(value, runs, fences);
     }
+
+    IntZoneVerdict zone(int64_t min, int64_t max) {
+      if (max < start || min >= end) return IntZoneVerdict::SKIP;
+      lo = min < start ? 0 : bucketOf(min);
+      size_t hi = max >= end ? fences.size() - 2 : bucketOf(max);
+      span = hi - lo;
+      return span == 0 && min >= start && max < end
+          ? IntZoneVerdict::WHOLE : IntZoneVerdict::VALUES;
+    }
+
+    // Bucket of an in-range value of the last zone().
+    LUXIR_INLINE size_t zoneBucketOf(int64_t value) {
+      const int64_t* inner = fences.data() + lo + 1;
+      if (span <= SCAN_FENCES) {
+        size_t bucket = lo;
+        for (size_t i = 0; i < span; i++) bucket += (size_t)(value >= inner[i]);
+        return bucket;
+      }
+      if (gap || !runs.empty()) return bucketOf(value);
+      return lo + (size_t)(std::upper_bound(inner, inner + span, value) - inner);
+    }
   };
+
+  BucketLayout fixedLayout() const { return {fences, affine ? affineGap : 0, runs}; }
 
   std::vector<DomainHandle> bucketDomains(size_t segnum,
       std::span<const SelectedFacetBucket<size_t>> buckets, DocSet* eligibility,
       BucketLayout layout) {
     std::vector<int32_t> builderOfBucket(layout.fences.size() - 1, -1);
     for (size_t i = 0; i < buckets.size(); i++) builderOfBucket[buckets[i].key] = (int32_t)i;
-    // Zone runs bucket by the op's own fences only.
-    if (layout.fences.data() == fences.data() && layout.fences.size() == fences.size()) {
-      if (auto domains = zoneBucketDomains(segnum, builderOfBucket, buckets.size(), eligibility)) {
-        return std::move(*domains);
-      }
+    if (auto domains = zoneBucketDomains(segnum, buckets, builderOfBucket, eligibility, layout)) {
+      return std::move(*domains);
     }
-    int64_t start = layout.fences.front(), end = layout.fences.back();
+    int64_t start = layout.start, end = layout.end;
     return buildFacetBucketDomains(reader.segments()[segnum].maxDoc(), buckets.size(),
         [&](auto&& accept) {
           int64_t missing = 0;
@@ -1811,111 +1853,57 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
     return cursor.bucketOf(val, runs);
   }
 
-  // Buckets the values of one int column zone at a time (forEachIntColZone).
-  // zone() finds the buckets [lo, lo + span] that the zone's [min, max]
-  // reaches, once per zone, so a value only searches the span fences inside
-  // the zone: a branchless compare-count over a few, or the full rule over
-  // many (unclustered data).
-  struct ZoneBuckets {
-    static constexpr size_t SCAN_FENCES = 8;
-    // Window words for a zone run over every doc (no domain).
-    static constexpr std::array<uint64_t, NumColumnFormat::BLOCK_SIZE / 64>
-        ALL_DOCS = [] {
-          std::array<uint64_t, NumColumnFormat::BLOCK_SIZE / 64> words;
-          words.fill(~0ULL);
-          return words;
-        }();
-    const IntFacetRangeReq& range;
-    int64_t start;
-    int64_t end;
-    size_t lo = 0;
-    size_t span = 0;
-
-    explicit ZoneBuckets(const IntFacetRangeReq& range)
-      : range(range), start(range.fences.front()), end(range.fences.back()) {}
-
-    IntZoneVerdict classify(int64_t min, int64_t max) {
-      if (max < start || min >= end) return IntZoneVerdict::SKIP;
-      lo = min < start ? 0 : range.bucketOf(min);
-      size_t hi = max >= end ? range.bucketCount() - 1 : range.bucketOf(max);
-      span = hi - lo;
-      return span == 0 && min >= start && max < end
-          ? IntZoneVerdict::WHOLE : IntZoneVerdict::VALUES;
-    }
-
-    bool inRange(int64_t val) const { return val >= start && val < end; }
-
-    // Bucket of an in-range value of the current zone.
-    LUXIR_INLINE size_t bucketOf(int64_t val) const {
-      const int64_t* inner = range.fences.data() + lo + 1;
-      if (span <= SCAN_FENCES) {
-        size_t bucket = lo;
-        for (size_t i = 0; i < span; i++) bucket += (size_t)(val >= inner[i]);
-        return bucket;
-      }
-      if (range.affine) return range.bucketOf(val);
-      return lo + (size_t)(std::upper_bound(inner, inner + span, val) - inner);
-    }
-  };
-
   // Walks a segment's column zone by zone (forEachIntColZone). False, having
-  // visited nothing, for a shape the zone walk does not cover.
-  // needDocs also requires value ranks to be docs, for a null domain too.
+  // visited nothing, for a column shape the zone walk does not cover.
   template <class V>
   bool facetSegIntZones(DocSet* domain, int32_t segnum, int64_t& missing_num,
-                        V& visitor, bool needDocs = false) {
+                        V& visitor) {
     if (disableZoneRangeFacetForTests) return false;
-    auto& postingsReader = reader.segments()[segnum].postingsReader();
-    int32_t maxDoc = postingsReader.maxDoc();
-    auto* info = fieldInfo(segnum);
-    if (info == nullptr) {
-      missing_num += domain ? domain->card() : maxDoc;
-      return true;
-    }
-    IntColReader column(postingsReader, *info);
-    if (needDocs && !column.leafBounded()) return false;
-    return forEachIntColZone(domain, column, maxDoc, missing_num, visitor);
+    bool walked = true;
+    withIntColumn(domain, segnum, missing_num,
+        [&](IntColReader& column, int32_t maxDoc) {
+          walked = forEachIntColZone(domain, column, maxDoc, missing_num, visitor);
+        });
+    return walked;
   }
 
-  // bucketDomains over a single-valued dense column, zone by zone: a zone
-  // inside one bucket adds its domain docs as a doc range. nullopt when the
-  // column has another shape.
-  std::optional<std::vector<DomainHandle>> zoneBucketDomains(
-      size_t segnum, std::span<const int32_t> builderOfBucket,
-      size_t numBuilders, DocSet* eligibility) {
-    struct Builders : ZoneBuckets {
+  // bucketDomains over a dense single-valued column, zone by zone: a zone
+  // inside one bucket adds its domain docs as a doc range, and a zone outside
+  // the chunk's fences adds nothing. nullopt when the column has another shape.
+  std::optional<std::vector<DomainHandle>> zoneBucketDomains(size_t segnum,
+      std::span<const SelectedFacetBucket<size_t>> buckets,
+      std::span<const int32_t> builderOfBucket, DocSet* eligibility,
+      BucketLayout layout) {
+    struct Builders {
+      static constexpr bool needsDocs() { return true; }
+      BucketLayout layout;
       std::span<const int32_t> builderOfBucket;
+      int64_t chunkStart;
+      int64_t chunkEnd;
       std::vector<DocSetBuilder> builders;
-      Builders(const IntFacetRangeReq& range,
-               std::span<const int32_t> builderOfBucket,
-               size_t numBuilders, int32_t maxDoc)
-        : ZoneBuckets(range), builderOfBucket(builderOfBucket) {
-        builders.reserve(numBuilders);
-        for (size_t i = 0; i < numBuilders; i++) builders.emplace_back(maxDoc);
-      }
       IntZoneVerdict zone(int64_t min, int64_t max) {
-        IntZoneVerdict verdict = this->classify(min, max);
-        // A zone reaching only buckets outside this chunk adds nothing.
+        if (max < chunkStart || min >= chunkEnd) return IntZoneVerdict::SKIP;
+        IntZoneVerdict verdict = layout.zone(min, max);
+        // A zone whose buckets all lie outside the chunk adds nothing.
         if (verdict != IntZoneVerdict::SKIP
-            && this->span <= ZoneBuckets::SCAN_FENCES) {
+            && layout.span <= BucketLayout::SCAN_FENCES) {
           bool any = false;
-          for (size_t i = 0; i <= this->span; i++) {
-            any |= builderOfBucket[this->lo + i] >= 0;
+          for (size_t i = 0; i <= layout.span; i++) {
+            any |= builderOfBucket[layout.lo + i] >= 0;
           }
           if (!any) return IntZoneVerdict::SKIP;
         }
         return verdict;
       }
       void run(const IntZoneRun& run) {
-        int32_t builder = builderOfBucket[this->lo];
+        int32_t builder = builderOfBucket[layout.lo];
         if (builder < 0) return;
         auto& target = builders[(size_t)builder];
         int32_t begin = (int32_t)run.begin;
         int32_t end = (int32_t)run.end;
         switch (run.kind) {
           case IntZoneRun::Kind::ALL:
-            target.addWindowWords(ZoneBuckets::ALL_DOCS.data(), begin, end,
-                                  (int32_t)run.count);
+            target.addRange(begin, end);
             break;
           case IntZoneRun::Kind::BITS:
             target.addWindowWords(run.words, begin, end, (int32_t)run.count);
@@ -1924,22 +1912,30 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
             target.addSorted(run.docs);
             break;
         }
-        skipCount(SkipStats::rangeFacetZoneRuns);
+        skipCount(SkipStats::rangeFacetZoneDomainRuns);
       }
       LUXIR_INLINE void value(int64_t doc, int64_t val) {
-        if (!this->inRange(val)) return;
-        int32_t builder = builderOfBucket[this->bucketOf(val)];
+        if (!layout.inRange(val)) return;
+        int32_t builder = builderOfBucket[layout.zoneBucketOf(val)];
         if (builder >= 0) builders[(size_t)builder].add((int32_t)doc);
       }
-    } visitor(*this, builderOfBucket, numBuilders,
-              reader.segments()[segnum].maxDoc());
+    };
+    size_t first = buckets.front().key, last = buckets.front().key;
+    for (const auto& bucket : buckets) {
+      first = std::min(first, bucket.key);
+      last = std::max(last, bucket.key);
+    }
+    Builders visitor{layout, builderOfBucket, layout.fences[first],
+                     layout.fences[last + 1], {}};
+    int32_t maxDoc = reader.segments()[segnum].maxDoc();
+    visitor.builders.reserve(buckets.size());
+    for (size_t i = 0; i < buckets.size(); i++) visitor.builders.emplace_back(maxDoc);
     int64_t missing = 0;
-    if (!facetSegIntZones(eligibility, (int32_t)segnum, missing,
-                         visitor, true)) {
+    if (!facetSegIntZones(eligibility, (int32_t)segnum, missing, visitor)) {
       return std::nullopt;
     }
     std::vector<DomainHandle> domains;
-    domains.reserve(numBuilders);
+    domains.reserve(buckets.size());
     for (auto& builder : visitor.builders) domains.emplace_back(builder.build());
     return domains;
   }
@@ -2124,22 +2120,20 @@ public:
           }
         }
       }
-      struct Counter : ZoneBuckets {
+      struct Counter {
+        static constexpr bool needsDocs() { return false; }
+        BucketLayout layout;
         std::span<int64_t> counts;
-        Counter(const IntFacetRangeReq& range, std::span<int64_t> counts)
-          : ZoneBuckets(range), counts(counts) {}
-        IntZoneVerdict zone(int64_t min, int64_t max) {
-          return this->classify(min, max);
-        }
+        IntZoneVerdict zone(int64_t min, int64_t max) { return layout.zone(min, max); }
         void run(const IntZoneRun& run) {
-          counts[this->lo] += run.count;
+          counts[layout.lo] += run.count;
           skipCount(SkipStats::rangeFacetZoneRuns);
         }
         LUXIR_INLINE void value(int64_t rank, int64_t val) {
           unused(rank);
-          if (this->inRange(val)) counts[this->bucketOf(val)]++;
+          if (layout.inRange(val)) counts[layout.zoneBucketOf(val)]++;
         }
-      } counter(rangeOp(), data.counts);
+      } counter{rangeOp().fixedLayout(), data.counts};
       if (rangeOp().facetSegIntZones(domain, segnum, data.missing_num, counter)) {
         return;
       }
@@ -2171,14 +2165,14 @@ public:
         std::span<const SelectedFacetBucket<size_t>> block, FacetBucketFeed feed) override {
       auto& range = rangeOp();
       range.feedRangeDomains(segnum, block, this->input[segnum], feed,
-          {range.fences, range.affine ? range.affineGap : 0, range.runs}, false);
+          range.fixedLayout(), false);
     }
     void feedIdentityDomains(size_t segnum,
         std::span<const SelectedFacetBucket<size_t>> block, DomainHandle eligibility,
         FacetBucketFeed feed) override {
       auto& range = rangeOp();
       range.feedRangeDomains(segnum, block, std::move(eligibility), feed,
-          {range.fences, range.affine ? range.affineGap : 0, range.runs}, true);
+          range.fixedLayout(), true);
     }
 
   public:

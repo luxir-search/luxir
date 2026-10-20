@@ -1366,31 +1366,44 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
 
 // The zone walk (whole blocks and leaves counted from their zones, straddling
 // zones bucketed against their own fences) must reproduce the doc walk exactly
-// across column shapes, domains, deletions, sub-ops and fence kinds.
+// across column shapes, domains, deletions, sub-ops, bucket-domain chunking
+// and fence kinds.
 TEST_F(FacetTest, zoneRangeFacetMatchesDocWalk) {
   CollectionHelper helper;
   helper.clear();
   const std::array fields = {
     RangeSchemaField{"when_dt", false, false, api::FieldDef::FieldClass::DATE},
+    RangeSchemaField{"rand_dt", false, false, api::FieldDef::FieldClass::DATE},
     RangeSchemaField{"step_i", false, false},
     RangeSchemaField{"rand_i", false, false},
+    RangeSchemaField{"step_f", false, false, api::FieldDef::FieldClass::FLOAT},
+    RangeSchemaField{"rand_d", false, false, api::FieldDef::FieldClass::DOUBLE},
     RangeSchemaField{"sparse_i", false, false},
     RangeSchemaField{"multi_is", false, true}
   };
   setRangeFacetSchema(helper, fields);
 
   // Three segments of time-ordered docs, 7 minutes apart from 2024-01-15 UTC.
+  // rand_dt holds unclustered instants over the ten years from 2020-01-01
+  // UTC, rand_d unclustered doubles in [-1000, 1000), and step_f exact FLOAT
+  // steps from negative to positive in doc order.
   const int64_t base = 1705276800000LL;
   const int64_t step = 7 * 60 * 1000LL;
+  const int64_t randBase = 1577836800000LL;
+  const uint64_t tenYears = 3653 * 86'400'000ULL;
   std::mt19937_64 rng(42);
   std::vector<std::string> deleted;
   int32_t doc = 0;
   for (int32_t segDocs : {12000, 10000, 3000}) {
     std::vector<Doc> docs;
     for (int32_t i = 0; i < segDocs; i++, doc++) {
+      int64_t randWhen = randBase + (int64_t)(rng() % tenYears);
+      int64_t randInt = (int64_t)(rng() % 100'000);
+      double randDouble = (double)((int64_t)(rng() % 2'000'000) - 1'000'000) / 1000;
       Doc d = flatdoc("id", std::to_string(doc), "when_dt", base + doc * step,
-                      "step_i", (int64_t)doc,
-                      "rand_i", (int64_t)(rng() % 100'000));
+                      "rand_dt", randWhen, "step_i", (int64_t)doc,
+                      "rand_i", randInt, "step_f", (float)(doc - 12'500) * 0.125f,
+                      "rand_d", randDouble);
       if (doc % 3 == 0) appendFlat(d, "tag_s", "third");
       if (doc % 97 == 0) appendFlat(d, "tag_s", "rare");
       if (doc % 10 != 0) appendFlat(d, "sparse_i", (int64_t)doc);
@@ -1405,92 +1418,122 @@ TEST_F(FacetTest, zoneRangeFacetMatchesDocWalk) {
   ASSERT_TRUE(helper.deleteByIds(std::span<const std::string>(deleted),
                                  UpdateMessage::COMMIT).success);
 
-  struct Guard {
-    bool saved = IntFacetRangeReq::disableZoneRangeFacetForTests;
-    bool savedStats = SkipStats::enabled;
-    Guard() { SkipStats::enabled = true; }
-    ~Guard() {
-      IntFacetRangeReq::disableZoneRangeFacetForTests = saved;
-      SkipStats::enabled = savedStats;
-    }
-  } guard;
   const int64_t lastWhen = base + (doc - 1) * step;
   const int64_t hour = 60 * 60 * 1000LL;
-  const std::array names = {
-    "hours", "days", "months", "step512", "step500", "step_wide", "rand_few",
-    "rand_many", "sparse", "multi", "sub_step", "sub_month"
+  using Unit = api::CalendarGap_::Unit;
+  // A sub facet carries an avg sub-op, so it also builds bucket domains.
+  struct Spec {
+    std::string_view name;
+    std::string_view field;
+    std::function<void(OpCursor&)> configure;
+    bool sub = false;
   };
-  auto addFacets = [&](auto&& facet) {
+  const std::vector<Spec> specs = {
     // Fixed gap clipped inside the data at both ends.
-    facet("hours", "when_dt").range(base + 12'345'678, lastWhen - 9'876'543, hour);
-    facet("days", "when_dt").calendarRange("2024-01-20", "2024-05-10", 1,
-        api::CalendarGap_::Unit::DAY, "America/Denver");
-    facet("months", "when_dt").calendarRange("2024-02-01", "2024-05-01", 1,
-        api::CalendarGap_::Unit::MONTH, "America/Denver");
+    {"hours", "when_dt", [&](OpCursor& f) {
+      f.range(base + 12'345'678, lastWhen - 9'876'543, hour); }},
+    {"days", "when_dt", [](OpCursor& f) {
+      f.calendarRange("2024-01-20", "2024-05-10", 1, Unit::DAY, "America/Denver"); }},
+    {"months", "when_dt", [](OpCursor& f) {
+      f.calendarRange("2024-02-01", "2024-05-01", 1, Unit::MONTH, "America/Denver"); }},
     // Fences on and off the 512-value leaf grid, and buckets spanning blocks.
-    facet("step512", "step_i").range(0, 30'000, 512);
-    facet("step500", "step_i").range(7, 24'000, 500);
-    facet("step_wide", "step_i").range(-5, 100'000, 9000);
+    {"step512", "step_i", [](OpCursor& f) { f.range(0, 30'000, 512); }},
+    {"step500", "step_i", [](OpCursor& f) { f.range(7, 24'000, 500); }},
+    {"step_wide", "step_i", [](OpCursor& f) { f.range(-5, 100'000, 9000); }},
     // Unclustered values: straddling zones reach a few or many fences.
-    facet("rand_few", "rand_i").range(1000, 99'000, 24'000);
-    facet("rand_many", "rand_i").range(0, 100'000, 1000);
-    facet("sparse", "sparse_i").range(100, 24'000, 1024);
-    facet("multi", "multi_is").range(0, 26'000, 2048);
-    facet("sub_step", "step_i").range(100, 20'000, 4000).avg("a", "rand_i");
-    facet("sub_month", "when_dt").calendarRange("2024-02-01", "2024-05-01", 1,
-        api::CalendarGap_::Unit::MONTH, "UTC").avg("a", "rand_i");
+    {"rand_few", "rand_i", [](OpCursor& f) { f.range(1000, 99'000, 24'000); }},
+    {"rand_many", "rand_i", [](OpCursor& f) { f.range(0, 100'000, 1000); }},
+    // Thousands of calendar fences per zone, with a run directory (DST days)
+    // and without one (months).
+    {"rand_days", "rand_dt", [](OpCursor& f) {
+      f.calendarRange("2020-03-01", "2029-11-01", 1, Unit::DAY, "America/Denver"); }},
+    {"rand_months", "rand_dt", [](OpCursor& f) {
+      f.calendarRange("2020-03-01", "2029-11-01", 1, Unit::MONTH, "America/Denver"); }},
+    // FLOAT and DOUBLE fences over negative and positive values.
+    {"step_float", "step_f", [](OpCursor& f) { f.rangeFp(-1000.0, 1000.0, 125.0); }},
+    {"rand_double", "rand_d", [](OpCursor& f) { f.rangeFp(-900.0, 900.0, 15.0); }},
+    {"sparse", "sparse_i", [](OpCursor& f) { f.range(100, 24'000, 1024); }},
+    {"multi", "multi_is", [](OpCursor& f) { f.range(0, 26'000, 2048); }},
+    {"sub_step", "step_i", [](OpCursor& f) {
+      f.range(100, 20'000, 4000).avg("a", "rand_i"); }, true},
+    {"sub_days", "when_dt", [](OpCursor& f) {
+      f.calendarRange("2024-03-01", "2024-04-15", 1, Unit::DAY, "America/Denver")
+          .avg("a", "rand_i"); }, true},
+    {"sub_month", "when_dt", [](OpCursor& f) {
+      f.calendarRange("2024-02-01", "2024-05-01", 1, Unit::MONTH, "UTC")
+          .avg("a", "rand_i"); }, true},
+    {"sub_float", "step_f", [](OpCursor& f) {
+      f.rangeFp(-1000.0, 1000.0, 250.0).avg("a", "rand_i"); }, true}
   };
-  auto missing = [](OpCursor& cursor) -> OpCursor& {
-    std::get<api::RangeFacet>(cursor.rawOp().kind).missing = true;
-    return cursor;
+
+  struct Pass {
+    std::vector<std::pair<std::string_view, std::vector<std::byte>>> results;
+    int64_t zoneRuns = 0;
+    int64_t domainRuns = 0;
+  };
+  // subOnly runs just the sub facets.
+  auto run = [&](std::string_view filter, bool zones, bool subOnly) {
+    IntFacetRangeReq::disableZoneRangeFacetForTests = !zones;
+    SkipStats::reset();
+    auto req = localReq(luxirNode->getSearchEngine());
+    req->collection("main");
+    OpCursor* top = nullptr;
+    if (!filter.empty()) {
+      top = &req->topDocs("q");
+      top->matchQuery("tag_s", filter).limit(0);
+    }
+    for (const auto& spec : specs) {
+      if (subOnly && !spec.sub) continue;
+      OpCursor& facet = top ? top->rangeFacet(spec.name, spec.field)
+                            : req->rangeFacet(spec.name, spec.field);
+      std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
+      spec.configure(facet);
+    }
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    Pass pass;
+    pass.zoneRuns = SkipStats::rangeFacetZoneRuns;
+    pass.domainRuns = SkipStats::rangeFacetZoneDomainRuns;
+    for (const auto& spec : specs) {
+      if (subOnly && !spec.sub) continue;
+      const auto& result = top ? topFacetResult(*req, "q", spec.name)
+                               : rootFacetResult(*req, spec.name);
+      std::vector<std::byte> bytes;
+      EXPECT_TRUE(api::encode(result, bytes));
+      pass.results.emplace_back(spec.name, std::move(bytes));
+    }
+    if (!top && !subOnly) {
+      const auto& wide = rootFacetResult(*req, "step_wide");
+      EXPECT_EQ(doc - (int64_t)deleted.size(),
+                std::accumulate(wide.counts.begin(), wide.counts.end(), 0LL));
+    }
+    return pass;
   };
 
   // Domains: all live docs (a liveDocs bitset in the segment with deletions),
-  // a bitset filter, and an array filter.
+  // a bitset filter, and an array filter. The chunked pass reruns the sub
+  // facets with one bucket domain per chunk, so a zone reaching only other
+  // buckets adds nothing.
+  SkipStatsScope stats;
+  SearchOverridesGuard overrides(IntFacetRangeReq::disableZoneRangeFacetForTests,
+                                 forcedRangeFacetBucketDomainByteBudget);
   for (std::string_view filter : {"", "third", "rare"}) {
-    auto run = [&](bool disableZones) {
-      IntFacetRangeReq::disableZoneRangeFacetForTests = disableZones;
-      SkipStats::reset();
-      auto req = localReq(luxirNode->getSearchEngine());
-      req->collection("main");
-      if (filter.empty()) {
-        addFacets([&](std::string_view name, std::string_view field) -> OpCursor& {
-          return missing(req->rangeFacet(name, field));
-        });
-      } else {
-        auto& top = req->topDocs("q");
-        top.matchQuery("tag_s", filter).limit(0);
-        addFacets([&](std::string_view name, std::string_view field) -> OpCursor& {
-          return missing(top.rangeFacet(name, field));
-        });
+    for (bool chunked : {false, true}) {
+      forcedRangeFacetBucketDomainByteBudget = chunked ? 1 : 0;
+      Pass zones = run(filter, true, chunked);
+      Pass walk = run(filter, false, chunked);
+      std::string label = std::format("filter '{}' chunked {}", filter, chunked);
+      EXPECT_GT(zones.zoneRuns, 0) << label;
+      EXPECT_GT(zones.domainRuns, 0) << label;
+      EXPECT_EQ(0, walk.zoneRuns) << label;
+      EXPECT_EQ(0, walk.domainRuns) << label;
+      ASSERT_EQ(zones.results.size(), walk.results.size()) << label;
+      for (size_t i = 0; i < zones.results.size(); i++) {
+        EXPECT_EQ(zones.results[i], walk.results[i]) << label;
       }
-      req->execute(false);
-      EXPECT_TRUE(req->ok()) << req->errorMsg();
-      std::vector<std::vector<std::byte>> encoded;
-      for (auto* name : names) {
-        const auto& result = filter.empty() ? rootFacetResult(*req, name)
-                                            : topFacetResult(*req, "q", name);
-        std::vector<std::byte> bytes;
-        EXPECT_TRUE(api::encode(result, bytes));
-        encoded.push_back(std::move(bytes));
-      }
-      if (filter.empty()) {
-        const auto& wide = rootFacetResult(*req, "step_wide");
-        EXPECT_EQ(doc - (int64_t)deleted.size(),
-                  std::accumulate(wide.counts.begin(), wide.counts.end(), 0LL));
-      }
-      return std::pair{std::move(encoded), SkipStats::rangeFacetZoneRuns};
-    };
-    auto [zoneResults, zoneRuns] = run(false);
-    auto [walkResults, walkRuns] = run(true);
-    EXPECT_GT(zoneRuns, 0) << filter;
-    EXPECT_EQ(0, walkRuns) << filter;
-    for (size_t i = 0; i < names.size(); i++) {
-      EXPECT_EQ(zoneResults[i], walkResults[i]) << filter << " " << names[i];
     }
   }
 }
-
 
 // Historical transition expectations depend on the process tzdb snapshot.
 TEST_F(FacetTest, calendarDateRangeDenverDstAndPointsParity) {
