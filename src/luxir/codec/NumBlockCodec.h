@@ -9,12 +9,26 @@ namespace luxir {
 
 class NumBlockCodec {
 public:
+  // `codec` holds the payload of a non-FOR plan (NumColumnFormat::planCodec);
+  // a FOR or raw plan needs none.
   static void write(OutputStream& out, size_t origin, std::span<const int64_t> values,
-                    NumColumnFormat::BlockPlan& plan, std::span<const uint64_t> quotients) {
+                    NumColumnFormat::BlockPlan& plan, std::span<const uint64_t> quotients,
+                    const NumColumnFormat::CodecScratch* codec = nullptr) {
     if (plan.raw()) out.align(MAX_ALIGN);
-    plan.info.setPayload(out.size() - origin, plan.bits);
+    plan.info.setPayload(out.size() - origin, plan.bits, plan.kind);
     if (plan.raw()) {
       out.write(values.data(), values.size_bytes());
+    } else if (plan.kind != NumBlockKind::FOR) {
+      // NumColumnFormat::CodecScratch: prefix, packed slots, exceptions.
+      assert(codec != nullptr && codec->slots.size() == values.size());
+      out.write(codec->prefix.data(), codec->prefix.size() * sizeof(int64_t));
+      LinearPack::Writer writer(out, plan.bits);
+      for (uint64_t slot : codec->slots) writer.append(slot);
+      writer.finish(false);
+      out.write(codec->positions.data(),
+                codec->positions.size() * sizeof(uint16_t));
+      out.write(codec->exceptions.data(),
+                codec->exceptions.size() * sizeof(int64_t));
     } else {
       LinearPack::Writer writer(out, plan.bits);
       pack(writer, values.size(), plan, quotients);

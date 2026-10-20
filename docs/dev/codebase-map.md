@@ -51,7 +51,13 @@ locations, browse `src/luxir/<area>/`.
    - `TermsEnum` enumerates or finds indexed terms for a field found by `FieldReader`
    - `DocsEnum` returns the documents for a term found with the `TermsEnum`. Optionally returns term positions for each document.
    - `IntColReader` reads the doc-order numeric column (all numeric field
-     classes store an order-preserving encoded int64)
+     classes store an order-preserving encoded int64). Each 4096-value block
+     picks the smallest of its kinds (`NumBlockKind` in
+     `codec/NumColumnFormat.h`): FOR (min + gcd + linear fit, or raw),
+     DELTA (frame anchors + packed deltas), DICT (sorted per-block
+     dictionary + codes) and, for FLOAT/DOUBLE, ALP decimal scaling with
+     patched exceptions. All decode to the same int64s; only the residual
+     range compare in `NumericPredicateQuery` is FOR-specific.
    - `PointsReader` reads the optional 1-D sorted-leaf points index of a
      `RANGE`-indexed numeric field (value-sorted leaves + fence directory;
      exact ordinal counts). `BKDReader` reads the 2-D int32 BKD of a
