@@ -44,6 +44,7 @@
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
+#include "luxir/util/geo.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/screaming.h"
 #include "luxir/util/luxir_util.h"
@@ -424,6 +425,40 @@ inline void loadNumCol(SearchRequest& req, IndexReader::FieldSegments infos, Fie
       };
       IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     }
+  });
+}
+
+// Decode a GEO_POINT column as multi_d: each document gets its points as
+// [lon, lat] pairs in the ingest coordinate order, so a single-valued field
+// yields [lon, lat] and a multi-valued one [lon1, lat1, lon2, lat2, ...].
+// A missing document leaves an empty array.
+inline void loadGeoCol(SearchRequest& req, IndexReader::FieldSegments infos,
+                       std::span<const segdoc> segDocs, SegmentRuns runs,
+                       luxir::api::Column& fieldCol,
+                       FieldLoaders* loaders, std::pmr::memory_resource& mr)
+{
+  auto columnSize = segDocs.size();
+  if (columnSize == 0) return;
+  auto& geoCol = fieldCol.kind.emplace<luxir::api::ArrArrDouble>();
+  std::span<luxir::api::ArrDouble> target(build::allocArray(geoCol.v, columnSize, mr), columnSize);
+  addFieldLoader(loaders, runs, [&req, infos, segDocs, target, &mr](std::span<RowIndex> idxSpan) {
+    auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
+    auto segNum = sortedSegDocs[0].segment();
+    auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
+    auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    auto* info = infos.at(segNum);
+    if (!info) return;
+    auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+      assert(segDocs[idxSpan[idx]].docId() == doc);
+      unused(doc);
+      luxir::api::ArrDouble& point = target[idxSpan[idx]];
+      if (valIdx == 0) build::allocArray(point.v, 2 * numVals, mr);
+      auto* out = const_cast<double*>(point.v.data()) + 2 * valIdx;
+      out[0] = geo::decodeLongitude(geo::unpackLongitude(val));
+      out[1] = geo::decodeLatitude(geo::unpackLatitude(val));
+    };
+    IntColReader::getValues(poolGuard.pool(), postingsReader, *info, sortedDocs, valHandler);
   });
 }
 
@@ -1160,6 +1195,10 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           // col_i.  ISO-8601 string rendering is an input-side / JSON-layer
           // concern, not the typed gRPC column.
           loadNumCol<IntColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          break;
+        }
+        case FieldType::Type::GEO_POINT: {
+          loadGeoCol(req, rf.infos, segDocs, runs, outputColumn(), pendingLoaders, mr);
           break;
         }
         case FieldType::Type::ID:

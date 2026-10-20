@@ -277,7 +277,5 @@ unless its slop reaches that gap.
 
 - Nested objects and nested documents are not a field type. Model
   relationships with IDs or flatten the fields in the producer.
-- Geo columns participate in queries but are not yet decoded by document
-  projection; see [Geo search](geo-search.md#current-limits).
 - Binary is reserved in the wire/schema enum but is not a usable engine field
   type in the current release.

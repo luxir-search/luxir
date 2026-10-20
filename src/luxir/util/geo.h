@@ -9,7 +9,12 @@
 #include <cstdint>
 #include <limits>
 #include <numbers>
+#include <span>
 #include <stdexcept>
+
+#if defined(__BMI2__)
+#include <immintrin.h>
+#endif
 
 namespace luxir::geo {
 
@@ -83,9 +88,52 @@ inline double decodeLongitude(int32_t encoded) {
   return (double)encoded * LON_DECODE;
 }
 
+// A GEO_POINT column value is the Morton (Z-order) interleave of the two
+// quantized coordinates: latitude in the odd bits, longitude in the even
+// bits, each biased to unsigned first so the interleave orders like the grid.
+// The top bit is then flipped back so signed int64 order, which column zones
+// and FOR blocks use, is exactly Morton order. Nearby points share high bits,
+// so a spatially clustered block packs into few bits, and a block's
+// [min, max] bounds a 2-D cell (mortonCell) instead of only latitude.
+inline constexpr uint64_t MORTON_LAT_BITS = UINT64_C(0xaaaaaaaaaaaaaaaa);
+inline constexpr uint64_t MORTON_LON_BITS = UINT64_C(0x5555555555555555);
+inline constexpr uint64_t MORTON_SIGN = UINT64_C(1) << 63;
+inline constexpr uint32_t COORD_BIAS = UINT32_C(0x80000000);
+
+// Deposits the 32 bits of value into the even bits of the result.
+inline uint64_t spreadBits(uint32_t value) {
+#if defined(__BMI2__)
+  return _pdep_u64(value, MORTON_LON_BITS);
+#else
+  uint64_t x = value;
+  x = (x | (x << 16)) & UINT64_C(0x0000ffff0000ffff);
+  x = (x | (x << 8)) & UINT64_C(0x00ff00ff00ff00ff);
+  x = (x | (x << 4)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
+  x = (x | (x << 2)) & UINT64_C(0x3333333333333333);
+  x = (x | (x << 1)) & MORTON_LON_BITS;
+  return x;
+#endif
+}
+
+// Inverse of spreadBits: gathers the even bits of value.
+inline uint32_t compactBits(uint64_t value) {
+#if defined(__BMI2__)
+  return (uint32_t)_pext_u64(value, MORTON_LON_BITS);
+#else
+  uint64_t x = value & MORTON_LON_BITS;
+  x = (x | (x >> 1)) & UINT64_C(0x3333333333333333);
+  x = (x | (x >> 2)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
+  x = (x | (x >> 4)) & UINT64_C(0x00ff00ff00ff00ff);
+  x = (x | (x >> 8)) & UINT64_C(0x0000ffff0000ffff);
+  x = (x | (x >> 16)) & UINT64_C(0x00000000ffffffff);
+  return (uint32_t)x;
+#endif
+}
+
 inline int64_t pack(int32_t latitude, int32_t longitude) {
-  uint64_t bits = ((uint64_t)(uint32_t)latitude << 32) | (uint32_t)longitude;
-  return (int64_t)bits;
+  uint64_t morton = (spreadBits((uint32_t)latitude ^ COORD_BIAS) << 1)
+      | spreadBits((uint32_t)longitude ^ COORD_BIAS);
+  return (int64_t)(morton ^ MORTON_SIGN);
 }
 
 inline int64_t encodePoint(double latitude, double longitude) {
@@ -93,11 +141,50 @@ inline int64_t encodePoint(double latitude, double longitude) {
 }
 
 inline int32_t unpackLatitude(int64_t packed) {
-  return (int32_t)((uint64_t)packed >> 32);
+  uint64_t morton = (uint64_t)packed ^ MORTON_SIGN;
+  return (int32_t)(compactBits(morton >> 1) ^ COORD_BIAS);
 }
 
 inline int32_t unpackLongitude(int64_t packed) {
-  return (int32_t)(uint32_t)packed;
+  uint64_t morton = (uint64_t)packed ^ MORTON_SIGN;
+  return (int32_t)(compactBits(morton) ^ COORD_BIAS);
+}
+
+// Inclusive encoded-space cell.
+struct Cell {
+  int32_t latMin;
+  int32_t latMax;
+  int32_t lonMin;
+  int32_t lonMax;
+};
+
+// The smallest quadtree cell holding every packed value in [min, max]: the
+// values share the Morton prefix above the highest differing bit, and each
+// coordinate's remaining bits range freely.
+inline Cell mortonCell(int64_t min, int64_t max) {
+  uint64_t lo = (uint64_t)min ^ MORTON_SIGN;
+  uint64_t hi = (uint64_t)max ^ MORTON_SIGN;
+  uint64_t diff = lo ^ hi;
+  uint64_t free = diff == 0 ? 0 : ~UINT64_C(0) >> std::countl_zero(diff);
+  int64_t first = (int64_t)((lo & ~free) ^ MORTON_SIGN);
+  int64_t last = (int64_t)((lo | free) ^ MORTON_SIGN);
+  return {unpackLatitude(first), unpackLatitude(last),
+          unpackLongitude(first), unpackLongitude(last)};
+}
+
+// Whether packed values in [min, max] can fall in the inclusive encoded box.
+// Morton order is monotone in each coordinate, so every point of the box
+// packs within [pack(latMin, lonMin), pack(latMax, lonMax)]. A reversed
+// (dateline-wrapping) longitude interval falls back to the full longitude
+// range. Conservative: an overlap does not imply a point in the box.
+inline bool mortonRangeMayIntersect(int64_t min, int64_t max,
+                                    int32_t latMin, int32_t latMax,
+                                    int32_t lonMin, int32_t lonMax) {
+  if (lonMax < lonMin) {
+    lonMin = std::numeric_limits<int32_t>::min();
+    lonMax = std::numeric_limits<int32_t>::max();
+  }
+  return min <= pack(latMax, lonMax) && pack(latMin, lonMin) <= max;
 }
 
 // Inclusive longitude interval. A reversed interval wraps across the dateline.
@@ -198,5 +285,113 @@ inline BoundingBox circleBoundingBox(double centerLat, double centerLon,
           minLon * (180.0 / std::numbers::pi),
           maxLon * (180.0 / std::numbers::pi)};
 }
+
+struct LatLon {
+  double lat;
+  double lon;
+};
+
+// A polygon in degrees: one outer ring and optional holes. Rings are not
+// closed (the last vertex connects back to the first), and edges are straight
+// lines in latitude/longitude, as in Lucene's LatLonPoint polygon queries. A
+// point is inside when it is inside the outer ring and inside no hole, each by
+// the even-odd rule, so a self-intersecting ring still has a defined interior.
+// Points exactly on an edge may fall either way.
+struct Polygon {
+  std::span<const LatLon> outer;
+  std::span<const std::span<const LatLon>> holes;
+  BoundingBox box;
+
+  static bool ringContains(std::span<const LatLon> ring, double lat,
+                           double lon) {
+    bool inside = false;
+    size_t n = ring.size();
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+      const LatLon& a = ring[i];
+      const LatLon& b = ring[j];
+      if ((a.lat > lat) != (b.lat > lat)
+          && lon < (b.lon - a.lon) * (lat - a.lat) / (b.lat - a.lat) + a.lon) {
+        inside = !inside;
+      }
+    }
+    return inside;
+  }
+
+  bool contains(double lat, double lon) const {
+    if (lat < box.minLat || lat > box.maxLat
+        || lon < box.minLon || lon > box.maxLon
+        || !ringContains(outer, lat, lon)) {
+      return false;
+    }
+    for (auto hole : holes) {
+      if (ringContains(hole, lat, lon)) return false;
+    }
+    return true;
+  }
+
+  // Whether any ring edge touches the closed rectangle. When none does, the
+  // whole rectangle is on one side of every ring, so one contains() probe
+  // classifies all of it.
+  bool edgeTouches(double minLat, double maxLat, double minLon,
+                   double maxLon) const {
+    if (ringTouches(outer, minLat, maxLat, minLon, maxLon)) return true;
+    for (auto hole : holes) {
+      if (ringTouches(hole, minLat, maxLat, minLon, maxLon)) return true;
+    }
+    return false;
+  }
+
+private:
+  static double orient(double ax, double ay, double bx, double by,
+                       double cx, double cy) {
+    return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+  }
+
+  // Closed segment intersection; collinear overlaps count.
+  static bool segmentsTouch(double ax, double ay, double bx, double by,
+                            double cx, double cy, double dx, double dy) {
+    double d1 = orient(cx, cy, dx, dy, ax, ay);
+    double d2 = orient(cx, cy, dx, dy, bx, by);
+    double d3 = orient(ax, ay, bx, by, cx, cy);
+    double d4 = orient(ax, ay, bx, by, dx, dy);
+    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0))
+        && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
+      return true;
+    }
+    auto onSegment = [](double px, double py, double qx, double qy,
+                        double rx, double ry) {
+      return std::min(px, qx) <= rx && rx <= std::max(px, qx)
+          && std::min(py, qy) <= ry && ry <= std::max(py, qy);
+    };
+    return (d1 == 0 && onSegment(cx, cy, dx, dy, ax, ay))
+        || (d2 == 0 && onSegment(cx, cy, dx, dy, bx, by))
+        || (d3 == 0 && onSegment(ax, ay, bx, by, cx, cy))
+        || (d4 == 0 && onSegment(ax, ay, bx, by, dx, dy));
+  }
+
+  static bool ringTouches(std::span<const LatLon> ring, double minLat,
+                          double maxLat, double minLon, double maxLon) {
+    size_t n = ring.size();
+    for (size_t i = 0, j = n - 1; i < n; j = i++) {
+      double ax = ring[j].lon, ay = ring[j].lat;
+      double bx = ring[i].lon, by = ring[i].lat;
+      if (std::max(ax, bx) < minLon || std::min(ax, bx) > maxLon
+          || std::max(ay, by) < minLat || std::min(ay, by) > maxLat) {
+        continue;
+      }
+      if ((minLon <= ax && ax <= maxLon && minLat <= ay && ay <= maxLat)
+          || (minLon <= bx && bx <= maxLon && minLat <= by && by <= maxLat)) {
+        return true;
+      }
+      if (segmentsTouch(ax, ay, bx, by, minLon, minLat, maxLon, minLat)
+          || segmentsTouch(ax, ay, bx, by, maxLon, minLat, maxLon, maxLat)
+          || segmentsTouch(ax, ay, bx, by, maxLon, maxLat, minLon, maxLat)
+          || segmentsTouch(ax, ay, bx, by, minLon, maxLat, minLon, minLat)) {
+        return true;
+      }
+    }
+    return false;
+  }
+};
 
 } // namespace luxir::geo

@@ -19,6 +19,7 @@
 #include <optional>
 #include <span>
 #include <type_traits>
+#include <utility>
 #include <vector>
 
 #include "LocalReq.h"
@@ -148,6 +149,29 @@ inline api::Query geoDistance(std::pmr::memory_resource& mr,
   g.lat = lat;
   g.lon = lon;
   g.radius_meters = radiusMeters;
+  return q;
+}
+
+// Rings are (lat, lon) vertex lists.
+using GeoRing = std::vector<std::pair<double, double>>;
+
+inline api::Query geoPolygon(std::pmr::memory_resource& mr,
+                             std::string_view field, const GeoRing& outer,
+                             const std::vector<GeoRing>& holes = {}) {
+  auto ring = [&mr](const GeoRing& points) {
+    std::span<const api::GeoLatLon> out;
+    auto* data = build::allocArray(out, points.size(), mr);
+    for (size_t i = 0; i < points.size(); i++) {
+      data[i] = {points[i].first, points[i].second};
+    }
+    return out;
+  };
+  api::Query q;
+  auto& g = q.kind.emplace<api::GeoPolygonQuery>();
+  g.field = build::arenaStr(mr, field);
+  g.points = ring(outer);
+  auto* rings = build::allocArray(g.holes, holes.size(), mr);
+  for (size_t i = 0; i < holes.size(); i++) rings[i].points = ring(holes[i]);
   return q;
 }
 
