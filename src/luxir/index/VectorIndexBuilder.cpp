@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "VectorIndexBuilder.h"
+#include "luxir/util/NumericalLibraries.h"
 
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
@@ -316,6 +317,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   // build site, so a listener can target a specific field and/or site.
   Signal::emit("vectorBuildField", (void*)&fieldName, (void*)(intptr_t)buildSite);
   const VectorAnnConfig& ann = ft.ann();
+  VectorBuildThreads threadBudget;
   int32_t dims = ft.storedDims();
   faiss::MetricType metric = toFaissMetric(ft.metric_);
   bool rabitq = ann.codec == VectorAnnConfig::RABITQ;

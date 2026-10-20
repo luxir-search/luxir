@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/util/NumericalLibraries.h"
 #include "luxir/server/ReplicationSource.h"
 #include "CommitWaits.h"
 #include "LuxirNode.h"
@@ -62,6 +63,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
     indexArena(workers + 1, 1, oneapi::tbb::task_arena::priority::low) {
   ensureWorkerPool(workers + 1);
+  initializeNumericalLibraries();
   if (following() && this->config.read_only) throw std::invalid_argument("replication.source cannot be combined with read-only");
   // A config assembled in code (tests, embedding) has not been through
   // normalize(), so resolve the RAM sentinels here too - before the writers

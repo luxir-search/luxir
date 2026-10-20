@@ -28,7 +28,8 @@
       "name": "openblas",
       "default-features": false,
       "features": [
-        "dynamic-arch"
+        "dynamic-arch",
+        "threads"
       ],
       "platform": "!osx"
     }

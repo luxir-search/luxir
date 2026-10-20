@@ -69,6 +69,9 @@ vcpkg_cmake_configure(
         -DBUILD_WITHOUT_LAPACK=OFF
         -DC_LAPACK=ON
         -DUSE_LOCKING=ON
+        # A cross-build host must not determine the target machine thread limit.
+        -DNUM_THREADS=256
+        -DUSE_OPENMP=OFF
         -DNOFORTRAN=ON
     MAYBE_UNUSED_VARIABLES
         GETARCH_BINARY_DIR
