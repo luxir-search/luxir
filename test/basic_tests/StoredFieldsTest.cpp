@@ -2,16 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gtest/gtest.h>
+#include <array>
 #include <atomic>
+#include <barrier>
+#include <chrono>
+#include <numeric>
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
+#include <zstd.h>
 
 #include "luxir/index/IndexRamBudget.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/IndexReader.h"
@@ -700,15 +707,17 @@ static std::unique_ptr<StoredFieldsReader> defaultStored(PostingsReader& pr) {
   return info ? std::make_unique<StoredFieldsReader>(pr, *info) : nullptr;
 }
 
+static void addBodyDoc(Inverter& inv, int doc) {
+  std::string body = "log line " + std::to_string(doc) + " status=200 path=/api/v1/items";
+  inv.startDoc();
+  inv.getIndexHandler("body").index(inv, std::string_view(body));
+  inv.finishDoc();
+}
+
 // Flush one segment of "body" docs numbered [first, first + n).
 static void addBodySegment(IndexWriter& iw, int first, int n) {
   auto& inv = iw.obtainInverter();
-  for (int i = first; i < first + n; i++) {
-    std::string body = "log line " + std::to_string(i) + " status=200 path=/api/v1/items";
-    inv.startDoc();
-    inv.getIndexHandler("body").index(inv, std::string_view(body));
-    inv.finishDoc();
-  }
+  for (int i = first; i < first + n; i++) addBodyDoc(inv, i);
   iw.releaseInverter(inv, true);
   iw.commit();
 }
@@ -979,9 +988,695 @@ TEST_F(StoredFieldsTest, mergePreAdoptsLargestCopyFieldTable) {
   }
 }
 
+static constexpr StoredChunkFormat DICT_FORMAT{StoredChunkFormat::ZSTD, 3, 1024, 8, 4096};
+
+static std::string trainStoredDictionary() {
+  std::string samples;
+  std::vector<size_t> sizes;
+  for (int doc = 0; doc < 3000; doc++) {
+    auto sample = "log line " + std::to_string(doc) + " status=200 path=/api/v1/items";
+    sizes.push_back(sample.size());
+    samples.append(sample);
+  }
+  return StoredChunkCompressor::trainDictionary(samples, sizes, DICT_FORMAT.dictionaryBytes);
+}
+
+// Exercise the fixed-handle writer directly; inverter dictionary providers
+// are separate from the chunk storage contract.
+static void writeStoredSegment(RAMDir& dir, const StoredChunkFormat& format,
+                               std::shared_ptr<const StoredCompressionDictionary> dictionary,
+                               std::span<const std::string> docs, uint64_t segId = 1) {
+  PostingsWriter postings(dir, segId, (int32_t)docs.size());
+  StoredFieldsWriter stored(postings, Postings::STORED_DEFAULT_RESOURCE, format, std::move(dictionary));
+  for (size_t doc = 0; doc < docs.size(); doc++) stored.addValue((int32_t)doc, "body", docs[doc]);
+  stored.finish((int32_t)docs.size());
+  postings.writeVersionRuns(VersionRunBuilder{});
+  postings.finish();
+}
+
+// Authored definitions survive reopen; hand-filled fieldTypeMap fixtures do not.
+static std::shared_ptr<Schema> dictionarySchema(
+    StoredChunkFormat format = DICT_FORMAT, std::optional<StoredChunkFormat> extra = {},
+    bool unrelated = false) {
+  SchemaBuilder b;
+  auto& body = b.field("body");
+  body.type = api::FieldDef::FieldClass::TEXT;
+  body.stored = true;
+  if (unrelated) b.field("price").type = api::FieldDef::FieldClass::INT;
+  auto resource = [&](std::string_view name, const StoredChunkFormat& f) {
+    auto& def = b.storedResource(name);
+    def.codec = (api::StoredResourceDef::Codec)f.codec;
+    def.chunk_size_bytes = (int32_t)f.chunkTarget;
+    def.max_docs_per_chunk = (int32_t)f.maxDocsPerChunk;
+    if (f.codec == StoredChunkFormat::ZSTD) def.zstd_level = f.zstdLevel;
+    if (f.dictionaryBytes) {
+      def.zstd_dictionary = true;
+      def.zstd_dictionary_bytes = (int32_t)f.dictionaryBytes;
+    }
+  };
+  resource("_stored_", format);
+  if (extra) resource("_stored_extra_", *extra);
+  return b.build();
+}
+
+static bool publishStoredDictionary(IndexWriter& iw, std::string_view resource,
+                                    const StoredChunkFormat& format,
+                                    const std::shared_ptr<const StoredDictionary>& bytes) {
+  auto token = iw.storedDictionaries.token(resource, format);
+  return token && iw.storedDictionaries.publish(resource, *token, bytes);
+}
+
+class StoredBootstrapProbe {
+public:
+  std::vector<bool> plans;
+  std::vector<int64_t> costs;
+  std::string sample;
+  size_t sampleCount = 0;
+  size_t sampleSizeTotal = 0;
+  size_t trainedBytes = 0;
+  int attempts = 0;
+  double trainingMs = 0;
+  std::chrono::steady_clock::time_point start;
+  std::function<void()> onPlan;
+  std::function<void()> onTrained;
+
+  StoredBootstrapProbe() {
+    Signal::listen("storedFieldsMergePlan", [this](void* resource, void* cost, void* bootstrap) -> void* {
+      if (*(std::string_view*)resource != Postings::STORED_DEFAULT_RESOURCE) return nullptr;
+      plans.push_back(*(bool*)bootstrap);
+      costs.push_back(*(int64_t*)cost);
+      if (onPlan) onPlan();
+      return nullptr;
+    });
+    Signal::listen("storedFieldsDictionarySample", [this](void* resource, void* bytes, void* count) -> void* {
+      if (*(std::string_view*)resource != Postings::STORED_DEFAULT_RESOURCE) return nullptr;
+      sample = *(std::string_view*)bytes;
+      auto sizes = *(std::span<const size_t>*)count;
+      sampleCount = sizes.size();
+      sampleSizeTotal = std::accumulate(sizes.begin(), sizes.end(), (size_t)0);
+      start = std::chrono::steady_clock::now();
+      return nullptr;
+    });
+    Signal::listen("storedFieldsDictionaryTrained", [this](void* resource, void* bytes, void*) -> void* {
+      if (*(std::string_view*)resource != Postings::STORED_DEFAULT_RESOURCE) return nullptr;
+      trainingMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      trainedBytes = ((std::string_view*)bytes)->size();
+      attempts++;
+      if (onTrained) onTrained();
+      return nullptr;
+    });
+  }
+
+  ~StoredBootstrapProbe() {
+    Signal::unlisten("storedFieldsMergePlan");
+    Signal::unlisten("storedFieldsDictionarySample");
+    Signal::unlisten("storedFieldsDictionaryTrained");
+  }
+};
+
+TEST_F(StoredFieldsTest, bootstrapTrainsPublishesSharesAndRetrainsAfterClear) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter iw(snapshots, dictionarySchema());
+  addBodySegment(iw, 0, 8192);
+  addBodySegment(iw, 8192, 8192);
+  int64_t plainBytes = 0;
+  for (auto& seg : snapshots.readers.getReader()->segments()) {
+    plainBytes += defaultStored(seg.postingsReader())->chunkRegionBytes();
+  }
+  StoredBootstrapProbe probe;
+  EXPECT_EQ((std::vector<bool>{false, false}), mergeStoredCopies(iw));
+  auto first = iw.storedDictionaries.lookup("_stored_", DICT_FORMAT);
+  ASSERT_NE(nullptr, first);
+  EXPECT_LT(defaultStored(snapshots.readers.getReader()->segments()[0].postingsReader())->chunkRegionBytes(), plainBytes);
+  EXPECT_EQ(StoredChunkCompressor::dictionarySampleBudget(DICT_FORMAT), probe.sample.size());
+  EXPECT_EQ(1, probe.attempts);
+  EXPECT_EQ(probe.sample.size(), probe.sampleSizeTotal);
+  EXPECT_NE(std::string::npos, probe.sample.find("log line 0 "));
+  EXPECT_NE(std::string::npos, probe.sample.find("log line 8192 ")); // both source halves sampled
+  addBodySegment(iw, 16384, 8);
+  auto reader = snapshots.readers.getReader();
+  EXPECT_EQ(first->bytes(), defaultStored(reader->segments().back().postingsReader())->dictionary());
+  EXPECT_EQ((std::vector<bool>{true, true}), mergeStoredCopies(iw));
+  EXPECT_EQ(1, probe.attempts);
+  addBodySegment(iw, 16392, 4096);
+  auto changed = DICT_FORMAT;
+  changed.dictionaryBytes *= 2;
+  iw.setSchema(dictionarySchema(changed));
+  EXPECT_EQ((std::vector<bool>{false, false}), mergeStoredCopies(iw));
+  auto next = iw.storedDictionaries.lookup("_stored_", changed);
+  ASSERT_NE(nullptr, next);
+  EXPECT_NE(first->bytes(), next->bytes());
+  EXPECT_EQ(2, probe.attempts);
+  EXPECT_EQ((std::vector<bool>{true, false, true}), probe.plans);
+  auto stored = defaultStored(snapshots.readers.getReader()->segments()[0].postingsReader());
+  expectBodies(*stored, 20488);
+}
+
+TEST_F(StoredFieldsTest, bootstrapAdmissionPricesOnlyAnEmptySlotAndPinsTheDecision) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter iw(snapshots, dictionarySchema());
+  addBodySegment(iw, 0, 8);
+  addBodySegment(iw, 8, 8);
+  StoredBootstrapProbe probe;
+  EXPECT_EQ((std::vector<bool>{true, true}), mergeStoredCopies(iw));
+  EXPECT_EQ(0, probe.attempts);
+  EXPECT_LT(probe.sample.size(), StoredChunkCompressor::dictionarySampleBudget(DICT_FORMAT));
+  auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
+  ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
+  addBodySegment(iw, 16, 8);
+  probe.onPlan = [&] {
+    auto changed = DICT_FORMAT;
+    changed.dictionaryBytes *= 2;
+    iw.setSchema(dictionarySchema(changed));
+    iw.setSchema(dictionarySchema());
+  };
+  size_t sampleBytes = probe.sample.size();
+  EXPECT_EQ((std::vector<bool>{true, false}), mergeStoredCopies(iw));
+  EXPECT_EQ((std::vector<bool>{true, false}), probe.plans);
+  ASSERT_EQ(2u, probe.costs.size());
+  EXPECT_EQ(StoredChunkCompressor::dictionaryTrainingBytes(DICT_FORMAT), probe.costs[0] - probe.costs[1]);
+  EXPECT_EQ(sampleBytes, probe.sample.size()); // no unpriced sampling after the clear
+  EXPECT_EQ(0, probe.attempts);
+  EXPECT_EQ(nullptr, iw.storedDictionaries.lookup("_stored_", DICT_FORMAT));
+}
+
+TEST_F(StoredFieldsTest, bootstrapManyTinyDocsHaveBoundedSamples) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter iw(snapshots, dictionarySchema());
+  for (int source = 0; source < 2; source++) {
+    auto& inv = iw.obtainInverter();
+    for (int doc = 0; doc < 45000; doc++) {
+      inv.startDoc();
+      inv.getIndexHandler("body").index(inv, std::string_view("x"));
+      inv.finishDoc();
+    }
+    iw.releaseInverter(inv, true);
+    iw.commit();
+  }
+  StoredBootstrapProbe probe;
+  iw.mergeSegments();
+  EXPECT_EQ(1, probe.attempts);
+  EXPECT_EQ(StoredChunkCompressor::dictionarySampleBudget(DICT_FORMAT), probe.sample.size());
+  EXPECT_EQ(probe.sample.size(), probe.sampleSizeTotal);
+  EXPECT_LE(probe.sampleCount, StoredChunkCompressor::MAX_DICTIONARY_SAMPLES);
+  EXPECT_GT(probe.sample.size() / 5, StoredChunkCompressor::MAX_DICTIONARY_SAMPLES);
+  auto reader = snapshots.readers.getReader();
+  EXPECT_EQ(90000, reader->segments()[0].maxDoc());
+}
+
+TEST_F(StoredFieldsTest, bootstrapLosingPublicationUsesWinnerOrMovedEpoch) {
+  auto format = DICT_FORMAT;
+  format.dictionaryBytes = 1024;
+  for (bool moveEpoch : {false, true}) {
+    SCOPED_TRACE(moveEpoch);
+    RAMDir dir;
+    CommitSnapshotRegistry snapshots(dir);
+    IndexWriter iw(snapshots, dictionarySchema(format));
+    addBodySegment(iw, 0, 2048);
+    addBodySegment(iw, 2048, 2048);
+    auto winner = std::make_shared<const StoredDictionary>(std::string(1024, 'w'));
+    StoredBootstrapProbe probe;
+    probe.onTrained = [&] {
+      if (moveEpoch) {
+        auto changed = format;
+        changed.dictionaryBytes *= 2;
+        iw.setSchema(dictionarySchema(changed));
+        iw.setSchema(dictionarySchema(format));
+      } else {
+        EXPECT_TRUE(publishStoredDictionary(iw, "_stored_", format, winner));
+      }
+    };
+    EXPECT_EQ((std::vector<bool>{moveEpoch, moveEpoch}), mergeStoredCopies(iw));
+    EXPECT_EQ(1, probe.attempts);
+    EXPECT_GT(probe.trainedBytes, 0u);
+    auto stored = defaultStored(snapshots.readers.getReader()->segments()[0].postingsReader());
+    EXPECT_EQ(moveEpoch ? std::string_view{} : winner->bytes(), stored->dictionary());
+    expectBodies(*stored, 4096);
+  }
+}
+
+TEST_F(StoredFieldsTest, bootstrapPublicationSurvivesAFailedMerge) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  auto format = DICT_FORMAT;
+  format.dictionaryBytes = 1024;
+  IndexWriter iw(snapshots, dictionarySchema(format));
+  addBodySegment(iw, 0, 2048);
+  addBodySegment(iw, 2048, 2048);
+  {
+    ExpectLog quiet("injected dictionary merge failure");
+    Signal::listen("storedFieldsMergeSource", [](void*, void*, void*) -> void* {
+      throw std::runtime_error("injected dictionary merge failure");
+    });
+    auto cleanup = scope_guard([] { Signal::unlisten("storedFieldsMergeSource"); });
+    iw.mergeSegments();
+  }
+  ASSERT_EQ(2u, snapshots.readers.getReader()->segments().size());
+  auto dictionary = iw.storedDictionaries.lookup("_stored_", format);
+  ASSERT_NE(nullptr, dictionary);
+  addBodySegment(iw, 4096, 8);
+  EXPECT_EQ((std::vector<bool>{false, false, true}), mergeStoredCopies(iw));
+  EXPECT_EQ(dictionary->bytes(), defaultStored(snapshots.readers.getReader()->segments()[0].postingsReader())->dictionary());
+}
+
+TEST_F(StoredFieldsTest, bootstrapFullSampleReservesTrainingPeakAndCapsDictionary) {
+  RAMDir dir;
+  IndexRamBudget budget(64 * 1024 * 1024);
+  CommitSnapshotRegistry snapshots(dir);
+  auto format = DICT_FORMAT;
+  format.dictionaryBytes = 262144;
+  IndexWriter iw(snapshots, dictionarySchema(format), &budget);
+  auto body = bigStoredValue();
+  for (int source = 0; source < 2; source++) {
+    auto& inv = iw.obtainInverter();
+    for (int doc = 0; doc < 128; doc++) {
+      inv.startDoc();
+      inv.getIndexHandler("body").index(inv, std::string_view(body));
+      inv.finishDoc();
+    }
+    iw.releaseInverter(inv, true);
+    iw.commit();
+  }
+  StoredBootstrapProbe probe;
+  probe.onTrained = [&] { EXPECT_GE(budget.reservedBytes(), probe.costs[0]); };
+  iw.mergeSegments();
+  auto dictionary = iw.storedDictionaries.lookup("_stored_", format);
+  ASSERT_NE(nullptr, dictionary);
+  EXPECT_EQ(1, probe.attempts);
+  EXPECT_EQ(8u * 1024 * 1024, probe.sample.size());
+  EXPECT_LE(dictionary->bytes().size(), probe.sample.size() / 100);
+  RecordProperty("dictionary_training_ms", std::to_string(probe.trainingMs));
+  RecordProperty("sample_bytes", std::to_string(probe.sample.size()));
+  RecordProperty("bootstrap_batch_bytes", std::to_string(probe.costs[0]));
+  auto stored = defaultStored(snapshots.readers.getReader()->segments()[0].postingsReader());
+  EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{{"body", body}}), readStored(*stored, 255).flat());
+}
+
+TEST_F(StoredFieldsTest, registryFreshFlushesHaveNoDictionary) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter iw(snapshots, dictionarySchema());
+  addBodySegment(iw, 0, 8);
+  addBodySegment(iw, 8, 8);
+  auto reader = snapshots.readers.getReader();
+  for (auto& seg : reader->segments()) EXPECT_TRUE(defaultStored(seg.postingsReader())->dictionary().empty());
+  EXPECT_EQ((std::vector<bool>{true, true}), mergeStoredCopies(iw));
+  EXPECT_TRUE(defaultStored(snapshots.readers.getReader()->segments()[0].postingsReader())->dictionary().empty());
+}
+
+TEST_F(StoredFieldsTest, registryFlushesShareDictionaryAndMergeCopies) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter iw(snapshots, dictionarySchema());
+  auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
+  ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
+  addBodySegment(iw, 0, 8);
+  addBodySegment(iw, 8, 8);
+  auto reader = snapshots.readers.getReader();
+  ASSERT_EQ(2u, reader->segments().size());
+  for (auto& seg : reader->segments()) EXPECT_EQ(bytes->bytes(), defaultStored(seg.postingsReader())->dictionary());
+  EXPECT_EQ((std::vector<bool>{true, true}), mergeStoredCopies(iw));
+  auto merged = defaultStored(snapshots.readers.getReader()->segments()[0].postingsReader());
+  EXPECT_EQ(bytes->bytes(), merged->dictionary());
+  expectBodies(*merged, 16);
+  merged.reset();
+  iw.testDeleteAllData();
+  EXPECT_EQ(nullptr, iw.storedDictionaries.lookup("_stored_", DICT_FORMAT));
+  EXPECT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
+}
+
+TEST_F(StoredFieldsTest, registryWriterKeepsPinAfterClear) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter iw(snapshots, dictionarySchema());
+  auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
+  ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
+  auto& inv = iw.obtainInverter();
+  addBodyDoc(inv, 0); // creates and pins the resource writer, before the clear
+  auto changed = DICT_FORMAT;
+  changed.dictionaryBytes *= 2;
+  iw.setSchema(dictionarySchema(changed));
+  EXPECT_EQ(nullptr, iw.storedDictionaries.lookup("_stored_", changed));
+  for (int doc = 1; doc < 8; doc++) addBodyDoc(inv, doc);
+  iw.releaseInverter(inv, true);
+  iw.commit();
+  EXPECT_EQ(bytes->bytes(), defaultStored(snapshots.readers.getReader()->segments()[0].postingsReader())->dictionary());
+  addBodySegment(iw, 8, 8);
+  EXPECT_EQ((std::vector<bool>{false, true}), mergeStoredCopies(iw));
+  auto merged = defaultStored(snapshots.readers.getReader()->segments()[0].postingsReader());
+  EXPECT_TRUE(merged->dictionary().empty());
+  expectBodies(*merged, 16);
+}
+
+TEST_F(StoredFieldsTest, registrySchemaInvalidatesOnlyAffectedPolicy) {
+  auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
+  for (int edit = 0; edit < 6; edit++) {
+    SCOPED_TRACE(edit);
+    RAMDir dir;
+    CommitSnapshotRegistry snapshots(dir);
+    IndexWriter iw(snapshots, dictionarySchema(DICT_FORMAT, DICT_FORMAT));
+    ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
+    ASSERT_TRUE(publishStoredDictionary(iw, "_stored_extra_", DICT_FORMAT, bytes));
+    auto original = iw.storedDictionaries.lookup("_stored_", DICT_FORMAT);
+    auto before = *iw.storedDictionaries.token("_stored_extra_", DICT_FORMAT);
+    std::optional<StoredChunkFormat> changed = DICT_FORMAT;
+    if (edit == 0) changed->dictionaryBytes *= 2;
+    if (edit == 1) changed->dictionaryBytes = 0;
+    if (edit == 2) { changed->codec = StoredChunkFormat::LZ4; changed->dictionaryBytes = 0; }
+    if (edit == 3) changed.reset();
+    if (edit == 4) { changed->zstdLevel = 7; changed->chunkTarget *= 2; changed->maxDocsPerChunk *= 2; }
+    iw.setSchema(dictionarySchema(DICT_FORMAT, changed, edit == 5));
+    EXPECT_EQ(original, iw.storedDictionaries.lookup("_stored_", DICT_FORMAT));
+    if (edit < 4) {
+      EXPECT_EQ(nullptr, iw.storedDictionaries.lookup("_stored_extra_", DICT_FORMAT));
+      iw.setSchema(dictionarySchema(DICT_FORMAT, DICT_FORMAT));
+      EXPECT_NE(before.epoch, iw.storedDictionaries.token("_stored_extra_", DICT_FORMAT)->epoch);
+      EXPECT_FALSE(iw.storedDictionaries.publish("_stored_extra_", before, bytes));
+    } else {
+      EXPECT_EQ(before.epoch, iw.storedDictionaries.token("_stored_extra_", *changed)->epoch);
+      EXPECT_EQ(bytes->bytes(), iw.storedDictionaries.lookup("_stored_extra_", *changed)->bytes());
+      EXPECT_EQ(bytes->bytes(), iw.storedDictionaries.lookup("_stored_extra_", DICT_FORMAT)->bytes());
+    }
+  }
+}
+
+TEST_F(StoredFieldsTest, registryPublishChecksEpochFormatAndEmptySlot) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter iw(snapshots, dictionarySchema());
+  auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
+  auto before = *iw.storedDictionaries.token("_stored_", DICT_FORMAT);
+  auto changed = DICT_FORMAT;
+  changed.zstdLevel++;
+  snapshots.onChange = [&] {
+    EXPECT_FALSE(iw.storedDictionaries.publish("_stored_", before, bytes));
+  };
+  iw.setSchema(dictionarySchema(changed));
+  snapshots.onChange = {};
+  EXPECT_FALSE(iw.storedDictionaries.publish("_stored_", before, bytes)); // same epoch, different format
+  changed.dictionaryBytes *= 2;
+  iw.setSchema(dictionarySchema(changed));
+  iw.setSchema(dictionarySchema()); // policy A -> B -> A, with an empty slot throughout
+  EXPECT_FALSE(iw.storedDictionaries.publish("_stored_", before, bytes));
+  auto current = *iw.storedDictionaries.token("_stored_", DICT_FORMAT);
+  EXPECT_NE(before.epoch, current.epoch);
+  EXPECT_TRUE(iw.storedDictionaries.publish("_stored_", current, bytes));
+  EXPECT_FALSE(iw.storedDictionaries.publish("_stored_", current, bytes));
+}
+
+TEST_F(StoredFieldsTest, registryPreparedDictionariesSharedBySettings) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter iw(snapshots, dictionarySchema());
+  auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
+  ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
+  std::array<std::shared_ptr<const StoredCompressionDictionary>, 8> pins;
+  std::barrier start((int)pins.size());
+  std::vector<std::thread> threads;
+  for (size_t i = 0; i < pins.size(); i++) threads.emplace_back([&, i] {
+    start.arrive_and_wait();
+    pins[i] = iw.storedDictionaries.lookup("_stored_", DICT_FORMAT);
+  });
+  for (auto& thread : threads) thread.join();
+  ASSERT_NE(nullptr, pins[0]);
+  for (auto& pin : pins) EXPECT_EQ(pins[0], pin);
+  for (int part : {0, 1}) {
+    auto other = DICT_FORMAT;
+    if (part == 0) other.zstdLevel++;
+    else other.chunkTarget *= 2;
+    auto prepared = iw.storedDictionaries.lookup("_stored_", other);
+    EXPECT_NE(pins[0], prepared);
+    EXPECT_EQ(prepared, iw.storedDictionaries.lookup("_stored_", other));
+    EXPECT_TRUE(prepared->matches(other));
+    EXPECT_EQ(bytes->bytes(), prepared->bytes());
+  }
+}
+
+TEST_F(StoredFieldsTest, registryUnchangedOnFailedSchemaPublication) {
+  auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
+  for (auto signal : {"manifestSynced", "manifestDurable"}) {
+    SCOPED_TRACE(signal);
+    RAMDir dir;
+    CommitSnapshotRegistry snapshots(dir);
+    IndexWriter iw(snapshots, dictionarySchema());
+    ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, bytes));
+    auto before = *iw.storedDictionaries.token("_stored_", DICT_FORMAT);
+    auto pinned = iw.storedDictionaries.lookup("_stored_", DICT_FORMAT);
+    Signal::listen(signal, [&](void* source, void*, void*) -> void* {
+      if (source == &iw) throw std::runtime_error("injected schema publication failure");
+      return nullptr;
+    });
+    auto cleanup = scope_guard([&] { Signal::unlisten(signal); });
+    auto changed = DICT_FORMAT;
+    changed.dictionaryBytes *= 2;
+    EXPECT_THROW(iw.setSchema(dictionarySchema(changed)), std::runtime_error);
+    EXPECT_EQ(before.epoch, iw.storedDictionaries.token("_stored_", DICT_FORMAT)->epoch);
+    EXPECT_EQ(pinned, iw.storedDictionaries.lookup("_stored_", DICT_FORMAT));
+  }
+}
+
+TEST_F(StoredFieldsTest, registryReopenUsesLargestLiveChunkRegionThenLowestId) {
+  auto a = std::make_shared<const StoredDictionary>(std::string(4096, 'a'));
+  auto b = std::make_shared<const StoredDictionary>(std::string(4096, 'b'));
+  for (bool tie : {false, true}) {
+    SCOPED_TRACE(tie);
+    RAMDir dir;
+    int64_t liveBytes = 0;
+    std::shared_ptr<const StoredCompressionDictionary> pin;
+    {
+      CommitSnapshotRegistry snapshots(dir);
+      IndexWriter iw(snapshots, dictionarySchema());
+      ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", DICT_FORMAT, a));
+      addBodySegment(iw, 0, tie ? 8 : 128);
+      auto changed = DICT_FORMAT;
+      changed.dictionaryBytes *= 2;
+      iw.setSchema(dictionarySchema(changed));
+      ASSERT_TRUE(publishStoredDictionary(iw, "_stored_", changed, b));
+      if (tie) {
+        addBodySegment(iw, 0, 8);
+      } else {
+        std::mt19937 random(0);
+        std::string body(1024, ' ');
+        for (size_t i = 0; i < body.size(); i++) body[i] = i % 64 == 63 ? ' ' : (char)('a' + random() % 26);
+        auto& inv = iw.obtainInverter();
+        for (int doc = 0; doc < 8; doc++) {
+          inv.startDoc();
+          inv.getIndexHandler("body").index(inv, std::string_view(body));
+          inv.finishDoc();
+        }
+        iw.releaseInverter(inv, true);
+        iw.commit();
+      }
+      auto reader = snapshots.readers.getReader();
+      auto first = defaultStored(reader->segments()[0].postingsReader());
+      auto second = defaultStored(reader->segments()[1].postingsReader());
+      if (tie) {
+        ASSERT_EQ(first->chunkRegionBytes(), second->chunkRegionBytes());
+      } else {
+        ASSERT_GT(first->numChunks(), second->numChunks());
+        ASSERT_GT(first->maxDoc(), second->maxDoc());
+        ASSERT_LT(first->chunkRegionBytes(), second->chunkRegionBytes());
+      }
+      liveBytes = second->chunkRegionBytes();
+      iw.setSchema(dictionarySchema()); // leave no current handle to carry through reopen
+      EXPECT_EQ(nullptr, iw.storedDictionaries.lookup("_stored_", DICT_FORMAT));
+    }
+    // An unreferenced, larger segment must not seed the registry.
+    auto orphanBytes = std::make_shared<const StoredDictionary>(std::string(4096, 'c'));
+    auto orphan = std::make_shared<const StoredCompressionDictionary>(orphanBytes, DICT_FORMAT);
+    std::vector<std::string> docs(4096, "orphan");
+    writeStoredSegment(dir, DICT_FORMAT, orphan, docs, 99);
+    {
+      PostingsReader reader(dir, 99);
+      ASSERT_GT(defaultStored(reader)->chunkRegionBytes(), liveBytes);
+    }
+    {
+      CommitSnapshotRegistry snapshots(dir);
+      IndexWriter iw(snapshots);
+      pin = iw.storedDictionaries.lookup("_stored_", DICT_FORMAT);
+      ASSERT_NE(nullptr, pin);
+      EXPECT_EQ((tie ? a : b)->bytes(), pin->bytes());
+      addBodySegment(iw, 136, 8);
+      auto reader = snapshots.readers.getReader();
+      EXPECT_EQ(pin->bytes(), defaultStored(reader->segments().back().postingsReader())->dictionary());
+    }
+    dir.clear(); // prepared dictionary must own bytes after segment mappings die
+    RAMDir output;
+    writeStoredSegment(output, DICT_FORMAT, pin, docs);
+    PostingsReader reader(output, 1);
+    auto stored = defaultStored(reader);
+    EXPECT_EQ(pin->bytes(), stored->dictionary());
+    EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{{"body", "orphan"}}), readStored(*stored, 0).flat());
+  }
+}
+
+TEST_F(StoredFieldsTest, pinnedDictionaryRoundTrip) {
+  auto trained = trainStoredDictionary();
+  ASSERT_FALSE(trained.empty());
+  ASSERT_NE(0u, ZSTD_getDictID_fromDict(trained.data(), trained.size()));
+  std::vector<std::string> docs(16, "log line status=200 path=/api/v1/items" + std::string(300, 'x'));
+  docs[5] = bigStoredValue();
+  for (int level : {1, 7}) {
+    for (uint32_t target : {1024u, 4096u}) {
+      SCOPED_TRACE(std::to_string(level) + "/" + std::to_string(target));
+      auto format = DICT_FORMAT;
+      format.zstdLevel = level;
+      format.chunkTarget = target;
+      format.maxDocsPerChunk = 128;
+      auto bytes = std::make_shared<const StoredDictionary>(trained);
+      std::weak_ptr<const StoredDictionary> pin = bytes;
+      auto prepared = std::make_shared<const StoredCompressionDictionary>(bytes, format);
+      bytes.reset();
+      ASSERT_FALSE(pin.expired());
+      RAMDir dir;
+      writeStoredSegment(dir, format, std::move(prepared), docs);
+      EXPECT_TRUE(pin.expired());
+      PostingsReader postings(dir, 1);
+      auto stored = defaultStored(postings);
+      ASSERT_NE(nullptr, stored);
+      EXPECT_EQ(trained, stored->dictionary());
+      EXPECT_TRUE(stored->format().sameLayout(format));
+      EXPECT_EQ(0u, stored->format().dictionaryBytes);  // policy is not segment metadata
+      EXPECT_GE(stored->maxChunkBytes(), (int64_t)docs[5].size());
+      for (size_t doc = 0; doc < docs.size(); doc++) {
+        EXPECT_EQ((std::vector<std::pair<std::string, std::string>>{{"body", docs[doc]}}),
+                  readStored(*stored, (int32_t)doc).flat());
+      }
+      std::vector<int64_t> firstDocs, offsets;
+      stored->readChunkDirectory(firstDocs, offsets);
+      offsets.push_back(stored->chunkRegionBytes());
+      for (size_t chunk = 0; chunk + 1 < offsets.size(); chunk++) {
+        const char* frame = stored->chunkRegionPtr() + offsets[chunk] + sizeof(int32_t);
+        size_t size = (size_t)(offsets[chunk + 1] - offsets[chunk]) - sizeof(int32_t);
+        EXPECT_EQ(0u, ZSTD_getDictID_fromFrame(frame, size));
+      }
+    }
+  }
+}
+
+TEST_F(StoredFieldsTest, copyRequiresMatchingLayoutAndDictionaryBytes) {
+  auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
+  ASSERT_FALSE(bytes->bytes().empty());
+  auto prepared = std::make_shared<const StoredCompressionDictionary>(bytes, DICT_FORMAT);
+  RAMDir dir;
+  PostingsWriter postings(dir, 1);
+  StoredFieldsWriter stored(postings, "_stored_", DICT_FORMAT, prepared);
+  auto other = DICT_FORMAT;
+  other.dictionaryBytes = 0;
+  other.zstdLevel = 7;
+  EXPECT_TRUE(DICT_FORMAT.sameLayout(other));
+  std::string identical(bytes->bytes());
+  EXPECT_TRUE(stored.canCopyChunks(other, identical));
+  identical.back() ^= 1;
+  EXPECT_FALSE(stored.canCopyChunks(other, identical));
+  EXPECT_FALSE(stored.canCopyChunks(other, {}));
+  for (int part : {0, 1, 2}) {
+    other = DICT_FORMAT;
+    if (part == 0) other.codec = StoredChunkFormat::LZ4;
+    if (part == 1) other.chunkTarget *= 2;
+    if (part == 2) other.maxDocsPerChunk *= 2;
+    EXPECT_FALSE(stored.canCopyChunks(other, bytes->bytes()));
+  }
+}
+
+TEST_F(StoredFieldsTest, emptyDictionarySourcesCopyAcrossPolicyChanges) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter iw(snapshots, withStoredFormat(DICT_FORMAT));
+  addBodySegment(iw, 0, 8);
+  auto plain = DICT_FORMAT;
+  plain.dictionaryBytes = 0;
+  iw.setSchema(withStoredFormat(plain));
+  addBodySegment(iw, 8, 8);
+  iw.setSchema(withStoredFormat(DICT_FORMAT));
+  EXPECT_EQ((std::vector<bool>{true, true}), mergeStoredCopies(iw));
+  auto reader = snapshots.readers.getReader();
+  auto stored = defaultStored(reader->segments()[0].postingsReader());
+  EXPECT_TRUE(stored->dictionary().empty());
+  expectBodies(*stored, 16);
+}
+
+TEST_F(StoredFieldsTest, corruptDictionarySizeRejected) {
+  RAMDir dir;
+  std::vector<std::string> docs{"log line status=200 path=/api/v1/items"};
+  writeStoredSegment(dir, DICT_FORMAT, {}, docs);
+  PostingsReader postings(dir, 1);
+  const auto* field = postings.fieldInfo("_stored_");
+  auto input = postings.getInputStream(field->columnLoc.filenum());
+  const char* ptr = input.ptr((int64_t)field->columnLoc.offset() + field->columnMetaOff);
+  const char* end = input.ptr(input.size());
+  InputStream::readVlong(ptr, end);  // max chunk bytes
+  InputStream::readVint(ptr, end);   // dirty count
+  ptr++;                           // codec
+  InputStream::readVint(ptr, end);  // chunk target
+  InputStream::readVint(ptr, end);  // max docs
+  ASSERT_GE(end - ptr, 5);
+  memcpy(const_cast<char*>(ptr), "\xff\xff\xff\xff\x0f", 5);  // UINT32_MAX
+  PostingsReader corrupt(dir, 1);
+  EXPECT_THROW(corrupt.fieldInfo("_stored_"), std::runtime_error);
+  EXPECT_EQ(0u, corrupt.fieldCacheStats().entries);
+}
+
+TEST_F(StoredFieldsTest, storedMetadataCacheSharedAndAccounted) {
+  RAMDir dir;
+  auto bytes = std::make_shared<const StoredDictionary>(trainStoredDictionary());
+  auto prepared = std::make_shared<const StoredCompressionDictionary>(bytes, DICT_FORMAT);
+  std::vector<std::string> docs{"log line status=200 path=/api/v1/items"};
+  writeStoredSegment(dir, DICT_FORMAT, prepared, docs);
+  auto before = fieldMetadataMemory.entryBytes.load();
+  {
+    PostingsReader postings(dir, 1);
+    EXPECT_EQ(0u, postings.fieldCacheStats().entries);
+    std::array<const PostingsReader::Field*, 8> fields{};
+    std::barrier start(8);
+    std::vector<std::jthread> threads;
+    for (size_t i = 0; i < fields.size(); i++) {
+      threads.emplace_back([&, i] {
+        start.arrive_and_wait();
+        fields[i] = postings.fieldInfo("_stored_");
+      });
+    }
+    threads.clear();
+    ASSERT_NE(nullptr, fields[0]);
+    ASSERT_TRUE(fields[0]->stored->ddict.has_value());
+    for (auto* field : fields) EXPECT_EQ(fields[0], field);
+    auto stats = postings.fieldCacheStats();
+    EXPECT_EQ(1u, stats.entries);
+    EXPECT_GT(stats.entryBytes, sizeof(PostingsReader::Field) + sizeof(StoredFieldsMetadata)
+              + ZSTD_sizeof_DDict(fields[0]->stored->ddict->get()));
+    EXPECT_GT(stats.bytes, stats.entryBytes);
+    EXPECT_EQ(before + stats.entryBytes, fieldMetadataMemory.entryBytes.load());
+  }
+  EXPECT_EQ(before, fieldMetadataMemory.entryBytes.load());
+}
+
 // End-to-end: a STORED TEXT field should come back in search results when
 // requested via TopDocs.fields.
 class StoredFieldsSearchTest : public luxir::LuxirTest {};
+
+TEST_F(StoredFieldsSearchTest, bootstrapSkipsDeletedEmptyAndPaddingDocs) {
+  using namespace luxir::test;
+  CollectionHelper helper;
+  helper.collection().setSchema(dictionarySchema());
+  std::vector<Doc> docs;
+  for (int doc = 0; doc < 32; doc++) docs.push_back(flatdoc("id", std::to_string(doc)));
+  docs[5] = flatdoc("id", "5", "body", "keep-first");
+  docs[9] = flatdoc("id", "9", "body", "DELETED_MARKER " + std::string(40000, ' '));
+  docs[23] = flatdoc("id", "23", "body", "keep-last");
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "without-resource"), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("9", UpdateMessage::COMMIT).success);
+  StoredBootstrapProbe probe;
+  helper.getIndexWriter()->mergeSegments();
+  EXPECT_EQ(0, probe.attempts);
+  EXPECT_EQ(27u, probe.sample.size()); // two field headers and their nonempty values
+  EXPECT_NE(std::string::npos, probe.sample.find("keep-first"));
+  EXPECT_NE(std::string::npos, probe.sample.find("keep-last"));
+  EXPECT_EQ(std::string::npos, probe.sample.find("DELETED_MARKER"));
+}
 
 // A segment with deletions cannot be chunk-copied (doc ids compact); the merge
 // re-adds its live docs and the deleted doc's values must not survive.

@@ -743,6 +743,17 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
     }
     format.maxDocsPerChunk = (uint32_t)*def.max_docs_per_chunk;
   }
+  if (def.zstd_dictionary.value_or(false)) {
+    if (codec != StoredCodec::ZSTD) fail("zstd_dictionary requires codec zstd");
+    format.dictionaryBytes = StoredChunkFormat::DEFAULT_DICTIONARY_BYTES;
+  }
+  if (def.zstd_dictionary_bytes) {
+    if (!format.dictionaryBytes) fail("zstd_dictionary_bytes requires zstd_dictionary: true");
+    if (*def.zstd_dictionary_bytes < 1024 || *def.zstd_dictionary_bytes > 262144) {
+      fail("zstd_dictionary_bytes must be 1024 to 262144");
+    }
+    format.dictionaryBytes = (uint32_t)*def.zstd_dictionary_bytes;
+  }
   return std::make_shared<StoredFieldType>(name, format);
 }
 

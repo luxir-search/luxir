@@ -193,6 +193,32 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     publish(recovered, arena);
   }
   snapshots.sweepOrphans(manifest);
+  storedDictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*getSchema()));
+  // Only manifest-live segments can seed a resource. Own the winning bytes;
+  // later retirement of its segment must not affect inverter/merge writers.
+  for (const auto& [name, type] : getSchema()->fieldTypeMap) {
+    auto* stored = dynamic_cast<const StoredFieldType*>(type.get());
+    if (!stored || !stored->format_.dictionaryBytes) continue;
+    std::string_view bestDictionary;
+    int64_t bestBytes = -1;
+    uint64_t bestSegId = 0;
+    for (const auto& [id, seg] : segInfos) {
+      auto reader = getSegmentPostingsReader(*seg);
+      const auto* field = reader->fieldInfo(name);
+      if (!field || !field->stored || field->stored->dictionary.empty()) continue;
+      auto bytes = field->columnMetaOff;
+      if (bytes > bestBytes || (bytes == bestBytes && id < bestSegId)) {
+        bestBytes = bytes;
+        bestSegId = id;
+        bestDictionary = field->stored->dictionary;
+      }
+    }
+    auto token = storedDictionaries.token(name, stored->format_);
+    if (!bestDictionary.empty() && token) {
+      storedDictionaries.publish(name, *token,
+          std::make_shared<const StoredDictionary>(std::string(bestDictionary)));
+    }
+  }
   {
     std::lock_guard<std::mutex> lock(indexMutex);
     seedActiveVectorOverlayNamesFromManifestLocked();
@@ -612,7 +638,10 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion, std::shared_ptr<Sc
   }
   if (!inverter) {
     auto newInverter = std::make_unique<Inverter>(
-        dir, ++lastSegId, pinned, indexRamBudget);
+        dir, ++lastSegId, pinned, indexRamBudget,
+        [this](std::string_view resource, const StoredChunkFormat& format) {
+          return storedDictionaries.lookup(resource, format);
+        });
     inverter = newInverter.get();
     inverter->updateVersions(updateVersion);
     busyInverters.emplace(inverter, std::move(newInverter));
@@ -1897,6 +1926,8 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   auto previousSchema = previous ? previous->schema : nullptr;
   schema = schema ? schema->withHistory(previousSchema ? previousSchema->gen_ + 1 : 1,
       previousSchema.get()) : previousSchema;
+  std::optional<StoredDictionaryRegistry::SchemaState> dictionarySlots;
+  if (schema != previousSchema) dictionarySlots = StoredDictionaryRegistry::prepareSchema(*schema);
   info.version = 1;
   info.index_gen = ++nextManifestGen;
   info.schema_gen = schema->gen_;
@@ -2007,6 +2038,9 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       lastCommitTime = info.commit_time;
       commitCount.fetch_add(1, std::memory_order_relaxed);
     }
+    // The remaining stores/notification do not throw. Advance registry formats
+    // first, so observing the new schema cannot admit an old-format CAS.
+    if (dictionarySlots) storedDictionaries.setSchema(std::move(*dictionarySlots));
     lastSnapshot.store(snapshot);
     snapshots.publish(snapshot);
   } catch (...) {
@@ -2362,7 +2396,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       auto mergeSchema = getSchema();
       SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget,
                            termPartitionMinBytes, termPartitionMinRangeBytes,
-                           termPartitionMaxRanges, *mergeSchema);
+                           termPartitionMaxRanges, *mergeSchema, storedDictionaries);
       merger.merge();
 
       phase = "new_segment_info";
@@ -2727,6 +2761,8 @@ void IndexWriter::testDeleteAllData() {
 
     lastCommitTime = 0;
   }
+  storedDictionaries.setSchema({});
+  storedDictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*getSchema()));
   std::pmr::monotonic_buffer_resource arena;
   api::IndexInfo initial;
   publish(initial, arena);

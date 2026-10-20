@@ -2195,6 +2195,19 @@ message StoredResourceDef {
   // zstd. A chunk closes at whichever of the byte and document limits comes
   // first.
   optional int32 max_docs_per_chunk = 4;
+
+  // Enable one ZSTD dictionary per resource, shared by its segments. The first
+  // merge with at least 100 times the capacity (at most 8 MiB) of live stored
+  // data trains it; earlier segments have none. Helps most with small chunks;
+  // decoding can be slower with large chunks. No automatic retraining: changing
+  // this setting, the capacity or codec clears it for a later merge to retrain.
+  // After restart, use the dictionary from the largest live segment carrying one.
+  // Only valid with codec zstd.
+  optional bool zstd_dictionary = 5;
+
+  // Dictionary capacity upper bound, 1024 to 262144 bytes; absent selects 65536.
+  // Training can produce a smaller dictionary. Only valid with zstd_dictionary.
+  optional int32 zstd_dictionary_bytes = 6;
 }
 
 message SchemaDef {

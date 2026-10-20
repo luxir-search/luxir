@@ -783,6 +783,8 @@ struct StoredResourceDef {
   std::optional<std::int32_t> zstd_level;                       // align 4
   std::optional<std::int32_t> chunk_size_bytes;
   std::optional<std::int32_t> max_docs_per_chunk;
+  std::optional<std::int32_t> zstd_dictionary_bytes;
+  std::optional<bool> zstd_dictionary;                          // align 1
 };
 struct SchemaDef {                                                // needs StoredResourceDef
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;

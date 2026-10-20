@@ -58,6 +58,9 @@ public:
   PostingsWriter postingsWriter;
 
   const std::shared_ptr<Schema> schema;
+  using StoredDictionaryProvider = std::function<std::shared_ptr<const StoredCompressionDictionary>(
+      std::string_view, const StoredChunkFormat&)>;
+  StoredDictionaryProvider storedDictionaryProvider;
 
   // Fixed by ProtoUpdateMessage for the duration of one update so every NOW
   // in every document/value resolves identically. Direct test indexing leaves
@@ -105,12 +108,14 @@ public:
 
   Inverter(luxir::Directory& dir, uint64_t segId,
            const std::function<std::shared_ptr<Schema>()>& schemaProvider = {},
-           IndexRamBudget* ramBudget = nullptr)
-      : Inverter(dir, segId, schemaProvider ? schemaProvider() : Schema::createDefaultSchema(), ramBudget) {}
+           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {})
+      : Inverter(dir, segId, schemaProvider ? schemaProvider() : Schema::createDefaultSchema(),
+                 ramBudget, std::move(dictionaryProvider)) {}
 
   Inverter(luxir::Directory& dir, uint64_t segId, std::shared_ptr<Schema> schema,
-           IndexRamBudget* ramBudget = nullptr)
+           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {})
       : postingsWriter(dir, segId, -1, ramBudget, true), schema(std::move(schema)),
+        storedDictionaryProvider(std::move(dictionaryProvider)),
         ramGuard(ramBudget == nullptr ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)) {}
 
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
@@ -424,8 +429,9 @@ private:
                                               const StoredFieldType* config) {
     auto it = storedFields_.find(resourceName);
     if (it != storedFields_.end()) return *it->second;
-    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName,
-                                                       config ? config->format_ : StoredChunkFormat{});
+    const auto& format = config ? config->format_ : StoredChunkFormat{};
+    auto dictionary = storedDictionaryProvider ? storedDictionaryProvider(resourceName, format) : nullptr;
+    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName, format, std::move(dictionary));
     auto [newIt, _] = storedFields_.emplace(std::string(resourceName), std::move(writer));
     return *newIt->second;
   }

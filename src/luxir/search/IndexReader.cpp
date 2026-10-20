@@ -7,7 +7,6 @@
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/Postings.h"
-#include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
@@ -543,13 +542,13 @@ std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projec
   callOnce(projectableOnce, [this] {
     // Both name sources are views into segment files held open by the
     // segment's PostingsReader: the field index (fi.fieldname) and the stored
-    // resource's metadata (StoredFieldsReader::fieldNames).  No copies needed.
+    // resource's cached metadata. No copies needed.
     std::map<std::string_view, ProjectableField> sources;
     for (auto& seg : segs) {
       auto& postingsReader = seg.postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
       FieldReader fieldReader(postingsReader);
-      while (fieldReader.readNextField()) {
+      for (int32_t ordinal = 0; fieldReader.readNextField(); ordinal++) {
         SegFieldInfo fi;
         fieldReader.readFieldInfo(fi);
         std::string_view physicalName(fi.fieldname.data(), fi.fieldname.size());
@@ -558,8 +557,8 @@ std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projec
           // An empty resource is never written, but guard the reader's
           // precondition anyway.
           if (fi.numValues <= 0) continue;
-          StoredFieldsReader sfr(postingsReader, fi);
-          for (std::string_view name : sfr.fieldNames()) {
+          const auto* field = postingsReader.fieldInfo(ordinal);
+          for (std::string_view name : field->stored->fieldNames) {
             auto& resources = sources[name].storedResources;
             if (std::ranges::find(resources, physicalName) == resources.end()) {
               resources.push_back(physicalName);

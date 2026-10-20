@@ -312,8 +312,10 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
   PostingsWriter writer(outputDir, 900, -1);
   IndexRamBudget budget;
   Schema schema;
+  StoredDictionaryRegistry dictionaries;
+  dictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(schema));
   SegmentMerger merger(readers, liveDocs, writer, budget,
-                       partitioned ? 1 : INT64_MAX, 1, 4, schema);
+                       partitioned ? 1 : INT64_MAX, 1, 4, schema, dictionaries);
   merger.merge();
   writer.finish();
 
@@ -559,7 +561,9 @@ TEST(TermPartitionMergeTest, CoordinatorGrowthIgnoresOccupiedBudget) {
   ASSERT_EQ(cap, budget.reservedBytes());
   RAMDir outputDir;
   PostingsWriter writer(outputDir, 901, -1);
-  SegmentMerger merger(readers, liveDocs, writer, budget, 1, 1, 4, *schema);
+  StoredDictionaryRegistry dictionaries;
+  dictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*schema));
+  SegmentMerger merger(readers, liveDocs, writer, budget, 1, 1, 4, *schema, dictionaries);
   merger.merge();
   writer.finish();
 

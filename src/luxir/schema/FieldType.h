@@ -390,9 +390,9 @@ public:
   bool knnSearchable() const { return metric_ != METRIC_NONE; }
 };
 
-// How a stored-fields resource compresses its chunks.  codec and the two chunk
-// limits are recorded in each segment's resource metadata; the level only
-// affects compression.
+// How a stored-fields resource compresses its chunks.  codec, the two chunk
+// limits are recorded in each segment's resource metadata. The level affects
+// compression, and dictionary capacity is schema training policy.
 struct StoredChunkFormat {
   // Recorded on disk as one byte.
   enum Codec : uint8_t { LZ4 = 0, ZSTD = 1 };
@@ -403,6 +403,7 @@ struct StoredChunkFormat {
   // cost for larger chunks.
   static constexpr uint32_t DEFAULT_ZSTD_CHUNK_TARGET = 64 * 1024;
   static constexpr uint32_t DEFAULT_ZSTD_MAX_DOCS_PER_CHUNK = 1024;
+  static constexpr uint32_t DEFAULT_DICTIONARY_BYTES = 64 * 1024;
 
   Codec codec = LZ4;
   int zstdLevel = DEFAULT_ZSTD_LEVEL;
@@ -411,9 +412,12 @@ struct StoredChunkFormat {
   // Hard cap on docs per chunk.  A chunk flushes when *either* the byte
   // target or this doc count is reached, whichever comes first.
   uint32_t maxDocsPerChunk = DEFAULT_MAX_DOCS_PER_CHUNK;
+  // ZSTD only: dictionary training capacity; 0 disables dictionaries.
+  uint32_t dictionaryBytes = 0;
 
   // Same chunk bytes and boundaries: compressed chunks of one format can be
-  // copied verbatim into a writer of the other.  The level is not part of it.
+  // copied verbatim into a writer of the other, provided both segments hold
+  // the same trained dictionary.  The level is not part of it.
   bool sameLayout(const StoredChunkFormat& o) const {
     return codec == o.codec && chunkTarget == o.chunkTarget && maxDocsPerChunk == o.maxDocsPerChunk;
   }

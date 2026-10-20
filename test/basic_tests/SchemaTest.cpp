@@ -1247,6 +1247,12 @@ TEST_F(SchemaTest, storedResourcesRoundTripAndSetMerge) {
   EXPECT_EQ((StoredChunkFormat{StoredChunkFormat::ZSTD, 3, 65536, 1024}), storedType(*set, "_stored_").format_);
   EXPECT_EQ(9, storedType(*set, "_stored_logs_").format_.zstdLevel);
   EXPECT_EQ(nullptr, schemaJson(R"({"fields":{}})")->getFieldTypePtr("_stored_logs_"));
+
+  auto dict = schemaJson(R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_dictionary":true},
+    "_stored_small_":{"codec":"zstd","zstd_dictionary":true,"zstd_dictionary_bytes":16384}}})");
+  EXPECT_EQ(65536u, storedType(*dict, "_stored_").format_.dictionaryBytes);
+  EXPECT_EQ(16384u, storedType(*dict, "_stored_small_").format_.dictionaryBytes);
+  EXPECT_EQ(dict->sourceDef_, schemaJson(authoredJson(*dict))->sourceDef_);
 }
 
 TEST_F(SchemaTest, storedResourcesValidation) {
@@ -1258,6 +1264,10 @@ TEST_F(SchemaTest, storedResourcesValidation) {
       R"({"stored_resources":{"_stored_":{"chunk_size_bytes":4194305}}})",
       R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":0}}})",
       R"({"stored_resources":{"_stored_":{"max_docs_per_chunk":65537}}})",
+      R"({"stored_resources":{"_stored_":{"zstd_dictionary":true}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_dictionary_bytes":4096}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_dictionary":true,"zstd_dictionary_bytes":1023}}})",
+      R"({"stored_resources":{"_stored_":{"codec":"zstd","zstd_dictionary":true,"zstd_dictionary_bytes":262145}}})",
       R"({"stored_resources":{"bad-name":{}}})",
       // Names must be '_name_': neither a field name nor a suffix template.
       R"({"stored_resources":{"cold":{}}})",

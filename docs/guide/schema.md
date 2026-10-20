@@ -328,18 +328,44 @@ POST /collections/logs/_schema
 | `zstd_level` | `zstd` only: 1 (fastest) to 22 (smallest); default 3 |
 | `chunk_size_bytes` | target uncompressed bytes per chunk, 1024 to 4194304; default 16384, or 65536 with `zstd` |
 | `max_docs_per_chunk` | most documents per chunk, 1 to 65536; default 128, or 1024 with `zstd` |
+| `zstd_dictionary` | `zstd` only: enable one dictionary per resource, shared by its segments; trained by a merge |
+| `zstd_dictionary_bytes` | dictionary capacity upper bound, 1024 to 262144; default 65536. Requires `zstd_dictionary` |
 
 Larger chunks compress better, but returning one stored document decompresses
 its whole chunk. Chunks are compressed as documents are indexed, so the codec
 and level also set indexing cost; levels above the default compress much more
 slowly for little further gain. Each segment records its codec and chunk
 limits, so a change applies to segments written afterwards. A merge copies
-compressed chunks from inputs that already match its output codec and chunk
-limits and recompresses the others; the level alone does not trigger
+compressed chunks from inputs that already match its output codec, chunk
+limits and dictionary and recompresses the others; the level alone does not trigger
 recompression. Inputs where more than 1% of chunks were sealed before filling
 (each small flush ends in one) are also recompressed, so documents indexed a
 few at a time still end up in full-size chunks. `mode=set` replaces the named
 entries and keeps the others.
+
+A dictionary holds text shared by documents of a resource, such as common
+values and log templates, so chunks can refer to it. That matters most for
+small chunks, which compress poorly on their own.
+For retrieval-heavy workloads (many single-document fetches), prefer small
+chunks plus a dictionary over large chunks:
+
+```json
+"stored_resources": {
+  "_stored_": {"codec": "zstd", "zstd_dictionary": true,
+               "chunk_size_bytes": 4096, "max_docs_per_chunk": 32}
+}
+```
+
+The first merge with at least 100 times the configured capacity (at most
+8 MiB) of live stored data trains the resource's dictionary. Earlier segments
+have none; later segments share the dictionary and each stores its bytes once.
+Capacity is an upper bound: training can produce a smaller dictionary. The
+benefit is greatest with small chunks; with large chunks, decoding can be slower.
+
+There is no automatic retraining. Changing `zstd_dictionary`,
+`zstd_dictionary_bytes` or the codec clears the current dictionary so a later
+merge can train another. After a restart, the dictionary from the largest
+live segment carrying one is used.
 
 ## Text analysis
 

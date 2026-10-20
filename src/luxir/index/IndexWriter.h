@@ -25,6 +25,7 @@
 #include "luxir/server/LuxirError.h"
 #include "luxir/util/DeadlineScheduler.h"
 #include "Inverter.h"
+#include "StoredDictionaryRegistry.h"
 #include "UpdateMessage.h"
 #include "VectorIndexBuilder.h"
 
@@ -296,6 +297,7 @@ public:
   Directory& dir;
   std::unique_ptr<IndexRamBudget> privateIndexRamBudget;
   IndexRamBudget* indexRamBudget;
+  StoredDictionaryRegistry storedDictionaries;
 
   // the last segId generated. Atomic since we don't grab any lock in the merge code to generate a new segment id.
   std::atomic_uint64_t lastSegId;

@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "IntColWriter.h"
@@ -42,12 +43,15 @@ namespace luxir {
 //   <chunk 1: ...>
 //   ...
 //   <metadata: [vlong maxChunkBytes][varint numDirtyChunks][byte codec]
-//              [varint chunkTarget][varint maxDocsPerChunk][varint numFields]
-//              then numFields PackedTerms (field names keyed by segment-local
-//              stored-field id)>
+//              [varint chunkTarget][varint maxDocsPerChunk]
+//              [varint dictSize][dictSize bytes]
+//              [varint numFields] then numFields PackedTerms (field names
+//              keyed by segment-local stored-field id)>
 //
 // Every chunk of a resource uses the codec recorded in its metadata; the chunk
 // limits are recorded so merges can tell whether chunks may be copied verbatim.
+// The writer pins an optional prepared ZSTD dictionary and uses it from the
+// first chunk. Its bytes are stored once in metadata (dictSize 0 for none).
 // A dirty chunk was sealed before reaching either limit (a segment's last
 // chunk, or the chunk pending before a merge appended copied chunks); copied
 // chunks carry their source's count.  Merges recompress a source with too many
@@ -117,11 +121,16 @@ public:
   // Postings::STORED_DEFAULT_RESOURCE for the canonical default.
   explicit StoredFieldsWriter(PostingsWriter& pw,
                               std::string_view resourceName = Postings::STORED_DEFAULT_RESOURCE,
-                              const StoredChunkFormat& format = {})
+                              const StoredChunkFormat& format = {},
+                              std::shared_ptr<const StoredCompressionDictionary> dictionary = {})
     : postingsWriter(pw),
       resourceName_(resourceName),
-      format_(format)
+      format_(format),
+      compressor(dictionary)
   {
+    if (dictionary && !dictionary->matches(format)) {
+      throw std::invalid_argument("stored fields: dictionary compression parameters do not match format");
+    }
     chunkOutput = postingsWriter.getOutputStream();
     chunksStart = (int64_t)chunkOutput->size();
   }
@@ -180,7 +189,6 @@ public:
       flushChunk();
       numDirtyChunks++;
     }
-
     int32_t numChunks = (int32_t)chunkFirstDocs.size();
     assert(numChunks > 0);
 
@@ -193,6 +201,9 @@ public:
     chunkOutput->write((char)format_.codec);
     chunkOutput->writeVint(format_.chunkTarget);
     chunkOutput->writeVint(format_.maxDocsPerChunk);
+    auto dictionary = compressor.dictionary();
+    chunkOutput->writeVint((uint32_t)dictionary.size());
+    chunkOutput->write(dictionary.data(), dictionary.size());
     chunkOutput->writeVint((uint32_t)fieldNames.size());
     for (const auto& name : fieldNames) {
       chunkOutput->writePackedTerm(name);
@@ -257,12 +268,20 @@ public:
   // chunk-relative) but reference the segment-local field-id table, so a
   // source segment's chunks may be appended verbatim only when its table maps
   // identically into this writer's, and only when the source was written with
-  // the same codec and chunk limits (StoredChunkFormat::sameLayout), so the
-  // output stays uniform.  A merge of such a no-deletions source calls:
+  // the same codec and chunk limits (StoredChunkFormat::sameLayout) and the
+  // same dictionary, so the output stays uniform.  A merge of such a
+  // no-deletions source calls:
   //   0. tooDirty(source counts)        - true means re-add doc by doc
+  //      canCopyChunks(source)          - false means re-add doc by doc
   //   1. adoptFieldTable(source names)  - false means re-add doc by doc
   //   2. alignForRawAppend(docBase)     - seal/pad so chunks cover [0, docBase)
   //   3. appendRawChunkRegion(...)      - bulk-copy chunks, rebase directory
+
+  // Can chunks written in srcFormat with srcDictionary be copied into this
+  // writer? Empty dictionaries compare equal regardless of training policy.
+  bool canCopyChunks(const StoredChunkFormat& srcFormat, std::string_view srcDictionary) const {
+    return srcFormat.sameLayout(format_) && srcDictionary == compressor.dictionary();
+  }
 
   // Adopt the source's field-id table: every existing id must map to the same
   // name; names beyond our table extend it.  Returns false (table unchanged)
@@ -411,21 +430,24 @@ private:
     }
     uncompressedScratch.append(chunkBody);
 
-    int32_t uncompressedSize = (int32_t)uncompressedScratch.size();
-    maxChunkBytes = std::max(maxChunkBytes, (int64_t)uncompressedSize);
-    size_t compressedSize = compressor.compress(format_, uncompressedScratch, compressScratch);
-
-    // Record chunk position before writing (offsets are relative to chunksStart).
-    int64_t chunkFileOffset = (int64_t)chunkOutput->size() - chunksStart;
-    chunkFirstDocs.push_back(chunkFirstDoc);
-    chunkFileOffsets.push_back(chunkFileOffset);
-
-    chunkOutput->writeInt(uncompressedSize);
-    chunkOutput->write(compressScratch.data(), (size_t)compressedSize);
+    maxChunkBytes = std::max(maxChunkBytes, (int64_t)uncompressedScratch.size());
+    writeChunk(chunkFirstDoc, uncompressedScratch);
 
     chunkDocOffsets.clear();
     chunkBody.clear();
     chunkFirstDoc = -1;
+  }
+
+  void writeChunk(int32_t firstDoc, std::string_view uncompressed) {
+    size_t compressedSize = compressor.compress(format_, uncompressed, compressScratch);
+
+    // Record chunk position before writing (offsets are relative to chunksStart).
+    int64_t chunkFileOffset = (int64_t)chunkOutput->size() - chunksStart;
+    chunkFirstDocs.push_back(firstDoc);
+    chunkFileOffsets.push_back(chunkFileOffset);
+
+    chunkOutput->writeInt((int32_t)uncompressed.size());
+    chunkOutput->write(compressScratch.data(), compressedSize);
   }
 
   static void appendVint(std::string& dest, uint32_t val) {

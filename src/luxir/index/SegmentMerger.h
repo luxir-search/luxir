@@ -11,6 +11,7 @@
 #include "BKDWriter.h"
 #include "PointsWriter.h"
 #include "StoredFieldsWriter.h"
+#include "StoredDictionaryRegistry.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/PosEnum.h"
 #include "luxir/reader/NormsReader.h"
@@ -24,6 +25,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -308,6 +310,7 @@ class SegmentMerger {
       int32_t streams = 0;
       std::string name;
       std::vector<MergeFieldInfo> fields;
+      bool bootstrapStoredDictionary = false;
       std::function<void(MergeAdmissionDriver&, Batch&, BatchAdmission&)> body;
     };
 
@@ -554,6 +557,7 @@ class SegmentMerger {
   IndexRamBudget& ramBudget;
   // Current schema, for per-resource stored-fields formats.
   const Schema& schema;
+  StoredDictionaryRegistry& storedDictionaries;
   const uint64_t estimatedOutputBytes;
   const int32_t streamBudget;
   int64_t termPartitionMinBytes;
@@ -569,9 +573,10 @@ public:
   SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
-                int32_t termPartitionMaxRanges, const Schema& schema)
+                int32_t termPartitionMaxRanges, const Schema& schema,
+                StoredDictionaryRegistry& storedDictionaries)
   : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
-    schema(schema),
+    schema(schema), storedDictionaries(storedDictionaries),
     estimatedOutputBytes(estimateOutputBytes(preaders)),
     streamBudget(MergeCostModel::streamBudgetForBytes(estimatedOutputBytes)),
     termPartitionMinBytes(termPartitionMinBytes),
@@ -660,10 +665,18 @@ public:
       // we could bail early.
 
       batch.cost = estimateCost(batch.fields);
+      if (isStoredField(batch.fields[0].segFieldInfo)) {
+        auto format = storedFormat(batch.name);
+        batch.bootstrapStoredDictionary = format.codec == StoredChunkFormat::ZSTD && format.dictionaryBytes
+            && !storedDictionaries.hasDictionary(batch.name, format);
+        if (batch.bootstrapStoredDictionary) batch.cost += StoredChunkCompressor::dictionaryTrainingBytes(format);
+        std::string_view resource = batch.name;
+        Signal::emit("storedFieldsMergePlan", &resource, &batch.cost, &batch.bootstrapStoredDictionary);
+      }
       batch.streams = estimateStreams(batch.fields);
       batch.body = [this](MergeAdmissionDriver& driver, MergeAdmissionDriver::Batch& current,
                           MergeAdmissionDriver::BatchAdmission& admission) {
-        mergeField(current.fields, driver, admission);
+        mergeField(current, driver, admission);
       };
       batches.push_back(std::move(batch));
     }
@@ -1430,9 +1443,10 @@ private:
     }
   };
 
-  void mergeField(std::vector<MergeFieldInfo>& mergeFieldInfos,
+  void mergeField(MergeAdmissionDriver::Batch& batch,
                   MergeAdmissionDriver& admissionDriver,
                   MergeAdmissionDriver::BatchAdmission& admission) {
+    auto& mergeFieldInfos = batch.fields;
     int32_t nDocs = postingsWriter.getMaxDoc();
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
@@ -1444,7 +1458,7 @@ private:
     const auto& firstInfo = mergeFieldInfos[0].segFieldInfo;
     if (firstInfo.type == FieldType::BIN
         && (firstInfo.flags & FieldType::STORED) != 0) {
-      mergeStoredFields(mergeFieldInfos);
+      mergeStoredFields(mergeFieldInfos, batch.bootstrapStoredDictionary);
       return;
     }
 
@@ -1588,6 +1602,91 @@ private:
     return type ? type->format_ : StoredChunkFormat{};
   }
 
+  std::vector<char> sampleStoredFields(std::span<const PostingsReader::Field* const> fields,
+                                       size_t budget) {
+    uint64_t chunks = 0;
+    for (auto* field : fields) if (field) chunks += (uint64_t)field->numValues;
+    std::vector<char> samples;
+    if (!chunks) return samples;
+    samples.reserve(budget);
+    std::unique_ptr<StoredFieldsReader> reader;
+    int source = -1;
+    // Bit-reversed order visits 0, half, quarter, three quarters, ... across
+    // the concatenated chunk ordinals. Skip excess ordinals for non-powers of
+    // two. This spreads the sample without a per-chunk permutation/directory.
+    uint64_t limit = std::bit_ceil(chunks);
+    uint64_t position = 0;
+    for (uint64_t visited = 0; visited < limit && samples.size() < budget; visited++) {
+      if (position < chunks) {
+        uint64_t chunk = position;
+        for (auto& seg : segs) {
+          auto* field = fields[seg.ord];
+          if (!field) continue;
+          if (chunk >= (uint64_t)field->numValues) {
+            chunk -= (uint64_t)field->numValues;
+            continue;
+          }
+          if (source != seg.ord) {
+            reader = std::make_unique<StoredFieldsReader>(*seg.postingsReader, *field);
+            source = seg.ord;
+          }
+          reader->readChunkDocs((int32_t)chunk, [&](int32_t doc, std::string_view encoded) {
+            if (seg.remapDocId(doc).second || encoded.empty() || encoded[0] == 0) return true;
+            size_t bytes = std::min(encoded.size(), budget - samples.size());
+            samples.insert(samples.end(), encoded.data(), encoded.data() + bytes);
+            return samples.size() < budget;
+          });
+          break;
+        }
+      }
+      uint64_t bit = limit >> 1;
+      while (position & bit) { position ^= bit; bit >>= 1; }
+      position ^= bit;
+    }
+    return samples;
+  }
+
+  std::shared_ptr<const StoredCompressionDictionary> storedDictionary(
+      std::string_view resource, const StoredChunkFormat& format,
+      std::span<const PostingsReader::Field* const> fields, bool bootstrap) {
+    auto dictionary = storedDictionaries.lookup(resource, format);
+    if (!bootstrap || dictionary) return dictionary;
+    auto token = storedDictionaries.token(resource, format);
+    if (!token) return {};
+    size_t budget = StoredChunkCompressor::dictionarySampleBudget(format);
+    auto samples = sampleStoredFields(fields, budget);
+    // Group encoded bytes into bounded training blocks. Document boundaries
+    // need no side array, even when millions of tiny docs fill the budget.
+    std::vector<size_t> sizes;
+    if (samples.size() == budget) {
+      size_t block = std::max(StoredChunkCompressor::DICTIONARY_SAMPLE_BYTES,
+          (samples.size() + StoredChunkCompressor::MAX_DICTIONARY_SAMPLES - 1)
+              / StoredChunkCompressor::MAX_DICTIONARY_SAMPLES);
+      sizes.reserve((samples.size() + block - 1) / block);
+      for (size_t offset = 0; offset < samples.size(); offset += block) {
+        sizes.push_back(std::min(block, samples.size() - offset));
+      }
+    }
+    std::string_view sample(samples.data(), samples.size());
+    std::span<const size_t> sampleSizes(sizes);
+    Signal::emit("storedFieldsDictionarySample", &resource, &sample, &sampleSizes);
+    if (!sizes.empty() && !storedDictionaries.hasDictionary(resource, format)) {
+      auto current = storedDictionaries.token(resource, format);
+      if (current && current->epoch == token->epoch) {
+        size_t capacity = std::max((size_t)1024,
+            std::min((size_t)format.dictionaryBytes, samples.size() / 100));
+        auto trained = StoredChunkCompressor::trainDictionary(sample, sizes, capacity);
+        std::string_view bytes(trained);
+        Signal::emit("storedFieldsDictionaryTrained", &resource, &bytes);
+        if (!trained.empty()) {
+          storedDictionaries.publish(resource, *token,
+              std::make_shared<const StoredDictionary>(std::move(trained)));
+        }
+      }
+    }
+    return storedDictionaries.lookup(resource, format);
+  }
+
   // Merge one stored-fields resource (default or named column family).
   // Writes a fresh StoredFieldsWriter for the same resource name in the
   // resource's current format. Sources in that layout within the dirt threshold
@@ -1598,7 +1697,7 @@ private:
   // chunk a merge leaves costs about 100 chunks of later recompression when its
   // segment crosses 1%; this is an amortization rule, not an output invariant.
   // Multi-valued fields keep their grouping through single addValues calls.
-  void mergeStoredFields(std::vector<MergeFieldInfo>& mergeFieldInfos) {
+  void mergeStoredFields(std::vector<MergeFieldInfo>& mergeFieldInfos, bool bootstrap) {
     // Resource name comes from the (identical across segments) field name.
     std::string_view resourceName(mergeFieldInfos[0].segFieldInfo.fieldname);
 
@@ -1606,12 +1705,14 @@ private:
     // segments whose source had no stored-fields resource.  Readers are opened
     // one source segment at a time below so decompressed chunk scratch does not
     // accumulate across sources.
-    std::vector<const SegFieldInfo*> fieldInfos(segs.size());
+    std::vector<const PostingsReader::Field*> fieldInfos(segs.size());
     for (auto& mfi : mergeFieldInfos) {
-      fieldInfos[mfi.seg->ord] = &mfi.segFieldInfo;
+      fieldInfos[mfi.seg->ord] = mfi.seg->postingsReader->fieldInfo(resourceName);
     }
 
-    StoredFieldsWriter writer(postingsWriter, resourceName, storedFormat(resourceName));
+    auto format = storedFormat(resourceName);
+    StoredFieldsWriter writer(postingsWriter, resourceName, format,
+                              storedDictionary(resourceName, format, fieldInfos, bootstrap));
     std::vector<int64_t> srcChunkFirstDocs, srcChunkOffsets;
 
     auto copyable = [&](Segment& seg, const StoredFieldsReader& reader) {
@@ -1621,10 +1722,11 @@ private:
     int bestSource = -1;
     int64_t bestBytes = 0;
     for (auto& seg : segs) {
-      const SegFieldInfo* fieldInfo = fieldInfos[seg.ord];
+      const auto* fieldInfo = fieldInfos[seg.ord];
       if (!fieldInfo) continue;
       StoredFieldsReader reader(*seg.postingsReader, *fieldInfo);
-      if (copyable(seg, reader) && reader.chunkRegionBytes() > bestBytes) {
+      if (copyable(seg, reader) && writer.canCopyChunks(reader.format(), reader.dictionary())
+          && reader.chunkRegionBytes() > bestBytes) {
         bestSource = seg.ord;
         bestBytes = reader.chunkRegionBytes();
       }
@@ -1635,7 +1737,7 @@ private:
     }
 
     for (auto& seg : segs) {
-      const SegFieldInfo* fieldInfo = fieldInfos[seg.ord];
+      const auto* fieldInfo = fieldInfos[seg.ord];
       if (!fieldInfo) continue;  // segment had no stored-fields; writer pads automatically
       StoredFieldsReader reader(*seg.postingsReader, *fieldInfo);
 
@@ -1644,12 +1746,13 @@ private:
       // so the whole source region is copied without decompression - the
       // dominant cost of a large merge is otherwise this resource's serial
       // recompression.  The source must have the output's codec and chunk
-      // limits and few enough dirty (partially filled) chunks, and bodies
-      // reference its field-id table, so it must adopt into ours; deletions,
-      // another layout, too many dirty chunks or a table mismatch fall back to
-      // the doc-by-doc re-add below, which packs these docs with adjacent
-      // re-added sources.
-      bool copy = copyable(seg, reader) && writer.adoptFieldTable(reader.fieldNames());
+      // limits, the same dictionary and few enough dirty (partially filled)
+      // chunks, and bodies reference its field-id table, so it must adopt into
+      // ours; deletions, another layout or dictionary, too many dirty chunks or
+      // a table mismatch fall back to the doc-by-doc re-add below, which packs
+      // these docs with adjacent re-added sources.
+      bool copy = copyable(seg, reader) && writer.canCopyChunks(reader.format(), reader.dictionary())
+          && writer.adoptFieldTable(reader.fieldNames());
       // Test seam: resource name, source ordinal, and copy versus re-add.
       Signal::emit("storedFieldsMergeSource", &resourceName, &seg.ord, &copy);
       if (copy) {
