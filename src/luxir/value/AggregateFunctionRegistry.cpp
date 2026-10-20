@@ -8,10 +8,12 @@
 #include <cmath>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/HyperLogLog.h"
+#include "luxir/util/TDigest.h"
 
 namespace luxir {
 namespace {
@@ -838,87 +840,136 @@ int64_t cardinalityThreshold(std::span<const AggregateConstant> arguments) {
   return (int64_t)value.doubleValue;
 }
 
-struct CardinalityState {
+template <class Sketch>
+struct SketchState {
   std::pmr::memory_resource* resource;
-  HyperLogLog* sketch;
+  Sketch* sketch;
 };
 
-void initCardinality(void* target, std::span<const AggregateConstant> arguments,
-                     std::pmr::memory_resource* resource) {
+template <class Sketch>
+void initSketch(void* target, std::span<const AggregateConstant> arguments,
+                std::pmr::memory_resource* resource) {
   unused(arguments);
-  storeState(target, CardinalityState{
+  storeState(target, SketchState<Sketch>{
       resource != nullptr ? resource : std::pmr::get_default_resource(), nullptr});
 }
 
-HyperLogLog& cardinalitySketch(void* target,
-                              std::span<const AggregateConstant> arguments) {
-  auto state = loadState<CardinalityState>(target);
+template <class Sketch, auto Parameter>
+Sketch& getSketch(void* target, std::span<const AggregateConstant> arguments) {
+  auto state = loadState<SketchState<Sketch>>(target);
   if (state.sketch == nullptr) {
-    state.sketch = std::pmr::polymorphic_allocator<>(state.resource).new_object<HyperLogLog>(
-        cardinalityThreshold(arguments), state.resource);
+    state.sketch = std::pmr::polymorphic_allocator<>(state.resource).new_object<Sketch>(
+        Parameter(arguments), state.resource);
     storeState(target, state);
   }
   return *state.sketch;
 }
 
-void destroyCardinality(void* target) noexcept {
-  auto state = loadState<CardinalityState>(target);
+template <class Sketch>
+void destroySketch(void* target) noexcept {
+  auto state = loadState<SketchState<Sketch>>(target);
   if (state.sketch != nullptr) {
     std::pmr::polymorphic_allocator<>(state.resource).delete_object(state.sketch);
   }
 }
 
-void addCardinality(void* target, const ValueResult& value,
-                    std::span<const AggregateConstant> arguments) {
-  if (!value.valid) return;
-  uint64_t bits;
-  if (value.type == ValueType::DOUBLE) {
-    if (!std::isfinite(value.doubleValue)) return;
-    bits = value.doubleValue == 0.0 ? 0 : std::bit_cast<uint64_t>(value.doubleValue);
-  } else {
-    bits = (uint64_t)value.intValue;
-  }
-  cardinalitySketch(target, arguments).add(HyperLogLog::mix(bits));
+inline void addValue(HyperLogLog& sketch, int64_t value) {
+  sketch.add(HyperLogLog::mix((uint64_t)value));
 }
 
-template <bool Floating>
-void addCardinalityBatch(void* target, std::span<const ScalarValueResult> values,
-                         std::span<const AggregateConstant> arguments) {
+inline void addValue(HyperLogLog& sketch, double value) {
+  if (!std::isfinite(value)) return;
+  uint64_t bits = value == 0.0 ? 0 : std::bit_cast<uint64_t>(value);
+  sketch.add(HyperLogLog::mix(bits));
+}
+
+inline void addValue(TDigest& sketch, int64_t value) {
+  sketch.add((double)value);
+}
+
+inline void addValue(TDigest& sketch, double value) {
+  if (std::isfinite(value)) sketch.add(value);
+}
+
+template <FieldType::Type Type, class F>
+void forEachRawFloatingBatchValue(std::span<const int64_t> values, F&& consume) {
+  for (int64_t raw : values) {
+    double value;
+    if (decodeRawDouble(Type, raw, value)) consume(value);
+  }
+}
+
+template <class F>
+void forEachRawBatchValue(std::span<const int64_t> values,
+                          FieldType::Type columnType, F&& consume) {
+  switch (columnType) {
+    case FieldType::FLOAT:
+      forEachRawFloatingBatchValue<FieldType::FLOAT>(values, consume);
+      break;
+    case FieldType::DOUBLE:
+      forEachRawFloatingBatchValue<FieldType::DOUBLE>(values, consume);
+      break;
+    default:
+      for (int64_t raw : values) consume(raw);
+  }
+}
+
+template <class Sketch, auto Parameter>
+void addSketch(void* target, const ValueResult& value,
+               std::span<const AggregateConstant> arguments) {
+  if (!value.valid) return;
+  if (value.type == ValueType::DOUBLE && !std::isfinite(value.doubleValue)) return;
+  auto& sketch = getSketch<Sketch, Parameter>(target, arguments);
+  if (value.type == ValueType::DOUBLE) addValue(sketch, value.doubleValue);
+  else addValue(sketch, value.intValue);
+}
+
+template <class Sketch, auto Parameter, bool Floating>
+void addSketchBatch(void* target, std::span<const ScalarValueResult> values,
+                    std::span<const AggregateConstant> arguments) {
+  if (values.empty()) return;
+  auto& sketch = getSketch<Sketch, Parameter>(target, arguments);
   for (const auto& value : values) {
     if (!value.valid) continue;
-    addCardinality(target, Floating ? ValueResult::floating(value.doubleValue)
-                                   : ValueResult::integer(value.intValue), arguments);
+    if constexpr (Floating) addValue(sketch, value.doubleValue);
+    else addValue(sketch, value.intValue);
   }
 }
 
-void addCardinalityRaw(void* target, int64_t raw, FieldType::Type columnType,
-                       std::span<const AggregateConstant> arguments) {
+template <class Sketch, auto Parameter>
+void addSketchRaw(void* target, int64_t raw, FieldType::Type columnType,
+                  std::span<const AggregateConstant> arguments) {
   if (columnType == FieldType::FLOAT || columnType == FieldType::DOUBLE) {
     double value;
     if (decodeRawDouble(columnType, raw, value)) {
-      addCardinality(target, ValueResult::floating(value), arguments);
+      addSketch<Sketch, Parameter>(target, ValueResult::floating(value), arguments);
     }
   } else {
-    addCardinality(target, ValueResult::integer(raw), arguments);
+    addSketch<Sketch, Parameter>(target, ValueResult::integer(raw), arguments);
   }
 }
 
-void addCardinalityRawBatch(void* target, std::span<const int64_t> values,
-                            FieldType::Type columnType,
-                            std::span<const AggregateConstant> arguments) {
-  for (int64_t raw : values) addCardinalityRaw(target, raw, columnType, arguments);
+template <class Sketch, auto Parameter>
+void addSketchRawBatch(void* target, std::span<const int64_t> values,
+                       FieldType::Type columnType,
+                       std::span<const AggregateConstant> arguments) {
+  if (values.empty()) return;
+  auto& sketch = getSketch<Sketch, Parameter>(target, arguments);
+  forEachRawBatchValue(values, columnType, [&](auto value) { addValue(sketch, value); });
 }
 
 void mergeCardinality(void* target, const void* source,
                       std::span<const AggregateConstant> arguments) {
-  auto state = loadState<CardinalityState>(source);
-  if (state.sketch != nullptr) cardinalitySketch(target, arguments).merge(*state.sketch);
+  auto state = loadState<SketchState<HyperLogLog>>(source);
+  if (state.sketch != nullptr) {
+    getSketch<HyperLogLog, cardinalityThreshold>(target, arguments).merge(*state.sketch);
+  }
 }
 
 BucketScalar finishCardinality(const void* source,
                                std::span<const AggregateConstant> arguments) {
   unused(arguments);
-  auto state = loadState<CardinalityState>(source);
+  auto state = loadState<SketchState<HyperLogLog>>(source);
   return BucketScalar::integer(state.sketch == nullptr ? 0 : state.sketch->estimate());
 }
 
@@ -937,10 +988,13 @@ ResolvedAggregate resolveCardinality(
       throw std::runtime_error("cardinality() threshold must be an integer in [0, 40000]");
     }
   }
-  AggregateStateOps ops{sizeof(CardinalityState), initCardinality, addCardinality,
-      valueDouble(input->type) ? addCardinalityBatch<true> : addCardinalityBatch<false>,
-      addCardinalityRaw, addCardinalityRawBatch, mergeCardinality, finishCardinality};
-  ops.destroy = destroyCardinality;
+  AggregateStateOps ops{sizeof(SketchState<HyperLogLog>), initSketch<HyperLogLog>,
+      addSketch<HyperLogLog, cardinalityThreshold>,
+      valueDouble(input->type) ? addSketchBatch<HyperLogLog, cardinalityThreshold, true>
+                               : addSketchBatch<HyperLogLog, cardinalityThreshold, false>,
+      addSketchRaw<HyperLogLog, cardinalityThreshold>,
+      addSketchRawBatch<HyperLogLog, cardinalityThreshold>, mergeCardinality, finishCardinality};
+  ops.destroy = destroySketch<HyperLogLog>;
   ops.inlineCapable = false;
   return {BucketValueType::INT128, ValueNature::NUMBER, ops};
 }
@@ -994,6 +1048,7 @@ void addRank(void* target, const ValueResult& value,
 template <bool Floating>
 void addRankBatch(void* target, std::span<const ScalarValueResult> values,
                   std::span<const AggregateConstant> arguments) {
+  if (values.empty()) return;
   auto state = loadState<PercentileRankState>(target);
   for (const auto& value : values) {
     if (!value.valid) continue;
@@ -1018,17 +1073,15 @@ void addRankRaw(void* target, int64_t raw, FieldType::Type columnType,
 void addRankRawBatch(void* target, std::span<const int64_t> values,
                      FieldType::Type columnType,
                      std::span<const AggregateConstant> arguments) {
+  if (values.empty()) return;
   auto state = loadState<PercentileRankState>(target);
-  if (columnType == FieldType::FLOAT || columnType == FieldType::DOUBLE) {
-    for (int64_t raw : values) {
-      double value;
-      if (decodeRawDouble(columnType, raw, value)) {
-        addRankValue(state, ValueResult::floating(value), arguments[0]);
-      }
+  forEachRawBatchValue(values, columnType, [&](auto value) {
+    if constexpr (std::is_same_v<decltype(value), double>) {
+      addRankValue(state, ValueResult::floating(value), arguments[0]);
+    } else {
+      addRankValue(state, ValueResult::integer(value), arguments[0]);
     }
-  } else {
-    for (int64_t raw : values) addRankValue(state, ValueResult::integer(raw), arguments[0]);
-  }
+  });
   storeState(target, state);
 }
 
@@ -1077,6 +1130,55 @@ ResolvedAggregate resolveRank(
   return {BucketValueType::DOUBLE, ValueNature::NUMBER, ops};
 }
 
+double constantDouble(const AggregateConstant& value) {
+  return value.type == ValueType::INT64 ? (double)value.intValue : value.doubleValue;
+}
+
+double percentileCompression(std::span<const AggregateConstant> arguments) {
+  return arguments.size() == 2 ? constantDouble(arguments[1]) : TDigest::DEFAULT_COMPRESSION;
+}
+
+void mergePercentile(void* target, const void* source,
+                      std::span<const AggregateConstant> arguments) {
+  auto state = loadState<SketchState<TDigest>>(source);
+  if (state.sketch != nullptr) {
+    getSketch<TDigest, percentileCompression>(target, arguments).merge(*state.sketch);
+  }
+}
+
+BucketScalar finishPercentile(const void* source,
+                               std::span<const AggregateConstant> arguments) {
+  auto state = loadState<SketchState<TDigest>>(source);
+  if (state.sketch == nullptr || state.sketch->empty()) {
+    return BucketScalar::missing(BucketValueType::DOUBLE, ValueNature::NUMBER);
+  }
+  state.sketch->finish();
+  return BucketScalar::floating(state.sketch->quantile(constantDouble(arguments[0]) / 100.0));
+}
+
+ResolvedAggregate resolvePercentile(
+    const ValueNode* input, std::span<AggregateConstant> arguments) {
+  double percent = constantDouble(arguments[0]);
+  if (!std::isfinite(percent) || percent < 0 || percent > 100) {
+    throw std::runtime_error("percentile() percent must be finite and in [0, 100]");
+  }
+  double compression = percentileCompression(arguments);
+  if (!std::isfinite(compression) || compression < TDigest::MIN_COMPRESSION
+      || compression > TDigest::MAX_COMPRESSION) {
+    throw std::runtime_error("percentile() compression must be finite and in [20, 1000]");
+  }
+  AggregateStateOps ops{sizeof(SketchState<TDigest>), initSketch<TDigest>,
+      addSketch<TDigest, percentileCompression>,
+      valueDouble(input->type) ? addSketchBatch<TDigest, percentileCompression, true>
+                               : addSketchBatch<TDigest, percentileCompression, false>,
+      addSketchRaw<TDigest, percentileCompression>,
+      addSketchRawBatch<TDigest, percentileCompression>, mergePercentile, finishPercentile};
+  ops.destroy = destroySketch<TDigest>;
+  ops.inlineCapable = false;
+  ops.orderSensitive = true;
+  return {BucketValueType::DOUBLE, input->nature, ops};
+}
+
 constexpr AggregateFunction FUNCTIONS[] = {
     {"avg", 1, 1, resolveAvg},
     {"sum", 1, 1, resolveSum},
@@ -1084,6 +1186,7 @@ constexpr AggregateFunction FUNCTIONS[] = {
     {"max", 1, 1, resolveMax},
     {"cardinality", 1, 2, resolveCardinality, true},
     {"percentile_rank", 2, 2, resolveRank},
+    {"percentile", 2, 3, resolvePercentile},
 };
 
 } // namespace

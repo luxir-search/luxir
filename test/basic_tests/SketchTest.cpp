@@ -4,7 +4,9 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <limits>
 #include <random>
 #include <vector>
 
@@ -208,6 +210,102 @@ TEST(TDigest, ExactPartsMergeExactly) {
   EXPECT_DOUBLE_EQ(50.5, a.quantile(0.5));
   EXPECT_DOUBLE_EQ(1.0, a.min);
   EXPECT_DOUBLE_EQ(100.0, a.max);
+}
+
+TEST(TDigest, SingletonCentroidsAndTailBoundaries) {
+  TDigest digest;
+  digest.centroids = {{0.0, 1.0}, {1.5, 2.0}};
+  digest.centroidWeight = 3;
+  digest.min = 0;
+  digest.max = 2;
+  EXPECT_DOUBLE_EQ(0, digest.quantile(0));
+  EXPECT_DOUBLE_EQ(1.5, digest.quantile(2.0 / 3.0));
+  EXPECT_DOUBLE_EQ(2, digest.quantile(1));
+  EXPECT_DOUBLE_EQ(1.0 / 3.0, digest.cdf(0));
+  EXPECT_DOUBLE_EQ(1, digest.cdf(2));
+  digest.centroids = {{7.0, 3.0}};
+  digest.min = 3;
+  digest.max = 9;
+  EXPECT_DOUBLE_EQ(7, digest.quantile(0.5));
+  EXPECT_DOUBLE_EQ(3, digest.quantile(0));
+  EXPECT_DOUBLE_EQ(9, digest.quantile(1));
+  digest.centroids = {{0, 10}, {1, 1}, {2, 10}};
+  digest.centroidWeight = 21;
+  digest.min = 0;
+  digest.max = 2;
+  for (double rank : {10.0, 10.5, 11.0}) {
+    EXPECT_DOUBLE_EQ(1, digest.quantile(rank / 21));
+  }
+  digest.centroids = {{0, 2}};
+  digest.centroidWeight = 2;
+  digest.min = -std::numeric_limits<double>::max();
+  digest.max = std::numeric_limits<double>::max();
+  EXPECT_DOUBLE_EQ(0.5, digest.cdf(0));
+}
+
+TEST(TDigest, CentroidMergesKeepStableTieOrder) {
+  TDigest a(1000), b(1000);
+  a.centroids = {{0,1}, {1,2}, {1,7}, {2,1}};
+  b.centroids = {{0,2}, {1,3}, {1,1}, {2,2}};
+  a.centroidWeight = 11;
+  b.centroidWeight = 8;
+  for (TDigest* digest : {&a, &b}) {
+    digest->min = 0;
+    digest->max = 2;
+    digest->add(1);
+  }
+  a.merge(b);
+  a.finish();
+  EXPECT_DOUBLE_EQ(21, a.count());
+  // High compression leaves each centroid separate, exposing the tie order.
+  std::vector<TDigest::Centroid> expected{
+      {0,1}, {0,2}, {1,2}, {1,7}, {1,3}, {1,1}, {1,1}, {1,1}, {2,1}, {2,2}};
+  ASSERT_EQ(expected.size(), a.centroids.size());
+  for (size_t i = 0; i < a.centroids.size(); i++) {
+    EXPECT_DOUBLE_EQ(expected[i].mean, a.centroids[i].mean);
+    EXPECT_DOUBLE_EQ(expected[i].weight, a.centroids[i].weight);
+  }
+}
+
+TEST(TDigest, MixedSignedZerosHaveIdenticalQuantiles) {
+  for (int count : {4, 1000}) {
+    TDigest a(20), b(20);
+    for (int i = 0; i < count; i++) {
+      double x = i % 2 == 0 ? -0.0 : 0.0;
+      a.add(x);
+      b.add(-x);
+    }
+    a.finish();
+    b.finish();
+    for (double q : {0.0, 0.25, 0.5, 0.99, 1.0}) {
+      EXPECT_EQ(uint64_t{0}, std::bit_cast<uint64_t>(a.quantile(q)));
+      EXPECT_EQ(uint64_t{0}, std::bit_cast<uint64_t>(b.quantile(q)));
+    }
+  }
+}
+
+TEST(TDigest, FiniteExtremesDoNotOverflowInterpolation) {
+  double extreme = std::numeric_limits<double>::max();
+  TDigest raw;
+  raw.add(-extreme);
+  raw.add(extreme);
+  raw.finish();
+  EXPECT_DOUBLE_EQ(0, raw.quantile(0.5));
+  EXPECT_DOUBLE_EQ(-extreme, raw.quantile(0));
+  EXPECT_DOUBLE_EQ(extreme, raw.quantile(1));
+  TDigest compressed(20);
+  for (int i = 0; i < 1000; i++) compressed.add(i % 2 == 0 ? -extreme : extreme);
+  compressed.finish();
+  double previous = -extreme;
+  for (int i = 0; i <= 1000; i++) {
+    double x = compressed.quantile((double)i / 1000);
+    EXPECT_TRUE(std::isfinite(x));
+    EXPECT_GE(x, previous);
+    previous = x;
+  }
+  EXPECT_DOUBLE_EQ(-extreme, compressed.quantile(0));
+  EXPECT_DOUBLE_EQ(extreme, compressed.quantile(1));
+  EXPECT_NEAR(0.5, compressed.cdf(0), 0.02);
 }
 
 } // namespace

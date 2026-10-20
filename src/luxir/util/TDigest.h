@@ -6,8 +6,9 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
-#include <cstdint>
+#include <iterator>
 #include <limits>
+#include <memory_resource>
 #include <numbers>
 #include <span>
 #include <vector>
@@ -29,6 +30,9 @@ namespace luxir {
 // While fewer than bufferLimit() values have been added in total the digest
 // holds them raw and answers exactly: quantile() interpolates linearly
 // between the two closest ranks, and cdf() is the fraction of values <= x.
+// Equal finite inputs have identical bits after normalizing signed zero.
+// Sorting only raw doubles and stably merging fixed runs makes compression
+// independent of the sort implementation.
 class TDigest {
 public:
   static constexpr double DEFAULT_COMPRESSION = 100.0;
@@ -41,8 +45,9 @@ public:
   };
 
   double compression;
-  std::vector<Centroid> centroids; // sorted by mean; empty while exact
-  std::vector<double> buffer;      // raw values not yet folded in
+  std::pmr::vector<Centroid> centroids; // sorted by mean; empty while exact
+  std::pmr::vector<double> buffer;      // raw values not yet folded in
+  std::pmr::vector<Centroid> scratch;
   double centroidWeight = 0.0;
   double min = std::numeric_limits<double>::infinity();
   double max = -std::numeric_limits<double>::infinity();
@@ -55,11 +60,13 @@ public:
   // Resident bytes a digest of this compression may hold.
   static size_t maxBytes(double compression) {
     size_t limit = bufferLimitFor(compression);
-    return limit * sizeof(double) + 2 * limit * sizeof(Centroid);
+    return sizeof(TDigest) + 4 * limit * sizeof(double)
+        + 6 * limit * sizeof(Centroid);
   }
 
-  explicit TDigest(double compression = DEFAULT_COMPRESSION)
-      : compression(compression) {
+  explicit TDigest(double compression = DEFAULT_COMPRESSION,
+                   std::pmr::memory_resource* resource = std::pmr::get_default_resource())
+      : compression(compression), centroids(resource), buffer(resource), scratch(resource) {
     assert(compression >= MIN_COMPRESSION && compression <= MAX_COMPRESSION);
   }
 
@@ -75,6 +82,7 @@ public:
   // Non-finite values are the caller's responsibility to drop.
   void add(double x) {
     assert(std::isfinite(x));
+    x += 0.0; // -0.0 becomes +0.0.
     min = std::min(min, x);
     max = std::max(max, x);
     buffer.push_back(x);
@@ -84,6 +92,15 @@ public:
 
   void merge(const TDigest& other) {
     if (other.empty()) return;
+    if (empty()) {
+      centroids.assign(other.centroids.begin(), other.centroids.end());
+      buffer.assign(other.buffer.begin(), other.buffer.end());
+      centroidWeight = other.centroidWeight;
+      min = other.min;
+      max = other.max;
+      sortedBuffer = other.sortedBuffer;
+      return;
+    }
     min = std::min(min, other.min);
     max = std::max(max, other.max);
     if (other.exact()) {
@@ -114,29 +131,32 @@ public:
   double quantile(double q) const {
     assert(q >= 0.0 && q <= 1.0);
     if (empty()) return std::numeric_limits<double>::quiet_NaN();
+    if (q == 0.0) return min;
+    if (q == 1.0) return max;
     if (exact()) {
       assert(sortedBuffer);
       double position = q * (double)(buffer.size() - 1);
       size_t lo = (size_t)std::floor(position);
       size_t hi = std::min(lo + 1, buffer.size() - 1);
       double fraction = position - (double)lo;
-      return buffer[lo] + (buffer[hi] - buffer[lo]) * fraction;
+      return interpolate(buffer[lo], buffer[hi], fraction);
     }
     assert(buffer.empty());
     const auto& c = centroids;
     const size_t n = c.size();
     const double total = centroidWeight;
-    if (n == 1) return interpolate(min, max, q);
+    if (n == 1) return c[0].mean;
     double index = q * total;
     if (index < 1.0) return min;
     // Half of the first centroid lies between min and its mean.
     if (c[0].weight > 1.0 && index < c[0].weight / 2.0) {
-      return min + (index - 1.0) / (c[0].weight / 2.0 - 1.0) * (c[0].mean - min);
+      return interpolate(min, c[0].mean,
+          (index - 1.0) / (c[0].weight / 2.0 - 1.0));
     }
     if (index > total - 1.0) return max;
-    if (c[n - 1].weight > 1.0 && total - index <= c[n - 1].weight / 2.0) {
-      return max - (total - index - 1.0) / (c[n - 1].weight / 2.0 - 1.0)
-          * (max - c[n - 1].mean);
+    if (c[n - 1].weight > 2.0 && total - index <= c[n - 1].weight / 2.0) {
+      return interpolate(max, c[n - 1].mean,
+          (total - index - 1.0) / (c[n - 1].weight / 2.0 - 1.0));
     }
     double weightSoFar = c[0].weight / 2.0;
     for (size_t i = 0; i + 1 < n; i++) {
@@ -178,17 +198,17 @@ public:
     const auto& c = centroids;
     const size_t n = c.size();
     const double total = centroidWeight;
-    if (n == 1) return (x - min) / (max - min);
+    if (n == 1) return fractionBetween(min, max, x);
     if (x < c[0].mean) {
       // Linear from min (weight 1) to the first centroid's midpoint.
-      double span = c[0].mean - min;
-      double left = 1.0 + (x - min) / span * std::max(0.0, c[0].weight / 2.0 - 1.0);
+      double left = 1.0 + fractionBetween(min, c[0].mean, x)
+          * std::max(0.0, c[0].weight / 2.0 - 1.0);
       return std::min(left, c[0].weight / 2.0) / total;
     }
     if (x >= c[n - 1].mean) {
-      double span = max - c[n - 1].mean;
-      double right = span > 0.0
-          ? 1.0 + (max - x) / span * std::max(0.0, c[n - 1].weight / 2.0 - 1.0)
+      double right = max > c[n - 1].mean
+          ? 1.0 + (1.0 - fractionBetween(c[n - 1].mean, max, x))
+              * std::max(0.0, c[n - 1].weight / 2.0 - 1.0)
           : 0.0;
       return 1.0 - std::min(right, c[n - 1].weight / 2.0) / total;
     }
@@ -198,8 +218,8 @@ public:
         double dw = (c[i].weight + c[i + 1].weight) / 2.0;
         double leftUnit = c[i].weight == 1.0 ? 0.5 : 0.0;
         double rightUnit = c[i + 1].weight == 1.0 ? 0.5 : 0.0;
-        double span = c[i + 1].mean - c[i].mean;
-        double fraction = span > 0.0 ? (x - c[i].mean) / span : 0.0;
+        double fraction = c[i + 1].mean > c[i].mean
+            ? fractionBetween(c[i].mean, c[i + 1].mean, x) : 0.0;
         double below = weightSoFar + leftUnit
             + (dw - leftUnit - rightUnit) * fraction;
         return below / total;
@@ -210,54 +230,74 @@ public:
   }
 
 private:
+  static double fractionBetween(double a, double b, double x) {
+    double span = b - a;
+    if (std::isfinite(span)) return (x - a) / span;
+    return (x / 2.0 - a / 2.0) / (b / 2.0 - a / 2.0);
+  }
+
   static double interpolate(double a, double b, double fraction) {
-    return a + (b - a) * std::clamp(fraction, 0.0, 1.0);
+    return std::lerp(a, b, std::clamp(fraction, 0.0, 1.0));
   }
 
   // (x1 * w1 + x2 * w2) / (w1 + w2), clamped to [x1, x2] against rounding.
   static double weightedAverage(double x1, double w1, double x2, double w2) {
-    if (w1 + w2 <= 0.0) return (x1 + x2) / 2.0;
-    double value = (x1 * w1 + x2 * w2) / (w1 + w2);
-    return std::clamp(value, std::min(x1, x2), std::max(x1, x2));
+    if (w1 + w2 <= 0.0) return interpolate(x1, x2, 0.5);
+    return interpolate(x1, x2, w2 / (w1 + w2));
   }
 
-  // Fold the buffer, the current centroids, and `extra` into new centroids.
+  // Merge sorted runs in a fixed order: current centroids, extra, raw values.
+  // Only raw doubles need sorting; equal values are bit-identical, so their
+  // sort order cannot affect the fold.
   void compress(std::span<const Centroid> extra) {
-    std::vector<Centroid> all;
-    all.reserve(centroids.size() + buffer.size() + extra.size());
-    all.insert(all.end(), centroids.begin(), centroids.end());
-    all.insert(all.end(), extra.begin(), extra.end());
-    double total = centroidWeight;
-    for (const Centroid& centroid : extra) total += centroid.weight;
-    for (double x : buffer) all.push_back({x, 1.0});
-    total += (double)buffer.size();
-    buffer.clear();
-    sortedBuffer = true;
-    std::sort(all.begin(), all.end(),
-              [](const Centroid& a, const Centroid& b) { return a.mean < b.mean; });
+    if (!extra.empty()) {
+      scratch.clear();
+      scratch.reserve(centroids.size() + extra.size());
+      std::merge(centroids.begin(), centroids.end(), extra.begin(), extra.end(),
+                 std::back_inserter(scratch),
+                 [](const Centroid& a, const Centroid& b) { return a.mean < b.mean; });
+      centroids.swap(scratch);
+      for (const Centroid& centroid : extra) centroidWeight += centroid.weight;
+    }
+    if (!sortedBuffer) std::sort(buffer.begin(), buffer.end());
+    const double total = centroidWeight + (double)buffer.size();
 
     const double normalizer = compression / (2.0 * std::numbers::pi);
-    auto k = [&](double q) {
-      return normalizer * std::asin(2.0 * std::clamp(q, 0.0, 1.0) - 1.0);
+    auto weightLimit = [&](double weightSoFar) {
+      double q = std::clamp(weightSoFar / total, 0.0, 1.0);
+      double kNext = normalizer * std::asin(2.0 * q - 1.0) + 1.0;
+      return kNext >= normalizer * std::numbers::pi / 2.0
+          ? total : total * (std::sin(kNext / normalizer) + 1.0) / 2.0;
     };
-    centroids.clear();
-    Centroid current = all.front();
+    size_t i = 0, j = 0;
+    auto nextCentroid = [&]() {
+      if (i < centroids.size() && (j == buffer.size() || centroids[i].mean <= buffer[j])) {
+        return centroids[i++];
+      }
+      return Centroid{buffer[j++], 1.0};
+    };
+    scratch.clear();
+    scratch.reserve((size_t)compression);
+    Centroid current = nextCentroid();
     double weightSoFar = 0.0;
-    double kLeft = k(0.0);
-    for (size_t i = 1; i < all.size(); i++) {
-      const Centroid& next = all[i];
+    double limit = weightLimit(weightSoFar);
+    while (i < centroids.size() || j < buffer.size()) {
+      Centroid next = nextCentroid();
       double proposed = current.weight + next.weight;
-      if (k((weightSoFar + proposed) / total) - kLeft <= 1.0) {
-        current.mean += (next.mean - current.mean) * next.weight / proposed;
+      if (weightSoFar + proposed <= limit) {
+        current.mean = interpolate(current.mean, next.mean, next.weight / proposed);
         current.weight = proposed;
       } else {
         weightSoFar += current.weight;
-        kLeft = k(weightSoFar / total);
-        centroids.push_back(current);
+        limit = weightLimit(weightSoFar);
+        scratch.push_back(current);
         current = next;
       }
     }
-    centroids.push_back(current);
+    scratch.push_back(current);
+    centroids.swap(scratch);
+    buffer.clear();
+    sortedBuffer = true;
     centroidWeight = total;
   }
 };

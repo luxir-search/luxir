@@ -36,6 +36,7 @@ class ExprStatsOp : public SearchOp {
   AggregateProgram& aggregate;
   std::span<const AggregateFieldInfos> fields;
   const DenseFacetStateOps* denseFacetState = nullptr;
+  bool orderSensitive = false;
 
   const DenseFacetStateOps* resolveDenseFacetState() {
     if (disableDenseFacetStateForTests) return nullptr;
@@ -89,10 +90,14 @@ public:
   void init() override {
     SearchOp::init();
     denseFacetState = resolveDenseFacetState();
+    orderSensitive = std::ranges::any_of(aggregate.leaves, [](const AggregateLeaf& leaf) {
+      return leaf.resolved.state.orderSensitive;
+    });
   }
 
   bool canEmitAsBucketChild() const override { return true; }
 
+  template <bool Ordered>
   class Calc : public Calculator {
     static constexpr size_t BATCH_SIZE = 1024;
 
@@ -106,8 +111,8 @@ public:
 
     void emitResult(const AggregateAccumulator& accumulator) {
       // Completion frees the accumulator before the bucket sizing hook runs.
-      if (stateResource) observedStateBytes = stateResource->bytes();
       BucketScalar result = accumulator.finish(scratch);
+      if (stateResource) observedStateBytes = stateResource->bytes();
       thisOp().warnFailure(result);
       auto& mr = op.req.lastResponse->mr;
       getTarget(nullptr, [&](api::Val& val) {
@@ -189,6 +194,9 @@ public:
         return new AggregateAccumulator(thisOp().aggregate,
             stateResource ? &*stateResource : nullptr);
       });
+      if constexpr (Ordered) {
+        driver.setOrdered(stateResource ? &*stateResource : std::pmr::get_default_resource());
+      }
     }
 
     size_t facetBucketObservedBytes() const override {
@@ -211,7 +219,7 @@ public:
         return;
       }
 
-      driver.contribute([&](AggregateAccumulator& accumulator) {
+      auto accumulate = [&](AggregateAccumulator& accumulator) {
         try {
           auto poolGuard = MemPool::threadLocalPoolGuard();
           MemPool& pool = poolGuard.pool();
@@ -232,7 +240,9 @@ public:
         } catch (const ValueEvaluationError&) {
           accumulator.fail(AggregateFailure::VALUE_EVALUATION);
         }
-      });
+      };
+      if constexpr (Ordered) driver.contribute((size_t)segnum, accumulate);
+      else driver.contribute(accumulate);
     }
   };
 
@@ -558,17 +568,25 @@ public:
     std::string chargeDetail;
     std::optional<RequestMemResource> stateResource;
     std::vector<std::byte> states;
+    std::vector<std::byte> mergedStates;
     AggregateEvalScratch scratch;
     size_t chargedBytes = 0;
     size_t initializedStates = 0;
+    size_t initializedMergedStates = 0;
     uint32_t stride;
 
     void releaseStates() {
       if (stateResource) {
         while (initializedStates != 0) state((int32_t)--initializedStates).destroy();
+        while (initializedMergedStates != 0) {
+          AggregateStateView(child.aggregate,
+              mergedStates.data() + --initializedMergedStates * stride).destroy();
+        }
       }
       initializedStates = 0;
+      initializedMergedStates = 0;
       std::vector<std::byte>().swap(states);
+      std::vector<std::byte>().swap(mergedStates);
       if (chargedBytes != 0) child.req.memoryTracker.release(chargedBytes);
       chargedBytes = 0;
     }
@@ -774,15 +792,18 @@ public:
 
     void execute() override {
       size_t numOwners = source.buckets.size();
-      if (numOwners > std::numeric_limits<size_t>::max() / stride) {
+      bool ordered = child.orderSensitive && source.domains.size() > 1;
+      size_t arrays = ordered ? 2 : 1;
+      if (numOwners > std::numeric_limits<size_t>::max() / stride / arrays) {
         child.req.memoryTracker.chargeOverflow(
             FACET_STATE_BREAKER, chargeDetail);
       }
       size_t bytes = numOwners * stride;
       if (bytes != 0) {
-        chargedBytes = child.chargeFacetState(bytes, bytes, chargeDetail);
+        chargedBytes = child.chargeFacetState(bytes * arrays, bytes * arrays, chargeDetail);
       }
-      states.resize(chargedBytes);
+      states.resize(bytes);
+      if (ordered) mergedStates.resize(bytes);
       for (size_t owner = 0; owner < numOwners; owner++) {
         state((int32_t)owner).init(stateResource ? &*stateResource : nullptr);
         initializedStates++;
@@ -791,6 +812,28 @@ public:
       for (int32_t segnum = 0; segnum < (int32_t)source.domains.size();
            segnum++) {
         replaySegment(segnum);
+        if (ordered) {
+          if (segnum == 0) {
+            states.swap(mergedStates);
+            std::swap(initializedStates, initializedMergedStates);
+          } else {
+            for (size_t owner = 0; owner < numOwners; owner++) {
+              AggregateStateView(child.aggregate, mergedStates.data() + owner * stride)
+                  .merge(state((int32_t)owner));
+            }
+          }
+          while (initializedStates != 0) state((int32_t)--initializedStates).destroy();
+          if (segnum + 1 < (int32_t)source.domains.size()) {
+            for (size_t owner = 0; owner < numOwners; owner++) {
+              state((int32_t)owner).init(stateResource ? &*stateResource : nullptr);
+              initializedStates++;
+            }
+          }
+        }
+      }
+      if (ordered) {
+        states.swap(mergedStates);
+        std::swap(initializedStates, initializedMergedStates);
       }
 
       std::vector<BucketScalar> results;
@@ -807,7 +850,8 @@ public:
   Calculator* createCalculator(
       Calculator* parent, int64_t slot = -1, int64_t numSlots = -1,
       const StructuralConstraint* structural = nullptr) override {
-    return new Calc(*this, parent, slot, numSlots, structural);
+    if (orderSensitive) return new Calc<true>(*this, parent, slot, numSlots, structural);
+    return new Calc<false>(*this, parent, slot, numSlots, structural);
   }
 
   InlineCalculator* createInlineCalculator(
