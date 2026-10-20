@@ -78,6 +78,7 @@ public:
   std::optional<SortPlan> headSort;
   boost::unordered_flat_map<std::string_view, SearchOp*> groupOps;
   bool diverseSources = false;
+  NamedQueries* namedQueries = nullptr;  // every source's named clauses, merged by name
 
   // ProtobufSearchParser builds each source TopDocsReq (with rankingSink wired)
   // and the filter weights, then passes them in (see TopDocsReq's ctor comment).
@@ -519,7 +520,7 @@ public:
         op.fusionProto.get_number,
         op.fusionProto.get_scores,
         op.fusionProto.document_format,
-        emission);
+        emission, {}, op.namedQueries);
     }
   };
 

@@ -568,6 +568,7 @@ public:
   MetricGroupPlan* metricOrder = nullptr;
   std::optional<SortPlan> headSort;
   boost::unordered_flat_map<std::string_view, SearchOp*> groupOps;
+  NamedQueries* namedQueries = nullptr;  // get_matched_queries; null without named clauses
 
   void init() override {
     SearchOp::init();

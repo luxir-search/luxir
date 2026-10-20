@@ -565,10 +565,33 @@ TEST_F(ExprParserTest, functionVariety) {
   EXPECT_EQ("dune messiah", p.text);
   EXPECT_EQ(7, asPhrase(*parse("phrase(dune messiah, field=title, slop=7)")).slop);
 
+  const auto* mpp = std::get_if<api::MatchPhrasePrefixQuery>(&parse(
+      "match_phrase_prefix(dune mess, field=title, slop=1, max_expansions=5)")->kind);
+  ASSERT_NE(nullptr, mpp);
+  EXPECT_EQ("dune mess", mpp->text);
+  EXPECT_EQ("title", mpp->field);
+  EXPECT_EQ(1, mpp->slop);
+  EXPECT_EQ(5, mpp->max_expansions);
+
   const auto& f = asFuzzy(*parse("fuzzy(smith, field=status, max_edits=2, prefix_length=0)"));
   EXPECT_EQ("smith", f.term);
   EXPECT_EQ(2, *f.max_edits);
   EXPECT_EQ(0, *f.prefix_length);
+
+  const auto& ff = asFuzzy(*parse("fuzzy(smith, field=status, fuzziness=\"AUTO:3,6\", "
+                                  "transpositions=false, rewrite=CONSTANT_SCORE, rewrite_size=5)"));
+  EXPECT_EQ("AUTO:3,6", *ff.fuzziness);
+  EXPECT_FALSE(*ff.transpositions);
+  EXPECT_EQ(api::FuzzyRewrite::CONSTANT_SCORE, ff.rewrite);
+  EXPECT_EQ(5, ff.rewrite_size);
+
+  const auto& fm = asMatch(*parse("match(dune messiah, field=title, fuzziness=AUTO, "
+                                  "prefix_length=0, fuzzy_rewrite=top_terms_boost)"));
+  EXPECT_EQ("AUTO", *fm.fuzziness);
+  EXPECT_EQ(0, *fm.prefix_length);
+  EXPECT_EQ(api::FuzzyRewrite::TOP_TERMS_BOOST, *fm.fuzzy_rewrite);
+  expectContains(parseErr("fuzzy(x, field=status, rewrite=SOMETIMES)"),
+                 "expects TOP_TERMS_BLENDED_FREQS");
 
   const auto& pre = asPrefix(*parse("prefix(mess, field=title)"));
   EXPECT_EQ("mess", pre.prefix);

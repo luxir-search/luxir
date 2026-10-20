@@ -249,7 +249,7 @@ void emitPage(const CollapsedPageSettings& settings,
     groupCount, settings.fields,
     settings.batchSize, settings.offset,
     settings.getNumber, settings.getScores,
-    settings.documentFormat, emission, std::move(metadata));
+    settings.documentFormat, emission, std::move(metadata), settings.namedQueries);
 }
 CollapsedPageSettings pageSettings(TopDocsReq& op, TopDocsReq::CalcBase& calc) {
   return {op, *op.collapse, *op.topDocsProto.collapse, op.sortPlan,
@@ -261,7 +261,8 @@ CollapsedPageSettings pageSettings(TopDocsReq& op, TopDocsReq::CalcBase& calc) {
       calc.memberReplay ? std::span<const DomainHandle>(calc.memberReplay->domains)
                         : std::span<const DomainHandle>{}, calc.pageGroups, false,
       [](SearchOp& owner, IndexReader::Segment& segment) { owner.releaseSegmentState(segment); },
-      [](SearchOp::Calculator& base) { static_cast<TopDocsReq::CalcBase&>(base).memberReplay.reset(); }};
+      [](SearchOp::Calculator& base) { static_cast<TopDocsReq::CalcBase&>(base).memberReplay.reset(); },
+      op.namedQueries};
 }
 }  // namespace
 
@@ -316,7 +317,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.topDocsProto.get_number,
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission);
+        emission, {}, qr.namedQueries);
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
@@ -331,7 +332,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.topDocsProto.get_number,
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission);
+        emission, {}, qr.namedQueries);
     }
   }
 

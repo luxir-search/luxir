@@ -77,6 +77,12 @@ locations, browse `src/luxir/<area>/`.
    and white-box tests include.
 
    - Supports Term, Boolean, Phrase, and All queries
+   - `PhraseQuery` slots may each hold a term set (MultiPhrase-style); such a
+     phrase reads every slot through `UnionDocsPosEnum`/`UnionPosEnum`
+     (`reader/UnionPosEnum.h`), heap merges of the terms' doc and position
+     streams, so the exact and sloppy matchers run unchanged.
+     `PhrasePrefixQuery` (match_phrase_prefix) expands its prefix at weight
+     creation and rewrites to such a phrase
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
      column scans; `GeoBoxQuery` executes through the BKD. Both share the

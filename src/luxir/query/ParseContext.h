@@ -5,6 +5,7 @@
 
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <google/protobuf/arena.h>
@@ -18,6 +19,7 @@
 namespace luxir {
 
 class CollapsePlan;
+class Query;
 
 // Request-scoped context threaded through query parsing and building: the
 // pool the query tree is built into, the schema, the warnings sink (declared
@@ -52,6 +54,10 @@ struct ParseContext {
   FieldResolver localFields;
   FieldResolver& fields;
   std::map<const api::Val*, std::pair<std::string_view, size_t>> exactSources;
+  // When set, every named node (api::Query.name) appends its name and its
+  // lowered query here, for per-hit matched_queries. Scoped by the caller to
+  // the parses that feed a ranked list (its query and filters).
+  std::vector<std::pair<std::string_view, Query*>>* named = nullptr;
 
   ParseContext(MemPool& pool, Schema& schema, google::protobuf::Arena& arena,
                const CoerceContext& coerceContext,

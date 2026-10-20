@@ -5,6 +5,8 @@
 // queries without a .cpp of their own. Each is its class's key function; see
 // docs/dev/codebase-map.md.
 
+#include <format>
+
 #include "luxir/query/AllQuery.h"
 #include "luxir/query/AutomatonQuery.h"
 #include "luxir/query/BooleanQuery.h"
@@ -19,6 +21,7 @@
 #include "luxir/query/MinScoreQuery.h"
 #include "luxir/query/MultiTermQuery.h"
 #include "luxir/query/NumericPredicateQuery.h"
+#include "luxir/query/PhrasePrefixQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/PrefixQuery.h"
 #include "luxir/query/RescoreQuery.h"
@@ -73,6 +76,24 @@ Query::Weight* ForcePrepareQuery::createWeight(Context& context, int32_t flags,
                                                       multiplier);
 }
 
+void FuzzyQuery::truncateCandidates(
+    Context& context, std::vector<ExpansionCandidate>& candidates) const {
+  int matched = (int)candidates.size();
+  ExpansionLimit limit = expansionLimit(context.limits.fuzzyMaxExpansions);
+  if (matched <= limit.limit) {
+    std::sort(candidates.begin(), candidates.end(), betterExpansion);
+    return;
+  }
+  std::partial_sort(candidates.begin(), candidates.begin() + limit.limit, candidates.end(),
+                    betterExpansion);
+  candidates.resize((size_t)limit.limit);
+  if (limit.warn) {
+    context.warn(FUZZY_TRUNCATED_WARNING, std::format(
+        "fuzzy query on field {} matched {} terms; only the {} closest were kept ({})",
+        field, matched, limit.limit, limit.reason));
+  }
+}
+
 Query* FuzzyQuery::rewriteToDisjunction(Context& context) const {
   CachedFieldInfo* cachedFieldInfo = context.getCachedFieldInfo(getField());
   if (cachedFieldInfo == nullptr) return context.pool.make<MatchNoDocsQuery>();
@@ -81,6 +102,19 @@ Query* FuzzyQuery::rewriteToDisjunction(Context& context) const {
   auto candidates = collectCandidates(context, scratch, *cachedFieldInfo);
   truncateCandidates(context, candidates);
   if (candidates.empty()) return context.pool.make<MatchNoDocsQuery>();
+
+  if (rewrite == FuzzyRewrite::CONSTANT_SCORE) {
+    std::sort(candidates.begin(), candidates.end(),
+              [](const ExpansionCandidate& a, const ExpansionCandidate& b) {
+                return a.term < b.term;
+              });
+    auto terms = context.pool.make_span<std::string_view>(candidates.size());
+    for (size_t i = 0; i < candidates.size(); i++) {
+      terms[i] = copyTerm(context.pool, candidates[i].term);
+    }
+    return context.pool.make<ConstantScoreQuery>(
+        context.pool.make<TermInSetQuery>(getField(), terms), getBoost());
+  }
 
   Similarity::TermStats blendedStats = {};
   for (const ExpansionCandidate& candidate : candidates) {
@@ -94,8 +128,22 @@ Query* FuzzyQuery::rewriteToDisjunction(Context& context) const {
   for (size_t i = 0; i < candidates.size(); i++) {
     const ExpansionCandidate& candidate = candidates[i];
     std::string_view termCopy = copyTerm(context.pool, candidate.term);
-    clauses[i] = context.pool.make<TermQuery>(
-        getField(), termCopy, blendedStats, getBoost() * candidate.damp);
+    float clauseBoost = getBoost() * candidate.damp;
+    switch (rewrite) {
+      case FuzzyRewrite::TOP_TERMS_BLENDED_FREQS:
+        clauses[i] = context.pool.make<TermQuery>(
+            getField(), termCopy, blendedStats, clauseBoost);
+        break;
+      case FuzzyRewrite::TOP_TERMS:
+        clauses[i] = context.pool.make<TermQuery>(
+            getField(), termCopy, candidate.termStats, clauseBoost);
+        break;
+      case FuzzyRewrite::TOP_TERMS_BOOST:
+      case FuzzyRewrite::CONSTANT_SCORE:
+        clauses[i] = context.pool.make<ConstantScoreQuery>(
+            context.pool.make<TermQuery>(getField(), termCopy), clauseBoost);
+        break;
+    }
   }
 
   return context.pool.make<BooleanQuery>(
@@ -152,6 +200,84 @@ Query::Weight* NumericPredicateQuery::createWeight(Context& context, int32_t fla
 Query::Weight* PhraseQuery::createWeight(Context& context, int32_t flags,
                                          float multiplier) {
   return context.pool.make<PhraseQuery::Weight>(context, *this, flags, multiplier);
+}
+
+std::vector<PhrasePrefixQuery::Expansion> PhrasePrefixQuery::expand(
+    Context& context, MemPool& pool) const {
+  std::vector<Expansion> expansions;
+  CachedFieldInfo* fieldInfo = context.getCachedFieldInfo(field);
+  if (fieldInfo == nullptr) return expansions;
+
+  // Each segment's dictionary is sorted, so only its first maxExpansions
+  // matches can be among the merged first maxExpansions.
+  MemPool scratch;
+  std::vector<Expansion> found;
+  for (size_t s = 0; s < context.numSegments(); s++) {
+    auto* segFieldInfo = fieldInfo->segInfos.at(s);
+    if (segFieldInfo == nullptr) continue;
+    auto& postingsReader = context.topReader.segments()[s].postingsReader();
+    TermsEnum te(scratch, postingsReader, *segFieldInfo);
+    PrefixTermsEnum prefixEnum(te, prefix);
+    for (int32_t n = 0; n < maxExpansions && prefixEnum.next(); n++) {
+      std::string_view term = prefixEnum.termView();
+      char* bytes = scratch.alloc(term.size());
+      std::copy(term.begin(), term.end(), bytes);
+      found.push_back({{bytes, term.size()},
+                       {(int64_t) te.docFreq(), (int64_t) te.totalTermFreq()}});
+    }
+  }
+
+  std::sort(found.begin(), found.end(),
+            [](const Expansion& a, const Expansion& b) { return a.term < b.term; });
+  for (const Expansion& expansion : found) {
+    if (!expansions.empty() && expansions.back().term == expansion.term) {
+      expansions.back().termStats.add(expansion.termStats);
+      continue;
+    }
+    if ((int32_t) expansions.size() == maxExpansions) break;
+    char* bytes = pool.alloc(expansion.term.size());
+    std::copy(expansion.term.begin(), expansion.term.end(), bytes);
+    expansions.push_back({{bytes, expansion.term.size()}, expansion.termStats});
+  }
+  return expansions;
+}
+
+Query* PhrasePrefixQuery::rewrite(Context& context) const {
+  std::vector<Expansion> expansions = expand(context, context.pool);
+  if (expansions.empty()) return context.pool.make<MatchNoDocsQuery>();
+
+  if (terms.empty()) {
+    // A lone prefix: the expansions share one slot's stats, as they would
+    // as the last slot of a phrase.
+    Similarity::TermStats slotStats = {};
+    for (const Expansion& expansion : expansions) slotStats.add(expansion.termStats);
+    CachedFieldInfo* fieldInfo = context.getCachedFieldInfo(field);
+    slotStats.docFreq = std::min(slotStats.docFreq, fieldInfo->fieldStats.docsWithField);
+    auto clauses = context.pool.make_span<Query*>(expansions.size());
+    for (size_t i = 0; i < expansions.size(); i++) {
+      clauses[i] = context.pool.make<TermQuery>(field, expansions[i].term, slotStats);
+    }
+    return context.pool.make<BooleanQuery>(
+        std::span<Query*>{}, clauses, std::span<Query*>{}, std::span<Query*>{});
+  }
+
+  auto slots = context.pool.make_span<std::span<std::string_view>>(terms.size() + 1);
+  for (size_t i = 0; i < terms.size(); i++) slots[i] = terms.subspan(i, 1);
+  auto last = context.pool.make_span<std::string_view>(expansions.size());
+  for (size_t i = 0; i < expansions.size(); i++) last[i] = expansions[i].term;
+  slots[terms.size()] = last;
+  return context.pool.make<PhraseQuery>(context.pool, field, slots, positions, slop);
+}
+
+Query::Weight* PhrasePrefixQuery::createWeight(
+    Context& context, int32_t flags, float multiplier) {
+  Query* rewritten = rewrite(context);
+#ifndef NDEBUG
+  if (context.logicalValidationActive()) {
+    rewritten->validateLogical(context.planningContext(), multiplier);
+  }
+#endif
+  return rewritten->createWeight(context, flags, multiplier);
 }
 
 FilteredTermsEnum* PrefixQuery::createFilteredEnum(MemPool& pool, TermsEnum& te) {

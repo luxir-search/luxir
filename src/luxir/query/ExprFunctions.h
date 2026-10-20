@@ -32,7 +32,7 @@ namespace luxir::expr {
 // field order).  The static_assert keeps this table in lockstep with the
 // variant: a new arm fails to compile until it is named here (and its expr
 // callability decided).
-inline constexpr std::array<std::string_view, 20> ARM_NAMES = {
+inline constexpr std::array<std::string_view, 21> ARM_NAMES = {
     "",               // monostate (unset)
     "match",          // Match
     "boolean",        // BooleanQuery
@@ -53,6 +53,7 @@ inline constexpr std::array<std::string_view, 20> ARM_NAMES = {
     "wildcard",       // WildcardQuery
     "regex",          // RegexQuery
     "any_of",         // AnyOfQuery - exact scalar/list input
+    "match_phrase_prefix", // MatchPhrasePrefixQuery
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),
               "Query gained an arm: name it in ARM_NAMES and decide its expr callability");
@@ -68,6 +69,7 @@ inline constexpr std::string_view mainValueArg(std::string_view fn) {
   if (fn == "any_of") return "values";
   if (fn == "exists") return "field";
   if (fn == "phrase") return "text";
+  if (fn == "match_phrase_prefix") return "text";
   if (fn == "simple_query") return "q";
   if (fn == "prefix") return "prefix";
   if (fn == "wildcard") return "pattern";
@@ -104,6 +106,7 @@ bool withCallableArm(api::Query& q, std::string_view name, F&& f) {
                   std::is_same_v<Arm, api::BooleanQuery> ||
                   std::is_same_v<Arm, api::ExistsQuery> ||
                   std::is_same_v<Arm, api::PhraseQuery> ||
+                  std::is_same_v<Arm, api::MatchPhrasePrefixQuery> ||
                   std::is_same_v<Arm, api::ConstantScoreQuery> ||
                   std::is_same_v<Arm, api::PrefixQuery> ||
                   std::is_same_v<Arm, api::WildcardQuery> ||

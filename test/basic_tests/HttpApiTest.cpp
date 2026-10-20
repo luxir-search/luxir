@@ -788,6 +788,30 @@ TEST_F(HttpApiTest, searchMinScore) {
   EXPECT_NE(search(match, "1000.0").find(R"("found":0)"), std::string::npos);
 }
 
+// Elasticsearch-style "_name" on query clauses: each hit lists the named
+// clauses it matches, or maps them to their scores.
+TEST_F(HttpApiTest, searchNamedQueries) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"nq1","title_w":"named red"},)"
+      R"({"id":"nq2","title_w":"named blue"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto search = [&](const std::string& extra) {
+    auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
+        R"({"query":{"boolean":{"required":[{"match":{"title_w":"named"},"_name":"base"}],)"
+        R"("optional":[{"match":{"title_w":"red"},"_name":"red","boost":2}]}},)"
+        R"("sort":"id asc","fields":["id"],"get_matched_queries":true)" + extra + "}");
+    EXPECT_EQ(200, res.result_int()) << res.body();
+    return res.body();
+  };
+  auto names = search("");
+  EXPECT_NE(names.find(R"("id":"nq1","_matched_queries_":["base","red"])"), std::string::npos)
+      << names;
+  EXPECT_NE(names.find(R"("id":"nq2","_matched_queries_":["base"])"), std::string::npos) << names;
+  auto scores = search(R"(,"include_named_queries_score":true)");
+  EXPECT_NE(scores.find(R"("_matched_queries_":{"base":)"), std::string::npos) << scores;
+  EXPECT_NE(scores.find(R"(,"red":)"), std::string::npos) << scores;
+}
+
 // No "fields" in the request: every retrievable field of each hit comes back
 // (engine fields such as _version_ only when named).
 TEST_F(HttpApiTest, searchWithoutFieldsReturnsEveryRetrievableField) {

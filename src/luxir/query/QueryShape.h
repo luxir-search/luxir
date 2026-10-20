@@ -52,6 +52,7 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
     case QueryKind::PHRASE:
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
+    case QueryKind::PHRASE_PREFIX:
     case QueryKind::KNN:
     case QueryKind::NONE:
     case QueryKind::MIN_SCORE:
@@ -79,6 +80,7 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
     case QueryKind::TERM:
     case QueryKind::PHRASE:
     case QueryKind::FUZZY:
+    case QueryKind::PHRASE_PREFIX:
     case QueryKind::NUMERIC_PREDICATE:
     case QueryKind::KNN:
     case QueryKind::AUTOMATON:
@@ -120,6 +122,7 @@ inline bool exactDomainIdentity(const Query& query) {
     case QueryKind::PHRASE:
     case QueryKind::BOOLEAN:
     case QueryKind::FUZZY:
+    case QueryKind::PHRASE_PREFIX:
     case QueryKind::NUMERIC_PREDICATE:
     case QueryKind::KNN:
     case QueryKind::AUTOMATON:
@@ -164,6 +167,7 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::PHRASE:
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
+    case QueryKind::PHRASE_PREFIX:
     case QueryKind::NUMERIC_PREDICATE:
     case QueryKind::KNN:
     case QueryKind::AUTOMATON:
@@ -217,6 +221,7 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
       return Query::VerificationWork::PRESENT;
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
+    case QueryKind::PHRASE_PREFIX:
     case QueryKind::NUMERIC_PREDICATE:
     case QueryKind::KNN:
     case QueryKind::AUTOMATON:

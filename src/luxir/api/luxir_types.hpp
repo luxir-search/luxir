@@ -67,7 +67,7 @@ struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struc
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
-struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning; struct Error;
+struct MatchPhrasePrefixQuery; struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning; struct Error;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
 struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult;
@@ -117,6 +117,7 @@ enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
+enum class FuzzyRewrite { TOP_TERMS_BLENDED_FREQS = 0, TOP_TERMS = 1, TOP_TERMS_BOOST = 2, CONSTANT_SCORE = 3 };
 namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
@@ -151,9 +152,13 @@ struct RegexQuery { std::string_view field; std::string_view pattern; };
 struct FuzzyQuery {
   std::string_view field;
   std::string_view term;
+  std::optional<std::string_view> fuzziness;
   std::optional<std::int32_t> max_edits;
   std::optional<std::int32_t> prefix_length;
   int32_t max_expansions = 0;
+  FuzzyRewrite rewrite = FuzzyRewrite::TOP_TERMS_BLENDED_FREQS;
+  int32_t rewrite_size = 0;
+  std::optional<bool> transpositions;
 };
 struct PhraseQuery {
   std::string_view field;
@@ -163,6 +168,12 @@ struct PhraseQuery {
   std::span<const ::hpp_proto::bytes_view> terms_bin;
   int32_t slop = 0;
   std::span<const std::int32_t> positions;
+};
+struct MatchPhrasePrefixQuery {
+  std::string_view field;
+  std::string_view text;
+  int32_t slop = 0;
+  int32_t max_expansions = 0;
 };
 struct AllReplicas {};
 struct ReplicaRequirement { std::variant<std::monostate, uint32_t, AllReplicas> kind; };
@@ -860,6 +871,8 @@ struct TopDocs {                                                 // all indirect
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_number = false;
   bool get_scores = false;
+  bool get_matched_queries = false;
+  bool include_named_queries_score = false;
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
   map_view<std::string_view, TopDocs> sources;
@@ -875,6 +888,8 @@ struct Fusion {                                                  // needs TopDoc
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
   bool get_number = false;
   bool get_scores = false;
+  bool get_matched_queries = false;
+  bool include_named_queries_score = false;
 };
 struct Domain {
   ::hpp_proto::optional_indirect_view<Query> query;
@@ -1030,8 +1045,13 @@ struct Match {
   using Operator = luxir::api::Match_::Operator;
   std::string_view field;
   ::hpp_proto::optional_indirect_view<Val> val;
+  std::optional<std::string_view> fuzziness;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
+  std::optional<std::int32_t> prefix_length;
+  std::optional<std::int32_t> max_expansions;
+  std::optional<FuzzyRewrite> fuzzy_rewrite;
+  std::optional<bool> transpositions;
 };
 struct AnyOfQuery {
   std::string_view field;
@@ -1087,8 +1107,9 @@ struct Query {                                                 // needs Match,An
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
-               AnyOfQuery>
+               AnyOfQuery, MatchPhrasePrefixQuery>
       kind;
+  std::string_view name;
 };
 struct UpdateRequest {                                         // needs CommitParams
   std::string_view request_id;
@@ -1112,6 +1133,7 @@ LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) L
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
+LUXIR_TD(MatchPhrasePrefixQuery)
 LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery)
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
@@ -1158,6 +1180,7 @@ LUXIR_ENTRY(TopDocs) LUXIR_ENTRY(Fusion) LUXIR_ENTRY(RrfFusion) LUXIR_ENTRY(Line
 LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXIR_ENTRY(BoostQuery) LUXIR_ENTRY(RescoreQuery)
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
+LUXIR_ENTRY(MatchPhrasePrefixQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(ExprQuery)
 LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)

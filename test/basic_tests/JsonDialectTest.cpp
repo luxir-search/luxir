@@ -379,12 +379,36 @@ TEST(JsonDialect, MatchSugar) {
   EXPECT_EQ(m.operator_, P::Match::Operator::AND);
   EXPECT_EQ(m.min_match, 1);
 
+  m = {};
+  ASSERT_TRUE(P::read_json(m, R"({"title_w":"dune","fuzziness":"AUTO:3,6","prefix_length":0,)"
+                              R"("max_expansions":9,"transpositions":false,)"
+                              R"("fuzzy_rewrite":"top_terms"})", mr));
+  EXPECT_EQ(m.field, "title_w");
+  EXPECT_EQ(*m.fuzziness, "AUTO:3,6");
+  EXPECT_EQ(*m.prefix_length, 0);
+  EXPECT_EQ(*m.max_expansions, 9);
+  EXPECT_FALSE(*m.transpositions);
+  EXPECT_EQ(*m.fuzzy_rewrite, P::FuzzyRewrite::TOP_TERMS);
+
   // two unknown keys / sugar mixed with explicit field or val are rejected
   EXPECT_FALSE(P::read_json(m, R"({"a":"x","b":"y"})", mr));
   EXPECT_FALSE(P::read_json(m, R"({"field":"a","b":"y"})", mr));
   std::string err;
   EXPECT_FALSE(P::read_json(m, R"({"title_w":"x","val":"y"})", mr, &err));
   EXPECT_FALSE(err.empty());
+}
+
+TEST(JsonDialect, FuzzyOptions) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::Query q;
+  ASSERT_TRUE(P::read_json(q, R"({"fuzzy":{"field":"name_s","term":"smith",)"
+                              R"("fuzziness":"AUTO:4,8","transpositions":false,)"
+                              R"("rewrite":"constant_score","rewrite_size":3}})", mr));
+  const auto& f = std::get<P::FuzzyQuery>(q.kind);
+  EXPECT_EQ(*f.fuzziness, "AUTO:4,8");
+  EXPECT_FALSE(*f.transpositions);
+  EXPECT_EQ(f.rewrite, P::FuzzyRewrite::CONSTANT_SCORE);
+  EXPECT_EQ(f.rewrite_size, 3);
 }
 
 TEST(JsonDialect, RangeQuery) {

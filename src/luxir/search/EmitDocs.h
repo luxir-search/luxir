@@ -40,6 +40,7 @@
 #include "luxir/reader/StrColReader.h"
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/search/Collector.h"
+#include "luxir/search/NamedQueries.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
@@ -794,9 +795,10 @@ inline size_t missingSlotBytes(const luxir::api::Column& col) {
 
 // Settle one batch's placement after finishPendingCols.  columnFields[i] is
 // the ReturnField behind response column i and columnPresent[i] its slot
-// tracker (null when untracked, see forEachPresent); later columns (_score_)
-// always stay.  ROWS moves every column to docs.  COLUMNS leaves out a
-// discovered column with no present value; a named one is always present.
+// tracker (null when untracked, see forEachPresent); later columns (_score_,
+// a names-only _matched_queries_) always stay.  ROWS moves every column to
+// docs.  COLUMNS leaves out a discovered column with no present value; a
+// named one is always present.
 // ADAPTIVE leaves out every column with no present value and moves a column
 // to docs when its missing slots cost more than per-document entries for its
 // present values would ((n - p) * missingSlotBytes > p * (key + 4)).  The
@@ -914,7 +916,12 @@ public:
   // Snapshot of req.tg != nullptr: req.tg points at submit()'s stack and may
   // dangle by the time a resumed emitter runs.
   bool parallel;
-  size_t colCap;  // response columns map capacity (fields + _score_)
+  size_t colCap;  // response columns map capacity (fields + _score_ + _matched_queries_)
+  // get_matched_queries: the _matched_queries_ pseudo-field.  Names only
+  // are placed like _score_: an ArrArrStr column except under ROWS, where
+  // they go into the per-document maps.  With scores (a name -> score Map)
+  // it is always in the per-document maps.
+  NamedQueries* namedQueries;
   int64_t batchStart;  // absolute rank cursor, clamped to numCollected
   bool fieldMetadataResolved = false;
   // Per-batch placement scratch, reused across batches: columnFields maps
@@ -931,11 +938,12 @@ public:
                  std::span<ReturnField> fields, int32_t maxBatchSize,
                  int64_t offset, bool getNumber, bool getScores,
                  luxir::api::DocFormat placement, bool parallel, size_t colCap,
-                 DocBatchMetadata metadata)
+                 DocBatchMetadata metadata, NamedQueries* namedQueries)
       : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
         metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
         getScores(getScores), placement(placement), parallel(parallel), colCap(colCap),
+        namedQueries(namedQueries),
         batchStart(std::min(offset, numCollected)) {}
 
   void produce() override;
@@ -1272,8 +1280,45 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     // missing_val and fill its missing slots.  (ROWS mode relies on the
     // exact sentinels for its presence checks.)
     finishPendingCols(pendingCols);
+
+    // Named clauses matched by each row, sorted by row then name.  A
+    // names-only column is added before placement, after the field columns,
+    // so placeBatchColumns keeps it in place like _score_.
+    std::vector<NamedQueries::Hit> namedHits;
+    if (namedQueries != nullptr && columnSize > 0) {
+      namedHits = namedQueries->evaluate(req, segDocs, runs);
+    }
+    bool namedRows = namedQueries != nullptr
+                     && (placement == luxir::api::DocFormat::ROWS || namedQueries->scores);
+    auto rowHits = [&](RowIndex row) {
+      auto first = std::ranges::lower_bound(namedHits, row, {}, &NamedQueries::Hit::row);
+      auto last = std::ranges::upper_bound(namedHits, row, {}, &NamedQueries::Hit::row);
+      return std::span<const NamedQueries::Hit>(first, last);
+    };
+    auto names = [&](std::span<const NamedQueries::Hit> hits) {
+      luxir::api::ArrStr out;
+      auto* values = build::allocArray(out.v, hits.size(), mr);
+      for (size_t j = 0; j < hits.size(); j++) values[j] = namedQueries->names[hits[j].name];
+      return out;
+    };
+    if (namedQueries != nullptr && !namedRows) {
+      auto& column = build::columnSlot(docListProto.columns, colCap, "_matched_queries_", mr);
+      auto* lists = build::allocArray(
+          column.kind.template emplace<luxir::api::ArrArrStr>().v, (size_t)columnSize, mr);
+      for (int i = 0; i < columnSize; i++) lists[i] = names(rowHits((RowIndex)i));
+    }
+
     placeBatchColumns(placement, columnFields, columnPresent, docListProto.columns, rowColumns,
                       (size_t)columnSize, scoreRows, columnFate, rowCaps, mr);
+
+    // A row-placed _matched_queries_ takes one more slot in each row that
+    // matches a named clause; a row matching none omits the field.
+    if (namedRows && !namedHits.empty()) {
+      if (rowCaps.empty()) rowCaps.assign((size_t)columnSize, 0);
+      for (size_t j = 0; j < namedHits.size(); j++) {
+        if (j == 0 || namedHits[j].row != namedHits[j - 1].row) rowCaps[namedHits[j].row]++;
+      }
+    }
 
     // Scores bypass the row columns: every doc has one, and a direct
     // write avoids the all-present column's sentinel ambiguity (a real
@@ -1284,6 +1329,22 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
         for (int i = 0; i < columnSize; i++) {
           build::mapSlot<luxir::api::Val>(rows[i].fields, rowCaps[i], "_score_", mr)->kind =
               getScore(batchStart + i);
+        }
+      }
+      // A row matching no named clause omits the field.
+      for (int i = 0; namedRows && i < columnSize; i++) {
+        auto hits = rowHits((RowIndex)i);
+        if (hits.empty()) continue;
+        auto* value = build::mapSlot<luxir::api::Val>(
+            rows[i].fields, rowCaps[i], "_matched_queries_", mr);
+        if (!namedQueries->scores) {
+          value->kind = names(hits);
+          continue;
+        }
+        auto& map = value->kind.template emplace<luxir::api::Map>();
+        for (const auto& hit : hits) {
+          build::mapSlot<luxir::api::Val>(map.fields, hits.size(),
+              namedQueries->names[hit.name], mr)->kind = hit.score;
         }
       }
     }
@@ -1443,7 +1504,8 @@ void emitDocsResponse(SearchRequest& req,
                       bool getScores,
                       luxir::api::DocFormat docFormat,
                       DocEmission emission,
-                      DocBatchMetadata metadata = {})
+                      DocBatchMetadata metadata = {},
+                      NamedQueries* namedQueries = nullptr)
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1463,7 +1525,8 @@ void emitDocsResponse(SearchRequest& req,
   // loads as a column and placeBatchColumns settles each batch: ROWS puts
   // every field in docs, COLUMNS leaves out all-missing discovered columns,
   // ADAPTIVE picks per field by encoded size.  _score_ (asked for by
-  // get_scores) is a column except under ROWS.
+  // get_scores) is a column except under ROWS, and so is a names-only
+  // _matched_queries_ (get_matched_queries); with scores it is a per-row map.
   std::span<ReturnField> rfields = resolveReturnFields(req, fields);
 
   // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
@@ -1477,8 +1540,8 @@ void emitDocsResponse(SearchRequest& req,
 
   // Response columns map capacity (columnSlot allocates the whole backing
   // array on first insertion, so the cap is paid per batch): every field
-  // plus the synthetic _score_.
-  size_t colCap = 1;
+  // plus the synthetic _score_, and a names-only _matched_queries_ column.
+  size_t colCap = namedQueries != nullptr ? 2 : 1;
   for (const auto& rf : rfields) {
     if (rf.kind != ReturnField::Kind::SCORE) colCap++;
   }
@@ -1489,7 +1552,7 @@ void emitDocsResponse(SearchRequest& req,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
       maxBatchSize, offset, getNumber, getScores, placement,
-      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata));
+      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata), namedQueries);
   req.streamStarted();
   emitter->produce();
 }

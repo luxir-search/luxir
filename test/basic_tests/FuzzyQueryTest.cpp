@@ -26,9 +26,10 @@ using namespace luxir::test;
 class FuzzyQueryTest : public LuxirTest {
 protected:
   std::vector<int32_t> fuzzyDocs(TestIndex& ti, std::string_view field, std::string_view term,
-                                 int maxEdits, int prefixLength, int segOrd, int32_t flags = 0) {
+                                 int maxEdits, int prefixLength, int segOrd, int32_t flags = 0,
+                                 bool transpositions = true) {
     auto g = ti.pool.rewindScopeGuard();
-    FuzzyQuery fq(field, term, maxEdits, prefixLength);
+    FuzzyQuery fq(field, term, maxEdits, prefixLength, 0, 1.0f, std::nullopt, transpositions);
     Query::Context ctx(ti.pool, *ti.reader);
     auto* weight = fq.createWeight(ctx, flags);
     Query::Scorer* scorer = weight->createScorer(ti.pool, ctx.topReader.segments()[segOrd]);
@@ -140,7 +141,7 @@ TEST_F(FuzzyQueryTest, editDistance) {
   f.add(3, "appl");      // 1 deletion
   f.add(4, "apples");    // 1 insertion
   f.add(5, "maple");     // 2 edits
-  f.add(6, "appel");     // transposition -> 2 edits under plain Levenshtein
+  f.add(6, "appel");     // transposition: 1 edit, 2 under plain Levenshtein
   f.add(7, "banana");    // unrelated
   ti.flush();
   f.startReading();
@@ -148,10 +149,12 @@ TEST_F(FuzzyQueryTest, editDistance) {
   using V = std::vector<int32_t>;
   // Exact term only.
   EXPECT_EQ(fuzzyDocs(ti, "foo_w", "apple", 0, 0, 0), (V{0}));
-  // Single-edit neighbors.
-  EXPECT_EQ(fuzzyDocs(ti, "foo_w", "apple", 1, 0, 0), (V{0, 1, 2, 3, 4}));
-  // Two edits add "maple" and the transposition "appel".
+  // Single-edit neighbors, the transposition among them.
+  EXPECT_EQ(fuzzyDocs(ti, "foo_w", "apple", 1, 0, 0), (V{0, 1, 2, 3, 4, 6}));
+  EXPECT_EQ(fuzzyDocs(ti, "foo_w", "apple", 1, 0, 0, 0, false), (V{0, 1, 2, 3, 4}));
+  // Two edits add "maple"; without transpositions they are what "appel" needs.
   EXPECT_EQ(fuzzyDocs(ti, "foo_w", "apple", 2, 0, 0), (V{0, 1, 2, 3, 4, 5, 6}));
+  EXPECT_EQ(fuzzyDocs(ti, "foo_w", "apple", 2, 0, 0, 0, false), (V{0, 1, 2, 3, 4, 5, 6}));
   EXPECT_TRUE(fuzzyDocs(ti, "foo_w", "zzzzz", 2, 0, 0).empty());
   EXPECT_TRUE(fuzzyDocs(ti, "missing_w", "apple", 2, 0, 0).empty());
 }
@@ -328,6 +331,33 @@ TEST_F(FuzzyQueryTest, builderValidationAndAuto) {
   EXPECT_EQ(QueryBuilder::autoMaxEdits(2), 0);
   EXPECT_EQ(QueryBuilder::autoMaxEdits(5), 1);
   EXPECT_EQ(QueryBuilder::autoMaxEdits(6), 2);
+  // AUTO counts code points: "cr<e-grave>me" is 6 bytes but 5 code points.
+  auto* creme = (FuzzyQuery*)builder.createFuzzyQuery("foo_s", "cr\xc3\xa8me");
+  EXPECT_EQ(creme->getMaxEdits(), 1);
+}
+
+// fuzziness strings: AUTO, AUTO:low,high, or an edit count.
+TEST_F(FuzzyQueryTest, builderFuzziness) {
+  auto schema = Schema::createDefaultSchema();
+  MemPool pool;
+  QueryBuilder builder(pool, *schema, CoerceContext{});
+  auto edits = [&](std::string_view fuzziness, std::string_view term) {
+    QueryBuilder::FuzzyOptions opts;
+    QueryBuilder::parseFuzziness(fuzziness, opts);
+    return ((FuzzyQuery*)builder.createFuzzyQuery("foo_s", term, opts))->getMaxEdits();
+  };
+  EXPECT_EQ(edits("AUTO", "apple"), 1);
+  EXPECT_EQ(edits("auto", "applesauce"), 2);
+  EXPECT_EQ(edits("AUTO:3,6", "ab"), 0);
+  EXPECT_EQ(edits("AUTO:3,6", "apple"), 1);
+  EXPECT_EQ(edits("AUTO:6,9", "apple"), 0);
+  EXPECT_EQ(edits("AUTO:2,4", "apple"), 2);
+  EXPECT_EQ(edits("2", "ab"), 2);
+  EXPECT_EQ(edits("0", "apple"), 0);
+  for (std::string_view bad : {"3", "-1", "AUTO:3", "AUTO:6,3", "AUTO:a,b", "AUTOX", "", "1.5"}) {
+    QueryBuilder::FuzzyOptions opts;
+    EXPECT_THROW(QueryBuilder::parseFuzziness(bad, opts), std::runtime_error) << bad;
+  }
 }
 
 // Unset prefix_length defaults to 1; explicit 0 disables it.
@@ -408,7 +438,47 @@ public:
     std::sort(ids.begin(), ids.end());
     return ids;
   }
+
+  std::vector<std::string> exprIds(std::string_view q) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").exprQuery(q).fields({"id"}).limit(100);
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    std::vector<std::string> ids;
+    for (auto& doc : req->getDocs()) {
+      if (auto* v = find(doc, "id")) ids.push_back(std::get<std::string>(*v));
+    }
+    std::sort(ids.begin(), ids.end());
+    return ids;
+  }
 };
+
+TEST_F(FuzzyQueryE2ETest, transpositionsAndCodePoints) {
+  using S = std::vector<std::string>;
+  helper.index(flatdoc("id", "d5", "color_s", "caf\xc3\xa9"), UpdateMessage::COMMIT);
+  // "aplpe" -> "apple" is one swap; two edits without transpositions.
+  EXPECT_EQ(exprIds("fuzzy(aplpe, field=body_w, max_edits=1, prefix_length=0)"), (S{"d1"}));
+  EXPECT_TRUE(exprIds("fuzzy(aplpe, field=body_w, max_edits=1, prefix_length=0, "
+                      "transpositions=false)").empty());
+  // e -> e-acute is one edit on a code point, though two bytes differ.
+  EXPECT_EQ(exprIds("fuzzy(cafe, field=color_s, max_edits=1)"), (S{"d5"}));
+  EXPECT_EQ(exprIds("fuzzy(\"caf\xc3\xa8\", field=color_s, max_edits=1)"), (S{"d5"}));
+}
+
+TEST_F(FuzzyQueryE2ETest, fuzzinessString) {
+  using S = std::vector<std::string>;
+  EXPECT_EQ(exprIds("fuzzy(apple, field=body_w, fuzziness=\"AUTO:3,6\")"), (S{"d1", "d2", "d3"}));
+  EXPECT_EQ(exprIds("fuzzy(apple, field=body_w, fuzziness=\"AUTO:6,9\")"), (S{"d1"}));
+  EXPECT_EQ(exprIds("fuzzy(banan, field=body_w, fuzziness=1)"), (S{"d4"}));
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.fuzzyQuery("body_w", "apple", 1, 0).fields({"id"}).limit(10);
+  std::get<api::FuzzyQuery>(cur.rawQuery().kind).fuzziness = "AUTO";
+  req->execute();
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(req->errorMsg().find("not both"), std::string::npos) << req->errorMsg();
+}
 
 TEST_F(FuzzyQueryE2ETest, textField) {
   using S = std::vector<std::string>;
@@ -539,7 +609,7 @@ TEST_F(FuzzyQueryTest, unsetMaxExpansionsDefaultsToFifty) {
   EXPECT_EQ(60u, req2->getDocs().size());
 }
 
-TEST_F(FuzzyQueryTest, scoringClauseBudgetTruncatesSilently) {
+TEST_F(FuzzyQueryTest, scoringClauseBudgetTruncationWarns) {
   CollectionHelper helper{"main"};
   constexpr int32_t kMatches = FuzzyQuery::FUZZY_CLAUSE_BUDGET + 1;
   for (int32_t i = 0; i < kMatches; i++) {
@@ -550,8 +620,7 @@ TEST_F(FuzzyQueryTest, scoringClauseBudgetTruncatesSilently) {
                  i == kMatches - 1 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
   }
 
-  // Explicit max_expansions above the budget: the budget clamps without a
-  // request warning. The truncation is execution policy, not response data.
+  // Explicit max_expansions above the budget: the budget clamps and says so.
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q")
       .fuzzyQuery("body_w", "aaaaa", 1, 0, 100)
@@ -559,7 +628,77 @@ TEST_F(FuzzyQueryTest, scoringClauseBudgetTruncatesSilently) {
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ((size_t)FuzzyQuery::FUZZY_CLAUSE_BUDGET, req->getDocs().size());
-  EXPECT_TRUE(req->respWarnings().empty());
+  EXPECT_TRUE(req->hasWarning("fuzzy_truncated"));
+
+  // An explicit smaller cap warns too; the constant-score rewrite has no
+  // clause budget and keeps every term.
+  auto capped = localReq(helper.getSearchEngine());
+  capped->collection("main").topDocs("q")
+      .fuzzyQuery("body_w", "aaaaa", 1, 0, 5).fields({"id"}).limit(100);
+  capped->execute();
+  ASSERT_TRUE(capped->ok()) << capped->errorMsg();
+  EXPECT_EQ(5u, capped->getDocs().size());
+  EXPECT_TRUE(capped->hasWarning("fuzzy_truncated"));
+
+  auto all = localReq(helper.getSearchEngine());
+  all->collection("main").topDocs("q")
+      .exprQuery("fuzzy(aaaaa, field=body_w, max_edits=1, rewrite=CONSTANT_SCORE)")
+      .fields({"id"}).limit(100);
+  all->execute();
+  ASSERT_TRUE(all->ok()) << all->errorMsg();
+  EXPECT_EQ((size_t)kMatches, all->getDocs().size());
+  EXPECT_TRUE(all->respWarnings().empty());
+
+  auto sized = localReq(helper.getSearchEngine());
+  sized->collection("main").topDocs("q")
+      .exprQuery("fuzzy(aaaaa, field=body_w, max_edits=1, rewrite=TOP_TERMS, rewrite_size=3)")
+      .fields({"id"}).limit(100);
+  sized->execute();
+  ASSERT_TRUE(sized->ok()) << sized->errorMsg();
+  EXPECT_EQ(3u, sized->getDocs().size());
+  EXPECT_TRUE(sized->hasWarning("fuzzy_truncated"));
+}
+
+// Each rewrite keeps the same terms and scores them its own way: blended
+// stats keep the common exact spelling first, per-term stats let the rare
+// typo's IDF win, boost-only scores are similarity constants, and
+// constant-score ties everything.
+TEST_F(FuzzyQueryTest, rewriteModesScoreDifferently) {
+  CollectionHelper helper{"main"};
+  for (int32_t i = 0; i < 12; i++) {
+    helper.index(flatdoc("id", "exact" + std::to_string(i), "body_w", "apple"),
+                 UpdateMessage::NO_COMMIT);
+  }
+  helper.index(flatdoc("id", "typo", "body_w", "applx"), UpdateMessage::COMMIT);
+
+  auto scores = [&](std::string_view rewrite) {
+    auto req = localReq(helper.getSearchEngine());
+    std::string q = "fuzzy(apple, field=body_w, max_edits=1, prefix_length=0, rewrite="
+        + std::string(rewrite) + ")";
+    req->collection("main").topDocs("q").exprQuery(q).fields({"id"}).limit(-1).getScores();
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto* docs = req->docList();
+    const auto& ids = std::get<api::ColStr>(docs->columns.at("id").kind).v;
+    const auto& vals = std::get<api::ColFloat>(docs->columns.at("_score_").kind).v;
+    std::pair<float, float> out{-1.0f, -1.0f};  // {exact, typo}
+    EXPECT_EQ(ids.size(), 13u);
+    for (size_t i = 0; i < ids.size(); i++) {
+      if (ids[i] == "typo") out.second = vals[i];
+      else out.first = vals[i];
+    }
+    return out;
+  };
+  auto blended = scores("TOP_TERMS_BLENDED_FREQS");
+  EXPECT_GT(blended.first, blended.second);
+  auto perTerm = scores("TOP_TERMS");
+  EXPECT_LT(perTerm.first, perTerm.second);
+  auto boostOnly = scores("TOP_TERMS_BOOST");
+  EXPECT_FLOAT_EQ(boostOnly.first, 1.0f);
+  EXPECT_FLOAT_EQ(boostOnly.second, 1.0f - 1.0f / 5.0f);
+  auto constant = scores("CONSTANT_SCORE");
+  EXPECT_FLOAT_EQ(constant.first, 1.0f);
+  EXPECT_FLOAT_EQ(constant.second, 1.0f);
 }
 
 TEST_F(FuzzyQueryTest, scoredFuzzyTopKMatchesBruteForceWithPruningEngaged) {
@@ -644,7 +783,7 @@ TEST_F(FuzzyQueryTest, boostedFuzzyTopKMatchesBruteForceWithPruningEngaged) {
   EXPECT_LT(pruned.visited, bruteForce.visited);
 }
 
-TEST_F(FuzzyQueryTest, operatorExpansionClampIsSilent) {
+TEST_F(FuzzyQueryTest, operatorExpansionClampWarns) {
   CollectionHelper helper{"main"};
   constexpr int32_t kDocs = 10005;
   std::vector<Doc> docs;
@@ -655,13 +794,14 @@ TEST_F(FuzzyQueryTest, operatorExpansionClampIsSilent) {
   }
   ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
 
-  // Explicit max_expansions above the operator limit: the operator clamp
-  // engages without making response contents depend on a dictionary walk.
+  // The constant-score rewrite has no clause budget, so the operator limit
+  // is what clamps it, and the response says so.
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q")
-      .fuzzyQuery("body_w", "aaaaaaaa", 2, 0, 20000)
-      .fields({"id"}).limit(1);
+      .exprQuery("fuzzy(aaaaaaaa, field=body_w, max_edits=2, prefix_length=0, "
+                 "rewrite=CONSTANT_SCORE)")
+      .fields({"id"}).limit(1).getNumber();
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_TRUE(req->respWarnings().empty());
+  EXPECT_TRUE(req->hasWarning("fuzzy_truncated"));
 }

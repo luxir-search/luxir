@@ -98,6 +98,8 @@ one.
 | `get_number` | Compute and return the exact match count as `found`. |
 | `get_scores` | Add `_score_` to every returned document. |
 | `min_score` | Minimum relevance score. Documents scoring below it do not match; see [Minimum score](#minimum-score). |
+| `get_matched_queries` | Add `_matched_queries_`, the names of the `_name`d clauses each document matches; see [Named queries](query-reference.md#named-queries). |
+| `include_named_queries_score` | With `get_matched_queries`, make `_matched_queries_` a map from name to that clause's score. |
 | `fields` | Fields to retrieve. Omitted: every retrievable field. |
 | `sort` | One sort clause or a list of them. Absent means relevance order. |
 | `batch_size` | Maximum documents in one streaming response batch. |
@@ -585,7 +587,7 @@ clauses, filters, fusion sources, or another query wrapper.
 | Phrase | `{"phrase":{"field":"title_t","text":"way of kings","slop":0}}` | Position-aware; see the [query language](query-language.md#terms-and-phrases) for slop semantics. |
 | Range | `{"range":{"field":"year_i","gte":1960,"lt":1970}}` | Numeric, date, string, ID, or text term ranges. |
 | Prefix | `{"prefix":{"field":"title_t","prefix":"king"}}` | Term prefix, not a general wildcard. |
-| Fuzzy | `{"fuzzy":{"field":"author_s","term":"Sandersen","max_edits":1}}` | Closest-term rewrite; `max_expansions` defaults to `50`. |
+| Fuzzy | `{"fuzzy":{"field":"author_s","term":"Sandersen","fuzziness":"AUTO"}}` | Closest-term rewrite in code points with transpositions; `max_expansions` defaults to `50`. |
 | Boolean | `{"boolean":{"required":[...],"filter":[...],"optional":[...],"prohibited":[...],"min_match":1}}` | Uniform composition of scoring and non-scoring clauses. |
 | Constant score | `{"constant_score":{"query":...,"score":1.0}}` | Replaces child scores without changing its match set. |
 | Boost | `{"boost":{"query":...,"boost":2.0}}` | Multiplies child scores. A numeric `boost` sibling is input sugar. |
@@ -804,6 +806,13 @@ of that batch, while a named column is always present. A field both named
 and matched by a pattern is returned once, so `"fields": ["id", "*"]` returns
 `id` and everything else. `_score_` is requested explicitly (`get_scores`)
 and is a column except under `rows`.
+`_matched_queries_` ([named queries](query-reference.md#named-queries)) is
+requested with `get_matched_queries`: a list of clause names, placed like
+`_score_` (a column under `columns` and `adaptive`, present in every batch,
+with an empty list for a document matching no named clause; a row key under
+`rows`, left out of a document matching none), or with
+`include_named_queries_score` a name-to-score map, always in the row
+documents and left out of a document matching no named clause.
 
 With [field variants](schema.md#field-variants): bare names return the
 primary's stored source or its own column, independently of the search and
@@ -1082,9 +1091,11 @@ supported maximum:
 }
 ```
 
-Treat warning `code` as the machine key and `message` as human detail. The
-fuzzy query expansion limits are execution policy and do not produce response
-warnings.
+Treat warning `code` as the machine key and `message` as human detail. A
+fuzzy query whose expansions a cap drops (an explicit `max_expansions` or
+`rewrite_size`, the 64-term scoring clause budget, or the operator limit)
+warns with `fuzzy_truncated`; the default `max_expansions` of 50 truncates
+silently, as in Lucene.
 
 See [HTTP API conventions](http-api.md#errors) for error responses and how to
 handle a search that fails after streaming has begun.

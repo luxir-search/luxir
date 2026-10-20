@@ -143,6 +143,7 @@ defaults and constraints are described in the comments and guides.
 - [`ListTenantsResponse`](#message-luxir.listtenantsresponse)
 - [`Map`](#message-luxir.map)
 - [`Match`](#message-luxir.match)
+- [`MatchPhrasePrefixQuery`](#message-luxir.matchphraseprefixquery)
 - [`MemoryStats`](#message-luxir.memorystats)
 - [`MultiVector`](#message-luxir.multivector)
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
@@ -1158,6 +1159,8 @@ Required fusion method: exactly one.
 | <a id="field-luxir.fusion.collapse"></a>[`collapse`](#field-luxir.fusion.collapse) | 17 | [`Collapse`](#message-luxir.collapse) | singular | Collapse the fused document list before paging. Source windows never refill. found counts eligible groups; found\_docs counts eligible fused documents. |
 | <a id="field-luxir.fusion.ops"></a>[`ops`](#field-luxir.fusion.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Runs over the union of filtered source ranked lists, even with collapse. Fusion limit and offset do not affect this candidate domain. |
 | <a id="field-luxir.fusion.weights"></a>[`weights`](#field-luxir.fusion.weights) | 16 | map&lt;`string`, `double`&gt; | map | Per-source weights keyed by source name, used by the fusion method. A source without an entry has weight 1. Weights must be finite, &gt;= 0, and within float range, every key must name a source, and at least one source must have a weight &gt; 0. A zero weight disables its source: it is not executed and its documents do not enter the fused list, found, or the ops domain. |
+| <a id="field-luxir.fusion.get_matched_queries"></a>[`get_matched_queries`](#field-luxir.fusion.get_matched_queries) | 18 | `bool` | singular | As TopDocs.get\_matched\_queries, over the named clauses of every source (and fusion filters): a fused document lists the names it matches in any source. Per-source get\_matched\_queries is ignored. |
+| <a id="field-luxir.fusion.include_named_queries_score"></a>[`include_named_queries_score`](#field-luxir.fusion.include_named_queries_score) | 19 | `bool` | singular | as TopDocs.include\_named\_queries\_score |
 
 <a id="message-luxir.fuzzyquery"></a>
 
@@ -1171,9 +1174,13 @@ Matches indexed terms within byte-wise Levenshtein distance of \`term\`. TEXT fi
 |---|---|---|---|---|
 | <a id="field-luxir.fuzzyquery.field"></a>[`field`](#field-luxir.fuzzyquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.fuzzyquery.term"></a>[`term`](#field-luxir.fuzzyquery.term) | 2 | `string` | singular |  |
-| <a id="field-luxir.fuzzyquery.max_edits"></a>[`max_edits`](#field-luxir.fuzzyquery.max_edits) | 3 | `int32` | optional | Maximum edit distance, 0..2. Unset = AUTO by term length: 0 for &lt;=2 bytes, 1 for &lt;=5, else 2. |
-| <a id="field-luxir.fuzzyquery.prefix_length"></a>[`prefix_length`](#field-luxir.fuzzyquery.prefix_length) | 4 | `int32` | optional | Leading bytes that must match exactly. Unset = 1; 0 = no required prefix. |
-| <a id="field-luxir.fuzzyquery.max_expansions"></a>[`max_expansions`](#field-luxir.fuzzyquery.max_expansions) | 5 | `int32` | singular | Max term expansions, closest terms first. Unset/0 = default 50. A positive value requests that cap; the operator/clause budget may lower it with a warning. Negative values are rejected. |
+| <a id="field-luxir.fuzzyquery.max_edits"></a>[`max_edits`](#field-luxir.fuzzyquery.max_edits) | 3 | `int32` | optional | Maximum edit distance, 0..2, counted in code points. Unset = AUTO by term length: 0 for &lt;=2 code points, 1 for &lt;=5, else 2. |
+| <a id="field-luxir.fuzzyquery.prefix_length"></a>[`prefix_length`](#field-luxir.fuzzyquery.prefix_length) | 4 | `int32` | optional | Leading code points that must match exactly. Unset = 1; 0 = no required prefix. |
+| <a id="field-luxir.fuzzyquery.max_expansions"></a>[`max_expansions`](#field-luxir.fuzzyquery.max_expansions) | 5 | `int32` | singular | Max term expansions, closest terms first. Unset/0 = default 50. A positive value requests that cap; the operator/clause budget may lower it. Negative values are rejected. Ignored by the CONSTANT\_SCORE rewrite. |
+| <a id="field-luxir.fuzzyquery.transpositions"></a>[`transpositions`](#field-luxir.fuzzyquery.transpositions) | 6 | `bool` | optional | Count an adjacent transposition ("ab" &lt;-&gt; "ba") as one edit (Damerau / optimal string alignment). Unset = true. |
+| <a id="field-luxir.fuzzyquery.fuzziness"></a>[`fuzziness`](#field-luxir.fuzzyquery.fuzziness) | 7 | `string` | optional | Elasticsearch-style fuzziness, instead of max\_edits: "AUTO" (= AUTO:3,6), "AUTO:low,high" (0 edits below low code points, 1 below high, else 2), or "0", "1", "2". AUTO is case-insensitive. Setting both is an error. |
+| <a id="field-luxir.fuzzyquery.rewrite"></a>[`rewrite`](#field-luxir.fuzzyquery.rewrite) | 8 | [`FuzzyRewrite`](#enum-luxir.fuzzyrewrite) | singular | How expanded terms become the query; see FuzzyRewrite. |
+| <a id="field-luxir.fuzzyquery.rewrite_size"></a>[`rewrite_size`](#field-luxir.fuzzyquery.rewrite_size) | 9 | `int32` | singular | Top-terms rewrites: keep at most this many closest terms (Lucene top\_terms\_N). Unset/0 = max\_expansions decides. Negative is rejected. |
 
 <a id="message-luxir.geoboxquery"></a>
 
@@ -1495,6 +1502,26 @@ Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolea
 | <a id="field-luxir.match.val"></a>[`val`](#field-luxir.match.val) | 2 | [`Val`](#message-luxir.val) | singular |  |
 | <a id="field-luxir.match.operator"></a>[`operator`](#field-luxir.match.operator) | 3 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How to combine the multiple terms an analyzed text field can produce. Unset = OR. |
 | <a id="field-luxir.match.min_match"></a>[`min_match`](#field-luxir.match.min_match) | 4 | `int32` | singular | Minimum number of the analyzed terms that must match (the OR..AND middle ground). When set it overrides \`operator\`; clamped to the term count. Mirrors BooleanQuery.min\_match. |
+| <a id="field-luxir.match.fuzziness"></a>[`fuzziness`](#field-luxir.match.fuzziness) | 5 | `string` | optional | Fuzzy matching: when set, each analyzed term (the single term of a string or id field) matches like a FuzzyQuery on that term, with FuzzyQuery.fuzziness syntax ("AUTO", "AUTO:3,6", "0", "1", "2"). operator and min\_match combine the fuzzy terms as usual. Numeric and date fields reject it. |
+| <a id="field-luxir.match.prefix_length"></a>[`prefix_length`](#field-luxir.match.prefix_length) | 6 | `int32` | optional | FuzzyQuery.prefix\_length for each term. Only with fuzziness. |
+| <a id="field-luxir.match.max_expansions"></a>[`max_expansions`](#field-luxir.match.max_expansions) | 7 | `int32` | optional | FuzzyQuery.max\_expansions for each term. Only with fuzziness. |
+| <a id="field-luxir.match.transpositions"></a>[`transpositions`](#field-luxir.match.transpositions) | 8 | `bool` | optional | FuzzyQuery.transpositions for each term. Only with fuzziness. |
+| <a id="field-luxir.match.fuzzy_rewrite"></a>[`fuzzy_rewrite`](#field-luxir.match.fuzzy_rewrite) | 9 | [`FuzzyRewrite`](#enum-luxir.fuzzyrewrite) | optional | FuzzyQuery.rewrite for each term. Only with fuzziness. |
+
+<a id="message-luxir.matchphraseprefixquery"></a>
+
+### luxir.MatchPhrasePrefixQuery
+
+A phrase whose last analyzed word is a prefix (search-as-you-type): "quick bro" matches "quick brown" and "quick brother". The prefix expands to the first max\_expansions indexed terms in term order, and the phrase matches with any of them in the last position. One analyzed word matches documents containing any expansion.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.matchphraseprefixquery.field"></a>[`field`](#field-luxir.matchphraseprefixquery.field) | 1 | `string` | singular |  |
+| <a id="field-luxir.matchphraseprefixquery.text"></a>[`text`](#field-luxir.matchphraseprefixquery.text) | 2 | `string` | singular | un-analyzed text; its last analyzed word is the prefix |
+| <a id="field-luxir.matchphraseprefixquery.slop"></a>[`slop`](#field-luxir.matchphraseprefixquery.slop) | 3 | `int32` | singular | Same as PhraseQuery.slop. Must be nonnegative. |
+| <a id="field-luxir.matchphraseprefixquery.max_expansions"></a>[`max_expansions`](#field-luxir.matchphraseprefixquery.max_expansions) | 4 | `int32` | singular | Max terms the prefix expands to. Unset/0 = default 50. Negative values are rejected. |
 
 <a id="message-luxir.memorystats"></a>
 
@@ -1698,6 +1725,8 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.wildcard"></a>[`wildcard`](#field-luxir.query.wildcard) | 17 | [`WildcardQuery`](#message-luxir.wildcardquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by wildcard term match |
 | <a id="field-luxir.query.regex"></a>[`regex`](#field-luxir.query.regex) | 18 | [`RegexQuery`](#message-luxir.regexquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by regular-expression term match |
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
+| <a id="field-luxir.query.match_phrase_prefix"></a>[`match_phrase_prefix`](#field-luxir.query.match_phrase_prefix) | 26 | [`MatchPhrasePrefixQuery`](#message-luxir.matchphraseprefixquery) | oneof [`kind`](#oneof-luxir.query.kind) | phrase whose last word is a prefix |
+| <a id="field-luxir.query.name"></a>[`name`](#field-luxir.query.name) | 27 | `string` | singular | Optional clause name. A request with get\_matched\_queries reports, for each returned document, the names of the named clauses it matches (anywhere in the tree, filters included). Reusing a name merges the clauses: the name matches when any of them does. Naming does not change matching or scoring. |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -2307,6 +2336,8 @@ TCP counters for this network namespace (/proc/net/snmp).
 | <a id="field-luxir.topdocs.collapse"></a>[`collapse`](#field-luxir.topdocs.collapse) | 11 | [`Collapse`](#message-luxir.collapse) | singular | limit, offset and found count groups; found\_docs counts eligible documents. |
 | <a id="field-luxir.topdocs.min_score"></a>[`min_score`](#field-luxir.topdocs.min_score) | 14 | `float` | optional | Minimum score cut-off. When set, documents whose query score is below this value do not match: they are excluded from the returned documents, from the get\_number count, and from the domain of ops (facets and metrics). The score compared is the query's own relevance score (filters do not score), computed even when the request sorts by fields or does not return scores. Must be finite. As a Fusion source, the cut-off applies to that source's ranked list. |
 | <a id="field-luxir.topdocs.ops"></a>[`ops`](#field-luxir.topdocs.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed over docs that match this query. |
+| <a id="field-luxir.topdocs.get_matched_queries"></a>[`get_matched_queries`](#field-luxir.topdocs.get_matched_queries) | 16 | `bool` | singular | Return, for each document, the pseudo-field \_matched\_queries\_ listing the names (Query.name) of the named clauses in query and filter that the document matches. Placed like \_score\_: a column except under ROWS (an empty list for a document matching none); in a row, a document matching none omits the field. |
+| <a id="field-luxir.topdocs.include_named_queries_score"></a>[`include_named_queries_score`](#field-luxir.topdocs.include_named_queries_score) | 17 | `bool` | singular | With get\_matched\_queries, return \_matched\_queries\_ as a map of name to that clause's own score instead of a list of names, always in the row documents. |
 
 <a id="message-luxir.transportstats"></a>
 
@@ -2500,6 +2531,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
 - [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit)
+- [`FuzzyRewrite`](#enum-luxir.fuzzyrewrite)
 - [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
 - [`Match.Operator`](#enum-luxir.match.operator)
@@ -2630,6 +2662,21 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 |---|---|---|
 | <a id="value-luxir.fieldfacet.countunit.docs"></a>[`DOCS`](#value-luxir.fieldfacet.countunit.docs) | 0 | Count documents. |
 | <a id="value-luxir.fieldfacet.countunit.groups"></a>[`GROUPS`](#value-luxir.fieldfacet.countunit.groups) | 1 | Distinct keys of the nearest enclosing collapsed list. |
+
+<a id="enum-luxir.fuzzyrewrite"></a>
+
+### luxir.FuzzyRewrite
+
+How a fuzzy query turns its expanded terms into the query that runs. Edit distance is counted in code points; terms are kept closest first. Whenever a cap the request did not leave to the default 50 drops terms (an explicit max\_expansions or rewrite\_size, the 64-term scoring clause budget, or the operator expansion limit), the response carries a fuzzy\_truncated warning.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.fuzzyrewrite.top_terms_blended_freqs"></a>[`TOP_TERMS_BLENDED_FREQS`](#value-luxir.fuzzyrewrite.top_terms_blended_freqs) | 0 | Disjunction of the closest terms, scored with one blended (max) document frequency so a rare misspelling does not outscore the common spelling; each term's score is scaled by its similarity. |
+| <a id="value-luxir.fuzzyrewrite.top_terms"></a>[`TOP_TERMS`](#value-luxir.fuzzyrewrite.top_terms) | 1 | Disjunction of the closest terms, each scored with its own statistics and scaled by its similarity. |
+| <a id="value-luxir.fuzzyrewrite.top_terms_boost"></a>[`TOP_TERMS_BOOST`](#value-luxir.fuzzyrewrite.top_terms_boost) | 2 | Disjunction of the closest terms, each contributing a constant of boost times its similarity. |
+| <a id="value-luxir.fuzzyrewrite.constant_score"></a>[`CONSTANT_SCORE`](#value-luxir.fuzzyrewrite.constant_score) | 3 | Every term within the distance, as one constant-score union: no closest-N selection and no clause budget (the operator expansion limit still applies). |
 
 <a id="enum-luxir.groupcomponent.type"></a>
 
