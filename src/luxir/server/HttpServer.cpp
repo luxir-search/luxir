@@ -46,6 +46,7 @@
 #include <glaze/core/read.hpp>
 #include <glaze/json/prettify.hpp>
 
+#include "luxir/plugin/Registries.h"
 #include "luxir/util/log.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchEngine.h"
@@ -650,7 +651,8 @@ private:
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
     NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
-    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED
+    REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED,
+    PLUGIN
   };
 
   struct RouteMatch {
@@ -668,6 +670,8 @@ private:
     // omitted body field), so dispatch rejects it before any handler resolves it.
     bool emptyCollection = false;
     bool prettyDefault = false;
+    // Route::PLUGIN: the registered routes for the path and its captures.
+    std::optional<HttpRouteRegistry::Match> plugin;
   };
 
   struct PrettyOpts : glz::opts {
@@ -1498,6 +1502,19 @@ private:
       else if (path == "installed") { m.route = Route::REPLICATION_INSTALLED; m.allow = "POST"; }
       return m;
     }
+    if (m.route == Route::NONE) {
+      // Built-in routes win; a plugin route answers only paths they do not.
+      if (auto plugin = Registries::global().http.match(target)) {
+        m.route = Route::PLUGIN;
+        m.allow = plugin->allow;
+        for (const auto& [key, value] : plugin->params) {
+          if (key == "collection") m.coll = value;
+        }
+        m.emptyCollection = target.starts_with("/collections/") && m.coll.empty();
+        m.plugin = std::move(plugin);
+        return m;
+      }
+    }
     bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE ||
                            m.route == Route::STATS || m.route == Route::SCHEMA ||
                            m.route == Route::REPLICATION_SNAPSHOT || m.route == Route::REPLICATION_FILE;
@@ -1541,6 +1558,17 @@ private:
     if (node_.readOnly() && isMutatingRequest(req.method(), target)) {
       respondError(readOnlyError(target));
       return;
+    }
+    const HttpRoute* pluginRoute = nullptr;
+    if (match.route == Route::PLUGIN) {
+      for (const auto* candidate : match.plugin->routes) {
+        if (candidate->method == http::to_string(req.method())) pluginRoute = candidate;
+      }
+      assert(pluginRoute != nullptr);  // methodAllowed checked the same list
+      if (node_.readOnly() && pluginRoute->mutating) {
+        respondError(readOnlyError(target));
+        return;
+      }
     }
 
     if (match.tenantRoute) {
@@ -1682,9 +1710,56 @@ private:
         handleSchemaSet(std::move(req.body()), coll, mode);
         break;
       }
+      case Route::PLUGIN:
+        handlePluginRoute(*pluginRoute, req, target);
+        break;
       case Route::NONE:
         break;
     }
+  }
+
+  // A plugin route runs its handler on the task arena, then answers on the
+  // connection's executor: the handler's body, or the search it asked for.
+  void handlePluginRoute(const HttpRoute& route, http::request<http::string_body>& req, std::string_view target) {
+    struct Call {
+      std::string method;
+      std::string path;
+      std::string body;
+      std::vector<std::pair<std::string, std::string>> pathParams;
+      std::vector<std::pair<std::string, std::string>> queryParams;
+    };
+    auto call = std::make_shared<Call>();
+    call->method = std::string(http::to_string(req.method()));
+    call->path = std::string(target);
+    call->body = std::move(req.body());
+    call->pathParams = route_.plugin->params;
+    for (const auto& param : urlParams_) call->queryParams.emplace_back(param.key, param.value);
+    auto shardPin = makeShardPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), &route, call, tenant = tenant_, shardPin] {
+      HttpPluginResponse response;
+      std::optional<ErrorInfo> failure;
+      try {
+        HttpPluginRequest request{self->node_, call->method, call->path, tenant, call->body,
+                                  call->pathParams, call->queryParams};
+        route.handler(request, response);
+      } catch (const std::exception& e) {
+        failure = classifyException(e, ErrorKind::INTERNAL);
+      }
+      net::post(self->stream_.get_executor(),
+                [self, shardPin, failure = std::move(failure), response = std::move(response)]() mutable {
+                  if (failure) {
+                    self->respondError(*failure);
+                  } else if (response.searchBody) {
+                    // A search with default URL options: the request's own URL
+                    // parameters belong to the plugin, not to the search.
+                    self->handleSearch(*response.searchBody, response.searchCollection,
+                                       HttpSearchFormat::ENVELOPE, SearchUrlOverlay{});
+                  } else {
+                    self->respondSimple((http::status)response.status, response.contentType,
+                                        std::move(response.body));
+                  }
+                });
+    });
   }
 
   static void setCollectionTarget(std::string_view& collection,

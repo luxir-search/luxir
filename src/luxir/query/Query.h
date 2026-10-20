@@ -67,6 +67,9 @@ enum class QueryKind : uint8_t {
   MIN_SCORE,
   COMBINED_FIELDS,
   DIS_MAX,
+  // Every query a plugin query type builds (QueryRegistry). Shape questions
+  // get the conservative answers, as for TEST.
+  PLUGIN,
   TEST,
 };
 

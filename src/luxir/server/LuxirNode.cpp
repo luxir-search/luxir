@@ -6,6 +6,7 @@
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
 #include "Scrubber.h"
+#include "luxir/plugin/Plugin.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/log.h"
 #include "oneapi/tbb/global_control.h"
@@ -124,9 +125,11 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   scrubber = std::make_unique<Scrubber>(*this);
   if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
+  notifyNodeStarted(*this);
 }
 
 LuxirNode::~LuxirNode() {
+  notifyNodeStopping(*this);
   scrubber->stop();
   if (follower) follower->stop();
   commitWaits->close();

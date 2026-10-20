@@ -717,8 +717,17 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 // out of a batch where it has no value).  infos and storedInfos are bound with the
 // first rows (see resolveReturnFieldMetadata), so a count-only response never
 // looks them up.
+// A per-document value the caller computes, returned beside the fields (an
+// operation's synthetic output such as a hop count). value(i, out, mr) fills
+// the value of ranked document i (absolute rank, like getDoc) and leaves out
+// unset for none; mr backs any strings or arrays it allocates.
+struct ExtraColumn {
+  std::string_view name;
+  std::function<void(int64_t i, luxir::api::Val& out, std::pmr::memory_resource& mr)> value;
+};
+
 struct ReturnField {
-  enum class Kind { PHYSICAL, SCORE, VERSION };
+  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA };
 
   std::string_view outputKey;
   std::string_view physicalName;
@@ -727,6 +736,7 @@ struct ReturnField {
   bool discovered;
   IndexReader::FieldSegments infos;
   IndexReader::FieldSegments storedInfos;
+  const ExtraColumn* extra = nullptr;  // Kind::EXTRA only
 };
 
 inline void resolveReturnFieldMetadata(IndexReader& reader, std::span<ReturnField> fields) {
@@ -1140,6 +1150,13 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
           loadVersionRuns(req, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
           registerColumn();
           continue;
+        case ReturnField::Kind::EXTRA: {
+          auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
+          luxir::api::Val* values = build::allocArray(column.v, columnSize, mr);
+          for (int i = 0; i < columnSize; i++) rf.extra->value(batchStart + i, values[i], mr);
+          registerColumn();
+          continue;
+        }
         case ReturnField::Kind::PHYSICAL:
           break;
       }
@@ -1434,7 +1451,8 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
                       luxir::api::DocFormat docFormat,
                       DocEmission emission,
                       DocBatchMetadata metadata = {},
-                      bool foundGte = false)
+                      bool foundGte = false,
+                      std::span<const ExtraColumn> extraColumns = {})
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1455,7 +1473,36 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
   // every field in docs, COLUMNS leaves out all-missing discovered columns,
   // ADAPTIVE picks per field by encoded size.  _score_ (asked for by
   // get_scores) is a column except under ROWS.
-  std::span<ReturnField> rfields = resolveReturnFields(req, fields);
+  // Extra columns are always returned; a field selector naming one is theirs.
+  // A selection made only of extra columns returns just those (an empty
+  // selection still projects the default set).
+  std::vector<std::string_view> selected;
+  bool onlyExtras = false;
+  if (!extraColumns.empty()) {
+    for (std::string_view f : fields) {
+      if (std::ranges::none_of(extraColumns, [f](const ExtraColumn& c) { return c.name == f; })) {
+        selected.push_back(f);
+      }
+    }
+    onlyExtras = selected.empty() && !fields.empty();
+    fields = selected;
+  }
+  std::span<ReturnField> rfields = onlyExtras ? std::span<ReturnField>{} : resolveReturnFields(req, fields);
+  if (!extraColumns.empty()) {
+    // The emitter can outlive the caller's frame (a paused stream), so the
+    // column callbacks and the widened field plan live in the request arena.
+    auto* extras = luxir::arenaCreate<std::vector<ExtraColumn>>(
+        req.arena, extraColumns.begin(), extraColumns.end());
+    size_t count = rfields.size() + extras->size();
+    auto* out = (ReturnField*)req.arena.AllocateAligned(sizeof(ReturnField) * count, alignof(ReturnField));
+    std::uninitialized_copy(rfields.begin(), rfields.end(), out);
+    for (size_t i = 0; i < extras->size(); i++) {
+      ReturnField rf{(*extras)[i].name, {}, nullptr, ReturnField::Kind::EXTRA, false};
+      rf.extra = &(*extras)[i];
+      new (&out[rfields.size() + i]) ReturnField(rf);
+    }
+    rfields = {out, count};
+  }
 
   // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
   // COLUMNS); an out-of-range wire value falls back to the default too.
