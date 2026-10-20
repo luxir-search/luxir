@@ -164,6 +164,10 @@ public:
       inverter.noteFlushWorkspace(ords.slotBytes());
 
       textWriter.startField(&fieldInfo);
+      // Lets applyDeletes skip this segment, or single ids, without a terms seek.
+      // count bounds the terms written; vacated ids are skipped below and
+      // never enter the filter or the min/max range.
+      textWriter.buildIdFilter(count);
       for (int32_t i = 0; i < count; i++) {
         auto term = terms[i];
         if (term.val().docId < 0) continue;

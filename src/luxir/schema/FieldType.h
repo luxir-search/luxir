@@ -76,9 +76,12 @@ public:
   // in this segment field is at least PackedTerm::MIN_FITTED_LEN bytes, so it
   // may be a truncated or hashed (fitted) form of a longer value.
   static constexpr flag_type MAY_HAVE_FITTED = (1 << 14);
+  // Segment-format marker, never supplied by schema configuration: the field
+  // carries an id membership filter and its min/max term (SegFieldInfo::idFilterLoc).
+  static constexpr flag_type ID_FILTER = (1 << 16);
   // Every segment-format marker. A writer derives them from what it writes,
   // so merges never carry them over from source segments.
-  static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED;
+  static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED | ID_FILTER;
 
   const FieldType::Type type_;
   const std::string name_;

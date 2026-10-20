@@ -108,6 +108,12 @@ struct SegFieldInfo {
   seg_location valDocLoc;
   int64_t valDocMetaOff;
 
+  // Optional id membership filter, present only with FieldType::ID_FILTER:
+  // the field's min and max term followed by a split-block bloom filter over
+  // its terms (see IdFilterReader).  Read only when applying deletes.
+  seg_location idFilterLoc;
+  int64_t idFilterLen = 0;
+
   // Within-file references are relative; these are the complete set of
   // segment-global bases.  Relocate them together before FieldInfo is
   // serialized so adding a new absolute base cannot silently update only one
@@ -130,6 +136,7 @@ struct SegFieldInfo {
     relocate(monoLoc);
     relocate(mono2Loc);
     relocate(valDocLoc);
+    relocate(idFilterLoc);
   }
 };
 
