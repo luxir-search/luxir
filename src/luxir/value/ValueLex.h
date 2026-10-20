@@ -100,8 +100,9 @@ NumericLiteral parseNumericLiteral(Cursor& cur, Fail&& fail) {
     return literal;
   }
   char next = cur.peek();
-  if (!cur.atEnd() && cur.wsLen() == 0 && next != ',' && next != ')'
-      && next != '+' && next != '-' && next != '*' && next != '/') {
+  constexpr std::string_view TERMINATORS = ",)+-*/<>=!?:&|";
+  if (!cur.atEnd() && cur.wsLen() == 0
+      && TERMINATORS.find(next) == std::string_view::npos) {
     fail(pos, fmt::format("invalid numeric literal '{}'",
                           cur.slice(pos, cur.position() + 1)));
     return literal;
