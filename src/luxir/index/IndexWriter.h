@@ -320,7 +320,7 @@ public:
     // Call with indexMutex locked.  Records seg (if any) and submits policy
     // merges while a level qualifies and fewer than maxConcurrentMerges are
     // running; returns true if any merge message was sent.  A client force
-    // merge, running or queued, holds policy merges back until it completes.
+    // merge, queued or merging, holds policy merges back until its merge's tail.
     bool _maybeMergeSegments(SegInfo* seg) {
       if (seg != nullptr) _update(seg);
       if (_update(nullptr) < 0) return false;  // counts include merging segments: a cheap upper bound
@@ -335,7 +335,7 @@ public:
       };
 
       bool submitted = false;
-      while (outstandingMerges < maxConcurrentMerges && iw.activeForceMerge == nullptr
+      while (outstandingMerges < maxConcurrentMerges && !iw.forceMergeRunning
              && iw.pendingForceMerges.empty()) {
         auto msg = std::make_unique<MyMergeMessage>();
         msg->segs = _selectMerge();
@@ -403,6 +403,9 @@ public:
   // is completed.  Protected by indexMutex.
   std::deque<UpdateMessage*> pendingForceMerges;
   UpdateMessage* activeForceMerge = nullptr;
+  // The active force merge is in the merge node.  Policy merges wait for it
+  // (and for queued force merges), not for its publication.
+  bool forceMergeRunning = false;
 
   // The last updateNumber generated (the first update number generated will be 1).
   // Only ever advanced from startUpdateBody, whose node has concurrency 1, so the
@@ -800,7 +803,7 @@ private:
   void moveSegmentToDelete(uint64_t segId);
   void applyDeletes(std::span<SegInfo*> segs, const MultiDeletesData& multiDeletesData);
   void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes);
-  bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
+  bool finishMergeTail(bool forceMerge, bool allowSyntheticCommit, bool chainNextMerge);
   bool mergeSegmentsBody(MergeMessage& msg);
 
 public:

@@ -530,12 +530,14 @@ void IndexWriter::_activateNextForceMergeLocked(std::vector<UpdateMessage*>& rej
     UpdateMessage* origin = pendingForceMerges.front();
     pendingForceMerges.pop_front();
     activeForceMerge = origin;
+    forceMergeRunning = true;
 
     auto failAdmission = [&](std::string_view detail) {
       std::string message = "merge admission failed: ";
       message.append(detail);
       setForceMergeError(*origin, message);
       activeForceMerge = nullptr;
+      forceMergeRunning = false;
       rejectedOrigins.push_back(origin);
     };
 
@@ -594,7 +596,7 @@ void IndexWriter::completeForceMerge(MergeMessage& msg) {
     activeForceMerge = nullptr;
     _activateNextForceMergeLocked(completedOrigins);
     if (activeForceMerge == nullptr) {
-      // Policy merges were held back while this one was active.
+      // Policy merges held back for a queued force merge that was rejected.
       try {
         mergePolicy->_maybeMergeSegments(nullptr);
       } catch (const std::exception& e) {
@@ -2109,7 +2111,7 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
   return info.commit_time;
 }
 
-bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge) {
+bool IndexWriter::finishMergeTail(bool forceMerge, bool allowSyntheticCommit, bool chainNextMerge) {
   bool triggerCommit = false;
   std::vector<UpdateMessage*> rejectedForceMerges;
   {
@@ -2121,13 +2123,14 @@ bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge
     // waiters.
     assert(mergePolicy->outstandingMerges > 0);
     mergePolicy->outstandingMerges--;
+    if (forceMerge) forceMergeRunning = false;
 
     // On a contained merge FAILURE the caller passes chainNextMerge=false: the
     // sources were restored unchanged, so _maybeMergeSegments would immediately
-    // re-select the same set and spin the single-concurrency merge node.  The
-    // next segment flush re-triggers _maybeMergeSegments naturally
-    // (event-paced), so a transient failure still self-heals without a busy
-    // loop.  A cause-aware retry/quarantine policy is future work.
+    // re-select the same set and spin the merge node.  The next segment flush
+    // re-triggers _maybeMergeSegments naturally (event-paced), so a transient
+    // failure still self-heals without a busy loop.  A cause-aware
+    // retry/quarantine policy is future work.
     bool anotherMerge = false;
     if (chainNextMerge) {
       try {
@@ -2739,10 +2742,10 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   // failure path above skips source/file restoration and this tail may still
   // request the synthetic publish commit.
   if (clientOrigin) {
-    finishMergeTail(allowSyntheticCommit, chainNextMerge);
+    finishMergeTail(true, allowSyntheticCommit, chainNextMerge);
     return submitMergeCommit(msg, /*publishOnly=*/true);
   }
-  bool triggerCommit = finishMergeTail(allowSyntheticCommit, chainNextMerge);
+  bool triggerCommit = finishMergeTail(false, allowSyntheticCommit, chainNextMerge);
   if (triggerCommit) {
     return submitMergeCommit(msg, /*publishOnly=*/false);
   } else {
