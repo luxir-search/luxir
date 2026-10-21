@@ -20,6 +20,7 @@
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 #include "luxir/query/BooleanWeight.h"
+#include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/PhraseQuery.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/reader/SkipStats.h"
@@ -190,14 +191,15 @@ ScoreTopKResult runFullTextScoreTopKDisjunction(IndexReader& reader,
                                                 std::string_view commonTerm,
                                                 std::string_view rareTerm,
                                                 int32_t topK,
-                                                bool skip) {
+                                                bool skip, bool disMax = false) {
   MemPool pool;
   Query::Context qContext(pool, reader);
   TermQuery common("body_w", commonTerm);
   TermQuery rare("body_w", rareTerm);
   std::vector<Query*> optional = {&common, &rare};
   BooleanQuery query({}, optional, {}, {});
-  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  Query* scoring = disMax ? DisMaxQuery::make(pool, optional, 0.0f) : &query;
+  auto* weight = scoring->createWeight(qContext, Query::NEED_SCORES);
   TopDocsCollector collector(topK);
 
   int64_t nonEssentialLookups = 0;
@@ -215,7 +217,9 @@ ScoreTopKResult runFullTextScoreTopKDisjunction(IndexReader& reader,
         collector.collect(segnum, doc, scorer->score());
       }
     }
-    if (auto* maxScore = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(scorer)) {
+    if (auto* disMaxScorer = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorerT<true>*>(scorer)) {
+      nonEssentialLookups += disMaxScorer->nonEssentialLookupCount();
+    } else if (auto* maxScore = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(scorer)) {
       nonEssentialLookups += maxScore->nonEssentialLookupCount();
     }
   }
@@ -1119,7 +1123,7 @@ static void BM_FullTextScoreTopKDisjunction(benchmark::State& state, int64_t nDo
                                             std::string_view shape,
                                             std::string_view commonTerm,
                                             std::string_view rareTerm,
-                                            bool skip) {
+                                            bool skip, bool disMax = false) {
   int mergeFactor = 10;  // TODO: actually get from IW?
   constexpr int32_t topK = 100;
 
@@ -1138,8 +1142,8 @@ static void BM_FullTextScoreTopKDisjunction(benchmark::State& state, int64_t nDo
 
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
 
-  ScoreTopKResult exhaustive = runFullTextScoreTopKDisjunction(*reader, commonTerm, rareTerm, topK, false);
-  ScoreTopKResult pruned = runFullTextScoreTopKDisjunction(*reader, commonTerm, rareTerm, topK, true);
+  ScoreTopKResult exhaustive = runFullTextScoreTopKDisjunction(*reader, commonTerm, rareTerm, topK, false, disMax);
+  ScoreTopKResult pruned = runFullTextScoreTopKDisjunction(*reader, commonTerm, rareTerm, topK, true, disMax);
   assertSameTopK(exhaustive, pruned);
 
   RSSWatcher watcher;
@@ -1148,7 +1152,7 @@ static void BM_FullTextScoreTopKDisjunction(benchmark::State& state, int64_t nDo
   int64_t visited = 0;
   int64_t nonEssentialLookups = 0;
   for (auto _ : state) {
-    ScoreTopKResult result = runFullTextScoreTopKDisjunction(*reader, commonTerm, rareTerm, topK, skip);
+    ScoreTopKResult result = runFullTextScoreTopKDisjunction(*reader, commonTerm, rareTerm, topK, skip, disMax);
     benchmark::DoNotOptimize(result.fp);
     benchmark::DoNotOptimize(result.visited);
     benchmark::DoNotOptimize(result.nonEssentialLookups);
@@ -1860,6 +1864,7 @@ LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_noskip,  nDocs, shape, "t100",
 // enough to lift the top-k threshold but common enough to supply k winners.
 LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunction, disj_skip,   nDocs, shape, "t0", "t1000", true);
 LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunction, disj_noskip, nDocs, shape, "t0", "t1000", false);
+LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunction, dis_max_skip, nDocs, shape, "t0", "t1000", true, true);
 
 // Clustered-disjunction A/B/C for block-max windowed MaxScore.
 LUXIR_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_windowed,

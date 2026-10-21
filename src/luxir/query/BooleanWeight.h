@@ -4347,6 +4347,18 @@ class BooleanQuery::DisjunctionScorerT final : public Query::Scorer {
     return pointers;
   }
 
+  float disMaxMaxScoreAt(int32_t upTo, bool refined) {
+    DisMaxBounds bounds;
+    for (auto& member : members) {
+      int32_t doc = member.docId();
+      if (doc != luxir::PostingsReader::END && doc <= upTo) {
+        bounds.add(refined ? member.scorer->refineMaxScore(upTo)
+                           : member.scorer->getMaxScore(upTo));
+      }
+    }
+    return bounds.upper(tie, 1.0 + (double) (members.size() + 4) * 0x1p-24);
+  }
+
   int32_t nextMatched(int32_t doc) {
     while (doc != luxir::PostingsReader::END && !matches()) {
       doc = approximationNext();
@@ -4565,42 +4577,62 @@ public:
   }
 
   float getMaxScore(int32_t upTo) override {
-    float sum = 0.0f;
-    for (auto& member : members) {
-      int32_t doc = member.docId();
-      if (doc != luxir::PostingsReader::END && doc <= upTo) {
-        sum += optionalUpperBound(member.scorer->getMaxScore(upTo));
+    if constexpr (DISMAX) {
+      return disMaxMaxScoreAt(upTo, false);
+    } else {
+      float sum = 0.0f;
+      for (auto& member : members) {
+        int32_t doc = member.docId();
+        if (doc != luxir::PostingsReader::END && doc <= upTo) {
+          sum += optionalUpperBound(member.scorer->getMaxScore(upTo));
+        }
       }
+      return sum;
     }
-    return sum;
   }
 
   float refineMaxScore(int32_t upTo) override {
-    float sum = 0.0f;
-    for (auto& member : members) {
-      int32_t doc = member.docId();
-      if (doc != luxir::PostingsReader::END && doc <= upTo) {
-        sum += optionalUpperBound(member.scorer->refineMaxScore(upTo));
+    if constexpr (DISMAX) {
+      return disMaxMaxScoreAt(upTo, true);
+    } else {
+      float sum = 0.0f;
+      for (auto& member : members) {
+        int32_t doc = member.docId();
+        if (doc != luxir::PostingsReader::END && doc <= upTo) {
+          sum += optionalUpperBound(member.scorer->refineMaxScore(upTo));
+        }
       }
+      return sum;
     }
-    return sum;
   }
 
   ScoreBounds scoreBoundsAt(int32_t upTo, bool refined) {
-    ScoreBounds sum = ScoreBounds::exact(0.0f);
-    bool any = false;
-    for (auto& member : members) {
-      int32_t doc = member.docId();
-      if (doc == luxir::PostingsReader::END || doc > upTo) {
-        continue;
+    if constexpr (DISMAX) {
+      DisMaxBounds bounds;
+      for (auto& member : members) {
+        int32_t doc = member.docId();
+        if (doc != luxir::PostingsReader::END && doc <= upTo) {
+          bounds.add(refined ? member.scorer->refineScoreBounds(upTo)
+                             : member.scorer->getScoreBounds(upTo));
+        }
       }
-      ScoreBounds bounds = refined ? member.scorer->refineScoreBounds(upTo)
-                                   : member.scorer->getScoreBounds(upTo);
-      bounds = optionalScoreBounds(bounds);
-      sum = any ? addScoreBounds(sum, bounds) : bounds;
-      any = true;
+      return bounds.bounds(tie, 1.0 + (double) (members.size() + 4) * 0x1p-24);
+    } else {
+      ScoreBounds sum = ScoreBounds::exact(0.0f);
+      bool any = false;
+      for (auto& member : members) {
+        int32_t doc = member.docId();
+        if (doc == luxir::PostingsReader::END || doc > upTo) {
+          continue;
+        }
+        ScoreBounds bounds = refined ? member.scorer->refineScoreBounds(upTo)
+                                     : member.scorer->getScoreBounds(upTo);
+        bounds = optionalScoreBounds(bounds);
+        sum = any ? addScoreBounds(sum, bounds) : bounds;
+        any = true;
+      }
+      return any ? sum : ScoreBounds::exact(0.0f);
     }
-    return any ? sum : ScoreBounds::exact(0.0f);
   }
 
   ScoreBounds getScoreBounds(int32_t upTo) override {
@@ -4623,7 +4655,8 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
   std::span<Scorer*> essentialPointers;
   // Probe order + cumulative bounds for the demoted (non-essential) clauses:
   // neOrder[0..splitIndex) ascending by bound, nePrefix[s] = sum of bounds
-  // over neOrder[0..s] (see scoreCurrentDoc).
+  // over neOrder[0..s]. DISMAX combines this sum with the last (largest)
+  // bound in the prefix (see scoreCurrentDoc).
   std::span<int32_t> neOrder;
   std::span<double> nePrefix;
 
@@ -4644,11 +4677,11 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
   int32_t docid = -1;
   float currentScore = 0.0f;
   int64_t visitedCandidates = 0;
-  // Inflates the double split bound to cover score()'s float-summation rounding:
-  // score() can round above the exact double sum of demoted-clause maxima by up to
-  // ~(m-1) ULP for m clauses, so demoting purely on the exact sum could skip a doc
-  // whose score() rounds > theta.  No-op at theta == lowest().  (scoreCurrentDoc and
-  // getMaxScore accumulate in float, which is already monotonically >= score().)
+  // Inflates double split/probe bounds to cover float score accumulation.
+  // Without headroom, rounding could make a demoted-only doc competitive.
+  // SUM's getMaxScore adds clamped bounds in float, monotonically above score().
+  // DISMAX also allows for its final combination, and its exported bounds use
+  // the same headroom plus outward float rounding.
   double scoreBoundFactor = 1.0;
   int64_t nonEssentialLookups = 0;
   [[no_unique_address]] std::conditional_t<DISMAX, float, SumScorePolicy> tie;
@@ -4718,17 +4751,20 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
   }
 
   void updateGlobalSplit() {
-    // Accumulate the non-essential bound in double so the partition is conservatively
-    // sound: a float running sum could round down below the threshold and demote a clause
-    // whose exact max-sum still reaches it.  Summing the float clauseMax values in double
-    // is exact for any realistic clause count, so a clause is demoted only when the true
-    // sum of clause maxima is strictly below the competitive threshold.
+    // Accumulate clamped bounds in double. In ascending order, the last bound
+    // is the prefix maximum, so both SUM and DISMAX prefix bounds are monotone.
+    // Only demote a prefix whose rounded bound is strictly below the threshold.
     double sum = 0.0;
     size_t newSplit = 0;
     for (; newSplit < scorers.size(); newSplit++) {
       if (!std::isfinite(clauseMax[newSplit])) break;
       double nextSum = sum + (double) clauseMax[newSplit];
-      if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
+      if constexpr (DISMAX) {
+        if (!(disMaxUpperBound(clauseMax[newSplit], nextSum, tie, scoreBoundFactor)
+              < minCompetitiveScore)) break;
+      } else {
+        if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
+      }
       sum = nextSum;
     }
     if (newSplit > splitIndex) {
@@ -4737,7 +4773,7 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
     }
   }
 
-  // Largest non-essential prefix whose cumulative window-max stays under the
+  // Largest non-essential prefix whose combined window bound stays under the
   // threshold, accumulated in double (conservative, as in updateGlobalSplit).
   size_t computeWindowSplit() const {
     double sum = 0.0;
@@ -4746,7 +4782,12 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
       float maxScore = windowMax[(size_t) windowOrder[s]];
       if (!std::isfinite(maxScore)) break;
       double nextSum = sum + (double) maxScore;
-      if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
+      if constexpr (DISMAX) {
+        if (!(disMaxUpperBound(maxScore, nextSum, tie, scoreBoundFactor)
+              < minCompetitiveScore)) break;
+      } else {
+        if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
+      }
       sum = nextSum;
     }
     return s;
@@ -4822,11 +4863,11 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
     if constexpr (DISMAX) {
       float sum = 0.0f;
       float best = -std::numeric_limits<float>::infinity();
-      double partialBound = 0.0;
+      double partialClampedSum = 0.0;
       auto add = [&](float score) {
         sum += score;
         best = std::max(best, score);
-        partialBound += (double) optionalUpperBound(score);
+        partialClampedSum += (double) optionalUpperBound(score);
       };
       for (size_t i = 0; i < scorers.size(); i++) {
         if (isEssential[i] && scorers[i]->docId() == docid) {
@@ -4834,10 +4875,13 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
         }
       }
       for (size_t s = splitIndex; s-- > 0; ) {
-        // Signed evaluated scores cannot bound dis_max. Clamp them just as
-        // nePrefix clamps the upper bounds of the unevaluated children.
-        if ((partialBound + nePrefix[s]) * scoreBoundFactor
-            < (double) minCompetitiveScore) {
+        // The remaining prefix is in ascending bound order. Signed scores
+        // contribute only their positive part to the upper-bound sum.
+        size_t idx = (size_t) neOrder[s];
+        float remainingMax = globalMode ? clauseMax[idx] : windowMax[idx];
+        if (disMaxUpperBound(std::max(best, remainingMax),
+                             partialClampedSum + nePrefix[s], tie, scoreBoundFactor)
+            < minCompetitiveScore) {
           break;
         }
         auto* scorer = scorers[(size_t) neOrder[s]];
@@ -4951,6 +4995,22 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
     }
   }
 
+  float disMaxMaxScoreAt(int32_t upTo, bool refined) {
+    DisMaxBounds bounds;
+    for (auto* scorer : scorers) {
+      bounds.add(refined ? scorer->refineMaxScore(upTo) : scorer->getMaxScore(upTo));
+    }
+    return bounds.upper(tie, scoreBoundFactor);
+  }
+
+  ScoreBounds disMaxScoreBoundsAt(int32_t upTo, bool refined) {
+    DisMaxBounds bounds;
+    for (auto* scorer : scorers) {
+      bounds.add(refined ? scorer->refineScoreBounds(upTo) : scorer->getScoreBounds(upTo));
+    }
+    return bounds.bounds(tie, scoreBoundFactor);
+  }
+
 public:
   [[gnu::cold]] void prepareMembership() override {
     for (auto* scorer : scorers) scorer->prepareMembership();
@@ -5014,35 +5074,51 @@ public:
   }
 
   float getMaxScore(int32_t upTo) override {
-    float sum = 0.0f;
-    for (auto* scorer : scorers) {
-      float maxScore = optionalUpperBound(scorer->getMaxScore(upTo));
-      if (!std::isfinite(maxScore)) {
-        return std::numeric_limits<float>::infinity();
+    if constexpr (DISMAX) {
+      return disMaxMaxScoreAt(upTo, false);
+    } else {
+      float sum = 0.0f;
+      for (auto* scorer : scorers) {
+        float maxScore = optionalUpperBound(scorer->getMaxScore(upTo));
+        if (!std::isfinite(maxScore)) {
+          return std::numeric_limits<float>::infinity();
+        }
+        sum += maxScore;
       }
-      sum += maxScore;
+      return sum;
     }
-    return sum;
   }
 
   float refineMaxScore(int32_t upTo) override {
-    float sum = 0.0f;
-    for (auto* scorer : scorers) {
-      float maxScore = optionalUpperBound(scorer->refineMaxScore(upTo));
-      if (!std::isfinite(maxScore)) {
-        return std::numeric_limits<float>::infinity();
+    if constexpr (DISMAX) {
+      return disMaxMaxScoreAt(upTo, true);
+    } else {
+      float sum = 0.0f;
+      for (auto* scorer : scorers) {
+        float maxScore = optionalUpperBound(scorer->refineMaxScore(upTo));
+        if (!std::isfinite(maxScore)) {
+          return std::numeric_limits<float>::infinity();
+        }
+        sum += maxScore;
       }
-      sum += maxScore;
+      return sum;
     }
-    return sum;
   }
 
   ScoreBounds getScoreBounds(int32_t upTo) override {
-    return sumOptionalScoreBounds(scorers, upTo, false);
+    if constexpr (DISMAX) {
+      return disMaxScoreBoundsAt(upTo, false);
+    } else {
+      return sumOptionalScoreBounds(scorers, upTo, false);
+    }
   }
 
   ScoreBounds refineScoreBounds(int32_t upTo) override {
-    return sumOptionalScoreBounds(scorers, upTo, true);
+    if constexpr (DISMAX) {
+      return disMaxScoreBoundsAt(upTo, true);
+    } else {
+      return sumOptionalScoreBounds(scorers, upTo, true);
+    }
   }
 
   int64_t visited() const {

@@ -249,6 +249,95 @@ TEST_F(DisMaxQueryTest, signedPartialBoundKeepsCompetitiveDoc) {
   EXPECT_GT(scorer->nonEssentialLookupCount(), 0);
 }
 
+TEST_F(DisMaxQueryTest, tightBoundsDemoteMoreClauses) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "one"), flatdoc("id", "two")},
+                             UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  AllQuery all;
+  ConstantScoreQuery small(&all, 1.0f), large(&all, 3.0f);
+  Query* clauses[] = {&small, &small, &large};
+  for (int32_t window : {1, 3}) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto& segment = reader->segments()[0];
+    auto children = [&] {
+      auto scorers = pool.make_span<Query::Scorer*>(3);
+      for (size_t i = 0; i < 3; i++) {
+        scorers[i] = clauses[i]->createWeight(context, Query::NEED_SCORES)->createScorer(pool, segment);
+      }
+      return scorers;
+    };
+    auto* sum = pool.make<BooleanQuery::MaxScoreDisjunctionScorer>(
+        pool, children(), segment.maxDoc(), window);
+    auto* best = pool.make<BooleanQuery::MaxScoreDisjunctionScorerT<true>>(
+        pool, children(), segment.maxDoc(), window, 0.0f);
+    sum->setMinCompetitiveScore(1.5f);
+    best->setMinCompetitiveScore(1.5f);
+    ASSERT_EQ(0, sum->next());
+    ASSERT_EQ(0, best->next());
+    EXPECT_EQ(1, sum->currentSplitIndex());
+    EXPECT_EQ(2, best->currentSplitIndex());
+    EXPECT_FLOAT_EQ(3.0f, best->score());
+  }
+}
+
+TEST_F(DisMaxQueryTest, clampedBoundsInBothScorers) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(flatdoc("id", "one"), UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  AllQuery all;
+  ConstantScoreQuery small(&all, 1.0f), large(&all, 3.0f), negative(&all, -4.0f);
+  Query* clauses[] = {&small, &small, &large, &negative};
+  for (float tie : {0.0f, 0.3f}) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto* query = DisMaxQuery::make(pool, clauses, tie);
+    auto* weight = query->createWeight(context, Query::NEED_SCORES);
+    auto& segment = reader->segments()[0];
+    auto* driven = buildScorerForTests(pool, *weight->scorerSupplier(pool, segment), 1);
+    for (auto* scorer : {weight->createScorer(pool, segment), driven}) {
+      float expected = (1.0f - tie) * 3.0f + tie * 5.0f;
+      for (float upper : {scorer->getMaxScore(PostingsReader::END),
+                           scorer->refineMaxScore(PostingsReader::END),
+                           scorer->getScoreBounds(PostingsReader::END).hi,
+                           scorer->refineScoreBounds(PostingsReader::END).hi}) {
+        EXPECT_GE(upper, expected);
+        EXPECT_NEAR(expected, upper, 1e-5f);
+      }
+      ASSERT_EQ(0, scorer->next());
+      EXPECT_GE(scorer->getScoreBounds(PostingsReader::END).hi, scorer->score());
+      EXPECT_LE(scorer->getScoreBounds(PostingsReader::END).lo, scorer->score());
+    }
+  }
+}
+
+TEST_F(DisMaxQueryTest, subnormalBoundKeepsRoundedScore) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(flatdoc("id", "one"), UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  float unit = std::numeric_limits<float>::denorm_min();
+  AllQuery all;
+  ConstantScoreQuery small(&all, 3.0f * unit);
+  Query* clauses[] = {&small, &small};
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto* query = DisMaxQuery::make(pool, clauses, 0.5f);
+  auto* weight = query->createWeight(context, Query::NEED_SCORES);
+  auto& segment = reader->segments()[0];
+  auto* exhaustive = weight->createScorer(pool, segment);
+  ASSERT_EQ(0, exhaustive->next());
+  float expected = exhaustive->score();
+  auto* driven = buildScorerForTests(pool, *weight->scorerSupplier(pool, segment), 1);
+  for (auto* scorer : {weight->createScorer(pool, segment), driven}) {
+    EXPECT_GE(scorer->getMaxScore(PostingsReader::END), expected);
+    EXPECT_GE(scorer->getScoreBounds(PostingsReader::END).hi, expected);
+    scorer->setMinCompetitiveScore(expected);
+    ASSERT_EQ(0, scorer->next());
+    EXPECT_EQ(expected, scorer->score());
+  }
+}
+
 TEST_F(DisMaxQueryTest, duplicatesIdentityMembershipAndBulk) {
   CollectionHelper helper;
   ASSERT_TRUE(helper.indexAll({flatdoc("id", "both", "title_w", "dune", "body_w", "dune"),
@@ -319,24 +408,33 @@ TEST_F(DisMaxQueryTest, duplicatesIdentityMembershipAndBulk) {
   expectScores(scores(*reader, *otherTie), scores(*reader, *preparedQuery));
 }
 
-TEST_F(DisMaxQueryTest, zeroTieDoesNotMultiplyOverflowedSum) {
+TEST_F(DisMaxQueryTest, overflowedSumKeepsScoresAndBounds) {
   CollectionHelper helper;
   ASSERT_TRUE(helper.index(flatdoc("id", "one"), UpdateMessage::COMMIT).success);
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   AllQuery all;
-  ConstantScoreQuery huge(&all, std::numeric_limits<float>::max());
+  ConstantScoreQuery huge(&all, 0.75f * std::numeric_limits<float>::max());
   Query* clauses[] = {&huge, &huge};
   MemPool pool;
-  auto* query = DisMaxQuery::make(pool, clauses, 0.0f);
-  auto hits = scores(*reader, *query);
-  ASSERT_EQ(1u, hits.size());
-  EXPECT_FLOAT_EQ(std::numeric_limits<float>::max(), hits.begin()->second);
-  Query::Context context(pool, *reader);
-  auto* supplier = query->createWeight(context, Query::NEED_SCORES)
-      ->scorerSupplier(pool, reader->segments()[0]);
-  auto* driven = buildScorerForTests(pool, *supplier, 1);
-  ASSERT_EQ(0, driven->next());
-  EXPECT_FLOAT_EQ(std::numeric_limits<float>::max(), driven->score());
+  for (float tie : {0.0f, 0.3f}) {
+    auto* query = DisMaxQuery::make(pool, clauses, tie);
+    float expected = tie == 0.0f ? huge.getConstantScore() : std::numeric_limits<float>::infinity();
+    auto hits = scores(*reader, *query);
+    ASSERT_EQ(1u, hits.size());
+    EXPECT_EQ(expected, hits.begin()->second);
+    Query::Context context(pool, *reader);
+    auto* weight = query->createWeight(context, Query::NEED_SCORES);
+    auto& segment = reader->segments()[0];
+    auto* driven = buildScorerForTests(pool, *weight->scorerSupplier(pool, segment), 1);
+    for (auto* scorer : {weight->createScorer(pool, segment), driven}) {
+      EXPECT_EQ(expected, scorer->getMaxScore(PostingsReader::END));
+      EXPECT_EQ(expected, scorer->refineMaxScore(PostingsReader::END));
+      EXPECT_EQ(expected, scorer->getScoreBounds(PostingsReader::END).hi);
+      EXPECT_EQ(expected, scorer->refineScoreBounds(PostingsReader::END).hi);
+      ASSERT_EQ(0, scorer->next());
+      EXPECT_EQ(expected, scorer->score());
+    }
+  }
 }
 
 TEST_F(DisMaxQueryTest, infiniteDisjunctScore) {
