@@ -83,11 +83,11 @@ public:
   OpCursor& fields(std::initializer_list<std::string> fieldNames);
   OpCursor& fields(std::span<const std::string> fieldNames);
   OpCursor& batchSize(int32_t n);
-  OpCursor& getNumber(bool v = true);
+  OpCursor& countLimit(int64_t n = -1);
   OpCursor& getScores(bool v = true);
   OpCursor& minScore(float v);
   OpCursor& documentFormat(luxir::api::DocFormat v);
-  OpCursor& withStats() { return getNumber().getScores(); }
+  OpCursor& withStats() { return countLimit().getScores(); }
 
   // --- configure a facet op ---
   OpCursor& limit(int64_t n);     // TopDocs / Fusion / FieldFacet, by op kind
@@ -643,7 +643,7 @@ inline OpCursor& OpCursor::fields(std::span<const std::string> fieldNames) {
   return *this;
 }
 inline OpCursor& OpCursor::batchSize(int32_t n) { asTopDocs().batch_size = n; return *this; }
-inline OpCursor& OpCursor::getNumber(bool v) { asTopDocs().get_number = v; return *this; }
+inline OpCursor& OpCursor::countLimit(int64_t n) { asTopDocs().count_limit = n; return *this; }
 inline OpCursor& OpCursor::getScores(bool v) { asTopDocs().get_scores = v; return *this; }
 inline OpCursor& OpCursor::minScore(float v) { asTopDocs().min_score = v; return *this; }
 inline OpCursor& OpCursor::documentFormat(luxir::api::DocFormat v) { asTopDocs().document_format = v; return *this; }

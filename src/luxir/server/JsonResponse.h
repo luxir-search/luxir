@@ -67,7 +67,7 @@ std::vector<DocRun> renderDocRuns(const luxir::api::SearchResponse& resp);
 //
 // Single-op requests: pure document lines; a marker precedes them only when
 // there is content to carry - found (set exactly when the request asked
-// get_number), warnings (degraded execution must not be silent), or the
+// nonzero count_limit), warnings (degraded execution must not be silent), or the
 // request_id (correlation must not be silent either):
 //   {"_header_":{"request_id":"...","found":N,"warnings":[...]}}
 //

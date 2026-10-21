@@ -187,7 +187,7 @@ public:
     // Build the SearchRequest with the LocalReq builder (used only as a builder; we serialize
     // its `proto`, we do not execute locally).
     auto lreq = localReq(luxirNode->getSearchEngine());
-    lreq->collection("main").topDocs("q").allQuery().getNumber();
+    lreq->collection("main").topDocs("q").allQuery().countLimit();
 
     bool wrote = rstream.Write(lreq->proto);  // lreq stays alive through Write
     EXPECT_TRUE(wrote);
@@ -675,7 +675,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   RequestCreator requestCreator = [&](int64_t docid, luxir::test::LocalReq& req) {
     req.collection("main").requestId(std::to_string(docid));  // set request id to the id so we know what doc we are looking for
     // try to retrieve the document we just indexed
-    auto& q = req.topDocs("q").getNumber().matchQuery("id", std::to_string(docid));
+    auto& q = req.topDocs("q").countLimit().matchQuery("id", std::to_string(docid));
     for (auto& field : retrieveFields) q.fields({std::string(field)});
 
     // Sometimes add integer facet request for id_i
@@ -714,7 +714,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     // the field t2_w contains integers from 1-10, 1-100, and 1-1000.  So if we search for
     // something like "0" it should match > 11% of the docs and use block compression in the codec
     // provided there are enough docs in the index (otherwise tail compression is used).
-    req.topDocs("q").getNumber().limit(1).matchQuery("t2_w", std::to_string(docid % 10));
+    req.topDocs("q").countLimit().limit(1).matchQuery("t2_w", std::to_string(docid % 10));
   };
 
   // record the number of hits per query in a boost flat unordered map
@@ -749,7 +749,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   int32_t batchSize = 5;
   RequestCreator reqc3 = [&](int64_t docid, luxir::test::LocalReq& req) {
     req.collection("main").requestId(std::to_string(docid));
-    auto& q = req.topDocs("q").getNumber().limit(limit).batchSize(batchSize)
+    auto& q = req.topDocs("q").countLimit().limit(limit).batchSize(batchSize)
                  .matchQuery("t2_w", std::to_string(docid % 10));
     for (auto& field : retrieveFields) q.fields({std::string(field)});
   };

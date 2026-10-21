@@ -235,7 +235,7 @@ LocalReq* makeKnnBenchReq(SearchEngine& engine, std::string_view field,
   req->collection("main").requestId("vector-bench");
 
   auto& cur = req->topDocs();
-  cur.limit(k).getNumber().fields({"id"});
+  cur.limit(k).countLimit().fields({"id"});
   cur.rawQuery() = qb::knn(cur.mr(), field, queryVec, k, nprobe, exact, refineCandidates);
   if (groups) {
     std::get<api::KnnQuery>(cur.rawQuery().kind).unit = "groups";

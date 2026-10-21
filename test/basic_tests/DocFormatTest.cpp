@@ -161,7 +161,7 @@ TEST_F(DocFormatTest, rowCountWithoutColumnsOrDocs) {
   auto req = localReq(ch.getSearchEngine());
   req->collection("main").topDocs("q").allQuery()
       .documentFormat(api::DocFormat::ROWS)
-      .getNumber()
+      .countLimit()
       .limit(0);
   req->execute();
   ASSERT_OK(req);

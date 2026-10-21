@@ -259,7 +259,7 @@ void BM_VectorColdColumn(benchmark::State& state) {
     auto* req = LocalReq::create(index.helper->getSearchEngine());
     req->collection("main").requestId("cold-bench");
     auto& cur = req->topDocs();
-    cur.limit(10).getNumber().fields({"id"});
+    cur.limit(10).countLimit().fields({"id"});
     auto knn = qb::knn(cur.mr(), "bench_v", queries[(size_t)(iteration++ % 8)], 10, 0, exact, refine);
     if (domain > 0) {
       auto filter = domain < 1000

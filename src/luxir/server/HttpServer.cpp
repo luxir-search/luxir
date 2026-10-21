@@ -1360,7 +1360,9 @@ private:
       json.string("document_format", *text);
       overlay.hasTopDocs = true;
     }
-    if (!appendBoolParam(params, "get_number", true, json, overlay, err) ||
+    if (!appendIntegerParam<std::int64_t>(params, "count_limit",
+                                         "signed 64-bit decimal integer", true,
+                                         json, overlay, err) ||
         !appendBoolParam(params, "get_scores", true, json, overlay, err)) {
       return false;
     }

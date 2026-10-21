@@ -146,6 +146,27 @@ TEST_F(ValCoerceTest, fieldTypeColInt64Encodings) {
   EXPECT_THROW(dat.coerceColInt64(sval("not a date"), "f"), std::runtime_error);
 }
 
+TEST_F(ValCoerceTest, tryColumnCoercion) {
+  IntFieldType integer("_i");
+  FloatFieldType floating("_f");
+  DoubleFieldType number("_d");
+  DateFieldType date("_dt");
+  const FieldType* types[] = {&integer, &floating, &number, &date};
+  for (const auto* type : types) {
+    EXPECT_FALSE(type->tryCoerceColInt64(sval("dune"), "f"));
+    for (auto text : {"7", "-7", "0"}) {
+      EXPECT_EQ(type->coerceColInt64(sval(text), "f"), type->tryCoerceColInt64(sval(text), "f"));
+    }
+  }
+  EXPECT_EQ(7, integer.tryCoerceColInt64(sval("7.0"), "f"));
+  EXPECT_EQ(1000, integer.tryCoerceColInt64(sval("1e3"), "f"));
+  for (auto text : {"1.5", "1e100", "nan", "inf"}) {
+    EXPECT_FALSE(integer.tryCoerceColInt64(sval(text), "f"));
+  }
+  StrFieldType string("_s");
+  EXPECT_THROW(string.tryCoerceColInt64(sval("7"), "f"), std::runtime_error);
+}
+
 TEST_F(ValCoerceTest, fieldTypeDefaultsThrow) {
   IntFieldType it("_i");
   StrFieldType st("_s");

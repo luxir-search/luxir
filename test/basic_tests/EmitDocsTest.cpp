@@ -227,7 +227,7 @@ TEST_F(EmitDocsTest, countOnlyResponsesSkipReturnFieldMetadata) {
   auto names = [] { return (int64_t)fieldMetadataMemory.names.load(); };
   int64_t before = names();
   auto count = localReq(helper.getSearchEngine());
-  count->collection("main").topDocs("q").allQuery().limit(0).getNumber(true);
+  count->collection("main").topDocs("q").allQuery().limit(0).countLimit();
   count->execute(0);
   ASSERT_OK(count);
   EXPECT_LT(names() - before, FIELDS);

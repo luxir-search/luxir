@@ -726,7 +726,7 @@ TEST_F(StrColTest, BasicMultiValuedColumnStoredStrings) {
   // Search and retrieve the _ssc field
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q")
-      .getNumber()
+      .countLimit()
       .limit(10)
       .allQuery()
       // Request fields including the multi-valued column-stored field
@@ -798,7 +798,7 @@ TEST_F(StrColTest, EmptyAndMissingValues) {
   // Search and retrieve
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q")
-      .getNumber()
+      .countLimit()
       .limit(10)
       .allQuery()
       .fields({"id_s", "tags_ssc"});
@@ -883,7 +883,7 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
   // Verify we can still read the values correctly
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q")
-      .getNumber()
+      .countLimit()
       .limit(10)
       .allQuery()
       .fields({"id_s", "uniform_ssc"});

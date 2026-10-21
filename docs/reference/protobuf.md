@@ -102,6 +102,7 @@ defaults and constraints are described in the comments and guides.
 - [`CreateCollectionResponse`](#message-luxir.createcollectionresponse)
 - [`DeleteCollectionRequest`](#message-luxir.deletecollectionrequest)
 - [`DeleteCollectionResponse`](#message-luxir.deletecollectionresponse)
+- [`DisMaxQuery`](#message-luxir.dismaxquery)
 - [`DiskStats`](#message-luxir.diskstats)
 - [`Diversify`](#message-luxir.diversify)
 - [`DocList`](#message-luxir.doclist)
@@ -144,10 +145,12 @@ defaults and constraints are described in the comments and guides.
 - [`Map`](#message-luxir.map)
 - [`Match`](#message-luxir.match)
 - [`MemoryStats`](#message-luxir.memorystats)
+- [`MultiMatchQuery`](#message-luxir.multimatchquery)
 - [`MultiVector`](#message-luxir.multivector)
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
 - [`OutcomeStats`](#message-luxir.outcomestats)
+- [`PhraseOptions`](#message-luxir.phraseoptions)
 - [`PhraseQuery`](#message-luxir.phrasequery)
 - [`PrefixQuery`](#message-luxir.prefixquery)
 - [`PressureStats`](#message-luxir.pressurestats)
@@ -200,6 +203,7 @@ defaults and constraints are described in the comments and guides.
 - [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq)
 - [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq)
 - [`Warning`](#message-luxir.warning)
+- [`WeightedField`](#message-luxir.weightedfield)
 - [`WildcardQuery`](#message-luxir.wildcardquery)
 
 <a id="message-luxir.activitystats"></a>
@@ -627,7 +631,7 @@ Partition matching documents by an exact, single-valued key.
 | <a id="field-luxir.collapse.field"></a>[`field`](#field-luxir.collapse.field) | 1 | `string` | repeated | One field, or an exact tuple. Uses value binding. |
 | <a id="field-luxir.collapse.missing"></a>[`missing`](#field-luxir.collapse.missing) | 2 | [`Collapse.MissingPolicy`](#enum-luxir.collapse.missingpolicy) | singular |  |
 | <a id="field-luxir.collapse.head_sort"></a>[`head_sort`](#field-luxir.collapse.head_sort) | 3 | [`SortSpec`](#message-luxir.sortspec) | repeated | Display member order; defaults to the list sort. |
-| <a id="field-luxir.collapse.get_number"></a>[`get_number`](#field-luxir.collapse.get_number) | 4 | `bool` | singular | Count members of each returned group in the finalized match set. |
+| <a id="field-luxir.collapse.get_count"></a>[`get_count`](#field-luxir.collapse.get_count) | 4 | `bool` | singular | Count members of each returned group in the finalized match set. |
 | <a id="field-luxir.collapse.ops"></a>[`ops`](#field-luxir.collapse.ops) | 5 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | Per-group operations on matching members; facet count units start at docs. Explicit group units still resolve to this nearest enclosing collapse. |
 | <a id="field-luxir.collapse.sort"></a>[`sort`](#field-luxir.collapse.sort) | 6 | [`SortSpec`](#message-luxir.sortspec) | repeated | Exhaustive group order by metrics in ops; missing/failed values last. Ties use the best member under the list sort, then document order. |
 
@@ -808,6 +812,19 @@ Parameters governing how a commit is performed. Presence of this message in an U
 |---|---|---|---|---|
 | <a id="field-luxir.deletecollectionresponse.name"></a>[`name`](#field-luxir.deletecollectionresponse.name) | 1 | `string` | singular |  |
 
+<a id="message-luxir.dismaxquery"></a>
+
+### luxir.DisMaxQuery
+
+Matches documents that match any query and combines their matching scores as best + tie \* (sum - best), defaulting to the best score (tie = 0). Duplicate queries are kept as separate scoring contributions. A single query scores as itself; tie = 1 is a boolean disjunction. Filter use shares the equivalent boolean's membership and cache key (Elasticsearch dis\_max).
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.dismaxquery.queries"></a>[`queries`](#field-luxir.dismaxquery.queries) | 1 | [`Query`](#message-luxir.query) | repeated | required, non-empty |
+| <a id="field-luxir.dismaxquery.tie"></a>[`tie`](#field-luxir.dismaxquery.tie) | 2 | `float` | optional | Weight of the non-best matching queries. Unset = 0. Must be finite and in \[0, 1\]; 1 adds every score like a boolean disjunction. |
+
 <a id="message-luxir.diskstats"></a>
 
 ### luxir.DiskStats
@@ -859,9 +876,10 @@ A batch of returned documents. Document i is the merge of columns row i and docs
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Exact match count when get\_number was requested. Counts groups with collapse; otherwise Fusion counts source-union documents before paging. |
-| <a id="field-luxir.doclist.found_docs"></a>[`found_docs`](#field-luxir.doclist.found_docs) | 2 | `sint64` | optional | Collapse only, when get\_number was requested, after missing=drop. |
-| <a id="field-luxir.doclist.found_groups"></a>[`found_groups`](#field-luxir.doclist.found_groups) | 8 | `sint64` | optional | Diversify only, with get\_number: distinct eligible keys. |
+| <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Match count when count\_limit is nonzero. Counts groups with collapse; otherwise Fusion counts source-union documents before paging. |
+| <a id="field-luxir.doclist.found_gte"></a>[`found_gte`](#field-luxir.doclist.found_gte) | 9 | `bool` | singular | True when found is a lower bound; false means the count is exact. |
+| <a id="field-luxir.doclist.found_docs"></a>[`found_docs`](#field-luxir.doclist.found_docs) | 2 | `sint64` | optional | Collapse only, when count\_limit is nonzero, after missing=drop. |
+| <a id="field-luxir.doclist.found_groups"></a>[`found_groups`](#field-luxir.doclist.found_groups) | 8 | `sint64` | optional | Diversify only, with nonzero count\_limit: distinct eligible keys. |
 | <a id="field-luxir.doclist.groups"></a>[`groups`](#field-luxir.doclist.groups) | 7 | [`GroupTable`](#message-luxir.grouptable) | singular | Collapse only: complete metadata aligned with this batch's rows. |
 | <a id="field-luxir.doclist.columns"></a>[`columns`](#field-luxir.doclist.columns) | 3 | map&lt;`string`, [`Column`](#message-luxir.column)&gt; | map | Dense columns; each has exactly row\_count slots. |
 | <a id="field-luxir.doclist.docs"></a>[`docs`](#field-luxir.doclist.docs) | 5 | [`Map`](#message-luxir.map) | repeated | Per-document field maps. When present: exactly row\_count entries; docs\[i\] holds the fields of document i not represented as a dense column. A field name never appears in both columns and docs\[i\]. |
@@ -1132,7 +1150,7 @@ Alternate representations of the same input value, keyed by local label. Absent 
 
 ### luxir.Fusion
 
-Hybrid-search fusion: run several source queries (each a full TopDocs spec) and merge their results into a single ranked list.<br><br>Per-source response-shape fields (\`fields\`, \`batch\_size\`, \`offset\`, \`get\_scores\`, \`get\_number\`, \`document\_format\`) are ignored - Fusion controls response shape at the top level. Per-source \`ops\` are rejected; put facets and metrics in Fusion.ops. Each source's \`query\`, \`sort\`, \`limit\`, and any per-source \`filter\` are used to produce that source's ranked list. A source collapse accepts only field and missing, and its limit counts groups; the head documents enter document fusion. Source collapse head\_sort, sort, get\_number and ops are errors.<br><br>The fusion-level \`filter\` is ANDed with each source's own filters.
+Hybrid-search fusion: run several source queries (each a full TopDocs spec) and merge their results into a single ranked list.<br><br>Per-source response-shape fields (\`fields\`, \`batch\_size\`, \`offset\`, \`get\_scores\`, \`count\_limit\`, \`document\_format\`) are ignored - Fusion controls response shape at the top level. Per-source \`ops\` are rejected; put facets and metrics in Fusion.ops. Each source's \`query\`, \`sort\`, \`limit\`, and any per-source \`filter\` are used to produce that source's ranked list. A source collapse accepts only field and missing, and its limit counts groups; the head documents enter document fusion. Source collapse head\_sort, sort, get\_count and ops are errors.<br><br>The fusion-level \`filter\` is ANDed with each source's own filters.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1150,7 +1168,7 @@ Required fusion method: exactly one.
 | <a id="field-luxir.fusion.rrf"></a>[`rrf`](#field-luxir.fusion.rrf) | 10 | [`RrfFusion`](#message-luxir.rrffusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
 | <a id="field-luxir.fusion.linear"></a>[`linear`](#field-luxir.fusion.linear) | 11 | [`LinearFusion`](#message-luxir.linearfusion) | oneof [`method`](#oneof-luxir.fusion.method) |  |
 | <a id="field-luxir.fusion.offset"></a>[`offset`](#field-luxir.fusion.offset) | 4 | `int64` | singular | Response shape (mirrors TopDocs). Zero-based rank of the first returned fused row; must be &gt;= 0. Return up to limit after skipping. Source limits remain candidate-pool sizes: paging cannot reach beyond the union of their ranked windows. Each response DocList.offset is the absolute rank of that batch's first row, or the requested offset for an empty page. |
-| <a id="field-luxir.fusion.get_number"></a>[`get_number`](#field-luxir.fusion.get_number) | 5 | `bool` | singular | eligible groups with collapse, otherwise distinct source-union documents |
+| <a id="field-luxir.fusion.count_limit"></a>[`count_limit`](#field-luxir.fusion.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 requests exact; positive N permits a lower bound. Fusion always supplies an exact count, also valid for N. Counts eligible groups with collapse, otherwise source-union documents. Must be &gt;= -1. |
 | <a id="field-luxir.fusion.get_scores"></a>[`get_scores`](#field-luxir.fusion.get_scores) | 6 | `bool` | singular |  |
 | <a id="field-luxir.fusion.fields"></a>[`fields`](#field-luxir.fusion.fields) | 7 | `string` | repeated | as TopDocs.fields: empty returns every retrievable field, '\*' patterns expand |
 | <a id="field-luxir.fusion.batch_size"></a>[`batch_size`](#field-luxir.fusion.batch_size) | 8 | `int32` | singular | same batching rules as TopDocs.batch\_size |
@@ -1485,7 +1503,7 @@ Tenants that own at least one collection, sorted. HTTP-only: GET /tenants.
 
 ### luxir.Match
 
-Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolean scalar values; numeric and DATE fields accept string or numeric scalars. Null matches nothing. Arrays and structured values are rejected, and GEO\_POINT is unsupported. TEXT values are analyzed and scored; use AnyOfQuery for constant-score value sets and SimpleQuery or ExprQuery for multi-field text.
+Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolean scalar values; numeric and DATE fields accept string or numeric scalars. Null matches nothing. Arrays and structured values are rejected, and GEO\_POINT is unsupported. TEXT values are analyzed and scored; use AnyOfQuery for constant-score value sets and MultiMatchQuery, SimpleQuery, or ExprQuery for multi-field text.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -1512,6 +1530,24 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 | <a id="field-luxir.memorystats.field_metadata"></a>[`field_metadata`](#field-luxir.memorystats.field_metadata) | 4 | [`FieldMetadataStats`](#message-luxir.fieldmetadatastats) | singular |  |
 | <a id="field-luxir.memorystats.node_budget_bytes"></a>[`node_budget_bytes`](#field-luxir.memorystats.node_budget_bytes) | 5 | `uint64` | singular | Configured budget for managed memory (max\_ram\_mb); not an RSS ceiling. Zero is unlimited. |
 | <a id="field-luxir.memorystats.search_request_limit_bytes"></a>[`search_request_limit_bytes`](#field-luxir.memorystats.search_request_limit_bytes) | 6 | `uint64` | singular | Per-request tracked search memory ceiling; zero disables rejection. |
+
+<a id="message-luxir.multimatchquery"></a>
+
+### luxir.MultiMatchQuery
+
+Searches one text across weighted fields. In COMBINED mode, TEXT fields sharing an analyzer and long-term policy form a group scored as one field with BM25F. STRING/ID/numeric/date fields form singleton match groups with multiplicative weights. PER\_FIELD scores a match in each field separately. Group or field scores combine as best + tie \* (sum - best), defaulting to sum (tie = 1). Values that cannot coerce to a field contribute no clause in either mode, including with phrase options; other errors fail the request. If no field contributes, matches nothing. BM25F follows Lucene's CombinedFieldQuery.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.multimatchquery.text"></a>[`text`](#field-luxir.multimatchquery.text) | 1 | `string` | singular | the text to analyze or coerce |
+| <a id="field-luxir.multimatchquery.fields"></a>[`fields`](#field-luxir.multimatchquery.fields) | 2 | [`WeightedField`](#message-luxir.weightedfield) | repeated | Required and non-empty. Fields resolve through their search bindings. Field order does not matter; duplicate physical targets keep the larger weight. Names containing '\*' select indexed TEXT/STRING/ID search targets from concrete declarations and dynamic roots present in reader metadata. Patterns containing '\_\_' select variants; other patterns select roots through their search binding. Declared fields and variants of known roots need not be present in the index. Wildcard lists may resolve to at most 64 distinct physical targets, including explicit selectors; exceeding the limit is an error. |
+| <a id="field-luxir.multimatchquery.mode"></a>[`mode`](#field-luxir.multimatchquery.mode) | 3 | [`MultiMatchQuery.Mode`](#enum-luxir.multimatchquery.mode) | singular | Unset = COMBINED. |
+| <a id="field-luxir.multimatchquery.operator"></a>[`operator`](#field-luxir.multimatchquery.operator) | 4 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How analyzed terms combine. Unset = OR. COMBINED applies this within each group (AND: every term in some field of one group). PER\_FIELD applies it within each field (AND: every term in that field). Must be unset when phrase is present. |
+| <a id="field-luxir.multimatchquery.min_match"></a>[`min_match`](#field-luxir.multimatchquery.min_match) | 5 | `int32` | singular | Zero uses operator. Positive values override operator and are clamped to the analyzed term count within each group/field. Must be &gt;= 0, and must be zero when phrase is present. |
+| <a id="field-luxir.multimatchquery.tie"></a>[`tie`](#field-luxir.multimatchquery.tie) | 6 | `float` | optional | Combines matching field/group scores as best + tie \* (sum - best). Unset = 1 in every mode. Must be finite and in \[0, 1\]. |
+| <a id="field-luxir.multimatchquery.phrase"></a>[`phrase`](#field-luxir.multimatchquery.phrase) | 7 | [`PhraseOptions`](#message-luxir.phraseoptions) | singular | Absent = match. Present = a phrase per TEXT field (requires indexed positions); STRING/ID fields match the whole value, and numeric/date fields still use match coercion. PER\_FIELD only; fields combine by tie, and each weight multiplies its field's score. Operator must be unset and min\_match must be zero. |
 
 <a id="message-luxir.multivector"></a>
 
@@ -1579,6 +1615,18 @@ Completed work by outcome, and its summed duration.
 | <a id="field-luxir.outcomestats.error"></a>[`error`](#field-luxir.outcomestats.error) | 2 | `uint64` | singular |  |
 | <a id="field-luxir.outcomestats.cancelled"></a>[`cancelled`](#field-luxir.outcomestats.cancelled) | 3 | `uint64` | singular |  |
 | <a id="field-luxir.outcomestats.seconds"></a>[`seconds`](#field-luxir.outcomestats.seconds) | 4 | `double` | singular |  |
+
+<a id="message-luxir.phraseoptions"></a>
+
+### luxir.PhraseOptions
+
+Phrase matching options. A present empty message requests an exact phrase.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.phraseoptions.slop"></a>[`slop`](#field-luxir.phraseoptions.slop) | 1 | `int32` | singular | Maximum spread of query-adjusted positions. Must be &gt;= 0; unset = 0. |
 
 <a id="message-luxir.phrasequery"></a>
 
@@ -1698,6 +1746,8 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.wildcard"></a>[`wildcard`](#field-luxir.query.wildcard) | 17 | [`WildcardQuery`](#message-luxir.wildcardquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by wildcard term match |
 | <a id="field-luxir.query.regex"></a>[`regex`](#field-luxir.query.regex) | 18 | [`RegexQuery`](#message-luxir.regexquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by regular-expression term match |
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
+| <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 20 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one text over several weighted fields |
+| <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -2299,7 +2349,7 @@ TCP counters for this network namespace (/proc/net/snmp).
 | <a id="field-luxir.topdocs.filter"></a>[`filter`](#field-luxir.topdocs.filter) | 2 | [`Filter`](#message-luxir.filter) | repeated |  |
 | <a id="field-luxir.topdocs.offset"></a>[`offset`](#field-luxir.topdocs.offset) | 3 | `int64` | singular | Zero-based rank of the first returned document; must be &gt;= 0. Skip this many ranked matches, then return up to limit (-1: all remaining; 0: none). Each response DocList.offset is the absolute rank of that batch's first row, or the requested offset for an empty page. Ignored as a Fusion source. |
 | <a id="field-luxir.topdocs.limit"></a>[`limit`](#field-luxir.topdocs.limit) | 4 | `sint64` | optional | Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining. |
-| <a id="field-luxir.topdocs.get_number"></a>[`get_number`](#field-luxir.topdocs.get_number) | 5 | `bool` | singular | return the number of matching documents |
+| <a id="field-luxir.topdocs.count_limit"></a>[`count_limit`](#field-luxir.topdocs.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 counts exactly; positive N permits stopping at N with found\_gte. An exact count is also valid for N. Must be &gt;= -1. Ops, collapse, diversify, field sorts, nested lists and limit 0 retain exact counting. |
 | <a id="field-luxir.topdocs.get_scores"></a>[`get_scores`](#field-luxir.topdocs.get_scores) | 6 | `bool` | singular | return the relevancy score for each document returned |
 | <a id="field-luxir.topdocs.fields"></a>[`fields`](#field-luxir.topdocs.fields) | 7 | `string` | repeated | Fields to return for each document. Empty returns every retrievable field (stored or column-backed; not vectors or engine fields such as \_version\_), discovered from the index; placement follows document\_format. A name containing '\*' is a pattern expanded the same way: the matching retrievable fields; matching nothing is not an error. Explicitly named fields win on collision and may name anything, vectors and engine fields included. |
 | <a id="field-luxir.topdocs.sort"></a>[`sort`](#field-luxir.topdocs.sort) | 8 | [`SortSpec`](#message-luxir.sortspec) | repeated |  |
@@ -2307,7 +2357,7 @@ TCP counters for this network namespace (/proc/net/snmp).
 | <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | placement of returned fields: rows, columns, or adaptive (see DocFormat) |
 | <a id="field-luxir.topdocs.diversify"></a>[`diversify`](#field-luxir.topdocs.diversify) | 12 | [`Diversify`](#message-luxir.diversify) | singular | Incompatible with collapse; found counts capped documents. |
 | <a id="field-luxir.topdocs.collapse"></a>[`collapse`](#field-luxir.topdocs.collapse) | 11 | [`Collapse`](#message-luxir.collapse) | singular | limit, offset and found count groups; found\_docs counts eligible documents. |
-| <a id="field-luxir.topdocs.min_score"></a>[`min_score`](#field-luxir.topdocs.min_score) | 14 | `float` | optional | Minimum score cut-off. When set, documents whose query score is below this value do not match: they are excluded from the returned documents, from the get\_number count, and from the domain of ops (facets and metrics). The score compared is the query's own relevance score (filters do not score), computed even when the request sorts by fields or does not return scores. Must be finite. As a Fusion source, the cut-off applies to that source's ranked list. |
+| <a id="field-luxir.topdocs.min_score"></a>[`min_score`](#field-luxir.topdocs.min_score) | 14 | `float` | optional | Minimum score cut-off. When set, documents whose query score is below this value do not match: they are excluded from the returned documents, from the match count, and from the domain of ops (facets and metrics). The score compared is the query's own relevance score (filters do not score), computed even when the request sorts by fields or does not return scores. Must be finite. As a Fusion source, the cut-off applies to that source's ranked list. |
 | <a id="field-luxir.topdocs.ops"></a>[`ops`](#field-luxir.topdocs.ops) | 15 | map&lt;`string`, [`SearchOp`](#message-luxir.searchop)&gt; | map | sub-facets or search operations performed over docs that match this query. |
 
 <a id="message-luxir.transportstats"></a>
@@ -2479,6 +2529,19 @@ A nonfatal degradation reported by the query parser or engine. Documented defaul
 | <a id="field-luxir.warning.code"></a>[`code`](#field-luxir.warning.code) | 1 | `string` | singular | stable machine key, e.g. "fuzzy\_clamped", "field\_narrowed" |
 | <a id="field-luxir.warning.message"></a>[`message`](#field-luxir.warning.message) | 2 | `string` | singular | human-readable detail |
 
+<a id="message-luxir.weightedfield"></a>
+
+### luxir.WeightedField
+
+One search field and its weight. TEXT weights scale term frequency and length in COMBINED; all other weights multiply the field's score. JSON also accepts a bare field name or "name^weight" as shorthand.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.weightedfield.field"></a>[`field`](#field-luxir.weightedfield.field) | 1 | `string` | singular |  |
+| <a id="field-luxir.weightedfield.weight"></a>[`weight`](#field-luxir.weightedfield.weight) | 2 | `float` | optional | Unset = 1. Must be finite and &gt; 0 in every mode. |
+
 <a id="message-luxir.wildcardquery"></a>
 
 ### luxir.WildcardQuery
@@ -2505,6 +2568,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
 - [`Match.Operator`](#enum-luxir.match.operator)
+- [`MultiMatchQuery.Mode`](#enum-luxir.multimatchquery.mode)
 - [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds)
 - [`ReplicaResult.Outcome`](#enum-luxir.replicaresult.outcome)
 - [`ReplicationCollectionStatus.State`](#enum-luxir.replicationcollectionstatus.state)
@@ -2667,6 +2731,17 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.match.operator.operator_unspecified"></a>[`OPERATOR_UNSPECIFIED`](#value-luxir.match.operator.operator_unspecified) | 0 | treated as OR |
 | <a id="value-luxir.match.operator.or"></a>[`OR`](#value-luxir.match.operator.or) | 1 | a doc matches if any analyzed term matches |
 | <a id="value-luxir.match.operator.and"></a>[`AND`](#value-luxir.match.operator.and) | 2 | a doc must match every analyzed term |
+
+<a id="enum-luxir.multimatchquery.mode"></a>
+
+### luxir.MultiMatchQuery.Mode
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.multimatchquery.mode.combined"></a>[`COMBINED`](#value-luxir.multimatchquery.mode.combined) | 0 | TEXT weights scale term frequency and document length at every group size. Other fields are singleton groups with multiplicative weights. |
+| <a id="value-luxir.multimatchquery.mode.per_field"></a>[`PER_FIELD`](#value-luxir.multimatchquery.mode.per_field) | 1 | One match or phrase per field; each weight multiplies its score. |
 
 <a id="enum-luxir.rangefacet.bounds"></a>
 

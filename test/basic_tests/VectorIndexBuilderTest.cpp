@@ -217,7 +217,7 @@ std::vector<std::string> runKnnIds(SearchEngine& engine, std::string_view field,
                                   int32_t nprobe = 0, int32_t refineCandidates = 0,
                                   bool exact = false) {
   auto req = localReq(engine);
-  auto& cur = req->collection("main").topDocs("q").getNumber().fields({"id"});
+  auto& cur = req->collection("main").topDocs("q").countLimit().fields({"id"});
   cur.rawQuery() = qb::knn(cur.mr(), field, queryVec, k, nprobe, exact, refineCandidates);
 
   req->execute();

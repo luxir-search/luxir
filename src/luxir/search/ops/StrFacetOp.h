@@ -1650,7 +1650,7 @@ public:
         : Calculator(child, &parent, -1, numSlots), child(child) {}
 
     luxir::api::Val* getTargetForSub(
-        SearchResponse* resp, Calculator* sub) override {
+        SearchResponse* resp, SearchOp& sub) override {
       unused(resp);
       unused(sub);
       return nullptr;

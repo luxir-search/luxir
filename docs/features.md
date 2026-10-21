@@ -41,7 +41,7 @@ POST /collections/main/_search
   },
   "fields": ["id", "title_t", "price_f"],
   "limit": 2,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "series": {
       "field_facet": {
@@ -122,9 +122,11 @@ whole machine. Designed from the start for parallelism on modern hardware.
   that cannot be competitive. Per-block min/max zone maps enable pruning
   even without a points (BKD) index.
 - **Range pruning:** Numeric ranges and value sets skip irrelevant column
-  blocks, accept fully covered blocks, and decode only blocks requiring
-  closer inspection. The same zone maps enable this without a points (BKD)
-  index.
+  blocks, accept fully covered blocks, and inspect only the values that
+  need it: crossing blocks are split by their 512-value leaf zones, and
+  linear-fit blocks (sorted ramps such as time-ordered timestamps) by the
+  rank intervals their fit bounds, leaving a narrow band at each range edge
+  to decode. The same zone maps enable this without a points (BKD) index.
 - **Adaptive facet execution:** Dynamically selects counting strategies and
   counter representations to suit the matching documents and field
   cardinality, balancing speed and memory use.
@@ -228,6 +230,19 @@ Anywhere a query goes, it can be a structured object or an expression string.
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
 - `knn` vector search, `geo_box`, and `geo_distance`.
+- `multi_match`: search one text across weighted fields. `combined`
+  (default) scores TEXT fields sharing an analyzer and long-term policy as
+  one field with BM25F; weights scale term frequency and length at every
+  group size. STRING/ID/numeric/date fields form singleton groups with
+  score multipliers. `per_field` multiplies each field's match score, with
+  optional `phrase` matching on TEXT fields. `tie` combines field/group
+  scores (default `1`, sum); `0` keeps the best. Fields whose text cannot
+  coerce are skipped. `*` patterns select indexed TEXT/STRING/ID targets,
+  limited to `64` physical targets after resolving bindings and deduplicating.
+  See [Multi-match](guide/query-reference.md#multi-match).
+- `dis_max`: the best matching query score plus `tie` times the other
+  matching scores. Default `tie: 0` keeps the best; `tie: 1` adds scores like
+  a boolean disjunction. Duplicate queries contribute separately.
 - `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,
   quoted phrases with `~N` slop, grouping, trailing-`*` prefix, `~N` fuzzy
   terms, and `field:value` terms against an allowlist).
@@ -265,7 +280,7 @@ Anywhere a query goes, it can be a structured object or an expression string.
   ranked lists, facets, metrics, and fusion, nested to any depth and executed
   in parallel. HTTP responses preserve their names and nesting under `ops`.
   Root query shorthand returns `found` and `docs` directly in the HTTP envelope.
-- Count-only and analytics-only requests: `limit: 0` with `get_number: true`
+- Count-only and analytics-only requests: `limit: 0` with `count_limit: -1`
   loads no document fields.
 - Stream every match: `limit: -1` with `?format=docs` returns one document
   per line over one connection, with no cursor, scroll state, or page size.
@@ -291,9 +306,10 @@ Anywhere a query goes, it can be a structured object or an expression string.
   order with zero counts included, daylight-saving changes handled.
 - Nesting: sub-facets under buckets, metrics per bucket, and a ranked
   `top_docs` (or `fusion`) list per bucket, all in one request.
-- Expression metrics: `avg`, `sum`, `min`, and `max` over value expressions
-  (`sum(price_f * qty_i) / sum(qty_i)`), at query level or per bucket; facets
-  can sort by a named metric.
+- Expression metrics: `avg`, `sum`, `min`, `max`, distinct counts
+  (`cardinality`), `percentile`, and exact `percentile_rank` over value
+  expressions (`sum(price_f * qty_i) / sum(qty_i)`), at query level or per
+  bucket; facets can sort by a named metric.
 - Easy [multi-select navigation](guide/faceting.md#easy-multi-select-with-selected):
   put choices in each facet's `selected` array. Luxir builds the filters and
   automatically counts alternatives with the other facets' selections applied.

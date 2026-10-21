@@ -344,6 +344,12 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
           e.what());
         msg->result.setException(e);
       }
+      catch (...) {
+        // Escaping the node would cancel the graph and strand this commit.
+        std::runtime_error error("Unknown non-standard exception while committing");
+        LOG_ERROR("finishCommitBody Exception Caught: exception={}", error.what());
+        msg->result.setException(error);
+      }
 
       metric.finish(dispatchCompletion && msg->result.errored() ? MetricOutcome::ERROR : MetricOutcome::OK);
       if (dispatchCompletion) {
@@ -1273,32 +1279,28 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // Not for a commit that waits for replicas: that wait relies on a generation
   // newer than any follower has acknowledged, even after a follower restart.
 
-  // Apply deletes from all segments that were part of this commit to all segments in the index.
-  // This must be mutually exclusive with segment merging, or we must do some form of optimistic concurrency.
-
-  // Optimistic concurrency for deletes strategy:
-  // 1. With index lock held: grab list of all segments and mark them as being part of a commit.  This will
-  //    prevent the SegmentInfo from being deleted.
-  // 2. Apply deletes to all of the snapshot segments.
-  // 3. Write the segments file with the snapshot.
-  // 4. With index lock held: check if any new segments were created by merging.  If so, it's our job
-  //    to apply deletes to those segments as well.  If any of the segments in our snapshot are marked
-  //    as being merged, then signal the segmentMerger to transfer the deletes to those new segments.
-  //    NOTE: both conditions could be true, some segments merged, some segments in process of being merged.
-  //    NOTE: instead of applying deletes to the new segments, we could just wait for the
-  //          next commit (which will use that new segment) to apply the deletes attached to it.
-
-  // THOUGHT: what if a segment with personal deletes is merged?  Need to merge the personal deletes
-  // of all segments as well?  Or else segment merger needs to handle that.  The latter would get
-  // rid of the personal deletes faster, but would mean that it could be concurrent with applying deletes
-  // in finishCommitBody().
-
+  // Pin the application snapshot through publication. A concurrent merge
+  // diffs source liveDocs before swapping; applications finishing after that
+  // swap forward their packets to its output for the next application.
 
   MultiDeletesData commitDeletes;
   uint64_t maxDeleteVersion;
 
   std::vector<SegInfo*> segs;
   std::vector<SegInfo*> segsToApplyDeletes;
+  std::vector<SegInfo*> markedInUse;
+
+  // A failed commit must clear its in-use marks: a marked segment that a merge
+  // retires before the next successful commit would otherwise never be deleted.
+  // Cleared once published, when publication or the empty-segment drop below
+  // has replaced every mark and retirement may free the segments.
+  auto releaseInUseMarks = scope_guard([&] {
+    if (markedInUse.empty()) return;
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    for (auto* seg : markedInUse) {
+      if (seg->lastCommitTime == 1) seg->lastCommitTime = 0;
+    }
+  });
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
@@ -1307,11 +1309,13 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     msg.commitInfo->highestUpdateVersion =
       std::max({durableUpdateVersion, msg.updateVersion, maxDeleteVersion});
     segs.reserve(segInfos.size());
+    markedInUse.reserve(segInfos.size());
     // grab all segments and mark them as being part of a commit.
     for (auto& [segId, seg] : segInfos) {
       segs.push_back(seg.get());
       if (seg->lastCommitTime == 0) {
         seg->lastCommitTime = 1; // IMPORTANT - for marking it in use to prevent its deletion.
+        markedInUse.push_back(seg.get());
       }
       if (mayApplyDeletes(*seg, commitDeletes) || mayApplyDeletes(*seg, seg->personalDeletes)) {
         // this segment has personal deletes and/or commit-level deletes that need to be applied.
@@ -1331,7 +1335,6 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
     INDEX_DEBUG("finishCommitBody: msg={} no deletes to apply.", (void*)&msg);
   }
   else {
-    // TODO: doesn't take into account personal deletes.
     INDEX_DEBUG("finishCommitBody: msg={} applying deletes to {} segments.", (void*)&msg, segs.size());
     // This is where seg.liveGen can change!
     // Can personal deletes be mutated elsewhere?
@@ -1341,103 +1344,31 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   }
 
 
-  //
-  // Now check if any of the segments were merged without necessary deletes applied.
-  // There are 3 possibilities:
-  // 1. An old segment liveGen is in the process of being merged.  We will add personalDeletes to the old
-  //    segment and then the segment merger will copy them to the new segment.
-  // 2. An old segment liveGen was merged.  We must handle putting personalDeletes on the new segment.
-  //    We won't know exactly what segment, since there could have been multiple merges.
-  // 3. A segment merge starts right here. No issues since it sees the latest liveGen.
-  //
+  // A running merge carries completed applications by liveDocs diff. Only
+  // an application finishing after the swap needs a packet carry to the output.
+  // publishOnly commits retire nothing; their batches stay pending.
+  const uint64_t retireThrough = msg.publishOnly ? 0 : msg.updateVersion;
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
-
-    std::vector<SegInfo*> startedMergingOldVersions;
-    std::vector<SegInfo*> finishedMergingOldVersions;
-    MultiDeletesData personalDeletes;
-    // personal deletes from segments that finished merging too early.
-
-    // Check if any segments were merged before deletes were applied.
-    for (auto& seg : segs) {
-      INDEX_TRACE("postApplyDeletes CHECK seg{}", *seg);
-      if (seg->mergedLiveGen >= 0) {
-        // segment was merged.
-        if (seg->mergedLiveGen == (int64_t)seg->liveGen) {
-          // this segment was merged (or is currently merging) with the latest liveGen, so no issues. We've applied all deletes,
-          // so we can drop any personal deletes to save space. Merger does not try to apply personal deletes.
-          seg->personalDeletes.clear();
-          INDEX_DEBUG("finishCommitBody: msg={} segment {} was merged with latest liveGen {}", (void*)&msg, seg->name(),
-                      seg->liveGen);
-          continue;
-        }
-
-        if (seg->merging == true) {
-          INDEX_DEBUG("Detected merging segments with old deletes {}", *seg);
-          startedMergingOldVersions.push_back(seg);
-        }
-        else {
-          INDEX_DEBUG("Detected finished merge of segment with old deletes {}", *seg);
-
-          finishedMergingOldVersions.push_back(seg);
-          // since this segment was already merged, we can just move it's personal deletes off
-          personalDeletes.addAll(seg->personalDeletes);
-          seg->personalDeletes.clear();
+    for (auto* seg : segs) {
+      if (!seg->merging && seg->mergedLiveGen >= 0 && seg->mergedLiveGen != (int64_t)seg->liveGen) {
+        // Swaps keep mergedIntoSegId on the latest output. An output that is
+        // no longer live has nothing left to delete.
+        if (auto it = segInfos.find(seg->mergedIntoSegId); it != segInfos.end()) {
+          auto& target = *it->second;
+          // The output is newer than this snapshot. Attach before clearing
+          // the source so an allocation failure keeps the packets.
+          assert(std::ranges::find(segs, &target) == segs.end());
+          target.personalDeletes.addAll(seg->personalDeletes);
+          // Batches this application does not retire reach the output from pending.
+          for (const auto& batch : commitDeletes.deletes) {
+            if (batch->getLargestVersion() <= retireThrough) target.personalDeletes.deletes.insert(batch);
+          }
         }
       }
-      else {
-        // segment was not merged and is not merging, so drop any personal deletes it had
-        // because they have been applied.
-        if (!seg->personalDeletes.empty()) {
-          INDEX_DEBUG("finishCommitBody: segment {} dropping personal deletes.", seg->name());
-          seg->personalDeletes.clear();
-        }
-      }
+      seg->personalDeletes.clear();
     }
-
-    if (!startedMergingOldVersions.empty() || !finishedMergingOldVersions.empty()) {
-      // Since only one merge can happen at once, we only need to add personal deletes to
-      // one of the segments that are being merged to get them transferred to the new segment when it is done.
-      if (!startedMergingOldVersions.empty()) {
-        auto& seg = *startedMergingOldVersions.front();
-        // no segments were merged, so we can just apply deletes to the new segments.
-        INDEX_DEBUG("finishCommitBody: Added personal deletes currently merging {}", seg);
-        seg.personalDeletes.addAll(commitDeletes);
-
-#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_TRACE
-        for (auto& d : seg.personalDeletes.deletes) {
-          INDEX_TRACE("\tpersonal deletes: {}", d->toString());
-        }
-#endif
-      }
-
-
-      // For segments that were already merged, look for new segments to attach personal deletes to.
-      // They won't be applied immediately, but will be the next time this commit code is entered.
-      // Add the applied batches to the personal deletes we previously collected and find the max delete version
-      // since it is possible for personal deletes to be higher than commit deletes.
-      personalDeletes.addAll(commitDeletes);
-      auto maxAllDeleteVersion = personalDeletes.getLargestVersion();
-      auto numSegmentsMissingDeletes = 0; // sanity check - we should find some.
-      for (auto& [segId, seg] : segInfos) {
-        // TODO: is it possible for any personal deletes to be higher than the maxDeletedVersion here?
-        // Uhhh, yes! There could be *no* deletes in a commit other than the personal deletes.
-        if (seg->minVersion < maxAllDeleteVersion && seg->lastCommitTime == 0) {
-          // this segment has deletes that need to be applied, so append to its personal deletes.
-          numSegmentsMissingDeletes++;
-          // *copy* all of the collected delete sets
-          seg->personalDeletes.addAll(personalDeletes);
-          INDEX_DEBUG("finishCommitBody: Added personal deletes for {}", *seg);
-        }
-      }
-
-      if (numSegmentsMissingDeletes == 0) {
-        // One was this can happen is if a merger resulted in totally dropping a segment.
-        INDEX_DEBUG(
-          "A segment was merged with old deletes, but no merged segments were found that needed deletes applied. Was segment deleted?");
-      }
-    }
-  } // end index lock
+  }
 
   // Check if any of the segments are now empty and remove them from the list.
   std::vector<SegInfo*> segsToKeep;
@@ -1519,19 +1450,16 @@ bool IndexWriter::finishCommitBody(UpdateMessage& msg) {
   std::unique_lock publicationLock(publicationMutex);
   CommitId result{incarnation, 0};
   writeIndexInfoFile(segsToKeep, *msg.commitInfo, auxIndexInfos);
+  markedInUse.clear();
   for (auto* seg : segsToKeep) seg->unsyncedFiles.clear();
   result.index_gen = indexGen;
   msg.resultingCommit = std::move(result);
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
-    if (!msg.publishOnly) {
-      // Retire only batches in this snapshot. Later flushes may have registered
-      // more while deletes were applied. Merge catch-up owns its own references.
-      for (const auto& batch : commitDeletes.deletes) {
-        if (batch->getLargestVersion() <= msg.updateVersion) {
-          pendingDeletes.deletes.erase(batch);
-        }
-      }
+    // Retire only batches in this snapshot. Later flushes may have registered
+    // more while deletes were applied. Merge catch-up owns its own references.
+    for (const auto& batch : commitDeletes.deletes) {
+      if (batch->getLargestVersion() <= retireThrough) pendingDeletes.deletes.erase(batch);
     }
   }
   publicationLock.unlock();
@@ -1593,7 +1521,8 @@ void IndexWriter::tryDeleteSegments() {
         // commit's sync list, including after a failed publication.
         std::erase_if(seg.obsoleteLiveGens, [&](uint64_t gen) {
           if (gen == seg.liveGen || gen >= seg.publishedLiveGen
-              || (seg.mergedLiveGen > 0 && gen == (uint64_t)seg.mergedLiveGen)) return false;
+              || (seg.mergedLiveGen > 0 && gen == (uint64_t)seg.mergedLiveGen)
+              || (seg.mergeDiffLiveGen > 0 && gen == (uint64_t)seg.mergeDiffLiveGen)) return false;
           auto name = Postings::getLiveDocsFileName(Postings::getSortableString(seg.segId), gen);
           liveDocsToDelete.push_back(std::move(name));
           return true;
@@ -2495,10 +2424,74 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         phase = "after_merge_vector_overlay";
       }
 
-      phase = "publish_swap_prepare";
-      // Move old segments to the delete list and add the new segment info.
-      {
+      std::vector<uint64_t> coveredGens;
+      coveredGens.reserve(segs.size());
+      for (auto* seg : segs) coveredGens.push_back(seg->mergedLiveGen);
+      auto diffGuard = indexRamBudget->forceAcquire(0);
+      std::unique_ptr<screaming::RAMFixedBitSet> outputLiveBits;
+      for (;;) {
+        std::vector<uint64_t> currentGens;
+        currentGens.reserve(segs.size());
+        {
+          const std::lock_guard<std::mutex> lock(indexMutex);
+          for (auto* seg : segs) {
+            currentGens.push_back(seg->liveGen);
+            // Pin the generation until it has been loaded outside the lock.
+            seg->mergeDiffLiveGen = seg->liveGen;
+          }
+        }
+        phase = "merge_live_docs_diff";
+        bool changed = false;
+        for (size_t i = 0; i < segs.size(); i++) {
+          if (currentGens[i] == coveredGens[i]) continue;
+          auto* seg = segs[i];
+          // Rescan from the merged generation on every retry. Clearing an
+          // already-clear output bit is a no-op, so only the generation the
+          // diff covered needs to be remembered.
+          auto current = LiveDocs::create(dir, seg->segId, currentGens[i], seg->maxDoc, false);
+          const auto* merged = liveDocsVec[i] ? &liveDocsVec[i]->bitset() : nullptr;
+          const auto& now = current->bitset();
+          for (int32_t word = 0; word < (int32_t)screaming::FixedBitSet::sizeInWords(seg->maxDoc); word++) {
+            uint64_t removed = (merged ? merged->words[word] : ~uint64_t(0)) & ~now.words[word];
+            while (removed != 0) {
+              int32_t doc = word * 64 + (int32_t)std::countr_zero(removed);
+              removed &= removed - 1;
+              if (doc >= seg->maxDoc) break;
+              int32_t mapped = merger.mapDocId(i, doc);
+              assert(mapped >= 0);
+              if (!outputLiveBits) {
+                diffGuard.forceResize(screaming::FixedBitSet::sizeInWords(newSegInfo->maxDoc) * sizeof(uint64_t));
+                outputLiveBits = std::make_unique<screaming::RAMFixedBitSet>(newSegInfo->maxDoc, true);
+              }
+              if (!outputLiveBits->get(mapped)) continue;
+              outputLiveBits->clear(mapped);
+              newSegInfo->liveDocs--;
+              changed = true;
+            }
+          }
+          coveredGens[i] = currentGens[i];
+        }
+        if (changed) {
+          // The output is private. Replace its first generation on a retry;
+          // no reader or manifest can observe an intermediate bitmap.
+          newSegInfo->unsyncedFiles.reserve(newSegInfo->unsyncedFiles.size() + 1);
+          newSegInfo->files.reserve(newSegInfo->files.size() + 1);
+          auto name = Postings::getLiveDocsFileName(Postings::getSortableString(outputSegId), 1);
+          std::erase(newSegInfo->unsyncedFiles, name);
+          std::erase_if(newSegInfo->files, [&](const auto& file) { return file.name == name; });
+          LiveDocsWriter::writeLiveDocs(dir, outputSegId, 1, *outputLiveBits,
+                                       newSegInfo->maxDoc, newSegInfo->liveDocs,
+                                       newSegInfo->unsyncedFiles, &newSegInfo->files);
+          newSegInfo->liveGen = 1;
+        }
+        Signal::emit("mergeLiveDocsDiff", newSegInfo.get());
+        phase = "publish_swap_prepare";
         const std::lock_guard<std::mutex> lock(indexMutex);
+        bool retry = false;
+        for (size_t i = 0; i < segs.size(); i++) {
+          if (segs[i]->liveGen != coveredGens[i]) retry = true;
+        }
+        if (retry) continue;
         segmentsToDelete.reserve(segmentsToDelete.size() + segs.size());
         if (newSegInfo->liveDocs > 0) {
           segInfos.reserve(segInfos.size() + 1);
@@ -2512,7 +2505,10 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         newSegInfo->personalDeletes.deletes.reserve(personalDeleteCount);
 
         phase = "publish_swap";
-        for (auto segInfo : segs) {
+        for (size_t i = 0; i < segs.size(); i++) {
+          auto* segInfo = segs[i];
+          segInfo->mergedLiveGen = coveredGens[i];
+          segInfo->mergeDiffLiveGen = -1;
           segInfo->merging = false; // mark as no longer merging so it can be removed.
           segInfo->mergedIntoSegId = newSegInfo->segId; // mark the segment as merged into the new segment
 
@@ -2535,17 +2531,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         // mutex-protected transfer, so the commit thread observes them after
         // taking indexMutex.
         //
-        // The empty-output case (liveDocs == 0) is not expected to occur: a
-        // segment whose docs are all deleted is dropped at commit time (see
-        // finishCommitBody, "if (seg->liveDocs == 0)"), so it is never selected
-        // for a merge, and a merge reads liveDocs at its mergedLiveGen snapshot
-        // - the gen at which the selected segments still had live docs - so the
-        // output reflects those live docs.  Measured: zero empty merges across
-        // heavy-churn multithreaded stress.  If that ever changes and empty
-        // policy merges become possible, the successful policy path must still
-        // request a commit that persists source removal and reclaims the
-        // dropped source files.  Client force merges already publish even when
-        // no output is selected.
+        // Concurrent applications can delete the entire output during the
+        // merge. Still publish source removal when no output survives.
         if (newSegInfo->liveDocs > 0) {
           auto* publishedSegInfo = newSegInfo.get();
           auto [iter, success] = segInfos.emplace(pwriter.getSegId(), std::move(newSegInfo));
@@ -2554,7 +2541,18 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           outputPublished = true;
           mergePolicy->_update(publishedSegInfo);
         }
-      } // end index lock
+        // Keep pinned ancestors pointing at the latest output even if an
+        // intermediate output is reclaimed before their application finishes.
+        for (auto& retired : segmentsToDelete) {
+          auto it = std::lower_bound(segs.begin(), segs.end(), retired->mergedIntoSegId,
+                                    [](const SegInfo* seg, uint64_t id) { return seg->segId < id; });
+          if (it != segs.end() && (*it)->segId == retired->mergedIntoSegId) {
+            retired->mergedIntoSegId = outputSegId;
+          }
+        }
+        break;
+      } // end swap retry
+      Signal::emit("mergeSwap", (void*)outputSegId);
     }
   } catch (const std::exception& e) {
     mergeFailed = true;
@@ -2580,6 +2578,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         for (auto* segInfo : segs) {
           segInfo->merging = false;
           segInfo->mergedLiveGen = -1;
+          segInfo->mergeDiffLiveGen = -1;
           segInfo->mergedIntoSegId = 0;
 
           if (!segInfos.contains(segInfo->segId)) {
@@ -2642,7 +2641,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     }
   }
 
-      allowSyntheticCommit = outputPublished;
+      allowSyntheticCommit = !mergeFailed;
       chainNextMerge = !mergeFailed;
     }
   } catch (const std::exception& e) {
@@ -2653,6 +2652,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       for (size_t i = 0; i < markedSegmentCount; i++) {
         segs[i]->merging = false;
         segs[i]->mergedLiveGen = -1;
+        segs[i]->mergeDiffLiveGen = -1;
         segs[i]->mergedIntoSegId = 0;
       }
     }
@@ -2675,6 +2675,7 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       for (size_t i = 0; i < markedSegmentCount; i++) {
         segs[i]->merging = false;
         segs[i]->mergedLiveGen = -1;
+        segs[i]->mergeDiffLiveGen = -1;
         segs[i]->mergedIntoSegId = 0;
       }
     }

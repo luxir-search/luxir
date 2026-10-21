@@ -395,7 +395,7 @@ TEST_F(ExecutionProfileTest, termLeadFirstFillLeapfrogMatchesKillSwitch) {
   auto count = [&] {
     auto req = localReq(helper.getSearchEngine());
     req->collection("profile_term_lead_leapfrog");
-    auto& top = req->topDocs("q").getNumber().limit(0);
+    auto& top = req->topDocs("q").countLimit().limit(0);
     top.rawQuery() = qb::boolean(
         top.mr(), {qb::match(top.mr(), "body_w", "lead"),
                    qb::match(top.mr(), "body_w", "tail")});

@@ -538,8 +538,8 @@ FieldType::flag_type IndexReader::FieldSegments::flagsUnion() const {
   return record ? totals().flags : 0;
 }
 
-std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projectableFields() {
-  callOnce(projectableOnce, [this] {
+void IndexReader::PhysicalCore::buildFieldCatalogs() {
+  callOnce(fieldCatalogsOnce, [this] {
     // Both name sources are views into segment files held open by the
     // segment's PostingsReader: the field index (fi.fieldname) and the stored
     // resource's cached metadata. No copies needed.
@@ -564,20 +564,25 @@ std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projec
               resources.push_back(physicalName);
             }
           }
-        } else if (fi.flags & FieldType::COLUMN_STORED) {
-          sources[physicalName].column = true;
+        } else if (fi.type != FieldType::BIN) {
+          sources[physicalName].column |= (fi.flags & FieldType::COLUMN_STORED) != 0;
         }
       }
     }
     std::vector<ProjectableField> fields;
+    std::vector<std::string_view> names;
     fields.reserve(sources.size());
+    names.reserve(sources.size());
     for (auto& [name, source] : sources) {
-      source.name = name;
-      fields.push_back(std::move(source));
+      names.push_back(name);
+      if (source.column || !source.storedResources.empty()) {
+        source.name = name;
+        fields.push_back(std::move(source));
+      }
     }
     projectable = std::move(fields);
+    physicalNames = std::move(names);
   });
-  return projectable;
 }
 
 std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() {
@@ -627,4 +632,12 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
   return retrievable;
 }
 
+std::span<const std::string> IndexReader::searchableFields() {
+  assert(sharedSchema);
+  callOnce(searchableOnce, [this] {
+    searchable = sharedSchema->searchableFields(core->physicalFieldNames());
+  });
+  return searchable;
 }
+
+} // namespace luxir

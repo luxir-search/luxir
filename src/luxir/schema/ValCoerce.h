@@ -95,35 +95,43 @@ inline api::Val scalarVal(auto value) {
 // once, outside their element loop. They intentionally mirror the Val coercion
 // contract below; scalarVal is only called on a failing typed-coercion path.
 template<typename T>
-inline int64_t toInt64Scalar(T value, std::string_view fieldName) {
+inline std::optional<int64_t> tryToInt64Scalar(T value) {
   using V = std::remove_cvref_t<T>;
   if constexpr (std::is_same_v<V, int64_t>) {
     return value;
   } else if constexpr (std::is_same_v<V, std::string_view>) {
-    if (auto parsed = parseInt64(value)) return *parsed;
-    if (auto parsed = parseDouble(value)) {
-      if (*parsed >= INT64_LO && *parsed < INT64_HI
-          && std::trunc(*parsed) == *parsed) {
-        return (int64_t)*parsed;
-      }
+    if (auto parsed = parseInt64(value)) return parsed;
+    if (auto parsed = parseDouble(value)) return tryToInt64Scalar(*parsed);
+  } else if constexpr (std::is_same_v<V, double> || std::is_same_v<V, float>) {
+    double widened = (double)value;
+    if (widened >= INT64_LO && widened < INT64_HI && std::trunc(widened) == widened) {
+      return (int64_t)widened;
+    }
+  }
+  return std::nullopt;
+}
+
+inline std::optional<int64_t> tryToInt64(const api::Val& val) {
+  if (auto i = std::get_if<int64_t>(&val.kind)) return tryToInt64Scalar(*i);
+  if (auto s = std::get_if<std::string_view>(&val.kind)) return tryToInt64Scalar(*s);
+  if (auto d = std::get_if<double>(&val.kind)) return tryToInt64Scalar(*d);
+  if (auto f = std::get_if<float>(&val.kind)) return tryToInt64Scalar(*f);
+  return std::nullopt;
+}
+
+template<typename T>
+inline int64_t toInt64Scalar(T value, std::string_view fieldName) {
+  if (auto parsed = tryToInt64Scalar(value)) return *parsed;
+  using V = std::remove_cvref_t<T>;
+  if constexpr (std::is_same_v<V, std::string_view>) {
+    if (parseDouble(value)) {
       throw RequestError(fmt::format(
           "field '{}': cannot use '{}' as an integer (value is not integral)",
           fieldName, value), "invalid_value");
     }
     throw RequestError(fmt::format(
         "field '{}': cannot parse '{}' as an integer", fieldName, value), "invalid_value");
-  } else if constexpr (std::is_same_v<V, double>) {
-    if (value >= INT64_LO && value < INT64_HI && std::trunc(value) == value) {
-      return (int64_t)value;
-    }
-    api::Val val = scalarVal(value);
-    throwCoerce(fieldName, val, "an integer (value is not integral)");
-  } else if constexpr (std::is_same_v<V, float>) {
-    double widened = (double)value;
-    if (widened >= INT64_LO && widened < INT64_HI
-        && std::trunc(widened) == widened) {
-      return (int64_t)widened;
-    }
+  } else if constexpr (std::is_same_v<V, double> || std::is_same_v<V, float>) {
     api::Val val = scalarVal(value);
     throwCoerce(fieldName, val, "an integer (value is not integral)");
   } else {
@@ -142,16 +150,28 @@ inline int64_t toInt64(const api::Val& val, std::string_view fieldName) {
 }
 
 template<typename T>
-inline double toDoubleScalar(T value, std::string_view fieldName) {
+inline std::optional<double> tryToDoubleScalar(T value) {
   using V = std::remove_cvref_t<T>;
-  if constexpr (std::is_same_v<V, double>) {
-    return value;
-  } else if constexpr (std::is_same_v<V, float>) {
-    return (double)value;
-  } else if constexpr (std::is_same_v<V, int64_t>) {
+  if constexpr (std::is_same_v<V, double> || std::is_same_v<V, float> || std::is_same_v<V, int64_t>) {
     return (double)value;
   } else if constexpr (std::is_same_v<V, std::string_view>) {
-    if (auto parsed = parseDouble(value)) return *parsed;
+    return parseDouble(value);
+  }
+  return std::nullopt;
+}
+
+inline std::optional<double> tryToDouble(const api::Val& val) {
+  if (auto d = std::get_if<double>(&val.kind)) return tryToDoubleScalar(*d);
+  if (auto f = std::get_if<float>(&val.kind)) return tryToDoubleScalar(*f);
+  if (auto i = std::get_if<int64_t>(&val.kind)) return tryToDoubleScalar(*i);
+  if (auto s = std::get_if<std::string_view>(&val.kind)) return tryToDoubleScalar(*s);
+  return std::nullopt;
+}
+
+template<typename T>
+inline double toDoubleScalar(T value, std::string_view fieldName) {
+  if (auto parsed = tryToDoubleScalar(value)) return *parsed;
+  if constexpr (std::is_same_v<std::remove_cvref_t<T>, std::string_view>) {
     throw RequestError(fmt::format(
         "field '{}': cannot parse '{}' as a number", fieldName, value), "invalid_value");
   } else {

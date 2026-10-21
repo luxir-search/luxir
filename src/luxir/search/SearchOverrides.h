@@ -105,6 +105,11 @@ struct InlineFacetEntryStats {
 };
 inline InlineFacetEntryStats* inlineFacetEntryStatsForTests = nullptr;
 inline bool disableDenseFacetStateForTests = false;
+inline bool disableAggregateSharingForTests = false;
+struct AggregateExecutionStats {
+  std::atomic<size_t> followers{0}, producerStates{0}, finishedStateBytes{0}, retainedStateBytes{0};
+};
+inline AggregateExecutionStats* aggregateExecutionStatsForTests = nullptr;
 // A/B toggle: inline facet metrics take the per-document calculator calls
 // instead of keyed ord batches.
 inline bool disableKeyedInlineBatchesForTests = false;

@@ -25,6 +25,7 @@
 #include <variant>
 #include <vector>
 
+#include <boost/describe/enum.hpp>
 #include <hpp_proto/field_types.hpp> // bytes_view
 #include <hpp_proto/indirect_view.hpp>
 #include <hpp_proto/optional_indirect.hpp>
@@ -67,7 +68,9 @@ struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struc
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
-struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning; struct Error;
+struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct WeightedField; struct PhraseOptions; struct MultiMatchQuery;
+struct DisMaxQuery;
+struct Warning; struct Error;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
 struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult;
@@ -108,7 +111,16 @@ namespace FieldFacet_ { enum class CountUnit { DOCS = 0, GROUPS = 1 }; }
 namespace RangeFacet_ { enum class Bounds { EXPLICIT = 0, DATA = 1 }; }
 namespace GroupComponent_ { enum class Type { STRING = 0, ID = 1, INT = 2, DATE = 3 }; }
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, DESC = 2 }; }
-namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
+// Enums an expr callable takes as an argument also describe the values it
+// accepts (ExprFunctions.h); keep each list beside its enum.
+namespace Match_ {
+enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 };
+BOOST_DESCRIBE_ENUM(Operator, AND, OR)
+}
+namespace MultiMatchQuery_ {
+enum class Mode { COMBINED = 0, PER_FIELD = 1 };
+BOOST_DESCRIBE_ENUM(Mode, COMBINED, PER_FIELD)
+}
 namespace CalendarGap_ {
 enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR = 5 };
 }
@@ -839,7 +851,7 @@ struct Collapse {
   Collapse_::MissingPolicy missing = Collapse_::MissingPolicy::EXPAND;
   std::span<const SortSpec> head_sort;
   std::span<const SortSpec> sort;
-  bool get_number = false;
+  bool get_count = false;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
 };
 struct Diversify {
@@ -852,6 +864,7 @@ struct TopDocs {                                                 // all indirect
   std::span<const Filter> filter;
   int64_t offset = 0;
   std::optional<std::int64_t> limit;
+  std::optional<std::int64_t> count_limit;
   std::span<const std::string_view> fields;
   std::span<const SortSpec> sort;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
@@ -860,13 +873,13 @@ struct TopDocs {                                                 // all indirect
   ::hpp_proto::optional_indirect_view<Collapse> collapse;
   ::hpp_proto::optional_indirect_view<Diversify> diversify;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
-  bool get_number = false;
   bool get_scores = false;
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion, LinearFusion
   map_view<std::string_view, TopDocs> sources;
   std::span<const Filter> filter;
   std::optional<std::int64_t> limit;
+  std::optional<std::int64_t> count_limit;
   int64_t offset = 0;
   std::span<const std::string_view> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
@@ -875,7 +888,6 @@ struct Fusion {                                                  // needs TopDoc
   std::variant<std::monostate, RrfFusion, LinearFusion> method;  // align 4
   int32_t batch_size = 0;
   DocFormat document_format = DocFormat::DEFAULT;                // align 4 (enum)
-  bool get_number = false;
   bool get_scores = false;
 };
 struct Domain {
@@ -955,6 +967,7 @@ struct DocList {                                                // needs Column 
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
   int32_t row_count = 0;                                       // align 4
   bool more = false;
+  bool found_gte = false;
 };
 struct FacetResult {                                           // needs Column (optional)
   std::optional<Column> bucket_ids;
@@ -1081,6 +1094,28 @@ struct GeoDistanceQuery {
   double lon = 0.0;
   double radius_meters = 0.0;
 };
+struct WeightedField {
+  std::string_view field;
+  std::optional<float> weight;
+};
+struct PhraseOptions {
+  int32_t slop = 0;
+};
+struct MultiMatchQuery {
+  using Operator = luxir::api::Match_::Operator;
+  using Mode = luxir::api::MultiMatchQuery_::Mode;
+  std::string_view text;
+  std::span<const WeightedField> fields;
+  Mode mode = Mode::COMBINED;
+  Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
+  int32_t min_match = 0;
+  std::optional<float> tie;
+  std::optional<PhraseOptions> phrase;
+};
+struct DisMaxQuery {                                             // span<incomplete Query> OK
+  std::span<const Query> queries;
+  std::optional<float> tie;
+};
 struct ExprQuery {                                             // map value indirect: Val may be incomplete, but is complete here anyway
   std::string_view q;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
@@ -1089,7 +1124,7 @@ struct Query {                                                 // needs Match,An
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
-               AnyOfQuery>
+               AnyOfQuery, MultiMatchQuery, DisMaxQuery>
       kind;
 };
 struct UpdateRequest {                                         // needs CommitParams
@@ -1114,7 +1149,7 @@ LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) L
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
-LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery)
+LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery) LUXIR_TD(WeightedField) LUXIR_TD(PhraseOptions) LUXIR_TD(MultiMatchQuery) LUXIR_TD(DisMaxQuery)
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
@@ -1161,6 +1196,7 @@ LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXI
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(ExprQuery)
+LUXIR_ENTRY(WeightedField) LUXIR_ENTRY(PhraseOptions) LUXIR_ENTRY(MultiMatchQuery) LUXIR_ENTRY(DisMaxQuery)
 LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)

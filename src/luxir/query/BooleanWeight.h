@@ -8,6 +8,7 @@
 
 #include <bit>
 #include <functional>
+#include <type_traits>
 
 #include "BooleanQuery.h"
 #include "MultiTermQuery.h"
@@ -4280,7 +4281,16 @@ public:
 }; // ConjunctionBulkScorer
 
 
-class BooleanQuery::DisjunctionScorer final : public Query::Scorer {
+// Shared by both score policies, so a flag set through DisjunctionScorer also
+// reaches the dis_max instantiation.
+struct BooleanQuery::DisjunctionTestFlags {
+  static inline bool disableDisjTwoPhaseForTests = false;
+  static inline bool disableTwoWayForTests = false;
+};
+
+template<bool DISMAX>
+class BooleanQuery::DisjunctionScorerT final : public Query::Scorer,
+                                               public DisjunctionTestFlags {
   struct ApproxSlot {
     Scorer* scorer = nullptr;
     bool twoPhase = false;
@@ -4321,6 +4331,7 @@ class BooleanQuery::DisjunctionScorer final : public Query::Scorer {
   float verificationCost = 0.0f;
   bool anyTwoPhase = false;
   bool twoWay;
+  [[no_unique_address]] std::conditional_t<DISMAX, float, SumScorePolicy> tie;
 
   static std::span<ApproxSlot> makeMembers(
       luxir::MemPool& pool, std::span<Scorer*> scorers,
@@ -4342,6 +4353,18 @@ class BooleanQuery::DisjunctionScorer final : public Query::Scorer {
     auto pointers = pool.make_span<ApproxSlot*>(members.size());
     for (size_t i = 0; i < members.size(); i++) pointers[i] = &members[i];
     return pointers;
+  }
+
+  float disMaxMaxScoreAt(int32_t upTo, bool refined) {
+    DisMaxBounds bounds;
+    for (auto& member : members) {
+      int32_t doc = member.docId();
+      if (doc != luxir::PostingsReader::END && doc <= upTo) {
+        bounds.add(refined ? member.scorer->refineMaxScore(upTo)
+                           : member.scorer->getMaxScore(upTo));
+      }
+    }
+    return bounds.upper(tie, 1.0 + (double) (members.size() + 4) * 0x1p-24);
   }
 
   int32_t nextMatched(int32_t doc) {
@@ -4393,18 +4416,16 @@ public:
     docid = -1;
   }
 
-  static inline bool disableDisjTwoPhaseForTests = false;
-  static inline bool disableTwoWayForTests = false;
-
-  DisjunctionScorer(luxir::MemPool& pool, std::span<Scorer*> scorers,
+  DisjunctionScorerT(luxir::MemPool& pool, std::span<Scorer*> scorers,
                     std::span<const uint8_t> twoPhaseScorers,
-                    bool enableTwoPhase)
+                    bool enableTwoPhase, float tie = 0.0f)
           : clauses(scorers),
             members(makeMembers(
                 pool, scorers, twoPhaseScorers, enableTwoPhase)),
             heap(makePointers(pool, members)),
             verificationOrder(makePointers(pool, members)), pq(heap),
             twoWay(scorers.size() == 2 && !disableTwoWayForTests) {
+    if constexpr (DISMAX) this->tie = tie;
     for (auto& member : members) {
       if (member.twoPhase) {
         anyTwoPhase = true;
@@ -4515,20 +4536,35 @@ public:
   }
 
   std::span<Scorer*> flatDisjunctionScorers() override {
+    if constexpr (DISMAX) return {};
     return clauses;
   }
 
   float score() override {
     assert(docid != luxir::PostingsReader::END);
     assert(twoWay || (pq.size() > 0 && docid == pq.top().docId()));
-    float score = 0.0f;
-    for (auto& member : members) {
-      if (member.docId() == docid
-          && (!member.twoPhase || member.scorer->matches())) {
-        score += member.scorer->score();
+    if constexpr (DISMAX) {
+      float sum = 0.0f;
+      float best = -std::numeric_limits<float>::infinity();
+      for (auto& member : members) {
+        if (member.docId() == docid
+            && (!member.twoPhase || member.scorer->matches())) {
+          float score = member.scorer->score();
+          sum += score;
+          best = std::max(best, score);
+        }
       }
+      return tie == 0.0f ? best : (1.0f - tie) * best + tie * sum;
+    } else {
+      float score = 0.0f;
+      for (auto& member : members) {
+        if (member.docId() == docid
+            && (!member.twoPhase || member.scorer->matches())) {
+          score += member.scorer->score();
+        }
+      }
+      return score;
     }
-    return score;
   }
 
   bool usesTwoWayMergeForTests() const {
@@ -4546,42 +4582,62 @@ public:
   }
 
   float getMaxScore(int32_t upTo) override {
-    float sum = 0.0f;
-    for (auto& member : members) {
-      int32_t doc = member.docId();
-      if (doc != luxir::PostingsReader::END && doc <= upTo) {
-        sum += optionalUpperBound(member.scorer->getMaxScore(upTo));
+    if constexpr (DISMAX) {
+      return disMaxMaxScoreAt(upTo, false);
+    } else {
+      float sum = 0.0f;
+      for (auto& member : members) {
+        int32_t doc = member.docId();
+        if (doc != luxir::PostingsReader::END && doc <= upTo) {
+          sum += optionalUpperBound(member.scorer->getMaxScore(upTo));
+        }
       }
+      return sum;
     }
-    return sum;
   }
 
   float refineMaxScore(int32_t upTo) override {
-    float sum = 0.0f;
-    for (auto& member : members) {
-      int32_t doc = member.docId();
-      if (doc != luxir::PostingsReader::END && doc <= upTo) {
-        sum += optionalUpperBound(member.scorer->refineMaxScore(upTo));
+    if constexpr (DISMAX) {
+      return disMaxMaxScoreAt(upTo, true);
+    } else {
+      float sum = 0.0f;
+      for (auto& member : members) {
+        int32_t doc = member.docId();
+        if (doc != luxir::PostingsReader::END && doc <= upTo) {
+          sum += optionalUpperBound(member.scorer->refineMaxScore(upTo));
+        }
       }
+      return sum;
     }
-    return sum;
   }
 
   ScoreBounds scoreBoundsAt(int32_t upTo, bool refined) {
-    ScoreBounds sum = ScoreBounds::exact(0.0f);
-    bool any = false;
-    for (auto& member : members) {
-      int32_t doc = member.docId();
-      if (doc == luxir::PostingsReader::END || doc > upTo) {
-        continue;
+    if constexpr (DISMAX) {
+      DisMaxBounds bounds;
+      for (auto& member : members) {
+        int32_t doc = member.docId();
+        if (doc != luxir::PostingsReader::END && doc <= upTo) {
+          bounds.add(refined ? member.scorer->refineScoreBounds(upTo)
+                             : member.scorer->getScoreBounds(upTo));
+        }
       }
-      ScoreBounds bounds = refined ? member.scorer->refineScoreBounds(upTo)
-                                   : member.scorer->getScoreBounds(upTo);
-      bounds = optionalScoreBounds(bounds);
-      sum = any ? addScoreBounds(sum, bounds) : bounds;
-      any = true;
+      return bounds.bounds(tie, 1.0 + (double) (members.size() + 4) * 0x1p-24);
+    } else {
+      ScoreBounds sum = ScoreBounds::exact(0.0f);
+      bool any = false;
+      for (auto& member : members) {
+        int32_t doc = member.docId();
+        if (doc == luxir::PostingsReader::END || doc > upTo) {
+          continue;
+        }
+        ScoreBounds bounds = refined ? member.scorer->refineScoreBounds(upTo)
+                                     : member.scorer->getScoreBounds(upTo);
+        bounds = optionalScoreBounds(bounds);
+        sum = any ? addScoreBounds(sum, bounds) : bounds;
+        any = true;
+      }
+      return any ? sum : ScoreBounds::exact(0.0f);
     }
-    return any ? sum : ScoreBounds::exact(0.0f);
   }
 
   ScoreBounds getScoreBounds(int32_t upTo) override {
@@ -4594,7 +4650,8 @@ public:
 }; // DisjunctionScorer
 
 
-class BooleanQuery::MaxScoreDisjunctionScorer final : public Query::Scorer {
+template<bool DISMAX>
+class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
   std::span<Scorer*> scorers;  // stable global-max order, used for deterministic scoring
   std::span<float> clauseMax;
   std::span<float> windowMax;
@@ -4603,7 +4660,8 @@ class BooleanQuery::MaxScoreDisjunctionScorer final : public Query::Scorer {
   std::span<Scorer*> essentialPointers;
   // Probe order + cumulative bounds for the demoted (non-essential) clauses:
   // neOrder[0..splitIndex) ascending by bound, nePrefix[s] = sum of bounds
-  // over neOrder[0..s] (see scoreCurrentDoc).
+  // over neOrder[0..s]. DISMAX combines this sum with the last (largest)
+  // bound in the prefix (see scoreCurrentDoc).
   std::span<int32_t> neOrder;
   std::span<double> nePrefix;
 
@@ -4624,13 +4682,14 @@ class BooleanQuery::MaxScoreDisjunctionScorer final : public Query::Scorer {
   int32_t docid = -1;
   float currentScore = 0.0f;
   int64_t visitedCandidates = 0;
-  // Inflates the double split bound to cover score()'s float-summation rounding:
-  // score() can round above the exact double sum of demoted-clause maxima by up to
-  // ~(m-1) ULP for m clauses, so demoting purely on the exact sum could skip a doc
-  // whose score() rounds > theta.  No-op at theta == lowest().  (scoreCurrentDoc and
-  // getMaxScore accumulate in float, which is already monotonically >= score().)
+  // Inflates double split/probe bounds to cover float score accumulation.
+  // Without headroom, rounding could make a demoted-only doc competitive.
+  // SUM's getMaxScore adds clamped bounds in float, monotonically above score().
+  // DISMAX also allows for its final combination, and its exported bounds use
+  // the same headroom plus outward float rounding.
   double scoreBoundFactor = 1.0;
   int64_t nonEssentialLookups = 0;
+  [[no_unique_address]] std::conditional_t<DISMAX, float, SumScorePolicy> tie;
 
   static bool lessMaxScore(float a, float b) {
     bool finiteA = std::isfinite(a);
@@ -4697,17 +4756,20 @@ class BooleanQuery::MaxScoreDisjunctionScorer final : public Query::Scorer {
   }
 
   void updateGlobalSplit() {
-    // Accumulate the non-essential bound in double so the partition is conservatively
-    // sound: a float running sum could round down below the threshold and demote a clause
-    // whose exact max-sum still reaches it.  Summing the float clauseMax values in double
-    // is exact for any realistic clause count, so a clause is demoted only when the true
-    // sum of clause maxima is strictly below the competitive threshold.
+    // Accumulate clamped bounds in double. In ascending order, the last bound
+    // is the prefix maximum, so both SUM and DISMAX prefix bounds are monotone.
+    // Only demote a prefix whose rounded bound is strictly below the threshold.
     double sum = 0.0;
     size_t newSplit = 0;
     for (; newSplit < scorers.size(); newSplit++) {
       if (!std::isfinite(clauseMax[newSplit])) break;
       double nextSum = sum + (double) clauseMax[newSplit];
-      if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
+      if constexpr (DISMAX) {
+        if (!(disMaxUpperBound(clauseMax[newSplit], nextSum, tie, scoreBoundFactor)
+              < minCompetitiveScore)) break;
+      } else {
+        if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
+      }
       sum = nextSum;
     }
     if (newSplit > splitIndex) {
@@ -4716,7 +4778,7 @@ class BooleanQuery::MaxScoreDisjunctionScorer final : public Query::Scorer {
     }
   }
 
-  // Largest non-essential prefix whose cumulative window-max stays under the
+  // Largest non-essential prefix whose combined window bound stays under the
   // threshold, accumulated in double (conservative, as in updateGlobalSplit).
   size_t computeWindowSplit() const {
     double sum = 0.0;
@@ -4725,7 +4787,12 @@ class BooleanQuery::MaxScoreDisjunctionScorer final : public Query::Scorer {
       float maxScore = windowMax[(size_t) windowOrder[s]];
       if (!std::isfinite(maxScore)) break;
       double nextSum = sum + (double) maxScore;
-      if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
+      if constexpr (DISMAX) {
+        if (!(disMaxUpperBound(maxScore, nextSum, tie, scoreBoundFactor)
+              < minCompetitiveScore)) break;
+      } else {
+        if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
+      }
       sum = nextSum;
     }
     return s;
@@ -4795,29 +4862,61 @@ class BooleanQuery::MaxScoreDisjunctionScorer final : public Query::Scorer {
     // the demoted clauses from the largest bound down, abandoning the doc as
     // soon as the unprobed bounds cannot lift it over the threshold (the
     // bulk scorer's scoreCandidate shape).  An abandoned doc keeps its
-    // partial sum, which is below the pushed threshold, so the collector
+    // partial score, which is below the pushed threshold, so the collector
     // discards it. Summation order varies across execution paths, so score
     // bits are not guaranteed identical.
-    float sum = 0.0f;
-    for (size_t i = 0; i < scorers.size(); i++) {
-      if (isEssential[i] && scorers[i]->docId() == docid) {
-        sum += scorers[i]->score();
+    if constexpr (DISMAX) {
+      float sum = 0.0f;
+      float best = -std::numeric_limits<float>::infinity();
+      double partialClampedSum = 0.0;
+      auto add = [&](float score) {
+        sum += score;
+        best = std::max(best, score);
+        partialClampedSum += (double) optionalUpperBound(score);
+      };
+      for (size_t i = 0; i < scorers.size(); i++) {
+        if (isEssential[i] && scorers[i]->docId() == docid) {
+          add(scorers[i]->score());
+        }
       }
+      for (size_t s = splitIndex; s-- > 0; ) {
+        // The remaining prefix is in ascending bound order. Signed scores
+        // contribute only their positive part to the upper-bound sum.
+        size_t idx = (size_t) neOrder[s];
+        float remainingMax = globalMode ? clauseMax[idx] : windowMax[idx];
+        if (disMaxUpperBound(std::max(best, remainingMax),
+                             partialClampedSum + nePrefix[s], tie, scoreBoundFactor)
+            < minCompetitiveScore) {
+          break;
+        }
+        auto* scorer = scorers[(size_t) neOrder[s]];
+        nonEssentialLookups++;
+        if (scorer->docId() < docid) scorer->advance(docid);
+        if (scorer->docId() == docid) add(scorer->score());
+      }
+      currentScore = tie == 0.0f ? best : (1.0f - tie) * best + tie * sum;
+    } else {
+      float sum = 0.0f;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        if (isEssential[i] && scorers[i]->docId() == docid) {
+          sum += scorers[i]->score();
+        }
+      }
+      for (size_t s = splitIndex; s-- > 0; ) {
+        if (((double) sum + nePrefix[s]) * scoreBoundFactor < (double) minCompetitiveScore) {
+          break;
+        }
+        auto* scorer = scorers[(size_t) neOrder[s]];
+        nonEssentialLookups++;
+        if (scorer->docId() < docid) {
+          scorer->advance(docid);
+        }
+        if (scorer->docId() == docid) {
+          sum += scorer->score();
+        }
+      }
+      currentScore = sum;
     }
-    for (size_t s = splitIndex; s-- > 0; ) {
-      if (((double) sum + nePrefix[s]) * scoreBoundFactor < (double) minCompetitiveScore) {
-        break;
-      }
-      auto* scorer = scorers[(size_t) neOrder[s]];
-      nonEssentialLookups++;
-      if (scorer->docId() < docid) {
-        scorer->advance(docid);
-      }
-      if (scorer->docId() == docid) {
-        sum += scorer->score();
-      }
-    }
-    currentScore = sum;
     visitedCandidates++;
   }
 
@@ -4901,14 +5000,31 @@ class BooleanQuery::MaxScoreDisjunctionScorer final : public Query::Scorer {
     }
   }
 
+  float disMaxMaxScoreAt(int32_t upTo, bool refined) {
+    DisMaxBounds bounds;
+    for (auto* scorer : scorers) {
+      bounds.add(refined ? scorer->refineMaxScore(upTo) : scorer->getMaxScore(upTo));
+    }
+    return bounds.upper(tie, scoreBoundFactor);
+  }
+
+  ScoreBounds disMaxScoreBoundsAt(int32_t upTo, bool refined) {
+    DisMaxBounds bounds;
+    for (auto* scorer : scorers) {
+      bounds.add(refined ? scorer->refineScoreBounds(upTo) : scorer->getScoreBounds(upTo));
+    }
+    return bounds.bounds(tie, scoreBoundFactor);
+  }
+
 public:
   [[gnu::cold]] void prepareMembership() override {
     for (auto* scorer : scorers) scorer->prepareMembership();
   }
 
   // The passed in span of scorers will be modified (rearranged).
-  MaxScoreDisjunctionScorer(luxir::MemPool& pool, std::span<Scorer*> scorers,
-                            int32_t maxDoc, int32_t windowSize = DocsEnumMeta::L1_DOCS)
+  MaxScoreDisjunctionScorerT(luxir::MemPool& pool, std::span<Scorer*> scorers,
+                            int32_t maxDoc, int32_t windowSize = DocsEnumMeta::L1_DOCS,
+                            float tie = 0.0f)
           : scorers(scorers),
             clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
             windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
@@ -4923,6 +5039,10 @@ public:
             globalMode(normalizeWindowSize(windowSize) >= maxDoc) {
     // Float-summation error headroom for the double split bound (see member).
     scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
+    if constexpr (DISMAX) {
+      this->tie = tie;
+      scoreBoundFactor += 4.0 * 0x1p-24;
+    }
     for (size_t i = 0; i < scorers.size(); i++) {
       clauseMax[i] = optionalUpperBound(
           scorers[i]->getMaxScoreForSetup(PostingsReader::END));
@@ -4959,35 +5079,51 @@ public:
   }
 
   float getMaxScore(int32_t upTo) override {
-    float sum = 0.0f;
-    for (auto* scorer : scorers) {
-      float maxScore = optionalUpperBound(scorer->getMaxScore(upTo));
-      if (!std::isfinite(maxScore)) {
-        return std::numeric_limits<float>::infinity();
+    if constexpr (DISMAX) {
+      return disMaxMaxScoreAt(upTo, false);
+    } else {
+      float sum = 0.0f;
+      for (auto* scorer : scorers) {
+        float maxScore = optionalUpperBound(scorer->getMaxScore(upTo));
+        if (!std::isfinite(maxScore)) {
+          return std::numeric_limits<float>::infinity();
+        }
+        sum += maxScore;
       }
-      sum += maxScore;
+      return sum;
     }
-    return sum;
   }
 
   float refineMaxScore(int32_t upTo) override {
-    float sum = 0.0f;
-    for (auto* scorer : scorers) {
-      float maxScore = optionalUpperBound(scorer->refineMaxScore(upTo));
-      if (!std::isfinite(maxScore)) {
-        return std::numeric_limits<float>::infinity();
+    if constexpr (DISMAX) {
+      return disMaxMaxScoreAt(upTo, true);
+    } else {
+      float sum = 0.0f;
+      for (auto* scorer : scorers) {
+        float maxScore = optionalUpperBound(scorer->refineMaxScore(upTo));
+        if (!std::isfinite(maxScore)) {
+          return std::numeric_limits<float>::infinity();
+        }
+        sum += maxScore;
       }
-      sum += maxScore;
+      return sum;
     }
-    return sum;
   }
 
   ScoreBounds getScoreBounds(int32_t upTo) override {
-    return sumOptionalScoreBounds(scorers, upTo, false);
+    if constexpr (DISMAX) {
+      return disMaxScoreBoundsAt(upTo, false);
+    } else {
+      return sumOptionalScoreBounds(scorers, upTo, false);
+    }
   }
 
   ScoreBounds refineScoreBounds(int32_t upTo) override {
-    return sumOptionalScoreBounds(scorers, upTo, true);
+    if constexpr (DISMAX) {
+      return disMaxScoreBoundsAt(upTo, true);
+    } else {
+      return sumOptionalScoreBounds(scorers, upTo, true);
+    }
   }
 
   int64_t visited() const {
@@ -7504,6 +7640,7 @@ class BooleanQuery::Weight final : public Query::Weight {
   std::span<FilterCache::Use*> prohibitedUses;
   std::span<FilterCache::Use*> filterUses;
   std::span<uint8_t> prohibitedCacheRoutes;
+  ScorePolicy scorePolicy;
   int minShouldMatch = 0;
   bool needsScores = false;
   bool allowsPruning = false;
@@ -7697,6 +7834,17 @@ class BooleanQuery::Weight final : public Query::Weight {
             false, leadCost, scoringCount, false};
   }
 
+  template <template <bool> class Scorer, typename... Args>
+  static Query::Scorer* makeDisjunctionScorer(
+      MemPool& targetPool, ScorePolicy policy, Args&&... args) {
+    if (policy.kind == ScorePolicy::DISMAX) {
+      return targetPool.make<Scorer<true>>(
+          targetPool, std::forward<Args>(args)..., policy.tie);
+    }
+    return targetPool.make<Scorer<false>>(
+        targetPool, std::forward<Args>(args)...);
+  }
+
   // Keep clause wiring in one place so prepared and non-prepared execution
   // cannot diverge on filter/prohibited semantics.
   static Query::Scorer* assembleScorer(
@@ -7714,6 +7862,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       bool needsScores,
       bool externallyDriven,
       bool allowsPruning,
+      ScorePolicy scorePolicy,
       const Query::PlanContext& planContext) {
     Required req = assembleRequired(
         targetPool, requiredPlans, requiredLeadCost, allowsPruning,
@@ -7812,11 +7961,12 @@ class BooleanQuery::Weight final : public Query::Weight {
           optScorer = targetPool.make<BooleanQuery::MinShouldMatchWandScorer>(
             targetPool, optionalScorers, 1);
         } else if (useMaxScoreDisjunction) {
-          optScorer = targetPool.make<BooleanQuery::MaxScoreDisjunctionScorer>(
-            targetPool, optionalScorers, segment.maxDoc());
+          optScorer = makeDisjunctionScorer<MaxScoreDisjunctionScorerT>(
+              targetPool, scorePolicy, optionalScorers, segment.maxDoc(),
+              DocsEnumMeta::L1_DOCS);
         } else {
-          optScorer = targetPool.make<BooleanQuery::DisjunctionScorer>(
-              targetPool, optionalScorers, optionalTwoPhase,
+          optScorer = makeDisjunctionScorer<DisjunctionScorerT>(
+              targetPool, scorePolicy, optionalScorers, optionalTwoPhase,
               !planContext.disableBooleanTwoPhaseForTests
                   && !planContext.disableDisjunctionTwoPhaseForTests);
           optTwoPhase = !planContext.disableBooleanTwoPhaseForTests
@@ -8016,6 +8166,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     bool needsScores;
     bool allowsPruning;
     bool uniformConstantCandidate;
+    ScorePolicy scorePolicy;
     Query::SupplierExecutionMode executionMode;
 
     static Query::ScorerShape emptyShape() {
@@ -8391,7 +8542,7 @@ class BooleanQuery::Weight final : public Query::Weight {
             supplier.needsScores,
             demand().candidates
                 != std::numeric_limits<int64_t>::max(),
-            supplier.allowsPruning, context());
+            supplier.allowsPruning, supplier.scorePolicy, context());
       }
 
     public:
@@ -8436,7 +8587,8 @@ class BooleanQuery::Weight final : public Query::Weight {
              bool needsScores,
              bool allowsPruning,
              bool uniformConstantCandidate,
-             Query::SupplierExecutionMode executionMode)
+             Query::SupplierExecutionMode executionMode,
+             ScorePolicy scorePolicy)
       : pool(pool), segment(segment), mandatorySources(mandatorySources),
         mandatoryScores(mandatoryScores),
         optionalSources(optionalSources), prohibitedSources(prohibitedSources),
@@ -8448,7 +8600,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         minShouldMatch(minShouldMatch),
         needsScores(needsScores), allowsPruning(allowsPruning),
         uniformConstantCandidate(uniformConstantCandidate),
-        executionMode(executionMode) {}
+        scorePolicy(scorePolicy), executionMode(executionMode) {}
 
     int64_t cost() override {
       int64_t maxDoc = segment.maxDoc();
@@ -8563,6 +8715,9 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
       if (nonemptyCount(prohibitedShapeSuppliers, unboundedContext) != 0) {
         positive = opaqueShape(positive.matchState);
+      }
+      if (scorePolicy.kind == ScorePolicy::DISMAX) {
+        positive = opaqueShape(positive.matchState, positive.reportedTwoPhase);
       }
       return maskSupplierAccess(positive);
     }
@@ -10770,7 +10925,7 @@ class BooleanQuery::Weight final : public Query::Weight {
             std::span<Query::ScorerSupplier* const>{},
             std::span<Query::ScorerSupplier* const>{}, minShouldMatch,
             needsScores, allowsPruning, uniformConstantCandidate,
-            executionMode);
+            executionMode, scorePolicy);
       }
       if (bodySupplier == nullptr) {
         return noBulkPlan();
@@ -10944,6 +11099,7 @@ class BooleanQuery::Weight final : public Query::Weight {
 
     BulkPlan planBulk(
         BulkUse use, const BulkScorerContext& bulkContext) override {
+      if (scorePolicy.kind != ScorePolicy::SUM) return noBulkPlan();
       if (bulkContext.requireConstantCount) {
         if (mandatorySources.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && minShouldMatch <= 1
@@ -11173,7 +11329,7 @@ class BooleanQuery::Weight final : public Query::Weight {
               std::span<Query::ScorerSupplier* const>{},
               std::span<Query::ScorerSupplier* const>{},
               minShouldMatch, needsScores, allowsPruning,
-              uniformConstantCandidate, executionMode);
+              uniformConstantCandidate, executionMode, scorePolicy);
         }
         if (body != nullptr) {
           BulkScorerContext childContext{
@@ -11310,7 +11466,8 @@ class BooleanQuery::Weight final : public Query::Weight {
       bool needsScores,
       bool allowsPruning,
       bool uniformConstantCandidate,
-      Query::SupplierExecutionMode executionMode) {
+      Query::SupplierExecutionMode executionMode,
+      ScorePolicy scorePolicy) {
     // Weight-time optional removal can expose a Boolean child that
     // normalization could not unwrap while the optionals were still present.
     // Preserve the child's complete supplier contract, including bulkScorer.
@@ -11372,7 +11529,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       prohibitedSources, filterSuppliers, mandatoryShapeSuppliers,
       optionalShapeSuppliers, prohibitedShapeSuppliers, shapeRequiredCost,
       minShouldMatch, needsScores, allowsPruning,
-      uniformConstantCandidate, executionMode);
+      uniformConstantCandidate, executionMode, scorePolicy);
   }
 
   class BooleanPreparedWeight final : public Query::Weight::PreparedWeight {
@@ -11386,6 +11543,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     std::span<const uint8_t> prohibitedCacheRoutes;
     bool hasFilters = false;
     bool prohibitedCacheEnabled = false;
+    ScorePolicy scorePolicy;
     int minShouldMatch = 0;
     bool needsScores = false;
     bool allowsPruning = false;
@@ -11403,7 +11561,8 @@ class BooleanQuery::Weight final : public Query::Weight {
                           bool hasFilters, bool prohibitedCacheEnabled,
                           int minShouldMatch, bool needsScores,
                           bool allowsPruning,
-                          bool uniformConstantCandidate)
+                          bool uniformConstantCandidate,
+                          ScorePolicy scorePolicy)
       : filterWeights(filterWeights), reader(reader),
         mandatorySources(std::move(mandatorySources)),
         mandatoryScores(mandatoryScores.begin(), mandatoryScores.end()),
@@ -11413,7 +11572,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         prohibitedCacheRoutes(prohibitedCacheRoutes),
         hasFilters(hasFilters),
         prohibitedCacheEnabled(prohibitedCacheEnabled),
-        minShouldMatch(minShouldMatch),
+        scorePolicy(scorePolicy), minShouldMatch(minShouldMatch),
         needsScores(needsScores), allowsPruning(allowsPruning),
         uniformConstantCandidate(uniformConstantCandidate) {}
 
@@ -11466,7 +11625,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
         prohibitedSegmentSources, prohibitedSuppliers,
         filterSuppliers, minShouldMatch, needsScores, allowsPruning,
-        uniformConstantCandidate, executionMode);
+        uniformConstantCandidate, executionMode, scorePolicy);
     }
 
     Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
@@ -11510,11 +11669,15 @@ class BooleanQuery::Weight final : public Query::Weight {
 
 
 public:
-  Weight(Context& context, const BooleanQuery& owner,
+  Weight(Context& context, const Query& owner,
          CompiledBoolean& query, int32_t flags,
-         float multiplier)
-    : Query::Weight(context, owner, flags) {
+         float multiplier, ScorePolicy scorePolicy)
+    : Query::Weight(context, owner, flags), scorePolicy(scorePolicy) {
     needsScores = (flags & Query::NEED_SCORES) != 0;
+    assert(scorePolicy.kind == ScorePolicy::SUM
+           || (needsScores && query.mandatory.empty() && query.filter.empty()
+               && query.prohibited.empty() && query.minShouldMatch == 1
+               && query.optional.size() >= 2));
     allowsPruning = (flags & Query::ALLOW_PRUNING) != 0;
     // Only mandatory and optional clauses can contribute to score.
     int32_t noScore = flags & ~NEED_SCORES;
@@ -11637,7 +11800,9 @@ public:
     for (auto* w : mandatoryWeights) {
       if (!w->isConstantScoring()) constant = false;
     }
-    if (constant) traits |= IS_CONSTANT_SCORING;
+    if (constant) {
+      traits |= IS_CONSTANT_SCORING;
+    }
     if (query.mandatory.empty() && query.optional.empty()
         && query.prohibited.empty() && query.filter.size() == 1
         && query.filter[0]->getKind() == QueryKind::TERM) {
@@ -11656,7 +11821,8 @@ public:
         && mandatoryWeights.size() == 1
         && mandatoryWeights[0]->matchesAllDocs()
         && !prohibitedWeights.empty();
-    if (directTermUnion || unfilteredConstantComplement) {
+    if (scorePolicy.kind == ScorePolicy::SUM
+        && (directTermUnion || unfilteredConstantComplement)) {
       traits |= CAN_COMPOSE_EXACT_COUNT_TOPK;
     }
     bool sparseFilteredTopKConjunction = !filterWeights.empty()
@@ -11665,8 +11831,9 @@ public:
         && std::all_of(
             mandatoryClauses.begin(), mandatoryClauses.end(),
             sparseFilteredTopKMandatory);
-    sparseFilteredTopKEligible = sparseFilteredTopKConjunction
-        || (directTermUnion && !filterWeights.empty());
+    sparseFilteredTopKEligible = scorePolicy.kind == ScorePolicy::SUM
+        && (sparseFilteredTopKConjunction
+            || (directTermUnion && !filterWeights.empty()));
     if (directTermUnion && !filterWeights.empty()) {
       sparseFilteredTopKFamilyKind = SparseFilteredTopKFamily::UNION;
     }
@@ -11719,6 +11886,9 @@ public:
           survivor = shortcut;
         }
         sum = std::min<int64_t>(segment.maxDoc(), sum + shortcut.maxMatches);
+        if (required == 0 && prohibitedWeights.empty() && minShouldMatch <= 1) {
+          bound.minMatches = std::max(bound.minMatches, shortcut.minMatches);
+        }
       }
       if (minShouldMatch > (int64_t)live) return {0, CountHow::METADATA};
       if (required == 0 && prohibitedWeights.empty() && minShouldMatch <= 1 && live <= 1) {
@@ -11768,7 +11938,7 @@ public:
       std::move(prohibitedSources), std::move(filterDomains),
       prohibitedCacheRoutes, !filterSources.empty(),
       prohibitedCacheEnabled, minShouldMatch, needsScores, allowsPruning,
-      uniformConstantCandidate);
+      uniformConstantCandidate, scorePolicy);
   }
 
   Query::ScorerSupplier* scorerSupplierImpl(
@@ -11826,7 +11996,7 @@ public:
                         prohibitedSources, prohibitedSuppliers,
                         filterSuppliers, minShouldMatch,
                         needsScores, allowsPruning,
-                        uniformConstantCandidate, executionMode);
+                        uniformConstantCandidate, executionMode, scorePolicy);
   }
 
   int64_t sparseFilteredTopKCost(

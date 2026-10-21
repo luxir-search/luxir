@@ -29,7 +29,7 @@ POST /collections/books/_search
   "query": "title_t:dune",
   "filter": ["stock_i:>0"],
   "limit": 10,
-  "get_number": true,
+  "count_limit": -1,
   "fields": ["id","title_t"],
   "ops": {
     "categories": {
@@ -87,7 +87,7 @@ The operation kinds on this page:
 | `field_facet` | Each distinct value of a field. |
 | `range_facet` | Fixed-width or calendar buckets over a numeric or date field. |
 | `query_facet` | Named buckets you define with arbitrary queries. |
-| Expression metric (`"avg(price_f)"`) | Nothing; one number over the incoming documents. |
+| Expression metric (`"avg(price_f)"`) | Nothing; one scalar such as an average, distinct count, or percentile. |
 | `top_docs` / `fusion` | Nothing; a ranked document list per bucket. |
 
 ## Easy multi-select with `selected`
@@ -105,7 +105,7 @@ POST /collections/books/_search
   "query": {"all":true},
   "filter": ["stock_i:>0"],
   "limit": 10,
-  "get_number": true,
+  "count_limit": -1,
   "fields": ["id","title_t"],
   "ops": {
     "categories": {
@@ -316,14 +316,39 @@ shortest form is a bare expression string in an operation position:
 "average_price": "avg(price_f)"
 ```
 
-`avg`, `sum`, `min`, and `max` are the aggregates. Their arguments use the same
-value-expression language as [sort expressions](searching.md#sorting):
+The aggregates are `avg`, `sum`, `min`, `max`, `cardinality`, `percentile`, and
+`percentile_rank`. Their value arguments use the same expression language as
+[sort expressions](searching.md#sorting):
 arithmetic, parentheses, `def`, unary math, and per-document array reducers.
 A composite metric is a single expression:
 
 ```json
 "weighted_price": "sum(price_f * qty_i) / sum(qty_i)"
 ```
+
+Distinct counts, percentiles, and the percentage of prices at or below a bound
+are scalar metrics too:
+
+```http
+POST /collections/books/_search
+
+{
+  "limit": 0,
+  "ops": {
+    "publishers": "cardinality(publisher_s)",
+    "p95_price": "percentile(price_f, 95)",
+    "affordable": "percentile_rank(price_f, 20)"
+  }
+}
+```
+
+| Aggregate | Result | Constant arguments |
+|---|---|---|
+| `cardinality(x [, threshold])` | int64 distinct count. | `threshold` defaults to 3000; an integer in [0, 40000]. |
+| `percentile(x, p [, compression])` | Double p-th percentile. | `p` in [0, 100]; `compression` defaults to 100, in [20, 1000]. |
+| `percentile_rank(x, v)` | Exact double percentage of values <= `v`. | `v` is the bound. |
+
+Trailing arguments must be finite numeric constants or scalar `$vars`.
 
 The explicit forms are `{"expr_op":"avg(price_f)"}` and
 `{"expr_op":{"expr":"avg(price_f)","vars":{...}}}`; the object form takes a
@@ -378,27 +403,54 @@ Sort a field facet by one of its metrics:
 }
 ```
 
-Field facet `sort` names a metric operation of that facet; `asc` and `desc` are both
-supported, and a bucket whose metric is missing or failed sorts last either
-way.
+Field facet `sort` names a sort-capable metric operation of that facet; `asc`
+and `desc` are both supported. `percentile_rank` supports metric sorting. A
+bucket whose metric is missing or failed sorts last either way. See
+[Limits](#limits) for restrictions.
 
 The typing rules:
 
-- Column leaves use the field's value binding and require a numeric or date
-  column.
-- Reduce multi-valued columns within each document first:
-  `avg(avg(prices_fs))` averages each document's prices, then averages those
-  across the bucket.
+- `cardinality` accepts numeric or date expressions and indexed STRING/ID
+  columns, and flattens multi-valued inputs.
+- Other aggregates require one scalar per document. Reduce multi-valued
+  columns first: `avg(avg(prices_fs))` averages each document's prices,
+  then averages those across the bucket.
 - Missing document values are skipped. `def(value, 0)` counts a missing value
-  as 0 in a sum or a denominator.
+  as 0 in a sum or a denominator. `cardinality`, `percentile`, and
+  `percentile_rank` also skip NaN and infinity.
 - Integer `sum`, `min`, and `max` return int64 values and accumulate exactly;
-  `avg` and any floating-point expression return a double. A bucket with no
-  contributing values returns `null`. Data-dependent overflow or a non-finite
-  result also returns `null` and adds a response warning rather than failing
-  the request.
-- `avg`, `min`, and `max` of a date keep their date meaning; `sum` requires
-  numeric values. Multiplication, division, unary minus, and unary math turn
-  a date into a plain number.
+  `avg` and floating-point `sum`, `min`, and `max` return a double. With no
+  contributing values, `cardinality` returns 0 and other aggregates return
+  `null`. Data-dependent overflow or a non-finite result returns `null` with
+  a response warning.
+- `avg`, `min`, `max`, and `percentile` of a date keep their DATE nature;
+  date percentiles are double epoch milliseconds. `cardinality` and
+  `percentile_rank` return plain numbers. `sum` requires numeric values.
+  Multiplication, division, unary minus, and unary math turn a date into a
+  plain number.
+- For a bare FLOAT column, `percentile_rank` rounds its bound to FLOAT,
+  matching range queries. Expression inputs use a double bound.
+
+### Accuracy and memory
+
+`cardinality` is exact up to `threshold` distinct values, then switches to a
+HyperLogLog estimate with a standard error of about 1.6% at the default
+threshold (0.4% at 40000). A larger threshold extends the exact phase and uses
+more memory; 0 estimates from the first value.
+
+`percentile` is exact for fewer than 5 x `compression` values (500 by
+default), interpolating linearly between adjacent ranks. Larger inputs use a
+t-digest: higher compression uses more memory for finer rank estimates, with
+no strict error bound. The minimum and maximum
+(`p` = 0 and 100) are exact. Results are deterministic for a fixed set of
+segments; segment merges can change estimates.
+
+Each bucket has its own state. Calls with the same function, input, and
+`compression` or `threshold` share one sketch within an expression, and
+sibling metrics that use exactly the same sketches share them too: `p50`,
+`p95`, and `p99` metrics on one field build a single t-digest. Sketch
+allocations count against the request memory limit. `percentile_rank` uses
+two counters and is exact regardless of the number of values.
 
 ## Nested facets
 
@@ -450,7 +502,7 @@ same `ops` map.
 A `top_docs` (or `fusion`) operation under a facet returns a ranked document
 list for every bucket: the best few products per category, the latest post per
 author. It is an ordinary operation with its own `query`, `filter`, `sort`,
-`limit`, `fields`, and `get_number`, applied to that bucket's documents:
+`limit`, `fields`, and `count_limit`, applied to that bucket's documents:
 
 ```json
 "category": {
@@ -463,7 +515,7 @@ author. It is an ordinary operation with its own `query`, `filter`, `sort`,
           "query": "title_t:dune",
           "limit": 2,
           "fields": ["id","title_t"],
-          "get_number": true
+          "count_limit": -1
         }
       }
     }
@@ -811,7 +863,7 @@ POST /collections/authors/_search
     "all": true
   },
   "fields": ["id", "title_t", "author_name"],
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "authors": {
       "field_facet": {
@@ -924,7 +976,7 @@ POST /collections/authors/_search
     "all": true
   },
   "limit": 0,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "words": {
       "field_facet": {
@@ -971,6 +1023,7 @@ primary, the bare field name counts words without needing `__self`.
 
 ## Limits
 
+- Facets cannot yet sort by metrics containing `cardinality` or `percentile`.
 - Field facet sorting takes one key, which must be a metric operation of that facet.
   Custom count or bucket-value sort orders are not yet supported; omit `sort`
   for the default count order.

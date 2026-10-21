@@ -54,8 +54,11 @@ inline size_t saturatingMultiply(size_t a, size_t b) {
 
 struct CollectionRequirements {
   bool needRankedDocs = false;
-  bool needExactCount = false;
+  int64_t countLimit = 0; // 0: none; -1: exact; positive: at least this many.
   bool needExactDomain = false;
+
+  bool needsCount() const { return countLimit != 0; }
+  bool isBounded() const { return countLimit > 0; }
 };
 
 // --- Response-side (owning) oneof / optional mutators ---
@@ -402,12 +405,15 @@ public:
     //     encode's it and respondRaw(..., more=true), then it is dropped (per-emit
     //     eager-drop). The accumulating/final response is untouched; multiple intermediates
     //     may precede the final, which goes out more=false.
-    luxir::api::Val* getTarget(SearchResponse* resp, auto&& visitor) {
+    luxir::api::Val* getTarget(SearchResponse* resp, SearchOp& sub, auto&& visitor) {
       std::lock_guard<std::mutex> lock(op.req.mutex);
       resp = resp ? resp : op.req.lastResponse;
-      auto* val = parent->getTargetForSub(resp, this);
+      auto* val = parent->getTargetForSub(resp, sub);
       visitor(*val); // call the visitor with the target Val with mutex held.
       return val;
+    }
+    luxir::api::Val* getTarget(SearchResponse* resp, auto&& visitor) {
+      return getTarget(resp, op, std::forward<decltype(visitor)>(visitor));
     }
     luxir::api::Val* getTarget(SearchResponse* resp) {
       return getTarget(resp, [](luxir::api::Val&){});
@@ -427,10 +433,10 @@ public:
       return arm;
     }
 
-    // Called by a subCalculator on us to get the target for the subCalculator to set.
+    // Resolve a named child, including when another child emits its result.
     // `resp` is non-null (getTarget resolves it). Do not call this without op.req.mutex
     // held to protect the response from concurrent modifications.
-    virtual luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) = 0;
+    virtual luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) = 0;
 
     SearchOp& getOp() {
       return op;
@@ -491,7 +497,7 @@ public:
       : Calculator(op, parent, slot, numSlots) {
     }
 
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override { return nullptr; }
+    luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override { return nullptr; }
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,
               DomainHandle domain) override {};
     virtual void startSeg(int32_t segnum) {};

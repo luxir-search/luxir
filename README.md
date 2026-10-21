@@ -10,7 +10,7 @@ POST /collections/books/_search
 Content-Type: application/json
 
 {"query":"title_t:(dune OR messiah) AND year_i:>=1965",
- "fields":["id","title_t","year_i"],"get_number":true}
+ "fields":["id","title_t","year_i"],"count_limit":-1}
 ```
 
 ```json
