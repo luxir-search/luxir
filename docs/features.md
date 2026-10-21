@@ -236,8 +236,8 @@ Anywhere a query goes, it can be a structured object or an expression string.
   Weights scale term frequency and length within a group. `per_field` adds
   each field's match score multiplied by its weight. Other field types form
   singleton groups in `combined`. `tie` controls how field/group
-  scores combine; `phrase`, `phrase_prefix`, and `bool_prefix` modes and `*`
-  field patterns are also supported.
+  scores combine; `phrase` options in `per_field` mode and `*` field patterns
+  are also supported.
 - `dis_max`: the best matching query's score plus `tie` times the
   other matching scores.
 - `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,

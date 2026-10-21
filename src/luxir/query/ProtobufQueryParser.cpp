@@ -576,9 +576,6 @@ float tieOf(std::optional<float> tie, std::string_view label, float defaultValue
   return value;
 }
 
-// Cap on multi_match max_expansions: each expansion is a phrase clause.
-constexpr int32_t MAX_PREFIX_EXPANSIONS = 1024;
-
 } // namespace
 
 luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQuery& query) {
@@ -586,17 +583,16 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
   if (query.min_match < 0) {
     throw std::runtime_error("multi_match 'min_match' must not be negative");
   }
-  if (query.slop < 0) {
-    throw std::runtime_error("multi_match 'slop' must not be negative");
-  }
-  if (query.max_expansions < 0 || query.max_expansions > MAX_PREFIX_EXPANSIONS) {
-    throw std::runtime_error(std::format(
-        "multi_match 'max_expansions' must be in [0, {}] (got {})",
-        MAX_PREFIX_EXPANSIONS, query.max_expansions));
-  }
-  bool phrase = query.mode == Mode::PHRASE || query.mode == Mode::PHRASE_PREFIX;
-  if (query.slop > 0 && !phrase) {
-    throw std::runtime_error("multi_match 'slop' applies only to modes phrase and phrase_prefix");
+  if (query.phrase) {
+    if (query.mode != Mode::PER_FIELD) {
+      throw std::runtime_error("multi_match 'phrase' requires mode per_field");
+    }
+    if (query.operator_ != api::Match_::Operator::OPERATOR_UNSPECIFIED || query.min_match > 0) {
+      throw std::runtime_error("multi_match 'phrase' cannot be combined with 'operator' or 'min_match'");
+    }
+    if (query.phrase->slop < 0) {
+      throw std::runtime_error("multi_match phrase 'slop' must not be negative");
+    }
   }
   float tie = tieOf(query.tie, "multi_match", 1.0f);
   if (query.fields.empty()) {
@@ -640,14 +636,8 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
     case Mode::COMBINED:
       return builder.createMultiMatchCombined(fields, query.text, op, query.min_match, tie);
     case Mode::PER_FIELD:
-      return builder.createMultiMatchPerField(fields, query.text, op, query.min_match, tie);
-    case Mode::PHRASE:
-      return builder.createMultiPhraseQuery(fields, query.text, query.slop, tie);
-    case Mode::PHRASE_PREFIX:
-      return builder.createMultiPhrasePrefixQuery(
-          fields, query.text, query.slop, query.max_expansions, tie);
-    case Mode::BOOL_PREFIX:
-      return builder.createMultiBoolPrefixQuery(fields, query.text, op, query.min_match);
+      return builder.createMultiMatchPerField(fields, query.text, op, query.min_match, tie,
+          query.phrase ? std::optional<int32_t>(query.phrase->slop) : std::nullopt);
   }
   throw std::runtime_error(std::format("multi_match: unknown mode {}", (int)query.mode));
 }

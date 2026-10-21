@@ -104,6 +104,7 @@ class ExprParser {
   // them as ordinary bytes (only quotes, parens, and whitespace are
   // structural everywhere).
   static constexpr std::string_view ARG_STOPS = ",)]=[";
+  static constexpr std::string_view OBJECT_ARG_STOPS = ",)]=[}";
 
   const ExprOptions& opts;
   std::optional<FieldResolver> localFields;
@@ -1086,6 +1087,49 @@ private:
     }
   }
 
+  // Message members share typed assignment and the expression nesting budget.
+  template <typename M>
+  void parseObject(std::string_view name, M& message) {
+    cur.skipWs();
+    size_t pos = cur.position();
+    if (!cur.consume('{')) {
+      fail(pos, fmt::format("argument '{}' expects an object: {}={{...}}", name, name));
+    }
+    DepthScope depth(*this, pos);
+    std::pmr::vector<std::string_view> seen(&mr);
+    cur.skipWs();
+    if (!cur.consume('}')) {
+      for (;;) {
+        cur.skipWs();
+        size_t memberPos = cur.position();
+        if (cur.atEnd()) fail(pos, fmt::format("unterminated object '{}'", name));
+        bool quoted = cur.peek() == '"' || cur.peek() == '\'';
+        std::string_view memberName = quoted ? scanQuoted() : value::lex::scanIdentifier(cur);
+        if (!quoted && memberName.empty()) fail(memberPos, "expected an object member name");
+        for (auto previous : seen) {
+          if (previous == memberName) {
+            fail(memberPos, fmt::format("duplicate member '{}' in object '{}'", memberName, name));
+          }
+        }
+        cur.skipWs();
+        if (!cur.consume(':')) fail(cur.position(), "expected ':' after object member name");
+        bool found = expr::withMember(message, memberName, [&](auto& member) {
+          assignArg(name, memberName, memberPos, member, '}');
+        });
+        if (!found) {
+          fail(memberPos, fmt::format("unknown member '{}' in object '{}'", memberName, name));
+        }
+        seen.push_back(memberName);
+        auto separator = value::lex::consumeListSeparator(cur, '}');
+        if (separator == value::lex::ListSeparator::CLOSE) break;
+        if (cur.atEnd()) fail(pos, fmt::format("unterminated object '{}'", name));
+        if (separator != value::lex::ListSeparator::COMMA) {
+          fail(cur.position(), fmt::format("expected ',' or '}}' in object '{}'", name));
+        }
+      }
+    }
+  }
+
   // Named-argument lookahead: identifier (ws) '=' - consumed when it matches,
   // fully restored otherwise, so raw text like "a=b" only becomes an argument
   // when 'a' really is one (and then errors as unknown, teaching the quote).
@@ -1109,30 +1153,44 @@ private:
   template <class T>
   static constexpr bool isOptional<std::optional<T>> = true;
 
+  template <class T>
+  static constexpr bool isOptionalIndirect = false;
+  template <class T>
+  static constexpr bool isOptionalIndirect<::hpp_proto::optional_indirect_view<T>> = true;
+
   // Typed argument assignment: the value grammar follows the member's proto
   // type (this is where "arguments are typed" lives).  Anything the string
   // language cannot express (vectors, binary terms) is a precise error
-  // pointing at the structured form.
+  // pointing at the structured form. Object members end at '}', function
+  // arguments at ')'; braces stay literal in ordinary function values.
   template <typename M>
-  void assignArg(std::string_view fn, std::string_view argName, size_t argPos, M& member) {
+  void assignArg(std::string_view fn, std::string_view argName, size_t argPos, M& member,
+                 char close = ')') {
     using T = std::remove_cvref_t<M>;
+    std::string_view stops = close == '}' ? OBJECT_ARG_STOPS : ARG_STOPS;
     if constexpr (std::is_same_v<T, std::string_view>) {
       member = argName == expr::valueExprArg(fn)
-          ? parseRawText(fn) : parseStringValue(argName);
+          ? parseRawText(fn) : parseStringValue(argName, stops);
     } else if constexpr (std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
                          std::is_same_v<T, float> || std::is_same_v<T, double>) {
-      member = parseNumberValue<T>(argName);
+      member = parseNumberValue<T>(argName, stops);
     } else if constexpr (std::is_same_v<T, bool>) {
-      member = parseBoolValue(argName);
+      member = parseBoolValue(argName, stops);
     } else if constexpr (std::is_enum_v<T>) {
-      member = parseEnumValue<T>(argName);
+      member = parseEnumValue<T>(argName, stops);
     } else if constexpr (isOptional<T>) {
-      assignArg(fn, argName, argPos, member.emplace());
+      assignArg(fn, argName, argPos, member.emplace(), close);
     } else if constexpr (std::is_same_v<T, ::hpp_proto::optional_indirect_view<api::Val>>) {
       member = fn == "any_of" && argName == "values"
-          ? parseExactValues(ARG_STOPS) : parseValValue(argName);
+          ? parseExactValues(stops) : parseValValue(argName, stops);
     } else if constexpr (std::is_same_v<T, ::hpp_proto::optional_indirect_view<api::Query>>) {
-      member = parseQueryValue(argName, ",)");
+      char queryStops[] = {',', close};
+      member = parseQueryValue(argName, std::string_view(queryStops, 2));
+    } else if constexpr (isOptionalIndirect<T>) {
+      using Value = typename T::value_type;
+      auto* value = api::build::allocMessage<Value>(mr);
+      assignArg(fn, argName, argPos, *value, close);
+      member = value;
     } else if constexpr (std::is_same_v<T, std::span<const std::string_view>>) {
       member = parseStringList(argName);
     } else if constexpr (std::is_same_v<T, std::span<const api::WeightedField>>) {
@@ -1141,6 +1199,8 @@ private:
       member = parseQueryList(argName);
     } else if constexpr (std::is_same_v<T, std::span<const int32_t>>) {
       member = parseIntList(argName);
+    } else if constexpr (std::is_aggregate_v<T>) {
+      parseObject(argName, member);
     } else {
       fail(argPos, fmt::format("argument '{}' of {}() has a type the expr language cannot "
                                "express; use the structured form",
@@ -1196,19 +1256,19 @@ private:
     fail(cur.position(), fmt::format("variable for '{}' is not a string", argName));
   }
 
-  std::string_view parseStringValue(std::string_view argName) {
+  std::string_view parseStringValue(std::string_view argName, std::string_view stops = ARG_STOPS) {
     cur.skipWs();
     size_t pos = cur.position();
     char c = cur.peek();
     if (c == '"' || c == '\'') return scanQuoted();
     if (c == '$') return varString(*parseVarRef(), argName);
-    Token t = scanToken(ARG_STOPS, /*stopAtColon=*/false);
+    Token t = scanToken(stops, /*stopAtColon=*/false);
     if (t.empty()) fail(pos, fmt::format("expected a value for '{}'", argName));
     return t.text;
   }
 
   template <typename T>
-  T parseNumberValue(std::string_view argName) {
+  T parseNumberValue(std::string_view argName, std::string_view stops = ARG_STOPS) {
     cur.skipWs();
     size_t pos = cur.position();
     if (cur.peek() == '$') {
@@ -1229,7 +1289,7 @@ private:
     std::string_view text = value::lex::scanNumber(cur);
     T out{};
     auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), out);
-    bool delimited = cur.atEnd() || cur.wsLen() > 0 || ARG_STOPS.find(cur.peek()) != std::string_view::npos;
+    bool delimited = cur.atEnd() || cur.wsLen() > 0 || isStop(cur.peek(), stops);
     if (text.empty() || !delimited || ec != std::errc() || p != text.data() + text.size() ||
         (std::is_floating_point_v<T> && !std::isfinite(out))) {
       fail(pos, fmt::format("argument '{}' expects a number (finite value required)", argName));
@@ -1237,7 +1297,7 @@ private:
     return out;
   }
 
-  bool parseBoolValue(std::string_view argName) {
+  bool parseBoolValue(std::string_view argName, std::string_view stops = ARG_STOPS) {
     cur.skipWs();
     size_t pos = cur.position();
     if (cur.peek() == '$') {
@@ -1245,17 +1305,17 @@ private:
       if (const auto* b = std::get_if<bool>(&v.kind)) return *b;
       fail(pos, fmt::format("variable for '{}' is not a boolean", argName));
     }
-    Token t = scanToken(ARG_STOPS, /*stopAtColon=*/false);
+    Token t = scanToken(stops, /*stopAtColon=*/false);
     if (t.text == "true") return true;
     if (t.text == "false") return false;
     fail(pos, fmt::format("argument '{}' expects true or false (got '{}')", argName, t.text));
   }
 
   template <typename E>
-  E parseEnumValue(std::string_view argName) {
+  E parseEnumValue(std::string_view argName, std::string_view stops = ARG_STOPS) {
     cur.skipWs();
     size_t pos = cur.position();
-    std::string_view text = parseStringValue(argName);
+    std::string_view text = parseStringValue(argName, stops);
     std::optional<E> result;
     expr::forEachEnumValue<E>([&](std::string_view name, E value) {
       if (expr::enumNameMatches(text, name)) result = value;
@@ -1269,14 +1329,14 @@ private:
     fail(pos, fmt::format("argument '{}' expects {} (got '{}')", argName, expected, text));
   }
 
-  const api::Val* parseValValue(std::string_view argName) {
+  const api::Val* parseValValue(std::string_view argName, std::string_view stops = ARG_STOPS) {
     cur.skipWs();
     size_t pos = cur.position();
     char c = cur.peek();
     if (c == '$') return parseVarRef();
     if (c == '"' || c == '\'') return allocVal(scanQuoted());
     if (c == '[') fail(pos, fmt::format("argument '{}' does not take a list", argName));
-    Token t = scanToken(ARG_STOPS, /*stopAtColon=*/false);
+    Token t = scanToken(stops, /*stopAtColon=*/false);
     if (t.empty()) fail(pos, fmt::format("expected a value for '{}'", argName));
     return allocVal(t.text);
   }

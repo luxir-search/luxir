@@ -150,6 +150,7 @@ defaults and constraints are described in the comments and guides.
 - [`NetworkInterfaceStats`](#message-luxir.networkinterfacestats)
 - [`NormalizerDef`](#message-luxir.normalizerdef)
 - [`OutcomeStats`](#message-luxir.outcomestats)
+- [`PhraseOptions`](#message-luxir.phraseoptions)
 - [`PhraseQuery`](#message-luxir.phrasequery)
 - [`PrefixQuery`](#message-luxir.prefixquery)
 - [`PressureStats`](#message-luxir.pressurestats)
@@ -1543,11 +1544,10 @@ Analyzes one text across several fields. In COMBINED mode, fields sharing an ana
 | <a id="field-luxir.multimatchquery.text"></a>[`text`](#field-luxir.multimatchquery.text) | 1 | `string` | singular | the text to analyze |
 | <a id="field-luxir.multimatchquery.fields"></a>[`fields`](#field-luxir.multimatchquery.fields) | 2 | [`WeightedField`](#message-luxir.weightedfield) | repeated | Required and non-empty. Fields resolve through their search bindings. Duplicate physical fields keep the larger weight. Names containing '\*' expand over schema and reader fields, keeping TEXT and STRING fields. |
 | <a id="field-luxir.multimatchquery.mode"></a>[`mode`](#field-luxir.multimatchquery.mode) | 3 | [`MultiMatchQuery.Mode`](#enum-luxir.multimatchquery.mode) | singular | Unset = COMBINED. |
-| <a id="field-luxir.multimatchquery.operator"></a>[`operator`](#field-luxir.multimatchquery.operator) | 4 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How analyzed terms combine. Unset = OR. COMBINED applies this within each group (AND: every term in some field of one group). PER\_FIELD applies it within each field (AND: every term in that field). Ignored by the phrase modes. |
-| <a id="field-luxir.multimatchquery.min_match"></a>[`min_match`](#field-luxir.multimatchquery.min_match) | 5 | `int32` | singular | Zero uses operator. Positive values override operator and are clamped to the analyzed term count within each group/field. Must be &gt;= 0. |
-| <a id="field-luxir.multimatchquery.tie"></a>[`tie`](#field-luxir.multimatchquery.tie) | 6 | `float` | optional | Weight of non-best fields or groups: best + tie \* others. Unset = 1 in every mode. Must be finite and in \[0, 1\]. Ignored by BOOL\_PREFIX, which always adds field scores. |
-| <a id="field-luxir.multimatchquery.slop"></a>[`slop`](#field-luxir.multimatchquery.slop) | 7 | `int32` | singular | Phrase slop for PHRASE and PHRASE\_PREFIX. Must be &gt;= 0. |
-| <a id="field-luxir.multimatchquery.max_expansions"></a>[`max_expansions`](#field-luxir.multimatchquery.max_expansions) | 8 | `int32` | singular | Maximum PHRASE\_PREFIX expansions, in byte order. 0 = 50, at most 1024. BOOL\_PREFIX ignores this limit and matches every expansion. |
+| <a id="field-luxir.multimatchquery.operator"></a>[`operator`](#field-luxir.multimatchquery.operator) | 4 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How analyzed terms combine. Unset = OR. COMBINED applies this within each group (AND: every term in some field of one group). PER\_FIELD applies it within each field (AND: every term in that field). Must be unset when phrase is present. |
+| <a id="field-luxir.multimatchquery.min_match"></a>[`min_match`](#field-luxir.multimatchquery.min_match) | 5 | `int32` | singular | Zero uses operator. Positive values override operator and are clamped to the analyzed term count within each group/field. Must be &gt;= 0, and must be zero when phrase is present. |
+| <a id="field-luxir.multimatchquery.tie"></a>[`tie`](#field-luxir.multimatchquery.tie) | 6 | `float` | optional | Weight of non-best fields or groups: best + tie \* others. Unset = 1 in every mode. Must be finite and in \[0, 1\]. |
+| <a id="field-luxir.multimatchquery.phrase"></a>[`phrase`](#field-luxir.multimatchquery.phrase) | 7 | [`PhraseOptions`](#message-luxir.phraseoptions) | singular | Absent = match. Present = a phrase per TEXT field (requires indexed positions), a whole-value match on STRING/ID fields. PER\_FIELD only; fields combine by tie, and each weight multiplies its field's score. |
 
 <a id="message-luxir.multivector"></a>
 
@@ -1615,6 +1615,18 @@ Completed work by outcome, and its summed duration.
 | <a id="field-luxir.outcomestats.error"></a>[`error`](#field-luxir.outcomestats.error) | 2 | `uint64` | singular |  |
 | <a id="field-luxir.outcomestats.cancelled"></a>[`cancelled`](#field-luxir.outcomestats.cancelled) | 3 | `uint64` | singular |  |
 | <a id="field-luxir.outcomestats.seconds"></a>[`seconds`](#field-luxir.outcomestats.seconds) | 4 | `double` | singular |  |
+
+<a id="message-luxir.phraseoptions"></a>
+
+### luxir.PhraseOptions
+
+Phrase matching options. A present empty message requests an exact phrase.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.phraseoptions.slop"></a>[`slop`](#field-luxir.phraseoptions.slop) | 1 | `int32` | singular | Maximum spread of query-adjusted positions. Must be &gt;= 0; unset = 0. |
 
 <a id="message-luxir.phrasequery"></a>
 
@@ -2730,9 +2742,6 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 |---|---|---|
 | <a id="value-luxir.multimatchquery.mode.combined"></a>[`COMBINED`](#value-luxir.multimatchquery.mode.combined) | 0 | TEXT weights scale term frequency and document length at every group size. Other fields are singleton groups with multiplicative weights. |
 | <a id="value-luxir.multimatchquery.mode.per_field"></a>[`PER_FIELD`](#value-luxir.multimatchquery.mode.per_field) | 1 | One match per field; each weight multiplies that field's score. |
-| <a id="value-luxir.multimatchquery.mode.phrase"></a>[`PHRASE`](#value-luxir.multimatchquery.mode.phrase) | 2 | One phrase per TEXT field, a match on other fields; combined by dis\_max. |
-| <a id="value-luxir.multimatchquery.mode.phrase_prefix"></a>[`PHRASE_PREFIX`](#value-luxir.multimatchquery.mode.phrase_prefix) | 3 | One phrase per field whose last word is a prefix; combined by dis\_max. |
-| <a id="value-luxir.multimatchquery.mode.bool_prefix"></a>[`BOOL_PREFIX`](#value-luxir.multimatchquery.mode.bool_prefix) | 4 | Leading terms and a final prefix per field; field scores add. |
 
 <a id="enum-luxir.rangefacet.bounds"></a>
 

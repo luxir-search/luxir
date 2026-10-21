@@ -280,7 +280,7 @@ void roundTripType(const char* nm) {
   X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(AnyOfQuery) X(Filter)    \
   X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(RegexQuery) X(FuzzyQuery) X(PhraseQuery)       \
   X(SimpleQuery) X(RangeQuery) X(GeoBoxQuery) X(GeoDistanceQuery) X(ExprQuery) X(Warning)           \
-  X(WeightedField) X(MultiMatchQuery) X(DisMaxQuery)                                         \
+  X(WeightedField) X(PhraseOptions) X(MultiMatchQuery) X(DisMaxQuery)                                         \
   X(FieldFacet) X(ExecutionProfile) X(ExecutionProfileOp) X(ExecutionProfilePiece)                 \
   X(CalendarGap) X(RangeFacet) X(QueryBucket) X(QueryFacet) X(Domain)                               \
   X(SearchResponse) X(DocList) X(FacetResult) X(CommitParams) X(UpdateRequest)                     \

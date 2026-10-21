@@ -611,7 +611,7 @@ clauses, filters, fusion sources, or another query wrapper.
 | Constant score | `{"constant_score":{"query":...,"score":1.0}}` | Replaces child scores without changing its match set. |
 | Boost | `{"boost":{"query":...,"boost":2.0}}` | Multiplies child scores. A numeric `boost` sibling is input sugar. |
 | Simple query | `{"simple_query":{"q":"dune | messiah","fields":["title_t"]}}` | Never-failing syntax for raw search-box input. |
-| Multi-match | `{"multi_match":{"text":"dune","fields":["title_t^2","body_t"]}}` | `combined` (default) scores analyzer/policy groups with BM25F; `per_field` adds weighted match scores. Also phrase/prefix modes, `tie`, and wildcard fields. |
+| Multi-match | `{"multi_match":{"text":"dune","fields":["title_t^2","body_t"]}}` | `combined` (default) scores analyzer/policy groups with BM25F; `per_field` adds weighted match scores. Also `phrase` options in `per_field` mode, `tie`, and wildcard fields. |
 | Disjunction max | `{"dis_max":{"queries":[...],"tie":0.3}}` | Best query score plus a fraction of the other scores. |
 | Expression | `"title_t:dune AND year_i:>=1965"` | Strict developer syntax with exact parse errors and safe `$vars`. |
 | kNN | `{"knn":{"field":"embedding_v","query":[...],"k":20}}` | Exact or ANN vector search; see [Vector Search](vector-search.md). |

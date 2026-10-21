@@ -58,7 +58,6 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
     case QueryKind::NONE:
     case QueryKind::MIN_SCORE:
     case QueryKind::DIS_MAX:
-    case QueryKind::PHRASE_PREFIX:
     case QueryKind::TEST:
       return Query::ScoreProfile::variable();
   }
@@ -85,7 +84,6 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
           *static_cast<const DisMaxQuery&>(query).getMembership());
     case QueryKind::TERM:
     case QueryKind::PHRASE:
-    case QueryKind::PHRASE_PREFIX:
     case QueryKind::COMBINED_FIELDS:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
@@ -127,7 +125,6 @@ inline bool exactDomainIdentity(const Query& query) {
       return true;
     case QueryKind::TERM:
     case QueryKind::PHRASE:
-    case QueryKind::PHRASE_PREFIX:
     case QueryKind::COMBINED_FIELDS:
     case QueryKind::DIS_MAX:
     case QueryKind::BOOLEAN:
@@ -177,7 +174,6 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::NONE:
       return true;
     case QueryKind::PHRASE:
-    case QueryKind::PHRASE_PREFIX:
     case QueryKind::COMBINED_FIELDS:
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
@@ -236,7 +232,6 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
     case QueryKind::DIS_MAX:
       return membershipVerificationWork(
           *static_cast<const DisMaxQuery&>(query).getMembership());
-    case QueryKind::PHRASE_PREFIX:
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:

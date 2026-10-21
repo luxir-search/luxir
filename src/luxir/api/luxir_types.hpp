@@ -68,7 +68,7 @@ struct Diversify; struct Collapse; struct GroupComponent; struct GroupKey; struc
 struct Fusion; struct RrfFusion; struct LinearFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct RescoreQuery; struct KnnQuery; struct Match; struct AnyOfQuery; struct Filter; struct BooleanQuery;
 struct PrefixQuery; struct WildcardQuery; struct RegexQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
-struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct WeightedField; struct MultiMatchQuery;
+struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct WeightedField; struct PhraseOptions; struct MultiMatchQuery;
 struct DisMaxQuery;
 struct Warning; struct Error;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
@@ -118,8 +118,8 @@ enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 };
 BOOST_DESCRIBE_ENUM(Operator, AND, OR)
 }
 namespace MultiMatchQuery_ {
-enum class Mode { COMBINED = 0, PER_FIELD = 1, PHRASE = 2, PHRASE_PREFIX = 3, BOOL_PREFIX = 4 };
-BOOST_DESCRIBE_ENUM(Mode, COMBINED, PER_FIELD, PHRASE, PHRASE_PREFIX, BOOL_PREFIX)
+enum class Mode { COMBINED = 0, PER_FIELD = 1 };
+BOOST_DESCRIBE_ENUM(Mode, COMBINED, PER_FIELD)
 }
 namespace CalendarGap_ {
 enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR = 5 };
@@ -1098,6 +1098,9 @@ struct WeightedField {
   std::string_view field;
   std::optional<float> weight;
 };
+struct PhraseOptions {
+  int32_t slop = 0;
+};
 struct MultiMatchQuery {
   using Operator = luxir::api::Match_::Operator;
   using Mode = luxir::api::MultiMatchQuery_::Mode;
@@ -1107,8 +1110,7 @@ struct MultiMatchQuery {
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
   std::optional<float> tie;
-  int32_t slop = 0;
-  int32_t max_expansions = 0;
+  std::optional<PhraseOptions> phrase;
 };
 struct DisMaxQuery {                                             // span<incomplete Query> OK
   std::span<const Query> queries;
@@ -1147,7 +1149,7 @@ LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) L
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)
-LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery) LUXIR_TD(WeightedField) LUXIR_TD(MultiMatchQuery) LUXIR_TD(DisMaxQuery)
+LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery) LUXIR_TD(WeightedField) LUXIR_TD(PhraseOptions) LUXIR_TD(MultiMatchQuery) LUXIR_TD(DisMaxQuery)
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
@@ -1194,7 +1196,7 @@ LUXIR_ENTRY(Query) LUXIR_ENTRY(ExistsQuery) LUXIR_ENTRY(ConstantScoreQuery) LUXI
 LUXIR_ENTRY(KnnQuery) LUXIR_ENTRY(Match) LUXIR_ENTRY(AnyOfQuery) LUXIR_ENTRY(Filter) LUXIR_ENTRY(BooleanQuery)
 LUXIR_ENTRY(PrefixQuery) LUXIR_ENTRY(WildcardQuery) LUXIR_ENTRY(RegexQuery) LUXIR_ENTRY(FuzzyQuery) LUXIR_ENTRY(PhraseQuery) LUXIR_ENTRY(SimpleQuery)
 LUXIR_ENTRY(RangeQuery) LUXIR_ENTRY(GeoBoxQuery) LUXIR_ENTRY(GeoDistanceQuery) LUXIR_ENTRY(ExprQuery)
-LUXIR_ENTRY(WeightedField) LUXIR_ENTRY(MultiMatchQuery) LUXIR_ENTRY(DisMaxQuery)
+LUXIR_ENTRY(WeightedField) LUXIR_ENTRY(PhraseOptions) LUXIR_ENTRY(MultiMatchQuery) LUXIR_ENTRY(DisMaxQuery)
 LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)

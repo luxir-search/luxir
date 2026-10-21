@@ -867,3 +867,30 @@ TEST(JsonDialect, MultiFieldTieName) {
     EXPECT_NE(std::string::npos, error.find("tie_breaker")) << error;
   }
 }
+
+TEST(JsonDialect, MultiMatchPhraseOptions) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::MultiMatchQuery absent;
+  ASSERT_TRUE(P::read_json(absent, R"({"text":"dune","fields":["title_t"],"mode":"per_field"})", mr));
+  EXPECT_FALSE(absent.phrase);
+  for (auto value : {"{}", "{\"slop\":2}"}) {
+    P::MultiMatchQuery query;
+    std::string json = std::string(R"({"text":"dune","fields":["title_t"],"mode":"per_field","phrase":)") + value + "}";
+    ASSERT_TRUE(P::read_json(query, json, mr));
+    ASSERT_TRUE(query.phrase);
+    EXPECT_EQ(value == std::string_view("{}") ? 0 : 2, query.phrase->slop);
+    std::string out;
+    ASSERT_TRUE(P::write_json(query, out));
+    EXPECT_NE(std::string::npos, out.find(R"("phrase":{)")) << out;
+    P::MultiMatchQuery roundTrip;
+    ASSERT_TRUE(P::read_json(roundTrip, out, mr));
+    ASSERT_TRUE(roundTrip.phrase);
+    EXPECT_EQ(query.phrase->slop, roundTrip.phrase->slop);
+  }
+  for (auto json : {R"({"slop":2})", R"({"max_expansions":50})", R"({"mode":"phrase"})",
+                    R"({"mode":"phrase_prefix"})", R"({"mode":"bool_prefix"})",
+                    R"({"phrase":2})", R"({"phrase":{"bogus":1}})"}) {
+    P::MultiMatchQuery query;
+    EXPECT_FALSE(P::read_json(query, json, mr)) << json;
+  }
+}

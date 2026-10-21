@@ -459,12 +459,11 @@ field with BM25F. The `per_field` mode adds weighted `match` scores by default:
 |---|---|
 | `text` | Text to analyze or coerce. |
 | `fields` | Required non-empty list of objects with `field` and optional `weight`. Unset weight is `1`; every weight must be finite and greater than `0`. |
-| `mode` | `combined` (default), `per_field`, `phrase`, `phrase_prefix`, or `bool_prefix`. |
-| `operator` | `or` (default) or `and`; combines terms within each group in `combined`, or within each field in `per_field`. |
-| `min_match` | Must be non-negative. Zero uses `operator`; a positive value overrides it and is clamped to the analyzed term count within each group or field. Ignored by the phrase modes. |
-| `tie` | Finite and in `[0, 1]`: best score plus this weight times the other scores. Default `1` in every mode; ignored by `bool_prefix`. |
-| `slop` | Non-negative phrase slop for `phrase` and `phrase_prefix` only. |
-| `max_expansions` | Maximum `phrase_prefix` expansions in byte order: `0` means `50`, at most `1024`. Ignored by `bool_prefix`. |
+| `mode` | `combined` (default) or `per_field`. |
+| `operator` | `or` (default) or `and`; combines terms within each group in `combined`, or within each field in `per_field`. Must be unset with `phrase`. |
+| `min_match` | Must be non-negative. Zero uses `operator`; a positive value overrides it and is clamped to the analyzed term count within each group or field. Must be zero with `phrase`. |
+| `tie` | Finite and in `[0, 1]`: best score plus this weight times the other scores. Default `1` in both modes. |
+| `phrase` | Optional object, `per_field` only. `{}` requests an exact phrase; `{"slop":2}` allows non-negative phrase slop. |
 
 JSON also accepts `"title_t"` and `"title_t^2"`, the field-list form of Solr's
 `qf`, as shorthand for field objects.
@@ -514,12 +513,16 @@ weights and enum arguments:
 multi_match(dune, fields=[title_t^2, body_t], mode=per_field, operator=and)
 ```
 
-`phrase` runs a phrase query per TEXT field and a whole-value match on
-other fields, combining their scores with `tie`. `phrase_prefix`
-expands the last analyzed word to index terms and scores the best completed
-phrase per field. `bool_prefix` combines the leading terms and a final prefix
-by `operator`/`min_match`, then adds field scores. The phrase modes ignore
-`operator` and `min_match`.
+In `per_field` mode, `phrase={}` in expr or `"phrase": {}` in JSON runs a
+phrase query per TEXT field and a whole-value match on STRING/ID fields,
+combining their weighted scores with `tie`. TEXT fields require indexed
+positions. Set `phrase.slop` for a sloppy phrase; it must be non-negative.
+With `phrase` present, setting `operator` or a positive `min_match` is an error.
+Phrase prefix and bool prefix forms are not supported.
+
+```text
+multi_match(dune messiah, fields=[title_t^2, body_t], mode=per_field, phrase={slop: 2})
+```
 
 ## Disjunction max
 

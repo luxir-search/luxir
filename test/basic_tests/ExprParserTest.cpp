@@ -747,3 +747,56 @@ TEST_F(ExprParserTest, functionTieArguments) {
     expectContains(parseErr(query), "unknown argument 'tie_breaker'");
   }
 }
+
+TEST_F(ExprParserTest, functionOptionsObjects) {
+  const auto& match = std::get<api::MultiMatchQuery>(parse(
+      "multi_match(dune messiah, fields=[title^2, body], mode=per_field, phrase={slop: 2})")->kind);
+  EXPECT_EQ("dune messiah", match.text);
+  EXPECT_EQ(api::MultiMatchQuery::Mode::PER_FIELD, match.mode);
+  ASSERT_EQ(2u, match.fields.size());
+  EXPECT_EQ(2.0f, match.fields[0].weight);
+  ASSERT_TRUE(match.phrase);
+  EXPECT_EQ(2, match.phrase->slop);
+  EXPECT_FALSE(std::get<api::MultiMatchQuery>(parse("multi_match(dune, fields=[title])")->kind).phrase);
+  const auto& empty = std::get<api::MultiMatchQuery>(parse(
+      "multi_match(dune, fields=[title], mode=per_field, phrase={})")->kind);
+  ASSERT_TRUE(empty.phrase);
+  EXPECT_EQ(0, empty.phrase->slop);
+
+  api::Val slop;
+  slop.kind = (int64_t)3;
+  bindVar("gap", slop);
+  const auto& quoted = std::get<api::MultiMatchQuery>(parse(
+      R"(multi_match(dune, fields=[title], mode=per_field, phrase={"slop": $gap}))")->kind);
+  ASSERT_TRUE(quoted.phrase);
+  EXPECT_EQ(3, quoted.phrase->slop);
+  EXPECT_EQ(1, std::get<api::MultiMatchQuery>(parse(
+      "multi_match(dune, fields=[title], mode=per_field, phrase={'slop': 1})")->kind).phrase->slop);
+}
+
+TEST_F(ExprParserTest, optionsObjectErrors) {
+  std::string unknown = "multi_match(dune, fields=[title], phrase={bogus:1})";
+  expectContains(parseErr(unknown), "byte " + std::to_string(unknown.find("bogus"))
+      + ": unknown member 'bogus' in object 'phrase'");
+  std::string duplicate = R"(multi_match(dune, fields=[title], phrase={slop:1, "slop":2}))";
+  expectContains(parseErr(duplicate), "byte " + std::to_string(duplicate.find(R"("slop")"))
+      + ": duplicate member 'slop' in object 'phrase'");
+  for (auto value : {"{slop=2}", "{slop:1 slop:2}", "{slop:1,}", "{slop:1", "2", "{slop:x}"}) {
+    expectContains(parseErr(std::string("multi_match(dune, fields=[title], phrase=") + value + ")"),
+                   "expr parse error at byte ");
+  }
+  expectContains(parseErr(R"(multi_match(dune, fields=[title], phrase={"":1}))"),
+                 "unknown member '' in object 'phrase'");
+}
+
+TEST_F(ExprParserTest, optionsObjectsUseSharedBudget) {
+  int budget = 2;
+  ExprOptions opts;
+  opts.schema = schema.get();
+  opts.nestingBudget = &budget;
+  EXPECT_THROW(parseExpr("multi_match(dune, fields=[title], phrase={})", opts, arena), std::runtime_error);
+  EXPECT_EQ(2, budget);
+  budget = 8;
+  EXPECT_NO_THROW(parseExpr("multi_match(dune, fields=[title], phrase={})", opts, arena));
+  EXPECT_EQ(8, budget);
+}

@@ -419,6 +419,17 @@ takes a full expression instead. Values are typed by the argument: numbers,
 `true`/`false`, `AND`/`OR`, `[lists]`, quoted strings; `rescore`'s `expr`
 takes a value expression.
 
+Object literals fill options messages, with unquoted or quoted member names
+and values parsed by their declared types:
+
+```
+multi_match(dune messiah, fields=[title_t^2, body_t], mode=per_field, phrase={slop: 2})
+```
+
+Objects can nest; `phrase={}` supplies a present message with its default
+values, requesting an exact phrase. Unknown and duplicate members are errors.
+Query arguments take sub-expressions, as in `boost(title_t:dune, boost=2)`.
+
 Quoting an argument protects it from the grammar but does not change what
 it means: `match("foo bar")` and `match(foo bar)` search the same text. Use
 `phrase(foo bar, field=title_t)` for a phrase. This differs
