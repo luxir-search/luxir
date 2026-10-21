@@ -348,9 +348,7 @@ public:
     uint16_t checkEnd = 0;
     uint16_t insideBegin = 0;
     uint16_t insideEnd = 0;
-    // Read only for CROSSES runs of residual-comparable blocks. Zero by
-    // default so a default plan is all zero bytes: classifyBlocks reloads
-    // each returned plan with wide loads, which stall on narrow stores.
+    // Read only for CROSSES runs of residual-comparable blocks.
     NumColumnFormat::ResidualBounds residualBounds = {};
 
     struct Run {
@@ -480,14 +478,20 @@ public:
     return false;
   }
 
+  // Each plan is built in its pool slot. Assigning into default-constructed
+  // plans would copy every result through the stack, and the copy's wide
+  // reload stalls on classifyBlock's narrow stores.
   static std::span<BlockPlan> classifyBlocks(
       MemPool& pool, const IntColReader& reader,
       const NumericPredicateQuery& query) {
-    auto plans = pool.make_span<BlockPlan>((size_t)reader.numBlocks());
-    for (int64_t i = 0; i < reader.numBlocks(); i++) {
-      plans[(size_t)i] = query.classifyBlock(reader, i);
+    static_assert(std::is_trivially_destructible_v<BlockPlan>);
+    size_t count = (size_t)reader.numBlocks();
+    auto* plans = (BlockPlan*)pool.alloc(
+        count * sizeof(BlockPlan), alignof(BlockPlan));
+    for (size_t i = 0; i < count; i++) {
+      new (plans + i) BlockPlan(query.classifyBlock(reader, (int64_t)i));
     }
-    return plans;
+    return {plans, count};
   }
 
   class CrossingValues {
