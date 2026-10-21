@@ -405,6 +405,9 @@ constant_score(status_s:active AND year_i:>=1960, score=1.0)
 rescore(title_t:dune, expr=score * log1p(popularity_i))
 boolean(required=[status_s:active], optional=[title_t:dune, title_t:messiah], min_match=1)
 simple_query($user_input, fields=[title_t, body_t], operator=AND)
+multi_match(dune messiah, fields=[title_t^2, description_t], operator=and)
+multi_match(dune, fields=[title_t^2, description_t], mode=per_field, tie=0)
+dis_max(queries=[title_t:dune, description_t:dune], tie=0.3)
 all()
 ```
 
@@ -416,14 +419,21 @@ Arguments work like Python's: at most one positional argument, then
 raw text up to the closing `,` or `)`; where the slot is itself a query
 (`boost`, `constant_score`, `rescore`, or lists like `required=[...]`), it
 takes a full expression instead. Values are typed by the argument: numbers,
-`true`/`false`, `AND`/`OR`, `[lists]`, quoted strings; `rescore`'s `expr`
-takes a value expression.
+`true`/`false`, enum names such as `AND`/`OR` or `combined`/`per_field`,
+`[lists]`, quoted strings; `rescore`'s `expr` takes a value expression.
+
+In `multi_match`'s field list, `title_t^2` is a field weight: a BM25F
+frequency/length weight in `combined`, or a score multiplier in `per_field`.
+`tie` combines matching groups or fields and defaults to `1` (sum).
+`dis_max` combines query scores and defaults to `tie=0` (best). See
+[Multi-match](query-reference.md#multi-match) and
+[Disjunction max](query-reference.md#disjunction-max).
 
 Object literals fill options messages, with unquoted or quoted member names
 and values parsed by their declared types:
 
 ```
-multi_match(dune messiah, fields=[title_t^2, body_t], mode=per_field, phrase={slop: 2})
+multi_match(dune messiah, fields=[title_t^2, description_t], mode=per_field, phrase={slop: 2})
 ```
 
 Objects can nest; `phrase={}` supplies a present message with its default
@@ -531,6 +541,8 @@ level; use NOT or parentheses (context: "status_s:live AND <HERE>+tag_s:beta")
 ## Limits
 
 - There is no default search field.
+- `multi_match` lists containing field patterns may resolve to at most `64`
+  distinct physical targets, including explicit fields.
 - `?` and mid-word `*` in a term are literal characters, and `/re/` is not a
   regex; use `wildcard(...)` and `regex(...)`.
 - `geo_box` and `geo_distance` have no function form; use their structured

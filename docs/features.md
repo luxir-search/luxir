@@ -230,16 +230,19 @@ Anywhere a query goes, it can be a structured object or an expression string.
   dropped from the returned list, the exact count, and facet and metric
   domains alike.
 - `knn` vector search, `geo_box`, and `geo_distance`.
-- `multi_match`: search one text across several weighted fields. `combined`
-  (default) groups TEXT fields sharing an analyzer and long-term policy,
-  scores each group as one field with BM25F, and adds the group scores.
-  Weights scale term frequency and length within a group. `per_field` adds
-  each field's match score multiplied by its weight. Other field types form
-  singleton groups in `combined`. `tie` controls how field/group
-  scores combine; `phrase` options in `per_field` mode and `*` field patterns
-  are also supported.
-- `dis_max`: the best matching query's score plus `tie` times the
-  other matching scores.
+- `multi_match`: search one text across weighted fields. `combined`
+  (default) scores TEXT fields sharing an analyzer and long-term policy as
+  one field with BM25F; weights scale term frequency and length at every
+  group size. STRING/ID/numeric/date fields form singleton groups with
+  score multipliers. `per_field` multiplies each field's match score, with
+  optional `phrase` matching on TEXT fields. `tie` combines field/group
+  scores (default `1`, sum); `0` keeps the best. Fields whose text cannot
+  coerce are skipped. `*` patterns select indexed TEXT/STRING/ID targets,
+  limited to `64` physical targets after resolving bindings and deduplicating.
+  See [Multi-match](guide/query-reference.md#multi-match).
+- `dis_max`: the best matching query score plus `tie` times the other
+  matching scores. Default `tie: 0` keeps the best; `tie: 1` adds scores like
+  a boolean disjunction. Duplicate queries contribute separately.
 - `simple_query`: a syntax for end-user input that never fails to parse (`+`/`-`, `|`,
   quoted phrases with `~N` slop, grouping, trailing-`*` prefix, `~N` fuzzy
   terms, and `field:value` terms against an allowlist).

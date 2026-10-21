@@ -611,8 +611,8 @@ clauses, filters, fusion sources, or another query wrapper.
 | Constant score | `{"constant_score":{"query":...,"score":1.0}}` | Replaces child scores without changing its match set. |
 | Boost | `{"boost":{"query":...,"boost":2.0}}` | Multiplies child scores. A numeric `boost` sibling is input sugar. |
 | Simple query | `{"simple_query":{"q":"dune | messiah","fields":["title_t"]}}` | Never-failing syntax for raw search-box input. |
-| Multi-match | `{"multi_match":{"text":"dune","fields":["title_t^2","body_t"]}}` | `combined` (default) scores analyzer/policy groups with BM25F; `per_field` adds weighted match scores. Also `phrase` options in `per_field` mode, `tie`, and wildcard fields. |
-| Disjunction max | `{"dis_max":{"queries":[...],"tie":0.3}}` | Best query score plus a fraction of the other scores. |
+| Multi-match | `{"multi_match":{"text":"dune","fields":["title_t^2","description_t"]}}` | `combined` (default) uses BM25F within TEXT analyzer groups; non-TEXT matches form singleton groups. `per_field` weights each match or phrase score. `tie` defaults to `1` (sum); field patterns expand to at most `64` physical targets. |
+| Disjunction max | `{"dis_max":{"queries":[{"match":{"title_t":"dune"}},{"match":{"description_t":"dune"}}],"tie":0.3}}` | Best matching query score plus `tie` times the other scores. Default `tie: 0` keeps the best; `tie: 1` is a boolean disjunction. Duplicates contribute separately. |
 | Expression | `"title_t:dune AND year_i:>=1965"` | Strict developer syntax with exact parse errors and safe `$vars`. |
 | kNN | `{"knn":{"field":"embedding_v","query":[...],"k":20}}` | Exact or ANN vector search; see [Vector Search](vector-search.md). |
 | Geo box | `{"geo_box":{"field":"location","min_lat":40,"max_lat":42,"min_lon":-75,"max_lon":-72}}` | Inclusive box, including dateline-crossing boxes. |
@@ -1123,6 +1123,9 @@ preparation without collecting results. See
 
 ## Limits
 
+- `multi_match` field lists containing patterns may resolve to at most `64`
+  distinct physical targets, including explicit fields. See
+  [Multi-match](query-reference.md#multi-match) for field types and phrase options.
 - Collapse keys cannot be FLOAT/DOUBLE, TEXT, vector, or multi-valued fields.
   Per-group `collapse.ops` uses the page's matching member domains.
   Distinct facet counts support STRING/ID and INT/DATE field facets, numeric/date

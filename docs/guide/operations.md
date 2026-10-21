@@ -597,6 +597,9 @@ Search has its own limits:
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
+- `multi_match` field lists containing patterns may resolve to at most `64`
+  distinct physical targets after resolving search bindings and deduplicating,
+  including explicit fields. See [Multi-match](query-reference.md#field-patterns).
 - `query-cache-bytes` caps each collection's filter cache (default `64MB`; `0`
   disables it). Cached filters are evicted by rebuild cost per byte, so under
   pressure the cache keeps expensive compound filters and drops cheap ones
