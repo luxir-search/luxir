@@ -307,10 +307,10 @@ TEST_F(DisMaxQueryTest, duplicatesIdentityMembershipAndBulk) {
   expectScores(scores(*reader, a), scores(*reader, *oneLiveQuery));
   auto* oneLiveSupplier = oneLiveQuery->createWeight(context, Query::NEED_SCORES)
       ->scorerSupplier(pool, reader->segments()[0]);
-  EXPECT_EQ(Supplier::BulkAnswer::NO,
+  EXPECT_EQ(Supplier::BulkAnswer::YES,
             oneLiveSupplier->planBulk(Supplier::BulkUse::SCORED_WINDOWS, {}).available);
   auto oneLiveContext = oneLiveSupplier->makePlanContext(Query::Demand::fromLeadCost(1));
-  EXPECT_EQ(Query::DirectScorerKind::OTHER,
+  EXPECT_EQ(Query::DirectScorerKind::TERM,
             oneLiveSupplier->describeScorer(oneLiveContext).directKind);
 
   ForcePrepareQuery forced(&a);
@@ -337,4 +337,33 @@ TEST_F(DisMaxQueryTest, zeroTieDoesNotMultiplyOverflowedSum) {
   auto* driven = buildScorerForTests(pool, *supplier, 1);
   ASSERT_EQ(0, driven->next());
   EXPECT_FLOAT_EQ(std::numeric_limits<float>::max(), driven->score());
+}
+
+TEST_F(DisMaxQueryTest, infiniteDisjunctScore) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(flatdoc("id", "one", "body_w", "red dune"), UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  TermQuery red("body_w", "red"), dune("body_w", "dune");
+  ConstantScoreQuery a(&red, std::numeric_limits<float>::max());
+  ConstantScoreQuery b(&dune, std::numeric_limits<float>::max());
+  Query* required[] = {&a, &b};
+  BooleanQuery infinite(required, {}, {}, {});
+  AllQuery all;
+  ConstantScoreQuery finite(&all);
+  Query* clauses[] = {&infinite, &finite};
+  MemPool pool;
+  for (float tie : {0.0f, 0.3f, 1.0f}) {
+    SCOPED_TRACE(tie);
+    auto* query = DisMaxQuery::make(pool, clauses, tie);
+    auto hits = scores(*reader, *query);
+    ASSERT_EQ(1u, hits.size());
+    EXPECT_EQ(std::numeric_limits<float>::infinity(), hits.begin()->second);
+    Query::Context context(pool, *reader);
+    auto* supplier = query->createWeight(context, Query::NEED_SCORES)
+        ->scorerSupplier(pool, reader->segments()[0]);
+    auto* driven = buildScorerForTests(pool, *supplier, 1);
+    ASSERT_NE(nullptr, driven);
+    ASSERT_EQ(0, driven->next());
+    EXPECT_EQ(std::numeric_limits<float>::infinity(), driven->score());
+  }
 }

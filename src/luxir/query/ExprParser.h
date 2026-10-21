@@ -1089,7 +1089,7 @@ private:
 
   // Message members share typed assignment and the expression nesting budget.
   template <typename M>
-  void parseObject(std::string_view name, M& message) {
+  void parseObject(std::string_view fn, std::string_view name, M& message) {
     cur.skipWs();
     size_t pos = cur.position();
     if (!cur.consume('{')) {
@@ -1114,7 +1114,7 @@ private:
         cur.skipWs();
         if (!cur.consume(':')) fail(cur.position(), "expected ':' after object member name");
         bool found = expr::withMember(message, memberName, [&](auto& member) {
-          assignArg(name, memberName, memberPos, member, '}');
+          assignArg(fn, memberName, memberPos, member, '}');
         });
         if (!found) {
           fail(memberPos, fmt::format("unknown member '{}' in object '{}'", memberName, name));
@@ -1200,7 +1200,7 @@ private:
     } else if constexpr (std::is_same_v<T, std::span<const int32_t>>) {
       member = parseIntList(argName);
     } else if constexpr (std::is_aggregate_v<T>) {
-      parseObject(argName, member);
+      parseObject(fn, argName, member);
     } else {
       fail(argPos, fmt::format("argument '{}' of {}() has a type the expr language cannot "
                                "express; use the structured form",

@@ -396,7 +396,7 @@ TEST_F(MultiMatchQueryTest, dateGroupsKeepRangeSemantics) {
   QueryBuilder builder(parsePool, *schema, CoerceContext{now});
   QueryBuilder::WeightedField fields[] = {{"when_dt", 2.0f}};
   for (auto text : {"2024-06", "NOW", "NOW/DAY"}) {
-    auto* expected = builder.boosted(builder.createMatchQuery("when_dt", text), 2.0f);
+    auto* expected = builder.createMatchQuery("when_dt", text, QueryBuilder::Operator::OR, 0, 2.0f);
     for (auto* actual : {builder.createMultiMatchCombined(fields, text, QueryBuilder::Operator::OR, 0),
                         builder.createMultiMatchPerField(fields, text, QueryBuilder::Operator::OR, 0),
                         builder.createMultiMatchPerField(fields, text, QueryBuilder::Operator::OR, 0, 1.0f, 0)}) {
@@ -588,6 +588,18 @@ TEST_F(MultiMatchQueryTest, phraseOptions) {
   auto id = run(multiMatch("d1", {{"id", {}}}, Mode::PER_FIELD, {}, api::PhraseOptions{}));
   ASSERT_TRUE(id);
   EXPECT_TRUE(id->contains("d1"));
+}
+
+TEST_F(MultiMatchQueryTest, weightedPhraseLeaves) {
+  auto* term = parse(multiMatch("Dune", {{"title_un", 2.0f}}, Mode::PER_FIELD,
+                                {}, api::PhraseOptions{}));
+  ASSERT_EQ(QueryKind::TERM, term->getKind());
+  EXPECT_FLOAT_EQ(2.0f, ((TermQuery*)term)->getBoost());
+  auto* phrase = parse(multiMatch("desert planet", {{"body_un", 2.0f}}, Mode::PER_FIELD,
+                                  {}, api::PhraseOptions{}));
+  ASSERT_EQ(QueryKind::BOOST, phrase->getKind());
+  EXPECT_FLOAT_EQ(2.0f, ((BoostQuery*)phrase)->getBoost());
+  EXPECT_EQ(QueryKind::PHRASE, ((BoostQuery*)phrase)->getChild()->getKind());
 }
 
 TEST_F(MultiMatchQueryTest, phraseValidation) {

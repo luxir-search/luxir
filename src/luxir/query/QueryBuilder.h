@@ -327,7 +327,7 @@ private:
   // terms and positions must already live in storage that outlives the query
   // tree (the pool, or the caller's source bytes for pass-through terms).
   Query* buildPhrase(const ResolvedFieldHandle& target, std::span<std::string_view> inputTerms,
-                     std::span<const int64_t> inputPositions, int32_t slop) {
+                     std::span<const int64_t> inputPositions, int32_t slop, float boost = 1.0f) {
     auto field = poolCopy(target.physicalName);
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");
@@ -366,13 +366,15 @@ private:
       return pool.make<MatchNoDocsQuery>();
     }
     if (terms.size() == 1) {
-      return pool.make<TermQuery>(field, terms[0]);
+      return pool.make<TermQuery>(field, terms[0], boost);
     }
-    return pool.make<PhraseQuery>(
+    auto* phrase = pool.make<PhraseQuery>(
         field,
         pool.copy_span(std::span<std::string_view>(terms.data(), terms.size())),
         pool.copy_span(std::span<int32_t>(positions.data(), positions.size())),
         slop);
+    if (boost == 1.0f) return phrase;
+    return pool.make<BoostQuery>(phrase, boost);
   }
 
 public:
@@ -1032,25 +1034,14 @@ public:
     for (size_t i = 0; i < resolved.size(); i++) {
       const auto& target = *resolved[i].target;
       if (phraseSlop && target.fieldType->type() == FieldType::Type::TEXT) {
-        auto* phrase = createPhraseQuery(target, std::span<const std::string_view>(&text, 1), {},
-                                        *phraseSlop);
-        clauses[count++] = boosted(phrase, resolved[i].weight);
+        clauses[count++] = createPhraseQuery(
+            target, std::span<const std::string_view>(&text, 1), {}, *phraseSlop, resolved[i].weight);
       } else if (auto* query = tryCreateMatchQuery(target, text, op, minMatch, resolved[i].weight)) {
         clauses[count++] = query;
       }
     }
     if (count == 0) return matchNoDocs();
     return DisMaxQuery::make(pool, clauses.first(count), tie);
-  }
-
-  Query* boosted(Query* query, float boost) {
-    if (boost == 1.0f) return query;
-    if (query->getKind() == QueryKind::TERM) {
-      auto* term = (TermQuery*)query;
-      return pool.make<TermQuery>(term->getField(), term->getTerm(), boost * term->getBoost(),
-                                  term->shouldUseFrontierBound());
-    }
-    return pool.make<BoostQuery>(query, boost);
   }
 
   // Build a range query over `field` from raw bound Vals (any may be null for
@@ -1203,12 +1194,15 @@ public:
   //     value is shifted by that overflow so the caller's gaps survive
   //     multi-token expansion.
   Query* createPhraseQuery(std::string_view field, std::span<const std::string_view> values,
-                           std::span<const int32_t> valuePositions = {}, int32_t slop = 0) {
-    return createPhraseQuery(fields.resolve(field, OpClass::SEARCH, opName), values, valuePositions, slop);
+                           std::span<const int32_t> valuePositions = {}, int32_t slop = 0,
+                           float boost = 1.0f) {
+    return createPhraseQuery(fields.resolve(field, OpClass::SEARCH, opName), values, valuePositions,
+                              slop, boost);
   }
 
   Query* createPhraseQuery(const ResolvedFieldHandle& target, std::span<const std::string_view> values,
-                           std::span<const int32_t> valuePositions = {}, int32_t slop = 0) {
+                           std::span<const int32_t> valuePositions = {}, int32_t slop = 0,
+                           float boost = 1.0f) {
     validatePositions(valuePositions, values.size(), "words");
     if (slop < 0) {
       throw std::runtime_error("Phrase query slop must be nonnegative");
@@ -1261,7 +1255,7 @@ public:
 
     return buildPhrase(target,
                        std::span<std::string_view>(terms.data(), terms.size()),
-                       std::span<const int64_t>(positions.data(), positions.size()), slop);
+                       std::span<const int64_t>(positions.data(), positions.size()), slop, boost);
   }
 
   // Build a phrase query from already-analyzed terms; the terms are used

@@ -4537,7 +4537,7 @@ public:
           best = std::max(best, score);
         }
       }
-      return tie == 0.0f ? best : best + tie * (sum - best);
+      return tie == 0.0f ? best : (1.0f - tie) * best + tie * sum;
     } else {
       float score = 0.0f;
       for (auto& member : members) {
@@ -4845,7 +4845,7 @@ class BooleanQuery::MaxScoreDisjunctionScorerT final : public Query::Scorer {
         if (scorer->docId() < docid) scorer->advance(docid);
         if (scorer->docId() == docid) add(scorer->score());
       }
-      currentScore = tie == 0.0f ? best : best + tie * (sum - best);
+      currentScore = tie == 0.0f ? best : (1.0f - tie) * best + tie * sum;
     } else {
       float sum = 0.0f;
       for (size_t i = 0; i < scorers.size(); i++) {
@@ -4976,7 +4976,7 @@ public:
     scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
     if constexpr (DISMAX) {
       this->tie = tie;
-      scoreBoundFactor += 3.0 * 0x1p-24;
+      scoreBoundFactor += 4.0 * 0x1p-24;
     }
     for (size_t i = 0; i < scorers.size(); i++) {
       clauseMax[i] = optionalUpperBound(
@@ -7753,6 +7753,17 @@ class BooleanQuery::Weight final : public Query::Weight {
             false, leadCost, scoringCount, false};
   }
 
+  template <template <bool> class Scorer, typename... Args>
+  static Query::Scorer* makeDisjunctionScorer(
+      MemPool& targetPool, ScorePolicy policy, Args&&... args) {
+    if (policy.kind == ScorePolicy::DISMAX) {
+      return targetPool.make<Scorer<true>>(
+          targetPool, std::forward<Args>(args)..., policy.tie);
+    }
+    return targetPool.make<Scorer<false>>(
+        targetPool, std::forward<Args>(args)...);
+  }
+
   // Keep clause wiring in one place so prepared and non-prepared execution
   // cannot diverge on filter/prohibited semantics.
   static Query::Scorer* assembleScorer(
@@ -7869,27 +7880,14 @@ class BooleanQuery::Weight final : public Query::Weight {
           optScorer = targetPool.make<BooleanQuery::MinShouldMatchWandScorer>(
             targetPool, optionalScorers, 1);
         } else if (useMaxScoreDisjunction) {
-          if (scorePolicy.kind == ScorePolicy::DISMAX) {
-            optScorer = targetPool.make<MaxScoreDisjunctionScorerT<true>>(
-                targetPool, optionalScorers, segment.maxDoc(),
-                DocsEnumMeta::L1_DOCS, scorePolicy.tie);
-          } else {
-            optScorer = targetPool.make<BooleanQuery::MaxScoreDisjunctionScorer>(
-              targetPool, optionalScorers, segment.maxDoc());
-          }
+          optScorer = makeDisjunctionScorer<MaxScoreDisjunctionScorerT>(
+              targetPool, scorePolicy, optionalScorers, segment.maxDoc(),
+              DocsEnumMeta::L1_DOCS);
         } else {
-          if (scorePolicy.kind == ScorePolicy::DISMAX) {
-            optScorer = targetPool.make<DisjunctionScorerT<true>>(
-                targetPool, optionalScorers, optionalTwoPhase,
-                !planContext.disableBooleanTwoPhaseForTests
-                    && !planContext.disableDisjunctionTwoPhaseForTests,
-                scorePolicy.tie);
-          } else {
-            optScorer = targetPool.make<BooleanQuery::DisjunctionScorer>(
-                targetPool, optionalScorers, optionalTwoPhase,
-                !planContext.disableBooleanTwoPhaseForTests
-                    && !planContext.disableDisjunctionTwoPhaseForTests);
-          }
+          optScorer = makeDisjunctionScorer<DisjunctionScorerT>(
+              targetPool, scorePolicy, optionalScorers, optionalTwoPhase,
+              !planContext.disableBooleanTwoPhaseForTests
+                  && !planContext.disableDisjunctionTwoPhaseForTests);
           optTwoPhase = !planContext.disableBooleanTwoPhaseForTests
               && !planContext.disableDisjunctionTwoPhaseForTests
               && std::any_of(
@@ -10846,7 +10844,7 @@ class BooleanQuery::Weight final : public Query::Weight {
             std::span<Query::ScorerSupplier* const>{},
             std::span<Query::ScorerSupplier* const>{}, minShouldMatch,
             needsScores, allowsPruning, uniformConstantCandidate,
-            executionMode);
+            executionMode, scorePolicy);
       }
       if (bodySupplier == nullptr) {
         return noBulkPlan();
@@ -11250,7 +11248,7 @@ class BooleanQuery::Weight final : public Query::Weight {
               std::span<Query::ScorerSupplier* const>{},
               std::span<Query::ScorerSupplier* const>{},
               minShouldMatch, needsScores, allowsPruning,
-              uniformConstantCandidate, executionMode);
+              uniformConstantCandidate, executionMode, scorePolicy);
         }
         if (body != nullptr) {
           BulkScorerContext childContext{
@@ -11388,7 +11386,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       bool allowsPruning,
       bool uniformConstantCandidate,
       Query::SupplierExecutionMode executionMode,
-      ScorePolicy scorePolicy = {}) {
+      ScorePolicy scorePolicy) {
     // Weight-time optional removal can expose a Boolean child that
     // normalization could not unwrap while the optionals were still present.
     // Preserve the child's complete supplier contract, including bulkScorer.
@@ -11409,10 +11407,8 @@ class BooleanQuery::Weight final : public Query::Weight {
     // the survivor's complete supplier contract, including bulkScorer, so
     // a dropped-clause singleton keeps the clause's own execution routes.
     // A clause is dead only when its own shape proves it empty; the cost
-    // check just keeps describeScorer off live-clause construction. A score
-    // policy keeps its opaque supplier and declines bulk even with one survivor.
-    if (scorePolicy.kind == ScorePolicy::SUM
-        && minShouldMatch <= 1 && mandatorySources.empty()
+    // check just keeps describeScorer off live-clause construction.
+    if (minShouldMatch <= 1 && mandatorySources.empty()
         && prohibitedSources.empty() && filterSuppliers.empty()) {
       Query::ScorerSupplier* survivor = nullptr;
       bool single = true;
@@ -11599,7 +11595,8 @@ public:
     needsScores = (flags & Query::NEED_SCORES) != 0;
     assert(scorePolicy.kind == ScorePolicy::SUM
            || (needsScores && query.mandatory.empty() && query.filter.empty()
-               && query.prohibited.empty() && query.minShouldMatch == 1));
+               && query.prohibited.empty() && query.minShouldMatch == 1
+               && query.optional.size() >= 2));
     allowsPruning = (flags & Query::ALLOW_PRUNING) != 0;
     // Only mandatory and optional clauses can contribute to score.
     int32_t noScore = flags & ~NEED_SCORES;
@@ -11722,7 +11719,7 @@ public:
     for (auto* w : mandatoryWeights) {
       if (!w->isConstantScoring()) constant = false;
     }
-    if (constant && scorePolicy.kind == ScorePolicy::SUM) {
+    if (constant) {
       traits |= IS_CONSTANT_SCORING;
     }
     if (query.mandatory.empty() && query.optional.empty()
