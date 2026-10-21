@@ -291,8 +291,8 @@ type. With `true`, a TEXT primary uses array mode and its STRING variant uses
 set mode. With `"set"`, numeric and STRING representations use sets while
 an array-only variant such as TEXT uses an array. Explicit `"array"` applies
 to every representation. Indexed STRING/ID array mode is not yet supported
-and is rejected. Column-only STRING storage currently keeps source order and
-duplicates in either mode; its set storage implementation is pending.
+and is rejected. Column-only STRING columns store sorted unique normalized bytes in set mode,
+and preserve source order and duplicates in array mode.
 
 The authored schema view echoes the declaration (`true`, `false`, `"set"`,
 or `"array"`), preserving inheritance through templates that change type.

@@ -7951,3 +7951,13 @@ TEST_F(FacetTest, facetLimitBelowMinusOneMeansAll) {
     for (const auto& r : rows) EXPECT_EQ(expected, r) << "mincount=" << mincount;
   }
 }
+
+TEST_F(FacetTest, multiColumnOnlyStringFacetIsRejected) {
+  CollectionHelper helper;
+  ASSERT_TRUE(helper.index(flatdoc("tags_ssc", vecs("z", "a", "z")), UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").facet("f", "tags_ssc");
+  req->execute(false);
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("column-only (not indexed)"));
+}

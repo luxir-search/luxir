@@ -8,6 +8,8 @@
 #include "test/TestUtils.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/SchemaBuilder.h"
+#include "test/QueryBuild.h"
 #include "luxir/index/handler/StrColHandler.h"
 #include "luxir/reader/StrColReader.h"
 #include "luxir/reader/PostingsReader.h"
@@ -754,14 +756,14 @@ TEST_F(StrColTest, BasicMultiValuedColumnStoredStrings) {
     if (idCol.v[i] == "doc1") {
       auto& tags = multiTags.v[i].v;
       ASSERT_EQ(3, tags.size());
-      ASSERT_EQ("programming", tags[0]);
-      ASSERT_EQ("c++", tags[1]);
+      ASSERT_EQ("c++", tags[0]);
+      ASSERT_EQ("programming", tags[1]);
       ASSERT_EQ("search", tags[2]);
     } else if (idCol.v[i] == "doc2") {
       auto& tags = multiTags.v[i].v;
       ASSERT_EQ(2, tags.size());
-      ASSERT_EQ("java", tags[0]);
-      ASSERT_EQ("database", tags[1]);
+      ASSERT_EQ("database", tags[0]);
+      ASSERT_EQ("java", tags[1]);
     } else if (idCol.v[i] == "doc3") {
       auto& tags = multiTags.v[i].v;
       ASSERT_EQ(1, tags.size());
@@ -919,6 +921,15 @@ TEST_F(StrColTest, DocValuesManyValuesPerDoc) {
   constexpr int N = 300;
 
   CollectionHelper helper;
+  SchemaBuilder schema;
+  for (auto name : {"chunks_ssc", "uniform_ssc"}) {
+    auto& field = schema.field(name);
+    field.type = api::FieldDef::FieldClass::STRING;
+    field.index = api::FieldDef::IndexMode::NONE;
+    field.column = true;
+    field.multi = api::FieldDef::MultiMode::ARRAY;
+  }
+  schema.set(helper.collection());
 
   // Variable-size: every value has a different length (1..N).
   std::vector<std::string> varValues;
@@ -991,3 +1002,219 @@ TEST_F(StrColTest, DocValuesManyValuesPerDoc) {
   }
 }
 
+
+TEST_F(StrColTest, columnOnlyModesNormalizeAndMerge) {
+  for (bool array : {false, true}) for (bool normalize : {false, true}) {
+    CollectionHelper helper;
+    helper.clear();
+    SchemaBuilder schema;
+    auto& field = schema.field("value");
+    field.type = api::FieldDef::FieldClass::STRING;
+    field.index = api::FieldDef::IndexMode::NONE;
+    field.column = true;
+    field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+    if (normalize) schema.normalizer(field, {"nfkc_cf"});
+    schema.set(helper.collection());
+    std::vector<std::string> expected{"z", "B", "b", "", "A", "B", "\xc3\x89", "\xc3\xa9"};
+    ASSERT_TRUE(helper.index(flatdoc("id", "a", "value", expected), UpdateMessage::COMMIT).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "b", "value", "Q"), UpdateMessage::NO_COMMIT).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "c", "value", vecs()), UpdateMessage::NO_COMMIT).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "d"), UpdateMessage::COMMIT).success);
+    ASSERT_TRUE(helper.index(flatdoc("id", "e", "value", vec_i(2, 10, 2)), UpdateMessage::COMMIT).success);
+    if (normalize) expected = {"z", "b", "b", "", "a", "b", "\xc3\xa9", "\xc3\xa9"};
+    if (!array) {
+      std::ranges::sort(expected);
+      expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
+    }
+    for (int merge = 0; merge < 2; merge++) {
+      auto req = localReq(helper.getSearchEngine());
+      auto& top = req->collection("main").topDocs("q").allQuery().limit(-1).fields({"id", "value"});
+      qb::sort(top, "id", qb::ASC);
+      req->execute(false);
+      ASSERT_OK(req);
+      const auto& rows = std::get<api::ArrArrStr>(req->docList("q")->columns.at("value").kind).v;
+      ASSERT_EQ(5u, rows.size());
+      EXPECT_EQ(expected, std::vector<std::string>(rows[0].v.begin(), rows[0].v.end()));
+      EXPECT_EQ(normalize ? "q" : "Q", rows[1].v[0]);
+      EXPECT_TRUE(rows[2].v.empty());
+      EXPECT_TRUE(rows[3].v.empty());
+      EXPECT_EQ(array ? (std::vector<std::string>{"2", "10", "2"})
+          : (std::vector<std::string>{"10", "2"}),
+          std::vector<std::string>(rows[4].v.begin(), rows[4].v.end()));
+      auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+      for (auto& segment : reader->segments()) {
+        auto* info = segment.postingsReader().fieldInfo("value");
+        ASSERT_NE(nullptr, info);
+        EXPECT_EQ(array, (info->flags & FieldType::MULTI_ARRAY) != 0);
+      }
+      if (!merge) {
+        CollectionHelper::UpdateBuilder update;
+        update.commit(true, 1);
+        ASSERT_TRUE(helper.submit(update).success);
+      }
+    }
+  }
+}
+
+TEST_F(StrColTest, columnOnlySortSelectsExtrema) {
+  for (bool array : {false, true}) {
+    CollectionHelper helper;
+    helper.clear();
+    SchemaBuilder schema;
+    auto& field = schema.field("value");
+    field.type = api::FieldDef::FieldClass::STRING;
+    field.index = api::FieldDef::IndexMode::NONE;
+    field.column = true;
+    field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+    schema.set(helper.collection());
+    helper.index(flatdoc("id", "missing"), UpdateMessage::COMMIT);
+    helper.index(flatdoc("id", "empty", "value", vecs(""), "ref_ss", vecs("")), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "left", "value", vecs("m", "z", "m"), "ref_ss", vecs("m", "z", "m")), UpdateMessage::COMMIT);
+    helper.index(flatdoc("id", "right", "value", vecs("y", "a", "y"), "ref_ss", vecs("y", "a", "y")), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "single", "value", "b", "ref_ss", "b"), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "emptyArray", "value", vecs()), UpdateMessage::COMMIT);
+    for (int merge = 0; merge < 2; merge++) {
+      for (bool parallel : {false, true}) for (auto dir : {qb::ASC, qb::DESC}) for (int limit : {2, -1}) {
+        auto run = [&](std::string_view name) {
+          auto req = localReq(helper.getSearchEngine());
+          auto& top = req->collection("main").topDocs("q").allQuery().limit(limit).fields({"id"});
+          qb::sort(top, name, dir);
+          req->execute(parallel);
+          EXPECT_TRUE(req->ok()) << req->errorMsg();
+          auto ids = std::get<api::ColStr>(req->docList("q")->columns.at("id").kind).v;
+          return std::vector<std::string>(ids.begin(), ids.end());
+        };
+        EXPECT_EQ(run("ref_ss"), run("value"));
+      }
+      if (!merge) {
+        CollectionHelper::UpdateBuilder update;
+        update.commit(true, 1);
+        ASSERT_TRUE(helper.submit(update).success);
+      }
+    }
+  }
+}
+
+TEST_F(StrColTest, coercionFailureRetainsAccountedScratchWithoutAppending) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("value");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.index = api::FieldDef::IndexMode::NONE;
+  field.column = true;
+  schema.normalizer(field, {"nfkc_cf"});
+  schema.set(helper.collection());
+  auto iw = helper.getIndexWriter();
+  auto& inverter = iw->obtainInverter();
+  // Exercise the physical handler's validation independently of the logical
+  // input dispatcher, which rejects this shape before materialization.
+  inverter.getIndexHandler("value");
+  auto& input = *inverter.indexHandlers.at("value");
+  std::string large(100000, 'A');
+  std::array<api::Val, 2> elements;
+  elements[0].kind = std::string_view(large);
+  elements[1].kind = int64_t{2};
+  api::Val value;
+  value.kind = api::ArrVal{.v = elements};
+  inverter.startDoc();
+  size_t before = inverter.extraRamBytes;
+  EXPECT_THROW(input.index(inverter, value), DocumentError);
+  EXPECT_GE(inverter.extraRamBytes - before, large.size());
+  inverter.deleteDoc(inverter.getDoc());
+  inverter.finishDoc();
+  inverter.startDoc();
+  input.index(inverter, std::string_view("OK"));
+  inverter.finishDoc();
+  iw->releaseInverter(inverter, true);
+  helper.commit();
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"value"});
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ("ok", std::get<api::ColStr>(req->docList("q")->columns.at("value").kind).v[0]);
+}
+
+TEST_F(StrColTest, materializationScratchIsAccountedAndReused) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("value");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.index = api::FieldDef::IndexMode::NONE;
+  field.column = true;
+  field.multi = api::FieldDef::MultiMode::SET;
+  schema.normalizer(field, {"nfkc_cf"});
+  schema.set(helper.collection());
+  auto iw = helper.getIndexWriter();
+  auto& inverter = iw->obtainInverter();
+  auto& input = inverter.getIndexHandler("value");
+  std::string token(128, 'A');
+  std::vector<std::string_view> values(1000, token);
+  size_t before = inverter.extraRamBytes;
+  inverter.startDoc();
+  input.index(inverter, values);
+  inverter.finishDoc();
+  size_t retained = inverter.extraRamBytes;
+  EXPECT_GE(retained - before, values.size() * (sizeof(std::string_view) + token.size()));
+  inverter.startDoc();
+  input.index(inverter, values);
+  inverter.finishDoc();
+  EXPECT_LE(inverter.extraRamBytes, retained + token.size()); // Only column bytes may grow.
+  iw->releaseInverter(inverter, true);
+  helper.commit();
+}
+
+TEST_F(StrColTest, modeChangesUseSegmentModeBeforeAndAfterMerge) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("value");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.index = api::FieldDef::IndexMode::NONE;
+  field.column = true;
+  field.multi = api::FieldDef::MultiMode::ARRAY;
+  schema.set(helper.collection());
+  helper.index(flatdoc("id", "a", "value", vecs("m", "z", "a", "m")), UpdateMessage::COMMIT);
+  field.multi = api::FieldDef::MultiMode::SET;
+  schema.set(helper.collection());
+  helper.index(flatdoc("id", "b", "value", vecs("y", "b", "x")), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "c", "value", vecs("n", "c", "u")), UpdateMessage::COMMIT);
+  for (int merge = 0; merge < 2; merge++) {
+    for (auto dir : {qb::ASC, qb::DESC}) {
+      auto req = localReq(helper.getSearchEngine());
+      auto& top = req->collection("main").topDocs("q").allQuery().limit(-1).fields({"id", "value"});
+      qb::sort(top, "value", dir);
+      req->execute(false);
+      ASSERT_OK(req);
+      auto ids = std::get<api::ColStr>(req->docList("q")->columns.at("id").kind).v;
+      EXPECT_EQ((std::vector<std::string>{"a", "b", "c"}), std::vector<std::string>(ids.begin(), ids.end()));
+      auto rows = std::get<api::ArrArrStr>(req->docList("q")->columns.at("value").kind).v;
+      EXPECT_EQ((vecs("m", "z", "a", "m")), std::vector<std::string>(rows[0].v.begin(), rows[0].v.end()));
+      EXPECT_EQ((vecs("b", "x", "y")), std::vector<std::string>(rows[1].v.begin(), rows[1].v.end()));
+    }
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    ASSERT_EQ(merge ? 1u : 3u, reader->segments().size());
+    for (size_t i = 0; i < reader->segments().size(); i++) {
+      auto& segment = reader->segments()[i];
+      StrColReader column(segment.postingsReader(), *segment.postingsReader().fieldInfo("value"));
+      EXPECT_EQ(i != 0, column.multiSet()); // A mixed merge conservatively carries ARRAY.
+    }
+    if (!merge) {
+      CollectionHelper::UpdateBuilder update;
+      update.commit(true, 1);
+      ASSERT_TRUE(helper.submit(update).success);
+    }
+  }
+}
+
+TEST_F(StrColTest, singleColumnEmptyStringSortsBeforeMissingDescending) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "missing"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "empty", "value_sc", ""), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "value", "value_sc", "x"), UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  auto& top = req->collection("main").topDocs("q").allQuery().limit(-1).fields({"id"});
+  qb::sort(top, "value_sc", qb::DESC);
+  req->execute(true);
+  ASSERT_OK(req);
+  auto ids = std::get<api::ColStr>(req->docList("q")->columns.at("id").kind).v;
+  EXPECT_EQ((vecs("value", "empty", "missing")), std::vector<std::string>(ids.begin(), ids.end()));
+}

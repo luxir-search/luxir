@@ -61,7 +61,13 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
         } else {
           StrColReader column(segment.postingsReader(), info);
           StrColReader::DocIterator iter(column);
-          if (iter.advance(doc.docId()) == doc.docId()) value.kind = build::arenaStr(mr, iter.value());
+          if (iter.advance(doc.docId()) != doc.docId()) break;
+          if (column.isMultiValued()) {
+            StrColReader::DocValues values(column);
+            value.kind = build::arenaStr(mr, column.selectedValue(iter.rank(), field.isReversed(), values));
+          } else {
+            value.kind = build::arenaStr(mr, iter.value());
+          }
         }
         break;
       }

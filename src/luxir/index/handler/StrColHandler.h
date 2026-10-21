@@ -17,7 +17,7 @@
 
 namespace luxir::handler {
 
-/// String field handler for column stored only (values are stored verbatim per-doc, values not deduped)
+/// Column-only strings: SET stores sorted unique normalized bytes; ARRAY keeps order and repeats.
 /// If the string is indexed and stored, see StrHandler.
 /// This class also handles binary values.
 ///
@@ -29,6 +29,10 @@ namespace luxir::handler {
 class StrColHandler : public Inverter::IndexHandler {
   friend Inverter;
   StringValue stringValue;
+  std::vector<std::string_view> docValues;
+  std::vector<std::string> normalizedValues; // retained slots; views built after materialization
+  size_t normalizedBytes = 0;
+  size_t scratchBytes = 0;
 
 protected:
   enum class ValueStorage {
@@ -91,27 +95,27 @@ public:
     }
     else if (std::holds_alternative<luxir::api::ArrBin>(val.kind)) {
       const auto& arr = std::get<luxir::api::ArrBin>(val.kind).v;
-      std::vector<std::string_view> views;
-      views.reserve(arr.size());
+      docValues.clear();
+      auto account = scope_guard([&] { accountScratch(inverter); });
+      docValues.reserve(arr.size());
       for (const auto& bin : arr) {
-        views.push_back(std::string_view((const char*)bin.data(), bin.size()));
+        docValues.emplace_back((const char*)bin.data(), bin.size());
       }
-      indexMulti(inverter, std::span<const std::string_view>(views.data(), views.size()));
+      indexMulti(inverter, docValues);
     }
     else if (coerce::isNull(val)) {
       return;
     }
     else if (coerce::isArray(val)) {
-      // numeric / mixed arrays: the column stores each element's canonical
-      // rendering.  Materialize (buf is per-element transient) so indexMulti
-      // sees stable views and the multi-valued check runs before any append.
+      // Coerce and normalize once, before any column stream changes.
+      auto account = scope_guard([&] { accountScratch(inverter); });
       char buf[coerce::TEXT_BUF_SIZE];
-      std::vector<std::string> storage;
+      size_t count = 0;
       coerce::forEachElement(val, [&](const IndexVal& elem) {
-        storage.emplace_back(fieldType->coerceTerm(elem, std::string_view(fieldName), buf));
+        materialize(count++, fieldType->coerceTerm(elem, std::string_view(fieldName), buf));
       });
-      std::vector<std::string_view> views(storage.begin(), storage.end());
-      indexMulti(inverter, std::span<const std::string_view>(views.data(), views.size()));
+      materializedViews(count);
+      appendDocValues(inverter);
     }
     else {
       // numeric scalars: store the canonical rendering
@@ -129,6 +133,11 @@ public:
   }
 
   void indexSingle(Inverter& inverter, std::string_view term) {
+    if (!stringValue.hasNormalizer()) {
+      appendSingle(inverter, term);
+      return;
+    }
+    auto account = scope_guard([&] { accountScratch(inverter); });
     appendSingle(inverter, stringValue.normalize(term));
   }
 
@@ -144,17 +153,61 @@ public:
     }
     // Validate every value before starting a column row. A later failure must
     // not leave the row's value count or end offsets incomplete.
-    if (!stringValue.hasNormalizer()) {
+    if (!stringValue.hasNormalizer() && !fieldType->multiSet()) {
       appendMulti(inverter, vals);
       return;
     }
-    std::vector<std::string> normalized;
-    normalized.reserve(vals.size());
-    for (auto val : vals) {
-      normalized.emplace_back(stringValue.normalize(val));
+    auto account = scope_guard([&] { accountScratch(inverter); });
+    if (stringValue.hasNormalizer()) {
+      normalizedValues.reserve(vals.size());
+      for (size_t i = 0; i < vals.size(); i++) materialize(i, vals[i]);
+      materializedViews(vals.size());
+    } else if (vals.data() != docValues.data()) {
+      docValues.assign(vals.begin(), vals.end());
     }
-    std::vector<std::string_view> views(normalized.begin(), normalized.end());
-    appendMulti(inverter, views);
+    appendDocValues(inverter);
+  }
+
+private:
+  static size_t heapBytes(const std::string& value) {
+    return value.capacity() > std::string{}.capacity() ? value.capacity() + 1 : 0;
+  }
+
+  void materialize(size_t index, std::string_view value) {
+    if (index == normalizedValues.size()) normalizedValues.emplace_back();
+    auto& target = normalizedValues[index];
+    size_t before = heapBytes(target);
+    auto account = scope_guard([&] { normalizedBytes = normalizedBytes - before + heapBytes(target); });
+    target.assign(value);
+    stringValue.normalizeInPlace(target);
+  }
+
+  void materializedViews(size_t count) {
+    docValues.clear();
+    docValues.reserve(count);
+    for (size_t i = 0; i < count; i++) docValues.emplace_back(normalizedValues[i]);
+  }
+
+  void appendDocValues(Inverter& inverter) {
+    if (docValues.empty()) return;
+    if (!fieldType->multiValued()) {
+      if (docValues.size() > 1) throw DocumentError(fmt::format(
+          "Field '{}' is single-valued but received multiple values", std::string_view(fieldName)));
+      appendSingle(inverter, docValues[0]);
+      return;
+    }
+    if (fieldType->multiSet()) {
+      std::ranges::sort(docValues);
+      docValues.erase(std::unique(docValues.begin(), docValues.end()), docValues.end());
+    }
+    appendMulti(inverter, docValues);
+  }
+
+  void accountScratch(Inverter& inverter) {
+    scratchBytes = docValues.capacity() * sizeof(std::string_view)
+        + normalizedValues.capacity() * sizeof(std::string)
+        + normalizedBytes + stringValue.retainedBytes();
+    accountExtraRam(inverter, valuesFile.size() + scratchBytes);
   }
 
 protected:
@@ -169,7 +222,7 @@ protected:
     // Buffered column bytes accumulate outside inverter.pool. Streamed columns
     // leave valuesFile empty; their OutputStream storage is owned by Directory.
     if (valueStorage == ValueStorage::BUFFERED) {
-      accountExtraRam(inverter, valuesFile.size());
+      accountExtraRam(inverter, valuesFile.size() + scratchBytes);
     }
   }
 
@@ -187,7 +240,7 @@ protected:
     }
     valCountStream.addVal(inverter.pool, (int64_t)vals.size());
     if (valueStorage == ValueStorage::BUFFERED) {
-      accountExtraRam(inverter, valuesFile.size());
+      accountExtraRam(inverter, valuesFile.size() + scratchBytes);
     }
   }
 

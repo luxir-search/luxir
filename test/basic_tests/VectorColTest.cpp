@@ -883,3 +883,25 @@ TEST_F(VectorColTest, schemaProtoRoundTrip) {
   // (the on-write default is derived from COSINE), so it round-trips as absent.
   EXPECT_FALSE(fd->normalize_on_write.has_value());
 }
+
+TEST_F(VectorColTest, multiArrayOrderAndDuplicatesSurviveMerge) {
+  CollectionHelper helper;
+  std::vector<std::vector<float>> expected{{3, 4}, {1, 2}, {3, 4}};
+  helper.index(flatdoc("id", "a", "emb_vs", expected), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "b", "emb_vs", expected), UpdateMessage::COMMIT);
+  for (int merge = 0; merge < 2; merge++) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").allQuery().fields({"id", "emb_vs"}).limit(-1);
+    req->execute(false);
+    ASSERT_OK(req);
+    for (const auto& doc : req->getDocs()) {
+      ASSERT_NE(nullptr, find(doc, "emb_vs"));
+      EXPECT_EQ(expected, std::get<std::vector<std::vector<float>>>(*find(doc, "emb_vs")));
+    }
+    if (!merge) {
+      CollectionHelper::UpdateBuilder update;
+      update.commit(true, 1);
+      ASSERT_TRUE(helper.submit(update).success);
+    }
+  }
+}

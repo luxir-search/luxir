@@ -776,12 +776,10 @@ Field names use the value binding. Numeric, date, string, and ID fields keep
 the direct column-sort path. Use `col("name")` when a field name is reserved
 or is not an identifier. To sort analyzed text, use a string variant.
 
-A bare multi-valued string field sorts by its smallest value ascending and its
-largest value descending (string values are stored as a per-document sorted
-set, so either edge is free to read). A bare multi-valued numeric or date field
-does the same in either multi-valued mode. A numeric/date set column keeps
-ascending unique values, so extrema read an edge; an array column retains
-source order and scans for the extremum. `min(f)` and `max(f)` over a bare
+A bare multi-valued string, numeric, or date field sorts by its smallest value
+ascending and its largest value descending in either mode. Set columns read
+an edge; array columns retain source order and scan for the extremum. Strings
+compare by normalized bytes. Numeric/date `min(f)` and `max(f)` over a bare
 field use the same edge/scan choice. Value-level reducers such as `count(f)`,
 `sum(f)`, and `avg(f)` see what the mode stores, including repeats in arrays.
 

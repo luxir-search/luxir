@@ -261,7 +261,7 @@ TEST_F(FieldVariantsIngestTest, normalizedLengthLimitAndRecoveryForBothStringLay
     auto docs = req->getDocs();
     ASSERT_EQ(1u, docs.size());
     auto expected = std::vector<std::string>{"cafe", std::string(128, 'e'), std::string(255, 'x'), std::string(254, 'x') + "i"};
-    if (indexed) std::sort(expected.begin(), expected.end());
+    std::sort(expected.begin(), expected.end());
     EXPECT_TRUE(containsDoc(docs, flatdoc("id", "good", "value", expected)));
     helper.clear();
   }

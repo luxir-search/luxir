@@ -1604,3 +1604,40 @@ TEST_F(CollapseTest, fusionChildrenRetainStructuralPrefixes) {
     }
   }
 }
+
+TEST_F(CollapseTest, multiColumnStringRanksSelectExtremaInBothModes) {
+  for (bool array : {false, true}) {
+    CollectionHelper helper;
+    helper.clear();
+    SchemaBuilder schema;
+    auto& field = schema.field("value");
+    field.type = api::FieldDef::FieldClass::STRING;
+    field.index = api::FieldDef::IndexMode::NONE;
+    field.column = true;
+    field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+    schema.set(helper.collection());
+    helper.index(flatdoc("id", "a", "key_s", "x", "value", vecs("m", "z", "a")), UpdateMessage::COMMIT);
+    helper.index(flatdoc("id", "b", "key_s", "y", "value", vecs("n", "b", "y")), UpdateMessage::COMMIT);
+    helper.index(flatdoc("id", "0a", "key_s", "x", "value", vecs("c")), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "0b", "key_s", "y", "value", vecs("d")), UpdateMessage::COMMIT);
+    for (int merge = 0; merge < 2; merge++) {
+      for (auto [sort, first, second] : {
+          std::tuple{R"("value asc")", "a", "b"}, {R"("value desc")", "z", "y"}}) {
+        for (int parallel : {0, -1}) {
+          auto req = run("main", "*:*", R"({"field":"key_s","head_sort":"id asc"})",
+              -1, 0, parallel, true, 10, sort);
+          ASSERT_OK(req);
+          const auto& ranks = req->docList()->groups->ranks;
+          ASSERT_EQ(2u, ranks.size());
+          EXPECT_EQ(first, std::get<std::string_view>(ranks[0].v[0].kind));
+          EXPECT_EQ(second, std::get<std::string_view>(ranks[1].v[0].kind));
+        }
+      }
+      if (!merge) {
+        CollectionHelper::UpdateBuilder update;
+        update.commit(true, 1);
+        ASSERT_TRUE(helper.submit(update).success);
+      }
+    }
+  }
+}

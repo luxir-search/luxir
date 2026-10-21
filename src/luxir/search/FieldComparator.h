@@ -1188,6 +1188,8 @@ public:
 class StrColComparator : public FieldComparator {
   std::optional<StrColReader> reader;
   std::optional<StrColReader::Iterator> iter;
+  std::optional<StrColReader::DocValues> docValues;
+  bool multiValued = false;
   std::vector<std::string> values; // Storage for string values
   // Missing is tracked apart from the value: any string, "" included, is a
   // real value that must not tie with a missing one.
@@ -1204,14 +1206,18 @@ public:
   void setSegment(const IndexReader::Segment& segment) override {
     auto* postingsReader = &segment.postingsReader();
     // Reset reader and iterator
-    reader.reset();
+    docValues.reset();
     iter.reset();
+    reader.reset();
+    multiValued = false;
 
     if (auto* info = fields.at(segment)) {
       const auto& fieldInfo = *info;
       if (fieldInfo.columnLoc.offset() > 0) {
         reader.emplace(*postingsReader, fieldInfo);
         iter.emplace(*reader);
+        multiValued = reader->isMultiValued();
+        if (multiValued) docValues.emplace(*reader);
       }
     }
   }
@@ -1238,7 +1244,9 @@ public:
       return std::nullopt;
     }
 
-    return iter->value();
+    return multiValued
+        ? reader->selectedValue(iter->rank(), sortMultiplier < 0, *docValues)
+        : iter->value();
   }
 
   int compareValues(bool missingA, std::string_view valA,
