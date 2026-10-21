@@ -140,6 +140,13 @@ public:
         || info.type == FieldType::DATE);
   }
 
+  // Value counts are document counts when every present doc has one value,
+  // even if the segment uses the multi-valued column representation.
+  static bool valuesAreDocuments(const SegFieldInfo& info) {
+    return !(info.flags & FieldType::MULTI_VALUED)
+        || info.numValues == info.docsWithField;
+  }
+
   // Compare a block's shared column pass with its points fences before
   // constructing one predicate supplier per bucket.
   bool numericIdentitiesLead(size_t segment, const SegFieldInfo& info, DocSet* eligibility,
@@ -189,6 +196,75 @@ public:
     IntColReader intColReader(postingsReader, segFieldInfo);
     forEachIntColValue(domain, intColReader, maxDoc, missing_num, callback);
     return true;
+  }
+
+  using DocBucketSet = boost::unordered_flat_set<int64_t, boost::hash<int64_t>,
+      std::equal_to<int64_t>, std::pmr::polymorphic_allocator<int64_t>>;
+
+  // Deliver a document once per distinct value (field facets). Only arrays
+  // can repeat a value within a doc; everything else hands the caller's
+  // callback to the plain walk unchanged.
+  bool facetSegIntDistinct(DocSet* domain, int32_t segnum, int64_t& missing_num,
+                           auto&& callback) {
+    auto* info = fieldInfo(segnum);
+    if (!info || valuesAreDocuments(*info) || !(info->flags & FieldType::MULTI_ARRAY)) {
+      return facetSegIntCol(domain, segnum, missing_num,
+                            std::forward<decltype(callback)>(callback));
+    }
+    return facetSegIntBucketsDedup(domain, segnum, missing_num,
+        [](int64_t value) -> std::optional<int64_t> { return value; }, callback);
+  }
+
+  // Deliver a document once per mapped bucket. bucketOf returns an optional
+  // stable key, not a growing directory's mutable index. SET mappings must be
+  // monotonic: values in the same bucket are adjacent. Single-valued walks keep
+  // no dedup state; ARRAY scratch is reused per doc and charged to the request.
+  bool facetSegIntBuckets(DocSet* domain, int32_t segnum, int64_t& missing_num,
+                          auto&& bucketOf, auto&& callback) {
+    auto* info = fieldInfo(segnum);
+    if (!info || valuesAreDocuments(*info)) {
+      return facetSegIntCol(domain, segnum, missing_num,
+          [&](int32_t doc, int64_t value) LUXIR_INLINE {
+            if (auto bucket = bucketOf(value)) callback(doc, *bucket);
+          });
+    }
+    return facetSegIntBucketsDedup(domain, segnum, missing_num, bucketOf, callback);
+  }
+
+  // Keep the dedup walks outside the plain walk's inlining context. Their
+  // additional instantiations otherwise change GCC's hot-loop codegen.
+  bool LUXIR_NOINLINE facetSegIntBucketsDedup(
+      DocSet* domain, int32_t segnum, int64_t& missing_num,
+      auto&& bucketOf, auto&& callback) {
+    return withIntColumn(domain, segnum, missing_num,
+        [&](IntColReader& column, int32_t maxDoc) {
+          if (column.multiSet()) {
+            int32_t lastDoc = -1;
+            int64_t lastBucket = 0;
+            forEachIntColValue(domain, column, maxDoc, missing_num,
+                [&](int32_t doc, int64_t value) LUXIR_INLINE {
+                  auto bucket = bucketOf(value);
+                  if (!bucket || (doc == lastDoc && *bucket == lastBucket)) return;
+                  lastDoc = doc;
+                  lastBucket = *bucket;
+                  callback(doc, *bucket);
+                });
+          } else {
+            FacetCountResource resource(req.memoryTracker, facetName, "facet document dedup");
+            DocBucketSet seen{&resource};
+            int32_t lastDoc = -1;
+            forEachIntColValue(domain, column, maxDoc, missing_num,
+                [&](int32_t doc, int64_t value) LUXIR_INLINE {
+                  auto bucket = bucketOf(value);
+                  if (!bucket) return;
+                  if (doc != lastDoc) {
+                    seen.clear();
+                    lastDoc = doc;
+                  }
+                  if (seen.insert(*bucket).second) callback(doc, *bucket);
+                });
+          }
+        });
   }
 
   // callback(docid, ord) per value, ord 0-based in `ordSpace`
@@ -567,7 +643,7 @@ public:
       size_t finalizedSlot = 0;
       if (finalizer.needsCandidates() || capturePins) {
         counts.forEachEntry([&](int64_t key, char* entry) {
-          int64_t count = counts.occurrenceCount(entry);
+          int64_t count = loadUnaligned<int64_t>(entry);
           finalizer.add({key, count, {entry, finalizedSlot}});
           if (capturePins) {
             auto pin = pinByKey.find(key);
@@ -951,9 +1027,9 @@ public:
                         data.counts.add(value - keyBase, docid);
                       });
                 } else {
-                  // Arrays retain source order and repeats. Count occurrences
-                  // for now, but feed metrics only once per doc and bucket.
-                  boost::unordered_flat_map<int64_t, char*> seen;
+                  FacetCountResource resource(thisOp().req.memoryTracker, thisOp().facetName,
+                      "facet document dedup");
+                  DocBucketSet seen{&resource};
                   int32_t lastDoc = -1;
                   forEachIntColValue(domain, column, maxDoc, data.missing_num,
                       [&](int32_t docid, int64_t value) LUXIR_INLINE {
@@ -962,12 +1038,8 @@ public:
                           lastDoc = docid;
                         }
                         int64_t key = value - keyBase;
-                        auto [it, first] = seen.try_emplace(key, nullptr);
-                        if (first) {
-                          it->second = data.counts.resolveEntry(key);
-                          data.counts.touchEntry(it->second, docid);
-                        } else {
-                          data.counts.addOccurrence(it->second);
+                        if (seen.insert(key).second) {
+                          data.counts.touchEntry(data.counts.resolveEntry(key), docid);
                         }
                       });
                 }
@@ -994,14 +1066,14 @@ public:
         }
         if (auto* countVec = std::get_if<MergeableIntFacet::CountVector>(&data.counts)) {
           int64_t minVal = data.minValue;
-          facetReq.facetSegIntCol(domain, segnum, data.missing_num,
+          facetReq.facetSegIntDistinct(domain, segnum, data.missing_num,
             [countVec, minVal](int32_t docid, int64_t val) LUXIR_INLINE {
               unused(docid);
               (*countVec)[val - minVal]++;
             });
         } else {
           auto* countMap = &std::get<MergeableIntFacet::IntHash>(data.counts);
-          facetReq.facetSegIntCol(domain, segnum, data.missing_num,
+          facetReq.facetSegIntDistinct(domain, segnum, data.missing_num,
             [countMap](int32_t docid, int64_t val) LUXIR_INLINE {
               unused(docid);
               (*countMap)[val]++;
@@ -1845,6 +1917,8 @@ class IntFacetRangeReq : public FixedBucketFacetReq {
   bool facetSegIntZones(DocSet* domain, int32_t segnum, int64_t& missing_num,
                         V& visitor) {
     if (disableZoneRangeFacetForTests) return false;
+    auto* info = fieldInfo(segnum);
+    if (info && !valuesAreDocuments(*info)) return false;
     bool walked = true;
     withIntColumn(domain, segnum, missing_num,
         [&](IntColReader& column, int32_t maxDoc) {
@@ -2071,7 +2145,8 @@ public:
                                       || segFieldInfo.type == FieldType::FLOAT
                                       || segFieldInfo.type == FieldType::DOUBLE
                                       || segFieldInfo.type == FieldType::DATE;
-          if (segFieldInfo.pointsMetaOff != 0 && oneDimensionalNumeric) {
+          if (segFieldInfo.pointsMetaOff != 0 && oneDimensionalNumeric
+              && valuesAreDocuments(segFieldInfo)) {
             IntColReader column(segment.postingsReader(), segFieldInfo);
             PointsReader points(segment.postingsReader(), segFieldInfo);
             if (points.pointCount() != (uint64_t)column.numValues()) {
@@ -2115,12 +2190,13 @@ public:
         return;
       }
       // Capture the layout by value so the counter store cannot alias it.
-      rangeOp().facetSegIntCol(domain, segnum, data.missing_num,
-          [counts = std::span(data.counts), layout = rangeOp().fixedLayout()]
-            (int32_t docid, int64_t val) mutable LUXIR_INLINE {
-          unused(docid);
-          if (layout.inRange(val)) counts[layout.bucketOf(val)]++;
-        });
+      rangeOp().facetSegIntBuckets(domain, segnum, data.missing_num,
+          [layout = rangeOp().fixedLayout()](int64_t value) mutable LUXIR_INLINE -> std::optional<int64_t> {
+            if (!layout.inRange(value)) return std::nullopt;
+            return (int64_t)layout.bucketOf(value);
+          }, [counts = std::span(data.counts)](int32_t, int64_t bucket) LUXIR_INLINE {
+            counts[(size_t)bucket]++;
+          });
       }
     }
 

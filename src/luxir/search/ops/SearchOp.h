@@ -577,9 +577,6 @@ class KeyedAggregateTable {
   BigFlatMap<Key, char*, Hash> sparseEntries;
   [[no_unique_address]] Payload payload;
   static constexpr size_t HEADER_BYTES = sizeof(int64_t) + Payload::BYTES;
-  // The entry header counts documents delivered to metrics. Repeated values
-  // add only facet occurrences, without changing compact metric denominators.
-  boost::unordered_flat_map<char*, int64_t> extraOccurrences;
   std::vector<int64_t> touchedKeys;
   std::vector<uint32_t> calcEntryBytes;
   MemPool entryPool;
@@ -930,28 +927,6 @@ public:
     }
   }
 
-  void addOccurrence(char* entry, int64_t count = 1) {
-    assert(loadUnaligned<int64_t>(entry) > 0);
-    auto it = extraOccurrences.find(entry);
-    if (it != extraOccurrences.end()) {
-      it->second += count;
-    } else {
-      constexpr size_t bytes = 2 * (sizeof(std::pair<char*, int64_t>) + 1);
-      charge(bytes);
-      sparseBytesCharged += bytes;
-      extraOccurrences.emplace(entry, count);
-    }
-  }
-
-  int64_t occurrenceCount(char* entry) const {
-    int64_t count = loadUnaligned<int64_t>(entry);
-    if (!extraOccurrences.empty()) {
-      auto it = extraOccurrences.find(entry);
-      if (it != extraOccurrences.end()) count += it->second;
-    }
-    return count;
-  }
-
   template <typename RemapKey>
   void merge(KeyedAggregateTable& other, RemapKey&& remapKey) {
     assert(rep != Rep::UNINITIALIZED || other.empty());
@@ -961,7 +936,6 @@ public:
         stats->mixedMerges.fetch_add(1, std::memory_order_relaxed);
       }
     }
-    const bool carryOccurrences = !other.extraOccurrences.empty();
     other.forEachEntry([&](KeyArg key, char* from) {
       decltype(auto) targetKey = remapKey(key);
       char* target = findEntry(targetKey);
@@ -970,10 +944,6 @@ public:
         mergeNewEntry(target, from, other);
       } else {
         mergeEntry(target, from, other);
-      }
-      if (carryOccurrences) {
-        auto it = other.extraOccurrences.find(from);
-        if (it != other.extraOccurrences.end()) addOccurrence(target, it->second);
       }
     });
   }

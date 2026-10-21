@@ -791,3 +791,36 @@ TEST_F(DistinctFacetTest, sparseNumericWalksWithTuplesAndDeletes) {
     }
   }
 }
+
+TEST_F(DistinctFacetTest, numericRepeatsCountEachGroupOnce) {
+  SearchOverridesGuard guard(forcedDistinctFacetMode);
+  for (bool array : {false, true}) {
+    CollectionHelper helper;
+    helper.clear();
+    SchemaBuilder schema;
+    auto& field = schema.field("n_is");
+    field.type = api::FieldDef::FieldClass::INT;
+    field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+    schema.set(helper.collection());
+    helper.index(flatdoc("n_is", vec_i(1, 11, 2, 1, 12), "key_i", 0), UpdateMessage::COMMIT);
+    helper.index(flatdoc("n_is", vec_i(2, 1), "key_i", 0), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("n_is", vec_i(2, 11), "key_i", 1), UpdateMessage::COMMIT);
+    for (auto mode : {DistinctFacetMode::PAGED, DistinctFacetMode::HASH}) {
+      forcedDistinctFacetMode = mode;
+      for (int parallel : {1, -1}) {
+        auto req = run("main", R"("limit":0,"collapse":"key_i","ops":{
+          "f":{"field_facet":{"field":"n_is","limit":-1,"count_unit":"groups"}},
+          "r":{"range_facet":{"field":"n_is","start":0,"end":20,"gap":10,"count_distinct":"key_i"}},
+          "d":{"range_facet":{"field":"n_is","bounds":"data","gap":10,"count_unit":"groups"}}})", parallel);
+        ASSERT_OK(req);
+        const auto& ops = req->docList()->ops;
+        for (auto name : {"f", "r", "d"}) {
+          const auto& facet = *ops.at(name)->facetResult();
+          std::vector<int64_t> expected = std::string_view(name) == "f"
+              ? std::vector<int64_t>{2, 2, 1, 1} : std::vector<int64_t>{2, 2};
+          EXPECT_EQ(expected, std::vector<int64_t>(facet.counts.begin(), facet.counts.end()));
+        }
+      }
+    }
+  }
+}

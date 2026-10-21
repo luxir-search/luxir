@@ -220,7 +220,7 @@ struct MetricGroupData::Impl {
         1, 0, op.topCount, better);
     size_t slot = 0;
     table.forEachEntry([&](const CollapseKey& key, char* entry) {
-      finalizer.add({&key, table.occurrenceCount(entry),
+      finalizer.add({&key, loadUnaligned<int64_t>(entry),
           {slot++, loadUnaligned<int32_t>(entry + sizeof(int64_t))}});
     });
     auto page = finalizer.finish();

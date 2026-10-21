@@ -16,7 +16,11 @@ metrics for it. Put facets and metrics in the **sub operations** `ops` of a
 query and they see every document the query and its filters match, not just
 the hits returned by `limit`. The ranked documents, the facet counts, and the
 total come back in one round trip, over one consistent view of the index.
-Counts are exact by default.
+Counts are exact by default. A document contributes once to each bucket it
+matches, including when an array repeats a value or several values fall in the
+same range bucket. Bucket metrics see each matching document once; metrics
+over its field values still see all values stored by the field's `set` or
+`array` mode.
 
 For an interactive facet sidebar, start with
 [`selected`](#easy-multi-select-with-selected): put the user's choices on each
@@ -672,9 +676,11 @@ as under a string bucket, so an empty range bucket yields `null` metrics.
 
 For numeric and date fields declared with `index: "range"`, a points index can
 answer a whole-index range facet from indexed points instead of walking the
-column. The result is the same either way; only the cost differs.
+column when each document has at most one stored value. Multi-valued columns
+walk document runs to count each document once per bucket. The result is the
+same either way; only the cost differs.
 
-Otherwise the column walk reads the min/max bounds the column keeps per block
+For single-valued columns, the column walk reads the min/max bounds kept per block
 and per 512 values. A run of values whose bounds fall inside one bucket is
 counted without decoding, so histograms over time-ordered data cost about one
 step per run rather than one per value. This holds for explicit and `data`

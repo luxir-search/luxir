@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <string>
 #include <vector>
 
@@ -13,6 +14,8 @@
 #include "test/CollectionHelper.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
+#include "test/SchemaBuilder.h"
+#include "test/LocalReq.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -440,4 +443,87 @@ TEST_F(ValueExprKernelTest, columnInfinityIsAValueAndNaNIsMissing) {
   EXPECT_EQ(std::numeric_limits<double>::infinity(),
             maximumBound->evalPoint(1, 0.0f).doubleValue);
   EXPECT_FALSE(maximumBound->evalPoint(2, 0.0f).valid);
+}
+
+// Check completed sums rather than partial sums, and retain ARRAY repeats.
+TEST_F(ValueExprKernelTest, wideArraySumAndAverage) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  for (auto name : {"ints", "doubles"}) {
+    auto& field = schema.field(name);
+    field.type = std::string_view(name) == "ints" ? api::FieldDef::FieldClass::INT
+                                                 : api::FieldDef::FieldClass::DOUBLE;
+    field.multi = api::FieldDef::MultiMode::ARRAY;
+  }
+  schema.set(helper.collection());
+  constexpr int64_t M = INT64_MAX;
+  helper.index(flatdoc("ints", vec_i(M, -M, -2),
+      "doubles", vec(-1e308, 1e308, -1e308)), UpdateMessage::COMMIT);
+  helper.index(flatdoc("ints", vec_i(M, 2, -M, -4),
+      "doubles", vec(1e308, 1e308, -1e308)), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("ints", vec_i(M, 1),
+      "doubles", vec(1e308, 1e308)), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("ints", vec_i(M, INT64_MIN, 1)), UpdateMessage::COMMIT);
+  struct Case { const char* expr; std::array<std::optional<double>, 4> expected; };
+  for (int merge = 0; merge < 2; merge++) {
+    auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+    auto currentSchema = helper.collection().getSchema();
+    ArenaOwner memory;
+    MemPool pool;
+    for (auto c : std::array{
+        Case{"sum(ints)", {-2, -2, std::nullopt, 0}},
+        Case{"sum(doubles)", {-1e308, 1e308, std::nullopt, std::nullopt}},
+        Case{"avg(ints)", {-2.0 / 3, -0.5, (double)((long double)M + 1) / 2, 0}},
+        Case{"avg(doubles)", {-1e308 / 3, 1e308 / 3, 1e308, std::nullopt}}}) {
+      auto* program = parseValue(memory, *currentSchema, c.expr);
+      for (auto& segment : reader->segments()) {
+        auto* bound = program->bind(pool, segment, program->resolveFields(pool, *reader));
+        std::vector<int32_t> docs((size_t)segment.maxDoc());
+        std::iota(docs.begin(), docs.end(), 0);
+        std::vector<ValueResult> batch(docs.size());
+        bound->evalBatch(docs, {}, batch);
+        for (int32_t doc : docs) {
+          auto expected = c.expected[(size_t)(segment.base + doc)];
+          for (auto result : {bound->evalPoint(doc, 0), batch[(size_t)doc]}) {
+            ASSERT_EQ(expected.has_value(), result.valid) << c.expr;
+            if (expected) {
+              EXPECT_DOUBLE_EQ(*expected, result.type == ValueType::INT64
+                  ? (double)result.intValue : result.doubleValue) << c.expr;
+            }
+          }
+        }
+      }
+    }
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").expr("total", "sum(sum(ints))").expr("mean", "avg(sum(ints))");
+    req->execute(false);
+    ASSERT_OK(req);
+    EXPECT_EQ(-4, req->responses[0]->proto.ops.at("total")->asInt());
+    EXPECT_DOUBLE_EQ(-4.0 / 3, req->responses[0]->proto.ops.at("mean")->asDouble());
+    if (!merge) {
+      CollectionHelper::UpdateBuilder update;
+      update.commit(true, 1);
+      ASSERT_TRUE(helper.submit(update).success);
+    }
+  }
+}
+
+TEST_F(ValueExprKernelTest, sortedSetSumsSurvivePartialOverflow) {
+  CollectionHelper helper;
+  helper.index(flatdoc("v_is", vec_i(INT64_MAX, -INT64_MAX, -2),
+      "v_ds", vec(1e308, -9e307, -1e308)), UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto schema = helper.collection().getSchema();
+  ArenaOwner memory;
+  MemPool pool;
+  for (auto [expr, expected] : {
+      std::pair{"sum(v_is)", -2.0}, {"avg(v_is)", -2.0 / 3},
+      {"sum(v_ds)", -9e307}, {"avg(v_ds)", -9e307 / 3}}) {
+    auto* program = parseValue(memory, *schema, expr);
+    auto* bound = program->bind(pool, reader->segments()[0], program->resolveFields(pool, *reader));
+    auto result = bound->evalPoint(0, 0);
+    ASSERT_TRUE(result.valid) << expr;
+    EXPECT_DOUBLE_EQ(expected, result.type == ValueType::INT64
+        ? (double)result.intValue : result.doubleValue) << expr;
+  }
 }

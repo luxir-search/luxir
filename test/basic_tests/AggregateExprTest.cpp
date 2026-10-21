@@ -2383,10 +2383,10 @@ TEST_F(AggregateExprTest, denseTableHugePageBoundaryAndReuse) {
         EXPECT_EQ(tracker.bytes(), bigBufferStorage(bytes) + 3 * sizeof(int64_t));
         for (int64_t key : {int64_t{0}, keys / 2, keys - 1}) {
           auto* entry = table.resolveEntry(key);
-          EXPECT_EQ(table.occurrenceCount(entry), 0);
+          EXPECT_EQ(loadUnaligned<int64_t>(entry), 0);
           table.touchEntry(entry, 0);
           table.touchEntry(entry, 1);
-          EXPECT_EQ(table.occurrenceCount(entry), 2);
+          EXPECT_EQ(loadUnaligned<int64_t>(entry), 2);
         }
       }
       EXPECT_EQ(tracker.bytes(), 0);
