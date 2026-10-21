@@ -116,6 +116,9 @@ field lands:
   batch, and a named field may be in `docs` or absent. `_score_` is always
   a column.
 
+A requested `_sort_` is placed like a field: a `col_val` column (or a `docs`
+entry) whose values are `ArrVal` arrays of the document's sort values.
+
 Treat each batch's `columns` keys as authoritative and merge `docs[i]` into
 row `i`.
 

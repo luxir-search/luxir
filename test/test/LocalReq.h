@@ -87,6 +87,7 @@ public:
   OpCursor& getScores(bool v = true);
   OpCursor& minScore(float v);
   OpCursor& documentFormat(luxir::api::DocFormat v);
+  OpCursor& sortBy(std::string_view expr, bool desc = false);  // appends one sort clause
   OpCursor& withStats() { return countLimit().getScores(); }
 
   // --- configure a facet op ---
@@ -646,6 +647,15 @@ inline OpCursor& OpCursor::batchSize(int32_t n) { asTopDocs().batch_size = n; re
 inline OpCursor& OpCursor::countLimit(int64_t n) { asTopDocs().count_limit = n; return *this; }
 inline OpCursor& OpCursor::getScores(bool v) { asTopDocs().get_scores = v; return *this; }
 inline OpCursor& OpCursor::minScore(float v) { asTopDocs().min_score = v; return *this; }
+inline OpCursor& OpCursor::sortBy(std::string_view expr, bool desc) {
+  auto& td = asTopDocs();
+  auto old = td.sort;
+  auto* a = build::allocArray(td.sort, old.size() + 1, req_->mr);
+  std::copy(old.begin(), old.end(), a);
+  a[old.size()].expr = build::arenaStr(req_->mr, expr);
+  a[old.size()].dir = desc ? luxir::api::SortSpec_::SortDir::DESC : luxir::api::SortSpec_::SortDir::ASC;
+  return *this;
+}
 inline OpCursor& OpCursor::documentFormat(luxir::api::DocFormat v) { asTopDocs().document_format = v; return *this; }
 
 inline OpCursor& OpCursor::limit(int64_t n) {

@@ -15,11 +15,13 @@
 #include <pthread.h>
 #include <gtest/gtest.h>
 #include "luxir/util/Signal.h"
+#include "luxir/util/geo.h"
 #include "test/CollectionHelper.h"
 #include "test/GrpcClient.h"
 #include "test/GrpcLuxirTest.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
 #include "luxir/server/GRPCServer.h"
 
@@ -255,6 +257,99 @@ TEST_F(GrpcSearchTest, routedFilterValidation) {
   EXPECT_NE(std::string::npos,
             missingError.find(
                 "top_docs.filter[0].query requires a query kind"));
+}
+
+// geo_nearest and a geo distance sort travel the wire: the query arm, its
+// optional limit, and the _sort_ column of distances.
+TEST_F(GrpcSearchTest, geoNearestAndDistanceSort) {
+  CollectionHelper helper;
+  SchemaBuilder b;
+  auto& field = b.field("geo");
+  field.type = api::FieldDef::FieldClass::GEO_POINT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  b.set(helper.collection());
+  helper.indexAll({{{"id", "ny"}, {"geo", "40.7128,-74.0060"}},
+                   {{"id", "philly"}, {"geo", "39.9526,-75.1652"}},
+                   {{"id", "la"}, {"geo", "34.0522,-118.2437"}}},
+                  UpdateMessage::COMMIT);
+
+  auto run = [&](LocalReq& request) {
+    grpc::ClientContext context;
+    HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
+        channel.get(), rpc::Search, &context);
+    EXPECT_TRUE(stream.Write(request.proto));
+    EXPECT_TRUE(stream.WritesDone());
+    std::vector<std::string> ids;
+    std::vector<double> meters;
+    Reply<luxir::api::SearchResponse> response;
+    while (stream.Read(&response)) {
+      EXPECT_FALSE(response.msg.error.has_value());
+      const auto* list = response.msg.ops.at("q")->docList();
+      if (list == nullptr) continue;
+      if (const auto* id = list->columns.find("id")) {
+        for (auto value : std::get<luxir::api::ColStr>(id->kind).v) ids.emplace_back(value);
+      }
+      if (const auto* sort = list->columns.find("_sort_")) {
+        for (const auto& value : std::get<luxir::api::ColVal>(sort->kind).v) {
+          meters.push_back(std::get<double>(std::get<luxir::api::ArrVal>(value.kind).v[0].kind));
+        }
+      }
+    }
+    EXPECT_TRUE(stream.Finish().ok());
+    return std::pair(ids, meters);
+  };
+
+  auto nearest = localReq(luxirNode->getSearchEngine());
+  auto& cur = nearest->collection("main").topDocs("q");
+  cur.rawQuery() = qb::geoNearest(cur.mr(), "geo", 40.0, -75.0, 2, 1000000.0);
+  cur.fields({"id"});
+  EXPECT_EQ((std::vector<std::string>{"philly", "ny"}), run(*nearest).first);
+
+  auto sorted = localReq(luxirNode->getSearchEngine());
+  auto& sortCur = sorted->collection("main").topDocs("q");
+  sortCur.allQuery().sortBy("geo_distance(geo, 40.0, -75.0)").fields({"id", "_sort_"});
+  auto [ids, meters] = run(*sorted);
+  EXPECT_EQ((std::vector<std::string>{"philly", "ny", "la"}), ids);
+  ASSERT_EQ(3u, meters.size());
+  EXPECT_NEAR(geo::haversinMeters(40.0, -75.0, 39.9526, -75.1652), meters[0], 0.5);
+  EXPECT_LT(meters[1], meters[2]);
+}
+
+TEST_F(GrpcSearchTest, distanceFeatureScoresByProximity) {
+  CollectionHelper helper;
+  SchemaBuilder b;
+  auto& field = b.field("geo");
+  field.type = api::FieldDef::FieldClass::GEO_POINT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  b.set(helper.collection());
+  helper.indexAll({{{"id", "ny"}, {"geo", "40.7128,-74.0060"}},
+                   {{"id", "la"}, {"geo", "34.0522,-118.2437"}}},
+                  UpdateMessage::COMMIT);
+  auto request = localReq(luxirNode->getSearchEngine());
+  auto& cur = request->collection("main").topDocs("q");
+  cur.rawQuery() = qb::distanceFeature(cur.mr(), "geo", 40.7128, -74.0060, 1000.0);
+  cur.fields({"id"}).getScores();
+  grpc::ClientContext context;
+  HppClientReaderWriter<luxir::api::SearchRequest, luxir::api::SearchResponse> stream(
+      channel.get(), rpc::Search, &context);
+  ASSERT_TRUE(stream.Write(request->proto));
+  ASSERT_TRUE(stream.WritesDone());
+  std::vector<std::string> ids;
+  std::vector<float> scores;
+  Reply<luxir::api::SearchResponse> response;
+  while (stream.Read(&response)) {
+    ASSERT_FALSE(response.msg.error.has_value());
+    const auto* list = response.msg.ops.at("q")->docList();
+    if (list == nullptr) continue;
+    for (auto value : std::get<luxir::api::ColStr>(list->columns.find("id")->kind).v) ids.emplace_back(value);
+    for (float value : std::get<luxir::api::ColFloat>(list->columns.find("_score_")->kind).v) scores.push_back(value);
+  }
+  ASSERT_TRUE(stream.Finish().ok());
+  EXPECT_EQ((std::vector<std::string>{"ny", "la"}), ids);
+  ASSERT_EQ(2u, scores.size());
+  EXPECT_GT(scores[0], 0.99f);
+  EXPECT_NEAR(1000.0 / (1000.0 + geo::haversinMeters(40.7128, -74.0060, 34.0522, -118.2437)),
+              scores[1], 1e-6);
 }
 
 // A client that cancels the RPC while the emitter is paused must not strand

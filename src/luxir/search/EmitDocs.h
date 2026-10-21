@@ -698,13 +698,14 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 // retains the request spelling; physicalName + fieldType identify the source.
 // fieldType is resolved from the request schema at selector resolution, so explicit-name
 // errors surface before any batch is assembled and the emit loop does no
-// per-batch schema lookups; kind selects the physical, score, or version source.
+// per-batch schema lookups; kind selects the physical, score, sort-value, or
+// version source.
 // discovered: from an empty or wildcard selector (COLUMNS leaves such a column
 // out of a batch where it has no value).  infos and storedInfos are bound with the
 // first rows (see resolveReturnFieldMetadata), so a count-only response never
 // looks them up.
 struct ReturnField {
-  enum class Kind { PHYSICAL, SCORE, VERSION };
+  enum class Kind { PHYSICAL, SCORE, SORT, VERSION };
 
   std::string_view outputKey;
   std::string_view physicalName;
@@ -885,6 +886,11 @@ inline void placeBatchColumns(luxir::api::DocFormat placement,
 // bodyDone) decides who sends it.  All but the final response have more=true.
 using DocBatchMetadata = std::function<void(luxir::api::DocList&, int64_t, int64_t,
                                            std::pmr::memory_resource&)>;
+// Writes one returned document's sort values (the synthetic _sort_ field):
+// one value per sort clause. Unset for a list ranked by score, whose sort
+// value is the score.
+using DocSortValues = std::function<void(luxir::api::ArrVal&, segdoc, float,
+                                         std::pmr::memory_resource&)>;
 
 class DocEmitter {
 public:
@@ -902,6 +908,7 @@ public:
   int64_t numCollected;
   int64_t totalHits;
   DocBatchMetadata metadata;
+  DocSortValues sortValues;
   std::span<ReturnField> fields;  // resolved selectors
   int32_t maxBatchSize;
   int64_t offset;
@@ -932,10 +939,10 @@ public:
                  std::span<ReturnField> fields, int32_t maxBatchSize,
                  int64_t offset, bool emitCount, bool foundGte, bool getScores,
                  luxir::api::DocFormat placement, bool parallel, size_t colCap,
-                 DocBatchMetadata metadata)
+                 DocBatchMetadata metadata, DocSortValues sortValues)
       : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
-        metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
+        metadata(std::move(metadata)), sortValues(std::move(sortValues)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
         foundGte(foundGte), getScores(getScores), placement(placement),
         parallel(parallel), colCap(colCap),
         batchStart(std::min(offset, numCollected)) {}
@@ -1121,6 +1128,21 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
         case ReturnField::Kind::SCORE:
           returnScores = true;
           continue;
+        case ReturnField::Kind::SORT: {
+          auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
+          auto* values = build::allocArray(column.v, columnSize, mr);
+          for (int i = 0; i < columnSize; i++) {
+            auto& sortValue = values[i].kind.template emplace<luxir::api::ArrVal>();
+            float score = getScore(batchStart + i);
+            if (sortValues) {
+              sortValues(sortValue, segDocs[(size_t)i], score, mr);
+            } else {
+              build::allocArray(sortValue.v, 1, mr)[0].kind = score;
+            }
+          }
+          registerColumn();
+          continue;
+        }
         case ReturnField::Kind::VERSION:
           loadVersionRuns(req, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
           registerColumn();
@@ -1347,6 +1369,10 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
       return;
     }
+    if (f == "_sort_") {
+      picked.push_back({f, {}, nullptr, ReturnField::Kind::SORT, false});
+      return;
+    }
     auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);
     if (source.fieldType->type() == FieldType::TEXT && !source.fieldType->isStored()) {
       auto* primary = source.owner ? source.owner->primary.get() : source.fieldType;
@@ -1416,7 +1442,8 @@ void emitDocsResponse(SearchRequest& req,
                       luxir::api::DocFormat docFormat,
                       DocEmission emission,
                       DocBatchMetadata metadata = {},
-                      bool foundGte = false)
+                      bool foundGte = false,
+                      DocSortValues sortValues = {})
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1462,7 +1489,7 @@ void emitDocsResponse(SearchRequest& req,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
       maxBatchSize, offset, emitCount, foundGte, getScores, placement,
-      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata));
+      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata), std::move(sortValues));
   req.streamStarted();
   emitter->produce();
 }

@@ -545,9 +545,9 @@ level; use NOT or parentheses (context: "status_s:live AND <HERE>+tag_s:beta")
   distinct physical targets, including explicit fields.
 - `?` and mid-word `*` in a term are literal characters, and `/re/` is not a
   regex; use `wildcard(...)` and `regex(...)`.
-- `geo_box` and `geo_distance` have no function form; use their structured
-  JSON objects. New structured query arms are not automatically callable
-  until their expression behavior is declared.
+- `geo_box`, `geo_distance`, `geo_nearest`, and `distance_feature` have no
+  function form; use their structured JSON objects. New structured query arms are not
+  automatically callable until their expression behavior is declared.
 - `$variables` are values only: they cannot supply a score decoration, a
   field name, or a fragment of expression syntax.
 - Nesting depth is bounded per request, including expressions nested inside

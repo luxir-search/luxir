@@ -249,7 +249,11 @@ void emitPage(const CollapsedPageSettings& settings,
     groupCount, settings.fields,
     settings.batchSize, settings.offset,
     settings.emitCount, settings.getScores,
-    settings.documentFormat, emission, std::move(metadata));
+    settings.documentFormat, emission, std::move(metadata), false,
+    [sort = &settings.sort, reader = qr.req.reader.get()](
+        luxir::api::ArrVal& out, segdoc doc, float score, std::pmr::memory_resource& mr) {
+      emitCollapseRank(out, *sort, *reader, doc, score, mr);
+    });
 }
 CollapsedPageSettings pageSettings(TopDocsReq& op, TopDocsReq::CalcBase& calc) {
   return {op, *op.collapse, *op.topDocsProto.collapse, op.sortPlan,
@@ -316,7 +320,11 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
         qr.requirements.needsCount(),
         qr.topDocsProto.get_scores,
         qr.topDocsProto.document_format,
-        emission);
+        emission, {}, false,
+        [sort = &qr.sortPlan, reader = qr.req.reader.get()](
+            luxir::api::ArrVal& out, segdoc doc, float score, std::pmr::memory_resource& mr) {
+          emitCollapseRank(out, *sort, *reader, doc, score, mr);
+        });
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();

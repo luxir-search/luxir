@@ -980,6 +980,42 @@ public:
     return facet;
   }
 
+  struct GeoDistanceSort {
+    uint32_t column;
+    GeoSortOrigin origin;
+  };
+
+  // A sort expression that is a distance from a point: geo_distance(field,
+  // lat, lon) over a single-valued field, or min() or max() over it for a
+  // multi-valued one. It sorts with a GeoDistanceComparator, which can prune
+  // through the points index, instead of evaluating the expression per doc.
+  static std::optional<GeoDistanceSort> geoDistanceSort(const ValueProgram& program) {
+    const ValueNode* node = &program.root();
+    bool reduced = false;
+    bool farthest = false;
+    if (node->kind == ValueNodeKind::FUNCTION && node->childCount == 1
+        && (node->opcode == ValueOpcode::MIN || node->opcode == ValueOpcode::MAX)) {
+      reduced = true;
+      farthest = node->opcode == ValueOpcode::MAX;
+      node = &program.nodes[node->children[0]];
+    }
+    if (node->kind != ValueNodeKind::FUNCTION || node->opcode != ValueOpcode::GEO_DISTANCE) {
+      return std::nullopt;
+    }
+    // A multi-valued field's distances are an array that needs a reducer;
+    // left bare, the generic path reports that.
+    const ValueNode& column = program.nodes[node->children[0]];
+    if (column.kind != ValueNodeKind::COLUMN || (column.columnMultiValued && !reduced)) {
+      return std::nullopt;
+    }
+    auto number = [&](uint32_t index) {
+      const ValueNode& arg = program.nodes[index];
+      return arg.type == ValueType::DOUBLE ? arg.doubleValue : (double)arg.intValue;
+    };
+    return GeoDistanceSort{node->children[0],
+        {number(node->children[1]), number(node->children[2]), farthest}};
+  }
+
   // Build the copyable sort plan. Schema lookups that may throw are resolved
   // here before the plan is passed to TopDocsReq.
   SortPlan parseSorts(std::span<const luxir::api::SortSpec> sorts) {
@@ -1003,7 +1039,11 @@ public:
       // values directly; string comparators binary-search global terms at setup and
       // use the matching ord or insertion point.
       FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
-      if (root.kind == ValueNodeKind::COLUMN) {
+      if (auto geo = geoDistanceSort(*program)) {
+        const ValueNode& column = program->nodes[geo->column];
+        auto* fieldTypePtr = req.schema->physical(column.text);
+        out.clauses.emplace_back(SortField(column.text, *fieldTypePtr, order, geo->origin));
+      } else if (root.kind == ValueNodeKind::COLUMN) {
         auto* fieldTypePtr = req.schema->physical(root.text);
         out.clauses.emplace_back(SortField(root.text, *fieldTypePtr, order, missing));
       } else if (root.kind == ValueNodeKind::SCORE) {

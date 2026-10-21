@@ -40,6 +40,12 @@ std::string ReaderManager::resolvedSchema() {
     auto* type = schema->physical(name);
     rep["stored"] = type->isStored();
     if (type->isStored()) rep["stored_resource"] = type->storedResource_;
+    // Ingest-time options: kept out of the signature, since changing them does
+    // not change what existing segments hold.
+    if (auto* geo = dynamic_cast<const GeoPointFieldType*>(type)) {
+      rep["ignore_malformed"] = geo->ignoreMalformed;
+      rep["ignore_z_value"] = geo->ignoreZValue;
+    }
     if (auto* vector = dynamic_cast<const VectorFieldType*>(type)) {
       const auto& config = vector->ann();
       auto& ann = rep["ann"];

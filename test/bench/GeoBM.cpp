@@ -17,13 +17,18 @@
 
 #include "bench/luxir_bench.h"
 #include "luxir/query/GeoBoxQuery.h"
+#include "luxir/query/DistanceFeatureQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
+#include "luxir/query/GeoNearestQuery.h"
 #include "luxir/reader/BKDReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/search/GeoDistanceComparator.h"
 #include "luxir/util/geo.h"
 #include "luxir/util/random.h"
+#include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
 #include "test/SchemaBuilder.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
@@ -790,6 +795,210 @@ std::string benchName(const CorpusSpec& corpus, std::string_view op,
   return name;
 }
 
+// Query points for nearest-k and distance sorts: twenty cities, offset so
+// they do not sit on a clustered corpus's centers.
+constexpr std::array<RawPoint, 20> NEAREST_CENTERS{{
+    {40.7258, -74.0271}, {34.0652, -118.2647}, {19.4456, -99.1542},
+    {-23.5375, -46.6543}, {51.5204, -0.1488}, {48.8696, 2.3312},
+    {30.0574, 31.2147}, {6.5374, 3.3582}, {55.7688, 37.5963},
+    {28.6269, 77.1880}, {39.9172, 116.3864}, {35.6892, 139.6293},
+    {1.3651, 103.7988}, {-33.8558, 151.1883}, {-33.9119, 18.4031},
+    {-1.2791, 36.8009}, {-34.5907, -58.4026}, {21.3199, -157.8793},
+    {61.2311, -149.9213}, {-33.4359, -70.6903},
+}};
+
+// The k nearest docs by a full column pass: what a nearest-k costs without
+// the points walk.
+std::vector<int32_t> bruteNearest(IndexReader& reader, const SegFieldInfo& info,
+                                  RawPoint center, int32_t k, bool multi) {
+  auto& segment = reader.segments()[0];
+  IntColReader column(segment.postingsReader(), info);
+  IntColReader::Iterator iter(column);
+  GeoNearestQuery::NearestHeap heap((size_t)k, std::numeric_limits<double>::infinity(), multi);
+  auto key = [&](int64_t packed) {
+    return geo::haversinSortKey(center.lat, center.lon,
+                                geo::decodeLatitude(geo::unpackLatitude(packed)),
+                                geo::decodeLongitude(geo::unpackLongitude(packed)));
+  };
+  for (int32_t doc = iter.next(); doc != PostingsReader::END; doc = iter.next()) {
+    if (!column.multiValued()) {
+      heap.offer(key(iter.value()), 0, doc);
+      continue;
+    }
+    auto [start, end] = column.getStartEndValueRank(iter.rank());
+    for (int64_t rank = start; rank < end; rank++) {
+      heap.offer(key(iter.values().valueAt(rank)), 0, doc);
+    }
+  }
+  std::vector<int32_t> docs;
+  heap.forEach([&](double, int32_t, int32_t doc) { docs.push_back(doc); });
+  std::sort(docs.begin(), docs.end());
+  return docs;
+}
+
+std::vector<int32_t> walkNearest(IndexReader& reader, RawPoint center, int32_t k,
+                                 bool multi) {
+  MemPool pool;
+  Query::Context context(pool, reader);
+  GeoNearestQuery query(FIELD, center.lat, center.lon, k,
+                        std::numeric_limits<double>::infinity(), multi);
+  auto* weight = query.createWeight(context, Query::NEED_SCORES);
+  Query::Weight::PrepareContext prepare(reader, {}, false, nullptr);
+  auto prepared = weight->prepare(prepare);
+  std::vector<int32_t> docs;
+  Query::Scorer* scorer = prepared->createScorer(pool, reader.segments()[0]);
+  for (int32_t doc = scorer ? scorer->next() : PostingsReader::END;
+       doc != PostingsReader::END; doc = scorer->next()) {
+    docs.push_back(doc);
+  }
+  return docs;
+}
+
+void BM_GeoNearest(benchmark::State& state, CorpusShape shape, bool walk) {
+  if (luxir::unit_tests && shape != UNIFORM && shape != CLUSTERED) {
+    skipReduced(state);
+    return;
+  }
+  int32_t k = (int32_t)state.range(0);
+  GeoFixture& data = fixture(shape);
+  IndexReader& reader = *data.testIndex().reader;
+  SegFieldInfo info = data.fieldInfo();
+  {
+    SkipStatsScope stats;
+    for (RawPoint center : NEAREST_CENTERS) {
+      if (walkNearest(reader, center, k, data.multiValued())
+          != bruteNearest(reader, info, center, k, data.multiValued())) {
+        state.SkipWithError("geo_nearest differs from the column pass");
+        return;
+      }
+    }
+    state.counters["leaves_per_query"] =
+        (double)SkipStats::geoNearestLeaves / (double)NEAREST_CENTERS.size();
+  }
+  for (auto _ : state) {
+    for (RawPoint center : NEAREST_CENTERS) {
+      auto docs = walk ? walkNearest(reader, center, k, data.multiValued())
+                       : bruteNearest(reader, info, center, k, data.multiValued());
+      benchmark::DoNotOptimize(docs.data());
+    }
+  }
+  state.counters["docs"] = data.docCount();
+  state.counters["us_per_query"] = benchmark::Counter(
+      (double)NEAREST_CENTERS.size(),
+      benchmark::Counter::kIsIterationInvariantRate | benchmark::Counter::kInvert);
+}
+
+// Distance sorts through the whole search path, over one segment of
+// uniform points: every doc, or the tenth of them that a filter admits.
+// pruning: 2 = box test and points-index competitive set (the default), 1 =
+// box test only, 0 = neither.
+void BM_GeoSort(benchmark::State& state, bool filtered, int32_t pruning) {
+  int32_t docs = luxir::unit_tests ? (int32_t)LuxirTest::scaleTestWork(5000) : 1'000'000;
+  CollectionHelper helper("geo_sort_bm");
+  std::vector<int32_t> shape{docs};
+  if (!helper.indexMatchesShape(shape)) {
+    helper.clear();
+    CorpusGenerator generator(UNIFORM, 0x6e0d15);
+    std::vector<Doc> batch;
+    batch.reserve((size_t)docs);
+    for (int32_t doc = 0; doc < docs; doc++) {
+      RawPoint point = generator.next();
+      batch.push_back(flatdoc("id", std::to_string(doc), "tag_s", doc % 10 == 0 ? "a" : "b",
+                              "loc_p", std::vector<double>{point.lon, point.lat}));
+    }
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::COMMIT, false, 1).success);
+  }
+  int32_t limit = (int32_t)state.range(0);
+  bool savedBox = GeoDistanceComparator::disableBoxForTests;
+  bool savedIndex = GeoDistanceComparator::disableIndexForTests;
+  auto restore = scope_guard([&]() {
+    GeoDistanceComparator::disableBoxForTests = savedBox;
+    GeoDistanceComparator::disableIndexForTests = savedIndex;
+  });
+  GeoDistanceComparator::disableBoxForTests = pruning < 1;
+  GeoDistanceComparator::disableIndexForTests = pruning < 2;
+  size_t center = 0;
+  auto request = [&]() {
+    RawPoint origin = NEAREST_CENTERS[center++ % NEAREST_CENTERS.size()];
+    std::string json = R"({"collection":"geo_sort_bm","query":)"
+        + std::string(filtered ? R"({"match":{"field":"tag_s","val":"a"}})" : R"({"all":true})")
+        + ",\"sort\":[\"geo_distance(loc_p, " + std::to_string(origin.lat) + ", "
+        + std::to_string(origin.lon) + ")\"],\"fields\":[\"id\",\"_sort_\"],\"limit\":"
+        + std::to_string(limit) + "}";
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
+    EXPECT_TRUE(luxir::api::read_json(req->rawRequest(), json, req->mr)) << json;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req;
+  };
+  {
+    SkipStatsScope stats;
+    request();
+    state.counters["circle_builds"] = (double)SkipStats::geoSortCircleBuilds;
+  }
+  for (auto _ : state) {
+    auto req = request();
+    benchmark::DoNotOptimize(req->responses.size());
+  }
+  state.counters["matches"] = filtered ? docs / 10 : docs;
+}
+
+// Text plus proximity top-10 over one segment of uniform points whose body
+// text matches half the docs, with distance_feature skipping on or off.
+// shape: 0 = distance_feature alone, 1 = required text + optional
+// distance_feature, 2 = optional text + optional distance_feature.
+void BM_GeoProximity(benchmark::State& state, int32_t shape, bool skipping) {
+  int32_t docs = luxir::unit_tests ? (int32_t)LuxirTest::scaleTestWork(5000) : 1'000'000;
+  CollectionHelper helper("geo_proximity_bm");
+  std::vector<int32_t> segments{docs};
+  if (!helper.indexMatchesShape(segments)) {
+    helper.clear();
+    CorpusGenerator generator(UNIFORM, 0x9e0f2a);
+    SplitMix64 rng(0x51);
+    std::vector<Doc> batch;
+    batch.reserve((size_t)docs);
+    for (int32_t doc = 0; doc < docs; doc++) {
+      RawPoint point = generator.next();
+      std::string body = doc % 2 == 0 ? "coffee" : "tea";
+      for (int32_t repeat = (int32_t)(rng() % 3); repeat > 0; repeat--) body += " coffee";
+      body += " house";
+      batch.push_back(flatdoc("id", std::to_string(doc), "body_t", body,
+                              "loc_p", std::vector<double>{point.lon, point.lat}));
+    }
+    ASSERT_TRUE(helper.indexAll(batch, UpdateMessage::COMMIT, false, 1).success);
+  }
+  bool saved = DistanceFeatureQuery::disableSkippingForTests;
+  auto restore = scope_guard([&]() { DistanceFeatureQuery::disableSkippingForTests = saved; });
+  DistanceFeatureQuery::disableSkippingForTests = !skipping;
+  size_t center = 0;
+  auto request = [&]() {
+    RawPoint origin = NEAREST_CENTERS[center++ % NEAREST_CENTERS.size()];
+    std::string df = R"({"distance_feature":{"field":"loc_p","lat":)" + std::to_string(origin.lat)
+        + R"(,"lon":)" + std::to_string(origin.lon) + R"(,"pivot_meters":50000}})";
+    std::string text = R"({"match":{"field":"body_t","val":"coffee"}})";
+    std::string query = shape == 0 ? df
+        : shape == 1 ? R"({"boolean":{"required":[)" + text + R"(],"optional":[)" + df + "]}}"
+                     : R"({"boolean":{"optional":[)" + text + "," + df + "]}}";
+    std::string json = R"({"collection":"geo_proximity_bm","query":)" + query
+        + R"(,"fields":["id"],"get_scores":true,"limit":10})";
+    auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
+    EXPECT_TRUE(luxir::api::read_json(req->rawRequest(), json, req->mr)) << json;
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req;
+  };
+  {
+    SkipStatsScope stats;
+    request();
+    state.counters["circle_builds"] = (double)SkipStats::distanceFeatureCircleBuilds;
+  }
+  for (auto _ : state) {
+    auto req = request();
+    benchmark::DoNotOptimize(req->responses.size());
+  }
+  state.counters["docs"] = docs;
+}
+
 std::string distanceBenchName(const CorpusSpec& corpus, std::string_view op,
                               std::string_view circle) {
   return "BM_GeoDistance/" + std::string(corpus.name) + "/"
@@ -848,6 +1057,39 @@ void registerBuildMerge(const CorpusSpec& corpus, bool merge) {
 }
 
 [[maybe_unused]] bool benchmarksRegistered = [] {
+  for (const CorpusSpec& corpus : CORPORA) {
+    for (bool walk : {true, false}) {
+      benchmark::RegisterBenchmark(
+          "BM_GeoNearest/" + std::string(corpus.name) + "/"
+              + (walk ? "bkd_best_first" : "column_pass"),
+          [shape = corpus.shape, walk](benchmark::State& state) {
+            BM_GeoNearest(state, shape, walk);
+          })->ArgName("k")->Arg(10)->Arg(100)->UseRealTime()
+            ->Unit(benchmark::kMicrosecond);
+    }
+  }
+  for (bool filtered : {false, true}) {
+    for (int32_t pruning : {2, 1, 0}) {
+      std::string_view mode = pruning == 2 ? "box_and_index" : pruning == 1 ? "box_only" : "none";
+      benchmark::RegisterBenchmark(
+          "BM_GeoSort/" + std::string(filtered ? "filter_10pct" : "all") + "/"
+              + std::string(mode),
+          [filtered, pruning](benchmark::State& state) {
+            BM_GeoSort(state, filtered, pruning);
+          })->ArgName("limit")->Arg(10)->Arg(100)->UseRealTime()
+            ->Unit(benchmark::kMicrosecond);
+    }
+  }
+  for (int32_t shape : {0, 1, 2}) {
+    std::string_view name = shape == 0 ? "alone" : shape == 1 ? "must_text" : "should_text";
+    for (bool skipping : {true, false}) {
+      benchmark::RegisterBenchmark(
+          "BM_GeoProximity/" + std::string(name) + "/" + (skipping ? "skipping" : "no_skipping"),
+          [shape, skipping](benchmark::State& state) {
+            BM_GeoProximity(state, shape, skipping);
+          })->UseRealTime()->Unit(benchmark::kMicrosecond);
+    }
+  }
   for (const CorpusSpec& corpus : CORPORA) {
     for (int32_t box = 0; box < BOX_CASE_COUNT; box++) {
       BoxCase boxCase = (BoxCase)box;

@@ -750,6 +750,10 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.normalize_on_write, ctx, vit, vend);
           } else if (key == "ann") {
             util::from_json<V>(value.ann, ctx, vit, vend);
+          } else if (key == "ignore_malformed") {
+            util::from_json<V>(value.ignore_malformed, ctx, vit, vend);
+          } else if (key == "ignore_z_value") {
+            util::from_json<V>(value.ignore_z_value, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
@@ -916,6 +920,10 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::GeoBoxQuery>);
           } else if (key == "geo_distance") {
             arm(std::in_place_type<api::GeoDistanceQuery>);
+          } else if (key == "geo_nearest") {
+            arm(std::in_place_type<api::GeoNearestQuery>);
+          } else if (key == "distance_feature") {
+            arm(std::in_place_type<api::DistanceFeatureQuery>);
           } else if (key == "boost") {
             arm(std::in_place_type<api::BoostQuery>);
           } else if (key == "rescore") {

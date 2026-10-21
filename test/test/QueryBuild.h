@@ -169,6 +169,31 @@ inline api::Query geoDistance(std::pmr::memory_resource& mr,
   return q;
 }
 
+inline api::Query geoNearest(std::pmr::memory_resource& mr,
+                             std::string_view field, double lat, double lon,
+                             int32_t k, std::optional<double> maxMeters) {
+  api::Query q;
+  auto& g = q.kind.emplace<api::GeoNearestQuery>();
+  g.field = build::arenaStr(mr, field);
+  g.lat = lat;
+  g.lon = lon;
+  g.k = k;
+  g.max_distance_meters = maxMeters;
+  return q;
+}
+
+inline api::Query distanceFeature(std::pmr::memory_resource& mr,
+                                  std::string_view field, double lat, double lon,
+                                  double pivotMeters) {
+  api::Query q;
+  auto& d = q.kind.emplace<api::DistanceFeatureQuery>();
+  d.field = build::arenaStr(mr, field);
+  d.lat = lat;
+  d.lon = lon;
+  d.pivot_meters = pivotMeters;
+  return q;
+}
+
 inline api::Query fuzzy(std::pmr::memory_resource& mr, std::string_view field,
                         std::string_view term, int maxEdits = -1, int prefixLength = -1,
                         int maxExpansions = 0) {

@@ -18,7 +18,7 @@ Choose a type based on how you want to search and use the values:
 | `double` | 64-bit floating-point number for greater precision than `float`. |
 | `date` | Timestamp with millisecond precision, supplied as ISO-8601 text or epoch milliseconds. Supports date queries, ranges, and calendar facets. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
-| `geo_point` | Geographic location supplied as `[longitude, latitude]`, for distance and bounding-box queries. See [Geo search](geo-search.md). |
+| `geo_point` | Geographic location supplied as `[longitude, latitude]`, an object, a string, or a geohash, for distance and bounding-box queries. See [Geo search](geo-search.md). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
 
 ### `text` versus `string`
@@ -123,6 +123,7 @@ The built-in templates are:
 | `_f`, `_fs` | Float column, single- or multi-valued. |
 | `_d`, `_ds` | Double column, single- or multi-valued. |
 | `_dt`, `_dts` | Date column, single- or multi-valued. |
+| `_p`, `_ps` | Geo point column with a points index (`index: "range"`), single- or multi-valued. |
 | `_t` | Unicode-word text with NFKC case folding, accent folding, English possessive removal, and KStem English stemming. The general-purpose text field. |
 | `_u` | Unicode-word text, case- and accent-sensitive. |
 | `_un` | Unicode-word text with NFKC case folding; accents preserved, no stemming. |
@@ -136,7 +137,8 @@ Text fields are **stored** in the default compressed **stored_resource**.
 Numeric suffixes are column-backed but do not build a points index by default;
 range and exact-match queries still work by quickly scanning the column. Define a
 concrete field with `index: "range"` when those operations need a points index.
-There is no default geo suffix; define geo fields explicitly.
+The geo suffixes `_p` and `_ps` build one by default, because geo queries are
+their only use.
 
 ## Field templates for dynamic fields
 
@@ -279,6 +281,7 @@ publication advances the schema generation.
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
+| `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. Both default to `false`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
 | `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
 
 For PQ, positive `ann.pq.m` requires positive effective (inherited) `dims`
@@ -789,5 +792,3 @@ Removing and reusing a name does not erase its old indexed values.
   or facet on whole values.
 - `english_possessive` and `kstem` are analyzer filters only; STRING
   normalizers accept `lowercase`, `nfkc_cf`, and `fold`.
-- There is no default geo suffix; geo fields need an explicit definition (see
-  [Geo search](geo-search.md)).

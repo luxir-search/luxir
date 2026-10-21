@@ -14,6 +14,7 @@
 
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/NumericUtils.h"
+#include "luxir/util/geo.h"
 #include "luxir/value/AggregateExpr.h"
 
 namespace luxir {
@@ -151,6 +152,12 @@ ResolvedValue countResolve(std::span<const ResolvedValue> args) {
   return {ValueType::INT64, ValueNature::NUMBER};
 }
 
+ResolvedValue geoDistanceResolve(std::span<const ResolvedValue> args) {
+  requireNumeric(args);
+  return {valueArray(args[0].type) ? ValueType::DOUBLE_ARRAY : ValueType::DOUBLE,
+          ValueNature::NUMBER};
+}
+
 [[noreturn]] void runtimeInvalid(const ValueNode& node, int32_t docid,
                                  std::string_view reason) {
   throw ValueEvaluationError(fmt::format(
@@ -231,15 +238,7 @@ ScalarKernelValue<Int> evalUnaryKernel(
       case ValueOpcode::LOG: output = std::log(value); break;
       case ValueOpcode::LOG1P: output = std::log1p(value); break;
       case ValueOpcode::FLOOR: output = std::floor(value); break;
-      case ValueOpcode::NONE:
-      case ValueOpcode::DEF:
-      case ValueOpcode::ADD:
-      case ValueOpcode::SUB:
-      case ValueOpcode::MUL:
-      case ValueOpcode::DIV:
-      case ValueOpcode::MIN:
-      case ValueOpcode::MAX:
-      case ValueOpcode::AVG:
+      default:
         throw std::logic_error("invalid unary ValueExpr opcode");
     }
     if (!std::isfinite(output)
@@ -259,19 +258,7 @@ ScalarKernelValue<Int> evalUnaryKernel(
       if (input.intValue >= 0) return integerKernelValue(input.intValue);
       overflow = __builtin_sub_overflow((Int)0, input.intValue, &output);
       break;
-    case ValueOpcode::NONE:
-    case ValueOpcode::DEF:
-    case ValueOpcode::ADD:
-    case ValueOpcode::SUB:
-    case ValueOpcode::MUL:
-    case ValueOpcode::DIV:
-    case ValueOpcode::SQRT:
-    case ValueOpcode::LOG:
-    case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
-    case ValueOpcode::MIN:
-    case ValueOpcode::MAX:
-    case ValueOpcode::AVG:
+    default:
       throw std::logic_error("invalid integer unary ValueExpr opcode");
   }
   return overflow
@@ -296,15 +283,7 @@ ScalarKernelValue<Int> evalBinaryKernel(
       case ValueOpcode::DIV: output = a / b; break;
       case ValueOpcode::MIN: output = std::min(a, b); break;
       case ValueOpcode::MAX: output = std::max(a, b); break;
-      case ValueOpcode::NONE:
-      case ValueOpcode::DEF:
-      case ValueOpcode::NEG:
-      case ValueOpcode::ABS:
-      case ValueOpcode::SQRT:
-      case ValueOpcode::LOG:
-      case ValueOpcode::LOG1P:
-      case ValueOpcode::FLOOR:
-      case ValueOpcode::AVG:
+      default:
         throw std::logic_error("invalid binary ValueExpr opcode");
     }
     if (!std::isfinite(output)
@@ -335,16 +314,7 @@ ScalarKernelValue<Int> evalBinaryKernel(
     case ValueOpcode::MAX:
       output = std::max(left.intValue, right.intValue);
       break;
-    case ValueOpcode::NONE:
-    case ValueOpcode::DEF:
-    case ValueOpcode::DIV:
-    case ValueOpcode::NEG:
-    case ValueOpcode::ABS:
-    case ValueOpcode::SQRT:
-    case ValueOpcode::LOG:
-    case ValueOpcode::LOG1P:
-    case ValueOpcode::FLOOR:
-    case ValueOpcode::AVG:
+    default:
       throw std::logic_error("invalid integer binary ValueExpr opcode");
   }
   return overflow
@@ -573,6 +543,37 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
                                    docid, score, size);
   }
   return evalBinaryScalar(node, first, second, docid);
+}
+
+double constantNumber(const ValueNode& node) {
+  return node.type == ValueType::DOUBLE ? node.doubleValue : (double)node.intValue;
+}
+
+double geoMeters(BoundValueProgram& program, const ValueNode& node, int64_t packed) {
+  const auto& nodes = program.program.nodes;
+  return geo::haversinMeters(
+      constantNumber(nodes[node.children[1]]), constantNumber(nodes[node.children[2]]),
+      geo::decodeLatitude(geo::unpackLatitude(packed)),
+      geo::decodeLongitude(geo::unpackLongitude(packed)));
+}
+
+ValueResult evalGeoDistancePoint(BoundValueProgram& program, const ValueNode& node,
+                                 int32_t docid, float score) {
+  ValueResult point = program.evalNode(node.children[0], docid, score);
+  if (!point.valid) return ValueResult::missing(node.type);
+  if (valueArray(point.type)) {
+    return ValueResult::arrayValue(node.type, (uint32_t)(&node - program.program.nodes.data()),
+                                   docid, score, point.array.size);
+  }
+  return ValueResult::floating(geoMeters(program, node, point.intValue));
+}
+
+ValueResult evalGeoDistanceElement(BoundValueProgram& program, const ValueNode& node,
+                                   const ValueArrayRef& array, int64_t index) {
+  ValueResult points = program.evalNode(node.children[0], array.docid, array.score);
+  ValueResult point = program.evalArrayElement(points.array, index);
+  if (!point.valid) return ValueResult::missing(ValueType::DOUBLE);
+  return ValueResult::floating(geoMeters(program, node, point.intValue));
 }
 
 void evalFunctionBatch(BoundValueProgram& program, const ValueNode& node,
@@ -932,6 +933,17 @@ ValueBounds countBounds(const ValueNode& node,
   return out;
 }
 
+ValueBounds geoDistanceBounds(const ValueNode& node, std::span<const ValueBounds> args) {
+  if (invalid(args[0])) return retag(args[0], node.type);
+  if (args[0].alwaysMissing) return ValueBounds::unbounded(node.type, true, true);
+  ValueBounds out = ValueBounds::floating(
+      0.0, geo::EARTH_MEAN_RADIUS_METERS * 2.0 * std::asin(1.0), args[0].mayBeMissing);
+  out.type = node.type;
+  out.minAttained = false;
+  out.maxAttained = false;
+  return out;
+}
+
 constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::DEF, "def", defResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2, nullptr},
@@ -977,6 +989,8 @@ constexpr ValueFunction FUNCTIONS[] = {
      sumBounds, evalSumElement, 1, 1, nullptr},
     {ValueOpcode::NONE, "count", countResolve, evalCountPoint,
      evalFunctionBatch, countBounds, evalCountElement, 1, 1, nullptr},
+    {ValueOpcode::GEO_DISTANCE, "geo_distance", geoDistanceResolve, evalGeoDistancePoint,
+     evalFunctionBatch, geoDistanceBounds, evalGeoDistanceElement, 3, 3, nullptr},
 };
 
 ValueBounds constantBounds(const ValueProgram& program, uint32_t index) {
@@ -1181,7 +1195,7 @@ void BoundValueProgram::propagateBounds(const ValueBounds& scoreBounds) {
       bound.bounds = scoreBounds;
       bound.bounds.type = ValueType::DOUBLE;
     } else if (node.kind == ValueNodeKind::FUNCTION) {
-      std::array<ValueBounds, 2> children{};
+      std::array<ValueBounds, VALUE_MAX_ARITY> children{};
       for (uint8_t child = 0; child < node.childCount; child++) {
         children[child] = nodes[node.children[child]].bounds;
       }
