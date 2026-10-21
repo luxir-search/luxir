@@ -12,6 +12,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <cstddef>
 #include <span>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -1091,6 +1092,40 @@ FieldType* Schema::physical(std::string_view name) const {
   auto* type = findPhysical(name);
   if (!type) throw RequestError("Physical field not found: " + std::string(name), "unknown_field");
   return type->get();
+}
+
+std::vector<std::string> Schema::searchableFields(
+    std::span<const std::string_view> physicalNames) const {
+  std::set<std::string_view> roots;
+  auto addRoot = [&](std::string_view name) {
+    if (name.empty() || name[0] == '_') return;
+    roots.insert(name.substr(0, name.rfind("__")));
+  };
+  for (const auto& [name, type] : fieldTypeMap) addRoot(name);
+  for (auto name : physicalNames) addRoot(name);
+  auto termTarget = [](FieldType& type) {
+    return type.indexed() && (type.type() == FieldType::TEXT
+        || type.type() == FieldType::STRING || type.type() == FieldType::ID);
+  };
+  std::vector<std::string> names;
+  for (auto root : roots) {
+    ResolvedFieldHandle target;
+    try {
+      if (!getFieldTypePtr(root)) continue;
+      target = resolveFor(root, OpClass::SEARCH);
+    } catch (const RequestError&) {
+      // A schema edit can retire an old dynamic root or make it too long.
+      continue;
+    }
+    if (termTarget(*target.fieldType)) names.emplace_back(root);
+    if (target.owner) {
+      for (const auto& [label, type] : target.owner->variants) {
+        if (termTarget(*type)) names.push_back(std::string(root) + "__" + label);
+      }
+    }
+  }
+  std::sort(names.begin(), names.end());
+  return names;
 }
 
 void Schema::toProto(luxir::api::SchemaDef* def, std::pmr::memory_resource& arena) const {

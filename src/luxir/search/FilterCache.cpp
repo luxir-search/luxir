@@ -223,17 +223,25 @@ void FilterCache::Use::pinValue(
   if (value == nullptr || segmentOrd >= requestSlotCount) return;
   auto& requestSlot = requestSlots[segmentOrd];
   std::lock_guard<std::mutex> lock(requestSlot.mutex);
+  bool alreadyPinned = requestSlot.firstPin == value
+      || std::ranges::find(requestSlot.pins, value) != requestSlot.pins.end();
+  // Everything that can throw precedes publishing raw: a throw here may
+  // release the only owner of the value.
+  if (!alreadyPinned) {
+    if (requestSlot.firstPin != nullptr) {
+      requestSlot.pins.reserve(requestSlot.pins.size() + 1);
+    }
+    if (requestOwned) {
+      requestSlot.requestOwnedPins.reserve(requestSlot.requestOwnedPins.size() + 1);
+      requestSlot.chargeRouted(value->ramBytesUsed());
+      requestSlot.requestOwnedPins.push_back(value);
+    }
+  }
   if (requestSlot.raw == nullptr) {
     requestSlot.raw = value->docSet();
     requestSlot.rawOwned = false;
   }
-  bool alreadyPinned = requestSlot.firstPin == value
-      || std::ranges::find(requestSlot.pins, value) != requestSlot.pins.end();
   if (!alreadyPinned) {
-    if (requestOwned) {
-      requestSlot.chargeRouted(value->ramBytesUsed());
-      requestSlot.requestOwnedPins.push_back(value);
-    }
     if (requestSlot.firstPin == nullptr) {
       requestSlot.firstPin = std::move(value);
     } else {

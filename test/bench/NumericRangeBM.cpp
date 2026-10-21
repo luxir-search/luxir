@@ -3,6 +3,7 @@
 
 #include <benchmark/benchmark.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
@@ -249,6 +250,103 @@ void BM_NumericRangePointsSize(benchmark::State& state, FieldShape shape) {
   state.counters["points"] = (double)points;
 }
 
+// Arrival-ordered timestamps have a useful linear fit; shuffled copies make
+// blocks cross throughout the column, exposing planning cost when SCAN wins.
+class TimestampBenchIndex {
+  TestIndex index;
+  int32_t numDocs;
+
+public:
+  static constexpr std::string_view SORTED_FIELD = "range_time_sorted_i";
+  static constexpr std::string_view SHUFFLED_FIELD = "range_time_shuffled_i";
+  static constexpr int64_t START = 1'700'000'000'000;
+  static constexpr int64_t STEP = 10;
+  static constexpr int64_t JITTER = 100;
+
+  TimestampBenchIndex()
+      : numDocs(luxir::unit_tests
+            ? (int32_t)LuxirTest::scaleTestWork(20'480)
+            : 1'024'000) {
+    std::vector<int64_t> values((size_t)numDocs);
+    std::vector<int32_t> shuffled((size_t)numDocs);
+    SplitMix64 rng(0x7135);
+    for (int32_t doc = 0; doc < numDocs; doc++) {
+      values[(size_t)doc] = START + (int64_t)doc * STEP + (int64_t)rng.rint(JITTER);
+    }
+    std::iota(shuffled.begin(), shuffled.end(), 0);
+    for (int32_t doc = numDocs - 1; doc > 0; doc--) {
+      std::swap(shuffled[(size_t)doc], shuffled[(size_t)rng.rint(doc + 1)]);
+    }
+    Inverter& inverter = index.getInverter();
+    auto& sortedField = inverter.getIndexHandler(SORTED_FIELD);
+    auto& shuffledField = inverter.getIndexHandler(SHUFFLED_FIELD);
+    for (int32_t doc = 0; doc < numDocs; doc++) {
+      inverter.startDoc();
+      sortedField.index(inverter, values[(size_t)doc]);
+      shuffledField.index(inverter, values[(size_t)shuffled[(size_t)doc]]);
+      inverter.finishDoc();
+    }
+    index.flush();
+    index.initReader();
+  }
+
+  TestIndex& getIndex() { return index; }
+  int32_t docCount() const { return numDocs; }
+};
+
+TimestampBenchIndex& timestampIndex() {
+  static TimestampBenchIndex fixture;
+  return fixture;
+}
+
+// state.range(0) disjoint ranges tile the middle half of the value domain.
+void BM_NumericRangeTimestamp(benchmark::State& state, bool shuffled, BenchArm arm) {
+  auto& fixture = timestampIndex();
+  std::string_view field = shuffled ? TimestampBenchIndex::SHUFFLED_FIELD
+                                    : TimestampBenchIndex::SORTED_FIELD;
+  int32_t ranges = (int32_t)state.range(0);
+  int64_t width = std::max<int64_t>(
+      1, (int64_t)fixture.docCount() / 2 / ranges);
+  int64_t first = TimestampBenchIndex::START
+      + (int64_t)fixture.docCount() / 4 * TimestampBenchIndex::STEP;
+  auto run = [&](BenchArm runArm, bool checkScan = false) {
+    MemPool pool;
+    Query::Context context(pool, *fixture.getIndex().reader);
+    auto& segment = fixture.getIndex().reader->segments()[0];
+    int64_t count = 0;
+    for (int32_t i = 0; i < ranges; i++) {
+      int64_t lo = first + i * width * TimestampBenchIndex::STEP;
+      int64_t hi = lo + width * TimestampBenchIndex::STEP - 1;
+      NumericPredicateQuery query(field, lo, hi);
+      auto* weight = static_cast<NumericPredicateQuery::Weight*>(
+          query.createWeight(context, 0));
+      auto* scorer = createScorer(*weight, pool, segment, runArm);
+      if (checkScan && dynamic_cast<
+              NumericPredicateQuery::PredicateScorer<IntColReader::Iterator>*>(scorer) == nullptr) {
+        state.SkipWithError("shuffled timestamp range did not select SCAN");
+        return (int64_t)-1;
+      }
+      count += countMatches(scorer);
+    }
+    return count;
+  };
+  int64_t baseline = run(FULLSCAN_FORCED);
+  if (shuffled && run(SELECTED, true) != baseline) {
+    state.SkipWithError("shuffled timestamp selected arm differs from full scan");
+    return;
+  }
+  for (auto _ : state) {
+    int64_t count = run(arm);
+    benchmark::DoNotOptimize(count);
+    if (count != baseline) {
+      state.SkipWithError("timestamp range arm differs from full scan");
+      break;
+    }
+  }
+  state.counters["docs"] = fixture.docCount();
+  state.counters["matches"] = (double)baseline;
+}
+
 benchmark::Benchmark* registerTimingBenchmark(FieldShape shape, BenchArm arm) {
   const FieldSpec& field = FIELDS[(size_t)shape];
   std::string name = "BM_NumericRangePoints/" + std::string(field.label)
@@ -281,6 +379,17 @@ benchmark::Benchmark* registerSizeBenchmark(FieldShape shape) {
     registerTimingBenchmark(shape, FULLSCAN_FORCED);
     registerTimingBenchmark(shape, SELECTED);
     registerSizeBenchmark(shape);
+  }
+  for (bool shuffled : {false, true}) {
+    for (BenchArm arm : {ZONE_FORCED, FULLSCAN_FORCED, SELECTED}) {
+      if (shuffled && arm == ZONE_FORCED) continue;
+      std::string name = shuffled ? "BM_NumericRangeTimeShuffled/"
+                                  : "BM_NumericRangeTimeSorted/";
+      name += armName(arm);
+      benchmark::RegisterBenchmark(name, [shuffled, arm](benchmark::State& state) {
+        BM_NumericRangeTimestamp(state, shuffled, arm);
+      })->ArgName("ranges")->Arg(1)->Arg(16)->Arg(256)->UseRealTime();
+    }
   }
   return true;
 }();

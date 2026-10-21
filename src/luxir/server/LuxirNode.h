@@ -151,7 +151,7 @@ private:
   // Query work.  Workers: server.workers (resolveWorkers(); at least
   // one, since an arena of only reserved slots never serves enqueued tasks).
   // Plus a reserved slot per thread that enters from outside (each configured
-  // HTTP shard and gRPC thread, and the embedding thread), so an execute()
+  // HTTP shard and the embedding thread; gRPC threads only enqueue), so an execute()
   // from a transport thread always finds a free slot instead of handing its
   // functor to the arena and blocking behind arena backlog.  Reserved slots
   // are seats, not threads: they add no workers.  Workers that run out of

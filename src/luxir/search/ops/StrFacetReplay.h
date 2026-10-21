@@ -157,7 +157,8 @@ public:
     Selected selected;
     selected.reserve(buckets.size());
     for (const auto& bucket : buckets) {
-      assert(bucket.id.has_value());
+      // A pinned value absent from the index has no ord: nothing routes to it.
+      if (!bucket.id.has_value()) continue;
       selected.emplace_back(bucket.id->value, bucket.owner.value);
     }
     std::sort(selected.begin(), selected.end());

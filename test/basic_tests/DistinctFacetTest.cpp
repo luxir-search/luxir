@@ -226,7 +226,7 @@ TEST_F(DistinctFacetTest, inheritedOverridesNearestCollapseAndChildLists) {
       flatdoc("id", "2", "key_s", "b", "color_s", "red", "size_s", "M", "price_i", 90)}, UpdateMessage::COMMIT);
   for (int32_t parallel : {1, -1}) {
     auto request = run("main", R"json("limit":0,"collapse":"key_s","ops":{
-        "child":{"top_docs":{"limit":1,"get_number":true,"ops":{"c":{"field_facet":{"field":"color_s"}}}}},
+        "child":{"top_docs":{"limit":1,"count_limit":-1,"ops":{"c":{"field_facet":{"field":"color_s"}}}}},
         "nearest":{"top_docs":{"limit":0,"collapse":"id","ops":{"c":{"field_facet":{"field":"color_s"}}}}},
         "color":{"field_facet":{"field":"color_s","count_unit":"docs","ops":{
             "docs":{"field_facet":{"field":"color_s"}},
@@ -247,7 +247,7 @@ TEST_F(DistinctFacetTest, inheritedOverridesNearestCollapseAndChildLists) {
     EXPECT_DOUBLE_EQ(40, std::get<api::ArrVal>(color.ops.at("avg")->kind).v[0].asDouble());
     auto groupedMetric = run("main", R"json("limit":0,"collapse":"key_s","ops":{
         "c":{"field_facet":{"field":"color_s","ops":{"avg":"avg(price_i)",
-            "members":{"top_docs":{"limit":1,"get_number":true,"ops":{
+            "members":{"top_docs":{"limit":1,"count_limit":-1,"ops":{
                 "c":{"field_facet":{"field":"color_s"}}}}}}}}})json", parallel);
     const auto& facet = *groupedMetric->docList()->ops.at("c")->facetResult();
     EXPECT_EQ(2, facet.counts[0]);

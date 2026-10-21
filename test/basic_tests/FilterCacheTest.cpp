@@ -427,7 +427,7 @@ CachedSearchResult runCachedSearch(LuxirNode& node, std::string_view collection,
       .matchQuery("body_w", "body")
       .matchFilter("filter_w", filter)
       .fields({"id"})
-      .getNumber()
+      .countLimit()
       .limit(-1);
   request->execute();
   EXPECT_TRUE(request->ok()) << request->toString();
@@ -462,7 +462,7 @@ CachedSearchResult runKnnFilter(
                      .topDocs("q")
                      .allQuery()
                      .fields({"id"})
-                     .getNumber()
+                     .countLimit()
                      .limit(-1);
   addFilter(cursor, luxir::test::qb::knn(
       cursor.mr(), "embedding_v", queryVector, k, nprobe, exact,
@@ -1363,6 +1363,33 @@ TEST(FilterCacheTest, routedAccountingOwnsRejectedSegmentValue) {
         0, claim, docs(100, {3, 7}), 1);
     EXPECT_EQ(value->ramBytesUsed(), tracker.bytes());
     EXPECT_EQ(0u, cache.bytesUsed());
+  }
+  EXPECT_EQ(0u, tracker.bytes());
+}
+
+TEST(FilterCacheTest, rejectedChargeOfRejectedPublishLeavesNoRawValue) {
+  FilterCacheConfig config = testConfig();
+  config.admissionThreshold = 1;
+  FilterCache cache(config);
+  std::array oldSegments{FilterCache::SegmentIdentity{1, 100}};
+  cache.onReaderPublished(4, oldSegments);
+  RequestMemTracker tracker(1);
+
+  {
+    FilterCache::UseRegistry request(cache, 4, oldSegments);
+    auto* use = request.get(FilterKey("routed-over-limit"));
+    use->enableRoutedAccounting(0, tracker, "segment 0");
+    {
+      // As in a request, unwinding releases the build claim.
+      auto claim = use->probe(0);
+      ASSERT_EQ(FilterCache::Probe::Kind::BUILD, claim.kind());
+      std::array newSegments{FilterCache::SegmentIdentity{2, 100}};
+      cache.onReaderPublished(5, newSegments);
+      EXPECT_ANY_THROW(use->publishRaw(0, claim, docs(100, {3, 7}), 1));
+    }
+    // The only owner of the rejected value unwound with the throw.
+    EXPECT_EQ(nullptr, use->rawDocSet(0));
+    EXPECT_NE(FilterCache::Probe::Kind::HIT, use->probe(0).kind());
   }
   EXPECT_EQ(0u, tracker.bytes());
 }
@@ -3244,7 +3271,7 @@ ExactFilteredConjResult runExactFilteredConj(
   auto request = luxir::test::localReq(node.getSearchEngine());
   request->collection(collection);
   auto& cursor = request->topDocs("q");
-  cursor.getNumber().withStats().fields({"id"}).limit(100);
+  cursor.countLimit().withStats().fields({"id"}).limit(100);
   switch (shape) {
     case ExactFilteredConjShape::THREE_TERMS:
       cursor.rawQuery() = luxir::test::qb::boolean(
@@ -4840,7 +4867,7 @@ TEST(FilterCacheIntegrationTest, cachedAndOffMatchAcrossDeleteAndFlush) {
       .topDocs("registry")
       .matchQuery("body_w", "body")
       .matchFilter("filter_w", "keep")
-      .getNumber()
+      .countLimit()
       .limit(0);
   registryRequest->execute();
   ASSERT_TRUE(registryRequest->ok()) << registryRequest->toString();
@@ -4981,7 +5008,7 @@ TEST(FilterCacheIntegrationTest, membershipProjectionCachesScoreOnlyAndMembershi
                        .topDocs("q")
                        .allQuery()
                        .fields({"id"})
-                       .getNumber()
+                       .countLimit()
                        .limit(-1);
     auto term = luxir::test::qb::match(cursor.mr(), "filter_w", "keep");
     auto knn = luxir::test::qb::knn(cursor.mr(), "embedding_v",
@@ -5156,7 +5183,7 @@ TEST(FilterCacheIntegrationTest, cacheFirstKnnCountOmitsWeightAndPrepare) {
   auto run = [&]() {
     auto request = luxir::test::localReq(node.getSearchEngine());
     auto& cursor = request->collection(collection)
-                       .topDocs("q").getNumber().limit(0);
+                       .topDocs("q").countLimit().limit(0);
     cursor.rawQuery() = luxir::test::qb::knn(
         cursor.mr(), "embedding_v", queryVector, 4, 0,
         /*exact=*/true);
@@ -5214,7 +5241,7 @@ TEST(FilterCacheIntegrationTest,
     auto request = luxir::test::localReq(node.getSearchEngine());
     auto& root = request->collection(collection)
                      .topDocs("root").allQuery().limit(0);
-    auto& nested = root.topDocs("near").getNumber().limit(0);
+    auto& nested = root.topDocs("near").countLimit().limit(0);
     nested.rawQuery() = luxir::test::qb::knn(
         nested.mr(), "embedding_v", queryVector, 4, 0,
         /*exact=*/true);
@@ -5519,7 +5546,7 @@ TEST(FilterCacheIntegrationTest, multiSelectFacetExactDomainWarmsSources) {
                     .matchQuery("body_w", "body")
                     .matchFilter("filter_w", "keep")
                     .matchFilter("group_s", "a")
-                    .getNumber()
+                    .countLimit()
                     .limit(0);
     top.facet("groups", "group_s").limit(-1);
     FilterFoldGuard passive(true);
@@ -5796,7 +5823,7 @@ TEST(FilterCacheIntegrationTest, unroundedNowRangeSkipsAdmission) {
     forcedDateMathNowEpochMillis = now;
     auto request = luxir::test::localReq(node.getSearchEngine());
     auto& cursor = request->collection(collection)
-                       .topDocs("q").allQuery().getNumber().limit(0);
+                       .topDocs("q").allQuery().countLimit().limit(0);
     addFilter(cursor, luxir::test::qb::range(
         cursor.mr(), "when_dt", luxir::test::qb::valStr(cursor.mr(), gte),
         nullptr, luxir::test::qb::valStr(cursor.mr(), lte), nullptr));
@@ -6107,7 +6134,7 @@ SearchResult runSearch(SearchEngine& engine, std::string_view collection,
                      .topDocs("q")
                      .allQuery()
                      .fields({"id"})
-                     .getNumber()
+                     .countLimit()
                      .limit(DOC_UNIVERSE + 1);
   if (filter.has_value()) {
     addConcurrencyFilter(cursor, buildFilter(*filter, cursor.mr()));
@@ -6123,7 +6150,7 @@ SearchResult runSearch(SearchEngine& engine, std::string_view collection,
   result.count = request->getMatchCount("q");
   if (result.count != (int64_t)docs.size()) {
     std::ostringstream out;
-    out << "count oracle: get_number=" << result.count
+    out << "count oracle: count_limit=" << result.count
         << " returned=" << docs.size();
     if (filter.has_value()) out << " filter=" << filterName(*filter);
     result.error = out.str();

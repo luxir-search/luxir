@@ -339,7 +339,7 @@ TEST_P(CountShortcutTest, topDocsResolvesPointsBeforeFilterCache) {
       CountStats stats;
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
-      auto& op = req->topDocs("q").limit(0).getNumber();
+      auto& op = req->topDocs("q").limit(0).countLimit();
       auto query = qb::range(op.mr(), "number", qb::valI64(op.mr(), -10), nullptr,
                              qb::valI64(op.mr(), 10), nullptr);
       if (shape == 2) {
@@ -371,7 +371,7 @@ TEST_P(CountShortcutTest, topDocsKeepsNumericCountExecutor) {
     CountStats stats;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& op = req->topDocs("q").limit(0).getNumber();
+    auto& op = req->topDocs("q").limit(0).countLimit();
     op.rawQuery() = qb::range(op.mr(), field, qb::valI64(op.mr(), -10), nullptr,
                               qb::valI64(op.mr(), 10), nullptr);
     req->execute(false);
@@ -407,7 +407,7 @@ TEST_P(CountShortcutTest, geoWholeCountsKeepCacheRouting) {
       CountStats stats;
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
-      auto& op = req->topDocs("q").limit(0).getNumber();
+      auto& op = req->topDocs("q").limit(0).countLimit();
       auto query = qb::geoBox(op.mr(), "geo", -bound, bound, -20, 20);
       if (filtered) op.allQuery().filter(query);
       else op.rawQuery() = query;
@@ -456,7 +456,7 @@ TEST_P(CountShortcutTest, pointsEmptyDisjunctionUsesWholeCacheRouting) {
     CountStats stats;
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& op = req->topDocs("q").limit(0).getNumber();
+    auto& op = req->topDocs("q").limit(0).countLimit();
     op.rawQuery() = qb::boolean(op.mr(), {},
         {qb::match(op.mr(), "body_w", "alpha"),
          qb::range(op.mr(), "number", qb::valI64(op.mr(), 0), nullptr,
@@ -589,7 +589,7 @@ TEST_P(CountShortcutTest, topDocsCountsMatchIterationAcrossDeletes) {
       CountStats stats;
       auto req = localReq(luxirNode->getSearchEngine());
       req->collection("main");
-      auto& op = req->topDocs("q").limit(0).getNumber();
+      auto& op = req->topDocs("q").limit(0).countLimit();
       AllQuery all;
       TermQuery term("body_w", "alpha");
       ExistsQuery exists("number");

@@ -67,7 +67,8 @@ public:
     out.appendKind(kind);
     out.appendByte((uint8_t)automatonKind);
     out.appendString(field);
-    out.appendTerm(pattern);
+    // A general pattern is not fitted to the term length a one-byte prefix holds.
+    out.appendString(pattern);
     unused(ctx);
     return FilterKeyScope::SEGMENT_STABLE;
   }

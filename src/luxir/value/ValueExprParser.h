@@ -312,6 +312,7 @@ private:
     node.kind = ValueNodeKind::COLUMN;
     node.columnType = field->type();
     node.columnMultiValued = field->multiValued();
+    node.columnIndexed = field->indexed();
     if (!numeric) {
       node.type = ValueType::COLUMN_ONLY;
     } else {

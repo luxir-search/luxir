@@ -3,7 +3,9 @@
 
 #include "luxir/query/ProtobufQueryParser.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <format>
 #include <limits>
 #include <stdexcept>
@@ -19,6 +21,7 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/ExprParser.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
@@ -30,6 +33,7 @@
 #include "luxir/query/SimpleQueryParser.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/search/IndexReader.h"
 #include "luxir/util/Overloaded.h"
 #include "luxir/value/ValueExprParser.h"
 
@@ -508,6 +512,78 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
   return pool.make<luxir::MinScoreQuery>(rescored, *rescoreQuery.min_score);
 }
 
+namespace {
+
+QueryBuilder::Operator builderOperator(luxir::api::Match_::Operator op) {
+  return op == luxir::api::Match_::Operator::AND ? QueryBuilder::Operator::AND
+                                                  : QueryBuilder::Operator::OR;
+}
+
+float tieOf(std::optional<float> tie, std::string_view label, float defaultValue) {
+  float value = tie.value_or(defaultValue);
+  if (!std::isfinite(value) || value < 0.0f || value > 1.0f) {
+    throw std::runtime_error(std::format(
+        "{} 'tie' must be finite and in [0, 1] (got {})", label, value));
+  }
+  return value;
+}
+
+} // namespace
+
+luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQuery& query) {
+  using Mode = luxir::api::MultiMatchQuery_::Mode;
+  if (query.min_match < 0) {
+    throw std::runtime_error("multi_match 'min_match' must not be negative");
+  }
+  if (query.phrase) {
+    if (query.mode != Mode::PER_FIELD) {
+      throw std::runtime_error("multi_match 'phrase' requires mode per_field");
+    }
+    if (query.operator_ != api::Match_::Operator::OPERATOR_UNSPECIFIED || query.min_match > 0) {
+      throw std::runtime_error("multi_match 'phrase' cannot be combined with 'operator' or 'min_match'");
+    }
+    if (query.phrase->slop < 0) {
+      throw std::runtime_error("multi_match phrase 'slop' must not be negative");
+    }
+  }
+  float tie = tieOf(query.tie, "multi_match", 1.0f);
+  if (query.fields.empty()) {
+    throw std::runtime_error("multi_match requires a non-empty 'fields' list");
+  }
+  std::vector<QueryBuilder::WeightedField> fields;
+  for (const auto& field : query.fields) {
+    float weight = field.weight.value_or(1.0f);
+    if (field.field.empty()) {
+      throw std::runtime_error("multi_match: empty field name");
+    }
+    if (!std::isfinite(weight) || weight <= 0.0f) {
+      throw std::runtime_error(std::format(
+          "multi_match: weight of field '{}' must be finite and > 0 (got {})",
+          field.field, weight));
+    }
+    fields.push_back({field.field, weight});
+  }
+  QueryBuilder builder(
+      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields, context.reader);
+  auto op = builderOperator(query.operator_);
+  switch (query.mode) {
+    case Mode::COMBINED:
+      return builder.createMultiMatchCombined(fields, query.text, op, query.min_match, tie);
+    case Mode::PER_FIELD:
+      return builder.createMultiMatchPerField(fields, query.text, op, query.min_match, tie,
+          query.phrase ? std::optional<int32_t>(query.phrase->slop) : std::nullopt);
+  }
+  throw std::runtime_error(std::format("multi_match: unknown mode {}", (int)query.mode));
+}
+
+luxir::Query* ProtobufQueryParser::parseDisMax(const luxir::api::DisMaxQuery& query) {
+  if (query.queries.empty()) {
+    throw std::runtime_error("dis_max requires a non-empty 'queries' list");
+  }
+  float tie = tieOf(query.tie, "dis_max", 0.0f);
+  return luxir::DisMaxQuery::make(pool, parseQueryList(query.queries), tie);
+}
+
 luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
   // The one recursion choke point for structured trees: every nested node
   // passes through here, so the shared budget bounds tree depth no matter
@@ -538,6 +614,8 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     [&](const luxir::api::RescoreQuery& r) -> luxir::Query* {
       return parseRescore(r);
     },
+    [&](const luxir::api::MultiMatchQuery& m) -> luxir::Query* { return parseMultiMatch(m); },
+    [&](const luxir::api::DisMaxQuery& d) -> luxir::Query* { return parseDisMax(d); },
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);

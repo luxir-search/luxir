@@ -568,6 +568,11 @@ class SegmentMerger {
   std::vector<Segment> segs;
 public:
 
+  int32_t mapDocId(size_t sourceOrd, int32_t localDocId) const {
+    auto [docId, deleted] = segs[sourceOrd].remapDocId(localDocId);
+    return deleted ? -1 : docId;
+  }
+
 
 
   SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,

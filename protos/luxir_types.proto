@@ -42,10 +42,11 @@ message SearchRequest {
   // Return execution details for instrumented operations; see ExecutionProfile.
   bool profile = 7;
 
-  // Intra-request parallelism: 0 (default) lets the engine choose; 1 runs
-  // serially on the shared executor; -1 permits unlimited parallelism,
-  // starting on the receiving thread with shared workers joining in.
-  // Automatic execution is serial on the receiving thread. Other values
+  // Intra-request parallelism: 0 (default) lets the engine choose, today
+  // serial: over HTTP normally inline on the receiving thread, over gRPC on
+  // the shared executor. 1 runs serially on the shared executor; -1 permits
+  // unlimited parallelism, with shared workers joining in (starting on the
+  // receiving HTTP thread, or on the shared executor over gRPC). Other values
   // are rejected.
   int32 max_parallel = 8;
 
@@ -105,7 +106,7 @@ message Collapse {
   }
   MissingPolicy missing = 2;
   repeated SortSpec head_sort = 3; // Display member order; defaults to the list sort.
-  bool get_number = 4; // Count members of each returned group in the finalized match set.
+  bool get_count = 4; // Count members of each returned group in the finalized match set.
   // Per-group operations on matching members; facet count units start at docs.
   // Explicit group units still resolve to this nearest enclosing collapse.
   map<string, SearchOp> ops = 5;
@@ -135,7 +136,11 @@ message TopDocs {
 
   // Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining.
   optional sint64 limit = 4;
-  bool get_number = 5;          // return the number of matching documents
+  // Match count: unset or 0 omits found; -1 counts exactly; positive N permits
+  // stopping at N with found_gte. An exact count is also valid for N.
+  // Must be >= -1. Ops, collapse, diversify, field sorts, nested lists and
+  // limit 0 retain exact counting.
+  optional sint64 count_limit = 5;
   bool get_scores = 6;          // return the relevancy score for each document returned
 
   // Fields to return for each document.  Empty returns every retrievable field
@@ -159,7 +164,7 @@ message TopDocs {
 
   // Minimum score cut-off. When set, documents whose query score is below
   // this value do not match: they are excluded from the returned documents,
-  // from the get_number count, and from the domain of ops (facets and
+  // from the match count, and from the domain of ops (facets and
   // metrics). The score compared is the query's own relevance score (filters
   // do not score), computed even when the request sorts by fields or does not
   // return scores. Must be finite. As a Fusion source, the cut-off applies to
@@ -173,13 +178,13 @@ message TopDocs {
 // and merge their results into a single ranked list.
 //
 // Per-source response-shape fields (`fields`, `batch_size`, `offset`,
-// `get_scores`, `get_number`, `document_format`) are ignored - Fusion controls
+// `get_scores`, `count_limit`, `document_format`) are ignored - Fusion controls
 // response shape at the top level. Per-source `ops` are rejected; put facets
 // and metrics in Fusion.ops.
 // Each source's `query`, `sort`, `limit`, and any per-source `filter` are used
 // to produce that source's ranked list. A source collapse accepts only field
 // and missing, and its limit counts groups; the head documents enter document fusion.
-// Source collapse head_sort, sort, get_number and ops are errors.
+// Source collapse head_sort, sort, get_count and ops are errors.
 //
 // The fusion-level `filter` is ANDed with each source's own filters.
 message Fusion {
@@ -206,7 +211,11 @@ message Fusion {
   // Each response DocList.offset is the absolute rank of that batch's first
   // row, or the requested offset for an empty page.
   int64 offset = 4;
-  bool get_number = 5; // eligible groups with collapse, otherwise distinct source-union documents
+  // Match count: unset or 0 omits found; -1 requests exact; positive N permits
+  // a lower bound. Fusion always supplies an exact count, also valid for N.
+  // Counts eligible groups with collapse, otherwise source-union documents.
+  // Must be >= -1.
+  optional sint64 count_limit = 5;
   bool get_scores = 6;
   repeated string fields = 7;   // as TopDocs.fields: empty returns every retrievable field, '*' patterns expand
   int32 batch_size = 8; // same batching rules as TopDocs.batch_size
@@ -289,6 +298,8 @@ message Query {
     WildcardQuery wildcard = 17;    // selects documents by wildcard term match
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
+    MultiMatchQuery multi_match = 20; // one text over several weighted fields
+    DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
   }
 }
 
@@ -371,8 +382,8 @@ message KnnQuery {
 // boolean scalar values; numeric and DATE fields accept string or numeric
 // scalars. Null matches nothing. Arrays and structured values are rejected,
 // and GEO_POINT is unsupported. TEXT values are analyzed and scored; use
-// AnyOfQuery for constant-score value sets and SimpleQuery or ExprQuery for
-// multi-field text.
+// AnyOfQuery for constant-score value sets and MultiMatchQuery, SimpleQuery,
+// or ExprQuery for multi-field text.
 message Match {
   string field = 1;
   Val val = 2;
@@ -391,6 +402,89 @@ message Match {
     OR = 1;                    // a doc matches if any analyzed term matches
     AND = 2;                   // a doc must match every analyzed term
   }
+}
+
+// One search field and its weight. TEXT weights scale term frequency and
+// length in COMBINED; all other weights multiply the field's score.
+// JSON also accepts a bare field name or "name^weight" as shorthand.
+message WeightedField {
+  string field = 1;
+  // Unset = 1. Must be finite and > 0 in every mode.
+  optional float weight = 2;
+}
+
+// Phrase matching options. A present empty message requests an exact phrase.
+message PhraseOptions {
+  // Maximum spread of query-adjusted positions. Must be >= 0; unset = 0.
+  int32 slop = 1;
+}
+
+// Searches one text across weighted fields. In COMBINED mode, TEXT fields
+// sharing an analyzer and long-term policy form a group scored as one field
+// with BM25F. STRING/ID/numeric/date fields form singleton match groups with
+// multiplicative weights. PER_FIELD scores a match in each field separately.
+// Group or field scores combine as best + tie * (sum - best), defaulting to
+// sum (tie = 1). Values that cannot coerce to a field contribute no clause in
+// either mode, including with phrase options; other errors fail the request.
+// If no field contributes, matches nothing. BM25F follows Lucene's
+// CombinedFieldQuery.
+message MultiMatchQuery {
+  string text = 1; // the text to analyze or coerce
+  // Required and non-empty. Fields resolve through their search bindings.
+  // Field order does not matter; duplicate physical targets keep the larger
+  // weight. Names containing '*' select indexed TEXT/STRING/ID search targets
+  // from concrete declarations and dynamic roots present in reader metadata.
+  // Patterns containing '__' select variants; other patterns select roots
+  // through their search binding. Declared fields and variants of known roots
+  // need not be present in the index. Wildcard lists may resolve to at most 64
+  // distinct physical targets, including explicit selectors; exceeding the
+  // limit is an error.
+  repeated WeightedField fields = 2;
+  // Unset = COMBINED.
+  Mode mode = 3;
+
+  // How analyzed terms combine. Unset = OR. COMBINED applies this within
+  // each group (AND: every term in some field of one group). PER_FIELD
+  // applies it within each field (AND: every term in that field). Must be
+  // unset when phrase is present.
+  Match.Operator operator = 4;
+
+  // Zero uses operator. Positive values override operator and are clamped
+  // to the analyzed term count within each group/field. Must be >= 0, and
+  // must be zero when phrase is present.
+  int32 min_match = 5;
+
+  // Combines matching field/group scores as best + tie * (sum - best).
+  // Unset = 1 in every mode. Must be finite and in [0, 1].
+  optional float tie = 6;
+
+  // Absent = match. Present = a phrase per TEXT field (requires indexed
+  // positions); STRING/ID fields match the whole value, and numeric/date
+  // fields still use match coercion. PER_FIELD only; fields combine by tie,
+  // and each weight multiplies its field's score. Operator must be unset
+  // and min_match must be zero.
+  PhraseOptions phrase = 7;
+
+  enum Mode {
+    // TEXT weights scale term frequency and document length at every group
+    // size. Other fields are singleton groups with multiplicative weights.
+    COMBINED = 0;
+    // One match or phrase per field; each weight multiplies its score.
+    PER_FIELD = 1;
+  }
+}
+
+// Matches documents that match any query and combines their matching scores
+// as best + tie * (sum - best), defaulting to the best score (tie = 0).
+// Duplicate queries are kept as separate scoring contributions. A single
+// query scores as itself; tie = 1 is a boolean disjunction. Filter use shares
+// the equivalent boolean's membership and cache key (Elasticsearch dis_max).
+message DisMaxQuery {
+  repeated Query queries = 1;  // required, non-empty
+
+  // Weight of the non-best matching queries. Unset = 0. Must be finite and
+  // in [0, 1]; 1 adds every score like a boolean disjunction.
+  optional float tie = 2;
 }
 
 // Constant-score exact value-set membership using the field's value binding.
@@ -875,11 +969,13 @@ message GroupTable {
 // DocFormat; under COLUMNS an all-missing discovered column is left out of
 // the batch, under ADAPTIVE placement is per batch and field.
 message DocList {
-  // Exact match count when get_number was requested. Counts groups with
+  // Match count when count_limit is nonzero. Counts groups with
   // collapse; otherwise Fusion counts source-union documents before paging.
   optional sint64 found = 1;
-  optional sint64 found_docs = 2; // Collapse only, when get_number was requested, after missing=drop.
-  optional sint64 found_groups = 8; // Diversify only, with get_number: distinct eligible keys.
+  // True when found is a lower bound; false means the count is exact.
+  bool found_gte = 9;
+  optional sint64 found_docs = 2; // Collapse only, when count_limit is nonzero, after missing=drop.
+  optional sint64 found_groups = 8; // Diversify only, with nonzero count_limit: distinct eligible keys.
   GroupTable groups = 7; // Collapse only: complete metadata aligned with this batch's rows.
 
   // Dense columns; each has exactly row_count slots.

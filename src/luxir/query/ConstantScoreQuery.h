@@ -333,6 +333,7 @@ public:
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }
+
   };
 };
 

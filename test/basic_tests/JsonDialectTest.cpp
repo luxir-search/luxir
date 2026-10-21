@@ -179,14 +179,14 @@ TEST(JsonDialect, SearchRequestUnifiedRoot) {
   // shorthand: root TopDocs keys register as ops["q"]; request-level keys mix in
   { P::SearchRequest r;
     ASSERT_TRUE(P::read_json(r,
-        R"({"query":"title_w:dune","limit":5,"max_parallel":-1,"time_zone":"UTC","get_number":true})", mr));
+        R"({"query":"title_w:dune","limit":5,"max_parallel":-1,"time_zone":"UTC","count_limit":-1})", mr));
     EXPECT_TRUE(r.json_shorthand);
     EXPECT_EQ(-1, r.max_parallel);
     EXPECT_EQ("UTC", r.time_zone);
     ASSERT_EQ(1u, r.ops.size());
     const auto& td = std::get<P::TopDocs>((**r.ops.find("q")).kind);
     EXPECT_EQ(5, *td.limit);
-    EXPECT_TRUE(td.get_number);
+    EXPECT_EQ(-1, td.count_limit);
     ASSERT_TRUE(td.query.has_value());
     EXPECT_EQ("title_w:dune", std::get<P::ExprQuery>(td.query->kind).q); }
 
@@ -811,3 +811,86 @@ TEST(JsonDialect, UnknownKeyIsNamed) {
 }
 
 }  // namespace
+
+TEST(JsonDialect, MultiMatchWeightedFields) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::Query sugar, object;
+  ASSERT_TRUE(P::read_json(sugar,
+      R"({"multi_match":{"text":"dune","fields":["title_t^2","body_t"],"mode":"per_field"}})", mr));
+  ASSERT_TRUE(P::read_json(object,
+      R"({"multi_match":{"text":"dune","fields":[{"field":"title_t","weight":2},{"field":"body_t"}],"mode":"per_field"}})", mr));
+  std::string sugarJson, objectJson;
+  ASSERT_TRUE(P::write_json(sugar, sugarJson));
+  ASSERT_TRUE(P::write_json(object, objectJson));
+  EXPECT_EQ(objectJson, sugarJson);
+  EXPECT_NE(std::string::npos, sugarJson.find(R"("fields":[{"field":"title_t","weight":2},{"field":"body_t"}])"));
+  const auto& match = std::get<P::MultiMatchQuery>(sugar.kind);
+  EXPECT_EQ(P::MultiMatchQuery::Mode::PER_FIELD, match.mode);
+  ASSERT_EQ(2u, match.fields.size());
+  ASSERT_TRUE(match.fields[0].weight);
+  EXPECT_FLOAT_EQ(2.0f, *match.fields[0].weight);
+  EXPECT_FALSE(match.fields[1].weight);
+
+  P::WeightedField root;
+  ASSERT_TRUE(P::read_json(root, R"("title_t^2")", mr));
+  EXPECT_EQ("title_t", root.field);
+  ASSERT_TRUE(root.weight);
+  EXPECT_FLOAT_EQ(2.0f, *root.weight);
+  for (auto shorthand : {"a^", "a^x", "a^1^2", "^2"}) {
+    P::WeightedField field;
+    EXPECT_FALSE(P::read_json(field, std::string("\"") + shorthand + "\"", mr)) << shorthand;
+  }
+  std::string error;
+  EXPECT_FALSE(P::read_json(object, R"({"combined_fields":{}})", mr, &error));
+  EXPECT_NE(std::string::npos, error.find("unknown_key")) << error;
+  EXPECT_NE(std::string::npos, error.find("combined_fields")) << error;
+  EXPECT_FALSE(P::read_json(object, R"({"multi_match":{"query":"dune"}})", mr));
+  EXPECT_FALSE(P::read_json(object, R"({"multi_match":{"type":"cross_fields"}})", mr));
+  EXPECT_FALSE(P::read_json(object, R"({"multi_match":{"mode":"best_fields"}})", mr));
+}
+
+TEST(JsonDialect, MultiFieldTieName) {
+  std::pmr::monotonic_buffer_resource mr;
+  for (std::string json : {
+           R"({"multi_match":{"text":"dune","fields":["title_t"],"tie":0.25}})",
+           R"({"dis_max":{"queries":[{"all":true}],"tie":0.25}})"}) {
+    P::Query query;
+    ASSERT_TRUE(P::read_json(query, json, mr));
+    std::string out;
+    ASSERT_TRUE(P::write_json(query, out));
+    EXPECT_NE(std::string::npos, out.find(R"("tie":0.25)")) << out;
+
+    json.replace(json.find(R"("tie")"), 5, R"("tie_breaker")");
+    std::string error;
+    EXPECT_FALSE(P::read_json(query, json, mr, &error));
+    EXPECT_NE(std::string::npos, error.find("unknown_key")) << error;
+    EXPECT_NE(std::string::npos, error.find("tie_breaker")) << error;
+  }
+}
+
+TEST(JsonDialect, MultiMatchPhraseOptions) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::MultiMatchQuery absent;
+  ASSERT_TRUE(P::read_json(absent, R"({"text":"dune","fields":["title_t"],"mode":"per_field"})", mr));
+  EXPECT_FALSE(absent.phrase);
+  for (auto value : {"{}", "{\"slop\":2}"}) {
+    P::MultiMatchQuery query;
+    std::string json = std::string(R"({"text":"dune","fields":["title_t"],"mode":"per_field","phrase":)") + value + "}";
+    ASSERT_TRUE(P::read_json(query, json, mr));
+    ASSERT_TRUE(query.phrase);
+    EXPECT_EQ(value == std::string_view("{}") ? 0 : 2, query.phrase->slop);
+    std::string out;
+    ASSERT_TRUE(P::write_json(query, out));
+    EXPECT_NE(std::string::npos, out.find(R"("phrase":{)")) << out;
+    P::MultiMatchQuery roundTrip;
+    ASSERT_TRUE(P::read_json(roundTrip, out, mr));
+    ASSERT_TRUE(roundTrip.phrase);
+    EXPECT_EQ(query.phrase->slop, roundTrip.phrase->slop);
+  }
+  for (auto json : {R"({"slop":2})", R"({"max_expansions":50})", R"({"mode":"phrase"})",
+                    R"({"mode":"phrase_prefix"})", R"({"mode":"bool_prefix"})",
+                    R"({"phrase":2})", R"({"phrase":{"bogus":1}})"}) {
+    P::MultiMatchQuery query;
+    EXPECT_FALSE(P::read_json(query, json, mr)) << json;
+  }
+}

@@ -266,6 +266,14 @@ else()
   message(STATUS "Luxir: using default system linker (no faster linker usable)")
 endif()
 
+# A Mach-O executable exports every external symbol, and GCC makes each inline
+# function and template instance a weak one, so dyld coalesced about 200k weak
+# definitions at every launch (0.5 s for luxir). Export only main, as an ELF
+# executable does without -rdynamic. Unstripped stack traces keep their names.
+if(APPLE)
+  string(APPEND CMAKE_EXE_LINKER_FLAGS " -Wl,-exported_symbol,_main")
+endif()
+
 # Thin static archives: the project's libraries only feed this build's own
 # links, so an archive can index its objects in place instead of copying them.
 # Rewriting the full luxir_lib archive after each engine edit took seconds.

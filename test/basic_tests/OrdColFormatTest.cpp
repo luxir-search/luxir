@@ -513,7 +513,7 @@ TEST_F(OrdColFormatTest, directAndPredictedFacetsMatch) {
     helper.indexAll(docs, UpdateMessage::COMMIT);
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& top = req->topDocs("q").getNumber(true).allQuery();
+    auto& top = req->topDocs("q").countLimit().allQuery();
     auto& facet = top.facet("f", field).limit(-1);
     std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
     req->execute(false);
@@ -575,7 +575,7 @@ TEST_F(OrdColFormatTest, directAndPredictedFacetsMatchAcrossBlocksAndSparseDomai
     EXPECT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& top = req->topDocs("q").getNumber(true).limit(10);
+    auto& top = req->topDocs("q").countLimit().limit(10);
     top.rawQuery() = qb::match(top.mr(), "gate_s", "yes");
     auto& facet = top.facet("f", "cat_s").limit(-1);
     std::get<luxir::api::FieldFacet>(facet.rawOp().kind).missing = true;
@@ -646,7 +646,7 @@ TEST_F(OrdColFormatTest, stringSortMissingLastAcrossSegmentsBothDirections) {
   auto sortedIds = [&](qb::SortDir direction) {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& top = req->topDocs("q").getNumber(true).allQuery().limit(10)
+    auto& top = req->topDocs("q").countLimit().allQuery().limit(10)
         .fields({"id_s", "name_s"});
     qb::sort(top, "name_s", direction);
     req->execute(false);
@@ -684,7 +684,7 @@ TEST_F(OrdColFormatTest, predictedInputSegmentsMergeWithFacetAndSortParity) {
   auto snapshot = [&]() {
     auto req = localReq(luxirNode->getSearchEngine());
     req->collection("main");
-    auto& top = req->topDocs("q").getNumber(true).allQuery().limit(100)
+    auto& top = req->topDocs("q").countLimit().allQuery().limit(100)
         .fields({"id_s", "sort_s"});
     qb::sort(top, "sort_s", qb::ASC);
     auto& facet = top.facet("f", "cat_s").limit(-1);

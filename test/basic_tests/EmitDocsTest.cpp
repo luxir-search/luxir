@@ -155,7 +155,7 @@ protected:
       }
       return nullptr;
     });
-    helper.getSearchEngine().dispatch(*req.get(), -1);
+    helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
     Signal::unlisten(signal);
     Signal::unlisten("searchRootChildStart");
     ASSERT_GE(waits.load(), 1);
@@ -227,7 +227,7 @@ TEST_F(EmitDocsTest, countOnlyResponsesSkipReturnFieldMetadata) {
   auto names = [] { return (int64_t)fieldMetadataMemory.names.load(); };
   int64_t before = names();
   auto count = localReq(helper.getSearchEngine());
-  count->collection("main").topDocs("q").allQuery().limit(0).getNumber(true);
+  count->collection("main").topDocs("q").allQuery().limit(0).countLimit();
   count->execute(0);
   ASSERT_OK(count);
   EXPECT_LT(names() - before, FIELDS);
@@ -264,7 +264,7 @@ TEST_F(EmitDocsTest, siblingFailureWhilePausedPreservesOriginalError) {
     paused->parked.wait();
     throw RequestError("sibling failure", "invalid_request");
   });
-  helper.getSearchEngine().dispatch(*req.get(), -1);
+  helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
   Signal::unlisten("searchRootChildStart");
   ASSERT_EQ(1u, req->responses.size());
   ASSERT_TRUE(req->responses[0]->proto.more);
@@ -284,7 +284,7 @@ TEST_F(EmitDocsTest, resumedLoadsIgnoreUnrelatedContextCancellation) {
   auto req = LocalReqHandle(paused);
   req->collection(helper.collection().getId().name);
   addDocsOp(*req.get(), "q", 5);
-  helper.getSearchEngine().dispatch(*req.get(), -1);
+  helper.getSearchEngine().dispatch(*req.get(), -1, SearchEngine::Receiver::MAY_EXECUTE);
   ASSERT_EQ(1u, req->responses.size());
   auto resume = std::move(paused->resume);
   ASSERT_TRUE(resume);

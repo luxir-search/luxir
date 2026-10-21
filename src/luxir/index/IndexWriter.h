@@ -53,7 +53,8 @@ public:
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
-    int64_t mergedLiveGen = -1;  // if this segment was merged into another, what liveGen was used.
+    int64_t mergedLiveGen = -1;  // source generation covered by the merge
+    int64_t mergeDiffLiveGen = -1; // generation pinned while loading a swap diff, protected by indexMutex
     uint64_t publishedLiveGen = 0; // the generation in the published snapshot
     std::vector<uint64_t> obsoleteLiveGens; // protected by indexMutex
     uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.
@@ -179,14 +180,12 @@ public:
     // really makes sense though since it would only occasionally fix the "many small segments" problem, and
     // it is the indexing pattern that is causing the issue.  Perhaps this should be fixed by the user
     // through an API that requests a more aggressive merge to sweep up small segments.
-    float inverseLogM = 1.0f / log2(mergeFactor);
 
     // Methods with _ prefix should be called with the indexMutex already locked.
     MergePolicy(IndexWriter& iw) : iw(iw) {}
 
     void setMergeFactor(int32_t mergeFactor) {
       this->mergeFactor = std::max(2,mergeFactor);
-      inverseLogM = 1.0f / log2(this->mergeFactor);
     }
 
     // re-calculate the merges from scratch (i.e. not incrementally)
@@ -213,11 +212,14 @@ public:
       }
     }
 
+    // Integer arithmetic: a floating-point log ratio rounds exact powers of the
+    // merge factor (e.g. 100 docs for factor 10) down a level.
     int32_t _mergeLevelForMaxDoc(int32_t maxDoc) const {
-      if (maxDoc < mergeFactor) {
-        return 0;
+      int32_t level = 0;
+      for (int64_t bound = mergeFactor; maxDoc >= bound; bound *= mergeFactor) {
+        level++;
       }
-      return (int32_t)(log2(maxDoc) * inverseLogM);
+      return level;
     }
 
     // Reserve any merge-policy storage needed by _update(seg) before the
@@ -646,6 +648,10 @@ private:
       INDEX_DEBUG("processUpdateBody: msg={} failed: {}", (void*)&msg, e.what());
       msg.result.setException(e);
       // message should continue flowing to finishUpdateBody so the sequencers stay happy.
+    } catch (...) {
+      // Escaping the node would cancel the graph and strand this message.
+      std::runtime_error error("Unknown non-standard exception while handling update");
+      msg.result.setException(error);
     }
   }
 

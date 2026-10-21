@@ -1,0 +1,883 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
+// multi_match: combined BM25F and weighted per-field match scoring.
+
+#include <algorithm>
+#include <cmath>
+#include <limits>
+#include <map>
+#include <optional>
+#include <typeindex>
+
+#include <gtest/gtest.h>
+
+#include "luxir/query/ParseContext.h"
+#include "luxir/query/ProtobufQueryParser.h"
+#include "luxir/query/QueryBuilder.h"
+#include "luxir/search/Similarity.h"
+#include "luxir/server/HttpServer.h"
+#include "test/CollectionHelper.h"
+#include "test/HttpReq.h"
+#include "test/LocalReq.h"
+#include "test/LuxirTest.h"
+#include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
+
+using namespace luxir;
+using namespace luxir::test;
+
+using Mode = api::MultiMatchQuery_::Mode;
+using MatchOp = api::Match_::Operator;
+
+class MultiMatchQueryTest : public LuxirTest {
+public:
+  CollectionHelper helper{"main"};
+  google::protobuf::Arena protoArena;
+  ArenaResource arena{&protoArena};
+  MemPool parsePool;
+
+  void SetUp() override {
+    helper.index(flatdoc("id", "d1", "title_un", "dune", "body_un", "a desert planet story",
+                         "tag_w", "Dune"), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "d2", "title_un", "the desert", "body_un", "dune dune sand",
+                         "tag_w", "sand"), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "d3", "title_un", "foundation", "body_un", "galactic empire",
+                         "tag_w", "empire"), UpdateMessage::COMMIT);
+  }
+
+  // id -> score for every hit; nullopt (plus the error text) on failure
+  std::optional<std::map<std::string, float>> run(const api::Query& query, bool filter = false,
+                                                  std::string* error = nullptr, int limit = -1) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    if (filter) {
+      cur.allQuery().filter(query);
+    } else {
+      cur.rawQuery() = query;
+    }
+    cur.fields({"id"}).limit(limit).getScores();
+    req->execute();
+    if (!req->ok()) {
+      if (error) *error = req->errorMsg();
+      return std::nullopt;
+    }
+    std::map<std::string, float> out;
+    const auto* docs = req->docList();
+    if (docs == nullptr || docs->row_count == 0) return out;
+    const auto& ids = std::get<api::ColStr>(docs->columns.at("id").kind).v;
+    const auto& scores = std::get<api::ColFloat>(docs->columns.at("_score_").kind).v;
+    for (size_t i = 0; i < ids.size(); i++) out[std::string(ids[i])] = scores[i];
+    return out;
+  }
+
+  std::pmr::memory_resource& mr() { return arena; }
+
+  api::Query multiMatch(std::string_view text, std::initializer_list<api::WeightedField> fields,
+                        Mode mode, std::optional<float> tie = std::nullopt,
+                        std::optional<api::PhraseOptions> phrase = std::nullopt) {
+    auto query = qb::multiMatch(mr(), text, fields, mode);
+    auto& arm = std::get<api::MultiMatchQuery>(query.kind);
+    arm.tie = tie;
+    arm.phrase = phrase;
+    return query;
+  }
+
+  float score(const api::Query& query, const std::string& id) {
+    auto hits = run(query);
+    return hits && hits->contains(id) ? hits->at(id) : 0.0f;
+  }
+
+  Query* parse(const api::Query& query, IndexReader* reader = nullptr) {
+    auto schema = reader ? reader->schema() : helper.collection().getSchema();
+    ParseContext context{parsePool, *schema, protoArena, CoerceContext{}, ""};
+    context.reader = reader;
+    return ProtobufQueryParser(context).parse(query);
+  }
+
+  static FilterKey filterKey(const Query& query) {
+    FilterKeyContext context;
+    FilterKeyBuilder builder;
+    auto scope = query.appendFilterKey(builder, context);
+    return std::move(builder).finishStructural(scope, context);
+  }
+};
+
+// Hand-computed BM25F: title weight 2, body weight 1, one term.
+TEST_F(MultiMatchQueryTest, scoresMatchBm25fFormula) {
+  auto hits = run(qb::multiMatch(mr(), "dune", {{"title_un", 2.0f}, {"body_un", {}}}));
+  ASSERT_TRUE(hits);
+  ASSERT_EQ(2u, hits->size());
+
+  // docCount = 3; weighted sumTotalTermFreq = 2*4 + 9; df = max(1, 1)
+  Similarity sim;
+  float idf = sim.idf(1, 3);
+  float avgdl = (float)(17.0 / 3.0);
+  auto bm25f = [&](float freq, float length) {
+    return Similarity::BM25Scorer(1.0f, sim.k1, sim.b, idf, avgdl)
+        .score(freq, SmallFloat::intToByte4((int32_t)length));
+  };
+  // d1: freq 2*1, length 2*1 + 4; d2: freq 1*2, length 2*2 + 3
+  EXPECT_NEAR(bm25f(2.0f, 6.0f), hits->at("d1"), 1e-6);
+  EXPECT_NEAR(bm25f(2.0f, 7.0f), hits->at("d2"), 1e-6);
+  EXPECT_GT(hits->at("d1"), hits->at("d2"));
+}
+
+// title_un in 1 of 3 docs is under half density, so its norms are sparse and
+// a doc without a title adds no title length.
+class MultiMatchSparseNormsTest : public MultiMatchQueryTest {
+public:
+  void SetUp() override {
+    helper.index(flatdoc("id", "s1", "title_un", "dune", "body_un", "dune sand"),
+                 UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "s2", "body_un", "dune desert planet"), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "s3", "body_un", "galactic empire"), UpdateMessage::COMMIT);
+  }
+};
+
+TEST_F(MultiMatchSparseNormsTest, missingFieldAddsNoLength) {
+  auto hits = run(qb::multiMatch(mr(), "dune", {{"title_un", 2.0f}, {"body_un", {}}}));
+  ASSERT_TRUE(hits);
+  ASSERT_EQ(2u, hits->size());
+
+  // docCount = max(1, 3); weighted sumTotalTermFreq = 2*1 + 7; df = max(1, 2)
+  Similarity sim;
+  float idf = sim.idf(2, 3);
+  float avgdl = (float)(9.0 / 3.0);
+  auto bm25f = [&](float freq, float length) {
+    return Similarity::BM25Scorer(1.0f, sim.k1, sim.b, idf, avgdl)
+        .score(freq, SmallFloat::intToByte4((int32_t)length));
+  };
+  // s1: freq 2*1 + 1, length 2*1 + 2; s2: freq 1, length 3 (no title)
+  EXPECT_NEAR(bm25f(3.0f, 4.0f), hits->at("s1"), 1e-6);
+  EXPECT_NEAR(bm25f(1.0f, 3.0f), hits->at("s2"), 1e-6);
+}
+
+TEST_F(MultiMatchQueryTest, operatorAndFilterContext) {
+  // AND: every term somewhere in the combined field
+  auto both = run(qb::multiMatch(mr(), "dune desert",
+      {{"title_un", {}}, {"body_un", {}}, {"tag_w", {}}}, Mode::COMBINED, MatchOp::AND));
+  ASSERT_TRUE(both);
+  EXPECT_EQ(2u, both->size());
+  EXPECT_TRUE(both->contains("d1") && both->contains("d2"));
+
+  auto any = run(qb::multiMatch(mr(), "dune empire", {{"title_un", {}}, {"body_un", {}}}));
+  ASSERT_TRUE(any);
+  EXPECT_EQ(3u, any->size());
+
+  // unscored filter use keeps the same match set
+  auto filtered = run(qb::multiMatch(mr(), "dune empire", {{"title_un", {}}, {"body_un", {}}}), true);
+  ASSERT_TRUE(filtered);
+  ASSERT_EQ(any->size(), filtered->size());
+  for (const auto& [id, score] : *any) EXPECT_TRUE(filtered->contains(id));
+}
+
+TEST_F(MultiMatchQueryTest, analysisGroups) {
+  // Analyzer identity determines groups even when the tokens coincide.
+  std::string_view names[] = {"body_un", "title_un"};
+  float weights[] = {1.0f, 1.0f};
+  for (std::string_view text : {"dune", "Dune"}) {
+    auto* query = parse(qb::multiMatch(mr(), text,
+        {{"title_un", {}}, {"body_un", {}}, {"tag_w", {}}}));
+    CombinedFieldQuery combined(names, weights, "dune");
+    TermQuery tag("tag_w", text);
+    Query* optional[] = {&combined, &tag};
+    BooleanQuery expected({}, optional, {}, {});
+    EXPECT_TRUE(query->equals(expected));
+  }
+
+  // The independent whitespace group adds to d1 only for uppercase Dune.
+  auto cross = run(qb::multiMatch(mr(), "Dune", {{"title_un", {}}, {"body_un", {}}, {"tag_w", {}}}, Mode::COMBINED));
+  ASSERT_TRUE(cross);
+  auto unGroup = run(qb::multiMatch(mr(), "Dune", {{"title_un", {}}, {"body_un", {}}}));
+  ASSERT_TRUE(unGroup);
+  EXPECT_EQ(2u, cross->size());
+  EXPECT_GT(cross->at("d1"), unGroup->at("d1"));  // tag_w:Dune adds to d1 only
+  EXPECT_FLOAT_EQ(cross->at("d2"), unGroup->at("d2"));
+}
+
+TEST_F(MultiMatchQueryTest, longTermsPolicySplitsGroups) {
+  SchemaBuilder schema;
+  schema.field("a").parent = "_un";
+  auto& b = schema.field("b");
+  b.parent = "_un";
+  b.long_terms = api::FieldDef::LongTerms::TRUNCATE;
+  auto compiled = schema.set(helper.collection());
+  auto* aType = (TextFieldType*)compiled->physical("a");
+  auto* bType = (TextFieldType*)compiled->physical("b");
+  ASSERT_EQ(aType->analyzer_.get(), bType->analyzer_.get());
+  ASSERT_NE(aType->longTerms, bType->longTerms);
+
+  QueryBuilder builder(parsePool, *compiled, CoerceContext{});
+  for (std::string text : {std::string("dune"), std::string(PackedTerm::MAX_LEN + 1, 'a')}) {
+    Query* optional[] = {builder.createMatchQuery("a", text), builder.createMatchQuery("b", text)};
+    BooleanQuery expected({}, optional, {}, {});
+    auto* query = parse(qb::multiMatch(mr(), text, {{"b", {}}, {"a", {}}}));
+    EXPECT_TRUE(query->equals(expected));
+  }
+}
+
+TEST_F(MultiMatchQueryTest, fieldOrderBindingsAndDuplicates) {
+  SchemaBuilder schema;
+  auto& name = schema.field("name");
+  name.type = api::FieldDef::FieldClass::STRING;
+  schema.variant(name, "t").parent = "_un";
+  name.defaults.emplace().search = "t";
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "d4", "name", "dune", "tag_w", "dune",
+                                  "body_un", "empire"), UpdateMessage::COMMIT).success);
+
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    auto first = qb::multiMatch(mr(), "dune",
+        {{"title_un", 2.0f}, {"tag_w", 0.5f}, {"name", 1.0f}, {"body_un", {}},
+         {"name__t", 3.0f}, {"title_un", 1.0f}}, mode);
+    auto second = qb::multiMatch(mr(), "dune",
+        {{"name__t", 3.0f}, {"body_un", {}}, {"tag_w", 0.5f}, {"title_un", 2.0f}}, mode);
+    auto* a = parse(first);
+    auto* b = parse(second);
+    EXPECT_TRUE(a->equals(*b));
+    EXPECT_EQ(a->hash(), b->hash());
+    EXPECT_EQ(filterKey(*a), filterKey(*b));
+    auto aHits = run(first);
+    auto bHits = run(second);
+    ASSERT_TRUE(aHits && bHits);
+    EXPECT_EQ(*aHits, *bHits);
+  }
+}
+
+TEST_F(MultiMatchQueryTest, emptyAnalysisGroupWithAndAndMinMatch) {
+  ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "p1", "tag_w", "!!! ??? ###"),
+      flatdoc("id", "p2", "tag_w", "!!! ???"),
+      flatdoc("id", "p3", "tag_w", "!!!")}, UpdateMessage::COMMIT).success);
+  auto query = qb::multiMatch(mr(), "!!! ??? ###",
+      {{"title_un", {}}, {"tag_w", {}}, {"body_un", {}}}, Mode::COMBINED, MatchOp::AND);
+  auto all = run(query);
+  ASSERT_TRUE(all);
+  ASSERT_EQ(1u, all->size());
+  EXPECT_TRUE(all->contains("p1"));
+  auto& multi = std::get<api::MultiMatchQuery>(query.kind);
+  multi.operator_ = MatchOp::OR;
+  multi.min_match = 2;
+  auto two = run(query);
+  ASSERT_TRUE(two);
+  EXPECT_EQ(2u, two->size());
+  EXPECT_TRUE(two->contains("p1") && two->contains("p2"));
+
+  auto empty = qb::multiMatch(mr(), "!!! ??? ###", {{"title_un", {}}, {"body_un", {}}});
+  EXPECT_EQ(QueryKind::NONE, parse(empty)->getKind());
+  auto none = run(empty);
+  ASSERT_TRUE(none);
+  EXPECT_TRUE(none->empty());
+}
+
+TEST_F(MultiMatchQueryTest, perFieldUsesBoostedTermLeaves) {
+  for (auto [field, weight] : {std::pair{"title_un", 2.0f}, {"body_un", 0.5f}}) {
+    auto query = qb::multiMatch(mr(), "dune", {{field, weight}}, Mode::PER_FIELD);
+    auto* term = dynamic_cast<TermQuery*>(parse(query));
+    ASSERT_NE(nullptr, term);
+    EXPECT_EQ(field, term->getField());
+    EXPECT_FLOAT_EQ(weight, term->getBoost());
+    auto weighted = run(query);
+    auto ordinary = run(qb::match(mr(), field, "dune"));
+    ASSERT_TRUE(weighted && ordinary);
+    ASSERT_EQ(ordinary->size(), weighted->size());
+    for (const auto& [id, score] : *ordinary) {
+      EXPECT_FLOAT_EQ(weight * score, weighted->at(id));
+    }
+  }
+  auto* boolean = dynamic_cast<BooleanQuery*>(parse(qb::multiMatch(mr(), "dune",
+      {{"title_un", 2.0f}, {"body_un", 0.5f}}, Mode::PER_FIELD)));
+  ASSERT_NE(nullptr, boolean);
+  auto shape = boolean->normalizationForTest(parsePool);
+  ASSERT_EQ(2u, shape.optionalTypes.size());
+  for (auto type : shape.optionalTypes) EXPECT_EQ(std::type_index(typeid(TermQuery)), type);
+}
+
+TEST_F(MultiMatchQueryTest, perFieldCoercesNumericMatch) {
+  ASSERT_TRUE(helper.index(flatdoc("id", "number", "count_i", 7), UpdateMessage::COMMIT).success);
+  auto query = qb::multiMatch(mr(), "7", {{"count_i", 2.0f}}, Mode::PER_FIELD);
+  auto* boost = dynamic_cast<BoostQuery*>(parse(query));
+  ASSERT_NE(nullptr, boost);
+  EXPECT_EQ(QueryKind::NUMERIC_PREDICATE, boost->getChild()->getKind());
+  auto weighted = run(query);
+  auto ordinary = run(qb::match(mr(), "count_i", "7"));
+  ASSERT_TRUE(weighted && ordinary);
+  ASSERT_EQ(1u, weighted->size());
+  EXPECT_FLOAT_EQ(2.0f * ordinary->at("number"), weighted->at("number"));
+}
+
+TEST_F(MultiMatchQueryTest, uncoercibleFieldsContributeNothing) {
+  ASSERT_TRUE(helper.index(flatdoc("id", "number", "title_un", "7", "count_i", 7),
+                           UpdateMessage::COMMIT).success);
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    for (bool phrase : {false, true}) {
+      if (phrase && mode == Mode::COMBINED) continue;
+      std::optional<api::PhraseOptions> options;
+      if (phrase) options.emplace();
+      auto title = run(multiMatch("dune", {{"title_un", {}}}, mode, {}, options));
+      auto mixed = run(multiMatch("dune", {{"title_un", {}}, {"count_i", 3.0f}}, mode, {}, options));
+      ASSERT_TRUE(title && mixed);
+      EXPECT_EQ(*title, *mixed);
+      auto numeric = multiMatch("7", {{"title_un", {}}, {"count_i", 3.0f}}, mode, {}, options);
+      auto hits = run(numeric);
+      auto filtered = run(numeric, true);
+      ASSERT_TRUE(hits && filtered);
+      ASSERT_EQ(1u, hits->size());
+      EXPECT_TRUE(filtered->contains("number"));
+      EXPECT_FLOAT_EQ(score(qb::match(mr(), "title_un", "7"), "number")
+          + 3.0f * score(qb::match(mr(), "count_i", "7"), "number"), hits->at("number"));
+      for (auto text : {"dune", "1.5", "1e100"}) {
+        auto none = multiMatch(text, {{"count_i", {}}}, mode, {}, options);
+        EXPECT_EQ(QueryKind::NONE, parse(none)->getKind());
+        auto empty = run(none);
+        ASSERT_TRUE(empty);
+        EXPECT_TRUE(empty->empty());
+      }
+    }
+  }
+}
+
+TEST_F(MultiMatchQueryTest, nonTextGroupsMultiplyWeights) {
+  ASSERT_TRUE(helper.index(flatdoc("id", "number", "title_un", "7", "count_i", 7,
+                                  "price_f", 7.0, "value_d", 7.0, "when_dt", "7", "name_s", "7"),
+                           UpdateMessage::COMMIT).success);
+  for (auto field : {"count_i", "price_f", "value_d", "when_dt", "name_s", "id"}) {
+    SCOPED_TRACE(field);
+    std::string_view text = field == std::string_view("id") ? "number" : "7";
+    for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+      auto query = multiMatch(text, {{field, 2.0f}}, mode);
+      auto hits = run(query);
+      ASSERT_TRUE(hits);
+      ASSERT_EQ(1u, hits->size());
+      EXPECT_FLOAT_EQ(2.0f * score(qb::match(mr(), field, text), "number"), hits->at("number"));
+      if (field == std::string_view("name_s") || field == std::string_view("id")) {
+        auto* term = dynamic_cast<TermQuery*>(parse(query));
+        ASSERT_NE(nullptr, term);
+        EXPECT_FLOAT_EQ(2.0f, term->getBoost());
+      }
+    }
+  }
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    auto title = run(multiMatch("dune", {{"title_un", {}}}, mode));
+    auto mixed = run(multiMatch("dune", {{"title_un", {}}, {"price_f", {}},
+                                        {"value_d", {}}, {"when_dt", {}}}, mode));
+    ASSERT_TRUE(title && mixed);
+    EXPECT_EQ(*title, *mixed);
+    auto empty = run(multiMatch("dune", {{"price_f", {}}, {"value_d", {}}, {"when_dt", {}}}, mode));
+    ASSERT_TRUE(empty);
+    EXPECT_TRUE(empty->empty());
+  }
+}
+
+TEST_F(MultiMatchQueryTest, coercionDoesNotHideOtherErrors) {
+  std::string error;
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    EXPECT_FALSE(run(multiMatch("dune", {{"count_i", {}}, {"unknown_field", {}}}, mode), false, &error));
+    EXPECT_NE(std::string::npos, error.find("unknown_field")) << error;
+  }
+  EXPECT_FALSE(run(qb::match(mr(), "count_i", "dune"), false, &error));
+  EXPECT_NE(std::string::npos, error.find("cannot parse 'dune' as an integer")) << error;
+  EXPECT_FALSE(run(qb::match(mr(), "when_dt", "dune"), false, &error));
+  EXPECT_NE(std::string::npos, error.find("cannot parse 'dune' as a date")) << error;
+
+  auto schema = Schema::createDefaultSchema();
+  schema->fieldTypeMap["no_column"] = std::make_shared<IntFieldType>("no_column", 0);
+  ParseContext context{parsePool, *schema, protoArena, CoerceContext{}, ""};
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    EXPECT_THROW(ProtobufQueryParser(context).parse(
+        multiMatch("dune", {{"no_column", {}}}, mode)), std::runtime_error);
+  }
+}
+
+TEST_F(MultiMatchQueryTest, dateGroupsKeepRangeSemantics) {
+  auto schema = Schema::createDefaultSchema();
+  int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
+  QueryBuilder builder(parsePool, *schema, CoerceContext{now});
+  QueryBuilder::WeightedField fields[] = {{"when_dt", 2.0f}};
+  for (auto text : {"2024-06", "NOW", "NOW/DAY"}) {
+    auto* expected = builder.createMatchQuery("when_dt", text, QueryBuilder::Operator::OR, 0, 2.0f);
+    for (auto* actual : {builder.createMultiMatchCombined(fields, text, QueryBuilder::Operator::OR, 0),
+                        builder.createMultiMatchPerField(fields, text, QueryBuilder::Operator::OR, 0),
+                        builder.createMultiMatchPerField(fields, text, QueryBuilder::Operator::OR, 0, 1.0f, 0)}) {
+      EXPECT_TRUE(expected->equals(*actual));
+      EXPECT_EQ(filterKey(*expected), filterKey(*actual));
+    }
+  }
+}
+
+TEST_F(MultiMatchQueryTest, singletonCombinedKeepsBm25fWeights) {
+  for (float weight : {0.5f, 1.0f, 2.0f}) {
+    auto query = qb::multiMatch(mr(), "dune", {{"title_un", weight}});
+    auto* built = parse(query);
+    if (weight == 1.0f) {
+      EXPECT_EQ(QueryKind::TERM, built->getKind());
+    } else {
+      auto* combined = dynamic_cast<CombinedFieldQuery*>(built);
+      ASSERT_NE(nullptr, combined);
+      ASSERT_EQ(1u, combined->getFields().size());
+      EXPECT_FLOAT_EQ(weight, combined->getWeights()[0]);
+    }
+    auto hits = run(query);
+    ASSERT_TRUE(hits);
+    ASSERT_EQ(1u, hits->size());
+    Similarity sim;
+    auto scorer = Similarity::BM25Scorer(1.0f, sim.k1, sim.b, sim.idf(1, 3), weight * 4.0f / 3.0f);
+    EXPECT_NEAR(scorer.score(weight, SmallFloat::intToByte4((int32_t)std::round(weight))),
+                hits->at("d1"), 1e-6);
+  }
+}
+
+TEST_F(MultiMatchQueryTest, finiteExtremeWeightsKeepMembershipAndScores) {
+  for (float weight : {std::numeric_limits<float>::denorm_min(), std::numeric_limits<float>::max()}) {
+    auto query = qb::multiMatch(mr(), "dune", {{"title_un", weight}, {"body_un", weight}});
+    auto hits = run(query);
+    auto filtered = run(query, true);
+    ASSERT_TRUE(hits && filtered);
+    ASSERT_EQ(2u, hits->size());
+    EXPECT_EQ(hits->size(), filtered->size());
+    for (const auto& [id, score] : *hits) {
+      EXPECT_TRUE(std::isfinite(score));
+      EXPECT_GE(score, 0.0f);
+      EXPECT_TRUE(filtered->contains(id));
+    }
+  }
+}
+
+TEST_F(MultiMatchQueryTest, modesAndWeightValidation) {
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    auto hits = run(qb::multiMatch(mr(), "dune", {{"title_un", 0.5f}, {"body_un", {}}}, mode));
+    ASSERT_TRUE(hits);
+    EXPECT_EQ(2u, hits->size());
+    for (float weight : {0.0f, -1.0f, std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::infinity()}) {
+      std::string error;
+      EXPECT_FALSE(run(qb::multiMatch(mr(), "dune", {{"title_un", weight}}, mode), false, &error));
+      EXPECT_NE(std::string::npos, error.find("field 'title_un'")) << error;
+      EXPECT_NE(std::string::npos, error.find("finite and > 0 (got ")) << error;
+    }
+  }
+  std::string error;
+  EXPECT_FALSE(run(qb::multiMatch(mr(), "dune", {}), false, &error));
+  EXPECT_NE(std::string::npos, error.find("non-empty 'fields'")) << error;
+  EXPECT_FALSE(run(qb::multiMatch(mr(), "dune", {{"", {}}}), false, &error));
+  EXPECT_NE(std::string::npos, error.find("empty field name")) << error;
+  auto negative = qb::multiMatch(mr(), "dune", {{"title_un", {}}});
+  std::get<api::MultiMatchQuery>(negative.kind).min_match = -1;
+  EXPECT_FALSE(run(negative, false, &error));
+  EXPECT_NE(std::string::npos, error.find("min_match")) << error;
+  auto id = run(qb::multiMatch(mr(), "d1", {{"id", {}}}));
+  ASSERT_TRUE(id);
+  EXPECT_EQ(1u, id->size());
+  EXPECT_TRUE(id->contains("d1"));
+  EXPECT_FALSE(run(qb::multiMatch(mr(), "dune", {{"title_un", {}}}, (Mode)123), false, &error));
+  EXPECT_NE(std::string::npos, error.find("unknown mode 123")) << error;
+}
+
+TEST_F(MultiMatchQueryTest, httpJsonAndExpr) {
+  HttpServer server(*LuxirTest::luxirNode, 1, 0);
+  server.start();
+  for (std::string query : {
+           R"({"multi_match":{"text":"dune","fields":["title_un^2","body_un"]}})",
+           R"({"multi_match":{"text":"dune desert","fields":[{"field":"title_un"},{"field":"body_un"}],)"
+           R"("mode":"combined","operator":"and"}})",
+           R"x("multi_match(dune, fields=[title_un^2, body_un], mode=per_field)")x"}) {
+    auto res = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+                           R"({"query":)" + query + R"(,"fields":["id"],"count_limit":-1})");
+    EXPECT_EQ(200, res.result_int()) << query << "\n" << res.body();
+    EXPECT_NE(std::string::npos, res.body().find(R"("found":2)")) << query << "\n" << res.body();
+  }
+  auto bad = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"combined_fields":{"query":"dune","fields":["title_un"]}}})");
+  EXPECT_EQ(400, bad.result_int()) << bad.body();
+  EXPECT_NE(std::string::npos, bad.body().find("unknown_key")) << bad.body();
+  server.shutdown();
+}
+
+TEST_F(MultiMatchQueryTest, disMaxScoresBestPlusTie) {
+  auto title = run(qb::match(mr(), "title_un", "dune"));
+  auto body = run(qb::match(mr(), "body_un", "dune"));
+  ASSERT_TRUE(title && body);
+  for (float tie : {0.0f, 0.3f}) {
+    auto hits = run(qb::disMax(mr(), {qb::match(mr(), "title_un", "dune"),
+                                      qb::match(mr(), "body_un", "dune")}, tie));
+    ASSERT_TRUE(hits);
+    ASSERT_EQ(2u, hits->size());
+    for (const auto& [id, s] : *hits) {
+      float t = title->contains(id) ? title->at(id) : 0.0f;
+      float b = body->contains(id) ? body->at(id) : 0.0f;
+      EXPECT_NEAR(std::max(t, b) + tie * std::min(t, b), s, 1e-5) << id << " tie " << tie;
+    }
+  }
+  // Top-1 collection returns the highest dis_max score.
+  auto disMax = qb::disMax(mr(), {qb::match(mr(), "title_un", "dune"),
+                                  qb::match(mr(), "body_un", "dune")});
+  auto all = run(disMax);
+  auto top = run(disMax, false, nullptr, 1);
+  ASSERT_TRUE(all && top);
+  ASSERT_EQ(1u, top->size());
+  auto best = std::max_element(all->begin(), all->end(),
+                               [](auto& a, auto& b) { return a.second < b.second; });
+  EXPECT_EQ(best->first, top->begin()->first);
+
+  // tie 1 adds the scores like a disjunction
+  auto sum = run(qb::disMax(mr(), {qb::match(mr(), "title_un", "dune"),
+                                   qb::match(mr(), "body_un", "dune")}, 1.0f));
+  auto most = run(multiMatch("dune", {{"title_un", {}}, {"body_un", {}}}, Mode::PER_FIELD));
+  ASSERT_TRUE(sum && most);
+  EXPECT_EQ(*most, *sum);
+
+  // a two-phase disjunct, and the same match set in a filter
+  auto mixed = qb::disMax(mr(), {qb::phraseText(mr(), "body_un", "desert planet"),
+                                 qb::match(mr(), "title_un", "foundation")});
+  auto scored = run(mixed);
+  auto filtered = run(mixed, true);
+  ASSERT_TRUE(scored && filtered);
+  EXPECT_EQ(2u, scored->size());
+  EXPECT_TRUE(scored->contains("d1") && scored->contains("d3"));
+  EXPECT_EQ(2u, filtered->size());
+}
+
+TEST_F(MultiMatchQueryTest, perFieldBestIsDisMaxOfMatches) {
+  auto expected = run(qb::disMax(mr(), {qb::match(mr(), "title_un", "dune"),
+                                        qb::match(mr(), "body_un", "dune")}, 0.2f));
+  auto best = run(multiMatch("dune", {{"title_un", {}}, {"body_un", {}}}, Mode::PER_FIELD, 0.2f));
+  ASSERT_TRUE(expected && best);
+  EXPECT_EQ(*expected, *best);
+
+  // a field boost scales that field's score before the max
+  auto boosted = run(multiMatch("dune", {{"title_un", 3.0f}, {"body_un", {}}}, Mode::PER_FIELD, 0.0f));
+  ASSERT_TRUE(boosted);
+  EXPECT_NEAR(std::max(3.0f * score(qb::match(mr(), "title_un", "dune"), "d1"),
+                       score(qb::match(mr(), "body_un", "dune"), "d1")),
+              boosted->at("d1"), 1e-5);
+}
+
+TEST_F(MultiMatchQueryTest, phraseOptions) {
+  auto query = multiMatch("desert planet", {{"title_un", {}}, {"body_un", {}}}, Mode::PER_FIELD,
+                          {}, api::PhraseOptions{});
+  auto phrase = run(query);
+  auto filtered = run(query, true);
+  ASSERT_TRUE(phrase && filtered);
+  ASSERT_EQ(1u, phrase->size());
+  EXPECT_TRUE(phrase->contains("d1"));
+  EXPECT_EQ(phrase->size(), filtered->size());
+  EXPECT_TRUE(filtered->contains("d1"));
+  auto sloppy = run(multiMatch("desert story", {{"body_un", {}}}, Mode::PER_FIELD,
+                               {}, api::PhraseOptions{1}));
+  ASSERT_TRUE(sloppy);
+  EXPECT_TRUE(sloppy->contains("d1"));
+  auto exact = run(multiMatch("desert story", {{"body_un", {}}}, Mode::PER_FIELD,
+                              {}, api::PhraseOptions{}));
+  ASSERT_TRUE(exact);
+  EXPECT_TRUE(exact->empty());
+
+  for (float tie : {0.0f, 0.5f, 1.0f}) {
+    auto weighted = run(multiMatch("Dune", {{"title_un", 2.0f}, {"tag_w", {}}}, Mode::PER_FIELD,
+                                   tie, api::PhraseOptions{}));
+    ASSERT_TRUE(weighted);
+    float title = 2.0f * score(qb::phraseText(mr(), "title_un", "Dune"), "d1");
+    float tag = score(qb::match(mr(), "tag_w", "Dune"), "d1");
+    float best = std::max(title, tag);
+    EXPECT_NEAR(best + tie * (title + tag - best), weighted->at("d1"), 1e-5);
+  }
+  ASSERT_TRUE(helper.index(flatdoc("id", "d4", "name_s", "Dune Messiah"), UpdateMessage::COMMIT).success);
+  auto whole = run(multiMatch("Dune Messiah", {{"name_s", {}}}, Mode::PER_FIELD, {}, api::PhraseOptions{}));
+  ASSERT_TRUE(whole);
+  EXPECT_TRUE(whole->contains("d4"));
+  auto id = run(multiMatch("d1", {{"id", {}}}, Mode::PER_FIELD, {}, api::PhraseOptions{}));
+  ASSERT_TRUE(id);
+  EXPECT_TRUE(id->contains("d1"));
+}
+
+TEST_F(MultiMatchQueryTest, weightedPhraseLeaves) {
+  auto* term = parse(multiMatch("Dune", {{"title_un", 2.0f}}, Mode::PER_FIELD,
+                                {}, api::PhraseOptions{}));
+  ASSERT_EQ(QueryKind::TERM, term->getKind());
+  EXPECT_FLOAT_EQ(2.0f, ((TermQuery*)term)->getBoost());
+  auto* phrase = parse(multiMatch("desert planet", {{"body_un", 2.0f}}, Mode::PER_FIELD,
+                                  {}, api::PhraseOptions{}));
+  ASSERT_EQ(QueryKind::BOOST, phrase->getKind());
+  EXPECT_FLOAT_EQ(2.0f, ((BoostQuery*)phrase)->getBoost());
+  EXPECT_EQ(QueryKind::PHRASE, ((BoostQuery*)phrase)->getChild()->getKind());
+}
+
+TEST_F(MultiMatchQueryTest, phraseValidation) {
+  auto query = multiMatch("dune", {{"title_un", {}}}, Mode::COMBINED, {}, api::PhraseOptions{});
+  std::string error;
+  EXPECT_FALSE(run(query, false, &error));
+  EXPECT_NE(std::string::npos, error.find("requires mode per_field")) << error;
+  auto& arm = std::get<api::MultiMatchQuery>(query.kind);
+  arm.mode = Mode::PER_FIELD;
+  for (auto op : {MatchOp::OR, MatchOp::AND}) {
+    arm.operator_ = op;
+    EXPECT_FALSE(run(query, false, &error));
+    EXPECT_NE(std::string::npos, error.find("cannot be combined with 'operator' or 'min_match'")) << error;
+  }
+  arm.operator_ = MatchOp::OPERATOR_UNSPECIFIED;
+  arm.min_match = 1;
+  EXPECT_FALSE(run(query, false, &error));
+  EXPECT_NE(std::string::npos, error.find("min_match")) << error;
+  arm.min_match = 0;
+  arm.phrase->slop = -1;
+  EXPECT_FALSE(run(query, false, &error));
+  EXPECT_NE(std::string::npos, error.find("'slop' must not be negative")) << error;
+}
+
+TEST_F(MultiMatchQueryTest, phraseRequiresPositions) {
+  auto schema = Schema::createDefaultSchema();
+  schema->fieldTypeMap["no_positions"] = std::make_shared<TextFieldType>(
+      "no_positions", FieldType::INDEX_DOCS_FREQS);
+  ParseContext context{parsePool, *schema, protoArena, CoerceContext{}, ""};
+  for (auto text : {"", "dune", "dune messiah"}) {
+    EXPECT_THROW(ProtobufQueryParser(context).parse(multiMatch(text, {{"no_positions", {}}},
+                     Mode::PER_FIELD, {}, api::PhraseOptions{})), std::runtime_error);
+  }
+}
+
+TEST_F(MultiMatchQueryTest, wildcardFields) {
+  auto listed = run(multiMatch("dune", {{"title_un", {}}, {"body_un", {}}}, Mode::PER_FIELD, 0.0f));
+  auto pattern = run(multiMatch("dune", {{"*_un", {}}}, Mode::PER_FIELD, 0.0f));
+  ASSERT_TRUE(listed && pattern);
+  EXPECT_EQ(*listed, *pattern);
+  auto combined = run(qb::multiMatch(mr(), "dune", {{"*_un", 2.0f}}));
+  auto combinedListed = run(qb::multiMatch(mr(), "dune", {{"title_un", 2.0f}, {"body_un", 2.0f}}));
+  ASSERT_TRUE(combined && combinedListed);
+  EXPECT_EQ(*combinedListed, *combined);
+
+  // a pattern keeps indexed TEXT/STRING/ID search targets and may select nothing
+  auto broad = run(multiMatch("Dune", {{"*", {}}}, Mode::PER_FIELD));
+  ASSERT_TRUE(broad);
+  EXPECT_TRUE(broad->contains("d1"));
+  auto none = run(multiMatch("dune", {{"nothing_*", {}}}, Mode::PER_FIELD));
+  ASSERT_TRUE(none);
+  EXPECT_TRUE(none->empty());
+}
+
+TEST_F(MultiMatchQueryTest, wildcardRootsVariantsAndBindings) {
+  SchemaBuilder schema;
+  auto& author = schema.field("author");
+  author.type = api::FieldDef::FieldClass::STRING;
+  author.index = api::FieldDef::IndexMode::NONE;
+  schema.variant(author, "words").parent = "_un";
+  schema.variant(author, "exact").parent = "_s";
+  author.defaults.emplace().search = "words";
+  auto& dynamic = schema.templ("_entry");
+  dynamic.parent = "_un";
+  dynamic.stored = false;
+  schema.variant(dynamic, "exact").parent = "_s";
+  dynamic.defaults.emplace().value = "exact";
+  schema.field("declared").parent = "_un";
+  auto& columnOnly = schema.field("column_only");
+  columnOnly.parent = "author";
+  columnOnly.defaults.emplace().search = "self";
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "d4", "author", "Dune Messiah", "note_entry", "Dune Messiah"),
+                           UpdateMessage::COMMIT).success);
+  schema.variant(dynamic, "later").parent = "_s";
+  schema.set(helper.collection());
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
+  auto catalog = reader->searchableFields();
+  EXPECT_EQ(catalog.data(), reader->searchableFields().data());
+  EXPECT_FALSE(reader->field("note_entry__later").exists());
+  for (auto name : {"author", "author__exact", "author__words", "declared", "id",
+                    "note_entry", "note_entry__exact", "note_entry__later"}) {
+    EXPECT_NE(catalog.end(), std::ranges::find(catalog, std::string_view(name))) << name;
+  }
+  for (auto name : {"_un", "_version_", "author__self", "column_only", "missing_entry"}) {
+    EXPECT_EQ(catalog.end(), std::ranges::find(catalog, std::string_view(name))) << name;
+  }
+  auto retrievable = reader->retrievableFields();
+  EXPECT_EQ(retrievable.end(), std::ranges::find(retrievable, std::string_view("note_entry"),
+                                                &IndexReader::RetrievableField::name));
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    auto wildcard = multiMatch("Dune Messiah", {{"author*", 2.0f}, {"author__words", 3.0f}}, mode);
+    auto explicitField = multiMatch("Dune Messiah", {{"author__words", 3.0f}}, mode);
+    EXPECT_TRUE(parse(wildcard, reader.get())->equals(*parse(explicitField, reader.get())));
+    EXPECT_EQ(run(explicitField), run(wildcard));
+    auto variants = multiMatch("Dune Messiah", {{"author__*", {}}}, mode);
+    auto listed = multiMatch("Dune Messiah", {{"author__exact", {}}, {"author__words", {}}}, mode);
+    EXPECT_TRUE(parse(variants, reader.get())->equals(*parse(listed, reader.get())));
+    EXPECT_EQ(run(listed), run(variants));
+    EXPECT_TRUE(parse(multiMatch("Dune Messiah", {{"note_*", {}}}, mode), reader.get())->equals(
+        *parse(multiMatch("Dune Messiah", {{"note_entry", {}}}, mode), reader.get())));
+  }
+  auto id = run(multiMatch("d1", {{"i*", {}}}, Mode::COMBINED));
+  ASSERT_TRUE(id);
+  EXPECT_TRUE(id->contains("d1"));
+  auto* absent = dynamic_cast<TermQuery*>(parse(
+      multiMatch("dune", {{"decl*", {}}}, Mode::PER_FIELD), reader.get()));
+  ASSERT_NE(nullptr, absent);
+  EXPECT_EQ("declared", absent->getField());
+  // Direct builders without a reader still expand concrete schema declarations.
+  EXPECT_TRUE(absent->equals(*parse(multiMatch("dune", {{"decl*", {}}}, Mode::PER_FIELD))));
+}
+
+TEST_F(MultiMatchQueryTest, wildcardCatalogFollowsReaderAndSchema) {
+  SchemaBuilder schema;
+  auto& choice = schema.field("choice");
+  choice.type = api::FieldDef::FieldClass::INT;
+  schema.variant(choice, "words").parent = "_un";
+  choice.defaults.emplace().search = "words";
+  schema.set(helper.collection());
+  auto before = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
+  auto original = before->searchableFields();
+  ASSERT_NE(original.end(), std::ranges::find(original, std::string_view("choice")));
+  choice.defaults->search = "self";
+  schema.set(helper.collection());
+  auto after = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
+  EXPECT_EQ(before->coreGen(), after->coreGen());
+  auto current = after->searchableFields();
+  EXPECT_NE(original.data(), current.data());
+  EXPECT_EQ(current.data(), after->searchableFields().data());
+  EXPECT_EQ(current.end(), std::ranges::find(current, std::string_view("choice")));
+  EXPECT_NE(current.end(), std::ranges::find(current, std::string_view("choice__words")));
+  ASSERT_TRUE(helper.index(flatdoc("id", "new", "fresh_un", "dune"), UpdateMessage::COMMIT).success);
+  auto fresh = helper.getIndexWriter()->snapshots.readers.getReader();
+  EXPECT_NE(fresh->searchableFields().end(),
+            std::ranges::find(fresh->searchableFields(), std::string_view("fresh_un")));
+  EXPECT_EQ(current.end(), std::ranges::find(current, std::string_view("fresh_un")));
+  EXPECT_NE(original.end(), std::ranges::find(original, std::string_view("choice")));
+}
+
+TEST_F(MultiMatchQueryTest, wildcardFieldLimitCountsPhysicalTargets) {
+  SchemaBuilder schema;
+  for (size_t i = 0; i < QueryBuilder::MAX_PATTERN_FIELDS; i++) {
+    schema.field("many" + std::to_string(i)).parent = "_un";
+  }
+  schema.set(helper.collection());
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
+  auto query = multiMatch("dune", {{"many*", {}}, {"many*", 2.0f}, {"many0__self", 3.0f}}, Mode::PER_FIELD);
+  EXPECT_NO_THROW(parse(query, reader.get()));
+  auto hits = run(query);
+  ASSERT_TRUE(hits);
+  EXPECT_TRUE(hits->empty());
+  schema.field("many_extra").parent = "_un";
+  schema.set(helper.collection());
+  reader = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
+  std::string error;
+  EXPECT_FALSE(run(query, false, &error));
+  EXPECT_NE(std::string::npos, error.find("limit of 64 physical targets")) << error;
+  HttpServer server(*LuxirTest::luxirNode, 1, 0);
+  server.start();
+  auto response = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"multi_match":{"text":"dune","fields":["many*"]}}})");
+  EXPECT_EQ(400, response.result_int()) << response.body();
+  server.shutdown();
+}
+
+TEST_F(MultiMatchQueryTest, groupScoresUseTie) {
+  ASSERT_TRUE(helper.index(flatdoc("id", "d1", "title_un", "dune", "body_un", "a desert planet story",
+                                  "tag_w", "Dune", "kind_s", "Dune"), UpdateMessage::COMMIT).success);
+  auto group = run(qb::multiMatch(mr(), "Dune", {{"title_un", {}}, {"body_un", {}}}));
+  ASSERT_TRUE(group);
+  float tag = score(qb::match(mr(), "tag_w", "Dune"), "d1");
+  ASSERT_GT(tag, 0.0f);
+  for (float tie : {0.0f, 0.5f, 1.0f}) {
+    auto cross = run(multiMatch("Dune", {{"title_un", {}}, {"body_un", {}}, {"tag_w", {}}},
+                                Mode::COMBINED, tie));
+    ASSERT_TRUE(cross);
+    ASSERT_EQ(2u, cross->size());
+    float best = std::max(group->at("d1"), tag);
+    EXPECT_NEAR(best + tie * (group->at("d1") + tag - best), cross->at("d1"), 1e-5);
+    EXPECT_FLOAT_EQ(group->at("d2"), cross->at("d2"));
+  }
+  auto keyword = run(multiMatch("Dune", {{"title_un", {}}, {"kind_s", {}}}, Mode::COMBINED, 0.0f));
+  ASSERT_TRUE(keyword);
+  ASSERT_EQ(1u, keyword->size());
+  EXPECT_FLOAT_EQ(std::max(score(qb::match(mr(), "title_un", "Dune"), "d1"),
+                           score(qb::match(mr(), "kind_s", "Dune"), "d1")), keyword->at("d1"));
+}
+
+TEST_F(MultiMatchQueryTest, tieDefaultsArePerArm) {
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    SCOPED_TRACE((int)mode);
+    auto query = multiMatch("Dune", {{"title_un", {}}, {"tag_w", {}}}, mode);
+    auto defaults = run(query);
+    std::get<api::MultiMatchQuery>(query.kind).tie = 1.0f;
+    auto sum = run(query);
+    ASSERT_TRUE(defaults && sum);
+    ASSERT_EQ(1u, defaults->size());
+    EXPECT_EQ(*sum, *defaults);
+    std::get<api::MultiMatchQuery>(query.kind).tie = 0.0f;
+    auto best = run(query);
+    ASSERT_TRUE(best);
+    EXPECT_GT(defaults->at("d1"), best->at("d1"));
+  }
+  auto phrase = multiMatch("Dune", {{"title_un", {}}, {"tag_w", {}}}, Mode::PER_FIELD,
+                           {}, api::PhraseOptions{});
+  auto defaults = run(phrase);
+  std::get<api::MultiMatchQuery>(phrase.kind).tie = 1.0f;
+  auto sum = run(phrase);
+  ASSERT_TRUE(defaults && sum);
+  EXPECT_EQ(*sum, *defaults);
+  auto best = run(qb::disMax(mr(), {qb::match(mr(), "title_un", "Dune"),
+                                   qb::match(mr(), "tag_w", "Dune")}));
+  ASSERT_TRUE(best);
+  EXPECT_FLOAT_EQ(std::max(score(qb::match(mr(), "title_un", "Dune"), "d1"),
+                           score(qb::match(mr(), "tag_w", "Dune"), "d1")), best->at("d1"));
+}
+
+TEST_F(MultiMatchQueryTest, tieValidation) {
+  for (float tie : {-0.1f, 1.1f, std::numeric_limits<float>::quiet_NaN(),
+                     std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity()}) {
+    auto multi = multiMatch("dune", {{"title_un", {}}}, Mode::COMBINED, tie);
+    auto disMax = qb::disMax(mr(), {qb::match(mr(), "title_un", "dune"),
+                                   qb::match(mr(), "body_un", "dune")}, tie);
+    for (const auto& query : {multi, disMax}) {
+      std::string error;
+      EXPECT_FALSE(run(query, false, &error));
+      EXPECT_NE(std::string::npos, error.find("'tie' must be finite and in [0, 1]")) << error;
+    }
+  }
+}
+
+TEST_F(MultiMatchQueryTest, disMaxValidation) {
+  std::string error;
+  EXPECT_FALSE(run(multiMatch("dune", {{"title_un", {}}}, Mode::PER_FIELD, 1.5f), false, &error));
+  EXPECT_NE(std::string::npos, error.find("tie")) << error;
+  EXPECT_FALSE(run(qb::disMax(mr(), {}), false, &error));
+  EXPECT_NE(std::string::npos, error.find("non-empty")) << error;
+}
+
+TEST_F(MultiMatchQueryTest, disMaxHttpJsonAndExpr) {
+  HttpServer server(*LuxirTest::luxirNode, 1, 0);
+  server.start();
+  for (std::string query : {
+           R"({"multi_match":{"text":"dune","fields":["title_un","body_un"],"tie":0.3}})",
+           R"({"dis_max":{"queries":[{"match":{"field":"title_un","val":"dune"}},)"
+           R"({"match":{"field":"body_un","val":"dune"}}],"tie":0.3}})",
+           R"x("dis_max(queries=[title_un:dune, body_un:dune], tie=0.3)")x"}) {
+    auto res = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+                           R"({"query":)" + query + R"(,"fields":["id"],"count_limit":-1})");
+    EXPECT_EQ(200, res.result_int()) << query << "\n" << res.body();
+    EXPECT_NE(std::string::npos, res.body().find(R"("found":2)")) << query << "\n" << res.body();
+  }
+  auto bad = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"dis_max":{"queries":[{"all":true}],"tie":2}}})");
+  EXPECT_EQ(400, bad.result_int()) << bad.body();
+  server.shutdown();
+}
+
+TEST_F(MultiMatchQueryTest, phraseHttpJsonAndExpr) {
+  HttpServer server(*LuxirTest::luxirNode, 1, 0);
+  server.start();
+  for (std::string query : {
+           R"({"multi_match":{"text":"desert planet","fields":["title_un^2","body_un"],"mode":"per_field","phrase":{}}})",
+           R"({"multi_match":{"text":"desert story","fields":["body_un"],"mode":"per_field","phrase":{"slop":2}}})",
+           R"x("multi_match(desert planet, fields=[title_un^2, body_un], mode=per_field, phrase={})")x",
+           R"x("multi_match(desert story, fields=[body_un], mode=per_field, phrase={slop: 2})")x"}) {
+    auto res = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+                           R"({"query":)" + query + R"(,"fields":["id"],"count_limit":-1})");
+    EXPECT_EQ(200, res.result_int()) << query << "\n" << res.body();
+    EXPECT_NE(std::string::npos, res.body().find(R"("found":1)")) << res.body();
+  }
+  for (std::string options : {R"("phrase":{})", R"("mode":"per_field","phrase":{"slop":-1})",
+                              R"("mode":"per_field","phrase":{},"operator":"or")",
+                              R"("mode":"per_field","phrase":{},"min_match":1)"}) {
+    auto res = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+        R"({"query":{"multi_match":{"text":"dune","fields":["title_un"],)" + options + "}}}");
+    EXPECT_EQ(400, res.result_int()) << res.body();
+  }
+  server.shutdown();
+}
