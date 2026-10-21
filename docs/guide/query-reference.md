@@ -257,6 +257,17 @@ apply their multi-term normalization/folding but do not tokenize it; STRING
 uses its normalizer if present, and ID uses the bytes verbatim. An empty prefix
 matches documents with at least one indexed term for the field.
 
+| Field | Meaning |
+|---|---|
+| `max_expansions` | Unset or `0`: every term with the prefix. `N` (at most 4096): in each segment, only the `N` terms with the highest document frequency (ties keep the lower term). |
+
+A short prefix over a large dictionary can expand to hundreds of thousands of
+terms, and an unscored or exactly counted request then reads every one of their
+postings lists. `max_expansions` bounds that work, the way Elasticsearch's
+`match_bool_prefix` does (its default there is 50). The terms are chosen per
+segment, so a term just outside the cut can match in one segment and not in
+another.
+
 ## Wildcard
 
 ```json

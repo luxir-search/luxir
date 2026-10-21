@@ -24,6 +24,12 @@ namespace luxir {
 class MultiTermQuery : public Query {
 protected:
   std::string_view field;
+  // Positive: per segment, union only the maxExpansions accepted terms with
+  // the highest document frequency (ties keep the lower term). Zero: every
+  // accepted term. Bounded by Weight::MAX_LAZY_TERMS, so a capped expansion
+  // never outgrows the retained-state budget and never spills to the eager
+  // bitset on its own.
+  int32_t maxExpansions;
 
 public:
   bool recoverableAsPredicate() const noexcept override { return true; }
@@ -31,10 +37,12 @@ public:
   static inline bool disableDenseFillForTests = false;
   static inline bool disableTruthfulCostForTests = false;
 
-  MultiTermQuery(QueryKind kind, std::string_view field)
-    : Query(kind), field(field) {}
+  MultiTermQuery(QueryKind kind, std::string_view field,
+                 int32_t maxExpansions = 0)
+    : Query(kind), field(field), maxExpansions(maxExpansions) {}
 
   std::string_view getField() const { return field; }
+  int32_t getMaxExpansions() const { return maxExpansions; }
 
   // Build the per-segment filtered term iterator.
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;
@@ -258,6 +266,48 @@ public:
           {bits.words, FixedBitSet::sizeInWords(bits.size())}, 0, bits.size());
     }
 
+    // One accepted term competing for a capped expansion. `ord` is the
+    // enumeration position, so equal document frequencies keep the lower term
+    // and the selection is a pure function of the segment.
+    struct TopTerm {
+      TermsEnum::PostingsState state;
+      size_t ord;
+    };
+
+    // Heap order with the weakest candidate (lowest docFreq, then highest
+    // ord) on top.
+    static bool strongerTerm(const TopTerm& a, const TopTerm& b) {
+      if (a.state.docFreq != b.state.docFreq) {
+        return a.state.docFreq > b.state.docFreq;
+      }
+      return a.ord < b.ord;
+    }
+
+    // Keep the `limit` accepted terms with the highest docFreq, returned in
+    // term order. Only postings states are retained; no postings are read.
+    static std::span<TopTerm> selectTopTerms(
+        MemPool& pool, FilteredTermsEnum& fenum, size_t limit) {
+      auto heap = pool.make_span<TopTerm>(limit);
+      size_t size = 0;
+      size_t ord = 0;
+      while (fenum.next()) {
+        TopTerm candidate{fenum.terms().postingsState(), ord++};
+        if (size < limit) {
+          heap[size++] = candidate;
+          std::push_heap(heap.begin(), heap.begin() + (ptrdiff_t) size,
+                         strongerTerm);
+        } else if (strongerTerm(candidate, heap[0])) {
+          std::pop_heap(heap.begin(), heap.end(), strongerTerm);
+          heap[limit - 1] = candidate;
+          std::push_heap(heap.begin(), heap.end(), strongerTerm);
+        }
+      }
+      auto kept = heap.first(size);
+      std::sort(kept.begin(), kept.end(),
+                [](const TopTerm& a, const TopTerm& b) { return a.ord < b.ord; });
+      return kept;
+    }
+
     static ExpansionFacts* findExpansionFacts(
         const ExpansionMemo& memo, size_t maxLazyStateBytes) {
       for (ExpansionFacts* facts = memo.facts;
@@ -301,9 +351,24 @@ public:
           FilteredTermsEnum* fenum =
               query.createFilteredEnum(scratchPool, *termsEnum);
           skipCount(SkipStats::multitermExpansions);
-          while (fenum->next()) {
-            TermsEnum::PostingsState state =
-                fenum->terms().postingsState();
+          std::span<TopTerm> topTerms;
+          if (query.maxExpansions > 0) {
+            topTerms = selectTopTerms(
+                scratchPool, *fenum, (size_t) query.maxExpansions);
+          }
+          size_t nextTop = 0;
+          auto nextState = [&](TermsEnum::PostingsState& out) {
+            if (query.maxExpansions > 0) {
+              if (nextTop == topTerms.size()) return false;
+              out = topTerms[nextTop++].state;
+              return true;
+            }
+            if (!fenum->next()) return false;
+            out = fenum->terms().postingsState();
+            return true;
+          };
+          TermsEnum::PostingsState state;
+          while (nextState(state)) {
             termCount++;
             sumDocFreq += state.docFreq;
             if (bitWords != nullptr) {
