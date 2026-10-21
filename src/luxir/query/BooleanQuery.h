@@ -40,6 +40,12 @@ public:
   // Test hook: keep score-only optional clauses in unscored plans.
   static inline bool disableUnscoredOptionalDropForTests = false;
 
+  struct ScorePolicy {
+    enum Kind { SUM, DISMAX };
+    Kind kind = SUM;
+    float tie = 1.0f;
+  };
+
   enum NormalizeRule : uint32_t {
     R1_REQUIRED_INLINE = 1u << 0,
     R2_DISJUNCTION_FLATTEN = 1u << 1,
@@ -1072,6 +1078,12 @@ public:
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;
 
+  // A scored disjunction with its own logical owner. Preserve the original
+  // clauses, including duplicates, rather than normalizing a BooleanQuery.
+  static Query::Weight* makeDisjunctionWeight(
+      Context& context, const Query& owner, std::span<Query*> clauses,
+      ScorePolicy policy, int32_t flags, float multiplier);
+
   struct ConjunctionClauseLayout {
     Query::ClauseShape windowFillKind = Query::ClauseShape::NONE;
     std::span<Query::Scorer*> denseMembers;
@@ -1092,8 +1104,11 @@ public:
   struct PostingsCandidateBatch;
   class ExactDocsOnlyTermConjunctionBulkScorer;
   class ConjunctionBulkScorer;
-  class DisjunctionScorer;
-  class MaxScoreDisjunctionScorer;
+  struct SumScorePolicy {};
+  template<bool DISMAX> class DisjunctionScorerT;
+  template<bool DISMAX> class MaxScoreDisjunctionScorerT;
+  using DisjunctionScorer = DisjunctionScorerT<false>;
+  using MaxScoreDisjunctionScorer = MaxScoreDisjunctionScorerT<false>;
   class FilteredDisjunctionBulkScorer;
   class MaxScoreBulkScorer;
   class MinShouldMatchWandScorer;
