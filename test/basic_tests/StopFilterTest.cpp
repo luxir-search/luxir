@@ -1,0 +1,128 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+#include "luxir/analysis/Analyzer.h"
+#include "luxir/api/luxir_types.hpp"
+#include "luxir/schema/Schema.h"
+#include "test/LuxirTest.h"
+#include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
+#include "test/TestUtils.h"
+
+using namespace luxir;
+using namespace luxir::test;
+
+namespace {
+std::shared_ptr<const Analyzer> compile(std::string_view json) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::AnalyzerDef def;
+  std::string error;
+  if (!api::read_json(def, json, arena, &error)) throw std::runtime_error(error);
+  return Analyzer::compile(def);
+}
+struct Analysis {
+  std::vector<std::string> terms;
+  std::vector<int> positions;
+};
+Analysis analyze(TokenChain& chain, std::string_view value) {
+  chain.setValue(value);
+  chain.reset();
+  Analysis out;
+  int position = -1;
+  while (chain.tail->incrementToken()) {
+    auto& token = chain.getToken();
+    out.terms.emplace_back(token.text);
+    position += token.positionIncrement;
+    out.positions.push_back(position);
+  }
+  return out;
+}
+std::shared_ptr<Schema> schema(std::string_view json) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  if (!api::read_json(def, json, arena)) throw std::runtime_error("Invalid test schema");
+  return Schema::fromProto(def);
+}
+} // namespace
+
+class StopFilterTest : public LuxirTest {};
+
+TEST_F(StopFilterTest, foldingPositionsFusionAndLifetime) {
+  auto plan = compile(R"({"tokenizer":"unicode_word","filters":["nfkc_cf","fold",
+    {"name":"stop","params":{"words":["THE","Cafe\u0301","cafe"]}}]})");
+  EXPECT_TRUE(plan->fusedFold);
+  auto chain = plan->createChain();
+  auto out = analyze(*chain, "THE Cafe\xcc\x81 tail");
+  EXPECT_EQ((std::vector<std::string>{"tail"}), out.terms);
+  EXPECT_EQ((std::vector<int>{2}), out.positions);
+  auto head = plan->tokenizer->create();
+  auto& headRef = *head;
+  std::unique_ptr<TokenStream> tail = std::move(head);
+  for (const auto& factory : plan->filters) tail = factory->create(std::move(tail));
+  TokenChain unfused(headRef, std::move(tail), true);
+  auto reference = analyze(unfused, "THE Cafe\xcc\x81 tail");
+  EXPECT_EQ(out.terms, reference.terms);
+  EXPECT_EQ(out.positions, reference.positions);
+  plan.reset();
+  EXPECT_TRUE(analyze(*chain, "THE").terms.empty());
+  EXPECT_EQ((std::vector<int>{0}), analyze(*chain, "tail").positions);
+  std::string term = "THE";
+  chain->normalizeTerm(term);
+  EXPECT_EQ("the", term);
+}
+
+TEST_F(StopFilterTest, onlyPrecedingNormalizationAndMultipleStops) {
+  auto early = compile(R"({"filters":[{"name":"stop","params":{"words":["THE"]}},"lowercase"]})")->createChain();
+  EXPECT_EQ((std::vector<std::string>{"the"}), analyze(*early, "the").terms);
+  EXPECT_TRUE(analyze(*early, "THE").terms.empty());
+  auto chain = compile(R"({"filters":["lowercase",{"name":"stop","params":{"words":["THE"]}},
+    "nfkc_cf","fold",{"name":"stop","params":{"words":["Cafe\u0301"]}}]})")->createChain();
+  EXPECT_EQ((std::vector<int>{2}), analyze(*chain, "THE CAFE tail").positions);
+  auto stemmed = compile(R"({"filters":["lowercase","kstem",{"name":"stop","params":{"words":["ponies"]}}]})")->createChain();
+  EXPECT_EQ((std::vector<std::string>{"pony"}), analyze(*stemmed, "PONIES").terms);
+}
+
+TEST_F(StopFilterTest, normalizingCharFiltersParticipate) {
+  auto chain = compile(R"({"char_filters":["html_strip","nfkc_cf",
+    {"name":"mapping","params":{"mappings":["- =>"]}}],
+    "filters":["fold",{"name":"stop","params":{"words":["CAF\u00c9-BAR"]}}]})")->createChain();
+  auto out = analyze(*chain, "<b>CAFE-BAR</b> next");
+  EXPECT_EQ((std::vector<std::string>{"next"}), out.terms);
+  EXPECT_EQ((std::vector<int>{1}), out.positions);
+}
+
+TEST_F(StopFilterTest, invalidWordsAndStringNormalizers) {
+  for (auto component : {R"({"name":"stop"})", R"({"name":"stop","params":{"words":[]}})",
+      R"({"name":"stop","params":{"words":[""]}})", R"({"name":"stop","params":{"words":"the"}})",
+      R"({"name":"stop","params":{"words":[42]}})",
+      R"({"name":"stop","params":{"words":["the"],"ignore_case":true}})",
+      R"({"name":"stop","params":{"words":["\u00ad"]}})"}) {
+    SCOPED_TRACE(component);
+    EXPECT_THROW(compile(std::string(R"({"filters":["nfkc_cf",)") + component + "]}"), std::invalid_argument);
+  }
+  EXPECT_THROW(schema(R"({"fields":{"tag":{"type":"string","normalizer":[
+    {"name":"stop","params":{"words":["the"]}}]}}})"), SchemaError);
+}
+
+TEST_F(StopFilterTest, phrasesAndTrailingHolesBetweenValues) {
+  CollectionHelper ch;
+  ch.collection().setSchema(schema(R"({"fields":{"id":"id","body":{"type":"text","multi":true,
+    "analyzer":{"filters":["lowercase",{"name":"stop","params":{"words":["the"]}}]}}}})"));
+  ch.index(flatdoc("id", "gap", "body", "red the blue"));
+  ch.index(flatdoc("id", "adjacent", "body", "red blue"));
+  ch.index(flatdoc("id", "values", "body", std::vector<std::string>{"red the", "blue"}), UpdateMessage::COMMIT);
+  for (int mode = 0; mode < 4; ++mode) {
+    auto req = localReq(ch.getSearchEngine());
+    auto& q = req->topDocs("q");
+    if (mode == 0) q.phraseText("body", "RED THE BLUE");
+    if (mode == 1) q.phraseQuery("body", {"red the", "blue"});
+    if (mode == 2) q.phraseQuery("body", {"red", "the blue"});
+    if (mode == 3) q.matchQuery("body", "THE");
+    q.fields({"id"});
+    req->execute();
+    ASSERT_OK(req);
+    auto docs = req->getDocs();
+    if (mode == 3) { EXPECT_TRUE(docs.empty()); continue; }
+    ASSERT_EQ(1u, docs.size());
+    EXPECT_EQ(mode == 1 ? "adjacent" : "gap", std::get<std::string>(*find(docs[0], "id")));
+  }
+}

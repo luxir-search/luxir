@@ -311,11 +311,16 @@ public:
   virtual std::unique_ptr<Tokenizer> create() const = 0;
 };
 
+class TokenChain;
+
 class TokenFilterFactory : public TokenStreamFactory {
 public:
   // True when normalizeTerm applies this filter's transformation. Only these
   // filters may appear in STRING normalizers; stemmers are analysis-only.
   bool normalizing = false;
+  // Once at compile time, before freezing the factory. The prefix is unfused
+  // and contains only preceding stages; runtime chains never call this hook.
+  virtual void prepare(TokenChain& preceding) { unused(preceding); }
   virtual std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const = 0;
 };
 
@@ -325,7 +330,7 @@ public:
 // teaching message (the valid names / the offending keys); Schema::fromProto
 // adds the field name.
 std::unique_ptr<const TokenizerFactory> makeTokenizerFactory(const api::AnalyzerComponent& def);
-std::unique_ptr<const TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def);
+std::unique_ptr<TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def);
 
 
 class TokenChain {

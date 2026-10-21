@@ -473,7 +473,8 @@ A tokenizer is followed by the configured token filters:
 | `lowercase` | Filter: Unicode lowercasing only. |
 | `fold` | Filter: accent and diacritic folding. |
 | `english_possessive` | Filter: remove a trailing `'s`. |
-| `kstem` | Filter: KStem English stemming; the only component with parameters. |
+| `kstem` | Filter: KStem English stemming; optional `possessive` parameter. |
+| `stop` | Filter: remove tokens in the required non-empty `params.words` list. |
 
 Prefer `nfkc_cf` to `lowercase` on Unicode-segmented text: bare lowercasing
 leaves equal-looking strings unequal (composed versus decomposed forms, final
@@ -483,6 +484,25 @@ variation selectors: `co<U+00AD>operate` matches `cooperate`. Tokens that become
 empty are dropped without a position gap. Normalization uses Unicode 15.1.0
 mapping tables followed by stream-safe NFC; runs exceeding 30 non-starters in
 NFKD receive U+034F (CGJ), so those adversarial inputs can differ from ICU.
+
+`stop` takes authored words, for example
+`{"name":"stop","params":{"words":["THE","Cafe\u0301"]}}`. At schema compile
+time, each word is normalized through preceding normalizing character filters
+and token filters, without tokenization. Normalized duplicates collapse; empty
+authored words and words that normalize to empty are rejected. There is no
+`ignore_case` parameter: preceding lowercase, NFKC, and accent-fold filters
+determine how words and tokens meet. Place stop after folding and before
+`english_possessive` or `kstem`; those analysis-only transformations are skipped
+by term normalization. Later filters do not affect the stop set.
+
+Removed tokens leave position holes before the next emitted token, preserving
+phrase distances. Trailing holes are discarded because token streams do not
+report final position increments yet. Indexed values retain the fixed
+100-position gap, but exact cross-value distances omit trailing stops. Each
+`phrase.words` entry is analyzed independently, so trailing stops at the end of
+an entry also lose their holes; use one `phrase.text` string to preserve internal
+stopword distances. Stop does not remove prefix/fuzzy/range terms or wildcard/
+regex literals during normalization, and cannot appear in STRING normalizers.
 
 `kstem` implements Bob Krovetz's dictionary-based English stemming algorithm:
 `ponies` becomes `pony`, while recognized dictionary words are preserved or
