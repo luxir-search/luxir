@@ -7768,7 +7768,7 @@ TEST_F(FacetTest, absentStringPinWithChildrenOnEveryDomainSource) {
     std::array<std::string, 2> pins{"x", "absent"};
     setSelected(facet, pins);
     facet.sum("total", "score_i");
-    facet.topDocs("hits").allQuery().limit(0).getNumber();
+    facet.topDocs("hits").allQuery().limit(0).countLimit();
     req->execute();
     ASSERT_OK(req);
     const auto& result = topFacetResult(*req, "q", "f");
