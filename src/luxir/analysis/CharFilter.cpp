@@ -31,6 +31,12 @@ void CharFilter::replace(size_t start, size_t end, std::string_view replacement)
   copied = end;
 }
 
+std::span<char> CharFilter::bytewiseOutput() {
+  buffer.resize(input.size());
+  copied = input.size();
+  return {buffer.data(), buffer.size()};
+}
+
 std::string_view CharFilter::apply(std::string_view value) {
   input = value;
   copied = 0;
@@ -217,7 +223,7 @@ class HtmlStripFilter : public CharFilter {
 } // namespace
 
 std::unique_ptr<const CharFilterFactory> makeCharFilterFactory(const api::AnalyzerComponent& def) {
-  constexpr std::string_view valid = "lowercase, nfkc_cf, fold, remove_chars, html_strip";
+  constexpr std::string_view valid = "nfkc_cf, remove_chars, html_strip";
   if (def.name == "remove_chars") {
     struct Factory : CharFilterFactory {
       std::shared_ptr<const std::vector<char32_t>> chars;
@@ -248,12 +254,12 @@ std::unique_ptr<const CharFilterFactory> makeCharFilterFactory(const api::Analyz
     factory->chars = std::move(chars);
     return factory;
   }
-  if (def.name == "html_strip" || def.name == "lowercase" || def.name == "nfkc_cf" || def.name == "fold") {
+  if (def.name == "html_strip" || def.name == "nfkc_cf") {
     if (!def.params.empty()) throw std::invalid_argument("char filter '" + std::string(def.name) + "' takes no parameters");
     struct Factory : CharFilterFactory {
       std::unique_ptr<CharFilter> create() const override {
         if (name == "html_strip") return std::make_unique<HtmlStripFilter>();
-        return makeUnicodeCharFilter(name);
+        return makeNfkcCfCharFilter();
       }
     };
     auto factory = std::make_unique<Factory>();

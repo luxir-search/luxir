@@ -501,32 +501,17 @@ std::unique_ptr<TokenStream> makeAccentFoldFilter(std::unique_ptr<TokenStream> s
 }
 
 namespace {
-class UnicodeCharFilter : public CharFilter {
-  std::string name;
+class NfkcCfCharFilter : public CharFilter {
   std::string scratch;
-public:
-  explicit UnicodeCharFilter(std::string_view name) : name(name) {}
-private:
+
   void filter() override {
-    if (name == "lowercase") {
-      auto lowered = applyLowercase(input, scratch);
-      if (lowered == input) return;
-      // Default Unicode lowercase has one contextual mapping (final sigma),
-      // whose UTF-8 length is the same as its non-contextual mapping. Compute
-      // text over the full value, then map each scalar's output length.
-      size_t out = 0;
-      auto decoded = una::views::utf8(input);
-      for (auto it = decoded.begin(); it != decoded.end(); ++it) {
-        size_t start = (size_t) (it.begin() - input.begin());
-        size_t end = (size_t) (it.end() - input.begin());
-        size_t len = *it < 128 ? 1 : una::cases::to_lowercase_utf8(input.substr(start, end - start)).size();
-        replace(start, end, lowered.substr(out, len));
-        out += len;
-      }
+    if (isAscii(input)) {
+      if (std::none_of(input.begin(), input.end(), [](char c) { return c >= 'A' && c <= 'Z'; })) return;
+      auto out = bytewiseOutput();
+      ascii::lowerCopy(out.data(), input.data(), input.size());
       return;
     }
-    if (name == "nfkc_cf" && applyNfkcCf(input, scratch) == input) return;
-    if (name == "fold" && std::all_of(input.begin(), input.end(), [](unsigned char c) { return c < 128; })) return;
+    if (applyNfkcCf(input, scratch) == input) return;
     // Split only at normalization-safe boundaries: a starter that cannot
     // compose backwards and has no leading NFKD non-starters. This preserves
     // Hangul composition, canonical reordering and stream-safe NFC behavior.
@@ -535,24 +520,18 @@ private:
     size_t start = 0;
     auto emit = [&](size_t end) {
       auto part = input.substr(start, end - start);
-      if (name == "nfkc_cf") replace(start, end, applyNfkcCf(part, scratch));
-      else {
-        scratch = una::norm::to_unaccent_utf8(part);
-        replace(start, end, scratch);
-      }
+      replace(start, end, applyNfkcCf(part, scratch));
       start = end;
     };
     auto decoded = una::views::utf8(input);
     for (auto it = decoded.begin(); it != decoded.end(); ++it) {
       uint32_t cp = (uint32_t) *it;
-      if (name == "nfkc_cf") {
-        auto mapping = nfkc_cf_data::lookup(cp).mapping;
-        if (mapping) {
-          std::string_view bytes((const char*) nfkc_cf_data::utf8 + (mapping & 0xFFFFFF),
-                                 (mapping >> 24) & 127);
-          if (bytes.empty()) continue;
-          cp = (uint32_t) *una::views::utf8(bytes).begin();
-        }
+      auto mapping = nfkc_cf_data::lookup(cp).mapping;
+      if (mapping) {
+        std::string_view bytes((const char*) nfkc_cf_data::utf8 + (mapping & 0xFFFFFF),
+                               (mapping >> 24) & 127);
+        if (bytes.empty()) continue;
+        cp = (uint32_t) *una::views::utf8(bytes).begin();
       }
       size_t offset = (size_t) (it.begin() - input.begin());
       if (offset > start && !(nfkc_cf_data::lookup(cp).props & 0x7FF)) emit(offset);
@@ -563,8 +542,8 @@ private:
 
 } // namespace
 
-std::unique_ptr<CharFilter> makeUnicodeCharFilter(std::string_view name) {
-  return std::make_unique<UnicodeCharFilter>(name);
+std::unique_ptr<CharFilter> makeNfkcCfCharFilter() {
+  return std::make_unique<NfkcCfCharFilter>();
 }
 
 TokenChain::TokenChain(Tokenizer& head, std::unique_ptr<TokenStream> tail, bool stateful,

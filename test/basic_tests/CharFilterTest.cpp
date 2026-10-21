@@ -73,8 +73,8 @@ TEST_F(CharFilterTest, removeUnicodeCharactersBeforeSegmentation) {
 }
 
 TEST_F(CharFilterTest, orderAndCanonicalIdentity) {
-  auto first = compile(R"({"char_filters":["lowercase",{"name":"remove_chars","params":{"chars":["a"]}}]})");
-  auto second = compile(R"({"char_filters":[{"name":"remove_chars","params":{"chars":["a"]}},"lowercase"]})");
+  auto first = compile(R"({"char_filters":["nfkc_cf",{"name":"remove_chars","params":{"chars":["a"]}}]})");
+  auto second = compile(R"({"char_filters":[{"name":"remove_chars","params":{"chars":["a"]}},"nfkc_cf"]})");
   EXPECT_NE(first->canonical, second->canonical);
   EXPECT_EQ((std::vector<std::string>{"b"}), analyze(*first->createChain(), "AB").terms);
   EXPECT_EQ((std::vector<std::string>{"ab"}), analyze(*second->createChain(), "AB").terms);
@@ -86,7 +86,7 @@ TEST_F(CharFilterTest, orderAndCanonicalIdentity) {
 }
 
 TEST_F(CharFilterTest, htmlMarkupEntitiesAndOffsets) {
-  auto chain = compile(R"({"tokenizer":"unicode_word","char_filters":["html_strip","nfkc_cf","fold"]})")->createChain();
+  auto chain = compile(R"({"tokenizer":"unicode_word","filters":["fold"],"char_filters":["html_strip","nfkc_cf"]})")->createChain();
   auto result = analyze(*chain, "<p>Caf&eacute;</p><b>ONE</b>&#x20;two");
   EXPECT_EQ((std::vector<std::string>{"cafe", "one", "two"}), result.terms);
   EXPECT_EQ((std::vector<int>{3, 21, 34}), result.starts);
@@ -146,7 +146,7 @@ TEST_F(CharFilterTest, unicodeCleanupMatchesWholeValueNormalization) {
     for (int j = 0; j < 30; ++j) scalars += alphabet[random() % std::size(alphabet)];
     inputs.push_back(una::utf32to8(scalars));
   }
-  for (auto name : {"lowercase", "nfkc_cf", "fold"}) {
+  for (auto name : {"nfkc_cf"}) {
     auto cleaned = compile(std::string(R"({"tokenizer":"keyword","char_filters":[")") + name + R"("]})")->createChain();
     auto reference = compile(std::string(R"({"tokenizer":"keyword","filters":[")") + name + R"("]})")->createChain();
     for (const auto& input : inputs) {
@@ -165,7 +165,7 @@ TEST_F(CharFilterTest, unicodeCleanupMatchesWholeValueNormalization) {
 }
 
 TEST_F(CharFilterTest, rejectsInvalidComponentsAndParameters) {
-  for (auto component : {R"("unknown")", R"({})", R"("kstem")", R"("english_possessive")",
+  for (auto component : {R"("unknown")", R"({})", R"("kstem")", R"("english_possessive")", R"("lowercase")", R"("fold")",
       R"({"name":"html_strip","params":{"x":1}})", R"({"name":"remove_chars"})",
       R"({"name":"remove_chars","params":{"chars":"-"}})",
       R"({"name":"remove_chars","params":{"chars":["ab"]}})",
@@ -202,7 +202,7 @@ TEST_F(CharFilterTest, adversarialHtmlAndReuse) {
 TEST_F(CharFilterTest, schemaInheritanceAndIndexQueryParity) {
   auto s = schema(R"({"templates":{"_base":{"type":"text","analyzer":{"tokenizer":"keyword"}}},
     "fields":{"id":"id","body":{"parent":"_base","stored":true,"multi":true,
-      "analyzer":{"tokenizer":"unicode_word","char_filters":["html_strip","nfkc_cf","fold",
+      "analyzer":{"tokenizer":"unicode_word","filters":["fold"],"char_filters":["html_strip","nfkc_cf",
         {"name":"remove_chars","params":{"chars":["-"]}}]}},
       "only":{"parent":"_base","analyzer":{"char_filters":["html_strip"]}}}})");
   auto* only = (TextFieldType*) s->getFieldTypePtr("only");
@@ -238,7 +238,7 @@ TEST_F(CharFilterTest, schemaInheritanceAndIndexQueryParity) {
 }
 
 TEST_F(CharFilterTest, normalizationExpansionOffsets) {
-  auto chain = compile(R"({"tokenizer":"unicode_word","char_filters":["nfkc_cf","fold"]})")->createChain();
+  auto chain = compile(R"({"tokenizer":"unicode_word","filters":["fold"],"char_filters":["nfkc_cf"]})")->createChain();
   auto out = analyze(*chain, "\xef\xac\x83 A\xcc\x8a \xe2\x84\x80 end");
   EXPECT_EQ((std::vector<std::string>{"ffi", "a", "a", "c", "end"}), out.terms);
   EXPECT_EQ((std::vector<int>{0, 4, 8, 8, 12}), out.starts);
@@ -289,4 +289,23 @@ TEST_F(CharFilterTest, lazyOffsetsAndCursorReuse) {
   chain->normalizeTerm(term);
   EXPECT_EQ("<b>cap", term); // html_strip is analysis-only
   EXPECT_EQ((std::vector<std::string>{"next"}), analyze(*chain, "NEXT").terms);
+}
+
+TEST_F(CharFilterTest, nfkcAsciiOffsetsAndWordBoundaries) {
+  auto chain = compile(R"({"tokenizer":"keyword","char_filters":["nfkc_cf"]})")->createChain();
+  std::string input("MiXeD a-B\0Z", 11);
+  auto out = analyze(*chain, input);
+  ASSERT_EQ(1u, out.terms.size());
+  EXPECT_EQ(std::string("mixed a-b\0z", 11), out.terms[0]);
+  for (int i = 0; i <= (int) input.size(); ++i) {
+    EXPECT_EQ(i, chain->sourceOffset(i, false));
+    EXPECT_EQ(i, chain->sourceOffset(i, true));
+  }
+  input = "already lowercase";
+  chain->setValue(input);
+  chain->reset();
+  ASSERT_TRUE(chain->tail->incrementToken());
+  EXPECT_EQ(input.data(), chain->getToken().text.data());
+  auto words = compile(R"({"tokenizer":"unicode_word","char_filters":["nfkc_cf"]})")->createChain();
+  EXPECT_EQ((std::vector<std::string>{"x2"}), analyze(*words, "x\xc2\xb2").terms);
 }

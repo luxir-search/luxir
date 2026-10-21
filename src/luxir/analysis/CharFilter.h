@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <array>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -28,6 +29,9 @@ protected:
   // Non-overlapping replacements in increasing input order. Copies intervening
   // bytes lazily; input and replacement must not alias this filter's buffer.
   void replace(size_t start, size_t end, std::string_view replacement);
+  // Fill every byte of a same-length result with identity byte offsets.
+  // Call before any replacements; the span cannot resize the output buffer.
+  std::span<char> bytewiseOutput();
 public:
   virtual ~CharFilter() = default;
   std::string_view apply(std::string_view value);
@@ -44,6 +48,5 @@ public:
 };
 
 std::unique_ptr<const CharFilterFactory> makeCharFilterFactory(const api::AnalyzerComponent& def);
-// The existing Unicode cleanup implementations are shared with token filters.
-std::unique_ptr<CharFilter> makeUnicodeCharFilter(std::string_view name);
+std::unique_ptr<CharFilter> makeNfkcCfCharFilter();
 } // namespace luxir

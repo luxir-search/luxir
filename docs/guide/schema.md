@@ -384,11 +384,10 @@ optional. Existing analyzers without `char_filters` retain their behavior.
         "char_filters": [
           "html_strip",
           "nfkc_cf",
-          "fold",
           {"name": "remove_chars", "params": {"chars": ["-", "\u2014"]}}
         ],
         "tokenizer": "unicode_word",
-        "filters": ["kstem"]
+        "filters": ["fold", "kstem"]
       }
     }
   }
@@ -403,17 +402,16 @@ hyphen in the tokenizer's input. Removing `-` from `foo-bar` produces one
 
 | Character filter | Behavior |
 |---|---|
-| `lowercase` | Existing Unicode lowercase method, applied to the whole value. |
 | `nfkc_cf` | Existing Unicode NFKC case folding, including default-ignorable removal, before segmentation. |
-| `fold` | Existing accent/diacritic folding, applied before segmentation. |
 | `remove_chars` | Delete Unicode scalars listed in `params.chars`. Each entry must be exactly one character; supplementary characters are supported. An empty list is a no-op; duplicates have no effect. |
 | `html_strip` | Extract text, remove tags/comments/declarations and script/style contents, and decode named and numeric HTML character references once. |
 
 These are the supported character filters; stemming and English possessive
 removal remain token filters. All except `remove_chars` take no parameters.
-The same lowercase and folding methods can still be placed in `filters` to
-retain their existing per-token behavior. Moving a fold before segmentation
-can change word boundaries, so the two placements are not interchangeable.
+Lowercase and accent folding remain token filters. `nfkc_cf` is also available
+as a char filter because compatibility normalization before segmentation can
+change word boundaries. Its ASCII path only lowercases bytes, preserving all
+byte offsets; unchanged input is borrowed.
 
 `html_strip` uses a forward scan with bounded named-reference lookup. It does
 not build a DOM, execute scripts, fetch resources, or expand document-defined
