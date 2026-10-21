@@ -6,6 +6,7 @@
 #include <array>
 #include <latch>
 #include <limits>
+#include <map>
 #include <random>
 #include <set>
 #include <string>
@@ -40,9 +41,10 @@ auto facetAggregateOverrides() {
       forcedFacetFeedStrategy, forcedFacetSubOpInline,
       forcedRequestMemoryMaxBytes,
       facetAggregateStateReservationCounterForTests,
+      aggregateExecutionStatsForTests,
       inlineAggregateStatsForTests,
       inlineFacetEntryStatsForTests,
-      disableDenseFacetStateForTests,
+      disableDenseFacetStateForTests, disableAggregateSharingForTests,
       forcedInlineFacetEntryMode,
       forcedRangeFacetBucketDomainByteBudget,
       forcedRangeFacetBindingStateChunkBytes,
@@ -53,6 +55,7 @@ AggregateProgram* parseAggregate(ArenaOwner& memory, Schema& schema,
                                  std::string_view expression,
                                  std::string_view opName = "metric") {
   AggregateExprOptions options{&schema, {}, opName};
+  options.shareProducers = !disableAggregateSharingForTests;
   return AggregateExprParser(options, *memory.arena).parse(expression);
 }
 
@@ -75,8 +78,8 @@ BucketScalar evaluate(AggregateProgram& program, IndexReader& reader, IndexReade
       bindAggregateInputs(program, pool, segment, resolveAggregateFields(program, pool, reader));
   int32_t maxDoc = segment.postingsReader().maxDoc();
   for (int32_t doc = 0; doc < maxDoc; doc++) {
-    for (size_t leaf = 0; leaf < bindings.size(); leaf++) {
-      accumulator.add((uint32_t)leaf, bindings[leaf].evalPoint(doc));
+    for (size_t producer = 0; producer < bindings.size(); producer++) {
+      accumulator.add((uint32_t)producer, bindings[producer].evalPoint(doc));
     }
   }
   return accumulator.finish();
@@ -101,6 +104,72 @@ std::vector<double> indexPercentileData(CollectionHelper& helper, int segments) 
   return values;
 }
 
+void indexSharedSketchData(CollectionHelper& helper) {
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  for (int segment = 0; segment < 3; segment++) {
+    std::vector<Doc> docs;
+    for (int i = 0; i < 600; i++) {
+      double x = std::exp((double)((i * 7 + segment) % 101) / 10) * (i % 2 ? 100 : 1);
+      docs.push_back(flatdoc("id", std::to_string(segment * 600 + i), "x_d", x,
+          "y_d", x * 2, "bucket_i", i % 2, "cat_s", i % 2 ? "b" : "a"));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+}
+
+constexpr std::string_view SHARED_SKETCH_OPS = R"json({
+  "p50":"percentile(x_d,50)","p95":"percentile(x_d,95)",
+  "p99":"percentile(x_d,99)","spread":"percentile(x_d,99)-percentile(x_d,50)"})json";
+
+using SketchResults = std::map<std::string, std::vector<uint64_t>>;
+
+void collectSketchResults(const api::Val& value, const std::string& path, SketchResults& result) {
+  auto ops = [&](const auto& children, std::string_view suffix = {}) {
+    for (auto& [name, child] : children) {
+      collectSketchResults(*child, path + std::string(suffix) + "/" + std::string(name), result);
+    }
+  };
+  if (const auto* number = std::get_if<double>(&value.kind)) {
+    result[path] = {(uint64_t)value.kind.index(), std::bit_cast<uint64_t>(*number)};
+  } else if (const auto* number = std::get_if<int64_t>(&value.kind)) {
+    result[path] = {(uint64_t)value.kind.index(), std::bit_cast<uint64_t>(*number)};
+  } else if (value.isNull()) {
+    result[path] = {(uint64_t)value.kind.index()};
+  } else if (const auto* facet = std::get_if<api::FacetResult>(&value.kind)) {
+    ops(facet->ops);
+  } else if (const auto* list = std::get_if<api::DocList>(&value.kind)) {
+    ops(list->ops);
+    if (list->groups) ops(list->groups->ops, "/groups");
+  } else if (const auto* array = std::get_if<api::ArrVal>(&value.kind)) {
+    result[path] = {(uint64_t)value.kind.index(), array->v.size()};
+    for (size_t i = 0; i < array->v.size(); i++) {
+      collectSketchResults(array->v[i], path + "/" + std::to_string(i), result);
+    }
+  } else ADD_FAILURE() << "unexpected metric result at " << path;
+}
+
+struct SketchRun {
+  SketchResults values;
+  size_t peakBytes;
+};
+
+SketchRun runSharedSketchRequest(CollectionHelper& helper, std::string_view json,
+                                 AggregateExecutionStats& stats, int parallel = 1) {
+  SearchOverridesGuard guard(aggregateExecutionStatsForTests);
+  aggregateExecutionStatsForTests = &stats;
+  auto req = localReq(helper.getSearchEngine());
+  parseQueryRequest(json, req->rawRequest(), req->mr);
+  req->collection("main");
+  req->execute(parallel);
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  SketchResults result;
+  if (req->ok()) for (auto& [name, value] : req->responses.back()->proto.ops) {
+    collectSketchResults(*value, "/" + std::string(name), result);
+  }
+  EXPECT_EQ(0u, stats.retainedStateBytes.load());
+  return {std::move(result), req->memoryTracker.peak()};
+}
+
 } // namespace
 
 class AggregateExprTest : public LuxirTest {};
@@ -114,7 +183,7 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
   ASSERT_NE(nullptr, expression->root().function);
   EXPECT_EQ(ValueOpcode::ADD, expression->root().function->opcode);
   ASSERT_EQ(2u, expression->leaves.size());
-  EXPECT_EQ(ValueOpcode::MUL, expression->leaves[0].input->root().opcode);
+  EXPECT_EQ(ValueOpcode::MUL, expression->producers[0].input->root().opcode);
 
   AggregateProgram* functionForms = parseAggregate(
       memory, *schema, "add(sum(price_i), div(max(foo_i), 2))");
@@ -137,7 +206,7 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
   AggregateProgram* nested =
       parseAggregate(memory, *schema, "avg(avg(prices_is))");
   ASSERT_EQ(1u, nested->leaves.size());
-  EXPECT_EQ(ValueOpcode::AVG, nested->leaves[0].input->root().opcode);
+  EXPECT_EQ(ValueOpcode::AVG, nested->producers[0].input->root().opcode);
 
   expectParseError(memory, *schema, "avg(prices_is)",
                    "requires one scalar per document");
@@ -198,8 +267,8 @@ TEST_F(AggregateExprTest, sharedGrammarLevelsOffsetsAndScoreRejection) {
       "sum(price_i * $scale) + $bias");
   EXPECT_EQ(BucketValueType::DOUBLE, variables->root().type);
   EXPECT_EQ(ValueNodeKind::VARIABLE,
-            variables->leaves[0].input->nodes[
-                variables->leaves[0].input->root().children[1]].kind);
+            variables->producers[0].input->nodes[
+                variables->producers[0].input->root().children[1]].kind);
 }
 
 TEST_F(AggregateExprTest, bitDomainWalkIncludesLastDocument) {
@@ -365,7 +434,7 @@ TEST_F(AggregateExprTest, registryEntriesHaveResolvedStateLifecycles) {
         memory, *schema, std::string(function.name)
             + (function.minArguments == 2 ? "(price_i, 5)" : "(price_i)"));
     ASSERT_EQ(1u, program->leaves.size());
-    const AggregateStateOps& state = program->leaves[0].resolved.state;
+    const AggregateStateOps& state = program->producers[0].resolved.state;
     EXPECT_GT(state.bytes, 0u) << function.name;
     EXPECT_NE(nullptr, state.init) << function.name;
     EXPECT_NE(nullptr, state.accumulate) << function.name;
@@ -606,20 +675,20 @@ TEST_F(AggregateExprTest, sketchRowsValidateArgumentsCapabilitiesAndEmptyResults
   expectParseError(memory, *schema, "percentile_rank(x_s, 1)", "numeric expression");
   expectParseError(memory, *schema, "percentile_rank(x_i, 1, 2)", "arguments");
   auto* cardinality = parseAggregate(memory, *schema, "cardinality(x_i, 0)");
-  EXPECT_FALSE(cardinality->leaves[0].resolved.state.inlineCapable);
-  EXPECT_NE(nullptr, cardinality->leaves[0].resolved.state.destroy);
+  EXPECT_FALSE(cardinality->producers[0].resolved.state.inlineCapable);
+  EXPECT_NE(nullptr, cardinality->producers[0].resolved.state.destroy);
   EXPECT_EQ(0, (int64_t)AggregateAccumulator(*cardinality).finish().intValue);
   auto* rank = parseAggregate(memory, *schema, "percentile_rank(x_i, 1)");
-  EXPECT_TRUE(rank->leaves[0].resolved.state.inlineCapable);
+  EXPECT_TRUE(rank->producers[0].resolved.state.inlineCapable);
   EXPECT_FALSE(AggregateAccumulator(*rank).finish().valid);
-  EXPECT_FALSE(parseAggregate(memory, *schema, "sum(x_d)")->leaves[0].resolved.state.orderSensitive);
-  EXPECT_FALSE(parseAggregate(memory, *schema, "sum(x_i)")->leaves[0].resolved.state.orderSensitive);
+  EXPECT_FALSE(parseAggregate(memory, *schema, "sum(x_d)")->producers[0].resolved.state.orderSensitive);
+  EXPECT_FALSE(parseAggregate(memory, *schema, "sum(x_i)")->producers[0].resolved.state.orderSensitive);
 }
 
 TEST_F(AggregateExprTest, indirectStatesReleaseFailedAddsAndMerges) {
   auto schema = Schema::createDefaultSchema();
   ArenaOwner memory;
-  auto* two = parseAggregate(memory, *schema, "cardinality(x_i) + cardinality(x_i)");
+  auto* two = parseAggregate(memory, *schema, "cardinality(x_i) + cardinality(y_i)");
   RequestMemTracker small(sizeof(HyperLogLog));
   RequestMemResource initResource(small, "test aggregates");
   {
@@ -904,8 +973,8 @@ TEST_F(AggregateExprTest, percentileValidationNatureAndExactInputs) {
   auto* program = parseAggregate(memory, *schema, "percentile(when_dt,25,20.5)");
   EXPECT_EQ(ValueNature::DATE, program->root().nature);
   EXPECT_EQ(BucketValueType::DOUBLE, program->root().type);
-  EXPECT_TRUE(program->leaves[0].resolved.state.orderSensitive);
-  EXPECT_FALSE(program->leaves[0].resolved.state.inlineCapable);
+  EXPECT_TRUE(program->producers[0].resolved.state.orderSensitive);
+  EXPECT_FALSE(program->producers[0].resolved.state.inlineCapable);
   RequestMemTracker tracker(0);
   RequestMemResource resource(tracker, "percentile");
   {
@@ -922,6 +991,446 @@ TEST_F(AggregateExprTest, percentileValidationNatureAndExactInputs) {
     EXPECT_EQ(ValueNature::DATE, result.nature);
   }
   EXPECT_EQ(0u, tracker.bytes());
+}
+
+TEST_F(AggregateExprTest, internedPercentilesShareDigestMemoryAndBits) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  SearchOverridesGuard guard(disableAggregateSharingForTests);
+  std::array<size_t, 2> bytes{};
+  std::array<uint64_t, 2> bits{};
+  for (int separate : {0, 1}) {
+    disableAggregateSharingForTests = separate != 0;
+    auto* program = parseAggregate(memory, *schema,
+        "percentile(x_d,99) - percentile(x_d,50,100)");
+    EXPECT_EQ(2u, program->leaves.size());
+    ASSERT_EQ(separate ? 2u : 1u, program->producers.size());
+    RequestMemTracker tracker(0);
+    RequestMemResource resource(tracker, "interned percentile");
+    {
+      AggregateAccumulator accumulator(*program, &resource);
+      EXPECT_FALSE(accumulator.finish().valid);
+      EXPECT_EQ(0u, tracker.bytes());
+      for (int value : {3, 1, 2}) {
+        for (uint32_t producer = 0; producer < program->producers.size(); producer++) {
+          accumulator.add(producer, ValueResult::floating((double)value));
+        }
+      }
+      EXPECT_DOUBLE_EQ(0.98, accumulator.finish().doubleValue);
+      for (int i = 0; i < 2400; i++) {
+        for (uint32_t producer = 0; producer < program->producers.size(); producer++) {
+          accumulator.add(producer, ValueResult::floating(std::exp((double)(i % 101) / 10)));
+        }
+      }
+      auto result = accumulator.finish();
+      ASSERT_TRUE(result.valid);
+      bits[separate] = std::bit_cast<uint64_t>(result.doubleValue);
+      bytes[separate] = resource.bytes();
+      EXPECT_EQ(bytes[separate], tracker.bytes());
+    }
+    EXPECT_EQ(0u, tracker.bytes());
+  }
+  EXPECT_EQ(bits[0], bits[1]);
+  EXPECT_GT(bytes[0], sizeof(TDigest));
+  EXPECT_EQ(bytes[0] * 2, bytes[1]);
+}
+
+TEST_F(AggregateExprTest, producerKeysUseFamilyInputAndStateArguments) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  for (auto [expression, count] : std::initializer_list<std::pair<std::string_view, size_t>>{
+      {"sum(x_i) + sum(col('x_i'))", 1},
+      {"avg(x_i) + avg(x_i)", 1},
+      {"min(x_i) + min(x_i)", 1},
+      {"max(x_i) + max(x_i)", 1},
+      {"sum(x_i) + avg(x_i)", 2},
+      {"percentile(x_d,99,100.0) - percentile(x_d,50)", 1},
+      {"percentile(x_d,99,101) - percentile(x_d,50)", 2},
+      {"cardinality(x_i) + cardinality(x_i,3000.0)", 1},
+      {"cardinality(x_i,3000) + cardinality(x_i)", 1},
+      {"cardinality(x_i,3001) + cardinality(x_i)", 2},
+      {"percentile_rank(x_i,10) + percentile_rank(x_i,20)", 2},
+      {"percentile_rank(f_f,0.1) + percentile_rank(f_f,0.10000000149011612)", 1},
+      {"sum(x_i) + sum(y_i)", 2},
+      {"sum(x_i) + sum(x_i + 0)", 2},
+      {"sum(x_i + 1) + sum(1 + x_i)", 2},
+      {"sum(9007199254740992) + sum(9007199254740993)", 2}}) {
+    EXPECT_EQ(count, parseAggregate(memory, *schema, expression)->producers.size()) << expression;
+  }
+}
+
+TEST_F(AggregateExprTest, producerInputsCompareResolvedConstantsStructurally) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory, otherMemory;
+  std::array<int64_t, 2> integers{9007199254740992LL, 9007199254740993LL};
+  auto otherIntegers = integers;
+  std::array<double, 2> doubles{0.5, 1.5};
+  auto otherDoubles = doubles;
+  api::Val scalar, array, copy, floating, floatingCopy;
+  scalar.kind = int64_t{9007199254740993LL};
+  array.kind = api::ArrInt{integers};
+  copy.kind = api::ArrInt{otherIntegers};
+  floating.kind = api::ArrDouble{doubles};
+  floatingCopy.kind = api::ArrDouble{otherDoubles};
+  using Pair = std::pair<std::string_view, ::hpp_proto::indirect_view<api::Val>>;
+  std::array<Pair, 5> pairs{{{"n", {&scalar}}, {"a", {&array}},
+                            {"b", {&copy}}, {"d", {&floating}}, {"e", {&floatingCopy}}}};
+  AggregateExprOptions options{schema.get(), {pairs}, "constants"};
+  auto parse = [&](std::string_view expression) {
+    return AggregateExprParser(options, *memory.arena).parse(expression);
+  };
+  EXPECT_EQ(1u, parse("sum($n) + sum(9007199254740993)")->producers.size());
+  EXPECT_EQ(2u, parse("sum($n) + sum(9007199254740992)")->producers.size());
+  auto* arrays = parse("cardinality($a) + cardinality($b)");
+  EXPECT_EQ(1u, arrays->producers.size());
+  EXPECT_EQ(1u, parse("cardinality($d) + cardinality($e)")->producers.size());
+  EXPECT_EQ(2u, parse("cardinality($a) + cardinality($d)")->producers.size());
+  auto* shifted = AggregateExprParser(options, *otherMemory.arena).parse("cardinality($b)");
+  auto& arrayInput = *shifted->producers[0].input;
+  arrayInput.intArrays.insert(arrayInput.intArrays.begin(), 7);
+  arrayInput.nodes[arrayInput.rootNode].arrayOffset++;
+  EXPECT_TRUE(arrays->producers[0].sameState(shifted->producers[0]));
+  auto* left = parse("sum(x_i + $n)");
+  auto* right = parseAggregate(otherMemory, *schema, "sum( x_i + 9007199254740993 )");
+  auto& input = *right->producers[0].input;
+  input.nodes.insert(input.nodes.begin(), ValueNode{});
+  for (auto& node : input.nodes) {
+    for (uint8_t i = 0; i < node.childCount; i++) node.children[i]++;
+  }
+  input.rootNode++;
+  EXPECT_TRUE(left->producers[0].sameState(right->producers[0]));
+  otherIntegers[1]--;
+  EXPECT_EQ(2u, parse("cardinality($a) + cardinality($b)")->producers.size());
+  otherDoubles[1]++;
+  EXPECT_EQ(2u, parse("cardinality($d) + cardinality($e)")->producers.size());
+}
+
+TEST_F(AggregateExprTest, programsAdoptProducerLayoutForSharedStateReadouts) {
+  auto schema = Schema::createDefaultSchema();
+  ArenaOwner memory;
+  auto* source = parseAggregate(memory, *schema,
+      "cardinality(id) + percentile(x_d,99)");
+  auto* target = parseAggregate(memory, *schema,
+      "percentile(x_d,50,100) + cardinality(id,3000)");
+  auto* reference = parseAggregate(memory, *schema,
+      "percentile(x_d,50,100) + cardinality(id,3000)");
+  auto* different = parseAggregate(memory, *schema,
+      "percentile(x_d,50,101) + cardinality(id)");
+  EXPECT_FALSE(different->adoptProducers(*source));
+  EXPECT_EQ(ValueType::DOUBLE, different->producers[0].input->root().type);
+  EXPECT_TRUE(source->adoptProducers(*source));
+  ASSERT_TRUE(target->adoptProducers(*source));
+  EXPECT_EQ(source->stateBytes, target->stateBytes);
+  EXPECT_EQ(1u, target->leaves[0].producer);
+  EXPECT_EQ(0u, target->leaves[1].producer);
+  for (size_t i = 0; i < source->producers.size(); i++) {
+    EXPECT_EQ(source->producers[i].stateOffset, target->producers[i].stateOffset);
+    EXPECT_EQ(source->producers[i].arguments.data(), target->producers[i].arguments.data());
+  }
+  RequestMemTracker tracker(0);
+  RequestMemResource resource(tracker, "shared layout");
+  {
+    std::vector<std::byte> storage(AggregateStateView::bytes(*source));
+    AggregateStateView state(*source, storage.data()), readout(*target, storage.data());
+    state.init(&resource);
+    AggregateAccumulator expected(*reference, &resource);
+    for (int i = 0; i < 1200; i++) {
+      state.add(0, ValueResult::integer(i % 29));
+      expected.add(1, ValueResult::integer(i % 29));
+      auto value = ValueResult::floating(std::exp((double)(i % 101) / 10));
+      state.add(1, value);
+      expected.add(0, value);
+    }
+    EXPECT_EQ(std::bit_cast<uint64_t>(expected.finish().doubleValue),
+              std::bit_cast<uint64_t>(readout.finish().doubleValue));
+    EXPECT_GT(state.finish().doubleValue, readout.finish().doubleValue);
+    state.destroy();
+  }
+  EXPECT_EQ(0u, tracker.bytes());
+}
+
+TEST_F(AggregateExprTest, internedInputsAgreeAcrossBucketInlineAndReplayBindings) {
+  CollectionHelper helper;
+  indexPercentileData(helper, 3);
+  auto guard = facetAggregateOverrides();
+  forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+  for (auto feed : {FacetFeedStrategy::BUCKET_DOMAINS, FacetFeedStrategy::STRING_COLUMN_REPLAY}) {
+    forcedFacetFeedStrategy = feed;
+    std::vector<uint64_t> expected;
+    for (bool separate : {false, true}) {
+      disableAggregateSharingForTests = separate;
+      auto req = localReq(helper.getSearchEngine());
+      auto& root = req->collection("main");
+      root.expr("spread", "percentile(x_d,99) - percentile(x_d,50)");
+      root.expr("expression", "percentile(x_d*2,99) - percentile(x_d*2,50)");
+      root.expr("ords", "cardinality(cat_s) + cardinality(cat_s)");
+      auto& facet = root.facet("f", "cat_s").limit(-1);
+      facet.expr("spread", "percentile(x_d,99) - percentile(x_d,50)");
+      facet.expr("twice", "sum(x_d) + sum(x_d)");
+      facet.expr("pct", "percentile_rank(x_d,100) + percentile_rank(x_d,100)");
+      req->execute(false);
+      ASSERT_TRUE(req->ok()) << req->errorMsg();
+      EXPECT_EQ(4, req->scalar<int64_t>("ords"));
+      std::vector<uint64_t> bits;
+      for (std::string_view name : {"spread", "expression"}) {
+        bits.push_back(std::bit_cast<uint64_t>(req->scalar<double>(name)));
+      }
+      auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
+      for (std::string_view name : {"spread", "twice", "pct"}) {
+        for (const auto& value : std::get<api::ArrVal>(result.ops.at(name)->kind).v) {
+          bits.push_back(std::bit_cast<uint64_t>(value.asDouble()));
+        }
+      }
+      if (!separate) expected = bits;
+      else EXPECT_EQ(expected, bits);
+      EXPECT_EQ(0u, req->memoryTracker.bytes());
+    }
+  }
+}
+
+TEST_F(AggregateExprTest, internedEmptyAndFailingInputsPreserveNulls) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "1", "x_i", -1), UpdateMessage::COMMIT);
+  SearchOverridesGuard guard(disableAggregateSharingForTests);
+  for (bool separate : {false, true}) {
+    disableAggregateSharingForTests = separate;
+    auto req = localReq(helper.getSearchEngine());
+    auto& root = req->collection("main");
+    root.expr("empty", "percentile(missing_d,99) - percentile(missing_d,50)");
+    root.expr("bad", "percentile(sqrt(x_i),99) - percentile(sqrt(x_i),50)");
+    root.expr("zero", "cardinality(missing_d) + cardinality(missing_d)");
+    req->execute(false);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_TRUE(req->responses[0]->proto.ops.at("empty")->isNull());
+    EXPECT_TRUE(req->responses[0]->proto.ops.at("bad")->isNull());
+    EXPECT_EQ(0, req->scalar<int64_t>("zero"));
+    EXPECT_EQ(0u, req->memoryTracker.bytes());
+  }
+}
+
+TEST_F(AggregateExprTest, siblingPercentilesShareRootStateAndRemainDeterministic) {
+  CollectionHelper helper;
+  indexSharedSketchData(helper);
+  auto guard = facetAggregateOverrides();
+  std::string json = "{\"ops\":" + std::string(SHARED_SKETCH_OPS) + "}";
+  AggregateExecutionStats baselineStats, sharedStats;
+  disableAggregateSharingForTests = true;
+  auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+  disableAggregateSharingForTests = false;
+  auto shared = runSharedSketchRequest(helper, json, sharedStats);
+  EXPECT_EQ(baseline.values, shared.values);
+  EXPECT_EQ(4u, shared.values.size());
+  EXPECT_EQ(3u, sharedStats.followers.load());
+  EXPECT_EQ(3u, sharedStats.producerStates.load());
+  EXPECT_EQ(15u, baselineStats.producerStates.load());
+  EXPECT_GT(sharedStats.finishedStateBytes.load(), sizeof(TDigest));
+  EXPECT_EQ(sharedStats.finishedStateBytes.load() * 5, baselineStats.finishedStateBytes.load());
+  EXPECT_GT(baseline.peakBytes, shared.peakBytes);
+  for (int run = 0; run < 3; run++) {
+    AggregateExecutionStats stats;
+    EXPECT_EQ(baseline.values, runSharedSketchRequest(helper, json, stats, -1).values);
+  }
+}
+
+TEST_F(AggregateExprTest, siblingCardinalitiesShareReusableState) {
+  CollectionHelper helper;
+  indexSharedSketchData(helper);
+  auto guard = facetAggregateOverrides();
+  std::string_view json = R"json({"ops":{"a":"cardinality(x_d)",
+    "z":"cardinality(x_d)+cardinality(x_d)"}})json";
+  AggregateExecutionStats baselineStats, sharedStats;
+  disableAggregateSharingForTests = true;
+  auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+  disableAggregateSharingForTests = false;
+  auto shared = runSharedSketchRequest(helper, json, sharedStats);
+  EXPECT_EQ(baseline.values, shared.values);
+  EXPECT_EQ(1u, sharedStats.followers.load());
+  EXPECT_EQ(1u, sharedStats.producerStates.load());
+  EXPECT_EQ(3u, baselineStats.producerStates.load());
+  EXPECT_EQ(sharedStats.finishedStateBytes.load() * 3, baselineStats.finishedStateBytes.load());
+}
+
+TEST_F(AggregateExprTest, siblingSketchesShareFacetBucketsAndDeclineReplay) {
+  CollectionHelper helper;
+  indexSharedSketchData(helper);
+  auto guard = facetAggregateOverrides();
+  SearchOverridesGuard blockGuard(forcedFacetBucketBlockBuckets);
+  forcedFacetBucketBlockBuckets = 1;
+  std::string ops(SHARED_SKETCH_OPS);
+  std::array<std::pair<std::string, size_t>, 4> cases{{
+    {R"json({"ops":{"f":{"field_facet":{"field":"cat_s","limit":-1,"ops":)json" + ops + "}}}}", 2},
+    {R"json({"ops":{"f":{"field_facet":{"field":"bucket_i","limit":-1,"ops":)json" + ops + "}}}}", 2},
+    {R"json({"ops":{"f":{"range_facet":{"field":"bucket_i","start":0,"end":3,"gap":1,"mincount":0,"ops":)json" + ops + "}}}}", 3},
+    {R"json({"ops":{"f":{"query_facet":{"buckets":{"a":"cat_s:a","b":"cat_s:b","empty":"id:absent"},"ops":)json" + ops + "}}}}", 3}
+  }};
+  for (auto feed : {FacetFeedStrategy::BUCKET_DOMAINS, FacetFeedStrategy::STRING_COLUMN_REPLAY}) {
+    forcedFacetFeedStrategy = feed;
+    for (auto& [json, buckets] : cases) {
+      SCOPED_TRACE(json);
+      AggregateExecutionStats baselineStats, sharedStats;
+      disableAggregateSharingForTests = true;
+      auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+      disableAggregateSharingForTests = false;
+      auto shared = runSharedSketchRequest(helper, json, sharedStats);
+      EXPECT_EQ(baseline.values, shared.values);
+      EXPECT_FALSE(shared.values.empty());
+      EXPECT_EQ(3u, sharedStats.followers.load());
+      EXPECT_EQ(buckets * 3, sharedStats.producerStates.load());
+      EXPECT_EQ(buckets * 15, baselineStats.producerStates.load());
+      EXPECT_EQ(sharedStats.finishedStateBytes.load() * 5, baselineStats.finishedStateBytes.load());
+    }
+  }
+}
+
+TEST_F(AggregateExprTest, siblingSketchesRouteListGroupAndFusionResults) {
+  CollectionHelper helper;
+  indexSharedSketchData(helper);
+  auto guard = facetAggregateOverrides();
+  std::string ops(SHARED_SKETCH_OPS);
+  std::array<std::pair<std::string, size_t>, 4> cases{{
+    {R"json({"ops":{"q":{"top_docs":{"limit":0,"ops":)json" + ops + "}}}}", 3},
+    {R"json({"ops":{"q":{"top_docs":{"limit":2,"collapse":{"field":"cat_s","head_sort":"id asc","ops":)json"
+        + ops + R"json(},"ops":)json" + ops + "}}}}", 6},
+    {R"json({"ops":{"f":{"fusion":{"rrf":{},"sources":{"all":{"limit":-1}},"limit":-1,"ops":)json"
+        + ops + "}}}}", 3},
+    {R"json({"ops":{"f":{"fusion":{"rrf":{},"sources":{"all":{"limit":-1}},"limit":2,"collapse":{"field":"cat_s","head_sort":"id asc","ops":)json"
+        + ops + R"json(},"ops":)json" + ops + "}}}}", 6}
+  }};
+  for (auto& [json, followers] : cases) {
+    SCOPED_TRACE(json);
+    AggregateExecutionStats baselineStats, sharedStats;
+    disableAggregateSharingForTests = true;
+    auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+    disableAggregateSharingForTests = false;
+    auto shared = runSharedSketchRequest(helper, json, sharedStats, -1);
+    EXPECT_EQ(baseline.values, shared.values);
+    EXPECT_FALSE(shared.values.empty());
+    EXPECT_EQ(followers, sharedStats.followers.load());
+  }
+}
+
+TEST_F(AggregateExprTest, siblingSketchGroupsRequireEqualIndirectProducerSets) {
+  CollectionHelper helper;
+  indexSharedSketchData(helper);
+  auto guard = facetAggregateOverrides();
+  for (std::string_view ops : {
+      R"json({"a":"percentile(x_d,50)","b":"percentile(x_d,99,101)"})json",
+      R"json({"a":"percentile(x_d,50)","b":"percentile(y_d,99)"})json",
+      R"json({"a":"percentile(x_d,50)","b":"percentile(x_d,99)+sum(x_d)"})json",
+      R"json({"a":"cardinality(x_d)","b":"percentile(x_d,99)"})json",
+      R"json({"a":"percentile(x_d,50)","b":"percentile(x_d,99)+cardinality(cat_s)"})json"}) {
+    SCOPED_TRACE(ops);
+    std::string json = "{\"ops\":" + std::string(ops) + "}";
+    AggregateExecutionStats baselineStats, sharedStats;
+    disableAggregateSharingForTests = true;
+    auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+    disableAggregateSharingForTests = false;
+    auto shared = runSharedSketchRequest(helper, json, sharedStats);
+    EXPECT_EQ(baseline.values, shared.values);
+    EXPECT_EQ(2u, shared.values.size());
+    EXPECT_EQ(0u, sharedStats.followers.load());
+    EXPECT_EQ(baselineStats.producerStates.load(), sharedStats.producerStates.load());
+  }
+}
+
+TEST_F(AggregateExprTest, siblingSketchGroupsRespectRoutesAndNormalizeDefault) {
+  CollectionHelper helper;
+  indexSharedSketchData(helper);
+  auto guard = facetAggregateOverrides();
+  for (std::string json : {
+      R"json({"ops":{"q":{"top_docs":{"limit":0,"filter":[{"query":"bucket_i:0","except_ops":["p50"]}],"ops":)json"
+          + std::string(SHARED_SKETCH_OPS) + "}}}}",
+      std::string(R"json({"ops":{"f":{"field_facet":{"field":"cat_s","limit":-1,"ops":{
+        "a":"percentile(x_d,50)","z":{"expr_op":"percentile(x_d,99)","domain":{}}}}}}})json")}) {
+    SCOPED_TRACE(json);
+    AggregateExecutionStats baselineStats, sharedStats;
+    disableAggregateSharingForTests = true;
+    auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+    disableAggregateSharingForTests = false;
+    auto shared = runSharedSketchRequest(helper, json, sharedStats);
+    EXPECT_EQ(baseline.values, shared.values);
+    EXPECT_FALSE(shared.values.empty());
+    EXPECT_EQ(json.find("except_ops") != std::string::npos ? 2u : 1u,
+              sharedStats.followers.load());
+    EXPECT_EQ(6u, sharedStats.producerStates.load());
+  }
+}
+
+TEST_F(AggregateExprTest, siblingSketchGroupsRefreshFieldsAfterReorderingProducers) {
+  CollectionHelper helper;
+  indexSharedSketchData(helper);
+  auto guard = facetAggregateOverrides();
+  for (std::string_view json : {
+      R"json({"ops":{"a":"percentile(x_d,50)+percentile(y_d+1,99)",
+                   "z":"percentile(y_d+1,50)+percentile(x_d,99)"}})json",
+      R"json({"ops":{"a":"cardinality(cat_s)+percentile(x_d,50)",
+                   "z":"percentile(x_d,99)+cardinality(cat_s)"}})json"}) {
+    AggregateExecutionStats baselineStats, sharedStats;
+    disableAggregateSharingForTests = true;
+    auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+    disableAggregateSharingForTests = false;
+    auto shared = runSharedSketchRequest(helper, json, sharedStats);
+    EXPECT_EQ(baseline.values, shared.values);
+    EXPECT_EQ(1u, sharedStats.followers.load());
+    EXPECT_EQ(6u, sharedStats.producerStates.load());
+    EXPECT_EQ(sharedStats.finishedStateBytes.load() * 2, baselineStats.finishedStateBytes.load());
+  }
+}
+
+TEST_F(AggregateExprTest, siblingSketchesPreserveEmptyAndFailingInputs) {
+  CollectionHelper helper;
+  auto guard = facetAggregateOverrides();
+  std::string ops(SHARED_SKETCH_OPS);
+  for (const std::string& json : {"{\"ops\":" + ops + "}",
+      R"json({"ops":{"f":{"query_facet":{"buckets":{"empty":"id:absent"},"ops":)json" + ops + "}}}}"}) {
+    AggregateExecutionStats baselineStats, sharedStats;
+    disableAggregateSharingForTests = true;
+    auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+    disableAggregateSharingForTests = false;
+    auto shared = runSharedSketchRequest(helper, json, sharedStats);
+    EXPECT_EQ(baseline.values, shared.values);
+    EXPECT_FALSE(shared.values.empty());
+    EXPECT_EQ(3u, sharedStats.followers.load());
+    EXPECT_EQ(1u, sharedStats.producerStates.load());
+    EXPECT_EQ(0u, sharedStats.finishedStateBytes.load());
+  }
+  helper.index(flatdoc("id", "bad", "x_d", -1.0), UpdateMessage::COMMIT);
+  std::string json = R"json({"ops":{"a":"percentile(sqrt(x_d),50)",
+                              "z":"percentile(sqrt(x_d),99)"}})json";
+  AggregateExecutionStats baselineStats, sharedStats;
+  disableAggregateSharingForTests = true;
+  auto baseline = runSharedSketchRequest(helper, json, baselineStats);
+  disableAggregateSharingForTests = false;
+  auto shared = runSharedSketchRequest(helper, json, sharedStats);
+  EXPECT_EQ(baseline.values, shared.values);
+  ASSERT_EQ(2u, shared.values.size());
+  EXPECT_EQ(1u, shared.values.at("/a").size());
+  EXPECT_EQ(1u, shared.values.at("/z").size());
+  EXPECT_EQ(1u, sharedStats.followers.load());
+}
+
+TEST_F(AggregateExprTest, siblingSketchReadoutFailureUsesMemberIdentity) {
+  CollectionHelper helper;
+  helper.indexAll({flatdoc("id", "1", "x_d", 1.0), flatdoc("id", "2", "x_d", 4.0)},
+                  UpdateMessage::COMMIT);
+  SearchOverridesGuard guard(disableAggregateSharingForTests);
+  uint64_t expected = 0;
+  for (bool separate : {true, false}) {
+    disableAggregateSharingForTests = separate;
+    auto req = localReq(helper.getSearchEngine());
+    parseQueryRequest(R"json({"ops":{"a":"percentile(x_d,50)",
+      "z":"sqrt(percentile(x_d,50)-percentile(x_d,99))"}})json",
+      req->rawRequest(), req->mr);
+    req->collection("main");
+    req->execute(false);
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    auto bits = std::bit_cast<uint64_t>(req->scalar<double>("a"));
+    if (separate) expected = bits;
+    else EXPECT_EQ(expected, bits);
+    EXPECT_TRUE(req->responses.back()->proto.ops.at("z")->isNull());
+    ASSERT_EQ(1u, req->respWarnings().size());
+    EXPECT_NE(std::string_view::npos, req->respWarnings()[0].message.find("op 'z'"));
+  }
 }
 
 TEST_F(AggregateExprTest, percentileFieldRangeAndQueryBuckets) {
@@ -1164,10 +1673,10 @@ TEST_F(AggregateExprTest, dataFailuresMergeAndFinishAsNull) {
   AggregateProgram* product = parseAggregate(
       memory, *schema, "sum(x_i) * sum(x_i)");
   AggregateAccumulator overflow(*product);
-  for (uint32_t leaf = 0; leaf < 2; leaf++) {
-    overflow.add(leaf, ValueResult::integer(
+  for (uint32_t producer = 0; producer < product->producers.size(); producer++) {
+    overflow.add(producer, ValueResult::integer(
         std::numeric_limits<int64_t>::max()));
-    overflow.add(leaf, ValueResult::integer(
+    overflow.add(producer, ValueResult::integer(
         std::numeric_limits<int64_t>::max()));
   }
   BucketScalar tooWide = overflow.finish();
@@ -1188,8 +1697,6 @@ TEST_F(AggregateExprTest, dataFailuresMergeAndFinishAsNull) {
   AggregateAccumulator expressionOverflow(*floatingProduct);
   expressionOverflow.add(
       0, ValueResult::floating(std::numeric_limits<double>::max()));
-  expressionOverflow.add(
-      1, ValueResult::floating(std::numeric_limits<double>::max()));
   EXPECT_EQ(AggregateFailure::NON_FINITE_EXPRESSION,
             expressionOverflow.finish().failure);
 
@@ -1855,6 +2362,10 @@ TEST_F(AggregateExprTest, rangeFacetFeedsExprChildrenInBindingBlocks) {
     if (!heavyExpression.empty()) heavyExpression += "+";
     heavyExpression += "sum(x_i)";
   }
+  blocks = 0;
+  run(heavyExpression, 100);
+  EXPECT_EQ(1u, blocks);
+  disableAggregateSharingForTests = true;
   blocks = 0;
   run(heavyExpression, 100);
   EXPECT_GT(blocks, 1u);

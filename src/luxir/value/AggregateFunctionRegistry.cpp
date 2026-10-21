@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -1179,17 +1180,47 @@ ResolvedAggregate resolvePercentile(
   return {BucketValueType::DOUBLE, input->nature, ops};
 }
 
+AggregateConstant canonicalCardinalityArgument(
+    std::span<const AggregateConstant> arguments, uint8_t index) {
+  assert(index == 0);
+  return {ValueType::INT64, cardinalityThreshold(arguments), 0};
+}
+
+AggregateConstant canonicalPercentileArgument(
+    std::span<const AggregateConstant> arguments, uint8_t index) {
+  assert(index == 1);
+  return {ValueType::DOUBLE, 0, percentileCompression(arguments)};
+}
+
 constexpr AggregateFunction FUNCTIONS[] = {
     {"avg", 1, 1, resolveAvg},
     {"sum", 1, 1, resolveSum},
     {"min", 1, 1, resolveMin},
     {"max", 1, 1, resolveMax},
-    {"cardinality", 1, 2, resolveCardinality, true},
+    {"cardinality", 1, 2, resolveCardinality, true, 0, canonicalCardinalityArgument},
     {"percentile_rank", 2, 2, resolveRank},
-    {"percentile", 2, 3, resolvePercentile},
+    {"percentile", 2, 3, resolvePercentile, false, 1, canonicalPercentileArgument},
 };
 
 } // namespace
+
+bool AggregateFunction::sameStateArguments(
+    std::span<const AggregateConstant> left,
+    std::span<const AggregateConstant> right) const {
+  if (canonicalArgument == nullptr && left.size() != right.size()) return false;
+  size_t count = canonicalArgument ? (size_t)maxArguments - 1 : left.size();
+  for (uint8_t i = 0; i < count; i++) {
+    if ((readoutArguments & (uint32_t{1} << i)) != 0) continue;
+    AggregateConstant a = canonicalArgument ? canonicalArgument(left, i) : left[i];
+    AggregateConstant b = canonicalArgument ? canonicalArgument(right, i) : right[i];
+    if (a.type != b.type) return false;
+    if (a.type == ValueType::INT64) {
+      if (a.intValue != b.intValue) return false;
+    } else if (std::bit_cast<uint64_t>(a.doubleValue)
+        != std::bit_cast<uint64_t>(b.doubleValue)) return false;
+  }
+  return true;
+}
 
 const AggregateFunction* AggregateFunctionRegistry::find(std::string_view name) {
   auto entry = std::ranges::find(FUNCTIONS, name, &AggregateFunction::name);

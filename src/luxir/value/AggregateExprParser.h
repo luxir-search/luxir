@@ -32,6 +32,7 @@ struct AggregateExprOptions {
   std::string_view opName;
   int* nestingBudget = nullptr;
   FieldResolver* fieldResolver = nullptr;
+  bool shareProducers = true;
 };
 
 class AggregateExprParser {
@@ -256,14 +257,10 @@ private:
       fail(pos, error.what());
     }
 
-    AggregateLeaf leaf;
-    leaf.input = input;
-    leaf.resolved = resolved;
-    leaf.arguments = program->copyConstants(trailing);
-    leaf.stateOffset = program->stateBytes;
-    program->stateBytes += leaf.resolved.state.bytes;
-    program->hasIndirectStates = program->hasIndirectStates
-        || leaf.resolved.state.destroy != nullptr;
+    auto arguments = program->copyConstants(trailing);
+    AggregateLeaf leaf{program->addProducer({&function, input, resolved, arguments},
+                                          opts.shareProducers),
+                       arguments};
     uint32_t leafIndex = (uint32_t)program->leaves.size();
     program->leaves.push_back(leaf);
 

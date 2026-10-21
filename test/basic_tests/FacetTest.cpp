@@ -3682,7 +3682,7 @@ public:
     }
     ~Calc() override { probe.liveBindings--; }
 
-    api::Val* getTargetForSub(SearchResponse*, Calculator*) override {
+    api::Val* getTargetForSub(SearchResponse*, SearchOp&) override {
       return nullptr;
     }
 

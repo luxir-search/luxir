@@ -16,6 +16,8 @@ struct AggregateFunction {
   using Resolve = ResolvedAggregate (*)(
       const ValueNode* input,
       std::span<AggregateConstant> trailingArguments);
+  using CanonicalArgument = AggregateConstant (*)(
+      std::span<const AggregateConstant> arguments, uint8_t index);
 
   std::string_view name;
   uint8_t minArguments = 0;
@@ -23,6 +25,12 @@ struct AggregateFunction {
   Resolve resolve = nullptr;
   // Set-valued aggregates flatten arrays and accept ordinal columns.
   bool acceptsValues = false;
+  // Bits name trailing arguments used only by finish, starting at zero.
+  uint32_t readoutArguments = 0;
+  CanonicalArgument canonicalArgument = nullptr;
+
+  bool sameStateArguments(std::span<const AggregateConstant> left,
+                          std::span<const AggregateConstant> right) const;
 };
 
 struct ExpressionFunctionLookup {

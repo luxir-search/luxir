@@ -445,9 +445,12 @@ no strict error bound. The minimum and maximum
 (`p` = 0 and 100) are exact. Results are deterministic for a fixed set of
 segments; segment merges can change estimates.
 
-Each bucket and aggregate call has its own state. Sketch allocations count
-against the request memory limit. `percentile_rank` uses two counters and
-is exact regardless of the number of values.
+Each bucket has its own state. Calls with the same function, input, and
+`compression` or `threshold` share one sketch within an expression, and
+sibling metrics that use exactly the same sketches share them too: `p50`,
+`p95`, and `p99` metrics on one field build a single t-digest. Sketch
+allocations count against the request memory limit. `percentile_rank` uses
+two counters and is exact regardless of the number of values.
 
 ## Nested facets
 

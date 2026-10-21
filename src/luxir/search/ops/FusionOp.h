@@ -236,14 +236,14 @@ public:
       return static_cast<FusionOp&>(op);
     }
 
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
-      auto* ourVal = parent->getTargetForSub(resp, this);
+    luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override {
+      auto* ourVal = parent->getTargetForSub(resp, op);
       assert(ourVal != nullptr);
       auto& target = slotTarget<luxir::api::ArrVal>(*ourVal, resp->mr);
       assert(std::holds_alternative<luxir::api::DocList>(target.kind)
              || std::holds_alternative<std::monostate>(target.kind));
       auto& dl = oneofMut<luxir::api::DocList>(target);
-      return build::opsSlot(dl.ops, op.subOps.size(), sub->getOp().name, resp->mr);
+      return build::opsSlot(dl.ops, op.subOps.size(), sub.name, resp->mr);
     }
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,

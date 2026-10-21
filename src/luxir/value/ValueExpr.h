@@ -97,6 +97,7 @@ public:
   }
 
   const ValueNode& root() const { return nodes[rootNode]; }
+  bool structurallyEqual(const ValueProgram& other) const;
   BoundValueProgram* bind(MemPool& pool, IndexReader::Segment& segment,
                           ValueFieldInfos fields) const;
 };

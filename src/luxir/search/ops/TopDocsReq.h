@@ -660,15 +660,15 @@ public:
     // Page result columns live in the final response arena, pinned through
     // all streaming batches. They are sliced only after every binding closes.
     luxir::api::GroupTable* pageGroups = nullptr;
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
+    luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override {
       auto& groups = thisOp().groupOps;
-      auto found = groups.find(sub->getOp().name);
-      if (found != groups.end() && found->second == &sub->getOp()) {
+      auto found = groups.find(sub.name);
+      if (found != groups.end() && found->second == &sub) {
         assert(pageGroups != nullptr);
         assert(resp == op.req.lastResponse); // bucket children never stream
-        return build::opsSlot(pageGroups->ops, groups.size(), sub->getOp().name, resp->mr);
+        return build::opsSlot(pageGroups->ops, groups.size(), sub.name, resp->mr);
       }
-      auto* ourVal = parent->getTargetForSub(resp, this);
+      auto* ourVal = parent->getTargetForSub(resp, op);
       assert(ourVal != nullptr);
       // Our DocList lives in our bucket slot when this TopDocs is a facet
       // bucket child; the Val should either be unset or already hold it.
@@ -676,7 +676,7 @@ public:
       assert(std::holds_alternative<luxir::api::DocList>(target.kind)
              || std::holds_alternative<std::monostate>(target.kind));
       auto& dl = oneofMut<luxir::api::DocList>(target);
-      return build::opsSlot(dl.ops, op.subOps.size(), sub->getOp().name, resp->mr);
+      return build::opsSlot(dl.ops, op.subOps.size(), sub.name, resp->mr);
     }
 
     CalcBase(TopDocsReq& op, Calculator* parent, int64_t slot, int64_t numSlots,

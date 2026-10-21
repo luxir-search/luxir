@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "luxir/search/SearchRequest.h"
+#include "luxir/search/SearchOverrides.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/search/ops/RootOp.h"
 #include "luxir/search/ops/SearchOp.h"
@@ -248,6 +249,46 @@ public:
     }
   }
 
+  void groupExprStats(SearchOp& parent, OpsPlacement placement,
+      const boost::unordered_flat_map<std::string_view, SearchOp*>& block) {
+    if (disableAggregateSharingForTests || block.size() < 2) return;
+    struct Candidate {
+      ExprStatsOp* op;
+      const DomainVariantPlan* plan;
+      size_t variant;
+    };
+    const DomainVariantPlan* parentPlan = nullptr;
+    if (placement == OpsPlacement::REQUEST_ROOT) {
+      parentPlan = &static_cast<RootOp&>(parent).domainVariants;
+    } else if (placement == OpsPlacement::TOP_DOCS) {
+      parentPlan = &static_cast<TopDocsReq&>(parent).domainVariants;
+    }
+    std::vector<Candidate> candidates;
+    for (auto& [name, child] : block) {
+      auto* metric = dynamic_cast<ExprStatsOp*>(child);
+      if (metric == nullptr || !metric->hasOnlyIndirectProducers()) continue;
+      auto* plan = parentPlan ? parentPlan
+          : child->bucketDomain ? &child->bucketDomain->variants : nullptr;
+      size_t variant = plan ? plan->variantForChild(name) : 0;
+      candidates.push_back({metric, variant == 0 ? nullptr : plan, variant});
+    }
+    std::ranges::sort(candidates, {}, [](const Candidate& candidate) {
+      return candidate.op->name;
+    });
+    std::vector<Candidate> leaders;
+    for (const Candidate& candidate : candidates) {
+      bool shared = false;
+      for (const Candidate& leader : leaders) {
+        if (candidate.plan == leader.plan && candidate.variant == leader.variant
+            && candidate.op->shareProducersFrom(*leader.op)) {
+          shared = true;
+          break;
+        }
+      }
+      if (!shared) leaders.push_back(candidate);
+    }
+  }
+
   void addSubs(SearchOp& currOp, OpsMap ops, int depth,
                OpsPlacement placement,
                boost::unordered_flat_map<std::string_view, SearchOp*>* destination = nullptr,
@@ -335,6 +376,7 @@ public:
         currOp.needsStructuralScope = true;
       }
     }
+    groupExprStats(currOp, placement, destination ? *destination : currOp.subOps);
   }
 
   SearchOp* parseOp(std::string_view name, const luxir::api::SearchOp& searchOp,
@@ -433,6 +475,7 @@ public:
       [&](const luxir::api::ExprOp& exprOp) -> SearchOp* {
         AggregateExprOptions options{req.schema.get(), exprOp.vars, name};
         options.fieldResolver = &fields;
+        options.shareProducers = !disableAggregateSharingForTests;
         AggregateProgram* program =
             AggregateExprParser(options, req.arena).parse(exprOp.expr);
         auto fields = resolveAggregateFields(*program, req.requestPool, *req.reader);

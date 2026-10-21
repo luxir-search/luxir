@@ -631,8 +631,8 @@ public:
 
   public:
     using Calculator::Calculator;
-    luxir::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
-      auto* ourVal = parent->getTargetForSub(resp, this);
+    luxir::api::Val* getTargetForSub(SearchResponse* resp, SearchOp& sub) override {
+      auto* ourVal = parent->getTargetForSub(resp, op);
       luxir::api::Val* target = nullptr;
       routeTarget<luxir::api::ArrVal>(*ourVal, resp->mr,
           [&](luxir::api::Val& val) { target = &val; });
@@ -648,7 +648,7 @@ public:
       // array must be sized for their sum or opsSlot's pre-sized array
       // overflows.
       std::size_t cap = fieldOp().subOps.size() + fieldOp().inlineSubOps.size();
-      return build::opsSlot(fr.ops, cap, sub->getOp().name, resp->mr);
+      return build::opsSlot(fr.ops, cap, sub.name, resp->mr);
     };
   };
 
@@ -1669,15 +1669,15 @@ public:
     }
 
     luxir::api::Val* getTargetForSub(
-        SearchResponse* resp, Calculator* sub) override {
-      auto* ourVal = parent->getTargetForSub(resp, this);
+        SearchResponse* resp, SearchOp& sub) override {
+      auto* ourVal = parent->getTargetForSub(resp, op);
       assert(ourVal != nullptr);
       luxir::api::Val* target = nullptr;
       routeTarget<luxir::api::ArrVal>(*ourVal, resp->mr,
           [&](luxir::api::Val& val) { target = &val; });
       auto& result = oneofMut<luxir::api::FacetResult>(*target);
       return build::opsSlot(
-          result.ops, fixedOp().subOps.size(), sub->getOp().name, resp->mr);
+          result.ops, fixedOp().subOps.size(), sub.name, resp->mr);
     }
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum,

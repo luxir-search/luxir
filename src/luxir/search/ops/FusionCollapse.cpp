@@ -80,12 +80,12 @@ public:
 
   void doFusion() override { doFusionImpl<true>(); }
 
-  api::Val* getTargetForSub(SearchResponse* response, Calculator* child) override {
+  api::Val* getTargetForSub(SearchResponse* response, SearchOp& child) override {
     auto& children = thisOp().groupOps;
-    auto found = children.find(child->getOp().name);
-    if (found != children.end() && found->second == &child->getOp()) {
+    auto found = children.find(child.name);
+    if (found != children.end() && found->second == &child) {
       assert(pageGroups != nullptr && response == op.req.lastResponse);
-      return build::opsSlot(pageGroups->ops, children.size(), child->getOp().name, response->mr);
+      return build::opsSlot(pageGroups->ops, children.size(), child.name, response->mr);
     }
     return FusionOp::Calc::getTargetForSub(response, child);
   }
