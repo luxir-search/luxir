@@ -815,14 +815,14 @@ Parameters governing how a commit is performed. Presence of this message in an U
 
 ### luxir.DisMaxQuery
 
-Disjunction max: matches documents that match any of \`queries\`, scoring each with its best-scoring query plus tie\_breaker times the sum of the other matching queries' scores (Elasticsearch dis\_max).
+Disjunction max: matches documents that match any of \`queries\`, scoring each with its best-scoring query plus tie times the sum of the other matching queries' scores (Elasticsearch dis\_max).
 
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
 | <a id="field-luxir.dismaxquery.queries"></a>[`queries`](#field-luxir.dismaxquery.queries) | 1 | [`Query`](#message-luxir.query) | repeated | required, non-empty |
-| <a id="field-luxir.dismaxquery.tie_breaker"></a>[`tie_breaker`](#field-luxir.dismaxquery.tie_breaker) | 2 | `float` | optional | Weight of the non-best matching queries. Unset = 0. Must be in \[0, 1\]; 1 adds every score like a boolean disjunction. |
+| <a id="field-luxir.dismaxquery.tie"></a>[`tie`](#field-luxir.dismaxquery.tie) | 2 | `float` | optional | Weight of the non-best matching queries. Unset = 0. Must be finite and in \[0, 1\]; 1 adds every score like a boolean disjunction. |
 
 <a id="message-luxir.diskstats"></a>
 
@@ -1545,7 +1545,7 @@ Analyzes one text across several fields. In COMBINED mode, fields sharing an ana
 | <a id="field-luxir.multimatchquery.mode"></a>[`mode`](#field-luxir.multimatchquery.mode) | 3 | [`MultiMatchQuery.Mode`](#enum-luxir.multimatchquery.mode) | singular | Unset = COMBINED. |
 | <a id="field-luxir.multimatchquery.operator"></a>[`operator`](#field-luxir.multimatchquery.operator) | 4 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How analyzed terms combine. Unset = OR. COMBINED applies this within each group (AND: every term in some field of one group). PER\_FIELD applies it within each field (AND: every term in that field). Ignored by the phrase modes. |
 | <a id="field-luxir.multimatchquery.min_match"></a>[`min_match`](#field-luxir.multimatchquery.min_match) | 5 | `int32` | singular | Zero uses operator. Positive values override operator and are clamped to the analyzed term count within each group/field. Must be &gt;= 0. |
-| <a id="field-luxir.multimatchquery.tie_breaker"></a>[`tie_breaker`](#field-luxir.multimatchquery.tie_breaker) | 6 | `float` | optional | Weight of non-best fields or groups: best + tie\_breaker \* others. Unset = 1 for COMBINED and PER\_FIELD, 0 for phrase modes. In \[0, 1\]. |
+| <a id="field-luxir.multimatchquery.tie"></a>[`tie`](#field-luxir.multimatchquery.tie) | 6 | `float` | optional | Weight of non-best fields or groups: best + tie \* others. Unset = 1 in every mode. Must be finite and in \[0, 1\]. Ignored by BOOL\_PREFIX, which always adds field scores. |
 | <a id="field-luxir.multimatchquery.slop"></a>[`slop`](#field-luxir.multimatchquery.slop) | 7 | `int32` | singular | Phrase slop for PHRASE and PHRASE\_PREFIX. Must be &gt;= 0. |
 | <a id="field-luxir.multimatchquery.max_expansions"></a>[`max_expansions`](#field-luxir.multimatchquery.max_expansions) | 8 | `int32` | singular | Maximum PHRASE\_PREFIX expansions, in byte order. 0 = 50, at most 1024. BOOL\_PREFIX ignores this limit and matches every expansion. |
 
@@ -1735,7 +1735,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.regex"></a>[`regex`](#field-luxir.query.regex) | 18 | [`RegexQuery`](#message-luxir.regexquery) | oneof [`kind`](#oneof-luxir.query.kind) | selects documents by regular-expression term match |
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
 | <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 20 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one text over several weighted fields |
-| <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best-scoring of several queries, plus a tie breaker |
+| <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
 
 <a id="message-luxir.querybucket"></a>
 

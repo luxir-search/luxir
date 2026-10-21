@@ -732,3 +732,18 @@ TEST_F(ExprParserTest, functionMultiMatch) {
   }
   expectContains(parseErr("combined_fields(dune, fields=[title])"), "unknown query function 'combined_fields'");
 }
+
+TEST_F(ExprParserTest, functionTieArguments) {
+  const auto& multi = std::get<api::MultiMatchQuery>(parse(
+      "multi_match(dune, fields=[title, body], tie=0.25)")->kind);
+  ASSERT_TRUE(multi.tie);
+  EXPECT_FLOAT_EQ(0.25f, *multi.tie);
+  const auto& disMax = std::get<api::DisMaxQuery>(parse(
+      "dis_max(queries=[title:dune, body:dune], tie=0.25)")->kind);
+  ASSERT_TRUE(disMax.tie);
+  EXPECT_FLOAT_EQ(0.25f, *disMax.tie);
+  for (auto query : {"multi_match(dune, fields=[title], tie_breaker=0.25)",
+                     "dis_max(queries=[title:dune], tie_breaker=0.25)"}) {
+    expectContains(parseErr(query), "unknown argument 'tie_breaker'");
+  }
+}

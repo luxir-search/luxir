@@ -297,13 +297,13 @@ inline api::Query boolean(std::pmr::memory_resource& mr,
                  std::span<const api::Query>(filter.begin(), filter.size()), minMatch);
 }
 
-// dis_max: the best-scoring query plus tieBreaker times the others.
+// dis_max: the best-scoring query plus tie times the others.
 inline api::Query disMax(std::pmr::memory_resource& mr, std::initializer_list<api::Query> queries,
-                         std::optional<float> tieBreaker = std::nullopt) {
+                         std::optional<float> tie = std::nullopt) {
   api::Query q;
   auto& d = q.kind.emplace<api::DisMaxQuery>();
   setSpan(d.queries, mr, std::span<const api::Query>(queries.begin(), queries.size()));
-  d.tie_breaker = tieBreaker;
+  d.tie = tie;
   return q;
 }
 

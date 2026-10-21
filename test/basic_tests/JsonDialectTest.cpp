@@ -848,3 +848,22 @@ TEST(JsonDialect, MultiMatchWeightedFields) {
   EXPECT_FALSE(P::read_json(object, R"({"multi_match":{"type":"cross_fields"}})", mr));
   EXPECT_FALSE(P::read_json(object, R"({"multi_match":{"mode":"best_fields"}})", mr));
 }
+
+TEST(JsonDialect, MultiFieldTieName) {
+  std::pmr::monotonic_buffer_resource mr;
+  for (std::string json : {
+           R"({"multi_match":{"text":"dune","fields":["title_t"],"tie":0.25}})",
+           R"({"dis_max":{"queries":[{"all":true}],"tie":0.25}})"}) {
+    P::Query query;
+    ASSERT_TRUE(P::read_json(query, json, mr));
+    std::string out;
+    ASSERT_TRUE(P::write_json(query, out));
+    EXPECT_NE(std::string::npos, out.find(R"("tie":0.25)")) << out;
+
+    json.replace(json.find(R"("tie")"), 5, R"("tie_breaker")");
+    std::string error;
+    EXPECT_FALSE(P::read_json(query, json, mr, &error));
+    EXPECT_NE(std::string::npos, error.find("unknown_key")) << error;
+    EXPECT_NE(std::string::npos, error.find("tie_breaker")) << error;
+  }
+}

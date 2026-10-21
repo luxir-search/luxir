@@ -1106,13 +1106,13 @@ struct MultiMatchQuery {
   Mode mode = Mode::COMBINED;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
-  std::optional<float> tie_breaker;
+  std::optional<float> tie;
   int32_t slop = 0;
   int32_t max_expansions = 0;
 };
 struct DisMaxQuery {                                             // span<incomplete Query> OK
   std::span<const Query> queries;
-  std::optional<float> tie_breaker;
+  std::optional<float> tie;
 };
 struct ExprQuery {                                             // map value indirect: Val may be incomplete, but is complete here anyway
   std::string_view q;

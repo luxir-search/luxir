@@ -902,7 +902,7 @@ public:
   // field order, independent of request order and the query text.
   Query* createMultiMatchCombined(std::span<const WeightedField> requested,
                                   std::string_view text, Operator op, int minMatch,
-                                  float tieBreaker = 1.0f) {
+                                  float tie = 1.0f) {
     struct Group {
       const ResolvedFieldHandle* target;
       std::span<std::string_view> fields;
@@ -962,20 +962,20 @@ public:
       optional[count++] = combineAnalyzedClauses(clauses, op, minMatch);
     }
     if (count == 0) return matchNoDocs();
-    return DisMaxQuery::make(pool, optional.first(count), tieBreaker);
+    return DisMaxQuery::make(pool, optional.first(count), tie);
   }
 
   // Each field contributes its own match score multiplied by its weight.
   Query* createMultiMatchPerField(std::span<const WeightedField> requested,
                                   std::string_view text, Operator op, int minMatch,
-                                  float tieBreaker = 1.0f) {
+                                  float tie = 1.0f) {
     auto resolved = resolveWeightedFields(requested);
     auto clauses = pool.make_span<Query*>(resolved.size());
     for (size_t i = 0; i < resolved.size(); i++) {
       clauses[i] = createMatchQuery(*resolved[i].target, text, op, minMatch, resolved[i].weight);
     }
     if (clauses.empty()) return matchNoDocs();
-    return DisMaxQuery::make(pool, clauses, tieBreaker);
+    return DisMaxQuery::make(pool, clauses, tie);
   }
 
   Query* boosted(Query* query, float boost) {
@@ -991,8 +991,8 @@ public:
   // multi_match phrase: a phrase per TEXT field (a match on other fields,
   // whose value is one term), combined like best_fields.
   Query* createMultiPhraseQuery(std::span<const WeightedField> requested, std::string_view text,
-                                int32_t slop, float tieBreaker) {
-    return createPerFieldQuery(requested, tieBreaker, [&](const ResolvedFieldHandle& target) {
+                                int32_t slop, float tie) {
+    return createPerFieldQuery(requested, tie, [&](const ResolvedFieldHandle& target) {
       if (target.fieldType->type() != FieldType::Type::TEXT) {
         return createMatchQuery(target, text);
       }
@@ -1004,8 +1004,8 @@ public:
   // prefix query on other fields), combined like best_fields.
   Query* createMultiPhrasePrefixQuery(std::span<const WeightedField> requested,
                                       std::string_view text, int32_t slop,
-                                      int32_t maxExpansions, float tieBreaker) {
-    return createPerFieldQuery(requested, tieBreaker, [&](const ResolvedFieldHandle& target) {
+                                      int32_t maxExpansions, float tie) {
+    return createPerFieldQuery(requested, tie, [&](const ResolvedFieldHandle& target) {
       return createPhrasePrefixQuery(target, text, slop, maxExpansions);
     });
   }
@@ -1093,9 +1093,9 @@ public:
   }
 
   // One query per requested field, boosted by the field's boost, combined
-  // as a dis_max with tieBreaker (1 adds the scores like a disjunction).
+  // as a dis_max with tie (1 adds the scores like a disjunction).
   template <typename PerField>
-  Query* createPerFieldQuery(std::span<const WeightedField> requested, float tieBreaker,
+  Query* createPerFieldQuery(std::span<const WeightedField> requested, float tie,
                              PerField&& perField) {
     auto resolved = resolveWeightedFields(requested);
     if (resolved.empty()) return matchNoDocs();
@@ -1103,7 +1103,7 @@ public:
     for (size_t i = 0; i < resolved.size(); i++) {
       clauses[i] = boosted(perField(*resolved[i].target), resolved[i].weight);
     }
-    return DisMaxQuery::make(pool, clauses, tieBreaker);
+    return DisMaxQuery::make(pool, clauses, tie);
   }
 
   // Build a range query over `field` from raw bound Vals (any may be null for

@@ -299,7 +299,7 @@ message Query {
     RegexQuery regex = 18;          // selects documents by regular-expression term match
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
     MultiMatchQuery multi_match = 20; // one text over several weighted fields
-    DisMaxQuery dis_max = 25;       // best-scoring of several queries, plus a tie breaker
+    DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
   }
 }
 
@@ -434,9 +434,10 @@ message MultiMatchQuery {
   // to the analyzed term count within each group/field. Must be >= 0.
   int32 min_match = 5;
 
-  // Weight of non-best fields or groups: best + tie_breaker * others.
-  // Unset = 1 for COMBINED and PER_FIELD, 0 for phrase modes. In [0, 1].
-  optional float tie_breaker = 6;
+  // Weight of non-best fields or groups: best + tie * others.
+  // Unset = 1 in every mode. Must be finite and in [0, 1].
+  // Ignored by BOOL_PREFIX, which always adds field scores.
+  optional float tie = 6;
 
   // Phrase slop for PHRASE and PHRASE_PREFIX. Must be >= 0.
   int32 slop = 7;
@@ -461,14 +462,14 @@ message MultiMatchQuery {
 }
 
 // Disjunction max: matches documents that match any of `queries`, scoring
-// each with its best-scoring query plus tie_breaker times the sum of the
+// each with its best-scoring query plus tie times the sum of the
 // other matching queries' scores (Elasticsearch dis_max).
 message DisMaxQuery {
   repeated Query queries = 1;  // required, non-empty
 
-  // Weight of the non-best matching queries. Unset = 0. Must be in [0, 1];
-  // 1 adds every score like a boolean disjunction.
-  optional float tie_breaker = 2;
+  // Weight of the non-best matching queries. Unset = 0. Must be finite and
+  // in [0, 1]; 1 adds every score like a boolean disjunction.
+  optional float tie = 2;
 }
 
 // Constant-score exact value-set membership using the field's value binding.

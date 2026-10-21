@@ -567,12 +567,11 @@ QueryBuilder::Operator builderOperator(luxir::api::Match_::Operator op) {
                                                   : QueryBuilder::Operator::OR;
 }
 
-float tieBreakerOf(std::optional<float> tieBreaker, std::string_view label,
-                   float defaultValue = 0.0f) {
-  float value = tieBreaker.value_or(defaultValue);
+float tieOf(std::optional<float> tie, std::string_view label, float defaultValue) {
+  float value = tie.value_or(defaultValue);
   if (!std::isfinite(value) || value < 0.0f || value > 1.0f) {
     throw std::runtime_error(std::format(
-        "{} 'tie_breaker' must be in [0, 1] (got {})", label, value));
+        "{} 'tie' must be finite and in [0, 1] (got {})", label, value));
   }
   return value;
 }
@@ -599,8 +598,7 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
   if (query.slop > 0 && !phrase) {
     throw std::runtime_error("multi_match 'slop' applies only to modes phrase and phrase_prefix");
   }
-  float defaultTie = query.mode == Mode::COMBINED || query.mode == Mode::PER_FIELD ? 1.0f : 0.0f;
-  float tieBreaker = tieBreakerOf(query.tie_breaker, "multi_match", defaultTie);
+  float tie = tieOf(query.tie, "multi_match", 1.0f);
   if (query.fields.empty()) {
     throw std::runtime_error("multi_match requires a non-empty 'fields' list");
   }
@@ -640,14 +638,14 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
   auto op = builderOperator(query.operator_);
   switch (query.mode) {
     case Mode::COMBINED:
-      return builder.createMultiMatchCombined(fields, query.text, op, query.min_match, tieBreaker);
+      return builder.createMultiMatchCombined(fields, query.text, op, query.min_match, tie);
     case Mode::PER_FIELD:
-      return builder.createMultiMatchPerField(fields, query.text, op, query.min_match, tieBreaker);
+      return builder.createMultiMatchPerField(fields, query.text, op, query.min_match, tie);
     case Mode::PHRASE:
-      return builder.createMultiPhraseQuery(fields, query.text, query.slop, tieBreaker);
+      return builder.createMultiPhraseQuery(fields, query.text, query.slop, tie);
     case Mode::PHRASE_PREFIX:
       return builder.createMultiPhrasePrefixQuery(
-          fields, query.text, query.slop, query.max_expansions, tieBreaker);
+          fields, query.text, query.slop, query.max_expansions, tie);
     case Mode::BOOL_PREFIX:
       return builder.createMultiBoolPrefixQuery(fields, query.text, op, query.min_match);
   }
@@ -658,8 +656,8 @@ luxir::Query* ProtobufQueryParser::parseDisMax(const luxir::api::DisMaxQuery& qu
   if (query.queries.empty()) {
     throw std::runtime_error("dis_max requires a non-empty 'queries' list");
   }
-  float tieBreaker = tieBreakerOf(query.tie_breaker, "dis_max");
-  return luxir::DisMaxQuery::make(pool, parseQueryList(query.queries), tieBreaker);
+  float tie = tieOf(query.tie, "dis_max", 0.0f);
+  return luxir::DisMaxQuery::make(pool, parseQueryList(query.queries), tie);
 }
 
 luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {

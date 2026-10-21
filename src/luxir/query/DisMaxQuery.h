@@ -20,9 +20,9 @@ namespace luxir {
 // Disjunction max (Lucene's DisjunctionMaxQuery, Elasticsearch dis_max): a
 // document matches when any disjunct matches, and scores
 //
-//   max_i s_i + tieBreaker * (sum_i s_i - max_i s_i)
+//   max_i s_i + tie * (sum_i s_i - max_i s_i)
 //
-// over the disjuncts that match it. tieBreaker 0 takes the best disjunct
+// over the disjuncts that match it. tie 0 takes the best disjunct
 // alone; 1 adds them up like a disjunction.
 //
 // Membership is exactly the disjunction of the disjuncts, so the query holds
@@ -30,7 +30,7 @@ namespace luxir {
 // the boolean's cache entries. Scored use merges the disjuncts' pull scorers.
 class DisMaxQuery final : public Query {
   std::span<Query*> disjuncts;
-  float tieBreaker;
+  float tie;
   Query* membership;
 
   static float roundUp(float value) {
@@ -44,20 +44,20 @@ class DisMaxQuery final : public Query {
 public:
   // membership must be the SHOULD-only BooleanQuery over the same disjuncts;
   // make() builds both.
-  DisMaxQuery(std::span<Query*> disjuncts, float tieBreaker, Query* membership)
-    : Query(QueryKind::DIS_MAX), disjuncts(disjuncts), tieBreaker(tieBreaker),
+  DisMaxQuery(std::span<Query*> disjuncts, float tie, Query* membership)
+    : Query(QueryKind::DIS_MAX), disjuncts(disjuncts), tie(tie),
       membership(membership) {
-    if (!std::isfinite(tieBreaker) || tieBreaker < 0.0f || tieBreaker > 1.0f) {
-      throw std::invalid_argument("dis_max tie_breaker must be in [0, 1]");
+    if (!std::isfinite(tie) || tie < 0.0f || tie > 1.0f) {
+      throw std::invalid_argument("dis_max tie must be finite and in [0, 1]");
     }
     assert(disjuncts.size() >= 2);
   }
 
   // A single disjunct is returned as is: its max is its own score.
-  static Query* make(MemPool& pool, std::span<Query*> disjuncts, float tieBreaker);
+  static Query* make(MemPool& pool, std::span<Query*> disjuncts, float tie);
 
   std::span<Query*> getDisjuncts() const { return disjuncts; }
-  float getTieBreaker() const { return tieBreaker; }
+  float getTie() const { return tie; }
   Query* getMembership() const { return membership; }
 
   bool recoverableAsPredicate() const noexcept override {
@@ -66,7 +66,7 @@ public:
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const DisMaxQuery&>(other);
-    if (std::bit_cast<uint32_t>(tieBreaker) != std::bit_cast<uint32_t>(rhs.tieBreaker)
+    if (std::bit_cast<uint32_t>(tie) != std::bit_cast<uint32_t>(rhs.tie)
         || disjuncts.size() != rhs.disjuncts.size()) {
       return false;
     }
@@ -77,7 +77,7 @@ public:
   }
 
   uint64_t hashImpl() const override {
-    uint64_t value = mixHash(Query::hashImpl(), std::bit_cast<uint32_t>(tieBreaker));
+    uint64_t value = mixHash(Query::hashImpl(), std::bit_cast<uint32_t>(tie));
     for (auto* disjunct : disjuncts) value = mixHash(value, disjunct->hash());
     return value;
   }
@@ -113,7 +113,7 @@ public:
     };
 
     std::span<Slot> slots;
-    float tieBreaker;
+    float tie;
     float verificationCost = 0.0f;
     int32_t doc = -1;
 
@@ -150,7 +150,7 @@ public:
         any = true;
       }
       if (!any) return ScoreBounds::exact(0.0f);
-      double t = tieBreaker;
+      double t = tie;
       float hi = std::isinf(hiMax) || std::isinf(hiSum)
           ? hiMax : (float)((1.0 - t) * hiMax + t * hiSum);
       float lo = std::isinf(loMin) || std::isinf(loSum)
@@ -159,8 +159,8 @@ public:
     }
 
   public:
-    Scorer(std::span<Slot> slots, float tieBreaker)
-      : slots(slots), tieBreaker(tieBreaker) {
+    Scorer(std::span<Slot> slots, float tie)
+      : slots(slots), tie(tie) {
       for (auto& slot : slots) {
         if (slot.twoPhase) {
           verificationCost = std::max(verificationCost, slot.scorer->matchCost());
@@ -169,14 +169,14 @@ public:
     }
 
     static Scorer* create(MemPool& pool, std::span<Query::Scorer*> scorers,
-                          std::span<const uint8_t> twoPhase, float tieBreaker) {
+                          std::span<const uint8_t> twoPhase, float tie) {
       auto slots = pool.make_span<Slot>(scorers.size());
       for (size_t i = 0; i < scorers.size(); i++) {
         bool approx = twoPhase[i] != 0;
         int32_t at = approx ? scorers[i]->approximationDocId() : scorers[i]->docId();
         slots[i] = {scorers[i], approx, false, at};
       }
-      return pool.make<Scorer>(slots, tieBreaker);
+      return pool.make<Scorer>(slots, tie);
     }
 
     int32_t docId() override { return doc; }
@@ -246,7 +246,7 @@ public:
         sum += s;
         any = true;
       }
-      return best + tieBreaker * (sum - best);
+      return best + tie * (sum - best);
     }
 
     int32_t advanceShallow(int32_t target) override {
@@ -271,11 +271,11 @@ public:
 
   class Supplier final : public Query::ScorerSupplier {
     std::span<Query::ScorerSupplier*> children;
-    float tieBreaker;
+    float tie;
 
     class Plan final : public Query::ScorerPlan {
       std::span<Query::ScorerPlan*> childPlans;
-      float tieBreaker;
+      float tie;
 
     protected:
       Query::Scorer* buildScorer(MemPool& targetPool) override {
@@ -291,19 +291,19 @@ public:
         }
         if (n == 0) return nullptr;
         if (n == 1) return scorers[0];
-        return Scorer::create(targetPool, scorers.first(n), twoPhase.first(n), tieBreaker);
+        return Scorer::create(targetPool, scorers.first(n), twoPhase.first(n), tie);
       }
 
     public:
       Plan(const Query::PlanContext& planContext, const Query::ScorerShape& shape,
-           int64_t cost, std::span<Query::ScorerPlan*> childPlans, float tieBreaker)
+           int64_t cost, std::span<Query::ScorerPlan*> childPlans, float tie)
         : Query::ScorerPlan(planContext, shape, cost), childPlans(childPlans),
-          tieBreaker(tieBreaker) {}
+          tie(tie) {}
     };
 
   public:
-    Supplier(std::span<Query::ScorerSupplier*> children, float tieBreaker)
-      : children(children), tieBreaker(tieBreaker) {}
+    Supplier(std::span<Query::ScorerSupplier*> children, float tie)
+      : children(children), tie(tie) {}
 
     int64_t cost() override {
       int64_t total = 0;
@@ -356,13 +356,13 @@ public:
         plans[i] = children[i]->resolve(planPool, childContext);
       }
       return planPool.make<Plan>(planContext, describeScorer(planContext), cost(),
-                                 plans, tieBreaker);
+                                 plans, tie);
     }
   };
 
   static Query::ScorerSupplier* makeSupplier(
       MemPool& targetPool, IndexReader::Segment& segment,
-      std::span<Query::SegmentSource* const> sources, float tieBreaker,
+      std::span<Query::SegmentSource* const> sources, float tie,
       Query::SupplierExecutionMode executionMode) {
     auto children = targetPool.make_span<Query::ScorerSupplier*>(sources.size());
     size_t n = 0;
@@ -372,7 +372,7 @@ public:
     }
     if (n == 0) return nullptr;
     if (n == 1) return children[0];
-    return targetPool.make<Supplier>(children.first(n), tieBreaker);
+    return targetPool.make<Supplier>(children.first(n), tie);
   }
 
   static Query::Scorer* buildPull(MemPool& targetPool, Query::ScorerSupplier* supplier) {
@@ -384,16 +384,16 @@ public:
   class Weight final : public Query::Weight {
     std::span<Query::Weight*> children;
     std::span<Query::SegmentSource*> sources;
-    float tieBreaker;
+    float tie;
 
     class Prepared final : public Query::Weight::PreparedWeight {
       std::vector<QueryPrep::PreparedSource> children;
       std::vector<Query::SegmentSource*> sources;
-      float tieBreaker;
+      float tie;
 
     public:
-      Prepared(std::vector<QueryPrep::PreparedSource>&& prepared, float tieBreaker)
-        : children(std::move(prepared)), tieBreaker(tieBreaker) {
+      Prepared(std::vector<QueryPrep::PreparedSource>&& prepared, float tie)
+        : children(std::move(prepared)), tie(tie) {
         for (auto& child : children) sources.push_back(&child.segmentSource());
       }
 
@@ -404,7 +404,7 @@ public:
       Query::ScorerSupplier* scorerSupplierImpl(
           MemPool& targetPool, IndexReader::Segment& segment,
           Query::SupplierExecutionMode executionMode) override {
-        return makeSupplier(targetPool, segment, sources, tieBreaker, executionMode);
+        return makeSupplier(targetPool, segment, sources, tie, executionMode);
       }
 
       void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
@@ -431,7 +431,7 @@ public:
 
   public:
     Weight(Context& context, DisMaxQuery& query, int32_t flags, float multiplier)
-      : Query::Weight(context, query, flags), tieBreaker(query.tieBreaker) {
+      : Query::Weight(context, query, flags), tie(query.tie) {
       size_t n = query.disjuncts.size();
       children = context.pool.make_span<Query::Weight*>(n);
       sources = context.pool.make_span<Query::SegmentSource*>(n);
@@ -446,7 +446,7 @@ public:
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(
         Query::Weight::PrepareContext& ctx) override {
-      return std::make_unique<Prepared>(QueryPrep::prepareSources(children, ctx), tieBreaker);
+      return std::make_unique<Prepared>(QueryPrep::prepareSources(children, ctx), tie);
     }
 
     Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
@@ -456,7 +456,7 @@ public:
     Query::ScorerSupplier* scorerSupplierImpl(
         MemPool& targetPool, IndexReader::Segment& segment,
         Query::SupplierExecutionMode executionMode) override {
-      return makeSupplier(targetPool, segment, sources, tieBreaker, executionMode);
+      return makeSupplier(targetPool, segment, sources, tie, executionMode);
     }
 
     void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
@@ -493,14 +493,14 @@ static_assert(std::is_trivially_destructible_v<DisMaxQuery::Scorer>);
 
 namespace luxir {
 
-inline Query* DisMaxQuery::make(MemPool& pool, std::span<Query*> disjuncts, float tieBreaker) {
+inline Query* DisMaxQuery::make(MemPool& pool, std::span<Query*> disjuncts, float tie) {
   assert(!disjuncts.empty());
   if (disjuncts.size() == 1) return disjuncts[0];
   std::span<Query*> none{};
   auto* membership = pool.make<BooleanQuery>(none, disjuncts, none, none);
-  // A full tie breaker adds every disjunct: that is the disjunction itself.
-  if (tieBreaker == 1.0f) return membership;
-  return pool.make<DisMaxQuery>(disjuncts, tieBreaker, membership);
+  // tie 1 adds every disjunct: that is the disjunction itself.
+  if (tie == 1.0f) return membership;
+  return pool.make<DisMaxQuery>(disjuncts, tie, membership);
 }
 
 } // namespace luxir

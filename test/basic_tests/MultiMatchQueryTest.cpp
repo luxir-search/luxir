@@ -74,11 +74,11 @@ public:
   std::pmr::memory_resource& mr() { return arena; }
 
   api::Query multiMatch(std::string_view text, std::initializer_list<api::WeightedField> fields,
-                        Mode mode, std::optional<float> tieBreaker = std::nullopt,
+                        Mode mode, std::optional<float> tie = std::nullopt,
                         int32_t slop = 0) {
     auto query = qb::multiMatch(mr(), text, fields, mode);
     auto& arm = std::get<api::MultiMatchQuery>(query.kind);
-    arm.tie_breaker = tieBreaker;
+    arm.tie = tie;
     arm.slop = slop;
     return query;
   }
@@ -393,7 +393,7 @@ TEST_F(MultiMatchQueryTest, httpJsonAndExpr) {
   server.shutdown();
 }
 
-TEST_F(MultiMatchQueryTest, disMaxScoresBestPlusTieBreaker) {
+TEST_F(MultiMatchQueryTest, disMaxScoresBestPlusTie) {
   auto title = run(qb::match(mr(), "title_un", "dune"));
   auto body = run(qb::match(mr(), "body_un", "dune"));
   ASSERT_TRUE(title && body);
@@ -419,7 +419,7 @@ TEST_F(MultiMatchQueryTest, disMaxScoresBestPlusTieBreaker) {
                                [](auto& a, auto& b) { return a.second < b.second; });
   EXPECT_EQ(best->first, top->begin()->first);
 
-  // tie_breaker 1 adds the scores like a disjunction
+  // tie 1 adds the scores like a disjunction
   auto sum = run(qb::disMax(mr(), {qb::match(mr(), "title_un", "dune"),
                                    qb::match(mr(), "body_un", "dune")}, 1.0f));
   auto most = run(multiMatch("dune", {{"title_un", {}}, {"body_un", {}}}, Mode::PER_FIELD));
@@ -505,7 +505,7 @@ TEST_F(MultiMatchQueryTest, wildcardFields) {
   EXPECT_TRUE(none->empty());
 }
 
-TEST_F(MultiMatchQueryTest, groupScoresUseTieBreaker) {
+TEST_F(MultiMatchQueryTest, groupScoresUseTie) {
   ASSERT_TRUE(helper.index(flatdoc("id", "d1", "title_un", "dune", "body_un", "a desert planet story",
                                   "tag_w", "Dune", "kind_s", "Dune"), UpdateMessage::COMMIT).success);
   auto group = run(qb::multiMatch(mr(), "Dune", {{"title_un", {}}, {"body_un", {}}}));
@@ -528,10 +528,49 @@ TEST_F(MultiMatchQueryTest, groupScoresUseTieBreaker) {
                            score(qb::match(mr(), "kind_s", "Dune"), "d1")), keyword->at("d1"));
 }
 
+TEST_F(MultiMatchQueryTest, tieDefaultsArePerArm) {
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD, Mode::PHRASE,
+                    Mode::PHRASE_PREFIX, Mode::BOOL_PREFIX}) {
+    SCOPED_TRACE((int)mode);
+    auto query = multiMatch("Dune", {{"title_un", {}}, {"tag_w", {}}}, mode);
+    auto defaults = run(query);
+    std::get<api::MultiMatchQuery>(query.kind).tie = 1.0f;
+    auto sum = run(query);
+    ASSERT_TRUE(defaults && sum);
+    ASSERT_EQ(1u, defaults->size());
+    EXPECT_EQ(*sum, *defaults);
+    if (mode != Mode::BOOL_PREFIX) {
+      std::get<api::MultiMatchQuery>(query.kind).tie = 0.0f;
+      auto best = run(query);
+      ASSERT_TRUE(best);
+      EXPECT_GT(defaults->at("d1"), best->at("d1"));
+    }
+  }
+  auto best = run(qb::disMax(mr(), {qb::match(mr(), "title_un", "Dune"),
+                                   qb::match(mr(), "tag_w", "Dune")}));
+  ASSERT_TRUE(best);
+  EXPECT_FLOAT_EQ(std::max(score(qb::match(mr(), "title_un", "Dune"), "d1"),
+                           score(qb::match(mr(), "tag_w", "Dune"), "d1")), best->at("d1"));
+}
+
+TEST_F(MultiMatchQueryTest, tieValidation) {
+  for (float tie : {-0.1f, 1.1f, std::numeric_limits<float>::quiet_NaN(),
+                     std::numeric_limits<float>::infinity(), -std::numeric_limits<float>::infinity()}) {
+    auto multi = multiMatch("dune", {{"title_un", {}}}, Mode::COMBINED, tie);
+    auto disMax = qb::disMax(mr(), {qb::match(mr(), "title_un", "dune"),
+                                   qb::match(mr(), "body_un", "dune")}, tie);
+    for (const auto& query : {multi, disMax}) {
+      std::string error;
+      EXPECT_FALSE(run(query, false, &error));
+      EXPECT_NE(std::string::npos, error.find("'tie' must be finite and in [0, 1]")) << error;
+    }
+  }
+}
+
 TEST_F(MultiMatchQueryTest, disMaxAndPhraseValidation) {
   std::string error;
   EXPECT_FALSE(run(multiMatch("dune", {{"title_un", {}}}, Mode::PER_FIELD, 1.5f), false, &error));
-  EXPECT_NE(std::string::npos, error.find("tie_breaker")) << error;
+  EXPECT_NE(std::string::npos, error.find("tie")) << error;
   EXPECT_FALSE(run(multiMatch("dune", {{"title_un", {}}}, Mode::PER_FIELD, std::nullopt, 1),
                    false, &error));
   EXPECT_NE(std::string::npos, error.find("slop")) << error;
@@ -543,17 +582,17 @@ TEST_F(MultiMatchQueryTest, disMaxHttpJsonAndExpr) {
   HttpServer server(*LuxirTest::luxirNode, 1, 0);
   server.start();
   for (std::string query : {
-           R"({"multi_match":{"text":"dune","fields":["title_un","body_un"],"tie_breaker":0.3}})",
+           R"({"multi_match":{"text":"dune","fields":["title_un","body_un"],"tie":0.3}})",
            R"({"dis_max":{"queries":[{"match":{"field":"title_un","val":"dune"}},)"
-           R"({"match":{"field":"body_un","val":"dune"}}],"tie_breaker":0.3}})",
-           R"x("dis_max(queries=[title_un:dune, body_un:dune], tie_breaker=0.3)")x"}) {
+           R"({"match":{"field":"body_un","val":"dune"}}],"tie":0.3}})",
+           R"x("dis_max(queries=[title_un:dune, body_un:dune], tie=0.3)")x"}) {
     auto res = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
                            R"({"query":)" + query + R"(,"fields":["id"],"count_limit":-1})");
     EXPECT_EQ(200, res.result_int()) << query << "\n" << res.body();
     EXPECT_NE(std::string::npos, res.body().find(R"("found":2)")) << query << "\n" << res.body();
   }
   auto bad = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
-      R"({"query":{"dis_max":{"queries":[{"all":true}],"tie_breaker":2}}})");
+      R"({"query":{"dis_max":{"queries":[{"all":true}],"tie":2}}})");
   EXPECT_EQ(400, bad.result_int()) << bad.body();
   server.shutdown();
 }
