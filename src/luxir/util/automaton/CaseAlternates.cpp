@@ -4,14 +4,10 @@
 #include "luxir/util/automaton/CaseAlternates.h"
 
 #include <algorithm>
-#include <iterator>
 #include <map>
 
 #include <uni_algo/case.h>
-#include <uni_algo/conv.h>
-#include <uni_algo/ranges_conv.h>
 
-#include "luxir/util/automaton/CodepointFolder.h"
 
 namespace luxir::automaton {
 namespace {
@@ -75,22 +71,6 @@ void appendCaseAlternates(int32_t lo, int32_t hi, std::vector<std::pair<int32_t,
       if (alternate < lo || alternate > hi) ranges.emplace_back(alternate, alternate);
     }
   }
-}
-
-bool caseStable(std::string_view term, const CodepointFolder& folder) {
-  if (!una::is_valid_utf8(term)) return false;
-  int32_t expected[32];
-  int32_t actual[32];
-  for (char32_t c : una::views::utf8(term)) {
-    auto alternates = caseAlternates((int32_t)c);
-    if (alternates.empty()) continue;
-    int32_t expectedCount = folder.fold((int32_t)c, expected, (int32_t)std::size(expected));
-    for (int32_t alternate : alternates) {
-      int32_t count = folder.fold(alternate, actual, (int32_t)std::size(actual));
-      if (count != expectedCount || !std::equal(actual, actual + count, expected)) return false;
-    }
-  }
-  return true;
 }
 
 } // namespace luxir::automaton

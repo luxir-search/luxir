@@ -38,7 +38,6 @@
 #include "luxir/util/DateTime.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
-#include "luxir/util/automaton/CaseAlternates.h"
 #include "luxir/util/automaton/WildcardCompiler.h"
 #include "luxir/util/automaton/RegExpParser.h"
 
@@ -792,10 +791,9 @@ public:
   // k <= 1 builds a disjunction, k >= N a conjunction, and the middle a
   // min-should-match boolean.
   //
-  // `caseInsensitive` applies to term-backed fields. A STRING / ID value, and
-  // any TEXT token the field's folding does not already make case-blind,
-  // matches through a case-alternating automaton instead of a TermQuery, so
-  // that term scores constantly. Numeric fields ignore it.
+  // `caseInsensitive` matches STRING / ID values through a constant-score
+  // case-alternating automaton. TEXT rejects it: the analyzer owns case.
+  // Numeric and DATE fields ignore it.
   Query* createMatchQuery(std::string_view field, std::string_view value,
                           Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
                           bool caseInsensitive = false) {
@@ -809,38 +807,17 @@ public:
     FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
       case FieldType::Type::TEXT: {
-        auto* chain = fields.chain(target);
-        TokenChain& tc = *chain;
-        Token& tok = tc.getToken();
-        TokenStream& tail = *tc.tail;
-
-        std::vector<std::string_view> terms;
-        tc.setValue(value);
-        tc.reset();
-        while (tail.incrementToken()) {
-          // Analyzer buffers are borrowed until the next pull. A token that
-          // goes through the case-insensitive automaton keeps its full bytes.
-          terms.push_back(poolCopy(caseInsensitive ? std::string_view(tok.text)
-                                                   : fitTerm(target, tok.text)));
+        if (caseInsensitive) {
+          throw std::runtime_error(std::format(
+              "Match case_insensitive is not supported on TEXT field '{}'; use a folding analyzer or field variant",
+              field));
         }
-
-        if (terms.empty()) {
-          return matchNoDocs();
-        }
-        FieldCodepointFolder folder(chain);
-        auto termQuery = [&](std::string_view term) -> Query* {
-          if (!caseInsensitive) return pool.make<TermQuery>(field, term, boost);
-          if (automaton::caseStable(term, folder)) {
-            return pool.make<TermQuery>(field, poolCopy(fitTerm(target, term)), boost);
-          }
-          return makeCaseInsensitiveTerm(target, field, term, boost);
-        };
-        if (terms.size() == 1) {
-          return termQuery(terms[0]);
-        }
+        auto terms = analyzeText(target, value);
+        if (terms.empty()) return matchNoDocs();
+        if (terms.size() == 1) return pool.make<TermQuery>(field, terms[0], boost);
         auto clauses = pool.make_span<Query*>(terms.size());
         for (size_t i = 0; i < terms.size(); i++) {
-          clauses[i] = termQuery(terms[i]);
+          clauses[i] = pool.make<TermQuery>(field, terms[i], boost);
         }
         return combineAnalyzedClauses(clauses, op, minMatch);
       }

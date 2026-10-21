@@ -624,3 +624,11 @@ TEST(ProtoRoundTrip, PackedRequestFlagsWireTags) {
   EXPECT_EQ(3u, op.flags);
   EXPECT_EQ(3u, op.flags_set);
 }
+
+TEST(ProtoRoundTrip, MatchCaseInsensitiveTag) {
+  P::Match query;
+  query.case_insensitive = true;
+  std::vector<std::byte> wire;
+  ASSERT_TRUE(P::encode(query, wire));
+  EXPECT_EQ((std::vector<std::byte>{std::byte{0x50}, std::byte{1}}), wire);
+}

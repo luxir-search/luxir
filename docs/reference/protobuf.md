@@ -1516,7 +1516,7 @@ Matches one field. TEXT, STRING, and ID accept string, bytes, numeric, or boolea
 | <a id="field-luxir.match.val"></a>[`val`](#field-luxir.match.val) | 2 | [`Val`](#message-luxir.val) | singular |  |
 | <a id="field-luxir.match.operator"></a>[`operator`](#field-luxir.match.operator) | 3 | [`Match.Operator`](#enum-luxir.match.operator) | singular | How to combine the multiple terms an analyzed text field can produce. Unset = OR. |
 | <a id="field-luxir.match.min_match"></a>[`min_match`](#field-luxir.match.min_match) | 4 | `int32` | singular | Minimum number of the analyzed terms that must match (the OR..AND middle ground). When set it overrides \`operator\`; clamped to the term count. Mirrors BooleanQuery.min\_match. |
-| <a id="field-luxir.match.case_insensitive"></a>[`case_insensitive`](#field-luxir.match.case_insensitive) | 5 | `bool` | singular | Match STRING and ID values, and TEXT tokens the field's folding does not already make case-blind, regardless of simple Unicode case. Such terms compile to a case-alternating automaton and score constantly. Ignored on numeric and DATE fields. |
+| <a id="field-luxir.match.case_insensitive"></a>[`case_insensitive`](#field-luxir.match.case_insensitive) | 10 | `bool` | singular | Match STRING and ID values regardless of simple Unicode case, after normalization. Uses a constant-score automaton. TEXT rejects this flag; use a folding analyzer or field variant. Numeric and DATE fields ignore it. |
 
 <a id="message-luxir.memorystats"></a>
 

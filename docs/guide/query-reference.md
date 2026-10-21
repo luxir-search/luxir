@@ -85,7 +85,7 @@ The HTTP dialect also accepts the field-name form:
 | `val` | Value to analyze or coerce. Required. |
 | `operator` | `or` (default) or `and` for several analyzed terms. |
 | `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
-| `case_insensitive` | Ignore letter case on term fields. Default `false`. |
+| `case_insensitive` | Ignore simple Unicode case on STRING/ID. TEXT rejects `true`; numeric/date ignore it. Default `false`. |
 
 Text values are analyzed with the resolved field analyzer. String values use
 their normalizer, if configured, and match as exact terms. Numeric and date
@@ -96,10 +96,12 @@ With `case_insensitive`, a STRING or ID value (after its normalizer) matches
 any indexed term that differs only in simple Unicode case: `FOO` matches
 `foo` and `Foo`, and `k` matches the Kelvin sign. Such a value is matched
 through the same automaton as an escaped `wildcard` and is constant-scoring.
-On TEXT fields, an analyzed term whose analyzer already folds case (such as
-`nfkc_cf`) stays a scored term query; other terms take the constant-scoring
-automaton path. Numeric and date fields ignore the flag. Simple case folding
-is one-to-one, so sharp s (U+00DF) does not match `SS`.
+TEXT fields reject `case_insensitive: true`: choose a folding analyzer or
+field variant such as `_wl`, and let analysis determine case handling. Numeric
+and date fields ignore the flag. Simple case folding is one-to-one, so sharp s
+(U+00DF) does not match `SS`. For frequent case-blind STRING matching, prefer a
+[STRING normalizer](schema.md#string-normalization-and-length) with `lowercase`
+or `nfkc_cf`, so ordinary `match` uses an exact term lookup.
 
 ## Exact membership (`any_of`)
 

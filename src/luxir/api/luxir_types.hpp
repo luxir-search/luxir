@@ -1095,7 +1095,6 @@ struct SimpleQuery {
   std::span<const std::string_view> allowed_fields;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
-  bool case_insensitive = false;
 };
 struct RangeQuery {                                            // needs Val
   std::string_view field;

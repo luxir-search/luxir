@@ -402,8 +402,6 @@ TEST(CaseAlternatesTest, compilersExpandLiteralsAndClasses) {
   ByteDfa sharpS = wildcard(utf8(0xdf), &folder);
   EXPECT_TRUE(sharpS.matches("sS"));
   EXPECT_FALSE(sharpS.matches(utf8(0xdf)));
-  EXPECT_TRUE(caseStable("a", folder));
-  EXPECT_FALSE(caseStable("b", folder));
 }
 
 TEST(RegExpTest, errorsHavePositions) {

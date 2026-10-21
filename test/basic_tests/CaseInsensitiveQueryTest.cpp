@@ -83,13 +83,30 @@ TEST_F(CaseInsensitiveQueryTest, regexClassesExpandCase) {
   EXPECT_EQ((Ids{"e"}), hits(R"({"regex":{"field":"name_s","pattern":"[j-l]","case_insensitive":true}})"));
 }
 
-TEST_F(CaseInsensitiveQueryTest, textMatchIgnoresCase) {
+TEST_F(CaseInsensitiveQueryTest, textMatchUsesItsAnalyzer) {
   EXPECT_EQ((Ids{"b"}), hits(R"({"match":{"body_w":"error"}})"));
-  EXPECT_EQ((Ids{"a", "b", "c"}), hits(R"({"match":{"body_w":"error","case_insensitive":true}})"));
-  EXPECT_EQ((Ids{"a", "b"}),
-            hits(R"({"match":{"body_w":"ERROR Happened","operator":"and","case_insensitive":true}})"));
-  // A folding analyzer already erases case: the flag keeps the scored term query.
-  EXPECT_EQ((Ids{"a", "b"}), hits(R"({"match":{"title_t":"ERROR","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"a", "b"}), hits(R"({"match":{"title_t":"ERROR"}})"));
+  for (auto field : {"body_w", "title_t"}) {
+    auto req = run(std::format(R"({{"query":{{"match":{{"field":"{}","val":"error","case_insensitive":true}}}}}})", field));
+    EXPECT_FALSE(req->ok());
+    EXPECT_NE(std::string::npos, req->errorMsg().find("folding"));
+  }
+  auto req = localReq(helper.getSearchEngine());
+  req->topDocs("q").exprQuery("match(error, field=body_w, case_insensitive=true)");
+  req->execute(false);
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("folding"));
+}
+
+TEST_F(CaseInsensitiveQueryTest, idAndNumericMatch) {
+  EXPECT_EQ((Ids{"a"}), hits(R"({"match":{"id":"A","case_insensitive":true}})"));
+  helper.index(flatdoc("id", "num", "count_i", 7, "when_dt", "2026-10-21"), UpdateMessage::COMMIT);
+  for (auto query : {
+      R"({"match":{"field":"count_i","val":7,"case_insensitive":true}})",
+      R"({"match":{"field":"count_i","val":"7","case_insensitive":true}})",
+      R"({"match":{"field":"when_dt","val":"2026-10-21","case_insensitive":true}})"}) {
+    EXPECT_EQ((Ids{"num"}), hits(query));
+  }
 }
 
 TEST_F(CaseInsensitiveQueryTest, flagSeparatesQueryIdentity) {
