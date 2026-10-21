@@ -3,9 +3,11 @@
 #include "luxir/analysis/CharFilter.h"
 #include "luxir/analysis/HtmlEntities.h"
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/util/screaming.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <uni_algo/conv.h>
@@ -34,6 +36,7 @@ std::string_view CharFilter::apply(std::string_view value) {
   copied = 0;
   buffer.clear();
   edits.clear();
+  cursors = {};
   filter();
   if (!copied) return input;
   buffer.append(input.substr(copied));
@@ -42,24 +45,28 @@ std::string_view CharFilter::apply(std::string_view value) {
   return buffer;
 }
 
-int CharFilter::correctOffset(int offset, bool end) const {
+int CharFilter::correctOffset(int offset, bool end) {
+  if (edits.empty()) return offset;
+  auto& cursor = cursors[end];
+  if (offset < cursor.offset) cursor.index = 0;
+  cursor.offset = offset;
   size_t pos = (size_t) offset;
   if (end) {
-    auto it = std::lower_bound(edits.begin(), edits.end(), pos,
-        [](const Edit& edit, size_t p) { return edit.outEnd < p; });
-    if (it != edits.end()) {
-      if (pos > it->outStart) return (int) it->inEnd;
-      return (int) (it->inStart - (it->outStart - pos));
+    cursor.index = (size_t) screaming::gallopLowerBound((int64_t) cursor.index, (int64_t) edits.size(), pos,
+        [&](int64_t i) { return edits[(size_t) i].outEnd; });
+    if (cursor.index < edits.size()) {
+      const auto& edit = edits[cursor.index];
+      if (pos > edit.outStart) return (int) edit.inEnd;
+      return (int) (edit.inStart - (edit.outStart - pos));
     }
   } else {
-    auto it = std::upper_bound(edits.begin(), edits.end(), pos,
-        [](size_t p, const Edit& edit) { return p < edit.outStart; });
-    if (it == edits.begin()) return offset;
-    --it;
-    if (pos < it->outEnd) return (int) it->inStart;
-    return (int) (it->inEnd + (pos - it->outEnd));
+    cursor.index = (size_t) screaming::gallopLowerBound((int64_t) cursor.index, (int64_t) edits.size(), pos + 1,
+        [&](int64_t i) { return edits[(size_t) i].outStart; });
+    if (!cursor.index) return offset;
+    const auto& edit = edits[cursor.index - 1];
+    if (pos < edit.outEnd) return (int) edit.inStart;
+    return (int) (edit.inEnd + (pos - edit.outEnd));
   }
-  if (edits.empty()) return offset;
   const auto& last = edits.back();
   return (int) (last.inEnd + (pos - last.outEnd));
 }
@@ -237,6 +244,7 @@ std::unique_ptr<const CharFilterFactory> makeCharFilterFactory(const api::Analyz
     chars->erase(std::unique(chars->begin(), chars->end()), chars->end());
     auto factory = std::make_unique<Factory>();
     factory->name = def.name;
+    factory->normalizing = true;
     factory->chars = std::move(chars);
     return factory;
   }
@@ -250,6 +258,7 @@ std::unique_ptr<const CharFilterFactory> makeCharFilterFactory(const api::Analyz
     };
     auto factory = std::make_unique<Factory>();
     factory->name = def.name;
+    factory->normalizing = def.name != "html_strip";
     return factory;
   }
   throw std::invalid_argument("unknown char filter '" + std::string(def.name) + "'; valid char filters: " + std::string(valid));

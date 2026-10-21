@@ -63,7 +63,7 @@ Analysis analyze(TokenChain& tc, std::string_view val) {
   tc.setValue(val);
   tc.reset();
   Analysis out;
-  Token& tok = tc.head.getToken();
+  Token& tok = tc.getToken();
   int pos = -1;
   while (tc.tail->incrementToken()) {
     pos += tok.positionIncrement;
@@ -97,7 +97,7 @@ TEST_F(AnalysisTest, englishPossessive) {
     EXPECT_EQ((std::vector<int>{0}), out.starts);
     EXPECT_EQ((std::vector<int>{(int) source.size()}), out.ends);
     EXPECT_EQ(input, source);
-    EXPECT_EQ(source.data(), chain->head.getToken().text.data());
+    EXPECT_EQ(source.data(), chain->getToken().text.data());
   }
   EXPECT_TRUE(analyze(*chain, "").terms.empty());
 }

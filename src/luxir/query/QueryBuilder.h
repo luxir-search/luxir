@@ -308,7 +308,7 @@ private:
   std::vector<std::string_view> analyzeText(const ResolvedFieldHandle& target,
                                            std::string_view text) {
     TokenChain& tc = *fields.chain(target);
-    Token& tok = tc.head.getToken();
+    Token& tok = tc.getToken();
     TokenStream& tail = *tc.tail;
     std::vector<std::string_view> terms;
     tc.setValue(text);
@@ -473,7 +473,7 @@ public:
           normalizer->reset();
           if (!normalizer->tail->incrementToken()) continue;
           // Token bytes are borrowed only until the next pull, including EOF.
-          term = poolCopy(normalizer->head.getToken().text);
+          term = poolCopy(normalizer->getToken().text);
           if (normalizer->tail->incrementToken()) {
             throw std::runtime_error(std::format(
                 "Field '{}': any_of / := requires a single term per exact TEXT value. "
@@ -1210,7 +1210,7 @@ public:
     positionalTextFieldType(target);
     auto* chain = fields.chain(target);
     TokenChain& tc = *chain;
-    Token& tok = tc.head.getToken();
+    Token& tok = tc.getToken();
     TokenStream& tail = *tc.tail;
 
     // Collected here, then copied into pool-backed spans. Query parsing is a

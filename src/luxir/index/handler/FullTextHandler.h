@@ -100,7 +100,7 @@ public:
     if (vals.empty()) return;
 
     TokenChain& tc = *tokenChain;
-    Token& tok = tc.head.getToken();
+    Token& tok = tc.getToken();
     TokenStream& tail = *tc.tail;
     int docid = inverter.getDoc();
 

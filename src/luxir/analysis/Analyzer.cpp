@@ -561,23 +561,6 @@ private:
   }
 };
 
-// Correct only once, after the token filters, and only on configured chains.
-// With no char filters the original token hot path remains unchanged.
-class OffsetFilter : public TokenFilter {
-  const std::vector<std::unique_ptr<CharFilter>>& filters;
-public:
-  OffsetFilter(std::unique_ptr<TokenStream> source,
-               const std::vector<std::unique_ptr<CharFilter>>& filters)
-      : TokenFilter(std::move(source)), filters(filters) {}
-  bool incrementToken() override {
-    if (!source().incrementToken()) return false;
-    for (auto it = filters.rbegin(); it != filters.rend(); ++it) {
-      token.startOffset = (*it)->correctOffset(token.startOffset, false);
-      token.endOffset = (*it)->correctOffset(token.endOffset, true);
-    }
-    return true;
-  }
-};
 } // namespace
 
 std::unique_ptr<CharFilter> makeUnicodeCharFilter(std::string_view name) {
@@ -585,23 +568,28 @@ std::unique_ptr<CharFilter> makeUnicodeCharFilter(std::string_view name) {
 }
 
 TokenChain::TokenChain(Tokenizer& head, std::unique_ptr<TokenStream> tail, bool stateful,
-                       std::vector<std::unique_ptr<CharFilter>> cleanups)
-    : head(head), tail(std::move(tail)), stateful(stateful), charFilters(std::move(cleanups)) {
-  if (!charFilters.empty()) this->tail = std::make_unique<OffsetFilter>(std::move(this->tail), charFilters);
-}
+                       std::vector<CharStage> cleanups)
+    : charStages(std::move(cleanups)), head(head), tail(std::move(tail)), stateful(stateful) {}
 
 void TokenChain::setFilteredValue(std::string_view value) {
   if (value.size() > (size_t) std::numeric_limits<int>::max())
     throw std::length_error("Analysis input exceeds byte-offset limit");
-  for (auto& filter : charFilters) value = filter->apply(value);
+  for (auto& stage : charStages) value = stage.filter->apply(value);
   head.setValue(value);
 }
 
-void TokenChain::normalizeTerm(std::string& term) {
+void TokenChain::normalizeCharFilters(std::string& term) {
   std::string_view value = term;
-  for (auto& filter : charFilters) value = filter->apply(value);
+  for (auto& stage : charStages) {
+    if (stage.normalizing) value = stage.filter->apply(value);
+  }
   if (value.data() != term.data()) term.assign(value);
-  tail->normalizeTerm(term);
+}
+
+int TokenChain::sourceOffset(int offset, bool isEnd) {
+  for (auto it = charStages.rbegin(); it != charStages.rend(); ++it)
+    offset = it->filter->correctOffset(offset, isEnd);
+  return offset;
 }
 
 // ---------------------------------------------------------------------------
@@ -814,8 +802,8 @@ std::unique_ptr<TokenChain> Analyzer::createChain() const {
   for (size_t i = fusedFold ? 2 : fusedHead ? 1 : 0; i < filters.size(); i++) {
     tail = filters[i]->create(std::move(tail));
   }
-  std::vector<std::unique_ptr<CharFilter>> cleanups;
-  for (const auto& factory : charFilters) cleanups.push_back(factory->create());
+  std::vector<TokenChain::CharStage> cleanups;
+  for (const auto& factory : charFilters) cleanups.push_back({factory->create(), factory->normalizing});
   return std::make_unique<TokenChain>(headRef, std::move(tail), stateful, std::move(cleanups));
 }
 

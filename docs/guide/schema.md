@@ -426,15 +426,12 @@ Decoded markup such as `&lt;b&gt;` remains text rather than being parsed again.
 This is a deterministic indexing text extractor, not a browser rendering model
 or an HTML sanitizer for safe display.
 
-Cleanup also runs for analyzed queries and before the existing normalization
-of prefix/fuzzy terms. Wildcard/regex queries retain per-codepoint literal
-normalization: character removal and folding apply, but multi-character HTML
-markup and entities are not decoded inside patterns. Already-analyzed phrase
-`terms` remain verbatim. Stored source values retain the submitted text.
-Token offsets map back to source byte spans, including through multiple cleanup
-stages; bytes introduced by a replacement refer to the source span that
-produced them. With no character filters, analysis still borrows the original
-input without a cleanup buffer or an offset-correction stage.
+Cleanup runs for analyzed queries. Prefix/fuzzy terms and TEXT range bounds
+use normalizing character filters before token normalization; `html_strip` is
+excluded. Wildcard/regex literals retain per-codepoint normalization, while
+character classes remain exact. Multi-character markup and entities are not
+decoded inside patterns. Already-analyzed phrase `terms` remain verbatim.
+Stored source values retain the submitted text.
 
 An analyzer specifying only `char_filters` replaces the inherited analyzer
 and uses the default `whitespace` tokenizer. Schema changes affect future

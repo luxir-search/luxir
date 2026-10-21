@@ -3,6 +3,7 @@
 #pragma once
 
 #include <memory>
+#include <array>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -16,8 +17,10 @@ namespace api { struct AnalyzerComponent; }
 // compositions still identify the source that produced a token.
 class CharFilter {
   struct Edit { size_t outStart, outEnd, inStart, inEnd; };
+  struct Cursor { size_t index = 0; int offset = 0; };
   std::string buffer;
   std::vector<Edit> edits;
+  std::array<Cursor, 2> cursors{};
   size_t copied = 0;
 protected:
   std::string_view input;
@@ -28,12 +31,14 @@ protected:
 public:
   virtual ~CharFilter() = default;
   std::string_view apply(std::string_view value);
-  int correctOffset(int offset, bool end) const;
+  // Start/end searches advance independently; decreasing requests rewind.
+  int correctOffset(int offset, bool end);
 };
 
 class CharFilterFactory {
 public:
   std::string name;
+  bool normalizing = false;
   virtual ~CharFilterFactory() = default;
   virtual std::unique_ptr<CharFilter> create() const = 0;
 };

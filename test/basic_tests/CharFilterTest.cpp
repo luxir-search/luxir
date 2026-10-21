@@ -32,10 +32,10 @@ Tokens analyze(TokenChain& chain, std::string_view input) {
   chain.reset();
   Tokens result;
   while (chain.tail->incrementToken()) {
-    const auto& token = chain.head.getToken();
+    const auto& token = chain.getToken();
     result.terms.emplace_back(token.text);
-    result.starts.push_back(token.startOffset);
-    result.ends.push_back(token.endOffset);
+    result.starts.push_back(chain.hasCharFilters() ? chain.sourceOffset(token.startOffset, false) : token.startOffset);
+    result.ends.push_back(chain.hasCharFilters() ? chain.sourceOffset(token.endOffset, true) : token.endOffset);
   }
   return result;
 }
@@ -82,7 +82,7 @@ TEST_F(CharFilterTest, orderAndCanonicalIdentity) {
   auto empty = compile(R"({"char_filters":[{"name":"remove_chars","params":{"chars":[]}}]})")->createChain();
   std::string source = "unchanged";
   analyze(*empty, source);
-  EXPECT_EQ(source.data(), empty->head.getToken().text.data());
+  EXPECT_EQ(source.data(), empty->getToken().text.data());
 }
 
 TEST_F(CharFilterTest, htmlMarkupEntitiesAndOffsets) {
@@ -266,4 +266,27 @@ TEST_F(CharFilterTest, schemaRoundTripInheritanceAndValidation) {
       R"({"type":"text","analyzer":{"char_filters":["no_such_filter"]}})"}) {
     EXPECT_THROW(schema(std::string("{\"fields\":{\"body\":") + field + "}}"), SchemaError);
   }
+}
+
+TEST_F(CharFilterTest, lazyOffsetsAndCursorReuse) {
+  auto chain = compile(R"({"tokenizer":"unicode_word","char_filters":["html_strip","nfkc_cf"]})")->createChain();
+  std::string source = "&#x2100; tail"; // a/c: both tokens identify the same entity
+  chain->setValue(source);
+  chain->reset();
+  for (auto [start, end] : {std::pair{0, 1}, {2, 3}, {4, 8}}) {
+    ASSERT_TRUE(chain->tail->incrementToken());
+    EXPECT_EQ(start, chain->getToken().startOffset);
+    EXPECT_EQ(end, chain->getToken().endOffset);
+  }
+  EXPECT_EQ(9, chain->sourceOffset(4, false));
+  EXPECT_EQ(0, chain->sourceOffset(0, false)); // rewind only the start cursor
+  EXPECT_EQ(8, chain->sourceOffset(3, true));
+  EXPECT_EQ(8, chain->sourceOffset(1, true));
+  EXPECT_EQ(0, chain->sourceOffset(2, false));
+  EXPECT_EQ(8, chain->sourceOffset(3, true));
+  EXPECT_EQ((std::vector<int>{0}), analyze(*chain, "fresh").starts);
+  std::string term = "<b>CAP";
+  chain->normalizeTerm(term);
+  EXPECT_EQ("<b>cap", term); // html_strip is analysis-only
+  EXPECT_EQ((std::vector<std::string>{"next"}), analyze(*chain, "NEXT").terms);
 }

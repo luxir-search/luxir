@@ -34,8 +34,8 @@ class Token {
 public:
   std::string_view text;
   int positionIncrement; // increment from the previous token's position
-  int startOffset; // byte offset into original text buffer of current token
-  int endOffset;   // end offset (exclusive) into the original text buffer
+  int startOffset; // byte offset into the tokenizer input of current token
+  int endOffset;   // end offset (exclusive) into the tokenizer input
 
   void clear() {
     // Offsets are deliberately not reset here: every emit path sets them, so
@@ -43,9 +43,9 @@ public:
     positionIncrement = 1;
   }
 
-  // Record the [start, end) source byte span. Only the head Tokenizer (which
-  // still sees the source) sets this; downstream filters generally leave it alone so it
-  // keeps pointing at the origin span even after they rewrite `text`.
+  // Record the [start, end) span in tokenizer input bytes. Token filters
+  // preserve it when rewriting text. With char filters, sourceOffset() maps
+  // this span back to the original value only when an offset consumer needs it.
   void setOffset(int start, int end) {
     startOffset = start;
     endOffset = end;
@@ -330,15 +330,20 @@ std::unique_ptr<const TokenFilterFactory> makeTokenFilterFactory(const api::Anal
 
 class TokenChain {
 public:
+  struct CharStage {
+    std::unique_ptr<CharFilter> filter;
+    bool normalizing;
+  };
+private:
+  std::vector<CharStage> charStages;
   Tokenizer &head;                   // owned via `tail` (the head is the bottom of the chain)
+public:
   std::unique_ptr<TokenStream> tail; // the top of the chain; pull from here
   bool stateful;                     // true iff any stage buffers state across tokens/values
-  std::vector<std::unique_ptr<CharFilter>> charFilters;
 
   TokenChain(Tokenizer &head, std::unique_ptr<TokenStream> tail, bool stateful = false,
-             std::vector<std::unique_ptr<CharFilter>> cleanups = {});
+             std::vector<CharStage> cleanups = {});
 
-  // OffsetFilter borrows this object's filter vector; chains stay at a fixed address.
   TokenChain(const TokenChain&) = delete;
   TokenChain& operator=(const TokenChain&) = delete;
   TokenChain(TokenChain&&) = delete;
@@ -346,7 +351,7 @@ public:
 
   // Keep unconfigured indexing on the existing borrowed-input fast path.
   void setValue(std::string_view value) {
-    if (charFilters.empty()) head.setValue(value);
+    if (charStages.empty()) head.setValue(value);
     else setFilteredValue(value);
   }
 
@@ -360,8 +365,18 @@ public:
 
   // Normalize a single term the way this chain folds token text, without
   // segmentation - the multiterm entry point (see TokenStream::normalizeTerm).
-  void normalizeTerm(std::string& term);
+  // Like setValue(), this invalidates the current value's buffers and offset maps.
+  void normalizeTerm(std::string& term) {
+    if (!charStages.empty()) normalizeCharFilters(term);
+    tail->normalizeTerm(term);
+  }
+
+  Token& getToken() { return head.getToken(); }
+  bool hasCharFilters() const noexcept { return !charStages.empty(); }
+  // Token ends exclude trailing deletions; this is not the source value's length.
+  int sourceOffset(int offset, bool isEnd);
 private:
+  void normalizeCharFilters(std::string& term);
   void setFilteredValue(std::string_view value);
 };
 

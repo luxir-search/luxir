@@ -50,7 +50,7 @@ static void BM_Tokenize(benchmark::State& state, std::string tokenizer,
     api::build::mapSlot(components[filters.size() - 1].params, 1, "possessive", arena)->kind = *possessive;
   }
   auto chain = Analyzer::compile(def)->createChain();
-  Token& tok = chain->head.getToken();
+  Token& tok = chain->getToken();
   TokenStream& tail = *chain->tail;
 
   int64_t ntokens = 0;
@@ -104,7 +104,7 @@ static void BM_KStem(benchmark::State& state) {
   chain->setValue(book.text());
   chain->reset();
   std::vector<std::string> terms;
-  while (chain->tail->incrementToken()) terms.emplace_back(chain->head.getToken().text);
+  while (chain->tail->incrementToken()) terms.emplace_back(chain->getToken().text);
   KStemmer stemmer;
   for (auto _ : state) {
     for (const auto& term : terms) {
@@ -141,11 +141,11 @@ static void BM_SciAnalyze(benchmark::State& state, std::string tokenizer, std::v
   auto* components = api::build::allocArray(def.filters, filters.size(), arena);
   for (size_t i = 0; i < filters.size(); ++i) components[i].name = filters[i];
   auto chain = Analyzer::compile(def)->createChain();
-  Token& tok = chain->head.getToken();
+  Token& tok = chain->getToken();
   TokenStream& tail = *chain->tail;
   int64_t ntokens = 0;
   for (auto _ : state) {
-    chain->head.setValue(text);
+    chain->setValue(text);
     chain->reset();
     while (tail.incrementToken()) {
       benchmark::DoNotOptimize(tok.text);
