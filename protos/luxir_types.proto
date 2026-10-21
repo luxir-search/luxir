@@ -149,7 +149,8 @@ message TopDocs {
   // A name containing '*' is a pattern expanded the same way: the matching
   // retrievable fields; matching nothing is not an error.  Explicitly
   // named fields win on collision and may name anything, vectors and engine
-  // fields included.
+  // fields included. "_sort_" returns each document's sort values, one per
+  // sort clause (the score for a list ranked by score), as an ArrVal.
   repeated string fields = 7;
   repeated SortSpec sort = 8;
 
@@ -300,6 +301,7 @@ message Query {
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
     MultiMatchQuery multi_match = 20; // one text over several weighted fields
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
+    GeoNearestQuery geo_nearest = 21; // the k documents nearest a point of a GEO_POINT field
   }
 }
 
@@ -551,6 +553,26 @@ message GeoDistanceQuery {
   double lat = 2;           // center latitude, degrees in [-90, 90]
   double lon = 3;           // center longitude, degrees in [-180, 180]
   double radius_meters = 4; // inclusive radius, finite and non-negative
+}
+
+// The k documents nearest a point of a GEO_POINT field, by the great-circle
+// distance geo_distance uses. A multi-valued field counts each document once,
+// at its nearest point; ties keep index order. Deleted documents and
+// documents outside the enclosing domain (filters, facet buckets) are not
+// candidates, so k counts eligible documents. Hits score 1 / (1 + meters),
+// times any enclosing boost; sort by geo_distance(field, lat, lon) to return
+// the exact distance.
+//
+// Named center scalars deliberately avoid positional ambiguity: the VALUE
+// array contract [x, y] = [lon, lat] does not apply to this message.
+message GeoNearestQuery {
+  string field = 1;
+  double lat = 2;  // center latitude, degrees in [-90, 90]
+  double lon = 3;  // center longitude, degrees in [-180, 180]
+  int32 k = 4;     // documents to return; must be positive
+  // Inclusive distance limit, so fewer than k may match. Unset = no limit;
+  // must be non-negative.
+  optional double max_distance_meters = 5;
 }
 
 message Filter {
@@ -2270,6 +2292,16 @@ message FieldDef {
   // VECTOR only: ANN overlay settings. Absent inherits the parent's whole
   // definition (no per-property merge), else every VectorAnnDef default.
   VectorAnnDef ann = 22;
+
+  // GEO_POINT only. Skip a value that is not a valid point (unreadable, out of
+  // range, or a z coordinate without ignore_z_value) and index the rest of the
+  // document; in a multi-valued field only the bad points are skipped. Unset
+  // inherits, else false: a malformed point fails the document.
+  optional bool ignore_malformed = 28;
+
+  // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
+  // inherits, else false: a point with a z coordinate is malformed.
+  optional bool ignore_z_value = 29;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

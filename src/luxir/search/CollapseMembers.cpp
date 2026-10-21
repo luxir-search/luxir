@@ -42,7 +42,10 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
         if (!found) break;
         const SegFieldInfo& info = *found;
         auto type = const_cast<FieldType&>(field.getFieldType()).type();
-        if (FieldType::sortsByIntColumn(type)) {
+        if (field.getGeoOrigin().has_value()) {
+          auto meters = GeoDistanceComparator::meters(segment, info, *field.getGeoOrigin(), doc.docId());
+          if (meters) value.kind = *meters;
+        } else if (FieldType::sortsByIntColumn(type)) {
           IntColReader column(segment.postingsReader(), info);
           IntColReader::Iterator iter(column);
           if (iter.advance(doc.docId()) != doc.docId()) break;

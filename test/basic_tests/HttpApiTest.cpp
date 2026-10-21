@@ -1123,6 +1123,91 @@ TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
   EXPECT_EQ(result.body().find(R"("la")"), std::string::npos) << result.body();
 }
 
+TEST_F(HttpApiTest, geoNearestAndDistanceSortOverJson) {
+  SchemaBuilder b;
+  auto& field = b.field("geo");
+  field.type = api::FieldDef::FieldClass::GEO_POINT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  b.set(helper.collection());
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"ny","geo":[-74.0060,40.7128]},{"id":"philly","geo":[-75.1652,39.9526]},)"
+      R"({"id":"la","geo":[-118.2437,34.0522]}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  auto nearest = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_nearest":{"field":"geo","lat":40.0,"lon":-75.0,"k":2,"max_distance_meters":1000000}},)"
+      R"("fields":["id"]})");
+  ASSERT_EQ(200, nearest.result_int()) << nearest.body();
+  size_t philly = nearest.body().find(R"("philly")");
+  size_t ny = nearest.body().find(R"("ny")");
+  ASSERT_NE(std::string::npos, philly) << nearest.body();
+  ASSERT_NE(std::string::npos, ny) << nearest.body();
+  EXPECT_LT(philly, ny) << nearest.body();
+  EXPECT_EQ(std::string::npos, nearest.body().find(R"("la")")) << nearest.body();
+
+  auto sorted = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"all":true},"sort":["geo_distance(geo, 40.0, -75.0) desc"],)"
+      R"("fields":["id","_sort_"]})");
+  ASSERT_EQ(200, sorted.result_int()) << sorted.body();
+  size_t la = sorted.body().find(R"("la")");
+  ASSERT_NE(std::string::npos, la) << sorted.body();
+  EXPECT_LT(la, sorted.body().find(R"("philly")")) << sorted.body();
+  EXPECT_NE(std::string::npos, sorted.body().find(R"("_sort_")")) << sorted.body();
+  // la is 3,857 km from the origin.
+  EXPECT_NE(std::string::npos, sorted.body().find(R"("_sort_":[3857)")) << sorted.body();
+
+  // A diversified list reports its sort values too.
+  auto diverse = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"x({"query":{"all":true},"sort":["geo_distance(geo, 40.0, -75.0)"],)x"
+      R"("diversify":{"field":"id","max_per_key":1},"fields":["id","_sort_"],"limit":1})");
+  ASSERT_EQ(200, diverse.result_int()) << diverse.body();
+  EXPECT_NE(std::string::npos, diverse.body().find(R"x("_sort_":[15031.)x")) << diverse.body();
+
+  auto bad = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_nearest":{"field":"geo","lat":40.0,"lon":-75.0,"k":0}}})");
+  EXPECT_NE(std::string::npos, bad.body().find("k > 0")) << bad.body();
+}
+
+TEST_F(HttpApiTest, geoPointFormatsAndOptionsOverJson) {
+  auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
+    "fields": {
+      "geo": {"type":"geo_point", "index":"range", "multi":true,
+              "ignore_malformed":true, "ignore_z_value":true}
+    }
+  })");
+  ASSERT_EQ(200, schema.result_int()) << schema.body();
+  auto authored = httpRequest(port(), http::verb::get, "/collections/main/_schema");
+  ASSERT_EQ(200, authored.result_int()) << authored.body();
+  EXPECT_NE(authored.body().find(R"("ignore_malformed": true)"), std::string::npos) << authored.body();
+  EXPECT_NE(authored.body().find(R"("ignore_z_value": true)"), std::string::npos) << authored.body();
+  auto resolved = httpRequest(port(), http::verb::get, "/collections/main/_schema?view=resolved");
+  ASSERT_EQ(200, resolved.result_int()) << resolved.body();
+  EXPECT_NE(resolved.body().find(R"("ignore_malformed": true)"), std::string::npos) << resolved.body();
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"obj","geo":{"lat":40.7128,"lon":-74.0060}},)"
+      R"j({"id":"str","geo":["40.7128,-74.0060","POINT (-0.1278 51.5074 12)"]},)j"
+      R"({"id":"hash","geo":"dr5regw3p"},)"
+      R"({"id":"bad","geo":"not a point","home_p":"51.5074,-0.1278"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_EQ(update.body().find(R"("errors")"), std::string::npos) << update.body();
+
+  auto near = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_distance":{"field":"geo","lat":40.7128,"lon":-74.0060,"radius_meters":1000}},)"
+      R"("fields":["id"],"count_limit":-1})");
+  ASSERT_EQ(200, near.result_int()) << near.body();
+  for (const char* id : {R"("obj")", R"("str")", R"("hash")"}) {
+    EXPECT_NE(near.body().find(id), std::string::npos) << id << near.body();
+  }
+  EXPECT_EQ(near.body().find(R"("bad")"), std::string::npos) << near.body();
+
+  auto london = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_distance":{"field":"home_p","lat":51.5074,"lon":-0.1278,"radius_meters":10}},)"
+      R"("fields":["id"]})");
+  ASSERT_EQ(200, london.result_int()) << london.body();
+  EXPECT_NE(london.body().find(R"("bad")"), std::string::npos) << london.body();
+}
+
 TEST_F(HttpApiTest, vectorDocumentsRoundTripOverJson) {
   auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
     "fields": {
@@ -3274,7 +3359,12 @@ TEST_F(HttpApiTest, schemaSetAndReplaceAllModes) {
   auto redefine = httpRequest(port(), http::verb::post, "/collections/main/_schema",
                               R"({"fields": {"published": {"type": "date"}}})");
   ASSERT_EQ(200, redefine.result_int()) << redefine.body();
-  EXPECT_EQ(redefine.body().find("\"index\": \"range\""), std::string::npos)
+  // Only published's own definition: the geo suffix templates are range-indexed.
+  size_t published = redefine.body().find("\"published\"");
+  ASSERT_NE(std::string::npos, published) << redefine.body();
+  std::string definition = redefine.body().substr(
+      published, redefine.body().find('}', published) - published);
+  EXPECT_EQ(definition.find("\"index\""), std::string::npos)
       << "whole-definition set dropped the old index property: " << redefine.body();
 
   // mode=replace_all: title/published gone, reserved fields materialized.

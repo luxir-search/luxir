@@ -343,6 +343,14 @@ struct SkipStats {
   static inline int64_t geoBKDArms = 0;
   static inline int64_t geoScanArms = 0;
   static inline int64_t geoSparseVerifyArms = 0;
+  // geo_nearest segments served by the best-first points walk, by the
+  // domain's docs, or by a column scan, and the leaves the walks decoded.
+  static inline int64_t geoNearestWalks = 0;
+  static inline int64_t geoNearestSparse = 0;
+  static inline int64_t geoNearestScans = 0;
+  static inline int64_t geoNearestLeaves = 0;
+  // Geo distance sorts: competitive circles built from the points index.
+  static inline int64_t geoSortCircleBuilds = 0;
   // Codec skipBlock calls on landing-block traversal only: header-level
   // leaps (skipToBlock over whole blocks) bypass freq planes by byte length
   // without charging this counter, so it undercounts under jumped windows.
@@ -640,6 +648,11 @@ struct SkipStats {
     geoBKDArms = 0;
     geoScanArms = 0;
     geoSparseVerifyArms = 0;
+    geoNearestWalks = 0;
+    geoNearestSparse = 0;
+    geoNearestScans = 0;
+    geoNearestLeaves = 0;
+    geoSortCircleBuilds = 0;
     docsOnlyFreqBlocksSkipped = 0;
     docsOnlyWordProbeAdvances = 0;
     scoredWordProbeAdvances = 0;

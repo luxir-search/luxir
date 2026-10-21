@@ -46,7 +46,14 @@ SearchOp::Calculator* TopDocsReq::createDiversifyCalculator(
 }
 
 void TopDocsReq::fillDiversifyResponse(CalcBase& calc, MergeableCollector& data) {
-  auto emit = [&](auto& collector) {
+  auto emit = [&](auto& collector, bool fieldSort) {
+    DocSortValues sortValues;
+    if (fieldSort) {
+      sortValues = [sort = &sortPlan, reader = req.reader.get()](
+          api::ArrVal& out, segdoc doc, float score, std::pmr::memory_resource& mr) {
+        emitCollapseRank(out, *sort, *reader, doc, score, mr);
+      };
+    }
     auto docs = collector.sort();
     auto target = [&](SearchResponse* response) -> api::DocList& {
       auto& list = *calc.slotArm<api::DocList>(response);
@@ -58,10 +65,11 @@ void TopDocsReq::fillDiversifyResponse(CalcBase& calc, MergeableCollector& data)
         [docs](int64_t i) { return docs[i].score; }, collector.totalHits(),
         topDocsProto.fields, topDocsProto.batch_size, topDocsProto.offset,
         requirements.needsCount(), topDocsProto.get_scores, topDocsProto.document_format,
-        calc.underBucketSlot() ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM);
+        calc.underBucketSlot() ? DocEmission::FINAL_RESPONSE : DocEmission::STREAM,
+        {}, false, std::move(sortValues));
   };
-  if (data.useFieldSort) emit(*data.diverseFieldCollector);
-  else emit(*data.diverseScoreCollector);
+  if (data.useFieldSort) emit(*data.diverseFieldCollector, true);
+  else emit(*data.diverseScoreCollector, false);
 }
 
 } // namespace luxir

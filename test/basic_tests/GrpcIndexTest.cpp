@@ -24,6 +24,8 @@
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "luxir/server/RpcStatus.h"
 #include "luxir/util/Signal.h"
 
@@ -816,6 +818,42 @@ TEST_F(GrpcIndexTest, addDocs) {
     GRPC_DEBUG("I got id:{}", idString(response.msg.request_id));
   }
 
+}
+
+// Geo point objects and strings arrive as Map and string Vals in the binary
+// protobuf encoding, the same as over HTTP JSON.
+TEST_F(GrpcIndexTest, geoPointFormatsOverProtobuf) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("loc");
+  field.type = api::FieldDef::FieldClass::GEO_POINT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  field.multi = true;
+  schema.set(helper.collection());
+
+  std::pmr::monotonic_buffer_resource mr;
+  api::UpdateRequest request;
+  std::string error;
+  ASSERT_TRUE(api::read_json(request,
+      R"({"docs":[{"id":"obj","loc":{"lat":50.5,"lon":10.5}},)"
+      R"({"id":"geojson","loc":{"type":"Point","coordinates":[10.6,50.6]}},)"
+      R"j({"id":"strs","loc":["50.7,10.7","POINT (10.8 50.8)","u0zrq"]},)j"
+      R"({"id":"far","loc":[-74.0,40.7]}],"commit":{}})", mr, &error)) << error;
+  Reply<api::UpdateResponse> response;
+  grpc::ClientContext context;
+  ASSERT_TRUE(hppUnaryCall(channel.get(), rpc::Update, &context, request, &response).ok());
+  EXPECT_EQ(api::UpdateResponse_::Status::OK, response.msg.status);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.rawQuery() = qb::geoBox(cur.mr(), "loc", 50.0, 51.0, 10.0, 11.0);
+  cur.fields({"id"}).limit(10);
+  req->execute();
+  ASSERT_OK(req);
+  std::vector<std::string> ids;
+  for (const auto& doc : req->getDocs()) ids.push_back(std::get<std::string>(*find(doc, "id")));
+  std::ranges::sort(ids);
+  EXPECT_EQ((std::vector<std::string>{"geojson", "obj", "strs"}), ids);
 }
 
 TEST_F(GrpcIndexTest, unsafeCollectionNameIsInvalidArgument) {

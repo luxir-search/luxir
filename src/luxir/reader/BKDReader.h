@@ -727,6 +727,86 @@ public:
           INT32_MIN, INT32_MAX);
   }
 
+  // Best-first walk for nearest-point search. Cells are visited in
+  // ascending cellKey(latMin, latMax, lonMin, lonMax) order, a lower bound
+  // on the key of every point inside the cell; a leaf is keyed by its tight
+  // bounds, an inner node by the split planes above it. offer(doc, lat, lon)
+  // receives every point of each visited leaf. The walk stops at the first
+  // cell whose key exceeds bound(), so bound() must be the key at or below
+  // which a point can still improve the result; it may shrink as points are
+  // offered. Returns the number of leaves decoded.
+  template <class CellKey, class Bound, class Offer>
+  uint32_t nearest(Scratch scratch, CellKey&& cellKey, Bound&& bound,
+                   Offer&& offer) const {
+    if (scratch.docs.size() < leafSizeMax || scratch.lat.size() < leafSizeMax
+        || scratch.lon.size() < leafSizeMax) {
+      throw std::invalid_argument("BKDReader: nearest scratch is too small");
+    }
+    struct Cell {
+      double key;
+      uint32_t nodeId;
+      uint32_t leaves;
+      uint32_t firstLeaf;
+      int32_t latMin;
+      int32_t latMax;
+      int32_t lonMin;
+      int32_t lonMax;
+    };
+    auto after = [](const Cell& a, const Cell& b) { return a.key > b.key; };
+    std::vector<Cell> queue;
+    auto push = [&](uint32_t nodeId, uint32_t leaves, uint32_t firstLeaf,
+                    int32_t latMin, int32_t latMax, int32_t lonMin,
+                    int32_t lonMax) {
+      if (leaves == 1) {
+        latMin = leafMinLat(firstLeaf);
+        latMax = leafMaxLat(firstLeaf);
+        lonMin = leafMinLon(firstLeaf);
+        lonMax = leafMaxLon(firstLeaf);
+      }
+      double key = cellKey(latMin, latMax, lonMin, lonMax);
+      if (key > bound()) return;
+      queue.push_back({key, nodeId, leaves, firstLeaf, latMin, latMax, lonMin,
+                       lonMax});
+      std::push_heap(queue.begin(), queue.end(), after);
+    };
+    push(1, leavesCount, 0, INT32_MIN, INT32_MAX, INT32_MIN, INT32_MAX);
+    uint32_t decoded = 0;
+    while (!queue.empty()) {
+      std::pop_heap(queue.begin(), queue.end(), after);
+      Cell cell = queue.back();
+      queue.pop_back();
+      if (cell.key > bound()) break;
+      if (cell.leaves == 1) {
+        LeafInfo info = leafInfo(cell.firstLeaf);
+        decodeDocids(cell.firstLeaf, info, scratch.docs);
+        decodeCoordinates(cell.firstLeaf, info, scratch.lat, scratch.lon);
+        for (uint16_t i = 0; i < info.count; i++) {
+          offer((int32_t)scratch.docs[i],
+                (int32_t)((uint32_t)info.latMin + scratch.lat[i]),
+                (int32_t)((uint32_t)info.lonMin + scratch.lon[i]));
+        }
+        decoded++;
+        continue;
+      }
+      InnerNode node = innerNode(cell.nodeId);
+      uint32_t leftLeaves = numLeftLeaves(cell.leaves);
+      if (node.splitDim == 0) {
+        push(cell.nodeId * 2, leftLeaves, cell.firstLeaf, cell.latMin,
+             node.splitValue, cell.lonMin, cell.lonMax);
+        push(cell.nodeId * 2 + 1, cell.leaves - leftLeaves,
+             cell.firstLeaf + leftLeaves, node.splitValue, cell.latMax,
+             cell.lonMin, cell.lonMax);
+      } else {
+        push(cell.nodeId * 2, leftLeaves, cell.firstLeaf, cell.latMin,
+             cell.latMax, cell.lonMin, node.splitValue);
+        push(cell.nodeId * 2 + 1, cell.leaves - leftLeaves,
+             cell.firstLeaf + leftLeaves, cell.latMin, cell.latMax,
+             node.splitValue, cell.lonMax);
+      }
+    }
+    return decoded;
+  }
+
   template <class Relation>
   EstimateResult estimateIntersect(Relation&& relation) const {
     uint64_t estimated = 0;

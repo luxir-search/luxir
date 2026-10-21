@@ -303,8 +303,15 @@ public:
 
 class GeoPointFieldType : public FieldType {
 public:
-  GeoPointFieldType(std::string_view name, int flags=COLUMN_STORED)
-    : FieldType(name, FieldType::GEO_POINT, flags) {
+  // Skip a value that is not a valid point instead of failing the document.
+  bool ignoreMalformed;
+  // Accept a third (z, altitude) coordinate and drop it; otherwise reject it.
+  bool ignoreZValue;
+
+  GeoPointFieldType(std::string_view name, int flags=COLUMN_STORED,
+                    bool ignoreMalformed = false, bool ignoreZValue = false)
+    : FieldType(name, FieldType::GEO_POINT, flags),
+      ignoreMalformed(ignoreMalformed), ignoreZValue(ignoreZValue) {
   }
 };
 

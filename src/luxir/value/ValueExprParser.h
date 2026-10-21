@@ -16,6 +16,7 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/query/FieldResolver.h"
 #include "luxir/util/Cursor.h"
+#include "luxir/util/geo.h"
 #include "luxir/util/proto.h"
 #include "luxir/value/AggregateFunctionRegistry.h"
 #include "luxir/value/ValueExpr.h"
@@ -77,7 +78,7 @@ public:
                         std::span<const uint32_t> args) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
     assert(function != nullptr);
-    std::array<uint32_t, 2> children{};
+    std::array<uint32_t, VALUE_MAX_ARITY> children{};
     assert(args.size() <= children.size());
     std::copy(args.begin(), args.end(), children.begin());
     return appendFunction(function, pos, children, (uint8_t)args.size());
@@ -126,7 +127,7 @@ private:
           }
         }
       } else if (node.kind == ValueNodeKind::FUNCTION) {
-        std::array<ValueBounds, 2> children;
+        std::array<ValueBounds, VALUE_MAX_ARITY> children;
         bool independent = true;
         for (uint8_t child = 0; child < node.childCount; child++) {
           const auto& childBounds = bounds[node.children[child]];
@@ -331,6 +332,7 @@ private:
   template <class Grammar>
   uint32_t parseCall(Grammar& grammar, std::string_view name, size_t pos) {
     if (name == "col") return parseExplicitColumn(grammar, pos);
+    if (name == "geo_distance") return parseGeoDistance(grammar, pos);
     ExpressionFunctionLookup lookup = ExpressionFunctionRegistry::find(name);
     const ValueFunction* function = lookup.value;
     if (function == nullptr) {
@@ -342,7 +344,7 @@ private:
       fail(pos, fmt::format("unknown value function '{}()'", name));
     }
 
-    std::array<uint32_t, 2> args{};
+    std::array<uint32_t, VALUE_MAX_ARITY> args{};
     uint8_t count = grammar.parseArguments(
         name, pos, function->minArity, function->maxArity,
         [&](uint8_t argument) {
@@ -369,9 +371,9 @@ private:
   }
 
   uint32_t appendFunction(const ValueFunction* function, size_t pos,
-                          std::array<uint32_t, 2> args, uint8_t count) {
+                          std::array<uint32_t, VALUE_MAX_ARITY> args, uint8_t count) {
     assert(function != nullptr);
-    std::array<ResolvedValue, 2> resolvedArgs{};
+    std::array<ResolvedValue, VALUE_MAX_ARITY> resolvedArgs{};
     for (uint8_t i = 0; i < count; i++) {
       const ValueNode& arg = program->nodes[args[i]];
       resolvedArgs[i] = {arg.type, arg.nature};
@@ -393,6 +395,72 @@ private:
     } catch (const std::exception& error) {
       fail(pos, fmt::format("{}(): {}", function->name, error.what()));
     }
+    return append(node);
+  }
+
+  double constantArg(uint32_t index, std::string_view function,
+                     std::string_view argument) {
+    const ValueNode& node = program->nodes[index];
+    bool constant = node.kind == ValueNodeKind::CONSTANT
+        || node.kind == ValueNodeKind::VARIABLE;
+    if (!constant || valueArray(node.type)) {
+      fail(node.sourcePos, fmt::format(
+          "{}() {} must be a numeric literal or scalar $variable", function, argument));
+    }
+    return node.type == ValueType::DOUBLE ? node.doubleValue : (double)node.intValue;
+  }
+
+  // geo_distance(field, lat, lon): meters from (lat, lon) to each point of a
+  // GEO_POINT field, by the haversine formula geo_distance queries use.
+  template <class Grammar>
+  uint32_t parseGeoDistance(Grammar& grammar, size_t pos) {
+    std::array<uint32_t, VALUE_MAX_ARITY> args{};
+    grammar.parseArguments("geo_distance", pos, 3, 3, [&](uint8_t argument) {
+      if (argument != 0) {
+        args[argument] = grammar.parseExpression();
+        return;
+      }
+      cur->skipWs();
+      size_t fieldPos = cur->position();
+      std::string_view name = cur->peek() == '"' || cur->peek() == '\''
+          ? value::lex::scanQuoted(
+                *cur, program->resource,
+                [&](size_t at, std::string_view message) { fail(at, message); })
+          : value::lex::scanIdentifier(*cur);
+      if (name.empty()) fail(fieldPos, "geo_distance() expects a GEO_POINT field name first");
+      args[0] = parseGeoColumn(name, fieldPos);
+    });
+    double latitude = constantArg(args[1], "geo_distance", "latitude");
+    double longitude = constantArg(args[2], "geo_distance", "longitude");
+    try {
+      geo::checkLatitude(latitude);
+      geo::checkLongitude(longitude);
+    } catch (const std::invalid_argument& error) {
+      fail(pos, fmt::format("geo_distance(): {}", error.what()));
+    }
+    return appendFunction(ValueFunctionRegistry::find("geo_distance"), pos, args, 3);
+  }
+
+  uint32_t parseGeoColumn(std::string_view name, size_t pos) {
+    ResolvedFieldHandle target;
+    try {
+      target = opts.fieldResolver ? opts.fieldResolver->resolve(name, OpClass::VALUE, opts.opName)
+          : opts.schema->resolveFor(name, OpClass::VALUE);
+    } catch (const RequestError& e) {
+      fail(pos, e.what());
+    }
+    FieldType* field = target.fieldType;
+    if (field->type() != FieldType::GEO_POINT || !field->hasColumn()) {
+      fail(pos, fmt::format("geo_distance(): field '{}' is not a GEO_POINT field with column values",
+                            name));
+    }
+    ValueNode node;
+    node.kind = ValueNodeKind::COLUMN;
+    node.columnType = FieldType::GEO_POINT;
+    node.columnMultiValued = field->multiValued();
+    node.type = field->multiValued() ? ValueType::INT64_ARRAY : ValueType::INT64;
+    node.sourcePos = pos;
+    node.text = program->copyString(target.physicalName);
     return append(node);
   }
 };

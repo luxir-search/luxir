@@ -39,7 +39,7 @@ struct ValueNode {
   ValueNature nature = ValueNature::NUMBER;
   ValueOpcode opcode = ValueOpcode::NONE;
   const ValueFunction* function = nullptr;
-  std::array<uint32_t, 2> children{};
+  std::array<uint32_t, VALUE_MAX_ARITY> children{};
   uint32_t arrayOffset = 0;
   uint32_t arraySize = 0;
   uint8_t childCount = 0;

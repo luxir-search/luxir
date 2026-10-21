@@ -7,6 +7,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <numbers>
 #include <stdexcept>
@@ -128,6 +129,50 @@ inline double haversinMeters(double sortKey) {
 inline double haversinMeters(double lat1, double lon1,
                              double lat2, double lon2) {
   return haversinMeters(haversinSortKey(lat1, lon1, lat2, lon2));
+}
+
+// Lower bound on haversinSortKey(lat, lon, p) over every point p of the
+// inclusive box [minLat, maxLat] x [minLon, maxLon], in degrees with
+// minLon <= maxLon. The nearest point of a box is on the meridian through
+// lon when lon is inside the box's longitude range, at the latitude closest
+// to lat. Otherwise it is on one of the two edge meridians: along a
+// meridian at longitude difference d the key is smallest at the latitude
+// atan2(sin(lat), cos(lat) * cos(d)) when that is inside the box, else at
+// an end. Clamping the center into the box is not a bound: it picks the
+// wrong edge across the date line, and past 90 degrees of longitude the
+// nearest point bends toward a pole. The result is lowered by a slack that
+// covers the rounding of both this and haversinSortKey (and its masked low
+// bits), so it never exceeds the key of a point in the box.
+inline double boxSortKeyLowerBound(double lat, double lon, double minLat,
+                                   double maxLat, double minLon,
+                                   double maxLon) {
+  constexpr double RADIANS = std::numbers::pi / 180.0;
+  double key;
+  if (minLon <= lon && lon <= maxLon) {
+    double nearest = std::clamp(lat, minLat, maxLat);
+    key = 1.0 - std::cos((lat - nearest) * RADIANS);
+  } else {
+    double latRadians = lat * RADIANS;
+    double cosLat = std::cos(latRadians);
+    double sinLat = std::sin(latRadians);
+    double minLatRadians = minLat * RADIANS;
+    double maxLatRadians = maxLat * RADIANS;
+    key = std::numeric_limits<double>::infinity();
+    for (double edge : {minLon, maxLon}) {
+      double deltaLon = (lon - edge) * RADIANS;
+      double lonTerm = 1.0 - std::cos(deltaLon);
+      auto at = [&](double pointLatRadians) {
+        return (1.0 - std::cos(latRadians - pointLatRadians))
+            + cosLat * std::cos(pointLatRadians) * lonTerm;
+      };
+      key = std::min({key, at(minLatRadians), at(maxLatRadians)});
+      double best = std::atan2(sinLat, cosLat * std::cos(deltaLon));
+      if (minLatRadians < best && best < maxLatRadians) {
+        key = std::min(key, at(best));
+      }
+    }
+  }
+  return std::max(0.0, key * (1.0 - 1e-12) - 1e-15);
 }
 
 inline double distanceQuerySortKey(double radiusMeters) {

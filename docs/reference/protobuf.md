@@ -127,6 +127,7 @@ defaults and constraints are described in the comments and guides.
 - [`FuzzyQuery`](#message-luxir.fuzzyquery)
 - [`GeoBoxQuery`](#message-luxir.geoboxquery)
 - [`GeoDistanceQuery`](#message-luxir.geodistancequery)
+- [`GeoNearestQuery`](#message-luxir.geonearestquery)
 - [`GroupComponent`](#message-luxir.groupcomponent)
 - [`GroupKey`](#message-luxir.groupkey)
 - [`GroupTable`](#message-luxir.grouptable)
@@ -1038,6 +1039,8 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
 | <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
+| <a id="field-luxir.fielddef.ignore_malformed"></a>[`ignore_malformed`](#field-luxir.fielddef.ignore_malformed) | 28 | `bool` | optional | GEO\_POINT only. Skip a value that is not a valid point (unreadable, out of range, or a z coordinate without ignore\_z\_value) and index the rest of the document; in a multi-valued field only the bad points are skipped. Unset inherits, else false: a malformed point fails the document. |
+| <a id="field-luxir.fielddef.ignore_z_value"></a>[`ignore_z_value`](#field-luxir.fielddef.ignore_z_value) | 29 | `bool` | optional | GEO\_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset inherits, else false: a point with a z coordinate is malformed. |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1224,6 +1227,22 @@ Geographic distance query with a center in degrees and radius in meters. Matches
 | <a id="field-luxir.geodistancequery.lat"></a>[`lat`](#field-luxir.geodistancequery.lat) | 2 | `double` | singular | center latitude, degrees in \[-90, 90\] |
 | <a id="field-luxir.geodistancequery.lon"></a>[`lon`](#field-luxir.geodistancequery.lon) | 3 | `double` | singular | center longitude, degrees in \[-180, 180\] |
 | <a id="field-luxir.geodistancequery.radius_meters"></a>[`radius_meters`](#field-luxir.geodistancequery.radius_meters) | 4 | `double` | singular | inclusive radius, finite and non-negative |
+
+<a id="message-luxir.geonearestquery"></a>
+
+### luxir.GeoNearestQuery
+
+The k documents nearest a point of a GEO\_POINT field, by the great-circle distance geo\_distance uses. A multi-valued field counts each document once, at its nearest point; ties keep index order. Deleted documents and documents outside the enclosing domain (filters, facet buckets) are not candidates, so k counts eligible documents. Hits score 1 / (1 + meters), times any enclosing boost; sort by geo\_distance(field, lat, lon) to return the exact distance.<br><br>Named center scalars deliberately avoid positional ambiguity: the VALUE array contract \[x, y\] = \[lon, lat\] does not apply to this message.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.geonearestquery.field"></a>[`field`](#field-luxir.geonearestquery.field) | 1 | `string` | singular |  |
+| <a id="field-luxir.geonearestquery.lat"></a>[`lat`](#field-luxir.geonearestquery.lat) | 2 | `double` | singular | center latitude, degrees in \[-90, 90\] |
+| <a id="field-luxir.geonearestquery.lon"></a>[`lon`](#field-luxir.geonearestquery.lon) | 3 | `double` | singular | center longitude, degrees in \[-180, 180\] |
+| <a id="field-luxir.geonearestquery.k"></a>[`k`](#field-luxir.geonearestquery.k) | 4 | `int32` | singular | documents to return; must be positive |
+| <a id="field-luxir.geonearestquery.max_distance_meters"></a>[`max_distance_meters`](#field-luxir.geonearestquery.max_distance_meters) | 5 | `double` | optional | Inclusive distance limit, so fewer than k may match. Unset = no limit; must be non-negative. |
 
 <a id="message-luxir.groupcomponent"></a>
 
@@ -1749,6 +1768,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
 | <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 20 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one text over several weighted fields |
 | <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
+| <a id="field-luxir.query.geo_nearest"></a>[`geo_nearest`](#field-luxir.query.geo_nearest) | 21 | [`GeoNearestQuery`](#message-luxir.geonearestquery) | oneof [`kind`](#oneof-luxir.query.kind) | the k documents nearest a point of a GEO\_POINT field |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -2352,7 +2372,7 @@ TCP counters for this network namespace (/proc/net/snmp).
 | <a id="field-luxir.topdocs.limit"></a>[`limit`](#field-luxir.topdocs.limit) | 4 | `sint64` | optional | Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining. |
 | <a id="field-luxir.topdocs.count_limit"></a>[`count_limit`](#field-luxir.topdocs.count_limit) | 5 | `sint64` | optional | Match count: unset or 0 omits found; -1 counts exactly; positive N permits stopping at N with found\_gte. An exact count is also valid for N. Must be &gt;= -1. Ops, collapse, diversify, field sorts, nested lists and limit 0 retain exact counting. |
 | <a id="field-luxir.topdocs.get_scores"></a>[`get_scores`](#field-luxir.topdocs.get_scores) | 6 | `bool` | singular | return the relevancy score for each document returned |
-| <a id="field-luxir.topdocs.fields"></a>[`fields`](#field-luxir.topdocs.fields) | 7 | `string` | repeated | Fields to return for each document. Empty returns every retrievable field (stored or column-backed; not vectors or engine fields such as \_version\_), discovered from the index; placement follows document\_format. A name containing '\*' is a pattern expanded the same way: the matching retrievable fields; matching nothing is not an error. Explicitly named fields win on collision and may name anything, vectors and engine fields included. |
+| <a id="field-luxir.topdocs.fields"></a>[`fields`](#field-luxir.topdocs.fields) | 7 | `string` | repeated | Fields to return for each document. Empty returns every retrievable field (stored or column-backed; not vectors or engine fields such as \_version\_), discovered from the index; placement follows document\_format. A name containing '\*' is a pattern expanded the same way: the matching retrievable fields; matching nothing is not an error. Explicitly named fields win on collision and may name anything, vectors and engine fields included. "\_sort\_" returns each document's sort values, one per sort clause (the score for a list ranked by score), as an ArrVal. |
 | <a id="field-luxir.topdocs.sort"></a>[`sort`](#field-luxir.topdocs.sort) | 8 | [`SortSpec`](#message-luxir.sortspec) | repeated |  |
 | <a id="field-luxir.topdocs.batch_size"></a>[`batch_size`](#field-luxir.topdocs.batch_size) | 9 | `int32` | singular | Maximum documents per streaming batch. Nonpositive = default (100); the server caps positive values at 256. More documents produce more batches. Ignored beneath a facet bucket, where all rows return together. |
 | <a id="field-luxir.topdocs.document_format"></a>[`document_format`](#field-luxir.topdocs.document_format) | 10 | [`DocFormat`](#enum-luxir.docformat) | singular | placement of returned fields: rows, columns, or adaptive (see DocFormat) |
