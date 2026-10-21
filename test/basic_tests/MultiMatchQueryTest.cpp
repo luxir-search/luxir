@@ -305,6 +305,105 @@ TEST_F(MultiMatchQueryTest, perFieldCoercesNumericMatch) {
   EXPECT_FLOAT_EQ(2.0f * ordinary->at("number"), weighted->at("number"));
 }
 
+TEST_F(MultiMatchQueryTest, uncoercibleFieldsContributeNothing) {
+  ASSERT_TRUE(helper.index(flatdoc("id", "number", "title_un", "7", "count_i", 7),
+                           UpdateMessage::COMMIT).success);
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    for (bool phrase : {false, true}) {
+      if (phrase && mode == Mode::COMBINED) continue;
+      std::optional<api::PhraseOptions> options;
+      if (phrase) options.emplace();
+      auto title = run(multiMatch("dune", {{"title_un", {}}}, mode, {}, options));
+      auto mixed = run(multiMatch("dune", {{"title_un", {}}, {"count_i", 3.0f}}, mode, {}, options));
+      ASSERT_TRUE(title && mixed);
+      EXPECT_EQ(*title, *mixed);
+      auto numeric = multiMatch("7", {{"title_un", {}}, {"count_i", 3.0f}}, mode, {}, options);
+      auto hits = run(numeric);
+      auto filtered = run(numeric, true);
+      ASSERT_TRUE(hits && filtered);
+      ASSERT_EQ(1u, hits->size());
+      EXPECT_TRUE(filtered->contains("number"));
+      EXPECT_FLOAT_EQ(score(qb::match(mr(), "title_un", "7"), "number")
+          + 3.0f * score(qb::match(mr(), "count_i", "7"), "number"), hits->at("number"));
+      for (auto text : {"dune", "1.5", "1e100"}) {
+        auto none = multiMatch(text, {{"count_i", {}}}, mode, {}, options);
+        EXPECT_EQ(QueryKind::NONE, parse(none)->getKind());
+        auto empty = run(none);
+        ASSERT_TRUE(empty);
+        EXPECT_TRUE(empty->empty());
+      }
+    }
+  }
+}
+
+TEST_F(MultiMatchQueryTest, nonTextGroupsMultiplyWeights) {
+  ASSERT_TRUE(helper.index(flatdoc("id", "number", "title_un", "7", "count_i", 7,
+                                  "price_f", 7.0, "value_d", 7.0, "when_dt", "7", "name_s", "7"),
+                           UpdateMessage::COMMIT).success);
+  for (auto field : {"count_i", "price_f", "value_d", "when_dt", "name_s", "id"}) {
+    SCOPED_TRACE(field);
+    std::string_view text = field == std::string_view("id") ? "number" : "7";
+    for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+      auto query = multiMatch(text, {{field, 2.0f}}, mode);
+      auto hits = run(query);
+      ASSERT_TRUE(hits);
+      ASSERT_EQ(1u, hits->size());
+      EXPECT_FLOAT_EQ(2.0f * score(qb::match(mr(), field, text), "number"), hits->at("number"));
+      if (field == std::string_view("name_s") || field == std::string_view("id")) {
+        auto* term = dynamic_cast<TermQuery*>(parse(query));
+        ASSERT_NE(nullptr, term);
+        EXPECT_FLOAT_EQ(2.0f, term->getBoost());
+      }
+    }
+  }
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    auto title = run(multiMatch("dune", {{"title_un", {}}}, mode));
+    auto mixed = run(multiMatch("dune", {{"title_un", {}}, {"price_f", {}},
+                                        {"value_d", {}}, {"when_dt", {}}}, mode));
+    ASSERT_TRUE(title && mixed);
+    EXPECT_EQ(*title, *mixed);
+    auto empty = run(multiMatch("dune", {{"price_f", {}}, {"value_d", {}}, {"when_dt", {}}}, mode));
+    ASSERT_TRUE(empty);
+    EXPECT_TRUE(empty->empty());
+  }
+}
+
+TEST_F(MultiMatchQueryTest, coercionDoesNotHideOtherErrors) {
+  std::string error;
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    EXPECT_FALSE(run(multiMatch("dune", {{"count_i", {}}, {"unknown_field", {}}}, mode), false, &error));
+    EXPECT_NE(std::string::npos, error.find("unknown_field")) << error;
+  }
+  EXPECT_FALSE(run(qb::match(mr(), "count_i", "dune"), false, &error));
+  EXPECT_NE(std::string::npos, error.find("cannot parse 'dune' as an integer")) << error;
+  EXPECT_FALSE(run(qb::match(mr(), "when_dt", "dune"), false, &error));
+  EXPECT_NE(std::string::npos, error.find("cannot parse 'dune' as a date")) << error;
+
+  auto schema = Schema::createDefaultSchema();
+  schema->fieldTypeMap["no_column"] = std::make_shared<IntFieldType>("no_column", 0);
+  ParseContext context{parsePool, *schema, protoArena, CoerceContext{}, ""};
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    EXPECT_THROW(ProtobufQueryParser(context).parse(
+        multiMatch("dune", {{"no_column", {}}}, mode)), std::runtime_error);
+  }
+}
+
+TEST_F(MultiMatchQueryTest, dateGroupsKeepRangeSemantics) {
+  auto schema = Schema::createDefaultSchema();
+  int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
+  QueryBuilder builder(parsePool, *schema, CoerceContext{now});
+  QueryBuilder::WeightedField fields[] = {{"when_dt", 2.0f}};
+  for (auto text : {"2024-06", "NOW", "NOW/DAY"}) {
+    auto* expected = builder.boosted(builder.createMatchQuery("when_dt", text), 2.0f);
+    for (auto* actual : {builder.createMultiMatchCombined(fields, text, QueryBuilder::Operator::OR, 0),
+                        builder.createMultiMatchPerField(fields, text, QueryBuilder::Operator::OR, 0),
+                        builder.createMultiMatchPerField(fields, text, QueryBuilder::Operator::OR, 0, 1.0f, 0)}) {
+      EXPECT_TRUE(expected->equals(*actual));
+      EXPECT_EQ(filterKey(*expected), filterKey(*actual));
+    }
+  }
+}
+
 TEST_F(MultiMatchQueryTest, singletonCombinedKeepsBm25fWeights) {
   for (float weight : {0.5f, 1.0f, 2.0f}) {
     auto query = qb::multiMatch(mr(), "dune", {{"title_un", weight}});

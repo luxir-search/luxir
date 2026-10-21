@@ -856,6 +856,27 @@ private:
     float weight;
   };
 
+  // Multi-field searches omit only values that cannot coerce to this field.
+  // Keep all query construction on the strict match/range path.
+  Query* tryCreateMatchQuery(const ResolvedFieldHandle& target, std::string_view text,
+                             Operator op, int minMatch, float weight) {
+    FieldType& type = *target.fieldType;
+    if (isNumericColumnType(type.type())) {
+      if (!type.hasColumn()) {
+        throw std::runtime_error(std::format(
+            "Range query field '{}' is not column-stored", target.physicalName));
+      }
+      api::Val value;
+      value.kind = text;
+      if (type.type() == FieldType::DATE) {
+        if (!((DateFieldType&)type).tryCoerceDateRange(value, coerceContext)) return nullptr;
+      } else {
+        if (!type.tryCoerceColInt64(value, target.physicalName, coerceContext)) return nullptr;
+      }
+    }
+    return createMatchQuery(target, text, op, minMatch, weight);
+  }
+
   // Normalize before analysis or clause construction. Search aliases can name
   // the same physical field; the largest weight wins in either mode.
   std::span<ResolvedWeightedField> resolveWeightedFields(std::span<const WeightedField> requested) {
@@ -944,7 +965,9 @@ public:
     size_t count = 0;
     for (const auto& group : groups) {
       if (group.target->fieldType->type() != FieldType::TEXT) {
-        optional[count++] = createMatchQuery(*group.target, text, op, minMatch, group.weights[0]);
+        if (auto* query = tryCreateMatchQuery(*group.target, text, op, minMatch, group.weights[0])) {
+          optional[count++] = query;
+        }
         continue;
       }
       auto terms = analyzeText(*group.target, text);
@@ -970,18 +993,19 @@ public:
                                   float tie = 1.0f, std::optional<int32_t> phraseSlop = {}) {
     auto resolved = resolveWeightedFields(requested);
     auto clauses = pool.make_span<Query*>(resolved.size());
+    size_t count = 0;
     for (size_t i = 0; i < resolved.size(); i++) {
       const auto& target = *resolved[i].target;
       if (phraseSlop && target.fieldType->type() == FieldType::Type::TEXT) {
         auto* phrase = createPhraseQuery(target, std::span<const std::string_view>(&text, 1), {},
                                         *phraseSlop);
-        clauses[i] = boosted(phrase, resolved[i].weight);
-      } else {
-        clauses[i] = createMatchQuery(target, text, op, minMatch, resolved[i].weight);
+        clauses[count++] = boosted(phrase, resolved[i].weight);
+      } else if (auto* query = tryCreateMatchQuery(target, text, op, minMatch, resolved[i].weight)) {
+        clauses[count++] = query;
       }
     }
-    if (clauses.empty()) return matchNoDocs();
-    return DisMaxQuery::make(pool, clauses, tie);
+    if (count == 0) return matchNoDocs();
+    return DisMaxQuery::make(pool, clauses.first(count), tie);
   }
 
   Query* boosted(Query* query, float boost) {

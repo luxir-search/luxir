@@ -170,6 +170,12 @@ public:
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
 
+  // Same conversion, returning nullopt only for an uncoercible value.
+  // Unsupported column types still throw.
+  virtual std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
   // Term/text bytes for term-backed fields (TEXT/STRING/ID).  Numeric and
   // bool arms render canonically into buf (>= coerce::TEXT_BUF_SIZE bytes)
   // and return a view of it; string/bytes arms pass through as views of the
@@ -227,6 +233,10 @@ public:
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 // FLOAT and DOUBLE fields store Lucene-style sortable bits in the standard
@@ -241,6 +251,10 @@ public:
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 class DoubleFieldType : public FieldType {
@@ -249,6 +263,10 @@ public:
   }
 
   int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 };
@@ -267,6 +285,10 @@ public:
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+
   // The [lo, hiExclusive) epoch-millis window a query-side date literal
   // denotes at its own granularity: "2024-06-25" is the whole day, "2024-06"
   // the month, epoch millis a single instant.  Queries match/round by the
@@ -274,6 +296,9 @@ public:
   DateRange coerceDateRange(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
+
+  std::optional<DateRange> tryCoerceDateRange(
+      const api::Val& val, const CoerceContext& context = {}) const;
 };
 
 class GeoPointFieldType : public FieldType {

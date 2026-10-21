@@ -1535,7 +1535,7 @@ Node memory: Luxir's own budgets and usage, and the process allocator's statisti
 
 ### luxir.MultiMatchQuery
 
-Analyzes one text across several fields. In COMBINED mode, fields sharing an analyzer and long-term policy form a group scored as one field with BM25F; group scores add by default. PER\_FIELD adds weighted match scores. BM25F follows Lucene's CombinedFieldQuery.
+Analyzes one text across several fields. In COMBINED mode, fields sharing an analyzer and long-term policy form a group scored as one field with BM25F; group scores add by default. PER\_FIELD adds weighted match scores. Values that cannot coerce to a field contribute no clause in either mode, including with phrase options. If no field contributes, matches nothing. BM25F follows Lucene's CombinedFieldQuery.
 
 [Source](../../protos/luxir_types.proto)
 

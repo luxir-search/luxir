@@ -504,6 +504,9 @@ the field types that [`match`](#match) accepts.
 `operator: "and"` requires every term in that field; `min_match` applies
 within each field. Use `per_field` to multiply individual field scores, or
 wrap the query in [`boost`](#constant-score-and-boost) to multiply its final score.
+In both modes, including with `phrase`, a field whose value coercion fails
+contributes no clause. Other errors still fail the request; single-field
+`match` remains strict. If no field contributes, the query matches nothing.
 Both modes keep the same match set when used as an unscored filter.
 
 The expression form uses `text` as its main value argument and accepts field
