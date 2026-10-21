@@ -10,6 +10,8 @@
 
 namespace luxir::automaton {
 
+class Budget;
+
 // Simple (one-to-one) Unicode case equivalence from the vendored uni-algo
 // tables: two scalars are case alternates when their simple case folds agree,
 // which covers lower, upper and title forms (k, K and KELVIN SIGN; sigma and
@@ -20,8 +22,8 @@ namespace luxir::automaton {
 // other case form.
 std::span<const int32_t> caseAlternates(int32_t cp);
 
-// Appends a single-codepoint range for every case alternate of every scalar in
-// [lo, hi]. Cost is proportional to the cased scalars in the range.
-void appendCaseAlternates(int32_t lo, int32_t hi, std::vector<std::pair<int32_t, int32_t>>& ranges);
+// Input ranges must be sorted and disjoint. Appends unsorted single-codepoint
+// ranges for case alternates. Cased-scalar visits and member scans consume budget.
+void appendCaseAlternates(std::vector<std::pair<int32_t, int32_t>>& ranges, Budget& budget);
 
 } // namespace luxir::automaton

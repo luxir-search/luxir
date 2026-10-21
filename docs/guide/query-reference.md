@@ -85,7 +85,7 @@ The HTTP dialect also accepts the field-name form:
 | `val` | Value to analyze or coerce. Required. |
 | `operator` | `or` (default) or `and` for several analyzed terms. |
 | `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
-| `case_insensitive` | Ignore simple Unicode case on STRING/ID. TEXT rejects `true`; numeric/date ignore it. Default `false`. |
+| `case_insensitive` | Ignore simple Unicode case on indexed STRING/ID. TEXT rejects `true`; numeric/date ignore it. Default `false`. |
 
 Text values are analyzed with the resolved field analyzer. String values use
 their normalizer, if configured, and match as exact terms. Numeric and date
@@ -325,7 +325,8 @@ characters; ID fields use literals verbatim. With `case_insensitive`, literals
 also match their other simple Unicode case forms, and character classes and
 ranges add the case forms of their members before negation: `[a-c]` matches
 `B`, and `[^a]` rejects both `a` and `A`. Regex queries are constant-scoring.
-The expression form is `regex(dune|kings, field=title_t)`.
+The expression form is `regex(dune|kings, field=title_t)`. Case expansion counts
+toward the pattern complexity budget.
 
 ## Fuzzy
 

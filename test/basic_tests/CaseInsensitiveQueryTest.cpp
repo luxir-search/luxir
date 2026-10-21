@@ -8,6 +8,8 @@
 #include "test/TestUtils.h"
 #include "luxir/server/JsonRequest.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/query/QueryBuilder.h"
+#include "luxir/search/FilterCache.h"
 
 using namespace luxir;
 using namespace luxir::test;
@@ -148,13 +150,17 @@ TEST_F(CaseInsensitiveQueryTest, flagSeparatesQueryIdentity) {
 
 class CaseInsensitiveMappingTest : public CaseInsensitiveQueryTest {
 protected:
+  std::shared_ptr<FilterCache> cache;
+
   void SetUp() override {
     std::pmr::monotonic_buffer_resource arena;
     api::SchemaDef def;
-    ASSERT_TRUE(api::read_json(def, R"({"fields":{"id":"id","body":{"type":"text",
+    ASSERT_TRUE(api::read_json(def, R"({"fields":{"id":"id","name_s":"string","body":{"type":"text",
       "analyzer":{"tokenizer":"whitespace","char_filters":[{"name":"mapping",
         "params":{"mappings":["a => b","b => c","ph => f"]}}]}}}})", arena));
     helper.collection().setSchema(Schema::fromProto(def));
+    cache = std::make_shared<FilterCache>(FilterCacheConfig{.minSegmentDocs = 0, .admissionThreshold = 1});
+    helper.getIndexWriter()->snapshots.readers.filterCache = cache;
     ASSERT_TRUE(helper.indexAll(std::array{
       flatdoc("id", "a", "body", "apple"), flatdoc("id", "b", "body", "apricot"),
       flatdoc("id", "c", "body", "berry"), flatdoc("id", "d", "body", "BERRY"),
@@ -171,4 +177,44 @@ TEST_F(CaseInsensitiveMappingTest, prefixNormalizesOnce) {
       hits(R"({"wildcard":{"field":"body","pattern":"a*","case_insensitive":true}})"));
   EXPECT_EQ((Ids{"e"}),
       hits(R"({"prefix":{"field":"body","prefix":"ph","case_insensitive":true}})"));
+}
+
+TEST_F(CaseInsensitiveMappingTest, literalAndPatternIdentity) {
+  MemPool pool;
+  auto schema = helper.collection().getSchema();
+  QueryBuilder builder(pool, *schema, CoerceContext{});
+  auto key = [](const Query& query) {
+    FilterKeyContext context;
+    FilterKeyBuilder out;
+    auto scope = query.appendFilterKey(out, context);
+    return std::move(out).finishStructural(scope, context);
+  };
+  auto distinct = [&](Query* literal, Query* pattern) {
+    EXPECT_FALSE(literal->equals(*pattern));
+    EXPECT_NE(literal->hash(), pattern->hash());
+    EXPECT_NE(key(*literal), key(*pattern));
+  };
+  distinct(builder.createPrefixQuery("body", "a", true), builder.createWildcardQuery("body", "b*", true));
+  distinct(builder.createMatchQuery("name_s", "b", QueryBuilder::Operator::OR, 0, 1.0f, true),
+           builder.createWildcardQuery("name_s", "b", true));
+}
+
+TEST_F(CaseInsensitiveMappingTest, literalAndPatternDedup) {
+  EXPECT_EQ((Ids{"c"}), hits(R"({"wildcard":{"field":"body","pattern":"b*","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"a", "b", "c", "d"}), hits(R"({"boolean":{"optional":[
+      {"prefix":{"field":"body","prefix":"a","case_insensitive":true}},
+      {"wildcard":{"field":"body","pattern":"b*","case_insensitive":true}}]}})"));
+}
+
+TEST_F(CaseInsensitiveMappingTest, literalAndPatternFilterCache) {
+  for (int pass = 0; pass < 2; pass++) {
+    auto prefix = run(R"json({"query":{"all":true},"filter":["prefix(a, field=body, case_insensitive=true)"],
+        "fields":["id"],"limit":-1})json");
+    EXPECT_EQ((Ids{"a", "b", "d"}), ids(*prefix));
+    auto wildcard = run(R"json({"query":{"all":true},"filter":["wildcard(b*, field=body, case_insensitive=true)"],
+        "fields":["id"],"limit":-1})json");
+    EXPECT_EQ((Ids{"c"}), ids(*wildcard));
+  }
+  auto counters = cache->counters();
+  EXPECT_GT(counters.hits + counters.readerStableHits, 0u);
 }

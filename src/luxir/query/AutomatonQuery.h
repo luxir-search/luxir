@@ -26,12 +26,12 @@ public:
 
 class AutomatonQuery final : public MultiTermQuery {
 public:
-  enum class Kind { WILDCARD, REGEX };
+  enum class Kind { WILDCARD, REGEX, MATCH, PREFIX };
 
 private:
+  // Kind distinguishes normalized literals from patterns that fold during
+  // compilation. Both kind and case alternation affect the accepted language.
   Kind automatonKind;
-  // Part of the identity: the same pattern with and without the flag compiles
-  // to different automata.
   bool caseInsensitive;
   std::string_view pattern;
   automaton::ByteDfaView dfa;

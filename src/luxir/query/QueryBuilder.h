@@ -579,7 +579,9 @@ public:
           throw std::runtime_error(std::format(
               "Prefix query requires an indexed field: {}", field));
         }
-        if (caseInsensitive) return makeCaseInsensitiveTerm(target, field, prefix, 1.0f, true);
+        if (caseInsensitive) {
+          return makeCaseInsensitiveTerm(AutomatonQuery::Kind::PREFIX, target, field, prefix);
+        }
         return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix));
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
@@ -700,16 +702,17 @@ private:
 
   // An already-normalized literal, escaped and compiled without a field folder
   // so non-idempotent normalizers run only once. Prefix adds the wildcard last.
-  Query* makeCaseInsensitiveTerm(const ResolvedFieldHandle& target, std::string_view field,
-                                 std::string_view term, float boost = 1.0f, bool prefix = false) {
+  Query* makeCaseInsensitiveTerm(AutomatonQuery::Kind kind, const ResolvedFieldHandle& target,
+                                 std::string_view field, std::string_view term, float boost = 1.0f) {
     std::string escaped;
     escaped.reserve(term.size());
     for (char c : term) {
       if (c == '*' || c == '?' || c == '\\') escaped.push_back('\\');
       escaped.push_back(c);
     }
+    bool prefix = kind == AutomatonQuery::Kind::PREFIX;
     if (prefix) escaped.push_back('*');
-    Query* query = makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, prefix ? "Prefix" : "Match",
+    Query* query = makeAutomatonQuery(kind, prefix ? "Prefix" : "Match",
                                       target, field, escaped, nullptr, true, automaton::compileWildcard);
     return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
   }
@@ -830,7 +833,8 @@ public:
       case FieldType::Type::ID:
         if (caseInsensitive) {
           checkAutomatonField("Match", target);
-          return makeCaseInsensitiveTerm(target, field, normalizeLiteral(target, value, false), boost);
+          return makeCaseInsensitiveTerm(AutomatonQuery::Kind::MATCH, target, field,
+                                         normalizeLiteral(target, value, false), boost);
         }
         return pool.make<TermQuery>(field, normalizeLiteral(target, value, true), boost);
       case FieldType::Type::INT:

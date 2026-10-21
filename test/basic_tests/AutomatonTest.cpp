@@ -375,9 +375,38 @@ TEST(CaseAlternatesTest, simpleFoldClasses) {
   EXPECT_EQ((std::vector<int32_t>{0x3a3, 0x3c2, 0x3c3}), alternates(0x3c2));
   EXPECT_EQ((std::vector<int32_t>{0x1c4, 0x1c5, 0x1c6}), alternates(0x1c5));
   EXPECT_TRUE(alternates('1').empty());
-  std::vector<std::pair<int32_t, int32_t>> ranges;
-  appendCaseAlternates('a', 'c', ranges);
-  EXPECT_EQ((std::vector<std::pair<int32_t, int32_t>>{{'A', 'A'}, {'B', 'B'}, {'C', 'C'}}), ranges);
+  std::vector<std::pair<int32_t, int32_t>> ranges{{'a', 'c'}};
+  Budget budget;
+  appendCaseAlternates(ranges, budget);
+  EXPECT_EQ((std::vector<std::pair<int32_t, int32_t>>{{'a', 'c'}, {'A', 'A'}, {'B', 'B'}, {'C', 'C'}}), ranges);
+}
+
+TEST(CaseAlternatesTest, expansionConsumesBudget) {
+  std::vector<std::pair<int32_t, int32_t>> ranges{{0, 0x10ffff}};
+  Budget budget(1);
+  EXPECT_THROW(appendCaseAlternates(ranges, budget), std::runtime_error);
+}
+
+TEST(RegExpTest, overlappingCaseRangesShareBudget) {
+  std::string pattern = "[";
+  for (int i = 0; i < 200; i++) pattern += "a-z";
+  pattern += "]";
+  Budget budget(5000);
+  auto compiled = compileRegex(pattern, budget, nullptr, true);
+  EXPECT_TRUE(compiled.matches("B"));
+  EXPECT_TRUE(compiled.matches(utf8(0x212a)));
+  EXPECT_FALSE(compiled.matches("0"));
+}
+
+TEST(RegExpTest, negatedFullRangeMatchesNothing) {
+  auto pattern = "[^" + utf8(0) + "-" + utf8(0x10ffff) + "]";
+  for (bool caseInsensitive : {false, true}) {
+    Budget budget;
+    auto compiled = compileRegex(pattern, budget, nullptr, caseInsensitive);
+    EXPECT_FALSE(compiled.matches(""));
+    EXPECT_FALSE(compiled.matches("a"));
+    EXPECT_FALSE(compiled.matches(utf8(0x10ffff)));
+  }
 }
 
 TEST(CaseAlternatesTest, compilersExpandLiteralsAndClasses) {

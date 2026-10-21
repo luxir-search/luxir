@@ -8,6 +8,8 @@
 
 #include <uni_algo/case.h>
 
+#include "luxir/util/automaton/Automaton.h"
+#include "luxir/util/screaming.h"
 
 namespace luxir::automaton {
 namespace {
@@ -63,12 +65,21 @@ std::span<const int32_t> caseAlternates(int32_t cp) {
   return {classes.members.data() + it->begin, (size_t)(it->end - it->begin)};
 }
 
-void appendCaseAlternates(int32_t lo, int32_t hi, std::vector<std::pair<int32_t, int32_t>>& ranges) {
+void appendCaseAlternates(std::vector<std::pair<int32_t, int32_t>>& ranges, Budget& budget) {
   const CaseClasses& classes = CaseClasses::get();
-  for (auto it = lowerBound(classes, lo); it != classes.entries.end() && it->codepoint <= hi; ++it) {
-    for (uint32_t i = it->begin; i < it->end; i++) {
-      int32_t alternate = classes.members[i];
-      if (alternate < lo || alternate > hi) ranges.emplace_back(alternate, alternate);
+  size_t explicitRanges = ranges.size();
+  int64_t cursor = 0;
+  for (size_t r = 0; r < explicitRanges; r++) {
+    auto [lo, hi] = ranges[r];
+    cursor = screaming::gallopLowerBound(cursor, (int64_t)classes.entries.size(), lo,
+        [&](int64_t i) { return classes.entries[(size_t)i].codepoint; });
+    while (cursor < (int64_t)classes.entries.size() && classes.entries[(size_t)cursor].codepoint <= hi) {
+      const auto& entry = classes.entries[(size_t)cursor++];
+      budget.consume(1 + (int64_t)(entry.end - entry.begin));
+      for (uint32_t i = entry.begin; i < entry.end; i++) {
+        int32_t alternate = classes.members[i];
+        if (alternate < lo || alternate > hi) ranges.emplace_back(alternate, alternate);
+      }
     }
   }
 }

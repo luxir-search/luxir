@@ -18,6 +18,19 @@ namespace {
   throw std::runtime_error(std::format("{} at byte {}: {}", message, position, pattern));
 }
 
+void mergeRanges(std::vector<std::pair<int32_t, int32_t>>& ranges) {
+  std::sort(ranges.begin(), ranges.end());
+  size_t size = 0;
+  for (auto [lo, hi] : ranges) {
+    if (size && lo <= ranges[size - 1].second + 1) {
+      ranges[size - 1].second = std::max(ranges[size - 1].second, hi);
+    } else {
+      ranges[size++] = {lo, hi};
+    }
+  }
+  ranges.resize(size);
+}
+
 class Parser {
   std::string_view pattern;
   Budget& budget;
@@ -54,6 +67,7 @@ class Parser {
   }
 
   Automaton fold(std::vector<Automaton>& parts, size_t begin, size_t end, bool unionParts) {
+    if (begin == end) return unionParts ? Automaton::empty(budget) : Automaton::epsilon(budget);
     if (end - begin == 1) return std::move(parts[begin]);
     size_t middle = begin + (end - begin) / 2;
     Automaton left = fold(parts, begin, middle, unionParts);
@@ -134,31 +148,24 @@ class Parser {
       first = false;
     }
     if (ranges.empty()) error("empty character class", open, pattern);
+    mergeRanges(ranges);
     if (caseInsensitive) {
-      size_t explicitRanges = ranges.size();
-      for (size_t i = 0; i < explicitRanges; i++) {
-        appendCaseAlternates(ranges[i].first, ranges[i].second, ranges);
-      }
-    }
-    std::sort(ranges.begin(), ranges.end());
-    std::vector<std::pair<int32_t, int32_t>> merged;
-    for (auto [lo, hi] : ranges) {
-      if (!merged.empty() && lo <= merged.back().second + 1) merged.back().second = std::max(merged.back().second, hi);
-      else merged.emplace_back(lo, hi);
+      appendCaseAlternates(ranges, budget);
+      mergeRanges(ranges);
     }
     if (negated) {
       std::vector<std::pair<int32_t, int32_t>> complement;
       int32_t current = 0;
-      for (auto [lo, hi] : merged) {
+      for (auto [lo, hi] : ranges) {
         if (current < lo) complement.emplace_back(current, lo - 1);
         if (hi == 0x10ffff) { current = 0x110000; break; }
         current = hi + 1;
       }
       if (current <= 0x10ffff) complement.emplace_back(current, 0x10ffff);
-      merged.swap(complement);
+      ranges.swap(complement);
     }
     std::vector<Automaton> parts;
-    for (auto [lo, hi] : merged) {
+    for (auto [lo, hi] : ranges) {
       if (lo <= 0xd7ff) parts.push_back(Automaton::charRange(lo, std::min(hi, 0xd7ff), budget));
       if (hi >= 0xe000) parts.push_back(Automaton::charRange(std::max(lo, 0xe000), hi, budget));
     }
@@ -192,7 +199,7 @@ class Parser {
       if (cp == '*' || cp == '+' || cp == '?' || cp == '{') error("repetition has no preceding atom", position, pattern);
       parts.push_back(repetition(atom()));
     }
-    return parts.empty() ? Automaton::epsilon(budget) : fold(parts, 0, parts.size(), false);
+    return fold(parts, 0, parts.size(), false);
   }
 
   Automaton unionExpr() {
