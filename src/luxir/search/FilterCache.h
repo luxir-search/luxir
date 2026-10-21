@@ -625,22 +625,10 @@ private:
     void reset();
   };
 
-  // Fixed policy. The byte budgets below live in limits and may change at
-  // runtime; requested keeps the caller's zero-means-derived budget fields so
-  // resize() can rederive them.
-  FilterCacheConfig config;
-  FilterCacheConfig requested;
-  // Each field is read independently with relaxed loads. A reader racing
-  // resize() may combine old and new values for one decision, which is
-  // harmless: every budget is a soft target that the next sweep enforces.
-  struct Limits {
-    std::atomic<size_t> maxBytes{0};
-    std::atomic<size_t> lowWatermarkBytes{0};
-    std::atomic<size_t> maxEntryBytes{0};
-    std::atomic<size_t> maxMetadataBytes{0};
-    std::atomic<size_t> lowWatermarkMetadataBytes{0};
-  } limits;
-  std::mutex resizeMutex;
+  // Immutable policy and explicit-or-zero overrides. config.maxBytes is only
+  // the construction input; all runtime budget reads go through budgetBytes().
+  const FilterCacheConfig config;
+  std::atomic<size_t> budget;
   boost::unordered::concurrent_flat_map<
       FilterKey, std::shared_ptr<FilterEntry>, FilterKeyHash> entries;
   AdmissionRing clauseAdmission;
@@ -712,11 +700,13 @@ private:
       Use& use, ReaderProbe& probe,
       std::vector<std::unique_ptr<DocSet>> liveExact,
       uint32_t buildCostMicros);
-  static FilterCacheConfig deriveLimits(FilterCacheConfig config);
-  void storeLimits(const FilterCacheConfig& derived);
-  size_t maxEntryBytes() const {
-    return limits.maxEntryBytes.load(std::memory_order_relaxed);
-  }
+  size_t budgetBytes() const { return budget.load(std::memory_order_relaxed); }
+  size_t lowWatermarkBytes(size_t bytes) const;
+  size_t maxEntryBytes(size_t bytes) const;
+  size_t maxEntryBytes() const { return maxEntryBytes(budgetBytes()); }
+  size_t maxMetadataBytes(size_t bytes) const;
+  size_t lowWatermarkMetadataBytes(size_t bytes) const;
+  void detachEntry(const std::shared_ptr<FilterEntry>& entry);
   void advanceEvictionClock(double priority);
   void maybeSweep();
   void sweepMetadata();
@@ -725,7 +715,7 @@ public:
   explicit FilterCache(FilterCacheConfig config = {});
 
   bool enabled() const {
-    return limits.maxBytes.load(std::memory_order_relaxed) != 0;
+    return budgetBytes() != 0;
   }
   // The effective configuration, with derived budgets filled in.
   FilterCacheConfig configuration() const;
@@ -734,10 +724,10 @@ public:
   // new size; explicit ones are kept and clamped as at construction. A
   // shrink is swept down to the new low watermark, on this thread unless a
   // sweep is already running (that sweeper then loops with the new limits).
-  // Zero disables the cache and drops every entry; a publish racing it may
-  // leave one value or entry behind, which the next Use's sweep evicts.
-  // Growing takes effect immediately. Admission history and other policy
-  // fields are unchanged.
+  // Zero disables the cache and clears its entries. An insertion racing clear
+  // detaches itself if still disabled. Existing request pins remain valid.
+  // Positive grow/repeat calls do not evict; an overlapping zero or earlier
+  // sweep may still evict after a grow. Admission history and policy stay fixed.
   void resize(size_t maxBytes);
   bool onReaderPublished(uint64_t coreGen,
                          std::span<const SegmentIdentity> segments);

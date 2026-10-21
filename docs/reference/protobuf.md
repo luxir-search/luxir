@@ -438,7 +438,7 @@ A list of vectors, used as a per-doc cell for multi-valued vector fields.
 
 ### luxir.CacheControlRequest
 
-Admin control over the per-collection query cache. Actions compose and apply in this order: flush, reset\_admission, reset\_counters, then dump. flush drops resident values and entry metadata; sighting history survives, so a known query can be readmitted and rebuilt immediately. flush + reset\_admission also forgets sightings, restarting admission tracking. reset\_counters zeroes the cumulative stats. An empty collection targets every collection.
+Admin control over the per-collection query cache. Actions compose and apply in this order: max\_bytes, flush, reset\_admission, reset\_counters, then dump. flush drops resident values and entry metadata; sighting history survives, so a known query can be readmitted and rebuilt immediately. flush + reset\_admission also forgets sightings, restarting admission tracking. reset\_counters zeroes the cumulative stats. An empty collection targets every collection.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -451,7 +451,7 @@ Admin control over the per-collection query cache. Actions compose and apply in 
 | <a id="field-luxir.cachecontrolrequest.reset_counters"></a>[`reset_counters`](#field-luxir.cachecontrolrequest.reset_counters) | 4 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.dump"></a>[`dump`](#field-luxir.cachecontrolrequest.dump) | 5 | `bool` | singular |  |
 | <a id="field-luxir.cachecontrolrequest.dump_limit"></a>[`dump_limit`](#field-luxir.cachecontrolrequest.dump_limit) | 6 | `uint32` | singular | max dump rows per shard; 0 = 100 |
-| <a id="field-luxir.cachecontrolrequest.max_bytes"></a>[`max_bytes`](#field-luxir.cachecontrolrequest.max_bytes) | 8 | `uint64` | optional | Resizes each selected shard's filter cache before the other actions; 0 disables it and drops every entry. Derived budgets (watermarks, per-entry and metadata caps) follow the new size. Not persisted: a reopened collection starts at the server's --query-cache-bytes. |
+| <a id="field-luxir.cachecontrolrequest.max_bytes"></a>[`max_bytes`](#field-luxir.cachecontrolrequest.max_bytes) | 8 | `uint64` | optional | Administration only. Sets the selected caches' byte budget before the other actions; 0 disables caching and drops entries. With collection and tenant both empty it is also the budget for collections created later. Lasts for the node session: kept when a collection is replaced, dropped when it is deleted, back to --query-cache-bytes on restart. |
 
 <a id="message-luxir.cachecontrolresponse"></a>
 

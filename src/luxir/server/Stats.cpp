@@ -396,7 +396,9 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
                         api::CacheControlResponse& response,
                         std::pmr::memory_resource& resource) {
   std::vector<LuxirNode::CollectionEntry> entries;
-  if (!request.collection.empty()) {
+  if (request.max_bytes) {
+    entries =node.collections().setCacheBytes(request.tenant, request.collection, (size_t)*request.max_bytes);
+  } else if (!request.collection.empty()) {
     auto collection = node.getCollection(LuxirNode::target(request.tenant, request.collection));
     entries.push_back({collection->getId(), std::move(collection), {}});
   } else {
@@ -426,7 +428,6 @@ void gatherCacheControl(LuxirNode& node, const api::CacheControlRequest& request
     shardControl.shard_id = 0;
     if (cache == nullptr) continue;
 
-    if (request.max_bytes) cache->resize((size_t)*request.max_bytes);
     if (request.flush) cache->clear();
     if (request.reset_admission) cache->resetAdmission();
     if (request.reset_counters) cache->resetCounters();

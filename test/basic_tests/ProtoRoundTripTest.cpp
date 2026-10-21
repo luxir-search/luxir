@@ -307,6 +307,27 @@ TEST(ProtoRoundTrip, AllMessages) {
 #undef RT
 }
 
+TEST(ProtoRoundTrip, CacheBudgetPresence) {
+  for (auto bytes : std::array<std::optional<uint64_t>, 3>{std::nullopt, 0, 17}) {
+    P::CacheControlRequest in;
+    in.max_bytes = bytes;
+    std::vector<std::byte> wire;
+    ASSERT_TRUE(encode(in, wire));
+    std::vector<std::byte> expected;
+    if (bytes) expected = {std::byte{0x40}, (std::byte)*bytes};
+    EXPECT_EQ(expected, wire);
+    std::pmr::monotonic_buffer_resource resource;
+    P::CacheControlRequest out;
+    ASSERT_TRUE(decode(out, P::copyToPaddedInput(std::span<const std::byte>(wire), resource), resource));
+    EXPECT_EQ(bytes, out.max_bytes);
+    std::string json;
+    ASSERT_TRUE(write_json(in, json));
+    P::CacheControlRequest fromJson;
+    ASSERT_TRUE(read_json(fromJson, json, resource));
+    EXPECT_EQ(bytes, fromJson.max_bytes);
+  }
+}
+
 TEST(ProtoRoundTrip, AnalyzerDefTypedParams) {
   // An explicit fixture beside the generic fill: ordered distinct filters and
   // string / int / bool / list / object / null params survive binary

@@ -51,6 +51,7 @@
 #include "luxir/server/Stats.h"
 #include "luxir/store/Directory.h"
 #include "luxir/util/DateTime.h"
+#include "luxir/util/Signal.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
@@ -720,6 +721,284 @@ TEST(FilterCacheTest, resizeAtRuntime) {
             servePolicyValue(cache, segments, key(0), 0, 10));
   EXPECT_EQ(FilterCache::Probe::Kind::HIT,
             servePolicyValue(cache, segments, key(0), 0, 10));
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, resizeGrowAndRepeatPreserveResidents) {
+  size_t charge = bitDocs(4096, 1)->ramBytesUsed();
+  size_t budget = charge * 10 + 10;
+  FilterCache cache({.maxBytes = budget, .minSegmentDocs = 0,
+                     .admissionThreshold = 1, .maxMetadataBytes = 64 * 1024});
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  cache.onReaderPublished(1, segments);
+  for (int i = 0; i < 10; i++) {
+    servePolicyValue(cache, segments, FilterKey("grow:" + std::to_string(i)), i, 10);
+  }
+  size_t resident = cache.bytesUsed();
+  ASSERT_GT(resident, cache.configuration().lowWatermarkBytes);
+  auto evictions = cache.counters().evictions;
+  cache.resize(budget);
+  cache.resize(budget + charge / 10);
+  EXPECT_EQ(resident, cache.bytesUsed());
+  EXPECT_EQ(evictions, cache.counters().evictions);
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, resizeDerivesLimitsAndRestoresExplicitWatermarks) {
+  FilterCache derived({.maxBytes = 0});
+  derived.resize(1000);
+  auto config = derived.configuration();
+  EXPECT_EQ(900u, config.lowWatermarkBytes);
+  EXPECT_EQ(200u, config.maxEntryBytes);
+  EXPECT_EQ(250u, config.maxMetadataBytes);
+  EXPECT_EQ(225u, config.lowWatermarkMetadataBytes);
+  derived.resize(100);
+  EXPECT_EQ(25u, derived.configuration().maxMetadataBytes);
+  EXPECT_EQ(22u, derived.configuration().lowWatermarkMetadataBytes);
+
+  FilterCache explicitLimits({.maxBytes = 1000, .lowWatermarkBytes = 900,
+      .maxEntryBytes = 77, .maxMetadataBytes = 300,
+      .lowWatermarkMetadataBytes = 400});
+  explicitLimits.resize(10);
+  EXPECT_EQ(10u, explicitLimits.configuration().lowWatermarkBytes);
+  explicitLimits.resize(2000);
+  config = explicitLimits.configuration();
+  EXPECT_EQ(900u, config.lowWatermarkBytes);
+  EXPECT_EQ(77u, config.maxEntryBytes);
+  EXPECT_EQ(300u, config.maxMetadataBytes);
+  EXPECT_EQ(300u, config.lowWatermarkMetadataBytes);
+  explicitLimits.resize(0);
+  explicitLimits.resize(0);
+  EXPECT_FALSE(explicitLimits.enabled());
+  EXPECT_EQ(0u, explicitLimits.entryCountForTest());
+}
+
+TEST(FilterCacheTest, resizeWatermarksDoNotOverflow) {
+  constexpr size_t maximum = std::numeric_limits<size_t>::max();
+  FilterCache cache({.maxBytes = 0, .maxMetadataBytes = maximum});
+  for (size_t bytes : std::array<size_t, 6>{0, 1, 9, 10, maximum / 9 + 1, maximum}) {
+    cache.resize(bytes);
+    auto config = cache.configuration();
+    EXPECT_EQ(bytes - bytes / 10 - (size_t)(bytes % 10 != 0), config.lowWatermarkBytes);
+    EXPECT_EQ(maximum - maximum / 10 - (size_t)(maximum % 10 != 0),
+              config.lowWatermarkMetadataBytes);
+  }
+}
+
+TEST(FilterCacheTest, resizeRejectedChargeLeavesNoRawValue) {
+  for (size_t bytes : {0u, 1024u}) {
+    FilterCache cache({.maxBytes = 1024 * 1024, .minSegmentDocs = 0,
+                       .admissionThreshold = 1, .maxMetadataBytes = 64 * 1024});
+    std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+    cache.onReaderPublished(1, segments);
+    RequestMemTracker tracker(1);
+    {
+      FilterCache::UseRegistry request(cache, 1, segments);
+      auto* use = request.get(FilterKey("resize-charge"));
+      use->enableRoutedAccounting(0, tracker, "segment 0");
+      {
+        auto claim = use->probe(0);
+        ASSERT_EQ(FilterCache::Probe::Kind::BUILD, claim.kind());
+        cache.resize(bytes);
+        EXPECT_THROW(use->publishRaw(0, claim, bitDocs(4096, 7), 1), ResourceExhaustedError);
+      }
+      EXPECT_EQ(nullptr, use->rawDocSet(0));
+      EXPECT_NE(FilterCache::Probe::Kind::HIT, use->probe(0).kind());
+    }
+    EXPECT_EQ(0u, tracker.bytes());
+    cache.validateForTest();
+  }
+}
+
+TEST(FilterCacheTest, resizeZeroRacingInsertCleansWithoutAnotherRequest) {
+  for (bool allocated : {false, true}) {
+    FilterCache cache({.maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 1});
+    std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+    cache.onReaderPublished(1, segments);
+    if (allocated) {
+      for (int i = 0; i < 128; i++) {
+        servePolicyValue(cache, segments, FilterKey("seed:" + std::to_string(i)), i, 10);
+      }
+      cache.clear();
+    }
+    std::latch inserting(1), resume(1);
+    Signal::listen("filterCacheBeforeInsert", [&](void* object, void*, void*) -> void* {
+      if (object == &cache) { inserting.count_down(); resume.wait(); }
+      return nullptr;
+    });
+    std::thread worker([&] {
+      FilterCache::UseRegistry request(cache, 1, segments);
+      request.get(FilterKey("late-insert"));
+    });
+    inserting.wait();
+    cache.resize(0);
+    resume.count_down();
+    worker.join();
+    Signal::unlisten("filterCacheBeforeInsert");
+    EXPECT_EQ(0u, cache.bytesUsed());
+    EXPECT_EQ(0u, cache.metadataBytesUsed());
+    EXPECT_EQ(0u, cache.entryCountForTest());
+    cache.validateForTest();
+  }
+}
+
+TEST(FilterCacheTest, resizeZeroRacingReaderInsertCleansWithoutAnotherRequest) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter writer(snapshots);
+  addTermDoc(writer, "body");
+  writer.commit();
+  auto reader = snapshots.readers.getReader();
+  auto domains = canonicalDomains(*reader);
+  for (bool allocated : {false, true}) {
+    FilterCache cache({.maxBytes = 1024 * 1024, .admissionThreshold = 1});
+    cache.onReaderPublished(*reader);
+    if (allocated) {
+      for (int i = 0; i < 128; i++) {
+        FilterCache::UseRegistry request(cache, *reader);
+        request.get(FilterKey("seed:" + std::to_string(i)), FilterKeyScope::READER_STABLE)
+            ->probeReaderStable(*reader, domains);
+      }
+      cache.clear();
+    }
+    std::latch inserting(1), resume(1);
+    Signal::listen("filterCacheBeforeInsert", [&](void*, void*, void*) -> void* {
+      inserting.count_down(); resume.wait(); return nullptr;
+    });
+    std::thread worker([&] {
+      FilterCache::UseRegistry request(cache, *reader);
+      auto* use = request.get(FilterKey("late-reader"), FilterKeyScope::READER_STABLE);
+      EXPECT_EQ(FilterCache::ReaderProbe::Kind::BYPASS,
+                use->probeReaderStable(*reader, domains).kind());
+    });
+    inserting.wait();
+    cache.resize(0);
+    resume.count_down();
+    worker.join();
+    Signal::unlisten("filterCacheBeforeInsert");
+    EXPECT_EQ(0u, cache.bytesUsed());
+    EXPECT_EQ(0u, cache.metadataBytesUsed());
+    EXPECT_EQ(0u, cache.entryCountForTest());
+    cache.validateForTest();
+  }
+}
+
+TEST(FilterCacheTest, resizeZeroDetachesValuePublishedBeforeInsertCheck) {
+  RAMDir dir;
+  CommitSnapshotRegistry snapshots(dir);
+  IndexWriter writer(snapshots);
+  // Two docs: a segment value matching every doc is never populated.
+  addTermDoc(writer, "body");
+  addTermDoc(writer, "other");
+  writer.commit();
+  auto reader = snapshots.readers.getReader();
+  auto domains = canonicalDomains(*reader);
+  for (auto scope : {FilterKeyScope::SEGMENT_STABLE, FilterKeyScope::READER_STABLE}) {
+    FilterCache cache({.maxBytes = 1024 * 1024, .minSegmentDocs = 0, .admissionThreshold = 1});
+    cache.onReaderPublished(*reader);
+    std::latch inserted(1), check(1), disabled(1), clear(1);
+    Signal::listen("filterCacheEntryInserted", [&](void*, void*, void*) -> void* {
+      inserted.count_down(); check.wait(); return nullptr;
+    });
+    Signal::listen("filterCacheDisabled", [&](void*, void*, void*) -> void* {
+      disabled.count_down(); clear.wait(); return nullptr;
+    });
+    std::thread inserter([&] {
+      FilterCache::UseRegistry request(cache, *reader);
+      auto* use = request.get(FilterKey("insert-check"), scope);
+      if (scope == FilterKeyScope::READER_STABLE) use->probeReaderStable(*reader, domains);
+    });
+    inserted.wait();
+    FilterCache::UseRegistry borrower(cache, *reader);
+    auto* use = borrower.get(FilterKey("insert-check"), scope);
+    DocSet* pin;
+    if (scope == FilterKeyScope::READER_STABLE) {
+      auto claim = use->probeReaderStable(*reader, domains);
+      EXPECT_EQ(FilterCache::ReaderProbe::Kind::BUILD, claim.kind());
+      auto value = use->publishReaderStable(claim, oneDocPerSegment(*reader), 10);
+      pin = value->docSet(0, readerIdentitiesForTest(*reader)[0]);
+    } else {
+      auto claim = use->probe(0);
+      EXPECT_EQ(FilterCache::Probe::Kind::BUILD, claim.kind());
+      pin = use->publishRaw(0, claim, docs(reader->segments()[0].maxDoc(), {0}), 10)->docSet();
+    }
+    EXPECT_GT(cache.bytesUsed(), 0u);
+    std::thread disabler([&] { cache.resize(0); });
+    disabled.wait();
+    check.count_down();
+    inserter.join();
+    EXPECT_EQ(0u, cache.bytesUsed());
+    EXPECT_EQ(0u, cache.metadataBytesUsed());
+    EXPECT_EQ(0u, cache.entryCountForTest());
+    EXPECT_TRUE(pin->get(0));
+    clear.count_down();
+    disabler.join();
+    Signal::unlisten("filterCacheEntryInserted");
+    Signal::unlisten("filterCacheDisabled");
+    cache.validateForTest();
+  }
+}
+
+TEST(FilterCacheTest, resizeShrinkHandsOffToActiveSweeper) {
+  FilterCache cache({.maxBytes = 1024 * 1024, .minSegmentDocs = 0,
+                     .admissionThreshold = 1, .maxMetadataBytes = 64 * 1024});
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  cache.onReaderPublished(1, segments);
+  for (int i = 0; i < 8; i++) {
+    servePolicyValue(cache, segments, FilterKey("handoff:" + std::to_string(i)), i, 10);
+  }
+  std::latch elected(1), resume(1);
+  Signal::listen("filterCacheSweepStarted", [&](void*, void*, void*) -> void* {
+    elected.count_down(); resume.wait(); return nullptr;
+  });
+  std::thread sweeper([&] { cache.sweep(); });
+  elected.wait();
+  cache.resize(cache.bytesUsed() / 2);
+  resume.count_down();
+  sweeper.join();
+  Signal::unlisten("filterCacheSweepStarted");
+  EXPECT_LE(cache.bytesUsed(), cache.configuration().lowWatermarkBytes);
+  cache.validateForTest();
+}
+
+TEST(FilterCacheTest, concurrentResizeAndRoutedPublish) {
+  FilterCache cache({.maxBytes = 1024 * 1024, .minSegmentDocs = 0,
+                     .admissionThreshold = 1, .maxMetadataBytes = 64 * 1024});
+  std::array segments{FilterCache::SegmentIdentity{1, 4096}};
+  cache.onReaderPublished(1, segments);
+  std::latch start(1);
+  std::vector<std::thread> threads;
+  for (int tid = 0; tid < 6; tid++) {
+    threads.emplace_back([&, tid] {
+      start.wait();
+      for (int i = 0; i < 500; i++) {
+        RequestMemTracker tracker(1);
+        {
+          FilterCache::UseRegistry request(cache, 1, segments);
+          auto* use = request.get(FilterKey("cycling:" + std::to_string((i + tid) % 64)));
+          use->enableRoutedAccounting(0, tracker, "segment 0");
+          {
+            auto claim = use->probe(0);
+            if (claim.kind() == FilterCache::Probe::Kind::BUILD) {
+              try { use->publishRaw(0, claim, bitDocs(4096, tid), 10); }
+              catch (const ResourceExhaustedError&) { EXPECT_EQ(nullptr, use->rawDocSet(0)); }
+            }
+          }
+        }
+        EXPECT_EQ(0u, tracker.bytes());
+      }
+    });
+  }
+  start.count_down();
+  for (int i = 0; i < 500; i++) {
+    for (size_t bytes : {0u, 64u * 1024, 1024u * 1024, 0u, 8u * 1024}) cache.resize(bytes);
+  }
+  // Disable while publishers may still hold Uses; check their automatic cleanup.
+  cache.resize(0);
+  for (auto& thread : threads) thread.join();
+  EXPECT_EQ(0u, cache.bytesUsed());
+  EXPECT_EQ(0u, cache.metadataBytesUsed());
+  EXPECT_EQ(0u, cache.entryCountForTest());
   cache.validateForTest();
 }
 

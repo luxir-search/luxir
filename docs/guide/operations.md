@@ -606,10 +606,14 @@ Search has its own limits:
   first. Cache counters appear in `_stats?collections=true`
   (and on the collection and tenant `_stats` routes). Date ranges with an unrounded
   `NOW` bound are never cached; see [Dates](dates.md#date-math).
-  The gRPC `Admin/CacheControl` call's `max_bytes` resizes the caches of the
-  selected collections at runtime: a shrink evicts down to the new budget,
-  and `0` disables the cache and drops its entries. The new size lasts
-  until the collection is reopened, which starts again at `query-cache-bytes`.
+  The gRPC `Admin/CacheControl` call's `max_bytes` (administration only)
+  changes the budget at runtime: a shrink evicts down to the new budget, a
+  grow evicts nothing, and `0` disables the cache and drops its entries.
+  Without a tenant or collection it sets every collection, including ones
+  created later; with a tenant or collection it sets the existing ones
+  selected. The setting is kept when a collection is replaced (for example by
+  a follower's re-download), dropped when the collection is deleted, and not
+  persisted: a restart returns to `query-cache-bytes`.
 
 ## Time-zone data
 

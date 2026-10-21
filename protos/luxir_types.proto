@@ -2007,7 +2007,7 @@ message ArenaStats {
 }
 
 // Admin control over the per-collection query cache. Actions compose and
-// apply in this order: flush, reset_admission, reset_counters, then dump.
+// apply in this order: max_bytes, flush, reset_admission, reset_counters, then dump.
 // flush drops resident values and entry metadata; sighting history survives,
 // so a known query can be readmitted and rebuilt immediately.
 // flush + reset_admission also forgets sightings, restarting admission
@@ -2024,10 +2024,11 @@ message CacheControlRequest {
   bool reset_counters = 4;
   bool dump = 5;
   uint32 dump_limit = 6;  // max dump rows per shard; 0 = 100
-  // Resizes each selected shard's filter cache before the other actions; 0
-  // disables it and drops every entry. Derived budgets (watermarks, per-entry
-  // and metadata caps) follow the new size. Not persisted: a reopened
-  // collection starts at the server's --query-cache-bytes.
+  // Administration only. Sets the selected caches' byte budget before the
+  // other actions; 0 disables caching and drops entries. With collection and
+  // tenant both empty it is also the budget for collections created later.
+  // Lasts for the node session: kept when a collection is replaced, dropped
+  // when it is deleted, back to --query-cache-bytes on restart.
   optional uint64 max_bytes = 8;
 }
 
