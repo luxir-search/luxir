@@ -219,24 +219,75 @@ bool equalName(std::string_view a, std::string_view b) {
 // No recursion, regex backtracking, external resources, or entity expansion.
 class HtmlStripFilter : public CharFilter {
   std::string entity;
+  size_t noTagAfter = 0;
+  std::array<size_t, 2> noQuoteAfter{};
+  // Lucene's inline elements. Other names, including unknown elements, separate text.
+  static constexpr std::string_view inlineElements[] = {
+    "a", "abbr", "acronym", "b", "basefont", "bdo", "big", "cite", "code", "dfn", "em", "font",
+    "i", "img", "input", "kbd", "label", "q", "s", "samp", "select", "small", "span", "strike",
+    "strong", "sub", "sup", "textarea", "tt", "u", "var"};
 
-  size_t tagEnd(size_t pos) const {
-    char quote = 0;
-    for (; pos < input.size(); ++pos) {
-      char c = input[pos];
-      if (quote) { if (c == quote) quote = 0; }
-      else if (c == '\'' || c == '"') quote = c;
-      else if (c == '>') return pos + 1;
-    }
-    return input.size(); // an unterminated tag consumes the remaining markup
+  size_t quotedEnd(size_t pos, char quote) {
+    auto& missing = noQuoteAfter[quote == '"'];
+    if (pos >= missing) return std::string_view::npos;
+    size_t end = input.find(quote, pos);
+    if (end == std::string_view::npos) { missing = pos; return end; }
+    return end + 1;
   }
 
-  size_t rawEnd(size_t pos, std::string_view name) const {
+  size_t tagEnd(size_t pos) {
+    if (pos >= noTagAfter) return std::string_view::npos;
+    enum State { ATTRIBUTES, BEFORE_VALUE, UNQUOTED } state = ATTRIBUTES;
+    size_t tail = pos;
+    while (pos < input.size()) {
+      char c = input[pos++];
+      if (c == '>') return pos;
+      // A nested opener outside a quoted value rejects this candidate early.
+      // Quote searches jump to the next matching quote; failed searches are
+      // cached, so malformed candidates cannot repeatedly scan a suffix to EOF.
+      if (c == '<') return std::string_view::npos;
+      if (state == BEFORE_VALUE) {
+        if (space(c)) continue;
+        if (c == '\'' || c == '"') {
+          pos = quotedEnd(pos, c);
+          if (pos == std::string_view::npos) return pos;
+          tail = pos;
+          state = ATTRIBUTES;
+        } else {
+          state = UNQUOTED;
+        }
+      } else if (state == UNQUOTED) {
+        if (space(c)) state = ATTRIBUTES;
+      } else if (c == '=') {
+        state = BEFORE_VALUE;
+      }
+    }
+    // Since the last quoted value, there was no raw '<' or '>'.
+    noTagAfter = std::min(noTagAfter, tail);
+    return std::string_view::npos;
+  }
+
+  size_t declarationEnd(size_t pos) {
+    while (pos < input.size()) {
+      char c = input[pos++];
+      if (c == '>') return pos;
+      if (c == '\'' || c == '"') {
+        pos = quotedEnd(pos, c);
+        if (pos == std::string_view::npos) return input.size();
+      }
+    }
+    return pos;
+  }
+
+  size_t rawEnd(size_t pos, std::string_view name) {
     while ((pos = input.find('<', pos)) != std::string_view::npos) {
       size_t end = pos + 2 + name.size();
       if (end < input.size() && input[pos + 1] == '/' &&
           equalName(input.substr(pos + 2, name.size()), name) &&
-          (space(input[end]) || input[end] == '/' || input[end] == '>')) return tagEnd(end);
+          (space(input[end]) || input[end] == '/' || input[end] == '>')) {
+        end = tagEnd(end);
+        if (end != std::string_view::npos) return end;
+      }
       ++pos;
     }
     return input.size();
@@ -289,12 +340,21 @@ class HtmlStripFilter : public CharFilter {
   }
 
   void filter() override {
+    noTagAfter = input.size();
+    noQuoteAfter.fill(input.size());
     for (size_t pos = 0; pos < input.size();) {
       size_t start = pos;
       if (input[pos] == '&') {
         size_t end = reference(pos);
         if (end > pos) { replace(pos, end, entity); pos = end; continue; }
       } else if (input[pos] == '<') {
+        if (input.substr(pos).starts_with("<![CDATA[")) {
+          replace(pos, pos + 9, "");
+          pos = input.find("]]>", pos + 9);
+          if (pos == std::string_view::npos) pos = input.size();
+          else { replace(pos, pos + 3, ""); pos += 3; }
+          continue;
+        }
         if (input.substr(pos).starts_with("<!--")) {
           pos += 4;
           while ((pos = input.find("--", pos)) != std::string_view::npos) {
@@ -303,26 +363,32 @@ class HtmlStripFilter : public CharFilter {
             ++pos;
           }
           if (pos == std::string_view::npos) pos = input.size();
-        } else if (pos + 1 < input.size() && (input[pos + 1] == '!' || input[pos + 1] == '?')) {
-          pos = tagEnd(pos + 2);
-        } else {
-          size_t nameStart = pos + 1;
-          bool closing = nameStart < input.size() && input[nameStart] == '/';
-          if (closing) ++nameStart;
-          if (nameStart < input.size() && alpha(input[nameStart])) {
-            size_t nameEnd = nameStart;
-            while (nameEnd < input.size() && !space(input[nameEnd]) &&
-                   input[nameEnd] != '/' && input[nameEnd] != '>') ++nameEnd;
-            auto name = input.substr(nameStart, nameEnd - nameStart);
-            pos = tagEnd(nameEnd);
-            if (!closing && (equalName(name, "script") || equalName(name, "style")))
-              pos = rawEnd(pos, equalName(name, "script") ? "script" : "style");
-          }
-        }
-        if (pos > start) {
-          // A separator for every tag prevents adjacent elements merging words.
-          replace(start, pos, " ");
+          replace(start, pos, "");
           continue;
+        }
+        if (pos + 1 < input.size() && (input[pos + 1] == '!' || input[pos + 1] == '?')) {
+          pos = declarationEnd(pos + 2);
+          replace(start, pos, "");
+          continue;
+        }
+        size_t nameStart = pos + 1;
+        bool closing = nameStart < input.size() && input[nameStart] == '/';
+        if (closing) ++nameStart;
+        if (nameStart < input.size() && alpha(input[nameStart])) {
+          size_t nameEnd = nameStart + 1;
+          while (nameEnd < input.size() && (alpha(input[nameEnd]) || digit(input[nameEnd]) ||
+                 input[nameEnd] == '-' || input[nameEnd] == '_' || input[nameEnd] == ':')) ++nameEnd;
+          auto name = input.substr(nameStart, nameEnd - nameStart);
+          size_t end = tagEnd(nameEnd);
+          if (end != std::string_view::npos) {
+            if (!closing && (equalName(name, "script") || equalName(name, "style")))
+              end = rawEnd(end, equalName(name, "script") ? "script" : "style");
+            bool inlineElement = std::any_of(std::begin(inlineElements), std::end(inlineElements),
+                [&](std::string_view element) { return equalName(name, element); });
+            replace(start, end, inlineElement ? "" : "\n");
+            pos = end;
+            continue;
+          }
         }
       }
       ++pos;

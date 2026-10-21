@@ -428,16 +428,23 @@ backslashes in JSON. For example, `"x => \\u0020"` maps `x` to a space;
 unknown parameters, and non-string rules are rejected. Rule text is not folded
 at compile time: put `nfkc_cf` before mapping when its input should be folded.
 
-`html_strip` uses a forward scan with bounded named-reference lookup. It does
+`html_strip` uses a linear scan with bounded named-reference lookup. It does
 not build a DOM, execute scripts, fetch resources, or expand document-defined
-entities. Each removed tag or markup region becomes a space, including inline
-tags: `one<b>two</b>` yields separate words. Attribute quotes are respected.
-Unterminated tags, comments, and script/style regions consume the remaining
-markup. Unknown references remain literal; invalid numeric scalars become
-U+FFFD. The named-reference table includes HTML's legacy semicolonless names.
-Decoded markup such as `&lt;b&gt;` remains text rather than being parsed again.
-This is a deterministic indexing text extractor, not a browser rendering model
-or an HTML sanitizer for safe display.
+entities. Known inline elements emit nothing: `H<sub>2</sub>O` becomes `H2O`
+and `<b>W</b>ord` becomes `Word`. The fixed inline list follows Lucene's
+HTMLStripCharFilter, including `img`, `input`, `select`, and `textarea`.
+Other elements, including `br` and unknown names, emit a newline separator.
+Comments and declarations emit nothing; script/style regions emit a separator.
+Attribute quotes open only at the start of a value after `=` and optional
+whitespace, so unquoted apostrophes such as `title=O'Reilly` remain ordinary
+value bytes. Unterminated ordinary tags retain the literal `<`; unterminated
+comments and script/style regions consume the remaining input. CDATA delimiters
+are removed and their content is preserved literally, including `<` and `&`.
+Unknown references remain literal; invalid numeric scalars become U+FFFD. The
+named-reference table includes HTML's legacy semicolonless names. Decoded markup
+such as `&lt;b&gt;` remains text rather than being parsed again. This is a
+deterministic indexing text extractor, not a browser rendering model or an HTML
+sanitizer for safe display.
 
 Cleanup runs for analyzed queries. Prefix/fuzzy terms and TEXT range bounds
 use normalizing character filters before token normalization; `html_strip` is

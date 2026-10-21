@@ -95,11 +95,11 @@ TEST_F(CharFilterTest, htmlMarkupEntitiesAndOffsets) {
       "<p a='>' b=\"<fake>\">ok</p>",
       "<!-- hidden --><STYLE>secret &amp; text</sTyLe>ok<script>bad < x</SCRIPT>",
       "<?processing?><!DOCTYPE html SYSTEM 'https://invalid.example/'>ok",
-      "<!-- --!>ok", "ok<!-- unclosed", "ok<script>unclosed", "ok<unfinished x='>'"}) {
+      "<!-- --!>ok", "ok<!-- unclosed", "ok<script>unclosed"}) {
     SCOPED_TRACE(input);
     EXPECT_EQ((std::vector<std::string>{"ok"}), analyze(*chain, input).terms);
   }
-  EXPECT_EQ((std::vector<std::string>{"one", "two"}), analyze(*chain, "one<b></b>two").terms);
+  EXPECT_EQ((std::vector<std::string>{"onetwo"}), analyze(*chain, "one<b></b>two").terms);
   EXPECT_EQ((std::vector<std::string>{"a", "b"}), analyze(*chain, "a&#32;b").terms);
   EXPECT_TRUE(analyze(*chain, "<script>secret</script><style>hidden</style><!--comment-->").terms.empty());
 }
@@ -183,7 +183,8 @@ TEST_F(CharFilterTest, adversarialHtmlAndReuse) {
   for (int i = 0; i < 20000; ++i) comments += "<!--x-->";
   EXPECT_EQ((std::vector<std::string>{"ok"}), analyze(*chain, comments + "ok").terms);
   EXPECT_TRUE(analyze(*chain, "<script>" + std::string(100000, '<')).terms.empty());
-  EXPECT_TRUE(analyze(*chain, "<b x='" + std::string(100000, '>')).terms.empty());
+  EXPECT_EQ((std::vector<std::string>{"b", "x"}),
+      analyze(*chain, "<b x='" + std::string(100000, '>')).terms);
   std::mt19937 random(57);
   constexpr std::string_view alphabet = "<>&;!/'\"-scriptSTYLE012 x\n";
   for (int i = 0; i < 1000; ++i) {
@@ -365,4 +366,31 @@ TEST_F(CharFilterTest, wholeTermsAndPatternLiteralsUseMapping) {
     ASSERT_OK(req);
     EXPECT_EQ(mode == 3 ? 0u : 1u, req->getDocs().size()) << mode;
   }
+}
+
+TEST_F(CharFilterTest, htmlInlineBlocksAttributesAndCdata) {
+  auto chain = compile(R"({"tokenizer":"keyword","char_filters":["html_strip"]})")->createChain();
+  for (auto [input, expected] : {
+      std::pair{"H<sub>2</sub>O", "H2O"}, {"<b>W</b>ord", "Word"},
+      {"a<BR/>b<unknown>c</unknown>d", "a\nb\nc\nd"},
+      {"<p>one</p><div>two</div>", "\none\n\ntwo\n"},
+      {"<a title=O'Reilly>Hello world</a> and more", "Hello world and more"},
+      {"<a title = 'a > b' other=x='>text</a>", "text"},
+      {"co<!--comment-->operate<?pi?>!", "cooperate!"},
+      {"one<script>secret</script><style>hidden</style>two", "one\n\ntwo"},
+      {"<![CDATA[x > y &amp; <b>]]> tail", "x > y &amp; <b> tail"},
+      {"<![CDATA[unfinished &amp;", "unfinished &amp;"},
+      {"if x<y then the rest...", "if x<y then the rest..."},
+      {"ok<unfinished x='>'", "ok<unfinished x='>'"},
+      {"<!DOCTYPE html PUBLIC 'id > name'>ok", "ok"}}) {
+    SCOPED_TRACE(input);
+    EXPECT_EQ((std::vector<std::string>{expected}), analyze(*chain, input).terms);
+  }
+  auto out = analyze(*chain, "<![CDATA[word]]>");
+  EXPECT_EQ((std::vector<int>{9}), out.starts);
+  EXPECT_EQ((std::vector<int>{13}), out.ends);
+  std::string input;
+  for (int i = 0; i < 20000; ++i) input += "<a ";
+  input += "title='>";
+  EXPECT_EQ((std::vector<std::string>{input}), analyze(*chain, input).terms);
 }
