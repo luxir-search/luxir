@@ -9,6 +9,7 @@
 #include "luxir/index/BKDWriter.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/index/IntColWriter.h"
+#include "luxir/index/handler/GeoPointWire.h"
 #include "luxir/index/PointsWriter.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/geo.h"
@@ -51,50 +52,6 @@ inline void writeGeoPoints(PostingsWriter& postingsWriter,
   auto data = writer.write(points);
   fieldInfo.pointsLoc = data.pointsLoc;
   fieldInfo.pointsMetaOff = data.pointsMetaOff;
-}
-
-[[noreturn]] inline void throwGeoPointWire(std::string_view fieldName,
-                                           std::string_view detail) {
-  throw DocumentError(fmt::format(
-      "field '{}': cannot coerce value to GEO_POINT [x, y] = [lon, lat]: {}",
-      fieldName, detail));
-}
-
-inline GeoPoint parseGeoPointWire(const IndexVal& val,
-                                  std::string_view fieldName) {
-  auto checkArity = [&](size_t size) {
-    if (size != 2) {
-      throwGeoPointWire(fieldName,
-                        fmt::format("expected exactly 2 elements, got {}", size));
-    }
-  };
-  if (const auto* a = std::get_if<luxir::api::ArrDouble>(&val.kind)) {
-    checkArity(a->v.size());
-    return {a->v[1], a->v[0]};
-  }
-  if (const auto* a = std::get_if<luxir::api::ArrInt>(&val.kind)) {
-    checkArity(a->v.size());
-    return {(double)a->v[1], (double)a->v[0]};
-  }
-  if (const auto* a = std::get_if<luxir::api::ArrVal>(&val.kind)) {
-    checkArity(a->v.size());
-    auto numeric = [&](size_t index) {
-      const IndexVal& element = a->v[index];
-      if (!std::holds_alternative<int64_t>(element.kind) &&
-          !std::holds_alternative<double>(element.kind) &&
-          !std::holds_alternative<float>(element.kind)) {
-        throwGeoPointWire(fieldName,
-                          fmt::format("element {} ({}) is not numeric", index,
-                                      coerce::describe(element)));
-      }
-      return coerce::toDouble(element, fieldName);
-    };
-    double longitude = numeric(0);
-    double latitude = numeric(1);
-    return {latitude, longitude};
-  }
-  throwGeoPointWire(fieldName,
-                    "expected a two-element numeric array");
 }
 
 //
@@ -438,6 +395,11 @@ public:
   }
 };
 
+inline GeoPointWire geoPointWire(const PackedTerm& fieldName, FieldType& fieldType) {
+  const auto& geo = static_cast<const GeoPointFieldType&>(fieldType);
+  return {std::string_view(fieldName), geo.ignoreMalformed, geo.ignoreZValue};
+}
+
 class GeoPointHandler final : public IntColHandler {
 public:
   GeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
@@ -451,15 +413,24 @@ public:
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
     if (points.empty()) return;
     if (points.size() != 1) {
-      throw DocumentError("single-valued GEO_POINT field received multiple points");
+      throw DocumentError(fmt::format(
+          "Field '{}' is single-valued but received multiple values",
+          std::string_view(fieldName)));
     }
     index(inverter, points[0].latitude, points[0].longitude);
   }
 
   void index(Inverter& inverter, const IndexVal& val) override {
-    if (coerce::isNull(val)) return;
-    GeoPoint point = parseGeoPointWire(val, std::string_view(fieldName));
-    index(inverter, point.latitude, point.longitude);
+    std::optional<GeoPoint> point;
+    geoPointWire(fieldName, *fieldType).forEachPoint(val, [&](const GeoPoint& p) {
+      if (point) {
+        throw DocumentError(fmt::format(
+            "Field '{}' is single-valued but received multiple values",
+            std::string_view(fieldName)));
+      }
+      point = p;
+    });
+    if (point) index(inverter, point->latitude, point->longitude);
   }
 };
 
@@ -484,17 +455,11 @@ public:
   }
 
   void index(Inverter& inverter, const IndexVal& val) override {
-    if (coerce::isNull(val)) return;
-    const auto* arr = std::get_if<luxir::api::ArrVal>(&val.kind);
-    if (arr == nullptr) {
-      throwGeoPointWire(std::string_view(fieldName),
-                        "multi-valued fields require an array of point arrays");
-    }
+    // Parse every point before indexing any (validate before mutate).
     std::vector<GeoPoint> points;
-    points.reserve(arr->v.size());
-    for (const auto& point : arr->v) {
-      points.push_back(parseGeoPointWire(point, std::string_view(fieldName)));
-    }
+    geoPointWire(fieldName, *fieldType).forEachPoint(val, [&](const GeoPoint& p) {
+      points.push_back(p);
+    });
     index(inverter, std::span<const GeoPoint>(points));
   }
 };

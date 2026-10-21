@@ -310,6 +310,8 @@ struct FieldDef {
   std::optional<bool> stored;
   std::optional<bool> normalized;
   std::optional<bool> normalize_on_write;
+  std::optional<bool> ignore_malformed;
+  std::optional<bool> ignore_z_value;
 };
 struct AuxStats {
   std::string_view kind;

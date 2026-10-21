@@ -1123,6 +1123,46 @@ TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
   EXPECT_EQ(result.body().find(R"("la")"), std::string::npos) << result.body();
 }
 
+TEST_F(HttpApiTest, geoPointFormatsAndOptionsOverJson) {
+  auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
+    "fields": {
+      "geo": {"type":"geo_point", "index":"range", "multi":true,
+              "ignore_malformed":true, "ignore_z_value":true}
+    }
+  })");
+  ASSERT_EQ(200, schema.result_int()) << schema.body();
+  auto authored = httpRequest(port(), http::verb::get, "/collections/main/_schema");
+  ASSERT_EQ(200, authored.result_int()) << authored.body();
+  EXPECT_NE(authored.body().find(R"("ignore_malformed": true)"), std::string::npos) << authored.body();
+  EXPECT_NE(authored.body().find(R"("ignore_z_value": true)"), std::string::npos) << authored.body();
+  auto resolved = httpRequest(port(), http::verb::get, "/collections/main/_schema?view=resolved");
+  ASSERT_EQ(200, resolved.result_int()) << resolved.body();
+  EXPECT_NE(resolved.body().find(R"("ignore_malformed": true)"), std::string::npos) << resolved.body();
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"obj","geo":{"lat":40.7128,"lon":-74.0060}},)"
+      R"j({"id":"str","geo":["40.7128,-74.0060","POINT (-0.1278 51.5074 12)"]},)j"
+      R"({"id":"hash","geo":"dr5regw3p"},)"
+      R"({"id":"bad","geo":"not a point","home_p":"51.5074,-0.1278"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_EQ(update.body().find(R"("errors")"), std::string::npos) << update.body();
+
+  auto near = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_distance":{"field":"geo","lat":40.7128,"lon":-74.0060,"radius_meters":1000}},)"
+      R"("fields":["id"],"count_limit":-1})");
+  ASSERT_EQ(200, near.result_int()) << near.body();
+  for (const char* id : {R"("obj")", R"("str")", R"("hash")"}) {
+    EXPECT_NE(near.body().find(id), std::string::npos) << id << near.body();
+  }
+  EXPECT_EQ(near.body().find(R"("bad")"), std::string::npos) << near.body();
+
+  auto london = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_distance":{"field":"home_p","lat":51.5074,"lon":-0.1278,"radius_meters":10}},)"
+      R"("fields":["id"]})");
+  ASSERT_EQ(200, london.result_int()) << london.body();
+  EXPECT_NE(london.body().find(R"("bad")"), std::string::npos) << london.body();
+}
+
 TEST_F(HttpApiTest, vectorDocumentsRoundTripOverJson) {
   auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
     "fields": {
@@ -3276,7 +3316,12 @@ TEST_F(HttpApiTest, schemaSetAndReplaceAllModes) {
   auto redefine = httpRequest(port(), http::verb::post, "/collections/main/_schema",
                               R"({"fields": {"published": {"type": "date"}}})");
   ASSERT_EQ(200, redefine.result_int()) << redefine.body();
-  EXPECT_EQ(redefine.body().find("\"index\": \"range\""), std::string::npos)
+  // Only published's own definition: the geo suffix templates are range-indexed.
+  size_t published = redefine.body().find("\"published\"");
+  ASSERT_NE(std::string::npos, published) << redefine.body();
+  std::string definition = redefine.body().substr(
+      published, redefine.body().find('}', published) - published);
+  EXPECT_EQ(definition.find("\"index\""), std::string::npos)
       << "whole-definition set dropped the old index property: " << redefine.body();
 
   // mode=replace_all: title/published gone, reserved fields materialized.

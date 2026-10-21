@@ -64,6 +64,8 @@ struct ResolvedField {
   bool vectorNormalizeOnWrite = false;
   // Atomic: the nearest authored ann in the parent chain.
   const luxir::api::VectorAnnDef* ann = nullptr;
+  std::optional<bool> geoIgnoreMalformed;
+  std::optional<bool> geoIgnoreZValue;
 };
 
 struct ResolvedOwnership {
@@ -288,6 +290,10 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   }
 
   r.ann = def.ann ? &*def.ann : parentResolved.ann;
+  r.geoIgnoreMalformed = def.ignore_malformed ? def.ignore_malformed
+                                              : parentResolved.geoIgnoreMalformed;
+  r.geoIgnoreZValue = def.ignore_z_value ? def.ignore_z_value
+                                         : parentResolved.geoIgnoreZValue;
   return r;
 }
 
@@ -439,6 +445,10 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
     throw SchemaError(
       "dims/truncate_dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " +
       name + ")");
+  }
+  if ((def.ignore_malformed || def.ignore_z_value) && r.type != FieldClass::GEO_POINT) {
+    throw SchemaError("ignore_malformed/ignore_z_value are only valid for geo_point fields (field: " +
+                      name + ")");
   }
 }
 
@@ -657,7 +667,8 @@ struct FieldCompiler {
             r.dateUnit.value_or(ApiDateUnit::MS) == ApiDateUnit::NS ? DateUnit::NANOS : DateUnit::MILLIS);
         break;
       case FieldClass::GEO_POINT:
-        ft = std::make_shared<GeoPointFieldType>(name, flags);
+        ft = std::make_shared<GeoPointFieldType>(name, flags, r.geoIgnoreMalformed.value_or(false),
+                                                 r.geoIgnoreZValue.value_or(false));
         break;
       case FieldClass::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
@@ -989,8 +1000,9 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
           throw SchemaError("generated physical field name exceeds 127 bytes: " + name);
         }
         const auto& def = *view;
-        if (def.multi || def.stored || def.stored_resource) {
-          throw SchemaError("multi/stored/stored_resource belong to the logical field, not variant: " + name);
+        if (def.multi || def.stored || def.stored_resource || def.ignore_malformed || def.ignore_z_value) {
+          throw SchemaError("multi/stored/stored_resource/ignore_malformed/ignore_z_value belong to the "
+                            "logical field, not variant: " + name);
         }
         if (def.variants || def.defaults) {
           throw SchemaError("variant cannot declare variants or defaults: " + name);
@@ -1013,6 +1025,10 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
             (r.vectorDims <= 0 || branch.vectorDims != r.vectorDims)) {
           throw SchemaError("vector variants require the same positive dims as the primary: " + name);
         }
+        // Every branch reads the same input value, so they skip or reject a
+        // malformed point together.
+        branch.geoIgnoreMalformed = r.geoIgnoreMalformed;
+        branch.geoIgnoreZValue = r.geoIgnoreZValue;
         branch.isTemplate = e.isTemplate;
         auto ft = compiler.create(name, branch, owned, true);
         logical->variants.emplace(label, std::move(ft));
@@ -1235,6 +1251,14 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   add(templates, "_ds", FieldClass::DOUBLE).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_dt", FieldClass::DATE);
   add(templates, "_dts", FieldClass::DATE).multi = api::FieldDef::MultiMode::DEFAULT;
+  // Geo points: unlike the numeric suffixes these build the points index,
+  // since geo queries are their only use.
+  add(templates, "_p", FieldClass::GEO_POINT).index = IndexMode::RANGE;
+  {
+    auto& f = add(templates, "_ps", FieldClass::GEO_POINT);
+    f.index = IndexMode::RANGE;
+    f.multi = api::FieldDef::MultiMode::DEFAULT;
+  }
   // Text suffixes, from raw to folded and stemmed. In the whitespace
   // family a trailing `l` means "plus lowercase"; the unicode family uses `n`
   // for NFKC_CF ("normalize": casefold + compatibility forms + canonical

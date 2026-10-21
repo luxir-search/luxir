@@ -355,9 +355,12 @@ Anywhere a query goes, it can be a structured object or an expression string.
 
 ## Geo
 
-- Geo point fields (`[lon, lat]` arrays in GeoJSON coordinate order,
-  quantized to about a centimeter), single- or multi-valued, with an optional
-  two-dimensional points index.
+- Geo point fields, quantized to about a centimeter, single- or
+  multi-valued, with an optional two-dimensional points index. Points are
+  `[lon, lat]` arrays (GeoJSON order), `{"lat", "lon"}` objects, GeoJSON
+  `Point` objects, `"lat,lon"` strings, WKT `POINT` strings, or geohashes.
+  `_p` and `_ps` suffix templates; per-field `ignore_malformed` and
+  `ignore_z_value`.
 - Bounding-box queries (dateline-aware) and great-circle distance queries,
   usable as the main query, as a non-scoring filter, or as a boolean clause.
 
