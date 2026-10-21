@@ -272,6 +272,17 @@ apply their multi-term normalization/folding but do not tokenize it; STRING
 uses its normalizer if present, and ID uses the bytes verbatim. An empty prefix
 matches documents with at least one indexed term for the field.
 
+| Field | Meaning |
+|---|---|
+| `field` | Indexed term field. Required. |
+| `prefix` | Literal prefix, including any `*`, `?`, or backslashes. Required. |
+| `case_insensitive` | After normalization, also match other simple Unicode case forms. Default `false`. |
+
+With `case_insensitive`, the entire prefix is normalized once, then matched
+through a case-alternating automaton. TEXT, STRING, and ID are supported, and
+queries are constant-scoring. The expression form is
+`prefix(err, field=body_w, case_insensitive=true)`.
+
 ## Wildcard
 
 ```json

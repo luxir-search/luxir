@@ -632,3 +632,11 @@ TEST(ProtoRoundTrip, MatchCaseInsensitiveTag) {
   ASSERT_TRUE(P::encode(query, wire));
   EXPECT_EQ((std::vector<std::byte>{std::byte{0x50}, std::byte{1}}), wire);
 }
+
+TEST(ProtoRoundTrip, PrefixCaseInsensitiveTag) {
+  P::PrefixQuery query;
+  query.case_insensitive = true;
+  std::vector<std::byte> wire;
+  ASSERT_TRUE(P::encode(query, wire));
+  EXPECT_EQ((std::vector<std::byte>{std::byte{0x18}, std::byte{1}}), wire);
+}

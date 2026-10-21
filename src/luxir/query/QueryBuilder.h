@@ -560,11 +560,14 @@ public:
   // Build a prefix query over term-backed fields. The prefix is normalized
   // (not tokenized) for analyzed TEXT fields and normalized for STRING; ID is verbatim;
   // the field and prefix views must outlive the returned query.
-  Query* createPrefixQuery(std::string_view field, std::string_view prefix) {
-    return createPrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), prefix);
+  Query* createPrefixQuery(std::string_view field, std::string_view prefix,
+                            bool caseInsensitive = false) {
+    return createPrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), prefix,
+                              caseInsensitive);
   }
 
-  Query* createPrefixQuery(const ResolvedFieldHandle& target, std::string_view prefix) {
+  Query* createPrefixQuery(const ResolvedFieldHandle& target, std::string_view prefix,
+                            bool caseInsensitive = false) {
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
@@ -576,6 +579,7 @@ public:
           throw std::runtime_error(std::format(
               "Prefix query requires an indexed field: {}", field));
         }
+        if (caseInsensitive) return makeCaseInsensitiveTerm(target, field, prefix, 1.0f, true);
         return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix));
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
@@ -694,18 +698,19 @@ private:
                                     exactOrPrefixCopy, scanPlan, fittedPolicy);
   }
 
-  // A case-insensitive exact term: the already-normalized literal, escaped and
-  // compiled as a wildcard with case alternation (constant-score).
+  // An already-normalized literal, escaped and compiled without a field folder
+  // so non-idempotent normalizers run only once. Prefix adds the wildcard last.
   Query* makeCaseInsensitiveTerm(const ResolvedFieldHandle& target, std::string_view field,
-                                 std::string_view term, float boost = 1.0f) {
+                                 std::string_view term, float boost = 1.0f, bool prefix = false) {
     std::string escaped;
     escaped.reserve(term.size());
     for (char c : term) {
       if (c == '*' || c == '?' || c == '\\') escaped.push_back('\\');
       escaped.push_back(c);
     }
-    Query* query = makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, "Match", target, field, escaped,
-                                      nullptr, true, automaton::compileWildcard);
+    if (prefix) escaped.push_back('*');
+    Query* query = makeAutomatonQuery(AutomatonQuery::Kind::WILDCARD, prefix ? "Prefix" : "Match",
+                                      target, field, escaped, nullptr, true, automaton::compileWildcard);
     return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
   }
 

@@ -222,11 +222,11 @@ Anywhere a query goes, it can be a structured object or an expression string.
   window they name (`2024-06` is all of June), and date math
   (`NOW/DAY-30DAYS`, `2024-06-25||+2d/d`) with a request-stable `NOW`,
   evaluated in a request time zone (IANA name or fixed offset).
-- `prefix`, `wildcard` (`*` and `?`), `regex` (anchored whole-term; both,
-  like STRING/ID `match`, take an opt-in `case_insensitive` flag), and
+- `prefix`, `wildcard` (`*` and `?`), `regex` (anchored whole-term), and
   `fuzzy` (edit distance up to 2, with blended scoring so a rare misspelling
   never outranks the exact term; fuzzy clauses take part in block-max pruning
-  like any other clause).
+  like any other clause). Prefix, wildcard, and regex, including on TEXT,
+  and STRING/ID `match` take an opt-in `case_insensitive` flag.
 - `constant_score`, `boost`, and `rescore`: keep a query's matches and replace
   each score with a value expression over columns and the original score
   (`score * def(popularity_i, 1)`). `rescore` takes an optional `min_score`

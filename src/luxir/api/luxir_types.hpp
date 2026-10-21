@@ -160,7 +160,11 @@ struct SortSpec {
   SortDir dir = SortDir::UNKNOWN;
 };
 struct ExistsQuery { std::string_view field; };
-struct PrefixQuery { std::string_view field; std::string_view prefix; };
+struct PrefixQuery {
+  std::string_view field;
+  std::string_view prefix;
+  bool case_insensitive = false;
+};
 struct WildcardQuery {
   std::string_view field;
   std::string_view pattern;

@@ -336,8 +336,11 @@ through their normalizer; ID fields use literals verbatim. Add
 `case_insensitive=true` to also match other simple Unicode case forms of
 literals (and, for regex, of character-class members), as in
 `wildcard(err*, field=message_s, case_insensitive=true)`; `match(...)` accepts
-the same argument on STRING/ID. TEXT `match` rejects it; use a folding analyzer
-or field variant instead. These case-insensitive queries are constant-scoring.
+the same argument on STRING/ID. `prefix(err, field=body_w,
+case_insensitive=true)` also accepts it, including on TEXT: its prefix is
+literal and is normalized as a whole before case expansion. TEXT `match`
+rejects the flag; use a folding analyzer or field variant instead. These
+case-insensitive queries are constant-scoring.
 Quote the pattern when it contains characters the argument grammar would
 otherwise see, such as a comma or a parenthesis. See the
 [structured reference](query-reference.md#wildcard) for the JSON arms.

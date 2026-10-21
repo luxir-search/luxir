@@ -7,11 +7,12 @@
 #include "test/QueryBuild.h"
 #include "test/TestUtils.h"
 #include "luxir/server/JsonRequest.h"
+#include "luxir/schema/Schema.h"
 
 using namespace luxir;
 using namespace luxir::test;
 
-// case_insensitive on wildcard, regex and match over fields that keep case:
+// case_insensitive over fields that keep case:
 // name_s is a STRING without a normalizer, body_w a whitespace TEXT field.
 class CaseInsensitiveQueryTest : public LuxirTest {
 protected:
@@ -109,6 +110,27 @@ TEST_F(CaseInsensitiveQueryTest, idAndNumericMatch) {
   }
 }
 
+TEST_F(CaseInsensitiveQueryTest, prefixIgnoresCase) {
+  EXPECT_EQ((Ids{"a", "b", "c"}),
+      hits(R"({"prefix":{"field":"name_s","prefix":"fO","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"b"}), hits(R"({"prefix":{"field":"name_s","prefix":"fo"}})"));
+  EXPECT_EQ((Ids{"a", "b", "c"}), expr("prefix(fO, field=name_s, case_insensitive=true)"));
+  EXPECT_EQ((Ids{"a", "b", "c"}),
+      hits(R"({"prefix":{"field":"body_w","prefix":"err","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"b"}), hits(R"({"prefix":{"field":"body_w","prefix":"err"}})"));
+  EXPECT_EQ((Ids{"a"}), hits(R"({"prefix":{"field":"id","prefix":"A","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"e"}), hits(R"({"prefix":{"field":"name_s","prefix":"k","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"a", "b", "c", "d", "e"}),
+      hits(R"({"prefix":{"field":"name_s","prefix":"","case_insensitive":true}})"));
+}
+
+TEST_F(CaseInsensitiveQueryTest, prefixEscapesLiteralSyntax) {
+  ASSERT_TRUE(helper.index(flatdoc("id", "escaped", "name_s", "F*?\\Tail"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ((Ids{"escaped"}),
+      hits(R"({"prefix":{"field":"name_s","prefix":"f*?\\","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"escaped"}), expr(R"(prefix("f*?\\", field=name_s, case_insensitive=true))"));
+}
+
 TEST_F(CaseInsensitiveQueryTest, flagSeparatesQueryIdentity) {
   // Same pattern with and without the flag: neither boolean dedup nor the
   // filter cache may merge them.
@@ -122,4 +144,31 @@ TEST_F(CaseInsensitiveQueryTest, flagSeparatesQueryIdentity) {
   ASSERT_OK(req);
   const auto& facet = *req->docList()->ops.at("f")->facetResult();
   EXPECT_EQ((std::vector<int64_t>{1, 3, 1}), std::vector<int64_t>(facet.counts.begin(), facet.counts.end()));
+}
+
+class CaseInsensitiveMappingTest : public CaseInsensitiveQueryTest {
+protected:
+  void SetUp() override {
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef def;
+    ASSERT_TRUE(api::read_json(def, R"({"fields":{"id":"id","body":{"type":"text",
+      "analyzer":{"tokenizer":"whitespace","char_filters":[{"name":"mapping",
+        "params":{"mappings":["a => b","b => c","ph => f"]}}]}}}})", arena));
+    helper.collection().setSchema(Schema::fromProto(def));
+    ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "a", "body", "apple"), flatdoc("id", "b", "body", "apricot"),
+      flatdoc("id", "c", "body", "berry"), flatdoc("id", "d", "body", "BERRY"),
+      flatdoc("id", "e", "body", "phone"),
+    }, UpdateMessage::COMMIT).success);
+  }
+};
+
+TEST_F(CaseInsensitiveMappingTest, prefixNormalizesOnce) {
+  EXPECT_EQ((Ids{"a", "b", "d"}),
+      hits(R"({"prefix":{"field":"body","prefix":"a","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"a", "b", "d"}), expr("prefix(a, field=body, case_insensitive=true)"));
+  EXPECT_EQ((Ids{"a", "b", "d"}),
+      hits(R"({"wildcard":{"field":"body","pattern":"a*","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"e"}),
+      hits(R"({"prefix":{"field":"body","prefix":"ph","case_insensitive":true}})"));
 }

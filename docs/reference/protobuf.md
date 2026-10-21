@@ -1660,6 +1660,7 @@ Matches documents where \`field\` has a term starting with \`prefix\`. TEXT fiel
 |---|---|---|---|---|
 | <a id="field-luxir.prefixquery.field"></a>[`field`](#field-luxir.prefixquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.prefixquery.prefix"></a>[`prefix`](#field-luxir.prefixquery.prefix) | 2 | `string` | singular |  |
+| <a id="field-luxir.prefixquery.case_insensitive"></a>[`case_insensitive`](#field-luxir.prefixquery.case_insensitive) | 3 | `bool` | singular | After whole-prefix normalization, also match simple Unicode case alternates. TEXT fields are supported. Uses a constant-score automaton. |
 
 <a id="message-luxir.pressurestats"></a>
 

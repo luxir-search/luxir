@@ -619,6 +619,10 @@ message BooleanQuery {
 message PrefixQuery {
   string field = 1;
   string prefix = 2;
+
+  // After whole-prefix normalization, also match simple Unicode case
+  // alternates. TEXT fields are supported. Uses a constant-score automaton.
+  bool case_insensitive = 3;
 }
 
 // Matches an entire indexed term. `*` matches any bytes, `?` matches one
