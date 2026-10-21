@@ -113,6 +113,18 @@ FilterKey key(const Query& query) {
   return std::move(builder).finishStructural(scope, {});
 }
 
+struct TwoWayDisjGuard {
+  bool saved = BooleanQuery::DisjunctionScorer::disableTwoWayForTests;
+
+  explicit TwoWayDisjGuard(bool disabled) {
+    BooleanQuery::DisjunctionScorer::disableTwoWayForTests = disabled;
+  }
+
+  ~TwoWayDisjGuard() {
+    BooleanQuery::DisjunctionScorer::disableTwoWayForTests = saved;
+  }
+};
+
 } // namespace
 
 class DisMaxQueryTest : public LuxirTest {};
@@ -204,6 +216,44 @@ TEST_F(DisMaxQueryTest, externallyDrivenPhraseAndOptionalClause) {
     auto* driven = plan->build(pool);
     ASSERT_NE(nullptr, dynamic_cast<BooleanQuery::DisjunctionScorerT<true>*>(driven));
     EXPECT_TRUE(driven->flatDisjunctionScorers().empty());
+  }
+}
+
+TEST_F(DisMaxQueryTest, twoWayFlagReachesDisMaxScorer) {
+  CollectionHelper helper;
+  std::vector<Doc> docs;
+  for (int32_t doc = 0; doc < 257; doc++) {
+    docs.push_back(flatdoc("id", std::to_string(doc), "title_w", doc % 3 ? "dune" : "water",
+        "body_w", doc % 2 ? "red dune" : "red gap dune"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  TermQuery a("title_w", "dune");
+  std::string_view terms[] = {"red", "dune"};
+  int32_t positions[] = {0, 1};
+  PhraseQuery phrase("body_w", terms, positions);
+  auto expected = combine(scores(*reader, a), scores(*reader, phrase), 0.3f);
+  MemPool pool;
+  Query* clauses[] = {&a, &phrase};
+  auto* query = DisMaxQuery::make(pool, clauses, 0.3f);
+  for (bool disabled : {false, true}) {
+    SCOPED_TRACE(disabled);
+    TwoWayDisjGuard guard(disabled);
+    Query::Context context(pool, *reader);
+    auto* weight = query->createWeight(context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    Scores actual;
+    for (auto& segment : reader->segments()) {
+      auto* supplier = weight->scorerSupplier(pool, segment);
+      if (supplier == nullptr) continue;
+      auto* scorer = dynamic_cast<BooleanQuery::DisjunctionScorerT<true>*>(
+          resolveScorerPlanForTests(pool, *supplier, 1)->build(pool));
+      ASSERT_NE(nullptr, scorer);
+      EXPECT_EQ(!disabled, scorer->usesTwoWayMergeForTests());
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        actual.emplace(segdoc(segment.ord, doc), scorer->score());
+      }
+    }
+    expectScores(expected, actual);
   }
 }
 

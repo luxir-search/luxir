@@ -4281,8 +4281,16 @@ public:
 }; // ConjunctionBulkScorer
 
 
+// Shared by both score policies, so a flag set through DisjunctionScorer also
+// reaches the dis_max instantiation.
+struct BooleanQuery::DisjunctionTestFlags {
+  static inline bool disableDisjTwoPhaseForTests = false;
+  static inline bool disableTwoWayForTests = false;
+};
+
 template<bool DISMAX>
-class BooleanQuery::DisjunctionScorerT final : public Query::Scorer {
+class BooleanQuery::DisjunctionScorerT final : public Query::Scorer,
+                                               public DisjunctionTestFlags {
   struct ApproxSlot {
     Scorer* scorer = nullptr;
     bool twoPhase = false;
@@ -4407,9 +4415,6 @@ public:
     pq.reset(members.size());
     docid = -1;
   }
-
-  static inline bool disableDisjTwoPhaseForTests = false;
-  static inline bool disableTwoWayForTests = false;
 
   DisjunctionScorerT(luxir::MemPool& pool, std::span<Scorer*> scorers,
                     std::span<const uint8_t> twoPhaseScorers,

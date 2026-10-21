@@ -1142,6 +1142,7 @@ public:
   class ExactDocsOnlyTermConjunctionBulkScorer;
   class ConjunctionBulkScorer;
   struct SumScorePolicy {};
+  struct DisjunctionTestFlags;
   template<bool DISMAX> class DisjunctionScorerT;
   template<bool DISMAX> class MaxScoreDisjunctionScorerT;
   using DisjunctionScorer = DisjunctionScorerT<false>;
