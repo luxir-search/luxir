@@ -37,6 +37,7 @@
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/query/VectorEngine.h"
+#include "luxir/query/VectorScorer.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/Collapse.h"
 #include "luxir/util/AtomicMerger.h"
@@ -1756,6 +1757,8 @@ public:
             "KnnQuery: query vector dims {} do not match segment dims {}",
             dims, vr.dims()));
         }
+        VectorScorer scorer(request.query, dims, metric, normalizeColumnOnCosineRescore,
+                            vr.encoding());
 
         // Pooled-rank exclusion (request.eligible), honored at DOC level:
         // this engine's scores are exact and it emits each doc's max-sim
@@ -1826,8 +1829,7 @@ public:
                 emit(docId, [&]() LUXIR_INLINE {
                   if constexpr (Groups) scanned += end - rank;
                   auto [bestRank, bestScore] = bestInRun(rank, end, [&](int64_t r) {
-                    return exactScore(request.query, vr.vectorAtRank(r), dims, metric,
-                                      normalizeColumnOnCosineRescore, 0.0f);
+                    return scorer.score(vr.rowAtRank(r), 0.0f);
                   });
                   return VectorEngineHit{bestScore, segOrd, bestRank};
                 });
@@ -1844,8 +1846,7 @@ public:
               eligibleDocs++;
               emit(docId, [&]() LUXIR_INLINE {
                 if constexpr (Groups) scanned++;
-                return VectorEngineHit{exactScore(request.query, vr.vectorAtRank(rank), dims, metric,
-                    normalizeColumnOnCosineRescore, 0.0f), segOrd, rank};
+                return VectorEngineHit{scorer.score(vr.rowAtRank(rank), 0.0f), segOrd, rank};
               });
             }
           }
@@ -2668,8 +2669,14 @@ private:
       int64_t rescored = 0;
       bool keepEngineScores = !segApprox.empty() && !segApprox[(size_t)segOrd];
       std::optional<VectorReader> vr;
+      std::optional<VectorScorer> scorer;
       if (!keepEngineScores) {
         vr.emplace(reader.segments()[(size_t)segOrd].postingsReader(), *info);
+        if (vr->dims() != dims) {
+          throw std::runtime_error(std::format(
+            "KnnQuery: query vector dims {} do not match segment dims {}", dims, vr->dims()));
+        }
+        scorer.emplace(queryPtr, dims, metric, normalizeColumnOnCosineRescore, vr->encoding());
       }
 
       [[no_unique_address]] std::conditional_t<Groups,
@@ -2733,13 +2740,12 @@ private:
             }
             bestScore = bestInRun(begin, end, [&](int64_t rank) {
               rescored++;
-              return exactScore(queryPtr, vr->vectorAtRank(rank), dims, metric,
-                  normalizeColumnOnCosineRescore, 0.0f);
+              return scorer->score(vr->rowAtRank(rank), 0.0f);
             }).second;
           } else {
             bestScore = bestInRun((int64_t)i, (int64_t)runEnd, [&](int64_t c) {
-              return exactScore(queryPtr, vr->vectorAtRank(candidates[(size_t)c].valueRank),
-                  dims, metric, normalizeColumnOnCosineRescore, candidates[(size_t)c].score);
+              return scorer->score(vr->rowAtRank(candidates[(size_t)c].valueRank),
+                                 candidates[(size_t)c].score);
             }).second;
           }
         }
@@ -2782,51 +2788,8 @@ private:
     std::sort(docHits.begin(), docHits.end(), betterDoc);
   }
 
-  // The query vector is validated finite at Weight construction, but stored
-  // vectors are not, so a distance can still come back NaN (a stored NaN, or
-  // inf - inf accumulation).  NaN scores would break the strict-total-order
-  // contract (betterHit/betterDoc) that makes the bounded cuts deterministic
-  // and std::sort defined, so map NaN to a worst-rank score at the point
-  // where scores are produced.  One ULP above lowest(): TopScoreCollector's
-  // minCompetitiveVal starts at lowest() and admits only strictly greater
-  // scores, and a kNN hit must rank last, not be counted in matches yet
-  // vanish from the returned docs.
   static float finiteScore(float score) {
-    if (!std::isnan(score)) [[likely]] return score;
-    return std::nextafter(std::numeric_limits<float>::lowest(), 0.0f);
-  }
-
-  // Keep L2's nonnegative branch and IP in sync with scoreFromDist below.
-  // COSINE has a separate stored-vector norm branch for raw-column rescore mode.
-  static float exactScore(const float* queryPtr,
-                          std::span<const float> vec,
-                          int32_t dims,
-                          int32_t metric,
-                          bool normalizeColumnOnCosineRescore,
-                          float fallbackScore) {
-    assert(queryPtr != nullptr);
-    assert((int32_t)vec.size() == dims);
-    switch (metric) {
-      case (int32_t)luxir::api::VectorMetric::L2: {
-        float dist = faiss::fvec_L2sqr(queryPtr, vec.data(), (size_t)dims);
-        return finiteScore(1.0f / (1.0f + dist));
-      }
-      case (int32_t)luxir::api::VectorMetric::IP:
-        return finiteScore(faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims));
-      case (int32_t)luxir::api::VectorMetric::COSINE: {
-        float sum = faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims);
-        if (!normalizeColumnOnCosineRescore) return finiteScore(sum);
-
-        // Raw-column cosine pays the vector norm at query time.  This is the
-        // explicit tradeoff for preserving the originally submitted bytes when
-        // normalize_on_write=false; the default cosine path stores unit vectors.
-        float normSq = faiss::fvec_norm_L2sqr(vec.data(), (size_t)dims);
-        if (!std::isfinite(normSq) || normSq <= VectorFieldType::MIN_COSINE_NORM_SQ) return 0.0f;
-        return finiteScore(sum / std::sqrt(normSq));
-      }
-      default:
-        return fallbackScore;
-    }
+    return VectorScorer::finiteScore(score);
   }
 
   static void sortCandidatesByScore(std::vector<VectorEngineHit>& candidates) {
@@ -2858,7 +2821,8 @@ private:
   //   IP:    FAISS returns dot product - already higher-is-better.
   //   COSINE: stored as IP over normalized vectors (write path or builder),
   //           query is normalized at search time - same as IP.
-  // NaN distances map to the worst score (see finiteScore).
+  // NaN distances map to the worst score (see finiteScore).  Keep in sync
+  // with the column score conversions in VectorScorer.
   static float scoreFromDist(float dist, int32_t metric) {
     switch (metric) {
       case (int32_t)luxir::api::VectorMetric::L2:

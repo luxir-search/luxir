@@ -278,7 +278,7 @@ publication advances the schema generation.
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
-| `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
+| `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write`, `encoding`, `keep_original` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; `encoding`: `f32`, `f16`, `int8`; see [Vector search](vector-search.md) |
 | `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
 
 For PQ, positive `ann.pq.m` requires positive effective (inherited) `dims`

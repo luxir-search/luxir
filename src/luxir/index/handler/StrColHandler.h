@@ -199,6 +199,12 @@ protected:
   /// single-valued fields valueRank == docRank, so no map is ever written.
   virtual bool writesValueDocMap() const { return false; }
 
+  /// Lets a subclass record type-specific segment metadata (the vector
+  /// encoding) on the field info written at flush.
+  virtual void describeField(PostingsWriter::IndexFieldInfo& fieldInfo) const {
+    unused(fieldInfo);
+  }
+
 private:
   void addValue(Inverter& inverter, std::string_view val) {
     int32_t valSize = (int32_t)val.size();
@@ -242,6 +248,7 @@ public:
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.numValues = numValuesTotal;
+    describeField(fieldInfo);
 
     auto maxDoc = inverter.getMaxDoc();
     bool full = numDocs == maxDoc;

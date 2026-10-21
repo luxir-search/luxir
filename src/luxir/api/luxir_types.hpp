@@ -126,6 +126,7 @@ enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR =
 }
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
+enum class VectorEncoding { F32 = 0, F16 = 1, INT8 = 2 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
@@ -273,6 +274,7 @@ struct FieldDef {
   using IndexMode = luxir::api::FieldDef_::IndexMode;
   using LongTerms = luxir::api::FieldDef_::LongTerms;
   using Metric = luxir::api::VectorMetric;
+  using Encoding = luxir::api::VectorEncoding;
   std::string_view parent;
   std::optional<AnalyzerDef> analyzer;                          // align 8
   std::optional<std::string_view> stored_resource;
@@ -286,11 +288,13 @@ struct FieldDef {
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<std::int32_t> truncate_dims;                    // align 4
   std::optional<Metric> metric;                                 // align 4 (enum)
+  std::optional<Encoding> encoding;                             // align 4 (enum)
   std::optional<bool> column;                                   // align 1 (optional<bool>s)
   std::optional<bool> multi;
   std::optional<bool> stored;
   std::optional<bool> normalized;
   std::optional<bool> normalize_on_write;
+  std::optional<bool> keep_original;
 };
 struct AuxStats {
   std::string_view kind;

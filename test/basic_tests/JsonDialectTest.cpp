@@ -682,7 +682,7 @@ TEST(JsonDialect, SchemaDefGoldenWire) {
   // The full friendly shape: name-keyed maps, lowercase enums, flattened
   // vector params, sparse presence. Literal text pins the public contract.
   constexpr std::string_view wire =
-      R"({"fields":{"title":{"type":"text","analyzer":{"tokenizer":"unicode_word","filters":["nfkc_cf","fold"]},"stored":true},"year":{"type":"int","index":"range"},"vec":{"type":"vector","dims":4,"metric":"cosine"}},"templates":{"_x":{"type":"string","multi":true}}})";
+      R"({"fields":{"title":{"type":"text","analyzer":{"tokenizer":"unicode_word","filters":["nfkc_cf","fold"]},"stored":true},"year":{"type":"int","index":"range"},"vec":{"type":"vector","dims":4,"metric":"cosine","encoding":"int8","keep_original":true}},"templates":{"_x":{"type":"string","multi":true}}})";
 
   std::pmr::monotonic_buffer_resource mr;
   P::SchemaDef def;
@@ -698,6 +698,8 @@ TEST(JsonDialect, SchemaDefGoldenWire) {
   ASSERT_NE(nullptr, vec);
   EXPECT_EQ(4, *vec->dims);
   EXPECT_EQ(P::VectorMetric::COSINE, *vec->metric);
+  EXPECT_EQ(P::VectorEncoding::INT8, *vec->encoding);
+  EXPECT_TRUE(*vec->keep_original);
   EXPECT_FALSE(vec->stored.has_value()) << "sparse presence preserved";
   const P::FieldDef* tmpl = def.templates.at("_x").operator->();
   ASSERT_NE(nullptr, tmpl);

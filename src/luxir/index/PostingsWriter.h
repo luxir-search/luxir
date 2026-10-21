@@ -583,6 +583,9 @@ private:
       fieldOutput.writeVlong(finfo.mono2MetaOff);
       fieldOutput.writeVal(finfo.valDocLoc);
       fieldOutput.writeVlong(finfo.valDocMetaOff);
+      if (finfo.type == FieldType::VECTOR) {
+        fieldOutput.writeVint((uint32_t)finfo.vectorEncoding);
+      }
     }
 
     // Now write the start of each fieldInfo
