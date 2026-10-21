@@ -82,7 +82,7 @@ void installVectorBenchSchema(Collection& col, int32_t dims,
   auto& multi = b.templ("_vs");
   multi.type = api::FieldDef_::FieldClass::VECTOR;
   multi.column = true;
-  multi.multi = true;
+  multi.multi = api::FieldDef::MultiMode::DEFAULT;
   multi.dims = dims;
   multi.metric = metric;
   setBenchAnn(multi, dims, codec);

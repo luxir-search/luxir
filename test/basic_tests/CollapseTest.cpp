@@ -930,6 +930,37 @@ TEST_F(CollapseTest, typedGroupRanks) {
   }
 }
 
+TEST_F(CollapseTest, multiNumericRanksUseExtremaInBothModes) {
+  for (bool array : {false, true}) {
+    CollectionHelper helper;
+    helper.clear();
+    SchemaBuilder b;
+    auto& field = b.field("sort_is");
+    field.type = api::FieldDef::FieldClass::INT;
+    field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+    b.set(helper.collection());
+    helper.index(flatdoc("id", "a", "key_s", "x", "sort_is", vec_i(9, 4)), UpdateMessage::COMMIT);
+    helper.index(flatdoc("id", "b", "key_s", "y", "sort_is", vec_i(8, 6)), UpdateMessage::COMMIT);
+    // Different displayed heads force rank emission for the winning members.
+    helper.index(flatdoc("id", "0a", "key_s", "x", "sort_is", vec_i(5)), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", "0b", "key_s", "y", "sort_is", vec_i(7)), UpdateMessage::COMMIT);
+    for (auto [sort, first, second] : {
+        std::tuple{R"("sort_is asc")", 4, 6}, {R"("sort_is desc")", 9, 8}}) {
+      for (int parallel : {0, -1}) {
+        auto req = run("main", "*:*", R"({"field":"key_s","get_count":true,"head_sort":"id asc"})",
+                       -1, 0, parallel, true, 10, sort);
+        ASSERT_TRUE(req->ok()) << req->errorMsg();
+        const auto* groups = &*req->docList()->groups;
+        ASSERT_EQ(2u, groups->ranks.size());
+        ASSERT_EQ(1u, groups->ranks[0].v.size());
+        ASSERT_EQ(1u, groups->ranks[1].v.size());
+        EXPECT_EQ(first, groups->ranks[0].v[0].asInt());
+        EXPECT_EQ(second, groups->ranks[1].v[0].asInt());
+      }
+    }
+  }
+}
+
 namespace {
 const api::Val& groupOp(const api::GroupTable& groups, std::string_view name, size_t row) {
   return std::get<api::ArrVal>(groups.ops.at(name)->kind).v[row];

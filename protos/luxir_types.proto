@@ -2206,7 +2206,22 @@ message FieldDef {
   optional IndexMode index = 3;
 
   optional bool column = 4;      // store values in a per-field column
-  optional bool multi = 5;       // multi-valued
+  // SINGLE is one value; DEFAULT enables the type's default multi mode.
+  // SET sorts and deduplicates per document; ARRAY keeps source order and repeats.
+  // DEFAULT resolves per representation: INT/FLOAT/DOUBLE/DATE/STRING/ID
+  // use SET, TEXT/VECTOR/GEO_POINT use ARRAY. Explicit SET is rejected on
+  // an array-only primary and resolves to ARRAY on an array-only variant.
+  // Explicit ARRAY applies to every representation; indexed STRING/ID
+  // ARRAY is not yet supported. Variants inherit the declared mode and
+  // cannot override it. Schema JSON views echo the declaration.
+  // HTTP JSON accepts false, true (DEFAULT), "set", or "array".
+  enum MultiMode {
+    SINGLE = 0;
+    DEFAULT = 1;
+    SET = 2;
+    ARRAY = 3;
+  }
+  optional MultiMode multi = 5; // unset inherits, falling back to SINGLE
 
   // TEXT only. Unset or empty inherits; a nonempty definition replaces the
   // entire analyzer. Without an inherited analyzer, defaults to whitespace.

@@ -239,11 +239,8 @@ public:
 };
 
 
-// Numeric multi-valued columns hold each doc's values in ascending encoded
-// order (duplicates kept), so a doc's min and max are its first and last
-// values. The encoded order is the numeric order for every int-column type
-// (FLOAT/DOUBLE use sortable bits). GEO_POINT keeps insertion order: packed
-// points have no meaningful order.
+// Numeric sets sort and deduplicate encoded values before appending. Arrays
+// retain source order and repeats. GEO_POINT is always an array.
 class MultiIntColHandler : public Inverter::IndexHandler {
   friend class Inverter;
   LongStream longStream;
@@ -252,13 +249,12 @@ class MultiIntColHandler : public Inverter::IndexHandler {
   std::vector<int64_t> docValues;  // per-doc scratch, reused across docs
   int64_t numVals = 0;
   int32_t numDocs = 0;
-  bool sortValues;
 
 public:
   MultiIntColHandler(Inverter& inverter, const std::string_view& fieldName,
-                     const std::shared_ptr<FieldType>& fieldType, bool sortValues = true)
+                     const std::shared_ptr<FieldType>& fieldType)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType), longStream(inverter.pool),
-      lengthStream(inverter.pool), docsWithVal(inverter.pool), sortValues(sortValues) {
+      lengthStream(inverter.pool), docsWithVal(inverter.pool) {
   }
 
   ~MultiIntColHandler() override = default;
@@ -275,21 +271,19 @@ public:
       return;
     }
     if (coerce::isNull(val)) return;
-    // Coercions last, element-wise through the field type.  Materialize the
-    // full array before indexMulti: a throw partway through a lazy transform
-    // would leave already-appended values without their doc/length entries
-    // (the column reconstructs positionally, corrupting later docs); a throw
-    // before any stream mutation just fails the doc.
-    std::vector<int64_t> encoded;
+    // Validate/materialize before mutating any stream. A failed coercion may
+    // retain scratch capacity, which still belongs to the inverter's budget.
+    docValues.clear();
+    auto account = scope_guard([&] { accountExtraRam(inverter, docValues.capacity() * sizeof(int64_t)); });
     bool wasArray = coerce::forEachElement(val, [&](const IndexVal& elem) {
-      encoded.push_back(fieldType->coerceColInt64(
+      docValues.push_back(fieldType->coerceColInt64(
           elem, std::string_view(fieldName), inverter.coerceContext));
     });
     if (!wasArray) {
-      encoded.push_back(fieldType->coerceColInt64(
+      docValues.push_back(fieldType->coerceColInt64(
           val, std::string_view(fieldName), inverter.coerceContext));
     }
-    indexMulti(inverter, std::span<const int64_t>(encoded.data(), encoded.size()));
+    appendDocValues(inverter);
   }
 
   void index(Inverter& inverter, int64_t int64) override {
@@ -309,9 +303,17 @@ public:
 
   void indexMulti(Inverter& inverter, std::ranges::input_range auto&& values) {
     docValues.clear();
+    auto account = scope_guard([&] { accountExtraRam(inverter, docValues.capacity() * sizeof(int64_t)); });
     for (auto val : values) docValues.push_back(val);
+    appendDocValues(inverter);
+  }
+
+  void appendDocValues(Inverter& inverter) {
     if (docValues.empty()) return;
-    if (sortValues) std::ranges::sort(docValues);
+    if (fieldType->multiSet()) {
+      std::ranges::sort(docValues);
+      docValues.erase(std::unique(docValues.begin(), docValues.end()), docValues.end());
+    }
     for (int64_t val : docValues) longStream.addVal(inverter.pool, val);
     int64_t n = (int64_t)docValues.size();
     numVals += n;
@@ -463,7 +465,7 @@ class MultiGeoPointHandler final : public MultiIntColHandler {
 public:
   MultiGeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
                        const std::shared_ptr<FieldType>& fieldType)
-    : MultiIntColHandler(inverter, fieldName, fieldType, false) {}
+    : MultiIntColHandler(inverter, fieldName, fieldType) {}
 
   void index(Inverter& inverter, double latitude, double longitude) override {
     int64_t packed = geo::encodePoint(latitude, longitude);

@@ -377,12 +377,12 @@ TEST_F(ScorerResetTest, freshProductsAcrossProtocolsAndEncodings) {
     field.type = api::FieldDef::FieldClass::INT;
     field.index = name == "point" ? api::FieldDef::IndexMode::RANGE : api::FieldDef::IndexMode::NONE;
     field.column = true;
-    field.multi = name == "multi";
+    field.multi = (name == "multi") ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
   }
   auto& tags = schema.field("tags");
   tags.type = api::FieldDef::FieldClass::STRING;
   tags.index = api::FieldDef::IndexMode::MATCH;
-  tags.multi = true;
+  tags.multi = api::FieldDef::MultiMode::DEFAULT;
   schema.set(helper.collection());
   auto writer = helper.getIndexWriter();
   auto& inverter = writer->obtainInverter();

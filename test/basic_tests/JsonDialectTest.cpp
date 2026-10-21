@@ -21,6 +21,7 @@
 
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/api/build.h"
+#include "luxir/api/padded_input.h"
 
 namespace {
 using namespace std::string_view_literals;
@@ -701,7 +702,7 @@ TEST(JsonDialect, SchemaDefGoldenWire) {
   EXPECT_FALSE(vec->stored.has_value()) << "sparse presence preserved";
   const P::FieldDef* tmpl = def.templates.at("_x").operator->();
   ASSERT_NE(nullptr, tmpl);
-  EXPECT_TRUE(*tmpl->multi);
+  EXPECT_EQ(P::FieldDef::MultiMode::DEFAULT, *tmpl->multi);
 
   // write(read(x)) is text-identity: the canonical form round-trips exactly.
   std::string out;
@@ -722,6 +723,27 @@ TEST(JsonDialect, FieldDefStringShorthand) {
   std::string out;
   ASSERT_TRUE(P::write_json(def, out));
   EXPECT_EQ(R"({"fields":{"year":{"type":"int"},"tag":{"type":"string"}}})", out);
+}
+
+TEST(JsonDialect, MultiModeGoldenWireAndBinaryPresence) {
+  for (auto [json, expected] : {
+      std::pair{"false", P::FieldDef::MultiMode::SINGLE},
+      {"true", P::FieldDef::MultiMode::DEFAULT},
+      {R"("set")", P::FieldDef::MultiMode::SET},
+      {R"("array")", P::FieldDef::MultiMode::ARRAY}}) {
+    std::pmr::monotonic_buffer_resource mr;
+    P::FieldDef def, decoded;
+    std::string input = std::string(R"({"multi":)") + json + "}";
+    ASSERT_TRUE(P::read_json(def, input, mr));
+    EXPECT_EQ(expected, def.multi);
+    std::string output;
+    std::vector<std::byte> wire;
+    ASSERT_TRUE(P::write_json(def, output));
+    EXPECT_EQ(input, output);
+    ASSERT_TRUE(P::encode(def, wire));
+    ASSERT_TRUE(P::decode(decoded, P::copyToPaddedInput(wire, mr), mr));
+    EXPECT_EQ(expected, decoded.multi);
+  }
 }
 
 TEST(JsonDialect, AnalyzerComponentStringShorthand) {

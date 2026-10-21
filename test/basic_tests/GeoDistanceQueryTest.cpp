@@ -88,7 +88,7 @@ void setGeoSchema(CollectionHelper& helper, bool range = true) {
   auto& multi = b.field("geo_multi");
   multi.type = api::FieldDef::FieldClass::GEO_POINT;
   multi.index = index;
-  multi.multi = true;
+  multi.multi = api::FieldDef::MultiMode::DEFAULT;
   b.set(helper.collection());
 }
 

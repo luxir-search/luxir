@@ -76,6 +76,9 @@ public:
   // in this segment field is at least PackedTerm::MIN_FITTED_LEN bytes, so it
   // may be a truncated or hashed (fitted) form of a longer value.
   static constexpr flag_type MAY_HAVE_FITTED = (1 << 14);
+  // Multi-valued set is the default; arrays retain source order and repeats.
+  // This is a physical property persisted in each segment, not a format marker.
+  static constexpr flag_type MULTI_ARRAY = (1 << 15);
   // Every segment-format marker. A writer derives them from what it writes,
   // so merges never carry them over from source segments.
   static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED;
@@ -93,6 +96,7 @@ public:
   // constructor
   FieldType(std::string_view name, FieldType::Type type, int flags) :
      type_(type), name_(name), flags_(flags) {
+    if ((flags_ & MULTI_VALUED) && arrayOnly(type)) flags_ |= MULTI_ARRAY;
   }
 
   bool isSet(flag_type flag) {
@@ -135,6 +139,9 @@ public:
   bool hasNumTokens() { return (bool) (flags_ & (NUM_TOKENS_APPROX | NUM_TOKENS_EXACT)); }
 
   bool multiValued() { return (bool) (flags_ & MULTI_VALUED); }
+  bool multiArray() const { return (flags_ & MULTI_ARRAY) != 0; }
+  bool multiSet() const { return (flags_ & MULTI_VALUED) && !multiArray(); }
+  static bool arrayOnly(Type type) { return type == TEXT || type == VECTOR || type == GEO_POINT; }
 
   // Whether a sort on a field of this type orders by its int64 column
   // values: raw integers for INT, epoch millis for DATE, sortable bits for

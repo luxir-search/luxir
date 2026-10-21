@@ -264,7 +264,7 @@ protected:
     auto& f = b.templ("_vs");
     f.type = api::FieldDef::FieldClass::VECTOR;
     f.column = true;
-    f.multi = true;
+    f.multi = api::FieldDef::MultiMode::DEFAULT;
     f.metric = metric;
     f.ann = ann;
     if (dims > 0) f.dims = dims;

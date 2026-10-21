@@ -20,7 +20,7 @@ protected:
     SchemaBuilder b;
     auto& author = b.field("author");
     author.type = FieldClass::TEXT;
-    author.multi = multi;
+    author.multi = (multi) ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
     auto& s = b.variant(author, "s");
     s.type = FieldClass::STRING;
     if (reject) s.long_terms = api::FieldDef::LongTerms::REJECT;
@@ -234,7 +234,7 @@ TEST_F(FieldVariantsIngestTest, normalizedLengthLimitAndRecoveryForBothStringLay
     SchemaBuilder b;
     auto& value = b.field("value");
     value.type = FieldClass::STRING;
-    value.multi = true;
+    value.multi = api::FieldDef::MultiMode::DEFAULT;
     value.index = indexed ? api::FieldDef::IndexMode::MATCH : api::FieldDef::IndexMode::NONE;
     if (indexed) value.long_terms = api::FieldDef::LongTerms::REJECT;
     b.normalizer(value, {"nfkc_cf", "fold"});
@@ -464,7 +464,7 @@ TEST_F(FieldVariantsIngestTest, directOverloadsUseBothRegistriesAndGlobalPhysica
   SchemaBuilder b;
   auto& a = b.field("a");
   a.type = FieldClass::TEXT;
-  a.multi = true;
+  a.multi = api::FieldDef::MultiMode::DEFAULT;
   b.variant(a, "s").type = FieldClass::STRING;
   auto& col = b.variant(a, "col");
   col.type = FieldClass::STRING;
@@ -473,7 +473,7 @@ TEST_F(FieldVariantsIngestTest, directOverloadsUseBothRegistriesAndGlobalPhysica
   b.field("aB").type = FieldClass::INT; // sorts between the primary and its variants
   auto& point = b.field("point");
   point.type = FieldClass::GEO_POINT;
-  point.multi = true;
+  point.multi = api::FieldDef::MultiMode::DEFAULT;
   b.variant(point, "copy").type = FieldClass::GEO_POINT;
   b.set(helper.collection());
   auto writer = helper.getIndexWriter();

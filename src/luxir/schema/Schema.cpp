@@ -66,7 +66,7 @@ struct ResolvedField {
 
 struct ResolvedOwnership {
   bool hasMulti = false;
-  bool multi = false;
+  api::FieldDef::MultiMode multi = api::FieldDef::MultiMode::SINGLE;
   bool hasStored = false;
   bool stored = false;
   // storedResource: empty string means "inherit from parent or use the
@@ -427,7 +427,7 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
       if (!r.hasType || r.type != FieldClass::ID) {
         throw SchemaError("reserved field 'id' must have type 'id'");
       }
-      if (logical.hasMulti && logical.multi) throw SchemaError("reserved field 'id' cannot be multi-valued");
+      if (logical.hasMulti && logical.multi != api::FieldDef::MultiMode::SINGLE) throw SchemaError("reserved field 'id' cannot be multi-valued");
       if (r.hasIndex && r.index != IndexMode::MATCH) {
         throw SchemaError("reserved field 'id' must be match-indexed (overwrite and delete-by-id use it)");
       }
@@ -439,7 +439,7 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
       if (!r.hasType || r.type != FieldClass::INT) {
         throw SchemaError("reserved field '_version_' must have type 'int'");
       }
-      if (logical.hasMulti && logical.multi) throw SchemaError("reserved field '_version_' cannot be multi-valued");
+      if (logical.hasMulti && logical.multi != api::FieldDef::MultiMode::SINGLE) throw SchemaError("reserved field '_version_' cannot be multi-valued");
       if ((r.hasColumn && r.column) || (r.hasIndex && r.index != IndexMode::NONE)
           || logical.stored || logical.hasStoredResource || r.analyzer || r.normalizer
           || r.longTerms || logical.defaults) {
@@ -454,6 +454,23 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
 
 // Pass 3 compiles each authored analysis definition once and creates physical
 // bundles with the logical owner's shape. Storage can only belong to the primary.
+static api::FieldDef::MultiMode resolveMultiMode(api::FieldDef::MultiMode declared,
+    FieldClass type, bool isPrimary, std::string_view name) {
+  using Mode = api::FieldDef::MultiMode;
+  bool arrayOnly = type == FieldClass::TEXT || type == FieldClass::VECTOR
+      || type == FieldClass::GEO_POINT;
+  switch (declared) {
+    case Mode::SINGLE: return Mode::SINGLE;
+    case Mode::DEFAULT: return arrayOnly ? Mode::ARRAY : Mode::SET;
+    case Mode::ARRAY: return Mode::ARRAY;
+    case Mode::SET:
+      if (!arrayOnly) return Mode::SET;
+      if (!isPrimary) return Mode::ARRAY;
+      throw SchemaError("multi=set is not supported for array-only field: " + std::string(name));
+    default: throw SchemaError("invalid multi mode for field: " + std::string(name));
+  }
+}
+
 struct FieldCompiler {
   boost::unordered_flat_map<const api::AnalyzerDef*, std::shared_ptr<const Analyzer>> analyzers;
   boost::unordered_flat_map<const api::NormalizerDef*, std::shared_ptr<const Analyzer>> normalizers;
@@ -468,7 +485,8 @@ struct FieldCompiler {
     IndexMode index = r.index;
     if (name == "_version_") return std::make_shared<IntFieldType>(name, 0);
     bool column = r.column;
-    bool multi = logical.multi;
+    using MultiMode = api::FieldDef::MultiMode;
+    MultiMode mode = resolveMultiMode(logical.multi, r.type, !derived, name);
     bool stored = logical.stored;
 
     if (!r.hasIndex) {
@@ -532,8 +550,9 @@ struct FieldCompiler {
         throw SchemaError("index=match is not supported for this type (field: " + std::string(name) + ")");
       }
     }
-    if (!logical.hasMulti) {
-      multi = false;
+    if (mode == MultiMode::ARRAY && index != IndexMode::NONE
+        && (r.type == FieldClass::STRING || r.type == FieldClass::ID)) {
+      throw SchemaError("multi=array is not yet supported for indexed STRING/ID field: " + std::string(name));
     }
     if (!logical.hasStored) {
       // TEXT fields are stored by default so the raw (pre-analysis) value can
@@ -553,7 +572,8 @@ struct FieldCompiler {
     }
     if (index == IndexMode::RANGE) flags |= FieldType::INDEX_RANGE;
     if (column) flags |= FieldType::COLUMN_STORED;
-    if (multi) flags |= FieldType::MULTI_VALUED;
+    if (mode != MultiMode::SINGLE) flags |= FieldType::MULTI_VALUED;
+    if (mode == MultiMode::ARRAY) flags |= FieldType::MULTI_ARRAY;
     if (stored && !derived) flags |= FieldType::STORED;
     if (derived) flags |= FieldType::DERIVED;
 
@@ -1169,20 +1189,20 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   // deviations are spelled out.  Multi-valued variants use the trailing "s".
   add(templates, "_s", FieldClass::STRING);
   add(templates, "_sc", FieldClass::STRING).index = IndexMode::NONE;
-  add(templates, "_ss", FieldClass::STRING).multi = true;
+  add(templates, "_ss", FieldClass::STRING).multi = api::FieldDef::MultiMode::DEFAULT;
   {
     auto& f = add(templates, "_ssc", FieldClass::STRING);
     f.index = IndexMode::NONE;
-    f.multi = true;
+    f.multi = api::FieldDef::MultiMode::DEFAULT;
   }
   add(templates, "_i", FieldClass::INT);
-  add(templates, "_is", FieldClass::INT).multi = true;
+  add(templates, "_is", FieldClass::INT).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_f", FieldClass::FLOAT);
-  add(templates, "_fs", FieldClass::FLOAT).multi = true;
+  add(templates, "_fs", FieldClass::FLOAT).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_d", FieldClass::DOUBLE);
-  add(templates, "_ds", FieldClass::DOUBLE).multi = true;
+  add(templates, "_ds", FieldClass::DOUBLE).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_dt", FieldClass::DATE);
-  add(templates, "_dts", FieldClass::DATE).multi = true;
+  add(templates, "_dts", FieldClass::DATE).multi = api::FieldDef::MultiMode::DEFAULT;
   // Text suffixes, from raw to folded and stemmed. In the whitespace
   // family a trailing `l` means "plus lowercase"; the unicode family uses `n`
   // for NFKC_CF ("normalize": casefold + compatibility forms + canonical
@@ -1214,12 +1234,12 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   name.defaults.emplace().value = "s";
   auto& names = add(templates, "_names");
   names.parent = "_name";
-  names.multi = true;
+  names.multi = api::FieldDef::MultiMode::DEFAULT;
 
   // VECTOR suffixes: single-valued (_v) and multi-valued (_vs).  dims is left
   // unset on the template; concrete fields may pin it.
   add(templates, "_v", FieldClass::VECTOR);
-  add(templates, "_vs", FieldClass::VECTOR).multi = true;
+  add(templates, "_vs", FieldClass::VECTOR).multi = api::FieldDef::MultiMode::DEFAULT;
 
   luxir::api::SchemaDef def;
   def.fields = luxir::api::map_view<std::string_view, hpp_proto::indirect_view<api::FieldDef>>(

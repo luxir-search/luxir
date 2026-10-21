@@ -882,7 +882,7 @@ TEST_F(SchemaTest, geoPointRoundTripsAndSurvivesMergeReconstruction) {
   auto& loc = b.field("location");
   loc.type = FieldClass::GEO_POINT;
   loc.index = IndexMode::RANGE;
-  loc.multi = true;
+  loc.multi = api::FieldDef::MultiMode::DEFAULT;
 
   auto schema = b.build();
   FieldType* location = schema->getFieldTypePtr("location");
@@ -1143,6 +1143,90 @@ static std::string authoredJson(const Schema& schema) {
   std::string json;
   if (!api::write_json(def, json)) throw std::runtime_error("schema JSON encode failed");
   return json;
+}
+
+TEST_F(SchemaTest, multiModesJsonBinaryAndViews) {
+  auto schema = schemaJson(R"({"templates":{
+    "_array":{"type":"int","multi":"array","variants":{"d":"double"}}
+  },"fields":{
+    "n":{"type":"int","multi":"set"}, "a":{"parent":"_array"},
+    "t":{"type":"text","multi":true,"variants":{"n":"int"}},
+    "f":{"type":"float","multi":true}, "dt":{"type":"date","multi":"array"},
+    "s":{"type":"string","multi":true},
+    "c":{"type":"string","index":"none","multi":"array"},
+    "v":{"type":"vector","multi":"array"}, "g":{"type":"geo_point","multi":true},
+    "one":{"type":"double","multi":false}
+  }})");
+  for (auto name : {"n", "f", "s", "t__n"}) EXPECT_TRUE(schema->physical(name)->multiSet()) << name;
+  for (auto name : {"a", "a__d", "t", "dt", "c", "v", "g"}) {
+    EXPECT_TRUE(schema->physical(name)->multiArray()) << name;
+  }
+  EXPECT_FALSE(schema->physical("one")->multiValued());
+  EXPECT_TRUE(schema->physical("x_array__d")->multiArray());
+  auto json = authoredJson(*schema);
+  EXPECT_NE(std::string::npos, json.find(R"("multi":"set")"));
+  auto sameProperties = [&](const Schema& copy) {
+    auto before = schema->signatures(true), after = copy.signatures(true);
+    ASSERT_EQ(before.size(), after.size());
+    for (const auto& [name, sig] : before) EXPECT_EQ(sig.properties, after.at(name).properties) << name;
+  };
+  sameProperties(*schemaJson(json));
+  EXPECT_EQ(schema->sourceDef_, schemaJson(json)->sourceDef_);
+  std::pmr::monotonic_buffer_resource arena;
+  sameProperties(*Schema::fromStored(schema->storedInfo(arena), schema->gen_));
+  EXPECT_EQ("true", schema->signatures().at("n").properties.at("multi"));
+  EXPECT_EQ("true", schema->signatures().at("t").properties.at("multi"));
+  EXPECT_EQ("true", schema->signatures().at("t__n").properties.at("multi"));
+  auto defaults = Schema::createDefaultSchema();
+  for (auto suffix : {"x_is", "x_fs", "x_ds", "x_dts", "x_ss"}) {
+    EXPECT_TRUE(defaults->physical(suffix)->multiSet()) << suffix;
+  }
+  EXPECT_TRUE(defaults->physical("x_vs")->multiArray());
+  EXPECT_TRUE(defaults->physical("author_names")->multiArray());
+  EXPECT_TRUE(defaults->physical("author_names__s")->multiSet());
+  EXPECT_EQ(defaults->sourceDef_, schemaJson(authoredJson(*defaults))->sourceDef_);
+}
+
+TEST_F(SchemaTest, declaredModesSurviveTypeChangingInheritance) {
+  auto original = schemaJson(R"({"templates":{
+    "_default":{"type":"text","multi":true,"variants":{"s":"string"}},
+    "_set":{"type":"int","multi":"set","variants":{"t":"text"}},
+    "_array":{"type":"text","multi":"array"}
+  },"fields":{
+    "n":{"parent":"_default","type":"int"},
+    "s":{"parent":"_set","type":"string"},
+    "a":{"parent":"_array","type":"double"}
+  }})");
+  auto json = authoredJson(*original);
+  auto copy = schemaJson(json);
+  EXPECT_EQ(original->sourceDef_, copy->sourceDef_);
+  for (auto name : {"n", "n__s", "s"}) EXPECT_TRUE(copy->physical(name)->multiSet()) << name;
+  for (auto name : {"s__t", "a"}) EXPECT_TRUE(copy->physical(name)->multiArray()) << name;
+  EXPECT_THROW(schemaJson(R"({"fields":{"s":{"parent":"_set","type":"text"}}})", copy.get()), SchemaError);
+  EXPECT_THROW(schemaJson(R"({"fields":{"s":{"parent":"_array","type":"string"}}})", copy.get()), SchemaError);
+}
+
+TEST_F(SchemaTest, multiModeValidationAndHistory) {
+  for (auto type : {"text", "vector", "geo_point"}) {
+    EXPECT_THROW(schemaJson(std::format(R"({{"fields":{{"f":{{"type":"{}","multi":"set"}}}}}})", type)), SchemaError);
+  }
+  EXPECT_THROW(schemaJson(R"({"fields":{"s":{"type":"string","multi":"array"}}})"), SchemaError);
+  EXPECT_TRUE(schemaJson(R"({"fields":{"n":{"type":"int","multi":"set","variants":{"t":"text"}}}})")->physical("n__t")->multiArray());
+  for (auto value : {"null", "1", "{}", R"("default")", R"("unknown")"}) {
+    EXPECT_THROW(schemaJson(std::format(R"({{"fields":{{"f":{{"type":"int","multi":{}}}}}}})", value)), std::runtime_error);
+  }
+  SchemaBuilder invalid;
+  invalid.field("f").type = FieldClass::INT;
+  auto& bad = invalid.field("bad");
+  bad.multi = (api::FieldDef::MultiMode)99;
+  bad.type = FieldClass::INT;
+  EXPECT_THROW(invalid.build(), SchemaError);
+  auto before = schemaJson(R"({"fields":{"f":{"type":"int","multi":true,"variants":{"d":"double"}}}})")->withHistory(10, nullptr);
+  auto same = schemaJson(R"({"fields":{"f":{"type":"int","multi":"set","variants":{"d":"double"}}}})")->withHistory(11, before.get());
+  EXPECT_EQ(10u, same->introduction("f"));
+  auto after = schemaJson(R"({"fields":{"f":{"type":"int","multi":"array","variants":{"d":"double"}}}})")->withHistory(12, same.get());
+  EXPECT_EQ(12u, after->introduction("f"));
+  EXPECT_EQ(12u, after->introduction("f__d"));
 }
 
 TEST_F(SchemaTest, longTermsInheritanceAndWirePresence) {
@@ -1547,7 +1631,8 @@ TEST_F(SchemaTest, variantParentsBorrowOnlyPhysicalSettings) {
 }
 
 TEST_F(SchemaTest, variantOwnershipAndDepthErrors) {
-  for (auto property : {R"("multi":false)", R"("multi":true)", R"("stored":false)",
+  for (auto property : {R"("multi":false)", R"("multi":true)", R"("multi":"set")",
+                        R"("multi":"array")", R"("stored":false)",
                         R"("stored":true)", R"("stored_resource":"cold")", R"("stored_resource":"")",
                         R"("variants":{})", R"("variants":{"nested":"string"})", R"("defaults":{})",
                         R"("defaults":{"value":"self"})"}) {

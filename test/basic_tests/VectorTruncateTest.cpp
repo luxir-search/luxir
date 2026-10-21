@@ -36,7 +36,7 @@ protected:
     SchemaBuilder b;
     auto& f = b.templ(multi ? "_vs" : "_v");
     f.type = api::FieldDef::FieldClass::VECTOR;
-    f.multi = multi;
+    f.multi = (multi) ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
     f.metric = api::VectorMetric::COSINE;
     f.dims = dims;
     f.truncate_dims = truncate;

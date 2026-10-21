@@ -264,10 +264,13 @@ Patterns without `__` never expand variants; `author__*` or `*__s` discovers
 variants that have a column. HTTP row format omits missing fields; HTTP
 column format includes the requested key with `null`.
 
-For a multi-valued field, stored values keep source order and duplicates;
-a string column is a sorted, deduplicated set, and a numeric or date column
-returns each document's values in ascending numeric order with duplicates
-kept. Geo point columns keep source order.
+For a multi-valued field, stored values keep source order and duplicates.
+Numeric and date columns default to set mode: values are returned ascending,
+with duplicates removed. Declare `"multi": "array"` to keep source order and
+duplicates in the column. Numeric fields have no separate stored-source copy.
+Indexed string columns are sorted, deduplicated sets; column-only string
+columns currently keep source order and duplicates. Geo point columns keep
+source order. See [Multi-valued modes](schema.md#field-properties).
 
 ### Multi-valued text and phrases
 

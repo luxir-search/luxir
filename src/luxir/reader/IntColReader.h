@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 
 #include "DocsReader.h"
@@ -115,6 +116,7 @@ private:
   NumColumnFormat::LeafMeta leaves;
   std::optional<MonoReader> endValueRankReader;  // exists if multi-valued.
   int64_t nvals;
+  bool arrayMode = false;
   int32_t docsWithField = 0;
   int64_t columnMin = 0;
   int64_t columnMax = 0;
@@ -136,6 +138,7 @@ public:
   docs(postingsReader, fieldInfo)
   {
     nvals = fieldInfo.numValues;
+    arrayMode = (fieldInfo.flags & FieldType::MULTI_ARRAY) != 0;
     docsWithField = fieldInfo.docsWithField;
     columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
     const char* blocks = columnIS.ptr();
@@ -291,11 +294,25 @@ public:
     return docRank == 0 ? 0 : endValueRankReader->valueAt(docRank - 1);
   }
 
-  /// Value rank of the doc's smallest (last == false) or largest value.
-  /// Numeric columns store each doc's values ascending (GEO_POINT excepted),
-  /// so either edge is one lookup. Only valid if multiValued() is true.
+  bool multiSet() const { return multiValued() && !arrayMode; }
+
+  /// First or last stored value rank. Only valid for multi-valued columns.
   int64_t getEdgeValueRank(int32_t docRank, bool last) {
     return last ? endValueRankReader->valueAt(docRank) - 1 : getStartValueRank(docRank);
+  }
+
+  // Numeric sort selection in encoded order. Set columns read an edge;
+  // arrays scan their source sequence. NaN remains a present encoded value.
+  int64_t selectedValue(int32_t docRank, bool maximum, auto& values) {
+    assert(multiValued());
+    if (multiSet()) return values.valueAt(getEdgeValueRank(docRank, maximum));
+    auto [start, end] = getStartEndValueRank(docRank);
+    int64_t selected = values.valueAt(start);
+    for (int64_t rank = start + 1; rank < end; rank++) {
+      int64_t next = values.valueAt(rank);
+      selected = maximum ? std::max(selected, next) : std::min(selected, next);
+    }
+    return selected;
   }
 
   template <class DocAcceptor>

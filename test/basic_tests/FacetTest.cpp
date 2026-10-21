@@ -59,7 +59,7 @@ void setRangeFacetSchema(CollectionHelper& helper,
     f.type = fs.fieldClass;
     f.index = fs.points ? api::FieldDef::IndexMode::RANGE
                         : api::FieldDef::IndexMode::NONE;
-    f.multi = fs.multi;
+    f.multi = (fs.multi) ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
   }
   b.set(helper.collection());
 }
@@ -3470,26 +3470,34 @@ TEST_F(FacetTest, nestedNumericFacetBindingsRespectResidentBudget) {
 TEST_F(FacetTest, numericFacetDuplicateOccurrencesAndUniqueFeedDomains) {
   SearchOverridesGuard guard(forcedInlineFacetEntryMode);
   CollectionHelper helper;
-  helper.indexAll(std::array{
-      flatdoc("n_is", vec_i(20, 20, 10, 20), "score_i", 10),
-      flatdoc("n_is", vec_i(20), "score_i", 20),
-  }, UpdateMessage::COMMIT);
-  helper.index(flatdoc("n_is", vec_i(20, 10, 20), "score_i", 30), UpdateMessage::COMMIT);
-  for (auto mode : {InlineFacetEntryMode::FORCE_DENSE, InlineFacetEntryMode::FORCE_SPARSE}) {
-    forcedInlineFacetEntryMode = mode;
-    for (int64_t limit : {1, -1}) {
-      auto req = localReq(helper.getSearchEngine());
-      auto& facet = req->collection("main").facet("f", "n_is").limit(limit);
-      facet.sum("total", "score_i").avg("mean", "score_i");
-      req->execute();
-      ASSERT_OK(req);
-      const auto& result = rootFacetResult(*req, "f");
-      ASSERT_FALSE(result.counts.empty());
-      EXPECT_EQ(20, std::get<api::ColInt>(result.bucket_ids->kind).v[0]);
-      EXPECT_EQ(6, result.counts[0]);
-      EXPECT_EQ(60, metricValues(result, "total")[0].asInt());
-      EXPECT_DOUBLE_EQ(20, metricValues(result, "mean")[0].asDouble());
-      EXPECT_EQ(0u, req->memoryTracker.bytes());
+  for (bool array : {false, true}) {
+    helper.clear();
+    SchemaBuilder schema;
+    auto& field = schema.field("n_is");
+    field.type = api::FieldDef::FieldClass::INT;
+    field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+    schema.set(helper.collection());
+    helper.indexAll(std::array{
+        flatdoc("n_is", vec_i(20, 20, 10, 20), "score_i", 10),
+        flatdoc("n_is", vec_i(20), "score_i", 20),
+    }, UpdateMessage::COMMIT);
+    helper.index(flatdoc("n_is", vec_i(20, 10, 20), "score_i", 30), UpdateMessage::COMMIT);
+    for (auto mode : {InlineFacetEntryMode::FORCE_DENSE, InlineFacetEntryMode::FORCE_SPARSE}) {
+      forcedInlineFacetEntryMode = mode;
+      for (int64_t limit : {1, -1}) {
+        auto req = localReq(helper.getSearchEngine());
+        auto& facet = req->collection("main").facet("f", "n_is").limit(limit);
+        facet.sum("total", "score_i").avg("mean", "score_i");
+        req->execute();
+        ASSERT_OK(req);
+        const auto& result = rootFacetResult(*req, "f");
+        ASSERT_FALSE(result.counts.empty());
+        EXPECT_EQ(20, std::get<api::ColInt>(result.bucket_ids->kind).v[0]);
+        EXPECT_EQ(array ? 6 : 3, result.counts[0]); // Arrays still count occurrences here.
+        EXPECT_EQ(60, metricValues(result, "total")[0].asInt());
+        EXPECT_DOUBLE_EQ(20, metricValues(result, "mean")[0].asDouble());
+        EXPECT_EQ(0u, req->memoryTracker.bytes());
+      }
     }
   }
 }
@@ -5318,7 +5326,7 @@ protected:
       def.type = field.name.ends_with("_dt") ? api::FieldDef::FieldClass::DATE
                                              : api::FieldDef::FieldClass::INT;
       def.index = api::FieldDef::IndexMode::RANGE;
-      def.multi = field.multiValued;
+      def.multi = (field.multiValued) ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
     }
     b.set(helper.collection());
     
@@ -6436,7 +6444,7 @@ TEST_F(FacetTest, resetIdentityPostingsPointsAndColumnFallbackAgree) {
       // column fallback when their points index is absent.
       field.index = name.ends_with("_s") ? api::FieldDef::IndexMode::MATCH
           : indexed ? api::FieldDef::IndexMode::RANGE : api::FieldDef::IndexMode::NONE;
-      field.multi = true;
+      field.multi = api::FieldDef::MultiMode::DEFAULT;
     }
     schema.set(helper.collection());
     for (int segment = 0; segment < 3; segment++) {
@@ -7273,6 +7281,9 @@ TEST_F(FacetTest, dataStreamingMatchesLiveDomainOracle) {
             ? helper.index(flatdoc("id", id, "group_i", doc.group, "keep_s", doc.keep ? "yes" : "no", "value", fp), commit)
             : helper.index(flatdoc("id", id, "group_i", doc.group, "keep_s", doc.keep ? "yes" : "no", "value", doc.values), commit);
         ASSERT_TRUE(result.success) << result.error_message;
+        // The default numeric set stores each encoded value only once.
+        std::ranges::sort(doc.values);
+        doc.values.erase(std::unique(doc.values.begin(), doc.values.end()), doc.values.end());
         docs.push_back(std::move(doc));
       }
       if (segments > 1) {

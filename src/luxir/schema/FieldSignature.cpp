@@ -14,7 +14,8 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
     "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point"
   };
   properties["type"] = "\"" + std::string(types[type.type()]) + "\"";
-  properties["multi"] = type.multiValued() ? "true" : "false";
+  properties["multi"] = !type.multiValued() ? "false"
+      : type.multiArray() && !FieldType::arrayOnly(type.type()) ? "\"array\"" : "true";
   properties["index"] = type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";
   properties["column"] = type.hasColumn() ? "true" : "false";
   if (type.type() == FieldType::TEXT || type.type() == FieldType::ID

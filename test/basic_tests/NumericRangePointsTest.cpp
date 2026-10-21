@@ -64,7 +64,7 @@ void setRangeSchema(CollectionHelper& helper, std::span<const RangeField> fields
     auto& f = b.field(fs.name);
     f.type = api::FieldDef::FieldClass::INT;
     f.index = api::FieldDef::IndexMode::RANGE;
-    f.multi = fs.multi;
+    f.multi = (fs.multi) ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
   }
   b.set(helper.collection());
 }
@@ -988,7 +988,7 @@ TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
   auto rebuilt = readPoints(freshReader->segments()[0], "merge_values_is");
   EXPECT_EQ(merged, rebuilt);
   EXPECT_EQ(std::count(merged.begin(), merged.end(),
-                       PointsReader::Point{6, 6}), 2);
+                       PointsReader::Point{6, 6}), 1); // Default set removes the repeated 6.
   EXPECT_EQ(std::count_if(merged.begin(), merged.end(), [](const auto& point) {
               return point.value == 12;
             }), 0);

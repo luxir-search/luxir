@@ -581,7 +581,7 @@ protected:
     hidden.stored = false;
     auto& multi = b.field("authors");
     multi.parent = "author";
-    multi.multi = true;
+    multi.multi = api::FieldDef::MultiMode::DEFAULT;
     auto& edition = b.field("edition");
     edition.type = api::FieldDef::FieldClass::INT;
     b.variant(edition, "label").type = api::FieldDef::FieldClass::STRING;
@@ -802,7 +802,7 @@ TEST_F(DocFormatTest, storedStringPrimaryPreservesSourceWithOnlyColumnBackedOutp
   SchemaBuilder b;
   auto& names = b.field("names_");
   names.type = api::FieldDef::FieldClass::STRING;
-  names.multi = true;
+  names.multi = api::FieldDef::MultiMode::DEFAULT;
   names.stored = true;
   auto& variant = b.variant(names, "s");
   variant.type = api::FieldDef::FieldClass::STRING;

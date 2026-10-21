@@ -1024,7 +1024,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.type"></a>[`type`](#field-luxir.fielddef.type) | 2 | [`FieldDef.FieldClass`](#enum-luxir.fielddef.fieldclass) | optional | required unless inherited from parent |
 | <a id="field-luxir.fielddef.index"></a>[`index`](#field-luxir.fielddef.index) | 3 | [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode) | optional | Unset inherits, falling back to MATCH for STRING/TEXT/ID and NONE for other types. Other type/mode combinations are rejected. |
 | <a id="field-luxir.fielddef.column"></a>[`column`](#field-luxir.fielddef.column) | 4 | `bool` | optional | store values in a per-field column |
-| <a id="field-luxir.fielddef.multi"></a>[`multi`](#field-luxir.fielddef.multi) | 5 | `bool` | optional | multi-valued |
+| <a id="field-luxir.fielddef.multi"></a>[`multi`](#field-luxir.fielddef.multi) | 5 | [`FieldDef.MultiMode`](#enum-luxir.fielddef.multimode) | optional | unset inherits, falling back to SINGLE |
 | <a id="field-luxir.fielddef.analyzer"></a>[`analyzer`](#field-luxir.fielddef.analyzer) | 6 | [`AnalyzerDef`](#message-luxir.analyzerdef) | singular | TEXT only. Unset or empty inherits; a nonempty definition replaces the entire analyzer. Without an inherited analyzer, defaults to whitespace. |
 | <a id="field-luxir.fielddef.stored"></a>[`stored`](#field-luxir.fielddef.stored) | 7 | `bool` | optional | Keep canonical source text before analysis/normalization for TEXT/STRING/ID retrieval. Defaults to true for TEXT, false otherwise; unused on other types. |
 | <a id="field-luxir.fielddef.stored_resource"></a>[`stored_resource`](#field-luxir.fielddef.stored_resource) | 8 | `string` | optional | Stored-field group for stored TEXT/STRING/ID values, e.g. "\_stored\_body\_", declared in SchemaDef.stored\_resources. Empty or unset inherits the parent's group, falling back to "\_stored\_". |
@@ -2565,6 +2565,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`FieldDef.FieldClass`](#enum-luxir.fielddef.fieldclass)
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
+- [`FieldDef.MultiMode`](#enum-luxir.fielddef.multimode)
 - [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit)
 - [`GroupComponent.Type`](#enum-luxir.groupcomponent.type)
 - [`LinearFusion.Normalization`](#enum-luxir.linearfusion.normalization)
@@ -2686,6 +2687,21 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 | <a id="value-luxir.fielddef.longterms.truncate"></a>[`TRUNCATE`](#value-luxir.fielddef.longterms.truncate) | 0 | keep a UTF-8-safe prefix of at most 255 bytes; values may merge |
 | <a id="value-luxir.fielddef.longterms.reject"></a>[`REJECT`](#value-luxir.fielddef.longterms.reject) | 1 | reject overlong terms |
 | <a id="value-luxir.fielddef.longterms.hash128"></a>[`HASH128`](#value-luxir.fielddef.longterms.hash128) | 2 | prefix of at most 230 bytes plus 25 base36 hash digits |
+
+<a id="enum-luxir.fielddef.multimode"></a>
+
+### luxir.FieldDef.MultiMode
+
+SINGLE is one value; DEFAULT enables the type's default multi mode. SET sorts and deduplicates per document; ARRAY keeps source order and repeats. DEFAULT resolves per representation: INT/FLOAT/DOUBLE/DATE/STRING/ID use SET, TEXT/VECTOR/GEO\_POINT use ARRAY. Explicit SET is rejected on an array-only primary and resolves to ARRAY on an array-only variant. Explicit ARRAY applies to every representation; indexed STRING/ID ARRAY is not yet supported. Variants inherit the declared mode and cannot override it. Schema JSON views echo the declaration. HTTP JSON accepts false, true (DEFAULT), "set", or "array".
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.fielddef.multimode.single"></a>[`SINGLE`](#value-luxir.fielddef.multimode.single) | 0 |  |
+| <a id="value-luxir.fielddef.multimode.default"></a>[`DEFAULT`](#value-luxir.fielddef.multimode.default) | 1 |  |
+| <a id="value-luxir.fielddef.multimode.set"></a>[`SET`](#value-luxir.fielddef.multimode.set) | 2 |  |
+| <a id="value-luxir.fielddef.multimode.array"></a>[`ARRAY`](#value-luxir.fielddef.multimode.array) | 3 |  |
 
 <a id="enum-luxir.fieldfacet.countunit"></a>
 

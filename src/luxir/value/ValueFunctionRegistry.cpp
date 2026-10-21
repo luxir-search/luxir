@@ -524,8 +524,9 @@ ValueResult evalFunctionPoint(BoundValueProgram& program, const ValueNode& node,
     if (reducer) {
       if (!first.valid || first.array.size == 0) return ValueResult::missing(node.type);
       if (node.opcode != ValueOpcode::AVG
-          && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN) {
-        // A column array holds the doc's values ascending, so min is the
+          && program.program.nodes[first.array.node].kind == ValueNodeKind::COLUMN
+          && program.nodes[first.array.node].column->multiSet()) {
+        // A set column holds the doc's values ascending, so min is the
         // first present element and max the last (a NaN reads as missing).
         bool fromEnd = node.opcode == ValueOpcode::MAX;
         for (int64_t i = 0; i < first.array.size; i++) {

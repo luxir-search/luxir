@@ -47,7 +47,7 @@ void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
           IntColReader::Iterator iter(column);
           if (iter.advance(doc.docId()) != doc.docId()) break;
           int64_t raw = column.multiValued()
-              ? iter.values().valueAt(column.getEdgeValueRank(iter.rank(), field.isReversed()))
+              ? column.selectedValue(iter.rank(), field.isReversed(), iter.values())
               : iter.value();
           if (type == FieldType::FLOAT) value.kind = sortableInt32ToFloat((int32_t)raw);
           else if (type == FieldType::DOUBLE) value.kind = sortableInt64ToDouble(raw);

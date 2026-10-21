@@ -692,6 +692,47 @@ struct to<JSON, luxir::api::NormalizerDef> {
   }
 };
 
+// FieldDef.multi uses booleans for single/default and strings for explicit modes.
+template <>
+struct from<JSON, luxir::api::FieldDef::MultiMode> {
+  template <auto Opts>
+  static void op(luxir::api::FieldDef::MultiMode& value,
+                 hpp_proto::concepts::is_non_owning_context auto& ctx, auto& it, auto& end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) return;
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    using Mode = luxir::api::FieldDef::MultiMode;
+    if (*it == 't' || *it == 'f') {
+      bool enabled = false;
+      util::from_json<O>(enabled, ctx, it, end);
+      if (ctx.error == error_code::none) value = enabled ? Mode::DEFAULT : Mode::SINGLE;
+    } else if (*it == '"') {
+      std::string_view mode;
+      util::from_json<O>(mode, ctx, it, end);
+      if (ctx.error != error_code::none) return;
+      if (mode == "set") value = Mode::SET;
+      else if (mode == "array") value = Mode::ARRAY;
+      else ctx.error = error_code::syntax_error;
+    } else {
+      ctx.error = error_code::syntax_error;
+    }
+  }
+};
+template <>
+struct to<JSON, luxir::api::FieldDef::MultiMode> {
+  template <auto Opts, class... Args>
+  static void op(luxir::api::FieldDef::MultiMode value, Args&&... args) noexcept {
+    using Mode = luxir::api::FieldDef::MultiMode;
+    if (value == Mode::SINGLE || value == Mode::DEFAULT) {
+      serialize<JSON>::template op<Opts>(value == Mode::DEFAULT, std::forward<Args>(args)...);
+    } else {
+      serialize<JSON>::template op<Opts>(std::string_view(value == Mode::SET ? "set" : "array"),
+                                         std::forward<Args>(args)...);
+    }
+  }
+};
+
 // ----- FieldDef: canonical object, or a bare string (type-only sugar) -----
 template <>
 struct from<JSON, luxir::api::FieldDef> {
@@ -725,7 +766,9 @@ struct from<JSON, luxir::api::FieldDef> {
           } else if (key == "column") {
             util::from_json<V>(value.column, ctx, vit, vend);
           } else if (key == "multi") {
-            util::from_json<V>(value.multi, ctx, vit, vend);
+            // The generic enum utility treats every non-string as an integer.
+            from<JSON, luxir::api::FieldDef::MultiMode>::template op<V>(
+                value.multi.emplace(), ctx, vit, vend);
           } else if (key == "analyzer") {
             util::from_json<V>(value.analyzer, ctx, vit, vend);
           } else if (key == "variants") {

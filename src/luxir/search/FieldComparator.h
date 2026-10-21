@@ -472,8 +472,7 @@ class SimpleNumericFieldComparator : public FieldComparator,
         keys[i] = missingValueSubstitute;
         continue;
       }
-      int64_t valueRank = reader->getEdgeValueRank(rank, sortMultiplier < 0);
-      keys[i] = transformPresent(pointValues->valueAt(valueRank));
+      keys[i] = transformPresent(reader->selectedValue(rank, sortMultiplier < 0, *pointValues));
     }
   }
 
@@ -673,11 +672,9 @@ public:
       if (iter->docId() > docid) return missingValueSubstitute;
       rank = iter->rank();
     }
-    // Multi-valued numeric columns store each doc's values ascending, so a
-    // multi-valued doc sorts by its min ascending and its max descending (the
-    // string comparators' edge semantics) with one value read.
+    // Min ascending, max descending: sets read an edge, arrays scan.
     int64_t value = multiValued
-        ? iter->values().valueAt(reader->getEdgeValueRank(rank, sortMultiplier < 0))
+        ? reader->selectedValue(rank, sortMultiplier < 0, iter->values())
         : iter->values().valueAt(rank);
     // For descending sort, negate the value.
     // if we wanted to make this branchless, we could have a an adder and multiplier

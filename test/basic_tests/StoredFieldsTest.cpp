@@ -1838,7 +1838,7 @@ TEST_F(StoredFieldsSearchTest, storedStringField) {
     f2.type = luxir::api::FieldDef::FieldClass::STRING;
     f2.index = IndexMode::MATCH;
     f2.column = false;
-    f2.multi = true;
+    f2.multi = api::FieldDef::MultiMode::DEFAULT;
     f2.stored = true;
     schema = b.build(schema.get());
   }

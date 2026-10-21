@@ -269,7 +269,7 @@ publication advances the schema generation.
 | `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
-| `multi` | multi-valued |
+| `multi` | `false` for one value; `true` for the type's default multi mode, `"set"` for sorted unique values, or `"array"` for source order and duplicates |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_`; see [Stored resources](#stored-resources) |
 | `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`; see [Text analysis](#text-analysis) |
@@ -280,6 +280,26 @@ publication advances the schema generation.
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 | `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
+
+`multi` is inherited when omitted and defaults to `false`. INT, FLOAT,
+DOUBLE, DATE, STRING, and ID default to set mode. TEXT, VECTOR, and GEO_POINT
+support array mode only; declaring `"set"` on one of these primary types is
+an error. The built-in `id` field remains single-valued.
+
+Each representation resolves the logical field's declaration against its own
+type. With `true`, a TEXT primary uses array mode and its STRING variant uses
+set mode. With `"set"`, numeric and STRING representations use sets while
+an array-only variant such as TEXT uses an array. Explicit `"array"` applies
+to every representation. Indexed STRING/ID array mode is not yet supported
+and is rejected. Column-only STRING storage currently keeps source order and
+duplicates in either mode; its set storage implementation is pending.
+
+The authored schema view echoes the declaration (`true`, `false`, `"set"`,
+or `"array"`), preserving inheritance through templates that change type.
+The resolved view reports the effective mode: `true` for the representation's
+default, `"array"` for an array on a set-capable type, and `false` for a
+single-valued representation. Changing the effective mode starts a new
+introduction generation, like other physical representation changes.
 
 For PQ, positive `ann.pq.m` requires positive effective (inherited) `dims`
 and must divide the stored dimension: `truncate_dims` when set, else `dims`.

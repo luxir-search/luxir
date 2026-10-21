@@ -38,7 +38,7 @@ public:
   // being able to fit in short-string optimization.
 
   static constexpr std::string_view PREFIX_FNAME = "s";         // prefix for all data files
-  static constexpr std::string_view LUXIR_HEADER = "LUXIR007";  // every data file starts with this header; the digits version the format
+  static constexpr std::string_view LUXIR_HEADER = "LUXIR008";  // every data file starts with this header; the digits version the format
 
   // Reserved field name under which the default stored-fields resource is
   // registered in a segment's per-field index.  Named column families live

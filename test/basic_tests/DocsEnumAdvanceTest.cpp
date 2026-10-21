@@ -2016,7 +2016,7 @@ TEST_F(DocsEnumAdvanceTest, wrongSegmentMagicIsRejected) {
   ASSERT_NE(input, nullptr);
   std::string bytes(input->read());
   ASSERT_GE(bytes.size(), Postings::LUXIR_HEADER.size());
-  memcpy(bytes.data(), "LUXIR000", Postings::LUXIR_HEADER.size());
+  memcpy(bytes.data(), "LUXIR007", Postings::LUXIR_HEADER.size());
 
   ASSERT_TRUE(dir.deleteFile(segName));
   auto outFile = dir.createFile(segName);

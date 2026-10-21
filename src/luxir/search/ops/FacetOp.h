@@ -945,29 +945,30 @@ public:
           int64_t keyBase = thisOp().useVector ? thisOp().globalMin : 0;
           thisOp().withIntColumn(domain, segnum, data.missing_num,
               [&](IntColReader& column, int32_t maxDoc) {
-                if (!column.multiValued()) {
+                if (!column.multiValued() || column.multiSet()) {
                   forEachIntColValue(domain, column, maxDoc, data.missing_num,
                       [&](int32_t docid, int64_t value) LUXIR_INLINE {
                         data.counts.add(value - keyBase, docid);
                       });
                 } else {
-                  // Each doc's values are stored ascending, so repeats are
-                  // adjacent. Only the first occurrence feeds the metrics.
+                  // Arrays retain source order and repeats. Count occurrences
+                  // for now, but feed metrics only once per doc and bucket.
+                  boost::unordered_flat_map<int64_t, char*> seen;
                   int32_t lastDoc = -1;
-                  int64_t lastKey = 0;
-                  char* lastEntry = nullptr;
                   forEachIntColValue(domain, column, maxDoc, data.missing_num,
                       [&](int32_t docid, int64_t value) LUXIR_INLINE {
-                        int64_t key = value - keyBase;
-                        if (docid == lastDoc && key == lastKey) {
-                          data.counts.addOccurrence(lastEntry);
-                          return;
+                        if (docid != lastDoc) {
+                          seen.clear();
+                          lastDoc = docid;
                         }
-                        assert(docid != lastDoc || key > lastKey);
-                        lastDoc = docid;
-                        lastKey = key;
-                        lastEntry = data.counts.resolveEntry(key);
-                        data.counts.touchEntry(lastEntry, docid);
+                        int64_t key = value - keyBase;
+                        auto [it, first] = seen.try_emplace(key, nullptr);
+                        if (first) {
+                          it->second = data.counts.resolveEntry(key);
+                          data.counts.touchEntry(it->second, docid);
+                        } else {
+                          data.counts.addOccurrence(it->second);
+                        }
                       });
                 }
               });
