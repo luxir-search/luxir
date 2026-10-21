@@ -35,7 +35,7 @@ struct ColdFile {
     fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
     std::vector<char> bytes(size, 'x');
     EXPECT_EQ((ssize_t)size, ::write(fd, bytes.data(), size));
-    fdatasync(fd);
+    fsync(fd);
     file = MMapInputFile::map(fd, path);
     drop();
   }
