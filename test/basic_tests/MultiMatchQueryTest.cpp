@@ -88,8 +88,10 @@ public:
     return hits && hits->contains(id) ? hits->at(id) : 0.0f;
   }
 
-  Query* parse(const api::Query& query) {
-    ParseContext context{parsePool, *helper.collection().getSchema(), protoArena, CoerceContext{}, ""};
+  Query* parse(const api::Query& query, IndexReader* reader = nullptr) {
+    auto schema = reader ? reader->schema() : helper.collection().getSchema();
+    ParseContext context{parsePool, *schema, protoArena, CoerceContext{}, ""};
+    context.reader = reader;
     return ProtobufQueryParser(context).parse(query);
   }
 
@@ -631,13 +633,125 @@ TEST_F(MultiMatchQueryTest, wildcardFields) {
   ASSERT_TRUE(combined && combinedListed);
   EXPECT_EQ(*combinedListed, *combined);
 
-  // a pattern keeps TEXT and STRING fields and may select nothing
+  // a pattern keeps indexed TEXT/STRING/ID search targets and may select nothing
   auto broad = run(multiMatch("Dune", {{"*", {}}}, Mode::PER_FIELD));
   ASSERT_TRUE(broad);
   EXPECT_TRUE(broad->contains("d1"));
   auto none = run(multiMatch("dune", {{"nothing_*", {}}}, Mode::PER_FIELD));
   ASSERT_TRUE(none);
   EXPECT_TRUE(none->empty());
+}
+
+TEST_F(MultiMatchQueryTest, wildcardRootsVariantsAndBindings) {
+  SchemaBuilder schema;
+  auto& author = schema.field("author");
+  author.type = api::FieldDef::FieldClass::STRING;
+  author.index = api::FieldDef::IndexMode::NONE;
+  schema.variant(author, "words").parent = "_un";
+  schema.variant(author, "exact").parent = "_s";
+  author.defaults.emplace().search = "words";
+  auto& dynamic = schema.templ("_entry");
+  dynamic.parent = "_un";
+  dynamic.stored = false;
+  schema.variant(dynamic, "exact").parent = "_s";
+  dynamic.defaults.emplace().value = "exact";
+  schema.field("declared").parent = "_un";
+  auto& columnOnly = schema.field("column_only");
+  columnOnly.parent = "author";
+  columnOnly.defaults.emplace().search = "self";
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "d4", "author", "Dune Messiah", "note_entry", "Dune Messiah"),
+                           UpdateMessage::COMMIT).success);
+  schema.variant(dynamic, "later").parent = "_s";
+  schema.set(helper.collection());
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
+  auto catalog = reader->searchableFields();
+  EXPECT_EQ(catalog.data(), reader->searchableFields().data());
+  EXPECT_FALSE(reader->field("note_entry__later").exists());
+  for (auto name : {"author", "author__exact", "author__words", "declared", "id",
+                    "note_entry", "note_entry__exact", "note_entry__later"}) {
+    EXPECT_NE(catalog.end(), std::ranges::find(catalog, std::string_view(name))) << name;
+  }
+  for (auto name : {"_un", "_version_", "author__self", "column_only", "missing_entry"}) {
+    EXPECT_EQ(catalog.end(), std::ranges::find(catalog, std::string_view(name))) << name;
+  }
+  auto retrievable = reader->retrievableFields();
+  EXPECT_EQ(retrievable.end(), std::ranges::find(retrievable, std::string_view("note_entry"),
+                                                &IndexReader::RetrievableField::name));
+  for (auto mode : {Mode::COMBINED, Mode::PER_FIELD}) {
+    auto wildcard = multiMatch("Dune Messiah", {{"author*", 2.0f}, {"author__words", 3.0f}}, mode);
+    auto explicitField = multiMatch("Dune Messiah", {{"author__words", 3.0f}}, mode);
+    EXPECT_TRUE(parse(wildcard, reader.get())->equals(*parse(explicitField, reader.get())));
+    EXPECT_EQ(run(explicitField), run(wildcard));
+    auto variants = multiMatch("Dune Messiah", {{"author__*", {}}}, mode);
+    auto listed = multiMatch("Dune Messiah", {{"author__exact", {}}, {"author__words", {}}}, mode);
+    EXPECT_TRUE(parse(variants, reader.get())->equals(*parse(listed, reader.get())));
+    EXPECT_EQ(run(listed), run(variants));
+    EXPECT_TRUE(parse(multiMatch("Dune Messiah", {{"note_*", {}}}, mode), reader.get())->equals(
+        *parse(multiMatch("Dune Messiah", {{"note_entry", {}}}, mode), reader.get())));
+  }
+  auto id = run(multiMatch("d1", {{"i*", {}}}, Mode::COMBINED));
+  ASSERT_TRUE(id);
+  EXPECT_TRUE(id->contains("d1"));
+  auto* absent = dynamic_cast<TermQuery*>(parse(
+      multiMatch("dune", {{"decl*", {}}}, Mode::PER_FIELD), reader.get()));
+  ASSERT_NE(nullptr, absent);
+  EXPECT_EQ("declared", absent->getField());
+  // Direct builders without a reader still expand concrete schema declarations.
+  EXPECT_TRUE(absent->equals(*parse(multiMatch("dune", {{"decl*", {}}}, Mode::PER_FIELD))));
+}
+
+TEST_F(MultiMatchQueryTest, wildcardCatalogFollowsReaderAndSchema) {
+  SchemaBuilder schema;
+  auto& choice = schema.field("choice");
+  choice.type = api::FieldDef::FieldClass::INT;
+  schema.variant(choice, "words").parent = "_un";
+  choice.defaults.emplace().search = "words";
+  schema.set(helper.collection());
+  auto before = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
+  auto original = before->searchableFields();
+  ASSERT_NE(original.end(), std::ranges::find(original, std::string_view("choice")));
+  choice.defaults->search = "self";
+  schema.set(helper.collection());
+  auto after = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
+  EXPECT_EQ(before->coreGen(), after->coreGen());
+  auto current = after->searchableFields();
+  EXPECT_NE(original.data(), current.data());
+  EXPECT_EQ(current.data(), after->searchableFields().data());
+  EXPECT_EQ(current.end(), std::ranges::find(current, std::string_view("choice")));
+  EXPECT_NE(current.end(), std::ranges::find(current, std::string_view("choice__words")));
+  ASSERT_TRUE(helper.index(flatdoc("id", "new", "fresh_un", "dune"), UpdateMessage::COMMIT).success);
+  auto fresh = helper.getIndexWriter()->snapshots.readers.getReader();
+  EXPECT_NE(fresh->searchableFields().end(),
+            std::ranges::find(fresh->searchableFields(), std::string_view("fresh_un")));
+  EXPECT_EQ(current.end(), std::ranges::find(current, std::string_view("fresh_un")));
+  EXPECT_NE(original.end(), std::ranges::find(original, std::string_view("choice")));
+}
+
+TEST_F(MultiMatchQueryTest, wildcardFieldLimitCountsPhysicalTargets) {
+  SchemaBuilder schema;
+  for (size_t i = 0; i < QueryBuilder::MAX_PATTERN_FIELDS; i++) {
+    schema.field("many" + std::to_string(i)).parent = "_un";
+  }
+  schema.set(helper.collection());
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
+  auto query = multiMatch("dune", {{"many*", {}}, {"many*", 2.0f}, {"many0__self", 3.0f}}, Mode::PER_FIELD);
+  EXPECT_NO_THROW(parse(query, reader.get()));
+  auto hits = run(query);
+  ASSERT_TRUE(hits);
+  EXPECT_TRUE(hits->empty());
+  schema.field("many_extra").parent = "_un";
+  schema.set(helper.collection());
+  reader = helper.getIndexWriter()->snapshots.readers.getReader(UINT64_MAX);
+  std::string error;
+  EXPECT_FALSE(run(query, false, &error));
+  EXPECT_NE(std::string::npos, error.find("limit of 64 physical targets")) << error;
+  HttpServer server(*LuxirTest::luxirNode, 1, 0);
+  server.start();
+  auto response = httpRequest(server.getPort(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"multi_match":{"text":"dune","fields":["many*"]}}})");
+  EXPECT_EQ(400, response.result_int()) << response.body();
+  server.shutdown();
 }
 
 TEST_F(MultiMatchQueryTest, groupScoresUseTie) {

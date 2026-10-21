@@ -471,8 +471,18 @@ Writes use the canonical object form shown above. Field names resolve through
 their `search` binding, like `match`. Duplicate physical targets keep the
 larger weight in both modes; field order does not affect the query.
 
-Field names containing `*` expand against schema and reader field names,
-keeping TEXT and STRING fields. A pattern matching nothing adds no field.
+Field names containing `*` expand from a cached catalog of indexed TEXT,
+STRING, and ID search targets. Concrete schema declarations are included even
+when absent from the index. Dynamic roots are discovered from reader metadata;
+their schema-defined variants are included even when a variant is absent.
+Patterns without `__` select roots through their search bindings; patterns
+containing `__` select variants. Templates do not invent unknown dynamic roots,
+and patterns exclude engine names and the `__self` alias. A pattern matching
+nothing adds no field.
+
+A list containing a wildcard may resolve to at most `64` distinct physical
+targets, including explicit selectors. Overlapping patterns and aliases count
+once, keeping the larger weight. Exceeding this limit fails the request.
 
 In `combined` mode, TEXT fields sharing the same compiled analyzer and
 long-term policy form a group. Other fields form singleton groups whose
@@ -592,5 +602,7 @@ in their own guides:
 - `except_ops` routing is not accepted on Fusion filters or Fusion source
   filters, and `domain` overrides are not supported directly in `Fusion.ops`
   or beneath facet buckets.
+- `multi_match` lists containing wildcards are limited to `64` distinct
+  physical targets after resolving bindings; exceeding the limit is an error.
 - Fuzzy expansion truncation (the `64` clause budget and any lower operator
   limit) is not reported in the response.

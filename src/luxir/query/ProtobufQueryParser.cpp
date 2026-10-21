@@ -514,54 +514,6 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
 
 namespace {
 
-// '*' matches any run of characters, as in Elasticsearch field patterns.
-bool globMatch(std::string_view pattern, std::string_view name) {
-  size_t p = 0, n = 0, star = std::string_view::npos, resume = 0;
-  while (n < name.size()) {
-    if (p < pattern.size() && pattern[p] == '*') {
-      star = p++;
-      resume = n;
-    } else if (p < pattern.size() && pattern[p] == name[n]) {
-      p++;
-      n++;
-    } else if (star != std::string_view::npos) {
-      p = star + 1;
-      n = ++resume;
-    } else {
-      return false;
-    }
-  }
-  while (p < pattern.size() && pattern[p] == '*') p++;
-  return p == pattern.size();
-}
-
-// Field names a wildcard can select: the schema's concrete fields and the
-// reader's indexed fields, without engine names ('_' prefix) and variant
-// representations ("__" separator), sorted and unique.
-std::vector<std::string> wildcardCandidates(const Schema& schema, IndexReader* reader) {
-  std::vector<std::string> names;
-  auto keep = [](std::string_view name) {
-    return !name.empty() && name[0] != '_' && name.find("__") == std::string_view::npos;
-  };
-  for (const auto& entry : schema.fieldTypeMap) {
-    if (keep(entry.first)) names.push_back(entry.first);
-  }
-  if (reader != nullptr) {
-    for (auto& segment : reader->segments()) {
-      auto& postings = segment.postingsReader();
-      for (int32_t ord = 0; ord < postings.numFields(); ord++) {
-        const auto* info = postings.fieldInfo(ord);
-        if (info == nullptr || info->nTerms == 0) continue;
-        std::string_view name = (std::string_view)info->fieldname;
-        if (keep(name)) names.emplace_back(name);
-      }
-    }
-  }
-  std::sort(names.begin(), names.end());
-  names.erase(std::unique(names.begin(), names.end()), names.end());
-  return names;
-}
-
 QueryBuilder::Operator builderOperator(luxir::api::Match_::Operator op) {
   return op == luxir::api::Match_::Operator::AND ? QueryBuilder::Operator::AND
                                                   : QueryBuilder::Operator::OR;
@@ -599,7 +551,6 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
     throw std::runtime_error("multi_match requires a non-empty 'fields' list");
   }
   std::vector<QueryBuilder::WeightedField> fields;
-  std::optional<std::vector<std::string>> candidates;
   for (const auto& field : query.fields) {
     float weight = field.weight.value_or(1.0f);
     if (field.field.empty()) {
@@ -610,27 +561,10 @@ luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQ
           "multi_match: weight of field '{}' must be finite and > 0 (got {})",
           field.field, weight));
     }
-    if (field.field.find('*') == std::string_view::npos) {
-      fields.push_back({field.field, weight});
-      continue;
-    }
-    if (!candidates) candidates = wildcardCandidates(schema, context.reader);
-    for (const auto& name : *candidates) {
-      if (!globMatch(field.field, name)) continue;
-      FieldType::Type type;
-      try {
-        type = context.fields.resolve(name, OpClass::SEARCH).fieldType->type();
-      } catch (const std::exception&) {
-        continue;  // no search binding
-      }
-      if (type != FieldType::TEXT && type != FieldType::STRING) continue;
-      char* copy = pool.alloc(name.size());
-      memcpy(copy, name.data(), name.size());
-      fields.push_back({std::string_view(copy, name.size()), weight});
-    }
+    fields.push_back({field.field, weight});
   }
   QueryBuilder builder(
-      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
+      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields, context.reader);
   auto op = builderOperator(query.operator_);
   switch (query.mode) {
     case Mode::COMBINED:

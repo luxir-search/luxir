@@ -32,6 +32,8 @@
 #include "luxir/query/ValueSequence.h"
 #include "luxir/query/FieldResolver.h"
 #include "luxir/schema/ValCoerce.h"
+#include "luxir/schema/FieldPattern.h"
+#include "luxir/search/IndexReader.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/NumericUtils.h"
@@ -114,6 +116,8 @@ public:
 // returned query tree.
 class QueryBuilder {
   MemPool& pool;
+  Schema& schema;
+  IndexReader* reader;
   FieldResolver localFields;
   FieldResolver& fields;
   CoerceContext coerceContext;
@@ -378,8 +382,9 @@ public:
 
   QueryBuilder(MemPool& pool, Schema& schema, const CoerceContext& coerceContext,
                std::string_view opName = {},
-               std::vector<api::Warning>* warnings = nullptr, FieldResolver* fields = nullptr)
-    : pool(pool), localFields(schema), fields(fields ? *fields : localFields),
+               std::vector<api::Warning>* warnings = nullptr, FieldResolver* fields = nullptr,
+               IndexReader* reader = nullptr)
+    : pool(pool), schema(schema), reader(reader), localFields(schema), fields(fields ? *fields : localFields),
       coerceContext(coerceContext), opName(opName),
       warnings(warnings) {}
 
@@ -850,6 +855,9 @@ public:
     float weight = 1.0f;
   };
 
+  // Wildcard lists include explicit selectors in this physical-target budget.
+  static constexpr size_t MAX_PATTERN_FIELDS = 64;
+
 private:
   struct ResolvedWeightedField {
     const ResolvedFieldHandle* target;
@@ -877,26 +885,53 @@ private:
     return createMatchQuery(target, text, op, minMatch, weight);
   }
 
-  // Normalize before analysis or clause construction. Search aliases can name
-  // the same physical field; the largest weight wins in either mode.
+  // Expand selectors, resolve search bindings, and keep the largest weight
+  // per physical target. Sort before analysis so request order never matters.
   std::span<ResolvedWeightedField> resolveWeightedFields(std::span<const WeightedField> requested) {
-    auto resolved = pool.make_span<ResolvedWeightedField>(requested.size());
-    for (size_t i = 0; i < requested.size(); i++) {
-      resolved[i] = {&fields.resolve(requested[i].field, OpClass::SEARCH, opName),
-                     requested[i].weight};
+    bool patterns = std::ranges::any_of(requested, [](const auto& field) {
+      return field.field.find('*') != std::string_view::npos;
+    });
+    std::vector<ResolvedWeightedField> resolved;
+    boost::unordered_flat_map<std::string_view, size_t, PackedTermHash, PackedTermEqual> seen;
+    auto add = [&](std::string_view name, float weight) {
+      const auto& target = fields.resolve(name, OpClass::SEARCH, opName);
+      auto [entry, inserted] = seen.try_emplace(target.physicalName, resolved.size());
+      if (inserted) {
+        if (patterns && resolved.size() == MAX_PATTERN_FIELDS) {
+          throw std::runtime_error(std::format(
+              "multi_match wildcard fields exceed the limit of {} physical targets", MAX_PATTERN_FIELDS));
+        }
+        resolved.push_back({&target, weight});
+      } else {
+        auto& previous = resolved[entry->second];
+        previous.weight = std::max(previous.weight, weight);
+      }
+    };
+    std::vector<std::string> schemaNames;
+    std::span<const std::string> catalog;
+    if (patterns) {
+      if (reader) {
+        assert(reader->schema().get() == &schema);
+        catalog = reader->searchableFields();
+      } else {
+        schemaNames = schema.searchableFields();
+        catalog = schemaNames;
+      }
+    }
+    for (const auto& field : requested) {
+      if (field.field.find('*') == std::string_view::npos) {
+        add(field.field, field.weight);
+      } else {
+        forEachFieldPattern(catalog, field.field,
+            [](const auto& name) { return std::string_view(name); },
+            [](const auto& name) { return name.find("__") != std::string_view::npos; },
+            [&](const auto& name) { add(name, field.weight); });
+      }
     }
     std::sort(resolved.begin(), resolved.end(), [](const auto& a, const auto& b) {
       return a.target->physicalName < b.target->physicalName;
     });
-    size_t count = 0;
-    for (const auto& field : resolved) {
-      if (count > 0 && resolved[count - 1].target->physicalName == field.target->physicalName) {
-        resolved[count - 1].weight = std::max(resolved[count - 1].weight, field.weight);
-      } else {
-        resolved[count++] = field;
-      }
-    }
-    return resolved.first(count);
+    return pool.copy_span(std::span(resolved));
   }
 
 public:

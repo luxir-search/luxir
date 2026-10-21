@@ -45,7 +45,7 @@
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/util/Signal.h"
-#include "luxir/util/screaming.h"
+#include "luxir/schema/FieldPattern.h"
 #include "luxir/util/luxir_util.h"
 #include "luxir/util/thread.h"
 
@@ -1310,29 +1310,6 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
   return true;
 }
 
-// Returned-fields selector match: '*' matches any (possibly empty) run of
-// bytes, every other byte is literal.  Iterative single-star backtracking.
-inline bool globMatch(std::string_view pattern, std::string_view name) {
-  size_t p = 0, n = 0;
-  size_t starP = std::string_view::npos, starN = 0;
-  while (n < name.size()) {
-    if (p < pattern.size() && pattern[p] == '*') {
-      starP = p++;
-      starN = n;
-    } else if (p < pattern.size() && pattern[p] == name[n]) {
-      p++;
-      n++;
-    } else if (starP != std::string_view::npos) {
-      p = starP + 1;
-      n = ++starN;
-    } else {
-      return false;
-    }
-  }
-  while (p < pattern.size() && pattern[p] == '*') p++;
-  return p == pattern.size();
-}
-
 // Resolve the request's returned-field selectors.  An empty list projects the
 // default set: every logical root in the reader's retrievable catalog, "id"
 // first, the rest in name order.  A selector containing '*' is a pattern: it
@@ -1408,18 +1385,10 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
         pushExplicit(f);
         continue;
       }
-      bool derived = f.find("__") != std::string_view::npos;
-      // The catalog is sorted: gallop to the pattern's literal prefix and
-      // stop as soon as the prefix no longer holds.
-      std::string_view prefix = f.substr(0, f.find('*'));
-      int64_t start = screaming::gallopLowerBound(0, (int64_t)catalog.size(), prefix,
-          [&](int64_t i) { return catalog[i].name; });
-      for (size_t i = (size_t)start; i < catalog.size() && catalog[i].name.starts_with(prefix); ++i) {
-        const auto& field = catalog[i];
-        if (field.derived == derived && globMatch(f, field.name) && taken.insert(field.name).second) {
-          pushDiscovered(field);
-        }
-      }
+      forEachFieldPattern(catalog, f, [](const auto& field) { return field.name; },
+          [](const auto& field) { return field.derived; }, [&](const auto& field) {
+            if (taken.insert(field.name).second) pushDiscovered(field);
+          });
     }
   }
   if (picked.empty()) return {};

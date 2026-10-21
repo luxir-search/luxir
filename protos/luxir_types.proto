@@ -427,7 +427,12 @@ message MultiMatchQuery {
   string text = 1; // the text to analyze
   // Required and non-empty. Fields resolve through their search bindings.
   // Duplicate physical fields keep the larger weight. Names containing '*'
-  // expand over schema and reader fields, keeping TEXT and STRING fields.
+  // select indexed TEXT/STRING/ID search targets from concrete declarations
+  // and dynamic roots present in reader metadata. Patterns containing '__'
+  // select variants; other patterns select roots through their search binding.
+  // Declared fields and variants of known roots need not be present in the
+  // index. Wildcard lists may resolve to at most 64 distinct physical targets,
+  // including explicit selectors; exceeding the limit is an error.
   repeated WeightedField fields = 2;
   // Unset = COMBINED.
   Mode mode = 3;

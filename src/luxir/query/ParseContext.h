@@ -27,8 +27,8 @@ class IndexReader;
 // query-string design; the limits-config snapshot joins it later.
 struct ParseContext {
   const CollapsePlan* collapse = nullptr;
-  // The searched reader, when there is one: wildcard field lists match its
-  // indexed field names as well as the schema's.
+  // The searched reader, when there is one: wildcard field lists reuse its
+  // schema-specific search catalog.
   IndexReader* reader = nullptr;
   MemPool& pool;
   Schema& schema;
