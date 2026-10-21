@@ -384,7 +384,7 @@ optional. Existing analyzers without `char_filters` retain their behavior.
         "char_filters": [
           "html_strip",
           "nfkc_cf",
-          {"name": "remove_chars", "params": {"chars": ["-", "\u2014"]}}
+          {"name": "mapping", "params": {"mappings": ["- =>", "\\u2014 =>"]}}
         ],
         "tokenizer": "unicode_word",
         "filters": ["fold", "kstem"]
@@ -403,15 +403,30 @@ hyphen in the tokenizer's input. Removing `-` from `foo-bar` produces one
 | Character filter | Behavior |
 |---|---|
 | `nfkc_cf` | Existing Unicode NFKC case folding, including default-ignorable removal, before segmentation. |
-| `remove_chars` | Delete Unicode scalars listed in `params.chars`. Each entry must be exactly one character; supplementary characters are supported. An empty list is a no-op; duplicates have no effect. |
+| `mapping` | Apply case-sensitive, leftmost-longest rules from `params.mappings`. Map to an empty replacement to delete text. |
 | `html_strip` | Extract text, remove tags/comments/declarations and script/style contents, and decode named and numeric HTML character references once. |
 
 These are the supported character filters; stemming and English possessive
-removal remain token filters. All except `remove_chars` take no parameters.
+removal remain token filters. All except `mapping` take no parameters.
 Lowercase and accent folding remain token filters. `nfkc_cf` is also available
 as a char filter because compatibility normalization before segmentation can
 change word boundaries. Its ASCII path only lowercases bytes, preserving all
 byte offsets; unchanged input is borrowed.
+
+`mapping` takes a list such as `["ph => f", "\\u2014 => "]`. The longest
+source at each input position wins; rule order does not break ties, and duplicate
+decoded sources are rejected. Replacements are not rescanned by the same filter.
+Use multiple mapping filters to apply successive rewrites. An empty list is a
+no-op; empty sources are invalid.
+
+Each rule has exactly one unescaped `=>`. ASCII whitespace around each side is
+trimmed before escape decoding. Rules accept `\\`, `\n`, `\r`, `\t`, `\b`,
+`\f`, and `\uXXXX`, including UTF-16 surrogate pairs for supplementary
+characters. These are mapping escapes inside JSON strings, so double their
+backslashes in JSON. For example, `"x => \\u0020"` maps `x` to a space;
+`"\\u003d> => arrow"` maps a literal `=>`. Invalid UTF-8, malformed escapes,
+unknown parameters, and non-string rules are rejected. Rule text is not folded
+at compile time: put `nfkc_cf` before mapping when its input should be folded.
 
 `html_strip` uses a forward scan with bounded named-reference lookup. It does
 not build a DOM, execute scripts, fetch resources, or expand document-defined
@@ -427,8 +442,11 @@ or an HTML sanitizer for safe display.
 Cleanup runs for analyzed queries. Prefix/fuzzy terms and TEXT range bounds
 use normalizing character filters before token normalization; `html_strip` is
 excluded. Wildcard/regex literals retain per-codepoint normalization, while
-character classes remain exact. Multi-character markup and entities are not
-decoded inside patterns. Already-analyzed phrase `terms` remain verbatim.
+character classes remain exact. Multi-character mapping sources do not span
+adjacent pattern literals, so `ph => f` applies to a prefix term but not the
+`ph` in `ph*`. Literal normalization currently rejects expansions beyond 32
+codepoints per input codepoint. HTML markup and entities are not decoded inside
+patterns. Already-analyzed phrase `terms` remain verbatim.
 Stored source values retain the submitted text.
 
 An analyzer specifying only `char_filters` replaces the inherited analyzer

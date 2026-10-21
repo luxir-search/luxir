@@ -49,9 +49,9 @@ std::shared_ptr<Schema> schema(std::string_view json) {
 
 class CharFilterTest : public LuxirTest {};
 
-TEST_F(CharFilterTest, removeUnicodeCharactersBeforeSegmentation) {
+TEST_F(CharFilterTest, mappingBeforeSegmentation) {
   auto plan = compile(R"({"tokenizer":"unicode_word","filters":["nfkc_cf"],
-    "char_filters":[{"name":"remove_chars","params":{"chars":["-","\u2014","\ud83d\ude00","-"]}}]})");
+    "char_filters":[{"name":"mapping","params":{"mappings":["- =>","\\u2014 =>","\\ud83d\\ude00 =>"]}}]})");
   auto chain = plan->createChain();
   std::string source = "-FOO-bar\xe2\x80\x94\xf0\x9f\x98\x80 baz-";
   auto result = analyze(*chain, source);
@@ -73,13 +73,13 @@ TEST_F(CharFilterTest, removeUnicodeCharactersBeforeSegmentation) {
 }
 
 TEST_F(CharFilterTest, orderAndCanonicalIdentity) {
-  auto first = compile(R"({"char_filters":["nfkc_cf",{"name":"remove_chars","params":{"chars":["a"]}}]})");
-  auto second = compile(R"({"char_filters":[{"name":"remove_chars","params":{"chars":["a"]}},"nfkc_cf"]})");
+  auto first = compile(R"({"char_filters":["nfkc_cf",{"name":"mapping","params":{"mappings":["a =>"]}}]})");
+  auto second = compile(R"({"char_filters":[{"name":"mapping","params":{"mappings":["a =>"]}},"nfkc_cf"]})");
   EXPECT_NE(first->canonical, second->canonical);
   EXPECT_EQ((std::vector<std::string>{"b"}), analyze(*first->createChain(), "AB").terms);
   EXPECT_EQ((std::vector<std::string>{"ab"}), analyze(*second->createChain(), "AB").terms);
   EXPECT_EQ(compile("{}")->canonical, compile(R"({"char_filters":[]})")->canonical);
-  auto empty = compile(R"({"char_filters":[{"name":"remove_chars","params":{"chars":[]}}]})")->createChain();
+  auto empty = compile(R"({"char_filters":[{"name":"mapping","params":{"mappings":[]}}]})")->createChain();
   std::string source = "unchanged";
   analyze(*empty, source);
   EXPECT_EQ(source.data(), empty->getToken().text.data());
@@ -117,9 +117,9 @@ TEST_F(CharFilterTest, htmlReferencesAreDecodedOnce) {
   }
 }
 
-TEST_F(CharFilterTest, htmlAndRemovalComposeOffsets) {
+TEST_F(CharFilterTest, htmlAndMappingComposeOffsets) {
   auto chain = compile(R"({"tokenizer":"unicode_word","char_filters":["html_strip",
-    {"name":"remove_chars","params":{"chars":["-"]}},"nfkc_cf"]})")->createChain();
+    {"name":"mapping","params":{"mappings":["- =>"]}},"nfkc_cf"]})")->createChain();
   auto result = analyze(*chain, "<b>FOO&#45;BAR</b> baz");
   EXPECT_EQ((std::vector<std::string>{"foobar", "baz"}), result.terms);
   EXPECT_EQ((std::vector<int>{3, 19}), result.starts);
@@ -165,13 +165,13 @@ TEST_F(CharFilterTest, unicodeCleanupMatchesWholeValueNormalization) {
 }
 
 TEST_F(CharFilterTest, rejectsInvalidComponentsAndParameters) {
-  for (auto component : {R"("unknown")", R"({})", R"("kstem")", R"("english_possessive")", R"("lowercase")", R"("fold")",
-      R"({"name":"html_strip","params":{"x":1}})", R"({"name":"remove_chars"})",
-      R"({"name":"remove_chars","params":{"chars":"-"}})",
-      R"({"name":"remove_chars","params":{"chars":["ab"]}})",
-      R"({"name":"remove_chars","params":{"chars":[""]}})",
-      R"({"name":"remove_chars","params":{"chars":[42]}})",
-      R"({"name":"remove_chars","params":{"chars":["-"],"unknown":true}})"}) {
+  for (auto component : {R"("unknown")", R"({})", R"("kstem")", R"("english_possessive")", R"("lowercase")", R"("fold")", R"("remove_chars")",
+      R"({"name":"html_strip","params":{"x":1}})", R"({"name":"mapping"})",
+      R"({"name":"mapping","params":{"mappings":"-"}})",
+      R"({"name":"mapping","params":{"mappings":["ab"]}})",
+      R"({"name":"mapping","params":{"mappings":[""]}})",
+      R"({"name":"mapping","params":{"mappings":[42]}})",
+      R"({"name":"mapping","params":{"mappings":["- =>"],"unknown":true}})"}) {
     SCOPED_TRACE(component);
     EXPECT_THROW(compile(std::string("{\"char_filters\":[") + component + "]}"), std::invalid_argument);
   }
@@ -203,7 +203,7 @@ TEST_F(CharFilterTest, schemaInheritanceAndIndexQueryParity) {
   auto s = schema(R"({"templates":{"_base":{"type":"text","analyzer":{"tokenizer":"keyword"}}},
     "fields":{"id":"id","body":{"parent":"_base","stored":true,"multi":true,
       "analyzer":{"tokenizer":"unicode_word","filters":["fold"],"char_filters":["html_strip","nfkc_cf",
-        {"name":"remove_chars","params":{"chars":["-"]}}]}},
+        {"name":"mapping","params":{"mappings":["- =>"]}}]}},
       "only":{"parent":"_base","analyzer":{"char_filters":["html_strip"]}}}})");
   auto* only = (TextFieldType*) s->getFieldTypePtr("only");
   EXPECT_EQ("whitespace", only->analyzer_->tokenizer->name);
@@ -247,7 +247,7 @@ TEST_F(CharFilterTest, normalizationExpansionOffsets) {
 
 TEST_F(CharFilterTest, schemaRoundTripInheritanceAndValidation) {
   auto original = schema(R"({"templates":{"_clean":{"type":"text","analyzer":{
-    "char_filters":["html_strip",{"name":"remove_chars","params":{"chars":["-"]}}]}}},
+    "char_filters":["html_strip",{"name":"mapping","params":{"mappings":["- =>"]}}]}}},
     "fields":{"body":{"parent":"_clean"},"title":{"type":"string","variants":{"text":{"parent":"_clean"}}}}})");
   std::pmr::monotonic_buffer_resource arena;
   api::SchemaDef def;
@@ -308,4 +308,61 @@ TEST_F(CharFilterTest, nfkcAsciiOffsetsAndWordBoundaries) {
   EXPECT_EQ(input.data(), chain->getToken().text.data());
   auto words = compile(R"({"tokenizer":"unicode_word","char_filters":["nfkc_cf"]})")->createChain();
   EXPECT_EQ((std::vector<std::string>{"x2"}), analyze(*words, "x\xc2\xb2").terms);
+}
+
+TEST_F(CharFilterTest, longestMappingsAreCaseSensitiveAndNonrecursive) {
+  auto chain = compile(R"({"tokenizer":"keyword","char_filters":[{"name":"mapping","params":{
+    "mappings":["p => P","ph => f","phi => Q","x => ph","same => same"]}}]})")->createChain();
+  EXPECT_EQ((std::vector<std::string>{"Q f P ph Ph"}), analyze(*chain, "phi ph p x Ph").terms);
+  std::string input = "same untouched";
+  chain->setValue(input);
+  ASSERT_TRUE(chain->tail->incrementToken());
+  EXPECT_EQ(input.data(), chain->getToken().text.data());
+  EXPECT_EQ((std::vector<std::string>{"PPP"}), analyze(*chain, "ppp").terms);
+}
+
+TEST_F(CharFilterTest, mappingEscapesAndComposedExpansionOffsets) {
+  auto chain = compile(R"({"tokenizer":"keyword","char_filters":[{"name":"mapping","params":{
+    "mappings":["\\uD83D\\uDE00 => smile","\\u2014 =>","\\t => \\u0020",
+                "\\u003d> => arrow","\\\\ => slash"]}}]})")->createChain();
+  EXPECT_EQ((std::vector<std::string>{"smile arrowslash"}),
+      analyze(*chain, "\xf0\x9f\x98\x80\xe2\x80\x94\t=>\\").terms);
+  chain = compile(R"({"tokenizer":"unicode_word","char_filters":["html_strip",
+    {"name":"mapping","params":{"mappings":["x => a b"]}}]})")->createChain();
+  auto out = analyze(*chain, "&#120;");
+  EXPECT_EQ((std::vector<std::string>{"a", "b"}), out.terms);
+  EXPECT_EQ((std::vector<int>{0, 0}), out.starts);
+  EXPECT_EQ((std::vector<int>{6, 6}), out.ends);
+}
+
+TEST_F(CharFilterTest, rejectsInvalidMappingRules) {
+  for (auto rules : {R"(["a => b => c"])", R"([" => b"])", R"(["a => \\q"])",
+      R"(["a => \\u12"])", R"(["a => \\uD800"])", R"(["a => \\uDC00"])",
+      R"(["a => \\uD800\\u0041"])", R"(["a => b","\\u0061 => c"])",
+      R"(["a => b"," a => c"])", R"(["a => \\"])", R"([42])"}) {
+    SCOPED_TRACE(rules);
+    EXPECT_THROW(compile(std::string(R"({"char_filters":[{"name":"mapping","params":{"mappings":)") +
+        rules + "}}]}"), std::invalid_argument);
+  }
+}
+
+TEST_F(CharFilterTest, wholeTermsAndPatternLiteralsUseMapping) {
+  CollectionHelper ch;
+  ch.collection().setSchema(schema(R"({"fields":{"id":"id","body":{"type":"text","analyzer":{
+    "char_filters":[{"name":"mapping","params":{"mappings":["ph => f"]}}]}}}})"));
+  ch.index(flatdoc("id", "one", "body", "phone"), UpdateMessage::COMMIT);
+  for (int mode = 0; mode < 5; ++mode) {
+    auto req = localReq(ch.getSearchEngine());
+    auto& q = req->topDocs("q");
+    if (mode == 0) q.prefixQuery("body", "pho");
+    if (mode == 1) q.fuzzyQuery("body", "phane", 1);
+    if (mode == 2) q.rawQuery() = qb::wildcard(q.mr(), "body", "f*");
+    if (mode == 3) q.rawQuery() = qb::wildcard(q.mr(), "body", "ph*");
+    if (mode == 4) q.rawQuery() = qb::range(q.mr(), "body", qb::valStr(q.mr(), "phone"), nullptr,
+                                         qb::valStr(q.mr(), "phone"), nullptr);
+    q.fields({"id"});
+    req->execute();
+    ASSERT_OK(req);
+    EXPECT_EQ(mode == 3 ? 0u : 1u, req->getDocs().size()) << mode;
+  }
 }

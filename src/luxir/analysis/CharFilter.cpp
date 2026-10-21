@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bitset>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -21,7 +22,7 @@ void CharFilter::replace(size_t start, size_t end, std::string_view replacement)
   buffer.append(input.substr(copied, start - copied));
   size_t outStart = buffer.size();
   buffer.append(replacement);
-  // ASCII case changes preserve byte boundaries exactly and need no edit.
+  // Single-byte substitutions preserve byte boundaries and need no edit.
   if (replacement.empty() && !edits.empty() && edits.back().inEnd == start &&
       edits.back().outStart == outStart && edits.back().outEnd == outStart) {
     edits.back().inEnd = end;
@@ -78,21 +79,129 @@ int CharFilter::correctOffset(int offset, bool end) {
 }
 
 namespace {
-class RemoveCharsFilter : public CharFilter {
-  std::shared_ptr<const std::vector<char32_t>> chars;
-  std::array<bool, 128> ascii{};
-public:
-  explicit RemoveCharsFilter(std::shared_ptr<const std::vector<char32_t>> chars) : chars(std::move(chars)) {
-    for (char32_t cp : *this->chars) if (cp < ascii.size()) ascii[cp] = true;
+[[noreturn]] void badMapping(std::string_view reason) {
+  throw std::invalid_argument("char filter 'mapping': " + std::string(reason));
+}
+
+std::string decodeMapping(std::string_view text) {
+  auto whitespace = [](char c) { return c == ' ' || (c >= '\t' && c <= '\r'); };
+  while (!text.empty() && whitespace(text.front())) text.remove_prefix(1);
+  while (!text.empty() && whitespace(text.back())) text.remove_suffix(1);
+  std::string out;
+  auto hexScalar = [&](size_t& pos) {
+    char32_t cp = 0;
+    for (int i = 0; i < 4; ++i) {
+      if (pos == text.size()) badMapping("incomplete Unicode escape in mappings");
+      unsigned char c = (unsigned char) text[pos++];
+      unsigned digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10
+          : c >= 'A' && c <= 'F' ? c - 'A' + 10 : 16;
+      if (digit == 16) badMapping("invalid Unicode escape in mappings");
+      cp = cp * 16 + digit;
+    }
+    return cp;
+  };
+  for (size_t pos = 0; pos < text.size();) {
+    char c = text[pos++];
+    if (c != '\\') { out.push_back(c); continue; }
+    if (pos == text.size()) badMapping("trailing escape in mappings");
+    switch (text[pos++]) {
+      case '\\': out.push_back('\\'); break;
+      case 'n': out.push_back('\n'); break;
+      case 'r': out.push_back('\r'); break;
+      case 't': out.push_back('\t'); break;
+      case 'b': out.push_back('\b'); break;
+      case 'f': out.push_back('\f'); break;
+      case 'u': {
+        char32_t cp = hexScalar(pos);
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+          if (text.substr(pos, 2) != "\\u") badMapping("unpaired Unicode surrogate in mappings");
+          pos += 2;
+          char32_t low = hexScalar(pos);
+          if (low < 0xDC00 || low > 0xDFFF) badMapping("unpaired Unicode surrogate in mappings");
+          cp = 0x10000 + (cp - 0xD800) * 0x400 + low - 0xDC00;
+        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+          badMapping("unpaired Unicode surrogate in mappings");
+        }
+        out += una::utf32to8(std::u32string_view(&cp, 1));
+        break;
+      }
+      default: badMapping("unknown escape in mappings; use \\\\, \\n, \\r, \\t, \\b, \\f or \\uXXXX");
+    }
   }
+  if (!una::is_valid_utf8(out)) badMapping("mappings must contain valid UTF-8");
+  return out;
+}
+
+struct MappingTrie {
+  struct Node {
+    std::vector<std::pair<unsigned char, size_t>> edges;
+    size_t replacement = std::string_view::npos;
+  };
+  std::bitset<256> first;
+  std::vector<Node> nodes{1};
+  std::vector<std::string> replacements;
+
+  void add(std::string_view rule) {
+    size_t split = std::string_view::npos;
+    for (size_t i = 0; i < rule.size(); ++i) {
+      if (rule[i] == '\\') { ++i; continue; }
+      if (rule.substr(i, 2) != "=>") continue;
+      if (split != std::string_view::npos) badMapping("each mapping needs exactly one unescaped =>");
+      split = i++;
+    }
+    if (split == std::string_view::npos) badMapping("each mapping needs exactly one unescaped =>");
+    auto source = decodeMapping(rule.substr(0, split));
+    auto replacement = decodeMapping(rule.substr(split + 2));
+    if (source.empty()) badMapping("mapping sources must not be empty");
+    first.set((unsigned char) source.front());
+    size_t node = 0;
+    for (unsigned char c : source) {
+      auto& edges = nodes[node].edges;
+      auto it = std::find_if(edges.begin(), edges.end(), [c](auto edge) { return edge.first == c; });
+      if (it == edges.end()) {
+        size_t next = nodes.size();
+        edges.emplace_back(c, next);
+        nodes.emplace_back();
+        node = next;
+      } else {
+        node = it->second;
+      }
+    }
+    if (nodes[node].replacement != std::string_view::npos) badMapping("duplicate decoded mapping source");
+    nodes[node].replacement = replacements.size();
+    replacements.push_back(std::move(replacement));
+  }
+
+  size_t next(size_t node, unsigned char c) const {
+    const auto& edges = nodes[node].edges;
+    auto it = std::lower_bound(edges.begin(), edges.end(), c,
+        [](auto edge, unsigned char value) { return edge.first < value; });
+    return it != edges.end() && it->first == c ? it->second : std::string_view::npos;
+  }
+};
+
+class MappingFilter : public CharFilter {
+  std::shared_ptr<const MappingTrie> trie;
+public:
+  explicit MappingFilter(std::shared_ptr<const MappingTrie> trie) : trie(std::move(trie)) {}
 private:
   void filter() override {
-    auto decoded = una::views::utf8(input);
-    for (auto it = decoded.begin(); it != decoded.end(); ++it) {
-      char32_t cp = *it;
-      if (cp < ascii.size() ? ascii[cp] : std::binary_search(chars->begin(), chars->end(), cp)) {
-        replace((size_t) (it.begin() - input.begin()), (size_t) (it.end() - input.begin()), "");
+    // Schema-authored keys are short. Forward leftmost-longest matching costs
+    // O(input bytes * longest key bytes) in the worst case; replacements are not rescanned.
+    for (size_t pos = 0; pos < input.size();) {
+      if (!trie->first[(unsigned char) input[pos]]) { ++pos; continue; }
+      size_t node = 0, end = pos, replacement = std::string_view::npos;
+      for (size_t scan = pos; scan < input.size(); ++scan) {
+        node = trie->next(node, (unsigned char) input[scan]);
+        if (node == std::string_view::npos) break;
+        if (trie->nodes[node].replacement != std::string_view::npos) {
+          replacement = trie->nodes[node].replacement;
+          end = scan + 1;
+        }
       }
+      if (replacement == std::string_view::npos) { ++pos; continue; }
+      replace(pos, end, trie->replacements[replacement]);
+      pos = end;
     }
   }
 };
@@ -223,35 +332,35 @@ class HtmlStripFilter : public CharFilter {
 } // namespace
 
 std::unique_ptr<const CharFilterFactory> makeCharFilterFactory(const api::AnalyzerComponent& def) {
-  constexpr std::string_view valid = "nfkc_cf, remove_chars, html_strip";
-  if (def.name == "remove_chars") {
+  constexpr std::string_view valid = "nfkc_cf, mapping, html_strip";
+  if (def.name == "mapping") {
     struct Factory : CharFilterFactory {
-      std::shared_ptr<const std::vector<char32_t>> chars;
-      std::unique_ptr<CharFilter> create() const override { return std::make_unique<RemoveCharsFilter>(chars); }
+      std::shared_ptr<const MappingTrie> trie;
+      std::unique_ptr<CharFilter> create() const override { return std::make_unique<MappingFilter>(trie); }
     };
-    auto chars = std::make_shared<std::vector<char32_t>>();
+    auto trie = std::make_shared<MappingTrie>();
     bool found = false;
     for (const auto& [key, value] : def.params) {
-      if (key != "chars") throw std::invalid_argument("char filter 'remove_chars': unknown parameter '" +
-          std::string(key) + "'; valid parameters: chars");
+      if (key != "mappings") badMapping("unknown parameter '" + std::string(key) + "'; valid parameters: mappings");
       found = true;
-      auto* list = std::get_if<api::ArrStr>(&value->kind);
-      if (auto* empty = std::get_if<api::ArrVal>(&value->kind); empty && empty->v.empty()) continue;
-      if (!list) throw std::invalid_argument("char filter 'remove_chars': chars must be a list of single Unicode characters");
-      for (auto item : list->v) {
-        auto scalars = una::utf8to32(item);
-        if (scalars.size() != 1 || una::utf32to8(scalars) != item)
-          throw std::invalid_argument("char filter 'remove_chars': each chars entry must be one valid Unicode scalar");
-        chars->push_back(scalars[0]);
+      if (auto* list = std::get_if<api::ArrStr>(&value->kind)) {
+        for (auto rule : list->v) trie->add(rule);
+      } else if (auto* list = std::get_if<api::ArrVal>(&value->kind)) {
+        for (const auto& item : list->v) {
+          auto* rule = std::get_if<std::string_view>(&item.kind);
+          if (!rule) badMapping("mappings must be a list of strings");
+          trie->add(*rule);
+        }
+      } else {
+        badMapping("mappings must be a list of strings");
       }
     }
-    if (!found) throw std::invalid_argument("char filter 'remove_chars': missing required parameter 'chars'");
-    std::sort(chars->begin(), chars->end());
-    chars->erase(std::unique(chars->begin(), chars->end()), chars->end());
+    if (!found) badMapping("missing required parameter 'mappings'");
+    for (auto& node : trie->nodes) std::sort(node.edges.begin(), node.edges.end());
     auto factory = std::make_unique<Factory>();
     factory->name = def.name;
     factory->normalizing = true;
-    factory->chars = std::move(chars);
+    factory->trie = std::move(trie);
     return factory;
   }
   if (def.name == "html_strip" || def.name == "nfkc_cf") {
