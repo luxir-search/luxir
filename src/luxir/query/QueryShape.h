@@ -45,6 +45,7 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
     case QueryKind::TERM_RANGE:
     case QueryKind::TERM_IN_SET:
     case QueryKind::EXISTS:
+    case QueryKind::BOOL_VALUE:
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::ALL:
@@ -93,6 +94,7 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
     case QueryKind::TERM_RANGE:
     case QueryKind::TERM_IN_SET:
     case QueryKind::EXISTS:
+    case QueryKind::BOOL_VALUE:
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::ALL:
@@ -136,6 +138,7 @@ inline bool exactDomainIdentity(const Query& query) {
     case QueryKind::TERM_RANGE:
     case QueryKind::TERM_IN_SET:
     case QueryKind::EXISTS:
+    case QueryKind::BOOL_VALUE:
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::NONE:
@@ -184,6 +187,7 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::TERM_RANGE:
     case QueryKind::TERM_IN_SET:
     case QueryKind::EXISTS:
+    case QueryKind::BOOL_VALUE:
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::MIN_SCORE:
@@ -241,6 +245,7 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
     case QueryKind::TERM_RANGE:
     case QueryKind::TERM_IN_SET:
     case QueryKind::EXISTS:
+    case QueryKind::BOOL_VALUE:
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::ALL:

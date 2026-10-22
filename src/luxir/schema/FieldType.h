@@ -82,10 +82,22 @@ public:
   // Every segment-format marker. A writer derives them from what it writes,
   // so merges never carry them over from source segments.
   static constexpr flag_type SEGMENT_MARKERS = TERM_RANGES | MAY_HAVE_FITTED;
+  // BOOLEAN column: the segment field also carries two doc bitsets, the docs
+  // with a true value and the docs with a false value (SegFieldInfo::trueDocs
+  // and falseDocs), so value predicates run as bitset iteration instead of a
+  // column scan. Set by BoolFieldType; merges carry it over like any
+  // physical-structure flag.
+  static constexpr flag_type BOOL_BITSETS = (1 << 15);
+
+  // Logical types layered on a physical one. Segments record only the
+  // physical type (the INT column for BOOLEAN and DECIMAL, STRING terms for
+  // IP), so the logical type changes coercion and rendering, not storage.
+  enum class Logical : uint8_t { NONE, BOOLEAN, DECIMAL, IP };
 
   const FieldType::Type type_;
   const std::string name_;
   flag_type flags_;
+  Logical logical = Logical::NONE;
   // Determines indexed and query term bytes.
   TermPolicy longTerms = TermPolicy::HASH128;
   // When STORED is set, raw values are routed to the stored-fields resource
@@ -232,6 +244,22 @@ public:
                               std::span<char> buf) const override;
 };
 
+// IP stores each address as its 16-byte big-endian IPv6 form (IPv4 maps to
+// ::ffff:a.b.c.d) in the STRING term dictionary and ord column. Term order is
+// address order, so ranges and CIDR blocks are term ranges; retrieval and
+// facets render the canonical text (see util/IpAddress.h).
+class IpFieldType : public StrFieldType {
+public:
+  IpFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : StrFieldType(name, flags) {
+    logical = Logical::IP;
+  }
+
+  // Address text only; it becomes the 16-byte term where STRING values are
+  // normalized (ingest handlers and QueryBuilder::normalizeLiteral).
+  std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
+                              std::span<char> buf) const override;
+};
+
 class IntFieldType : public FieldType {
 public:
   IntFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::INT, flags) {
@@ -242,6 +270,55 @@ public:
       const CoerceContext& context = {}) const override;
 
   std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+};
+
+// BOOLEAN stores 0 (false) or 1 (true) in the standard int column, so facets,
+// sort and retrieval reuse the INT paths (retrieval renders JSON booleans).
+// Next to the column the segment keeps the true-docs and false-docs bitsets
+// (BOOL_BITSETS), which match, range and any_of queries iterate directly
+// (query/BoolValueQuery.h) instead of scanning the column.
+class BoolFieldType : public FieldType {
+public:
+  BoolFieldType(std::string_view name, int flags=COLUMN_STORED)
+    : FieldType(name, FieldType::INT, (flags & COLUMN_STORED) ? flags | BOOL_BITSETS : flags) {
+    logical = Logical::BOOLEAN;
+  }
+
+  int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+};
+
+// DECIMAL stores v * 10^scale as a raw int64 in the standard int
+// column. The scaled integers order like the values, so sort, range and
+// min/max run on the column; rendering and value expressions divide by
+// 10^scale at the edges. Inputs with more fractional digits than scale are
+// rejected rather than rounded.
+class DecimalFieldType : public FieldType {
+public:
+  static constexpr int32_t MAX_SCALE = 18;
+
+  int32_t scale;
+  double unit;  // 10^scale
+
+  DecimalFieldType(std::string_view name, int32_t scale, int flags=COLUMN_STORED)
+    : FieldType(name, FieldType::INT, flags), scale(scale), unit(pow10(scale)) {
+    logical = Logical::DECIMAL;
+  }
+
+  static double pow10(int32_t n) {
+    double r = 1;
+    for (int32_t i = 0; i < n; i++) r *= 10;
+    return r;
+  }
+
+  // The nearest double to the decimal value; exact decimal text for scaled
+  // integers within 2^53.
+  double decode(int64_t scaled) const { return (double)scaled / unit; }
+
+  int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 };

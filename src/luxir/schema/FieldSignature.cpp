@@ -13,7 +13,13 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
   static constexpr const char* types[] = {
     "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point"
   };
-  properties["type"] = "\"" + std::string(types[type.type()]) + "\"";
+  static constexpr const char* logicalTypes[] = {"", "boolean", "decimal", "ip"};
+  const char* typeName = type.logical == FieldType::Logical::NONE
+      ? types[type.type()] : logicalTypes[(int)type.logical];
+  properties["type"] = "\"" + std::string(typeName) + "\"";
+  if (auto* decimal = dynamic_cast<DecimalFieldType*>(&type)) {
+    properties["scale"] = std::to_string(decimal->scale);
+  }
   properties["multi"] = !type.multiValued() ? "false"
       : type.multiArray() && !FieldType::arrayOnly(type.type()) ? "\"array\"" : "true";
   properties["index"] = type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";

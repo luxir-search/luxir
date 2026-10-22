@@ -108,6 +108,17 @@ struct SegFieldInfo {
   seg_location valDocLoc;
   int64_t valDocMetaOff;
 
+  // BOOLEAN columns (FieldType::BOOL_BITSETS): the docs with at least one
+  // true value and the docs with at least one false value, each a serialized
+  // screaming bitset addressed by its end like docsWithFieldEndLoc. The same
+  // sentinels apply: a count of 0 or of maxDoc has no bitset (none / every
+  // doc), and only the counts are present otherwise. A multi-valued doc can
+  // be in both sets.
+  int32_t trueDocs = 0;
+  seg_location trueDocsEndLoc;
+  int32_t falseDocs = 0;
+  seg_location falseDocsEndLoc;
+
   // Within-file references are relative; these are the complete set of
   // segment-global bases.  Relocate them together before FieldInfo is
   // serialized so adding a new absolute base cannot silently update only one
@@ -130,6 +141,8 @@ struct SegFieldInfo {
     relocate(monoLoc);
     relocate(mono2Loc);
     relocate(valDocLoc);
+    relocate(trueDocsEndLoc);
+    relocate(falseDocsEndLoc);
   }
 };
 

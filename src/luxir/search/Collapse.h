@@ -16,6 +16,7 @@
 #include "luxir/reader/OrdColReader.h"
 #include "luxir/search/OrdMapStr.h"
 #include "luxir/search/ops/DomainIter.h"
+#include "luxir/util/IpAddress.h"
 #include "luxir/util/luxir_util.h"
 
 namespace luxir {
@@ -64,6 +65,7 @@ struct CollapsePlan {
     luxir::api::GroupComponent_::Type type;
     std::shared_ptr<OrdMap> ords;
     IndexReader::FieldSegments segments;
+    bool ip = false;  // IP terms are emitted as address text
     bool ordinal() const { return type == luxir::api::GroupComponent_::Type::STRING
                                || type == luxir::api::GroupComponent_::Type::ID; }
   };
@@ -107,8 +109,10 @@ struct CollapsePlan {
         components[i].value = google::protobuf::NullValue::NULL_VALUE;
       } else if (fields[i].ordinal()) {
         OrdMapStr strings(pool, fields[i].ords.get(), reader, fields[i].segments);
-        components[i].value = luxir::api::build::arenaStr(
-            mr, strings.ordToStr(key.components[i].value));
+        std::string_view term = strings.ordToStr(key.components[i].value);
+        char text[ip::TEXT_BUF_SIZE];
+        if (fields[i].ip && term.size() == ip::BYTES) term = ip::format(term, text);
+        components[i].value = luxir::api::build::arenaStr(mr, term);
       } else components[i].value = key.components[i].value;
     }
   }

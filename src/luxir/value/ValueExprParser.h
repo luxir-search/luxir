@@ -325,7 +325,17 @@ private:
     }
     node.sourcePos = pos;
     node.text = program->copyString(target.physicalName);
-    return append(node);
+    uint32_t column = append(node);
+    if (field->logical != FieldType::Logical::DECIMAL) return column;
+    // A DECIMAL column holds value * 10^scale: expressions see the value.
+    ValueNode unit;
+    unit.kind = ValueNodeKind::CONSTANT;
+    unit.type = ValueType::DOUBLE;
+    unit.doubleValue = static_cast<DecimalFieldType*>(field)->unit;
+    unit.sourcePos = pos;
+    unit.text = program->copyString(target.physicalName);
+    std::array<uint32_t, 2> args{column, append(unit)};
+    return makeFunction("div", pos, args);
   }
 
   template <class Grammar>

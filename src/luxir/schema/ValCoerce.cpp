@@ -38,6 +38,45 @@ int64_t IntFieldType::coerceColInt64(const api::Val& val, std::string_view field
   return coerce::toInt64(val, fieldName);
 }
 
+int64_t BoolFieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
+                                      const CoerceContext& context) const {
+  unused(context);
+  if (auto b = std::get_if<bool>(&val.kind)) return *b ? 1 : 0;
+  if (auto s = std::get_if<std::string_view>(&val.kind)) {
+    if (*s == "true") return 1;
+    if (*s == "false") return 0;
+  }
+  coerce::throwCoerce(fieldName, val, "a boolean (true or false)");
+}
+
+int64_t DecimalFieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
+                                         const CoerceContext& context) const {
+  unused(context);
+  if (auto i = std::get_if<int64_t>(&val.kind)) {
+    int64_t scaled;
+    int64_t factor = (int64_t)unit;
+    if (!__builtin_mul_overflow(*i, factor, &scaled)) return scaled;
+    coerce::throwCoerce(fieldName, val, fmt::format("a decimal with scale {} (out of range)", scale));
+  }
+  // Numbers parse through their shortest round-trip text, so 0.1 means the
+  // decimal 0.1 rather than the binary double nearest it.
+  char buf[coerce::TEXT_BUF_SIZE];
+  std::string_view text;
+  if (auto s = std::get_if<std::string_view>(&val.kind)) {
+    text = *s;
+  } else if (auto d = std::get_if<double>(&val.kind)) {
+    text = std::string_view(buf, std::to_chars(buf, buf + sizeof(buf), *d).ptr);
+  } else if (auto f = std::get_if<float>(&val.kind)) {
+    text = std::string_view(buf, std::to_chars(buf, buf + sizeof(buf), *f).ptr);
+  } else {
+    coerce::throwCoerce(fieldName, val, "a decimal number");
+  }
+  const char* error = nullptr;
+  if (auto scaled = coerce::parseScaledDecimal(text, scale, error)) return *scaled;
+  throw RequestError(fmt::format("DECIMAL field '{}' (scale {}): '{}' {}",
+                                 fieldName, scale, text, error), "invalid_value");
+}
+
 int64_t FloatFieldType::coerceColInt64(const api::Val& val, std::string_view fieldName,
                                        const CoerceContext& context) const {
   unused(context);
@@ -126,6 +165,15 @@ std::string_view TextFieldType::coerceTerm(const api::Val& val, std::string_view
 std::string_view StrFieldType::coerceTerm(const api::Val& val, std::string_view fieldName,
                                           std::span<char> buf) const {
   return coerce::toText(val, fieldName, buf);
+}
+
+std::string_view IpFieldType::coerceTerm(const api::Val& val, std::string_view fieldName,
+                                         std::span<char> buf) const {
+  unused(buf);
+  // Address text passes through; ingest and query literals parse it to the
+  // 16-byte term where STRING values are normalized.
+  if (auto s = std::get_if<std::string_view>(&val.kind)) return *s;
+  coerce::throwCoerce(fieldName, val, "an IP address");
 }
 
 std::string_view IdFieldType::coerceTerm(const api::Val& val, std::string_view fieldName,

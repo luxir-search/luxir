@@ -7,6 +7,7 @@
 
 #include "luxir/query/AllQuery.h"
 #include "luxir/query/AutomatonQuery.h"
+#include "luxir/query/BoolValueQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/CombinedFieldQuery.h"
@@ -54,6 +55,12 @@ FilteredTermsEnum* AutomatonQuery::createFilteredEnum(MemPool& pool, TermsEnum& 
 Query::Weight* BoostQuery::createWeight(Context& context, int32_t flags,
                                         float multiplier) {
   return child->createWeight(context, flags, multiplier * boost);
+}
+
+BoolValueQuery::Weight* BoolValueQuery::createWeight(
+    Context& context, int32_t flags, float multiplier) {
+  return context.pool.make<BoolValueQuery::Weight>(
+      context, *this, flags, Query::constantWhenScored(flags, multiplier));
 }
 
 Query::Weight* ConstantScoreQuery::createWeight(Context& context, int32_t flags,
