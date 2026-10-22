@@ -246,6 +246,9 @@ void appendBucketId(std::string& out, const luxir::api::Column& col, size_t i) {
   } else if (auto* c = std::get_if<luxir::api::ColStr>(&col.kind)) {
     if (i < c->v.size()) appendJsonString(out, c->v[i]);
     else out += "null";
+  } else if (auto* c = std::get_if<luxir::api::ColDouble>(&col.kind)) {
+    if (i < c->v.size()) appendFloating(out, c->v[i]);
+    else out += "null";
   } else if (std::holds_alternative<luxir::api::ArrArrInt>(col.kind)) {
     cell::arrInt(out, col, i);
   } else if (std::holds_alternative<luxir::api::ArrArrFloat>(col.kind)) {

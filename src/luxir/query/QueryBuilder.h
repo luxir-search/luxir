@@ -19,6 +19,7 @@
 #include "luxir/query/CombinedFieldQuery.h"
 #include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/BoolValueQuery.h"
 #include "luxir/query/ExistsQuery.h"
 #include "luxir/query/FuzzyQuery.h"
 #include "luxir/query/MatchNoDocsQuery.h"
@@ -36,6 +37,7 @@
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
+#include "luxir/util/IpAddress.h"
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/util/automaton/WildcardCompiler.h"
@@ -197,7 +199,9 @@ private:
     if constexpr (std::is_same_v<T, api::Val>) {
       return fieldType.coerceColInt64(value, field, coerceContext);
     } else {
-      switch (fieldType.type()) {
+      // Logical types (BOOLEAN, DECIMAL) share the INT column but not its
+      // coercion, so only plain types take the typed shortcuts.
+      switch (fieldType.logical == FieldType::Logical::NONE ? fieldType.type() : FieldType::Type::NONE) {
         case FieldType::Type::INT:
           return coerce::toInt64Scalar(value, field);
         case FieldType::Type::FLOAT:
@@ -408,6 +412,17 @@ public:
     return pool.make<ExistsQuery>(field);
   }
 
+  // A BOOLEAN column predicate over the encoded window [lo, hi] (its values
+  // are 0 and 1): the field's value bitset, both of them (ExistsQuery), or
+  // nothing. The column itself is never scanned.
+  Query* createBoolPredicate(std::string_view field, int64_t lo, int64_t hi) {
+    bool falses = lo <= 0 && hi >= 0;
+    bool trues = lo <= 1 && hi >= 1;
+    if (falses && trues) return pool.make<ExistsQuery>(field);
+    if (!falses && !trues) return matchNoDocs();
+    return pool.make<BoolValueQuery>(field, trues);
+  }
+
   CanonicalValueSet canonicalizeFieldValues(
       std::string_view field, ValueSequence values,
       bool preserveInputOrder = false) {
@@ -521,6 +536,9 @@ public:
             field));
       }
       auto encoded = values.numerics();
+      if (fieldType.logical == FieldType::Logical::BOOLEAN) {
+        return createBoolPredicate(field, encoded.front(), encoded.back());
+      }
       if (encoded.size() == 1) {
         return pool.make<NumericPredicateQuery>(field, encoded[0], encoded[0]);
       }
@@ -558,6 +576,7 @@ public:
 
   std::string_view normalizeLiteral(const ResolvedFieldHandle& target,
                                     std::string_view text, bool exact) {
+    if (target.fieldType->logical == FieldType::Logical::IP) return ipTerm(target, text, exact);
     if (auto* chain = fields.chain(target)) text = normalizeMultiterm(*chain, text);
     if (exact && (target.fieldType->type() != FieldType::STRING || target.fieldType->indexed())) {
       text = fitTerm(target, text);
@@ -634,10 +653,29 @@ private:
       default:
         throw std::runtime_error(std::format("{} query on unsupported field type: {}", label, field));
     }
+    if (fieldType.logical == FieldType::Logical::IP) {
+      throw std::runtime_error(std::format("{} query is not supported on IP field: {}", label, field));
+    }
     if (!fieldType.indexed()) {
       throw std::runtime_error(std::format("{} query requires an indexed field: {}", label, field));
     }
     return &fieldType;
+  }
+
+  // An IP literal's 16-byte term. CIDR blocks are only valid where a match
+  // can lower them to a term range (createMatchQuery).
+  std::string_view ipTerm(const ResolvedFieldHandle& target, std::string_view text, bool exact) {
+    if (!exact) {
+      throw std::runtime_error(std::format(
+          "IP field '{}' supports exact, range and CIDR queries only", target.physicalName));
+    }
+    auto addr = ip::parse(text);
+    if (!addr) {
+      throw std::runtime_error(std::format(
+          "IP field '{}': cannot parse '{}' as an IPv4 or IPv6 address{}", target.physicalName, text,
+          text.contains('/') ? "; CIDR blocks are only valid in a match query" : ""));
+    }
+    return poolCopy(ip::bytes(*addr));
   }
 
   std::string_view poolCopy(std::string_view bytes) {
@@ -797,6 +835,16 @@ public:
       }
       case FieldType::Type::STRING:
       case FieldType::Type::ID:
+        if (fieldType.logical == FieldType::Logical::IP && value.contains('/')) {
+          // A CIDR block is the inclusive term range of its addresses.
+          auto block = ip::parseCidr(value);
+          if (!block) {
+            throw std::runtime_error(std::format(
+                "IP field '{}': cannot parse '{}' as a CIDR block", field, value));
+          }
+          return pool.make<TermRangeQuery>(field, poolCopy(ip::bytes(block->lo)), true,
+                                           poolCopy(ip::bytes(block->hi)), true);
+        }
         return pool.make<TermQuery>(field, normalizeLiteral(target, value, true), boost);
       case FieldType::Type::INT:
       case FieldType::Type::FLOAT:
@@ -1173,6 +1221,7 @@ public:
       hi = *hiEnc - 1;
     }
     if (lo > hi) return matchNoDocs();  // empty range
+    if (fieldType.logical == FieldType::Logical::BOOLEAN) return createBoolPredicate(field, lo, hi);
     return pool.make<NumericPredicateQuery>(field, lo, hi,
         unroundedNow ? FilterKeyScope::REQUEST_STABLE
                      : FilterKeyScope::SEGMENT_STABLE);

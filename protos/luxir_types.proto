@@ -2192,6 +2192,9 @@ message FieldDef {
     VECTOR = 7;    // dense float vector
     DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
     GEO_POINT = 9; // latitude/longitude point
+    BOOLEAN = 11;  // true/false, stored as 0/1 in the int column
+    IP = 12;       // IPv4 or IPv6 address, a 16-byte term (IPv4 as ::ffff:a.b.c.d)
+    DECIMAL = 13;  // fixed-point number, stored as the int64 v * 10^scale
   }
   optional FieldClass type = 2; // required unless inherited from parent
 
@@ -2289,6 +2292,10 @@ message FieldDef {
   // VECTOR only: ANN overlay settings. Absent inherits the parent's whole
   // definition (no per-property merge), else every VectorAnnDef default.
   VectorAnnDef ann = 22;
+
+  // DECIMAL only, and required there: digits after the decimal point, 0 to 18.
+  // Values with more fractional digits are rejected, not rounded.
+  optional int32 scale = 23;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

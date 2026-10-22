@@ -237,7 +237,12 @@ private:
 
   // ---- schema consultation (arm selection only; text stays uninterpreted) ----
 
-  static bool termQueryable(FieldType& ft) { return SimpleQueryParser::termQueryable(ft); }
+  // IP fields are term-backed: match, range and CIDR literals go through
+  // QueryBuilder, which rejects prefix and fuzzy on them.
+  static bool termQueryable(FieldType& ft) {
+    return SimpleQueryParser::termQueryable(ft)
+        || (ft.logical == FieldType::Logical::IP && ft.indexed());
+  }
 
   static bool numericQueryable(FieldType& ft) {
     return QueryBuilder::isNumericColumnType(ft.type()) && ft.hasColumn();

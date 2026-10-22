@@ -291,6 +291,9 @@ public:
   const ReqFieldFacet& fieldFacet;
   std::span<const int64_t> selectedInts;
   std::span<const std::string_view> selectedStrings;
+  // The faceted field's schema type, which renders logical-type bucket keys
+  // (see emitBuckets). Set by the parser.
+  const FieldType* valueType = nullptr;
 
 protected:
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
@@ -544,7 +547,7 @@ public:
       emitted.reserve(finalized.size());
       for (const auto& bucket : finalized) emitted.emplace_back(label(bucket), bucket.count);
       auto& out = *slotArm<luxir::api::FacetResult>(nullptr);
-      emitBuckets(out, emitted, op.req.lastResponse->mr);
+      emitBuckets(out, emitted, op.req.lastResponse->mr, fieldOp().valueType);
       if (fieldOp().missing) out.missing = missing;
       using ChildKey = std::conditional_t<std::is_same_v<Label, std::string>, std::string_view, Label>;
       auto buckets = selectedBuckets<ChildKey>(finalized,
@@ -666,7 +669,7 @@ public:
       for (const auto& bucket : finalized) {
         emitted.emplace_back(resolveLabel(bucket), bucket.count);
       }
-      emitBuckets(facetResultProto, emitted, mr);
+      emitBuckets(facetResultProto, emitted, mr, fieldOp().valueType);
       if (missing) {
         facetResultProto.missing = missing_count;
       }
@@ -2004,6 +2007,9 @@ public:
   static inline bool disablePointsRangeFacetForTests = false;
   static inline bool disableZoneRangeFacetForTests = false;
 
+  // 10^scale for a DECIMAL field, whose bounds are emitted decoded; 0 otherwise.
+  double decimalUnit = 0;
+
   std::span<const int64_t> bucketFences() const { return fences; }
 
   IntFacetRangeReq(SearchRequest& req,
@@ -2098,6 +2104,11 @@ public:
             [](int64_t encoded) { return sortableInt64ToDouble(encoded); });
         break;
       default:
+        if (decimalUnit != 0) {
+          emitBounds.template operator()<luxir::api::ArrArrDouble>(
+              [unit = decimalUnit](int64_t value) { return (double)value / unit; });
+          break;
+        }
         emitBounds.template operator()<luxir::api::ArrArrInt>(
             [](int64_t value) { return value; });
         break;
