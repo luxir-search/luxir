@@ -168,12 +168,13 @@ whole machine. Designed from the start for parallelism on modern hardware.
 
 ## Text analysis
 
-- Ordered cleanup before tokenization: HTML stripping, Unicode character removal,
-  lowercase, NFKC case folding, and accent folding, with source-offset correction.
+- Ordered character filters before tokenization: `html_strip` for HTML text
+  extraction, `mapping` for character replacements/removal, and `nfkc_cf` for
+  Unicode NFKC case folding.
 - Tokenizers: Unicode word segmentation (UAX#29), whitespace, keyword.
-- Token filters: NFKC case folding, ASCII lowercase, accent and diacritic
-  folding, English possessive removal, and KStem English stemming (the
-  dictionary-based Krovetz stemmer).
+- Token filters: NFKC case folding, Unicode lowercase, accent and diacritic
+  folding, stop-word removal, English possessive removal, and KStem English
+  stemming (the dictionary-based Krovetz stemmer).
 - The default `_t` field applies Unicode words, case folding, accent folding,
   possessive removal, and KStem. `_un` is Unicode text without stemming, `_u`
   keeps case and accents, and `_w`/`_wl` split on whitespace.

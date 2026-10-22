@@ -373,7 +373,7 @@ live segment carrying one is used.
 
 A text analyzer applies an ordered list of `char_filters` to the whole value,
 then one tokenizer, then an ordered list of token `filters`. Both lists are
-optional. Existing analyzers without `char_filters` retain their behavior.
+optional.
 
 ### Cleanup before tokenization
 
@@ -386,7 +386,7 @@ optional. Existing analyzers without `char_filters` retain their behavior.
         "char_filters": [
           "html_strip",
           "nfkc_cf",
-          {"name": "mapping", "params": {"mappings": ["- =>", "\\u2014 =>"]}}
+          {"name": "mapping", "params": {"mappings": ["- =>", "\u2014 =>"]}}
         ],
         "tokenizer": "unicode_word",
         "filters": ["fold", "kstem"]
@@ -404,49 +404,45 @@ hyphen in the tokenizer's input. Removing `-` from `foo-bar` produces one
 
 | Character filter | Behavior |
 |---|---|
-| `nfkc_cf` | Existing Unicode NFKC case folding, including default-ignorable removal, before segmentation. |
+| `nfkc_cf` | Unicode NFKC case folding, including default-ignorable removal, before segmentation. |
 | `mapping` | Apply case-sensitive, leftmost-longest rules from `params.mappings`. Map to an empty replacement to delete text. |
 | `html_strip` | Extract text, remove tags/comments/declarations and script/style contents, and decode named and numeric HTML character references once. |
 
-These are the supported character filters; stemming and English possessive
-removal remain token filters. All except `mapping` take no parameters.
-Lowercase and accent folding remain token filters. `nfkc_cf` is also available
-as a char filter because compatibility normalization before segmentation can
-change word boundaries. Its ASCII path only lowercases bytes, preserving all
-byte offsets; unchanged input is borrowed.
+All except `mapping` take no parameters. Lowercase, accent folding, stemming,
+and possessive removal are token filters only. `nfkc_cf` is also available as a
+char filter because compatibility normalization before segmentation can change
+word boundaries.
 
-`mapping` takes a list such as `["ph => f", "\\u2014 => "]`. The longest
+`mapping` takes a list such as `["ph => f", "\u2014 => "]`. The longest
 source at each input position wins; rule order does not break ties, and duplicate
 decoded sources are rejected. Replacements are not rescanned by the same filter.
 Use multiple mapping filters to apply successive rewrites. An empty list is a
 no-op; empty sources are invalid.
 
-Each rule has exactly one unescaped `=>`. ASCII whitespace around each side is
-trimmed before escape decoding. Rules accept `\\`, `\n`, `\r`, `\t`, `\b`,
-`\f`, and `\uXXXX`, including UTF-16 surrogate pairs for supplementary
-characters. These are mapping escapes inside JSON strings, so double their
-backslashes in JSON. For example, `"x => \\u0020"` maps `x` to a space;
-`"\\u003d> => arrow"` maps a literal `=>`. Invalid UTF-8, malformed escapes,
-unknown parameters, and non-string rules are rejected. Rule text is not folded
-at compile time: put `nfkc_cf` before mapping when its input should be folded.
+Each rule has exactly one unescaped `=>`; ASCII whitespace at either edge of
+each side is trimmed. Use ordinary JSON escapes for characters, as in
+`"\u2014 =>"` to delete an em dash. Mapping-level escapes are needed only to
+preserve edge whitespace or include a literal `=>`: `"x => \\u0020"` maps
+`x` to a space, and `"\\u003d> => arrow"` maps `=>` to `arrow`. Double the
+backslash in JSON for these mapping-level escapes. Mapping escapes accept
+`\\`, `\n`, `\r`, `\t`, `\b`, `\f`, and `\uXXXX`, including surrogate pairs.
+Invalid UTF-8, malformed escapes, unknown parameters, and non-string rules are
+rejected. For folded matching, put `nfkc_cf` before mapping and write folded
+sources in the rules.
 
-`html_strip` uses a linear scan with bounded named-reference lookup. It does
-not build a DOM, execute scripts, fetch resources, or expand document-defined
-entities. Known inline elements emit nothing: `H<sub>2</sub>O` becomes `H2O`
-and `<b>W</b>ord` becomes `Word`. The fixed inline list follows Lucene's
-HTMLStripCharFilter, including `img`, `input`, `select`, and `textarea`.
-Other elements, including `br` and unknown names, emit a newline separator.
-Comments and declarations emit nothing; script/style regions emit a separator.
-Attribute quotes open only at the start of a value after `=` and optional
-whitespace, so unquoted apostrophes such as `title=O'Reilly` remain ordinary
-value bytes. Unterminated ordinary tags retain the literal `<`; unterminated
-comments and script/style regions consume the remaining input. CDATA delimiters
-are removed and their content is preserved literally, including `<` and `&`.
-Unknown references remain literal; invalid numeric scalars become U+FFFD. The
-named-reference table includes HTML's legacy semicolonless names. Decoded markup
-such as `&lt;b&gt;` remains text rather than being parsed again. This is a
-deterministic indexing text extractor, not a browser rendering model or an HTML
-sanitizer for safe display.
+`html_strip` removes inline tags without separating text: `H<sub>2</sub>O`
+becomes `H2O`. Its inline list follows Lucene, including `img`, `input`,
+`select`, and `textarea`; other tags, including `br` and unknown names, emit
+newlines. Comments/declarations disappear; script/style regions become separators.
+Quotes protect attribute values only immediately after `=` and optional
+whitespace, so `title=O'Reilly` works. Unterminated ordinary tags preserve `<`;
+unterminated comments and script/style regions consume the remainder. CDATA
+delimiters disappear but contents stay literal, including `<` and `&`.
+Named/numeric references decode once, including legacy semicolonless names;
+unknown references stay literal and invalid numeric scalars become U+FFFD.
+Decoded `&lt;b&gt;` stays text. It never executes scripts, fetches resources,
+or expands document-defined entities. This extracts indexing text; it is neither
+a browser rendering model nor an HTML sanitizer for safe display.
 
 Cleanup runs for analyzed queries. Prefix/fuzzy terms and TEXT range bounds
 use normalizing character filters before token normalization; `html_strip` is
@@ -459,8 +455,8 @@ patterns. Already-analyzed phrase `terms` remain verbatim.
 Stored source values retain the submitted text.
 
 An analyzer specifying only `char_filters` keeps the inherited tokenizer and
-token filters. Schema changes affect future
-indexing; reindex existing documents to apply new cleanup rules to them.
+token filters. Schema changes affect future indexing; reindex existing documents
+to apply new cleanup rules to them.
 
 ### Tokenizers and token filters
 
@@ -483,8 +479,8 @@ leaves equal-looking strings unequal (composed versus decomposed forms, final
 sigma), while NFKC case folding makes them compare equal. It also removes
 invisible default-ignorable characters such as soft hyphens, ZWJ/ZWNJ, and
 variation selectors: `co<U+00AD>operate` matches `cooperate`. Tokens that become
-empty are dropped without a position gap. Normalization uses Unicode 15.1.0
-mapping tables followed by stream-safe NFC; runs exceeding 30 non-starters in
+empty are dropped without a position gap. Normalization follows Unicode 15.1.0
+and stream-safe NFC; runs exceeding 30 non-starters in
 NFKD receive U+034F (CGJ), so those adversarial inputs can differ from ICU.
 
 `stop` takes authored words, for example
@@ -499,13 +495,10 @@ For example, stop after `kstem` analyzes `ponies` to `pony`. Later filters do no
 affect the stop set.
 
 Removed tokens leave position holes before the next emitted token, preserving
-phrase distances. Trailing holes are discarded because token streams do not
-report final position increments yet. Indexed values retain the fixed
-100-position gap, but exact cross-value distances omit trailing stops. Each
-`phrase.words` entry is analyzed independently, so trailing stops at the end of
-an entry also lose their holes; use one `phrase.text` string to preserve internal
-stopword distances. Stop does not remove prefix/fuzzy/range terms or wildcard/
-regex literals during normalization, and cannot appear in STRING normalizers.
+phrase distances. Trailing holes are preserved between indexed values, in
+addition to the fixed 100-position gap, and between `phrase.words` entries.
+Stop does not remove prefix/fuzzy/range terms or wildcard/regex literals during
+normalization, and cannot appear in STRING normalizers.
 
 `kstem` implements Bob Krovetz's dictionary-based English stemming algorithm:
 `ponies` becomes `pony`, while recognized dictionary words are preserved or
