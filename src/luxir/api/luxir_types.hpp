@@ -96,6 +96,7 @@ struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
 namespace KnnQuery_ { struct Ivf; }
+namespace SchemaDef_ { struct IndexSort; }
 namespace VectorAnnDef_ { struct RaBitQ; struct Pq; }
 
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
@@ -793,6 +794,9 @@ struct KnnQuery {                                                // needs Vector
   bool exact = false;
   std::string_view unit;
 };
+namespace SchemaDef_ {
+struct IndexSort { std::string_view field; };
+} // namespace SchemaDef_
 struct StoredResourceDef {
   using Codec = luxir::api::StoredResourceDef_::Codec;
   std::optional<Codec> codec;                                   // align 4 (enum)
@@ -803,8 +807,10 @@ struct StoredResourceDef {
   std::optional<bool> zstd_dictionary;                          // align 1
 };
 struct SchemaDef {                                                // needs StoredResourceDef
+  using IndexSort = luxir::api::SchemaDef_::IndexSort;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> templates;
+  std::optional<IndexSort> index_sort;
   map_view<std::string_view, StoredResourceDef> stored_resources;
 };
 struct ColVal { std::span<const Val> v; };                        // span<incomplete Val> OK
@@ -1168,7 +1174,7 @@ LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(Sc
 LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef) LUXIR_TD(StoredResourceDef)
 LUXIR_TD(VectorAnnDef) LUXIR_TD(VectorAnnDef_::RaBitQ) LUXIR_TD(VectorAnnDef_::Pq)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
-LUXIR_TD(KnnQuery_::Ivf)
+LUXIR_TD(KnnQuery_::Ivf) LUXIR_TD(SchemaDef_::IndexSort)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(OutcomeStats) LUXIR_TD(CollectionActivityStats) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)

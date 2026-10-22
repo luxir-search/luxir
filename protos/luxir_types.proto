@@ -2345,6 +2345,21 @@ message SchemaDef {
   // any field/template may name one as parent.  A name in both maps is an error.
   map<string, FieldDef> templates = 2;
 
+  // Merge source order. Absent in a SET request keeps the current setting;
+  // present with an empty field clears it. Changes affect future merges only.
+  IndexSort index_sort = 3;
+
+  // A merge concatenates its source segments in ascending order of each
+  // source's minimum value of this field instead of segment creation order.
+  // Documents within a source keep their arrival order. When segments are
+  // flushed out of time order, this keeps a merged segment roughly sorted by
+  // time, so column zones stay tight for range pruning and descending time
+  // sorts. Sources without values for the field go last.
+  message IndexSort {
+    // A concrete field or template instance of type int or date with a column.
+    string field = 1;
+  }
+
   // Stored-field groups, keyed by the name fields use as stored_resource. A
   // name is '_', ASCII letters, digits, or underscores, and a closing '_' (for
   // example "_stored_body_"), so it never matches a field or suffix template.
