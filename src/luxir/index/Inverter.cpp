@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <boost/sort/spreadsort/string_sort.hpp>
 #include "luxir/schema/Schema.h"
+#include "luxir/schema/GeoPointCoerce.h"
 
 // include the actual index handlers
 #include "handler/IdHandler.h"
@@ -227,6 +228,20 @@ void Inverter::InputHandler::store(Inverter& inverter, const IndexVal& val) {
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, const IndexVal& val) {
+  if (shape == LogicalField::Shape::GEO) {
+    // Parse once for every branch, and fully before any branch indexes.
+    geoPoints.clear();
+    auto account = scope_guard([&] {
+      size_t bytes = geoPoints.capacity() * sizeof(GeoPoint);
+      inverter.addExtraRam((int64_t)bytes - (int64_t)geoScratchBytes);
+      geoScratchBytes = bytes;
+    });
+    const auto& geoType = static_cast<const GeoPointFieldType&>(*fieldType);
+    coerce::GeoPointInput{std::string_view(fieldName), geoType.ignoreMalformed, geoType.ignoreZValue}
+        .forEachPoint(val, [&](const GeoPoint& point) { geoPoints.push_back(point); });
+    indexPoints(inverter, geoPoints);
+    return;
+  }
   checkShape(val);
   // Capture the original value before any branch's analysis or normalization.
   if (writer) store(inverter, val);
@@ -252,10 +267,19 @@ void Inverter::InputHandler::index(Inverter& inverter, std::span<const int64_t> 
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, double latitude, double longitude) {
-  forEachBranch([&](IndexHandler& branch) { branch.index(inverter, latitude, longitude); });
+  GeoPoint point{latitude, longitude};
+  index(inverter, std::span<const GeoPoint>(&point, 1));
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, std::span<const GeoPoint> points) {
+  for (const auto& point : points) {
+    coerce::checkGeoPoint(point, std::string_view(fieldName), "typed geo point");
+  }
+  indexPoints(inverter, points);
+}
+
+// Points already range-checked.
+void Inverter::InputHandler::indexPoints(Inverter& inverter, std::span<const GeoPoint> points) {
   if (points.size() > 1 && !multi) {
     throw DocumentError(fmt::format("Field '{}' is single-valued but received multiple values",
                                     std::string_view(fieldName)));

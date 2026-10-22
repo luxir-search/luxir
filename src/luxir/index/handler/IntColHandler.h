@@ -9,7 +9,6 @@
 #include "luxir/index/BKDWriter.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/index/IntColWriter.h"
-#include "luxir/index/handler/GeoPointWire.h"
 #include "luxir/index/PointsWriter.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/geo.h"
@@ -395,20 +394,11 @@ public:
   }
 };
 
-inline GeoPointWire geoPointWire(const PackedTerm& fieldName, FieldType& fieldType) {
-  const auto& geo = static_cast<const GeoPointFieldType&>(fieldType);
-  return {std::string_view(fieldName), geo.ignoreMalformed, geo.ignoreZValue};
-}
-
 class GeoPointHandler final : public IntColHandler {
 public:
   GeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
                   const std::shared_ptr<FieldType>& fieldType)
     : IntColHandler(inverter, fieldName, fieldType) {}
-
-  void index(Inverter& inverter, double latitude, double longitude) override {
-    indexSingle(inverter, geo::encodePoint(latitude, longitude));
-  }
 
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
     if (points.empty()) return;
@@ -417,20 +407,7 @@ public:
           "Field '{}' is single-valued but received multiple values",
           std::string_view(fieldName)));
     }
-    index(inverter, points[0].latitude, points[0].longitude);
-  }
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    std::optional<GeoPoint> point;
-    geoPointWire(fieldName, *fieldType).forEachPoint(val, [&](const GeoPoint& p) {
-      if (point) {
-        throw DocumentError(fmt::format(
-            "Field '{}' is single-valued but received multiple values",
-            std::string_view(fieldName)));
-      }
-      point = p;
-    });
-    if (point) index(inverter, point->latitude, point->longitude);
+    indexSingle(inverter, geo::encodePoint(points[0].latitude, points[0].longitude));
   }
 };
 
@@ -440,29 +417,11 @@ public:
                        const std::shared_ptr<FieldType>& fieldType)
     : MultiIntColHandler(inverter, fieldName, fieldType) {}
 
-  void index(Inverter& inverter, double latitude, double longitude) override {
-    int64_t packed = geo::encodePoint(latitude, longitude);
-    indexMulti(inverter, std::views::single(packed));
-  }
-
   void index(Inverter& inverter, std::span<const GeoPoint> points) override {
-    std::vector<int64_t> packed;
-    packed.reserve(points.size());
-    for (const auto& point : points) {
-      packed.push_back(geo::encodePoint(point.latitude, point.longitude));
-    }
-    indexMulti(inverter, packed);
-  }
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    // Parse every point before indexing any (validate before mutate).
-    std::vector<GeoPoint> points;
-    geoPointWire(fieldName, *fieldType).forEachPoint(val, [&](const GeoPoint& p) {
-      points.push_back(p);
-    });
-    index(inverter, std::span<const GeoPoint>(points));
+    indexMulti(inverter, points | std::views::transform([](const GeoPoint& point) {
+      return geo::encodePoint(point.latitude, point.longitude);
+    }));
   }
 };
-
 
 } // namespace luxir::handler

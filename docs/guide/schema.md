@@ -282,7 +282,7 @@ publication advances the schema generation.
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
-| `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. Both default to `false`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
+| `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
 | `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
 
 Every property is optional. Absent means "inherit from `parent`, else the

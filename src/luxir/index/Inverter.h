@@ -8,6 +8,7 @@
 #include <limits>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include "luxir/util/MemPool.h"
+#include "luxir/util/geo.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/schema/Schema.h"
 #include "IndexRamBudget.h"
@@ -19,11 +20,6 @@
 #include "luxir/api/luxir_types.hpp"
 
 namespace luxir {
-
-struct GeoPoint {
-  double latitude;
-  double longitude;
-};
 
 // The indexing path reads field values straight out of the inbound UpdateRequest
 // bytes, which are kept alive for the duration of (synchronous) indexing, so the
@@ -204,23 +200,29 @@ public:
     // constrain later docs; see VectorHandler.
     virtual void index(Inverter& inverter, std::string_view val) {
       unused(inverter, val);
+      unsupportedValue("string");
     }
     // handles an array of strings without creating a new list. non_owning hpp arrays
     // are span<const string_view>, so this takes a const span.
     virtual void index(Inverter& inverter, std::span<const std::string_view> vals) {
       unused(inverter,vals);
+      unsupportedValue("string array");
     }
     virtual void index(Inverter& inverter, int64_t val) {
       unused(inverter, val);
+      unsupportedValue("integer");
     }
     virtual void index(Inverter& inverter, std::span<const int64_t> vals) {
       unused(inverter, vals);
+      unsupportedValue("integer array");
     }
     virtual void index(Inverter& inverter, double latitude, double longitude) {
       unused(inverter, latitude, longitude);
+      unsupportedValue("typed geo point");
     }
     virtual void index(Inverter& inverter, std::span<const GeoPoint> points) {
       unused(inverter, points);
+      unsupportedValue("typed geo point array");
     }
 
     virtual void index(Inverter& inverter, const IndexVal& val) {
@@ -229,7 +231,15 @@ public:
       } else if (std::holds_alternative<luxir::api::ArrStr>(val.kind)) {
         const auto& arr = std::get<luxir::api::ArrStr>(val.kind).v;
         index(inverter, std::span<const std::string_view>(arr.data(), arr.size()));
+      } else if (!std::holds_alternative<std::monostate>(val.kind)
+                 && !std::holds_alternative<google::protobuf::NullValue>(val.kind)) {
+        unsupportedValue("input");
       }
+    }
+
+    [[noreturn]] void unsupportedValue(std::string_view kind) const {
+      throw DocumentError(fmt::format("field '{}': unsupported {} value",
+          std::string_view(fieldName), kind));
     }
 
     // End the indexing phase before any field starts flushing. Handlers that
@@ -283,12 +293,15 @@ public:
     bool multi;
     StoredFieldsWriter* writer;
     std::vector<Branch> branches;
+    std::vector<GeoPoint> geoPoints;
+    size_t geoScratchBytes = 0;
     // The document that last claimed this field, and the slot it claimed (see claim).
     int32_t claimedDoc = -1;
     uint32_t claimedSlot = 0;
 
     void store(Inverter& inverter, const IndexVal& val);
     void checkShape(const IndexVal& val) const;
+    void indexPoints(Inverter& inverter, std::span<const GeoPoint> points);
 
     template<typename F>
     void forEachBranch(F&& index) {

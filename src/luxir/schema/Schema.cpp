@@ -597,6 +597,11 @@ struct FieldCompiler {
       stored = (r.type == FieldClass::TEXT);
     }
 
+    if (geoClass && stored) {
+      throw SchemaError("stored=true is not supported for geo_point fields (field: " +
+                        std::string(name) + ")");
+    }
+
     // Build flags
     FieldType::flag_type flags = 0;
     if (index == IndexMode::MATCH) {
@@ -668,7 +673,7 @@ struct FieldCompiler {
         break;
       case FieldClass::GEO_POINT:
         ft = std::make_shared<GeoPointFieldType>(name, flags, r.geoIgnoreMalformed.value_or(false),
-                                                 r.geoIgnoreZValue.value_or(false));
+                                                 r.geoIgnoreZValue.value_or(true));
         break;
       case FieldClass::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
@@ -1025,10 +1030,6 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
             (r.vectorDims <= 0 || branch.vectorDims != r.vectorDims)) {
           throw SchemaError("vector variants require the same positive dims as the primary: " + name);
         }
-        // Every branch reads the same input value, so they skip or reject a
-        // malformed point together.
-        branch.geoIgnoreMalformed = r.geoIgnoreMalformed;
-        branch.geoIgnoreZValue = r.geoIgnoreZValue;
         branch.isTemplate = e.isTemplate;
         auto ft = compiler.create(name, branch, owned, true);
         logical->variants.emplace(label, std::move(ft));

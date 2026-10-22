@@ -27,6 +27,9 @@ index for boxes and circles. If it is omitted, the same queries remain correct
 and scan the point column instead. The indexed and scan paths return the
 same results; only the cost differs.
 
+Geo fields reject `stored: true`: points are kept in the field's column for
+queries and sorting, not as stored values.
+
 For a document with several locations, set `multi: true`:
 
 ```json
@@ -66,7 +69,9 @@ alike:
 | Geohash | `"dr5regw3p"` | 1 to 12 characters; decoded to the centre of the cell |
 
 Keep the order straight: arrays, GeoJSON and WKT put longitude first, while
-the `"lat,lon"` string puts latitude first.
+the `"lat,lon"` string puts latitude first. A string with no comma that is
+not WKT is read as a geohash. For example, a coordinate sent as the bare
+string `"40"` becomes a coarse geohash cell, not a number.
 
 A multi-valued field takes an array of points, in any mix of forms:
 
@@ -94,11 +99,14 @@ document with an error naming the field. Two field properties relax this:
   document. In a multi-valued field only the bad points are skipped. Skipped
   values are not reported in the update response.
 - A third coordinate (`[lon, lat, z]`, `"lat,lon,z"`, `POINT Z (lon lat z)`)
-  is an altitude. It is rejected unless `ignore_z_value: true`, which accepts
-  the point and drops the altitude. Altitude is never indexed.
+  is an altitude. By default `ignore_z_value: true` accepts the point and
+  drops the altitude. Set `ignore_z_value: false` to reject a third coordinate.
+  Altitude is never indexed.
 
-Both default to `false`, so a typo or a swapped coordinate order is reported
-rather than dropped. Templates and `parent` inheritance carry them like other
+`ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`.
+An in-range longitude/latitude swap cannot be detected. Rejected points name
+the recognized form and interpreted `lon` and `lat` when both can be read.
+Templates and `parent` inheritance carry these options like other
 properties. They belong to the logical field, like `multi`: a
 [variant](schema.md#field-variants) of a geo field follows the primary's
 settings and cannot set its own.

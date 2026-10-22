@@ -344,7 +344,7 @@ public:
   bool ignoreZValue;
 
   GeoPointFieldType(std::string_view name, int flags=COLUMN_STORED,
-                    bool ignoreMalformed = false, bool ignoreZValue = false)
+                    bool ignoreMalformed = false, bool ignoreZValue = true)
     : FieldType(name, FieldType::GEO_POINT, flags),
       ignoreMalformed(ignoreMalformed), ignoreZValue(ignoreZValue) {
   }

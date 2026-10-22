@@ -2355,13 +2355,13 @@ message FieldDef {
   optional DateUnit unit = 24;
 
   // GEO_POINT only. Skip a value that is not a valid point (unreadable, out of
-  // range, or a z coordinate without ignore_z_value) and index the rest of the
-  // document; in a multi-valued field only the bad points are skipped. Unset
-  // inherits, else false: a malformed point fails the document.
+  // range, or a z coordinate when ignore_z_value is false) and index the rest
+  // of the document; in a multi-valued field only the bad points are skipped.
+  // Unset inherits, else false: a malformed point fails the document.
   optional bool ignore_malformed = 28;
 
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
-  // inherits, else false: a point with a z coordinate is malformed.
+  // inherits, else true. Set false to reject a point with a z coordinate.
   optional bool ignore_z_value = 29;
 }
 
