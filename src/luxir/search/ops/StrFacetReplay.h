@@ -255,7 +255,7 @@ void forEachSelectedBucketDoc(
     if (!owners.empty()) callback(currentDoc, std::span<const int32_t>(owners));
     owners.clear();
   };
-  forEachOrdValue(
+  forEachOrdDocument(
       domain, parentColumn, OrdMap::SegToGlobal::identity(), maxDoc,
       parentMissing,
       [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {

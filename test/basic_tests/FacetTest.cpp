@@ -7961,3 +7961,64 @@ TEST_F(FacetTest, multiColumnOnlyStringFacetIsRejected) {
   EXPECT_FALSE(req->ok());
   EXPECT_NE(std::string::npos, req->errorMsg().find("column-only (not indexed)"));
 }
+
+TEST_F(FacetTest, indexedStringArrayBucketsCountDocumentsAcrossPlans) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  for (auto name : {"parent", "child"}) for (bool array : {false, true}) {
+    auto& f = schema.field(std::string(name) + (array ? "_array" : "_set"));
+    f.type = api::FieldDef::FieldClass::STRING;
+    f.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+  }
+  schema.set(helper.collection());
+  // One doc spans multiple decoded batches; its repeats must dedup across them.
+  std::vector<std::string> repeats(600, "a");
+  repeats[1] = "z";
+  for (int i = 0; i < 6; i++) {
+    auto p = i == 0 ? repeats : i == 1 ? vecs("b", "a", "b") : vecs("b", "z", "b");
+    auto c = i == 0 ? vecs("y", "x", "y") : vecs("x", "y", "x");
+    ASSERT_TRUE(helper.index(flatdoc("id", std::to_string(i),
+        "parent_array", p, "parent_set", p, "child_array", c, "child_set", c,
+        "metric_i", i + 1, "selected_s", i < 4 ? "yes" : "no"),
+        i % 2 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT).success);
+  }
+  ASSERT_TRUE(helper.deleteById("5", UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(forcedStrFacetStrategy, forcedFacetSubOpInline, forcedFacetFeedStrategy);
+  // Compare complete responses below, using the same operation names in each.
+  auto result = [&](bool array, bool metrics, bool nested, bool filtered, bool parallel) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->collection("main").topDocs("q").countLimit();
+    if (filtered) top.matchQuery("selected_s", "yes"); else top.allQuery();
+    auto& parent = top.facet("f", array ? "parent_array" : "parent_set").limit(-1);
+    if (metrics) parent.avg("avg", "metric_i");
+    if (nested) parent.facet("child", array ? "child_array" : "child_set").limit(-1);
+    req->execute(parallel);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    std::vector<std::byte> encoded;
+    EXPECT_TRUE(api::encode(topFacetResult(*req, "q", "f"), encoded));
+    return encoded;
+  };
+  for (int merge = 0; merge < 2; merge++) {
+    for (bool parallel : {false, true}) for (bool filtered : {false, true}) {
+      forcedFacetSubOpInline = FacetSubOpInlineMode::AUTO;
+      for (auto strategy : {StrFacetStrategy::COLUMN_DOMAIN, StrFacetStrategy::COLUMN_COMPLEMENT,
+                            StrFacetStrategy::TERM_DRIVEN, StrFacetStrategy::TOP_TERMS}) {
+        forcedStrFacetStrategy = strategy;
+        EXPECT_EQ(result(false, false, false, filtered, parallel), result(true, false, false, filtered, parallel));
+      }
+      forcedStrFacetStrategy = StrFacetStrategy::COLUMN_DOMAIN;
+      forcedFacetSubOpInline = FacetSubOpInlineMode::ALL;
+      EXPECT_EQ(result(false, true, false, filtered, parallel), result(true, true, false, filtered, parallel));
+      forcedFacetSubOpInline = FacetSubOpInlineMode::AUTO;
+      for (auto feed : {FacetFeedStrategy::BUCKET_DOMAINS, FacetFeedStrategy::STRING_COLUMN_REPLAY}) {
+        forcedFacetFeedStrategy = feed;
+        EXPECT_EQ(result(false, true, true, filtered, parallel), result(true, true, true, filtered, parallel));
+      }
+    }
+    if (!merge) {
+      CollectionHelper::UpdateBuilder update;
+      update.commit(true, 1);
+      ASSERT_TRUE(helper.submit(update).success);
+    }
+  }
+}

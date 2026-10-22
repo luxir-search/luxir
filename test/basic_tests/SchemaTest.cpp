@@ -1153,12 +1153,14 @@ TEST_F(SchemaTest, multiModesJsonBinaryAndViews) {
     "t":{"type":"text","multi":true,"variants":{"n":"int"}},
     "f":{"type":"float","multi":true}, "dt":{"type":"date","multi":"array"},
     "s":{"type":"string","multi":true},
+    "indexed_array":{"type":"string","multi":"array"},
+    "text_array":{"type":"text","multi":"array","variants":{"s":"string"}},
     "c":{"type":"string","index":"none","multi":"array"},
     "v":{"type":"vector","multi":"array"}, "g":{"type":"geo_point","multi":true},
     "one":{"type":"double","multi":false}
   }})");
   for (auto name : {"n", "f", "s", "t__n"}) EXPECT_TRUE(schema->physical(name)->multiSet()) << name;
-  for (auto name : {"a", "a__d", "t", "dt", "c", "v", "g"}) {
+  for (auto name : {"a", "a__d", "t", "dt", "c", "v", "g", "indexed_array", "text_array", "text_array__s"}) {
     EXPECT_TRUE(schema->physical(name)->multiArray()) << name;
   }
   EXPECT_FALSE(schema->physical("one")->multiValued());
@@ -1203,14 +1205,14 @@ TEST_F(SchemaTest, declaredModesSurviveTypeChangingInheritance) {
   for (auto name : {"n", "n__s", "s"}) EXPECT_TRUE(copy->physical(name)->multiSet()) << name;
   for (auto name : {"s__t", "a"}) EXPECT_TRUE(copy->physical(name)->multiArray()) << name;
   EXPECT_THROW(schemaJson(R"({"fields":{"s":{"parent":"_set","type":"text"}}})", copy.get()), SchemaError);
-  EXPECT_THROW(schemaJson(R"({"fields":{"s":{"parent":"_array","type":"string"}}})", copy.get()), SchemaError);
+  EXPECT_TRUE(schemaJson(R"({"fields":{"s":{"parent":"_array","type":"string"}}})", copy.get())->physical("s")->multiArray());
 }
 
 TEST_F(SchemaTest, multiModeValidationAndHistory) {
   for (auto type : {"text", "vector", "geo_point"}) {
     EXPECT_THROW(schemaJson(std::format(R"({{"fields":{{"f":{{"type":"{}","multi":"set"}}}}}})", type)), SchemaError);
   }
-  EXPECT_THROW(schemaJson(R"({"fields":{"s":{"type":"string","multi":"array"}}})"), SchemaError);
+  EXPECT_TRUE(schemaJson(R"({"fields":{"s":{"type":"string","multi":"array"}}})")->physical("s")->multiArray());
   EXPECT_TRUE(schemaJson(R"({"fields":{"n":{"type":"int","multi":"set","variants":{"t":"text"}}}})")->physical("n__t")->multiArray());
   for (auto value : {"null", "1", "{}", R"("default")", R"("unknown")"}) {
     EXPECT_THROW(schemaJson(std::format(R"({{"fields":{{"f":{{"type":"int","multi":{}}}}}}})", value)), std::runtime_error);

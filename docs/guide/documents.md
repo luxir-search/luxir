@@ -268,9 +268,9 @@ For a multi-valued field, stored values keep source order and duplicates.
 Numeric and date columns default to set mode: values are returned ascending,
 with duplicates removed. Declare `"multi": "array"` to keep source order and
 duplicates in the column. Numeric fields have no separate stored-source copy.
-Indexed string columns are sorted, deduplicated sets. Column-only STRING
-columns in set mode return normalized values in byte order with duplicates
-removed; array mode keeps source order and duplicates. Geo point and VECTOR
+Indexed and column-only STRING columns in set mode return normalized values
+in byte order with duplicates removed; array mode keeps normalized source
+order and duplicates. Geo point and VECTOR
 columns keep source order. See [Multi-valued modes](schema.md#field-properties).
 
 ### Multi-valued text and phrases

@@ -282,7 +282,7 @@ publication advances the schema generation.
 | `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
 
 `multi` is inherited when omitted and defaults to `false`. INT, FLOAT,
-DOUBLE, DATE, STRING, and ID default to set mode. TEXT, VECTOR, and GEO_POINT
+DOUBLE, DATE, and STRING default to set mode. TEXT, VECTOR, and GEO_POINT
 support array mode only; declaring `"set"` on one of these primary types is
 an error. The built-in `id` field remains single-valued.
 
@@ -290,9 +290,10 @@ Each representation resolves the logical field's declaration against its own
 type. With `true`, a TEXT primary uses array mode and its STRING variant uses
 set mode. With `"set"`, numeric and STRING representations use sets while
 an array-only variant such as TEXT uses an array. Explicit `"array"` applies
-to every representation. Indexed STRING/ID array mode is not yet supported
-and is rejected. Column-only STRING columns store sorted unique normalized bytes in set mode,
-and preserve source order and duplicates in array mode.
+to every representation. Indexed and column-only STRING columns store sorted
+unique normalized bytes in set mode, and preserve normalized source order and
+duplicates in array mode. Indexed STRING postings contain each document once
+per term in both modes. The ID type is reserved for the single-valued `id` field.
 
 The authored schema view echoes the declaration (`true`, `false`, `"set"`,
 or `"array"`), preserving inheritance through templates that change type.

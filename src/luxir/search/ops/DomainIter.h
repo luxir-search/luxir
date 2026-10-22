@@ -11,6 +11,7 @@
 #include "luxir/util/MemPool.h"
 #include "luxir/util/luxir_util.h"
 #include <optional>
+#include <boost/unordered/unordered_flat_set.hpp>
 
 namespace luxir {
 
@@ -534,6 +535,28 @@ private:
   template <Source S> int32_t nextRankDoc();
 };
 
+// A bucket-membership view of a lossless ord walk. ARRAY-only callers opt in;
+// the SET batch decoder and its consumers retain their original loops.
+class DistinctOrdValueBatches {
+  OrdValueBatches& values;
+  boost::unordered_flat_set<int64_t> seen;
+  int32_t lastDoc = -1;
+public:
+  explicit DistinctOrdValueBatches(OrdValueBatches& values) : values(values) {}
+  bool next(OrdValueBatches::Batch& batch);
+};
+
+template <class F>
+void LUXIR_NOINLINE consumeArrayOrdDocuments(OrdValueBatches& values,
+                                            int64_t& missing_num, F& callback) {
+  DistinctOrdValueBatches distinct(values);
+  OrdValueBatches::Batch batch;
+  while (distinct.next(batch)) {
+    for (int32_t i = 0; i < batch.size; i++) callback(batch.docs[i], batch.ords[i]);
+  }
+  missing_num += values.missing();
+}
+
 // The consuming half of a walk: the caller's callback, once per decoded
 // value, in a loop over each batch.
 template <class F>
@@ -562,6 +585,27 @@ void forEachOrdValue(DocSet* domain, OrdColReader& ordColReader,
   consumeOrdValues(values, missing_num, callback);
 }
 
+template <class F>
+void LUXIR_NOINLINE forEachArrayOrdDocument(
+    DocSet* domain, OrdColReader& column, const OrdMap::SegToGlobal& ordSpace,
+    int32_t maxDoc, int64_t& missing_num, F&& callback) {
+  OrdValueBatches values(domain, column, ordSpace, maxDoc, false, nullptr);
+  consumeArrayOrdDocuments(values, missing_num, callback);
+}
+
+// Document membership per term. Pass the original callback straight through on
+// the existing SET/single-valued path (the hot walk's inlining is sensitive).
+template <class F>
+void forEachOrdDocument(DocSet* domain, OrdColReader& column,
+                        const OrdMap::SegToGlobal& ordSpace, int32_t maxDoc,
+                        int64_t& missing_num, F&& callback) {
+  if (!column.multiArray() || !column.multiValued()) {
+    forEachOrdValue(domain, column, ordSpace, maxDoc, missing_num, std::forward<F>(callback));
+  } else {
+    forEachArrayOrdDocument(domain, column, ordSpace, maxDoc, missing_num, std::forward<F>(callback));
+  }
+}
+
 // Walk the complement of a resolved facet domain over the ord column. Bitset
 // domains drive the shared adaptive machinery through inverted word reads, so
 // no second bitset is materialized. Array domains (reachable only when a
@@ -588,7 +632,7 @@ void forEachComplementOrdValue(DomainView& view, MemPool& pool,
     }
     FixedBitSet complementBits(words, view.maxDoc);
     BitDocSet complement(complementBits, view.compCard);
-    forEachOrdValue(&complement, ordColReader, OrdMap::SegToGlobal::identity(),
+    forEachOrdDocument(&complement, ordColReader, OrdMap::SegToGlobal::identity(),
                     view.maxDoc, missing_num, std::forward<F>(callback));
     return;
   }
@@ -599,7 +643,11 @@ void forEachComplementOrdValue(DomainView& view, MemPool& pool,
   OrdValueBatches values(view.domain, ordColReader,
                          OrdMap::SegToGlobal::identity(), view.maxDoc, true,
                          nullptr);
-  consumeOrdValues(values, missing_num, callback);
+  if (ordColReader.multiArray() && ordColReader.multiValued()) {
+    consumeArrayOrdDocuments(values, missing_num, callback);
+  } else {
+    consumeOrdValues(values, missing_num, callback);
+  }
 }
 
 }

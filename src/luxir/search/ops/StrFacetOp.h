@@ -751,7 +751,8 @@ public:
         }
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
-        if (found && data.counts.acceptsKeyedBatches()) {
+        if (found && !(segFieldInfo->flags & FieldType::MULTI_ARRAY)
+            && data.counts.acceptsKeyedBatches()) {
           // Each decoded ord batch goes to the calculators whole: they read
           // their columns for its docs and fold the values into the ords'
           // entries in one call.
@@ -1467,9 +1468,8 @@ public:
     // intersection per bucket.  Indexed [segment * numBuckets + owner], which is
     // what the bucket-domain executor asks for.
     //
-    // A document reaches a builder at most once: ord columns carry each doc's
-    // distinct terms, and the segment-to-global mapping is injective, so no two
-    // stored ords of one document route to the same owner.  DocSetBuilder's
+    // A document reaches a builder at most once: the membership walk dedups
+    // ARRAY terms; the segment-to-global mapping is injective.  DocSetBuilder's
     // debug monotonicity assert covers the claim.
     std::vector<DomainHandle> ordColumnBucketDomains(
         std::span<const SelectedFacetBucket<std::string_view>> buckets) {
@@ -1497,7 +1497,7 @@ public:
           int64_t missing_num = 0;
           DocSet* domain = input[segnum].get();
           selectedMap.visit([&](const auto& ownerOfOrd) {
-            forEachOrdValue(
+            forEachOrdDocument(
                 domain, ordColReader, OrdMap::SegToGlobal::identity(), maxDoc,
                 missing_num,
                 [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
@@ -1715,6 +1715,19 @@ public:
     int64_t maxDocs = 0;
     int64_t expectedUpdates = 0;
 
+    template <typename Visit>
+    static bool LUXIR_NOINLINE visitArrayChildOrds(
+        OrdColReader& column, OrdColReader::Iterator& iter,
+        const OrdMap::SegToGlobal& mapping, Visit&& visit) {
+      auto [start, end] = column.getStartEndValueRank(iter.rank());
+      boost::unordered_flat_set<int32_t> seen;
+      for (int64_t rank = start; rank < end; rank++) {
+        int32_t ord = iter.values().valueAt(rank);
+        if (seen.insert(ord).second) visit(mapping.globalOrd((int64_t)ord - 1));
+      }
+      return start != end;
+    }
+
     template <bool ChildMulti, typename Visit>
     static bool visitChildOrds(
         int32_t docid, OrdColReader& childColumn,
@@ -1729,6 +1742,10 @@ public:
         visit(childMapping.globalOrd((int64_t)storedOrd - 1));
         return true;
       } else {
+        if (childColumn.multiArray()) {
+          return visitArrayChildOrds(childColumn, childIterator, childMapping,
+                                    std::forward<Visit>(visit));
+        }
         auto [start, end] = childColumn.getStartEndValueRank(
             childIterator.rank());
         for (int64_t rank = start; rank < end; rank++) {

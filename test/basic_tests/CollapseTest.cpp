@@ -1641,3 +1641,35 @@ TEST_F(CollapseTest, multiColumnStringRanksSelectExtremaInBothModes) {
     }
   }
 }
+
+TEST_F(CollapseTest, indexedStringArrayRanksSelectWinningMemberExtrema) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("sort_array");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.multi = api::FieldDef::MultiMode::ARRAY;
+  schema.set(helper.collection());
+  helper.index(flatdoc("id", "a", "key_s", "x", "sort_array", vecs("m", "z", "a", "m")), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "b", "key_s", "y", "sort_array", vecs("p", "y", "b", "p")), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "0a", "key_s", "x", "sort_array", "n"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "0b", "key_s", "y", "sort_array", "q"), UpdateMessage::COMMIT);
+  for (int merge = 0; merge < 2; merge++) {
+    for (auto [sort, first, second] : {
+        std::tuple{R"("sort_array asc")", "a", "b"}, {R"("sort_array desc")", "z", "y"}}) {
+      for (int parallel : {0, -1}) {
+        auto req = run("main", "*:*", R"({"field":"key_s","get_count":true,"head_sort":"id asc"})",
+                       -1, 0, parallel, true, 10, sort);
+        ASSERT_TRUE(req->ok()) << req->errorMsg();
+        const auto& groups = *req->docList()->groups;
+        ASSERT_EQ(2u, groups.ranks.size());
+        EXPECT_EQ(first, groups.ranks[0].v[0].asString());
+        EXPECT_EQ(second, groups.ranks[1].v[0].asString());
+      }
+    }
+    if (!merge) {
+      CollectionHelper::UpdateBuilder update;
+      update.commit(true, 1);
+      ASSERT_TRUE(helper.submit(update).success);
+    }
+  }
+}

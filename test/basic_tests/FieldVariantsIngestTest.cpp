@@ -617,3 +617,24 @@ TEST_F(FieldVariantsIngestTest, vectorBranchesFinishTheirRawColumns) {
   req->execute();
   EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("vec", values, "vec__copy", values)));
 }
+
+TEST_F(FieldVariantsIngestTest, declaredArrayPreservesIndexedStringVariantSequence) {
+  CollectionHelper helper;
+  SchemaBuilder b;
+  auto& text = b.field("author");
+  text.type = FieldClass::TEXT;
+  text.multi = api::FieldDef::MultiMode::ARRAY;
+  auto& exact = b.variant(text, "s");
+  exact.type = FieldClass::STRING;
+  b.normalizer(exact, {"nfkc_cf"});
+  b.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "author", vecs("Z", "B", "b", "A")), UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"author__s"});
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& values = std::get<api::ArrArrStr>(req->docList("q")->columns.at("author__s").kind).v;
+  ASSERT_EQ(1u, values.size());
+  EXPECT_EQ((std::vector<std::string>{"z", "b", "b", "a"}), std::vector<std::string>(values[0].v.begin(), values[0].v.end()));
+  EXPECT_EQ(1u, match(helper, "author__s", "b").size());
+}

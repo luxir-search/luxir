@@ -746,10 +746,12 @@ public:
 // A comparator for string fields that uses global ordinals for efficient cross-segment comparison
 // Selected segment ord for sorting: single-valued docs read their one ord;
 // multi-valued docs sort by their smallest ord ascending and largest ord
-// descending (min/max term semantics). Returns 0 for missing.
-inline int32_t selectedSortOrd(const OrdColReader& reader, int32_t docid,
-                               bool descending) {
+// descending (min/max term semantics). Returns 0 for missing. Forced inline:
+// the comparators' hot paths depend on it folding into their callers.
+LUXIR_INLINE inline int32_t selectedSortOrd(const OrdColReader& reader, int32_t docid,
+                                            bool descending) {
   if (!reader.multiValued()) return reader.ordAt(docid);
+  if (reader.multiArray()) return reader.selectedArrayOrdAt(docid, descending);
   if (!descending) return reader.firstOrdAt(docid);
   const DocsReader& docs = reader.docsReader();
   int32_t docRank;
@@ -861,7 +863,7 @@ public:
     return OrdIntervalStatus::READY;
   }
 
-  int64_t getGlobalOrd(int32_t docid) {
+  LUXIR_INLINE int64_t getGlobalOrd(int32_t docid) {
     if (!reader.has_value()) {
       return missingOrd;
     }
@@ -996,7 +998,7 @@ class SegmentOrdComparator : public FieldComparator {
     slot.length = (uint32_t)value.size();
   }
 
-  int32_t selectedOrd(int32_t docid) const {
+  LUXIR_INLINE int32_t selectedOrd(int32_t docid) const {
     if (!reader.has_value()) return 0;
     return selectedSortOrd(*reader, docid, sortMultiplier < 0);
   }

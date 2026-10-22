@@ -280,7 +280,7 @@ public:
     }
     const auto& segFieldInfo = *info;
     OrdColReader ordColReader(postingsReader, segFieldInfo);
-    forEachOrdValue(domain, ordColReader, ordSpace, maxDoc, missing_num,
+    forEachOrdDocument(domain, ordColReader, ordSpace, maxDoc, missing_num,
                     callback);
     return true;
   }

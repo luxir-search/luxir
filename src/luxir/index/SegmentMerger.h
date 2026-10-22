@@ -18,6 +18,7 @@
 #include "luxir/reader/PointsReader.h"
 #include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/StrColReader.h"
+#include "luxir/reader/OrdColReader.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/util/geo.h"
@@ -780,6 +781,15 @@ private:
       // postings pass finishes: OrdCollector allocates ords[mergedMaxDoc] (int32)
       // up front, plus roughly a TaggedPtr/entry of pool per value for multi-value
       // chains.  This is the heavy class the budget exists for.
+      if (allFlags & FieldType::MULTI_ARRAY) {
+        int64_t mapBytes = 0;
+        for (const auto& field : fields) mapBytes += (field.segFieldInfo.nTerms + 1) * sizeof(uint32_t);
+        // Mapped source runs stream directly; only maps and codec plans grow.
+        int64_t blocks = (numValues + OrdColumnFormat::BLOCK_SIZE - 1) / OrdColumnFormat::BLOCK_SIZE;
+        return mapBytes + (int64_t)fields.size() * sizeof(std::vector<uint32_t>)
+            + blocks * (2 * sizeof(OrdColumnFormat::PredictedBlockPlan))
+            + MergeCostModel::LIGHT_BYTES + pointsBytes;
+      }
       return (int64_t)postingsWriter.getMaxDoc() * 4 + numValues * 8
           + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
@@ -1136,10 +1146,11 @@ private:
     return plan;
   }
 
-  template<DocsEnumTier Tier>
+  template<DocsEnumTier Tier, bool Array = false>
   void mergeTermsTier(TextWriter& textWriter, std::span<MergeFieldInfo*> compactFields,
                       OrdCollector* ordCollector, const std::optional<std::string>& lower,
-                      const std::optional<std::string>& upper, MemPool& pool) {
+                      const std::optional<std::string>& upper, MemPool& pool,
+                      std::vector<std::vector<uint32_t>>* ordMaps = nullptr) {
     struct TermsEnumIdx {
       TermsEnum tenum;
       size_t idx;
@@ -1177,9 +1188,18 @@ private:
         TermsEnumIdx& entry = termPQ.top();
         BasicDocsEnum<Tier> docsEnum(entry.tenum);
         if constexpr (Tier == DocsEnumTier::DOCS) {
-          assert(ordCollector != nullptr);
-          addDocsOrds(textWriter, docsEnum, *compactFields[entry.idx]->seg,
-                      *ordCollector, termOrd);
+          if constexpr (Array) {
+            (*ordMaps)[entry.idx][(size_t)entry.tenum.ord() + 1] = (uint32_t)termOrd;
+            const auto& seg = *compactFields[entry.idx]->seg;
+            for (int32_t doc = docsEnum.nextDoc(); doc != INT_MAX; doc = docsEnum.nextDoc()) {
+              auto [mapped, deleted] = seg.remapDocId(doc);
+              if (!deleted) textWriter.addDoc(mapped, 1);
+            }
+          } else {
+            assert(ordCollector != nullptr);
+            addDocsOrds(textWriter, docsEnum, *compactFields[entry.idx]->seg,
+                        *ordCollector, termOrd);
+          }
         } else if constexpr (Tier == DocsEnumTier::FREQS) {
           addDocsFreq(textWriter, docsEnum, *compactFields[entry.idx]->seg);
         } else {
@@ -1213,6 +1233,104 @@ private:
       mergeTermsTier<DocsEnumTier::FREQS>(
           textWriter, compactFields, ordCollector, lower, upper, pool);
     }
+  }
+
+  // A replayable, doc-ordered source for the writer's count/plan/encode passes.
+  // Only one source column/cursor is live at a time. Sequence payloads stay on
+  // disk rather than being copied into another merge-time collector.
+  class MergedArrayOrds {
+    std::span<MergeFieldInfo*> fields;
+    const std::vector<std::vector<uint32_t>>& maps;
+    int32_t maxDoc;
+    int32_t docCount = 0;
+    bool multi = false;
+    mutable size_t fieldIndex = 0;
+    mutable std::optional<OrdColReader> column;
+    mutable std::optional<OrdColReader::Iterator> iter;
+    mutable int32_t nextDoc = -1;
+    mutable int32_t requested = -1;
+
+    void advance() const {
+      while (fieldIndex < fields.size()) {
+        auto& field = *fields[fieldIndex];
+        if (!column) {
+          column.emplace(*field.seg->postingsReader, field.segFieldInfo);
+          iter.emplace(*column);
+        }
+        for (int32_t doc = iter->next(); doc != OrdColReader::ENDDOC; doc = iter->next()) {
+          auto [mapped, deleted] = field.seg->remapDocId(doc);
+          if (!deleted) { nextDoc = mapped; return; }
+        }
+        iter.reset();
+        column.reset();
+        fieldIndex++;
+      }
+      nextDoc = OrdColReader::ENDDOC;
+    }
+
+    bool seek(int32_t doc) const {
+      if (requested < 0 || doc < requested) {
+        iter.reset();
+        column.reset();
+        fieldIndex = 0;
+        nextDoc = -1;
+      }
+      requested = doc;
+      while (nextDoc < doc) advance();
+      return nextDoc == doc;
+    }
+
+  public:
+    MergedArrayOrds(std::span<MergeFieldInfo*> fields,
+                    const std::vector<std::vector<uint32_t>>& maps, int32_t maxDoc)
+        : fields(fields), maps(maps), maxDoc(maxDoc) {
+      for (auto* field : fields) {
+        OrdColReader source(*field->seg->postingsReader, field->segFieldInfo);
+        OrdColReader::Iterator docs(source);
+        for (int32_t doc = docs.next(); doc != OrdColReader::ENDDOC; doc = docs.next()) {
+          if (field->seg->remapDocId(doc).second) continue;
+          docCount++;
+          if (source.multiValued() && !multi) {
+            auto [start, end] = source.getStartEndValueRank(docs.rank());
+            multi = end - start > 1;
+          }
+        }
+      }
+    }
+    int32_t size() const { return maxDoc; }
+    int32_t docsWithValue() const { return docCount; }
+    bool multiValued() const { return multi; }
+    bool hasValues(int32_t doc) const { return seek(doc); }
+    void pushValues(int32_t doc, auto&& acceptor) const {
+      if (!seek(doc)) return;
+      const auto& map = maps[fieldIndex];
+      if (!column->multiValued()) {
+        acceptor(map[iter->value()]);
+      } else {
+        auto [start, end] = column->getStartEndValueRank(iter->rank());
+        for (int64_t rank = start; rank < end; rank++) {
+          acceptor(map[iter->values().valueAt(rank)]);
+        }
+      }
+    }
+  };
+
+  // ARRAY columns cannot be reconstructed from DOCS-only postings. Keep their
+  // term map/replay workspace and walks out of the SET merge instantiation.
+  void LUXIR_NOINLINE mergeArrayOrdColumn(
+      std::span<MergeFieldInfo*> fields, PostingsWriter::IndexFieldInfo& output,
+      MemPool& pool) {
+    std::vector<std::vector<uint32_t>> ordMaps;
+    for (auto* field : fields) ordMaps.emplace_back((size_t)field->segFieldInfo.nTerms + 1);
+    TextWriter textWriter(postingsWriter);
+    textWriter.startField(&output);
+    mergeTermsTier<DocsEnumTier::DOCS, true>(textWriter, fields, nullptr,
+        std::nullopt, std::nullopt, pool, &ordMaps);
+    textWriter.endField();
+
+    MergedArrayOrds ords(fields, ordMaps, postingsWriter.getMaxDoc());
+    BasicOrdColWriter<MergedArrayOrds> writer(pool, postingsWriter, output, ords);
+    writer.finish();
   }
 
   class PartitionCoordinator {
@@ -1539,6 +1657,10 @@ private:
 
     // if this is an indexed string column, we need to collect the ordinals for each doc
     bool isOrdCol = (type == FieldType::Type::STRING) && (allFlags & FieldType::INDEX_DOCS);
+    if (isOrdCol && (allFlags & FieldType::MULTI_ARRAY)) {
+      mergeArrayOrdColumn(compactFields, outputFieldInfo, pool);
+      return;
+    }
     std::optional<OrdCollector> ordCollector;
     // use a separate pool for the ordCollector since the ords will be built at the same time as the postings are read/written,
     // and we want to roll back much of that allocation, but preserve the ords.

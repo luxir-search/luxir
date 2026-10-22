@@ -550,10 +550,6 @@ struct FieldCompiler {
         throw SchemaError("index=match is not supported for this type (field: " + std::string(name) + ")");
       }
     }
-    if (mode == MultiMode::ARRAY && index != IndexMode::NONE
-        && (r.type == FieldClass::STRING || r.type == FieldClass::ID)) {
-      throw SchemaError("multi=array is not yet supported for indexed STRING/ID field: " + std::string(name));
-    }
     if (!logical.hasStored) {
       // TEXT fields are stored by default so the raw (pre-analysis) value can
       // be returned in search results.  Other types default to false;

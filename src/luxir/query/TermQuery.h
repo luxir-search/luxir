@@ -590,7 +590,7 @@ public:
         assert(normDoc == doc);
         return normsIter->value();
       }
-      if (ordReader != nullptr) return ordReader->firstOrdAt(doc);
+      if (ordReader != nullptr) return ordReader->minOrdAt(doc);
       int32_t normDoc = valueIter->advance(doc);
       assert(normDoc == doc);
       return valueIter->value();

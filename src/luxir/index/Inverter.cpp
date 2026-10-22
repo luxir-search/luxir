@@ -118,7 +118,11 @@ Inverter::IndexHandler& Inverter::createPhysicalHandler(
         fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType);
       } else {
         // indexed and column stored (via ord)
-        fieldHandler = pool.make_unique<handler::StrHandler>(*this, name, fieldType);
+        if (fieldType->multiArray()) {
+          fieldHandler = pool.make_unique<handler::StrHandler<true>>(*this, name, fieldType);
+        } else {
+          fieldHandler = pool.make_unique<handler::StrHandler<>>(*this, name, fieldType);
+        }
       }
       break;
     case FieldType::Type::INT:
