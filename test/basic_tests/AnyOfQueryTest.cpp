@@ -229,6 +229,32 @@ TEST_F(AnyOfQueryTest, dateIsOneIngestInstantNotAPartialRange) {
   EXPECT_EQ((std::vector<std::string>{"a"}), resultIds(*req));
 }
 
+TEST_F(AnyOfQueryTest, nanosecondMembersAreExactAndOutOfDomainMembersAreDropped) {
+  SchemaBuilder schema;
+  auto& field = schema.field("stamp");
+  field.type = api::FieldDef::FieldClass::DATE;
+  field.unit = api::FieldDef::DateUnit::NS;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "zero", "stamp", 0),
+      flatdoc("id", "tick", "stamp", 1), flatdoc("id", "ms", "stamp", 1000000),
+      flatdoc("id", "inside_ms", "stamp", 1000001)}, UpdateMessage::COMMIT).success);
+  for (bool hasMember : {false, true}) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& top = req->collection("main").topDocs("q").withStats().fields({"id"}).limit(-1);
+    top.rawQuery() = anyOfQuery(top.mr(), "stamp", {intVal(INT64_MIN), intVal(INT64_MAX),
+        strVal("1500-01-01"), strVal("3000-01-01"),
+        strVal(hasMember ? "1970-01-01T00:00:00.001Z" : "3000-01-01")});
+    req->execute();
+    ASSERT_OK(req);
+    EXPECT_EQ(hasMember ? (std::vector<std::string>{"ms"}) : std::vector<std::string>{}, resultIds(*req));
+  }
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").exprQuery("stamp:=(1, 1970-01-01)").fields({"id"}).limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ((std::vector<std::string>{"tick", "zero"}), resultIds(*req));
+}
+
 TEST_F(AnyOfQueryTest, rawStringColumnIsRejected) {
   auto req = localReq(helper.getSearchEngine());
   auto& top = req->collection("main").topDocs("q");

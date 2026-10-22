@@ -846,7 +846,7 @@ public:
 
     auto dateBound = [&](const api::Val& value) {
       auto& dateType = (DateFieldType&)*fieldType;
-      DateRange range = dateType.coerceDateRange(value, facetField, context);
+      auto range = dateType.coerceDateRange(value, facetField, context);
       if (range.granuleSkipped) {
         const auto* text = std::get_if<std::string_view>(&value.kind);
         if (text != nullptr) {
@@ -928,36 +928,32 @@ public:
       throw std::runtime_error("facet '" + std::string(facetName)
           + "': range start must be less than end");
     }
+    bool date = fieldType->type() == FieldType::DATE;
+    auto dateUnit = date ? ((DateFieldType&)*fieldType).unit : DateUnit::MILLIS;
     auto grid = [&]() {
       if (calendar) {
         const auto& spec = std::get<api::CalendarGap>(facetReq.gap_kind);
         return RangeFacetGrid::calendar(*calendarGridUnit, spec.n, zone,
-            dataBounds ? std::nullopt : givenStart);
+            dataBounds ? std::nullopt : givenStart, dateUnit);
       }
-      const auto& gapValue = std::get<api::Val>(facetReq.gap_kind);
-      bool date = fieldType->type() == FieldType::Type::DATE;
-      auto integer = [&](const api::Val& value, std::string_view name) {
+      auto integer = [&](const api::Val& value, std::string_view name) -> __int128 {
         if (!date) return fieldType->coerceColInt64(value, facetField, context);
-        const auto* millis = std::get_if<int64_t>(&value.kind);
-        if (!millis) {
-          throw std::runtime_error("facet '" + std::string(facetName)
-              + "': a DATE " + std::string(name) + " must be integer milliseconds");
+        const auto* number = std::get_if<int64_t>(&value.kind);
+        if (!number) {
+          throw RequestError(std::format("facet '{}': a DATE {} must be integer {}",
+              facetName, name, dateUnitName(context.dateInputUnit.value_or(dateUnit))));
         }
-        return *millis;
+        return convertDateUnits(*number, context.dateInputUnit.value_or(dateUnit), dateUnit);
       };
-      int64_t gap = integer(gapValue, "fixed gap");
-      int64_t origin = 0;
-      if (dataBounds) {
-        if (facetReq.origin.has_value()) origin = integer(*facetReq.origin, "origin");
-      } else {
-        if (date) {
-          auto civil = civilFromInstant(*givenStart, zone);
-          if (!civil) throw std::runtime_error("range bounds are outside the supported civil range");
-          origin = civil->millis;
-        } else origin = *givenStart;
+      auto convertedGap = integer(std::get<api::Val>(facetReq.gap_kind), "fixed gap");
+      if (convertedGap <= 0 || convertedGap > INT64_MAX) {
+        throw RequestError(std::format("facet '{}': range gap must be > 0 and fit int64 in field units", facetName));
       }
-      return RangeFacetGrid::fixed(fieldType->type(),
-                                   gap, origin, zone);
+      int64_t gap = (int64_t)convertedGap;
+      int64_t origin = dataBounds && facetReq.origin.has_value()
+          ? (int64_t)(integer(*facetReq.origin, "origin") % gap) : 0;
+      return RangeFacetGrid::fixed(fieldType->type(), gap, origin, zone, dateUnit,
+          dataBounds ? std::nullopt : givenStart);
     }();
     if (dataBounds) {
       auto* facet = luxir::arenaCreate<IntFacetRangeReq>(req.arena, req,

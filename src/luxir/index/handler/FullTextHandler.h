@@ -174,6 +174,7 @@ public:
     PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
+    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
 
     auto preparedNorms = NormsWriter::prepare(inverter.pool, inverter.getPostingsWriter(),
                                               fieldInfo, normBytes, normDocsWithField,

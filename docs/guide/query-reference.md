@@ -135,7 +135,10 @@ POST /collections/authors/_search
 | `values` | Exact values; any matching value admits the document. |
 
 STRING, TEXT, and ID exact membership requires indexed terms. Numeric/date
-representations can use their columns.
+representations can use their columns. DATE members are exact instants in
+the field's unit: an ISO member uses its floored start, even for a partial
+date. Members outside the stored date domain are dropped. Match/range date
+literals retain their granularity windows.
 
 STRING literals are whole values and use the same normalizer as ingest. TEXT
 literals use exact token membership: each value must analyze to at most one
@@ -332,7 +335,7 @@ Use at most one lower bound (`gte` or `gt`) and one upper bound (`lte` or
 exists query.
 
 Numeric and date fields compare column values. Date bounds accept epoch
-milliseconds, ISO-8601, partial dates, and date math; see
+numbers in the field's unit (`ms` or `ns`), ISO-8601, partial dates, and date math; see
 [Dates and time zones](dates.md). String, ID, and text fields range over indexed
 terms in byte order with constant scores. Text bounds receive the field's
 normalization/folding but are not tokenized; STRING bounds use its normalizer.

@@ -1039,6 +1039,7 @@ A field, template, or variant definition, named by its enclosing map key. Unset 
 | <a id="field-luxir.fielddef.long_terms"></a>[`long_terms`](#field-luxir.fielddef.long_terms) | 16 | [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms) | optional | absent: inherit from parent, else hash128 |
 | <a id="field-luxir.fielddef.truncate_dims"></a>[`truncate_dims`](#field-luxir.fielddef.truncate_dims) | 19 | `int32` | optional | VECTOR only. Keep the first truncate\_dims components of every indexed and query vector, for Matryoshka (MRL) embeddings whose prefixes are usable embeddings. Requires dims (the full input dimension, which must be larger) and metric COSINE, which renormalizes the prefix; normalized=true is rejected. Inputs carry dims components, or truncate\_dims for a vector already truncated. The column, ANN overlays and kNN scoring use truncate\_dims. Unset inherits; 0 means no truncation. |
 | <a id="field-luxir.fielddef.ann"></a>[`ann`](#field-luxir.fielddef.ann) | 22 | [`VectorAnnDef`](#message-luxir.vectoranndef) | singular | VECTOR only: ANN overlay settings. Absent inherits the parent's whole definition (no per-property merge), else every VectorAnnDef default. |
+| <a id="field-luxir.fielddef.unit"></a>[`unit`](#field-luxir.fielddef.unit) | 24 | [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit) | optional |  |
 
 <a id="message-luxir.fielddefaults"></a>
 
@@ -1826,7 +1827,7 @@ Numeric or DATE buckets using the field's value binding. Each bucket is inclusiv
 | <a id="field-luxir.rangefacet.field"></a>[`field`](#field-luxir.rangefacet.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.rangefacet.start"></a>[`start`](#field-luxir.rangefacet.start) | 2 | [`Val`](#message-luxir.val) | singular | EXPLICIT: inclusive first fence, required. DATA: optional widening bound; include its cell without excluding smaller matching values. |
 | <a id="field-luxir.rangefacet.end"></a>[`end`](#field-luxir.rangefacet.end) | 3 | [`Val`](#message-luxir.val) | singular | EXPLICIT: exclusive last fence, required. DATA: optional exclusive widening bound; include intersecting cells below it without excluding larger values. |
-| <a id="field-luxir.rangefacet.gap"></a>[`gap`](#field-luxir.rangefacet.gap) | 4 | [`Val`](#message-luxir.val) | oneof [`gap_kind`](#oneof-luxir.rangefacet.gap_kind) | positive fixed width in field units; integer milliseconds for DATE |
+| <a id="field-luxir.rangefacet.gap"></a>[`gap`](#field-luxir.rangefacet.gap) | 4 | [`Val`](#message-luxir.val) | oneof [`gap_kind`](#oneof-luxir.rangefacet.gap_kind) | positive fixed width in field units; integer field units for DATE |
 | <a id="field-luxir.rangefacet.calendar_gap"></a>[`calendar_gap`](#field-luxir.rangefacet.calendar_gap) | 10 | [`CalendarGap`](#message-luxir.calendargap) | oneof [`gap_kind`](#oneof-luxir.rangefacet.gap_kind) | civil gap for DATE fields only |
 | <a id="field-luxir.rangefacet.mincount"></a>[`mincount`](#field-luxir.rangefacet.mincount) | 5 | `int64` | optional | minimum bucket count; unset = 0; must be &gt;= 0 |
 | <a id="field-luxir.rangefacet.missing"></a>[`missing`](#field-luxir.rangefacet.missing) | 6 | `bool` | singular | Return the count without a value, in the chosen count unit. |
@@ -1837,13 +1838,13 @@ Numeric or DATE buckets using the field's value binding. Each bucket is inclusiv
 | <a id="field-luxir.rangefacet.count_unit"></a>[`count_unit`](#field-luxir.rangefacet.count_unit) | 13 | [`FieldFacet.CountUnit`](#enum-luxir.fieldfacet.countunit) | optional | Inherits the parent measure; GROUPS uses the nearest collapse. |
 | <a id="field-luxir.rangefacet.count_distinct"></a>[`count_distinct`](#field-luxir.rangefacet.count_distinct) | 14 | [`Collapse`](#message-luxir.collapse) | singular | Exact distinct keys; same specification as Collapse. |
 | <a id="field-luxir.rangefacet.bounds"></a>[`bounds`](#field-luxir.rangefacet.bounds) | 15 | [`RangeFacet.Bounds`](#enum-luxir.rangefacet.bounds) | singular |  |
-| <a id="field-luxir.rangefacet.origin"></a>[`origin`](#field-luxir.rangefacet.origin) | 16 | [`Val`](#message-luxir.val) | singular | DATA fixed gaps only; rejected with calendar\_gap. Default 0. For INT, FLOAT and DOUBLE, fences are origin + k \* gap from a global integer k. For DATE, origin is a wall-clock phase in the facet zone: 21600000 with gap 86400000 starts days at 06:00 local across DST. This differs from Elasticsearch's UTC-translated offset near transitions. Must be integer milliseconds for DATE, an integer for INT, or a number for FLOAT/DOUBLE. |
+| <a id="field-luxir.rangefacet.origin"></a>[`origin`](#field-luxir.rangefacet.origin) | 16 | [`Val`](#message-luxir.val) | singular | DATA fixed gaps only; rejected with calendar\_gap. Default 0. For INT, FLOAT and DOUBLE, fences are origin + k \* gap from a global integer k. For DATE, origin is a wall-clock phase in the facet zone: 21600000 with gap 86400000 starts days at 06:00 local across DST. This differs from Elasticsearch's UTC-translated offset near transitions. Must be integer field units for DATE, an integer for INT, or a number for FLOAT/DOUBLE. |
 
 <a id="message-luxir.rangequery"></a>
 
 ### luxir.RangeQuery
 
-Matches documents whose field value falls in the given range. All bounds are optional; omit a side for an open-ended range. Set at most one of gte/gt (lower) and at most one of lte/lt (upper); setting both of a pair is an error. With no bounds the query matches every document that has a value for the field. A doc with no value never matches.<br><br>Numeric fields (INT/FLOAT/DOUBLE/DATE) require a column. Bounds go through the same value-coercion contract as ingest, so querying a literal finds the documents ingested with it. DATE accepts ISO-8601 strings or epoch millis, and a partial date names its whole window: bounds include the granule they name (\[2024-01 TO 2024-06\] covers January through June; exclusive bounds exclude the granule whole). FLOAT/DOUBLE compare by IEEE-754 total order: -0.0 sorts below +0.0 and NaN sorts above +Inf.<br><br>Term-backed fields (TEXT/STRING/ID) range over indexed terms in byte order (no collation), constant-scoring. TEXT bounds use multi-term normalization without tokenization; STRING bounds use the field's normalizer. Exact bounds follow the field's long\_terms policy. Uses the field's value binding.
+Matches documents whose field value falls in the given range. All bounds are optional; omit a side for an open-ended range. Set at most one of gte/gt (lower) and at most one of lte/lt (upper); setting both of a pair is an error. With no bounds the query matches every document that has a value for the field. A doc with no value never matches.<br><br>Numeric fields (INT/FLOAT/DOUBLE/DATE) require a column. Bounds go through the same value-coercion contract as ingest, so querying a literal finds the documents ingested with it. DATE accepts ISO-8601 strings or epoch values in the field's unit, and a partial date names its whole window: bounds include the granule they name (\[2024-01 TO 2024-06\] covers January through June; exclusive bounds exclude the granule whole). FLOAT/DOUBLE compare by IEEE-754 total order: -0.0 sorts below +0.0 and NaN sorts above +Inf.<br><br>Term-backed fields (TEXT/STRING/ID) range over indexed terms in byte order (no collation), constant-scoring. TEXT bounds use multi-term normalization without tokenization; STRING bounds use the field's normalizer. Exact bounds follow the field's long\_terms policy. Uses the field's value binding.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -2564,6 +2565,7 @@ Matches an entire indexed term. \`\*\` matches any bytes, \`?\` matches one code
 - [`Collapse.MissingPolicy`](#enum-luxir.collapse.missingpolicy)
 - [`DocFormat`](#enum-luxir.docformat)
 - [`Error.Kind`](#enum-luxir.error.kind)
+- [`FieldDef.DateUnit`](#enum-luxir.fielddef.dateunit)
 - [`FieldDef.FieldClass`](#enum-luxir.fielddef.fieldclass)
 - [`FieldDef.IndexMode`](#enum-luxir.fielddef.indexmode)
 - [`FieldDef.LongTerms`](#enum-luxir.fielddef.longterms)
@@ -2644,6 +2646,19 @@ Placement of returned document fields: dense columns (DocList.columns) or per-do
 | <a id="value-luxir.error.kind.unavailable"></a>[`UNAVAILABLE`](#value-luxir.error.kind.unavailable) | 6 | the target exists but cannot serve now: shutting down, being deleted, failed to load (503) |
 | <a id="value-luxir.error.kind.internal"></a>[`INTERNAL`](#value-luxir.error.kind.internal) | 7 | a server-side failure the request did not cause (500) |
 
+<a id="enum-luxir.fielddef.dateunit"></a>
+
+### luxir.FieldDef.DateUnit
+
+DATE only: unit of numeric ingest and stored epoch values. ISO-8601 text is converted to this precision, truncating toward earlier time. NS reserves the int64 extrema and covers 1677-09-21 to 2262-04-11. The unit is part of the field signature and cannot change on an existing date definition. Absent inherits from the parent, falling back to ms.
+
+[Source](../../protos/luxir_types.proto)
+
+| Value | Number | Description |
+|---|---|---|
+| <a id="value-luxir.fielddef.dateunit.ms"></a>[`MS`](#value-luxir.fielddef.dateunit.ms) | 0 | milliseconds |
+| <a id="value-luxir.fielddef.dateunit.ns"></a>[`NS`](#value-luxir.fielddef.dateunit.ns) | 1 | nanoseconds |
+
 <a id="enum-luxir.fielddef.fieldclass"></a>
 
 ### luxir.FieldDef.FieldClass
@@ -2659,7 +2674,7 @@ Placement of returned document fields: dense columns (DocList.columns) or per-do
 | <a id="value-luxir.fielddef.fieldclass.double"></a>[`DOUBLE`](#value-luxir.fielddef.fieldclass.double) | 4 |  |
 | <a id="value-luxir.fielddef.fieldclass.id"></a>[`ID`](#value-luxir.fielddef.fieldclass.id) | 6 | document identifier used for replacement and deletion |
 | <a id="value-luxir.fielddef.fieldclass.vector"></a>[`VECTOR`](#value-luxir.fielddef.fieldclass.vector) | 7 | dense float vector |
-| <a id="value-luxir.fielddef.fieldclass.date"></a>[`DATE`](#value-luxir.fielddef.fieldclass.date) | 8 | timestamp, stored as int64 milliseconds since the Unix epoch |
+| <a id="value-luxir.fielddef.fieldclass.date"></a>[`DATE`](#value-luxir.fielddef.fieldclass.date) | 8 | timestamp, stored as int64 units since the Unix epoch (see unit) |
 | <a id="value-luxir.fielddef.fieldclass.geo_point"></a>[`GEO_POINT`](#value-luxir.fielddef.fieldclass.geo_point) | 9 | latitude/longitude point |
 
 <a id="enum-luxir.fielddef.indexmode"></a>

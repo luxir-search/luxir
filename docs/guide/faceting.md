@@ -654,8 +654,8 @@ float, double, or date field:
 | `field` | Numeric or date field. Required; its value binding must be numeric or date. |
 | `start`, `end` | Bounds of the bucketed range. Required unless `bounds` is `data`, where they only widen it. |
 | `bounds` | `explicit` (default) or `data`; see [Data-derived bounds](#data-derived-bounds). |
-| `origin` | With `bounds: data` and a fixed gap, the grid phase. Default 0; wall-clock milliseconds for DATE. Rejected with `calendar_gap`. |
-| `gap` | Fixed bucket width (milliseconds for dates). Exactly one of `gap` or `calendar_gap` is required. |
+| `origin` | With `bounds: data` and a fixed gap, the grid phase. Default 0; wall-clock field units (`ms` or `ns`) for DATE. Rejected with `calendar_gap`. |
+| `gap` | Fixed bucket width (field units for dates). Exactly one of `gap` or `calendar_gap` is required. |
 | `calendar_gap` | `{"n": 1, "unit": "month"}` for civil buckets over dates; see [Date histograms](#date-histograms). |
 | `mincount` | `0` (default) keeps every bucket in order, zero counts included; a positive value filters after counting. |
 | `missing` | Also return the count of documents with no value. |
@@ -726,8 +726,8 @@ The grid is independent of the matching minimum:
   global integer `k`; default `origin` is 0. Floating fences use the field's
   encoded representation, so rounding does not shift the grid with the query.
 - For DATE fixed gaps, `origin` is a wall-clock phase in the facet zone,
-  expressed in integer milliseconds. For example, `gap: 86400000` and
-  `origin: 21600000` start days at 06:00 local, including DST days. Luxir
+  expressed in integer field units (`ms` or `ns`). For an ms field,
+  `gap: 86400000` and `origin: 21600000` start days at 06:00 local, including DST days. Luxir
   applies this phase before resolving local times. Elasticsearch's `offset`
   translates the rounded grid in UTC, so nonzero phases can differ near DST
   changes; `origin` is not an exact synonym for that offset.
@@ -747,8 +747,8 @@ cap applies after `mincount` filtering.
 
 ## Date histograms
 
-Date bounds accept epoch milliseconds, ISO-8601 text, and both Solr and
-Elasticsearch/OpenSearch [date-math syntax](dates.md#date-math). Use
+Date bounds accept epoch numbers in the field's unit, ISO-8601 text, and both
+Solr and Elasticsearch/OpenSearch [date-math syntax](dates.md#date-math). Use
 `calendar_gap` when buckets should follow civil days, weeks, months, quarters,
 or years:
 
@@ -767,7 +767,13 @@ or years:
 The facet `time_zone` controls offset-less bounds and fixed or calendar
 stepping. Empty inherits the request time zone; `UTC` explicitly overrides it.
 IANA zone names and fixed offsets are accepted. Bucket IDs remain raw
-epoch-millisecond fence pairs, because they identify instants unambiguously.
+epoch fence pairs in the field's unit, because they identify instants
+unambiguously.
+
+Fixed gaps use the field's unit, including one-ns gaps on an ns field.
+Numeric `start`, `end`, `origin`, and `selected` use the same unit. DATA works
+for both units and shares its fence identities with EXPLICIT. An ns exclusive
+end can be `INT64_MAX`, which is reserved and never stored.
 
 Fixed gaps step on the local clock in both EXPLICIT and DATA modes. Every
 occurrence of a repeated lattice time is a fence, so an hourly histogram has
@@ -790,9 +796,9 @@ bucket, Luxir drops the zero-width bucket and returns a
 `calendar_bucket_skipped` warning.
 [Dates and time zones](dates.md) has the date-math and civil-time contract.
 
-For a fixed UTC epoch-day number in the value-expression language, use
-`floor(when_dt / 86400000)`; use a calendar gap when day bucketing must follow
-a civil time zone.
+For a fixed UTC epoch-day number on an ms field in the value-expression
+language, use `floor(when_dt / 86400000)`; use a calendar gap when day bucketing
+must follow a civil time zone.
 
 ## Query facets
 

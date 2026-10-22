@@ -63,7 +63,7 @@ namespace datetime_detail {
 // backing store is a 16-bit field ([-32767, 32767]).  Years outside this would
 // silently narrow in the chrono::year constructor and slip past ymd.ok(), so we
 // reject them. The matching epoch-millis bounds limit text parsing and civil
-// arithmetic; numeric ms columns can hold any int64. Formatting rejects values
+// arithmetic and ms ingest. Formatting rejects values
 // outside this civil range before constructing a chrono::year.
 inline constexpr int kMinYear = -32767;
 inline constexpr int kMaxYear = 32767;
@@ -345,7 +345,33 @@ inline __int128 toUnits128(int64_t millis, int32_t nanos, int64_t unitNanos, boo
   return quotient;
 }
 
+inline std::optional<int64_t> epochInteger(std::string_view text) {
+  if (text.empty() || text.size() > kMaxLiteralParseLen) return std::nullopt;
+  if (text.starts_with('+')) {
+    text.remove_prefix(1);
+    if (text.empty() || !isAsciiDigit(text.front())) return std::nullopt;
+  }
+  int64_t value;
+  auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
+  if (error != std::errc{} || end != text.data() + text.size()) return std::nullopt;
+  return value;
+}
+
 } // namespace datetime_detail
+
+inline int64_t clampDateUnits(__int128 value) {
+  return (int64_t)std::clamp(value, (__int128)INT64_MIN, (__int128)INT64_MAX);
+}
+
+inline __int128 convertDateUnits(int64_t value, DateUnit from, DateUnit to) {
+  __int128 nanos = (__int128)value * dateUnitNanos(from);
+  int64_t divisor = dateUnitNanos(to);
+  return nanos / divisor - (nanos % divisor < 0);
+}
+
+inline int64_t dateEpochMillis(int64_t value, DateUnit unit) {
+  return (int64_t)convertDateUnits(value, unit, DateUnit::MILLIS);
+}
 
 // A stored instant in the given unit, rounded down (or up). Finer digits are
 // truncated toward earlier time. NANOS excludes both int64 extrema; bounds
@@ -373,12 +399,8 @@ inline std::pair<int64_t, int64_t> dateUnitWindow(const DateRange& range,
                                                   DateUnit unit) {
   namespace dd = datetime_detail;
   int64_t unitNanos = dateUnitNanos(unit);
-  auto clamp = [](__int128 value) {
-    return (int64_t)std::clamp(value, (__int128)std::numeric_limits<int64_t>::min(),
-                               (__int128)std::numeric_limits<int64_t>::max());
-  };
-  return {clamp(dd::toUnits128(range.lo, range.loNanos, unitNanos, false)),
-          clamp(dd::toUnits128(range.hiExclusive, range.hiNanos, unitNanos, true))};
+  return {clampDateUnits(dd::toUnits128(range.lo, range.loNanos, unitNanos, false)),
+          clampDateUnits(dd::toUnits128(range.hiExclusive, range.hiNanos, unitNanos, true))};
 }
 
 // A parsed literal additionally preserves whether an offset token was present.
@@ -504,30 +526,29 @@ public:
 // Parse only the literal forms above. Date-math splitting calls this for each
 // possible fixed anchor, so it deliberately requires the whole input.
 inline std::optional<DateLiteralRange> parseDateLiteralRange(
-    std::string_view s, const TimeZone& frameZone) {
+    std::string_view s, const TimeZone& frameZone, DateUnit numericUnit = DateUnit::MILLIS) {
   using namespace std::chrono;
   namespace dd = datetime_detail;
   Cursor input{s};
   if (input.atEnd() || input.size() > dd::kMaxLiteralParseLen) return std::nullopt;
 
-  // Bare integer => epoch millis (OpenSearch epoch_millis).  A real ISO date
+  // Bare integer => epoch units. A real ISO date
   // always carries a '-' between year and month, so an all-digit run (after an
   // optional leading sign) is unambiguous.  Detected with range-checked
   // algorithms; converted with from_chars, which reports overflow as an error
   // rather than wrapping (signed-overflow UB).
-  {
-    Cursor integer = input;
-    bool leadingPlus = integer.consume('+');
-    if (!leadingPlus) integer.consume('-');
-    std::string_view digits = integer.takeWhile(dd::isAsciiDigit);
-    if (!digits.empty() && integer.atEnd()) {
-      int64_t v = 0;
-      std::string_view token = input.slice(leadingPlus ? 1 : 0, input.size());
-      auto [ptr, ec] = std::from_chars(token.begin(), token.end(), v);
-      if (ec != std::errc{} || ptr != token.end()) return std::nullopt;
-      if (v < dd::kMinEpochMs || v > dd::kMaxEpochMs) return std::nullopt;
-      return DateLiteralRange{DateRange{v, v + 1}, false};
+  if (auto integer = dd::epochInteger(s)) {
+    int64_t v = *integer;
+    if (numericUnit == DateUnit::NANOS) {
+      int64_t millis = dateEpochMillis(v, numericUnit);
+      int32_t nanos = (int32_t)((__int128)v - (__int128)millis * 1000000);
+      DateRange range{millis, millis + (nanos + 1) / 1000000};
+      range.loNanos = nanos;
+      range.hiNanos = (nanos + 1) % 1000000;
+      return DateLiteralRange{range, false};
     }
+    if (v < dd::kMinEpochMs || v > dd::kMaxEpochMs) return std::nullopt;
+    return DateLiteralRange{DateRange{v, v + 1}, false};
   }
 
   Cursor c = input;
@@ -976,7 +997,8 @@ inline std::optional<int64_t> civilCalendarAt(
 }
 
 inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEpochMillis,
-                                               const TimeZone& zone) {
+                                               const TimeZone& zone,
+                                               DateUnit numericUnit = DateUnit::MILLIS) {
   namespace dd = datetime_detail;
   Cursor input{s};
   if (input.atEnd() || input.size() > dd::kMaxDateMathParseLen
@@ -1001,7 +1023,7 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
   }
 
   // A literal without math retains Luxir's existing granularity window.
-  if (auto literal = parseDateLiteralRange(input.slice(0, input.size()), zone)) {
+  if (auto literal = parseDateLiteralRange(input.slice(0, input.size()), zone, numericUnit)) {
     return literal->range;
   }
 
@@ -1013,7 +1035,7 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     separatorScan.advance(2);
     size_t mathStart = separatorScan.position();
     if (separatorScan.findNext("||")) return std::nullopt;
-    auto anchor = parseDateLiteralRange(input.slice(0, separator), zone);
+    auto anchor = parseDateLiteralRange(input.slice(0, separator), zone, numericUnit);
     if (!anchor) return std::nullopt;
     auto [loNanos, hiLastNanos] = dd::anchorNanos(anchor->range);
     auto result = dd::applyDateMath(
@@ -1034,7 +1056,7 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     char c = suffixScan.peek();
     if (c != '+' && c != '-' && c != '/') continue;
     size_t separator = suffixScan.position();
-    auto anchor = parseDateLiteralRange(input.slice(0, separator), zone);
+    auto anchor = parseDateLiteralRange(input.slice(0, separator), zone, numericUnit);
     if (!anchor) continue;
     auto [loNanos, hiLastNanos] = dd::anchorNanos(anchor->range);
     if (auto result = dd::applyDateMath(

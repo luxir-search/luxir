@@ -483,7 +483,7 @@ public:
 
   // An inclusive range of encoded numeric column values (the column's
   // order-preserving int64 encoding: INT raw, FLOAT/DOUBLE sortable bits,
-  // DATE epoch millis). lo > hi is empty.
+  // DATE epoch units). lo > hi is empty.
   struct ValueEnvelope {
     int64_t lo;
     int64_t hi;

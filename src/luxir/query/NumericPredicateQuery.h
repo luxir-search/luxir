@@ -24,7 +24,7 @@ namespace luxir {
 // Numeric predicate over the doc-order numeric column: either one inclusive
 // range or an exact sorted value set. Every numeric field type stores an
 // order-preserving encoded int64 (INT raw, FLOAT/DOUBLE Lucene sortable bits,
-// DATE epoch millis), so pruning and comparisons happen in encoded space. A
+// DATE epoch units), so pruning and comparisons happen in encoded space. A
 // document matches when any value satisfies the range or set.
 class NumericPredicateQuery final : public Query {
   std::string_view field;

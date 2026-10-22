@@ -23,6 +23,7 @@ namespace luxir {
 using FieldClass = luxir::api::FieldDef_::FieldClass;
 using IndexMode = luxir::api::FieldDef_::IndexMode;
 using LongTerms = luxir::api::FieldDef_::LongTerms;
+using ApiDateUnit = luxir::api::FieldDef_::DateUnit;
 using StoredCodec = luxir::api::StoredResourceDef_::Codec;
 using VectorMetric = luxir::api::VectorMetric;
 
@@ -43,6 +44,7 @@ struct ResolvedField {
   bool hasIndex = false;
   IndexMode index = IndexMode::NONE;
   std::optional<LongTerms> longTerms;
+  std::optional<ApiDateUnit> dateUnit;
   bool hasColumn = false;
   bool column = false;
   // The effective analyzer, backed by source entries or AnalyzerDefinitions;
@@ -206,6 +208,12 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
       && *r.longTerms != LongTerms::HASH128) {
     throw SchemaError("unknown long_terms value " + std::to_string((int)*r.longTerms) +
                       " (field: " + std::string(name) + "); valid: hash128, truncate, reject");
+  }
+
+  r.dateUnit = def.unit ? def.unit : parentResolved.dateUnit;
+  if (r.dateUnit && *r.dateUnit != ApiDateUnit::MS && *r.dateUnit != ApiDateUnit::NS) {
+    throw SchemaError("unknown unit value " + std::to_string((int)*r.dateUnit) +
+                      " (field: " + std::string(name) + "); valid: ms, ns");
   }
 
   // column
@@ -420,6 +428,9 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   }
   if (def.normalizer && r.type != FieldClass::STRING) {
     throw SchemaError("normalizer is only valid for string fields (field: " + name + ")");
+  }
+  if (def.unit && r.type != FieldClass::DATE) {
+    throw SchemaError("unit is only valid for date fields (field: " + name + ")");
   }
   bool vectorProp = def.dims.has_value() || def.truncate_dims.has_value() || def.metric.has_value() ||
                     def.normalized.has_value() || def.normalize_on_write.has_value() ||
@@ -642,7 +653,8 @@ struct FieldCompiler {
         ft = std::make_shared<DoubleFieldType>(name, flags);
         break;
       case FieldClass::DATE:
-        ft = std::make_shared<DateFieldType>(name, flags);
+        ft = std::make_shared<DateFieldType>(name, flags,
+            r.dateUnit.value_or(ApiDateUnit::MS) == ApiDateUnit::NS ? DateUnit::NANOS : DateUnit::MILLIS);
         break;
       case FieldClass::GEO_POINT:
         ft = std::make_shared<GeoPointFieldType>(name, flags);

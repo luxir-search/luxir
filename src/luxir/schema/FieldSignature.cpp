@@ -37,6 +37,9 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
       }
     }
   }
+  if (auto* date = dynamic_cast<DateFieldType*>(&type)) {
+    properties["unit"] = "\"" + std::string(dateUnitName(date->unit)) + "\"";
+  }
   if (auto* vector = dynamic_cast<VectorFieldType*>(&type)) {
     properties["dims"] = std::to_string(vector->inputDims());
     if (vector->truncateDims() > 0) properties["truncate_dims"] = std::to_string(vector->truncateDims());

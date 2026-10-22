@@ -181,7 +181,7 @@ class QueryBuilder {
 
 public:
   // The numeric field types stored in the shared int column (INT raw,
-  // FLOAT/DOUBLE sortable bits, DATE epoch millis).  Match and range on these
+  // FLOAT/DOUBLE sortable bits, DATE epoch units).  Match and range on these
   // build a NumericPredicateQuery over the column. Public because schema-aware
   // string parsers select arms by the same classification.
   static bool isNumericColumnType(FieldType::Type t) {
@@ -192,8 +192,16 @@ public:
 private:
 
   template<typename T>
-  int64_t coerceAnyOfNumeric(FieldType& fieldType, std::string_view field,
+  std::optional<int64_t> coerceAnyOfNumeric(FieldType& fieldType, std::string_view field,
                              const T& value) {
+    if (fieldType.type() == FieldType::DATE) {
+      auto& date = (DateFieldType&)fieldType;
+      if constexpr (std::is_same_v<T, api::Val>) {
+        return date.coerceDateInstant(value, field, coerceContext);
+      } else {
+        return date.coerceDateInstant(coerce::scalarVal(value), field, coerceContext);
+      }
+    }
     if constexpr (std::is_same_v<T, api::Val>) {
       return fieldType.coerceColInt64(value, field, coerceContext);
     } else {
@@ -206,24 +214,6 @@ private:
         case FieldType::Type::DOUBLE:
           return doubleToSortableInt64(
               coerce::toDoubleScalar(value, field));
-        case FieldType::Type::DATE:
-          if constexpr (std::is_same_v<T, int64_t>) {
-            return value;
-          } else if constexpr (std::is_same_v<T, std::string_view>) {
-            int64_t now = coerceContext.dateMathNowEpochMillis.value_or(
-                currentEpochMillis());
-            if (auto millis = parseDateToEpochMillis(
-                    value, now, coerceContext.timeZone)) {
-              return *millis;
-            }
-            throw std::runtime_error(std::format(
-                "DATE field '{}': cannot parse '{}' as a date "
-                "(expected ISO-8601, epoch millis, or date math)",
-                field, value));
-          } else {
-            api::Val scalar = coerce::scalarVal(value);
-            coerce::throwCoerce(field, scalar, "a date");
-          }
         default:
           break;
       }
@@ -428,7 +418,9 @@ public:
       encoded.reserve(values.size());
       values.visit([&](const auto& viewed) {
         for (const auto& value : viewed) {
-          encoded.push_back(coerceAnyOfNumeric(fieldType, field, value));
+          if (auto encodedValue = coerceAnyOfNumeric(fieldType, field, value)) {
+            encoded.push_back(*encodedValue);
+          }
         }
       });
       std::vector<int64_t> inputOrder;
@@ -1121,7 +1113,7 @@ public:
     if (fieldType.type() == FieldType::Type::DATE) {
       auto& dateType = (DateFieldType&)fieldType;
       auto dateBound = [&](const api::Val& value) {
-        DateRange range = dateType.coerceDateRange(value, field, coerceContext);
+        auto range = dateType.coerceDateRange(value, field, coerceContext);
         if (range.granuleSkipped && warnings != nullptr) {
           std::string_view text = std::get<std::string_view>(value.kind);
           std::string message = opName.empty()
@@ -1137,12 +1129,11 @@ public:
         unroundedNow |= range.unroundedNow;
         return range;
       };
-      // Window edges chosen so the existing +/-1 exclusive fold below lands
-      // on the granule boundary: gt = the window's last milli (+1 = past it),
-      // lt = the window's first milli (-1 = before it).
+      // Query windows are inclusive in field units. Exact numeric literals
+      // use the same value at both edges; exclusive folding below is guarded.
       if (hasGte) loEnc = dateBound(*gte).lo;
-      if (hasGt)  loEnc = dateBound(*gt).hiExclusive - 1;
-      if (hasLte) hiEnc = dateBound(*lte).hiExclusive - 1;
+      if (hasGt)  loEnc = dateBound(*gt).hi;
+      if (hasLte) hiEnc = dateBound(*lte).hi;
       if (hasLt)  hiEnc = dateBound(*lt).lo;
     } else {
       if (hasGte || hasGt) {

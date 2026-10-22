@@ -33,11 +33,19 @@ class FieldTypeContractTest : public LuxirTest {};
 
 TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
   CollectionHelper helper;
+  SchemaBuilder schema;
+  for (auto name : {"nano", "nanos"}) {
+    auto& field = schema.field(name);
+    field.type = api::FieldDef::FieldClass::DATE;
+    field.unit = api::FieldDef::DateUnit::NS;
+    field.multi = name == std::string_view("nanos") ? api::FieldDef::MultiMode::DEFAULT : api::FieldDef::MultiMode::SINGLE;
+  }
+  schema.set(helper.collection());
   auto writer = helper.getIndexWriter();
   writer->mergePolicy->setMergeFactor(100);
   for (auto id : {"one", "two"}) {
     ASSERT_TRUE(helper.index(flatdoc("id", id, "n_i", 7, "when_dt", (int64_t)123,
-        "text_w", "words", "many_is", vec_i(1, 2)), UpdateMessage::COMMIT).success);
+        "nano", 7, "nanos", vec_i(1, 2), "text_w", "words", "many_is", vec_i(1, 2)), UpdateMessage::COMMIT).success);
   }
   auto check = [&] {
     IndexReader reopened(writer->dir);
@@ -47,8 +55,10 @@ TEST_F(FieldTypeContractTest, typeFlagsSurviveFlushMergeAndReopen) {
       while (fields.readNextField()) {
         SegFieldInfo info{};
         fields.readFieldInfo(info);
-        EXPECT_EQ(0u, info.typeFlags) << (std::string_view)info.fieldname;
-        EXPECT_EQ(0u, FieldType::typeParameters(info.type, info.typeFlags));
+        auto name = (std::string_view)info.fieldname;
+        uint32_t expected = name == "nano" || name == "nanos" ? 1 : 0;
+        EXPECT_EQ(expected, info.typeFlags) << name;
+        EXPECT_EQ(expected, FieldType::typeParameters(info.type, info.typeFlags));
       }
       EXPECT_EQ(FieldType::STRING, postings.fieldInfo("id")->type);
       EXPECT_EQ(FieldType::DATE, postings.fieldInfo("when_dt")->type);
@@ -68,7 +78,7 @@ TEST_F(FieldTypeContractTest, unknownTypeFlagsAreRejectedWithoutSchema) {
     PostingsWriter writer(dir, 1, 0);
     auto& info = writer.addField("value");
     info.type = (FieldType::Type)type;
-    info.typeFlags = 1; // deliberately invalid persisted metadata
+    info.typeFlags = type == FieldType::DATE ? 2 : 1; // deliberately invalid persisted metadata
     writeUnversionedRuns(writer);
     writer.finish();
     PostingsReader reader(dir, 1);
@@ -78,6 +88,62 @@ TEST_F(FieldTypeContractTest, unknownTypeFlagsAreRejectedWithoutSchema) {
     EXPECT_THROW(fields.readFieldInfo(decoded), std::runtime_error);
     EXPECT_THROW(reader.fieldInfo("value"), std::runtime_error);
   }
+}
+
+TEST_F(FieldTypeContractTest, changedDateUnitFailsOnlyFieldUsers) {
+  CollectionHelper helper;
+  SchemaBuilder first;
+  auto& ns = first.field("value");
+  ns.type = api::FieldDef::FieldClass::DATE;
+  ns.unit = api::FieldDef::DateUnit::NS;
+  first.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "one", "value", 7), UpdateMessage::COMMIT).success);
+  auto writer = helper.getIndexWriter();
+  auto before = writer->snapshots.readers.getReader();
+  EXPECT_EQ(1u, before->field("value").at(0)->typeFlags);
+
+  SchemaBuilder removed;
+  removed.replaceAll(helper.collection());
+  setValueType(helper, api::FieldDef::FieldClass::DATE);
+  IndexReader reopened(writer->dir);
+  EXPECT_EQ((std::vector<std::string>{"one"}), allIds(helper));
+  EXPECT_EQ(1u, before->field("value").at(0)->typeFlags);
+  EXPECT_THROW(reopened.field("value"), RequestError);
+  for (bool retrieve : {true, false}) {
+    auto request = localReq(helper.getSearchEngine());
+    auto& op = request->collection("main").topDocs("q");
+    if (retrieve) op.allQuery().fields({"value"});
+    else op.matchQuery("value", "7").fields({"id"});
+    request->execute();
+    ASSERT_FALSE(request->ok());
+    EXPECT_NE(std::string::npos, request->errorMsg().find("schema type 'date' unit 'ms'"));
+    EXPECT_NE(std::string::npos, request->errorMsg().find("persisted type 'date' unit 'ns'"));
+  }
+  EXPECT_EQ((std::vector<std::string>{"one"}), allIds(helper));
+}
+
+TEST_F(FieldTypeContractTest, mixedDateUnitsRefuseMerge) {
+  CollectionHelper helper;
+  auto writer = helper.getIndexWriter();
+  writer->mergePolicy->setMergeFactor(100);
+  setValueType(helper, api::FieldDef::FieldClass::DATE);
+  ASSERT_TRUE(helper.index(flatdoc("id", "old", "value", 1), UpdateMessage::COMMIT).success);
+  SchemaBuilder removed;
+  removed.replaceAll(helper.collection());
+  SchemaBuilder schema;
+  auto& field = schema.field("value");
+  field.type = api::FieldDef::FieldClass::DATE;
+  field.unit = api::FieldDef::DateUnit::NS;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "new", "value", 2), UpdateMessage::COMMIT).success);
+  ExpectLog quiet("Incompatible persisted types for field 'value'");
+  auto result = forceMerge(helper);
+  EXPECT_FALSE(result.success);
+  EXPECT_NE(std::string::npos, result.error_message.find("type 'date' unit 'ms'"));
+  EXPECT_NE(std::string::npos, result.error_message.find("type 'date' unit 'ns'"));
+  EXPECT_FALSE(writer->testMergeRunning());
+  EXPECT_EQ(2u, helper.durableSegmentCount());
+  EXPECT_EQ(2u, allIds(helper).size());
 }
 
 TEST_F(FieldTypeContractTest, schemaMismatchFailsOnlyFieldUsers) {

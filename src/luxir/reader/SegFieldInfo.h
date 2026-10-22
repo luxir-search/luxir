@@ -114,10 +114,9 @@ struct SegFieldInfo {
     if (type != other.type || FieldType::typeParameters(type, typeFlags)
         != FieldType::typeParameters(other.type, other.typeFlags)) {
       throw std::runtime_error(std::format(
-          "Incompatible persisted types for field '{}': '{}' (type flags 0x{:x}) "
-          "and '{}' (type flags 0x{:x})",
-          (std::string_view)fieldname, FieldType::typeName(type), typeFlags,
-          FieldType::typeName(other.type), other.typeFlags));
+          "Incompatible persisted types for field '{}': {} and {}",
+          (std::string_view)fieldname, FieldType::describeType(type, typeFlags),
+          FieldType::describeType(other.type, other.typeFlags)));
     }
   }
 

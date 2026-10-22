@@ -160,6 +160,7 @@ public:
       PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
       fieldInfo.type = fieldType->persistedType();
       fieldInfo.flags = fieldType->segmentFlags();
+      fieldInfo.typeFlags = fieldType->segmentTypeFlags();
       OrdCollector ords(guard.pool(), inverter.getMaxDoc());
       inverter.noteFlushWorkspace(ords.slotBytes());
 

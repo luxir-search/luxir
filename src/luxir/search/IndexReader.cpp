@@ -478,10 +478,12 @@ IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
   if (sharedSchema) {
     if (auto* expected = sharedSchema->getFieldTypePtr(name)) {
       const auto& persisted = result.totals();
-      if (expected->persistedType() != persisted.type) {
+      if (expected->persistedType() != persisted.type
+          || expected->segmentTypeFlags() != FieldType::typeParameters(persisted.type, persisted.typeFlags)) {
         throw RequestError(std::format(
-            "Field '{}': schema type '{}' does not match persisted type '{}'",
-            name, FieldType::typeName(expected->type()), FieldType::typeName(persisted.type)),
+            "Field '{}': schema {} does not match persisted {}",
+            name, FieldType::describeType(expected->persistedType(), expected->segmentTypeFlags()),
+            FieldType::describeType(persisted.type, persisted.typeFlags)),
             "field_type_mismatch");
       }
     }

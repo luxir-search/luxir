@@ -16,7 +16,7 @@ Choose a type based on how you want to search and use the values:
 | `int` | Signed 64-bit integer: counts, quantities, and years. |
 | `float` | 32-bit floating-point number: measurements and other numeric values where single precision is sufficient. |
 | `double` | 64-bit floating-point number for greater precision than `float`. |
-| `date` | Timestamp with millisecond precision, supplied as ISO-8601 text or epoch milliseconds. Supports date queries, ranges, and calendar facets. See [Dates](dates.md). |
+| `date` | Timestamp with `ms` (default) or `ns` storage precision. Ingest accepts ISO-8601 text or numeric epoch values in the field's unit. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
 | `geo_point` | Geographic location supplied as `[longitude, latitude]`, for distance and bounding-box queries. See [Geo search](geo-search.md). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
@@ -275,6 +275,7 @@ publication advances the schema generation.
 | `analyzer` | `text` only: `{"char_filters": [...], "tokenizer": <component>, "filters": [...]}`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
+| `unit` | `date` only: `ms` (default) or `ns`. Inherits from the parent and is part of the field signature. An existing date definition cannot change its resolved unit. |
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |

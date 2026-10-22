@@ -444,7 +444,7 @@ a column. Use an object to group by a tuple of fields:
 Each returned document has `_group_`: `{"val":"P17"}` for one field,
 `{"val":["shop-A",null]}` for a tuple, or
 `{"val":null,"singleton":true}` for a document grouped separately by
-`expand`. String keys use indexed values; date keys use epoch milliseconds.
+`expand`. String keys use indexed values; date keys use epoch values in the field's unit (`ms` or `ns`).
 Groups tied on all sort values follow their best member's document order,
 including documents grouped separately by `expand`. The best member within a
 group uses the same sort and document tiebreak. With the default

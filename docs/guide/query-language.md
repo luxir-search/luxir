@@ -484,6 +484,9 @@ text. A `$` inside quotes or inside a word is an ordinary character
 Details of the date grammar. [Dates and time zones](dates.md) explains the
 model.
 
+- Numeric dates, including numeric date-math anchors, use the field's unit
+  (`ms` or `ns`) in both `expr` and `simple_query`. Exact membership (`:=`)
+  uses one floored instant per member; out-of-domain date members are dropped.
 - Both Solr and Elasticsearch/OpenSearch date-math syntaxes are accepted:
   Solr-style word units appended directly to the anchor (`NOW-1DAY/DAY`,
   `2024-01-01T00:00:00Z+2MONTHS`),

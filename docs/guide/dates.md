@@ -1,20 +1,41 @@
 # Dates and time zones
 
-Luxir accepts ISO-8601 dates, epoch milliseconds, and both Solr and
+Luxir accepts ISO-8601 dates, numeric epoch values, and both Solr and
 Elasticsearch/OpenSearch date-math syntax. Date fields support queries,
 ranges, sorting, and facets. Use the built-in `_dt` template (`_dts` for
 multiple dates), or define a date field explicitly. Partial dates match the
 whole day or month they name. Set `time_zone` on a request for local date
-queries and calendar buckets. Dates
-are stored as int64 milliseconds since the Unix epoch. This page covers the
+queries and calendar buckets. Dates are stored as int64 counts since the Unix
+epoch, in milliseconds by default. This page covers the
 accepted forms, date math, and time zones; the
 [query language](query-language.md#dates-in-expressions) has the grammar
 corners and [faceting](faceting.md#date-histograms) has calendar buckets.
 
 ## Accepted date values
 
-At ingest and in queries, a DATE value is either a number (epoch
-milliseconds, not a year) or an ISO-8601 string:
+A date field's `unit` is `"ms"` (default) or `"ns"`, inherited from its parent
+when omitted. Numeric ingest and query literals, including integer strings and
+date-math anchors, use that unit. Numeric facet bounds, gaps, origins and
+selected values also use the field's unit. ISO-8601 input converts to the
+field's precision. For example:
+
+```json
+{"fields":{"event_time":{"type":"date","unit":"ns"}}}
+```
+
+Nanosecond ingest accepts values from `INT64_MIN+1` through `INT64_MAX-1`,
+covering 1677-09-21 to 2262-04-11; the two extrema are reserved and rejected.
+Numeric ms ingest rejects values outside years -32767 through 32767.
+
+Query bounds outside the ns domain saturate to the reserved extrema, so an
+upper bound above the domain includes everything and a lower bound above
+it includes nothing. The extrema themselves are never stored values.
+
+The unit is part of the field's signature. A schema update cannot change it
+on an existing date definition, including an empty field or an inherited unit.
+
+For default millisecond fields, date values and query examples use epoch
+milliseconds (not a year) or ISO-8601 strings:
 
 ```
 2024-06-25T10:30:00Z        a full instant, UTC
@@ -25,13 +46,18 @@ milliseconds, not a year) or an ISO-8601 string:
 1719311400000               epoch milliseconds
 ```
 
+Match and range queries use a date's whole window at its literal precision.
+Numeric literals name one field tick. `any_of` instead tests exact instants:
+numbers are exact field ticks, ISO text uses its start rounded toward earlier
+time, and members outside the field's stored domain are dropped.
+
 A partial date names its whole window at its own granularity. Querying
 `when_dt:2024-06` matches every instant in June; the range
 `[2024-01 TO 2024-06]` covers January through June, endpoints included.
 
 ISO fractions retain up to nine digits during parsing and date math; further
-digits are truncated. Storage and query literals truncate to millisecond
-precision, always toward earlier time. For example,
+digits are truncated. Storage truncates to field precision, always toward
+earlier time. For example, on a default millisecond field,
 `1969-12-31T23:59:59.9999999999Z` stores as epoch millisecond `-1` and finds
 that value when used as a query literal.
 
@@ -92,7 +118,7 @@ The zone can be an IANA name (case-sensitive) or a fixed offset such as
   `+1DAY` lands at the same local clock time even when that is 23 or 25
   physical hours away. Hours and smaller stay fixed physical durations.
 
-`NOW`, epoch milliseconds, and literals with `Z` or an explicit offset are
+`NOW`, numeric epoch values, and literals with `Z` or an explicit offset are
 instants; the zone does not move them, only math applied to them.
 
 Around a daylight-saving change, local times that do not exist are shifted
@@ -107,7 +133,7 @@ explicit offset.
 
 ## Date histograms
 
-Range facets bucket DATE fields with either a fixed gap in milliseconds or a
+Range facets bucket DATE fields with either a fixed gap in field units or a
 calendar gap in the facet's zone. Set `"bounds": "data"` to derive the span
 from matching values; each nested instance has its own extent. Explicit
 `start` and `end` instead set a fixed span:
@@ -140,8 +166,10 @@ POST /collections/main/_search
 ```
 
 Buckets are returned in order, zero counts included, with `[start, end)`
-epoch-millisecond pairs as bucket ids. Calendar buckets follow the civil
-calendar: months vary in length, and a daylight-saving day is 23 or 25 hours
+pairs in the field's unit as bucket ids. Nanosecond fields support one-ns
+fixed gaps, including negative epoch values; DATA and EXPLICIT use the same
+grid. An ns bucket's exclusive end may be `INT64_MAX`. Calendar buckets follow
+the civil calendar: months vary in length, and a daylight-saving day is 23 or 25 hours
 wide. Fixed gaps also step in local time when a zone is set: repeated lattice
 times have both occurrences as fences, and skipped lattice times map to the
 transition instant. With EXPLICIT bounds, the phase comes from the local time

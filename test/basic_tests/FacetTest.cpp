@@ -5374,6 +5374,8 @@ protected:
         if constexpr (std::is_same_v<Key, int64_t>) {
           if (facetOp.selected) {
             for (int64_t pin : std::get<api::ArrInt>(facetOp.selected->kind).v) {
+              if (fieldName.ends_with("_dt")
+                  && (pin < datetime_detail::kMinEpochMs || pin > datetime_detail::kMaxEpochMs)) continue;
               if (std::ranges::find(ids, pin) == ids.end()) ids.push_back(pin);
             }
           }
@@ -8052,4 +8054,102 @@ TEST_F(FacetTest, arrayChildReplayDedupUsesRequestBreaker) {
     }
     EXPECT_EQ(0u, req->memoryTracker.bytes());
   }
+}
+
+namespace {
+void setNanosecondFacetSchema(CollectionHelper& helper, bool points = false) {
+  SchemaBuilder schema;
+  auto& field = schema.field("stamp");
+  field.type = api::FieldDef::FieldClass::DATE;
+  field.unit = api::FieldDef::DateUnit::NS;
+  field.index = points ? api::FieldDef::IndexMode::RANGE : api::FieldDef::IndexMode::NONE;
+  schema.set(helper.collection());
+}
+}
+
+TEST_F(FacetTest, nanosecondFixedDataExplicitAndSelections) {
+  for (bool points : {false, true}) {
+    auto collection = points ? "points" : "columns";
+    CollectionHelper helper(collection);
+    setNanosecondFacetSchema(helper, points);
+    std::vector<Doc> docs;
+    for (int64_t value : {-2, -1, 1, 2}) docs.push_back(flatdoc("id", std::to_string(value), "stamp", value));
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(collection);
+    req->rangeFacet("ticks", "stamp").rangeData(1, std::nullopt, -3, 4);
+    req->rangeFacet("explicit", "stamp").range("1969-12-31T23:59:59.999999997Z", "1970-01-01T00:00:00.000000004Z", 1);
+    req->rangeFacet("phase", "stamp").rangeData(2, 1);
+    req->execute(false);
+    ASSERT_OK(req);
+    EXPECT_EQ(boundsOf(rootFacetResult(*req, "ticks")), boundsOf(rootFacetResult(*req, "explicit")));
+    EXPECT_EQ((Counts{0, 1, 1, 0, 1, 1, 0}), countsOf(rootFacetResult(*req, "ticks")));
+    EXPECT_EQ((Bounds{{-3, -1}, {-1, 1}, {1, 3}}), boundsOf(rootFacetResult(*req, "phase")));
+    EXPECT_EQ((Counts{1, 1, 2}), countsOf(rootFacetResult(*req, "phase")));
+    for (bool fieldFacet : {false, true}) {
+      auto selected = localReq(helper.getSearchEngine());
+      auto& top = selected->collection(collection).topDocs("q").allQuery().withStats();
+      if (fieldFacet) {
+        auto& facet = top.facet("f", "stamp");
+        setSelected(facet, std::vector<int64_t>{1});
+      } else {
+        auto& facet = top.rangeFacet("f", "stamp").range(-3, 3, 2);
+        auto* values = api::build::allocMessage<api::Val>(facet.mr());
+        values->kind = (int64_t)-1;
+        std::get<api::RangeFacet>(facet.rawOp().kind).selected = values;
+      }
+      selected->execute();
+      ASSERT_OK(selected);
+      EXPECT_EQ(1, selected->getMatchCount());
+    }
+  }
+}
+
+TEST_F(FacetTest, nanosecondCalendarDataAndExplicitShareFences) {
+  using Unit = api::CalendarGap_::Unit;
+  for (auto [name, start, end] : {
+      std::tuple{"America/Denver", "2024-03-09T07:00Z", "2024-03-12T06:00Z"},
+      std::tuple{"Pacific/Apia", "2011-12-29T10:00Z", "2012-01-01T10:00Z"}}) {
+    auto collection = name == std::string_view("Pacific/Apia") ? "apia" : "denver";
+    CollectionHelper helper(collection);
+    setNanosecondFacetSchema(helper, true);
+    int64_t lo = epoch(start), hi = epoch(end), day = 86400000;
+    std::vector<Doc> docs;
+    for (int64_t value = lo + day / 2; value < hi; value += day) {
+      docs.push_back(flatdoc("id", std::to_string(value), "stamp", value * 1000000 + 7));
+    }
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+    auto req = localReq(helper.getSearchEngine());
+    req->collection(collection).timeZone(name);
+    req->rangeFacet("data", "stamp").rangeDataCalendar(1, Unit::DAY);
+    req->rangeFacet("explicit", "stamp").calendarRange(start, end, 1, Unit::DAY);
+    req->rangeFacet("fixed", "stamp").rangeData(day * 1000000);
+    req->execute(false);
+    ASSERT_OK(req);
+    auto expected = oldCalendarFences(lo, hi, CalendarUnit::DAY, zone(name));
+    Bounds bounds;
+    for (size_t i = 1; i < expected.size(); i++) bounds.emplace_back(expected[i - 1] * 1000000, expected[i] * 1000000);
+    for (auto facet : {"data", "explicit", "fixed"}) {
+      EXPECT_EQ(bounds, boundsOf(rootFacetResult(*req, facet))) << name << " " << facet;
+      EXPECT_EQ((Counts(bounds.size(), 1)), countsOf(rootFacetResult(*req, facet)));
+    }
+    EXPECT_EQ(name == std::string_view("Pacific/Apia"), req->hasWarning("calendar_bucket_skipped"));
+  }
+}
+
+TEST_F(FacetTest, nanosecondMaximumIsAnExclusiveFence) {
+  CollectionHelper helper;
+  setNanosecondFacetSchema(helper, true);
+  ASSERT_TRUE(helper.index(flatdoc("id", "last", "stamp", INT64_MAX - 1), UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("data", "stamp").rangeData(1);
+  req->rangeFacet("explicit", "stamp").range(INT64_MAX - 3, INT64_MAX, 1);
+  req->rangeFacet("calendar", "stamp").rangeDataCalendar(1, api::CalendarGap_::Unit::MONTH);
+  req->execute(false);
+  ASSERT_OK(req);
+  EXPECT_EQ((Bounds{{INT64_MAX - 1, INT64_MAX}}), boundsOf(rootFacetResult(*req, "data")));
+  EXPECT_EQ((Counts{0, 0, 1}), countsOf(rootFacetResult(*req, "explicit")));
+  EXPECT_EQ((Bounds{{epoch("2262-04-01") * 1000000, INT64_MAX}}), boundsOf(rootFacetResult(*req, "calendar")));
+  EXPECT_EQ((Counts{1}), countsOf(rootFacetResult(*req, "calendar")));
 }
