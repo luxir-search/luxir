@@ -167,6 +167,31 @@ TEST_F(ValCoerceTest, tryColumnCoercion) {
   EXPECT_THROW(string.tryCoerceColInt64(sval("7"), "f"), std::runtime_error);
 }
 
+TEST_F(ValCoerceTest, dateFractionsHaveTheSameIngestAndQueryPrecision) {
+  DateFieldType date("_dt");
+  CoerceContext context;
+  context.dateMathNowEpochMillis = 0;
+  for (const auto& [text, expected] : {
+      std::pair{"1970-01-01T00:00:00.123456789123Z", (int64_t)123},
+      std::pair{"1969-12-31T23:59:59.9999999999Z", (int64_t)-1},
+      std::pair{"1969-12-31T23:59:59.9999999999Z||+1MILLI", (int64_t)0},
+  }) {
+    SCOPED_TRACE(text);
+    api::Val value = sval(text);
+    EXPECT_EQ(expected, date.coerceColInt64(value, "f", context));
+    EXPECT_EQ(expected, date.tryCoerceColInt64(value, "f", context));
+    auto range = date.tryCoerceDateRange(value, context);
+    ASSERT_TRUE(range);
+    EXPECT_EQ(expected, range->lo);
+    EXPECT_EQ(expected + 1, range->hiExclusive);
+    EXPECT_EQ(0, range->loNanos);
+    EXPECT_EQ(0, range->hiNanos);
+    EXPECT_EQ(range->hiExclusive, date.coerceDateRange(value, "f", context).hiExclusive);
+  }
+  EXPECT_FALSE(date.tryCoerceDateRange(sval("1970-01-01T00:00:00.Z"), context));
+  EXPECT_THROW(date.coerceDateRange(sval("1970-01-01T00:00:00.Z"), "f", context), RequestError);
+}
+
 TEST_F(ValCoerceTest, fieldTypeDefaultsThrow) {
   IntFieldType it("_i");
   StrFieldType st("_s");

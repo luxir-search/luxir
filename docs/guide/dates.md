@@ -29,6 +29,12 @@ A partial date names its whole window at its own granularity. Querying
 `when_dt:2024-06` matches every instant in June; the range
 `[2024-01 TO 2024-06]` covers January through June, endpoints included.
 
+ISO fractions retain up to nine digits during parsing and date math; further
+digits are truncated. Storage and query literals truncate to millisecond
+precision, always toward earlier time. For example,
+`1969-12-31T23:59:59.9999999999Z` stores as epoch millisecond `-1` and finds
+that value when used as a query literal.
+
 ## Date math
 
 Anywhere a date is accepted in a query, date math is too. Both Solr and

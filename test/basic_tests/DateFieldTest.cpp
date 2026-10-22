@@ -10,6 +10,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "test/TestUtils.h"
 #include "luxir/query/NumericPredicateQuery.h"
 #include "luxir/query/QueryBuilder.h"
 #include "luxir/util/DateTime.h"
@@ -85,6 +86,125 @@ TEST_F(DateFieldTest, parseFractionTruncates) {
   EXPECT_EQ(z + 500, parseDateToEpochMillis("2000-01-01T00:00:00.5Z"));
   // Sub-millisecond digits are truncated, not rounded.
   EXPECT_EQ(z + 123, parseDateToEpochMillis("2000-01-01T00:00:00.123999Z"));
+}
+
+TEST_F(DateFieldTest, subMillisecondFractionsAndUnits) {
+  struct Case {
+    const char* text;
+    int64_t lo;
+    int32_t loNanos;
+    int64_t hi;
+    int32_t hiNanos;
+  };
+  for (const auto& c : {
+      Case{"1970-01-01T00:00:00.123Z", 123, 0, 124, 0},
+      Case{"1970-01-01T00:00:00.1234Z", 123, 400000, 123, 500000},
+      Case{"1970-01-01T00:00:00.123456789Z", 123, 456789, 123, 456790},
+      Case{"1970-01-01T00:00:00.123456789123456789Z", 123, 456789, 123, 456790},
+      Case{"1969-12-31T23:59:59.999999Z", -1, 999000, 0, 0},
+      Case{"1969-12-31T23:59:59.9999999999Z", -1, 999999, 0, 0},
+  }) {
+    SCOPED_TRACE(c.text);
+    DateRange range = zoneRange(c.text, TimeZone::utc());
+    EXPECT_EQ(c.lo, range.lo);
+    EXPECT_EQ(c.loNanos, range.loNanos);
+    EXPECT_EQ(c.hi, range.hiExclusive);
+    EXPECT_EQ(c.hiNanos, range.hiNanos);
+    EXPECT_EQ(c.lo, parseDateToEpochMillis(c.text, 0));
+    EXPECT_EQ(c.lo * 1000000 + c.loNanos,
+              toDateUnits(range.lo, range.loNanos, DateUnit::NANOS));
+    EXPECT_EQ((std::pair<int64_t, int64_t>{c.lo, c.lo + 1}),
+              dateUnitWindow(range, DateUnit::MILLIS));
+  }
+  EXPECT_EQ(-1, toDateUnits(-1, 999999, DateUnit::MILLIS));
+  EXPECT_EQ(0, toDateUnits(-1, 999999, DateUnit::MILLIS, true));
+}
+
+TEST_F(DateFieldTest, nanosecondDomainAndSaturatedWindows) {
+  constexpr int64_t min = INT64_MIN, max = INT64_MAX;
+  auto nanos = [](std::string_view text) {
+    DateRange range = zoneRange(text, TimeZone::utc());
+    return toDateUnits(range.lo, range.loNanos, DateUnit::NANOS);
+  };
+  EXPECT_FALSE(nanos("1677-09-21T00:12:43.145224191Z"));
+  EXPECT_FALSE(nanos("1677-09-21T00:12:43.145224192Z"));
+  EXPECT_EQ(min + 1, nanos("1677-09-21T00:12:43.145224193Z"));
+  EXPECT_EQ(max - 1, nanos("2262-04-11T23:47:16.854775806Z"));
+  EXPECT_FALSE(nanos("2262-04-11T23:47:16.854775807Z"));
+  EXPECT_FALSE(nanos("2262-04-11T23:47:16.854775808Z"));
+  for (auto value : {min, max}) {
+    EXPECT_FALSE(toDateUnits(value, 0, DateUnit::NANOS));
+    EXPECT_EQ(value, toDateUnits(value, 0, DateUnit::MILLIS));
+  }
+  EXPECT_FALSE(toDateUnits(max, 1, DateUnit::MILLIS, true));
+  for (const auto& [text, expected] : {
+      std::pair{"1500-01-01", std::pair{min, min}},
+      std::pair{"3000-01-01", std::pair{max, max}},
+      std::pair{"1677-09-21T00:12:43.145224193Z", std::pair{min + 1, min + 2}},
+      std::pair{"2262-04-11T23:47:16.854775806Z", std::pair{max - 1, max}},
+  }) {
+    EXPECT_EQ(expected, dateUnitWindow(zoneRange(text, TimeZone::utc()), DateUnit::NANOS));
+  }
+}
+
+TEST_F(DateFieldTest, dateMathPreservesSubMillisecondEdges) {
+  auto expect = [](std::string_view expression, const TimeZone& zone, std::string_view literal) {
+    DateRange actual = zoneRange(expression, zone);
+    DateRange expected = zoneRange(literal, TimeZone::utc());
+    EXPECT_EQ(expected.lo, actual.lo) << expression;
+    EXPECT_EQ(expected.loNanos, actual.loNanos) << expression;
+    EXPECT_EQ(expected.hiExclusive, actual.hiExclusive) << expression;
+    EXPECT_EQ(expected.hiNanos, actual.hiNanos) << expression;
+  };
+  expect("1969-12-31T23:59:59.999999999Z+1MILLI", TimeZone::utc(),
+         "1970-01-01T00:00:00.000999999Z");
+  expect("2000-01-01T00:00:00.999999Z||+1d", TimeZone::utc(),
+         "2000-01-02T00:00:00.999999Z");
+  expect("2024-01-31T12:00:00.1234567899Z||+1M", TimeZone::utc(),
+         "2024-02-29T12:00:00.123456789Z");
+  expect("2024-03-09T12:00:00.123456789||+1d", testZone("America/Denver"),
+         "2024-03-10T18:00:00.123456789Z");
+  expect("2000-01-01T00:00:00.123456Z||/MILLI", TimeZone::utc(),
+         "2000-01-01T00:00:00.123Z");
+  expect("2000-01-01T00:00:00.123456Z||/s", TimeZone::utc(),
+         "2000-01-01T00:00:00Z");
+}
+
+TEST_F(DateFieldTest, overPrecisionLiteralsFindTheirIngestedValues) {
+  CollectionHelper helper;
+  const char* positive = "1970-01-01T00:00:00.123456789123456789Z";
+  const char* negative = "1969-12-31T23:59:59.9999999999Z";
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "positive", "when_dt", positive),
+      flatdoc("id", "negative", "when_dt", negative),
+      flatdoc("id", "next", "when_dt", (int64_t)124),
+      flatdoc("id", "epoch", "when_dt", (int64_t)0),
+  }, UpdateMessage::COMMIT).success);
+  for (const auto& [text, expected] : {
+      std::pair{positive, (int64_t)123}, std::pair{negative, (int64_t)-1}}) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("match").matchQuery("when_dt", text)
+        .fields({"when_dt"}).withStats();
+    auto& range = req->topDocs("range");
+    range.rawQuery() = qb::range(range.mr(), "when_dt", qb::valStr(range.mr(), text),
+        nullptr, qb::valStr(range.mr(), text), nullptr);
+    range.withStats();
+    std::string query = "when_dt:" + std::string(text);
+    req->topDocs("expr").exprQuery(query).withStats();
+    req->topDocs("simple").simpleQuery(query, {"id"}).withStats();
+    std::string_view texts[]{text};
+    api::Val values;
+    values.kind.emplace<api::ArrStr>().v = texts;
+    auto& any = req->topDocs("any").withStats().rawQuery().kind.emplace<api::AnyOfQuery>();
+    any.field = "when_dt";
+    any.values = &values;
+    req->execute();
+    ASSERT_OK(req);
+    for (auto name : {"match", "range", "expr", "simple", "any"}) {
+      EXPECT_EQ(1, req->getMatchCount(name)) << name << ": " << text;
+    }
+    EXPECT_TRUE(containsDoc(req->getDocs("match"), flatdoc("when_dt", expected)));
+  }
 }
 
 TEST_F(DateFieldTest, parseEpochMillisInteger) {
@@ -308,14 +428,34 @@ TEST_F(DateFieldTest, mergeAcrossSegments) {
   EXPECT_EQ((std::vector<std::string>{"c", "a", "b"}), ids);
 }
 
-// ---- format: canonical UTC ISO-8601, '.fff' only when non-zero ----
+// ---- format: canonical UTC ISO-8601 at field precision ----
 
 TEST_F(DateFieldTest, formatCanonical) {
-  EXPECT_EQ("1970-01-01T00:00:00Z", formatEpochMillisIso8601(0));
+  EXPECT_EQ("1970-01-01T00:00:00.000Z", formatEpochMillisIso8601(0));
   EXPECT_EQ("1970-01-01T00:00:00.001Z", formatEpochMillisIso8601(1));
-  EXPECT_EQ("2000-01-01T00:00:00Z", formatEpochMillisIso8601(946684800000LL));
-  EXPECT_EQ("1969-12-31T23:59:59Z", formatEpochMillisIso8601(-1000));  // pre-epoch (floor)
+  EXPECT_EQ("2000-01-01T00:00:00.000Z", formatEpochMillisIso8601(946684800000LL));
+  EXPECT_EQ("1969-12-31T23:59:59.000Z", formatEpochMillisIso8601(-1000));
   EXPECT_EQ("1969-12-31T23:59:59.500Z", formatEpochMillisIso8601(-500));
+}
+
+TEST_F(DateFieldTest, formatNanosecondsAndCivilLimits) {
+  for (const auto& [value, text] : {
+      std::pair{(int64_t)0, "1970-01-01T00:00:00.000Z"},
+      std::pair{(int64_t)1, "1970-01-01T00:00:00.000000001Z"},
+      std::pair{(int64_t)-1, "1969-12-31T23:59:59.999999999Z"},
+      std::pair{(int64_t)1000, "1970-01-01T00:00:00.000001Z"},
+      std::pair{(int64_t)1500000, "1970-01-01T00:00:00.001500Z"},
+      std::pair{(int64_t)2000000, "1970-01-01T00:00:00.002Z"},
+      std::pair{INT64_MIN, "1677-09-21T00:12:43.145224192Z"},
+      std::pair{INT64_MAX, "2262-04-11T23:47:16.854775807Z"},
+  }) {
+    EXPECT_EQ(text, formatDateIso8601(value, DateUnit::NANOS));
+  }
+  for (int64_t value : {datetime_detail::kMinEpochMs, datetime_detail::kMaxEpochMs}) {
+    EXPECT_EQ(value, parseDateToEpochMillis(formatEpochMillisIso8601(value)));
+  }
+  EXPECT_THROW(formatEpochMillisIso8601(INT64_MIN), std::out_of_range);
+  EXPECT_THROW(formatEpochMillisIso8601(INT64_MAX), std::out_of_range);
 }
 
 TEST_F(DateFieldTest, parseFormatRoundTrip) {

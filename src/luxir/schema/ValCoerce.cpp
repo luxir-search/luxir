@@ -106,7 +106,16 @@ std::optional<DateRange> DateFieldType::tryCoerceDateRange(
   if (auto i = std::get_if<int64_t>(&val.kind)) return DateRange{*i, *i + 1};
   if (auto s = std::get_if<std::string_view>(&val.kind)) {
     int64_t now = context.dateMathNowEpochMillis.value_or(currentEpochMillis());
-    return parseDateRange(*s, now, context.timeZone);
+    auto parsed = parseDateRange(*s, now, context.timeZone);
+    if (parsed) {
+      // Query coercion exposes column units, while the parser retains the
+      // sub-millisecond edges needed for date math and finer columns.
+      auto [lo, hi] = dateUnitWindow(*parsed, DateUnit::MILLIS);
+      parsed->lo = lo;
+      parsed->hiExclusive = hi;
+      parsed->loNanos = parsed->hiNanos = 0;
+    }
+    return parsed;
   }
   return std::nullopt;
 }
