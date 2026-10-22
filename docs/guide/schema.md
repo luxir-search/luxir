@@ -290,9 +290,11 @@ Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you
 wrote.
 
-`analyzer` inherits as one unit: an empty `{}` inherits the parent's analyzer,
-while naming a tokenizer or listing any character or token filter replaces the whole chain
-(filters alone get the `whitespace` tokenizer).
+An empty `analyzer: {}` inherits the parent's analyzer. Naming a tokenizer or
+listing any token filter replaces the whole chain, including character filters
+(token filters alone get the `whitespace` tokenizer). Setting only `char_filters`
+keeps the parent's tokenizer and token filters, replacing its character filters.
+Without a parent analyzer, the base is `whitespace` with no token filters.
 
 `column` and `stored` solve different problems. A column is a typed,
 per-field structure used by sorting, faceting, analytics, numeric/geo queries,
@@ -456,8 +458,8 @@ codepoints per input codepoint. HTML markup and entities are not decoded inside
 patterns. Already-analyzed phrase `terms` remain verbatim.
 Stored source values retain the submitted text.
 
-An analyzer specifying only `char_filters` replaces the inherited analyzer
-and uses the default `whitespace` tokenizer. Schema changes affect future
+An analyzer specifying only `char_filters` keeps the inherited tokenizer and
+token filters. Schema changes affect future
 indexing; reindex existing documents to apply new cleanup rules to them.
 
 ### Tokenizers and token filters

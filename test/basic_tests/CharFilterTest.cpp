@@ -207,7 +207,7 @@ TEST_F(CharFilterTest, schemaInheritanceAndIndexQueryParity) {
         {"name":"mapping","params":{"mappings":["- =>"]}}]}},
       "only":{"parent":"_base","analyzer":{"char_filters":["html_strip"]}}}})");
   auto* only = (TextFieldType*) s->getFieldTypePtr("only");
-  EXPECT_EQ("whitespace", only->analyzer_->tokenizer->name);
+  EXPECT_EQ("keyword", only->analyzer_->tokenizer->name);
   ASSERT_EQ(1u, only->analyzer_->charFilters.size());
   CollectionHelper ch;
   ch.collection().setSchema(s);
@@ -266,6 +266,50 @@ TEST_F(CharFilterTest, schemaRoundTripInheritanceAndValidation) {
       R"({"type":"int","analyzer":{"char_filters":["html_strip"]}})",
       R"({"type":"text","analyzer":{"char_filters":["no_such_filter"]}})"}) {
     EXPECT_THROW(schema(std::string("{\"fields\":{\"body\":") + field + "}}"), SchemaError);
+  }
+}
+
+TEST_F(CharFilterTest, charFiltersKeepInheritedTokenChain) {
+  auto original = schema(R"({"templates":{
+    "_base":{"type":"text","analyzer":{"tokenizer":"unicode_word",
+      "filters":["nfkc_cf","fold"],"char_filters":["nfkc_cf"]}},
+    "_clean":{"parent":"_base","analyzer":{"char_filters":["html_strip"]}},
+    "_owner":{"type":"string","variants":{"text":{"parent":"_base",
+      "analyzer":{"char_filters":["html_strip"]}}}}},
+    "fields":{"a":{"parent":"_clean"},"b":{"parent":"_clean"},
+      "title":{"parent":"_owner"},"summary":{"parent":"_owner"},
+      "keyword":{"parent":"_clean","analyzer":{"tokenizer":"keyword"}},
+      "filters":{"parent":"_clean","analyzer":{"filters":["lowercase"]}},
+      "bare":{"type":"text","analyzer":{"char_filters":["html_strip"]}}}})");
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  original->toProto(&def, arena);
+  const auto& sparse = *def.templates.at("_clean")->analyzer;
+  EXPECT_FALSE(sparse.tokenizer);
+  EXPECT_TRUE(sparse.filters.empty());
+  ASSERT_EQ(1u, sparse.char_filters.size());
+  auto restored = Schema::fromProto(def);
+  for (const auto& s : {original, restored}) {
+    auto plan = [&](const char* field) { return ((TextFieldType*) s->physical(field))->analyzer_; };
+    EXPECT_EQ(plan("a"), plan("b"));
+    EXPECT_EQ(plan("title__text"), plan("summary__text"));
+    for (auto field : {"a", "title__text"}) {
+      auto p = plan(field);
+      EXPECT_EQ("unicode_word", p->tokenizer->name);
+      ASSERT_EQ(2u, p->filters.size());
+      EXPECT_EQ("nfkc_cf", p->filters[0]->name);
+      EXPECT_EQ("fold", p->filters[1]->name);
+      ASSERT_EQ(1u, p->charFilters.size());
+      EXPECT_EQ("html_strip", p->charFilters[0]->name);
+      EXPECT_EQ((std::vector<std::string>{"cafe", "bar"}), analyze(*p->createChain(), "<b>CAF&Eacute;-BAR</b>").terms);
+    }
+    EXPECT_EQ("keyword", plan("keyword")->tokenizer->name);
+    EXPECT_TRUE(plan("keyword")->filters.empty());
+    EXPECT_TRUE(plan("keyword")->charFilters.empty());
+    EXPECT_EQ("whitespace", plan("filters")->tokenizer->name);
+    EXPECT_TRUE(plan("filters")->charFilters.empty());
+    EXPECT_EQ("whitespace", plan("bare")->tokenizer->name);
+    EXPECT_TRUE(plan("bare")->filters.empty());
   }
 }
 
