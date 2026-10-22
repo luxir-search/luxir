@@ -1187,12 +1187,12 @@ public:
   // words + positions form): it gives the intended phrase position of each
   // value.
   //   * empty: positions accumulate into one continuous stream, so a value that
-  //     expands to several tokens occupies several positions and a value that
-  //     drops to zero tokens contributes none (no gap).
+  //     expands to several tokens occupies several positions, including holes
+  //     from removed stop words. Empty analysis contributes no positions.
   //   * provided: each value's tokens start at its given position; a value that
   //     expands to multiple tokens consumes extra positions, and every later
   //     value is shifted by that overflow so the caller's gaps survive
-  //     multi-token expansion.
+  //     multi-token expansion and trailing stop words.
   Query* createPhraseQuery(std::string_view field, std::span<const std::string_view> values,
                            std::span<const int32_t> valuePositions = {}, int32_t slop = 0,
                            float boost = 1.0f) {
@@ -1232,6 +1232,7 @@ public:
           pos += (int64_t) tok.positionIncrement;
           emit(pos);
         }
+        pos += (int64_t) tc.end();
       }
     } else {
       int64_t carry = 0;  // extra positions consumed by prior values' expansion
@@ -1244,9 +1245,10 @@ public:
           relPos += (int64_t) tok.positionIncrement;
           emit(base + relPos);
         }
+        relPos += (int64_t) tc.end();
         // A single-token value spans relPos 0 (no overflow); a value spanning
-        // relPos slots pushes the rest by relPos. A dropped value (relPos < 0)
-        // leaves following positions untouched.
+        // relPos slots pushes the rest by relPos, including trailing holes.
+        // An empty value (relPos < 0) leaves following positions untouched.
         if (relPos > 0) {
           carry += relPos;
         }

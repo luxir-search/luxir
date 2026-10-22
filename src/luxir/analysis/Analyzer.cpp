@@ -421,6 +421,9 @@ public:
       }
       gap += token.positionIncrement - 1;
     }
+    // Empty folds consume no position, but retain any upstream stop holes.
+    // With no stop filter, gap stays zero and only this EOF branch is added.
+    if (gap) token.finalPositionIncrement += gap;
     return false;
   }
 
@@ -695,6 +698,11 @@ public:
   StopFilter(std::unique_ptr<TokenStream> source, std::shared_ptr<const StopWords> words)
       : TokenFilter(std::move(source)), words(std::move(words)) {}
 
+  void reset() override {
+    TokenFilter::reset();
+    token.finalPositionIncrement = 0;
+  }
+
   bool incrementToken() override {
     int skipped = 0;
     while (source().incrementToken()) {
@@ -704,7 +712,9 @@ public:
       }
       skipped += token.positionIncrement;
     }
-    // There is no end() yet: trailing holes are discarded at each value boundary.
+    // Each stop stage contributes only its own pending holes. Token::clear()
+    // leaves this stream attribute intact as exhaustion propagates downstream.
+    token.finalPositionIncrement += skipped;
     return false;
   }
 };
@@ -743,6 +753,7 @@ std::unique_ptr<TokenFilterFactory> stopFilter(const api::AnalyzerComponent& def
   };
   auto factory = std::make_unique<Factory>();
   factory->name = def.name;
+  factory->stateful = true;
   auto add = [&](std::string_view word) {
     factory->authored.emplace_back(word);
   };

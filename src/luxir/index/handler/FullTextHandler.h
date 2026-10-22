@@ -135,6 +135,7 @@ public:
           entry->val().addDoc(termsHash.getMemPool(), docid, pos);
         }
       }
+      pos += tc.end();
     }
 
     finishValues(inverter, numTokens);

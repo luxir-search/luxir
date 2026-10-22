@@ -22,6 +22,7 @@ std::shared_ptr<const Analyzer> compile(std::string_view json) {
 struct Analysis {
   std::vector<std::string> terms;
   std::vector<int> positions;
+  int finalPositionIncrement;
 };
 Analysis analyze(TokenChain& chain, std::string_view value) {
   chain.setValue(value);
@@ -34,6 +35,7 @@ Analysis analyze(TokenChain& chain, std::string_view value) {
     position += token.positionIncrement;
     out.positions.push_back(position);
   }
+  out.finalPositionIncrement = chain.end();
   return out;
 }
 std::shared_ptr<Schema> schema(std::string_view json) {
@@ -146,6 +148,27 @@ TEST_F(StopFilterTest, invalidWordsAndStringNormalizers) {
     {"name":"stop","params":{"words":["the"]}}]}}})"), SchemaError);
 }
 
+TEST_F(StopFilterTest, finalPositionsMultipleStopsAndReuse) {
+  auto chain = compile(R"({"filters":[{"name":"stop","params":{"words":["a"]}},
+    {"name":"stop","params":{"words":["b"]}}]})")->createChain();
+  for (auto value : {"red a b a", "red b a b", "a b a"}) {
+    EXPECT_EQ(3, analyze(*chain, value).finalPositionIncrement) << value;
+    EXPECT_FALSE(chain->tail->incrementToken());
+    EXPECT_EQ(3, chain->end()); // repeated exhaustion adds no duplicate holes
+    EXPECT_EQ(0, analyze(*chain, "").finalPositionIncrement);
+    EXPECT_EQ(0, analyze(*chain, "red").finalPositionIncrement);
+  }
+  auto out = analyze(*chain, "red a b blue a b");
+  EXPECT_EQ((std::vector<int>{0, 3}), out.positions);
+  EXPECT_EQ(2, out.finalPositionIncrement);
+  EXPECT_EQ(0, analyze(*compile("{}")->createChain(), "red").finalPositionIncrement);
+  auto folded = compile(R"({"filters":[{"name":"stop","params":{"words":["a"]}},"nfkc_cf"]})")->createChain();
+  EXPECT_EQ(1, analyze(*folded, "red a \xc2\xad").finalPositionIncrement);
+  EXPECT_EQ(2, analyze(*folded, "red a \xc2\xad a").finalPositionIncrement);
+  EXPECT_EQ((std::vector<int>{0, 2}), analyze(*folded, "red a \xc2\xad blue").positions);
+  EXPECT_EQ(0, analyze(*folded, "red \xc2\xad").finalPositionIncrement);
+}
+
 TEST_F(StopFilterTest, phrasesAndTrailingHolesBetweenValues) {
   CollectionHelper ch;
   ch.collection().setSchema(schema(R"({"fields":{"id":"id","body":{"type":"text","multi":true,
@@ -153,19 +176,26 @@ TEST_F(StopFilterTest, phrasesAndTrailingHolesBetweenValues) {
   ch.index(flatdoc("id", "gap", "body", "red the blue"));
   ch.index(flatdoc("id", "adjacent", "body", "red blue"));
   ch.index(flatdoc("id", "values", "body", std::vector<std::string>{"red the", "blue"}), UpdateMessage::COMMIT);
-  for (int mode = 0; mode < 4; ++mode) {
+  for (int mode = 0; mode < 9; ++mode) {
     auto req = localReq(ch.getSearchEngine());
     auto& q = req->topDocs("q");
     if (mode == 0) q.phraseText("body", "RED THE BLUE");
     if (mode == 1) q.phraseQuery("body", {"red the", "blue"});
     if (mode == 2) q.phraseQuery("body", {"red", "the blue"});
     if (mode == 3) q.matchQuery("body", "THE");
+    if (mode == 4) q.phraseQuery("body", {"red the", "blue"});
+    if (mode == 5 || mode == 6) q.phraseTerms("body", {"red", "blue"});
+    if (mode == 7) q.phraseQuery("body", {"red", "the", "blue"});
+    if (mode == 8) q.phraseQuery("body", {"red", "the the", "blue"});
+    int32_t positions[] = {0, mode == 5 ? 102 : mode == 6 ? 101 : 1, 2};
+    if (mode == 4 || mode == 5 || mode == 6 || mode == 8)
+      std::get<api::PhraseQuery>(q.rawQuery().kind).positions = std::span(positions, mode == 8 ? 3 : 2);
     q.fields({"id"});
     req->execute();
     ASSERT_OK(req);
     auto docs = req->getDocs();
-    if (mode == 3) { EXPECT_TRUE(docs.empty()); continue; }
+    if (mode == 3 || mode == 6 || mode == 8) { EXPECT_TRUE(docs.empty()); continue; }
     ASSERT_EQ(1u, docs.size());
-    EXPECT_EQ(mode == 1 ? "adjacent" : "gap", std::get<std::string>(*find(docs[0], "id")));
+    EXPECT_EQ(mode == 5 ? "values" : "gap", std::get<std::string>(*find(docs[0], "id")));
   }
 }

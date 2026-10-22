@@ -36,6 +36,9 @@ public:
   int positionIncrement; // increment from the previous token's position
   int startOffset; // byte offset into the tokenizer input of current token
   int endOffset;   // end offset (exclusive) into the tokenizer input
+  // Stream state, deliberately untouched by clear(). Stop filters reset this
+  // per value and accumulate trailing holes when exhaustion reaches them.
+  int finalPositionIncrement = 0;
 
   void clear() {
     // Offsets are deliberately not reset here: every emit path sets them, so
@@ -55,16 +58,15 @@ public:
 
 // A pull-based stream of Tokens. The whole chain shares a single Token object
 // (held by the head Tokenizer); each stage repoints its `text`/attributes in
-// place. Lifecycle is reset() / incrementToken()* / end():
+// place. TokenChain manages reset() / incrementToken()* / end():
 //   * reset()           - prepare to emit tokens for a fresh value. The head's
 //                         input is supplied separately via Tokenizer::setValue.
 //                         Defaults to no-op (and non-forwarding); only stateful
 //                         (buffering) filters need to override it.
 //   * incrementToken()  - advance to the next token, returning false at the end.
-//   * end()             - reserved seam for reporting trailing stream state
-//                         (final offset, trailing position increment). Not needed
-//                         yet; will be added no-op-defaulted when the first
-//                         feature that produces trailing state lands.
+//   * TokenChain::end()  - after exhaustion, read the final position increment
+//                         once per value. Stages contribute on exhaustion, so
+//                         reading it needs no virtual walk through the chain.
 class TokenStream {
 protected:
   Token &token;
@@ -375,6 +377,10 @@ public:
     if (stateful) tail->reset();
   }
 
+  // Read once after incrementToken() returns false, before the next value.
+  // Chains without stop filters keep this at zero, with no per-token work.
+  int end() { return head.getToken().finalPositionIncrement; }
+
   // Normalize a single term the way this chain folds token text, without
   // segmentation - the multiterm entry point (see TokenStream::normalizeTerm).
   // Like setValue(), this invalidates the current value's buffers and offset maps.
@@ -393,9 +399,9 @@ private:
 };
 
 
-// The compiled analysis plan for one authored AnalyzerDef (Lucene's Analyzer):
+// The compiled analysis plan for one effective AnalyzerDef (Lucene's Analyzer):
 // immutable and thread-safe, shared by every field that resolves to the same
-// definition (Schema::fromProto compiles each authored definition once).
+// definition (Schema::fromProto compiles each effective definition once).
 // compile() runs the component registry, so an Analyzer only exists for a
 // fully validated definition and owns everything it needs (the authored
 // views may be freed right after); createChain() instantiates a fresh
