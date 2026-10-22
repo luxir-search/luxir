@@ -144,6 +144,7 @@ private:
     previousLiveDepth = s.liveDepth;
     chainBroken = s.chainBroken;
     termsExaminedCount = s.examined;
+    this->visitedTerms = s.examined;
     dpStepCount = s.steps;
     jumpCount = s.jumps;
   }
@@ -151,6 +152,11 @@ private:
   bool stop(const Scan& s) {
     store(s);
     return finish();
+  }
+
+  bool stopAtLimit(const Scan& s) {
+    store(s);
+    return this->finishAtLimit();
   }
 
 public:
@@ -181,7 +187,9 @@ public:
     Scan s{(int)prefix.size(), previousLiveDepth, chainBroken,
            termsExaminedCount, dpStepCount, jumpCount};
     if (advanceFirst && !advanceAutomaton(a, s)) return stop(s);
+    const int64_t limit = this->visitLimit;
     for (;;) {
+      if (s.examined >= limit) return stopAtLimit(s);
       Status status = acceptAutomaton(a, s);
       if (status != Status::REJECT) {
         if (status == Status::END) return stop(s);

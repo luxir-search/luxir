@@ -640,3 +640,124 @@ TEST_F(PrefixQueryE2ETest, stringField) {
   EXPECT_EQ(prefixIds("color_s", "blue"), (std::vector<std::string>{"d3"}));
   EXPECT_EQ(prefixIds("color_s", "re"), (std::vector<std::string>{"d1", "d2", "d4"}));
 }
+
+// Docs a capped prefix query matches in one segment, in iteration order, plus
+// how many expanded terms the segment retained.
+static std::pair<std::vector<int32_t>, size_t> cappedPrefixDocs(
+    TestIndex& ti, std::string_view prefix, int32_t maxExpansions, int32_t flags) {
+  MemPool pool;
+  Query::Context context(pool, *ti.reader);
+  PrefixQuery query("foo_w", prefix, maxExpansions);
+  auto* weight = static_cast<MultiTermQuery::Weight*>(query.createWeight(context, flags));
+  auto& segment = context.topReader.segments()[0];
+  auto* scorer = weight->createScorer(pool, segment);
+  std::vector<int32_t> docs;
+  if (scorer == nullptr) return {docs, 0};
+  for (int32_t d = scorer->next(); d != PostingsReader::END; d = scorer->next()) {
+    docs.push_back(d);
+  }
+  return {docs, weight->expansionMemoRetainedStatesForTests(segment)};
+}
+
+// max_expansions keeps the highest-docFreq terms (ties to the lower term) and
+// matches exactly the union of those terms, scored or not.
+TEST_F(PrefixQueryTest, maxExpansionsKeepsHighestDocFreqTerms) {
+  TestIndex ti;
+  TestField f(ti, "foo_w");
+  f.startIndexing();
+  // docFreq: paa=1, pbb=2, pcc=5, pdd=2, pee=3, other=1
+  f.add(0, "pcc pbb");
+  f.add(1, "pcc pee");
+  f.add(2, "pcc");
+  f.add(3, "pcc paa");
+  f.add(4, "pcc");
+  f.add(5, "pee other");
+  f.add(6, "pee pdd");
+  f.add(7, "pbb");
+  f.add(8, "pdd");
+  ti.flush();
+  f.startReading();
+
+  using V = std::vector<int32_t>;
+  for (int32_t flags : {0, Query::NEED_SCORES | Query::ALLOW_PRUNING}) {
+    SCOPED_TRACE(::testing::Message() << "flags=" << flags);
+    // pcc
+    EXPECT_EQ(cappedPrefixDocs(ti, "p", 1, flags), (std::pair{V{0, 1, 2, 3, 4}, (size_t) 1}));
+    // pcc, pee
+    EXPECT_EQ(cappedPrefixDocs(ti, "p", 2, flags), (std::pair{V{0, 1, 2, 3, 4, 5, 6}, (size_t) 2}));
+    // pcc, pee, pbb (ties with pdd and wins as the lower term)
+    EXPECT_EQ(cappedPrefixDocs(ti, "p", 3, flags), (std::pair{V{0, 1, 2, 3, 4, 5, 6, 7}, (size_t) 3}));
+    // a cap above the expansion is the unbounded query
+    EXPECT_EQ(cappedPrefixDocs(ti, "p", 50, flags), (std::pair{V{0, 1, 2, 3, 4, 5, 6, 7, 8}, (size_t) 5}));
+    EXPECT_EQ(cappedPrefixDocs(ti, "p", 0, flags), cappedPrefixDocs(ti, "p", 50, flags));
+    EXPECT_EQ(cappedPrefixDocs(ti, "z", 2, flags), (std::pair{V{}, (size_t) 0}));
+  }
+
+  // The cap is part of query identity.
+  EXPECT_FALSE(PrefixQuery("foo_w", "p", 2).equals(PrefixQuery("foo_w", "p")));
+  EXPECT_TRUE(PrefixQuery("foo_w", "p", 2).equals(PrefixQuery("foo_w", "p", 2)));
+}
+
+// A capped expansion of a huge prefix stays on the windowed lazy union instead
+// of the heap union the uncapped query takes.
+TEST_F(PrefixQueryTest, maxExpansionsKeepsHugePrefixWindowed) {
+  TestIndex ti;
+  TestField field(ti, "foo_w");
+  field.startIndexing();
+  constexpr int32_t termCount =
+      (int32_t) MultiTermQuery::Weight::MAX_LAZY_TERMS + 100;
+  for (int32_t doc = 0; doc < termCount; doc++) {
+    std::string body = "pre" + std::to_string(doc);
+    // A few terms repeat so they outrank the single-doc terms.
+    if (doc >= 7 && doc < 7 + 3 * 4) body = "prehot" + std::to_string(doc % 3);
+    field.add(doc, body);
+  }
+  ti.flush();
+  field.startReading();
+
+  MemPool pool;
+  Query::Context context(pool, *ti.reader);
+  PrefixQuery prefix("foo_w", "pre", 3);
+  auto* scorer = prefix.createWeight(
+      context, Query::NEED_SCORES | Query::ALLOW_PRUNING)
+      ->createScorer(pool, context.topReader.segments()[0]);
+  ASSERT_NE(dynamic_cast<UnionLazyScorer*>(scorer), nullptr);
+  std::vector<int32_t> docs;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+    docs.push_back(doc);
+  }
+  std::vector<int32_t> expected;
+  for (int32_t doc = 7; doc < 7 + 3 * 4; doc++) expected.push_back(doc);
+  EXPECT_EQ(expected, docs);
+}
+
+TEST_F(PrefixQueryTest, maxExpansionsValidation) {
+  auto schema = Schema::createDefaultSchema();
+  MemPool pool;
+  QueryBuilder builder(pool, *schema, CoerceContext{});
+  int32_t cap = (int32_t) MultiTermQuery::Weight::MAX_LAZY_TERMS;
+  EXPECT_NE(builder.createPrefixQuery("foo_w", "ab", cap), nullptr);
+  EXPECT_THROW(builder.createPrefixQuery("foo_w", "ab", cap + 1), std::runtime_error);
+  EXPECT_THROW(builder.createPrefixQuery("foo_w", "ab", -1), std::runtime_error);
+}
+
+// The expression language and protobuf carry max_expansions end to end.
+TEST_F(PrefixQueryE2ETest, maxExpansions) {
+  helper.index(flatdoc("id", "d5", "body_w", "apple"), UpdateMessage::COMMIT);
+  auto count = [&](std::string_view q) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").exprQuery(q).countLimit();
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->getMatchCount();
+  };
+  // apple (d1, d4, d5) outranks apricot (d1, d3) and avocado (d3)
+  EXPECT_EQ(count("prefix(a, field=body_w)"), 4);
+  EXPECT_EQ(count("prefix(a, field=body_w, max_expansions=1)"), 3);
+  EXPECT_EQ(count("prefix(a, field=body_w, max_expansions=2)"), 4);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").exprQuery("prefix(a, field=body_w, max_expansions=5000)");
+  req->execute();
+  EXPECT_FALSE(req->ok());
+}

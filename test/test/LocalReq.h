@@ -72,7 +72,9 @@ public:
   OpCursor& filter(const luxir::api::Query& query,
                    std::initializer_list<std::string_view> exceptOps = {});
   OpCursor& matchFilter(std::string_view field, std::string_view value);
-  OpCursor& prefixQuery(std::string_view field, std::string_view prefix);
+  OpCursor& prefixQuery(std::string_view field, std::string_view prefix, int maxExpansions = 0);
+  OpCursor& wildcardQuery(std::string_view field, std::string_view pattern);
+  OpCursor& regexQuery(std::string_view field, std::string_view pattern);
   OpCursor& fuzzyQuery(std::string_view field, std::string_view term,
                        int maxEdits = -1, int prefixLength = -1, int maxExpansions = 0);
   OpCursor& simpleQuery(std::string_view q, std::initializer_list<std::string> fieldNames);
@@ -598,10 +600,24 @@ inline OpCursor& OpCursor::exprQuery(std::string_view q) {
   e.q = build::arenaStr(req_->mr, q);
   return *this;
 }
-inline OpCursor& OpCursor::prefixQuery(std::string_view field, std::string_view prefix) {
+inline OpCursor& OpCursor::prefixQuery(std::string_view field, std::string_view prefix,
+                                       int maxExpansions) {
   auto& p = getOrCreateQuery().kind.emplace<luxir::api::PrefixQuery>();
   p.field = build::arenaStr(req_->mr, field);
   p.prefix = build::arenaStr(req_->mr, prefix);
+  p.max_expansions = maxExpansions;
+  return *this;
+}
+inline OpCursor& OpCursor::wildcardQuery(std::string_view field, std::string_view pattern) {
+  auto& w = getOrCreateQuery().kind.emplace<luxir::api::WildcardQuery>();
+  w.field = build::arenaStr(req_->mr, field);
+  w.pattern = build::arenaStr(req_->mr, pattern);
+  return *this;
+}
+inline OpCursor& OpCursor::regexQuery(std::string_view field, std::string_view pattern) {
+  auto& r = getOrCreateQuery().kind.emplace<luxir::api::RegexQuery>();
+  r.field = build::arenaStr(req_->mr, field);
+  r.pattern = build::arenaStr(req_->mr, pattern);
   return *this;
 }
 inline OpCursor& OpCursor::fuzzyQuery(std::string_view field, std::string_view term,

@@ -22,6 +22,7 @@
 #include "FilterCache.h"
 #include "RequestMemTracker.h"
 #include "luxir/query/ExecutionWarnings.h"
+#include "luxir/query/MultiTermBudget.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/Clock.h"
 #include "luxir/util/DateTime.h"
@@ -103,6 +104,9 @@ public:
   SearchEngine& engine;
   const SearchConfig searchConfig;
   RequestMemTracker memoryTracker;
+  // Shared by every query tree of the request: one allowance for all of its
+  // prefix/wildcard/regex/range/fuzzy dictionary work.
+  MultiTermBudget multiTermBudget;
   const ReqProto& proto;            // borrowed non-owning view over the request bytes
   google::protobuf::Arena& arena;   // engine object allocator (NOT proto storage)
   std::shared_ptr<IndexReader> reader;

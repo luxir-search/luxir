@@ -257,6 +257,18 @@ apply their multi-term normalization/folding but do not tokenize it; STRING
 uses its normalizer if present, and ID uses the bytes verbatim. An empty prefix
 matches documents with at least one indexed term for the field.
 
+| Field | Meaning |
+|---|---|
+| `max_expansions` | Unset or `0`: every term with the prefix. `N` (at most 4096): in each segment, only the `N` terms with the highest document frequency (ties keep the lower term). |
+
+A short prefix over a large dictionary can expand to hundreds of thousands of
+terms, and an unscored or exactly counted request then reads every one of their
+postings lists. `max_expansions` bounds that work, the way Elasticsearch's
+`match_bool_prefix` does (its default there is 50). The terms are chosen per
+segment, so a term just outside the cut can match in one segment and not in
+another. Without `max_expansions` the complete expansion is held to the server
+limits in [Expansion limits](#expansion-limits).
+
 ## Wildcard
 
 ```json
@@ -337,6 +349,30 @@ milliseconds, ISO-8601, partial dates, and date math; see
 terms in byte order with constant scores. Text bounds receive the field's
 normalization/folding but are not tokenized; STRING bounds use its normalizer.
 The bare field uses the value binding, including a range with no bounds.
+Term ranges are subject to [Expansion limits](#expansion-limits).
+
+## Expansion limits
+
+Prefix, wildcard, regex, term-range, and fuzzy queries expand against the
+field's term dictionary, so their cost grows with the field's cardinality
+rather than with the request. The server bounds that work for each request,
+and a request that needs more fails with `RESOURCE_EXHAUSTED` instead of
+returning a truncated match set:
+
+| Error code | Cause |
+|---|---|
+| `too_many_expansions` | One index segment of a wildcard, regex, term-range, or prefix query without `max_expansions` matched more terms than the server allows (`65536` by default). |
+| `too_many_terms_examined` | The request's dictionary scans, matching or not, visited more terms than the server allows. All multi-term and fuzzy queries of a request share this budget. |
+| `too_many_expansion_postings` | The request's multi-term expansions together matched more postings than the server allows. |
+| `pattern_prefix_too_short` | An open-ended wildcard or regex (for example `*abc*` or `.*abc`) has fewer literal leading bytes than the server minimum, and the terms under that prefix already exceed the request's remaining scan budget. It is rejected before it scans anything. |
+
+A request cannot raise or disable these limits. A prefix query that sets
+`max_expansions` keeps at most that many terms per segment, so it never hits
+`too_many_expansions`, but its scan still counts toward the terms-examined
+budget. `any_of` term lists are not capped by term count, because the request
+already lists every term. Finite patterns such as `(dune|kings)` need no
+literal prefix: they seek directly to each term. See
+[Operations](operations.md) for the server settings.
 
 ## Constant score and boost
 
@@ -699,3 +735,5 @@ in their own guides:
   positive `min_match`.
 - Fuzzy expansion truncation (the `64` clause budget and any lower operator
   limit) is not reported in the response.
+- Multi-term and fuzzy dictionary work is bounded per request; see
+  [Expansion limits](#expansion-limits).

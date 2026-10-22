@@ -80,10 +80,15 @@ class DfaIntersectEnum final : public AutomatonSeekCore<automaton::ByteDfaView> 
     s.chainBroken = true;
   }
 
+  // Terms classified by either path, for the visit limit.
+  static int64_t visits(const SmartScan& s) { return s.examined; }
+  static int64_t visits(const Scan& s) { return s.examined + s.linearTerms; }
+
   void store(const SmartScan& s) {
     previousLiveDepth = s.liveDepth;
     chainBroken = s.chainBroken;
     termsExaminedCount = s.examined;
+    visitedTerms = s.examined;
     dpStepCount = s.steps;
     jumpCount = s.jumps;
   }
@@ -95,12 +100,19 @@ class DfaIntersectEnum final : public AutomatonSeekCore<automaton::ByteDfaView> 
     linearActive = s.linearActive;
     linearTermCount = s.linearTerms;
     suffixRejectCount = s.suffixRejects;
+    visitedTerms = visits(s);
   }
 
   template<typename S>
   bool stop(const S& s) {
     store(s);
     return finish();
+  }
+
+  template<typename S>
+  bool stopAtLimit(const S& s) {
+    store(s);
+    return finishAtLimit();
   }
 
   template<typename T>
@@ -290,7 +302,9 @@ class DfaIntersectEnum final : public AutomatonSeekCore<automaton::ByteDfaView> 
     }
 
     const A a = automaton;
+    const int64_t limit = visitLimit;
     for (;;) {
+      if (visits(s) >= limit) return stopAtLimit(s);
       if constexpr (USE_LINEAR) {
         if (s.linearActive) {
           if (!termBeforeLinearUpper(s)) {

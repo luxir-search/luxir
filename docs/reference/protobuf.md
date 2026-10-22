@@ -1657,6 +1657,7 @@ Matches documents where \`field\` has a term starting with \`prefix\`. TEXT fiel
 |---|---|---|---|---|
 | <a id="field-luxir.prefixquery.field"></a>[`field`](#field-luxir.prefixquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.prefixquery.prefix"></a>[`prefix`](#field-luxir.prefixquery.prefix) | 2 | `string` | singular |  |
+| <a id="field-luxir.prefixquery.max_expansions"></a>[`max_expansions`](#field-luxir.prefixquery.max_expansions) | 3 | `int32` | singular | Max term expansions per segment. Unset/0 = every term with the prefix. A positive value keeps only the terms with the highest document frequency in each segment (ties go to the lower term), so a short prefix over a large dictionary costs at most this many postings lists per segment. Values above 4096 and negative values are rejected. |
 
 <a id="message-luxir.pressurestats"></a>
 

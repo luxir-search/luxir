@@ -172,7 +172,8 @@ luxir::Query* ProtobufQueryParser::parsePhrase(const luxir::api::PhraseQuery& ph
 luxir::Query* ProtobufQueryParser::parsePrefix(const luxir::api::PrefixQuery& prefixQuery) {
   QueryBuilder builder(
       pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields);
-  return builder.createPrefixQuery(prefixQuery.field, prefixQuery.prefix);
+  return builder.createPrefixQuery(prefixQuery.field, prefixQuery.prefix,
+                                   prefixQuery.max_expansions);
 }
 
 luxir::Query* ProtobufQueryParser::parseWildcard(const luxir::api::WildcardQuery& wildcardQuery) {

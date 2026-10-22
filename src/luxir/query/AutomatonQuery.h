@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <format>
 #include <optional>
+#include <string>
 #include <string_view>
 
 #include "FittedTerms.h"
@@ -35,6 +37,8 @@ private:
   automaton::ByteDfaKind classification;
   std::string_view exactOrPrefix;
   DfaScanPlan scanPlan;
+  // The language is infinite, so a scan is bounded only by its literal prefix.
+  bool unboundedLanguage;
   // The field's long-term policy for a general pattern on a field that can
   // hold fitted (hashed or truncated) long values, whose discarded bytes the
   // pattern cannot see; nullopt means no warning applies.
@@ -48,7 +52,10 @@ public:
       : MultiTermQuery(QueryKind::AUTOMATON, field), automatonKind(kind),
         pattern(pattern), dfa(dfa),
         classification(classification), exactOrPrefix(exactOrPrefix),
-        scanPlan(scanPlan), fittedPolicy(fittedPolicy) {}
+        scanPlan(scanPlan),
+        unboundedLanguage(classification == automaton::ByteDfaKind::NORMAL
+            && dfa.maxAcceptedLength() == automaton::ByteDfaView::UNBOUNDED),
+        fittedPolicy(fittedPolicy) {}
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const AutomatonQuery&>(other);
@@ -60,6 +67,17 @@ public:
     uint64_t value = mixHash(Query::hashImpl(), automatonKind);
     value = mixHash(value, field);
     return mixHash(value, pattern);
+  }
+
+  std::optional<std::string_view> unboundedScanPrefix() const override {
+    if (!unboundedLanguage) return std::nullopt;
+    return scanPlan.prefix;
+  }
+
+  std::string describe() const override {
+    return std::format("{} query '{}' on field '{}'",
+                       automatonKind == Kind::WILDCARD ? "wildcard" : "regex",
+                       pattern, field);
   }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,

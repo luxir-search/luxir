@@ -169,6 +169,13 @@ struct SearchConfig {
   // reservation tails, is 158,536,389 bytes - so 160 MiB covers it.
   // Early-merge degradation is future work.
   size_t request_memory_max_bytes = 0;
+  // Term-dictionary expansion guards for prefix, wildcard, regex, string
+  // range, and fuzzy queries (see MultiTermLimits). Zero is unlimited; a
+  // request can never raise or disable them.
+  int32_t multiterm_max_expansions = 65'536;
+  int64_t multiterm_max_terms_examined = 1 << 23;
+  int64_t multiterm_max_postings = 1 << 30;
+  int32_t multiterm_min_prefix_length = 1;
 };
 
 struct ReplicationConfig {

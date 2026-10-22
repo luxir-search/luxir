@@ -568,11 +568,22 @@ public:
   // Build a prefix query over term-backed fields. The prefix is normalized
   // (not tokenized) for analyzed TEXT fields and normalized for STRING; ID is verbatim;
   // the field and prefix views must outlive the returned query.
-  Query* createPrefixQuery(std::string_view field, std::string_view prefix) {
-    return createPrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), prefix);
+  // maxExpansions 0 expands every matching term; a positive value keeps the
+  // highest-docFreq terms per segment, up to MultiTermQuery's lazy-union cap.
+  Query* createPrefixQuery(std::string_view field, std::string_view prefix,
+                           int32_t maxExpansions = 0) {
+    return createPrefixQuery(fields.resolve(field, OpClass::SEARCH, opName), prefix,
+                             maxExpansions);
   }
 
-  Query* createPrefixQuery(const ResolvedFieldHandle& target, std::string_view prefix) {
+  Query* createPrefixQuery(const ResolvedFieldHandle& target, std::string_view prefix,
+                           int32_t maxExpansions = 0) {
+    if (maxExpansions < 0
+        || (size_t) maxExpansions > MultiTermQuery::Weight::MAX_LAZY_TERMS) {
+      throw std::runtime_error(std::format(
+          "Prefix query max_expansions must be between 0 and {} (got {})",
+          MultiTermQuery::Weight::MAX_LAZY_TERMS, maxExpansions));
+    }
     auto field = poolCopy(target.physicalName);
     FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
@@ -584,7 +595,8 @@ public:
           throw std::runtime_error(std::format(
               "Prefix query requires an indexed field: {}", field));
         }
-        return pool.make<PrefixQuery>(field, PackedTerm::fitPrefix(fieldType.longTerms, prefix));
+        return pool.make<PrefixQuery>(
+            field, PackedTerm::fitPrefix(fieldType.longTerms, prefix), maxExpansions);
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
     }
