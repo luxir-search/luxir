@@ -117,3 +117,64 @@ LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_10k_batch1,       1, 10'000, 1, true);
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t1_10k_batch1_noOW,  1, 10'000, 1, false);
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k_batch1,       4, 10'000, 1, true);
 LUXIR_BENCHMARK_CAPTURE(BM_Overwrite, t4_10k_batch1_noOW,  4, 10'000, 1, false);
+
+
+// Bulk ingest of unique ids with overwrite on and no commit until the end, the shape of
+// an ES-style _bulk load where the gateway generates every id. No id ever collides, but
+// each flush still leaves a delete packet holding the inverter's whole id hash. Those
+// packets must be retired by delete passes under a finite budget instead of piling up
+// until the commit. retained_max and reserved_max should stay near the budget no matter
+// how many docs are indexed; compare with noOW, which builds no packets at all.
+static void BM_OverwriteUniqueNoCommit(benchmark::State& state, int64_t totalDocs, int batchSize, bool overwrite, int64_t budgetMB) {
+  if (luxir::unit_tests) totalDocs = std::min(totalDocs, LuxirTest::scaleTestWork(2000));
+
+  CollectionHelper helper;
+  auto& budget = helper.getNode().getIndexRamBudget();
+  auto writer = helper.getIndexWriter();
+  int64_t savedTotal = budget.totalBytes();
+  size_t savedInverterCap = writer->perInverterRamBytes;
+  // As on a server, --indexing.max-inverter-ram-mb defaults to the whole budget.
+  budget.setTotalBytes(budgetMB << 20);
+  writer->perInverterRamBytes = (size_t)budgetMB << 20;
+
+  RSSWatcher watcher;
+  int64_t retainedMax = 0, reservedMax = 0;
+
+  for (auto _ : state) {
+    helper.clear();
+
+    std::vector<Doc> docs(batchSize);
+    for (auto& d : docs) d = {{"id", std::string()}};
+
+    for (int64_t done = 0; done < totalDocs; ) {
+      int thisBatch = (int)std::min(totalDocs - done, (int64_t)batchSize);
+      for (int i = 0; i < thisBatch; i++) {
+        std::get<std::string>(docs[i][0].val) = "doc-" + std::to_string(done + i);
+      }
+      helper.indexAll({docs.data(), (size_t)thisBatch}, UpdateMessage::NO_COMMIT, overwrite);
+      done += thisBatch;
+      retainedMax = std::max(retainedMax, budget.retainedDeleteBytesCount());
+      reservedMax = std::max(reservedMax, budget.reservedBytes());
+    }
+
+    helper.commit();
+  }
+
+  budget.setTotalBytes(savedTotal);
+  writer->perInverterRamBytes = savedInverterCap;
+
+  auto mem = watcher.getDeltaKB();
+  state.counters["rate"] = benchmark::Counter((double)totalDocs, benchmark::Counter::kIsIterationInvariantRate);
+  state.counters["docs"] = (double)totalDocs;
+  state.counters["overwrite"] = overwrite;
+  state.counters["budget_MB"] = (double)budgetMB;
+  state.counters["retained_max_MB"] = (double)retainedMax / (1 << 20);
+  state.counters["reserved_max_MB"] = (double)reservedMax / (1 << 20);
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
+}
+
+// 4x the docs at the same budget should not raise retained_max or RSS_max.
+LUXIR_BENCHMARK_CAPTURE(BM_OverwriteUniqueNoCommit, 5m_64mb,       5'000'000,  1000, true,  64);
+LUXIR_BENCHMARK_CAPTURE(BM_OverwriteUniqueNoCommit, 20m_64mb,      20'000'000, 1000, true,  64);
+LUXIR_BENCHMARK_CAPTURE(BM_OverwriteUniqueNoCommit, 20m_64mb_noOW, 20'000'000, 1000, false, 64);
