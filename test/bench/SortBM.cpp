@@ -5,6 +5,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/Inverter.h"
 #include "luxir/query/QueryPrep.h"
@@ -423,17 +424,22 @@ INT_SORT_SHAPE_CAPTURES(phrase_mid, IntSortShape::PHRASE_MID)
 INT_SORT_SHAPE_CAPTURES(phrase_hh, IntSortShape::PHRASE_HH)
 
 // A multi-valued int sort over one segment of docs holding eight random
-// values each: the bare field (its edge value) and the min()/max() reducers.
+// values each: SET edge reads and ARRAY scans, bare fields and reducers.
 static void BM_MultiIntSort(benchmark::State& state, const char* sortExpr,
-                            qb::SortDir direction) {
+                            qb::SortDir direction, bool array) {
   int64_t nDocs = 2'000'000;
   if (luxir::unit_tests) nDocs = LuxirTest::scaleTestWork(200);
-  std::string collection = std::format("multi_int_sort_bm_{}", nDocs);
+  std::string collection = std::format("multi_int_sort_bm_{}_{}", array ? "array" : "set", nDocs);
   CollectionHelper helper(collection);
   std::vector<int32_t> docsPerSeg{(int32_t)nDocs};
   bool reused = helper.indexMatchesShape(docsPerSeg);
   if (!reused) {
     helper.clear();
+    SchemaBuilder schema;
+    auto& field = schema.field("many_is");
+    field.type = api::FieldDef::FieldClass::INT;
+    field.multi = array ? api::FieldDef::MultiMode::ARRAY : api::FieldDef::MultiMode::SET;
+    schema.set(helper.collection());
     auto iw = helper.getIndexWriter();
     Inverter& inverter = iw->obtainInverter();
     Inverter::InputHandler& id = inverter.getIndexHandler("id");
@@ -451,14 +457,15 @@ static void BM_MultiIntSort(benchmark::State& state, const char* sortExpr,
     helper.commit();
   }
 
-  int64_t fingerprint = -1;
+  std::optional<uint64_t> fingerprint;
   for (auto _ : state) {
     auto req = localReq(LuxirTest::luxirNode->getSearchEngine());
     req->collection(collection);
     auto& top = req->topDocs("q").allQuery().limit(10).fields({"id"});
     qb::sort(top, sortExpr, direction);
     req->execute(false);
-    int64_t current = 0;
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    uint64_t current = 0;
     for (const auto& batch : req->responses) {
       const auto* list = batch->proto.ops.at("q")->docList();
       for (const auto& docId : std::get<api::ColStr>(list->columns.at("id").kind).v) {
@@ -466,16 +473,21 @@ static void BM_MultiIntSort(benchmark::State& state, const char* sortExpr,
       }
     }
     benchmark::DoNotOptimize(current);
-    if (fingerprint != -1) {
-      ASSERT_EQ(fingerprint, current);
+    if (fingerprint) {
+      ASSERT_EQ(*fingerprint, current);
     }
     fingerprint = current;
   }
-  state.counters["fp"] = fingerprint;
+  state.counters["fp"] = (int64_t)fingerprint.value_or(0);
   state.counters["reused"] = reused;
 }
 
-LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, field_asc, "many_is", qb::ASC);
-LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, field_desc, "many_is", qb::DESC);
-LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, min_asc, "min(many_is)", qb::ASC);
-LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, max_desc, "max(many_is)", qb::DESC);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, field_asc, "many_is", qb::ASC, false);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, field_desc, "many_is", qb::DESC, false);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, min_asc, "min(many_is)", qb::ASC, false);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, max_desc, "max(many_is)", qb::DESC, false);
+
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_field_asc, "many_is", qb::ASC, true);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_field_desc, "many_is", qb::DESC, true);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_min_asc, "min(many_is)", qb::ASC, true);
+LUXIR_BENCHMARK_CAPTURE(BM_MultiIntSort, array_max_desc, "max(many_is)", qb::DESC, true);

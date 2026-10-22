@@ -745,7 +745,7 @@ public:
       selected.visit([&](const auto& selectedMap) {
         DocSet* domain = source.domains[(size_t)segnum].get();
         forEachSelectedBucketDoc(
-            domain, parentColumn, maxDoc, selectedMap,
+            domain, parentColumn, maxDoc, selectedMap, child.req.memoryTracker, child.name,
             [&](int32_t docid,
                 std::span<const int32_t> owners) LUXIR_INLINE {
               if (bindingFailed) {

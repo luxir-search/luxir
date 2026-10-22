@@ -659,7 +659,7 @@ public:
     return out;
   }
 
-  int64_t getDocValue(int32_t docid) {
+  LUXIR_INLINE int64_t getDocValue(int32_t docid) {
     if (!iter.has_value()) {
       return missingValueSubstitute;
     }

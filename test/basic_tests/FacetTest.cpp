@@ -8022,3 +8022,34 @@ TEST_F(FacetTest, indexedStringArrayBucketsCountDocumentsAcrossPlans) {
     }
   }
 }
+
+TEST_F(FacetTest, arrayChildReplayDedupUsesRequestBreaker) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("child");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.multi = api::FieldDef::MultiMode::ARRAY;
+  schema.set(helper.collection());
+  std::vector<std::string> values;
+  for (int i = 0; i < 64; i++) values.push_back(std::to_string(i));
+  ASSERT_TRUE(helper.indexAll({flatdoc("parent_s", "p", "child", values),
+      flatdoc("parent_s", "p", "child", values)}, UpdateMessage::COMMIT).success);
+  SearchOverridesGuard guard(forcedFacetFeedStrategy, forcedRequestMemoryMaxBytes);
+  forcedFacetFeedStrategy = FacetFeedStrategy::STRING_COLUMN_REPLAY;
+  for (size_t ceiling : {size_t{1 << 20}, size_t{1}}) {
+    forcedRequestMemoryMaxBytes = ceiling;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").facet("p", "parent_s").limit(-1).facet("c", "child").limit(-1);
+    req->execute(false);
+    if (ceiling == 1) {
+      EXPECT_FALSE(req->ok());
+      EXPECT_NE(std::string::npos, req->errorMsg().find("facet document dedup"));
+    } else {
+      ASSERT_OK(req);
+      const auto& child = *metricValues(rootFacetResult(*req, "p"), "c")[0].facetResult();
+      EXPECT_EQ(Counts(64, 2), countsOf(child));
+      EXPECT_GT(req->memoryTracker.peak(), 0u);
+    }
+    EXPECT_EQ(0u, req->memoryTracker.bytes());
+  }
+}

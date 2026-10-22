@@ -158,7 +158,8 @@ whole machine. Designed from the start for parallelism on modern hardware.
 - Field variants: one input value indexed under several representations
   (`author` for word search, `author__s` for exact facets and sorts), with
   per-operation default bindings so a bare field name does the right thing.
-- Per-field choices: index mode (match, or range acceleration), multi-valued,
+- Per-field choices: index mode (match, or range acceleration),
+  [multi-valued modes](guide/schema.md#multi-valued-modes),
   column-stored (sorting, faceting, analytics), stored source (retrieval, in
   LZ4- or ZSTD-compressed chunks, configurable per stored resource).
 - Numeric, date, and geo fields with `index: "range"` build a points index;

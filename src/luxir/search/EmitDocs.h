@@ -1197,8 +1197,8 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
       // A single-valued STRING or ID column holds the source value except
       // where a normalizer rewrote it (every row) or the term was fitted to
       // the term space (rows recognizable by length, re-read from the chunk
-      // after the loads).  Multi-valued columns are sorted sets and TEXT has
-      // no column, so any such member sends the whole group to the chunk.
+      // after the loads). Multi-valued columns can differ from stored source,
+      // and TEXT has no column, so such members send the group to the chunk.
       bool useColumns = std::ranges::all_of(reqs, [](const StoredReq& r) {
         if (r.multi || !r.fieldType->hasColumn()) return false;
         switch (r.fieldType->type()) {

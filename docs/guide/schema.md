@@ -269,7 +269,7 @@ publication advances the schema generation.
 | `type` | The [field type](#field-types): `text`, `string`, `int`, `float`, `double`, `date`, `vector`, `geo_point`, `id` |
 | `index` | `match`, `range`, or `none`; absent = the type's default (`text`/`string` index for match, numerics don't) |
 | `column` | store values in a per-field column (sorting, faceting, analytics); supported and default-on for non-`text` types |
-| `multi` | `false` for one value; `true` for the type's default multi mode, `"set"` for sorted unique values, or `"array"` for source order and duplicates |
+| `multi` | `false`, `true`, `"set"`, or `"array"`; see [Multi-valued modes](#multi-valued-modes) |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_`; see [Stored resources](#stored-resources) |
 | `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`; see [Text analysis](#text-analysis) |
@@ -280,32 +280,6 @@ publication advances the schema generation.
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 | `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
-
-`multi` is inherited when omitted and defaults to `false`. INT, FLOAT,
-DOUBLE, DATE, and STRING default to set mode. TEXT, VECTOR, and GEO_POINT
-support array mode only; declaring `"set"` on one of these primary types is
-an error. The built-in `id` field remains single-valued.
-
-Each representation resolves the logical field's declaration against its own
-type. With `true`, a TEXT primary uses array mode and its STRING variant uses
-set mode. With `"set"`, numeric and STRING representations use sets while
-an array-only variant such as TEXT uses an array. Explicit `"array"` applies
-to every representation. Indexed and column-only STRING columns store sorted
-unique normalized bytes in set mode, and preserve normalized source order and
-duplicates in array mode. Indexed STRING postings contain each document once
-per term in both modes. The ID type is reserved for the single-valued `id` field.
-
-The authored schema view echoes the declaration (`true`, `false`, `"set"`,
-or `"array"`), preserving inheritance through templates that change type.
-The resolved view reports the effective mode: `true` for the representation's
-default, `"array"` for an array on a set-capable type, and `false` for a
-single-valued representation. Changing the effective mode starts a new
-introduction generation, like other physical representation changes.
-
-For PQ, positive `ann.pq.m` requires positive effective (inherited) `dims`
-and must divide the stored dimension: `truncate_dims` when set, else `dims`.
-Omitted or zero `m` selects automatically and permits inferred dimensions.
-Validation includes inherited ANN settings and variants.
 
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you
@@ -322,6 +296,46 @@ compressed chunks. Analyzed text has postings and stored retrieval but no
 per-document value column; use a `string` variant when the same source value
 must also sort or facet. Scalar types return their values from columns without
 a second stored copy.
+
+For PQ, positive `ann.pq.m` requires positive effective (inherited) `dims`
+and must divide the stored dimension: `truncate_dims` when set, else `dims`.
+Omitted or zero `m` selects automatically and permits inferred dimensions.
+Validation includes inherited ANN settings and variants.
+
+### Multi-valued modes
+
+`multi` is inherited when omitted and defaults to `false` (one value).
+`true` selects the type's default: set for INT, FLOAT, DOUBLE, DATE, and
+STRING; array for TEXT, VECTOR, and GEO_POINT. Explicit `"set"` and `"array"`
+select a mode. Array-only primary types reject `"set"`; ID is reserved for
+the single-valued `id` field.
+
+- **Set:** each document's column values are sorted and deduplicated after
+  coercion and normalization. Numbers and dates use ascending numeric order;
+  strings use byte order after normalization and any
+  [long-term fitting](#long-terms), whether indexed or column-only.
+- **Array:** columns preserve source order and repeats after coercion and
+  normalization. Stored source, when enabled, keeps source order and repeats
+  independently of the column mode. Numeric fields have no stored-source copy.
+
+Bare multi-valued numeric, date, and STRING fields sort by their minimum
+ascending and maximum descending in both modes. Per-document numeric reducers
+such as `min(f)`, `max(f)`, `count(f)`, `sum(f)`, and `avg(f)` consume the stored
+values. Default facets count each document once per bucket in either
+mode, even when several values fall in that bucket. Indexed STRING postings
+also contain each document once per term in both modes.
+
+The declaration resolves against each representation's own type. With `true`,
+a TEXT primary uses an array and its STRING variant uses a set. With `"set"`,
+set-capable representations use sets and array-only variants use arrays.
+Explicit `"array"` applies to every representation.
+
+The authored schema view echoes `true`, `false`, `"set"`, or `"array"`,
+preserving inheritance through type-changing templates. The resolved view
+reports the effective mode: `true` for the type's default, `"array"` for an
+array on a set-capable type, and `false` for a single-valued representation.
+Changing the effective mode starts a new introduction generation and affects
+newly indexed data; reindex original values to convert existing documents.
 
 ### Stored resources
 

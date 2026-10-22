@@ -475,8 +475,9 @@ TEST_F(OrdColFormatTest, batchedOrdWalkMatchesPerDocValues) {
           };
           if (complement) {
             DomainView view(domain, maxDoc);
+            RequestMemTracker tracker(SIZE_MAX);
             forEachComplementOrdValue(view, index.pool, reader, missing,
-                                      collect);
+                                      tracker, "ord walk", collect);
           } else {
             forEachOrdValue(domain, reader, OrdMap::SegToGlobal::identity(),
                             maxDoc, missing, collect);
@@ -847,4 +848,43 @@ TEST_F(OrdColFormatTest, indexedStringMixedModesMergeKeepsSurvivingSequences) {
   auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
   ASSERT_EQ(1u, reader->segments().size());
   EXPECT_NE(0, reader->segments()[0].postingsReader().fieldInfo("value")->flags & FieldType::MULTI_ARRAY);
+}
+
+TEST_F(OrdColFormatTest, arrayDocumentDedupChargesReusesAndReleasesScratch) {
+  CollectionHelper helper;
+  SchemaBuilder schema;
+  auto& field = schema.field("values");
+  field.type = api::FieldDef::FieldClass::STRING;
+  field.multi = api::FieldDef::MultiMode::ARRAY;
+  schema.set(helper.collection());
+  std::vector<std::string> values;
+  for (int i = 0; i < 256; i++) values.push_back(std::to_string(i));
+  auto repeats = values;
+  values.insert(values.end(), repeats.begin(), repeats.end());
+  ASSERT_TRUE(helper.indexAll({flatdoc("values", values), flatdoc("values", values)}, UpdateMessage::COMMIT).success);
+  auto index = helper.getIndexWriter()->snapshots.readers.getReader();
+  auto& segment = index->segments()[0];
+  OrdColReader column(segment.postingsReader(), *segment.postingsReader().fieldInfo("values"));
+  for (size_t ceiling : {SIZE_MAX, size_t{1}}) {
+    RequestMemTracker tracker(ceiling);
+    {
+      OrdValueBatches values(nullptr, column, OrdMap::SegToGlobal::identity(), segment.maxDoc(), false, nullptr);
+      DistinctOrdValueBatches distinct(values, tracker, "values");
+      OrdValueBatches::Batch batch;
+      if (ceiling == 1) {
+        EXPECT_THROW(distinct.next(batch), ResourceExhaustedError);
+      } else {
+        size_t peak = 0;
+        int count = 0;
+        while (distinct.next(batch)) {
+          count += batch.size;
+          EXPECT_GT(tracker.bytes(), 0u);
+          if (peak == 0) peak = tracker.peak();
+          EXPECT_EQ(peak, tracker.peak());
+        }
+        EXPECT_EQ(512, count);
+      }
+    }
+    EXPECT_EQ(0u, tracker.bytes());
+  }
 }

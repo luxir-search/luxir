@@ -232,7 +232,8 @@ public:
 template <typename SelectedMap, typename Callback>
 void forEachSelectedBucketDoc(
     DocSet* domain, OrdColReader& parentColumn, int32_t maxDoc,
-    const SelectedMap& selectedMap, Callback&& callback) {
+    const SelectedMap& selectedMap, RequestMemTracker& tracker,
+    std::string_view label, Callback&& callback) {
   int64_t parentMissing = 0;
   if (!parentColumn.multiValued()) {
     forEachOrdValue(
@@ -257,7 +258,7 @@ void forEachSelectedBucketDoc(
   };
   forEachOrdDocument(
       domain, parentColumn, OrdMap::SegToGlobal::identity(), maxDoc,
-      parentMissing,
+      parentMissing, tracker, label,
       [&](int32_t docid, int64_t localOrd) LUXIR_INLINE {
         if (docid != currentDoc) {
           flush();

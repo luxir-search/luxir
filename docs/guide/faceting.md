@@ -294,8 +294,8 @@ the facet's `limit: 10` returns up to ten categories.
 | `selection_mode` | `any` (default) or `all`: match any selected value, or require every one. |
 
 String and ID facets return buckets in count-descending order, with bucket
-value ascending as a deterministic tie break. A multi-valued field contributes
-its document to each value it holds, but never twice to the same bucket.
+value ascending as a deterministic tie break. Default bucket counts are
+document counts in either [multi-valued mode](schema.md#multi-valued-modes).
 `mincount: 0` includes values that exist in the collection but have zero
 matches in the current result set, which keeps a sidebar stable while the user
 narrows a search.
@@ -676,16 +676,16 @@ as under a string bucket, so an empty range bucket yields `null` metrics.
 
 For numeric and date fields declared with `index: "range"`, a points index can
 answer a whole-index range facet from indexed points instead of walking the
-column when each document has at most one stored value. Multi-valued columns
-walk document runs to count each document once per bucket. The result is the
+column when each document has at most one stored value. Other columns walk
+document runs to count each document once per bucket. The result is the
 same either way; only the cost differs.
 
-For single-valued columns, the column walk reads the min/max bounds kept per block
-and per 512 values. A run of values whose bounds fall inside one bucket is
+When each document has at most one value, the column walk reads min/max bounds
+per block and per 512 values. A run of values whose bounds fall inside one bucket is
 counted without decoding, so histograms over time-ordered data cost about one
 step per run rather than one per value. This holds for explicit and `data`
 bounds alike. Filtered facets, sub-operation facets and segments with deleted
-documents get this when the field is single-valued and present in every
+documents get this when the field has one stored value in every
 document of the segment; other shapes, and distinct counts, walk documents.
 
 ### Data-derived bounds

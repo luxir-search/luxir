@@ -776,12 +776,8 @@ Field names use the value binding. Numeric, date, string, and ID fields keep
 the direct column-sort path. Use `col("name")` when a field name is reserved
 or is not an identifier. To sort analyzed text, use a string variant.
 
-A bare multi-valued string, numeric, or date field sorts by its smallest value
-ascending and its largest value descending in either mode. Set columns read
-an edge; array columns retain source order and scan for the extremum. Strings
-compare by normalized bytes. Numeric/date `min(f)` and `max(f)` over a bare
-field use the same edge/scan choice. Value-level reducers such as `count(f)`,
-`sum(f)`, and `avg(f)` see what the mode stores, including repeats in arrays.
+Multi-valued field sorting and per-document reducers follow the field's
+[multi-valued mode](schema.md#multi-valued-modes).
 
 Integer-only addition, subtraction, and multiplication stay int64; a double
 operand promotes that operation to double, and division always returns double.
@@ -839,9 +835,8 @@ names only (`author_name*`). A pattern containing `__` expands over variants
 that have a column, under their physical names: `author_name__*` returns
 `author_name__s`, and `*__s` returns every `s` variant in the index.
 TEXT variants are skipped; retrieve their logical primary for source text.
-Name `__self` explicitly to retrieve it. A multi-valued string variant returns
-a sorted, deduplicated set while the stored primary retains source order and
-duplicates.
+Name `__self` explicitly to retrieve it. Variant columns follow their resolved
+[multi-valued mode](schema.md#multi-valued-modes).
 
 Over gRPC the response is a typed `DocList`: dense columns and row maps can
 coexist, `row_count` is authoritative, and `_score_` is a synthetic float

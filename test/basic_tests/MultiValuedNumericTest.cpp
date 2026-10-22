@@ -110,25 +110,33 @@ TEST_F(MultiValuedNumericTest, arraysPreserveSourceAndSelectExtremaThroughMerge)
 }
 
 TEST_F(MultiValuedNumericTest, materializationScratchIsAccountedAndReused) {
-  CollectionHelper helper;
-  auto iw = helper.getIndexWriter();
-  auto& inverter = iw->obtainInverter();
-  auto& field = inverter.getIndexHandler("v_ds");
-  size_t before = inverter.extraRamBytes;
-  std::vector<double> values(100000, 1.5);
-  inverter.startDoc();
-  api::Val input;
-  input.kind = api::ArrDouble{.v = values};
-  field.index(inverter, input);
-  size_t retained = inverter.extraRamBytes;
-  EXPECT_GE(retained - before, values.size() * sizeof(int64_t));
-  inverter.finishDoc();
-  inverter.startDoc();
-  field.index(inverter, input);
-  EXPECT_EQ(retained, inverter.extraRamBytes);
-  inverter.finishDoc();
-  iw->releaseInverter(inverter, true);
-  helper.commit();
+  for (bool typedInts : {false, true}) {
+    CollectionHelper helper;
+    helper.clear();
+    auto iw = helper.getIndexWriter();
+    auto& inverter = iw->obtainInverter();
+    auto& field = inverter.getIndexHandler(typedInts ? "v_is" : "v_ds");
+    size_t before = inverter.extraRamBytes;
+    std::vector<double> doubles(100000, 1.5);
+    std::vector<int64_t> ints(100000, 1);
+    api::Val input;
+    input.kind = api::ArrDouble{.v = doubles};
+    auto index = [&] {
+      if (typedInts) field.index(inverter, std::span<const int64_t>(ints));
+      else field.index(inverter, input);
+    };
+    inverter.startDoc();
+    index();
+    size_t retained = inverter.extraRamBytes;
+    EXPECT_GE(retained - before, ints.size() * sizeof(int64_t));
+    inverter.finishDoc();
+    inverter.startDoc();
+    index();
+    EXPECT_EQ(retained, inverter.extraRamBytes);
+    inverter.finishDoc();
+    iw->releaseInverter(inverter, true);
+    helper.commit();
+  }
 }
 
 TEST_F(MultiValuedNumericTest, modeChangesUseSegmentModeBeforeAndAfterMerge) {

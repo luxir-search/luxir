@@ -204,8 +204,8 @@ The outer JSON shape follows the schema:
 String, text, numeric, and date multi-fields use an array of scalar values.
 A multi-geo field uses an array of `[lon,lat]` points. A multi-vector field
 uses an array of number arrays; a bare number array is also accepted as a
-one-vector list. The field must be declared `multi: true`; the `_ss`, `_is`,
-`_fs`, `_ds`, `_dts`, and `_vs` default suffixes already are.
+one-vector list. Enable a [multi-valued mode](schema.md#multi-valued-modes);
+the `_ss`, `_is`, `_fs`, `_ds`, `_dts`, and `_vs` suffixes already do.
 
 ## What is returned
 
@@ -264,14 +264,9 @@ Patterns without `__` never expand variants; `author__*` or `*__s` discovers
 variants that have a column. HTTP row format omits missing fields; HTTP
 column format includes the requested key with `null`.
 
-For a multi-valued field, stored values keep source order and duplicates.
-Numeric and date columns default to set mode: values are returned ascending,
-with duplicates removed. Declare `"multi": "array"` to keep source order and
-duplicates in the column. Numeric fields have no separate stored-source copy.
-Indexed and column-only STRING columns in set mode return normalized values
-in byte order with duplicates removed; array mode keeps normalized source
-order and duplicates. Geo point and VECTOR
-columns keep source order. See [Multi-valued modes](schema.md#field-properties).
+Column retrieval follows each representation's
+[multi-valued mode](schema.md#multi-valued-modes). Stored-source retrieval
+keeps source order and repeats independently of that mode.
 
 ### Multi-valued text and phrases
 

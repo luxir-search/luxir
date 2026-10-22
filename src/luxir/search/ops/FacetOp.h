@@ -281,7 +281,7 @@ public:
     const auto& segFieldInfo = *info;
     OrdColReader ordColReader(postingsReader, segFieldInfo);
     forEachOrdDocument(domain, ordColReader, ordSpace, maxDoc, missing_num,
-                    callback);
+                    req.memoryTracker, facetName, callback);
     return true;
   }
 };

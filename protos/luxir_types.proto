@@ -2207,7 +2207,8 @@ message FieldDef {
 
   optional bool column = 4;      // store values in a per-field column
   // SINGLE is one value; DEFAULT enables the type's default multi mode.
-  // SET sorts and deduplicates per document; ARRAY keeps source order and repeats.
+  // SET sorts and deduplicates column values; ARRAY keeps their source order and repeats.
+  // Stored source keeps order and repeats independently of the column mode.
   // DEFAULT resolves per representation: INT/FLOAT/DOUBLE/DATE/STRING
   // use SET, TEXT/VECTOR/GEO_POINT use ARRAY. Explicit SET is rejected on
   // an array-only primary and resolves to ARRAY on an array-only variant.

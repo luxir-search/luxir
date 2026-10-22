@@ -2692,7 +2692,7 @@ Policy for indexed terms longer than 255 bytes: STRING after normalization, TEXT
 
 ### luxir.FieldDef.MultiMode
 
-SINGLE is one value; DEFAULT enables the type's default multi mode. SET sorts and deduplicates per document; ARRAY keeps source order and repeats. DEFAULT resolves per representation: INT/FLOAT/DOUBLE/DATE/STRING use SET, TEXT/VECTOR/GEO\_POINT use ARRAY. Explicit SET is rejected on an array-only primary and resolves to ARRAY on an array-only variant. Explicit ARRAY applies to every representation. ID is reserved for the single-valued id field. Variants inherit the declared mode and cannot override it. Schema JSON views echo the declaration. HTTP JSON accepts false, true (DEFAULT), "set", or "array".
+SINGLE is one value; DEFAULT enables the type's default multi mode. SET sorts and deduplicates column values; ARRAY keeps their source order and repeats. Stored source keeps order and repeats independently of the column mode. DEFAULT resolves per representation: INT/FLOAT/DOUBLE/DATE/STRING use SET, TEXT/VECTOR/GEO\_POINT use ARRAY. Explicit SET is rejected on an array-only primary and resolves to ARRAY on an array-only variant. Explicit ARRAY applies to every representation. ID is reserved for the single-valued id field. Variants inherit the declared mode and cannot override it. Schema JSON views echo the declaration. HTTP JSON accepts false, true (DEFAULT), "set", or "array".
 
 [Source](../../protos/luxir_types.proto)
 

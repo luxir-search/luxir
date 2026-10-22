@@ -306,6 +306,12 @@ public:
   int64_t selectedValue(int32_t docRank, bool maximum, auto& values) {
     assert(multiValued());
     if (multiSet()) return values.valueAt(getEdgeValueRank(docRank, maximum));
+    return scanSelectedValue(docRank, maximum, values);
+  }
+
+  // Out of line so the array scan does not enlarge the comparators' inlined
+  // per-document reads.
+  LUXIR_NOINLINE int64_t scanSelectedValue(int32_t docRank, bool maximum, auto& values) {
     auto [start, end] = getStartEndValueRank(docRank);
     int64_t selected = values.valueAt(start);
     for (int64_t rank = start + 1; rank < end; rank++) {
