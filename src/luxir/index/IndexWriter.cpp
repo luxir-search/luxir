@@ -2286,7 +2286,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
   } else schema = previousSchema;
   std::optional<StoredDictionaryRegistry::SchemaState> dictionarySlots;
   if (schema != previousSchema) dictionarySlots = StoredDictionaryRegistry::prepareSchema(*schema);
-  info.version = 1;
+  info.version = IndexFormat::VERSION;
   info.index_gen = ++nextManifestGen;
   info.writer_epoch = writerEpoch;
   if (schema != previousSchema) schema = snapshots.schemas->publish(dir, incarnation, std::move(schema));

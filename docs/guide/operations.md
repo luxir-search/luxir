@@ -171,6 +171,9 @@ Incarnation ids are millisecond timestamps in 11 lowercase hex digits, allocated
 monotonically by the catalog. The root `LAYOUT` marker identifies this format;
 older layouts are refused at startup and must be reindexed. Node-private state,
 including `write.lock` and `replication.json`, lives under `node/`.
+Each commit records its index format version. A collection written with another
+version is listed as failed to load, with both versions in the error, and must
+be deleted and reindexed.
 
 Deletion marks the incarnation retiring in the catalog before removing its
 directory, then removes its entry. Writer startup finishes interrupted retirements

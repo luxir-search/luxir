@@ -9,6 +9,7 @@
 #include "luxir/schema/SchemaBinding.h"
 #include "IncarnationState.h"
 #include "luxir/reader/Postings.h"
+#include "IndexFormat.h"
 #include "luxir/api/index_files.h"
 #include "luxir/api/padded_input.h"
 
@@ -88,6 +89,7 @@ struct Manifest {
         || !info.schema || info.schema_file.name.empty() || info.incarnation.empty()) {
       throw std::runtime_error("Invalid snapshot manifest");
     }
+    if (info.version != IndexFormat::VERSION) throw IndexFormatError(info.version);
     return info;
   }
 
@@ -112,6 +114,8 @@ struct Manifest {
     try {
       auto info = decode(bytes, arena);
       if (info.index_gen != gen || info.writer_epoch != epoch) return {};
+    } catch (const IndexFormatError&) {
+      throw; // not torn: falling back to an older generation would not help
     } catch (const std::runtime_error&) { return {}; }
     return bytes;
   }
