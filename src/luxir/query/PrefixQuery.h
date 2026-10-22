@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <format>
+#include <string>
 #include <string_view>
 
 #include "MultiTermQuery.h"
@@ -36,6 +38,10 @@ public:
     value = mixHash(value, field);
     value = mixHash(value, prefix);
     return maxExpansions > 0 ? mixHash(value, maxExpansions) : value;
+  }
+
+  std::string describe() const override {
+    return std::format("prefix query '{}' on field '{}'", prefix, field);
   }
 
   std::string_view getPrefix() const { return prefix; }

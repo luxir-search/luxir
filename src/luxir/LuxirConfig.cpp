@@ -249,6 +249,30 @@ void LuxirConfig::addOptions(CLI::App& app) {
                  "Per-request query-memory breaker ceiling (0 = unlimited)")
       ->default_val(search.request_memory_max_bytes)
       ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-expansions",
+                 search.multiterm_max_expansions,
+                 "Terms one segment of a complete prefix/wildcard/regex/range "
+                 "expansion may match before the request is rejected (0 = unlimited)")
+      ->default_val(search.multiterm_max_expansions)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-terms-examined",
+                 search.multiterm_max_terms_examined,
+                 "Dictionary terms all multi-term and fuzzy scans of one request "
+                 "may visit (0 = unlimited)")
+      ->default_val(search.multiterm_max_terms_examined)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-max-postings",
+                 search.multiterm_max_postings,
+                 "Postings all multi-term expansions of one request may union "
+                 "(0 = unlimited)")
+      ->default_val(search.multiterm_max_postings)
+      ->check(CLI::NonNegativeNumber);
+  app.add_option("--search.multiterm-min-prefix-length",
+                 search.multiterm_min_prefix_length,
+                 "Literal leading bytes below which an open-ended wildcard/regex "
+                 "is costed as a scan of its whole prefix range")
+      ->default_val(search.multiterm_min_prefix_length)
+      ->check(CLI::NonNegativeNumber);
 }
 
 void LuxirConfig::resolveRamBudgets() {

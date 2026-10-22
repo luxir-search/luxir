@@ -7,10 +7,13 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <optional>
+#include <string>
 #include <string_view>
 #include <variant>
 
 #include "DocSetBulkScorer.h"
+#include "MultiTermBudget.h"
 #include "PostingsUnion.h"
 #include "Query.h"
 #include "QueryStats.h"
@@ -46,6 +49,20 @@ public:
 
   // Build the per-segment filtered term iterator.
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;
+
+  // False when the terms come from the request itself (TermInSetQuery), so
+  // the request size already bounds them; the scan budgets still apply.
+  virtual bool capsExpansions() const { return true; }
+
+  // The literal prefix of a pattern whose language is unbounded, so the scan
+  // can visit every term in that prefix's range; nullopt when the scan is
+  // bounded otherwise (a fixed prefix, range, or finite language).
+  virtual std::optional<std::string_view> unboundedScanPrefix() const {
+    return std::nullopt;
+  }
+
+  // Names the query in limit errors, e.g. "prefix query 'ab' on field 'f'".
+  virtual std::string describe() const = 0;
 
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
@@ -166,6 +183,8 @@ public:
     bool canUseLazy;
     google::protobuf::Arena& memoArena;
     std::span<ExpansionMemo> expansionMemos;
+    MultiTermBudget& budget;
+    int32_t expansionCap;
 
   public:
     // Test/bench force switch over the constant-score union scorers. AUTO is
@@ -222,12 +241,59 @@ public:
                    && scorerModeForTests != ScorerMode::FORCE_EAGER),
         memoArena(context.arena()),
         expansionMemos(
-            context.pool.make_span<ExpansionMemo>(context.numSegments())) {
+            context.pool.make_span<ExpansionMemo>(context.numSegments())),
+        budget(context.multiTermBudget()),
+        expansionCap(query.capsExpansions() && query.getMaxExpansions() == 0
+            ? budget.maxExpansions() : std::numeric_limits<int32_t>::max()) {
       traits |= IS_CONSTANT_SCORING;  // every match scores the same
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
+      rejectShortPrefixScan(context);
     }
 
   private:
+    // Terms in the dictionary range [prefix, next prefix) across segments:
+    // an upper bound on what a scan anchored only by `prefix` visits.
+    int64_t prefixRangeTerms(Context& context, std::string_view prefix) const {
+      MemPool scratch;
+      int64_t total = 0;
+      for (size_t s = 0; s < context.numSegments(); s++) {
+        auto* segFieldInfo = cachedFieldInfo->segInfos.at(s);
+        if (segFieldInfo == nullptr) continue;
+        TermsEnum te(scratch, context.topReader.segments()[s].postingsReader(),
+                     *segFieldInfo);
+        if (prefix.empty()) {
+          total += te.numTerms();
+          continue;
+        }
+        if (!te.seekCeil(prefix)) continue;
+        int64_t first = te.ord();
+        std::string next(prefix);
+        while (!next.empty() && (uint8_t)next.back() == 0xff) next.pop_back();
+        int64_t end = te.numTerms();
+        if (!next.empty()) {
+          next.back() = (char)((uint8_t)next.back() + 1);
+          if (te.seekCeil(next)) end = te.ord();
+        }
+        total += end - first;
+      }
+      return total;
+    }
+
+    // An unbounded pattern with too short a literal prefix is costed as a
+    // scan of its whole prefix range; reject it before any scan runs when
+    // that range alone is more than the request has left.
+    void rejectShortPrefixScan(Context& context) const {
+      std::optional<std::string_view> prefix = query.unboundedScanPrefix();
+      if (!prefix || cachedFieldInfo == nullptr) return;
+      if ((int32_t)prefix->size() >= budget.getLimits().minPrefixLength) return;
+      int64_t remaining = budget.remainingTermsExamined();
+      if (remaining == std::numeric_limits<int64_t>::max()) return;
+      int64_t rangeTerms = prefixRangeTerms(context, *prefix);
+      if (rangeTerms > remaining) {
+        budget.throwShortPrefix(query.describe(), prefix->size(), rangeTerms);
+      }
+    }
+
     static ExpansionMode chooseAutoMode(
         size_t termCount, size_t maxStateBytes) {
       size_t maxStates =
@@ -350,6 +416,14 @@ public:
               scratchPool, segment.postingsReader(), *segFieldInfo);
           FilteredTermsEnum* fenum =
               query.createFilteredEnum(scratchPool, *termsEnum);
+          // A refill re-walks a scan this request was already charged for;
+          // the engine released it, so the request does not pay twice. The
+          // expansion cap still applies: the same walk accepts the same terms.
+          // A top-terms selection drains the same visit-limited enum.
+          bool charge = !facts->released;
+          int64_t postingsLimit = charge ? budget.remainingPostings()
+                                         : std::numeric_limits<int64_t>::max();
+          if (charge) fenum->setVisitLimit(budget.remainingTermsExamined());
           skipCount(SkipStats::multitermExpansions);
           std::span<TopTerm> topTerms;
           if (query.maxExpansions > 0) {
@@ -371,6 +445,12 @@ public:
           while (nextState(state)) {
             termCount++;
             sumDocFreq += state.docFreq;
+            if (termCount > (size_t)expansionCap) [[unlikely]] {
+              budget.throwTooManyExpansions(query.describe());
+            }
+            if (sumDocFreq > postingsLimit) [[unlikely]] {
+              budget.throwPostings(query.describe());
+            }
             if (bitWords != nullptr) {
               FixedBitSet bits(bitWords, segment.maxDoc());
               addPostingsToBitset(bits, state);
@@ -392,6 +472,15 @@ public:
             addPostingsToBitset(bits, state);
             // No state views have escaped; return all heap blocks at spill.
             facts->statePool.rewind(facts->stateStart, 0);
+          }
+          if (charge) {
+            if (fenum->stoppedAtVisitLimit()
+                || !budget.chargeTermsExamined(fenum->termsVisited())) {
+              budget.throwTermsExamined(query.describe());
+            }
+            if (!budget.chargePostings(sumDocFreq)) {
+              budget.throwPostings(query.describe());
+            }
           }
         }
       }
