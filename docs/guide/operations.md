@@ -91,7 +91,10 @@ On the filesystem backend collections use
 file in `t/<tenant>/<name>/`. Single-tenant deployments use the default tenant
 `t0`, so the default collection lives in `t/t0/main/`. An incarnation is 16 hex
 digits. `t/LAYOUT` names this layout; a data directory written in another layout
-is refused at startup and must be reindexed. Deletion removes and
+is refused at startup and must be reindexed. Likewise, each commit records the
+index format version it was written with. A collection written with another
+version does not load: it is listed as failed to load, with the two versions in
+the error, and must be deleted and reindexed. Deletion removes and
 syncs `CURRENT` before removing the directory tree, so an interrupted deletion
 cannot reopen the partially deleted index. If
 deletion fails partway (for example an I/O error), the name stays unavailable

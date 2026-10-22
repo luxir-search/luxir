@@ -5,6 +5,7 @@
 #include <charconv>
 #include <map>
 #include "Directory.h"
+#include "IndexFormat.h"
 #include "luxir/api/index_files.h"
 #include "luxir/api/padded_input.h"
 #include "luxir/util/Signal.h"
@@ -44,6 +45,7 @@ struct Manifest {
         || !info.schema || info.incarnation.empty()) {
       throw std::runtime_error("Invalid snapshot manifest");
     }
+    if (info.version != IndexFormat::VERSION) throw IndexFormatError(info.version);
     return info;
   }
 
@@ -67,6 +69,8 @@ struct Manifest {
     std::pmr::monotonic_buffer_resource arena;
     try {
       if (decode(bytes, arena).index_gen != gen) return {};
+    } catch (const IndexFormatError&) {
+      throw; // not torn: falling back to an older generation would not help
     } catch (const std::runtime_error&) { return {}; }
     return bytes;
   }

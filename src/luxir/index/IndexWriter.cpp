@@ -2217,7 +2217,7 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       previousSchema.get()) : previousSchema;
   std::optional<StoredDictionaryRegistry::SchemaState> dictionarySlots;
   if (schema != previousSchema) dictionarySlots = StoredDictionaryRegistry::prepareSchema(*schema);
-  info.version = 1;
+  info.version = IndexFormat::VERSION;
   info.index_gen = ++nextManifestGen;
   info.schema_gen = schema->gen_;
   info.schema = schema->storedInfo(arena);

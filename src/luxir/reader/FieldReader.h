@@ -25,7 +25,9 @@ class FieldReader {
   // TODO: field number?
 public:
   explicit FieldReader(PostingsReader& postingsReader) {
-    fieldIS = postingsReader.getInputStream(0);
+    // Field metadata ends where the offsets table begins; reads are checked against that bound.
+    auto file = postingsReader.getInputStream(0);
+    fieldIS = InputStream(file.ptr(0), file.ptr(postingsReader.fieldOffsetsLoc));
     nFields = postingsReader.nFields;
     fieldOffsets = postingsReader.fieldOffsets;
     fieldOffsetsLoc = postingsReader.fieldOffsetsLoc;
@@ -51,7 +53,7 @@ public:
     //
     // See PostingsWriter.endField() for the format written.
     //
-    fieldname = fieldIS.readPackedTerm();
+    fieldname = fieldIS.checkedPackedTerm();
     fieldInfoRead = false;
     return true;
   }
@@ -65,44 +67,44 @@ public:
     if (!fieldInfoRead) {
       fieldInfoRead = true;
       fieldInfo.fieldname = fieldname;
-      fieldInfo.type = static_cast<FieldType::Type>(fieldIS.readVint());
-      fieldInfo.flags = fieldIS.readVint();
-      fieldInfo.docsWithField = fieldIS.readVint();
+      fieldInfo.type = static_cast<FieldType::Type>(fieldIS.checkedVint());
+      fieldInfo.flags = fieldIS.checkedVint();
+      fieldInfo.docsWithField = fieldIS.checkedVint();
       fieldInfo.rangeTableLoc = {0, 0};
       if (fieldInfo.flags & FieldType::INDEX_DOCS) {
-        fieldInfo.termBlockIndexLoc = fieldIS.readVal<seg_location>();
-        fieldInfo.termsLoc = fieldIS.readVal<seg_location>();
-        fieldInfo.docsLoc = fieldIS.readVal<seg_location>();
-        fieldInfo.posLoc = fieldIS.readVal<seg_location>();
-        fieldInfo.nTerms = fieldIS.readVlong();
-        fieldInfo.sumDocFreq = fieldInfo.nTerms + fieldIS.readVlong();
-        fieldInfo.sumTotalTermFreq = fieldInfo.sumDocFreq + fieldIS.readVlong();
-        fieldInfo.trieLoc = fieldIS.readVal<seg_location>();
-        fieldInfo.trieRootOff = fieldIS.readVlong();
+        fieldInfo.termBlockIndexLoc = seg_location::checkedRead(fieldIS);
+        fieldInfo.termsLoc = seg_location::checkedRead(fieldIS);
+        fieldInfo.docsLoc = seg_location::checkedRead(fieldIS);
+        fieldInfo.posLoc = seg_location::checkedRead(fieldIS);
+        fieldInfo.nTerms = fieldIS.checkedVlong();
+        fieldInfo.sumDocFreq = fieldInfo.nTerms + fieldIS.checkedVlong();
+        fieldInfo.sumTotalTermFreq = fieldInfo.sumDocFreq + fieldIS.checkedVlong();
+        fieldInfo.trieLoc = seg_location::checkedRead(fieldIS);
+        fieldInfo.trieRootOff = fieldIS.checkedVlong();
         if ((fieldInfo.flags & FieldType::TERM_RANGES) != 0) {
-          fieldInfo.rangeTableLoc = fieldIS.readVal<seg_location>();
+          fieldInfo.rangeTableLoc = seg_location::checkedRead(fieldIS);
         }
       }
 
-      fieldInfo.docsWithFieldEndLoc = fieldIS.readVal<seg_location>();
-      fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
-      fieldInfo.columnMetaOff = fieldIS.readVlong();
-      fieldInfo.numValues = fieldIS.readVlong();
-      fieldInfo.ordFormat = fieldIS.readVint();
-      fieldInfo.ordIndexing = fieldIS.readVint();
-      fieldInfo.ordBits = fieldIS.readVint();
-      fieldInfo.pointsLoc = fieldIS.readVal<seg_location>();
-      fieldInfo.pointsMetaOff = fieldIS.readVlong();
-      fieldInfo.normsFormat = fieldIS.readVint();
-      fieldInfo.normsLoc = fieldIS.readVal<seg_location>();
-      fieldInfo.normsLen = fieldIS.readVlong();
+      fieldInfo.docsWithFieldEndLoc = seg_location::checkedRead(fieldIS);
+      fieldInfo.columnLoc = seg_location::checkedRead(fieldIS);
+      fieldInfo.columnMetaOff = fieldIS.checkedVlong();
+      fieldInfo.numValues = fieldIS.checkedVlong();
+      fieldInfo.ordFormat = fieldIS.checkedVint();
+      fieldInfo.ordIndexing = fieldIS.checkedVint();
+      fieldInfo.ordBits = fieldIS.checkedVint();
+      fieldInfo.pointsLoc = seg_location::checkedRead(fieldIS);
+      fieldInfo.pointsMetaOff = fieldIS.checkedVlong();
+      fieldInfo.normsFormat = fieldIS.checkedVint();
+      fieldInfo.normsLoc = seg_location::checkedRead(fieldIS);
+      fieldInfo.normsLen = fieldIS.checkedVlong();
 
-      fieldInfo.monoLoc = fieldIS.readVal<seg_location>();
-      fieldInfo.monoMetaOff = fieldIS.readVlong();
-      fieldInfo.mono2Loc = fieldIS.readVal<seg_location>();
-      fieldInfo.mono2MetaOff = fieldIS.readVlong();
-      fieldInfo.valDocLoc = fieldIS.readVal<seg_location>();
-      fieldInfo.valDocMetaOff = fieldIS.readVlong();
+      fieldInfo.monoLoc = seg_location::checkedRead(fieldIS);
+      fieldInfo.monoMetaOff = fieldIS.checkedVlong();
+      fieldInfo.mono2Loc = seg_location::checkedRead(fieldIS);
+      fieldInfo.mono2MetaOff = fieldIS.checkedVlong();
+      fieldInfo.valDocLoc = seg_location::checkedRead(fieldIS);
+      fieldInfo.valDocMetaOff = fieldIS.checkedVlong();
     }
   }
 

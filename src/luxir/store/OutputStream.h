@@ -28,6 +28,7 @@ class seg_location {
 
 public:
   static constexpr uint64_t maxOffset() noexcept { return OFFSET_MASK; }
+  static constexpr uint32_t maxFilenum() noexcept { return (1u << FILENUM_BITS) - 1; }
 
   seg_location() noexcept : x(0) {}
 
@@ -56,6 +57,13 @@ public:
   static seg_location read(InputStream& is) {
     uint32_t fnum = is.readVint();
     uint64_t off = is.readVlong();
+    return {fnum, off};
+  }
+
+  static seg_location checkedRead(InputStream& is) {
+    uint32_t fnum = is.checkedVint();
+    uint64_t off = is.checkedVlong();
+    if (fnum > maxFilenum() || off > maxOffset()) throw std::runtime_error("index data has an invalid segment location");
     return {fnum, off};
   }
 };

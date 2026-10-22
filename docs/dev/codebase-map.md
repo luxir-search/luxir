@@ -121,7 +121,11 @@ locations, browse `src/luxir/<area>/`.
 7. **Storage** (`src/luxir/store/`)
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
      `FSDirectory` (on-disk, mmap reads), `CheckedDirectory` (validation wrapper)
-   - `InputStream` / `OutputStream`: segment I/O primitives
+   - `InputStream` / `OutputStream`: segment I/O primitives; the `checked*` reads decode
+     segment info and the field catalog without trusting the file
+   - `IndexFormat`: the on-disk format version, recorded in each manifest and in every data
+     file's header. Bump it with any change to written bytes (`IndexFormatTest` flags one);
+     manifests of another version fail to load with `IndexFormatError`
    - `FileVerifier`: size + xxh3 checks of files against manifest `FileDescriptor`s over
      `Directory::openChecksum` (pread, optional O_DIRECT; never mmap): verify-on-open, scrub
    - `CorruptionMarker`: `corrupted_<id>` files naming suspect index files, re-verified at open

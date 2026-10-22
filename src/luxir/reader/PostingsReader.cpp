@@ -30,6 +30,37 @@ void validateSegmentFileHeader(InputFile& file, std::string_view fileName) {
   }
 }
 
+[[noreturn]] void invalidSegment(std::string_view fileName, std::string_view what) {
+  throw std::runtime_error(std::format("Segment file '{}' is corrupt or in an unsupported format: {}", fileName, what));
+}
+
+// Every region a field's metadata points to lies within one of the segment's files.
+void checkFieldLocations(const std::vector<std::shared_ptr<InputFile>>& files, const SegFieldInfo& field) {
+  auto check = [&](seg_location loc, uint64_t length = 0) {
+    if (loc.isNull()) return;
+    uint32_t fnum = loc.filenum();
+    if (fnum >= files.size() || !files[fnum] || loc.offset() > files[fnum]->size()
+        || length > files[fnum]->size() - loc.offset()) {
+      throw std::runtime_error(std::format(
+          "Field '{}' of a segment is corrupt or in an unsupported format: data location out of range",
+          std::string_view(field.fieldname)));
+    }
+  };
+  check(field.termBlockIndexLoc);
+  check(field.termsLoc);
+  check(field.docsLoc);
+  check(field.posLoc);
+  check(field.trieLoc);
+  check(field.rangeTableLoc);
+  check(field.docsWithFieldEndLoc);
+  check(field.columnLoc, field.columnMetaOff);
+  check(field.pointsLoc, field.pointsMetaOff);
+  check(field.normsLoc, field.normsLen);
+  check(field.monoLoc, field.monoMetaOff);
+  check(field.mono2Loc, field.mono2MetaOff);
+  check(field.valDocLoc, field.valDocMetaOff);
+}
+
 } // namespace
 
 // Metadata layout: see StoredFieldsWriter.
@@ -96,31 +127,41 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   inputStreams.emplace_back(files[0]->getInputStream());
   InputStream firstIS = inputStreams[0];
 
-  // seek to the end of firstIs and read the size of the segmentInfo
-  // See PostingsWriter.writeSegmentInfo
+  // File 0 ends with: ... field metadata, field offsets table, field count,
+  // segment info, segment info size. See PostingsWriter.writeSegmentInfo.
+  const int64_t headerSize = (int64_t)Postings::LUXIR_HEADER.size();
+  if (firstIS.size() < headerSize + 2 * (int64_t)sizeof(int32_t)) invalidSegment(segInfoFile, "no segment info");
   firstIS.seek(firstIS.size() - sizeof(int32_t));
-  auto segInfoSize = firstIS.readInt();
+  int64_t segInfoSize = firstIS.readInt();
+  if (segInfoSize < 0 || segInfoSize > firstIS.size() - headerSize - 2 * (int64_t)sizeof(int32_t)) {
+    invalidSegment(segInfoFile, "invalid segment info size");
+  }
   segInfoOffset = firstIS.size() - sizeof(int32_t) - segInfoSize;
-  firstIS.seek(segInfoOffset);
-  maxdoc = firstIS.readVint();
-  uint32_t physicalFileCount = firstIS.readVint();
-  if (physicalFileCount == 0) {
-    throw std::runtime_error("Segment physical-file list is empty");
-  }
+  InputStream segInfo(firstIS.ptr(segInfoOffset), firstIS.ptr(segInfoOffset + segInfoSize));
   std::vector<uint32_t> physicalFileNums;
-  physicalFileNums.reserve(physicalFileCount);
-  uint32_t previous = 0;
-  for (uint32_t i = 0; i < physicalFileCount; i++) {
-    uint32_t fileNum = firstIS.readVint();
-    if ((i == 0 && fileNum != 0) || (i != 0 && fileNum <= previous)) {
-      throw std::runtime_error("Segment physical-file list is not strictly sorted from file 0");
+  seg_location versionsLoc;
+  uint32_t versionCount;
+  try {
+    maxdoc = (int32_t)segInfo.checkedVint();
+    uint32_t physicalFileCount = segInfo.checkedVint();
+    if (physicalFileCount == 0 || physicalFileCount > segInfo.left()) {
+      throw std::runtime_error("invalid physical-file count");
     }
-    physicalFileNums.push_back(fileNum);
-    previous = fileNum;
+    physicalFileNums.reserve(physicalFileCount);
+    uint32_t previous = 0;
+    for (uint32_t i = 0; i < physicalFileCount; i++) {
+      uint32_t fileNum = segInfo.checkedVint();
+      if ((i == 0 && fileNum != 0) || (i != 0 && fileNum <= previous) || fileNum > seg_location::maxFilenum()) {
+        throw std::runtime_error("physical-file list is not strictly sorted from file 0");
+      }
+      physicalFileNums.push_back(fileNum);
+      previous = fileNum;
+    }
+    versionsLoc = seg_location::checkedRead(segInfo);
+    versionCount = segInfo.checkedVint();
+  } catch (const std::runtime_error& e) {
+    invalidSegment(segInfoFile, e.what());
   }
-
-  auto versionsLoc = seg_location::read(firstIS);
-  uint32_t versionCount = firstIS.readVint();
   files.resize((size_t) physicalFileNums.back() + 1);
   inputStreams.resize((size_t) physicalFileNums.back() + 1);
 
@@ -151,9 +192,18 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   }
   auto fields = inputStreams[0];
   fields.seek(segInfoOffset - sizeof(int32_t));
-  auto count = fields.readInt();
-  fieldOffsetsLoc = segInfoOffset - sizeof(int32_t) - (int64_t)count * sizeof(uint32_t);
+  int64_t count = fields.readInt();
+  if (count < 0 || count > (segInfoOffset - (int64_t)sizeof(int32_t) - headerSize) / (int64_t)sizeof(uint32_t)) {
+    invalidSegment(segInfoFile, "invalid field count");
+  }
+  fieldOffsetsLoc = segInfoOffset - sizeof(int32_t) - count * (int64_t)sizeof(uint32_t);
   fieldOffsets = (const uint32_t*)fields.ptr(fieldOffsetsLoc);
+  // Each offset is back from the table to a field's metadata, which starts with its name.
+  for (int64_t i = 0; i < count; i++) {
+    if (fieldOffsets[i] == 0 || fieldOffsets[i] > fieldOffsetsLoc - headerSize) {
+      invalidSegment(segInfoFile, "invalid field offset");
+    }
+  }
   fieldPages = std::make_unique<std::atomic<FieldPage*>[]>(
       ((size_t)count + FIELDS_PER_PAGE - 1) / FIELDS_PER_PAGE);
   nFields = count;
@@ -197,10 +247,16 @@ PostingsReader::~PostingsReader() {
 int32_t PostingsReader::findOrdinal(std::string_view name) const {
   const auto& input = inputStreams[0];
   auto* end = fieldOffsets + nFields;
+  // Offsets were checked at open; a name must also end before the offsets table.
+  auto nameAt = [&](uint32_t offset) {
+    auto term = input.readPackedTerm(fieldOffsetsLoc - offset);
+    if (term.memorySize() > offset) throw std::runtime_error("Segment field name extends past the field metadata");
+    return term;
+  };
   auto* found = std::lower_bound(fieldOffsets, end, name, [&](uint32_t offset, std::string_view key) {
-    return input.readPackedTerm(fieldOffsetsLoc - offset) < key;
+    return nameAt(offset) < key;
   });
-  return found != end && input.readPackedTerm(fieldOffsetsLoc - *found) == name
+  return found != end && nameAt(*found) == name
       ? (int32_t)(found - fieldOffsets) : -1;
 }
 
@@ -228,6 +284,7 @@ const PostingsReader::Field* PostingsReader::fieldInfo(int32_t ordinal) {
     auto fresh = std::make_unique<Field>();
     FieldReader fields(*this, ordinal);
     fields.readFieldInfo(*fresh);
+    checkFieldLocations(files, *fresh);
     if (fresh->type == FieldType::BIN && (fresh->flags & FieldType::STORED) != 0) {
       fresh->stored = std::make_unique<const StoredFieldsMetadata>(*this, *fresh);
     }
