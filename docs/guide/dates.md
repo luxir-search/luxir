@@ -61,6 +61,18 @@ earlier time. For example, on a default millisecond field,
 `1969-12-31T23:59:59.9999999999Z` stores as epoch millisecond `-1` and finds
 that value when used as a query literal.
 
+## Value expressions and aggregates
+
+Date values retain their field unit through `def`, `min`, `max`, `avg`, and
+`percentile`. Numeric offsets and `def` fallbacks use that unit; subtracting
+two dates returns a numeric duration in their common unit. Combining ms and
+ns dates converts the ms operand to ns, and any DATE result uses ns.
+Conversion uses multiplication's existing overflow rules: per-document int64
+overflow is an evaluation error, while aggregate expressions use wider intermediates.
+`sum` rejects dates;
+multiplication and division explicitly turn dates into numbers. Date averages
+and percentiles keep their double numeric lane, including fractional ticks.
+
 ## Date math
 
 Anywhere a date is accepted in a query, date math is too. Both Solr and

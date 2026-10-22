@@ -427,9 +427,10 @@ The typing rules:
   contributing values, `cardinality` returns 0 and other aggregates return
   `null`. Data-dependent overflow or a non-finite result returns `null` with
   a response warning.
-- `avg`, `min`, `max`, and `percentile` of a date keep their DATE nature;
-  date percentiles are double epoch milliseconds. `cardinality` and
-  `percentile_rank` return plain numbers. `sum` requires numeric values.
+- `avg`, `min`, `max`, and `percentile` of a date keep their DATE nature and
+  unit (`ms` or `ns`). Date averages and percentiles are doubles in that unit
+  and can contain fractional ticks or lose precision for large ns values.
+  `cardinality` and `percentile_rank` return plain numbers. `sum` requires numeric values.
   Multiplication, division, unary minus, and unary math turn a date into a
   plain number.
 - For a bare FLOAT column, `percentile_rank` rounds its bound to FLOAT,

@@ -66,23 +66,37 @@ ValueType binaryNumericType(std::span<const ResolvedValue> args) {
   return floating ? ValueType::DOUBLE : ValueType::INT64;
 }
 
+// Parsers normalize date-combining operands to a common unit first.
+ValueNature commonDateNature(std::span<const ResolvedValue> args) {
+  ValueNature nature = ValueNature::NUMBER;
+  for (const ResolvedValue& arg : args) {
+    if (!valueDate(arg.nature)) continue;
+    assert(!valueDate(nature) || nature == arg.nature);
+    nature = arg.nature;
+  }
+  return nature;
+}
+
 ResolvedValue addResolve(std::span<const ResolvedValue> args) {
   ValueType type = binaryNumericType(args);
-  int dates = (int)std::ranges::count(args, ValueNature::DATE,
-                                      &ResolvedValue::nature);
+  ValueNature nature = commonDateNature(args);
+  int dates = (int)std::ranges::count_if(args, [](const ResolvedValue& arg) {
+    return valueDate(arg.nature);
+  });
   if (dates == 2) throw std::runtime_error("cannot add two DATE values");
-  return {type, dates == 1 ? ValueNature::DATE : ValueNature::NUMBER};
+  return {type, nature};
 }
 
 ResolvedValue subResolve(std::span<const ResolvedValue> args) {
+  commonDateNature(args);
   ValueType type = binaryNumericType(args);
   if (args[0].nature == ValueNature::NUMBER
-      && args[1].nature == ValueNature::DATE) {
+      && valueDate(args[1].nature)) {
     throw std::runtime_error("cannot subtract a DATE from a number");
   }
-  if (args[0].nature == ValueNature::DATE
+  if (valueDate(args[0].nature)
       && args[1].nature == ValueNature::NUMBER) {
-    return {type, ValueNature::DATE};
+    return {type, args[0].nature};
   }
   return {type, ValueNature::NUMBER};
 }
@@ -106,14 +120,13 @@ ResolvedValue defResolve(std::span<const ResolvedValue> args) {
   ValueType type = valueArray(args[0].type)
       ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
       : (floating ? ValueType::DOUBLE : ValueType::INT64);
-  ValueNature nature = std::ranges::find(args, ValueNature::DATE,
-                                         &ResolvedValue::nature) != args.end()
-      ? ValueNature::DATE : ValueNature::NUMBER;
+  ValueNature nature = commonDateNature(args);
   return {type, nature};
 }
 
 ResolvedValue minMaxResolve(std::span<const ResolvedValue> args) {
   requireNumeric(args);
+  commonDateNature(args);
   if (args.size() == 1) {
     if (!valueArray(args[0].type)) {
       throw std::runtime_error("the one-argument form requires an array");
@@ -140,7 +153,7 @@ ResolvedValue sumResolve(std::span<const ResolvedValue> args) {
   if (!valueArray(args[0].type)) {
     throw std::runtime_error("sum() requires a numeric array");
   }
-  if (args[0].nature == ValueNature::DATE) {
+  if (valueDate(args[0].nature)) {
     throw std::runtime_error("sum() cannot reduce a DATE array");
   }
   return {valueScalarType(args[0].type), ValueNature::NUMBER};
@@ -946,13 +959,13 @@ ValueBounds countBounds(const ValueNode& node,
 
 constexpr ValueFunction FUNCTIONS[] = {
     {ValueOpcode::DEF, "def", defResolve, evalFunctionPoint, evalFunctionBatch,
-     propagateBounds, evalFunctionElement, 2, 2, nullptr},
+     propagateBounds, evalFunctionElement, 2, 2, nullptr, true},
     {ValueOpcode::ADD, "add", addResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2,
-     evalBucketOperation<ValueOpcode::ADD, 2>},
+     evalBucketOperation<ValueOpcode::ADD, 2>, true},
     {ValueOpcode::SUB, "sub", subResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2,
-     evalBucketOperation<ValueOpcode::SUB, 2>},
+     evalBucketOperation<ValueOpcode::SUB, 2>, true},
     {ValueOpcode::MUL, "mul", mulResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 2, 2,
      evalBucketOperation<ValueOpcode::MUL, 2>},
@@ -979,10 +992,10 @@ constexpr ValueFunction FUNCTIONS[] = {
      evalBucketOperation<ValueOpcode::FLOOR, 1>},
     {ValueOpcode::MIN, "min", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 2,
-     evalBucketOperation<ValueOpcode::MIN, 2>},
+     evalBucketOperation<ValueOpcode::MIN, 2>, true},
     {ValueOpcode::MAX, "max", minMaxResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 2,
-     evalBucketOperation<ValueOpcode::MAX, 2>},
+     evalBucketOperation<ValueOpcode::MAX, 2>, true},
     {ValueOpcode::AVG, "avg", avgResolve, evalFunctionPoint, evalFunctionBatch,
      propagateBounds, evalFunctionElement, 1, 1, nullptr},
     {ValueOpcode::NONE, "sum", sumResolve, evalSumPoint, evalFunctionBatch,
@@ -1072,6 +1085,23 @@ std::string ValueFunctionRegistry::arrayReducerNames() {
     result += names[i];
     result += "(...)";
   }
+  return result;
+}
+
+std::string ValueProgram::describeDateSources(uint32_t node) const {
+  std::string result;
+  std::vector<std::string_view> fields;
+  auto visit = [&](auto&& self, uint32_t index) -> void {
+    const ValueNode& value = nodes[index];
+    if (value.kind == ValueNodeKind::COLUMN && valueDate(value.nature)
+        && std::ranges::find(fields, value.text) == fields.end()) {
+      fields.push_back(value.text);
+      if (!result.empty()) result += ", ";
+      result += fmt::format("'{}' ({})", value.text, valueNatureName(value.nature));
+    }
+    for (uint8_t i = 0; i < value.childCount; i++) self(self, value.children[i]);
+  };
+  visit(visit, node);
   return result;
 }
 

@@ -789,8 +789,12 @@ zip two arrays. A NaN read from a stored column is missing; stored infinities
 remain values, including for `min` and `max`; a non-finite result produced by
 arithmetic, an invalid math domain, or int64 overflow is an evaluation error.
 
-DATE values keep their DATE meaning through `def`, `min`, `max`, `avg`, and
-DATE plus or minus a number. DATE minus DATE produces a number.
+DATE values keep their unit (`ms` or `ns`) through `def`, `min`, `max`, `avg`,
+and DATE plus or minus a number. Numeric offsets and `def` fallbacks use that
+unit. DATE minus DATE produces a number in the operands' common unit. Combining
+ms/ns DATE operands converts the ms operand to ns before the operation; any
+DATE result then uses ns. See [date expressions](dates.md#value-expressions-and-aggregates)
+for conversion overflow behavior.
 Multiplication, division, unary minus, and unary math such as `floor` demote a
 DATE to a number (`floor(when_dt / 86400000)` is an epoch-day number); adding
 two DATE values or subtracting a DATE from a number is rejected.
