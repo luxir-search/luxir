@@ -541,6 +541,7 @@ private:
       fieldOutput.writePackedTerm(finfo.fieldname);
       fieldOutput.writeVint(finfo.type);
       fieldOutput.writeVint(finfo.flags);
+      fieldOutput.writeVint(finfo.typeFlags);
       fieldOutput.writeVlong(finfo.docsWithField);
 
       //  nocommit     if ((finfo.flags & 0x01) != 0) {

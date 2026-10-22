@@ -52,6 +52,11 @@ public:
     GEO_POINT // latitude/longitude point; packed into one int64 column value
   };
 
+  static std::string_view typeName(Type type);
+  // Decode parameters using the persisted type, independently of any schema.
+  // Unknown types and bits are invalid. No type defines any bits yet.
+  static uint32_t typeParameters(Type type, uint32_t typeFlags);
+
   using flag_type = int32_t;
 
   static constexpr flag_type INDEX_DOCS = (1 << 0);
@@ -157,6 +162,9 @@ public:
   bool hasColumn() { return (bool) (flags_ & COLUMN_STORED); }
 
   bool isStored() { return (bool) (flags_ & STORED); }
+
+  // ID uses the indexed STRING representation in segment metadata.
+  Type persistedType() const { return type_ == ID ? STRING : type_; }
 
   // ---- Val -> field-native coercion ----
   // One contract shared by ingest and query build so both sides coerce

@@ -473,7 +473,20 @@ IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
       break;
     }
   }
-  return record ? FieldSegments(record, core->segs.data()) : FieldSegments{};
+  if (!record) return {};
+  FieldSegments result(record, core->segs.data());
+  if (sharedSchema) {
+    if (auto* expected = sharedSchema->getFieldTypePtr(name)) {
+      const auto& persisted = result.totals();
+      if (expected->persistedType() != persisted.type) {
+        throw RequestError(std::format(
+            "Field '{}': schema type '{}' does not match persisted type '{}'",
+            name, FieldType::typeName(expected->type()), FieldType::typeName(persisted.type)),
+            "field_type_mismatch");
+      }
+    }
+  }
+  return result;
 }
 
 std::shared_ptr<OrdMap> IndexReader::getOrdMap(std::string_view name) {
@@ -486,8 +499,8 @@ std::string_view IndexReader::FieldSegments::name() const noexcept {
   return record ? std::string_view(record->name) : std::string_view{};
 }
 
-const PostingsReader::Field* IndexReader::FieldSegments::at(size_t segment) const {
-  if (!record) return nullptr;
+int32_t IndexReader::FieldSegments::ordinalAt(size_t segment) const {
+  assert(record);
   assert(segment < record->numSegments);
   auto& postings = segments[segment].postingsReader();
   int32_t ordinal = record->ordinals[segment].load(std::memory_order_relaxed);
@@ -495,7 +508,11 @@ const PostingsReader::Field* IndexReader::FieldSegments::at(size_t segment) cons
     ordinal = postings.findOrdinal(record->name);
     record->ordinals[segment].store(ordinal, std::memory_order_relaxed);
   }
-  return postings.fieldInfo(ordinal);
+  return ordinal;
+}
+
+const PostingsReader::Field* IndexReader::FieldSegments::at(size_t segment) const {
+  return record ? segments[segment].postingsReader().fieldInfo(ordinalAt(segment)) : nullptr;
 }
 
 bool IndexReader::FieldSegments::exists() const noexcept {
@@ -511,14 +528,24 @@ const IndexReader::HeaderTotals& IndexReader::FieldSegments::totals() const {
   auto* totals = record->totals.load(std::memory_order_acquire);
   if (!totals) {
     auto fresh = std::make_unique<HeaderTotals>();
+    std::optional<SegFieldInfo> first;
     for (size_t i = 0; i < size(); i++) {
       fresh->stats.maxDoc += segments[i].maxDoc();
-      if (auto* info = at(i)) {
-        fresh->stats.docsWithField += info->docsWithField;
-        fresh->stats.sumDocFreq += info->sumDocFreq;
-        fresh->stats.sumTotalTermFreq += info->sumTotalTermFreq;
-        fresh->flags |= info->flags;
+      int32_t ordinal = ordinalAt(i);
+      if (ordinal < 0) continue;
+      SegFieldInfo info{};
+      FieldReader fields(segments[i].postingsReader(), ordinal);
+      fields.readFieldInfo(info);
+      if (first) first->requireCompatibleType(info);
+      else {
+        first = info;
+        fresh->type = info.type;
+        fresh->typeFlags = FieldType::typeParameters(info.type, info.typeFlags);
       }
+      fresh->stats.docsWithField += info.docsWithField;
+      fresh->stats.sumDocFreq += info.sumDocFreq;
+      fresh->stats.sumTotalTermFreq += info.sumTotalTermFreq;
+      fresh->flags |= info.flags;
     }
     if (record->totals.compare_exchange_strong(totals, fresh.get(),
                                                std::memory_order_release,

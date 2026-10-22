@@ -11,6 +11,24 @@
 
 namespace luxir {
 
+std::string_view FieldType::typeName(Type type) {
+  static constexpr std::string_view names[] = {
+    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point"
+  };
+  return (unsigned)type < std::size(names) ? names[(unsigned)type] : "unknown";
+}
+
+uint32_t FieldType::typeParameters(Type type, uint32_t typeFlags) {
+  switch (type) {
+    case NONE: case STRING: case TEXT: case BIN: case INT: case FLOAT:
+    case DOUBLE: case ID: case VECTOR: case DATE: case GEO_POINT:
+      if (typeFlags == 0) return 0;
+      throw std::runtime_error(std::format(
+          "Unknown type flags 0x{:x} for persisted field type '{}'", typeFlags, typeName(type)));
+  }
+  throw std::runtime_error(std::format("Unknown persisted field type {}", (int)type));
+}
+
 void StrFieldType::normalize(std::string& value) const {
   if (normalizer) normalizer->createChain()->normalizeTerm(value);
 }
