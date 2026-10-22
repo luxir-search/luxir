@@ -1,8 +1,11 @@
 include("${CMAKE_CURRENT_LIST_DIR}/common/linux.cmake")
 set(VCPKG_TARGET_ARCHITECTURE arm64)
 set(VCPKG_BUILD_TYPE release)
-set(VCPKG_C_FLAGS "-march=armv8-a -mtune=generic")
-set(VCPKG_CXX_FLAGS "-march=armv8-a -mtune=generic")
+# -fPIC matches vcpkg's own Linux toolchain, which this chainload replaces. It
+# belongs here rather than in the toolchain, which also configures Luxir: GCC's
+# -fPIC implies semantic interposition, blocking inlining of global functions.
+set(VCPKG_C_FLAGS "-fPIC -march=armv8-a -mtune=generic")
+set(VCPKG_CXX_FLAGS "-fPIC -march=armv8-a -mtune=generic")
 set(VCPKG_CHAINLOAD_TOOLCHAIN_FILE "${CMAKE_CURRENT_LIST_DIR}/../../cmake/arm64-toolchain.cmake")
 list(APPEND VCPKG_HASH_ADDITIONAL_FILES "${VCPKG_CHAINLOAD_TOOLCHAIN_FILE}")
 list(APPEND VCPKG_HASH_ADDITIONAL_FILES "${CMAKE_CURRENT_LIST_DIR}/../../tools/setup-arm64-toolchain")

@@ -5,6 +5,7 @@
 #include "CommitWaits.h"
 #include "LuxirNode.h"
 #include "ReplicationFollower.h"
+#include "Scrubber.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/log.h"
 #include "oneapi/tbb/global_control.h"
@@ -12,11 +13,11 @@
 namespace luxir {
 
 // One arena slot per thread that enters the task arena from outside: each
-// HTTP shard and gRPC thread the configured servers run, plus the embedding
-// (main or test) thread.
+// HTTP shard the configured server runs, plus the embedding (main or test)
+// thread.  gRPC threads never enter: they enqueue their work.
 static int reservedArenaSlots(const LuxirConfig& config) {
   const auto& server = config.server;
-  return (server.http.enabled ? server.http.resolveThreads() : 0) + server.grpc.resolveThreads() + 1;
+  return (server.http.enabled ? server.http.resolveThreads() : 0) + 1;
 }
 
 // TBB's global pool lends at most max_allowed_parallelism - 1 workers to all
@@ -49,7 +50,7 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
   int total = node.arenaEntrants.fetch_add(n, std::memory_order_relaxed) + n;
   if (total > node.reservedSlots) {
     LOG_WARN("{} with {} threads brings task arena entrants to {}, past the {} slots reserved from "
-             "server.http.threads and server.grpc.threads; excess entrants can block behind arena work",
+             "server.http.threads; excess entrants can block behind arena work",
              server, n, total, node.reservedSlots);
   }
 }
@@ -93,7 +94,7 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   events = std::make_shared<Events>(replication, commitWaits);
   indexRamBudget.setTotalBytes(this->config.index.max_ram_mb * 1024 * 1024);
   preWarmTimeZoneDatabase();
-  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget, indexArena);
+  collections_ = std::make_unique<Collections>(this->config, *events, indexRamBudget, indexArena, metrics);
 
   if (following()) {
     // The follower first checks that it owns the data directory.
@@ -109,10 +110,13 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
     collections_->open(this->config.read_only ? Collections::Role::READ_ONLY : Collections::Role::WRITER);
   }
   searchEngine = std::make_unique<SearchEngine>(*this);
+  scrubber = std::make_unique<Scrubber>(*this);
+  if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
 }
 
 LuxirNode::~LuxirNode() {
+  scrubber->stop();
   if (follower) follower->stop();
   commitWaits->close();
 }

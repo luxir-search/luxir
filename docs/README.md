@@ -80,6 +80,9 @@ state, and commits are crash-safe on immutable segments.
   execution, and native vector integration.
 - [Vector search design](design/vector-search.md) covers segment overlays and
   the ANN execution model.
+- [Storage and object stores](design/storage.md) lays out the storage
+  roadmap: object-store durability, nodes reading from the store through a
+  local cache, and the publication contract both use.
 - [Codebase map](dev/codebase-map.md) traces source components and request
   flow.
 - [Build setup](dev/build-setup.md) covers toolchains, dependencies, presets,

@@ -9,6 +9,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 
+#include "luxir/index/IndexRamBudget.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/TermValHash.h"
 #include "luxir/util/luxir_util.h"
@@ -16,35 +17,37 @@
 namespace luxir {
 
 /// Entry stored in the TermValHash for the id field.
-/// Each unique id maps to exactly one document and its version.
-/// For explicit delete-by-id entries, docId is -1.
+/// Each unique id has an optional local document and a delete watermark.
+/// An unoccupied entry has docId -1; a zero watermark contributes no delete fact.
 LUXIR_UNALIGNED_START
 struct IdEntry {
   int32_t docId;
-  uint64_t version;
+  uint64_t deleteWatermark;
 
-  IdEntry(int32_t docId, uint64_t version) : docId(docId), version(version) {}
+  IdEntry(int32_t docId, uint64_t deleteWatermark) : docId(docId), deleteWatermark(deleteWatermark) {}
 
   friend std::ostream& operator<<(std::ostream& out, const IdEntry& e) {
-    return out << "(doc=" << e.docId << " ver=" << e.version << ")";
+    return out << "(doc=" << e.docId << " watermark=" << e.deleteWatermark << ")";
   }
 } LUXIR_UNALIGNED_END;
 
 
-/// A sorted list of (id, version) pairs for applying deletes to segments.
+/// A sorted list of (id, watermark) pairs for applying deletes to segments.
 ///
 /// Each SortedDeletes owns a MemPool (the id string bytes) and exposes
-/// 1 or 2 sorted spans of entries:
-///   - overwrite list: ids from documents indexed with overwrite=true
-///   - delete-by-id list: explicit delete_ids from the update request
+/// sorted spans of nonzero-watermark entries. An inverter produces one span
+/// combining overwrites and explicit deletes.
 ///
-/// Both lists are sorted by id, enabling efficient k-way merge
+/// Lists are sorted by id, enabling efficient k-way merge
 /// when applying deletes across multiple inverters.
 class SortedDeletes {
 public:
   using Entry = TermValRef<IdEntry>;
   using EntrySpan = std::span<const Entry>;
   using Table = TermValHash<IdEntry>::Table;
+
+  // Declared before storage so the last owner's destruction frees storage first.
+  IndexRamBudget::Guard ramGuard;
 
 private:
   std::unique_ptr<MemPool> pool_;
@@ -59,8 +62,8 @@ public:
 
   SortedDeletes(const SortedDeletes&) = delete;
   SortedDeletes& operator=(const SortedDeletes&) = delete;
-  SortedDeletes(SortedDeletes&&) = default;
-  SortedDeletes& operator=(SortedDeletes&&) = default;
+  SortedDeletes(SortedDeletes&&) = delete;
+  SortedDeletes& operator=(SortedDeletes&&) = delete;
 
   /// Take ownership of a sorted table, keeping its original allocation size.
   void addList(Table table, int32_t count, uint64_t minVersion, uint64_t maxVersion) {
@@ -79,6 +82,12 @@ public:
 
   std::span<const EntrySpan> lists() const { return lists_; }
 
+  size_t memSize() const {
+    size_t bytes = sizeof(SortedDeletes) + (pool_ ? pool_->capacity() : 0);
+    for (const auto& table : ownedTables_) bytes += table.get_deleter().bytes;
+    return bytes;
+  }
+
   uint64_t getLargestVersion() const { return maxVersion_; }
   uint64_t getSmallestVersion() const { return minVersion_; }
 
@@ -91,7 +100,7 @@ public:
         if (shown > 0) s += ",";
         s += (std::string_view)e;
         s += ':';
-        s += std::to_string(e.val().version);
+        s += std::to_string(e.val().deleteWatermark);
         shown++;
       }
     }

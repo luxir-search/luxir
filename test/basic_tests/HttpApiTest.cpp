@@ -614,9 +614,18 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   ASSERT_EQ(200, nodeStats.result_int()) << nodeStats.body();
   glz::generic_i64 nodeJson;
   ASSERT_FALSE(glz::read_json(nodeJson, nodeStats.body())) << nodeStats.body();
-  EXPECT_TRUE(nodeJson.contains("totals"));
-  EXPECT_TRUE(nodeJson.contains("collections"));
-  EXPECT_FALSE(nodeJson.contains("memory"));
+  // The default node response is the cheap counters only: no collection walk.
+  EXPECT_FALSE(nodeJson.contains("totals"));
+  EXPECT_FALSE(nodeJson.contains("collections"));
+  EXPECT_TRUE(nodeJson.contains("memory"));
+  EXPECT_TRUE(nodeJson.contains("service"));
+  EXPECT_FALSE(nodeJson.contains("system"));
+  auto walked = httpRequest(port(), http::verb::get, "/_stats?collections=true");
+  ASSERT_EQ(200, walked.result_int()) << walked.body();
+  glz::generic_i64 walkedJson;
+  ASSERT_FALSE(glz::read_json(walkedJson, walked.body())) << walked.body();
+  EXPECT_TRUE(walkedJson.contains("totals"));
+  EXPECT_TRUE(walkedJson.contains("collections"));
 
   CollectionHelper metadataHelper("metadata");
   ASSERT_TRUE(metadataHelper.index(flatdoc("id", "one", "n_i", 7), UpdateMessage::COMMIT).success);
@@ -624,15 +633,12 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   auto metadataField = metadataReader->field("n_i");
   ASSERT_NE(nullptr, metadataField.at(0));
 
-  // Node memory is a separate request that returns nothing else; the jemalloc
-  // block is present only on jemalloc.
-  auto memoryStats = httpRequest(port(), http::verb::get, "/_stats?memory=true");
+  // The jemalloc block is present only on jemalloc.
+  auto memoryStats = httpRequest(port(), http::verb::get, "/_stats");
   ASSERT_EQ(200, memoryStats.result_int()) << memoryStats.body();
   glz::generic_i64 memoryJson;
   ASSERT_FALSE(glz::read_json(memoryJson, memoryStats.body())) << memoryStats.body();
   ASSERT_TRUE(memoryJson.contains("memory"));
-  EXPECT_FALSE(memoryJson.contains("collections"));
-  EXPECT_FALSE(memoryJson.contains("totals"));
   EXPECT_TRUE(memoryJson["memory"].contains("indexing_budget"));
   EXPECT_EQ(processAllocatorStats().has_value(),
             memoryJson["memory"].contains("jemalloc"));
@@ -650,7 +656,7 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   for (int i = 0; i < 100; i++) {
     EXPECT_FALSE(metadataReader->field(std::format("absent_{}_i", i)).exists());
   }
-  auto afterMissing = httpRequest(port(), http::verb::get, "/_stats?memory=true");
+  auto afterMissing = httpRequest(port(), http::verb::get, "/_stats");
   ASSERT_EQ(200, afterMissing.result_int()) << afterMissing.body();
   glz::generic_i64 afterMissingJson;
   ASSERT_FALSE(glz::read_json(afterMissingJson, afterMissing.body()));
@@ -658,16 +664,9 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
             afterMissingJson["memory"]["field_metadata"]["names"].get<int64_t>());
   EXPECT_EQ(metadata["name_bytes"].get<int64_t>(),
             afterMissingJson["memory"]["field_metadata"]["name_bytes"].get<int64_t>());
-  auto badMemory = httpRequest(port(), http::verb::get, "/_stats?memory=yes");
-  EXPECT_EQ(400, badMemory.result_int()) << badMemory.body();
-  auto noMemory = httpRequest(port(), http::verb::get, "/_stats?memory=false");
-  ASSERT_EQ(200, noMemory.result_int()) << noMemory.body();
-  glz::generic_i64 noMemoryJson;
-  ASSERT_FALSE(glz::read_json(noMemoryJson, noMemory.body())) << noMemory.body();
-  EXPECT_FALSE(noMemoryJson.contains("memory"));
-  // Memory is node-wide: no collection route, and no per-segment records.
-  for (const char* target : {"/collections/main/_stats?memory=true",
-                             "/_stats?memory=true&segments=true"}) {
+  // Flags are strict booleans; system stats are node-wide.
+  for (const char* target : {"/_stats?collections=yes", "/_stats?format=xml",
+                             "/collections/main/_stats?system=true"}) {
     auto rejected = httpRequest(port(), http::verb::get, target);
     EXPECT_EQ(400, rejected.result_int()) << target << ": " << rejected.body();
   }
@@ -685,6 +684,8 @@ TEST_F(HttpApiTest, statsNodeWideAndPerCollection) {
   auto* name = (*collections)[0]["name"].get_if<std::string>();
   ASSERT_NE(nullptr, name);
   EXPECT_EQ("main", *name);
+  EXPECT_FALSE(collectionJson.contains("memory"));
+  EXPECT_FALSE(collectionJson.contains("service"));
 
   auto* shards = (*collections)[0]["shards"].get_if<glz::generic_i64::array_t>();
   ASSERT_NE(nullptr, shards);
@@ -760,6 +761,33 @@ TEST_F(HttpApiTest, malformedJsonIs400) {
   EXPECT_NE(res.body().find(R"("error")"), std::string::npos);
 }
 
+// Elasticsearch-style top-level min_score in the shorthand body, as an
+// integer or a float, beside ops.
+TEST_F(HttpApiTest, searchMinScore) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"ms1","title_w":"cutoff","rank_i":1},)"
+      R"({"id":"ms2","title_w":"cutoff","rank_i":2},)"
+      R"({"id":"ms3","title_w":"cutoff","rank_i":3}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto search = [&](const std::string& query, const std::string& minScore) {
+    auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
+        R"({"query":)" + query + R"(,"min_score":)" + minScore
+        + R"j(,"count_limit":-1,"fields":["id"],"ops":{"s":"sum(rank_i)"}})j");
+    EXPECT_EQ(200, res.result_int()) << res.body();
+    return res.body();
+  };
+  const std::string rescored =
+      R"({"rescore":{"query":{"match":{"title_w":"cutoff"}},"expr":"rank_i"}})";
+  auto two = search(rescored, "2");
+  EXPECT_NE(two.find(R"("found":2)"), std::string::npos) << two;
+  EXPECT_NE(two.find(R"("s":5)"), std::string::npos) << two;
+  auto one = search(rescored, "2.5");
+  EXPECT_NE(one.find(R"("found":1)"), std::string::npos) << one;
+  const std::string match = R"({"match":{"title_w":"cutoff"}})";
+  EXPECT_NE(search(match, "0").find(R"("found":3)"), std::string::npos);
+  EXPECT_NE(search(match, "1000.0").find(R"("found":0)"), std::string::npos);
+}
+
 // No "fields" in the request: every retrievable field of each hit comes back
 // (engine fields such as _version_ only when named).
 TEST_F(HttpApiTest, searchWithoutFieldsReturnsEveryRetrievableField) {
@@ -812,7 +840,7 @@ TEST_F(HttpApiTest, facetBucketsCarryTopDocs) {
 
   auto response = httpRequest(port(), http::verb::post, "/collections/main/_search",
       R"({"ops":{"cats":{"field_facet":{"field":"http_pb_s","limit":-1,)"
-      R"("ops":{"hits":{"top_docs":{"limit":1,"get_number":true,"fields":["id"],)"
+      R"("ops":{"hits":{"top_docs":{"limit":1,"count_limit":-1,"fields":["id"],)"
       R"("sort":[{"field":"price_i","dir":"desc"}]}}}}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
   EXPECT_EQ(withCommit(
@@ -829,7 +857,7 @@ TEST_F(HttpApiTest, shorthandCarriesRequestLevelKeys) {
 
   // request-level keys (max_parallel, time_zone) mix with shorthand TopDocs keys
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
-      R"({"query":"title_w:dune","limit":0,"get_number":true,"max_parallel":-1,"time_zone":"UTC"})");
+      R"({"query":"title_w:dune","limit":0,"count_limit":-1,"max_parallel":-1,"time_zone":"UTC"})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   EXPECT_NE(res.body().find(R"("found":2)"), std::string::npos) << res.body();
 
@@ -1335,28 +1363,56 @@ TEST_F(HttpApiTest, ndjsonEndRejectsFieldMap) {
             std::string::npos) << update.body();
 }
 
-// "found" is opt-in: it appears only when get_number is requested (an exact count
-// forgoes dynamic pruning).  A default query carries no count, and absence must be
-// omitted rather than rendered as found:0 (indistinguishable from zero matches).
-TEST_F(HttpApiTest, foundIsOptInWithGetNumber) {
+// "found" is opt-in: nonzero count_limit requests a count. A default query
+// carries no count, and absence must be omitted rather than rendered as found:0.
+TEST_F(HttpApiTest, foundIsOptInWithCountLimit) {
   helper.indexAll(std::array{
     flatdoc("id", std::string("f1"), "title_w", std::string("foundtoken alpha")),
     flatdoc("id", std::string("f2"), "title_w", std::string("foundtoken beta")),
   }, UpdateMessage::COMMIT);
 
-  // Default request (no get_number): "found" omitted, docs still returned.
+  // Default request (no count_limit): "found" omitted, docs still returned.
   HttpReq noCount(port());
   noCount.collection("main").matchQuery("title_w", "foundtoken").fields({"id"}).limit(10).execute();
   ASSERT_EQ(200, noCount.status()) << noCount.rawResponse();
   EXPECT_EQ(noCount.rawResponse().find(R"("found")"), std::string::npos) << noCount.rawResponse();
   EXPECT_EQ((std::size_t)2, noCount.getDocs().size()) << noCount.rawResponse();
 
-  // With get_number: "found" present and accurate.
+  // With count_limit: "found" present and accurate.
   HttpReq withCount(port());
   withCount.collection("main").matchQuery("title_w", "foundtoken").fields({"id"}).limit(10).withStats().execute();
   ASSERT_EQ(200, withCount.status()) << withCount.rawResponse();
   EXPECT_NE(withCount.rawResponse().find(R"("found")"), std::string::npos) << withCount.rawResponse();
   EXPECT_EQ((int64_t)2, withCount.found()) << withCount.rawResponse();
+}
+
+TEST_F(HttpApiTest, countLimit) {
+  std::vector<Doc> docs;
+  for (int i = 0; i < 30; i++) {
+    docs.push_back(flatdoc("id", "t" + std::to_string(i), "title_w",
+                           i % 2 ? "counttoken other" : "counttoken keep"));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  auto search = [&](std::string_view limit) {
+    auto res = httpRequest(port(), http::verb::get,
+        "/collections/main/_search?query=*%3A*&fields=id&count_limit=" + std::string(limit));
+    EXPECT_EQ(200, res.result_int()) << res.body();
+    return res.body();
+  };
+  for (auto limit : {"-1", "5", "100"}) {
+    auto exact = search(limit);
+    EXPECT_NE(std::string::npos, exact.find(R"("found":30,"docs")")) << exact;
+    EXPECT_EQ(std::string::npos, exact.find("found_gte")) << exact;
+  }
+  auto none = search("0");
+  EXPECT_EQ(std::string::npos, none.find(R"("found")")) << none;
+  auto bounded = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?count_limit=5",
+      R"({"query":"*:*","fields":["id"],"filter":["title_w:counttoken AND title_w:keep"]})");
+  ASSERT_EQ(200, bounded.result_int()) << bounded.body();
+  EXPECT_NE(std::string::npos, bounded.body().find(R"("found":5,"found_gte":true)")) << bounded.body();
+  auto invalid = httpRequest(port(), http::verb::get, "/collections/main/_search?count_limit=-2");
+  EXPECT_EQ(400, invalid.result_int()) << invalid.body();
 }
 
 TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
@@ -2144,7 +2200,8 @@ TEST_F(HttpApiTest, ndjsonUpdateControlDecodesFullRequestAndInlineDeletes) {
   dupReq.collection("main").matchQuery("title_w", "fulldecode").fields({"id"})
       .limit(10).withStats().execute();
   ASSERT_EQ(200, dupReq.status()) << dupReq.rawResponse();
-  EXPECT_EQ((int64_t)2, dupReq.found()) << dupReq.rawResponse();
+  // Local id collisions keep the later document, including with allow_dups.
+  EXPECT_EQ((int64_t)1, dupReq.found()) << dupReq.rawResponse();
 
   HttpReq delReq(port());
   delReq.collection("main").matchQuery("title_w", "deletestream").fields({"id"})
@@ -2518,7 +2575,7 @@ TEST_F(HttpApiTest, namedOpsPreserveNestedResultsAcrossBatches) {
       auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
           R"({"request_id":"named","max_parallel":)" + std::to_string(parallel) +
           R"(,"ops":{
-            "q1":{"top_docs":{"query":"cat_s:x","fields":["id"],"get_number":true,
+            "q1":{"top_docs":{"query":"cat_s:x","fields":["id"],"count_limit":-1,
               "batch_size":)" + std::to_string(batchSize) + R"json(,
               "ops":{"metric":"min(price_f)","q2":"max(price_f)"}}},
             "q2":{"top_docs":{"query":"id:3","fields":["id"]}},
@@ -2590,7 +2647,7 @@ TEST_F(HttpApiTest, shorthandKeepsRootResultsAcrossBatches) {
   helper.indexAll(std::array{flatdoc("id", "1"), flatdoc("id", "2"), flatdoc("id", "3")},
                   UpdateMessage::COMMIT);
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_search",
-      R"json({"fields":["id"],"batch_size":1,"get_number":true,"ops":{"q":"sum(1)"}})json");
+      R"json({"fields":["id"],"batch_size":1,"count_limit":-1,"ops":{"q":"sum(1)"}})json");
   ASSERT_EQ(200, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
   ASSERT_GT(lines.size(), 1u);
@@ -2697,7 +2754,7 @@ TEST_F(HttpApiTest, searchGetLimitOnlyMatchesAll) {
   }, UpdateMessage::COMMIT);
 
   auto res = httpRequest(port(), http::verb::get,
-      "/collections/main/_search?limit=1&fields=id&get_number=true");
+      "/collections/main/_search?limit=1&fields=id&count_limit=-1");
   ASSERT_EQ(200, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
   ASSERT_EQ(1u, lines.size()) << res.body();
@@ -2755,7 +2812,7 @@ TEST_F(HttpApiTest, searchUrlOverlayEchoPostbackEquivalent) {
   }, UpdateMessage::COMMIT);
 
   const std::string target =
-      "/collections/main/_search?query=title_w%3Adune&limit=4&fields=id&get_number=true";
+      "/collections/main/_search?query=title_w%3Adune&limit=4&fields=id&count_limit=-1";
   auto direct = httpRequest(port(), http::verb::get, target);
   auto echo = httpRequest(port(), http::verb::get, target + "&explain=request");
   ASSERT_EQ(200, echo.result_int()) << echo.body();
@@ -2776,7 +2833,7 @@ TEST_F(HttpApiTest, searchUrlOverlayScalarGrammars) {
       "&request_id=url%22%5Cvalue&freshness_ms=17&time_zone=UTC&profile=true&max_parallel=1"
       "&query=title_w%3Adune&limit=bad&limit=7&offset=-2&fields=id%2Ctitle_s"
       "&sort=price_i+desc&sort=score&batch_size=5&document_format=columns"
-      "&get_number=true&get_scores=false";
+      "&count_limit=-1&get_scores=false";
   auto echo = httpRequest(port(), http::verb::get, target);
   ASSERT_EQ(200, echo.result_int()) << echo.body();
 
@@ -2792,7 +2849,7 @@ TEST_F(HttpApiTest, searchUrlOverlayScalarGrammars) {
   EXPECT_EQ(-2, *td["offset"].get_if<int64_t>());
   EXPECT_EQ(5, *td["batch_size"].get_if<int64_t>());
   EXPECT_EQ("columns", *td["document_format"].get_if<std::string>());
-  EXPECT_TRUE(*td["get_number"].get_if<bool>());
+  EXPECT_EQ(-1, *td["count_limit"].get_if<int64_t>());
   auto* sorts = td["sort"].get_if<glz::generic_i64::array_t>();
   ASSERT_NE(nullptr, sorts);
   ASSERT_EQ(2u, sorts->size());
@@ -2883,7 +2940,7 @@ TEST_F(HttpApiTest, searchUrlKnownValueErrorsNameParam) {
     std::pair{"offset", "9223372036854775808"},
     std::pair{"batch_size", "2147483648"},
     std::pair{"document_format", "row"},
-    std::pair{"get_number", "1"},
+    std::pair{"count_limit", "1x"},
     std::pair{"get_scores", "falsex"},
   };
   for (const auto& [name, value] : badValues) {
@@ -3468,7 +3525,7 @@ TEST_F(HttpApiTest, docsFormatSelectableInBody) {
   EXPECT_EQ(R"({"id":"b1"})" "\n", res.body());
 }
 
-// get_number puts the count in a _header_ meta record on the first line;
+// count_limit puts the count in a _header_ meta record on the first line;
 // without it the body is pure documents.
 TEST_F(HttpApiTest, docsFormatHeaderCarriesFound) {
   LuxirTest::clearCollection("http_docs_hdr");
@@ -3477,7 +3534,7 @@ TEST_F(HttpApiTest, docsFormatHeaderCarriesFound) {
   ch.index(flatdoc("id", std::string("h2")), UpdateMessage::COMMIT);
 
   auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_hdr/_search?format=docs",
-      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id"]})");
+      R"({"query":{"all":true},"limit":-1,"count_limit":-1,"fields":["id"]})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
   ASSERT_EQ(3u, lines.size()) << res.body();
@@ -3501,9 +3558,46 @@ TEST_F(HttpApiTest, docsFormatValidation) {
   EXPECT_EQ(400, columns.result_int()) << columns.body();
   EXPECT_NE(std::string::npos, columns.body().find("format=docs")) << columns.body();
 
+  auto adaptive = httpRequest(port(), http::verb::post,
+      "/collections/main/_search?format=docs&document_format=adaptive",
+      R"({"query":{"all":true},"fields":["id"]})");
+  EXPECT_EQ(400, adaptive.result_int()) << adaptive.body();
+  EXPECT_NE(std::string::npos, adaptive.body().find("ADAPTIVE")) << adaptive.body();
+
   auto unknown = httpRequest(port(), http::verb::post, "/collections/main/_search?format=lines",
       R"({"query":{"all":true}})");
   EXPECT_EQ(400, unknown.result_int()) << unknown.body();
+}
+
+// document_format=adaptive answers with envelopes whose merged documents
+// carry sparse fields from docs and dense ones from columns.
+TEST_F(HttpApiTest, adaptiveFormat) {
+  LuxirTest::clearCollection("http_adaptive");
+  CollectionHelper ch("http_adaptive");
+  std::vector<Doc> docs{flatdoc("id", "a0", "year_i", (int64_t)2000, "rare_s", "x")};
+  for (int i = 1; i < 20; i++) {
+    docs.push_back(flatdoc("id", "a" + std::to_string(i), "year_i", (int64_t)(2000 + i)));
+  }
+  ASSERT_TRUE(ch.indexAll(std::span<const Doc>(docs), UpdateMessage::COMMIT).success);
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_adaptive/_search",
+      R"({"query":{"all":true},"limit":-1,"fields":["id","year_i","rare_s"],"document_format":"adaptive"})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  size_t rows = 0, withRare = 0;
+  for (const auto& line : splitLines(res.body())) {
+    glz::generic_i64 body;
+    ASSERT_FALSE(glz::read_json(body, line));
+    for (const auto& row : body["docs"].get_array()) {
+      rows++;
+      EXPECT_TRUE(row.contains("year_i"));
+      if (row.contains("rare_s")) {
+        withRare++;
+        EXPECT_EQ("x", row["rare_s"].get_string());
+      }
+    }
+  }
+  EXPECT_EQ(20u, rows);
+  EXPECT_EQ(1u, withRare);
 }
 
 // An engine error before anything streams is a plain HTTP error, not a 200
@@ -3518,19 +3612,19 @@ TEST_F(HttpApiTest, docsFormatErrorBeforeFlushIsHttpError) {
 
 // Object-valued sole-underscore-field records are the reserved meta/control
 // namespace in streaming ingest: unknown names are an error, never indexed as
-// documents.  Scalar-valued ones stay documents ({"_version_":42} is a
-// legitimate one-field export; every real control carries an object).
+// documents. Scalar-valued ones stay documents and undergo document validation.
 TEST_F(HttpApiTest, ndjsonUnknownUnderscoreRecordIs400) {
   auto res = httpRequest(port(), http::verb::post, "/collections/main/_update",
       std::string(R"({"_bogus_":{"x":1}})") + "\n", "application/x-ndjson");
   EXPECT_EQ(400, res.result_int()) << res.body();
   EXPECT_NE(std::string::npos, res.body().find("_bogus_")) << res.body();
 
-  // Scalar payload: classified as a document, not an unknown control (it may
-  // still fail schema-level checks, but never as a control record).
+  // Scalar payload: a document error for an engine field, not an unknown control.
   auto scalar = httpRequest(port(), http::verb::post, "/collections/main/_update",
       std::string(R"({"_version_":42})") + "\n", "application/x-ndjson");
   EXPECT_EQ(std::string::npos, scalar.body().find("unknown control record")) << scalar.body();
+  EXPECT_NE(std::string::npos, scalar.body().find("assigned by the engine")) << scalar.body();
+  EXPECT_NE(std::string::npos, scalar.body().find("optimistic concurrency is not supported")) << scalar.body();
 
   // _header_ itself must carry an object.
   auto malformed = httpRequest(port(), http::verb::post, "/collections/main/_update",
@@ -3560,7 +3654,7 @@ TEST_F(HttpApiTest, ndjsonHeaderRecordsInterleaveWithDocs) {
   ASSERT_EQ(200, res.result_int()) << res.body();
 
   auto check = httpRequest(port(), http::verb::post, "/collections/http_hdrs/_search?format=docs",
-      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id"]})");
+      R"({"query":{"all":true},"limit":-1,"count_limit":-1,"fields":["id"]})");
   ASSERT_EQ(200, check.result_int()) << check.body();
   auto lines = splitLines(check.body());
   ASSERT_EQ(3u, lines.size()) << check.body();  // header + 2 docs
@@ -3574,7 +3668,7 @@ TEST_F(HttpApiTest, fusionSubOpsEchoAndStreaming) {
       flatdoc("id", "c", "color_s", "blue")}, UpdateMessage::COMMIT);
   const std::string body = R"({"ops":{"f":{"fusion":{
     "sources":{"all":{"query":{"all":true},"limit":3}},"rrf":{},
-    "limit":2,"batch_size":1,"get_number":true,"fields":["id"],
+    "limit":2,"batch_size":1,"count_limit":-1,"fields":["id"],
     "ops":{"colors":{"field_facet":{"field":"color_s"}}}
   }}}})";
   auto echo = httpRequest(port(), http::verb::post,
@@ -3639,8 +3733,8 @@ TEST_F(HttpApiTest, docsFormatMultiOpRunMarkers) {
 
   auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_multi/_search?format=docs",
       R"({"ops":{)"
-      R"("qa":{"top_docs":{"query":{"match":{"kind_s":"a"}},"limit":-1,"batch_size":2,"get_number":true,"fields":["id"]}},)"
-      R"("qb":{"top_docs":{"query":{"match":{"kind_s":"b"}},"limit":-1,"batch_size":2,"get_number":true,"fields":["id"]}})"
+      R"("qa":{"top_docs":{"query":{"match":{"kind_s":"a"}},"limit":-1,"batch_size":2,"count_limit":-1,"fields":["id"]}},)"
+      R"("qb":{"top_docs":{"query":{"match":{"kind_s":"b"}},"limit":-1,"batch_size":2,"count_limit":-1,"fields":["id"]}})"
       R"(}})");
   ASSERT_EQ(200, res.result_int()) << res.body();
 
@@ -3666,7 +3760,7 @@ TEST_F(HttpApiTest, docsFormatMultiOpRunMarkers) {
   EXPECT_EQ(4, foundByOp["qb"]);
 }
 
-// Warnings force a _header_ even without get_number: degraded execution is
+// Warnings force a _header_ even without count_limit: degraded execution is
 // never silent, docs format included.
 TEST_F(HttpApiTest, docsFormatWarningsForceHeader) {
   LuxirTest::clearCollection("http_docs_warn");
@@ -3684,7 +3778,7 @@ TEST_F(HttpApiTest, docsFormatWarningsForceHeader) {
   EXPECT_EQ(R"({"id":"w1"})", lines[1]);
 }
 
-// Zero matches: pure mode returns an empty 200 body; with get_number the body
+// Zero matches: pure mode returns an empty 200 body; with count_limit the body
 // is the single header line.
 TEST_F(HttpApiTest, docsFormatZeroResults) {
   LuxirTest::clearCollection("http_docs_zero");
@@ -3697,7 +3791,7 @@ TEST_F(HttpApiTest, docsFormatZeroResults) {
   EXPECT_TRUE(pure.body().empty()) << pure.body();
 
   auto counted = httpRequest(port(), http::verb::post, "/collections/http_docs_zero/_search?format=docs",
-      R"({"query":{"match":{"id":"nomatch"}},"get_number":true,"fields":["id"]})");
+      R"({"query":{"match":{"id":"nomatch"}},"count_limit":-1,"fields":["id"]})");
   ASSERT_EQ(200, counted.result_int()) << counted.body();
   EXPECT_EQ(R"({"_header_":{"found":0}})" "\n", counted.body());
 }
@@ -3745,7 +3839,7 @@ TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
   }
 
   auto exported = httpRequest(port(), http::verb::post, "/collections/http_rt_src/_search?format=docs",
-      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id","num_i"]})");
+      R"({"query":{"all":true},"limit":-1,"count_limit":-1,"fields":["id","num_i"]})");
   ASSERT_EQ(200, exported.result_int()) << exported.body();
   ASSERT_EQ(8u, splitLines(exported.body()).size());  // header + 7 docs
 
@@ -3755,7 +3849,7 @@ TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
 
   // Verify by re-exporting the destination: identical doc lines, same count.
   auto reexported = httpRequest(port(), http::verb::post, "/collections/http_rt_dst/_search?format=docs",
-      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id","num_i"]})");
+      R"({"query":{"all":true},"limit":-1,"count_limit":-1,"fields":["id","num_i"]})");
   ASSERT_EQ(200, reexported.result_int()) << reexported.body();
   auto a = splitLines(exported.body());
   auto b = splitLines(reexported.body());
@@ -4047,7 +4141,7 @@ TEST_F(HttpApiTest, envelopeEchoesRequestId) {
   EXPECT_NE(res.body().find(R"({"request_id":"q9",)"), std::string::npos) << res.body();
   EXPECT_NE(res.body().find(R"("rid1")"), std::string::npos) << res.body();
 
-  // Docs format: the id rides on the first _header_ even without get_number.
+  // Docs format: the id rides on the first _header_ even without count_limit.
   auto docs = httpRequest(port(), http::verb::post,
                           "/collections/main/_search?format=docs&request_id=q10",
                           R"({"query":"title_w:requestid","fields":["id"]})");
@@ -4195,7 +4289,7 @@ TEST_F(HttpApiTest, offsetUrlOverlay) {
   ASSERT_EQ(4u, ids.size());
   auto page = httpRequest(port(), http::verb::post,
       "/collections/main/_search?offset=1&limit=2",
-      R"({"query":"title_w:dune","fields":["id"],"offset":0,"limit":10,"get_number":true})");
+      R"({"query":"title_w:dune","fields":["id"],"offset":0,"limit":10,"count_limit":-1})");
   ASSERT_EQ(200, page.result_int()) << page.body();
   auto lines = splitLines(page.body());
   ASSERT_EQ(1u, lines.size());
@@ -4392,7 +4486,7 @@ TEST_F(HttpApiTest, collapseOverlayRowsColumnsAndDocs) {
   for (std::string format : {"rows", "columns"}) {
     auto response = httpRequest(port(), http::verb::post,
         "/collections/main/_search?collapse=key_s",
-        R"({"fields":["id"],"get_number":true,"batch_size":2,"document_format":")" + format + "\"}");
+        R"({"fields":["id"],"count_limit":-1,"batch_size":2,"document_format":")" + format + "\"}");
     ASSERT_EQ(200, response.result_int()) << response.body();
     std::vector<std::string> ids;
     for (const auto& line : splitLines(response.body())) {
@@ -4409,7 +4503,7 @@ TEST_F(HttpApiTest, collapseOverlayRowsColumnsAndDocs) {
   }
   auto response = httpRequest(port(), http::verb::post,
       "/collections/main/_search?format=docs&collapse=key_s",
-      R"({"fields":["id"],"get_number":true,"batch_size":1})");
+      R"({"fields":["id"],"count_limit":-1,"batch_size":1})");
   ASSERT_EQ(200, response.result_int()) << response.body();
   auto lines = splitLines(response.body());
   ASSERT_EQ(4, lines.size());

@@ -31,6 +31,12 @@ class NumericPredicateQuery final : public Query {
   PointsReader::ValueRange envelope;
   std::span<const int64_t> exactValues;
   std::span<const PointsReader::ValueRange> exactIntervals;
+  // Normally SEGMENT_STABLE; REQUEST_STABLE when a bound came from the request
+  // clock (unrounded NOW). Such keys never repeat across requests, so skip the
+  // shared cache and admission history while still deduplicating in the request.
+  // equals()/hash() ignore this: BooleanQuery dedups by equals(), and cache
+  // lifetime must not change membership.
+  FilterKeyScope filterKeyScope = FilterKeyScope::SEGMENT_STABLE;
 
 public:
   bool recoverableAsPredicate() const noexcept override { return true; }
@@ -42,8 +48,10 @@ public:
   static inline thread_local void (*verificationObserver)(int32_t) = nullptr;
 #endif
 
-  NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi)
-    : Query(QueryKind::NUMERIC_PREDICATE), field(field), envelope{lo, hi} {}
+  NumericPredicateQuery(std::string_view field, int64_t lo, int64_t hi,
+                        FilterKeyScope filterKeyScope = FilterKeyScope::SEGMENT_STABLE)
+    : Query(QueryKind::NUMERIC_PREDICATE), field(field), envelope{lo, hi},
+      filterKeyScope(filterKeyScope) {}
 
   NumericPredicateQuery(std::string_view field,
                         std::span<const int64_t> exactValues,
@@ -169,14 +177,11 @@ public:
       out.appendSize(exactValues.size());
       for (int64_t value : exactValues) out.appendInt64(value);
     }
-    return FilterKeyScope::SEGMENT_STABLE;
+    return filterKeyScope;
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags,
-                              float multiplier = 1.0f) override {
-    float score = constantWhenScored(flags, multiplier);
-    return context.pool.make<Weight>(context, *this, flags, score);
-  }
+                              float multiplier = 1.0f) override;
 
   // PredicateScorer is the sparse two-phase verifier and, when instantiated
   // with IntColReader::Iterator, the benchmark's full column-scan baseline.
@@ -322,15 +327,75 @@ public:
     CROSSES
   };
 
+  // A block's relation to the predicate. A CROSSES block is refined below
+  // block granularity: per leaf zone (any encoding), and for a linear-fit
+  // block by the rank intervals the codec bounds. runAt walks the refinement
+  // as runs of in-block ranks sharing one relation, so consumers emit INSIDE
+  // runs, skip OUTSIDE runs and check only CROSSES runs value by value.
   struct BlockPlan {
+    static constexpr uint32_t LEAF_SIZE = NumColumnFormat::LEAF_ZONE_SIZE;
+    static_assert(NumColumnFormat::LEAVES_PER_BLOCK <= 8);
+    static_assert(IntColReader::BLOCK_SIZE <= UINT16_MAX);
+
     BlockRelation relation = BlockRelation::OUTSIDE;
-    uint32_t lowerResidual = 0;
-    uint32_t upperResidual = 0;
+    // Bit i describes the block's leaf i: inside, crossing, or neither
+    // (outside).
+    uint8_t leafInside = 0;
+    uint8_t leafCrossing = 0;
+    // In-block ranks outside [checkBegin, checkEnd) cannot match; ranks in
+    // [insideBegin, insideEnd) all match.
+    uint16_t checkBegin = 0;
+    uint16_t checkEnd = 0;
+    uint16_t insideBegin = 0;
+    uint16_t insideEnd = 0;
+    // Read only for CROSSES runs of residual-comparable blocks.
+    NumColumnFormat::ResidualBounds residualBounds = {};
+
+    struct Run {
+      BlockRelation relation;
+      uint32_t end;
+    };
+
+    // The relation shared by in-block ranks [rank, end). end is capped at
+    // BLOCK_SIZE, not at the block's value count; callers clamp it.
+    Run runAt(uint32_t rank) const {
+      if (relation != BlockRelation::CROSSES) {
+        return {relation, IntColReader::BLOCK_SIZE};
+      }
+      if (rank < checkBegin) return {BlockRelation::OUTSIDE, checkBegin};
+      if (rank >= checkEnd) {
+        return {BlockRelation::OUTSIDE, IntColReader::BLOCK_SIZE};
+      }
+      if (rank >= insideBegin && rank < insideEnd) {
+        return {BlockRelation::INSIDE, insideEnd};
+      }
+      uint32_t leaf = rank / LEAF_SIZE;
+      uint32_t end = std::min<uint32_t>(checkEnd, (leaf + 1) * LEAF_SIZE);
+      if (rank < insideBegin) end = std::min<uint32_t>(end, insideBegin);
+      uint32_t bit = 1u << leaf;
+      BlockRelation leafRelation = (leafInside & bit) != 0
+          ? BlockRelation::INSIDE
+          : (leafCrossing & bit) != 0 ? BlockRelation::CROSSES
+                                      : BlockRelation::OUTSIDE;
+      return {leafRelation, end};
+    }
+
+    // Calls fn(relation, begin, end) for each run of the block's `count`
+    // values.
+    template <typename Fn>
+    void forEachRun(uint32_t count, Fn&& fn) const {
+      for (uint32_t rank = 0; rank < count;) {
+        Run run = runAt(rank);
+        uint32_t end = std::min(run.end, count);
+        fn(run.relation, rank, end);
+        rank = end;
+      }
+    }
   };
 
-  BlockPlan classifyBlock(const IntColReader::NumericBlockInfo& block,
-                          const NumBlockZone& zone) const {
+  BlockPlan classifyBlock(const IntColReader& reader, int64_t blockNum) const {
     BlockPlan plan;
+    NumBlockZone zone = reader.blockZone(blockNum);
     if (!intersects(zone.min, zone.max)) {
       return plan;
     }
@@ -340,33 +405,93 @@ public:
     }
 
     plan.relation = BlockRelation::CROSSES;
-    if (isExactSet()) return plan;
-    if (block.bits() > 32 || block.scaledSlope != 0) {
-      return plan;
+    uint32_t count = (uint32_t)reader.valuesInBlock(blockNum);
+    plan.checkEnd = (uint16_t)count;
+    int64_t firstLeaf = blockNum * NumColumnFormat::LEAVES_PER_BLOCK;
+    uint32_t leaves = (count + BlockPlan::LEAF_SIZE - 1) / BlockPlan::LEAF_SIZE;
+    if (firstLeaf + leaves <= reader.numLeafZones()) {
+      const auto& leafMeta = reader.leafMeta();
+      for (uint32_t leaf = 0; leaf < leaves; leaf++) {
+        NumBlockZone leafZone = leafMeta.leafZone(firstLeaf + leaf);
+        if (!intersects(leafZone.min, leafZone.max)) continue;
+        if (covers(leafZone.min, leafZone.max)) {
+          plan.leafInside |= (uint8_t)(1u << leaf);
+        } else {
+          plan.leafCrossing |= (uint8_t)(1u << leaf);
+        }
+      }
+    } else {
+      plan.leafCrossing = (uint8_t)((1u << leaves) - 1);
     }
 
-    // CROSSES guarantees every subtraction below represents a non-negative
-    // signed-order distance. Unsigned subtraction makes the full INT64 span
-    // exact, and quotient+remainder implements ceil without overflow.
-    uint64_t gcd = block.gcd;
-    assert(gcd != 0);
-    uint64_t lower = 0;
-    if (envelope.lo > zone.min) {
-      uint64_t delta = (uint64_t)envelope.lo - (uint64_t)zone.min;
-      lower = delta / gcd + (delta % gcd != 0);
+    if (plan.leafCrossing != 0) {
+      if (auto bounds = reader.rankBounds(blockNum, envelope.lo, envelope.hi)) {
+        plan.checkBegin = (uint16_t)bounds->checkBegin;
+        plan.checkEnd = (uint16_t)bounds->checkEnd;
+        // An exact set's envelope proves exclusion, not inclusion.
+        if (!isExactSet()) {
+          plan.insideBegin = (uint16_t)bounds->insideBegin;
+          plan.insideEnd = (uint16_t)bounds->insideEnd;
+        }
+      }
     }
-    uint64_t upper;
-    if (envelope.hi >= zone.max) {
-      upper = ((uint64_t)zone.max - (uint64_t)zone.min) / gcd;
-    } else {
-      upper = ((uint64_t)envelope.hi - (uint64_t)zone.min) / gcd;
+
+    // Leaves can settle a block its hull zone could not: an exact set whose
+    // intervals each cover different leaves, or a range in a gap between
+    // unsorted leaves.
+    bool anyInside = false;
+    bool anyOutside = false;
+    bool anyCrossing = false;
+    plan.forEachRun(count, [&](BlockRelation relation, uint32_t, uint32_t) {
+      anyInside |= relation == BlockRelation::INSIDE;
+      anyOutside |= relation == BlockRelation::OUTSIDE;
+      anyCrossing |= relation == BlockRelation::CROSSES;
+    });
+    if (!anyCrossing && !anyInside) return BlockPlan();
+    if (!anyCrossing && !anyOutside) {
+      BlockPlan inside;
+      inside.relation = BlockRelation::INSIDE;
+      return inside;
     }
-    // A compressed block's maximum persisted residual fits its format<=32.
-    // Saturation keeps a defensive release build correct at both signed
-    // extremes even if future metadata admits a wider residual.
-    plan.lowerResidual = lower > UINT32_MAX ? UINT32_MAX : (uint32_t)lower;
-    plan.upperResidual = upper > UINT32_MAX ? UINT32_MAX : (uint32_t)upper;
+
+    if (!anyCrossing || isExactSet()) return plan;
+    auto block = reader.blockInfo(blockNum);
+    if (block.residualComparable()) {
+      plan.residualBounds = NumColumnFormat::residualBounds(
+          block, envelope.lo, envelope.hi);
+    }
     return plan;
+  }
+
+  // Whether the plans hold an INSIDE run, which proves a match.
+  static bool hasInsideRun(const IntColReader& reader,
+                           std::span<const BlockPlan> plans) {
+    for (int64_t blockNum = 0; blockNum < (int64_t)plans.size(); blockNum++) {
+      bool inside = false;
+      plans[(size_t)blockNum].forEachRun(
+          (uint32_t)reader.valuesInBlock(blockNum),
+          [&](BlockRelation relation, uint32_t, uint32_t) {
+            inside |= relation == BlockRelation::INSIDE;
+          });
+      if (inside) return true;
+    }
+    return false;
+  }
+
+  // Each plan is built in its pool slot. Assigning into default-constructed
+  // plans would copy every result through the stack, and the copy's wide
+  // reload stalls on classifyBlock's narrow stores.
+  static std::span<BlockPlan> classifyBlocks(
+      MemPool& pool, const IntColReader& reader,
+      const NumericPredicateQuery& query) {
+    static_assert(std::is_trivially_destructible_v<BlockPlan>);
+    size_t count = (size_t)reader.numBlocks();
+    auto* plans = (BlockPlan*)pool.alloc(
+        count * sizeof(BlockPlan), alignof(BlockPlan));
+    for (size_t i = 0; i < count; i++) {
+      new (plans + i) BlockPlan(query.classifyBlock(reader, (int64_t)i));
+    }
+    return {plans, count};
   }
 
   class CrossingValues {
@@ -386,14 +511,14 @@ public:
       int64_t blockNum = valueRank / IntColReader::BLOCK_SIZE;
       auto block = reader.blockInfo(blockNum);
       if (!query.isExactSet()
-          && block.bits() <= 32 && block.scaledSlope == 0) {
+          && block.residualComparable()) {
         if (valueRank < residualStart
             || valueRank >= residualStart + (int64_t)residualCount) {
           residualStart = reader.decodeResidualSubBlock(valueRank, residuals,
                                                         residualCount);
         }
         uint32_t v = residuals[valueRank - residualStart];
-        return plan.lowerResidual <= v && v <= plan.upperResidual;
+        return plan.residualBounds.lower <= v && v <= plan.residualBounds.upper;
       }
       if (valueRank < rawStart || valueRank >= rawStart + (int64_t)rawCount) {
         rawStart = reader.decodeValueSubBlock(valueRank, raw, rawCount);
@@ -402,6 +527,30 @@ public:
       return query.matchesValue(v);
     }
   };
+
+  // Whether any value at ranks [start, end) matches.
+  static bool anyValueMatches(std::span<const BlockPlan> plans,
+                              CrossingValues& crossing,
+                              const NumericPredicateQuery& query,
+                              int64_t start, int64_t end) {
+    int64_t rank = start;
+    while (rank < end) {
+      int64_t blockStart = rank / IntColReader::BLOCK_SIZE
+          * (int64_t)IntColReader::BLOCK_SIZE;
+      const BlockPlan& plan =
+          plans[(size_t)(blockStart / IntColReader::BLOCK_SIZE)];
+      BlockPlan::Run run = plan.runAt((uint32_t)(rank - blockStart));
+      int64_t runEnd = std::min<int64_t>(end, blockStart + run.end);
+      if (run.relation == BlockRelation::INSIDE) return true;
+      if (run.relation == BlockRelation::CROSSES) {
+        for (; rank < runEnd; rank++) {
+          if (crossing.matches(rank, plan, query)) return true;
+        }
+      }
+      rank = runEnd;
+    }
+    return false;
+  }
 
   class ZoneMapScorer final : public Query::ConstantScorer {
     static constexpr int32_t ITER_WINDOW_SIZE = 4096;
@@ -466,34 +615,34 @@ public:
       int64_t nvals = reader.numValues();
       while (doc < max && rank < nvals) {
         int64_t blockNum = rank / IntColReader::BLOCK_SIZE;
-        int64_t blockEnd = std::min<int64_t>(nvals,
-            (blockNum + 1) * (int64_t)IntColReader::BLOCK_SIZE);
+        int64_t blockStart = blockNum * (int64_t)IntColReader::BLOCK_SIZE;
         const BlockPlan& plan = plans[(size_t)blockNum];
-        if (plan.relation == BlockRelation::OUTSIDE) {
-          rank = (int32_t)blockEnd;
+        BlockPlan::Run run = plan.runAt((uint32_t)(rank - blockStart));
+        int64_t runEnd = std::min<int64_t>(nvals, blockStart + run.end);
+        if (run.relation == BlockRelation::OUTSIDE) {
+          rank = (int32_t)runEnd;
           if (rank >= nvals) break;
           doc = docForRank(rank);
           continue;
         }
-        if (plan.relation == BlockRelation::INSIDE
+        if (run.relation == BlockRelation::INSIDE
             && reader.denseDocsWithValue()) {
-          int32_t runEnd = (int32_t)std::min<int64_t>(blockEnd, max);
-          setRun(words, min, doc, runEnd);
-          rank = runEnd;
-          doc = runEnd;
+          int32_t insideEnd = (int32_t)std::min<int64_t>(runEnd, max);
+          setRun(words, min, doc, insideEnd);
+          rank = insideEnd;
+          doc = insideEnd;
           continue;
         }
 
-        int64_t limit = blockEnd;
-        while (rank < limit) {
+        while (rank < runEnd) {
           doc = docForRank(rank);
           if (doc >= max) return;
 #ifndef NDEBUG
-          if (plan.relation == BlockRelation::CROSSES && verificationObserver != nullptr) {
+          if (run.relation == BlockRelation::CROSSES && verificationObserver != nullptr) {
             verificationObserver(doc);
           }
 #endif
-          if (plan.relation == BlockRelation::INSIDE
+          if (run.relation == BlockRelation::INSIDE
               || crossing.matches(rank, plan, query)) {
             setBit(words, min, doc);
           }
@@ -503,26 +652,6 @@ public:
       }
     }
 
-    bool docValuesMatch(int64_t start, int64_t end) {
-      int64_t rank = start;
-      while (rank < end) {
-        int64_t blockNum = rank / IntColReader::BLOCK_SIZE;
-        int64_t blockEnd = std::min<int64_t>(end,
-            (blockNum + 1) * (int64_t)IntColReader::BLOCK_SIZE);
-        const BlockPlan& plan = plans[(size_t)blockNum];
-        if (plan.relation == BlockRelation::INSIDE) return true;
-        if (plan.relation == BlockRelation::CROSSES) {
-          while (rank < blockEnd) {
-            if (crossing.matches(rank, plan, query)) return true;
-            rank++;
-          }
-        } else {
-          rank = blockEnd;
-        }
-      }
-      return false;
-    }
-
     void fillMulti(std::span<uint64_t> words, int32_t min, int32_t max) {
       auto [doc, docRank] = firstDocRank(min);
       while (doc < max && docRank < reader.docsWithValue()) {
@@ -530,7 +659,8 @@ public:
 #ifndef NDEBUG
         if (verificationObserver != nullptr) verificationObserver(doc);
 #endif
-        if (start < end && docValuesMatch(start, end)) {
+        if (start < end
+            && anyValueMatches(plans, crossing, query, start, end)) {
           setBit(words, min, doc);
         }
         docRank++;
@@ -825,23 +955,28 @@ public:
                                 bool exactSet) {
       int64_t estimate = 0;
       for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
-        int64_t count = reader.valuesInBlock(blockNum);
-        switch (plans[(size_t)blockNum].relation) {
-          case BlockRelation::INSIDE:
-            estimate += count;
-            break;
-          case BlockRelation::CROSSES:
-            // A crossing zone gives no exact cardinality. A range crosses a
-            // block at one end and matches part of it, so charge the measured
-            // half-block heuristic. A value set has gaps throughout the block
-            // and no comparable midpoint, so charge its full value count as a
-            // conservative upper bound. Points-backed fields replace both with
-            // exact point ordinal counts below.
-            estimate += exactSet ? count : (count + 1) / 2;
-            break;
-          case BlockRelation::OUTSIDE:
-            break;
-        }
+        plans[(size_t)blockNum].forEachRun(
+            (uint32_t)reader.valuesInBlock(blockNum),
+            [&](BlockRelation relation, uint32_t begin, uint32_t end) {
+              int64_t count = end - begin;
+              switch (relation) {
+                case BlockRelation::INSIDE:
+                  estimate += count;
+                  break;
+                case BlockRelation::CROSSES:
+                  // A crossing run gives no exact cardinality. A range
+                  // crosses a run at one end and matches part of it, so
+                  // charge the measured half-run heuristic. A value set has
+                  // gaps throughout the run and no comparable midpoint, so
+                  // charge its full value count as a conservative upper
+                  // bound. Points-backed fields replace both with exact
+                  // point ordinal counts below.
+                  estimate += exactSet ? count : (count + 1) / 2;
+                  break;
+                case BlockRelation::OUTSIDE:
+                  break;
+              }
+            });
       }
       return std::min<int64_t>(estimate, reader.docsWithValue());
     }
@@ -1156,11 +1291,7 @@ public:
           return (int64_t)pointValueCount;
         }
         if (plans.empty()) {
-          auto stored = planPool.make_span<BlockPlan>((size_t)reader.numBlocks());
-          for (int64_t i = 0; i < reader.numBlocks(); i++) {
-            stored[(size_t)i] = weight.query.classifyBlock(reader.blockInfo(i), reader.blockZone(i));
-          }
-          plans = stored;
+          plans = classifyBlocks(planPool, reader, weight.query);
         }
         CrossingValues crossing(reader);
         if (!reader.multiValued()) {
@@ -1170,15 +1301,18 @@ public:
             const BlockPlan& plan = plans[(size_t)blockNum];
             int64_t start =
                 blockNum * (int64_t)IntColReader::BLOCK_SIZE;
-            int64_t end = start + reader.valuesInBlock(blockNum);
-            if (plan.relation == BlockRelation::INSIDE) {
-              count += end - start;
-            } else if (plan.relation == BlockRelation::CROSSES) {
-              for (int64_t rank = start; rank < end; rank++) {
-                count += crossing.matches(
-                    rank, plan, weight.query);
-              }
-            }
+            plan.forEachRun(
+                (uint32_t)reader.valuesInBlock(blockNum),
+                [&](BlockRelation relation, uint32_t begin, uint32_t end) {
+                  if (relation == BlockRelation::INSIDE) {
+                    count += end - begin;
+                  } else if (relation == BlockRelation::CROSSES) {
+                    for (int64_t rank = start + begin; rank < start + end;
+                         rank++) {
+                      count += crossing.matches(rank, plan, weight.query);
+                    }
+                  }
+                });
           }
           return count;
         }
@@ -1187,27 +1321,7 @@ public:
         for (int32_t docRank = 0;
              docRank < reader.docsWithValue(); docRank++) {
           auto [start, end] = reader.getStartEndValueRank(docRank);
-          int64_t rank = start;
-          bool matched = false;
-          while (rank < end && !matched) {
-            int64_t blockNum = rank / IntColReader::BLOCK_SIZE;
-            int64_t blockEnd = std::min<int64_t>(
-                end, (blockNum + 1)
-                    * (int64_t)IntColReader::BLOCK_SIZE);
-            const BlockPlan& plan = plans[(size_t)blockNum];
-            if (plan.relation == BlockRelation::INSIDE) {
-              matched = true;
-            } else if (plan.relation == BlockRelation::CROSSES) {
-              while (rank < blockEnd && !matched) {
-                matched = crossing.matches(
-                    rank, plan, weight.query);
-                rank++;
-              }
-            } else {
-              rank = blockEnd;
-            }
-          }
-          count += matched;
+          count += anyValueMatches(plans, crossing, weight.query, start, end);
         }
         return count;
       }
@@ -1229,9 +1343,13 @@ public:
         if (points != nullptr) return;
         int64_t prunableValues = 0;
         for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
-          if (plans[(size_t)blockNum].relation != BlockRelation::CROSSES) {
-            prunableValues += reader.valuesInBlock(blockNum);
-          }
+          plans[(size_t)blockNum].forEachRun(
+              (uint32_t)reader.valuesInBlock(blockNum),
+              [&](BlockRelation relation, uint32_t begin, uint32_t end) {
+                if (relation != BlockRelation::CROSSES) {
+                  prunableValues += end - begin;
+                }
+              });
         }
         int64_t denominator = ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR;
         int64_t minPrunable = reader.numValues() / denominator
@@ -1430,15 +1548,11 @@ public:
         matchState = pointValueCount == 0
             ? Query::MatchState::EMPTY : Query::MatchState::NONEMPTY;
       } else {
-        plans = targetPool.make_span<BlockPlan>((size_t)reader->numBlocks());
-        for (int64_t i = 0; i < reader->numBlocks(); i++) {
-          plans[(size_t)i] = query.classifyBlock(reader->blockInfo(i), reader->blockZone(i));
-        }
+        plans = classifyBlocks(targetPool, *reader, query);
         cost = estimateCost(*reader, plans, query.isExactSet());
-        bool hasInside = false;
+        bool hasInside = hasInsideRun(*reader, plans);
         bool hasCrosses = false;
         for (const BlockPlan& plan : plans) {
-          hasInside |= plan.relation == BlockRelation::INSIDE;
           hasCrosses |= plan.relation == BlockRelation::CROSSES;
         }
         matchState = hasInside ? Query::MatchState::NONEMPTY
@@ -1499,11 +1613,7 @@ public:
       if (reader->getMax() < query.getLo() || query.getHi() < reader->getMin()) {
         return nullptr;
       }
-      auto plans = targetPool.make_span<BlockPlan>((size_t)reader->numBlocks());
-      for (int64_t i = 0; i < reader->numBlocks(); i++) {
-        plans[(size_t)i] = query.classifyBlock(
-            reader->blockInfo(i), reader->blockZone(i));
-      }
+      auto plans = classifyBlocks(targetPool, *reader, query);
       return targetPool.make<ZoneMapScorer>(
           targetPool, *reader, plans, query,
           segment.maxDoc(), constantScore);

@@ -11,6 +11,7 @@
 #include "BKDWriter.h"
 #include "PointsWriter.h"
 #include "StoredFieldsWriter.h"
+#include "StoredDictionaryRegistry.h"
 #include "luxir/reader/DocsEnum.h"
 #include "luxir/reader/PosEnum.h"
 #include "luxir/reader/NormsReader.h"
@@ -24,6 +25,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <exception>
 #include <functional>
 #include <limits>
@@ -308,6 +310,7 @@ class SegmentMerger {
       int32_t streams = 0;
       std::string name;
       std::vector<MergeFieldInfo> fields;
+      bool bootstrapStoredDictionary = false;
       std::function<void(MergeAdmissionDriver&, Batch&, BatchAdmission&)> body;
     };
 
@@ -554,6 +557,7 @@ class SegmentMerger {
   IndexRamBudget& ramBudget;
   // Current schema, for per-resource stored-fields formats.
   const Schema& schema;
+  StoredDictionaryRegistry& storedDictionaries;
   const uint64_t estimatedOutputBytes;
   const int32_t streamBudget;
   int64_t termPartitionMinBytes;
@@ -564,14 +568,20 @@ class SegmentMerger {
   std::vector<Segment> segs;
 public:
 
+  int32_t mapDocId(size_t sourceOrd, int32_t localDocId) const {
+    auto [docId, deleted] = segs[sourceOrd].remapDocId(localDocId);
+    return deleted ? -1 : docId;
+  }
+
 
 
   SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,
                 PostingsWriter& postingsWriter, IndexRamBudget& ramBudget,
                 int64_t termPartitionMinBytes, int64_t termPartitionMinRangeBytes,
-                int32_t termPartitionMaxRanges, const Schema& schema)
+                int32_t termPartitionMaxRanges, const Schema& schema,
+                StoredDictionaryRegistry& storedDictionaries)
   : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget),
-    schema(schema),
+    schema(schema), storedDictionaries(storedDictionaries),
     estimatedOutputBytes(estimateOutputBytes(preaders)),
     streamBudget(MergeCostModel::streamBudgetForBytes(estimatedOutputBytes)),
     termPartitionMinBytes(termPartitionMinBytes),
@@ -607,17 +617,9 @@ public:
       fieldReaders.emplace_back(*preader);
       FieldReader& fieldReader = fieldReaders.back();
 
-      // position fieldReader on first field and add to segs if it's non-empty
-      if (fieldReader.readNextField()) {
-        // Calculate number of live documents
-        int32_t numLive = segLiveDocs ? segLiveDocs->numLive() : preader->maxDoc();
-        
-        segs.emplace_back(preader, &fieldReader, numLive, totalLive, (int)segs.size());
-        MERGER_DEBUG("SegmentMerger: added segment to merge, base={}, numLive={}", totalLive, numLive);
-        totalLive += numLive; // Count only live documents for base offset
-      } else {
-        LOG_ERROR("Empty fieldReader!");
-      }
+      int32_t numLive = segLiveDocs ? segLiveDocs->numLive() : preader->maxDoc();
+      segs.emplace_back(preader, &fieldReader, numLive, totalLive, (int)i);
+      totalLive += numLive;
     }
     // Set maxDoc to total number of live documents
     postingsWriter.setMaxDoc(totalLive);
@@ -626,16 +628,22 @@ public:
                  totalLive, estimatedOutputBytes, streamBudget);
 
     // Now build the docId maps based on liveDocs, then release the liveDocs.
+    PostingsWriter::VersionRunsWriter versions(postingsWriter);
     for (size_t i = 0; i < segs.size(); i++) {
       auto& seg = segs[i];
-      buildDocIdMapping(seg, liveDocs[i], seg.remap);
+      buildDocIdMapping(seg, liveDocs[i], seg.remap, versions);
       // TODO: pass the actual liveDocs shared_ptr into the merger so we can release them.
     }
 
+    versions.finish();
+
     auto fnameComp = [](const Segment& a, const Segment& b){ return b.fieldReader->name() < a.fieldReader->name(); };
-    std::vector<Segment*> segPtrs(segs.size());
-    // IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs, false);
-    IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs);
+    std::vector<Segment*> segPtrs;
+    segPtrs.reserve(segs.size());
+    for (auto& seg : segs) {
+      if (seg.fieldReader->readNextField()) segPtrs.push_back(&seg);
+    }
+    IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segPtrs);
 
     std::vector<MergeAdmissionDriver::Batch> batches;
     while (fieldPQ.size() > 0) {
@@ -662,10 +670,18 @@ public:
       // we could bail early.
 
       batch.cost = estimateCost(batch.fields);
+      if (isStoredField(batch.fields[0].segFieldInfo)) {
+        auto format = storedFormat(batch.name);
+        batch.bootstrapStoredDictionary = format.codec == StoredChunkFormat::ZSTD && format.dictionaryBytes
+            && !storedDictionaries.hasDictionary(batch.name, format);
+        if (batch.bootstrapStoredDictionary) batch.cost += StoredChunkCompressor::dictionaryTrainingBytes(format);
+        std::string_view resource = batch.name;
+        Signal::emit("storedFieldsMergePlan", &resource, &batch.cost, &batch.bootstrapStoredDictionary);
+      }
       batch.streams = estimateStreams(batch.fields);
       batch.body = [this](MergeAdmissionDriver& driver, MergeAdmissionDriver::Batch& current,
                           MergeAdmissionDriver::BatchAdmission& admission) {
-        mergeField(current.fields, driver, admission);
+        mergeField(current, driver, admission);
       };
       batches.push_back(std::move(batch));
     }
@@ -806,9 +822,13 @@ private:
   // Helper to build mapping from old doc IDs to new doc IDs for a segment, accounting for deletes
   // Returns a vector where vector[oldDocId] = newDocId, or -1 if deleted.
   // This is still 0 based, so add the base in both cases.
-  void buildDocIdMapping(const Segment& seg, LiveDocs* liveDocs, std::vector<int32_t>& target) {
+  void buildDocIdMapping(const Segment& seg, LiveDocs* liveDocs, std::vector<int32_t>& target,
+                         PostingsWriter::VersionRunsWriter& versions) {
     if (liveDocs == nullptr) {
-      return; // no deletes, so nothing to do.
+      VersionRuns::Iterator runs(seg.postingsReader->versionRuns());
+      VersionRun run;
+      while (runs.next(run)) versions.add((uint32_t)seg.base + run.firstDocId, run.version);
+      return;
     }
     int32_t maxDoc = seg.postingsReader->maxDoc();
     assert(liveDocs->size() == maxDoc); // make sure this is the right liveDocs for the segment.
@@ -816,8 +836,21 @@ private:
     int32_t newDocId = 0;
     const FixedBitSet& bitset = liveDocs->bitset();
     
+    VersionRuns::Iterator runs(seg.postingsReader->versionRuns());
+    VersionRun current, next;
+    bool haveNext = runs.next(current) && runs.next(next);
+    bool emitted = false;
     for (int32_t oldDocId = 0; oldDocId < maxDoc; oldDocId++) {
+      if (haveNext && next.firstDocId == (uint32_t)oldDocId) {
+        current = next;
+        haveNext = runs.next(next);
+        emitted = false;
+      }
       if (bitset.get(oldDocId)) {
+        if (!emitted) {
+          versions.add((uint32_t)(seg.base + newDocId), current.version);
+          emitted = true;
+        }
         target[oldDocId] = newDocId++;
       } else {
         target[oldDocId] = -1; // Document is deleted
@@ -1415,9 +1448,10 @@ private:
     }
   };
 
-  void mergeField(std::vector<MergeFieldInfo>& mergeFieldInfos,
+  void mergeField(MergeAdmissionDriver::Batch& batch,
                   MergeAdmissionDriver& admissionDriver,
                   MergeAdmissionDriver::BatchAdmission& admission) {
+    auto& mergeFieldInfos = batch.fields;
     int32_t nDocs = postingsWriter.getMaxDoc();
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
@@ -1429,7 +1463,7 @@ private:
     const auto& firstInfo = mergeFieldInfos[0].segFieldInfo;
     if (firstInfo.type == FieldType::BIN
         && (firstInfo.flags & FieldType::STORED) != 0) {
-      mergeStoredFields(mergeFieldInfos);
+      mergeStoredFields(mergeFieldInfos, batch.bootstrapStoredDictionary);
       return;
     }
 
@@ -1548,7 +1582,7 @@ private:
       // int column that is not an ord column (assume all other field types have this (currently true)
       std::vector<BKDWriter::Point> geoPoints;
       bool rebuildGeo = hasGeoPoints(type, allFlags);
-      mergeIntCol2(sortedFields, postingsWriter, outputFieldInfo,
+      mergeIntCol(sortedFields, postingsWriter, outputFieldInfo,
                    rebuildGeo ? &geoPoints : nullptr);
       if (rebuildGeo) {
         if (!geoPoints.empty()) {
@@ -1573,14 +1607,102 @@ private:
     return type ? type->format_ : StoredChunkFormat{};
   }
 
+  std::vector<char> sampleStoredFields(std::span<const PostingsReader::Field* const> fields,
+                                       size_t budget) {
+    uint64_t chunks = 0;
+    for (auto* field : fields) if (field) chunks += (uint64_t)field->numValues;
+    std::vector<char> samples;
+    if (!chunks) return samples;
+    samples.reserve(budget);
+    std::unique_ptr<StoredFieldsReader> reader;
+    int source = -1;
+    // Bit-reversed order visits 0, half, quarter, three quarters, ... across
+    // the concatenated chunk ordinals. Skip excess ordinals for non-powers of
+    // two. This spreads the sample without a per-chunk permutation/directory.
+    uint64_t limit = std::bit_ceil(chunks);
+    uint64_t position = 0;
+    for (uint64_t visited = 0; visited < limit && samples.size() < budget; visited++) {
+      if (position < chunks) {
+        uint64_t chunk = position;
+        for (auto& seg : segs) {
+          auto* field = fields[seg.ord];
+          if (!field) continue;
+          if (chunk >= (uint64_t)field->numValues) {
+            chunk -= (uint64_t)field->numValues;
+            continue;
+          }
+          if (source != seg.ord) {
+            reader = std::make_unique<StoredFieldsReader>(*seg.postingsReader, *field);
+            source = seg.ord;
+          }
+          reader->readChunkDocs((int32_t)chunk, [&](int32_t doc, std::string_view encoded) {
+            if (seg.remapDocId(doc).second || encoded.empty() || encoded[0] == 0) return true;
+            size_t bytes = std::min(encoded.size(), budget - samples.size());
+            samples.insert(samples.end(), encoded.data(), encoded.data() + bytes);
+            return samples.size() < budget;
+          });
+          break;
+        }
+      }
+      uint64_t bit = limit >> 1;
+      while (position & bit) { position ^= bit; bit >>= 1; }
+      position ^= bit;
+    }
+    return samples;
+  }
+
+  std::shared_ptr<const StoredCompressionDictionary> storedDictionary(
+      std::string_view resource, const StoredChunkFormat& format,
+      std::span<const PostingsReader::Field* const> fields, bool bootstrap) {
+    auto dictionary = storedDictionaries.lookup(resource, format);
+    if (!bootstrap || dictionary) return dictionary;
+    auto token = storedDictionaries.token(resource, format);
+    if (!token) return {};
+    size_t budget = StoredChunkCompressor::dictionarySampleBudget(format);
+    auto samples = sampleStoredFields(fields, budget);
+    // Group encoded bytes into bounded training blocks. Document boundaries
+    // need no side array, even when millions of tiny docs fill the budget.
+    std::vector<size_t> sizes;
+    if (samples.size() == budget) {
+      size_t block = std::max(StoredChunkCompressor::DICTIONARY_SAMPLE_BYTES,
+          (samples.size() + StoredChunkCompressor::MAX_DICTIONARY_SAMPLES - 1)
+              / StoredChunkCompressor::MAX_DICTIONARY_SAMPLES);
+      sizes.reserve((samples.size() + block - 1) / block);
+      for (size_t offset = 0; offset < samples.size(); offset += block) {
+        sizes.push_back(std::min(block, samples.size() - offset));
+      }
+    }
+    std::string_view sample(samples.data(), samples.size());
+    std::span<const size_t> sampleSizes(sizes);
+    Signal::emit("storedFieldsDictionarySample", &resource, &sample, &sampleSizes);
+    if (!sizes.empty() && !storedDictionaries.hasDictionary(resource, format)) {
+      auto current = storedDictionaries.token(resource, format);
+      if (current && current->epoch == token->epoch) {
+        size_t capacity = std::max((size_t)1024,
+            std::min((size_t)format.dictionaryBytes, samples.size() / 100));
+        auto trained = StoredChunkCompressor::trainDictionary(sample, sizes, capacity);
+        std::string_view bytes(trained);
+        Signal::emit("storedFieldsDictionaryTrained", &resource, &bytes);
+        if (!trained.empty()) {
+          storedDictionaries.publish(resource, *token,
+              std::make_shared<const StoredDictionary>(std::move(trained)));
+        }
+      }
+    }
+    return storedDictionaries.lookup(resource, format);
+  }
+
   // Merge one stored-fields resource (default or named column family).
   // Writes a fresh StoredFieldsWriter for the same resource name in the
-  // resource's current format.  Sources in that same layout are copied as
-  // compressed chunks; the rest are decompressed and their live docs re-added
-  // in merged-docID order, which converts them to the output codec and chunk
-  // size.  Multi-valued fields are preserved as single addValues calls so the
-  // on-disk grouping survives the merge.
-  void mergeStoredFields(std::vector<MergeFieldInfo>& mergeFieldInfos) {
+  // resource's current format. Sources in that layout within the dirt threshold
+  // can be copied as compressed chunks; the rest have their live docs re-added
+  // in merged-docID order. Adopt the largest eligible chunk region's field table
+  // first so earlier re-added fields cannot prevent its copy. Re-added docs pack
+  // together, but a copy boundary can seal another partial chunk. Each partial
+  // chunk a merge leaves costs about 100 chunks of later recompression when its
+  // segment crosses 1%; this is an amortization rule, not an output invariant.
+  // Multi-valued fields keep their grouping through single addValues calls.
+  void mergeStoredFields(std::vector<MergeFieldInfo>& mergeFieldInfos, bool bootstrap) {
     // Resource name comes from the (identical across segments) field name.
     std::string_view resourceName(mergeFieldInfos[0].segFieldInfo.fieldname);
 
@@ -1588,16 +1710,39 @@ private:
     // segments whose source had no stored-fields resource.  Readers are opened
     // one source segment at a time below so decompressed chunk scratch does not
     // accumulate across sources.
-    std::vector<const SegFieldInfo*> fieldInfos(segs.size());
+    std::vector<const PostingsReader::Field*> fieldInfos(segs.size());
     for (auto& mfi : mergeFieldInfos) {
-      fieldInfos[mfi.seg->ord] = &mfi.segFieldInfo;
+      fieldInfos[mfi.seg->ord] = mfi.seg->postingsReader->fieldInfo(resourceName);
     }
 
-    StoredFieldsWriter writer(postingsWriter, resourceName, storedFormat(resourceName));
+    auto format = storedFormat(resourceName);
+    StoredFieldsWriter writer(postingsWriter, resourceName, format,
+                              storedDictionary(resourceName, format, fieldInfos, bootstrap));
     std::vector<int64_t> srcChunkFirstDocs, srcChunkOffsets;
 
+    auto copyable = [&](Segment& seg, const StoredFieldsReader& reader) {
+      return !seg.hasDeletes() && reader.format().sameLayout(writer.format())
+          && !StoredFieldsWriter::tooDirty(reader.numChunks(), reader.numDirtyChunks());
+    };
+    int bestSource = -1;
+    int64_t bestBytes = 0;
     for (auto& seg : segs) {
-      const SegFieldInfo* fieldInfo = fieldInfos[seg.ord];
+      const auto* fieldInfo = fieldInfos[seg.ord];
+      if (!fieldInfo) continue;
+      StoredFieldsReader reader(*seg.postingsReader, *fieldInfo);
+      if (copyable(seg, reader) && writer.canCopyChunks(reader.format(), reader.dictionary())
+          && reader.chunkRegionBytes() > bestBytes) {
+        bestSource = seg.ord;
+        bestBytes = reader.chunkRegionBytes();
+      }
+    }
+    if (bestSource >= 0) {
+      StoredFieldsReader reader(*segs[bestSource].postingsReader, *fieldInfos[bestSource]);
+      writer.adoptFieldTable(reader.fieldNames());  // writer's table is still empty
+    }
+
+    for (auto& seg : segs) {
+      const auto* fieldInfo = fieldInfos[seg.ord];
       if (!fieldInfo) continue;  // segment had no stored-fields; writer pads automatically
       StoredFieldsReader reader(*seg.postingsReader, *fieldInfo);
 
@@ -1606,17 +1751,23 @@ private:
       // so the whole source region is copied without decompression - the
       // dominant cost of a large merge is otherwise this resource's serial
       // recompression.  The source must have the output's codec and chunk
-      // limits, and bodies reference its field-id table, so it must adopt
-      // into ours; deletions, another layout or a table mismatch fall back to
-      // the doc-by-doc re-add below.
-      if (!seg.hasDeletes() && reader.format().sameLayout(writer.format())
-          && writer.adoptFieldTable(reader.fieldNames())) {
+      // limits, the same dictionary and few enough dirty (partially filled)
+      // chunks, and bodies reference its field-id table, so it must adopt into
+      // ours; deletions, another layout or dictionary, too many dirty chunks or
+      // a table mismatch fall back to the doc-by-doc re-add below, which packs
+      // these docs with adjacent re-added sources.
+      bool copy = copyable(seg, reader) && writer.canCopyChunks(reader.format(), reader.dictionary())
+          && writer.adoptFieldTable(reader.fieldNames());
+      // Test seam: resource name, source ordinal, and copy versus re-add.
+      Signal::emit("storedFieldsMergeSource", &resourceName, &seg.ord, &copy);
+      if (copy) {
         writer.alignForRawAppend(seg.base);
         reader.readChunkDirectory(srcChunkFirstDocs, srcChunkOffsets);
         writer.appendRawChunkRegion(seg.base, reader.chunkRegionPtr(),
                                     reader.chunkRegionBytes(),
                                     srcChunkFirstDocs, srcChunkOffsets,
-                                    reader.maxDoc(), reader.maxChunkBytes());
+                                    reader.maxDoc(), reader.maxChunkBytes(),
+                                    reader.numDirtyChunks());
         continue;
       }
 
@@ -1637,85 +1788,6 @@ private:
 
     writer.finish(postingsWriter.getMaxDoc());
   }
-
-  void mergeIntCol(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
-                   PostingsWriter::IndexFieldInfo& outputFieldInfo) {
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    auto& pool = poolGuard.pool();
-
-    auto outputPtr = postingsWriter.getOutputStream();
-    IntColWriter intColWriter(*outputPtr);
-
-    // currently all values must be written before all docs - TODO FIXME - is this still true??
-    for (auto* field : sortedFields) {
-      auto baseId = (int32_t)field->seg->base;
-      unused(baseId);
-
-      IntColReader reader(*field->seg->postingsReader, field->segFieldInfo);
-      IntColReader::BulkValues values(reader);
-
-
-      // int32_t highest = field->seg->postingsReader->numDocs();
-      for (;;) {
-        auto index = values.next();
-        if (index == IntColReader::ENDINDEX) {
-          break;
-        }
-        int64_t val = values.value();
-        intColWriter.addInt64(val);
-      }
-    }
-
-    bool full = false; // TODO: calculate if this column is dense!
-
-    if (!full) {
-      DocsWithValWriter docsWriter(pool, postingsWriter, outputFieldInfo);
-      for (auto* field : sortedFields) {
-        auto baseId = (int32_t)field->seg->base;
-
-        IntColReader reader(*field->seg->postingsReader, field->segFieldInfo);
-        IntColReader::Iterator colIter(reader);
-
-        [[maybe_unused]] int32_t highest = field->seg->postingsReader->maxDoc();
-        for (;;) {
-          int32_t localId = colIter.next();
-          if (localId == IntColReader::ENDDOC) {
-            break;
-          }
-          assert(localId < highest);
-          docsWriter.startDoc(baseId + localId);
-        }
-      }
-      docsWriter.finish();
-    }
-
-
-    intColWriter.finish(outputFieldInfo);
-    if (outputFieldInfo.flags & FieldType::MULTI_VALUED) {
-      auto guard = pool.rewindScopeGuard();
-      OutputStreamPtr out = postingsWriter.getOutputStream();
-      MonoWriter endValueRankWriter(pool, *out);
-      int64_t endValueRankBase = 0;
-
-      for (auto* field : sortedFields) {
-        assert(field->segFieldInfo.flags & FieldType::MULTI_VALUED);
-        // open IntColReader for each segment
-        IntColReader reader( *field->seg->postingsReader, field->segFieldInfo);
-        MonoReader* endValueRankReader = reader.getEndValueRankReader();
-        assert(endValueRankReader != nullptr);
-        int64_t endValueRank;
-        for (int i = 0; i < endValueRankReader->numValues(); i++) {
-          endValueRank = endValueRankBase + endValueRankReader->valueAt(i);
-          endValueRankWriter.addInt64(endValueRank);
-        }
-        endValueRankBase = endValueRank;
-      }
-      endValueRankWriter.finish();
-      outputFieldInfo.monoLoc = endValueRankWriter.blockLoc;
-      outputFieldInfo.monoMetaOff = endValueRankWriter.metaOff;
-    }
-  }
-
 
   // Merges non-indexed string/binary columns written by StrColHandler.
   // Rebuilds the concatenated byte stream, the per-value endOffsetReader (if values are
@@ -1977,10 +2049,14 @@ private:
     outputFieldInfo.pointsMetaOff = data.pointsMetaOff;
   }
 
-  void mergeIntCol2(std::span<MergeFieldInfo*> sortedFields,
-                    PostingsWriter& postingsWriter,
-                    PostingsWriter::IndexFieldInfo& outputFieldInfo,
-                    std::vector<BKDWriter::Point>* geoPoints) {
+  // Merges int64 columns. The output is dense (no docs-with-field bitset, so
+  // value rank == doc id for single-valued readers) whenever every surviving
+  // doc has a value: all sources dense and present, or a sparse source whose
+  // docs without a value were all deleted.
+  void mergeIntCol(std::span<MergeFieldInfo*> sortedFields,
+                   PostingsWriter& postingsWriter,
+                   PostingsWriter::IndexFieldInfo& outputFieldInfo,
+                   std::vector<BKDWriter::Point>* geoPoints) {
     assert(sortedFields.size() == segs.size());  // expect non-compacted fields to make the code a little simpler.
 
     auto poolGuard = MemPool::threadLocalPoolGuard();

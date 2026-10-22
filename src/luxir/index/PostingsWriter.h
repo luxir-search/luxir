@@ -21,6 +21,7 @@
 #include <vector>
 #include "luxir/index/TrieBuilder.h"
 #include "luxir/index/IndexRamBudget.h"
+#include "luxir/index/IdRange.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/store/OutputStream.h"
@@ -33,6 +34,7 @@
 #include "luxir/util/screaming.h"
 #include "luxir/util/Signal.h"
 #include "LiveDocsWriter.h"
+#include "VersionRunBuilder.h"
 
 
 namespace luxir {
@@ -60,10 +62,18 @@ public:
   struct IndexFieldInfo : public SegFieldInfo {
   };
 
+  // The id field's bounds, captured when its dictionary is finalized. Absent
+  // when no finalized dictionary was written for it; callers then derive them.
+  std::optional<IdRange> idRange;
+
 private:
   Directory& directory;
   int32_t maxDoc;  // set by caller
   int64_t sizeInBytes = 0; // total size of all files written
+  // Immutable request births, referenced from segment metadata rather than a field.
+  seg_location versionRunsLoc;
+  uint32_t versionRunCount = 0;
+  bool finished = false;
 
   // Files available for use, sorted so largest are at the back. Reusing the
   // largest keeps residual streams small enough to fold into file 0 at finish.
@@ -214,6 +224,54 @@ public:
 
   typedef std::unique_ptr<OutputStream, OutputStreamDeleter> OutputStreamPtr;
 
+  void writeVersionRuns(const VersionRunBuilder& builder) {
+    if (!maxDoc) return;
+    auto stream = getOutputStream();
+    VersionRunsOutput output(*stream, (uint32_t)((builder.size() + VersionRuns::BLOCK_SIZE - 1) / VersionRuns::BLOCK_SIZE));
+    versionRunCount = builder.finish(output, (uint32_t)maxDoc);
+    versionRunsLoc = output.finish(versionRunCount);
+  }
+
+  class VersionRunsWriter {
+    PostingsWriter& writer;
+    OutputStreamPtr stream;
+    std::optional<VersionRunsOutput> output;
+    VersionRunBuilder builder;
+    uint32_t lastStart = 0;
+    bool added = false;
+
+    VersionRunsOutput& target() {
+      if (!output) {
+        stream = writer.getOutputStream();
+        output.emplace(*stream);
+      }
+      return *output;
+    }
+
+  public:
+    explicit VersionRunsWriter(PostingsWriter& writer) : writer(writer),
+        builder([this](std::span<const char> block, uint32_t first) { target().add(block, first); }) {}
+    VersionRunsWriter(VersionRunsWriter&&) = delete;
+
+    void add(uint32_t firstDocId, uint64_t version) {
+      if (added ? firstDocId <= lastStart : firstDocId != 0) {
+        throw std::runtime_error("Request-version runs must start at zero and increase");
+      }
+      builder.add(firstDocId, version);
+      lastStart = firstDocId;
+      added = true;
+    }
+
+    void finish() {
+      if (added) {
+        writer.versionRunCount = builder.finish(target(), (uint32_t)writer.maxDoc);
+        writer.versionRunsLoc = target().finish(writer.versionRunCount);
+      }
+      output.reset();
+      stream.reset();
+    }
+  };
+
   // Thread-safe.  A checked-out stream is exclusively owned until released.
   OutputStreamPtr getOutputStream() {
     return std::move(getOutputStreams<1>()[0]);
@@ -269,8 +327,12 @@ public:
   // If filenames is non-null, appends the names of files written (for fsync at commit time).
   bool finish(std::vector<std::string>* filenames = nullptr, std::vector<FileDescriptor>* descriptors = nullptr) {
 
-    if (fieldInfos.empty()) {
+    if (finished || (fieldInfos.empty() && maxDoc <= 0)) {
       return false;  // already called, or no data added.
+    }
+
+    if (maxDoc > 0 && (versionRunsLoc.isNull() || versionRunCount == 0)) {
+      throw std::runtime_error("Segment has no request birth versions");
     }
 
     // make sure we have at least one file
@@ -313,6 +375,7 @@ public:
       }
     }
 
+    finished = true;
     freeFiles.clear();
     fieldInfos.resize(0);
     files.resize(0);
@@ -365,6 +428,7 @@ private:
     // appended like any other stream (the reader must be able to open the
     // location's file even to read zero bytes).
     std::vector<bool> referenced(files.size(), false);
+    if (!versionRunsLoc.isNull()) referenced[versionRunsLoc.filenum()] = true;
     for (auto& fieldInfo : fieldInfos) {
       fieldInfo.relocateLocations([&](seg_location location) {
         if (location.filenum() < referenced.size()) {
@@ -411,6 +475,7 @@ private:
     for (auto& fieldInfo : fieldInfos) {
       fieldInfo.relocateLocations(relocate);
     }
+    if (!versionRunsLoc.isNull()) versionRunsLoc = relocate(versionRunsLoc);
 
     std::vector<uint32_t> survivors;
     survivors.reserve(files.size());
@@ -432,6 +497,8 @@ private:
     // object-store copy.  Readers keep a filenum-indexed table with holes.
     out.writeVint((uint32_t) survivorFileNums.size());
     for (uint32_t fileNum : survivorFileNums) out.writeVint(fileNum);
+    out.writeVal(versionRunsLoc);
+    out.writeVint(versionRunCount);
     auto segInfoSize = out.size() - outStart;
     out.writeInt(segInfoSize);
   }
@@ -1771,6 +1838,10 @@ public:
 
   void finalizeField(RangeResult&& result) {
     assert(buildTrie);
+
+    if ((std::string_view)fieldInfo->fieldname == "id") {
+      postingsWriter.idRange = IdRange{std::move(result.firstTerm), std::move(result.lastTerm), result.nTerms == 0};
+    }
 
     // write index into the blocks of the terms dict
     // TODO: use a more efficient encoding for this array

@@ -8,6 +8,7 @@
 #include "luxir/util/DateTime.h"
 #include "luxir/util/StrRef.h"
 
+#include <cassert>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -169,6 +170,12 @@ public:
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
 
+  // Same conversion, returning nullopt only for an uncoercible value.
+  // Unsupported column types still throw.
+  virtual std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
   // Term/text bytes for term-backed fields (TEXT/STRING/ID).  Numeric and
   // bool arms render canonically into buf (>= coerce::TEXT_BUF_SIZE bytes)
   // and return a view of it; string/bytes arms pass through as views of the
@@ -226,6 +233,10 @@ public:
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 // FLOAT and DOUBLE fields store Lucene-style sortable bits in the standard
@@ -240,6 +251,10 @@ public:
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 class DoubleFieldType : public FieldType {
@@ -248,6 +263,10 @@ public:
   }
 
   int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+
+  std::optional<int64_t> tryCoerceColInt64(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 };
@@ -266,6 +285,10 @@ public:
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 
+  std::optional<int64_t> tryCoerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
+
   // The [lo, hiExclusive) epoch-millis window a query-side date literal
   // denotes at its own granularity: "2024-06-25" is the whole day, "2024-06"
   // the month, epoch millis a single instant.  Queries match/round by the
@@ -273,6 +296,9 @@ public:
   DateRange coerceDateRange(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
+
+  std::optional<DateRange> tryCoerceDateRange(
+      const api::Val& val, const CoerceContext& context = {}) const;
 };
 
 class GeoPointFieldType : public FieldType {
@@ -292,10 +318,37 @@ public:
                               std::span<char> buf) const override;
 };
 
+// Resolved ANN overlay settings of a vector field (api::VectorAnnDef with
+// defaults applied: PQ unless explicitly selected otherwise). Build-time
+// parameters are recorded in each overlay's VectorAuxMeta, so a change only
+// affects overlays built afterwards;
+// rabitqQueryBits is a search-time parameter read from the current schema.
+struct VectorAnnConfig {
+  enum Codec {
+    RABITQ = 0,
+    PQ = 1,
+  };
+  static constexpr int32_t DEFAULT_RABITQ_BITS = 1;
+  static constexpr int32_t DEFAULT_RABITQ_QUERY_BITS = 4;
+  static constexpr int32_t DEFAULT_PQ_BITS = 8;
+
+  Codec codec = PQ;
+  int32_t nlist = 0;  // 0 = sqrt(segment vectors), capped
+  int32_t rabitqBits = DEFAULT_RABITQ_BITS;
+  int32_t rabitqQueryBits = DEFAULT_RABITQ_QUERY_BITS;
+  int32_t pqM = 0;    // 0 = derived from dims
+  int32_t pqBits = DEFAULT_PQ_BITS;
+};
+
 // Dense float vector field.  Values are stored as fixed-size byte blobs
-// through the standard binary-column path (see VectorHandler).  dims_ may be
-// 0, in which case the first indexed value in a segment fixes the segment's
-// per-vector size; a positive dims_ enforces validation at index time.
+// through the standard binary-column path (see VectorHandler).  inputDims_ may
+// be 0, in which case the first indexed value in a segment fixes the segment's
+// per-vector size; a positive inputDims_ enforces validation at index time.
+//
+// truncateDims_ > 0 keeps only the first truncateDims_ components of every
+// indexed and query vector (Matryoshka embeddings).  storedDims() is the
+// dimension the column, ANN overlays and kNN scoring see; inputDims() is the
+// declared dimension of the full vectors clients send.
 //
 // metric_ controls whether the field is searchable by kNN / ANN.  NONE means
 // storage-only; L2 / IP / COSINE pick the similarity metric for exact column
@@ -309,7 +362,11 @@ public:
     METRIC_COSINE = 3,
   };
 
-  int32_t dims_;
+  // Squared norm at or below which a cosine vector has no direction.
+  static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
+
+  int32_t inputDims_;
+  int32_t truncateDims_;
   Metric metric_;
   // Caller asserts incoming vectors are unit-norm.  COSINE write and aux-build
   // paths trust the bytes as-is.  Ignored for non-COSINE metrics.
@@ -317,32 +374,50 @@ public:
   // COSINE fields normalize vectors before column storage by default.  Ignored
   // for non-COSINE metrics.
   bool normalizeOnWrite_;
+  // ANN overlay codec and parameters (schema "ann").
+  VectorAnnConfig ann_;
 
   VectorFieldType(std::string_view name, int32_t dims = 0,
                   int flags = COLUMN_STORED | FIXED_SIZE,
                   Metric metric = METRIC_NONE,
                   bool normalized = false,
-                  bool normalizeOnWrite = true)
+                  bool normalizeOnWrite = true,
+                  VectorAnnConfig ann = {},
+                  int32_t truncateDims = 0)
     : FieldType(name, FieldType::VECTOR, flags),
-      dims_(dims),
+      inputDims_(dims),
+      truncateDims_(truncateDims),
       metric_(metric),
       normalized_(normalized),
-      normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized) {
+      normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized),
+      ann_(ann) {
+    assert(truncateDims == 0 || (truncateDims > 0 && truncateDims < dims));
   }
 
-  int32_t dims() const { return dims_; }
+  // Stored dimension (0 = inferred per segment).
+  int32_t storedDims() const { return truncateDims_ > 0 ? truncateDims_ : inputDims_; }
+  int32_t inputDims() const { return inputDims_; }
+  int32_t truncateDims() const { return truncateDims_; }
   Metric metric() const { return metric_; }
   bool normalized() const { return normalized_; }
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
+  const VectorAnnConfig& ann() const { return ann_; }
+
+  // The contract for every indexed and query vector: inputDims() components
+  // (or truncateDims() for an already truncated vector), all finite.  Returns
+  // the error text, or empty when vec is valid.  A valid vec is stored and
+  // searched as its first storedSize(vec.size()) components.
+  std::string inputError(std::span<const float> vec) const;
+  size_t storedSize(size_t n) const { return truncateDims_ > 0 ? (size_t)truncateDims_ : n; }
 
   // True iff this field supports kNN / ANN search.  Exact flat search can run
   // directly over the column; real ANN engines may also build aux artifacts.
   bool knnSearchable() const { return metric_ != METRIC_NONE; }
 };
 
-// How a stored-fields resource compresses its chunks.  codec and the two chunk
-// limits are recorded in each segment's resource metadata; the level only
-// affects compression.
+// How a stored-fields resource compresses its chunks.  codec, the two chunk
+// limits are recorded in each segment's resource metadata. The level affects
+// compression, and dictionary capacity is schema training policy.
 struct StoredChunkFormat {
   // Recorded on disk as one byte.
   enum Codec : uint8_t { LZ4 = 0, ZSTD = 1 };
@@ -353,6 +428,7 @@ struct StoredChunkFormat {
   // cost for larger chunks.
   static constexpr uint32_t DEFAULT_ZSTD_CHUNK_TARGET = 64 * 1024;
   static constexpr uint32_t DEFAULT_ZSTD_MAX_DOCS_PER_CHUNK = 1024;
+  static constexpr uint32_t DEFAULT_DICTIONARY_BYTES = 64 * 1024;
 
   Codec codec = LZ4;
   int zstdLevel = DEFAULT_ZSTD_LEVEL;
@@ -361,9 +437,12 @@ struct StoredChunkFormat {
   // Hard cap on docs per chunk.  A chunk flushes when *either* the byte
   // target or this doc count is reached, whichever comes first.
   uint32_t maxDocsPerChunk = DEFAULT_MAX_DOCS_PER_CHUNK;
+  // ZSTD only: dictionary training capacity; 0 disables dictionaries.
+  uint32_t dictionaryBytes = 0;
 
   // Same chunk bytes and boundaries: compressed chunks of one format can be
-  // copied verbatim into a writer of the other.  The level is not part of it.
+  // copied verbatim into a writer of the other, provided both segments hold
+  // the same trained dictionary.  The level is not part of it.
   bool sameLayout(const StoredChunkFormat& o) const {
     return codec == o.codec && chunkTarget == o.chunkTarget && maxDocsPerChunk == o.maxDocsPerChunk;
   }

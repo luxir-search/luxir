@@ -8,6 +8,7 @@
 #include "luxir/reader/PosEnum.h"
 #include "gtest/gtest.h"
 #include "test/LuxirTest.h"
+#include "test/TestUtils.h"
 #include<boost/container/static_vector.hpp>
 
 #include "luxir/index/IntColWriter.h"
@@ -57,6 +58,7 @@ protected:
   }
 
   void initReader() {
+    luxir::test::writeUnversionedRuns(*postingsWriter);
     postingsWriter->finish();
 
     reader = std::make_unique<PostingsReader>(dir, 0);
@@ -303,6 +305,7 @@ TEST_F(PostingsTest, basic) {
     writer.endField();
   }
 
+  luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
 
@@ -400,6 +403,7 @@ TEST_F(PostingsTest, levelLadder) {
       }
       writer.endField();
     }
+    luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
 
     PostingsReader reader(dir, 0);
@@ -580,6 +584,7 @@ TEST_F(PostingsTest, blockPositions) {
     writer.endTerm(term1);
     writer.endField();
   }
+  luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
   PostingsReader reader(dir, 0);
@@ -659,6 +664,7 @@ TEST_F(PostingsTest, blockTerms) {
     }
     writer.endField();
   }
+  luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
   PostingsReader reader(dir, 0);
 
@@ -723,6 +729,7 @@ TEST_F(PostingsTest, seekForward) {
     }
     writer.endField();
   }
+  luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
   PostingsReader reader(dir, 0);
@@ -907,6 +914,7 @@ TEST_F(PostingsTest, seekForwardNumericIds) {
     }
     writer.endField();
   }
+  luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
   PostingsReader reader(dir, 0);
@@ -1001,6 +1009,7 @@ TEST_F(PostingsTest, seekForwardRandom) {
       }
       writer.endField();
     }
+    luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
 
     PostingsReader reader(dir, 0);
@@ -1170,6 +1179,7 @@ TEST_F(PostingsTest, intCol) {
       docsWriter.finish();
     }
 
+    luxir::test::writeUnversionedRuns(writer);
     writer.finish();
   }
 

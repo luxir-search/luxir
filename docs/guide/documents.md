@@ -101,7 +101,7 @@ POST /collections/authors/_search
   "fields": ["title_t", "author_name"],
   "sort": "id",
   "limit": 3,
-  "get_number": true,
+  "count_limit": -1,
   "ops": {
     "authors": {
       "field_facet": {
@@ -178,8 +178,15 @@ are known to be new and unique, see
 
 An ID is not required. A document with an absent or null ID can be searched,
 but it cannot be overwritten or deleted by ID and has no useful external
-identity.  `_version_` is reserved for internal overwrite ordering and is not
-an application field.
+identity.
+
+`_version_` is the update version of the request that indexed the document,
+including `allow_dups` and documents without an ID. It is assigned by the engine
+and is retrieval-only: name it explicitly in the returned fields (`fl`) to read
+it. Sorting, filtering, faceting, functions, collapse and value statistics on
+`_version_` are not supported. Default and wildcard projections exclude it.
+Documents that supply it, directly or through field mapping, are rejected
+with a document error. Optimistic concurrency is not supported.
 
 ## Multi-valued fields
 

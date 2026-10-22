@@ -171,7 +171,7 @@ TEST_F(StrColTest, multiValued) {
     ASSERT_EQ(0, f.nextDoc());
     std::vector<int64_t> ords;
     f.ords(ords);
-    ASSERT_EQ(ords, vec(1l, 2l));
+    ASSERT_EQ(ords, vec_i(1, 2));
     ASSERT_EQ(-1, f.nextDoc());
   }
 
@@ -187,7 +187,7 @@ TEST_F(StrColTest, multiValued) {
     ASSERT_EQ(1, f.nextDoc());
     std::vector<int64_t> ords;
     f.ords(ords);
-    ASSERT_EQ(ords, vec(1l, 2l));
+    ASSERT_EQ(ords, vec_i(1, 2));
     ASSERT_EQ(-1, f.nextDoc());
   }
 
@@ -204,13 +204,13 @@ TEST_F(StrColTest, multiValued) {
     ASSERT_EQ(5, f.nextDoc());
     std::vector<int64_t> ords;
     f.ords(ords);
-    ASSERT_EQ(ords, vec(1l, 2l));
+    ASSERT_EQ(ords, vec_i(1, 2));
     ASSERT_EQ(10, f.nextDoc());
     f.ords(ords);
-    ASSERT_EQ(ords, vec(3l));
+    ASSERT_EQ(ords, vec_i(3));
     ASSERT_EQ(15, f.nextDoc());
     f.ords(ords);
-    ASSERT_EQ(ords, vec(1l, 2l, 3l));
+    ASSERT_EQ(ords, vec_i(1, 2, 3));
     ASSERT_EQ(-1, f.nextDoc());
   }
 
@@ -232,16 +232,16 @@ TEST_F(StrColTest, multiValued) {
     std::vector<int64_t> ords;
     ASSERT_EQ(0, f.nextDoc());
     f.ords(ords);
-    ASSERT_EQ(ords, vec(1l));
+    ASSERT_EQ(ords, vec_i(1));
     ASSERT_EQ(1, f.nextDoc());
     f.ords(ords);
-    ASSERT_EQ(ords, vec(3l));
+    ASSERT_EQ(ords, vec_i(3));
     ASSERT_EQ(2, f.nextDoc());
     f.ords(ords);
-    ASSERT_EQ(ords, vec(1l, 2l, 3l));
+    ASSERT_EQ(ords, vec_i(1, 2, 3));
     ASSERT_EQ(3, f.nextDoc());
     f.ords(ords);
-    ASSERT_EQ(ords, vec(2l));
+    ASSERT_EQ(ords, vec_i(2));
     ASSERT_EQ(-1, f.nextDoc());
   }
 }
@@ -305,15 +305,15 @@ TEST_F(StrColTest, deleteAndMergeMultiValued) {
   
   ASSERT_EQ(5, f.nextDoc());
   f.ords(ords);
-  ASSERT_EQ(ords, vec(4l, 6l));  // "hello"=4, "world"=6
+  ASSERT_EQ(ords, vec_i(4, 6));  // "hello"=4, "world"=6
   
   ASSERT_EQ(10, f.nextDoc());  // renumbered from 11
   f.ords(ords);
-  ASSERT_EQ(ords, vec(3l, 5l));  // "final"=3, "string"=5
+  ASSERT_EQ(ords, vec_i(3, 5));  // "final"=3, "string"=5
   
   ASSERT_EQ(11, f.nextDoc());  // renumbered from 0 in second segment
   f.ords(ords);
-  ASSERT_EQ(ords, vec(1l, 2l));  // "apple"=1, "banana"=2
+  ASSERT_EQ(ords, vec_i(1, 2));  // "apple"=1, "banana"=2
   
   ASSERT_EQ(-1, f.nextDoc());
 }
@@ -726,7 +726,7 @@ TEST_F(StrColTest, BasicMultiValuedColumnStoredStrings) {
   // Search and retrieve the _ssc field
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q")
-      .getNumber()
+      .countLimit()
       .limit(10)
       .allQuery()
       // Request fields including the multi-valued column-stored field
@@ -798,7 +798,7 @@ TEST_F(StrColTest, EmptyAndMissingValues) {
   // Search and retrieve
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q")
-      .getNumber()
+      .countLimit()
       .limit(10)
       .allQuery()
       .fields({"id_s", "tags_ssc"});
@@ -883,7 +883,7 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
   // Verify we can still read the values correctly
   auto req = localReq(luxirNode->getSearchEngine());
   req->collection("main").topDocs("q")
-      .getNumber()
+      .countLimit()
       .limit(10)
       .allQuery()
       .fields({"id_s", "uniform_ssc"});

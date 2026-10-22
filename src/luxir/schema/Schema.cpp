@@ -12,6 +12,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <cstddef>
 #include <span>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -51,12 +52,16 @@ struct ResolvedField {
   // 0 means "not set / infer from first indexed value"; > 0 means strict.
   int32_t vectorDims = 0;
   bool hasVectorDims = false;
+  // 0 means no truncation; > 0 keeps that many leading components.
+  int32_t vectorTruncateDims = 0;
   bool hasVectorMetric = false;
   VectorFieldType::Metric vectorMetric = VectorFieldType::METRIC_NONE;
   bool hasVectorNormalized = false;
   bool vectorNormalized = false;
   bool hasVectorNormalizeOnWrite = false;
   bool vectorNormalizeOnWrite = false;
+  // Atomic like analyzer: the nearest authored ann in the parent chain.
+  const luxir::api::VectorAnnDef* ann = nullptr;
 };
 
 struct ResolvedOwnership {
@@ -212,6 +217,17 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorDims = parentResolved.vectorDims;
   }
 
+  // truncate_dims: explicit set on this field overrides (0 = no truncation);
+  // otherwise inherit.
+  if (def.truncate_dims.has_value()) {
+    if (*def.truncate_dims < 0) {
+      throw SchemaError("truncate_dims must be >= 0 (field: " + std::string(name) + ")");
+    }
+    r.vectorTruncateDims = *def.truncate_dims;
+  } else {
+    r.vectorTruncateDims = parentResolved.vectorTruncateDims;
+  }
+
   // metric: explicit set on this field overrides (including an explicit
   // "none" = storage-only); otherwise inherit.  Range-checked like index.
   if (def.metric.has_value()) {
@@ -245,7 +261,68 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
     r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
   }
 
+  r.ann = def.ann ? &*def.ann : parentResolved.ann;
   return r;
+}
+
+// Apply defaults to an authored ann definition and validate it against the
+// effective dims. Positive PQ m requires pinned dims; automatic m also works
+// with dims inferred per segment.
+// dims is the stored dimension the overlay is built over; dimsName names the
+// schema property it came from.
+static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t dims,
+                                        std::string_view dimsName, std::string_view name) {
+  VectorAnnConfig cfg;
+  if (def == nullptr) return cfg;
+  auto fail = [&](const std::string& msg) {
+    throw SchemaError("ann: " + msg + " (field: " + std::string(name) + ")");
+  };
+  using Codec = api::VectorAnnDef_::Codec;
+  if (def->codec) {
+    Codec codec = *def->codec;
+    if (codec != Codec::RABITQ && codec != Codec::PQ) {
+      fail("unknown codec " + std::to_string((int)codec) + "; valid: rabitq, pq");
+    }
+    cfg.codec = codec == Codec::PQ ? VectorAnnConfig::PQ : VectorAnnConfig::RABITQ;
+  }
+  if (def->nlist) {
+    if (*def->nlist < 0 || *def->nlist > 65536) fail("nlist must be in [0, 65536]");
+    cfg.nlist = *def->nlist;
+  }
+  if (def->rabitq && cfg.codec != VectorAnnConfig::RABITQ) {
+    fail("rabitq settings require explicit codec \"rabitq\"");
+  }
+  if (def->pq && cfg.codec != VectorAnnConfig::PQ) fail("pq settings require codec pq");
+  if (def->rabitq) {
+    if (def->rabitq->bits) {
+      if (*def->rabitq->bits < 1 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [1, 9]");
+      cfg.rabitqBits = *def->rabitq->bits;
+    }
+    if (def->rabitq->query_bits) {
+      if (*def->rabitq->query_bits < 0 || *def->rabitq->query_bits > 8) {
+        fail("rabitq.query_bits must be in [0, 8]");
+      }
+      cfg.rabitqQueryBits = *def->rabitq->query_bits;
+    }
+  }
+  if (def->pq) {
+    if (def->pq->m) {
+      if (*def->pq->m < 0) fail("pq.m must be >= 0");
+      if (*def->pq->m > 0) {
+        if (dims <= 0) fail("positive pq.m requires positive dims");
+        if (dims % *def->pq->m != 0) {
+          fail("pq.m=" + std::to_string(*def->pq->m) + " does not divide " + std::string(dimsName) + "=" +
+               std::to_string(dims));
+        }
+      }
+      cfg.pqM = *def->pq->m;
+    }
+    if (def->pq->bits) {
+      if (*def->pq->bits < 1 || *def->pq->bits > 8) fail("pq.bits must be in [1, 8]");
+      cfg.pqBits = *def->pq->bits;
+    }
+  }
+  return cfg;
 }
 
 static void resolveField(std::string_view name, const sv_entry_map& defMap,
@@ -326,11 +403,13 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   if (def.normalizer && r.type != FieldClass::STRING) {
     throw SchemaError("normalizer is only valid for string fields (field: " + name + ")");
   }
-  bool vectorProp = def.dims.has_value() || def.metric.has_value() ||
-                    def.normalized.has_value() || def.normalize_on_write.has_value();
+  bool vectorProp = def.dims.has_value() || def.truncate_dims.has_value() || def.metric.has_value() ||
+                    def.normalized.has_value() || def.normalize_on_write.has_value() ||
+                    def.ann.has_value();
   if (vectorProp && r.type != FieldClass::VECTOR) {
     throw SchemaError(
-      "dims/metric/normalized/normalize_on_write are only valid for vector fields (field: " + name + ")");
+      "dims/truncate_dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " +
+      name + ")");
   }
 }
 
@@ -361,8 +440,10 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
         throw SchemaError("reserved field '_version_' must have type 'int'");
       }
       if (logical.hasMulti && logical.multi) throw SchemaError("reserved field '_version_' cannot be multi-valued");
-      if (r.hasColumn && !r.column) {
-        throw SchemaError("reserved field '_version_' requires column=true");
+      if ((r.hasColumn && r.column) || (r.hasIndex && r.index != IndexMode::NONE)
+          || logical.stored || logical.hasStoredResource || r.analyzer || r.normalizer
+          || r.longTerms || logical.defaults) {
+        throw SchemaError("reserved field '_version_' is retrieval-only and cannot be configured");
       }
     } else if (r.hasType && r.type == FieldClass::ID) {
       throw SchemaError("type 'id' is reserved for the 'id' field (field: " + std::string(name) +
@@ -385,6 +466,7 @@ struct FieldCompiler {
 
     // Apply defaults based on type if properties were not explicitly set
     IndexMode index = r.index;
+    if (name == "_version_") return std::make_shared<IntFieldType>(name, 0);
     bool column = r.column;
     bool multi = logical.multi;
     bool stored = logical.stored;
@@ -533,12 +615,42 @@ struct FieldCompiler {
       case FieldClass::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
         // dims may be 0, meaning "infer from first indexed value".
+        if (r.vectorTruncateDims > 0) {
+          // Every truncated input stores the same size, so the declared full
+          // dims is the only check that catches vectors from another model.
+          if (r.vectorDims == 0) {
+            throw SchemaError("truncate_dims requires dims (field: " + std::string(name) + ")");
+          }
+          if (r.vectorTruncateDims >= r.vectorDims) {
+            throw SchemaError("truncate_dims (" + std::to_string(r.vectorTruncateDims) +
+                              ") must be < dims (" + std::to_string(r.vectorDims) +
+                              ") (field: " + std::string(name) + ")");
+          }
+          // Matryoshka models compare renormalized prefixes.  Under cosine a
+          // prefix cut here and one the provider renormalized score the same;
+          // l2 and ip would score the raw prefix's shrunken length.
+          if (r.vectorMetric != VectorFieldType::METRIC_COSINE) {
+            throw SchemaError("truncate_dims requires metric cosine (field: " + std::string(name) + ")");
+          }
+          // normalized asserts unit-length input, but a truncated prefix of a
+          // unit vector is shorter than 1.
+          if (r.vectorNormalized) {
+            throw SchemaError("normalized=true cannot be combined with truncate_dims "
+                              "(a truncated prefix is not unit length; it is renormalized on write) (field: " +
+                              std::string(name) + ")");
+          }
+        }
         bool normalizeOnWrite;
         normalizeOnWrite = !r.vectorNormalized && (r.hasVectorNormalizeOnWrite
           ? r.vectorNormalizeOnWrite
           : (r.vectorMetric == VectorFieldType::METRIC_COSINE));
+        // ANN overlays are built over the stored (truncated) column.
+        bool truncated = r.vectorTruncateDims > 0;
+        VectorAnnConfig ann = resolveAnnConfig(r.ann, truncated ? r.vectorTruncateDims : r.vectorDims,
+                                               truncated ? "truncate_dims" : "dims", name);
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
-                                               r.vectorMetric, r.vectorNormalized, normalizeOnWrite);
+                                               r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
+                                               ann, r.vectorTruncateDims);
         break;
       }
       default:
@@ -631,6 +743,17 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
       fail("max_docs_per_chunk must be 1 to 65536");
     }
     format.maxDocsPerChunk = (uint32_t)*def.max_docs_per_chunk;
+  }
+  if (def.zstd_dictionary.value_or(false)) {
+    if (codec != StoredCodec::ZSTD) fail("zstd_dictionary requires codec zstd");
+    format.dictionaryBytes = StoredChunkFormat::DEFAULT_DICTIONARY_BYTES;
+  }
+  if (def.zstd_dictionary_bytes) {
+    if (!format.dictionaryBytes) fail("zstd_dictionary_bytes requires zstd_dictionary: true");
+    if (*def.zstd_dictionary_bytes < 1024 || *def.zstd_dictionary_bytes > 262144) {
+      fail("zstd_dictionary_bytes must be 1024 to 262144");
+    }
+    format.dictionaryBytes = (uint32_t)*def.zstd_dictionary_bytes;
   }
   return std::make_shared<StoredFieldType>(name, format);
 }
@@ -937,6 +1060,9 @@ ResolvedFieldHandle Schema::resolveFor(std::string_view name, OpClass op) const 
   if (!validFieldName(rootName)) {
     throw RequestError("Invalid field or selector root: " + std::string(name), "invalid_field_name");
   }
+  if (rootName == "_version_" && op != OpClass::RETRIEVE) {
+    throw RequestError("Field '_version_' is retrieval-only", "retrieval_only");
+  }
   auto root = findRoot(rootName);
   if (!root.primary) throw RequestError("Field not found: " + std::string(rootName), "unknown_field");
   std::string_view label = "self";
@@ -966,6 +1092,40 @@ FieldType* Schema::physical(std::string_view name) const {
   auto* type = findPhysical(name);
   if (!type) throw RequestError("Physical field not found: " + std::string(name), "unknown_field");
   return type->get();
+}
+
+std::vector<std::string> Schema::searchableFields(
+    std::span<const std::string_view> physicalNames) const {
+  std::set<std::string_view> roots;
+  auto addRoot = [&](std::string_view name) {
+    if (name.empty() || name[0] == '_') return;
+    roots.insert(name.substr(0, name.rfind("__")));
+  };
+  for (const auto& [name, type] : fieldTypeMap) addRoot(name);
+  for (auto name : physicalNames) addRoot(name);
+  auto termTarget = [](FieldType& type) {
+    return type.indexed() && (type.type() == FieldType::TEXT
+        || type.type() == FieldType::STRING || type.type() == FieldType::ID);
+  };
+  std::vector<std::string> names;
+  for (auto root : roots) {
+    ResolvedFieldHandle target;
+    try {
+      if (!getFieldTypePtr(root)) continue;
+      target = resolveFor(root, OpClass::SEARCH);
+    } catch (const RequestError&) {
+      // A schema edit can retire an old dynamic root or make it too long.
+      continue;
+    }
+    if (termTarget(*target.fieldType)) names.emplace_back(root);
+    if (target.owner) {
+      for (const auto& [label, type] : target.owner->variants) {
+        if (termTarget(*type)) names.push_back(std::string(root) + "__" + label);
+      }
+    }
+  }
+  std::sort(names.begin(), names.end());
+  return names;
 }
 
 void Schema::toProto(luxir::api::SchemaDef* def, std::pmr::memory_resource& arena) const {
@@ -1001,7 +1161,7 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
     for (size_t i = 0; i < filters.size(); i++) fl[i].name = filters[i];
   };
 
-  // Concrete fields (id defaults to MATCH+column, _version_ to NONE+column).
+  // Concrete fields (id defaults to MATCH+column, _version_ is virtual retrieval).
   add(fields, "id", FieldClass::ID);
   add(fields, "_version_", FieldClass::INT);
 

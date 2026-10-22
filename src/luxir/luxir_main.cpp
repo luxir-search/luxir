@@ -11,13 +11,16 @@
 #include <sstream>
 #include <thread>
 #include "luxir/luxir_main.h"
+#include "luxir/BuildInfo.h"
 #include "luxir/server/Promotion.h"
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/util/luxir_util.h"
+#include "luxir/util/thread.h"
 #include "luxir/server/GRPCServer.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/ReplicationFollower.h"
 #include "luxir/LuxirConfig.h"
+#include <CLI/CLI.hpp>
 
 namespace fs = std::filesystem;
 
@@ -42,7 +45,7 @@ class SignalWatcher {
   std::thread thread;
 
   void run() {
-    pthread_setname_np(pthread_self(), "luxir_signals");
+    nameThisThread("luxir_signals");
     sigset_t set = shutdownSignals();
     bool stopping = false;
     for (;;) {
@@ -75,7 +78,7 @@ int luxir_main(int argc, char** argv) {
   spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");
 
   CLI::App app{"Luxir search engine"};
-  app.set_version_flag("--version", "Luxir " LUXIR_VERSION " (" LUXIR_CPU_NAME ")");
+  app.set_version_flag("--version", "Luxir " + std::string(buildVersion()) + " (" + std::string(buildCpuTarget()) + ")");
   LuxirConfig config;
   config.addOptions(app);
   auto* pull = app.add_subcommand("pull", "Copy current source snapshots to a follower data directory");
@@ -134,7 +137,7 @@ int luxir_main(int argc, char** argv) {
 
   if (*promote) {
     try {
-      return luxir::promote(config.store.data_dir, std::cout) ? 0 : 1;
+      return luxir::promote(config.store.data_dir, std::cout, config.store.verify_on_open == "full") ? 0 : 1;
     } catch (const std::exception& e) {
       std::cerr << "Promote failed: " << e.what() << '\n';
       return 1;
@@ -191,7 +194,7 @@ int luxir_main(int argc, char** argv) {
 
 std::string luxir_banner() {
   std::stringstream ss;
-  ss << "Luxir " LUXIR_VERSION " (" LUXIR_CPU_NAME ")";
+  ss << "Luxir " << buildVersion() << " (" << buildCpuTarget() << ")";
 #ifdef NDEBUG
   ss << " Release (NDEBUG)";
 #else

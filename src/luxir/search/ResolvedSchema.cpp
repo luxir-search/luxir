@@ -23,8 +23,14 @@ std::string ReaderManager::resolvedSchema() {
   result["fields"] = Json::object_t{};
   for (const auto& [name, signature] : fields) {
     auto& logical = result["fields"][signature.logicalName];
-    logical["bindings"]["search"] = schema->resolveFor(signature.logicalName, OpClass::SEARCH).physicalName;
-    logical["bindings"]["value"] = schema->resolveFor(signature.logicalName, OpClass::VALUE).physicalName;
+    for (auto [name, op] : {std::pair{"search", OpClass::SEARCH}, {"value", OpClass::VALUE}}) {
+      try {
+        logical["bindings"][name] = schema->resolveFor(signature.logicalName, op).physicalName;
+      } catch (const RequestError& e) {
+        if (e.code != "retrieval_only") throw;
+        logical["bindings"][name] = nullptr;
+      }
+    }
     auto& rep = logical["representations"][signature.label];
     rep["name"] = name;
     for (const auto& [property, value] : signature.properties) {
@@ -34,6 +40,19 @@ std::string ReaderManager::resolvedSchema() {
     auto* type = schema->physical(name);
     rep["stored"] = type->isStored();
     if (type->isStored()) rep["stored_resource"] = type->storedResource_;
+    if (auto* vector = dynamic_cast<const VectorFieldType*>(type)) {
+      const auto& config = vector->ann();
+      auto& ann = rep["ann"];
+      ann["codec"] = config.codec == VectorAnnConfig::PQ ? "pq" : "rabitq";
+      ann["nlist"] = config.nlist;
+      if (config.codec == VectorAnnConfig::PQ) {
+        ann["pq"]["m"] = config.pqM;
+        ann["pq"]["bits"] = config.pqBits;
+      } else {
+        ann["rabitq"]["bits"] = config.rabitqBits;
+        ann["rabitq"]["query_bits"] = config.rabitqQueryBits;
+      }
+    }
     if (!signature.properties.contains("analyzer")) rep["analyzer"] = nullptr;
     if (!signature.properties.contains("normalizer")) rep["normalizer"] = nullptr;
     uint64_t introduced = schema->introduction(name);

@@ -214,7 +214,9 @@ field omitted by the new version is absent from the new document.
 
 When you know the incoming IDs are unique and do not already exist in the
 collection, set `allow_dups: true` to improve indexing performance by skipping
-ID overwrite/deduplication. This disables overwrites for that request.
+ID overwrite/deduplication. This disables overwrites for that request. If
+the IDs are not in fact unique, the outcome is unspecified: some duplicates
+remain as separate documents, and others replace each other.
 
 Delete by ID with no document body:
 

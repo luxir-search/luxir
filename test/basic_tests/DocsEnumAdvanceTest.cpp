@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "test/TestUtils.h"
 #include "luxir/reader/FieldReader.h"
 #include <algorithm>
 #include <array>
@@ -182,6 +183,7 @@ protected:
       writer.endTerm(tref);
       writer.endField();
     }
+    luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
   }
 
@@ -391,6 +393,7 @@ protected:
       }
       writer.endField();
     }
+    luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
   }
 
@@ -462,6 +465,7 @@ protected:
       writer.endTerm(tref);
       writer.endField();
     }
+    luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
   }
 
@@ -571,6 +575,7 @@ protected:
       writer.endTerm(nextTerm);
       writer.endField();
     }
+    luxir::test::writeUnversionedRuns(postingsWriter);
     postingsWriter.finish();
 
     PostingsReader reader(dir, 0);
@@ -762,6 +767,7 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
     writer.endTerm(zzz);
     writer.endField();
   }
+  luxir::test::writeUnversionedRuns(postingsWriter);
   postingsWriter.finish();
 
   PostingsReader reader(dir, 0);

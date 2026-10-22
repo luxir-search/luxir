@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# Copyright 2020-2026 Yonik Seeley and Luxir contributors
+# SPDX-License-Identifier: Apache-2.0
+
+# Prints how many build jobs fit this machine: at most one per physical core
+# (within the CPUs and CPU quota available to this process) and at most one per
+# MB_PER_JOB megabytes of memory (within any cgroup limit).
+# Usage: tools/build-jobs MB_PER_JOB
+set -euo pipefail
+if (( $# != 1 )); then
+  echo "Usage: $0 MB_PER_JOB" >&2
+  exit 1
+fi
+per_job=$1
+
+if [[ $(uname -s) == Darwin ]]; then
+  cores=$(sysctl -n hw.physicalcpu)
+  mem_mb=$(( $(sysctl -n hw.memsize) / 1048576 ))
+else
+  # nproc also honors OpenMP's thread limits, which say nothing about build jobs.
+  cpus=$(env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc)
+  cores=$(lscpu -p=core,socket 2>/dev/null | grep -v '^#' | sort -u | wc -l || true)
+  if (( cores < 1 || cores > cpus )); then
+    cores=$cpus
+  fi
+  mem_mb=$(( $(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) / 1024 ))
+fi
+
+# Walk this process's cgroup (v2) up to the root, then the v1 location.
+cgroup=/sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null || true)
+limits=()
+while [[ $cgroup == /sys/fs/cgroup* ]]; do
+  limits+=("$cgroup/memory.max")
+  if [[ -r $cgroup/cpu.max ]]; then
+    read -r quota period < "$cgroup/cpu.max"
+    if [[ $quota != max ]] && (( (quota + period - 1) / period < cores )); then
+      cores=$(( (quota + period - 1) / period ))
+    fi
+  fi
+  cgroup=${cgroup%/*}
+done
+limits+=(/sys/fs/cgroup/memory/memory.limit_in_bytes)
+for limit_file in "${limits[@]}"; do
+  if [[ -r $limit_file ]]; then
+    limit=$(< "$limit_file")
+    # cgroup v1 reports "no limit" as a huge page-aligned number.
+    if [[ $limit =~ ^[0-9]+$ ]] && (( ${#limit} < 19 && limit / 1048576 < mem_mb )); then
+      mem_mb=$(( limit / 1048576 ))
+    fi
+  fi
+done
+
+jobs=$(( mem_mb / per_job ))
+(( jobs > cores )) && jobs=$cores
+(( jobs < 1 )) && jobs=1
+echo "$jobs"

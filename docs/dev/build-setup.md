@@ -26,8 +26,9 @@ use the [ARM64 cross-build workflow](arm64-build.md).
   Benchmark. The compiler supplies OpenMP; FastPFOR is fetched and uni-algo is
   vendored
 
-The build uses `-march=native`; a release binary is intended for the machine
-class on which its dependencies and Luxir itself were built.
+The build targets the host CPU (`-march=native`, or the host's `-mcpu` on Apple
+silicon); a release binary is intended for the machine class on which its
+dependencies and Luxir itself were built.
 TBB and its internal tbbmalloc allocator are static vcpkg libraries. Static
 jemalloc replaces malloc/free and operator new/delete process-wide in every
 build by default unless sanitizer flags are present (`LUXIR_JEMALLOC` then
@@ -35,8 +36,8 @@ defaults to `OFF`); explicitly enabling both is an error. The startup banner
 reports the allocator version and effective configuration. The jemalloc overlay
 embeds allocator defaults; see [dependency settings](../../deps/README.txt).
 For Valgrind, configure a build with `-DLUXIR_JEMALLOC=OFF` or run with
-`--soname-synonyms=somalloc=NONE`. OpenBLAS supplies C LAPACK, so neither a
-Fortran compiler nor a Fortran runtime is required. Native builds retain shared
+`--soname-synonyms=somalloc=NONE`. OpenBLAS supplies C LAPACK (Accelerate does
+on macOS), so neither a Fortran compiler nor a Fortran runtime is required. Native builds retain shared
 GCC runtimes; the container's static runtime setting is a separate packaging
 choice.
 
@@ -65,6 +66,14 @@ Install the host tools (in addition to GCC/G++, CMake, and Ninja):
 sudo apt install pkg-config python3 curl zip unzip tar
 ```
 
+On macOS, install the Command Line Tools (`xcode-select --install`), then the
+compiler and build tools from Homebrew; [macOS](#macos-apple-silicon) lists the
+differences from Linux:
+
+```bash
+brew install gcc cmake ninja pkg-config ccache
+```
+
 Build both native dependency variants:
 
 ```bash
@@ -73,8 +82,9 @@ Build both native dependency variants:
 
 The script fetches pinned FastPFOR sources, checks the vcpkg revision, and installs
 the manifest sequentially with `x64-linux-luxir-native` and
-`x64-linux-luxir-native-asan`. It defaults to 12 dependency build jobs; override
-`VCPKG_MAX_CONCURRENCY` for the machine's memory budget. Both variants include
+`x64-linux-luxir-native-asan`. Dependency build jobs default to what the cores
+and memory allow (`tools/build-jobs`); `VCPKG_MAX_CONCURRENCY` overrides
+that. Both variants include
 Debug and Release libraries. ASan uses unsanitized host tools from the
 Release-only `x64-linux-luxir-native-host` triplet, avoiding duplicated normal
 Debug libraries in the ASan install. Normal native builds reuse their target
@@ -93,6 +103,30 @@ options when refreshing.
 After changing the manifest or overlays, rerun the script. To update vcpkg itself,
 change the manifest baseline, check out that revision in `/opt/vcpkg`, bootstrap
 again, then rerun the script. No changes to upstream ports or triplets are needed.
+
+### macOS (Apple silicon)
+
+The same presets and setup script work with Homebrew GCC. On macOS:
+
+- Dependencies use the `arm64-osx-luxir-m1*` triplets: a fixed `apple-m1`
+  and macOS 14 baseline instead of the host CPU, so one install serves local
+  builds and binaries for other Macs. Later Apple cores add only BF16 and int8
+  matrix-multiply instructions, and no dependency header tests for them, so
+  Luxir built for a newer chip sees the same inline dependency code. No CPU
+  fingerprint is needed.
+- `LUXIR_CPU_TARGET=native` resolves to the host chip (`apple-m5` and so on,
+  from `sysctl`), since GCC's `-mcpu=native` reports every Apple core as
+  `apple-m1`. Configure with `-DLUXIR_CPU_TARGET=apple-m1` for a binary that
+  runs on any Apple silicon Mac.
+- jemalloc is not yet supported; `LUXIR_JEMALLOC` defaults to `OFF`.
+- ASan works, but GCC has no LeakSanitizer there; `detect_leaks=1` is
+  accepted and finds nothing.
+- FAISS uses Apple's Accelerate for BLAS and LAPACK instead of OpenBLAS. Its
+  matrix unit runs SGEMM at about 15 times the rate of single-threaded
+  OpenBLAS on an M5. Accelerate runs its own threads; `VECLIB_MAXIMUM_THREADS`
+  caps them.
+- FAISS is built without its Metal GPU backend, which needs Xcode's `metal`
+  compiler.
 
 When migrating an existing build from the old classic-mode dependencies, reset
 the CMake caches so cached package paths cannot retain system TBB or the old
@@ -144,6 +178,65 @@ OpenMP are only set up in the GCC vcpkg roots, so configuring one failed at
 `find_package(OpenMP)`. Building for Clang means preparing a Clang vcpkg root
 with those dependencies first, then adding the preset back.
 
+## Parallelism and shared caches
+
+Configure sizes `LUXIR_COMPILE_JOBS` from the machine with `tools/build-jobs`,
+which counts physical cores and memory, honoring cgroup CPU and memory limits:
+one compile per physical core, at most 16, and at most one per 3 GB of memory
+(4 GB with ASan).
+
+The limit is a Ninja pool, so a plain `cmake --build` needs no `-j`. Compiles
+also take one of that many machine-wide slots (lock files under
+`~/.cache/luxir/build-slots`, see `tools/build-slot`), so concurrent builds from
+other worktrees, presets, or the development container share the limit rather
+than each assuming the whole machine. A compile waiting for a slot sleeps and
+uses no memory. Override the limit with `-DLUXIR_COMPILE_JOBS=N` when
+configuring; set `-DLUXIR_BUILD_SLOT_DIR=` (empty) to limit a build only by its
+own pool.
+
+Shared state lives outside the checkout, so a new worktree reuses it:
+
+- Native vcpkg dependencies are installed once under `/opt/vcpkg`, with
+  vcpkg's default binary cache and downloads. vcpkg serializes installs that
+  share its root. The install directories follow the manifest of the most recent
+  `deps/make_deps.sh` run, so a branch that changes dependencies affects every
+  native worktree once it is installed.
+- ccache uses its normal cache directory. Objects are shared between worktrees
+  at different paths only when every checkout involved, including the main one,
+  is configured with `-DLUXIR_CCACHE_RELATIVE_PATHS=ON`. That sets
+  `CCACHE_BASEDIR` to the checkout and maps the checkout to `.` in debug
+  information, with two costs: compiler diagnostics and `__FILE__` name sources
+  relative to the build directory (`../../src/...`), and debuggers resolve
+  sources from the checkout root, so start GDB there or add it with
+  `directory`. Size the cache for several builds (one debug build is over
+  4 GB of objects), e.g. `ccache -M 20G`.
+- `LUXIR_CACHE_DIR` (default `~/.cache/luxir`, or `$XDG_CACHE_HOME/luxir`) holds
+  the build slots, the [ARM64](arm64-build.md) toolchain, vcpkg checkout,
+  downloads, and binary packages, and the development container's ccache.
+  Setup steps that write shared state take a lock, and vcpkg's binary cache
+  is keyed by package ABI, so concurrent builds and different branches do not
+  corrupt it.
+
+Build directories and per-build installs (such as `build/arm64-deps`) stay in
+each worktree. With `-DLUXIR_CCACHE_RELATIVE_PATHS=ON` they must physically be
+there: ccache rewrites paths relative to the real working directory, so a build
+directory outside the worktree (through `-B` or a `build/` symlink) puts the
+worktree's name in every hashed path and never hits another worktree's objects.
+Configure warns about such a build directory. A worktree reached through a
+symlink shares normally.
+
+`tools/worktree add NAME [START]` creates a worktree under
+`LUXIR_WORKTREE_ROOT` (default `<main checkout>-wt`) with the submodule and
+FastPFOR fetched. It checks out branch NAME, creating it from START (default:
+the main checkout's HEAD) if it does not exist. `tools/worktree remove NAME`
+deletes a worktree with its builds and keeps its branch. Without `-f` it
+refuses when that would lose uncommitted changes or commits on no branch, tag,
+or remote, including a submodule's. `tools/worktree list` shows each worktree
+with its build size. Build directories take 10 to 20 GB per worktree, so on a
+machine whose source disk is short of space, point `LUXIR_WORKTREE_ROOT` at a
+larger one. Avoid `/tmp` and `/var/tmp`, where systemd-tmpfiles can delete
+files left untouched for days.
+
 ## Fresh checkout / after `rm -rf build/`
 
 Generated API and descriptor headers only exist after a build, and IDE code
@@ -177,6 +270,10 @@ Before committing memory-sensitive work, run the ASan build:
 
 The ASan presets use the instrumented dependencies in
 `/opt/vcpkg/installed-native-asan`, built by the same setup script.
+`gcc-debug-asan` compiles Luxir with `-g1`: backtraces keep functions, inlined
+frames, and line numbers, but a debugger cannot show local variables. To
+inspect locals under ASan, configure with
+`-DCMAKE_CXX_FLAGS_DEBUG="-g -Og -ftrivial-auto-var-init=pattern"`.
 
 ```bash
 cmake --preset gcc-debug-asan
@@ -204,8 +301,12 @@ The negative filter excludes the slow vector families. For a quick path/code
 coverage pass over the small unit-test corpus, use:
 
 ```bash
-./build/gcc-debug/bin/luxir_test --gtest_filter='Benchmarks.all'
+./build/gcc-release/bin/luxir_test --gtest_filter='Benchmarks.all'
 ```
+
+Debug builds, including ASan, leave the benchmarks out of `luxir_test` to keep
+the edit-build-test loop short. Configure with `-DLUXIR_TEST_BENCHMARKS=ON` to
+include them.
 
 Test runs default to `--effort=1`. Scalable fuzz loops and benchmark unit
 corpora can derive linear work with `LuxirTest::scaleTestWork()` or scale each
@@ -224,12 +325,13 @@ Treat those as harnesses, not published comparative results.
 
 ## Time-zone database at runtime
 
-`std::chrono` time-zone support requires the system zoneinfo database to be
-present at runtime. Without it, the service degrades to UTC and fixed-offset
-zones only. The loaded tzdb version is logged at startup. Keep the zoneinfo
-data and the C++ runtime consistent across a fleet: identical tzdb version
-strings do not guarantee identical transition decoding across different
-parser implementations.
+IANA time zones are read at runtime from the system zoneinfo database
+(`$TZDIR`, else `/usr/share/zoneinfo`): zone and link names and the version
+come from its `tzdata.zi`, and the rules from the compiled TZif files that the
+C library also uses. Without it, the service degrades to UTC and fixed-offset
+zones only. The loaded version is logged at startup. Requests produce identical
+civil-time boundaries on machines with identical zoneinfo trees, whatever the
+compiler or C++ runtime.
 
 See [Operating Luxir](../guide/operations.md) for persistence, ports, security,
 and resource controls after the binary is built.

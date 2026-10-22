@@ -7,7 +7,6 @@
 #include "luxir/reader/FieldReader.h"
 #include "luxir/reader/FieldMetadataMemory.h"
 #include "luxir/reader/Postings.h"
-#include "luxir/reader/StoredFieldsReader.h"
 #include "luxir/reader/TestOverlayAuxReader.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
@@ -539,17 +538,17 @@ FieldType::flag_type IndexReader::FieldSegments::flagsUnion() const {
   return record ? totals().flags : 0;
 }
 
-std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projectableFields() {
-  std::call_once(projectableOnce, [this] {
+void IndexReader::PhysicalCore::buildFieldCatalogs() {
+  callOnce(fieldCatalogsOnce, [this] {
     // Both name sources are views into segment files held open by the
     // segment's PostingsReader: the field index (fi.fieldname) and the stored
-    // resource's metadata (StoredFieldsReader::fieldNames).  No copies needed.
+    // resource's cached metadata. No copies needed.
     std::map<std::string_view, ProjectableField> sources;
     for (auto& seg : segs) {
       auto& postingsReader = seg.postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
       FieldReader fieldReader(postingsReader);
-      while (fieldReader.readNextField()) {
+      for (int32_t ordinal = 0; fieldReader.readNextField(); ordinal++) {
         SegFieldInfo fi;
         fieldReader.readFieldInfo(fi);
         std::string_view physicalName(fi.fieldname.data(), fi.fieldname.size());
@@ -558,32 +557,37 @@ std::span<const IndexReader::ProjectableField> IndexReader::PhysicalCore::projec
           // An empty resource is never written, but guard the reader's
           // precondition anyway.
           if (fi.numValues <= 0) continue;
-          StoredFieldsReader sfr(postingsReader, fi);
-          for (std::string_view name : sfr.fieldNames()) {
+          const auto* field = postingsReader.fieldInfo(ordinal);
+          for (std::string_view name : field->stored->fieldNames) {
             auto& resources = sources[name].storedResources;
             if (std::ranges::find(resources, physicalName) == resources.end()) {
               resources.push_back(physicalName);
             }
           }
-        } else if (fi.flags & FieldType::COLUMN_STORED) {
-          sources[physicalName].column = true;
+        } else if (fi.type != FieldType::BIN) {
+          sources[physicalName].column |= (fi.flags & FieldType::COLUMN_STORED) != 0;
         }
       }
     }
     std::vector<ProjectableField> fields;
+    std::vector<std::string_view> names;
     fields.reserve(sources.size());
+    names.reserve(sources.size());
     for (auto& [name, source] : sources) {
-      source.name = name;
-      fields.push_back(std::move(source));
+      names.push_back(name);
+      if (source.column || !source.storedResources.empty()) {
+        source.name = name;
+        fields.push_back(std::move(source));
+      }
     }
     projectable = std::move(fields);
+    physicalNames = std::move(names);
   });
-  return projectable;
 }
 
 std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() {
   assert(sharedSchema);
-  std::call_once(retrievableOnce, [this] {
+  callOnce(retrievableOnce, [this] {
     std::vector<RetrievableField> fields;
     for (const auto& source : projectableFields()) {
       auto split = source.name.rfind("__");
@@ -628,4 +632,12 @@ std::span<const IndexReader::RetrievableField> IndexReader::retrievableFields() 
   return retrievable;
 }
 
+std::span<const std::string> IndexReader::searchableFields() {
+  assert(sharedSchema);
+  callOnce(searchableOnce, [this] {
+    searchable = sharedSchema->searchableFields(core->physicalFieldNames());
+  });
+  return searchable;
 }
+
+} // namespace luxir

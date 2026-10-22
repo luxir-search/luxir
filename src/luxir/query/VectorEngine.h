@@ -62,10 +62,12 @@ struct VectorSearchRequest {
   int64_t perKey = 1;
 };
 
-/// Candidate from the vector engine seam.  score is exact for flat engines;
-/// quantized engines may return an approximate score and must be rescored by
-/// the host before doc collapse.  valueRank is segment-relative: it is the
-/// vector's ordinal within segOrd's vector column, not a shard-level FAISS id.
+/// Candidate from the vector engine seam. score is exact for flat engines;
+/// quantized engines may return an internal ordering score, possibly above
+/// the public L2 range [0, 1] for negative distance estimates. The host must
+/// rescore before the final cut and similarity filtering. valueRank is
+/// segment-relative: the vector's ordinal within segOrd's vector column,
+/// not a shard-level FAISS id.
 struct VectorEngineHit {
   float score = 0.0f;
   int32_t segOrd = -1;
@@ -84,7 +86,8 @@ static_assert(sizeof(VectorEngineHit) == 16);
 struct VectorSearchResult {
   std::vector<VectorEngineHit> hits;
   // False means hit.score is only an engine approximation; the host must
-  // rescore from full-precision column vectors before sorting / doc collapse.
+  // rescore from full-precision column vectors before the final cut and
+  // similarity filtering.
   bool scoresAreExact = false;
   // Refinement when scoresAreExact is false: segments whose hits in this
   // result carry exact scores anyway (a multi-engine merge where only some

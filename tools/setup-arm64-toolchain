@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 set -euo pipefail
 
-repo_dir=$(cd "$(dirname "$0")/.." && pwd)
-work="$repo_dir/build/arm64-toolchain"
+# Shared by all checkouts and worktrees; tools/build-arm64 serializes setup.
+cache_dir=${LUXIR_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/luxir}
+work="$cache_dir/arm64-toolchain"
 version=16.1.0
 archive="$work/gcc-$version.tar.xz"
 compiler_root="$work/compiler"
@@ -20,6 +21,7 @@ fi
 printf '%s  %s\n' a0a158a02595413527c1092a845930eb0d7a10d7e4ae7f7c8d986850eb3d2e66 \
     "$archive" | sha256sum -c -
 if [[ ! -f $compiler_root/.gcc-$version-ready ]]; then
+    rm -rf "$compiler_root/gcc-$version"
     tar -xJf "$archive" -C "$compiler_root"
     touch "$compiler_root/.gcc-$version-ready"
 fi

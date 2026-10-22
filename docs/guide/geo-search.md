@@ -75,7 +75,7 @@ POST /collections/places/_search
     }
   },
   "fields": ["id","name_s"],
-  "get_number": true
+  "count_limit": -1
 }
 ```
 
@@ -116,7 +116,7 @@ POST /collections/places/_search
     }
   },
   "fields":["id","name_s"],
-  "get_number":true
+  "count_limit":-1
 }
 ```
 

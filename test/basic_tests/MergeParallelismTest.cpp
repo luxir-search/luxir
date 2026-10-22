@@ -80,7 +80,7 @@ std::vector<Doc> allMergedDocs(CollectionHelper& helper) {
       .allQuery()
       .fields({"id", "title_t", "cat_s", "tags_ss", "price_i", "nums_is", "raw_sc"})
       .limit(-1)
-      .getNumber();
+      .countLimit();
   req->execute();
   EXPECT_TRUE(req->ok()) << req->toString();
   auto docs = req->getDocs();
@@ -90,7 +90,7 @@ std::vector<Doc> allMergedDocs(CollectionHelper& helper) {
 
 int64_t countTitleMatches(CollectionHelper& helper, std::string_view term) {
   auto req = localReq(helper.getSearchEngine());
-  req->collection("main").topDocs("q").matchQuery("title_t", term).getNumber();
+  req->collection("main").topDocs("q").matchQuery("title_t", term).countLimit();
   req->execute();
   EXPECT_TRUE(req->ok()) << req->toString();
   return req->getMatchCount();

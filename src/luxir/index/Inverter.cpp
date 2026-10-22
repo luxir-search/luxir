@@ -25,7 +25,12 @@ void Inverter::deleteId(std::string_view id, uint64_t version) {
     getIndexHandler("id");
     assert(idHandler_ != nullptr);
   }
-  static_cast<handler::IdHandler&>(*idHandler_).addDelete(id, version);
+  static_cast<handler::IdHandler&>(*idHandler_).addDelete(*this, id, version);
+}
+
+size_t Inverter::retainedDeleteBytes() const {
+  if (failed() || idHandler_ == nullptr) return 0;
+  return static_cast<handler::IdHandler&>(*idHandler_).retainedDeleteBytes();
 }
 
 
@@ -40,7 +45,7 @@ Inverter::UndoMark Inverter::undoMark() const {
 
 void Inverter::rollbackTo(const UndoMark& mark) {
   if (idHandler_ != nullptr) {
-    static_cast<handler::IdHandler&>(*idHandler_).rollbackTo(mark.idUndoSize);
+    static_cast<handler::IdHandler&>(*idHandler_).rollbackTo(*this, mark.idUndoSize);
   }
   assert(deleted.size() >= mark.numDeleted);
   deleted.resize(mark.numDeleted);
@@ -292,6 +297,9 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
     fieldHandler->flush(*this);
   }
 
+  if (getMaxDoc()) noteFlushWorkspace(versionRuns.flushWorkspaceBytes());
+  postingsWriter.writeVersionRuns(versionRuns);
+
   // Handle deleted documents if any
   if (!deleted.empty()) {
     // Create a FixedBitSet with all bits initially set (all docs are live)
@@ -312,14 +320,14 @@ bool Inverter::flush(std::vector<std::string>* filenames, std::vector<FileDescri
     int32_t numLiveDocs = maxDocId - numDeleted;
 
 
-    // Write the liveDocs file and get the liveGen
-    liveGen = 1;  // start with generation 1 for the first liveDocs file
-    liveDocs = numLiveDocs;
+    // Start with generation 1 for the first liveDocs file.
     if (filenames) {
-      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, liveGen, liveBits, maxDocId, numLiveDocs, *filenames, descriptors);
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, 1, liveBits, maxDocId, numLiveDocs, *filenames, descriptors);
     } else {
-      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, liveGen, liveBits, maxDocId, numLiveDocs);
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, 1, liveBits, maxDocId, numLiveDocs);
     }
+    liveGen = 1;
+    liveDocs = numLiveDocs;
   } else {
     // No deletes
     liveGen = 0;

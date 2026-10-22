@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/util/Metrics.h"
 
 #include <atomic>
 #include <deque>
@@ -24,6 +25,7 @@
 #include "luxir/server/LuxirError.h"
 #include "luxir/util/DeadlineScheduler.h"
 #include "Inverter.h"
+#include "StoredDictionaryRegistry.h"
 #include "UpdateMessage.h"
 #include "VectorIndexBuilder.h"
 
@@ -51,7 +53,8 @@ public:
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
-    int64_t mergedLiveGen = -1;  // if this segment was merged into another, what liveGen was used.
+    int64_t mergedLiveGen = -1;  // source generation covered by the merge
+    int64_t mergeDiffLiveGen = -1; // generation pinned while loading a swap diff, protected by indexMutex
     uint64_t publishedLiveGen = 0; // the generation in the published snapshot
     std::vector<uint64_t> obsoleteLiveGens; // protected by indexMutex
     uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.
@@ -66,6 +69,9 @@ public:
     // snapshot this writer published (CommitSnapshot::openReaders). Atomic: commit and merge
     // threads fill it without a lock (IndexWriter::getSegmentPostingsReader).
     std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
+
+    // Null until known; once populated, the physical dictionary's bounds never change.
+    std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
 
     // Schema generation this segment was indexed under.
     uint64_t schemaGen = 0;
@@ -123,11 +129,16 @@ class IndexWriter {
   std::mutex indexMutex;
   std::vector<std::string> manifestNames;
   std::vector<std::string> pendingRetirement; // publicationMutex
+  uint64_t completedUpdateVersion = 0; // indexMutex
   uint64_t nextManifestGen = 0;
   std::string incarnation;
 
 public:
 
+  // The node's and the collection's counters; set by the collection that opens
+  // this writer.
+  std::shared_ptr<Metrics> metrics = Metrics::detached();
+  std::shared_ptr<CollectionMetrics> collectionMetrics = CollectionMetrics::detached();
   struct MergeFailureInfo {
     std::vector<uint64_t> sourceSegIds;
     uint64_t outputSegId = 0;
@@ -145,6 +156,11 @@ public:
   struct Stats : ReaderManager::SnapshotStats<SegmentStats> {
     uint64_t commits = 0;
     uint64_t activeMerges = 0;
+    uint64_t flushing = 0, idle = 0, indexing = 0;
+    uint64_t retainedDeleteBytes = 0;
+    uint64_t completedUpdateVersion = 0;
+    uint64_t minInverterVersion = UINT64_MAX;
+    uint64_t frontierHeldDeleteBytes = 0;
   };
 
   // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file
@@ -164,14 +180,12 @@ public:
     // really makes sense though since it would only occasionally fix the "many small segments" problem, and
     // it is the indexing pattern that is causing the issue.  Perhaps this should be fixed by the user
     // through an API that requests a more aggressive merge to sweep up small segments.
-    float inverseLogM = 1.0f / log2(mergeFactor);
 
     // Methods with _ prefix should be called with the indexMutex already locked.
     MergePolicy(IndexWriter& iw) : iw(iw) {}
 
     void setMergeFactor(int32_t mergeFactor) {
       this->mergeFactor = std::max(2,mergeFactor);
-      inverseLogM = 1.0f / log2(this->mergeFactor);
     }
 
     // re-calculate the merges from scratch (i.e. not incrementally)
@@ -198,11 +212,14 @@ public:
       }
     }
 
+    // Integer arithmetic: a floating-point log ratio rounds exact powers of the
+    // merge factor (e.g. 100 docs for factor 10) down a level.
     int32_t _mergeLevelForMaxDoc(int32_t maxDoc) const {
-      if (maxDoc < mergeFactor) {
-        return 0;
+      int32_t level = 0;
+      for (int64_t bound = mergeFactor; maxDoc >= bound; bound *= mergeFactor) {
+        level++;
       }
-      return (int32_t)(log2(maxDoc) * inverseLogM);
+      return level;
     }
 
     // Reserve any merge-policy storage needed by _update(seg) before the
@@ -289,6 +306,7 @@ public:
   Directory& dir;
   std::unique_ptr<IndexRamBudget> privateIndexRamBudget;
   IndexRamBudget* indexRamBudget;
+  StoredDictionaryRegistry storedDictionaries;
 
   // the last segId generated. Atomic since we don't grab any lock in the merge code to generate a new segment id.
   std::atomic_uint64_t lastSegId;
@@ -524,6 +542,12 @@ public:
     return failed.load(std::memory_order_acquire) ? failureReason : nullptr;
   }
 
+  // An external check found a committed file damaged (Collection::fail): no
+  // further update, flush, merge or commit may read those bytes or publish
+  // over them. Admission, commit and publication all consult `failed`; a
+  // publication in flight completes first, and the registry closes.
+  void fail(std::string reason);
+
   // Advisory, for callers that would rather give up than submit (a streaming update
   // holding a cached writer).  Closing is terminal, so false may be stale but true
   // is final; the rejection that matters happens in the graph.
@@ -624,11 +648,19 @@ private:
       INDEX_DEBUG("processUpdateBody: msg={} failed: {}", (void*)&msg, e.what());
       msg.result.setException(e);
       // message should continue flowing to finishUpdateBody so the sequencers stay happy.
+    } catch (...) {
+      // Escaping the node would cancel the graph and strand this message.
+      std::runtime_error error("Unknown non-standard exception while handling update");
+      msg.result.setException(error);
     }
   }
 
   void finishUpdateBody(UpdateMessage& msg) {
     INDEX_DEBUG("finishUpdateBody: msg={}", (void*)&msg);
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      completedUpdateVersion = msg.updateVersion;
+    }
     bool doneWithMessage = true;
     // A failed request has no effects, including its commit.  Commit numbers are
     // taken in initiateCommit, so skipping it leaves the commit sequencer dense.
@@ -741,7 +773,7 @@ public:
   std::optional<MergeFailureInfo> testLastMergeFailure();
 
   // Coherent writer-visible and committed state for operational introspection.
-  Stats stats(bool includeSegments);
+  Stats stats(bool includeSegments, bool includeFiles = true);
 };
 
 

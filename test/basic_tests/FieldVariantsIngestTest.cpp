@@ -424,8 +424,8 @@ TEST_F(FieldVariantsIngestTest, hash128UsesCompleteNormalizedValueAndLeavesColum
 // A stored ID and a stored indexed STRING are retrieved from their columns;
 // only rows whose term may have been fitted (MIN_FITTED_LEN bytes or more)
 // come from the stored chunk.  Every length around the boundary, in two
-// segments, must round-trip its source, including two values that share one
-// truncated term.
+// segments, must round-trip its source, including STRING values that share one
+// truncated term. IDs remain distinct after fitting.
 TEST_F(FieldVariantsIngestTest, columnBackedRetrievalReturnsSourceForLongValues) {
   for (auto policy : {api::FieldDef::LongTerms::HASH128, api::FieldDef::LongTerms::TRUNCATE}) {
     SCOPED_TRACE((int)policy);
@@ -441,9 +441,11 @@ TEST_F(FieldVariantsIngestTest, columnBackedRetrievalReturnsSourceForLongValues)
     std::vector<Doc> docs;
     for (size_t len : {1u, 10u, 251u, 252u, 254u, 255u, 256u, 300u, 5000u}) {
       std::string value(len - 1, 'x');
-      docs.push_back(flatdoc("id", value + "i", "s", value + "s"));
+      std::string id = value + "i";
+      id[0] = (char)('a' + docs.size());
+      docs.push_back(flatdoc("id", id, "s", value + "s"));
     }
-    docs.push_back(flatdoc("id", std::string(300, 'x') + "a", "s", std::string(300, 'x') + "b"));
+    docs.push_back(flatdoc("id", std::string(300, 'y') + "a", "s", std::string(300, 'x') + "b"));
     size_t half = docs.size() / 2;
     ASSERT_TRUE(helper.indexAll(std::span(docs).subspan(0, half), UpdateMessage::COMMIT).success);
     ASSERT_TRUE(helper.indexAll(std::span(docs).subspan(half), UpdateMessage::COMMIT).success);
@@ -497,8 +499,8 @@ TEST_F(FieldVariantsIngestTest, directOverloadsUseBothRegistriesAndGlobalPhysica
     else geo.index(inv, 10.0, 20.0);
     inv.finishDoc();
   }
-  EXPECT_TRUE(inv.inputHandlers.contains("_version_"));
-  EXPECT_TRUE(inv.indexHandlers.contains("_version_"));
+  EXPECT_FALSE(inv.inputHandlers.contains("_version_"));
+  EXPECT_FALSE(inv.indexHandlers.contains("_version_"));
   EXPECT_FALSE(inv.inputHandlers.contains("a__s"));
   writer->releaseInverter(inv, true);
   helper.commit();

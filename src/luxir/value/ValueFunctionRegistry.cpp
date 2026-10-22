@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <stdexcept>
@@ -684,13 +685,13 @@ ValueBounds unaryBounds(const ValueNode& node, const ValueBounds& input) {
   }
 
   if (node.opcode == ValueOpcode::SQRT && low < 0.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
+    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
   }
   if (node.opcode == ValueOpcode::LOG && low <= 0.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
+    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
   }
   if (node.opcode == ValueOpcode::LOG1P && low <= -1.0 && input.minAttained) {
-    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN, input.mayBeMissing);
+    return ValueBounds::invalid(node.type, BoundsInvalidity::DOMAIN_ERROR, input.mayBeMissing);
   }
   if ((node.opcode == ValueOpcode::SQRT && low < 0.0)
       || (node.opcode == ValueOpcode::LOG && low <= 0.0)
@@ -1072,6 +1073,56 @@ std::string ValueFunctionRegistry::arrayReducerNames() {
     result += "(...)";
   }
   return result;
+}
+
+bool ValueProgram::structurallyEqual(const ValueProgram& other) const {
+  auto equalNode = [&](auto&& self, uint32_t leftIndex, uint32_t rightIndex) -> bool {
+    const ValueNode& left = nodes[leftIndex];
+    const ValueNode& right = other.nodes[rightIndex];
+    auto kind = [](ValueNodeKind value) {
+      return value == ValueNodeKind::VARIABLE ? ValueNodeKind::CONSTANT : value;
+    };
+    if (kind(left.kind) != kind(right.kind)
+        || left.type != right.type || left.nature != right.nature) return false;
+    switch (kind(left.kind)) {
+      case ValueNodeKind::CONSTANT:
+        if (left.type == ValueType::INT64) return left.intValue == right.intValue;
+        if (left.type == ValueType::DOUBLE) {
+          return std::bit_cast<uint64_t>(left.doubleValue)
+              == std::bit_cast<uint64_t>(right.doubleValue);
+        }
+        if (left.arraySize != right.arraySize) return false;
+        for (uint32_t i = 0; i < left.arraySize; i++) {
+          if (left.type == ValueType::INT64_ARRAY) {
+            if (intArrays[left.arrayOffset + i]
+                != other.intArrays[right.arrayOffset + i]) return false;
+          } else if (std::bit_cast<uint64_t>(doubleArrays[left.arrayOffset + i])
+              != std::bit_cast<uint64_t>(other.doubleArrays[right.arrayOffset + i])) {
+            return false;
+          }
+        }
+        return true;
+      case ValueNodeKind::COLUMN:
+        return left.text == right.text && left.columnType == right.columnType
+            && left.columnMultiValued == right.columnMultiValued
+            && left.columnIndexed == right.columnIndexed;
+      case ValueNodeKind::FUNCTION:
+        if (left.function != right.function || left.opcode != right.opcode
+            || left.childCount != right.childCount) return false;
+        for (uint8_t i = 0; i < left.childCount; i++) {
+          if (!self(self, left.children[i], right.children[i])) return false;
+        }
+        return true;
+      case ValueNodeKind::SCORE:
+      case ValueNodeKind::DOCID:
+        return true;
+      case ValueNodeKind::VARIABLE:
+        assert(false);
+        return false;
+    }
+    return false;
+  };
+  return equalNode(equalNode, rootNode, other.rootNode);
 }
 
 BoundValueProgram* ValueProgram::bind(MemPool& pool,

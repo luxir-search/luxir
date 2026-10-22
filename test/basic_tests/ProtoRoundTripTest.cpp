@@ -280,19 +280,24 @@ void roundTripType(const char* nm) {
   X(Query) X(ExistsQuery) X(ConstantScoreQuery) X(BoostQuery) X(RescoreQuery) X(KnnQuery) X(Match) X(AnyOfQuery) X(Filter)    \
   X(BooleanQuery) X(PrefixQuery) X(WildcardQuery) X(RegexQuery) X(FuzzyQuery) X(PhraseQuery)       \
   X(SimpleQuery) X(RangeQuery) X(GeoBoxQuery) X(GeoDistanceQuery) X(ExprQuery) X(Warning)           \
+  X(WeightedField) X(PhraseOptions) X(MultiMatchQuery) X(DisMaxQuery)                                         \
   X(FieldFacet) X(ExecutionProfile) X(ExecutionProfileOp) X(ExecutionProfilePiece)                 \
   X(CalendarGap) X(RangeFacet) X(QueryBucket) X(QueryFacet) X(Domain)                               \
   X(SearchResponse) X(DocList) X(FacetResult) X(CommitParams) X(UpdateRequest)                     \
   X(UpdateResponse) X(Map) X(Val) X(ArrVal) X(ArrStr) X(ArrInt)                                    \
   X(ArrFloat) X(ArrDouble) X(ArrBin) X(ArrArrStr) X(ArrArrInt) X(ArrArrFloat) X(ArrArrDouble)      \
-  X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVector) X(MultiVector) X(ColInt)    \
+  X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVal) X(ColVector) X(MultiVector) X(ColInt) \
   X(ColFloat) X(ColDouble) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerComponent) X(AnalyzerDef) \
   X(FieldDef) X(SchemaDef) X(SchemaRequest) X(SchemaResponse)                                      \
   X(CreateCollectionRequest) X(CreateCollectionResponse)                                           \
   X(DeleteCollectionRequest) X(DeleteCollectionResponse) X(ListCollectionsResponse)                \
   X(StatsRequest) X(StatsResponse) X(StatsTotals) X(CollectionStats) X(ShardStats) X(IndexStats)    \
   X(SegmentStats) X(AuxStats) X(QueryCacheStats) X(IndexRamStats) X(ArenaStats) X(JemallocStats)   \
-  X(FieldMetadataStats) X(MemoryStats) X(StorageRamStats)                                                                \
+  X(FieldMetadataStats) X(MemoryStats) X(ScrubStats) X(StorageRamStats) X(OutcomeStats) X(CollectionActivityStats) \
+  X(HistogramStats) X(ActivityStats) X(TransportStats) X(ServiceStats) X(SystemStats) X(HostStats)             \
+  X(ProcessStats) X(ProcessIoStats) X(CpuTimes) X(HostCpuStats) X(HostMemoryStats) X(NetworkInterfaceStats)        \
+  X(TcpStats) X(DiskStats) X(FilesystemStats) X(PressureStats) X(CgroupStats)                    \
+  X(CgroupMemoryStats) X(CgroupCpuStats) X(CgroupTaskStats)                                       \
   X(CacheControlRequest) X(CacheControlResponse) X(CacheEntryDump)                                \
   X(ShardCacheControl) X(CollectionCacheControl)
 
@@ -300,6 +305,27 @@ TEST(ProtoRoundTrip, AllMessages) {
 #define RT(T) roundTripType<P::T>(#T);
   LUXIR_MSGS(RT)
 #undef RT
+}
+
+TEST(ProtoRoundTrip, CacheBudgetPresence) {
+  for (auto bytes : std::array<std::optional<uint64_t>, 3>{std::nullopt, 0, 17}) {
+    P::CacheControlRequest in;
+    in.max_bytes = bytes;
+    std::vector<std::byte> wire;
+    ASSERT_TRUE(encode(in, wire));
+    std::vector<std::byte> expected;
+    if (bytes) expected = {std::byte{0x40}, (std::byte)*bytes};
+    EXPECT_EQ(expected, wire);
+    std::pmr::monotonic_buffer_resource resource;
+    P::CacheControlRequest out;
+    ASSERT_TRUE(decode(out, P::copyToPaddedInput(std::span<const std::byte>(wire), resource), resource));
+    EXPECT_EQ(bytes, out.max_bytes);
+    std::string json;
+    ASSERT_TRUE(write_json(in, json));
+    P::CacheControlRequest fromJson;
+    ASSERT_TRUE(read_json(fromJson, json, resource));
+    EXPECT_EQ(bytes, fromJson.max_bytes);
+  }
 }
 
 TEST(ProtoRoundTrip, AnalyzerDefTypedParams) {

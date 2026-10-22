@@ -79,7 +79,7 @@ struct Members {
     for (auto& clause : field.clauses) {
       if (auto* text = dynamic_cast<StrColComparator*>(clause.comparator.get())) {
         strings.push_back(text);
-        slotStride += sizeof(std::string);
+        slotStride += sizeof(std::string) + sizeof(uint8_t); // value and missing flag
       } else if (clause.comparator) slotStride += sizeof(int64_t);
       else if (clause.expr) slotStride += sizeof(FieldSortCollector::RuntimeClause::ExprSlot);
     }

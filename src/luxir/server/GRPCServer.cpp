@@ -20,6 +20,7 @@
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
 #include <grpcpp/support/byte_buffer.h>
 #include <hpp_proto/grpc/serialization.hpp>
+#include <oneapi/tbb/task_arena.h>
 #include <oneapi/tbb/task_group.h>
 
 #include "GRPCServer.h"
@@ -46,8 +47,7 @@ namespace luxir {
 // #define GRPC_DEBUG LOG_DEBUG
 
 GRPCServer::GRPCServer(LuxirNode& node, int nthreads, int port, int64_t streamBufferBytes)
-  : luxirNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads),
-    arenaEntrants(node, nthreads, "GRPCServer"), requestedPort(port),
+  : luxirNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads), requestedPort(port),
     // Clamp to >= 1: a non-positive high-water mark (misconfiguration) would
     // pause every reply while the drain check (queuedBytes <= low) never fires.
     streamBufferBytes_(std::max<int64_t>(1,
@@ -59,7 +59,7 @@ GRPCServer::GRPCServer(LuxirNode& node, int nthreads, int port, int64_t streamBu
 // interface that may help with integration with external event loops.
 
 void luxir::GRPCServer::run() {
-  pthread_setname_np(pthread_self(), "luxir_grpc_main");
+  nameThisThread("luxir_grpc_main");
 
   // Use requestedPort (default 0 for dynamic allocation, or a specific port
   // like 50051).  Dynamic test ports bind localhost; configured ports keep the
@@ -171,6 +171,10 @@ struct MethodEntry {
   // ReadOnlyDirectory), but that backstop is for paths holding a Directory
   // directly - it is not a decent error for a caller.
   bool mutating = false;
+  MetricOperation operation = MetricOperation::OTHER;
+  // Many request messages on one call; a message's in-band failure does not
+  // fail the call (searches and index batches count each message).
+  bool clientStream = false;
 };
 
 static const MethodEntry* lookupMethod(const std::string& method);
@@ -292,6 +296,8 @@ static grpc::ByteBuffer serializeToByteBuffer(const Message& msg) {
 // post-write callback. A unary RPC is just a stream with one read + one write.
 class GenericCallData : public CallData {
 public:
+  MetricScope requestMetric;
+  std::atomic<int> metricErrorKind{-1};  // the first ErrorKind, or -1
   std::stop_source waitCancellation{std::nostopstate};
   std::optional<std::stop_callback<std::function<void()>>> serverCancellation;
   grpc::AsyncGenericService& genericService;
@@ -339,6 +345,12 @@ public:
         highWater(server.streamBufferBytes()), lowWater(server.streamBufferBytes() / 2) {
     genericCtx.AsyncNotifyWhenDone(make_tag(DONE));
     genericService.RequestCall(&genericCtx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
+  }
+
+  // Records the call's first error; any thread may report it.
+  void metricError(ErrorKind kind) {
+    int none = -1;
+    metricErrorKind.compare_exchange_strong(none, (int)kind, std::memory_order_relaxed);
   }
 
   void enableWaitCancellation() {
@@ -394,6 +406,7 @@ public:
       kickFinish();
       return -1;
     }
+    server.getLuxirNode().metrics->add(MetricTransportCounter::SENT_BYTES, MetricTransport::GRPC, buf.Length());
     queuedBytes += (int64_t)buf.Length();
     if (writeOutstanding) {
       pending.emplace_back(std::move(buf));
@@ -422,6 +435,7 @@ public:
     {
       const std::lock_guard<std::mutex> lock(mutex);
       if (!errored && queuedBytes > lowWater) {
+        server.getLuxirNode().metrics->add(MetricTransportCounter::STREAM_PAUSES, MetricTransport::GRPC);
         drainWaiters.push_back(std::move(resume));
         return;
       }
@@ -442,6 +456,10 @@ public:
   // been written: no further requests are read, but nothing accepted is
   // dropped, so a client of a multiplexed UpdateStream still sees the
   // acknowledgements that preceded the failure, then the terminal status.
+  void finishWithError(const ErrorInfo& info, int32_t finishCount = 1) {
+    metricError(info.kind);
+    finishWithError(grpcStatus(info), finishCount);
+  }
   void finishWithError(grpc::Status status, int32_t finishCount = 1) {
     std::vector<std::function<void()>> waiters;
     {
@@ -492,7 +510,11 @@ public:
   // allocation failure falls back to running the resume inline.
   void enqueueResume(std::function<void()> resume) {
     try {
-      server.getLuxirNode().getTaskArena().enqueue(resume);  // copies; resume stays valid if this throws
+      // Isolated like the search itself (SearchEngine::enqueueSubmit): a
+      // parallel emitter's batch waits help only with its own tasks.
+      server.getLuxirNode().getTaskArena().enqueue([resume] {  // copies; resume stays valid if this throws
+        oneapi::tbb::this_task_arena::isolate(resume);
+      });
     } catch (...) {
       if (resume) resume();
     }
@@ -511,6 +533,17 @@ public:
   void deleteIfFinished() {
     if (!doneReceived || !finishReceived) return;
     { const std::lock_guard<std::mutex> lock(mutex); if (readOutstanding) return; }
+    if (requestMetric.active()) {
+      int kind = metricErrorKind.load(std::memory_order_relaxed);
+      // A failed write means the client went away, as on HTTP.
+      auto outcome = genericCtx.IsCancelled() || errored ? MetricOutcome::CANCELLED
+          : kind >= 0 || !finishStatus.ok() ? MetricOutcome::ERROR : MetricOutcome::OK;
+      if (outcome == MetricOutcome::ERROR) {
+        server.getLuxirNode().metrics->requestError(MetricTransport::GRPC,
+            kind >= 0 ? (ErrorKind)kind : ErrorKind::UNKNOWN);
+      }
+      requestMetric.finish(outcome);
+    }
     delete this;
   }
 
@@ -521,7 +554,10 @@ public:
         // re-arm a fresh acceptor before doing any work
         createNew();
         methodEntry = lookupMethod(genericCtx.method());
+        requestMetric.begin(*server.getLuxirNode().metrics, metricActivity(MetricTransport::GRPC,
+            methodEntry ? methodEntry->operation : MetricOperation::OTHER));
         if (methodEntry == nullptr) {
+          metricError(ErrorKind::NOT_FOUND);
           LOG_ERROR("gRPC: no handler for method '{}'", genericCtx.method());
           readsDone = true;
           finishSent = true;
@@ -529,6 +565,7 @@ public:
           break;
         }
         if (methodEntry->mutating && server.getLuxirNode().readOnly()) {
+          metricError(ErrorKind::FAILED_PRECONDITION);
           readsDone = true;
           finishSent = true;
           readerWriter.Finish(
@@ -552,6 +589,7 @@ public:
           else responsesExpected++;
         }
         if (discard) { deleteIfFinished(); break; }
+        server.getLuxirNode().metrics->add(MetricTransportCounter::RECEIVED_BYTES, MetricTransport::GRPC, readBuf.Length());
         methodEntry->handle(*this, readBuf);
         {
           const std::lock_guard<std::mutex> lock(mutex);
@@ -605,7 +643,7 @@ static std::shared_ptr<Collection> resolveUpdateCollection(GRPCServer& server, c
 }
 
 static void finishWithError(GenericCallData& call, const ErrorInfo& info) {
-  call.finishWithError(grpcStatus(info));
+  call.finishWithError(info);
 }
 
 // Unary handlers run after request parsing, so an unclassified exception is
@@ -643,8 +681,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       } catch (const std::exception& e) {
         // The response cannot be delivered: the call ends with the failure
         // instead of a silently empty message.
-        parent->finishWithError(grpcStatus(classifyException(e, ErrorKind::INTERNAL)),
-                                response.last ? 1 : 0);
+        parent->finishWithError(classifyException(e, ErrorKind::INTERNAL), response.last ? 1 : 0);
         response.req.replyCallback(response);
         return ReplyStatus::CANCEL;
       }
@@ -692,17 +729,18 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     call.enableWaitCancellation();
     req.waitCancellation = call.waitCancellation;
   }
-  // Route by max_parallel (via dispatch()): the default (0) runs the whole
-  // query serially right here on this completion-queue thread - the cheapest
-  // path, accepting that this cq's other calls wait for the query's duration
-  // (a paused streaming producer parks and returns, so flow control still
-  // advances).  -1 also runs here, entering the task arena so its workers
-  // parallelize the query; 1 runs on the task arena instead, keeping this
-  // cq thread free to process completions.  The call outlives the request
-  // because its outstanding-response count stays positive until the final
-  // reply, and requestActive keeps pipelined requests on this stream ordered.
+  // Every search leaves this completion-queue thread for the task arena (see
+  // SearchEngine::Receiver): gRPC offers a connection's new calls to its
+  // preferred cq first, so a query run here would serialize the concurrent
+  // calls on that connection.  max_parallel keeps its parallelism meaning: 0
+  // (the default) and 1 run serially on a worker, -1 fans out from one.  The
+  // reply and the final response come from that worker: respondRaw() is
+  // thread-safe and Finish is kicked back to this call's cq thread.  The call
+  // outlives the request because its outstanding-response count stays
+  // positive until the final reply, and requestActive keeps pipelined
+  // requests on this stream ordered.
   { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
-  engine.dispatch(req, req.proto.max_parallel);
+  engine.dispatch(req, req.proto.max_parallel, SearchEngine::Receiver::OFFLOAD);
 }
 
 
@@ -736,9 +774,12 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       completed->await(call->server.getLuxirNode(), [call](auto result) {
         call->server.getLuxirNode().getTaskArena().enqueue([call, result] {
           try {
+            // A unary update fails only when nothing was applied.
+            if (!call->methodEntry->clientStream && result->response.status == api::UpdateResponse_::Status::ERROR)
+              call->metricError(ProtoUpdateMessage::failureKind(result->response));
             call->respondRaw(serializeToByteBuffer(result->response), 1);
           } catch (const std::exception& e) {
-            call->finishWithError(grpcStatus(classifyException(e, ErrorKind::INTERNAL)));
+            call->finishWithError(classifyException(e, ErrorKind::INTERNAL));
           }
         });
       }, stop);
@@ -967,15 +1008,15 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
 
 static const MethodEntry* lookupMethod(const std::string& method) {
   static const std::unordered_map<std::string, MethodEntry> table = {
-    {"/luxir.Searcher/Search",          {handleSearch}},
-    {"/luxir.Indexer/Update",           {handleUpdate, true}},
-    {"/luxir.Indexer/UpdateStream",     {handleUpdate, true}},
-    {"/luxir.Admin/SetSchema",          {handleSetSchema, true}},
-    {"/luxir.Admin/GetSchema",          {handleGetSchema}},
-    {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true}},
-    {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true}},
-    {"/luxir.Admin/Stats",              {handleStats}},
-    {"/luxir.Admin/CacheControl",       {handleCacheControl}},
+    {"/luxir.Searcher/Search",          {handleSearch, false, MetricOperation::SEARCH, true}},
+    {"/luxir.Indexer/Update",           {handleUpdate, true, MetricOperation::UPDATE}},
+    {"/luxir.Indexer/UpdateStream",     {handleUpdate, true, MetricOperation::UPDATE, true}},
+    {"/luxir.Admin/SetSchema",          {handleSetSchema, true, MetricOperation::SCHEMA}},
+    {"/luxir.Admin/GetSchema",          {handleGetSchema, false, MetricOperation::SCHEMA}},
+    {"/luxir.Admin/CreateCollection",   {handleCreateCollection, true, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/DeleteCollection",   {handleDeleteCollection, true, MetricOperation::COLLECTIONS}},
+    {"/luxir.Admin/Stats",              {handleStats, false, MetricOperation::STATS}},
+    {"/luxir.Admin/CacheControl",       {handleCacheControl, false, MetricOperation::OTHER}},
   };
   auto it = table.find(method);
   return it == table.end() ? nullptr : &it->second;
@@ -983,9 +1024,9 @@ static const MethodEntry* lookupMethod(const std::string& method) {
 
 
 void GRPCServer::runThread(ThreadInfo& threadInfo) {
-  // linux-only: give threads a nice name for debugging.
+  // Give threads a name for debugging.
   std::string tname = "luxir_grpc_" + std::to_string(threadInfo.threadno);
-  pthread_setname_np(pthread_self(), tname.c_str());
+  nameThisThread(tname.c_str());
 
   // wait for the server to start before trying to use it.
   startLatch.wait();

@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "LuxirConfig.h"
+#include <CLI/CLI.hpp>
 #include "luxir/util/ProcessAllocator.h"
 #include "luxir/server/Collections.h"
 #include <unistd.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
 #include <algorithm>
 #include <fstream>
 #include <limits>
@@ -12,6 +16,7 @@
 
 namespace luxir {
 
+#ifndef __APPLE__
 namespace {
 
 // Single integer from a one-line file; 0 if it is missing or not a number
@@ -24,8 +29,16 @@ int64_t readInt64File(const char* path) {
 }
 
 }  // namespace
+#endif
 
 int64_t systemRamBytes() {
+#ifdef __APPLE__
+  uint64_t bytes = 0;
+  size_t size = sizeof(bytes);
+  if (sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) != 0
+      || bytes > (uint64_t)std::numeric_limits<int64_t>::max()) return 0;
+  return (int64_t)bytes;
+#else
   long pages = sysconf(_SC_PHYS_PAGES);
   long pageSize = sysconf(_SC_PAGESIZE);
   if (pages <= 0 || pageSize <= 0) return 0;
@@ -40,6 +53,7 @@ int64_t systemRamBytes() {
     if (limit > 0 && limit < bytes) bytes = limit;
   }
   return bytes;
+#endif
 }
 
 /*
@@ -168,6 +182,17 @@ void LuxirConfig::addOptions(CLI::App& app) {
   app.add_option("--store.checked-dir.sync", store.checked_dir.sync, "Check fsync correctness: off, warn, throw")
       ->default_val(store.checked_dir.sync)
       ->check(CLI::IsMember({"off", "warn", "throw"}));
+  app.add_option("--store.verify-on-open", store.verify_on_open,
+                 "Startup check of committed files: none, or full (size and xxh3 of every file)")
+      ->default_val(store.verify_on_open)
+      ->check(CLI::IsMember({"none", "full"}));
+  app.add_option("--store.scrub-interval-s", store.scrub_interval_s,
+                 "Seconds between background checksum scrubs of published snapshots (0 = off)")
+      ->default_val(store.scrub_interval_s);
+  app.add_option("--store.scrub-max-bytes-per-sec", store.scrub_max_bytes_per_sec,
+                 "Background scrub read rate limit (0 = unthrottled)")
+      ->transform(CLI::AsSizeValue(false))
+      ->default_str("64MB");
 
   app.add_flag("--indexing.huge-pages,!--no-indexing.huge-pages", index.huge_pages,
                "Advise transparent huge pages for the indexing arena (jemalloc builds; "

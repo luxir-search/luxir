@@ -144,10 +144,12 @@ void appendArray(std::string& out, const Repeated& v, Emit&& emit) {
   out += ']';
 }
 
+void appendOpVal(std::string& out, const luxir::api::Val& val);
+
 // Per-cell renderers, one per column kind.  Missing renders as null: scalar
 // columns by the exact missing_val sentinel, multi-valued columns by empty
 // array (a present-but-empty list is indistinguishable from missing and also
-// maps to null), vectors by the unset f32 oneof.  Out-of-range slots render
+// maps to null), vectors by the unset f32 oneof, values by an unset kind.  Out-of-range slots render
 // null.  resolveCellFn dispatches a column's variant ONCE; the row walk then
 // calls the resolved function per cell.
 using CellFn = void (*)(std::string&, const luxir::api::Column&, size_t);
@@ -212,6 +214,11 @@ void multiVec(std::string& out, const luxir::api::Column& col, size_t i) {
     });
   } else out += "null";
 }
+void val(std::string& out, const luxir::api::Column& col, size_t i) {
+  auto& c = std::get<luxir::api::ColVal>(col.kind);
+  if (i < c.v.size() && !c.v[i].isNull()) appendOpVal(out, c.v[i]);
+  else out += "null";
+}
 void nul(std::string& out, const luxir::api::Column&, size_t) { out += "null"; }
 } // namespace cell
 
@@ -224,6 +231,7 @@ CellFn resolveCellFn(const luxir::api::Column& col) {
   if (std::holds_alternative<luxir::api::ArrArrInt>(col.kind)) return cell::arrInt;
   if (std::holds_alternative<luxir::api::ArrArrFloat>(col.kind)) return cell::arrFlt;
   if (std::holds_alternative<luxir::api::ArrArrDouble>(col.kind)) return cell::arrDbl;
+  if (std::holds_alternative<luxir::api::ColVal>(col.kind)) return cell::val;
   if (std::holds_alternative<luxir::api::ColVector>(col.kind)) return cell::vec;
   if (std::holds_alternative<luxir::api::MultiVector>(col.kind)) return cell::multiVec;
   return cell::nul;
@@ -249,7 +257,6 @@ void appendBucketId(std::string& out, const luxir::api::Column& col, size_t i) {
   }
 }
 
-void appendOpVal(std::string& out, const luxir::api::Val& val);
 void appendFacetSlot(std::string& out, const luxir::api::Val& val, size_t i);
 
 // Document i is the merge of columns row i and docs[i] (see the DocList
@@ -459,6 +466,7 @@ void appendDocListMembers(std::string& out, const luxir::api::DocList& docs) {
     out += R"("found":)";
     appendInt(out, *docs.found);
     out += ',';
+    if (docs.found_gte) out += R"("found_gte":true,)";
   }
   if (docs.found_docs.has_value()) {
     out += R"("found_docs":)";
@@ -651,7 +659,7 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
   // Found goes out with the op's first run; request warnings and the request
   // id with the stream's first header. Degraded execution must not be silent,
   // and neither may correlation, so either forces a header even without
-  // get_number.
+  // nonzero count_limit.
   bool haveFound = firstForOp && docs.found.has_value();
   bool haveFoundDocs = firstForOp && docs.found_docs.has_value();
   bool haveFoundGroups = firstForOp && docs.found_groups.has_value();
@@ -679,6 +687,7 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
       if (!first) marker += ',';
       marker += R"("found":)";
       appendInt(marker, *docs.found);
+      if (docs.found_gte) marker += R"(,"found_gte":true)";
       first = false;
     }
     if (haveFoundDocs) {

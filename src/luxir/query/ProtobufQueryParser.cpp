@@ -3,7 +3,9 @@
 
 #include "luxir/query/ProtobufQueryParser.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <format>
 #include <limits>
 #include <stdexcept>
@@ -19,6 +21,7 @@
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
+#include "luxir/query/DisMaxQuery.h"
 #include "luxir/query/ExprParser.h"
 #include "luxir/query/GeoBoxQuery.h"
 #include "luxir/query/GeoDistanceQuery.h"
@@ -26,9 +29,11 @@
 #include "luxir/query/ParseContext.h"
 #include "luxir/query/Query.h"
 #include "luxir/query/RescoreQuery.h"
+#include "luxir/query/MinScoreQuery.h"
 #include "luxir/query/SimpleQueryParser.h"
 #include "luxir/query/TermQuery.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/search/IndexReader.h"
 #include "luxir/util/Overloaded.h"
 #include "luxir/value/ValueExprParser.h"
 
@@ -257,10 +262,23 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
     throw std::runtime_error(std::format(
       "KnnQuery for field '{}' must have a non-empty query vector", field));
   }
-  if (vectorType.dims() > 0 && (int32_t)queryVec.size() != vectorType.dims()) {
+  // Query vectors follow the same input contract as indexed ones and are cut
+  // to the same stored prefix, so the query is scored exactly like the
+  // indexed vectors.
+  if (std::string err = vectorType.inputError(queryVec); !err.empty()) {
     throw std::runtime_error(std::format(
-      "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
-      queryVec.size(), vectorType.dims(), field));
+      "KnnQuery: query vector for field '{}': {}", field, err));
+  }
+  queryVec = queryVec.first(vectorType.storedSize(queryVec.size()));
+  if (vectorType.metric() == VectorFieldType::METRIC_COSINE) {
+    // No direction to compare (possibly only after truncation): every
+    // candidate would score 0.
+    double normSq = 0.0;
+    for (float x : queryVec) normSq += (double)x * (double)x;
+    if (normSq <= VectorFieldType::MIN_COSINE_NORM_SQ) {
+      throw std::runtime_error(std::format(
+        "KnnQuery: cosine query vector for field '{}' has zero norm", field));
+    }
   }
 
   int32_t k = knnQuery.k;
@@ -288,9 +306,24 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
   if (groups && context.collapse == nullptr) {
     throw std::runtime_error("knn.unit groups requires an enclosing collapse");
   }
+  std::optional<float> similarity = knnQuery.similarity;
+  if (similarity.has_value()) {
+    if (!std::isfinite(*similarity)) {
+      throw std::runtime_error(std::format(
+        "KnnQuery for field '{}' must have a finite similarity", field));
+    }
+    if (vectorType.metric() == VectorFieldType::METRIC_L2
+        && *similarity < 0.0f) {
+      throw std::runtime_error(std::format(
+        "KnnQuery for l2 field '{}' must have similarity >= 0 (a maximum distance), got {}",
+        field, *similarity));
+    }
+  }
+
   return pool.make<luxir::KnnQuery>(
     field, vectorType, queryVec, k, nprobe, knnQuery.refine_candidates,
-    minScanFraction, knnQuery.exact, groups ? context.collapse : nullptr);
+    minScanFraction, knnQuery.exact, groups ? context.collapse : nullptr,
+    similarity);
 }
 
 std::span<Query*> ProtobufQueryParser::parseQueryList(
@@ -459,16 +492,96 @@ luxir::Query* ProtobufQueryParser::parseRescore(const luxir::api::RescoreQuery& 
         "RescoreQuery expression must produce a scalar numeric value");
   }
 
+  if (rescoreQuery.min_score.has_value()
+      && !std::isfinite(*rescoreQuery.min_score)) {
+    throw std::runtime_error("RescoreQuery min_score must be finite");
+  }
   luxir::Query* child = parse(*rescoreQuery.query);
+  luxir::Query* rescored;
+  std::optional<float> constant;
   if (program->root().kind == ValueNodeKind::SCORE) {
-    return child;
+    rescored = child;
+  } else if (constant = constantOutput(*program);
+             constant.has_value()
+             && exactlyRepresented(*program->constantScalar, *constant)) {
+    rescored = pool.make<luxir::ConstantScoreQuery>(child, *constant);
+  } else {
+    rescored = pool.make<luxir::RescoreQuery>(child, program, constant);
   }
-  std::optional<float> constant = constantOutput(*program);
-  if (constant.has_value()
-      && exactlyRepresented(*program->constantScalar, *constant)) {
-    return pool.make<luxir::ConstantScoreQuery>(child, *constant);
+  if (!rescoreQuery.min_score.has_value()) return rescored;
+  return pool.make<luxir::MinScoreQuery>(rescored, *rescoreQuery.min_score);
+}
+
+namespace {
+
+QueryBuilder::Operator builderOperator(luxir::api::Match_::Operator op) {
+  return op == luxir::api::Match_::Operator::AND ? QueryBuilder::Operator::AND
+                                                  : QueryBuilder::Operator::OR;
+}
+
+float tieOf(std::optional<float> tie, std::string_view label, float defaultValue) {
+  float value = tie.value_or(defaultValue);
+  if (!std::isfinite(value) || value < 0.0f || value > 1.0f) {
+    throw std::runtime_error(std::format(
+        "{} 'tie' must be finite and in [0, 1] (got {})", label, value));
   }
-  return pool.make<luxir::RescoreQuery>(child, program, constant);
+  return value;
+}
+
+} // namespace
+
+luxir::Query* ProtobufQueryParser::parseMultiMatch(const luxir::api::MultiMatchQuery& query) {
+  using Mode = luxir::api::MultiMatchQuery_::Mode;
+  if (query.min_match < 0) {
+    throw std::runtime_error("multi_match 'min_match' must not be negative");
+  }
+  if (query.phrase) {
+    if (query.mode != Mode::PER_FIELD) {
+      throw std::runtime_error("multi_match 'phrase' requires mode per_field");
+    }
+    if (query.operator_ != api::Match_::Operator::OPERATOR_UNSPECIFIED || query.min_match > 0) {
+      throw std::runtime_error("multi_match 'phrase' cannot be combined with 'operator' or 'min_match'");
+    }
+    if (query.phrase->slop < 0) {
+      throw std::runtime_error("multi_match phrase 'slop' must not be negative");
+    }
+  }
+  float tie = tieOf(query.tie, "multi_match", 1.0f);
+  if (query.fields.empty()) {
+    throw std::runtime_error("multi_match requires a non-empty 'fields' list");
+  }
+  std::vector<QueryBuilder::WeightedField> fields;
+  for (const auto& field : query.fields) {
+    float weight = field.weight.value_or(1.0f);
+    if (field.field.empty()) {
+      throw std::runtime_error("multi_match: empty field name");
+    }
+    if (!std::isfinite(weight) || weight <= 0.0f) {
+      throw std::runtime_error(std::format(
+          "multi_match: weight of field '{}' must be finite and > 0 (got {})",
+          field.field, weight));
+    }
+    fields.push_back({field.field, weight});
+  }
+  QueryBuilder builder(
+      pool, schema, context.coerceContext, context.opName, context.warnings, &context.fields, context.reader);
+  auto op = builderOperator(query.operator_);
+  switch (query.mode) {
+    case Mode::COMBINED:
+      return builder.createMultiMatchCombined(fields, query.text, op, query.min_match, tie);
+    case Mode::PER_FIELD:
+      return builder.createMultiMatchPerField(fields, query.text, op, query.min_match, tie,
+          query.phrase ? std::optional<int32_t>(query.phrase->slop) : std::nullopt);
+  }
+  throw std::runtime_error(std::format("multi_match: unknown mode {}", (int)query.mode));
+}
+
+luxir::Query* ProtobufQueryParser::parseDisMax(const luxir::api::DisMaxQuery& query) {
+  if (query.queries.empty()) {
+    throw std::runtime_error("dis_max requires a non-empty 'queries' list");
+  }
+  float tie = tieOf(query.tie, "dis_max", 0.0f);
+  return luxir::DisMaxQuery::make(pool, parseQueryList(query.queries), tie);
 }
 
 luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
@@ -501,6 +614,8 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
     [&](const luxir::api::RescoreQuery& r) -> luxir::Query* {
       return parseRescore(r);
     },
+    [&](const luxir::api::MultiMatchQuery& m) -> luxir::Query* { return parseMultiMatch(m); },
+    [&](const luxir::api::DisMaxQuery& d) -> luxir::Query* { return parseDisMax(d); },
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },
   }, pquery.kind);

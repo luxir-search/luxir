@@ -9,11 +9,13 @@
 #include <cstdint>
 #include <cstdio>
 #include <limits>
-#include <mutex>
+#include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "luxir/util/Clock.h"
 #include "luxir/util/Cursor.h"
@@ -109,10 +111,55 @@ inline int varDigits(Cursor& cur, int maxDigits, long& out) {
   return count;
 }
 
+struct IanaZoneRules;
+
 } // namespace datetime_detail
 
+// The UTC offset in force over the instants [begin, end), in epoch millis.
+// Endpoints beyond the supported range clamp to [kMinEpochMs, kMaxEpochMs + 1].
+struct ZoneInterval {
+  int64_t begin;
+  int64_t end;
+  std::chrono::seconds offset;
+};
+
+// How a civil millisecond maps to instants. A SKIPPED civil time lies in a
+// forward gap and a REPEATED one in a fold; before and after are the offsets
+// on either side of that transition (equal for UNIQUE). The classification
+// holds for every civil millisecond in [civilBegin, civilEnd), clamped like
+// ZoneInterval: the whole gap or fold, or for a UNIQUE time the rest of its
+// run up to the next gap or fold.
+struct LocalOffsets {
+  enum class Kind : uint8_t { UNIQUE, SKIPPED, REPEATED };
+  Kind kind;
+  std::chrono::seconds before;
+  std::chrono::seconds after;
+  int64_t civilBegin;
+  int64_t civilEnd;
+};
+
+// A named IANA zone decoded from its compiled TZif file (DateTime.cpp). The
+// process-lifetime registry owns every instance.
+class IanaZone {
+  std::string zoneName;
+  std::unique_ptr<const datetime_detail::IanaZoneRules> rules;
+  uint64_t id;  // never reused, unlike the address
+
+public:
+  IanaZone(std::string name, std::unique_ptr<const datetime_detail::IanaZoneRules> rules);
+  ~IanaZone();
+
+  std::string_view name() const { return zoneName; }
+  std::chrono::seconds offsetAt(int64_t instant) const;
+  ZoneInterval intervalAt(int64_t instant) const;
+  LocalOffsets localAt(int64_t civilMillis) const;
+
+private:
+  std::runtime_error inconsistent(int64_t millis) const;
+};
+
 // A request's civil frame. UTC and fixed offsets use arithmetic-only fast
-// paths; an IANA value points into the process-lifetime chrono tzdb snapshot.
+// paths; an IANA value points at a zone in the process-lifetime registry.
 class TimeZone {
 public:
   enum class Kind : uint8_t { UTC, FIXED, IANA };
@@ -120,10 +167,9 @@ public:
 private:
   Kind kind_;
   int offsetMinutes_;
-  const std::chrono::time_zone* zone_;
+  const IanaZone* zone_;
 
-  constexpr TimeZone(Kind kind, int offsetMinutes,
-                     const std::chrono::time_zone* zone)
+  constexpr TimeZone(Kind kind, int offsetMinutes, const IanaZone* zone)
     : kind_(kind), offsetMinutes_(offsetMinutes), zone_(zone) {}
 
 public:
@@ -131,7 +177,7 @@ public:
   static constexpr TimeZone fixed(int offsetMinutes) {
     return offsetMinutes == 0 ? utc() : TimeZone(Kind::FIXED, offsetMinutes, nullptr);
   }
-  static constexpr TimeZone iana(const std::chrono::time_zone* zone) {
+  static constexpr TimeZone iana(const IanaZone* zone) {
     return TimeZone(Kind::IANA, 0, zone);
   }
 
@@ -140,7 +186,7 @@ public:
   constexpr bool isFixed() const { return kind_ == Kind::FIXED; }
   constexpr bool isIana() const { return kind_ == Kind::IANA; }
   constexpr int offsetMinutes() const { return offsetMinutes_; }
-  constexpr const std::chrono::time_zone* ianaZone() const { return zone_; }
+  constexpr const IanaZone* ianaZone() const { return zone_; }
 
   std::string name() const {
     if (isUtc()) return "UTC";
@@ -157,37 +203,27 @@ public:
 
 namespace datetime_detail {
 
-struct TzdbState {
-  std::once_flag once;
-  const std::chrono::tzdb* database = nullptr;
+// The zones of one zoneinfo tree: every Zone and Link that its tzdata.zi
+// names, decoded from the tree's compiled TZif files. The process loads one on
+// first use (DateTime.cpp).
+class ZoneRegistry {
+  std::vector<std::unique_ptr<IanaZone>> zones;
+  std::vector<std::pair<std::string, const IanaZone*>> names;  // sorted
+
+public:
   std::string version = "unavailable";
   std::string error;
+
+  // An unreadable tzdata.zi or a tree with no loadable zone sets error.
+  static ZoneRegistry load(const std::string& root);
+  // Exact, case-sensitive Zone or Link name; a link yields its target zone.
+  const IanaZone* find(std::string_view name) const;
+  size_t zoneCount() const { return zones.size(); }
+  const IanaZone& zone(size_t index) const { return *zones[index]; }
 };
 
-inline TzdbState& tzdbState() {
-  static TzdbState state;
-  return state;
-}
-
-inline void loadTzdbOnce() {
-  TzdbState& state = tzdbState();
-  std::call_once(state.once, [&] {
-    try {
-      state.database = &std::chrono::get_tzdb();
-      state.version = state.database->version;
-      LOG_INFO("Loaded time-zone database version {}", state.version);
-    } catch (const std::exception& e) {
-      state.error = e.what();
-      LOG_ERROR("Time-zone database unavailable (probed system zoneinfo at "
-                "/usr/share/zoneinfo): {}. UTC and fixed offsets remain available",
-                state.error);
-    } catch (...) {
-      state.error = "unknown error";
-      LOG_ERROR("Time-zone database unavailable (probed system zoneinfo at "
-                "/usr/share/zoneinfo): unknown error. UTC and fixed offsets remain available");
-    }
-  });
-}
+// $TZDIR, else /usr/share/zoneinfo, read once.
+const ZoneRegistry& zoneRegistry();
 
 inline bool parseFixedZoneOffset(std::string_view spec, int& offsetMinutes) {
   if (spec.empty() || (spec[0] != '+' && spec[0] != '-')) return false;
@@ -210,25 +246,22 @@ inline bool parseFixedZoneOffset(std::string_view spec, int& offsetMinutes) {
 
 } // namespace datetime_detail
 
-// Force the process tzdb snapshot to load at server startup. Failure is
+// Force the process zone registry to load at server startup. Failure is
 // recorded rather than thrown so UTC/fixed-only service remains available.
 inline void preWarmTimeZoneDatabase() {
-  datetime_detail::loadTzdbOnce();
+  datetime_detail::zoneRegistry();
 }
 
 inline bool timeZoneDatabaseAvailable() {
-  datetime_detail::loadTzdbOnce();
-  return datetime_detail::tzdbState().database != nullptr;
+  return datetime_detail::zoneRegistry().error.empty();
 }
 
 inline std::string_view timeZoneDatabaseVersion() {
-  datetime_detail::loadTzdbOnce();
-  return datetime_detail::tzdbState().version;
+  return datetime_detail::zoneRegistry().version;
 }
 
 inline std::string_view timeZoneDatabaseError() {
-  datetime_detail::loadTzdbOnce();
-  return datetime_detail::tzdbState().error;
+  return datetime_detail::zoneRegistry().error;
 }
 
 // Exact request-zone grammar: UTC aliases, fixed +/-hh[[:]mm] capped at
@@ -243,14 +276,9 @@ inline std::optional<TimeZone> resolveTimeZone(std::string_view spec) {
   // are not eligible to become surprising IANA names.
   if (spec[0] == '+' || spec[0] == '-') return std::nullopt;
 
-  datetime_detail::loadTzdbOnce();
-  auto* database = datetime_detail::tzdbState().database;
-  if (database == nullptr) return std::nullopt;
-  try {
-    return TimeZone::iana(database->locate_zone(std::string(spec)));
-  } catch (const std::exception&) {
-    return std::nullopt;
-  }
+  const IanaZone* zone = datetime_detail::zoneRegistry().find(spec);
+  if (zone == nullptr) return std::nullopt;
+  return TimeZone::iana(zone);
 }
 
 inline std::string timeZoneResolutionError(std::string_view spec) {
@@ -270,6 +298,9 @@ struct DateRange {
   int64_t lo;
   int64_t hiExclusive;
   bool granuleSkipped = false;
+  // NOW-anchored with no rounding coarser than a millisecond: the window
+  // moves with every request millisecond.
+  bool unroundedNow = false;
 };
 
 // A parsed literal additionally preserves whether an offset token was present.
@@ -290,11 +321,6 @@ struct CivilTime {
 
 enum class CalendarUnit : uint8_t { DAY, WEEK, MONTH, QUARTER, YEAR };
 
-struct CivilFence {
-  int64_t civilMillis;
-  int64_t instant;
-};
-
 inline std::optional<CivilTime> civilFromInstant(int64_t millis, const TimeZone& zone) {
   namespace dd = datetime_detail;
   using namespace std::chrono;
@@ -304,12 +330,7 @@ inline std::optional<CivilTime> civilFromInstant(int64_t millis, const TimeZone&
   if (zone.isFixed()) {
     offset = minutes{zone.offsetMinutes()};
   } else if (zone.isIana()) {
-    try {
-      auto info = zone.ianaZone()->get_info(sys_time<milliseconds>{milliseconds{millis}});
-      offset = info.offset;
-    } catch (const std::exception&) {
-      return std::nullopt;
-    }
+    offset = zone.ianaZone()->offsetAt(millis);
   }
 
   __int128 local = (__int128)millis + duration_cast<milliseconds>(offset).count();
@@ -321,33 +342,15 @@ inline std::optional<CivilTime> civilFromInstant(int64_t millis, const TimeZone&
 
 namespace datetime_detail {
 
-inline std::chrono::seconds offsetForLocalInfo(
-    int64_t civilMillis, const std::chrono::local_info& info,
-    std::optional<std::chrono::seconds> preferredOffset) {
-  using namespace std::chrono;
-  if (info.result == local_info::unique) return info.first.offset;
-  if (info.result == local_info::ambiguous) {
-    // libstdc++ 16 classifies the exact upper endpoint of some transition
-    // intervals with the interval itself. Civil transition intervals are
-    // half-open; at that endpoint only the post-transition offset is valid.
-    auto transition = duration_cast<milliseconds>(
-        info.first.end.time_since_epoch()).count();
-    __int128 overlapEnd = (__int128)transition
-                        + duration_cast<milliseconds>(info.first.offset).count();
-    if ((__int128)civilMillis >= overlapEnd) return info.second.offset;
-    // Java ZonedDateTime.ofLocal: retain a valid preferred source offset;
-    // otherwise use the earlier (pre-transition) offset.
-    return preferredOffset && *preferredOffset == info.second.offset
-        ? info.second.offset : info.first.offset;
+// Java ZonedDateTime.ofLocal: a gap shifts forward by its length (the
+// pre-transition offset); a fold retains a valid preferred source offset and
+// otherwise uses the earlier (pre-transition) one.
+inline std::chrono::seconds offsetForLocal(
+    const LocalOffsets& local, std::optional<std::chrono::seconds> preferredOffset) {
+  if (local.kind == LocalOffsets::Kind::REPEATED && preferredOffset == local.after) {
+    return local.after;
   }
-  auto transition = duration_cast<milliseconds>(
-      info.second.begin.time_since_epoch()).count();
-  __int128 gapEnd = (__int128)transition
-                  + duration_cast<milliseconds>(info.second.offset).count();
-  if ((__int128)civilMillis >= gapEnd) return info.second.offset;
-  // Java's gap shift is local - pre-transition offset. This deliberately
-  // does not use to_sys(choose::), which clamps to the transition instant.
-  return info.first.offset;
+  return local.before;
 }
 
 inline std::optional<int64_t> instantWithOffset(
@@ -374,83 +377,30 @@ inline std::optional<int64_t> instantFromCivil(
   if (zone.isFixed()) {
     offset = minutes{zone.offsetMinutes()};
   } else if (zone.isIana()) {
-    try {
-      auto info = zone.ianaZone()->get_info(
-          local_time<milliseconds>{milliseconds{civilMillis}});
-      offset = dd::offsetForLocalInfo(civilMillis, info, preferredOffset);
-    } catch (const std::exception&) {
-      return std::nullopt;
-    }
+    offset = dd::offsetForLocal(zone.ianaZone()->localAt(civilMillis), preferredOffset);
   }
   return dd::instantWithOffset(civilMillis, offset);
 }
 
-// Detect a nominal civil interval covered by a single forward offset jump.
-// This also normalizes libstdc++ text-tzdb endpoint discrepancies such as
-// Pacific/Apia's 2011 skipped date, where adjacent resolved starts alone do
-// not identify the intended civil label reliably.
+// True when no instant has a civil time in [civilLo, civilNext): the whole
+// civil interval lies inside one forward gap.
 inline bool civilIntervalSkipped(
     int64_t civilLo, int64_t civilNext, const TimeZone& zone) {
-  using namespace std::chrono;
   if (!zone.isIana() || civilNext <= civilLo) return false;
-  try {
-    auto info = zone.ianaZone()->get_info(
-        local_time<milliseconds>{milliseconds{civilNext - 1}});
-    int64_t jump = duration_cast<milliseconds>(
-        info.second.offset - info.first.offset).count();
-    return info.result == local_info::nonexistent
-        && jump >= civilNext - civilLo;
-  } catch (const std::exception&) {
-    return false;
-  }
+  auto local = zone.ianaZone()->localAt(civilLo);
+  return local.kind == LocalOffsets::Kind::SKIPPED && civilNext <= local.civilEnd;
 }
 
 namespace datetime_detail {
 
-// Forward-only local resolver for dense civil fence sequences. A cached
-// local_info interval avoids repeated tzdb searches while a sequence stays in
-// one transition window. A jump outside the interval performs one direct
-// get_info lookup instead of walking intervening transitions.
+// Local resolver for dense, mostly increasing civil fence sequences. The
+// cached classification holds over its civil span, so a sequence that moves
+// forward within one transition window resolves without another zone lookup.
 class LocalTimeResolver {
   TimeZone zone;
   std::optional<std::chrono::seconds> preferredOffset;
-  std::chrono::local_info cachedInfo;
-  __int128 cachedBegin = 0;
-  __int128 cachedEnd = 0;
+  LocalOffsets cachedLocal{};
   bool cached = false;
-
-  void cache(int64_t civilMillis, const std::chrono::local_info& info) {
-    using namespace std::chrono;
-    cachedInfo = info;
-    if (info.result == local_info::ambiguous) {
-      auto transition = duration_cast<milliseconds>(
-          info.first.end.time_since_epoch()).count();
-      cachedBegin = (__int128)transition
-                  + duration_cast<milliseconds>(info.second.offset).count();
-      cachedEnd = (__int128)transition
-                + duration_cast<milliseconds>(info.first.offset).count();
-    } else if (info.result == local_info::nonexistent) {
-      auto transition = duration_cast<milliseconds>(
-          info.second.begin.time_since_epoch()).count();
-      cachedBegin = (__int128)transition
-                  + duration_cast<milliseconds>(info.first.offset).count();
-      cachedEnd = (__int128)transition
-                + duration_cast<milliseconds>(info.second.offset).count();
-    } else {
-      cachedBegin = civilMillis;
-      if (info.first.end == sys_seconds::max()) {
-        cachedEnd = (__int128)kMaxEpochMs + 1;
-      } else {
-        auto next = zone.ianaZone()->get_info(info.first.end);
-        auto transition = duration_cast<milliseconds>(
-            info.first.end.time_since_epoch()).count();
-        auto endOffset = std::min(info.first.offset, next.offset);
-        cachedEnd = (__int128)transition
-                  + duration_cast<milliseconds>(endOffset).count();
-      }
-    }
-    cached = cachedBegin <= civilMillis && (__int128)civilMillis < cachedEnd;
-  }
 
 public:
   LocalTimeResolver(const TimeZone& zone,
@@ -458,24 +408,16 @@ public:
     : zone(zone), preferredOffset(preferredOffset) {}
 
   std::optional<int64_t> resolve(int64_t civilMillis) {
-    using namespace std::chrono;
     if (!zone.isIana()) {
       return instantFromCivil(civilMillis, zone, preferredOffset);
     }
-    try {
-      if (!cached || (__int128)civilMillis < cachedBegin
-          || (__int128)civilMillis >= cachedEnd) {
-        auto info = zone.ianaZone()->get_info(
-            local_time<milliseconds>{milliseconds{civilMillis}});
-        cache(civilMillis, info);
-      }
-      seconds offset = offsetForLocalInfo(
-          civilMillis, cachedInfo, preferredOffset);
-      return instantWithOffset(civilMillis, offset);
-    } catch (const std::exception&) {
-      cached = false;
-      return std::nullopt;
+    if (civilMillis < kMinEpochMs || civilMillis > kMaxEpochMs) return std::nullopt;
+    if (!cached || civilMillis < cachedLocal.civilBegin
+        || civilMillis >= cachedLocal.civilEnd) {
+      cachedLocal = zone.ianaZone()->localAt(civilMillis);
+      cached = true;
     }
+    return instantWithOffset(civilMillis, offsetForLocal(cachedLocal, preferredOffset));
   }
 };
 
@@ -630,20 +572,8 @@ inline std::optional<DateLiteralRange> parseDateLiteralRange(
   auto last = instantFromCivil(civilLast, literalZone, source->offset);
   if (!last || *last < *lo) return std::nullopt;
 
-  bool granuleSkipped = false;
-  if (!hasExplicitOffset && civilNext) {
-    auto next = instantFromCivil(*civilNext, frameZone);
-    granuleSkipped = next && *next == *lo;
-    if (!granuleSkipped && frameZone.isIana()) {
-      // libstdc++ 16's text-tzdb reader places Apia's 2011 dateline jump one
-      // hour later than the system TZif file. The ofLocal result for the
-      // skipped label remains correct (it depends only on the pre-offset), but
-      // resolving the next label does not compare equal. If get_info reports a
-      // forward jump at least as wide as the whole nominal granule containing
-      // its last millisecond, this is the same zero-width-granule condition.
-      granuleSkipped = civilIntervalSkipped(civilLo, *civilNext, frameZone);
-    }
-  }
+  bool granuleSkipped = !hasExplicitOffset && civilNext
+      && civilIntervalSkipped(civilLo, *civilNext, frameZone);
   return DateLiteralRange{DateRange{*lo, *last + 1, granuleSkipped}, hasExplicitOffset};
 }
 
@@ -843,16 +773,23 @@ inline std::optional<std::pair<int64_t, int64_t>> roundedInterval(
   return std::pair{*lo, *last};
 }
 
+struct DateMathResult {
+  DateRange range;
+  bool rounded;
+};
+
 // Evaluate once for the lower edge and once for the upper edge. A slash floors
 // the lower edge and rounds the upper edge to the unit's last millisecond;
 // later commands transform both. This is exactly the interval the existing
-// DATE range fold needs for gte/gt/lte/lt semantics.
-inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view math,
-                                              const TimeZone& zone) {
+// DATE range fold needs for gte/gt/lte/lt semantics. rounded is true when some
+// /unit coarser than a millisecond was applied.
+inline std::optional<DateMathResult> applyDateMath(
+    int64_t anchor, std::string_view math, const TimeZone& zone) {
   Cursor cur{math};
   if (cur.atEnd()) return std::nullopt;
   int64_t lo = anchor;
   int64_t hi = anchor;
+  bool rounded = false;
   while (!cur.atEnd()) {
     char op = cur.peek();
     cur.advance();
@@ -878,6 +815,7 @@ inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view m
       if (!lowWindow || !highWindow) return std::nullopt;
       lo = lowWindow->first;
       hi = highWindow->second;
+      rounded |= *unit != DateMathUnit::MILLISECOND;
     } else {
       auto newLo = addUnit(lo, amount, *unit, zone);
       auto newHi = addUnit(hi, amount, *unit, zone);
@@ -887,7 +825,7 @@ inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view m
     }
   }
   if (!supportedInstant(lo) || !supportedInstant(hi) || lo > hi) return std::nullopt;
-  return DateRange{lo, hi + 1};
+  return DateMathResult{.range = {lo, hi + 1}, .rounded = rounded};
 }
 
 inline bool startsWithNow(const Cursor& input) {
@@ -896,55 +834,26 @@ inline bool startsWithNow(const Cursor& input) {
 
 } // namespace datetime_detail
 
-// From-start civil stepping for calendar facet fences. The start instant's
-// frame offset is retained as the ofLocal preference for every independently
-// computed fence.
-class CivilCalendarStepper {
-  TimeZone zone;
-  std::optional<CivilTime> startCivil;
-  datetime_detail::LocalTimeResolver resolver;
-
-public:
-  CivilCalendarStepper(int64_t startInstant, const TimeZone& zone)
-    : zone(zone), startCivil(civilFromInstant(startInstant, zone)),
-      resolver(zone, startCivil
-          ? std::optional<std::chrono::seconds>{startCivil->offset}
-          : std::nullopt) {}
-
-  bool valid() const { return startCivil.has_value(); }
-
-  std::optional<CivilFence> at(int64_t amount, CalendarUnit unit) {
-    namespace dd = datetime_detail;
-    if (!startCivil) return std::nullopt;
-
-    std::optional<int64_t> civil;
-    if (unit == CalendarUnit::DAY || unit == CalendarUnit::WEEK) {
-      int64_t daysPerUnit = unit == CalendarUnit::WEEK ? 7 : 1;
-      __int128 target = (__int128)startCivil->millis
-                      + (__int128)amount * daysPerUnit * dd::kMsPerDay;
-      if (target < dd::kMinEpochMs || target > dd::kMaxEpochMs) {
-        return std::nullopt;
-      }
-      civil = (int64_t)target;
-    } else if (unit == CalendarUnit::YEAR) {
-      civil = dd::calendarCivil(
-          startCivil->millis, amount, dd::DateMathUnit::YEAR);
-    } else {
-      __int128 months = amount;
-      if (unit == CalendarUnit::QUARTER) months *= 3;
-      if (months < std::numeric_limits<int64_t>::min()
-          || months > std::numeric_limits<int64_t>::max()) {
-        return std::nullopt;
-      }
-      civil = dd::calendarCivil(
-          startCivil->millis, (int64_t)months, dd::DateMathUnit::MONTH);
-    }
-    if (!civil) return std::nullopt;
-    auto instant = resolver.resolve(*civil);
-    if (!instant) return std::nullopt;
-    return CivilFence{*civil, *instant};
+// Pure civil arithmetic, always from the original anchor. Month-end clamping
+// must not accumulate (Jan 31 -> Feb 29 -> Mar 31).
+inline std::optional<int64_t> civilCalendarAt(
+    int64_t startCivil, int64_t amount, CalendarUnit unit) {
+  namespace dd = datetime_detail;
+  if (unit == CalendarUnit::DAY || unit == CalendarUnit::WEEK) {
+    int64_t daysPerUnit = unit == CalendarUnit::WEEK ? 7 : 1;
+    __int128 target = (__int128)startCivil
+                    + (__int128)amount * daysPerUnit * dd::kMsPerDay;
+    if (target < dd::kMinEpochMs || target > dd::kMaxEpochMs) return std::nullopt;
+    return (int64_t)target;
   }
-};
+  if (unit == CalendarUnit::YEAR) {
+    return dd::calendarCivil(startCivil, amount, dd::DateMathUnit::YEAR);
+  }
+  __int128 months = (__int128)amount * (unit == CalendarUnit::QUARTER ? 3 : 1);
+  if (months < std::numeric_limits<int64_t>::min()
+      || months > std::numeric_limits<int64_t>::max()) return std::nullopt;
+  return dd::calendarCivil(startCivil, (int64_t)months, dd::DateMathUnit::MONTH);
+}
 
 inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEpochMillis,
                                                const TimeZone& zone) {
@@ -958,11 +867,17 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
   // NOW/now is the one non-literal anchor. Case-insensitive acceptance lets
   // Solr and OpenSearch clients share the same endpoint.
   if (dd::startsWithNow(input)) {
-    if (input.size() == 3) return DateRange{nowEpochMillis, nowEpochMillis + 1};
+    if (input.size() == 3) {
+      return DateRange{.lo = nowEpochMillis, .hiExclusive = nowEpochMillis + 1,
+                       .unroundedNow = true};
+    }
     input.advance(3);
     input.consume("||");  // harmless union convenience
-    return dd::applyDateMath(
+    auto result = dd::applyDateMath(
         nowEpochMillis, input.slice(input.position(), input.size()), zone);
+    if (!result) return std::nullopt;
+    result->range.unroundedNow = !result->rounded;
+    return result->range;
   }
 
   // A literal without math retains Luxir's existing granularity window.
@@ -982,8 +897,9 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     if (!anchor) return std::nullopt;
     auto result = dd::applyDateMath(
         anchor->range.lo, input.slice(mathStart, input.size()), zone);
-    if (result) result->granuleSkipped = anchor->range.granuleSkipped;
-    return result;
+    if (!result) return std::nullopt;
+    result->range.granuleSkipped = anchor->range.granuleSkipped;
+    return result->range;
   }
 
   // Solr appends math directly. Try operator positions from right to left so
@@ -1000,8 +916,8 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     if (!anchor) continue;
     if (auto result = dd::applyDateMath(
             anchor->range.lo, input.slice(separator, input.size()), zone)) {
-      result->granuleSkipped = anchor->range.granuleSkipped;
-      return result;
+      result->range.granuleSkipped = anchor->range.granuleSkipped;
+      return result->range;
     }
   }
   return std::nullopt;

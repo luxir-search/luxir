@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/reader/SkipStats.h"
 #include "test/CollectionHelper.h"
@@ -135,7 +135,7 @@ public:
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
-    cur.getNumber().getScores().limit(32).batchSize(33).fields({"id"});
+    cur.countLimit().getScores().limit(32).batchSize(33).fields({"id"});
 
     std::vector<api::Query> required;
     if (shape == Shape::DISJOINT_PHRASES) {
@@ -169,7 +169,7 @@ public:
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
-    cur.getNumber().getScores().limit(32).batchSize(33).fields({"id"});
+    cur.countLimit().getScores().limit(32).batchSize(33).fields({"id"});
     cur.rawQuery() = qb::boolean(
       cur.mr(), {qb::match(cur.mr(), "body_w", mandatory)}, {},
       {qb::phraseWords(cur.mr(), "body_w", {"p", "q"})});
@@ -187,7 +187,7 @@ public:
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
-    cur.getNumber().getScores().limit(2).batchSize(3).fields({"id"});
+    cur.countLimit().getScores().limit(2).batchSize(3).fields({"id"});
 
     api::Query phrase = qb::boost(
         cur.mr(), qb::phraseWords(cur.mr(), "body_w", {"a", "b"}), 4.0f);

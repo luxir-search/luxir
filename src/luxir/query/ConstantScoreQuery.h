@@ -238,10 +238,7 @@ public:
     return child->appendFilterKey(out, ctx);
   }
   Weight* createWeight(Context& context, int32_t flags,
-                       float multiplier = 1.0f) override {
-    return context.pool.make<ConstantScoreQuery::Weight>(context, *this, flags,
-                                                         multiplier);
-  }
+                       float multiplier = 1.0f) override;
 
   class Weight final : public Query::Weight {
     Query::Weight* childWeight = nullptr;
@@ -336,6 +333,7 @@ public:
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }
+
   };
 };
 

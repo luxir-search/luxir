@@ -158,7 +158,7 @@ void CollapseMembers::walk(int32_t segment, DocSet* eligibility,
   // Estimate before opening streams. A page covering a large part of a
   // selective domain is cheaper as one key-column walk. The benchmark can
   // force either traversal to measure the crossover.
-  bool useKeys = indexed && collapseMemberStrategy != CollapseMemberStrategy::DOMAIN;
+  bool useKeys = indexed && collapseMemberStrategy != CollapseMemberStrategy::DOMAIN_WALK;
   if (useKeys && collapseMemberStrategy == CollapseMemberStrategy::AUTO) {
     int64_t groups = 0;
     for (const auto& field : plan.fields) {

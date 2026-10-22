@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <latch>
 #include <span>
 #include <string>
 #include <thread>
@@ -21,6 +22,7 @@
 #include "luxir/index/IndexWriter.h"
 #include "luxir/index/MergeCostModel.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/server/Stats.h"
 #include "luxir/search/IndexReader.h"
 #include "luxir/store/Directory.h"
 #include "luxir/util/Signal.h"
@@ -124,6 +126,161 @@ TEST_F(AutoFlushTest, accumulationAcrossMessagesFlushesAtBoundaries) {
   req->execute();
   ASSERT_OK(req);
   EXPECT_EQ(req->getMatchCount("q"), nDocs);
+}
+
+TEST_F(AutoFlushTest, deleteOnlyGrowthAccountsAndFlushes) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  ASSERT_TRUE(helper.deleteById("repeat").success);
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->idleInverters.size());
+  auto* inverter = iw->idleInverters.begin()->first;
+  size_t initialSize = inverter->memSize();
+  int64_t initialReserved = budget.reservedBytes();
+  for (int i = 0; i < 32; i++) {
+    ASSERT_TRUE(helper.deleteByIds({"repeat", std::string(100, 'x') + std::to_string(i)}).success);
+  }
+  iw->updateGraph->wait_for_all();
+  ASSERT_EQ(1, iw->idleInverters.size());
+  EXPECT_EQ(inverter, iw->idleInverters.begin()->first);
+  EXPECT_GT(inverter->memSize(), initialSize);
+  EXPECT_GT(budget.reservedBytes(), initialReserved);
+  iw->perInverterRamBytes = inverter->memSize() - 1;
+  ASSERT_TRUE(helper.deleteById(std::string(100, 'y')).success);
+  iw->updateGraph->wait_for_all();
+  EXPECT_FALSE(iw->pendingDeletes.empty());
+  EXPECT_TRUE(iw->segInfos.empty());
+}
+
+TEST_F(AutoFlushTest, retainedDeletesTransferWithoutDraining) {
+  for (int shape : {0, 1, 2, 3}) {
+    SCOPED_TRACE(shape); // overwrite-only, delete-only, allow_dups+delete, mixed
+    LuxirNode node;
+    CollectionHelper helper(node);
+    auto iw = helper.getIndexWriter();
+    auto& budget = node.getIndexRamBudget();
+    if (shape != 1) {
+      ASSERT_TRUE(helper.index(flatdoc("id", std::string(200, 'a')), UpdateMessage::NO_COMMIT, shape == 0).success);
+    }
+    if (shape == 3) {
+      ASSERT_TRUE(helper.index(flatdoc("id", std::string(100, 'x')), UpdateMessage::NO_COMMIT, true).success);
+    }
+    if (shape != 0) {
+      ASSERT_TRUE(helper.deleteById("absent").success);
+    }
+    iw->updateGraph->wait_for_all();
+    ASSERT_EQ(1, iw->idleInverters.size());
+    auto& inverter = iw->obtainInverter(iw->idleInverters.begin()->first->currVersion);
+    int64_t packetBytes = (int64_t)inverter.retainedDeleteBytes();
+    int64_t before = budget.reservedBytes();
+    std::latch started(1), release(1);
+    auto cleanup = scope_guard([&] {
+      if (!release.try_wait()) release.count_down();
+      iw->updateGraph->wait_for_all();
+      Signal::unlisten("segmentFlushBody");
+    });
+    Signal::listen("segmentFlushBody", [&](void* source, void*, void*) -> void* {
+      if (source == &inverter) { started.count_down(); release.wait(); }
+      return nullptr;
+    });
+    iw->releaseInverter(inverter, true);
+    started.wait();
+    EXPECT_EQ(before, budget.reservedBytes());
+    EXPECT_EQ(before - packetBytes, budget.drainingBytesCount());
+    release.count_down();
+    iw->updateGraph->wait_for_all();
+    Signal::unlisten("segmentFlushBody");
+    ASSERT_EQ(1, iw->pendingDeletes.size());
+    const auto& packet = **iw->pendingDeletes.deletes.begin();
+    ASSERT_EQ(1, packet.lists().size());
+    EXPECT_EQ(shape == 3 ? 2 : 1, packet.lists()[0].size());
+    EXPECT_GT(packet.getSmallestVersion(), 0);
+    EXPECT_EQ(packetBytes, packet.memSize());
+    EXPECT_EQ(packetBytes, budget.retainedDeleteBytesCount());
+    EXPECT_EQ(packetBytes, budget.reservedBytes());
+    EXPECT_EQ(packetBytes, iw->stats(false).retainedDeleteBytes);
+    helper.commit();
+    iw->updateGraph->wait_for_all();
+    EXPECT_EQ(0, budget.retainedDeleteBytesCount());
+    EXPECT_EQ(0, budget.reservedBytes());
+  }
+}
+
+TEST_F(AutoFlushTest, rollbackRetainedDeleteAccounting) {
+  for (bool overwrite : {false, true}) {
+    LuxirNode node;
+    CollectionHelper helper(node);
+    auto iw = helper.getIndexWriter();
+    auto& budget = node.getIndexRamBudget();
+    if (overwrite) {
+      ASSERT_TRUE(helper.index(flatdoc("id", "old"), UpdateMessage::NO_COMMIT, true).success);
+      ASSERT_TRUE(helper.deleteById("absent").success);
+    }
+    CollectionHelper::UpdateBuilder request;
+    request.add(flatdoc("id", "new")).add(flatdoc("id", "old"))
+        .add(flatdoc("id", "bad", "no_such_field", "fail"))
+        .overwrite().allOrNone();
+    if (overwrite) request.remove("absent").remove("rolled-back");
+    EXPECT_FALSE(helper.submit(request).success);
+    auto& inverter = iw->obtainInverter();
+    iw->releaseInverter(inverter, true);
+    iw->updateGraph->wait_for_all();
+    if (overwrite) {
+      ASSERT_EQ(1, iw->pendingDeletes.size());
+      EXPECT_EQ((*iw->pendingDeletes.deletes.begin())->memSize(), budget.retainedDeleteBytesCount());
+    } else {
+      EXPECT_TRUE(iw->pendingDeletes.empty());
+      EXPECT_EQ(0, budget.retainedDeleteBytesCount());
+      EXPECT_EQ(0, budget.reservedBytes());
+    }
+  }
+}
+
+TEST_F(AutoFlushTest, retainedDeleteStatsReachApi) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  iw->perInverterRamBytes = 1;
+  ASSERT_TRUE(helper.deleteById("absent").success);
+  iw->updateGraph->wait_for_all();
+  uint64_t bytes = (uint64_t)node.getIndexRamBudget().retainedDeleteBytesCount();
+  ASSERT_GT(bytes, 0);
+  api::StatsRequest request;
+  request.collections = true;
+  api::StatsResponse response;
+  std::pmr::monotonic_buffer_resource resource;
+  gatherStats(node, request, response, resource);
+  EXPECT_EQ(bytes, response.memory->indexing_budget.retained_delete_bytes);
+  EXPECT_EQ(bytes, response.collections[0].shards[0].index.retained_delete_bytes);
+}
+
+TEST_F(AutoFlushTest, pressureChoosesReliefInsteadOfRetainedDeletes) {
+  LuxirNode node;
+  CollectionHelper helper(node);
+  auto iw = helper.getIndexWriter();
+  auto& budget = node.getIndexRamBudget();
+  auto& deletes = iw->obtainInverter(1);
+  for (int i = 0; i < 1000; i++) deletes.deleteId(std::string(100, 'x') + std::to_string(i), 1);
+  auto& docs = iw->obtainInverter(1);
+  auto& text = docs.getIndexHandler("text_w");
+  docs.startDoc();
+  text.index(docs, "reclaimable text");
+  docs.finishDoc();
+  size_t relief = deletes.memSize() - deletes.retainedDeleteBytes();
+  docs.pool.alloc(relief + 16384);
+  iw->pressureFlushFloorBytes = relief + 1;
+  ASSERT_GT(docs.memSize(), iw->pressureFlushFloorBytes);
+  ASSERT_GT(deletes.memSize(), docs.memSize());
+  iw->releaseInverter(deletes);
+  iw->releaseInverter(docs);
+  budget.setTotalBytes(1);
+  iw->updateGraph->wait_for_all();
+  EXPECT_TRUE(iw->idleInverters.contains(&deletes));
+  EXPECT_TRUE(iw->pendingDeletes.empty());
+  EXPECT_EQ(1, iw->segInfos.size());
+  budget.setTotalBytes(0);
 }
 
 // Waits for the budget's reservations to drain back to at most `bound` (the
@@ -334,6 +491,57 @@ TEST(PressureShedDirectTest, mergeDemandWakesIdleWriter) {
     iw.commit();
     EXPECT_EQ(1u, iw.snapshots.readers.getReader()->segments().size());
   }
+}
+
+// A merge waiting on a whole pool of demand must not turn every batch of large
+// documents into its own segment: demand claims at most half the pool from
+// inverters, and only an inverter holding a fair share of that half is shed for
+// it.  (Uncapped demand flushed all 40 batches as 40 segments.)
+TEST(PressureShedDirectTest, mergeDemandDoesNotShedEveryBatch) {
+  RAMDir dir;
+  auto schema = std::make_shared<Schema>();
+  schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
+      "body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace");
+
+  IndexRamBudget budget;
+  CommitSnapshotRegistry iwSnapshots(dir);
+  IndexWriter iw(iwSnapshots, schema, &budget);
+  iw.mergePolicy->setMergeFactor(1000);  // count flushed segments only
+  iw.pressureFlushFloorBytes = 1;
+
+  int docOrd = 0;
+  auto addBatch = [&]() {  // 20 docs of ~7 KB
+    auto& inverter = iw.obtainInverter();
+    for (int d = 0; d < 20; d++, docOrd++) {
+      std::string body;
+      for (int w = 0; w < 1000; w++) body += "w" + std::to_string((docOrd * 7919 + w * 104729) % 50000) + " ";
+      inverter.startDoc();
+      inverter.getIndexHandler("body").index(inverter, std::string_view(body));
+      inverter.finishDoc();
+    }
+    iw.releaseInverter(inverter);
+  };
+
+  addBatch();
+  int64_t first = budget.reservedBytes();
+  addBatch();
+  int64_t perBatch = budget.reservedBytes() - first;
+  ASSERT_GT(perBatch, 0);
+  // Inverters keep half of the pool: about five batches.
+  int64_t cap = 2 * (first + 4 * perBatch);
+  budget.setTotalBytes(cap);
+  auto demand = budget.registerMergeDemand([]() {});
+  demand.publish(cap);  // a merge that wants the whole pool
+
+  const int batches = 40;
+  for (int i = 2; i < batches; i++) addBatch();
+
+  demand.publish(0);
+  budget.setTotalBytes(0);
+  iw.commit();
+  auto segments = iw.snapshots.readers.getReader()->segments().size();
+  EXPECT_GT(segments, 1u) << "inverters past half the pool still yield to merge demand";
+  EXPECT_LE(segments, (size_t)batches / 3) << "merge demand shed small inverters";
 }
 
 // Hold the demand-triggered inverter flush.  Once it releases its reservation,

@@ -253,6 +253,11 @@ POST /collections/main/_schema?mode=replace_all
 ```
 
 The reserved `id` and `_version_` fields are added automatically if omitted.
+`_version_` is a fixed, retrieval-only reserved field with no index, column or
+stored capability. It returns the update version of the request that indexed
+the document. Its capabilities cannot be configured. Setting it in document
+input is rejected. Optimistic concurrency is not supported. The resolved schema
+view reports null search and value bindings for this field.
 Omitting templates removes them, leaving a schema with only explicit fields.
 To edit the existing schema, start from `GET` output. Each successful
 publication advances the schema generation.
@@ -273,7 +278,13 @@ publication advances the schema generation.
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
-| `dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
+| `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
+| `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
+
+For PQ, positive `ann.pq.m` requires positive effective (inherited) `dims`
+and must divide the stored dimension: `truncate_dims` when set, else `dims`.
+Omitted or zero `m` selects automatically and permits inferred dimensions.
+Validation includes inherited ANN settings and variants.
 
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you
@@ -317,15 +328,44 @@ POST /collections/logs/_schema
 | `zstd_level` | `zstd` only: 1 (fastest) to 22 (smallest); default 3 |
 | `chunk_size_bytes` | target uncompressed bytes per chunk, 1024 to 4194304; default 16384, or 65536 with `zstd` |
 | `max_docs_per_chunk` | most documents per chunk, 1 to 65536; default 128, or 1024 with `zstd` |
+| `zstd_dictionary` | `zstd` only: enable one dictionary per resource, shared by its segments; trained by a merge |
+| `zstd_dictionary_bytes` | dictionary capacity upper bound, 1024 to 262144; default 65536. Requires `zstd_dictionary` |
 
 Larger chunks compress better, but returning one stored document decompresses
 its whole chunk. Chunks are compressed as documents are indexed, so the codec
 and level also set indexing cost; levels above the default compress much more
 slowly for little further gain. Each segment records its codec and chunk
 limits, so a change applies to segments written afterwards. A merge copies
-compressed chunks from inputs that already match its output codec and chunk
-limits and recompresses the others; the level alone does not trigger
-recompression. `mode=set` replaces the named entries and keeps the others.
+compressed chunks from inputs that already match its output codec, chunk
+limits and dictionary and recompresses the others; the level alone does not trigger
+recompression. Inputs where more than 1% of chunks were sealed before filling
+(each small flush ends in one) are also recompressed, so documents indexed a
+few at a time still end up in full-size chunks. `mode=set` replaces the named
+entries and keeps the others.
+
+A dictionary holds text shared by documents of a resource, such as common
+values and log templates, so chunks can refer to it. That matters most for
+small chunks, which compress poorly on their own.
+For retrieval-heavy workloads (many single-document fetches), prefer small
+chunks plus a dictionary over large chunks:
+
+```json
+"stored_resources": {
+  "_stored_": {"codec": "zstd", "zstd_dictionary": true,
+               "chunk_size_bytes": 4096, "max_docs_per_chunk": 32}
+}
+```
+
+The first merge with at least 100 times the configured capacity (at most
+8 MiB) of live stored data trains the resource's dictionary. Earlier segments
+have none; later segments share the dictionary and each stores its bytes once.
+Capacity is an upper bound: training can produce a smaller dictionary. The
+benefit is greatest with small chunks; with large chunks, decoding can be slower.
+
+There is no automatic retraining. Changing `zstd_dictionary`,
+`zstd_dictionary_bytes` or the codec clears the current dictionary so a later
+merge can train another. After a restart, the dictionary from the largest
+live segment carrying one is used.
 
 ## Text analysis
 
@@ -713,6 +753,7 @@ field.) The resolved view is diagnostic, not a schema write body. It contains:
 | `fields.<f>.bindings` | `search` and `value`, each naming the effective physical field. |
 | `fields.<f>.representations` | Definitions keyed by `self` or variant label. |
 | Representation settings | `name`, `type`, `multi`, `index`, `column`, `stored`, `analyzer`, `normalizer`, effective `long_terms` for term-backed representations, plus `stored_resource` and vector settings when applicable. These describe the structures available to operations. |
+| `ann` (vector representations) | Effective ANN settings in the authored vocabulary, including defaults and inherited values. Contains `codec`, `nlist`, and only the selected codec's `pq` or `rabitq` object. Zero `nlist` and `pq.m` retain their automatic policies. ANN-only changes preserve introduction and coverage generations. |
 | `introduced_generation` | Start of this representation's current continuous availability. Redefining a representation or removing and re-adding its label starts a new introduction. |
 | `oldest_generation` | Minimum schema generation across all committed live segments, even those lacking this field; `null` for an empty index. |
 | `coverage_complete` | True for an empty index or when that minimum reaches the introduction generation. |

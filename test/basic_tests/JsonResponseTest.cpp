@@ -323,7 +323,7 @@ TEST_F(JsonResponseTest, namedDocListAndFacetRemainUnderOps) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  req->topDocs("hits").allQuery().fields({"id"}).limit(2).getNumber();
+  req->topDocs("hits").allQuery().fields({"id"}).limit(2).countLimit();
   req->facet("cats", "cat_s").limit(-1);
   req->execute(false);
   ASSERT_OK(req);
@@ -344,7 +344,7 @@ TEST_F(JsonResponseTest, shorthandUnwrapsImplicitQ) {
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
   auto& td = req->topDocs("q");
-  td.allQuery().fields({"id"}).limit(1).getNumber();
+  td.allQuery().fields({"id"}).limit(1).countLimit();
   td.facet("cats", "cat_s").limit(-1);
   req->execute(false);
   ASSERT_OK(req);
@@ -366,7 +366,7 @@ TEST_F(JsonResponseTest, secondDocListRendersItsNestedOps) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  req->topDocs("first").allQuery().fields({"id"}).limit(1).getNumber();
+  req->topDocs("first").allQuery().fields({"id"}).limit(1).countLimit();
   auto& second = req->topDocs("second");
   second.allQuery().fields({"id"}).limit(1);
   second.facet("cats", "cat_s").limit(-1);
@@ -388,7 +388,7 @@ TEST_F(JsonResponseTest, everyDocListRendersUnderOps) {
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  req->topDocs("first").allQuery().fields({"id"}).limit(1).getNumber();
+  req->topDocs("first").allQuery().fields({"id"}).limit(1).countLimit();
   req->topDocs("second").allQuery().fields({"id"}).limit(2);
   req->execute(false);
   ASSERT_OK(req);

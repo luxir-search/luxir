@@ -133,6 +133,7 @@ void buildSources(TestIndex& index, const std::shared_ptr<Schema>& schema,
   for (int32_t segment = 0; segment < 4; segment++) {
     body.startIndexing();
     for (int32_t doc = 0; doc < 40; doc++) {
+      if ((segment & 1) == 0 && doc % 3 == 0) index.getInverter().updateVersions((uint64_t)segment * 40 + doc + 1);
       std::string value = "common common";
       for (int32_t i = 0; i < 8; i++) {
         std::string term = termName(termBase + doc * 8 + i);
@@ -311,12 +312,21 @@ FieldSnapshot mergePair(TestIndex& left, TestIndex& right, bool partitioned,
   PostingsWriter writer(outputDir, 900, -1);
   IndexRamBudget budget;
   Schema schema;
+  StoredDictionaryRegistry dictionaries;
+  dictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(schema));
   SegmentMerger merger(readers, liveDocs, writer, budget,
-                       partitioned ? 1 : INT64_MAX, 1, 4, schema);
+                       partitioned ? 1 : INT64_MAX, 1, 4, schema, dictionaries);
   merger.merge();
   writer.finish();
 
   PostingsReader outputReader(outputDir, 900);
+  VersionRuns::Cursor outputBirths(outputReader.versionRuns());
+  int32_t base = 0;
+  for (auto* reader : readers) {
+    VersionRuns::Cursor inputBirths(reader->versionRuns());
+    for (int32_t doc = 0; doc < reader->maxDoc(); doc++) EXPECT_EQ(inputBirths.birth(doc), outputBirths.birth(base + doc));
+    base += reader->maxDoc();
+  }
   MemPool pool;
   auto* fields = outputReader.fieldInfo("body");
   EXPECT_NE(nullptr, fields);
@@ -551,7 +561,9 @@ TEST(TermPartitionMergeTest, CoordinatorGrowthIgnoresOccupiedBudget) {
   ASSERT_EQ(cap, budget.reservedBytes());
   RAMDir outputDir;
   PostingsWriter writer(outputDir, 901, -1);
-  SegmentMerger merger(readers, liveDocs, writer, budget, 1, 1, 4, *schema);
+  StoredDictionaryRegistry dictionaries;
+  dictionaries.setSchema(StoredDictionaryRegistry::prepareSchema(*schema));
+  SegmentMerger merger(readers, liveDocs, writer, budget, 1, 1, 4, *schema, dictionaries);
   merger.merge();
   writer.finish();
 

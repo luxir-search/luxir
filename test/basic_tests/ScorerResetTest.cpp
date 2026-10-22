@@ -10,7 +10,7 @@
 #include <vector>
 
 #include "luxir/query/AllQuery.h"
-#include "luxir/query/BooleanQuery.h"
+#include "luxir/query/BooleanWeight.h"
 #include "luxir/query/BoostQuery.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExistsQuery.h"
@@ -519,7 +519,9 @@ TEST_F(ScorerResetTest, freshProductsAcrossProtocolsAndEncodings) {
   }
   Query* numericExcluded = boolean(clauses({word}), {}, clauses({pointArray}), clauses({zone}));
   checkBulk(*reader, *numericExcluded, true);
-  checkBulk(*reader, *sparse, false);
+  // One block of a sorted ramp: its linear fit leaves only the range edges
+  // to verify, so the zone-map arm takes it.
+  checkBulk(*reader, *sparse, true);
   checkBulk(*reader, *scan, false);
   checkBulk(*reader, *exists, false);
   checkBulk(*reader, *constant, false);

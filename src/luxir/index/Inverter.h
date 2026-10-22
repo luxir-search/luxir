@@ -58,6 +58,9 @@ public:
   PostingsWriter postingsWriter;
 
   const std::shared_ptr<Schema> schema;
+  using StoredDictionaryProvider = std::function<std::shared_ptr<const StoredCompressionDictionary>(
+      std::string_view, const StoredChunkFormat&)>;
+  StoredDictionaryProvider storedDictionaryProvider;
 
   // Fixed by ProtoUpdateMessage for the duration of one update so every NOW
   // in every document/value resolves identically. Direct test indexing leaves
@@ -74,6 +77,8 @@ public:
   // when the inverter is destroyed (after its flush completes, or at writer close), so
   // flushing inverters stay counted until their RAM is actually freed.
   IndexRamBudget::Guard ramGuard;
+  // Unversioned direct indexing starts at zero; acquisitions replace empty runs.
+  VersionRunBuilder versionRuns;
 
   // High-water mark of transient flush memory charged to ramGuard.
   size_t flushWorkspaceBytes = 0;
@@ -91,7 +96,7 @@ public:
   uint64_t maxVersion = 0;
 
   // When true, indexing an id field will automatically queue a delete for previous
-  // versions and index the _version_ field. Set via setOverwrite() before indexing docs.
+  // versions. Set before indexing docs.
   bool overwrite = false;
 
   // Populated by IdHandler::flush() with sorted delete lists.
@@ -103,12 +108,14 @@ public:
 
   Inverter(luxir::Directory& dir, uint64_t segId,
            const std::function<std::shared_ptr<Schema>()>& schemaProvider = {},
-           IndexRamBudget* ramBudget = nullptr)
-      : Inverter(dir, segId, schemaProvider ? schemaProvider() : Schema::createDefaultSchema(), ramBudget) {}
+           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {})
+      : Inverter(dir, segId, schemaProvider ? schemaProvider() : Schema::createDefaultSchema(),
+                 ramBudget, std::move(dictionaryProvider)) {}
 
   Inverter(luxir::Directory& dir, uint64_t segId, std::shared_ptr<Schema> schema,
-           IndexRamBudget* ramBudget = nullptr)
+           IndexRamBudget* ramBudget = nullptr, StoredDictionaryProvider dictionaryProvider = {})
       : postingsWriter(dir, segId, -1, ramBudget, true), schema(std::move(schema)),
+        storedDictionaryProvider(std::move(dictionaryProvider)),
         ramGuard(ramBudget == nullptr ? IndexRamBudget::Guard() : IndexRamBudget::Guard(*ramBudget, 0)) {}
 
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
@@ -133,6 +140,7 @@ public:
   // for segmentVersions, adds, and deletes to be versioned correctly, this should be called after
   // obtaining the inverter
   void updateVersions(uint64_t version) {
+    versionRuns.add((uint32_t)getMaxDoc(), version);
     minVersion = std::min(minVersion, version);
     maxVersion = std::max(maxVersion, version);
     currVersion = version;
@@ -145,6 +153,7 @@ public:
   // Record an explicit delete-by-id. Routes through IdHandler's delete hash
   // so all deletes end up as sorted lists after flush.
   void deleteId(std::string_view id, uint64_t version);
+  size_t retainedDeleteBytes() const;
 
   /// This is what clients should call to index the fields of a document.
   class IndexHandler {
@@ -371,7 +380,7 @@ public:
 
   // Rollback support for failed documents / failed all_or_none requests.
   // A mark captures the undo state at a point in time; rollbackTo restores the
-  // id map (termsHash / deleteHash mutations are undone) and un-marks docs
+  // id map (occupancy and watermarks are restored) and un-marks docs
   // deleted after the mark (in-inverter overwrites mark superseded docs deleted;
   // a rolled-back update must resurrect them).  Postings and column data of
   // rolled-back docs stay in the segment; callers mark those docs deleted.
@@ -389,7 +398,7 @@ public:
   // hold outside it (extraRamBytes). O(1) - no walk. Over-estimates slightly (pool
   // capacity steps by chunk), so a size-based flush trips a touch early, never late.
   size_t memSize() {
-    return pool.size() + extraRamBytes;
+    return pool.size() + extraRamBytes + versionRuns.allocatedBytes();
   }
 
   // True when this inverter has grown past a size cap and should be flushed to a
@@ -420,8 +429,9 @@ private:
                                               const StoredFieldType* config) {
     auto it = storedFields_.find(resourceName);
     if (it != storedFields_.end()) return *it->second;
-    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName,
-                                                       config ? config->format_ : StoredChunkFormat{});
+    const auto& format = config ? config->format_ : StoredChunkFormat{};
+    auto dictionary = storedDictionaryProvider ? storedDictionaryProvider(resourceName, format) : nullptr;
+    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName, format, std::move(dictionary));
     auto [newIt, _] = storedFields_.emplace(std::string(resourceName), std::move(writer));
     return *newIt->second;
   }

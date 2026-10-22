@@ -10,11 +10,19 @@
 #include <tuple>
 #include "LuxirTest.h"
 #include "luxir/index/IndexWriter.h"
+#include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/query/Query.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/util/Overloaded.h"
 
 namespace luxir::test {
+
+inline void writeUnversionedRuns(PostingsWriter& writer) {
+  PostingsWriter::VersionRunsWriter versions(writer);
+  if (writer.getMaxDoc() > 0) versions.add(0, 0);
+  versions.finish();
+}
+
 
 template <class... Values>
 class SearchOverridesGuard {
@@ -38,6 +46,21 @@ public:
 
 template <class... Values>
 SearchOverridesGuard(Values&...) -> SearchOverridesGuard<Values...>;
+
+// Opens the IVF build policy for tiny test corpora (training floor
+// minTraining, no scan-cost threshold). Restores on destruction.
+class IvfTestGuard {
+  SearchOverridesGuard<int64_t, int64_t, int64_t> saved{
+    VectorIndexBuilder::ivfPqMinTrainingVectors, VectorIndexBuilder::ivfRaBitQMinTrainingVectors,
+    VectorIndexBuilder::ivfBuildThresholdScanCost};
+
+public:
+  explicit IvfTestGuard(int64_t minTraining = 2) {
+    VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
+    VectorIndexBuilder::ivfRaBitQMinTrainingVectors = minTraining;
+    VectorIndexBuilder::ivfBuildThresholdScanCost = 0;
+  }
+};
 
 inline Query::ScorerPlan* resolveScorerPlanForTests(
     MemPool& pool, Query::ScorerSupplier& supplier, int64_t candidates,

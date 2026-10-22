@@ -27,14 +27,21 @@ if ("gpu" IN_LIST FEATURES)
     endif()
 endif()
 
+# Apple silicon has NEON but no SVE, which the arm64 dd level also builds.
+set(opt_level dd)
+if(VCPKG_TARGET_IS_OSX AND VCPKG_TARGET_ARCHITECTURE STREQUAL "arm64")
+    set(opt_level generic)
+endif()
+
 vcpkg_cmake_configure(
     SOURCE_PATH "${SOURCE_PATH}"
     OPTIONS
         ${FEATURE_OPTIONS}
         -DFAISS_ENABLE_MKL=OFF
+        -DFAISS_ENABLE_METAL=OFF  # Apple GPU backend; needs Xcode's metal compiler
         -DFAISS_ENABLE_PYTHON=OFF  # Requires SWIG
         -DBUILD_TESTING=OFF
-        -DFAISS_OPT_LEVEL=dd
+        "-DFAISS_OPT_LEVEL=${opt_level}"
 )
 
 vcpkg_cmake_install()

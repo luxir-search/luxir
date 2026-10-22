@@ -12,6 +12,8 @@
 #include "ConstantScoreQuery.h"
 #include "ForcePrepareQuery.h"
 #include "RescoreQuery.h"
+#include "MinScoreQuery.h"
+#include "DisMaxQuery.h"
 #include "BooleanQuery.h"
 
 namespace luxir {
@@ -49,10 +51,13 @@ inline Query::ScoreProfile scoreProfile(const Query& query) {
       return Query::ScoreProfile::automatic(1.0f);
     case QueryKind::TERM:
     case QueryKind::PHRASE:
+    case QueryKind::COMBINED_FIELDS:
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
     case QueryKind::KNN:
     case QueryKind::NONE:
+    case QueryKind::MIN_SCORE:
+    case QueryKind::DIS_MAX:
     case QueryKind::TEST:
       return Query::ScoreProfile::variable();
   }
@@ -74,8 +79,12 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
     case QueryKind::RESCORE:
       return canOmitWeightForCacheFirstMembership(
           *static_cast<const RescoreQuery&>(query).getChild());
+    case QueryKind::DIS_MAX:
+      return canOmitWeightForCacheFirstMembership(
+          *static_cast<const DisMaxQuery&>(query).getMembership());
     case QueryKind::TERM:
     case QueryKind::PHRASE:
+    case QueryKind::COMBINED_FIELDS:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
     case QueryKind::KNN:
@@ -90,6 +99,7 @@ inline bool canOmitWeightForCacheFirstMembership(const Query& query) {
     case QueryKind::NONE:
       return true;
     case QueryKind::FORCE_PREPARE:
+    case QueryKind::MIN_SCORE:
     case QueryKind::TEST:
       return false;
   }
@@ -115,6 +125,8 @@ inline bool exactDomainIdentity(const Query& query) {
       return true;
     case QueryKind::TERM:
     case QueryKind::PHRASE:
+    case QueryKind::COMBINED_FIELDS:
+    case QueryKind::DIS_MAX:
     case QueryKind::BOOLEAN:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
@@ -127,6 +139,7 @@ inline bool exactDomainIdentity(const Query& query) {
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
     case QueryKind::NONE:
+    case QueryKind::MIN_SCORE:
     case QueryKind::TEST:
       return false;
   }
@@ -154,10 +167,14 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::RESCORE:
       return directCountAvailable(
           *static_cast<const RescoreQuery&>(query).getChild(), reader);
+    case QueryKind::DIS_MAX:
+      return directCountAvailable(
+          *static_cast<const DisMaxQuery&>(query).getMembership(), reader);
     case QueryKind::ALL:
     case QueryKind::NONE:
       return true;
     case QueryKind::PHRASE:
+    case QueryKind::COMBINED_FIELDS:
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:
@@ -169,6 +186,7 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
     case QueryKind::EXISTS:
     case QueryKind::GEO_BOX:
     case QueryKind::GEO_DISTANCE:
+    case QueryKind::MIN_SCORE:
     case QueryKind::TEST:
       return false;
   }
@@ -196,6 +214,7 @@ inline bool hasRequiredConjunction(const Query& query) {
 inline Query::VerificationWork membershipVerificationWork(const Query& query) {
   switch (query.getKind()) {
     case QueryKind::TERM:
+    case QueryKind::COMBINED_FIELDS:
       return Query::VerificationWork::ABSENT;
     case QueryKind::PHRASE:
       return Query::VerificationWork::PRESENT;
@@ -208,6 +227,11 @@ inline Query::VerificationWork membershipVerificationWork(const Query& query) {
     case QueryKind::CONSTANT_SCORE:
       return membershipVerificationWork(
           *static_cast<const ConstantScoreQuery&>(query).getChild());
+    case QueryKind::MIN_SCORE:
+      return Query::VerificationWork::PRESENT;
+    case QueryKind::DIS_MAX:
+      return membershipVerificationWork(
+          *static_cast<const DisMaxQuery&>(query).getMembership());
     case QueryKind::FORCE_PREPARE:
     case QueryKind::FUZZY:
     case QueryKind::NUMERIC_PREDICATE:

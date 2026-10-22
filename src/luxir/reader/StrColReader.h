@@ -27,6 +27,8 @@ private:
   DocsReader docs;
   InputStream valuesIS;                       // Stream for concatenated string values
   const char* valuesData;                     // Pointer to concatenated string data
+  InputFile* valuesInput;                     // File holding valuesData (for read-ahead)
+  size_t valuesFileOffset;                    // Offset of valuesData in valuesInput
   std::optional<MonoReader> endValueRankReader;    // per-doc -> end value rank (multi-valued only)
   std::optional<MonoReader> endOffsetReader;  // per-value -> end byte offset (variable-size only)
   std::optional<MonoReader> valDocReader;     // per-value rank -> owning docId (multi-valued reverse map; vectors only)
@@ -40,6 +42,8 @@ public:
     docs(postingsReader, fieldInfo),
     valuesIS(postingsReader.getInputStreamSeek(fieldInfo.columnLoc)),
     valuesData(valuesIS.ptr()),
+    valuesInput(postingsReader.getFile(fieldInfo.columnLoc.filenum())),
+    valuesFileOffset((size_t)fieldInfo.columnLoc.offset()),
     docsWithField(fieldInfo.docsWithField),
     nvals(fieldInfo.numValues)
   {
@@ -103,13 +107,18 @@ public:
     return valDocReader ? &(*valDocReader) : nullptr;
   }
 
+  /// The file holding the value bytes and their offset in it, for read-ahead.
+  InputFile* valuesFile() const { return valuesInput; }
+  size_t valuesOffset() const { return valuesFileOffset; }
+
   /// Fixed value size for fixed-size fields; -1 for variable size.
   int32_t fixedValueSize() const {
     return fixedSize;
   }
 
   /// Get the value at a given global value rank (0..numValues()-1).
-  std::string_view valueAt(int64_t valueRank) const {
+  // Keep fixed-size column access in scan loops independent of the TU inline budget.
+  LUXIR_INLINE std::string_view valueAt(int64_t valueRank) const {
     assert(valueRank >= 0 && valueRank < nvals);
     if (endOffsetReader) {
       auto [startOffset, endOffset] = endOffsetReader->valuesAt(valueRank);

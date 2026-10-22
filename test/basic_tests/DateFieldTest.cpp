@@ -183,6 +183,42 @@ TEST(DateMathQueryBuilder, usesOneExplicitNowAndRoundingWindow) {
   EXPECT_EQ(*parseDateToEpochMillis("2024-06-25T23:59:59.999Z"), range->getHi());
 }
 
+// NOW math with no rounding coarser than a millisecond moves with every
+// request, so its range is request-stable; the bounds stay exact.
+TEST(DateMathQueryBuilder, unroundedNowRangesAreRequestStable) {
+  auto schema = Schema::createDefaultSchema();
+  MemPool pool;
+  int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
+  QueryBuilder builder(pool, *schema, CoerceContext{now, TimeZone::utc()});
+  auto build = [&](std::string_view lower, std::string_view upper) {
+    api::Val lo, hi;
+    lo.kind = lower;
+    hi.kind = upper;
+    return dynamic_cast<NumericPredicateQuery*>(
+        builder.createRangeQuery("when_dt", &lo, nullptr, &hi, nullptr));
+  };
+  auto expectScope = [&](FilterKeyScope expected, std::string_view lower,
+                         std::string_view upper) {
+    auto* range = build(lower, upper);
+    ASSERT_NE(nullptr, range);
+    FilterKeyBuilder out;
+    EXPECT_EQ(expected, range->appendFilterKey(out, FilterKeyContext{}));
+  };
+  expectScope(FilterKeyScope::REQUEST_STABLE, "now-1h", "now");
+  expectScope(FilterKeyScope::REQUEST_STABLE, "now-1h/m", "NOW");
+  expectScope(FilterKeyScope::REQUEST_STABLE, "2024-06-01", "now+1d");
+  expectScope(FilterKeyScope::REQUEST_STABLE, "now-1h/MILLI", "now/MILLI");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "now-1h/m", "now/m");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "now-1h/m/MILLI", "now/MILLI/m");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "NOW/DAY-7DAYS", "NOW/DAY");
+  expectScope(FilterKeyScope::SEGMENT_STABLE, "2024-06-01", "2024-06-01||+1d");
+
+  auto* exact = build("now-1h", "now");
+  ASSERT_NE(nullptr, exact);
+  EXPECT_EQ(now - 3600000, exact->getLo());
+  EXPECT_EQ(now, exact->getHi());
+}
+
 TEST_F(DateFieldTest, parseRejectsInvalid) {
   EXPECT_FALSE(parseDateToEpochMillis("").has_value());
   EXPECT_FALSE(parseDateToEpochMillis("not a date").has_value());
@@ -462,7 +498,10 @@ TEST_F(DateFieldTest, timeZoneGrammarAndTzdbResolution) {
 
   std::string embeddedNul("America/Denver\0junk", 19);
   for (std::string_view spec : {"utc", "z", "+18:01", "+24:00", "+5:30",
-                                " UTC", "UTC ", "No/Such_Zone"}) {
+                                " UTC", "UTC ", "No/Such_Zone", "america/denver",
+                                "../../../etc/localtime", "/usr/share/zoneinfo/UTC",
+                                "file:/usr/share/zoneinfo/UTC", "localtime", "posixrules",
+                                "posix/UTC", "Fixed/UTC+05:30:00"}) {
     EXPECT_FALSE(resolveTimeZone(spec).has_value()) << spec;
   }
   EXPECT_FALSE(resolveTimeZone(embeddedNul).has_value());
@@ -470,7 +509,7 @@ TEST_F(DateFieldTest, timeZoneGrammarAndTzdbResolution) {
   auto alias = resolveTimeZone("US/Eastern");
   ASSERT_TRUE(alias.has_value());
   EXPECT_TRUE(alias->isIana());
-  EXPECT_EQ("America/New_York", alias->name());  // chrono returns the canonical target
+  EXPECT_EQ("America/New_York", alias->name());  // a link resolves to its target zone
   EXPECT_TRUE(timeZoneDatabaseAvailable());
   EXPECT_FALSE(timeZoneDatabaseVersion().empty());
 
@@ -486,6 +525,23 @@ TEST_F(DateFieldTest, timeZoneGrammarAndTzdbResolution) {
   }
   for (auto& thread : threads) thread.join();
   EXPECT_TRUE(concurrentOk);
+}
+
+// Transitions that std::chrono's text-tzdb parser has decoded wrongly, as the
+// compiled zoneinfo files define them.
+TEST_F(DateFieldTest, namedZonesFollowCompiledZoneinfo) {
+  auto offsetHours = [](std::string_view zone, std::string_view instant) {
+    return civilFromInstant(utcMs(instant), testZone(zone))->offset.count() / 3600.0;
+  };
+  EXPECT_EQ(-10, offsetHours("Pacific/Apia", "2011-12-30T09:59:59Z"));
+  EXPECT_EQ(14, offsetHours("Pacific/Apia", "2011-12-30T10:00:00Z"));
+  EXPECT_EQ(14, offsetHours("Pacific/Apia", "2012-03-31T13:59:59Z"));
+  EXPECT_EQ(-3, offsetHours("America/Argentina/Buenos_Aires", "2000-01-01T00:00:00Z"));
+  // A second-granular offset before 1970 keeps the instant's milliseconds.
+  TimeZone monrovia = testZone("Africa/Monrovia");  // -0:44:30
+  auto civil = civilFromInstant(utcMs("1960-01-01T00:00:00.123Z"), monrovia);
+  EXPECT_EQ(utcMs("1959-12-31T23:15:30.123Z"), civil->millis);
+  EXPECT_EQ(utcMs("1960-01-01T00:00:00.123Z"), instantFromCivil(civil->millis, monrovia));
 }
 
 TEST_F(DateFieldTest, literalOffsetPresenceCapsAndFrameRebase) {

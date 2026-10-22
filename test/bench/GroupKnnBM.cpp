@@ -53,6 +53,8 @@ void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t 
     field.column = true;
     field.metric = api::VectorMetric::L2;
     field.dims = dims;
+    field.ann = pqAnn(unit_tests ? 2 : 16, coarse ? 4 : 0,
+                      unit_tests ? 1 : coarse ? 4 : 8);
     b.set(helper.collection());
     std::mt19937 rng(52);
     for (int segment = 0; segment < 4; segment++) {
@@ -70,22 +72,11 @@ void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t 
       }
       // Active overlay names otherwise build new segments automatically once
       // effort makes the last segment exceed the default training/work floor.
-      SearchOverridesGuard automaticBuild(VectorIndexBuilder::buildFaissIvfPqAuxIndexes);
-      if (segment == 3) VectorIndexBuilder::buildFaissIvfPqAuxIndexes = false;
+      SearchOverridesGuard automaticBuild(VectorIndexBuilder::buildFaissAuxIndexes);
+      if (segment == 3) VectorIndexBuilder::buildFaissAuxIndexes = false;
       helper.indexAll(docs, UpdateMessage::COMMIT);
       if (segment == 2) {
-        SearchOverridesGuard enabled(VectorIndexBuilder::buildFaissIvfPqAuxIndexes);
-        SearchOverridesGuard threshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost);
-        SearchOverridesGuard lists(VectorIndexBuilder::ivfPqNList);
-        SearchOverridesGuard m(VectorIndexBuilder::ivfPqM);
-        SearchOverridesGuard bits(VectorIndexBuilder::ivfPqBits);
-        SearchOverridesGuard training(VectorIndexBuilder::ivfPqMinTrainingVectors);
-        VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-        VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-        VectorIndexBuilder::ivfPqNList = unit_tests ? 2 : 16;
-        VectorIndexBuilder::ivfPqM = coarse ? 4 : 0;
-        VectorIndexBuilder::ivfPqBits = unit_tests ? 1 : coarse ? 4 : 8;
-        VectorIndexBuilder::ivfPqMinTrainingVectors = unit_tests ? 8 : 64;
+        IvfTestGuard ivf(unit_tests ? 8 : 64);
         helper.commit({"vec.vec_v"});
       }
     }
@@ -127,7 +118,7 @@ void BM_GroupKnn(benchmark::State& state, bool adversarial, bool exact, int32_t 
     std::string collapse = key == 0 ? R"("product_s")" : key == 1 ? R"("product_i")"
         : R"({"field":["product_s","catalog_i"]})";
     std::string json = R"({"collection":")" + name
-        + R"(","limit":10,"get_scores":true,"get_number":true,"fields":["id","product_s"],"document_format":"rows",)"
+        + R"(","limit":10,"get_scores":true,"count_limit":-1,"fields":["id","product_s"],"document_format":"rows",)"
         + (groups ? R"("collapse":)" + collapse + ',' : "")
         + R"("query":{"knn":{"field":"vec_v","unit":")" + (groups ? "groups" : "docs") + R"(","query":)" + vectors[query]
         + R"(,"k":10,"refine_candidates":160,"exact":)" + (forceExact ? "true" : "false")

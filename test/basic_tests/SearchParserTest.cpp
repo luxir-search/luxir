@@ -496,7 +496,7 @@ TEST_F(SearchParserTest, getNumberControlsPruningWeightFlag) {
     auto request = localReq(helper.getSearchEngine());
     auto& topDocs = request->collection("main").topDocs("q")
         .prefixQuery("body_w", "ap").limit(10);
-    topDocs.getNumber(getNumber);
+    topDocs.countLimit(getNumber ? -1 : 0);
     request->reader = helper.getIndexWriter()->snapshots.readers.getReader();
     request->schema = helper.collection().getSchema();
     ProtobufSearchParser parser(*request);

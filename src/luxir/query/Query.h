@@ -64,6 +64,9 @@ enum class QueryKind : uint8_t {
   ALL,
   NONE,
   RESCORE,
+  MIN_SCORE,
+  COMBINED_FIELDS,
+  DIS_MAX,
   TEST,
 };
 
@@ -742,6 +745,7 @@ public:
     int64_t maxMatches;
     CountHow how;
     Weight* resolver = nullptr;
+    int64_t minMatches = 0; // Live-match floor under no additional domain.
   };
 
   // Restrict header totals by cheap eligibility bounds; restrictions need iteration.
@@ -752,8 +756,10 @@ public:
       bound = std::min<int64_t>(bound, domain->cachedCard());
     }
     if (bound == 0) return {0, CountHow::METADATA};
+    int64_t minMatches = how == CountHow::METADATA && domain == nullptr
+        ? std::max<int64_t>(0, docs - (segment.maxDoc() - segment.numLive())) : 0;
     if (domain || segment.liveDocs()) how = CountHow::ITERATE;
-    return {bound, how};
+    return {bound, how, nullptr, minMatches};
   }
 
   /// Per-segment planning state. Suppliers are allocated from the segment-local
@@ -1188,7 +1194,7 @@ public:
         const Query& query, bool allowReaderStable = false) {
       if (filterUses == nullptr) return std::nullopt;
       const auto& identity = filterIdentity(query);
-      if (identity.scope == FilterKeyScope::UNCACHEABLE
+      if (!usesSharedFilterCache(identity.scope)
           || (identity.scope == FilterKeyScope::READER_STABLE
               && !allowReaderStable)) {
         return std::nullopt;
@@ -1226,7 +1232,7 @@ public:
       auto uniqueByQuery = pool.make_span<size_t>(queries.size());
       for (size_t i = 0; i < queries.size(); i++) {
         const auto& identity = filterIdentity(*queries[i]);
-        if (identity.scope == FilterKeyScope::UNCACHEABLE
+        if (!usesSharedFilterCache(identity.scope)
             || (identity.scope == FilterKeyScope::READER_STABLE
                 && !allowReaderStable)
             || !identity.key) {

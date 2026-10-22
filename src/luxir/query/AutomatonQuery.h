@@ -67,25 +67,13 @@ public:
     out.appendKind(kind);
     out.appendByte((uint8_t)automatonKind);
     out.appendString(field);
-    out.appendTerm(pattern);
+    // A general pattern is not fitted to the term length a one-byte prefix holds.
+    out.appendString(pattern);
     unused(ctx);
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
-  FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override {
-    switch (classification) {
-      case automaton::ByteDfaKind::SINGLE:
-        return pool.make<ExactTermTermsEnum>(te, exactOrPrefix);
-      case automaton::ByteDfaKind::PREFIX:
-      case automaton::ByteDfaKind::ALL:
-        return pool.make<PrefixTermsEnum>(te, exactOrPrefix);
-      case automaton::ByteDfaKind::NORMAL:
-        return pool.make<DfaIntersectEnum>(pool, te, dfa, scanPlan);
-      case automaton::ByteDfaKind::NONE:
-        assert(false);
-    }
-    return nullptr;
-  }
+  FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override;
 
   const DfaScanPlan& getScanPlan() const { return scanPlan; }
 
