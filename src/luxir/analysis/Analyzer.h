@@ -313,6 +313,10 @@ public:
 
 class TokenChain;
 
+// Stored schemas must survive words becoming invalid after an analysis update.
+// This policy applies only while compiling the shared stop-word sets.
+enum class InvalidStopWords { REJECT, WARN_AND_DROP };
+
 class TokenFilterFactory : public TokenStreamFactory {
 public:
   // True when normalizeTerm applies this filter's transformation. Only these
@@ -320,7 +324,10 @@ public:
   bool normalizing = false;
   // Once at compile time, before freezing the factory. The prefix is unfused
   // and contains only preceding stages; runtime chains never call this hook.
-  virtual void prepare(TokenChain& preceding) { unused(preceding); }
+  virtual void prepare(TokenChain& preceding, InvalidStopWords invalidStopWords) {
+    unused(preceding);
+    unused(invalidStopWords);
+  }
   virtual std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const = 0;
 };
 
@@ -416,7 +423,8 @@ public:
   // An absent tokenizer means "whitespace".  Throws std::invalid_argument with a
   // teaching message for an unknown or unnamed component or a parameter it
   // does not take.
-  static std::shared_ptr<const Analyzer> compile(const api::AnalyzerDef& def);
+  static std::shared_ptr<const Analyzer> compile(const api::AnalyzerDef& def,
+      InvalidStopWords invalidStopWords = InvalidStopWords::REJECT);
 
   std::unique_ptr<TokenChain> createChain() const;
 

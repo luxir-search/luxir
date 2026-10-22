@@ -70,7 +70,7 @@ TEST_F(StopFilterTest, foldingPositionsFusionAndLifetime) {
   EXPECT_EQ("the", term);
 }
 
-TEST_F(StopFilterTest, onlyPrecedingNormalizationAndMultipleStops) {
+TEST_F(StopFilterTest, onlyPrecedingAnalysisAndMultipleStops) {
   auto early = compile(R"({"filters":[{"name":"stop","params":{"words":["THE"]}},"lowercase"]})")->createChain();
   EXPECT_EQ((std::vector<std::string>{"the"}), analyze(*early, "the").terms);
   EXPECT_TRUE(analyze(*early, "THE").terms.empty());
@@ -78,16 +78,59 @@ TEST_F(StopFilterTest, onlyPrecedingNormalizationAndMultipleStops) {
     "nfkc_cf","fold",{"name":"stop","params":{"words":["Cafe\u0301"]}}]})")->createChain();
   EXPECT_EQ((std::vector<int>{2}), analyze(*chain, "THE CAFE tail").positions);
   auto stemmed = compile(R"({"filters":["lowercase","kstem",{"name":"stop","params":{"words":["ponies"]}}]})")->createChain();
-  EXPECT_EQ((std::vector<std::string>{"pony"}), analyze(*stemmed, "PONIES").terms);
+  EXPECT_TRUE(analyze(*stemmed, "PONIES").terms.empty());
+  auto possessive = compile(R"({"filters":["lowercase","english_possessive",
+    {"name":"stop","params":{"words":["Winter's"]}}]})")->createChain();
+  EXPECT_TRUE(analyze(*possessive, "WINTER'S").terms.empty());
+  auto segmented = compile(R"({"tokenizer":"unicode_word",
+    "filters":[{"name":"stop","params":{"words":["word!"]}}]})")->createChain();
+  EXPECT_TRUE(analyze(*segmented, "word").terms.empty());
 }
 
-TEST_F(StopFilterTest, normalizingCharFiltersParticipate) {
+TEST_F(StopFilterTest, charFiltersParticipate) {
   auto chain = compile(R"({"char_filters":["html_strip","nfkc_cf",
     {"name":"mapping","params":{"mappings":["- =>"]}}],
-    "filters":["fold",{"name":"stop","params":{"words":["CAF\u00c9-BAR"]}}]})")->createChain();
+    "filters":["fold",{"name":"stop","params":{"words":["<b>CAF&Eacute;-BAR</b>","&amp;"]}}]})")->createChain();
   auto out = analyze(*chain, "<b>CAFE-BAR</b> next");
   EXPECT_EQ((std::vector<std::string>{"next"}), out.terms);
   EXPECT_EQ((std::vector<int>{1}), out.positions);
+  EXPECT_TRUE(analyze(*chain, "&amp;").terms.empty());
+}
+
+TEST_F(StopFilterTest, invalidTokenCountsOnSetAndStoredLoad) {
+  for (auto [word, count] : {std::pair{"two words", 2}, {"<b></b>", 0}, {"", 0}}) {
+    SCOPED_TRACE(word);
+    std::string json = std::string(R"({"fields":{"body":{"type":"text","analyzer":{
+      "char_filters":["html_strip"],"tokenizer":"unicode_word",
+      "filters":[{"name":"stop","params":{"words":["keep",")") + word + R"("]}}]}}}})";
+    auto message = fmt::format("word '{}' produced {} tokens", word, count);
+    try {
+      schema(json);
+      FAIL() << "Accepted invalid stop word";
+    } catch (const SchemaError& e) {
+      EXPECT_NE(std::string::npos, std::string(e.what()).find(message));
+      auto info = classifyException(e, ErrorKind::INTERNAL);
+      EXPECT_EQ(ErrorKind::INVALID_REQUEST, info.kind);
+      EXPECT_EQ("invalid_schema", info.code);
+    }
+    // Encode the authored definition directly, as if saved by an older version.
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef def;
+    ASSERT_TRUE(api::read_json(def, json, arena));
+    std::vector<std::byte> bytes;
+    ASSERT_TRUE(api::encode(def, bytes));
+    api::SchemaInfo info;
+    info.source_def = bytes;
+    ExpectLog warning("Dropping stored stop word: filter 'stop': " + message);
+    auto loaded = Schema::fromStored(info, 7);
+    EXPECT_EQ(1u, warning.suppressed());
+    EXPECT_EQ(7u, loaded->gen_);
+    auto plan = ((TextFieldType*) loaded->physical("body"))->analyzer_;
+    EXPECT_EQ((std::vector<std::string>{"two", "words", "next"}),
+        analyze(*plan->createChain(), "keep two words next").terms);
+  }
+  EXPECT_THROW(compile(R"({"filters":[{"name":"stop","params":{"words":["the"]}},
+    {"name":"stop","params":{"words":["the"]}}]})"), std::invalid_argument);
 }
 
 TEST_F(StopFilterTest, invalidWordsAndStringNormalizers) {

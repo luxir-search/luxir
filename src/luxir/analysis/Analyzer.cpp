@@ -5,6 +5,7 @@
 #include "luxir/analysis/AsciiScan.h"
 #include "luxir/analysis/KStemmer.h"
 #include "luxir/analysis/NfkcCfData.h"
+#include "luxir/util/log.h"
 
 #include <algorithm>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -713,14 +714,25 @@ std::unique_ptr<TokenFilterFactory> stopFilter(const api::AnalyzerComponent& def
     std::vector<std::string> authored;
     std::shared_ptr<const StopWords> words;
 
-    void prepare(TokenChain& preceding) override {
+    void prepare(TokenChain& preceding, InvalidStopWords invalidStopWords) override {
       auto normalized = std::make_shared<StopWords>();
       auto source = std::move(authored);
       normalized->reserve(source.size());
-      for (auto& word : source) {
-        preceding.normalizeTerm(word);
-        if (word.empty()) throw std::invalid_argument("filter 'stop': a word becomes empty after preceding normalization");
-        normalized->insert(std::move(word));
+      for (const auto& word : source) {
+        preceding.setValue(word);
+        preceding.reset();
+        size_t count = 0;
+        std::string text;
+        while (preceding.tail->incrementToken()) {
+          if (++count == 1) text.assign(preceding.getToken().text);
+        }
+        if (count != 1) {
+          auto message = fmt::format("filter 'stop': word '{}' produced {} tokens; expected exactly one", word, count);
+          if (invalidStopWords == InvalidStopWords::REJECT) throw std::invalid_argument(message);
+          LOG_WARN("Dropping stored stop word: {}", message);
+          continue;
+        }
+        normalized->insert(std::move(text));
       }
       words = std::move(normalized);
     }
@@ -732,7 +744,6 @@ std::unique_ptr<TokenFilterFactory> stopFilter(const api::AnalyzerComponent& def
   auto factory = std::make_unique<Factory>();
   factory->name = def.name;
   auto add = [&](std::string_view word) {
-    if (word.empty()) throw std::invalid_argument("filter 'stop': words must not contain an empty string");
     factory->authored.emplace_back(word);
   };
   for (const auto& [key, value] : def.params) {
@@ -815,7 +826,7 @@ std::unique_ptr<TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerCo
                               "'; valid filters: " + joinNames(FILTERS));
 }
 
-std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
+std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def, InvalidStopWords invalidStopWords) {
   api::AnalyzerComponent whitespace;
   whitespace.name = "whitespace";
   auto tokenizer = makeTokenizerFactory(def.tokenizer.has_value() ? *def.tokenizer : whitespace);
@@ -825,12 +836,13 @@ std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
   for (const auto& factory : cleanups) stages.push_back({factory->create(), factory->normalizing});
   auto head = tokenizer->create();
   auto& headRef = *head;
-  TokenChain preceding(headRef, std::move(head), false, std::move(stages));
+  TokenChain preceding(headRef, std::move(head), tokenizer->stateful, std::move(stages));
   std::vector<std::unique_ptr<const TokenFilterFactory>> filters;
   filters.reserve(def.filters.size());
   for (const auto& filter : def.filters) {
     auto factory = makeTokenFilterFactory(filter);
-    factory->prepare(preceding);
+    factory->prepare(preceding, invalidStopWords);
+    preceding.stateful = preceding.stateful || factory->stateful;
     preceding.tail = factory->create(std::move(preceding.tail));
     filters.push_back(std::move(factory));
   }

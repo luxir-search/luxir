@@ -488,14 +488,15 @@ mapping tables followed by stream-safe NFC; runs exceeding 30 non-starters in
 NFKD receive U+034F (CGJ), so those adversarial inputs can differ from ICU.
 
 `stop` takes authored words, for example
-`{"name":"stop","params":{"words":["THE","Cafe\u0301"]}}`. At schema compile
-time, each word is normalized through preceding normalizing character filters
-and token filters, without tokenization. Normalized duplicates collapse; empty
-authored words and words that normalize to empty are rejected. There is no
-`ignore_case` parameter: preceding lowercase, NFKC, and accent-fold filters
-determine how words and tokens meet. Place stop after folding and before
-`english_possessive` or `kstem`; those analysis-only transformations are skipped
-by term normalization. Later filters do not affect the stop set.
+`{"name":"stop","params":{"words":["THE","Cafe\u0301"]}}`. Stop words are
+analyzed like field text up to the stop filter, including character filters,
+tokenization, and preceding token filters. Each must produce exactly one token;
+analyzed duplicates collapse. A schema set rejects words producing zero or
+several tokens. Loading a stored schema logs a warning and drops those words,
+so schemas saved under an older analysis version still load. There is no
+`ignore_case` parameter: preceding filters determine how words and tokens meet.
+For example, stop after `kstem` analyzes `ponies` to `pony`. Later filters do not
+affect the stop set.
 
 Removed tokens leave position holes before the next emitted token, preserving
 phrase distances. Trailing holes are discarded because token streams do not

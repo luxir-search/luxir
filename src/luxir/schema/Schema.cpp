@@ -473,6 +473,7 @@ static void validateReservedFields(const sv_resolved_map& resolved, const owners
 // Pass 3 compiles each effective analysis definition once and creates physical
 // bundles with the logical owner's shape. Storage can only belong to the primary.
 struct FieldCompiler {
+  InvalidStopWords invalidStopWords;
   boost::unordered_flat_map<const api::AnalyzerDef*, std::shared_ptr<const Analyzer>> analyzers;
   boost::unordered_flat_map<const api::NormalizerDef*, std::shared_ptr<const Analyzer>> normalizers;
 
@@ -607,7 +608,7 @@ struct FieldCompiler {
           // The registry's teaching error (unknown component, unexpected
           // parameter) plus the field it was found on.
           try {
-            analyzer = Analyzer::compile(r.analyzer ? *r.analyzer : luxir::api::AnalyzerDef{});
+            analyzer = Analyzer::compile(r.analyzer ? *r.analyzer : luxir::api::AnalyzerDef{}, invalidStopWords);
           } catch (const std::invalid_argument& e) {
             throw SchemaError(std::string(e.what()) + " (field: " + std::string(name) + ")");
           }
@@ -777,6 +778,10 @@ static std::shared_ptr<StoredFieldType> storedResourceType(std::string_view name
 }
 
 std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, const Schema* base) {
+  return compile(def, base, InvalidStopWords::REJECT);
+}
+
+std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema* base, InvalidStopWords invalidStopWords) {
   auto schema = std::make_shared<Schema>();
 
   // ---- assemble the authored source entries (merge or replace) ----
@@ -931,7 +936,7 @@ std::shared_ptr<Schema> Schema::fromProto(const luxir::api::SchemaDef& def, cons
     }
   }
 
-  FieldCompiler compiler;
+  FieldCompiler compiler{invalidStopWords, {}, {}};
   for (const auto& e : entries) {
     const auto& r = resolved.at(e.name);
     const auto& owned = ownership.at(e.name);

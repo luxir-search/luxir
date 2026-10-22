@@ -78,6 +78,8 @@ private:
 
   RootField findRoot(std::string_view root) const;
   const std::shared_ptr<FieldType>* findPhysical(std::string_view name) const;
+  static std::shared_ptr<Schema> compile(const api::SchemaDef& def, const Schema* base,
+                                         InvalidStopWords invalidStopWords);
 
 public:
   Schema() = default;
