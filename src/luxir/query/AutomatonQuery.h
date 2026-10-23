@@ -78,6 +78,13 @@ public:
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
+  // Same scored-clause ceiling as fuzzy. Filters retain the complete union;
+  // scored MATCH rejects overflow rather than silently losing case variants.
+  static constexpr size_t MAX_CASE_VARIANTS = 64;
+
+  Query::Weight* createWeight(Context& context, int32_t flags,
+                              float multiplier = 1.0f) override;
+
   FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override;
 
   const DfaScanPlan& getScanPlan() const { return scanPlan; }

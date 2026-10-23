@@ -7,8 +7,10 @@
 #include <map>
 
 #include <uni_algo/case.h>
+#include <uni_algo/conv.h>
 
 #include "luxir/util/automaton/Automaton.h"
+#include "luxir/util/automaton/CodepointFolder.h"
 #include "luxir/util/screaming.h"
 
 namespace luxir::automaton {
@@ -63,6 +65,18 @@ std::span<const int32_t> caseAlternates(int32_t cp) {
   auto it = lowerBound(classes, cp);
   if (it == classes.entries.end() || it->codepoint != cp) return {};
   return {classes.members.data() + it->begin, (size_t)(it->end - it->begin)};
+}
+
+bool caseAlternatesFoldToSelf(std::string_view term, const CodepointFolder& folder) {
+  auto scalars = una::utf8to32(term);
+  if (una::utf32to8(scalars) != term) return false;
+  for (char32_t cp : scalars) {
+    for (int32_t alternate : caseAlternates((int32_t)cp)) {
+      int32_t folded[32];
+      if (folder.fold(alternate, folded, 32) != 1 || folded[0] != (int32_t)cp) return false;
+    }
+  }
+  return true;
 }
 
 void appendCaseAlternates(std::vector<std::pair<int32_t, int32_t>>& ranges, Budget& budget) {

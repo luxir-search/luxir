@@ -85,23 +85,36 @@ The HTTP dialect also accepts the field-name form:
 | `val` | Value to analyze or coerce. Required. |
 | `operator` | `or` (default) or `and` for several analyzed terms. |
 | `min_match` | Minimum analyzed terms that must match; overrides `operator` and is clamped to the term count. |
-| `case_insensitive` | Ignore simple Unicode case on indexed STRING/ID. TEXT rejects `true`; numeric/date ignore it. Default `false`. |
+| `case_insensitive` | Ignore simple Unicode case on indexed TEXT/STRING/ID; numeric/date ignore it. Default `false`. |
 
 Text values are analyzed with the resolved field analyzer. String values use
 their normalizer, if configured, and match as exact terms. Numeric and date
 values are coerced through the same rules as indexing and matched through
 their columns.
 
-With `case_insensitive`, a STRING or ID value (after its normalizer) matches
-any indexed term that differs only in simple Unicode case: `FOO` matches
-`foo` and `Foo`, and `k` matches the Kelvin sign. Such a value is matched
-through the same automaton as an escaped `wildcard` and is constant-scoring.
-TEXT fields reject `case_insensitive: true`: choose a folding analyzer or
-field variant such as `_wl`, and let analysis determine case handling. Numeric
-and date fields ignore the flag. Simple case folding is one-to-one, so sharp s
-(U+00DF) does not match `SS`. For frequent case-blind STRING matching, prefer a
-[STRING normalizer](schema.md#string-normalization-and-length) with `lowercase`
-or `nfkc_cf`, so ordinary `match` uses an exact term lookup.
+With `case_insensitive`, each analyzed TEXT token or normalized STRING/ID
+value matches indexed terms that differ only in simple Unicode case: `FOO`
+matches `foo` and `Foo`, and `k` matches the Kelvin sign. All indexed variants
+of one token score as a single synonym word: their term frequencies are
+summed per document before BM25 saturation, with shared statistics (maximum
+document frequency and summed total term frequency). A rare spelling gets no
+extra IDF, and every variant has the same weight. `operator`, `min_match`, and
+boosts still apply over the analyzed query tokens. Filters match the same
+variants without computing scores. Scored matches reject more than 64 distinct
+indexed case variants per token; filters retain the complete match set.
+
+If analysis already erases the token's case, ordinary term lookup and scoring
+are retained. Case expansion is slower than using a folding TEXT variant such
+as `_t`, `_un`, or `_wl`; prefer those for frequent case-blind matching.
+Alternates come from the token **after query-time analysis**, without analyzing
+them again. Case-preserving stemmed fields can therefore be lopsided: KStem
+stems only lowercase words, so `ponies` can become `pony` while `PONIES` stays
+`PONIES`; case expansion cannot bridge the different stems.
+
+Numeric and date fields ignore the flag. Simple case folding is one-to-one,
+so sharp s (U+00DF) does not match `SS`. For frequent case-blind STRING matching,
+prefer a [STRING normalizer](schema.md#string-normalization-and-length) with
+`lowercase` or `nfkc_cf`, so ordinary `match` uses an exact term lookup.
 
 ## Exact membership (`any_of`)
 

@@ -1,6 +1,8 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <map>
+
 #include "test/LuxirTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -51,6 +53,27 @@ protected:
     return ids(*run(std::format(R"({{"query":{},"fields":["id"],"limit":-1}})", query)));
   }
 
+  std::map<std::string, float> scores(std::string_view expression) {
+    auto req = localReq(helper.getSearchEngine());
+    req->topDocs("q").exprQuery(expression).fields({"id"}).limit(-1).getScores();
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    std::map<std::string, float> out;
+    if (!req->ok() || req->docList()->row_count == 0) return out;
+    const auto& columns = req->docList()->columns;
+    const auto& ids = std::get<api::ColStr>(columns.at("id").kind).v;
+    const auto& values = std::get<api::ColFloat>(columns.at("_score_").kind).v;
+    for (size_t i = 0; i < ids.size(); i++) out.emplace(std::string(ids[i]), values[i]);
+    return out;
+  }
+
+  static FilterKey key(const Query& query) {
+    FilterKeyContext context;
+    FilterKeyBuilder out;
+    auto scope = query.appendFilterKey(out, context);
+    return std::move(out).finishStructural(scope, context);
+  }
+
   Ids expr(std::string_view expression) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main").topDocs("q").exprQuery(expression).fields({"id"}).limit(-1);
@@ -89,16 +112,148 @@ TEST_F(CaseInsensitiveQueryTest, regexClassesExpandCase) {
 TEST_F(CaseInsensitiveQueryTest, textMatchUsesItsAnalyzer) {
   EXPECT_EQ((Ids{"b"}), hits(R"({"match":{"body_w":"error"}})"));
   EXPECT_EQ((Ids{"a", "b"}), hits(R"({"match":{"title_t":"ERROR"}})"));
-  for (auto field : {"body_w", "title_t"}) {
-    auto req = run(std::format(R"({{"query":{{"match":{{"field":"{}","val":"error","case_insensitive":true}}}}}})", field));
-    EXPECT_FALSE(req->ok());
-    EXPECT_NE(std::string::npos, req->errorMsg().find("folding"));
+  EXPECT_EQ((Ids{"a", "b", "c"}), hits(R"({"match":{"body_w":"error","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"a", "b"}), hits(R"({"match":{"title_t":"ERROR","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"a", "b", "c"}), expr("match(error, field=body_w, case_insensitive=true)"));
+}
+
+TEST_F(CaseInsensitiveQueryTest, textOperatorAndMinMatchCountTokens) {
+  EXPECT_EQ((Ids{"a", "b", "c"}), hits(R"({"match":{"body_w":"error happened","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"a", "b"}), hits(R"({"match":{"body_w":"error happened","case_insensitive":true,"operator":"and"}})"));
+  EXPECT_EQ((Ids{"a", "b"}), hits(R"({"match":{"body_w":"error happened other","case_insensitive":true,"min_match":2}})"));
+  // Two alternate spellings in a document still count as just one query token.
+  ASSERT_TRUE(helper.index(flatdoc("id", "mixed", "body_w", "Error ERROR"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ((Ids{"a", "b"}), hits(R"({"match":{"body_w":"error happened","case_insensitive":true,"min_match":2}})"));
+}
+
+TEST_F(CaseInsensitiveQueryTest, foldingKeepsTermQueriesAndScores) {
+  MemPool pool;
+  auto schema = helper.collection().getSchema();
+  QueryBuilder builder(pool, *schema, CoerceContext{});
+  for (auto field : {"title_t", "title_un", "title_wl"}) {
+    auto* plain = builder.createMatchQuery(field, "ERROR");
+    auto* ci = builder.createMatchQuery(field, "ERROR", QueryBuilder::Operator::OR, 0, 1.0f, true);
+    EXPECT_EQ(QueryKind::TERM, ci->getKind());
+    EXPECT_TRUE(plain->equals(*ci));
+    EXPECT_EQ(plain->hash(), ci->hash());
+    EXPECT_EQ(key(*plain), key(*ci));
+    std::string longWord(300, 'A');
+    plain = builder.createMatchQuery(field, longWord);
+    ci = builder.createMatchQuery(field, longWord, QueryBuilder::Operator::OR, 0, 1.0f, true);
+    EXPECT_EQ(QueryKind::TERM, ci->getKind());
+    EXPECT_TRUE(plain->equals(*ci));
   }
-  auto req = localReq(helper.getSearchEngine());
-  req->topDocs("q").exprQuery("match(error, field=body_w, case_insensitive=true)");
-  req->execute(false);
+  EXPECT_EQ(scores("match(ERROR, field=title_t)"),
+            scores("match(ERROR, field=title_t, case_insensitive=true)"));
+}
+
+class CaseInsensitiveScoringTest : public CaseInsensitiveQueryTest {
+protected:
+  void SetUp() override {
+    // Separate commits exercise the union and term statistics across segments.
+    ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "a", "word_w", "Foo pad"),
+      flatdoc("id", "b", "word_w", "foo pad"),
+      flatdoc("id", "c", "word_w", "foo pad"),
+    }, UpdateMessage::COMMIT).success);
+    ASSERT_TRUE(helper.indexAll(std::array{
+      flatdoc("id", "d", "word_w", "Foo foo"),
+      flatdoc("id", "e", "word_w", "FOO FOO"),
+      flatdoc("id", "f", "word_w", "other other"),
+    }, UpdateMessage::COMMIT).success);
+  }
+};
+
+TEST_F(CaseInsensitiveScoringTest, synonymsSumTfBeforeSaturation) {
+  auto actual = scores("match(Foo, field=word_w, case_insensitive=true)");
+  ASSERT_EQ(5u, actual.size());
+  Similarity sim;
+  // Shared df = max(2, 3, 1), field length and avgdl are both 2.
+  Similarity::BM25Scorer bm25(1.0f, sim.k1, sim.b, sim.idf(3, 6), 2.0f);
+  float single = bm25.score(1.0f, SmallFloat::intToByte4(2));
+  float twice = bm25.score(2.0f, SmallFloat::intToByte4(2));
+  for (auto id : {"a", "b", "c"}) EXPECT_FLOAT_EQ(single, actual.at(id));
+  for (auto id : {"d", "e"}) EXPECT_FLOAT_EQ(twice, actual.at(id));
+  EXPECT_GT(twice, single);
+  EXPECT_LT(twice, 2.0f * single);
+  // Neither the query's spelling nor the rarity of a variant changes its IDF.
+  EXPECT_EQ(actual, scores("match(FOO, field=word_w, case_insensitive=true)"));
+  auto boosted = scores("match(foo, field=word_w, case_insensitive=true)^3");
+  ASSERT_EQ(actual.size(), boosted.size());
+  for (const auto& [id, score] : actual) EXPECT_FLOAT_EQ(3.0f * score, boosted.at(id));
+}
+
+TEST_F(CaseInsensitiveScoringTest, sharedStatsAndIdentitySurviveWeightCreation) {
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_GE(reader->segments().size(), 2u);
+  MemPool pool;
+  QueryBuilder builder(pool, *reader->schema(), CoerceContext{});
+  auto* ci = builder.createMatchQuery("word_w", "Foo", QueryBuilder::Operator::OR, 0, 1.0f, true);
+  auto* plain = builder.createMatchQuery("word_w", "Foo");
+  EXPECT_FALSE(ci->equals(*plain));
+  EXPECT_NE(ci->hash(), plain->hash());
+  EXPECT_NE(key(*ci), key(*plain));
+  auto before = key(*ci);
+  Query::Context context(pool, *reader);
+  auto* weight = ci->createWeight(context, Query::NEED_SCORES);
+  auto* combined = dynamic_cast<CombinedFieldQuery::Weight*>(weight);
+  ASSERT_NE(nullptr, combined);
+  EXPECT_EQ(3, combined->getTermStats().docFreq);
+  EXPECT_EQ(7, combined->getTermStats().totalTermFreq);
+  auto* filter = ci->createWeight(context, 0);
+  EXPECT_TRUE(filter->isConstantScoring());
+  EXPECT_EQ(before, key(*ci));
+  // Scored and unscored weights see exactly the same segment-local documents.
+  for (auto& segment : reader->segments()) {
+    auto* scored = weight->createScorer(pool, segment);
+    auto* unscored = filter->createScorer(pool, segment);
+    ASSERT_NE(nullptr, scored);
+    ASSERT_NE(nullptr, unscored);
+    float bound = scored->getMaxScore(PostingsReader::END);
+    for (int doc = scored->next(); doc != PostingsReader::END; doc = scored->next()) {
+      EXPECT_EQ(doc, unscored->advance(doc));
+      EXPECT_GE(bound, scored->score());
+    }
+    EXPECT_EQ(PostingsReader::END, unscored->next());
+  }
+}
+
+TEST_F(CaseInsensitiveQueryTest, unicodeTextAndStringScores) {
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "k1", "letter_u", "k", "letter_s", "k"),
+    flatdoc("id", "k2", "letter_u", "K", "letter_s", "K"),
+    flatdoc("id", "k3", "letter_u", "\u212a", "letter_s", "\u212a"),
+  }, UpdateMessage::COMMIT).success);
+  for (auto field : {"letter_u", "letter_s"}) {
+    auto actual = scores(std::format("match(k, field={}, case_insensitive=true)", field));
+    ASSERT_EQ(3u, actual.size());
+    EXPECT_GT(actual.at("k1"), 0.0f);
+    EXPECT_FLOAT_EQ(actual.at("k1"), actual.at("k2"));
+    EXPECT_FLOAT_EQ(actual.at("k1"), actual.at("k3"));
+  }
+  EXPECT_EQ((Ids{"k1", "k2", "k3"}), hits(R"({"match":{"letter_u":"k","case_insensitive":true}})"));
+}
+
+TEST_F(CaseInsensitiveQueryTest, scoredExpansionBudgetRejectsWithoutTruncatingFilters) {
+  for (int i = 0; i <= (int)AutomatonQuery::MAX_CASE_VARIANTS; i++) {
+    std::string term(7, 'a');
+    for (size_t bit = 0; bit < term.size(); bit++) {
+      if ((i & (1 << bit)) != 0) term[bit] = 'A';
+    }
+    ASSERT_TRUE(helper.index(flatdoc("id", std::to_string(i), "variants_w", term),
+        UpdateMessage::NO_COMMIT).success);
+    if (i + 1 == (int)AutomatonQuery::MAX_CASE_VARIANTS) {
+      helper.commit();
+      EXPECT_EQ(AutomatonQuery::MAX_CASE_VARIANTS,
+                scores("match(aaaaaaa, field=variants_w, case_insensitive=true)").size());
+    }
+  }
+  helper.commit();
+  auto req = run(R"({"query":{"match":{"variants_w":"aaaaaaa","case_insensitive":true}},"get_scores":true})");
   EXPECT_FALSE(req->ok());
-  EXPECT_NE(std::string::npos, req->errorMsg().find("folding"));
+  EXPECT_NE(std::string::npos, req->errorMsg().find("64 indexed case variants"));
+  auto filtered = run(R"json({"query":{"all":true},"filter":["match(aaaaaaa, field=variants_w, case_insensitive=true)"],"fields":["id"],"limit":-1})json");
+  EXPECT_EQ(AutomatonQuery::MAX_CASE_VARIANTS + 1, ids(*filtered).size());
 }
 
 TEST_F(CaseInsensitiveQueryTest, idAndNumericMatch) {
@@ -155,7 +310,8 @@ protected:
   void SetUp() override {
     std::pmr::monotonic_buffer_resource arena;
     api::SchemaDef def;
-    ASSERT_TRUE(api::read_json(def, R"({"fields":{"id":"id","name_s":"string","body":{"type":"text",
+    ASSERT_TRUE(api::read_json(def, R"({"fields":{"id":"id","name_s":"string","word_w":{"type":"text","analyzer":{"tokenizer":"whitespace"}},
+      "stem":{"type":"text","analyzer":{"tokenizer":"whitespace","filters":["kstem"]}},"body":{"type":"text",
       "analyzer":{"tokenizer":"whitespace","char_filters":[{"name":"mapping",
         "params":{"mappings":["a => b","b => c","ph => f"]}}]}}}})", arena));
     helper.collection().setSchema(Schema::fromProto(def));
@@ -217,4 +373,38 @@ TEST_F(CaseInsensitiveMappingTest, literalAndPatternFilterCache) {
   }
   auto counters = cache->counters();
   EXPECT_GT(counters.hits + counters.readerStableHits, 0u);
+}
+
+TEST_F(CaseInsensitiveMappingTest, matchNormalizesOnlyBeforeExpansion) {
+  // berry analyzes to cerry; expanding before analysis would also find BERRY.
+  EXPECT_EQ((Ids{"c"}), hits(R"({"match":{"body":"berry","case_insensitive":true}})"));
+}
+
+TEST_F(CaseInsensitiveMappingTest, matchFilterCacheSeparatesExactAndCaseInsensitive) {
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "lower", "word_w", "foo"),
+    flatdoc("id", "upper", "word_w", "FOO"),
+  }, UpdateMessage::COMMIT).success);
+  for (int pass = 0; pass < 2; pass++) {
+    for (bool ci : {false, true, false}) {
+      auto req = run(std::format(R"json({{"query":{{"all":true}},"filter":[
+          {{"match":{{"word_w":"foo","case_insensitive":{}}}}}],"fields":["id"],"limit":-1}})json", ci));
+      EXPECT_EQ(ci ? (Ids{"lower", "upper"}) : (Ids{"lower"}), ids(*req));
+    }
+  }
+  auto actual = scores("match(foo, field=word_w, case_insensitive=true)");
+  ASSERT_EQ(2u, actual.size());
+  EXPECT_GT(actual.at("lower"), 0.0f);
+  EXPECT_FLOAT_EQ(actual.at("lower"), actual.at("upper"));
+  auto counters = cache->counters();
+  EXPECT_GT(counters.hits + counters.readerStableHits, 0u);
+}
+
+TEST_F(CaseInsensitiveMappingTest, expansionUsesAnalyzedStem) {
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "lower", "stem", "ponies"),
+    flatdoc("id", "upper", "stem", "PONIES"),
+  }, UpdateMessage::COMMIT).success);
+  EXPECT_EQ((Ids{"lower"}), hits(R"({"match":{"stem":"ponies","case_insensitive":true}})"));
+  EXPECT_EQ((Ids{"upper"}), hits(R"({"match":{"stem":"PONIES","case_insensitive":true}})"));
 }

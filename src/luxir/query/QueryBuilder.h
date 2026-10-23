@@ -39,6 +39,7 @@
 #include "luxir/util/NumericUtils.h"
 #include "luxir/util/StrRef.h"
 #include "luxir/util/automaton/WildcardCompiler.h"
+#include "luxir/util/automaton/CaseAlternates.h"
 #include "luxir/util/automaton/RegExpParser.h"
 
 namespace luxir {
@@ -293,8 +294,10 @@ private:
     return term->data() == scratch.data() ? poolCopy(*term) : *term;
   }
 
-  // Analyzer buffers are borrowed until the next pull. Fitted term bytes
-  // belong to the pool; the returned vector only owns their views.
+  // Analyzer buffers are borrowed until the next pull. Copied term bytes
+  // belong to the pool; the returned vector only owns their views. Case
+  // expansion needs Unicode bytes before fitting, which can introduce hashes.
+  template<bool fit = true>
   std::vector<std::string_view> analyzeText(const ResolvedFieldHandle& target,
                                            std::string_view text) {
     TokenChain& tc = *fields.chain(target);
@@ -304,7 +307,8 @@ private:
     tc.setValue(text);
     tc.reset();
     while (tail.incrementToken()) {
-      terms.push_back(poolCopy(fitTerm(target, tok.text)));
+      if constexpr (fit) terms.push_back(poolCopy(fitTerm(target, tok.text)));
+      else terms.push_back(poolCopy(tok.text));
     }
     return terms;
   }
@@ -799,8 +803,8 @@ public:
   // k <= 1 builds a disjunction, k >= N a conjunction, and the middle a
   // min-should-match boolean.
   //
-  // `caseInsensitive` matches STRING / ID values through a constant-score
-  // case-alternating automaton. TEXT rejects it: the analyzer owns case.
+  // `caseInsensitive` expands each analyzed/normalized token to indexed case
+  // alternates, scored together as synonyms. Case-erasing analysis keeps terms.
   // Numeric and DATE fields ignore it.
   Query* createMatchQuery(std::string_view field, std::string_view value,
                           Operator op = Operator::OR, int minMatch = 0, float boost = 1.0f,
@@ -815,18 +819,30 @@ public:
     FieldType& fieldType = *target.fieldType;
     switch (fieldType.type()) {
       case FieldType::Type::TEXT: {
-        if (caseInsensitive) {
-          throw std::runtime_error(std::format(
-              "Match case_insensitive is not supported on TEXT field '{}'; use a folding analyzer or field variant",
-              field));
-        }
-        auto terms = analyzeText(target, value);
+        auto terms = caseInsensitive ? analyzeText<false>(target, value) : analyzeText(target, value);
         if (terms.empty()) return matchNoDocs();
-        if (terms.size() == 1) return pool.make<TermQuery>(field, terms[0], boost);
-        auto clauses = pool.make_span<Query*>(terms.size());
-        for (size_t i = 0; i < terms.size(); i++) {
-          clauses[i] = pool.make<TermQuery>(field, terms[i], boost);
+        if (!caseInsensitive) {
+          if (terms.size() == 1) return pool.make<TermQuery>(field, terms[0], boost);
+          auto clauses = pool.make_span<Query*>(terms.size());
+          for (size_t i = 0; i < terms.size(); i++) {
+            clauses[i] = pool.make<TermQuery>(field, terms[i], boost);
+          }
+          return combineAnalyzedClauses(clauses, op, minMatch);
         }
+        auto* chain = fields.chain(target);
+        FieldCodepointFolder folder(chain);
+        auto makeTerm = [&](std::string_view term) -> Query* {
+          // Character mappings can span scalars or be non-idempotent. In
+          // that case use the analyzed bytes verbatim for case expansion.
+          if (chain->hasCharFilters() || !automaton::caseAlternatesFoldToSelf(term, folder)) {
+            checkAutomatonField("Match", target);
+            return makeCaseInsensitiveTerm(AutomatonQuery::Kind::MATCH, target, field, term, boost);
+          }
+          return pool.make<TermQuery>(field, fitTerm(target, term), boost);
+        };
+        if (terms.size() == 1) return makeTerm(terms[0]);
+        auto clauses = pool.make_span<Query*>(terms.size());
+        for (size_t i = 0; i < terms.size(); i++) clauses[i] = makeTerm(terms[i]);
         return combineAnalyzedClauses(clauses, op, minMatch);
       }
       case FieldType::Type::STRING:
@@ -1057,9 +1073,13 @@ public:
       for (size_t t = 0; t < terms.size(); t++) {
         // Only a singleton at weight 1 is ordinary BM25. All other weights
         // scale frequency and length, including in single-field groups.
-        clauses[t] = plainTerm
-            ? (Query*)pool.make<TermQuery>(group.fields[0], terms[t])
-            : (Query*)pool.make<CombinedFieldQuery>(group.fields, group.weights, terms[t]);
+        if (plainTerm) {
+          clauses[t] = pool.make<TermQuery>(group.fields[0], terms[t]);
+        } else {
+          auto entries = pool.make_span<CombinedFieldQuery::Term>(group.fields.size());
+          for (size_t f = 0; f < entries.size(); f++) entries[f] = {f, terms[t]};
+          clauses[t] = pool.make<CombinedFieldQuery>(group.fields, group.weights, entries);
+        }
       }
       optional[count++] = combineAnalyzedClauses(clauses, op, minMatch);
     }

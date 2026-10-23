@@ -179,7 +179,8 @@ TEST_F(MultiMatchQueryTest, analysisGroups) {
   for (std::string_view text : {"dune", "Dune"}) {
     auto* query = parse(qb::multiMatch(mr(), text,
         {{"title_un", {}}, {"body_un", {}}, {"tag_w", {}}}));
-    CombinedFieldQuery combined(names, weights, "dune");
+    CombinedFieldQuery::Term terms[] = {{0, "dune"}, {1, "dune"}};
+    CombinedFieldQuery combined(names, weights, terms);
     TermQuery tag("tag_w", text);
     Query* optional[] = {&combined, &tag};
     BooleanQuery expected({}, optional, {}, {});

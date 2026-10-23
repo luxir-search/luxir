@@ -426,9 +426,12 @@ message Match {
   // Mirrors BooleanQuery.min_match.
   int32 min_match = 4;
 
-  // Match STRING and ID values regardless of simple Unicode case, after
-  // normalization. Uses a constant-score automaton. TEXT rejects this flag;
-  // use a folding analyzer or field variant. Numeric and DATE fields ignore it.
+  // Match TEXT tokens and STRING/ID values regardless of simple Unicode case,
+  // after query analysis/normalization. Indexed case variants score as synonyms
+  // with summed frequency and shared statistics. Slower than a folding variant
+  // (_t, _un, _wl), recommended for frequent use. Alternates come from analyzed
+  // tokens; case-preserving stemmers can be asymmetric (KStem stems lowercase
+  // only). Numeric and DATE fields ignore it.
   bool case_insensitive = 10;
 
   enum Operator {
