@@ -7,6 +7,7 @@
 #include <string>
 
 #include "luxir/server/JsonResponse.h"
+#include "luxir/server/JsonRequest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
@@ -396,6 +397,82 @@ TEST_F(JsonResponseTest, everyDocListRendersUnderOps) {
   EXPECT_EQ(
       R"({"ops":{"first":{"found":3,"docs":[{"id":"1"}]},"second":{"docs":[{"id":"1"},{"id":"2"}]}}})",
       renderOperations(req->responses[0]->proto));
+}
+
+TEST_F(JsonResponseTest, integerStringOptionUsesSafeBoundariesAndPreservesUnsignedValues) {
+  std::pmr::monotonic_buffer_resource mr;
+  constexpr int64_t safe = (int64_t{1} << 53) - 1;
+  const std::array<int64_t, 6> values{safe, safe + 1, -safe, -safe - 1, INT64_MIN, INT64_MAX};
+  api::SearchResponse response;
+  api::build::opsSlot(response.ops, 1, "values", mr)->kind = api::ArrInt{.v = values};
+  const std::string numbers = R"({"ops":{"values":[9007199254740991,9007199254740992,-9007199254740991,-9007199254740992,-9223372036854775808,9223372036854775807]}})";
+  EXPECT_EQ(numbers, renderSearchResponseBody(response));
+  EXPECT_EQ(numbers, renderSearchResponseBody(response, false, {}));
+  EXPECT_EQ(R"({"ops":{"values":[9007199254740991,"9007199254740992",-9007199254740991,"-9007199254740992","-9223372036854775808","9223372036854775807"]}})",
+      renderSearchResponseBody(response, false, {.int64Str = true}));
+
+  api::ExecutionProfilePiece piece;
+  piece.elapsed_us = UINT64_MAX;
+  api::ExecutionProfileOp profile;
+  profile.name = "timing";
+  profile.pieces = {&piece, 1};
+  response.profile.emplace().ops = {&profile, 1};
+  EXPECT_NE(std::string::npos, renderSearchResponseBody(response).find(R"("elapsed_us":18446744073709551615)"));
+  EXPECT_NE(std::string::npos, renderSearchResponseBody(response, false, {.int64Str = true}).find(
+      R"("elapsed_us":"18446744073709551615")"));
+}
+
+TEST_F(JsonResponseTest, integerStringOptionRecursesThroughMapsAndArrays) {
+  std::pmr::monotonic_buffer_resource mr;
+  api::SearchResponse response;
+  api::Map map;
+  api::build::opsSlot(map.fields, 1, "x", mr)->kind = INT64_MAX;
+  const std::array<api::Val, 2> values{api::Val{.kind = map}, api::Val{.kind = INT64_MIN}};
+  api::build::opsSlot(response.ops, 1, "nested", mr)->kind = api::ArrVal{.v = values};
+  EXPECT_EQ(R"({"ops":{"nested":[{"x":9223372036854775807},-9223372036854775808]}})",
+      renderSearchResponseBody(response));
+  EXPECT_EQ(R"({"ops":{"nested":[{"x":"9223372036854775807"},"-9223372036854775808"]}})",
+      renderSearchResponseBody(response, false, {.int64Str = true}));
+}
+
+TEST_F(JsonResponseTest, integerStringOptionCoversDocsHeadersAndScalarCounts) {
+  std::pmr::monotonic_buffer_resource mr;
+  api::SearchResponse response;
+  auto& docs = api::build::opsSlot(response.ops, 1, "q", mr)->kind.emplace<api::DocList>();
+  docs.found = INT64_MAX;
+  docs.found_docs = 1;
+  auto runs = renderDocRuns(response, {.int64Str = true});
+  ASSERT_EQ(1u, runs.size());
+  DocLinesState state;
+  std::string marker;
+  ASSERT_TRUE(frameDocRun(runs[0], state, {}, marker, {.int64Str = true}));
+  EXPECT_EQ(R"({"_header_":{"found":"9223372036854775807","found_docs":1}})" "\n", marker);
+}
+
+TEST_F(JsonResponseTest, integerStringOptionCoversFacetBoundsGroupKeysAndRanks) {
+  CollectionHelper helper;
+  constexpr int64_t big = int64_t{1} << 53;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "key_i", big),
+      flatdoc("id", "b", "key_i", big)}, UpdateMessage::COMMIT).success);
+  auto req = localReq(helper.getSearchEngine());
+  parseQueryRequest(R"json({"query":"*:*","fields":["id"],"get_scores":true,"sort":"key_i asc",
+    "collapse":{"field":["key_i"],"head_sort":"id desc"},"ops":{
+      "values":{"field_facet":{"field":"key_i"}},
+      "bounds":{"range_facet":{"field":"key_i","start":9007199254740992,"end":9007199254740994,"gap":1}},
+      "metric":"min(key_i)"}})json", req->rawRequest(), req->mr);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& response = req->responses[0]->proto;
+  auto text = renderSearchResponseBody(response, true, {.int64Str = true});
+  for (auto part : {R"("_group_":{"val":"9007199254740992","rank":["9007199254740992"]})",
+                    R"("val":"9007199254740992","count":1)",
+                    R"("val":["9007199254740992","9007199254740993"],"count":1)",
+                    R"("metric":"9007199254740992")"}) {
+    EXPECT_NE(std::string::npos, text.find(part)) << text;
+  }
+  auto runs = renderDocRuns(response, {.int64Str = true});
+  ASSERT_EQ(1u, runs.size());
+  EXPECT_NE(std::string::npos, runs[0].body.find(R"("rank":["9007199254740992"])"));
 }
 
 } // namespace luxir::test

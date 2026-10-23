@@ -179,9 +179,10 @@ Subops inherit their parent's effective word. The date mode occupies bits 0-1:
 `0` is native, `1` is iso, `2` is ms, and `3` is ns. To override it, set
 `flags_set = 3` and put the mode value in `flags`. Explicit native uses
 `flags = 0, flags_set = 3`. Setting only one date-mode mask bit is rejected.
-Bits outside the date group, including reserved bit 2, are rejected in either
-word, even when attempting to clear them. Bits absent from `flags_set` have no
-effect on inheritance.
+Bit 2 is `int64_str`, accepted only on SearchRequest; a SearchOp cannot set
+or clear it in either word. It affects HTTP JSON rendering only, and binary
+gRPC responses retain their integer types. Unknown bits are rejected in either
+word. Bits absent from `flags_set` have no effect on inheritance.
 
 `RequestFlagBit` names bit positions, not masks; shift `uint64{1}` by the
 position when constructing masks. JSON uses lowercase name arrays instead of

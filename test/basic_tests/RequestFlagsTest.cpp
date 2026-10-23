@@ -155,11 +155,12 @@ TEST_F(RequestFlagsTest, explicitAndDataFacetGridsConvertGapAndOriginAtTheEdge) 
   }
 }
 
-TEST_F(RequestFlagsTest, binaryValidationRejectsReservedUnknownAndPartialOverrides) {
+TEST_F(RequestFlagsTest, binaryValidationRejectsUnknownPartialAndOpOnlyOverrides) {
   CollectionHelper helper;
   for (bool opLevel : {false, true}) for (auto [flags, set] : {
       std::pair<uint64_t, uint64_t>{1, 1}, {2, 2}, {8, 0}, {0, 8},
       {uint64_t{1} << 63, 0}, {4, 0}, {0, 4}}) {
+    if (!opLevel && ((flags | set) & RequestFlags::INT64_STR)) continue;
     auto req = localReq(helper.getSearchEngine());
     req->topDocs("q").allQuery().limit(0);
     if (opLevel) {
@@ -173,7 +174,8 @@ TEST_F(RequestFlagsTest, binaryValidationRejectsReservedUnknownAndPartialOverrid
     wireRoundTrip(*req);
     req->execute(false);
     EXPECT_FALSE(req->ok());
-    auto expected = RequestFlags::validationError(flags, set);
+    auto expected = RequestFlags::validationError(flags, set,
+        opLevel ? RequestFlags::Level::OP : RequestFlags::Level::REQUEST);
     EXPECT_NE(std::string::npos, req->errorMsg().find(expected)) << req->errorMsg();
   }
 }
@@ -488,5 +490,23 @@ TEST_F(RequestFlagsTest, numericDateGroupKeysNormalizeEachTupleComponent) {
     ASSERT_EQ(2u, keys.size());
     EXPECT_EQ(mode == 2 ? 2 : 2000000, std::get<int64_t>(keys[0].component[0].value));
     EXPECT_EQ(mode == 3 ? 2000000 : 2, std::get<int64_t>(keys[0].component[1].value));
+  }
+}
+
+TEST_F(RequestFlagsTest, int64StringsLeaveBinaryResponseValuesNative) {
+  CollectionHelper helper;
+  indexDates(helper);
+  for (bool binary : {false, true}) {
+    auto req = runFlags(helper, R"json({"flags":["int64_str"],"query":"*:*",
+      "fields":["stamp"],"ops":{"child":{"flags":["date_ms"],"expr_op":"min(stamp)"}}})json", binary);
+    ASSERT_OK(req);
+    EXPECT_EQ(RequestFlags::INT64_STR, req->flags);
+    EXPECT_EQ(2000000, std::get<api::ColInt>(req->docList()->columns.at("stamp").kind).v[0]);
+    EXPECT_EQ(2, req->docList()->ops.at("child")->asInt());
+    std::vector<std::byte> bytes;
+    ASSERT_TRUE(api::encode(req->responses[0]->proto, bytes));
+    api::SearchResponse response;
+    ASSERT_TRUE(api::decode(response, api::copyToPaddedInput(bytes, req->mr), req->mr));
+    EXPECT_EQ(2000000, std::get<api::ColInt>(response.ops.at("q")->docList()->columns.at("stamp").kind).v[0]);
   }
 }

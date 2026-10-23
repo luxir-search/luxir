@@ -95,6 +95,13 @@ values toward earlier time. `date_ns` rejects an ms date outside the ns range
 with a request error naming its field. Integral date output can be sent back
 as a numeric literal under the same mode.
 
+Nanosecond timestamps commonly exceed JavaScript's safe integer range. Set
+request-level `"flags": ["date_ns", "int64_str"]` (or use `date_native`) to
+quote JSON int64/uint64 values outside +/- (2^53 - 1); smaller integers stay
+numbers. Clients must accept either a number or a string for a 64-bit value.
+This affects every integer in the search response, and leaves binary gRPC
+values unchanged. See [request flags](http-api.md#packed-request-flags).
+
 Date averages and percentiles remain doubles: numeric modes scale the double
 without rounding, while ISO output floors to the source field's tick before
 formatting. In numeric modes these are statistics, not instants, and are not

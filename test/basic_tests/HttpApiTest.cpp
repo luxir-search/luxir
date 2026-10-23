@@ -4519,4 +4519,39 @@ TEST_F(HttpApiTest, collapseOverlayRowsColumnsAndDocs) {
   EXPECT_TRUE(singleton["_group_"]["singleton"].get<bool>());
 }
 
+TEST_F(HttpApiTest, int64StringsApplyToEnvelopeAndDocumentStreams) {
+  SchemaBuilder schema;
+  auto& field = schema.field("stamp");
+  field.type = api::FieldDef::FieldClass::DATE;
+  field.unit = api::FieldDef::DateUnit::NS;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "stamp", int64_t{1700000000123456789},
+      "when_dt", int64_t{1700000000123}, "large_i", int64_t{9007199254740992},
+      "values_is", std::vector<int64_t>{INT64_MIN, -9007199254740992, -9007199254740991,
+          9007199254740991, 9007199254740992, INT64_MAX}), UpdateMessage::COMMIT).success);
+  for (auto format : {"rows", "columns", "adaptive"}) for (auto framing : {"", "?format=docs"}) {
+    if (*framing != '\0' && std::string_view(format) != "rows") continue;
+    auto json = fmt::format(R"json({{"flags":["int64_str"],"query":"*:*","count_limit":-1,
+      "document_format":"{}","fields":["stamp","when_dt","large_i","values_is"]}})json", format);
+    auto response = httpRequest(port(), http::verb::post,
+        "/collections/main/_search" + std::string(framing), json);
+    ASSERT_EQ(200, response.result_int()) << response.body();
+    for (auto text : {R"("stamp":"1700000000123456789")", R"("when_dt":1700000000123)",
+                      R"("large_i":"9007199254740992")", R"("found":1)",
+                      R"("values_is":["-9223372036854775808","-9007199254740992",-9007199254740991,9007199254740991,"9007199254740992","9223372036854775807"])"}) {
+      EXPECT_NE(std::string::npos, response.body().find(text)) << response.body();
+    }
+  }
+  auto ordinary = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":"*:*","fields":["stamp","when_dt"]})");
+  auto explicitDefault = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"flags":[],"query":"*:*","fields":["stamp","when_dt"]})");
+  EXPECT_EQ(ordinary.body(), explicitDefault.body());
+  EXPECT_NE(std::string::npos, ordinary.body().find(R"("stamp":1700000000123456789)"));
+  auto rejected = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"ops":{"q":{"flags":["int64_str"],"top_docs":{}}}})");
+  EXPECT_EQ(400, rejected.result_int());
+  EXPECT_NE(std::string::npos, rejected.body().find("request-level only"));
+}
+
 } // namespace luxir::test

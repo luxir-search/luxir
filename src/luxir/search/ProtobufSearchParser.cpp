@@ -102,7 +102,7 @@ struct OpParseContext {
 
   OpParseContext child(const api::SearchOp& op, std::string_view name) const {
     try {
-      return {RequestFlags::resolve(flags, op.flags, op.flags_set)};
+      return {RequestFlags::resolve(flags, op.flags, op.flags_set, RequestFlags::Level::OP)};
     } catch (const RequestError& error) {
       throw RequestError("op '" + std::string(name) + "': " + error.what());
     }

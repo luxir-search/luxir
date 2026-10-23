@@ -12,11 +12,11 @@ option objc_class_prefix = "Luxir";
 package luxir;
 
 // Bit positions in the packed request option word, not masks. The two date
-// bits form one field: native=0, iso=1, ms=2, ns=3. Bit 2 is reserved.
+// bits form one field: native=0, iso=1, ms=2, ns=3.
 enum RequestFlagBit {
   DATE_MODE_LOW_BIT = 0;
   DATE_MODE_HIGH_BIT = 1;
-  reserved 2;
+  INT64_STR_BIT = 2; // request-only: quote JSON integers outside the safe range
 }
 
 // Top-level search request that can contain multiple search operations.
@@ -70,8 +70,10 @@ message SearchRequest {
   // Date modes control numeric date literal units: ms or ns overrides the
   // field unit; native and iso use the field unit. Value arithmetic is unchanged.
   uint64 flags = 11;
-  // Override mask. Set both date-mode bits (3), or neither. Unknown bits and
-  // reserved bit 2 are rejected in either word.
+  // Override mask. Set both date-mode bits (3), or neither. Request-only
+  // int64_str (bit 2) quotes JSON int64/uint64 values outside the safe integer
+  // range, +/- (2^53 - 1). Unknown bits are rejected in either word.
+  // Binary gRPC responses retain their integer types.
   uint64 flags_set = 12;
 }
 
@@ -95,7 +97,9 @@ message SearchOp {
   // queries and facet literals. Subops inherit this op's effective options.
   // JSON uses the same lowercase flags name array as SearchRequest.
   uint64 flags = 21;
-  // Override mask, with the same validation as SearchRequest.flags_set.
+  // Override mask. int64_str is request-only: bit 2 is rejected in both
+  // flags and flags_set, including an attempted clear. Other validation is
+  // the same as SearchRequest.flags_set.
   // Naming date_native in JSON explicitly replaces an inherited date mode.
   uint64 flags_set = 22;
 }

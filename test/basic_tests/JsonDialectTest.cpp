@@ -952,7 +952,7 @@ TEST(JsonDialect, PackedRequestFlagsNamesAndCanonicalOverrides) {
 
 TEST(JsonDialect, PackedRequestFlagsRejectAmbiguousAndUnsupportedNames) {
   for (auto flags : {R"(["date_ms","date_ms"])", R"(["date_iso","date_ns"])",
-                     R"(["int64_str"])", R"(["DATE_MS"])", R"(["unknown"])",
+                     R"(["int64_str","int64_str"])", R"(["DATE_MS"])", R"(["unknown"])",
                      R"("date_ms")", "null", "[1]"}) {
     std::pmr::monotonic_buffer_resource mr;
     P::SearchRequest request;
@@ -967,4 +967,25 @@ TEST(JsonDialect, PackedRequestFlagsRejectAmbiguousAndUnsupportedNames) {
   EXPECT_FALSE(P::read_json(request, R"({"flags":[],"flags":["date_ms"]})", mr));
   EXPECT_FALSE(P::read_json(op, R"({"flags":[],"top_docs":{},"flags":["date_ns"]})", mr));
   EXPECT_FALSE(P::read_json(request, R"({"flags":2,"flags_set":3})", mr));
+}
+
+TEST(JsonDialect, Int64StringsAreRequestOnlyAndKeepOtherFlagGroups) {
+  for (auto names : {R"(["int64_str","date_ns"])", R"(["date_ns","int64_str"])"}) {
+    std::pmr::monotonic_buffer_resource mr;
+    P::SearchRequest request;
+    ASSERT_TRUE(P::read_json(request, std::string(R"({"flags":)") + names + "}", mr));
+    EXPECT_EQ(7u, request.flags);
+    EXPECT_EQ(7u, request.flags_set);
+    std::string echo;
+    ASSERT_TRUE(P::write_json(request, echo));
+    EXPECT_EQ(R"({"flags":["date_ns","int64_str"]})", echo);
+  }
+  std::pmr::monotonic_buffer_resource mr;
+  P::SearchOp op;
+  std::string error;
+  EXPECT_FALSE(P::read_json(op, R"json({"flags":["int64_str"],"expr_op":"min(when_dt)"})json", mr, &error));
+  EXPECT_NE(std::string::npos, error.find("request-level only"));
+  op.flags_set = 4; // attempting to clear is also an op-level override
+  std::string echo;
+  EXPECT_FALSE(P::write_json(op, echo));
 }

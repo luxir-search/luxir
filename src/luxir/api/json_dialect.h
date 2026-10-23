@@ -499,7 +499,7 @@ void readRequestFlags(auto& value, auto& ctx, auto& it, auto& end) {
   util::parse_repeated<Opts>(false, target, ctx, it, end);
   if (bool(ctx.error)) return;
   try {
-    auto flags = luxir::RequestFlags::fromNames(names);
+    auto flags = luxir::RequestFlags::fromNames(names, luxir::RequestFlags::levelOf(value));
     value.flags = flags.flags;
     value.flags_set = flags.flagsSet;
   } catch (const std::exception& error) {
@@ -516,7 +516,7 @@ struct FlaggedRequestJsonWriter {
   static constexpr bool can_error = true;
   template <auto Opts, class B>
   static void op(const T& value, is_context auto& ctx, B& b, auto& ix) {
-    if (!luxir::RequestFlags::validationError(value.flags, value.flags_set).empty()) {
+    if (!luxir::RequestFlags::validationError(value.flags, value.flags_set, luxir::RequestFlags::levelOf(value)).empty()) {
       ctx.error = error_code::syntax_error;
       return;
     }

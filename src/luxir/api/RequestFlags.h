@@ -18,6 +18,7 @@
 namespace luxir {
 
 struct RequestFlags {
+  enum class Level { REQUEST, OP };
   enum class DateMode : uint8_t { NATIVE = 0, ISO = 1, MILLIS = 2, NANOS = 3 };
   struct Override {
     uint64_t flags = 0;
@@ -27,12 +28,18 @@ struct RequestFlags {
   static constexpr uint64_t DATE_MASK =
       (uint64_t{1} << (int)api::RequestFlagBit::DATE_MODE_LOW_BIT)
       | (uint64_t{1} << (int)api::RequestFlagBit::DATE_MODE_HIGH_BIT);
-  static constexpr uint64_t INT64_STR = uint64_t{1} << 2; // reserved, not accepted yet
+  static constexpr uint64_t INT64_STR = uint64_t{1} << (int)api::RequestFlagBit::INT64_STR_BIT;
   static constexpr std::array<std::string_view, 4> DATE_NAMES{
       "date_native", "date_iso", "date_ms", "date_ns"};
 
-  static std::string_view validationError(uint64_t flags, uint64_t flagsSet) {
-    if ((flags | flagsSet) & INT64_STR) return "int64_str is not supported";
+  static constexpr Level levelOf(const api::SearchRequest&) { return Level::REQUEST; }
+  static constexpr Level levelOf(const api::SearchOp&) { return Level::OP; }
+
+  static std::string_view validationError(uint64_t flags, uint64_t flagsSet,
+                                          Level level = Level::REQUEST) {
+    if (level == Level::OP && ((flags | flagsSet) & INT64_STR)) {
+      return "int64_str is request-level only";
+    }
     if ((flags | flagsSet) & ~(DATE_MASK | INT64_STR)) return "unknown request flag bits";
     uint64_t dateSet = flagsSet & DATE_MASK;
     if (dateSet != 0 && dateSet != DATE_MASK) {
@@ -41,17 +48,25 @@ struct RequestFlags {
     return {};
   }
 
-  static uint64_t resolve(uint64_t inherited, uint64_t flags, uint64_t flagsSet) {
-    if (auto error = validationError(flags, flagsSet); !error.empty()) {
+  static uint64_t resolve(uint64_t inherited, uint64_t flags, uint64_t flagsSet,
+                          Level level = Level::REQUEST) {
+    if (auto error = validationError(flags, flagsSet, level); !error.empty()) {
       throw RequestError(std::string(error));
     }
     return (inherited & ~flagsSet) | (flags & flagsSet);
   }
 
-  static Override fromNames(std::span<const std::string_view> names) {
+  static Override fromNames(std::span<const std::string_view> names,
+                             Level level = Level::REQUEST) {
     Override out;
     for (auto name : names) {
-      if (name == "int64_str") throw RequestError("int64_str is not supported");
+      if (name == "int64_str") {
+        if (level == Level::OP) throw RequestError("int64_str is request-level only");
+        if (out.flagsSet & INT64_STR) throw RequestError("duplicate int64_str flag");
+        out.flags |= INT64_STR;
+        out.flagsSet |= INT64_STR;
+        continue;
+      }
       size_t mode = 0;
       for (; mode < DATE_NAMES.size(); mode++) if (DATE_NAMES[mode] == name) break;
       if (mode == DATE_NAMES.size()) {
@@ -60,8 +75,8 @@ struct RequestFlags {
       if (out.flagsSet & DATE_MASK) {
         throw RequestError("duplicate or conflicting date flags");
       }
-      out.flags = mode;
-      out.flagsSet = DATE_MASK;
+      out.flags = (out.flags & ~DATE_MASK) | mode;
+      out.flagsSet |= DATE_MASK;
     }
     return out;
   }
@@ -69,6 +84,7 @@ struct RequestFlags {
   static std::vector<std::string_view> names(uint64_t flags, uint64_t flagsSet) {
     std::vector<std::string_view> out;
     if (flagsSet & DATE_MASK) out.push_back(dateName(flags));
+    if (flags & flagsSet & INT64_STR) out.push_back("int64_str");
     return out;
   }
 

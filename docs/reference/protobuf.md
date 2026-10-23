@@ -2075,7 +2075,7 @@ A named search operation. The name is its key in the enclosing ops map.
 | <a id="field-luxir.searchop.expr_op"></a>[`expr_op`](#field-luxir.searchop.expr_op) | 15 | [`ExprOp`](#message-luxir.exprop) | oneof [`kind`](#oneof-luxir.searchop.kind) |  |
 | <a id="field-luxir.searchop.domain"></a>[`domain`](#field-luxir.searchop.domain) | 20 | [`Domain`](#message-luxir.domain) | singular | optional override of the incoming document domain |
 | <a id="field-luxir.searchop.flags"></a>[`flags`](#field-luxir.searchop.flags) | 21 | `uint64` | singular | Overrides the parent's packed options, including for this op's domain, queries and facet literals. Subops inherit this op's effective options. JSON uses the same lowercase flags name array as SearchRequest. |
-| <a id="field-luxir.searchop.flags_set"></a>[`flags_set`](#field-luxir.searchop.flags_set) | 22 | `uint64` | singular | Override mask, with the same validation as SearchRequest.flags\_set. Naming date\_native in JSON explicitly replaces an inherited date mode. |
+| <a id="field-luxir.searchop.flags_set"></a>[`flags_set`](#field-luxir.searchop.flags_set) | 22 | `uint64` | singular | Override mask. int64\_str is request-only: bit 2 is rejected in both flags and flags\_set, including an attempted clear. Other validation is the same as SearchRequest.flags\_set. Naming date\_native in JSON explicitly replaces an inherited date mode. |
 
 <a id="message-luxir.searchrequest"></a>
 
@@ -2098,7 +2098,7 @@ Top-level search request that can contain multiple search operations.
 | <a id="field-luxir.searchrequest.min_commit"></a>[`min_commit`](#field-luxir.searchrequest.min_commit) | 9 | `string` | singular | Require a local snapshot at least this new (incarnation:index\_gen). Writers reject a different incarnation immediately; followers wait for a switch. |
 | <a id="field-luxir.searchrequest.min_commit_timeout_ms"></a>[`min_commit_timeout_ms`](#field-luxir.searchrequest.min_commit_timeout_ms) | 10 | `uint64` | optional | Search floor deadline. Absent defaults to 30000; zero checks immediately. |
 | <a id="field-luxir.searchrequest.flags"></a>[`flags`](#field-luxir.searchrequest.flags) | 11 | `uint64` | singular | Packed request options. Effective = (inherited &amp; ~flags\_set) \| (flags &amp; flags\_set); the request inherits 0. JSON uses lowercase names, e.g. "flags": \["date\_ms"\], rather than numeric flags/flags\_set. Date modes control numeric date literal units: ms or ns overrides the field unit; native and iso use the field unit. Value arithmetic is unchanged. |
-| <a id="field-luxir.searchrequest.flags_set"></a>[`flags_set`](#field-luxir.searchrequest.flags_set) | 12 | `uint64` | singular | Override mask. Set both date-mode bits (3), or neither. Unknown bits and reserved bit 2 are rejected in either word. |
+| <a id="field-luxir.searchrequest.flags_set"></a>[`flags_set`](#field-luxir.searchrequest.flags_set) | 12 | `uint64` | singular | Override mask. Set both date-mode bits (3), or neither. Request-only int64\_str (bit 2) quotes JSON int64/uint64 values outside the safe integer range, +/- (2^53 - 1). Unknown bits are rejected in either word. Binary gRPC responses retain their integer types. |
 
 <a id="message-luxir.searchresponse"></a>
 
@@ -2826,7 +2826,7 @@ Whether the extent is explicit or derived from this facet instance's values.
 
 ### luxir.RequestFlagBit
 
-Bit positions in the packed request option word, not masks. The two date bits form one field: native=0, iso=1, ms=2, ns=3. Bit 2 is reserved.
+Bit positions in the packed request option word, not masks. The two date bits form one field: native=0, iso=1, ms=2, ns=3.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -2834,6 +2834,7 @@ Bit positions in the packed request option word, not masks. The two date bits fo
 |---|---|---|
 | <a id="value-luxir.requestflagbit.date_mode_low_bit"></a>[`DATE_MODE_LOW_BIT`](#value-luxir.requestflagbit.date_mode_low_bit) | 0 |  |
 | <a id="value-luxir.requestflagbit.date_mode_high_bit"></a>[`DATE_MODE_HIGH_BIT`](#value-luxir.requestflagbit.date_mode_high_bit) | 1 |  |
+| <a id="value-luxir.requestflagbit.int64_str_bit"></a>[`INT64_STR_BIT`](#value-luxir.requestflagbit.int64_str_bit) | 2 | request-only: quote JSON integers outside the safe range |
 
 <a id="enum-luxir.responseformat"></a>
 

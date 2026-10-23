@@ -121,6 +121,17 @@ errors. Canonical echo and both explain modes emit names, including an explicit
 in the named unit. This applies to documents, facets, groups, sort values and
 DATE metrics; the same output types are used over gRPC.
 
+`int64_str` is request-level only. For example, `"flags": ["date_ns",
+"int64_str"]` renders JSON int64 and uint64 values as decimal strings only
+when they fall outside JavaScript's safe integer range, -9007199254740991
+through 9007199254740991 (`Number.isSafeInteger`). All other integers stay
+JSON numbers. The rule covers every integer in search responses, including
+fields, arrays, metrics, facets, group keys/ranks, counts, headers and profile
+metadata, in both envelope and docs formats. It does not apply to doubles.
+Clients using this flag must accept either a number or a string for a 64-bit
+value. Setting or clearing the flag on any operation is an error. Binary gRPC
+responses retain their integer types.
+
 ### Explain modes
 
 `?explain=request` is parse-and-serialize only. It returns the bare canonical
