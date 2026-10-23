@@ -59,12 +59,17 @@ Libraries
   has no SVE to dispatch to, so macOS uses the NEON-only generic level and
   omits the Metal GPU backend.
 - OpenBLAS includes C LAPACK with 32-bit LAPACK integers. No Fortran compiler
-  or runtime is needed. BLAS is single-threaded with locking for concurrent
-  callers; CPU-specific kernels are selected at runtime. ASan disables the
-  AVX-512 OpenBLAS kernels whose inline assembly GCC cannot instrument.
+  or runtime is needed. The threads feature enables pthread workers with a
+  256-worker build ceiling; Luxir defaults to one worker per available CPU
+  unless explicitly configured. Idle workers spin for 2^12 cycles before
+  sleeping (THREAD_TIMEOUT=12, upstream 28) so they do not starve FAISS's
+  OpenMP team. CPU-specific kernels are selected at runtime on x86-64 and
+  ARM64. ASan disables the AVX-512 OpenBLAS kernels whose inline assembly GCC cannot instrument.
   The overlay preserves caller CPU flags for common code and C LAPACK; upstream
   otherwise strips -march=native as a workaround for older GCC versions.
 - The lapack overlay directs FAISS to the LAPACK routines inside OpenBLAS.
+  Luxir also supports selecting an external LP64 AOCL or ArmPL provider at
+  configure time. See ../docs/dev/blas.md for backend and thread controls.
   On macOS, vcpkg's blas port selects Apple's Accelerate, so the overlay uses
   Accelerate for LAPACK too and OpenBLAS is not built.
 

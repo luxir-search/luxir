@@ -1,6 +1,7 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include "luxir/util/NumericalLibraries.h"
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -235,6 +236,12 @@ int gArgc;
 char** gArgv;
 
 int main(int argc, char **argv) {
+  try {
+    luxir::initializeNumericalLibraries();
+  } catch (const std::exception& e) {
+    std::cerr << "Invalid numerical library configuration: " << e.what() << '\n';
+    return 1;
+  }
   gArgc = argc;
   gArgv = argv;
 

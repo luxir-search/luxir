@@ -100,8 +100,9 @@ sources. Change only the engine target for a separate experiment:
 ```
 
 Dependencies stay at v2. FAISS and OpenBLAS contain runtime-selected kernels.
-The OpenBLAS overlay includes C LAPACK with 32-bit LAPACK integers and keeps
-BLAS single-threaded, with locking for concurrent callers. Its ASan build
+The OpenBLAS overlay includes C LAPACK with 32-bit LAPACK integers and pthread
+workers, with locking for concurrent callers. Luxir defaults to one BLAS worker
+per available CPU; see [BLAS backends and thread budgets](blas.md) to narrow it. Its ASan build
 excludes AVX-512 OpenBLAS kernels because GCC cannot instrument their inline
 assembly; FAISS retains its own AVX-512 kernels.
 

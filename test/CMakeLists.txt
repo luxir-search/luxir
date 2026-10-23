@@ -27,12 +27,21 @@ add_executable(luxir_test ${Test_SOURCES})
 set_source_files_properties(test/LuxirTest.cpp PROPERTIES
   COMPILE_DEFINITIONS "LUXIR_TEST_BENCHMARKS=$<BOOL:${LUXIR_TEST_BENCHMARKS}>")
 target_include_directories(luxir_test PRIVATE .)
-target_link_libraries(luxir_test PRIVATE luxir_lib benchmark::benchmark GTest::gtest)
+target_link_libraries(luxir_test PRIVATE luxir_lib benchmark::benchmark GTest::gtest OpenMP::OpenMP_CXX)
 # HttpApiTest's helper (test/HttpReq.h) parses NDJSON with glaze (via luxir_lib) and
 # drives the HTTP server with a header-only Boost.Beast client.
 # uni-algo (vendored): AnalysisTest exercises Unicode case folding / NFKC / UAX#29
 # segmentation directly to gate conformance before the real filters are built.
 target_link_libraries(luxir_test PRIVATE uni_algo)
+
+# A small standalone numerical check also works with optional vendor providers,
+# without building a vector corpus. The default checks the threaded dependency
+# feature as well as the BLAS/LAPACK routines used by FAISS.
+add_executable(blas_lapack_test ../.devcontainer/check-lapack.cpp)
+target_link_libraries(blas_lapack_test PRIVATE luxir_blas)
+if(NOT LUXIR_BLAS_VENDOR STREQUAL "OpenBLAS")
+  target_compile_definitions(blas_lapack_test PRIVATE LUXIR_CHECK_OPENBLAS=0)
+endif()
 
 # gtest/benchmark are the dominant parse cost across the ~40 test TUs; add them
 # to the shared heavy-header set (LUXIR_PCH_COMMON comes from the root CMake).
