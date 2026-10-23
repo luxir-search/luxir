@@ -80,6 +80,18 @@ public:
 
   std::string_view facetName;
   IndexReader::FieldSegments segInfos;
+  ValueNature outputNature = ValueNature::NUMBER;
+
+  template <typename Label>
+  void emitFieldBuckets(api::FacetResult& result,
+                        const std::vector<std::pair<Label, int64_t>>& buckets,
+                        std::pmr::memory_resource& mr) const {
+    if constexpr (std::is_same_v<Label, int64_t>) {
+      withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, [&](auto output) {
+        emitBuckets(result, buckets, mr, output);
+      });
+    } else emitBuckets(result, buckets, mr);
+  }
 
   const SegFieldInfo* fieldInfo(int32_t segnum) const {
     return segInfos.at((size_t)segnum);
@@ -89,6 +101,12 @@ public:
     int64_t limit, int64_t minCount, bool missing)
     : SearchOp(req, facetName), reader(*req.reader), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
       facetName(facetName), segInfos(fieldName.empty() ? IndexReader::FieldSegments{} : reader.field(fieldName)) {
+    if (!fieldName.empty()) {
+      auto& type = *req.schema->getFieldTypeEx(fieldName);
+      if (type.type() == FieldType::DATE) {
+        outputNature = dateValueNature(DateFieldType::unitOf(type));
+      }
+    }
   }
 
   virtual ~FacetReq() = default;
@@ -544,7 +562,7 @@ public:
       emitted.reserve(finalized.size());
       for (const auto& bucket : finalized) emitted.emplace_back(label(bucket), bucket.count);
       auto& out = *slotArm<luxir::api::FacetResult>(nullptr);
-      emitBuckets(out, emitted, op.req.lastResponse->mr);
+      fieldOp().emitFieldBuckets(out, emitted, op.req.lastResponse->mr);
       if (fieldOp().missing) out.missing = missing;
       using ChildKey = std::conditional_t<std::is_same_v<Label, std::string>, std::string_view, Label>;
       auto buckets = selectedBuckets<ChildKey>(finalized,
@@ -666,7 +684,7 @@ public:
       for (const auto& bucket : finalized) {
         emitted.emplace_back(resolveLabel(bucket), bucket.count);
       }
-      emitBuckets(facetResultProto, emitted, mr);
+      fieldOp().emitFieldBuckets(facetResultProto, emitted, mr);
       if (missing) {
         facetResultProto.missing = missing_count;
       }
@@ -2087,6 +2105,13 @@ public:
       }
     };
     switch (valueType) {
+      case FieldType::Type::DATE:
+        withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, [&](auto output) {
+          using Outer = std::conditional_t<std::is_same_v<decltype(output(int64_t{})), std::string_view>,
+                                            luxir::api::ArrArrStr, luxir::api::ArrArrInt>;
+          emitBounds.template operator()<Outer>(output);
+        });
+        break;
       case FieldType::Type::FLOAT:
         emitBounds.template operator()<luxir::api::ArrArrFloat>(
             [](int64_t encoded) {

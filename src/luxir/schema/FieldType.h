@@ -309,6 +309,8 @@ public:
 
   static uint32_t typeFlagsForUnit(DateUnit unit);
   static DateUnit unitFromTypeFlags(uint32_t typeFlags);
+  // The unit of a field type whose type() is DATE.
+  static DateUnit unitOf(const FieldType& type) { return ((const DateFieldType&)type).unit; }
   uint32_t segmentTypeFlags() const override { return typeFlagsForUnit(unit); }
 
   int64_t coerceColInt64(

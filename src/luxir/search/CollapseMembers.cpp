@@ -11,6 +11,33 @@ CollapseMembers::CollapseMembers(const CollapsePlan& plan,
     std::span<const CollapseKey> keys, RequestMemTracker& tracker)
     : plan(plan), keys(keys), tracker(tracker), resource(tracker, "page groups", "collapse member state") {}
 
+void renderSortRanks(std::span<const api::ArrVal> ranks, const SortPlan& sort,
+                     uint64_t flags, std::pmr::memory_resource& mr) {
+  if (RequestFlags::dateMode(flags) == RequestFlags::DateMode::NATIVE) return;
+  for (size_t i = 0; i < sort.clauses.size(); i++) {
+    const auto& clause = sort.clauses[i];
+    ValueNature nature = ValueNature::NUMBER;
+    if (clause.getKind() == SortClause::EXPR) nature = clause.getValueProgram().root().nature;
+    else if (clause.getKind() == SortClause::COLUMN) {
+      auto& type = const_cast<FieldType&>(clause.getSortField().getFieldType());
+      if (type.type() == FieldType::DATE) {
+        nature = dateValueNature(DateFieldType::unitOf(type));
+      }
+    }
+    withDateOutput(nature, flags, mr, [&] {
+      return clause.getKind() == SortClause::EXPR
+          ? clause.getValueProgram().describeDateSources(clause.getValueProgram().rootNode)
+          : clause.getSortField().getFieldName();
+    }, [&](auto output) {
+      if constexpr (!std::is_same_v<decltype(output), NativeDateOutput>) {
+        for (const auto& rank : ranks) {
+          if (!rank.v.empty()) renderDateValue(const_cast<api::Val&>(rank.v[i]), output);
+        }
+      }
+    });
+  }
+}
+
 void emitCollapseRank(luxir::api::ArrVal& out, const SortPlan& sort,
     IndexReader& reader, segdoc doc, float score, std::pmr::memory_resource& mr) {
   using namespace luxir::api;

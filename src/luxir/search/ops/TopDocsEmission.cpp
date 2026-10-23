@@ -237,8 +237,13 @@ void emitPage(const CollapsedPageSettings& settings,
             *qr.req.reader, rank.doc, rank.score, mr);
       }
     }
+    settings.collapse.renderKeys(table.keys, qr.flags, mr);
+    if (ranks) {
+      if constexpr (metricOrder) collector.renderRanks(table.ranks, qr.flags, mr);
+      else renderSortRanks(table.ranks, settings.sort, qr.flags, mr);
+    }
   };
-  emitDocsResponse(qr.req, getDocList,
+  emitDocsResponse(qr.req, qr.flags, getDocList,
     (int64_t)scoreDocs.size(),
     [scoreDocs, page, offset](int64_t i) {
       return page ? page->heads[(size_t)(i - offset)] : scoreDocs[(size_t)i].doc;
@@ -305,7 +310,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
     } else if (mergeableCollector->useFieldSort) {
       auto& collector = *mergeableCollector->fieldCollector;
       auto sortDocs = collector.sort();
-      emitDocsResponse(qr.req, getDocList,
+      emitDocsResponse(qr.req, qr.flags, getDocList,
         (int64_t)sortDocs.size(),
         [sortDocs](int64_t i) { return sortDocs[i].doc; },
         [sortDocs](int64_t i) { return sortDocs[i].score; },
@@ -324,7 +329,7 @@ void TopDocsReq::fillQueryTopNResponse(TopDocsReq::CalcBase& calc) {
       int64_t found = collector.totalHits();
       bool foundGte = qr.boundedCount && collector.countIncomplete;
       if (foundGte) found = qr.requirements.countLimit;
-      emitDocsResponse(qr.req, getDocList,
+      emitDocsResponse(qr.req, qr.flags, getDocList,
         (int64_t)scoreDocs.size(),
         [scoreDocs](int64_t i) { return scoreDocs[i].doc; },
         [scoreDocs](int64_t i) { return scoreDocs[i].score; },

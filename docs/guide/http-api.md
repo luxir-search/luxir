@@ -109,14 +109,17 @@ The request and each operation wrapper accept a lowercase `flags` name array:
 
 Operations inherit their parent's options. Naming a date mode replaces the
 inherited date mode, including `date_native` to restore field-native literal
-units. An empty array overrides nothing. The root shorthand accepts request
-flags beside `query`, `filter`, and other request controls. A bare expression
+units and numeric output. An empty array overrides nothing. The root shorthand
+accepts request flags beside `query`, `filter`, and other request controls. A bare expression
 op inherits flags; use an `expr_op` wrapper to override them.
 
 Duplicate or conflicting names, unknown names, and reserved flags are request
 errors. Canonical echo and both explain modes emit names, including an explicit
 `date_native` override, rather than numeric masks. See
-[date literal units](dates.md#request-flags-and-literal-units).
+[date literal units and output](dates.md#request-flags-and-literal-units).
+`date_iso` emits UTC strings, while `date_ms` and `date_ns` emit numeric dates
+in the named unit. This applies to documents, facets, groups, sort values and
+DATE metrics; the same output types are used over gRPC.
 
 ### Explain modes
 

@@ -587,7 +587,9 @@ public:
       }
       collapse->fields.push_back({field.physicalName, wireType,
           ordinal ? req.reader->getOrdMap(field.physicalName) : nullptr,
-          req.reader->field(field.physicalName)});
+          req.reader->field(field.physicalName), type.type() == FieldType::DATE
+              ? dateValueNature(DateFieldType::unitOf(type))
+              : ValueNature::NUMBER});
     }
     return collapse;
   }
@@ -954,7 +956,7 @@ public:
           + "': range start must be less than end");
     }
     bool date = fieldType->type() == FieldType::DATE;
-    auto dateUnit = date ? ((DateFieldType&)*fieldType).unit : DateUnit::MILLIS;
+    auto dateUnit = date ? DateFieldType::unitOf(*fieldType) : DateUnit::MILLIS;
     auto grid = [&]() {
       if (calendar) {
         const auto& spec = std::get<api::CalendarGap>(facetReq.gap_kind);

@@ -321,7 +321,7 @@ private:
           ? (floating ? ValueType::DOUBLE_ARRAY : ValueType::INT64_ARRAY)
           : (floating ? ValueType::DOUBLE : ValueType::INT64);
       node.nature = field->type() == FieldType::DATE
-          ? dateValueNature(DateFieldType::unitFromTypeFlags(field->segmentTypeFlags()))
+          ? dateValueNature(DateFieldType::unitOf(*field))
           : ValueNature::NUMBER;
     }
     node.sourcePos = pos;

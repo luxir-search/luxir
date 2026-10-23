@@ -67,12 +67,12 @@ that value when used as a query literal.
 The request and each operation wrapper accept a `flags` array with one date
 mode. Subops inherit it unless they name a replacement:
 
-| Name | Numeric date literal unit |
-|---|---|
-| `date_native` (default) | Each field's own unit. |
-| `date_iso` | Each field's own unit. |
-| `date_ms` | Milliseconds for every date field. |
-| `date_ns` | Nanoseconds for every date field. |
+| Name | Numeric date literal unit | Date output |
+|---|---|---|
+| `date_native` (default) | Each field's own unit. | Numeric, in each field's unit. |
+| `date_iso` | Each field's own unit. | ISO-8601 strings in UTC. |
+| `date_ms` | Milliseconds for every date field. | Numeric milliseconds. |
+| `date_ns` | Nanoseconds for every date field. | Numeric nanoseconds. |
 
 These units apply to that operation's query literals in every query dialect,
 its domain queries/filters, and facet start/end/gap/origin/selected values.
@@ -82,11 +82,29 @@ one instant, floored to storage precision. ISO-8601 text is always accepted
 and keeps its textual precision. Ingest is unaffected.
 
 Numeric constants in value expressions and aggregate expressions always use
-the date operand's native unit. Date response formatting for these modes is
-not enabled yet; output remains numeric in the field's native unit.
+the date operand's native unit. The output mode applies to retrieved fields
+in every document format, sort values, facet bucket IDs and bounds, group
+keys and ranks, and DATE expression and aggregate results. Each operation
+uses its own effective mode. Sorting, grouping and bucket identities always
+use native values.
 
-Naming `date_native` restores field-native literals under an overridden
-parent. `[]` inherits unchanged. Duplicate or conflicting names are errors.
+ISO output uses three fraction digits for ms fields, and the fewest of three,
+six or nine digits that is exact for ns fields, including `.000` on a whole
+second. Both JSON and gRPC receive string values. `date_ms` floors integer ns
+values toward earlier time. `date_ns` rejects an ms date outside the ns range
+with a request error naming its field. Integral date output can be sent back
+as a numeric literal under the same mode.
+
+Date averages and percentiles remain doubles: numeric modes scale the double
+without rounding, while ISO output floors to the source field's tick before
+formatting. In numeric modes these are statistics, not instants, and are not
+promised to be valid date literals. Non-finite or out-of-range DATE results
+under `date_iso` are request errors. Lossy `date_ms` output can give sub-ms range buckets duplicate bounds;
+those displayed IDs cannot identify a bucket for selection. See
+[date histograms](faceting.md#date-histograms).
+
+Naming `date_native` restores field-native literals and numeric output under
+an overridden parent. `[]` inherits unchanged. Duplicate or conflicting names are errors.
 See [JSON request flags](http-api.md#packed-request-flags) or
 [protobuf flag words](grpc.md#packed-request-flags).
 

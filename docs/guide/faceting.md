@@ -430,6 +430,9 @@ The typing rules:
 - `avg`, `min`, `max`, and `percentile` of a date keep their DATE nature and
   unit (`ms` or `ns`). Date averages and percentiles are doubles in that unit
   and can contain fractional ticks or lose precision for large ns values.
+  Date output follows the metric operation's effective date mode; ISO output
+  floors these doubles to the field's tick. An invalid ISO date is a request
+  error. See [date modes](dates.md#request-flags-and-literal-units).
   `cardinality` and `percentile_rank` return plain numbers. `sum` requires numeric values.
   Multiplication, division, unary minus, and unary math turn a date into a
   plain number.
@@ -767,12 +770,21 @@ or years:
 
 The facet `time_zone` controls offset-less bounds and fixed or calendar
 stepping. Empty inherits the request time zone; `UTC` explicitly overrides it.
-IANA zone names and fixed offsets are accepted. Bucket IDs remain raw
-epoch fence pairs in the field's unit, because they identify instants
-unambiguously.
+IANA zone names and fixed offsets are accepted. Bucket IDs are fence pairs,
+rendered in the facet operation's effective date mode: native numeric units,
+normalized ms/ns, or UTC ISO strings. Field-facet values use the same modes.
+The facet time zone never changes the output zone.
 
-Fixed gaps use the field's unit, including one-ns gaps on an ns field.
-Numeric `start`, `end`, `origin`, and `selected` use the same unit. DATA works
+Bucket identities and counts remain native. Under `date_ms`, ns buckets
+narrower than one ms can have duplicate displayed bounds; their displayed IDs
+then no longer identify a bucket for selection. For buckets whose fences are
+exact ms ticks (for example, a UTC histogram with a one-ms gap), the returned
+lower bound selects the same bucket in a `date_ms` request. `selected` takes
+the lower bound, rather than the whole fence pair.
+
+Fixed gaps use the field's unit by default, including one-ns gaps on an ns
+field. Numeric `start`, `end`, `gap`, `origin`, and `selected` use the date mode's
+literal unit (`date_ms` or `date_ns` overrides the field unit). DATA works
 for both units and shares its fence identities with EXPLICIT. An ns exclusive
 end can be `INT64_MAX`, which is reserved and never stored.
 

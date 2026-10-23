@@ -990,9 +990,13 @@ beside `ops` in the full form:
 - `flags` is an array of lowercase packed option names, for example
   `["date_ms"]`. An operation wrapper can override inherited flags, and its
   subops inherit the result. Naming `date_native` restores field-native
-  literal units; `[]` overrides nothing. Duplicate/conflicting names, unknown
-  names, and reserved flags are rejected. See [request flags](http-api.md#packed-request-flags)
-  and [date literal units](dates.md#request-flags-and-literal-units).
+  literal units and numeric output; `[]` overrides nothing. Duplicate/conflicting
+  names, unknown names, and reserved flags are rejected. See [request flags](http-api.md#packed-request-flags)
+  and [date literal units and output](dates.md#request-flags-and-literal-units).
+  Date modes apply to fields, sort values, facet bounds, group keys/ranks and
+  DATE metrics emitted by that operation; internal order and identities stay
+  native. `date_iso` emits UTC strings, and `date_ms`/`date_ns` normalize numeric
+  output. Numeric constants in value expressions retain the operand's unit.
 - `max_parallel` chooses where and how the request runs. `0`, the default,
   executes serially on the HTTP io thread that received it, with no
   scheduler handoff. `1` moves the request onto the
