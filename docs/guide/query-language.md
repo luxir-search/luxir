@@ -337,8 +337,10 @@ through their normalizer; ID fields use literals verbatim. Add
 literals (and, for regex, of character-class members), as in
 `wildcard(err*, field=message_s, case_insensitive=true)`; `match(...)` accepts
 the same argument on TEXT/STRING/ID and scores the indexed case variants of
-each analyzed token as one synonym word, summing frequency before BM25
-saturation and sharing statistics. Alternates come from query-time analyzed
+each analyzed token as one word, with the exact case of the query preferred
+slightly. Frequencies have weight 1.0 for the analyzed/normalized query token
+and 0.9 for other variants, summed before BM25 saturation with shared
+statistics. Alternates come from query-time analyzed
 tokens, so case-preserving stemmers can be lopsided (KStem stems lowercase
 words only). This is slower than a folding TEXT variant (`_t`, `_un`, `_wl`),
 which remains the recommendation for frequent case-blind matching.

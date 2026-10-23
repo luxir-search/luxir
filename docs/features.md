@@ -226,8 +226,9 @@ Anywhere a query goes, it can be a structured object or an expression string.
   `fuzzy` (edit distance up to 2, with blended scoring so a rare misspelling
   never outranks the exact term; fuzzy clauses take part in block-max pruning
   like any other clause). Prefix, wildcard, regex, and TEXT/STRING/ID `match`
-  take an opt-in `case_insensitive` flag. Match scores case variants as synonyms
-  with summed term frequency and shared statistics; the others keep constant
+  take an opt-in `case_insensitive` flag. Match scores case variants as one word,
+  with the exact case of the query preferred slightly, weighted term frequency
+  summed before BM25 saturation, and shared statistics. The others keep constant
   scores. Expansion follows query-time analysis, so case-preserving stemmers
   can be lopsided (KStem stems lowercase words only). For frequent case-blind
   TEXT matching, prefer a folding variant (`_t`, `_un`, `_wl`); it is faster.

@@ -85,12 +85,22 @@ Query::Weight* AutomatonQuery::createWeight(
   if (variants.empty()) {
     rewritten = context.pool.make<MatchNoDocsQuery>();
   } else {
+    // MATCH patterns are escaped literals. Recover the analyzed/normalized
+    // token, without normalizing again, to prefer its own case slightly.
+    std::string exactTerm;
+    exactTerm.reserve(pattern.size());
+    for (size_t p = 0; p < pattern.size(); p++) {
+      if (pattern[p] == '\\') p++;
+      assert(p < pattern.size());
+      exactTerm.push_back(pattern[p]);
+    }
     auto terms = context.pool.make_span<CombinedFieldQuery::Term>(variants.size());
     size_t i = 0;
     for (const auto& variant : variants) {
       char* copy = context.pool.alloc(variant.size());
       memcpy(copy, variant.data(), variant.size());
-      terms[i++] = {0, std::string_view(copy, variant.size())};
+      terms[i++] = {0, std::string_view(copy, variant.size()),
+                    variant == exactTerm ? 1.0f : CASE_ALTERNATE_WEIGHT};
     }
     auto fields = context.pool.make_span<std::string_view>(1);
     auto weights = context.pool.make_span<float>(1);

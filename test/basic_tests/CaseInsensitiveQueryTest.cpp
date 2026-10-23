@@ -170,15 +170,20 @@ TEST_F(CaseInsensitiveScoringTest, synonymsSumTfBeforeSaturation) {
   Similarity sim;
   // Shared df = max(2, 3, 1), field length and avgdl are both 2.
   Similarity::BM25Scorer bm25(1.0f, sim.k1, sim.b, sim.idf(3, 6), 2.0f);
-  float single = bm25.score(1.0f, SmallFloat::intToByte4(2));
-  float twice = bm25.score(2.0f, SmallFloat::intToByte4(2));
-  for (auto id : {"a", "b", "c"}) EXPECT_FLOAT_EQ(single, actual.at(id));
-  for (auto id : {"d", "e"}) EXPECT_FLOAT_EQ(twice, actual.at(id));
-  EXPECT_GT(twice, single);
-  EXPECT_LT(twice, 2.0f * single);
-  // Neither the query's spelling nor the rarity of a variant changes its IDF.
-  EXPECT_EQ(actual, scores("match(FOO, field=word_w, case_insensitive=true)"));
-  auto boosted = scores("match(foo, field=word_w, case_insensitive=true)^3");
+  auto expected = [&](float freq) { return bm25.score(freq, SmallFloat::intToByte4(2)); };
+  float alternate = AutomatonQuery::CASE_ALTERNATE_WEIGHT;
+  EXPECT_FLOAT_EQ(expected(1.0f), actual.at("a"));
+  for (auto id : {"b", "c"}) EXPECT_FLOAT_EQ(expected(alternate), actual.at(id));
+  EXPECT_FLOAT_EQ(expected(1.0f + alternate), actual.at("d"));
+  EXPECT_FLOAT_EQ(expected(2.0f * alternate), actual.at("e"));
+  EXPECT_GT(actual.at("d"), actual.at("a"));
+  EXPECT_LT(actual.at("d"), actual.at("a") + actual.at("b"));
+  // Preferring the rare FOO spelling still uses the common form's IDF.
+  auto upper = scores("match(FOO, field=word_w, case_insensitive=true)");
+  ASSERT_EQ(actual.size(), upper.size());
+  EXPECT_FLOAT_EQ(expected(2.0f), upper.at("e"));
+  EXPECT_FLOAT_EQ(expected(alternate), upper.at("a"));
+  auto boosted = scores("match(Foo, field=word_w, case_insensitive=true)^3");
   ASSERT_EQ(actual.size(), boosted.size());
   for (const auto& [id, score] : actual) EXPECT_FLOAT_EQ(3.0f * score, boosted.at(id));
 }
@@ -227,11 +232,75 @@ TEST_F(CaseInsensitiveQueryTest, unicodeTextAndStringScores) {
   for (auto field : {"letter_u", "letter_s"}) {
     auto actual = scores(std::format("match(k, field={}, case_insensitive=true)", field));
     ASSERT_EQ(3u, actual.size());
-    EXPECT_GT(actual.at("k1"), 0.0f);
-    EXPECT_FLOAT_EQ(actual.at("k1"), actual.at("k2"));
-    EXPECT_FLOAT_EQ(actual.at("k1"), actual.at("k3"));
+    Similarity sim;
+    Similarity::BM25Scorer bm25(1.0f, sim.k1, sim.b, sim.idf(1, 3), 1.0f);
+    // STRING uses its column-backed norms, as in TermQuery: K=1, k=2,
+    // Kelvin=3. TEXT has length 1 for every doc. Preference affects tf only.
+    bool stringField = std::string_view(field) == "letter_s";
+    EXPECT_FLOAT_EQ(bm25.score(1.0f, stringField ? 2 : 1), actual.at("k1"));
+    EXPECT_FLOAT_EQ(bm25.score(AutomatonQuery::CASE_ALTERNATE_WEIGHT, 1), actual.at("k2"));
+    EXPECT_FLOAT_EQ(bm25.score(AutomatonQuery::CASE_ALTERNATE_WEIGHT, stringField ? 3 : 1), actual.at("k3"));
   }
   EXPECT_EQ((Ids{"k1", "k2", "k3"}), hits(R"({"match":{"letter_u":"k","case_insensitive":true}})"));
+}
+
+TEST_F(CaseInsensitiveQueryTest, exactOnlyScoresMatchPlainTermQueries) {
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "Aardvark", "only_w", "Solo pad", "only_s", "Solo",
+            "only_ss", std::vector<std::string>{"Aardvark", "Solo"}),
+    flatdoc("id", "Solo", "only_w", "Solo", "only_s", "Other",
+            "only_ss", std::vector<std::string>{"Solo", "Zebra"}),
+    flatdoc("id", "Zebra", "only_s", "Solo"),
+  }, UpdateMessage::COMMIT).success);
+  // Non-unit ordinals and different first ordinals exercise the non-text
+  // norm source, rather than accidentally comparing two unit lengths.
+  for (auto field : {"only_w", "only_s", "only_ss", "id"}) {
+    auto plain = scores(std::format("match(Solo, field={})", field));
+    auto ci = scores(std::format("match(Solo, field={}, case_insensitive=true)", field));
+    ASSERT_FALSE(plain.empty()) << field;
+    EXPECT_EQ(plain, ci) << field;
+  }
+}
+
+TEST_F(CaseInsensitiveQueryTest, exactCaseRanksFirst) {
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "http://x/Foo", "rank_w", "Foo"),
+    flatdoc("id", "http://x/foo", "rank_w", "foo"),
+  }, UpdateMessage::COMMIT).success);
+  for (auto expression : {"match(\"http://x/Foo\", field=id, case_insensitive=true)",
+                          "match(Foo, field=rank_w, case_insensitive=true)"}) {
+    auto actual = scores(expression);
+    ASSERT_EQ(2u, actual.size());
+    EXPECT_GT(actual.at("http://x/Foo"), actual.at("http://x/foo"));
+    auto req = localReq(helper.getSearchEngine());
+    req->topDocs("q").exprQuery(expression).fields({"id"}).limit(1);
+    req->execute(false);
+    EXPECT_EQ((Ids{"http://x/Foo"}), ids(*req));
+  }
+}
+
+TEST_F(CaseInsensitiveQueryTest, termWeightsSeparateScoringIdentityOnly) {
+  std::string_view fields[] = {"body_w"};
+  float weights[] = {1.0f};
+  CombinedFieldQuery::Term plain[] = {{0, "Foo"}, {0, "foo"}};
+  CombinedFieldQuery::Term preferred[] = {{0, "Foo"}, {0, "foo", AutomatonQuery::CASE_ALTERNATE_WEIGHT}};
+  CombinedFieldQuery a(fields, weights, plain);
+  CombinedFieldQuery b(fields, weights, preferred);
+  EXPECT_FALSE(a.equals(b));
+  EXPECT_NE(a.hash(), b.hash());
+  EXPECT_EQ(key(a), key(b));
+}
+
+TEST_F(CaseInsensitiveQueryTest, escapedLiteralKeepsExactCasePreference) {
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "exact", "escaped_w", R"(Foo*?\Tail)", "escaped_s", R"(Foo*?\Tail)"),
+    flatdoc("id", "alternate", "escaped_w", R"(foo*?\tail)", "escaped_s", R"(foo*?\tail)"),
+  }, UpdateMessage::COMMIT).success);
+  for (auto field : {"escaped_w", "escaped_s"}) {
+    auto actual = scores(std::format(R"(match("Foo*?\\Tail", field={}, case_insensitive=true))", field));
+    ASSERT_EQ(2u, actual.size());
+    EXPECT_GT(actual.at("exact"), actual.at("alternate"));
+  }
 }
 
 TEST_F(CaseInsensitiveQueryTest, scoredExpansionBudgetRejectsWithoutTruncatingFilters) {
@@ -378,6 +447,10 @@ TEST_F(CaseInsensitiveMappingTest, literalAndPatternFilterCache) {
 TEST_F(CaseInsensitiveMappingTest, matchNormalizesOnlyBeforeExpansion) {
   // berry analyzes to cerry; expanding before analysis would also find BERRY.
   EXPECT_EQ((Ids{"c"}), hits(R"({"match":{"body":"berry","case_insensitive":true}})"));
+  ASSERT_TRUE(helper.index(flatdoc("id", "upper", "body", "CERRY"), UpdateMessage::COMMIT).success);
+  auto actual = scores("match(berry, field=body, case_insensitive=true)");
+  ASSERT_EQ(2u, actual.size());
+  EXPECT_GT(actual.at("c"), actual.at("upper"));
 }
 
 TEST_F(CaseInsensitiveMappingTest, matchFilterCacheSeparatesExactAndCaseInsensitive) {
@@ -395,7 +468,7 @@ TEST_F(CaseInsensitiveMappingTest, matchFilterCacheSeparatesExactAndCaseInsensit
   auto actual = scores("match(foo, field=word_w, case_insensitive=true)");
   ASSERT_EQ(2u, actual.size());
   EXPECT_GT(actual.at("lower"), 0.0f);
-  EXPECT_FLOAT_EQ(actual.at("lower"), actual.at("upper"));
+  EXPECT_GT(actual.at("lower"), actual.at("upper"));
   auto counters = cache->counters();
   EXPECT_GT(counters.hits + counters.readerStableHits, 0u);
 }

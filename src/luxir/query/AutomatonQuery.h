@@ -81,6 +81,7 @@ public:
   // Same scored-clause ceiling as fuzzy. Filters retain the complete union;
   // scored MATCH rejects overflow rather than silently losing case variants.
   static constexpr size_t MAX_CASE_VARIANTS = 64;
+  static constexpr float CASE_ALTERNATE_WEIGHT = 0.9f;
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override;

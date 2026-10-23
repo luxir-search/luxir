@@ -427,11 +427,13 @@ message Match {
   int32 min_match = 4;
 
   // Match TEXT tokens and STRING/ID values regardless of simple Unicode case,
-  // after query analysis/normalization. Indexed case variants score as synonyms
-  // with summed frequency and shared statistics. Slower than a folding variant
-  // (_t, _un, _wl), recommended for frequent use. Alternates come from analyzed
-  // tokens; case-preserving stemmers can be asymmetric (KStem stems lowercase
-  // only). Numeric and DATE fields ignore it.
+  // after query analysis/normalization. Indexed case variants score as one word,
+  // with the query's exact case preferred slightly: frequency weight 1.0 for
+  // the analyzed/normalized query token, 0.9 for other variants. Frequencies sum
+  // before BM25 saturation, with shared statistics. Slower than a folding
+  // variant (_t, _un, _wl), recommended for frequent use. Alternates come from
+  // analyzed tokens; case-preserving stemmers can be asymmetric (KStem stems
+  // lowercase only). Numeric and DATE fields ignore it.
   bool case_insensitive = 10;
 
   enum Operator {

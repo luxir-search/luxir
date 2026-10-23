@@ -95,10 +95,12 @@ their columns.
 With `case_insensitive`, each analyzed TEXT token or normalized STRING/ID
 value matches indexed terms that differ only in simple Unicode case: `FOO`
 matches `foo` and `Foo`, and `k` matches the Kelvin sign. All indexed variants
-of one token score as a single synonym word: their term frequencies are
-summed per document before BM25 saturation, with shared statistics (maximum
-document frequency and summed total term frequency). A rare spelling gets no
-extra IDF, and every variant has the same weight. `operator`, `min_match`, and
+of one token score as one word, with the exact case of the query preferred
+slightly. The analyzed/normalized query token has frequency weight 1.0;
+other case variants have weight 0.9. Weighted frequencies are summed per
+document before BM25 saturation, with shared statistics (maximum document
+frequency and summed total term frequency). A rare spelling gets no extra
+IDF. These term weights do not affect field lengths. `operator`, `min_match`, and
 boosts still apply over the analyzed query tokens. Filters match the same
 variants without computing scores. Scored matches reject more than 64 distinct
 indexed case variants per token; filters retain the complete match set.
