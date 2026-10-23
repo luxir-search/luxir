@@ -233,13 +233,13 @@ TEST_F(CaseInsensitiveQueryTest, unicodeTextAndStringScores) {
     auto actual = scores(std::format("match(k, field={}, case_insensitive=true)", field));
     ASSERT_EQ(3u, actual.size());
     Similarity sim;
-    Similarity::BM25Scorer bm25(1.0f, sim.k1, sim.b, sim.idf(1, 3), 1.0f);
-    // STRING uses its column-backed norms, as in TermQuery: K=1, k=2,
-    // Kelvin=3. TEXT has length 1 for every doc. Preference affects tf only.
-    bool stringField = std::string_view(field) == "letter_s";
-    EXPECT_FLOAT_EQ(bm25.score(1.0f, stringField ? 2 : 1), actual.at("k1"));
+    Similarity::BM25Scorer bm25(1.0f, sim.k1, sim.b, sim.idf(1, 3), 1.0f,
+                               std::string_view(field) == "letter_u");
+    // TEXT has length 1 for every doc; STRING ignores the encoded norm.
+    // Preference affects tf only, independent of the spelling's ordinal.
+    EXPECT_FLOAT_EQ(bm25.score(1.0f, 1), actual.at("k1"));
     EXPECT_FLOAT_EQ(bm25.score(AutomatonQuery::CASE_ALTERNATE_WEIGHT, 1), actual.at("k2"));
-    EXPECT_FLOAT_EQ(bm25.score(AutomatonQuery::CASE_ALTERNATE_WEIGHT, stringField ? 3 : 1), actual.at("k3"));
+    EXPECT_FLOAT_EQ(bm25.score(AutomatonQuery::CASE_ALTERNATE_WEIGHT, 1), actual.at("k3"));
   }
   EXPECT_EQ((Ids{"k1", "k2", "k3"}), hits(R"({"match":{"letter_u":"k","case_insensitive":true}})"));
 }
@@ -252,8 +252,8 @@ TEST_F(CaseInsensitiveQueryTest, exactOnlyScoresMatchPlainTermQueries) {
             "only_ss", std::vector<std::string>{"Solo", "Zebra"}),
     flatdoc("id", "Zebra", "only_s", "Solo"),
   }, UpdateMessage::COMMIT).success);
-  // Non-unit ordinals and different first ordinals exercise the non-text
-  // norm source, rather than accidentally comparing two unit lengths.
+  // Non-unit ordinals and different first ordinals must not affect scoring.
+  // These fields are absent from the first segment, so type lookup must skip it.
   for (auto field : {"only_w", "only_s", "only_ss", "id"}) {
     auto plain = scores(std::format("match(Solo, field={})", field));
     auto ci = scores(std::format("match(Solo, field={}, case_insensitive=true)", field));
@@ -262,20 +262,73 @@ TEST_F(CaseInsensitiveQueryTest, exactOnlyScoresMatchPlainTermQueries) {
   }
 }
 
+TEST_F(CaseInsensitiveQueryTest, stringSynonymScoresIgnoreOtherValuesAndSegments) {
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "tag_a", "tags_ss", std::vector<std::string>{"Foo"}),
+    flatdoc("id", "tag_b", "tags_ss", std::vector<std::string>{"foo"}),
+  }, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(std::array{
+    flatdoc("id", "tag_c", "tags_ss", std::vector<std::string>{"Foo", "foo", "ZZZ"}),
+    flatdoc("id", "tag_d", "tags_ss", std::vector<std::string>{"AAA", "Foo"}),
+  }, UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  Similarity::TermStats termStats;
+  termStats.docFreq = 3;
+  auto bm25 = Similarity().getScorer(1.0f, reader->field("tags_ss").stats(), termStats, false);
+  auto actual = scores("match(Foo, field=tags_ss, case_insensitive=true)");
+  ASSERT_EQ(4u, actual.size());
+  float alternate = AutomatonQuery::CASE_ALTERNATE_WEIGHT;
+  EXPECT_EQ(bm25.score(1.0f, 0), actual.at("tag_a"));
+  EXPECT_EQ(actual.at("tag_a"), actual.at("tag_d"));
+  EXPECT_EQ(bm25.score(alternate, 0), actual.at("tag_b"));
+  EXPECT_EQ(bm25.score(1.0f + alternate, 0), actual.at("tag_c"));
+
+  MemPool pool;
+  QueryBuilder builder(pool, *reader->schema(), CoerceContext{});
+  auto* query = builder.createMatchQuery("tags_ss", "Foo", QueryBuilder::Operator::OR, 0, 1.0f, true);
+  Query::Context context(pool, *reader);
+  auto* weight = query->createWeight(context, Query::NEED_SCORES);
+  int32_t count = 0;
+  for (auto& segment : reader->segments()) {
+    auto* scorer = weight->createScorer(pool, segment);
+    if (scorer == nullptr) continue;
+    float bound = scorer->getMaxScore(PostingsReader::END);
+    EXPECT_EQ(bm25.internalWeight(), bound);
+    EXPECT_EQ(bound, scorer->getMaxScoreForSetup(PostingsReader::END));
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      EXPECT_GE(bound, scorer->score());
+      count++;
+    }
+  }
+  EXPECT_EQ(4, count);
+}
+
 TEST_F(CaseInsensitiveQueryTest, exactCaseRanksFirst) {
   ASSERT_TRUE(helper.indexAll(std::array{
-    flatdoc("id", "http://x/Foo", "rank_w", "Foo"),
-    flatdoc("id", "http://x/foo", "rank_w", "foo"),
+    flatdoc("id", "http://x/Foo", "rank_s", "http://x/Foo", "rank_w", "Foo"),
+    flatdoc("id", "http://x/foo", "rank_s", "http://x/foo", "rank_w", "foo"),
   }, UpdateMessage::COMMIT).success);
-  for (auto expression : {"match(\"http://x/Foo\", field=id, case_insensitive=true)",
-                          "match(Foo, field=rank_w, case_insensitive=true)"}) {
-    auto actual = scores(expression);
-    ASSERT_EQ(2u, actual.size());
-    EXPECT_GT(actual.at("http://x/Foo"), actual.at("http://x/foo"));
-    auto req = localReq(helper.getSearchEngine());
-    req->topDocs("q").exprQuery(expression).fields({"id"}).limit(1);
-    req->execute(false);
-    EXPECT_EQ((Ids{"http://x/Foo"}), ids(*req));
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  for (std::string_view field : {"id", "rank_s", "rank_w"}) {
+    Similarity::TermStats termStats;
+    termStats.docFreq = 1;
+    // TEXT length and average are both 1, so every field has neutral length.
+    auto bm25 = Similarity().getScorer(1.0f, reader->field(field).stats(), termStats, false);
+    for (std::string_view word : {"Foo", "foo"}) {
+      std::string exact = std::format("http://x/{}", word);
+      std::string other = std::format("http://x/{}", word == "Foo" ? "foo" : "Foo");
+      auto expression = std::format(R"(match("{}", field={}, case_insensitive=true))",
+                                   field == "rank_w" ? word : exact, field);
+      auto actual = scores(expression);
+      ASSERT_EQ(2u, actual.size());
+      EXPECT_EQ(bm25.score(1.0f, 0), actual.at(exact));
+      EXPECT_EQ(bm25.score(AutomatonQuery::CASE_ALTERNATE_WEIGHT, 0), actual.at(other));
+      EXPECT_GT(actual.at(exact), actual.at(other));
+      auto req = localReq(helper.getSearchEngine());
+      req->topDocs("q").exprQuery(expression).fields({"id"}).limit(1);
+      req->execute(false);
+      EXPECT_EQ((Ids{exact}), ids(*req));
+    }
   }
 }
 

@@ -29,6 +29,9 @@ namespace luxir {
 //   term stats: docFreq = max_entries docFreq, totalTermFreq = sum_entries ttf
 //
 // Each distinct field is listed once, independently of the term entries.
+// Fields must all be TEXT or all be non-TEXT: combined multi_match groups
+// contain only TEXT, and case-insensitive synonym queries contain one field.
+// Non-TEXT queries use neutral length and never read document norms.
 // Every listed field contributes its length to a document even when the
 // term is absent from that field, so a long body still dampens a title hit.
 // Positive field weights and term weights in (0, 1] retain the BM25 score bound.
@@ -125,8 +128,6 @@ public:
       float weight;
       const uint8_t* flat = nullptr;
       NormsReader::Iterator* sparse = nullptr;
-      IntColReader::Iterator* values = nullptr;
-      OrdColReader* ords = nullptr;
     };
 
   private:
@@ -154,16 +155,10 @@ public:
         uint8_t code;
         if (n.flat != nullptr) {
           code = n.flat[doc];
-        } else if (n.sparse != nullptr) {
+        } else {
           if (n.sparse->docId() < doc) n.sparse->advance(doc);
           if (n.sparse->docId() != doc) continue;
           code = n.sparse->value();
-        } else if (n.ords != nullptr) {
-          code = (uint8_t)n.ords->firstOrdAt(doc);
-        } else {
-          if (n.values->docId() < doc) n.values->advance(doc);
-          if (n.values->docId() != doc) continue;
-          code = (uint8_t)n.values->value();
         }
         length += (double)n.weight * (double)SmallFloat::decodeLengthByte(code);
       }
@@ -218,6 +213,7 @@ public:
     std::span<CachedTermInfo*> termInfos;
     Similarity::TermStats termStats;
     Similarity::BM25Scorer* simScorer = nullptr;
+    bool hasNorms = false;
 
     int64_t segmentCost(IndexReader::Segment& segment) const {
       int64_t cost = 0;
@@ -236,13 +232,26 @@ public:
       int64_t docCount = 0;
       double sumTotalTermFreq = 0.0;
       bool anyTerm = false;
+      std::optional<bool> fieldHasNorms;
       for (size_t i = 0; i < n; i++) {
         fieldInfos[i] = context.getCachedFieldInfo(query.fields[i]);
         if (fieldInfos[i] == nullptr) continue;
+        // Use segment metadata, as in TermQuery; older fields need not be
+        // listed in the current schema. Query builders keep these modes apart.
+        const auto& segInfos = fieldInfos[i]->segInfos;
+        for (size_t seg = 0; seg < segInfos.size(); seg++) {
+          if (const auto* info = segInfos.at(seg)) {
+            bool text = info->type == FieldType::TEXT;
+            assert(!fieldHasNorms || *fieldHasNorms == text);
+            fieldHasNorms = text;
+            break;
+          }
+        }
         const auto& stats = fieldInfos[i]->fieldStats;
         docCount = std::max(docCount, stats.docsWithField);
         sumTotalTermFreq += (double)query.weights[i] * (double)stats.sumTotalTermFreq;
       }
+      hasNorms = fieldHasNorms.value_or(false);
       for (size_t i = 0; i < query.terms.size(); i++) {
         const auto& term = query.terms[i];
         auto* fieldInfo = fieldInfos[term.field];
@@ -263,7 +272,7 @@ public:
         // finite field weights. BM25 needs a finite, positive average length.
         if (!(avgdl > 0.0f) || !std::isfinite(avgdl)) avgdl = 1.0f;
         simScorer = context.pool.make<Similarity::BM25Scorer>(
-            multiplier, similarity.k1, similarity.b, idf, avgdl);
+            multiplier, similarity.k1, similarity.b, idf, avgdl, hasNorms);
       }
     }
 
@@ -336,24 +345,13 @@ public:
           postings[numPostings++] = {docs, query.weights[query.terms[i].field] * query.terms[i].weight};
         }
       }
-      auto norms = targetPool.make_span<Scorer::Norms>(n);
-      for (size_t i = 0; i < n; i++) {
+      auto norms = targetPool.make_span<Scorer::Norms>(hasNorms ? n : 0);
+      for (size_t i = 0; hasNorms && i < n; i++) {
         if (fieldInfos[i] == nullptr) continue;
         const SegFieldInfo* segInfo = fieldInfos[i]->segInfos.at(segment);
         if (segInfo == nullptr) continue;
+        assert(segInfo->type == FieldType::TEXT);
         float weight = query.weights[i];
-        if (segInfo->type != FieldType::TEXT) {
-          // Keep the same encoded norm source as TermQuery, including the
-          // first ordinal for multi-valued STRING fields.
-          if (segInfo->ordFormat != SegFieldInfo::ORD_NONE) {
-            auto* reader = targetPool.make<OrdColReader>(segment.postingsReader(), *segInfo);
-            norms[numNorms++] = {.weight = weight, .ords = reader};
-          } else if (segInfo->columnLoc.offset() > 0) {
-            auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
-            norms[numNorms++] = {.weight = weight, .values = targetPool.make<IntColReader::Iterator>(*reader)};
-          }
-          continue;
-        }
         if (segInfo->normsFormat == SegFieldInfo::NORMS_NONE) continue;
         auto* reader = targetPool.make<NormsReader>(segment.postingsReader(), *segInfo);
         if (reader->numBytes() == 0) continue;
