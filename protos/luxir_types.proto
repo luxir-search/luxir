@@ -11,6 +11,14 @@ option objc_class_prefix = "Luxir";
 
 package luxir;
 
+// Bit positions in the packed request option word, not masks. The two date
+// bits form one field: native=0, iso=1, ms=2, ns=3. Bit 2 is reserved.
+enum RequestFlagBit {
+  DATE_MODE_LOW_BIT = 0;
+  DATE_MODE_HIGH_BIT = 1;
+  reserved 2;
+}
+
 // Top-level search request that can contain multiple search operations.
 message SearchRequest {
   // Optional opaque identifier, echoed in every response to this request.
@@ -55,6 +63,16 @@ message SearchRequest {
   string min_commit = 9;
   // Search floor deadline. Absent defaults to 30000; zero checks immediately.
   optional uint64 min_commit_timeout_ms = 10;
+
+  // Packed request options. Effective = (inherited & ~flags_set) |
+  // (flags & flags_set); the request inherits 0. JSON uses lowercase names,
+  // e.g. "flags": ["date_ms"], rather than numeric flags/flags_set.
+  // Date modes control numeric date literal units: ms or ns overrides the
+  // field unit; native and iso use the field unit. Value arithmetic is unchanged.
+  uint64 flags = 11;
+  // Override mask. Set both date-mode bits (3), or neither. Unknown bits and
+  // reserved bit 2 are rejected in either word.
+  uint64 flags_set = 12;
 }
 
 enum ResponseFormat {
@@ -73,6 +91,13 @@ message SearchOp {
     ExprOp expr_op = 15;
   }
   Domain domain = 20; // optional override of the incoming document domain
+  // Overrides the parent's packed options, including for this op's domain,
+  // queries and facet literals. Subops inherit this op's effective options.
+  // JSON uses the same lowercase flags name array as SearchRequest.
+  uint64 flags = 21;
+  // Override mask, with the same validation as SearchRequest.flags_set.
+  // Naming date_native in JSON explicitly replaces an inherited date mode.
+  uint64 flags_set = 22;
 }
 
 // An expression aggregate over the operation's incoming document domain.

@@ -13,6 +13,7 @@
 #include <variant>
 #include <vector>
 
+#include "luxir/api/RequestFlags.h"
 #include "luxir/search/SearchRequest.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/query/ParseContext.h"
@@ -94,9 +95,24 @@ std::vector<double> resolveSourceWeights(
   return resolved;
 }
 
+// Also used before ops are constructed: domains and selections belong to the
+// child's options even though its parent pointer does not exist yet.
+struct OpParseContext {
+  uint64_t flags = 0;
+
+  OpParseContext child(const api::SearchOp& op, std::string_view name) const {
+    try {
+      return {RequestFlags::resolve(flags, op.flags, op.flags_set)};
+    } catch (const RequestError& error) {
+      throw RequestError("op '" + std::string(name) + "': " + error.what());
+    }
+  }
+};
+
 struct SearchParserImpl {
   SearchRequest& req;
   FieldResolver fields;
+  OpParseContext options;
   TopDocsReq* firstQuery = nullptr;
   size_t nonDefaultDomainVariants = 0;
   std::unordered_map<const api::SearchOp*, FacetParsePlan> preparedFacets;
@@ -198,17 +214,23 @@ public:
     : req(req), fields(*req.schema, req.resolvedFields), maxOpDepth(req.searchConfig.max_op_depth) {
   }
 
+  CoerceContext coerceContext(const TimeZone& zone) const {
+    return {req.dateMathNowEpochMillis, zone, RequestFlags::dateInputUnit(options.flags)};
+  }
+
   RootOp* parse() {
+    req.flags = RequestFlags::resolve(0, req.proto.flags, req.proto.flags_set);
+    options.flags = req.flags;
     RootOp& rootOp = *luxir::arenaCreate<RootOp>(req.arena, req);
     rootOp.parent = nullptr;
+    rootOp.flags = options.flags;
 
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
+      coerceContext(*req.timeZone),
       "root", &req.warnings, &fields};
     parseContext.reader = req.reader.get();
-    ProtobufQueryParser parser(parseContext);
-    ParsedDomains domains = parseChildDomains(req.proto.ops, parser);
+    ParsedDomains domains = parseChildDomains(req.proto.ops, parseContext);
     if (!domains.empty()) {
       rootOp.planning = luxir::arenaCreate<Query::PlanningContext>(
           req.arena, req.requestPool, *req.reader,
@@ -304,12 +326,11 @@ public:
     BucketDomainPlan* bucketPlan = nullptr;
     if (placement == OpsPlacement::FACET_BUCKET || placement == OpsPlacement::GROUP_BUCKET) {
       ParseContext context{req.requestPool, *req.schema, req.arena,
-          CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
+          coerceContext(*req.timeZone),
           currOp.name, &req.warnings, &fields};
       context.collapse = enclosingCollapse;
       context.reader = req.reader.get();
-      ProtobufQueryParser parser(context);
-      auto domains = parseChildDomains(ops, parser);
+      auto domains = parseChildDomains(ops, context);
       if (!domains.empty()) {
         std::vector<Query*> filters;
         auto* owner = placement == OpsPlacement::GROUP_BUCKET ? currentList : owningList;
@@ -381,11 +402,14 @@ public:
 
   SearchOp* parseOp(std::string_view name, const luxir::api::SearchOp& searchOp,
                     int depth, OpsPlacement placement) {
+    auto inherited = options;
+    options = inherited.child(searchOp, name);
+    auto restoreOptions = scope_guard([&]() noexcept { options = inherited; });
     if (searchOp.domain && placement == OpsPlacement::FUSION) {
       throw RequestError("domain is not supported under Fusion.ops");
     }
     // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
-    return std::visit(luxir::overloaded{
+    SearchOp* op = std::visit(luxir::overloaded{
       [&](const luxir::api::TopDocs& topDocs) -> SearchOp* {
         auto* oldCollapse = enclosingCollapse;
         auto* oldMeasure = inheritedFacetMeasure;
@@ -456,7 +480,7 @@ public:
         } else {
           ParseContext parseContext{
             req.requestPool, *req.schema, req.arena,
-            CoerceContext{req.dateMathNowEpochMillis, *req.timeZone},
+            coerceContext(*req.timeZone),
             name, &req.warnings, &fields};
           parseContext.collapse = enclosingCollapse;
           parseContext.reader = req.reader.get();
@@ -483,6 +507,8 @@ public:
       },
       [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
     }, searchOp.kind);
+    if (op != nullptr) op->flags = options.flags;
+    return op;
   }
 
   template<typename Facet>
@@ -649,8 +675,7 @@ public:
         : ValueSequence();
     CanonicalValueSet ownedSelected;
     if (preparedSelected == nullptr && !selectedValues.empty()) {
-      CoerceContext selectionContext{
-          req.dateMathNowEpochMillis, *req.timeZone};
+      CoerceContext selectionContext = coerceContext(*req.timeZone);
       QueryBuilder builder(req.requestPool, *req.schema,
                            selectionContext, facetName, &req.warnings, &fields);
       ownedSelected = builder.canonicalizeFieldValues(
@@ -670,8 +695,8 @@ public:
 
     FieldFacetReq* facet = nullptr;
     switch (ftype->type()) {
-      // DATE is epoch millis in the int column; it terms-facets exactly like
-      // INT (distinct millis values).  Date-histogram bucketing is a range
+      // DATE stores native ticks in the int column; it terms-facets exactly
+      // like INT (distinct values). Date-histogram bucketing is a range
       // facet, not a terms facet.
       case FieldType::Type::DATE:
       case FieldType::Type::INT: {
@@ -799,7 +824,7 @@ public:
         zone = *resolved;
       }
     }
-    CoerceContext context{req.dateMathNowEpochMillis, zone};
+    CoerceContext context = coerceContext(zone);
 
     auto resolveSelectedBuckets = [&](const ParsedFences& parsed,
                                       auto&& encode) {
@@ -1063,11 +1088,18 @@ public:
   }
 
   ParsedDomains parseChildDomains(
-      OpsMap ops, ProtobufQueryParser& parser) {
+      OpsMap ops, ParseContext& parseContext) {
     ParsedDomains out;
     for (const auto& [key, childView] : lastWins(ops)) {
       const api::SearchOp& child = **childView;
+      auto childOptions = options.child(child, key);
       if (!child.domain.has_value()) continue;
+      auto inheritedCoercion = parseContext.coerceContext;
+      parseContext.coerceContext.dateInputUnit = RequestFlags::dateInputUnit(childOptions.flags);
+      auto restoreCoercion = scope_guard([&]() noexcept {
+        parseContext.coerceContext = inheritedCoercion;
+      });
+      ProtobufQueryParser parser(parseContext);
       const api::Domain& domain = *child.domain;
       std::string path = "op '" + std::string(key) + "'.domain";
       if (domain.apply_parent_filters.has_value()
@@ -1330,6 +1362,14 @@ public:
       if (fieldProto == nullptr && rangeProto == nullptr
           && queryProto == nullptr) continue;
 
+      auto inherited = options;
+      options = inherited.child(child, key);
+      auto inheritedCoercion = parseContext.coerceContext;
+      parseContext.coerceContext.dateInputUnit = RequestFlags::dateInputUnit(options.flags);
+      auto restoreOptions = scope_guard([&]() noexcept {
+        options = inherited;
+        parseContext.coerceContext = inheritedCoercion;
+      });
       constexpr auto placement = OpsPlacement::TOP_DOCS;
       if (fieldProto != nullptr) {
         validateSelectionEnvelope(key, *fieldProto, placement);
@@ -1521,7 +1561,7 @@ public:
     }
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
+      coerceContext(*req.timeZone), name, &req.warnings, &fields};
     parseContext.collapse = enclosingCollapse;
     parseContext.reader = req.reader.get();
     ProtobufQueryParser parser(parseContext);
@@ -1585,7 +1625,7 @@ public:
         prepareFacetSelections(
             topDocsReq, parseContext, parser,
             specifiedLimit != 0 || countLimit != 0));
-    ParsedDomains parsedDomains = parseChildDomains(topDocsReq.ops, parser);
+    ParsedDomains parsedDomains = parseChildDomains(topDocsReq.ops, parseContext);
 
     DomainVariantPlan domainVariants;
     bool routedFilterSyntax = std::any_of(
@@ -2199,6 +2239,7 @@ public:
       });
       auto* src = parseTopDocs(
           srcName, *srcProto, TopDocsPlacement::FUSION_SOURCE);
+      src->flags = options.flags;
       // Linear fusion normalizes relevance scores; a field-sorted source
       // ranks by something else and carries no score to normalize.
       if (method != FusionOp::Method::RRF && src->sortPlan.useFieldSort) {
@@ -2214,7 +2255,7 @@ public:
 
     ParseContext parseContext{
       req.requestPool, *req.schema, req.arena,
-      CoerceContext{req.dateMathNowEpochMillis, *req.timeZone}, name, &req.warnings, &fields};
+      coerceContext(*req.timeZone), name, &req.warnings, &fields};
     parseContext.collapse = enclosingCollapse;
     parseContext.reader = req.reader.get();
     ProtobufQueryParser parser(parseContext);

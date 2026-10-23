@@ -148,6 +148,7 @@ class SearchOp {
 public:
   SearchRequest& req;
   std::string_view name;
+  uint64_t flags = 0; // effective packed options, set by the parser
   SearchOp* parent = nullptr;  // set by parser after construction.
   boost::unordered_flat_map<std::string_view, SearchOp*> subOps;  // set by parser after construction.
   ExecutionProfileOpState* executionProfile = nullptr;

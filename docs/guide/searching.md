@@ -987,6 +987,12 @@ beside `ops` in the full form:
   latest commit.
 - `time_zone` sets the default time zone for date queries and facets in the
   request. See [Dates and time zones](dates.md).
+- `flags` is an array of lowercase packed option names, for example
+  `["date_ms"]`. An operation wrapper can override inherited flags, and its
+  subops inherit the result. Naming `date_native` restores field-native
+  literal units; `[]` overrides nothing. Duplicate/conflicting names, unknown
+  names, and reserved flags are rejected. See [request flags](http-api.md#packed-request-flags)
+  and [date literal units](dates.md#request-flags-and-literal-units).
 - `max_parallel` chooses where and how the request runs. `0`, the default,
   executes serially on the HTTP io thread that received it, with no
   scheduler handoff. `1` moves the request onto the

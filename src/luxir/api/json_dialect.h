@@ -68,6 +68,7 @@
 #include <system_error>
 #include <unordered_set>
 
+#include "luxir/api/RequestFlags.h"
 #include "luxir/api/sort_clause.h"
 #include "luxir/api/weighted_field.h"
 
@@ -488,6 +489,70 @@ struct to<JSON, luxir::api::QueryFacet> {
   }
 };
 
+// Packed option words have one JSON representation at both overriding levels.
+// Keep the generated field metadata for ordinary fields so new request options
+// cannot silently disappear from canonical echo.
+template <auto Opts>
+void readRequestFlags(auto& value, auto& ctx, auto& it, auto& end) {
+  std::span<const std::string_view> names;
+  decltype(auto) target = ::hpp_proto::detail::as_modifiable(ctx, names);
+  util::parse_repeated<Opts>(false, target, ctx, it, end);
+  if (bool(ctx.error)) return;
+  try {
+    auto flags = luxir::RequestFlags::fromNames(names);
+    value.flags = flags.flags;
+    value.flags_set = flags.flagsSet;
+  } catch (const std::exception& error) {
+    ctx.error = error_code::syntax_error;
+    std::string_view message(error.what());
+    char* stored = (char*)ctx.memory_resource().allocate(message.size(), 1);
+    std::memcpy(stored, message.data(), message.size());
+    ctx.custom_error_message = std::string_view(stored, message.size());
+  }
+}
+
+template <class T>
+struct FlaggedRequestJsonWriter {
+  static constexpr bool can_error = true;
+  template <auto Opts, class B>
+  static void op(const T& value, is_context auto& ctx, B& b, auto& ix) {
+    if (!luxir::RequestFlags::validationError(value.flags, value.flags_set).empty()) {
+      ctx.error = error_code::syntax_error;
+      return;
+    }
+    dump<'{'>(b, ix);
+    bool first = true;
+    auto emit = [&](std::string_view key, const auto& member) {
+      if (!first) dump<','>(b, ix);
+      first = false;
+      serialize<JSON>::template op<Opts>(key, ctx, b, ix);
+      dump<':'>(b, ix);
+      serialize<JSON>::template op<Opts>(member, ctx, b, ix);
+    };
+    for_each<reflect<T>::size>([&]<size_t I>() {
+      constexpr auto key = get<I>(reflect<T>::keys);
+      if constexpr (key == "flags_set") {
+        return;
+      } else if constexpr (key == "flags") {
+        auto names = luxir::RequestFlags::names(value.flags, value.flags_set);
+        if (!names.empty()) emit(key, names);
+      } else {
+        decltype(auto) member = get_member(value, get<I>(reflect<T>::values));
+        if constexpr (null_t<std::remove_cvref_t<decltype(member)>>) {
+          if (!bool(member)) return;
+        }
+        emit(key, member);
+      }
+    });
+    dump<'}'>(b, ix);
+  }
+};
+
+template <>
+struct to<JSON, luxir::api::SearchOp> : FlaggedRequestJsonWriter<luxir::api::SearchOp> {};
+template <>
+struct to<JSON, luxir::api::SearchRequest> : FlaggedRequestJsonWriter<luxir::api::SearchRequest> {};
+
 // ----- SearchOp: canonical one-arm object plus optional domain, or ExprOp sugar -----
 static_assert(std::variant_size_v<decltype(luxir::api::SearchOp::kind)> == 7,
               "SearchOp gained an arm: update its hand-written JSON arm dispatch and sugar");
@@ -512,9 +577,15 @@ struct from<JSON, luxir::api::SearchOp> {
     decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
     bool sawArm = false;
     bool sawDomain = false;
+    bool sawFlags = false;
     util::scan_object_fields<O, true>(
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
+          if (key == "flags" && !sawFlags) {
+            sawFlags = true;
+            readRequestFlags<V>(value, ctx, vit, vend);
+            return bool(ctx.error);
+          }
           if (key == "domain" && !sawDomain) {
             sawDomain = true;
             util::from_json<V>(value.domain, ctx, vit, vend);
@@ -1479,6 +1550,7 @@ struct from<JSON, luxir::api::SearchRequest> {
     api::SearchOp *shorthandOp = nullptr;
     api::TopDocs *td = nullptr;
     bool reusedShorthand = false;
+    bool sawFlags = false;
     // A second read can overlay shorthand fields onto an already-decoded request.
     // Capture q before scanning so an ordinary shorthand body's root "ops" key
     // remains sub-ops even when that map itself contains an op named q.
@@ -1510,6 +1582,9 @@ struct from<JSON, luxir::api::SearchRequest> {
           } else if (key == "ops") {
             decltype(auto) ops = ::hpp_proto::detail::as_modifiable(ctx, value.ops);
             glz::util::parse_repeated<O>(true, ops, ctx, vit, vend);
+          } else if (key == "flags" && !sawFlags) {
+            sawFlags = true;
+            readRequestFlags<O>(value, ctx, vit, vend);
           } else if (key == "freshness_ms") {
             util::from_json<O>(value.freshness_ms, ctx, vit, vend);
           } else if (key == "min_commit") {

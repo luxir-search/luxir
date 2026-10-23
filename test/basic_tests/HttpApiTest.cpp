@@ -2683,7 +2683,7 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   }, UpdateMessage::COMMIT);
 
   const std::string body =
-      R"({"collection":"","query":{"match":{"status_s":"active"}},"fields":["id"]})";
+      R"({"collection":"","flags":["date_iso"],"query":{"match":{"status_s":"active"}},"fields":["id"]})";
   auto echo = httpRequest(port(), http::verb::post,
                           "/collections/main/_search?explain=request", body);
   ASSERT_EQ(200, echo.result_int()) << echo.body();
@@ -2694,6 +2694,8 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   EXPECT_NE(canonical.find(R"("field":"status_s")"), std::string::npos) << canonical;
   EXPECT_NE(canonical.find(R"("val":"active")"), std::string::npos) << canonical;
   EXPECT_NE(canonical.find(R"("collection":"main")"), std::string::npos) << canonical;
+  EXPECT_NE(canonical.find(R"("flags":["date_iso"])"), std::string::npos) << canonical;
+  EXPECT_EQ(canonical.find("flags_set"), std::string::npos) << canonical;
   // not executed
   EXPECT_EQ(canonical.find(R"("docs")"), std::string::npos) << canonical;
   EXPECT_EQ(canonical.find(R"("found")"), std::string::npos) << canonical;

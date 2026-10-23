@@ -99,6 +99,25 @@ the named response shape.
 The HTTP path collection is authoritative. Canonical echo may show it as
 `"collection":"books"` even when the original body omitted it.
 
+### Packed request flags
+
+The request and each operation wrapper accept a lowercase `flags` name array:
+
+```json
+{"flags":["date_ms"],"ops":{"q":{"flags":["date_native"],"top_docs":{"query":"when_dt:2"}}}}
+```
+
+Operations inherit their parent's options. Naming a date mode replaces the
+inherited date mode, including `date_native` to restore field-native literal
+units. An empty array overrides nothing. The root shorthand accepts request
+flags beside `query`, `filter`, and other request controls. A bare expression
+op inherits flags; use an `expr_op` wrapper to override them.
+
+Duplicate or conflicting names, unknown names, and reserved flags are request
+errors. Canonical echo and both explain modes emit names, including an explicit
+`date_native` override, rather than numeric masks. See
+[date literal units](dates.md#request-flags-and-literal-units).
+
 ### Explain modes
 
 `?explain=request` is parse-and-serialize only. It returns the bare canonical

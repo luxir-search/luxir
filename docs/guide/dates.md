@@ -15,8 +15,9 @@ corners and [faceting](faceting.md#date-histograms) has calendar buckets.
 
 A date field's `unit` is `"ms"` (default) or `"ns"`, inherited from its parent
 when omitted. Numeric ingest and query literals, including integer strings and
-date-math anchors, use that unit. Numeric facet bounds, gaps, origins and
-selected values also use the field's unit. ISO-8601 input converts to the
+date-math anchors, use that unit by default. Numeric facet bounds, gaps, origins
+and selected values also default to the field's unit; request flags can select
+another input unit. ISO-8601 input converts to the
 field's precision. For example:
 
 ```json
@@ -60,6 +61,34 @@ digits are truncated. Storage truncates to field precision, always toward
 earlier time. For example, on a default millisecond field,
 `1969-12-31T23:59:59.9999999999Z` stores as epoch millisecond `-1` and finds
 that value when used as a query literal.
+
+## Request flags and literal units
+
+The request and each operation wrapper accept a `flags` array with one date
+mode. Subops inherit it unless they name a replacement:
+
+| Name | Numeric date literal unit |
+|---|---|
+| `date_native` (default) | Each field's own unit. |
+| `date_iso` | Each field's own unit. |
+| `date_ms` | Milliseconds for every date field. |
+| `date_ns` | Nanoseconds for every date field. |
+
+These units apply to that operation's query literals in every query dialect,
+its domain queries/filters, and facet start/end/gap/origin/selected values.
+For example, `date_ms` makes `stamp:2` mean epoch millisecond 2 on an ns field.
+Match and range literals cover the input tick; `any_of` members still denote
+one instant, floored to storage precision. ISO-8601 text is always accepted
+and keeps its textual precision. Ingest is unaffected.
+
+Numeric constants in value expressions and aggregate expressions always use
+the date operand's native unit. Date response formatting for these modes is
+not enabled yet; output remains numeric in the field's native unit.
+
+Naming `date_native` restores field-native literals under an overridden
+parent. `[]` inherits unchanged. Duplicate or conflicting names are errors.
+See [JSON request flags](http-api.md#packed-request-flags) or
+[protobuf flag words](grpc.md#packed-request-flags).
 
 ## Value expressions and aggregates
 

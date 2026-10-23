@@ -158,7 +158,10 @@ void fillMessage(M& m, std::pmr::memory_resource& mr, int depth) {
   // These fields are value sequences, not arbitrary Val payloads. Keep the generic fixture
   // inside the semantic domain accepted by the parser, and avoid an explicit null Val whose
   // JSON representation is intentionally indistinguishable from an absent optional field.
-  if constexpr (std::is_same_v<M, P::AnyOfQuery>) {
+  if constexpr (std::is_same_v<M, P::SearchRequest> || std::is_same_v<M, P::SearchOp>) {
+    m.flags = 2;
+    m.flags_set = 3;
+  } else if constexpr (std::is_same_v<M, P::AnyOfQuery>) {
     P::Val* values = B::allocMessage<P::Val>(mr);
     auto& strings = values->kind.emplace<P::ArrStr>();
     std::string_view* items = B::allocArray(strings.v, 2, mr);
@@ -607,3 +610,17 @@ TEST(ProtoRoundTrip, BuildByBacking) {
 }
 
 }  // namespace
+
+TEST(ProtoRoundTrip, PackedRequestFlagsWireTags) {
+  std::pmr::monotonic_buffer_resource arena;
+  std::array requestBytes{std::byte{0x58}, std::byte{2}, std::byte{0x60}, std::byte{3}};
+  P::SearchRequest request;
+  ASSERT_TRUE(decode(request, P::copyToPaddedInput(requestBytes, arena), arena));
+  EXPECT_EQ(2u, request.flags);
+  EXPECT_EQ(3u, request.flags_set);
+  std::array opBytes{std::byte{0xa8}, std::byte{1}, std::byte{3}, std::byte{0xb0}, std::byte{1}, std::byte{3}};
+  P::SearchOp op;
+  ASSERT_TRUE(decode(op, P::copyToPaddedInput(opBytes, arena), arena));
+  EXPECT_EQ(3u, op.flags);
+  EXPECT_EQ(3u, op.flags_set);
+}

@@ -127,6 +127,7 @@ enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR =
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
+enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
@@ -942,6 +943,8 @@ struct SearchRequest {
   std::int32_t max_parallel = 0;
   std::string_view min_commit;
   std::optional<uint64_t> min_commit_timeout_ms;
+  uint64_t flags = 0;
+  uint64_t flags_set = 0;
   // JSON parsing metadata, absent from the wire schema and canonical JSON.
   // Only a root TopDocs shorthand creates this implicit q; an explicit op
   // named q (including one modified by a URL overlay) keeps its wrapper.
@@ -1022,6 +1025,8 @@ struct RangeFacet {                                             // needs Val,Cal
 struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,Domain
   std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, QueryFacet, ExprOp> kind;
   std::optional<Domain> domain;
+  uint64_t flags = 0;
+  uint64_t flags_set = 0;
 };
 struct Warning { std::string_view code; std::string_view message; };
 struct ExecutionProfilePiece {

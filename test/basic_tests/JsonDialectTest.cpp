@@ -916,3 +916,55 @@ TEST(JsonDialect, MultiMatchPhraseOptions) {
     EXPECT_FALSE(P::read_json(query, json, mr)) << json;
   }
 }
+
+TEST(JsonDialect, PackedRequestFlagsNamesAndCanonicalOverrides) {
+  for (auto mode : {"date_native", "date_iso", "date_ms", "date_ns"}) {
+    std::pmr::monotonic_buffer_resource mr;
+    P::SearchRequest request;
+    std::string json = fmt::format(R"json({{"flags":["{}"],"query":"when_dt:2","ops":{{
+      "child":{{"flags":["date_native"],"domain":{{"query":"when_dt:2"}},"expr_op":"min(when_dt)"}},
+      "bare":"avg(when_dt)"}}}})json", mode);
+    ASSERT_TRUE(P::read_json(request, json, mr)) << json;
+    EXPECT_EQ(3u, request.flags_set);
+    const auto& children = std::get<P::TopDocs>(request.ops.at("q")->kind).ops;
+    EXPECT_EQ(3u, children.at("child")->flags_set);
+    EXPECT_EQ(0u, children.at("child")->flags);
+    EXPECT_EQ(0u, children.at("bare")->flags_set);
+    std::string echo;
+    ASSERT_TRUE(P::write_json(request, echo));
+    EXPECT_NE(std::string::npos, echo.find(fmt::format(R"("flags":["{}"])", mode)));
+    EXPECT_NE(std::string::npos, echo.find(R"("flags":["date_native"])"));
+    EXPECT_EQ(std::string::npos, echo.find("flags_set"));
+    P::SearchRequest replay;
+    ASSERT_TRUE(P::read_json(replay, echo, mr));
+    EXPECT_EQ(request.flags, replay.flags);
+    EXPECT_EQ(request.flags_set, replay.flags_set);
+  }
+  std::pmr::monotonic_buffer_resource mr;
+  P::SearchRequest empty;
+  ASSERT_TRUE(P::read_json(empty, R"({"flags":[]})", mr));
+  EXPECT_EQ(0u, empty.flags_set);
+  empty.flags = 3; // unset bits do not override anything
+  std::string echo;
+  ASSERT_TRUE(P::write_json(empty, echo));
+  EXPECT_EQ("{}", echo);
+}
+
+TEST(JsonDialect, PackedRequestFlagsRejectAmbiguousAndUnsupportedNames) {
+  for (auto flags : {R"(["date_ms","date_ms"])", R"(["date_iso","date_ns"])",
+                     R"(["int64_str"])", R"(["DATE_MS"])", R"(["unknown"])",
+                     R"("date_ms")", "null", "[1]"}) {
+    std::pmr::monotonic_buffer_resource mr;
+    P::SearchRequest request;
+    P::SearchOp op;
+    std::string error;
+    EXPECT_FALSE(P::read_json(request, std::string(R"({"flags":)") + flags + "}", mr, &error)) << flags;
+    EXPECT_FALSE(P::read_json(op, std::string(R"json({"expr_op":"min(when_dt)","flags":)json") + flags + "}", mr, &error)) << flags;
+  }
+  std::pmr::monotonic_buffer_resource mr;
+  P::SearchRequest request;
+  P::SearchOp op;
+  EXPECT_FALSE(P::read_json(request, R"({"flags":[],"flags":["date_ms"]})", mr));
+  EXPECT_FALSE(P::read_json(op, R"({"flags":[],"top_docs":{},"flags":["date_ns"]})", mr));
+  EXPECT_FALSE(P::read_json(request, R"({"flags":2,"flags_set":3})", mr));
+}
