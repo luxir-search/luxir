@@ -19,6 +19,7 @@
 #include "TermQuery.h"
 #include "luxir/reader/FuzzySeekEnum.h"
 #include "luxir/util/MemPool.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -126,6 +127,12 @@ public:
     warnIfFittedTermsReachable(context, field, *fittedPolicy, [] { return true; });
   }
 
+  MatchState mayMatch(const SummaryView& view) const override {
+    MatchState state;
+    summary::requireField(view, field, state);
+    return state;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
@@ -152,7 +159,12 @@ private:
     std::string_view suffix = term.substr(prefixLength);
 
     size_t nSegs = context.numSegments();
+    // Expand only over the segments this query may match, so pruned ones
+    // stay closed; their terms could not contribute matches anyway.
+    SegmentMask viable = context.scopedMaskCopy();
+    viable &= context.planningContext().viableSegments(*this);
     for (size_t s = 0; s < nSegs; s++) {
+      if (!viable.test(s)) continue;
       auto* segFieldInfo = fieldInfo.segInfos.at(s);
       if (segFieldInfo == nullptr) continue;
       auto& postingsReader = context.topReader.segments()[s].postingsReader();

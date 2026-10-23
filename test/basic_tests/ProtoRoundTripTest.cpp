@@ -286,11 +286,12 @@ void roundTripType(const char* nm) {
   X(WeightedField) X(PhraseOptions) X(MultiMatchQuery) X(DisMaxQuery)                                         \
   X(FieldFacet) X(ExecutionProfile) X(ExecutionProfileOp) X(ExecutionProfilePiece)                 \
   X(CalendarGap) X(RangeFacet) X(QueryBucket) X(QueryFacet) X(Domain)                               \
-  X(SearchResponse) X(DocList) X(FacetResult) X(CommitParams) X(UpdateRequest)                     \
+  X(SearchResponse) X(CanMatchResponse) X(DocList) X(FacetResult) X(CommitParams) X(UpdateRequest)                     \
   X(UpdateResponse) X(Map) X(Val) X(ArrVal) X(ArrStr) X(ArrInt)                                    \
   X(ArrFloat) X(ArrDouble) X(ArrBin) X(ArrArrStr) X(ArrArrInt) X(ArrArrFloat) X(ArrArrDouble)      \
   X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVal) X(ColVector) X(MultiVector) X(ColInt) \
   X(ColFloat) X(ColDouble) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerComponent) X(AnalyzerDef) \
+  X(FieldSummary) X(SummaryPayload) X(SegmentSummaryInfo) X(FieldSummaryDef) \
   X(FieldDef) X(SchemaDef) X(SchemaRequest) X(SchemaResponse)                                      \
   X(CreateCollectionRequest) X(CreateCollectionResponse)                                           \
   X(DeleteCollectionRequest) X(DeleteCollectionResponse) X(ListCollectionsResponse)                \

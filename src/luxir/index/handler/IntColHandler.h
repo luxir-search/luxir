@@ -161,6 +161,7 @@ public:
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
+    inverter.getPostingsWriter().summaryFor(fieldInfo, fieldType->summary);
     flushIntCol(inverter, fieldInfo);
   }
 
@@ -187,6 +188,9 @@ public:
       // individual values)
       longStream.pushValues(inverter.pool, writer);
       writer.finish(fieldInfo);
+    }
+    if (fieldInfo.summary != nullptr && fieldType->type() == FieldType::GEO_POINT) {
+      longStream.visitValues(inverter.pool, [&](int64_t value) { fieldInfo.summary->addGeoPacked(value); });
     }
 
     if (fieldType->rangeIndexed()) {
@@ -339,6 +343,7 @@ public:
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
+    inverter.getPostingsWriter().summaryFor(fieldInfo, fieldType->summary);
     flushIntCol(inverter, fieldInfo);
   }
 
@@ -354,6 +359,9 @@ public:
       IntColWriter writer(*outputPtr);
       longStream.pushValues(inverter.pool, writer);
       writer.finish(fieldInfo);
+    }
+    if (fieldInfo.summary != nullptr && fieldType->type() == FieldType::GEO_POINT) {
+      longStream.visitValues(inverter.pool, [&](int64_t value) { fieldInfo.summary->addGeoPacked(value); });
     }
 
     if (fieldType->rangeIndexed()) {

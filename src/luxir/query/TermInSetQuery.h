@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "MultiTermQuery.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -37,6 +38,13 @@ public:
   }
 
   std::span<const std::string_view> getTerms() const { return terms; }
+
+  MatchState mayMatch(const SummaryView& view) const override {
+    for (std::string_view term : terms) {
+      if (summary::termMatch(view, field, term) != MatchState::EMPTY) return MatchState::UNKNOWN;
+    }
+    return terms.empty() ? MatchState::UNKNOWN : MatchState::EMPTY;
+  }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {

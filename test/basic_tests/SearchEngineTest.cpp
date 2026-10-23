@@ -23,6 +23,7 @@
 #include "test/QueryBuild.h"
 #include "test/SchemaBuilder.h"
 #include "luxir/query/BooleanWeight.h"
+#include "luxir/query/QueryPruning.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/reader/SkipStats.h"
 #include "luxir/reader/DocsEnum.h"
@@ -2170,6 +2171,13 @@ TEST_F(SearchEngineTest, wholeCountGatesSegmentsAndComposesDeletesOnce) {
   WholeCountQueryBuilder empty = [](auto& mr) {
     return qb::phraseWords(mr, "body_w", {"not", "present"});
   };
+  // Summaries prove the phrase absent, so the cache is never consulted.
+  WholeCountRun pruned = runWholeCount(helper.getSearchEngine(), collection, empty);
+  EXPECT_EQ(0, pruned.found);
+  EXPECT_EQ(0, pruned.bypasses + pruned.builds + pruned.hits);
+  // Without that proof the empty result goes through the cache like any other.
+  QueryPruning::disableForTests = true;
+  auto restore = scope_guard([]() noexcept { QueryPruning::disableForTests = false; });
   WholeCountRun emptyBypass = runWholeCount(
       helper.getSearchEngine(), collection, empty);
   WholeCountRun emptyBuild = runWholeCount(

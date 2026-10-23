@@ -55,6 +55,20 @@ private:
   };
   std::mutex mutex;
   std::mutex retirementMutex; // joins directory access before close returns
+  // Open readers hold their snapshot's files for as long as they live: a
+  // lazily opened segment must still find them. Holds have no timeout and
+  // no budget; they count in FileRef::pins like timed pins. The gate lets a
+  // token released after the registry's destruction do nothing.
+  struct HoldGate {
+    std::mutex mutex;
+    CommitSnapshotRegistry* registry;
+  };
+  std::shared_ptr<HoldGate> holdGate = std::make_shared<HoldGate>();
+  size_t holdCount = 0;
+  // Advanced by detach(), which drops every hold's bookkeeping at once; a
+  // token from an earlier epoch then releases nothing.
+  uint64_t holdEpoch = 0;
+  std::shared_ptr<Directory> ownedDir;
   Policy policy;
   Stats counters;
   Now now;
@@ -73,6 +87,7 @@ public:
   std::function<void()> onChange;
 private:
   void releaseLocked(const CommitId& id, std::vector<std::string>& retired);
+  void releaseHoldLocked(const CommitSnapshot& snapshot, uint64_t epoch, std::vector<std::string>& retired);
   void expireLocked(std::vector<std::string>& retired);
   void enforceBudgetLocked(std::vector<std::string>& retired);
   decltype(pins)::iterator oldestReclaimableLocked();
@@ -82,9 +97,18 @@ private:
   void retireUnreferenced(std::span<const Directory::FileInfo> listing);
   void requireHeld(const FileDescriptor& descriptor);
 public:
+  // `dir` must outlive readers opened through this registry (tests, tools);
+  // a collection passes its owning pointer so lazily opened segments can
+  // reach their files after the collection is gone.
   explicit CommitSnapshotRegistry(Directory& dir, FilterCacheConfig config = {}, Now now = Clock::now)
-      : now(std::move(now)), dir(dir), readers(dir, config) {}
-  ~CommitSnapshotRegistry() { close(); }
+      : CommitSnapshotRegistry(std::shared_ptr<Directory>(std::shared_ptr<void>{}, &dir), config, std::move(now)) {}
+  explicit CommitSnapshotRegistry(std::shared_ptr<Directory> dir, FilterCacheConfig config = {},
+                                  Now now = Clock::now);
+  ~CommitSnapshotRegistry();
+  // Holds every file of `snapshot` until the token is released, regardless
+  // of pin expiry and the retention budget. Retirement of a held file waits
+  // for the token; close() and detach() do not.
+  std::shared_ptr<void> hold(const CommitSnapshot& snapshot);
   void close() noexcept;
   // The owning writer failed after durable publication: close and notify.
   void fail() noexcept;

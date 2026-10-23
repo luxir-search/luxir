@@ -29,6 +29,7 @@ struct RequestFlags {
       (uint64_t{1} << (int)api::RequestFlagBit::DATE_MODE_LOW_BIT)
       | (uint64_t{1} << (int)api::RequestFlagBit::DATE_MODE_HIGH_BIT);
   static constexpr uint64_t INT64_STR = uint64_t{1} << (int)api::RequestFlagBit::INT64_STR_BIT;
+  static constexpr uint64_t GLOBAL_STATS = uint64_t{1} << (int)api::RequestFlagBit::GLOBAL_STATS_BIT;
   static constexpr std::array<std::string_view, 4> DATE_NAMES{
       "date_native", "date_iso", "date_ms", "date_ns"};
 
@@ -40,7 +41,7 @@ struct RequestFlags {
     if (level == Level::OP && ((flags | flagsSet) & INT64_STR)) {
       return "int64_str is request-level only";
     }
-    if ((flags | flagsSet) & ~(DATE_MASK | INT64_STR)) return "unknown request flag bits";
+    if ((flags | flagsSet) & ~(DATE_MASK | INT64_STR | GLOBAL_STATS)) return "unknown request flag bits";
     uint64_t dateSet = flagsSet & DATE_MASK;
     if (dateSet != 0 && dateSet != DATE_MASK) {
       return "flags_set must cover both date-mode bits or neither";
@@ -67,6 +68,12 @@ struct RequestFlags {
         out.flagsSet |= INT64_STR;
         continue;
       }
+      if (name == "global_stats") {
+        if (out.flagsSet & GLOBAL_STATS) throw RequestError("duplicate global_stats flag");
+        out.flags |= GLOBAL_STATS;
+        out.flagsSet |= GLOBAL_STATS;
+        continue;
+      }
       size_t mode = 0;
       for (; mode < DATE_NAMES.size(); mode++) if (DATE_NAMES[mode] == name) break;
       if (mode == DATE_NAMES.size()) {
@@ -85,9 +92,12 @@ struct RequestFlags {
     std::vector<std::string_view> out;
     if (flagsSet & DATE_MASK) out.push_back(dateName(flags));
     if (flags & flagsSet & INT64_STR) out.push_back("int64_str");
+    if (flags & flagsSet & GLOBAL_STATS) out.push_back("global_stats");
     return out;
   }
 
+  // BM25 statistics over every segment instead of the weight's unpruned ones.
+  static bool globalStats(uint64_t flags) { return (flags & GLOBAL_STATS) != 0; }
   static DateMode dateMode(uint64_t flags) { return (DateMode)(flags & DATE_MASK); }
   static std::string_view dateName(uint64_t flags) { return DATE_NAMES[flags & DATE_MASK]; }
 

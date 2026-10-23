@@ -866,6 +866,8 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.normalize_on_write, ctx, vit, vend);
           } else if (key == "ann") {
             util::from_json<V>(value.ann, ctx, vit, vend);
+          } else if (key == "summary") {
+            util::from_json<V>(value.summary, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

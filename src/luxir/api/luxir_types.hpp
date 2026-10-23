@@ -73,7 +73,7 @@ struct DisMaxQuery;
 struct Warning; struct Error;
 struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
 struct FieldFacet; struct CalendarGap; struct RangeFacet; struct QueryBucket; struct QueryFacet;
-struct Domain; struct SearchResponse; struct DocList; struct FacetResult;
+struct Domain; struct SearchResponse; struct DocList; struct FacetResult; struct CanMatchResponse;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct Map;
 struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
 struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrArrFloat;
@@ -81,6 +81,7 @@ struct ArrArrDouble; struct Vector; struct ArrVector;
 struct ColStr; struct Column; struct ColVal; struct ColVector; struct MultiVector; struct ColInt;
 struct ColFloat; struct ColDouble; struct AnalyzerComponent; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
 struct FieldVariants; struct FieldDefaults; struct NormalizerDef; struct VectorAnnDef; struct StoredResourceDef;
+struct FieldSummaryDef;
 struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
@@ -95,6 +96,7 @@ struct CgroupMemoryStats; struct CgroupCpuStats; struct CgroupTaskStats;
 struct CacheControlRequest; struct CacheControlResponse; struct CacheEntryDump;
 struct ShardCacheControl; struct CollectionCacheControl;
 namespace UpdateResponse_ { struct DocError; }
+namespace CanMatchResponse_ { struct Op; enum class Verdict { MAY_MATCH = 0, NO_MATCH = 1 }; }
 namespace KnnQuery_ { struct Ivf; }
 namespace VectorAnnDef_ { struct RaBitQ; struct Pq; }
 
@@ -127,7 +129,7 @@ enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR =
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
-enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2 };
+enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2, GLOBAL_STATS_BIT = 3 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
@@ -138,6 +140,7 @@ enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
 enum class DateUnit { MS = 0, NS = 1 };
 }
 namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1 }; }
+namespace FieldSummaryDef_ { enum class Terms { AUTO = 0, SET = 1, FILTER = 2, NONE = 3 }; }
 namespace StoredResourceDef_ { enum class Codec { LZ4 = 0, ZSTD = 1 }; }
 namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 
@@ -272,6 +275,14 @@ struct VectorAnnDef {
   std::optional<Codec> codec;
   std::optional<int32_t> nlist;
 };
+struct FieldSummaryDef {
+  using Terms = luxir::api::FieldSummaryDef_::Terms;
+  std::span<const std::uint32_t> prefixes;                      // align 8
+  std::optional<std::uint64_t> filter_max_bytes;                // align 8
+  std::optional<Terms> terms;                                   // align 4 (enum)
+  std::optional<std::uint32_t> set_max;                         // align 4
+  std::optional<bool> bounds;                                   // align 1
+};
 struct FieldDef {
   using FieldClass = luxir::api::FieldDef_::FieldClass;
   using MultiMode = luxir::api::FieldDef_::MultiMode;
@@ -285,6 +296,7 @@ struct FieldDef {
   std::optional<FieldVariants> variants;
   std::optional<FieldDefaults> defaults;
   std::optional<NormalizerDef> normalizer;
+  std::optional<FieldSummaryDef> summary;                       // align 8
   std::optional<VectorAnnDef> ann;                              // align 4
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
@@ -539,6 +551,8 @@ struct ServiceStats {
   HistogramStats search_execution;
   uint64_t search_resource_exhausted = 0;
   uint64_t search_warnings = 0;
+  uint64_t segments_considered = 0;
+  uint64_t segments_pruned = 0;
   ActivityStats index_batches;
   uint64_t documents_accepted = 0;
   uint64_t documents_rejected = 0;
@@ -1045,6 +1059,24 @@ struct ExecutionProfileOp {
   std::span<const ExecutionProfilePiece> pieces;
 };
 struct ExecutionProfile { std::span<const ExecutionProfileOp> ops; };
+namespace CanMatchResponse_ {
+struct Op {
+  std::string_view op;
+  std::string_view reason;
+  Verdict verdict = Verdict::MAY_MATCH;
+};
+}
+struct CanMatchResponse {
+  using Verdict = luxir::api::CanMatchResponse_::Verdict;
+  using Op = luxir::api::CanMatchResponse_::Op;
+  std::string_view commit;
+  std::span<const Op> ops;
+  std::span<const std::uint64_t> pruned_segments;
+  std::optional<Error> error;
+  std::uint64_t segments = 0;
+  Verdict verdict = Verdict::MAY_MATCH;
+  bool summary_complete = false;
+};
 struct SearchResponse {
   std::string_view commit;
   std::string_view request_id;
@@ -1166,7 +1198,7 @@ LUXIR_TD(GeoBoxQuery) LUXIR_TD(GeoDistanceQuery) LUXIR_TD(ExprQuery) LUXIR_TD(We
 LUXIR_TD(Warning) LUXIR_TD(Error) LUXIR_TD(ExecutionProfile) LUXIR_TD(ExecutionProfileOp)
 LUXIR_TD(ExecutionProfilePiece) LUXIR_TD(FieldFacet) LUXIR_TD(CalendarGap) LUXIR_TD(RangeFacet)
 LUXIR_TD(QueryBucket) LUXIR_TD(QueryFacet)
-LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult)
+LUXIR_TD(Domain) LUXIR_TD(SearchResponse) LUXIR_TD(DocList) LUXIR_TD(FacetResult) LUXIR_TD(CanMatchResponse) LUXIR_TD(CanMatchResponse_::Op)
 LUXIR_TD(CollectionCommit) LUXIR_TD(ReplicaResult) LUXIR_TD(CommitParams) LUXIR_TD(UpdateRequest) LUXIR_TD(UpdateResponse) LUXIR_TD(Map)
 LUXIR_TD(Val) LUXIR_TD(ArrVal) LUXIR_TD(ArrStr) LUXIR_TD(ArrInt) LUXIR_TD(ArrFloat)
 LUXIR_TD(ArrDouble) LUXIR_TD(ArrBin) LUXIR_TD(ArrArrStr) LUXIR_TD(ArrArrInt) LUXIR_TD(ArrArrFloat)
@@ -1174,7 +1206,7 @@ LUXIR_TD(ArrArrDouble) LUXIR_TD(Vector) LUXIR_TD(ArrVector)
 LUXIR_TD(ColStr) LUXIR_TD(Column) LUXIR_TD(ColVal) LUXIR_TD(ColVector) LUXIR_TD(MultiVector) LUXIR_TD(ColInt)
 LUXIR_TD(ColFloat) LUXIR_TD(ColDouble)
 LUXIR_TD(AnalyzerComponent) LUXIR_TD(AnalyzerDef) LUXIR_TD(FieldDef) LUXIR_TD(SchemaDef)
-LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef) LUXIR_TD(StoredResourceDef)
+LUXIR_TD(FieldVariants) LUXIR_TD(FieldDefaults) LUXIR_TD(NormalizerDef) LUXIR_TD(StoredResourceDef) LUXIR_TD(FieldSummaryDef)
 LUXIR_TD(VectorAnnDef) LUXIR_TD(VectorAnnDef_::RaBitQ) LUXIR_TD(VectorAnnDef_::Pq)
 LUXIR_TD(SchemaRequest) LUXIR_TD(SchemaResponse) LUXIR_TD(UpdateResponse_::DocError)
 LUXIR_TD(KnnQuery_::Ivf)
@@ -1213,7 +1245,7 @@ LUXIR_ENTRY(WeightedField) LUXIR_ENTRY(PhraseOptions) LUXIR_ENTRY(MultiMatchQuer
 LUXIR_ENTRY(Warning) LUXIR_ENTRY(Error) LUXIR_ENTRY(ExecutionProfile) LUXIR_ENTRY(ExecutionProfileOp)
 LUXIR_ENTRY(ExecutionProfilePiece) LUXIR_ENTRY(FieldFacet)
 LUXIR_ENTRY(CalendarGap) LUXIR_ENTRY(RangeFacet) LUXIR_ENTRY(QueryBucket) LUXIR_ENTRY(QueryFacet)
-LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(DocList)
+LUXIR_ENTRY(Domain) LUXIR_ENTRY(SearchResponse) LUXIR_ENTRY(CanMatchResponse) LUXIR_ENTRY(DocList)
 LUXIR_ENTRY(FacetResult) LUXIR_ENTRY(CollectionCommit) LUXIR_ENTRY(ReplicaResult) LUXIR_ENTRY(CommitParams) LUXIR_ENTRY(UpdateRequest)
 LUXIR_ENTRY(UpdateResponse) LUXIR_ENTRY(Map)
 LUXIR_ENTRY(Val) LUXIR_ENTRY(ArrVal) LUXIR_ENTRY(ArrStr) LUXIR_ENTRY(ArrInt) LUXIR_ENTRY(ArrFloat)
@@ -1222,7 +1254,7 @@ LUXIR_ENTRY(ArrArrFloat) LUXIR_ENTRY(ArrArrDouble) LUXIR_ENTRY(Vector)
 LUXIR_ENTRY(ArrVector) LUXIR_ENTRY(ColStr) LUXIR_ENTRY(Column)
 LUXIR_ENTRY(ColVal) LUXIR_ENTRY(ColVector) LUXIR_ENTRY(MultiVector) LUXIR_ENTRY(ColInt) LUXIR_ENTRY(ColFloat)
 LUXIR_ENTRY(ColDouble) LUXIR_ENTRY(AnalyzerComponent) LUXIR_ENTRY(AnalyzerDef) LUXIR_ENTRY(FieldDef)
-LUXIR_ENTRY(FieldVariants) LUXIR_ENTRY(FieldDefaults) LUXIR_ENTRY(NormalizerDef) LUXIR_ENTRY(StoredResourceDef)
+LUXIR_ENTRY(FieldVariants) LUXIR_ENTRY(FieldDefaults) LUXIR_ENTRY(NormalizerDef) LUXIR_ENTRY(StoredResourceDef) LUXIR_ENTRY(FieldSummaryDef)
 LUXIR_ENTRY(VectorAnnDef)
 LUXIR_ENTRY(SchemaDef) LUXIR_ENTRY(SchemaRequest) LUXIR_ENTRY(SchemaResponse)
 LUXIR_ENTRY(CreateCollectionRequest) LUXIR_ENTRY(CreateCollectionResponse)

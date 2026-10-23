@@ -12,6 +12,8 @@
 #include "luxir/index/OrdColWriter.h"
 #include "luxir/schema/ValCoerce.h"
 #include "luxir/util/TermValHash.h"
+#include <algorithm>
+#include <optional>
 
 
 
@@ -74,6 +76,37 @@ protected:
       bufferedValuesOut(&valuesFile),
       valueStorage(valueStorage)
   {
+  }
+
+  // Column-only STRING fields with an exact-set summary policy collect their
+  // distinct values while indexing; other subclasses hand over their own
+  // statistics (VectorHandler: centroid and box).
+  std::optional<bool> collectValues;
+  std::vector<std::string> columnValues;
+  bool columnValuesOverflow = false;
+
+  void collectValue(std::string_view val) {
+    if (!collectValues) {
+      collectValues = fieldType->type() == FieldType::STRING
+          && fieldType->summary.terms == SummaryPolicy::Terms::SET
+          && (fieldType->segmentFlags() & FieldType::INDEX_DOCS) == 0;
+    }
+    if (!*collectValues || columnValuesOverflow) return;
+    auto it = std::ranges::lower_bound(columnValues, val);
+    if (it != columnValues.end() && *it == val) return;
+    if (columnValues.size() >= fieldType->summary.setMax) {
+      columnValuesOverflow = true;
+      columnValues.clear();
+      columnValues.shrink_to_fit();
+      return;
+    }
+    columnValues.insert(it, std::string(val));
+  }
+
+protected:
+  virtual void fillSummary(FieldSummaryCollector& collector) {
+    collector.columnValues = std::move(columnValues);
+    collector.columnValuesOverflow = columnValuesOverflow;
   }
 
 public:
@@ -254,6 +287,7 @@ protected:
 
 private:
   void addValue(Inverter& inverter, std::string_view val) {
+    collectValue(val);
     int32_t valSize = (int32_t)val.size();
     minSize = std::min(minSize, valSize);
     maxSize = std::max(maxSize, valSize);
@@ -295,6 +329,7 @@ public:
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
+    fillSummary(inverter.getPostingsWriter().summaryFor(fieldInfo, fieldType->summary));
     fieldInfo.numValues = numValuesTotal;
 
     auto maxDoc = inverter.getMaxDoc();

@@ -163,6 +163,7 @@ public:
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
+    inverter.getPostingsWriter().summaryFor(fieldInfo, fieldType->summary);
 
     // Postings are keyed by field-rank, so the ord collector is sized to docsWithField
     // (not maxDoc).  For a full field rank == docid, so we skip the rank->docid table

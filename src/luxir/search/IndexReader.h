@@ -12,6 +12,9 @@
 
 #include "DocSet.h"
 #include "Similarity.h"
+#include "luxir/index/AuxInfo.h"
+#include "luxir/query/SegmentMask.h"
+#include "luxir/index/SegmentSummary.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
 #include "luxir/util/screaming.h"
@@ -73,10 +76,61 @@ public:
 };
 
 
+// A physical segment's data readers open on first use and are shared by every
+// snapshot, and the writer, holding the same files: opening a snapshot costs
+// no segment reads, so a query can skip a segment it never touched. The cells
+// keep the directory alive; the owning reader holds the files (registry hold).
+class SegmentBase {
+  std::shared_ptr<Directory> dir;
+  SharedLazyCell<PostingsReader, false> cell;
+public:
+  const uint64_t segId;
+  const int32_t maxDoc;
+  SegmentBase(std::shared_ptr<Directory> dir, uint64_t segId, int32_t maxDoc,
+              std::shared_ptr<PostingsReader> opened = nullptr)
+      : dir(std::move(dir)), cell(std::move(opened)), segId(segId), maxDoc(maxDoc) {}
+  // Opens on first use. Throws ApiError UNAVAILABLE ("segment_unavailable")
+  // when the files cannot be opened; a later call retries.
+  std::shared_ptr<PostingsReader> get();
+  std::shared_ptr<PostingsReader> peek() const noexcept { return cell.peek(); }
+};
+
+class SegmentLive {
+  std::shared_ptr<Directory> dir;
+  SharedLazyCell<LiveDocs, false> cell;
+public:
+  const uint64_t segId;
+  const uint64_t liveGen;
+  const int32_t maxDoc;
+  const int32_t liveDocs;
+  SegmentLive(std::shared_ptr<Directory> dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, int32_t liveDocs,
+              std::shared_ptr<LiveDocs> opened = nullptr)
+      : dir(std::move(dir)), cell(std::move(opened)), segId(segId), liveGen(liveGen), maxDoc(maxDoc),
+        liveDocs(liveDocs) {}
+  std::shared_ptr<LiveDocs> get();
+  std::shared_ptr<LiveDocs> peek() const noexcept { return cell.peek(); }
+};
+
+class SegmentOverlay {
+  std::shared_ptr<Directory> dir;
+  SharedLazyCell<AuxReader, true> cell;  // null for an unknown kind, cached
+public:
+  const AuxInfo info;
+  SegmentOverlay(std::shared_ptr<Directory> dir, AuxInfo info, std::shared_ptr<AuxReader> opened = nullptr,
+                 bool openedKnown = false)
+      : dir(std::move(dir)), cell(openedKnown ? SharedLazyCell<AuxReader, true>(std::move(opened))
+                                              : SharedLazyCell<AuxReader, true>()),
+        info(std::move(info)) {}
+  std::shared_ptr<AuxReader> get();
+  std::shared_ptr<AuxReader> peek() const noexcept { return cell.peek(); }
+};
+
   class Segment {
-    const std::shared_ptr<PostingsReader> sharedPostingsReader;
-    const std::shared_ptr<LiveDocs> sharedLiveDocs;
-    const std::vector<std::shared_ptr<AuxReader>> sharedAuxReaders;
+    std::shared_ptr<SegmentBase> physical_;
+    std::shared_ptr<SegmentLive> live_;
+    std::vector<std::shared_ptr<SegmentOverlay>> overlays_;
+    std::shared_ptr<const SegmentSummary> summary_;
+    uint64_t summaryGen_ = 0;
   public:
     friend class IndexReader;
 
@@ -86,7 +140,7 @@ public:
       uint64_t min_version;     // Minimum update version in this segment
       uint64_t max_version;     // Maximum update version in this segment
       uint64_t commit_time;     // first time this segment was committed as part of the index
-      int32_t  max_doc;         // Number of live documents in this segment
+      int32_t  max_doc;         // Number of documents in this segment, deleted ones included
       int32_t  live_docs;       // Number of live documents in this segment
     };
 
@@ -94,44 +148,53 @@ public:
     const int64_t base;           // global index (ordinal/rank) of the first document in this segment with respect to the list of segments
     const int32_t ord;            // index of this segment in the list of segments
 
-    Segment(std::shared_ptr<PostingsReader>&& postingsReader, std::shared_ptr<LiveDocs>&& liveDocs,
-              std::vector<std::shared_ptr<AuxReader>>&& auxReaders,
-              SegmentInfo segInfo, int64_t base, int ord)
-            :  sharedPostingsReader(std::move(postingsReader)), sharedLiveDocs(std::move(liveDocs)),
-                sharedAuxReaders(std::move(auxReaders)),
-                segInfo(segInfo), base(base), ord(ord) {
+    Segment(std::shared_ptr<SegmentBase> physical, std::shared_ptr<SegmentLive> live,
+            std::vector<std::shared_ptr<SegmentOverlay>>&& overlays,
+            std::shared_ptr<const SegmentSummary> summary, uint64_t summaryGen,
+            SegmentInfo segInfo, int64_t base, int ord)
+            : physical_(std::move(physical)), live_(std::move(live)), overlays_(std::move(overlays)),
+              summary_(std::move(summary)), summaryGen_(summaryGen),
+              segInfo(segInfo), base(base), ord(ord) {
     }
 
-    PostingsReader& postingsReader() const noexcept {
-      return *sharedPostingsReader;
+    // Opens the segment's data files on first use.
+    PostingsReader& postingsReader() const {
+      return *physical_->get();
     }
 
     // shared form of postingsReader(): every snapshot holding this physical
     // segment, and the writer, use the one instance
-    std::shared_ptr<PostingsReader> postingsReaderShared() const noexcept {
-      return sharedPostingsReader;
+    std::shared_ptr<PostingsReader> postingsReaderShared() const {
+      return physical_->get();
     }
 
-    // returns null if all docs are live (no deletes)
-    LiveDocs* liveDocs() const noexcept {
-      return sharedLiveDocs.get();
+    // The open reader, or null when the segment has not been opened.
+    PostingsReader* postingsReaderIfOpen() const noexcept {
+      return physical_->peek().get();
+    }
+    bool isOpen() const noexcept { return physical_->peek() != nullptr; }
+
+    bool hasDeletes() const noexcept { return live_ != nullptr; }
+
+    // returns null if all docs are live (no deletes); opens the live-docs file on first use
+    LiveDocs* liveDocs() const {
+      return live_ ? live_->get().get() : nullptr;
     }
 
     // shared form of liveDocs(), for callers that cache views into its mapped bits
-    std::shared_ptr<LiveDocs> liveDocsShared() const noexcept {
-      return sharedLiveDocs;
+    std::shared_ptr<LiveDocs> liveDocsShared() const {
+      return live_ ? live_->get() : nullptr;
     }
 
-    std::span<const std::shared_ptr<AuxReader>> auxReaders() const noexcept {
-      return sharedAuxReaders;
-    }
+    // Every known overlay of the segment, opened.
+    std::vector<std::shared_ptr<AuxReader>> auxReaders() const;
 
-    std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const {
-      for (const auto& r : sharedAuxReaders) {
-        if (r->getName() == name) return r;
-      }
-      return nullptr;
-    }
+    // The overlay `name`, opened on first use; null when absent or unknown.
+    std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const;
+
+    // The segment's summary, or null when it has none readable (pruning then
+    // treats the segment as unknown).
+    const SegmentSummary* summary() const noexcept { return summary_.get(); }
 
     int32_t maxDoc() const noexcept {
       return segInfo.max_doc;
@@ -139,12 +202,12 @@ public:
 
     // Get number of deleted documents
     int32_t numDeletes() const noexcept {
-      return sharedLiveDocs ? sharedLiveDocs->numDeletes() : 0;
+      return segInfo.max_doc - segInfo.live_docs;
     }
 
     // Get number of live documents
     int32_t numLive() const noexcept {
-      return sharedLiveDocs ? sharedLiveDocs->numLive() : segInfo.max_doc;
+      return segInfo.live_docs;
     }
   };
 
@@ -184,9 +247,17 @@ public:
     std::string_view name() const noexcept;
     bool exists() const noexcept;
     size_t size() const noexcept;
+    // False when the segment provably lacks the field (summary or probe);
+    // true when it has it or that is not yet known. Never opens a segment.
+    bool presentIn(size_t segment) const noexcept;
     const Similarity::FieldStats& stats() const;
+    // Totals over the segments of `mask` only, from summaries where the
+    // segment is not open and from its headers otherwise.
+    Similarity::FieldStats stats(const SegmentMask& mask) const;
     // OR of the segment headers' flags, such as segment-format markers.
     FieldType::flag_type flagsUnion() const;
+    // The type every segment persisted the field with; NONE when absent.
+    FieldType::Type persistedType() const;
     bool operator==(const FieldSegments&) const = default;
   };
 
@@ -228,7 +299,7 @@ private:
     mutable SharedLazyCell<OrdMap, true> ordMap;
     size_t bytes;
 
-    FieldRecord(std::string_view name, size_t hash, size_t numSegments, size_t first, int32_t ordinal);
+    FieldRecord(std::string_view name, size_t hash, std::span<const int32_t> initialOrdinals);
     ~FieldRecord();
   };
 
@@ -292,6 +363,8 @@ private:
     std::string incarnation;
     // (segId, ord) of each segment, by segId.
     std::vector<std::pair<uint64_t, int32_t>> segOrds;
+    // The manifest's collection-level summary (IndexInfo.field_summaries).
+    std::shared_ptr<const SegmentSummary> aggregate;
 
     // The segment `segId`, or null.
     const Segment* segment(uint64_t segId) const;
@@ -315,6 +388,11 @@ private:
   };
   const uint64_t snapshotTime;
   const uint64_t snapshotGen;
+  // Keeps this reader's snapshot files from retirement while it lives, so a
+  // lazily opened segment still finds them. Each reader holds its own
+  // snapshot: readers sharing a core differ in files such as live docs.
+  // Declared before `core`, so the files are released after its mappings.
+  std::shared_ptr<void> filesHold;
   const std::shared_ptr<PhysicalCore> core;
   const std::shared_ptr<Schema> sharedSchema;
   const std::shared_ptr<FilterCache> sharedFilterCache;
@@ -328,10 +406,15 @@ private:
   // readers, by manifest segment order), else from `previous` when its files
   // are identical, else is opened; its live docs come from `previous` when
   // their file is identical.
-  static Snapshot openSnapshot(Directory& dir, const IndexReader* previous,
+  // Segments open lazily through `dir`. With `eagerSource` (a follower
+  // install through a VerifiedDirectory), or without a pinned manifest (the
+  // newest durable root may lose files to retirement before a lazy open),
+  // every segment opens now, through `eagerSource` when given.
+  static Snapshot openSnapshot(std::shared_ptr<Directory> dir, const IndexReader* previous,
                                std::shared_ptr<Schema> schema,
                                std::shared_ptr<const std::vector<std::byte>> manifest,
-                               std::span<const std::weak_ptr<PostingsReader>> published = {});
+                               std::span<const std::weak_ptr<PostingsReader>> published = {},
+                               Directory* eagerSource = nullptr);
 
   IndexReader(Snapshot snapshot,
               std::shared_ptr<FilterCache> filterCache);
@@ -434,11 +517,23 @@ public:
 
   // Opens a published snapshot, reusing what it shares with previousReader
   // and the readers its publisher holds open (CommitSnapshot::openReaders).
+  // `hold` keeps the snapshot's files for this reader's lifetime (see
+  // CommitSnapshotRegistry::hold); segments open lazily unless `eagerSource`
+  // is given.
+  IndexReader(std::shared_ptr<Directory> dir, const CommitSnapshot& snapshot, IndexReader* previousReader = nullptr,
+              std::shared_ptr<FilterCache> filterCache = nullptr, std::shared_ptr<void> hold = nullptr,
+              Directory* eagerSource = nullptr);
+  // As above over a borrowed directory, opening every segment now.
   IndexReader(Directory& dir, const CommitSnapshot& snapshot, IndexReader* previousReader = nullptr,
               std::shared_ptr<FilterCache> filterCache = nullptr);
-  // Direct tools/tests: the newest durable root, or an empty index.
+  // Direct tools/tests: the newest durable root, or an empty index, every
+  // segment opened now.
   explicit IndexReader(Directory& dir, IndexReader* previousReader = nullptr,
                        std::shared_ptr<FilterCache> filterCache = nullptr);
+
+  // The collection-level summary of this snapshot, or null when the manifest
+  // carries none.
+  const SegmentSummary* collectionSummary() const noexcept { return core->aggregate.get(); }
 };
 
 }

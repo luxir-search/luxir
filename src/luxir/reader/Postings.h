@@ -129,6 +129,11 @@ public:
     return s;
   }
 
+  /// Header of a segment summary sidecar (SegmentSummary), the file of the
+  /// "segment_summary" overlay; the digits version its layout independently
+  /// of the data-file format.
+  static constexpr std::string_view SUMMARY_HEADER = "LUXIRSM1";
+
   /// A file that contains deletes for the segment.  deleteGen==0 implies no deletes.
   static std::string getLiveDocsFileName(const std::string_view gen, uint64_t liveGen) {
     std::string s = std::string(PREFIX_FNAME).append(gen);

@@ -161,6 +161,7 @@ public:
       fieldInfo.type = fieldType->persistedType();
       fieldInfo.flags = fieldType->segmentFlags();
       fieldInfo.typeFlags = fieldType->segmentTypeFlags();
+      postingsWriter.summaryFor(fieldInfo, fieldType->summary);
       OrdCollector ords(guard.pool(), inverter.getMaxDoc());
       inverter.noteFlushWorkspace(ords.slotBytes());
 

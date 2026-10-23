@@ -16,6 +16,7 @@
 #include "Query.h"
 #include "luxir/reader/NormsReader.h"
 #include "luxir/util/luxir_util.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -86,6 +87,10 @@ public:
     checkedBoostProduct(multiplier, boost);
   }
 
+  MatchState mayMatch(const SummaryView& view) const override {
+    return summary::termMatch(view, field, term);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
@@ -120,38 +125,38 @@ public:
       // Filter-style terms match normally but always score 0.
       if (!needScores) traits |= IS_CONSTANT_SCORING;
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
+      // Statistics follow the mask unless global_stats asks for every
+      // segment; only the segments they cover are seeked.
+      const SegmentMask& stats = context.planningContext().statsMask(viable);
       if (cachedFieldInfo != nullptr) {
-        cachedTermInfo = context.getCachedTerminfo(*cachedFieldInfo, query.getTerm());
+        cachedTermInfo = context.getCachedTerminfo(*cachedFieldInfo, query.getTerm(), &stats);
       }
       // Only set up the BM25 sim scorer when this clause's score is actually
       // read. FuzzyQuery injects blended stats per clause, so those scorers are
-      // weight-local; normal term queries keep sharing the cached scorer.
+      // weight-local; normal term queries keep sharing the cached scorer when
+      // nothing was pruned.
       if (needScores && cachedTermInfo != nullptr) {
-        if (!query.hasInjectedStats()) simScorer = cachedTermInfo->simScorer;
+        bool shared = !query.hasInjectedStats() && stats.isAll();
+        if (shared) simScorer = cachedTermInfo->simScorer;
         if (simScorer == nullptr) {
           // Segments decide norms, as in the supplier; the schema may no longer
-          // list a field that older segments still hold.
-          bool hasNorms = false;
-          const auto& segInfos = cachedFieldInfo->segInfos;
-          for (size_t i = 0; i < segInfos.size(); i++) {
-            if (const auto* info = segInfos.at(i)) {
-              hasNorms = info->type == FieldType::TEXT;
-              break;
-            }
-          }
+          // list a field that older segments still hold. The persisted totals
+          // come from summaries where they can, so no segment is opened here.
+          bool hasNorms = cachedFieldInfo->segInfos.persistedType() == FieldType::TEXT;
+          Similarity::TermStats termStats = query.hasInjectedStats()
+              ? query.scoringTermStats(*cachedTermInfo) : cachedTermInfo->statsOver(stats);
           simScorer = context.pool.make<luxir::Similarity::BM25Scorer>(
               luxir::Similarity().getScorer(
-                  1.0f, cachedFieldInfo->fieldStats, query.scoringTermStats(*cachedTermInfo),
-                  hasNorms));
-          if (!query.hasInjectedStats()) cachedTermInfo->simScorer = simScorer;
+                  1.0f, cachedFieldInfo->statsOver(stats), termStats, hasNorms));
+          if (shared) cachedTermInfo->simScorer = simScorer;
         }
       }
     }
 
 
     Query::Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
-      if (cachedTermInfo == nullptr) {
-        // term doesn't exist in any segment
+      if (cachedTermInfo == nullptr || excludesSegment(segment.ord)) {
+        // term doesn't exist in any segment, or this one was pruned
         return nullptr;
       }
       luxir::DocsFreqEnum* docsEnum = cachedTermInfo->useDocsEnum<DocsEnumTier::FREQS>(
@@ -180,7 +185,7 @@ public:
 
     // A missing term is empty under any domain; otherwise docFreq is exact
     // only when eligibility does not restrict the segment.
-    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
       int64_t docs = cachedTermInfo ? cachedTermInfo->docFreq(segment.ord) : 0;
       return countBound(segment, domain, docs, CountHow::METADATA);
     }
@@ -277,7 +282,7 @@ public:
       BulkPlan planBulk(
           BulkUse use, const BulkScorerContext& bulkContext) override {
         if (bulkContext.requireConstantCount) {
-          if (segment.liveDocs() != nullptr) {
+          if (segment.hasDeletes()) {
             return {
               BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
               BulkAnswer::NO,

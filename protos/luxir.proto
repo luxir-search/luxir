@@ -23,6 +23,12 @@ service Searcher {
   // Each request produces one or more responses, ending with more=false.
   // Use request_id to correlate responses when sending multiple requests.
   rpc Search(stream SearchRequest) returns (stream SearchResponse) {}
+
+  // Whether the collection may hold a match for the request's query-bearing
+  // ops, from its manifest summaries alone: no segment is opened. A router
+  // over time- or tenant-partitioned collections asks this before searching.
+  // With `profile` set, the pruned segments of the pinned snapshot are listed.
+  rpc CanMatch(SearchRequest) returns (CanMatchResponse) {}
 }
 
 service Admin {

@@ -610,7 +610,7 @@ private:
   // Known paths answer a wrong method with 405 and an Allow header; only an
   // unknown path is 404.  A read-only node then refuses mutations with 403.
   enum class Route {
-    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, UPDATE, STATS, METRICS, SCHEMA,
+    NONE, HEALTH, TENANT_LIST, COLLECTION_LIST, COLLECTION_CREATE, COLLECTION_DELETE, SEARCH, CAN_MATCH, UPDATE, STATS, METRICS, SCHEMA,
     REPLICATION_STATUS, REPLICATION_WATCH, REPLICATION_SNAPSHOT, REPLICATION_FILE, REPLICATION_INSTALLED
   };
 
@@ -696,7 +696,7 @@ private:
     metricErrorKind.store(-1, std::memory_order_relaxed);
     MetricOperation operation = MetricOperation::OTHER;
     switch (route_.route) {
-      case Route::SEARCH: operation = MetricOperation::SEARCH; break;
+      case Route::SEARCH: case Route::CAN_MATCH: operation = MetricOperation::SEARCH; break;
       case Route::UPDATE: operation = MetricOperation::UPDATE; break;
       case Route::SCHEMA: operation = MetricOperation::SCHEMA; break;
       case Route::STATS: case Route::METRICS: operation = MetricOperation::STATS; break;
@@ -1424,6 +1424,8 @@ private:
       m.route = Route::REPLICATION_FILE; m.allow = "GET, HEAD";
     } else if (parseSearchPath(target, m.coll)) {
       m.route = Route::SEARCH; m.allow = "GET, POST";
+    } else if (parseCollectionPath(target, "/_can_match", m.coll)) {
+      m.route = Route::CAN_MATCH; m.allow = "GET, POST"; m.prettyDefault = true;
     } else if (parseUpdatePath(target, m.coll)) {
       m.route = Route::UPDATE; m.allow = "POST";
     } else if (target == "/_stats" || parseStatsPath(target, m.coll)) {
@@ -1439,7 +1441,7 @@ private:
       else if (path == "installed") { m.route = Route::REPLICATION_INSTALLED; m.allow = "POST"; }
       return m;
     }
-    bool collectionRoute = m.route == Route::SEARCH || m.route == Route::UPDATE ||
+    bool collectionRoute = m.route == Route::SEARCH || m.route == Route::CAN_MATCH || m.route == Route::UPDATE ||
                            m.route == Route::STATS || m.route == Route::SCHEMA ||
                            m.route == Route::REPLICATION_SNAPSHOT || m.route == Route::REPLICATION_FILE;
     m.emptyCollection = collectionRoute && m.coll.empty() && target.starts_with("/collections/");
@@ -1566,6 +1568,23 @@ private:
         }
         break;
       }
+      case Route::CAN_MATCH: {
+        // The search body and URL overlay, answered from the manifest alone.
+        SearchUrlOverlay overlay;
+        std::string overlayErr;
+        if (!parseSearchUrlOverlay(params, overlay, overlayErr)) {
+          respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, overlayErr));
+          return;
+        }
+        bool segments = false;
+        std::string err;
+        if (!parseBoolParam(params, "segments", segments, err)) {
+          respondError(ErrorInfo::of(ErrorKind::INVALID_REQUEST, err));
+          return;
+        }
+        handleCanMatch(req.body(), coll, overlay, segments);
+        break;
+      }
       case Route::UPDATE:
         handleUpdate(std::move(req.body()), coll, updateUrl_);
         break;
@@ -1686,6 +1705,43 @@ private:
           throw ApiError(ErrorKind::INTERNAL, "internal", "failed to serialize resolved fields");
         }
         out = "{\"request\":" + out + ",\"resolved_fields\":" + targets + "}";
+      }
+    } catch (const std::exception& e) {
+      respondException(e, ErrorKind::INVALID_REQUEST);
+      return;
+    }
+    respondJson(http::status::ok, std::move(out));
+  }
+
+  // POST /collections/{c}/_can_match: the collection-level pruning verdict for
+  // a search body (SearchEngine::canMatch). ?segments=true also lists the
+  // segment ids of the pinned snapshot that no op can match.
+  void handleCanMatch(const std::string& body, const std::string& coll,
+                      const SearchUrlOverlay& overlay, bool segments) {
+    HttpSearchRequestState state;
+    std::string out;
+    try {
+      parseEffectiveRequest(body, coll, overlay, state);
+      requestId_ = std::string(state.proto.request_id);
+      auto result = node_.getSearchEngine().canMatch(state.proto, tenant_, segments);
+      std::pmr::monotonic_buffer_resource arena;
+      api::CanMatchResponse response;
+      response.verdict = result.mayMatch ? api::CanMatchResponse::Verdict::MAY_MATCH
+                                         : api::CanMatchResponse::Verdict::NO_MATCH;
+      response.commit = result.commit;
+      response.summary_complete = result.summaryComplete;
+      response.segments = result.segments;
+      auto* ops = api::build::allocArray(response.ops, result.ops.size(), arena);
+      for (size_t i = 0; i < result.ops.size(); i++) {
+        ops[i].op = result.ops[i].name;
+        ops[i].verdict = result.ops[i].mayMatch ? api::CanMatchResponse::Verdict::MAY_MATCH
+                                                 : api::CanMatchResponse::Verdict::NO_MATCH;
+        ops[i].reason = result.ops[i].reason;
+      }
+      auto* pruned = api::build::allocArray(response.pruned_segments, result.prunedSegments.size(), arena);
+      for (size_t i = 0; i < result.prunedSegments.size(); i++) pruned[i] = result.prunedSegments[i];
+      if (!api::write_json(response, out)) {
+        throw ApiError(ErrorKind::INTERNAL, "internal", "failed to serialize can-match response");
       }
     } catch (const std::exception& e) {
       respondException(e, ErrorKind::INVALID_REQUEST);

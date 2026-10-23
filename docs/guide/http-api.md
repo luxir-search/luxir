@@ -15,6 +15,7 @@ credentials. Administration and snapshot routes may name another tenant under
 |---|---|
 | `GET /health` | Process liveness. |
 | `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
+| `GET` or `POST /collections/{collection}/_can_match` | Whether the collection may hold a match for a search body, from its manifest summaries alone, without opening a segment; `segments=true` lists the segment ids nothing can match. See [Segment summaries](../design/segment-summaries.md#collection-level-can-match). |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
 | `GET /collections/{collection}/_schema` | Read the authored schema. |
 | `GET /collections/{collection}/_schema?view=resolved` | Read physical representations, bindings, and conservative schema coverage; HTTP only. |
@@ -131,6 +132,15 @@ metadata, in both envelope and docs formats. It does not apply to doubles.
 Clients using this flag must accept either a number or a string for a 64-bit
 value. Setting or clearing the flag on any operation is an error. Binary gRPC
 responses retain their integer types.
+
+`global_stats` makes BM25 scoring use statistics from every segment. By
+default a query skips segments its summaries prove cannot match, and its term
+and field statistics cover only the remaining segments, so a score can change
+with how documents are spread across segments. With `global_stats` the
+statistics match an unpruned execution exactly; terms are then looked up in
+the pruned segments too, which opens them. Matching is unchanged either way.
+It is valid on the request and on any operation, for example
+`"flags": ["global_stats"]`.
 
 ### Explain modes
 

@@ -47,6 +47,10 @@ public:
     return child->requiredValueEnvelope(field);
   }
 
+  MatchState mayMatch(const SummaryView& view) const override {
+    return child->mayMatch(view);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
@@ -97,12 +101,13 @@ public:
   public:
     Weight(Context& context, ForcePrepareQuery& query, int32_t flags, float multiplier)
       : Query::Weight(context, query, flags) {
+      Context::MaskScope maskScope(context, viable);
       childWeight = query.child->createWeight(context, flags, multiplier);
       // Forces prepare; scoring behavior is otherwise the child's.
       traits |= NEEDS_PREPARE | (childWeight->getFlags() & IS_CONSTANT_SCORING);
     }
 
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
       prepareCallsForTests.fetch_add(1, std::memory_order_relaxed);
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
@@ -131,7 +136,7 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    CountShortcut countShortcut(
+    CountShortcut countShortcutImpl(
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }

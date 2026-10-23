@@ -16,6 +16,7 @@
 #include "QueryStats.h"
 #include "luxir/reader/FilteredTermsEnum.h"
 #include "luxir/util/screaming.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -35,6 +36,14 @@ public:
     : Query(kind), field(field) {}
 
   std::string_view getField() const { return field; }
+
+  // Expansions are unknown without the dictionary; only field absence proves
+  // emptiness. Subclasses with bounded shapes (prefix, range, set) refine this.
+  MatchState mayMatch(const SummaryView& view) const override {
+    MatchState state;
+    summary::requireField(view, field, state);
+    return state;
+  }
 
   // Build the per-segment filtered term iterator.
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;
@@ -386,7 +395,7 @@ public:
         const ExpansionFacts& facts, ExpansionMode mode) {
       unused(facts.sumDocFreq);
       if (facts.matchState == Query::MatchState::EMPTY) return nullptr;
-      int32_t maxDoc = segment.postingsReader().maxDoc();
+      int32_t maxDoc = segment.maxDoc();
       if (mode == ExpansionMode::EAGER) {
         return targetPool.make<MultiTermQuery::Scorer>(
             materializeEagerBitset(targetPool, facts, maxDoc), maxDoc, boost);
@@ -635,6 +644,7 @@ public:
     Query::Scorer* createScorer(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       auto* supplier = scorerSupplier(targetPool, segment);
+      if (supplier == nullptr) return nullptr;
       Query::PlanContext planContext = scorerBuildContext(
           std::numeric_limits<int64_t>::max());
       return supplier->resolve(targetPool, planContext)->build(targetPool);

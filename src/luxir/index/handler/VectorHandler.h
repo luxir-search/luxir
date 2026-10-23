@@ -35,6 +35,7 @@ namespace luxir::handler {
 /// per-segment fixed-size constraint real even if its doc is later deleted.
 class VectorHandler final : public StrColHandler {
   int32_t dims_ = 0;          // 0 until first value appended (or set from schema)
+  FieldSummaryCollector::Vectors vectorStats;  // centroid and box of the stored vectors
   int32_t pendingDims_ = 0;   // dims learned from the current value, not yet appended
   VectorFieldType::Metric metric = VectorFieldType::METRIC_NONE;
   bool trustNormalized = false;
@@ -160,8 +161,17 @@ private:
         for (float& x : vec) x *= invNorm;
       }
     }
+    // The stored vector, after truncation and normalization.
+    FieldSummaryCollector::accumulate(vectorStats, vec);
     return true;
   }
+
+protected:
+  void fillSummary(FieldSummaryCollector& collector) override {
+    collector.vectors = std::move(vectorStats);
+  }
+
+public:
 
   static std::string_view bytesOf(std::span<const float> vec) {
     return std::string_view((const char*)vec.data(), vec.size_bytes());

@@ -10,6 +10,7 @@
 
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/PhraseQuery.h"
+#include "luxir/query/QueryPruning.h"
 #include "luxir/query/QueryShape.h"
 #include "luxir/query/TermQuery.h"
 #include "test/CollectionHelper.h"
@@ -25,7 +26,10 @@ public:
   std::shared_ptr<IndexReader> reader;
   MemPool pool;
 
+  // Shapes of the suppliers themselves: segment pruning would answer a
+  // missing term before any supplier exists.
   PhraseCapabilityShapeTest() {
+    QueryPruning::disableForTests = true;
     EXPECT_TRUE(helper.indexAll(
         {flatdoc("id", "0", "body_w", "common rare r x r"),
          flatdoc("id", "1", "body_w", "common"),
@@ -34,6 +38,7 @@ public:
         UpdateMessage::COMMIT).success);
     reader = helper.getIndexWriter()->snapshots.readers.getReader();
   }
+  ~PhraseCapabilityShapeTest() override { QueryPruning::disableForTests = false; }
 
   Query::ScorerShape shape(
       std::span<std::string_view> terms,

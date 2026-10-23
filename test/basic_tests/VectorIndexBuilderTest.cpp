@@ -340,8 +340,12 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   ASSERT_GT(fileSize, 0u);
   auto stats = h.getIndexWriter()->stats(true);
   ASSERT_EQ(1u, stats.segmentStats.size());
-  ASSERT_EQ(1u, stats.segmentStats[0].overlays.size());
-  EXPECT_EQ(fileSize, stats.segmentStats[0].overlays[0].bytes);
+  // The segment summary is an overlay too; find the vector one.
+  const auto& overlays = stats.segmentStats[0].overlays;
+  ASSERT_EQ(2u, overlays.size());
+  auto vector = std::ranges::find(overlays, aux.files[0].name, [](const auto& o) { return o.files.at(0); });
+  ASSERT_NE(overlays.end(), vector);
+  EXPECT_EQ(fileSize, vector->bytes);
 }
 
 // The mmap-lists layout must serve identically whether the aux file's memory

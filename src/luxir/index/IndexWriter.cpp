@@ -1403,6 +1403,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     auto& postings = inverter.getPostingsWriter();
     if (auto& range = postings.idRange) segInfo->idRange.store(std::make_shared<const IdRange>(std::move(*range)));
     segInfo->idDictionaryBlocks.store(postings.idDictionaryBlocks.value_or(0));
+    writeSegmentSummary(*segInfo, postings);
     // Set liveDocs + liveGen for deleted docs from errors during indexing
     if (inverter.liveGen > 0) {
       liveDocsBytesWritten += LiveDocsWriter::fileBytes(segInfo->maxDoc);
@@ -2418,8 +2419,69 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
   }
   auto* aux = api::build::allocArray(info.aux_indexes, auxIndexes.size(), arena);
   for (size_t i = 0; i < auxIndexes.size(); i++) aux[i] = toWire(auxIndexes[i], arena);
+  {
+    const auto& aggregate = collectionSummary(segs, commitInfo.coreGen);
+    info.field_summaries = toWire(aggregate.fields, arena);
+    info.summary_complete = aggregate.complete;
+  }
   publish(info, arena);
   return info.commit_time;
+}
+
+void IndexWriter::writeSegmentSummary(SegInfo& seg, PostingsWriter& pwriter) noexcept {
+  if (SegmentSummaryBuilder::disableForTests) return;
+  try {
+    // Written once per segment under its own name, so it takes no
+    // generation from the overlays that get rebuilt (vector indexes).
+    uint64_t gen = 0;
+    std::string fileName = SegmentSummary::overlayFileName(seg.segId, gen);
+    FileDescriptor descriptor;
+    auto summary = pwriter.summary.write(dir, fileName, seg.segId, seg.maxDoc, true, descriptor);
+    AuxInfo info;
+    info.kind = std::string(SegmentSummary::OVERLAY_KIND);
+    info.name = std::string(SegmentSummary::OVERLAY_NAME);
+    info.gen = gen;
+    info.files.push_back(descriptor);
+    seg.unsyncedFiles.push_back(fileName);
+    seg.auxOverlays.push_back(std::move(info));
+    seg.summary.store(std::move(summary));
+  } catch (const std::exception& e) {
+    LOG_WARN("Segment summary not written for seg={}: {}", seg.segId, e.what());
+  } catch (...) {
+    LOG_WARN("Segment summary not written for seg={}: unknown exception", seg.segId);
+  }
+}
+
+std::shared_ptr<const SegmentSummary> IndexWriter::segmentSummary(SegInfo& seg) noexcept {
+  if (auto loaded = seg.summary.load()) return loaded;
+  const AuxInfo* overlay = nullptr;
+  for (const auto& candidate : seg.auxOverlays) {
+    if (candidate.kind == SegmentSummary::OVERLAY_KIND && (overlay == nullptr || candidate.gen > overlay->gen)) {
+      overlay = &candidate;
+    }
+  }
+  if (overlay == nullptr || overlay->files.empty()) return nullptr;
+  try {
+    auto summary = SegmentSummary::open(dir, overlay->files.front().name, true);
+    if (summary) seg.summary.store(summary);
+    return summary;
+  } catch (const std::exception& e) {
+    LOG_WARN("Segment summary unreadable for seg={}: {}", seg.segId, e.what());
+    return nullptr;
+  }
+}
+
+const IndexWriter::AggregateCache& IndexWriter::collectionSummary(std::span<SegInfo*> segs, uint64_t coreGen) {
+  std::lock_guard lock(aggregateMutex);
+  if (aggregateCache.coreGen == coreGen) return aggregateCache;
+  std::vector<std::shared_ptr<const SegmentSummary>> summaries;
+  summaries.reserve(segs.size());
+  for (SegInfo* seg : segs) summaries.push_back(segmentSummary(*seg));
+  bool complete = false;
+  aggregateCache.fields = SummaryAggregator::aggregate(summaries, complete);
+  aggregateCache.complete = complete;
+  aggregateCache.coreGen = coreGen;
+  return aggregateCache;
 }
 
 bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge) {
@@ -2716,6 +2778,8 @@ bool IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       pwriter.finish(&newSegInfo->unsyncedFiles, &newSegInfo->files);
       if (pwriter.idRange) newSegInfo->idRange.store(std::make_shared<const IdRange>(std::move(*pwriter.idRange)));
       if (pwriter.idDictionaryBlocks) newSegInfo->idDictionaryBlocks.store(*pwriter.idDictionaryBlocks);
+      phase = "segment_summary";
+      writeSegmentSummary(*newSegInfo, pwriter);
 
       phase = "active_overlay_snapshot";
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();

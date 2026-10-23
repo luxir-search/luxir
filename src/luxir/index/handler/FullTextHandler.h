@@ -175,6 +175,7 @@ public:
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
     fieldInfo.typeFlags = fieldType->segmentTypeFlags();
+    inverter.getPostingsWriter().summaryFor(fieldInfo, fieldType->summary);
 
     auto preparedNorms = NormsWriter::prepare(inverter.pool, inverter.getPostingsWriter(),
                                               fieldInfo, normBytes, normDocsWithField,

@@ -14,6 +14,7 @@
 #include "Query.h"
 #include "TermQuery.h"
 #include "luxir/reader/NormsReader.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -48,6 +49,14 @@ public:
   std::span<const std::string_view> getFields() const { return fields; }
   std::span<const float> getWeights() const { return weights; }
   std::string_view getTerm() const { return term; }
+
+  // A match in any field keeps the segment; every field must reject it.
+  MatchState mayMatch(const SummaryView& view) const override {
+    for (std::string_view field : fields) {
+      if (summary::termMatch(view, field, term) != MatchState::EMPTY) return MatchState::UNKNOWN;
+    }
+    return MatchState::EMPTY;
+  }
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const CombinedFieldQuery&>(other);
@@ -200,17 +209,18 @@ public:
       int64_t docFreq = 0;
       double sumTotalTermFreq = 0.0;
       bool anyTerm = false;
+      const SegmentMask& statsMask = context.planningContext().statsMask(viable);
       for (size_t i = 0; i < n; i++) {
         fieldInfos[i] = context.getCachedFieldInfo(query.fields[i]);
         termInfos[i] = nullptr;
         if (fieldInfos[i] == nullptr) continue;
-        const auto& stats = fieldInfos[i]->fieldStats;
+        Similarity::FieldStats stats = fieldInfos[i]->statsOver(statsMask);
         docCount = std::max(docCount, stats.docsWithField);
         sumTotalTermFreq += (double)query.weights[i] * (double)stats.sumTotalTermFreq;
-        termInfos[i] = context.getCachedTerminfo(*fieldInfos[i], query.term);
+        termInfos[i] = context.getCachedTerminfo(*fieldInfos[i], query.term, &statsMask);
         if (termInfos[i] != nullptr) {
           anyTerm = true;
-          docFreq = std::max(docFreq, termInfos[i]->termStats.docFreq);
+          docFreq = std::max(docFreq, termInfos[i]->statsOver(statsMask).docFreq);
         }
       }
       if (anyTerm && docCount > 0) {
@@ -280,7 +290,7 @@ public:
     }
 
     Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
-      if (simScorer == nullptr) return nullptr;
+      if (simScorer == nullptr || excludesSegment(segment.ord)) return nullptr;
       size_t n = query.fields.size();
       size_t numPostings = 0;
       size_t numNorms = 0;

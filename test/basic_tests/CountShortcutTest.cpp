@@ -6,6 +6,7 @@
 #include "luxir/query/AllQuery.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/BoostQuery.h"
+#include "luxir/query/QueryPruning.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ExistsQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
@@ -426,10 +427,28 @@ TEST_P(CountShortcutTest, geoWholeCountsKeepCacheRouting) {
 
 TEST_P(CountShortcutTest, executionCanDiscoverEmptyChildren) {
   MemPool pool;
-  Query::Context context(pool, *reader);
   TermQuery term("body_w", "alpha");
   GeoBoxQuery emptyGeo("geo", 80, 85, 100, 110);
   NumericPredicateQuery emptyPoints("number", 0, 0);
+  {
+    // Summaries prove both empty children absent at planning; counts agree.
+    Query::Context pruned(pool, *reader);
+    for (Query* empty : std::array<Query*, 2>{&emptyGeo, &emptyPoints}) {
+      std::array<Query*, 2> clauses{&term, empty};
+      BooleanQuery query({}, clauses, {}, {});
+      auto* weight = query.createWeight(pruned, 0);
+      auto* termWeight = term.createWeight(pruned, 0);
+      for (auto& segment : reader->segments()) {
+        auto count = QueryPrep::supplierCount(weight->scorerSupplier(pool, segment));
+        ASSERT_TRUE(count);
+        EXPECT_EQ(termWeight->countShortcut(segment, nullptr).maxMatches, *count);
+      }
+    }
+  }
+  // Without those proofs execution itself must discover the empty children.
+  QueryPruning::disableForTests = true;
+  auto restore = scope_guard([]() noexcept { QueryPruning::disableForTests = false; });
+  Query::Context context(pool, *reader);
   auto* numeric = emptyPoints.createWeight(context, 0);
   for (auto& segment : reader->segments()) {
     auto shortcut = numeric->countShortcut(segment, nullptr);

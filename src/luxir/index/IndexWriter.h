@@ -5,6 +5,7 @@
 #include "luxir/util/Metrics.h"
 
 #include <atomic>
+#include <limits>
 #include <deque>
 #include <optional>
 #include <string>
@@ -15,6 +16,8 @@
 #include <oneapi/tbb/flow_graph.h>
 #include <oneapi/tbb/task_arena.h>
 #include "luxir/index/AuxInfo.h"
+#include "luxir/index/SegmentSummary.h"
+#include "luxir/index/SummaryInfo.h"
 #include "CommitSnapshotRegistry.h"
 #include "luxir/index/IndexRamBudget.h"
 #include "luxir/util/ApiError.h"
@@ -74,6 +77,10 @@ public:
     // Null until known; once populated, the physical dictionary's bounds never change.
     std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
     std::atomic<uint64_t> idDictionaryBlocks = UINT64_MAX;
+
+    // The segment's summary (its "segment_summary" overlay), loaded from the
+    // sidecar on demand after a reopen; null when the segment has none.
+    std::atomic<std::shared_ptr<const SegmentSummary>> summary = nullptr;
 
     // Schema generation this segment was indexed under.
     uint64_t schemaGen = 0;
@@ -825,6 +832,23 @@ private:
   void activateVectorOverlayNames(std::span<const std::string> names);
   std::vector<std::string> snapshotActiveVectorOverlayNames();
   uint64_t nextSegmentOverlayGen(SegInfo& seg);
+  // Writes the segment summary sidecar `pwriter` collected and registers it
+  // as the segment's "segment_summary" overlay. A failure leaves the segment
+  // without a summary (pruning then treats it as unknown) and never fails
+  // the flush or merge.
+  void writeSegmentSummary(SegInfo& seg, PostingsWriter& pwriter) noexcept;
+  // The segment's summary, opened from its overlay file when not yet loaded.
+  std::shared_ptr<const SegmentSummary> segmentSummary(SegInfo& seg) noexcept;
+  // The collection aggregate for a commit over `segs`, recomputed only when
+  // the segment composition changed.
+  struct AggregateCache {
+    uint64_t coreGen = std::numeric_limits<uint64_t>::max();
+    std::vector<OwnedFieldSummary> fields;
+    bool complete = false;
+  };
+  std::mutex aggregateMutex;
+  AggregateCache aggregateCache;
+  const AggregateCache& collectionSummary(std::span<SegInfo*> segs, uint64_t coreGen);
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
       PostingsReader& postingsReader,

@@ -683,7 +683,7 @@ public:
     };
 
   public:
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
       return query.groups ? prepareUnit<true>(ctx) : prepareUnit<false>(ctx);
     }
 
@@ -720,6 +720,7 @@ public:
       auxName.append(query.getField());
       if (!query.getExact()) {
         for (size_t i = 0; i < numSegs; i++) {
+          if (excludesSegment((int32_t)i)) continue;
           auto aux = reader.segments()[i].getAuxReader(auxName);
           if (!aux) continue;
           auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
@@ -752,6 +753,7 @@ public:
         && !query.getFieldType().normalized()
         && !query.getFieldType().normalizeOnWrite();
       for (size_t i = 0; i < numSegs; i++) {
+        if (excludesSegment((int32_t)i)) continue;
         int64_t segCount = 0;
         if (segInfos.at(i) != nullptr) {
           // FIXED_SIZE vector column.  numVectors == #docs-with-field for
@@ -789,7 +791,7 @@ public:
               }
             }
             IndexReader::Segment& seg = reader.segments()[i];
-            if (vauxPerSeg[i] != nullptr && seg.liveDocs() != nullptr) {
+            if (vauxPerSeg[i] != nullptr && seg.hasDeletes()) {
               // Rank-space liveness bitmap, cached on the aux reader per
               // liveDocs generation; fetched here so a (rare) rebuild runs
               // while the scratch column readers it walks are alive.
@@ -868,7 +870,7 @@ public:
         // is the complete eligibility predicate; null means no deletes and
         // no filters.  The engines rely on it - they never re-check
         // liveDocs.
-        assert(domain != nullptr || seg.liveDocs() == nullptr);
+        assert(domain != nullptr || !seg.hasDeletes());
         VectorAuxReader* vaux = vauxPerSeg[i];
         if (vaux != nullptr) {
           if (vaux->getDims() != dims) {

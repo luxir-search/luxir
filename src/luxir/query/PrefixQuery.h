@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include "MultiTermQuery.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -33,6 +34,10 @@ public:
   }
 
   std::string_view getPrefix() const { return prefix; }
+
+  MatchState mayMatch(const SummaryView& view) const override {
+    return summary::prefixMatch(view, field, prefix);
+  }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {

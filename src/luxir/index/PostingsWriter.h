@@ -35,6 +35,7 @@
 #include "luxir/util/Signal.h"
 #include "LiveDocsWriter.h"
 #include "VersionRunBuilder.h"
+#include "SummaryCollector.h"
 
 
 namespace luxir {
@@ -60,12 +61,29 @@ public:
 
   // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.
   struct IndexFieldInfo : public SegFieldInfo {
+    // The field's segment summary collector, index-time only (never
+    // serialized); null until a writer registers one with summaryFor().
+    FieldSummaryCollector* summary = nullptr;
   };
 
   // The id field's bounds, captured when its dictionary is finalized. Absent
   // when no finalized dictionary was written for it; callers then derive them.
   std::optional<IdRange> idRange;
   std::optional<uint64_t> idDictionaryBlocks;
+
+  // The segment summary under construction: per-field collectors fed by the
+  // field writers, finalized with the field directory in finish(). The owner
+  // writes the sidecar afterwards (IndexWriter::writeSegmentSummary).
+  SegmentSummaryBuilder summary;
+
+  // The collector of `fi`, registered on first use with `policy`. Call after
+  // fi.type and fi.flags are set.
+  FieldSummaryCollector& summaryFor(IndexFieldInfo& fi, const SummaryPolicy& policy) {
+    if (fi.summary == nullptr) {
+      fi.summary = &summary.field(std::string_view(fi.fieldname), fi.type, fi.flags, policy);
+    }
+    return *fi.summary;
+  }
 
 private:
   Directory& directory;
@@ -343,6 +361,7 @@ public:
     // Do this for non-debug mode as well?
     assert(freeFiles.size() == files.size());
     Signal::emit("postingsBeforeCollapse", this);
+    finalizeSummary();
     std::vector<uint32_t> survivorFileNums = collapseFiles();
     writeFieldIndex();
     writeSegmentInfo(survivorFileNums);
@@ -382,6 +401,26 @@ public:
     files.resize(0);
     assert(delegatedRamBytes == 0);
     return true;
+  }
+
+  // Every field of the directory, stored-field resources included, gets a
+  // summary record carrying the directory's counts and BM25 totals, so a
+  // field without a record provably is not in the segment.
+  void finalizeSummary() {
+    for (auto& fi : fieldInfos) {
+      FieldSummaryCollector& collector = summaryFor(fi, SummaryPolicy{});
+      collector.type = fi.type;
+      collector.flags = fi.flags;
+      collector.typeFlags = fi.typeFlags;
+      bool column = (fi.flags & FieldType::COLUMN_STORED) != 0;
+      collector.setCounts((uint64_t)std::max<int32_t>(0, fi.docsWithField),
+                          column ? (uint64_t)std::max<int64_t>(0, fi.numValues) : 0, column,
+                          (fi.flags & FieldType::MULTI_VALUED) != 0);
+      if (fi.flags & FieldType::INDEX_DOCS) {
+        collector.setHeaderTotals((uint64_t)std::max<int64_t>(0, fi.sumDocFreq),
+                                  (uint64_t)std::max<int64_t>(0, fi.sumTotalTermFreq));
+      }
+    }
   }
 
   void setMaxDoc(int max) {
@@ -667,6 +706,7 @@ public:
     int64_t nTerms = 0;
     int32_t nBlocks = 0;
     bool mayHaveFitted = false;  // some kept term could be a fitted long value
+    std::optional<TermKeyCollector> keys;  // the run's distinct terms for the segment summary
   };
 
   static std::string separatorKey(std::string_view previous, std::string_view first) {
@@ -775,6 +815,9 @@ private:
   int64_t sumDocFreq = 0; // updated in endTerm
   int64_t numTerms; // currently only updated in flushTerms
   bool mayHaveFitted = false; // set in endTerm for kept terms of MIN_FITTED_LEN bytes or more
+  // Summary term keys of the current run, when the field's summary policy
+  // collects terms (startField from the field's collector, or setSummaryPolicy).
+  std::optional<TermKeyCollector> keys;
 
   // TODO: pool allocate this
   std::vector<char> compressed_output;
@@ -1263,6 +1306,8 @@ public:
     posLoc = posOutput.size();
     numTerms = 0;
     mayHaveFitted = false;
+    keys.reset();
+    if (finfo->summary != nullptr) setSummaryPolicy(finfo->summary->policy);
     // nocommit fieldInfo->flags |= 0x01;  // text field
 
     termBlockOffsets.resize(0);
@@ -1273,6 +1318,13 @@ public:
     hasLastTermOfPrevBlock = false;
 
     _startTermBlock(false);
+  }
+
+  // Collect this run's terms for a segment summary under `policy`; a range
+  // of a parallel merge sets it since its field info has no collector.
+  void setSummaryPolicy(const SummaryPolicy& policy) {
+    if (policy.collectsTerms()) keys.emplace(policy);
+    else keys.reset();
   }
 
   // Currently only called for a full block of positions.
@@ -1696,6 +1748,7 @@ public:
     // Recorded from the terms actually written, so flush and merge (where
     // deletes may drop the last long value) both derive the flag exactly.
     if (PackedTerm::mayBeFitted(std::string_view(termList.back()))) mayHaveFitted = true;
+    if (keys) keys->add(std::string_view(termList.back()));
     if (totalTermFreq == 1) {
       assert(getDocFileSize()==0 && docs.size()==1 && tfreqs.size()==1);
       assert(posdeltas.size() == (hasPositions ? 1u : 0u));
@@ -1834,12 +1887,20 @@ public:
     result.nTerms = numTerms;
     result.nBlocks = (int32_t) result.termBlockOffsets.size();
     result.mayHaveFitted = mayHaveFitted;
+    result.keys = std::move(keys);
+    keys.reset();
     assert((result.nTerms == 0) == (result.nBlocks == 0));
     return result;
   }
 
   void finalizeField(RangeResult&& result) {
     assert(buildTrie);
+
+    if (fieldInfo->summary != nullptr) {
+      fieldInfo->summary->setTermBounds(result.firstTerm, result.lastTerm, (uint64_t)result.nTerms);
+      fieldInfo->summary->mayHaveFitted = result.mayHaveFitted;
+      if (result.keys) fieldInfo->summary->setTermKeys(std::move(*result.keys));
+    }
 
     if ((std::string_view)fieldInfo->fieldname == "id") {
       postingsWriter.idDictionaryBlocks = result.nBlocks;

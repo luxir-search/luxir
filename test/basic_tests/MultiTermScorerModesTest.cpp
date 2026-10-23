@@ -20,6 +20,7 @@
 #include "luxir/query/BooleanWeight.h"
 #include "luxir/query/ConstantScoreQuery.h"
 #include "luxir/query/ForcePrepareQuery.h"
+#include "luxir/query/QueryPruning.h"
 #include "luxir/query/RescoreQuery.h"
 #include "luxir/server/Stats.h"
 #include "luxir/value/ValueExprParser.h"
@@ -379,7 +380,17 @@ void expectMultiTermShape(const Query::ScorerShape& shape,
 
 }  // namespace
 
-class MultiTermScorerModesTest : public LuxirTest {};
+// These tests exercise multi-term suppliers and scorers themselves, so they
+// run without segment pruning, which would skip an empty expansion before a
+// supplier exists. Tests that check the pruned path turn it back on.
+class MultiTermScorerModesTest : public LuxirTest {
+protected:
+  void SetUp() override {
+    LuxirTest::SetUp();
+    QueryPruning::disableForTests = true;
+  }
+  void TearDown() override { QueryPruning::disableForTests = false; }
+};
 
 TEST_F(MultiTermScorerModesTest, pulsedSparseParity) {
   TestIndex ti;
@@ -691,6 +702,14 @@ TEST_F(MultiTermScorerModesTest, supplierScorerShapes) {
 
   auto guard = ti.pool.rewindScopeGuard();
   auto& segment = ti.reader->segments()[0];
+  {
+    // With pruning the summary proves an absent term: no supplier at all.
+    QueryPruning::disableForTests = false;
+    auto restore = scope_guard([]() noexcept { QueryPruning::disableForTests = true; });
+    Query::Context pruned(ti.pool, *ti.reader);
+    TermQuery missing("body_w", "missing");
+    EXPECT_EQ(nullptr, missing.createWeight(pruned, 0)->scorerSupplier(ti.pool, segment));
+  }
   Query::Context context(ti.pool, *ti.reader);
   Query::PlanContext buildContext{
       .demand = Query::Demand::fromLeadCost(1),
@@ -942,12 +961,22 @@ TEST_F(MultiTermScorerModesTest, emptyExpansionKeepsFilterOnlyBulkValid) {
   buildCorpus(field, {{0, "qalpha"}, {1, "other"}});
   for (std::string_view name : {"body_w", "missing_w"}) {
     auto guard = ti.pool.rewindScopeGuard();
-    Query::Context context(ti.pool, *ti.reader);
     PrefixQuery prefix(name, "absent");
     Query* filters[] = {&prefix};
     BooleanQuery query({}, {}, {}, filters);
+    {
+      // With pruning the summary proves the empty expansion: no supplier.
+      QueryPruning::disableForTests = false;
+      auto restore = scope_guard([]() noexcept { QueryPruning::disableForTests = true; });
+      Query::Context context(ti.pool, *ti.reader);
+      auto& segment = context.topReader.segments()[0];
+      EXPECT_EQ(nullptr, query.createWeight(context, 0)->scorerSupplier(ti.pool, segment));
+    }
+    // Without that proof the expansion itself must keep a valid bulk plan.
+    Query::Context context(ti.pool, *ti.reader);
     auto& segment = context.topReader.segments()[0];
     auto* supplier = query.createWeight(context, 0)->scorerSupplier(ti.pool, segment);
+    ASSERT_NE(nullptr, supplier);
     auto plan = supplier->planBulk(Query::ExecutionUse::COUNT_WINDOWS, {});
     ASSERT_EQ(Query::ScorerSupplier::BulkAnswer::YES, plan.available);
     auto* bulk = supplier->buildBulk(ti.pool, plan);

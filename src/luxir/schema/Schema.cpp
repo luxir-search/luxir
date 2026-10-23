@@ -64,6 +64,8 @@ struct ResolvedField {
   bool vectorNormalizeOnWrite = false;
   // Atomic: the nearest authored ann in the parent chain.
   const luxir::api::VectorAnnDef* ann = nullptr;
+  // Atomic like ann: the nearest authored summary in the parent chain.
+  const luxir::api::FieldSummaryDef* summary = nullptr;
 };
 
 struct ResolvedOwnership {
@@ -288,7 +290,68 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   }
 
   r.ann = def.ann ? &*def.ann : parentResolved.ann;
+  r.summary = def.summary ? &*def.summary : parentResolved.summary;
   return r;
+}
+
+// Apply defaults to an authored summary definition and validate it against
+// the field's type and index mode. Term presence structures need a term
+// space (an indexed STRING, ID or TEXT field) or, for an exact set, a STRING
+// column; bounds apply to every type.
+static SummaryPolicy resolveSummaryPolicy(const api::FieldSummaryDef* def, FieldClass type, bool indexed,
+                                          std::string_view name) {
+  SummaryPolicy policy;
+  bool termish = type == FieldClass::STRING || type == FieldClass::ID || type == FieldClass::TEXT;
+  if (def == nullptr) {
+    if (!termish) policy.terms = SummaryPolicy::Terms::NONE;
+    return policy;
+  }
+  auto fail = [&](const std::string& msg) {
+    throw SchemaError("summary: " + msg + " (field: " + std::string(name) + ")");
+  };
+  using Terms = api::FieldSummaryDef_::Terms;
+  bool termOptions = def->terms.has_value() || def->set_max.has_value() || def->filter_max_bytes.has_value()
+      || !def->prefixes.empty();
+  if (termOptions && !termish) fail("terms, set_max, filter_max_bytes and prefixes apply to string, id and text fields only");
+  if (!termish) {
+    policy.terms = SummaryPolicy::Terms::NONE;
+  } else if (def->terms) {
+    switch (*def->terms) {
+      case Terms::AUTO: policy.terms = SummaryPolicy::Terms::AUTO; break;
+      case Terms::SET: policy.terms = SummaryPolicy::Terms::SET; break;
+      case Terms::FILTER: policy.terms = SummaryPolicy::Terms::FILTER; break;
+      case Terms::NONE: policy.terms = SummaryPolicy::Terms::NONE; break;
+    }
+  }
+  if (termish && !indexed) {
+    // A column-only string has no term space: an exact set of its values or nothing.
+    if (policy.terms == SummaryPolicy::Terms::FILTER) fail("terms filter requires an indexed field");
+    if (policy.terms == SummaryPolicy::Terms::AUTO) policy.terms = SummaryPolicy::Terms::NONE;
+    if (!def->prefixes.empty()) fail("prefixes require an indexed field");
+  }
+  if (def->set_max) {
+    if (*def->set_max < 1 || *def->set_max > SummaryPolicy::MAX_SET_MAX) {
+      fail("set_max must be between 1 and " + std::to_string(SummaryPolicy::MAX_SET_MAX));
+    }
+    policy.setMax = *def->set_max;
+  }
+  if (def->filter_max_bytes) {
+    if (*def->filter_max_bytes < SummaryPolicy::MIN_FILTER_BYTES) {
+      fail("filter_max_bytes must be at least " + std::to_string(SummaryPolicy::MIN_FILTER_BYTES));
+    }
+    policy.filterMaxBytes = *def->filter_max_bytes;
+  }
+  for (uint32_t length : def->prefixes) {
+    if (length < 1 || length > SummaryPolicy::MAX_PREFIX_LEN) {
+      fail("prefixes must be between 1 and " + std::to_string(SummaryPolicy::MAX_PREFIX_LEN));
+    }
+    policy.prefixes.push_back((uint8_t)length);
+  }
+  std::ranges::sort(policy.prefixes);
+  policy.prefixes.erase(std::unique(policy.prefixes.begin(), policy.prefixes.end()), policy.prefixes.end());
+  if (policy.terms == SummaryPolicy::Terms::NONE) policy.prefixes.clear();
+  if (def->bounds) policy.bounds = *def->bounds;
+  return policy;
 }
 
 // Apply defaults to an authored ann definition and validate it against the
@@ -709,6 +772,7 @@ struct FieldCompiler {
       case LongTerms::TRUNCATE: ft->longTerms = TermPolicy::TRUNCATE; break;
       case LongTerms::REJECT: ft->longTerms = TermPolicy::REJECT; break;
     }
+    ft->summary = resolveSummaryPolicy(r.summary, r.type, (flags & FieldType::INDEX_DOCS) != 0, name);
     if (r.isTemplate) ft->flags_ |= FieldType::ABSTRACT;
     // Apply any resolved storedResource_ override; empty means "keep default".
     if (!derived && !logical.storedResource.empty()) ft->storedResource_ = logical.storedResource;

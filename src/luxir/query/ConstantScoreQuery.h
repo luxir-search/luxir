@@ -225,6 +225,10 @@ public:
       std::string_view field) const override {
     return child->requiredValueEnvelope(field);
   }
+
+  MatchState mayMatch(const SummaryView& view) const override {
+    return child->mayMatch(view);
+  }
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     if (!std::isfinite(constantScore)) {
@@ -291,12 +295,13 @@ public:
       : Query::Weight(context, query, flags),
         constantScore(constantWhenScored(flags, multiplier, query.constantScore)) {
       // The child constrains matches; this wrapper replaces its score.
+      Context::MaskScope maskScope(context, viable);
       childWeight = query.child->createWeight(context, flags & ~NEED_SCORES, 1.0f);
       // The wrapper is constant-scoring; prepare still follows the child.
       traits |= IS_CONSTANT_SCORING | (childWeight->getFlags() & NEEDS_PREPARE);
     }
 
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
       if (childWeight->needsPrepare()) {
@@ -329,7 +334,7 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    CountShortcut countShortcut(
+    CountShortcut countShortcutImpl(
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }

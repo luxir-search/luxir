@@ -18,6 +18,7 @@
 #include "luxir/query/PointsMaterialize.h"
 #include "luxir/reader/IntColReader.h"
 #include "luxir/reader/PointsReader.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -158,6 +159,14 @@ public:
       std::string_view target) const override {
     if (target != field) return std::nullopt;
     return ValueEnvelope{envelope.lo, envelope.hi};
+  }
+
+  MatchState mayMatch(const SummaryView& view) const override {
+    if (envelope.lo > envelope.hi) {
+      view.prove("empty numeric range");
+      return MatchState::EMPTY;
+    }
+    return summary::numericMatch(view, field, [this](int64_t min, int64_t max) { return intersects(min, max); });
   }
 
   float valueMatchCost() const {
@@ -1017,7 +1026,7 @@ public:
     // Bounds answer covering and disjoint ranges without opening points.
     // Partial single-valued points counts resolve at supplier construction;
     // multi-valued and points-less counts walk the column only at execution.
-    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
       if (query.getHi() < query.getLo()) return {0, CountHow::METADATA};
       const auto* info = segmentInfo(segment);
       if (!info) return {0, CountHow::METADATA};
@@ -1440,7 +1449,7 @@ public:
             return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
                     BulkAnswer::NO, nullptr, (int64_t)pointValueCount};
           }
-          if (segment.liveDocs() != nullptr) {
+          if (segment.hasDeletes()) {
             return {
               BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
               BulkAnswer::NO,

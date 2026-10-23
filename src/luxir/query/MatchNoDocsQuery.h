@@ -23,6 +23,11 @@ public:
 
   uint64_t hashImpl() const override { return Query::hashImpl(); }
 
+  MatchState mayMatch(const SummaryView& view) const override {
+    view.prove("match no docs");
+    return MatchState::EMPTY;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
@@ -54,7 +59,7 @@ public:
       return nullptr;  // never matches any doc
     }
 
-    CountShortcut countShortcut(
+    CountShortcut countShortcutImpl(
         IndexReader::Segment& segment, DocSet* domain) override {
       unused(segment, domain);
       return {0, CountHow::METADATA};

@@ -278,7 +278,7 @@ std::shared_ptr<Collection> Collections::makeCollection(const CollectionId& name
     std::lock_guard lock(cachePolicyMutex);
     bytes = cacheBytes(name);
   }
-  col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(*col->shard->dir,
+  col->shard->snapshots = std::make_unique<CommitSnapshotRegistry>(col->shard->dir,
       FilterCacheConfig{.maxBytes = bytes});
   col->shard->getReaderManager().metrics = metrics;
   const auto& policy = config.replication;

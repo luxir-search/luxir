@@ -942,6 +942,30 @@ public:
   // intersect. Optional clauses (even under minShouldMatch) and prohibited
   // clauses require nothing of a single field here. Normalization only
   // rearranges the same constraints, so the raw tree answers for it.
+  // One impossible required clause empties the conjunction; an optional
+  // group needs enough possible members (UNKNOWN counts as possible);
+  // prohibited clauses never prove anything. A query with no positive
+  // clause is the planner's match-all and stays unknown.
+  MatchState mayMatch(const SummaryView& view) const override {
+    for (auto clauses : {mandatory, filter}) {
+      for (Query* clause : clauses) {
+        if (clause->mayMatch(view) == MatchState::EMPTY) return MatchState::EMPTY;
+      }
+    }
+    if (optional.empty()) return MatchState::UNKNOWN;
+    size_t possible = 0;
+    for (Query* clause : optional) {
+      if (clause->mayMatch(view) != MatchState::EMPTY) possible++;
+    }
+    bool optionalRequired = mandatory.empty() && filter.empty();
+    int needed = minShouldMatch > 0 ? minShouldMatch : (optionalRequired ? 1 : 0);
+    if ((int64_t)possible < needed) {
+      view.prove("too few possible optional clauses");
+      return MatchState::EMPTY;
+    }
+    return MatchState::UNKNOWN;
+  }
+
   std::optional<ValueEnvelope> requiredValueEnvelope(
       std::string_view field) const override {
     std::optional<ValueEnvelope> result;

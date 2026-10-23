@@ -11,6 +11,7 @@
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/util/MemPool.h"
+#include "luxir/util/ApiError.h"
 
 #include "luxir/api/padded_input.h"
 #include "luxir/api/luxir_index.hpp"
@@ -129,22 +130,123 @@ IndexReader::IndexReader(Snapshot snapshot, std::shared_ptr<FilterCache> filterC
     core(std::move(snapshot.core)), sharedSchema(std::move(snapshot.schema)),
     sharedFilterCache(std::move(filterCache)) {}
 
+namespace {
+std::shared_ptr<Directory> borrowed(Directory& dir) {
+  return std::shared_ptr<Directory>(std::shared_ptr<void>{}, &dir);
+}
+}
+
+IndexReader::IndexReader(std::shared_ptr<Directory> dir, const CommitSnapshot& snapshot, IndexReader* previousReader,
+                         std::shared_ptr<FilterCache> filterCache, std::shared_ptr<void> hold,
+                         Directory* eagerSource)
+  : IndexReader(openSnapshot(std::move(dir), previousReader, snapshot.schema, snapshot.bytes, snapshot.openReaders,
+                             eagerSource),
+                filterCache ? std::move(filterCache)
+                    : (previousReader ? previousReader->sharedFilterCache : nullptr)) {
+  filesHold = std::move(hold);
+}
+
 IndexReader::IndexReader(Directory& dir, const CommitSnapshot& snapshot, IndexReader* previousReader,
                          std::shared_ptr<FilterCache> filterCache)
-  : IndexReader(openSnapshot(dir, previousReader, snapshot.schema, snapshot.bytes, snapshot.openReaders),
+  : IndexReader(openSnapshot(borrowed(dir), previousReader, snapshot.schema, snapshot.bytes, snapshot.openReaders,
+                             &dir),
                 filterCache ? std::move(filterCache)
                     : (previousReader ? previousReader->sharedFilterCache : nullptr)) {}
 
 IndexReader::IndexReader(Directory& dir, IndexReader* previousReader, std::shared_ptr<FilterCache> filterCache)
-  : IndexReader(openSnapshot(dir, previousReader, nullptr, nullptr),
+  : IndexReader(openSnapshot(borrowed(dir), previousReader, nullptr, nullptr, {}, &dir),
                 filterCache ? std::move(filterCache)
                     : (previousReader ? previousReader->sharedFilterCache : nullptr)) {}
 
-IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReader* previousReader,
+std::shared_ptr<PostingsReader> SegmentBase::get() {
+  return cell.getOrCreate([this] {
+    std::shared_ptr<PostingsReader> reader;
+    try {
+      reader = PostingsReader::create(*dir, segId, false, true);
+    } catch (const ApiError&) {
+      throw;
+    } catch (const std::exception& e) {
+      throw ApiError(ErrorKind::UNAVAILABLE, "segment_unavailable",
+                     "segment " + std::to_string(segId) + " cannot be opened: " + e.what());
+    }
+    if (!reader) {
+      throw ApiError(ErrorKind::UNAVAILABLE, "segment_unavailable",
+                     "segment " + std::to_string(segId) + " files are missing");
+    }
+    if (reader->maxDoc() != maxDoc) {
+      throw ApiError(ErrorKind::INTERNAL, "segment_corrupt",
+                     "segment " + std::to_string(segId) + " maxDoc disagrees with its manifest");
+    }
+    return reader;
+  });
+}
+
+std::shared_ptr<LiveDocs> SegmentLive::get() {
+  return cell.getOrCreate([this] {
+    std::shared_ptr<LiveDocs> live;
+    try {
+      live = LiveDocs::create(*dir, segId, liveGen, maxDoc, false, true);
+    } catch (const ApiError&) {
+      throw;
+    } catch (const std::exception& e) {
+      throw ApiError(ErrorKind::UNAVAILABLE, "segment_unavailable",
+                     "segment " + std::to_string(segId) + " live docs cannot be opened: " + e.what());
+    }
+    if (!live) {
+      throw ApiError(ErrorKind::UNAVAILABLE, "segment_unavailable",
+                     "segment " + std::to_string(segId) + " live docs file is missing");
+    }
+    if (live->numLive() != liveDocs) {
+      throw ApiError(ErrorKind::INTERNAL, "segment_corrupt",
+                     "segment " + std::to_string(segId) + " live docs disagree with its manifest");
+    }
+    return live;
+  });
+}
+
+std::shared_ptr<AuxReader> SegmentOverlay::get() {
+  return cell.getOrCreate([this] {
+    std::pmr::monotonic_buffer_resource arena;
+    std::shared_ptr<AuxReader> aux;
+    try {
+      aux = openKnownAux(*dir, toWire(info, arena), false);
+    } catch (const ApiError&) {
+      throw;
+    } catch (const std::exception& e) {
+      throw ApiError(ErrorKind::UNAVAILABLE, "segment_unavailable",
+                     "overlay " + info.name + " cannot be opened: " + e.what());
+    }
+    return aux;
+  });
+}
+
+std::vector<std::shared_ptr<AuxReader>> Segment::auxReaders() const {
+  std::vector<std::shared_ptr<AuxReader>> result;
+  result.reserve(overlays_.size());
+  for (const auto& overlay : overlays_) {
+    if (auto aux = overlay->get()) result.push_back(std::move(aux));
+  }
+  return result;
+}
+
+std::shared_ptr<AuxReader> Segment::getAuxReader(std::string_view name) const {
+  for (const auto& overlay : overlays_) {
+    if (overlay->info.name == name) return overlay->get();
+  }
+  return nullptr;
+}
+
+IndexReader::Snapshot IndexReader::openSnapshot(std::shared_ptr<Directory> dirPtr, const IndexReader* previousReader,
                                                 std::shared_ptr<Schema> preferredSchema,
                                                 std::shared_ptr<const std::vector<std::byte>> manifest,
-                                                std::span<const std::weak_ptr<PostingsReader>> published) {
+                                                std::span<const std::weak_ptr<PostingsReader>> published,
+                                                Directory* eagerSource) {
   assert(published.empty() || manifest);  // aligned with that manifest's segments
+  assert(dirPtr);
+  Directory& dir = eagerSource ? *eagerSource : *dirPtr;
+  // Without a pinned manifest (tools, tests) a file may be retired between
+  // the root read and a later open, so everything opens inside the retry loop.
+  bool eager = eagerSource != nullptr || !manifest;
   auto core = std::make_shared<PhysicalCore>();
   const auto* previous = previousReader ? previousReader->core.get() : nullptr;
   auto& segs = core->segs;
@@ -162,17 +264,18 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
   // Index previous reader's aux readers by name for cheap reuse when the new
   // commit carried the entry forward (same gen + built_core_gen).  FAISS
-  // deserialization is the expensive part; reuse keeps reopens cheap.
+  // deserialization is the expensive part; reuse keeps reopens cheap. Segment
+  // overlays are reused as cells, opened or not.
   boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevAuxByName;
-  boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevSegAuxByKey;
+  boost::unordered_flat_map<std::string, std::shared_ptr<SegmentOverlay>> prevSegOverlays;
   if (previous) {
     assert(previous->segmentFiles.size() == previous->segs.size());
     for (const auto& r : previous->auxReadersList) {
       prevAuxByName.emplace(std::string(r->getName()), r);
     }
     for (const auto& seg : previous->segs) {
-      for (const auto& r : seg.auxReaders()) {
-        prevSegAuxByKey.emplace(segmentAuxKey(seg.segInfo.seg_id, r->getName()), r);
+      for (const auto& overlay : seg.overlays_) {
+        prevSegOverlays.emplace(segmentAuxKey(seg.segInfo.seg_id, overlay->info.name), overlay);
       }
     }
   }
@@ -188,15 +291,15 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
     }
 
     // Non-owning IndexInfo view; its repeated messages and padded input copy live in
-    // indexInfoArena, which is alive through the loop.
-    std::pmr::monotonic_buffer_resource indexInfoArena;
+    // the arena, which the collection summary keeps alive past this loop.
+    auto indexInfoArena = std::make_shared<std::pmr::monotonic_buffer_resource>();
     luxir::api::IndexInfo indexInfo;
 
     auto bytes = manifest ? manifest : Manifest::load(dir).bytes;
     if (!bytes) {
       schema = preferredSchema ? preferredSchema : Schema::createDefaultSchema();
     } else {
-      indexInfo = Manifest::decode(bytes, indexInfoArena);
+      indexInfo = Manifest::decode(bytes, *indexInfoArena);
       if (!indexInfo.schema || indexInfo.incarnation.empty()) {
         throw std::runtime_error("Incomplete commit manifest");
       }
@@ -204,7 +307,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
       if (previous && previous->incarnation != indexInfo.incarnation) {
         previous = nullptr;
         prevAuxByName.clear();
-        prevSegAuxByKey.clear();
+        prevSegOverlays.clear();
       }
       if (preferredSchema && preferredSchema->gen_ == indexInfo.schema_gen) {
         schema = preferredSchema;
@@ -228,7 +331,17 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         for (const auto& overlay : segment.overlays) files.overlays.push_back(fromWire(overlay.files));
       }
       for (const auto& aux : indexInfo.aux_indexes) core->auxFiles.push_back(fromWire(aux.files));
-      if (previous && previous->segmentFiles == core->segmentFiles && previous->auxFiles == core->auxFiles) {
+      // The same files reuse the previous core, unless the publisher hands
+      // over a different open reader for a segment, which then wins.
+      auto publishedAgrees = [&] {
+        for (size_t i = 0; i < published.size() && i < previous->segs.size(); i++) {
+          auto opened = published[i].lock();
+          if (opened && opened != previous->segs[i].physical_->peek()) return false;
+        }
+        return true;
+      };
+      if (previous && previous->segmentFiles == core->segmentFiles && previous->auxFiles == core->auxFiles
+          && publishedAgrees()) {
         return {previousReader->core, std::move(schema), indexInfo.commit_time, indexGen};
       }
       commitTimeUs = indexInfo.commit_time;
@@ -251,71 +364,115 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         int32_t nDocs = segment.max_doc;
         const auto& files = core->segmentFiles[i];
 
-        // Every holder of a physical segment shares one open PostingsReader.
-        // The publisher's (the writer's) comes first: it opened the segment for
-        // deletes, a merge or an overlay build, possibly while a reader opened
-        // it too, so preferring it converges all holders by the next reopen.
-        // Then the previous snapshot's, when the base files are identical (a
-        // delete or overlay commit leaves them unchanged); without descriptors
-        // the identity is unknown and nothing is shared. Live docs carry over
-        // when the generation's file is unchanged.
+        // Every holder of a physical segment shares one cell, opened or not.
+        // The previous snapshot's cell is reused when the base files are
+        // identical (a delete or overlay commit leaves them unchanged); a new
+        // cell is seeded with the publisher's (the writer's) open reader when
+        // it has one, so holders converge on one instance. Without
+        // descriptors the identity is unknown and nothing is shared.
         const Segment* prevSeg = previous ? previous->segment(segId) : nullptr;
         const auto* prevFiles = prevSeg ? &previous->segmentFiles[(size_t)prevSeg->ord] : nullptr;
-        std::shared_ptr<PostingsReader> postingsReader;
-        if ((size_t)i < published.size()) {
-          postingsReader = published[i].lock();
-          if (postingsReader && postingsReader->maxDoc() != nDocs) postingsReader = nullptr;
+        std::shared_ptr<SegmentBase> physical;
+        if (prevSeg && !files.files.empty() && prevFiles->files == files.files) {
+          // A different reader handed over by the publisher wins.
+          auto handed = (size_t)i < published.size() ? published[i].lock() : nullptr;
+          if (!handed || handed == prevSeg->physical_->peek()) physical = prevSeg->physical_;
         }
-        if (!postingsReader && prevSeg && !files.files.empty() && prevFiles->files == files.files) {
-          postingsReader = prevSeg->sharedPostingsReader;
-        }
-        if (!postingsReader) postingsReader = PostingsReader::create(dir, segId, missingFileOK, true);
-        if (!postingsReader) {
-          // Failed to create PostingsReader (segment files not found) - trigger retry
-          retry = true;
-          break; // Break out of the segments loop to retry
+        if (!physical) {
+          std::shared_ptr<PostingsReader> opened;
+          if ((size_t)i < published.size()) {
+            opened = published[i].lock();
+            if (opened && opened->maxDoc() != nDocs) opened = nullptr;
+          }
+          if (!opened && eager) {
+            opened = PostingsReader::create(dir, segId, missingFileOK, true);
+            if (!opened) {
+              // Failed to create PostingsReader (segment files not found) - trigger retry
+              retry = true;
+              break; // Break out of the segments loop to retry
+            }
+          }
+          physical = std::make_shared<SegmentBase>(dirPtr, segId, nDocs, std::move(opened));
+        } else if (eager && !physical->peek()) {
+          physical->get();
         }
 
-        std::shared_ptr<LiveDocs> liveDocs;
-        if (liveGen > 0 && prevSeg && prevSeg->sharedLiveDocs && !files.liveDocs.empty()
-            && prevFiles->liveDocs == files.liveDocs) {
-          liveDocs = prevSeg->sharedLiveDocs;
-        } else if (liveGen > 0) {
-          liveDocs = LiveDocs::create(dir, segId, liveGen, nDocs, missingFileOK, true);
-          if (!liveDocs) {
-            // Failed to create LiveDocs (delete file not found) - trigger retry
-            retry = true;
-            break; // Break out of the segments loop to retry
+        std::shared_ptr<SegmentLive> live;
+        if (liveGen > 0) {
+          if (prevSeg && prevSeg->live_ && !files.liveDocs.empty() && prevFiles->liveDocs == files.liveDocs) {
+            live = prevSeg->live_;
+            if (eager && !live->peek()) live->get();
+          } else {
+            std::shared_ptr<LiveDocs> opened;
+            if (eager) {
+              opened = LiveDocs::create(dir, segId, liveGen, nDocs, missingFileOK, true);
+              if (!opened) {
+                // Failed to create LiveDocs (delete file not found) - trigger retry
+                retry = true;
+                break; // Break out of the segments loop to retry
+              }
+            }
+            live = std::make_shared<SegmentLive>(dirPtr, segId, liveGen, nDocs, segment.live_docs, std::move(opened));
           }
         }
-        // If liveGen == 0, liveDocs remains nullptr (no deletes)
+        // If liveGen == 0, live stays null (no deletes)
 
-        std::vector<std::shared_ptr<AuxReader>> segmentAuxReaders;
-        segmentAuxReaders.reserve(segment.overlays.size());
+        std::vector<std::shared_ptr<SegmentOverlay>> segmentOverlays;
+        std::shared_ptr<const SegmentSummary> summary;
+        uint64_t summaryGen = 0;
+        segmentOverlays.reserve(segment.overlays.size());
         for (int j = 0; j < (int)segment.overlays.size(); j++) {
           const auto& info = segment.overlays[j];
 
-          auto prevIt = prevSegAuxByKey.find(segmentAuxKey(segId, info.name));
-          if (prevIt != prevSegAuxByKey.end()
-              && prevIt->second->getGen() == info.gen
-              && prevIt->second->getBuiltCoreGen() == info.built_core_gen) {
-            IREADER_DEBUG("Reusing segment overlay '{}' for seg={} (gen={}) from previous IndexReader",
-                          info.name, segId, info.gen);
-            segmentAuxReaders.push_back(prevIt->second);
+          if (info.kind == SegmentSummary::OVERLAY_KIND) {
+            // The summary is read now: it is small, and what lets a query
+            // skip the segment without opening anything else.
+            if (prevSeg && prevSeg->summary_ && prevSeg->summaryGen_ == info.gen) {
+              summary = prevSeg->summary_;
+              summaryGen = info.gen;
+              continue;
+            }
+            if (info.files.empty()) continue;
+            try {
+              summary = SegmentSummary::open(dir, info.files.front().name, true);
+            } catch (const std::exception& e) {
+              LOG_WARN("Segment summary unreadable for seg={}: {}", segId, e.what());
+              summary = nullptr;
+            }
+            if (!summary && missingFileOK) {
+              IREADER_DEBUG("Segment summary file missing for seg={} - triggering retry", segId);
+              retry = true;
+              break;
+            }
+            if (summary) summaryGen = info.gen;
             continue;
           }
 
-          auto aux = openKnownAux(dir, info, missingFileOK);
-          if (!aux && (info.kind == VectorAuxReader::KIND
-                       || info.kind == TestOverlayAuxReader::KIND)) {
-            IREADER_DEBUG("Segment overlay file missing for '{}' seg={} - triggering retry",
-                          info.name, segId);
-            retry = true;
-            break;
+          auto prevIt = prevSegOverlays.find(segmentAuxKey(segId, info.name));
+          if (prevIt != prevSegOverlays.end()
+              && prevIt->second->info.gen == info.gen
+              && prevIt->second->info.built_core_gen == info.built_core_gen) {
+            IREADER_DEBUG("Reusing segment overlay '{}' for seg={} (gen={}) from previous IndexReader",
+                          info.name, segId, info.gen);
+            segmentOverlays.push_back(prevIt->second);
+            if (eager && !prevIt->second->peek()) prevIt->second->get();
+            continue;
           }
-          if (aux) {
-            segmentAuxReaders.push_back(std::move(aux));
+
+          std::shared_ptr<AuxReader> aux;
+          bool openedKnown = false;
+          if (eager) {
+            aux = openKnownAux(dir, info, missingFileOK);
+            if (!aux && (info.kind == VectorAuxReader::KIND
+                         || info.kind == TestOverlayAuxReader::KIND)) {
+              IREADER_DEBUG("Segment overlay file missing for '{}' seg={} - triggering retry",
+                            info.name, segId);
+              retry = true;
+              break;
+            }
+            openedKnown = true;
           }
+          segmentOverlays.push_back(std::make_shared<SegmentOverlay>(dirPtr, fromWire(info), std::move(aux), openedKnown));
         }
         if (retry) break;
 
@@ -328,11 +485,10 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
         segmentInfo.commit_time = segment.commit_time;
         segmentInfo.live_docs = segment.live_docs;
 
-        segs.emplace_back(std::move(postingsReader), std::move(liveDocs),
-                          std::move(segmentAuxReaders), segmentInfo, totalMaxDoc, i);
-        totalMaxDoc += segs.back().postingsReader().maxDoc();
-        livedocs += segs.back().numLive();
-        assert(nDocs == segs.back().postingsReader().maxDoc());
+        segs.emplace_back(std::move(physical), std::move(live), std::move(segmentOverlays),
+                          std::move(summary), summaryGen, segmentInfo, totalMaxDoc, i);
+        totalMaxDoc += nDocs;
+        livedocs += segment.live_docs;
       }
 
       // Aux indexes: open inside the same retry loop so a missing aux file
@@ -372,6 +528,10 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
           auxReadersList.push_back(std::move(aux));
         }
       }
+      if (!retry && (!indexInfo.field_summaries.empty() || indexInfo.summary_complete)) {
+        core->aggregate = SegmentSummary::fromAggregate(indexInfo.field_summaries, indexInfo.summary_complete,
+                                                        indexInfoArena);
+      }
     }
   }
   while (retry);
@@ -399,14 +559,12 @@ const Segment* IndexReader::PhysicalCore::segment(uint64_t segId) const {
   return it != segOrds.end() && it->first == segId ? &segs[(size_t)it->second] : nullptr;
 }
 
-IndexReader::FieldRecord::FieldRecord(std::string_view name, size_t hash, size_t numSegments,
-                                      size_t first, int32_t ordinal)
-    : name(name), hash(hash), numSegments(numSegments),
-      ordinals(std::make_unique<std::atomic<int32_t>[]>(numSegments)) {
+IndexReader::FieldRecord::FieldRecord(std::string_view name, size_t hash, std::span<const int32_t> initialOrdinals)
+    : name(name), hash(hash), numSegments(initialOrdinals.size()),
+      ordinals(std::make_unique<std::atomic<int32_t>[]>(initialOrdinals.size())) {
   for (size_t i = 0; i < numSegments; i++) {
-    ordinals[i].store(i < first ? -1 : UNRESOLVED, std::memory_order_relaxed);
+    ordinals[i].store(initialOrdinals[i], std::memory_order_relaxed);
   }
-  ordinals[first].store(ordinal, std::memory_order_relaxed);
   bytes = sizeof(FieldRecord) + numSegments * sizeof(std::atomic<int32_t>)
       + FieldRecords::BYTES_PER_RECORD
       + (name.size() > std::string().capacity() ? name.size() + 1 : 0);
@@ -465,13 +623,24 @@ IndexReader::FieldSegments IndexReader::field(std::string_view name) const {
   size_t hash = PackedTermHash{}(name);
   const FieldRecord* record = core->fields->find(name, hash);
   if (!record) {
+    // A complete summary proves presence or absence without opening the
+    // segment; other segments are probed until the field is found, and every
+    // present ordinal is resolved lazily after.
+    std::vector<int32_t> ordinals(core->segs.size(), FieldRecord::UNRESOLVED);
+    bool found = false;
     for (size_t i = 0; i < core->segs.size(); i++) {
+      const SegmentSummary* summary = core->segs[i].summary();
+      if (summary && summary->complete()) {
+        if (summary->field(name) == nullptr) ordinals[i] = -1;
+        else found = true;
+        continue;
+      }
+      if (found) continue;
       int32_t ordinal = core->segs[i].postingsReader().findOrdinal(name);
-      if (ordinal < 0) continue;
-      record = core->fields->insert(
-          std::make_unique<FieldRecord>(name, hash, core->segs.size(), i, ordinal));
-      break;
+      ordinals[i] = ordinal;
+      if (ordinal >= 0) found = true;
     }
+    if (found) record = core->fields->insert(std::make_unique<FieldRecord>(name, hash, ordinals));
   }
   if (!record) return {};
   FieldSegments result(record, core->segs.data());
@@ -504,17 +673,24 @@ std::string_view IndexReader::FieldSegments::name() const noexcept {
 int32_t IndexReader::FieldSegments::ordinalAt(size_t segment) const {
   assert(record);
   assert(segment < record->numSegments);
-  auto& postings = segments[segment].postingsReader();
   int32_t ordinal = record->ordinals[segment].load(std::memory_order_relaxed);
   if (ordinal == FieldRecord::UNRESOLVED) {
-    ordinal = postings.findOrdinal(record->name);
+    ordinal = segments[segment].postingsReader().findOrdinal(record->name);
     record->ordinals[segment].store(ordinal, std::memory_order_relaxed);
   }
-  return ordinal;
+  return ordinal;  // -1 is proven absent, without an open
 }
 
 const PostingsReader::Field* IndexReader::FieldSegments::at(size_t segment) const {
-  return record ? segments[segment].postingsReader().fieldInfo(ordinalAt(segment)) : nullptr;
+  if (!record) return nullptr;
+  int32_t ordinal = ordinalAt(segment);
+  return ordinal < 0 ? nullptr : segments[segment].postingsReader().fieldInfo(ordinal);
+}
+
+bool IndexReader::FieldSegments::presentIn(size_t segment) const noexcept {
+  if (!record) return false;
+  assert(segment < record->numSegments);
+  return record->ordinals[segment].load(std::memory_order_relaxed) != -1;
 }
 
 bool IndexReader::FieldSegments::exists() const noexcept {
@@ -530,24 +706,46 @@ const IndexReader::HeaderTotals& IndexReader::FieldSegments::totals() const {
   auto* totals = record->totals.load(std::memory_order_acquire);
   if (!totals) {
     auto fresh = std::make_unique<HeaderTotals>();
-    std::optional<SegFieldInfo> first;
+    bool first = true;
     for (size_t i = 0; i < size(); i++) {
       fresh->stats.maxDoc += segments[i].maxDoc();
-      int32_t ordinal = ordinalAt(i);
-      if (ordinal < 0) continue;
-      SegFieldInfo info{};
-      FieldReader fields(segments[i].postingsReader(), ordinal);
-      fields.readFieldInfo(info);
-      if (first) first->requireCompatibleType(info);
-      else {
-        first = info;
-        fresh->type = info.type;
-        fresh->typeFlags = FieldType::typeParameters(info.type, info.typeFlags);
+      // A complete summary carries the same header totals and persisted type
+      // as the field directory, so an unopened segment stays unopened.
+      FieldType::Type type;
+      uint32_t typeFlags;
+      const SegmentSummary* summary = segments[i].summary();
+      if (summary && summary->complete() && !segments[i].isOpen()) {
+        const auto* field = summary->field(record->name);
+        if (!field) continue;
+        type = (FieldType::Type)field->type;
+        typeFlags = field->type_flags;
+        fresh->stats.docsWithField += (int64_t)field->docs_with_field;
+        fresh->stats.sumDocFreq += (int64_t)field->sum_doc_freq;
+        fresh->stats.sumTotalTermFreq += (int64_t)field->sum_total_term_freq;
+        fresh->flags |= (FieldType::flag_type)field->flags;
+      } else {
+        int32_t ordinal = ordinalAt(i);
+        if (ordinal < 0) continue;
+        SegFieldInfo info{};
+        FieldReader fields(segments[i].postingsReader(), ordinal);
+        fields.readFieldInfo(info);
+        type = info.type;
+        typeFlags = info.typeFlags;
+        fresh->stats.docsWithField += info.docsWithField;
+        fresh->stats.sumDocFreq += info.sumDocFreq;
+        fresh->stats.sumTotalTermFreq += info.sumTotalTermFreq;
+        fresh->flags |= info.flags;
       }
-      fresh->stats.docsWithField += info.docsWithField;
-      fresh->stats.sumDocFreq += info.sumDocFreq;
-      fresh->stats.sumTotalTermFreq += info.sumTotalTermFreq;
-      fresh->flags |= info.flags;
+      typeFlags = FieldType::typeParameters(type, typeFlags);
+      if (first) {
+        first = false;
+        fresh->type = type;
+        fresh->typeFlags = typeFlags;
+      } else if (type != fresh->type || typeFlags != fresh->typeFlags) {
+        throw std::runtime_error(std::format(
+            "Incompatible persisted types for field '{}': {} and {}", record->name,
+            FieldType::describeType(fresh->type, fresh->typeFlags), FieldType::describeType(type, typeFlags)));
+      }
     }
     if (record->totals.compare_exchange_strong(totals, fresh.get(),
                                                std::memory_order_release,
@@ -563,8 +761,36 @@ const Similarity::FieldStats& IndexReader::FieldSegments::stats() const {
   return totals().stats;
 }
 
+Similarity::FieldStats IndexReader::FieldSegments::stats(const SegmentMask& mask) const {
+  if (mask.isAll()) return totals().stats;
+  Similarity::FieldStats result = {};
+  if (!record) return result;
+  mask.forEach([&](size_t i) {
+    result.maxDoc += segments[i].maxDoc();
+    const SegmentSummary* summary = segments[i].summary();
+    if (summary && summary->complete() && !segments[i].isOpen()) {
+      if (const auto* field = summary->field(record->name)) {
+        result.docsWithField += (int64_t)field->docs_with_field;
+        result.sumDocFreq += (int64_t)field->sum_doc_freq;
+        result.sumTotalTermFreq += (int64_t)field->sum_total_term_freq;
+      }
+      return;
+    }
+    if (auto* info = at(i)) {
+      result.docsWithField += info->docsWithField;
+      result.sumDocFreq += info->sumDocFreq;
+      result.sumTotalTermFreq += info->sumTotalTermFreq;
+    }
+  });
+  return result;
+}
+
 FieldType::flag_type IndexReader::FieldSegments::flagsUnion() const {
   return record ? totals().flags : 0;
+}
+
+FieldType::Type IndexReader::FieldSegments::persistedType() const {
+  return record ? totals().type : FieldType::NONE;
 }
 
 void IndexReader::PhysicalCore::buildFieldCatalogs() {

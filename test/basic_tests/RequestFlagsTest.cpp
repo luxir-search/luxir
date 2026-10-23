@@ -158,7 +158,7 @@ TEST_F(RequestFlagsTest, explicitAndDataFacetGridsConvertGapAndOriginAtTheEdge) 
 TEST_F(RequestFlagsTest, binaryValidationRejectsUnknownPartialAndOpOnlyOverrides) {
   CollectionHelper helper;
   for (bool opLevel : {false, true}) for (auto [flags, set] : {
-      std::pair<uint64_t, uint64_t>{1, 1}, {2, 2}, {8, 0}, {0, 8},
+      std::pair<uint64_t, uint64_t>{1, 1}, {2, 2}, {16, 0}, {0, 16},
       {uint64_t{1} << 63, 0}, {4, 0}, {0, 4}}) {
     if (!opLevel && ((flags | set) & RequestFlags::INT64_STR)) continue;
     auto req = localReq(helper.getSearchEngine());
@@ -509,4 +509,22 @@ TEST_F(RequestFlagsTest, int64StringsLeaveBinaryResponseValuesNative) {
     ASSERT_TRUE(api::decode(response, api::copyToPaddedInput(bytes, req->mr), req->mr));
     EXPECT_EQ(2000000, std::get<api::ColInt>(response.ops.at("q")->docList()->columns.at("stamp").kind).v[0]);
   }
+}
+
+TEST(RequestFlags, globalStatsIsAnInheritedFlagAtEitherLevel) {
+  std::string_view names[] = {"global_stats", "date_ms"};
+  for (auto level : {RequestFlags::Level::REQUEST, RequestFlags::Level::OP}) {
+    auto parsed = RequestFlags::fromNames(names, level);
+    EXPECT_EQ(RequestFlags::GLOBAL_STATS, parsed.flags & RequestFlags::GLOBAL_STATS);
+    EXPECT_TRUE(RequestFlags::globalStats(RequestFlags::resolve(0, parsed.flags, parsed.flagsSet, level)));
+    EXPECT_EQ((std::vector<std::string_view>{"date_ms", "global_stats"}),
+              RequestFlags::names(parsed.flags, parsed.flagsSet));
+  }
+  std::string_view twice[] = {"global_stats", "global_stats"};
+  EXPECT_THROW(RequestFlags::fromNames(twice), RequestError);
+  // Inherited unless an op's flags_set clears it.
+  uint64_t inherited = RequestFlags::GLOBAL_STATS;
+  EXPECT_TRUE(RequestFlags::globalStats(RequestFlags::resolve(inherited, 0, 0, RequestFlags::Level::OP)));
+  EXPECT_FALSE(RequestFlags::globalStats(
+      RequestFlags::resolve(inherited, 0, RequestFlags::GLOBAL_STATS, RequestFlags::Level::OP)));
 }

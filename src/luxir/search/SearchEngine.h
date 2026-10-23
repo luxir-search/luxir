@@ -37,6 +37,25 @@ public:
   // As a search in `tenant` would resolve it.
   std::vector<std::string> explain(const ReqProto& proto, std::string tenant);
 
+  // Collection-level pruning: whether the collection's manifest summaries
+  // leave any chance that a query-bearing op of `proto` matches. Pins the
+  // snapshot it evaluates (its commit token is returned) and opens no
+  // segment. With `includeSegments`, also lists the segments no op can match.
+  struct CanMatchResult {
+    struct Op {
+      std::string name;
+      bool mayMatch = true;
+      std::string reason;
+    };
+    bool mayMatch = true;
+    bool summaryComplete = false;
+    std::string commit;
+    size_t segments = 0;
+    std::vector<Op> ops;
+    std::vector<uint64_t> prunedSegments;
+  };
+  CanMatchResult canMatch(const ReqProto& proto, std::string tenant, bool includeSegments);
+
   // Whether dispatch() may execute the query on the calling (transport)
   // thread.  An HTTP io shard may: it owns its connections, and the inline
   // lane saves a scheduler hop.  A gRPC completion-queue thread may not: gRPC

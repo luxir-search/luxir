@@ -10487,7 +10487,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
 
       if (!needsScores && !disableDisjunctionCountIdentityForTests) {
-        if (segment.liveDocs() != nullptr) {
+        if (segment.hasDeletes()) {
           state->identityFallback =
               DisjunctionIdentityFallback::DELETES;
         } else {
@@ -11630,6 +11630,7 @@ class BooleanQuery::Weight final : public Query::Weight {
 
     Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
       Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
+      if (supplier == nullptr) return nullptr;
       Query::Demand demand = Query::Demand::fromLeadCost(
           std::numeric_limits<int64_t>::max());
       return supplier->resolve(
@@ -11673,6 +11674,8 @@ public:
          CompiledBoolean& query, int32_t flags,
          float multiplier, ScorePolicy scorePolicy)
     : Query::Weight(context, owner, flags), scorePolicy(scorePolicy) {
+    // Children inherit this clause's viable segments.
+    Context::MaskScope maskScope(context, viable);
     needsScores = (flags & Query::NEED_SCORES) != 0;
     assert(scorePolicy.kind == ScorePolicy::SUM
            || (needsScores && query.mandatory.empty() && query.filter.empty()
@@ -11738,6 +11741,7 @@ public:
             || verificationWork == Query::VerificationWork::PARTIAL;
         bool anyRouted = false;
         for (auto& segment : context.topReader.segments()) {
+          if (excludesSegment(segment.ord)) continue;
           auto savepoint = routePool.getSavePoint();
           Query::ScorerSupplier* supplier = nullptr;
           bool supplierBuilt = false;
@@ -11861,7 +11865,7 @@ public:
   // union with empty clauses introduces no overlap. More survivors, gating
   // optionals and exclusions need execution. Required bounds intersect by
   // minimum, and a constrained optional group's bound is its capped sum.
-  CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+  CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
     auto bound = countBound(segment, domain, segment.maxDoc());
     if (bound.maxMatches == 0) return bound;
     size_t required = mandatoryWeights.size() + filterWeights.size();
@@ -11900,7 +11904,7 @@ public:
     return bound;
   }
 
-  std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+  std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(Query::Weight::PrepareContext& ctx) override {
     auto filterSources = QueryPrep::prepareFilterSources(
         filterWeights, filterUses, ctx);
     std::vector<DomainHandle> filterDomains(
@@ -11999,7 +12003,7 @@ public:
                         uniformConstantCandidate, executionMode, scorePolicy);
   }
 
-  int64_t sparseFilteredTopKCost(
+  int64_t sparseFilteredTopKCostImpl(
       MemPool& targetPool, IndexReader::Segment& segment) override {
     if (!sparseFilteredTopKEligible) {
       return -1;
@@ -12022,6 +12026,7 @@ public:
 
   Query::Scorer* createScorer(luxir::MemPool& targetPool, luxir::IndexReader::Segment& segment) override {
     Query::ScorerSupplier* supplier = scorerSupplier(targetPool, segment);
+    if (supplier == nullptr) return nullptr;
     Query::Demand demand = Query::Demand::fromLeadCost(
         std::numeric_limits<int64_t>::max());
     return supplier->resolve(

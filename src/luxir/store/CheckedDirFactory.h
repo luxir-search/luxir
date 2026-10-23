@@ -56,6 +56,9 @@ public:
       }
     }
     if (verbose_) LOG_DEBUG("CheckedDirectory: openFile({}, expectSynced={})", name, expectSynced);
+    // Test seam: which files a reader opens (segment pruning asserts a pruned
+    // segment's data files stay closed).
+    Signal::emit("directoryOpenFile", this, &name);
     return delegate_->openFile(name, expectSynced);
   }
 

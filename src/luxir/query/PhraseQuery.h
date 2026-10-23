@@ -16,6 +16,7 @@
 #include "Query.h"
 #include "luxir/reader/NormsReader.h"
 #include "luxir/reader/PosEnum.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -337,6 +338,14 @@ public:
   [[nodiscard]] std::span<const int32_t> getPositions() const { return positions; }
   [[nodiscard]] int32_t getSlop() const { return slop; }
 
+  // A phrase needs every term: one provably absent term empties the segment.
+  MatchState mayMatch(const SummaryView& view) const override {
+    for (std::string_view term : terms) {
+      if (summary::termMatch(view, field, term) == MatchState::EMPTY) return MatchState::EMPTY;
+    }
+    return MatchState::UNKNOWN;
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     out.appendKind(kind);
@@ -437,17 +446,18 @@ public:
       cachedTermInfos = context.pool.make_span<CachedTermInfo*>(query.getTerms().size());
       Similarity similarity;
       double idf = 0.0;
+      const SegmentMask& stats = context.planningContext().statsMask(viable);
       for (int i = 0; i < cachedTermInfos.size(); i++) {
-        cachedTermInfos[i] = context.getCachedTerminfo(*cachedFieldInfo, query.getTerms()[i]);
+        cachedTermInfos[i] = context.getCachedTerminfo(*cachedFieldInfo, query.getTerms()[i], &stats);
         if (cachedTermInfos[i] == nullptr) {
           cachedFieldInfo = nullptr;
           return;
         }
-        idf += similarity.idf(cachedFieldInfo->fieldStats, cachedTermInfos[i]->termStats);
+        idf += similarity.idf(cachedFieldInfo->statsOver(stats), cachedTermInfos[i]->statsOver(stats));
       }
       if (needScores) {
         simScorer = context.pool.make<Similarity::BM25Scorer>(
-            similarity.getScorer(multiplier, cachedFieldInfo->fieldStats, (float) idf));
+            similarity.getScorer(multiplier, cachedFieldInfo->statsOver(stats), (float) idf));
       }
     }
 
@@ -714,6 +724,7 @@ public:
     Query::Scorer* createScorer(
         MemPool& targetPool, IndexReader::Segment& segment) override {
       auto* supplier = scorerSupplier(targetPool, segment);
+      if (supplier == nullptr) return nullptr;
       Query::PlanContext planContext = scorerBuildContext(
           std::numeric_limits<int64_t>::max());
       return supplier->resolve(targetPool, planContext)->build(targetPool);

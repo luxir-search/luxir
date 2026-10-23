@@ -948,6 +948,47 @@ static void handleGetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   }
 }
 
+//   rpc CanMatch(SearchRequest) returns (CanMatchResponse)  [unary]
+static void handleCanMatch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto request = std::make_shared<HppRequestState<SearchReqProto>>();
+  if (!parseRequest(readBuf, *request, "CanMatch")) {
+    finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "CanMatch: malformed request"));
+    return;
+  }
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  try {
+    call.server.getLuxirNode().getTaskArena().enqueue([request, &call] {
+      try {
+        // Data-plane calls act in the default tenant (see handleSearch).
+        // `profile` asks for the pruned segment list, as it asks a search
+        // for per-segment detail.
+        auto result = call.server.getLuxirNode().getSearchEngine().canMatch(
+            request->proto, std::string(), request->proto.profile);
+        std::pmr::monotonic_buffer_resource respArena;
+        luxir::api::CanMatchResponse response;
+        using Verdict = luxir::api::CanMatchResponse::Verdict;
+        response.verdict = result.mayMatch ? Verdict::MAY_MATCH : Verdict::NO_MATCH;
+        response.commit = result.commit;
+        response.summary_complete = result.summaryComplete;
+        response.segments = result.segments;
+        auto* ops = luxir::api::build::allocArray(response.ops, result.ops.size(), respArena);
+        for (size_t i = 0; i < result.ops.size(); i++) {
+          ops[i].op = result.ops[i].name;
+          ops[i].verdict = result.ops[i].mayMatch ? Verdict::MAY_MATCH : Verdict::NO_MATCH;
+          ops[i].reason = result.ops[i].reason;
+        }
+        auto* pruned = luxir::api::build::allocArray(response.pruned_segments, result.prunedSegments.size(), respArena);
+        for (size_t i = 0; i < result.prunedSegments.size(); i++) pruned[i] = result.prunedSegments[i];
+        call.respondRaw(serializeToByteBuffer(response), 1);
+      } catch (const std::exception& e) {
+        finishWithException(call, e);
+      }
+    });
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
+}
+
 //   rpc Stats(StatsRequest) returns (StatsResponse)  [unary]
 static void handleStats(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   auto request = std::make_shared<HppRequestState<StatsReqProto>>();
@@ -1009,6 +1050,7 @@ static void handleCacheControl(GenericCallData& call, grpc::ByteBuffer& readBuf)
 static const MethodEntry* lookupMethod(const std::string& method) {
   static const std::unordered_map<std::string, MethodEntry> table = {
     {"/luxir.Searcher/Search",          {handleSearch, false, MetricOperation::SEARCH, true}},
+    {"/luxir.Searcher/CanMatch",        {handleCanMatch, false, MetricOperation::SEARCH}},
     {"/luxir.Indexer/Update",           {handleUpdate, true, MetricOperation::UPDATE}},
     {"/luxir.Indexer/UpdateStream",     {handleUpdate, true, MetricOperation::UPDATE, true}},
     {"/luxir.Admin/SetSchema",          {handleSetSchema, true, MetricOperation::SCHEMA}},

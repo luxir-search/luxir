@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/search/ProtobufSearchParser.h"
+#include "luxir/query/QueryPruning.h"
 
 #include "luxir/util/proto.h"
 #include <algorithm>
@@ -15,6 +16,7 @@
 
 #include "luxir/api/RequestFlags.h"
 #include "luxir/search/SearchRequest.h"
+#include "luxir/search/SearchEngine.h"
 #include "luxir/search/SearchOverrides.h"
 #include "luxir/query/ParseContext.h"
 #include "luxir/search/ops/RootOp.h"
@@ -207,6 +209,43 @@ struct SearchParserImpl {
   }
 
 public:
+  // Segment pruning accounting for one query-bearing op: node counters,
+  // explain notes and, when profiling, one "pruning" profile piece per
+  // segment with the proof that excluded it.
+  void reportPruning(const Query& query, const Query::Weight& weight) {
+    size_t segments = req.reader->segments().size();
+    size_t viable = weight.viableSegments().popcount();
+    req.engine.metrics().add(MetricCounter::SEGMENTS_CONSIDERED, segments);
+    req.engine.metrics().add(MetricCounter::SEGMENTS_PRUNED, segments - viable);
+    // Profile and explain describe pruning only when it happened.
+    if (viable == segments) return;
+    bool explain = req.resolvedFields != nullptr;
+    auto* profileOp = req.addExecutionProfileOp("pruning");
+    if (!explain && profileOp == nullptr) return;
+    std::vector<SegmentVerdict> verdicts;
+    MemPool scratch;
+    QueryPruning::viableSegments(query, *req.reader, scratch, &verdicts, true);
+    if (explain) {
+      for (const auto& verdict : verdicts) {
+        if (!verdict.pruned) continue;
+        req.resolvedFields->push_back(fmt::format("pruned segment {} (ord {}): {}", verdict.segId, verdict.ord,
+                                                  verdict.reason));
+      }
+    }
+    if (profileOp != nullptr) {
+      auto* run = req.addExecutionProfileRun(profileOp);
+      for (const auto& verdict : verdicts) {
+        auto& piece = run->pieces[(size_t)verdict.ord];
+        piece.wire.kind = "segment";
+        piece.wire.segment = verdict.ord;
+        piece.wire.max_doc = req.reader->segments()[(size_t)verdict.ord].maxDoc();
+        piece.wire.strategy = verdict.pruned ? "pruned" : "viable";
+        if (verdict.pruned) piece.details.push_back(verdict.reason);
+        piece.complete = true;
+      }
+    }
+  }
+
   // The provided pool will be used to store the parsed query tree.
   // We need access to the schema to figure out what types of queries to produce?
   // Both the pool and any parsed protobuf objects must outlive the query tree.
@@ -1685,6 +1724,7 @@ public:
       FilterKeyContext{.schemaGen = req.schema->gen_,
                        .timeZone = req.proto.time_zone},
       req.filterUses);
+    planningContext->globalStats = RequestFlags::globalStats(options.flags);
     // One unconditional serial pass validates the complete effective query,
     // including score decorations that an unscored Weight would not consume.
     // Folded filters are already children of query; passive filters remain
@@ -1879,6 +1919,7 @@ public:
     }
     auto* weight = omitMainWeight
         ? nullptr : query->createWeight(*qcontext, mainWeightFlags);
+    if (weight != nullptr) reportPruning(*query, *weight);
     Query::Weight* variantMembershipWeight = nullptr;
     if (routedFilters) {
       assert(weight != nullptr);
@@ -2001,7 +2042,7 @@ public:
           everySegmentConstant = true;
           bool everySegmentEmpty = !req.reader->segments().empty();
           for (auto& segment : req.reader->segments()) {
-            DocSet* rootDomain = segment.liveDocs() == nullptr
+            DocSet* rootDomain = !segment.hasDeletes()
                 ? nullptr : &segment.liveDocs()->docset();
             auto shortcut = wholeMembershipWeight->countShortcut(segment, rootDomain);
             everySegmentEmpty &= shortcut.how == Query::CountHow::METADATA

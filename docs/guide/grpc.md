@@ -26,6 +26,7 @@ The default gRPC port is one greater than the HTTP port: `9401` when HTTP uses
 | [`luxir.Indexer/Update`](../reference/protobuf.md#method-luxir.indexer.update) | unary | One bounded update request and response. |
 | [`luxir.Indexer/UpdateStream`](../reference/protobuf.md#method-luxir.indexer.updatestream) | bidirectional stream | A stream of independently acknowledged update requests. |
 | [`luxir.Searcher/Search`](../reference/protobuf.md#method-luxir.searcher.search) | bidirectional stream | Several search requests per call, with one or more response batches per request. |
+| `luxir.Searcher/CanMatch` | unary | Whether the collection may hold a match for a search request, from its manifest summaries alone (the structured form of HTTP `_can_match`); `profile` lists the segments nothing can match. |
 | [`luxir.Admin/SetSchema`](../reference/protobuf.md#method-luxir.admin.setschema) | unary | Set named definitions or replace a collection schema. |
 | [`luxir.Admin/GetSchema`](../reference/protobuf.md#method-luxir.admin.getschema) | unary | Read a collection schema. |
 | [`luxir.Admin/CreateCollection`](../reference/protobuf.md#method-luxir.admin.createcollection) | unary | Create a collection, optionally with a schema. |
@@ -181,7 +182,9 @@ Subops inherit their parent's effective word. The date mode occupies bits 0-1:
 `flags = 0, flags_set = 3`. Setting only one date-mode mask bit is rejected.
 Bit 2 is `int64_str`, accepted only on SearchRequest; a SearchOp cannot set
 or clear it in either word. It affects HTTP JSON rendering only, and binary
-gRPC responses retain their integer types. Unknown bits are rejected in either
+gRPC responses retain their integer types. Bit 3 is `global_stats`, valid at
+either level: BM25 statistics sum over every segment instead of only the
+segments the query was not pruned from. Unknown bits are rejected in either
 word. Bits absent from `flags_set` have no effect on inheritance.
 
 `RequestFlagBit` names bit positions, not masks; shift `uint64{1}` by the

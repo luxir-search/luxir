@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "MultiTermQuery.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -52,6 +53,10 @@ public:
   const std::optional<std::string_view>& getUpper() const { return upper; }
   bool lowerInclusive() const { return includeLower; }
   bool upperInclusive() const { return includeUpper; }
+
+  MatchState mayMatch(const SummaryView& view) const override {
+    return summary::termRangeMatch(view, field, lower, includeLower, upper, includeUpper);
+  }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {

@@ -45,6 +45,13 @@ public:
   static Query* make(MemPool& pool, std::span<Query*> disjuncts, float tie);
 
   std::span<Query*> getDisjuncts() const { return disjuncts; }
+
+  MatchState mayMatch(const SummaryView& view) const override {
+    for (Query* disjunct : disjuncts) {
+      if (disjunct->mayMatch(view) != MatchState::EMPTY) return MatchState::UNKNOWN;
+    }
+    return MatchState::EMPTY;
+  }
   float getTie() const { return tie; }
   Query* getMembership() const { return membership; }
 

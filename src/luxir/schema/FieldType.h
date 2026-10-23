@@ -16,6 +16,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include "SummaryPolicy.h"
 
 namespace luxir {
 
@@ -100,6 +101,9 @@ public:
   // with this name (default: Postings::STORED_DEFAULT_RESOURCE).  Shared by
   // TEXT, STRING, and ID.  Ignored by field types that don't support STORED.
   std::string storedResource_ = std::string(Postings::STORED_DEFAULT_RESOURCE);
+  // Segment summary settings (schema "summary"): what each segment records
+  // about this field for query-time pruning.
+  SummaryPolicy summary;
 
   // constructor
   FieldType(std::string_view name, FieldType::Type type, int flags) :

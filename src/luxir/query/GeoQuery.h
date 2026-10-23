@@ -116,7 +116,7 @@ public:
 
   // A BKD count can decode crossing leaves, so probes only report that level;
   // the walk belongs to execution after the supplier has been selected.
-  Query::CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+  Query::CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
     const SegFieldInfo* info = nullptr;
     if (query.isEmpty() || !segmentInfo(segment, info) || info->numValues == 0) {
       return {0, Query::CountHow::METADATA};
@@ -308,7 +308,7 @@ public:
             BulkAnswer::NO,
           };
         }
-        assert(bkd != nullptr && !reader.multiValued() && segment.liveDocs() == nullptr);
+        assert(bkd != nullptr && !reader.multiValued() && !segment.hasDeletes());
         size_t size = bkd->maxPointsPerLeaf();
         BKDReader::Scratch countScratch{
           {}, planPool.make_span<uint32_t>(size),

@@ -5,6 +5,10 @@
 #include "luxir/api/padded_input.h"
 
 #include "SearchEngine.h"
+#include "luxir/query/AllQuery.h"
+#include "luxir/query/ParseContext.h"
+#include "luxir/query/ProtobufQueryParser.h"
+#include "luxir/query/QueryPruning.h"
 #include "luxir/server/CommitWaits.h"
 #include "ProtobufSearchParser.h"
 #include "luxir/search/ops/RootOp.h"
@@ -53,6 +57,82 @@ std::vector<std::string> SearchEngine::explain(const ReqProto& proto, std::strin
   req->resolvedFields = &notes;
   prepare(*req);
   return notes;
+}
+
+SearchEngine::CanMatchResult SearchEngine::canMatch(const ReqProto& proto, std::string tenant, bool includeSegments) {
+  class CanMatchRequest final : public SearchRequest {
+  public:
+    using SearchRequest::SearchRequest;
+    ReplyStatus reply(SearchResponse&) override { return ReplyStatus::OK; }
+  };
+  std::pmr::monotonic_buffer_resource source;
+  std::vector<std::byte> encoded;
+  ReqProto copy;
+  if (!api::encode(proto, encoded)
+      || !api::decode(copy, api::copyToPaddedInput(encoded, source), source)) {
+    throw ApiError(ErrorKind::INTERNAL, "internal", "failed to copy can-match request");
+  }
+  google::protobuf::Arena arena;
+  auto* req = arenaCreate<CanMatchRequest>(arena, *this, copy, arena);
+  req->tenant = std::move(tenant);
+  getResources(*req);
+  if (!req->timeZone) throw ApiError(ErrorKind::INVALID_REQUEST, "time_zone", req->timeZoneError);
+
+  CanMatchResult result;
+  IndexReader& reader = *req->reader;
+  result.commit = CommitId{std::string(reader.incarnation()), reader.commitId()}.token();
+  const SegmentSummary* aggregate = reader.collectionSummary();
+  result.summaryComplete = aggregate != nullptr && aggregate->complete();
+  result.segments = reader.segments().size();
+  std::vector<uint64_t> unionStorage;
+  SegmentMask viable = SegmentMask::make(unionStorage, result.segments, false);
+  bool anyOp = false;
+  bool anyMayMatch = false;
+  for (const auto& [name, opView] : req->proto.ops) {
+    const api::SearchOp& op = *opView;
+    const auto* topDocs = std::get_if<api::TopDocs>(&op.kind);
+    if (topDocs == nullptr) continue;
+    anyOp = true;
+    // The same lowering a search applies, with no weights: weights seek
+    // terms in segments, and this call must open none.
+    ParseContext parseContext{req->requestPool, *req->schema, req->arena,
+                              CoerceContext{req->dateMathNowEpochMillis, *req->timeZone}, name, &req->warnings};
+    parseContext.reader = &reader;
+    ProtobufQueryParser parser(parseContext);
+    std::vector<Query*> clauses;
+    clauses.push_back(topDocs->query.has_value() ? parser.parse(*topDocs->query) : req->requestPool.make<AllQuery>());
+    for (const auto& filter : topDocs->filter) {
+      if (filter.query.has_value()) clauses.push_back(parser.parse(*filter.query));
+    }
+    CanMatchResult::Op verdict{std::string(name), true, {}};
+    for (Query* clause : clauses) {
+      std::string reason;
+      if (!QueryPruning::collectionMayMatch(*clause, aggregate, &reason)) {
+        verdict.mayMatch = false;
+        verdict.reason = std::move(reason);
+        break;
+      }
+    }
+    if (verdict.mayMatch && !result.summaryComplete) {
+      verdict.reason = aggregate == nullptr ? "summary_missing" : "summary_incomplete";
+    }
+    if (verdict.mayMatch && includeSegments) {
+      SegmentMask opMask = SegmentMask::make(req->requestPool, result.segments, true);
+      for (Query* clause : clauses) {
+        opMask &= QueryPruning::viableSegments(*clause, reader, req->requestPool);
+      }
+      viable |= opMask;
+    }
+    anyMayMatch |= verdict.mayMatch;
+    result.ops.push_back(std::move(verdict));
+  }
+  result.mayMatch = !anyOp || anyMayMatch;
+  if (includeSegments && anyOp) {
+    for (const Segment& segment : reader.segments()) {
+      if (!viable.test((size_t)segment.ord)) result.prunedSegments.push_back(segment.segInfo.seg_id);
+    }
+  }
+  return result;
 }
 
 Metrics& SearchEngine::metrics() const { return *node.metrics; }

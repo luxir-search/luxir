@@ -52,6 +52,12 @@ locations, browse `src/luxir/<area>/`.
    - `DocsEnum` returns the documents for a term found with the `TermsEnum`. Optionally returns term positions for each document.
    - `IntColReader` reads the doc-order numeric column (all numeric field
      classes store an order-preserving encoded int64)
+   - `SegmentSummary` (`src/luxir/index/`) is the per-segment summary sidecar (a
+     `segment_summary` overlay): field presence, counts, numeric/geo/term bounds and
+     term filters (`util/BinaryFuse8.h`, `util/BloomFilter.h`), built by
+     `SummaryCollector` at flush and merge and unioned into the manifest by
+     `SummaryAggregator`. Segments open lazily (`SegmentBase`/`SegmentLive`/
+     `SegmentOverlay` cells in `IndexReader.h`); the summary is read at snapshot open.
    - `PointsReader` reads the optional 1-D sorted-leaf points index of a
      `RANGE`-indexed numeric field (value-sorted leaves + fence directory;
      exact ordinal counts). `BKDReader` reads the 2-D int32 BKD of a
@@ -76,6 +82,10 @@ locations, browse `src/luxir/<area>/`.
    Weight and scorers are in `BooleanWeight.h`, which only `BooleanQuery.cpp`
    and white-box tests include.
 
+   - `Query::mayMatch` evaluates a logical tree against a `SummaryView`;
+     `QueryPruning` turns the verdicts into each Weight's `SegmentMask`, enforced in
+     the per-segment entry points so a pruned segment is never opened. See
+     [segment summaries](../design/segment-summaries.md).
    - Supports Term, Boolean, Phrase, and All queries
    - `NumericRangeQuery` executes through the points index when present
      (direct materialization or complement), else zone-map pruned or full
@@ -152,7 +162,7 @@ locations, browse `src/luxir/<area>/`.
 
 ## Request Flow
 
-**Search**: gRPC/HTTP Request -> SearchEngine -> Query Parsing -> Weight Creation -> Per-Segment Plan Resolution and Execution -> Result Collection -> Response
+**Search**: gRPC/HTTP Request -> SearchEngine -> Query Parsing -> Weight Creation (segment pruning from summaries) -> Per-Segment Plan Resolution and Execution -> Result Collection -> Response
 
 **Indexing**: gRPC/HTTP Request -> IndexWriter -> Document Processing (Inverter) -> Segment Writing -> optional Commit
 

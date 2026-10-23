@@ -60,6 +60,10 @@ public:
 
   static std::unique_ptr<DocSet> intersect(std::span<DocSet*> sets);
 
+  // The shared immutable empty set: the domain of a segment a query cannot
+  // match, so every per-ordinal slot stays filled.
+  static DocSet& emptyInstance();
+
   /// Union two or more DocSets into a single new DocSet.  All BITSET inputs
   /// must share a size (caller's responsibility - typically all from the same
   /// segment's maxDoc).  Result is BITSET if any input is BITSET, otherwise
@@ -930,5 +934,11 @@ inline std::unique_ptr<DocSet> DocSet::union_(std::span<DocSet*> sets) {
   return std::make_unique<ArrDocSet>(std::move(*current));
 }
 
+
+inline DocSet& DocSet::emptyInstance() {
+  static ArrDocSet instance(std::vector<int32_t>{});
+  instance.setCard(0);
+  return instance;
+}
 
 }

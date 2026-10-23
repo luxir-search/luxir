@@ -19,6 +19,12 @@ public:
     int64_t numValues;
   };
 
+  // Bounds over every value added, complete once finish() ran; meaningless
+  // when no value was added.
+  int64_t min() const noexcept { return overallMin; }
+  int64_t max() const noexcept { return overallMax; }
+  int64_t count() const noexcept { return nAdded; }
+
 private:
   OutputStream& out;
   size_t colStart;

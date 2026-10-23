@@ -751,7 +751,10 @@ inline std::vector<PreparedSource> prepareFilterSources(
       continue;
     }
 
-    if (use != nullptr && use->scope() == FilterKeyScope::READER_STABLE) {
+    // A reader-wide canonical value must cover every segment: a weight whose
+    // mask pruned some prepares privately and leaves the lane alone.
+    if (use != nullptr && use->scope() == FilterKeyScope::READER_STABLE
+        && weight->viableSegments().isAll()) {
       auto probe = use->probeReaderStable(ctx.reader, ctx.domainPerSeg);
       std::shared_ptr<const FilterCache::ReaderValue> value;
       ReaderStablePreparedWeight::CacheOutcome outcome =
@@ -1407,6 +1410,9 @@ public:
 inline DomainHandle materializeEffectiveFilter(
     const PreparedSource& source, IndexReader& reader,
     IndexReader::Segment& segment, DocSet* domain) {
+  if (source.segmentSource().excludesSegment(segment.ord)) {
+    return DomainHandle::borrowed(&DocSet::emptyInstance());
+  }
   auto& weight = *source.weight;
   auto* prepared = source.prepared.get();
   auto* use = source.cacheUse;
@@ -1421,7 +1427,7 @@ inline DomainHandle materializeEffectiveFilter(
 
   if (use->scope() == FilterKeyScope::READER_STABLE) {
     if (auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared)) {
-      DocSet* canonical = segment.liveDocs() == nullptr
+      DocSet* canonical = !segment.hasDeletes()
           ? nullptr : &segment.liveDocs()->docset();
       assert(domain == nullptr || domain == canonical);
       return DomainHandle::borrowed(cached->docSet(segment));

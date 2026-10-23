@@ -10,6 +10,7 @@
 #include "AllQuery.h"
 #include "Query.h"
 #include "luxir/reader/DocsReader.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -35,6 +36,10 @@ public:
   }
 
   std::string_view getField() const { return field; }
+
+  MatchState mayMatch(const SummaryView& view) const override {
+    return summary::existsMatch(view, field);
+  }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
@@ -115,7 +120,7 @@ public:
     }
 
     // Header totals include deleted docs, so a restricted segment needs iteration.
-    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) override {
+    CountShortcut countShortcutImpl(IndexReader::Segment& segment, DocSet* domain) override {
       const auto* info = segmentInfo(segment);
       return countBound(segment, domain, info ? info->docsWithField : 0,
                         CountHow::METADATA);
@@ -198,7 +203,7 @@ public:
           BulkUse use, const BulkScorerContext& bulkContext) override {
         unused(use);
         if (bulkContext.requireConstantCount
-            && segment.liveDocs() == nullptr) {
+            && !segment.hasDeletes()) {
           return {
             BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
             BulkAnswer::NO, nullptr, cost(),

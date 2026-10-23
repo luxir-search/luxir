@@ -281,6 +281,7 @@ publication advances the schema generation.
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
 | `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
+| `summary` | What each segment records about the field for query-time pruning: `{"terms": "auto"|"set"|"filter"|"none", "set_max": N, "filter_max_bytes": N, "prefixes": [L, ...], "bounds": true}`; see [Segment summaries](#segment-summaries) |
 
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you
@@ -758,6 +759,38 @@ stemming; its string variant keeps the whole value for sorting, faceting,
 and exact lookup through the inferred value binding. See
 [field retrieval](searching.md#field-retrieval-and-result-shape)
 for retrieving a particular variant.
+
+## Segment summaries
+
+Every segment carries a summary of its fields that lets a query skip the
+segment without reading it: field presence, document and value counts,
+numeric, date and geo bounds, first and last term, and a term presence
+structure (see the [design page](../design/segment-summaries.md)). Bounds and
+counts cost almost nothing and are always recorded; the term structure is the
+configurable part:
+
+```json
+{"fields": {
+  "tenant_s": {"type": "string", "summary": {"terms": "set", "set_max": 1024}},
+  "message_t": {"type": "text", "summary": {"terms": "filter", "filter_max_bytes": 4194304}},
+  "trace_id_s": {"type": "string", "summary": {"prefixes": [8]}},
+  "blob_s": {"type": "string", "summary": {"terms": "none"}}
+}}
+```
+
+| Key | Meaning |
+|---|---|
+| `terms` | `auto` (default): `string` and `id` fields keep an exact sorted set of their distinct terms up to `set_max`, else a probabilistic filter; `text` fields get a filter (an exact set when they have few terms). `set`: an exact set up to `set_max`, nothing above it. `filter`: a filter within `filter_max_bytes` even for a small set. `none`: no term structure. A column-only `string` (`index: none`) accepts only `set` or `none`. |
+| `set_max` | Exact-set cap, 1 to 4096 distinct terms; default 256. |
+| `filter_max_bytes` | Filter budget per segment and field, at least 4096; default 1 MiB, enough for about 900,000 distinct terms. Over budget the field degrades to a smaller Bloom filter, then to bounds only. |
+| `prefixes` | Extra prefix filters for prefix queries, by prefix byte length (1 to 32); indexed `string` and `text` only. A prefix query probes the longest configured length not above its prefix. |
+| `bounds` | Record numeric, date, geo and term bounds and vector statistics; default `true`. |
+
+`summary` inherits as one unit, like `ann`: a definition on a field replaces
+the parent's whole setting. Summaries never produce false negatives: a filter
+answers "maybe" or "definitely absent", and every bound includes deleted
+documents until a merge recomputes it. Changing the policy applies to segments
+written afterwards.
 
 ## STRING normalization and length
 

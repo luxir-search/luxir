@@ -1391,6 +1391,8 @@ private:
       outputFieldInfo = &merger.postingsWriter.addField(compactFields[0]->segFieldInfo.fieldname);
       outputFieldInfo->type = FieldType::TEXT;
       outputFieldInfo->flags = flags;
+      merger.postingsWriter.summaryFor(*outputFieldInfo,
+                                       merger.summaryPolicyFor(std::string_view(outputFieldInfo->fieldname)));
       preparedNorms = NormsWriter::prepare(pool, merger.postingsWriter, *outputFieldInfo,
                                            normBytes, normDocsWithField,
                                            numNormDocsWithField);
@@ -1444,6 +1446,7 @@ private:
 
       TextWriter writer(merger.postingsWriter, termsOut, docsOut, posOut);
       writer.startField(&rangeFieldInfo);
+      if (outputFieldInfo->summary != nullptr) writer.setSummaryPolicy(outputFieldInfo->summary->policy);
       if (FieldType::hasPositions(flags)) {
         writer.setNorms(preparedNorms.textView());
       }
@@ -1479,11 +1482,19 @@ private:
       int64_t sumDocFreq = 0;
       int64_t sumTotalTermFreq = 0;
       bool mayHaveFitted = false;
+      std::string firstTerm;
+      std::optional<TermKeyCollector> summaryKeys;
 
       for (auto& outputPtr : outputs) {
         RangeOutput& output = *outputPtr;
         auto& result = output.result;
         if (result.nTerms == 0) continue;
+        if (termOrd == 0) firstTerm = result.firstTerm;
+        // Ranges are disjoint and ascending, so their collectors concatenate.
+        if (result.keys) {
+          if (summaryKeys) summaryKeys->append(std::move(*result.keys));
+          else summaryKeys.emplace(std::move(*result.keys));
+        }
 
         seg_location termsBase = termsOut.slocation();
         if (blockOrd != 0) {
@@ -1515,6 +1526,11 @@ private:
         previousLastTerm = result.lastTerm;
       }
 
+      if (outputFieldInfo->summary != nullptr) {
+        outputFieldInfo->summary->setTermBounds(firstTerm, previousLastTerm, (uint64_t)termOrd);
+        outputFieldInfo->summary->mayHaveFitted = mayHaveFitted;
+        if (summaryKeys) outputFieldInfo->summary->setTermKeys(std::move(*summaryKeys));
+      }
       outputFieldInfo->nTerms = termOrd;
       outputFieldInfo->sumDocFreq = sumDocFreq;
       outputFieldInfo->sumTotalTermFreq = sumTotalTermFreq;
@@ -1648,6 +1664,7 @@ private:
     outputFieldInfo.type = type;
     outputFieldInfo.flags = allFlags;
     outputFieldInfo.typeFlags = FieldType::typeParameters(type, firstInfo.typeFlags);
+    postingsWriter.summaryFor(outputFieldInfo, summaryPolicyFor(std::string_view(outputFieldInfo.fieldname)));
     NormsWriter::PreparedNorms preparedNorms;
     if (isText) {
       preparedNorms = NormsWriter::prepare(pool, postingsWriter, outputFieldInfo, normBytes,
@@ -1720,6 +1737,13 @@ private:
     }
   }
 
+
+  // Summary settings for an output field: the schema's current setting
+  // (concrete field or suffix template), else the defaults.
+  SummaryPolicy summaryPolicyFor(std::string_view name) const {
+    auto* type = schema.getFieldTypePtr(name);
+    return type != nullptr ? type->summary : SummaryPolicy{};
+  }
 
   // Output format for a stored-fields resource: the schema's current setting,
   // else the defaults.
@@ -1975,6 +1999,10 @@ private:
     // and writes the corresponding endOffset entry (lazily starting the mono column if
     // a size mismatch appears).
     auto emitValue = [&](std::string_view value) {
+      if (outputFieldInfo.summary != nullptr) {
+        if (outputFieldInfo.type == FieldType::Type::VECTOR) outputFieldInfo.summary->addVectorBytes(value);
+        else outputFieldInfo.summary->addColumnValue(value);
+      }
       int32_t valueSize = (int32_t)value.size();
       valuesOut->write(value.data(), valueSize);
       cumulativeBytes += valueSize;
@@ -2301,6 +2329,9 @@ private:
           for (int64_t inRank = lastEndValueRankIn; inRank < endValueRank; inRank++) {
             auto val = values.valueAt(inRank);
             intColWriter->addInt64(val);
+            if (outputFieldInfo.summary != nullptr && outputFieldInfo.type == FieldType::GEO_POINT) {
+              outputFieldInfo.summary->addGeoPacked(val);
+            }
             if (geoPoints != nullptr) {
               geoPoints->push_back({geo::unpackLatitude(val),
                                     geo::unpackLongitude(val), mappedDoc});
@@ -2313,6 +2344,9 @@ private:
           // single-valued
           auto val = values.valueAt(docRankIn);
           intColWriter->addInt64(val);
+          if (outputFieldInfo.summary != nullptr && outputFieldInfo.type == FieldType::GEO_POINT) {
+            outputFieldInfo.summary->addGeoPacked(val);
+          }
           if (geoPoints != nullptr) {
             geoPoints->push_back({geo::unpackLatitude(val),
                                   geo::unpackLongitude(val), mappedDoc});

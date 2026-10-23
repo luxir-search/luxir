@@ -1754,7 +1754,12 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
     }
   }
   EXPECT_GT(deletedSegmentId, 0); // Should have found a deleted segment
-  
+  // Readers hold their snapshot's files (a lazily opened segment must still
+  // find them), so the dropped segment's files go with the last reader.
+  indexReader.reset();
+  indexReader2.reset();
+  indexReader3.reset();
+
   // Add another document to force another commit, which should wait long enough for the segment to be deleted.
   Doc doc4 = flatdoc("id", "doc4", "text_w", "final document");
   helper.index(doc4, UpdateMessage::COMMIT, true);
@@ -3169,6 +3174,9 @@ TEST_F(IndexWriterTest, manifestInventorySurvivesReopenAndMerge) {
       EXPECT_EQ(before, verify());
       reopened.mergeSegments();
       verify();
+      // The published pre-merge reader holds its files until a refresh
+      // replaces it; then the merged-away files go.
+      reopened.snapshots.readers.getReader(0);
       for (const auto& [name, descriptor] : before) EXPECT_EQ(nullptr, dir->openFile(name));
       std::vector<Directory::FileInfo> files;
       dir->listFiles(files);

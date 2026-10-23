@@ -165,6 +165,12 @@ inside the vector search rather than as a post-pass over a fixed unfiltered
 top-k, and hybrid ranking combines lexical and vector evidence in a single
 request.
 
+Before a segment is touched, the query tree is checked against the segment's
+summary (field presence, counts, bounds, term filters): a segment that
+provably cannot match is skipped without opening its files, and the manifest's
+collection-level summary answers the same question for a whole collection. See
+[segment-summaries.md](segment-summaries.md).
+
 Filters are cached per collection as document sets. Entries are ranked by
 how expensive they are to rebuild per byte, so under pressure a cheap
 single-term filter is evicted before a compound boolean or a kNN membership

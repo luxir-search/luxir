@@ -1569,6 +1569,7 @@ TEST_F(ReplicationFollowerTest, excludedHistorySurvivesUntilReinclusion) {
   ASSERT_TRUE(until([&] {
     try { follower->getCollection(beta); return false; }
     catch (const CollectionNotFoundError&) { return true; }
+    catch (const CollectionUnavailableError&) { return false; }  // deletion still in progress
   })); // same-boot catalog absence becomes authoritative again
 }
 

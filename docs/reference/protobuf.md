@@ -2835,6 +2835,7 @@ Bit positions in the packed request option word, not masks. The two date bits fo
 | <a id="value-luxir.requestflagbit.date_mode_low_bit"></a>[`DATE_MODE_LOW_BIT`](#value-luxir.requestflagbit.date_mode_low_bit) | 0 |  |
 | <a id="value-luxir.requestflagbit.date_mode_high_bit"></a>[`DATE_MODE_HIGH_BIT`](#value-luxir.requestflagbit.date_mode_high_bit) | 1 |  |
 | <a id="value-luxir.requestflagbit.int64_str_bit"></a>[`INT64_STR_BIT`](#value-luxir.requestflagbit.int64_str_bit) | 2 | request-only: quote JSON integers outside the safe range |
+| <a id="value-luxir.requestflagbit.global_stats_bit"></a>[`GLOBAL_STATS_BIT`](#value-luxir.requestflagbit.global_stats_bit) | 3 | BM25 statistics over every segment, not just the unpruned ones |
 
 <a id="enum-luxir.responseformat"></a>
 

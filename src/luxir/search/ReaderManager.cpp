@@ -8,8 +8,8 @@
 
 namespace luxir {
 
-ReaderManager::ReaderManager(Directory& dir, FilterCacheConfig config)
-    : dir(dir), originalFilterCacheConfig(config), filterCache(std::make_shared<FilterCache>(config)) {}
+ReaderManager::ReaderManager(std::shared_ptr<Directory> dir, FilterCacheConfig config)
+    : dir(std::move(dir)), originalFilterCacheConfig(config), filterCache(std::make_shared<FilterCache>(config)) {}
 
 void ReaderManager::throwClosed() {
   throw ApiError(ErrorKind::UNAVAILABLE, "reader_closed", "reader manager is closed");
@@ -20,7 +20,9 @@ std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapsh
   std::lock_guard lock(indexReaderMutex);
   checkOpen();
   auto previous = indexReader.load();
-  return std::make_shared<IndexReader>(source, snapshot, previous.get(), filterCache);
+  // Install path: every file is verified and opened now, through `source`.
+  auto hold = holdFiles ? holdFiles(snapshot) : nullptr;
+  return std::make_shared<IndexReader>(dir, snapshot, previous.get(), filterCache, std::move(hold), &source);
 }
 
 void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {
@@ -85,7 +87,9 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
         if (!snapshot) throw ApiError(ErrorKind::UNAVAILABLE, "snapshot_unavailable", "no snapshot installed");
         try {
           Signal::emit("indexReaderOpening", this);
-          return std::make_shared<IndexReader>(dir, *snapshot, previous, filterCache);
+          // Local reopen: segments open lazily; the hold keeps their files.
+          auto hold = holdFiles ? holdFiles(*snapshot) : nullptr;
+          return std::make_shared<IndexReader>(dir, *snapshot, previous, filterCache, std::move(hold));
         } catch (...) {
           if (snapshot == published.load()) throw;
         }
@@ -112,7 +116,7 @@ ReaderManager::Stats ReaderManager::stats(bool includeSegments, bool includeFile
   out.updateVersion = info.update_version;
   out.schemaGen = info.schema_gen;
   out.segments = out.committedSegments = info.segments.size();
-  if (includeFiles) out.totalBytes = dir.totalBytes();
+  if (includeFiles) out.totalBytes = dir->totalBytes();
   auto copyAux = [](const api::AuxIndexInfo& aux) {
     AuxStats result;
     result.kind = aux.kind;

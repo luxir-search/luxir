@@ -52,6 +52,10 @@ public:
     fieldInfo.columnLoc = writer.columnLocation();
     fieldInfo.columnMetaOff = data.columnMetaOff;
     fieldInfo.numValues = data.numValues;  // TODO: do this here?
+    // Numeric segment summary bounds come straight from the column's own.
+    if (fieldInfo.summary != nullptr && data.numValues > 0 && FieldType::sortsByIntColumn(fieldInfo.type)) {
+      fieldInfo.summary->addNumericBounds(writer.min(), writer.max());
+    }
     return data.numValues;
   }
 };

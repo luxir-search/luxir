@@ -151,6 +151,8 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
                 requestBounds, resource);
   dst.search_resource_exhausted = counter(MetricCounter::SEARCH_RESOURCE_EXHAUSTED);
   dst.search_warnings = counter(MetricCounter::SEARCH_WARNINGS);
+  dst.segments_considered = counter(MetricCounter::SEGMENTS_CONSIDERED);
+  dst.segments_pruned = counter(MetricCounter::SEGMENTS_PRUNED);
   fillActivity(dst.index_batches, counts, metricActivity(MetricStage::INDEX_BATCH), resource);
   dst.documents_accepted = counter(MetricCounter::DOCUMENTS_ACCEPTED);
   dst.documents_rejected = counter(MetricCounter::DOCUMENTS_REJECTED);

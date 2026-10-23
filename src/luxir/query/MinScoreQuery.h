@@ -448,6 +448,10 @@ public:
     return child->requiredValueEnvelope(field);
   }
 
+  MatchState mayMatch(const SummaryView& view) const override {
+    return child->mayMatch(view);
+  }
+
   void validateLogicalImpl(
       PlanningContext& context, float multiplier = 1.0f) const override {
     checkedBoostProduct(multiplier, 1.0f);
@@ -513,6 +517,7 @@ public:
            float multiplier)
       : Query::Weight(context, query, flags), minScore(query.minScore),
         multiplier(multiplier), scored((flags & NEED_SCORES) != 0) {
+      Context::MaskScope maskScope(context, viable);
       childWeight = query.child->createWeight(
           context, (flags & ~EXCLUSION_WINDOW_FILL) | NEED_SCORES | ALLOW_PRUNING,
           1.0f);
@@ -523,7 +528,7 @@ public:
       if (!scored) traits |= IS_CONSTANT_SCORING;
     }
 
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(
         Query::Weight::PrepareContext& ctx) override {
       QueryPrep::PreparedSource source;
       source.weight = childWeight;

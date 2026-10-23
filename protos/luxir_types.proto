@@ -17,6 +17,7 @@ enum RequestFlagBit {
   DATE_MODE_LOW_BIT = 0;
   DATE_MODE_HIGH_BIT = 1;
   INT64_STR_BIT = 2; // request-only: quote JSON integers outside the safe range
+  GLOBAL_STATS_BIT = 3; // BM25 statistics over every segment, not just the unpruned ones
 }
 
 // Top-level search request that can contain multiple search operations.
@@ -952,6 +953,28 @@ message ExecutionProfilePiece {
 }
 
 // Top-level response to a Search request
+// Answer to Searcher.CanMatch and POST /collections/{c}/_can_match: whether
+// the collection's summaries leave any chance of a match. NO_MATCH is a
+// proof over the pinned snapshot named by `commit`; MAY_MATCH proves nothing.
+message CanMatchResponse {
+  enum Verdict {
+    MAY_MATCH = 0;
+    NO_MATCH = 1;
+  }
+  message Op {
+    string op = 1;
+    Verdict verdict = 2;
+    string reason = 3;  // what proved NO_MATCH, or summary_missing / summary_incomplete
+  }
+  Verdict verdict = 1;             // NO_MATCH only when every query-bearing op is NO_MATCH
+  string commit = 2;               // the snapshot evaluated
+  bool summary_complete = 3;       // every segment contributed a summary to the aggregate
+  uint64 segments = 4;             // segments in the snapshot
+  repeated Op ops = 5;
+  repeated uint64 pruned_segments = 6;  // segment ids no op can match (with segment detail requested)
+  Error error = 7;
+}
+
 message SearchResponse {
   string commit = 7; // token of the reader used for this response
   string request_id = 1;
@@ -1535,6 +1558,10 @@ message ServiceStats {
   ActivityStats merge = 16;
   ActivityStats vector_build = 17;
   ActivityStats reader_refresh = 18;
+  // Segments a search considered and segments its summaries proved unable
+  // to match, so never opened (segment pruning).
+  uint64 segments_considered = 23;
+  uint64 segments_pruned = 24;
 }
 
 // This process, its data filesystem and its cgroup. Collectors that read their
@@ -2320,6 +2347,10 @@ message FieldDef {
   // definition (no per-property merge), else every VectorAnnDef default.
   VectorAnnDef ann = 22;
 
+  // Segment summary policy for query-time pruning. Absent inherits the
+  // parent's whole definition (no per-property merge), else every default.
+  FieldSummaryDef summary = 23;
+
   // DATE only: unit of numeric ingest and stored epoch values. ISO-8601
   // text is converted to this precision, truncating toward earlier time.
   // NS reserves the int64 extrema and covers 1677-09-21 to 2262-04-11.
@@ -2330,6 +2361,33 @@ message FieldDef {
     NS = 1; // nanoseconds
   }
   optional DateUnit unit = 24;
+}
+
+// Per-field settings for the segment summaries that let a query skip a
+// segment or a collection without reading its data. Bounds (numeric, date,
+// geo and term min/max) and counts are always cheap; the term presence
+// structure is the only one with a size cost, so it is the configurable part.
+message FieldSummaryDef {
+  enum Terms {
+    AUTO = 0;    // string/id: exact set up to set_max distinct terms, else a filter; text: filter (exact set when tiny)
+    SET = 1;     // exact sorted set up to set_max distinct terms; above that, nothing
+    FILTER = 2;  // probabilistic filter within filter_max_bytes, even for a small set
+    NONE = 3;    // no term presence structure; bounds and counts are still recorded
+  }
+  // STRING, ID and TEXT; a column-only STRING accepts set or none.
+  optional Terms terms = 1;
+  // Exact set cap, 1..4096; absent selects 256.
+  optional uint32 set_max = 2;
+  // Filter budget per segment and field, at least 4096; absent selects 1 MiB.
+  // Over budget the field degrades to a smaller Bloom filter, then to
+  // bounds only.
+  optional uint64 filter_max_bytes = 3;
+  // Extra prefix filters for prefix queries, by prefix byte length (1..32);
+  // indexed STRING and TEXT only.
+  repeated uint32 prefixes = 4;
+  // Record numeric, date, geo and term bounds and vector statistics; absent
+  // selects true.
+  optional bool bounds = 5;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

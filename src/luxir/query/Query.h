@@ -22,6 +22,8 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
+#include "SegmentMask.h"
+#include "SummaryView.h"
 #include "Warnings.h"
 #include "luxir/util/proto.h"
 #include "luxir/util/StrRef.h"
@@ -309,9 +311,31 @@ public:
 };
 
 struct CachedTermInfo {
+  // Totals over every segment seeked so far (`seeked`); a weight sums its
+  // own mask with statsOver().
   Similarity::TermStats termStats = {};
   Similarity::BM25Scorer* simScorer = nullptr;  // This may be null even if other elements are fille in (phrase query would have different one)
   std::span<const TermsEnum::PostingsState*> postingsStates = {};
+  SegmentMask seeked;
+
+  // Statistics over the segments of `mask`, which must have been seeked.
+  Similarity::TermStats statsOver(const SegmentMask& mask) const {
+    assert(mask.subsetOf(seeked));
+    Similarity::TermStats stats = {};
+    mask.forEach([&](size_t ord) {
+      if (const auto* state = postingsStates[ord]) {
+        stats.docFreq += state->docFreq;
+        stats.totalTermFreq += state->totalTermFreq;
+      }
+    });
+    return stats;
+  }
+  // Whether any segment of `mask` holds the term.
+  bool foundIn(const SegmentMask& mask) const {
+    bool found = false;
+    mask.forEach([&](size_t ord) { found |= postingsStates[ord] != nullptr; });
+    return found;
+  }
 
   /// Construct an independent tiered docs enum from the immutable state captured by the
   /// original term seek. No dictionary re-seek or shared mutable enum is involved.
@@ -332,7 +356,11 @@ struct CachedTermInfo {
 
 struct CachedFieldInfo {
   IndexReader::FieldSegments segInfos;
+  // Totals over every segment; statsOver() restricts them to a weight's mask.
   Similarity::FieldStats fieldStats = {};
+  Similarity::FieldStats statsOver(const SegmentMask& mask) const {
+    return mask.isAll() ? fieldStats : segInfos.stats(mask);
+  }
   std::span<TermsEnum*> termsEnums = {};  // TODO: cache align if they will be used in multiple threads
   boost::unordered_node_map<std::string_view, CachedTermInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
 
@@ -640,6 +668,17 @@ public:
     return std::nullopt;
   }
 
+  // Whether this query can match any document of the data `view`
+  // summarizes: EMPTY is a proof that none does (over live and deleted
+  // documents alike), UNKNOWN is always legal, NONEMPTY says only that the
+  // summary offers no proof of absence. A pure function of the logical tree
+  // and the view; it must never read a segment. Leaves consult evidence by
+  // tier and stop at what the view allows (SummaryView::allows).
+  virtual MatchState mayMatch(const SummaryView& view) const {
+    unused(view);
+    return MatchState::UNKNOWN;
+  }
+
   // Validate the complete logical tree once during serial request planning,
   // before cache lookup or Weight construction. Every concrete query must
   // make an explicit validation decision. A composite MUST override
@@ -758,7 +797,7 @@ public:
     if (bound == 0) return {0, CountHow::METADATA};
     int64_t minMatches = how == CountHow::METADATA && domain == nullptr
         ? std::max<int64_t>(0, docs - (segment.maxDoc() - segment.numLive())) : 0;
-    if (domain || segment.liveDocs()) how = CountHow::ITERATE;
+    if (domain || segment.hasDeletes()) how = CountHow::ITERATE;
     return {bound, how, nullptr, minMatches};
   }
 
@@ -1049,7 +1088,16 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment,
         SupplierExecutionMode executionMode =
             SupplierExecutionMode::ORDINARY) {
+      if (excludesSegment(segment.ord)) return nullptr;
       return scorerSupplierImpl(targetPool, segment, executionMode);
+    }
+
+    /// True when summaries proved this source cannot match the segment: it
+    /// is then never asked for a supplier, scorer, count or prepared domain,
+    /// and contributes nothing there, without the segment being opened.
+    virtual bool excludesSegment(int32_t ord) const noexcept {
+      unused(ord);
+      return false;
     }
 
     virtual Query::ScorerSupplier* scorerSupplierImpl(
@@ -1081,6 +1129,8 @@ public:
     boost::unordered_node_map<const Query*, CachedFilterIdentity>
         filterIdentities;
     boost::unordered_flat_map<const Query*, void*> logicalPlans;
+    // Segments each logical subtree may match (QueryPruning), by Query address.
+    boost::unordered_flat_map<const Query*, SegmentMask> viableMasks;
 #ifndef NDEBUG
     boost::unordered_flat_set<const Query*> logicallyValidatedQueries;
 #endif
@@ -1112,6 +1162,24 @@ public:
     FilterKeyContext filterKeyContext;
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
+
+    // The segments `query` may match in this reader, by ordinal: the
+    // query's own proofs (not its parents'), memoized for the request.
+    const SegmentMask& viableSegments(const Query& query);
+    SegmentMask allSegments() {
+      return SegmentMask::make(pool, topReader.segments().size(), true);
+    }
+
+    // The global_stats request flag: BM25 statistics sum over every segment
+    // (seeking terms in pruned ones too) rather than over a weight's mask.
+    bool globalStats = false;
+    SegmentMask everySegment;
+    // The segments a weight with mask `viable` takes its statistics from.
+    const SegmentMask& statsMask(const SegmentMask& viable) {
+      if (!globalStats) return viable;
+      if (everySegment.empty()) everySegment = allSegments();
+      return everySegment;
+    }
 
     PlanningContext(
         MemPool& pool, IndexReader& topReader, Limits limits = {},
@@ -1355,6 +1423,28 @@ public:
 
     PlanningContext& planningContext() const noexcept { return planning; }
 
+    // The mask of the weight whose children are being created, set by a
+    // composite weight for the duration of its child creation; a child's
+    // own mask is this intersected with its own proofs. createWeight runs
+    // single-threaded, so a plain pointer suffices.
+    const SegmentMask* scopeMask = nullptr;
+    class MaskScope {
+      Context& context;
+      const SegmentMask* saved;
+    public:
+      MaskScope(Context& context, const SegmentMask& mask) : context(context), saved(context.scopeMask) {
+        context.scopeMask = &mask;
+      }
+      ~MaskScope() { context.scopeMask = saved; }
+      MaskScope(const MaskScope&) = delete;
+      MaskScope& operator=(const MaskScope&) = delete;
+    };
+    // A fresh pool copy of the current scope's mask (every segment when none).
+    SegmentMask scopedMaskCopy() {
+      if (scopeMask != nullptr) return scopeMask->copy(pool);
+      return SegmentMask::make(pool, topReader.segments().size(), true);
+    }
+
     google::protobuf::Arena& arena() const noexcept {
       return *allocationArena;
     }
@@ -1425,41 +1515,35 @@ public:
     }
 
   public:
-    CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term) {
+    // The term's per-segment postings states over the segments of `need`
+    // (every segment when null). Segments outside the mask are not seeked,
+    // so a pruned segment is never opened; a later call with a wider mask
+    // extends the entry. Returns null when no segment of the mask holds the
+    // term.
+    CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term,
+                                      const SegmentMask* need = nullptr) {
       auto [iter, inserted] = cachedFieldInfo.termInfos.try_emplace(term);
       CachedTermInfo& result = iter->second;
-      if (!inserted) {
-        return &result;
+      size_t numSegs = numSegments();
+      if (inserted) {
+        auto* states = pool.make_arr<const TermsEnum::PostingsState*>(numSegs);
+        for (size_t i = 0; i < numSegs; i++) states[i] = nullptr;
+        result.postingsStates = {states, numSegs};
+        result.seeked = SegmentMask::make(pool, numSegs, false);
       }
-
-      auto numSegs = numSegments();
-      // TermsEnums survive missing-term lookups; allocate them before the
-      // temporary postings states that can be rewound below.
-      for (size_t i = 0; i < numSegs; i++) getTermsEnum(cachedFieldInfo, i);
-      auto savepoint = pool.getSavePoint();
-      int foundInSegCount = 0;
-      result.postingsStates = {
-          pool.make_arr<const TermsEnum::PostingsState*>(numSegs), numSegs};
-      for (int i = 0; i < numSegs; ++i) {
-        auto* termsEnum = cachedFieldInfo.termsEnums[i];
-        if (!termsEnum || !termsEnum->seek(term)) {
-          result.postingsStates[i] = nullptr;
-          continue;
-        }
-        foundInSegCount++;
+      auto* states = const_cast<const TermsEnum::PostingsState**>(result.postingsStates.data());
+      for (size_t i = 0; i < numSegs; i++) {
+        if ((need != nullptr && !need->test(i)) || result.seeked.test(i)) continue;
+        result.seeked.set(i);
+        auto* termsEnum = getTermsEnum(cachedFieldInfo, i);
+        if (!termsEnum || !termsEnum->seek(term)) continue;
         auto* state = pool.make<TermsEnum::PostingsState>(termsEnum->postingsState());
-        result.postingsStates[i] = state;
+        states[i] = state;
         result.termStats.docFreq += state->docFreq;
         result.termStats.totalTermFreq += state->totalTermFreq;
       }
-
-      if (foundInSegCount == 0) {
-        pool.rewind(savepoint);
-        cachedFieldInfo.termInfos.erase(iter);
-        return nullptr;
-      }
-
-      return &result;
+      bool found = need != nullptr ? result.foundIn(*need) : result.foundIn(result.seeked);
+      return found ? &result : nullptr;
     }
 
     bool lookupTermStats(CachedFieldInfo& cachedFieldInfo, std::string_view term, Similarity::TermStats& result) {
@@ -1506,14 +1590,23 @@ public:
       UNION,
     };
 
+    // The segments this weight may execute against: its parent's mask
+    // intersected with its own query's proofs (QueryPruning). Pool-backed.
+    SegmentMask viable;
+
     Weight(Query::Context& context, const Query& query, int32_t inputFlags)
       : context(context), inputFlags(inputFlags) {
 #ifndef NDEBUG
       context.assertLogicalValidation(query);
-#else
-      unused(query);
 #endif
+      viable = context.scopedMaskCopy();
+      viable &= context.planningContext().viableSegments(query);
     }
+
+    bool excludesSegment(int32_t ord) const noexcept override {
+      return !viable.test((size_t)ord);
+    }
+    const SegmentMask& viableSegments() const noexcept { return viable; }
 
     /// Per-segment domains available during prepare(). An empty domain span
     /// means unrestricted aside from whatever the caller applies later.
@@ -1544,6 +1637,12 @@ public:
     /// whole-index work has completed.
     class PreparedWeight : public Query::SegmentSource {
     public:
+      // The preparing weight's mask, stamped by Weight::prepare.
+      SegmentMask viable;
+      bool excludesSegment(int32_t ord) const noexcept override {
+        return !viable.empty() && !viable.test((size_t)ord);
+      }
+
       /// Create a scorer from prepared state. Follows the same threading and
       /// allocation rules as Weight::createScorer().
       virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
@@ -1624,8 +1723,12 @@ public:
     /// INDEX_WALK may decode crossing index leaves; ITERATE is a bound.
     /// Resolvable non-metadata shortcuts name the leaf that resolves them.
     /// Execution may resolve more than this metadata proves.
-    virtual CountShortcut countShortcut(IndexReader::Segment& segment,
-                                         DocSet* domain) {
+    CountShortcut countShortcut(IndexReader::Segment& segment, DocSet* domain) {
+      if (excludesSegment(segment.ord)) return CountShortcut{0, CountHow::METADATA};
+      return countShortcutImpl(segment, domain);
+    }
+    virtual CountShortcut countShortcutImpl(IndexReader::Segment& segment,
+                                            DocSet* domain) {
       return countBound(segment, domain, segment.maxDoc());
     }
 
@@ -1639,7 +1742,11 @@ public:
     /// profitably abandon top-k pruning, or -1 when this weight's shape is not
     /// eligible. Implementations must inspect suppliers only: this planner hook
     /// runs before request execution and must not populate filter caches.
-    virtual int64_t sparseFilteredTopKCost(
+    int64_t sparseFilteredTopKCost(MemPool& target, IndexReader::Segment& segment) {
+      if (excludesSegment(segment.ord)) return 0;
+      return sparseFilteredTopKCostImpl(target, segment);
+    }
+    virtual int64_t sparseFilteredTopKCostImpl(
         MemPool& target, IndexReader::Segment& segment) {
       unused(target, segment);
       return -1;
@@ -1661,7 +1768,25 @@ public:
     /// The returned PreparedWeight may later be asked to create per-segment
     /// scorers from segment tasks, so createScorer() should treat its stored
     /// prepared state as read-only.
-    virtual std::unique_ptr<PreparedWeight> prepare(PrepareContext& ctx) {
+    std::unique_ptr<PreparedWeight> prepare(PrepareContext& ctx) {
+      std::unique_ptr<PreparedWeight> prepared;
+      if (viable.isAll()) {
+        prepared = prepareImpl(ctx);
+      } else {
+        // Pruned segments keep their slot, with an empty domain: a prepared
+        // weight sees one entry per ordinal and nothing eligible there.
+        std::vector<DocSet*> domains(ctx.reader.segments().size());
+        for (size_t ord = 0; ord < domains.size(); ord++) {
+          domains[ord] = !viable.test(ord) ? &DocSet::emptyInstance()
+              : (ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[ord]);
+        }
+        PrepareContext masked(ctx.reader, domains, ctx.parallel, ctx.warnings);
+        prepared = prepareImpl(masked);
+      }
+      if (prepared) prepared->viable = viable;
+      return prepared;
+    }
+    virtual std::unique_ptr<PreparedWeight> prepareImpl(PrepareContext& ctx) {
       unused(ctx);
       return nullptr;
     }

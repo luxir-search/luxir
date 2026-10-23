@@ -9,6 +9,77 @@
 
 namespace luxir {
 
+CommitSnapshotRegistry::CommitSnapshotRegistry(std::shared_ptr<Directory> dir, FilterCacheConfig config, Now now)
+    : ownedDir(std::move(dir)), now(std::move(now)), dir(*ownedDir), readers(ownedDir, config) {
+  holdGate->registry = this;
+  readers.holdFiles = [this](const CommitSnapshot& snapshot) { return hold(snapshot); };
+}
+
+CommitSnapshotRegistry::~CommitSnapshotRegistry() {
+  close();
+  std::lock_guard gate(holdGate->mutex);
+  holdGate->registry = nullptr;
+}
+
+std::shared_ptr<void> CommitSnapshotRegistry::hold(const CommitSnapshot& snapshot) {
+  struct Token {
+    std::shared_ptr<HoldGate> gate;
+    std::shared_ptr<const CommitSnapshot> snapshot;
+    uint64_t epoch = 0;
+    ~Token() {
+      std::lock_guard gateLock(gate->mutex);
+      auto* registry = gate->registry;
+      if (registry == nullptr) return;
+      std::vector<std::string> retired;
+      {
+        std::lock_guard lock(registry->mutex);
+        registry->releaseHoldLocked(*snapshot, epoch, retired);
+      }
+      registry->unlink(retired);
+    }
+  };
+  // The hold keeps the snapshot's descriptors alive for its own release.
+  auto token = std::make_shared<Token>();
+  token->gate = holdGate;
+  token->snapshot = std::make_shared<const CommitSnapshot>(snapshot);
+  std::lock_guard lock(mutex);
+  if (closed) return nullptr;
+  token->epoch = holdEpoch;
+  size_t added = 0;
+  try {
+    for (const auto& file : token->snapshot->files) {
+      auto [it, inserted] = files.try_emplace(file.name, FileRef{file.size});
+      it->second.pins++;
+      added++;
+    }
+  } catch (...) {
+    for (size_t i = 0; i < added; i++) {
+      auto it = files.find(token->snapshot->files[i].name);
+      if (--it->second.pins == 0) files.erase(it);
+    }
+    throw;
+  }
+  holdCount++;
+  return token;
+}
+
+void CommitSnapshotRegistry::releaseHoldLocked(const CommitSnapshot& snapshot, uint64_t epoch,
+                                               std::vector<std::string>& retired) {
+  if (closed || epoch != holdEpoch) return;  // detach() already dropped the bookkeeping
+  holdCount--;
+  for (const auto& file : snapshot.files) {
+    auto it = files.find(file.name);
+    if (it == files.end()) continue;
+    auto& ref = it->second;
+    if (--ref.pins == 0) {
+      if (ref.retired) {
+        counters.retainedBytes -= ref.size;
+        retired.push_back(std::move(files.extract(it).key()));
+      } else files.erase(it);
+    }
+  }
+}
+
 void CommitSnapshotRegistry::publish(std::shared_ptr<const CommitSnapshot> snapshot,
                                      std::shared_ptr<IndexReader> opened) {
   // No pin lock: a large acquire or slow file open cannot stall publication.
@@ -373,10 +444,11 @@ void CommitSnapshotRegistry::retire(std::span<const std::string> names) {
 
 void CommitSnapshotRegistry::testReset() {
   close();
+  // Dropping the last reader releases its hold, which takes `mutex`.
+  readers.testReset();
   std::lock_guard lock(mutex);
   closed = false;
   counters = {};
-  readers.testReset();
 }
 
 void CommitSnapshotRegistry::retirePrefix(std::string_view prefix) {
@@ -388,7 +460,7 @@ void CommitSnapshotRegistry::retirePrefix(std::string_view prefix) {
     {
       std::lock_guard lock(mutex);
       if (closed) return;
-      unpinned = pins.empty();
+      unpinned = pins.empty() && holdCount == 0;
     }
     // New pins can only acquire current, which cannot contain this dead
     // segment. Preserve the backend's cheap prefix erase with no pins.
@@ -442,6 +514,8 @@ void CommitSnapshotRegistry::detach() noexcept {
     std::lock_guard lock(mutex);
     for (auto& [id, pin] : pins) pin.cancellation.request_stop();
     pins.clear();
+    holdCount = 0;
+    holdEpoch++;
     retired.swap(files);
     counters.retainedBytes = 0;
     // Admitted metadata requests can still hold the collection after close.

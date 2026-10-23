@@ -5,6 +5,7 @@
 #include "luxir/util/Metrics.h"
 
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include "IndexReader.h"
 #include "FilterCache.h"
@@ -16,7 +17,7 @@ namespace luxir {
 // A writer or follower serializes publish() after making a snapshot durable.
 // Recreating a collection uses a new manager and cache for its new incarnation.
 class ReaderManager {
-  Directory& dir;
+  std::shared_ptr<Directory> dir;
   std::mutex indexReaderMutex;
   std::atomic<std::shared_ptr<const CommitSnapshot>> published;
   // These read-only query hints must not share the snapshot or reader lock bit.
@@ -27,6 +28,9 @@ class ReaderManager {
 public:
   // The node's service counters; set by the collection that owns this manager.
   std::shared_ptr<Metrics> metrics = Metrics::detached();
+  // Holds a snapshot's files for an opened reader's lifetime (set by the
+  // owning CommitSnapshotRegistry). Null: nothing retires files underneath.
+  std::function<std::shared_ptr<void>(const CommitSnapshot&)> holdFiles;
   std::shared_ptr<FilterCache> filterCache;
   alignas(64) std::atomic<std::shared_ptr<IndexReader>> indexReader;
 
@@ -91,12 +95,14 @@ private:
 public:
   Stats stats(bool includeSegments, bool includeFiles = true);
   void cacheStats(CacheStats& out) const;
-  explicit ReaderManager(Directory& dir, FilterCacheConfig config = {});
+  explicit ReaderManager(std::shared_ptr<Directory> dir, FilterCacheConfig config = {});
+  explicit ReaderManager(Directory& dir, FilterCacheConfig config = {})
+      : ReaderManager(std::shared_ptr<Directory>(std::shared_ptr<void>{}, &dir), config) {}
   std::shared_ptr<IndexReader> getReader(uint64_t freshness_us = 0);
   std::shared_ptr<const CommitSnapshot> snapshot() const { return published.load(); }
   std::shared_ptr<Schema> getSchema() const { return snapshot()->schema; }
   // Opens a reader for a snapshot before it is published.
-  std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot) { return prepare(snapshot, dir); }
+  std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot) { return prepare(snapshot, *dir); }
   std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot, Directory& source);
   // Publishes a durable snapshot. With a reader from prepare() searches switch
   // to it now; without one, readers reopen lazily on demand (local writers).

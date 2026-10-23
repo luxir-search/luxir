@@ -432,6 +432,11 @@ public:
     child->validateLogical(context, 1.0f);
   }
 
+  // Rescoring reorders matches; the inner query decides membership.
+  MatchState mayMatch(const SummaryView& view) const override {
+    return child->mayMatch(view);
+  }
+
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
     return child->appendFilterKey(out, ctx);
@@ -511,6 +516,7 @@ public:
         needsChildScore(scored && program->needsScore) {
       if (scored) fieldInfos = program->resolveFields(context.pool, context.topReader);
       int32_t childFlags = needsChildScore ? flags : flags & ~NEED_SCORES;
+      Context::MaskScope maskScope(context, viable);
       childWeight = query.child->createWeight(context, childFlags, 1.0f);
       traits = childWeight->getFlags() & ~IS_CONSTANT_SCORING;
       if (!scored || query.constantOutput.has_value()) {
@@ -518,7 +524,7 @@ public:
       }
     }
 
-    std::unique_ptr<Query::Weight::PreparedWeight> prepare(
+    std::unique_ptr<Query::Weight::PreparedWeight> prepareImpl(
         Query::Weight::PrepareContext& ctx) override {
       QueryPrep::PreparedSource source;
       source.weight = childWeight;
@@ -560,7 +566,7 @@ public:
       return childWeight->hasReleasableSegmentState();
     }
 
-    CountShortcut countShortcut(
+    CountShortcut countShortcutImpl(
         IndexReader::Segment& segment, DocSet* domain) override {
       return childWeight->countShortcut(segment, domain);
     }
