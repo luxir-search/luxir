@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/analysis/AnalysisRegistry.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/query/QueryRegistry.h"
 #include "luxir/search/SearchOpRegistry.h"
@@ -13,6 +14,7 @@ namespace luxir {
 class Registries {
 public:
   PluginRegistry plugins;
+  AnalysisRegistry analysis;
   // Plugin query types (api::PluginQuery).
   QueryRegistry query;
   // Plugin search operations (api::PluginOp).

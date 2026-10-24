@@ -293,6 +293,7 @@ std::unique_ptr<Tokenizer> makeStandardTokenizer(bool foldAccents = false);
 // dependent, so it is a separate opt-in filter applied after nfkc_cf.
 std::unique_ptr<TokenStream> makeAccentFoldFilter(std::unique_ptr<TokenStream> source);
 
+class AnalysisRegistry;
 namespace api { struct AnalyzerComponent; struct AnalyzerDef; }  // authored definitions (api/luxir_types.hpp)
 
 // Component factories, Lucene's TokenizerFactory / TokenFilterFactory split:
@@ -333,11 +334,12 @@ public:
   virtual std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const = 0;
 };
 
-// The component registry (Analyzer.cpp): the only path from a name to a
-// stage, so validation and construction cannot drift.  An unknown name, or a
-// parameter the component does not take, throws std::invalid_argument with a
-// teaching message (the valid names / the offending keys); Schema::fromProto
-// adds the field name.
+// The component registry (AnalysisRegistry.h, globalAnalysisRegistry()):
+// the only path from a name to a stage, so validation and construction cannot
+// drift.  An unknown name, or a parameter the component does not take, throws
+// std::invalid_argument with a teaching message (the valid names / the
+// offending keys); Schema::fromProto adds the field name.  These wrap the
+// global registry (makeCharFilterFactory is declared in CharFilter.h).
 std::unique_ptr<const TokenizerFactory> makeTokenizerFactory(const api::AnalyzerComponent& def);
 std::unique_ptr<TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def);
 
@@ -416,6 +418,9 @@ public:
   const std::unique_ptr<const TokenizerFactory> tokenizer;
   const std::vector<std::unique_ptr<const TokenFilterFactory>> filters;
   const std::vector<std::unique_ptr<const CharFilterFactory>> charFilters;
+  // The registered analyzer name this plan was expanded from, or empty when
+  // authored directly. `canonical` always holds the expanded definition.
+  const std::string presetName;
   // unicode_word + nfkc_cf (the common default) fuses into one StandardTokenizer
   // stage - segmentation and NFKC_CF in a single pass, remaining filters on top.
   // Equivalent output (see AnalysisTest); decided here, on validated components.
@@ -429,7 +434,13 @@ public:
   // An absent tokenizer means "whitespace".  Throws std::invalid_argument with a
   // teaching message for an unknown or unnamed component or a parameter it
   // does not take.
+  // A def with `name` set expands that registered analyzer; it may carry
+  // char_filters, which replace the preset's, but no tokenizer or filters.
+  // Components resolve through the global registry (globalAnalysisRegistry()).
   static std::shared_ptr<const Analyzer> compile(const api::AnalyzerDef& def,
+      InvalidStopWords invalidStopWords = InvalidStopWords::REJECT);
+  // Same, against an explicit registry (tests).
+  static std::shared_ptr<const Analyzer> compile(const api::AnalyzerDef& def, const AnalysisRegistry& registry,
       InvalidStopWords invalidStopWords = InvalidStopWords::REJECT);
 
   std::unique_ptr<TokenChain> createChain() const;
@@ -437,7 +448,8 @@ public:
 private:
   Analyzer(std::unique_ptr<const TokenizerFactory> tok,
            std::vector<std::unique_ptr<const TokenFilterFactory>> fs,
-           std::vector<std::unique_ptr<const CharFilterFactory>> cs, std::string canonical);
+           std::vector<std::unique_ptr<const CharFilterFactory>> cs, std::string canonical,
+           std::string presetName);
 };
 
 

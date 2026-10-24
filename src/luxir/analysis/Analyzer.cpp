@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/analysis/Analyzer.h"
+#include "luxir/analysis/AnalysisRegistry.h"
 #include "luxir/analysis/AsciiScan.h"
 #include "luxir/analysis/KStemmer.h"
 #include "luxir/analysis/NfkcCfData.h"
 #include "luxir/util/log.h"
 
 #include <algorithm>
+#include <array>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <functional>
 #include <memory>
@@ -777,72 +779,92 @@ std::unique_ptr<TokenFilterFactory> stopFilter(const api::AnalyzerComponent& def
   return factory;
 }
 
-struct TokenizerEntry {
-  std::string_view name;
-  std::unique_ptr<const TokenizerFactory> (*make)(const api::AnalyzerComponent&);
-};
-struct FilterEntry {
-  std::string_view name;
-  std::unique_ptr<TokenFilterFactory> (*make)(const api::AnalyzerComponent&);
-};
-
-// The registries: adding a component is one line here plus its factory (a
-// param-taking one reads its Val params in the maker).  unicode_word is
-// stateful: it carries a segmentation cursor and rebuilds it in reset().
-constexpr TokenizerEntry TOKENIZERS[] = {
-  {"whitespace", plainTokenizer<makeWhitespaceTokenizer>},
-  {"keyword", plainTokenizer<makeKeywordTokenizer>},
-  {"unicode_word", plainTokenizer<makeUnicodeWordTokenizer, true>},
-};
-constexpr FilterEntry FILTERS[] = {
-  {"lowercase", plainFilter<makeLowercaseFilter>},
-  {"nfkc_cf", plainFilter<makeNfkcCasefoldFilter>},
-  {"fold", plainFilter<makeAccentFoldFilter>},
-  {"english_possessive", plainFilter<makeEnglishPossessiveFilter, false>},
-  {"kstem", kstemFilter},
-  {"stop", stopFilter},
-};
-
-template <class Entry, size_t N>
-std::string joinNames(const Entry (&table)[N]) {
-  std::string out;
-  for (const auto& entry : table) {
-    if (!out.empty()) out += ", ";
-    out += entry.name;
-  }
-  return out;
-}
-
 }  // namespace
 
+void registerBuiltinAnalysis(AnalysisRegistry& r) {
+  // unicode_word is stateful: it carries a segmentation cursor and rebuilds it in reset().
+  r.addTokenizer("whitespace", plainTokenizer<makeWhitespaceTokenizer>);
+  r.addTokenizer("keyword", plainTokenizer<makeKeywordTokenizer>);
+  r.addTokenizer("unicode_word", plainTokenizer<makeUnicodeWordTokenizer, true>);
+  r.addFilter("lowercase", plainFilter<makeLowercaseFilter>);
+  r.addFilter("nfkc_cf", plainFilter<makeNfkcCasefoldFilter>);
+  r.addFilter("fold", plainFilter<makeAccentFoldFilter>);
+  r.addFilter("english_possessive", plainFilter<makeEnglishPossessiveFilter, false>);
+  r.addFilter("kstem", kstemFilter);
+  r.addFilter("stop", stopFilter);
+  registerBuiltinCharFilters(r);
+
+  api::AnalyzerComponent unicodeWord;
+  unicodeWord.name = "unicode_word";
+  api::AnalyzerComponent nfkc, fold, possessive, kstem;
+  nfkc.name = "nfkc_cf";
+  fold.name = "fold";
+  possessive.name = "english_possessive";
+  kstem.name = "kstem";
+  api::AnalyzerDef standard;
+  standard.tokenizer = unicodeWord;
+  std::array<api::AnalyzerComponent, 1> standardFilters{nfkc};
+  standard.filters = standardFilters;
+  r.addAnalyzer("standard", standard);
+  // possessive removal happens in english_possessive; kstem must not strip it a second time
+  api::Val noPossessive;
+  noPossessive.kind = false;
+  using ParamPair = std::pair<std::string_view, ::hpp_proto::indirect_view<api::Val>>;
+  const ParamPair kstemParams[] = {{"possessive", &noPossessive}};
+  kstem.params = api::map_view<std::string_view, ::hpp_proto::indirect_view<api::Val>>(std::span<const ParamPair>(kstemParams));
+  api::AnalyzerDef english;
+  english.tokenizer = unicodeWord;
+  std::array<api::AnalyzerComponent, 4> englishFilters{nfkc, fold, possessive, kstem};
+  english.filters = englishFilters;
+  r.addAnalyzer("english", english);
+}
+
 std::unique_ptr<const TokenizerFactory> makeTokenizerFactory(const api::AnalyzerComponent& def) {
-  if (def.name.empty()) {
-    throw std::invalid_argument("tokenizer component has no name; valid tokenizers: " + joinNames(TOKENIZERS));
-  }
-  for (const auto& entry : TOKENIZERS) {
-    if (entry.name == def.name) return entry.make(def);
-  }
-  throw std::invalid_argument("unknown tokenizer '" + std::string(def.name) +
-                              "'; valid tokenizers: " + joinNames(TOKENIZERS));
+  return globalAnalysisRegistry().makeTokenizer(def);
 }
 
 std::unique_ptr<TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def) {
-  if (def.name.empty()) {
-    throw std::invalid_argument("filter component has no name; valid filters: " + joinNames(FILTERS));
-  }
-  for (const auto& entry : FILTERS) {
-    if (entry.name == def.name) return entry.make(def);
-  }
-  throw std::invalid_argument("unknown filter '" + std::string(def.name) +
-                              "'; valid filters: " + joinNames(FILTERS));
+  return globalAnalysisRegistry().makeFilter(def);
+}
+
+std::unique_ptr<const CharFilterFactory> makeCharFilterFactory(const api::AnalyzerComponent& def) {
+  return globalAnalysisRegistry().makeCharFilter(def);
 }
 
 std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def, InvalidStopWords invalidStopWords) {
+  return compile(def, globalAnalysisRegistry(), invalidStopWords);
+}
+
+std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& authored, const AnalysisRegistry& registry,
+                                                  InvalidStopWords invalidStopWords) {
+  api::AnalyzerDef def = authored;
+  std::string presetName;
+  if (!authored.name.empty()) {
+    if (authored.tokenizer || !authored.filters.empty()) {
+      throw std::invalid_argument("analyzer '" + std::string(authored.name) +
+                                  "' is a named analyzer; it takes no tokenizer or filters");
+    }
+    const api::AnalyzerDef* preset = registry.findAnalyzer(authored.name);
+    if (!preset) {
+      std::string valid;
+      for (const auto& name : registry.analyzerNames()) {
+        if (!valid.empty()) valid += ", ";
+        valid += name;
+      }
+      throw std::invalid_argument("unknown analyzer '" + std::string(authored.name) + "'; valid analyzers: " +
+                                  (valid.empty() ? "none" : valid));
+    }
+    // char_filters next to a name replace the preset's, as they do when a
+    // field sets only char_filters under an inherited analyzer.
+    def = *preset;
+    if (!authored.char_filters.empty()) def.char_filters = authored.char_filters;
+    presetName = std::string(authored.name);
+  }
   api::AnalyzerComponent whitespace;
   whitespace.name = "whitespace";
-  auto tokenizer = makeTokenizerFactory(def.tokenizer.has_value() ? *def.tokenizer : whitespace);
+  auto tokenizer = registry.makeTokenizer(def.tokenizer.has_value() ? *def.tokenizer : whitespace);
   std::vector<std::unique_ptr<const CharFilterFactory>> cleanups;
-  for (const auto& filter : def.char_filters) cleanups.push_back(makeCharFilterFactory(filter));
+  for (const auto& filter : def.char_filters) cleanups.push_back(registry.makeCharFilter(filter));
   std::vector<TokenChain::CharStage> stages;
   for (const auto& factory : cleanups) stages.push_back({factory->create(), factory->normalizing});
   auto head = tokenizer->create();
@@ -851,7 +873,7 @@ std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def, I
   std::vector<std::unique_ptr<const TokenFilterFactory>> filters;
   filters.reserve(def.filters.size());
   for (const auto& filter : def.filters) {
-    auto factory = makeTokenFilterFactory(filter);
+    auto factory = registry.makeFilter(filter);
     factory->prepare(preceding, invalidStopWords);
     preceding.stateful = preceding.stateful || factory->stateful;
     preceding.tail = factory->create(std::move(preceding.tail));
@@ -868,14 +890,16 @@ std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def, I
   if (def.filters.empty()) value["filters"] = glz::generic_sorted_u64::array_t{};
   if (def.char_filters.empty()) value["char_filters"] = glz::generic_sorted_u64::array_t{};
   if (glz::write_json(value, json)) throw std::runtime_error("Cannot serialize canonical analyzer");
-  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters), std::move(cleanups), std::move(json)));
+  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters), std::move(cleanups),
+                                                      std::move(json), std::move(presetName)));
 }
 
 Analyzer::Analyzer(std::unique_ptr<const TokenizerFactory> tok,
                    std::vector<std::unique_ptr<const TokenFilterFactory>> fs,
-                   std::vector<std::unique_ptr<const CharFilterFactory>> cs, std::string canonical)
+                   std::vector<std::unique_ptr<const CharFilterFactory>> cs, std::string canonical,
+                   std::string presetName)
     : canonical(std::move(canonical)), tokenizer(std::move(tok)),
-      filters(std::move(fs)), charFilters(std::move(cs)),
+      filters(std::move(fs)), charFilters(std::move(cs)), presetName(std::move(presetName)),
       fusedHead(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "nfkc_cf"),
       fusedFold(fusedHead && filters.size() > 1 && filters[1]->name == "fold"),
       stateful(tokenizer->stateful ||

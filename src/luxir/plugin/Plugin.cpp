@@ -37,12 +37,15 @@ Registries& Registries::global() {
   return instance;
 }
 
+const AnalysisRegistry& globalAnalysisRegistry() { return Registries::global().analysis; }
+
 const QueryRegistry& globalQueryRegistry() { return Registries::global().query; }
 
 const SearchOpRegistry& globalSearchOpRegistry() { return Registries::global().searchOps; }
 
 void Registries::freeze() {
   plugins.freeze();
+  analysis.freeze();
   query.freeze();
   searchOps.freeze();
   http.freeze();
@@ -61,6 +64,7 @@ void initPlugins(void (*addPlugins)(PluginRegistry&)) {
   static std::once_flag once;
   std::call_once(once, [addPlugins] {
     Registries& r = Registries::global();
+    registerBuiltinAnalysis(r.analysis);
     addPlugins(r.plugins);
     std::string names;
     for (const auto& p : r.plugins.plugins()) {

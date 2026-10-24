@@ -2164,10 +2164,17 @@ message AnalyzerComponent {
   map<string, Val> params = 2;
 }
 
+// A text analysis chain: char filters, then one tokenizer, then token filters.
+// Alternatively `name` selects a registered analyzer (a built-in preset such as
+// "english", or one a plugin provides); it excludes tokenizer and filters, and
+// char_filters alongside it replace the preset's char filters.
+// The JSON dialect accepts a bare string for the named form:
+// "english" == {"name": "english"}.
 message AnalyzerDef {
   AnalyzerComponent tokenizer = 1;         // "whitespace" (default when absent), "keyword", "unicode_word"
   repeated AnalyzerComponent filters = 2;  // applied after tokenization, in order
   repeated AnalyzerComponent char_filters = 3; // whole-value cleanup before tokenization, in order
+  string name = 4;                         // a registered analyzer name; combines only with char_filters
 }
 
 // Alternate representations of the same input value, keyed by local label.
