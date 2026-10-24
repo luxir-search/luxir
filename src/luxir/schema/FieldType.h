@@ -4,6 +4,7 @@
 #pragma once
 
 #include "luxir/analysis/Analyzer.h"
+#include "luxir/collation/CollationRegistry.h"
 #include "luxir/reader/Postings.h"
 #include "luxir/util/DateTime.h"
 #include "luxir/util/StrRef.h"
@@ -232,10 +233,15 @@ public:
 class StrFieldType : public FieldType {
 public:
   std::shared_ptr<const Analyzer> normalizer;
+  // When set, the column stores the collation's sort key of the normalized
+  // value instead of the value. Only column-only fields (no term index).
+  std::shared_ptr<const Collation> collation;
 
   StrFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED,
-               std::shared_ptr<const Analyzer> normalizer = {})
-    : FieldType(name, FieldType::STRING, flags), normalizer(std::move(normalizer)) {}
+               std::shared_ptr<const Analyzer> normalizer = {},
+               std::shared_ptr<const Collation> collation = {})
+    : FieldType(name, FieldType::STRING, flags), normalizer(std::move(normalizer)),
+      collation(std::move(collation)) {}
 
   // Hot paths (ingest and query literals) must retain a chain from normalizer->createChain().
   void normalize(std::string& value) const;

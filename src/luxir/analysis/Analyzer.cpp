@@ -26,7 +26,9 @@
 #include <uni_algo/case.h>
 #include <uni_algo/norm.h>
 #include <uni_algo/ranges_word.h>
+#include <uni_algo/prop.h>
 #include <uni_algo/ranges_conv.h>
+#include <uni_algo/script.h>
 #include <uni_algo/version.h>
 
 // The uni-algo dependency is confined to this translation unit; the rest of the
@@ -37,8 +39,93 @@ namespace luxir {
 
 namespace {
 
+// The script of a code point in the common blocks that hold only letters (no
+// digits, no marks, no punctuation), without the property tables; UNKNOWN
+// anywhere else. AnalysisTest checks it against the tables for every code point.
+Script letterScript(char32_t cp) {
+  if (cp >= 0x4E00 && cp <= 0x9FFF) return Script::HAN;
+  if (cp >= 0xAC00 && cp <= 0xD7A3) return Script::HANGUL;
+  if (cp >= 0x3041 && cp <= 0x3096) return Script::HIRAGANA;
+  if (cp >= 0x30A1 && cp <= 0x30FA) return Script::KATAKANA;
+  if (cp >= 0x0410 && cp <= 0x044F) return Script::CYRILLIC;
+  if ((cp >= 0x3B1 && cp <= 0x3C9) || (cp >= 0x391 && cp <= 0x3A9 && cp != 0x3A2)) return Script::GREEK;
+  if (cp >= 0xC0 && cp <= 0x24F && cp != 0xD7 && cp != 0xF7) return Script::LATIN;
+  return Script::UNKNOWN;
+}
+
+}  // namespace
+
+Script scriptOf(char32_t cp) {
+  if (cp < 0x80) return ((cp | 0x20) >= 'a' && (cp | 0x20) <= 'z') ? Script::LATIN : Script::COMMON;
+  if (Script s = letterScript(cp); s != Script::UNKNOWN) return s;
+  static constexpr una::locale::script latin("Latn"), han("Hani"), hiragana("Hira"), katakana("Kana"),
+      hangul("Hang"), thai("Thai"), arabic("Arab"), cyrillic("Cyrl"), greek("Grek"), common("Zyyy"),
+      inherited("Zinh");
+  una::locale::script s = una::codepoint::get_script(cp);
+  if (s == latin) return Script::LATIN;
+  if (s == common || s == inherited) return Script::COMMON;
+  if (s == han) return Script::HAN;
+  if (s == hiragana) return Script::HIRAGANA;
+  if (s == katakana) return Script::KATAKANA;
+  if (s == hangul) return Script::HANGUL;
+  if (s == thai) return Script::THAI;
+  if (s == arabic) return Script::ARABIC;
+  if (s == cyrillic) return Script::CYRILLIC;
+  if (s == greek) return Script::GREEK;
+  return Script::OTHER;
+}
+
+const char* scriptName(Script script) {
+  static constexpr const char* names[] = {"unknown", "common", "latin", "han", "hiragana", "katakana",
+                                          "hangul", "thai", "arabic", "cyrillic", "greek", "other"};
+  return names[(size_t) script];
+}
+
+const char* tokenTypeName(TokenType type) {
+  static constexpr const char* names[] = {"unknown", "alpha", "numeric", "alnum", "other"};
+  return names[(size_t) type];
+}
+
+namespace {
+
 static_assert(UNI_ALGO_UNICODE_VERSION == nfkc_cf_data::unicodeVersion,
               "Regenerate NFKC_CF tables when upgrading uni-algo's Unicode data");
+
+// Sets type and script from the code points of a UAX#29 word. The ASCII fast
+// path of StandardTokenizer classifies from its byte classes instead.
+void classifyWord(std::string_view word, Token& token) {
+  bool alpha = false, numeric = false;
+  Script script = Script::COMMON;
+  // Most words are ASCII or start with an ASCII run; only decode from the first high byte.
+  size_t ascii = 0;
+  for (; ascii < word.size() && (unsigned char) word[ascii] < 0x80; ascii++) {
+    unsigned char c = (unsigned char) word[ascii];
+    if (c >= '0' && c <= '9') {
+      numeric = true;
+    } else if ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') {
+      if (!alpha) script = Script::LATIN;
+      alpha = true;
+    }
+  }
+  if (ascii < word.size()) {
+    for (char32_t cp : una::views::utf8(word.substr(ascii))) {
+      Script s = letterScript(cp);
+      if (s == Script::UNKNOWN) {
+        if (cp < 0x80 ? (cp >= '0' && cp <= '9') : una::codepoint::is_numeric(cp)) {
+          numeric = true;
+          continue;
+        }
+        s = scriptOf(cp);
+        if (s == Script::COMMON) continue;  // '_', combining marks, symbols
+      }
+      if (!alpha) script = s;
+      alpha = true;
+    }
+  }
+  token.type = alpha ? (numeric ? TokenType::ALNUM : TokenType::ALPHA)
+                     : (numeric ? TokenType::NUMERIC : TokenType::OTHER);
+  token.script = script;
+}
 
 // UAX#29 word-boundary tokenizer. Emits word-like segments only (letters,
 // numbers, ideographs, ...); punctuation and whitespace runs are dropped, like
@@ -64,6 +151,7 @@ public:
     std::string_view w = *it;  // word_only yields a view into the source value
     token.text = w;
     token.setOffset((int) (w.data() - base_), (int) (w.data() + w.size() - base_));
+    classifyWord(w, token);
     ++it;
     return true;
   }
@@ -171,7 +259,8 @@ std::string_view applyNfkcCf(std::string_view in, std::string& buf) {
 // A run with no letter or digit (a bare "_") is not a word: word_only filters
 // segments by their max word-break property and ExtendNumLet < Numeric.
 enum AsciiWb : unsigned char {
-  WB_BRK = 0, WB_LET, WB_NUM, WB_ENL, WB_MID_LET, WB_MID_NUM, WB_MID_BOTH
+  // Bit flags, so a word's kinds are the OR of its bytes' classes.
+  WB_BRK = 0, WB_LET = 1, WB_NUM = 2, WB_ENL = 4, WB_MID_LET = 8, WB_MID_NUM = 16, WB_MID_BOTH = 32
 };
 
 struct AsciiWbTable {
@@ -192,7 +281,10 @@ struct AsciiWbTable {
 };
 constexpr AsciiWbTable wbTable;
 
-inline bool isWbWord(unsigned char cls) { return cls >= WB_LET && cls <= WB_ENL; }
+static_assert(offsetof(Token, script) == offsetof(Token, type) + 1);
+constexpr uint16_t asciiClass(TokenType type, Script script) { return (uint16_t) ((unsigned) type | ((unsigned) script << 8)); }
+
+inline bool isWbWord(unsigned char cls) { return (unsigned) (cls - 1) < 4u; }  // LET, NUM or ENL
 
 inline bool isAscii(std::string_view s) {
   return ascii::findNonAscii(s.data(), s.size()) == s.size();
@@ -272,7 +364,9 @@ public:
     if (foldAccents && !isAscii(term)) term = una::norm::to_unaccent_utf8(term);
   }
 
-  bool incrementToken() override {
+  // Aligned because the inlined ASCII DFA loop below is sensitive to where the
+  // linker puts it: an unlucky offset cost ~10% on the ASCII benchmarks.
+  [[gnu::aligned(64)]] bool incrementToken() override {
     token.clear();
     for (;;) {
       // Drain the active region first. The ASCII DFA is the hot path and stays
@@ -301,6 +395,7 @@ private:
       token.text = applyNfkcCf(w, buf);
       ++it;
       if (token.text.empty()) continue;  // invisible words consume no position
+      classifyWord(w, token);
       // Fused `fold`, exactly as AccentFoldFilter applies it after nfkc_cf
       // (including keeping a token that folds to empty). DFA tokens are
       // ASCII, which fold leaves alone, so only this path pays for it.
@@ -368,11 +463,11 @@ private:
         return false;
       }
       const char* w = s;
-      bool sawLetNum = false;
+      unsigned kinds = 0;  // WB_LET / WB_NUM set when the word has a letter / digit (WB_ENL too for '_')
       for (;;) {
         unsigned char k;
         while (s < e && isWbWord(k = wbTable.cls[(unsigned char) *s])) {
-          sawLetNum |= (k <= WB_NUM);  // LET or NUM
+          kinds |= k;
           s++;
         }
         // a mid char continues the word iff bracketed by kind-matched word
@@ -393,9 +488,15 @@ private:
         }
         break;
       }
-      if (sawLetNum) {
+      if (kinds & (WB_LET | WB_NUM)) {
         token.text = std::string_view(w, (size_t) (s - w));
         token.setOffset((int) (w - loweredBase), (int) (s - loweredBase));
+        // ASCII letters are Latin; a digits-only word has no script.
+        // type and script in one 16-bit store (adjacent, little-endian: see Token).
+        static constexpr uint16_t classes[4] = {0, asciiClass(TokenType::ALPHA, Script::LATIN),
+                                                asciiClass(TokenType::NUMERIC, Script::COMMON),
+                                                asciiClass(TokenType::ALNUM, Script::LATIN)};
+        std::memcpy(&token.type, &classes[kinds & 3], sizeof(uint16_t));
         dfaCur = s;
         return true;
       }

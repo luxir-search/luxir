@@ -2398,6 +2398,17 @@ message FieldDef {
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
   // inherits, else true. Set false to reject a point with a z coordinate.
   optional bool ignore_z_value = 29;
+
+  // STRING only: a registered collation (a plugin's name and params) whose
+  // sort keys the column stores in place of the normalized value, so sorting
+  // the field orders by the collation. Requires index=NONE and column=true,
+  // so it is normally a variant of the field it sorts (see FieldVariants and
+  // FieldDefaults.value). The column then holds opaque key bytes: facets and
+  // value expressions over it see keys, not text. Absent inherits; present
+  // replaces. A changed definition is a new representation: segments written
+  // before it do not carry its keys. HTTP JSON takes a bare name or
+  // {"name": ..., "params": {...}}.
+  AnalyzerComponent collation = 23;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

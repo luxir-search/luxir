@@ -38,11 +38,63 @@ public:
   }
 };
 
+// Filter: sets positionLength to 2 on tokens that start with 'x', as a filter
+// emitting a two-word synonym would.
+class Span2Filter : public TokenFilter {
+public:
+  explicit Span2Filter(std::unique_ptr<TokenStream> source) : TokenFilter(std::move(source)) {}
+
+  bool incrementToken() override {
+    if (!source().incrementToken()) return false;
+    if (!token.text.empty() && token.text[0] == 'x') token.positionLength = 2;
+    return true;
+  }
+};
+
+// Filter: rewrites every token to "text|type|script|positionLength", what a
+// downstream plugin filter can read of the attributes upstream stages set.
+class DescribeFilter : public TokenFilter {
+  std::string buf;
+
+public:
+  explicit DescribeFilter(std::unique_ptr<TokenStream> source) : TokenFilter(std::move(source)) {}
+
+  bool incrementToken() override {
+    if (!source().incrementToken()) return false;
+    buf.assign(token.text);
+    buf += '|';
+    buf += tokenTypeName(token.type);
+    buf += '|';
+    buf += scriptName(token.script);
+    buf += '|';
+    buf += std::to_string(token.positionLength);
+    token.text = buf;
+    return true;
+  }
+};
+
 // Char filter: removes every 'x'. The base class records each deletion, so
 // token offsets map back to the source.
 class StripXFilter : public CharFilter {
   void filter() override {
     for (size_t i = input.find('x'); i != std::string_view::npos; i = input.find('x', i + 1)) replace(i, i + 1, "");
+  }
+};
+
+// Collation: ASCII case-insensitive order. strength=primary keys are the
+// lowercased value, so "a" and "A" tie; strength=tertiary (default) appends the
+// case of each letter, lowercase first, as ICU's default does.
+class CaseCollator : public Collator {
+  bool tertiary;
+
+public:
+  explicit CaseCollator(bool tertiary) : tertiary(tertiary) {}
+
+  void appendKey(std::string_view value, std::string& key) override {
+    for (char c : value) key.push_back((c >= 'A' && c <= 'Z') ? (char)(c + ('a' - 'A')) : c);
+    if (!tertiary) return;
+    key.push_back('\0');
+    for (char c : value) key.push_back((c >= 'A' && c <= 'Z') ? '\1' : '\0');
   }
 };
 
@@ -138,8 +190,8 @@ uint64_t CountingStorage::count(std::string_view source, std::string_view op, st
 namespace {
 
 // Test-only plugin that exercises the plugin framework: analysis components,
-// query types, search ops, HTTP routes, the node lifecycle, and storage
-// backends and layers.
+// collations, query types, search ops, HTTP routes, the node lifecycle, and
+// storage backends and layers.
 class ExamplePlugin : public Plugin {
   static void registerAnalysis(Registries& r) {
     r.analysis.addFilter("reverse", [](const api::AnalyzerComponent& def) {
@@ -179,6 +231,47 @@ class ExamplePlugin : public Plugin {
     r.analysis.addAnalyzer("example", example);
   }
 
+  static void registerFilter(Registries& r, std::string name,
+                             std::unique_ptr<TokenStream> (*make)(std::unique_ptr<TokenStream>)) {
+    r.analysis.addFilter(name, [name, make](const api::AnalyzerComponent& def) {
+      noParams(def);
+      struct Factory : TokenFilterFactory {
+        std::unique_ptr<TokenStream> (*make)(std::unique_ptr<TokenStream>);
+        std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
+          return make(std::move(source));
+        }
+      };
+      auto factory = std::make_unique<Factory>();
+      factory->name = name;
+      factory->make = make;
+      return std::unique_ptr<TokenFilterFactory>(std::move(factory));
+    });
+  }
+
+  static void registerCollation(Registries& r) {
+    r.collation.add("example_ci", [](const api::AnalyzerComponent& def) {
+      bool tertiary = true;
+      for (const auto& [key, value] : def.params) {
+        auto* text = std::get_if<std::string_view>(&value->kind);
+        if (key != "strength") {
+          throw std::invalid_argument("collation 'example_ci': unknown parameter '" + std::string(key) +
+                                      "'; valid parameters: strength");
+        }
+        if (!text || (*text != "primary" && *text != "tertiary")) {
+          throw std::invalid_argument("collation 'example_ci': parameter 'strength' must be \"primary\" or \"tertiary\"");
+        }
+        tertiary = *text == "tertiary";
+      }
+      struct Factory : CollatorFactory {
+        bool tertiary = true;
+        std::unique_ptr<Collator> create() const override { return std::make_unique<CaseCollator>(tertiary); }
+      };
+      auto factory = std::make_unique<Factory>();
+      factory->tertiary = tertiary;
+      return std::unique_ptr<const CollatorFactory>(std::move(factory));
+    });
+  }
+
   static void registerStorage(Registries& r) {
     r.storage.addBackend("counting_ram", [](const StorageContext& ctx) -> std::unique_ptr<DirectoryFactory> {
       return std::make_unique<CountingRamBackend>(ctx);
@@ -211,6 +304,13 @@ public:
   void registerComponents(Registries& r) override {
     registerAnalysis(r);
     registerSearch(r);
+    registerFilter(r, "span2", [](std::unique_ptr<TokenStream> source) -> std::unique_ptr<TokenStream> {
+      return std::make_unique<Span2Filter>(std::move(source));
+    });
+    registerFilter(r, "describe", [](std::unique_ptr<TokenStream> source) -> std::unique_ptr<TokenStream> {
+      return std::make_unique<DescribeFilter>(std::move(source));
+    });
+    registerCollation(r);
     registerStorage(r);
   }
   void nodeStarted(LuxirNode&) override { startedNodes++; }

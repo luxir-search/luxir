@@ -45,10 +45,13 @@ const SearchOpRegistry& globalSearchOpRegistry() { return Registries::global().s
 
 const StorageRegistry& globalStorageRegistry() { return Registries::global().storage; }
 
+const CollationRegistry& globalCollationRegistry() { return Registries::global().collation; }
+
 void Registries::freeze() {
   plugins.freeze();
   analysis.freeze();
   storage.freeze();  // storage backends and layers
+  collation.freeze();
   query.freeze();
   searchOps.freeze();
   http.freeze();

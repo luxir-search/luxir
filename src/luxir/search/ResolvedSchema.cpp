@@ -66,6 +66,7 @@ std::string ReaderManager::resolvedSchema() {
     }
     if (!signature.properties.contains("analyzer")) rep["analyzer"] = nullptr;
     if (!signature.properties.contains("normalizer")) rep["normalizer"] = nullptr;
+    if (!signature.properties.contains("collation")) rep["collation"] = nullptr;
     uint64_t introduced = schema->introduction(name);
     rep["introduced_generation"] = introduced;
     // Include segments that LACK this physical name. Looking only at segments
