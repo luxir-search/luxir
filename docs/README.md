@@ -83,6 +83,8 @@ state, and commits are crash-safe on immutable segments.
 - [Storage and object stores](design/storage.md) lays out the storage
   roadmap: object-store durability, nodes reading from the store through a
   local cache, and the publication contract both use.
+- [Storage tiers](design/storage-tiers.md) explains lazy range reads over an
+  object store and the per-segment hotcache.
 - [Codebase map](dev/codebase-map.md) traces source components and request
   flow.
 - [Build setup](dev/build-setup.md) covers toolchains, dependencies, presets,

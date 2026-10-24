@@ -28,6 +28,7 @@
 #include "luxir/store/Directory.h"
 #include "luxir/codec/StreamVByte.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/reader/Hotcache.h"
 #include "ScreamingBuilder.h"
 #include "luxir/codec/Codec.h"
 #include "luxir/schema/FieldType.h"
@@ -375,6 +376,10 @@ public:
         filenames->emplace_back(dataFile.file->name());
       }
     }
+
+    // A directory that fetches remotely gets the segment's open-time ranges as
+    // one more file of the segment.
+    writeHotcacheIfRemote(directory, segId, filenames, descriptors);
 
     finished = true;
     freeFiles.clear();

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -35,7 +36,27 @@ class PostingsReader {
   // folds buffered streams without renaming survivors, which keeps already
   // spilled filesystem/object-store keys stable.
   std::vector<std::shared_ptr<InputFile>> files;
-  std::vector<InputStream> inputStreams;
+
+  // The whole-file stream of each physical file. A file's stream is created on
+  // first use: on a lazy file (an object store) that is the moment its bytes
+  // are fetched, so files no query touches are never materialized. Files that
+  // are already resident (memory, mmap) are published at open and cost one
+  // acquire load per use.
+  struct StreamSlot {
+    std::atomic<bool> ready{false};
+    InputStream stream;
+  };
+  std::unique_ptr<StreamSlot[]> streams;
+  std::mutex streamMutex;
+  InputStream materializeStream(uint32_t fnum);
+
+  // The part of file 0 that describes the fields: every field's metadata, the
+  // offsets table, the count and the segment info. Opening a segment reads
+  // exactly this tail of file 0 (plus the header of every file and the request
+  // versions), so a lazy file fetches only those ranges. Offsets within
+  // `catalog` count from catalogStart.
+  InputStream catalog;
+  int64_t catalogStart = 0;
   int64_t segInfoOffset;  // after this is segInfo, before this is the field index
   int32_t maxdoc;
   VersionRuns versions;
@@ -149,10 +170,15 @@ public:
   // TODO: could also have a mode that opens on demand (and hence synchronizes)... that would be good for something like IndexWriter
   // that needs to only read the ID field to handle overwrites / deletions.  That file *might* already be open by another IndexReader
   // though?  How to coordinate?
+  //
+  // Bulk readers use this: it hands out the whole file, so on a lazy file the
+  // first call materializes it. Open-time reads go through getFile()->rangeStream().
   InputStream getInputStream(uint32_t fnum) {
-    assert(fnum < inputStreams.size());
+    assert(fnum < files.size());
     assert(files[fnum] != nullptr);
-    return inputStreams[fnum];
+    StreamSlot& slot = streams[fnum];
+    if (!slot.ready.load(std::memory_order_acquire)) [[unlikely]] return materializeStream(fnum);
+    return slot.stream;
   }
 
   // return an InputStream positioned on the current location specified

@@ -134,6 +134,17 @@ locations, browse `src/luxir/<area>/`.
      everything, so a layer overrides only what it changes (Checked and ReadOnly are built on them);
      `Directory::capabilities()` (`HARD_LINK`, `ATOMIC_RENAME`, `DURABLE_SYNC`, `MEMORY_MAPPED`,
      `REMOTE`) lets callers fall back (`reuseFiles` copies when links are unavailable)
+   - `ObjectStore` / `RamObjectStore` (`ObjectStore.h`): the flat key/value contract of a remote store
+     and an in-memory implementation with request counters; `LazyInputFile`: an `InputFile` that
+     fetches ranges on first touch into an anonymous mapping; `ObjectStoreDirectory` /
+     `ObjectStoreDirFactory` (`ObjectStoreDirectory.h`): a `Directory` and a backend over an
+     `ObjectStore` (writes staged locally then `put`, renames as copy+remove, deletes wait for
+     readers). Built-in backend `ram_object`. `InputFile::rangeStream` / `prefetchRanges` is the
+     reader-side contract; see [../design/storage-tiers.md](../design/storage-tiers.md)
+   - `Hotcache` (`reader/Hotcache.h`): the `s<seg>__hot` file listing the ranges opening a segment reads,
+     written by `PostingsWriter::finish` for `REMOTE` directories; `RecordingDirectory` records them.
+     `PostingsReader` opens through ranges (header, file 0 tail, versions, field catalog) and creates
+     each file's whole-file stream on first use
    - Note: segment readers/writers live in `reader/` (`PostingsReader`) and `index/` (`PostingsWriter`), not in `store/`.
 
 8. **Schema** (`src/luxir/schema/`)
