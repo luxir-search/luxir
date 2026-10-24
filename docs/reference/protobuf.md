@@ -115,6 +115,7 @@ defaults and constraints are described in the comments and guides.
 - [`ExprOp`](#message-luxir.exprop)
 - [`ExprQuery`](#message-luxir.exprquery)
 - [`FacetResult`](#message-luxir.facetresult)
+- [`FieldBytesStats`](#message-luxir.fieldbytesstats)
 - [`FieldDef`](#message-luxir.fielddef)
 - [`FieldDefaults`](#message-luxir.fielddefaults)
 - [`FieldFacet`](#message-luxir.fieldfacet)
@@ -1011,6 +1012,38 @@ An expression in the Luxir query language, with strict syntax and precise parse 
 | <a id="field-luxir.facetresult.ops"></a>[`ops`](#field-luxir.facetresult.ops) | 22 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | sub-operation results performed per bucket, like a sub-facet or statistics. |
 | <a id="field-luxir.facetresult.offset"></a>[`offset`](#field-luxir.facetresult.offset) | 6 | `int64` | singular |  |
 
+<a id="message-luxir.fieldbytesstats"></a>
+
+### luxir.FieldBytesStats
+
+Storage one field uses across the segments of a snapshot. Structure starts come from each segment's field directory; a structure runs to the next recorded boundary in its file, so alignment padding after it is counted in it. Counts are summed per segment and include deleted docs, so terms is not the number of distinct terms.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.fieldbytesstats.field"></a>[`field`](#field-luxir.fieldbytesstats.field) | 1 | `string` | singular | physical field name |
+| <a id="field-luxir.fieldbytesstats.type"></a>[`type`](#field-luxir.fieldbytesstats.type) | 2 | `string` | singular | physical type (string, text, int, vector, bin, ...) |
+| <a id="field-luxir.fieldbytesstats.segments"></a>[`segments`](#field-luxir.fieldbytesstats.segments) | 3 | `uint32` | singular |  |
+| <a id="field-luxir.fieldbytesstats.bytes"></a>[`bytes`](#field-luxir.fieldbytesstats.bytes) | 4 | `uint64` | singular | sum of the structure bytes below |
+| <a id="field-luxir.fieldbytesstats.terms_bytes"></a>[`terms_bytes`](#field-luxir.fieldbytesstats.terms_bytes) | 5 | `uint64` | singular | term blocks, with per-term metadata and impact frontiers |
+| <a id="field-luxir.fieldbytesstats.term_index_bytes"></a>[`term_index_bytes`](#field-luxir.fieldbytesstats.term_index_bytes) | 6 | `uint64` | singular | term trie, block offset table and range table |
+| <a id="field-luxir.fieldbytesstats.postings_bytes"></a>[`postings_bytes`](#field-luxir.fieldbytesstats.postings_bytes) | 7 | `uint64` | singular | doc ids, freqs and block skip/impact headers |
+| <a id="field-luxir.fieldbytesstats.positions_bytes"></a>[`positions_bytes`](#field-luxir.fieldbytesstats.positions_bytes) | 8 | `uint64` | singular |  |
+| <a id="field-luxir.fieldbytesstats.norms_bytes"></a>[`norms_bytes`](#field-luxir.fieldbytesstats.norms_bytes) | 9 | `uint64` | singular |  |
+| <a id="field-luxir.fieldbytesstats.docs_with_field_bytes"></a>[`docs_with_field_bytes`](#field-luxir.fieldbytesstats.docs_with_field_bytes) | 10 | `uint64` | singular | presence bitsets of sparse fields |
+| <a id="field-luxir.fieldbytesstats.column_bytes"></a>[`column_bytes`](#field-luxir.fieldbytesstats.column_bytes) | 11 | `uint64` | singular | int, ord or str column values and their metadata |
+| <a id="field-luxir.fieldbytesstats.column_index_bytes"></a>[`column_index_bytes`](#field-luxir.fieldbytesstats.column_index_bytes) | 12 | `uint64` | singular | monotonic rank, offset and value-to-doc side columns |
+| <a id="field-luxir.fieldbytesstats.points_bytes"></a>[`points_bytes`](#field-luxir.fieldbytesstats.points_bytes) | 13 | `uint64` | singular | 1-D points leaves and inner nodes |
+| <a id="field-luxir.fieldbytesstats.stored_bytes"></a>[`stored_bytes`](#field-luxir.fieldbytesstats.stored_bytes) | 14 | `uint64` | singular | stored-fields resource (the field is the resource) |
+| <a id="field-luxir.fieldbytesstats.vector_bytes"></a>[`vector_bytes`](#field-luxir.fieldbytesstats.vector_bytes) | 15 | `uint64` | singular | vector column rows |
+| <a id="field-luxir.fieldbytesstats.vector_index_bytes"></a>[`vector_index_bytes`](#field-luxir.fieldbytesstats.vector_index_bytes) | 16 | `uint64` | singular | ANN overlay files (segment overlays naming the field) |
+| <a id="field-luxir.fieldbytesstats.docs"></a>[`docs`](#field-luxir.fieldbytesstats.docs) | 17 | `uint64` | singular | docs with a value |
+| <a id="field-luxir.fieldbytesstats.values"></a>[`values`](#field-luxir.fieldbytesstats.values) | 18 | `uint64` | singular | column values |
+| <a id="field-luxir.fieldbytesstats.terms"></a>[`terms`](#field-luxir.fieldbytesstats.terms) | 19 | `uint64` | singular |  |
+| <a id="field-luxir.fieldbytesstats.postings"></a>[`postings`](#field-luxir.fieldbytesstats.postings) | 20 | `uint64` | singular | sum of doc freqs |
+| <a id="field-luxir.fieldbytesstats.positions"></a>[`positions`](#field-luxir.fieldbytesstats.positions) | 21 | `uint64` | singular | sum of term freqs, for fields with positions |
+
 <a id="message-luxir.fielddef"></a>
 
 ### luxir.FieldDef
@@ -1404,6 +1437,8 @@ Indexing RAM budget: the configured limit and the bytes reserved against it.
 | <a id="field-luxir.indexstats.inverters_flushing"></a>[`inverters_flushing`](#field-luxir.indexstats.inverters_flushing) | 17 | `uint64` | singular |  |
 | <a id="field-luxir.indexstats.commits"></a>[`commits`](#field-luxir.indexstats.commits) | 18 | `uint64` | singular | writer only: commits since the writer opened |
 | <a id="field-luxir.indexstats.retained_delete_bytes"></a>[`retained_delete_bytes`](#field-luxir.indexstats.retained_delete_bytes) | 19 | `uint64` | singular | Writer only: resident delete packets held by its pending set or merge catch-up, deduplicated across owners. Included in the node indexing reservation. |
+| <a id="field-luxir.indexstats.field_bytes"></a>[`field_bytes`](#field-luxir.indexstats.field_bytes) | 24 | [`FieldBytesStats`](#message-luxir.fieldbytesstats) | repeated | Set by StatsRequest.field\_bytes: bytes per field and structure, summed over the segments of the current search snapshot, largest field first. |
+| <a id="field-luxir.indexstats.unattributed_bytes"></a>[`unattributed_bytes`](#field-luxir.indexstats.unattributed_bytes) | 25 | `uint64` | singular | Segment bytes no field owns: file headers, the field directory, segment info and gaps between structures. With field\_bytes, the two sum to the segment data files of the snapshot. |
 
 <a id="message-luxir.jemallocstats"></a>
 
@@ -2250,6 +2285,7 @@ Which statistics to gather. The node scope (no collection, no tenant) always ret
 | <a id="field-luxir.statsrequest.files"></a>[`files`](#field-luxir.statsrequest.files) | 6 | `bool` | singular | Also list index directories, filling the \`bytes\` totals, segment bytes and aux index bytes. Implies \`collections\` at node scope. |
 | <a id="field-luxir.statsrequest.system"></a>[`system`](#field-luxir.statsrequest.system) | 7 | `bool` | singular | Node scope only: this process, the data directory's filesystem and the process's cgroup v2, read from procfs and cgroupfs (Linux only). |
 | <a id="field-luxir.statsrequest.host"></a>[`host`](#field-luxir.statsrequest.host) | 8 | `bool` | singular | Node scope only: host-wide CPU, memory, network, TCP, disk and pressure statistics from procfs (Linux only), which node\_exporter also reports. Inside a container most of them describe the host, not the container. |
+| <a id="field-luxir.statsrequest.field_bytes"></a>[`field_bytes`](#field-luxir.statsrequest.field_bytes) | 14 | `bool` | singular | Add per-field storage accounting (IndexStats.field\_bytes) for the segments of the current search snapshot. Reads every segment's field directory and a few headers per field; decodes no data. Implies \`files\` (ANN overlay files are charged to their fields). |
 
 <a id="message-luxir.statsresponse"></a>
 
