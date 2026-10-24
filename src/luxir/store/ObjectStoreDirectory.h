@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <condition_variable>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -11,6 +14,7 @@
 #include <set>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 
 #include "luxir/store/Directory.h"
 #include "luxir/store/DirectoryFactory.h"
@@ -22,6 +26,26 @@ namespace luxir {
 
 class Hotcache;
 
+/// Threads that run the background uploads and removals of an object-store
+/// backend's directories. Destroying it runs the tasks still queued, then joins.
+class ObjectStoreWorkers {
+  std::mutex mutex;
+  std::condition_variable wake;
+  std::deque<std::function<void()>> tasks;
+  bool stopping = false;
+  std::vector<std::thread> threads;
+
+  void run();
+
+public:
+  explicit ObjectStoreWorkers(size_t threads);
+  ~ObjectStoreWorkers();
+  ObjectStoreWorkers(const ObjectStoreWorkers&) = delete;
+  ObjectStoreWorkers& operator=(const ObjectStoreWorkers&) = delete;
+
+  void submit(std::function<void()> task);
+};
+
 /// A Directory over the objects of an ObjectStore that share a key prefix.
 ///
 /// Reads are lazy: openFile returns a LazyInputFile that fetches byte ranges on
@@ -32,12 +56,28 @@ class Hotcache;
 /// manifest lists without a hotcache is not probed for one.
 ///
 /// Writes go to a local staging Directory: createFile hands out a staging file,
-/// and finishFile closes it and uploads it with one put. The staged copy stays
-/// readable until the file is deleted or the directory is destroyed, so a
-/// segment that was just flushed is not fetched back. An acknowledged put is
-/// durable, so sync() has nothing left to do. renameFile is a server-side copy
-/// plus a remove: the target object is replaced atomically, which is all that
-/// CURRENT switching needs. linkFile is a server-side copy.
+/// and finishFile closes it and queues its upload, one put, on the backend's
+/// workers. So a segment is on its way to the store as soon as it is
+/// finalized, and a flush or merge does not wait for the network. sync()
+/// waits for the uploads of the files it names (an acknowledged put is
+/// durable), uploads one itself that is still queued behind other files, and
+/// throws when one failed, so a commit root, which is written
+/// only after its files are synced, never names a file the store lacks. The
+/// staged copy stays readable until the file is deleted or the directory is
+/// destroyed, so a segment that was just flushed is not fetched back.
+///
+/// A `.pending` file is the first half of a publication: it is renamed into
+/// place. It is not uploaded until then, and the rename puts its bytes under
+/// the final name with one request. A commit root (commit_<gen>) is put only
+/// if absent: a second writer that publishes the same generation fails
+/// instead of replacing a root. Renaming a file that is already in the store
+/// is a server-side copy plus a remove. linkFile is a server-side copy.
+///
+/// Removals are queued too and sent in batches (ObjectStore::removeMany); a
+/// removed name is gone from this directory at once. A file deleted before
+/// its upload started is never sent. The directory keeps the names of its
+/// objects from its first listing on, so retiring a segment (deletePrefix)
+/// lists nothing.
 class ObjectStoreDirectory : public Directory {
 public:
   struct Options {
@@ -48,6 +88,10 @@ public:
     // Smaller streams are folded into the segment's first file, so a smaller
     // value means more, finer objects for a lazy reader to choose between.
     uint64_t spillBytes = 0;
+    // Runs uploads and removals; a directory without one starts its own.
+    std::shared_ptr<ObjectStoreWorkers> workers;
+    uint32_t workerThreads = 8;  // of a directory's own workers
+    uint32_t uploadAttempts = 3;  // background attempts before an upload counts as failed
   };
 
 private:
@@ -81,6 +125,35 @@ private:
     std::shared_ptr<const Hotcache> cache;
   };
 
+  // Files that are staged but not in the store yet, and objects whose removal
+  // is queued. Shared with the queued tasks, which can outlive the directory.
+  struct Upload {
+    enum State { QUEUED, RUNNING, FAILED } state = QUEUED;
+    uint64_t size = 0;
+    std::exception_ptr error;  // FAILED
+  };
+  struct Writes {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::map<std::string, std::shared_ptr<Upload>, std::less<>> uploads;  // by name
+    std::map<std::string, uint64_t, std::less<>> deferred;  // .pending files, uploaded by their rename
+    std::set<std::string, std::less<>> removals;  // queued
+    std::set<std::string, std::less<>> removing;  // in the batch being sent
+    bool removalQueued = false;  // a removal task is queued
+    bool closed = false;
+    bool abandoned = false;  // the objects under the prefix are being removed
+    std::set<std::string, std::less<>> unsendable;  // finished after abandon(): a sync of one fails
+    // Every name that may have an object, once a listing has been seen: the
+    // listed names, plus what this directory wrote, minus what it removed.
+    std::set<std::string, std::less<>> inventory;
+    bool inventoryComplete = false;
+    // Commit roots another writer published where this directory tried to:
+    // never removed here, not even by the cleanup of the commit that lost.
+    std::set<std::string, std::less<>> foreign;
+  };
+  std::shared_ptr<Writes> writes = std::make_shared<Writes>();
+  std::shared_ptr<ObjectStoreWorkers> workers;
+
   std::mutex mutex;
   std::shared_ptr<Directory> staged;  // created on first write
   std::filesystem::path stagedPath;   // only when staging on a filesystem
@@ -99,6 +172,19 @@ private:
   // Drops the known size of `name` and, for a hotcache file, the cached
   // hotcache of its segment: the name is about to hold another object.
   void forget(std::string_view name);
+  // Waits until no upload of `name` and no removal batch holding it runs.
+  void settle(std::unique_lock<std::mutex>& lock, std::string_view name);
+  // Before `name` is written again: a queued upload or removal of the old
+  // bytes is dropped, a running one is waited for.
+  void supersede(std::unique_lock<std::mutex>& lock, std::string_view name);
+  // Puts the staged file; the caller marked `entry` RUNNING. Settles it.
+  static void upload(const std::shared_ptr<Writes>& writes, ObjectStore& store, Directory& staging,
+                     const std::string& name, const std::string& objectKey, const std::shared_ptr<Upload>& entry,
+                     uint32_t attempts);
+  void queueRemoval(std::unique_lock<std::mutex>& lock, const std::string& name);
+  static void sendRemovals(const std::shared_ptr<Writes>& writes, ObjectStore& store, const std::string& prefix);
+  void publish(std::string_view name, std::string_view bytes);  // put under the final name of a rename
+  void ensureLive();  // throws once abandoned
 
 public:
   /// `prefix` is the key prefix of this directory; a '/' is appended when missing.
@@ -109,6 +195,15 @@ public:
   Capabilities capabilities() const override { return REMOTE | ATOMIC_RENAME | DURABLE_SYNC; }
   ObjectStore& objects() { return *store; }
   const std::string& keyPrefix() const { return prefix; }
+  /// True while a removal of `name` is queued or being sent: the name is gone
+  /// from this directory though the store may still hold its object. A layer
+  /// that reads the store directly (a cache) treats the name as absent.
+  bool removalPending(std::string_view name);
+  /// The objects under this directory's prefix are about to be removed (a
+  /// collection or incarnation is deleted): drops the uploads and removals
+  /// that are queued, waits for the ones in flight, and sends nothing to the
+  /// store from then on, so nothing lands after the removal. Reads go on.
+  void abandon();
 
   void listFiles(std::vector<FileInfo>& target) override;
   std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override;
@@ -118,7 +213,8 @@ public:
   bool deleteFile(std::string_view name) override;
   void finishFile(File& file) override;
   void renameFile(std::string_view from, std::string_view to) override;
-  void sync(std::span<const std::string> filenames) override { unused(filenames); }
+  void sync(std::span<const std::string> filenames) override;
+  void deletePrefix(std::string_view namePrefix) override;
   void clear() override;
   void linkFile(Directory& source, std::string_view name) override;
   std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override;
@@ -136,12 +232,16 @@ public:
 ///   staging_dir  local directory for staged writes (default: stage in RAM)
 ///   spill_bytes  with staging_dir, stream size at which a file becomes its own
 ///                object instead of being folded into the segment's first one
+///   upload_threads   uploads and removal batches in flight (default 8)
+///   upload_attempts  tries of a background upload before sync reports it (default 3)
 class ObjectStoreDirFactory : public DirectoryFactory {
   std::shared_ptr<ObjectStore> store_;
   ObjectStoreDirectory::Options options_;
+  std::mutex directoriesMutex;
+  std::vector<std::weak_ptr<ObjectStoreDirectory>> directories;  // handed out, abandoned by a removal
 
   std::string collectionPrefix(const CollectionId& id) const { return "t/" + id.tenant + "/" + id.name + "/"; }
-  std::shared_ptr<Directory> directory(std::string prefix) const;
+  std::shared_ptr<Directory> directory(std::string prefix);
   void ensureMarker(const std::string& key);
   bool exists(const std::string& prefix, const std::string& marker);
   void removeAll(const std::string& prefix);

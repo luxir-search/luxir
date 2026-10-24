@@ -3,6 +3,7 @@
 #pragma once
 
 #include <charconv>
+#include <cstring>
 #include <map>
 #include "Directory.h"
 #include "luxir/api/index_files.h"
@@ -36,6 +37,16 @@ struct Manifest {
     uint64_t gen = 0;
     auto [end, error] = std::from_chars(name.data(), name.data() + name.size(), gen);
     return error == std::errc() && end == name.data() + name.size() ? gen : 0;
+  }
+
+  // Whether `file` holds a whole root: its footer's length and hash match.
+  static bool intact(std::string_view file) {
+    if (file.size() < 16) return false;
+    size_t length = file.size() - 16;
+    uint64_t storedLength, storedHash;
+    std::memcpy(&storedLength, file.data() + length, 8);
+    std::memcpy(&storedHash, file.data() + length + 8, 8);
+    return storedLength == length && storedHash == XXH3_64bits(file.data(), length);
   }
 
   static api::IndexInfo decode(const Bytes& bytes, std::pmr::memory_resource& arena) {

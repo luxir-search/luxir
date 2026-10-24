@@ -128,14 +128,13 @@ The request count depends on the number of files, not on the size of the segment
   no stable mapped bytes.
 - **Writes** go to a local staging directory (RAM by default, or a filesystem
   directory under `staging_dir`, one subdirectory per `Directory` instance, removed
-  with it). `finishFile` closes the staged file and uploads it with one `put`. The
-  staged copy stays readable until the file is deleted or the directory is
-  destroyed, so a segment that was just written is not fetched back. `sync` has
-  nothing to do: an acknowledged put is durable. With a staging directory,
-  `spill_bytes` sets when a stream stops being folded into the segment's first
-  file and becomes an object of its own (see below).
-- **`renameFile`** is a server-side copy and a remove. The target object is
-  replaced atomically, which is all `CURRENT` needs.
+  with it). The staged copy stays readable until the file is deleted or the
+  directory is destroyed, so a segment that was just written is not fetched back.
+  With a staging directory, `spill_bytes` sets when a stream stops being folded
+  into the segment's first file and becomes an object of its own (see below).
+  See [the write path](#the-write-path) for when the bytes reach the store.
+- **`renameFile`** of a file that is in the store is a server-side copy and a
+  remove. The target object is replaced atomically, which is all `CURRENT` needs.
 - **`linkFile`** is a server-side copy; between different stores it streams the
   bytes. `reuseFiles` copies, as the directory has no `HARD_LINK`.
 - **`listFiles`** lists the prefix, hiding marker objects and other directories.
@@ -166,6 +165,66 @@ by the first query that needs anything but its catalog. Streams that spilled
 (4 MiB by default; `spill_bytes` with a staging directory) stay separate and
 survive as their own files, which is what a lazy reader can leave unfetched.
 Choose `spill_bytes` for the trade between many small objects and coarse ones.
+
+## The write path
+
+A segment goes to the store as soon as it is finalized, and a commit returns
+only once the store holds everything it names. In between, nothing waits for
+the network.
+
+- **Uploads start at `finishFile`.** The file is queued for one `put` on the
+  backend's upload workers (`upload_threads`, default 8, shared by the backend's
+  directories), so a flush or a merge hands its files over and goes on. A failed
+  upload is retried (`upload_attempts`, default 3, backing off 200 ms, 800 ms).
+- **`sync` is the durability barrier.** It waits for the uploads of the files it
+  names. A file still queued behind other uploads (the workers busy with a large
+  merge) is uploaded by `sync` itself, so a commit never waits its turn behind
+  files it does not name. A file whose background attempts all failed gets one
+  more attempt there, and a failure throws. `Manifest::commit` syncs every file a root references
+  before writing the root, so a root never names an object the store lacks, and
+  a failed upload fails the commit rather than publishing it. The writer goes on:
+  its next commit syncs the same files again. An acknowledged commit is in the
+  store, and a node that starts over the same keys with nothing local finds it.
+- **A root is one conditional put.** `Manifest::commit` writes `commit_<gen>.pending`,
+  syncs it and renames it into place. A `.pending` file is not uploaded on its
+  own: the rename puts its bytes under the final name (one `put`, no copy, no
+  remove). A commit root is put only if absent (`If-None-Match` on S3), so two
+  writers on the same keys cannot both publish one generation: the second fails
+  with "another writer published this generation" instead of replacing a root.
+  The same bytes again (a retried commit) succeed, and a root that is damaged
+  (its footer does not match) is replaced, as a repair does. The writer that
+  lost never removes the root it lost to, not even in the cleanup of its failed
+  commit. This detects a second writer that publishes the generation another
+  one did; it is not a lease: a stale writer that only publishes later
+  generations is not fenced, and its retirement can still remove files of the
+  other writer's lineage.
+- **A file deleted before its upload started is never sent**, and its delete
+  costs no request: a small flushed segment that a merge folds away quickly may
+  never reach the store.
+- **Removals are queued and sent in batches** (`ObjectStore::removeMany`; S3's
+  `DeleteObjects` takes 1000 keys a request). A removed name is gone from the
+  directory at once. A batch that fails twice is logged; the objects are
+  unreferenced and the startup sweep of unreferenced index files removes them.
+- **Removing a collection stops its uploads.** Before it lists and removes the
+  objects under a collection or incarnation, the backend drops the queued uploads
+  of every directory it handed out under that prefix and waits for the running
+  ones, and those directories send nothing more, so an upload that lands late
+  cannot bring a removed collection back.
+- **Retiring a segment lists nothing.** From its first listing on (opening an
+  index lists the directory) the directory keeps the names of its objects, adds
+  what it writes and drops what it removes, so `deletePrefix` of a dead segment
+  needs no `list`. A name it does not know of is removed with a direct request,
+  so a file another handle wrote is still removed.
+
+What a commit costs, beyond the segment files that were uploaded while they were
+written: one `size` (the root is looked up before it is written) and one `put` of
+the root. Retirement costs one batched removal and no listing.
+`ObjectStoreWriteTest` pins this.
+
+Updates acknowledged without a commit are not durable on any backend; see
+[indexing](../guide/indexing.md#visibility-and-commits). An update that must
+survive a crash asks for a commit (`?commit=true`), whose response waits for the
+store.
 
 ## The backend
 
@@ -198,8 +257,13 @@ is: a second writer on the same keys is not detected beyond the collection marke
   resident chunks fits the bitmap; it needs the readers to stop assuming a pointer
   stays valid, or readers to pin ranges.
 - **Parallel fetches.** A `prefetchRanges` call fetches its runs one after another.
-- **Multipart upload and write-behind.** `put` takes a whole object, which an S3
-  plugin has to split itself, and a flush uploads from the staged file before it
-  returns.
+- **Multipart upload.** `put` takes a whole object, which an S3 plugin splits
+  itself (the `objectstore` plugin uploads parts in parallel).
+- **A write-ahead log.** Updates are durable once a commit includes them; a
+  commit per request batch is the unit of durability. A shared log in the store
+  would let acknowledgment come before a segment is written.
+- **Packing segments.** Each segment file is an object of its own; small streams
+  are folded into the segment's first file (see above), so a small segment is
+  one object and its hotcache another.
 - **A tiered or cached layer.** The layer registry composes (a `DelegatingDirFactory`
   over an object store), but no layer ships.

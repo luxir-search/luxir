@@ -19,6 +19,12 @@ The order is the original plan, not a requirement. Work on step 4 can come
 first as long as it does not preclude step 3. In practice that means both
 steps use the publication contract below.
 
+An object-store backend already keeps a collection in a store as its primary
+copy, both written and read there: segments are uploaded as they are
+finalized, and a commit returns once the store holds it. See
+[storage tiers](storage-tiers.md#the-write-path). That is not the syncer below:
+its layout is the `fs` layout, not content-addressed files and a HEAD.
+
 ## Publication contract
 
 Steps 3 and 4 share one layout in the store:

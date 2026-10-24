@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -43,6 +44,10 @@ public:
   virtual void put(std::string_view name, std::string_view bytes, bool ifAbsent = false) = 0;
   /// True when the object existed.
   virtual bool remove(std::string_view name) = 0;
+  /// Removes every named object; a missing one is not an error. The default
+  /// removes them one at a time; a backend with a batch delete (S3's
+  /// DeleteObjects takes up to 1000 keys a request) overrides it.
+  virtual void removeMany(std::span<const std::string> names);
   /// Server-side copy; replaces `to`. Throws when `from` does not exist.
   virtual void copy(std::string_view from, std::string_view to) = 0;
 
@@ -73,11 +78,13 @@ private:
   std::map<std::string, std::string, std::less<>> objects;
   std::vector<Request> log;
   std::string label;
+  std::function<void(std::string_view op, std::string_view name)> intercept;
   std::atomic<uint64_t> requests_{0};
   std::atomic<uint64_t> bytesRead_{0};
   std::atomic<uint64_t> bytesWritten_{0};
 
   void record(std::string_view op, std::string_view name, uint64_t offset, uint64_t length);
+  void before(std::string_view op, std::string_view name);
 
 public:
   explicit RamObjectStore(std::string label = "ram") : label(std::move(label)) {}
@@ -92,8 +99,17 @@ public:
   void readRange(std::string_view name, uint64_t offset, std::span<char> out) override;
   void put(std::string_view name, std::string_view bytes, bool ifAbsent = false) override;
   bool remove(std::string_view name) override;
+  void removeMany(std::span<const std::string> names) override;  // one remove_many request
   void copy(std::string_view from, std::string_view to) override;
   std::string describe() const override { return "ram_object:" + label; }
+
+  /// Runs before every request, outside the store's lock, with the request's
+  /// op and object (a list's prefix, a remove_many's first name). It may
+  /// block, to hold a request in flight, or throw, to fail it as a network
+  /// error would: the request then neither happens nor counts. After a put
+  /// lands it runs again with op "put_done": a throw there is a lost response,
+  /// a put the store holds though its caller sees it fail. Null clears it.
+  void interceptRequests(std::function<void(std::string_view op, std::string_view name)> hook);
 
   /// Every call counts as a request.
   uint64_t requests() const { return requests_.load(std::memory_order_relaxed); }

@@ -20,6 +20,10 @@ std::vector<std::string> ObjectStore::listDirectories(std::string_view prefix) {
   return {names.begin(), names.end()};
 }
 
+void ObjectStore::removeMany(std::span<const std::string> names) {
+  for (const auto& name : names) remove(name);
+}
+
 namespace {
 std::mutex namedMutex;
 std::map<std::string, std::shared_ptr<RamObjectStore>, std::less<>>& namedStores() {
@@ -48,7 +52,22 @@ void RamObjectStore::record(std::string_view op, std::string_view name, uint64_t
   log.push_back({std::string(op), std::string(name), offset, length});
 }
 
+void RamObjectStore::interceptRequests(std::function<void(std::string_view op, std::string_view name)> hook) {
+  std::lock_guard lock(mutex);
+  intercept = std::move(hook);
+}
+
+void RamObjectStore::before(std::string_view op, std::string_view name) {
+  std::function<void(std::string_view, std::string_view)> hook;
+  {
+    std::lock_guard lock(mutex);
+    hook = intercept;
+  }
+  if (hook) hook(op, name);
+}
+
 std::vector<ObjectStore::ObjectInfo> RamObjectStore::list(std::string_view prefix) {
+  before("list", prefix);
   std::lock_guard lock(mutex);
   record("list", prefix, 0, 0);
   std::vector<ObjectInfo> result;
@@ -59,6 +78,7 @@ std::vector<ObjectStore::ObjectInfo> RamObjectStore::list(std::string_view prefi
 }
 
 std::optional<uint64_t> RamObjectStore::size(std::string_view name) {
+  before("size", name);
   std::lock_guard lock(mutex);
   record("size", name, 0, 0);
   auto it = objects.find(name);
@@ -67,6 +87,7 @@ std::optional<uint64_t> RamObjectStore::size(std::string_view name) {
 }
 
 void RamObjectStore::readRange(std::string_view name, uint64_t offset, std::span<char> out) {
+  before("read", name);
   std::lock_guard lock(mutex);
   record("read", name, offset, out.size());
   auto it = objects.find(name);
@@ -80,19 +101,24 @@ void RamObjectStore::readRange(std::string_view name, uint64_t offset, std::span
 }
 
 void RamObjectStore::put(std::string_view name, std::string_view bytes, bool ifAbsent) {
-  std::lock_guard lock(mutex);
-  record("put", name, 0, bytes.size());
-  auto it = objects.find(name);
-  if (it != objects.end()) {
-    if (ifAbsent) throw std::runtime_error("object already exists: " + std::string(name));
-    it->second.assign(bytes);
-  } else {
-    objects.emplace(std::string(name), std::string(bytes));
+  before("put", name);
+  {
+    std::lock_guard lock(mutex);
+    record("put", name, 0, bytes.size());
+    auto it = objects.find(name);
+    if (it != objects.end()) {
+      if (ifAbsent) throw std::runtime_error("object already exists: " + std::string(name));
+      it->second.assign(bytes);
+    } else {
+      objects.emplace(std::string(name), std::string(bytes));
+    }
+    bytesWritten_.fetch_add(bytes.size(), std::memory_order_relaxed);
   }
-  bytesWritten_.fetch_add(bytes.size(), std::memory_order_relaxed);
+  before("put_done", name);
 }
 
 bool RamObjectStore::remove(std::string_view name) {
+  before("remove", name);
   std::lock_guard lock(mutex);
   record("remove", name, 0, 0);
   auto it = objects.find(name);
@@ -101,7 +127,18 @@ bool RamObjectStore::remove(std::string_view name) {
   return true;
 }
 
+void RamObjectStore::removeMany(std::span<const std::string> names) {
+  if (names.empty()) return;
+  before("remove_many", names.front());
+  std::lock_guard lock(mutex);
+  record("remove_many", names.front(), 0, names.size());
+  for (const auto& name : names) {
+    if (auto it = objects.find(name); it != objects.end()) objects.erase(it);
+  }
+}
+
 void RamObjectStore::copy(std::string_view from, std::string_view to) {
+  before("copy", from);
   std::lock_guard lock(mutex);
   record("copy", from, 0, 0);
   auto it = objects.find(from);

@@ -1,10 +1,13 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#include <future>
+
 #include <gtest/gtest.h>
 
 #include "luxir/plugin/Registries.h"
 #include "luxir/reader/Hotcache.h"
+#include "luxir/store/Manifest.h"
 #include "luxir/store/ObjectStoreDirectory.h"
 #include "luxir/util/Uuid.h"
 #include "test/CollectionHelper.h"
@@ -17,12 +20,19 @@ using namespace luxir;
 
 namespace {
 
-void write(Directory& dir, const std::string& name, const std::string& bytes) {
+void finish(Directory& dir, const std::string& name, const std::string& bytes) {
   auto file = dir.createFile(name);
   OutputStream out(file.get());
   out.writeBytes(bytes);
   out.close();
   dir.finishFile(*file);
+}
+
+// A written and synced file, as a commit leaves it: in the store.
+void write(Directory& dir, const std::string& name, const std::string& bytes) {
+  finish(dir, name, bytes);
+  std::array<std::string, 1> names{name};
+  dir.sync(names);
 }
 
 std::string readAll(Directory& dir, const std::string& name) {
@@ -88,9 +98,18 @@ TEST_F(ObjectStoreDirectoryTest, renameReplacesTheTargetAtomically) {
   EXPECT_EQ("two", readAll(fresh, "CURRENT"));
   EXPECT_EQ("<absent>", readAll(dir, "CURRENT.pending"));
   EXPECT_FALSE(store->size("d/CURRENT.pending"));
-  EXPECT_EQ(1u, store->requests("copy"));
+  EXPECT_EQ(0u, store->requests("put", "d/CURRENT.pending"));  // a pending file goes up under its final name
+  EXPECT_EQ(0u, store->requests("copy"));
   EXPECT_EQ("one", before->read());  // a file that is not segment data is read whole when opened
   EXPECT_THROW(dir.renameFile("missing", "x"), std::runtime_error);
+
+  // A file that is in the store already is renamed server side.
+  write(dir, "x", "three");
+  store->resetStats();
+  dir.renameFile("x", "y");
+  EXPECT_EQ(1u, store->requests("copy"));
+  EXPECT_EQ("three", readAll(fresh, "y"));
+  EXPECT_EQ("<absent>", readAll(dir, "x"));
 }
 
 TEST_F(ObjectStoreDirectoryTest, linkIsAServerSideCopyAndReuseFallsBackToCopyingAcrossStores) {
@@ -244,7 +263,8 @@ TEST_F(ObjectStoreDirectoryTest, nodeFilesLiveUnderNodeAndAPendingFileIsNotAColl
   ObjectStoreDirFactory factory(store, ctx);
   auto node = factory.nodeDirectory();
   write(*node, "replication.json.pending", "{}");
-  EXPECT_TRUE(store->size("node/replication.json.pending"));
+  EXPECT_FALSE(store->size("node/replication.json.pending"));  // uploaded by its rename
+  store->put("node/replication.json.pending", "{}");  // left by a crash
   EXPECT_TRUE(factory.holdsNoCollections());
   write(*node, "replication.json", "{}");
   EXPECT_EQ("{}", readAll(*factory.nodeDirectory(), "replication.json"));
@@ -367,4 +387,274 @@ TEST(ObjectStoreBackendTest, aReopenedCollectionOpensItsFilesWithoutSizeRequests
   }
   store.reset();
   RamObjectStore::drop(name);
+}
+
+namespace {
+
+// Holds a RamObjectStore's puts in flight until released, as a slow network would.
+class HeldPuts {
+  RamObjectStore& store;
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool held = true;
+  int waiting = 0;
+
+public:
+  explicit HeldPuts(RamObjectStore& store) : store(store) {
+    store.interceptRequests([this](std::string_view op, std::string_view) {
+      if (op != "put") return;
+      std::unique_lock lock(mutex);
+      waiting++;
+      changed.notify_all();
+      changed.wait(lock, [&] { return !held; });
+      waiting--;
+    });
+  }
+  ~HeldPuts() {
+    release();
+    store.interceptRequests(nullptr);
+  }
+  void awaitHeld(int puts) {
+    std::unique_lock lock(mutex);
+    changed.wait(lock, [&] { return waiting >= puts; });
+  }
+  void release() {
+    std::lock_guard lock(mutex);
+    held = false;
+    changed.notify_all();
+  }
+};
+
+void syncOne(Directory& dir, const std::string& name) {
+  std::array<std::string, 1> names{name};
+  dir.sync(names);
+}
+
+std::vector<std::byte> rootBytes(std::string_view text) {
+  auto data = (const std::byte*)text.data();
+  return {data, data + text.size()};
+}
+
+}  // namespace
+
+// A finished file is on its way to the store at once, and sync is what waits
+// for it: a flush does not wait for the network, a commit does.
+TEST_F(ObjectStoreDirectoryTest, anUploadStartsWhenAFileIsFinishedAndSyncWaitsForIt) {
+  ObjectStoreDirectory dir(store, "d/", chunks(8));
+  HeldPuts held(*store);
+  finish(dir, "s01_00", "segment bytes");
+  held.awaitHeld(1);
+  EXPECT_EQ("segment bytes", readAll(dir, "s01_00"));  // the staged copy
+  std::vector<Directory::FileInfo> files;
+  dir.listFiles(files);
+  ASSERT_EQ(1u, files.size());
+  EXPECT_EQ(13u, files[0].size);
+
+  auto synced = std::async(std::launch::async, [&] { syncOne(dir, "s01_00"); });
+  EXPECT_EQ(std::future_status::timeout, synced.wait_for(std::chrono::milliseconds(50)));
+  EXPECT_FALSE(store->size("d/s01_00"));
+  held.release();
+  synced.get();
+  EXPECT_TRUE(store->size("d/s01_00"));
+  EXPECT_EQ(1u, store->requests("put", "d/s01_00"));
+}
+
+// Background attempts that fail leave the file staged; sync tries once more
+// and reports the failure, so a commit never names a file the store lacks,
+// and the next sync after the outage goes through.
+TEST_F(ObjectStoreDirectoryTest, aFailedUploadFailsSyncUntilAnAttemptSucceeds) {
+  auto options = chunks(8);
+  options.uploadAttempts = 1;
+  ObjectStoreDirectory dir(store, "d/", options);
+  std::atomic<bool> down{true};
+  store->interceptRequests([&](std::string_view op, std::string_view) {
+    if (op == "put" && down) throw std::runtime_error("network down");
+  });
+  finish(dir, "s01_00", "bytes");
+  for (int i = 0; i < 2; i++) {
+    try {
+      syncOne(dir, "s01_00");
+      FAIL() << "sync of a file that is not in the store returned";
+    } catch (const std::runtime_error& e) {
+      EXPECT_NE(std::string::npos, std::string(e.what()).find("network down")) << e.what();
+    }
+  }
+  EXPECT_FALSE(store->size("d/s01_00"));
+  EXPECT_EQ("bytes", readAll(dir, "s01_00"));  // still staged
+  down = false;
+  syncOne(dir, "s01_00");
+  EXPECT_TRUE(store->size("d/s01_00"));
+  store->interceptRequests(nullptr);
+}
+
+// A segment merged away before its upload started is never sent, and its
+// delete costs no request.
+TEST_F(ObjectStoreDirectoryTest, aFileDeletedBeforeItsUploadStartsIsNeverSent) {
+  auto options = chunks(8);
+  options.workerThreads = 1;
+  ObjectStoreDirectory dir(store, "d/", options);
+  {
+    HeldPuts held(*store);
+    finish(dir, "s01_00", "first");  // occupies the only worker
+    held.awaitHeld(1);
+    finish(dir, "s02_00", "merged away");
+    EXPECT_TRUE(dir.deleteFile("s02_00"));
+    EXPECT_EQ("<absent>", readAll(dir, "s02_00"));
+  }
+  syncOne(dir, "s01_00");
+  syncOne(dir, "s02_00");  // nothing to wait for
+  EXPECT_EQ(0u, store->requests("put", "d/s02_00"));
+  EXPECT_EQ(0u, store->requests("remove"));
+  EXPECT_FALSE(store->size("d/s02_00"));
+}
+
+// A commit root goes up with one conditional put under its final name. The
+// same root again (a retried commit) is fine, another writer's root for the
+// generation is never replaced, and a damaged one is, as a repair does.
+TEST_F(ObjectStoreDirectoryTest, aCommitRootIsCreatedOnceAndNeverReplacedByAnother) {
+  ObjectStoreDirectory dir(store, "d/", chunks(8));
+  auto publish = [&](uint64_t gen, std::string_view text) {
+    Manifest::write(dir, Manifest::name(gen) + ".pending", rootBytes(text));
+    syncOne(dir, Manifest::name(gen) + ".pending");
+    dir.renameFile(Manifest::name(gen) + ".pending", Manifest::name(gen));
+  };
+  publish(5, "root five");
+  EXPECT_EQ(1u, store->requests("put"));
+  EXPECT_EQ(0u, store->requests("copy"));
+  EXPECT_EQ(0u, store->requests("remove"));
+  auto published = readAll(dir, "commit_5");
+  EXPECT_TRUE(Manifest::intact(published));
+
+  publish(5, "root five");
+  try {
+    publish(5, "another writer's five");
+    FAIL() << "a commit root was replaced";
+  } catch (const std::runtime_error& e) {
+    EXPECT_NE(std::string::npos, std::string(e.what()).find("another writer")) << e.what();
+  }
+  ObjectStoreDirectory fresh(store, "d/", chunks(8));
+  EXPECT_EQ(published, readAll(fresh, "commit_5"));
+  // The commit that lost cleans up after itself, but never removes the root
+  // it lost to.
+  EXPECT_FALSE(dir.deleteFile("commit_5"));
+  EXPECT_EQ(published, readAll(fresh, "commit_5"));
+
+  store->put("d/commit_6", "torn");
+  publish(6, "root six");
+  EXPECT_TRUE(Manifest::intact(readAll(fresh, "commit_6")));
+}
+
+// Removals are queued and sent in batches, and a directory that has listed
+// its objects retires a segment without listing again.
+TEST_F(ObjectStoreDirectoryTest, removalsAreBatchedAndRetiringASegmentListsNothing) {
+  {
+    ObjectStoreDirectory dir(store, "d/", chunks(8));
+    for (const char* name : {"s01_00", "s01_01", "s01__hot", "s02_00"}) write(dir, name, name);
+    std::vector<Directory::FileInfo> files;
+    dir.listFiles(files);  // as opening an index does
+    store->resetStats();
+    dir.deletePrefix("s01_");
+    EXPECT_TRUE(dir.deleteFile("s02_00"));
+    EXPECT_EQ(nullptr, dir.openFile("s01_00"));  // gone for this directory at once
+    EXPECT_EQ(nullptr, dir.openFile("s02_00"));
+    EXPECT_EQ(0u, store->requests("list"));
+  }  // a closing directory sends what is still queued
+  EXPECT_EQ(0u, store->requests("remove"));
+  EXPECT_GE(2u, store->requests("remove_many"));
+  EXPECT_EQ(0u, store->storedBytes("d/"));
+}
+
+// A directory closing while an upload fails does not wait for it forever:
+// the closing directory gives up on the file, which nothing synced.
+TEST_F(ObjectStoreDirectoryTest, closingWhileAnUploadFailsReturns) {
+  auto options = chunks(8);
+  options.uploadAttempts = 3;
+  auto dir = std::make_unique<ObjectStoreDirectory>(store, "d/", options);
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  std::promise<void> started;
+  store->interceptRequests([&, released](std::string_view op, std::string_view) {
+    if (op != "put") return;
+    started.set_value();
+    released.wait();
+    throw std::runtime_error("network down");
+  });
+  finish(*dir, "s01_00", "bytes");
+  started.get_future().wait();
+  auto closed = std::async(std::launch::async, [&] { dir.reset(); });
+  EXPECT_EQ(std::future_status::timeout, closed.wait_for(std::chrono::milliseconds(20)));  // waits for the put
+  release.set_value();
+  EXPECT_EQ(std::future_status::ready, closed.wait_for(std::chrono::seconds(30)));
+  store->interceptRequests(nullptr);
+}
+
+// A name a reader still held when it was deleted, then renamed onto: the
+// reader's last release does not remove the new object.
+TEST_F(ObjectStoreDirectoryTest, aNameRenamedOntoAfterADeferredDeleteKeepsItsNewObject) {
+  ObjectStoreDirectory writer(store, "d/", chunks(8));
+  write(writer, "s01_00", std::string(40, 'o'));
+  ObjectStoreDirectory dir(store, "d/", chunks(8));
+  auto reader = dir.openFile("s01_00");
+  ASSERT_TRUE(reader->lazy());
+  EXPECT_TRUE(dir.deleteFile("s01_00"));  // deferred: the reader holds it
+  write(dir, "s09_00", "new bytes");
+  dir.renameFile("s09_00", "s01_00");
+  reader.reset();
+  ObjectStoreDirectory fresh(store, "d/", chunks(8));
+  EXPECT_EQ("new bytes", readAll(fresh, "s01_00"));
+  EXPECT_EQ("new bytes", readAll(dir, "s01_00"));
+}
+
+// A commit's files are uploaded by the commit itself when the workers are busy
+// with others (a large merge), so a commit never queues behind them.
+TEST_F(ObjectStoreDirectoryTest, syncUploadsAQueuedFileItselfInsteadOfWaitingBehindOthers) {
+  auto options = chunks(8);
+  options.workerThreads = 1;
+  ObjectStoreDirectory dir(store, "d/", options);
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  std::promise<void> started;
+  store->interceptRequests([&, released](std::string_view op, std::string_view name) {
+    if (op != "put" || name != "d/s01_00") return;
+    started.set_value();
+    released.wait();
+  });
+  finish(dir, "s01_00", "a large merge");  // occupies the only worker
+  started.get_future().wait();
+  finish(dir, "s02_00", "a small flush");
+  auto synced = std::async(std::launch::async, [&] { syncOne(dir, "s02_00"); });
+  EXPECT_EQ(std::future_status::ready, synced.wait_for(std::chrono::seconds(10)));
+  release.set_value();
+  synced.get();
+  syncOne(dir, "s01_00");
+  EXPECT_EQ(1u, store->requests("put", "d/s02_00"));  // its queued task found it sent
+  EXPECT_EQ("a small flush", readAll(dir, "s02_00"));
+  store->interceptRequests(nullptr);
+}
+
+// Removing a collection while one of its directories still has uploads in
+// flight or queued leaves nothing behind: none of them lands after the removal,
+// and the directory sends nothing more.
+TEST_F(ObjectStoreDirectoryTest, aRemovedCollectionStaysRemovedWhileItsUploadsFinish) {
+  LuxirConfig config;
+  config.store.options = {{"upload_threads", "1"}};
+  StorageContext ctx{config, config.store.options, {}};
+  ObjectStoreDirFactory factory(store, ctx);
+  auto storage = factory.collection(CollectionId::of("main"));
+  auto dir = storage.create("i1");
+  std::future<void> removing;
+  {
+    HeldPuts held(*store);
+    finish(*dir, "s01_00", "flushed, never committed");
+    held.awaitHeld(1);
+    finish(*dir, "s02_00", "queued behind it");
+    removing = std::async(std::launch::async, [&] { storage.remove(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  removing.get();
+  finish(*dir, "s03_00", "written after the removal");
+  EXPECT_THROW(syncOne(*dir, "s03_00"), std::runtime_error);
+  dir.reset();
+  EXPECT_TRUE(store->list("t/t0/main/").empty());
+  EXPECT_TRUE(factory.collections().empty());
 }

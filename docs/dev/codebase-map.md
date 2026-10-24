@@ -138,8 +138,9 @@ locations, browse `src/luxir/<area>/`.
      and an in-memory implementation with request counters; `LazyInputFile`: an `InputFile` that
      fetches ranges on first touch into an anonymous mapping; `ObjectStoreDirectory` /
      `ObjectStoreDirFactory` (`ObjectStoreDirectory.h`): a `Directory` and a backend over an
-     `ObjectStore` (writes staged locally then `put`, renames as copy+remove, deletes wait for
-     readers). Built-in backend `ram_object`. `InputFile::rangeStream` / `prefetchRanges` is the
+     `ObjectStore` (writes staged locally and uploaded in the background from `finishFile`, `sync`
+     waits for them, a `.pending` file is put once under its final name, a commit root only if
+     absent, removals batched, deletes wait for readers). Built-in backend `ram_object`. `InputFile::rangeStream` / `prefetchRanges` is the
      reader-side contract; see [../design/storage-tiers.md](../design/storage-tiers.md)
    - `Hotcache` (`reader/Hotcache.h`): the `s<seg>__hot` file listing the ranges opening a segment reads,
      written by `PostingsWriter::finish` for `REMOTE` directories; `RecordingDirectory` records them.
