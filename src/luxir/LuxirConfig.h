@@ -6,7 +6,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <string>
+#include <vector>
 #include <oneapi/tbb/info.h>
 
 namespace CLI { class App; }
@@ -73,8 +75,12 @@ struct CheckedDirConfig {
 };
 
 struct StoreConfig {
-  std::string backend = "ram";           // ram, fs
+  std::string backend = "ram";           // built in: ram, fs; plugins may add more
   std::string data_dir = "luxir_data";
+  // Layers wrapped around the backend, innermost first, inside checked_dir and read_only.
+  std::vector<std::string> layers;
+  // Free-form KEY=VALUE settings for backends and layers (StorageContext::options).
+  std::map<std::string, std::string> options;
   uint64_t ram_limit_mb = 0; // RAM storage only; zero is unlimited.
   CheckedDirConfig checked_dir;
   // Before a collection serves at startup: none trusts the manifest footer and

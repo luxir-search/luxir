@@ -39,6 +39,7 @@ Registries& Registries::global() {
 void Registries::freeze() {
   plugins.freeze();
   analysis.freeze();
+  storage.freeze();  // storage backends and layers
 }
 
 void initPlugins(void (*addPlugins)(PluginRegistry&)) {
@@ -46,6 +47,7 @@ void initPlugins(void (*addPlugins)(PluginRegistry&)) {
   std::call_once(once, [addPlugins] {
     Registries& r = Registries::global();
     registerBuiltinAnalysis(r.analysis);
+    registerBuiltinStorage(r.storage);  // storage: ram, fs
     addPlugins(r.plugins);
     std::string names;
     for (const auto& p : r.plugins.plugins()) {

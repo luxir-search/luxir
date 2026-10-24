@@ -4,11 +4,13 @@
 #include "Collections.h"
 #include "Promotion.h"
 #include "luxir/api/luxir_types.hpp"
+#include "luxir/plugin/Registries.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/store/CheckedDirFactory.h"
 #include "luxir/store/CorruptionMarker.h"
 #include "luxir/store/FileVerifier.h"
 #include "luxir/store/ReadOnlyDirectory.h"
+#include "luxir/store/StorageRegistry.h"
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
 
@@ -93,18 +95,18 @@ Collections::Collections(const LuxirConfig& config, CollectionEvents& events, In
     : metrics(std::move(metrics)), config(config), events(events), indexRamBudget(indexRamBudget), arena(arena),
       verifyOnOpen(config.store.verify_on_open == "full"), cacheDefaultBytes(config.queryCacheBytes) {
   if (!verifyOnOpen && config.store.verify_on_open != "none") throw std::invalid_argument("store.verify-on-open must be none or full");
-  if (config.store.backend == "fs") {
-    factory = std::make_unique<FSDirFactory>(config.store.data_dir, config.read_only);
-  } else {
-    if (config.store.ram_limit_mb > UINT64_MAX / (1024 * 1024)) throw std::invalid_argument("store.ram_limit_mb is too large");
-    factory = std::make_unique<RAMDirFactory>(config.store.ram_limit_mb * 1024 * 1024, [this] { return reclaimStorage(); });
-  }
+  // Backend, then plugin layers (innermost first), then the core wrappers below.
+  const auto& storage = Registries::global().storage;
+  StorageContext storageContext{config, config.store.options, [this] { return reclaimStorage(); }};
+  factory = storage.makeBackend(config.store.backend, storageContext);
+  for (const auto& layer : config.store.layers) factory = storage.makeLayer(layer, std::move(factory), storageContext);
   if (config.store.checked_dir.sync != "off") {
     auto mode = config.store.checked_dir.sync == "throw" ? CheckedDirMode::THROW : CheckedDirMode::WARN;
     factory = std::make_unique<CheckedDirFactory>(std::move(factory), mode);
   }
   // Outermost, so a mutation is refused before any wrapper does bookkeeping for it.
   if (config.read_only) factory = std::make_unique<ReadOnlyDirFactory>(std::move(factory));
+  LOG_INFO("storage: {}", factory->describe());
 }
 
 Collections::~Collections() = default;

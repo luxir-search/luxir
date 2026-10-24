@@ -4,6 +4,7 @@
 #pragma once
 #include "luxir/analysis/AnalysisRegistry.h"
 #include "luxir/plugin/Plugin.h"
+#include "luxir/store/StorageRegistry.h"
 
 namespace luxir {
 
@@ -12,6 +13,8 @@ class Registries {
 public:
   PluginRegistry plugins;
   AnalysisRegistry analysis;
+  // Storage backends and layers.
+  StorageRegistry storage;
 
   static Registries& global();
   // Freezes every registry.
