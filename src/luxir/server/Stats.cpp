@@ -149,15 +149,19 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   fillActivity(dst.search, counts, metricActivity(MetricStage::SEARCH), resource);
   fillHistogram(dst.search_execution, counts.activities[metricActivity(MetricStage::SEARCH_EXECUTION)],
                 requestBounds, resource);
+  fillHistogram(dst.search_queue_wait, counts.activities[metricActivity(MetricStage::SEARCH_QUEUE_WAIT)],
+                requestBounds, resource);
   dst.search_resource_exhausted = counter(MetricCounter::SEARCH_RESOURCE_EXHAUSTED);
   dst.search_warnings = counter(MetricCounter::SEARCH_WARNINGS);
   fillActivity(dst.index_batches, counts, metricActivity(MetricStage::INDEX_BATCH), resource);
+  fillHistogram(dst.update_wait, counts.activities[metricActivity(MetricStage::UPDATE_WAIT)], requestBounds, resource);
   dst.documents_accepted = counter(MetricCounter::DOCUMENTS_ACCEPTED);
   dst.documents_rejected = counter(MetricCounter::DOCUMENTS_REJECTED);
   dst.delete_ids_accepted = counter(MetricCounter::DELETE_IDS_ACCEPTED);
   dst.document_errors = errorKinds(counts.documentErrors, resource);
   fillActivity(dst.flush, counts, metricActivity(MetricStage::FLUSH), resource);
   fillActivity(dst.commit, counts, metricActivity(MetricStage::COMMIT), resource);
+  fillActivity(dst.merge_publish, counts, metricActivity(MetricStage::MERGE_PUBLISH), resource);
   fillActivity(dst.delete_pass, counts, metricActivity(MetricStage::DELETE_PASS), resource);
   fillActivity(dst.merge, counts, metricActivity(MetricStage::MERGE), resource);
   fillActivity(dst.vector_build, counts, metricActivity(MetricStage::VECTOR_BUILD), resource);
@@ -175,6 +179,7 @@ void fillOutcomes(api::OutcomeStats& dst, const std::array<uint64_t, (size_t)Met
 void fillCollectionActivity(api::CollectionActivityStats& dst, const CollectionCounts& src) {
   fillOutcomes(dst.searches, src.searches, src.searchNanos);
   fillOutcomes(dst.index_batches, src.batches, src.batchNanos);
+  fillOutcomes(dst.commits, src.commits, src.commitNanos);
   dst.documents_accepted = src.documentsAccepted;
   dst.documents_rejected = src.documentsRejected;
   dst.delete_ids_accepted = src.deleteIdsAccepted;
@@ -232,7 +237,6 @@ void fillIndexStats(api::IndexStats& dst, const Stats& src,
     dst.inverters_busy = src.indexing;
     dst.inverters_idle = src.idle;
     dst.inverters_flushing = src.flushing;
-    dst.commits = src.commits;
     dst.retained_delete_bytes = src.retainedDeleteBytes;
   }
 

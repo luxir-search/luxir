@@ -354,8 +354,11 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     UpdateMessageMultiFunc::output_ports_type& op) {
       unused(op);
       bool dispatchCompletion = true;
-      // Delete passes share this serial node with commits, not their metrics.
-      MetricScope metric(*metrics, metricActivity(msg->applyOnly ? MetricStage::DELETE_PASS : MetricStage::COMMIT));
+      // Delete passes and merge layout publications share this serial node
+      // with commits, not their metrics: COMMIT counts whole commits.
+      auto stage = msg->applyOnly ? MetricStage::DELETE_PASS
+          : msg->publishOnly ? MetricStage::MERGE_PUBLISH : MetricStage::COMMIT;
+      MetricScope metric(*metrics, metricActivity(stage));
       try {
         if (msg->applyOnly) this->deletePassBody();
         else dispatchCompletion = this->finishCommitBody(*msg);
@@ -372,7 +375,9 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
         msg->result.setException(error);
       }
 
-      metric.finish(dispatchCompletion && msg->result.errored() ? MetricOutcome::ERROR : MetricOutcome::OK);
+      auto outcome = dispatchCompletion && msg->result.errored() ? MetricOutcome::ERROR : MetricOutcome::OK;
+      auto nanos = metric.finish(outcome);
+      if (stage == MetricStage::COMMIT) collectionMetrics->commit(outcome, nanos);
       if (dispatchCompletion) {
         try {
           msg->done(*this);
@@ -2338,7 +2343,6 @@ void IndexWriter::publish(api::IndexInfo& info, std::pmr::memory_resource& arena
       currentAuxIndexes_.swap(auxIndexes);
       currentSegmentOverlays_.swap(overlays);
       lastCommitTime = info.commit_time;
-      commitCount.fetch_add(1, std::memory_order_relaxed);
     }
     // The remaining stores/notification do not throw. Advance registry formats
     // first, so observing the new schema cannot admit an old-format CAS.
@@ -3227,7 +3231,6 @@ IndexWriter::Stats IndexWriter::stats(bool includeSegments, bool includeFiles) {
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
     out.commitTime = lastCommitTime.load(std::memory_order_relaxed);
-    out.commits = commitCount.load(std::memory_order_relaxed);
     out.indexGen = indexGen;
     out.coreGen = coreGen;
     out.updateVersion = updateNumber.load(std::memory_order_relaxed);

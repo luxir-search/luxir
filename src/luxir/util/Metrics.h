@@ -23,9 +23,15 @@ namespace luxir {
 enum class MetricOperation { SEARCH, UPDATE, SCHEMA, COLLECTIONS, STATS, HEALTH, OTHER, COUNT };
 enum class MetricTransport { HTTP, GRPC, COUNT };
 enum class MetricOutcome { OK, ERROR, CANCELLED, COUNT };
-// Timed engine work. Searches, their execution and index batches are
-// request-sized; the rest runs in the background.
-enum class MetricStage { SEARCH, SEARCH_EXECUTION, INDEX_BATCH, FLUSH, COMMIT, DELETE_PASS, MERGE, VECTOR_BUILD, READER_REFRESH, COUNT };
+// Timed engine work. Searches, their execution, index batches and the queue
+// waits ahead of searches and updates are request-sized; the rest runs in the
+// background. A wait records only completions, never in-flight work.
+// MERGE_PUBLISH is a merge layout's publication on the commit stage, so
+// COMMIT counts whole commits.
+enum class MetricStage {
+  SEARCH, SEARCH_EXECUTION, SEARCH_QUEUE_WAIT, INDEX_BATCH, UPDATE_WAIT, FLUSH, COMMIT, MERGE_PUBLISH, DELETE_PASS,
+  MERGE, VECTOR_BUILD, READER_REFRESH, COUNT
+};
 enum class MetricCounter {
   SEARCH_RESOURCE_EXHAUSTED, SEARCH_WARNINGS, DOCUMENTS_ACCEPTED, DOCUMENTS_REJECTED, DELETE_IDS_ACCEPTED, COUNT
 };
@@ -177,6 +183,8 @@ struct CollectionCellsT {
   C searchNanos{};
   std::array<C, (size_t)MetricOutcome::COUNT> batches{};
   C batchNanos{};
+  std::array<C, (size_t)MetricOutcome::COUNT> commits{};
+  C commitNanos{};
   C documentsAccepted{};
   C documentsRejected{};
   C deleteIdsAccepted{};
@@ -190,6 +198,8 @@ inline void addCells(CollectionCounts& dst, const CollectionCells& src) {
   addCells(dst.searchNanos, src.searchNanos);
   addCells(dst.batches, src.batches);
   addCells(dst.batchNanos, src.batchNanos);
+  addCells(dst.commits, src.commits);
+  addCells(dst.commitNanos, src.commitNanos);
   addCells(dst.documentsAccepted, src.documentsAccepted);
   addCells(dst.documentsRejected, src.documentsRejected);
   addCells(dst.deleteIdsAccepted, src.deleteIdsAccepted);
@@ -211,6 +221,12 @@ public:
     cell.documentsAccepted.fetch_add(accepted, std::memory_order_relaxed);
     cell.documentsRejected.fetch_add(rejected, std::memory_order_relaxed);
     cell.deleteIdsAccepted.fetch_add(deleteIds, std::memory_order_relaxed);
+  }
+
+  void commit(MetricOutcome outcome, uint64_t nanos) {
+    auto& cell = cells.local();
+    cell.commits[(size_t)outcome].fetch_add(1, std::memory_order_relaxed);
+    cell.commitNanos.fetch_add(nanos, std::memory_order_relaxed);
   }
 
   CollectionCounts counts() const {
@@ -249,10 +265,13 @@ public:
     start = std::chrono::steady_clock::now();
     metrics->start(activity);
   }
-  void finish(MetricOutcome outcome = MetricOutcome::OK) noexcept {
-    if (!metrics) return;
+  // The recorded duration; 0 when nothing was in flight.
+  uint64_t finish(MetricOutcome outcome = MetricOutcome::OK) noexcept {
+    if (!metrics) return 0;
     auto* current = std::exchange(metrics, nullptr);
-    current->complete(activity, outcome, nanosSince(start));
+    auto nanos = nanosSince(start);
+    current->complete(activity, outcome, nanos);
+    return nanos;
   }
 };
 

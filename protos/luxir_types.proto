@@ -1527,11 +1527,11 @@ message ServiceStats {
   // The CPU target the binary was built for.
   string cpu_target = 20;
   bool read_only = 2;
-  // Upper bounds, in seconds, of the request, search execution and index batch
-  // histograms.
+  // Upper bounds, in seconds, of the request, search execution, index batch
+  // and queue wait histograms.
   repeated double request_duration_bounds = 3;
-  // Upper bounds, in seconds, of the flush, commit, delete pass, merge,
-  // vector build and reader refresh histograms.
+  // Upper bounds, in seconds, of the flush, commit, merge publication, delete
+  // pass, merge, vector build and reader refresh histograms.
   repeated double background_duration_bounds = 4;
   TransportStats http = 5;
   TransportStats grpc = 6;
@@ -1540,9 +1540,15 @@ message ServiceStats {
   ActivityStats search = 21;
   // Search body execution, excluding scheduler waits and streaming drains.
   HistogramStats search_execution = 7;
+  // Searches waiting to execute: from submission, or the end of a min_commit
+  // wait, to the start of execution.
+  HistogramStats search_queue_wait = 23;
   uint64 search_resource_exhausted = 8;
   uint64 search_warnings = 9;
   ActivityStats index_batches = 10;
+  // Update messages waiting in a collection's writer, from submission to the
+  // start of processing. Commit requests and internal commits are messages too.
+  HistogramStats update_wait = 24;
   // Accepted into indexing (not durably acknowledged) or rejected/rolled back.
   uint64 documents_accepted = 11;
   uint64 documents_rejected = 12;
@@ -1551,7 +1557,10 @@ message ServiceStats {
   // rest of documents_rejected were rolled back with a failed batch.
   map<string, uint64> document_errors = 19;
   ActivityStats flush = 14;
+  // Whole commits: client, deferred and merge-triggered. A merge layout's
+  // publication counts under merge_publish.
   ActivityStats commit = 15;
+  ActivityStats merge_publish = 25;
   // Delete passes, which apply deletes between commits without flushing,
   // syncing or publishing.
   ActivityStats delete_pass = 22;
@@ -1917,6 +1926,9 @@ message CollectionActivityStats {
   uint64 documents_accepted = 3;
   uint64 documents_rejected = 4;
   uint64 delete_ids_accepted = 5;
+  // Whole commits of the collection and their summed duration, kept across
+  // writer reopens; see ServiceStats.commit.
+  OutcomeStats commits = 6;
 }
 
 // Completed work by outcome, and its summed duration.
@@ -1951,7 +1963,8 @@ message IndexStats {
   uint64 inverters_busy = 15;
   uint64 inverters_idle = 16;
   uint64 inverters_flushing = 17;
-  uint64 commits = 18; // writer only: commits since the writer opened
+  reserved 18;
+  reserved "commits";
   // Writer only: resident delete packets held by its pending set or merge
   // catch-up, deduplicated across owners. Included in the node indexing
   // reservation.

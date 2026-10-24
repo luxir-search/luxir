@@ -273,10 +273,11 @@ Two byte counts measure different things and will disagree:
 
 `service` counters are process-wide and reset on restart. Each activity
 (`operations` per transport, `search`, `index_batches`, `flush`, `commit`,
-`delete_pass`, `merge`, `vector_build`, `reader_refresh`) reports `in_flight`, completions by outcome
-(`ok`, `error`, `cancelled`) and a `duration` histogram. Histogram `counts` are
+`merge_publish`, `delete_pass`, `merge`, `vector_build`, `reader_refresh`) reports `in_flight`, completions by outcome
+(`ok`, `error`, `cancelled`) and a `duration` histogram. `search_execution`,
+`search_queue_wait` and `update_wait` are histograms alone. Histogram `counts` are
 cumulative, aligned with `service.request_duration_bounds` (requests, search
-execution and index batches, from 10 microseconds) or
+execution, index batches and queue waits, from 10 microseconds) or
 `service.background_duration_bounds` (the background stages, up to an hour),
 in seconds, plus a final `+Inf` entry, and are omitted while `count` is zero.
 A request or call fails when its response carries a whole-request error (a
@@ -344,13 +345,15 @@ client load.
 | `luxir_request_body_bytes_total`, `luxir_response_body_bytes_total` | Application payload throughput; excludes transport framing. Response bytes are counted when submitted for sending, even if delivery subsequently fails. |
 | `luxir_searches_total`, `luxir_searches_in_flight`, `luxir_search_duration_seconds` | Searches the engine accepted, by `outcome`, from submission to the final response. A gRPC `Search` call can carry many searches, so this is its per-search view; `cancelled` means the search ended without a final response. |
 | `luxir_search_execution_duration_seconds` | Search-body execution, excluding scheduler/visibility waits and later streaming drains. |
+| `luxir_search_queue_wait_seconds` | Searches waiting to execute: from submission, or the end of a `min_commit` wait, to the start of execution. Near zero on the lanes that run on the receiving thread; grows when the search arena is saturated. |
 | `luxir_search_resource_exhausted_total`, `luxir_search_warnings_total` | Resource-limit failures (including the request memory breaker), and searches with declared degradation warnings. |
 | `luxir_index_batches_total`, `luxir_index_batches_in_flight`, `luxir_index_batch_duration_seconds` | Index-batch processing inside the engine, excluding queueing and commit work. HTTP NDJSON can produce many batches per request. A batch fails only when none of it applied. |
+| `luxir_index_update_wait_seconds` | Update messages waiting in a collection's writer, from submission to the start of processing: the writer's serial admission plus waiting for an indexing worker. Commit requests and internal commits are messages too. |
 | `luxir_ingest_documents_total`, `luxir_ingest_delete_ids_total` | Documents accepted into indexing or rejected/rolled back, and accepted delete IDs. Acceptance does not mean durability; commits can still fail. Deletes count submitted IDs, not matched documents. |
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
 | `luxir_stream_pauses_total` | Response backpressure events by transport. |
 | `luxir_http_connections`, `luxir_http_io_threads` | Live HTTP sessions and running connection-shard threads; the thread gauge excludes the accept thread. gRPC active calls are in `luxir_requests_in_flight`. |
-| `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit-finish, merge, vector-build, and reader-refresh stages by `kind`. These are stage attempts; a commit handing off to a forced merge can have multiple finish stages. |
+| `luxir_background_total`, `luxir_background_in_flight`, `luxir_background_duration_seconds` | Flush, commit, merge-publish, delete-pass, merge, vector-build, and reader-refresh stages by `kind`. `commit` counts whole commits (client, deferred, and merge-triggered) once each; publishing a merged layout, including a forced merge's, counts as `merge_publish`. Commit, merge-publish and delete-pass share one serial stage per collection. |
 | `luxir_node_memory_budget_bytes`, `luxir_search_request_memory_limit_bytes` | Configured managed-memory budget and tracked per-search ceiling. Neither is a process RSS limit. |
 | `luxir_index_ram_*_bytes` | Indexing reservations, budget, draining reservations, pending merge demand, and retained delete packets (part of the reservations, never freed by a flush). The budget is soft; pending demand is capped at that budget when limited. |
 | `luxir_storage_ram_bytes`, `luxir_storage_ram_limit_bytes` | RAM storage consumption and its cap, separate from filesystem usage. |
@@ -370,10 +373,10 @@ With `collections=true`:
 | `luxir_index_documents`, `luxir_index_segments`, `luxir_index_uncommitted_segments` | Flushed segment document/segment state; excludes documents still buffered in inverters. |
 | `luxir_index_committed_bytes`, `luxir_index_last_commit_timestamp_seconds` | Current snapshot descriptor bytes and publication timestamp. An old timestamp alone does not indicate a problem on an idle collection. |
 | `luxir_index_directory_bytes` | Directory-listing bytes; only with `files=true`. See the two byte counts above. |
-| `luxir_index_commits_total` | Commits since the writer opened. |
 | `luxir_index_retained_delete_bytes` | Delete packets the writer retains for its pending set and merge catch-up, counted once per packet; part of `luxir_index_ram_reserved_bytes`. |
 | `luxir_collection_searches_total`, `luxir_collection_search_seconds_total` | Searches that reached the collection, by `outcome`, and their summed duration from submission to the final response. The mean is the ratio of the two rates. |
 | `luxir_collection_index_batches_total`, `luxir_collection_index_batch_seconds_total` | The collection's index batches by `outcome`, and their summed processing time. |
+| `luxir_collection_commits_total`, `luxir_collection_commit_seconds_total` | The collection's whole commits by `outcome`, and their summed duration. Kept across writer reopens; reset when the collection is recreated or the node restarts. |
 | `luxir_collection_documents_total`, `luxir_collection_delete_ids_total` | Documents the collection accepted or rejected, and its accepted delete IDs. |
 | `luxir_inverters`, `luxir_merge_tasks` | Busy, idle, and flushing inverters; outstanding merge work includes queued tasks. |
 | `luxir_filter_cache_*` | Hit/miss counters, build attempts, builds, dead builds, thrash skips, admissions, rejections, evictions, purges, bypasses, reader-stable counters, payload/metadata memory, and payload budget. |
@@ -391,6 +394,35 @@ Each collection adds about 50 series; on a node with very many collections,
 scrape `/metrics?collections=false` and read per-collection detail from
 `_stats` on demand.
 Generations, aux indexes, and per-segment layout are JSON only.
+
+### Write and read pressure
+
+These expressions show whether load is queueing rather than being served:
+
+- Update queueing. The mean update wait,
+  `rate(luxir_index_update_wait_seconds_sum[1m]) / rate(luxir_index_update_wait_seconds_count[1m])`,
+  measures queueing directly. As a cross-check, compare the mean update request,
+  `rate(luxir_request_duration_seconds_sum{operation="update"}[1m]) / rate(luxir_request_duration_seconds_count{operation="update"}[1m])`,
+  with the mean commit,
+  `rate(luxir_background_duration_seconds_sum{kind="commit"}[1m]) / rate(luxir_background_duration_seconds_count{kind="commit"}[1m])`.
+  When the ratio of the request mean to the commit mean grows, requests are
+  waiting on more than their own commit.
+- Commit busy.
+  `sum(rate(luxir_background_duration_seconds_sum{kind=~"commit|merge_publish|delete_pass"}[1m]))`
+  is the average number of collections on their serial commit stage. Compare it
+  with `count(rate(luxir_collection_index_batches_total[1m]) > 0)`, the
+  collections being written. Per collection,
+  `rate(luxir_collection_commit_seconds_total[1m])` approaching 1 means the
+  commit stage is saturated and further commits queue behind it.
+- Throughput against concurrency. Plot
+  `sum(rate(luxir_background_total{kind="commit",outcome="ok"}[1m]))` against
+  `sum(luxir_requests_in_flight{operation="update"})`. When in-flight updates
+  rise but the commit rate stays flat, more load no longer adds commits.
+- Search queueing. The mean and p99 of `luxir_search_queue_wait_seconds`,
+  against `luxir_searches_in_flight`. The difference between
+  `luxir_search_duration_seconds` and
+  `luxir_search_execution_duration_seconds` also covers visibility waits and
+  streaming drains.
 
 ### Process, system and host metrics
 
