@@ -7,6 +7,8 @@
 #include <string_view>
 #include <vector>
 #include <cstdint>
+#include <bit>
+#include <cstddef>
 #include <cstring>
 #include <memory>
 #include "luxir/util/luxir_util.h"
@@ -30,10 +32,62 @@ namespace luxir {
 // `text` (a string_view) is itself an attribute: the only way to change the
 // token's text is to reassign it. Positions/type/payload would join the same
 // mutable bag.
+//
+// Every attribute lives in the one shared Token, so a filter that rewrites or
+// drops tokens in place forwards the others untouched; the built-in filters
+// do exactly that. A filter that buffers tokens past the current pull (shingles,
+// CJK bigram) must save the attributes it wants back with the bytes, and restore
+// them when it re-emits.
+
+// What a tokenizer knew about the token's characters. UNKNOWN means the
+// tokenizer does not classify (whitespace, keyword, most plugin tokenizers).
+enum class TokenType : uint8_t {
+  UNKNOWN = 0,
+  ALPHA,    // letters or ideographs only
+  NUMERIC,  // digits only
+  ALNUM,    // letters and digits
+  OTHER     // a word segment with neither (emoji, ...)
+};
+
+// The Unicode script of the first letter in a token (a mixed-script token
+// reports its first letter's). COMMON is a token with no letter, such as
+// digits; UNKNOWN means the tokenizer does not classify. Scripts beyond this
+// short list are OTHER; scriptOf() is the full per-code-point lookup behind it.
+enum class Script : uint8_t {
+  UNKNOWN = 0,
+  COMMON,
+  LATIN,
+  HAN,
+  HIRAGANA,
+  KATAKANA,
+  HANGUL,
+  THAI,
+  ARABIC,
+  CYRILLIC,
+  GREEK,
+  OTHER
+};
+
+// The script of one code point; COMMON for characters that belong to no
+// script (digits, punctuation, symbols) or inherit one (combining marks).
+Script scriptOf(char32_t cp);
+const char* scriptName(Script script);
+const char* tokenTypeName(TokenType type);
+
 class Token {
 public:
   std::string_view text;
   int positionIncrement; // increment from the previous token's position
+  // Number of positions the token spans (Lucene's PositionLengthAttribute: the
+  // arc length in the token graph, 1 for an ordinary token, 2 for a synonym
+  // covering two source words). It, type and script sit next to
+  // positionIncrement so clear() is one 8-byte store; a graph never needs more
+  // than 65535 positions. Nothing reads it yet: postings keep only each term's
+  // start position (as in Lucene), and phrase queries are built from position
+  // increments alone.
+  uint16_t positionLength;
+  TokenType type;
+  Script script;
   int startOffset; // byte offset into the tokenizer input of current token
   int endOffset;   // end offset (exclusive) into the tokenizer input
   // Stream state, deliberately untouched by clear(). Stop filters reset this
@@ -42,8 +96,12 @@ public:
 
   void clear() {
     // Offsets are deliberately not reset here: every emit path sets them, so
-    // zeroing first would just be a dead store on the hot path.
-    positionIncrement = 1;
+    // zeroing first would just be a dead store on the hot path. The four
+    // fields that do reset are adjacent and written as one 8-byte store (what
+    // positionIncrement alone used to cost): increment 1, length 1, type and
+    // script UNKNOWN (zero).
+    uint64_t defaults = 1 | (1ULL << 32);
+    std::memcpy(&positionIncrement, &defaults, sizeof defaults);
   }
 
   // Record the [start, end) span in tokenizer input bytes. Token filters
@@ -54,6 +112,10 @@ public:
     endOffset = end;
   }
 };
+static_assert(sizeof(Token) == 40, "Token layout changed; keep new attributes inside the padding");
+static_assert(std::endian::native == std::endian::little && offsetof(Token, positionLength) == offsetof(Token, positionIncrement) + 4 &&
+              offsetof(Token, script) == offsetof(Token, positionLength) + 3 && (int) TokenType::UNKNOWN == 0 &&
+              (int) Script::UNKNOWN == 0, "Token::clear() writes its defaults as one 8-byte store");
 
 
 // A pull-based stream of Tokens. The whole chain shares a single Token object

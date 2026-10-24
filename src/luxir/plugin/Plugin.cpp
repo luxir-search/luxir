@@ -40,6 +40,7 @@ void Registries::freeze() {
   plugins.freeze();
   analysis.freeze();
   storage.freeze();  // storage backends and layers
+  collation.freeze();
 }
 
 void initPlugins(void (*addPlugins)(PluginRegistry&)) {

@@ -20,6 +20,7 @@
 #include <uni_algo/conv.h>
 #include <uni_algo/norm.h>
 #include <uni_algo/ranges_word.h>
+#include <uni_algo/script.h>
 
 #include "luxir/analysis/Analyzer.h"
 #include "luxir/api/luxir_types.hpp"
@@ -40,6 +41,7 @@ struct Analysis {
   std::vector<int> positions;
   std::vector<int> starts;  // startOffset per token (parallel to terms)
   std::vector<int> ends;    // endOffset per token
+  std::vector<std::string> kinds;  // "type/script" per token
 };
 
 // Drive a raw stream (caller already wired the chain). `head` supplies the input.
@@ -54,6 +56,7 @@ Analysis analyze(Tokenizer& head, TokenStream& tail, std::string_view val) {
     out.positions.push_back(pos);
     out.starts.push_back(tok.startOffset);
     out.ends.push_back(tok.endOffset);
+    out.kinds.push_back(std::string(tokenTypeName(tok.type)) + "/" + scriptName(tok.script));
   }
   return out;
 }
@@ -70,7 +73,7 @@ Analysis analyze(TokenChain& tc, std::string_view val) {
     out.terms.emplace_back(tok.text);
     out.positions.push_back(pos);
     out.starts.push_back(tok.startOffset);
-    out.ends.push_back(tok.endOffset);
+    out.ends.push_back(tok.endOffset);    out.kinds.push_back(std::string(tokenTypeName(tok.type)) + "/" + scriptName(tok.script));
   }
   return out;
 }
@@ -336,7 +339,7 @@ TEST_F(AnalysisTest, chainKeyword) {
 
 // The registry is the only path from a name to a stage: an unknown name (the
 // old "nocopy_whitespace" alias is gone) is a teaching error naming the valid set,
-// sorted (the example plugin's "reverse" is registered in this binary).
+// sorted (the example plugin's "reverse", "span2" and "describe" are registered in this binary).
 TEST_F(AnalysisTest, unknownComponentIsRejected) {
   try {
     TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "nocopy_whitespace");
@@ -349,7 +352,7 @@ TEST_F(AnalysisTest, unknownComponentIsRejected) {
     TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "whitespace", {"stemmer"});
     FAIL() << "unknown filter accepted";
   } catch (const std::invalid_argument& e) {
-    EXPECT_EQ("unknown filter 'stemmer'; valid filters: english_possessive, fold, kstem, lowercase, nfkc_cf, reverse, stop",
+    EXPECT_EQ("unknown filter 'stemmer'; valid filters: describe, english_possessive, fold, kstem, lowercase, nfkc_cf, reverse, span2, stop",
               std::string(e.what()));
   }
 }
@@ -748,6 +751,99 @@ TEST_F(AnalysisTest, nfkcCfIllFormedUtf8) {
 // The fused StandardTokenizer (swapped in for unicode_word + nfkc_cf) must produce
 // byte-identical tokens to the explicit two-stage chain - the optimization is
 // behavior-preserving.
+// Type and script come from the same classification in the composed and the
+// fused tokenizer (the fused ASCII fast path derives them from its byte
+// classes, everything else from the code points).
+TEST_F(AnalysisTest, tokenTypeAndScriptOfWords) {
+  struct Case {
+    const char* text;
+    const char* kind;
+  };
+  const Case cases[] = {
+      {"hello", "alpha/latin"},          {"Hello", "alpha/latin"},      {"42", "numeric/common"},
+      {"3.14", "numeric/common"},        {"abc123", "alnum/latin"},     {"snake_case", "alpha/latin"},
+      {"don't", "alpha/latin"},          {"café", "alpha/latin"},       {"Привет", "alpha/cyrillic"},
+      {"Γειά", "alpha/greek"},           {"مرحبا", "alpha/arabic"},     {"한국어", "alpha/hangul"},
+      {"カタカナ", "alpha/katakana"},    {"中", "alpha/han"},           {"の", "alpha/hiragana"},
+      {"１２３", "numeric/common"},      {"ａｂｃ１", "alnum/latin"},   {"x٣", "alnum/latin"},
+      {"Привет42", "alnum/cyrillic"},    {"42Привет", "alnum/cyrillic"}, {"שלום", "alpha/other"},
+  };
+  for (const auto& c : cases) {
+    for (bool fused : {false, true}) {
+      auto head = fused ? makeStandardTokenizer() : makeUnicodeWordTokenizer();
+      Tokenizer& h = *head;
+      TokenChain chain(h, fused ? std::move(head) : makeNfkcCasefoldFilter(std::move(head)), true);
+      auto out = analyze(chain, c.text);
+      ASSERT_EQ(1u, out.kinds.size()) << c.text << " fused=" << fused;
+      EXPECT_EQ(c.kind, out.kinds[0]) << c.text << " fused=" << fused;
+    }
+  }
+}
+
+TEST_F(AnalysisTest, tokenTypeAndScriptDefaultsAndReset) {
+  static_assert(sizeof(Token) == 40);
+  // Tokenizers that do not classify leave the defaults, and each pull starts from them.
+  for (const char* tokenizer : {"whitespace", "keyword"}) {
+    TextFieldType ft("t", FieldType::INDEX_DOCS_FREQS_POSITIONS, tokenizer);
+    auto chain = ft.createAnalyzer("t");
+    Token& tok = chain->getToken();
+    tok.positionLength = 7;
+    tok.type = TokenType::NUMERIC;
+    tok.script = Script::GREEK;
+    chain->setValue("a1 b");
+    chain->reset();
+    ASSERT_TRUE(chain->tail->incrementToken());
+    EXPECT_EQ(1, tok.positionLength);
+    EXPECT_EQ(TokenType::UNKNOWN, tok.type);
+    EXPECT_EQ(Script::UNKNOWN, tok.script);
+  }
+  // A mixed-script word reports the script of its first letter; digits first do not count.
+  TextFieldType ft("t", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
+  auto chain = ft.createAnalyzer("t");
+  EXPECT_EQ((std::vector<std::string>{"alnum/cyrillic"}), analyze(*chain, "7жa").kinds);
+  EXPECT_EQ((std::vector<std::string>{"alpha/latin", "numeric/common", "alpha/han"}),
+            analyze(*chain, "abc 123 中").kinds);
+}
+
+// The block shortcuts in scriptOf must agree with the Unicode tables everywhere.
+TEST_F(AnalysisTest, scriptOfAgreesWithTablesForEveryCodePoint) {
+  auto reference = [](char32_t cp) {
+    una::locale::script s = una::codepoint::get_script(cp);
+    for (auto [tag, script] : {std::pair{"Latn", Script::LATIN}, {"Hani", Script::HAN}, {"Hira", Script::HIRAGANA},
+                               {"Kana", Script::KATAKANA}, {"Hang", Script::HANGUL}, {"Thai", Script::THAI},
+                               {"Arab", Script::ARABIC}, {"Cyrl", Script::CYRILLIC}, {"Grek", Script::GREEK},
+                               {"Zyyy", Script::COMMON}, {"Zinh", Script::COMMON}}) {
+      if (s == una::locale::script(std::string_view(tag))) return script;
+    }
+    return Script::OTHER;
+  };
+  for (char32_t cp = 0; cp <= 0x10FFFF; cp++) {
+    if (scriptOf(cp) != reference(cp)) {
+      FAIL() << "code point U+" << std::hex << (uint32_t) cp << " is " << scriptName(scriptOf(cp)) << ", tables say "
+             << scriptName(reference(cp));
+    }
+  }
+}
+
+TEST_F(AnalysisTest, scriptOfCodePoints) {
+  EXPECT_EQ(Script::LATIN, scriptOf('q'));
+  EXPECT_EQ(Script::COMMON, scriptOf('7'));
+  EXPECT_EQ(Script::COMMON, scriptOf('_'));
+  EXPECT_EQ(Script::LATIN, scriptOf(0xE9));       // e acute
+  EXPECT_EQ(Script::COMMON, scriptOf(0x301));     // combining acute (Inherited)
+  EXPECT_EQ(Script::HAN, scriptOf(0x4E2D));
+  EXPECT_EQ(Script::HIRAGANA, scriptOf(0x3042));
+  EXPECT_EQ(Script::KATAKANA, scriptOf(0x30AB));
+  EXPECT_EQ(Script::HANGUL, scriptOf(0xD55C));
+  EXPECT_EQ(Script::THAI, scriptOf(0x0E01));
+  EXPECT_EQ(Script::ARABIC, scriptOf(0x0645));
+  EXPECT_EQ(Script::CYRILLIC, scriptOf(0x0416));
+  EXPECT_EQ(Script::GREEK, scriptOf(0x03B1));
+  EXPECT_EQ(Script::OTHER, scriptOf(0x05D0));     // Hebrew
+  EXPECT_STREQ("katakana", scriptName(Script::KATAKANA));
+  EXPECT_STREQ("alnum", tokenTypeName(TokenType::ALNUM));
+}
+
 TEST_F(AnalysisTest, standardFusionMatchesComposedChain) {
   for (std::string_view v : {"The QUICK brown FOX 42",
                              "Café 中文 Straße señor naïve",
@@ -791,6 +887,7 @@ std::pair<std::vector<std::string>, std::vector<std::string>> composedVsFused(st
   EXPECT_EQ(a.positions, b.positions) << v;
   EXPECT_EQ(a.starts, b.starts) << v;
   EXPECT_EQ(a.ends, b.ends) << v;
+  EXPECT_EQ(a.kinds, b.kinds) << v;
   return {a.terms, b.terms};
 }
 }  // namespace

@@ -854,6 +854,8 @@ struct from<JSON, luxir::api::FieldDef> {
             util::from_json<V>(value.defaults, ctx, vit, vend);
           } else if (key == "normalizer") {
             util::from_json<V>(value.normalizer, ctx, vit, vend);
+          } else if (key == "collation") {
+            util::from_json<V>(value.collation, ctx, vit, vend);
           } else if (key == "stored") {
             util::from_json<V>(value.stored, ctx, vit, vend);
           } else if (key == "stored_resource") {
