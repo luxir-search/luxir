@@ -141,6 +141,12 @@ locations, browse `src/luxir/<area>/`.
    - `FieldSignature`: Effective properties for schema introduction history and
      the resolved view; `SchemaInfo` persists authored definitions and introductions
 
+9. **Plugins** (`src/luxir/plugin/`, `cmake/LuxirPlugins.cmake`)
+   - `Plugin` / `PluginRegistry` / `Registries`: compiled-in extensions registered once by
+     `initPlugins()` at startup, then frozen. Plugins are CMake targets added with
+     `luxir_add_plugin` and selected at build time via `LUXIR_PLUGIN_DIRS`.
+   - See [plugins.md](plugins.md).
+
 ## Data Organization
 
 - **Collection**: Logical document group with schema; its storage is a sequence of
