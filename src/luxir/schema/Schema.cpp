@@ -6,6 +6,7 @@
 #include <memory_resource>
 #include "luxir/api/build.h"
 #include "luxir/api/padded_input.h"
+#include "luxir/plugin/Registries.h"
 #include "luxir/api/luxir_types.hpp"
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -51,6 +52,7 @@ struct ResolvedField {
   // null = the type default. Char-filter-only definitions keep the parent chain.
   const luxir::api::AnalyzerDef* analyzer = nullptr;
   const luxir::api::NormalizerDef* normalizer = nullptr;
+  const luxir::api::AnalyzerComponent* collation = nullptr;
   // 0 means "not set / infer from first indexed value"; > 0 means strict.
   int32_t vectorDims = 0;
   bool hasVectorDims = false;
@@ -230,6 +232,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   // just the inherited char filters, retaining the tokenizer and token filters.
   r.analyzer = analyzers.resolve(def, parentResolved.analyzer);
   r.normalizer = def.normalizer ? &*def.normalizer : parentResolved.normalizer;
+  r.collation = def.collation ? &*def.collation : parentResolved.collation;
 
   // dims: explicit set on this field overrides (0 = infer from first value);
   // otherwise inherit.
@@ -433,6 +436,9 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
   if (def.unit && r.type != FieldClass::DATE) {
     throw SchemaError("unit is only valid for date fields (field: " + name + ")");
   }
+  if (def.collation && r.type != FieldClass::STRING) {
+    throw SchemaError("collation is only valid for string fields (field: " + name + ")");
+  }
   bool vectorProp = def.dims.has_value() || def.truncate_dims.has_value() || def.metric.has_value() ||
                     def.normalized.has_value() || def.normalize_on_write.has_value() ||
                     def.ann.has_value();
@@ -505,6 +511,7 @@ struct FieldCompiler {
   InvalidStopWords invalidStopWords;
   boost::unordered_flat_map<const api::AnalyzerDef*, std::shared_ptr<const Analyzer>> analyzers;
   boost::unordered_flat_map<const api::NormalizerDef*, std::shared_ptr<const Analyzer>> normalizers;
+  boost::unordered_flat_map<const api::AnalyzerComponent*, std::shared_ptr<const Collation>> collations;
 
   std::shared_ptr<FieldType> create(std::string_view name, const ResolvedField& r,
                                    const ResolvedOwnership& logical, bool derived = false) {
@@ -627,7 +634,24 @@ struct FieldCompiler {
             throw SchemaError(std::string(e.what()) + " (normalizer on field: " + std::string(name) + ")");
           }
         }
-        ft = std::make_shared<StrFieldType>(name, flags, normalizer);
+        std::shared_ptr<const Collation> collation;
+        if (r.collation) {
+          if (index != IndexMode::NONE || !column) {
+            throw SchemaError("collation stores sort keys in the column, so the field needs index=none and "
+                              "column=true; put it in a variant of the field it sorts (field: " +
+                              std::string(name) + ")");
+          }
+          auto& compiled = collations[r.collation];
+          if (!compiled) {
+            try {
+              compiled = Registries::global().collation.make(*r.collation);
+            } catch (const std::invalid_argument& e) {
+              throw SchemaError(std::string(e.what()) + " (collation on field: " + std::string(name) + ")");
+            }
+          }
+          collation = compiled;
+        }
+        ft = std::make_shared<StrFieldType>(name, flags, normalizer, std::move(collation));
         break;
       }
       case FieldClass::TEXT: {
@@ -965,7 +989,7 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
     }
   }
 
-  FieldCompiler compiler{invalidStopWords, {}, {}};
+  FieldCompiler compiler{invalidStopWords, {}, {}, {}};
   for (const auto& e : entries) {
     const auto& r = resolved.at(e.name);
     const auto& owned = ownership.at(e.name);

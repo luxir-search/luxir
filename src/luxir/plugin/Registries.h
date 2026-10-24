@@ -3,6 +3,7 @@
 
 #pragma once
 #include "luxir/analysis/AnalysisRegistry.h"
+#include "luxir/collation/CollationRegistry.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/store/StorageRegistry.h"
 
@@ -15,6 +16,8 @@ public:
   AnalysisRegistry analysis;
   // Storage backends and layers.
   StorageRegistry storage;
+  // Collators: string -> binary sort key, named by a string field.
+  CollationRegistry collation;
 
   static Registries& global();
   // Freezes every registry.
