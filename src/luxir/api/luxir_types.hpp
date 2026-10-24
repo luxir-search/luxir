@@ -260,6 +260,7 @@ struct AnalyzerDef {                                              // needs Analy
   std::optional<AnalyzerComponent> tokenizer;
   std::span<const AnalyzerComponent> filters;
   std::span<const AnalyzerComponent> char_filters;
+  std::string_view name;
 };
 struct FieldVariants {
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> entries;

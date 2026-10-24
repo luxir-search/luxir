@@ -794,6 +794,43 @@ TEST(JsonDialect, AnalyzerComponentStringShorthand) {
   EXPECT_TRUE(nameless.analyzer->tokenizer->name.empty());
 }
 
+TEST(JsonDialect, AnalyzerDefNamedForms) {
+  // "english" == {"name": "english"} in analyzer position; char_filters read
+  // like filters; the generated writer stays canonical (object form).
+  std::pmr::monotonic_buffer_resource mr;
+  std::string err;
+  P::FieldDef bare;
+  ASSERT_TRUE(P::read_json(bare, R"({"type":"text","analyzer":"english"})", mr, &err)) << err;
+  ASSERT_TRUE(bare.analyzer.has_value());
+  EXPECT_EQ("english", bare.analyzer->name);
+  EXPECT_FALSE(bare.analyzer->tokenizer.has_value());
+  EXPECT_TRUE(bare.analyzer->filters.empty());
+  P::FieldDef object;
+  ASSERT_TRUE(P::read_json(object, R"({"type":"text","analyzer":{"name":"english"}})", mr, &err)) << err;
+  EXPECT_EQ("english", object.analyzer->name);
+  std::string out;
+  ASSERT_TRUE(P::write_json(bare, out));
+  EXPECT_EQ(R"({"type":"text","analyzer":{"name":"english"}})", out);
+
+  P::AnalyzerDef top;
+  ASSERT_TRUE(P::read_json(top, R"("standard")", mr, &err)) << err;
+  EXPECT_EQ("standard", top.name);
+
+  P::AnalyzerDef full;
+  ASSERT_TRUE(P::read_json(full,
+      R"({"char_filters":["a",{"name":"b","params":{"k":true}}],"tokenizer":"whitespace","filters":["lowercase"]})", mr, &err)) << err;
+  ASSERT_EQ(2u, full.char_filters.size());
+  EXPECT_EQ("a", full.char_filters[0].name);
+  EXPECT_EQ("b", full.char_filters[1].name);
+  EXPECT_TRUE(full.name.empty());
+  ASSERT_TRUE(P::write_json(full, out));
+  EXPECT_EQ(R"({"tokenizer":"whitespace","filters":["lowercase"],"char_filters":["a",{"name":"b","params":{"k":true}}]})", out);
+
+  P::AnalyzerDef bad;
+  EXPECT_FALSE(P::read_json(bad, R"({"nam":"english"})", mr));
+  EXPECT_FALSE(P::read_json(bad, R"({"name":5})", mr));
+}
+
 TEST(JsonDialect, FieldDefStrictReads) {
   std::pmr::monotonic_buffer_resource mr;
   {  // unknown key -> error, not silent ignore

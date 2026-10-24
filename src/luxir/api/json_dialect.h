@@ -51,6 +51,8 @@
 //   other sugars, writes use the bare string whenever params is empty, so the
 //   common parameterless chain echoes exactly as written; only a component with
 //   params writes the object form.
+// - AnalyzerDef reads accept a bare STRING as named-analyzer sugar: "english" ==
+//   {"name": "english"}. Writes stay canonical (the object form).
 // - SortSpec reads a bare STRING as a clause, "expr", "expr asc", or "expr desc"
 //   (the HTTP sort parameter grammar), and `field` as an alias for `expr`. A
 //   top-docs `sort` takes one clause or a list of them.
@@ -905,6 +907,49 @@ struct from<JSON, luxir::api::AnalyzerComponent> {
           } else if (key == "params") {
             decltype(auto) params = ::hpp_proto::detail::as_modifiable(ctx, value.params);
             glz::util::parse_repeated<V>(true, params, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+  }
+};
+
+// ----- AnalyzerDef: canonical object, or a bare string (named-analyzer sugar) -----
+// Reads: "english" == {"name": "english"}. Writes stay the generated canonical form.
+template <>
+struct from<JSON, luxir::api::AnalyzerDef> {
+  template <auto Opts>
+  static void op(luxir::api::AnalyzerDef &value,
+                 hpp_proto::concepts::is_non_owning_context auto &ctx, auto &it, auto &end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) {
+        return;
+      }
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    if ((char)*it == '"') {
+      util::from_json<O>(value.name, ctx, it, end);
+      return;
+    }
+    static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<O, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "tokenizer") {
+            util::from_json<V>(value.tokenizer, ctx, vit, vend);
+          } else if (key == "filters") {
+            decltype(auto) filters = ::hpp_proto::detail::as_modifiable(ctx, value.filters);
+            glz::util::parse_repeated<V>(false, filters, ctx, vit, vend);
+          } else if (key == "char_filters") {
+            decltype(auto) charFilters = ::hpp_proto::detail::as_modifiable(ctx, value.char_filters);
+            glz::util::parse_repeated<V>(false, charFilters, ctx, vit, vend);
+          } else if (key == "name") {
+            util::from_json<V>(value.name, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

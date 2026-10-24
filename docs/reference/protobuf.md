@@ -245,6 +245,8 @@ One analysis-chain component - a tokenizer, character filter, or token filter - 
 
 ### luxir.AnalyzerDef
 
+A text analysis chain: char filters, then one tokenizer, then token filters. Alternatively \`name\` selects a registered analyzer (a built-in preset such as "english", or one a plugin provides); it excludes tokenizer and filters, and char\_filters alongside it replace the preset's char filters. The JSON dialect accepts a bare string for the named form: "english" == {"name": "english"}.
+
 [Source](../../protos/luxir_types.proto)
 
 | Field | Number | Type | Cardinality / group | Description |
@@ -252,6 +254,7 @@ One analysis-chain component - a tokenizer, character filter, or token filter - 
 | <a id="field-luxir.analyzerdef.tokenizer"></a>[`tokenizer`](#field-luxir.analyzerdef.tokenizer) | 1 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | singular | "whitespace" (default when absent), "keyword", "unicode\_word" |
 | <a id="field-luxir.analyzerdef.filters"></a>[`filters`](#field-luxir.analyzerdef.filters) | 2 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | repeated | applied after tokenization, in order |
 | <a id="field-luxir.analyzerdef.char_filters"></a>[`char_filters`](#field-luxir.analyzerdef.char_filters) | 3 | [`AnalyzerComponent`](#message-luxir.analyzercomponent) | repeated | whole-value cleanup before tokenization, in order |
+| <a id="field-luxir.analyzerdef.name"></a>[`name`](#field-luxir.analyzerdef.name) | 4 | `string` | singular | a registered analyzer name; combines only with char\_filters |
 
 <a id="message-luxir.anyofquery"></a>
 
