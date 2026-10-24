@@ -669,8 +669,9 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     // done() releases this request.
     std::unique_ptr<HppRequestState<SearchReqProto>> requestState;
 
-    GRPCSearchRequest(SearchEngine& engine, const SearchReqProto& proto, google::protobuf::Arena& arena)
-      : SearchRequest(engine, proto, arena) {}
+    GRPCSearchRequest(SearchEngine& engine, const SearchReqProto& proto, google::protobuf::Arena& arena,
+                      RequestClock::time_point startTime)
+      : SearchRequest(engine, proto, arena, startTime) {}
 
     ReplyStatus reply(SearchResponse& response) override {
       // Serialize eagerly into an OWNED ByteBuffer, then drop arenas (no post-write callback).
@@ -706,6 +707,8 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     }
   };
 
+  // The message is fully read; took_us covers parsing onward.
+  auto startTime = RequestClock::now();
   auto* arena = createArena();
   auto requestState = std::make_unique<HppRequestState<SearchReqProto>>();
   if (!parseRequest(readBuf, *requestState, "Search")) {
@@ -722,7 +725,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     return;
   }
   auto& engine = call.server.getLuxirNode().getSearchEngine();
-  auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena);
+  auto& req = *luxir::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena, startTime);
   req.requestState = std::move(requestState);
   req.parent = &call;
   if (!req.proto.min_commit.empty()) {
@@ -746,6 +749,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
 
 // Unary Update and streaming UpdateStream share asynchronous completion.
 static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto startTime = RequestClock::now();
   auto request = std::make_unique<HppRequestState<UpdateReqProto>>();
   if (!parseRequest(readBuf, *request, "Update")) {
     finishWithError(call, ErrorInfo::of(ErrorKind::INVALID_REQUEST, "Update: malformed request"));
@@ -760,8 +764,9 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     std::unique_ptr<HppRequestState<UpdateReqProto>> request;
     GenericCallData* parent;
     const std::stop_token waitToken;
-    Update(std::unique_ptr<HppRequestState<UpdateReqProto>> requestState, GenericCallData* parent)
-      : ProtoUpdateMessage(&requestState->proto), request(std::move(requestState)), parent(parent),
+    Update(std::unique_ptr<HppRequestState<UpdateReqProto>> requestState, GenericCallData* parent,
+           RequestClock::time_point startTime)
+      : ProtoUpdateMessage(&requestState->proto, startTime), request(std::move(requestState)), parent(parent),
         // Admission runs on the completion queue thread, as does enabling
         // cancellation. Worker completions never read the mutable stop source.
         waitToken(parent->waitCancellation.get_token()) {}
@@ -774,6 +779,7 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
       completed->await(call->server.getLuxirNode(), [call](auto result) {
         call->server.getLuxirNode().getTaskArena().enqueue([call, result] {
           try {
+            result->response.took_us = elapsedMicros(result->startTime);
             // A unary update fails only when nothing was applied.
             if (!call->methodEntry->clientStream && result->response.status == api::UpdateResponse_::Status::ERROR)
               call->metricError(ProtoUpdateMessage::failureKind(result->response));
@@ -792,7 +798,7 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     auto iw = shard->requireIndexWriter();
 
     if (request->proto.commit && request->proto.commit->wait_for_replicas.has_value()) call.enableWaitCancellation();
-    Update* updateMessage = new Update(std::move(request), &call);
+    Update* updateMessage = new Update(std::move(request), &call, startTime);
     updateMessage->target = collection->getId();
     try {
       if (!iw->submitUpdate(updateMessage)) {

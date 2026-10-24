@@ -120,6 +120,9 @@ public:
   // One clock snapshot for every query tree/op in this request. Parsers are
   // short-lived and numerous, so NOW belongs here rather than in a parser.
   const int64_t dateMathNowEpochMillis;
+  // When the transport received the request; the final response's took_us is
+  // measured from here (stamped in maybeSendFinal, just before reply()).
+  const RequestClock::time_point startTime;
   // Resolved eagerly from proto.time_zone. Invalid IANA/fixed specifications
   // retain an error for submitBody to surface as a whole-request failure.
   std::optional<TimeZone> timeZone;
@@ -157,7 +160,8 @@ public:
   bool testForcePrepare = false;
 
   SearchRequest(SearchEngine& engine, const ReqProto& proto,
-                google::protobuf::Arena& arena);
+                google::protobuf::Arena& arena,
+                RequestClock::time_point startTime = RequestClock::now());
 
   virtual ~SearchRequest();
 

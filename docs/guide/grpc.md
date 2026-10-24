@@ -68,6 +68,9 @@ several `SearchRequest` messages. Each request may produce several
 `SearchResponse` messages when a document list is batched; `more` tells the
 client another response belongs to the same logical request. Set `request_id`
 when several requests share a call and use the echoed value for correlation.
+The final response of each request carries `took_us`, the server-side wall
+time in microseconds from receiving the request message to sending that
+response.
 
 One request contains:
 
@@ -127,7 +130,10 @@ returns one [`UpdateResponse`](../reference/protobuf.md#message-luxir.updateresp
 for each. Each message has its own overwrite, atomicity, return-ID, and commit
 settings; all-or-none never spans messages.
 `request_id` is echoed so responses can be associated without depending on
-completion timing. Responses may complete out of request order.
+completion timing. Responses may complete out of request order. Each
+response's `took_us` is the server-side wall time in microseconds from
+receiving its request message to sending the response, commit and replica
+waits included.
 
 Send documents through the repeated `docs` row maps. Row maps use the field
 coercion, update, and commit semantics described in [Indexing](indexing.md).
