@@ -95,6 +95,7 @@ defaults and constraints are described in the comments and guides.
 - [`CollectionCommit`](#message-luxir.collectioncommit)
 - [`CollectionStats`](#message-luxir.collectionstats)
 - [`Column`](#message-luxir.column)
+- [`ColumnZoneStats`](#message-luxir.columnzonestats)
 - [`CommitParams`](#message-luxir.commitparams)
 - [`ConstantScoreQuery`](#message-luxir.constantscorequery)
 - [`CpuTimes`](#message-luxir.cputimes)
@@ -720,6 +721,29 @@ One slot per document, including missing values, aligned with DocList rows. Scal
 | <a id="field-luxir.column.col_val"></a>[`col_val`](#field-luxir.column.col_val) | 9 | [`ColVal`](#message-luxir.colval) | oneof [`kind`](#oneof-luxir.column.kind) | any other value type: one Val per doc; missing = unset kind |
 | <a id="field-luxir.column.col_vec"></a>[`col_vec`](#field-luxir.column.col_vec) | 16 | [`ColVector`](#message-luxir.colvector) | oneof [`kind`](#oneof-luxir.column.kind) | single-valued vector column: one Vector per doc; missing = unset oneof |
 | <a id="field-luxir.column.multi_vec"></a>[`multi_vec`](#field-luxir.column.multi_vec) | 17 | [`MultiVector`](#message-luxir.multivector) | oneof [`kind`](#oneof-luxir.column.kind) | multi-valued vector column: one ArrVector per doc; missing = empty list |
+
+<a id="message-luxir.columnzonestats"></a>
+
+### luxir.ColumnZoneStats
+
+How tightly one INT or DATE column's 4096-value block zones (per-block min/max) cluster, which decides how many blocks range filters can skip or take whole. Spans are relative to the column span max - min in this segment. Computed from block metadata at read time.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.columnzonestats.field"></a>[`field`](#field-luxir.columnzonestats.field) | 1 | `string` | singular |  |
+| <a id="field-luxir.columnzonestats.values"></a>[`values`](#field-luxir.columnzonestats.values) | 2 | `uint64` | singular |  |
+| <a id="field-luxir.columnzonestats.blocks"></a>[`blocks`](#field-luxir.columnzonestats.blocks) | 3 | `uint64` | singular |  |
+| <a id="field-luxir.columnzonestats.min"></a>[`min`](#field-luxir.columnzonestats.min) | 4 | `int64` | singular |  |
+| <a id="field-luxir.columnzonestats.max"></a>[`max`](#field-luxir.columnzonestats.max) | 5 | `int64` | singular |  |
+| <a id="field-luxir.columnzonestats.mean_block_span"></a>[`mean_block_span`](#field-luxir.columnzonestats.mean_block_span) | 6 | `double` | singular | Mean of block span / column span: about 1 / blocks for values that arrive in order, close to 1 for values in random order. |
+| <a id="field-luxir.columnzonestats.tight_blocks"></a>[`tight_blocks`](#field-luxir.columnzonestats.tight_blocks) | 7 | `double` | singular | Fraction of blocks whose span is at most 1% of the column span. |
+| <a id="field-luxir.columnzonestats.zone_overlap"></a>[`zone_overlap`](#field-luxir.columnzonestats.zone_overlap) | 8 | `double` | singular | Sum of block span / column span: the expected number of block zones that hold a point of \[min, max\]. About 1 when sorted whatever the block count, about \`blocks\` when random, under 1 when the values cluster with gaps. |
+| <a id="field-luxir.columnzonestats.constant_blocks"></a>[`constant_blocks`](#field-luxir.columnzonestats.constant_blocks) | 9 | `uint64` | singular | Block encodings: frame of reference (zero slope), linear fit, and raw. |
+| <a id="field-luxir.columnzonestats.linear_blocks"></a>[`linear_blocks`](#field-luxir.columnzonestats.linear_blocks) | 10 | `uint64` | singular |  |
+| <a id="field-luxir.columnzonestats.raw_blocks"></a>[`raw_blocks`](#field-luxir.columnzonestats.raw_blocks) | 11 | `uint64` | singular |  |
+| <a id="field-luxir.columnzonestats.bits_per_value"></a>[`bits_per_value`](#field-luxir.columnzonestats.bits_per_value) | 12 | `double` | singular | Packed width averaged over values, raw blocks counted at 64. |
 
 <a id="message-luxir.commitparams"></a>
 
@@ -2147,6 +2171,7 @@ Ids and generations that appear in filenames are reported in their filesystem sp
 | <a id="field-luxir.segmentstats.merge_level"></a>[`merge_level`](#field-luxir.segmentstats.merge_level) | 12 | `uint32` | singular |  |
 | <a id="field-luxir.segmentstats.overlays"></a>[`overlays`](#field-luxir.segmentstats.overlays) | 13 | [`AuxStats`](#message-luxir.auxstats) | repeated |  |
 | <a id="field-luxir.segmentstats.bytes"></a>[`bytes`](#field-luxir.segmentstats.bytes) | 14 | `uint64` | singular |  |
+| <a id="field-luxir.segmentstats.columns"></a>[`columns`](#field-luxir.segmentstats.columns) | 15 | [`ColumnZoneStats`](#message-luxir.columnzonestats) | repeated | Set by StatsRequest.columns, for segments of the current search snapshot. |
 
 <a id="message-luxir.servicestats"></a>
 
@@ -2250,6 +2275,7 @@ Which statistics to gather. The node scope (no collection, no tenant) always ret
 | <a id="field-luxir.statsrequest.files"></a>[`files`](#field-luxir.statsrequest.files) | 6 | `bool` | singular | Also list index directories, filling the \`bytes\` totals, segment bytes and aux index bytes. Implies \`collections\` at node scope. |
 | <a id="field-luxir.statsrequest.system"></a>[`system`](#field-luxir.statsrequest.system) | 7 | `bool` | singular | Node scope only: this process, the data directory's filesystem and the process's cgroup v2, read from procfs and cgroupfs (Linux only). |
 | <a id="field-luxir.statsrequest.host"></a>[`host`](#field-luxir.statsrequest.host) | 8 | `bool` | singular | Node scope only: host-wide CPU, memory, network, TCP, disk and pressure statistics from procfs (Linux only), which node\_exporter also reports. Inside a container most of them describe the host, not the container. |
+| <a id="field-luxir.statsrequest.columns"></a>[`columns`](#field-luxir.statsrequest.columns) | 15 | `bool` | singular | Add per-segment column zone statistics (SegmentStats.columns); implies segments. Reads every INT and DATE column's block metadata in the current search snapshot, so it costs O(blocks) per column but decodes nothing. |
 
 <a id="message-luxir.statsresponse"></a>
 

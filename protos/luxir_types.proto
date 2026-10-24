@@ -1462,6 +1462,10 @@ message StatsRequest {
   // statistics from procfs (Linux only), which node_exporter also reports.
   // Inside a container most of them describe the host, not the container.
   bool host = 8;
+  // Add per-segment column zone statistics (SegmentStats.columns); implies
+  // segments. Reads every INT and DATE column's block metadata in the current
+  // search snapshot, so it costs O(blocks) per column but decodes nothing.
+  bool columns = 15;
 }
 
 message StatsResponse {
@@ -1982,6 +1986,35 @@ message SegmentStats {
   uint32 merge_level = 12;
   repeated AuxStats overlays = 13;
   uint64 bytes = 14;
+  // Set by StatsRequest.columns, for segments of the current search snapshot.
+  repeated ColumnZoneStats columns = 15;
+}
+
+// How tightly one INT or DATE column's 4096-value block zones (per-block
+// min/max) cluster, which decides how many blocks range filters can skip or
+// take whole. Spans are relative to the column span max - min in this
+// segment. Computed from block metadata at read time.
+message ColumnZoneStats {
+  string field = 1;
+  uint64 values = 2;
+  uint64 blocks = 3;
+  int64 min = 4;
+  int64 max = 5;
+  // Mean of block span / column span: about 1 / blocks for values that arrive
+  // in order, close to 1 for values in random order.
+  double mean_block_span = 6;
+  // Fraction of blocks whose span is at most 1% of the column span.
+  double tight_blocks = 7;
+  // Sum of block span / column span: the expected number of block zones that
+  // hold a point of [min, max]. About 1 when sorted whatever the block count,
+  // about `blocks` when random, under 1 when the values cluster with gaps.
+  double zone_overlap = 8;
+  // Block encodings: frame of reference (zero slope), linear fit, and raw.
+  uint64 constant_blocks = 9;
+  uint64 linear_blocks = 10;
+  uint64 raw_blocks = 11;
+  // Packed width averaged over values, raw blocks counted at 64.
+  double bits_per_value = 12;
 }
 
 message AuxStats {

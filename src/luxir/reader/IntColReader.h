@@ -258,6 +258,56 @@ public:
     return values.valuesInBlock(blockNum);
   }
 
+  // How well the block zones partition the column's value range, read from
+  // block metadata alone (nothing is decoded). Spans are relative to the
+  // column span S = max - min, in the stored int64 representation:
+  // - meanBlockSpan: mean of span(block) / S. About 1 / blocks when values
+  //   arrive sorted, close to 1 when they arrive in random order.
+  // - tightBlocks: fraction of blocks with span(block) <= S / 100, the blocks
+  //   a short range can skip or take whole.
+  // - zoneOverlap: sum of span(block) / S, the expected number of block zones
+  //   holding a point of [min, max], so the blocks a point probe cannot skip.
+  //   About 1 when sorted whatever the block count, about `blocks` when
+  //   random, and under 1 when the values cluster with gaps between them.
+  // A column holding one distinct value reports 0, 1 and 0.
+  // bitsPerValue is the packed width averaged over values, raw blocks at 64.
+  struct ZoneStats {
+    double meanBlockSpan = 0;
+    double tightBlocks = 0;
+    double zoneOverlap = 0;
+    double bitsPerValue = 0;
+    int64_t constantBlocks = 0;
+    int64_t linearBlocks = 0;
+    int64_t rawBlocks = 0;
+  };
+
+  ZoneStats zoneStats() const {
+    ZoneStats stats;
+    int64_t blocks = numBlocks();
+    if (blocks == 0) return stats;
+    double columnSpan = (double)((uint64_t)columnMax - (uint64_t)columnMin);
+    double spanSum = 0;
+    double bits = 0;
+    int64_t tight = 0;
+    for (int64_t b = 0; b < blocks; b++) {
+      NumBlockZone zone = blockZone(b);
+      double span = (double)((uint64_t)zone.max - (uint64_t)zone.min);
+      double ratio = columnSpan > 0 ? span / columnSpan : 0;
+      spanSum += ratio;
+      if (ratio <= 0.01) tight++;
+      const NumBlockInfo& info = values.blockInfo(b);
+      if (info.bits() > NumColumnFormat::MAX_PACKED_BITS) stats.rawBlocks++;
+      else if (info.scaledSlope != 0) stats.linearBlocks++;
+      else stats.constantBlocks++;
+      bits += (double)info.bits() * (double)valuesInBlock(b);
+    }
+    stats.meanBlockSpan = spanSum / (double)blocks;
+    stats.tightBlocks = (double)tight / (double)blocks;
+    stats.zoneOverlap = spanSum;
+    stats.bitsPerValue = bits / (double)nvals;
+    return stats;
+  }
+
   bool denseDocsWithValue() const {
     return !docs.hasBitset();
   }
