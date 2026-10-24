@@ -1,0 +1,13 @@
+// Copyright 2020-2026 Yonik Seeley and Luxir contributors
+// SPDX-License-Identifier: Apache-2.0
+
+#include "luxir/BuildInfo.h"
+
+namespace luxir {
+
+const BuildInfo& buildInfo() {
+  static constexpr BuildInfo info{"@PROJECT_VERSION@", "@luxir_source_commit@", "@_luxir_cpu_name@"};
+  return info;
+}
+
+} // namespace luxir
