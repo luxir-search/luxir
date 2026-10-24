@@ -240,7 +240,18 @@ POST /collections/main/_schema
 {"fields": {"year": "int", "author": "string"}}
 ```
 
-Setting an existing field replaces its entire definition.
+Setting an existing field replaces its entire definition, but a change that
+would make existing data unreadable or unmergeable is rejected with an
+invalid-request error of the form `Cannot change <property> of existing field
+'<name>': <old> -> <new>`. This applies to both modes and to fields resolved
+through declared variants. Templates themselves (names starting with `_`) are
+patterns and may change. The checked properties are `type`
+(field class), `multi`, `index`, `column`, `posting_flags`, `unit` (date),
+`dims`, `truncate_dims`, `metric` and `normalized` (vector), `analyzer` (text)
+and `normalizer` (string). Adding fields or templates, and changing other
+properties (for example `long_terms`), is allowed, as is re-setting an
+identical schema. To change a rejected property, use a new field name and
+reindex.
 
 Each tokenizer or filter is `{"name": ..., "params": {...}}`. Components
 without parameters can use a bare name, as in the `title` example above.

@@ -2131,3 +2131,58 @@ TEST_F(SchemaTest, concurrentSchemaTransactionsCompose) {
   EXPECT_EQ(schema->introducedGen, stored->introducedGen);
   EXPECT_TRUE(manifest->segments.empty());
 }
+
+TEST_F(SchemaTest, incompatibleChangeToExistingFieldRejected) {
+  LuxirNode node{LuxirConfig{}};
+  test::CollectionHelper h(node, "main");
+  auto set = [&](auto&& configure) {
+    SchemaBuilder b;
+    configure(b);
+    h.collection().setSchema(b.build(h.collection().getSchema().get()));
+  };
+  auto rejects = [&](auto&& configure, const char* name) {
+    try {
+      set(configure);
+      FAIL() << "expected rejection of " << name;
+    } catch (const SchemaError& e) {
+      EXPECT_NE(std::string(e.what()).find(std::string("'") + name + "'"), std::string::npos) << e.what();
+      EXPECT_NE(std::string(e.what()).find("->"), std::string::npos) << e.what();
+    }
+  };
+  set([](SchemaBuilder& b) {
+    auto& t = b.field("title");
+    t.type = FieldClass::TEXT;
+    t.index = IndexMode::MATCH;
+    b.analyzer(t, "whitespace");
+    auto& n = b.field("n");
+    n.type = FieldClass::INT;
+    n.column = true;
+  });
+  auto sameTitle = [](SchemaBuilder& b) {
+    auto& t = b.field("title");
+    t.type = FieldClass::TEXT;
+    t.index = IndexMode::MATCH;
+    b.analyzer(t, "whitespace");
+  };
+  set(sameTitle);  // identical re-set is a no-op
+  rejects([](SchemaBuilder& b) { b.field("n").type = FieldClass::STRING; }, "n");
+  rejects([](SchemaBuilder& b) { b.field("title").type = FieldClass::STRING; }, "title");
+  rejects([](SchemaBuilder& b) {
+    auto& t = b.field("title");
+    t.type = FieldClass::TEXT;
+    t.index = IndexMode::MATCH;
+    b.analyzer(t, "unicode_word");
+  }, "title");
+  rejects([](SchemaBuilder& b) {
+    auto& n = b.field("n");
+    n.type = FieldClass::INT;
+    n.column = false;
+  }, "n");
+  // Additions stay allowed
+  set([](SchemaBuilder& b) {
+    auto& p = b.field("price");
+    p.type = FieldClass::INT;
+    p.column = true;
+  });
+  EXPECT_NE(nullptr, h.collection().getSchema()->getFieldTypePtr("price"));
+}
