@@ -73,9 +73,13 @@ void service(Renderer& r, const api::ServiceStats& s) {
   r.activity("luxir_searches", "luxir_search_duration_seconds", s.search, s.request_duration_bounds);
   r.histogram("luxir_search_execution_duration_seconds", "Search body execution, excluding scheduler waits and later streaming drains.",
               s.request_duration_bounds, s.search_execution);
+  r.histogram("luxir_search_queue_wait_seconds", "Searches waiting to execute, from submission or the end of a min_commit wait.",
+              s.request_duration_bounds, s.search_queue_wait);
   r.counter("luxir_search_resource_exhausted_total", "Searches rejected by resource limits, including the request memory breaker.", (double)s.search_resource_exhausted);
   r.counter("luxir_search_warnings_total", "Searches completing with at least one declared degradation warning.", (double)s.search_warnings);
   r.activity("luxir_index_batches", "luxir_index_batch_duration_seconds", s.index_batches, s.request_duration_bounds);
+  r.histogram("luxir_index_update_wait_seconds", "Update messages waiting in a writer, from submission to the start of processing.",
+              s.request_duration_bounds, s.update_wait);
   constexpr std::string_view docs = "Documents accepted into indexing or rejected/rolled back; acceptance is not durable acknowledgment.";
   r.counter("luxir_ingest_documents_total", docs, (double)s.documents_accepted, "outcome=\"accepted\"");
   r.counter("luxir_ingest_documents_total", docs, (double)s.documents_rejected, "outcome=\"rejected\"");
@@ -83,8 +87,9 @@ void service(Renderer& r, const api::ServiceStats& s) {
     r.counter("luxir_ingest_document_errors_total", "Documents rejected with an error of their own, by error kind.",
               (double)count, PrometheusText::label("kind", kind));
   r.counter("luxir_ingest_delete_ids_total", "Accepted delete IDs, not the number of matching documents removed.", (double)s.delete_ids_accepted);
-  for (auto [kind, activity] : {std::pair{"flush", &s.flush}, {"commit", &s.commit}, {"delete_pass", &s.delete_pass}, {"merge", &s.merge},
-                                {"vector_build", &s.vector_build}, {"reader_refresh", &s.reader_refresh}})
+  for (auto [kind, activity] : {std::pair{"flush", &s.flush}, {"commit", &s.commit}, {"merge_publish", &s.merge_publish},
+                                {"delete_pass", &s.delete_pass}, {"merge", &s.merge}, {"vector_build", &s.vector_build},
+                                {"reader_refresh", &s.reader_refresh}})
     r.activity("luxir_background", "luxir_background_duration_seconds", *activity, s.background_duration_bounds,
                PrometheusText::label("kind", kind));
 }
@@ -152,7 +157,9 @@ void collectionActivity(Renderer& r, const api::CollectionActivityStats& a, cons
            std::tuple{"luxir_collection_searches", "luxir_collection_search_seconds_total",
                       "Searches that reached the collection, by outcome.", &a.searches},
            {"luxir_collection_index_batches", "luxir_collection_index_batch_seconds_total",
-            "Index batches the collection's writer processed, by outcome.", &a.index_batches}}) {
+            "Index batches the collection's writer processed, by outcome.", &a.index_batches},
+           {"luxir_collection_commits", "luxir_collection_commit_seconds_total",
+            "Whole commits of the collection, by outcome; kept across writer reopens.", &a.commits}}) {
     auto total = std::string(name) + "_total";
     r.counter(total, help, (double)o->ok, labels + ",outcome=\"ok\"");
     r.counter(total, help, (double)o->error, labels + ",outcome=\"error\"");
@@ -195,7 +202,6 @@ void collections(Renderer& r, const api::StatsResponse& stats) {
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_busy, labels + ",state=\"busy\"");
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_idle, labels + ",state=\"idle\"");
     r.gauge("luxir_inverters", "Indexing inverters by state.", (double)index.inverters_flushing, labels + ",state=\"flushing\"");
-    r.counter("luxir_index_commits_total", "Commits since the writer opened.", (double)index.commits, labels);
     r.gauge("luxir_index_retained_delete_bytes", "Delete packets retained by the writer, counted once per packet.", (double)index.retained_delete_bytes, labels);
     if (c.activity) collectionActivity(r, *c.activity, labels);
     cache(r, index.query_cache, labels);

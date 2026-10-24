@@ -164,7 +164,6 @@ public:
     uint64_t deletePassProbes = 0, deletePassMaxProbes = 0;
   };
   struct Stats : ReaderManager::SnapshotStats<SegmentStats>, DeletePassStats {
-    uint64_t commits = 0;
     uint64_t activeMerges = 0;
     uint64_t flushing = 0, idle = 0, indexing = 0;
     uint64_t retainedDeleteBytes = 0;
@@ -490,9 +489,6 @@ public:
   // Time of the last commit (since 1970 epoch) in microseconds. Guaranteed to be strictly increasing.
   std::atomic_uint64_t lastCommitTime;
 
-  // Commits performed by this writer instance (process lifetime, not persisted).
-  std::atomic_uint64_t commitCount = 0;
-
   // Deferred-commit (commit_within_ms) state, guarded by autoCommitMutex.
   // pending/deadline registration and clearing happen on the serial graph entry
   // node (startUpdateBody), so they are exactly ordered against the commits that
@@ -612,6 +608,7 @@ public:
     // this is currently a simple submit to the startUpdateNode, but could be more complex in the future.
     // We could also eliminate the startUpdateNode completely and just submit to the processUpdateNode
     // after setting the sequence numbers.
+    msg->submitted = std::chrono::steady_clock::now();
     return startUpdateNode->try_put(msg);
   }
 
@@ -718,6 +715,7 @@ private:
 
   void processUpdateBody(UpdateMessage& msg) {
     INDEX_DEBUG("processUpdateBody: msg={}", (void*)&msg);
+    metrics->complete(metricActivity(MetricStage::UPDATE_WAIT), MetricOutcome::OK, nanosSince(msg.submitted));
     try {
       msg.handle(*this);
     } catch (std::exception& e) {

@@ -99,6 +99,9 @@ public:
   // counts from then until its final response, or as cancelled without one.
   // An explain is prepared but never dispatched, so it does not count.
   std::chrono::steady_clock::time_point submitted;
+  // When the request became ready to run: submission, or the end of its
+  // min_commit wait. Its queue wait runs from here to execution.
+  std::chrono::steady_clock::time_point ready;
   bool counting = false;
   SearchEngine& engine;
   const SearchConfig searchConfig;
