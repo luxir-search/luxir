@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include "luxir/analysis/AnalysisRegistry.h"
 #include "luxir/plugin/Plugin.h"
 
 namespace luxir {
@@ -10,6 +11,7 @@ namespace luxir {
 class Registries {
 public:
   PluginRegistry plugins;
+  AnalysisRegistry analysis;
 
   static Registries& global();
   // Freezes every registry.

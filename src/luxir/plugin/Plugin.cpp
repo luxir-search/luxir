@@ -36,12 +36,16 @@ Registries& Registries::global() {
   return instance;
 }
 
-void Registries::freeze() { plugins.freeze(); }
+void Registries::freeze() {
+  plugins.freeze();
+  analysis.freeze();
+}
 
 void initPlugins(void (*addPlugins)(PluginRegistry&)) {
   static std::once_flag once;
   std::call_once(once, [addPlugins] {
     Registries& r = Registries::global();
+    registerBuiltinAnalysis(r.analysis);
     addPlugins(r.plugins);
     std::string names;
     for (const auto& p : r.plugins.plugins()) {
