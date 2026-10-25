@@ -320,6 +320,25 @@ TEST_F(StatsMetricsTest, ForcedMergeCountsOneCommit) {
   EXPECT_EQ(collectionCommits + 1, helper.collection().getMetrics().counts().commits[(size_t)MetricOutcome::OK]);
 }
 
+// Node-wide commits outlive their collection; the collection's own counter
+// starts over when a new collection is created under the same name.
+TEST_F(StatsMetricsTest, NodeCommitsSurviveCollectionDelete) {
+  LuxirNode node;
+  auto nodeCommits = [&] { return node.metrics->counts().activities[metricActivity(MetricStage::COMMIT)].completed[(size_t)MetricOutcome::OK]; };
+  {
+    CollectionHelper helper(node, "metrics");
+    helper.index(flatdoc("id", "a"), UpdateMessage::COMMIT);
+  }
+  auto before = nodeCommits();
+  node.deleteCollection("metrics");
+  EXPECT_EQ(before, nodeCommits());
+  CollectionHelper helper(node, "metrics");
+  EXPECT_EQ(0u, helper.collection().getMetrics().counts().commits[(size_t)MetricOutcome::OK]);
+  helper.index(flatdoc("id", "b"), UpdateMessage::COMMIT);
+  EXPECT_EQ(before + 1, nodeCommits());
+  EXPECT_EQ(1u, helper.collection().getMetrics().counts().commits[(size_t)MetricOutcome::OK]);
+}
+
 TEST_F(StatsMetricsTest, EscapingAndHistogramBuckets) {
   Metrics metrics;
   auto activity = metricActivity(MetricStage::SEARCH_EXECUTION);
