@@ -1588,6 +1588,9 @@ public:
     // pass. Profitability and exact-count product availability remain
     // per-segment planner decisions.
     static constexpr int32_t CAN_COMPOSE_EXACT_COUNT_TOPK = 1 << 4;
+    // One scorer produces every score, so the composed ranking pass needs no
+    // canonical rescoring of its survivors.
+    static constexpr int32_t COMPOSES_WITHOUT_RESCORING = 1 << 5;
 
     /// Raw execution trait bitmask.
     int32_t getFlags() const noexcept { return traits; }
@@ -1606,6 +1609,10 @@ public:
 
     bool canComposeExactCountTopK() const noexcept {
       return (traits & CAN_COMPOSE_EXACT_COUNT_TOPK) != 0;
+    }
+
+    bool composesWithoutRescoring() const noexcept {
+      return (traits & COMPOSES_WITHOUT_RESCORING) != 0;
     }
 
     /// True when every doc in the segment matches, so the domain is already

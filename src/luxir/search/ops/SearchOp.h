@@ -56,6 +56,8 @@ struct CollectionRequirements {
   bool needRankedDocs = false;
   int64_t countLimit = 0; // 0: none; -1: exact; positive: at least this many.
   bool needExactDomain = false;
+  // countLimit is 0, but the response carries a cheap estimate of the count.
+  bool estimateCount = false;
 
   bool needsCount() const { return countLimit != 0; }
   bool isBounded() const { return countLimit > 0; }
@@ -166,6 +168,16 @@ public:
     for (auto& [name, subOp] : subOps) {
       subOp->init();
     }
+  }
+
+  // Upper bound on the documents this op and its children visit, from index
+  // metadata alone. A default-lane request parallelizes above a threshold.
+  virtual size_t workEstimate() {
+    size_t total = 0;
+    for (auto& [name, subOp] : subOps) {
+      total = saturatingAdd(total, subOp->workEstimate());
+    }
+    return total;
   }
 
   // Bucket blocks execute synchronously. Segment tasks otherwise own distinct

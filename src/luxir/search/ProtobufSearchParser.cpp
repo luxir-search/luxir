@@ -1924,6 +1924,19 @@ public:
       countWeight = query->createWeight(*qcontext, countFlags);
       rankingWeight = query->createWeight(*qcontext, rankingFlags);
     }
+    // An unset count_limit on a plain ranked root list reports an estimate:
+    // ranking keeps pruning, and an unscored weight samples each segment.
+    Query::Weight* estimateWeight = nullptr;
+    if (!topDocsReq.count_limit.has_value() && !disableEstimatedCount
+        && req.estimateUnsetCount
+        && placement == TopDocsPlacement::ROOT_OP && collapse == nullptr
+        && diversify == nullptr && topDocsReq.ops.empty() && limit > 0
+        && !parsedSorts.useFieldSort && weight != nullptr
+        && !weight->needsPrepare()) {
+      requirements.estimateCount = true;
+      estimateWeight = query->createWeight(
+          *qcontext, requestFlags & ~(Query::NEED_SCORES | Query::ALLOW_PRUNING));
+    }
     auto filterWeights = foldFilters || cacheFirstExactDomain || filters.empty()
       ? std::span<Query::Weight*>{}
       : buildFilterWeights(filters, *qcontext, requestFlags);
@@ -2107,6 +2120,7 @@ public:
 
     qr->collapse = collapse;
     qr->diversify = diversify;
+    qr->estimateWeight = estimateWeight;
     qr->boundedCount = boundedCount && wholeMembershipWeight == nullptr
         && wholeMembershipUse == nullptr;
     if (qr->boundedCount && filterWeights.empty()) {

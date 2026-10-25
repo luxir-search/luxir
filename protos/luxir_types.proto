@@ -165,10 +165,12 @@ message TopDocs {
 
   // Maximum documents to return. Unset = 10; 0 = none; -1 = all remaining.
   optional sint64 limit = 4;
-  // Match count: unset or 0 omits found; -1 counts exactly; positive N permits
-  // stopping at N with found_gte. An exact count is also valid for N.
-  // Must be >= -1. Ops, collapse, diversify, field sorts, nested lists and
-  // limit 0 retain exact counting.
+  // Match count: unset estimates found (found_estimated when sampled) for a
+  // relevance-ranked top-level list with limit > 0 and no ops, collapse,
+  // diversify or field sort, and otherwise omits it; 0 omits found; -1 counts
+  // exactly; positive N permits stopping at N with found_gte. An exact count
+  // is also valid for N or an estimate. Must be >= -1. Ops, collapse,
+  // diversify, field sorts, nested lists and limit 0 retain exact counting.
   optional sint64 count_limit = 5;
   bool get_scores = 6;          // return the relevancy score for each document returned
 
@@ -1021,11 +1023,15 @@ message GroupTable {
 // DocFormat; under COLUMNS an all-missing discovered column is left out of
 // the batch, under ADAPTIVE placement is per batch and field.
 message DocList {
-  // Match count when count_limit is nonzero. Counts groups with
+  // Match count when count_limit is nonzero, or an estimate when it is unset
+  // (see TopDocs.count_limit). Counts groups with
   // collapse; otherwise Fusion counts source-union documents before paging.
   optional sint64 found = 1;
   // True when found is a lower bound; false means the count is exact.
   bool found_gte = 9;
+  // True when found was extrapolated from a sample of the index (unset
+  // count_limit); it may be above or below the exact count.
+  bool found_estimated = 16;
   optional sint64 found_docs = 2; // Collapse only, when count_limit is nonzero, after missing=drop.
   optional sint64 found_groups = 8; // Diversify only, with nonzero count_limit: distinct eligible keys.
   GroupTable groups = 7; // Collapse only: complete metadata aligned with this batch's rows.

@@ -922,6 +922,7 @@ public:
   int64_t offset;
   bool emitCount;
   bool foundGte;
+  bool foundEstimated;
   bool getScores;
   // Resolved DocFormat: ROWS, COLUMNS or ADAPTIVE.  Every field loads as a
   // column; placeBatchColumns settles each batch's placement.  The synthetic
@@ -945,13 +946,14 @@ public:
   DocEmitterImpl(SearchRequest& req, uint64_t flags, GetDocList getDocList, GetDoc getDoc,
                  GetScore getScore, int64_t numCollected, int64_t totalHits,
                  std::span<ReturnField> fields, int32_t maxBatchSize,
-                 int64_t offset, bool emitCount, bool foundGte, bool getScores,
-                 luxir::api::DocFormat placement, bool parallel, size_t colCap,
+                 int64_t offset, bool emitCount, bool foundGte, bool foundEstimated,
+                 bool getScores, luxir::api::DocFormat placement, bool parallel, size_t colCap,
                  DocBatchMetadata metadata)
       : req(req), flags(flags), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
         metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
-        foundGte(foundGte), getScores(getScores), placement(placement),
+        foundGte(foundGte), foundEstimated(foundEstimated), getScores(getScores),
+        placement(placement),
         parallel(parallel), colCap(colCap),
         batchStart(std::min(offset, numCollected)) {}
 
@@ -1023,6 +1025,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     if (emitCount) {
       docListProto.found = totalHits;
       docListProto.found_gte = foundGte;
+      docListProto.found_estimated = foundEstimated;
     }
 
     // Materialize just this batch's docs from getDoc.  Field loaders need a
@@ -1434,7 +1437,8 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
                       luxir::api::DocFormat docFormat,
                       DocEmission emission,
                       DocBatchMetadata metadata = {},
-                      bool foundGte = false)
+                      bool foundGte = false,
+                      bool foundEstimated = false)
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1479,7 +1483,7 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
   auto* emitter = luxir::arenaCreate<Impl>(req.arena, req, flags,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
-      maxBatchSize, offset, emitCount, foundGte, getScores, placement,
+      maxBatchSize, offset, emitCount, foundGte, foundEstimated, getScores, placement,
       /*parallel=*/req.tg != nullptr, colCap, std::move(metadata));
   req.streamStarted();
   emitter->produce();

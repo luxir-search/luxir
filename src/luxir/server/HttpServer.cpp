@@ -1776,6 +1776,8 @@ private:
       sreq->waitCancellation = waitCancellation;
     }
     sreq->format = format;
+    // Pure document lines carry no count unless the request asks for one.
+    sreq->estimateUnsetCount = format != HttpSearchFormat::DOCS;
     sreq->docsState.multiOp = docsMultiOp;
     sreq->docsState.requestId = sreq->proto.request_id;
     // Pin the io_context: shutdown drains until this query finishes, and the

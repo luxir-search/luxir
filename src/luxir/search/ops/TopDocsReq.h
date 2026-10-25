@@ -83,6 +83,17 @@ public:
   static inline bool
       disableExactCountTopKSparseFilterSinglePassForTests = false;
 
+  // An unset count_limit reports an estimate. Each segment counts the leading
+  // 1/64, then 1/8, of kEstimateSlices evenly spaced doc ranges until the
+  // sample holds kEstimateMinMatches matches (about 6% relative error for
+  // doc order independent of the query), and scales by the sampled fraction.
+  // Smaller segments and sparse queries count every range, which is exact.
+  static constexpr int32_t kEstimateSlices = 16;
+  static constexpr int64_t kEstimateMinMatches = 256;
+  static constexpr int32_t kEstimateMinSampledDocs = 1 << 16;
+  static inline int32_t estimateMinSampledDocsForTests =
+      kEstimateMinSampledDocs;
+
   // Filtered MUST conjunctions can abandon competitive-score pruning when the
   // filter caps the candidate set tightly enough. The depth-specific knees
   // bracketed on the 5M Wikipedia corpus are:
@@ -599,6 +610,8 @@ public:
   // The requested quantity stays in requirements; exact routes need no hold.
   bool boundedCount = false;
   bool countLimitProven = false;
+  // Unscored weight that estimates the count for requirements.estimateCount.
+  Query::Weight* estimateWeight = nullptr;
   QueryPrep::WholeMembershipPlan wholeMembershipPlan;
   QueryPrep::ExactDomainPlan exactDomainPlan;
   SortPlan sortPlan;
@@ -613,10 +626,20 @@ public:
   std::function<void(CalcBase&, MergeableCollector*)> rankingSink;
 
 
+  size_t workEstimate() override {
+    size_t total = SearchOp::workEstimate();
+    if (weight == nullptr || weight->needsPrepare()) return total;
+    for (auto& segment : req.reader->segments()) {
+      total = saturatingAdd(
+          total, (size_t) weight->countShortcut(segment, nullptr).maxMatches);
+    }
+    return total;
+  }
+
   void releaseSegmentState(IndexReader::Segment& segment) noexcept override {
     if (segmentStateRetained(segment)) return;
     for (auto* source : {weight, variantMembershipWeight, countWeight,
-                         rankingWeight, wholeRankingWeight}) {
+                         rankingWeight, wholeRankingWeight, estimateWeight}) {
       if (source) source->releaseSegmentState(segment);
     }
     for (auto* source : filterWeights) source->releaseSegmentState(segment);
@@ -629,7 +652,7 @@ public:
 
   bool facetBucketSharesSegmentState() const override {
     for (auto* source : {weight, variantMembershipWeight, countWeight,
-                         rankingWeight, wholeRankingWeight}) {
+                         rankingWeight, wholeRankingWeight, estimateWeight}) {
       if (source && source->hasReleasableSegmentState()) return true;
     }
     return std::ranges::any_of(filterWeights, [](const auto* source) {
@@ -948,6 +971,68 @@ public:
       return true;
     }
 
+    // Adds this segment's share of an estimated count (see
+    // kEstimateMinMatches). A metadata count shortcut answers exactly.
+    void estimateSegmentCount(MemPool& pool, IndexReader::Segment& seg,
+                              DocSet* collectorFilter, auto& collector) {
+      auto& weight = *thisOp().estimateWeight;
+      if (collectorFilter == nullptr) {
+        auto shortcut = weight.countShortcut(seg, nullptr);
+        if (shortcut.how == Query::CountHow::METADATA) {
+          collector.estimatedHits += shortcut.maxMatches;
+          return;
+        }
+      }
+      int32_t maxDoc = seg.maxDoc();
+      int32_t shift =
+          maxDoc < TopDocsReq::estimateMinSampledDocsForTests ? 0 : 6;
+      for (;; shift -= 3) {
+        auto* supplier = weight.scorerSupplier(pool, seg);
+        if (supplier == nullptr) return;
+        Query::ScorerSupplier::BulkScorerContext bulkContext;
+        auto plan = supplier->planBulk(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
+        BulkScorer* bulk = nullptr;
+        Query::Scorer* scorer = nullptr;
+        if (plan.available == Query::ScorerSupplier::BulkAnswer::YES) {
+          bulk = supplier->buildBulk(pool, plan);
+        } else {
+          supplier->recordBulkPlanCommitment(
+              Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+              bulkContext, plan);
+        }
+        if (bulk == nullptr) {
+          scorer = buildPullScorer(pool, *supplier);
+          if (scorer == nullptr) return;
+        }
+        int64_t matches = 0;
+        int64_t sampled = 0;
+        for (int32_t slice = 0; slice < TopDocsReq::kEstimateSlices; slice++) {
+          int32_t begin = (int32_t) ((int64_t) maxDoc * slice
+              / TopDocsReq::kEstimateSlices);
+          int32_t end = (int32_t) ((int64_t) maxDoc * (slice + 1)
+              / TopDocsReq::kEstimateSlices);
+          if (shift > 0 && end > begin) {
+            end = begin + std::max(1, (end - begin) >> shift);
+          }
+          matches += bulk != nullptr
+              ? countMatchesInRange(bulk, collectorFilter, begin, end)
+              : countMatchesInRange(scorer, collectorFilter, begin, end);
+          sampled += end - begin;
+        }
+        if (shift <= 0 || sampled >= maxDoc) {
+          collector.estimatedHits += matches;
+          return;
+        }
+        if (matches >= TopDocsReq::kEstimateMinMatches) {
+          collector.estimatedHits += (int64_t) std::llround(
+              (double) matches * (double) maxDoc / (double) sampled);
+          collector.countEstimated = true;
+          return;
+        }
+      }
+    }
+
     void collectKnownCountTopK(
         MemPool& pool, int32_t segnum, int64_t count,
         Query::ScorerSupplier* rankingSupplier, DocSet* collectorFilter,
@@ -1001,6 +1086,37 @@ public:
           collector, maxDoc, allowPruning, exactScorer);
     }
 
+    // A single scorer ranks canonically by itself: count with the unscored
+    // weight (windowed when it can, else pulled), then rank with pruning.
+    void countThenRankWithoutRescoring(
+        MemPool& pool, int32_t segnum,
+        Query::ScorerSupplier& countSupplier, DocSet* collectorFilter,
+        auto& collector, int32_t maxDoc) {
+      Query::ScorerSupplier::BulkScorerContext bulkContext;
+      auto countPlan = countSupplier.planBulk(
+          Query::ScorerSupplier::BulkUse::COUNT_WINDOWS, bulkContext);
+      BulkScorer* countBulk = nullptr;
+      if (countPlan.available == Query::ScorerSupplier::BulkAnswer::YES) {
+        countBulk = countSupplier.buildBulk(pool, countPlan);
+      } else {
+        countSupplier.recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
+            bulkContext, countPlan);
+      }
+      int64_t count = 0;
+      if (countBulk != nullptr) {
+        count = countMatchesWindowed(
+            countBulk, collectorFilter, nullptr, maxDoc);
+      } else if (auto* scorer = buildPullScorer(pool, countSupplier)) {
+        count = countMatchesInRange(scorer, collectorFilter, 0, maxDoc);
+      }
+      auto* rankingSupplier = thisOp().rankingWeight->scorerSupplier(
+          pool, thisOp().planning.topReader.segments()[segnum]);
+      collectKnownCountTopK(
+          pool, segnum, count, rankingSupplier, collectorFilter,
+          collector, maxDoc, true);
+    }
+
     bool composeVariableScoreExactCountTopK(
         MemPool& pool, int32_t segnum,
         Query::ScorerSupplier& scoringSupplier,
@@ -1015,6 +1131,14 @@ public:
               != Query::ScorerSupplier::BulkAnswer::YES
           || scoringPlan.supportsExactCandidateScoring
               != Query::ScorerSupplier::BulkAnswer::YES;
+      if (scoringDeclined && thisOp().weight->composesWithoutRescoring()) {
+        scoringSupplier.recordBulkPlanCommitment(
+            Query::ScorerSupplier::BulkUse::EXACT_CANDIDATE_SCORING,
+            bulkContext, scoringPlan);
+        countThenRankWithoutRescoring(
+            pool, segnum, countSupplier, collectorFilter, collector, maxDoc);
+        return true;
+      }
       if (scoringDeclined) {
         auto countPlan = countSupplier.planBulk(
             Query::ScorerSupplier::BulkUse::COUNT_WINDOWS,
@@ -2444,6 +2568,11 @@ public:
                   }
                 }
               }
+            }
+            if (!Collapsed && op.estimateWeight != nullptr
+                && !requiresWholeIndexPrepare && !data->useFieldSort) {
+              estimateSegmentCount(
+                  poolGuard.pool(), seg, collectorFilter, *scoreCollector);
             }
           }
         }

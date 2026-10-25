@@ -431,6 +431,11 @@ public:
         : Query::Weight(context, query, flags), query(query) {
       bool needScores = (flags & NEED_SCORES) != 0;
       if (!needScores) traits |= IS_CONSTANT_SCORING;
+      // Only exact phrases prune on impacts, which is what an exact count
+      // composed with a separate ranking pass gains.
+      if (needScores && query.getSlop() == 0) {
+        traits |= CAN_COMPOSE_EXACT_COUNT_TOPK | COMPOSES_WITHOUT_RESCORING;
+      }
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
       if (cachedFieldInfo == nullptr) return;
 
