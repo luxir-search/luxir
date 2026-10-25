@@ -510,6 +510,22 @@ private:
     return {kept, out.size()};
   }
 
+  // Luxir-defined min_match semantics under duplicate removal, split by the
+  // intent the value expresses (Lucene instead refuses to dedup when
+  // min_match > 1 and lets duplicates satisfy multiple match slots):
+  // - Above half the raw clauses, preserve the miss budget.
+  // - At or below half, preserve the absolute distinct-term count.
+  // Shared by logicalPlan and mayMatch so a proof counts what executes.
+  static int32_t dedupedMinShouldMatch(
+      int32_t minShouldMatch, size_t rawOptional, size_t distinctOptional) {
+    int32_t removed = (int32_t) (rawOptional - distinctOptional);
+    if (minShouldMatch <= 1 || removed <= 0) return minShouldMatch;
+    if ((int64_t) minShouldMatch * 2 > (int64_t) rawOptional) {
+      return std::max(1, minShouldMatch - removed);
+    }
+    return std::min(minShouldMatch, (int32_t) distinctOptional);
+  }
+
   static std::span<Query*> persistClauses(
       MemPool& pool, std::span<Query*> clauses) {
     if (clauses.empty()) return {};
@@ -537,21 +553,9 @@ private:
       auto filterClauses = dropDuplicateMembershipClauses(
           context.pool, normalized.filter);
 
-      // Luxir-defined min_match semantics under duplicate removal, split by
-      // the intent the value expresses (Lucene instead refuses to dedup when
-      // min_match > 1 and lets duplicates satisfy multiple match slots):
-      // - Above half the raw clauses, preserve the miss budget.
-      // - At or below half, preserve the absolute distinct-term count.
-      if (compiled->minShouldMatch > 1 && removedOptional > 0) {
-        if ((int64_t) compiled->minShouldMatch * 2
-            > (int64_t) normalized.optional.size()) {
-          compiled->minShouldMatch = std::max(
-              1, compiled->minShouldMatch - removedOptional);
-        } else {
-          compiled->minShouldMatch = std::min(
-              compiled->minShouldMatch, (int32_t) optionalClauses.size());
-        }
-      }
+      compiled->minShouldMatch = dedupedMinShouldMatch(
+          compiled->minShouldMatch, normalized.optional.size(),
+          normalized.optional.size() - (size_t) removedOptional);
 
       // NormalizedBoolean owns small_vector storage. Persist every final span
       // in the request pool so all Weights for this Query share one plan.
@@ -947,6 +951,45 @@ public:
     if (hasDynamicTerms) return FieldSortConjunction::DYNAMIC_TERMS;
     return hasOther ? FieldSortConjunction::NOT_FLAT
                     : FieldSortConjunction::FLAT_LITERAL_CONJUNCTION;
+  }
+
+  // One impossible required clause empties the conjunction; an optional
+  // group needs enough possible members (UNKNOWN counts as possible);
+  // prohibited clauses never prove anything. A query with no positive
+  // clause is the planner's match-all and stays unknown. Duplicate optional
+  // clauses count once, against the min_match logicalPlan executes.
+  MatchState mayMatch(const SummaryView& view) const override {
+    for (auto clauses : {mandatory, filter}) {
+      for (Query* clause : clauses) {
+        if (clause->mayMatch(view) == MatchState::EMPTY) return MatchState::EMPTY;
+      }
+    }
+    if (optional.empty()) return MatchState::UNKNOWN;
+    bool optionalRequired = mandatory.empty() && filter.empty();
+    int64_t needed = minShouldMatch > 0 ? minShouldMatch : (optionalRequired ? 1 : 0);
+    if (needed == 0) return MatchState::UNKNOWN;
+    int64_t possible = 0;
+    if (minShouldMatch > 1) {
+      auto guard = MemPool::threadLocalPoolGuard();
+      DuplicateGroups duplicates = findDuplicateGroups(guard.pool(), optional, false);
+      size_t distinct = 0;
+      for (size_t i = 0; i < optional.size(); i++) {
+        int32_t group = duplicates.byClause[i];
+        if (group >= 0 && i != duplicates.slots[(size_t) group].representative) continue;
+        distinct++;
+        if (optional[i]->mayMatch(view) != MatchState::EMPTY) possible++;
+      }
+      needed = dedupedMinShouldMatch(minShouldMatch, optional.size(), distinct);
+    } else {
+      for (Query* clause : optional) {
+        if (clause->mayMatch(view) != MatchState::EMPTY) possible++;
+      }
+    }
+    if (possible < needed) {
+      view.prove("too few possible optional clauses");
+      return MatchState::EMPTY;
+    }
+    return MatchState::UNKNOWN;
   }
 
   // Every match satisfies every MUST and FILTER clause, so their envelopes

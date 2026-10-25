@@ -1024,6 +1024,43 @@ public:
     skipCount(SkipStats::wholeFieldSortRoutingBypasses);
   }
 
+  // A segment the op's root mask pruned matches nothing. A cache-backed plan
+  // records that empty membership as resolve() records a zero count, without
+  // building anything from the segment, so the cached membership can still
+  // become complete and later requests may omit the Weight.
+  void recordProvenEmpty(IndexReader::Segment& segment) const {
+    if (source == Source::ACCEPTED_EXISTING) {
+      record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits,
+             SkipStats::wholeFieldSortHits);
+      return;
+    }
+    if (source != Source::WEIGHT || weight->needsPrepare()) return;
+    if (cacheUse == nullptr) {
+      record(SkipStats::wholeCountConstant, SkipStats::wholeTopKCountConstant,
+             SkipStats::wholeFieldSortConstant);
+      return;
+    }
+    if (!fieldSortCacheRoutes.empty() && fieldSortCacheRoutes[(size_t)segment.ord] == 0) {
+      recordRoutingBypass();
+      return;
+    }
+    auto probe = cacheUse->probe((size_t) segment.ord);
+    if (probe.kind() == FilterCache::Probe::Kind::HIT) {
+      record(SkipStats::wholeCountHits, SkipStats::wholeTopKCountHits,
+             SkipStats::wholeFieldSortHits);
+    } else if (probe.kind() == FilterCache::Probe::Kind::BUILD) {
+      cacheUse->publishRaw((size_t) segment.ord, probe,
+                           std::make_unique<ArrDocSet>(std::vector<int32_t>{}), 0);
+      record(SkipStats::wholeCountBuilds, SkipStats::wholeTopKCountBuilds,
+             SkipStats::wholeFieldSortBuilds);
+    } else {
+      record(SkipStats::wholeCountBypasses, SkipStats::wholeTopKCountBypasses,
+             SkipStats::wholeFieldSortBypasses);
+      record(SkipStats::wholeCountConstant, SkipStats::wholeTopKCountConstant,
+             SkipStats::wholeFieldSortConstant);
+    }
+  }
+
   template <typename SupplierFor>
   WholeMembershipResult resolve(
       IndexReader& reader, IndexReader::Segment& segment,

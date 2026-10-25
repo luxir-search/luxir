@@ -84,8 +84,8 @@ state, and commits are crash-safe on immutable segments.
   roadmap: object-store durability, nodes reading from the store through a
   local cache, and the publication contract both use.
 - [Segment summaries](design/segment-summaries.md) describes the per-segment
-  summary sidecar: the metadata that will let a query skip a segment without
-  opening its data.
+  summary sidecar and the query-time pruning over it: one root mask per
+  operation, with scoring statistics over every segment.
 - [Codebase map](dev/codebase-map.md) traces source components and request
   flow.
 - [Build setup](dev/build-setup.md) covers toolchains, dependencies, presets,
