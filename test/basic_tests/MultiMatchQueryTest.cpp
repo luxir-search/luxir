@@ -9,6 +9,8 @@
 #include <map>
 #include <optional>
 #include <typeindex>
+#include <utility>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -121,6 +123,47 @@ TEST_F(MultiMatchQueryTest, scoresMatchBm25fFormula) {
   EXPECT_NEAR(bm25f(2.0f, 6.0f), hits->at("d1"), 1e-6);
   EXPECT_NEAR(bm25f(2.0f, 7.0f), hits->at("d2"), 1e-6);
   EXPECT_GT(hits->at("d1"), hits->at("d2"));
+}
+
+// The scorer's norm tables and fast rounding match std::round, clamping and
+// intToByte4 over the weighted lengths for every pair of field norms.
+TEST(CombinedFieldNormTest, normTablesMatchReference) {
+  auto reference = [](double length) {
+    double rounded = std::min(std::round(length), (double)std::numeric_limits<int32_t>::max());
+    return SmallFloat::intToByte4((int32_t)rounded);
+  };
+  std::vector<uint8_t> pairNorms(256 * 256);
+  std::pair<float, float> weights[] = {{1.0f, 1.0f}, {2.0f, 1.0f}, {0.3f, 1.7f},
+                                       {1.5f, 0.25f}, {1e-3f, 3e9f}};
+  for (auto [w0, w1] : weights) {
+    CombinedFieldQuery::fillPairNorms(pairNorms, w0, w1);
+    for (int c0 = 0; c0 < 256; c0++) {
+      for (int c1 = 0; c1 < 256; c1++) {
+        double length = (double)w0 * (double)SmallFloat::decodeLengthByte((uint8_t)c0)
+            + (double)w1 * (double)SmallFloat::decodeLengthByte((uint8_t)c1);
+        ASSERT_EQ(reference(length), pairNorms[c0 << 8 | c1]) << w0 << " " << w1 << " " << c0 << " " << c1;
+        ASSERT_EQ(reference(length), CombinedFieldQuery::encodeLength(length));
+      }
+    }
+  }
+  for (double length : {0.0, 0.49999999999999994, 0.5, 2.5, 23.5, 24.5, 1e9 + 0.5,
+                        2147483646.5, 2147483647.0, 1e300}) {
+    EXPECT_EQ(reference(length), CombinedFieldQuery::encodeLength(length)) << length;
+  }
+}
+
+// Both fields have flat norms here, so a lowered threshold scores through the
+// shared pair table instead of summing the weighted lengths.
+TEST_F(MultiMatchQueryTest, pairNormTableScoresMatchSummedLengths) {
+  auto query = qb::multiMatch(mr(), "dune desert", {{"title_un", 1.3f}, {"body_un", 0.7f}});
+  auto summed = run(query);
+  int64_t threshold = CombinedFieldQuery::pairNormMinDocFreq;
+  CombinedFieldQuery::pairNormMinDocFreq = 0;
+  auto tabled = run(query);
+  CombinedFieldQuery::pairNormMinDocFreq = threshold;
+  ASSERT_TRUE(summed && tabled);
+  ASSERT_EQ(2u, summed->size());
+  EXPECT_EQ(*summed, *tabled);
 }
 
 // title_un in 1 of 3 docs is under half density, so its norms are sparse and

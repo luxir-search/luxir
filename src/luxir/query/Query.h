@@ -1302,6 +1302,10 @@ public:
     FilterKeyContext& filterKeyContext;
     Limits& limits;
     FieldInfoMap fieldInfoMap;
+    // Pool-owned norm tables shared by the CombinedFieldQuery weights of a
+    // multi_match group, one per field weight vector; defined there.
+    struct CombinedNorms;
+    CombinedNorms* combinedNorms = nullptr;
 
     Context(google::protobuf::Arena& arena, PlanningContext& planning,
             FieldInfoMap&& fieldInfoMap)
