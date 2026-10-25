@@ -64,6 +64,7 @@ struct ResolvedField {
   bool vectorNormalizeOnWrite = false;
   // Atomic: the nearest authored ann in the parent chain.
   const luxir::api::VectorAnnDef* ann = nullptr;
+  std::optional<int32_t> decimalScale;
   std::optional<bool> geoIgnoreMalformed;
   std::optional<bool> geoIgnoreZValue;
 };
@@ -290,6 +291,7 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
   }
 
   r.ann = def.ann ? &*def.ann : parentResolved.ann;
+  r.decimalScale = def.scale ? def.scale : parentResolved.decimalScale;
   r.geoIgnoreMalformed = def.ignore_malformed ? def.ignore_malformed
                                               : parentResolved.geoIgnoreMalformed;
   r.geoIgnoreZValue = def.ignore_z_value ? def.ignore_z_value
@@ -446,6 +448,9 @@ static void validateDirectProps(const SourceEntry& entry, const ResolvedField& r
       "dims/truncate_dims/metric/normalized/normalize_on_write/ann are only valid for vector fields (field: " +
       name + ")");
   }
+  if (def.scale && r.type != FieldClass::DECIMAL) {
+    throw SchemaError("scale is only valid for decimal fields (field: " + name + ")");
+  }
   if ((def.ignore_malformed || def.ignore_z_value) && r.type != FieldClass::GEO_POINT) {
     throw SchemaError("ignore_malformed/ignore_z_value are only valid for geo_point fields (field: " +
                       name + ")");
@@ -534,6 +539,7 @@ struct FieldCompiler {
       switch (r.type) {
         case FieldClass::ID:     index = IndexMode::MATCH; break;
         case FieldClass::STRING: index = IndexMode::MATCH; break;
+        case FieldClass::IP:     index = IndexMode::MATCH; break;
         case FieldClass::TEXT:   index = IndexMode::MATCH; break;
         case FieldClass::INT:    index = IndexMode::NONE; break;
         default: index = IndexMode::NONE; break;
@@ -569,7 +575,8 @@ struct FieldCompiler {
     // Reject index modes the engine cannot honor. RANGE covers 1-D numeric
     // ranges and 2-D GEO_POINT boxes; both require a column in this phase.
     bool numericClass = r.type == FieldClass::INT || r.type == FieldClass::FLOAT ||
-                        r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE;
+                        r.type == FieldClass::DOUBLE || r.type == FieldClass::DATE ||
+                        r.type == FieldClass::BOOLEAN || r.type == FieldClass::DECIMAL;
     bool geoClass = r.type == FieldClass::GEO_POINT;
     if (index == IndexMode::RANGE) {
       if (!numericClass && !geoClass) {
@@ -595,6 +602,16 @@ struct FieldCompiler {
       // be returned in search results.  Other types default to false;
       // STRING/ID already expose their value via the column store.
       stored = (r.type == FieldClass::TEXT);
+    }
+    if (r.type == FieldClass::IP) {
+      // Retrieval renders the canonical address from the column; there is no
+      // source text to keep, and no term space without the index.
+      if (stored && !derived) {
+        throw SchemaError("stored is not supported for ip fields (field: " + std::string(name) + ")");
+      }
+      if (index != IndexMode::MATCH) {
+        throw SchemaError("ip fields require index=match (field: " + std::string(name) + ")");
+      }
     }
 
     if (geoClass && stored) {
@@ -660,6 +677,23 @@ struct FieldCompiler {
       }
       case FieldClass::INT:
         ft = std::make_shared<IntFieldType>(name, flags);
+        break;
+      case FieldClass::BOOLEAN:
+        ft = std::make_shared<BoolFieldType>(name, flags);
+        break;
+      case FieldClass::DECIMAL: {
+        if (!r.decimalScale) {
+          throw SchemaError("decimal fields require a scale (field: " + std::string(name) + ")");
+        }
+        if (*r.decimalScale < 0 || *r.decimalScale > DecimalFieldType::MAX_SCALE) {
+          throw SchemaError("scale must be 0 to " + std::to_string(DecimalFieldType::MAX_SCALE) +
+                            " (field: " + std::string(name) + ")");
+        }
+        ft = std::make_shared<DecimalFieldType>(name, *r.decimalScale, flags);
+        break;
+      }
+      case FieldClass::IP:
+        ft = std::make_shared<IpFieldType>(name, flags);
         break;
       case FieldClass::FLOAT:
         ft = std::make_shared<FloatFieldType>(name, flags);
@@ -1252,6 +1286,10 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   add(templates, "_ds", FieldClass::DOUBLE).multi = api::FieldDef::MultiMode::DEFAULT;
   add(templates, "_dt", FieldClass::DATE);
   add(templates, "_dts", FieldClass::DATE).multi = api::FieldDef::MultiMode::DEFAULT;
+  add(templates, "_b", FieldClass::BOOLEAN);
+  add(templates, "_bs", FieldClass::BOOLEAN).multi = api::FieldDef::MultiMode::DEFAULT;
+  add(templates, "_ip", FieldClass::IP);
+  add(templates, "_ips", FieldClass::IP).multi = api::FieldDef::MultiMode::DEFAULT;
   // Geo points: unlike the numeric suffixes these build the points index,
   // since geo queries are their only use.
   add(templates, "_p", FieldClass::GEO_POINT).index = IndexMode::RANGE;

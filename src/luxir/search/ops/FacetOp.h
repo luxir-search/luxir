@@ -81,16 +81,23 @@ public:
   std::string_view facetName;
   IndexReader::FieldSegments segInfos;
   ValueNature outputNature = ValueNature::NUMBER;
+  // The faceted field's schema type, which renders logical-type bucket keys
+  // (see emitBuckets). Set by the parser.
+  const FieldType* valueType = nullptr;
 
   template <typename Label>
   void emitFieldBuckets(api::FacetResult& result,
                         const std::vector<std::pair<Label, int64_t>>& buckets,
                         std::pmr::memory_resource& mr) const {
     if constexpr (std::is_same_v<Label, int64_t>) {
+      if (valueType && valueType->logical != FieldType::Logical::NONE) {
+        emitLogicalBuckets(result, buckets, mr, valueType);
+        return;
+      }
       withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, [&](auto output) {
         emitBuckets(result, buckets, mr, output);
       });
-    } else emitBuckets(result, buckets, mr);
+    } else emitBuckets(result, buckets, mr, valueType);
   }
 
   const SegFieldInfo* fieldInfo(int32_t segnum) const {
@@ -2022,6 +2029,9 @@ public:
   static inline bool disablePointsRangeFacetForTests = false;
   static inline bool disableZoneRangeFacetForTests = false;
 
+  // 10^scale for a DECIMAL field, whose bounds are emitted decoded; 0 otherwise.
+  double decimalUnit = 0;
+
   std::span<const int64_t> bucketFences() const { return fences; }
 
   IntFacetRangeReq(SearchRequest& req,
@@ -2123,6 +2133,11 @@ public:
             [](int64_t encoded) { return sortableInt64ToDouble(encoded); });
         break;
       default:
+        if (decimalUnit != 0) {
+          emitBounds.template operator()<luxir::api::ArrArrDouble>(
+              [unit = decimalUnit](int64_t value) { return (double)value / unit; });
+          break;
+        }
         emitBounds.template operator()<luxir::api::ArrArrInt>(
             [](int64_t value) { return value; });
         break;

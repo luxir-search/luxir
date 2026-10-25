@@ -41,6 +41,7 @@
 #include "luxir/reader/TermsEnum.h"
 #include "luxir/search/Collector.h"
 #include "luxir/search/SearchRequest.h"
+#include "luxir/util/IpAddress.h"
 #include "luxir/search/DateOutput.h"
 #include "luxir/util/MemPool.h"
 #include "luxir/util/NumericUtils.h"
@@ -246,6 +247,13 @@ inline void loadStrColForSegment(SearchRequest& req, const SegFieldInfo* info, F
   const auto& segFieldInfo = *info;
 
   bool isIndexedString = (segFieldInfo.flags & FieldType::INDEX_DOCS) != 0;
+  // IP terms are 16-byte addresses; the response carries their text form.
+  bool ipTerms = fieldType.logical == FieldType::Logical::IP;
+  auto copy = [&](std::string_view term) {
+    char text[ip::TEXT_BUF_SIZE];
+    if (ipTerms && term.size() == ip::BYTES) term = ip::format(term, text);
+    return build::arenaStr(mr, term);
+  };
 
   if (!fieldType.multiValued()) {
     if (isIndexedString) {
@@ -253,14 +261,14 @@ inline void loadStrColForSegment(SearchRequest& req, const SegFieldInfo* info, F
       auto valHandler = [&](size_t idx, int32_t doc, int32_t val) {
         assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
         tenum.seekOrd((int32_t) val - 1);
-        starget[idxSpan[idx]] = build::arenaStr(mr, (std::string_view) tenum.term());
+        starget[idxSpan[idx]] = copy((std::string_view) tenum.term());
         if (present) present[idxSpan[idx]] = 1;
       };
       OrdColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     } else {
       auto valHandler = [&](size_t idx, int32_t doc, std::string_view val) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
-        starget[idxSpan[idx]] = build::arenaStr(mr, val);
+        starget[idxSpan[idx]] = copy(val);
         if (present) present[idxSpan[idx]] = 1;
       };
       StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
@@ -273,7 +281,7 @@ inline void loadStrColForSegment(SearchRequest& req, const SegFieldInfo* info, F
         luxir::api::ArrStr& target = mtarget[idxSpan[idx]];
         if (valIdx == 0) build::allocArray(target.v, numVals, mr);
         tenum.seekOrd((int32_t) val - 1);
-        const_cast<std::string_view*>(target.v.data())[valIdx] = build::arenaStr(mr, (std::string_view) tenum.term());
+        const_cast<std::string_view*>(target.v.data())[valIdx] = copy((std::string_view) tenum.term());
       };
       OrdColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     } else {
@@ -281,7 +289,7 @@ inline void loadStrColForSegment(SearchRequest& req, const SegFieldInfo* info, F
         assert(segDocs[idxSpan[idx]].docId() == doc);
         luxir::api::ArrStr& target = mtarget[idxSpan[idx]];
         if (valIdx == 0) build::allocArray(target.v, numVals, mr);
-        const_cast<std::string_view*>(target.v.data())[valIdx] = build::arenaStr(mr, val);
+        const_cast<std::string_view*>(target.v.data())[valIdx] = copy(val);
       };
       StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     }
@@ -706,6 +714,33 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
     // numDocs > 0).
   }
   return rows;
+}
+
+// BOOLEAN fields load as 0/1 int columns (missing_val exact after
+// finishPendingCols).  Columns have no boolean arm, so this rewrites such a
+// column as a col_val column holding exactly what the row entry would: a bool
+// (or an array of bools) per document, unset when missing.
+inline void boolColumnToVals(luxir::api::Column& col, std::pmr::memory_resource& mr) {
+  using luxir::api::Val;
+  if (auto* c = std::get_if<luxir::api::ColInt>(&col.kind)) {
+    auto src = c->v;
+    auto missing = c->missing_val;
+    auto& vc = col.kind.emplace<luxir::api::ColVal>();
+    Val* out = build::allocArray(vc.v, src.size(), mr);
+    for (size_t i = 0; i < src.size(); i++)
+      if (src[i] != missing) out[i].kind = src[i] != 0;
+  } else if (auto* c = std::get_if<luxir::api::ArrArrInt>(&col.kind)) {
+    auto src = c->v;
+    auto& vc = col.kind.emplace<luxir::api::ColVal>();
+    Val* out = build::allocArray(vc.v, src.size(), mr);
+    for (size_t i = 0; i < src.size(); i++) {
+      auto values = src[i].v;
+      if (values.empty()) continue;
+      auto& arr = out[i].kind.emplace<luxir::api::ArrVal>();
+      Val* elems = build::allocArray(arr.v, values.size(), mr);
+      for (size_t j = 0; j < values.size(); j++) elems[j].kind = values[j] != 0;
+    }
+  }
 }
 
 // One resolved returned-field entry (see resolveReturnFields). The output key
@@ -1162,7 +1197,13 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
 
       switch (fieldType.type()) {
         case FieldType::Type::INT: {
-          loadNumCol<IntColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          if (fieldType.logical == FieldType::Logical::DECIMAL) {
+            double unit = static_cast<DecimalFieldType&>(fieldType).unit;
+            loadNumCol<DoubleColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders,
+                                      pendingCols, mr, [unit](int64_t raw) { return (double)raw / unit; });
+          } else {
+            loadNumCol<IntColEmit>(req, rf.infos, fieldType, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
+          }
           break;
         }
         case FieldType::Type::FLOAT: {
@@ -1293,6 +1334,12 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     // missing_val and fill its missing slots.  (ROWS mode relies on the
     // exact sentinels for its presence checks.)
     finishPendingCols(pendingCols);
+    for (size_t i = 0; i < columnFields.size(); i++) {
+      const ReturnField& rf = *columnFields[i];
+      if (rf.fieldType && rf.fieldType->logical == FieldType::Logical::BOOLEAN) {
+        boolColumnToVals(const_cast<luxir::api::Column&>(docListProto.columns.data()[i].second), mr);
+      }
+    }
     placeBatchColumns(placement, columnFields, columnPresent, docListProto.columns, rowColumns,
                       (size_t)columnSize, scoreRows, columnFate, rowCaps, mr);
 

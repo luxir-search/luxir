@@ -17,6 +17,8 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/search/DateOutput.h"
 #include "SearchOp.h"  // build:: alias + luxir::api types (via SearchRequest.h)
+#include "luxir/schema/FieldType.h"
+#include "luxir/util/IpAddress.h"
 
 namespace luxir {
 
@@ -216,6 +218,31 @@ std::vector<FinalizedFacetBucket<Key, Payload>> finalizeCountFieldBuckets(
 // Build bucket_ids (a Column) + counts (an int64 span) into the NON-OWNING
 // FacetResult.  The bucket count is known up front (buckets.size()), so each
 // span is allocArray'd once into the response arena `mr` and index-filled.
+// valueType, the faceted field's schema type, renders logical-type keys:
+// BOOLEAN as "true"/"false", DECIMAL as decoded doubles, IP as address text.
+inline void emitLogicalBuckets(luxir::api::FacetResult& facetResultProto,
+                        const std::vector<std::pair<int64_t, int64_t>>& buckets,
+                        std::pmr::memory_resource& mr, const FieldType* valueType = nullptr) {
+  auto logical = valueType ? valueType->logical : FieldType::Logical::NONE;
+  size_t n = buckets.size();
+  int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
+  for (size_t i = 0; i < n; i++) counts[i] = buckets[i].second;
+  if (logical == FieldType::Logical::BOOLEAN) {
+    auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<luxir::api::ColStr>();
+    std::string_view* ids = build::allocArray(bucketIds.v, n, mr);
+    for (size_t i = 0; i < n; i++) ids[i] = buckets[i].first != 0 ? "true" : "false";
+  } else if (logical == FieldType::Logical::DECIMAL) {
+    double unit = static_cast<const DecimalFieldType*>(valueType)->unit;
+    auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<luxir::api::ColDouble>();
+    double* ids = build::allocArray(bucketIds.v, n, mr);
+    for (size_t i = 0; i < n; i++) ids[i] = (double)buckets[i].first / unit;
+  } else {
+    auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<luxir::api::ColInt>();
+    int64_t* ids = build::allocArray(bucketIds.v, n, mr);
+    for (size_t i = 0; i < n; i++) ids[i] = buckets[i].first;
+  }
+}
+
 template <typename Output = NativeDateOutput>
 inline void emitBuckets(luxir::api::FacetResult& facetResultProto,
                         const std::vector<std::pair<int64_t, int64_t>>& buckets,
@@ -234,14 +261,18 @@ inline void emitBuckets(luxir::api::FacetResult& facetResultProto,
 
 inline void emitBuckets(luxir::api::FacetResult& facetResultProto,
                         const std::vector<std::pair<std::string, int64_t>>& buckets,
-                        std::pmr::memory_resource& mr) {
+                        std::pmr::memory_resource& mr, const FieldType* valueType = nullptr) {
+  bool ipTerms = valueType && valueType->logical == FieldType::Logical::IP;
   auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<luxir::api::ColStr>();
   size_t n = buckets.size();
   std::string_view* ids = build::allocArray(bucketIds.v, n, mr);
   int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
   for (size_t i = 0; i < n; i++) {
     // bucket strings live in the transient countVec; copy into the arena.
-    ids[i] = build::arenaStr(mr, buckets[i].first);
+    std::string_view key = buckets[i].first;
+    char text[ip::TEXT_BUF_SIZE];
+    if (ipTerms && key.size() == ip::BYTES) key = ip::format(key, text);
+    ids[i] = build::arenaStr(mr, key);
     counts[i] = buckets[i].second;
   }
 }
