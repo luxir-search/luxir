@@ -1237,6 +1237,45 @@ TEST_F(KnnQueryTest, booleanProhibitedConstrainsKnnDomain) {
   EXPECT_EQ(run(false, true, false), (Ids{"d7", "d8", "d9"}));
 }
 
+// A prohibited clause that matches everything leaves the kNN no domain: 0
+// hits, not a hang or the unfiltered top-k. One that matches nothing changes
+// nothing.
+TEST_F(KnnQueryTest, booleanProhibitedMatchAllOrNothingWithKnn) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  for (int i = 0; i < 6; i++) {
+    h.index(flatdoc("id", std::format("d{}", i), "state_s", "ok",
+                    "body_v", std::vector<float>{(float)i, 0.0f}));
+  }
+  h.commit({"*"});
+
+  auto run = [&](bool optional, bool matchAll) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.limit(10).countLimit().fields({"id"});
+    auto& mr = cur.mr();
+    std::vector<api::Query> knn{qb::knn(mr, "body_v", {0.0f, 0.0f}, 3)};
+    std::vector<api::Query> none;
+    std::vector<api::Query> prohibited{matchAll
+        ? qb::all()
+        : qb::match(mr, "state_s", "blocked")};
+    cur.rawQuery() = optional
+        ? qb::boolean(mr, none, knn, prohibited, none)
+        : qb::boolean(mr, knn, none, prohibited, none);
+    req->execute();
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->errorMsg();
+    auto ids = resultIds(*req);
+    std::sort(ids.begin(), ids.end());
+    req->done();
+    return ids;
+  };
+  using Ids = std::vector<std::string>;
+  for (bool optional : {false, true}) {
+    EXPECT_TRUE(run(optional, true).empty());
+    EXPECT_EQ(run(optional, false), (Ids{"d0", "d1", "d2"}));
+  }
+}
+
 TEST_F(KnnQueryTest, booleanMinMatchWithRequiredConstrains) {
   CollectionHelper h("main");
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple"), UpdateMessage::COMMIT);
