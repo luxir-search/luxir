@@ -35,6 +35,7 @@
 #include "luxir/util/Signal.h"
 #include "LiveDocsWriter.h"
 #include "VersionRunBuilder.h"
+#include "SummaryCollector.h"
 
 
 namespace luxir {
@@ -60,12 +61,20 @@ public:
 
   // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.
   struct IndexFieldInfo : public SegFieldInfo {
+    // Bounds for the segment summary, fed by the field's writers; index-time
+    // only, never serialized with the field info.
+    FieldSummaryCollector summary;
   };
 
   // The id field's bounds, captured when its dictionary is finalized. Absent
   // when no finalized dictionary was written for it; callers then derive them.
   std::optional<IdRange> idRange;
   std::optional<uint64_t> idDictionaryBlocks;
+
+  // The segment summary: one record per field of the directory, filled in
+  // finish(). The owner writes the sidecar afterwards
+  // (IndexWriter::writeSegmentSummary).
+  SegmentSummaryBuilder summary;
 
 private:
   Directory& directory;
@@ -343,6 +352,9 @@ public:
     // Do this for non-debug mode as well?
     assert(freeFiles.size() == files.size());
     Signal::emit("postingsBeforeCollapse", this);
+    // Every field of the directory, stored-field resources included, gets a
+    // record, so a field without one provably is not in the segment.
+    for (const auto& fi : fieldInfos) summary.add((std::string_view)fi.fieldname, fi, fi.summary);
     std::vector<uint32_t> survivorFileNums = collapseFiles();
     writeFieldIndex();
     writeSegmentInfo(survivorFileNums);
@@ -1841,6 +1853,8 @@ public:
 
   void finalizeField(RangeResult&& result) {
     assert(buildTrie);
+
+    fieldInfo->summary.setTermBounds(result.firstTerm, result.lastTerm, (uint64_t)result.nTerms);
 
     if ((std::string_view)fieldInfo->fieldname == "id") {
       postingsWriter.idDictionaryBlocks = result.nBlocks;

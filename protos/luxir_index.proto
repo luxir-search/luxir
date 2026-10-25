@@ -28,6 +28,43 @@ message IndexInfo {
   repeated AuxIndexInfo aux_indexes = 16;
 }
 
+// One physical field's record in a segment summary sidecar. Bounds are
+// conservative supersets of the values the field holds (deleted documents
+// may be counted); see docs/design/segment-summaries.md for the exact
+// semantics. Fields shared with SegFieldInfo carry its names.
+message FieldSummary {
+  string fieldname = 1;            // physical field name as the segment stores it
+  uint32 type = 2;                 // FieldType::Type ordinal persisted by the segment
+  uint32 summary_flags = 3;        // SegmentSummary::Flags bitset
+  uint64 docs_with_field = 4;
+  uint64 num_values = 5;           // column values; valid with HAS_NUM_VALUES
+  uint64 sum_doc_freq = 6;         // BM25 header totals, indexed fields only
+  uint64 sum_total_term_freq = 7;
+  uint64 n_terms = 8;              // distinct indexed terms
+  sint64 num_min = 9;              // encoded int64 column bounds; valid with HAS_NUMERIC
+  sint64 num_max = 10;
+  sint32 geo_min_lat = 11;         // encoded int32 lat/lon box; valid with HAS_GEO_BOX
+  sint32 geo_max_lat = 12;
+  sint32 geo_min_lon = 13;         // never wraps the antimeridian
+  sint32 geo_max_lon = 14;
+  bytes term_min = 15;             // truncated first term; valid with HAS_TERM_BOUNDS
+  bytes term_max = 16;             // rounded up when truncated, so still an upper bound
+  uint32 flags = 19;               // FieldType flags incl. segment markers (SegFieldInfo.flags)
+  uint32 type_flags = 20;          // interpreted by type (SegFieldInfo.typeFlags)
+}
+
+// The body of a segment summary sidecar, the file of the segment overlay of
+// kind "segment_summary" (SegmentSummary::OVERLAY_KIND). The file header
+// carries the format version.
+message SegmentSummaryInfo {
+  uint64 seg_id = 3;
+  int32 max_doc = 4;
+  // Every field of the segment's directory has a record, stored-field
+  // resources included, so a field without one holds no document.
+  bool complete = 5;
+  repeated FieldSummary fields = 6; // sorted by field name
+}
+
 // Authored schema and field introduction history embedded in the manifest.
 message SchemaInfo {
   bytes source_def = 1; // encoded luxir.SchemaDef

@@ -71,9 +71,38 @@ struct IndexInfo {
   std::span<const AuxIndexInfo> aux_indexes;
 };
 
+struct FieldSummary {
+  std::string_view fieldname;
+  ::hpp_proto::bytes_view term_min;
+  ::hpp_proto::bytes_view term_max;
+  uint64_t docs_with_field = 0;
+  uint64_t num_values = 0;
+  uint64_t sum_doc_freq = 0;
+  uint64_t sum_total_term_freq = 0;
+  uint64_t n_terms = 0;
+  int64_t num_min = 0;
+  int64_t num_max = 0;
+  uint32_t type = 0;
+  uint32_t summary_flags = 0;
+  uint32_t flags = 0;
+  uint32_t type_flags = 0;
+  int32_t geo_min_lat = 0;
+  int32_t geo_max_lat = 0;
+  int32_t geo_min_lon = 0;
+  int32_t geo_max_lon = 0;
+};
+
+struct SegmentSummaryInfo {
+  uint64_t seg_id = 0;
+  std::span<const FieldSummary> fields;
+  int32_t max_doc = 0;
+  bool complete = false;
+};
+
 #define LUXIR_TD(M) static_assert(std::is_trivially_destructible_v<M>);
 LUXIR_TD(IndexInfo) LUXIR_TD(SegmentInfo) LUXIR_TD(AuxIndexInfo)
 LUXIR_TD(SchemaInfo) LUXIR_TD(FileDescriptor)
+LUXIR_TD(FieldSummary) LUXIR_TD(SegmentSummaryInfo)
 #undef LUXIR_TD
 
 #define LUXIR_ENTRY(M)                                                                  \
@@ -86,6 +115,7 @@ LUXIR_TD(SchemaInfo) LUXIR_TD(FileDescriptor)
                   std::string *error = nullptr);
 LUXIR_ENTRY(IndexInfo) LUXIR_ENTRY(SegmentInfo) LUXIR_ENTRY(AuxIndexInfo)
 LUXIR_ENTRY(SchemaInfo) LUXIR_ENTRY(FileDescriptor)
+LUXIR_ENTRY(FieldSummary) LUXIR_ENTRY(SegmentSummaryInfo)
 #undef LUXIR_ENTRY
 
 } // namespace luxir::api

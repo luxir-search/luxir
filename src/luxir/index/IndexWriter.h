@@ -846,6 +846,11 @@ private:
   void activateVectorOverlayNames(std::span<const std::string> names);
   std::vector<std::string> snapshotActiveVectorOverlayNames();
   uint64_t nextSegmentOverlayGen(SegInfo& seg);
+  // Writes the segment summary sidecar `pwriter` collected and registers it
+  // as the segment's "segment_summary" overlay. A failure leaves the segment
+  // without a summary, which proves nothing, and never fails the flush or
+  // merge.
+  void writeSegmentSummary(SegInfo& seg, PostingsWriter& pwriter) noexcept;
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
       PostingsReader& postingsReader,
