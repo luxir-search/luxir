@@ -118,10 +118,14 @@ TEST_F(SourceHttpTest, exportFailsOnAHitWithoutSourceAndWrapsControlLookingOnes)
                             R"({"query":{"all":true},"fields":["_source"],"limit":-1})");
   EXPECT_EQ(400, failed.result_int()) << failed.body();
   EXPECT_NE(std::string::npos, failed.body().find("missing_source")) << failed.body();
-  // Without source=true the document comes back with a null source instead.
-  auto partial = post("/collections/src_export/_search?format=docs",
-                      R"({"query":{"match":{"id":"old"}},"fields":["_source"]})");
-  EXPECT_EQ(R"({"_source":null})" "\n", partial);
+  // Column output keeps the requested key with null; the HTTP rows default
+  // omits it, so the row of the same document has no _source key.
+  auto partial = post("/collections/src_export/_search",
+                      R"({"query":{"match":{"id":"old"}},"fields":["_source"],"document_format":"columns"})");
+  EXPECT_NE(std::string::npos, partial.find(R"("_source":null)")) << partial;
+  auto row = post("/collections/src_export/_search?format=docs",
+                  R"({"query":{"match":{"id":"old"}},"fields":["_source"]})");
+  EXPECT_EQ("{}\n", row);
 
   post("/collections/src_export/_update?commit=true", R"({"delete_ids":["old"]})");
   EXPECT_EQ(R"({"id":"new"})" "\n", exportSources("src_export"));

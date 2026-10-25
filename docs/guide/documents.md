@@ -292,10 +292,12 @@ documents indexed afterwards. The settings are listed under
 [Schema](schema.md#the-_source_-resource-experimental).
 
 Request `"fields": ["_source"]` to get a document back as raw JSON. `_source` is
-never part of the default or wildcard projection, and a document without a
-stored source comes back as `null`. To export the original documents, add
-`?format=docs&source=true`: each line is one stored document, and the output
-pipes straight back into `_update`. The export fails if any hit has no readable
+never part of the default or wildcard projection. A document without a stored
+source comes back as `null` in column output (adaptive and columns placement,
+gRPC's default); in row format (`document_format` `rows`, HTTP's default) its
+row has no `_source` key, like any other missing field. To export the original
+documents, add `?format=docs&source=true`: each line is one stored document,
+and the output pipes straight back into `_update`. The export fails if any hit has no readable
 source, so it never loses documents silently; a stored source that ingest would
 read as a control record (`{}`, or a lone `_name_` object) is emitted wrapped in
 an inline `_update_` so it comes back as a document.

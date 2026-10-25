@@ -858,7 +858,10 @@ inline size_t missingSlotBytes(const luxir::api::Column& col) {
 // Settle one batch's placement after finishPendingCols.  columnFields[i] is
 // the ReturnField behind response column i and columnPresent[i] its slot
 // tracker (null when untracked, see forEachPresent); later columns (_score_)
-// always stay.  ROWS moves every column to docs.  COLUMNS leaves out a
+// always stay.  ROWS moves every column to docs, _source included, so a
+// document without a stored source has no _source key in its row.  Under
+// ADAPTIVE and COLUMNS a requested _source is never dropped or moved: it stays
+// a column and a missing one renders as null.  COLUMNS leaves out a
 // discovered column with no present value; a named one is always present.
 // ADAPTIVE leaves out every column with no present value and moves a column
 // to docs when its missing slots cost more than per-document entries for its
@@ -885,10 +888,11 @@ inline void placeBatchColumns(luxir::api::DocFormat placement,
   size_t changed = 0, numMoved = 0;
   for (size_t i = 0; i < count; i++) {
     const ReturnField& rf = *columnFields[i];
-    if (rf.kind == ReturnField::Kind::SOURCE) {
-      // A requested _source always stays a column, so a missing one renders as null.
-    } else if (placement == luxir::api::DocFormat::ROWS) {
+    if (placement == luxir::api::DocFormat::ROWS) {
       fate[i] = MOVE;
+    } else if (rf.kind == ReturnField::Kind::SOURCE) {
+      // A requested _source stays a column under ADAPTIVE and COLUMNS, so a
+      // missing one renders as null; only ROWS moves it into docs with the rest.
     } else if (placement == luxir::api::DocFormat::ADAPTIVE || rf.discovered) {
       size_t p = 0;
       forEachPresent(arr[i].second, columnPresent[i], [&p](size_t) { p++; });
