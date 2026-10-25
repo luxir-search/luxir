@@ -96,6 +96,8 @@ static bool fieldTypesEqual(const FieldType& lhs, const FieldType& rhs) {
 
 bool LuxirTest::isDefaultSchema(const std::shared_ptr<Schema>& schema) {
   if (schema == nullptr) return false;
+  // A schema that keeps _source is not the default, or the next test inherits it.
+  if (schema->source.enabled) return false;
   static const std::shared_ptr<Schema> defaultSchema = Schema::createDefaultSchema();
   if (schema->fieldTypeMap.size() != defaultSchema->fieldTypeMap.size()) return false;
   for (const auto& [name, defaultField] : defaultSchema->fieldTypeMap) {

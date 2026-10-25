@@ -33,6 +33,8 @@ protected:
     out.write(bytes.data(), bytes.size());
     out.close();
     dir.finishFile(*file);
+    const std::string names[] = {name};
+    dir.sync(names);  // a listed file must be synced before a commit publishes it
     return file->descriptor();
   }
 
@@ -126,6 +128,8 @@ TEST_F(SharedFilesTest, uncommittedSegmentsFileGoesWhenTheyAreMergedAway) {
   iw->mergePolicy->setMergeFactor(100);
   flushSegment(*iw, "a");
   flushSegment(*iw, "b");
+  // Flushes complete in the background; the segments appear once they do.
+  for (int i = 0; i < 300 && iw->segInfos.size() < 2; i++) std::this_thread::sleep_for(std::chrono::milliseconds(10));
   ASSERT_EQ(2u, iw->segInfos.size());
   auto shared = writeFile(iw->dir, "x02");
   attachToAll(*iw, shared);

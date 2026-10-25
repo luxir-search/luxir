@@ -85,6 +85,29 @@ TEST_F(SourceHttpTest, keepsTheBytesOfBufferedNdjsonAndInlineDocs) {
   EXPECT_NE(std::string::npos, compact(schema.body()).find(R"("stored_resources":{"_source_":{}})")) << schema.body();
 }
 
+TEST_F(SourceHttpTest, keepsSpellingAndEscapesOfSmallDocs) {
+  createWithSource("src_spell");
+  // "meta" is mapped away from the index, so only the source keeps it.
+  post("/collections/src_spell/_update?commit=true",
+       R"({"docs":[{"id":"a","x_s":"caf\u00e9 \"q\"","p_i":1.0,"q_i":1e3,"r_i":-0,"meta":{"k":{}}},)"
+       R"({"id":"b","zz_s":"b"},{"id":"d","e_s":[]}],"field_map":{"meta":""}})");
+  EXPECT_EQ(R"({"id":"a","x_s":"caf\u00e9 \"q\"","p_i":1.0,"q_i":1e3,"r_i":-0,"meta":{"k":{}}})" "\n"
+            R"({"id":"b","zz_s":"b"})" "\n"
+            R"({"id":"d","e_s":[]})" "\n", exportSources("src_spell"));
+}
+
+TEST_F(SourceHttpTest, keepsLargeDocsAcrossBlocks) {
+  createWithSource("src_big", R"({"chunk_size_bytes":1024,"max_docs_per_chunk":2})");
+  const std::string big(70000, 'q');
+  post("/collections/src_big/_update?commit=true",
+       R"({"docs":[{"id":"a"},{"id":"c","big_s":")" + big + R"("},{"id":"d"},{"id":"e"}]})");
+  EXPECT_EQ(R"({"id":"a"})" "\n" R"({"id":"c","big_s":")" + big + R"("})" "\n"
+            R"({"id":"d"})" "\n" R"({"id":"e"})" "\n", exportSources("src_big"));
+  auto one = post("/collections/src_big/_search?format=docs",
+                  R"({"query":{"match":{"id":"c"}},"fields":["_source"]})");
+  EXPECT_EQ(R"({"_source":{"id":"c","big_s":")" + big + R"("}})" "\n", one);
+}
+
 TEST_F(SourceHttpTest, exportFailsOnAHitWithoutSourceAndWrapsControlLookingOnes) {
   post("/collections/_create", R"({"name":"src_export"})");
   post("/collections/src_export/_update?commit=true", R"({"docs":[{"id":"old"}]})");

@@ -90,6 +90,8 @@ protected:
     out.write(junk.data(), junk.size());
     out.close();
     dir.finishFile(*file);
+    const std::string names[] = {name};
+    dir.sync(names);  // a listed file must be synced before a commit publishes it
   }
 };
 
@@ -177,7 +179,8 @@ TEST_F(SourceStoreTest, numericIdsAreRecordedCanonically) {
   source::Record record;
   ASSERT_EQ(SourceReader::Status::OK, reader.fetch(0, cursor, record));
   EXPECT_EQ("7", record.id);
-  EXPECT_EQ(R"({"id":7,"n_i":1})", record.body);
+  EXPECT_EQ(source::kFlagProtoMap, record.flags & source::kFlagProtoMap);  // a Map, not JSON text
+  EXPECT_EQ((std::vector<std::string>{R"({"id":7,"n_i":1})"}), sources(helper));
 }
 
 TEST_F(SourceStoreTest, unreadableMapFailsTheMergeAndDamagedFilesAreCarried) {
@@ -267,6 +270,38 @@ TEST_F(SourceStoreTest, requestingSourceWithoutTheStoreIsAnError) {
   EXPECT_EQ("invalid_field", req->errorCode());
 }
 
+TEST_F(SourceStoreTest, overwriteThenMergeKeepsTheLiveDocsSources) {
+  CollectionHelper helper;
+  enableSource(helper);
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "n_i", 1), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "n_i", 5), UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "n_i", 2), UpdateMessage::COMMIT, true).success);  // overwrites a
+  ASSERT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(forceMerge(helper).success);
+  EXPECT_EQ((std::vector<std::string>{R"({"id":"a","n_i":2})"}), sources(helper));
+}
+
+TEST_F(SourceStoreTest, disableThenEnableCapturesOnlyWhileOn) {
+  CollectionHelper helper;
+  enableSource(helper);
+  ASSERT_TRUE(helper.index(flatdoc("id", "a"), UpdateMessage::COMMIT).success);
+  enableSource(helper, [](Resource& r) { r.enabled = false; });
+  ASSERT_TRUE(helper.index(flatdoc("id", "b"), UpdateMessage::COMMIT).success);
+  enableSource(helper);
+  ASSERT_TRUE(helper.index(flatdoc("id", "c"), UpdateMessage::COMMIT).success);
+  EXPECT_EQ((std::vector<std::string>{R"({"id":"a"})", "", R"({"id":"c"})"}), sources(helper));
+}
+
+TEST_F(SourceStoreTest, lz4SourcesSurviveAMerge) {
+  CollectionHelper helper;
+  enableSource(helper, [](Resource& r) { r.codec = Resource::Codec::LZ4; r.min_file_bytes = 0; });
+  const std::string big(5000, 'x');
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "a", "title_t", big)}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "b")}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(forceMerge(helper).success);
+  EXPECT_EQ((std::vector<std::string>{R"({"id":"a","title_t":")" + big + R"("})", R"({"id":"b"})"}), sources(helper));
+}
+
 TEST_F(SourceStoreTest, schemaRejectsMisuse) {
   auto rejects = [](const std::function<void(SchemaBuilder&)>& define) {
     SchemaBuilder b;
@@ -278,6 +313,7 @@ TEST_F(SourceStoreTest, schemaRejectsMisuse) {
   rejects([](SchemaBuilder& b) { b.storedResource("_stored_").enabled = false; });
   rejects([](SchemaBuilder& b) { b.storedResource("_stored_").max_files = 4; });
   rejects([](SchemaBuilder& b) { b.storedResource("_source_").zstd_dictionary = true; });
+  rejects([](SchemaBuilder& b) { b.field("_source_").type = api::FieldDef::FieldClass::TEXT; });
   rejects([](SchemaBuilder& b) { b.storedResource("_source_").max_files = 0; });
   rejects([](SchemaBuilder& b) { b.storedResource("_source_").min_live_ratio = 0.0; });
   rejects([](SchemaBuilder& b) {

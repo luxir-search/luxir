@@ -106,7 +106,8 @@ TEST(SourceFiles, namesAreStrict) {
   EXPECT_TRUE(isSourceFile("t00"));
   EXPECT_TRUE(isSourceMapFile("s00__S01"));
   EXPECT_FALSE(isSourceFile("tmp123"));   // length prefix 'm' does not match the digits
-  EXPECT_FALSE(isSourceFile("v01"));      // a leading zero digit
+  EXPECT_TRUE(isSourceFile("v01"));       // seq 1: length prefix 0, one digit
+  EXPECT_FALSE(isSourceFile("v100"));     // a leading zero digit
   EXPECT_FALSE(isSourceFile("v0"));
   EXPECT_FALSE(isSourceFile("s00_01"));
   EXPECT_FALSE(isSourceFile("version"));
