@@ -885,7 +885,9 @@ inline void placeBatchColumns(luxir::api::DocFormat placement,
   size_t changed = 0, numMoved = 0;
   for (size_t i = 0; i < count; i++) {
     const ReturnField& rf = *columnFields[i];
-    if (placement == luxir::api::DocFormat::ROWS) {
+    if (rf.kind == ReturnField::Kind::SOURCE) {
+      // A requested _source always stays a column, so a missing one renders as null.
+    } else if (placement == luxir::api::DocFormat::ROWS) {
       fate[i] = MOVE;
     } else if (placement == luxir::api::DocFormat::ADAPTIVE || rf.discovered) {
       size_t p = 0;
