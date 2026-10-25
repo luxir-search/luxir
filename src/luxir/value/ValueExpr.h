@@ -153,7 +153,6 @@ class BoundValueProgram {
 public:
   const ValueProgram& program;
   IndexReader::Segment& segment;
-  PostingsReader& postings;
   std::span<BoundValueNode> nodes;
 
   BoundValueProgram(MemPool& pool, const ValueProgram& program,

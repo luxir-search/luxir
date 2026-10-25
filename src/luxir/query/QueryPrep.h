@@ -1433,8 +1433,7 @@ inline DomainHandle materializeEffectiveFilter(
 
   if (use->scope() == FilterKeyScope::READER_STABLE) {
     if (auto* cached = dynamic_cast<ReaderStablePreparedWeight*>(prepared)) {
-      DocSet* canonical = segment.liveDocs() == nullptr
-          ? nullptr : &segment.liveDocs()->docset();
+      DocSet* canonical = segment.liveDocSet();
       assert(domain == nullptr || domain == canonical);
       return DomainHandle::borrowed(cached->docSet(segment));
     }
@@ -1539,7 +1538,7 @@ inline DomainHandle materializeEffectiveExclusion(
     std::span<const PreparedSource> sources, IndexReader& reader,
     IndexReader::Segment& segment, DomainHandle domain) {
   DocSet* base = domain.get();
-  assert(base != nullptr || segment.liveDocs() == nullptr);
+  assert(base != nullptr || !segment.hasDeletes());
   std::vector<DomainHandle> excluded;
   std::vector<DocSet*> ptrs;
   excluded.reserve(sources.size());

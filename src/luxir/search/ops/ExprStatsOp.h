@@ -60,12 +60,11 @@ class ExprStatsOp : public SearchOp {
     }
     auto infos = fields[aggregate.leaves.front().producer].values[producer.input->rootNode];
     for (auto& segment : req.reader->segments()) {
-      auto& postings = segment.postingsReader();
-      if (postings.maxDoc() == 0) continue;
+      if (segment.maxDoc() == 0) continue;
       auto* field = infos.at((size_t)segment.ord);
       if (!field) return nullptr;
       const auto& info = *field;
-      if (info.docsWithField != postings.maxDoc()) return nullptr;
+      if (info.docsWithField != segment.maxDoc()) return nullptr;
     }
     return producer.resolved.denseFacetState;
   }
@@ -316,7 +315,7 @@ public:
           std::vector<BoundAggregateInput> bindings = bindAggregateInputs(
               thisOp().aggregate, pool, segment, thisOp().fields);
 
-          int32_t maxDoc = segment.postingsReader().maxDoc();
+          int32_t maxDoc = segment.maxDoc();
           for (BoundAggregateInput& binding : bindings) {
             if (binding.columnScan
                 && !(disableOrdinalAggregateBatchesForTests
@@ -704,13 +703,12 @@ public:
       static constexpr size_t BATCH_SIZE = 256;
       auto poolGuard = MemPool::threadLocalPoolGuard();
       auto& segment = child.req.reader->segments()[(size_t)segnum];
-      auto& postings = segment.postingsReader();
-      int32_t maxDoc = postings.maxDoc();
+      int32_t maxDoc = segment.maxDoc();
 
       auto* info = source.segInfos.at((size_t)segnum);
       if (!info) return;
       const auto& parentInfo = *info;
-      OrdColReader parentColumn(postings, parentInfo);
+      OrdColReader parentColumn(segment.postingsReader(), parentInfo);
       auto mapping = source.ordMap.getSegToGlobal(segnum);
       StrFacetSelectedOrdMap selected(mapping, selectedBuckets);
 

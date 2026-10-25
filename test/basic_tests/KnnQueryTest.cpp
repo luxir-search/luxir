@@ -3466,7 +3466,7 @@ TEST_F(KnnQueryTest, filteredFlatWalkMatchesCosineOracle) {
           expected.emplace_back(best, doc);
         }
         VectorReader vr(seg.postingsReader(), *reader->field(field).at(0));
-        auto unfiltered = KnnQuery::countEligible(vr, seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr, seg.liveDocs(), seg.maxDoc());
+        auto unfiltered = KnnQuery::countEligible(vr, seg.liveDocSet(), seg.liveDocs(), seg.maxDoc());
         EXPECT_TRUE(unfiltered.unfiltered);
         int64_t liveDocs = 0, liveVectors = 0;
         for (int doc = 0; doc < 1600; doc++) {
@@ -4377,7 +4377,7 @@ TEST_F(KnnQueryTest, exactWorkPredictionMatchesExecution) {
           members.push_back(i); bitmap.mutableBits().set(i);
         }
         ArrDocSet array(std::move(members));
-        DocSet* domain = domainKind == 0 ? (seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr)
+        DocSet* domain = domainKind == 0 ? seg.liveDocSet()
             : domainKind == 1 ? (DocSet*)&array : &bitmap;
         KnnQuery::Stats stats;
         KnnQuery::statsForTests = &stats;

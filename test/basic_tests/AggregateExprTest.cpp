@@ -77,7 +77,7 @@ BucketScalar evaluate(AggregateProgram& program, IndexReader& reader, IndexReade
   AggregateAccumulator accumulator(program);
   std::vector<BoundAggregateInput> bindings =
       bindAggregateInputs(program, pool, segment, resolveAggregateFields(program, pool, reader));
-  int32_t maxDoc = segment.postingsReader().maxDoc();
+  int32_t maxDoc = segment.maxDoc();
   for (int32_t doc = 0; doc < maxDoc; doc++) {
     for (size_t producer = 0; producer < bindings.size(); producer++) {
       accumulator.add((uint32_t)producer, bindings[producer].evalPoint(doc));

@@ -2270,7 +2270,7 @@ public:
             return {BulkAnswer::YES, BulkAnswer::NO, BulkAnswer::NO,
                     BulkAnswer::NO, nullptr, shortcut.maxMatches};
           }
-          if (segment.liveDocs() != nullptr) {
+          if (segment.hasDeletes()) {
             return {
               BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
               BulkAnswer::NO,

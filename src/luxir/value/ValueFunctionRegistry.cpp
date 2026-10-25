@@ -2008,7 +2008,7 @@ BoundValueProgram* ValueProgram::bind(MemPool& pool,
 
 BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
                                      IndexReader::Segment& segment, ValueFieldInfos fields)
-    : program(program), segment(segment), postings(segment.postingsReader()),
+    : program(program), segment(segment),
       nodes(pool.make_span<BoundValueNode>(program.nodes.size())) {
   for (uint32_t index = 0; index < program.nodes.size(); index++) {
     const ValueNode& node = program.nodes[index];
@@ -2018,7 +2018,7 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
     } else if (node.kind == ValueNodeKind::SCORE) {
       bound.bounds = ValueBounds::unbounded(ValueType::DOUBLE);
     } else if (node.kind == ValueNodeKind::DOCID) {
-      int32_t maxDoc = postings.maxDoc();
+      int32_t maxDoc = segment.maxDoc();
       bound.bounds = maxDoc == 0 ? ValueBounds::unbounded(ValueType::INT64, true, true)
                                 : ValueBounds::integer(segment.base,
                                                        segment.base + maxDoc - 1);
@@ -2027,14 +2027,14 @@ BoundValueProgram::BoundValueProgram(MemPool& pool, const ValueProgram& program,
       if (!fieldInfo) {
         bound.bounds = ValueBounds::unbounded(node.type, true, true);
       } else if (node.type == ValueType::COLUMN_ONLY) {
-        bound.stringColumn = pool.make<BoundStringColumn>(postings, *fieldInfo);
+        bound.stringColumn = pool.make<BoundStringColumn>(segment.postingsReader(), *fieldInfo);
         bound.bounds = ValueBounds::unbounded(node.type,
-            fieldInfo->docsWithField < postings.maxDoc());
+            fieldInfo->docsWithField < segment.maxDoc());
       } else {
-        bound.column.emplace(postings, *fieldInfo);
+        bound.column.emplace(segment.postingsReader(), *fieldInfo);
         bound.iterator.emplace(*bound.column);
         bound.bulkIterator.emplace(*bound.column);
-        bool missing = bound.column->docsWithValue() < postings.maxDoc();
+        bool missing = bound.column->docsWithValue() < segment.maxDoc();
         auto encoded = bound.column->encodedBounds();
         if (!encoded.hasValues) {
           bound.bounds = ValueBounds::unbounded(node.type, true, true);

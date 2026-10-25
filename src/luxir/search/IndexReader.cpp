@@ -332,7 +332,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
         segs.emplace_back(std::move(postingsReader), std::move(liveDocs),
                           std::move(segmentAuxReaders), segmentInfo, totalMaxDoc, i);
-        totalMaxDoc += segs.back().postingsReader().maxDoc();
+        totalMaxDoc += segs.back().maxDoc();
         livedocs += segs.back().numLive();
         assert(nDocs == segs.back().postingsReader().maxDoc());
       }
@@ -506,17 +506,18 @@ std::string_view IndexReader::FieldSegments::name() const noexcept {
 int32_t IndexReader::FieldSegments::ordinalAt(size_t segment) const {
   assert(record);
   assert(segment < record->numSegments);
-  auto& postings = segments[segment].postingsReader();
   int32_t ordinal = record->ordinals[segment].load(std::memory_order_relaxed);
   if (ordinal == FieldRecord::UNRESOLVED) {
-    ordinal = postings.findOrdinal(record->name);
+    ordinal = segments[segment].postingsReader().findOrdinal(record->name);
     record->ordinals[segment].store(ordinal, std::memory_order_relaxed);
   }
   return ordinal;
 }
 
 const PostingsReader::Field* IndexReader::FieldSegments::at(size_t segment) const {
-  return record ? segments[segment].postingsReader().fieldInfo(ordinalAt(segment)) : nullptr;
+  if (!record) return nullptr;
+  int32_t ordinal = ordinalAt(segment);
+  return ordinal < 0 ? nullptr : segments[segment].postingsReader().fieldInfo(ordinal);
 }
 
 bool IndexReader::FieldSegments::exists() const noexcept {

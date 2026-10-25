@@ -506,8 +506,7 @@ std::vector<DocSet*> canonicalDomains(IndexReader& reader) {
   std::vector<DocSet*> result;
   result.reserve(reader.segments().size());
   for (auto& segment : reader.segments()) {
-    result.push_back(segment.liveDocs() == nullptr
-        ? nullptr : &segment.liveDocs()->docset());
+    result.push_back(segment.liveDocSet());
   }
   return result;
 }
@@ -5423,8 +5422,7 @@ TEST(FilterCacheIntegrationTest, fuzzyBoostsShareWholeCountEntry) {
         *weight, use, context.filterUses);
     int64_t result = 0;
     for (auto& segment : reader->segments()) {
-      DocSet* domain = segment.liveDocs() == nullptr
-          ? nullptr : &segment.liveDocs()->docset();
+      DocSet* domain = segment.liveDocSet();
       auto resolved = test::resolveWholeMembershipForTests(plan, *reader, segment, domain);
       EXPECT_TRUE(resolved.available);
       result += resolved.count;

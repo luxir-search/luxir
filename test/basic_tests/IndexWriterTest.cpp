@@ -1650,7 +1650,7 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
       EXPECT_EQ(segment.numLive(), segInfo.live_docs);
       
       // Verify delete bitmap functionality
-      int32_t numDocs = segment.postingsReader().maxDoc();
+      int32_t numDocs = segment.maxDoc();
       int32_t deletedCount = 0;
       
       auto* liveDocs = segment.liveDocs();

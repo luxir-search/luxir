@@ -121,7 +121,7 @@ TEST_F(AutoFlushTest, accumulationAcrossMessagesFlushesAtBoundaries) {
       << "per-message flush should bound accumulation into multiple segments";
 
   int64_t totalDocs = 0;
-  for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+  for (const auto& seg : reader->segments()) totalDocs += seg.maxDoc();
   EXPECT_EQ(totalDocs, nDocs);
 
   auto req = localReq(helper.getSearchEngine());
@@ -358,7 +358,7 @@ TEST_F(AutoFlushTest, overBudgetReleaseFlushesIdleInverter) {
       << "an over-budget release should flush an idle inverter into its own segment";
 
   int64_t totalDocs = 0;
-  for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+  for (const auto& seg : reader->segments()) totalDocs += seg.maxDoc();
   EXPECT_EQ(totalDocs, nDocs);
 
   auto req = localReq(helper.getSearchEngine());
@@ -475,7 +475,7 @@ TEST(PressureShedDirectTest, concurrentShedsWithInFlightDiscount) {
     auto reader = iw.snapshots.readers.getReader();
     EXPECT_EQ(reader->segments().size(), 3u);  // A shed, B shed, C at commit
     int64_t totalDocs = 0;
-    for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+    for (const auto& seg : reader->segments()) totalDocs += seg.maxDoc();
     EXPECT_EQ(totalDocs, 61);
   }
 }

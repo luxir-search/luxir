@@ -670,8 +670,7 @@ public:
       int64_t totalDomainSize = 0;
       inlineExpectedValues = inlineOps.empty() ? -1 : 0;
       for (size_t segnum = 0; segnum < domains.size(); segnum++) {
-        auto& postings = thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postings.maxDoc();
+        int32_t maxDoc = thisOp().reader.segments()[segnum].maxDoc();
         int64_t domainSize = domains[segnum].get() != nullptr
             ? domains[segnum].get()->card() : maxDoc;
         if (domainSize > std::numeric_limits<int64_t>::max()
@@ -782,8 +781,8 @@ public:
                ExecutionProfilePieceState* profile) {
       inlineDriver.contribute([&](MergeableFieldFacetInline& data) {
         InlineSegmentScope inlineScope(data.inlineCalcs, segnum);
-        PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postingsReader.maxDoc();
+        auto& segment = thisOp().reader.segments()[segnum];
+        int32_t maxDoc = segment.maxDoc();
         if (profile != nullptr) {
           profile->wire.max_doc = maxDoc;
           profile->wire.domain_size = domain ? domain->card() : maxDoc;
@@ -824,7 +823,7 @@ public:
           // Each decoded ord batch goes to the calculators whole: they read
           // their columns for its docs and fold the values into the ords'
           // entries in one call.
-          OrdColReader ordColReader(postingsReader, *segFieldInfo);
+          OrdColReader ordColReader(segment.postingsReader(), *segFieldInfo);
           OrdValueBatches values(domain, ordColReader, mapping, maxDoc,
                                  false, nullptr);
           OrdValueBatches::Batch batch;
@@ -865,8 +864,8 @@ public:
                       ExecutionProfilePieceState* profile,
                       bool allowTopTerms) {
         //write only to different slots, so no need to synchronize
-        auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postingsReader.maxDoc();
+        auto& segment = thisOp().reader.segments()[segnum];
+        int32_t maxDoc = segment.maxDoc();
         int32_t domainSize = domain ? domain->card() : maxDoc;
         if (profile != nullptr) {
           profile->wire.max_doc = maxDoc;
@@ -884,6 +883,7 @@ public:
           }
           return; // field not found, but still a contribution (driver releases)
         }
+        auto& postingsReader = segment.postingsReader();
         const auto& segFieldInfo = *info;
 
         int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
@@ -1641,9 +1641,8 @@ public:
       auto selected = StrFacetSelectedOrdMap::selectedBuckets(buckets);
 
       for (size_t segnum = 0; segnum < numSegments; segnum++) {
-        auto& postingsReader =
-            thisOp().reader.segments()[segnum].postingsReader();
-        int32_t maxDoc = postingsReader.maxDoc();
+        auto& segment = thisOp().reader.segments()[segnum];
+        int32_t maxDoc = segment.maxDoc();
         auto poolGuard = MemPool::threadLocalPoolGuard();
         // Reserved up front: DocSetBuilder holds a pointer into its own
         // optional bitset, so it must never be reallocated once built into.
@@ -1653,7 +1652,7 @@ public:
 
         if (auto* info = thisOp().fieldInfo((int32_t)segnum)) {
           const auto& segFieldInfo = *info;
-          OrdColReader ordColReader(postingsReader, segFieldInfo);
+          OrdColReader ordColReader(segment.postingsReader(), segFieldInfo);
           auto mapping = thisOp().ordMap->getSegToGlobal((int32_t)segnum);
           StrFacetSelectedOrdMap selectedMap(mapping, selected);
           int64_t missing_num = 0;
@@ -1691,7 +1690,7 @@ public:
       BucketDomainCost cost;
       for (size_t segnum = 0; segnum < input.size(); segnum++) {
         int32_t segmentMax =
-            thisOp().reader.segments()[segnum].postingsReader().maxDoc();
+            thisOp().reader.segments()[segnum].maxDoc();
         cost.maxDocs += segmentMax;
         DocSet* domain = input[segnum].get();
         cost.domainDocs += domain != nullptr ? domain->card() : segmentMax;
@@ -1989,9 +1988,8 @@ public:
     void replaySegment(Bank& bank,
                        std::vector<int64_t>& missingCounts,
                        int32_t segnum) {
-      auto& postingsReader =
-          child.reader.segments()[(size_t)segnum].postingsReader();
-      int32_t maxDoc = postingsReader.maxDoc();
+      auto& segment = child.reader.segments()[(size_t)segnum];
+      int32_t maxDoc = segment.maxDoc();
       auto profile = parent.profilePiece(
           TrackProfile ? profileRun : nullptr, segnum);
       int64_t routedDocs = 0;
@@ -1999,21 +1997,10 @@ public:
 
       auto* parentInfo = source.segInfos.at((size_t)segnum);
       if (!parentInfo) return;
-      const auto& parentFieldInfo = *parentInfo;
-      OrdColReader parentColumn(postingsReader, parentFieldInfo);
-      auto parentMapping = source.ordMap.getSegToGlobal(segnum);
-      StrFacetSelectedOrdMap selected(parentMapping, selectedBuckets);
-
       auto* childFieldInfo = child.fieldInfo(segnum);
       bool childFieldFound = childFieldInfo != nullptr;
       std::optional<OrdColReader> childColumn;
       std::optional<OrdColReader::Iterator> childIterator;
-      auto childMapping = child.ordMap->getSegToGlobal(segnum);
-      if (childFieldFound) {
-        childColumn.emplace(postingsReader, *childFieldInfo);
-        childIterator.emplace(*childColumn);
-      }
-
       if (!childFieldFound && !child.missing) {
         if constexpr (TrackProfile) {
           if (auto* piece = profile.get()) {
@@ -2022,6 +2009,17 @@ public:
           }
         }
         return;
+      }
+
+      auto& postingsReader = segment.postingsReader();
+      const auto& parentFieldInfo = *parentInfo;
+      OrdColReader parentColumn(postingsReader, parentFieldInfo);
+      auto parentMapping = source.ordMap.getSegToGlobal(segnum);
+      StrFacetSelectedOrdMap selected(parentMapping, selectedBuckets);
+      auto childMapping = child.ordMap->getSegToGlobal(segnum);
+      if (childFieldFound) {
+        childColumn.emplace(postingsReader, *childFieldInfo);
+        childIterator.emplace(*childColumn);
       }
 
       selected.visit([&](const auto& selectedMap) {
@@ -2078,9 +2076,7 @@ public:
       }
       __int128 childValues = 0;
       for (size_t segnum = 0; segnum < source.domains.size(); segnum++) {
-        auto& postingsReader =
-            child.reader.segments()[segnum].postingsReader();
-        int32_t segmentMax = postingsReader.maxDoc();
+        int32_t segmentMax = child.reader.segments()[segnum].maxDoc();
         maxDocs += segmentMax;
         DocSet* domain = source.domains[segnum].get();
         domainDocs += domain != nullptr ? domain->card() : segmentMax;

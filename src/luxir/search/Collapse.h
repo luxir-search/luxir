@@ -158,11 +158,12 @@ public:
     columns.clear();
     columns.resize(plan.fields.size());
     scratch.components.resize(plan.fields.size());
-    auto& postings = plan.reader.segments()[(size_t)segment].postingsReader();
+    auto& seg = plan.reader.segments()[(size_t)segment];
     for (size_t i = 0; i < columns.size(); i++) {
       auto* info = plan.fields[i].segments.at((size_t)segment);
       if (!info) continue;
-      columns[i].dense = info->docsWithField == postings.maxDoc();
+      auto& postings = seg.postingsReader();
+      columns[i].dense = info->docsWithField == seg.maxDoc();
       if (plan.fields[i].ordinal()) {
         columns[i].ords.emplace(postings, *info);
         columns[i].mapping = plan.fields[i].ords->getSegToGlobal(segment);
