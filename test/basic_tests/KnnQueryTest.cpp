@@ -1181,6 +1181,62 @@ TEST_F(KnnQueryTest, booleanFilterOnlyAppliesProhibited) {
   req->done();
 }
 
+// must_not is a pre-filter for kNN like filter is: excluding the nearest
+// neighbors must still return k hits, for a required or optional kNN, with or
+// without filters and deletes, and through a nested boolean.
+TEST_F(KnnQueryTest, booleanProhibitedConstrainsKnnDomain) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorMetric::L2);
+  for (int i = 0; i < 12; i++) {
+    h.index(flatdoc("id", std::format("d{}", i),
+                    "state_s", i < 5 ? "blocked" : "ok",
+                    "foo_w", i == 6 ? "orange" : "apple",
+                    "body_v", std::vector<float>{(float)i, 0.0f}));
+  }
+  h.commit({"*"});
+
+  auto run = [&](bool optional, bool filtered, bool nested) {
+    auto* req = LocalReq::create(luxirNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.limit(10).countLimit().fields({"id"});
+    auto& mr = cur.mr();
+    std::vector<api::Query> knn{qb::knn(mr, "body_v", {0.0f, 0.0f}, 3)};
+    std::vector<api::Query> blocked{qb::match(mr, "state_s", "blocked")};
+    std::vector<api::Query> none, filter;
+    if (filtered) filter.push_back(qb::match(mr, "foo_w", "apple"));
+    std::vector<api::Query> q{optional
+        ? qb::boolean(mr, none, knn, blocked, filter)
+        : qb::boolean(mr, knn, none, blocked, filter)};
+    cur.rawQuery() = nested ? qb::boolean(mr, std::span<const api::Query>(q)) : q[0];
+    req->execute();
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->errorMsg();
+    auto ids = resultIds(*req);
+    std::sort(ids.begin(), ids.end());
+    req->done();
+    return ids;
+  };
+  using Ids = std::vector<std::string>;
+  for (bool optional : {false, true}) {
+    for (bool nested : {false, true}) {
+      EXPECT_EQ(run(optional, false, nested), (Ids{"d5", "d6", "d7"}));
+      // Beside a filter an optional clause only scores (min_match 0).
+      EXPECT_EQ(run(optional, true, nested), optional
+          ? (Ids{"d10", "d11", "d5", "d7", "d8", "d9"}) : (Ids{"d5", "d7", "d8"}));
+    }
+  }
+
+  {
+    // Without the fold, must_not post-filters the kNN top-k.
+    SearchOverridesGuard fold(QueryPrep::disableProhibitedDomainFoldForTests);
+    QueryPrep::disableProhibitedDomainFoldForTests = true;
+    EXPECT_TRUE(run(false, false, false).empty());
+  }
+
+  h.deleteById("d5", UpdateMessage::COMMIT);
+  EXPECT_EQ(run(false, false, false), (Ids{"d6", "d7", "d8"}));
+  EXPECT_EQ(run(false, true, false), (Ids{"d7", "d8", "d9"}));
+}
+
 TEST_F(KnnQueryTest, booleanMinMatchWithRequiredConstrains) {
   CollectionHelper h("main");
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple"), UpdateMessage::COMMIT);
