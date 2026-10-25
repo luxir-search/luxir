@@ -156,7 +156,7 @@ inline bool directCountAvailable(const Query& query, IndexReader& reader) {
       return std::none_of(
           reader.segments().begin(), reader.segments().end(),
           [](const IndexReader::Segment& segment) {
-            return segment.liveDocs() != nullptr;
+            return segment.hasDeletes();
           });
     case QueryKind::BOOLEAN:
       return static_cast<const BooleanQuery&>(query)

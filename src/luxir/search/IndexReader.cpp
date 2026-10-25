@@ -330,7 +330,7 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
 
         segs.emplace_back(std::move(postingsReader), std::move(liveDocs),
                           std::move(segmentAuxReaders), segmentInfo, totalMaxDoc, i);
-        totalMaxDoc += segs.back().postingsReader().maxDoc();
+        totalMaxDoc += segs.back().maxDoc();
         livedocs += segs.back().numLive();
         assert(nDocs == segs.back().postingsReader().maxDoc());
       }

@@ -281,7 +281,7 @@ public:
       BulkPlan planBulk(
           BulkUse use, const BulkScorerContext& bulkContext) override {
         if (bulkContext.requireConstantCount) {
-          if (segment.liveDocs() != nullptr) {
+          if (segment.hasDeletes()) {
             return {
               BulkAnswer::NO, BulkAnswer::NO, BulkAnswer::NO,
               BulkAnswer::NO,

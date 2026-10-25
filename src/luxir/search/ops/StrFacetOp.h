@@ -1532,7 +1532,7 @@ public:
       BucketDomainCost cost;
       for (size_t segnum = 0; segnum < input.size(); segnum++) {
         int32_t segmentMax =
-            thisOp().reader.segments()[segnum].postingsReader().maxDoc();
+            thisOp().reader.segments()[segnum].maxDoc();
         cost.maxDocs += segmentMax;
         DocSet* domain = input[segnum].get();
         cost.domainDocs += domain != nullptr ? domain->card() : segmentMax;

@@ -304,7 +304,7 @@ public:
           std::vector<BoundAggregateInput> bindings = bindAggregateInputs(
               thisOp().aggregate, pool, segment, thisOp().fields);
 
-          int32_t maxDoc = segment.postingsReader().maxDoc();
+          int32_t maxDoc = segment.maxDoc();
           for (BoundAggregateInput& binding : bindings) {
             if (binding.columnScan) {
               accumulateColumn(

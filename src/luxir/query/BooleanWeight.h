@@ -11133,7 +11133,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
 
       if (!needsScores && !disableDisjunctionCountIdentityForTests) {
-        if (segment.liveDocs() != nullptr) {
+        if (segment.hasDeletes()) {
           state->identityFallback =
               DisjunctionIdentityFallback::DELETES;
         } else {
