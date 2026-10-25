@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <chrono>
+#include <functional>
 #include <stdexcept>
 
 #include "SourceWriter.h"
@@ -103,6 +104,16 @@ private:
       double ratio = use.ref.docs == 0 ? 0.0 : (double)use.live / (double)use.ref.docs;
       use.relocate = ratio < settings.minLiveRatio || use.ref.bytes < settings.minFileBytes ||
                      (double)use.ref.bytes < share;
+    }
+    // The cap: at most maxFiles referenced files survive, the largest ones.  Files
+    // at exactly one share each would otherwise all survive.
+    std::vector<size_t> kept;
+    for (size_t f = 0; f < files.size(); f++) {
+      if (files[f].live > 0 && !files[f].relocate) kept.push_back(f);
+    }
+    if (kept.size() > settings.maxFiles) {
+      std::ranges::sort(kept, std::greater<>{}, [&](size_t f) { return files[f].ref.bytes; });
+      for (size_t k = settings.maxFiles; k < kept.size(); k++) files[kept[k]].relocate = true;
     }
     // A file the relocation cannot read stays referenced as it is: the merge
     // then loses nothing that was not already lost.

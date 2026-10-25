@@ -77,7 +77,7 @@ TEST(SourceMergeTest, referencesLiveFilesAndRelocatesMostlyDeletedOnes) {
   EXPECT_EQ(4, result.map.runs[0].count);
   EXPECT_EQ(4, result.map.runs[1].docStart);
   EXPECT_EQ(1, result.map.runs[1].count);
-  EXPECT_EQ(1u, result.map.runs[1].ordinal);  // v2's second record
+  EXPECT_EQ(0u, result.map.runs[1].ordinal);  // first record of the output file
   EXPECT_EQ(1u, relocation.copied["v2"]);
   EXPECT_EQ(0u, relocation.copied.count("v1"));
   ASSERT_TRUE(result.written.has_value());
@@ -129,6 +129,17 @@ TEST(SourceMergeTest, maxFilesRelocatesTheSmallShare) {
   for (const auto& ref : result.map.files) names.push_back(ref.name);
   EXPECT_EQ((std::vector<std::string>{"v1", "v2", "vout"}), names);
   EXPECT_EQ(2u, relocation.copied["v3"]);
+}
+
+TEST(SourceMergeTest, referencedFilesStayWithinMaxFiles) {
+  // Four files, each half live (at the ratio floor) and each exactly one share of the live bytes.
+  auto a = mapOf({"v1", 2, 100}, 2), b = mapOf({"v2", 2, 100}, 2);
+  auto c = mapOf({"v3", 2, 100}, 2), d = mapOf({"v4", 2, 100}, 2);
+  const SourceMap* inputs[] = {&a, &b, &c, &d};
+  CountingRelocation relocation;
+  auto result = mergeSources(settings(0.5, 0, 2), inputs, sequential({{0, -1}, {1, -1}, {2, -1}, {3, -1}}), relocation);
+  EXPECT_EQ(3u, result.map.files.size());  // two referenced files and the one written
+  EXPECT_EQ(2u, relocation.copied.size());
 }
 
 TEST(SourceMergeTest, minFileBytesFoldsSmallFilesEvenWhenLive) {
