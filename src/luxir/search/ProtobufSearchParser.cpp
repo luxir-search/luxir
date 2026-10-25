@@ -700,6 +700,13 @@ public:
       // DATE stores native ticks in the int column; it terms-facets exactly
       // like INT (distinct values). Date-histogram bucketing is a range
       // facet, not a terms facet.
+      case FieldType::Type::FLOAT:
+      case FieldType::Type::DOUBLE:
+        if (facetReq.selected.has_value()) {
+          throw std::runtime_error("facet '" + std::string(facetName)
+              + "': selected is not supported for floating-point field facets");
+        }
+        [[fallthrough]];
       case FieldType::Type::DATE:
       case FieldType::Type::INT: {
         if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {

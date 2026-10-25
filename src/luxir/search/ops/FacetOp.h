@@ -81,16 +81,44 @@ public:
   std::string_view facetName;
   IndexReader::FieldSegments segInfos;
   ValueNature outputNature = ValueNature::NUMBER;
+  FieldType::Type floatingType = FieldType::Type::INT;  // FLOAT/DOUBLE when decoding bucket ids
 
   template <typename Label>
   void emitFieldBuckets(api::FacetResult& result,
                         const std::vector<std::pair<Label, int64_t>>& buckets,
                         std::pmr::memory_resource& mr) const {
     if constexpr (std::is_same_v<Label, int64_t>) {
+      // Floating columns store order-preserving integers; decode for output.
+      if (floatingType != FieldType::Type::INT) {
+        emitFloatingBuckets(result, buckets, mr);
+        return;
+      }
       withDateOutput(outputNature, flags, mr, [this] { return fieldName; }, [&](auto output) {
         emitBuckets(result, buckets, mr, output);
       });
     } else emitBuckets(result, buckets, mr);
+  }
+
+  template <typename Label>
+  void emitFloatingBuckets(api::FacetResult& result,
+                           const std::vector<std::pair<Label, int64_t>>& buckets,
+                           std::pmr::memory_resource& mr) const {
+    size_t n = buckets.size();
+    int64_t* counts = build::allocArray(result.counts, n, mr);
+    auto& kind = result.bucket_ids.emplace().kind;
+    if (floatingType == FieldType::Type::FLOAT) {
+      auto* ids = build::allocArray(kind.template emplace<api::ColFloat>().v, n, mr);
+      for (size_t i = 0; i < n; i++) {
+        ids[i] = sortableInt32ToFloat((int32_t)buckets[i].first);
+        counts[i] = buckets[i].second;
+      }
+    } else {
+      auto* ids = build::allocArray(kind.template emplace<api::ColDouble>().v, n, mr);
+      for (size_t i = 0; i < n; i++) {
+        ids[i] = sortableInt64ToDouble(buckets[i].first);
+        counts[i] = buckets[i].second;
+      }
+    }
   }
 
   const SegFieldInfo* fieldInfo(int32_t segnum) const {
@@ -105,6 +133,8 @@ public:
       auto& type = *req.schema->getFieldTypeEx(fieldName);
       if (type.type() == FieldType::DATE) {
         outputNature = dateValueNature(DateFieldType::unitOf(type));
+      } else if (type.type() == FieldType::FLOAT || type.type() == FieldType::DOUBLE) {
+        floatingType = type.type();
       }
     }
   }

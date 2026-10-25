@@ -219,3 +219,35 @@ TEST_F(FloatFieldTest, avg) {
   ASSERT_DOUBLE_EQ(3.0, req->scalar<double>("avgf"));
   ASSERT_DOUBLE_EQ(2.0, req->scalar<double>("avgd"));
 }
+
+// Facet buckets on float and double fields count documents per decoded value.
+TEST_F(FloatFieldTest, facetCountsOnFloatingFields) {
+  CollectionHelper helper;
+
+  helper.index(flatdoc("id_s", "a", "price_f", 1.5f, "weight_d", -1.5), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "b", "price_f", 1.5f, "weight_d", 2.5), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id_s", "c", "price_f", 6.0f, "weight_d", 2.5), UpdateMessage::COMMIT);
+
+  auto req = localReq(luxirNode->getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().limit(10);
+  req->facet("ff", "price_f").limit(-1);
+  req->facet("fd", "weight_d").limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+
+  const auto* ff = req->responses[0]->proto.ops.at("ff")->facetResult();
+  ASSERT_NE(ff, nullptr);
+  auto& fids = std::get<luxir::api::ColFloat>(ff->bucket_ids->kind);
+  ASSERT_EQ(2u, fids.v.size());
+  ASSERT_FLOAT_EQ(1.5f, fids.v[0]);
+  ASSERT_FLOAT_EQ(6.0f, fids.v[1]);
+  ASSERT_EQ((std::vector<int64_t>{2, 1}), std::vector<int64_t>(ff->counts.begin(), ff->counts.end()));
+
+  const auto* fd = req->responses[0]->proto.ops.at("fd")->facetResult();
+  ASSERT_NE(fd, nullptr);
+  auto& dids = std::get<luxir::api::ColDouble>(fd->bucket_ids->kind);
+  ASSERT_EQ(2u, dids.v.size());
+  ASSERT_DOUBLE_EQ(2.5, dids.v[0]);
+  ASSERT_DOUBLE_EQ(-1.5, dids.v[1]);
+  ASSERT_EQ((std::vector<int64_t>{2, 1}), std::vector<int64_t>(fd->counts.begin(), fd->counts.end()));
+}
