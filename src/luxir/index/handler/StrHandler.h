@@ -162,6 +162,7 @@ public:
     PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
+    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
 
     // Postings are keyed by field-rank, so the ord collector is sized to docsWithField
     // (not maxDoc).  For a full field rank == docid, so we skip the rank->docid table

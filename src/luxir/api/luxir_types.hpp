@@ -127,6 +127,7 @@ enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR =
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2, ADAPTIVE = 3 };
+enum class RequestFlagBit { DATE_MODE_LOW_BIT = 0, DATE_MODE_HIGH_BIT = 1, INT64_STR_BIT = 2 };
 enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 enum class SelectionMode { ANY = 0, ALL = 1 };
 namespace FieldDef_ {
@@ -134,6 +135,7 @@ enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, ID
 enum class MultiMode { SINGLE = 0, DEFAULT = 1, SET = 2, ARRAY = 3 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 enum class LongTerms { TRUNCATE = 0, REJECT = 1, HASH128 = 2 };
+enum class DateUnit { MS = 0, NS = 1 };
 }
 namespace VectorAnnDef_ { enum class Codec { RABITQ = 0, PQ = 1 }; }
 namespace StoredResourceDef_ { enum class Codec { LZ4 = 0, ZSTD = 1 }; }
@@ -158,9 +160,22 @@ struct SortSpec {
   SortDir dir = SortDir::UNKNOWN;
 };
 struct ExistsQuery { std::string_view field; };
-struct PrefixQuery { std::string_view field; std::string_view prefix; int32_t max_expansions = 0; };
-struct WildcardQuery { std::string_view field; std::string_view pattern; };
-struct RegexQuery { std::string_view field; std::string_view pattern; };
+struct PrefixQuery {
+  std::string_view field;
+  std::string_view prefix;
+  bool case_insensitive = false;
+  int32_t max_expansions = 0;
+};
+struct WildcardQuery {
+  std::string_view field;
+  std::string_view pattern;
+  bool case_insensitive = false;
+};
+struct RegexQuery {
+  std::string_view field;
+  std::string_view pattern;
+  bool case_insensitive = false;
+};
 struct FuzzyQuery {
   std::string_view field;
   std::string_view term;
@@ -245,6 +260,7 @@ struct AnalyzerComponent {
 struct AnalyzerDef {                                              // needs AnalyzerComponent
   std::optional<AnalyzerComponent> tokenizer;
   std::span<const AnalyzerComponent> filters;
+  std::span<const AnalyzerComponent> char_filters;
 };
 struct FieldVariants {
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> entries;
@@ -274,6 +290,7 @@ struct FieldDef {
   using MultiMode = luxir::api::FieldDef_::MultiMode;
   using IndexMode = luxir::api::FieldDef_::IndexMode;
   using LongTerms = luxir::api::FieldDef_::LongTerms;
+  using DateUnit = luxir::api::FieldDef_::DateUnit;
   using Metric = luxir::api::VectorMetric;
   std::string_view parent;
   std::optional<AnalyzerDef> analyzer;                          // align 8
@@ -285,6 +302,7 @@ struct FieldDef {
   std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<LongTerms> long_terms;                          // align 4 (enum)
+  std::optional<DateUnit> unit;                                // align 4 (enum)
   std::optional<std::int32_t> dims;                             // align 4
   std::optional<std::int32_t> truncate_dims;                    // align 4
   std::optional<Metric> metric;                                 // align 4 (enum)
@@ -293,6 +311,8 @@ struct FieldDef {
   std::optional<bool> stored;
   std::optional<bool> normalized;
   std::optional<bool> normalize_on_write;
+  std::optional<bool> ignore_malformed;
+  std::optional<bool> ignore_z_value;
 };
 struct AuxStats {
   std::string_view kind;
@@ -938,6 +958,8 @@ struct SearchRequest {
   std::int32_t max_parallel = 0;
   std::string_view min_commit;
   std::optional<uint64_t> min_commit_timeout_ms;
+  uint64_t flags = 0;
+  uint64_t flags_set = 0;
   // JSON parsing metadata, absent from the wire schema and canonical JSON.
   // Only a root TopDocs shorthand creates this implicit q; an explicit op
   // named q (including one modified by a URL overlay) keeps its wrapper.
@@ -1018,6 +1040,8 @@ struct RangeFacet {                                             // needs Val,Cal
 struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,QueryFacet,ExprOp,Domain
   std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, QueryFacet, ExprOp> kind;
   std::optional<Domain> domain;
+  uint64_t flags = 0;
+  uint64_t flags_set = 0;
 };
 struct Warning { std::string_view code; std::string_view message; };
 struct ExecutionProfilePiece {
@@ -1051,6 +1075,7 @@ struct Match {
   ::hpp_proto::optional_indirect_view<Val> val;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   int32_t min_match = 0;
+  bool case_insensitive = false;
 };
 struct AnyOfQuery {
   std::string_view field;

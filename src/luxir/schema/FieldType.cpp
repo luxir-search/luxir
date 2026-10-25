@@ -11,6 +11,50 @@
 
 namespace luxir {
 
+std::string_view FieldType::typeName(Type type) {
+  static constexpr std::string_view names[] = {
+    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point"
+  };
+  return (unsigned)type < std::size(names) ? names[(unsigned)type] : "unknown";
+}
+
+uint32_t FieldType::typeParameters(Type type, uint32_t typeFlags) {
+  switch (type) {
+    case DATE:
+      DateFieldType::unitFromTypeFlags(typeFlags);
+      return typeFlags;
+    case NONE: case STRING: case TEXT: case BIN: case INT: case FLOAT:
+    case DOUBLE: case ID: case VECTOR: case GEO_POINT:
+      if (typeFlags == 0) return 0;
+      throw std::runtime_error(std::format(
+          "Unknown type flags 0x{:x} for persisted field type '{}'", typeFlags, typeName(type)));
+  }
+  throw std::runtime_error(std::format("Unknown persisted field type {}", (int)type));
+}
+
+std::string FieldType::describeType(Type type, uint32_t typeFlags) {
+  if (type == DATE) {
+    return std::format("type 'date' unit '{}'", dateUnitName(DateFieldType::unitFromTypeFlags(typeFlags)));
+  }
+  typeParameters(type, typeFlags);
+  return std::format("type '{}'", typeName(type));
+}
+
+uint32_t DateFieldType::typeFlagsForUnit(DateUnit unit) {
+  switch (unit) {
+    case DateUnit::MILLIS: return 0;
+    case DateUnit::NANOS: return 1;
+  }
+  throw std::invalid_argument("Unknown date unit");
+}
+
+DateUnit DateFieldType::unitFromTypeFlags(uint32_t typeFlags) {
+  if (typeFlags & ~1u) {
+    throw std::runtime_error(std::format("Unknown type flags 0x{:x} for persisted field type 'date'", typeFlags));
+  }
+  return typeFlags & 1u ? DateUnit::NANOS : DateUnit::MILLIS;
+}
+
 void StrFieldType::normalize(std::string& value) const {
   if (normalizer) normalizer->createChain()->normalizeTerm(value);
 }

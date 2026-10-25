@@ -26,6 +26,8 @@ namespace api { struct Val; }  // the wire value oneof (api/luxir_types.hpp)
 struct CoerceContext {
   std::optional<int64_t> dateMathNowEpochMillis;
   TimeZone timeZone = TimeZone::utc();
+  // Omitted means the field's unit. Request modes may supply a different unit.
+  std::optional<DateUnit> dateInputUnit = std::nullopt;
 };
 
 
@@ -48,9 +50,15 @@ public:
     DOUBLE,
     ID,       // unique id field
     VECTOR,   // dense float vector; column-stored as fixed-size bytes
-    DATE,     // timestamp; column-stored as int64 milliseconds since the Unix epoch
+    DATE,     // timestamp; column-stored as int64 epoch units (default ms)
     GEO_POINT // latitude/longitude point; packed into one int64 column value
   };
+
+  static std::string_view typeName(Type type);
+  // Decode parameters using the persisted type, independently of any schema.
+  // Unknown types and bits are invalid. DATE defines its unit in bit 0.
+  static uint32_t typeParameters(Type type, uint32_t typeFlags);
+  static std::string describeType(Type type, uint32_t typeFlags);
 
   using flag_type = int32_t;
 
@@ -120,6 +128,7 @@ public:
 
   // Segment flags describe physical structures; schema roles stay in the schema.
   flag_type segmentFlags() const { return flags_ & ~(ABSTRACT | DERIVED); }
+  virtual uint32_t segmentTypeFlags() const { return 0; }
 
   // TODO: check standard on cast of int to bool (check generated code too)
   bool indexed() { return (bool) (flags_ & INDEX_DOCS); }
@@ -144,7 +153,7 @@ public:
   static bool arrayOnly(Type type) { return type == TEXT || type == VECTOR || type == GEO_POINT; }
 
   // Whether a sort on a field of this type orders by its int64 column
-  // values: raw integers for INT, epoch millis for DATE, sortable bits for
+  // values: raw integers for INT, epoch units for DATE, sortable bits for
   // FLOAT and DOUBLE (SimpleNumericFieldComparator). Single-valued columns
   // of these types are the ones field-sort planning reads, so only they
   // persist a value sketch (NumColumnWriter).
@@ -158,6 +167,9 @@ public:
 
   bool isStored() { return (bool) (flags_ & STORED); }
 
+  // ID uses the indexed STRING representation in segment metadata.
+  Type persistedType() const { return type_ == ID ? STRING : type_; }
+
   // ---- Val -> field-native coercion ----
   // One contract shared by ingest and query build so both sides coerce
   // identically (a doc ingested via one rule must be findable by querying the
@@ -168,7 +180,7 @@ public:
 
   // The encoded int64 the standard int column stores for this field type:
   // the raw integer for INT, sortable bits for FLOAT/DOUBLE (NumericUtils),
-  // epoch millis for DATE (ISO-8601 strings parsed on the way in).  Throws on
+  // epoch units for DATE (ISO-8601 strings parsed on the way in). Throws on
   // impossible values (per-doc failure at ingest, request error at query
   // build).
   // context fixes NOW for the surrounding request/update. Other numeric types
@@ -195,7 +207,7 @@ public:
 class TextFieldType : public FieldType {
 public:
   // The compiled chain (analysis/Analyzer.h), shared with every field that
-  // resolves to the same authored definition.
+  // resolves to the same effective definition.
   std::shared_ptr<const Analyzer> analyzer_;
 
   TextFieldType(std::string_view name, int flags, std::shared_ptr<const Analyzer> analyzer)
@@ -278,15 +290,28 @@ public:
       const CoerceContext& context = {}) const override;
 };
 
-// DATE stores int64 milliseconds since the Unix epoch directly in the standard
-// int column.  Signed millis already sorts in chronological order, so sort,
-// range-facet, and min/max stats run on the raw column with no per-value
-// transform (unlike FLOAT/DOUBLE, which store sortable bits).  The DATE tag
-// drives string<->millis parsing on input and date-aware rendering on output.
+// DATE stores int64 epoch units directly in the standard int column. Signed
+// counts sort chronologically without a transform. Numeric ingest uses the
+// field's unit; ISO text is converted from milliseconds plus a sub-ms remainder.
 class DateFieldType : public FieldType {
 public:
-  DateFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DATE, flags) {
+  struct QueryRange {
+    int64_t lo, hi; // inclusive, in field units; out-of-domain bounds saturate
+    bool granuleSkipped = false;
+    bool unroundedNow = false;
+  };
+  DateUnit unit;
+
+  DateFieldType(std::string_view name, int flags=COLUMN_STORED, DateUnit unit=DateUnit::MILLIS)
+    : FieldType(name, FieldType::DATE, flags), unit(unit) {
+    typeFlagsForUnit(unit);
   }
+
+  static uint32_t typeFlagsForUnit(DateUnit unit);
+  static DateUnit unitFromTypeFlags(uint32_t typeFlags);
+  // The unit of a field type whose type() is DATE.
+  static DateUnit unitOf(const FieldType& type) { return ((const DateFieldType&)type).unit; }
+  uint32_t segmentTypeFlags() const override { return typeFlagsForUnit(unit); }
 
   int64_t coerceColInt64(
       const api::Val& val, std::string_view fieldName,
@@ -296,22 +321,32 @@ public:
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const override;
 
-  // The [lo, hiExclusive) epoch-millis window a query-side date literal
-  // denotes at its own granularity: "2024-06-25" is the whole day, "2024-06"
-  // the month, epoch millis a single instant.  Queries match/round by the
-  // window; ingest and sorting use coerceColInt64 (the window start).
-  DateRange coerceDateRange(
+  // Exact set membership uses the literal's floored start. Out-of-domain
+  // members are omitted; malformed values remain request errors.
+  std::optional<int64_t> coerceDateInstant(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
 
-  std::optional<DateRange> tryCoerceDateRange(
+  // Match/range use the literal's granularity, expressed in column units.
+  QueryRange coerceDateRange(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
+
+  std::optional<QueryRange> tryCoerceDateRange(
       const api::Val& val, const CoerceContext& context = {}) const;
 };
 
 class GeoPointFieldType : public FieldType {
 public:
-  GeoPointFieldType(std::string_view name, int flags=COLUMN_STORED)
-    : FieldType(name, FieldType::GEO_POINT, flags) {
+  // Skip a value that is not a valid point instead of failing the document.
+  bool ignoreMalformed;
+  // Accept a third (z, altitude) coordinate and drop it; otherwise reject it.
+  bool ignoreZValue;
+
+  GeoPointFieldType(std::string_view name, int flags=COLUMN_STORED,
+                    bool ignoreMalformed = false, bool ignoreZValue = true)
+    : FieldType(name, FieldType::GEO_POINT, flags),
+      ignoreMalformed(ignoreMalformed), ignoreZValue(ignoreZValue) {
   }
 };
 

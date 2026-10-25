@@ -589,3 +589,25 @@ TEST_F(SearchParserTest, opNestingDepthCapped) {
   parseNested(node.getSearchEngine(), 2);
   EXPECT_THROW(parseNested(node.getSearchEngine(), 3), std::runtime_error);
 }
+
+TEST_F(SearchParserTest, effectivePackedFlagsAreRetainedThroughoutTheOpTree) {
+  CollectionHelper helper;
+  auto request = localReq(helper.getSearchEngine());
+  ASSERT_TRUE(api::read_json(request->rawRequest(), R"json({"flags":["date_ns"],"ops":{
+    "p":{"flags":["date_ms"],"top_docs":{"limit":0,"ops":{
+      "inherit":{"top_docs":{"limit":0}},
+      "native":{"flags":["date_native"],"top_docs":{"limit":0,"ops":{
+        "iso":{"flags":["date_iso"],"top_docs":{"limit":0}}}}}}}}}})json", request->mr));
+  request->reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  request->schema = helper.collection().getSchema();
+  ProtobufSearchParser parser(*request);
+  auto* root = parser.parse();
+  EXPECT_EQ(3u, request->flags);
+  EXPECT_EQ(3u, root->flags);
+  const auto* parent = root->subOps.at("p");
+  EXPECT_EQ(2u, parent->flags);
+  EXPECT_EQ(2u, parent->subOps.at("inherit")->flags);
+  const auto* native = parent->subOps.at("native");
+  EXPECT_EQ(0u, native->flags);
+  EXPECT_EQ(1u, native->subOps.at("iso")->flags);
+}

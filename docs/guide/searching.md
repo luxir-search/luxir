@@ -444,7 +444,7 @@ a column. Use an object to group by a tuple of fields:
 Each returned document has `_group_`: `{"val":"P17"}` for one field,
 `{"val":["shop-A",null]}` for a tuple, or
 `{"val":null,"singleton":true}` for a document grouped separately by
-`expand`. String keys use indexed values; date keys use epoch milliseconds.
+`expand`. String keys use indexed values; date keys use epoch values in the field's unit (`ms` or `ns`).
 Groups tied on all sort values follow their best member's document order,
 including documents grouped separately by `expand`. The best member within a
 group uses the same sort and document tiebreak. With the default
@@ -789,8 +789,12 @@ zip two arrays. A NaN read from a stored column is missing; stored infinities
 remain values, including for `min` and `max`; a non-finite result produced by
 arithmetic, an invalid math domain, or int64 overflow is an evaluation error.
 
-DATE values keep their DATE meaning through `def`, `min`, `max`, `avg`, and
-DATE plus or minus a number. DATE minus DATE produces a number.
+DATE values keep their unit (`ms` or `ns`) through `def`, `min`, `max`, `avg`,
+and DATE plus or minus a number. Numeric offsets and `def` fallbacks use that
+unit. DATE minus DATE produces a number in the operands' common unit. Combining
+ms/ns DATE operands converts the ms operand to ns before the operation; any
+DATE result then uses ns. See [date expressions](dates.md#value-expressions-and-aggregates)
+for conversion overflow behavior.
 Multiplication, division, unary minus, and unary math such as `floor` demote a
 DATE to a number (`floor(when_dt / 86400000)` is an epoch-day number); adding
 two DATE values or subtracting a DATE from a number is rejected.
@@ -983,6 +987,16 @@ beside `ops` in the full form:
   latest commit.
 - `time_zone` sets the default time zone for date queries and facets in the
   request. See [Dates and time zones](dates.md).
+- `flags` is an array of lowercase packed option names, for example
+  `["date_ms"]`. An operation wrapper can override inherited flags, and its
+  subops inherit the result. Naming `date_native` restores field-native
+  literal units and numeric output; `[]` overrides nothing. Duplicate/conflicting
+  names, unknown names, and reserved flags are rejected. See [request flags](http-api.md#packed-request-flags)
+  and [date literal units and output](dates.md#request-flags-and-literal-units).
+  Date modes apply to fields, sort values, facet bounds, group keys/ranks and
+  DATE metrics emitted by that operation; internal order and identities stay
+  native. `date_iso` emits UTC strings, and `date_ms`/`date_ns` normalize numeric
+  output. Numeric constants in value expressions retain the operand's unit.
 - `max_parallel` chooses where and how the request runs. `0`, the default,
   executes serially on the HTTP io thread that received it, with no
   scheduler handoff. `1` moves the request onto the

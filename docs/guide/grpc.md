@@ -166,6 +166,28 @@ before that status. The kinds, codes, and their meanings are
 transport-independent; see [HTTP API conventions](http-api.md#errors) for the
 table.
 
+## Packed request flags
+
+`SearchRequest` and the `SearchOp` wrapper carry `uint64 flags` and
+`uint64 flags_set`. Starting from request defaults of 0, resolve each level as:
+
+```text
+effective = (inherited & ~flags_set) | (flags & flags_set)
+```
+
+Subops inherit their parent's effective word. The date mode occupies bits 0-1:
+`0` is native, `1` is iso, `2` is ms, and `3` is ns. To override it, set
+`flags_set = 3` and put the mode value in `flags`. Explicit native uses
+`flags = 0, flags_set = 3`. Setting only one date-mode mask bit is rejected.
+Bit 2 is `int64_str`, accepted only on SearchRequest; a SearchOp cannot set
+or clear it in either word. It affects HTTP JSON rendering only, and binary
+gRPC responses retain their integer types. Unknown bits are rejected in either
+word. Bits absent from `flags_set` have no effect on inheritance.
+
+`RequestFlagBit` names bit positions, not masks; shift `uint64{1}` by the
+position when constructing masks. JSON uses lowercase name arrays instead of
+the two wire words. See [date literal units](dates.md#request-flags-and-literal-units).
+
 ## HTTP JSON versus protobuf values
 
 The HTTP JSON accepts shorthands that the protobuf messages do not: a

@@ -52,6 +52,7 @@
 #include "luxir/search/SearchRequest.h"
 #include "JsonRequest.h"
 #include "luxir/api/build.h"
+#include "luxir/api/RequestFlags.h"
 #include "luxir/api/sort_clause.h"
 #include "JsonResponse.h"
 #include "NdjsonFramer.h"
@@ -385,6 +386,7 @@ public:
   // (getTarget takes and releases it during batch assembly; maybeSendFinal
   // sends outside its critical section), so the lock cannot recurse.
   DocLinesState docsState;
+  JsonResponseOptions jsonOptions;
   // True once output has been handed to the session (enqueued, not necessarily
   // flushed) - the boundary past which an error must abort the chunked stream
   // rather than answer with a plain HTTP error response.
@@ -394,7 +396,8 @@ public:
                     std::shared_ptr<HttpSession> s, google::protobuf::Arena& arena)
     : SearchRequest(engine, requestState->proto, arena),
       requestState(std::move(requestState)),
-      session(std::move(s)) {
+      session(std::move(s)),
+      jsonOptions{.int64Str = (proto.flags & proto.flags_set & RequestFlags::INT64_STR) != 0} {
     docFormatDefault = luxir::api::DocFormat::ROWS;
   }
 
@@ -3975,7 +3978,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
       session->respondErrorFromEngine(httpStatusFor(info), renderErrorBody(info, response.proto.request_id));
     } else {
       int64_t queued = session->enqueueJson(
-          renderSearchResponseBody(response.proto, requestState->proto.json_shorthand), last);
+          renderSearchResponseBody(response.proto, requestState->proto.json_shorthand, jsonOptions), last);
       outputCommitted = true;
       if (queued > session->highWater()) { session->metricPause(); status = ReplyStatus::PAUSE; }
     }
@@ -4014,7 +4017,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
       // Document bodies are a pure function of the batch: render them OUTSIDE
       // any lock (this is the expensive part).  Only run framing depends on
       // cross-emitter interleaving.
-      auto runs = renderDocRuns(response.proto);
+      auto runs = renderDocRuns(response.proto, jsonOptions);
 
       // Multi-op requests have one emitter per op replying concurrently: the
       // framing decisions and the queue posts must agree on order, so both
@@ -4028,7 +4031,7 @@ SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response
       std::vector<std::string> outLines;
       for (auto& run : runs) {
         std::string marker;
-        if (!frameDocRun(run, docsState, warnings, marker)) continue;
+        if (!frameDocRun(run, docsState, warnings, marker, jsonOptions)) continue;
         if (!marker.empty()) outLines.push_back(std::move(marker));
         if (!run.body.empty()) outLines.push_back(std::move(run.body));
       }

@@ -679,6 +679,9 @@ public:
           if (mode == ExpansionMode::EAGER
               && !buildContext.multiTermDisableDenseFillForTests) {
             shape.windowFillClause = Query::ClauseShape::DIRECT;
+            if (buildContext.membershipConsumption == Query::MembershipConsumption::CANDIDATES) {
+              shape.membershipConsumption = Query::MembershipConsumption::CANDIDATES;
+            }
           }
           return shape;
         }
@@ -688,6 +691,9 @@ public:
         if (eagerGuaranteed
             && !buildContext.multiTermDisableDenseFillForTests) {
           shape.windowFillClause = Query::ClauseShape::DIRECT;
+          if (buildContext.membershipConsumption == Query::MembershipConsumption::CANDIDATES) {
+            shape.membershipConsumption = Query::MembershipConsumption::CANDIDATES;
+          }
         }
         if (!weight.canUseLazy) return shape;
         switch (buildContext.multiTermScorerModeForTests) {
@@ -751,7 +757,7 @@ public:
         auto* state = scratchPool.make<BulkState>(*this, use);
         return {
           BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
-          BulkAnswer::NO, state, -1, BulkAnswer::NO,
+          BulkAnswer::NO, state, -1, WindowFilterConsumption::NO,
         };
       }
 

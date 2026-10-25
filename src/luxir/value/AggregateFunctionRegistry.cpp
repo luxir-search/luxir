@@ -803,7 +803,7 @@ ResolvedAggregate resolveSum(
     std::span<AggregateConstant> trailingArguments) {
   assert(input != nullptr);
   assert(trailingArguments.empty());
-  if (input->nature == ValueNature::DATE) {
+  if (valueDate(input->nature)) {
     throw std::runtime_error("sum() cannot aggregate a DATE expression");
   }
   bool floating = input->type == ValueType::DOUBLE;

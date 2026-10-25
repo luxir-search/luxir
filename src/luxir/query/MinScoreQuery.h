@@ -308,7 +308,10 @@ class MinScoreQuery final : public Query {
 
     Query::ScorerShape describeScorer(
         const Query::PlanContext& buildContext) const override {
-      Query::ScorerShape child = childSupplier->describeScorer(buildContext);
+      Query::PlanContext childContext = buildContext;
+      childContext.demand.horizon = Query::ExecutionUse::PULL;
+      childContext.membershipConsumption = Query::MembershipConsumption::WINDOWS;
+      Query::ScorerShape child = childSupplier->describeScorer(childContext);
       return {
         .matchState = child.matchState,
         .directKind = Query::DirectScorerKind::OTHER,
@@ -349,6 +352,7 @@ class MinScoreQuery final : public Query {
       // The child retains scoring even when our consumer requests membership.
       Query::PlanContext childContext = planContext;
       childContext.demand.horizon = Query::ExecutionUse::PULL;
+      childContext.membershipConsumption = Query::MembershipConsumption::WINDOWS;
       Query::ScorerPlan* childPlan =
           childSupplier->resolve(planPool, childContext);
       assert(childPlan != nullptr);
@@ -373,7 +377,7 @@ class MinScoreQuery final : public Query {
         plan.available = BulkAnswer::YES;
         plan.supportsMatchWindows = BulkAnswer::YES;
         plan.consumesFilters = childPlan.consumesFilters;
-        plan.acceptsWindowFilter = childPlan.acceptsWindowFilter;
+        plan.windowFilterConsumption = childPlan.windowFilterConsumption;
       }
       return plan;
     }

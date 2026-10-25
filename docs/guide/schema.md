@@ -16,9 +16,9 @@ Choose a type based on how you want to search and use the values:
 | `int` | Signed 64-bit integer: counts, quantities, and years. |
 | `float` | 32-bit floating-point number: measurements and other numeric values where single precision is sufficient. |
 | `double` | 64-bit floating-point number for greater precision than `float`. |
-| `date` | Timestamp with millisecond precision, supplied as ISO-8601 text or epoch milliseconds. Supports date queries, ranges, and calendar facets. See [Dates](dates.md). |
+| `date` | Timestamp with `ms` (default) or `ns` storage precision. Ingest accepts ISO-8601 text or numeric epoch values in the field's unit. See [Dates](dates.md). |
 | `vector` | Dense vector of floating-point values, such as an embedding. Set a similarity metric to enable nearest-neighbor search. See [Vector search](vector-search.md). |
-| `geo_point` | Geographic location supplied as `[longitude, latitude]`, for distance and bounding-box queries. See [Geo search](geo-search.md). |
+| `geo_point` | Geographic location supplied as `[longitude, latitude]`, an object, a string, or a geohash, for distance and bounding-box queries. See [Geo search](geo-search.md). |
 | `id` | Unique document identifier, reserved for the built-in `id` field. Used to identify documents for replacement and deletion. |
 
 ### `text` versus `string`
@@ -123,6 +123,7 @@ The built-in templates are:
 | `_f`, `_fs` | Float column, single- or multi-valued. |
 | `_d`, `_ds` | Double column, single- or multi-valued. |
 | `_dt`, `_dts` | Date column, single- or multi-valued. |
+| `_p`, `_ps` | Geo point column with a points index (`index: "range"`), single- or multi-valued. |
 | `_t` | Unicode-word text with NFKC case folding, accent folding, English possessive removal, and KStem English stemming. The general-purpose text field. |
 | `_u` | Unicode-word text, case- and accent-sensitive. |
 | `_un` | Unicode-word text with NFKC case folding; accents preserved, no stemming. |
@@ -136,7 +137,8 @@ Text fields are **stored** in the default compressed **stored_resource**.
 Numeric suffixes are column-backed but do not build a points index by default;
 range and exact-match queries still work by quickly scanning the column. Define a
 concrete field with `index: "range"` when those operations need a points index.
-There is no default geo suffix; define geo fields explicitly.
+The geo suffixes `_p` and `_ps` build one by default, because geo queries are
+their only use.
 
 ## Field templates for dynamic fields
 
@@ -272,22 +274,26 @@ publication advances the schema generation.
 | `multi` | `false`, `true`, `"set"`, or `"array"`; see [Multi-valued modes](#multi-valued-modes) |
 | `stored` | keep canonical source text for TEXT/STRING/ID retrieval, before analysis/normalization; default on for `text` only; ignored for numerics |
 | `stored_resource` | stored-field group for TEXT/STRING/ID; empty or absent inherits, falling back to `_stored_`; see [Stored resources](#stored-resources) |
-| `analyzer` | `text` only: `{"tokenizer": <component>, "filters": [<component>, ...]}`; see [Text analysis](#text-analysis) |
+| `analyzer` | `text` only: `{"char_filters": [...], "tokenizer": <component>, "filters": [...]}`; see [Text analysis](#text-analysis) |
 | `normalizer` | `string` only: a list of filter components applied to each whole value, with no tokenizer; see [STRING normalization and length](#string-normalization-and-length) |
 | `long_terms` | `string`, `text` (per token), and `id`: `hash128` (default), `truncate`, or `reject` for terms over 255 bytes after normalization/analysis; see [Long terms](#long-terms) |
+| `unit` | `date` only: `ms` (default) or `ns`. Inherits from the parent and is part of the field signature. An existing date definition cannot change its resolved unit. |
 | `variants` | Map from label to another field definition receiving the same input value; bare type strings work here too; see [Field variants](#field-variants) |
 | `defaults` | For fields with variants, choose `self` or a variant label to override the inferred `search` and `value` bindings; see [Default bindings for variants](#default-bindings-for-variants) |
 | `parent` | inherit any unset properties from a field or template |
 | `dims`, `truncate_dims`, `metric`, `normalized`, `normalize_on_write` | `vector` only; `metric`: `l2`, `ip`, `cosine`, `none`; see [Vector search](vector-search.md) |
+| `ignore_malformed`, `ignore_z_value` | `geo_point` only; skip malformed points instead of failing the document, and accept and drop a third (altitude) coordinate. `ignore_malformed` defaults to `false`; `ignore_z_value` defaults to `true`. See [Malformed points and altitude](geo-search.md#malformed-points-and-altitude). |
 | `ann` | `vector` only; approximate index codec and parameters. PQ is the default; RaBitQ requires explicit `codec:"rabitq"`. See [Index settings](vector-search.md#index-settings). |
 
 Every property is optional. Absent means "inherit from `parent`, else the
 type's default", and the schema you read back stays as sparse as the one you
 wrote.
 
-`analyzer` inherits as one unit: an empty `{}` inherits the parent's analyzer,
-while naming a tokenizer or listing any filter replaces the whole chain
-(filters alone get the `whitespace` tokenizer).
+An empty `analyzer: {}` inherits the parent's analyzer. Naming a tokenizer or
+listing any token filter replaces the whole chain, including character filters
+(token filters alone get the `whitespace` tokenizer). Setting only `char_filters`
+keeps the parent's tokenizer and token filters, replacing its character filters.
+Without a parent analyzer, the base is `whitespace` with no token filters.
 
 `column` and `stored` solve different problems. A column is a typed,
 per-field structure used by sorting, faceting, analytics, numeric/geo queries,
@@ -404,7 +410,96 @@ live segment carrying one is used.
 
 ## Text analysis
 
-A text analyzer is one tokenizer followed by a list of filters:
+A text analyzer applies an ordered list of `char_filters` to the whole value,
+then one tokenizer, then an ordered list of token `filters`. Both lists are
+optional.
+
+### Cleanup before tokenization
+
+```json
+{
+  "fields": {
+    "body": {
+      "type": "text",
+      "analyzer": {
+        "char_filters": [
+          "html_strip",
+          "nfkc_cf",
+          {"name": "mapping", "params": {"mappings": ["- =>", "\u2014 =>"]}}
+        ],
+        "tokenizer": "unicode_word",
+        "filters": ["fold", "kstem"]
+      }
+    }
+  }
+}
+```
+
+Character filters run in the written order, separately for each field value.
+For example, HTML stripping followed by character removal can decode `&#45;`
+and then delete the resulting hyphen. Reversing those filters leaves that
+hyphen in the tokenizer's input. Removing `-` from `foo-bar` produces one
+`foobar` token, instead of two words separated by punctuation.
+
+| Character filter | Behavior |
+|---|---|
+| `nfkc_cf` | Unicode NFKC case folding, including default-ignorable removal, before segmentation. |
+| `mapping` | Apply case-sensitive, leftmost-longest rules from `params.mappings`. Map to an empty replacement to delete text. |
+| `html_strip` | Extract text, remove tags/comments/declarations and script/style contents, and decode named and numeric HTML character references once. |
+
+All except `mapping` take no parameters. Lowercase, accent folding, stemming,
+and possessive removal are token filters only. `nfkc_cf` is also available as a
+char filter because compatibility normalization before segmentation can change
+word boundaries.
+
+`mapping` takes a list such as `["ph => f", "\u2014 => "]`. The longest
+source at each input position wins; rule order does not break ties, and duplicate
+decoded sources are rejected. Replacements are not rescanned by the same filter.
+Use multiple mapping filters to apply successive rewrites. An empty list is a
+no-op; empty sources are invalid.
+
+Each rule has exactly one unescaped `=>`; ASCII whitespace at either edge of
+each side is trimmed. Use ordinary JSON escapes for characters, as in
+`"\u2014 =>"` to delete an em dash. Mapping-level escapes are needed only to
+preserve edge whitespace or include a literal `=>`: `"x => \\u0020"` maps
+`x` to a space, and `"\\u003d> => arrow"` maps `=>` to `arrow`. Double the
+backslash in JSON for these mapping-level escapes. Mapping escapes accept
+`\\`, `\n`, `\r`, `\t`, `\b`, `\f`, and `\uXXXX`, including surrogate pairs.
+Invalid UTF-8, malformed escapes, unknown parameters, and non-string rules are
+rejected. For folded matching, put `nfkc_cf` before mapping and write folded
+sources in the rules.
+
+`html_strip` removes inline tags without separating text: `H<sub>2</sub>O`
+becomes `H2O`. Its inline list follows Lucene, including `img`, `input`,
+`select`, and `textarea`; other tags, including `br` and unknown names, emit
+newlines. Comments/declarations disappear; script/style regions become separators.
+Quotes protect attribute values only immediately after `=` and optional
+whitespace, so `title=O'Reilly` works. Unterminated ordinary tags preserve `<`;
+unterminated comments and script/style regions consume the remainder. CDATA
+delimiters disappear but contents stay literal, including `<` and `&`.
+Named/numeric references decode once, including legacy semicolonless names;
+unknown references stay literal and invalid numeric scalars become U+FFFD.
+Decoded `&lt;b&gt;` stays text. It never executes scripts, fetches resources,
+or expands document-defined entities. This extracts indexing text; it is neither
+a browser rendering model nor an HTML sanitizer for safe display.
+
+Cleanup runs for analyzed queries. Prefix/fuzzy terms and TEXT range bounds
+use normalizing character filters before token normalization; `html_strip` is
+excluded. Wildcard/regex literals retain per-codepoint normalization, while
+character classes remain exact. Multi-character mapping sources do not span
+adjacent pattern literals, so `ph => f` applies to a prefix term but not the
+`ph` in `ph*`. Literal normalization currently rejects expansions beyond 32
+codepoints per input codepoint. HTML markup and entities are not decoded inside
+patterns. Already-analyzed phrase `terms` remain verbatim.
+Stored source values retain the submitted text.
+
+An analyzer specifying only `char_filters` keeps the inherited tokenizer and
+token filters. Schema changes affect future indexing; reindex existing documents
+to apply new cleanup rules to them.
+
+### Tokenizers and token filters
+
+A tokenizer is followed by the configured token filters:
 
 | Component | Meaning |
 |---|---|
@@ -415,16 +510,34 @@ A text analyzer is one tokenizer followed by a list of filters:
 | `lowercase` | Filter: Unicode lowercasing only. |
 | `fold` | Filter: accent and diacritic folding. |
 | `english_possessive` | Filter: remove a trailing `'s`. |
-| `kstem` | Filter: KStem English stemming; the only component with parameters. |
+| `kstem` | Filter: KStem English stemming; optional `possessive` parameter. |
+| `stop` | Filter: remove tokens in the required non-empty `params.words` list. |
 
 Prefer `nfkc_cf` to `lowercase` on Unicode-segmented text: bare lowercasing
 leaves equal-looking strings unequal (composed versus decomposed forms, final
 sigma), while NFKC case folding makes them compare equal. It also removes
 invisible default-ignorable characters such as soft hyphens, ZWJ/ZWNJ, and
 variation selectors: `co<U+00AD>operate` matches `cooperate`. Tokens that become
-empty are dropped without a position gap. Normalization uses Unicode 15.1.0
-mapping tables followed by stream-safe NFC; runs exceeding 30 non-starters in
+empty are dropped without a position gap. Normalization follows Unicode 15.1.0
+and stream-safe NFC; runs exceeding 30 non-starters in
 NFKD receive U+034F (CGJ), so those adversarial inputs can differ from ICU.
+
+`stop` takes authored words, for example
+`{"name":"stop","params":{"words":["THE","Cafe\u0301"]}}`. Stop words are
+analyzed like field text up to the stop filter, including character filters,
+tokenization, and preceding token filters. Each must produce exactly one token;
+analyzed duplicates collapse. A schema set rejects words producing zero or
+several tokens. Loading a stored schema logs a warning and drops those words,
+so schemas saved under an older analysis version still load. There is no
+`ignore_case` parameter: preceding filters determine how words and tokens meet.
+For example, stop after `kstem` analyzes `ponies` to `pony`. Later filters do not
+affect the stop set.
+
+Removed tokens leave position holes before the next emitted token, preserving
+phrase distances. Trailing holes are preserved between indexed values, in
+addition to the fixed 100-position gap, and between `phrase.words` entries.
+Stop does not remove prefix/fuzzy/range terms or wildcard/regex literals during
+normalization, and cannot appear in STRING normalizers.
 
 `kstem` implements Bob Krovetz's dictionary-based English stemming algorithm:
 `ponies` becomes `pony`, while recognized dictionary words are preserved or
@@ -824,5 +937,3 @@ Removing and reusing a name does not erase its old indexed values.
   or facet on whole values.
 - `english_possessive` and `kstem` are analyzer filters only; STRING
   normalizers accept `lowercase`, `nfkc_cf`, and `fold`.
-- There is no default geo suffix; geo fields need an explicit definition (see
-  [Geo search](geo-search.md)).

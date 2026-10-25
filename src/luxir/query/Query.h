@@ -484,7 +484,7 @@ public:
 
   // An inclusive range of encoded numeric column values (the column's
   // order-preserving int64 encoding: INT raw, FLOAT/DOUBLE sortable bits,
-  // DATE epoch millis). lo > hi is empty.
+  // DATE epoch units). lo > hi is empty.
   struct ValueEnvelope {
     int64_t lo;
     int64_t hi;
@@ -562,9 +562,14 @@ public:
     }
   };
 
-  // Exact inputs that may affect which scorer a supplier constructs. Test
-  // controls are snapshots carried with the demand rather than separate
-  // planning-time inputs.
+  // EITHER allows the supplier to select one of the two consumption protocols.
+  enum class MembershipConsumption : uint8_t {
+    WINDOWS,
+    CANDIDATES,
+    EITHER,
+  };
+
+  // Exact construction inputs, including snapshots of test controls.
   struct PlanContext {
     enum class MultiTermScorerMode : uint8_t {
       AUTO,
@@ -574,6 +579,7 @@ public:
     };
 
     Demand demand;
+    MembershipConsumption membershipConsumption = MembershipConsumption::WINDOWS;
     MultiTermScorerMode multiTermScorerModeForTests =
         MultiTermScorerMode::AUTO;
     size_t multiTermMaxLazyStateBytes = 32u << 20;
@@ -609,6 +615,7 @@ public:
     IndependentTermAccess independentTerm = IndependentTermAccess::UNKNOWN;
     DocsOnlyAccess docsOnly = DocsOnlyAccess::UNKNOWN;
     DirectDocSetAccess directDocSet = DirectDocSetAccess::UNKNOWN;
+    MembershipConsumption membershipConsumption = MembershipConsumption::WINDOWS;
 
     bool hasUnknown() const noexcept {
       return matchState == MatchState::UNKNOWN
@@ -806,6 +813,8 @@ public:
       const ScorerSupplier* owner = nullptr;
     };
 
+    enum class WindowFilterConsumption : uint8_t { NO, FILL, FILL_OR_PROBE };
+
     struct BulkPlan {
       BulkAnswer available = BulkAnswer::NO;
       BulkAnswer supportsMatchWindows = BulkAnswer::NO;
@@ -813,7 +822,7 @@ public:
       BulkAnswer consumesFilters = BulkAnswer::NO;
       const BulkBuildState* buildState = nullptr;
       int64_t constantCount = -1;
-      BulkAnswer acceptsWindowFilter = BulkAnswer::NO;
+      WindowFilterConsumption windowFilterConsumption = WindowFilterConsumption::NO;
       // Stateful arms derive capability from their resolved graph through
       // the owner hook. Stateless leaves record their complete answer here.
       // Neither route is consulted during ordinary forward iteration.
@@ -1875,6 +1884,23 @@ public:
       return {};
     }
 
+    // Keep only matching candidates in a window-relative mask. Membership
+    // verification is bounded to the set bits; gaps must not be scanned.
+    // Set bits must name valid, monotonically visited docids (padding zero).
+    // Like advanceWindow, this can leave an unconfirmed approximation cursor;
+    // continue through bounded membership, not docId()/score() or next().
+    virtual void intersectCandidateBits(std::span<uint64_t> words, int32_t min) {
+      for (size_t w = 0; w < words.size(); w++) {
+        uint64_t candidates = words[w];
+        while (candidates != 0) {
+          int32_t bit = (int32_t)std::countr_zero(candidates);
+          int32_t doc = min + (int32_t)(w * 64) + bit;
+          if (advanceWindow(doc, doc + 1) != doc) words[w] &= ~(1ULL << bit);
+          candidates &= candidates - 1;
+        }
+      }
+    }
+
     // Frequency-preserving bit production for a consumer that keeps scoring.
     // Membership fills may discard frequency state; this default retains it.
     virtual void fillScoredWindowBits(std::span<uint64_t> words,
@@ -1953,7 +1979,11 @@ public:
     ScorerPlan(const PlanContext& planContext,
                const ScorerShape& recordedShape, int64_t resolvedCost)
       : planContext(planContext), recordedShape(recordedShape),
-        resolvedCost(resolvedCost) {}
+        resolvedCost(resolvedCost) {
+      assert(recordedShape.membershipConsumption != MembershipConsumption::EITHER);
+      assert(planContext.membershipConsumption == MembershipConsumption::EITHER
+          || planContext.membershipConsumption == recordedShape.membershipConsumption);
+    }
 
     virtual Scorer* buildScorer(MemPool& targetPool) = 0;
     virtual Scorer* buildIndependentScorer(MemPool& targetPool) {
@@ -2154,9 +2184,8 @@ public:
   }
 };
 
-// Lazy intersection of direct filter scorers over one L1-sized
-// production window. Unlike DocSet this has no segment-wide identity or
-// cardinality: accepts() is valid only for the most recently prepared window.
+// Intersection of direct filters, either by filling an L1-sized window or
+// probing ordered candidates. Fill-mode accepts() requires a prepared window.
 class WindowFilter {
   static constexpr int32_t kWindowSize = DocsEnumMeta::L1_DOCS;
 
@@ -2185,9 +2214,9 @@ public:
                bool probeMode = false, int64_t filterCost = 0)
       : scorers(scorers),
         probeEnums(pool.make_span<DocsFreqEnum*>(scorers.size())),
-        bitIntersection(pool),
         probeMode(probeMode), filterCost(filterCost) {
     assert(!scorers.empty());
+    if (!probeMode) bitIntersection.initialize(pool);
     for (size_t i = 0; i < scorers.size(); i++) {
       probeEnums[i] = scorers[i]->windowFilterProbeDocsEnum();
     }
@@ -2208,10 +2237,12 @@ public:
     windowStart = start;
     windowEnd = end;
 
-    return bitIntersection.prepare(scorers, start, end);
+    return probeMode ? (int32_t)(end > start)
+                     : bitIntersection.prepare(scorers, start, end);
   }
 
   bool accepts(int32_t doc) const {
+    assert(!probeMode);
     assert(doc >= windowStart && doc < windowEnd);
     return bitIntersection.accepts(doc - windowStart);
   }
@@ -2239,8 +2270,33 @@ public:
     return true;
   }
 
-  void intersect(std::span<uint64_t> bits) const {
-    bitIntersection.intersect(bits);
+  // Probe windows need no preparation. Set bits must be valid docids and
+  // successive calls must consume candidates in ascending order.
+  void intersect(std::span<uint64_t> bits, int32_t base) {
+    if (!probeMode) {
+      assert(base == windowStart);
+      bitIntersection.intersect(bits);
+      return;
+    }
+    for (size_t i = 0; i < scorers.size(); i++) {
+      if (std::none_of(bits.begin(), bits.end(), [](uint64_t word) { return word != 0; })) return;
+      DocsFreqEnum* docs = probeEnums[i];
+      if (docs == nullptr) {
+        scorers[i]->intersectCandidateBits(bits, base);
+        continue;
+      }
+      int32_t current = docs->docId();
+      for (size_t w = 0; w < bits.size(); w++) {
+        uint64_t candidates = bits[w];
+        while (candidates != 0) {
+          int32_t bit = (int32_t)std::countr_zero(candidates);
+          int32_t doc = base + (int32_t)(w * 64) + bit;
+          if (current < doc) current = docs->advanceDocOnly(doc);
+          if (current != doc) bits[w] &= ~(1ULL << bit);
+          candidates &= candidates - 1;
+        }
+      }
+    }
   }
 };
 

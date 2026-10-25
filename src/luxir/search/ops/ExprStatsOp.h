@@ -15,6 +15,7 @@
 #include <fmt/format.h>
 
 #include "luxir/search/SearchOverrides.h"
+#include "luxir/search/DateOutput.h"
 #include "luxir/search/ops/SearchOp.h"
 #include "luxir/search/ops/DomainIter.h"
 #include "luxir/search/ops/FacetExecution.h"
@@ -77,6 +78,26 @@ class ExprStatsOp : public SearchOp {
     return charged;
   }
 
+  template <typename Output>
+  static void writeOutputValue(api::Val& target, const BucketScalar& value, const Output& output) {
+    if constexpr (std::is_same_v<Output, NativeDateOutput>) {
+      writeAggregateValue(target, value);
+    } else if (!value.valid) {
+      if constexpr (std::is_same_v<Output, IsoDateOutput>) {
+        if (value.failure == AggregateFailure::NON_FINITE_SUM
+            || value.failure == AggregateFailure::NON_FINITE_AVERAGE
+            || value.failure == AggregateFailure::NON_FINITE_EXPRESSION) {
+          throw RequestError("date_iso output for " + output.source + " is non-finite");
+        }
+      }
+      target.kind = google::protobuf::NullValue::NULL_VALUE;
+    } else if (value.type == BucketValueType::DOUBLE) {
+      target.kind = output(value.doubleValue);
+    } else {
+      target.kind = output((int64_t)value.intValue);
+    }
+  }
+
   void warnFailure(const BucketScalar& result) const {
     if (result.failure == AggregateFailure::NONE) return;
     req.warnOnce("aggregate_eval_failed", fmt::format(
@@ -88,6 +109,20 @@ public:
   ExprStatsOp(SearchRequest& req, std::string_view name,
               AggregateProgram& aggregate, std::span<const AggregateFieldInfos> fields)
       : SearchOp(req, name), aggregate(aggregate), fields(fields) {}
+
+  template <typename Emit>
+  void withOutput(uint64_t outputFlags, std::pmr::memory_resource& mr, Emit emit) const {
+    withDateOutput(aggregate.root().nature, outputFlags, mr, [this] {
+      std::string sources;
+      for (const auto& producer : aggregate.producers) {
+        auto description = producer.input->describeDateSources(producer.input->rootNode);
+        if (description.empty()) continue;
+        if (!sources.empty()) sources += ", ";
+        sources += description;
+      }
+      return sources;
+    }, emit);
+  }
 
   bool hasOnlyIndirectProducers() const {
     return aggregate.hasIndirectStates
@@ -136,9 +171,11 @@ public:
       auto& mr = op.req.lastResponse->mr;
       auto emit = [&](ExprStatsOp& member, const BucketScalar& result) {
         member.warnFailure(result);
-        getTarget(nullptr, member, [&](api::Val& val) {
-          routeTarget<api::ArrVal>(val, mr, [&](api::Val& target) {
-            writeAggregateValue(target, result);
+        member.withOutput(member.flags, mr, [&](auto output) {
+          getTarget(nullptr, member, [&](api::Val& val) {
+            routeTarget<api::ArrVal>(val, mr, [&](api::Val& target) {
+              writeOutputValue(target, result, output);
+            });
           });
         });
       };
@@ -588,15 +625,16 @@ public:
         if (arr.v.empty()) build::allocArray(arr.v, entries.size(), mr);
       });
       auto& arr = oneofMut<api::ArrVal>(*value);
-      for (size_t i = 0; i < entries.size(); i++) {
-        BucketScalar result = entries[i] == nullptr
-            ? BucketScalar::missing(
-                  resultType, thisOp().aggregate.root().nature)
-            : finishState(entries[i], counts[i]);
-        thisOp().warnFailure(result);
-        writeAggregateValue(const_cast<api::Val&>(arr.v[i]), result);
-        if (entries[i] != nullptr) entries[i] += entryBytes;
-      }
+      thisOp().withOutput(thisOp().flags, mr, [&](auto output) {
+        for (size_t i = 0; i < entries.size(); i++) {
+          BucketScalar result = entries[i] == nullptr
+              ? BucketScalar::missing(resultType, thisOp().aggregate.root().nature)
+              : finishState(entries[i], counts[i]);
+          thisOp().warnFailure(result);
+          writeOutputValue(const_cast<api::Val&>(arr.v[i]), result, output);
+          if (entries[i] != nullptr) entries[i] += entryBytes;
+        }
+      });
     }
   };
 
@@ -795,13 +833,14 @@ public:
           if (arr.v.empty()) build::allocArray(arr.v, buckets.size(), mr);
         });
         auto& arr = oneofMut<api::ArrVal>(*value);
-        for (const auto& bucket : buckets) {
-          assert(bucket.owner.value >= 0);
-          assert(bucket.output.value >= 0);
-          writeAggregateValue(
-              const_cast<api::Val&>(arr.v[(size_t)bucket.output.value]),
-              results[(size_t)bucket.owner.value]);
-        }
+        child.withOutput(child.flags, mr, [&](auto output) {
+          for (const auto& bucket : buckets) {
+            assert(bucket.owner.value >= 0);
+            assert(bucket.output.value >= 0);
+            writeOutputValue(const_cast<api::Val&>(arr.v[(size_t)bucket.output.value]),
+                             results[(size_t)bucket.owner.value], output);
+          }
+        });
       }
     };
 

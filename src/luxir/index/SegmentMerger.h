@@ -667,6 +667,11 @@ public:
         }
       }
 
+      // Check before route selection, cost estimation, or dispatching field work.
+      for (const auto& field : batch.fields) {
+        batch.fields.front().segFieldInfo.requireCompatibleType(field.segFieldInfo);
+      }
+
       // If merging would break any of the segment max constraints (i.e. number of unique terms in a field)
       // we could bail early.
 
@@ -1602,17 +1607,10 @@ private:
       }
     }
 
-    // TODO: check if fields are compatible!
     // TODO: gather other stats to help us build the field (like if it's a dense field!)
     int32_t allFlags = 0;
-    FieldType::Type type = FieldType::Type::NONE;
+    FieldType::Type type = firstInfo.type;
     for (auto* field : compactFields) {
-      if (type == FieldType::Type::NONE) {
-        type = field->segFieldInfo.type;
-      } else if (type != field->segFieldInfo.type) {
-        LOG_ERROR("Field types don't match! {} {}", (int)type, (int)field->segFieldInfo.type);
-        // now what?
-      }
       allFlags |= field->segFieldInfo.flags & ~FieldType::SEGMENT_MARKERS;
     }
     bool isText = type == FieldType::Type::TEXT;
@@ -1649,6 +1647,7 @@ private:
     PostingsWriter::IndexFieldInfo& outputFieldInfo = postingsWriter.addField(compactFields[0]->segFieldInfo.fieldname);
     outputFieldInfo.type = type;
     outputFieldInfo.flags = allFlags;
+    outputFieldInfo.typeFlags = FieldType::typeParameters(type, firstInfo.typeFlags);
     NormsWriter::PreparedNorms preparedNorms;
     if (isText) {
       preparedNorms = NormsWriter::prepare(pool, postingsWriter, outputFieldInfo, normBytes,

@@ -17,41 +17,63 @@
 
 namespace luxir {
 
-// BM25F over one term in several TEXT fields, scored as if the fields were a
-// single combined field. Each field's weight multiplies its term frequency
-// and its document length, as in Lucene's CombinedFieldQuery:
+// BM25F over (field, term) entries, scored as if the fields were a
+// single combined field. One field with several terms is a synonym query.
+// Each field's weight multiplies its term frequency and its document length,
+// as in Lucene's CombinedFieldQuery. Term weights affect only frequency:
 //
-//   freq(d)   = sum_f w_f * tf_f(d)
+//   freq(d)   = sum_entries w_f * w_term * tf_entry(d)
 //   length(d) = sum_f w_f * length_f(d), rounded and re-encoded like a norm
 //   avgdl     = sum_f w_f * sumTotalTermFreq_f / max_f docsWithField_f
-//   idf       = BM25 idf from max_f docFreq_f and max_f docsWithField_f
+//   idf       = BM25 idf from max_entries docFreq and max_f docsWithField_f
+//   term stats: docFreq = max_entries docFreq, totalTermFreq = sum_entries ttf
 //
+// Each distinct field is listed once, independently of the term entries.
+// Fields must all be TEXT or all be non-TEXT: combined multi_match groups
+// contain only TEXT, and case-insensitive synonym queries contain one field.
+// Non-TEXT queries use neutral length and never read document norms.
 // Every listed field contributes its length to a document even when the
 // term is absent from that field, so a long body still dampens a title hit.
-// Positive weights, including those below 1, retain the BM25 score bound.
+// Positive field weights and term weights in (0, 1] retain the BM25 score bound.
 //
 // Membership is the union of the per-field postings, so an unscored use
 // rewrites to a disjunction of TermQuerys. Its own filter key identifies the
-// combined field set and term, independently of the scoring weights.
+// field/term entries, independently of the scoring weights.
 class CombinedFieldQuery final : public Query {
+public:
+  struct Term {
+    size_t field;
+    std::string_view text;
+    float weight = 1.0f;
+
+    bool operator==(const Term& rhs) const {
+      return field == rhs.field && text == rhs.text
+          && std::bit_cast<uint32_t>(weight) == std::bit_cast<uint32_t>(rhs.weight);
+    }
+  };
+
+private:
   std::span<const std::string_view> fields;
   std::span<const float> weights;
-  std::string_view term;
+  std::span<const Term> terms;
 
 public:
   CombinedFieldQuery(std::span<const std::string_view> fields,
-                     std::span<const float> weights, std::string_view term)
-    : Query(QueryKind::COMBINED_FIELDS), fields(fields), weights(weights), term(term) {
-    assert(!fields.empty() && fields.size() == weights.size());
+                     std::span<const float> weights, std::span<const Term> terms)
+    : Query(QueryKind::COMBINED_FIELDS), fields(fields), weights(weights), terms(terms) {
+    assert(!fields.empty() && fields.size() == weights.size() && !terms.empty());
+    for (const auto& term : terms) {
+      assert(term.field < fields.size() && term.weight > 0.0f && term.weight <= 1.0f);
+    }
   }
 
   std::span<const std::string_view> getFields() const { return fields; }
   std::span<const float> getWeights() const { return weights; }
-  std::string_view getTerm() const { return term; }
+  std::span<const Term> getTerms() const { return terms; }
 
   bool equalsSameKind(const Query& other) const override {
     const auto& rhs = static_cast<const CombinedFieldQuery&>(other);
-    if (term != rhs.term || fields.size() != rhs.fields.size()) return false;
+    if (fields.size() != rhs.fields.size() || !std::ranges::equal(terms, rhs.terms)) return false;
     for (size_t i = 0; i < fields.size(); i++) {
       if (fields[i] != rhs.fields[i]
           || std::bit_cast<uint32_t>(weights[i]) != std::bit_cast<uint32_t>(rhs.weights[i])) {
@@ -62,10 +84,15 @@ public:
   }
 
   uint64_t hashImpl() const override {
-    uint64_t value = mixHash(Query::hashImpl(), term);
+    uint64_t value = Query::hashImpl();
     for (size_t i = 0; i < fields.size(); i++) {
       value = mixHash(value, fields[i]);
       value = mixHash(value, std::bit_cast<uint32_t>(weights[i]));
+    }
+    for (const auto& term : terms) {
+      value = mixHash(value, term.field);
+      value = mixHash(value, term.text);
+      value = mixHash(value, std::bit_cast<uint32_t>(term.weight));
     }
     return value;
   }
@@ -83,7 +110,11 @@ public:
     out.appendKind(kind);
     out.appendInt32((int32_t)fields.size());
     for (auto field : fields) out.appendString(field);
-    out.appendTerm(term);
+    out.appendInt32((int32_t)terms.size());
+    for (const auto& term : terms) {
+      out.appendInt32((int32_t)term.field);
+      out.appendTerm(term.text);
+    }
     return FilterKeyScope::SEGMENT_STABLE;
   }
 
@@ -94,9 +125,9 @@ public:
       float weight;
     };
     struct Norms {
-      const uint8_t* flat;
-      NormsReader::Iterator* sparse;
       float weight;
+      const uint8_t* flat = nullptr;
+      NormsReader::Iterator* sparse = nullptr;
     };
 
   private:
@@ -180,7 +211,9 @@ public:
     CombinedFieldQuery& query;
     std::span<CachedFieldInfo*> fieldInfos;
     std::span<CachedTermInfo*> termInfos;
+    Similarity::TermStats termStats;
     Similarity::BM25Scorer* simScorer = nullptr;
+    bool hasNorms = false;
 
     int64_t segmentCost(IndexReader::Segment& segment) const {
       int64_t cost = 0;
@@ -195,35 +228,55 @@ public:
       : Query::Weight(context, query, flags), query(query) {
       size_t n = query.fields.size();
       fieldInfos = context.pool.make_span<CachedFieldInfo*>(n);
-      termInfos = context.pool.make_span<CachedTermInfo*>(n);
+      termInfos = context.pool.make_span<CachedTermInfo*>(query.terms.size());
       int64_t docCount = 0;
-      int64_t docFreq = 0;
       double sumTotalTermFreq = 0.0;
       bool anyTerm = false;
+      std::optional<bool> fieldHasNorms;
       for (size_t i = 0; i < n; i++) {
         fieldInfos[i] = context.getCachedFieldInfo(query.fields[i]);
-        termInfos[i] = nullptr;
         if (fieldInfos[i] == nullptr) continue;
+        // Use segment metadata, as in TermQuery; older fields need not be
+        // listed in the current schema. Query builders keep these modes apart.
+        const auto& segInfos = fieldInfos[i]->segInfos;
+        for (size_t seg = 0; seg < segInfos.size(); seg++) {
+          if (const auto* info = segInfos.at(seg)) {
+            bool text = info->type == FieldType::TEXT;
+            assert(!fieldHasNorms || *fieldHasNorms == text);
+            fieldHasNorms = text;
+            break;
+          }
+        }
         const auto& stats = fieldInfos[i]->fieldStats;
         docCount = std::max(docCount, stats.docsWithField);
         sumTotalTermFreq += (double)query.weights[i] * (double)stats.sumTotalTermFreq;
-        termInfos[i] = context.getCachedTerminfo(*fieldInfos[i], query.term);
+      }
+      hasNorms = fieldHasNorms.value_or(false);
+      for (size_t i = 0; i < query.terms.size(); i++) {
+        const auto& term = query.terms[i];
+        auto* fieldInfo = fieldInfos[term.field];
+        termInfos[i] = fieldInfo == nullptr ? nullptr
+            : context.getCachedTerminfo(*fieldInfo, term.text);
         if (termInfos[i] != nullptr) {
           anyTerm = true;
-          docFreq = std::max(docFreq, termInfos[i]->termStats.docFreq);
+          const auto& stats = termInfos[i]->termStats;
+          termStats.docFreq = std::max(termStats.docFreq, stats.docFreq);
+          termStats.totalTermFreq += stats.totalTermFreq;
         }
       }
       if (anyTerm && docCount > 0) {
         Similarity similarity;
-        float idf = similarity.idf(docFreq, docCount);
+        float idf = similarity.idf(termStats.docFreq, docCount);
         float avgdl = (float)(sumTotalTermFreq / (double)docCount);
         // Keep membership even with empty statistics or float overflow from
         // finite field weights. BM25 needs a finite, positive average length.
         if (!(avgdl > 0.0f) || !std::isfinite(avgdl)) avgdl = 1.0f;
         simScorer = context.pool.make<Similarity::BM25Scorer>(
-            multiplier, similarity.k1, similarity.b, idf, avgdl);
+            multiplier, similarity.k1, similarity.b, idf, avgdl, hasNorms);
       }
     }
+
+    const Similarity::TermStats& getTermStats() const { return termStats; }
 
     class Supplier final : public Query::ScorerSupplier {
       Weight& weight;
@@ -284,27 +337,28 @@ public:
       size_t n = query.fields.size();
       size_t numPostings = 0;
       size_t numNorms = 0;
-      auto postings = targetPool.make_span<Scorer::Postings>(n);
-      auto norms = targetPool.make_span<Scorer::Norms>(n);
-      for (size_t i = 0; i < n; i++) {
+      auto postings = targetPool.make_span<Scorer::Postings>(query.terms.size());
+      for (size_t i = 0; i < query.terms.size(); i++) {
+        if (termInfos[i] == nullptr) continue;
+        auto* docs = termInfos[i]->useDocsEnum<DocsEnumTier::FREQS>(targetPool, segment);
+        if (docs != nullptr) {
+          postings[numPostings++] = {docs, query.weights[query.terms[i].field] * query.terms[i].weight};
+        }
+      }
+      auto norms = targetPool.make_span<Scorer::Norms>(hasNorms ? n : 0);
+      for (size_t i = 0; hasNorms && i < n; i++) {
         if (fieldInfos[i] == nullptr) continue;
         const SegFieldInfo* segInfo = fieldInfos[i]->segInfos.at(segment);
         if (segInfo == nullptr) continue;
+        assert(segInfo->type == FieldType::TEXT);
         float weight = query.weights[i];
-        if (termInfos[i] != nullptr) {
-          auto* docs = termInfos[i]->useDocsEnum<DocsEnumTier::FREQS>(targetPool, segment);
-          if (docs != nullptr) postings[numPostings++] = {docs, weight};
-        }
-        if (segInfo->type != FieldType::TEXT
-            || segInfo->normsFormat == SegFieldInfo::NORMS_NONE) {
-          continue;
-        }
+        if (segInfo->normsFormat == SegFieldInfo::NORMS_NONE) continue;
         auto* reader = targetPool.make<NormsReader>(segment.postingsReader(), *segInfo);
         if (reader->numBytes() == 0) continue;
         if (reader->isFlat()) {
-          norms[numNorms++] = {reader->flatBase(), nullptr, weight};
+          norms[numNorms++] = {.weight = weight, .flat = reader->flatBase()};
         } else {
-          norms[numNorms++] = {nullptr, targetPool.make<NormsReader::Iterator>(*reader), weight};
+          norms[numNorms++] = {.weight = weight, .sparse = targetPool.make<NormsReader::Iterator>(*reader)};
         }
       }
       if (numPostings == 0) return nullptr;

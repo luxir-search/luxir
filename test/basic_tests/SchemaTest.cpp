@@ -1231,6 +1231,91 @@ TEST_F(SchemaTest, multiModeValidationAndHistory) {
   EXPECT_EQ(12u, after->introduction("f__d"));
 }
 
+TEST_F(SchemaTest, dateUnitsInheritanceAndWirePresence) {
+  auto schema = schemaJson(R"({"templates":{
+    "_ns":{"type":"date","unit":"ns"}, "_child":{"parent":"_ns"}
+  },"fields":{
+    "plain":"date", "inherited":{"parent":"_child"},
+    "millis":{"parent":"_ns","unit":"ms"},
+    "with_variant":{"type":"date","variants":{"ns":{"parent":"_ns"}}}
+  }})");
+  for (auto name : {"inherited", "dynamic_child", "with_variant__ns"}) {
+    EXPECT_EQ(DateUnit::NANOS, ((DateFieldType*)schema->physical(name))->unit) << name;
+  }
+  for (auto name : {"plain", "millis", "with_variant"}) {
+    EXPECT_EQ(DateUnit::MILLIS, ((DateFieldType*)schema->physical(name))->unit) << name;
+  }
+  auto signatures = schema->signatures(true);
+  EXPECT_EQ("\"ms\"", signatures.at("plain").properties.at("unit"));
+  EXPECT_EQ("\"ns\"", signatures.at("inherited").properties.at("unit"));
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef source;
+  schema->toProto(&source, arena);
+  EXPECT_FALSE(source.fields.at("inherited")->unit);
+  EXPECT_EQ(api::FieldDef::DateUnit::MS, source.fields.at("millis")->unit);
+  EXPECT_EQ(api::FieldDef::DateUnit::NS, source.templates.at("_ns")->unit);
+  std::vector<std::byte> bytes;
+  ASSERT_TRUE(api::encode(source, bytes));
+  api::SchemaDef decoded;
+  ASSERT_TRUE(api::decode(decoded, api::copyToPaddedInput(bytes, arena), arena));
+  EXPECT_EQ(schema->sourceDef_, Schema::fromProto(decoded)->sourceDef_);
+  auto json = authoredJson(*schema);
+  EXPECT_NE(std::string::npos, json.find("\"unit\":\"ns\""));
+  EXPECT_NE(std::string::npos, json.find("\"unit\":\"ms\""));
+  EXPECT_EQ(schema->sourceDef_, schemaJson(json)->sourceDef_);
+}
+
+TEST_F(SchemaTest, dateUnitRequiresDateAndKnownUnit) {
+  for (auto json : {
+      R"({"fields":{"bad":{"type":"int","unit":"ms"}}})",
+      R"({"fields":{"bad":{"type":"date","unit":77}}})",
+      R"({"fields":{"bad":{"type":"date","unit":"us"}}})"}) {
+    EXPECT_THROW(schemaJson(json), std::exception) << json;
+  }
+  SchemaBuilder invalid;
+  auto& field = invalid.field("bad");
+  field.type = FieldClass::DATE;
+  field.unit = (api::FieldDef::DateUnit)77;
+  EXPECT_THROW(invalid.build(), SchemaError);
+}
+
+TEST_F(SchemaTest, dateUnitChangesAreRejectedWithoutInspectingData) {
+  CollectionHelper helper;
+  SchemaBuilder original;
+  auto& parent = original.templ("_ns");
+  parent.type = FieldClass::DATE;
+  parent.unit = api::FieldDef::DateUnit::NS;
+  auto& owner = original.field("when_dt");
+  owner.parent = "_ns";
+  original.variant(owner, "copy").parent = "_ns";
+  original.set(helper.collection()); // new declaration can replace a suffix-template instance
+  for (bool withData : {false, true}) {
+    if (withData) {
+      ASSERT_TRUE(helper.index(flatdoc("id", "one", "when_dt", 1), UpdateMessage::COMMIT).success);
+    }
+    SchemaBuilder change;
+    auto& inherited = change.templ("_ns");
+    inherited.type = FieldClass::DATE;
+    inherited.unit = api::FieldDef::DateUnit::MS;
+    EXPECT_THROW(change.set(helper.collection()), SchemaError);
+    SchemaBuilder direct;
+    auto& field = direct.field("when_dt");
+    field.type = FieldClass::DATE;
+    field.unit = api::FieldDef::DateUnit::MS;
+    EXPECT_THROW(direct.set(helper.collection()), SchemaError);
+    EXPECT_THROW(direct.replaceAll(helper.collection()), SchemaError);
+    EXPECT_EQ(DateUnit::NANOS, ((DateFieldType*)helper.collection().getSchema()->physical("when_dt"))->unit);
+  }
+  SchemaBuilder variantChange;
+  auto& sameOwner = variantChange.field("when_dt");
+  sameOwner.parent = "_ns";
+  auto& variant = variantChange.variant(sameOwner, "copy");
+  variant.type = FieldClass::DATE;
+  variant.unit = api::FieldDef::DateUnit::MS;
+  EXPECT_THROW(variantChange.set(helper.collection()), SchemaError);
+  EXPECT_NO_THROW(original.set(helper.collection()));
+}
+
 TEST_F(SchemaTest, longTermsInheritanceAndWirePresence) {
   auto s = schemaJson(R"({"templates":{
     "_strict":{"type":"string","long_terms":"reject"},

@@ -5,9 +5,13 @@
 #include "luxir/analysis/AsciiScan.h"
 #include "luxir/analysis/KStemmer.h"
 #include "luxir/analysis/NfkcCfData.h"
+#include "luxir/util/log.h"
 
 #include <algorithm>
+#include <boost/unordered/unordered_flat_set.hpp>
+#include <functional>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -417,6 +421,9 @@ public:
       }
       gap += token.positionIncrement - 1;
     }
+    // Empty folds consume no position, but retain any upstream stop holes.
+    // With no stop filter, gap stays zero and only this EOF branch is added.
+    if (gap) token.finalPositionIncrement += gap;
     return false;
   }
 
@@ -499,6 +506,77 @@ std::unique_ptr<TokenStream> makeAccentFoldFilter(std::unique_ptr<TokenStream> s
   return std::make_unique<AccentFoldFilter>(std::move(source));
 }
 
+namespace {
+class NfkcCfCharFilter : public CharFilter {
+  std::string scratch;
+
+  void filter() override {
+    if (isAscii(input)) {
+      if (std::none_of(input.begin(), input.end(), [](char c) { return c >= 'A' && c <= 'Z'; })) return;
+      auto out = bytewiseOutput();
+      ascii::lowerCopy(out.data(), input.data(), input.size());
+      return;
+    }
+    if (applyNfkcCf(input, scratch) == input) return;
+    // Split only at normalization-safe boundaries: a starter that cannot
+    // compose backwards and has no leading NFKD non-starters. This preserves
+    // Hangul composition, canonical reordering and stream-safe NFC behavior.
+    // Mapping a changed normalization segment to its source span also handles
+    // expansions, contractions, and reordered combining marks.
+    size_t start = 0;
+    auto emit = [&](size_t end) {
+      auto part = input.substr(start, end - start);
+      replace(start, end, applyNfkcCf(part, scratch));
+      start = end;
+    };
+    auto decoded = una::views::utf8(input);
+    for (auto it = decoded.begin(); it != decoded.end(); ++it) {
+      uint32_t cp = (uint32_t) *it;
+      auto mapping = nfkc_cf_data::lookup(cp).mapping;
+      if (mapping) {
+        std::string_view bytes((const char*) nfkc_cf_data::utf8 + (mapping & 0xFFFFFF),
+                               (mapping >> 24) & 127);
+        if (bytes.empty()) continue;
+        cp = (uint32_t) *una::views::utf8(bytes).begin();
+      }
+      size_t offset = (size_t) (it.begin() - input.begin());
+      if (offset > start && !(nfkc_cf_data::lookup(cp).props & 0x7FF)) emit(offset);
+    }
+    emit(input.size());
+  }
+};
+
+} // namespace
+
+std::unique_ptr<CharFilter> makeNfkcCfCharFilter() {
+  return std::make_unique<NfkcCfCharFilter>();
+}
+
+TokenChain::TokenChain(Tokenizer& head, std::unique_ptr<TokenStream> tail, bool stateful,
+                       std::vector<CharStage> cleanups)
+    : charStages(std::move(cleanups)), head(head), tail(std::move(tail)), stateful(stateful) {}
+
+void TokenChain::setFilteredValue(std::string_view value) {
+  if (value.size() > (size_t) std::numeric_limits<int>::max())
+    throw std::length_error("Analysis input exceeds byte-offset limit");
+  for (auto& stage : charStages) value = stage.filter->apply(value);
+  head.setValue(value);
+}
+
+void TokenChain::normalizeCharFilters(std::string& term) {
+  std::string_view value = term;
+  for (auto& stage : charStages) {
+    if (stage.normalizing) value = stage.filter->apply(value);
+  }
+  if (value.data() != term.data()) term.assign(value);
+}
+
+int TokenChain::sourceOffset(int offset, bool isEnd) {
+  for (auto it = charStages.rbegin(); it != charStages.rend(); ++it)
+    offset = it->filter->correctOffset(offset, isEnd);
+  return offset;
+}
+
 // ---------------------------------------------------------------------------
 // Component registry
 
@@ -542,7 +620,7 @@ public:
   // Inherit normalization forwarding: multiterm input is folded, never stemmed.
 };
 
-std::unique_ptr<const TokenFilterFactory> kstemFilter(const api::AnalyzerComponent& def) {
+std::unique_ptr<TokenFilterFactory> kstemFilter(const api::AnalyzerComponent& def) {
   struct Factory : TokenFilterFactory {
     bool possessive = true;
 
@@ -594,7 +672,7 @@ std::unique_ptr<const TokenizerFactory> plainTokenizer(const api::AnalyzerCompon
 
 template <std::unique_ptr<TokenStream> (*Make)(std::unique_ptr<TokenStream>),
           bool Normalizing = true, bool Stateful = false>
-std::unique_ptr<const TokenFilterFactory> plainFilter(const api::AnalyzerComponent& def) {
+std::unique_ptr<TokenFilterFactory> plainFilter(const api::AnalyzerComponent& def) {
   requireNoParams(def, "filter");
   struct Factory : TokenFilterFactory {
     std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
@@ -608,13 +686,104 @@ std::unique_ptr<const TokenFilterFactory> plainFilter(const api::AnalyzerCompone
   return factory;
 }
 
+struct StopWordHash {
+  using is_transparent = void;
+  size_t operator()(std::string_view word) const noexcept { return std::hash<std::string_view>{}(word); }
+};
+using StopWords = boost::unordered_flat_set<std::string, StopWordHash, std::equal_to<>>;
+
+class StopFilter : public TokenFilter {
+  std::shared_ptr<const StopWords> words;
+public:
+  StopFilter(std::unique_ptr<TokenStream> source, std::shared_ptr<const StopWords> words)
+      : TokenFilter(std::move(source)), words(std::move(words)) {}
+
+  void reset() override {
+    TokenFilter::reset();
+    token.finalPositionIncrement = 0;
+  }
+
+  bool incrementToken() override {
+    int skipped = 0;
+    while (source().incrementToken()) {
+      if (!words->contains(token.text)) {
+        token.positionIncrement += skipped;
+        return true;
+      }
+      skipped += token.positionIncrement;
+    }
+    // Each stop stage contributes only its own pending holes. Token::clear()
+    // leaves this stream attribute intact as exhaustion propagates downstream.
+    token.finalPositionIncrement += skipped;
+    return false;
+  }
+};
+
+std::unique_ptr<TokenFilterFactory> stopFilter(const api::AnalyzerComponent& def) {
+  struct Factory : TokenFilterFactory {
+    std::vector<std::string> authored;
+    std::shared_ptr<const StopWords> words;
+
+    void prepare(TokenChain& preceding, InvalidStopWords invalidStopWords) override {
+      auto normalized = std::make_shared<StopWords>();
+      auto source = std::move(authored);
+      normalized->reserve(source.size());
+      for (const auto& word : source) {
+        preceding.setValue(word);
+        preceding.reset();
+        size_t count = 0;
+        std::string text;
+        while (preceding.tail->incrementToken()) {
+          if (++count == 1) text.assign(preceding.getToken().text);
+        }
+        if (count != 1) {
+          auto message = fmt::format("filter 'stop': word '{}' produced {} tokens; expected exactly one", word, count);
+          if (invalidStopWords == InvalidStopWords::REJECT) throw std::invalid_argument(message);
+          LOG_WARN("Dropping stored stop word: {}", message);
+          continue;
+        }
+        normalized->insert(std::move(text));
+      }
+      words = std::move(normalized);
+    }
+
+    std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const override {
+      return std::make_unique<StopFilter>(std::move(source), words);
+    }
+  };
+  auto factory = std::make_unique<Factory>();
+  factory->name = def.name;
+  factory->stateful = true;
+  auto add = [&](std::string_view word) {
+    factory->authored.emplace_back(word);
+  };
+  for (const auto& [key, value] : def.params) {
+    if (key != "words") throw std::invalid_argument("filter 'stop': unknown parameter '" + std::string(key) +
+                                                  "'; valid parameters: words");
+    if (auto* list = std::get_if<api::ArrStr>(&value->kind)) {
+      for (auto word : list->v) add(word);
+    } else if (auto* list = std::get_if<api::ArrVal>(&value->kind)) {
+      for (const auto& item : list->v) {
+        auto* word = std::get_if<std::string_view>(&item.kind);
+        if (!word) throw std::invalid_argument("filter 'stop': words must be a list of strings");
+        add(*word);
+      }
+    } else {
+      throw std::invalid_argument("filter 'stop': words must be a list of strings");
+    }
+  }
+  if (factory->authored.empty())
+    throw std::invalid_argument("filter 'stop': words is required and must be a non-empty list of strings");
+  return factory;
+}
+
 struct TokenizerEntry {
   std::string_view name;
   std::unique_ptr<const TokenizerFactory> (*make)(const api::AnalyzerComponent&);
 };
 struct FilterEntry {
   std::string_view name;
-  std::unique_ptr<const TokenFilterFactory> (*make)(const api::AnalyzerComponent&);
+  std::unique_ptr<TokenFilterFactory> (*make)(const api::AnalyzerComponent&);
 };
 
 // The registries: adding a component is one line here plus its factory (a
@@ -631,6 +800,7 @@ constexpr FilterEntry FILTERS[] = {
   {"fold", plainFilter<makeAccentFoldFilter>},
   {"english_possessive", plainFilter<makeEnglishPossessiveFilter, false>},
   {"kstem", kstemFilter},
+  {"stop", stopFilter},
 };
 
 template <class Entry, size_t N>
@@ -656,7 +826,7 @@ std::unique_ptr<const TokenizerFactory> makeTokenizerFactory(const api::Analyzer
                               "'; valid tokenizers: " + joinNames(TOKENIZERS));
 }
 
-std::unique_ptr<const TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def) {
+std::unique_ptr<TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def) {
   if (def.name.empty()) {
     throw std::invalid_argument("filter component has no name; valid filters: " + joinNames(FILTERS));
   }
@@ -667,14 +837,25 @@ std::unique_ptr<const TokenFilterFactory> makeTokenFilterFactory(const api::Anal
                               "'; valid filters: " + joinNames(FILTERS));
 }
 
-std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
+std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def, InvalidStopWords invalidStopWords) {
   api::AnalyzerComponent whitespace;
   whitespace.name = "whitespace";
   auto tokenizer = makeTokenizerFactory(def.tokenizer.has_value() ? *def.tokenizer : whitespace);
+  std::vector<std::unique_ptr<const CharFilterFactory>> cleanups;
+  for (const auto& filter : def.char_filters) cleanups.push_back(makeCharFilterFactory(filter));
+  std::vector<TokenChain::CharStage> stages;
+  for (const auto& factory : cleanups) stages.push_back({factory->create(), factory->normalizing});
+  auto head = tokenizer->create();
+  auto& headRef = *head;
+  TokenChain preceding(headRef, std::move(head), tokenizer->stateful, std::move(stages));
   std::vector<std::unique_ptr<const TokenFilterFactory>> filters;
   filters.reserve(def.filters.size());
   for (const auto& filter : def.filters) {
-    filters.push_back(makeTokenFilterFactory(filter));
+    auto factory = makeTokenFilterFactory(filter);
+    factory->prepare(preceding, invalidStopWords);
+    preceding.stateful = preceding.stateful || factory->stateful;
+    preceding.tail = factory->create(std::move(preceding.tail));
+    filters.push_back(std::move(factory));
   }
   api::AnalyzerDef effective = def;
   if (!effective.tokenizer) effective.tokenizer = whitespace;
@@ -685,14 +866,16 @@ std::shared_ptr<const Analyzer> Analyzer::compile(const api::AnalyzerDef& def) {
   if (glz::read_json(value, json)) throw std::runtime_error("Cannot canonicalize analyzer");
   // Give the empty chain the same representation everywhere.
   if (def.filters.empty()) value["filters"] = glz::generic_sorted_u64::array_t{};
+  if (def.char_filters.empty()) value["char_filters"] = glz::generic_sorted_u64::array_t{};
   if (glz::write_json(value, json)) throw std::runtime_error("Cannot serialize canonical analyzer");
-  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters), std::move(json)));
+  return std::shared_ptr<const Analyzer>(new Analyzer(std::move(tokenizer), std::move(filters), std::move(cleanups), std::move(json)));
 }
 
 Analyzer::Analyzer(std::unique_ptr<const TokenizerFactory> tok,
-                   std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical)
+                   std::vector<std::unique_ptr<const TokenFilterFactory>> fs,
+                   std::vector<std::unique_ptr<const CharFilterFactory>> cs, std::string canonical)
     : canonical(std::move(canonical)), tokenizer(std::move(tok)),
-      filters(std::move(fs)),
+      filters(std::move(fs)), charFilters(std::move(cs)),
       fusedHead(tokenizer->name == "unicode_word" && !filters.empty() && filters[0]->name == "nfkc_cf"),
       fusedFold(fusedHead && filters.size() > 1 && filters[1]->name == "fold"),
       stateful(tokenizer->stateful ||
@@ -705,7 +888,9 @@ std::unique_ptr<TokenChain> Analyzer::createChain() const {
   for (size_t i = fusedFold ? 2 : fusedHead ? 1 : 0; i < filters.size(); i++) {
     tail = filters[i]->create(std::move(tail));
   }
-  return std::make_unique<TokenChain>(headRef, std::move(tail), stateful);
+  std::vector<TokenChain::CharStage> cleanups;
+  for (const auto& factory : charFilters) cleanups.push_back({factory->create(), factory->normalizing});
+  return std::make_unique<TokenChain>(headRef, std::move(tail), stateful, std::move(cleanups));
 }
 
 }  // namespace luxir

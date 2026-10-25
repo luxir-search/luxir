@@ -10,10 +10,7 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
   auto split = name.rfind("__");
   logicalName = name.substr(0, split);
   label = split == std::string_view::npos ? "self" : std::string(name.substr(split + 2));
-  static constexpr const char* types[] = {
-    "none", "string", "text", "bin", "int", "float", "double", "id", "vector", "date", "geo_point"
-  };
-  properties["type"] = "\"" + std::string(types[type.type()]) + "\"";
+  properties["type"] = "\"" + std::string(FieldType::typeName(type.type())) + "\"";
   properties["multi"] = !type.multiValued() ? "false"
       : type.multiArray() && !FieldType::arrayOnly(type.type()) ? "\"array\"" : "true";
   properties["index"] = type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";
@@ -39,6 +36,9 @@ FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
         throw std::runtime_error("Cannot serialize normalizer signature");
       }
     }
+  }
+  if (auto* date = dynamic_cast<DateFieldType*>(&type)) {
+    properties["unit"] = "\"" + std::string(dateUnitName(date->unit)) + "\"";
   }
   if (auto* vector = dynamic_cast<VectorFieldType*>(&type)) {
     properties["dims"] = std::to_string(vector->inputDims());

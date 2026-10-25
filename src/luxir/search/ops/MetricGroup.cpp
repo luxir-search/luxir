@@ -267,6 +267,19 @@ std::span<MetricGroupData::Rank> MetricGroupData::sort() { impl->finish(); retur
 const CollapseKey& MetricGroupData::key(size_t slot) const { return *impl->selected[slot].key; }
 int64_t MetricGroupData::totalHits() const { return impl->hits; }
 int64_t MetricGroupData::totalGroups() const { return (int64_t)impl->table.size(); }
+void MetricGroupData::renderRanks(std::span<const api::ArrVal> ranks, uint64_t flags,
+                                 std::pmr::memory_resource& mr) const {
+  if (RequestFlags::dateMode(flags) == RequestFlags::DateMode::NATIVE) return;
+  for (size_t i = 0; i < impl->calcs.size(); i++) {
+    auto& metric = (ExprStatsOp&)impl->calcs[i]->getOp();
+    metric.withOutput(flags, mr, [&](auto output) {
+      if constexpr (!std::is_same_v<decltype(output), NativeDateOutput>) {
+        for (const auto& rank : ranks) renderDateValue(const_cast<api::Val&>(rank.v[i]), output);
+      }
+    });
+  }
+}
+
 void MetricGroupData::emitRank(api::ArrVal& out, size_t slot, std::pmr::memory_resource& mr) const {
   auto* values = build::allocArray(out.v, impl->calcs.size(), mr);
   for (size_t i = 0; i < impl->calcs.size(); i++) values[i] =

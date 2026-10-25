@@ -504,17 +504,20 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
     ASSERT_NE(nullptr, supplier);
     int64_t supplierCost = supplier->cost();
     ASSERT_GT(supplierCost, 0);
-    expectShapeAndScorer(*reader, field, lo, hi, supplierCost - 1,
+    int64_t fence = denseKind == ExpectedScorerKind::POINTS_ARRAY
+            || denseKind == ExpectedScorerKind::POINTS_BIT
+        ? NumericPredicateQuery::pointsVerifyLimit(supplierCost) : supplierCost;
+    expectShapeAndScorer(*reader, field, lo, hi, fence - 1,
                          ExpectedScorerKind::SPARSE_VERIFY, matchState);
     expectShapeAndScorer(
         *reader, field, lo, hi,
         Query::Demand::fromCandidatesAndSpan(
-            supplierCost - 1, supplierCost),
+            fence - 1, fence),
         denseKind, matchState);
     expectShapeAndScorer(
-        *reader, field, lo, hi, supplierCost, denseKind, matchState);
+        *reader, field, lo, hi, fence, denseKind, matchState);
     expectShapeAndScorer(
-        *reader, field, lo, hi, supplierCost + 1, denseKind, matchState);
+        *reader, field, lo, hi, fence + 1, denseKind, matchState);
     expectShapeAndScorer(*reader, field, lo, hi,
                          std::numeric_limits<int64_t>::max(), denseKind,
                          matchState);

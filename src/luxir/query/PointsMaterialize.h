@@ -21,7 +21,9 @@ struct PointsMaterialize {
   };
 
   static uint64_t arrayLimit(int32_t maxDoc) {
-    return ((uint64_t)(uint32_t)maxDoc + 31) >> 5;
+    // Point traversal emits docids in value order. Switch before the memory
+    // break-even (maxDoc/32) to avoid sorting moderately sparse result sets.
+    return ((uint64_t)(uint32_t)maxDoc + 127) >> 7;
   }
 
   static bool useBitset(uint64_t expected, int32_t maxDoc) {

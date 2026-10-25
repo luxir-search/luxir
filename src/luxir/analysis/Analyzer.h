@@ -10,6 +10,7 @@
 #include <cstring>
 #include <memory>
 #include "luxir/util/luxir_util.h"
+#include "luxir/analysis/CharFilter.h"
 
 namespace luxir {
 
@@ -33,8 +34,11 @@ class Token {
 public:
   std::string_view text;
   int positionIncrement; // increment from the previous token's position
-  int startOffset; // byte offset into original text buffer of current token
-  int endOffset;   // end offset (exclusive) into the original text buffer
+  int startOffset; // byte offset into the tokenizer input of current token
+  int endOffset;   // end offset (exclusive) into the tokenizer input
+  // Stream state, deliberately untouched by clear(). Stop filters reset this
+  // per value and accumulate trailing holes when exhaustion reaches them.
+  int finalPositionIncrement = 0;
 
   void clear() {
     // Offsets are deliberately not reset here: every emit path sets them, so
@@ -42,9 +46,9 @@ public:
     positionIncrement = 1;
   }
 
-  // Record the [start, end) source byte span. Only the head Tokenizer (which
-  // still sees the source) sets this; downstream filters generally leave it alone so it
-  // keeps pointing at the origin span even after they rewrite `text`.
+  // Record the [start, end) span in tokenizer input bytes. Token filters
+  // preserve it when rewriting text. With char filters, sourceOffset() maps
+  // this span back to the original value only when an offset consumer needs it.
   void setOffset(int start, int end) {
     startOffset = start;
     endOffset = end;
@@ -54,16 +58,15 @@ public:
 
 // A pull-based stream of Tokens. The whole chain shares a single Token object
 // (held by the head Tokenizer); each stage repoints its `text`/attributes in
-// place. Lifecycle is reset() / incrementToken()* / end():
+// place. TokenChain manages reset() / incrementToken()* / end():
 //   * reset()           - prepare to emit tokens for a fresh value. The head's
 //                         input is supplied separately via Tokenizer::setValue.
 //                         Defaults to no-op (and non-forwarding); only stateful
 //                         (buffering) filters need to override it.
 //   * incrementToken()  - advance to the next token, returning false at the end.
-//   * end()             - reserved seam for reporting trailing stream state
-//                         (final offset, trailing position increment). Not needed
-//                         yet; will be added no-op-defaulted when the first
-//                         feature that produces trailing state lands.
+//   * TokenChain::end()  - after exhaustion, read the final position increment
+//                         once per value. Stages contribute on exhaustion, so
+//                         reading it needs no virtual walk through the chain.
 class TokenStream {
 protected:
   Token &token;
@@ -310,11 +313,23 @@ public:
   virtual std::unique_ptr<Tokenizer> create() const = 0;
 };
 
+class TokenChain;
+
+// Stored schemas must survive words becoming invalid after an analysis update.
+// This policy applies only while compiling the shared stop-word sets.
+enum class InvalidStopWords { REJECT, WARN_AND_DROP };
+
 class TokenFilterFactory : public TokenStreamFactory {
 public:
   // True when normalizeTerm applies this filter's transformation. Only these
   // filters may appear in STRING normalizers; stemmers are analysis-only.
   bool normalizing = false;
+  // Once at compile time, before freezing the factory. The prefix is unfused
+  // and contains only preceding stages; runtime chains never call this hook.
+  virtual void prepare(TokenChain& preceding, InvalidStopWords invalidStopWords) {
+    unused(preceding);
+    unused(invalidStopWords);
+  }
   virtual std::unique_ptr<TokenStream> create(std::unique_ptr<TokenStream> source) const = 0;
 };
 
@@ -324,35 +339,69 @@ public:
 // teaching message (the valid names / the offending keys); Schema::fromProto
 // adds the field name.
 std::unique_ptr<const TokenizerFactory> makeTokenizerFactory(const api::AnalyzerComponent& def);
-std::unique_ptr<const TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def);
+std::unique_ptr<TokenFilterFactory> makeTokenFilterFactory(const api::AnalyzerComponent& def);
 
 
 class TokenChain {
 public:
+  struct CharStage {
+    std::unique_ptr<CharFilter> filter;
+    bool normalizing;
+  };
+private:
+  std::vector<CharStage> charStages;
   Tokenizer &head;                   // owned via `tail` (the head is the bottom of the chain)
+public:
   std::unique_ptr<TokenStream> tail; // the top of the chain; pull from here
   bool stateful;                     // true iff any stage buffers state across tokens/values
 
-  TokenChain(Tokenizer &head, std::unique_ptr<TokenStream> tail, bool stateful = false)
-          : head(head), tail(std::move(tail)), stateful(stateful) {}
+  TokenChain(Tokenizer &head, std::unique_ptr<TokenStream> tail, bool stateful = false,
+             std::vector<CharStage> cleanups = {});
+
+  TokenChain(const TokenChain&) = delete;
+  TokenChain& operator=(const TokenChain&) = delete;
+  TokenChain(TokenChain&&) = delete;
+  TokenChain& operator=(TokenChain&&) = delete;
+
+  // Keep unconfigured indexing on the existing borrowed-input fast path.
+  void setValue(std::string_view value) {
+    if (charStages.empty()) head.setValue(value);
+    else setFilteredValue(value);
+  }
 
   // Begin analysis of a fresh value (the value itself is supplied via
-  // head.setValue). For the common stateless chain this is a single predictable
+  // setValue). For the common stateless chain this is a single predictable
   // branch with no virtual dispatch; only a chain that contains a stateful
   // filter pays the source-ward reset() walk.
   void reset() {
     if (stateful) tail->reset();
   }
 
+  // Read once after incrementToken() returns false, before the next value.
+  // Chains without stop filters keep this at zero, with no per-token work.
+  int end() { return head.getToken().finalPositionIncrement; }
+
   // Normalize a single term the way this chain folds token text, without
   // segmentation - the multiterm entry point (see TokenStream::normalizeTerm).
-  void normalizeTerm(std::string& term) { tail->normalizeTerm(term); }
+  // Like setValue(), this invalidates the current value's buffers and offset maps.
+  void normalizeTerm(std::string& term) {
+    if (!charStages.empty()) normalizeCharFilters(term);
+    tail->normalizeTerm(term);
+  }
+
+  Token& getToken() { return head.getToken(); }
+  bool hasCharFilters() const noexcept { return !charStages.empty(); }
+  // Token ends exclude trailing deletions; this is not the source value's length.
+  int sourceOffset(int offset, bool isEnd);
+private:
+  void normalizeCharFilters(std::string& term);
+  void setFilteredValue(std::string_view value);
 };
 
 
-// The compiled analysis plan for one authored AnalyzerDef (Lucene's Analyzer):
+// The compiled analysis plan for one effective AnalyzerDef (Lucene's Analyzer):
 // immutable and thread-safe, shared by every field that resolves to the same
-// definition (Schema::fromProto compiles each authored definition once).
+// definition (Schema::fromProto compiles each effective definition once).
 // compile() runs the component registry, so an Analyzer only exists for a
 // fully validated definition and owns everything it needs (the authored
 // views may be freed right after); createChain() instantiates a fresh
@@ -366,6 +415,7 @@ public:
   // state below is always consistent with the components.
   const std::unique_ptr<const TokenizerFactory> tokenizer;
   const std::vector<std::unique_ptr<const TokenFilterFactory>> filters;
+  const std::vector<std::unique_ptr<const CharFilterFactory>> charFilters;
   // unicode_word + nfkc_cf (the common default) fuses into one StandardTokenizer
   // stage - segmentation and NFKC_CF in a single pass, remaining filters on top.
   // Equivalent output (see AnalysisTest); decided here, on validated components.
@@ -379,13 +429,15 @@ public:
   // An absent tokenizer means "whitespace".  Throws std::invalid_argument with a
   // teaching message for an unknown or unnamed component or a parameter it
   // does not take.
-  static std::shared_ptr<const Analyzer> compile(const api::AnalyzerDef& def);
+  static std::shared_ptr<const Analyzer> compile(const api::AnalyzerDef& def,
+      InvalidStopWords invalidStopWords = InvalidStopWords::REJECT);
 
   std::unique_ptr<TokenChain> createChain() const;
 
 private:
   Analyzer(std::unique_ptr<const TokenizerFactory> tok,
-           std::vector<std::unique_ptr<const TokenFilterFactory>> fs, std::string canonical);
+           std::vector<std::unique_ptr<const TokenFilterFactory>> fs,
+           std::vector<std::unique_ptr<const CharFilterFactory>> cs, std::string canonical);
 };
 
 

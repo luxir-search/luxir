@@ -53,7 +53,7 @@ void TopDocsReq::fillDiversifyResponse(CalcBase& calc, MergeableCollector& data)
       if (requirements.needsCount()) list.found_groups = collector.groups->totalGroups();
       return list;
     };
-    emitDocsResponse(req, target, (int64_t)docs.size(),
+    emitDocsResponse(req, flags, target, (int64_t)docs.size(),
         [docs](int64_t i) { return docs[i].doc; },
         [docs](int64_t i) { return docs[i].score; }, collector.totalHits(),
         topDocsProto.fields, topDocsProto.batch_size, topDocsProto.offset,

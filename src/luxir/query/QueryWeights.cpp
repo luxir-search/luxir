@@ -5,6 +5,8 @@
 // queries without a .cpp of their own. Each is its class's key function; see
 // docs/dev/codebase-map.md.
 
+#include <set>
+
 #include "luxir/query/AllQuery.h"
 #include "luxir/query/AutomatonQuery.h"
 #include "luxir/query/BooleanQuery.h"
@@ -49,6 +51,69 @@ FilteredTermsEnum* AutomatonQuery::createFilteredEnum(MemPool& pool, TermsEnum& 
       assert(false);
   }
   return nullptr;
+}
+
+Query::Weight* AutomatonQuery::createWeight(
+    Context& context, int32_t flags, float multiplier) {
+  if (automatonKind != Kind::MATCH || !caseInsensitive || (flags & NEED_SCORES) == 0) {
+    return MultiTermQuery::createWeight(context, flags, multiplier);
+  }
+
+  // Discover the union across segments before computing shared synonym stats.
+  // Bound retained terms as well as scorer clauses. Unlike fuzzy, case matching
+  // promises every alternate, so overflow is an error rather than truncation.
+  std::set<std::string> variants;
+  if (auto* fieldInfo = context.getCachedFieldInfo(field)) {
+    for (auto& segment : context.topReader.segments()) {
+      const auto* segInfo = fieldInfo->segInfos.at(segment);
+      if (segInfo == nullptr) continue;
+      MemPool scratch;
+      TermsEnum te(scratch, segment.postingsReader(), *segInfo);
+      auto* filtered = createFilteredEnum(scratch, te);
+      while (filtered->next()) {
+        variants.emplace(filtered->termView());
+        if (variants.size() > MAX_CASE_VARIANTS) {
+          throw std::runtime_error(std::format(
+              "Match case_insensitive on field '{}' exceeds {} indexed case variants; use a folding field variant",
+              field, MAX_CASE_VARIANTS));
+        }
+      }
+    }
+  }
+
+  Query* rewritten;
+  if (variants.empty()) {
+    rewritten = context.pool.make<MatchNoDocsQuery>();
+  } else {
+    // MATCH patterns are escaped literals. Recover the analyzed/normalized
+    // token, without normalizing again, to prefer its own case slightly.
+    std::string exactTerm;
+    exactTerm.reserve(pattern.size());
+    for (size_t p = 0; p < pattern.size(); p++) {
+      if (pattern[p] == '\\') p++;
+      assert(p < pattern.size());
+      exactTerm.push_back(pattern[p]);
+    }
+    auto terms = context.pool.make_span<CombinedFieldQuery::Term>(variants.size());
+    size_t i = 0;
+    for (const auto& variant : variants) {
+      char* copy = context.pool.alloc(variant.size());
+      memcpy(copy, variant.data(), variant.size());
+      terms[i++] = {0, std::string_view(copy, variant.size()),
+                    variant == exactTerm ? 1.0f : CASE_ALTERNATE_WEIGHT};
+    }
+    auto fields = context.pool.make_span<std::string_view>(1);
+    auto weights = context.pool.make_span<float>(1);
+    fields[0] = field;
+    weights[0] = 1.0f;
+    rewritten = context.pool.make<CombinedFieldQuery>(fields, weights, terms);
+  }
+#ifndef NDEBUG
+  if (context.logicalValidationActive()) {
+    rewritten->validateLogical(context.planningContext(), multiplier);
+  }
+#endif
+  return rewritten->createWeight(context, flags, multiplier);
 }
 
 Query::Weight* BoostQuery::createWeight(Context& context, int32_t flags,
@@ -112,12 +177,12 @@ Query::Weight* CombinedFieldQuery::createWeight(
   // Unscored: the same match set as a disjunction of the per-field terms,
   // which keeps the term planner's docs-only and window-fill routes.
   Query* rewritten;
-  if (fields.size() == 1) {
-    rewritten = context.pool.make<TermQuery>(fields[0], term);
+  if (terms.size() == 1) {
+    rewritten = context.pool.make<TermQuery>(fields[terms[0].field], terms[0].text);
   } else {
-    auto clauses = context.pool.make_span<Query*>(fields.size());
-    for (size_t i = 0; i < fields.size(); i++) {
-      clauses[i] = context.pool.make<TermQuery>(fields[i], term);
+    auto clauses = context.pool.make_span<Query*>(terms.size());
+    for (size_t i = 0; i < terms.size(); i++) {
+      clauses[i] = context.pool.make<TermQuery>(fields[terms[i].field], terms[i].text);
     }
     rewritten = context.pool.make<BooleanQuery>(
         std::span<Query*>{}, clauses, std::span<Query*>{}, std::span<Query*>{});

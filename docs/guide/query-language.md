@@ -332,9 +332,24 @@ anchored, so `regex(mess, ...)` does not match `messiah` but `regex(mess.*,
 ...)` does. On TEXT fields, literal characters fold the way the field folds
 text while the pattern syntax, escapes, character classes, and ranges are
 codepoint-exact and never fold; STRING fields normalize literal characters
-through their normalizer; ID fields use literals verbatim. Both queries are
-constant-scoring. Quote the pattern when it contains characters the argument
-grammar would otherwise see, such as a comma or a parenthesis. See the
+through their normalizer; ID fields use literals verbatim. Add
+`case_insensitive=true` to also match other simple Unicode case forms of
+literals (and, for regex, of character-class members), as in
+`wildcard(err*, field=message_s, case_insensitive=true)`; `match(...)` accepts
+the same argument on TEXT/STRING/ID and scores the indexed case variants of
+each analyzed token as one word, with the exact case of the query preferred
+slightly. Frequencies have weight 1.0 for the analyzed/normalized query token
+and 0.9 for other variants, summed before BM25 saturation with shared
+statistics. Alternates come from query-time analyzed
+tokens, so case-preserving stemmers can be lopsided (KStem stems lowercase
+words only). This is slower than a folding TEXT variant (`_t`, `_un`, `_wl`),
+which remains the recommendation for frequent case-blind matching.
+`prefix(err, field=body_w, case_insensitive=true)` also accepts it, including
+on TEXT: its prefix is literal and normalized as a whole before case expansion.
+Prefix, wildcard, and regex remain constant-scoring. See
+[Match](query-reference.md#match) for scoring and expansion limits.
+Quote the pattern when it contains characters the argument grammar would
+otherwise see, such as a comma or a parenthesis. See the
 [structured reference](query-reference.md#wildcard) for the JSON arms.
 
 ## Per-clause scores
@@ -485,6 +500,9 @@ text. A `$` inside quotes or inside a word is an ordinary character
 Details of the date grammar. [Dates and time zones](dates.md) explains the
 model.
 
+- Numeric dates, including numeric date-math anchors, use the field's unit
+  (`ms` or `ns`) in both `expr` and `simple_query`. Exact membership (`:=`)
+  uses one floored instant per member; out-of-domain date members are dropped.
 - Both Solr and Elasticsearch/OpenSearch date-math syntaxes are accepted:
   Solr-style word units appended directly to the anchor (`NOW-1DAY/DAY`,
   `2024-01-01T00:00:00Z+2MONTHS`),

@@ -68,6 +68,7 @@ inline std::string describe(const api::Val& val) {
   if (auto b = std::get_if<bool>(&val.kind)) return *b ? "true" : "false";
   if (isNull(val)) return "null";
   if (isArray(val)) return "an array value";
+  if (std::holds_alternative<api::Map>(val.kind)) return "an object value";
   if (std::holds_alternative<api::Vector>(val.kind)) return "a vector value";
   if (std::holds_alternative<api::ArrVector>(val.kind)) return "a vector array value";
   return "an unsupported value kind";

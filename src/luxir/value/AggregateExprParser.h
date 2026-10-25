@@ -74,9 +74,12 @@ public:
   }
 
   uint32_t makeFunction(std::string_view name, size_t pos,
-                        std::span<const uint32_t> children) {
+                        std::span<const uint32_t> args) {
     const ValueFunction* function = ValueFunctionRegistry::find(name);
     assert(function != nullptr && function->evalBucketScalar != nullptr);
+    std::array<uint32_t, 2> indices{};
+    std::copy(args.begin(), args.end(), indices.begin());
+    std::span<uint32_t> children(indices.data(), args.size());
     ResolvedValue resolved = resolveFunction(*function, pos, children);
     AggregateNode node;
     node.kind = children.size() == 1
@@ -141,7 +144,7 @@ public:
 
 private:
   ResolvedValue resolveFunction(const ValueFunction& function, size_t pos,
-                                std::span<const uint32_t> children) {
+                                std::span<uint32_t> children) {
     std::array<ResolvedValue, 2> args{};
     for (size_t i = 0; i < children.size(); i++) {
       const AggregateNode& child = program->nodes[children[i]];
@@ -149,6 +152,17 @@ private:
           child.type == BucketValueType::DOUBLE
               ? ValueType::DOUBLE : ValueType::INT64,
           child.nature};
+    }
+    int convert = function.dateConversionOperand(
+        std::span<const ResolvedValue>(args.data(), children.size()));
+    if (convert >= 0) {
+      AggregateNode scale;
+      scale.intValue = 1000000;
+      scale.sourcePos = pos;
+      std::array<uint32_t, 2> inputs{children[convert], program->addNode(scale)};
+      children[convert] = makeFunction("mul", pos, inputs);
+      program->nodes[children[convert]].nature = ValueNature::DATE_NS;
+      args[convert].nature = ValueNature::DATE_NS;
     }
     try {
       return function.resolve(

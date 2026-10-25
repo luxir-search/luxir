@@ -11,6 +11,15 @@
 #include <numbers>
 #include <stdexcept>
 
+namespace luxir {
+
+struct GeoPoint {
+  double latitude;
+  double longitude;
+};
+
+} // namespace luxir
+
 namespace luxir::geo {
 
 inline constexpr int16_t BITS = 32;
@@ -33,14 +42,22 @@ struct BoundingBox {
   double maxLon;
 };
 
+inline bool validLatitude(double latitude) {
+  return std::isfinite(latitude) && latitude >= -90.0 && latitude <= 90.0;
+}
+
+inline bool validLongitude(double longitude) {
+  return std::isfinite(longitude) && longitude >= -180.0 && longitude <= 180.0;
+}
+
 inline void checkLatitude(double latitude) {
-  if (!std::isfinite(latitude) || latitude < -90.0 || latitude > 90.0) {
+  if (!validLatitude(latitude)) {
     throw std::invalid_argument("latitude must be finite and in [-90, 90]");
   }
 }
 
 inline void checkLongitude(double longitude) {
-  if (!std::isfinite(longitude) || longitude < -180.0 || longitude > 180.0) {
+  if (!validLongitude(longitude)) {
     throw std::invalid_argument("longitude must be finite and in [-180, 180]");
   }
 }

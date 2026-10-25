@@ -202,10 +202,12 @@ The outer JSON shape follows the schema:
 ```
 
 String, text, numeric, and date multi-fields use an array of scalar values.
-A multi-geo field uses an array of `[lon,lat]` points. A multi-vector field
+A multi-geo field uses an array of points in any
+[point form](geo-search.md#point-formats); an array of numbers alone is one
+point. A multi-vector field
 uses an array of number arrays; a bare number array is also accepted as a
 one-vector list. Enable a [multi-valued mode](schema.md#multi-valued-modes);
-the `_ss`, `_is`, `_fs`, `_ds`, `_dts`, and `_vs` suffixes already do.
+the `_ss`, `_is`, `_fs`, `_ds`, `_dts`, `_ps`, and `_vs` suffixes already do.
 
 ## What is returned
 
@@ -238,8 +240,10 @@ a field at ingest can be used to match or bound that field later.
 - Date fields accept epoch milliseconds, ISO-8601 strings, partial dates, and
   date math. Update messages interpret offset-less date text in UTC; search
   requests may supply a query time zone. See [Dates](dates.md).
-- Geo points and vectors have array shapes described in their dedicated
-  guides; they are not generic numeric multi-value fields. A vector is a
+- Geo points take `[lon, lat]` arrays, `{"lat", "lon"}` objects, GeoJSON
+  points, `"lat,lon"` and WKT strings, and geohashes; see
+  [Point formats](geo-search.md#point-formats). Vectors have array shapes
+  described in their guide; neither is a generic numeric multi-value field. A vector is a
   number array; integer elements are accepted, and every element must be a
   finite float32.
 

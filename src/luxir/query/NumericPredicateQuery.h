@@ -7,6 +7,7 @@
 #include <bit>
 #include <cassert>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <span>
 #include <string_view>
@@ -24,7 +25,7 @@ namespace luxir {
 // Numeric predicate over the doc-order numeric column: either one inclusive
 // range or an exact sorted value set. Every numeric field type stores an
 // order-preserving encoded int64 (INT raw, FLOAT/DOUBLE Lucene sortable bits,
-// DATE epoch millis), so pruning and comparisons happen in encoded space. A
+// DATE epoch units), so pruning and comparisons happen in encoded space. A
 // document matches when any value satisfies the range or set.
 class NumericPredicateQuery final : public Query {
   std::string_view field;
@@ -40,6 +41,31 @@ class NumericPredicateQuery final : public Query {
 
 public:
   bool recoverableAsPredicate() const noexcept override { return true; }
+
+  static constexpr int64_t kPointsVerifyWeight = 8;
+
+  static constexpr int64_t pointsVerifyLimit(int64_t cost) {
+    return cost / kPointsVerifyWeight + (cost % kPointsVerifyWeight != 0);
+  }
+
+  // Routing weights of one sparse candidate verification, in units of one
+  // column value of window production. Against a full scan, forced-arm runs
+  // favored verification at 1-10% candidates (10M docs) and 30-40% (131k).
+  // A producer also ratchets its siblings past windows it rejects, which this
+  // model does not price: on a time-ordered range, verification lost 24-87%
+  // to zone production at sub-percent leads, so zone arms keep the
+  // conservative weight. Read once so description and resolution agree; the
+  // environment overrides exist for recalibration.
+  static constexpr double kScanCandidateValueWeight = 1.25;
+  static constexpr double kZoneCandidateValueWeight = 8;
+  static inline const double scanCandidateValueWeight = [] {
+    const char* value = std::getenv("LUXIR_NUMERIC_CANDIDATE_WEIGHT");
+    return value != nullptr ? std::atof(value) : kScanCandidateValueWeight;
+  }();
+  static inline const double zoneCandidateValueWeight = [] {
+    const char* value = std::getenv("LUXIR_NUMERIC_ZONE_CANDIDATE_WEIGHT");
+    return value != nullptr ? std::atof(value) : kZoneCandidateValueWeight;
+  }();
 
   static inline bool disableShapesForTests = false;
 #ifndef NDEBUG
@@ -298,6 +324,23 @@ public:
         });
       });
       return docid;
+    }
+
+    void intersectCandidateBits(std::span<uint64_t> words, int32_t min) override {
+      docid = withTest([this, words, min](auto test) {
+        int32_t current = docid;
+        for (size_t w = 0; w < words.size(); w++) {
+          uint64_t candidates = words[w];
+          while (candidates != 0) {
+            int32_t bit = (int32_t)std::countr_zero(candidates);
+            int32_t doc = min + (int32_t)(w * 64) + bit;
+            if (current < doc) current = iter.advance(doc);
+            if (current != doc || !test(doc, iter.rank())) words[w] &= ~(1ULL << bit);
+            candidates &= candidates - 1;
+          }
+        }
+        return current;
+      });
     }
 
     void fillWindowBits(std::span<uint64_t> words, int32_t min,
@@ -1069,6 +1112,12 @@ public:
       Query::MatchState matchState;
       bool allMatch;
       bool useZoneMap;
+      double zoneProductionWork = 0;
+
+      struct Selection {
+        ScorerArm arm;
+        Query::MembershipConsumption consumption;
+      };
 
       Materialized materializePoints(MemPool& pool) {
         assert(points != nullptr);
@@ -1187,18 +1236,51 @@ public:
             && exactCount > (uint64_t)reader.docsWithValue() * 3 / 4;
       }
 
-      ScorerArm selectScorerArm(const Query::Demand& demand) const {
-        // Sparse verification pays for the consumer's possible fill span;
-        // materialize once that span can cross the range's estimate fence.
-        if (demand.span < estimatedCost) {
-          return ScorerArm::SPARSE_VERIFY;
+      Selection selectScorer(const Query::PlanContext& context) const {
+        using Consumption = Query::MembershipConsumption;
+        const auto& demand = context.demand;
+        auto windowArm = [&] {
+          int64_t verifyLimit = points == nullptr ? estimatedCost
+              : pointsVerifyLimit(estimatedCost);
+          if (demand.span < verifyLimit) return ScorerArm::SPARSE_VERIFY;
+          if (points != nullptr) return ScorerArm::POINTS;
+          return useZoneMap ? ScorerArm::ZONE_MAP : ScorerArm::SCAN;
+        };
+        if (context.membershipConsumption == Consumption::WINDOWS) {
+          return {windowArm(), Consumption::WINDOWS};
         }
-        if (points != nullptr) return ScorerArm::POINTS;
-        return useZoneMap ? ScorerArm::ZONE_MAP : ScorerArm::SCAN;
+        if (context.membershipConsumption == Consumption::CANDIDATES) {
+          ScorerArm arm = points != nullptr
+                  && demand.candidates >= pointsVerifyLimit(estimatedCost)
+              ? ScorerArm::POINTS : ScorerArm::SPARSE_VERIFY;
+          return {arm, Consumption::CANDIDATES};
+        }
+        // Compare the existing sparse decoder against production, not result
+        // cardinality. Verification does not yet reuse BlockPlan proofs.
+        double valuesPerDoc = std::max(1.0,
+            (double)reader.numValues() / std::max(1, reader.docsWithValue()));
+        double candidateWork = (useZoneMap ? zoneCandidateValueWeight
+                                           : scanCandidateValueWeight)
+            * (double)demand.candidates * valuesPerDoc;
+        double spanFraction = std::min(1.0,
+            (double)demand.span / std::max(1, segment.maxDoc()));
+        double productionWork = points != nullptr ? (double)estimatedCost
+            : spanFraction * (useZoneMap ? zoneProductionWork
+                                         : (double)reader.numValues());
+        if (points != nullptr) {
+          candidateWork = (double)kPointsVerifyWeight * (double)demand.candidates;
+        }
+        if (candidateWork < productionWork) {
+          return {ScorerArm::SPARSE_VERIFY, Consumption::CANDIDATES};
+        }
+        return {points != nullptr ? ScorerArm::POINTS
+            : useZoneMap ? ScorerArm::ZONE_MAP : ScorerArm::SCAN,
+            Consumption::WINDOWS};
       }
 
       static Query::ScorerShape shapeFor(
-          ScorerArm arm, Query::MatchState matchState) {
+          Selection selection, Query::MatchState matchState) {
+        ScorerArm arm = selection.arm;
         bool twoPhase = arm == ScorerArm::SPARSE_VERIFY
             || arm == ScorerArm::SCAN;
         return {
@@ -1213,6 +1295,7 @@ public:
           .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
           .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
           .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+          .membershipConsumption = selection.consumption,
         };
       }
 
@@ -1348,9 +1431,15 @@ public:
               [&](BlockRelation relation, uint32_t begin, uint32_t end) {
                 if (relation != BlockRelation::CROSSES) {
                   prunableValues += end - begin;
+                  if (relation == BlockRelation::INSIDE) {
+                    zoneProductionWork += (end - begin + 63) / 64;
+                  }
+                } else {
+                  zoneProductionWork += 2.0 * (end - begin);
                 }
               });
         }
+        zoneProductionWork += 8.0 * reader.numBlocks();
         int64_t denominator = ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR;
         int64_t minPrunable = reader.numValues() / denominator
             + (reader.numValues() % denominator != 0);
@@ -1385,8 +1474,7 @@ public:
       Query::ScorerShape describeScorer(
           const Query::PlanContext& buildContext) const override {
         if (buildContext.numericPredicateDisableShapesForTests) return {};
-        ScorerArm arm = selectScorerArm(buildContext.demand);
-        return shapeFor(arm, matchState);
+        return shapeFor(selectScorer(buildContext), matchState);
       }
 
       Query::UnresolvedSupplierCause unresolvedScorerCause(
@@ -1409,11 +1497,12 @@ public:
       Query::ScorerPlan* resolve(
           MemPool& planPool,
           const Query::PlanContext& planContext) override {
-        ScorerArm arm = selectScorerArm(planContext.demand);
+        Selection selection = selectScorer(planContext);
+        ScorerArm arm = selection.arm;
         bool complement = arm == ScorerArm::POINTS
             && useComplement(pointValueCount);
         return planPool.make<Plan>(
-            *this, planContext, shapeFor(arm, matchState), cost(), arm,
+            *this, planContext, shapeFor(selection, matchState), cost(), arm,
             complement);
       }
 
@@ -1463,7 +1552,7 @@ public:
           state->complement = useComplement(pointValueCount);
           return {
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
-            BulkAnswer::NO, state, -1, BulkAnswer::NO,
+            BulkAnswer::NO, state, -1, WindowFilterConsumption::NO,
           };
         }
         if (useZoneMap) {
@@ -1471,7 +1560,7 @@ public:
               this, BulkState::Arm::ZONE_MAP, use);
           return {
             BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
-            BulkAnswer::NO, state, -1, BulkAnswer::NO,
+            BulkAnswer::NO, state, -1, WindowFilterConsumption::NO,
           };
         }
         return {

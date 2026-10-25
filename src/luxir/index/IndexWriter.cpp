@@ -656,8 +656,21 @@ std::shared_ptr<const CommitSnapshot> IndexWriter::updateSchema(
     std::function<std::shared_ptr<Schema>(const Schema*)> change) {
   std::unique_lock lock(publicationMutex);
   if (isClosed()) throw IndexWriterClosedError("index writer is closed");
-  auto schema = change(getSchema().get());
+  auto previous = getSchema();
+  auto schema = change(previous.get());
   if (!schema) throw std::invalid_argument("Schema change returned no schema");
+  auto before = previous->signatures(true);
+  for (const auto& [name, signature] : schema->signatures(true)) {
+    auto old = before.find(name);
+    if (old == before.end()) continue;
+    auto oldUnit = old->second.properties.find("unit");
+    auto newUnit = signature.properties.find("unit");
+    if (oldUnit != old->second.properties.end() && newUnit != signature.properties.end()
+        && oldUnit->second != newUnit->second) {
+      throw SchemaError(std::format("Cannot change unit of existing date field '{}': {} -> {}",
+          name, oldUnit->second, newUnit->second));
+    }
+  }
   std::pmr::monotonic_buffer_resource arena;
   api::IndexInfo info;
   if (!api::decode(info, api::copyToPaddedInput(*lastSnapshot.load()->bytes, arena), arena)) {

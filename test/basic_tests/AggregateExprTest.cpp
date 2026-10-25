@@ -23,6 +23,7 @@
 #include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
 
 using namespace luxir;
@@ -287,11 +288,11 @@ TEST_F(AggregateExprTest, dateRulesAreResolvedAcrossBothLevels) {
   auto schema = Schema::createDefaultSchema();
   ArenaOwner memory;
 
-  EXPECT_EQ(ValueNature::DATE,
+  EXPECT_EQ(ValueNature::DATE_MS,
             parseAggregate(memory, *schema, "avg(when_dt)")->root().nature);
-  EXPECT_EQ(ValueNature::DATE,
+  EXPECT_EQ(ValueNature::DATE_MS,
             parseAggregate(memory, *schema, "min(when_dt)")->root().nature);
-  EXPECT_EQ(ValueNature::DATE,
+  EXPECT_EQ(ValueNature::DATE_MS,
             parseAggregate(memory, *schema, "max(when_dt)")->root().nature);
   EXPECT_EQ(ValueNature::NUMBER,
             parseAggregate(memory, *schema,
@@ -971,7 +972,7 @@ TEST_F(AggregateExprTest, percentileValidationNatureAndExactInputs) {
   expectParseError(memory, *schema, "percentile(x_i, x_i)", "numeric constants");
   EXPECT_NO_THROW(parseAggregate(memory, *schema, "percentile(x_i,100,1000)"));
   auto* program = parseAggregate(memory, *schema, "percentile(when_dt,25,20.5)");
-  EXPECT_EQ(ValueNature::DATE, program->root().nature);
+  EXPECT_EQ(ValueNature::DATE_MS, program->root().nature);
   EXPECT_EQ(BucketValueType::DOUBLE, program->root().type);
   EXPECT_TRUE(program->producers[0].resolved.state.orderSensitive);
   EXPECT_FALSE(program->producers[0].resolved.state.inlineCapable);
@@ -988,7 +989,7 @@ TEST_F(AggregateExprTest, percentileValidationNatureAndExactInputs) {
     accumulator.add(0, ValueResult::floating(std::numeric_limits<double>::infinity()));
     auto result = accumulator.finish();
     EXPECT_DOUBLE_EQ(17.5, result.doubleValue);
-    EXPECT_EQ(ValueNature::DATE, result.nature);
+    EXPECT_EQ(ValueNature::DATE_MS, result.nature);
   }
   EXPECT_EQ(0u, tracker.bytes());
 }
@@ -2390,6 +2391,125 @@ TEST_F(AggregateExprTest, denseTableHugePageBoundaryAndReuse) {
         }
       }
       EXPECT_EQ(tracker.bytes(), 0);
+    }
+  }
+}
+
+TEST_F(AggregateExprTest, dateUnitsSurviveAggregateAndBucketResults) {
+  CollectionHelper helper;
+  SchemaBuilder builder;
+  for (auto name : {"stamp", "absent"}) {
+    auto& field = builder.field(name);
+    field.type = api::FieldDef::FieldClass::DATE;
+    field.unit = api::FieldDef::DateUnit::NS;
+  }
+  builder.set(helper.collection());
+  ASSERT_TRUE(helper.indexAll({
+      flatdoc("id", "a", "stamp", 1, "when_dt", 1, "cat_s", "a"),
+      flatdoc("id", "b", "stamp", 4, "when_dt", 2, "cat_s", "a")},
+      UpdateMessage::COMMIT).success);
+  auto schema = helper.collection().getSchema();
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ArenaOwner memory;
+  struct Example { const char* expression; double expected; bool floating; ValueNature nature; };
+  for (const auto& example : {
+      Example{"min(stamp)", 1, false, ValueNature::DATE_NS},
+      {"max(stamp)", 4, false, ValueNature::DATE_NS},
+      {"avg(stamp)", 2.5, true, ValueNature::DATE_NS},
+      {"percentile(stamp,50)", 2.5, true, ValueNature::DATE_NS},
+      {"avg(stamp)+1", 3.5, true, ValueNature::DATE_NS},
+      {"avg(stamp+1)", 3.5, true, ValueNature::DATE_NS},
+      {"min(min(stamp),max(stamp))", 1, false, ValueNature::DATE_NS},
+      {"max(min(stamp),max(stamp))", 4, false, ValueNature::DATE_NS},
+      {"min(def(absent,stamp))", 1, false, ValueNature::DATE_NS},
+      {"min(def(absent,7))", 7, false, ValueNature::DATE_NS},
+      {"max(stamp)-min(stamp)", 3, false, ValueNature::NUMBER},
+      {"avg(stamp)-min(stamp)", 1.5, true, ValueNature::NUMBER},
+      {"min(stamp)-max(when_dt)", -1999999, false, ValueNature::NUMBER},
+      {"max(when_dt)-max(stamp)", 1999996, false, ValueNature::NUMBER},
+      {"avg(when_dt)-avg(stamp)", 1499997.5, true, ValueNature::NUMBER},
+      {"avg(def(absent,when_dt))", 1500000, true, ValueNature::DATE_NS},
+      {"avg(def(when_dt,stamp))", 1500000, true, ValueNature::DATE_NS},
+      {"min(min(stamp,when_dt))", 1, false, ValueNature::DATE_NS},
+      {"max(max(when_dt,stamp))", 2000000, false, ValueNature::DATE_NS},
+      {"min(min(stamp),min(when_dt))", 1, false, ValueNature::DATE_NS},
+      {"max(avg(when_dt),avg(stamp))", 1500000, true, ValueNature::DATE_NS}}) {
+    SCOPED_TRACE(example.expression);
+    auto* program = parseAggregate(memory, *schema, example.expression);
+    EXPECT_EQ(example.nature, program->root().nature);
+    BucketScalar result = evaluate(*program, *reader, reader->segments()[0]);
+    ASSERT_TRUE(result.valid);
+    EXPECT_EQ(example.nature, result.nature);
+    EXPECT_EQ(example.floating ? BucketValueType::DOUBLE : BucketValueType::INT128, result.type);
+    EXPECT_DOUBLE_EQ(example.expected, example.floating ? result.doubleValue : (double)result.intValue);
+  }
+  expectParseError(memory, *schema, "sum(stamp)", "cannot aggregate a DATE");
+  expectParseError(memory, *schema, "max(stamp)+min(when_dt)", "cannot add two DATE");
+
+  // The same native ns values must survive dense, keyed, replay and shared
+  // aggregate execution, including a DOUBLE date with a fractional tick.
+  auto guard = facetAggregateOverrides();
+  for (auto feed : {FacetFeedStrategy::BUCKET_DOMAINS, FacetFeedStrategy::STRING_COLUMN_REPLAY}) {
+    forcedFacetFeedStrategy = feed;
+    for (bool separate : {false, true}) {
+      disableAggregateSharingForTests = separate;
+      disableDenseFacetStateForTests = separate;
+      auto req = localReq(helper.getSearchEngine());
+      auto& root = req->collection("main");
+      root.expr("mid", "avg(stamp)");
+      root.expr("pct", "percentile(stamp,50)");
+      auto& facet = root.facet("f", "cat_s").limit(-1);
+      facet.expr("mid", "avg(stamp)");
+      facet.expr("lo", "min(stamp)");
+      facet.expr("hi", "max(stamp)");
+      req->execute();
+      ASSERT_OK(req);
+      EXPECT_DOUBLE_EQ(2.5, req->scalar<double>("mid"));
+      EXPECT_DOUBLE_EQ(2.5, req->scalar<double>("pct"));
+      auto& result = *req->responses[0]->proto.ops.at("f")->facetResult();
+      EXPECT_DOUBLE_EQ(2.5, std::get<api::ArrVal>(result.ops.at("mid")->kind).v[0].asDouble());
+      EXPECT_EQ(1, std::get<api::ArrVal>(result.ops.at("lo")->kind).v[0].asInt());
+      EXPECT_EQ(4, std::get<api::ArrVal>(result.ops.at("hi")->kind).v[0].asInt());
+    }
+  }
+}
+
+TEST_F(AggregateExprTest, dateUnitIsPartOfProducerIdentityAndSameUnitTreesAreUnconverted) {
+  ArenaOwner memory;
+  auto base = Schema::createDefaultSchema();
+  AggregateProgram* millis = nullptr;
+  AggregateProgram combined(*memory.arena);
+  for (bool nanos : {false, true}) {
+    SchemaBuilder builder;
+    auto& field = builder.field("stamp");
+    field.type = api::FieldDef::FieldClass::DATE;
+    field.unit = nanos ? api::FieldDef::DateUnit::NS : api::FieldDef::DateUnit::MS;
+    auto schema = builder.build(base.get());
+    auto* program = parseAggregate(memory, *schema, "max(stamp)-min(stamp)");
+    ASSERT_EQ(3u, program->nodes.size());
+    EXPECT_EQ(AggregateNodeKind::BINARY, program->root().kind);
+    EXPECT_EQ(ValueFunctionRegistry::find("sub"), program->root().function);
+    EXPECT_EQ((std::array<uint32_t, 2>{0, 1}), program->root().children);
+    for (int i = 0; i < 2; i++) {
+      EXPECT_EQ(AggregateNodeKind::AGGREGATE, program->nodes[i].kind);
+      EXPECT_EQ(nanos ? ValueNature::DATE_NS : ValueNature::DATE_MS, program->nodes[i].nature);
+      EXPECT_EQ(1u, program->producers[i].input->nodes.size());
+    }
+    EXPECT_EQ(ValueNature::NUMBER, program->root().nature);
+    const auto& producer = program->producers[0];
+    uint32_t index = combined.addProducer(producer);
+    EXPECT_EQ(nanos ? 1u : 0u, index);
+    EXPECT_EQ(index, combined.addProducer(producer));
+    if (!nanos) millis = program;
+    else {
+      EXPECT_FALSE(producer.sameState(millis->producers[0]));
+      // Even with matching output metadata, input identity includes the unit.
+      AggregateProducer differentInput = producer;
+      differentInput.resolved.nature = millis->producers[0].resolved.nature;
+      EXPECT_FALSE(differentInput.sameState(millis->producers[0]));
+      AggregateProducer differentOutput = millis->producers[0];
+      differentOutput.resolved.nature = producer.resolved.nature;
+      EXPECT_FALSE(differentOutput.sameState(millis->producers[0]));
     }
   }
 }

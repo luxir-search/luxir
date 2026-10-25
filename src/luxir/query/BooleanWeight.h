@@ -1023,6 +1023,8 @@ public:
   }
 
   bool attachWindowFilter(WindowFilter* filter) override {
+    assert(!filter->probes());
+    if (filter->probes()) return false;
     assert(windowFilter == nullptr);
     windowFilter = filter;
     return true;
@@ -2274,7 +2276,8 @@ private:
     int32_t size = 0;
   };
 
-  std::span<Query::Scorer*> scorers;  // ascending cost; scorers[0] leads
+  // Cheapest producer leads; candidate filters are owned by windowFilter.
+  std::span<Query::Scorer*> scorers;
   std::span<Query::Scorer*> prohibitedScorers;
   std::span<TermQuery::Scorer*> candidateProhibitedTerms;
   std::span<DocSet*> candidateProhibitedDocSets;
@@ -2490,6 +2493,7 @@ private:
       if (denseClauseDocId(denseClause) == PostingsReader::END) {
         prohibitedExhausted[clause] = 1;
       }
+      if (popCountWindowBits() == 0) break;
     }
   }
 
@@ -3442,7 +3446,9 @@ private:
       }
     }
 
+    if (popCountWindowBits() == 0) return false;
     applyProhibitedWindowBits(windowBase, windowEnd);
+    if (popCountWindowBits() == 0) return false;
     if (filter != nullptr && filter->type == DocSet::BITSET) {
       applyDomainBitsToWindow(windowBits, windowBase, windowEnd,
                               &((BitDocSet*) filter)->bits());
@@ -3450,7 +3456,7 @@ private:
       applyDocSetToWindow(windowBits, windowBase, windowEnd, filter);
     }
     if (windowFilter != nullptr) {
-      windowFilter->intersect(windowBits);
+      windowFilter->intersect(windowBits, windowBase);
     }
     return true;
   }
@@ -3535,7 +3541,7 @@ private:
       applyDocSetToWindow(windowBits, windowBase, windowEnd, filter);
     }
     if (windowFilter != nullptr) {
-      windowFilter->intersect(windowBits);
+      windowFilter->intersect(windowBits, windowBase);
     }
     return true;
   }
@@ -3869,7 +3875,9 @@ public:
                         std::span<const ConjunctionClauseLayout>
                             plannedClauses,
                         std::span<const ConjunctionClauseLayout>
-                            plannedProhibitedClauses)
+                            plannedProhibitedClauses,
+                        ConjunctionRoute plannedRoute,
+                        WindowFilter* membershipFilter)
       : scorers(scorers),
         prohibitedScorers(prohibitedScorers),
         candidateProhibitedTerms(candidateProhibitedTerms),
@@ -3909,6 +3917,7 @@ public:
             pool.make_arr<uint64_t>(((size_t) kChunk + 63) >> 6),
             ((size_t) kChunk + 63) >> 6),
         groupScores(pool.make_arr<float>((size_t) kChunk), (size_t) kChunk),
+        windowFilter(membershipFilter),
         maxDoc(maxDoc),
         candidateBatchSize(
             countLeadIsDocSet || candidatePostingsLead != nullptr
@@ -4044,6 +4053,10 @@ public:
         && maxDoc >= kWindowSize
         && leadCost >= std::max<int64_t>(
             1, (int64_t) maxDoc / denseThresholdInverse);
+    if (!scoredConstruction) {
+      denseCountPath = plannedRoute == ConjunctionRoute::COUNT_DENSE
+          || plannedRoute == ConjunctionRoute::COUNT_POSTINGS_SAMPLE;
+    }
     if (candidatePostingsLead != nullptr && !scoredConstruction) {
       assert(denseCountPath);
       candidateCountAdmission = CandidateCountAdmission::SAMPLING;
@@ -4110,10 +4123,9 @@ public:
   }
 
   bool attachWindowFilter(WindowFilter* filter) override {
-    if (!allTermClauses) {
+    if (!allTermClauses || windowFilter != nullptr) {
       return false;
     }
-    assert(windowFilter == nullptr);
     windowFilter = filter;
     // Candidate COUNT does not prepare WindowFilter windows. Preserve the
     // BulkScorer filter contract by selecting its exact dense sibling before
@@ -6210,7 +6222,7 @@ private:
       applyDocSetToWindow(windowBits, windowStart, windowEnd, filter);
     }
     if (windowFilter != nullptr) {
-      windowFilter->intersect(windowBits);
+      windowFilter->intersect(windowBits, windowStart);
     }
     removeExcludedWindowBits(windowBits);
     return true;
@@ -6230,7 +6242,7 @@ private:
       applyDocSetToWindow(windowBits, windowStart, windowEnd, filter);
     }
     if (windowFilter != nullptr) {
-      windowFilter->intersect(windowBits);
+      windowFilter->intersect(windowBits, windowStart);
     }
     removeExcludedWindowBits(windowBits);
     return true;
@@ -6870,6 +6882,8 @@ public:
   }
 
   bool attachWindowFilter(WindowFilter* filter) override {
+    assert(!filter->probes());
+    if (filter->probes()) return false;
     assert(windowFilter == nullptr);
     windowFilter = filter;
     // The identity counts the full largest term without consulting the
@@ -8500,6 +8514,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         const Query::Demand& demand) {
       Query::PlanContext childContext = parentContext;
       childContext.demand = demand;
+      childContext.membershipConsumption = Query::MembershipConsumption::WINDOWS;
       return childContext;
     }
 
@@ -8947,19 +8962,6 @@ class BooleanQuery::Weight final : public Query::Weight {
       CANDIDATE,
     };
 
-    // The route selected at construction/admission time. Runtime sampling
-    // may later latch a candidate route back to dense execution.
-    enum class ConjunctionRoute : uint8_t {
-      GENERIC,
-      CANDIDATE_DOC_SET_FILTER,
-      CANDIDATE_POSTINGS_FILTER,
-      CANDIDATE_SCORING_TERM,
-      COUNT_EXACT_DOCS_ONLY,
-      COUNT_POSTINGS_SAMPLE,
-      COUNT_DENSE,
-      COUNT_DOC_SET_SPARSE,
-    };
-
     enum class EnclosingFilters : uint8_t {
       NOT_SUPPLIED,
       CONSUMED,
@@ -9021,14 +9023,14 @@ class BooleanQuery::Weight final : public Query::Weight {
       bool docSetFilter;
       bool scoring;
       size_t order;
-      Query::Demand buildDemand;
+      Query::PlanContext buildContext;
       Query::ScorerPlan* plan = nullptr;
     };
 
     struct PlannedSupplier {
       Query::ScorerSupplier* supplier;
       Query::ScorerShape shape;
-      Query::Demand buildDemand;
+      Query::PlanContext buildContext;
       Query::ScorerPlan* plan = nullptr;
     };
 
@@ -9038,6 +9040,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       BulkUse use = BulkUse::MATCH_WINDOWS;
       EnclosingFilters enclosingFilters = EnclosingFilters::NOT_SUPPLIED;
       std::span<PlannedEntry> entries;
+      std::span<PlannedSupplier> candidateFilters;
       std::span<PlannedSupplier> optionalGroup;
       std::span<PlannedSupplier> prohibited;
       int64_t leadCost = 0;
@@ -9129,8 +9132,8 @@ class BooleanQuery::Weight final : public Query::Weight {
       Query::ScorerSupplier* bodySupplier = nullptr;
       BulkPlan bodyPlan;
       std::span<PlannedSupplier> filters;
-      int64_t bodyCost = 0;
       int64_t filterCost = 0;
+      bool probe = false;
 
       FilteredBodyPlan()
         : BooleanBulkBuildState(Kind::FILTERED_BODY) {}
@@ -9285,7 +9288,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       plan.mode = mode;
       plan.use = use;
       bool perEntryDemand = mode == ConjunctionMode::EXHAUSTIVE
-          && use == BulkUse::COUNT_WINDOWS;
+          && isMembershipWindowUse(use);
       plan.enclosingFilters = enclosingFilterSuppliers.empty()
           ? EnclosingFilters::NOT_SUPPLIED
           : EnclosingFilters::CONSUMED;
@@ -9363,19 +9366,20 @@ class BooleanQuery::Weight final : public Query::Weight {
           Query::Demand::fromLeadCost(plan.leadCost, use);
       for (size_t i = 0; i < entries.size(); i++) {
         PlannedEntry& entry = entries[i];
-        entry.buildDemand = Query::Demand::fromLeadCost(
-            plan.leadCost, use);
+        Query::Demand demand = Query::Demand::fromLeadCost(plan.leadCost, use);
         if (perEntryDemand) {
-          entry.buildDemand = entries.size() == 1
+          demand = entries.size() == 1
               ? Query::Demand::fromCandidatesAndSpan(
                   segment.maxDoc(), segment.maxDoc(), use)
-              : windowFillDemand(
-                  entries[i == 0 ? 1 : 0].cost, use);
+              : windowFillDemand(entries[i == 0 ? 1 : 0].cost, use);
         }
-        Query::PlanContext buildContext =
-            scorerBuildContext(entry.buildDemand);
+        entry.buildContext = scorerBuildContext(demand);
+        if (perEntryDemand && i > 0 && !entry.optionalGroup) {
+          entry.buildContext.membershipConsumption = Query::MembershipConsumption::EITHER;
+        }
+        const Query::PlanContext& buildContext = entry.buildContext;
         if (entry.optionalGroup) {
-          optionalGroupBuildDemand = entry.buildDemand;
+          optionalGroupBuildDemand = entry.buildContext.demand;
           if (hasUnknownElision(optionalSuppliers, buildContext)) {
             plan.unresolvedCause = firstUnresolvedCause(
                 optionalSuppliers, buildContext);
@@ -9399,6 +9403,35 @@ class BooleanQuery::Weight final : public Query::Weight {
           }
         }
       }
+
+      boost::container::small_vector<PlannedSupplier, 16> candidateFilters;
+      if (perEntryDemand) {
+        entries.erase(std::remove_if(entries.begin(), entries.end(), [&](const PlannedEntry& entry) {
+          if (entry.shape.membershipConsumption != Query::MembershipConsumption::CANDIDATES) {
+            return false;
+          }
+          assert(entry.shape.windowFillClause == Query::ClauseShape::DIRECT);
+          candidateFilters.push_back({entry.supplier, entry.shape, entry.buildContext});
+          return true;
+        }), entries.end());
+        assert(!entries.empty());
+        // Only producers can ratchet the lead's exposure. A sole producer
+        // must be able to produce the complete membership span.
+        auto& lead = entries[0];
+        lead.buildContext = scorerBuildContext(entries.size() == 1
+            ? Query::Demand::fromCandidatesAndSpan(segment.maxDoc(), segment.maxDoc(), use)
+            : windowFillDemand(entries[1].cost, use));
+        if (lead.optionalGroup) {
+          optionalGroupBuildDemand = lead.buildContext.demand;
+          lead.shape = plannedOptionalGroupShape(optionalSuppliers, lead.buildContext);
+        } else {
+          lead.shape = lead.supplier->describeScorer(lead.buildContext);
+        }
+      }
+      plan.nonLeadCost = 0;
+      for (size_t i = 1; i < entries.size(); i++) plan.nonLeadCost += entries[i].cost;
+      plan.candidateFilters = targetPool.make_span<PlannedSupplier>(candidateFilters.size());
+      std::copy(candidateFilters.begin(), candidateFilters.end(), plan.candidateFilters.begin());
 
       boost::container::small_vector<Query::ScorerSupplier*, 16>
           prohibitedSuppliers;
@@ -9429,7 +9462,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         plan.optionalGroup[i] = {
             optionalSuppliers[i],
             optionalSuppliers[i]->describeScorer(buildContext),
-            optionalGroupBuildDemand};
+            buildContext};
         if (plan.unresolvedCause
                 == Query::UnresolvedSupplierCause::NONE
             && plan.optionalGroup[i].shape.hasUnknown()) {
@@ -9444,7 +9477,7 @@ class BooleanQuery::Weight final : public Query::Weight {
             prohibitedSuppliers[i],
             prohibitedSuppliers[i]->describeScorer(
                 prohibitedBuildContext),
-            prohibitedBuildDemand};
+            prohibitedBuildContext};
         if (plan.unresolvedCause
                 == Query::UnresolvedSupplierCause::NONE
             && plan.prohibited[i].shape.hasUnknown()) {
@@ -9474,6 +9507,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       bool exactFilteredTermConjunction =
           mode == ConjunctionMode::EXHAUSTIVE
           && !needsScores && !disableExactTermCountForTests
+          && plan.candidateFilters.empty()
           && (!filterSuppliers.empty()
               || !enclosingFilterSuppliers.empty());
       if (exactFilteredTermConjunction) {
@@ -9481,9 +9515,6 @@ class BooleanQuery::Weight final : public Query::Weight {
                 >= ConjunctionBulkScorer::kIntegratedCountMinClauses
             && prohibitedSources.empty() && !plan.hasOptionalGroup;
         if (!structurallySupported) {
-          if (!enclosingFilterSuppliers.empty()) {
-            return {ConjunctionPlanStatus::DECLINED, plan};
-          }
           exactFilteredTermConjunction = false;
         }
       }
@@ -9500,9 +9531,8 @@ class BooleanQuery::Weight final : public Query::Weight {
           return finishRoute(
               ConjunctionRoute::COUNT_EXACT_DOCS_ONLY, false);
         }
-        if (!enclosingFilterSuppliers.empty()) {
-          return {ConjunctionPlanStatus::DECLINED, plan};
-        }
+        // Non-postings filters can still participate in the mixed window
+        // routes below, including filters supplied by an enclosing query.
       }
 
       for (const PlannedEntry& entry : plan.entries) {
@@ -9646,6 +9676,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
 
       bool postingsSampleCandidate = !needsScores
+          && plan.candidateFilters.empty()
           && !disableIntegratedFilteredCountForTests
           && (!filterSuppliers.empty()
               || !enclosingFilterSuppliers.empty())
@@ -9727,7 +9758,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           sparseEligibleTails &= *term || directDenseDocSet;
         }
       }
-      int32_t denseThresholdInverse = sparseEligibleTails
+      int32_t denseThresholdInverse = sparseEligibleTails && plan.candidateFilters.empty()
           ? ConjunctionBulkScorer::termTailDenseThresholdInverseForTests
           : ConjunctionBulkScorer::denseThresholdInverseForTests;
       bool denseCount = allDense && allDenseProhibited
@@ -9744,7 +9775,7 @@ class BooleanQuery::Weight final : public Query::Weight {
             return {ConjunctionPlanStatus::DECLINED, plan};
       }
       plan.entries[0].docSetFilter = *leadDocSet;
-      plan.docSetSparseEligible = *leadDocSet;
+      plan.docSetSparseEligible = *leadDocSet && plan.candidateFilters.empty();
       if (plan.docSetSparseEligible) {
         for (size_t i = 1; i < plan.entries.size(); i++) {
           std::optional<bool> term = directTerm(plan.entries[i].shape);
@@ -9757,6 +9788,9 @@ class BooleanQuery::Weight final : public Query::Weight {
       if (plan.docSetSparseEligible && prohibitedSources.empty()) {
         return finishRoute(
             ConjunctionRoute::COUNT_DOC_SET_SPARSE, true);
+      }
+      if (!plan.prohibited.empty()) {
+        return {ConjunctionPlanStatus::DECLINED, plan};
       }
       return finishRoute(ConjunctionRoute::GENERIC, true);
     }
@@ -9786,9 +9820,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     void resolveConjunctionChildren(
         MemPool& planPool, ConjunctionPlan& plan) {
       auto resolveChild = [&](PlannedSupplier& child) {
-        Query::PlanContext planContext =
-            scorerBuildContext(child.buildDemand);
-        child.plan = child.supplier->resolve(planPool, planContext);
+        child.plan = child.supplier->resolve(planPool, child.buildContext);
         assert(child.plan != nullptr);
       };
 
@@ -9799,9 +9831,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           }
           continue;
         }
-        Query::PlanContext planContext =
-            scorerBuildContext(entry.buildDemand);
-        entry.plan = entry.supplier->resolve(planPool, planContext);
+        entry.plan = entry.supplier->resolve(planPool, entry.buildContext);
         assert(entry.plan != nullptr);
       }
       if (plan.termFeed) {
@@ -9811,16 +9841,16 @@ class BooleanQuery::Weight final : public Query::Weight {
             plan.entries[0].supplier->resolve(planPool, planContext);
         assert(plan.independentLeadPlan != nullptr);
       }
-      for (PlannedSupplier& child : plan.prohibited) {
-        resolveChild(child);
-      }
+      for (PlannedSupplier& child : plan.prohibited) resolveChild(child);
+      for (PlannedSupplier& child : plan.candidateFilters) resolveChild(child);
     }
 
     static bool resettableConjunction(const ConjunctionPlan& plan) {
       for (const auto& entry : plan.entries) {
         if (!entry.optionalGroup && !entry.plan->supportsReset()) return false;
       }
-      return resettableChildren(plan.optionalGroup)
+      return resettableChildren(plan.candidateFilters)
+          && resettableChildren(plan.optionalGroup)
           && resettableChildren(plan.prohibited)
           && (plan.independentLeadPlan == nullptr
               || plan.independentLeadPlan->supportsReset());
@@ -9872,14 +9902,14 @@ class BooleanQuery::Weight final : public Query::Weight {
         BulkAnswer available, BulkAnswer matchWindows,
         BulkAnswer exactCandidateScoring,
         BulkAnswer consumesFilters = BulkAnswer::NO,
-        BulkAnswer acceptsWindowFilter = BulkAnswer::NO) {
+        WindowFilterConsumption windowFilterConsumption = WindowFilterConsumption::NO) {
       BulkPlan plan{
         available,
         matchWindows,
         exactCandidateScoring,
         consumesFilters,
       };
-      plan.acceptsWindowFilter = acceptsWindowFilter;
+      plan.windowFilterConsumption = windowFilterConsumption;
       return plan;
     }
 
@@ -9891,7 +9921,7 @@ class BooleanQuery::Weight final : public Query::Weight {
     static BulkPlan matchWindowBulkPlan() {
       return knownBulkPlan(
           BulkAnswer::YES, BulkAnswer::YES, BulkAnswer::NO,
-          BulkAnswer::NO, BulkAnswer::YES);
+          BulkAnswer::NO, WindowFilterConsumption::FILL);
     }
 
     BulkPlan planConjunctionBulk(
@@ -9904,7 +9934,7 @@ class BooleanQuery::Weight final : public Query::Weight {
           enclosingFilterSuppliers);
       switch (planning.status) {
         case ConjunctionPlanStatus::READY: {
-          bool acceptsWindowFilter = true;
+          bool acceptsWindowFilter = planning.plan.candidateFilters.empty();
           for (const PlannedEntry& entry : planning.plan.entries) {
             acceptsWindowFilter &=
                 entry.shape.termDisjunctionClause
@@ -9921,7 +9951,7 @@ class BooleanQuery::Weight final : public Query::Weight {
               enclosingFilterSuppliers.empty()
                   ? BulkAnswer::NO : BulkAnswer::YES,
               acceptsWindowFilter
-                  ? BulkAnswer::YES : BulkAnswer::NO);
+                  ? WindowFilterConsumption::FILL_OR_PROBE : WindowFilterConsumption::NO);
           resolveConjunctionChildren(pool, planning.plan);
           auto* buildPlan = pool.make<ConjunctionPlan>(planning.plan);
           buildPlan->owner = this;
@@ -9980,13 +10010,16 @@ class BooleanQuery::Weight final : public Query::Weight {
         }
       };
       for (const PlannedEntry& entry : plan.entries) {
-        assertBuildDemand(entry.buildDemand);
+        assertBuildDemand(entry.buildContext.demand);
       }
       for (const PlannedSupplier& member : plan.optionalGroup) {
-        assertBuildDemand(member.buildDemand);
+        assertBuildDemand(member.buildContext.demand);
       }
       for (const PlannedSupplier& prohibited : plan.prohibited) {
-        assertBuildDemand(prohibited.buildDemand);
+        assertBuildDemand(prohibited.buildContext.demand);
+      }
+      for (const PlannedSupplier& filter : plan.candidateFilters) {
+        assertBuildDemand(filter.buildContext.demand);
       }
       if (plan.route == ConjunctionRoute::COUNT_EXACT_DOCS_ONLY) {
         auto countTermEnums =
@@ -10160,7 +10193,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
 
       bool runtimeDocSetSparseEligible =
-          plan.entries[0].docSetFilter;
+          plan.entries[0].docSetFilter && plan.candidateFilters.empty();
       if (runtimeDocSetSparseEligible) {
         for (size_t i = 1; i < plan.entries.size(); i++) {
           if (clauseLayouts[i].directTerm == nullptr) {
@@ -10247,6 +10280,15 @@ class BooleanQuery::Weight final : public Query::Weight {
         candidateProhibitedDocSets = {docSets.data(), docSets.size()};
       }
 
+      WindowFilter* membershipFilter = nullptr;
+      if (!plan.candidateFilters.empty()) {
+        auto filters = targetPool.make_span<Query::Scorer*>(plan.candidateFilters.size());
+        for (size_t i = 0; i < filters.size(); i++) {
+          filters[i] = plan.candidateFilters[i].plan->build(targetPool);
+          if (filters[i] == nullptr) return {};
+        }
+        membershipFilter = targetPool.make<WindowFilter>(targetPool, filters, true);
+      }
       auto* bulk = targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
           targetPool,
           std::span<Query::Scorer*>(arr, plan.entries.size()),
@@ -10255,11 +10297,11 @@ class BooleanQuery::Weight final : public Query::Weight {
           clauseScores, segment.maxDoc(),
           plan.leadCost, plan.nonLeadCost,
           plan.mode != ConjunctionMode::EXHAUSTIVE,
-          plan.entries[0].docSetFilter, candidatePostingsLead,
+          plan.entries[0].docSetFilter && plan.candidateFilters.empty(), candidatePostingsLead,
           candidateLeadScoreScorer, candidateFilters,
           candidateFilterDocSets, plan.negatedCount, false,
           clauseLayouts,
-          prohibitedLayouts.first(prohibitedCount));
+          prohibitedLayouts.first(prohibitedCount), plan.route, membershipFilter);
 
 #ifndef NDEBUG
       ConjunctionRoute builtRoute = ConjunctionRoute::GENERIC;
@@ -10354,7 +10396,7 @@ class BooleanQuery::Weight final : public Query::Weight {
             || shape.reportedTwoPhase != Query::ReportedTwoPhase::NO) {
           return noBulkPlan();
         }
-        optional.push_back({supplier, shape, demand});
+        optional.push_back({supplier, shape, buildContext});
         optionalCosts.push_back(cost);
       }
       if (optional.empty()) {
@@ -10363,7 +10405,7 @@ class BooleanQuery::Weight final : public Query::Weight {
 
       auto* state = pool.make<MandOptPlan>();
       state->owner = this;
-      state->mandatory = {mandSupplier, mandShape, demand};
+      state->mandatory = {mandSupplier, mandShape, buildContext};
       state->mandatory.plan = mandSupplier->resolve(pool, buildContext);
       state->mandatoryCost = mandCost;
       state->optional = pool.make_span<PlannedSupplier>(optional.size());
@@ -10376,7 +10418,7 @@ class BooleanQuery::Weight final : public Query::Weight {
       }
       BulkPlan plan = matchWindowBulkPlan();
       plan.buildState = state;
-      plan.acceptsWindowFilter = BulkAnswer::YES;
+      plan.windowFilterConsumption = WindowFilterConsumption::FILL;
       return plan;
     }
 
@@ -10422,7 +10464,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         if (shape.matchState != Query::MatchState::NONEMPTY) {
           return noBulkPlan();
         }
-        optional.push_back({supplier, shape, optionalDemand});
+        optional.push_back({supplier, shape, optionalContext});
         optionalCosts.push_back(cost);
         if (cost > 0
             && aggregateClauseCost < std::numeric_limits<int64_t>::max()) {
@@ -10460,7 +10502,7 @@ class BooleanQuery::Weight final : public Query::Weight {
                       != Query::ClauseShape::FLAT_DISJUNCTION)) {
             return noBulkPlan();
           }
-          prohibited.push_back({supplier, shape, exclusionDemand});
+          prohibited.push_back({supplier, shape, exclusionContext});
         }
       }
 
@@ -10550,7 +10592,7 @@ class BooleanQuery::Weight final : public Query::Weight {
 
       BulkPlan plan = matchWindowBulkPlan();
       plan.buildState = state;
-      plan.acceptsWindowFilter = BulkAnswer::YES;
+      plan.windowFilterConsumption = WindowFilterConsumption::FILL;
       return plan;
     }
 
@@ -10666,7 +10708,7 @@ class BooleanQuery::Weight final : public Query::Weight {
         } else {
           Query::ScorerShape shape =
               filterSupplier->describeScorer(filterContext);
-          filter = {filterSupplier, shape, filterDemand};
+          filter = {filterSupplier, shape, filterContext};
         }
       } else if (!QueryPrep::
                      disableSparseBatchPostingsFeedForTests) {
@@ -10674,7 +10716,7 @@ class BooleanQuery::Weight final : public Query::Weight {
             describeResolved(filterSupplier, filterContext);
         if (shape.matchState == Query::MatchState::NONEMPTY
             && shape.directKind == Query::DirectScorerKind::TERM) {
-          filter = {filterSupplier, shape, filterDemand};
+          filter = {filterSupplier, shape, filterContext};
           postingsFilterFeed = true;
         }
       }
@@ -10706,7 +10748,7 @@ class BooleanQuery::Weight final : public Query::Weight {
             || shape.directKind != Query::DirectScorerKind::TERM) {
           return declined();
         }
-        entries.push_back({supplier, shape, optionalDemand});
+        entries.push_back({supplier, shape, optionalContext});
       }
       if (entries.empty()) {
         return declined();
@@ -10816,7 +10858,7 @@ class BooleanQuery::Weight final : public Query::Weight {
                 != Query::ReportedTwoPhase::NO) {
           return noBulkPlan();
         }
-        optional.push_back({supplier, shape, demand});
+        optional.push_back({supplier, shape, context});
       }
 
       auto* state = pool.make<ExactFilteredMandOptPlan>();
@@ -10947,31 +10989,52 @@ class BooleanQuery::Weight final : public Query::Weight {
         return plan;
       }
       if (bodyPlan.consumesFilters != BulkAnswer::NO
-          || bodyPlan.acceptsWindowFilter != BulkAnswer::YES) {
+          || bodyPlan.windowFilterConsumption == WindowFilterConsumption::NO) {
         return noBulkPlan();
       }
 
-      Query::Demand filterDemand = Query::Demand::fromLeadCost(
-          bodyCost, use);
-      Query::PlanContext filterContext =
-          scorerBuildContext(filterDemand);
+      bool probe = bodyPlan.windowFilterConsumption == WindowFilterConsumption::FILL_OR_PROBE
+          && !disableFilterMaskProbeForTests
+          && localFilterCost > 0
+          && localFilterCost >= (int64_t) segment.maxDoc()
+                                   / kMaskProbeMinFilterDensityInverse
+          && bodyCost <= (localFilterCost - 1) / kMaskProbeAdvanceWeight;
+      // A mask consumes the physical windows reached by the body, not just
+      // its candidate docids. Resolve the filter for the consumption chosen
+      // here so a sparse verifier cannot turn into a whole-column scan.
+      Query::Demand filterDemand = windowFillDemand(bodyCost, use);
+      Query::PlanContext filterContext = scorerBuildContext(filterDemand);
       boost::container::small_vector<PlannedSupplier, 16> filters;
-      for (Query::ScorerSupplier* supplier : filterSuppliers) {
-        if (supplier == nullptr) return noBulkPlan();
-        Query::ScorerShape shape =
-            describeResolved(supplier, filterContext);
-        if (shape.matchState != Query::MatchState::NONEMPTY
-            || shape.windowFillClause != Query::ClauseShape::DIRECT) {
-          return noBulkPlan();
+      for (;;) {
+        filterContext.membershipConsumption = probe
+            ? Query::MembershipConsumption::CANDIDATES
+            : Query::MembershipConsumption::WINDOWS;
+        filters.clear();
+        bool retryFill = false;
+        for (Query::ScorerSupplier* supplier : filterSuppliers) {
+          if (supplier == nullptr) return noBulkPlan();
+          Query::ScorerShape shape = describeResolved(supplier, filterContext);
+          if (shape.matchState == Query::MatchState::EMPTY) return noBulkPlan();
+          // Keep the prior admission for fill-only bodies. Unknown predicates
+          // can be much cheaper to verify on pull candidates than to fill.
+          if (bodyPlan.windowFilterConsumption == WindowFilterConsumption::FILL
+              && shape.matchState == Query::MatchState::UNKNOWN) return noBulkPlan();
+          if (probe && shape.membershipConsumption != Query::MembershipConsumption::CANDIDATES) {
+            retryFill = true;
+            break;
+          }
+          if (shape.windowFillClause != Query::ClauseShape::DIRECT) return noBulkPlan();
+          filters.push_back({supplier, shape, filterContext});
         }
-        filters.push_back({supplier, shape, filterDemand});
+        if (!retryFill) break;
+        probe = false;
       }
       auto* state = pool.make<FilteredBodyPlan>();
       state->owner = this;
       state->bodySupplier = bodySupplier;
       state->bodyPlan = bodyPlan;
-      state->bodyCost = bodyCost;
       state->filterCost = localFilterCost;
+      state->probe = probe;
       state->filters = pool.make_span<PlannedSupplier>(filters.size());
       for (size_t i = 0; i < filters.size(); i++) {
         filters[i].plan = filters[i].supplier->resolve(
@@ -10985,23 +11048,16 @@ class BooleanQuery::Weight final : public Query::Weight {
 
     BulkScorer* buildFilteredBodyBulk(
         MemPool& targetPool, const FilteredBodyPlan& plan) {
-      BulkScorer* bulk = plan.bodySupplier->buildBulk(
-          targetPool, plan.bodyPlan);
-      assert(bulk != nullptr);
       auto scorers = targetPool.make_span<Query::Scorer*>(
           plan.filters.size());
       for (size_t i = 0; i < plan.filters.size(); i++) {
         scorers[i] = plan.filters[i].plan->build(targetPool);
-        assert(scorers[i] != nullptr);
+        if (scorers[i] == nullptr) return nullptr;
       }
-      bool probe = !disableFilterMaskProbeForTests
-          && plan.filterCost > 0
-          && plan.filterCost >= (int64_t) segment.maxDoc()
-                                   / kMaskProbeMinFilterDensityInverse
-          && plan.bodyCost
-              <= (plan.filterCost - 1) / kMaskProbeAdvanceWeight;
       auto* filter = targetPool.make<WindowFilter>(
-          targetPool, scorers, probe, plan.filterCost);
+          targetPool, scorers, plan.probe, plan.filterCost);
+      BulkScorer* bulk = plan.bodySupplier->buildBulk(targetPool, plan.bodyPlan);
+      assert(bulk != nullptr);
       bool attached = bulk->attachWindowFilter(filter);
       assert(attached);
       return attached ? bulk : nullptr;

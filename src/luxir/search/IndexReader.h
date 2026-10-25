@@ -170,6 +170,7 @@ public:
     const Segment* segments = nullptr;
     FieldSegments(const FieldRecord* record, const Segment* segments)
         : record(record), segments(segments) {}
+    int32_t ordinalAt(size_t segment) const;
     const HeaderTotals& totals() const;
 
   public:
@@ -210,6 +211,8 @@ private:
   struct HeaderTotals {
     Similarity::FieldStats stats;
     FieldType::flag_type flags = 0;
+    FieldType::Type type = FieldType::NONE;
+    uint32_t typeFlags = 0;
   };
 
   // Positive names, header totals and OrdMaps shared by segment sets with the same
@@ -388,6 +391,8 @@ public:
     return core->coreGeneration;
   }
 
+  // Validate this schema's type against the field's persisted segment types
+  // on access. Unused fields never prevent opening or using a reader.
   FieldSegments field(std::string_view name) const;
 
   std::shared_ptr<OrdMap> getOrdMap(std::string_view name);

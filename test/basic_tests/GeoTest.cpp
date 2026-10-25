@@ -336,7 +336,7 @@ TEST_F(GeoBoxQueryTest, publicWireRejectsBadPointsWithoutCorruptingLaterDocs) {
     setDoubles(val, mr, {1.0});
   });
   addWireDoc(update, "long", "geo_single", [](api::Val& val, auto& mr) {
-    setInts(val, mr, {1, 2, 3});
+    setInts(val, mr, {1, 2, 3, 4});
   });
   addWireDoc(update, "text", "geo_single", [](api::Val& val, auto& mr) {
     setValues(val, mr, 2, [](api::Val& elem, size_t i, auto&) {
@@ -356,10 +356,12 @@ TEST_F(GeoBoxQueryTest, publicWireRejectsBadPointsWithoutCorruptingLaterDocs) {
   ASSERT_EQ(IndexResult::Status::PARTIAL, result.status);
   ASSERT_EQ(4u, result.errors.size());
   for (const auto& error : result.errors) {
-    EXPECT_NE(std::string::npos, error.error_message.find("field 'geo_single'"));
-    EXPECT_NE(std::string::npos,
-              error.error_message.find("[x, y] = [lon, lat]"));
+    EXPECT_NE(std::string::npos, error.error_message.find("'geo_single'"));
   }
+  EXPECT_NE(std::string::npos, result.errors[0].error_message.find("needs 2 coordinates"));
+  EXPECT_NE(std::string::npos, result.errors[1].error_message.find("needs 2 coordinates"));
+  EXPECT_NE(std::string::npos, result.errors[2].error_message.find("geohash"));
+  EXPECT_NE(std::string::npos, result.errors[3].error_message.find("single-valued"));
 
   auto req = localReq(luxirNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");

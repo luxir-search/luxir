@@ -294,6 +294,7 @@ public:
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->segmentFlags();
+    fieldInfo.typeFlags = fieldType->segmentTypeFlags();
     fieldInfo.numValues = numValuesTotal;
 
     auto maxDoc = inverter.getMaxDoc();

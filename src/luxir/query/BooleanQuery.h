@@ -1121,6 +1121,19 @@ public:
       Context& context, const Query& owner, std::span<Query*> clauses,
       ScorePolicy policy, int32_t flags, float multiplier);
 
+  // The route selected at construction/admission time. Runtime sampling
+  // may later latch a candidate route back to dense execution.
+  enum class ConjunctionRoute : uint8_t {
+    GENERIC,
+    CANDIDATE_DOC_SET_FILTER,
+    CANDIDATE_POSTINGS_FILTER,
+    CANDIDATE_SCORING_TERM,
+    COUNT_EXACT_DOCS_ONLY,
+    COUNT_POSTINGS_SAMPLE,
+    COUNT_DENSE,
+    COUNT_DOC_SET_SPARSE,
+  };
+
   struct ConjunctionClauseLayout {
     Query::ClauseShape windowFillKind = Query::ClauseShape::NONE;
     std::span<Query::Scorer*> denseMembers;

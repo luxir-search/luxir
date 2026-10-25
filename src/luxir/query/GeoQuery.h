@@ -219,6 +219,8 @@ public:
         .independentTerm = Query::IndependentTermAccess::UNSUPPORTED,
         .docsOnly = Query::DocsOnlyAccess::UNSUPPORTED,
         .directDocSet = Query::DirectDocSetAccess::UNSUPPORTED,
+        // Candidate consumption requires a bounded verifier before opting in.
+        .membershipConsumption = Query::MembershipConsumption::WINDOWS,
       };
     }
 

@@ -104,6 +104,7 @@ public:
   SearchEngine& engine;
   const SearchConfig searchConfig;
   RequestMemTracker memoryTracker;
+  uint64_t flags = 0;             // effective packed options, resolved during parsing
   // Shared by every query tree of the request: one allowance for all of its
   // prefix/wildcard/regex/range/fuzzy dictionary work.
   MultiTermBudget multiTermBudget;

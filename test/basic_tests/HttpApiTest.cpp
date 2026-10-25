@@ -1123,6 +1123,46 @@ TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
   EXPECT_EQ(result.body().find(R"("la")"), std::string::npos) << result.body();
 }
 
+TEST_F(HttpApiTest, geoPointFormatsAndOptionsOverJson) {
+  auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
+    "fields": {
+      "geo": {"type":"geo_point", "index":"range", "multi":true,
+              "ignore_malformed":true, "ignore_z_value":true}
+    }
+  })");
+  ASSERT_EQ(200, schema.result_int()) << schema.body();
+  auto authored = httpRequest(port(), http::verb::get, "/collections/main/_schema");
+  ASSERT_EQ(200, authored.result_int()) << authored.body();
+  EXPECT_NE(authored.body().find(R"("ignore_malformed": true)"), std::string::npos) << authored.body();
+  EXPECT_NE(authored.body().find(R"("ignore_z_value": true)"), std::string::npos) << authored.body();
+  auto resolved = httpRequest(port(), http::verb::get, "/collections/main/_schema?view=resolved");
+  ASSERT_EQ(200, resolved.result_int()) << resolved.body();
+  EXPECT_NE(resolved.body().find(R"("ignore_malformed": true)"), std::string::npos) << resolved.body();
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"obj","geo":{"lat":40.7128,"lon":-74.0060}},)"
+      R"j({"id":"str","geo":["40.7128,-74.0060","POINT (-0.1278 51.5074 12)"]},)j"
+      R"({"id":"hash","geo":"dr5regw3p"},)"
+      R"({"id":"bad","geo":"not a point","home_p":"51.5074,-0.1278"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_EQ(update.body().find(R"("errors")"), std::string::npos) << update.body();
+
+  auto near = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_distance":{"field":"geo","lat":40.7128,"lon":-74.0060,"radius_meters":1000}},)"
+      R"("fields":["id"],"count_limit":-1})");
+  ASSERT_EQ(200, near.result_int()) << near.body();
+  for (const char* id : {R"("obj")", R"("str")", R"("hash")"}) {
+    EXPECT_NE(near.body().find(id), std::string::npos) << id << near.body();
+  }
+  EXPECT_EQ(near.body().find(R"("bad")"), std::string::npos) << near.body();
+
+  auto london = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":{"geo_distance":{"field":"home_p","lat":51.5074,"lon":-0.1278,"radius_meters":10}},)"
+      R"("fields":["id"]})");
+  ASSERT_EQ(200, london.result_int()) << london.body();
+  EXPECT_NE(london.body().find(R"("bad")"), std::string::npos) << london.body();
+}
+
 TEST_F(HttpApiTest, vectorDocumentsRoundTripOverJson) {
   auto schema = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
     "fields": {
@@ -2683,7 +2723,7 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   }, UpdateMessage::COMMIT);
 
   const std::string body =
-      R"({"collection":"","query":{"match":{"status_s":"active"}},"fields":["id"]})";
+      R"({"collection":"","flags":["date_iso"],"query":{"match":{"status_s":"active"}},"fields":["id"]})";
   auto echo = httpRequest(port(), http::verb::post,
                           "/collections/main/_search?explain=request", body);
   ASSERT_EQ(200, echo.result_int()) << echo.body();
@@ -2694,6 +2734,8 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   EXPECT_NE(canonical.find(R"("field":"status_s")"), std::string::npos) << canonical;
   EXPECT_NE(canonical.find(R"("val":"active")"), std::string::npos) << canonical;
   EXPECT_NE(canonical.find(R"("collection":"main")"), std::string::npos) << canonical;
+  EXPECT_NE(canonical.find(R"("flags":["date_iso"])"), std::string::npos) << canonical;
+  EXPECT_EQ(canonical.find("flags_set"), std::string::npos) << canonical;
   // not executed
   EXPECT_EQ(canonical.find(R"("docs")"), std::string::npos) << canonical;
   EXPECT_EQ(canonical.find(R"("found")"), std::string::npos) << canonical;
@@ -3274,7 +3316,12 @@ TEST_F(HttpApiTest, schemaSetAndReplaceAllModes) {
   auto redefine = httpRequest(port(), http::verb::post, "/collections/main/_schema",
                               R"({"fields": {"published": {"type": "date"}}})");
   ASSERT_EQ(200, redefine.result_int()) << redefine.body();
-  EXPECT_EQ(redefine.body().find("\"index\": \"range\""), std::string::npos)
+  // Only published's own definition: the geo suffix templates are range-indexed.
+  size_t published = redefine.body().find("\"published\"");
+  ASSERT_NE(std::string::npos, published) << redefine.body();
+  std::string definition = redefine.body().substr(
+      published, redefine.body().find('}', published) - published);
+  EXPECT_EQ(definition.find("\"index\""), std::string::npos)
       << "whole-definition set dropped the old index property: " << redefine.body();
 
   // mode=replace_all: title/published gone, reserved fields materialized.
@@ -4515,6 +4562,41 @@ TEST_F(HttpApiTest, collapseOverlayRowsColumnsAndDocs) {
   ASSERT_FALSE(glz::read_json(singleton, lines.back()));
   EXPECT_TRUE(singleton["_group_"]["val"].is_null());
   EXPECT_TRUE(singleton["_group_"]["singleton"].get<bool>());
+}
+
+TEST_F(HttpApiTest, int64StringsApplyToEnvelopeAndDocumentStreams) {
+  SchemaBuilder schema;
+  auto& field = schema.field("stamp");
+  field.type = api::FieldDef::FieldClass::DATE;
+  field.unit = api::FieldDef::DateUnit::NS;
+  schema.set(helper.collection());
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "stamp", int64_t{1700000000123456789},
+      "when_dt", int64_t{1700000000123}, "large_i", int64_t{9007199254740992},
+      "values_is", std::vector<int64_t>{INT64_MIN, -9007199254740992, -9007199254740991,
+          9007199254740991, 9007199254740992, INT64_MAX}), UpdateMessage::COMMIT).success);
+  for (auto format : {"rows", "columns", "adaptive"}) for (auto framing : {"", "?format=docs"}) {
+    if (*framing != '\0' && std::string_view(format) != "rows") continue;
+    auto json = fmt::format(R"json({{"flags":["int64_str"],"query":"*:*","count_limit":-1,
+      "document_format":"{}","fields":["stamp","when_dt","large_i","values_is"]}})json", format);
+    auto response = httpRequest(port(), http::verb::post,
+        "/collections/main/_search" + std::string(framing), json);
+    ASSERT_EQ(200, response.result_int()) << response.body();
+    for (auto text : {R"("stamp":"1700000000123456789")", R"("when_dt":1700000000123)",
+                      R"("large_i":"9007199254740992")", R"("found":1)",
+                      R"("values_is":["-9223372036854775808","-9007199254740992",-9007199254740991,9007199254740991,"9007199254740992","9223372036854775807"])"}) {
+      EXPECT_NE(std::string::npos, response.body().find(text)) << response.body();
+    }
+  }
+  auto ordinary = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"query":"*:*","fields":["stamp","when_dt"]})");
+  auto explicitDefault = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"flags":[],"query":"*:*","fields":["stamp","when_dt"]})");
+  EXPECT_EQ(ordinary.body(), explicitDefault.body());
+  EXPECT_NE(std::string::npos, ordinary.body().find(R"("stamp":1700000000123456789)"));
+  auto rejected = httpRequest(port(), http::verb::post, "/collections/main/_search",
+      R"({"ops":{"q":{"flags":["int64_str"],"top_docs":{}}}})");
+  EXPECT_EQ(400, rejected.result_int());
+  EXPECT_NE(std::string::npos, rejected.body().find("request-level only"));
 }
 
 } // namespace luxir::test
