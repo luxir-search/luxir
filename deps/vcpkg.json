@@ -34,6 +34,12 @@
     }
   ],
   "features": {
+    "icu": {
+      "description": "ICU libraries for out-of-tree plugins that need them",
+      "dependencies": [
+        "icu"
+      ]
+    },
     "jemalloc": {
       "description": "jemalloc as the process allocator; sanitizer installs omit it",
       "dependencies": [
