@@ -73,9 +73,16 @@ fi
 stage sources ./deps/fetch_sources.sh
 # Make-based ports preserve CC/CXX from the environment, even when CMake has
 # selected the cross compiler. Let vcpkg supply each triplet's compiler.
+# Optional extra vcpkg manifest features (for example "icu"), comma-separated.
+extra_features=()
+IFS=, read -ra _features <<< "${LUXIR_VCPKG_FEATURES:-}"
+for _f in ${_features[@]+"${_features[@]}"}; do
+    [[ -z $_f ]] || extra_features+=("--x-feature=$_f")
+done
 stage dependencies env -u CC -u CXX "$vcpkg/vcpkg" install --x-manifest-root="$repo_dir/deps" \
     --x-install-root="$repo_dir/build/arm64-deps" --triplet=arm64-linux-luxir \
     --host-triplet=x64-linux-luxir-host --x-feature=jemalloc \
+    ${extra_features[@]+"${extra_features[@]}"} \
     --clean-buildtrees-after-build --clean-packages-after-build
 stage lapack-check "$LUXIR_ARM64_TOOLCHAIN/bin/aarch64-unknown-linux-gnu-g++" \
     --sysroot="$LUXIR_ARM64_SYSROOT" -march=armv8-a -std=c++26 -O2 -pthread \
