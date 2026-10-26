@@ -38,6 +38,13 @@ else
   jemalloc=(--x-feature=jemalloc)
 fi
 
+# Optional extra manifest features (comma-separated, e.g. "icu") for the normal
+# native install, from LUXIR_VCPKG_FEATURES.
+IFS=, read -ra extra <<< "${LUXIR_VCPKG_FEATURES:-}"
+for f in ${extra[@]+"${extra[@]}"}; do
+  [[ -z $f ]] || jemalloc+=("--x-feature=$f")
+done
+
 # Manifest reconciliation owns each prefix. Keep normal, ASan and legacy
 # classic-mode installs separate. Host code generators always run unsanitized.
 # ASan's separate host packages need only Release; normal builds reuse their

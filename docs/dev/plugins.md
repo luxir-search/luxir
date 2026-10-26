@@ -91,6 +91,8 @@ runtime plugin also embeds the string `luxir-plugin-compiled:<name>`, so
 
 For ARM64 builds, `tools/build-arm64` installs extra vcpkg manifest features named in
 `LUXIR_VCPKG_FEATURES` (comma-separated; for example `icu` for plugins that link ICU).
+`deps/make_deps.sh` reads the same variable for the native install, so plugins link ICU
+statically there too.
 
 Plugin targets see the include directories `luxir_lib` keeps private (generated
 protos, hash maps) and link TBB, so a plugin can build on engine internals such as
