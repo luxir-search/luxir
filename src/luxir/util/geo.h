@@ -89,28 +89,31 @@ inline double decodeLongitude(int32_t encoded) {
 }
 
 // A GEO_POINT column value is the Morton (Z-order) interleave of the two
-// quantized coordinates: latitude in the odd bits, longitude in the even
+// quantized coordinates: longitude in the odd bits, latitude in the even
 // bits, each biased to unsigned first so the interleave orders like the grid.
+// Longitude takes the top bit, so the unsigned interleave is bit-identical to
+// a geohash's binary form (longitude bit first): the top 5p bits are the
+// precision-p geohash (geohashPrefix).
 // The top bit is then flipped back so signed int64 order, which column zones
 // and FOR blocks use, is exactly Morton order. Nearby points share high bits,
 // so a spatially clustered block packs into few bits, and a block's
 // [min, max] bounds a 2-D cell (mortonCell) instead of only latitude.
-inline constexpr uint64_t MORTON_LAT_BITS = UINT64_C(0xaaaaaaaaaaaaaaaa);
-inline constexpr uint64_t MORTON_LON_BITS = UINT64_C(0x5555555555555555);
+inline constexpr uint64_t MORTON_ODD_BITS = UINT64_C(0xaaaaaaaaaaaaaaaa);
+inline constexpr uint64_t MORTON_EVEN_BITS = UINT64_C(0x5555555555555555);
 inline constexpr uint64_t MORTON_SIGN = UINT64_C(1) << 63;
 inline constexpr uint32_t COORD_BIAS = UINT32_C(0x80000000);
 
 // Deposits the 32 bits of value into the even bits of the result.
 inline uint64_t spreadBits(uint32_t value) {
 #if defined(__BMI2__)
-  return _pdep_u64(value, MORTON_LON_BITS);
+  return _pdep_u64(value, MORTON_EVEN_BITS);
 #else
   uint64_t x = value;
   x = (x | (x << 16)) & UINT64_C(0x0000ffff0000ffff);
   x = (x | (x << 8)) & UINT64_C(0x00ff00ff00ff00ff);
   x = (x | (x << 4)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
   x = (x | (x << 2)) & UINT64_C(0x3333333333333333);
-  x = (x | (x << 1)) & MORTON_LON_BITS;
+  x = (x | (x << 1)) & MORTON_EVEN_BITS;
   return x;
 #endif
 }
@@ -118,9 +121,9 @@ inline uint64_t spreadBits(uint32_t value) {
 // Inverse of spreadBits: gathers the even bits of value.
 inline uint32_t compactBits(uint64_t value) {
 #if defined(__BMI2__)
-  return (uint32_t)_pext_u64(value, MORTON_LON_BITS);
+  return (uint32_t)_pext_u64(value, MORTON_EVEN_BITS);
 #else
-  uint64_t x = value & MORTON_LON_BITS;
+  uint64_t x = value & MORTON_EVEN_BITS;
   x = (x | (x >> 1)) & UINT64_C(0x3333333333333333);
   x = (x | (x >> 2)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
   x = (x | (x >> 4)) & UINT64_C(0x00ff00ff00ff00ff);
@@ -131,8 +134,8 @@ inline uint32_t compactBits(uint64_t value) {
 }
 
 inline int64_t pack(int32_t latitude, int32_t longitude) {
-  uint64_t morton = (spreadBits((uint32_t)latitude ^ COORD_BIAS) << 1)
-      | spreadBits((uint32_t)longitude ^ COORD_BIAS);
+  uint64_t morton = (spreadBits((uint32_t)longitude ^ COORD_BIAS) << 1)
+      | spreadBits((uint32_t)latitude ^ COORD_BIAS);
   return (int64_t)(morton ^ MORTON_SIGN);
 }
 
@@ -142,12 +145,18 @@ inline int64_t encodePoint(double latitude, double longitude) {
 
 inline int32_t unpackLatitude(int64_t packed) {
   uint64_t morton = (uint64_t)packed ^ MORTON_SIGN;
-  return (int32_t)(compactBits(morton >> 1) ^ COORD_BIAS);
+  return (int32_t)(compactBits(morton) ^ COORD_BIAS);
 }
 
 inline int32_t unpackLongitude(int64_t packed) {
   uint64_t morton = (uint64_t)packed ^ MORTON_SIGN;
-  return (int32_t)(compactBits(morton) ^ COORD_BIAS);
+  return (int32_t)(compactBits(morton >> 1) ^ COORD_BIAS);
+}
+
+// The precision-p geohash cell (1 <= p <= 12) of a packed value, as the
+// integer of its 5p bits: the base-32 digits of the geohash string.
+inline uint64_t geohashPrefix(int64_t packed, int32_t precision) {
+  return ((uint64_t)packed ^ MORTON_SIGN) >> (64 - 5 * precision);
 }
 
 // Inclusive encoded-space cell.
@@ -174,9 +183,11 @@ inline Cell mortonCell(int64_t min, int64_t max) {
 
 // Whether packed values in [min, max] can fall in the inclusive encoded box.
 // Morton order is monotone in each coordinate, so every point of the box
-// packs within [pack(latMin, lonMin), pack(latMax, lonMax)]. A reversed
-// (dateline-wrapping) longitude interval falls back to the full longitude
-// range. Conservative: an overlap does not imply a point in the box.
+// packs within [pack(latMin, lonMin), pack(latMax, lonMax)]; the range must
+// also hold a value of the box's own cell, so the smallest quadtree cell of
+// [min, max] must meet the box too. A reversed (dateline-wrapping) longitude
+// interval falls back to the full longitude range. Conservative: an overlap
+// does not imply a point in the box.
 inline bool mortonRangeMayIntersect(int64_t min, int64_t max,
                                     int32_t latMin, int32_t latMax,
                                     int32_t lonMin, int32_t lonMax) {
@@ -184,7 +195,12 @@ inline bool mortonRangeMayIntersect(int64_t min, int64_t max,
     lonMin = std::numeric_limits<int32_t>::min();
     lonMax = std::numeric_limits<int32_t>::max();
   }
-  return min <= pack(latMax, lonMax) && pack(latMin, lonMin) <= max;
+  if (max < pack(latMin, lonMin) || pack(latMax, lonMax) < min) {
+    return false;
+  }
+  Cell cell = mortonCell(min, max);
+  return cell.latMin <= latMax && latMin <= cell.latMax
+      && cell.lonMin <= lonMax && lonMin <= cell.lonMax;
 }
 
 // Inclusive longitude interval. A reversed interval wraps across the dateline.

@@ -12,6 +12,7 @@
 #include <limits>
 #include <memory_resource>
 #include <span>
+#include <string>
 #include <string_view>
 #include <tuple>
 #include <vector>
@@ -293,6 +294,34 @@ TEST_F(GeoEncodingTest, mortonOrderRoundTripsAndZoneCells) {
   EXPECT_FALSE(geo::mortonRangeMayIntersect(
       a, a, geo::encodeLatitude(-10.0), geo::encodeLatitude(10.0),
       geo::encodeLongitude(-10.0), geo::encodeLongitude(10.0)));
+}
+
+// The packed value's top bits are the geohash: longitude-major interleave of
+// the biased coordinates, the same bits Elasticsearch's Geohash.longEncode uses.
+TEST_F(GeoEncodingTest, packedPrefixIsGeohash) {
+  static constexpr std::string_view BASE32 = "0123456789bcdefghjkmnpqrstuvwxyz";
+  auto geohash = [](int64_t packed, int32_t precision) {
+    uint64_t bits = geo::geohashPrefix(packed, precision);
+    std::string out((size_t)precision, ' ');
+    for (int32_t i = precision - 1; i >= 0; i--, bits >>= 5) {
+      out[(size_t)i] = BASE32[bits & 31];
+    }
+    return out;
+  };
+  EXPECT_EQ("u4pruydqqvj", geohash(geo::encodePoint(57.64911, 10.40744), 11));
+  EXPECT_EQ("dr5regw3p", geohash(geo::encodePoint(40.7128, -74.0060), 9));
+  EXPECT_EQ("gcpvj0duq", geohash(geo::encodePoint(51.5074, -0.1278), 9));
+  EXPECT_EQ("7zzzzzzzzzzz", geohash(geo::encodePoint(-0.0000001, -0.0000001), 12));
+  EXPECT_EQ("s00000000000", geohash(geo::encodePoint(0.0, 0.0), 12));
+  EXPECT_EQ("0", geohash(geo::encodePoint(-90.0, -180.0), 1));
+  EXPECT_EQ("z", geohash(geo::encodePoint(90.0, 180.0), 1));
+  SplitMix64 rng(0x6e0ba5e);
+  for (int32_t i = 0; i < 2000; i++) {
+    int64_t packed = geo::pack((int32_t)rng(), (int32_t)rng());
+    for (int32_t p = 1; p < 12; p++) {
+      EXPECT_EQ(geo::geohashPrefix(packed, p), geo::geohashPrefix(packed, p + 1) >> 5);
+    }
+  }
 }
 
 TEST_F(GeoEncodingTest, quantizationBoundariesAndRandomRoundTrips) {
