@@ -340,8 +340,19 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   ASSERT_GT(fileSize, 0u);
   auto stats = h.getIndexWriter()->stats(true);
   ASSERT_EQ(1u, stats.segmentStats.size());
-  ASSERT_EQ(1u, stats.segmentStats[0].overlays.size());
-  EXPECT_EQ(fileSize, stats.segmentStats[0].overlays[0].bytes);
+  // The segment summary is an overlay too, at its fixed generation 0; it
+  // takes no generation from the vector overlay, which still gets the first.
+  const auto& overlays = stats.segmentStats[0].overlays;
+  ASSERT_EQ(2u, overlays.size());
+  auto vector = std::ranges::find(overlays, std::string(aux.files[0].name), [](const auto& o) { return o.files.at(0); });
+  ASSERT_NE(overlays.end(), vector);
+  EXPECT_EQ(fileSize, vector->bytes);
+  EXPECT_EQ(0u, vector->gen);
+  EXPECT_EQ(Postings::getSegmentOverlayFileName(stats.segmentStats[0].segId, "vec.embedding_v", 0, 0),
+            aux.files[0].name);
+  auto summary = std::ranges::find(overlays, std::string("segment_summary"), [](const auto& o) { return o.kind; });
+  ASSERT_NE(overlays.end(), summary);
+  EXPECT_EQ(0u, summary->gen);
 }
 
 // The mmap-lists layout must serve identically whether the aux file's memory
