@@ -2180,6 +2180,8 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.merge"></a>[`merge`](#field-luxir.servicestats.merge) | 16 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.vector_build"></a>[`vector_build`](#field-luxir.servicestats.vector_build) | 17 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.reader_refresh"></a>[`reader_refresh`](#field-luxir.servicestats.reader_refresh) | 18 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.segments_opened"></a>[`segments_opened`](#field-luxir.servicestats.segments_opened) | 26 | `uint64` | singular | Segments whose base data a reader materialized (mapped and decoded its segment files). Readers open segments lazily, so a segment nothing reads is not counted. A segment a search prunes can still be opened for term statistics (BM25 covers every segment) or whole-index preparation. |
+| <a id="field-luxir.servicestats.segment_bytes_mapped"></a>[`segment_bytes_mapped`](#field-luxir.servicestats.segment_bytes_mapped) | 27 | `uint64` | singular | Bytes of every file mapped for segments as their parts materialize: base files, live docs and overlays. A part that fails to build adds nothing. |
 
 <a id="message-luxir.shardcachecontrol"></a>
 

@@ -15,6 +15,7 @@
 #include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
 #include "luxir/store/Manifest.h"
+#include "luxir/reader/Postings.h"
 #include "luxir/store/CorruptionMarker.h"
 #include "luxir/luxir_main.h"
 #include <sstream>
@@ -1769,6 +1770,44 @@ TEST_F(ReplicationFollowerTest, scrubHitIsRepairedByTheNextSync) {
   }));
   // Repaired, so a second pass finds nothing.
   EXPECT_EQ(0u, follower->getScrubber().scrub());
+}
+
+// A follower restarted under verify-on-open none over a damaged segment file
+// finds it when a search first needs the segment. The file is recorded and
+// repaired like a scrub hit, so the next sync fetches it again instead of
+// reusing it and sharing the unreadable segment forever.
+TEST_F(ReplicationFollowerTest, lazilyFoundDamageIsRepairedByTheNextSync) {
+  startSource(); startFollower();
+  { CollectionHelper h(*source, "main"); ASSERT_TRUE(h.indexAll({flatdoc("id", "a"), flatdoc("id", "b")}, UpdateMessage::COMMIT).success); }
+  ASSERT_TRUE(caughtUp());
+  auto installed = follower->getCollection("main")->getShard()->getSnapshots().snapshot();
+  auto segId = follower->getCollection("main")->getReaderManager().getReader()->segments()[0].segInfo.seg_id;
+  auto name = Postings::getIndexFileName(Postings::getSortableString(segId), 0);
+  auto file = path / "follower" / "t" / "t0" / "main" / installed->id.incarnation / name;
+  stopFollower();
+  {
+    auto size = std::filesystem::file_size(file);
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    out << std::string((size_t)size, '\0');
+  }
+  std::vector<std::string> names;
+  std::mutex namesMutex;
+  Signal::listen("replicationDownloadStart", [&](void* descriptor, void*, void*) -> void* {
+    std::lock_guard lock(namesMutex);
+    names.push_back(((FileDescriptor*)descriptor)->name);
+    return nullptr;
+  });
+  auto unlisten = scope_guard([] { Signal::unlisten("replicationDownloadStart"); });
+  startFollower();
+  auto damaged = follower->getCollection("main");
+  EXPECT_THROW(damaged->getReaderManager().getReader()->segments()[0].postingsReader(), ApiError);
+  EXPECT_TRUE(until([&] {
+    try { return follower->getCollection("main") != damaged; }
+    catch (const CollectionUnavailableError&) { return false; }
+  }));
+  ASSERT_TRUE(caughtUp());
+  EXPECT_EQ(2, follower->getCollection("main")->getReaderManager().getReader()->liveDocs());
+  { std::lock_guard lock(namesMutex); EXPECT_TRUE(std::ranges::find(names, name) != names.end()) << name; }
 }
 
 TEST_F(ReplicationFollowerTest, repairDownloadsIntactSuspectFile) {

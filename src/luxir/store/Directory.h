@@ -42,12 +42,18 @@ struct FileCheck {
 };
 
 // One file open for a sequential checksum pass; see Directory::openChecksum.
+// The handle keeps the file's bytes readable until it and every InputFile it
+// mapped are destroyed, even after deleteFile of the name and a later commit:
+// a backend that defers removal (an object store) counts the handle as a
+// reader, as it counts an open file. Readers rely on this to secure a
+// snapshot's files when it opens and map them much later (HeldFiles).
 class ChecksumReader {
 public:
   virtual ~ChecksumReader() = default;
   virtual uint64_t size() const = 0;
-  // Maps this held file, without reopening its name. The InputFile outlives
-  // this handle; callers verify before mapping potentially corrupt bytes.
+  // Maps this held file, without reopening its name, so it works after the
+  // name was deleted. The InputFile outlives this handle; callers verify
+  // before mapping potentially corrupt bytes.
   virtual std::shared_ptr<InputFile> map() = 0;
   virtual FileCheck checksum(const std::function<void(size_t)>& progress = {}) = 0;
 };

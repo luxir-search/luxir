@@ -15,12 +15,14 @@ void ReaderManager::throwClosed() {
   throw ApiError(ErrorKind::UNAVAILABLE, "reader_closed", "reader manager is closed");
 }
 
-std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot, Directory& source) {
+std::shared_ptr<IndexReader> ReaderManager::prepare(const CommitSnapshot& snapshot, Directory& source,
+                                                   bool materialize) {
   MetricWork metric(*metrics, MetricStage::READER_REFRESH);
   std::lock_guard lock(indexReaderMutex);
   checkOpen();
   auto previous = indexReader.load();
-  return std::make_shared<IndexReader>(source, snapshot, previous.get(), filterCache);
+  return std::make_shared<IndexReader>(source, snapshot, previous.get(), filterCache, metrics, materialize,
+                                       onUnreadable);
 }
 
 void ReaderManager::publishReader(std::shared_ptr<IndexReader> reader) {
@@ -85,7 +87,9 @@ std::shared_ptr<IndexReader> ReaderManager::getReader(uint64_t freshness_us) {
         if (!snapshot) throw ApiError(ErrorKind::UNAVAILABLE, "snapshot_unavailable", "no snapshot installed");
         try {
           Signal::emit("indexReaderOpening", this);
-          return std::make_shared<IndexReader>(dir, *snapshot, previous, filterCache);
+          // Every file is secured by handle here, inside the retry: a file a
+          // newer commit retired first fails this open, never a later lazy one.
+          return std::make_shared<IndexReader>(dir, *snapshot, previous, filterCache, metrics, false, onUnreadable);
         } catch (...) {
           if (snapshot == published.load()) throw;
         }

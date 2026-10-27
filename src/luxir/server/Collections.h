@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -107,6 +108,15 @@ private:
     ~Transition();
   };
 
+  // Where readers report unreadable segment parts; shared with every
+  // collection's hook so a late report after the sink is cleared is dropped.
+  using UnreadableSink =
+      std::function<void(const CollectionId&, std::weak_ptr<Collection>, std::vector<std::string>, std::string)>;
+  struct UnreadableRelay {
+    std::mutex mutex;
+    UnreadableSink sink;
+  };
+  std::shared_ptr<UnreadableRelay> unreadableRelay = std::make_shared<UnreadableRelay>();
   std::shared_ptr<Metrics> metrics;
   const LuxirConfig& config;
   CollectionEvents& events;
@@ -205,6 +215,11 @@ public:
   // marker write is warned but does not prevent failing the collection.
   void fail(const CollectionId& id, const std::shared_ptr<Collection>& collection, const std::string& reason,
             std::span<const std::string> suspects);
+  // Receives the files a reader of a collection found unreadable (a segment
+  // materialized after the collection opened) and why; null stops reporting.
+  // It is called on the reader's thread, possibly under a writer's locks, so
+  // it must only queue the report for fail() and a repair on another thread.
+  void onUnreadable(UnreadableSink sink);
   // Replaces the registered `expected` with an unavailable placeholder and
   // retains its incarnation, as a failed load does: a follower then repairs
   // it in place by staging the same incarnation again.

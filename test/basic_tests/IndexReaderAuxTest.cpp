@@ -545,7 +545,7 @@ TEST_F(IndexReaderAuxTest, schemaOnlyReaderSharesPhysicalState) {
     EXPECT_EQ(&old.postingsReader(), &next.postingsReader());
     EXPECT_EQ(old.liveDocs(), next.liveDocs());
     ASSERT_FALSE(old.auxReaders().empty());
-    EXPECT_EQ(old.auxReaders().data(), next.auxReaders().data());
+    EXPECT_EQ(old.auxReaders(), next.auxReaders());  // the same reader objects
   }
   // Populate lazily through the replacement, then observe the same objects
   // through the old reader. This checks sharing of the caches themselves.

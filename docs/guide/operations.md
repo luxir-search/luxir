@@ -345,6 +345,7 @@ client load.
 | `luxir_searches_total`, `luxir_searches_in_flight`, `luxir_search_duration_seconds` | Searches the engine accepted, by `outcome`, from submission to the final response. A gRPC `Search` call can carry many searches, so this is its per-search view; `cancelled` means the search ended without a final response. |
 | `luxir_search_execution_duration_seconds` | Search-body execution, excluding scheduler/visibility waits and later streaming drains. |
 | `luxir_search_resource_exhausted_total`, `luxir_search_warnings_total` | Resource-limit failures (including the request memory breaker), and searches with declared degradation warnings. |
+| `luxir_segments_opened_total`, `luxir_segment_mapped_bytes_total` | Segments whose data a reader materialized, and the bytes of segment files (data, live docs, overlays) mapped to do it. Readers open segments lazily, so a segment nothing reads adds to neither. A segment a search prunes can still be opened to seek its term statistics (BM25 statistics cover every segment, so only a segment whose own summary proves the term absent skips the seek) or for whole-index preparation such as kNN's global top k. Also `service.segments_opened` and `service.segment_bytes_mapped` in `_stats`. |
 | `luxir_index_batches_total`, `luxir_index_batches_in_flight`, `luxir_index_batch_duration_seconds` | Index-batch processing inside the engine, excluding queueing and commit work. HTTP NDJSON can produce many batches per request. A batch fails only when none of it applied. |
 | `luxir_ingest_documents_total`, `luxir_ingest_delete_ids_total` | Documents accepted into indexing or rejected/rolled back, and accepted delete IDs. Acceptance does not mean durability; commits can still fail. Deletes count submitted IDs, not matched documents. |
 | `luxir_ingest_document_errors_total` | Documents rejected with an error of their own, by `kind`: `invalid_request` is bad input, `internal` an engine fault on that document. Documents rolled back with a failed batch have no error of their own. |
@@ -647,9 +648,25 @@ At startup, a collection whose top-level index metadata cannot be parsed is
 kept as a tombstone rather than preventing healthy collections from loading.
 Queries and updates to that collection return the recorded load error as an
 `unavailable` error (HTTP `503`, code `collection_unavailable`) and the server
-will not silently recreate storage over it. Other segment corruption is
-detected when the affected reader is opened, or earlier with the
-[file integrity checks](#file-integrity-checks) below.
+will not silently recreate storage over it. Readers open segment data
+lazily, so with the default `--store.verify-on-open=none` other segment
+corruption is detected when a search first needs the segment: the error is
+logged once, the search fails with `INTERNAL` `segment_unreadable`, and the
+segment's files are recorded as suspect and fail the collection, as a scrub
+hit does (a follower re-fetches them from its source). Use the
+[file integrity checks](#file-integrity-checks) below to detect it earlier.
+
+### Open file descriptors
+
+A reader keeps one descriptor open for every file of each segment it has not
+opened yet (descriptors close once the segment's data is mapped), and startup
+opens collections without opening their segments. A node therefore needs
+roughly one descriptor per segment file of every collection, plus sockets. At
+startup the server raises its soft `RLIMIT_NOFILE` to the hard limit, logs
+both, and warns when the limit is below 65536. Set the hard limit with
+`LimitNOFILE=` in the systemd unit (or `ulimit -Hn`, or the container
+runtime's `nofile` ulimit); `_stats?system=true` reports `open_fds` and
+`max_fds`.
 
 ## File integrity checks
 

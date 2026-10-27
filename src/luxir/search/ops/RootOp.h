@@ -22,8 +22,44 @@ public:
   RootOp(SearchRequest& req) : SearchOp(req, "root") {
   }
 
+  // Whether domain variant `variant` may hold a document in `segment`.
+  bool variantMayMatch(size_t variant, size_t segment) const {
+    return variant >= variantViable.size() || variantViable[variant].test(segment);
+  }
+
+  // Whether the request-root child `child` (keyed `key`) needs `segment`:
+  // its domain variant and its own root mask may both match there.
+  bool childNeeds(std::string_view key, const SearchOp& child, size_t segment) const {
+    size_t variant = domainVariants.empty() ? 0 : domainVariants.variantForChild(key);
+    return variantMayMatch(variant, segment) && !child.segmentPruned((int32_t)segment);
+  }
+
   bool needsWholePreparation() const override {
     return domainVariants.sourcesNeedPrepare() || SearchOp::needsWholePreparation();
+  }
+
+  // The segments whole-index preparation reads: every segment when some
+  // weight of the request prepares over the whole index, else none. Kept
+  // apart from neededSegments(), the segments collection needs.
+  SegmentMask preparationSegments() const {
+    return SegmentMask(req.reader->segments().size(), needsWholePreparation());
+  }
+
+  // The segments some request-root child needs: the union of the root masks.
+  // Nothing the request computes holds a document elsewhere, so these are
+  // the segments the search materializes, at its one batched point.
+  SegmentMask neededSegments() const {
+    size_t n = req.reader->segments().size();
+    SegmentMask needed(n, false);
+    for (size_t segment = 0; segment < n; segment++) {
+      for (auto [key, subOp] : subOps) {
+        if (childNeeds(key, *subOp, segment)) {
+          needed.set(segment);
+          break;
+        }
+      }
+    }
+    return needed;
   }
 
 
@@ -73,12 +109,9 @@ public:
       if (!root.domainVariants.empty()) {
         subCalcVariants.reserve(op.subOps.size());
       }
-      std::vector<SearchOp*> childOps;
-      childOps.reserve(op.subOps.size());
       for (auto [key, subOp] : op.subOps) {
         auto* subCalc = subOp->createCalculator(this, -1);
         subCalcs.emplace_back(subCalc);
-        childOps.push_back(subOp);
         if (!root.domainVariants.empty()) {
           subCalcVariants.push_back(
               root.domainVariants.variantForChild(key));
@@ -93,20 +126,14 @@ public:
       // unpruned, and pruning only skips each op's collection.
       bool prunesDomains = !root.needsWholePreparation();
       auto variantMayMatch = [&](size_t variant, size_t segnum) {
-        return !prunesDomains || variant >= root.variantViable.size() || root.variantViable[variant].test(segnum);
-      };
-      auto childNeeds = [&](size_t child, size_t segnum) {
-        size_t variant = subCalcVariants.empty() ? 0 : subCalcVariants[child];
-        return !prunesDomains
-            || (variantMayMatch(variant, segnum) && !childOps[child]->segmentPruned((int32_t)segnum));
+        return !prunesDomains || root.variantMayMatch(variant, segnum);
       };
       const auto& segs = op.req.reader->segments();
+      SegmentMask neededMask = prunesDomains ? root.neededSegments() : root.preparationSegments();
       std::vector<uint8_t> needed(segs.size(), 0);
       domains.reserve(segs.size());
       for (auto& seg : segs) {
-        for (size_t child = 0; child < childOps.size() && !needed[(size_t)seg.ord]; child++) {
-          needed[(size_t)seg.ord] = childNeeds(child, (size_t)seg.ord);
-        }
+        needed[(size_t)seg.ord] = neededMask.test((size_t)seg.ord);
         if (!needed[(size_t)seg.ord]) {
           domains.push_back(DomainHandle::empty());
           continue;

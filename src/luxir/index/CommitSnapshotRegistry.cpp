@@ -64,7 +64,7 @@ void CommitSnapshotRegistry::openLocalSnapshot(bool verify) {
       verification.run();
       try {
         VerifiedDirectory source(dir, verification);
-        reader = readers.prepare(*snapshot, source);
+        reader = readers.prepare(*snapshot, source, false);
       } catch (...) {
         // Full holds every file: a prepare failure is final. Under none an
         // unchecked file may have been retired while hashing, so retry it.

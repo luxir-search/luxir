@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <atomic>
+#include <cerrno>
+#include <climits>
 #include <csignal>
 #include <cstring>
 #include <filesystem>
 #include <optional>
 #include <pthread.h>
+#include <sys/resource.h>
 #include <semaphore>
 #include <sstream>
 #include <thread>
@@ -72,6 +75,39 @@ public:
   }
 };
 
+// Readers hold one descriptor per file of every segment part they have not
+// materialized yet (see docs/design/segment-summaries.md), so a node with
+// many collections and segments needs more than the usual soft limit of 1024.
+// Raise the soft limit to the hard limit; the hard limit is the operator's
+// (systemd LimitNOFILE, ulimit -Hn).
+void raiseOpenFileLimit() {
+  constexpr rlim_t kLowHardLimit = 65536;
+  rlimit limit{};
+  if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+    LOG_WARN("Cannot read the open file limit: {}", strerror(errno));
+    return;
+  }
+  auto show = [](rlim_t value) { return value == RLIM_INFINITY ? std::string("unlimited") : std::to_string(value); };
+  rlim_t soft = limit.rlim_cur;
+  rlim_t target = limit.rlim_max;
+#if defined(__APPLE__)
+  // macOS rejects a soft limit above OPEN_MAX, even under an unlimited hard limit.
+  if (target == RLIM_INFINITY || target > (rlim_t)OPEN_MAX) target = (rlim_t)OPEN_MAX;
+#endif
+  if (soft != RLIM_INFINITY && soft < target) {
+    limit.rlim_cur = target;
+    if (setrlimit(RLIMIT_NOFILE, &limit) != 0) {
+      LOG_WARN("Cannot raise the open file limit from {} to {}: {}", show(soft), show(target), strerror(errno));
+      limit.rlim_cur = soft;
+    }
+  }
+  LOG_INFO("Open file limit: soft {} (was {}), hard {}", show(limit.rlim_cur), show(soft), show(limit.rlim_max));
+  if (limit.rlim_cur != RLIM_INFINITY && limit.rlim_cur < kLowHardLimit) {
+    LOG_WARN("Open file limit {} is low: readers hold a descriptor per file of every segment not yet opened; "
+             "raise the hard limit (systemd LimitNOFILE, ulimit -Hn) to at least {}", show(limit.rlim_cur), kLowHardLimit);
+  }
+}
+
 } // namespace
 
 int luxir_main(int argc, char** argv) {
@@ -124,6 +160,9 @@ int luxir_main(int argc, char** argv) {
     LOG_ERROR("Invalid configuration: {}", e.what());
     return 1;
   }
+
+  // Before any subcommand: pull and promote open collections too.
+  raiseOpenFileLimit();
 
   if (*pull) {
     try {

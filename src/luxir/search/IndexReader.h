@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #pragma once
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -12,9 +14,13 @@
 
 #include "DocSet.h"
 #include "Similarity.h"
+#include "luxir/index/AuxInfo.h"
 #include "luxir/index/SegmentSummary.h"
+#include "luxir/query/SegmentMask.h"
 #include "luxir/reader/AuxReader.h"
 #include "luxir/reader/PostingsReader.h"
+#include "luxir/store/HeldFiles.h"
+#include "luxir/util/Metrics.h"
 #include "luxir/util/screaming.h"
 #include "luxir/util/Once.h"
 #include "luxir/util/SharedLazyCell.h"
@@ -74,10 +80,101 @@ public:
 };
 
 
+// One lazily materialized part of a segment: the files it needs, secured by
+// open handles when the snapshot opened, and the reader built from them on
+// first need. Shared by every snapshot (and the writer) holding the same
+// files, opened or not; once built the handles close, since the mappings
+// keep the bytes. A build that fails on an I/O or resource error (an
+// ApiError such as a failed mmap, std::system_error, std::bad_alloc) throws
+// and a later call retries. One that fails on the bytes themselves (a format
+// or checksum error, EIO, or a held file absent at decode) marks the part
+// unreadable: it is logged at error
+// level once, its handles close, every later call rethrows the same error
+// without rebuilding, and the part's files are reported to its owner's
+// UnreadableHook as suspects, so they are recorded and repaired the way a
+// scrub mismatch is.
+//
+// The hook runs on the thread that found the damage, possibly a writer's
+// under its locks: it must not throw, block, or fail the collection inline.
+using UnreadableHook = std::function<void(std::vector<std::string> files, std::string reason)>;
+
+template <class Value>
+class SegmentPart {
+protected:
+  SharedLazyCell<Value, false> cell;
+  std::unique_ptr<HeldFiles> files;
+  std::shared_ptr<Metrics> metrics;
+  std::shared_ptr<const UnreadableHook> onUnreadable;  // null: nobody to tell
+  // Set once by the (serialized) build that found the bytes unreadable;
+  // `failure` is written before `unreadable` is released.
+  std::atomic<bool> unreadable{false};
+  std::string failure;
+
+  SegmentPart(std::unique_ptr<HeldFiles> files, std::shared_ptr<Metrics> metrics,
+              std::shared_ptr<const UnreadableHook> onUnreadable)
+      : files(std::move(files)), metrics(std::move(metrics)), onUnreadable(std::move(onUnreadable)) {}
+  explicit SegmentPart(std::shared_ptr<Value> opened) : cell(std::move(opened)) {}
+
+  // Builds through the held files; `what` names the part in errors.
+  template <class Open>
+  std::shared_ptr<Value> getOrOpen(std::string_view what, Open&& open);
+
+public:
+  // The built value, or null when it is not built yet; never builds.
+  std::shared_ptr<Value> peek() const noexcept { return cell.peek(); }
+  // Whether a build found the part's bytes unreadable; it never retries.
+  bool isUnreadable() const noexcept { return unreadable.load(std::memory_order_acquire); }
+  // peek() without a reference count; valid while the part lives.
+  Value* peekRaw() const noexcept { return cell.peekRaw(); }
+};
+
+// A segment's base data: its PostingsReader over the segment files.
+class SegmentBase : public SegmentPart<PostingsReader> {
+public:
+  const uint64_t segId;
+  const int32_t maxDoc;
+  SegmentBase(uint64_t segId, int32_t maxDoc, std::unique_ptr<HeldFiles> files, std::shared_ptr<Metrics> metrics,
+              std::shared_ptr<const UnreadableHook> onUnreadable)
+      : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), segId(segId), maxDoc(maxDoc) {}
+  SegmentBase(uint64_t segId, int32_t maxDoc, std::shared_ptr<PostingsReader> opened)
+      : SegmentPart(std::move(opened)), segId(segId), maxDoc(maxDoc) {}
+  std::shared_ptr<PostingsReader> get();
+};
+
+// The live documents of one delete generation.
+class SegmentLive : public SegmentPart<LiveDocs> {
+public:
+  const uint64_t segId;
+  const uint64_t liveGen;
+  const int32_t maxDoc;
+  const int32_t numLive;
+  SegmentLive(uint64_t segId, uint64_t liveGen, int32_t maxDoc, int32_t numLive,
+              std::unique_ptr<HeldFiles> files, std::shared_ptr<Metrics> metrics,
+              std::shared_ptr<const UnreadableHook> onUnreadable)
+      : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), segId(segId), liveGen(liveGen),
+        maxDoc(maxDoc),
+        numLive(numLive) {}
+  std::shared_ptr<LiveDocs> get();
+};
+
+// A segment overlay of a known kind (a vector index, the test overlay).
+class SegmentOverlay : public SegmentPart<AuxReader> {
+public:
+  const AuxInfo info;
+  SegmentOverlay(AuxInfo info, std::unique_ptr<HeldFiles> files, std::shared_ptr<Metrics> metrics,
+                 std::shared_ptr<const UnreadableHook> onUnreadable)
+      : SegmentPart(std::move(files), std::move(metrics), std::move(onUnreadable)), info(std::move(info)) {}
+  std::shared_ptr<AuxReader> get();
+};
+
+  // A snapshot's view of one segment. Opening the snapshot reads only the
+  // manifest and the segment's summary and secures its files by handle;
+  // the base data, live docs and overlays materialize later, together at the
+  // search's batched point (IndexReader::materialize) or on first use.
   class Segment {
-    const std::shared_ptr<PostingsReader> sharedPostingsReader;
-    const std::shared_ptr<LiveDocs> sharedLiveDocs;
-    const std::vector<std::shared_ptr<AuxReader>> sharedAuxReaders;
+    const std::shared_ptr<SegmentBase> sharedBase;
+    const std::shared_ptr<SegmentLive> sharedLive;
+    const std::vector<std::shared_ptr<SegmentOverlay>> sharedOverlays;
     const std::shared_ptr<const SegmentSummary> sharedSummary;
   public:
     friend class IndexReader;
@@ -96,68 +193,75 @@ public:
     const int64_t base;           // global index (ordinal/rank) of the first document in this segment with respect to the list of segments
     const int32_t ord;            // index of this segment in the list of segments
 
-    Segment(std::shared_ptr<PostingsReader>&& postingsReader, std::shared_ptr<LiveDocs>&& liveDocs,
-              std::vector<std::shared_ptr<AuxReader>>&& auxReaders,
-              std::shared_ptr<const SegmentSummary>&& summary,
-              SegmentInfo segInfo, int64_t base, int ord)
-            :  sharedPostingsReader(std::move(postingsReader)), sharedLiveDocs(std::move(liveDocs)),
-                sharedAuxReaders(std::move(auxReaders)), sharedSummary(std::move(summary)),
-                segInfo(segInfo), base(base), ord(ord) {
+    Segment(std::shared_ptr<SegmentBase> data, std::shared_ptr<SegmentLive> live,
+            std::vector<std::shared_ptr<SegmentOverlay>>&& overlays,
+            std::shared_ptr<const SegmentSummary>&& summary,
+            SegmentInfo segInfo, int64_t docBase, int ord)
+            :  sharedBase(std::move(data)), sharedLive(std::move(live)),
+                sharedOverlays(std::move(overlays)), sharedSummary(std::move(summary)),
+                segInfo(segInfo), base(docBase), ord(ord) {
     }
 
     // The segment's summary sidecar, loaded when the snapshot opened; null
     // when the segment has none readable, which proves nothing about it.
     const SegmentSummary* summary() const noexcept { return sharedSummary.get(); }
 
-    PostingsReader& postingsReader() const noexcept {
-      return *sharedPostingsReader;
+    // Materializes the base data on first use.
+    PostingsReader& postingsReader() const {
+      if (auto* reader = sharedBase->peekRaw()) return *reader;
+      return *sharedBase->get();
     }
 
     // shared form of postingsReader(): every snapshot holding this physical
     // segment, and the writer, use the one instance
-    std::shared_ptr<PostingsReader> postingsReaderShared() const noexcept {
-      return sharedPostingsReader;
+    std::shared_ptr<PostingsReader> postingsReaderShared() const {
+      return sharedBase->get();
     }
+
+    // The base data when materialized, else null; never opens.
+    PostingsReader* postingsReaderIfOpen() const noexcept { return sharedBase->peekRaw(); }
+    bool isOpen() const noexcept { return sharedBase->peekRaw() != nullptr; }
+    // Whether the base, live docs and every overlay are materialized.
+    bool isMaterialized() const noexcept;
+    // Materializes the base, live docs and every overlay.
+    void materialize() const;
 
     // Whether the segment carries a live-docs generation (live_gen > 0), so
     // liveDocs() is non-null and must be consulted. It does not guarantee a
     // deleted document exists (compare numLive() with maxDoc() for that).
     // Never opens the segment's files.
-    bool hasDeletes() const noexcept { return sharedLiveDocs != nullptr; }
+    bool hasDeletes() const noexcept { return sharedLive != nullptr; }
 
-    // returns null if all docs are live (no deletes)
-    LiveDocs* liveDocs() const noexcept {
-      return sharedLiveDocs.get();
+    // returns null if all docs are live (no deletes); materializes them on first use
+    LiveDocs* liveDocs() const {
+      if (!sharedLive) return nullptr;
+      if (auto* live = sharedLive->peekRaw()) return live;
+      return sharedLive->get().get();
     }
 
     // shared form of liveDocs(), for callers that cache views into its mapped bits
-    std::shared_ptr<LiveDocs> liveDocsShared() const noexcept {
-      return sharedLiveDocs;
+    std::shared_ptr<LiveDocs> liveDocsShared() const {
+      return sharedLive ? sharedLive->get() : nullptr;
     }
 
-    std::span<const std::shared_ptr<AuxReader>> auxReaders() const noexcept {
-      return sharedAuxReaders;
-    }
+    // Every overlay of a known kind, materialized.
+    std::vector<std::shared_ptr<AuxReader>> auxReaders() const;
 
-    std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const {
-      for (const auto& r : sharedAuxReaders) {
-        if (r->getName() == name) return r;
-      }
-      return nullptr;
-    }
+    // The overlay `name`, materialized on first use; null when absent.
+    std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const;
 
     int32_t maxDoc() const noexcept {
       return segInfo.max_doc;
     }
 
-    // Get number of deleted documents
+    // Get number of deleted documents (from the manifest; never opens)
     int32_t numDeletes() const noexcept {
-      return sharedLiveDocs ? sharedLiveDocs->numDeletes() : 0;
+      return segInfo.max_doc - numLive();
     }
 
-    // Get number of live documents
+    // Get number of live documents (from the manifest; never opens)
     int32_t numLive() const noexcept {
-      return sharedLiveDocs ? sharedLiveDocs->numLive() : segInfo.max_doc;
+      return sharedLive ? sharedLive->numLive : segInfo.max_doc;
     }
   };
 
@@ -174,9 +278,10 @@ public:
   using Segment = ::luxir::Segment;
 
   // A borrowed view, valid while its reader lives. Null means absent.
-  // at() lazily resolves ordinals and headers in this core's segments.
-  // stats() and flagsUnion() resolve every segment for header totals,
-  // including deleted docs.
+  // at() lazily resolves ordinals and headers in this core's segments,
+  // materializing a segment only where the field may be present. stats()
+  // and flagsUnion() total every segment's header, deleted docs included,
+  // from complete summaries where segments have them, so they open nothing.
   class FieldSegments {
     friend class IndexReader;
     const FieldRecord* record = nullptr;
@@ -197,6 +302,9 @@ public:
     std::string_view name() const noexcept;
     bool exists() const noexcept;
     size_t size() const noexcept;
+    // False when the segment provably lacks the field (its summary, or an
+    // earlier probe); true when it has it or that is not known yet. Never opens.
+    bool presentIn(size_t segment) const noexcept;
     const Similarity::FieldStats& stats() const;
     // OR of the segment headers' flags, such as segment-format markers.
     FieldType::flag_type flagsUnion() const;
@@ -241,7 +349,7 @@ private:
     mutable SharedLazyCell<OrdMap, true> ordMap;
     size_t bytes;
 
-    FieldRecord(std::string_view name, size_t hash, size_t numSegments, size_t first, int32_t ordinal);
+    FieldRecord(std::string_view name, size_t hash, std::span<const int32_t> initialOrdinals);
     ~FieldRecord();
   };
 
@@ -336,15 +444,22 @@ private:
   OnceFlag searchableOnce;
   std::vector<std::string> searchable;
 
-  // Opens the snapshot `manifest` (the newest durable root when null). Each
-  // segment's PostingsReader comes from `published` (the publisher's open
-  // readers, by manifest segment order), else from `previous` when its files
-  // are identical, else is opened; its live docs come from `previous` when
-  // their file is identical.
+  // Opens the snapshot `manifest` (the newest durable root when null),
+  // securing every file it needs by an open handle inside the retry loop: a
+  // file a newer root retired before its handle opened retries against that
+  // root, and once held no deletion can take it. Nothing else is read but the
+  // manifest and the segment summaries. Each segment's base comes from
+  // `previous` when its files are identical (opened or not), unless
+  // `published` (the publisher's open readers, by manifest segment order)
+  // hands over a different open one; live docs and overlays likewise come
+  // from `previous` when their files are identical. `materialize` opens every
+  // segment before returning.
   static Snapshot openSnapshot(Directory& dir, const IndexReader* previous,
                                std::shared_ptr<Schema> schema,
                                std::shared_ptr<const std::vector<std::byte>> manifest,
-                               std::span<const std::weak_ptr<PostingsReader>> published = {});
+                               std::span<const std::weak_ptr<PostingsReader>> published,
+                               const std::shared_ptr<Metrics>& metrics, bool materialize,
+                               const std::shared_ptr<const UnreadableHook>& onUnreadable);
 
   IndexReader(Snapshot snapshot,
               std::shared_ptr<FilterCache> filterCache);
@@ -423,8 +538,9 @@ public:
   // schema-independent - read from segment metadata, so dynamic
   // (suffix-template) fields appear under their concrete names.  Sorted and
   // unique by name, with column presence and the resources storing that name
-  // retained for schema-specific source selection. Built once on first use
-  // and immutable afterwards (segments never
+  // retained for schema-specific source selection. Built once on first use,
+  // which materializes the base of every segment (stored resources list their
+  // fields only in segment data), and immutable afterwards (segments never
   // change under a reader).  The views point into segment metadata that this
   // reader's PostingsReaders keep mapped, so they are valid for as long as the
   // caller holds the reader.
@@ -445,10 +561,19 @@ public:
   // built once on first use, independent of storage or column availability.
   std::span<const std::string> searchableFields();
 
+  // Materializes every segment of `mask` (every segment when unrestricted)
+  // that is not yet, in parallel: the one batched point where a search opens
+  // the segments its root masks kept. Counts into the reader's metrics.
+  void materialize(const SegmentMask& mask = {});
+
   // Opens a published snapshot, reusing what it shares with previousReader
   // and the readers its publisher holds open (CommitSnapshot::openReaders).
+  // Files are secured through `dir` by handle; segments materialize lazily
+  // unless `materialize`. Materializations count into `metrics`; parts found
+  // unreadable are reported to `onUnreadable`.
   IndexReader(Directory& dir, const CommitSnapshot& snapshot, IndexReader* previousReader = nullptr,
-              std::shared_ptr<FilterCache> filterCache = nullptr);
+              std::shared_ptr<FilterCache> filterCache = nullptr, std::shared_ptr<Metrics> metrics = nullptr,
+              bool materialize = false, std::shared_ptr<const UnreadableHook> onUnreadable = nullptr);
   // Direct tools/tests: the newest durable root, or an empty index.
   explicit IndexReader(Directory& dir, IndexReader* previousReader = nullptr,
                        std::shared_ptr<FilterCache> filterCache = nullptr);

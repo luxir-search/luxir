@@ -563,6 +563,8 @@ struct ServiceStats {
   ActivityStats merge;
   ActivityStats vector_build;
   ActivityStats reader_refresh;
+  uint64_t segments_opened = 0;
+  uint64_t segment_bytes_mapped = 0;
   bool read_only = false;
 };
 struct ProcessStats {

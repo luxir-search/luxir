@@ -155,6 +155,8 @@ void fillServiceStats(LuxirNode& node, api::ServiceStats& dst, std::pmr::memory_
   dst.documents_accepted = counter(MetricCounter::DOCUMENTS_ACCEPTED);
   dst.documents_rejected = counter(MetricCounter::DOCUMENTS_REJECTED);
   dst.delete_ids_accepted = counter(MetricCounter::DELETE_IDS_ACCEPTED);
+  dst.segments_opened = counter(MetricCounter::SEGMENTS_OPENED);
+  dst.segment_bytes_mapped = counter(MetricCounter::SEGMENT_BYTES_MAPPED);
   dst.document_errors = errorKinds(counts.documentErrors, resource);
   fillActivity(dst.flush, counts, metricActivity(MetricStage::FLUSH), resource);
   fillActivity(dst.commit, counts, metricActivity(MetricStage::COMMIT), resource);

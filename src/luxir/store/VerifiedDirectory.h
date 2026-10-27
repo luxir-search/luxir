@@ -9,7 +9,8 @@ namespace luxir {
 
 // After run() succeeds, opens checked files through the verified handles.
 // Only the preparation borrows this view and its verification; the resulting
-// readers retain InputFiles, which outlive both. Unchecked names use delegate.
+// readers retain the handles or their InputFiles, which outlive both.
+// Unchecked names use delegate.
 class VerifiedDirectory : public Directory {
   Directory& delegate;
   std::map<std::string_view, const FileVerification::Item*, std::less<>> held;
@@ -27,7 +28,11 @@ public:
   }
 
   void listFiles(std::vector<FileInfo>& target) override { delegate.listFiles(target); }
+  // A checked name returns its verified handle, so a reader that secures its
+  // files by handle (HeldFiles) retains exactly the bytes that were hashed.
   std::shared_ptr<ChecksumReader> openChecksum(std::string_view name, bool direct = false) override {
+    auto it = held.find(name);
+    if (it != held.end()) return it->second->reader;
     return delegate.openChecksum(name, direct);
   }
   void expectSynced(std::span<const FileDescriptor> files) override { delegate.expectSynced(files); }

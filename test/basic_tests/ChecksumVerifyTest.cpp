@@ -10,8 +10,11 @@
 #include "luxir/store/FileVerifier.h"
 #include "luxir/store/VerifiedDirectory.h"
 #include "luxir/store/CheckedDirFactory.h"
+#include "luxir/reader/Postings.h"
 #include "luxir/reader/VectorAuxReader.h"
+#include "luxir/util/Signal.h"
 #include "luxir/util/Uuid.h"
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <glaze/glaze.hpp>
@@ -61,6 +64,20 @@ protected:
   static FileDescriptor corrupt(LuxirNode& node, const std::string& collection) {
     auto snapshot = node.getCollection(collection)->getShard()->getSnapshots().snapshot();
     return flip(dirOf(node, collection), *std::ranges::max_element(snapshot->files, {}, &FileDescriptor::size));
+  }
+  // Overwrites the file with zeros of the same size.
+  static void zero(const std::filesystem::path& file) {
+    auto size = std::filesystem::file_size(file);
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    out << std::string((size_t)size, '\0');
+  }
+  template<class Predicate> static bool until(Predicate predicate) {
+    auto end = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    do {
+      if (predicate()) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    } while (std::chrono::steady_clock::now() < end);
+    return false;
   }
   static size_t count(const std::filesystem::path& dir, std::string_view prefix) {
     size_t n = 0;
@@ -171,7 +188,7 @@ TEST_F(ChecksumVerifyTest, verifiedReaderSurvivesUnlinkAndViewLifetime) {
       dir.sync(names);
       for (const auto& name : names) ASSERT_TRUE(dir.deleteFile(name));
       ReaderManager readers(dir);
-      reader = readers.prepare(*snapshot, source);
+      reader = readers.prepare(*snapshot, source, false);
     }
     EXPECT_EQ(1, reader->liveDocs());
     for (const auto& segment : reader->segments()) for (const auto& aux : segment.auxReaders()) {
@@ -240,6 +257,51 @@ TEST_F(ChecksumVerifyTest, scrubFailsTheWriterAndTheFailureSurvivesRestart) {
   LuxirNode node(config);
   EXPECT_EQ(1, node.getCollection("main")->getReaderManager().getReader()->liveDocs());
   EXPECT_EQ(0u, count(dir, CorruptionMarker::kPrefix));
+}
+
+// Under verify-on-open none a damaged segment is found when a search first
+// needs it. The part fails once and is not retried (no remap, no decode), and
+// its files are recorded as suspects and fail the collection as a scrub hit
+// does, so the next start re-verifies them.
+TEST_F(ChecksumVerifyTest, lazilyFoundDamageIsRecordedLikeAScrubHit) {
+  populate();
+  std::filesystem::path dir;
+  std::string name;
+  {
+    LuxirNode node(config);
+    dir = dirOf(node, "main");
+    auto segId = node.getCollection("main")->getReaderManager().getReader()->segments()[0].segInfo.seg_id;
+    name = Postings::getIndexFileName(Postings::getSortableString(segId), 0);
+  }
+  zero(dir / name);
+  std::atomic<int> marked{0};
+  Signal::listen("segmentUnreadable", [&](void*, void*, void*) -> void* { marked++; return nullptr; });
+  LuxirNode node(config);
+  auto collection = node.getCollection("main");
+  auto counter = [&](MetricCounter which) { return node.metrics->counts().counters[(size_t)which]; };
+  uint64_t mappedBefore = counter(MetricCounter::SEGMENT_BYTES_MAPPED);
+  auto reader = collection->getReaderManager().getReader();
+  auto req = localReq(node.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("id", "b").fields({"id"});
+  req->execute();
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(std::string::npos, req->errorMsg().find("cannot be read")) << req->errorMsg();
+  for (int attempt = 0; attempt < 2; attempt++) {
+    try {
+      reader->segments()[0].postingsReader();
+      FAIL() << "a zeroed segment file opened";
+    } catch (const ApiError& e) {
+      EXPECT_EQ("segment_unreadable", e.code) << e.what();
+    }
+  }
+  EXPECT_EQ(1, marked.load());
+  EXPECT_EQ(mappedBefore, counter(MetricCounter::SEGMENT_BYTES_MAPPED));
+  ASSERT_TRUE(until([&] { return collection->isFailed(); }));
+  EXPECT_THROW(node.getCollection("main"), CollectionUnavailableError);
+  auto suspects = CorruptionMarker::read(*collection->getShard()->getDirectory());
+  EXPECT_TRUE(std::ranges::find(suspects, name) != suspects.end()) << name;
+  EXPECT_NO_THROW(node.getCollection("other"));
+  Signal::unlisten("segmentUnreadable");
 }
 
 TEST_F(ChecksumVerifyTest, writerRecoveryPreservesSuspectFiles) {

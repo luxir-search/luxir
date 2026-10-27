@@ -27,6 +27,9 @@ class ReaderManager {
 public:
   // The node's service counters; set by the collection that owns this manager.
   std::shared_ptr<Metrics> metrics = Metrics::detached();
+  // Told when a part of this collection's segments is found unreadable; set
+  // by the collection that owns this manager.
+  std::shared_ptr<const UnreadableHook> onUnreadable;
   std::shared_ptr<FilterCache> filterCache;
   alignas(64) std::atomic<std::shared_ptr<IndexReader>> indexReader;
 
@@ -95,9 +98,12 @@ public:
   std::shared_ptr<IndexReader> getReader(uint64_t freshness_us = 0);
   std::shared_ptr<const CommitSnapshot> snapshot() const { return published.load(); }
   std::shared_ptr<Schema> getSchema() const { return snapshot()->schema; }
-  // Opens a reader for a snapshot before it is published.
-  std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot) { return prepare(snapshot, dir); }
-  std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot, Directory& source);
+  // Opens a reader for a snapshot before it is published, securing its files
+  // by handle through `source`. An install (no source) also materializes
+  // every segment, so a snapshot that cannot be read fails before it is
+  // published; a local open leaves segments to materialize lazily.
+  std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot) { return prepare(snapshot, dir, true); }
+  std::shared_ptr<IndexReader> prepare(const CommitSnapshot& snapshot, Directory& source, bool materialize);
   // Publishes a durable snapshot. With a reader from prepare() searches switch
   // to it now; without one, readers reopen lazily on demand (local writers).
   void publish(std::shared_ptr<const CommitSnapshot> snapshot, std::shared_ptr<IndexReader> opened = {});

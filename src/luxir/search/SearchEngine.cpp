@@ -68,6 +68,16 @@ void SearchEngine::submitBody(SearchRequest& req) {
   try {
     root = prepare(req);
     root->init();
+    // The one batched point: planning is done and every op's root mask is
+    // known, so the segments the search needs materialize now, together:
+    // those collection needs (some op may match there) and those whole-index
+    // preparation reads (a kNN global top k sees every segment's domain).
+    // Planning itself opens only what statistics need (a segment's base for
+    // term dictionary seeks), never live docs or overlays; a pruned segment
+    // nothing prepares over gets nothing more.
+    SegmentMask segments = root->neededSegments();
+    segments |= root->preparationSegments();
+    req.reader->materialize(segments);
     std::unique_ptr<RootOp::Calc> calc(root->createCalculator(nullptr, -1));
     // The request owns the calculator tree: a flow-controlled emitter can
     // outlive this function, and its callbacks reach into collector output and

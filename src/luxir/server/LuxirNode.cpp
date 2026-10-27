@@ -111,11 +111,18 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   }
   searchEngine = std::make_unique<SearchEngine>(*this);
   scrubber = std::make_unique<Scrubber>(*this);
-  if (mode == Mode::SERVE) scrubber->start();
+  if (mode == Mode::SERVE) {
+    collections_->onUnreadable([scrubber = scrubber.get()](const CollectionId& id, std::weak_ptr<Collection> collection,
+                                                           std::vector<std::string> files, std::string reason) {
+      scrubber->report(id, std::move(collection), std::move(files), std::move(reason));
+    });
+    scrubber->start();
+  }
   if (follower && mode == Mode::SERVE) follower->start();
 }
 
 LuxirNode::~LuxirNode() {
+  collections_->onUnreadable(nullptr);
   scrubber->stop();
   if (follower) follower->stop();
   commitWaits->close();
