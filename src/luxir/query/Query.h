@@ -1176,6 +1176,10 @@ public:
     FilterKeyContext filterKeyContext;
     Limits limits;
     std::vector<api::Warning>* warnings = nullptr;
+    // Logical validation visited a query whose weight may prepare over the
+    // whole index (kNN, the test-only force-prepare wrapper): the only
+    // sources of Weight::NEEDS_PREPARE, known before any weight exists.
+    bool mayPrepare = false;
 
     PlanningContext(
         MemPool& pool, IndexReader& topReader, Limits limits = {},
@@ -2211,6 +2215,7 @@ Query::VerificationWork membershipVerificationWork(const Query& query);
 
 inline void Query::validateLogical(
     PlanningContext& context, float multiplier) const {
+  if (kind == QueryKind::KNN || kind == QueryKind::FORCE_PREPARE) context.mayPrepare = true;
   validateLogicalImpl(context, multiplier);
 #ifndef NDEBUG
   context.recordLogicalValidation(*this);

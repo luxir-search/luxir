@@ -391,6 +391,8 @@ private:
     std::vector<ProjectableField> projectable;
     std::vector<std::shared_ptr<AuxReader>> auxReadersList;
     std::shared_ptr<FieldRecords> fields;
+    // The manifest's collection summary when it is complete, else null.
+    std::shared_ptr<const SegmentSummary> collectionSummary;
     uint64_t coreGeneration = 0;
     int64_t totalMaxDoc = 0;
     int64_t livedocs = 0;
@@ -439,6 +441,9 @@ private:
   const std::shared_ptr<PhysicalCore> core;
   const std::shared_ptr<Schema> sharedSchema;
   const std::shared_ptr<FilterCache> sharedFilterCache;
+  // The core's collection summary, unless a field it records persists a type
+  // this reader's schema does not match (see collectionSummary()).
+  const SegmentSummary* provingSummary;
   OnceFlag retrievableOnce;
   std::vector<RetrievableField> retrievable;
   OnceFlag searchableOnce;
@@ -517,6 +522,17 @@ public:
   // This can be used as a cache key for structures that depend on segments but don't care about deletes.
   uint64_t coreGen() const noexcept {
     return core->coreGeneration;
+  }
+
+  // The collection summary of this snapshot's manifest (the union of every
+  // segment's summary), or null when the manifest has no complete one: an
+  // incomplete aggregate proves nothing. Also null when the schema types a
+  // recorded field differently from its persisted type: a proof answers
+  // without weights, so it would hide the field_type_mismatch that field()
+  // raises for requests using that field; those requests take the
+  // per-segment path instead.
+  const SegmentSummary* collectionSummary() const noexcept {
+    return provingSummary;
   }
 
   // Validate this schema's type against the field's persisted segment types

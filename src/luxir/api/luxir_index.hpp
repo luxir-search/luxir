@@ -57,20 +57,6 @@ struct SegmentInfo {
   int32_t live_docs = 0;
 };
 
-struct IndexInfo {
-  uint64_t last_seg_id = 0;
-  std::optional<SchemaInfo> schema;
-  std::string_view incarnation;
-  uint64_t version = 0;
-  uint64_t commit_time = 0;
-  uint64_t index_gen = 0;
-  uint64_t core_gen = 0;
-  uint64_t update_version = 0;
-  uint64_t schema_gen = 0;
-  std::span<const SegmentInfo> segments;
-  std::span<const AuxIndexInfo> aux_indexes;
-};
-
 struct FieldSummary {
   std::string_view fieldname;
   ::hpp_proto::bytes_view term_min;
@@ -86,10 +72,27 @@ struct FieldSummary {
   uint32_t summary_flags = 0;
   uint32_t flags = 0;
   uint32_t type_flags = 0;
+  uint32_t segments_with_field = 0;
   int32_t geo_min_lat = 0;
   int32_t geo_max_lat = 0;
   int32_t geo_min_lon = 0;
   int32_t geo_max_lon = 0;
+};
+
+struct IndexInfo {
+  uint64_t last_seg_id = 0;
+  std::optional<SchemaInfo> schema;
+  std::string_view incarnation;
+  uint64_t version = 0;
+  uint64_t commit_time = 0;
+  uint64_t index_gen = 0;
+  uint64_t core_gen = 0;
+  uint64_t update_version = 0;
+  uint64_t schema_gen = 0;
+  std::span<const SegmentInfo> segments;
+  std::span<const AuxIndexInfo> aux_indexes;
+  std::span<const FieldSummary> field_summaries;
+  bool summary_complete = false;
 };
 
 struct SegmentSummaryInfo {

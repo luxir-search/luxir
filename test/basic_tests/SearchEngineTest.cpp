@@ -3,6 +3,7 @@
 
 
 #include <gtest/gtest.h>
+#include "luxir/query/QueryPruning.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -2170,6 +2171,11 @@ TEST_F(SearchEngineTest, wholeCountGatesSegmentsAndComposesDeletesOnce) {
   WholeCountQueryBuilder empty = [](auto& mr) {
     return qb::phraseWords(mr, "body_w", {"not", "present"});
   };
+  // The collection summary proves the phrase empty and the op then plans
+  // nothing; the cache path is exercised with pruning disabled.
+  EXPECT_EQ(0, runWholeCount(helper.getSearchEngine(), collection, empty).found);
+  QueryPruning::disableForTests = true;
+  auto restorePruning = scope_guard([] { QueryPruning::disableForTests = false; });
   WholeCountRun emptyBypass = runWholeCount(
       helper.getSearchEngine(), collection, empty);
   WholeCountRun emptyBuild = runWholeCount(

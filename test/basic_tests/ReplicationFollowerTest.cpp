@@ -1970,4 +1970,24 @@ TEST_F(ReplicationFollowerTest, replicaReopenSharesUnchangedSegments) {
   EXPECT_EQ(1, search.found());
 }
 
+// The collection summary travels in the manifest: a follower's reader
+// proves from it exactly as the source's does.
+TEST_F(ReplicationFollowerTest, followerReadsTheCollectionSummary) {
+  startSource(); startFollower();
+  CollectionHelper h(*source, "main");
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "a", "price_i", (int64_t)5)}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(h.indexAll({flatdoc("id", "b", "price_i", (int64_t)9)}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(caughtUp());
+  auto sourceReader = source->getCollection("main")->getReaderManager().getReader();
+  auto followerReader = follower->getCollection("main")->getReaderManager().getReader();
+  ASSERT_NE(nullptr, sourceReader->collectionSummary());
+  ASSERT_NE(nullptr, followerReader->collectionSummary());
+  const auto* expected = sourceReader->collectionSummary()->field("price_i");
+  const auto* replicated = followerReader->collectionSummary()->field("price_i");
+  ASSERT_NE(nullptr, replicated);
+  EXPECT_EQ(2u, replicated->segments_with_field);
+  EXPECT_EQ(expected->num_min, replicated->num_min);
+  EXPECT_EQ(expected->num_max, replicated->num_max);
+}
+
 }

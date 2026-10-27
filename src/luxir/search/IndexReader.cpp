@@ -130,10 +130,28 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
 }
 
 
+// Whether `schema` types every field `summary` records as the segments
+// persist it: the check field() makes on access.
+static bool schemaMatchesPersisted(const SegmentSummary& summary, const Schema* schema) {
+  if (!schema) return true;
+  for (const auto& record : summary.fields()) {
+    auto* expected = schema->getFieldTypePtr(record.fieldname);
+    if (!expected) continue;
+    auto type = (FieldType::Type)record.type;
+    if (expected->persistedType() != type
+        || expected->segmentTypeFlags() != FieldType::typeParameters(type, record.type_flags)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 IndexReader::IndexReader(Snapshot snapshot, std::shared_ptr<FilterCache> filterCache)
   : snapshotTime(snapshot.commitTime), snapshotGen(snapshot.indexGen),
     core(std::move(snapshot.core)), sharedSchema(std::move(snapshot.schema)),
-    sharedFilterCache(std::move(filterCache)) {}
+    sharedFilterCache(std::move(filterCache)),
+    provingSummary(core->collectionSummary && schemaMatchesPersisted(*core->collectionSummary, sharedSchema.get())
+                       ? core->collectionSummary.get() : nullptr) {}
 
 IndexReader::IndexReader(Directory& dir, const CommitSnapshot& snapshot, IndexReader* previousReader,
                          std::shared_ptr<FilterCache> filterCache, std::shared_ptr<Metrics> metrics,
@@ -377,6 +395,14 @@ IndexReader::Snapshot IndexReader::openSnapshot(Directory& dir, const IndexReade
       }
       commitTimeUs = indexInfo.commit_time;
       core->coreGeneration = indexInfo.core_gen;
+      core->collectionSummary = nullptr;
+      if (indexInfo.summary_complete) {
+        try {
+          core->collectionSummary = SegmentSummary::fromAggregate(indexInfo.field_summaries, true);
+        } catch (const std::exception& e) {
+          LOG_WARN("Collection summary unreadable at gen={}: {}", indexInfo.index_gen, e.what());
+        }
+      }
       bool missingFileOK = !manifest; // Allow missing files on first attempt
       IREADER_DEBUG("\tOpening IndexReader, commitTime={} nSegs={} gen={}", indexInfo.commit_time,
                     indexInfo.segments.size(), indexInfo.index_gen);

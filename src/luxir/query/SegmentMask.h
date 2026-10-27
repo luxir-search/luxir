@@ -50,6 +50,8 @@ public:
   }
   // Whether some segment is excluded.
   bool prunesAny() const noexcept { return count != 0 && popcount() != count; }
+  // Whether every segment is excluded (false for a reader without segments).
+  bool none() const noexcept { return count != 0 && popcount() == 0; }
 
   SegmentMask& operator&=(const SegmentMask& other) {
     if (other.unrestricted()) return *this;

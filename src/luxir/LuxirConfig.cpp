@@ -217,6 +217,12 @@ void LuxirConfig::addOptions(CLI::App& app) {
       ->default_val(index.pressure_flush_floor_mb)
       ->check(CLI::PositiveNumber);
 
+  app.add_option("--indexing.collection-summary-max-bytes", index.collection_summary_max_bytes,
+                 "Max encoded size of the collection summary in each manifest; over it bounds are "
+                 "dropped, then the summary is stored incomplete (e.g. 64KB, 0 = none)")
+      ->transform(CLI::AsSizeValue(false))
+      ->default_str("64KB");
+
   app.add_option("--indexing.max-request-body", ingest.max_request_body,
                  "Max buffered (non-streaming) request body; oversized -> 413 (e.g. 32MB)")
       ->transform(CLI::AsSizeValue(false))

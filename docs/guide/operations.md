@@ -553,6 +553,19 @@ the node unlimited. The resolved values are logged at startup.
   `indexing.pressure-flush-floor-mb`, default 4). Without a waiting merge,
   inverters are flushed only once the whole budget is in use.
 
+Each commit's manifest carries a collection summary: per field, its
+presence, counts and value bounds over the whole collection, which lets a
+search answer an operation that cannot match anything (a range above every
+value, a term outside every segment's terms) without opening any segment.
+`--indexing.collection-summary-max-bytes` (default `64KB`, size suffixes
+accepted) caps its encoded size in each manifest, which every reader open and
+replication step reads. Over the cap, term bounds are dropped first, then the
+other bounds (leaving presence and counts); if presence alone is still over
+(a collection with very many fields), the summary is stored as incomplete and
+proves nothing, so searches fall back to per-segment proofs. `0` stores none.
+The summary is recomputed only when the segment set changes (a flush or
+merge), so a new cap takes effect from the next one.
+
 `--indexing.huge-pages` is enabled by default in jemalloc builds. It advises
 transparent huge pages for whole-huge-page indexing allocations; disable it
 with `--no-indexing.huge-pages` (or `--indexing.huge-pages=false`). This is a

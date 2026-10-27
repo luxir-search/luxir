@@ -111,6 +111,9 @@ struct IndexConfig {
   int64_t max_ram_mb = -1;
   int64_t pressure_flush_floor_mb = 4;           // min idle-inverter size to shed when over the shared cap
   int merge_factor = 10;
+  // Encoded bytes the collection summary may take in each manifest; see
+  // IndexWriter::collectionSummaryMaxBytes. 0 stores none.
+  uint64_t collection_summary_max_bytes = 64 * 1024;
 };
 
 struct IngestConfig {

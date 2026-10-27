@@ -124,7 +124,12 @@ locations, browse `src/luxir/<area>/`.
      write it, and `PostingsWriter::finish` turns the field directory into one
      summary record per field; `IndexWriter` writes the result as the segment's
      `segment_summary` overlay. `SegmentSummary` is the decoded sidecar, loaded
-     with the segment by `IndexReader` (`Segment::summary()`). See
+     with the segment by `IndexReader` (`Segment::summary()`).
+     `CollectionSummary` (`SummaryInfo.h`) unions the segment summaries into
+     the manifest's collection summary under a size budget;
+     `IndexWriter::writeCollectionSummary` recomputes it only when the segment
+     set changes, and `IndexReader::collectionSummary()` serves it to
+     `QueryPruning::collectionEmpty`. See
      [segment summaries](../design/segment-summaries.md).
 
 6. **Vector Search** (`src/luxir/index/`, `src/luxir/reader/`)

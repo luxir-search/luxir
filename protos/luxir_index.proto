@@ -26,9 +26,19 @@ message IndexInfo {
   // Auxiliary indexes built at index scope. Segment-local overlays live on
   // SegmentInfo.overlays.
   repeated AuxIndexInfo aux_indexes = 16;
+
+  // The collection summary: the union of every segment's summary, one record
+  // per physical field present in any segment, sorted by name. Recomputed
+  // only when the segment set (core_gen) changes. When summary_complete is
+  // false it proves nothing (some segment had no readable or complete
+  // summary, or the records exceeded the writer's size budget) and is
+  // stored without records. See docs/design/segment-summaries.md.
+  repeated FieldSummary field_summaries = 17;
+  bool summary_complete = 18;
 }
 
-// One physical field's record in a segment summary sidecar. Bounds are
+// One physical field's record in a segment summary sidecar or in the
+// collection summary (IndexInfo.field_summaries). Bounds are
 // conservative supersets of the values the field holds (deleted documents
 // may be counted); see docs/design/segment-summaries.md for the exact
 // semantics. Fields shared with SegFieldInfo carry its names.
@@ -49,7 +59,8 @@ message FieldSummary {
   sint32 geo_max_lon = 14;
   bytes term_min = 15;             // truncated first term; valid with HAS_TERM_BOUNDS
   bytes term_max = 16;             // rounded up when truncated, so still an upper bound
-  uint32 flags = 19;               // FieldType flags incl. segment markers (SegFieldInfo.flags)
+  uint32 flags = 19;               // FieldType flags incl. segment markers (SegFieldInfo.flags); OR-ed in the collection summary
+  uint32 segments_with_field = 18; // collection summary only: segments with a record
   uint32 type_flags = 20;          // interpreted by type (SegFieldInfo.typeFlags)
 }
 

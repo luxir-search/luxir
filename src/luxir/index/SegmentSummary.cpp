@@ -7,6 +7,7 @@
 #include <climits>
 #include <cstring>
 #include <stdexcept>
+#include <vector>
 
 #include "luxir/api/padded_input.h"
 #include "luxir/reader/Postings.h"
@@ -49,15 +50,32 @@ void SegmentSummary::decode(std::span<const std::byte> image) {
   if (version != FORMAT_VERSION) {
     throw std::runtime_error("segment summary: unsupported format version " + std::to_string(version));
   }
-  // Decoded views point into the arena's padded copy, so the image need not
+  decodeBody(image.subspan(HEADER_BYTES));
+  imageBytes = image.size();
+}
+
+void SegmentSummary::decodeBody(std::span<const std::byte> body) {
+  // Decoded views point into the arena's padded copy, so the bytes need not
   // outlive the summary.
-  if (!api::decode(info, api::copyToPaddedInput(image.subspan(HEADER_BYTES), arena), arena)) {
+  if (!api::decode(info, api::copyToPaddedInput(body, arena), arena)) {
     throw std::runtime_error("segment summary: undecodable field records");
   }
   if (!std::ranges::is_sorted(info.fields, {}, &api::FieldSummary::fieldname)) {
     throw std::runtime_error("segment summary: field records are not sorted");
   }
-  imageBytes = image.size();
+}
+
+std::shared_ptr<const SegmentSummary> SegmentSummary::fromAggregate(std::span<const api::FieldSummary> fields,
+                                                                    bool complete) {
+  api::SegmentSummaryInfo aggregate;
+  aggregate.fields = fields;
+  aggregate.complete = complete;
+  std::vector<std::byte> body;
+  if (!api::encode(aggregate, body)) throw std::runtime_error("collection summary: encoding failed");
+  auto summary = std::make_shared<SegmentSummary>();
+  summary->decodeBody(body);
+  summary->imageBytes = body.size();
+  return summary;
 }
 
 const api::FieldSummary* SegmentSummary::field(std::string_view physicalName) const noexcept {

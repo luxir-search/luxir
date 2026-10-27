@@ -15,6 +15,8 @@
 #include <oneapi/tbb/flow_graph.h>
 #include <oneapi/tbb/task_arena.h>
 #include "luxir/index/AuxInfo.h"
+#include "luxir/index/SegmentSummary.h"
+#include "luxir/index/SummaryInfo.h"
 #include "CommitSnapshotRegistry.h"
 #include "luxir/index/IndexRamBudget.h"
 #include "luxir/util/ApiError.h"
@@ -70,6 +72,11 @@ public:
     // snapshot this writer published (CommitSnapshot::openReaders). Atomic: commit and merge
     // threads fill it without a lock (IndexWriter::getSegmentPostingsReader).
     std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
+
+    // The segment's summary (its "segment_summary" overlay), opened when the
+    // collection summary is first computed over it; null until then and
+    // when the segment has no readable summary.
+    std::atomic<std::shared_ptr<const SegmentSummary>> summary = nullptr;
 
     // Null until known; once populated, the physical dictionary's bounds never change.
     std::atomic<std::shared_ptr<const IdRange>> idRange = nullptr;
@@ -605,6 +612,16 @@ public:
   // without meaningful RAM relief, e.g. when merge reservations hold the budget.
   size_t pressureFlushFloorBytes = 4 * 1024 * 1024;
 
+  // Encoded bytes the collection summary may take in each manifest
+  // (IndexInfo.field_summaries). Over it, term bounds go first, then every
+  // other bound, and when presence records alone are over, the summary is
+  // stored incomplete and proves nothing (CollectionSummary::fit). Set from
+  // LuxirConfig (indexing.collection-summary-max-bytes); 0 stores none.
+  size_t collectionSummaryMaxBytes = 64 * 1024;
+  // Times the collection summary was computed from segment summaries: once
+  // per segment set (core_gen), never for a delete-only commit.
+  std::atomic<uint64_t> collectionSummaryBuilds{0};
+
   // TEXT merge partitioning thresholds. Tests and constrained deployments may
   // lower these without changing the on-disk behavior of flushes or serial merges.
   // Debug builds default the byte floors to 1 so every text merge with enough
@@ -851,6 +868,23 @@ private:
   // without a summary, which proves nothing, and never fails the flush or
   // merge.
   void writeSegmentSummary(SegInfo& seg, PostingsWriter& pwriter) noexcept;
+  // The segment's summary, opened from its overlay file on first need; null
+  // when it has none or it cannot be read.
+  std::shared_ptr<const SegmentSummary> segmentSummary(SegInfo& seg) noexcept;
+  // The collection summary of the segment set `segs` at `coreGen`, fitted
+  // to collectionSummaryMaxBytes, written into `info` (views into the
+  // cache's records, stable while publicationMutex is held). Recomputed only
+  // when the segment set changes, so a delete-only commit copies it.
+  void writeCollectionSummary(std::span<SegInfo*> segs, uint64_t coreGen, api::IndexInfo& info,
+                              std::pmr::memory_resource& arena);
+  struct CollectionSummaryCache {
+    bool valid = false;
+    uint64_t coreGen = 0;
+    std::vector<uint64_t> segIds;
+    CollectionSummary summary;
+  };
+  std::mutex collectionSummaryMutex;
+  CollectionSummaryCache collectionSummaryCache;  // protected by collectionSummaryMutex
   std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
       PostingsReader& postingsReader,

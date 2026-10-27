@@ -24,6 +24,8 @@ class QueryPruning {
   IndexReader& reader;
   boost::unordered_flat_map<const Query*, SegmentMask> memo;
   boost::unordered_flat_map<const Query*, SegmentMask> membershipMemo;
+  // Whether the collection summary proves the query empty, by query.
+  boost::unordered_flat_map<const Query*, bool> collectionMemo;
 
 public:
   // Disables every proof, including the skipped statistics seeks, so pruned
@@ -32,10 +34,20 @@ public:
 
   explicit QueryPruning(IndexReader& reader) : reader(reader) {}
 
+  // Whether the collection summary (the manifest's union of every segment's
+  // summary) proves that no document of any segment, deleted or not,
+  // matches `query`. Evaluated once, before any segment, and memoized.
+  bool collectionEmpty(const Query& query);
+
+  // Why the collection summary proves `query` empty, for explain and
+  // profile notes; empty when it does not.
+  std::string collectionReason(const Query& query) const;
+
   // The segments where `query`'s summary proofs allow a match, deletes
   // ignored, by ordinal, memoized for the request. A segment outside it holds
   // no document matching `query`, deleted or not, so its cached membership
-  // is exactly empty.
+  // is exactly empty. A query the collection summary proves empty gets the
+  // empty mask without a proof per segment.
   const SegmentMask& membership(const Query& query);
 
   // The segments `query` may match: membership() without the segments that

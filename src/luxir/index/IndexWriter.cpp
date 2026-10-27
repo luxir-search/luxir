@@ -221,6 +221,14 @@ IndexWriter::IndexWriter(CommitSnapshotRegistry& snapshots, std::shared_ptr<Sche
     for (const auto& aux : indexInfo.aux_indexes) {
       currentAuxIndexes_.push_back(fromWire(aux));
     }
+    // The stored collection summary covers exactly this segment set: a
+    // commit that keeps it (deletes only) copies it without recomputing.
+    collectionSummaryCache.valid = true;
+    collectionSummaryCache.coreGen = coreGen;
+    collectionSummaryCache.segIds = lastCommittedSegIds;
+    std::ranges::sort(collectionSummaryCache.segIds);
+    collectionSummaryCache.summary =
+        CollectionSummary::fromManifest(indexInfo.field_summaries, indexInfo.summary_complete);
   }
   if (!manifest.bytes) {
     api::IndexInfo initial;
@@ -2489,8 +2497,61 @@ uint64_t IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo& c
   }
   auto* aux = api::build::allocArray(info.aux_indexes, auxIndexes.size(), arena);
   for (size_t i = 0; i < auxIndexes.size(); i++) aux[i] = toWire(auxIndexes[i], arena);
+  writeCollectionSummary(segs, commitInfo.coreGen, info, arena);
   publish(info, arena);
   return info.commit_time;
+}
+
+std::shared_ptr<const SegmentSummary> IndexWriter::segmentSummary(SegInfo& seg) noexcept {
+  if (auto loaded = seg.summary.load()) return loaded;
+  auto overlay = std::ranges::find_if(seg.auxOverlays, [](const AuxInfo& candidate) {
+    return candidate.kind == SegmentSummary::OVERLAY_KIND;
+  });
+  if (overlay == seg.auxOverlays.end() || overlay->files.empty()) return nullptr;
+  try {
+    auto summary = SegmentSummary::open(dir, overlay->files.front().name);
+    if (summary && (summary->segId() != seg.segId || summary->maxDoc() != seg.maxDoc)) {
+      LOG_WARN("Segment summary for seg={} describes seg={} max_doc={}; ignored", seg.segId,
+               summary->segId(), summary->maxDoc());
+      return nullptr;
+    }
+    if (summary) seg.summary.store(summary);
+    return summary;
+  } catch (const std::exception& e) {
+    LOG_WARN("Segment summary unreadable for seg={}: {}", seg.segId, e.what());
+    return nullptr;
+  }
+}
+
+void IndexWriter::writeCollectionSummary(std::span<SegInfo*> segs, uint64_t coreGen, api::IndexInfo& info,
+                                         std::pmr::memory_resource& arena) {
+  std::lock_guard lock(collectionSummaryMutex);
+  auto& cache = collectionSummaryCache;
+  bool sameSegments = cache.valid && cache.coreGen == coreGen && cache.segIds.size() == segs.size()
+      && std::ranges::equal(cache.segIds, segs, {}, {}, [](const SegInfo* seg) { return seg->segId; });
+  if (!sameSegments) {
+    std::vector<std::shared_ptr<const SegmentSummary>> owned;
+    std::vector<const SegmentSummary*> summaries;
+    owned.reserve(segs.size());
+    summaries.reserve(segs.size());
+    for (SegInfo* seg : segs) {
+      owned.push_back(segmentSummary(*seg));
+      summaries.push_back(owned.back().get());
+    }
+    cache.summary = CollectionSummary::aggregate(summaries);
+    cache.summary.fit(collectionSummaryMaxBytes);
+    if (cache.summary.tier != CollectionSummary::Tier::FULL) {
+      LOG_DEBUG("Collection summary at core_gen={} stored at tier {} ({} records)", coreGen,
+                (int)cache.summary.tier, cache.summary.fields.size());
+    }
+    cache.coreGen = coreGen;
+    cache.segIds.clear();
+    for (SegInfo* seg : segs) cache.segIds.push_back(seg->segId);
+    cache.valid = true;
+    collectionSummaryBuilds.fetch_add(1, std::memory_order_relaxed);
+  }
+  info.field_summaries = summariesToWire(cache.summary.fields, arena);
+  info.summary_complete = cache.summary.complete;
 }
 
 bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge) {
@@ -3199,6 +3260,10 @@ void IndexWriter::testDeleteAllData() {
     indexGen = 0;
     incarnation = CommitId::newIncarnation();
     coreGen = 0;
+    {
+      std::lock_guard summaryLock(collectionSummaryMutex);
+      collectionSummaryCache = {};
+    }
     lastCommittedSegIds.clear();
     currentAuxIndexes_.clear();
     currentSegmentOverlays_.clear();
