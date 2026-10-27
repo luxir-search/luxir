@@ -22,6 +22,8 @@
 #include "luxir/api/luxir_types.hpp"
 #include "luxir/util/MemPool.h"
 #include "ExecutionWarnings.h"
+#include "QueryPruning.h"
+#include "SummaryView.h"
 #include "Warnings.h"
 #include "luxir/util/proto.h"
 #include "luxir/util/StrRef.h"
@@ -667,6 +669,17 @@ public:
       std::string_view field) const {
     unused(field);
     return std::nullopt;
+  }
+
+  // Whether this query can match any document of the segment `view`
+  // summarizes: EMPTY is a proof that none does (over live and deleted
+  // documents alike), UNKNOWN is always legal, NONEMPTY says only that the
+  // summary offers no proof of absence. A pure function of the logical tree
+  // and the view; it must never read a segment. Composites combine their
+  // children's answers (QueryPruning evaluates them once per segment).
+  virtual MatchState mayMatch(const SummaryView& view) const {
+    unused(view);
+    return MatchState::UNKNOWN;
   }
 
   // Validate the complete logical tree once during serial request planning,
@@ -1486,14 +1499,24 @@ public:
       auto numSegs = numSegments();
       // TermsEnums survive missing-term lookups; allocate them before the
       // temporary postings states that can be rewound below.
-      for (size_t i = 0; i < numSegs; i++) getTermsEnum(cachedFieldInfo, i);
+      for (size_t i = 0; i < numSegs; i++) {
+        if (!QueryPruning::termAbsent(topReader.segments()[i], cachedFieldInfo.segInfos.name(), term)) {
+          getTermsEnum(cachedFieldInfo, i);
+        }
+      }
       auto savepoint = pool.getSavePoint();
       int foundInSegCount = 0;
       result.postingsStates = {
           pool.make_arr<const TermsEnum::PostingsState*>(numSegs), numSegs};
       for (int i = 0; i < numSegs; ++i) {
+        // A segment whose summary proves the term absent holds zero
+        // frequency for it, exactly what a seek would find, so it is not
+        // seeked. Every other segment is, pruned by other predicates or not:
+        // statistics always cover the whole reader.
         auto* termsEnum = cachedFieldInfo.termsEnums[i];
-        if (!termsEnum || !termsEnum->seek(term)) {
+        if (!termsEnum
+            || QueryPruning::termAbsent(topReader.segments()[(size_t)i], cachedFieldInfo.segInfos.name(), term)
+            || !termsEnum->seek(term)) {
           result.postingsStates[i] = nullptr;
           continue;
         }
@@ -1517,6 +1540,9 @@ public:
       result = {};
       bool found = false;
       for (int i = 0; i < (int)numSegments(); ++i) {
+        if (QueryPruning::termAbsent(topReader.segments()[(size_t)i], cachedFieldInfo.segInfos.name(), term)) {
+          continue;
+        }
         auto* termsEnum = getTermsEnum(cachedFieldInfo, (size_t)i);
         if (!termsEnum || !termsEnum->seek(term)) {
           continue;

@@ -16,6 +16,7 @@
 #include "Query.h"
 #include "luxir/reader/NormsReader.h"
 #include "luxir/reader/PosEnum.h"
+#include "SummaryPredicates.h"
 
 namespace luxir {
 
@@ -336,6 +337,14 @@ public:
   [[nodiscard]] std::span<std::string_view> getTerms() const { return terms; }
   [[nodiscard]] std::span<const int32_t> getPositions() const { return positions; }
   [[nodiscard]] int32_t getSlop() const { return slop; }
+
+  // A phrase needs every term: one provably absent term empties the segment.
+  MatchState mayMatch(const SummaryView& view) const override {
+    for (std::string_view term : terms) {
+      if (summary::termMatch(view, field, term) == MatchState::EMPTY) return MatchState::EMPTY;
+    }
+    return MatchState::UNKNOWN;
+  }
 
   FilterKeyScope appendFilterKey(FilterKeyBuilder& out,
                                  const FilterKeyContext& ctx) const override {
