@@ -176,6 +176,42 @@ public:
 
   class Calc : public SearchOp::Calculator {
   public:
+    class EvidenceWindow final : public Query::SegmentSource {
+    public:
+      std::vector<Query::SegmentSource*> sources;
+      std::vector<segdoc> candidates;
+      Query::Scorer* createScorer(MemPool&, IndexReader::Segment&) override { return nullptr; }
+      Query::ScorerSupplier* scorerSupplierImpl(MemPool&, IndexReader::Segment&, Query::SupplierExecutionMode) override { return nullptr; }
+      void visitChildMatches(int32_t segment, int32_t doc, const Query::ChildMatchVisitor& visitor) const override {
+        if (!std::binary_search(candidates.begin(), candidates.end(), segdoc(segment, doc))) return;
+        for (auto* source : sources) source->visitChildMatches(segment, doc, visitor);
+      }
+    };
+    std::vector<std::unique_ptr<EvidenceWindow>> evidenceWindows;
+    std::vector<Query::SegmentSource*> evidenceSources() override {
+      std::vector<Query::SegmentSource*> sources;
+      for (size_t i = 0; i < sourceCalcs.size(); ++i) {
+        auto child = sourceCalcs[i]->evidenceSources();
+        auto* collector = deliveredCollectors[i];
+        if (child.empty() || !collector) continue;
+        auto window = std::make_unique<EvidenceWindow>();
+        window->sources = std::move(child);
+        if (thisOp().sources[i]->collapse || thisOp().sources[i]->diversify) {
+          std::vector<RankedHead> heads;
+          appendCollapsedSource(*collector, heads);
+          for (auto& head : heads) window->candidates.push_back(head.doc);
+        } else if (collector->useFieldSort) {
+          for (auto& hit : collector->fieldCollector->sort()) window->candidates.push_back(hit.doc);
+        } else {
+          for (auto& hit : collector->scoreCollector->sort()) window->candidates.push_back(hit.doc);
+        }
+        std::sort(window->candidates.begin(), window->candidates.end());
+        sources.push_back(window.get());
+        evidenceWindows.push_back(std::move(window));
+      }
+      return sources;
+    }
+
     // One sub-calc per source TopDocsReq.  Each is a TopDocsReq::Calc that
     // collects across all segments and ultimately fires its rankingSink,
     // delivering its merged collector to this Calc.
@@ -521,7 +557,7 @@ public:
         op.needsCount(),
         op.fusionProto.get_scores,
         op.fusionProto.document_format,
-        emission);
+        emission, {}, false, evidenceSources());
     }
   };
 

@@ -82,7 +82,7 @@ public:
         // contract (Query.h): a segment's domain, when present, is
         // live-filtered and is the complete eligibility predicate; null means
         // no deletes and no filters.
-        auto* liveDocs = seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr;
+        auto* liveDocs = op.req.reader->rootDomain(seg.ord);
         domains.push_back(DomainHandle::pinned(liveDocs, op.req.reader));
       }
 

@@ -329,7 +329,24 @@ message Query {
     AnyOfQuery any_of = 19;         // constant-score exact value-set membership
     MultiMatchQuery multi_match = 20; // one text over several weighted fields
     DisMaxQuery dis_max = 25;       // best query score plus tie times the other scores
+    HasChildQuery has_child = 27;   // Search children and return their live parents; 26 is used by plugin queries.
   }
+}
+
+message InnerHits {
+  string name = 1;
+  optional int32 limit = 2; // default 1; 0 disables evidence
+  repeated string fields = 3;
+}
+
+message HasChildQuery {
+  string relation = 1;
+  Query query = 2;
+  repeated Query filter = 3;
+  string score_mode = 4; // max (default), none, sum, avg, min
+  InnerHits inner_hits = 5;
+  optional int32 min_children = 6;
+  optional int32 max_children = 7;
 }
 
 message ExistsQuery {
@@ -386,6 +403,8 @@ message KnnQuery {
 
   // docs (default): k counts documents. groups: k counts nearest groups under
   // the enclosing top_docs collapse key and missing policy; requires collapse.
+  // Inside has_child, the default (also spelled parents) groups by the live
+  // parent incarnation. Explicit docs selects child records instead.
   // The match set contains one best scored witness per selected group.
   string unit = 7;
 
@@ -1021,6 +1040,9 @@ message GroupTable {
 // DocFormat; under COLUMNS an all-missing discovered column is left out of
 // the batch, under ADAPTIVE placement is per batch and field.
 message DocList {
+  // One map of named inner-hit lists per parent row, in row order.
+  repeated Map matches = 20;
+
   // Match count when count_limit is nonzero. Counts groups with
   // collapse; otherwise Fusion counts source-union documents before paging.
   optional sint64 found = 1;
@@ -1127,7 +1149,23 @@ message CollectionCommit {
   Error error = 3;
 }
 
-// Index or delete documents, with an optional commit.
+// A family replacement is atomic and assigns a new family token.
+message FamilyUpdate {
+  Map parent = 1;
+  map<string, ArrVal> children = 2; // relation name -> child document maps
+}
+
+// Child mutations require the family token returned with the parent.
+// A replaced or deleted parent never adopts children from an older token.
+message ChildUpdate {
+  string parent_id = 1;
+  string family = 2;
+  string relation = 3;
+  repeated Map docs = 4;
+  repeated string delete_ids = 5;
+}
+
+// Index or delete documents and families, with an optional commit.
 message UpdateRequest {
   // Optional opaque identifier, echoed in the response for correlation.
   string request_id = 1;
@@ -1138,6 +1176,8 @@ message UpdateRequest {
   // rejected with a document error: the field is assigned by the engine and
   // optimistic concurrency is not supported.
   repeated Map docs = 4;
+  repeated FamilyUpdate families = 13;
+  repeated ChildUpdate child_updates = 14;
 
   // Document IDs to delete.  Deletes never fail per-id; deleting a nonexistent id
   // is a no-op.
@@ -1178,6 +1218,8 @@ message UpdateRequest {
 // The response to an update request.  In streaming mode the server sends exactly one
 // response per request.
 message UpdateResponse {
+  // New incarnation tokens for successfully replaced families, keyed by parent id.
+  map<string, string> families = 11;
   // This is the request_id from the UpdateRequest, if it was set.
   string request_id = 1;
 
@@ -2405,7 +2447,13 @@ message StoredResourceDef {
   optional int32 zstd_dictionary_bytes = 6;
 }
 
+message RelationDef {
+  map<string, FieldDef> fields = 1;
+}
+
 message SchemaDef {
+  map<string, RelationDef> relations = 5;
+
   // Concrete fields, keyed by field name.  Exact-name lookup consults only this
   // map.  The reserved "id" and "_version_" fields are always materialized: a
   // REPLACE_ALL that omits them gets the defaults; redefining them incompatibly, or

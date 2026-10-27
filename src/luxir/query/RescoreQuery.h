@@ -458,6 +458,10 @@ public:
       bool pruning;
 
     public:
+      void visitChildMatches(int32_t segment, int32_t doc, const ChildMatchVisitor& visitor) const override {
+        child.segmentSource().visitChildMatches(segment, doc, visitor);
+      }
+
       Prepared(QueryPrep::PreparedSource&& child, ValueProgram* program, ValueFieldInfos fieldInfos,
                float multiplier, bool scored, bool needsChildScore,
                bool pruning)

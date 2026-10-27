@@ -221,6 +221,25 @@ struct to<JSON, luxir::api::Map> {
   }
 };
 
+// Repeated child objects use a JSON array rather than the wire wrapper.
+template <>
+struct from<JSON, luxir::api::ArrVal> {
+  template <auto Opts>
+  static void op(luxir::api::ArrVal& value, hpp_proto::concepts::is_non_owning_context auto& ctx,
+                 auto& it, auto& end) {
+    decltype(auto) elements = ::hpp_proto::detail::as_modifiable(ctx, value.v);
+    glz::util::parse_repeated<Opts>(false, elements, ctx, it, end);
+  }
+};
+template <>
+struct to<JSON, luxir::api::ArrVal> {
+  static constexpr bool can_error = true;
+  template <auto Opts>
+  static void op(const luxir::api::ArrVal& value, is_context auto& ctx, auto& b, auto& ix) {
+    serialize<JSON>::template op<Opts>(value.v, ctx, b, ix);
+  }
+};
+
 // ----- Vector: a bare number array (null when no encoding present) -----
 template <>
 struct from<JSON, luxir::api::Vector> {
@@ -1046,6 +1065,8 @@ struct from<JSON, luxir::api::Query> {
             arm(std::in_place_type<api::ExprQuery>);
           } else if (key == "multi_match") {
             arm(std::in_place_type<api::MultiMatchQuery>);
+          } else if (key == "has_child") {
+            arm(std::in_place_type<api::HasChildQuery>);
           } else if (key == "dis_max") {
             arm(std::in_place_type<api::DisMaxQuery>);
           } else {

@@ -142,8 +142,7 @@ void FacetBucketBlockExecutor::deliverStructural(SearchOp::Calculator& parent,
       DomainHandle base = domain;
       if (plan->variants.hasResetVariants()) {
         auto& seg = reader.segments()[(size_t)segnum];
-        base = DomainHandle::pinned(seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr,
-                                    parent.getOp().req.reader);
+        base = DomainHandle::pinned(reader.rootDomain(seg.ord), parent.getOp().req.reader);
         if (auto path = binding->structuralConstraint()) {
           base = path->prefix((int32_t)segnum, std::move(base));
         }

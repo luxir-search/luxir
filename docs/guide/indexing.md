@@ -53,6 +53,8 @@ are:
 | `all_or_none` | Roll back the whole request if one document fails. Default `false`. |
 | `return_ids` | Include successfully indexed IDs in request order. |
 | `commit` | Make changes visible, with optional commit controls. |
+| `families` | Atomically replace parents and all their child relations; see [relations](relations.md). |
+| `child_updates` | Mutate individual children using their parent's incarnation token. |
 | `field_map` | Rename input document keys onto schema fields for this request. |
 | `drop_unmapped` | Drop doc keys not present in `field_map` instead of indexing them. |
 

@@ -3021,7 +3021,7 @@ private:
   }
 
   static bool streamRequestHasInlineOps(const HttpUpdateReqProto& request) {
-    return !request.docs.empty() || !request.delete_ids.empty();
+    return !request.docs.empty() || !request.delete_ids.empty() || !request.families.empty() || !request.child_updates.empty();
   }
 
   void startImplicitStreamGroup() {

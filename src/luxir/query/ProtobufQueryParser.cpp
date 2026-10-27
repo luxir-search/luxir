@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "luxir/query/ProtobufQueryParser.h"
+#include "luxir/query/HasChildQuery.h"
+#include "luxir/search/Collapse.h"
 
 #include <algorithm>
 #include <cmath>
@@ -244,6 +246,32 @@ luxir::Query* ProtobufQueryParser::parseFuzzy(const luxir::api::FuzzyQuery& fuzz
                                   maxEdits, prefixLength, fuzzyQuery.max_expansions);
 }
 
+luxir::Query* ProtobufQueryParser::parseHasChild(const api::HasChildQuery& spec) {
+  if (context.childScope) throw RequestError("has_child cannot be nested inside a child scope");
+  if (!context.reader || !schema.relations.contains(spec.relation)) throw RequestError("unknown relation: " + std::string(spec.relation));
+  if (spec.min_children.value_or(1) < 1 || spec.max_children.value_or(INT32_MAX) < spec.min_children.value_or(1))
+    throw RequestError("has_child requires 1 <= min_children <= max_children");
+  if (!spec.score_mode.empty() && spec.score_mode != "max" && spec.score_mode != "none" && spec.score_mode != "min"
+      && spec.score_mode != "sum" && spec.score_mode != "avg") throw RequestError("invalid has_child score_mode");
+  if (spec.inner_hits && (spec.inner_hits->name.empty() || spec.inner_hits->limit.value_or(1) < 0 || spec.inner_hits->limit.value_or(1) > 1000))
+    throw RequestError("inner_hits requires a name and limit between 0 and 1000");
+  auto* resolver = arenaCreate<FieldResolver>(context.arena, schema, nullptr, "luxir_rel_" + std::to_string(spec.relation.size()) + "_" + std::string(spec.relation) + "_");
+  ParseContext nested(pool, schema, context.arena, context.coerceContext, context.opName, context.warnings, resolver);
+  nested.nestingBudget = context.nestingBudget;
+  nested.reader = context.reader;
+  nested.childScope = true;
+  auto* collapse = arenaCreate<CollapsePlan>(context.arena, *context.reader, api::Collapse_::MissingPolicy::DROP, false);
+  collapse->fields.push_back({"luxir_family_s", api::GroupComponent_::Type::STRING,
+      context.reader->getOrdMap("luxir_family_s"), context.reader->field("luxir_family_s"), ValueNature::NUMBER});
+  nested.collapse = collapse;
+  ProtobufQueryParser parser(nested);
+  auto* child = spec.query ? parser.parse(*spec.query) : pool.make<AllQuery>();
+  Query* filter = nullptr;
+  if (!spec.filter.empty()) filter = pool.make<BooleanQuery>(std::span<Query*>{}, std::span<Query*>{},
+      std::span<Query*>{}, parser.parseQueryList(spec.filter), 0);
+  return pool.make<HasChildQuery>(child, filter, spec);
+}
+
 luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery) {
   const auto& target = context.fields.resolve(knnQuery.field, OpClass::PRIMARY, context.opName);
   auto field = api::build::arenaStr(pool, target.physicalName);
@@ -304,7 +332,7 @@ luxir::Query* ProtobufQueryParser::parseKnn(const luxir::api::KnnQuery& knnQuery
     }
   }
 
-  bool groups = knnQuery.unit == "groups";
+  bool groups = knnQuery.unit == "groups" || (context.childScope && (knnQuery.unit.empty() || knnQuery.unit == "parents"));
   if (!knnQuery.unit.empty() && knnQuery.unit != "docs" && !groups) {
     throw std::runtime_error("knn.unit must be docs or groups");
   }
@@ -620,6 +648,7 @@ luxir::Query* ProtobufQueryParser::parse(const luxir::api::Query& pquery) {
       return parseRescore(r);
     },
     [&](const luxir::api::MultiMatchQuery& m) -> luxir::Query* { return parseMultiMatch(m); },
+    [&](const luxir::api::HasChildQuery& h) -> luxir::Query* { return parseHasChild(h); },
     [&](const luxir::api::DisMaxQuery& d) -> luxir::Query* { return parseDisMax(d); },
     // Unset oneof selects all documents, same as the explicit `all` arm.
     [&](std::monostate) -> luxir::Query* { return pool.make<luxir::AllQuery>(); },

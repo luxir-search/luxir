@@ -255,6 +255,10 @@ public:
       bool needsScores;
 
     public:
+      void visitChildMatches(int32_t segment, int32_t doc, const ChildMatchVisitor& visitor) const override {
+        child.segmentSource().visitChildMatches(segment, doc, visitor);
+      }
+
       Prepared(QueryPrep::PreparedSource&& child, float constantScore, bool needsScores)
         : child(std::move(child)), constantScore(constantScore), needsScores(needsScores) {}
 

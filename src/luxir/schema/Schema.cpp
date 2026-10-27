@@ -860,6 +860,21 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
   for (const auto& [name, fd] : def.fields) entries.push_back({name, *fd, false});
   for (const auto& [name, fd] : def.templates) entries.push_back({name, *fd, true});
 
+  using RelationPair = std::pair<std::string_view, api::RelationDef>;
+  std::vector<RelationPair> relationDefs;
+  for (const auto& [name, rd] : baseSrc.relations)
+    if (!def.relations.contains(name)) relationDefs.emplace_back(name, rd);
+  for (const auto& [name, rd] : def.relations) {
+    if (!validFieldName(name) || name.size() > 40 || name.starts_with("luxir_"))
+      throw SchemaError("invalid relation name: " + std::string(name));
+    std::erase_if(relationDefs, [&](const auto& r) { return r.first == name; });
+    relationDefs.emplace_back(name, rd);
+  }
+  std::ranges::sort(relationDefs, {}, &RelationPair::first);
+  for (auto& [name, rd] : relationDefs) schema->relations.emplace(name);
+  for (auto& entry : entries)
+    if (entry.name.starts_with("luxir_")) throw SchemaError("reserved field prefix: luxir_");
+
   // Stored resources merge the same way: a named entry replaces the base one.
   using ResourcePair = std::pair<std::string_view, api::StoredResourceDef>;
   std::vector<ResourcePair> resources;
@@ -929,7 +944,27 @@ std::shared_ptr<Schema> Schema::compile(const api::SchemaDef& def, const Schema*
       std::span<const std::pair<std::string_view, hpp_proto::indirect_view<api::FieldDef>>>(templatePairs.data(), templatePairs.size()));
     src.stored_resources = luxir::api::map_view<std::string_view, api::StoredResourceDef>(
       std::span<const ResourcePair>(resources.data(), resources.size()));
+    src.relations = api::map_view<std::string_view, api::RelationDef>(std::span<const RelationPair>(relationDefs));
     schema->sourceDef_ = serializeSchemaDef(src);
+  }
+
+  // Physical relation fields are engine-owned, never part of the authored map.
+  if (!relationDefs.empty()) {
+    for (std::string_view name : {"luxir_relation_s", "luxir_family_s", "luxir_parent_s", "luxir_child_s", "luxir_source_s"}) {
+      SourceEntry entry{name, {}, false};
+      entry.def.type = FieldClass::STRING;
+      entry.def.column = true;
+      entry.def.index = name == "luxir_source_s" ? api::FieldDef_::IndexMode::NONE : api::FieldDef_::IndexMode::MATCH;
+      entries.push_back(entry);
+    }
+    for (const auto& [relation, rd] : relationDefs) {
+      for (const auto& [name, field] : rd.fields) {
+        if (!validFieldName(name) || name == "id" || name.starts_with("luxir_"))
+          throw SchemaError("invalid child field: " + std::string(name));
+        auto physical = api::build::arenaStr(baseArena, "luxir_rel_" + std::to_string(relation.size()) + "_" + std::string(relation) + "_" + std::string(name));
+        entries.push_back({physical, *field, false});
+      }
+    }
   }
 
   // ---- resolve the whole merged graph ----

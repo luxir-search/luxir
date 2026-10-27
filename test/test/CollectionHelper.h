@@ -42,6 +42,7 @@ struct IndexResult {
   ErrorKind error_kind = ErrorKind::UNKNOWN;
   int64_t total_errors = 0;
   std::vector<std::string> ids;       // returned ids (return_ids requests)
+  std::map<std::string, std::string> families;
   std::vector<Error> errors;          // per-doc errors
 };
 
@@ -55,6 +56,7 @@ private:
   static void fillResult(ProtoUpdateMessage& msg, IndexResult& out) {
     auto* rsp = msg.finishResponse();
     out.updateVersion = rsp->update_version;
+    for (auto [parent, token] : rsp->families) out.families.emplace(parent, token);
     if (!rsp->commit.empty()) out.commit = CommitId::parse(rsp->commit);
     out.status = rsp->status;
     out.error_message.clear();
@@ -267,6 +269,8 @@ public:
 
   // Submit a fully-built UpdateBuilder (for cases the convenience methods don't cover:
   // all_or_none, return_ids, mixed adds + deletes); build docs with builder.add().
+  IndexResult submit(const api::UpdateRequest& request) { return runSync(request); }
+
   IndexResult submit(UpdateBuilder& builder) { return runSync(builder.finish()); }
 
   // Distinct names keep a single document's braced fields unambiguous.

@@ -83,6 +83,7 @@ defaults and constraints are described in the comments and guides.
 - [`CgroupMemoryStats`](#message-luxir.cgroupmemorystats)
 - [`CgroupStats`](#message-luxir.cgroupstats)
 - [`CgroupTaskStats`](#message-luxir.cgrouptaskstats)
+- [`ChildUpdate`](#message-luxir.childupdate)
 - [`ColDouble`](#message-luxir.coldouble)
 - [`ColFloat`](#message-luxir.colfloat)
 - [`ColInt`](#message-luxir.colint)
@@ -115,6 +116,7 @@ defaults and constraints are described in the comments and guides.
 - [`ExprOp`](#message-luxir.exprop)
 - [`ExprQuery`](#message-luxir.exprquery)
 - [`FacetResult`](#message-luxir.facetresult)
+- [`FamilyUpdate`](#message-luxir.familyupdate)
 - [`FieldDef`](#message-luxir.fielddef)
 - [`FieldDefaults`](#message-luxir.fielddefaults)
 - [`FieldFacet`](#message-luxir.fieldfacet)
@@ -130,12 +132,14 @@ defaults and constraints are described in the comments and guides.
 - [`GroupComponent`](#message-luxir.groupcomponent)
 - [`GroupKey`](#message-luxir.groupkey)
 - [`GroupTable`](#message-luxir.grouptable)
+- [`HasChildQuery`](#message-luxir.haschildquery)
 - [`HistogramStats`](#message-luxir.histogramstats)
 - [`HostCpuStats`](#message-luxir.hostcpustats)
 - [`HostMemoryStats`](#message-luxir.hostmemorystats)
 - [`HostStats`](#message-luxir.hoststats)
 - [`IndexRamStats`](#message-luxir.indexramstats)
 - [`IndexStats`](#message-luxir.indexstats)
+- [`InnerHits`](#message-luxir.innerhits)
 - [`JemallocStats`](#message-luxir.jemallocstats)
 - [`KnnQuery`](#message-luxir.knnquery)
 - [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf)
@@ -163,6 +167,7 @@ defaults and constraints are described in the comments and guides.
 - [`RangeFacet`](#message-luxir.rangefacet)
 - [`RangeQuery`](#message-luxir.rangequery)
 - [`RegexQuery`](#message-luxir.regexquery)
+- [`RelationDef`](#message-luxir.relationdef)
 - [`ReplicaRequirement`](#message-luxir.replicarequirement)
 - [`ReplicaResult`](#message-luxir.replicaresult)
 - [`ReplicationCatalog`](#message-luxir.replicationcatalog)
@@ -552,6 +557,22 @@ This process's cgroup v2. Limits are local to the cgroup; ancestors may impose s
 | <a id="field-luxir.cgrouptaskstats.current"></a>[`current`](#field-luxir.cgrouptaskstats.current) | 1 | `uint64` | singular | including threads |
 | <a id="field-luxir.cgrouptaskstats.max"></a>[`max`](#field-luxir.cgrouptaskstats.max) | 2 | `int64` | singular | -1 is unlimited |
 
+<a id="message-luxir.childupdate"></a>
+
+### luxir.ChildUpdate
+
+Child mutations require the family token returned with the parent. A replaced or deleted parent never adopts children from an older token.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.childupdate.parent_id"></a>[`parent_id`](#field-luxir.childupdate.parent_id) | 1 | `string` | singular |  |
+| <a id="field-luxir.childupdate.family"></a>[`family`](#field-luxir.childupdate.family) | 2 | `string` | singular |  |
+| <a id="field-luxir.childupdate.relation"></a>[`relation`](#field-luxir.childupdate.relation) | 3 | `string` | singular |  |
+| <a id="field-luxir.childupdate.docs"></a>[`docs`](#field-luxir.childupdate.docs) | 4 | [`Map`](#message-luxir.map) | repeated |  |
+| <a id="field-luxir.childupdate.delete_ids"></a>[`delete_ids`](#field-luxir.childupdate.delete_ids) | 5 | `string` | repeated |  |
+
 <a id="message-luxir.coldouble"></a>
 
 ### luxir.ColDouble
@@ -878,6 +899,7 @@ A batch of returned documents. Document i is the merge of columns row i and docs
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.doclist.matches"></a>[`matches`](#field-luxir.doclist.matches) | 20 | [`Map`](#message-luxir.map) | repeated | One map of named inner-hit lists per parent row, in row order. |
 | <a id="field-luxir.doclist.found"></a>[`found`](#field-luxir.doclist.found) | 1 | `sint64` | optional | Match count when count\_limit is nonzero. Counts groups with collapse; otherwise Fusion counts source-union documents before paging. |
 | <a id="field-luxir.doclist.found_gte"></a>[`found_gte`](#field-luxir.doclist.found_gte) | 9 | `bool` | singular | True when found is a lower bound; false means the count is exact. |
 | <a id="field-luxir.doclist.found_docs"></a>[`found_docs`](#field-luxir.doclist.found_docs) | 2 | `sint64` | optional | Collapse only, when count\_limit is nonzero, after missing=drop. |
@@ -1010,6 +1032,19 @@ An expression in the Luxir query language, with strict syntax and precise parse 
 | <a id="field-luxir.facetresult.missing"></a>[`missing`](#field-luxir.facetresult.missing) | 4 | `int64` | optional | the number of documents that do not have this field |
 | <a id="field-luxir.facetresult.ops"></a>[`ops`](#field-luxir.facetresult.ops) | 22 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | sub-operation results performed per bucket, like a sub-facet or statistics. |
 | <a id="field-luxir.facetresult.offset"></a>[`offset`](#field-luxir.facetresult.offset) | 6 | `int64` | singular |  |
+
+<a id="message-luxir.familyupdate"></a>
+
+### luxir.FamilyUpdate
+
+A family replacement is atomic and assigns a new family token.
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.familyupdate.parent"></a>[`parent`](#field-luxir.familyupdate.parent) | 1 | [`Map`](#message-luxir.map) | singular |  |
+| <a id="field-luxir.familyupdate.children"></a>[`children`](#field-luxir.familyupdate.children) | 2 | map&lt;`string`, [`ArrVal`](#message-luxir.arrval)&gt; | map | relation name -&gt; child document maps |
 
 <a id="message-luxir.fielddef"></a>
 
@@ -1274,6 +1309,22 @@ Columns aligned with a collapsed list's returned rows. Absent columns were not r
 | <a id="field-luxir.grouptable.ranks"></a>[`ranks`](#field-luxir.grouptable.ranks) | 3 | [`ArrVal`](#message-luxir.arrval) | repeated | Metric sort values, or list rank values when head\_sort chooses another member. |
 | <a id="field-luxir.grouptable.ops"></a>[`ops`](#field-luxir.grouptable.ops) | 4 | map&lt;`string`, [`Val`](#message-luxir.val)&gt; | map | Each operation is an array aligned with keys, as in FacetResult.ops. |
 
+<a id="message-luxir.haschildquery"></a>
+
+### luxir.HasChildQuery
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.haschildquery.relation"></a>[`relation`](#field-luxir.haschildquery.relation) | 1 | `string` | singular |  |
+| <a id="field-luxir.haschildquery.query"></a>[`query`](#field-luxir.haschildquery.query) | 2 | [`Query`](#message-luxir.query) | singular |  |
+| <a id="field-luxir.haschildquery.filter"></a>[`filter`](#field-luxir.haschildquery.filter) | 3 | [`Query`](#message-luxir.query) | repeated |  |
+| <a id="field-luxir.haschildquery.score_mode"></a>[`score_mode`](#field-luxir.haschildquery.score_mode) | 4 | `string` | singular | max (default), none, sum, avg, min |
+| <a id="field-luxir.haschildquery.inner_hits"></a>[`inner_hits`](#field-luxir.haschildquery.inner_hits) | 5 | [`InnerHits`](#message-luxir.innerhits) | singular |  |
+| <a id="field-luxir.haschildquery.min_children"></a>[`min_children`](#field-luxir.haschildquery.min_children) | 6 | `int32` | optional |  |
+| <a id="field-luxir.haschildquery.max_children"></a>[`max_children`](#field-luxir.haschildquery.max_children) | 7 | `int32` | optional |  |
+
 <a id="message-luxir.histogramstats"></a>
 
 ### luxir.HistogramStats
@@ -1405,6 +1456,18 @@ Indexing RAM budget: the configured limit and the bytes reserved against it.
 | <a id="field-luxir.indexstats.commits"></a>[`commits`](#field-luxir.indexstats.commits) | 18 | `uint64` | singular | writer only: commits since the writer opened |
 | <a id="field-luxir.indexstats.retained_delete_bytes"></a>[`retained_delete_bytes`](#field-luxir.indexstats.retained_delete_bytes) | 19 | `uint64` | singular | Writer only: resident delete packets held by its pending set or merge catch-up, deduplicated across owners. Included in the node indexing reservation. |
 
+<a id="message-luxir.innerhits"></a>
+
+### luxir.InnerHits
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.innerhits.name"></a>[`name`](#field-luxir.innerhits.name) | 1 | `string` | singular |  |
+| <a id="field-luxir.innerhits.limit"></a>[`limit`](#field-luxir.innerhits.limit) | 2 | `int32` | optional | default 1; 0 disables evidence |
+| <a id="field-luxir.innerhits.fields"></a>[`fields`](#field-luxir.innerhits.fields) | 3 | `string` | repeated |  |
+
 <a id="message-luxir.jemallocstats"></a>
 
 ### luxir.JemallocStats
@@ -1442,7 +1505,7 @@ Nearest-neighbor query against a searchable vector field. Search is exact when n
 | <a id="field-luxir.knnquery.exact"></a>[`exact`](#field-luxir.knnquery.exact) | 4 | `bool` | singular | Require exact top-k results by scanning stored vectors. Cost is linear in the number of stored vectors; refine\_candidates and ivf are ignored. |
 | <a id="field-luxir.knnquery.refine_candidates"></a>[`refine_candidates`](#field-luxir.knnquery.refine_candidates) | 5 | `int32` | singular | Candidate-document pool size for full-precision rescoring of ANN results, in both units. Group search caps the number of candidates per group so repeated keys cannot consume the whole pool. Clamped up to k; 0 selects an adaptive default. Larger pools can improve recall at a cost in memory and latency. Fewer candidates may be available. |
 | <a id="field-luxir.knnquery.ivf"></a>[`ivf`](#field-luxir.knnquery.ivf) | 6 | [`KnnQuery.Ivf`](#message-luxir.knnquery.ivf) | singular | ignored for exact search and segments without an IVF index |
-| <a id="field-luxir.knnquery.unit"></a>[`unit`](#field-luxir.knnquery.unit) | 7 | `string` | singular | docs (default): k counts documents. groups: k counts nearest groups under the enclosing top\_docs collapse key and missing policy; requires collapse. The match set contains one best scored witness per selected group. |
+| <a id="field-luxir.knnquery.unit"></a>[`unit`](#field-luxir.knnquery.unit) | 7 | `string` | singular | docs (default): k counts documents. groups: k counts nearest groups under the enclosing top\_docs collapse key and missing policy; requires collapse. Inside has\_child, the default (also spelled parents) groups by the live parent incarnation. Explicit docs selects child records instead. The match set contains one best scored witness per selected group. |
 | <a id="field-luxir.knnquery.similarity"></a>[`similarity`](#field-luxir.knnquery.similarity) | 8 | `float` | optional | Minimum vector similarity for a hit, in the metric's own space (not the transformed score): for l2 the maximum L2 distance (not squared), for ip the minimum dot product, for cosine the minimum cosine similarity. Hits beyond it are dropped from the k nearest, so fewer than k may match. Compared before any enclosing boost. Must be finite; l2 requires &gt;= 0. |
 
 <a id="message-luxir.knnquery.ivf"></a>
@@ -1755,6 +1818,7 @@ An unset kind selects all documents, same as \`all\`.
 | <a id="field-luxir.query.any_of"></a>[`any_of`](#field-luxir.query.any_of) | 19 | [`AnyOfQuery`](#message-luxir.anyofquery) | oneof [`kind`](#oneof-luxir.query.kind) | constant-score exact value-set membership |
 | <a id="field-luxir.query.multi_match"></a>[`multi_match`](#field-luxir.query.multi_match) | 20 | [`MultiMatchQuery`](#message-luxir.multimatchquery) | oneof [`kind`](#oneof-luxir.query.kind) | one text over several weighted fields |
 | <a id="field-luxir.query.dis_max"></a>[`dis_max`](#field-luxir.query.dis_max) | 25 | [`DisMaxQuery`](#message-luxir.dismaxquery) | oneof [`kind`](#oneof-luxir.query.kind) | best query score plus tie times the other scores |
+| <a id="field-luxir.query.has_child"></a>[`has_child`](#field-luxir.query.has_child) | 27 | [`HasChildQuery`](#message-luxir.haschildquery) | oneof [`kind`](#oneof-luxir.query.kind) | Search children and return their live parents; 26 is used by plugin queries. |
 
 <a id="message-luxir.querybucket"></a>
 
@@ -1873,6 +1937,16 @@ Matches an anchored whole indexed term using \`\|\`, concatenation, groups, repe
 | <a id="field-luxir.regexquery.field"></a>[`field`](#field-luxir.regexquery.field) | 1 | `string` | singular |  |
 | <a id="field-luxir.regexquery.pattern"></a>[`pattern`](#field-luxir.regexquery.pattern) | 2 | `string` | singular |  |
 | <a id="field-luxir.regexquery.case_insensitive"></a>[`case_insensitive`](#field-luxir.regexquery.case_insensitive) | 3 | `bool` | singular | Literal characters, after field folding, and every member of character classes and ranges also match their simple Unicode case alternates. Negated classes exclude all case forms of their members. |
+
+<a id="message-luxir.relationdef"></a>
+
+### luxir.RelationDef
+
+[Source](../../protos/luxir_types.proto)
+
+| Field | Number | Type | Cardinality / group | Description |
+|---|---|---|---|---|
+| <a id="field-luxir.relationdef.fields"></a>[`fields`](#field-luxir.relationdef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map |  |
 
 <a id="message-luxir.replicarequirement"></a>
 
@@ -2010,6 +2084,7 @@ Reciprocal Rank Fusion: fused\_score(d) = sum over sources s of weight\_s / (k +
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.schemadef.relations"></a>[`relations`](#field-luxir.schemadef.relations) | 5 | map&lt;`string`, [`RelationDef`](#message-luxir.relationdef)&gt; | map |  |
 | <a id="field-luxir.schemadef.fields"></a>[`fields`](#field-luxir.schemadef.fields) | 1 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Concrete fields, keyed by field name. Exact-name lookup consults only this map. The reserved "id" and "\_version\_" fields are always materialized: a REPLACE\_ALL that omits them gets the defaults; redefining them incompatibly, or defining a second ID-class field, is an error. \_version\_ is fixed and retrieval-only: it returns the update version of the request that indexed each document, including allow\_dups and documents without an ID. |
 | <a id="field-luxir.schemadef.templates"></a>[`templates`](#field-luxir.schemadef.templates) | 2 | map&lt;`string`, [`FieldDef`](#message-luxir.fielddef)&gt; | map | Abstract definitions, keyed by template name. Never directly usable as a doc field; suffix matching ("title\_w" -&gt; "\_w") consults only this map, and any field/template may name one as parent. A name in both maps is an error. |
 | <a id="field-luxir.schemadef.stored_resources"></a>[`stored_resources`](#field-luxir.schemadef.stored_resources) | 4 | map&lt;`string`, [`StoredResourceDef`](#message-luxir.storedresourcedef)&gt; | map | Stored-field groups, keyed by the name fields use as stored\_resource. A name is '\_', ASCII letters, digits, or underscores, and a closing '\_' (for example "\_stored\_body\_"), so it never matches a field or suffix template. A field may name only an entry here or the default "\_stored\_", which uses the defaults without one. mode=set replaces the named entries and keeps the others. |
@@ -2395,7 +2470,7 @@ Request traffic on one transport. Replication routes are not counted.
 
 ### luxir.UpdateRequest
 
-Index or delete documents, with an optional commit.
+Index or delete documents and families, with an optional commit.
 
 [Source](../../protos/luxir_types.proto)
 
@@ -2404,6 +2479,8 @@ Index or delete documents, with an optional commit.
 | <a id="field-luxir.updaterequest.request_id"></a>[`request_id`](#field-luxir.updaterequest.request_id) | 1 | `string` | singular | Optional opaque identifier, echoed in the response for correlation. |
 | <a id="field-luxir.updaterequest.collection"></a>[`collection`](#field-luxir.updaterequest.collection) | 3 | `string` | singular | empty selects the default collection, "main" |
 | <a id="field-luxir.updaterequest.docs"></a>[`docs`](#field-luxir.updaterequest.docs) | 4 | [`Map`](#message-luxir.map) | repeated | Documents to index. Input fields named \_version\_ after field mapping are rejected with a document error: the field is assigned by the engine and optimistic concurrency is not supported. |
+| <a id="field-luxir.updaterequest.families"></a>[`families`](#field-luxir.updaterequest.families) | 13 | [`FamilyUpdate`](#message-luxir.familyupdate) | repeated |  |
+| <a id="field-luxir.updaterequest.child_updates"></a>[`child_updates`](#field-luxir.updaterequest.child_updates) | 14 | [`ChildUpdate`](#message-luxir.childupdate) | repeated |  |
 | <a id="field-luxir.updaterequest.delete_ids"></a>[`delete_ids`](#field-luxir.updaterequest.delete_ids) | 6 | `string` | repeated | Document IDs to delete. Deletes never fail per-id; deleting a nonexistent id is a no-op. |
 | <a id="field-luxir.updaterequest.allow_dups"></a>[`allow_dups`](#field-luxir.updaterequest.allow_dups) | 7 | `bool` | singular | Skip overwrite/dedupe for faster indexing when incoming IDs are known to be unique and do not already exist in the collection. Default (false) overwrites any existing document with the same ID. |
 | <a id="field-luxir.updaterequest.all_or_none"></a>[`all_or_none`](#field-luxir.updaterequest.all_or_none) | 8 | `bool` | singular | If true, all documents in this request must be successfully indexed or none will be. Processing stops at the first failing document: documents already indexed by this request are rolled back, queued delete\_ids from this request are rolled back, and later documents are not attempted (and not listed in errors). Atomicity is per-request; it does not span multiple requests in a stream. |
@@ -2422,6 +2499,7 @@ The response to an update request. In streaming mode the server sends exactly on
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
+| <a id="field-luxir.updateresponse.families"></a>[`families`](#field-luxir.updateresponse.families) | 11 | map&lt;`string`, `string`&gt; | map | New incarnation tokens for successfully replaced families, keyed by parent id. |
 | <a id="field-luxir.updateresponse.request_id"></a>[`request_id`](#field-luxir.updateresponse.request_id) | 1 | `string` | singular | This is the request\_id from the UpdateRequest, if it was set. |
 | <a id="field-luxir.updateresponse.update_version"></a>[`update_version`](#field-luxir.updateresponse.update_version) | 2 | `uint64` | singular | The update version assigned to the update request. |
 | <a id="field-luxir.updateresponse.status"></a>[`status`](#field-luxir.updateresponse.status) | 3 | [`UpdateResponse.Status`](#enum-luxir.updateresponse.status) | singular |  |

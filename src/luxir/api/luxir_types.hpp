@@ -228,6 +228,7 @@ struct CollectionCommit {
 };
 
 struct UpdateResponse {
+  map_view<std::string_view, std::string_view> families;
   using Status = luxir::api::UpdateResponse_::Status;
   using DocError = luxir::api::UpdateResponse_::DocError;
   std::string_view commit;
@@ -821,10 +822,14 @@ struct StoredResourceDef {
   std::optional<std::int32_t> zstd_dictionary_bytes;
   std::optional<bool> zstd_dictionary;                          // align 1
 };
+struct RelationDef {
+  map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
+};
 struct SchemaDef {                                                // needs StoredResourceDef
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<FieldDef>> templates;
   map_view<std::string_view, StoredResourceDef> stored_resources;
+  map_view<std::string_view, RelationDef> relations;
 };
 struct ColVal { std::span<const Val> v; };                        // span<incomplete Val> OK
 struct ColVector { std::span<const Vector> v; };
@@ -979,7 +984,8 @@ struct GroupTable {
   std::span<const ArrVal> ranks;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
 };
-struct DocList {                                                // needs Column (map by value)
+struct DocList {
+  std::span<const Map> matches;                                                // needs Column (map by value)
   std::optional<std::int64_t> found;
   std::optional<std::int64_t> found_docs;
   std::optional<std::int64_t> found_groups;
@@ -1148,17 +1154,44 @@ struct ExprQuery {                                             // map value indi
   std::string_view q;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
+struct InnerHits {
+  std::string_view name;
+  std::optional<int32_t> limit;
+  std::span<const std::string_view> fields;
+};
+struct HasChildQuery {
+  std::string_view relation;
+  ::hpp_proto::optional_indirect_view<Query> query;
+  std::span<const Query> filter;
+  std::string_view score_mode;
+  std::optional<InnerHits> inner_hits;
+  std::optional<int32_t> min_children;
+  std::optional<int32_t> max_children;
+};
 struct Query {                                                 // needs Match,AnyOfQuery,BooleanQuery,Exists,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,Expr,GeoBox,GeoDistance,Boost,Rescore
   std::variant<std::monostate, Match, BooleanQuery, bool, ExistsQuery, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
                GeoBoxQuery, GeoDistanceQuery, BoostQuery, RescoreQuery, WildcardQuery, RegexQuery,
-               AnyOfQuery, MultiMatchQuery, DisMaxQuery>
+               AnyOfQuery, MultiMatchQuery, DisMaxQuery, HasChildQuery>
       kind;
+};
+struct FamilyUpdate {
+  std::optional<Map> parent;
+  map_view<std::string_view, ArrVal> children;
+};
+struct ChildUpdate {
+  std::string_view parent_id;
+  std::string_view family;
+  std::string_view relation;
+  std::span<const Map> docs;
+  std::span<const std::string_view> delete_ids;
 };
 struct UpdateRequest {                                         // needs CommitParams
   std::string_view request_id;
   std::string_view collection;
   std::span<const Map> docs;
+  std::span<const FamilyUpdate> families;
+  std::span<const ChildUpdate> child_updates;
   std::span<const std::string_view> delete_ids;
   std::optional<CommitParams> commit;
   // Input doc key -> schema field for this request's docs ("" target = drop the key).
@@ -1174,6 +1207,7 @@ struct UpdateRequest {                                         // needs CommitPa
 LUXIR_TD(SearchRequest) LUXIR_TD(SearchOp) LUXIR_TD(ExprOp) LUXIR_TD(TopDocs)
 LUXIR_TD(Diversify) LUXIR_TD(Collapse) LUXIR_TD(GroupComponent) LUXIR_TD(GroupKey) LUXIR_TD(GroupTable)
 LUXIR_TD(Fusion) LUXIR_TD(RrfFusion) LUXIR_TD(LinearFusion) LUXIR_TD(SortSpec) LUXIR_TD(Query)
+LUXIR_TD(RelationDef) LUXIR_TD(HasChildQuery) LUXIR_TD(InnerHits) LUXIR_TD(FamilyUpdate) LUXIR_TD(ChildUpdate)
 LUXIR_TD(ExistsQuery)
 LUXIR_TD(ConstantScoreQuery) LUXIR_TD(BoostQuery) LUXIR_TD(RescoreQuery) LUXIR_TD(KnnQuery) LUXIR_TD(Match) LUXIR_TD(AnyOfQuery) LUXIR_TD(Filter) LUXIR_TD(BooleanQuery)
 LUXIR_TD(PrefixQuery) LUXIR_TD(WildcardQuery) LUXIR_TD(RegexQuery) LUXIR_TD(FuzzyQuery) LUXIR_TD(PhraseQuery) LUXIR_TD(SimpleQuery) LUXIR_TD(RangeQuery)

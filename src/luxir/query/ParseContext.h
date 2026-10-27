@@ -30,6 +30,7 @@ struct ParseContext {
   // The searched reader, when there is one: wildcard field lists reuse its
   // schema-specific search catalog.
   IndexReader* reader = nullptr;
+  bool childScope = false;
   MemPool& pool;
   Schema& schema;
   google::protobuf::Arena& arena;

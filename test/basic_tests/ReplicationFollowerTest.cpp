@@ -1569,6 +1569,7 @@ TEST_F(ReplicationFollowerTest, excludedHistorySurvivesUntilReinclusion) {
   ASSERT_TRUE(until([&] {
     try { follower->getCollection(beta); return false; }
     catch (const CollectionNotFoundError&) { return true; }
+    catch (const CollectionUnavailableError&) { return false; } // deletion is still in flight
   })); // same-boot catalog absence becomes authoritative again
 }
 
@@ -1932,3 +1933,46 @@ TEST_F(ReplicationFollowerTest, replicaReopenSharesUnchangedSegments) {
 }
 
 }
+
+namespace luxir::test {
+TEST_F(ReplicationFollowerTest, parentChildRelationsAndIncarnationsReplicate) {
+  startSource();
+  CollectionHelper helper(*source);
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef schema;
+  ASSERT_TRUE(api::read_json(schema, R"({"relations":{"variants":{"fields":{"color":{"type":"string","column":true}}}}})", arena));
+  helper.collection().setSchema(Schema::fromProto(schema, Schema::createDefaultSchema().get()));
+  auto update = [&](std::string_view json) {
+    std::pmr::monotonic_buffer_resource mr;
+    api::UpdateRequest req;
+    if (!api::read_json(req, json, mr)) throw std::runtime_error("invalid relation update");
+    return helper.submit(req);
+  };
+  auto family = update(R"({"families":[{"parent":{"id":"p","title_s":"product"},"children":{"variants":[{"id":"v","color":"red"}]}}],"commit":{}})");
+  ASSERT_TRUE(family.success);
+  startFollower();
+  ASSERT_TRUE(caughtUp());
+  auto search = [&] {
+    auto req = localReq(follower->getSearchEngine());
+    if (!api::read_json(req->rawRequest(), R"({"collection":"main","document_format":"rows","query":{"has_child":{"relation":"variants","inner_hits":{"name":"v"}}}})", req->mr))
+      throw std::runtime_error("invalid relation search");
+    req->execute(1);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req;
+  };
+  auto first = search();
+  ASSERT_EQ(1u, first->docList()->docs.size());
+  EXPECT_EQ("product", first->docList()->docs[0].fields.at("title_s")->asString());
+  EXPECT_EQ("red", first->docList()->matches[0].fields.at("v")->docList()->docs[0].fields.at("color")->asString());
+  ASSERT_TRUE(update(R"({"child_updates":[{"parent_id":"p","relation":"variants","family":")" + family.families.at("p")
+      + R"(","docs":[{"id":"v","color":"blue"}]}],"commit":{}})").success);
+  ASSERT_TRUE(caughtUp());
+  auto changed = search();
+  ASSERT_EQ(1u, changed->docList()->matches.size());
+  EXPECT_EQ("blue", changed->docList()->matches[0].fields.at("v")->docList()->docs[0].fields.at("color")->asString());
+  ASSERT_TRUE(helper.deleteByIds({"p"}, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(caughtUp());
+  EXPECT_TRUE(search()->docList()->docs.empty());
+}
+
+} // namespace luxir::test

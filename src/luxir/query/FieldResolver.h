@@ -24,20 +24,21 @@ class FieldResolver {
   using Handles = boost::unordered_node_map<std::string, ResolvedFieldHandle,
                                             PackedTermHash, PackedTermEqual>;
   Schema& schema;
+  std::string prefix;
   std::vector<std::string>* explanations;
   std::array<Handles, (size_t)OpClass::PRIMARY + 1> fields;  // one memo per OpClass
   boost::unordered_flat_map<FieldType*, std::unique_ptr<TokenChain>> chains;
 
 public:
-  explicit FieldResolver(Schema& schema, std::vector<std::string>* explanations = nullptr)
-      : schema(schema), explanations(explanations) {}
+  explicit FieldResolver(Schema& schema, std::vector<std::string>* explanations = nullptr, std::string prefix = {})
+      : schema(schema), prefix(std::move(prefix)), explanations(explanations) {}
 
   const ResolvedFieldHandle& resolve(std::string_view name, OpClass op,
                                      std::string_view context = {}) {
     auto& memo = fields[(size_t)op];
     auto found = memo.find(name);
     if (found == memo.end()) {
-      auto target = schema.resolveFor(name, op);
+      auto target = schema.resolveFor(prefix.empty() ? std::string(name) : name == "id" ? std::string("luxir_child_s") : prefix + std::string(name), op);
       found = memo.emplace(std::string(name), std::move(target)).first;
     }
     const auto& target = found->second;

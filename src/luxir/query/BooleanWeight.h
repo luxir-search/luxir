@@ -11606,6 +11606,24 @@ class BooleanQuery::Weight final : public Query::Weight {
     bool uniformConstantCandidate = false;
 
   public:
+    void visitChildMatches(int32_t segment, int32_t doc, const ChildMatchVisitor& visitor) const override {
+      // Optional branches may have evidence below a conjunction which did
+      // not match this parent. Verify the already-prepared parent predicate;
+      // never rerun child retrieval or enlarge a vector window.
+      std::optional<bool> matched;
+      auto guarded = [&](const api::InnerHits& spec, std::string_view relation,
+                         std::span<const ChildMatch> hits, int64_t count) {
+        if (!matched) {
+          auto guard = MemPool::threadLocalPoolGuard();
+          auto* scorer = const_cast<BooleanPreparedWeight*>(this)->createScorer(guard.pool(), reader.segments()[segment]);
+          matched = scorer && scorer->advance(doc) == doc;
+        }
+        if (*matched) visitor(spec, relation, hits, count);
+      };
+      for (const auto& source : mandatorySources) source.segmentSource().visitChildMatches(segment, doc, guarded);
+      for (const auto& source : optionalSources) source.segmentSource().visitChildMatches(segment, doc, guarded);
+    }
+
     BooleanPreparedWeight(std::span<Query::Weight*> filterWeights,
                           IndexReader& reader,
                           std::vector<QueryPrep::PreparedSource>&& mandatorySources,

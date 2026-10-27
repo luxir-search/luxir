@@ -749,3 +749,11 @@ in their own guides:
   positive `min_match`.
 - Fuzzy expansion truncation (the `64` clause budget and any lower operator
   limit) is not reported in the response.
+
+## Parent and child queries
+
+`has_child` evaluates a query and optional filters in a declared relation,
+reduces matching child scores to parent scores, and returns parent records.
+Its optional named `inner_hits` preserve matching children, including vector
+witnesses. See [Parent and child search](relations.md) for schema, updates,
+score modes, count constraints, and vector/fusion semantics.

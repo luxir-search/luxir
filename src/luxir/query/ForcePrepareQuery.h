@@ -62,6 +62,10 @@ public:
       QueryPrep::PreparedSource child;
 
     public:
+      void visitChildMatches(int32_t segment, int32_t doc, const ChildMatchVisitor& visitor) const override {
+        child.segmentSource().visitChildMatches(segment, doc, visitor);
+      }
+
       explicit Prepared(QueryPrep::PreparedSource&& child) : child(std::move(child)) {}
 
       Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {

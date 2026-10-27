@@ -476,14 +476,28 @@ public:
 
     class Prepared final : public Query::Weight::PreparedWeight {
       QueryPrep::PreparedSource child;
+      IndexReader& reader;
       float minScore;
       float multiplier;
       bool scored;
 
     public:
-      Prepared(QueryPrep::PreparedSource&& child, float minScore,
+      void visitChildMatches(int32_t segment, int32_t doc, const ChildMatchVisitor& visitor) const override {
+        std::optional<bool> matched;
+        child.segmentSource().visitChildMatches(segment, doc,
+          [&](const api::InnerHits& spec, std::string_view relation, std::span<const ChildMatch> hits, int64_t count) {
+            if (!matched) {
+              auto guard = MemPool::threadLocalPoolGuard();
+              auto* scorer = QueryPrep::createScorer(guard.pool(), reader.segments()[segment], child.segmentSource());
+              matched = scorer && scorer->advance(doc) == doc && scorer->score() >= minScore;
+            }
+            if (*matched) visitor(spec, relation, hits, count);
+          });
+      }
+
+      Prepared(IndexReader& reader, QueryPrep::PreparedSource&& child, float minScore,
                float multiplier, bool scored)
-        : child(std::move(child)), minScore(minScore), multiplier(multiplier),
+        : child(std::move(child)), reader(reader), minScore(minScore), multiplier(multiplier),
           scored(scored) {}
 
       Query::Scorer* createScorer(
@@ -534,7 +548,7 @@ public:
       if (childWeight->needsPrepare()) {
         source.setPrepared(childWeight->prepare(ctx));
       }
-      return std::make_unique<Prepared>(std::move(source), minScore,
+      return std::make_unique<Prepared>(ctx.reader, std::move(source), minScore,
                                         multiplier, scored);
     }
 

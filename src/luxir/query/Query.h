@@ -67,6 +67,7 @@ enum class QueryKind : uint8_t {
   MIN_SCORE,
   COMBINED_FIELDS,
   DIS_MAX,
+  HAS_CHILD,
   TEST,
 };
 
@@ -1044,8 +1045,13 @@ public:
   };
 
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
+  struct ChildMatch { int32_t segment; int32_t doc; float score; };
+  using ChildMatchVisitor = std::function<void(const api::InnerHits&, std::string_view,
+      std::span<const ChildMatch>, int64_t)>;
   class SegmentSource {
   public:
+    virtual void visitChildMatches(int32_t segment, int32_t doc, const ChildMatchVisitor& visitor) const {}
+
     /// Drop refillable transient state only; preserve semantics and prepared
     /// results. Idempotent. No plan or scorer from this source for the segment
     /// may still be in use, including plans abandoned during route selection.

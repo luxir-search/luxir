@@ -10,6 +10,7 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <new>
+#include <charconv>
 #include <optional>
 #include <variant>
 
@@ -84,6 +85,16 @@ static std::string_view docId(const luxir::api::Map& doc, const FieldNameMap& fi
 }
 
 
+// Hide the physical child-key encoding from document acknowledgements/errors.
+static std::string_view responseDocId(const api::Map& doc, const FieldNameMap& fieldMap) {
+  auto id = docId(doc, fieldMap);
+  if (id.starts_with("\1luxir:")) {
+    auto* child = doc.fields.find("luxir_child_s");
+    if (child) return (*child)->asString();
+  }
+  return id;
+}
+
 static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::UndoMark& requestMark) {
   auto& request = *msg.req;
   const bool allOrNone = request.all_or_none;
@@ -154,12 +165,12 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
       failed++;
       ErrorInfo info = currentExceptionInfo(ErrorKind::INTERNAL);
       if (info.kind == ErrorKind::INTERNAL) {
-        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, docId(doc, fieldMap),
+        LOG_ERROR("document {} (id '{}') failed to index: {}", docIndex, responseDocId(doc, fieldMap),
                   info.message);
       }
       auto* response = msg.getResponse();
       auto& err = msg.addError();
-      err.id = luxir::api::build::arenaStr(msg.responseArena(), docId(doc, fieldMap));
+      err.id = luxir::api::build::arenaStr(msg.responseArena(), responseDocId(doc, fieldMap));
       err.index = docIndex;
       err.error = luxir::api::build::arenaError(msg.responseArena(), info);
 
@@ -184,7 +195,7 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     }
 
     if (returnIds) {
-      msg.addId(docId(doc, fieldMap));
+      msg.addId(responseDocId(doc, fieldMap));
     }
   }
 
@@ -197,7 +208,122 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 }
 
 
+// A request with family mutations is one transaction in one inverter. All
+// validation and expansion happens before deletes or postings are touched.
+static std::string childKey(std::string_view family, std::string_view relation, std::string_view id) {
+  return "\1luxir:" + std::to_string(family.size()) + ":" + std::string(family)
+      + std::to_string(relation.size()) + ":" + std::string(relation) + std::string(id);
+}
+
+static api::UpdateRequest expandRelations(ProtoUpdateMessage& msg, std::pmr::memory_resource& mr,
+    std::vector<api::Map>& docs, std::vector<std::string_view>& deletes) {
+  auto request = *msg.req;
+  FieldNameMap fieldMap(request);
+  auto validateDoc = [&](const api::Map& doc) {
+    for (const auto& [name, value] : doc.fields) {
+      auto mapped = fieldMap.resolve(name);
+      if (mapped && mapped->starts_with("luxir_")) throw RequestError("luxir_ fields are reserved for relations");
+    }
+    auto id = docId(doc, fieldMap);
+    if (id.starts_with("\1luxir:")) throw RequestError("reserved internal document id");
+  };
+  for (const auto& doc : request.docs) validateDoc(doc);
+  for (const auto& id : request.delete_ids) if (id.starts_with("\1luxir:")) throw RequestError("reserved internal document id");
+  if (request.families.empty() && request.child_updates.empty()) return request;
+  if (msg.schema->relations.empty()) throw RequestError("family updates require schema.relations");
+  if (request.allow_dups || !request.field_map.empty() || request.drop_unmapped)
+    throw RequestError("family updates require unique ids and do not support field_map");
+  request.all_or_none = true;
+  docs.assign(request.docs.begin(), request.docs.end());
+  deletes.assign(request.delete_ids.begin(), request.delete_ids.end());
+  auto add = [&](api::Map& doc, size_t capacity, std::string_view name, const api::Val& value) {
+    *api::build::mapSlot(doc.fields, capacity, api::build::arenaStr(mr, name), mr) = value;
+  };
+  auto string = [&](std::string_view value) { api::Val v; v.kind = api::build::arenaStr(mr, value); return v; };
+  auto indexChild = [&](const api::Map& child, std::string_view parent, std::string_view token, std::string_view relation) {
+    validateDoc(child);
+    auto id = docId(child, fieldMap);
+    if (id.empty()) throw RequestError("each child requires a non-empty string id");
+    api::Map physical;
+    size_t capacity = child.fields.size() + 6;
+    for (auto [field, val] : child.fields) {
+      if (field == "id") continue;
+      if (field == "_version_") throw RequestError("_version_ is assigned by the engine");
+      add(physical, capacity, "luxir_rel_" + std::to_string(relation.size()) + "_" + std::string(relation) + "_" + std::string(field), *val);
+    }
+    add(physical, capacity, "id", string(childKey(token, relation, id)));
+    add(physical, capacity, "luxir_relation_s", string(relation));
+    add(physical, capacity, "luxir_family_s", string(token));
+    add(physical, capacity, "luxir_parent_s", string(parent));
+    add(physical, capacity, "luxir_child_s", string(id));
+    std::string json;
+    if (!api::write_json(child, json)) throw RequestError("cannot serialize child source");
+    add(physical, capacity, "luxir_source_s", string(json));
+    docs.push_back(physical);
+  };
+  using Pair = std::pair<std::string_view, std::string_view>;
+  std::vector<Pair> tokens;
+  std::set<std::string> parentIds;
+  for (const auto& family : request.families) {
+    if (!family.parent) throw RequestError("family requires parent");
+    validateDoc(*family.parent);
+    auto id = docId(*family.parent, fieldMap);
+    if (id.empty() || !parentIds.insert(std::string(id)).second) throw RequestError("families require distinct non-empty parent ids");
+    std::string token = std::to_string(msg.updateVersion) + ":" + std::string(id);
+    api::Map parent;
+    for (const auto& [name, value] : family.parent->fields) add(parent, family.parent->fields.size() + 1, name, *value);
+    add(parent, family.parent->fields.size() + 1, "luxir_family_s", string(token));
+    docs.push_back(parent);
+    tokens.emplace_back(api::build::arenaStr(msg.responseArena(), id), api::build::arenaStr(msg.responseArena(), token));
+    for (const auto& [relation, children] : family.children) {
+      if (!msg.schema->relations.contains(relation)) throw RequestError("unknown relation: " + std::string(relation));
+      std::set<std::string> childIds;
+      for (const auto& value : children.v) {
+        auto* child = std::get_if<api::Map>(&value.kind);
+        if (!child) throw RequestError("family children must be objects");
+        if (!childIds.insert(std::string(docId(*child, fieldMap))).second) throw RequestError("duplicate child id in family relation");
+        indexChild(*child, id, token, relation);
+      }
+    }
+  }
+  for (const auto& update : request.child_updates) {
+    if (!msg.schema->relations.contains(update.relation)) throw RequestError("unknown child update relation");
+    auto colon = update.family.find(':');
+    if (update.parent_id.empty() || colon == std::string_view::npos || colon == 0
+        || update.family.substr(colon + 1) != update.parent_id
+        || update.family.substr(0, colon).find_first_not_of("0123456789") != std::string_view::npos)
+      throw RequestError("child_updates requires the family's incarnation token and matching parent_id");
+    uint64_t version = 0;
+    auto parsed = std::from_chars(update.family.data(), update.family.data() + colon, version);
+    if (parsed.ec != std::errc{} || version >= msg.updateVersion)
+      throw RequestError("child update token must come from an earlier family update");
+    if (parentIds.contains(std::string(update.parent_id))) throw RequestError("cannot replace a family and mutate its children together");
+    for (auto id : update.delete_ids) deletes.push_back(api::build::arenaStr(mr, childKey(update.family, update.relation, id)));
+    for (const auto& child : update.docs) indexChild(child, update.parent_id, update.family, update.relation);
+  }
+  if (!tokens.empty()) {
+    auto* out = (Pair*)msg.responseArena().allocate(sizeof(Pair) * tokens.size(), alignof(Pair));
+    std::uninitialized_copy(tokens.begin(), tokens.end(), out);
+    msg.getResponse()->families = api::map_view<std::string_view, std::string_view>(std::span<const Pair>(out, tokens.size()));
+  }
+  request.docs = docs;
+  request.delete_ids = deletes;
+  return request;
+}
+
+
 void ProtoUpdateMessage::handle(IndexWriter& iw) {
+  std::pmr::monotonic_buffer_resource expansionArena;
+  std::vector<api::Map> expandedDocs;
+  std::vector<std::string_view> expandedDeletes;
+  auto expanded = expandRelations(*this, expansionArena, expandedDocs, expandedDeletes);
+  const auto* original = req;
+  req = &expanded;
+  auto restore = scope_guard([&]() {
+    req = original;
+    if (getResponse()->status == ResponseStatus::ERROR) getResponse()->families = {};
+  });
+
   // Counts the batch for the node and its collection as it leaves, however
   // it leaves. A message with no documents and no delete ids (a commit-only
   // message) is not a batch; its commit counts under the COMMIT stage.
