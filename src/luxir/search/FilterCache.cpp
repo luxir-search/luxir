@@ -485,7 +485,7 @@ FilterCache::ReaderProbe FilterCache::Use::probeReaderStable(
   }
   for (size_t i = 0; i < reader.segments().size(); i++) {
     auto& segment = reader.segments()[i];
-    DocSet* canonical = segment.liveDocs() == nullptr
+    DocSet* canonical = !segment.hasDeletes()
         ? nullptr : &segment.liveDocs()->docset();
     DocSet* actual = emptyMeansCanonical ? nullptr : domainPerSeg[i];
     if (actual != canonical) return {};
@@ -753,7 +753,7 @@ DocSet* FilterCache::Use::effectiveDocSet(
   DocSet* raw = requestSlot.raw;
   if (raw == nullptr) return nullptr;
 
-  if (segment.liveDocs() == nullptr) return raw;
+  if (!segment.hasDeletes()) return raw;
   if (requestSlot.liveEffective != nullptr) {
     return requestSlot.liveEffective.get();
   }
@@ -772,7 +772,7 @@ DomainHandle FilterCache::Use::effectiveDomain(
   // AND domain. The canonical live set is the request-stable value itself.
   if (domain != nullptr && segmentOrd < reader.segments().size()) {
     auto& segment = reader.segments()[segmentOrd];
-    DocSet* canonical = segment.liveDocs() == nullptr
+    DocSet* canonical = !segment.hasDeletes()
         ? nullptr : &segment.liveDocs()->docset();
     if (domain == canonical) domain = nullptr;
   }

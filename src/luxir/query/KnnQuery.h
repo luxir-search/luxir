@@ -789,7 +789,7 @@ public:
               }
             }
             IndexReader::Segment& seg = reader.segments()[i];
-            if (vauxPerSeg[i] != nullptr && seg.liveDocs() != nullptr) {
+            if (vauxPerSeg[i] != nullptr && seg.hasDeletes()) {
               // Rank-space liveness bitmap, cached on the aux reader per
               // liveDocs generation; fetched here so a (rare) rebuild runs
               // while the scratch column readers it walks are alive.
@@ -868,7 +868,7 @@ public:
         // is the complete eligibility predicate; null means no deletes and
         // no filters.  The engines rely on it - they never re-check
         // liveDocs.
-        assert(domain != nullptr || seg.liveDocs() == nullptr);
+        assert(domain != nullptr || !seg.hasDeletes());
         VectorAuxReader* vaux = vauxPerSeg[i];
         if (vaux != nullptr) {
           if (vaux->getDims() != dims) {
