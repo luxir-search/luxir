@@ -71,7 +71,8 @@ TEST(BitSetScorerTest, iterationAndWindowFills) {
   BitSetScorer scorer(set.end(), 1.0f);
   EXPECT_EQ(0, scorer.next());
   EXPECT_EQ(3, scorer.next());
-  EXPECT_EQ(65536 + 5, scorer.advance(65535));
+  EXPECT_EQ(65535, scorer.advance(65535));
+  EXPECT_EQ(65536 + 5, scorer.advance(65536));
   EXPECT_EQ(3 * 65536, scorer.advance(65536 + 65536));
   scorer.reset();
 
