@@ -29,6 +29,10 @@ protected:
     price.type = FieldClass::DECIMAL;
     price.scale = 2;
     price.index = api::FieldDef::IndexMode::RANGE;
+    auto& prices = b.field("prices");
+    prices.type = FieldClass::DECIMAL;
+    prices.scale = 2;
+    prices.multi = api::FieldDef::MultiMode::ARRAY;
     b.set(helper.collection());
 
     ASSERT_TRUE(helper.indexAll(std::array{
@@ -194,7 +198,7 @@ TEST_F(ScalarFieldTypesTest, decimalRangeSortFacetsAndStats) {
   EXPECT_EQ(vecs("d", "a", "b", "c", "e"), ids(*req));
   EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "a", "price", 9.99));
   EXPECT_CONTAINS_DOC(req->getDocs(), flatdoc("id", "d", "price", 0.1));
-  EXPECT_NEAR(122.59, req->docList()->ops.at("total")->asDouble(), 1e-9);
+  EXPECT_EQ(122.59, req->docList()->ops.at("total")->asDouble());
   EXPECT_EQ(100.0, req->docList()->ops.at("top")->asDouble());
 
   auto body = json(R"({"limit":0,"ops":{
@@ -208,6 +212,28 @@ TEST_F(ScalarFieldTypesTest, decimalRangeSortFacetsAndStats) {
   EXPECT_TRUE(rejected(flatdoc("id", "x", "price", "1e-3")));
   EXPECT_TRUE(rejected(flatdoc("id", "x", "price", "abc")));
   EXPECT_TRUE(rejected(flatdoc("id", "x", "price", (int64_t)std::numeric_limits<int64_t>::max())));
+}
+
+// Summing 0.1 ten times in doubles gives 0.9999999999999999; decimal
+// aggregates add the scaled integers and divide once.
+TEST_F(ScalarFieldTypesTest, decimalAggregatesAreExact) {
+  std::vector<Doc> docs;
+  for (int i = 0; i < 9; i++) {
+    docs.push_back(flatdoc("id", std::format("t{}", i), "price", "0.10",
+                           "prices", vecs("0.10", "0.20")));
+  }
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  auto req = run(R"JSON({"query":{"match":{"price":0.1}},"limit":0,"ops":{
+    "total":"sum(price)","mean":"avg(price)","low":"min(price)",
+    "tops":"sum(max(prices))","pair":"sum(max(price, price))"}})JSON");
+  ASSERT_OK(req);
+  const auto& ops = req->docList()->ops;
+  EXPECT_EQ(1.0, ops.at("total")->asDouble());
+  EXPECT_EQ(0.1, ops.at("mean")->asDouble());
+  EXPECT_EQ(0.1, ops.at("low")->asDouble());
+  EXPECT_EQ(1.8, ops.at("tops")->asDouble());
+  EXPECT_EQ(1.0, ops.at("pair")->asDouble());
 }
 
 TEST_F(ScalarFieldTypesTest, scaledDecimalParse) {
