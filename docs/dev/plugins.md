@@ -118,11 +118,19 @@ r.query.add("doc_ids", luxir::PluginQueryDef{
 
 - The maker returns an engine `Query` allocated in `ctx.parse.pool` (queries are
   trivially destructible). It may return a built-in query (lower to `any_of`,
-  boolean, ...) or its own `Query` subclass constructed with `QueryKind::PLUGIN`,
-  which every planner shape question answers conservatively. All plugin query
-  classes share that kind, so `equalsSameKind` must `dynamic_cast` the other
-  query. A subclass that depends on documents across segments returns a
-  reader-wide filter key scope (`READER_STABLE`).
+  boolean, ...) or a `PluginQueryBase` subclass (include
+  `luxir/query/PluginQueryBase.h`), constructed with the maker's `ctx`.
+  The base sets `QueryKind::PLUGIN`, which every planner shape question answers
+  conservatively. It borrows the registry's stable name and final-overrides
+  equality, hashing and filter keys to include both that name and the concrete
+  C++ type. Filter keys use an interned, collision-free process-local type token;
+  they are only used by the in-memory cache. Implement `equalsPayload`,
+  `hashPayload` and `appendPayloadFilterKey`; the equality payload hook sees
+  only the same concrete type and registered name. Keep payload members
+  trivially destructible too. A PLUGIN-kind result without this base is rejected
+  at the maker boundary for both structured and expression queries. A subclass
+  that depends on documents across segments returns a reader-wide filter key
+  scope (`READER_STABLE`) from `appendPayloadFilterKey`.
 - `ctx.parse.fields.note(text)` adds a line to `?explain=resolved`, for
   example what the query resolved its parameters to.
 - `ctx.parse` is the request's `ParseContext`: pool, schema, the searched reader
@@ -209,7 +217,10 @@ r.http.add("POST", "/collections/{collection}/_sample",
 ## The example plugin
 
 `test/plugins/example` is a test-only plugin (always configured, linked into
-`luxir_test` only). It registers a `doc_ids` query type, a `sample_docs` search op
+`luxir_test` only). It registers `doc_ids` (lowering to built-ins), `field_value`
+(two concrete PLUGIN query classes), an alias to test registered-name identity,
+and `unscoped_value` to test rejection of a PLUGIN query without the base.
+It also registers a `sample_docs` search op
 (an extra `_rank` column and nested ops over its documents), two HTTP routes and
 lifecycle counters, exercised end to end by `PluginExtensionTest`; `PluginTest`
 covers the framework.

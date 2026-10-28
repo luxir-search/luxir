@@ -6,6 +6,7 @@
 #include <map>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "luxir/api/luxir_types.hpp"
@@ -24,7 +25,7 @@ class PluginQueryContext {
 
 public:
   ParseContext& parse;
-  std::string_view name;
+  const std::string_view name;  // view of the registry's stable key
   ParamReader params;
 
   PluginQueryContext(ParseContext& parse, std::string_view name, ParamReader params,
@@ -69,6 +70,8 @@ class QueryRegistry {
   bool isFrozen = false;
 
 public:
+  using Entry = std::pair<const std::string, PluginQueryDef>;
+
   QueryRegistry();
   static QueryRegistry& global();
 
@@ -77,8 +80,9 @@ public:
   void add(std::string name, PluginQueryDef def);
   void add(std::string name, QueryMaker maker) { add(std::move(name), PluginQueryDef{std::move(maker), {}, {}}); }
   const PluginQueryDef* find(std::string_view name) const;
-  // Throws RequestError naming the registered query types.
-  const PluginQueryDef& require(std::string_view name) const;
+  // Returns the stable name and definition. Throws RequestError naming the
+  // registered query types when absent.
+  const Entry& require(std::string_view name) const;
   std::vector<std::string> names() const;
   bool frozen() const { return isFrozen; }
   void freeze() { isFrozen = true; }

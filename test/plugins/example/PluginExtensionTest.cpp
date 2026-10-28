@@ -6,10 +6,14 @@
 
 #include <gtest/gtest.h>
 
+#include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
+#include "luxir/query/ProtobufQueryParser.h"
+#include "luxir/query/QueryPrep.h"
 #include "luxir/server/HttpServer.h"
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
+#include "test/LocalReq.h"
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
@@ -151,6 +155,94 @@ TEST_F(PluginExtensionTest, queryTypeErrors) {
   expectError(R"({"doc_ids":{"values":["d1"],"values":["d2"]}})", "duplicate plugin parameter");
   expectError(R"({"not_registered":{}})", "unknown_key");
   expectError(R"x("doc_ids(vals=[d1])")x", "unknown argument 'vals' for doc_ids()");
+  expectError(R"({"unscoped_value":{"value":"d1"}})",
+              "query type 'unscoped_value' returned a PLUGIN query that must derive from PluginQueryBase");
+  expectError(R"x("unscoped_value(d1)")x",
+              "query type 'unscoped_value' returned a PLUGIN query that must derive from PluginQueryBase");
+}
+
+TEST(PluginQueryTest, identityAndSharedFilterCache) {
+  LuxirNode node;
+  CollectionHelper helper(node, "plugin_identity");
+  FilterCacheConfig config;
+  config.minSegmentDocs = 0;
+  config.admissionThreshold = 1;
+  auto cache = std::make_shared<FilterCache>(config);
+  helper.getIndexWriter()->snapshots.readers.filterCache = cache;
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "x", "cat_s", "y"), flatdoc("id", "y", "cat_s", "x")},
+                              UpdateMessage::COMMIT).success);
+  auto reader = helper.getIndexWriter()->snapshots.readers.getReader();
+  ASSERT_EQ(1u, reader->segments().size());
+  MemPool pool;
+  google::protobuf::Arena arena;
+  ParseContext parseContext(pool, *reader->schema(), arena, CoerceContext{}, "");
+  ProtobufQueryParser parser(parseContext);
+  auto parse = [&](std::string_view json) {
+    api::Query wire;
+    EXPECT_TRUE(api::read_json(wire, json, pool));
+    return parser.parse(wire);
+  };
+  auto* category = parse(R"({"field_value":{"value":"x"}})");
+  auto* same = parse(R"x("field_value(x)")x");
+  auto* byId = parse(R"({"field_value":{"value":"x","by_id":true}})");
+  auto* alias = parse(R"({"field_value_alias":{"value":"x"}})");
+  auto* different = parse(R"({"field_value":{"value":"y"}})");
+  ASSERT_EQ(QueryKind::PLUGIN, category->getKind());
+  EXPECT_NE(nullptr, dynamic_cast<example::CategoryValueQuery*>(category));
+  EXPECT_NE(nullptr, dynamic_cast<example::IdValueQuery*>(byId));
+  EXPECT_TRUE(category->equals(*same));
+  EXPECT_EQ(category->hash(), same->hash());
+  for (auto* other : {byId, alias, different}) {
+    EXPECT_FALSE(category->equals(*other));
+    EXPECT_FALSE(other->equals(*category));
+    EXPECT_NE(category->hash(), other->hash());
+  }
+  const auto& [name, def] = QueryRegistry::global().require("field_value");
+  EXPECT_EQ(name.data(), static_cast<PluginQueryBase*>(category)->registeredName().data());
+  EXPECT_EQ(name.data(), static_cast<PluginQueryBase*>(same)->registeredName().data());
+
+  const void* categoryEntry = nullptr;
+  // Each Context is a separate request: the second query must hit the shared
+  // cache, and the other class must materialize its own distinct document.
+  Query* queries[] = {category, same, byId, alias};
+  for (int i = 0; i < 4; i++) {
+    MemPool executionPool;
+    Query::Context context(executionPool, *reader);
+    queries[i]->validateLogical(context.planningContext());
+    auto* use = context.getFilterUse(*queries[i]);
+    ASSERT_NE(nullptr, use);
+    ASSERT_NE(nullptr, use->entryIdentityForTest());
+    if (i == 0) categoryEntry = use->entryIdentityForTest();
+    if (i == 1) {
+      EXPECT_EQ(categoryEntry, use->entryIdentityForTest());
+    }
+    if (i >= 2) {
+      EXPECT_NE(categoryEntry, use->entryIdentityForTest());
+    }
+    auto docs = QueryPrep::materializeEffectiveFilter(
+        *queries[i]->createWeight(context, 0), use, *reader, reader->segments()[0], nullptr);
+    ASSERT_NE(nullptr, docs.get());
+    EXPECT_EQ(1, docs.get()->card());
+    EXPECT_TRUE(docs.get()->get(i == 2 ? 0 : 1));
+    EXPECT_FALSE(docs.get()->get(i == 2 ? 1 : 0));
+    EXPECT_EQ((uint64_t)(i == 0 ? 1 : i), cache->counters().builds);
+  }
+  EXPECT_EQ(3u, cache->entryCountForTest());
+  EXPECT_GT(cache->counters().hits, 0u);
+
+  auto req = localReq(helper.getSearchEngine());
+  auto& op = req->collection("plugin_identity").topDocs("q").allQuery().countLimit();
+  api::Query filter;
+  ASSERT_TRUE(api::read_json(filter, R"({"field_value":{"value":"x","by_id":true}})", req->mr));
+  op.filter(filter).fields({"id"});
+  req->execute();
+  ASSERT_OK(req);
+  EXPECT_EQ(1, req->getMatchCount());
+  auto docs = req->getDocs();
+  ASSERT_EQ(1u, docs.size());
+  const auto* id = find(docs[0], "id");
+  ASSERT_NE(nullptr, id);
+  EXPECT_EQ("x", std::get<std::string>(*id));
 }
 
 TEST_F(PluginExtensionTest, explainRoundTripsPluginArms) {

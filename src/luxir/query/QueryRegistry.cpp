@@ -64,8 +64,9 @@ const PluginQueryDef* QueryRegistry::find(std::string_view name) const {
   return it == defs.end() ? nullptr : &it->second;
 }
 
-const PluginQueryDef& QueryRegistry::require(std::string_view name) const {
-  if (const auto* def = find(name)) return *def;
+const QueryRegistry::Entry& QueryRegistry::require(std::string_view name) const {
+  auto it = defs.find(name);
+  if (it != defs.end()) return *it;
   std::string valid;
   for (const auto& [key, def] : defs) {
     if (!valid.empty()) valid += ", ";

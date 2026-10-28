@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "ExampleSearch.h"
+#include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/server/LuxirNode.h"
 
@@ -15,6 +16,9 @@ public:
   luxir::PluginInfo info() const override { return {"example", "1.0", "exercises the plugin framework"}; }
   void registerComponents(luxir::Registries& r) override {
     r.query.add("doc_ids", example::docIdsDef());
+    r.query.add("field_value", example::fieldValueDef());
+    r.query.add("field_value_alias", example::fieldValueDef());
+    r.query.add("unscoped_value", example::unscopedDef());
     r.searchOps.add("sample_docs", example::makeSampleDocs);
     r.http.add("GET", "/_plugins/example/ping", [](luxir::HttpPluginRequest& request, luxir::HttpPluginResponse& response) {
       const std::string* echo = request.queryParam("echo");
