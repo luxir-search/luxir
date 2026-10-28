@@ -204,9 +204,15 @@ void LuxirNode::detachCollection(const CollectionId& id) {
   collections_->detach(id);
 }
 
-std::shared_ptr<Collection> LuxirNode::attachCollection(const CollectionId& id) {
-  if (following() || readOnly()) throw ReadOnlyError("only a writer node attaches collections");
-  return collections_->attach(id);
+std::shared_ptr<Collection> LuxirNode::attachCollection(const CollectionId& id, Collections::Role role) {
+  if (following()) throw ReadOnlyError("a follower node attaches no collections");
+  if (readOnly() && role == Collections::Role::WRITER) throw ReadOnlyError("only a writer node attaches collections for writing");
+  return collections_->attach(id, role);
+}
+
+void LuxirNode::demoteCollection(const CollectionId& id) {
+  if (following()) throw ReadOnlyError("a follower node has no writers to demote");
+  collections_->demote(id);
 }
 
 void LuxirNode::deleteCollection(const CollectionId& id) {

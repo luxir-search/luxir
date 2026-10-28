@@ -4,7 +4,9 @@
 #include "luxir/store/ObjectStore.h"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <functional>
 #include <set>
 #include <stdexcept>
 
@@ -64,6 +66,31 @@ std::optional<uint64_t> RamObjectStore::size(std::string_view name) {
   auto it = objects.find(name);
   if (it == objects.end()) return std::nullopt;
   return (uint64_t)it->second.size();
+}
+
+std::string RamObjectStore::tagOf(std::string_view bytes) {
+  char buf[32];
+  std::snprintf(buf, sizeof buf, "%016zx", std::hash<std::string_view>{}(bytes));
+  return buf;
+}
+
+std::optional<ObjectStore::Head> RamObjectStore::head(std::string_view name) {
+  std::lock_guard lock(mutex);
+  record("size", name, 0, 0);
+  auto it = objects.find(name);
+  if (it == objects.end()) return std::nullopt;
+  return Head{(uint64_t)it->second.size(), tagOf(it->second)};
+}
+
+void RamObjectStore::putIfMatch(std::string_view name, std::string_view bytes, std::string_view etag) {
+  std::lock_guard lock(mutex);
+  record("put", name, 0, bytes.size());
+  auto it = objects.find(name);
+  if (it == objects.end() || tagOf(it->second) != etag) {
+    throw std::runtime_error("precondition failed: object " + std::string(name) + " changed");
+  }
+  it->second.assign(bytes);
+  bytesWritten_.fetch_add(bytes.size(), std::memory_order_relaxed);
 }
 
 void RamObjectStore::readRange(std::string_view name, uint64_t offset, std::span<char> out) {

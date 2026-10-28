@@ -33,6 +33,12 @@ public:
     std::string name;  // the full key, relative to the store
     uint64_t size = 0;
   };
+  /// What a HEAD reports: the size and the version tag the backend gives
+  /// the object's bytes (an S3 ETag); empty when the backend has none.
+  struct Head {
+    uint64_t size = 0;
+    std::string etag;
+  };
 
   virtual ~ObjectStore() = default;
 
@@ -52,6 +58,21 @@ public:
   /// when the object exists: it throws std::runtime_error whose message
   /// contains "already exists".
   virtual void put(std::string_view name, std::string_view bytes, bool ifAbsent = false) = 0;
+  /// The object's size and tag, or nullopt when it does not exist. The
+  /// default has no tag.
+  virtual std::optional<Head> head(std::string_view name) {
+    auto s = size(name);
+    if (!s) return std::nullopt;
+    return Head{*s, {}};
+  }
+  /// Replaces the object only while its tag is still `etag` (compare and
+  /// swap). Throws std::runtime_error whose message contains "precondition
+  /// failed" when the object changed or is gone, and "not supported" on a
+  /// backend without tags (the default).
+  virtual void putIfMatch(std::string_view name, std::string_view bytes, std::string_view etag) {
+    (void)name; (void)bytes; (void)etag;
+    throw std::runtime_error("conditional put not supported by " + describe());
+  }
   /// True when the object existed.
   virtual bool remove(std::string_view name) = 0;
   /// Server-side copy; replaces `to`. Throws when `from` does not exist.
@@ -100,11 +121,15 @@ public:
 
   std::vector<ObjectInfo> list(std::string_view prefix) override;
   std::optional<uint64_t> size(std::string_view name) override;
+  std::optional<Head> head(std::string_view name) override;
   void readRange(std::string_view name, uint64_t offset, std::span<char> out) override;
   void put(std::string_view name, std::string_view bytes, bool ifAbsent = false) override;
+  void putIfMatch(std::string_view name, std::string_view bytes, std::string_view etag) override;
   bool remove(std::string_view name) override;
   void copy(std::string_view from, std::string_view to) override;
   std::string describe() const override { return "ram_object:" + label; }
+  /// The tag of these bytes, as head() reports it.
+  static std::string tagOf(std::string_view bytes);
 
   /// Every call counts as a request.
   uint64_t requests() const { return requests_.load(std::memory_order_relaxed); }

@@ -107,7 +107,12 @@ public:
   // Hand a collection's storage to another node, or take one over: see
   // Collections::detach and attach. Writers only (ReadOnlyError otherwise).
   void detachCollection(const CollectionId& id);
-  std::shared_ptr<Collection> attachCollection(const CollectionId& id);
+  // READ_ONLY attaches are allowed on a read-only node too; a writer attach
+  // needs a writer node.
+  std::shared_ptr<Collection> attachCollection(const CollectionId& id, Collections::Role role = Collections::Role::WRITER);
+  // Commits and closes the collection's writer and keeps serving it
+  // read-only (the first half of a writer handoff).
+  void demoteCollection(const CollectionId& id);
 
   oneapi::tbb::task_arena& getTaskArena() {
     return taskArena;

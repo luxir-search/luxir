@@ -103,6 +103,14 @@ void CommitWaits::admit(std::shared_ptr<Wait> wait, std::stop_token stop) {
   if (!ready.empty()) { finish(ready); return; }
   wait->cancellation.emplace(stop, [this, name = wait->name, id = wait->id] { cancel(name, id); });
   Signal::emit("replicationWaitParked");
+  ParkHook hook;
+  { std::lock_guard lock(hookMutex); hook = parkHook; }
+  if (hook) hook(wait->name);
+}
+
+void CommitWaits::setParkHook(ParkHook hook) {
+  std::lock_guard lock(hookMutex);
+  parkHook = std::move(hook);
 }
 
 void CommitWaits::awaitCommit(CollectionId name, CommitId floor, Clock::time_point deadline,
