@@ -147,7 +147,7 @@ locations, browse `src/luxir/<area>/`.
      `luxir_add_plugin` and selected at build time via `LUXIR_PLUGIN_DIRS`.
    - Extension registries: `QueryRegistry` (`src/luxir/query/`, the `plugin` Query arm),
      `SearchOpRegistry` (`src/luxir/search/`, the `plugin` SearchOp arm) and
-     `HttpRouteRegistry` (`src/luxir/server/`); `PluginParams` reads plugin arm params.
+     `HttpRouteRegistry` (`src/luxir/server/`); `ParamReader` reads plugin arm params.
    - See [plugins.md](plugins.md).
 
 ## Data Organization

@@ -9,18 +9,17 @@
 
 namespace luxir {
 
-// The process-wide registries. Populated once by initPlugins(), then frozen.
-class Registries {
-public:
-  PluginRegistry plugins;
+// References to area-owned registries, populated by initPlugins() then frozen.
+struct Registries {
+  PluginRegistry& plugins;
   // Plugin query types (api::PluginQuery).
-  QueryRegistry query;
+  QueryRegistry& query;
   // Plugin search operations (api::PluginOp).
-  SearchOpRegistry searchOps;
+  SearchOpRegistry& searchOps;
   // Plugin HTTP routes.
-  HttpRouteRegistry http;
+  HttpRouteRegistry& http;
 
-  static Registries& global();
+  static Registries global();
   // Freezes every registry.
   void freeze();
 };

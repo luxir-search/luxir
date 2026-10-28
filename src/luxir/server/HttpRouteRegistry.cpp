@@ -9,6 +9,13 @@
 
 namespace luxir {
 
+HttpRouteRegistry::HttpRouteRegistry() = default;
+
+HttpRouteRegistry& HttpRouteRegistry::global() {
+  static HttpRouteRegistry instance;
+  return instance;
+}
+
 namespace {
 
 std::vector<std::string_view> splitPath(std::string_view path) {

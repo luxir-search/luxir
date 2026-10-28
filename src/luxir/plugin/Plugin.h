@@ -15,7 +15,7 @@ struct PluginInfo {
   std::string description;  // one line
 };
 
-class Registries;
+struct Registries;
 class LuxirNode;
 
 // A compiled-in extension. Plugins are linked into the executable at build time
@@ -39,6 +39,8 @@ class PluginRegistry {
   bool isFrozen = false;
 
 public:
+  PluginRegistry();
+  static PluginRegistry& global();
   // Throws std::invalid_argument on a bad or duplicate name, std::logic_error after freeze.
   void add(std::unique_ptr<Plugin> plugin);
   const std::vector<std::unique_ptr<Plugin>>& plugins() const { return list; }
@@ -51,10 +53,10 @@ public:
 // luxir_lib: adds every configured plugin to `r`.
 void addConfiguredPlugins(PluginRegistry& r);
 
-// Idempotent. Registers builtins, calls addPlugins (executables pass addConfiguredPlugins, so the
+// Idempotent. Calls addPlugins (executables pass addConfiguredPlugins, so the
 // generated object is referenced from the executable and pulled in naturally), then runs
 // each plugin's registerComponents, logs the plugin list, then freezes the global registries.
-// Call before any LuxirNode or Schema exists.
+// Each area seeds its built-ins at registry construction. Call before any LuxirNode or Schema exists.
 void initPlugins(void (*addPlugins)(PluginRegistry&));
 
 // Node lifecycle: call every plugin's nodeStarted / nodeStopping, in

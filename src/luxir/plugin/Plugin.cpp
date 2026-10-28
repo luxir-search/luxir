@@ -32,14 +32,16 @@ const Plugin* PluginRegistry::find(std::string_view name) const {
   return nullptr;
 }
 
-Registries& Registries::global() {
-  static Registries instance;
+PluginRegistry::PluginRegistry() = default;
+
+PluginRegistry& PluginRegistry::global() {
+  static PluginRegistry instance;
   return instance;
 }
 
-const QueryRegistry& globalQueryRegistry() { return Registries::global().query; }
-
-const SearchOpRegistry& globalSearchOpRegistry() { return Registries::global().searchOps; }
+Registries Registries::global() {
+  return {PluginRegistry::global(), QueryRegistry::global(), SearchOpRegistry::global(), HttpRouteRegistry::global()};
+}
 
 void Registries::freeze() {
   plugins.freeze();
@@ -49,18 +51,18 @@ void Registries::freeze() {
 }
 
 void notifyNodeStarted(LuxirNode& node) {
-  for (const auto& p : Registries::global().plugins.plugins()) p->nodeStarted(node);
+  for (const auto& p : PluginRegistry::global().plugins()) p->nodeStarted(node);
 }
 
 void notifyNodeStopping(LuxirNode& node) noexcept {
-  const auto& list = Registries::global().plugins.plugins();
+  const auto& list = PluginRegistry::global().plugins();
   for (auto it = list.rbegin(); it != list.rend(); ++it) (*it)->nodeStopping(node);
 }
 
 void initPlugins(void (*addPlugins)(PluginRegistry&)) {
   static std::once_flag once;
   std::call_once(once, [addPlugins] {
-    Registries& r = Registries::global();
+    Registries r = Registries::global();
     addPlugins(r.plugins);
     std::string names;
     for (const auto& p : r.plugins.plugins()) {
@@ -72,10 +74,10 @@ void initPlugins(void (*addPlugins)(PluginRegistry&)) {
     LOG_INFO("plugins: {}", names.empty() ? "none" : names);
     // The JSON dialect reads registered names as plugin arms (api/PluginArms.h).
     api::pluginArmNames.isQuery = [](std::string_view name) {
-      return Registries::global().query.find(name) != nullptr;
+      return QueryRegistry::global().find(name) != nullptr;
     };
     api::pluginArmNames.isOp = [](std::string_view name) {
-      return Registries::global().searchOps.find(name) != nullptr;
+      return SearchOpRegistry::global().find(name) != nullptr;
     };
     r.freeze();
   });

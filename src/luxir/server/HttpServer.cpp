@@ -46,7 +46,7 @@
 #include <glaze/core/read.hpp>
 #include <glaze/json/prettify.hpp>
 
-#include "luxir/plugin/Registries.h"
+#include "luxir/server/HttpRouteRegistry.h"
 #include "luxir/util/log.h"
 #include "luxir/schema/Schema.h"
 #include "luxir/search/SearchEngine.h"
@@ -1504,7 +1504,7 @@ private:
     }
     if (m.route == Route::NONE) {
       // Built-in routes win; a plugin route answers only paths they do not.
-      if (auto plugin = Registries::global().http.match(target)) {
+      if (auto plugin = HttpRouteRegistry::global().match(target)) {
         m.route = Route::PLUGIN;
         m.allow = plugin->allow;
         for (const auto& [key, value] : plugin->params) {

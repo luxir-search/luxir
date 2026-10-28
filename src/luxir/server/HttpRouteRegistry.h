@@ -66,12 +66,19 @@ struct HttpRoute {
 // _stats) or use _snapshot. Patterns may not overlap: two patterns with the
 // same segment count must differ at some position where both are literals.
 class HttpRouteRegistry {
+  std::vector<HttpRoute> list;
+  std::map<std::string, std::string, std::less<>> allowByPattern;
+  bool isFrozen = false;
+
 public:
   struct Match {
     std::vector<const HttpRoute*> routes;  // every method registered for the path
     std::vector<std::pair<std::string, std::string>> params;
     std::string_view allow;  // the methods, as an Allow header value
   };
+
+  HttpRouteRegistry();
+  static HttpRouteRegistry& global();
 
   // Throws std::invalid_argument on a bad method, pattern, duplicate or
   // overlapping pattern, or a null handler, std::logic_error after freeze.
@@ -81,11 +88,6 @@ public:
   const std::vector<HttpRoute>& routes() const { return list; }
   bool frozen() const { return isFrozen; }
   void freeze() { isFrozen = true; }
-
-private:
-  std::vector<HttpRoute> list;
-  std::map<std::string, std::string, std::less<>> allowByPattern;
-  bool isFrozen = false;
 };
 
 }  // namespace luxir

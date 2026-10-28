@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "luxir/api/luxir_types.hpp"
-#include "luxir/plugin/PluginParams.h"
+#include "luxir/util/ParamReader.h"
 
 namespace luxir {
 
@@ -20,14 +20,16 @@ struct ParseContext;
 // schema, reader, coercion context, warnings, field resolver), the arm's
 // params, and a way back into the query parser for nested queries.
 class PluginQueryContext {
+  std::function<Query*(const api::Query&)> parseApi;
+
 public:
   ParseContext& parse;
   std::string_view name;
-  PluginParams params;
+  ParamReader params;
 
-  PluginQueryContext(ParseContext& parse, std::string_view name, PluginParams params,
+  PluginQueryContext(ParseContext& parse, std::string_view name, ParamReader params,
                      std::function<Query*(const api::Query&)> parseApi)
-    : parse(parse), name(name), params(std::move(params)), parseApi(std::move(parseApi)) {}
+    : parseApi(std::move(parseApi)), parse(parse), name(name), params(std::move(params)) {}
 
   // Lower a nested api::Query through the ordinary parser (same context and
   // nesting budget).
@@ -37,9 +39,6 @@ public:
   Query* parseQuery(const api::Val& value);
   // The param `name` as a nested query; throws when it is absent.
   Query* requireQuery(std::string_view name);
-
-private:
-  std::function<Query*(const api::Query&)> parseApi;
 };
 
 // Lowers one plugin query arm to an engine Query (pool-allocated from
@@ -70,6 +69,9 @@ class QueryRegistry {
   bool isFrozen = false;
 
 public:
+  QueryRegistry();
+  static QueryRegistry& global();
+
   // Throws std::invalid_argument on a bad, built-in or duplicate name or a
   // null maker, std::logic_error after freeze.
   void add(std::string name, PluginQueryDef def);
@@ -81,8 +83,5 @@ public:
   bool frozen() const { return isFrozen; }
   void freeze() { isFrozen = true; }
 };
-
-// Registries::global().query, for parsers that need no other registry.
-const QueryRegistry& globalQueryRegistry();
 
 }  // namespace luxir

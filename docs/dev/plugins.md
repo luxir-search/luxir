@@ -11,9 +11,10 @@ and it registers its components through a generated translation unit.
 - The `luxir` executable links the library `luxir_plugins`, which holds the
   generated `addConfiguredPlugins()` plus every non-test-only plugin library.
   `luxir_test` links `luxir_test_plugins`, which adds the test-only plugins.
-- Registries (`luxir::Registries::global()`) are process-global. They are filled once
-  by `luxir::initPlugins()` and then frozen: later registration throws, and lookups
-  read immutable tables without locking.
+- Each area owns its function-local static registry.
+  `luxir::Registries::global()` binds references to them for registration.
+  `luxir::initPlugins()` fills and freezes them: later registration throws,
+  and lookups read immutable tables without locking.
 - Registering a name that already exists throws `std::invalid_argument` during
   startup, so a misconfigured binary fails loudly instead of overriding silently.
 
@@ -22,7 +23,8 @@ and it registers its components through a generated translation unit.
 `initPlugins(addPlugins)` runs after configuration is applied and before any `LuxirNode` or
 `Schema` exists (`luxir_main` and the test `main` both call it). It is idempotent.
 
-1. Built-in components are registered (none yet in the framework step).
+1. Each area constructs its registry on first access and seeds its built-ins
+   there (these registries have none yet). This does not initialize plugins.
 2. The `addPlugins` callback (executables pass `addConfiguredPlugins`, so the reference
    comes from the executable and the generated object is linked in) adds every
    configured plugin, in link-list order.
@@ -129,8 +131,10 @@ r.query.add("doc_ids", luxir::PluginQueryDef{
 - `ctx.parseQuery(...)` lowers a nested `api::Query`, or a Query-shaped param (an
   object or an expression string), through the ordinary parser with the shared
   nesting budget.
-- `ctx.params` (`PluginParams`) reads typed params and `rejectUnknown()` refuses the
-  rest; every error names the type and the parameter.
+- `ctx.params` (`ParamReader`) reads typed params and `rejectUnknown()` refuses the
+  rest; every error names the type and the parameter. The neutral reader throws
+  `std::invalid_argument`; query and op maker boundaries translate it to
+  `RequestError` with the same message.
 - The expression arguments make the type callable in the expression language,
   `doc_ids([a, b], within=cat_s:x)`. Each argument parses by its kind (`STRING`,
   `NUMBER`, `BOOL`, `STRING_LIST`, `QUERY`); a `QUERY` argument is a sub-expression

@@ -2184,7 +2184,7 @@ public:
   public:
     PluginOpContextImpl(SearchParserImpl& parser, std::string_view name, const luxir::api::PluginOp& proto, int depth)
       : PluginOpContext(parser.req, name, proto,
-                        PluginParams("op '" + std::string(name) + "': " + std::string(proto.name), proto.params)),
+                        ParamReader("op '" + std::string(name) + "': " + std::string(proto.name), proto.params)),
         parser(parser), depth(depth),
         context(parser.req.requestPool, *parser.req.schema, parser.req.arena,
                 parser.coerceContext(*parser.req.timeZone), name, &parser.req.warnings, &parser.fields) {
@@ -2257,9 +2257,14 @@ public:
   };
 
   SearchOp* parsePluginOp(std::string_view name, const luxir::api::PluginOp& pluginOp, int depth) {
-    const auto& maker = globalSearchOpRegistry().require(pluginOp.name);
+    const auto& maker = SearchOpRegistry::global().require(pluginOp.name);
     PluginOpContextImpl context(*this, name, pluginOp, depth);
-    SearchOp* op = maker(context);
+    SearchOp* op;
+    try {
+      op = maker(context);
+    } catch (const std::invalid_argument& e) {
+      throw RequestError(e.what());
+    }
     if (op == nullptr) throw std::logic_error("search op '" + std::string(pluginOp.name) + "' made no operation");
     return op;
   }

@@ -13,6 +13,13 @@
 
 namespace luxir {
 
+QueryRegistry::QueryRegistry() = default;
+
+QueryRegistry& QueryRegistry::global() {
+  static QueryRegistry instance;
+  return instance;
+}
+
 Query* PluginQueryContext::parseQuery(const api::Val& value) {
   // The parser reads api::Query views; a param holds the same JSON as a Val,
   // so round-trip it. The text and the views it yields live in the pool.

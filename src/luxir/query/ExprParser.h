@@ -1035,7 +1035,7 @@ private:
           }
         });
     if (!known) {
-      const auto* plugin = globalQueryRegistry().find(name.text);
+      const auto* plugin = QueryRegistry::global().find(name.text);
       if (plugin == nullptr) fail(name.pos, fmt::format("unknown query function '{}'", name.text));
       if (plugin->exprArgs.empty()) {
         fail(name.pos, fmt::format("{}() is not callable in expr; use the structured form", name.text));

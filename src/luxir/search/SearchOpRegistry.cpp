@@ -11,6 +11,13 @@
 
 namespace luxir {
 
+SearchOpRegistry::SearchOpRegistry() = default;
+
+SearchOpRegistry& SearchOpRegistry::global() {
+  static SearchOpRegistry instance;
+  return instance;
+}
+
 namespace {
 
 // SearchOp arm keys and the other keys a SearchOp object reads.

@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "luxir/api/luxir_types.hpp"
-#include "luxir/plugin/PluginParams.h"
+#include "luxir/util/ParamReader.h"
 #include "luxir/query/Query.h"
 
 namespace luxir {
@@ -27,9 +27,9 @@ public:
   SearchRequest& req;
   std::string_view name;           // the op's key in its ops map
   const api::PluginOp& proto;
-  PluginParams params;
+  ParamReader params;
 
-  PluginOpContext(SearchRequest& req, std::string_view name, const api::PluginOp& proto, PluginParams params)
+  PluginOpContext(SearchRequest& req, std::string_view name, const api::PluginOp& proto, ParamReader params)
     : req(req), name(name), proto(proto), params(std::move(params)) {}
   virtual ~PluginOpContext() = default;
 
@@ -65,6 +65,9 @@ class SearchOpRegistry {
   bool isFrozen = false;
 
 public:
+  SearchOpRegistry();
+  static SearchOpRegistry& global();
+
   // Throws std::invalid_argument on a bad, built-in or duplicate name or a
   // null maker, std::logic_error after freeze.
   void add(std::string name, SearchOpMaker maker);
@@ -75,8 +78,5 @@ public:
   bool frozen() const { return isFrozen; }
   void freeze() { isFrozen = true; }
 };
-
-// Registries::global().searchOps, for parsers that need no other registry.
-const SearchOpRegistry& globalSearchOpRegistry();
 
 }  // namespace luxir

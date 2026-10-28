@@ -12,21 +12,22 @@
 
 namespace luxir {
 
-// Typed reads of a plugin arm's params (PluginQuery.params, PluginOp.params,
-// or a nested object inside them). Every error is a RequestError that names
-// the owner and the parameter: "lookup: 'max_values' must be an integer".
+// Typed reads of component params or a nested object inside them.
+// Errors are std::invalid_argument and name the owner and parameter: "lookup: 'max_values' must be an integer".
 // Reads record which keys were consumed, so rejectUnknown() can refuse the
 // rest with the list of valid names.
-class PluginParams {
+class ParamReader {
+  mutable std::vector<std::string_view> seen;
+
 public:
   using Entries = api::map_view<std::string_view, ::hpp_proto::indirect_view<api::Val>>;
 
   std::string owner;  // prefixes every message, e.g. "lookup" or "op 'hood': graph_expand"
   Entries entries;
 
-  PluginParams(std::string owner, Entries entries) : owner(std::move(owner)), entries(entries) {}
+  ParamReader(std::string owner, Entries entries) : owner(std::move(owner)), entries(entries) {}
   // A nested object param: its own owner path ("graph_expand.hops[0]").
-  PluginParams(std::string owner, const api::Map& map) : owner(std::move(owner)), entries(map.fields) {}
+  ParamReader(std::string owner, const api::Map& map) : owner(std::move(owner)), entries(map.fields) {}
 
   // The raw value, or null when absent (or JSON null).
   const api::Val* get(std::string_view name) const;
@@ -55,7 +56,6 @@ public:
   [[noreturn]] void fail(std::string_view name, std::string_view what) const;
 
 private:
-  mutable std::vector<std::string_view> seen;
   void markSeen(std::string_view name) const;
 };
 

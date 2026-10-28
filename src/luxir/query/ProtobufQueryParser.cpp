@@ -591,10 +591,15 @@ luxir::Query* ProtobufQueryParser::parseDisMax(const luxir::api::DisMaxQuery& qu
 }
 
 luxir::Query* ProtobufQueryParser::parsePlugin(const luxir::api::PluginQuery& query) {
-  const auto& def = globalQueryRegistry().require(query.name);
-  PluginQueryContext ctx(context, query.name, PluginParams(std::string(query.name), query.params),
+  const auto& def = QueryRegistry::global().require(query.name);
+  PluginQueryContext ctx(context, query.name, ParamReader(std::string(query.name), query.params),
                          [this](const luxir::api::Query& nested) { return parse(nested); });
-  luxir::Query* result = def.maker(ctx);
+  luxir::Query* result;
+  try {
+    result = def.maker(ctx);
+  } catch (const std::invalid_argument& e) {
+    throw RequestError(e.what());
+  }
   if (result == nullptr) throw std::logic_error("query type '" + std::string(query.name) + "' made no query");
   return result;
 }

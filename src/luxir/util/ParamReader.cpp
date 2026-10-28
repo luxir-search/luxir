@@ -1,24 +1,23 @@
 // Copyright 2020-2026 Yonik Seeley and Luxir contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#include "luxir/plugin/PluginParams.h"
+#include "luxir/util/ParamReader.h"
 
 #include <algorithm>
 #include <cmath>
-
-#include "luxir/util/ApiError.h"
+#include <stdexcept>
 
 namespace luxir {
 
-void PluginParams::markSeen(std::string_view name) const {
+void ParamReader::markSeen(std::string_view name) const {
   if (std::ranges::find(seen, name) == seen.end()) seen.push_back(name);
 }
 
-void PluginParams::fail(std::string_view name, std::string_view what) const {
-  throw RequestError(owner + ": '" + std::string(name) + "' " + std::string(what));
+void ParamReader::fail(std::string_view name, std::string_view what) const {
+  throw std::invalid_argument(owner + ": '" + std::string(name) + "' " + std::string(what));
 }
 
-const api::Val* PluginParams::get(std::string_view name) const {
+const api::Val* ParamReader::get(std::string_view name) const {
   markSeen(name);
   const auto* found = entries.find(name);
   if (found == nullptr) return nullptr;
@@ -26,21 +25,21 @@ const api::Val* PluginParams::get(std::string_view name) const {
   return val.isNull() ? nullptr : &val;
 }
 
-std::string_view PluginParams::getString(std::string_view name, std::string_view fallback) const {
+std::string_view ParamReader::getString(std::string_view name, std::string_view fallback) const {
   const api::Val* val = get(name);
   if (val == nullptr) return fallback;
   if (const auto* s = std::get_if<std::string_view>(&val->kind)) return *s;
   fail(name, "must be a string");
 }
 
-std::string_view PluginParams::requireString(std::string_view name) const {
+std::string_view ParamReader::requireString(std::string_view name) const {
   if (get(name) == nullptr) fail(name, "is required");
   std::string_view s = getString(name);
   if (s.empty()) fail(name, "must not be empty");
   return s;
 }
 
-std::optional<int64_t> PluginParams::getInt(std::string_view name) const {
+std::optional<int64_t> ParamReader::getInt(std::string_view name) const {
   const api::Val* val = get(name);
   if (val == nullptr) return std::nullopt;
   if (const auto* i = std::get_if<std::int64_t>(&val->kind)) return *i;
@@ -50,17 +49,17 @@ std::optional<int64_t> PluginParams::getInt(std::string_view name) const {
   fail(name, "must be an integer");
 }
 
-int64_t PluginParams::getInt(std::string_view name, int64_t fallback) const {
+int64_t ParamReader::getInt(std::string_view name, int64_t fallback) const {
   return getInt(name).value_or(fallback);
 }
 
-int64_t PluginParams::requireInt(std::string_view name) const {
+int64_t ParamReader::requireInt(std::string_view name) const {
   auto value = getInt(name);
   if (!value) fail(name, "is required");
   return *value;
 }
 
-std::optional<double> PluginParams::getDouble(std::string_view name) const {
+std::optional<double> ParamReader::getDouble(std::string_view name) const {
   const api::Val* val = get(name);
   if (val == nullptr) return std::nullopt;
   if (const auto* d = std::get_if<double>(&val->kind)) return *d;
@@ -69,18 +68,18 @@ std::optional<double> PluginParams::getDouble(std::string_view name) const {
   fail(name, "must be a number");
 }
 
-double PluginParams::getDouble(std::string_view name, double fallback) const {
+double ParamReader::getDouble(std::string_view name, double fallback) const {
   return getDouble(name).value_or(fallback);
 }
 
-bool PluginParams::getBool(std::string_view name, bool fallback) const {
+bool ParamReader::getBool(std::string_view name, bool fallback) const {
   const api::Val* val = get(name);
   if (val == nullptr) return fallback;
   if (const auto* b = std::get_if<bool>(&val->kind)) return *b;
   fail(name, "must be true or false");
 }
 
-std::vector<std::string_view> PluginParams::getStringList(std::string_view name) const {
+std::vector<std::string_view> ParamReader::getStringList(std::string_view name) const {
   const api::Val* val = get(name);
   std::vector<std::string_view> out;
   if (val == nullptr) return out;
@@ -100,14 +99,14 @@ std::vector<std::string_view> PluginParams::getStringList(std::string_view name)
   return out;
 }
 
-const api::Map* PluginParams::getObject(std::string_view name) const {
+const api::Map* ParamReader::getObject(std::string_view name) const {
   const api::Val* val = get(name);
   if (val == nullptr) return nullptr;
   if (const auto* map = std::get_if<api::Map>(&val->kind)) return map;
   fail(name, "must be an object");
 }
 
-std::vector<api::Val> PluginParams::getList(std::string_view name) const {
+std::vector<api::Val> ParamReader::getList(std::string_view name) const {
   const api::Val* val = get(name);
   std::vector<api::Val> out;
   if (val == nullptr) return out;
@@ -130,7 +129,7 @@ std::vector<api::Val> PluginParams::getList(std::string_view name) const {
   return out;
 }
 
-void PluginParams::rejectUnknown() const {
+void ParamReader::rejectUnknown() const {
   for (const auto& [key, val] : entries) {
     if (std::ranges::find(seen, key) != seen.end()) continue;
     std::string valid;
@@ -138,7 +137,7 @@ void PluginParams::rejectUnknown() const {
       if (!valid.empty()) valid += ", ";
       valid += name;
     }
-    throw RequestError(owner + ": unknown parameter '" + std::string(key) + "'"
+    throw std::invalid_argument(owner + ": unknown parameter '" + std::string(key) + "'"
                        + (valid.empty() ? "; it takes no parameters" : "; valid: " + valid));
   }
 }
