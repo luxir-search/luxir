@@ -188,9 +188,17 @@ The op's calculator follows the `SearchOp::Calculator` contract (see
 response: `emitDocsResponse` (`EmitDocs.h`) writes a `DocList` with returned
 fields, and its `extraColumns` add computed per-document values beside them
 (`ExtraColumn{name, value(i, out, mr)}`). Extra columns are always returned; a
-`fields` selection may name them, and one made only of extra columns (such as
-`["_rank"]`) returns just those, while an empty selection projects the default
-field set. A free-form result is a `Map`. Nested op
+`fields` selection may name them. An explicit selector naming an extra selects
+that extra even if a physical field has the same name, and takes the normal
+explicit-selector precedence over matching wildcards. Other selectors are
+resolved normally. A selection made only of extras does not project default
+fields; an empty selection still does. If default or wildcard discovery finds
+a field whose output name matches an extra, the request fails: use an explicit
+field list to omit that physical field or select the extra by name. `_score_`
+and `_version_` are reserved output names and cannot be extras. Duplicate extra
+names are a plugin error (`std::logic_error`); field clashes are `RequestError`s.
+All checks run during resolution, before any column or loader is created.
+A free-form result is a `Map`. Nested op
 results go in the `DocList`'s `ops` (route them in `getTargetForSub`). `format=docs`
 accepts only `top_docs` and `fusion` ops.
 
@@ -232,6 +240,7 @@ r.http.add("POST", "/collections/{collection}/_sample",
 (two concrete PLUGIN query classes), an alias to test registered-name identity,
 and `unscoped_value` to test rejection of a PLUGIN query without the base.
 It also registers a `sample_docs` search op
-(an extra `_rank` column and nested ops over its documents), two HTTP routes and
+(rank columns named by `rank_names`, defaulting to `_rank`, and nested ops over
+its documents), two HTTP routes and
 lifecycle counters, exercised end to end by `PluginExtensionTest`; `PluginTest`
 covers the framework.

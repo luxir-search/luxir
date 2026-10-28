@@ -51,6 +51,15 @@ protected:
   http::response<http::string_body> search(std::string body) {
     return post("/collections/main/_search", std::move(body));
   }
+  LocalReqHandle sampleDocs(std::string_view params, api::DocFormat format) {
+    auto req = localReq(helper.getSearchEngine());
+    req->docFormatDefault = format;
+    std::string json = R"({"ops":{"s":{"sample_docs":)" + std::string(params) + "}}}";
+    auto text = api::build::arenaStr(req->mr, json);
+    EXPECT_TRUE(api::read_json(req->rawRequest(), text, req->mr));
+    req->execute();
+    return req;
+  }
   // found for a filter-only search over `query` (a JSON query value).
   std::string found(const std::string& query) {
     auto res = search(R"({"query":)" + query + R"(,"fields":["id"],"count_limit":-1})");
@@ -281,6 +290,69 @@ TEST_F(PluginExtensionTest, searchOpWithExtraColumnAndNestedOps) {
   // Out-of-tree plugins may register more operations beside the example's.
   EXPECT_NE(std::string::npos, unknown.body().find("unknown search op 'nope'; registered plugin operations: ")) << unknown.body();
   EXPECT_NE(std::string::npos, unknown.body().find("sample_docs")) << unknown.body();
+}
+
+TEST_F(PluginExtensionTest, extraColumnRejectsDiscoveredFieldCollisions) {
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "d1", "cat_s", "x", "price_i", 17)},
+                              UpdateMessage::COMMIT, true).success);
+  for (auto format : {api::DocFormat::COLUMNS, api::DocFormat::ROWS}) {
+    SCOPED_TRACE((int)format);
+    for (std::string_view fields : {"", R"(,"fields":["*"])", R"(,"fields":["price*"])"}) {
+      SCOPED_TRACE(fields);
+      auto req = sampleDocs(R"({"ids":["d1"],"rank_names":["price_i"])" + std::string(fields) + "}", format);
+      EXPECT_FALSE(req->ok());
+      EXPECT_EQ(ErrorKind::INVALID_REQUEST, req->errorKind());
+      EXPECT_EQ("Extra column 'price_i' conflicts with a returned field; use an explicit field list"
+                " to omit the physical field or select the extra by name", req->errorMsg());
+      ASSERT_EQ(1u, req->responses.size());
+      EXPECT_TRUE(req->responses[0]->proto.ops.empty());
+    }
+  }
+}
+
+TEST_F(PluginExtensionTest, extraColumnNamesMustBeUniqueAndNotReserved) {
+  for (auto format : {api::DocFormat::COLUMNS, api::DocFormat::ROWS}) {
+    SCOPED_TRACE((int)format);
+    auto duplicate = sampleDocs(R"({"ids":["d1"],"fields":["id"],"rank_names":["_rank","_rank"]})", format);
+    EXPECT_FALSE(duplicate->ok());
+    EXPECT_EQ(ErrorKind::INTERNAL, duplicate->errorKind());
+    EXPECT_EQ("Duplicate extra column '_rank'; extra column names must be unique", duplicate->errorMsg());
+    for (std::string_view name : {"_score_", "_version_"}) {
+      auto req = sampleDocs(R"({"ids":["d1"],"fields":["id"],"rank_names":[")" + std::string(name) + R"("]})", format);
+      EXPECT_FALSE(req->ok());
+      EXPECT_EQ(ErrorKind::INVALID_REQUEST, req->errorKind());
+      EXPECT_EQ("Extra column '" + std::string(name)
+                + "' conflicts with a reserved output name; choose a different extra column name", req->errorMsg());
+    }
+  }
+}
+
+TEST_F(PluginExtensionTest, explicitSelectorKeepsExtraAndOtherFields) {
+  ASSERT_TRUE(helper.indexAll({flatdoc("id", "d1", "cat_s", "x", "price_i", 17)},
+                              UpdateMessage::COMMIT, true).success);
+  for (auto format : {api::DocFormat::COLUMNS, api::DocFormat::ROWS}) {
+    SCOPED_TRACE((int)format);
+    for (auto [fields, size] : {std::pair{R"(["price_i"])", 1u}, {R"(["price_i","cat_s"])", 2u},
+                                {R"(["id"])", 2u}, {R"(["*","price_i"])", 3u}, {R"(["price_i","*"])", 3u}}) {
+      SCOPED_TRACE(fields);
+      auto req = sampleDocs(R"({"ids":["d1"],"rank_names":["price_i"],"fields":)" + std::string(fields) + "}", format);
+      ASSERT_OK(req);
+      ASSERT_NE(nullptr, req->docList("s"));
+      EXPECT_EQ(format == api::DocFormat::COLUMNS, !req->docList("s")->columns.empty());
+      EXPECT_EQ(format == api::DocFormat::ROWS, !req->docList("s")->docs.empty());
+      auto docs = req->getDocs("s");
+      ASSERT_EQ(1u, docs.size());
+      EXPECT_EQ(size, docs[0].size());
+      const auto* price = find(docs[0], "price_i");
+      ASSERT_NE(nullptr, price);
+      EXPECT_EQ(1, std::get<int64_t>(*price));  // the rank, rather than the physical value 17
+      if (size == 3 || std::string_view(fields).contains("cat_s")) {
+        const auto* category = find(docs[0], "cat_s");
+        ASSERT_NE(nullptr, category);
+        EXPECT_EQ("x", std::get<std::string>(*category));
+      }
+    }
+  }
 }
 
 TEST_F(PluginExtensionTest, httpRoutes) {

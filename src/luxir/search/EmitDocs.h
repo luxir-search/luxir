@@ -712,7 +712,7 @@ inline luxir::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 // retains the request spelling; physicalName + fieldType identify the source.
 // fieldType is resolved from the request schema at selector resolution, so explicit-name
 // errors surface before any batch is assembled and the emit loop does no
-// per-batch schema lookups; kind selects the physical, score, or version source.
+// per-batch schema lookups; kind selects the physical, synthetic, or extra source.
 // discovered: from an empty or wildcard selector (COLUMNS leaves such a column
 // out of a batch where it has no value).  infos and storedInfos are bound with the
 // first rows (see resolveReturnFieldMetadata), so a count-only response never
@@ -1361,20 +1361,43 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
 // match, and a repeated explicit name collapses to its first occurrence (a
 // repeat would re-emplace the same output Column and orphan the earlier
 // stored-field target).  Entries from patterns or an empty list are marked
-// discovered.  The plan is allocated from the protobuf request arena: emission
+// discovered. Extra columns are always returned; explicit selectors naming one
+// select the extra even if a physical field has the same name. Discovered fields
+// must not collide with extras, and synthetic output names are reserved.
+// The plan is allocated from the protobuf request arena: emission
 // starts on task-group threads and concurrent ops must not race (protobuf
 // Arena allocation is thread-safe; the request MemPool is not).  The names
 // are reader-catalog or request-proto views; generated read names are copied
 // into the request arena. The reader and schema are pinned for the request.
 inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
-                                                  std::span<const std::string_view> fields) {
+                                                  std::span<const std::string_view> fields,
+                                                  std::span<const ExtraColumn> extraColumns = {}) {
+  boost::unordered_flat_set<std::string_view, PackedTermHash, PackedTermEqual> extraNames;
+  for (const auto& extra : extraColumns) {
+    if (!extraNames.insert(extra.name).second) {
+      throw std::logic_error("Duplicate extra column '" + std::string(extra.name) + "'; extra column names must be unique");
+    }
+  }
+  // The emitter synthesizes scores; retrieval also exposes virtual versions.
+  for (std::string_view reserved : {"_score_", "_version_"}) {
+    if (extraNames.contains(reserved)) {
+      throw RequestError("Extra column '" + std::string(reserved)
+                         + "' conflicts with a reserved output name; choose a different extra column name");
+    }
+  }
   auto isPattern = [](std::string_view f) { return f.find('*') != std::string_view::npos; };
   ArenaResource mr(&req.arena);
   std::vector<ReturnField> picked;
   auto pushDiscovered = [&](const IndexReader::RetrievableField& field) {
+    if (extraNames.contains(field.name)) {
+      throw RequestError("Extra column '" + std::string(field.name)
+                         + "' conflicts with a returned field; use an explicit field list to omit the physical field"
+                           " or select the extra by name");
+    }
     picked.push_back({field.name, field.name, field.type, ReturnField::Kind::PHYSICAL, true});
   };
   auto pushExplicit = [&](std::string_view f) {
+    if (extraNames.contains(f)) return;  // extras are appended after the physical fields
     for (auto& rf : picked) {
       if (rf.outputKey == f) return;  // explicit lists are small; linear scan
     }
@@ -1426,6 +1449,17 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
           });
     }
   }
+  if (!extraColumns.empty()) {
+    // A paused emitter can outlive the caller's frame, so callbacks live in
+    // the request arena. Copy them only after the whole projection is valid.
+    auto* extras = luxir::arenaCreate<std::vector<ExtraColumn>>(
+        req.arena, extraColumns.begin(), extraColumns.end());
+    for (const auto& extra : *extras) {
+      ReturnField rf{extra.name, {}, nullptr, ReturnField::Kind::EXTRA, false};
+      rf.extra = &extra;
+      picked.push_back(rf);
+    }
+  }
   if (picked.empty()) return {};
   auto* out = (ReturnField*)req.arena.AllocateAligned(sizeof(ReturnField) * picked.size(),
                                                       alignof(ReturnField));
@@ -1473,36 +1507,7 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
   // every field in docs, COLUMNS leaves out all-missing discovered columns,
   // ADAPTIVE picks per field by encoded size.  _score_ (asked for by
   // get_scores) is a column except under ROWS.
-  // Extra columns are always returned; a field selector naming one is theirs.
-  // A selection made only of extra columns returns just those (an empty
-  // selection still projects the default set).
-  std::vector<std::string_view> selected;
-  bool onlyExtras = false;
-  if (!extraColumns.empty()) {
-    for (std::string_view f : fields) {
-      if (std::ranges::none_of(extraColumns, [f](const ExtraColumn& c) { return c.name == f; })) {
-        selected.push_back(f);
-      }
-    }
-    onlyExtras = selected.empty() && !fields.empty();
-    fields = selected;
-  }
-  std::span<ReturnField> rfields = onlyExtras ? std::span<ReturnField>{} : resolveReturnFields(req, fields);
-  if (!extraColumns.empty()) {
-    // The emitter can outlive the caller's frame (a paused stream), so the
-    // column callbacks and the widened field plan live in the request arena.
-    auto* extras = luxir::arenaCreate<std::vector<ExtraColumn>>(
-        req.arena, extraColumns.begin(), extraColumns.end());
-    size_t count = rfields.size() + extras->size();
-    auto* out = (ReturnField*)req.arena.AllocateAligned(sizeof(ReturnField) * count, alignof(ReturnField));
-    std::uninitialized_copy(rfields.begin(), rfields.end(), out);
-    for (size_t i = 0; i < extras->size(); i++) {
-      ReturnField rf{(*extras)[i].name, {}, nullptr, ReturnField::Kind::EXTRA, false};
-      rf.extra = &(*extras)[i];
-      new (&out[rfields.size() + i]) ReturnField(rf);
-    }
-    rfields = {out, count};
-  }
+  std::span<ReturnField> rfields = resolveReturnFields(req, fields, extraColumns);
 
   // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
   // COLUMNS); an out-of-range wire value falls back to the default too.
