@@ -4,6 +4,8 @@
 #include <gtest/gtest.h>
 
 #include "luxir/plugin/Registries.h"
+#include "luxir/plugin/PluginInit.h"
+#include "luxir/server/LuxirNode.h"
 
 using namespace luxir;
 
@@ -15,6 +17,20 @@ public:
   explicit DummyPlugin(std::string n) : name(std::move(n)) {}
   PluginInfo info() const override { return {name, "0", "dummy"}; }
   void registerComponents(Registries&) override {}
+};
+
+class LifecyclePlugin : public DummyPlugin {
+  std::vector<std::string>& calls;
+  bool fail;
+
+public:
+  LifecyclePlugin(std::string name, std::vector<std::string>& calls, bool fail = false)
+    : DummyPlugin(std::move(name)), calls(calls), fail(fail) {}
+  void nodeStarted(LuxirNode&) override {
+    calls.push_back("start:" + name);
+    if (fail) throw std::runtime_error(name);
+  }
+  void nodeStopping(LuxirNode&) noexcept override { calls.push_back("stop:" + name); }
 };
 
 }  // namespace
@@ -50,6 +66,76 @@ TEST(PluginTest, initIsIdempotent) {
   size_t n = Registries::global().plugins.plugins().size();
   EXPECT_NO_THROW(initPlugins(addConfiguredPlugins));
   EXPECT_EQ(Registries::global().plugins.plugins().size(), n);
+}
+
+TEST(PluginTest, differentAdderIsRejected) {
+  initPlugins(addConfiguredPlugins);
+  try {
+    initPlugins(nullptr);
+    FAIL();
+  } catch (const std::logic_error& e) {
+    EXPECT_STREQ("initPlugins called with a different plugin adder", e.what());
+  }
+  EXPECT_NO_THROW(initPlugins(addConfiguredPlugins));
+}
+
+TEST(PluginTest, nullAdderIsIdempotentAndDistinctFromConfigured) {
+  int attempts = 0;
+  auto initialize = [&](auto adder) {
+    attempts++;
+    PluginRegistry plugins;
+    adder(plugins);
+  };
+  detail::PluginInit empty;
+  EXPECT_NO_THROW(empty.run(nullptr, initialize));
+  EXPECT_NO_THROW(empty.run(nullptr, initialize));
+  EXPECT_THROW(empty.run(addConfiguredPlugins, initialize), std::logic_error);
+  EXPECT_EQ(1, attempts);
+
+  detail::PluginInit configured;
+  EXPECT_NO_THROW(configured.run(addConfiguredPlugins, initialize));
+  EXPECT_NO_THROW(configured.run(addConfiguredPlugins, initialize));
+  EXPECT_THROW(configured.run(nullptr, initialize), std::logic_error);
+  EXPECT_EQ(2, attempts);
+}
+
+TEST(PluginTest, initializationFailureIsTerminal) {
+  detail::PluginInit state;
+  PluginRegistry plugins;
+  int attempts = 0;
+  auto initialize = [&](auto adder) {
+    attempts++;
+    adder(plugins);
+    plugins.freeze();
+    throw std::runtime_error("registration failed after freeze");
+  };
+  void (*adders[])(PluginRegistry&) = {nullptr, nullptr, addConfiguredPlugins};
+  for (auto adder : adders) {
+    try {
+      state.run(adder, initialize);
+      FAIL();
+    } catch (const std::runtime_error& e) {
+      EXPECT_STREQ("registration failed after freeze", e.what());
+    }
+  }
+  EXPECT_EQ(1, attempts);
+}
+
+TEST(PluginTest, failedNodeStartUnwindsOnlyCompletedHooks) {
+  LuxirNode node;
+  std::vector<std::string> calls;
+  PluginRegistry plugins;
+  plugins.add(std::make_unique<LifecyclePlugin>("a", calls));
+  plugins.add(std::make_unique<LifecyclePlugin>("b", calls));
+  plugins.add(std::make_unique<LifecyclePlugin>("c", calls, true));
+  plugins.add(std::make_unique<LifecyclePlugin>("d", calls));
+  try {
+    plugins.notifyNodeStarted(node);
+    FAIL();
+  } catch (const std::runtime_error& e) {
+    EXPECT_STREQ("c", e.what());
+  }
+  EXPECT_EQ(std::vector<std::string>({"start:a", "start:b", "start:c", "stop:b", "stop:a"}), calls);
 }
 
 TEST(PluginTest, paramReaderUsesParamErrors) {

@@ -53,6 +53,7 @@ public:
   ~LuxirNode();
 
   const LuxirConfig& getConfig() const { return config; }
+  Mode getMode() const { return mode; }
   Clock::time_point now() const { return clock(); }
   ReplicationFollower* getFollower() { return follower.get(); }
   // Checksum scrub of published snapshots; runs periodically only when
@@ -146,6 +147,7 @@ private:
   static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
 
   LuxirConfig config;
+  const Mode mode;
   Now clock;
 
   // Query work.  Workers: server.workers (resolveWorkers(); at least

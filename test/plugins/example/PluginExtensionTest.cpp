@@ -11,6 +11,7 @@
 #include "luxir/query/ProtobufQueryParser.h"
 #include "luxir/query/QueryPrep.h"
 #include "luxir/server/HttpServer.h"
+#include "luxir/util/luxir_util.h"
 #include "test/CollectionHelper.h"
 #include "test/HttpReq.h"
 #include "test/LocalReq.h"
@@ -19,6 +20,9 @@
 
 int exampleNodesStarted();
 int exampleNodesStopped();
+int examplePullNodesStarted();
+int examplePullNodesStopped();
+void exampleThrowOnNodeStart(bool value);
 
 using namespace luxir;
 using namespace luxir::test;
@@ -300,6 +304,37 @@ TEST_F(PluginExtensionTest, httpRoutes) {
 TEST_F(PluginExtensionTest, nodeLifecycle) {
   EXPECT_GE(exampleNodesStarted(), 1);
   int started = exampleNodesStarted(), stopped = exampleNodesStopped();
+  {
+    LuxirNode node;
+    EXPECT_EQ(LuxirNode::Mode::SERVE, node.getMode());
+  }
+  EXPECT_EQ(started + 1, exampleNodesStarted());
+  EXPECT_EQ(stopped + 1, exampleNodesStopped());
+  int pullStarted = examplePullNodesStarted(), pullStopped = examplePullNodesStopped();
+  {
+    LuxirNode node(LuxirConfig{}, LuxirNode::Mode::PULL);
+    EXPECT_EQ(LuxirNode::Mode::PULL, node.getMode());
+  }
+  EXPECT_EQ(started + 2, exampleNodesStarted());
+  EXPECT_EQ(stopped + 2, exampleNodesStopped());
+  EXPECT_EQ(pullStarted + 1, examplePullNodesStarted());
+  EXPECT_EQ(pullStopped + 1, examplePullNodesStopped());
+}
+
+TEST_F(PluginExtensionTest, nodeConstructorRethrowsHookFailure) {
+  int started = exampleNodesStarted(), stopped = exampleNodesStopped();
+  {
+    exampleThrowOnNodeStart(true);
+    auto reset = scope_guard([]() { exampleThrowOnNodeStart(false); });
+    try {
+      LuxirNode node;
+      FAIL();
+    } catch (const std::runtime_error& e) {
+      EXPECT_STREQ("example node start failed", e.what());
+    }
+  }
+  EXPECT_EQ(started, exampleNodesStarted());
+  EXPECT_EQ(stopped, exampleNodesStopped());
   { LuxirNode node; }
   EXPECT_EQ(started + 1, exampleNodesStarted());
   EXPECT_EQ(stopped + 1, exampleNodesStopped());

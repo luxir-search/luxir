@@ -6,6 +6,8 @@
 #include "luxir/plugin/Registries.h"
 #include "luxir/server/LuxirNode.h"
 
+#include <stdexcept>
+
 namespace {
 
 // Test-only plugin that exercises the plugin framework: a query type
@@ -13,6 +15,12 @@ namespace {
 // Later steps register analysis components and storage backends here.
 class ExamplePlugin : public luxir::Plugin {
 public:
+  static inline std::atomic<int> startedNodes{0};
+  static inline std::atomic<int> stoppedNodes{0};
+  static inline std::atomic<int> startedPullNodes{0};
+  static inline std::atomic<int> stoppedPullNodes{0};
+  static inline std::atomic<bool> throwOnNodeStart{false};
+
   luxir::PluginInfo info() const override { return {"example", "1.0", "exercises the plugin framework"}; }
   void registerComponents(luxir::Registries& r) override {
     r.query.add("doc_ids", example::docIdsDef());
@@ -31,11 +39,15 @@ public:
       response.searchBody = R"({"ops":{"sample":{"sample_docs":)" + std::string(request.body) + "}}}";
     });
   }
-  void nodeStarted(luxir::LuxirNode&) override { startedNodes++; }
-  void nodeStopping(luxir::LuxirNode&) noexcept override { stoppedNodes++; }
-
-  static inline std::atomic<int> startedNodes{0};
-  static inline std::atomic<int> stoppedNodes{0};
+  void nodeStarted(luxir::LuxirNode& node) override {
+    if (throwOnNodeStart.load()) throw std::runtime_error("example node start failed");
+    startedNodes++;
+    if (node.getMode() == luxir::LuxirNode::Mode::PULL) startedPullNodes++;
+  }
+  void nodeStopping(luxir::LuxirNode& node) noexcept override {
+    stoppedNodes++;
+    if (node.getMode() == luxir::LuxirNode::Mode::PULL) stoppedPullNodes++;
+  }
 };
 
 }  // namespace
@@ -43,5 +55,8 @@ public:
 // For PluginTest: how many nodes the example plugin saw start and stop.
 int exampleNodesStarted() { return ExamplePlugin::startedNodes.load(); }
 int exampleNodesStopped() { return ExamplePlugin::stoppedNodes.load(); }
+int examplePullNodesStarted() { return ExamplePlugin::startedPullNodes.load(); }
+int examplePullNodesStopped() { return ExamplePlugin::stoppedPullNodes.load(); }
+void exampleThrowOnNodeStart(bool value) { ExamplePlugin::throwOnNodeStart.store(value); }
 
 LUXIR_PLUGIN(example, ExamplePlugin)

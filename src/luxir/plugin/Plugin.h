@@ -29,7 +29,9 @@ public:
   virtual void registerComponents(Registries& r) = 0;
   // Called when a node has opened its collections, and before it shuts down
   // (a process may run several nodes, e.g. in tests). Throwing from
-  // nodeStarted aborts the node's construction; nodeStopping must not throw.
+  // nodeStarted aborts construction and unwinds completed hooks in reverse.
+  // A throwing hook must clean up its own partial state. nodeStopping must not
+  // throw. Both modes fire hooks; node.getMode() distinguishes SERVE and PULL.
   virtual void nodeStarted(LuxirNode& node) { (void)node; }
   virtual void nodeStopping(LuxirNode& node) noexcept { (void)node; }
 };
@@ -47,6 +49,8 @@ public:
   const Plugin* find(std::string_view name) const;
   bool frozen() const { return isFrozen; }
   void freeze() { isFrozen = true; }
+  void notifyNodeStarted(LuxirNode& node);
+  void notifyNodeStopping(LuxirNode& node) noexcept;
 };
 
 // Defined in the generated translation unit (cmake/LuxirPlugins.cmake), never in
@@ -57,12 +61,10 @@ void addConfiguredPlugins(PluginRegistry& r);
 // generated object is referenced from the executable and pulled in naturally), then runs
 // each plugin's registerComponents, logs the plugin list, then freezes the global registries.
 // Each area seeds its built-ins at registry construction. Call before any LuxirNode or Schema exists.
+// A null adder means no plugins. Repeating the same adder is a no-op; a different
+// adder is an error. Initialization failure is terminal: later calls rethrow the
+// original exception. No registry state may be relied on afterwards; the process must exit.
 void initPlugins(void (*addPlugins)(PluginRegistry&));
-
-// Node lifecycle: call every plugin's nodeStarted / nodeStopping, in
-// registration order (stopping in reverse).
-void notifyNodeStarted(LuxirNode& node);
-void notifyNodeStopping(LuxirNode& node) noexcept;
 
 }  // namespace luxir
 

@@ -68,7 +68,7 @@ void LuxirNode::ArenaThreadNamer::on_scheduler_entry(bool worker) {
 }
 
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
-  : config(std::move(config)), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
+  : config(std::move(config)), mode(mode), clock(std::move(clock)), workers(std::max(1, this->config.server.resolveWorkers())),
     reservedSlots(reservedArenaSlots(this->config)),
     taskArena(workers + reservedSlots, reservedSlots,
               oneapi::tbb::task_arena::priority::normal, oneapi::tbb::task_arena::leave_policy::fast),
@@ -125,11 +125,11 @@ LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)
   scrubber = std::make_unique<Scrubber>(*this);
   if (mode == Mode::SERVE) scrubber->start();
   if (follower && mode == Mode::SERVE) follower->start();
-  notifyNodeStarted(*this);
+  PluginRegistry::global().notifyNodeStarted(*this);
 }
 
 LuxirNode::~LuxirNode() {
-  notifyNodeStopping(*this);
+  PluginRegistry::global().notifyNodeStopping(*this);
   scrubber->stop();
   if (follower) follower->stop();
   commitWaits->close();

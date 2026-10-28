@@ -21,7 +21,12 @@ and it registers its components through a generated translation unit.
 ## Startup order
 
 `initPlugins(addPlugins)` runs after configuration is applied and before any `LuxirNode` or
-`Schema` exists (`luxir_main` and the test `main` both call it). It is idempotent.
+`Schema` exists (`luxir_main` and the test `main` both call it).
+Passing `nullptr` means no plugins. Repeating the same adder, including `nullptr`,
+is a no-op after success; calling with a different adder is an error. A failed
+initialization is terminal: every later call rethrows the original exception,
+even with a different adder. The registries may be partially populated or frozen;
+nothing about their state may be relied on afterwards, and the process must exit.
 
 1. Each area constructs its registry on first access and seeds its built-ins
    there (these registries have none yet). This does not initialize plugins.
@@ -83,8 +88,14 @@ search ops, readers and `QueryPrep`.
 `Plugin::nodeStarted(LuxirNode&)` runs at the end of a node's construction, after
 its collections are open; `nodeStopping(LuxirNode&)` runs first in its destructor,
 in reverse plugin order. A process can run several nodes (tests do), so a plugin
-that keeps per-node state keys it by node. A throw from `nodeStarted` aborts the
-node's construction; `nodeStopping` is `noexcept`.
+that keeps per-node state keys it by node. If a hook throws, completed hooks get
+`nodeStopping` in reverse order and the node constructor rethrows. The throwing
+hook must clean up its own partial state; it and hooks after it get no stop call.
+`nodeStopping` is `noexcept`.
+
+Both SERVE and PULL nodes fire the hooks. `node.getMode()` returns
+`LuxirNode::Mode::SERVE` or `PULL`, so a plugin can decide which resources to start.
+The example plugin counts PULL starts and stops separately using this getter.
 
 ## Query types
 

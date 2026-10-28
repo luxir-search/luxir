@@ -3,10 +3,10 @@
 
 #include "luxir/plugin/Plugin.h"
 
-#include <mutex>
 #include <stdexcept>
 
 #include "luxir/api/PluginArms.h"
+#include "luxir/plugin/PluginInit.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/util/log.h"
 
@@ -50,18 +50,23 @@ void Registries::freeze() {
   http.freeze();
 }
 
-void notifyNodeStarted(LuxirNode& node) {
-  for (const auto& p : PluginRegistry::global().plugins()) p->nodeStarted(node);
+void PluginRegistry::notifyNodeStarted(LuxirNode& node) {
+  size_t started = 0;
+  try {
+    for (; started < list.size(); started++) list[started]->nodeStarted(node);
+  } catch (...) {
+    while (started > 0) list[--started]->nodeStopping(node);
+    throw;
+  }
 }
 
-void notifyNodeStopping(LuxirNode& node) noexcept {
-  const auto& list = PluginRegistry::global().plugins();
+void PluginRegistry::notifyNodeStopping(LuxirNode& node) noexcept {
   for (auto it = list.rbegin(); it != list.rend(); ++it) (*it)->nodeStopping(node);
 }
 
 void initPlugins(void (*addPlugins)(PluginRegistry&)) {
-  static std::once_flag once;
-  std::call_once(once, [addPlugins] {
+  static detail::PluginInit state;
+  state.run(addPlugins, [](auto addPlugins) {
     Registries r = Registries::global();
     addPlugins(r.plugins);
     std::string names;
