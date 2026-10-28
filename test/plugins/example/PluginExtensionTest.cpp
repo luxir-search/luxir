@@ -7,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include "ExampleQuery.h"
+#include "ExampleNodeState.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/query/ProtobufQueryParser.h"
 #include "luxir/query/QueryPrep.h"
@@ -18,11 +19,7 @@
 #include "test/LuxirTest.h"
 #include "test/TestUtils.h"
 
-int exampleNodesStarted();
-int exampleNodesStopped();
-int examplePullNodesStarted();
-int examplePullNodesStopped();
-void exampleThrowOnNodeStart(bool value);
+void exampleThrowOnNodeStateCreation(bool value);
 
 using namespace luxir;
 using namespace luxir::test;
@@ -356,9 +353,12 @@ TEST_F(PluginExtensionTest, explicitSelectorKeepsExtraAndOtherFields) {
 }
 
 TEST_F(PluginExtensionTest, httpRoutes) {
+  auto* state = luxirNode->pluginState<example::NodeState>("example");
+  int routes = state->routes.load();
   auto ping = httpRequest(server->getPort(), http::verb::get, "/_plugins/example/ping?echo=hi");
   EXPECT_EQ(200, ping.result_int()) << ping.body();
   EXPECT_EQ(R"({"pong":"hi"})", ping.body());
+  EXPECT_EQ(routes + 1, state->routes.load());
   auto wrongMethod = post("/_plugins/example/ping", "");
   EXPECT_EQ(405, wrongMethod.result_int()) << wrongMethod.body();
   EXPECT_EQ("GET", std::string(wrongMethod[http::field::allow]));
@@ -373,41 +373,81 @@ TEST_F(PluginExtensionTest, httpRoutes) {
   EXPECT_NE(std::string::npos, badSample.body().find("unknown parameter 'idz'")) << badSample.body();
 }
 
-TEST_F(PluginExtensionTest, nodeLifecycle) {
-  EXPECT_GE(exampleNodesStarted(), 1);
-  int started = exampleNodesStarted(), stopped = exampleNodesStopped();
-  {
-    LuxirNode node;
-    EXPECT_EQ(LuxirNode::Mode::SERVE, node.getMode());
-  }
-  EXPECT_EQ(started + 1, exampleNodesStarted());
-  EXPECT_EQ(stopped + 1, exampleNodesStopped());
-  int pullStarted = examplePullNodesStarted(), pullStopped = examplePullNodesStopped();
-  {
-    LuxirNode node(LuxirConfig{}, LuxirNode::Mode::PULL);
-    EXPECT_EQ(LuxirNode::Mode::PULL, node.getMode());
-  }
-  EXPECT_EQ(started + 2, exampleNodesStarted());
-  EXPECT_EQ(stopped + 2, exampleNodesStopped());
-  EXPECT_EQ(pullStarted + 1, examplePullNodesStarted());
-  EXPECT_EQ(pullStopped + 1, examplePullNodesStopped());
+TEST(PluginQueryTest, makersReachTheirOwnNodeState) {
+  LuxirNode first, second;
+  auto* a = first.pluginState<example::NodeState>("example");
+  auto* b = second.pluginState<example::NodeState>("example");
+  ASSERT_NE(nullptr, a);
+  ASSERT_NE(nullptr, b);
+  EXPECT_NE(a, b);
+  EXPECT_EQ(nullptr, first.pluginState<example::NodeState>("missing"));
+  struct OtherState : PluginNodeState {};
+  EXPECT_EQ(nullptr, first.pluginState<OtherState>("example"));
+  auto run = [&](LuxirNode& node) {
+    CollectionHelper docs(node);
+    ASSERT_TRUE(docs.index(flatdoc("id", "d1"), UpdateMessage::COMMIT).success);
+    auto req = localReq(node.getSearchEngine());
+    ASSERT_TRUE(api::read_json(req->rawRequest(), R"x({"ops":{
+      "q":{"top_docs":{"query":"doc_ids([d1], within=doc_ids([d1]))","fields":["id"]}},
+      "s":{"sample_docs":{"ids":["d1"],"fields":["id"]}}
+    }})x", req->mr));
+    req->execute();
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_EQ(1u, req->getDocs("q").size());
+    EXPECT_EQ(1u, req->getDocs("s").size());
+  };
+  run(first);
+  EXPECT_EQ(2, a->queries.load());
+  EXPECT_EQ(1, a->ops.load());
+  EXPECT_EQ(0, b->queries.load());
+  EXPECT_EQ(0, b->ops.load());
+  run(second);
+  EXPECT_EQ(2, a->queries.load());
+  EXPECT_EQ(1, a->ops.load());
+  EXPECT_EQ(2, b->queries.load());
+  EXPECT_EQ(1, b->ops.load());
 }
 
-TEST_F(PluginExtensionTest, nodeConstructorRethrowsHookFailure) {
-  int started = exampleNodesStarted(), stopped = exampleNodesStopped();
+TEST(PluginQueryTest, offlineQueryContextHasNoNode) {
+  auto schema = Schema::createDefaultSchema();
+  MemPool pool;
+  google::protobuf::Arena arena;
+  ParseContext parse(pool, *schema, arena, CoerceContext{}, "offline");
+  ProtobufQueryParser parser(parse);
+  PluginQueryContext context(parse, "doc_ids", ParamReader("doc_ids", ParamReader::Entries{}),
+                             [&](const api::Query& query) { return parser.parse(query); });
+  EXPECT_EQ(nullptr, context.node());
+  api::Query query;
+  ASSERT_TRUE(api::read_json(query, R"({"doc_ids":{"values":["d1"]}})", pool));
+  EXPECT_NE(nullptr, parser.parse(query));
+}
+
+TEST(PluginQueryTest, nodeStateLifecycle) {
+  for (auto mode : {LuxirNode::Mode::SERVE, LuxirNode::Mode::PULL}) {
+    std::shared_ptr<std::atomic<bool>> stopped;
+    {
+      LuxirNode node(LuxirConfig{}, mode);
+      auto* state = node.pluginState<example::NodeState>("example");
+      ASSERT_NE(nullptr, state);
+      EXPECT_EQ(mode, state->mode);
+      stopped = state->stopped;
+      EXPECT_FALSE(stopped->load());
+    }
+    EXPECT_TRUE(stopped->load());
+  }
+}
+
+TEST(PluginQueryTest, nodeConstructorRethrowsStateCreationFailure) {
   {
-    exampleThrowOnNodeStart(true);
-    auto reset = scope_guard([]() { exampleThrowOnNodeStart(false); });
+    exampleThrowOnNodeStateCreation(true);
+    auto reset = scope_guard([]() { exampleThrowOnNodeStateCreation(false); });
     try {
       LuxirNode node;
       FAIL();
     } catch (const std::runtime_error& e) {
-      EXPECT_STREQ("example node start failed", e.what());
+      EXPECT_STREQ("example node state creation failed", e.what());
     }
   }
-  EXPECT_EQ(started, exampleNodesStarted());
-  EXPECT_EQ(stopped, exampleNodesStopped());
-  { LuxirNode node; }
-  EXPECT_EQ(started + 1, exampleNodesStarted());
-  EXPECT_EQ(stopped + 1, exampleNodesStopped());
+  LuxirNode node;
+  EXPECT_NE(nullptr, node.pluginState<example::NodeState>("example"));
 }

@@ -20,6 +20,8 @@ QueryRegistry& QueryRegistry::global() {
   return instance;
 }
 
+LuxirNode* PluginQueryContext::node() const { return parse.node; }
+
 Query* PluginQueryContext::parseQuery(const api::Val& value) {
   // The parser reads api::Query views; a param holds the same JSON as a Val,
   // so round-trip it. The text and the views it yields live in the pool.

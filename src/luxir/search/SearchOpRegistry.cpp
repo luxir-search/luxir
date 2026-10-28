@@ -8,8 +8,11 @@
 #include <stdexcept>
 
 #include "luxir/util/ApiError.h"
+#include "luxir/search/SearchEngine.h"
 
 namespace luxir {
+
+LuxirNode& PluginOpContext::node() const { return req.engine.getNode(); }
 
 SearchOpRegistry::SearchOpRegistry() = default;
 

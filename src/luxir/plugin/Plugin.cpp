@@ -50,20 +50,6 @@ void Registries::freeze() {
   http.freeze();
 }
 
-void PluginRegistry::notifyNodeStarted(LuxirNode& node) {
-  size_t started = 0;
-  try {
-    for (; started < list.size(); started++) list[started]->nodeStarted(node);
-  } catch (...) {
-    while (started > 0) list[--started]->nodeStopping(node);
-    throw;
-  }
-}
-
-void PluginRegistry::notifyNodeStopping(LuxirNode& node) noexcept {
-  for (auto it = list.rbegin(); it != list.rend(); ++it) (*it)->nodeStopping(node);
-}
-
 void initPlugins(void (*addPlugins)(PluginRegistry&)) {
   static detail::PluginInit state;
   state.run(addPlugins, [](auto addPlugins) {

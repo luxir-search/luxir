@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "ExampleNodeState.h"
 #include "luxir/api/build.h"
 #include "luxir/query/BooleanQuery.h"
 #include "luxir/query/QueryRegistry.h"
@@ -26,6 +27,7 @@ namespace example {
 // expression form is doc_ids([a, b], within=cat_s:x).
 inline luxir::Query* makeDocIds(luxir::PluginQueryContext& ctx) {
   namespace api = luxir::api;
+  if (auto* node = ctx.node()) node->pluginState<NodeState>("example")->queries++;
   auto& pool = ctx.parse.pool;
   auto values = ctx.params.getStringList("values");
   const api::Val* within = ctx.params.get("within");
@@ -161,6 +163,7 @@ public:
 };
 
 inline luxir::SearchOp* makeSampleDocs(luxir::PluginOpContext& ctx) {
+  ctx.node().pluginState<NodeState>("example")->ops++;
   auto* op = luxir::arenaCreate<SampleDocsOp>(ctx.req.arena, ctx.req, ctx.name);
   op->ids = ctx.params.getStringList("ids");
   op->fields = ctx.params.getStringList("fields");

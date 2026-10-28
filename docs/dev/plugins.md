@@ -15,6 +15,9 @@ and it registers its components through a generated translation unit.
   `luxir::Registries::global()` binds references to them for registration.
   `luxir::initPlugins()` fills and freezes them: later registration throws,
   and lookups read immutable tables without locking.
+- One `Plugin` instance per process supplies metadata and registers types once.
+  Mutable node-level work belongs in a separate `PluginNodeState` per node;
+  registered makers get the current node from their context.
 - Registering a name that already exists throws `std::invalid_argument` during
   startup, so a misconfigured binary fails loudly instead of overriding silently.
 
@@ -85,17 +88,27 @@ search ops, readers and `QueryPrep`.
 
 ## Node lifecycle
 
-`Plugin::nodeStarted(LuxirNode&)` runs at the end of a node's construction, after
-its collections are open; `nodeStopping(LuxirNode&)` runs first in its destructor,
-in reverse plugin order. A process can run several nodes (tests do), so a plugin
-that keeps per-node state keys it by node. If a hook throws, completed hooks get
-`nodeStopping` in reverse order and the node constructor rethrows. The throwing
-hook must clean up its own partial state; it and hooks after it get no stop call.
-`nodeStopping` is `noexcept`.
+`Plugin::createNodeState(LuxirNode&)` runs at the end of each node's construction,
+after its collections are open, in registration order. The default returns null
+for a plugin with no node state. Otherwise return a `std::unique_ptr` to a
+`PluginNodeState` subclass (defined in `luxir/server/PluginNodeState.h`): its
+construction starts the work, and its `noexcept` destructor stops it. The node
+owns these states, independently of every other node in the process. Factories
+may run concurrently for different nodes; keep their mutable work in the states.
 
-Both SERVE and PULL nodes fire the hooks. `node.getMode()` returns
-`LuxirNode::Mode::SERVE` or `PULL`, so a plugin can decide which resources to start.
-The example plugin counts PULL starts and stops separately using this getter.
+If creation throws, the node destroys completed states in reverse order and
+rethrows. The throwing factory must use RAII to clean up its own partial work;
+factories after it are not called. Node shutdown explicitly destroys the states
+in reverse order first, before stopping the scrubber, follower and commit waits.
+
+`node.pluginState<T>("my_plugin")` looks up the state by plugin name, using a
+checked cast. It returns null if the plugin is absent, returned no state, or the
+state has a different type. Registered makers must look up their node's state
+per call rather than capturing one node's state in a process-wide registration.
+
+Both SERVE and PULL nodes create states. `node.getMode()` returns
+`LuxirNode::Mode::SERVE` or `PULL`, so a state can decide which resources to start.
+The example plugin records its node's mode in its state.
 
 ## Query types
 
@@ -147,6 +160,9 @@ r.query.add("doc_ids", luxir::PluginQueryDef{
 - `ctx.parse` is the request's `ParseContext`: pool, schema, the searched reader
   (`ctx.parse.reader`, null outside a search), coercion context, warnings and field
   resolver, which is everything `QueryBuilder` needs.
+- `ctx.node()` returns the request's node, including for expression and nested
+  queries. It returns null for offline parsing without a node (`ParseContext::node`
+  defaults to null); makers using node state must handle that case.
 - `ctx.parseQuery(...)` lowers a nested `api::Query`, or a Query-shaped param (an
   object or an expression string), through the ordinary parser with the shared
   nesting budget.
@@ -171,6 +187,8 @@ to `top_docs`, `fusion` and the facets. On the wire a plugin op is the `plugin` 
 The maker receives a `PluginOpContext` while the request is parsed and returns a
 `SearchOp` subclass allocated with `luxir::arenaCreate` in `ctx.req.arena`:
 
+- `node()` returns the request's node by reference. Its `pluginState<T>(name)`
+  accesses the same state that query makers and HTTP handlers see.
 - `parseQuery(...)` lowers and validates a query against the op's `planning()`
   context; `weightContext()` is the `Query::Context` for `createWeight`, and
   `planning().getFilterUse(query)` its filter cache entry.
@@ -223,7 +241,8 @@ r.http.add("POST", "/collections/{collection}/_sample",
 ```
 
 - The handler runs on a task-arena worker, so it may block on engine work through
-  `request.node`. It answers with `status`, `contentType` and `body`, or sets
+  `request.node`, which also supplies `pluginState<T>(name)`. It answers with
+  `status`, `contentType` and `body`, or sets
   `searchBody` to have the server run that body as a search with default URL
   options and answer as `_search` would (streaming, errors). The request's URL
   parameters are not applied to that search; they reach the handler as
@@ -241,6 +260,8 @@ r.http.add("POST", "/collections/{collection}/_sample",
 and `unscoped_value` to test rejection of a PLUGIN query without the base.
 It also registers a `sample_docs` search op
 (rank columns named by `rank_names`, defaulting to `_rank`, and nested ops over
-its documents), two HTTP routes and
-lifecycle counters, exercised end to end by `PluginExtensionTest`; `PluginTest`
-covers the framework.
+its documents), two HTTP routes and a per-node state with query, op and route
+counters. The makers and handlers reach that state through their contexts.
+`PluginExtensionTest` and `PluginQueryTest` exercise the plugin end to end,
+including independent live nodes; `PluginTest` covers registry validation and
+state creation/destruction order.

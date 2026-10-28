@@ -26,11 +26,18 @@ class LifecyclePlugin : public DummyPlugin {
 public:
   LifecyclePlugin(std::string name, std::vector<std::string>& calls, bool fail = false)
     : DummyPlugin(std::move(name)), calls(calls), fail(fail) {}
-  void nodeStarted(LuxirNode&) override {
+  std::unique_ptr<PluginNodeState> createNodeState(LuxirNode&) override {
+    class State final : public PluginNodeState {
+      std::vector<std::string>& calls;
+      std::string name;
+    public:
+      State(std::vector<std::string>& calls, std::string name) : calls(calls), name(std::move(name)) {}
+      ~State() noexcept override { calls.push_back("stop:" + name); }
+    };
     calls.push_back("start:" + name);
     if (fail) throw std::runtime_error(name);
+    return std::make_unique<State>(calls, name);
   }
-  void nodeStopping(LuxirNode&) noexcept override { calls.push_back("stop:" + name); }
 };
 
 }  // namespace
@@ -121,7 +128,7 @@ TEST(PluginTest, initializationFailureIsTerminal) {
   EXPECT_EQ(1, attempts);
 }
 
-TEST(PluginTest, failedNodeStartUnwindsOnlyCompletedHooks) {
+TEST(PluginTest, failedNodeStateCreationUnwindsCompletedStates) {
   LuxirNode node;
   std::vector<std::string> calls;
   PluginRegistry plugins;
@@ -129,13 +136,32 @@ TEST(PluginTest, failedNodeStartUnwindsOnlyCompletedHooks) {
   plugins.add(std::make_unique<LifecyclePlugin>("b", calls));
   plugins.add(std::make_unique<LifecyclePlugin>("c", calls, true));
   plugins.add(std::make_unique<LifecyclePlugin>("d", calls));
+  PluginNodeStates states;
   try {
-    plugins.notifyNodeStarted(node);
+    states.create(node, plugins);
     FAIL();
   } catch (const std::runtime_error& e) {
     EXPECT_STREQ("c", e.what());
   }
   EXPECT_EQ(std::vector<std::string>({"start:a", "start:b", "start:c", "stop:b", "stop:a"}), calls);
+  EXPECT_EQ(nullptr, states.find("a"));
+}
+
+TEST(PluginTest, nodeStatesStopInReverseOrder) {
+  LuxirNode node;
+  std::vector<std::string> calls;
+  PluginRegistry plugins;
+  plugins.add(std::make_unique<LifecyclePlugin>("a", calls));
+  plugins.add(std::make_unique<DummyPlugin>("stateless"));
+  plugins.add(std::make_unique<LifecyclePlugin>("b", calls));
+  {
+    PluginNodeStates states;
+    states.create(node, plugins);
+    EXPECT_NE(nullptr, states.find("a"));
+    EXPECT_EQ(nullptr, states.find("stateless"));
+    EXPECT_EQ(nullptr, states.find("missing"));
+  }
+  EXPECT_EQ(std::vector<std::string>({"start:a", "start:b", "stop:b", "stop:a"}), calls);
 }
 
 TEST(PluginTest, paramReaderUsesParamErrors) {

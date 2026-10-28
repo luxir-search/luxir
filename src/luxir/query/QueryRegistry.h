@@ -16,9 +16,10 @@ namespace luxir {
 
 class Query;
 struct ParseContext;
+class LuxirNode;
 
 // What a plugin query maker receives: the request's parse context (pool,
-// schema, reader, coercion context, warnings, field resolver), the arm's
+// schema, reader, node, coercion context, warnings, field resolver), the arm's
 // params, and a way back into the query parser for nested queries.
 class PluginQueryContext {
   std::function<Query*(const api::Query&)> parseApi;
@@ -31,6 +32,9 @@ public:
   PluginQueryContext(ParseContext& parse, std::string_view name, ParamReader params,
                      std::function<Query*(const api::Query&)> parseApi)
     : parseApi(std::move(parseApi)), parse(parse), name(name), params(std::move(params)) {}
+
+  // Null for offline parsing without a node.
+  LuxirNode* node() const;
 
   // Lower a nested api::Query through the ordinary parser (same context and
   // nesting budget).

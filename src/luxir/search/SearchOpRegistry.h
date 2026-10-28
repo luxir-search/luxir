@@ -18,6 +18,7 @@ class SearchOp;
 class SearchRequest;
 class TopDocsReq;
 struct ParseContext;
+class LuxirNode;
 
 // What a plugin search op maker receives while the request is parsed. The op
 // it returns is a SearchOp subclass allocated with luxir::arenaCreate in
@@ -32,6 +33,8 @@ public:
   PluginOpContext(SearchRequest& req, std::string_view name, const api::PluginOp& proto, ParamReader params)
     : req(req), name(name), proto(proto), params(std::move(params)) {}
   virtual ~PluginOpContext() = default;
+
+  LuxirNode& node() const;
 
   // The op's query parse context (pool, schema, reader, coercion, warnings).
   virtual ParseContext& parseContext() = 0;

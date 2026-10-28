@@ -7,6 +7,8 @@
 #include <string_view>
 #include <vector>
 
+#include "luxir/server/PluginNodeState.h"
+
 namespace luxir {
 
 struct PluginInfo {
@@ -27,13 +29,10 @@ public:
   // Called once during initPlugins(). Register components into `r`.
   // Throwing aborts startup with the message.
   virtual void registerComponents(Registries& r) = 0;
-  // Called when a node has opened its collections, and before it shuts down
-  // (a process may run several nodes, e.g. in tests). Throwing from
-  // nodeStarted aborts construction and unwinds completed hooks in reverse.
-  // A throwing hook must clean up its own partial state. nodeStopping must not
-  // throw. Both modes fire hooks; node.getMode() distinguishes SERVE and PULL.
-  virtual void nodeStarted(LuxirNode& node) { (void)node; }
-  virtual void nodeStopping(LuxirNode& node) noexcept { (void)node; }
+  // Called per node after its collections are open. Null means no node state.
+  // A throw aborts node construction; RAII must clean up partial work.
+  // Both modes create states; node.getMode() distinguishes SERVE and PULL.
+  virtual std::unique_ptr<PluginNodeState> createNodeState(LuxirNode&) { return nullptr; }
 };
 
 class PluginRegistry {
@@ -49,8 +48,6 @@ public:
   const Plugin* find(std::string_view name) const;
   bool frozen() const { return isFrozen; }
   void freeze() { isFrozen = true; }
-  void notifyNodeStarted(LuxirNode& node);
-  void notifyNodeStopping(LuxirNode& node) noexcept;
 };
 
 // Defined in the generated translation unit (cmake/LuxirPlugins.cmake), never in

@@ -14,6 +14,7 @@
 #include <string_view>
 #include <vector>
 #include "Collections.h"
+#include "PluginNodeState.h"
 #include "luxir/index/IndexRamBudget.h"
 #include "oneapi/tbb/task_arena.h"
 #include "oneapi/tbb/task_scheduler_observer.h"
@@ -25,9 +26,7 @@
 
 namespace luxir {
 
-/// There should normally be a single LuxirNode instance per process.
-/// A single LuxirNode can host many indexes.
-/// There still *may* be multiple LuxirNode instances per process, but it's currently more for testing.
+// A node hosts many collections. A process may run several independent nodes.
 
 class SearchEngine;
 class LuxirNode;
@@ -54,6 +53,11 @@ public:
 
   const LuxirConfig& getConfig() const { return config; }
   Mode getMode() const { return mode; }
+  // Null for a missing state or a different concrete state type.
+  template <class T>
+  T* pluginState(std::string_view pluginName) const {
+    return dynamic_cast<T*>(pluginStates.find(pluginName));
+  }
   Clock::time_point now() const { return clock(); }
   ReplicationFollower* getFollower() { return follower.get(); }
   // Checksum scrub of published snapshots; runs periodically only when
@@ -201,6 +205,7 @@ private:
   std::unique_ptr<ReplicationFollower> follower;
   std::unique_ptr<Scrubber> scrubber;
   std::unique_ptr<SearchEngine> searchEngine;
+  PluginNodeStates pluginStates;
 };
 
 }
