@@ -4,6 +4,7 @@
 #pragma once
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -12,8 +13,13 @@
 
 namespace luxir {
 
+class ParamError : public std::invalid_argument {
+public:
+  using std::invalid_argument::invalid_argument;
+};
+
 // Typed reads of component params or a nested object inside them.
-// Errors are std::invalid_argument and name the owner and parameter: "lookup: 'max_values' must be an integer".
+// ParamError names the owner and parameter: "lookup: 'max_values' must be an integer".
 // Reads record which keys were consumed, so rejectUnknown() can refuse the
 // rest with the list of valid names.
 class ParamReader {

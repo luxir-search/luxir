@@ -133,8 +133,8 @@ r.query.add("doc_ids", luxir::PluginQueryDef{
   nesting budget.
 - `ctx.params` (`ParamReader`) reads typed params and `rejectUnknown()` refuses the
   rest; every error names the type and the parameter. The neutral reader throws
-  `std::invalid_argument`; query and op maker boundaries translate it to
-  `RequestError` with the same message.
+  `ParamError`, derived from `std::invalid_argument`. Query and op maker boundaries
+  translate `ParamError` to `RequestError` with the same message.
 - The expression arguments make the type callable in the expression language,
   `doc_ids([a, b], within=cat_s:x)`. Each argument parses by its kind (`STRING`,
   `NUMBER`, `BOOL`, `STRING_LIST`, `QUERY`); a `QUERY` argument is a sub-expression

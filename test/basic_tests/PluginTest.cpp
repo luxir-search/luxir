@@ -52,13 +52,14 @@ TEST(PluginTest, initIsIdempotent) {
   EXPECT_EQ(Registries::global().plugins.plugins().size(), n);
 }
 
-TEST(PluginTest, paramReaderUsesNeutralErrors) {
+TEST(PluginTest, paramReaderUsesParamErrors) {
   ParamReader params("component", ParamReader::Entries{});
   EXPECT_EQ(7, params.getInt("count", 7));
   try {
     params.requireInt("count");
     FAIL();
-  } catch (const std::invalid_argument& e) {
+  } catch (const ParamError& e) {
     EXPECT_STREQ("component: 'count' is required", e.what());
   }
+  EXPECT_THROW(params.requireInt("count"), std::invalid_argument);
 }

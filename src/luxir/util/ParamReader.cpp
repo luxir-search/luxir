@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <stdexcept>
 
 namespace luxir {
 
@@ -14,7 +13,7 @@ void ParamReader::markSeen(std::string_view name) const {
 }
 
 void ParamReader::fail(std::string_view name, std::string_view what) const {
-  throw std::invalid_argument(owner + ": '" + std::string(name) + "' " + std::string(what));
+  throw ParamError(owner + ": '" + std::string(name) + "' " + std::string(what));
 }
 
 const api::Val* ParamReader::get(std::string_view name) const {
@@ -137,8 +136,8 @@ void ParamReader::rejectUnknown() const {
       if (!valid.empty()) valid += ", ";
       valid += name;
     }
-    throw std::invalid_argument(owner + ": unknown parameter '" + std::string(key) + "'"
-                       + (valid.empty() ? "; it takes no parameters" : "; valid: " + valid));
+    throw ParamError(owner + ": unknown parameter '" + std::string(key) + "'"
+                     + (valid.empty() ? "; it takes no parameters" : "; valid: " + valid));
   }
 }
 

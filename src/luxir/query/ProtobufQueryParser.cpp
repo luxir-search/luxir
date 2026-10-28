@@ -597,7 +597,7 @@ luxir::Query* ProtobufQueryParser::parsePlugin(const luxir::api::PluginQuery& qu
   luxir::Query* result;
   try {
     result = def.maker(ctx);
-  } catch (const std::invalid_argument& e) {
+  } catch (const ParamError& e) {
     throw RequestError(e.what());
   }
   if (result == nullptr) throw std::logic_error("query type '" + std::string(query.name) + "' made no query");

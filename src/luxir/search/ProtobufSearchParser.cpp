@@ -2262,7 +2262,7 @@ public:
     SearchOp* op;
     try {
       op = maker(context);
-    } catch (const std::invalid_argument& e) {
+    } catch (const ParamError& e) {
       throw RequestError(e.what());
     }
     if (op == nullptr) throw std::logic_error("search op '" + std::string(pluginOp.name) + "' made no operation");
