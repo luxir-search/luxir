@@ -127,6 +127,7 @@ int luxir_main(int argc, char** argv, void (*addPlugins)(PluginRegistry&)) {
   }
 
   try {
+    if (addPlugins == nullptr) addPlugins = [](PluginRegistry&) {};
     initPlugins(addPlugins);
   } catch (const std::exception &e) {
     LOG_ERROR("Plugin initialization failed: {}", e.what());

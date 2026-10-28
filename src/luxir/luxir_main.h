@@ -7,5 +7,5 @@
 
 #include "luxir/plugin/Plugin.h"
 
-int luxir_main(int argc, char** argv, void (*addPlugins)(luxir::PluginRegistry&));
+int luxir_main(int argc, char** argv, void (*addPlugins)(luxir::PluginRegistry&) = nullptr);
 std::string luxir_banner();  // return a banner string that includes useful version info
