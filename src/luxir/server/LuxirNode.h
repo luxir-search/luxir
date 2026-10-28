@@ -166,7 +166,9 @@ private:
 
   // Labels arena worker threads for ps/top/gdb. Masters (transport threads
   // executing in the arena) keep their own names. Declared after taskArena:
-  // observation detaches before the arena tears down.
+  // observation detaches before the arena tears down. Also pins FAISS's
+  // OpenMP to one thread on every thread that enters the arena, masters
+  // included: build and query parallelism comes from TBB tasks alone.
   class ArenaThreadNamer : public oneapi::tbb::task_scheduler_observer {
     const char* prefix;
     int reservedSlots;  // workers occupy the slots after these
@@ -175,13 +177,7 @@ private:
       : oneapi::tbb::task_scheduler_observer(arena), prefix(prefix), reservedSlots(reservedSlots) {
       observe(true);
     }
-    void on_scheduler_entry(bool worker) override {
-      if (!worker) return;
-      char name[16];
-      snprintf(name, sizeof(name), "%s%d", prefix,
-               oneapi::tbb::this_task_arena::current_thread_index() - reservedSlots);
-      nameThisThread(name);
-    }
+    void on_scheduler_entry(bool worker) override;
   };
   ArenaThreadNamer arenaThreadNamer{taskArena, "luxir_tbb_", reservedSlots};
 

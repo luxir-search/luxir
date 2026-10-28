@@ -10,6 +10,8 @@
 #include "luxir/util/log.h"
 #include "oneapi/tbb/global_control.h"
 
+#include <omp.h>
+
 namespace luxir {
 
 // One arena slot per thread that enters the task arena from outside: each
@@ -53,6 +55,15 @@ LuxirNode::ArenaEntrants::ArenaEntrants(LuxirNode& node, int n, std::string_view
              "server.http.threads; excess entrants can block behind arena work",
              server, n, total, node.reservedSlots);
   }
+}
+
+void LuxirNode::ArenaThreadNamer::on_scheduler_entry(bool worker) {
+  omp_set_num_threads(1);
+  if (!worker) return;
+  char name[16];
+  snprintf(name, sizeof(name), "%s%d", prefix,
+           oneapi::tbb::this_task_arena::current_thread_index() - reservedSlots);
+  nameThisThread(name);
 }
 
 LuxirNode::LuxirNode(LuxirConfig config, Mode mode, Now clock)

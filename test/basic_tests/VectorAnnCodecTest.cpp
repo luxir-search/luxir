@@ -10,8 +10,11 @@
 #include <algorithm>
 #include <array>
 #include <string>
+#include <typeinfo>
 #include <vector>
 
+#include <faiss/IndexFlat.h>
+#include <faiss/IndexIVFPQ.h>
 #include <faiss/utils/distances.h>
 
 #include "luxir/index/VectorIndexBuilder.h"
@@ -343,6 +346,91 @@ TEST_F(VectorAnnCodecTest, rotateVectorMatchesFaissTransform) {
     rotation.apply_noalloc(1, x.data(), expected.data());
     rotateVector(rotation, x.data(), actual.data());
     for (int32_t i = 0; i < DIMS; i++) EXPECT_NEAR(actual[i], expected[i], 1e-5f) << i;
+  }
+}
+
+// Compare list payloads rather than files: RaBitQ's sliced rotation GEMMs
+// can differ in the last bits, so only PQ codes must match exactly.
+TEST_F(VectorAnnCodecTest, partitionedBuildMatchesSingleTask) {
+  IvfTestGuard guard;
+  SearchOverridesGuard rows(VectorIndexBuilder::ivfBuildMinRowsPerTask);
+  using List = std::pair<std::vector<faiss::idx_t>, std::vector<uint8_t>>;
+  using Snapshot = std::vector<std::vector<List>>;
+  for (const auto& ann : {pqAnn(0, 2, 4), rabitqAnn()}) {
+    SCOPED_TRACE(std::to_string((int)*ann.codec));
+    auto build = [&](int64_t minRows) {
+      VectorIndexBuilder::ivfBuildMinRowsPerTask = minRows;
+      CollectionHelper h("main");
+      h.clear();
+      installAnn(h.collection(), api::VectorMetric::L2, ann);
+      indexSegment(h, 0, 1500);
+      indexSegment(h, 1500, 1500);
+      Snapshot result;
+      for (bool merge : {false, true}) {
+        if (merge) h.getIndexWriter()->mergeSegments();
+        std::shared_ptr<IndexReader> reader;
+        auto aux = overlays(h, reader);
+        EXPECT_EQ(aux.size(), merge ? 1u : 2u);
+        for (auto* overlay : aux) {
+          std::vector<List> lists;
+          if (!overlay) { ADD_FAILURE() << "Missing overlay"; continue; }
+          auto* ivf = dynamic_cast<const faiss::IndexIVF*>(overlay->getFaissIndex());
+          if (!ivf) { ADD_FAILURE() << "Missing IVF index"; continue; }
+          for (size_t i = 0; i < ivf->nlist; i++) {
+            auto* inv = ivf->invlists;
+            size_t n = inv->list_size(i);
+            List list;
+            if (n) {
+              faiss::InvertedLists::ScopedIds ids(inv, i);
+              list.first.assign(ids.get(), ids.get() + n);
+              if (ann.codec == api::VectorAnnDef::Codec::PQ) {
+                faiss::InvertedLists::ScopedCodes codes(inv, i);
+                list.second.assign(codes.get(), codes.get() + n * ivf->code_size);
+              }
+            }
+            lists.push_back(std::move(list));
+          }
+          result.push_back(std::move(lists));
+        }
+      }
+      return result;
+    };
+    auto single = build(1000000000);
+    EXPECT_EQ(build(64), single);
+  }
+}
+
+TEST_F(VectorAnnCodecTest, partitionedBlasBuildKeepsFormatAndRecall) {
+  IvfTestGuard guard;
+  SearchOverridesGuard saved(VectorIndexBuilder::ivfBuildMinRowsPerTask,
+                              faiss::distance_compute_blas_threshold);
+  VectorIndexBuilder::ivfBuildMinRowsPerTask = 64;
+  faiss::distance_compute_blas_threshold = 64 * DIMS;
+  for (const auto& ann : {pqAnn(0, 2, 4), rabitqAnn()}) {
+    SCOPED_TRACE(std::to_string((int)*ann.codec));
+    CollectionHelper h("main");
+    h.clear();
+    installAnn(h.collection(), api::VectorMetric::L2, ann);
+    indexSegment(h, 0, 1500);
+    indexSegment(h, 1500, 1500);
+    int32_t refine = ann.codec == api::VectorAnnDef::Codec::PQ ? 300 : 100;
+    for (bool merge : {false, true}) {
+      if (merge) h.getIndexWriter()->mergeSegments();
+      std::shared_ptr<IndexReader> reader;
+      auto aux = overlays(h, reader);
+      ASSERT_EQ(aux.size(), merge ? 1u : 2u);
+      for (auto* overlay : aux) {
+        ASSERT_NE(overlay, nullptr);
+        auto* ivf = dynamic_cast<const faiss::IndexIVF*>(overlay->getFaissIndex());
+        ASSERT_NE(ivf, nullptr);
+        EXPECT_EQ(ivf->ntotal, merge ? 3000 : 1500);
+        EXPECT_EQ(typeid(*ivf->quantizer), typeid(faiss::IndexFlatL2));
+        if (ann.codec == api::VectorAnnDef::Codec::PQ) {
+          EXPECT_EQ(typeid(*ivf), typeid(faiss::IndexIVFPQ));
+        }
+      }
+      EXPECT_GE(recallVsExact(h, refine), 0.9);
+    }
   }
 }
 
