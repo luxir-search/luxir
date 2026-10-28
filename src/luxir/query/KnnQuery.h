@@ -854,7 +854,7 @@ public:
           if (rot == rotation) return buf.data();
         }
         auto& entry = rotatedQueries.emplace_back(rotation, std::vector<float>((size_t)dims));
-        rotation->apply_noalloc(1, queryPtr, entry.second.data());
+        rotateVector(*rotation, queryPtr, entry.second.data());
         return entry.second.data();
       };
       // RaBitQ query quantization is a search-time knob: the current

@@ -333,6 +333,19 @@ TEST_F(VectorAnnCodecTest, groupedNegativeDistanceFloor) {
   }
 }
 
+// The query-side matvec reproduces FAISS's one-column SGEMM rotation.
+TEST_F(VectorAnnCodecTest, rotateVectorMatchesFaissTransform) {
+  faiss::RandomRotationMatrix rotation(DIMS, DIMS);
+  rotation.init(VectorIndexBuilder::RABITQ_ROTATION_SEED);
+  std::vector<float> expected(DIMS), actual(DIMS);
+  for (int32_t q = 0; q < 4; q++) {
+    auto x = clustered(500 + q, q);
+    rotation.apply_noalloc(1, x.data(), expected.data());
+    rotateVector(rotation, x.data(), actual.data());
+    for (int32_t i = 0; i < DIMS; i++) EXPECT_NEAR(actual[i], expected[i], 1e-5f) << i;
+  }
+}
+
 TEST_F(VectorAnnCodecTest, negativeEstimateCannotEvictExactColumnWitness) {
   IvfTestGuard guard;
   CollectionHelper h("main");
