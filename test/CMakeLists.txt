@@ -19,6 +19,8 @@ else()
 endif()
 option(LUXIR_TEST_BENCHMARKS "Compile the benchmarks (test/bench) into luxir_test"
        ${_luxir_bench_default})
+# blas_lapack_test.cpp is a standalone program with its own main (below).
+list(FILTER Test_SOURCES EXCLUDE REGEX "/blas_lapack_test\\.cpp$")
 if(NOT LUXIR_TEST_BENCHMARKS)
   list(FILTER Test_SOURCES EXCLUDE REGEX "/bench/[^/]*\\.cpp$")
 endif()
@@ -33,6 +35,23 @@ target_link_libraries(luxir_test PRIVATE luxir_lib benchmark::benchmark GTest::g
 # uni-algo (vendored): AnalysisTest exercises Unicode case folding / NFKC / UAX#29
 # segmentation directly to gate conformance before the real filters are built.
 target_link_libraries(luxir_test PRIVATE uni_algo)
+
+# Standalone check of the OpenBLAS overlay without a vector corpus: the
+# library must be serial (vector builds partition GEMMs across TBB tasks and
+# the query path must never queue behind a BLAS thread pool), its scratch
+# buffers must serve concurrent callers, and the ten LAPACK entry points FAISS
+# uses must have the LP64 ABI.  The dev-container image and tools/build-arm64
+# compile the same source directly.  macOS links Accelerate instead.
+if(NOT APPLE)
+  find_package(OpenBLAS CONFIG REQUIRED)
+  find_package(Threads REQUIRED)
+  add_executable(blas_lapack_test blas_lapack_test.cpp)
+  target_link_libraries(blas_lapack_test PRIVATE OpenBLAS::OpenBLAS Threads::Threads)
+  if(NOT CMAKE_CROSSCOMPILING)
+    add_custom_command(TARGET blas_lapack_test POST_BUILD COMMAND blas_lapack_test
+                       COMMENT "Checking the OpenBLAS overlay")
+  endif()
+endif()
 
 # gtest/benchmark are the dominant parse cost across the ~40 test TUs; add them
 # to the shared heavy-header set (LUXIR_PCH_COMMON comes from the root CMake).
