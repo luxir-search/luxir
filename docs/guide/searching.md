@@ -827,7 +827,13 @@ that under `columns` a discovered field with no value in a batch is left out
 of that batch, while a named column is always present. A field both named
 and matched by a pattern is returned once, so `"fields": ["id", "*"]` returns
 `id` and everything else. `_score_` is requested explicitly (`get_scores`)
-and is a column except under `rows`.
+and is a column except under `rows`. `_sort_`, requested by name, is each
+document's sort values as an array, one per sort clause (the score for a list
+ranked by score); a document missing a sort value has `null` there, and dates
+render as in `_group_.rank`. Under collapse it is the returned document's
+values under the list sort, so with a `head_sort` it can differ from the
+group's rank. A clause a plugin sort kind claims gives the value the plugin
+ranks by.
 
 With [field variants](schema.md#field-variants): bare names return the
 primary's stored source or its own column, independently of the search and

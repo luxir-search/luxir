@@ -53,6 +53,8 @@
 
 namespace luxir {
 
+struct SortPlan;
+
 // Batch-local row index and segment run length. One batch holds at most
 // INT32_MAX rows (the DocList row_count is an int32); the same width serves
 // the segment-sorted permutation and the per-segment run lengths.
@@ -730,7 +732,7 @@ struct ExtraColumn {
 struct ReturnField {
   // PROJECT: a plugin-typed field, returned as its type projects it from the
   // derived fields' columns (physicalName is the field).
-  enum class Kind { PHYSICAL, SCORE, VERSION, EXTRA, PROJECT };
+  enum class Kind { PHYSICAL, SCORE, SORT, VERSION, EXTRA, PROJECT };
 
   std::string_view outputKey;
   std::string_view physicalName;
@@ -956,8 +958,9 @@ inline void placeBatchColumns(luxir::api::DocFormat placement,
 // `getDoc(i)` and `getScore(i)` are invoked lazily, only for indices in the
 // current batch - no upfront materialization of a parallel array, so callers
 // can wire them directly to whatever layout they have (collector ScoreDoc /
-// SortDoc spans, RRF result vectors, etc.).  `getScore` is only called when
-// `getScores` is true.
+// SortDoc spans, RRF result vectors, etc.).  `getScore` is called when
+// `getScores` is true or the _sort_ field is returned (its score values), so
+// it must stay callable either way.
 //
 // Emission is resumable: each non-final batch goes out via req.reply(), and a
 // PAUSE status (connection over its buffer high-water mark) parks the emitter
@@ -973,6 +976,16 @@ inline void placeBatchColumns(luxir::api::DocFormat placement,
 // bodyDone) decides who sends it.  All but the final response have more=true.
 using DocBatchMetadata = std::function<void(luxir::api::DocList&, int64_t, int64_t,
                                            std::pmr::memory_resource&)>;
+// Writes one returned document's sort values (the synthetic _sort_ field):
+// one value per sort clause. Unset for a list ranked by score, whose sort
+// value is the score.
+using DocSortValues = std::function<void(luxir::api::ArrVal&, segdoc, float,
+                                         std::pmr::memory_resource&)>;
+
+// The _sort_ values under `sort` (CollapseMembers.cpp): emitCollapseRank's,
+// with dates rendered as groups.ranks renders them. The plan and the reader
+// must outlive the emission (the request's do).
+DocSortValues sortValuesUnder(const SortPlan& sort, IndexReader& reader, uint64_t flags);
 
 class DocEmitter {
 public:
@@ -991,6 +1004,7 @@ public:
   int64_t numCollected;
   int64_t totalHits;
   DocBatchMetadata metadata;
+  DocSortValues sortValues;
   std::span<ReturnField> fields;  // resolved selectors
   int32_t maxBatchSize;
   int64_t offset;
@@ -1021,12 +1035,12 @@ public:
                  std::span<ReturnField> fields, int32_t maxBatchSize,
                  int64_t offset, bool emitCount, bool foundGte, bool getScores,
                  luxir::api::DocFormat placement, bool parallel, size_t colCap,
-                 DocBatchMetadata metadata)
+                 DocBatchMetadata metadata, DocSortValues sortValues)
       : req(req), flags(flags), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
         getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
-        metadata(std::move(metadata)), fields(fields), maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount),
-        foundGte(foundGte), getScores(getScores), placement(placement),
-        parallel(parallel), colCap(colCap),
+        metadata(std::move(metadata)), sortValues(std::move(sortValues)), fields(fields),
+        maxBatchSize(maxBatchSize), offset(offset), emitCount(emitCount), foundGte(foundGte),
+        getScores(getScores), placement(placement), parallel(parallel), colCap(colCap),
         batchStart(std::min(offset, numCollected)) {}
 
   void produce() override;
@@ -1212,6 +1226,18 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
         case ReturnField::Kind::SCORE:
           returnScores = true;
           continue;
+        case ReturnField::Kind::SORT: {
+          auto& column = outputColumn().kind.template emplace<luxir::api::ColVal>();
+          luxir::api::Val* values = build::allocArray(column.v, columnSize, mr);
+          for (int i = 0; i < columnSize; i++) {
+            auto& sortValue = values[i].kind.template emplace<luxir::api::ArrVal>();
+            float score = getScore(batchStart + i);
+            if (sortValues) sortValues(sortValue, getDoc(batchStart + i), score, mr);
+            else build::allocArray(sortValue.v, 1, mr)[0].kind = score;
+          }
+          registerColumn();
+          continue;
+        }
         case ReturnField::Kind::VERSION:
           loadVersionRuns(req, segDocs, runs, outputColumn(), pendingLoaders, pendingCols, mr);
           registerColumn();
@@ -1488,6 +1514,10 @@ inline std::span<ReturnField> resolveReturnFields(SearchRequest& req,
       picked.push_back({f, {}, nullptr, ReturnField::Kind::SCORE, false});
       return;
     }
+    if (f == "_sort_") {
+      picked.push_back({f, {}, nullptr, ReturnField::Kind::SORT, false});
+      return;
+    }
     auto source = req.schema->resolveFor(f, OpClass::RETRIEVE);
     const CompositeFieldType* owner = nullptr;
     if (const auto* spec = req.schema->derivedField(f, &owner); spec && spec->opaque) {
@@ -1584,7 +1614,8 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
                       DocEmission emission,
                       DocBatchMetadata metadata = {},
                       bool foundGte = false,
-                      std::span<const ExtraColumn> extraColumns = {})
+                      std::span<const ExtraColumn> extraColumns = {},
+                      DocSortValues sortValues = {})
 {
   int32_t maxBatchSize = batchSize;
   if (emission == DocEmission::FINAL_RESPONSE) {
@@ -1630,7 +1661,7 @@ void emitDocsResponse(SearchRequest& req, uint64_t flags,
       std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
       std::forward<GetScore>(getScore), numCollected, totalHits, rfields,
       maxBatchSize, offset, emitCount, foundGte, getScores, placement,
-      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata));
+      /*parallel=*/req.tg != nullptr, colCap, std::move(metadata), std::move(sortValues));
   req.streamStarted();
   emitter->produce();
 }

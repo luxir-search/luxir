@@ -186,6 +186,8 @@ locations, browse `src/luxir/<area>/`.
      `SearchOpRegistry` (`src/luxir/search/`, the `plugin` SearchOp arm),
      `FieldTypeRegistry` (`src/luxir/schema/`, `FieldDef.plugin_type`) and
      `HttpRouteRegistry` (`src/luxir/server/`); `ParamReader` reads plugin arm params.
+   - `SortKindRegistry` (`src/luxir/search/`): sort clauses whose root is a claimed call,
+     sorted by the plugin's `FieldComparator` (`SortClause::PLUGIN`).
    - See [plugins.md](plugins.md).
 
 ## Data Organization
