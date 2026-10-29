@@ -629,7 +629,7 @@ std::string renderSearchResponseBody(const luxir::api::SearchResponse& resp, boo
   }
   if (resp.took_us != 0) {  // final response only
     appendKey("took_us");
-    appendInt(out, (int64_t)resp.took_us);
+    appendInt<Int64Str>(out, (int64_t)resp.took_us);
   }
   if (resp.error.has_value()) {
     // A failed request carries no op results; warnings declared before the
