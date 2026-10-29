@@ -37,7 +37,11 @@ struct SegFieldInfo {
   enum NormsFormat : uint8_t {
     NORMS_NONE = 0,
     NORMS_FLAT = 1,
-    NORMS_SPARSE = 2
+    NORMS_SPARSE = 2,
+    // Every doc with the field has the same norm byte; only that byte is stored.
+    NORMS_CONSTANT = 3,
+    // Norm bytes bit-packed to 1, 2 or 4 bits per doc (see NormsLayout).
+    NORMS_PACKED = 4
   };
 
   enum OrdFormat : uint8_t {
@@ -87,7 +91,8 @@ struct SegFieldInfo {
   int64_t pointsMetaOff = 0;
 
   // Dedicated text norms column.  The docs-with-field bitset remains in
-  // docsWithFieldEndLoc/docsWithField; this region stores only the raw norm bytes.
+  // docsWithFieldEndLoc/docsWithField; this region stores only the norm bytes,
+  // raw, constant or packed as normsFormat says.
   int32_t normsFormat;
   seg_location normsLoc;
   int64_t normsLen;

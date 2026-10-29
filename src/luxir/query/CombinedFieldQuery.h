@@ -358,7 +358,7 @@ public:
         if (reader->isFlat()) {
           norms[numNorms++] = {.weight = weight, .flat = reader->flatBase()};
         } else {
-          norms[numNorms++] = {.weight = weight, .sparse = targetPool.make<NormsReader::Iterator>(*reader)};
+          norms[numNorms++] = {.weight = weight, .sparse = targetPool.make<NormsReader::Iterator>(*reader, true)};
         }
       }
       if (numPostings == 0) return nullptr;
