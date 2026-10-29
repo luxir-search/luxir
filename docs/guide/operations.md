@@ -603,6 +603,22 @@ Search has its own limits:
 - `search.request-memory-max-bytes` is a per-request breaker for query memory
   such as facet aggregate state; `0` (the default) is unlimited.
 - `search.max-op-depth` bounds how deeply operations may nest in one request.
+- Multi-term expansion (prefix, wildcard, regex, term range, fuzzy) is bounded
+  per request so one pattern on a high-cardinality field cannot hold a core.
+  A request can never raise or disable these limits; `0` here means
+  unlimited. See [Expansion limits](query-reference.md#expansion-limits).
+  - `search.multiterm-max-expansions` (default `65536`): terms one index
+    segment of one query may match before the request is rejected. A prefix
+    query with `max_expansions` keeps only its top terms and is not held to it.
+  - `search.multiterm-max-terms-examined` (default `8388608`): dictionary
+    terms all scans of one request may visit, matching or not. This bounds a
+    zero-hit `*abc*` scan; the default is roughly 100 ms of one core.
+  - `search.multiterm-max-postings` (default `1073741824`): postings all
+    expansions of one request may union.
+  - `search.multiterm-min-prefix-length` (default `1`): an open-ended wildcard
+    or regex with fewer literal leading bytes is costed as a scan of every
+    term under its prefix, and is rejected before scanning when that exceeds
+    the remaining request budget.
 - `multi_match` field lists containing patterns may resolve to at most `64`
   distinct physical targets after resolving search bindings and deduplicating,
   including explicit fields. See [Multi-match](query-reference.md#field-patterns).
