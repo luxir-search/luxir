@@ -226,6 +226,7 @@ blocks.
 | `collections=true` | `totals` and per-collection `collections`: documents, segments, committed bytes, commit time, generations, merges, inverters, retained delete bytes, snapshot pins and drops, query cache, availability. Implied on tenant and collection routes. | Briefly takes each writer's index lock and decodes each reader-only manifest. No file I/O. |
 | `files=true` | `bytes` from an index directory listing; aux index and segment bytes. Implies `collections`. | Lists every index directory. |
 | `segments=true` | Per-segment records. Implies `files`. | Iterates segments. |
+| `field_bytes=true` | Per-field storage accounting; see [Per-field storage](#per-field-storage). Implies `files`. | Reads every segment's field directory and a few headers per field. |
 | `system=true` | `system`: this process, the data filesystem and the process's cgroup v2. Node scope only. | About 15 procfs/cgroupfs reads and a scan of `/proc/self/fd`. |
 | `host=true` | `host`: host-wide CPU, memory, network, TCP, disk and pressure statistics, which node_exporter also reports. Node scope only. | About 10 procfs reads. |
 | `format=prometheus` | Text exposition instead of JSON (`text/plain; version=0.0.4`). | Rendering only. |
@@ -315,6 +316,45 @@ are the sortable strings embedded in filenames (segment `s0a` with `live_gen`
 and an absent field means none. `schema_gen`, `index_gen`, `core_gen`, and
 `update_version` are numeric. The schema and its history are embedded in each
 `commit_<index_gen>` manifest.
+
+### Per-field storage
+
+`?field_bytes=true` (`StatsRequest.field_bytes`) adds `field_bytes` to each
+index: one entry per physical field, summed over the segments of the current
+search snapshot and sorted largest first, so storage work can be ranked by
+what it would actually save. Segments the writer has not published yet are not
+counted. Each entry has the field's `type`, the number of `segments` that hold
+it, its total `bytes`, and the bytes of each structure:
+
+| Field | Structure |
+| --- | --- |
+| `terms_bytes` | Term blocks, with per-term metadata and impact frontiers |
+| `term_index_bytes` | Term trie, block offset table, and range table |
+| `postings_bytes` | Doc ids, freqs, and block skip/impact headers |
+| `positions_bytes` | Positions |
+| `norms_bytes` | Text norms |
+| `docs_with_field_bytes` | Presence bitset of a field some docs lack |
+| `column_bytes` | Int, ord, or str column values and their metadata |
+| `column_index_bytes` | Rank, offset, and value-to-doc side columns |
+| `points_bytes` | 1-D points leaves and inner nodes |
+| `stored_bytes` | A stored-fields resource (the entry's field is the resource) |
+| `vector_bytes` | Vector column rows |
+| `vector_index_bytes` | ANN overlay files for the field |
+
+Header counts come with it: `docs` with a value, column `values`, `terms`,
+`postings` (sum of doc freqs), and `positions` (sum of term freqs). They are
+summed per segment and include deleted docs, so `terms` is not a distinct
+count. The index's `unattributed_bytes` holds what no field owns: file
+headers, the field directory, segment info, and gaps between structures. With
+no deletes or overlays, field `bytes` plus `unattributed_bytes` equals the sum
+of the segments' `bytes`.
+
+The split comes from each segment's field directory, which records where every
+structure starts; a structure runs to the next recorded boundary in its file,
+so alignment padding after it counts toward it. Freqs and skip data are
+interleaved with doc ids, so they are reported together under
+`postings_bytes`. The request reads every segment's field directory and a few
+headers per field, but decodes no postings or column data.
 
 ### Prometheus scraping
 

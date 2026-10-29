@@ -1490,6 +1490,11 @@ message StatsRequest {
   // statistics from procfs (Linux only), which node_exporter also reports.
   // Inside a container most of them describe the host, not the container.
   bool host = 8;
+  // Add per-field storage accounting (IndexStats.field_bytes) for the
+  // segments of the current search snapshot. Reads every segment's field
+  // directory and a few headers per field; decodes no data. Implies `files`
+  // (ANN overlay files are charged to their fields).
+  bool field_bytes = 14;
 }
 
 message StatsResponse {
@@ -1984,6 +1989,42 @@ message IndexStats {
   // catch-up, deduplicated across owners. Included in the node indexing
   // reservation.
   uint64 retained_delete_bytes = 19;
+  // Set by StatsRequest.field_bytes: bytes per field and structure, summed
+  // over the segments of the current search snapshot, largest field first.
+  repeated FieldBytesStats field_bytes = 24;
+  // Segment bytes no field owns: file headers, the field directory, segment
+  // info and gaps between structures. With field_bytes, the two sum to the
+  // segment data files of the snapshot.
+  uint64 unattributed_bytes = 25;
+}
+
+// Storage one field uses across the segments of a snapshot. Structure starts
+// come from each segment's field directory; a structure runs to the next
+// recorded boundary in its file, so alignment padding after it is counted in
+// it. Counts are summed per segment and include deleted docs, so terms is not
+// the number of distinct terms.
+message FieldBytesStats {
+  string field = 1;  // physical field name
+  string type = 2;   // physical type (string, text, int, vector, bin, ...)
+  uint32 segments = 3;
+  uint64 bytes = 4;  // sum of the structure bytes below
+  uint64 terms_bytes = 5;          // term blocks, with per-term metadata and impact frontiers
+  uint64 term_index_bytes = 6;     // term trie, block offset table and range table
+  uint64 postings_bytes = 7;       // doc ids, freqs and block skip/impact headers
+  uint64 positions_bytes = 8;
+  uint64 norms_bytes = 9;
+  uint64 docs_with_field_bytes = 10; // presence bitsets of sparse fields
+  uint64 column_bytes = 11;        // int, ord or str column values and their metadata
+  uint64 column_index_bytes = 12;  // monotonic rank, offset and value-to-doc side columns
+  uint64 points_bytes = 13;        // 1-D points leaves and inner nodes
+  uint64 stored_bytes = 14;        // stored-fields resource (the field is the resource)
+  uint64 vector_bytes = 15;        // vector column rows
+  uint64 vector_index_bytes = 16;  // ANN overlay files (segment overlays naming the field)
+  uint64 docs = 17;      // docs with a value
+  uint64 values = 18;    // column values
+  uint64 terms = 19;
+  uint64 postings = 20;  // sum of doc freqs
+  uint64 positions = 21; // sum of term freqs, for fields with positions
 }
 
 // Ids and generations that appear in filenames are reported in their

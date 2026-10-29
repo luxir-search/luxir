@@ -740,6 +740,76 @@ TEST_F(HttpApiTest, statsSegmentsAfterCommit) {
   EXPECT_FALSE((*segments)[0].contains("live_gen"));
 }
 
+TEST_F(HttpApiTest, statsFieldBytes) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"fb-1","title_w":"alpha beta gamma","year_i":2001},)"
+      R"({"id":"fb-2","title_w":"beta"},{"id":"fb-3","title_w":"gamma delta","year_i":2003}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  auto indexOf = [](glz::generic_i64& root) -> glz::generic_i64* {
+    auto* collections = root["collections"].get_if<glz::generic_i64::array_t>();
+    if (collections == nullptr || collections->size() != 1) return nullptr;
+    auto* shards = (*collections)[0]["shards"].get_if<glz::generic_i64::array_t>();
+    return shards != nullptr && shards->size() == 1 ? &(*shards)[0]["index"] : nullptr;
+  };
+  auto num = [](glz::generic_i64& obj, const char* key) -> int64_t {
+    if (!obj.contains(key)) return 0;
+    auto* value = obj[key].get_if<int64_t>();
+    return value ? *value : 0;
+  };
+
+  auto response = httpRequest(port(), http::verb::get,
+                              "/collections/main/_stats?field_bytes=true&segments=true");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  glz::generic_i64 root;
+  ASSERT_FALSE(glz::read_json(root, response.body())) << response.body();
+  auto* index = indexOf(root);
+  ASSERT_NE(nullptr, index) << response.body();
+
+  auto* fields = (*index)["field_bytes"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, fields) << response.body();
+  int64_t attributed = 0;
+  glz::generic_i64* title = nullptr;
+  glz::generic_i64* year = nullptr;
+  for (auto& field : *fields) {
+    attributed += num(field, "bytes");
+    auto* name = field["field"].get_if<std::string>();
+    auto* type = field["type"].get_if<std::string>();
+    ASSERT_TRUE(name != nullptr && type != nullptr) << response.body();
+    if (title == nullptr && name->starts_with("title_w") && *type == "text") title = &field;
+    if (year == nullptr && name->starts_with("year_i") && num(field, "column_bytes") > 0) year = &field;
+  }
+  ASSERT_NE(nullptr, title) << response.body();
+  ASSERT_NE(nullptr, year) << response.body();
+  EXPECT_EQ(3, num(*title, "docs"));
+  EXPECT_EQ(4, num(*title, "terms"));
+  EXPECT_EQ(6, num(*title, "positions"));
+  for (const char* kind : {"terms_bytes", "postings_bytes", "positions_bytes", "norms_bytes"}) {
+    EXPECT_GT(num(*title, kind), 0) << kind;
+  }
+  EXPECT_EQ(2, num(*year, "docs"));
+  EXPECT_GT(num(*year, "docs_with_field_bytes"), 0);
+
+  // Field and unattributed bytes partition the segment files (no deletes or
+  // overlays here).
+  int64_t segmentBytes = 0;
+  auto* segments = (*index)["segments"].get_if<glz::generic_i64::array_t>();
+  ASSERT_NE(nullptr, segments);
+  for (auto& segment : *segments) segmentBytes += num(segment, "bytes");
+  EXPECT_GT(num(*index, "unattributed_bytes"), 0);
+  EXPECT_EQ(segmentBytes, attributed + num(*index, "unattributed_bytes"));
+
+  // Segment records are gathered for overlays but only returned on request.
+  auto plain = httpRequest(port(), http::verb::get, "/collections/main/_stats?field_bytes=true");
+  ASSERT_EQ(200, plain.result_int()) << plain.body();
+  glz::generic_i64 plainRoot;
+  ASSERT_FALSE(glz::read_json(plainRoot, plain.body())) << plain.body();
+  auto* plainIndex = indexOf(plainRoot);
+  ASSERT_NE(nullptr, plainIndex);
+  EXPECT_TRUE(plainIndex->contains("field_bytes"));
+  EXPECT_FALSE(plainIndex->contains("segments"));
+}
+
 TEST_F(HttpApiTest, statsRoutingErrors) {
   auto missing =
       httpRequest(port(), http::verb::get, "/collections/http_missing_stats/_stats");

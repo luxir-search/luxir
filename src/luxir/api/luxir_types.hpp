@@ -85,7 +85,7 @@ struct SchemaRequest; struct SchemaResponse;
 struct CreateCollectionRequest; struct CreateCollectionResponse;
 struct DeleteCollectionRequest; struct DeleteCollectionResponse; struct ListCollectionsResponse; struct ListTenantsResponse;
 struct StatsRequest; struct StatsResponse; struct StatsTotals; struct CollectionStats;
-struct ShardStats; struct IndexStats; struct SegmentStats; struct AuxStats;
+struct ShardStats; struct IndexStats; struct SegmentStats; struct FieldBytesStats; struct AuxStats;
 struct QueryCacheStats; struct IndexRamStats; struct ArenaStats; struct JemallocStats; struct FieldMetadataStats; struct MemoryStats; struct ScrubStats;
 struct HistogramStats; struct ActivityStats; struct TransportStats; struct ServiceStats; struct SystemStats;
 struct HostStats; struct OutcomeStats; struct CollectionActivityStats; struct ProcessIoStats;
@@ -401,6 +401,29 @@ struct StatsTotals {
   std::optional<uint64_t> bytes;
   uint64_t committed_bytes = 0;
 };
+struct FieldBytesStats {
+  std::string_view field;
+  std::string_view type;
+  uint32_t segments = 0;
+  uint64_t bytes = 0;
+  uint64_t terms_bytes = 0;
+  uint64_t term_index_bytes = 0;
+  uint64_t postings_bytes = 0;
+  uint64_t positions_bytes = 0;
+  uint64_t norms_bytes = 0;
+  uint64_t docs_with_field_bytes = 0;
+  uint64_t column_bytes = 0;
+  uint64_t column_index_bytes = 0;
+  uint64_t points_bytes = 0;
+  uint64_t stored_bytes = 0;
+  uint64_t vector_bytes = 0;
+  uint64_t vector_index_bytes = 0;
+  uint64_t docs = 0;
+  uint64_t values = 0;
+  uint64_t terms = 0;
+  uint64_t postings = 0;
+  uint64_t positions = 0;
+};
 struct SegmentStats {
   std::string_view seg;
   std::string_view live_gen;
@@ -429,6 +452,7 @@ struct IndexStats {
   uint64_t pin_retained_bytes = 0;
   uint64_t pin_idle_drops = 0;
   uint64_t pin_budget_drops = 0;
+  uint64_t unattributed_bytes = 0;
   uint64_t inverters_busy = 0;
   uint64_t inverters_idle = 0;
   uint64_t inverters_flushing = 0;
@@ -437,6 +461,7 @@ struct IndexStats {
   std::span<const AuxStats> aux_indexes;
   QueryCacheStats query_cache;
   std::span<const SegmentStats> segments;
+  std::span<const FieldBytesStats> field_bytes;
 };
 struct ShardStats {
   IndexStats index;
@@ -473,6 +498,7 @@ struct StatsRequest {
   bool files = false;
   bool system = false;
   bool host = false;
+  bool field_bytes = false;
 };
 struct FollowerStatus {
   std::string_view follower;
@@ -1206,7 +1232,7 @@ LUXIR_TD(KnnQuery_::Ivf)
 LUXIR_TD(CreateCollectionRequest) LUXIR_TD(CreateCollectionResponse)
 LUXIR_TD(DeleteCollectionRequest) LUXIR_TD(DeleteCollectionResponse) LUXIR_TD(ListCollectionsResponse)
 LUXIR_TD(ReplicationStatus) LUXIR_TD(ReplicationCollectionStatus) LUXIR_TD(FollowerStatus) LUXIR_TD(StatsRequest) LUXIR_TD(StatsResponse) LUXIR_TD(OutcomeStats) LUXIR_TD(CollectionActivityStats) LUXIR_TD(StatsTotals) LUXIR_TD(CollectionStats)
-LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(AuxStats)
+LUXIR_TD(ShardStats) LUXIR_TD(IndexStats) LUXIR_TD(SegmentStats) LUXIR_TD(FieldBytesStats) LUXIR_TD(AuxStats)
 LUXIR_TD(QueryCacheStats) LUXIR_TD(StorageRamStats) LUXIR_TD(IndexRamStats) LUXIR_TD(ArenaStats)
 LUXIR_TD(JemallocStats) LUXIR_TD(FieldMetadataStats) LUXIR_TD(MemoryStats) LUXIR_TD(ScrubStats)
 LUXIR_TD(HistogramStats) LUXIR_TD(ActivityStats) LUXIR_TD(TransportStats) LUXIR_TD(ServiceStats) LUXIR_TD(HostStats) LUXIR_TD(SystemStats) LUXIR_TD(ProcessIoStats) LUXIR_TD(ProcessStats) LUXIR_TD(CpuTimes) LUXIR_TD(HostCpuStats) LUXIR_TD(HostMemoryStats) LUXIR_TD(NetworkInterfaceStats) LUXIR_TD(TcpStats) LUXIR_TD(DiskStats) LUXIR_TD(FilesystemStats) LUXIR_TD(PressureStats) LUXIR_TD(CgroupStats) LUXIR_TD(CgroupMemoryStats) LUXIR_TD(CgroupCpuStats) LUXIR_TD(CgroupTaskStats)
@@ -1256,7 +1282,7 @@ LUXIR_ENTRY(ListCollectionsResponse)
 LUXIR_ENTRY(ListTenantsResponse)
 LUXIR_ENTRY(ReplicationStatus) LUXIR_ENTRY(ReplicationCollectionStatus) LUXIR_ENTRY(FollowerStatus) LUXIR_ENTRY(StatsRequest) LUXIR_ENTRY(StatsResponse) LUXIR_ENTRY(OutcomeStats) LUXIR_ENTRY(CollectionActivityStats) LUXIR_ENTRY(StatsTotals)
 LUXIR_ENTRY(CollectionStats) LUXIR_ENTRY(ShardStats) LUXIR_ENTRY(IndexStats)
-LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
+LUXIR_ENTRY(SegmentStats) LUXIR_ENTRY(FieldBytesStats) LUXIR_ENTRY(AuxStats) LUXIR_ENTRY(QueryCacheStats)
 LUXIR_ENTRY(StorageRamStats) LUXIR_ENTRY(IndexRamStats) LUXIR_ENTRY(ArenaStats)
 LUXIR_ENTRY(JemallocStats) LUXIR_ENTRY(FieldMetadataStats) LUXIR_ENTRY(MemoryStats) LUXIR_ENTRY(ScrubStats)
 LUXIR_ENTRY(HistogramStats) LUXIR_ENTRY(ActivityStats) LUXIR_ENTRY(TransportStats) LUXIR_ENTRY(ServiceStats) LUXIR_ENTRY(HostStats) LUXIR_ENTRY(SystemStats) LUXIR_ENTRY(ProcessIoStats) LUXIR_ENTRY(ProcessStats) LUXIR_ENTRY(CpuTimes) LUXIR_ENTRY(HostCpuStats) LUXIR_ENTRY(HostMemoryStats) LUXIR_ENTRY(NetworkInterfaceStats) LUXIR_ENTRY(TcpStats) LUXIR_ENTRY(DiskStats) LUXIR_ENTRY(FilesystemStats) LUXIR_ENTRY(PressureStats) LUXIR_ENTRY(CgroupStats) LUXIR_ENTRY(CgroupMemoryStats) LUXIR_ENTRY(CgroupCpuStats) LUXIR_ENTRY(CgroupTaskStats)
