@@ -369,6 +369,7 @@ struct VectorAnnConfig {
   enum Codec {
     RABITQ = 0,
     PQ = 1,
+    PQ4 = 2,   // 4-bit PQ scanned with SIMD register lookups (IP / cosine)
   };
   static constexpr int32_t DEFAULT_RABITQ_BITS = 1;
   static constexpr int32_t DEFAULT_RABITQ_QUERY_BITS = 4;

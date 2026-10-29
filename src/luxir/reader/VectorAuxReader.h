@@ -5,6 +5,7 @@
 
 #include <faiss/Index.h>
 #include <faiss/IndexIVF.h>
+#include <faiss/IndexIVFPQ.h>
 #include <faiss/IndexIVFRaBitQ.h>
 #include <faiss/IndexPreTransform.h>
 #include <faiss/VectorTransform.h>
@@ -49,8 +50,8 @@ struct VectorAuxMeta {
   int32_t cosineNormalizeColumnOnRescore = 0;  // bool: raw cosine column, renorm at rescore
   int32_t engine = 0;       // ENGINE_IVFPQ or ENGINE_IVFRABITQ: the overlay's codec
   int32_t nlist = 0;
-  int32_t pqM = 0;          // ENGINE_IVFPQ only
-  int32_t pqBits = 0;       // ENGINE_IVFPQ only
+  int32_t pqM = 0;          // ENGINE_IVFPQ / ENGINE_IVFPQ4FS only
+  int32_t pqBits = 0;       // ENGINE_IVFPQ / ENGINE_IVFPQ4FS only (4 for the latter)
   int32_t rabitqBits = 0;   // ENGINE_IVFRABITQ only: bits per dimension
 
   // IVF + product quantization; the FAISS header is a bare IndexIVFPQ.
@@ -59,6 +60,12 @@ struct VectorAuxMeta {
   // IndexIVFRaBitQ).  The IVF index lives in the rotated space, so queries
   // are rotated before coarse assignment and list scans.
   static constexpr int32_t ENGINE_IVFRABITQ = 2;
+  // IVF + 4-bit PQ whose list codes are stored block-packed for the SIMD
+  // fast-scan kernels (VectorAuxListsFooter packed layout); the FAISS header
+  // is a bare 4-bit IndexIVFPQ.  Inner product and cosine only.
+  static constexpr int32_t ENGINE_IVFPQ4FS = 3;
+
+  bool isPq4() const noexcept { return engine == ENGINE_IVFPQ4FS; }
 
   std::string toBytes() const {
     return std::string((const char*)this, sizeof(VectorAuxMeta));
@@ -73,7 +80,8 @@ struct VectorAuxMeta {
     }
     VectorAuxMeta meta;
     std::memcpy(&meta, bytes.data(), sizeof(VectorAuxMeta));
-    if (meta.engine != ENGINE_IVFPQ && meta.engine != ENGINE_IVFRABITQ) {
+    if (meta.engine != ENGINE_IVFPQ && meta.engine != ENGINE_IVFRABITQ
+        && meta.engine != ENGINE_IVFPQ4FS) {
       // (int32_t) copies: can't bind a reference to a packed field.
       throw std::runtime_error(std::format(
         "VectorAuxMeta: aux '{}' has unsupported vector engine {}",
@@ -149,7 +157,11 @@ internVectorRotation(std::unique_ptr<faiss::LinearTransform> rotation) {
 ///   [0, H)    FAISS index blob (faiss::write_index with lists swapped empty)
 ///   [H8, S)   per-list sizes, int64[nlist]           (H8 = H padded to 8)
 ///   [S, I)    ids, int64[ntotal], concatenated in list order (8-aligned)
-///   [I, C)    codes, uint8[ntotal * codeSize], same order
+///   [I64, C)  codes (I64 = I padded to 64), same list order, codesBytes long:
+///             flat engines store uint8[ntotal * codeSize]; ENGINE_IVFPQ4FS
+///             stores each list block-packed for the fast-scan kernels
+///             (packedListBytes per list, lists of 32-code blocks, tail
+///             lanes zero), so a list's blocks start at a 64-aligned offset
 ///   [.., end) this footer (8-aligned)
 ///
 /// Native endianness, same contract as VectorAuxMeta: aux files are rebuilt
@@ -160,23 +172,33 @@ struct VectorAuxListsFooter {
   int64_t nlist = 0;
   int64_t codeSize = 0;
   int64_t ntotal = 0;
+  int64_t codesBytes = 0;
   int32_t version = 0;
   int32_t magic = 0;
 
   static constexpr int32_t MAGIC = 0x4C495853;  // "SXIL"
-  static constexpr int32_t VERSION = 1;
+  static constexpr int32_t VERSION = 2;
+  static constexpr size_t PACK_BLOCK = 32;  // codes per fast-scan block
 
   static constexpr size_t align8(size_t n) noexcept { return (n + 7) & ~(size_t)7; }
+  static constexpr size_t align64(size_t n) noexcept { return (n + 63) & ~(size_t)63; }
+
+  /// Sub-quantizer count the fast-scan kernels run over: M rounded up to even.
+  static constexpr size_t packedNsq(size_t m) noexcept { return (m + 1) & ~(size_t)1; }
+  /// Bytes of one block-packed list of n codes with m sub-quantizers.
+  static constexpr size_t packedListBytes(size_t n, size_t m) noexcept {
+    return (n + PACK_BLOCK - 1) / PACK_BLOCK * PACK_BLOCK * packedNsq(m) / 2;
+  }
 
   /// Section offsets within the file, derived from the footer fields.
   size_t sizesOffset() const noexcept { return align8((size_t)faissHeaderBytes); }
   size_t idsOffset() const noexcept { return sizesOffset() + (size_t)nlist * 8; }
-  size_t codesOffset() const noexcept { return idsOffset() + (size_t)ntotal * 8; }
+  size_t codesOffset() const noexcept { return align64(idsOffset() + (size_t)ntotal * 8); }
   size_t expectedFileBytes() const noexcept {
     // Unsigned multiply: ntotal/codeSize are file-controlled (read from the
     // footer before validation), so a corrupt footer could overflow a signed
     // int64 product (UB) inside the very check meant to reject it.
-    return align8(codesOffset() + (uint64_t)ntotal * (uint64_t)codeSize) + sizeof(VectorAuxListsFooter);
+    return align8(codesOffset() + (uint64_t)codesBytes) + sizeof(VectorAuxListsFooter);
   }
 
   /// Decode + validate the footer at the tail of a fileBytes-long file.
@@ -209,6 +231,7 @@ struct VectorAuxListsFooter {
         || (uint64_t)f.nlist > fileBytes / 8
         || (uint64_t)f.ntotal > fileBytes / 8
         || (uint64_t)f.ntotal > fileBytes / (uint64_t)f.codeSize
+        || f.codesBytes < 0 || (uint64_t)f.codesBytes > fileBytes
         || f.expectedFileBytes() != fileBytes) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' lists footer does not match file size {}",
@@ -218,7 +241,7 @@ struct VectorAuxListsFooter {
   }
 } LUXIR_UNALIGNED_END;
 
-static_assert(sizeof(VectorAuxListsFooter) == 4 * sizeof(int64_t) + 2 * sizeof(int32_t),
+static_assert(sizeof(VectorAuxListsFooter) == 5 * sizeof(int64_t) + 2 * sizeof(int32_t),
               "VectorAuxListsFooter layout is an on-disk contract");
 
 /// Read-only faiss::InvertedLists serving codes + ids directly out of the aux
@@ -231,16 +254,36 @@ class MmapInvertedLists final : public faiss::ReadOnlyInvertedLists {
   const faiss::idx_t* ids;      // all lists' ids, concatenated in list order
   const uint8_t* codes;         // all lists' codes, same order
   std::vector<size_t> offsets;  // prefix sums of list sizes, nlist+1 entries
+  // Block-packed (fast-scan) lists only: byte offsets of each list's blocks,
+  // nlist+1 entries.  Empty for flat lists.  get_codes() on packed lists
+  // returns the packed blocks, which FAISS's flat scanners cannot read.
+  std::vector<size_t> packedOffsets;
 
 public:
+  /// packedM > 0 marks block-packed lists of packedM sub-quantizers.
   MmapInvertedLists(size_t nlist, size_t codeSize, const int64_t* listSizes,
-                    const faiss::idx_t* ids, const uint8_t* codes)
+                    const faiss::idx_t* ids, const uint8_t* codes, size_t packedM = 0)
     : faiss::ReadOnlyInvertedLists(nlist, codeSize), ids(ids), codes(codes) {
     offsets.resize(nlist + 1);
     offsets[0] = 0;
-    for (size_t i = 0; i < nlist; i++) {
-      offsets[i + 1] = offsets[i] + (size_t)listSizes[i];
+    if (packedM > 0) {
+      packedOffsets.resize(nlist + 1);
+      packedOffsets[0] = 0;
     }
+    for (size_t i = 0; i < nlist; i++) {
+      if (listSizes[i] < 0) throw std::runtime_error("MmapInvertedLists: negative list size");
+      offsets[i + 1] = offsets[i] + (size_t)listSizes[i];
+      if (packedM > 0) {
+        packedOffsets[i + 1] = packedOffsets[i]
+          + VectorAuxListsFooter::packedListBytes((size_t)listSizes[i], packedM);
+      }
+    }
+  }
+
+  bool isPacked() const noexcept { return !packedOffsets.empty(); }
+  /// Total bytes of the codes section implied by the list sizes.
+  size_t codesBytes() const noexcept {
+    return isPacked() ? packedOffsets.back() : offsets.back() * code_size;
   }
 
   size_t totalSize() const noexcept { return offsets.back(); }
@@ -249,7 +292,7 @@ public:
     return offsets[listNo + 1] - offsets[listNo];
   }
   const uint8_t* get_codes(size_t listNo) const override {
-    return codes + offsets[listNo] * code_size;
+    return codes + (isPacked() ? packedOffsets[listNo] : offsets[listNo] * code_size);
   }
   const faiss::idx_t* get_ids(size_t listNo) const override {
     return ids + offsets[listNo];
@@ -330,6 +373,7 @@ public:
   }
   int32_t getEngine() const noexcept { return meta.engine; }
   bool isRaBitQ() const noexcept { return meta.engine == VectorAuxMeta::ENGINE_IVFRABITQ; }
+  bool isPq4() const noexcept { return meta.isPq4(); }
   int32_t getNList() const noexcept { return meta.nlist; }
   int32_t getPqM() const noexcept { return meta.pqM; }
   int32_t getPqBits() const noexcept { return meta.pqBits; }
@@ -397,6 +441,14 @@ public:
         throw std::runtime_error(std::format(
           "VectorAuxReader: aux '{}' header is not an IVF index", name));
       }
+      if (isPq4()) {
+        auto* ivfpq = dynamic_cast<faiss::IndexIVFPQ*>(ivf);
+        if (ivfpq == nullptr || ivfpq->pq.nbits != 4 || ivfpq->pq.M != (size_t)meta.pqM
+            || !ivfpq->by_residual || ivf->metric_type != faiss::METRIC_INNER_PRODUCT) {
+          throw std::runtime_error(std::format(
+            "VectorAuxReader: aux '{}' header is not a residual 4-bit inner-product IVF+PQ index", name));
+        }
+      }
       if (ivf->nlist != (size_t)meta.nlist) {
         throw std::runtime_error(std::format(
           "VectorAuxReader: nlist mismatch for aux '{}': index has {}, opaque_meta says {}",
@@ -428,7 +480,13 @@ public:
       const uint8_t* listCodes = (const uint8_t*)(base + footer.codesOffset());
       assert(((uintptr_t)sizes % 8) == 0 && ((uintptr_t)listIds % 8) == 0);
       auto lists = std::make_unique<MmapInvertedLists>(
-        (size_t)footer.nlist, (size_t)footer.codeSize, sizes, listIds, listCodes);
+        (size_t)footer.nlist, (size_t)footer.codeSize, sizes, listIds, listCodes,
+        isPq4() ? (size_t)meta.pqM : 0);
+      if (lists->codesBytes() != (size_t)footer.codesBytes) {
+        throw std::runtime_error(std::format(
+          "VectorAuxReader: aux '{}' codes section is {} bytes, list sizes imply {}",
+          name, (int64_t)footer.codesBytes, lists->codesBytes()));
+      }
       if ((int64_t)lists->totalSize() != footer.ntotal) {
         throw std::runtime_error(std::format(
           "VectorAuxReader: aux '{}' list sizes sum to {}, expected ntotal {}",

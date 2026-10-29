@@ -9,6 +9,7 @@
 #include <faiss/Clustering.h>
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
+#include <faiss/impl/fast_scan/fast_scan.h>
 #include <faiss/IndexIVFRaBitQ.h>
 #include <faiss/IndexPreTransform.h>
 #include <faiss/MetricType.h>
@@ -86,7 +87,7 @@ int32_t chooseIvfNList(int32_t configured, int64_t ntotal) {
   return defaultIvfNList(ntotal);
 }
 
-int32_t choosePqM(int32_t configured, int32_t dims, faiss::MetricType metric) {
+int32_t choosePqM(int32_t configured, int32_t dims, faiss::MetricType metric, bool pq4 = false) {
   if (configured > 0) {
     // The schema validates authored settings; keep this check for
     // programmatically constructed field types too.
@@ -100,7 +101,10 @@ int32_t choosePqM(int32_t configured, int32_t dims, faiss::MetricType metric) {
   // IP (including cosine) builds lookup tables per query, so grow code bytes
   // with dims. L2 + by_residual recomputes nlist * M * 256 floats at open
   // and keeps them resident at 8 bits; retain its cap to bound that table.
+  // 4-bit codes carry half the bits per sub-quantizer, so pq4 doubles the cap
+  // to keep the same code bytes and recall as the 8-bit default.
   int32_t cap = metric == faiss::METRIC_INNER_PRODUCT ? std::max(32, dims / 8) : 32;
+  if (pq4) cap *= 2;
   int32_t maxM = std::min(cap, dims);
   for (int32_t m = maxM; m >= 1; m--) {
     if (dims % m == 0 && dims / m >= 4) return m;
@@ -389,7 +393,12 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   int32_t dims = ft.storedDims();
   faiss::MetricType metric = toFaissMetric(ft.metric_);
   bool rabitq = ann.codec == VectorAnnConfig::RABITQ;
-  const char* codecName = rabitq ? "IVF+RaBitQ" : "IVF+PQ";
+  bool pq4 = ann.codec == VectorAnnConfig::PQ4;
+  const char* codecName = rabitq ? "IVF+RaBitQ" : pq4 ? "IVF+PQ4" : "IVF+PQ";
+  if (pq4 && metric != faiss::METRIC_INNER_PRODUCT) {
+    throw std::runtime_error(fmt::format(
+      "VectorIndexBuilder: codec pq4 supports only inner product and cosine (field {})", fieldName));
+  }
   int64_t ntotal = 0;
 
   forEachVectorSegment(segments_, fieldName, dims,
@@ -412,7 +421,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
   if (rabitq) {
     requiredTraining = std::max<int64_t>(ivfRaBitQMinTrainingVectors, nlist);
   } else {
-    pqBits = std::clamp(ann.pqBits, 1, 8);
+    pqBits = pq4 ? 4 : std::clamp(ann.pqBits, 1, 8);
     int64_t pqTrainingFloor = MIN_TRAINING_POINTS_PER_CENTROID * ((int64_t)1 << pqBits);
     requiredTraining = std::max<int64_t>(
         std::max<int64_t>(ivfPqMinTrainingVectors, nlist), pqTrainingFloor);
@@ -430,7 +439,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
               fieldName, scanCost, ivfBuildThresholdScanCost);
     return std::nullopt;
   }
-  if (!rabitq) pqM = choosePqM(ann.pqM, dims, metric);
+  if (!rabitq) pqM = choosePqM(ann.pqM, dims, metric, pq4);
 
   size_t bytesPerVec = (size_t)dims * sizeof(float);
   int64_t byteCap = bytesPerVec == 0 ? 0 : (int64_t)(ivfTrainingSampleBytes / bytesPerVec);
@@ -608,11 +617,28 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
       faiss::InvertedLists::ScopedIds ids(&lists, i);
       os.write(ids.get(), sz * sizeof(faiss::idx_t));
     }
+    // 64-aligned so block-packed lists start on a cache line (the offset is
+    // within the file, whose mmap base is page-aligned).
+    os.align(64);
+    int64_t codesBytes = 0;
+    std::vector<uint8_t> packed;
     for (size_t i = 0; i < lists.nlist; i++) {
       size_t sz = lists.list_size(i);
       if (sz == 0) continue;
       faiss::InvertedLists::ScopedCodes codes(&lists, i);
-      os.write(codes.get(), sz * lists.code_size);
+      if (!pq4) {
+        os.write(codes.get(), sz * lists.code_size);
+        codesBytes += (int64_t)(sz * lists.code_size);
+        continue;
+      }
+      size_t bytes = VectorAuxListsFooter::packedListBytes(sz, (size_t)pqM);
+      packed.assign(bytes, 0);
+      size_t nb = (sz + VectorAuxListsFooter::PACK_BLOCK - 1) / VectorAuxListsFooter::PACK_BLOCK
+        * VectorAuxListsFooter::PACK_BLOCK;
+      faiss::pq4_pack_codes(codes.get(), sz, (size_t)pqM, nb, VectorAuxListsFooter::PACK_BLOCK,
+                            VectorAuxListsFooter::packedNsq((size_t)pqM), packed.data());
+      os.write(packed.data(), bytes);
+      codesBytes += (int64_t)bytes;
     }
     os.align(8);
     VectorAuxListsFooter footer;
@@ -620,6 +646,7 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     footer.nlist = (int64_t)lists.nlist;
     footer.codeSize = (int64_t)lists.code_size;
     footer.ntotal = ntotal;
+    footer.codesBytes = codesBytes;
     footer.version = VectorAuxListsFooter::VERSION;
     footer.magic = VectorAuxListsFooter::MAGIC;
     os.write(&footer, sizeof(footer));
@@ -639,7 +666,8 @@ VectorIndexBuilder::buildIvfField(std::string_view fieldName,
     meta.dims = dims;
     meta.metric = (int32_t)ft.metric_;
     meta.cosineNormalizeColumnOnRescore = shouldNormalizeForFaiss(ft) ? 1 : 0;
-    meta.engine = rabitq ? VectorAuxMeta::ENGINE_IVFRABITQ : VectorAuxMeta::ENGINE_IVFPQ;
+    meta.engine = rabitq ? VectorAuxMeta::ENGINE_IVFRABITQ
+                : pq4 ? VectorAuxMeta::ENGINE_IVFPQ4FS : VectorAuxMeta::ENGINE_IVFPQ;
     meta.nlist = nlist;
     meta.pqM = pqM;
     meta.pqBits = pqBits;

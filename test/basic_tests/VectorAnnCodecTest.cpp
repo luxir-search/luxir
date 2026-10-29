@@ -20,6 +20,7 @@
 #include "luxir/index/VectorIndexBuilder.h"
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/schema/Schema.h"
+#include "luxir/query/Pq4Scan.h"
 #include "luxir/server/LuxirNode.h"
 #include "luxir/util/random.h"
 #include "test/CollectionHelper.h"
@@ -456,4 +457,99 @@ TEST_F(VectorAnnCodecTest, negativeEstimateCannotEvictExactColumnWitness) {
     EXPECT_EQ(boundedKnn(h, q, groups, false, {}, parallel), (std::vector<ScoredId>{{"exact", 1}}));
     EXPECT_EQ(boundedKnn(h, q, groups, false, 0.01f, parallel), boundedKnn(h, q, groups, true, 0.01f));
   }
+}
+
+// The fast-scan estimate of every code in every list must track the exact PQ
+// inner product decoded from the same (block-packed) codes, to within the
+// uint8 table's rounding.
+TEST_F(VectorAnnCodecTest, pq4ScanTracksDecodedScores) {
+  IvfTestGuard guard;
+  for (int32_t m : {0, 5 * 0 + 16, 3 * 0 + 32}) {
+    SCOPED_TRACE(m);
+    CollectionHelper h("main");
+    h.clear();
+    installAnn(h.collection(), api::VectorMetric::IP, pq4Ann(0, m));
+    indexSegment(h, 0, 2000);
+    std::shared_ptr<IndexReader> reader;
+    auto aux = overlays(h, reader);
+    ASSERT_EQ(aux.size(), 1u);
+    ASSERT_NE(aux[0], nullptr);
+    EXPECT_EQ(aux[0]->getEngine(), VectorAuxMeta::ENGINE_IVFPQ4FS);
+    EXPECT_EQ(aux[0]->getPqBits(), 4);
+    auto* ivf = dynamic_cast<const faiss::IndexIVFPQ*>(aux[0]->getFaissIndex());
+    ASSERT_NE(ivf, nullptr);
+    const auto& pq = ivf->pq;
+    auto q = clustered(1'000'000, 3);
+    Pq4Scanner scanner(pq, q.data());
+    struct Collect {
+      std::vector<std::pair<float, faiss::idx_t>> hits;
+      float threshold() const { return -std::numeric_limits<float>::infinity(); }
+      bool add(float score, faiss::idx_t id) { hits.emplace_back(score, id); return true; }
+    };
+    int64_t seen = 0;
+    float worst = 0;
+    for (size_t list = 0; list < ivf->nlist; list++) {
+      size_t n = ivf->invlists->list_size(list);
+      std::vector<float> centroid(DIMS);
+      ivf->quantizer->reconstruct((faiss::idx_t)list, centroid.data());
+      float coarse = faiss::fvec_inner_product(q.data(), centroid.data(), DIMS);
+      Collect sink;
+      scanner.scanList(ivf->invlists->get_codes(list), n, ivf->invlists->get_ids(list), coarse, nullptr, sink);
+      ASSERT_EQ(sink.hits.size(), n);
+      for (size_t i = 0; i < n; i++) {
+        float exact = coarse;
+        for (size_t sub = 0; sub < pq.M; sub++) {
+          auto code = faiss::pq4_get_packed_element(ivf->invlists->get_codes(list), 32,
+                                                    pq.M, i, sub);
+          exact += faiss::fvec_inner_product(q.data() + sub * pq.dsub, pq.get_centroids(sub, code), pq.dsub);
+        }
+        worst = std::max(worst, std::abs(exact - sink.hits[i].first));
+        seen++;
+      }
+    }
+    EXPECT_EQ(seen, 2000);
+    EXPECT_LT(worst, 0.05f);
+  }
+}
+
+TEST_F(VectorAnnCodecTest, pq4RecallsWithDeletesGroupsAndParallelScan) {
+  IvfTestGuard guard;
+  for (auto metric : {api::VectorMetric::IP, api::VectorMetric::COSINE}) {
+    SCOPED_TRACE((int)metric);
+    CollectionHelper h("main");
+    h.clear();
+    installAnn(h.collection(), metric, pq4Ann());
+    indexSegment(h, 0, 2000);
+    EXPECT_GE(recallVsExact(h, 300), 0.9);
+
+    std::vector<std::string> dels;
+    for (int i = 0; i < 2000; i += 3) dels.push_back("d" + std::to_string(i));
+    h.deleteByIds(dels, UpdateMessage::COMMIT);
+    std::shared_ptr<IndexReader> reader;
+    EXPECT_EQ(overlays(h, reader)[0]->getEngine(), VectorAuxMeta::ENGINE_IVFPQ4FS);
+    EXPECT_GE(recallVsExact(h, 300), 0.9);
+    auto q = clustered(1'000'001, 5);
+    for (int32_t id : {0, 3, 6}) EXPECT_NE(knnIds(h, q, false, 300)[0], "d" + std::to_string(id));
+    for (bool groups : {false, true}) {
+      auto serial = boundedKnn(h, q, groups, false, {}, 1);
+      ASSERT_EQ(serial.size(), 1u);
+      EXPECT_EQ(boundedKnn(h, q, groups, false, {}, -1), serial);
+    }
+  }
+}
+
+TEST_F(VectorAnnCodecTest, pq4MergeRebuildsPackedLists) {
+  IvfTestGuard guard;
+  CollectionHelper h("main");
+  installAnn(h.collection(), api::VectorMetric::COSINE, pq4Ann());
+  indexSegment(h, 0, 1000);
+  indexSegment(h, 1000, 1000);
+  h.getIndexWriter()->mergeSegments();
+  std::shared_ptr<IndexReader> reader;
+  auto aux = overlays(h, reader);
+  ASSERT_EQ(aux.size(), 1u);
+  ASSERT_NE(aux[0], nullptr);
+  EXPECT_EQ(aux[0]->getEngine(), VectorAuxMeta::ENGINE_IVFPQ4FS);
+  EXPECT_EQ(aux[0]->getFaissIndex()->ntotal, 2000);
+  EXPECT_GE(recallVsExact(h, 300), 0.9);
 }

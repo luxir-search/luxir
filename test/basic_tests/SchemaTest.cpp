@@ -1876,6 +1876,16 @@ TEST_F(SchemaTest, vectorPqMUsesEffectiveDimensions) {
     EXPECT_THROW(schemaJson(templ + "{\"a\":" + field + "}}"), SchemaError);
   }
   EXPECT_THROW(schemaJson(R"({"templates":{"_e":{"type":"vector","ann":{"codec":"pq","pq":{"m":4}}}}})"), SchemaError);
+  // pq4 is inner product / cosine only and always 4-bit.
+  for (const char* bad : {R"({"type":"vector","dims":8,"metric":"l2","ann":{"codec":"pq4"}})",
+                          R"({"type":"vector","dims":8,"ann":{"codec":"pq4"}})",
+                          R"({"type":"vector","dims":8,"metric":"ip","ann":{"codec":"pq4","pq":{"bits":8}}})",
+                          R"({"type":"vector","dims":8,"metric":"ip","ann":{"codec":"pq4","rabitq":{"bits":1}}})"}) {
+    SCOPED_TRACE(bad);
+    EXPECT_THROW(schemaJson(std::string(R"({"fields":{"a":)") + bad + "}}"), SchemaError);
+  }
+  EXPECT_NO_THROW(schemaJson(R"({"fields":{"a":{"type":"vector","dims":8,"metric":"cosine",
+    "ann":{"codec":"pq4","pq":{"m":4,"bits":4}}}}})"));
   // Replacing a parent revalidates a child's authored m against its new dims.
   auto before = schemaJson(templ + R"({"a":{"parent":"_e","ann":{"codec":"pq","pq":{"m":4}}}}})");
   EXPECT_THROW(schemaJson(R"({"templates":{"_e":{"type":"vector","dims":6,

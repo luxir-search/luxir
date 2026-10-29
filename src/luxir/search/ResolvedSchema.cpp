@@ -54,9 +54,10 @@ std::string ReaderManager::resolvedSchema() {
     if (auto* vector = dynamic_cast<const VectorFieldType*>(type)) {
       const auto& config = vector->ann();
       auto& ann = rep["ann"];
-      ann["codec"] = config.codec == VectorAnnConfig::PQ ? "pq" : "rabitq";
+      ann["codec"] = config.codec == VectorAnnConfig::PQ ? "pq"
+                   : config.codec == VectorAnnConfig::PQ4 ? "pq4" : "rabitq";
       ann["nlist"] = config.nlist;
-      if (config.codec == VectorAnnConfig::PQ) {
+      if (config.codec != VectorAnnConfig::RABITQ) {
         ann["pq"]["m"] = config.pqM;
         ann["pq"]["bits"] = config.pqBits;
       } else {

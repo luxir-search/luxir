@@ -2536,10 +2536,10 @@ Approximate nearest-neighbor index settings for a VECTOR field: the codec and pa
 
 | Field | Number | Type | Cardinality / group | Description |
 |---|---|---|---|---|
-| <a id="field-luxir.vectoranndef.codec"></a>[`codec`](#field-luxir.vectoranndef.codec) | 1 | [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec) | optional | absent: pq; rabitq is opt-in |
+| <a id="field-luxir.vectoranndef.codec"></a>[`codec`](#field-luxir.vectoranndef.codec) | 1 | [`VectorAnnDef.Codec`](#enum-luxir.vectoranndef.codec) | optional | absent: pq; rabitq and pq4 are opt-in |
 | <a id="field-luxir.vectoranndef.nlist"></a>[`nlist`](#field-luxir.vectoranndef.nlist) | 2 | `int32` | optional | IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors), capped at 4096. Clamped to the segment's vector count. |
 | <a id="field-luxir.vectoranndef.rabitq"></a>[`rabitq`](#field-luxir.vectoranndef.rabitq) | 3 | [`VectorAnnDef.RaBitQ`](#message-luxir.vectoranndef.rabitq) | singular | requires explicit codec rabitq |
-| <a id="field-luxir.vectoranndef.pq"></a>[`pq`](#field-luxir.vectoranndef.pq) | 4 | [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq) | singular | codec pq only |
+| <a id="field-luxir.vectoranndef.pq"></a>[`pq`](#field-luxir.vectoranndef.pq) | 4 | [`VectorAnnDef.Pq`](#message-luxir.vectoranndef.pq) | singular | codec pq or pq4 |
 
 <a id="message-luxir.vectoranndef.pq"></a>
 
@@ -2957,6 +2957,7 @@ How facet selections filter the enclosing TopDocs results and its sub-operations
 |---|---|---|
 | <a id="value-luxir.vectoranndef.codec.rabitq"></a>[`RABITQ`](#value-luxir.vectoranndef.codec.rabitq) | 0 | IVF + RaBitQ (randomly rotated, centroid-relative bit codes) |
 | <a id="value-luxir.vectoranndef.codec.pq"></a>[`PQ`](#value-luxir.vectoranndef.codec.pq) | 1 | IVF + product quantization |
+| <a id="value-luxir.vectoranndef.codec.pq4"></a>[`PQ4`](#value-luxir.vectoranndef.codec.pq4) | 2 | IVF + 4-bit product quantization scanned with SIMD register lookups (fast-scan). Inner-product and cosine fields only. Uses pq.m (auto: about dims / 4, the same code bytes as 8-bit pq at half that m) and implies 4-bit codes. |
 
 <a id="enum-luxir.vectormetric"></a>
 

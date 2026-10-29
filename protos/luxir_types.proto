@@ -2233,8 +2233,13 @@ message VectorAnnDef {
   enum Codec {
     RABITQ = 0;  // IVF + RaBitQ (randomly rotated, centroid-relative bit codes)
     PQ = 1;      // IVF + product quantization
+    // IVF + 4-bit product quantization scanned with SIMD register lookups
+    // (fast-scan). Inner-product and cosine fields only. Uses pq.m (auto: about
+    // dims / 4, the same code bytes as 8-bit pq at half that m) and implies 4-bit
+    // codes.
+    PQ4 = 2;
   }
-  optional Codec codec = 1;  // absent: pq; rabitq is opt-in
+  optional Codec codec = 1;  // absent: pq; rabitq and pq4 are opt-in
 
   // IVF coarse lists per segment overlay. Absent or 0: sqrt(segment vectors),
   // capped at 4096. Clamped to the segment's vector count.
@@ -2261,7 +2266,7 @@ message VectorAnnDef {
     optional int32 m = 1;
     optional int32 bits = 2;  // bits per sub-quantizer code, 1..8. Absent: 8.
   }
-  Pq pq = 4;  // codec pq only
+  Pq pq = 4;  // codec pq or pq4
 }
 
 // A field, template, or variant definition, named by its enclosing map key.

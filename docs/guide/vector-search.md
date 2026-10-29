@@ -689,12 +689,12 @@ POST /collections/books/_schema
 
 | Field | Meaning |
 |---|---|
-| `codec` | `pq` (default) or opt-in `rabitq`. |
+| `codec` | `pq` (default) or opt-in `rabitq` or `pq4`. |
 | `nlist` | IVF lists per segment overlay. Absent or `0`: `sqrt(segment vectors)`, capped at 4096. |
 | `rabitq.bits` | Bits per dimension, `1` to `9`. Default `1`. |
 | `rabitq.query_bits` | Bits the query is quantized to while scanning, `0` to `8`; `0` scans with the float query. Default `4`. |
-| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for IP/cosine or `32` for L2. If none does, use the largest divisor under the same cap. |
-| `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. |
+| `pq.m` | PQ sub-quantizers. Positive values require positive effective (inherited) `dims` and must divide the stored dimension (`truncate_dims` when set). Absent or `0`: automatic from the stored dimension, including inferred dims; the largest divisor leaving at least 4 dimensions each, capped at `max(32, stored dims / 8)` for IP/cosine or `32` for L2 (doubled for `pq4`, which is IP/cosine only). If none does, use the largest divisor under the same cap. |
+| `pq.bits` | Bits per PQ code, `1` to `8`. Default `8`. Codec `pq4` is always 4-bit: `4` or absent. |
 
 `rabitq` settings require an explicit `"codec":"rabitq"`, for example
 `"ann":{"codec":"rabitq","rabitq":{"bits":1,"query_bits":4}}`.
@@ -729,6 +729,15 @@ precomputed table at 8 bits; IP/cosine builds its lookup table per query and
 has no such resident table. Fields of up to 256 dimensions and explicit `m`
 settings keep their existing choices. PQ codebooks are retrained for every
 segment build and merge; automatic `m` depends only on dimensions and metric.
+
+**PQ4** (opt-in, inner product and cosine only) stores 4-bit codes packed in
+blocks of 32 so the scan looks codes up in SIMD registers instead of memory
+(FAISS fast-scan). Its automatic `m` is twice PQ's, so a vector takes the same
+code bytes as the 8-bit default (768 dimensions: `m=192`, 96 bytes). On x86
+(AVX2) the scan of equal-size codes is several times faster than 8-bit PQ, at
+a few points less candidate recall before rescoring; raise `refine_candidates`
+modestly if recall at small `k` matters. Below about 128 dimensions 8-bit PQ
+is the better choice. Deleted and filtered vectors are skipped per code.
 
 PQ favors scan speed: FAISS currently scans PQ lists faster than RaBitQ
 lists. Opt into RaBitQ for its different size/recall tradeoff.

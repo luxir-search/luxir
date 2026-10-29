@@ -304,7 +304,8 @@ static ResolvedField physicalSettings(std::string_view name, const api::FieldDef
 // dims is the stored dimension the overlay is built over; dimsName names the
 // schema property it came from.
 static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t dims,
-                                        std::string_view dimsName, std::string_view name) {
+                                        std::string_view dimsName, std::string_view name,
+                                        VectorFieldType::Metric metric) {
   VectorAnnConfig cfg;
   if (def == nullptr) return cfg;
   auto fail = [&](const std::string& msg) {
@@ -313,10 +314,11 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
   using Codec = api::VectorAnnDef_::Codec;
   if (def->codec) {
     Codec codec = *def->codec;
-    if (codec != Codec::RABITQ && codec != Codec::PQ) {
-      fail("unknown codec " + std::to_string((int)codec) + "; valid: rabitq, pq");
+    if (codec != Codec::RABITQ && codec != Codec::PQ && codec != Codec::PQ4) {
+      fail("unknown codec " + std::to_string((int)codec) + "; valid: rabitq, pq, pq4");
     }
-    cfg.codec = codec == Codec::PQ ? VectorAnnConfig::PQ : VectorAnnConfig::RABITQ;
+    cfg.codec = codec == Codec::PQ ? VectorAnnConfig::PQ
+              : codec == Codec::PQ4 ? VectorAnnConfig::PQ4 : VectorAnnConfig::RABITQ;
   }
   if (def->nlist) {
     if (*def->nlist < 0 || *def->nlist > 65536) fail("nlist must be in [0, 65536]");
@@ -325,7 +327,14 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
   if (def->rabitq && cfg.codec != VectorAnnConfig::RABITQ) {
     fail("rabitq settings require explicit codec \"rabitq\"");
   }
-  if (def->pq && cfg.codec != VectorAnnConfig::PQ) fail("pq settings require codec pq");
+  bool pqFamily = cfg.codec == VectorAnnConfig::PQ || cfg.codec == VectorAnnConfig::PQ4;
+  if (def->pq && !pqFamily) fail("pq settings require codec pq or pq4");
+  if (cfg.codec == VectorAnnConfig::PQ4) {
+    if (metric != VectorFieldType::METRIC_IP && metric != VectorFieldType::METRIC_COSINE) {
+      fail("codec pq4 supports only ip and cosine metrics");
+    }
+    cfg.pqBits = 4;
+  }
   if (def->rabitq) {
     if (def->rabitq->bits) {
       if (*def->rabitq->bits < 1 || *def->rabitq->bits > 9) fail("rabitq.bits must be in [1, 9]");
@@ -350,7 +359,9 @@ static VectorAnnConfig resolveAnnConfig(const api::VectorAnnDef* def, int32_t di
       }
       cfg.pqM = *def->pq->m;
     }
-    if (def->pq->bits) {
+    if (def->pq->bits && cfg.codec == VectorAnnConfig::PQ4) {
+      if (*def->pq->bits != 4) fail("pq4 uses 4-bit codes; pq.bits must be 4 or absent");
+    } else if (def->pq->bits) {
       if (*def->pq->bits < 1 || *def->pq->bits > 8) fail("pq.bits must be in [1, 8]");
       cfg.pqBits = *def->pq->bits;
     }
@@ -711,7 +722,7 @@ struct FieldCompiler {
         // ANN overlays are built over the stored (truncated) column.
         bool truncated = r.vectorTruncateDims > 0;
         VectorAnnConfig ann = resolveAnnConfig(r.ann, truncated ? r.vectorTruncateDims : r.vectorDims,
-                                               truncated ? "truncate_dims" : "dims", name);
+                                               truncated ? "truncate_dims" : "dims", name, r.vectorMetric);
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
                                                r.vectorMetric, r.vectorNormalized, normalizeOnWrite,
                                                ann, r.vectorTruncateDims);

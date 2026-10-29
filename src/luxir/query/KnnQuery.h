@@ -5,6 +5,8 @@
 
 #include <faiss/Index.h>
 #include <faiss/IndexIVF.h>
+#include <faiss/IndexIVFPQ.h>
+#include <faiss/utils/Heap.h>
 #include <faiss/impl/ResultHandler.h>
 #include <faiss/MetricType.h>
 #include <faiss/impl/IDSelector.h>
@@ -37,6 +39,7 @@
 #include "luxir/reader/VectorAuxReader.h"
 #include "luxir/reader/VectorReader.h"
 #include "luxir/query/VectorEngine.h"
+#include "luxir/query/Pq4Scan.h"
 #include "luxir/search/DocSet.h"
 #include "luxir/search/Collapse.h"
 #include "luxir/util/AtomicMerger.h"
@@ -894,7 +897,8 @@ public:
           // Both codecs are IVF; each segment is served by its own overlay's
           // meta, so segments built with different codecs mix freely.
           bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ
-            || vaux->getEngine() == VectorAuxMeta::ENGINE_IVFRABITQ;
+            || vaux->getEngine() == VectorAuxMeta::ENGINE_IVFRABITQ
+            || vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ4FS;
           approximateEngine = approximateEngine || !vaux->scoresAreExact();
           const float* indexQuery = vaux->getRotation() != nullptr
             ? rotatedQuery(vaux->getRotation())
@@ -1342,6 +1346,9 @@ public:
 
       faiss::Index& index;
       faiss::IndexIVF* ivf;
+      // Non-null for ENGINE_IVFPQ4FS overlays: lists are block-packed for
+      // Pq4Scanner, so FAISS's list scanners must not touch them.
+      const faiss::IndexIVFPQ* pq4;
       int32_t segOrd;
       const SegV2D& v2d;
       LiveDocs* liveDocs;
@@ -1480,6 +1487,7 @@ public:
                                PreparedQuery preparedQuery)
         : groupPlan(groupPlan), groupV2d(groupV2d), index(index),
           ivf(isIvf ? dynamic_cast<faiss::IndexIVF*>(&index) : nullptr),
+          pq4(packedPq(ivf)),
           segOrd(segOrd),
           v2d(v2d),
           liveDocs(seg.liveDocs()),
@@ -1500,6 +1508,12 @@ public:
       }
 
       int32_t getNList() const noexcept { return nlist; }
+
+      static const faiss::IndexIVFPQ* packedPq(const faiss::IndexIVF* ivf) {
+        if (ivf == nullptr) return nullptr;
+        auto* lists = dynamic_cast<const MmapInvertedLists*>(ivf->invlists);
+        return lists != nullptr && lists->isPacked() ? dynamic_cast<const faiss::IndexIVFPQ*>(ivf) : nullptr;
+      }
 
       void coarseRun(int32_t dims,
                      std::vector<faiss::idx_t>& listIds,
@@ -1544,6 +1558,22 @@ public:
       /// of one segment as concurrent tasks, so all scratch is local and the
       /// shared state (index, selector, v2d) is read-only.  rangeLiveVectors
       /// is the live count of exactly the lists in listIds.
+      /// Fast-scan every selected list of a block-packed overlay into sink
+      /// (see Pq4Scanner); adds the codes visited to scanned.
+      template <class Sink, class Count>
+      void scanPq4(std::span<const faiss::idx_t> listIds, std::span<const float> centroidDists,
+                   const faiss::IDSelector* sel, const float* query, Sink& sink, Count& scanned) const {
+        Pq4Scanner scanner(pq4->pq, query);
+        for (size_t list = 0; list < listIds.size(); list++) {
+          auto id = listIds[list];
+          if (id < 0) continue;
+          size_t count = ivf->invlists->list_size((size_t)id);
+          scanner.scanList(ivf->invlists->get_codes((size_t)id), count,
+                           ivf->invlists->get_ids((size_t)id), centroidDists[list], sel, sink);
+          scanned += (Count)count;
+        }
+      }
+
       VectorSearchResult searchSelectedLists(const VectorSearchRequest& request,
                                              std::span<const faiss::idx_t> listIds,
                                              std::span<const float> centroidDists,
@@ -1562,21 +1592,30 @@ public:
 
         auto scan = prepareScan(request, listIds.size());
         if constexpr (Groups) {
-          std::unique_ptr<faiss::InvertedListScanner> scanner(
-              ivf->get_InvertedListScanner(false, scan.params.sel, &scan.params));
-          scanner->set_query(scan.query);
           BoundedHits<true, VectorEngineHit, betterHit> heap(request.candidates, groupPlan, groupV2d,
               exactScores ? 1 : (size_t)request.perKey);
           GroupResultHandler handler(heap, metric, segOrd);
-          for (size_t list = 0; list < listIds.size(); list++) {
-            auto id = listIds[list];
-            if (id < 0) continue;
-            scanner->set_list(id, centroidDists[list]);
-            faiss::InvertedLists::ScopedIds ids(ivf->invlists, (size_t)id);
-            faiss::InvertedLists::ScopedCodes codes(ivf->invlists, (size_t)id);
-            size_t count = ivf->invlists->list_size((size_t)id);
-            // IVFPQ applies its selector and threshold in the optimized loop.
-            scanner->scan_codes(count, codes.get(), ids.get(), handler);
+          if (pq4 != nullptr) {
+            struct Sink {
+              GroupResultHandler& handler;
+              float threshold() const { return handler.threshold; }
+              bool add(float score, faiss::idx_t id) { return handler.add_result(score, id); }
+            } sink{handler};
+            scanPq4(listIds, centroidDists, scan.params.sel, scan.query, sink, handler.stats.scan_cnt);
+          } else {
+            std::unique_ptr<faiss::InvertedListScanner> scanner(
+                ivf->get_InvertedListScanner(false, scan.params.sel, &scan.params));
+            scanner->set_query(scan.query);
+            for (size_t list = 0; list < listIds.size(); list++) {
+              auto id = listIds[list];
+              if (id < 0) continue;
+              scanner->set_list(id, centroidDists[list]);
+              faiss::InvertedLists::ScopedIds ids(ivf->invlists, (size_t)id);
+              faiss::InvertedLists::ScopedCodes codes(ivf->invlists, (size_t)id);
+              size_t count = ivf->invlists->list_size((size_t)id);
+              // IVFPQ applies its selector and threshold in the optimized loop.
+              scanner->scan_codes(count, codes.get(), ids.get(), handler);
+            }
           }
           if (statsForTests) {
             statsForTests->lists += (int64_t)listIds.size();
@@ -1599,10 +1638,31 @@ public:
         // plain non-atomic '+=' on the global faiss::indexIVF_stats, and
         // concurrent chunk tasks of one query would race on it.
         faiss::IndexIVFStats stats;
-        ivf->search_preassigned(1, scan.query, request.candidates,
-                                listIds.data(), centroidDists.data(),
-                                dists.data(), ids.data(), false, &scan.params,
-                                &stats);
+        if (pq4 != nullptr) {
+          // Inner product: a min-heap on the score keeps the best candidates.
+          size_t k = (size_t)request.candidates;
+          faiss::minheap_heapify(k, dists.data(), ids.data());
+          struct Sink {
+            size_t k;
+            float* dists;
+            faiss::idx_t* ids;
+            float threshold() const { return dists[0]; }
+            bool add(float score, faiss::idx_t id) {
+              if (!(score > dists[0])) return false;
+              faiss::minheap_replace_top(k, dists, ids, score, id);
+              return true;
+            }
+          } sink{k, dists.data(), ids.data()};
+          size_t scanned = 0;
+          scanPq4(listIds, centroidDists, scan.params.sel, scan.query, sink, scanned);
+          stats.ndis = scanned;
+          faiss::minheap_reorder(k, dists.data(), ids.data());
+        } else {
+          ivf->search_preassigned(1, scan.query, request.candidates,
+                                  listIds.data(), centroidDists.data(),
+                                  dists.data(), ids.data(), false, &scan.params,
+                                  &stats);
+        }
         if (statsForTests) {
           statsForTests->lists += (int64_t)listIds.size();
           statsForTests->vectors += (int64_t)stats.ndis;
