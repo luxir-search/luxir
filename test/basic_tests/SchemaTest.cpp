@@ -2226,7 +2226,7 @@ TEST_F(SchemaTest, namedAnalyzerResolvedView) {
       R"({"char_filters":[],"filters":["nfkc_cf","fold","kstem"],"tokenizer":"unicode_word"})";
   EXPECT_EQ(english, self("named", "analyzer"));
   EXPECT_EQ(R"("english")", self("named", "analyzer_preset"));
-  EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","reverse"],"tokenizer":"whitespace"})",
+  EXPECT_EQ(R"({"char_filters":["strip_x"],"filters":["lowercase","example_reverse"],"tokenizer":"whitespace"})",
             self("ex", "analyzer"));
   EXPECT_EQ(R"("example")", self("ex", "analyzer_preset"));
   // an authored equivalent shows the same expansion and no preset

@@ -105,7 +105,7 @@ std::shared_ptr<const RegisteredFieldType> FieldTypeRegistry::make(const api::An
                                                   : "unknown field type '" + std::string(def.name) + "'") +
                                 "; valid types: " + builtins + "; plugin types: " + joined(plugins));
   }
-  PluginParams params("field type '" + std::string(def.name) + "'", def.params);
+  ParamReader params("field type '" + std::string(def.name) + "'", def.params);
   auto type = it->second(params);
   if (!type) throw std::invalid_argument("field type '" + std::string(def.name) + "' made no type");
   params.rejectUnknown();

@@ -14,8 +14,8 @@
 #include <vector>
 
 #include "luxir/api/luxir_types.hpp"
-#include "luxir/plugin/PluginParams.h"
 #include "luxir/schema/FieldType.h"
+#include "luxir/util/ParamReader.h"
 #include "luxir/util/geo.h"
 
 namespace luxir {
@@ -207,7 +207,7 @@ public:
 // code that does not link the plugin headers. Filled during initPlugins(), then
 // frozen; lookups after the freeze read an immutable table without locking.
 //
-// A maker reads the authored params (PluginParams: typed reads whose errors
+// A maker reads the authored params (ParamReader: typed reads whose errors
 // name the type and the parameter; a param it does not read is refused after
 // it returns) and returns the immutable type with its derived fields declared.
 // Makers throw std::invalid_argument or RequestError for bad params, with a
@@ -216,7 +216,7 @@ class FieldTypeRegistry {
 public:
   static FieldTypeRegistry& global();
 
-  using Maker = std::function<std::unique_ptr<const PluginFieldType>(const PluginParams& params)>;
+  using Maker = std::function<std::unique_ptr<const PluginFieldType>(const ParamReader& params)>;
 
   // The name is [a-z0-9_]+ and not a built-in type name or "plugin". A
   // duplicate throws std::invalid_argument; any add after freeze() throws
