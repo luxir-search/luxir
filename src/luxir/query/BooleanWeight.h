@@ -2336,7 +2336,12 @@ private:
   bool denseScoredCostRejected = false;
   bool competitivePruning = true;
   int32_t candidateProofCount;
+  // Dense-scored norms: either a flat byte array shared by all clauses, or
+  // (CONSTANT / docid-addressed PACKED) the shared reader, decoded for the
+  // window survivors into denseNormBuf before the per-clause scoring loop.
   const uint8_t* denseScoredNorms = nullptr;
+  const NormsReader* denseScoredByDoc = nullptr;
+  std::span<uint8_t> denseNormBuf;
   TermQuery::Scorer* candidatePostingsLead = nullptr;
   TermQuery::Scorer* candidateLeadScoreScorer = nullptr;
   std::span<uint8_t> candidateFilters;
@@ -3674,10 +3679,15 @@ private:
       denseSampleSurvivors += out.size;
     }
 
+    const uint8_t* denseNorms = denseScoredNorms;
+    if (denseNorms == nullptr) {
+      // survivors match every clause, so they all have the field
+      denseScoredByDoc->byDocValues(out.docs.data(), out.size, denseNormBuf.data());
+    }
     for (int32_t i = 0; i < out.size; i++) {
       int32_t doc = out.docs[(size_t) i];
       int32_t offset = doc - windowBase;
-      int64_t norm = denseScoredNorms[doc];
+      int64_t norm = denseNorms != nullptr ? denseNorms[doc] : denseNormBuf[(size_t) i];
       float score = 0.0f;
       for (size_t c = 0; c < termScorers.size(); c++) {
         score += termScorers[c]->scoreFreqWithNorm(
@@ -4137,11 +4147,15 @@ public:
         && candidatePostingsLead == nullptr
         && !disableDenseScoredForTests;
     if (denseScoredEligible) {
-      denseScoredNorms = termScorers[0]->flatNormsBase;
+      TermQuery::Scorer* first = termScorers[0];
+      denseScoredNorms = first->flatNormsBase;
+      denseScoredByDoc = first->byDocNorms;
       for (TermQuery::Scorer* scorer : termScorers) {
-        denseScoredEligible &= scorer->simScorer != nullptr
-            && scorer->flatNormsBase != nullptr
-            && scorer->flatNormsBase == denseScoredNorms;
+        bool sameNorms = denseScoredNorms != nullptr
+            ? scorer->flatNormsBase == denseScoredNorms
+            : denseScoredByDoc != nullptr && scorer->byDocNorms != nullptr
+                && scorer->byDocNorms->sharesNorms(*denseScoredByDoc);
+        denseScoredEligible &= scorer->simScorer != nullptr && sameNorms;
       }
       if (denseScoredEligible) {
         denseScoredCostRejected =
@@ -4152,6 +4166,9 @@ public:
       if (denseScoredEligible) {
         denseFreqs = pool.make_span<int32_t>(
             scorers.size() * (size_t) kWindowSize);
+        if (denseScoredNorms == nullptr) {
+          denseNormBuf = pool.make_span<uint8_t>((size_t) kWindowSize);
+        }
       }
     }
   }

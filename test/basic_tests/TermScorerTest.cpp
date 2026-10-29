@@ -6519,10 +6519,7 @@ TEST_F(TermScorerTest, conjunctionDenseScoredLatchBackResumesExactScoring) {
   TestField f(testIndex, "body_w");
   f.startIndexing();
   for (int32_t doc = 0; doc < N; doc++) {
-    // >16 distinct lengths keep the norms FLAT (dense-scored needs flat norms)
-    std::string body = "latch_a latch_b filler";
-    appendRepeatedTerm(body, "pad", doc % 20);
-    f.add(doc, body);
+    f.add(doc, "latch_a latch_b filler");
   }
   testIndex.flush();
   f.startReading();
@@ -6571,6 +6568,66 @@ TEST_F(TermScorerTest, conjunctionDenseScoredLatchBackResumesExactScoring) {
       sortedCollectorDocs(pullCollector), sortedCollectorDocs(bulkCollector));
 }
 
+// CONSTANT and docid-addressed PACKED norms take the dense scored path with
+// scores bit-identical to pull scoring, also when some docs lack the field.
+TEST_F(TermScorerTest, conjunctionDenseScoredServesConstantAndPackedNorms) {
+  DenseScoredGuard denseScoredGuard(false);
+  const int32_t N = 10 * DocsEnumMeta::L1_DOCS + 37;
+  struct Variant {
+    bool varyLength;
+    bool sparse;
+  };
+  for (Variant v : {Variant{false, false}, Variant{true, false},
+                    Variant{false, true}, Variant{true, true}}) {
+    SkipStatsGuard stats;
+    TestIndex testIndex;
+    TestField f(testIndex, "body_w");
+    f.startIndexing();
+    for (int32_t doc = 0; doc < N; doc++) {
+      if (v.sparse && doc % 5 == 4) continue;
+      std::string body = "dn_a dn_b";
+      appendRepeatedTerm(body, "filler", 1 + (v.varyLength ? doc % 4 : 0));
+      f.add(doc, body);
+    }
+    testIndex.flush();
+    f.startReading();
+
+    auto poolFree = testIndex.pool.rewindScopeGuard();
+    Query::Context qContext(testIndex.pool, *testIndex.reader);
+    auto& segment = qContext.topReader.segments()[0];
+    std::array<std::string_view, 2> terms = {"dn_a", "dn_b"};
+    auto queries = makeTermQueries(terms);
+    auto mandatory = queryPointers(queries);
+    std::span<Query*> empty;
+    constexpr int32_t topK = 100;
+    std::span<Query*> mand(mandatory.data(), mandatory.size());
+
+    BooleanQuery pullQuery(mand, empty, empty, empty);
+    auto* pullScorer = pullQuery.createWeight(qContext, Query::NEED_SCORES)
+                           ->createScorer(testIndex.pool, segment);
+    ASSERT_NE(pullScorer, nullptr);
+    TopDocsCollector pullCollector(topK);
+    collectTopK(0, pullScorer, nullptr, nullptr, pullCollector, false);
+
+    BooleanQuery bulkQuery(mand, empty, empty, empty);
+    auto* supplier = bulkQuery.createWeight(qContext, Query::NEED_SCORES)
+                         ->scorerSupplier(testIndex.pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    auto* bulk = dynamic_cast<BooleanQuery::ConjunctionBulkScorer*>(
+        supplier->bulkScorer(testIndex.pool));
+    ASSERT_NE(bulk, nullptr);
+    TopDocsCollector bulkCollector(topK);
+    collectTopKWindowed(0, bulk, nullptr, bulkCollector, nullptr,
+                        segment.maxDoc(), false);
+
+    EXPECT_GT(SkipStats::conjDenseScoredWindows, 0)
+        << "varyLength=" << v.varyLength << " sparse=" << v.sparse;
+    EXPECT_EQ(bulkCollector.totalHits(), pullCollector.totalHits());
+    assertTopKEquivalent(
+        sortedCollectorDocs(pullCollector), sortedCollectorDocs(bulkCollector));
+  }
+}
+
 TEST_F(TermScorerTest, conjunctionDenseScoredRejectsAsymmetricClauseCosts) {
   DenseScoredGuard denseScoredGuard(false);
   SkipStatsGuard stats;
@@ -6582,8 +6639,6 @@ TEST_F(TermScorerTest, conjunctionDenseScoredRejectsAsymmetricClauseCosts) {
   for (int32_t doc = 0; doc < N; doc++) {
     std::string body = "producer";
     if ((doc % 10) == 0) body += " lead";
-    // >16 distinct lengths keep the norms FLAT (dense-scored needs flat norms)
-    appendRepeatedTerm(body, "pad", doc % 20);
     f.add(doc, body);
   }
   testIndex.flush();
@@ -6649,8 +6704,6 @@ TEST_F(TermScorerTest, conjunctionScoredProbeKeepsBlockWorkSurvivorBounded) {
     if ((doc % 257) == 0) {
       appendRepeatedTerm(body, "probe_lead", 1 + (doc % 7));
     }
-    // >16 distinct lengths keep the norms FLAT (dense-scored needs flat norms)
-    appendRepeatedTerm(body, "pad", doc % 20);
     f.add(doc, body);
   }
   testIndex.flush();

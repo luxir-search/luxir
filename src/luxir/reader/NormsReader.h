@@ -118,6 +118,11 @@ public:
     return isFlat() ? normsBytes : nullptr;
   }
 
+  // True when both read the same stored norms region, so one decode serves both.
+  bool sharesNorms(const NormsReader& other) const noexcept {
+    return format == other.format && normsBytes == other.normsBytes && nbytes == other.nbytes;
+  }
+
   bool isSparse() const noexcept {
     return format == SegFieldInfo::NORMS_SPARSE;
   }

@@ -88,8 +88,6 @@ std::vector<Doc> makeSegment(
         appendToken(body, shape.other);
       }
     }
-    // >16 distinct lengths keep the norms FLAT (dense-scored needs flat norms)
-    for (int32_t i = 0; i < doc % 20; i++) appendToken(body, "pad");
     docs.push_back(flatdoc(
         "id", std::string(idPrefix) + std::to_string(doc),
         "body_w", body));
