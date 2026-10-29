@@ -13,6 +13,7 @@ credentials. Administration and snapshot routes may name another tenant under
 
 | Method and path | Purpose |
 |---|---|
+| `GET /` | Binary version, full source commit hash, and CPU target. |
 | `GET /health` | Process liveness. |
 | `GET` or `POST /collections/{collection}/_search` | Search; URL request fields and optional POST JSON body, chunked NDJSON response. |
 | `POST /collections/{collection}/_update` | Bounded JSON update or unbounded NDJSON ingest. |
@@ -44,6 +45,25 @@ reader they used. See
 [Collection lifecycle](operations.md#collection-lifecycle) for deletion
 semantics under concurrent use.
 
+## Build information
+
+`GET /` returns metadata compiled into the running binary, without collecting
+statistics or accessing Git at runtime:
+
+```json
+{
+  "version": "0.1.0",
+  "source_commit": "0123456789abcdef0123456789abcdef01234567",
+  "cpu_target": "x86-64-v2"
+}
+```
+
+`source_commit` identifies the checkout's HEAD at build time; it does not describe
+uncommitted edits. It is `"unknown"` for source archives built without an explicit
+commit hash. `luxir --version` and the startup banner report the same version,
+commit, and CPU target. The root endpoint defaults to pretty JSON; use
+`/?pretty=false` for compact output.
+
 ## Content types and framing
 
 Send bounded search, schema, and update messages as `application/json`. Send a
@@ -69,7 +89,7 @@ query's `found`, `docs`, and sub-`ops` directly in the response envelope.
 Every JSON body ends with a newline. `?pretty` (bare, or `?pretty=true` /
 `?pretty=false`) is a URL-only, best-effort formatting hint that applies to
 every JSON body of the request, errors and ingest acknowledgements included.
-Schema, collection list, and stats responses default to pretty; every other
+Build information, schema, collection list, and stats responses default to pretty; every other
 route defaults to compact. `_stats?format=prometheus` is
 `text/plain; version=0.0.4` and ignores `pretty`. Indentation is two spaces but is not part of the
 contract. A pretty stream is sent as `application/json`, still chunked, with
