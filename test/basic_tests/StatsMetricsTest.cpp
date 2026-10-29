@@ -4,6 +4,8 @@
 #include "test/HttpReq.h"
 #include "test/GrpcClient.h"
 #include "test/GrpcLuxirTest.h"
+#include "test/CollectionHelper.h"
+#include "test/TestUtils.h"
 #include "luxir/server/HttpServer.h"
 #include "luxir/server/Prometheus.h"
 #include "luxir/server/Stats.h"
@@ -210,6 +212,11 @@ TEST_F(StatsMetricsTest, HttpTrafficAndIndexingOutcomes) {
   EXPECT_EQ(2, sample(text, "luxir_collection_documents_total{" + collection + ",outcome=\"accepted\"}"));
   EXPECT_EQ(1, sample(text, "luxir_collection_index_batches_total{" + collection + ",outcome=\"ok\"}"));
   EXPECT_EQ(1, sample(text, "luxir_index_batches_total{outcome=\"ok\"}"));
+  // Both updates committed: once each, for the node and the collection.
+  EXPECT_EQ(2, sample(text, "luxir_background_total{kind=\"commit\",outcome=\"ok\"}"));
+  EXPECT_EQ(2, sample(text, "luxir_collection_commits_total{" + collection + ",outcome=\"ok\"}"));
+  EXPECT_GE(sample(text, "luxir_index_update_wait_seconds_count"), 2);
+  EXPECT_EQ(1, sample(text, "luxir_search_queue_wait_seconds_count"));
   EXPECT_EQ(2, sample(text, "luxir_request_duration_seconds_count{transport=\"http\",operation=\"update\"}"));
   EXPECT_EQ(2, sample(text, "luxir_request_duration_seconds_bucket{transport=\"http\",operation=\"update\",le=\"+Inf\"}"));
   // Directory bytes need files=true; the cheap walk lists no directories.
@@ -293,6 +300,43 @@ TEST_F(StatsMetricsTest, ConcurrentScrapesAndCollectionRemoval) {
   done = true;
   for (auto& scraper : scrapers) EXPECT_EQ(0, scraper.get());
   EXPECT_EQ(std::string::npos, render(node).find("collection=\"metrics\""));
+}
+
+// A forced merge publishes its layout on the commit stage, but the client's
+// commit counts once.
+TEST_F(StatsMetricsTest, ForcedMergeCountsOneCommit) {
+  LuxirNode node;
+  CollectionHelper helper(node, "metrics");
+  helper.index(flatdoc("id", "a"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "b"), UpdateMessage::COMMIT);
+  auto ok = [&](MetricStage stage) {
+    return node.metrics->counts().activities[metricActivity(stage)].completed[(size_t)MetricOutcome::OK];
+  };
+  auto commits = ok(MetricStage::COMMIT), publishes = ok(MetricStage::MERGE_PUBLISH);
+  auto collectionCommits = helper.collection().getMetrics().counts().commits[(size_t)MetricOutcome::OK];
+  ASSERT_TRUE(helper.index(flatdoc("id", "c"), UpdateMessage::COMMIT, false, 1).success);
+  EXPECT_EQ(commits + 1, ok(MetricStage::COMMIT));
+  EXPECT_GT(ok(MetricStage::MERGE_PUBLISH), publishes);
+  EXPECT_EQ(collectionCommits + 1, helper.collection().getMetrics().counts().commits[(size_t)MetricOutcome::OK]);
+}
+
+// Node-wide commits outlive their collection; the collection's own counter
+// starts over when a new collection is created under the same name.
+TEST_F(StatsMetricsTest, NodeCommitsSurviveCollectionDelete) {
+  LuxirNode node;
+  auto nodeCommits = [&] { return node.metrics->counts().activities[metricActivity(MetricStage::COMMIT)].completed[(size_t)MetricOutcome::OK]; };
+  {
+    CollectionHelper helper(node, "metrics");
+    helper.index(flatdoc("id", "a"), UpdateMessage::COMMIT);
+  }
+  auto before = nodeCommits();
+  node.deleteCollection("metrics");
+  EXPECT_EQ(before, nodeCommits());
+  CollectionHelper helper(node, "metrics");
+  EXPECT_EQ(0u, helper.collection().getMetrics().counts().commits[(size_t)MetricOutcome::OK]);
+  helper.index(flatdoc("id", "b"), UpdateMessage::COMMIT);
+  EXPECT_EQ(before + 1, nodeCommits());
+  EXPECT_EQ(1u, helper.collection().getMetrics().counts().commits[(size_t)MetricOutcome::OK]);
 }
 
 TEST_F(StatsMetricsTest, EscapingAndHistogramBuckets) {

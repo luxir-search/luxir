@@ -432,7 +432,6 @@ struct IndexStats {
   uint64_t inverters_busy = 0;
   uint64_t inverters_idle = 0;
   uint64_t inverters_flushing = 0;
-  uint64_t commits = 0;
   uint64_t retained_delete_bytes = 0;
   std::span<const AuxStats> aux_indexes;
   QueryCacheStats query_cache;
@@ -451,6 +450,7 @@ struct OutcomeStats {
 struct CollectionActivityStats {
   OutcomeStats searches;
   OutcomeStats index_batches;
+  OutcomeStats commits;
   uint64_t documents_accepted = 0;
   uint64_t documents_rejected = 0;
   uint64_t delete_ids_accepted = 0;
@@ -552,6 +552,8 @@ struct ServiceStats {
   ActivityStats search;
   map_view<std::string_view, uint64_t> document_errors;
   HistogramStats search_execution;
+  HistogramStats search_queue_wait;
+  HistogramStats update_wait;
   uint64_t search_resource_exhausted = 0;
   uint64_t search_warnings = 0;
   ActivityStats index_batches;
@@ -560,6 +562,7 @@ struct ServiceStats {
   uint64_t delete_ids_accepted = 0;
   ActivityStats flush;
   ActivityStats commit;
+  ActivityStats merge_publish;
   ActivityStats delete_pass;
   ActivityStats merge;
   ActivityStats vector_build;

@@ -58,6 +58,9 @@ std::vector<std::string> SearchEngine::explain(const ReqProto& proto, std::strin
 Metrics& SearchEngine::metrics() const { return *node.metrics; }
 
 void SearchEngine::submitBody(SearchRequest& req) {
+  if (req.counting) {
+    node.metrics->complete(metricActivity(MetricStage::SEARCH_QUEUE_WAIT), MetricOutcome::OK, nanosSince(req.ready));
+  }
   MetricScope execution(*node.metrics, metricActivity(MetricStage::SEARCH_EXECUTION));
   // Until the calculators start, an unclassified failure is the request's
   // fault: parsers and planners reject authored input with bare exceptions.
@@ -141,6 +144,7 @@ void SearchEngine::enqueueSubmit(SearchRequest& req, int32_t maxParallel) {
 void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver receiver) {
   req.counting = true;
   req.submitted = std::chrono::steady_clock::now();
+  req.ready = req.submitted;
   metrics().start(metricActivity(MetricStage::SEARCH));
   if (!req.proto.min_commit.empty()) {
     try {
@@ -152,6 +156,7 @@ void SearchEngine::dispatch(SearchRequest& req, int32_t maxParallel, Receiver re
           [this, &req, maxParallel](CommitWaits::CommitResult result) {
             if (!result.error) {
               req.floorCollection = result.collection;
+              req.ready = std::chrono::steady_clock::now();
               enqueueSubmit(req, maxParallel);
               return;
             }

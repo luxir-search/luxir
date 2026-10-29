@@ -657,6 +657,7 @@ Engine work that reached this collection since it was opened. The node's Service
 | <a id="field-luxir.collectionactivitystats.documents_accepted"></a>[`documents_accepted`](#field-luxir.collectionactivitystats.documents_accepted) | 3 | `uint64` | singular |  |
 | <a id="field-luxir.collectionactivitystats.documents_rejected"></a>[`documents_rejected`](#field-luxir.collectionactivitystats.documents_rejected) | 4 | `uint64` | singular |  |
 | <a id="field-luxir.collectionactivitystats.delete_ids_accepted"></a>[`delete_ids_accepted`](#field-luxir.collectionactivitystats.delete_ids_accepted) | 5 | `uint64` | singular |  |
+| <a id="field-luxir.collectionactivitystats.commits"></a>[`commits`](#field-luxir.collectionactivitystats.commits) | 6 | [`OutcomeStats`](#message-luxir.outcomestats) | singular | Whole commits of the collection and their summed duration, kept across writer reopens; see ServiceStats.commit. |
 
 <a id="message-luxir.collectioncachecontrol"></a>
 
@@ -1407,7 +1408,6 @@ Indexing RAM budget: the configured limit and the bytes reserved against it.
 | <a id="field-luxir.indexstats.inverters_busy"></a>[`inverters_busy`](#field-luxir.indexstats.inverters_busy) | 15 | `uint64` | singular | Writer only: indexing inverters by state. |
 | <a id="field-luxir.indexstats.inverters_idle"></a>[`inverters_idle`](#field-luxir.indexstats.inverters_idle) | 16 | `uint64` | singular |  |
 | <a id="field-luxir.indexstats.inverters_flushing"></a>[`inverters_flushing`](#field-luxir.indexstats.inverters_flushing) | 17 | `uint64` | singular |  |
-| <a id="field-luxir.indexstats.commits"></a>[`commits`](#field-luxir.indexstats.commits) | 18 | `uint64` | singular | writer only: commits since the writer opened |
 | <a id="field-luxir.indexstats.retained_delete_bytes"></a>[`retained_delete_bytes`](#field-luxir.indexstats.retained_delete_bytes) | 19 | `uint64` | singular | Writer only: resident delete packets held by its pending set or merge catch-up, deduplicated across owners. Included in the node indexing reservation. |
 
 <a id="message-luxir.jemallocstats"></a>
@@ -2195,21 +2195,24 @@ Process-wide service counters since start. Counters reset on restart and cache-c
 | <a id="field-luxir.servicestats.version"></a>[`version`](#field-luxir.servicestats.version) | 1 | `string` | singular |  |
 | <a id="field-luxir.servicestats.cpu_target"></a>[`cpu_target`](#field-luxir.servicestats.cpu_target) | 20 | `string` | singular | The CPU target the binary was built for. |
 | <a id="field-luxir.servicestats.read_only"></a>[`read_only`](#field-luxir.servicestats.read_only) | 2 | `bool` | singular |  |
-| <a id="field-luxir.servicestats.request_duration_bounds"></a>[`request_duration_bounds`](#field-luxir.servicestats.request_duration_bounds) | 3 | `double` | repeated | Upper bounds, in seconds, of the request, search execution and index batch histograms. |
-| <a id="field-luxir.servicestats.background_duration_bounds"></a>[`background_duration_bounds`](#field-luxir.servicestats.background_duration_bounds) | 4 | `double` | repeated | Upper bounds, in seconds, of the flush, commit, delete pass, merge, vector build and reader refresh histograms. |
+| <a id="field-luxir.servicestats.request_duration_bounds"></a>[`request_duration_bounds`](#field-luxir.servicestats.request_duration_bounds) | 3 | `double` | repeated | Upper bounds, in seconds, of the request, search execution, index batch and queue wait histograms. |
+| <a id="field-luxir.servicestats.background_duration_bounds"></a>[`background_duration_bounds`](#field-luxir.servicestats.background_duration_bounds) | 4 | `double` | repeated | Upper bounds, in seconds, of the flush, commit, merge publication, delete pass, merge, vector build and reader refresh histograms. |
 | <a id="field-luxir.servicestats.http"></a>[`http`](#field-luxir.servicestats.http) | 5 | [`TransportStats`](#message-luxir.transportstats) | singular |  |
 | <a id="field-luxir.servicestats.grpc"></a>[`grpc`](#field-luxir.servicestats.grpc) | 6 | [`TransportStats`](#message-luxir.transportstats) | singular |  |
 | <a id="field-luxir.servicestats.search"></a>[`search`](#field-luxir.servicestats.search) | 21 | [`ActivityStats`](#message-luxir.activitystats) | singular | Searches the engine accepted, from submission to the final response. A gRPC Search call can carry many, so this is the per-search view there. |
 | <a id="field-luxir.servicestats.search_execution"></a>[`search_execution`](#field-luxir.servicestats.search_execution) | 7 | [`HistogramStats`](#message-luxir.histogramstats) | singular | Search body execution, excluding scheduler waits and streaming drains. |
+| <a id="field-luxir.servicestats.search_queue_wait"></a>[`search_queue_wait`](#field-luxir.servicestats.search_queue_wait) | 23 | [`HistogramStats`](#message-luxir.histogramstats) | singular | Searches waiting to execute: from submission, or the end of a min\_commit wait, to the start of execution. |
 | <a id="field-luxir.servicestats.search_resource_exhausted"></a>[`search_resource_exhausted`](#field-luxir.servicestats.search_resource_exhausted) | 8 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.search_warnings"></a>[`search_warnings`](#field-luxir.servicestats.search_warnings) | 9 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.index_batches"></a>[`index_batches`](#field-luxir.servicestats.index_batches) | 10 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.update_wait"></a>[`update_wait`](#field-luxir.servicestats.update_wait) | 24 | [`HistogramStats`](#message-luxir.histogramstats) | singular | Update messages waiting in a collection's writer, from submission to the start of processing. Commit requests and internal commits are messages too. |
 | <a id="field-luxir.servicestats.documents_accepted"></a>[`documents_accepted`](#field-luxir.servicestats.documents_accepted) | 11 | `uint64` | singular | Accepted into indexing (not durably acknowledged) or rejected/rolled back. |
 | <a id="field-luxir.servicestats.documents_rejected"></a>[`documents_rejected`](#field-luxir.servicestats.documents_rejected) | 12 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.delete_ids_accepted"></a>[`delete_ids_accepted`](#field-luxir.servicestats.delete_ids_accepted) | 13 | `uint64` | singular |  |
 | <a id="field-luxir.servicestats.document_errors"></a>[`document_errors`](#field-luxir.servicestats.document_errors) | 19 | map&lt;`string`, `uint64`&gt; | map | Documents rejected with an error of their own, keyed by error kind. The rest of documents\_rejected were rolled back with a failed batch. |
 | <a id="field-luxir.servicestats.flush"></a>[`flush`](#field-luxir.servicestats.flush) | 14 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
-| <a id="field-luxir.servicestats.commit"></a>[`commit`](#field-luxir.servicestats.commit) | 15 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
+| <a id="field-luxir.servicestats.commit"></a>[`commit`](#field-luxir.servicestats.commit) | 15 | [`ActivityStats`](#message-luxir.activitystats) | singular | Whole commits: client, deferred and merge-triggered. A merge layout's publication counts under merge\_publish. |
+| <a id="field-luxir.servicestats.merge_publish"></a>[`merge_publish`](#field-luxir.servicestats.merge_publish) | 25 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.delete_pass"></a>[`delete_pass`](#field-luxir.servicestats.delete_pass) | 22 | [`ActivityStats`](#message-luxir.activitystats) | singular | Delete passes, which apply deletes between commits without flushing, syncing or publishing. |
 | <a id="field-luxir.servicestats.merge"></a>[`merge`](#field-luxir.servicestats.merge) | 16 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
 | <a id="field-luxir.servicestats.vector_build"></a>[`vector_build`](#field-luxir.servicestats.vector_build) | 17 | [`ActivityStats`](#message-luxir.activitystats) | singular |  |
