@@ -146,7 +146,7 @@ TEST_F(ValCoerceTest, fieldTypeColInt64Encodings) {
   EXPECT_THROW(dat.coerceColInt64(sval("not a date"), "f"), std::runtime_error);
 
   // A local date resolves in UTC whatever the zone and rejects a time of day.
-  DateFieldType local("_ld", FieldType::COLUMN_STORED, true);
+  DateFieldType local("_ld", FieldType::COLUMN_STORED, DateUnit::MILLIS, true);
   CoerceContext denver{std::nullopt, *resolveTimeZone("America/Denver")};
   EXPECT_EQ(*ms, local.coerceColInt64(sval("2020-01-01"), "f", denver));
   EXPECT_EQ(*ms, local.coerceDateRange(sval("2020-01-01"), "f", denver).lo);
