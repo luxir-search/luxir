@@ -141,6 +141,31 @@ public:
     finishValues(inverter, numTokens);
   }
 
+  // Pre-analyzed tokens (a plugin field type's derived field): one value,
+  // positions as given, which the caller keeps non-decreasing.
+  void indexTokens(Inverter& inverter, std::span<const std::string_view> terms,
+                   std::span<const int32_t> positions) override {
+    assert(terms.size() == positions.size());
+    if (terms.empty()) return;
+    int docid = inverter.getDoc();
+    int numTokens = 0;
+    PackedTerm::TermBuffer scratch;
+    for (size_t i = 0; i < terms.size(); i++) {
+      auto term = PackedTerm::fitTerm(fieldType->longTerms, terms[i], scratch);
+      if (!term) {
+        finishValues(inverter, numTokens);
+        throw DocumentError(fmt::format("Field '{}': token is {} bytes; maximum is {}",
+                                        std::string_view(fieldName), terms[i].size(), PackedTerm::MAX_LEN));
+      }
+      ++numTokens;
+      auto [entry, inserted] = termsHash.try_emplace(*term, termsHash.getMemPool(), docid, positions[i]);
+      if (!inserted) {
+        entry->val().addDoc(termsHash.getMemPool(), docid, positions[i]);
+      }
+    }
+    finishValues(inverter, numTokens);
+  }
+
 private:
   void finishValues(Inverter& inverter, int numTokens) {
     // We index the length even if all tokens were removed somehow, because we still want

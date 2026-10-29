@@ -2,17 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 
+#include <glaze/glaze.hpp>
+
 #include "CountingStorage.h"
 #include "ExampleSearch.h"
+#include "luxir/api/build.h"
 #include "ExampleQuery.h"
 #include "luxir/plugin/Registries.h"
 #include "luxir/server/LuxirNode.h"
 #include "luxir/store/DelegatingDirectory.h"
+#include "luxir/util/ApiError.h"
 
 namespace luxir::example {
 
@@ -79,6 +84,149 @@ public:
 class StripXFilter : public CharFilter {
   void filter() override {
     for (size_t i = input.find('x'); i != std::string_view::npos; i = input.find('x', i + 1)) replace(i, i + 1, "");
+  }
+};
+
+// Field type "pair": {"a": <int>, "b": <int>} (with params {"multi": true},
+// an array of them). Derives two INT columns, a keyword "<a><separator><b>"
+// and the pair packed into 16 bytes in a column-only STRING, which is what
+// project() decodes back into the object.
+class PairType : public PluginFieldType {
+public:
+  enum Field { A, B, KEY, PACKED };
+  std::string separator;
+  bool multi;
+
+  PairType(std::string separator, bool multi) : separator(std::move(separator)), multi(multi) {
+    fields = {{.suffix = "a", .kind = DerivedField::Kind::INT, .multi = multi},
+              {.suffix = "b", .kind = DerivedField::Kind::INT, .multi = multi},
+              {.suffix = "key", .kind = DerivedField::Kind::STRING, .multi = multi},
+              {.suffix = "packed", .kind = DerivedField::Kind::STRING, .multi = multi, .index = false,
+               .opaque = true}};
+  }
+
+  // The defaults filled in, so {} and {"separator": ":"} are one definition.
+  std::string canonicalParams() const override {
+    glz::generic_sorted_u64 params;
+    params["separator"] = separator;
+    params["multi"] = multi;
+    return glz::write_json(params).value_or("");
+  }
+
+  void index(const api::Val& value, DerivedSink& sink) const override {
+    if (auto* list = std::get_if<api::ArrVal>(&value.kind); list && multi) {
+      for (const auto& element : list->v) indexPair(element, sink);
+    } else {
+      indexPair(value, sink);
+    }
+  }
+
+  bool projects() const override { return true; }
+
+  void project(const DerivedValues& values, api::Val& out, std::pmr::memory_resource& mr) const override {
+    const api::Val* packed = values.get(PACKED);
+    if (packed == nullptr) return;
+    if (!multi) {
+      out = pairValue(std::get<std::string_view>(packed->kind), mr);
+      return;
+    }
+    // A multi pair keeps a sorted set of packed values, so pairs come back in that order.
+    const auto& all = std::get<api::ArrStr>(packed->kind).v;
+    api::ArrVal list;
+    auto* items = api::build::allocArray(list.v, all.size(), mr);
+    for (size_t i = 0; i < all.size(); i++) items[i] = pairValue(all[i], mr);
+    out.kind = list;
+  }
+
+private:
+  static int64_t member(const api::Map& map, std::string_view name) {
+    const auto* found = map.fields.find(name);
+    if (found == nullptr) throw std::invalid_argument("'" + std::string(name) + "' is required");
+    if (auto* i = std::get_if<int64_t>(&(*found)->kind)) return *i;
+    throw std::invalid_argument("'" + std::string(name) + "' must be an integer");
+  }
+
+  void indexPair(const api::Val& value, DerivedSink& sink) const {
+    auto* map = std::get_if<api::Map>(&value.kind);
+    if (map == nullptr) throw std::invalid_argument("expected an object {\"a\": <int>, \"b\": <int>}");
+    for (const auto& entry : map->fields) {
+      if (entry.first != "a" && entry.first != "b") {
+        throw std::invalid_argument("unknown member '" + std::string(entry.first) + "'");
+      }
+    }
+    int64_t a = member(*map, "a"), b = member(*map, "b");
+    sink.integer(A, a);
+    sink.integer(B, b);
+    sink.string(KEY, std::to_string(a) + separator + std::to_string(b));
+    char bytes[16];
+    std::memcpy(bytes, &a, 8);
+    std::memcpy(bytes + 8, &b, 8);
+    sink.string(PACKED, std::string_view(bytes, 16));
+  }
+
+  // Null for bytes this type did not write.
+  static api::Val pairValue(std::string_view bytes, std::pmr::memory_resource& mr) {
+    if (bytes.size() != 16) return {};
+    int64_t a, b;
+    std::memcpy(&a, bytes.data(), 8);
+    std::memcpy(&b, bytes.data() + 8, 8);
+    api::Map map;
+    auto* va = api::build::mapSlot<api::Val>(map.fields, 2, "a", mr);
+    va->kind = a;
+    api::build::mapSlot<api::Val>(map.fields, 2, "b", mr)->kind = b;
+    api::Val out;
+    out.kind = map;
+    return out;
+  }
+};
+
+// Field type "spot": {"label": <text>, "lat": <num>, "lon": <num>, "tokens":
+// [[<term>, <position>], ...]}. Derives a geo point, the analyzed label, and
+// pre-analyzed tokens (a TEXT field): the given tokens, else the label's
+// letters at their offsets. Not retrievable. Given positions go to the sink
+// unchecked, so decreasing ones fail the document as a type fault.
+class SpotType : public PluginFieldType {
+public:
+  enum Field { AT, LABEL, LETTERS };
+
+  SpotType() {
+    fields = {{.suffix = "at", .kind = DerivedField::Kind::GEO_POINT},
+              {.suffix = "label", .kind = DerivedField::Kind::TEXT, .column = false, .analyzer = "english"},
+              {.suffix = "letters", .kind = DerivedField::Kind::TEXT, .column = false}};
+  }
+
+  void index(const api::Val& value, DerivedSink& sink) const override {
+    auto* map = std::get_if<api::Map>(&value.kind);
+    if (map == nullptr) throw std::invalid_argument("expected an object");
+    auto number = [&](std::string_view name) {
+      const auto* found = map->fields.find(name);
+      if (found == nullptr) throw std::invalid_argument("'" + std::string(name) + "' is required");
+      if (auto* d = std::get_if<double>(&(*found)->kind)) return *d;
+      if (auto* i = std::get_if<int64_t>(&(*found)->kind)) return (double)*i;
+      throw std::invalid_argument("'" + std::string(name) + "' must be a number");
+    };
+    sink.point(AT, number("lat"), number("lon"));
+    const auto* tokens = map->fields.find("tokens");
+    if (tokens != nullptr) {
+      const auto* list = std::get_if<api::ArrVal>(&(*tokens)->kind);
+      if (list == nullptr) throw std::invalid_argument("'tokens' must be an array");
+      for (const auto& token : list->v) {
+        const auto* pair = std::get_if<api::ArrVal>(&token.kind);
+        const std::string_view* term = pair && pair->v.size() == 2
+            ? std::get_if<std::string_view>(&pair->v[0].kind) : nullptr;
+        const int64_t* position = term ? std::get_if<int64_t>(&pair->v[1].kind) : nullptr;
+        if (position == nullptr) throw std::invalid_argument("each token must be [<term>, <position>]");
+        sink.token(LETTERS, *term, (int32_t)*position);
+      }
+    }
+    if (const auto* label = map->fields.find("label")) {
+      const auto* text = std::get_if<std::string_view>(&(*label)->kind);
+      if (text == nullptr) throw DocumentError("'label' must be a string", "invalid_label");
+      sink.text(LABEL, *text);
+      for (size_t i = 0; tokens == nullptr && i < text->size(); i++) {
+        if ((*text)[i] != ' ') sink.token(LETTERS, text->substr(i, 1), (int32_t)i);
+      }
+    }
   }
 };
 
@@ -238,6 +386,17 @@ public:
     });
   }
 
+  static void registerFieldTypes(Registries& r) {
+    r.fieldTypes.add("pair", [](const ParamReader& params) -> std::unique_ptr<const PluginFieldType> {
+      std::string separator(params.getString("separator", ":"));
+      if (separator.empty()) params.fail("separator", "must not be empty");
+      return std::make_unique<PairType>(std::move(separator), params.getBool("multi", false));
+    });
+    r.fieldTypes.add("spot", [](const ParamReader&) -> std::unique_ptr<const PluginFieldType> {
+      return std::make_unique<SpotType>();
+    });
+  }
+
   PluginInfo info() const override { return {"example", "1.0", "exercises the plugin framework"}; }
 
   void registerComponents(Registries& r) override {
@@ -284,6 +443,7 @@ public:
       return std::make_unique<DescribeFilter>(std::move(source));
     });
     registerCollation(r);
+    registerFieldTypes(r);
 
     r.storage.addBackend("counting_ram", [](const StorageContext& ctx) -> std::unique_ptr<DirectoryFactory> {
       return std::make_unique<CountingRamBackend>(ctx);

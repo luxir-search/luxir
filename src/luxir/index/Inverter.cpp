@@ -90,6 +90,16 @@ Inverter::InputHandler& Inverter::createInputHandler(std::string_view name) {
   }
 
   auto input = pool.make_unique<InputHandler>(*this, resolved, fieldType, writer);
+  if (input->shape == LogicalField::Shape::PLUGIN) {
+    // The composite has no physical structures; each derived field is a branch.
+    for (const auto& [suffix, type] : resolved.owner->derived) {
+      auto physical = CompositeFieldType::derivedName(resolved.logicalName, suffix);
+      input->branches.push_back({physical, &createPhysicalHandler(physical, type)});
+    }
+    auto [iter, inserted] = inputHandlers.try_emplace(std::string(name), std::move(input));
+    assert(inserted);
+    return *iter->second;
+  }
   input->branches.push_back({"self", &createPhysicalHandler(resolved.physicalName, fieldType)});
   if (resolved.owner) {
     for (const auto& [label, type] : resolved.owner->variants) {
@@ -228,6 +238,10 @@ void Inverter::InputHandler::store(Inverter& inverter, const IndexVal& val) {
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, const IndexVal& val) {
+  if (shape == LogicalField::Shape::PLUGIN) {
+    indexDerived(inverter, val);
+    return;
+  }
   if (shape == LogicalField::Shape::GEO) {
     // Parse once for every branch, and fully before any branch indexes.
     geoPoints.clear();
@@ -272,10 +286,105 @@ void Inverter::InputHandler::index(Inverter& inverter, double latitude, double l
 }
 
 void Inverter::InputHandler::index(Inverter& inverter, std::span<const GeoPoint> points) {
+  if (shape == LogicalField::Shape::PLUGIN) {
+    throw DocumentError(fmt::format("Field '{}' has a plugin type; typed geo points are not its input",
+                                    std::string_view(fieldName)));
+  }
   for (const auto& point : points) {
     coerce::checkGeoPoint(point, std::string_view(fieldName), "typed geo point");
   }
   indexPoints(inverter, points);
+}
+
+// The plugin indexes the whole value into its sink first; the derived fields
+// receive their values only once it returned, so a rejected value leaves no
+// trace and ignore_malformed can skip it.
+void Inverter::InputHandler::indexDerived(Inverter& inverter, const IndexVal& val) {
+  if (coerce::isNull(val)) return;
+  const auto& composite = static_cast<const CompositeFieldType&>(*fieldType);
+  if (!derivedSink) derivedSink = std::make_unique<DerivedSink>(*composite.plugin);
+  auto& sink = *derivedSink;
+  sink.clear();
+  auto account = scope_guard([&] {
+    size_t bytes = sink.retainedBytes() + derivedViews.capacity() * sizeof(std::string_view);
+    inverter.addExtraRam((int64_t)bytes - (int64_t)derivedScratchBytes);
+    derivedScratchBytes = bytes;
+  });
+  // A malformed value: the message, and a DocumentError's code.
+  std::optional<std::string> malformed;
+  std::string code = "invalid_value";
+  try {
+    composite.impl().index(val, sink);
+  } catch (const DocumentError& e) {
+    malformed = e.what();
+    code = e.code;
+  } catch (const RequestError& e) {
+    malformed = e.what();
+  } catch (const std::invalid_argument& e) {
+    malformed = e.what();
+  } catch (const ApiError&) {
+    throw;  // resource limits and the like are the request's
+  } catch (const std::bad_alloc&) {
+    throw;
+  } catch (const std::exception& e) {
+    // A fault in the plugin (or a misuse of the sink), not a bad value, so
+    // ignore_malformed does not hide it; it still fails only this document.
+    throw DocumentError(fmt::format("Field '{}': field type '{}' failed to index the value: {}",
+                                    std::string_view(fieldName), composite.plugin->name, e.what()),
+                        "field_type_error");
+  }
+  if (malformed) {
+    if (composite.ignoreMalformed) return;
+    throw DocumentError(fmt::format("Field '{}': cannot read {} value: {}", std::string_view(fieldName),
+                                    composite.plugin->name, *malformed), std::move(code));
+  }
+  const auto& fields = composite.impl().fields;
+  for (size_t i = 0; i < branches.size(); i++) {
+    if (sink.values[i].count() == 0) continue;
+    try {
+      indexDerivedField(inverter, fields[i], sink.values[i], *branches[i].handler);
+    } catch (const DocumentError& e) {
+      throw DocumentError(fmt::format("Field '{}' derived field '{}': {}",
+          std::string_view(fieldName), branches[i].label, e.what()), e.code);
+    } catch (const RequestError& e) {
+      throw RequestError(fmt::format("Field '{}' derived field '{}': {}",
+          std::string_view(fieldName), branches[i].label, e.what()), e.code);
+    }
+  }
+}
+
+void Inverter::InputHandler::indexDerivedField(Inverter& inverter, const DerivedField& spec,
+                                               const DerivedSink::Values& values, IndexHandler& handler) {
+  switch (spec.kind) {
+    case DerivedField::Kind::STRING:
+    case DerivedField::Kind::TEXT: {
+      derivedViews.clear();
+      uint32_t start = 0;
+      for (uint32_t end : values.ends) {
+        derivedViews.emplace_back(values.bytes.data() + start, end - start);
+        start = end;
+      }
+      std::span<const std::string_view> views(derivedViews);
+      if (!values.positions.empty()) {
+        handler.indexTokens(inverter, views, values.positions);
+      } else {
+        handler.index(inverter, views);
+      }
+      break;
+    }
+    case DerivedField::Kind::INT:
+    case DerivedField::Kind::DATE:
+      // A single-valued column handler takes only the scalar form.
+      if (spec.multi) {
+        handler.index(inverter, std::span<const int64_t>(values.ints));
+      } else {
+        handler.index(inverter, values.ints[0]);
+      }
+      break;
+    case DerivedField::Kind::GEO_POINT:
+      handler.index(inverter, std::span<const GeoPoint>(values.points));
+      break;
+  }
 }
 
 // Points already range-checked.

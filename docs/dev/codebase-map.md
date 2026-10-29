@@ -171,12 +171,20 @@ locations, browse `src/luxir/<area>/`.
      (`collation`); `StringValue` stores the key in the column instead of the value, so the
      string column sort orders by it.
 
+   - Plugin field types (`src/luxir/schema/FieldTypeRegistry.h`): `FieldTypeRegistry` (name
+     -> maker of a `PluginFieldType`, which declares `DerivedField`s). The schema compiles a
+     field naming one (`plugin_type`) into a `CompositeFieldType` primary plus hidden built-in
+     fields `<field>$<suffix>` (`LogicalField::derived`); the Inverter's input handler runs
+     the type's `index` into a `DerivedSink` and feeds those fields, and `EmitDocs` returns
+     the field through `project` (`ReturnField::Kind::PROJECT`).
+
 9. **Plugins** (`src/luxir/plugin/`, `cmake/LuxirPlugins.cmake`)
    - `Plugin` / `PluginRegistry` / `Registries`: compiled-in extensions registered once by
      `initPlugins()` at startup, then frozen. Plugins are CMake targets added with
      `luxir_add_plugin` and selected at build time via `LUXIR_PLUGIN_DIRS`.
    - Extension registries: `QueryRegistry` (`src/luxir/query/`, the `plugin` Query arm),
-     `SearchOpRegistry` (`src/luxir/search/`, the `plugin` SearchOp arm) and
+     `SearchOpRegistry` (`src/luxir/search/`, the `plugin` SearchOp arm),
+     `FieldTypeRegistry` (`src/luxir/schema/`, `FieldDef.plugin_type`) and
      `HttpRouteRegistry` (`src/luxir/server/`); `ParamReader` reads plugin arm params.
    - See [plugins.md](plugins.md).
 

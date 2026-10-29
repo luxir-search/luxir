@@ -2389,10 +2389,12 @@ message FieldDef {
   }
   optional DateUnit unit = 24;
 
-  // GEO_POINT only. Skip a value that is not a valid point (unreadable, out of
-  // range, or a z coordinate when ignore_z_value is false) and index the rest
-  // of the document; in a multi-valued field only the bad points are skipped.
-  // Unset inherits, else false: a malformed point fails the document.
+  // GEO_POINT and plugin_type fields. Skip a value that is not a valid point
+  // (unreadable, out of range, or a z coordinate when ignore_z_value is false)
+  // and index the rest of the document; in a multi-valued field only the bad
+  // points are skipped. A plugin_type field skips the whole value when the
+  // plugin rejects it. Unset inherits, else false: a malformed value fails
+  // the document.
   optional bool ignore_malformed = 28;
 
   // GEO_POINT only. Accept a third (z, altitude) coordinate and drop it. Unset
@@ -2409,6 +2411,18 @@ message FieldDef {
   // before it do not carry its keys. HTTP JSON takes a bare name or
   // {"name": ..., "params": {...}}.
   AnalyzerComponent collation = 23;
+
+  // A field type a plugin registered (Registries::fieldTypes): its name and
+  // params. The authored value is handed whole (objects and arrays included)
+  // to the plugin, which indexes it into hidden built-in sub-fields named
+  // <field>$<suffix>; those are queried, sorted and faceted by that name, and
+  // retrieving the field returns what the plugin projects from them. Excludes
+  // type and every other property except parent and ignore_malformed (skip a
+  // value the plugin rejects and index the rest of the document). Absent
+  // inherits; a parent with a built-in type clears it. The name and params
+  // are part of the sub-fields' signatures. HTTP JSON also reads
+  // {"type": "<name>", "params": {...}} for a name that is not a built-in type.
+  AnalyzerComponent plugin_type = 31;
 }
 
 // Chunk settings for one stored-field group (a FieldDef stored_resource).

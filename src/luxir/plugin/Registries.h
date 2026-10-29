@@ -6,6 +6,7 @@
 #include "luxir/collation/CollationRegistry.h"
 #include "luxir/plugin/Plugin.h"
 #include "luxir/query/QueryRegistry.h"
+#include "luxir/schema/FieldTypeRegistry.h"
 #include "luxir/search/SearchOpRegistry.h"
 #include "luxir/server/HttpRouteRegistry.h"
 #include "luxir/store/StorageRegistry.h"
@@ -20,6 +21,8 @@ struct Registries {
   StorageRegistry& storage;
   // Collators: string -> binary sort key, named by a string field.
   CollationRegistry& collation;
+  // Plugin field types: one authored field indexed into derived built-in fields.
+  FieldTypeRegistry& fieldTypes;
   // Plugin query types (api::PluginQuery).
   QueryRegistry& query;
   // Plugin search operations (api::PluginOp).

@@ -21,8 +21,10 @@ inline bool identifierStart(char c) {
   return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
 }
 
+// '$' continues an identifier so a plugin field's derived fields
+// (<field>$<suffix>) read as names; it never starts one (variables).
 inline bool identifierChar(char c) {
-  return identifierStart(c) || (c >= '0' && c <= '9');
+  return identifierStart(c) || (c >= '0' && c <= '9') || c == '$';
 }
 
 inline bool digit(char c) {
@@ -45,7 +47,7 @@ inline std::string_view scanIdentifier(Cursor& cur) {
 // Cursor sits on '$'. The returned name excludes it.
 inline std::string_view scanVariable(Cursor& cur) {
   cur.advance();
-  return cur.takeWhile([](char c) { return identifierChar(c); });
+  return cur.takeWhile([](char c) { return identifierChar(c) && c != '$'; });
 }
 
 // Shared numeric token grammar for every expression value position. Conversion

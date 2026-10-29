@@ -2,15 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "FieldSignature.h"
+#include "FieldTypeRegistry.h"
 #include <glaze/glaze.hpp>
 
 namespace luxir {
 
 FieldSignature::FieldSignature(std::string_view name, FieldType& type) {
-  auto split = name.rfind("__");
-  logicalName = name.substr(0, split);
-  label = split == std::string_view::npos ? "self" : std::string(name.substr(split + 2));
+  // A plugin field's derived fields are representations labelled "$<suffix>".
+  if (auto dollar = name.find(CompositeFieldType::SEPARATOR); dollar != std::string_view::npos) {
+    logicalName = name.substr(0, dollar);
+    label = name.substr(dollar);
+  } else {
+    auto split = name.rfind("__");
+    logicalName = name.substr(0, split);
+    label = split == std::string_view::npos ? "self" : std::string(name.substr(split + 2));
+  }
   properties["type"] = "\"" + std::string(FieldType::typeName(type.type())) + "\"";
+  if (auto* composite = dynamic_cast<CompositeFieldType*>(&type)) {
+    properties["type"] = "\"plugin\"";
+    properties["plugin_type"] = composite->plugin->canonical;
+  }
   properties["multi"] = !type.multiValued() ? "false"
       : type.multiArray() && !FieldType::arrayOnly(type.type()) ? "\"array\"" : "true";
   properties["index"] = type.rangeIndexed() ? "\"range\"" : type.indexed() ? "\"match\"" : "\"none\"";

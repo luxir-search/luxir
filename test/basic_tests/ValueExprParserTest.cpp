@@ -191,6 +191,13 @@ TEST(ValueExprParserTest, variablesAndArrayReducers) {
   EXPECT_EQ(ValueType::INT64, parser.parse("count(price_i)")->root().type);
   EXPECT_EQ(ValueType::INT64_ARRAY, parser.parse("def($values,$values)")->root().type);
   EXPECT_EQ(ValueType::DOUBLE_ARRAY, parser.parse("$values / 2")->root().type);
+  // '$' continues an identifier (derived fields, <field>$<suffix>) but never
+  // starts one, so a variable next to a field name is still a variable.
+  EXPECT_EQ(ValueType::INT64, parser.parse("price_i*$n")->root().type);
+  EXPECT_EQ(ValueType::INT64, parser.parse("$n*price_i")->root().type);
+  EXPECT_EQ(ValueType::INT64, parser.parse("max(price_i,$n)-$n")->root().type);
+  ValueExprParser joined(options, *memory.arena);
+  expectParseError(joined, "price_i$n", "has no derived fields");
 }
 
 TEST(ValueExprParserTest, reportsArityTypeVariableAndLiteralErrors) {
