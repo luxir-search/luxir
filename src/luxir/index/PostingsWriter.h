@@ -1860,7 +1860,7 @@ public:
 
     if ((std::string_view)fieldInfo->fieldname == "id") {
       postingsWriter.idDictionaryBlocks = result.nBlocks;
-      postingsWriter.idRange = IdRange{std::move(result.firstTerm), std::move(result.lastTerm), result.nTerms == 0};
+      postingsWriter.idRange = IdRange{result.firstTerm, result.lastTerm, result.nTerms == 0};
     }
 
     // write index into the blocks of the terms dict
